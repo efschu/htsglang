@@ -1764,6 +1764,18 @@ def state_aligned_load_back_len(req) -> Optional[int]:
 
     n = _1040_ALIGN["n"]
     from sglang.srt.weg2 import prefix_trace as _pt
+    from sglang.srt.weg2 import rank_trace_968 as _rt968
+
+    # #968-RT (default off, pure log): THIS rank's own match decision -- the
+    # radix key match depth, the anchor the walk accepted, the host hit, the
+    # device prefix and the extent they yield. One line per distinct fact.
+    if _rt968.once("state_align", getattr(req, "rid", None), kv, int(device_len), anchor, key_depth, extent):
+        _rt968.emit(
+            "state_align", getattr(req, "rid", None), matched_prefix_len=key_depth,
+            resident_rows=int(device_len) + kv, src="radix",
+            decision="extent=%d" % int(extent), anchor_depth=anchor, host_hit=kv,
+            device_len=int(device_len), loss=loss, cls=absent_class or "aligned",
+        )
 
     if (
         loss > 0
@@ -2838,7 +2850,27 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     """
     local = len(req.prefix_indices)
     scheduled = int(scheduled_prefix_len)
+    from sglang.srt.weg2 import rank_trace_968 as _rt968
+
+    def _rt(decision, **extra):
+        # #968-RT (default off, pure log): this rank's execution of PP0's
+        # decision. told is not on the request here: `scheduled` IS the
+        # decision's prefix_len. Read-only, never raises.
+        if not _rt968.armed():
+            return
+        try:
+            _rt968.emit(
+                "prefix_exec", getattr(req, "rid", None), told=None,
+                matched_prefix_len=len(req.prefix_indices),
+                resident_rows=_rt968.resident_rows_of(req),
+                src="host_hit" if int(getattr(req, "host_hit_length", 0) or 0) > 0 else "radix",
+                decision=decision, scheduled=scheduled, **extra,
+            )
+        except Exception:  # noqa: BLE001 - an instrument never breaks the station
+            pass
+
     if local == scheduled:
+        _rt("noop")
         # #1175 (E4): NOT A SILENT RETURN ANY MORE. This is the healthy
         # majority path, and until now it printed nothing at all -- so
         # "#968 PREFIX-EXEC materialised = 0 lines on the whole boot"
@@ -2866,6 +2898,7 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
         req.cache_protected_len = min(
             int(getattr(req, "cache_protected_len", 0) or 0), scheduled
         )
+        _rt("truncate", local_before=local)
         logger.info(
             "#968 PREFIX-EXEC truncate rid=%s local=%d -> scheduled=%d: this "
             "rank's own reuse exceeds the decision; executing the decision.",
@@ -2899,6 +2932,7 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     # longer being unfulfillable (E2) and the decision no longer naming a
     # prefix only PP0 holds (E1); this line is what makes the FIRST blocked
     # rank legible while those hold.
+    _rt("materialise_enter", deficit=deficit, bound_s="%.2f" % bound_s)
     global _PREFIX_EXEC_SHORT_SEEN
     _PREFIX_EXEC_SHORT_SEEN += 1
     _short_n = _PREFIX_EXEC_SHORT_SEEN
@@ -2922,6 +2956,10 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     def _die(served: int, why: str) -> "RuntimeError":
         host_offer = int(getattr(req, "host_hit_length", 0) or 0)
         best_now = getattr(req, "best_match_node", None)
+        _rt(
+            "SHORTFALL", served=served, deficit=deficit, why=str(why)[:48].replace(" ", "_"),
+            best_node=getattr(best_now, "id", "ABSENT"),
+        )
         return RuntimeError(
             f"#968 PREFIX MATERIALISATION SHORTFALL for rid="
             f"{getattr(req, 'rid', '?')}: the decision names prefix_len="
@@ -2957,7 +2995,11 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
             # where PP0's did not) -- load back from the ancestor that ends
             # exactly at the decision, if that ancestor carries a host-backed
             # recurrent state. Otherwise unchanged (the #968 stop below).
+            _rt_best0 = best
             best = _ancestor_retarget_968(req, best, deficit)
+            # #968-RT: where the match reaches (relative to last_node) BEFORE
+            # the load-back moves last_node, read-only tree walk
+            _rt_rel = _rt968.node_depth_rel(best, getattr(req, "last_node", None)) if _rt968.armed() else None
             # Armed False for THIS attempt only; the mamba component sets it
             # True if the load-back plants a node-END anchor (same protocol
             # as the S1 site in schedule_policy.add_one_req).
@@ -2976,6 +3018,17 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
                 applied = int(new_indices.numel())
             except AttributeError:
                 applied = len(new_indices)
+            if _rt968.armed() and _rt968.once(
+                "prefix_exec_lb", getattr(req, "rid", None), getattr(best, "id", None), applied, deficit
+            ):
+                # one line per distinct (best node, applied, deficit): a poll
+                # that repeats the same facts is not a new line
+                _rt(
+                    "loadback", best_node=getattr(best, "id", "?"), best_rel=_rt_rel,
+                    retargeted=int(best is not _rt_best0), applied=applied, deficit=deficit,
+                    adopted=int(bool(getattr(req, "mamba_loadback_anchor_adopted", False))),
+                    mamba=_rt968.mamba_flags(best),
+                )
             if applied != deficit and bool(
                 getattr(req, "mamba_loadback_anchor_adopted", False)
             ):
@@ -2997,6 +3050,7 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
                 loaded_total += applied
                 deficit -= applied
         if deficit <= 0:
+            _rt("materialised", loaded=loaded_total, local_before=local)
             logger.info(
                 "#968 PREFIX-EXEC materialised rid=%s local=%d -> scheduled=%d "
                 "loaded=%d waited=%.2fs of %.2fs bound (host read-back, "

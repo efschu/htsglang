@@ -84,6 +84,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from sglang.srt.weg2 import rank_trace_968 as _rt968  # #968-RT instrument (default off)
+
 logger = logging.getLogger(__name__)
 
 ENV_FALLBACK = "SGLANG_WEG2_TOLD_GROUP_FALLBACK"
@@ -369,6 +371,11 @@ def pp0_decide(scheduler, rid: str, now: float) -> Optional[Tuple[int, str]]:
 def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float) -> None:
     o = _pp0_open_map(scheduler).pop(str(rid), None)
     acks = dict(o.acks) if o is not None else {}
+    # #968-RT (default off, pure log): PP0's told verdict -- told asked, told given
+    _rt968.emit(
+        "told_verdict", rid, told=told, matched_prefix_len=told_final, src="pp0_verdict",
+        decision=reason, scheduler=scheduler, acks=acks,
+    )
     if reason == REASON_ACKS:
         n = _bump(scheduler, "_pf_admit_acks_n")
         if _say(n):
@@ -464,6 +471,20 @@ def follower_release(scheduler, rid: str) -> None:
     from sglang.srt.weg2 import p_twin_defer as _twin
 
     rid = str(rid)
+    if _rt968.armed():
+        # #968-RT (default off, pure log): what this rank's own store read held
+        # at the moment the fallback made it let go (read-only, before the release)
+        try:
+            from sglang.srt.managers import weg2_store_told as _st
+
+            _own = _st._completed_prefix(getattr(scheduler, "tree_cache", None), rid)
+        except Exception:  # noqa: BLE001 - an instrument
+            _own = None
+        _sat = getattr(scheduler, "_weg2_store_told_satisfied", None) or {}
+        _rt968.emit(
+            "told_release", rid, told=_sat.get(rid), matched_prefix_len=_own,
+            src="store_read", decision="fallback_release", scheduler=scheduler,
+        )
     follower_forget(scheduler, rid)
     release_own_read(scheduler, rid)
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)

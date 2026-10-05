@@ -53,6 +53,16 @@ def _note_988_loadback(req, new_prefix_len: int) -> None:
     # conclude nothing. `#988 LOADBACK` is the quantity the whole slice is
     # judged on; it is now unconditional, and the cumulative counters ride every
     # line so any single line states the totals.
+    # #968-RT (default off, pure log): the applied load-back on THIS rank
+    from sglang.srt.weg2 import rank_trace_968 as _rt968
+
+    _rt968.emit(
+        "loadback", getattr(req, "rid", None), matched_prefix_len=new_prefix_len,
+        resident_rows=_rt968.resident_rows_of(req), src="host_loadback",
+        decision="applied", mamba_adopted=int(bool(getattr(req, "mamba_loadback_anchor_adopted", False))),
+        anchor_depth=getattr(req, "state_anchor_depth", None),
+        extent=getattr(req, "pp_load_back_extent", None),
+    )
     if True:
         logger.info(
             "#988 LOADBACK rid=%s prefix moved to %d, extend_range re-derived "
