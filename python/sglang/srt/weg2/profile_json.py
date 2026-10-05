@@ -770,7 +770,8 @@ def view(doc: Mapping, catalog: Optional[Mapping] = None, comments: Optional[Map
         key = r["key"]
         ex = explain_row(r, catalog, comments)
         for d in ex["depends"]:
-            d["present"] = d["to"] in present
+            # a refusal code is no value of the profile: "set in this profile" does not apply (None), the chip points at the register
+            d["present"] = None if d.get("to_kind") == "ablehnung" else d["to"] in present
         origin = origins.get(key) or (ORIGIN_PROFIL if (key in pv or not pv) else ORIGIN_NUTZER)
         row = dict(r)
         row.update({"origin": origin, "origin_label": ORIGIN_LABEL[origin],

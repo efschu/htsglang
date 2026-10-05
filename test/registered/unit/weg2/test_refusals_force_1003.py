@@ -10,6 +10,8 @@ Gepinnt:
   * Mit ``--force``: HW-COUNT und HW-UNCALIBRATED laufen durch, ``FORCED-PAST <CODE> <Grund>`` wird geloggt, der Boot schreibt keine Records
     (``host_ledger.append_measured_record`` kehrt zurueck), die Kinder erben die Markierung.
   * Nicht forcebare Codes werden auch mit ``--force`` geworfen (Belegung, HW-ARCH).
+  * Auftrag 2002 (Register-Korrektur): PROFIL-STATUS, SHM, STORE, MEMAVAIL uebergeht der ENTRYPOINT mit FLLIPER_FORCE=1 (nicht der Launcher);
+    das Register sagt das (``wired_at`` / ``force_scope``), und die Liste ``ENTRYPOINT_FORCE_CODES`` ist an den Entrypoint-Quelltext gepinnt.
 GPU-frei, NVML-frei.
 """
 
@@ -87,6 +89,62 @@ class Register(Base):
     def test_classify_by_prefix(self):
         self.assertEqual(R.classify("HW-COUNT: 2 card(s)"), "HW-COUNT")
         self.assertIsNone(R.classify("W40 something"))
+
+
+ENTRYPOINT_CANDIDATES = (
+    os.path.join(HERE, "..", "..", "..", "..", "docker", "weg2-release", "entrypoint.sh"),
+    "/spinning/gpu-arb/docker/entrypoint.sh",
+)
+
+
+class EntrypointWiring(Base):
+    """Auftrag 2002 A: der Trockenlauf prueft Force nicht nur gegen das Launcher-Register, der Entrypoint uebergeht vier weitere Codes."""
+
+    def _entrypoint_src(self):
+        for c in ENTRYPOINT_CANDIDATES:
+            if os.path.isfile(c):
+                with open(c, encoding="utf-8") as fh:
+                    return fh.read()
+        self.skipTest("kein entrypoint.sh auf diesem Rechner (docker/weg2-release oder /spinning/gpu-arb/docker)")
+
+    def test_the_entrypoint_list_is_pinned_to_the_entrypoint_source(self):
+        src = self._entrypoint_src()
+        self.assertEqual(sorted(R.ENTRYPOINT_FORCE_CODES), R.entrypoint_wired_codes(src))
+        for c in R.ENTRYPOINT_FORCE_CODES:
+            self.assertTrue(R.by_code(c).forcebar, c)               # the entrypoint never passes a hard code
+
+    def test_entrypoint_parser_reads_calls_and_literal_lines_not_the_function_body(self):
+        src = ('refuse_value() { if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then say "FORCED-PAST $2 $3"; return 0; fi; refuse "$1" "$3"; }\n'
+               '  || refuse_value SHM SHM "zu klein"\n  || refuse_value MEMORY MEMAVAIL "x"\n'
+               '  say "FORCED-PAST HW-COUNT $msg"\n# Boot-Log: FORCED-PAST <CODE> <Grund>\n')
+        self.assertEqual(R.entrypoint_wired_codes(src), ["HW-COUNT", "MEMAVAIL", "SHM"])
+        self.assertEqual(R.entrypoint_wired_codes("echo nothing"), [])
+
+    def test_register_says_where_force_lifts_each_code(self):
+        with open(LAUNCHER_SRC, encoding="utf-8") as fh:
+            wired = R.wired_codes(fh.read())
+        pub = {r["code"]: r for r in R.public_register(wired)}
+        for c in ("PROFIL-STATUS", "SHM", "STORE", "MEMAVAIL"):
+            r = pub[c]
+            self.assertFalse(r["wired"], c)                         # the launcher does not consult it
+            self.assertTrue(r["wired_entrypoint"], c)
+            self.assertEqual(r["wired_at"], "entrypoint", c)
+            self.assertEqual(r["force_scope"], R.SCOPE_ENTRYPOINT_ONLY, c)
+        self.assertIn("Docker-Start (Entrypoint)", R.SCOPE_ENTRYPOINT_ONLY)
+        self.assertIn("reinen Launcher-Aufruf nicht", R.SCOPE_ENTRYPOINT_ONLY)
+        self.assertEqual(pub["HW-COUNT"]["wired_at"], "launcher+entrypoint")
+        self.assertEqual(pub["HW-UNCALIBRATED"]["wired_at"], "launcher+entrypoint")
+        self.assertEqual(pub["HOST-MEM"]["wired_at"], "launcher")
+        self.assertEqual(pub["PP-CUT"]["wired_at"], "none")         # forcebar by class, wired nowhere: still refuses
+        for c in ("HW-ARCH", "KARTE-BELEGT", "HW-TOPOLOGY"):
+            self.assertIsNone(pub[c]["wired_at"], c)
+            self.assertIsNone(pub[c]["wired_entrypoint"], c)
+            self.assertEqual(pub[c]["force_scope"], "nicht forcebar")
+
+    def test_explicit_entrypoint_list_overrides_the_default(self):
+        pub = {r["code"]: r for r in R.public_register([], entrypoint_wired=["SHM"])}
+        self.assertEqual(pub["SHM"]["wired_at"], "entrypoint")
+        self.assertEqual(pub["STORE"]["wired_at"], "none")
 
 
 class Switch(Base):
