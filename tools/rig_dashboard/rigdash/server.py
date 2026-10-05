@@ -42,10 +42,8 @@ STATIC_FILES = {
     "/uplot.LICENSE": ("uplot.LICENSE", "text/plain; charset=utf-8"),
     "/grafik.js": ("grafik.js", "application/javascript; charset=utf-8"),
     "/zoom.js": ("zoom.js", "application/javascript; charset=utf-8"),
-}
-#: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
-DEV_STATIC_FILES = {
-    "/kartenplan.js": ("kartenplan.js", "application/javascript; charset=utf-8"),
+    # Profil-Editor (Nutzer-Entscheid 05.10.: kommt INS Release, Auftrag 1984): die Module des Reiters Profil stehen in beiden Ausgaben.
+    # Sie rechnen nichts und lösen nichts am Rig aus; was Rig-Betrieb ist (Hardware messen = gpuq), sperren die Routen.
     "/profil.js": ("profil.js", "application/javascript; charset=utf-8"),
     # PROFIL-EDITOR S3 (Auftrag 960): das kleine Modul hinter "Modellprofil erstellen" (die Oberfläche baut Auftrag 930)
     "/modellprofil.js": ("modellprofil.js", "application/javascript; charset=utf-8"),
@@ -53,6 +51,10 @@ DEV_STATIC_FILES = {
     "/hwprofil.js": ("hwprofil.js", "application/javascript; charset=utf-8"),
     # Profil-Editor S4b (Auftrag 1432): Balken je Karte mit Überlauf und Browser-Näherung
     "/profil_balken.js": ("profil_balken.js", "application/javascript; charset=utf-8"),
+}
+#: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
+DEV_STATIC_FILES = {
+    "/kartenplan.js": ("kartenplan.js", "application/javascript; charset=utf-8"),
 }
 #: Körper einer POST-Anfrage: Pfad und ein paar Optionen, nie mehr
 MAX_POST_BODY = 64 * 1024
@@ -558,9 +560,9 @@ def make_handler(app: App):
 
         def _profil_guard(self):
             """None if allowed; else the (code, message) of the refusal.  The editor shows host paths and tunables of the
-            profiles and writes to the state volume: LAN only, never through the public proxy, never in the release edition."""
-            if app.edition == "release":
-                return 404, "not found"
+            profiles and writes to the state volume: LAN only, never through the public proxy.  The release edition has it too
+            (Nutzer-Entscheid 05.10.: "ein Release, das außer mir niemand nutzen kann, ist kein Release"; Auftrag 1984): it only
+            builds a profile and starts nothing; what touches the rig (measuring hardware = booking gpuq) stays shut, see _hwprofil."""
             if self._via_proxy():
                 return 403, "Der Profil-Editor ist nur im LAN erreichbar (http://192.168.0.88:8890/#t=profil)"
             return None
@@ -630,15 +632,16 @@ def make_handler(app: App):
             return self._json(res, 200)
 
         def _hwprofil(self, method, n=0, raw=b""):
-            """Profil-Editor S2: nur Rig-Ausgabe, nur LAN (die Route bucht GPU-Fenster und startet einen Messlauf)."""
-            if app.edition == "release":
-                return self._send(404, "not found", "text/plain")
+            """Profil-Editor S2: nur LAN.  ANZEIGEN (GET) gibt es in beiden Ausgaben; MESSEN und Fenster zurückgeben bucht GPU-Fenster und
+            startet einen Messlauf: nur Rig-Ausgabe, in der Release-Ausgabe 403 mit Klartext (Auftrag 1984)."""
             if self._via_proxy():
                 return self._json({"ok": False, "error": "Hardwareprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
             path = self.path.split("?", 1)[0]
             if method == "GET" and path == "/api/hwprofil":
                 return self._json(app.hwprofil.get())
             if method == "POST" and path in ("/api/hwprofil/measure", "/api/hwprofil/cancel"):
+                if app.edition == "release":
+                    return self._json({"ok": False, "error": hwprofil.RELEASE_NO_MEASURE}, 403)
                 if n > 4096:
                     raise ValueError("Body zu groß")
                 try:
@@ -713,9 +716,7 @@ def make_handler(app: App):
                         return self._json(app.kartenplaner.plan(req))
                     return self._send(404, "not found", "text/plain")
                 if path == "/api/modellprofil/modelle":
-                    # welche Modellverzeichnisse unter den Wurzeln liegen (nur stat); wie das Schätzen nur im LAN und nicht im Release
-                    if app.edition == "release":
-                        return self._send(404, "not found", "text/plain")
+                    # welche Modellverzeichnisse unter den Wurzeln liegen (nur stat); wie das Schätzen nur im LAN (auch im Release: der Reiter Profil braucht es)
                     if self._via_proxy():
                         return self._json({"ok": False, "error": "Modellprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
                     return self._json(app.modellprofil.models())
@@ -771,9 +772,7 @@ def make_handler(app: App):
                 n = max(0, int(self.headers.get("Content-Length") or 0))
                 raw = self.rfile.read(min(n, MAX_POST_DRAIN)) if n > 0 else b""
                 if path == "/api/modellprofil/schaetzen":
-                    # PROFIL-EDITOR S3: Modellpfad -> flliper.model/1.  Liest Dateien des Hosts: nur im LAN, nicht im Release.
-                    if app.edition == "release":
-                        return self._send(404, "not found", "text/plain")
+                    # PROFIL-EDITOR S3: Modellpfad -> flliper.model/1.  Liest config.json und Köpfe unter den Modellwurzeln: nur im LAN (auch im Release).
                     if self._via_proxy():
                         return self._json({"ok": False, "error": "Modellprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
                     if n > MAX_POST_BODY:

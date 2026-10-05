@@ -140,17 +140,24 @@
   function mount(el, opts) {
     opts = opts || {};
     const api = opts.api || "api/hwprofil";   // relativ: die Seite läuft auch unter einem Pfadpräfix
+    // Release-Ausgabe (Auftrag 1984): nur anzeigen.  Messen bucht ein gpuq-Fenster des Rigs; der Server sperrt es dort ebenfalls (403).
+    const edition = opts.edition || (typeof document !== "undefined" && document.documentElement && document.documentElement.getAttribute
+      && document.documentElement.getAttribute("data-edition")) || "rig";
+    const noMeasure = edition === "release";
     const st = { last: null, sel: null, busy: false, msg: "" };
     async function refresh() { st.last = await call(api); paint(); }
     function paint() {
       const r = st.last;
       const cards = (r && r.profile && r.profile.cards) || [];
       if (st.sel == null) st.sel = cards.map((c) => c.nvml_index);
-      const box = cards.map((c) => '<label><input type="checkbox" data-nvml="' + c.nvml_index + '"' + (st.sel.indexOf(c.nvml_index) >= 0 ? " checked" : "") + "> "
+      const box = noMeasure ? "" : cards.map((c) => '<label><input type="checkbox" data-nvml="' + c.nvml_index + '"' + (st.sel.indexOf(c.nvml_index) >= 0 ? " checked" : "") + "> "
         + c.ord + " · NVML " + c.nvml_index + " " + esc(c.name.replace(/^NVIDIA (GeForce )?/, "")) + "</label>").join(" ");
-      const bar = '<div class="hwp hwp-bar">' + box + ' <button type="button" data-act="measure"' + (st.busy || !st.sel.length ? " disabled" : "") + ">Hardwareprofil messen</button>"
+      const measureUi = noMeasure
+        ? ' <span class="hwp-warn" title="Messen bucht ein GPU-Fenster im gpuq-Fensterplan des Rigs und startet einen Messlauf.">Messen braucht gpuq und ist in der Release-Ausgabe gesperrt; hier wird das Profil nur angezeigt.</span>'
+        : ' <button type="button" data-act="measure"' + (st.busy || !st.sel.length ? " disabled" : "") + ">Hardwareprofil messen</button>";
+      const bar = '<div class="hwp hwp-bar">' + box + measureUi
         + ' <button type="button" data-act="refresh">Aktualisieren</button>'
-        + (r && r.window && r.window.state === "pending" ? ' <button type="button" data-act="cancel">Wartendes Fenster zurückgeben</button>' : "")
+        + (!noMeasure && r && r.window && r.window.state === "pending" ? ' <button type="button" data-act="cancel">Wartendes Fenster zurückgeben</button>' : "")
         + (st.msg ? " <span>" + esc(st.msg) + "</span>" : "")
         + (r && r.profile && r.profile.measure_needed ? ' <span class="hwp-warn">Es fehlen Messwerte.</span>' : "") + "</div>";
       el.innerHTML = bar + render(r, {});
@@ -165,6 +172,7 @@
       const act = e.target && e.target.getAttribute && e.target.getAttribute("data-act");
       if (!act) return;
       if (act === "refresh") return refresh();
+      if (noMeasure) return;
       st.busy = true; paint();
       try {
         const res = act === "cancel" ? await call(api + "/cancel", {}) : await call(api + "/measure", { cards: st.sel });

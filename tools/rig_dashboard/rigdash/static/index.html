@@ -87,8 +87,7 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
   background: var(--surface-2); color: var(--text); cursor: pointer; }
 .lf .miss { color: var(--warn); font-size: 12px; }
 /* <!--DEV:END--> */
-/* <!--DEV:BEGIN--> */
-/* Profil-Editor (Auftrag 930, S1) */
+/* Profil-Editor (Auftrag 930, S1): auch in der Release-Ausgabe (Nutzer-Entscheid 05.10.) */
 #pf-root { max-width: 1280px; }
 .pf-h3 { font-size: 13.5px; margin: 10px 0 2px; }
 .pf-models { width: 100%; border-collapse: collapse; } .pf-models td, .pf-models th { padding: 4px 6px; border-top: 1px solid var(--line); font-size: 12.5px; vertical-align: top; text-align: left; }
@@ -133,9 +132,8 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .pf-export { border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; margin: 10px 0; background: var(--surface); } .pf-export h3 { margin: 4px 0; font-size: 14px; }
 .pf-ok { border-color: var(--good); color: var(--good); } .pf-bad { border-color: var(--bad); color: var(--bad); }
 .pf-env { max-height: 420px; overflow: auto; } .pf-use { font-size: 12.5px; margin: 6px 0; } .pf-val { overflow-wrap: anywhere; max-width: 30em; }
-/* <!--DEV:END--> */
-/* <!--DEV:BEGIN--> */
-/* Kartenplaner (Item 510): Auswahl, Einfach- und Expertenseite; Farben aus den Seitenvariablen (hell/dunkel) */
+/* Kartenplaner (Item 510): Auswahl, Einfach- und Expertenseite; Farben aus den Seitenvariablen (hell/dunkel).
+   Die kp-Klassen tragen auch den Profil-Reiter (Urteil, Balken) und stehen darum auch in der Release-Ausgabe. */
 #kp-root { max-width: 1200px; }
 .kp-top { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin: 4px 0 10px; }
 .kp-top select, .kp-card select { font: inherit; font-size: 13px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); max-width: 100%; }
@@ -189,7 +187,6 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .kp-fold { border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; margin: 6px 0; background: var(--surface); } .kp-fold > summary { cursor: pointer; font-size: 13px; }
 .kp-nae { border: 1px dashed var(--warn); border-radius: 8px; padding: 6px 12px; margin: 6px 0; }
 #kp-envf { padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; width: min(420px, 100%); margin-bottom: 6px; }
-/* <!--DEV:END--> */
 .cardstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 6px; margin: -4px 0 12px; }
 .cardstrip > div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
 .cardstrip b { font-size: 13px; }
@@ -511,7 +508,9 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
   <button type="button" role="tab" data-tab="karten">Karten</button>
   <!--DEV:BEGIN-->
   <button type="button" role="tab" data-tab="kartenplan">Kartenplaner</button>
+  <!--DEV:END-->
   <button type="button" role="tab" data-tab="profil">Profil</button>
+  <!--DEV:BEGIN-->
   <button type="button" role="tab" data-tab="entwicklung">Entwicklung <span class="cnt" id="tab-dev-cnt"></span></button>
   <!--DEV:END-->
 </nav>
@@ -572,14 +571,12 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
     </section>
   </div>
   <!--DEV:END-->
-  <!--DEV:BEGIN-->
   <div class="tab" id="tab-profil" role="tabpanel" hidden>
     <section class="card" id="pf-card" aria-label="Profil-Editor">
       <h2>Profil <span class="muted">ein Serverprofil laden, jeden Wert erklärt bearbeiten, prüfen, speichern &middot; erstellt nur, startet nichts &middot; nur im LAN</span></h2>
       <div id="pf-root"><div class="muted">lädt &hellip;</div></div>
     </section>
   </div>
-  <!--DEV:END-->
   <!--DEV:BEGIN-->
   <div class="tab" id="tab-entwicklung" role="tabpanel" hidden>
   <div class="devhead" id="dev-head"><h2>Entwicklungsstand</h2><span class="muted">nur im Rig-Dashboard; die veröffentlichte fLLiper-Ausgabe (<span class="mono">--edition release</span>) liefert diesen Teil nicht aus &middot; Bereiche auf-/zuklappen, der Zustand bleibt gemerkt</span></div>
@@ -648,11 +645,11 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
 <script src="zoom.js"></script>
 <!--DEV:BEGIN-->
 <script src="kartenplan.js"></script>
+<!--DEV:END-->
 <script src="modellprofil.js"></script>
 <script src="hwprofil.js"></script>
 <script src="profil_balken.js"></script>
 <script src="profil.js"></script>
-<!--DEV:END-->
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);

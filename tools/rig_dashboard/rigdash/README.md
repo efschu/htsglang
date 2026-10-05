@@ -317,6 +317,12 @@ fLLiper-Ausgabe: `server.edition_page` schneidet jeden Block `<!--DEV:BEGIN-->�
 Image-Änderungen, Container, GPU-Fensterplan, Letzte Boots und die LAN-Links. Es bleibt keine leere Hülle.
 `/api/live` antwortet ohne `features`, `image_changes`, `gpuq`; `/api/launch`, `/weg2` und `/api/weg2/*`
 geben 404. Neue Entwicklungsteile gehören in einen DEV-Block (`tests/test_edition_0930.py` prüft das).
+**Ausnahme Profil-Reiter (Nutzer-Entscheid 05.10., Auftrag 1984):** Reiter, Panel, CSS und die Module `profil.js`, `profil_balken.js`,
+`hwprofil.js`, `modellprofil.js` stehen NICHT in einem DEV-Block; `/api/profil/*` (laden, bearbeiten, speichern, exportieren, Trockenlauf,
+Balken-`recompute`), `GET /api/hwprofil` (nur Anzeige, spricht gpuq nicht an) und `/api/modellprofil/*` (liest nur `config.json` und Köpfe
+unter den Modellwurzeln) antworten auch in `release`, weiter nur im LAN (Proxy 403). Rig-Betrieb bleibt zu:
+`POST /api/hwprofil/measure|cancel` (bucht gpuq) 403 mit Klartext, Kartenplaner, Startzeile, `/api/launch`, `/api/weg2/*` 404
+(`tests/test_profil_release_edition_1984.py`).
 
 ### Speicher und Stufen
 
@@ -369,7 +375,7 @@ abgeleiteten Felder einer `form.ModelProfile`-Zeile.  `GET /api/modellprofil/mod
 * **Gelesen wird nur `config.json` und die Kopfzeilen** (8 Byte + JSON je Shard bzw. der GGUF-Kopf), nie ein Gewicht.  Der Pfad muss unter einer
   Modellwurzel liegen (`--model-root`, wiederholbar, oder `RIGDASH_MODEL_ROOTS`; Standard `/spinning/llm_stuff/club-3090/models-cache`); relative
   Pfade, `..`, NUL und Symlinks aus der Wurzel hinaus werden mit 400 abgewiesen.  Antworten werden je Pfad und Dateistand (Größe, mtime) gemerkt.
-* **Nur im LAN und nicht im Release:** über den Proxy 403, Edition `release` 404 (die Route liest Dateien des Hosts).  Körper höchstens 64 KiB.
+* **Nur im LAN** (auch in der Edition `release`, seit 05.10.): über den Proxy 403 (die Route liest Dateien unter den Modellwurzeln).  Körper höchstens 64 KiB.
 * `static/modellprofil.js` (`window.ModellProfil`): `liste()`, `schaetzen(path, opts)`, `zeilen(profil)` (Zeilen `{gruppe, label, wert, roh, src, hinweis}`),
   `tabelle(profil)` (HTML-Baustein, escaped), `bytes(n)`.  Die Oberfläche baut Auftrag 930; dieses Modul zeichnet nichts selbst.
 

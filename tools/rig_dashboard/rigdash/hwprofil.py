@@ -55,6 +55,11 @@ IDLE_RELEASE_S = 180.0
 #: Das Profil ist eine Sicht, die Dateien liest; hier nur gegen Dauerfeuer der offenen Seite.
 VIEW_TTL_S = 4.0
 
+#: Release-Ausgabe (Auftrag 1984): das Hardwareprofil wird nur ANGEZEIGT; Messen bucht ein gpuq-Fenster des Rigs und bleibt zu
+RELEASE_NO_MEASURE = ("Hardware messen braucht gpuq (den Fensterplan des Rigs: es bucht ein Karten-Fenster und startet einen Messlauf) "
+                      "und ist in der Release-Ausgabe gesperrt. Das Hardwareprofil wird hier nur angezeigt.")
+RELEASE_NO_GPUQ = "gpuq gibt es in der Release-Ausgabe nicht (Hardware messen ist dort gesperrt)"
+
 MODULE_REL = os.path.join("sglang", "srt", "rigmon", "hardware_profile.py")
 #: Planer-Bäume, in denen ``hardware_profile.py`` gesucht wird (KARTENPLAN_TREE wie beim Kartenplaner)
 TREE_CANDIDATES = (
@@ -163,7 +168,10 @@ class HwProfil:
         return self.http(method, self.gpuq + path, body, headers)
 
     def gpuq_cards(self) -> dict:
-        """Die Karten des Fensterplans (Index = NVML-Index).  Nie ein Fehler nach außen: ``reachable`` sagt es."""
+        """Die Karten des Fensterplans (Index = NVML-Index).  Nie ein Fehler nach außen: ``reachable`` sagt es.
+        Release-Ausgabe: gpuq wird gar nicht angesprochen."""
+        if self.edition == "release":
+            return {"reachable": False, "error": RELEASE_NO_GPUQ, "cards": []}
         try:
             st, js = self._gq("GET", "/api/v1/cards")
         except GpuqUnavailable as e:
@@ -268,6 +276,8 @@ class HwProfil:
     # ------------------------------------------------------------------ Messen
     def measure(self, req: dict) -> dict:
         """Ergebnis: ``action`` = messung_gestartet | wartet | abgelehnt | laeuft_bereits."""
+        if self.edition == "release":
+            raise ValueError(RELEASE_NO_MEASURE)
         cards = req.get("cards")
         if (not isinstance(cards, list) or not cards or not all(isinstance(c, int) and not isinstance(c, bool) for c in cards)
                 or len(set(cards)) != len(cards)):
@@ -367,6 +377,8 @@ class HwProfil:
 
     # ------------------------------------------------------------------ Zurückgeben
     def cancel(self) -> dict:
+        if self.edition == "release":
+            return {"ok": False, "error": RELEASE_NO_MEASURE}
         with self._lock:
             if self._job.get("state") == "running":
                 return {"ok": False, "error": "Messung läuft; das Fenster geht nach dem Lauf von selbst zurück"}

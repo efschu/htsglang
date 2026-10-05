@@ -241,11 +241,13 @@ class TestRoute(Base):
         st, _, _ = self.call("/api/modellprofil/modelle", headers={"X-Forwarded-Prefix": "/rigdash"})
         self.assertEqual(st, 403)
 
-    def test_not_in_the_release_edition(self):
+    def test_in_the_release_edition_too_but_lan_only(self):
+        # Auftrag 1984: der Reiter Profil kommt ins Release und braucht Schaetzen und Liste (nur Lesen unter den Modellwurzeln)
         self.app.edition = "release"
-        self.assertEqual(self.call("/api/modellprofil/schaetzen", {"path": self.model})[0], 404)
-        self.assertEqual(self.call("/api/modellprofil/modelle")[0], 404)
-        self.assertEqual(self.call("/modellprofil.js")[0], 404)
+        self.assertEqual(self.call("/api/modellprofil/schaetzen", {"path": self.model})[0], 200)
+        self.assertEqual(self.call("/api/modellprofil/modelle")[0], 200)
+        self.assertEqual(self.call("/modellprofil.js")[0], 200)
+        self.assertEqual(self.call("/api/modellprofil/schaetzen", {"path": self.model}, headers={"X-Forwarded-For": "1.2.3.4"})[0], 403)
 
     def test_unknown_post_path_is_404(self):
         self.assertEqual(self.call("/api/modellprofil/anderes", {"x": 1})[0], 404)

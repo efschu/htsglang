@@ -122,7 +122,8 @@ parser must take the active one.
 
 ## Profil-Editor (Auftrag 930, S1)
 
-Reiter **Profil** (nur Edition `rig`, nur im LAN, über den öffentlichen Proxy 403): ein Serverprofil laden (Release-`.env` aus `--profiles-release-dir`
+Reiter **Profil** (beide Ausgaben `rig` und `release` seit Nutzer-Entscheid 05.10., Auftrag 1984; nur im LAN, über den öffentlichen Proxy 403;
+in `release` bleibt Hardware MESSEN gesperrt: es bucht gpuq, 403 mit Klartext, der Knopf fehlt): ein Serverprofil laden (Release-`.env` aus `--profiles-release-dir`
 oder ein eigenes JSON aus `--profile-dir`, Env `FLLIPER_PROFILES_DIR`, Standard `/var/lib/flliper/profiles` -- derselbe Ort, den der Entrypoint liest), jeden Wert mit Erklärung, Herkunft (Profil / Nutzer / Planer / Default),
 Rücksetzknopf und Abhängigkeits-Chips bearbeiten, den Trockenlauf gegen gewählte Karten sehen (Ablehnungen mit Code, Klasse und der Aussage, was
 **Force am Serverstart** damit tut), speichern und als geprüftes `.env` exportieren.

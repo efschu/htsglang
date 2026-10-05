@@ -241,14 +241,16 @@ class TestRoute(unittest.TestCase):
         self.assertIn("Modellwurzel", j["error"])
         self.assertEqual(self.call(port, {"doc": self.DOC, "what": "start"})[0], 400)
 
-    def test_lan_only_and_not_in_the_release_edition(self):
+    def test_lan_only_and_in_the_release_edition_too(self):
+        # Auftrag 1984: die Balken sind Rechnung ohne Rig-Eingriff und kommen mit dem Reiter Profil ins Release (weiter nur LAN)
         port = self.serve(tmp=self.tmp)
         self.assertEqual(self.call(port, {"doc": self.DOC}, headers={"X-Forwarded-For": "1.2.3.4"})[0], 403)
         rel = self.serve("release", tmp=self.tmp)
-        self.assertEqual(self.call(rel, {"doc": self.DOC})[0], 404)
+        self.assertEqual(self.call(rel, {"doc": self.DOC})[0], 200)
+        self.assertEqual(self.call(rel, {"doc": self.DOC}, headers={"X-Forwarded-For": "1.2.3.4"})[0], 403)
         c = http.client.HTTPConnection("127.0.0.1", rel, timeout=30)
         c.request("GET", "/profil_balken.js")
-        self.assertEqual(c.getresponse().status, 404)
+        self.assertEqual(c.getresponse().status, 200)
 
 
 @unittest.skipUnless(NODE, "node fehlt")
@@ -309,7 +311,7 @@ class TestJsApprox(unittest.TestCase):
     def test_the_page_loads_the_module_and_the_tab_draws_the_fold(self):
         html = open(os.path.join(STATIC, "index.html"), encoding="utf-8").read()
         self.assertIn('<script src="profil_balken.js"></script>', S.edition_page(html, "rig"))
-        self.assertNotIn("profil_balken.js", S.edition_page(html, "release"))
+        self.assertIn('<script src="profil_balken.js"></script>', S.edition_page(html, "release"))
         pj = open(os.path.join(STATIC, "profil.js"), encoding="utf-8").read()
         for needle in ('api("recompute"', "ProfilBalken.attach", 'data-fold="bars"', "setTimeout(recompute, 300)"):
             self.assertIn(needle, pj)

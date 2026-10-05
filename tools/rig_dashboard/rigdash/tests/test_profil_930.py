@@ -8,7 +8,7 @@ Gepinnt:
     traegt Klasse, Begruendung und die Aussage, was Force beim Serverstart tut; HW-ARCH ist nicht forcebar. Das Dashboard hat KEINEN
     Force-Schalter und keine Start-Route.
   * Nutzerprofile liegen als JSON im Profilverzeichnis; ungueltige Namen werden abgewiesen (kein Pfadausbruch).
-  * Routen: im LAN erreichbar, ueber den oeffentlichen Proxy 403, in der Release-Ausgabe 404.
+  * Routen: im LAN erreichbar, ueber den oeffentlichen Proxy 403; die Release-Ausgabe hat den Editor seit 05.10. auch (Auftrag 1984).
 """
 
 import http.client
@@ -281,25 +281,28 @@ class Routes(unittest.TestCase):
         self.assertEqual(self.call(port, "POST", "/api/profil/start", {})[0], 404)
         self.assertEqual(self.call(port, "POST", "/api/other", {})[0], 404)
 
-    def test_public_proxy_is_refused_and_release_edition_has_no_editor(self):
+    def test_public_proxy_is_refused_and_release_edition_has_the_editor(self):
         port = self.serve("rig")
         px = {"X-Forwarded-For": "1.2.3.4"}
         self.assertEqual(self.call(port, "GET", "/api/profil/list", headers=px)[0], 403)
         self.assertEqual(self.call(port, "POST", "/api/profil/load", {"kind": "release", "name": "demo"}, headers=px)[0], 403)
         self.assertEqual(self.call(port, "POST", "/api/profil/save", {"doc": {}, "name": "x"}, headers=px)[0], 403)
+        # Nutzer-Entscheid 05.10. (Auftrag 1984): der Editor kommt ins Release, im LAN erreichbar, ueber den Proxy weiter zu
         rel = self.serve("release")
-        self.assertEqual(self.call(rel, "GET", "/api/profil/list")[0], 404)
-        self.assertEqual(self.call(rel, "GET", "/api/profil/modelle")[0], 404)
+        self.assertEqual(self.call(rel, "GET", "/api/profil/list")[0], 200)
+        self.assertEqual(self.call(rel, "GET", "/api/profil/modelle")[0], 200)
+        self.assertEqual(self.call(rel, "POST", "/api/profil/load", {"kind": "release", "name": "demo"})[0], 200)
+        self.assertEqual(self.call(rel, "GET", "/api/profil/list", headers=px)[0], 403)
         self.assertEqual(self.call(port, "GET", "/api/profil/modelle", headers=px)[0], 403)
-        self.assertEqual(self.call(rel, "POST", "/api/profil/load", {})[0], 404)
-        self.assertEqual(self.call(rel, "GET", "/profil.js")[0], 404)
+        self.assertEqual(self.call(rel, "GET", "/profil.js")[0], 200)
 
-    def test_edition_page_carries_the_tab_only_in_rig(self):
+    def test_edition_page_carries_the_tab_in_both_editions(self):
         html = open(os.path.join(os.path.dirname(HERE), "static", "index.html"), encoding="utf-8").read()
         self.assertIn('data-tab="profil"', S.edition_page(html, "rig"))
         rel = S.edition_page(html, "release")
         for needle in ('data-tab="profil"', "pf-root", "profil.js"):
-            self.assertNotIn(needle, rel)
+            self.assertIn(needle, rel)
+        self.assertNotIn('data-tab="kartenplan"', rel)      # der Planer bleibt Entwicklungsstand
 
     def test_answers_pass_the_secret_guard(self):
         port = self.serve("rig")

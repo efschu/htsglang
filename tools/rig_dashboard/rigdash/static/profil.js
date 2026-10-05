@@ -187,7 +187,7 @@
   let hwEl = null;
   function drawHardware() {
     if (!window.HwProfil) return "";
-    if (!hwEl) { hwEl = document.createElement("div"); window.HwProfil.mount(hwEl); }
+    if (!hwEl) { hwEl = document.createElement("div"); window.HwProfil.mount(hwEl, { edition: document.documentElement.getAttribute("data-edition") || "rig" }); }
     return `<details class="pf-fold" data-fold="hw" ${isOpen("hw", false) ? "open" : ""}><summary><b>Hardware</b> · Karten und Messwerte (Hardwareprofil lesen, im gebuchten gpuq-Fenster messen)</summary><div id="pf-hwroot"></div></details>`;
   }
   // ------------------------------------------------------------------ Balken (Auftrag 1432, S4b)

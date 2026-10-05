@@ -429,12 +429,17 @@ class TestHttpRoutes(Base):
             self.assertEqual(st, 403, path)
         self.assertEqual(self.gq.calls("POST", "/api/v1/bookings"), [])
 
-    def test_release_edition_serves_neither_routes_nor_script(self):
+    def test_release_edition_shows_but_never_measures(self):
+        # Auftrag 1984: Anzeige (GET) und Skript auch im Release; Messen und Fenster zurueckgeben bucht gpuq: dort 403, keine Buchung
         srv = _serve(_App(self.hw, "release"))
         self.addCleanup(srv.shutdown)
-        self.assertEqual(_req(srv, "GET", "/api/hwprofil")[0], 404)
-        self.assertEqual(_req(srv, "POST", "/api/hwprofil/measure", {"cards": [1]})[0], 404)
-        self.assertEqual(_req(srv, "GET", "/hwprofil.js")[0], 404)
+        self.assertEqual(_req(srv, "GET", "/api/hwprofil")[0], 200)
+        self.assertEqual(_req(srv, "GET", "/hwprofil.js")[0], 200)
+        for path, body in (("/api/hwprofil/measure", {"cards": [1]}), ("/api/hwprofil/cancel", {})):
+            st, txt, _ = _req(srv, "POST", path, body)
+            self.assertEqual(st, 403, path)
+            self.assertIn("gpuq", json.loads(txt)["error"])
+        self.assertEqual(self.gq.calls("POST", "/api/v1/bookings"), [])
 
     def test_the_script_is_served_in_the_rig_edition(self):
         st, body, h = _req(self.srv, "GET", "/hwprofil.js")
