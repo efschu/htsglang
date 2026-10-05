@@ -20761,6 +20761,10 @@ class Scheduler(
                 # the pools since, REUSE that round: no second bind, move,
                 # reset_keep, allocator re-arm or keep arm -- only stamp the
                 # release's flip epoch into the published manifest.
+                # L15-NOPARK-INIT: idle D never parked -> weg2_d_parked None ->
+                # this whole block skipped; [] = the state a park leaves behind
+                # (master + SGLANG_WEG2_L15_NOPARK_INIT + group D, never dual)
+                l15_plan.noparkinit_apply(self, os.environ)
                 _l15_reuse = (
                     l15_sleep_once.reusable(self)
                     if l15_plan.master_on(os.environ)

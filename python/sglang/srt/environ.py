@@ -1058,6 +1058,15 @@ class Envs:
     # fallback. Q2: the cap-0 rank's L2 duty (post_vote) stays. Default off = the
     # S2 path (or today's per-card path when POOL is off) byte for byte.
     SGLANG_WEG2_L15_POOL_S3 = EnvBool(False)
+    # L15-NOPARK-INIT (desk 2018, docs: deskq/done/2017): an idle D never runs
+    # park_running, so weg2_d_parked stays None and the whole L15 retain block of
+    # the D sleep flush (reuse / SLEEP-AGREE / TREE-CAND / retain / KEEP-CLEAR) is
+    # skipped (boot 1736: 0 of 42 flips). On (with SGLANG_WEG2_L15=1, group D, not
+    # --dual-layout): the sleep flush sets weg2_d_parked = [] (the state a park
+    # leaves behind) before the block. Only in the L15 path; default off = flip and
+    # dual path without L15 byte for byte today's. Read by the ranks through
+    # l15_plan.noparkinit_apply(os.environ) (1/true/on).
+    SGLANG_WEG2_L15_NOPARK_INIT = EnvBool(False)
     # L15-POOL S4 (docs/L15-POOL-ENTWURF-1004.md sec 1.2/3.3/4.5/5.2 N4/7, KV AND
     # END anchor = a WHOLE request): part switch ON TOP of SGLANG_WEG2_L15_POOL and
     # SGLANG_WEG2_L15_POOL_S3 (S4 without them is refused by name,
