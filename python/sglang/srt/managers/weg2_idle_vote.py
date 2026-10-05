@@ -109,7 +109,19 @@ logger = logging.getLogger(__name__)
 #: The vote's own point-to-point stream.  NOT tag 0: that pair already carries
 #: the ``pp_typed_channel`` proxy/output messages, which are demultiplexed in
 #: band rather than by tag, so a standing frame there would misframe them.
-WEG2_VOTE_TAG = 1268
+#:
+#: 1538 (latent gloo tag clash, boot fs10052155 / int8abn-tod-1005): NOT a small
+#: number either.  ``torch.distributed.monitored_barrier`` on the same world cpu
+#: group (the Weg-2 group fence) sends/receives on the RAW slot
+#: ``collectiveCounter_`` (``t1``, ``t2``; the counter grows by 4 per fence), so a
+#: fixed tag below the counter's reachable range is hit sooner or later.  A home
+#: receive outstanding while ``t1 == WEG2_VOTE_TAG`` would take PP(last)'s
+#: barrier send, or the vote object would be taken by PP0's barrier recv.
+#: Collective slots are ``prefix << 56 | tag << 24`` and cannot collide with a raw
+#: tag below 2**32, so only the p2p tags need the shift.  Every fixed p2p tag on
+#: that group lives at or above ``FIXED_P2P_TAG_BASE``.
+FIXED_P2P_TAG_BASE = 1 << 30
+WEG2_VOTE_TAG = FIXED_P2P_TAG_BASE + 1268
 
 #: One bounded step of the home receive per pass.  Small on purpose: this is a
 #: poll that must never become a wait (see the module docstring on why a

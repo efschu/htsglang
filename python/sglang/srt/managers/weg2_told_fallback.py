@@ -83,6 +83,8 @@ import pickle
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from sglang.srt.managers.weg2_idle_vote import FIXED_P2P_TAG_BASE
+
 logger = logging.getLogger(__name__)
 
 ENV_FALLBACK = "SGLANG_WEG2_TOLD_GROUP_FALLBACK"
@@ -97,7 +99,12 @@ TOTAL_S_DEFAULT = 16.0
 
 #: the ack stream's own point-to-point tag (1268 = idle vote, 580 = the
 #: prefetch vote collective, 0 = the typed proxy/output channel).
-WEG2_TOLD_ACK_TAG = 1416
+#: 1538: shifted above ``FIXED_P2P_TAG_BASE`` (see ``weg2_idle_vote``): the
+#: group fence's ``monitored_barrier`` uses the collective counter as a raw p2p
+#: slot on this same world cpu group, and at ``t1 == 1416`` PP0's standing ack
+#: frames swallowed both followers' barrier messages (fence #337, boot
+#: fs10052155, 27B with PF on).
+WEG2_TOLD_ACK_TAG = FIXED_P2P_TAG_BASE + 1416
 #: wire markers: INSTANCE attributes, present only on the armed path.
 WIRE_ACK = "ack"
 WIRE_FALLBACK = "fallback"
