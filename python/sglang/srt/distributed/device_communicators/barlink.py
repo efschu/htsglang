@@ -1392,6 +1392,7 @@ class BarlinkCommunicator:
         output_split_sizes=None,
         input_split_sizes=None,
         largest_block_rows=None,
+        select_bytes=None,
     ) -> torch.Tensor:
         """``torch.distributed.all_to_all_single`` over barlink.
 
@@ -1471,7 +1472,13 @@ class BarlinkCommunicator:
         recv_bytes = [n * row_bytes for n in out_rows]
         nbytes = sum(send_bytes)
 
-        t = self._select("all_to_all", nbytes)
+        # L15-park (1780/1800): ``select_bytes`` is a caller-known, RANK-UNIFORM
+        # figure for the transport choice. ``nbytes`` above is this rank's own
+        # send sum -- 0 on every non-source rank of a one-to-one park chunk --
+        # so the choice (BAR1 + group_max vs. the gloo fallback) would differ per
+        # rank, two different gloo collectives that never pair. None = as before.
+        t = self._select(
+            "all_to_all", nbytes if select_bytes is None else int(select_bytes))
         if t is not None and not (
             hasattr(t, "barlink_all_to_all_single") and hasattr(t, "supports_a2a")
         ):

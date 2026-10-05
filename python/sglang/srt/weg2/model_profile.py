@@ -1251,6 +1251,8 @@ FIELD_CLASS: Dict[str, Tuple[str, str]] = {
     "d_token_placement": ("policy", "Zeile 24b: 27B INT8 Bandbreite"), "d_token_placement_formats": ("policy", "Zeile 24b: 27B INT8"),
     "group_switch_defaults": ("policy", "Leistungsschalter NF (a): Gruppenschalter, wie die Linie lief"),
     "d_kv_token_cut": ("policy", "#239: NF 'owned'"), "handback_claim_n": ("policy", "HANDBACK N-1: 27B"),
+    # INT8-Fixsatz (cand2-Merge 1005): Q-711 SHORT-KEPT-BOUND kam als ModelProfile-Feld in ``form.ModelProfile``
+    "short_kept_max_wait_s": ("policy", "Q-711 SHORT-KEPT-BOUND: 27B-Zeile 30 s, NF 0 (aus), SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S"),
 }
 
 #: Standard der erzeugten Zeile für Pflichtfelder der Klasse ``policy`` (jedes andere Feld nimmt den Dataclass-Standard, Schalter aus)

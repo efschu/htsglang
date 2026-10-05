@@ -84,7 +84,10 @@ from sglang.srt.weg2 import (
     DEFAULT_P_BS,
     DEFAULT_PP_ORDERED_CUT,
 )
+from sglang.srt.weg2 import pp_ordered_cut_for as weg2_pp_ordered_cut_for
 from sglang.srt.weg2 import admin_key as admin_key_mod
+from sglang.srt.weg2 import bar1_windows as bar1_windows_mod
+from sglang.srt.weg2 import inventory_view as inventory_view_mod
 from sglang.srt.weg2 import budget_rest as _budget_rest
 from sglang.srt.weg2 import rank_state as rank_state_mod
 from sglang.srt.weg2 import shared_cache_release as shared_cache_release_mod
@@ -113,6 +116,7 @@ from sglang.srt.weg2 import (
     corridor_budget,
     host_ledger,
     l15_plan,
+    l15_pool_peak,
     card_identity,
     refusals,
     ring_table,
@@ -1188,7 +1192,7 @@ def _p_prefill_graph_decide(cal) -> None:
     policy, bucket = str(g["policy"]), int(g["bucket"])
     try:
         captured, verdicts = _pgp.decide(policy, bucket, g["tiny"], g["extras"], cal,
-                                         P_PREFILL_GRAPH_STAGES, float(g["min_gain"]))
+                                         p_group_stages(), float(g["min_gain"]))
     except _pgp.GraphPolicyError as exc:
         raise SystemExit(str(exc))
     g.update(
@@ -1414,8 +1418,22 @@ def p_prefill_graph_flags() -> List[str]:
 #: that is already in the cuda_graph tag (SGLANG_FULL_CG_PREFILL_SHARED_
 #: WORKSPACE). The task's own forecast was ~0.1 GiB per stage.
 P_PREFILL_GRAPH_POOL_MIB_PER_512 = 160.0
-#: Group P's stage count (argv_p ships --pp-size 3).
+#: Group P's stage count on the reference rig (argv_p ships --pp-size <N>; N = 3).
 P_PREFILL_GRAPH_STAGES = 3
+
+
+def p_group_stages() -> int:
+    """HW-P1c 1003: group P's stage count = the launch's card count (one stage
+    per card). :data:`P_PREFILL_GRAPH_STAGES` (3) wherever NVML cannot say, so
+    the reference rig and every desk test read what they always read."""
+    live = _live_inventory_or_none()
+    if not live:
+        return P_PREFILL_GRAPH_STAGES
+    # only a launch the inventory check will DERIVE (a subset of the calibrated
+    # cards) changes the table; a foreign inventory keeps the three-stage tables
+    # and meets the named HW-COUNT / HW-UNCALIBRATED refusal in main first
+    cal, _ = records_inventory(weg2_form.DEFAULT_PROFILE)
+    return len(live) if inventory_view_mod.is_subset(live, cal) else P_PREFILL_GRAPH_STAGES
 
 
 def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
@@ -1429,11 +1447,11 @@ def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
     if raw:
         vals = tuple(float(x) for x in raw.split(",") if x.strip())
         if len(vals) == 1:
-            vals = vals * P_PREFILL_GRAPH_STAGES
-        if len(vals) != P_PREFILL_GRAPH_STAGES or any(v < 0 for v in vals):
+            vals = vals * p_group_stages()
+        if len(vals) != p_group_stages() or any(v < 0 for v in vals):
             raise SystemExit(
                 f"--p-prefill-graph-pool-mib {raw!r}: one value or "
-                f"{P_PREFILL_GRAPH_STAGES} non-negative per-stage values expected"
+                f"{p_group_stages()} non-negative per-stage values expected"
             )
         return vals
     # Tiny buckets (--p-prefill-graph-tiny) are priced proportionally on top:
@@ -1442,7 +1460,7 @@ def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
     # reuse its blocks; the rank line 'PREFILL-GRAPH captured ... capture_mib='
     # measures all buckets together and replaces this via the flag above.
     est = P_PREFILL_GRAPH_POOL_MIB_PER_512 * float(sum(p_prefill_graph_buckets())) / 512.0
-    return (est,) * P_PREFILL_GRAPH_STAGES
+    return (est,) * p_group_stages()
 
 
 #: --p-deep-split-from (27B line, 2026-09-24): 0 = off, the default.
@@ -1748,8 +1766,30 @@ def _p_chunk_interp(curve: Dict[int, float], m: int) -> float:
     return 1.0
 
 
-def p_chunk_stage_model(src: str, mscale: str, stages: int = 3):
-    """``(stage models, source text)`` for --p-chunk-model / --p-chunk-mscale."""
+def _p_chunk_by_class(items, key, stages: int, profile: Optional[str]):
+    """HW-P1c 1003: the reference stage tables (one entry per calibrated card)
+    for a P group of ``stages`` stages on a SUBSET of those cards: each live
+    stage takes the SLOWEST (by ``key``) calibrated stage of its card class.
+    ``(mapped items, the reference index each live stage took)``; ``None`` when
+    there is nothing to map (same count) or no mapping exists."""
+    items = tuple(items)
+    if int(stages) == len(items):
+        return None
+    prof = str(profile or weg2_form.DEFAULT_PROFILE)
+    cal, _ = records_inventory(prof)
+    live = _live_inventory_or_none()
+    if not live or len(live) != int(stages) or len(cal) != len(items):
+        return None
+    if not inventory_view_mod.is_subset(live, cal):
+        return None
+    idx = tuple(max((i for i, k in enumerate(cal) if k == c), key=lambda i: key(items[i])) for c in live)
+    return tuple(items[i] for i in idx), idx
+
+
+def p_chunk_stage_model(src: str, mscale: str, stages: int = 3, profile: Optional[str] = None):
+    """``(stage models, source text)`` for --p-chunk-model / --p-chunk-mscale.
+    ``stages`` != the reference table's three: the table is mapped to the live
+    stages by card class (:func:`_p_chunk_by_class`), else refused as before."""
     from sglang.srt.weg2 import p_chunk_policy as _pcp
 
     src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
@@ -1782,14 +1822,26 @@ def p_chunk_stage_model(src: str, mscale: str, stages: int = 3):
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise SystemExit(f"--p-chunk-model {src}: not builtin-int8, fit:<P.log> or a "
                              f"readable JSON with 'stages': {exc}")
+        mapped = _p_chunk_by_class(models, lambda m: float(m.points[-1][1]), stages, profile)
+        if mapped is not None:
+            import dataclasses
+
+            return tuple(dataclasses.replace(m, name=f"PP{j}") for j, m in enumerate(mapped[0])), (
+                f"json:{os.path.basename(src)} (HW-DERIVE: {len(models)} -> {stages} stages by card class)")
         if len(models) != stages:
             raise SystemExit(f"--p-chunk-model {src}: {len(models)} stages, group P has {stages}")
         return models, f"json:{os.path.basename(src)}"
+    curve_of = list(range(len(rows)))   # the chunk-scale curve follows the CARD, not the stage index
+    mapped_rows = _p_chunk_by_class(
+        rows, lambda r: float(r["a_ms"]) + 4.0 * float(r["b_ms_per_1k"]), stages, profile)
+    if mapped_rows is not None:
+        rows, curve_of = mapped_rows[0], list(mapped_rows[1])
+        source += f" (HW-DERIVE: stage table mapped to {stages} stages by card class)"
     if len(rows) != stages:
         raise SystemExit(f"--p-chunk-model {src}: {len(rows)} stages, group P has {stages}")
     models = tuple(
         _p_chunk_stage(r["a_ms"], r["b_ms_per_1k"], r["fwd_overhead_ms"], r["eager_floor_ms"],
-                       curves[min(i, len(curves) - 1)], f"PP{i}")
+                       curves[min(curve_of[i], len(curves) - 1)], f"PP{i}")
         for i, r in enumerate(rows)
     )
     return models, source
@@ -1833,7 +1885,8 @@ def apply_p_chunk_policy(ns, boot_form=None, argv_words: Sequence[str] = ()) -> 
     models, source = p_chunk_stage_model(
         str(getattr(ns, "p_chunk_model", P_CHUNK_MODEL_DEFAULT) or P_CHUNK_MODEL_DEFAULT),
         str(getattr(ns, "p_chunk_mscale", P_CHUNK_MSCALE_DEFAULT) or P_CHUNK_MSCALE_DEFAULT),
-        P_PREFILL_GRAPH_STAGES,
+        p_group_stages(),
+        profile=getattr(ns, "profile", None),
     )
     # --p-prefill-graph-policy: the plan prices every width in the mode the
     # policy decided (graph or eager), from the SAME calibration table. No
@@ -4093,6 +4146,7 @@ def d_hold_active(d_hold_s: Optional[float]) -> bool:
 
 def resolve_pool_floor(
     override: Optional[int],
+    n_stages: Optional[int] = None,
 ) -> Tuple[Optional[int], Optional[Tuple[int, ...]], str]:
     """The P-cut POOL FLOOR's SOURCE and its RULE LINE -- before the solve.
 
@@ -4127,6 +4181,16 @@ def resolve_pool_floor(
     ``--pp-solve-objective`` ranks over.
     """
     cut_s = ",".join(str(n) for n in DEFAULT_PP_ORDERED_CUT)
+    if override is None and n_stages is not None and weg2_pp_ordered_cut_for(n_stages) is None:
+        # HW-P1c 1003 (PP-CUT-FLOOR): the ordered cut is a user order for THREE
+        # stages; a P group of another size has no order and no floor.
+        return None, None, (
+            f"pool_floor=none source=n-stages ({int(n_stages)} stages) -- the shipped default "
+            f"(the floor of the ordered cut {cut_s}, user order 2026-09-09) is a "
+            f"{len(DEFAULT_PP_ORDERED_CUT)}-stage cut and names no floor for {int(n_stages)}; the "
+            f"cut is SOLVED over the unfloored makespan (planner/pp_cut.py), as with "
+            f"--pp-solve-pool-floor 0. --pp-solve-pool-floor N still overrides"
+        )
     if override is None:
         return None, tuple(int(n) for n in DEFAULT_PP_ORDERED_CUT), (
             f"source=default-from-ordered-cut {cut_s} -- the SHIPPED default, user "
@@ -5099,6 +5163,10 @@ COLLECTIVE_CENSUS_INTERVAL = 50
 #: carve-out. It is cited here so P's window is not the one number in this file
 #: a reader has to go looking for.
 P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
+#: Group D's BAR1 windows (#1234 C1, the derivation lives at argv_d): the
+#: default of --d-barlink-bar1-window-mib (HW-P1c: derived per N by
+#: weg2/bar1_windows.py; this value is the N = 3 / 256 MiB BAR measurement).
+D_BARLINK_BAR1_WINDOW_MIB = "16,TP_0=32,DCP_0=40"
 #: Group P's device mamba pool (--max-mamba-cache-size); see argv_p.
 P_MAX_MAMBA_CACHE_SIZE = 24
 #: H92c: the runtime's HARD FLOOR per running P request on P's posture
@@ -5948,13 +6016,55 @@ def calibrated_inventory(ns) -> Tuple[Tuple[str, ...], str]:
     return records_inventory(str(prof))
 
 
-def inventory_check_line(ns, cards: Sequence["Card"]) -> str:
+def derivation_assessment(ns, cards: Sequence["Card"],
+                          environ: Optional[Mapping[str, str]] = None):
+    """HW-P1c 1003: can the profile's positional records and vectors be DERIVED
+    for the live inventory (weg2/inventory_view.py)? ``None`` when there is
+    nothing to derive (the live inventory IS the calibrated one, or the
+    operator named the vectors' inventory with ``--profile-inventory``);
+    else ``(subset, records_ok, underivable_records, underivable_vectors,
+    l15_underivable)``."""
+    from sglang.srt.weg2 import inventory_view as _iv
+    from sglang.srt.weg2 import profile_records as _pr
+
+    env = os.environ if environ is None else environ
+    prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
+    rec_inv, _ = records_inventory(prof)
+    vec_inv, vec_src = calibrated_inventory(ns)
+    live = tuple(card_identity.inventory_signature(cards))
+    if vec_src == "--profile-inventory" or live == tuple(rec_inv):
+        return None
+    pos = [(r.name, r.value) for r in _pr.records(prof) if _pr.is_positional(r.value, len(rec_inv))]
+    asm = _iv.assess_records(pos, tuple(rec_inv), live)
+    vec_bad = sorted(k for k, c in positional_vector_lengths(ns).items()
+                     if int(c) != len(live) and not _iv.vector_derivable(k, int(c), tuple(vec_inv), live))
+    l15_bad = []
+    if l15_plan.master_on(env):
+        mib = str(env.get(l15_plan.L15_MIB_ENV, "") or "")
+        try:
+            mode, posts = l15_plan.parse_l15_mib(mib)
+        except ValueError:
+            mode, posts = "auto", {}
+        if mode == "override" and not _iv.l15_derivable(mib, tuple(rec_inv), live):
+            l15_bad = [l15_plan.L15_MIB_ENV]
+    return asm.subset, asm.derivable + asm.exempt, list(asm.underivable), vec_bad, l15_bad
+
+
+def inventory_check_line(ns, cards: Sequence["Card"],
+                         environ: Optional[Mapping[str, str]] = None) -> str:
     """The HW-INVENTORY line; raises Weg2LaunchRefused (HW-UNCALIBRATED) when
     the live ordered inventory is not the one the profile's positional
     measured RECORDS were taken on, or not the one its positional VECTORS
     (argv/env, ``--profile-inventory``) were written for. Two checks: a
     profile that names a foreign inventory does not make the reference
-    rig's records hold there."""
+    rig's records hold there.
+
+    HW-P1c 1003: a live inventory that is a SUBSET of the calibrated one (every
+    live card has its own measured twin of its class, e.g. 5090 + 3080 or
+    3080 + 3080 of [RTX5090, RTX3080, RTX3080]) is not refused when every
+    positional value has a derivation (weg2/inventory_view.py): the line says
+    DERIVED and :func:`apply_inventory_derivation` installs the values. Only
+    what cannot be derived is refused, and only that is named."""
     from sglang.srt.weg2 import profile_records as _pr
 
     prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
@@ -5973,7 +6083,23 @@ def inventory_check_line(ns, cards: Sequence["Card"]) -> str:
         if m is not None:
             msgs.append(m)
     else:
-        m = card_identity.uncalibrated_message(cards, rec_inv, rec_what + vec_what,
+        da = derivation_assessment(ns, cards, environ)
+        what = rec_what + vec_what
+        if da is not None:
+            subset, ok, bad_rec, bad_vec, bad_l15 = da
+            if subset and not (bad_rec or bad_vec or bad_l15):
+                return ("HW-INVENTORY " + "; ".join(f"ordinal {i}: {card_identity.describe(c)}"
+                                                    for i, c in enumerate(cards))
+                        + f" -- calibrated inventory [{','.join(rec_inv)}] ({rec_src}): the live cards "
+                        f"are a SUBSET of it (each has a measured twin of its class), positional "
+                        f"values DERIVED not measured: records {', '.join(ok) or '(none)'}; vectors "
+                        f"{', '.join(sorted(positional_vector_lengths(ns))) or '(none)'}"
+                        + ("; L15 posts" if l15_plan.master_on(os.environ if environ is None else environ) else "")
+                        + " (weg2/inventory_view.py; the first boot on these cards is the "
+                        "measurement) DERIVED")
+            if subset:
+                what = bad_rec + bad_vec + bad_l15
+        m = card_identity.uncalibrated_message(cards, rec_inv, what,
                                                f"profile {prof!r} ({rec_src})")
         if m is not None:
             msgs.append(m)
@@ -5985,6 +6111,182 @@ def inventory_check_line(ns, cards: Sequence["Card"]) -> str:
             + f" -- calibrated inventory [{','.join(rec_inv)}] ({rec_src}"
             + (f"; vectors: {vec_src}" if vec_src == "--profile-inventory" else "")
             + (") MISMATCH (--force)" if msgs else ") MATCH"))
+
+
+def apply_bar1_windows(ns, cards: Sequence["Card"], log=None) -> Optional[str]:
+    """HW-P1c 1003 (BAR1-WINDOW): the group windows for THIS card count and the
+    MEASURED BAR1 of the cards (weg2/bar1_windows.py). Only the untouched
+    defaults (and the dual default) are replaced; an operator's explicit
+    window is kept. N = 3 on 256 MiB BARs: the shipped windows, no line."""
+    n = len(cards)
+    if n in _topo.PROVEN_CARD_COUNTS:
+        return None   # the proven layout is not re-judged: the shipped windows stand byte for byte
+    dual = bool(getattr(ns, "dual_layout", False) or getattr(ns, "dual_share", False))
+    p_cur = str(getattr(ns, "p_barlink_bar1_window_mib", P_BARLINK_BAR1_WINDOW_MIB))
+    d_cur = str(getattr(ns, "d_barlink_bar1_window_mib", D_BARLINK_BAR1_WINDOW_MIB))
+    p_default = p_cur in (P_BARLINK_BAR1_WINDOW_MIB, DUAL_P_BARLINK_BAR1_WINDOW_MIB)
+    d_default = d_cur == D_BARLINK_BAR1_WINDOW_MIB
+    pl = bar1_windows_mod.plan(
+        n, [getattr(c, "bar1_total_mib", None) for c in cards], dual=dual,
+        p_base=p_cur if not p_default else (DUAL_P_BARLINK_BAR1_WINDOW_MIB if dual else None),
+        d_base=d_cur if not d_default else None)
+    if not pl.ok:
+        raise Weg2LaunchRefused(f"BAR1-WINDOW: {pl.why}")
+    changed = (pl.p != p_cur and p_default) or (pl.d != d_cur and d_default)
+    if p_default:
+        ns.p_barlink_bar1_window_mib = pl.p
+    if d_default:
+        ns.d_barlink_bar1_window_mib = pl.d
+    if changed or pl.usable_mib is None and n != _topo.PROVEN_CARD_COUNTS[0]:
+        line = pl.line()
+        if log is not None:
+            log(line)
+        return line
+    return None
+
+
+def configure_xchg_region(n_cards: int, log=None) -> None:
+    """HW-P1c 1003 (XCHG-REGION): lay the host exchange region out for ``n_cards``
+    in THIS process (the ranks learn N from the env var ``prepare_region``
+    publishes). N = 3: no-op."""
+    if int(n_cards) == weight_exchange_region.DEFAULT_N_CARDS:
+        weight_exchange_region.configure(weight_exchange_region.DEFAULT_N_CARDS)
+        return
+    prev = weight_exchange_region.configure(int(n_cards))
+    if log is not None:
+        log(f"WEG2-XCHG-REGION geometry for {int(n_cards)} cards (was {prev}): "
+            f"{weight_exchange_region.N_PAIRS} directed cross pairs, "
+            f"{weight_exchange_region.REGION_BYTES / (1 << 20):.0f} MiB, data offset "
+            f"{weight_exchange_region.DATA_OFF // (1 << 20)} MiB; ranks read "
+            f"{weight_exchange_region.ENV_N_CARDS}")
+
+
+def _derive_csv(policy: str, text: str, calibrated: Sequence[str], live: Sequence[str]) -> Optional[str]:
+    """A 'a,b,c' vector under a derivation policy, as 'a,b' text; None when not derivable."""
+    from sglang.srt.weg2 import inventory_view as _iv
+
+    got = _iv.derive_vector(policy, str(text), tuple(calibrated), tuple(live))
+    return None if got is None else (got if isinstance(got, str) else ",".join(str(x) for x in got))
+
+
+def apply_inventory_derivation(ns, cards: Sequence["Card"], log=None,
+                               environ: Optional[Dict[str, str]] = None) -> List[str]:
+    """HW-P1c 1003 (PROFILE-VECTORS / RECORDS-NVEC / L15-POSTS / PP-CUT-PIN):
+    install the values :func:`inventory_check_line` called DERIVED, for a live
+    inventory that is a subset of the calibrated one. ONE ``HW-DERIVE`` line
+    per value (the old text, the new text, the rule); the profile's records
+    are read derived from here on (``form.profile_constant``). Returns the
+    lines (also ``log``-ged). No-op for the calibrated inventory itself (the
+    reference rig: nothing changes) and for an underivable one (the check
+    already refused)."""
+    from sglang.srt.weg2 import inventory_view as _iv
+
+    env = os.environ if environ is None else environ
+    lines: List[str] = []
+
+    def note(msg: str) -> None:
+        lines.append(msg)
+        if log is not None:
+            log(msg)
+
+    da = derivation_assessment(ns, cards, env)
+    if da is None:
+        _iv.clear_active()
+        return lines
+    subset, _ok, bad_rec, bad_vec, bad_l15 = da
+    if not subset or bad_rec or bad_vec or bad_l15:
+        _iv.clear_active()
+        return lines
+    prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
+    cal, _ = records_inventory(prof)
+    vcal, _ = calibrated_inventory(ns)
+    live = tuple(card_identity.inventory_signature(cards))
+    _iv.set_active(prof, tuple(cal), live)
+    n = len(live)
+    defaults = build_parser().parse_args(["--tree", "/", "--tag", "x"])
+    head = f"HW-DERIVE [{','.join(cal)}] -> [{','.join(live)}]"
+    # 1. launcher flags that carry a per-card vector or a pinned P cut
+    for dest in _TOPOLOGY_VECTOR_FLAGS:
+        flag = "--" + dest.replace("_", "-")
+        pol = _iv.FLAG_POLICY.get(flag)
+        v = getattr(ns, dest, None)
+        if pol is None or v in (None, "", [], ()) or v == getattr(defaults, dest, None):
+            continue
+        cnt = _vector_len(v if isinstance(v, str) else ",".join(str(x) for x in v))
+        if cnt is None or cnt == n:
+            continue
+        if pol == _iv.CUT_PIN:
+            setattr(ns, dest, getattr(defaults, dest, None))
+            note(f"{head} {flag} {v}: a P cut pinned for {cnt} stages does not hold for P = PP{n} "
+                 "-> DROPPED, the planner's cut solver (planner/pp_cut.py) derives the cut")
+            continue
+        got = _derive_csv(pol, v, vcal, live)
+        if got is not None:
+            setattr(ns, dest, got)
+            note(f"{head} {flag} {v} -> {got} ({pol} by card class)")
+    # 2. record-fed launcher flags (the profile default put the 3-vector there)
+    for dest, rec in _iv.RECORD_FLAGS.items():
+        v = getattr(ns, dest, None)
+        pol = _iv.RECORD_POLICY.get(rec)
+        if v in (None, "") or pol is None:
+            continue
+        cnt = _vector_len(str(v))
+        if cnt is None or cnt == n:
+            continue
+        got = _derive_csv(pol, str(v), cal, live)
+        if got is not None:
+            setattr(ns, dest, got)
+            note(f"{head} --{dest.replace('_', '-')} {v} -> {got} (record {rec}, {pol})")
+    # 3. --env-p/-d tokens (K=V;K=V): per-card vectors with a policy
+    for key in ("env_p", "env_d"):
+        spec = str(getattr(ns, key, "") or "")
+        if not spec:
+            continue
+        envd = parse_group_env(spec)
+        for tok, pol in _iv.FLAG_POLICY.items():
+            if tok.startswith("--") or tok not in envd:
+                continue
+            cnt = _vector_len(envd[tok])
+            if cnt is None or cnt == n:
+                continue
+            got = _derive_csv(pol, envd[tok], vcal, live)
+            if got is not None:
+                setattr(ns, key, set_group_env(getattr(ns, key, ""), tok, got))
+                note(f"{head} --{key.replace('_', '-')} {tok}={envd[tok]} -> {got} ({pol} by card class)")
+    # 4. cut pins inside --extra-p/-d words
+    for key in ("extra_p", "extra_d"):
+        blob = str(getattr(ns, key, "") or "")
+        if not blob:
+            continue
+        try:
+            words = shlex.split(blob)
+        except ValueError:
+            continue
+        out: List[str] = []
+        i = 0
+        dropped = []
+        while i < len(words):
+            w = words[i]
+            if w in ("--pp-stage-ratio", "--pp-attn-stage-ratio") and i + 1 < len(words):
+                cnt = _vector_len(words[i + 1])
+                if cnt is not None and cnt != n:
+                    dropped.append(f"{w} {words[i + 1]}")
+                    i += 2
+                    continue
+            out.append(w)
+            i += 1
+        if dropped:
+            setattr(ns, key, " ".join(shlex.quote(x) for x in out))
+            note(f"{head} --{key.replace('_', '-')}: {', '.join(dropped)} DROPPED (a cut pinned for another "
+                 f"stage count; the cut solver derives it)")
+    # 5. L15 ordinal posts
+    mib = str(env.get(l15_plan.L15_MIB_ENV, "") or "")
+    if l15_plan.master_on(env) and mib:
+        new, why = _iv.derive_l15_override(mib, cal, live)
+        if why and new != mib:
+            env[l15_plan.L15_MIB_ENV] = new
+            note(f"{head} {l15_plan.L15_MIB_ENV} {mib!r} -> {new!r} ({why})")
+    return lines
 
 
 #: HW-P1a 1003: the card count of the REFERENCE rig (the proven release
@@ -6078,8 +6380,10 @@ def positional_vector_lengths(ns) -> Dict[str, int]:
     return out
 
 
-def topology_context(ns, environ: Optional[Mapping[str, str]] = None) -> "_topo.TopologyContext":
-    """HW-P1a: what of THIS launch the topology blockers depend on."""
+def topology_context(ns, environ: Optional[Mapping[str, str]] = None,
+                     cards: Optional[Sequence["Card"]] = None) -> "_topo.TopologyContext":
+    """HW-P1a: what of THIS launch the topology blockers depend on. ``cards``
+    (card order): the live inventory and the BAR1 of each card (HW-P1c)."""
     env = os.environ if environ is None else environ
     prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
     try:
@@ -6094,6 +6398,10 @@ def topology_context(ns, environ: Optional[Mapping[str, str]] = None) -> "_topo.
         l15=l15_plan.master_on(env),
         l15_mib=str(env.get(l15_plan.L15_MIB_ENV, "") or ""),
         vectors=positional_vector_lengths(ns),
+        live_inventory=(tuple(card_identity.inventory_signature(cards)) if cards is not None else ()),
+        vector_inventory=tuple(calibrated_inventory(ns)[0]),
+        record_inventory=tuple(records_inventory(prof)[0]),
+        bar1_mib=(tuple(getattr(c, "bar1_total_mib", None) for c in cards) if cards is not None else ()),
     )
 
 
@@ -6104,7 +6412,7 @@ def topology_check_line(ns, cards: Sequence["Card"],
     HW-TOPOLOGY (N outside 2..8) or HW-COUNT with the CONCRETE blockers of
     this launch -- when the count is not runnable. N = 3 passes as before."""
     try:
-        t = _topo.plan_topology(len(cards), topology_context(ns, environ))
+        t = _topo.plan_topology(len(cards), topology_context(ns, environ, cards))
     except _topo.TopologyRefused as exc:
         text = f"{exc} || visible: " + "; ".join(card_identity.describe(c) for c in cards)
         if str(exc).startswith(_topo.CODE_COUNT):
@@ -8923,6 +9231,9 @@ def argv_d(
     # admission (W123). `off` (default) is byte-identical to every argv
     # before this parameter existed.
     vision: str = VISION_OFF,
+    # HW-P1c 1003: APPENDED LAST (argv_d has no `*` marker). Default = the
+    # shipped N = 3 window, so every existing caller's argv is byte-identical.
+    window_mib: str = D_BARLINK_BAR1_WINDOW_MIB,
 ) -> List[str]:
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "D")
     _refuse_if_extra_drops_transient_lmo(vision, extra, "D")
@@ -9038,7 +9349,7 @@ def argv_d(
         # window also buys all_gather rounds: 12 -> 7 across the same step.
         # ARM 1 of the A/B boot measured w40 at 2361.4 ms of wait per full
         # chunk against the baseline's 4755.7 and NCCL's 3307.6.
-        "--barlink-bar1-window-mib", "16,TP_0=32,DCP_0=40",
+        "--barlink-bar1-window-mib", window_mib,
         # #1234 C5: group D is the one place where a silent host-staged
         # 4.7x is a known boot killer, and with the window above no declared
         # class is anywhere near the round budget. The library default stays
@@ -11040,6 +11351,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # nobody asked for, and a stale region path is a rank mapping another
     # boot's shm.
     for key in ("SGLANG_WEG2_XCHG_REGION", "SGLANG_WEG2_XCHG_BOOT",
+                weight_exchange_region.ENV_N_CARDS,
                 "SGLANG_WEG2_WEIGHT_SOURCE",
                 # S5b: the shadow's hop bound is launcher OUTPUT too, so an
                 # operator's inherited shell value may not silently regrade a
@@ -12528,7 +12840,8 @@ def choose_host_ledger(
         # the ledger's prediction does not move with the cut.  The count
         # published to the ranks stays `_lane_n` (W102 compares counts).
         if os.environ.get("SGLANG_WEG2_PCUT_LANE_PRICE", "") != "1":
-            _price_cap = region_form_lane_price_cap(d_vector, legs)
+            _price_cap = region_form_lane_price_cap(
+                d_vector, legs, n_stages=len([x for x in str(stage_ratio or "").split(",") if x.strip()]) or None)
             if _price_cap:
                 _lane_prov += (
                     f" | #1464b REGION-FORM: lanes charged min(n_lanes={_lane_n}, "
@@ -18969,11 +19282,17 @@ PCUT_BOUNCE_SLACK_ENV = "SGLANG_WEG2_PCUT_BOUNCE_SLACK_GIB"
 
 
 def region_form_lane_price_cap(d_vector: str = XCHG_D_VECTOR_DEFAULT,
-                               legs: str = "both") -> int:
+                               legs: str = "both",
+                               n_stages: Optional[int] = None) -> int:
     """#1464b: the lane count the ledger charges in the REGION form for EVERY
     cut -- the measured record of the ordered default cut (39,13,12 -> 5),
     0 when that record does not exist (then nothing is capped and the old
     per-cut count prices, as before)."""
+    if n_stages is not None and weg2_pp_ordered_cut_for(n_stages) is None:
+        # HW-P1c 1003: the incumbent record is the THREE-stage ordered cut's;
+        # another stage count has no incumbent -> its own worst-case lane count
+        # (host_ledger.resolve_xchg_lanes, N_PAIRS + N_CARDS) stands.
+        return 0
     rec = host_ledger.XCHG_LANES_BY_CUT.get(
         host_ledger.xchg_cut_key(_csv(DEFAULT_PP_ORDERED_CUT), str(d_vector), str(legs)))
     try:
@@ -19334,7 +19653,7 @@ def d_record_torch_caps(ns, cards: List[Card], budgets_d: Sequence[int], log,
 D_EXTEND_CAP_RATE_RECORD = "D_EXTEND_CAP_PER_ROW_MIB"
 
 
-def _d_extend_cap_rate_env(ns, log, label: str) -> Optional[str]:
+def _d_extend_cap_rate_env(ns, log, label: str, *, capped: bool = True) -> Optional[str]:
     """WEG2-EXTEND-CAP (29.09.): with the record caps armed (the 27B, whose verdict books no
     non-torch term and so never reaches the #145 ledger's EXTEND-STUECKELUNG), the D extend
     chunk must follow the CAP, not only the card: p0-nopin (dkr27browauthorityp0nopinbar1fs09291720)
@@ -19343,11 +19662,19 @@ def _d_extend_cap_rate_env(ns, log, label: str) -> Optional[str]:
     the profile's ``D_EXTEND_CAP_PER_ROW_MIB`` -- the ALLOCATED transient per extend row under the
     cap, a different quantity from Next Flash's uncapped reserved growth -- (extend_trim.width_vote then funds the chunk
     from ``min(card_free, cap - reserved)``); a value named in --env-d wins. A profile without
-    the record: nothing written, no vote."""
+    the record: nothing written, no vote. ``capped=False`` is the Q-694 flip arm
+    (:func:`_d_extend_flip_rate_env`): same record, the vote funds the chunk from
+    ``card_free`` alone (no torch cap), and the line says so.
+
+    Q-694b (hardware-generic): the record is a START value measured on one rig. The flip arm
+    also arms the per-rank run-time measurement (``SGLANG_WEG2_EXTEND_RATE_MEASURE=1``, line
+    ``EXTEND-RATE source=record``); a profile WITHOUT the record no longer leaves the vote unarmed
+    -- :func:`_d_extend_derived_rate_env` writes a start rate derived from the model geometry
+    (``EXTEND-RATE source=derived``). The P0 arm with its record is byte-identical."""
     try:
         _rate = [None if v is None else float(v) for v in _pconst(D_EXTEND_CAP_RATE_RECORD, ns.profile)]
     except KeyError:
-        return None
+        return _d_extend_derived_rate_env(ns, log, label, capped=capped)
     _rate_src = _pconst_boots(D_EXTEND_CAP_RATE_RECORD, ns.profile)
     from sglang.srt.weg2 import extend_trim as _et
 
@@ -19360,11 +19687,147 @@ def _d_extend_cap_rate_env(ns, log, label: str) -> Optional[str]:
         return None
     if not _given:
         ns.env_d = set_group_env(_env_d, "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB", _rtext)
-    log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-CAP rows_cap aus min(card_free, torch_cap - reserved): "
+    _what = ("EXTEND-CAP rows_cap aus min(card_free, torch_cap - reserved)" if capped else
+             f"{EXTEND_CAP_FLIP_MARKER} rows_cap aus card_free_post (ohne torch cache cap, Flip-Linie)")
+    log(f"{D_RANK_SOLVE_MARKER} {label} {_what}: "
         f"SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB={_rtext}{' (aus --env-d, Vorrang)' if _given else ''} "
         f"(Rate aus {D_EXTEND_CAP_RATE_RECORD} {_rate}, boots {_rate_src}; D kappt den Extend-Chunk "
         f"auf floor((post - 300) / Rate), MIN ueber TP)")
+    if not capped:
+        _d_extend_rate_measure_env(ns, log, label, "record", _rtext,
+                                   f"{D_EXTEND_CAP_RATE_RECORD} {_rate}, boots {_rate_src}")
     return _rtext
+
+
+#: Q-694b: the arming variable of the per-rank run-time measurement of the extend rate
+EXTEND_RATE_MEASURE_ENV = "SGLANG_WEG2_EXTEND_RATE_MEASURE"
+#: Q-694b: the launcher's line naming where the start rate of the chunk cap came from
+EXTEND_RATE_MARKER = "EXTEND-RATE"
+
+
+def _d_extend_rate_measure_env(ns, log, label: str, source: str, rtext: str, why: str) -> None:
+    """Q-694b: arm the per-rank run-time measurement in the D group env (a value named in
+    --env-d wins) and name the start rate's source: ``EXTEND-RATE source=record|derived``."""
+    from sglang.srt.weg2 import extend_trim as _et
+
+    _env_d = getattr(ns, "env_d", "") or ""
+    # a value other than our own came from the user (a second solve pass sees its own write)
+    _given = str(parse_group_env(_env_d).get(EXTEND_RATE_MEASURE_ENV, "1")).strip() != "1"
+    if not _given:
+        ns.env_d = set_group_env(_env_d, EXTEND_RATE_MEASURE_ENV, "1")
+    _on = str(parse_group_env(getattr(ns, "env_d", "") or "").get(EXTEND_RATE_MEASURE_ENV, "")
+              ).strip().lower() in ("1", "true", "yes", "on")
+    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_RATE_MARKER} source={source} start={rtext} "
+        f"measure={'on' if _on else 'off'}{' (aus --env-d, Vorrang)' if _given else ''} "
+        f"safety={_et.RATE_SAFETY} ({why}; je Rang gilt max(start, gemessen x {_et.RATE_SAFETY}), "
+        f"gemessen = max(Allokator-Spitze, reserved-Zuwachs) / Zeilen ueber jeden Ziel-Extend "
+        f">= {_et.GROWTH_PER_ROW_MIN_ROWS} Zeilen, Ratsche nur nach oben)")
+
+
+def _d_extend_derived_rate_env(ns, log, label: str, *, capped: bool) -> Optional[str]:
+    """Q-694b: the chunk-cap start rate of a profile WITHOUT ``D_EXTEND_CAP_PER_ROW_MIB``
+    (another model, another card mix): derived from the checkpoint's geometry
+    (:func:`extend_trim.derived_rate_mib`, no rig number), the run-time measurement armed.
+
+    Next Flash UNCHANGED: a profile carrying ``D_EXTEND_GROWTH_PER_ROW_MIB`` gets its rate from
+    the #145 ledger's EXTEND-STUECKELUNG write -- nothing is written here, byte for byte as
+    before. An unreadable geometry writes nothing and says the cap is NOT armed."""
+    if d_extend_growth_per_row_record(getattr(ns, "profile", None))[0] is not None:
+        return None
+    from sglang.srt.weg2 import extend_trim as _et
+
+    try:
+        _rate = _et.derived_rate_mib(_model_config(str(getattr(ns, "model", "") or "")))
+        _geo_err = "" if _rate is not None else "keine hidden_size"
+    except Exception as exc:  # noqa: BLE001 -- an unreadable geometry is NAMED below, never fatal
+        _rate, _geo_err = None, f"{type(exc).__name__}: {exc}"
+    if _rate is None:
+        log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_RATE_MARKER} source=none: kein "
+            f"{D_EXTEND_CAP_RATE_RECORD} im Profil {getattr(ns, 'profile', None)} und keine "
+            f"Modellgeometrie ({_geo_err}) -- der Extend-Chunk-Deckel ist NICHT scharf")
+        return None
+    _rtext = _et.launcher_rates([_rate])
+    _env_d = getattr(ns, "env_d", "") or ""
+    _given = any(x.split("=", 1)[0].strip() == "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB"
+                 and x.split("=", 1)[1].strip() != _rtext
+                 for x in _env_d.split(";") if "=" in x)
+    if not _given:
+        ns.env_d = set_group_env(_env_d, "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB", _rtext)
+    _what = ("EXTEND-CAP rows_cap aus min(card_free, torch_cap - reserved)" if capped else
+             f"{EXTEND_CAP_FLIP_MARKER} rows_cap aus card_free_post (ohne torch cache cap, Flip-Linie)")
+    log(f"{D_RANK_SOLVE_MARKER} {label} {_what}: "
+        f"SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB={_rtext}{' (aus --env-d, Vorrang)' if _given else ''} "
+        f"(Startrate aus der Modellgeometrie, kein {D_EXTEND_CAP_RATE_RECORD} im Profil "
+        f"{getattr(ns, 'profile', None)}; D kappt den Extend-Chunk auf floor((post - 300) / Rate), "
+        f"MIN ueber TP)")
+    _d_extend_rate_measure_env(
+        ns, log, label, "derived", _rtext,
+        f"Geometrie {getattr(ns, 'model', '')}: ({_et.DERIVED_HIDDEN_COPIES} x hidden + "
+        f"{_et.DERIVED_MLP_COPIES} x intermediate + {_et.DERIVED_MIXER_COPIES} x mixer [+ MoE top-k]) "
+        f"x max({_et.DERIVED_MIN_ELEM_BYTES}, dtype) Bytes je Zeile, ohne TP-Teilung")
+    return _rtext
+
+
+#: Q-694: the line of the uncapped (flip-layout) arm of the EXTEND-CAP rate
+EXTEND_CAP_FLIP_MARKER = "Q694 EXTEND-CAP-FLIP"
+
+
+def _d_extend_flip_rate_env(ns, log, label: str) -> Optional[str]:
+    """Q-694 (INT8 y8va, 03.10. 18:39:37Z, D-TP0 OOM): the D extend chunk follows the card on
+    the FLIP line too, not only under the P0 torch cache cap.
+
+    rc12g's chunk cap (``extend_trim.width_vote``, a vote in the #794 MIN reduce) is armed by
+    ``SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB``, and the launcher wrote that rate on two paths only:
+    the #145 ledger (Next Flash's ``D_EXTEND_GROWTH_PER_ROW_MIB``; the 27B is dense, its fraction
+    solve is SKIPPED) and the P0 cap branch (:func:`_d_extend_cap_rate_env`, only with
+    ``SGLANG_WEG2_TORCH_CACHE_CAP=1``; the qwen27b registry row has it off). So the 27B INT8 flip
+    boot ran with the trim threshold (``SGLANG_WEG2_EXTEND_TRIM_MIB=1200,0,0``) but no chunk cap:
+    the trim emptied the cache to 529 MiB free and the extend still went 4096 rows deep (prefix
+    70169, weg2-30-101), whose transient on TP0 measures 518-1001 MiB at 4096 rows -> barlink
+    all_reduce ``torch.empty_like`` 20 MiB with 3.44 MiB free. The #656 corridor actuator did not
+    cut it: its config price for 4096 rows is 198 MiB (a third of what TP0 takes).
+
+    Same record as the P0 branch (``D_EXTEND_CAP_PER_ROW_MIB`` 0.3091, the deep-prefix maximum of
+    the ALLOCATED transient per row; 40 boots up to 03.10. measured <= 0.2690 on every extend of
+    >= 2048 rows), so ``rows_cap = floor((card_free_post - 300) / 0.3091)``: 740 rows at the
+    death's 529 MiB. DUAL UNCHANGED: the dual layout (``--dual-layout`` / ``--dual-share``)
+    writes nothing here, byte for byte as before. Next Flash (its own record
+    ``D_EXTEND_GROWTH_PER_ROW_MIB`` through the #145 ledger): nothing written. Q-694b: any other
+    profile without the record gets a geometry-derived start rate; the record, where present, is
+    only the start value of the per-rank run-time measurement."""
+    if getattr(ns, "dual_layout", False) is True or getattr(ns, "dual_share", False) is True:
+        return None
+    _rtext = _d_extend_cap_rate_env(ns, log, label, capped=False)
+    if _rtext:
+        _d_extend_cap_floor_env(ns, log, label)
+    return _rtext
+
+
+#: Q-710: the arming variable of the chunk-cap floor (the vote never crawls)
+EXTEND_CAP_FLOOR_ENV = "SGLANG_WEG2_EXTEND_CAP_FLOOR"
+EXTEND_CAP_FLOOR_MARKER = "EXTEND-CAP-FLOOR"
+
+
+def _d_extend_cap_floor_env(ns, log, label: str) -> None:
+    """Q-710 (INT8 y8vb 03.10. 19:34-19:51Z): arm the vote floor wherever the flip arm armed
+    the Q-694 chunk cap -- and only there. On a card with < 300 MiB free in the D phase the
+    rc12g vote was ONE row, the group cut to 1 token per forward (3905 extends of ~152 ms in 17
+    min, 133 s without a decode step). With the flag the vote keeps a floor chunk derived from
+    the configured chunk width and what the free card funds at the priced rate, and a fresh
+    D-direct request longer than a starved group width is refused at the X gate so the front
+    routes it through P (``EXTEND-CAP-FLOOR route=P``). A value named in --env-d wins. The P0
+    arm, Next Flash (ledger rate) and the dual layout never reach this."""
+    _env_d = getattr(ns, "env_d", "") or ""
+    _given = EXTEND_CAP_FLOOR_ENV in parse_group_env(_env_d) and \
+        str(parse_group_env(_env_d).get(EXTEND_CAP_FLOOR_ENV, "1")).strip() != "1"
+    if not _given:
+        ns.env_d = set_group_env(_env_d, EXTEND_CAP_FLOOR_ENV, "1")
+    _on = str(parse_group_env(getattr(ns, "env_d", "") or "").get(EXTEND_CAP_FLOOR_ENV, "")
+              ).strip().lower() in ("1", "true", "yes", "on")
+    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_CAP_FLOOR_MARKER} floor={'on' if _on else 'off'}"
+        f"{' (aus --env-d, Vorrang)' if _given else ''}: der Chunk-Deckel faellt nie unter "
+        f"chunked_prefill_size/16 (begrenzt auf floor(card_free_post / Rate)); ein frischer "
+        f"D-Direktprefill laenger als eine Gruppenbreite unter dem Boden geht ueber P")
 
 
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
@@ -19469,6 +19932,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             log(f"{D_RANK_SOLVE_MARKER} {label} P0 {_tcc.MARKER} {_tcc.MIB_ENV}={_caps} (verfuegbar "
                 f"minus Korridor-Floor {_floor:.0f} MiB je Rang; der torch-Allokator leert seinen "
                 f"Cache, bevor er die Linie ueberschreitet)")
+    else:
+        # Q-694: without the torch cap the flip line's D extend chunk follows
+        # card_free_post (the rc12g vote); the dual layout writes nothing.
+        _d_extend_flip_rate_env(ns, log, label)
     log(
         "%s VERDIKT %s: %s%s"
         % (
@@ -20877,6 +21344,77 @@ def publish_p_fractions(ns, fracs: Sequence[float]) -> None:
                                       "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", fracs)
 
 
+def n_stage_incumbent(n_stages: int, n_layers: int, ms_per_layer: Sequence[float]) -> List[int]:
+    """HW-P1c 1003 (PP-CUT-PIN): the solver's starting cut for a P group of
+    ``n_stages`` stages: layers in proportion to each stage's speed (1 / its
+    measured ms per layer), every stage >= 1 layer, the sum exact. A STARTING
+    point (the cost model's incumbent); the cut that ships is the solver's."""
+    n = int(n_stages)
+    rates = [1.0 / max(1e-9, float(m)) for m in list(ms_per_layer)[:n]]
+    if len(rates) != n:
+        rates = [1.0] * n
+    tot = sum(rates)
+    counts = [max(1, int(round(r / tot * int(n_layers)))) for r in rates]
+    counts[-1] = int(n_layers) - sum(counts[:-1])
+    while counts[-1] < 1:   # the last stage must keep a layer: take from the largest
+        j = max(range(n - 1), key=lambda i: counts[i])
+        counts[j] -= 1
+        counts[-1] += 1
+    return counts
+
+
+def derived_family_cost(ns, cards: Sequence["Card"], families, chunk_tokens: int):
+    """HW-P1c 1003: the P-cut family cost (linear / attention ms per layer per
+    stage) for a P group whose cards are a SUBSET of the calibration rig's.
+
+    The split is a closed form of ONE measured cut (``MEASURED_MS_PER_LAYER`` at
+    ``P_PP_STAGE_RATIO_SCORES``) and the deep anchor; it is fitted on THAT
+    reference basis exactly as on the reference rig and then mapped to the live
+    stages by calibration class (a stage on a 3080 takes the slowest cost the
+    reference measured on a 3080: conservative). The family RATIO is, by the
+    function's own assumption, a property of the model shape and not of the
+    card, so it is kept; only the per-stage scale follows the live cards."""
+    from sglang.srt.planner import pp_cut as _pp_cut
+    from sglang.srt.weg2 import profile_records as _pr
+
+    prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
+    cal, _ = records_inventory(prof)
+    row = weg2_form.profile_row(prof)
+    ref_ms = _csv_floats(str(row.constant("MEASURED_MS_PER_LAYER")))
+    ref_counts = list(P_PP_STAGE_RATIO_SCORES)
+    ref_attn = _pp_cut.attention_counts(families, ref_counts)
+    anchor = next((i for i, c in enumerate(cal) if c == ATTN_ANCHOR_CARD_CLASS), None)
+    if anchor is None or len(ref_ms) != len(cal):
+        raise Weg2LaunchRefused(
+            f"{card_identity.CODE_UNCALIBRATED}: the P-cut family cost of profile {prof!r} has no "
+            f"reference basis for the calibrated inventory [{', '.join(cal)}]")
+    ref_cost, ref_prov = _pp_cut.family_costs_from_measurement(
+        measured_ms_per_layer=ref_ms,
+        measured_counts=ref_counts,
+        measured_attn_counts=ref_attn,
+        chunk_tokens=int(chunk_tokens),
+        ref_prefix_tokens=float(ns.pp_cut_calibration_prefix_tokens),
+        anchor_stage=anchor,
+        anchor_attn_ms_per_layer=float(ns.pp_cut_attn_anchor_ms),
+        anchor_prefix_tokens=float(ns.pp_cut_attn_anchor_prefix_tokens),
+    )
+    live = tuple(card_identity.inventory_signature(cards))
+    lin, att = [], []
+    for c in live:
+        idx = [i for i, k in enumerate(cal) if k == c]
+        if not idx:
+            raise Weg2LaunchRefused(
+                f"{card_identity.CODE_UNCALIBRATED}: stage card class {c} has no measured twin in "
+                f"[{', '.join(cal)}]; the P-cut family cost is not derived across classes")
+        lin.append(max(ref_cost.linear_ms_per_layer[i] for i in idx))
+        att.append(max(ref_cost.attn_ms_per_layer_at_ref[i] for i in idx))
+    cost = _pp_cut.FamilyDepthCost(
+        linear_ms_per_layer=tuple(lin), attn_ms_per_layer_at_ref=tuple(att),
+        chunk_tokens=int(chunk_tokens), ref_prefix_tokens=float(ns.pp_cut_calibration_prefix_tokens))
+    return cost, (f"HW-DERIVE family cost for [{', '.join(live)}] from the reference basis "
+                  f"[{', '.join(cal)}] by card class (slowest same-class stage): " + ref_prov)
+
+
 def solve_p_cut(
     ns,
     cards: List[Card],
@@ -21385,6 +21923,10 @@ def solve_p_cut(
     # BEFORE argv_p ever got a chance to consult the calibration record.
     if ns.pp_stage_ratio:
         incumbent = _csv_ints(ns.pp_stage_ratio)
+    elif len(budgets_p) != len(P_PP_STAGE_RATIO_SCORES):
+        # HW-P1c 1003: the measurement basis is a THREE-stage cut; a P group of
+        # another size starts the solver from a cut sized to its stage rates
+        incumbent = n_stage_incumbent(len(budgets_p), n_layers, ms)
     else:
         incumbent = (
             host_ledger.resolve_calibrated_stage_layer_counts(
@@ -21450,22 +21992,27 @@ def solve_p_cut(
             )
         )
 
-    measured_attn = _pp_cut.attention_counts(families, incumbent)
-    # HW-GENERIC 1002: the stage whose card is of the class the deep
-    # attention anchor (ATTN_ANCHOR_MS, "a 3080 ... 0.4 s per chunk") was
-    # measured on -- by calibration class, not "the first card that is not a
-    # 5090". On the reference rig that is stage 1, as before.
-    anchor_stage = attn_anchor_stage(cards)
-    family_cost, family_prov = _pp_cut.family_costs_from_measurement(
-        measured_ms_per_layer=ms,
-        measured_counts=incumbent,
-        measured_attn_counts=measured_attn,
-        chunk_tokens=int(chunk_tokens),
-        ref_prefix_tokens=float(ns.pp_cut_calibration_prefix_tokens),
-        anchor_stage=anchor_stage,
-        anchor_attn_ms_per_layer=float(ns.pp_cut_attn_anchor_ms),
-        anchor_prefix_tokens=float(ns.pp_cut_attn_anchor_prefix_tokens),
-    )
+    if len(budgets_p) != len(P_PP_STAGE_RATIO_SCORES):
+        # HW-P1c 1003: the family split is fitted on the REFERENCE basis and
+        # mapped to the live stages by card class (see derived_family_cost)
+        family_cost, family_prov = derived_family_cost(ns, cards, families, int(chunk_tokens))
+    else:
+        measured_attn = _pp_cut.attention_counts(families, incumbent)
+        # HW-GENERIC 1002: the stage whose card is of the class the deep
+        # attention anchor (ATTN_ANCHOR_MS, "a 3080 ... 0.4 s per chunk") was
+        # measured on -- by calibration class, not "the first card that is not a
+        # 5090". On the reference rig that is stage 1, as before.
+        anchor_stage = attn_anchor_stage(cards)
+        family_cost, family_prov = _pp_cut.family_costs_from_measurement(
+            measured_ms_per_layer=ms,
+            measured_counts=incumbent,
+            measured_attn_counts=measured_attn,
+            chunk_tokens=int(chunk_tokens),
+            ref_prefix_tokens=float(ns.pp_cut_calibration_prefix_tokens),
+            anchor_stage=anchor_stage,
+            anchor_attn_ms_per_layer=float(ns.pp_cut_attn_anchor_ms),
+            anchor_prefix_tokens=float(ns.pp_cut_attn_anchor_prefix_tokens),
+        )
     # 27B line (user 24.09.): every boot prints its P cards' power limits --
     # the record a later --pp-cut-stage-fit is checked against.
     _power_now = card_power_limits_w(cards)
@@ -21556,7 +22103,8 @@ def solve_p_cut(
         log("PP-CUT POOL FLOOR RULE: source=cap+chunk (p_bs=1, user order 2026-09-16) floor=%d = "
             "max_kv_per_request %d + chunk %d -- the solver ships the fastest cut at or above it"
             % (_floor_flag, _cap, int(chunk_tokens)))
-    pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(_floor_flag)
+    pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(
+        _floor_flag, n_stages=len(budgets_p))
     log("PP-CUT POOL FLOOR RULE: " + pool_floor_rule)
     # --p-prefill-graph-policy auto: extra buckets only where the pool still
     # clears the floor with their capture pool (no-op without extras).
@@ -21759,7 +22307,8 @@ def solve_p_cut(
         # plus the operator's slack.  The ledger keeps the last word.
         if str(ns.pp_solve_objective) == "makespan" and xchg_bounce_arm_pins_host(
                 str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT)),
-                str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT))):
+                str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT))) \
+                and weg2_pp_ordered_cut_for(len(budgets_p)) is not None:
             _floor = decision.pool_floor
             _rows = [c for c in decision.frontier
                      if _floor is None or float(c.pool_tokens) >= float(_floor)]
@@ -24046,6 +24595,12 @@ def build_parser() -> argparse.ArgumentParser:
              f"the boot depends on it except how much of it a reader sees.",
     )
     ap.add_argument(
+        "--d-barlink-bar1-window-mib", default=D_BARLINK_BAR1_WINDOW_MIB,
+        help=f"Group D's BAR1 windows. Default {D_BARLINK_BAR1_WINDOW_MIB!r} is the N = 3 / 256 MiB "
+             f"BAR measurement (#1234 C1, see argv_d); on another card count or BAR1 size the "
+             f"launcher derives it (HW-P1c, weg2/bar1_windows.py) unless this flag names one.",
+    )
+    ap.add_argument(
         "--p-barlink-bar1-window-mib", default=P_BARLINK_BAR1_WINDOW_MIB,
         help=f"Group P's BAR1 windows. Default {P_BARLINK_BAR1_WINDOW_MIB!r} "
              f"shares group D's provenance from the other side (#1234 C1): the "
@@ -24636,13 +25191,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
     # HW-P1a 1003: the card count is the inventory's; an unrunnable one is
-    # refused here BY NAME with its concrete blockers (N = 3: one line, as before).
-    log(topology_check_line(ns, cards))
+    # refused here BY NAME with its concrete blockers. The line is printed only
+    # for a count the metal has NOT proven: on the proven reference count (N = 3)
+    # the launch output stays byte-identical to the tree without HW-P1a (the
+    # rig-plan gate of desk 27b-int8-hw-1004; the topology is derived either way).
+    _topology_line = topology_check_line(ns, cards)
+    if len(cards) not in _topo.PROVEN_CARD_COUNTS:
+        log(_topology_line)
     # HW-GENERIC 1002: the profile's positional records and vectors hold only
     # for the inventory they were measured on -- checked once, here, before
     # any of them is read. The reference rig passes silently-identically.
     log(inventory_check_line(ns, cards))
     refusals.flush(log)         # --force: refusals passed by sites without a logger (HW-COUNT); nothing otherwise
+    # HW-P1c 1003: what the inventory check called DERIVED is installed now (a
+    # subset of the calibrated cards); the BAR1 group windows and the exchange
+    # region follow the card count and the measured BAR1. N = 3 on the
+    # reference rig: nothing changes, no line.
+    apply_inventory_derivation(ns, cards, log)
+    apply_bar1_windows(ns, cards, log)
+    configure_xchg_region(len(cards), log)
     state.cards = [c.__dict__ for c in cards]
     record_card_power(state.cards, cards, log)
     if not dry:
@@ -25017,6 +25584,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _not27b = l15_plan.refuse_not_27b(ns.profile, os.environ)
     if _not27b is not None:
         raise Weg2LaunchRefused(_not27b)
+    # L15-POOL S2: the pooled hold is a part of L1.5 -- no master, no pool
+    _poolmaster = l15_plan.refuse_pool_without_master(os.environ)
+    if _poolmaster is not None:
+        raise Weg2LaunchRefused(_poolmaster)
+    # L15-POOL S3 is a part switch on top of POOL -- alone it would do nothing
+    _pools3 = l15_plan.refuse_pool_s3_without_pool(os.environ)
+    if _pools3 is not None:
+        raise Weg2LaunchRefused(_pools3)
+    _pools4 = l15_plan.refuse_pool_s4_without_s3(os.environ)
+    if _pools4 is not None:
+        raise Weg2LaunchRefused(_pools4)
+    _pools4b = l15_plan.refuse_pool_s4b_without_s4(os.environ)
+    if _pools4b is not None:
+        raise Weg2LaunchRefused(_pools4b)
+    from sglang.srt.weg2 import l15_pool_anchor as _l15_pa4b
+
+    for _ln in _l15_pa4b.s4b_boot_lines(os.environ):
+        log(_ln)
+    _pooldep = l15_plan.refuse_pool_with_deposit(os.environ)
+    if _pooldep is not None:
+        raise Weg2LaunchRefused(_pooldep)
     if l15_plan.master_on(os.environ):
         if ns.profile == weg2_form.PROFILE_QWEN27B:
             l15_base = budgets_from_dc(
@@ -25031,10 +25619,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # UNMEASURED: the pure layer prices a missing peak as a 0 post,
                 # never an estimate.
                 l15_peaks = [None] * len(cards)
+            # L15-POOL S1b: the measured per-card record as the planner input,
+            # behind SGLANG_WEG2_L15_POOL_PEAK_RECORD (default off: peaks and
+            # log untouched). On: a card without a record gets None = no share.
+            l15_peaks, _l15_peak_lines = l15_pool_peak.planner_peaks(
+                ns.profile, cards, l15_peaks, os.environ)
+            for _ln in _l15_peak_lines:
+                log(_ln)
             l15_posts = l15_plan.resolve_posts(
                 ns.profile, l15_base, l15_peaks, os.environ)
             for post in l15_posts:
                 log(l15_plan.post_line(post))
+            # L15-POOL S1 (log only): the per-card posts seen as ONE pool.
+            from sglang.srt.weg2 import l15_keep_split, l15_pool, l15_pool_anchor
+
+            if l15_pool.pool_on(os.environ):
+                log(l15_pool.boot_line(
+                    [p.mib for p in l15_posts], [p.src for p in l15_posts],
+                    l15_keep_split.anchor_cap(os.environ),
+                    mode=l15_pool.POOL_MODE if not l15_pool.pool_s3_on(os.environ)
+                    else l15_pool.S3_MODE))
+                if l15_pool_anchor.pool_s4_on(os.environ):
+                    # S4: the anchors are part of the whole request (second line,
+                    # the S3 boot line above stays as it was)
+                    log("L15-POOL-S4 mode=%s anchor_cap=%d" % (
+                        l15_pool_anchor.S4_MODE, l15_keep_split.anchor_cap(os.environ)))
+            elif l15_pool.pool_shadow_on(os.environ):
+                log(l15_pool.boot_line(
+                    [p.mib for p in l15_posts], [p.src for p in l15_posts],
+                    l15_keep_split.anchor_cap(os.environ)))
             # L15-NOCAP (N3f): armed with nothing to hold is a launch error,
             # not a boot window spent on cap=0 (N3c/N3e).
             _nocap = l15_plan.refuse_no_caps(l15_posts, os.environ, cards)
@@ -26566,7 +27179,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
         _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV D: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_only_bind_argv(ns.front_host), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_only_bind_argv(ns.front_host), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision, window_mib=ns.d_barlink_bar1_window_mib), ns.transport), state.logs["D"], env_d)
         state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
         launch_group(spec_d, tree, log, dry)
         if dry:
@@ -26641,7 +27254,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                            if str(k).startswith("SGLANG_"))
             log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision, window_mib=ns.d_barlink_bar1_window_mib), ns.transport), state.logs["D"], env_d)
         return spec_d, budgets_d
 
     refuse_d_early_start_unreviewed(ns)  # W185, before any group starts
@@ -26741,7 +27354,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                            if str(k).startswith("SGLANG_"))
             log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision, window_mib=ns.d_barlink_bar1_window_mib), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,

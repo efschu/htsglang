@@ -102,37 +102,45 @@ class P1aTopologyFromInventory(unittest.TestCase):
         self.assertTrue(str(cm.exception).startswith(CI.CODE_COUNT))
 
     def test_two_cards_name_the_concrete_blockers(self):
+        # HW-P1c: 5090 + 3080 is a SUBSET of the calibrated rig: the exchange
+        # region, the BAR1 windows, the PP-cut floor, the vectors, the records
+        # and the L1.5 posts are N-capable or DERIVED; only the metal proof is left
         ns = ns_for("--profile", "qwen27b", "--weg2-weight-source", "exchange",
                     "--user-reserve-mib", "1800,1400,1400")
-        msg, codes = refused_blockers(ns, L.order_cards(rig()[:2]),
-                                      {"SGLANG_WEG2_L15": "1", "SGLANG_WEG2_L15_MIB": "c1=7616,c2=1792"})
+        env = {"SGLANG_WEG2_L15": "1", "SGLANG_WEG2_L15_MIB": "c1=7616,c2=1792"}
+        msg, codes = refused_blockers(ns, L.order_cards(rig()[:2]), env)
         self.assertTrue(msg.startswith("HW-COUNT: 2 cards would be P = TP1 x PP2, D = TP2 x PP1"), msg)
-        self.assertEqual(codes, ["XCHG-REGION", "BAR1-WINDOW", "PP-CUT-FLOOR", "PROFILE-VECTORS",
-                                 "L15-POSTS", "RECORDS-NVEC", "METAL-UNPROVEN"])
+        self.assertEqual(codes, ["METAL-UNPROVEN"])
+        self.assertIn("visible: nvml1 NVIDIA GeForce RTX 5090", msg)
+        # two cards WITHOUT a measured twin (3090): the old concrete blockers stand,
+        # minus the paths that became N-capable
+        two = [card(i, "NVIDIA GeForce RTX 3090", 24576, (8, 6)) for i in range(2)]
+        msg, codes = refused_blockers(ns, L.order_cards(two), env)
+        self.assertEqual(codes, ["PROFILE-VECTORS", "L15-POSTS", "RECORDS-NVEC", "METAL-UNPROVEN"])
         self.assertIn("c2 names no card of 2", msg)
         self.assertIn("--user-reserve-mib (3 entries)", msg)
-        self.assertIn("weight_exchange_region.py N_CARDS=3", msg)
-        self.assertIn("visible: nvml1 NVIDIA GeForce RTX 5090", msg)
-        self.assertNotIn("DUAL-FRONT-STAGES", codes)
+        for gone in ("XCHG-REGION", "BAR1-WINDOW", "PP-CUT-FLOOR", "DUAL-FRONT-STAGES"):
+            self.assertNotIn(gone, codes)
 
     def test_blockers_follow_the_launch(self):
         rig2 = L.order_cards(rig()[:2])
         # ring weight source: no exchange region
         _, codes = refused_blockers(ns_for("--profile", "nextflash", "--weg2-weight-source", "ring"), rig2)
         self.assertNotIn("XCHG-REGION", codes)
-        self.assertNotIn("PP-CUT-FLOOR", codes)  # the 27B pool floor only
-        # dual: the front's stage loop
+        self.assertNotIn("PP-CUT-FLOOR", codes)
+        # NF vectors/records have no derivation (tested on all three cards only)
+        self.assertIn("RECORDS-NVEC", codes)
+        _, codes = refused_blockers(ns_for("--profile", "nextflash", "--pp-cut-expert-lru-rows", "32,32,32"), rig2)
+        self.assertIn("PROFILE-VECTORS", codes)
+        # dual: the front reads one stage file per card now
         _, codes = refused_blockers(ns_for("--profile", "qwen27b", "--dual-share"), rig2)
-        self.assertIn("DUAL-FRONT-STAGES", codes)
-        msg, _ = refused_blockers(ns_for("--profile", "qwen27b", "--dual-layout"), rig2)
-        self.assertIn("DUAL_P_BARLINK_BAR1_WINDOW_MIB '16,PP_0=64'", msg)
-        # the format's cut pin (27B NVFP4 49,8,7 / 12,2,2)
+        self.assertNotIn("DUAL-FRONT-STAGES", codes)
+        # the format's cut pin (27B NVFP4 49,8,7 / 12,2,2) is dropped for another stage count
         from sglang.srt.weg2 import form as F
 
         ckpt = F.profile_row("qwen27b").formats["nvfp4"].checkpoint
-        msg, codes = refused_blockers(ns_for("--profile", "qwen27b", "--model", ckpt), rig2)
-        self.assertIn("PP-CUT-PIN", codes)
-        self.assertIn("49,8,7 / 12,2,2", msg)
+        _, codes = refused_blockers(ns_for("--profile", "qwen27b", "--model", ckpt), rig2)
+        self.assertNotIn("PP-CUT-PIN", codes)
 
     def test_one_card_and_nine_cards_have_no_flip_topology(self):
         msg, codes = refused_blockers(ns_for("--profile", "nextflash"), L.order_cards(rig()[1:2]))
@@ -148,9 +156,9 @@ class P1aTopologyFromInventory(unittest.TestCase):
         from sglang.srt.weg2 import weight_exchange_region as WXR
 
         ctx = T.TopologyContext(profile="qwen27b", weight_source="exchange")
-        self.assertIn("XCHG-REGION", [b.code for b in T.blockers(2, ctx)])
-        with mock.patch.object(WXR, "N_CARDS", 2), mock.patch.object(WXR, "CROSS_PAIRS", ((0, 1), (1, 0))):
-            self.assertNotIn("XCHG-REGION", [b.code for b in T.blockers(2, ctx)])
+        self.assertNotIn("XCHG-REGION", [b.code for b in T.blockers(2, ctx)])   # N-capable since HW-P1c
+        with mock.patch.object(WXR, "layout_problems", lambda n: ["a layout problem"]):
+            self.assertIn("XCHG-REGION", [b.code for b in T.blockers(2, ctx)])
         with mock.patch.object(T, "PROVEN_CARD_COUNTS", (2, 3)):
             self.assertEqual(T.blockers(2, ctx), ())
 
@@ -181,9 +189,11 @@ class P1aTopologyFromInventory(unittest.TestCase):
 
         src = inspect.getsource(L.main)
         i = src.index("cards = order_cards(resolve_cards())")
-        self.assertLess(i, src.index("log(topology_check_line(ns, cards))"))
-        self.assertLess(src.index("log(topology_check_line(ns, cards))"),
+        self.assertLess(i, src.index("_topology_line = topology_check_line(ns, cards)"))
+        self.assertLess(src.index("_topology_line = topology_check_line(ns, cards)"),
                         src.index("log(inventory_check_line(ns, cards))"))
+        # rig-plan gate (desk 27b-int8-hw-1004): the proven count adds no launch line
+        self.assertIn("if len(cards) not in _topo.PROVEN_CARD_COUNTS:", src)
         self.assertLess(src.index("set_card_selection("), i)
 
 
@@ -277,7 +287,7 @@ class P1bSimulationHarness(unittest.TestCase):
 
     def test_argv_shape_and_fit_bound(self):
         c = self.by_id["4x ref 5090+3080 | 27B-INT8"]
-        self.assertEqual(c.argv, "P tp1/pp4 D tp4/pp1 ranks 0,1,2,3")
+        self.assertTrue(c.argv.startswith("P tp1/pp4 D tp4/pp1 ranks 0,1,2,3"), c.argv)
         self.assertEqual(self.by_id["1x sm120 5090 | 27B-INT8"].argv, "-")
         self.assertIn("FIT", self.by_id["1x sm86 3080-20G | 27B-INT8"].blockers)
         self.assertNotIn("FIT", self.by_id["1x sm120 5090 | 27B-INT8"].blockers)

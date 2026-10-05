@@ -57,6 +57,8 @@ from sglang.srt.weg2.l15_manifest import (
 )
 from sglang.srt.weg2.l15_manifest import write as manifest_write
 from sglang.srt.weg2.l15_policy import HoldSet, select_hold
+from sglang.srt.weg2 import l15_pool, l15_pool_anchor
+from sglang.srt.weg2.l15_park import park_plan
 
 __all__ = [
     "PAD_SLOTS",
@@ -224,6 +226,319 @@ def _no_l2_lanes(rid: str) -> Tuple[int, ...]:
     return ()
 
 
+@dataclass
+class RoundPlan:
+    """Steps (1)-(2) of one retain round: pure planning, nothing touched.
+
+    L15-SLEEP-DECIDE-FIRST: the scheduler computes this BEFORE the group's
+    cap-0 vote, so a round the group refuses is never paid (the moves, tree
+    rewrite, host pins, reset and arm). ``manifest`` is filled lazily by
+    :func:`manifest_of_plan` (identical to what step (8) publishes)."""
+
+    hs: HoldSet
+    plan: CompactPlan
+    a_h: int
+    anchor_moves: list
+    new_anchors: Dict
+    manifest: Optional[Manifest] = None
+    # L15-POOL S2 (None = the per-card path): the guest pieces the cap-0
+    # ranks' compacted rows park in (``l15_park.ParkPiece``) and the digest
+    # of the whole pool decision the group compares (``agree_pool``)
+    guest_pieces: Optional[tuple] = None
+    pool_fp: Optional[str] = None
+    # L15-POOL S3: the plan was made with the overflow of EVERY rank; the
+    # planned caps ride the manifest v2 (None = S2 / per-card path)
+    s3: bool = False
+    caps: Optional[tuple] = None
+    # L15-POOL S4 (None = S3 / S2 / per-card path): the anchor byte guests of the
+    # ranks without a home segment, and what the plan was priced with (both ride
+    # the manifest v2 and the group fingerprint)
+    anchor_guests: Optional[tuple] = None
+    anchor_ctx: Optional["l15_pool_anchor.AnchorCtx"] = None
+
+
+def plan_round(
+    *,
+    candidates: Iterable,
+    slots_of: Callable[[str], Sequence[int]],
+    anchor_slot_of: Callable[[str], int],
+    caps_rows_by_rank: Sequence[int],
+    cap_anchor_slots: int,
+    prefix: Sequence[int],
+    epoch: int,
+    log: Callable[[str], None],
+    pool: Optional[bool] = None,
+    s3: Optional[bool] = None,
+    rates: Optional[dict] = None,
+    rates_src: Optional[str] = None,
+    s4: Optional[bool] = None,
+    anchor_ctx: Optional["l15_pool_anchor.AnchorCtx"] = None,
+) -> Optional["RoundPlan"]:
+    """Steps (1)-(2) of :func:`retain_at_sleep` (select_hold, compact_plan,
+    anchor_plan). None = benign skip, nothing touched (logged as before).
+
+    ``pool`` (None = ``SGLANG_WEG2_L15_POOL`` from the environment): the S2
+    pooled hold -- the cap-0 ranks' shards need guest room in the capped
+    ranks' free hold rows. The room is checked HERE on the COMPACTED rows
+    (``park_plan``) before anything moves: a request without room is dropped,
+    lowest priority first (reason ``pool_full``), never held half and never
+    paid for in a retain the park would refuse afterwards. False = today's
+    path, byte for byte.
+
+    ``s3`` (None = ``SGLANG_WEG2_L15_POOL_S3`` with the pool on): EVERY rank
+    may overflow -- the admission runs against the SUM of the segments
+    (``select_hold_pool_s3``), a capped rank's rows beyond its hold region are
+    guest rows too, the placement is ``l15_pool.pool_park_plan`` (Q3 rule with
+    the measured pair ``rates``; ``rates=None`` = resolved from the env / the
+    barlink matrix, ``rates_src`` names where they came from) and
+    the digest every rank compares carries the rates. A capped rank never
+    gets ``keep_over_cap``-trimmed in this mode: its overflow is a guest.
+
+    ``s4`` (None = ``SGLANG_WEG2_L15_POOL_S4`` with the pool and S3 on): the
+    END anchors are part of the WHOLE request -- admission counts the KV rows
+    AND the anchor bytes of the ranks without a home segment against the sum of
+    the segments (``l15_pool_anchor.select_hold_pool_s4``), the exact check on
+    the compacted rows places the KV guests and then the anchor byte guests
+    (``pool_park_plan_s4``); a request whose anchor finds no room is dropped
+    whole (reason ``anchor_full``), never held half. ``anchor_ctx`` = the
+    pricing (share bytes per rank, row bytes); an S4 round without it is not
+    held (named skip). False = the S3 plan, byte for byte."""
+    import os as _os
+
+    candidates = list(candidates)
+    if pool is None:
+        pool = l15_pool.pool_on(_os.environ)
+    if s3 is None:
+        s3 = l15_pool.pool_s3_on(_os.environ)
+    s3 = bool(s3) and bool(pool)
+    if s4 is None:
+        s4 = l15_pool_anchor.pool_s4_on(_os.environ)
+    s4 = bool(s4) and s3
+    if s4 and anchor_ctx is None:
+        log("L15-RETAIN skipped reason=pool-s4-no-anchor-pricing: the anchor share "
+            "bytes / KV row bytes of this sleep are unknown, a request is not held "
+            "without its anchor")
+        return None
+    if s3 and rates is None:
+        rates, rates_src = l15_pool.resolve_rates(_os.environ, len(caps_rows_by_rank))
+    rates = l15_pool.quantize_rates(rates) if s3 else None
+    rates_src = (rates_src or "none") if s3 else None
+    guest_pieces = None
+    anchor_guests = None
+    pool_fp = None
+    # (1) who stays
+    try:
+        if s4 and anchor_ctx.anchor_cap is not None:
+            # S4b: no anchor COUNT cap -- KV rows and all anchor bytes against
+            # the sum of the free rows, in the candidate order
+            hs = l15_pool_anchor.select_hold_pool_s4b(
+                candidates, caps_rows_by_rank, anchor_ctx.bytes_by_rank,
+                anchor_ctx.row_bytes, anchor_ctx.anchor_cap)
+        elif s4:
+            hs = l15_pool_anchor.select_hold_pool_s4(
+                candidates, caps_rows_by_rank, cap_anchor_slots,
+                anchor_ctx.bytes_by_rank, anchor_ctx.row_bytes)
+        else:
+            hs = (l15_pool.select_hold_pool_s3 if s3 else
+                  l15_pool.select_hold_pool if pool else select_hold)(
+                candidates, caps_rows_by_rank, cap_anchor_slots)
+        if not hs.rids:
+            log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold")
+            return None
+        # (2) where the survivors land; PAD_SLOTS (padding slot 0, the dummy
+        # write target for padded tokens) is never a compaction target.
+        plan = compact_plan(
+            {rid: slots_of(rid) for rid in hs.rids},
+            prefix,
+            reserved=PAD_SLOTS,
+        )
+        # L15-FIX-KEEP-OVER-CAP (N3y 08:41:52Z TP2: keep-arm FAILED
+        # not-split-or-outside-hold with keep_rows 68820 > cap 57344): the
+        # compacted keep capacity is a WHOLE number of blocks on every rank
+        # (rows = blocks * ratio_r, L_H driven by the rank with the largest
+        # need/ratio), so a set select_hold admitted by summed rows can still
+        # overrun a capped rank's hold region. Drop the lowest-priority held
+        # request until every capped rank's keep fits its cap.
+        trimmed = []
+        _rows0 = tuple(int(x) for x in plan.rows_by_rank)
+        def _home_over(pl):
+            if s3:
+                return False  # S3: a capped rank's overflow is a guest, not a trim
+            return any(
+                int(caps_rows_by_rank[r]) > 0
+                and int(pl.rows_by_rank[r]) > int(caps_rows_by_rank[r])
+                for r in range(len(pl.rows_by_rank)))
+
+        _code = [l15_pool.REASON_POOL_FULL]
+
+        def _s4_plan(pl, rids):
+            # the unique held anchors are exactly slots [1, A_H) after the
+            # compaction (slot 0 = padding), so n_anchors = A_H - 1
+            _a_h, _ = anchor_plan({rid: anchor_slot_of(rid) for rid in rids},
+                                  reserved=PAD_SLOTS)
+            return l15_pool_anchor.pool_park_plan_s4(
+                list(pl.rows_by_rank), [int(c) for c in caps_rows_by_rank],
+                anchor_ctx.bytes_by_rank, anchor_ctx.row_bytes, int(_a_h) - 1, rates,
+                anchor_cap=anchor_ctx.anchor_cap)
+
+        def _guest_refusal(pl):
+            # S2: every cap-0 rank's compacted rows must find guest room in
+            # the capped ranks' free hold rows (the SAME function the park
+            # runs at the release, so plan and park cannot disagree)
+            if not pool:
+                return None
+            if s4:
+                _p, _g, _why4, _c4 = _s4_plan(pl, hs.rids)
+                _code[0] = _c4 or l15_pool.REASON_POOL_FULL
+                return _why4
+            if s3:
+                return l15_pool.pool_park_plan(
+                    list(pl.rows_by_rank), [int(c) for c in caps_rows_by_rank],
+                    rates)[1]
+            return park_plan(list(pl.rows_by_rank),
+                             [int(c) for c in caps_rows_by_rank])[1]
+
+        _reasons = []
+        while hs.rids and (_home_over(plan) or _guest_refusal(plan) is not None):
+            _why = "keep_over_cap" if _home_over(plan) else _code[0]
+            _reasons.append(_why)
+            trimmed.append(hs.rids[-1])
+            keep_rids = hs.rids[:-1]
+            _rows = {c.rid: c.rows_by_rank for c in candidates}
+            hs = dataclasses.replace(
+                hs, rids=keep_rids, anchors=len(keep_rids),
+                rows_by_rank=tuple(
+                    sum(int(_rows[x][r]) for x in keep_rids)
+                    for r in range(len(hs.rows_by_rank))),
+                excluded=tuple(hs.excluded) + ((trimmed[-1], _why),))
+            if not keep_rids:
+                break
+            plan = compact_plan({rid: slots_of(rid) for rid in hs.rids},
+                                prefix, reserved=PAD_SLOTS)
+        if trimmed:
+            log(f"L15-RETAIN trimmed n={len(trimmed)} rids={trimmed} "
+                f"keep_rows={_rows0} caps={tuple(int(c) for c in caps_rows_by_rank)} "
+                f"l_h={plan.l_h} "
+                + ("(compacted keep rows over a capped rank's hold region)"
+                   if not pool else
+                   "(compacted keep rows over a capped rank's hold region or "
+                   f"without guest room for the cap-0 rows; reasons={_reasons})"))
+        if not hs.rids:
+            log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold (all trimmed)")
+            return None
+        a_h, anchor_moves = anchor_plan(
+            {rid: anchor_slot_of(rid) for rid in hs.rids},
+            reserved=PAD_SLOTS,
+        )
+    except Exception as exc:  # noqa: BLE001 - benign skip, nothing touched yet
+        log(f"L15-RETAIN skipped reason={type(exc).__name__}: {exc}")
+        return None
+
+    anchor_map = {int(old): int(new) for old, new in anchor_moves}
+    new_anchors = {
+        rid: anchor_map.get(int(anchor_slot_of(rid)), int(anchor_slot_of(rid)))
+        for rid in hs.rids
+    }
+    if pool:
+        # the final plan's guest placement: the loop above ended only when
+        # park_plan accepted it, so a refusal here is impossible -- if it
+        # happens anyway the round is not held (never "held without room")
+        if s4:
+            guest_pieces, anchor_guests, _gwhy, _gcode = _s4_plan(plan, hs.rids)
+        elif s3:
+            guest_pieces, _gwhy = l15_pool.pool_park_plan(
+                list(plan.rows_by_rank), [int(c) for c in caps_rows_by_rank], rates)
+        else:
+            guest_pieces, _gwhy = park_plan(list(plan.rows_by_rank),
+                                            [int(c) for c in caps_rows_by_rank])
+        if _gwhy is not None:
+            log(f"L15-RETAIN skipped reason=pool-no-guest-room: {_gwhy}")
+            return None
+        guest_pieces = tuple(guest_pieces)
+        if s4:
+            anchor_guests = l15_pool_anchor.anchor_guest_tuples(anchor_guests)
+            pool_fp = l15_pool_anchor.plan_fingerprint_s4(
+                hs.rids, plan.rows_by_rank, caps_rows_by_rank, guest_pieces,
+                anchor_guests, anchor_ctx.bytes_by_rank, anchor_ctx.row_bytes,
+                int(a_h) - 1, anchor_cap=anchor_ctx.anchor_cap)
+        else:
+            pool_fp = l15_pool.plan_fingerprint(
+                hs.rids, plan.rows_by_rank, caps_rows_by_rank, guest_pieces)
+        if s3:
+            _line = l15_pool.plan_line_s3(
+                epoch, hs, caps_rows_by_rank, plan.rows_by_rank, guest_pieces,
+                pool_fp, len(candidates), rates_src, l15_pool.rates_digest(rates))
+            if s4:
+                _codes: Dict[str, int] = {}
+                for _rid, _w in hs.excluded:
+                    _codes[_w] = _codes.get(_w, 0) + 1
+                _line = l15_pool_anchor.plan_line_s4(
+                    _line, anchor_guests, int(a_h) - 1, anchor_ctx, _codes)
+                if anchor_ctx.anchor_cap is not None:
+                    _line = l15_pool_anchor.plan_line_s4b(
+                        _line, anchor_guests, caps_rows_by_rank, plan.rows_by_rank,
+                        anchor_ctx.anchor_cap)
+            log(_line)
+        else:
+            log(l15_pool.plan_line(epoch, hs, caps_rows_by_rank, plan.rows_by_rank,
+                                   guest_pieces, pool_fp, len(candidates)))
+    return RoundPlan(hs=hs, plan=plan, a_h=a_h, anchor_moves=anchor_moves,
+                     new_anchors=new_anchors, guest_pieces=guest_pieces,
+                     pool_fp=pool_fp, s3=s3,
+                     caps=(tuple(int(c) for c in caps_rows_by_rank) if s3 else None),
+                     anchor_guests=(anchor_guests if s4 else None),
+                     anchor_ctx=(anchor_ctx if s4 else None))
+
+
+def manifest_of_plan(
+    rp: "RoundPlan",
+    *,
+    candidates: Iterable,
+    l2_of: Callable[[str], Tuple[Sequence[int], Sequence[int]]],
+    anchor_l2_of: Callable[[str], Tuple[int, int]],
+    l2_lanes_of: Callable[[str], Tuple[int, ...]],
+    epoch: int,
+    pid: int,
+) -> Manifest:
+    """The manifest step (8) publishes, built from the plan alone (all of it
+    is known after steps 1-2: the new slots, the bind-time L2 snapshot)."""
+    cand_depth = {c.rid: int(c.kv_depth) for c in candidates}
+    spans = tuple(
+        HoldSpan(
+            rid=rid,
+            depth=cand_depth[rid],
+            slots=tuple(int(s) for s in rp.plan.new_slots[rid]),
+            anchor_slot=rp.new_anchors[rid],
+            l2_slots=tuple(int(x) for x in l2_of(rid)[0]),
+            l2_gens=tuple(int(x) for x in l2_of(rid)[1]),
+            # L15-12c-E2a: the anchor's L2 identity for the cap-0 wake
+            anchor_l2_slot=int(anchor_l2_of(rid)[0]),
+            anchor_l2_gen=int(anchor_l2_of(rid)[1]),
+            # L15-12c-P1: the lane each held token owns in its L2 page
+            l2_lanes=tuple(int(x) for x in l2_lanes_of(rid)),
+        )
+        for rid in rp.hs.rids
+    )
+    return Manifest(
+        epoch=int(epoch),
+        pid=int(pid),
+        spans=spans,
+        rows_by_rank=tuple(int(x) for x in rp.plan.rows_by_rank),
+        anchor_slots=int(rp.a_h),
+        # MANIFEST v2 (S3 only): the guest placement and the planned caps ride
+        # the record and its fingerprint; a v1 round writes the old record
+        guests=(l15_pool.guest_tuples(rp.guest_pieces or ()) if rp.s3 else None),
+        caps=(tuple(rp.caps or ()) if rp.s3 else None),
+        # MANIFEST v2 + S4: the anchor byte guests, their pricing and the row
+        # bytes; None = no S4 round (the S3 record, byte for byte)
+        anchor_guests=(tuple(rp.anchor_guests or ()) if rp.anchor_ctx is not None else None),
+        anchor_bytes=(tuple(int(x) for x in rp.anchor_ctx.bytes_by_rank)
+                      if rp.anchor_ctx is not None else None),
+        anchor_row_bytes=(int(rp.anchor_ctx.row_bytes) if rp.anchor_ctx is not None else 0),
+        anchor_cap=(rp.anchor_ctx.anchor_cap if rp.anchor_ctx is not None else None),
+    )
+
+
 def retain_at_sleep(
     *,
     candidates: Iterable,
@@ -252,6 +567,8 @@ def retain_at_sleep(
     set_keep: Callable[[object, Tuple[Tuple[int, int], ...]], None],
     manifest_path: str,
     log: Callable[[str], None],
+    planned: Optional["RoundPlan"] = None,
+    anchor_ctx: Optional["l15_pool_anchor.AnchorCtx"] = None,
 ) -> Optional[RetainResult]:
     """Run the whole L1.5 retain round at D's sleep; None means "skip it".
 
@@ -293,66 +610,15 @@ def retain_at_sleep(
 
     _t0 = _t[0]
 
-    # (1) who stays
-    try:
-        hs = select_hold(candidates, caps_rows_by_rank, cap_anchor_slots)
-        if not hs.rids:
-            log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold")
-            return None
-        # (2) where the survivors land; PAD_SLOTS (padding slot 0, the dummy
-        # write target for padded tokens) is never a compaction target.
-        plan = compact_plan(
-            {rid: slots_of(rid) for rid in hs.rids},
-            prefix,
-            reserved=PAD_SLOTS,
-        )
-        # L15-FIX-KEEP-OVER-CAP (N3y 08:41:52Z TP2: keep-arm FAILED
-        # not-split-or-outside-hold with keep_rows 68820 > cap 57344): the
-        # compacted keep capacity is a WHOLE number of blocks on every rank
-        # (rows = blocks * ratio_r, L_H driven by the rank with the largest
-        # need/ratio), so a set select_hold admitted by summed rows can still
-        # overrun a capped rank's hold region. Drop the lowest-priority held
-        # request until every capped rank's keep fits its cap.
-        trimmed = []
-        _rows0 = tuple(int(x) for x in plan.rows_by_rank)
-        while hs.rids and any(
-                int(caps_rows_by_rank[r]) > 0
-                and int(plan.rows_by_rank[r]) > int(caps_rows_by_rank[r])
-                for r in range(len(plan.rows_by_rank))):
-            trimmed.append(hs.rids[-1])
-            keep_rids = hs.rids[:-1]
-            _rows = {c.rid: c.rows_by_rank for c in candidates}
-            hs = dataclasses.replace(
-                hs, rids=keep_rids, anchors=len(keep_rids),
-                rows_by_rank=tuple(
-                    sum(int(_rows[x][r]) for x in keep_rids)
-                    for r in range(len(hs.rows_by_rank))),
-                excluded=tuple(hs.excluded) + ((trimmed[-1], "keep_over_cap"),))
-            if not keep_rids:
-                break
-            plan = compact_plan({rid: slots_of(rid) for rid in hs.rids},
-                                prefix, reserved=PAD_SLOTS)
-        if trimmed:
-            log(f"L15-RETAIN trimmed n={len(trimmed)} rids={trimmed} "
-                f"keep_rows={_rows0} caps={tuple(int(c) for c in caps_rows_by_rank)} "
-                f"l_h={plan.l_h} "
-                f"(compacted keep rows over a capped rank's hold region)")
-        if not hs.rids:
-            log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold (all trimmed)")
-            return None
-        a_h, anchor_moves = anchor_plan(
-            {rid: anchor_slot_of(rid) for rid in hs.rids},
-            reserved=PAD_SLOTS,
-        )
-    except Exception as exc:  # noqa: BLE001 - benign skip, nothing touched yet
-        log(f"L15-RETAIN skipped reason={type(exc).__name__}: {exc}")
+    # (1)-(2) who stays, where the survivors land (pure; nothing touched)
+    rp = planned if planned is not None else plan_round(
+        candidates=candidates, slots_of=slots_of, anchor_slot_of=anchor_slot_of,
+        caps_rows_by_rank=caps_rows_by_rank, cap_anchor_slots=cap_anchor_slots,
+        prefix=prefix, epoch=epoch, log=log, anchor_ctx=anchor_ctx)
+    if rp is None:
         return None
-
-    anchor_map = {int(old): int(new) for old, new in anchor_moves}
-    new_anchors = {
-        rid: anchor_map.get(int(anchor_slot_of(rid)), int(anchor_slot_of(rid)))
-        for rid in hs.rids
-    }
+    hs, plan, a_h = rp.hs, rp.plan, rp.a_h
+    anchor_moves, new_anchors = rp.anchor_moves, rp.new_anchors
 
     _lap("plan")
     # (3) rows land in the compact buffers: kv rows of THIS rank, every rank
@@ -448,39 +714,34 @@ def retain_at_sleep(
     # keep windows are EMPTY; the rows are still compacted and the manifest
     # still published (the wake refill and the group vote need both).
     cap0 = int(caps_rows_by_rank[rank]) == 0
-    kv_range = () if cap0 else ((0, int(plan.rows_by_rank[rank])),)
+    _keep_hi = int(plan.rows_by_rank[rank])
+    if rp.s3 and not cap0:
+        # S3: a capped rank's overflow is no home row (its keep window is its
+        # hold region at most); a rank that HOSTS guests keeps its whole hold
+        # region (the guests lie in the rows after its own)
+        _keep_hi = (int(caps_rows_by_rank[rank])
+                    if any(int(p.dst) == int(rank) for p in (rp.guest_pieces or ()))
+                    or any(int(g[1]) == int(rank) for g in (rp.anchor_guests or ()))
+                    else min(_keep_hi, int(caps_rows_by_rank[rank])))
+    kv_range = () if cap0 else ((0, _keep_hi),)
     for buf in kv_buffers:
         set_keep(buf, kv_range)
-    mamba_range = () if cap0 else ((0, int(a_h)),)
+    _a_keep = int(a_h)
+    if rp.anchor_ctx is not None and rp.anchor_ctx.anchor_cap is not None:
+        # S4b: the Mamba hold region of a capped rank is anchor_cap + 1 slots
+        # (slot 0 = padding); the anchors above it were planned as byte pieces
+        # in the KV hold rows and travel with the park at the release -- a keep
+        # window above the hold region the split reserved would be refused
+        _a_keep = min(_a_keep, int(rp.anchor_ctx.anchor_cap) + 1)
+    mamba_range = () if cap0 else ((0, _a_keep),)
     for buf in mamba_buffers:
         set_keep(buf, mamba_range)
 
     _lap("keep")
     # (8) publish the hold for the group agreement
-    cand_depth = {c.rid: int(c.kv_depth) for c in candidates}
-    spans = tuple(
-        HoldSpan(
-            rid=rid,
-            depth=cand_depth[rid],
-            slots=tuple(int(s) for s in plan.new_slots[rid]),
-            anchor_slot=new_anchors[rid],
-            l2_slots=tuple(int(x) for x in l2_of(rid)[0]),
-            l2_gens=tuple(int(x) for x in l2_of(rid)[1]),
-            # L15-12c-E2a: the anchor's L2 identity for the cap-0 wake
-            anchor_l2_slot=int(anchor_l2_of(rid)[0]),
-            anchor_l2_gen=int(anchor_l2_of(rid)[1]),
-            # L15-12c-P1: the lane each held token owns in its L2 page
-            l2_lanes=tuple(int(x) for x in l2_lanes_of(rid)),
-        )
-        for rid in hs.rids
-    )
-    manifest = Manifest(
-        epoch=int(epoch),
-        pid=int(pid),
-        spans=spans,
-        rows_by_rank=tuple(int(x) for x in plan.rows_by_rank),
-        anchor_slots=int(a_h),
-    )
+    manifest = rp.manifest if rp.manifest is not None else manifest_of_plan(
+        rp, candidates=candidates, l2_of=l2_of, anchor_l2_of=anchor_l2_of,
+        l2_lanes_of=l2_lanes_of, epoch=epoch, pid=pid)
     manifest_write(manifest_path, manifest)
 
     # (9) the one line

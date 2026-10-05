@@ -1117,3 +1117,39 @@ class TestQ2004DWantLockedFlipUnchanged:
                 mock.patch.object(DK, "_instr_d_want", lambda *a, **k: called.append(a)):
             assert DK.tick(sched) is None
         assert called == []
+
+
+# ---------------------------------------------------------------------------------- joint 1005
+
+class TestJoint1005DualGates:
+    """Joint tree 05.10. (b9p Dual head + INT8/L15 head): what the INT8/L15 branch brought in must not move the
+    Dual-NVFP4 path."""
+
+    _POOL_SWITCHES = ("SGLANG_WEG2_L15", "SGLANG_WEG2_L15_POOL_SHADOW", "SGLANG_WEG2_L15_POOL",
+                      "SGLANG_WEG2_L15_POOL_S3", "SGLANG_WEG2_L15_POOL_S4", "SGLANG_WEG2_L15_POOL_S4B")
+
+    def test_h5_short_rides_never_armed_in_the_dual_layout(self):
+        """FLIPCYCLE H5 (SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES, default ON for the flip form): the cap_exempt
+        predicate handed to the P drain carries the dual gate, so the dual layout takes the pre-port drain."""
+        from sglang.srt.environ import envs
+        assert envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.default is True  # the flip default is untouched
+        src = inspect.getsource(F)
+        i = src.index("cap_exempt=(self._p_phase_short_rides")
+        window = src[i:i + 400]
+        assert 'not getattr(self, "dual_layout", False)' in window
+        assert "else None" in window
+
+    def test_publish_sweep_bg_off_in_the_dual_layout(self, monkeypatch):
+        from sglang.srt.managers import weg2_flush_nonblock as FN
+        monkeypatch.setenv("SGLANG_WEG2_DUAL_LAYOUT", "1")
+        assert FN.bg_publish_on() is False
+
+    def test_l15_pool_switches_default_off_and_dual_refuses_each(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.weg2 import l15_plan
+        for name in self._POOL_SWITCHES[1:]:
+            assert getattr(envs, name).default is False, name
+        assert l15_plan.refuse_dual(["--dual-layout"], {}) is None
+        for name in self._POOL_SWITCHES:
+            msg = l15_plan.refuse_dual(["--dual-layout"], {name: "1"})
+            assert msg is not None and "W-L15-DUAL" in msg and name in msg, name
