@@ -2193,6 +2193,14 @@ class Scheduler(
 
         self.init_metrics_reporter(tp_rank, pp_rank, dp_rank)
 
+        # #1720: prove the SEATS-STALL-OFF switch in the boot log (once, only when active)
+        try:
+            from sglang.srt.weg2.dual_card_stall import log_seats_stall_off_once
+
+            log_seats_stall_off_once(logger)
+        except Exception:  # noqa: BLE001 -- a log line never blocks the scheduler start
+            pass
+
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
 
@@ -16089,7 +16097,10 @@ class Scheduler(
             # the request slots until the flip, so this never resolves by
             # itself (xsn272/273: 150 s idle, boot killed). Name it, answer
             # the head 503 (the front requeues it and flips).
-            if running_batch.is_empty() and self.waiting_queue:
+            # #1720: skipped on dual P with SGLANG_WEG2_DUAL_SEATS_STALL_OFF (false positive,
+            # the one slot is held by a PP-ring mini request); default path unchanged.
+            if (running_batch.is_empty() and self.waiting_queue
+                    and not self._weg2_seats_stall_off()):
                 self._weg2_intake_stall_observe(
                     self.waiting_queue[0], None,
                     note=(f"gate=seats allocatable_reqs="
@@ -22777,6 +22788,13 @@ class Scheduler(
         drl = self.metrics_reporter.decode_round_log
         if drl is not None:
             drl.arm_wake_census(wake_mono=self._weg2_last_wake_t)
+
+    def _weg2_seats_stall_off(self) -> bool:
+        """#1720 SEATS-STALL-OFF: True when the gate=seats stall observation is to be skipped
+        (env switch on AND dual group P; identical on every rank)."""
+        from sglang.srt.weg2.dual_card_stall import seats_stall_off
+
+        return seats_stall_off()
 
     def _weg2_intake_stall_observe(self, req, adder, note: str = "",
                                    immediate: bool = False) -> None:

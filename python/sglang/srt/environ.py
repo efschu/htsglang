@@ -690,6 +690,14 @@ class Envs:
     # (no collective, no wall clock in the decision); the head keeps retrying itself. The marker
     # '#1640 GRANT-INFEASIBLE' is a pure log line and is written with or without the switch. 0 = off (default).
     SGLANG_WEG2_DUAL_GRANT_INFEASIBLE_SKIP = EnvBool(False)
+    # #1720 SEATS-STALL-OFF (deskq/done/1720, F1): on dual group P (--max-running-requests 1) the seat gate
+    # declines with 'running=empty' whenever the ONE request slot is held by a mini request flying in the PP
+    # ring (self.mbs, not running_batch); IntakeStallWatch never resets on a slot change, so after 1.0 s the
+    # next observation fires a false-positive 503 (gate=seats) that aborts a healthy head (30-36 s cost).
+    # With the switch on AND dual P (SGLANG_WEG2_DUAL_LAYOUT=1, SGLANG_WEG2_GROUP=P) the gate=seats
+    # observation is skipped; a real wedge stays covered by wedge_recovery (gate=admission-wedge, >=20 s,
+    # immediate). Pure env, identical on every rank, no clock in the decision. 0 = off (default).
+    SGLANG_WEG2_DUAL_SEATS_STALL_OFF = EnvBool(False)
     # Q-680 DUAL RESUME-STALE-LEDGER (dual y8w fs10031623 16:45:42: two P
     # followers kept 201/302 MB committed for 905 s, the front's RESUME-WAIT
     # held the whole queue): when P is idle (no leg in flight) and the only

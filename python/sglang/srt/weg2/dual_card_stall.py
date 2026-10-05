@@ -52,6 +52,35 @@ def dual_p_env(env: Optional[Mapping[str, str]] = None) -> bool:
             and str(env.get("SGLANG_WEG2_GROUP", "")).strip().upper() == "P")
 
 
+#: the start marker of the #1720 switch (logged once per process by ``log_seats_stall_off_once``)
+SEATS_STALL_OFF_MARK = "#1720 SEATS-STALL-OFF"
+_SEATS_STALL_OFF_LOGGED = False
+
+
+def seats_stall_off(env: Optional[Mapping[str, str]] = None) -> bool:
+    """#1720: SGLANG_WEG2_DUAL_SEATS_STALL_OFF on AND dual group P -> the gate=seats intake-stall
+    observation is skipped. Pure env (identical on every rank), no clock. Default off; any error
+    reads as off (the default path stays byte-identical)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_DUAL_SEATS_STALL_OFF.get()) and dual_p_env(env)
+    except Exception:  # noqa: BLE001 -- a bad value never changes the stall path
+        return False
+
+
+def log_seats_stall_off_once(log) -> bool:
+    """Log the #1720 marker once per process when the switch is active; True when it logged."""
+    global _SEATS_STALL_OFF_LOGGED
+    if _SEATS_STALL_OFF_LOGGED or not seats_stall_off():
+        return False
+    _SEATS_STALL_OFF_LOGGED = True
+    log.info(
+        "%s: SGLANG_WEG2_DUAL_SEATS_STALL_OFF=1 on dual P -- the gate=seats intake-stall observation "
+        "is skipped (a real wedge stays with wedge_recovery gate=admission-wedge)", SEATS_STALL_OFF_MARK)
+    return True
+
+
 def _card_rows(paths: Iterable[str]):
     from sglang.srt.weg2.card_kv_ledger import peek
 
