@@ -356,7 +356,7 @@ def test_the_launcher_names_the_seats_and_reads_the_sidecar(tmp_path, monkeypatc
     (tmp_path / MODEL).mkdir()
     (tmp_path / MODEL / "config.json").write_text(json.dumps(cfg))
     ns = types.SimpleNamespace(
-        model=str(tmp_path / MODEL), d_bs=6,
+        model=str(tmp_path / MODEL), d_bs=6, profile="qwen27b",
         extra_d=("--rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
                  "--rank-moe-resident-fraction 0.06,0.51,0.48 --max-running-requests 6"),
         env_d=("SGLANG_MOE_POOL_STAGING=8;SGLANG_MOE_SCRATCH_SLOTS=82,48,48;"

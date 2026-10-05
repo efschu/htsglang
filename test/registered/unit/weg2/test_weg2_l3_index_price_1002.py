@@ -334,7 +334,7 @@ def _boot_front(probe, ids):
     f.state = "serving"
     f.routed = []
 
-    async def seat(rid, est, refused=None):
+    async def seat(rid, est, refused=None, **kw):   # Q-712: _acquire_short_seat(..., uncached=...)
         return 1
 
     async def leg2(request, rid, payload, text, stream, pending=None, **kw):

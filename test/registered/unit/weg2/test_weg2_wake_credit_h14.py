@@ -184,7 +184,7 @@ def _launcher_ns(tmp_path, fr_p, fr_d):
     (tmp_path / MODEL).mkdir(parents=True)
     (tmp_path / MODEL / "config.json").write_text(json.dumps(cfg))
     return types.SimpleNamespace(
-        model=str(tmp_path / MODEL),
+        model=str(tmp_path / MODEL), profile="qwen27b",
         extra_d=("--rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
                  "--rank-moe-resident-fraction " + fr_d),
         # x114c/d liefen vor H39 (H50: der Zustand waehlt die Referenzen)
