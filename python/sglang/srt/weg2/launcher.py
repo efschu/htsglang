@@ -22754,9 +22754,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "at the rung's fraction), green (stage 3, NOT built: named fallback to chunk).")
     ap.add_argument("--dual-green-ladder", choices=("off", "on", "hold"), default="off",
                     help="DUAL-SHARE stage 3 (weg2/dual_green.py): P's SM share as a green-context LADDER "
-                         "(100/75/50/25 % per forward, dynamic, up AND down; PP0 stamps the stage on the request "
+                         "(100/75/50/25 %% per forward, dynamic, up AND down; PP0 stamps the stage on the request "
                          "wire so all three stages run the same one). 'on' = ladder + hold OBSERVER (the P-STUFE "
-                         "log carries would_hold), 'hold' = additionally PP0 really holds (0 %) while the arena "
+                         "log carries would_hold), 'hold' = additionally PP0 really holds (0 %%) while the arena "
                          "is full. Needs --dual-priority, 'green' in --dual-share-actuators, --dual-mps on, "
                          "no --dual-p-sm-pct. Default off = argv/env/launch path byte-identical.")
     ap.add_argument("--dual-d-capture-prio", choices=("off", "on"), default="off",
