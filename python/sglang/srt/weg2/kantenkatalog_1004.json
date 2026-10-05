@@ -181,6 +181,12 @@
      "beleg": {"datei": "/spinning/gpu-arb/docker/entrypoint.sh", "zeile": 525, "anker": "PROFILE_MEMAVAIL_MIN_GIB"}},
     {"id": "K59", "von": "--pp-cut-expert-device-fraction", "nach": "--pp-stage-ratio", "rel": "skaliert_mit", "calc": "text", "wert": null,
      "satz": "Der Anteil-Vektor trägt einen Wert pro P-Stufe -- die Stufenzahl des Schnitts bestimmt seine Länge.",
-     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 21499, "anker": "device pool"}}
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 21499, "anker": "device pool"}},
+    {"id": "K60", "von": "--p-prefill-graph-calibration", "nach": "--pp-stage-ratio", "rel": "braucht", "calc": "text", "wert": null,
+     "satz": "Die Kalibriertabelle gilt nur für den Layer-Schnitt, auf dem sie gemessen wurde (ihr Schlüssel pp_layer_ratio). Weicht der Schnitt dieses Starts ab, verwirft der Launcher die Tabelle, löst den Schnitt neu und schreibt CUT-MISMATCH ins Log; ohne pp_layer_ratio in der Tabelle gibt es nur eine Warnung und die Tabelle wird benutzt. Was es kostet: ein anderer Schnitt (z. B. Dual 45,10,9 statt Flip 49,8,7) braucht eine eigene Tabelle, sonst wählt der Start die Graph-Breiten ohne Kalibrierung.",
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 23185, "anker": "different = PREFILL-GRAPH-CALIBRATION CUT-MISMATCH"}},
+    {"id": "K61", "von": "--p-prefill-graph-calibration", "nach": "--p-prefill-graph-policy", "rel": "braucht", "calc": "text", "wert": null,
+     "satz": "Die Kalibriertabelle entscheidet nur bei --p-prefill-graph-policy auto, welche Breiten einen Prefill-Graph bekommen; bei on (alles erzwungen) und off (nur Hauptgröße plus tiny) wird sie bei dieser Wahl nicht gelesen.",
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 23179, "anker": "Only with --p-prefill-graph-policy auto: the calibration table"}}
   ]
 }

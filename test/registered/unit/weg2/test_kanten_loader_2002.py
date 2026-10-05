@@ -1,7 +1,7 @@
 """Auftrag 2002 C: der Kantenkatalog (kantenkatalog_1004.json) wird gelesen und mit ``CURATED[...]["depends"]`` verschmolzen.
 
 Gepinnt (Nutzerentscheid 05.10., Variante A: Loader + Verschmelzung, KEINE Regelauswertung im Editor):
-  * Jede der 59 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``kante``-ID, ``beleg``, ``satz``); 51 verschmolzen, 8 neu.
+  * Jede der 61 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``kante``-ID, ``beleg``, ``satz``); 51 verschmolzen, 10 neu.
   * Die 24 kuratierten Kanten ohne Katalogkante bleiben und sind ``belegt: False`` ("ohne Beleg"), nicht geloescht.
   * Weicht die Beziehungsart ab, bleibt die kuratierte und ``rel_katalog`` traegt die andere (kein stilles Ueberschreiben).
   * ``to_kind`` kennzeichnet das Ziel (flag/env/var/ablehnung/unbekannt): ein Chip zeigt nie stumm ins Leere.
@@ -59,9 +59,9 @@ class RealCatalog(unittest.TestCase):
     def test_status_block_counts(self):
         k = self.cat["kanten"]
         self.assertTrue(k["geladen"])
-        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"]), (59, 51, 8))
+        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"]), (61, 51, 10))
         self.assertEqual(k["kanten_ohne_beleg"], 24)
-        self.assertEqual(k["kanten_belegt"], 59)
+        self.assertEqual(k["kanten_belegt"], 61)
         self.assertEqual(k["uebersprungen_ohne_von"], [])
         self.assertEqual(k["ziel_unbekannt"], 0)
         self.assertEqual(k["wertbedingt"], 8)
@@ -89,7 +89,7 @@ class RealCatalog(unittest.TestCase):
         self.assertTrue(d["effect"])                    # the curated sentence is untouched
         n_curated = sum(len(c.get("depends", [])) for c in CU.CURATED.values())
         n_all = sum(len(e["depends"]) for e in self.ent.values())
-        self.assertEqual(n_all, n_curated + 8)          # nothing deleted, 8 appended
+        self.assertEqual(n_all, n_curated + 10)         # nothing deleted, 10 appended
 
     def test_new_edges_are_appended_with_source_katalog(self):
         d = self.dep("--idle-layout", "--dual-layout")  # K44, not curated
