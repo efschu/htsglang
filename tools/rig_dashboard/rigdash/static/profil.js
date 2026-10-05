@@ -232,8 +232,11 @@
     else if (!st.doc) body = `<div class="muted pf-note">Erst ein Profil laden.</div>`;
     else if (!b) body = `<div class="muted pf-note">${st.barBusy ? "rechnet …" : "Noch nicht gerechnet."}</div>`;
     else {
-      const note = b.err ? `<div class="kp-verdict bad">${esc(b.err)}</div>` : "";
-      if (b.fast) {
+      // Fehler der ERSTEN Rechnung: es gibt noch keine Balken (b.phases fehlt); nur die Meldung zeigen, nie in b.phases greifen (sonst wirft draw() und der ganze Reiter friert ein)
+      // Fehler einer Folgerechnung: die alten Balken bleiben stehen, sind aber ausdrücklich als veraltet gekennzeichnet
+      const note = b.err ? `<div class="kp-verdict bad">${esc(b.err)}${b.phases ? " &middot; die Balken darunter stammen aus der letzten erfolgreichen Rechnung und sind VERALTET" : ""}</div>` : "";
+      if (!b.phases && !b.fast) body = note || `<div class="muted pf-note">Keine Balken: ${esc("die Rechnung lieferte nichts")}.</div>`;
+      else if (b.fast) {
         barsDrawn = barsDrawn.concat(b.fast);
         body = `${note}<div class="muted pf-note"><b>Näherung im Browser</b> (lineare Rechnung für den geänderten Layer-Schnitt; der Server rechnet gerade nach)</div>${PB.render(b.fast, { base: 0 })}`;
       } else {
@@ -304,7 +307,7 @@
   root.addEventListener("toggle", (e) => {
     const f = e.target && e.target.dataset && e.target.dataset.fold;
     if (f) st.fold[f] = e.target.open;
-    if (f === "bars" && e.target.open && !st.bars && st.doc) scheduleRecompute();
+    if (f === "bars" && e.target.open && !st.bars && !st.barBusy && st.doc) scheduleRecompute();
   }, true);
   if (window.ProfilBalken) window.ProfilBalken.attach(root, () => barsDrawn);
   root.addEventListener("change", (e) => {

@@ -122,8 +122,8 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .pf-dep-off { opacity: .55; border-style: dashed; }
 .pf-flash { animation: pfflash 1.6s; } @keyframes pfflash { 0% { background: color-mix(in srgb, var(--warn) 35%, transparent); } 100% { background: transparent; } }
 .pf-fold { border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; margin: 8px 0; background: var(--surface); } .pf-fold > summary { cursor: pointer; font-size: 13px; }
-.pf-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 6px; margin: 6px 0; }
-.pf-card { display: flex; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; } .pf-card select { flex: 1 1 auto; }
+.pf-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 6px; margin: 6px 0; }
+.pf-card { display: flex; gap: 8px; align-items: center; min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; } .pf-card select { flex: 1 1 auto; min-width: 0; }
 .pf-row-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
 .pf-verdict { border: 1px solid var(--line); border-left-width: 5px; border-radius: 8px; padding: 8px 12px; margin: 8px 0; background: var(--surface); }
 .pf-verdict.ok { border-left-color: var(--good); } .pf-verdict.bad { border-left-color: var(--bad); }

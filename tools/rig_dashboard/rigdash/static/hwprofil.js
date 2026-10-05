@@ -14,7 +14,7 @@
   "use strict";
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const BADGE = { "gemessen": ["hwp-m", "gem."], "NVML": ["hwp-n", "NVML"], "Datenblatt": ["hwp-d", "Datenbl."], "geschätzt": ["hwp-e", "gesch."], "nicht gemessen": ["hwp-x", ""] };
-  const CSS = ".hwp{font:13px/1.45 system-ui,sans-serif}.hwp table{border-collapse:collapse;margin:.4em 0 1em}"
+  const CSS = ".hwp{font:13px/1.45 system-ui,sans-serif;max-width:100%;overflow-x:auto}.hwp table{border-collapse:collapse;margin:.4em 0 1em}"
     + ".hwp th,.hwp td{border:1px solid var(--hwp-line,#8884);padding:2px 8px;text-align:right;white-space:nowrap}"
     + ".hwp th:first-child,.hwp td:first-child{text-align:left}.hwp h4{margin:1em 0 .2em}"
     + ".hwp .hwp-x{opacity:.6;font-style:italic}.hwp sup{font-size:.7em;opacity:.7;margin-left:2px}"

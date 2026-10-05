@@ -459,6 +459,11 @@ class ProfilEditor:
                 found.append({"code": "HW-UNCALIBRATED", "text": msg, "source": "weg2/card_identity.uncalibrated_message"})
             try:
                 tp.plan_topology(len(cards))
+            except ImportError as exc:
+                # topology.plan_topology prüft für N != 3 mit weg2/weight_exchange_region (import sglang): im Dashboard-Prozess ohne
+                # sglang-Umgebung nicht möglich. Das ist KEINE Ablehnung und darf nicht als HTTP 500 enden (Browsertest 1979).
+                notes.append("Topologie für %d Karte(n) nicht geprüft: das Planer-Gate braucht dafür die sglang-Umgebung (%s: %s)."
+                             % (len(cards), type(exc).__name__, exc))
             except tp.TopologyRefused as exc:
                 # N inside the range that is only not proven ("N cards would be P = ..., proven on metal only for N in [3]") is the value
                 # refusal HW-COUNT (the 27B line names it so); N with no topology at all is HW-TOPOLOGY (not forceable)

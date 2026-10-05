@@ -87,14 +87,14 @@
     if (!r) return "";
     const s = r.s;
     return "<b>" + esc(s.label) + "</b><br>" + fmt(s.mib) + " MiB (" + gib(s.mib) + " GiB) · " + pct(s.mib, bar.total_mib) + " der Karte<br>" +
-      "Herkunft: <b>" + esc(s.origin || "") + "</b>" + (s.src ? ' <span class="muted">(' + esc(s.src) + ")</span>" : "") + "<br>" +
+      "Herkunft: <b>" + esc(s.origin || "") + "</b>" + (s.src && String(s.origin || "").indexOf(s.src) < 0 ? ' <span class="muted">(' + esc(s.src) + ")</span>" : "") + "<br>" +
       '<span class="muted">' + esc(s.what || s.label) + "</span>" +
       (s.key === "overflow" ? '<br><span class="kp-t-bad">Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden.</span>' : "");
   }
   function bar(b, ctx) {
     const m = model(b), w = (a) => (100 * a / m.scale).toFixed(3) + "%";
     let html = "";
-    m.rows.forEach((r) => { html += '<i class="kp-s ks-' + (CLS[r.s.key] || "o") + (r.s.key === "overflow" ? " kp-beyond" : "") + '" data-s="' + r.i + '" data-b="' + ctx + '" style="width:' + w(r.s.mib) + '"></i>'; });
+    m.rows.forEach((r) => { html += '<i class="kp-s ks-' + (CLS[r.s.key] || "o") + (r.s.key === "overflow" ? " kp-beyond" : "") + '" data-s="' + r.i + '" data-b="' + ctx + '" tabindex="0" aria-label="' + esc(r.s.label) + " " + fmt(r.s.mib) + ' MiB" style="width:' + w(r.s.mib) + '"></i>'; });
     const over = m.sum > b.total_mib;
     const edge = over ? '<div class="kp-edge" style="left:' + w(b.total_mib) + '" title="Kartenende ' + fmt(b.total_mib) + ' MiB"><span>Kartenende ' + gib(b.total_mib) + " GiB</span></div>" : "";
     return '<div class="kp-barw' + (b.overflow_mib > 0 ? " kp-ov" : "") + '" data-bar="' + ctx + '"><div class="kp-bar">' + html + "</div>" + edge + "</div>";
@@ -132,6 +132,9 @@
     };
     el.addEventListener("mousemove", (ev) => { const t = at(ev); if (t) show(t, ev.clientX, ev.clientY); else hide(); });
     el.addEventListener("mouseleave", hide);
+    // Tastatur: Segment per Tab erreichbar, Tooltip beim Fokus (Browsertest 1979: die Segmente waren nicht fokussierbar, obwohl der Kommentar "Fokus" nannte)
+    el.addEventListener("focusin", (ev) => { const t = at(ev); if (t) { const r = ev.target.getBoundingClientRect(); show(t, r.left + r.width / 2, r.top); } });
+    el.addEventListener("focusout", hide);
     el.addEventListener("click", (ev) => { const t = at(ev); if (t) show(t, ev.clientX, ev.clientY); else hide(); });
   }
 
