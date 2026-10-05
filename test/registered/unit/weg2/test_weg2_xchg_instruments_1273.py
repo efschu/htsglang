@@ -300,7 +300,7 @@ class XchgInstrumentTest(CustomTestCase):
         instrument lie, and the cheapest possible way to get this wrong.
         """
         src = open(WEIGHT_UPDATER, encoding="utf-8").read()
-        resume_call = src.index("self.memory_saver_adapter.resume(tag)")
+        resume_call = src.index("weg2_tms_resume(self.memory_saver_adapter, tag)")
         stats_call = src.index("self.memory_saver_adapter.resume_stats(tag)")
         leg_done = src.index("weg2_leg_ms = (time.perf_counter() - t_w0) * 1000")
         self.assertLess(resume_call, stats_call)
@@ -382,7 +382,7 @@ class XchgInstrumentTest(CustomTestCase):
         alone), and a moved line would silently redefine the number.
         """
         src = open(CORE_CPP, encoding="utf-8").read()
-        resume_at = src.index("void TorchMemorySaver::resume(")
+        resume_at = src.index("int TorchMemorySaver::resume(")
         body = src[resume_at:]
         i_pass1 = body.index("// --- pass 1: map every allocation of the tag ---")
         i_t0 = body.index("const auto weg2_map_t0")

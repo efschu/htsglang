@@ -3685,7 +3685,11 @@ def test_the_adapter_derives_and_hands_the_plan_down(no_active_leg):
     on ``no-plan`` while this file's behaviour tests all passed -- the seam is
     exactly where a wiring defect is invisible from both sides.
     """
-    src = _wu_source("_weg2_shadow_plan")
+    # 1533: `_weg2_shadow_plan` is the per-leg cache wrapper since 15.09.
+    # (weg2xsn94); the derivation, the region tag and the never-raises law live
+    # in `_weg2_shadow_plan_uncached`, which the wrapper must still reach.
+    assert "_weg2_shadow_plan_uncached" in _wu_source("_weg2_shadow_plan")
+    src = _wu_source("_weg2_shadow_plan_uncached")
     assert "sh.derive_leg_plan(" in src
     assert "weights_region_tag_for" in src, (
         "the region tag must be the one this runner's weights were opened "
@@ -3697,7 +3701,7 @@ def test_the_adapter_derives_and_hands_the_plan_down(no_active_leg):
     # And it still cannot raise into the leg.
     import ast as _ast
 
-    tree = _wu_ast("_weg2_shadow_plan")
+    tree = _wu_ast("_weg2_shadow_plan_uncached")
     assert not any(isinstance(n, _ast.Raise) for n in _ast.walk(tree))
     assert any(isinstance(n, _ast.ExceptHandler) for n in _ast.walk(tree))
 

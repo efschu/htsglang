@@ -867,8 +867,21 @@ def test_no_join_path_can_reach_derive_leg_plan():
 
     from sglang.srt.managers.scheduler_components import weight_updater as wu
 
+    # 1533: `_weg2_shadow_plan` is a per-leg CACHE since 15.09. (weg2xsn94) and
+    # the producer choice lives in `_weg2_shadow_plan_uncached`.  The ratchet is
+    # about the provider as a whole, so the wrapper is held to it as well: it
+    # may only forward to the impl, never derive anything itself.
+    wrapper = ast.parse(textwrap.dedent(inspect.getsource(
+        wu.SchedulerWeightUpdaterManager._weg2_shadow_plan)))
+    wrapper_calls = {
+        (n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", None))
+        for n in ast.walk(wrapper) if isinstance(n, ast.Call)
+    }
+    assert "derive_leg_plan" not in wrapper_calls
+    assert "_weg2_shadow_plan_uncached" in ast.dump(wrapper), (
+        "the cache wrapper no longer forwards to the provider this ratchet reads")
     src = textwrap.dedent(inspect.getsource(
-        wu.SchedulerWeightUpdaterManager._weg2_shadow_plan))
+        wu.SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached))
     tree = ast.parse(src)
 
     # Find the `if <...exchange_armed()...>:` branch and prove that no call to
@@ -1026,7 +1039,14 @@ def test_the_product_write_site_passes_the_group_unique_rank():
     runner = inspect.getsource(
         __import__("sglang.srt.model_executor.model_runner",
                    fromlist=["x"]).ModelRunner.load_model)
-    assert "pp_rank=self.pp_rank" in runner
+    # 1533 (#1378 xsn78/xsn79): the manifest carries the PROCESS's pipeline
+    # place (the primary group's ``rank_in_group``, which a drafter's own
+    # runner -- pp_rank 0 -- cannot tell), with the runner's own ``self.pp_rank``
+    # only as the fallback on a desk without a process group.  Either way the
+    # PP axis, and not tp_rank, is what reaches ``arm_coverage_at_load``.
+    assert "pp_rank=_pp_rank_of_process" in runner
+    assert 'getattr(_ps, "_PP", None)' in runner
+    assert "else int(self.pp_rank)" in runner
     assert "tp_size=self.tp_size" in runner
 
 
