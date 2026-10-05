@@ -690,6 +690,13 @@ class Envs:
     # (no collective, no wall clock in the decision); the head keeps retrying itself. The marker
     # '#1640 GRANT-INFEASIBLE' is a pure log line and is written with or without the switch. 0 = off (default).
     SGLANG_WEG2_DUAL_GRANT_INFEASIBLE_SKIP = EnvBool(False)
+    # #1730 FRONT-REJECT-OVERLONG (deskq/done/1740; b9o: 27 of 28 claude-cli 503 = P's 400 'Input length (134k-150k) exceeds the
+    # maximum allowed length (131072 tokens)', each one a 1-token stub that held a full ring slot on P and fed the
+    # gate=seats stall): in the DUAL layout the front answers a request whose EXACT front token count (X-EXACT) is over
+    # the group's --max-kv-per-request with HTTP 400 invalid_request_error (Anthropic or OpenAI body by route) BEFORE any
+    # route/seat/leg 1, P untouched. Inert in the flip form (no dual layout), without an exact count, and without a
+    # known cap. 0 = off (default).
+    SGLANG_WEG2_FRONT_REJECT_OVERLONG = EnvBool(False)
     # Q-680 DUAL RESUME-STALE-LEDGER (dual y8w fs10031623 16:45:42: two P
     # followers kept 201/302 MB committed for 905 s, the front's RESUME-WAIT
     # held the whole queue): when P is idle (no leg in flight) and the only

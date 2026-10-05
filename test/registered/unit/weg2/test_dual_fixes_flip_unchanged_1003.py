@@ -1051,3 +1051,18 @@ class TestQ1330FlipUnchanged:
                                     p_min_share=0.25, env={}, log=lambda m: None)
         assert type(fs.ctrl) is S.ShareController and fs.green is None
 
+
+
+# ---------------------------------------------------------------------------------- #1730
+
+class TestQ1730FrontRejectOverlongFlipUnchanged:
+    def test_flip_form_never_refuses_even_with_the_switch_on(self, monkeypatch):
+        """#1730 FRONT-REJECT-OVERLONG: without the dual layout the gate returns None (no counter, no refusal),
+        whatever the switch and the count say -- the flip form takes the unchanged path."""
+        monkeypatch.setenv("SGLANG_WEG2_FRONT_REJECT_OVERLONG", "1")
+        f = object.__new__(F.Front)
+        f.counters = collections.Counter()
+        f.dual_layout = False
+        f._store_probe_info = {"max_kv_per_request": 131072}
+        assert f._overlong_gate("r", "/v1/messages", SimpleNamespace(n=10 ** 6, mm=False)) is None
+        assert not f.counters
