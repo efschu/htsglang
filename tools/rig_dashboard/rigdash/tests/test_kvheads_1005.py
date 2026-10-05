@@ -94,6 +94,18 @@ class GegenLaufzeit(unittest.TestCase):
             self.assertEqual(KV.split_units(units, w), want, (units, w))
 
 
+class RenameFest(unittest.TestCase):
+    def test_json_keys_the_page_reads_are_not_keyword_arguments(self):
+        """Das Rename-Kit (rename_rigdash.py) benennt BEZEICHNER um (``quelle`` -> ``source``), String-Schlüssel nicht. ``profil.js`` liest ``r.quelle``;
+        stünde ``quelle=`` als Schlüsselwort-Argument in kvheads.py, hieße der JSON-Schlüssel im umbenannten Editor ``source`` und die Seite zeigte
+        "(undefined)" (gefunden bei der Rename-Probe 05.10.)."""
+        with open(os.path.join(os.path.dirname(HERE), "kvheads.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        page_keys = {"quelle", "regime", "kv", "q", "satz", "notiz", "belege", "heads", "ratios", "group"}
+        bad = sorted({k.arg for n in ast.walk(tree) if isinstance(n, ast.Call) for k in n.keywords if k.arg in {"quelle"}})
+        self.assertEqual(bad, [], "Schlüsselwort-Argumente, die das Rename-Kit umbenennt: %s (Seitenschlüssel: %s)" % (bad, sorted(page_keys)))
+
+
 class Ansicht(unittest.TestCase):
     def test_view_reads_config_and_row(self):
         with tempfile.TemporaryDirectory() as d:
