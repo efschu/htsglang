@@ -139,7 +139,9 @@ def test_xsn273_the_seat_gate_in_front_of_the_adder_feeds_the_watch_too():
     src = open(sch.__file__).read()
     i = src.index("weg2xsn273: the seat gate declined")
     blk = src[i:i + 1200]
-    assert "if running_batch.is_empty() and self.waiting_queue:" in blk
+    # #1720: the condition is now also gated by the (default-off) SEATS-STALL-OFF switch
+    assert ("if (running_batch.is_empty() and self.waiting_queue\n"
+            "                    and not self._weg2_seats_stall_off()):") in blk
     assert "self._weg2_intake_stall_observe(" in blk and "self.waiting_queue[0], None," in blk
     assert "allocatable_reqs=" in blk and "req_slots_free=" in blk
     w = st.IntakeStallWatch(hold_s=1.0)
