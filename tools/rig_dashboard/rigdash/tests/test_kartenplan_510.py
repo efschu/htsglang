@@ -42,8 +42,26 @@ class TestKatalog(unittest.TestCase):
         ids = {c["id"] for c in CAT.CATALOG}
         for want in ("rtx5060ti-8", "rtx5060ti-16", "rtx4060ti-8", "rtx4060ti-16", "rtx3080-10", "rtx3080-12", "rtx3080-20",
                      "rtx3090ti-24", "rtx3090-24", "rtx3080ti-12", "rtx5090-32", "rtx5080-16", "rtx5070ti-16", "rtx5070-12",
-                     "rtx4090-24", "rtx4080s-16", "rtx4080-16", "rtx4070tis-16", "rtx4070ti-12", "rtx4070s-12", "rtx4070-12"):
+                     "rtx4090-24", "rtx4080s-16", "rtx4080-16", "rtx4070tis-16", "rtx4070ti-12", "rtx4070s-12", "rtx4070-12", "rtx3070-8"):
             self.assertIn(want, ids)
+
+    def test_rtx3070_hat_die_datenblattwerte(self):
+        """HW-generisches Release (Nutzer): die 3070 fehlte. Datenblatt: 8 GB GDDR6, 256 Bit, 448 GB/s, PCIe 4.0 x16; Ampere = sm86 wie die anderen 30er."""
+        c = CAT.card("rtx3070-8")
+        self.assertEqual((c["vram_gb"], c["usable_mib"], c["arch"], c["mem_bw_gbs"], c["bus_bits"]), (8, 8 * 1024, "sm86", 448, 256))
+        self.assertEqual((c["pcie_native"]["gen"], c["pcie_native"]["lanes"]), (4, 16))
+        self.assertTrue(c["usable_src"].startswith("Datenblatt"))
+        self.assertFalse(c["measured_on_rig"])
+
+    def test_max_cards_follows_the_planner(self):
+        """Die Seite bietet höchstens so viele Karten an wie der Planer beurteilen kann (weg2/topology.py MAX_CARDS_BAR1); sonst nennt sie 6 Karten, wo
+        der Planer 8 kennt (gefunden bei der HW-generisch-Meldung 05.10.)."""
+        import re
+        from rigdash import kartenplan as KP
+        topo = os.path.join(os.path.dirname(HERE), "..", "..", "..", "python", "sglang", "srt", "weg2", "topology.py")
+        with open(os.path.normpath(topo), encoding="utf-8") as fh:
+            planner_max = int(re.search(r"^MAX_CARDS_BAR1 = (\d+)", fh.read(), re.M).group(1))
+        self.assertEqual(KP.MAX_CARDS, planner_max)
 
     def test_rig_karten_haben_nvml_record_fremde_datenblatt(self):
         self.assertEqual(CAT.card("rtx3080-20")["usable_mib"], 20480)
@@ -187,7 +205,7 @@ class TestGateUndAblehnung(unittest.TestCase):
 
     def test_zu_viele_oder_keine_karten(self):
         with self.assertRaises(ValueError):
-            self.plan("27b-int8", ["rtx3090-24"] * 7)
+            self.plan("27b-int8", ["rtx3090-24"] * (K.MAX_CARDS + 1))      # eine Karte über der Grenze (Planer: MAX_CARDS_BAR1)
         with self.assertRaises(ValueError):
             self.plan("27b-int8", [])
 

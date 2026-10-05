@@ -28,7 +28,9 @@ from . import kartenplan_transport as TR
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kartenplan_data")
 SCHEMA = "kartenplan.record/1"
-MAX_CARDS = 6
+#: so viele Karten bietet die Seite an: dieselbe Grenze wie der Planer (weg2/topology.py MAX_CARDS_BAR1 = 8, MIN_CARDS = 2); was dort außerhalb liegt,
+#: sagt der Planer selbst als HW-TOPOLOGY ab. test_max_cards_follows_the_planner hält beide Zahlen zusammen.
+MAX_CARDS = 8
 
 
 def _canonical(obj) -> str:

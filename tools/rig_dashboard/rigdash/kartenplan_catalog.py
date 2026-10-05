@@ -75,6 +75,8 @@ def _build_catalog() -> List[dict]:
 
     c.append(_card("rtx3090ti-24", "RTX 3090 Ti", 24, "sm86", 1008, 4, 16, bus_bits=384))
     c.append(_card("rtx3090-24", "RTX 3090", 24, "sm86", 936, 4, 16, bus_bits=384))
+    # Datenblatt: 8 GB GDDR6, 256 Bit, 448 GB/s, PCIe 4.0 x16 (GA104); Compute Capability 8.6 wie die übrigen 30er-Karten (Ampere), nicht am Rig gemessen
+    c.append(_card("rtx3070-8", "RTX 3070", 8, "sm86", 448, 4, 16, bus_bits=256))
     c.append(_card("rtx3080ti-12", "RTX 3080 Ti", 12, "sm86", 912, 4, 16, bus_bits=384))
     c.append(_card("rtx3080-12", "RTX 3080", 12, "sm86", 912, 4, 16, variant="12 GB", bus_bits=384))
     c.append(_card("rtx3080-10", "RTX 3080", 10, "sm86", 760, 4, 16, variant="10 GB", bus_bits=320))
