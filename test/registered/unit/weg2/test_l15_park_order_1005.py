@@ -400,7 +400,7 @@ def test_loss_census_where_in_the_chain():
     cen = l15_tree_cand.loss_census(tree, require_l2=True)
     assert cen["first_miss_tok"] == [4] and cen["head_miss"] == 1
     line = l15_tree_cand.loss_line(1, cen, 0, 0, True)
-    assert line.endswith("head_miss=1 shadow_len_mismatch=0 first_miss_tok=4")
+    assert line.endswith("head_miss=1 shadow_len_mismatch=0 tip_miss=1 anc_miss=0 first_miss_tok=4")
 
 
 def test_diag_line_only_when_switch_on_and_walk_ends_empty():
@@ -414,7 +414,7 @@ def test_diag_line_only_when_switch_on_and_walk_ends_empty():
     assert len(loss) == 1
     assert loss[0].startswith("L15-TREE-CAND-LOSS rank=2 local=3 agreed=0 require_l2=0 tips=3 "
                               "no_mamba_host=3 ")
-    assert loss[0].endswith("head_miss=0 shadow_len_mismatch=0 first_miss_tok=-")
+    assert loss[0].endswith("head_miss=0 shadow_len_mismatch=0 tip_miss=0 anc_miss=0 first_miss_tok=-")
     # log-only: the result and every other line are identical
     assert out_on == out_off == []
     assert [x for x in logs_on if "TREE-CAND-LOSS" not in x] == logs_off
