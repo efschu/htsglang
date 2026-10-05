@@ -524,10 +524,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
   <button type="button" role="tab" data-tab="verlauf">Verlauf</button>
   <button type="button" role="tab" data-tab="sitzungen">Sitzungen</button>
   <button type="button" role="tab" data-tab="karten">Karten</button>
-  <!--DEV:BEGIN-->
-  <button type="button" role="tab" data-tab="kartenplan">Kartenplaner</button>
-  <!--DEV:END-->
-  <button type="button" role="tab" data-tab="profil">Profil</button>
+  <button type="button" role="tab" data-tab="profil">Profil-Planer</button>
   <!--DEV:BEGIN-->
   <button type="button" role="tab" data-tab="entwicklung">Entwicklung <span class="cnt" id="tab-dev-cnt"></span></button>
   <!--DEV:END-->
@@ -581,19 +578,20 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
     </div>
   </section>
   </div>
-  <!--DEV:BEGIN-->
-  <div class="tab" id="tab-kartenplan" role="tabpanel" hidden>
-    <section class="card" id="kp-card" aria-label="Kartenplaner">
-      <h2>Kartenplaner <span class="muted">optimale Startkonfiguration für ein Modell auf bis zu 6 Karten &middot; Zahlen aus unserem Planer und seinen Aufzeichnungen, nichts wird gestartet</span></h2>
-      <div id="kp-root"><div class="muted">lädt &hellip;</div></div>
-    </section>
-  </div>
-  <!--DEV:END-->
   <div class="tab" id="tab-profil" role="tabpanel" hidden>
     <section class="card" id="pf-card" aria-label="Profil-Editor">
-      <h2>Profil <span class="muted">ein Serverprofil laden, jeden Wert erklärt bearbeiten, prüfen, speichern &middot; erstellt nur, startet nichts &middot; nur im LAN</span></h2>
+      <h2>Profil-Planer <span class="muted">ein Serverprofil laden, jeden Wert erklärt bearbeiten, Karten und Plan dazu sehen, prüfen, speichern &middot; erstellt nur, startet nichts &middot; nur im LAN</span></h2>
       <div id="pf-root"><div class="muted">lädt &hellip;</div></div>
     </section>
+    <!--DEV:BEGIN-->
+    <section class="card" id="kp-card" aria-label="Plan für andere Karten">
+      <details id="kp-fold" class="pf-fold">
+        <summary><b>Plan für andere Karten</b> <span class="muted">Kartenplaner &middot; dasselbe Modell auf anderen oder mehr Karten (auch solchen, die wir nicht haben), Zahlen aus unserem Planer und seinen Aufzeichnungen &middot; nichts wird gestartet</span></summary>
+        <div class="muted pf-note">Die Balken im Profil oben gelten für das geladene Profil auf der gemessenen Hardware dieses Rigs. Hier wählst du Karten frei und siehst den Plan dazu.</div>
+        <div id="kp-root"><div class="muted">lädt &hellip;</div></div>
+      </details>
+    </section>
+    <!--DEV:END-->
   </div>
   <!--DEV:BEGIN-->
   <div class="tab" id="tab-entwicklung" role="tabpanel" hidden>
@@ -2013,9 +2011,13 @@ function pauseReason() {
 // ---------------------------------------------------------------- Tabs und Expertenansicht (Nutzer 01.10.)
 const TABS = [...document.querySelectorAll("#tabbar button[data-tab]")].map((b) => b.dataset.tab);
 let curTab = "ueberblick";
+// der Kartenplaner-Reiter ist im Profil-Planer aufgegangen: alte Links und ein gespeicherter Reiter "kartenplan" führen dorthin
+const TAB_ALIAS = { kartenplan: "profil" };
 try {
-  const h = (location.hash.match(/t=([a-z]+)/) || [])[1];
-  curTab = TABS.includes(h) ? h : (TABS.includes(localStorage.getItem("rigdash.tab")) ? localStorage.getItem("rigdash.tab") : "ueberblick");
+  const alias = (t) => TAB_ALIAS[t] || t;
+  const h = alias((location.hash.match(/t=([a-z]+)/) || [])[1]);
+  const stored = alias(localStorage.getItem("rigdash.tab"));
+  curTab = TABS.includes(h) ? h : (TABS.includes(stored) ? stored : "ueberblick");
 } catch (e) { curTab = "ueberblick"; }
 if (EDITOR_ONLY) curTab = "profil";
 const lastHtml = {};

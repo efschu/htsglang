@@ -56,16 +56,28 @@ class TestPage(unittest.TestCase):
 
     def test_release_page_still_has_no_planer_and_no_development_part(self):
         rel = S.edition_page(page(), "release")
-        for needle in ('data-tab="kartenplan"', 'data-tab="entwicklung"', 'id="kp-root"', "kartenplan.js", 'id="tab-entwicklung"',
+        for needle in ('data-tab="kartenplan"', 'data-tab="entwicklung"', 'id="kp-root"', 'id="kp-fold"', "kartenplan.js", 'id="tab-entwicklung"',
                        "GPU-Fensterplan", "Startzeile", 'id="dev-head"', 'id="gpuqlink"'):
             self.assertNotIn(needle, rel, needle)
 
     def test_the_profil_tab_sits_before_nothing_dev_in_release_and_before_entwicklung_in_rig(self):
         html = page()
         rig = S.edition_page(html, "rig")
-        self.assertLess(rig.index('data-tab="kartenplan"'), rig.index('data-tab="profil"'))
         self.assertLess(rig.index('data-tab="profil"'), rig.index('data-tab="entwicklung"'))
         self.assertIn("kartenplan.js", rig)
+
+    def test_the_planer_is_a_section_of_the_profil_page_not_a_second_tab(self):
+        """Kartenplaner und Profil-Planer sind EINE Seite (Nutzerauftrag 05.10.): kein eigener Reiter, kein eigenes Panel; der Plan ist der
+        aufklappbare Abschnitt #kp-fold INNERHALB des Profil-Panels; alte Links (#t=kartenplan) führen in den Profil-Planer."""
+        html = page()
+        rig = S.edition_page(html, "rig")
+        for gone in ('data-tab="kartenplan"', 'id="tab-kartenplan"'):
+            self.assertNotIn(gone, rig, gone)
+        profil_panel = rig.index('id="tab-profil"')
+        self.assertLess(profil_panel, rig.index('id="kp-fold"'))
+        self.assertLess(rig.index('id="kp-fold"'), rig.index('id="tab-entwicklung"'))
+        self.assertLess(rig.index('id="kp-root"'), rig.index('id="tab-entwicklung"'))
+        self.assertIn('kartenplan: "profil"', rig)
 
     def test_rig_page_is_byte_identical_to_the_source(self):
         self.assertEqual(S.edition_page(page(), "rig"), page())

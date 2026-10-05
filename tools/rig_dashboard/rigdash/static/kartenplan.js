@@ -1,6 +1,7 @@
 /* Kartenplaner (Item 510): Startkonfiguration für ein gewähltes Modell auf 1..6 gewählten Karten.
    Rechnet NICHTS selbst: Katalog und Plan kommen von /api/kartenplan/* (Planer-Funktionen und Planer-Aufzeichnungen).
-   Diese Datei zeichnet nur: Auswahl, Einfach-Seite, Experten-Seite. Nur im Rig-Dashboard (Edition rig). */
+   Diese Datei zeichnet nur: Auswahl, Einfach-Seite, Experten-Seite. Nur im Rig-Dashboard (Edition rig).
+   Seit 05.10. kein eigener Reiter mehr: der Plan ist der aufklappbare Abschnitt "Plan für andere Karten" im Profil-Planer (#kp-fold). */
 (function () {
   "use strict";
   const root = document.getElementById("kp-root");
@@ -321,9 +322,12 @@
     state.cards = state.cat.rig_preset.cards.map((c) => ({ card: c.card, pcie: Object.assign({}, c.pcie) }));
     draw(); run();
   }
-  // erst laden, wenn der Reiter geöffnet wird (kein Abruf im Hintergrund)
+  // erst laden, wenn der Abschnitt "Plan für andere Karten" im Profil-Planer aufgeklappt wird (kein Abruf im Hintergrund)
   let started = false;
-  function maybeStart() { if (!started && !document.getElementById("tab-kartenplan").hidden) { started = true; init(); } }
-  new MutationObserver(maybeStart).observe(document.getElementById("tab-kartenplan"), { attributes: true, attributeFilter: ["hidden"] });
-  maybeStart();
+  function maybeStart() { if (!started) { started = true; init(); } }
+  const fold = document.getElementById("kp-fold");
+  if (fold) {
+    fold.addEventListener("toggle", () => { if (fold.open) maybeStart(); });
+    if (fold.open) maybeStart();
+  }
 })();
