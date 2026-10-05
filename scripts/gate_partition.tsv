@@ -29,6 +29,17 @@
 # at risk either way; the sha is corrected because a stale one is a false
 # provenance record, not because the gate would have mis-routed.
 #
+# 1514 (2026-10-05): rows moved by the test branch desk/nf-release-cand-tests-1509,
+# applied here without a rebuild because the logs behind this table are gone
+# (see #895/#899 above). REMOVED: test_pp_proxy_retracted_pass_mispair_791c.py
+# (file deleted by 1502; its NOT_CROWDING_PROVABLE entry is removed from the
+# builder too). ADDED: test_pp_membership_follows_the_row_791c_1502.py and
+# test_pp_proxy_cross_epoch_795_followup_1493.py (successor of the 795 test
+# deleted by 1509). Both rows are exactly what the builder emits for a module
+# with no solo log -- SERIAL, unproven:no_solo_log -- and the sha256 is
+# gate_partition_build.sha() over the current bytes. A fresh solo proof may
+# promote them. 1503's test lives under unit/weg2, outside this gate path.
+#
 # verdicts
 #   PARALLEL  solo failure set == serial failure set -> wide lane
 #   RANKS     same proof, but the module spawns real ranks -> narrow lane,
@@ -222,6 +233,7 @@ test/registered/unit/managers/test_pp_flip_leftover_proxy_757.py	RANKS	solo_equa
 test/registered/unit/managers/test_pp_flip_slot_hold_631.py	PARALLEL	solo_equals_serial	088dfe9a4f774c0a	
 test/registered/unit/managers/test_pp_forwarded_schedule_791.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	113fe41383ebfafb	
 test/registered/unit/managers/test_pp_idle_void_streak_801.py	PARALLEL	solo_equals_serial	99202d435af26561	
+test/registered/unit/managers/test_pp_membership_follows_the_row_791c_1502.py	SERIAL	unproven:no_solo_log	750547bb9923092e	
 test/registered/unit/managers/test_pp_micro_batch_cap_701.py	PARALLEL	solo_equals_serial	708599f937b3e977	
 test/registered/unit/managers/test_pp_output_readiness_ring_802.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	92b97e2fee251131	
 test/registered/unit/managers/test_pp_output_ring_retraction_wedge_791b.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	622a6c6c14eaf249	
@@ -231,9 +243,9 @@ test/registered/unit/managers/test_pp_presence_futile_wait_850.py	PARALLEL	solo_
 test/registered/unit/managers/test_pp_presence_stash_on_real_wire_800.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	3b29058313dc43b9	
 test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py	PARALLEL	solo_equals_serial	881563b75486a3af	
 test/registered/unit/managers/test_pp_progress_exit_677.py	PARALLEL	solo_equals_serial	a3938985e54ac20f	
+test/registered/unit/managers/test_pp_proxy_cross_epoch_795_followup_1493.py	SERIAL	unproven:no_solo_log	815da6097e7d2b2d	
 test/registered/unit/managers/test_pp_proxy_readiness_contract_789.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	0b93d601eeddbb95	
 test/registered/unit/managers/test_pp_proxy_readiness_rendezvous_789.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	97672c13c37c386b	
-test/registered/unit/managers/test_pp_proxy_retracted_pass_mispair_791c.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	641b08fadf14dd3e	
 test/registered/unit/managers/test_pp_proxy_stamp_631.py	PARALLEL	solo_equals_serial	c96bb2dc6aed7109	
 test/registered/unit/managers/test_pp_reconcile_slot_blind_798.py	PARALLEL	solo_equals_serial	08810f5ef6623082	
 test/registered/unit/managers/test_pp_retracted_pass_void_797.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	5c0f3bbfa1bc9105	
