@@ -905,6 +905,10 @@ class KvRowCap:
         page = max(1, int(getattr(self._alloc, "page_size", 1) or 1))
         try:
             self._alloc.residency_withheld_slots = self.withheld * page
+            # 1535 F5: READ ONLY BY THE ERROR TEXT (mem_cache/common.py,
+            # _residency_withheld_note). No decision reads it. In PAGE ids,
+            # the unit ``_apply`` compares free page ids against.
+            self._alloc.residency_cap_pages = self._cap
         except Exception:  # pragma: no cover - exotic allocator objects
             pass
 

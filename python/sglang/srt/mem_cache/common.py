@@ -429,6 +429,16 @@ def payable_size(allocator) -> int:
     return payable
 
 
+def _published_int(allocator, name: str) -> Optional[int]:
+    """An int attribute of the allocator, or None. Text-only helper (1535 F5):
+    None is printed as '?', so a missing figure reads as missing, not as 0."""
+    try:
+        value = getattr(allocator, name, None)
+        return None if value is None else int(value)
+    except Exception:  # noqa: BLE001 - a diagnostic must not raise
+        return None
+
+
 def _residency_withheld_note(allocator) -> str:
     """One clause naming the confiscator, or ''. #790.
 
@@ -437,19 +447,42 @@ def _residency_withheld_note(allocator) -> str:
     scheduler's idle invariant does not read it as a leak. The same number is
     the answer to "where did the tokens the tree just freed go", so the error
     that reports the under-delivery names it.
+
+    1535 F5: WHAT THE NUMBER IS. It is ``len(withheld page ids) * page_size``
+    -- TOKEN slot ids (pages x page_size), counted over the allocator's WHOLE
+    id space (``num_pages * page_size``), not over the "EFFECTIVE
+    max_total_num_tokens" the boot line projects, and not references or tree
+    nodes. NF K2 20:49:25: 336064 = 5251 pages x 64 inside an id space of
+    8192 pages = 524288 tokens (cap at page 2560 = 163840 tokens), while the
+    EFFECTIVE line said 262144. The clause therefore names the unit and prints
+    the id space, the cap and the available tokens beside it.
     """
-    withheld = getattr(allocator, "residency_withheld_slots", 0)
+    withheld = _published_int(allocator, "residency_withheld_slots")
+    if withheld is None or withheld <= 0:
+        return ""
+    page = max(1, _published_int(allocator, "page_size") or 1)
+    num_pages = _published_int(allocator, "num_pages")
+    cap_pages = _published_int(allocator, "residency_cap_pages")
     try:
-        withheld = int(withheld)
+        available = int(allocator.available_size())
     except Exception:  # noqa: BLE001 - a diagnostic must not raise
-        return ""
-    if withheld <= 0:
-        return ""
+        available = None
+
+    def _fmt(value: Optional[int]) -> str:
+        return "?" if value is None else str(value)
+
+    space = None if num_pages is None else num_pages * page
+    cap_tokens = None if cap_pages is None else cap_pages * page
     return (
-        f" A RESIDENCY CAP IS ENGAGED and is holding {withheld} slot ids out "
-        f"of the allocator's free list: every freed id above the cap is taken "
-        f"straight back by the cap's free listener, so peeling nodes whose "
-        f"slots live above it frees the TREE and pays the POOL nothing."
+        f" A RESIDENCY CAP IS ENGAGED and is holding {withheld} token slot "
+        f"ids ({withheld // page} pages x page_size {page}; ids, not "
+        f"references or tree nodes) out of the allocator's free list "
+        f"[id space {_fmt(space)} tokens = {_fmt(num_pages)} pages; cap "
+        f"{_fmt(cap_tokens)} tokens = page {_fmt(cap_pages)}; available "
+        f"under the cap {_fmt(available)} tokens]: every freed id above the "
+        f"cap is taken straight back by the cap's free listener, so peeling "
+        f"nodes whose slots live above it frees the TREE and pays the POOL "
+        f"nothing."
     )
 
 
@@ -918,8 +951,11 @@ def _attempt_extend_relief(num_tokens: int) -> int:
                 "extend allocation failed and NO relief provider is "
                 "registered: the alloc-site net is empty on this boot, so the "
                 "guarantee against this crash is entirely the admission guard "
-                "(chunk_tokens_the_pool_can_fund). If you are reading this "
-                "line, admission let through work the pool could not fund."
+                "(chunk_tokens_the_pool_can_fund on the _rem_tokens <= 0 path; "
+                "otherwise PrefillAdder.rem_total_tokens = available_size() + "
+                "deliverable evictable, which does not subtract a residency "
+                "cap). If you are reading this line, admission let through "
+                "work the pool could not fund."
             )
         return 0
     freed = 0
