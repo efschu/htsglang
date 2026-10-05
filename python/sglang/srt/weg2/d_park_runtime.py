@@ -769,6 +769,16 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     no_token_rid = getattr(sched, "_weg2_sa_no_token", None)
     # Q-702: the adder's own numbers of that refusal travel with the rid.
     no_token_view = getattr(sched, NO_TOKEN_VIEW_ATTR, None)
+    if no_token_view is not None and not _view_fresh(sched, no_token_view):
+        n = getattr(sched, "_sa_view_stale_n", 0) + 1
+        sched._sa_view_stale_n = n
+        if n <= 8 or (n & (n - 1)) == 0:
+            logger.info("Q-702 SEAT-AGE VIEW-STALE older=%s age=%d passes max=%d (n=%d): the adder's "
+                        "numbers are older than one pass; the verdict reads the legacy basis",
+                        no_token_view.get("rid"),
+                        int(getattr(sched, SA_PASS_ATTR, 0) or 0) - int(no_token_view.get("pass", 0)),
+                        VIEW_MAX_AGE_PASSES, n)
+        no_token_view = None
     try:
         sched._weg2_sa_no_token = None
         setattr(sched, NO_TOKEN_VIEW_ATTR, None)
@@ -984,6 +994,15 @@ def _req_kv_tokens(r) -> int:
 #: next to ``_weg2_sa_no_token`` (set in the same branch, consumed in the same pass).
 NO_TOKEN_VIEW_ATTR = "_weg2_sa_no_token_view"
 
+#: Q-702 (Auftrag 1522): the scheduler's pass counter (``_get_new_batch_prefill_raw``
+#: counts every call, before any early exit). A view carries the count of the pass
+#: that wrote it; ``displace_for_age`` reads it in the NEXT pass at the earliest.
+SA_PASS_ATTR = "_weg2_sa_pass"
+#: A view older than this many passes is dropped (legacy reading): its budget
+#: carries only the pool drift, not the decode steps, finished requests and
+#: backfills of the passes in between (review 1140, finding 2).
+VIEW_MAX_AGE_PASSES = 1
+
 
 def _pool_reading(sched) -> Optional[int]:
     """available + evictable as the (legacy) verdict reads them; None = no reading."""
@@ -998,30 +1017,85 @@ def _pool_reading(sched) -> Optional[int]:
     return have
 
 
+def _group_refusal(follow, rid: str):
+    """Q-702 (Auftrag 1522, review 1140 finding 1): ``(rid, price, budget)`` of the
+    GROUP's refusal on a Form A group, read from the gate numbers the group verdict
+    carried (``tp_match_floor.form_a_admission_verdict(sink=...)``, kept by the
+    scheduler's ``_follow`` as ``last_verdict``): the host's -- under the token cut
+    the decider's -- ``total_tokens`` against ``rem_total_tokens``, the same tuple on
+    every rank. None unless that call was THIS rid's NO_TOKEN with the adder's own
+    shape (``price >= budget``: a lifetime refusal; a host refusal on another gate --
+    SWA, load-back no room, cut room -- carries no budget question and stays legacy
+    on every rank alike)."""
+    last = getattr(follow, "last_verdict", None)
+    if not isinstance(last, tuple) or len(last) != 4:
+        return None
+    lrid, code, price, budget = last
+    if str(lrid) != str(rid) or str(code) != "NO_TOKEN":
+        return None
+    price, budget = int(price), int(budget)
+    if price < budget:
+        return None
+    return (str(rid), price, budget)
+
+
 def note_adder_refusal(sched, adder, req, running_batch) -> None:
     """Q-702 BUDGET-EINHEIT. Called by the scheduler where it keeps the first
     NO_TOKEN rid of a pass (``_weg2_sa_no_token``): keeps what the ADDER refused
     on -- ``price`` (its ``total_tokens``) against ``budget`` (its
     ``rem_total_tokens``) -- plus the decode reserve it holds for each running
-    request (what a victim's leaving gives back besides its KV rows) and the pool
-    reading at that moment (to carry the number forward by the drift). The
-    verdict (:func:`kv_displace_would_fit`) then asks the adder's question, not
-    one of its own. Bookkeeping only; a missing or foreign refusal sets None and
-    the verdict keeps its legacy reading."""
+    request (what a victim's leaving gives back besides its KV rows), the pool
+    reading at that moment (to carry the number forward by the drift) and the
+    pass number (the age lock of :func:`displace_for_age`). The verdict
+    (:func:`kv_displace_would_fit`) then asks the adder's question, not one of its
+    own. Bookkeeping only; a missing or foreign refusal sets None and the verdict
+    keeps its legacy reading.
+
+    Form A (``adder.form_a_admission_follow`` set; NF D): the gate is the HOST's
+    and every rank adopts its verdict -- a worker's own gate said ADMIT
+    (``local_price`` 4544 against ``local_budget`` 176587, D.log of 10032328
+    23:33:28Z) and never wrote a lifetime refusal, so with only the local numbers
+    the workers read the legacy basis and vetoed the host's in the group MIN. Here
+    every rank takes the GROUP's numbers (:func:`_group_refusal`), so the view --
+    and with it the basis of the verdict -- is the same on all ranks by
+    construction. The rank-local ``lifetime_refusal`` is not read on such a group."""
     view = None
     if not d_seats.d_flip_park_active():
         return  # not a D park group: nothing reads the view, nothing is kept
     try:
-        ref = getattr(adder, "lifetime_refusal", None)
+        follow = getattr(adder, "form_a_admission_follow", None)
+        if follow is not None:
+            ref = _group_refusal(follow, req.rid)
+        else:
+            ref = getattr(adder, "lifetime_refusal", None)
         if ref is not None and str(ref[0]) == str(req.rid):
             reserve = {}
             for r in list(getattr(running_batch, "reqs", None) or []):
                 reserve[str(r.rid)] = int(adder.released_by_leaving(r))
             view = {"rid": str(ref[0]), "price": int(ref[1]), "budget": int(ref[2]),
-                    "reserve": reserve, "pool": _pool_reading(sched)}
+                    "reserve": reserve, "pool": _pool_reading(sched),
+                    "pass": int(getattr(sched, SA_PASS_ATTR, 0) or 0)}
     except Exception:  # noqa: BLE001 -- bookkeeping must never take a pass down
         view = None
     setattr(sched, NO_TOKEN_VIEW_ATTR, view)
+
+
+def _view_fresh(sched, view) -> bool:
+    """Q-702 age lock (review 1140 finding 2): a view is read in the pass after the
+    one that wrote it. When ``admission()`` was not reached in between (the pass
+    declined above it: ``batch_is_full``, the HOL scan cap, an idle run) the budget
+    in it is several passes old -- decode steps took ``bs`` rows a step, finished
+    requests gave their reserve back, backfills took theirs -- and only the pool's
+    drift is carried. Older than :data:`VIEW_MAX_AGE_PASSES` it is dropped and the
+    verdict reads the legacy basis (the base's behaviour, fresh each pass). A view
+    without a pass stamp (a desk double) counts as fresh."""
+    if view is None:
+        return False
+    then = view.get("pass")
+    if then is None:
+        return True
+    age = int(getattr(sched, SA_PASS_ATTR, 0) or 0) - int(then)
+    return 0 <= age <= VIEW_MAX_AGE_PASSES
 
 
 def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, view=None) -> bool:
@@ -1079,7 +1153,9 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
             k = max(1, k)                              # the seat itself needs one victim
     n = getattr(sched, "_sa_kv_fit_n", 0) + 1
     sched._sa_kv_fit_n = n
-    if k != 1 and (n <= 8 or (n & (n - 1)) == 0):
+    # Q-702 (Auftrag 1522): the adder basis names k == 1 too (the displacement itself) -- the
+    # metal probe reads ``basis=adder`` per RANK on exactly that line (review 1110/1140).
+    if (k != 1 or basis == "adder") and (n <= 8 or (n & (n - 1)) == 0):
         logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d basis=%s -> %s (n=%d)",
                     "SEAT" if seat else "KV", str(older_rid), need, avail, len(young), basis,
                     "fits free, nobody leaves" if k == 0 else

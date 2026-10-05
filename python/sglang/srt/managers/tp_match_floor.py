@@ -1171,6 +1171,7 @@ def form_a_admission_verdict(
     drained: int = 0,
     stop: str = "",
     on_host_drain: Any = None,
+    sink: Optional[dict] = None,
 ) -> str:
     """The host's admission verdict for ``rid``, adopted by every worker.
 
@@ -1197,11 +1198,20 @@ def form_a_admission_verdict(
     tokens there, the floor stayed at the workers' 30336 and the head waited
     7 min). ``stop`` -- the host's named deadlock verdict
     (:class:`FormAAdmissionWedgeWatch`); every rank raises
-    :class:`FormAAdmissionDeadlock` with it."""
+    :class:`FormAAdmissionDeadlock` with it.
+
+    Q-702 (Auftrag 1522): ``sink`` (a dict, optional) receives ``price`` and
+    ``budget`` of the rank whose gate DECIDED the returned code -- the host's
+    tuple, or under the token cut the decider's of the gather. The tuple is the
+    same on every rank by construction (broadcast / gather), so a consumer
+    reading it holds the group's numbers, not a rank-local reading (the SEAT-AGE
+    verdict, ``weg2/d_park_runtime.note_adder_refusal``). Nothing else changes;
+    None = today's call."""
     rid = str(rid)
     if gather is not None:
         return _form_a_dcp_admission_verdict(
-            rid, str(local), is_host=is_host, gather=gather, price=price, budget=budget
+            rid, str(local), is_host=is_host, gather=gather, price=price, budget=budget,
+            sink=sink,
         )
     got = exchange(
         (rid, str(local), price, budget, int(drained or 0), str(stop or ""))
@@ -1244,11 +1254,14 @@ def form_a_admission_verdict(
             on_host_drain(host_drained)
     if len(got) == 6 and got[5]:
         raise FormAAdmissionDeadlock(str(got[5]))
+    if sink is not None:
+        sink["price"], sink["budget"] = got[2], got[3]
     return host_code
 
 
 def _form_a_dcp_admission_verdict(
-    rid: str, local: str, *, is_host: bool, gather: Any, price: Any, budget: Any
+    rid: str, local: str, *, is_host: bool, gather: Any, price: Any, budget: Any,
+    sink: Optional[dict] = None,
 ) -> str:
     """#239 S3d: :func:`form_a_admission_verdict` under the token cut."""
     got = gather((rid, local, price, budget))
@@ -1292,6 +1305,8 @@ def _form_a_dcp_admission_verdict(
                 break
     if not is_host:
         _note_admission_wait(rid, code, decider[2], decider[3], local, price, budget)
+    if sink is not None:
+        sink["price"], sink["budget"] = decider[2], decider[3]
     return code
 
 

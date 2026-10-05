@@ -1315,7 +1315,10 @@ class PrefillAdder:
         its own that omits all of that (weg2/d_park_runtime.kv_displace_would_fit).
         Bookkeeping only: no admission decision reads it here."""
         if self.lifetime_refusal is None:
-            self.lifetime_refusal = (str(req.rid), int(total_tokens), int(budget))
+            try:
+                self.lifetime_refusal = (str(req.rid), int(total_tokens), int(budget))
+            except Exception:  # noqa: BLE001 -- bookkeeping on every group's gate path (review 1140, 3c)
+                pass
 
     def released_by_leaving(self, req: Req) -> int:
         """Q-702: what the lifetime budget regains when the RUNNING request

@@ -4713,6 +4713,7 @@ class Scheduler(
                     req.rid, local, price, budget,
                     running_empty=running_empty, now=time.monotonic(),
                 )
+            _numbers = {}
             code = _tmf.form_a_admission_verdict(
                 req.rid,
                 local,
@@ -4724,6 +4725,15 @@ class Scheduler(
                 drained=drained,
                 stop=stop,
                 on_host_drain=_worker_drain if _drain_rides else None,
+                sink=_numbers,
+            )
+            # Q-702 (Auftrag 1522): the GROUP's gate numbers of this call -- the
+            # host's (or, under the token cut, the decider's), identical on every
+            # rank. A worker's own gate said ADMIT (its pool is not the host's),
+            # so its adder never wrote a lifetime refusal; the SEAT-AGE verdict
+            # (`weg2/d_park_runtime.note_adder_refusal`) reads these instead.
+            _follow.last_verdict = (
+                str(req.rid), code, _numbers.get("price"), _numbers.get("budget")
             )
             return None if code == _tmf.ADMISSION_ADMIT else AddReqResult[code]
 
@@ -4733,6 +4743,7 @@ class Scheduler(
         # Under the token cut the verdict is a gather of real gates on every
         # rank -- unchanged there.
         _follow.host_decides_load_back = bool(is_host) and _gather is None
+        _follow.last_verdict = None  # Q-702: (rid, code, price, budget) of the last call
         return _follow
 
     def _form_a_extend_set_riegel(self, can_run_list) -> None:
@@ -15566,6 +15577,11 @@ class Scheduler(
         # itself here, and _trace_pp_admission_verdict prints it on DECLINE
         # lines. Host-side strings only (#790).
         self._admission_decline_note = None
+        # Q-702 (Auftrag 1522): the pass number the SEAT-AGE verdict ages the
+        # adder's refusal numbers by (`weg2/d_park_runtime.NO_TOKEN_VIEW_ATTR`):
+        # one count per call, before any early exit, so a pass that declines
+        # above `admission()` still ages the view. Host-side int, no collective.
+        self._weg2_sa_pass = getattr(self, "_weg2_sa_pass", 0) + 1
 
         # #1046: PP0'S SELF-APPLY IS GONE WITH THE REST OF THE DELIVERY CHAIN.
         # PP0 used to apply the row it built last pass so its timing matched a
