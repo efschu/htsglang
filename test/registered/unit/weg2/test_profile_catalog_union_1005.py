@@ -140,5 +140,40 @@ class Union(unittest.TestCase):
             PC.main(["--tree-27b", "/nonexistent"])
 
 
+REPO = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
+#: rename_rigdash.py lebt auf desk/rename-editor-1005 (docker/weg2-release/); RENAME_RIGDASH überschreibt den Pfad, das Kit liegt unter /spinning/flliper/tools
+RENAME = os.environ.get("RENAME_RIGDASH") or os.path.join(REPO, "docker", "weg2-release", "rename_rigdash.py")
+KIT = os.environ.get("RELEASE_KIT_TOOLS") or "/spinning/flliper/tools"
+
+
+@unittest.skipUnless(os.path.isfile(RENAME) and os.path.isdir(KIT), "rename_rigdash.py oder das Release-Kit fehlt")
+class RenameRoundtrip(unittest.TestCase):
+    """Die Generator-Ausgabe muss durch die Editor-Umbenennung (rename_rigdash.py) laufen: kein Rest ``SGLANG_WEG2_``/``sglang/srt`` (Exit 3 sonst),
+    gleiche Eintragszahl, ``baeume``/``abweichung`` bleiben."""
+
+    def test_union_catalog_survives_the_rename(self):
+        import json
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            a = _tree(d, "a", ["SGLANG_WEG2_FOO = EnvBool(False)  # foo", "SGLANG_WEG2_BOTH = EnvInt(1)"],
+                      extra_files={"weg2/m.py": 'import os\nX_ENV = "SGLANG_WEG2_VIA_CONST"\nv = os.environ.get(X_ENV, "1")\n'})
+            b = _tree(d, "b", ["SGLANG_WEG2_BOTH = EnvInt(2)", "SGLANG_WEG2_NF_ONLY = EnvBool(True)"])
+            cat = PC.build_union_catalog([("27b", a), ("nf", b)], {}, edges_root=PY)
+            pkg = os.path.join(d, "pkg")
+            os.makedirs(os.path.join(pkg, "rigdash", "profil_data"))
+            with open(os.path.join(pkg, "rigdash", "profil_data", "catalog.json"), "w", encoding="utf-8") as fh:
+                json.dump(cat, fh, ensure_ascii=False)
+            out = os.path.join(d, "out")
+            res = subprocess.run([sys.executable, RENAME, pkg, "--out", out, "--kit", KIT], capture_output=True, text=True, timeout=240)
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            with open(os.path.join(out, "rigdash", "profil_data", "catalog.json"), encoding="utf-8") as fh:
+                renamed = json.load(fh)
+        self.assertEqual(len(renamed["entries"]), len(cat["entries"]))
+        self.assertFalse([k for k in renamed["entries"] if k.startswith("SGLANG_WEG2_")])
+        both = next(e for k, e in renamed["entries"].items() if k.endswith("_BOTH"))
+        self.assertEqual(both["baeume"], ["27b", "nf"])
+        self.assertEqual(sorted(both["abweichung"]), ["27b", "nf"])
+
+
 if __name__ == "__main__":
     unittest.main()

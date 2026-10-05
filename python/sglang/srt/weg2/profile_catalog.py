@@ -610,10 +610,12 @@ def _finish(entries: Dict[str, Dict[str, object]], curated: Mapping[str, Mapping
     # ``erklaert`` = one-sentence texts written from the code's consumers (``profile_catalog_curated.ERKLAERT``), status
     # "erklaert"; ``curated`` (the hand-curated core) is applied after it and wins on a name clash, status "kuratiert".
     for name, c, stat in [(n, c, "erklaert") for n, c in (erklaert or {}).items()] + [(n, c, "kuratiert") for n, c in curated.items()]:
+        if "baeume_erwartet" in c and name not in entries:
+            continue        # the name lives in another tree only: no entry in a catalog that does not cover that tree
         e = entries.setdefault(name, {"id": name, "kind": c.get("kind", "env"), "name": name, "type": "str", "default": None,
                                       "choices": None, "bare": False, "nargs": None, "help": "",
                                       "source": {"file": "profile", "line": 0, "kind": "kuratiert"}})
-        for k in ("text", "gain", "cost", "group", "level", "planner_derived"):
+        for k in ("text", "gain", "cost", "group", "level", "planner_derived", "satz_quelle"):
             if k in c:
                 e[k] = c[k]
         e["depends"] = [dict(d) for d in c.get("depends", [])]
@@ -682,6 +684,12 @@ def build_union_catalog(trees: Sequence[Tuple[str, str]], curated: Mapping[str, 
     cat["stats"]["baeume"] = {"nur_" + lb: sum(1 for e in union.values() if e.get("baeume") == [lb]) for lb in labels}
     cat["stats"]["baeume"]["beide"] = sum(1 for e in union.values() if len(e.get("baeume", [])) == len(labels) > 1)
     cat["stats"]["baeume"]["abweichung"] = sum(1 for e in union.values() if "abweichung" in e)
+    cat["warnungen"] = [
+        "%s: der Text erwartet die Bäume %s, der Eintrag steht in %s" % (n, c["baeume_erwartet"], union[n].get("baeume"))
+        for n, c in sorted((erklaert or {}).items())
+        if "baeume_erwartet" in c and n in union and union[n].get("baeume") != c["baeume_erwartet"]]
+    cat["warnungen"] += ["%s: der Text erwartet die Bäume %s, der Name steht in keinem Baum" % (n, c["baeume_erwartet"])
+                         for n, c in sorted((erklaert or {}).items()) if "baeume_erwartet" in c and n not in union]
     return cat
 
 
@@ -730,6 +738,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         launcher, environ, sargs = find_tree_files(py)
         cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs, erklaert=mod.ERKLAERT, srt_dir=os.path.join(py, "sglang", "srt"))
+    cat["glossar"] = dict(mod.GLOSSAR)
     text = json.dumps(cat, indent=1, sort_keys=True, ensure_ascii=False, default=str) + "\n"
     if ns.out:
         with open(ns.out, "w", encoding="utf-8") as fh:
@@ -740,6 +749,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("catalog: %(entries)d entries (%(flags)d flags, %(envs)d envs): %(kuratiert)d kuratiert, %(erklaert)d erklaert, %(geerntet)d geerntet, %(unerklaert)d unerklaert" % st, file=sys.stderr)
     if "baeume" in st:
         print("trees: %s" % ", ".join("%s=%s" % kv for kv in sorted(st["baeume"].items())), file=sys.stderr)
+    for w in cat.get("warnungen", []):
+        print("WARNUNG: %s" % w, file=sys.stderr)
     return 0
 
 
