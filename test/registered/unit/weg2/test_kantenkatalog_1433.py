@@ -7,8 +7,8 @@ Gepinnt:
   * Namen existieren im Katalog: kuratiert, Launcher-Parser, ServerArgs, ``environ.py`` oder
     Ablehnungscode des Registers (wie im S1-Kuraten-Test).
   * ``wert`` (Wertebereich): liegt er an einem Flag mit ``choices`` vor, muss der Wert drin stehen.
-  * Beleg-Plausibilitaet: Datei existiert, Zeile im gueltigen Bereich, Anker-Token innerhalb von
-    ±2 Zeilen. Externe Belege (absolute Pfade, z. B. docker/entrypoint.sh) werden nur geprueft,
+  * Beleg-Aufloesung (Auftrag 2013): der Anker-Text wird in der Datei gesucht (``PC.resolve_edge_belege``); die gespeicherte
+    Zeile ist nur ein Hinweis. Bricht nur bei fehlendem/mehrdeutigem Anker, nicht bei verschobenen Zeilen. Externe Belege (absolute Pfade, z. B. docker/entrypoint.sh) werden nur geprueft,
     wenn die Datei anwesend ist -- auf Maschinen ohne Docker-Baum bleibt der Test grün.
   * Abdeckung sinkt nicht: Mindestanzahl Kanten und Mindestabdeckung der Kuraten-Kernwerte.
   * ``offen.txt``: jede dort gelistete Kante zeigt ebenfalls auf existierende Namen (kein
@@ -115,25 +115,20 @@ class Beleg(Basis, unittest.TestCase):
         return self.files[path]
 
     def test_every_edge_has_a_readable_anchor(self):
-        missing, bad_anchor = [], []
-        for k in self.kanten:
-            b = k["beleg"]
-            path = self._resolve(b["datei"])
-            lines = self._lines(path)
-            if lines is None:
-                if os.path.isabs(b["datei"]):
-                    self.skipped_external.append(k["id"])
-                else:
-                    missing.append(k["id"])
-                continue
-            if b["zeile"] > len(lines):
-                missing.append(k["id"])
-                continue
-            window = "".join(lines[b["zeile"] - 3:b["zeile"] + 2])
-            if b["anker"] not in window:
-                bad_anchor.append(k["id"])
-        self.assertEqual(missing, [])
-        self.assertEqual(bad_anchor, [])
+        """Der ANKER-TEXT ist der Beleg (Auftrag 2013): er muss in der Datei stehen und sich eindeutig aufloesen lassen.
+
+        Eine bloss verschobene Zeilennummer bricht den Test NICHT mehr; es bricht nur ein fehlender (``veraltet``), ein
+        nicht aufloesbar mehrdeutiger (``mehrdeutig``) Anker oder eine fehlende Repo-Datei (``datei_fehlt``)."""
+        res = PC.resolve_edge_belege(self.kanten, REPO_ROOT)
+        self.assertEqual(set(res), {k["id"] for k in self.kanten})
+        problems = {i: (r["status"], r["datei"], r["treffer"]) for i, r in res.items() if r["status"] in PC.ANKER_PROBLEM}
+        self.assertEqual(problems, {})
+        for i, r in res.items():
+            if r["status"] == "extern_fehlt":
+                self.skipped_external.append(i)
+            else:
+                self.assertIn(r["status"], PC.ANKER_OK, i)
+                self.assertIsInstance(r["zeile"], int, i)
 
     def test_repo_belege_are_all_verified(self):
         """Repo-interne Belege duerfen niemals uebersprungen werden."""

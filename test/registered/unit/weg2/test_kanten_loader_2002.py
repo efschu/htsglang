@@ -73,7 +73,10 @@ class RealCatalog(unittest.TestCase):
             self.assertTrue(d["belegt"], e["id"])
             self.assertEqual(d["satz"], e["satz"])
             self.assertEqual(d["beleg"]["datei"], e["beleg"]["datei"])
-            self.assertEqual(d["beleg"]["zeile"], e["beleg"]["zeile"])
+            # Auftrag 2013: the displayed line is the one resolved by the anchor text; the stored line stays as hint
+            self.assertEqual(d["beleg"]["zeile_hinweis"], e["beleg"]["zeile"])
+            self.assertIn(d["beleg"]["aufloesung"], PC.ANKER_OK + ("extern_fehlt",), e["id"])
+            self.assertIsInstance(d["beleg"]["zeile"], int, e["id"])
             self.assertEqual(d["beleg"]["anker"], e["beleg"]["anker"])
 
     def test_the_24_curated_edges_without_evidence_stay_and_are_marked(self):
