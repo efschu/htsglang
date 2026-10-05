@@ -2385,6 +2385,16 @@ class Envs:
     # nextflash 2.0; -1 (= the 60 s code default) for qwen27b and no form.
     SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(_admission_wedge_recovery_default)
 
+    # deskq 1507 (NF boot 1005_185049, two false ADMISSION-WEDGE alarms after idle): both verdicts age a request
+    # from the LAST PROGRESS (first-token clock for the classic verdict, decode clock for PREFILL-LIVELOCK), so a
+    # request that arrives after a long idle meets an old clock and the first 10 s poll that sees it alarms. 1 = the
+    # age of BOTH verdicts (and of the recovery driver) is taken from max(last progress, the poll that saw the
+    # queue/running set go from empty to non-empty): a request alarms only after 20 s of its OWN waiting; a stand
+    # that begins while the box is busy alarms exactly as fast as before. 0 = off (default): the pre-fix verdict,
+    # byte for byte, nothing written onto the scheduler. Same name as the 27B branch's switch (deskq 1981); here
+    # without the dual-layout gate.
+    SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK = EnvBool(False)
+
     # #788: per-rank admission-verdict trace. OFF by default -- it exists to
     # convert a MECHANISM proof into a captured value on one instrumented
     # boot, not to run permanently. Under PP every rank re-derives the

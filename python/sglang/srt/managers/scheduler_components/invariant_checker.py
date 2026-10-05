@@ -1199,6 +1199,37 @@ def _admission_wedge_recovery_threshold() -> float:
     return ADMISSION_WEDGE_RECOVERY_SECONDS
 
 
+def _wedge_queue_clock_on() -> bool:
+    """deskq 1507: SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK (default off = the pre-fix verdict). Never raises."""
+    try:
+        return bool(envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.get())
+    except Exception:  # noqa: BLE001 - a bad value reads as off
+        return False
+
+
+def _wedge_busy_floor(scheduler, now: float, busy: bool) -> Optional[float]:
+    """deskq 1507: the poll time at which the queue/running set last went from empty to non-empty.
+
+    A progress clock only says when something LAST moved; a request arriving after a long idle meets a clock that
+    is already old, and the first poll that sees it would alarm. The floor is stamped by the first poll that finds
+    the set non-empty (so at most one poll late) and dropped as soon as a poll finds it empty again. While the set
+    stays non-empty it does not move, so a stand that begins during activity is judged by its progress clock as
+    before. ``None`` = the set is empty."""
+    since = getattr(scheduler, "_wedge_busy_since", None)
+    if not busy:
+        if since is not None:
+            scheduler._wedge_busy_since = None
+        return None
+    if since is None:
+        since = scheduler._wedge_busy_since = now
+    return since
+
+
+def _wedge_clock_age(stamp: float, now: float, floor: Optional[float]) -> float:
+    """Seconds since ``stamp``, never counted from before ``floor`` (None = no floor = ``now - stamp``)."""
+    return now - (stamp if floor is None else max(stamp, floor))
+
+
 def check_admission_wedge_once(
     scheduler: Scheduler,
     now: Optional[float] = None,
@@ -1225,7 +1256,14 @@ def check_admission_wedge_once(
     now = now if now is not None else time.perf_counter()
     queued = len(scheduler.waiting_queue)
     running = len(scheduler.running_batch.reqs)
-    age = now - scheduler.last_first_token_progress_time
+    # deskq 1507: with SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK both ages start no earlier than the poll that saw the
+    # queue/running set become non-empty; off: floor None and nothing is written (the pre-fix numbers).
+    floor = (
+        _wedge_busy_floor(scheduler, now, queued > 0 or running > 0)
+        if _wedge_queue_clock_on()
+        else None
+    )
+    age = _wedge_clock_age(scheduler.last_first_token_progress_time, now, floor)
     # #739: absent on an older scheduler -> None -> the pre-#739 verdict.
     prefill_stamp = getattr(scheduler, "last_prefill_progress_time", None)
     seconds_since_prefill_progress = (
@@ -1243,6 +1281,8 @@ def check_admission_wedge_once(
         f"(perf_counter={scheduler.last_first_token_progress_time:.1f}): "
         f"{verdict_detail}"
     )
+    if floor is not None:
+        detail += " [QUEUE-CLOCK: age counted from max(last progress, busy-set start)]"
     # #739: SAY WHICH OF THE TWO WEDGES THIS IS.
     #
     # The predicate above is true of a dead pipeline AND of a busy one whose
@@ -1274,7 +1314,7 @@ def check_admission_wedge_once(
         live, live_detail = prefill_livelock_verdict(
             queued,
             running,
-            None if decode_stamp is None else now - decode_stamp,
+            None if decode_stamp is None else _wedge_clock_age(decode_stamp, now, floor),
             seconds_since_prefill_progress,
         )
         if live:
@@ -1415,7 +1455,14 @@ class AdmissionWedgeRecovery:
                 channel.reset_episode()
             return None
         threshold = _admission_wedge_recovery_threshold()
-        age = time.perf_counter() - self._scheduler.last_first_token_progress_time
+        _now = time.perf_counter()
+        # deskq 1507: the same floor the verdict used (read only here; the poll's check stamps it)
+        _floor = (
+            getattr(self._scheduler, "_wedge_busy_since", None)
+            if _wedge_queue_clock_on()
+            else None
+        )
+        age = _wedge_clock_age(self._scheduler.last_first_token_progress_time, _now, _floor)
         if age < threshold:
             return None
         now = self._clock()
