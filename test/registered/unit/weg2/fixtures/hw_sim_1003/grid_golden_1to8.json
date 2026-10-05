@@ -210,7 +210,8 @@
    "PROFILE-VECTORS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
-   "UNCALIBRATED"
+   "UNCALIBRATED",
+   "FIT"
   ]
  ],
  "1x sm86 3090 | 27B-FP8": [

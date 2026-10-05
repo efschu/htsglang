@@ -293,7 +293,10 @@ class P1bSimulationHarness(unittest.TestCase):
         self.assertEqual(self.by_id["1x sm120 5090 | 27B-INT8"].argv, "-")
         self.assertIn("FIT", self.by_id["1x sm86 3080-20G | 27B-INT8"].blockers)
         self.assertNotIn("FIT", self.by_id["1x sm120 5090 | 27B-INT8"].blockers)
-        self.assertNotIn("FIT", self.by_id["1x sm86 3080-20G | NF"].blockers)  # host-store experts
+        # AP0 1525: NF has no checkpoint bound (experts in the host store) but its MODEL PROFILE does: 48 layers + the
+        # stage posts + activation do not fit one 20 GiB card, they fit one 5090
+        self.assertIn("FIT", self.by_id["1x sm86 3080-20G | NF"].blockers)
+        self.assertNotIn("FIT", self.by_id["1x sm120 5090 | NF"].blockers)
         self.assertTrue(any("replicated KV" in n for n in self.by_id["5x sm120 5090 | 27B-FP8"].notes))
 
     def test_rig_subsets_are_the_metal_matrix_inventories(self):

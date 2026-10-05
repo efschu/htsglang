@@ -22,9 +22,13 @@ WHAT ONE CELL RUNS (in launcher.main's order, the REAL functions, no copy):
    blockers of this model's launch argv/env;
 5. the calibration inventory (``launcher.inventory_check_line``):
    HW-UNCALIBRATED;
-6. a weight FIT bound (a NECESSARY condition only -- checkpoint bytes
-   against the summed VRAM, one card for N = 1; NOT the planned fit check
-   of the single mode, P4): FIT;
+6. a weight FIT bound (a NECESSARY condition only): checkpoint bytes against
+   the summed VRAM (one card for N = 1) for a model with a known checkpoint
+   size; for a model without one (NF, experts in the host store) the verdict of
+   its MODEL PROFILE (AP0 1525, ``weg2/hw_fit.py``: weights + KV of 262144
+   tokens + mamba slots + the records' posts against ``total - residue`` per
+   card). The profile verdict of every model stays on ``CellResult.fit`` and is
+   what the progress meter (``weg2/hw_progress.py``) prints: FIT;
 7. the profile resolution (``form.format_of`` + the row's per-arch kernel
    path) and the planner preset (``planner.flags._match_calibration``):
    notes, never a refusal;
@@ -59,6 +63,8 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+import msgspec
+
 MIB = 1 << 20
 
 #: Result labels (table); "läuft" = every gate passes.
@@ -80,27 +86,48 @@ class SimCard:
     bar1_mib: int
     bus_bits: int
     mem_clock_mhz: int
+    #: where the figures come from (AP0 1525): METAL = read on the reference
+    #: rig, NVML-RECORDING = a recorded NVML reply, DATASHEET = nameplate,
+    #: BORROWED = "HW-BORROWED/unbelegt" (pattern / datasheet only, no card and
+    #: no recording ever read). ``; ...`` adds a caveat (sm89 never measured).
+    evidence: str = "DATASHEET"
 
     @property
     def sm(self) -> str:
         return f"sm{self.cc[0]}{self.cc[1]}"
 
+    @property
+    def borrowed(self) -> bool:
+        return self.evidence.startswith(EV_BORROWED)
+
+
+EV_METAL = "METAL"
+EV_NVML = "NVML-RECORDING"
+EV_DATASHEET = "DATASHEET"
+EV_BORROWED = "HW-BORROWED/unbelegt"
+_SM89 = "; sm89 am Metall nie gemessen"
 
 #: The catalog (nameplate figures; totals as NVML reports them where the rig
 #: or a recording has them: 3080-20G 20480, 5090 32607, A6000 49140, 4090
 #: 24564, PRO 6000 97887). BAR1 256 MiB = GeForce without ReBAR (S).
 CATALOG: Dict[str, SimCard] = {c.key: c for c in (
-    SimCard("3080-10G", "NVIDIA GeForce RTX 3080", (8, 6), 10240, 68, 256, 320, 9501),
-    SimCard("3080-20G", "NVIDIA GeForce RTX 3080", (8, 6), 20480, 68, 256, 320, 9501),
-    SimCard("3090", "NVIDIA GeForce RTX 3090", (8, 6), 24576, 82, 256, 384, 9751),
-    SimCard("A6000", "NVIDIA RTX A6000", (8, 6), 49140, 84, 256, 384, 8001),
-    SimCard("4060Ti-16G", "NVIDIA GeForce RTX 4060 Ti", (8, 9), 16380, 34, 256, 128, 9001),
-    SimCard("4080", "NVIDIA GeForce RTX 4080", (8, 9), 16376, 76, 256, 256, 11201),
-    SimCard("4090", "NVIDIA GeForce RTX 4090", (8, 9), 24564, 128, 256, 384, 10501),
-    SimCard("5080", "NVIDIA GeForce RTX 5080", (12, 0), 16303, 84, 16384, 256, 15001),
-    SimCard("5090", "NVIDIA GeForce RTX 5090", (12, 0), 32607, 170, 32768, 512, 14001),
+    SimCard("3070", "NVIDIA GeForce RTX 3070", (8, 6), 8192, 46, 256, 256, 7001,
+            EV_BORROWED + ": NVML total from the datasheet (8 GB), never read from a card"),
+    SimCard("3080-10G", "NVIDIA GeForce RTX 3080", (8, 6), 10240, 68, 256, 320, 9501, EV_DATASHEET),
+    SimCard("3080-20G", "NVIDIA GeForce RTX 3080", (8, 6), 20480, 68, 256, 320, 9501, EV_METAL),
+    SimCard("3090", "NVIDIA GeForce RTX 3090", (8, 6), 24576, 82, 256, 384, 9751, EV_DATASHEET),
+    SimCard("A6000", "NVIDIA RTX A6000", (8, 6), 49140, 84, 256, 384, 8001, EV_NVML),
+    SimCard("4060Ti-16G", "NVIDIA GeForce RTX 4060 Ti", (8, 9), 16380, 34, 256, 128, 9001, EV_DATASHEET + _SM89),
+    SimCard("4080", "NVIDIA GeForce RTX 4080", (8, 9), 16376, 76, 256, 256, 11201, EV_DATASHEET + _SM89),
+    SimCard("4090", "NVIDIA GeForce RTX 4090", (8, 9), 24564, 128, 256, 384, 10501, EV_NVML + _SM89),
+    SimCard("5070", "NVIDIA GeForce RTX 5070", (12, 0), 12227, 48, 16384, 192, 14001,
+            EV_BORROWED + ": NVML total by the 5080/5090 pattern (12 GB - ~61 MiB), BAR1 by the 5080 pattern"),
+    SimCard("5070Ti", "NVIDIA GeForce RTX 5070 Ti", (12, 0), 16303, 70, 16384, 256, 14001,
+            EV_BORROWED + ": NVML total as the 5080 (16 GB), BAR1 by the 5080 pattern"),
+    SimCard("5080", "NVIDIA GeForce RTX 5080", (12, 0), 16303, 84, 16384, 256, 15001, EV_DATASHEET),
+    SimCard("5090", "NVIDIA GeForce RTX 5090", (12, 0), 32607, 170, 32768, 512, 14001, EV_METAL),
     SimCard("PRO6000", "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", (12, 0), 97887, 188,
-            131072, 512, 14001),
+            131072, 512, 14001, EV_NVML),
 )}
 
 #: The reference rig as NVML enumerates it (nvml0 3080, nvml1 5090, nvml2 3080).
@@ -290,6 +317,9 @@ class CellResult:
     notes: List[str] = field(default_factory=list)
     order: List[str] = field(default_factory=list)
     argv: str = ""
+    #: the profile-driven fit verdict (hw_fit): level / first / margin / marks;
+    #: None = no model profile ("Profil fehlt")
+    fit: Optional[Dict[str, object]] = None
 
     def refuse(self, code: str, detail: str) -> None:
         if self.result == RUNS:
@@ -300,7 +330,7 @@ class CellResult:
         return {"inventory": self.inventory, "model": self.model, "n": self.n_cards,
                 "result": self.result, "code": self.code, "blockers": list(self.blockers),
                 "order": list(self.order), "argv": self.argv, "notes": list(self.notes),
-                "details": list(self.details)}
+                "details": list(self.details), "fit": self.fit}
 
 
 _ARGV_CACHE: Dict[Tuple[int, str, str], str] = {}
@@ -361,10 +391,41 @@ def _kernel_notes(model: SimModel, cards: Sequence) -> List[str]:
     return notes
 
 
+def fit_of(model: SimModel, order: Sequence, asm=None) -> Optional[Dict[str, object]]:
+    """The :mod:`hw_fit` verdict of ``model`` on the ordered live cards, as a
+    plain dict; None when the model's profile has no fit profile."""
+    from sglang.srt.weg2 import card_identity as CI
+    from sglang.srt.weg2 import hw_fit as HF
+
+    prof = HF.load_profile(model.profile)
+    if prof is None:
+        return None
+    marks: List[str] = []
+    if model.ckpt_mib is not None and model.weight_format != prof.weight_format:
+        prof, mark = HF.with_checkpoint_mib(prof, int(model.ckpt_mib))
+        marks.append(mark)
+    cards = [HF.FitCard(total_mib=int(c.total_mib), arch=CI._sm(tuple(c.cc)) if c.cc is not None else "sm?",
+                        cls=CI.calibration_class(c) or "", label=CI.card_key(c)) for c in order]
+    base = asm or HF.Assumptions()
+    asm = msgspec.structs.replace(base, dual=base.dual or "--dual-share" in model.argv)
+    v = HF.evaluate(prof, cards, argv=model.argv, asm=asm, records_profile=model.profile)
+    return {"level": v.level, "first": v.first, "margin_mib": v.margin_mib, "marks": marks + list(v.marks),
+            "lines": list(v.lines)}
+
+
+def _p_chunk_policy(ns) -> str:
+    """``--p-chunk-policy`` of the parsed launch (the launcher's own default
+    when the profile names none)."""
+    from sglang.srt.weg2 import launcher as L
+
+    return str(ns.p_chunk_policy or L.P_CHUNK_POLICY_DEFAULT)
+
+
 def simulate(inventory: str, keys: Sequence[str], model: SimModel,
-             selection: Optional[Sequence[int]] = None) -> CellResult:
+             selection: Optional[Sequence[int]] = None, fit_asm=None) -> CellResult:
     """One cell: ``keys`` (catalog keys, NVML order), the ``--cards``
-    selection, one release model."""
+    selection, one release model. ``fit_asm``: the :class:`hw_fit.Assumptions`
+    of the fit bound (None = the defaults)."""
     from sglang.srt.planner import flags as PF
     from sglang.srt.weg2 import card_identity as CI
     from sglang.srt.weg2 import form as F
@@ -441,8 +502,12 @@ def simulate(inventory: str, keys: Sequence[str], model: SimModel,
         # 5c. the P-chunk stage table and the prefill-graph pool vector are
         # reference-rig (three-stage) tables: for the live stage count they are
         # mapped by card class or the launch is refused BY NAME (they sit in
-        # main's early path, before the cards are read, so they read NVML again)
-        if not uncalibrated and len(order) >= 2:
+        # main's early path, before the cards are read, so they read NVML again).
+        # AP0 1525: ONLY under --p-chunk-policy dynamic -- the default policy
+        # ``fixed`` (launcher.P_CHUNK_POLICY_DEFAULT, apply_p_chunk_policy returns
+        # before the table) never reads it, the NF release and every profile that
+        # does not name ``dynamic`` run it fixed: the check was a simulator artefact.
+        if not uncalibrated and len(order) >= 2 and _p_chunk_policy(ns2) == "dynamic":
             with replayed(keys, selection):
                 try:
                     models_, _src = L.p_chunk_stage_model(
@@ -457,13 +522,25 @@ def simulate(inventory: str, keys: Sequence[str], model: SimModel,
                     cell.blockers.append("P-CHUNK-MODEL")
     finally:
         L.inventory_view_mod.clear_active()
-    # 6. weight fit bound (necessary condition)
+    # 6. weight fit. A model with a known checkpoint size keeps the bound of 1003
+    # (checkpoint bytes >= the summed VRAM, one card for N = 1; the pinned 27B
+    # cells of the line do not move). A model WITHOUT one (``ckpt_mib`` None: the
+    # experts live in the host store, NF) had no bound at all -- 1520 A: "laeuft"
+    # for 3 x RTX 3070 -- so it takes the verdict of the MODEL PROFILE
+    # (AP0 1525, weg2/hw_fit.py): weights + KV + mamba + the records' posts
+    # against the cards, ``nein`` is FIT. The profile-driven verdict is kept on
+    # ``cell.fit`` for EVERY model (the progress meter prints it); it is not in the
+    # notes (the reference cell's notes are pinned by 1518).
+    cell.fit = fit_of(model, order, fit_asm)
     if model.ckpt_mib is not None and order:
         room = order[0].total_mib if len(order) == 1 else sum(c.total_mib for c in order)
         if model.ckpt_mib >= room:
             cell.refuse("FIT", f"checkpoint {model.ckpt_mib} MiB >= VRAM {room} MiB "
                                f"({'one card' if len(order) == 1 else 'all cards'}), before any KV")
             cell.blockers.append("FIT")
+    elif cell.fit is not None and cell.fit["level"] == "nein":
+        cell.refuse("FIT", f"{model.key}: {cell.fit['first']}")
+        cell.blockers.append("FIT")
     # 7. profile resolution + planner preset (notes)
     fmt = F.format_of(model.profile, ns.model)
     if fmt != model.weight_format:
@@ -576,7 +653,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if ns.catalog:
         for c in CATALOG.values():
             print(f"{c.key:12s} {c.name:52s} {c.sm:6s} {c.total_mib:6d} MiB  {c.sm_count:3d} SMs  "
-                  f"BAR1 {c.bar1_mib} MiB")
+                  f"BAR1 {c.bar1_mib} MiB  [{c.evidence}]")
         return 0
     table = models_from_profiles(ns.profiles_dir) if ns.profiles_dir else dict(MODELS)
     models = [m.strip() for m in ns.models.split(",") if m.strip()]

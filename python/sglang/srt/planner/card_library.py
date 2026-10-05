@@ -165,7 +165,10 @@ class CardSpec:
     #: PROVENANCE. ``"seed"`` is a curated nameplate entry (capacity from a
     #: datasheet); ``"measured"`` means the entry describes a card the #213
     #: probe actually ran on, so its capacity is an NVML reading rather than a
-    #: catalogue claim; ``"submitted"`` came from a RESULTS fingerprint.
+    #: catalogue claim; ``"submitted"`` came from a RESULTS fingerprint;
+    #: ``"borrowed"`` (AP0 1525, "HW-BORROWED/unbelegt") is a seed whose
+    #: figures come from a datasheet / the NVML pattern of a sibling card and
+    #: that no card of the rig and no recording ever backed.
     #: :meth:`CardLibrary.resolve` lets a measured entry outrank a seed of the
     #: same name -- the measurement is the authority on the card it measured.
     #: Absent in files written before this field existed, which read as
@@ -229,6 +232,19 @@ SEED_CARDS: Dict[str, CardSpec] = {
                    peak_membw_gbs=760.0, peak_gemm_tflops_fp16=119.0),
         CardSpec("RTX 3060", 12288, "sm86", 4, 16, False, 170,
                    peak_membw_gbs=360.0, peak_gemm_tflops_fp16=51.0),
+        # -- AP0 1525: cards of the release example configurations that no
+        # seed, no recording and no card of the rig ever backed. Datasheet /
+        # pattern figures ONLY (VRAM total = nominal GB minus the 5080/5090
+        # NVML pattern; fp16 peak = AI-TOPS / 8 like the 5090 and 5080 rows).
+        # source="borrowed" = "HW-BORROWED/unbelegt": NOT read from a card.
+        CardSpec("RTX 3070", 8192, "sm86", 4, 16, False, 220,
+                   peak_membw_gbs=448.0, peak_gemm_tflops_fp16=81.3, source="borrowed"),
+        CardSpec("RTX 5070", 12227, "sm120", 5, 16, False, 250,
+                   peak_membw_gbs=672.0, peak_gemm_tflops_fp16=123.0,
+                   peak_gemm_tflops_fp8=247.0, source="borrowed"),
+        CardSpec("RTX 5070 Ti", 16303, "sm120", 5, 16, False, 300,
+                   peak_membw_gbs=896.0, peak_gemm_tflops_fp16=176.0,
+                   peak_gemm_tflops_fp8=352.0, source="borrowed"),
         # -- workstation / datacenter --------------------------------------
         CardSpec("RTX A6000", 49140, "sm86", 4, 16, True, 300,
                    peak_membw_gbs=768.0, peak_gemm_tflops_fp16=155.0),
