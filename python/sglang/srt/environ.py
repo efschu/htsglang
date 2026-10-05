@@ -948,6 +948,84 @@ class Envs:
     # competes for the GIL with the rest of the D>P sleep leg. 0 = build at
     # once (the pre-540 form).
     SGLANG_WEG2_L15_PLAN_WARM_DEFER_S = EnvFloat(5.0)
+    # L15-POOL S1 (docs/L15-POOL-ENTWURF-1004.md sec 7): LOG-ONLY shadow of the
+    # pooled L1.5 admission (weg2/l15_pool.py) at the D sleep flush -- what a
+    # hold against the SUM of all cards' segments (KV + end anchors, guests in
+    # foreign segments) would keep vs what the per-rank path keeps today.
+    # Emits L15-POOL-SHADOW and the launcher's L15-POOL line; changes nothing.
+    # Only in the L15 path (SGLANG_WEG2_L15=1, never --dual-layout: W-L15-DUAL).
+    # The ranks read it through l15_pool.pool_shadow_on(os.environ) (1/true/on/yes),
+    # like every SGLANG_WEG2_L15* switch. Default off = today byte for byte.
+    SGLANG_WEG2_L15_POOL_SHADOW = EnvBool(False)
+    # L15-POOL S2 (docs/L15-POOL-ENTWURF-1004.md sec 7, KV only, no anchor): the
+    # pooled hold takes effect. A rank with no home segment (cap 0) is no longer
+    # refused/refilled from L2 alone: the hold is admitted against the SUM of the
+    # segments (its KV shards need guest room in the capped ranks' free hold
+    # rows), the plan checks that room BEFORE the retain moves anything (a
+    # request without room is dropped, never held half), the cap-0 rank's rows
+    # park card to card in the capped ranks' segments (weg2/l15_park.py, group
+    # all_to_all) and come back at the wake; any pool failure = the group falls
+    # back to today's L2 refill. Marks: L15-POOL-OUT / L15-POOL-BACK /
+    # L15-POOL-CHECK. Only in the L15 path (SGLANG_WEG2_L15=1, 27B, never
+    # --dual-layout: refused by name). Read by the ranks through
+    # l15_pool.pool_on(os.environ) (1/true/on/yes). Default off = today's
+    # per-card path byte for byte.
+    SGLANG_WEG2_L15_POOL = EnvBool(False)
+    # L15-POOL S3 (docs/L15-POOL-ENTWURF-1004.md sec 3.2-3.3/4.1/7, KV only, no
+    # anchor): part switch ON TOP of SGLANG_WEG2_L15_POOL (S3 without POOL is
+    # refused by name, W-L15-POOL-S3-NEEDS-POOL). EVERY rank may overflow, not
+    # only the rank without a home segment: what does not fit a rank's own hold
+    # region lies as guest rows in the free rows of the other segments (Q3 rule:
+    # home first; guests by free area x measured link rate of the barlink matrix,
+    # the slowest card only as the last overflow), admission runs against the SUM
+    # of the segments, the hold manifest becomes v2 (guest placement + caps in
+    # the group fingerprint, so ranks that disagree on the placement fall back
+    # together), the guest rows are sampled at the wake (L15-POOL-CHECK, L15-CHECK
+    # with guest rows) and a failed park of a capped rank's overflow is a group
+    # fallback. Q2: the cap-0 rank's L2 duty (post_vote) stays. Default off = the
+    # S2 path (or today's per-card path when POOL is off) byte for byte.
+    SGLANG_WEG2_L15_POOL_S3 = EnvBool(False)
+    # L15-POOL S4 (docs/L15-POOL-ENTWURF-1004.md sec 1.2/3.3/4.5/5.2 N4/7, KV AND
+    # END anchor = a WHOLE request): part switch ON TOP of SGLANG_WEG2_L15_POOL and
+    # SGLANG_WEG2_L15_POOL_S3 (S4 without them is refused by name,
+    # W-L15-POOL-S4-NEEDS-S3). The anchor share (GDN head share, priced in bytes
+    # from the MambaBlobSpec) of a rank WITHOUT a home segment lies as a byte guest
+    # in the free KV hold rows of a host rank (same free rows as the KV guests; the
+    # Mamba hold region is too small, zeroed by every flush and ledgered); admission
+    # counts KV rows AND anchor bytes against the sum of the segments, a request
+    # whose anchor finds no room is not held at all (no half hold), the manifest v2
+    # carries the anchor guests, the pricing and the row bytes in the group
+    # fingerprint, the source checksum covers the anchor bytes, and a wake whose
+    # anchors came back from the pool loads none from L2 (no 'Mamba-Anker fehlt'
+    # re-prefill from a stale L2 generation). Q2: the L2 duty (post_vote, anchor L2
+    # identity) is unchanged. Default off = the S3 path byte for byte.
+    SGLANG_WEG2_L15_POOL_S4 = EnvBool(False)
+    # L15-POOL S4b (docs/L15-POOL-ENTWURF-1004.md sec 5.2 N4, user idea 04.10.
+    # ~17:50Z "dynamische Anker-Anzahl"): part switch ON TOP of SGLANG_WEG2_L15_POOL,
+    # _S3 and _S4 (S4b without S4 is refused by name, W-L15-POOL-S4B-NEEDS-S4; dual /
+    # non-27B refuse it too). The anchor count is no longer capped at
+    # SGLANG_WEG2_L15_ANCHOR_CAP for the ranks WITH a home segment: the anchors
+    # beyond the cap (their Mamba hold region is anchor_cap+1 slots) lie as bytes
+    # in free KV hold rows -- first the rank's own home segment, then as a guest in
+    # the foreign segments (Q3: home first, then free area x rate, never a card
+    # name). Admission plans KV rows AND all anchor bytes of ALL ranks together
+    # against the SUM of the free rows (whole requests, all or nothing, in the
+    # candidate order): the anchor consumes rows, KV gets the rest (max KV shrinks
+    # only as far as an anchor really displaces free rows). The anchor count, the
+    # cap and the pricing ride the plan digest and the manifest v2 fingerprint; the
+    # wake reads the overflow anchors back from the hold rows (source checksum),
+    # nothing from L2. Default off = the S4 path byte for byte.
+    SGLANG_WEG2_L15_POOL_S4B = EnvBool(False)
+    # L15-POOL S1b (weg2/l15_pool_peak.py): the planner input P_AWAKE_PEAK_MIB
+    # per card, built from measured WEG2-VRAM-PEAK windows (scripts/
+    # l15_pool_peak_record.py): per card the MAXIMUM over boots/lines with its
+    # origin, never a mean, never an estimate. On: with SGLANG_WEG2_L15=1 the
+    # pool record is the only source of the peaks (no record for a card = no
+    # pool share there) and one ``L15-POOL-PEAK card=.. peak_mib=.. source=..
+    # n=..`` line per card is printed. 0 = the planner byte for byte as before.
+    # _FILE overrides weg2/profile_records_data/l15_pool_peak_<profile>.json.
+    SGLANG_WEG2_L15_POOL_PEAK_RECORD = EnvBool(False)
+    SGLANG_WEG2_L15_POOL_PEAK_RECORD_FILE = EnvStr("")
     # L3FILL_JOIN_WAIT_MS (L3FILL-JOINED 30.09., NF y4a ep36 weg2-36-74): how
     # long an L3 -> L2 fill waits for a stem another writer has CLAIMED to
     # become COMPLETE before it counts as a miss. A prefix read ends at its
@@ -1115,6 +1193,11 @@ class Envs:
     # FLIPCYCLE H1 (02.10., weg2/front.drain): a flip whose ledger is already
     # empty (D->P after the park) skips the drain's blocking progress read.
     SGLANG_WEG2_ENABLE_DRAIN_EMPTY_SKIP = EnvBool(True)
+    # FLIPCYCLE H5 (02.10., weg2/front._p_drain_pool cap_exempt): past the P
+    # phase cap (H91 part C rule 1) a queued SHORT still rides P's batch; off =
+    # the cap strands it and D prefills it after the P->D flip (y6z ep 2,
+    # weg2-1-7: 2.03 s with every seat stalled). Design law E2: on.
+    SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES = EnvBool(True)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.
@@ -1149,6 +1232,23 @@ class Envs:
     SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(True)
     # the groups both parts apply to (comma list; default the D->P sleeper)
     SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
+    # PUBLISH-SWEEP-BG (04.10., INT8 boot 4cf740ad50, D->P flip layer 2.1 s ->
+    # 3.4-5.6 s): after a long D wake phase 110-121 finished-request nodes sat
+    # un-backed (D-IDLE-PUBLISH only runs when D is idle, one node per pass) and
+    # the flip's flush paid 1.9-2.8 s of write_backup issue for them. True = the
+    # same publish_unbacked_sweep also runs BETWEEN D decode rounds, every
+    # _EVERY-th forward, at most _MAX_ISSUE node(s), only nodes no running
+    # request references (device lock 0) whose parent is already backed, so the
+    # flip finds the backlog small. False = the flush alone, as in 4cf740ad50.
+    SGLANG_WEG2_PUBLISH_SWEEP_BG = EnvBool(True)
+    # EVERY 64 (review 1270 #5: a BG issue is synchronous in the TP lockstep, p90 54 ms,
+    # 4.6 % of the issues > 100 ms): about one node per 2-4 s of D decode.
+    SGLANG_WEG2_PUBLISH_SWEEP_BG_EVERY = EnvInt(64)
+    # BG only publishes nodes with len(key) <= this many tokens (replicated, so every rank
+    # decides alike); a longer node (a P hand-over chain) is left to the flip's flush as
+    # before. 0 = no size limit.
+    SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_TOKENS = EnvInt(8192)
+    SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_ISSUE = EnvInt(1)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).
@@ -1250,6 +1350,26 @@ class Envs:
     # CSV, "0" = no rate). Set by the weg2 launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
     # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
     SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
+    # Q-694b EXTEND-RATE: the rank MEASURES its own extend transient per row
+    # (allocator peak / reserved growth of every target extend of >= 2048 rows)
+    # and votes with max(start rate, measured x 1.15), a per-rank ratchet up
+    # only; the rate above is then only the start value (record or derived from
+    # the model geometry). Written by the weg2 launcher on the flip line's D
+    # group; off = the rate above alone, byte-identical.
+    SGLANG_WEG2_EXTEND_RATE_MEASURE = EnvBool(False)
+    # Q-710 EXTEND-CAP-FLOOR (INT8 y8vb 03.10. 19:34-19:51Z, 3905 one-token D
+    # extends, ~150 ms each, 11x 'GROUP-NARROWED 4096 to 1'): the rc12g vote
+    # floor((card_free_post - 300) / rate) is page-clamped to ONE row once a
+    # card (the 3080, 72-290 MiB free in the D phase) sits under the 300 MiB
+    # line, and an eager extend costs the same ~150 ms at 1 row as at 100. With
+    # this on the vote never drops below a floor chunk (1/16 of the configured
+    # width, bounded by what the free card physically funds at the priced
+    # rate), and a fresh D-direct request longer than the group's width while
+    # that width is under the floor is refused at the X gate so the front
+    # routes it through P. Written by the weg2 launcher only where it wrote
+    # the flip arm's rate (Q-694); off = byte-identical, P0 arm and dual never
+    # set it.
+    SGLANG_WEG2_EXTEND_CAP_FLOOR = EnvBool(False)
     # CORRIDOR BOUND WAKE RESET (y3r Klasse E/A2, D TP1 3080, 23:45:29-34): the
     # '#794 GROUP-NARROWED ... from 4096 to 64' right after every wake is the
     # #1028c bounded-min window (5 s) of the #656 gate still holding the
@@ -2034,6 +2154,15 @@ class Envs:
     # and stays on D. Line 'WEG2 P-ANCHOR-PRESENCE'. Off = no record (#1324:
     # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
     SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(True)
+    # Q-711 SHORT-KEPT-BOUND (INT8 y8vb 03.10.): a SHORT kept for D waits in the
+    # front's _ready_for_d, which no flip trigger reads (they read only the batch
+    # queue) -- it had no upper bound (137 s and 152 s, p90 137 s against 1 s on
+    # y8va). Past this many seconds in D's admission line WITHOUT a free seat it
+    # moves to P's queue (_to_p_batch, arrival order) and the existing flip path
+    # takes it. Profile row ``short_kept_max_wait_s`` (qwen27b 30 s, nextflash
+    # 0); 0 = off, byte-identical (also the value without a form). Not read in
+    # the dual layout.
+    SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S = EnvFloat(_profile_default("SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S", 0.0))
     # RPC-STALL-WATCHDOG (30.09., hauenh P->D epoch 6: D TP0 silent 6 s inside the wake RPC):
     # faulthandler's C watchdog writes every thread's stack into its own file per rank when a sleep
     # (release) or wake (resume) RPC outlives this many seconds (weg2/rpc_stall_watchdog.py). A normal

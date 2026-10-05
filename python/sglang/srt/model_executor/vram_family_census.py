@@ -561,6 +561,16 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
     re-bases the counter -- in this order, so the cumulative readers see this
     forward's peak before the re-base (the shadow keeps it anyway)."""
     kind = _maybe_log_vram_peak_since_pools(runner, forward_batch, cuda=cuda)
+    # Q-694b EXTEND-RATE: the extend's own reading, BEFORE the window below
+    # re-bases the peak counter (no-op unless SGLANG_WEG2_EXTEND_RATE_MEASURE
+    # opened a reading at the extend's start)
+    try:
+        from sglang.srt.weg2 import extend_trim as _et
+
+        if _et._CACHE["pending"] is not None:
+            _et.measure_close(runner, forward_batch, cuda, rank=getattr(runner, "tp_rank", None))
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a forward
+        logger.debug("EXTEND-RATE skipped: %s", exc)
     try:
         from sglang.srt.model_executor import vram_peak_window
 
