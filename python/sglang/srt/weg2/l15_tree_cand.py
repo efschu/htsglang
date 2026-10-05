@@ -41,6 +41,8 @@ TREE_CAND_ENV = "SGLANG_WEG2_L15_TREE_CAND"
 TREE_CAND_N_ENV = "SGLANG_WEG2_L15_TREE_CAND_N"
 #: L15-TREE-CAND-DIAG (desk 2023): log-only loss census of a walk that ends empty
 TREE_CAND_DIAG_ENV = "SGLANG_WEG2_L15_TREE_CAND_DIAG"
+#: L15-TREE-CAND-DIAG-ALL (desk 2025): with the DIAG switch on, one census line at EVERY vote
+TREE_CAND_DIAG_ALL_ENV = "SGLANG_WEG2_L15_TREE_CAND_DIAG_ALL"
 DEFAULT_MAX_N = 8
 RID_PREFIX = "tree:"
 # L15-EXTRAKEY (240): a tip whose key carries an extra_key (cache salt,
@@ -232,6 +234,18 @@ def diag_on(env: Optional[Mapping[str, str]] = None) -> bool:
         "1", "true", "on")
 
 
+def diag_all(env: Optional[Mapping[str, str]] = None) -> bool:
+    """``SGLANG_WEG2_L15_TREE_CAND_DIAG_ALL=1`` (with the DIAG switch on): the census
+    line at EVERY vote, not only after an empty walk (kurz2 20:02-20:05Z: five of six D
+    sleeps had agreed>=1 and logged nothing, although TP0 offered 1-2 of the 4-7 tips of
+    TP1/TP2). Log only, default off."""
+    import os
+
+    env = os.environ if env is None else env
+    return str(env.get(TREE_CAND_DIAG_ALL_ENV, "") or "").strip().lower() in (
+        "1", "true", "on")
+
+
 def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, object]:
     """L15-TREE-CAND-DIAG: where the device tips of this rank's tree are lost on
     the way to the TREE-CAND vote. Read-only, no collective, never a decision.
@@ -268,7 +282,7 @@ def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, object]:
     out: Dict[str, object] = {
         "tips": len(tips), "no_mamba_host": 0, "no_kv_host": 0, "kv_pending": 0,
         "chain_error": 0, "l2_ok": 0, "kept": 0, "head_miss": 0,
-        "shadow_len_mismatch": 0, "first_miss_tok": []}
+        "shadow_len_mismatch": 0, "tip_miss": 0, "anc_miss": 0, "first_miss_tok": []}
     offsets = set()
     inflight = set()
     try:  # keyed by node id (ongoing_backup is keyed by operation id: not used)
@@ -316,6 +330,14 @@ def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, object]:
                             pending = True
                 chain.append((ntok, missing))
                 cur = par
+            if reason == "no_kv_host":
+                # which half of the chain lacks backing: the tip node itself (a node
+                # published once and whose host rows a reset_keep nulled: chain[0]) and/or
+                # an ancestor (a split parent: chain[1:])
+                if chain and chain[0][1]:
+                    out["tip_miss"] += 1
+                if any(m for _n, m in chain[1:]):
+                    out["anc_miss"] += 1
             if pending:
                 out["kv_pending"] += 1
             if sh_bad:
@@ -347,13 +369,14 @@ def loss_line(rank, census: Mapping[str, object], local: int, agreed: int,
     """``L15-TREE-CAND-LOSS rank=<r> local=.. agreed=.. require_l2=.. tips=.. ...``"""
     return ("L15-TREE-CAND-LOSS rank=%s local=%d agreed=%d require_l2=%d tips=%d "
             "no_mamba_host=%d no_kv_host=%d kv_pending=%d chain_error=%d l2_ok=%d kept=%d "
-            "head_miss=%d shadow_len_mismatch=%d first_miss_tok=%s"
+            "head_miss=%d shadow_len_mismatch=%d tip_miss=%d anc_miss=%d first_miss_tok=%s"
             % (rank if rank is not None else "?", local, agreed, int(bool(require_l2)),
                census.get("tips", 0), census.get("no_mamba_host", 0),
                census.get("no_kv_host", 0), census.get("kv_pending", 0),
                census.get("chain_error", 0), census.get("l2_ok", 0),
                census.get("kept", 0), census.get("head_miss", 0),
-               census.get("shadow_len_mismatch", 0),
+               census.get("shadow_len_mismatch", 0), census.get("tip_miss", 0),
+               census.get("anc_miss", 0),
                ",".join(str(x) for x in list(census.get("first_miss_tok") or ())[:4])
                or "-"))
 
@@ -747,7 +770,7 @@ def build(tree_cache, gather: Callable[[object], List[object]], n_live: int,
                "" if err is None else " walk_failed=%s: %s" % (type(err).__name__, err),
                ",".join("%s(%d)" % (rid_of(c), c.n_tokens)
                         for c in agreed[:6])))
-    if log is not None and (not local or not agreed) and diag_on(env):
+    if log is not None and ((not local or not agreed) or diag_all(env)) and diag_on(env):
         # L15-TREE-CAND-DIAG: log-only, after the vote -- never changes ``agreed``
         try:
             log(loss_line(rank, loss_census(tree_cache, require_l2), len(local),

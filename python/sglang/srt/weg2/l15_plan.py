@@ -138,6 +138,49 @@ def park_after_flush_active(env: Mapping[str, str]) -> bool:
     )
 
 
+SPLIT_SHADOW_ENV = "SGLANG_WEG2_L15_SPLIT_SHADOW"
+
+
+def split_shadow_active(env: Mapping[str, str]) -> bool:
+    """L15-SPLIT-SHADOW: True iff ``UnifiedRadixCache._split_node`` must hand the
+    recorded L2 shadow (``park_l3.L2_SHADOW_ATTR``) of a split node to both halves.
+
+    True only when ALL hold: L15 master on, the new switch on, group D (the shadow
+    only exists on D's store-loaded nodes), not the dual layout (V1 refuses L15 there).
+    Process-env terms only, so every D rank decides alike; no collective is involved.
+    Anything else = False = ``_split_node`` byte for byte as before.
+    """
+    group = str(env.get("SGLANG_WEG2_GROUP", "") or "").strip().upper()
+    dual = str(env.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip()
+    return bool(
+        master_on(env)
+        and _switch(env, SPLIT_SHADOW_ENV)
+        and group == "D"
+        and dual != "1"
+    )
+
+
+KEEP_SHADOW_ENV = "SGLANG_WEG2_L15_KEEP_SHADOW"
+
+
+def keep_shadow_active(env: Mapping[str, str]) -> bool:
+    """L15-KEEP-SHADOW: True iff ``UnifiedRadixCache.reset_keep`` must record the host rows
+    of the kept nodes as the L2 shadow (``park_l3.L2_SHADOW_ATTR``) before it nulls them.
+
+    Same terms as :func:`split_shadow_active`: L15 master on, the new switch on, group D,
+    not the dual layout. Process-env only (every D rank decides alike, no collective).
+    Anything else = False = ``reset_keep`` byte for byte as before.
+    """
+    group = str(env.get("SGLANG_WEG2_GROUP", "") or "").strip().upper()
+    dual = str(env.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip()
+    return bool(
+        master_on(env)
+        and _switch(env, KEEP_SHADOW_ENV)
+        and group == "D"
+        and dual != "1"
+    )
+
+
 def parse_l15_mib(value: Optional[str]) -> Tuple[str, Dict[int, int]]:
     """``SGLANG_WEG2_L15_MIB`` -> ``("auto", {})`` or ``("override", {card: mib})``.
 

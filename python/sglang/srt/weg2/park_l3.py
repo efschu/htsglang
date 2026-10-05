@@ -686,6 +686,34 @@ def _l15_shadow_on() -> bool:
         return False
 
 
+def split_l2_shadow(parent, child, split_len: int) -> bool:
+    """L15-SPLIT-SHADOW: ``_split_node`` cut ``child``'s span at ``split_len`` keys; hand
+    the L2 shadow the same way ``FullComponent.redistribute_on_node_split`` hands
+    ``host_value``: the new ``parent`` gets rows/gens ``[:split_len]``, ``child`` keeps
+    ``[split_len:]``. Without it the parent has no host value and no shadow (so
+    ``l15_tree_cand.l2_backed`` refuses EVERY chain through it on the cap-0 rank) and the
+    child's shadow is longer than its tokens (``l15_bind`` refuses it).
+
+    Called only after the split, with ``child.key`` already the lower half. Does nothing
+    (returns False, nothing touched) when the child carries no shadow, the shadow is not a
+    consistent (rows, gens) pair, or its length is not the node's whole span
+    (``split_len + len(child.key)``) -- a shadow that was already wrong stays as it was.
+    Never raises."""
+    try:
+        sh = getattr(child, L2_SHADOW_ATTR, None)
+        if sh is None or len(sh) != 2:
+            return False
+        rows, gens = sh
+        k = int(split_len)
+        if len(rows) != len(gens) or k <= 0 or len(rows) != k + len(child.key):
+            return False
+        setattr(parent, L2_SHADOW_ATTR, (tuple(rows[:k]), tuple(gens[:k])))
+        setattr(child, L2_SHADOW_ATTR, (tuple(rows[k:]), tuple(gens[k:])))
+        return True
+    except Exception:  # noqa: BLE001 -- the shadow is optional
+        return False
+
+
 def record_l2_shadow(pool, shadowed) -> int:
     """L15-L2-SHADOW (N5n 14:44:07, dac8b62b8c): the #248 release drops the KV
     host rows of a freshly loaded span (P's prefill pages, read from the shared
@@ -718,6 +746,45 @@ def record_l2_shadow(pool, shadowed) -> int:
         return total
     except Exception as exc:  # noqa: BLE001 -- the shadow is optional
         logger.info("L15-L2-SHADOW record failed (%s: %s)", type(exc).__name__, exc)
+        return 0
+
+
+def record_keep_shadow(tree, nodes) -> int:
+    """L15-KEEP-SHADOW: ``reset_keep`` is about to null ``Full.host_value`` of every kept
+    node (the hold keeps the node OBJECTS, device only). Record each such node's host rows
+    with their arena generations as the L2 shadow first -- the same attribute and form
+    ``record_l2_shadow`` writes for a store-loaded node -- so that the node still has an L2
+    identity at the next sleep (``l15_tree_cand.l2_backed``, ``l15_bind.chain_host_rows_ex``
+    adopt it only where the slot still carries that generation, a re-claim bumps it).
+    A fresher ``host_value`` replaces an older shadow; a node without host rows keeps what it
+    has. Same guards as :func:`release_loaded_host` (park_l3 on, group D, not a Form A
+    worker, an arena KV pool). Returns the rows recorded; never raises."""
+    try:
+        if not enabled() or not _group_d():
+            return 0
+        from sglang.srt.weg2 import l15_plan
+
+        if not l15_plan.keep_shadow_active(os.environ):
+            return 0
+        from sglang.srt.mem_cache import form_a_host_shadow as _r12
+        from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
+
+        if _r12.role() == "worker":
+            return 0
+        pool = tree._weg2_arena_pools().get(BASE_COMPONENT_TYPE)
+        if pool is None:
+            return 0
+        shadowed = []
+        for node in nodes:
+            hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+            if hv is None or len(hv) == 0:
+                continue
+            if getattr(node, "write_through_pending_id", None) is not None:
+                continue  # its page is not COMPLETE yet: no L2 identity to remember
+            shadowed.append((node, [int(x) for x in (hv.tolist() if hasattr(hv, "tolist") else hv)]))
+        return record_l2_shadow(pool, shadowed) if shadowed else 0
+    except Exception as exc:  # noqa: BLE001 -- the shadow is optional
+        logger.info("L15-KEEP-SHADOW record failed (%s: %s)", type(exc).__name__, exc)
         return 0
 
 

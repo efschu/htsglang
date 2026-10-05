@@ -1610,6 +1610,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 keep_set.add(cur)
                 cur = cur.parent
+        # L15-KEEP-SHADOW (default off): the kept nodes lose ``host_value`` below; remember
+        # its rows + arena gens as the L2 shadow first (park_l3.record_keep_shadow gates itself)
+        from sglang.srt.weg2 import park_l3 as _park_l3
+
+        _park_l3.record_keep_shadow(self, keep_set)
         # Everything _reset_full does for the tree: prefetch pins, host
         # arena values, deferred publish/cap state, counters, fresh root
         # (lock_ref 1), empty LRU lists and leaf sets, zeroed sizes.
@@ -3843,6 +3848,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
+        # L15-SPLIT-SHADOW (default off): a store-loaded node keeps its released host rows
+        # as ``_weg2_l2_shadow`` (park_l3.record_l2_shadow); hand it to both halves like
+        # ``host_value`` above. The attribute exists only on such nodes, so the common
+        # split pays one getattr.
+        if getattr(child, "_weg2_l2_shadow", None) is not None:
+            from sglang.srt.weg2 import l15_plan as _l15_plan
+
+            if _l15_plan.split_shadow_active(os.environ):
+                from sglang.srt.weg2 import park_l3 as _park_l3
+
+                _park_l3.split_l2_shadow(new_node, child, split_len)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
         if child.backuped:

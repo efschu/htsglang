@@ -1008,6 +1008,27 @@ class Envs:
     # reason of loss (no mamba host row / no KV host row / no L2 shadow / chain does not
     # compose). No collective, no behaviour change. Default off.
     SGLANG_WEG2_L15_TREE_CAND_DIAG = EnvBool(False)
+    # L15-TREE-CAND-DIAG-ALL (desk 2025): log-only, needs SGLANG_WEG2_L15_TREE_CAND_DIAG. On: the
+    # L15-TREE-CAND-LOSS census line at every TREE-CAND vote, not only after an empty walk.
+    SGLANG_WEG2_L15_TREE_CAND_DIAG_ALL = EnvBool(False)
+    # L15-SPLIT-SHADOW (desk 2025, kurz2 20:02-20:05Z): a radix split of a store-loaded node
+    # (``release_loaded_host`` kept its host rows only as the L2 shadow attribute) gave the new
+    # parent NO shadow and left the child a shadow longer than its tokens, so every chain through
+    # the split parent read "no KV host" on the cap-0 rank (TREE-CAND require_l2) and the session
+    # tips were not agreed. On (+ L15 master + group D + not dual): ``_split_node`` splits the
+    # shadow at ``split_len`` exactly as ``FullComponent.redistribute_on_node_split`` splits
+    # ``host_value``. Default off = ``_split_node`` unchanged. Read through
+    # ``l15_plan.split_shadow_active(os.environ)``.
+    SGLANG_WEG2_L15_SPLIT_SHADOW = EnvBool(False)
+    # L15-KEEP-SHADOW (desk 2025, code-derived, see done/2025-l15-e-gelb.md sec. 4): the L15 wake keeps a
+    # held chain's nodes as the SAME objects but ``reset_keep`` nulls their ``host_value`` (and the
+    # publish sweep skips ``l3_present`` nodes), so at the NEXT sleep a held tip has no KV host
+    # row on the cap-0 rank and TREE-CAND ``require_l2`` drops it -- a tip survives one sleep, never
+    # the four a k=1 follow-up needs. On (+ L15 master + group D + not dual + park_l3 enabled):
+    # ``reset_keep`` records the about-to-be-nulled host rows of every kept node as the L2 shadow
+    # (rows + arena gens, the form ``record_l2_shadow`` uses for store-loaded nodes) first.
+    # Default off = ``reset_keep`` unchanged. Read through ``l15_plan.keep_shadow_active``.
+    SGLANG_WEG2_L15_KEEP_SHADOW = EnvBool(False)
     # L15-POOL S4 (docs/L15-POOL-ENTWURF-1004.md sec 1.2/3.3/4.5/5.2 N4/7, KV AND
     # END anchor = a WHOLE request): part switch ON TOP of SGLANG_WEG2_L15_POOL and
     # SGLANG_WEG2_L15_POOL_S3 (S4 without them is refused by name,
