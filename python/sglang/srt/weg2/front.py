@@ -6582,6 +6582,53 @@ class Front:
                         f"length ({ctx} tokens)."),
             "type": "BadRequestError", "param": None, "code": 400}}, status=400)
 
+    # -- #1730 FRONT-REJECT-OVERLONG -------------------------------------------------------
+    # b9o (04.10. 23:40-23:51Z, deskq/done/1710 + 1720 side finding): in the dual arm
+    # (--max-kv-per-request 131072) a prompt of 133969..149779 tokens was routed LONG, ran on P as a
+    # 1-token abort stub (scheduler.py: validate_input_length(min(max_req_input_len, kv_cap)) refuses
+    # len >= cap) that held a full ring slot for one revolution, and came back 400 -> client 503.
+    #: The front's exact count was 1 above P's in all 4 b9o samples (front SESSION-PREFIX prompt=149780 /
+    #: 133970 against P "Input length (149779 / 133969 tokens)"); the scheduler refuses len >= cap, so the
+    #: front refuses (n - OFFSET) >= cap and names P's number (n - OFFSET), i.e. the exact message P would give.
+    OVERLONG_FRONT_OVER_P = 1
+
+    def _overlong_cap(self) -> int:
+        """The dual arm's per-request cap: the groups' own ``max_kv_per_request`` (their /get_server_info
+        server args). 0 = not known / not set (then the cap is the context length, the CONTEXT-GATE's)."""
+        info = self.__dict__.get("_store_probe_info") or {}
+        v = info.get("max_kv_per_request")
+        return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+    def _overlong_gate(self, rid: str, path: str, xx: Any):
+        """400 for a request P would refuse at intake for its length, else None.
+
+        What the front HAS: the exact tokenizer count only through X-EXACT (``xx.n``, D's tokenizer +
+        template, no band). Without it (chars/3 estimate, tokenizer not ready, fallback) the request passes
+        unchanged -- an estimate can be 60 % off and would refuse near the cap wrongly. An image request
+        (``xx.mm``) passes too: its count may rest on a learned image size. Off / flip form: unchanged."""
+        if not envs.SGLANG_WEG2_FRONT_REJECT_OVERLONG.get() or not getattr(self, "dual_layout", False):
+            return None
+        if xx is None or getattr(xx, "mm", False):
+            return None
+        cap = Front._overlong_cap(self)
+        if cap <= 0:
+            return None
+        n_front = int(xx.n)
+        tokens = n_front - int(self.OVERLONG_FRONT_OVER_P)
+        if tokens < cap:
+            return None
+        self.counters["front_reject_overlong"] += 1
+        logger.warning("#1730 FRONT-REJECT-OVERLONG rid=%s tokens=%d cap=%d front_count=%d path=%s (400 before "
+                       "any route, seat or P leg 1 -- P would answer 400 after a ring slot)",
+                       rid, tokens, cap, n_front, path)
+        msg = (f"Input length ({tokens} tokens) exceeds the maximum allowed length ({cap} tokens). "
+               f"Use a shorter input or enable --allow-auto-truncate.")
+        if path == "/v1/messages":
+            body: Dict[str, object] = {"type": "error", "error": {"type": "invalid_request_error", "message": msg}}
+        else:
+            body = {"error": {"message": msg, "type": "invalid_request_error", "param": None, "code": 400}}
+        return web.json_response(body, status=400)
+
     # -- MM-XPRICE (front_tokens): image token counts as the groups realised them --------
     def _mm_ktok(self) -> Dict[str, int]:
         """image key -> its token count, learned from served legs (front-local)."""
@@ -9086,6 +9133,11 @@ class Front:
         if _ctx_refusal is not None:
             Front._pb_resolve(self, rid, _pb_fut, "none", 0)
             return _ctx_refusal
+        # #1730 FRONT-REJECT-OVERLONG: dual layout + switch + exact count over the cap -> 400 here, P untouched.
+        _ol_refusal = self._overlong_gate(rid, request.path, _xx)
+        if _ol_refusal is not None:
+            Front._pb_resolve(self, rid, _pb_fut, "none", 0)
+            return _ol_refusal
         if not known:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
