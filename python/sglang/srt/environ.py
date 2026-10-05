@@ -2521,6 +2521,13 @@ class Envs:
     SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(
         _profile_default("SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS", -1.0))
 
+    # deskq 1981 (f11 false alarms): the ADMISSION-WEDGE 'queue age' is the time since D's LAST FIRST TOKEN, not the
+    # age of the waiting request -- a long decode or an idle D makes the clock old before the request arrives, and
+    # the first poll that sees it alarms. 1 = (dual layout only, SGLANG_WEG2_DUAL_LAYOUT=1) the age is
+    # min(that clock, time the waiting_queue has been non-empty as seen by the poll), and a new alarm window
+    # clears the recovery channel's stale last_outcome. 0 = off (default): the pre-fix verdict, byte for byte.
+    SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK = EnvBool(False)
+
     # #788: per-rank admission-verdict trace. OFF by default -- it exists to
     # convert a MECHANISM proof into a captured value on one instrumented
     # boot, not to run permanently. Under PP every rank re-derives the
