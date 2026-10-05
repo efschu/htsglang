@@ -797,6 +797,19 @@ class Envs:
     # needs card_room (blind = P stays asleep, one named line) and the sleep leg's RPC answered (the loan is published
     # at its end). No reserve, no D brake: D may grow into the loan; P returns only once the card has it free again.
     SGLANG_WEG2_DUAL_WAKE_SEES_LOAN = EnvBool(False)
+    # #1962 P-LAYER-STREAM (dual P, PP0 only; weg2/p_layer_stream.py). DEFAULT OFF = the old code path byte for
+    # byte (nothing is built, no hook installed, the grant path never calls in). Goal: Dual-P prefills 262144 tokens
+    # (1959/1960: the K0 pool is 3.3 GB against 6.0 GB for level 266240; no static cut carries it under D load).
+    # On: when PP0's atomic group grant is short ONLY on PP0's own card, PP0 pauses whole weight-chunk tags of its
+    # P-PRIVATE layer bytes (TMS pause, VA kept), lends the freed bytes to the card pool and streams those layers'
+    # tensors from pinned host images per forward (side stream, SGLANG_WEG2_DUAL_P_LAYER_STREAM_PREFETCH layers
+    # ahead) -- the 27B analogue of NF's "experts out, KV in", staged by the prompt's level. Regain at idle when the
+    # ledger has the bytes back (P never presses D; D may grow into the loan, then P keeps streaming). PP0 runs
+    # eager while a unit is paused (graphs read the paused VA). Same math, same outputs, no collective, no rank
+    # but PP0 changes behaviour.
+    SGLANG_WEG2_DUAL_P_LAYER_STREAM = EnvBool(False)
+    # #1962: layers whose streamed tensors are copied ahead of the forward (staging = this many layers' bytes).
+    SGLANG_WEG2_DUAL_P_LAYER_STREAM_PREFETCH = EnvInt(2)
     # #1540 D-SIGNAL-SEATS (dual front, default off): d_signal (D's id-space / Mamba-arena reading,
     # dual_d_priority.d_signal_short) counts as pressure only while D really has work that needs the
     # rows -- a live seat (front._d_seats_live) or a leg-1-done request waiting for one

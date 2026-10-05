@@ -495,6 +495,15 @@ def attach(runner) -> Optional["PKvStage"]:
     book_alloc_cache(ledger, int(getattr(runner, "pp_rank", 0) or 0), card)
     actor._engage_cap(actor.allocator, 0, actor.page)
     setattr(runner, ACTOR_ATTR, actor)
+    # #1962 P-LAYER-STREAM (PP0, default off): weights out, KV in, by the prompt's level
+    from sglang.srt.weg2 import p_layer_stream as _pls
+
+    if _pls.armed() and int(getattr(runner, "pp_rank", 0) or 0) == 0:
+        try:
+            actor.streamer = _pls.build_for_runner(runner)
+        except Exception as exc:  # noqa: BLE001 -- no streamer = the grant path as before, never a death
+            logger.warning("%s not built: %r -- PP0 grants as before", _pls.MARK, exc)
+            actor.streamer = None
     publish_stage(actor, tag, int(getattr(runner, "pp_rank", 0) or 0))
     logger.info("%s JOIN card=%s boot_tokens=%d contributed=%d B top=%d tokens step=%d -- P keeps 0 "
                 "mapped; its KV is the card pool's", MARK, card[-12:], boot, boot_bytes, actor.top,
@@ -723,7 +732,7 @@ def _infeasible_skip_armed() -> bool:
         return False
 
 
-def infeasible_cards(stages, covered, level_tokens: int) -> list:
+def infeasible_cards(stages, covered, level_tokens: int, stream_room: int = 0) -> list:
     """[(card, need, have, P, D)] of every card on which this grant stays short even if D gave back
     everything it holds there (need > ledger free + D committed). ``need`` is what ``group_grant``
     asks of that card (the level's bytes less what the ledger already covers for PP0's own mapping).
@@ -742,7 +751,8 @@ def infeasible_cards(stages, covered, level_tokens: int) -> list:
                 continue
             have = int(st.free)
             d = int(st.committed.get("D", 0))
-            if need > have + d:
+            # #1962: what PP0 could still free of its own weights counts on its own card (0 = off)
+            if need > have + d + (int(stream_room) if i == 0 else 0):
                 out.append((i, need, have, int(st.committed.get("P", 0)), d))
         return out
     except Exception:  # noqa: BLE001
@@ -758,6 +768,12 @@ _OVERTAKERS: dict = {}
 _FLOOR_CACHE: list = [None, False]
 FLOOR_CACHE_S = 0.25
 FLOOR_MARK = "#1920 HEAD-BYPASS-FLOOR"
+
+
+def _stream_room(actor) -> int:
+    """#1962: bytes PP0 could still free by pausing weight units (0 without a streamer)."""
+    st = getattr(actor, "streamer", None)
+    return int(st.room()) if st is not None else 0
 
 
 def head_grantable_now(stages, covered, level_tokens: int) -> bool:
@@ -917,6 +933,16 @@ def pp0_grant(sched, req) -> Optional[int]:
     own = int(getattr(actor, "_committed", 0) or 0)    # PP0's card: the ledger covers its mapping exactly
     taken: list = []
     lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"), covered={0: own}, taken_out=taken)
+    if not lvl and getattr(actor, "streamer", None) is not None:
+        # #1962 P-LAYER-STREAM: short ONLY on PP0's card -> PP0 pauses weight units of its own (D untouched),
+        # lends the bytes and asks once more. Off (no streamer): this branch does not exist.
+        from sglang.srt.weg2 import p_layer_stream as _pls
+        from sglang.srt.weg2.card_kv_ledger import peek as _peek
+
+        if _pls.try_stream_for_grant(actor, stages, tokens, own, _peek) > 0:
+            taken = []
+            lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"), covered={0: own},
+                              taken_out=taken)
     if lvl and older:
         head, since = min(older, key=lambda x: x[1])
         logger.info("%s %s rid=%s tokens=%d past=%s head_wait_s=%.1f: the head waits for a card, this grant "
@@ -967,11 +993,11 @@ def pp0_grant(sched, req) -> Optional[int]:
         if _infeasible_skip_armed():
             # evaluated on every wait only while the switch is on (a ledger peek per card); otherwise the
             # marker is computed lazily on the log's backoff curve below
-            _inf = infeasible_cards(stages, {0: own}, _lv)
+            _inf = infeasible_cards(stages, {0: own}, _lv, _stream_room(actor))
             _INFEASIBLE[rid] = bool(_inf)
 
         def _inf_line():
-            cards = _inf if _inf is not None else infeasible_cards(stages, {0: own}, _lv)
+            cards = _inf if _inf is not None else infeasible_cards(stages, {0: own}, _lv, _stream_room(actor))
             return _infeasible_line(rid, tokens, _lv, cards) if cards else None
 
         _log_wait(rid, tokens, lambda: _grant_short_detail(
@@ -1495,6 +1521,8 @@ def on_idle(sched) -> int:
     actor = _actor(sched)
     if actor is not None:
         phys_check(actor, "P")
+    if actor is not None and actor.mapped_tokens <= 0 and getattr(actor, "streamer", None) is not None:
+        _stream_regain(actor)                 # #1962: P holds no KV -- weight units back if the card has them
     if actor is None or actor.mapped_tokens <= 0:
         return 0
     tree = getattr(sched, "tree_cache", None)
@@ -1511,4 +1539,18 @@ def on_idle(sched) -> int:
         except Exception as exc:  # noqa: BLE001 -- a failed flush keeps the pages, never frees under them
             logger.warning("%s idle flush skipped: %r", MARK, exc)
             return 0
-    return actor.release_all()
+    n = actor.release_all()
+    if n and getattr(actor, "streamer", None) is not None:
+        _stream_regain(actor)
+    return n
+
+
+def _stream_regain(actor) -> int:
+    """#1962 regain at idle; a refused resume keeps the unit paused and the loan standing (logged)."""
+    from sglang.srt.weg2 import p_layer_stream as _pls
+
+    try:
+        return _pls.regain_at_idle(actor, phys_free=phys_free_bytes)
+    except Exception as exc:  # noqa: BLE001 -- the unit stays streamed, P serves on
+        logger.warning("%s REGAIN-REFUSED %r -- the unit stays paused, P keeps streaming", _pls.MARK, exc)
+        return 0

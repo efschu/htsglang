@@ -100,6 +100,23 @@ def _weg2_ring_symbol(name: str):
         return None
 
 
+def _p_layer_stream_owns(tag) -> bool:
+    """#1962 P-LAYER-STREAM: a weight-chunk tag the dual P's PP0 streamer paused
+    belongs to the streamer -- an ordinary pause/resume (the P sleep and wake legs)
+    leaves it alone: pausing it again or resuming it under the streamer's loan is
+    the double-leg class (weight_updater.py #1285). False whenever nothing is paused
+    (the default path: one empty-set test)."""
+    from sglang.srt.weg2 import p_layer_stream as _pls
+
+    if not _pls._OWNED:
+        return False
+    if _pls.owns(tag):
+        logging.getLogger(__name__).warning(
+            "%s tag=%s is the streamer's (paused for P's KV): the ordinary leg skips it", _pls.MARK, tag)
+        return True
+    return False
+
+
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
     def create(enable: bool):
@@ -225,6 +242,8 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         return _memory_saver.disable()
 
     def pause(self, tag: str):
+        if _p_layer_stream_owns(tag):
+            return None
         with _abort_poll_excluded():
             return _memory_saver.pause(tag=tag)
 
@@ -262,6 +281,8 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         """
         from sglang.srt.weg2.wake_kv import resume_landed
 
+        if _p_layer_stream_owns(tag):
+            return None
         need = None
         try:
             need = self.tag_bytes(tag)

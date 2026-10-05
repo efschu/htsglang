@@ -901,6 +901,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._is_full_backend:
                 self._note_eager("green_rung", forward_batch)
             return False
+        # #1962 (weg2/p_layer_stream.py): while a weight unit of this dual-P PP0 is paused, a captured graph would
+        # read its unmapped addresses -- eager (the streamer's layer hooks swap the tensors in). False (inert) in
+        # every process that never paused a unit; after the regain the VA is the same and the graphs replay again.
+        from sglang.srt.weg2.p_layer_stream import force_eager as _pls_stream_eager
+
+        if _pls_stream_eager():
+            if self._is_full_backend:
+                self._note_eager("layer_stream", forward_batch)
+            return False
         if self._is_full_backend:
             reason = self._full_graph_ineligible_reason(forward_batch)
             if reason is not None:
