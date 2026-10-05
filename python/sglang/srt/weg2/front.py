@@ -16596,8 +16596,11 @@ class Front:
                 # FLIPCYCLE H5: the phase cap never strands a SHORT -- except under the
                 # DECODE-COLLECT seat gate (``_dc_cap`` > 0): there the cap IS the free-seat
                 # count, a hard bound (head wins over the H5 port: no SHORT rides past it).
+                # DUAL GATE (joint tree 05.10.): the H5 port is a flip-form default-on; the dual
+                # layout (NVFP4 P+D together, no flip, no D prefill after a flip) never takes it.
                 cap_exempt=(self._p_phase_short_rides
-                            if (envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0)
+                            if (envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0
+                                and not getattr(self, "dual_layout", False))
                             else None))
             if _phase_stats.get("short_rides"):
                 self.counters["p_phase_short_rides"] += _phase_stats["short_rides"]
