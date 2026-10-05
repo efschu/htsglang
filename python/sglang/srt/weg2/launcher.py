@@ -6280,8 +6280,13 @@ def topology_check_line(ns, cards: Sequence["Card"],
     try:
         t = _topo.plan_topology(len(cards), topology_context(ns, environ, cards))
     except _topo.TopologyRefused as exc:
-        raise Weg2LaunchRefused(
-            f"{exc} || visible: " + "; ".join(card_identity.describe(c) for c in cards)) from exc
+        text = f"{exc} || visible: " + "; ".join(card_identity.describe(c) for c in cards)
+        if str(exc).startswith(_topo.CODE_COUNT):
+            # PROFIL-EDITOR S1: an N inside the range that is not proven / N-capable is a VALUE refusal (--force lifts it);
+            # HW-TOPOLOGY (N outside the range: no flip topology exists at all) is never lifted
+            refusals.refuse_value("HW-COUNT", text, Weg2LaunchRefused, cause=exc)
+            return f"HW-TOPOLOGY N={len(cards)}: not proven, started with --force: {str(exc)[:240]}"
+        raise Weg2LaunchRefused(text) from exc
     return _topo.topology_line(t)
 
 
