@@ -115,3 +115,135 @@ def test_wiring_gate_runs_before_any_verdict_seat_or_pending():
     assert src.index("_ctx_refusal = self._context_gate(rid, text, _xx, est_prompt)") < g
     assert g < src.index("route = serviceable_route(remainder, carrier_est,")
     assert g < src.index("p = Pending(rid, request.path, payload, text, time.time(), fut,")
+
+
+# ---------------------------------------------------------------------------------- #1958 FRONT-CAP-LEVEL-TOP
+# Profile top112 (--dual-p-kv-max-tokens 114688): P's pool is 114688 rows -> max_req_len 114687 ->
+# max_req_input_len 114682 (tp_worker.get_worker_info: pool - 1 - 5); the scheduler refuses len >= min(114682,
+# max_kv_per_request). The front must take the same minimum, from P's own /get_server_info.
+
+P_CAP = 114682
+
+
+def _front_p(p_cap=P_CAP, max_kv=CAP):
+    f = _front(cap=max_kv)
+    if p_cap is not None:
+        f._overlong_p_input_cap = p_cap
+    return f
+
+
+def test_1958_p_cap_below_max_kv_prompt_between_is_400_with_p_message(monkeypatch):
+    monkeypatch.setenv(ENV, "1")
+    # b: the 117635-token prompt of the release record: front count 117636 -> P's count 117635
+    status, body = _body(_front_p()._overlong_gate("r", "/v1/chat/completions", _xx(117636)))
+    assert status == 400
+    assert body["error"]["message"] == ("Input length (117635 tokens) exceeds the maximum allowed length "
+                                        "(114682 tokens). Use a shorter input or enable --allow-auto-truncate.")
+
+
+def test_1958_boundary_is_the_schedulers_len_ge_cap(monkeypatch):
+    monkeypatch.setenv(ENV, "1")
+    f = _front_p()
+    assert f._overlong_gate("r", "/v1/messages", _xx(P_CAP)) is None             # P count 114681 -> accepted
+    assert f._overlong_gate("r", "/v1/messages", _xx(P_CAP + 1)) is not None     # P count 114682 -> P refuses
+
+
+def test_1958_effective_cap_is_the_minimum_of_both(monkeypatch):
+    monkeypatch.setenv(ENV, "1")
+    assert _front_p(p_cap=200000)._overlong_cap() == CAP        # P roomier: max-kv still rules
+    assert _front_p(p_cap=P_CAP)._overlong_cap() == P_CAP
+    assert _front_p(p_cap=None)._overlong_cap() == CAP          # P cap not known: unchanged (#1730)
+    assert _front_p(p_cap=P_CAP, max_kv=None)._overlong_cap() == P_CAP   # no max-kv flag: scheduler uses ctx, min is P's
+
+
+def test_1958_p_cap_known_switch_off_or_flip_is_unchanged(monkeypatch):
+    f = _front_p()
+    assert f._overlong_gate("r", "/v1/messages", _xx(117636)) is None            # switch off
+    monkeypatch.setenv(ENV, "1")
+    g = _front_p()
+    g.dual_layout = False
+    assert g._overlong_gate("r", "/v1/messages", _xx(10 ** 6)) is None           # flip form
+    assert _front_p()._overlong_gate("r", "/v1/messages", _xx(10 ** 6, mm=True)) is None   # image request
+    assert _front_p()._overlong_gate("r", "/v1/messages", None) is None          # no exact count
+
+
+def test_1958_p_cap_from_info_takes_only_a_positive_int():
+    f = F.Front._overlong_p_cap_from_info
+    assert f({"max_req_input_len": 114682}) == 114682
+    for bad in ({}, {"max_req_input_len": 0}, {"max_req_input_len": -1}, {"max_req_input_len": "x"},
+                {"max_req_input_len": True}, {"max_req_input_len": None}, None):
+        assert f(bad) == 0
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self._b = status, body
+
+    async def json(self):
+        return self._b
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _Sess:
+    def __init__(self, answers):
+        self.answers, self.urls = list(answers), []
+
+    def get(self, url, **kw):
+        self.urls.append(url)
+        a = self.answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return _Resp(*a)
+
+
+def _probe_front(answers):
+    f = _front()
+    f.groups = {"P": types.SimpleNamespace(url="http://p:1"), "D": types.SimpleNamespace(url="http://d:2")}
+    f.session = _Sess(answers)
+    f.OVERLONG_P_PROBE_SLEEP_S = 0.0
+    return f
+
+
+def test_1958_probe_reads_p_group_not_d_and_retries_until_it_answers(monkeypatch):
+    import asyncio
+
+    monkeypatch.setenv(ENV, "1")
+    f = _probe_front([RuntimeError("P not up"), (503, {}), (200, [{"max_req_input_len": P_CAP}])])
+    asyncio.run(f._overlong_probe_p())
+    assert f._overlong_p_input_cap == P_CAP
+    assert f.session.urls == ["http://p:1/get_server_info"] * 3     # only P is asked, never D
+
+
+def test_1958_probe_gives_up_named_and_leaves_the_1730_cap(monkeypatch, caplog):
+    import asyncio
+
+    monkeypatch.setenv(ENV, "1")
+    caplog.set_level(logging.WARNING)
+    f = _probe_front([(200, {})] * 3)
+    f.OVERLONG_P_PROBE_TRIES = 3
+    asyncio.run(f._overlong_probe_p())
+    assert f.__dict__.get("_overlong_p_input_cap", 0) == 0
+    assert f._overlong_cap() == CAP
+    assert any("#1958" in m for m in caplog.messages)
+
+
+def test_1958_probe_is_not_started_without_switch_or_in_flip_form(monkeypatch):
+    import asyncio
+
+    f = _probe_front([(200, {"max_req_input_len": P_CAP})])
+    assert asyncio.run(f._overlong_probe_p()) is None                # switch off
+    monkeypatch.setenv(ENV, "1")
+    f.dual_layout = False
+    asyncio.run(f._overlong_probe_p())                               # flip form
+    assert f.session.urls == [] and not f.__dict__.get("_overlong_p_input_cap")
+
+
+def test_1958_wiring_boot_load_starts_the_probe():
+    src = inspect.getsource(F.Front._x_exact_boot_load)
+    assert "_overlong_probe_p" in src
+    assert src.index("self._store_probe_info = info") < src.index("_overlong_probe_p")

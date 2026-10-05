@@ -6284,6 +6284,9 @@ class Front:
             info.get("tool_call_parser"), int(is_mm),
             int(bool(envs.SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.get())), ft.why, ft.load_s)
         self._store_probe_info = info
+        # #1958: P's own input ceiling for the overlong gate (dual + switch only; a background task)
+        if envs.SGLANG_WEG2_FRONT_REJECT_OVERLONG.get() and getattr(self, "dual_layout", False):
+            self._overlong_probe_task = asyncio.get_running_loop().create_task(Front._overlong_probe_p(self))
         Front._context_gate_announce(self)
         await asyncio.get_running_loop().run_in_executor(ft.executor, self._store_probe_open)
 
@@ -6592,12 +6595,56 @@ class Front:
     #: front refuses (n - OFFSET) >= cap and names P's number (n - OFFSET), i.e. the exact message P would give.
     OVERLONG_FRONT_OVER_P = 1
 
+    #: #1958 FRONT-CAP-LEVEL-TOP: P's own input ceiling, probed once from P's /get_server_info (its scheduler
+    #: ``max_req_input_len`` = pool - 1 - 5; with --dual-p-kv-max-tokens N the P pool is max(boot, N) rows, so
+    #: top112 = 114688 -> 114682). The scheduler refuses len >= min(max_req_input_len, max_kv_per_request); the
+    #: front takes the same minimum. No new channel: the endpoint the front already reads for its tokenizer.
+    OVERLONG_P_PROBE_TRIES = 120
+    OVERLONG_P_PROBE_SLEEP_S = 5.0
+
+    @staticmethod
+    def _overlong_p_cap_from_info(info: Any) -> int:
+        v = info.get("max_req_input_len") if isinstance(info, dict) else None
+        return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+    async def _overlong_probe_p(self) -> None:
+        """#1958: learn P's ``max_req_input_len`` (group P's /get_server_info, never D's -- the two pools
+        differ). Dual layout + FRONT_REJECT_OVERLONG only, bounded retries; on give-up the #1730 cap (the
+        groups' max_kv_per_request) stays as before. Background task, never on the request path."""
+        if not envs.SGLANG_WEG2_FRONT_REJECT_OVERLONG.get() or not getattr(self, "dual_layout", False):
+            return
+        url = f"{self.groups['P'].url}/get_server_info"
+        for tries in range(1, int(self.OVERLONG_P_PROBE_TRIES) + 1):
+            try:
+                async with self.session.get(url, timeout=ClientTimeout(total=10)) as r:
+                    got = await r.json() if r.status == 200 else None
+                if isinstance(got, list) and got:
+                    got = got[0]
+                cap = Front._overlong_p_cap_from_info(got)
+            except Exception:  # noqa: BLE001 -- P not up yet; retried
+                cap = 0
+            if cap > 0:
+                self._overlong_p_input_cap = cap
+                logger.info("#1958 FRONT-CAP-LEVEL-TOP P max_req_input_len=%d (try %d) -- the overlong gate "
+                            "refuses at min(max_kv_per_request, this)", cap, tries)
+                return
+            await asyncio.sleep(float(self.OVERLONG_P_PROBE_SLEEP_S))
+        logger.warning("#1958 FRONT-CAP-LEVEL-TOP: P's max_req_input_len unknown after %d tries -- the overlong "
+                       "gate keeps the #1730 cap (max_kv_per_request); prompts between P's ceiling and it "
+                       "still reach P", int(self.OVERLONG_P_PROBE_TRIES))
+
     def _overlong_cap(self) -> int:
-        """The dual arm's per-request cap: the groups' own ``max_kv_per_request`` (their /get_server_info
-        server args). 0 = not known / not set (then the cap is the context length, the CONTEXT-GATE's)."""
+        """The dual arm's per-request cap, as the scheduler computes it: min(P's ``max_req_input_len`` (#1958,
+        probed), the groups' own ``max_kv_per_request`` (their /get_server_info server args)). Either one
+        unknown/unset drops out of the minimum; 0 = neither known (the cap is the context length, the
+        CONTEXT-GATE's)."""
         info = self.__dict__.get("_store_probe_info") or {}
         v = info.get("max_kv_per_request")
-        return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+        caps = [int(v)] if isinstance(v, int) and not isinstance(v, bool) and v > 0 else []
+        pc = self.__dict__.get("_overlong_p_input_cap")
+        if isinstance(pc, int) and not isinstance(pc, bool) and pc > 0:
+            caps.append(int(pc))
+        return min(caps) if caps else 0
 
     def _overlong_gate(self, rid: str, path: str, xx: Any):
         """400 for a request P would refuse at intake for its length, else None.

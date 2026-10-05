@@ -715,7 +715,9 @@ class Envs:
     # gate=seats stall): in the DUAL layout the front answers a request whose EXACT front token count (X-EXACT) is over
     # the group's --max-kv-per-request with HTTP 400 invalid_request_error (Anthropic or OpenAI body by route) BEFORE any
     # route/seat/leg 1, P untouched. Inert in the flip form (no dual layout), without an exact count, and without a
-    # known cap. 0 = off (default).
+    # known cap. #1958 FRONT-CAP-LEVEL-TOP: the cap is min(--max-kv-per-request, P's max_req_input_len), the latter
+    # read once from P's /get_server_info (top112: --dual-p-kv-max-tokens 114688 -> 114682), so prompts between P's
+    # ceiling and max-kv no longer reach P. 0 = off (default).
     SGLANG_WEG2_FRONT_REJECT_OVERLONG = EnvBool(False)
     # Q-680 DUAL RESUME-STALE-LEDGER (dual y8w fs10031623 16:45:42: two P
     # followers kept 201/302 MB committed for 905 s, the front's RESUME-WAIT
