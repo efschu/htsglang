@@ -1894,6 +1894,7 @@ class GroupCoordinator:
         output_split_sizes: Optional[List[int]] = None,
         input_split_sizes: Optional[List[int]] = None,
         largest_block_rows: Optional[int] = None,
+        select_bytes: Optional[int] = None,
     ) -> torch.Tensor:
         """all_to_all_single with uneven split sizes (rows, not bytes).
 
@@ -1916,6 +1917,7 @@ class GroupCoordinator:
                 return self.all_to_all_single_v(
                     output, input, output_split_sizes, input_split_sizes,
                     largest_block_rows=largest_block_rows,
+                    select_bytes=select_bytes,
                 )
         # Same family as the even form: what the census compares is how many
         # times each rank entered this wire family, and a rank that skips an
@@ -1927,14 +1929,16 @@ class GroupCoordinator:
             return output
         if self.barlink_comm is not None:
             # DP-NACHLAUF: a caller-known group-wide largest block skips
-            # barlink's gloo group_max (largest_block_rows; None = as before)
+            # barlink's gloo group_max (largest_block_rows; None = as before).
+            # select_bytes (L15 park): a rank-uniform transport-choice size;
+            # passed on only when given, so the default call is unchanged.
+            kw = {}
             if largest_block_rows is not None:
-                return self.barlink_comm.all_to_all_single(
-                    output, input, output_split_sizes, input_split_sizes,
-                    largest_block_rows=largest_block_rows,
-                )
+                kw["largest_block_rows"] = largest_block_rows
+            if select_bytes is not None:
+                kw["select_bytes"] = select_bytes
             return self.barlink_comm.all_to_all_single(
-                output, input, output_split_sizes, input_split_sizes
+                output, input, output_split_sizes, input_split_sizes, **kw
             )
         torch.distributed.all_to_all_single(
             output,

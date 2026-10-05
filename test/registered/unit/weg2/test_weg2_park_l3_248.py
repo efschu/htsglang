@@ -556,8 +556,15 @@ def test_red_pdflip_early_read_is_off_under_l15(env):
     park_l3.defer_hold_read(s, a)
     s.weg2_dormant_hold = [a]
     assert park_l3.early_enabled() is False
+    # L15-EARLY-READ (04.10.): the retained hold early-reads again, but only behind the
+    # group's hold prediction (no manifest / vote here -> none) and never when switched off
+    assert park_l3.early_enabled(s) is True
+    assert park_l3.issue_reads_at_wake_begin(s) == [] and reads == [], \
+        "no agreed hold prediction: the read stays at the release (the wake may reset the tree)"
+    env.mp.setenv("SGLANG_WEG2_L15_EARLY_READ", "0")
     assert park_l3.early_enabled(s) is False
     assert park_l3.issue_reads_at_wake_begin(s) == [] and reads == []
+    env.mp.delenv("SGLANG_WEG2_L15_EARLY_READ")
     Scheduler._weg2_release_dormant_hold(s)
     assert reads == [PARKED]
     env.mp.setenv("SGLANG_WEG2_L15", "0")

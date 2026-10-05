@@ -70,6 +70,46 @@ class Manifest:
     spans: Tuple[HoldSpan, ...]
     rows_by_rank: Tuple[int, ...]
     anchor_slots: int
+    # MANIFEST v2 (L15-POOL S3, docs/L15-POOL-ENTWURF-1004.md sec 4.1). None =
+    # a v1 record: nothing below is written, hashed or read, so the record and
+    # its fingerprint are byte for byte the old ones (switch off). A tuple (empty
+    # allowed) = v2:
+    #   guests -- the guest placement, one ``(src, dst, src_row, dst_row, rows)``
+    #             per piece: ``src``'s compact rows ``[src_row, src_row + rows)``
+    #             lie as guests in ``dst``'s free hold rows from ``dst_row`` for
+    #             the P phase (home rows stay in their own segment and are not
+    #             listed);
+    #   caps   -- every rank's hold region in rows as the planner gave it.
+    # Both are part of the fingerprint, so ranks that disagree on WHERE a row
+    # lies (or on the segments it was planned for) fall back together -- the
+    # same hash edge as for slots and generations.
+    guests: Optional[Tuple[Tuple[int, int, int, int, int], ...]] = None
+    caps: Optional[Tuple[int, ...]] = None
+    # MANIFEST v2 + S4 (L15-POOL S4, sec 4.5): the END ANCHORS of a rank without
+    # a home segment lie as byte guests in the free hold rows of a host rank.
+    # None = no S4 (the v2/S3 record and fingerprint stay byte for byte);
+    # a tuple (empty allowed) = S4:
+    #   anchor_guests    -- ``(owner, host, a_lo, n_a, host_row_lo, host_rows,
+    #                       nbytes)`` per piece: the owner's head share of the
+    #                       anchors ``[a_lo, a_lo + n_a)`` (index into the sorted
+    #                       held anchor slots) lies as ``nbytes`` bytes in the
+    #                       host's KV hold rows ``[host_row_lo, host_row_lo +
+    #                       host_rows)``;
+    #   anchor_bytes     -- every rank's head share of ONE anchor in bytes (the
+    #                       pricing of the plan; read from the MambaBlobSpec);
+    #   anchor_row_bytes -- bytes of one KV hold row (all layers) the host rows
+    #                       are counted in.
+    # All three are part of the group fingerprint: ranks that disagree on where
+    # an anchor lies, or on what it was priced with, fall back together.
+    anchor_guests: Optional[Tuple[Tuple[int, int, int, int, int, int, int], ...]] = None
+    anchor_bytes: Optional[Tuple[int, ...]] = None
+    anchor_row_bytes: int = 0
+    # MANIFEST v2 + S4b (L15-POOL S4b): the anchors a rank WITH a home segment
+    # keeps in its Mamba hold region; the anchors beyond it are byte pieces in
+    # ``anchor_guests`` (owner == host = the owner's own segment). None = S4 (no
+    # dynamic anchor count: the S4 record and fingerprint byte for byte); part of
+    # the group fingerprint like the three fields above.
+    anchor_cap: Optional[int] = None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -108,6 +148,51 @@ def manifest_path(group: str, rank: int, env) -> str:
     return "%s.%s.%d.json" % (override, group, rank)
 
 
+def _v2_head(m: Manifest) -> dict:
+    """The v2 fields of the record head ({} for a v1 manifest)."""
+    if m.guests is None:
+        return {}
+    out = {"guests": [[int(x) for x in g] for g in m.guests],
+           "caps": [int(x) for x in (m.caps or ())]}
+    if m.anchor_guests is not None:
+        # S4: only an S4 round writes (and hashes) these keys
+        out["anchor_guests"] = [[int(x) for x in g] for g in m.anchor_guests]
+        out["anchor_bytes"] = [int(x) for x in (m.anchor_bytes or ())]
+        out["anchor_row_bytes"] = int(m.anchor_row_bytes)
+        if m.anchor_cap is not None:
+            out["anchor_cap"] = int(m.anchor_cap)
+    return out
+
+
+def _v2_load(head: dict) -> dict:
+    """Constructor kwargs from a record head that may carry the v2 fields."""
+    if "guests" not in head:
+        return {}
+    g = head["guests"]
+    if not isinstance(g, list) or any(not isinstance(x, list) or len(x) != 5 for x in g):
+        raise ValueError("malformed L1.5 manifest: 'guests' is not a list of 5-int pieces")
+    c = head.get("caps", [])
+    if not isinstance(c, list):
+        raise ValueError("malformed L1.5 manifest: 'caps' is not a list")
+    out = {"guests": tuple(tuple(int(v) for v in x) for x in g),
+           "caps": tuple(int(v) for v in c)}
+    if "anchor_guests" in head:
+        ag = head["anchor_guests"]
+        if not isinstance(ag, list) or any(
+                not isinstance(x, list) or len(x) != 7 for x in ag):
+            raise ValueError(
+                "malformed L1.5 manifest: 'anchor_guests' is not a list of 7-int pieces")
+        ab = head.get("anchor_bytes", [])
+        if not isinstance(ab, list):
+            raise ValueError("malformed L1.5 manifest: 'anchor_bytes' is not a list")
+        out["anchor_guests"] = tuple(tuple(int(v) for v in x) for x in ag)
+        out["anchor_bytes"] = tuple(int(v) for v in ab)
+        out["anchor_row_bytes"] = int(head.get("anchor_row_bytes", 0))
+        if "anchor_cap" in head:
+            out["anchor_cap"] = int(head["anchor_cap"])
+    return out
+
+
 def _span_to_dict(s: HoldSpan) -> dict:
     return {
         "rid": s.rid,
@@ -132,6 +217,7 @@ def to_json(m: Manifest) -> str:
         "rows_by_rank": list(m.rows_by_rank),
         "anchor_slots": m.anchor_slots,
     }
+    obj.update(_v2_head(m))
     return json.dumps(obj, sort_keys=True)
 
 
@@ -204,6 +290,7 @@ def from_json(s: str) -> Manifest:
         spans=tuple(spans),
         rows_by_rank=_int_list(obj, "rows_by_rank", "record"),
         anchor_slots=_as_int(obj, "anchor_slots", "record"),
+        **_v2_load(obj),
     )
 
 
@@ -222,6 +309,7 @@ def to_bytes(m: Manifest) -> bytes:
     head = {"epoch": int(m.epoch), "pid": int(m.pid),
             "rows_by_rank": [int(x) for x in m.rows_by_rank],
             "anchor_slots": int(m.anchor_slots),
+            **_v2_head(m),
             "spans": [{"rid": s.rid, "depth": int(s.depth),
                        "anchor_slot": int(s.anchor_slot),
                        "anchor_l2_slot": int(s.anchor_l2_slot),
@@ -265,7 +353,8 @@ def from_bytes(raw: bytes) -> Manifest:
         return Manifest(epoch=int(head["epoch"]), pid=int(head["pid"]),
                         spans=tuple(spans),
                         rows_by_rank=tuple(int(x) for x in head["rows_by_rank"]),
-                        anchor_slots=int(head["anchor_slots"]))
+                        anchor_slots=int(head["anchor_slots"]),
+                        **_v2_load(head))
     except (KeyError, ValueError, TypeError) as exc:
         raise ValueError(f"malformed L1.5 manifest (binary): {exc}") from None
 
@@ -342,6 +431,9 @@ def fingerprint(m: Manifest) -> int:
     h = hashlib.sha256()
     head = {"epoch": int(m.epoch), "rows_by_rank": [int(x) for x in m.rows_by_rank],
             "anchor_slots": int(m.anchor_slots), "n_spans": len(m.spans)}
+    # v2 (S3): the guest placement and the planned caps are hashed too; a v1
+    # manifest hashes exactly what it always did
+    head.update(_v2_head(m))
     h.update(json.dumps(head, sort_keys=True).encode())
     for sp in sorted(m.spans, key=lambda x: x.rid):
         h.update(json.dumps({"rid": sp.rid, "depth": int(sp.depth),

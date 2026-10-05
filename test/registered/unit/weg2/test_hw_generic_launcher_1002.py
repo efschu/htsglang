@@ -275,11 +275,20 @@ class ArchAndCountGates(unittest.TestCase):
                 L.resolve_cards()
 
     def test_card_count_other_than_three_is_refused_by_name(self):
+        # HW-P1a 1003: the count gate moved from order_cards (fixed 3) to the
+        # topology of the inventory (launcher.topology_check_line), which
+        # names the concrete blockers instead of a blanket HW-COUNT.
+        ns = L.build_parser().parse_args(["--tree", "/t", "--tag", "t"])
         for n in (2, 4):
-            cards = [card(i, "NVIDIA GeForce RTX 3090", 24576, (8, 6)) for i in range(n)]
+            cards = L.order_cards([card(i, "NVIDIA GeForce RTX 3090", 24576, (8, 6)) for i in range(n)])
             with self.assertRaises(L.Weg2LaunchRefused) as cm:
-                L.order_cards(cards)
+                L.topology_check_line(ns, cards, {})
             self.assertTrue(str(cm.exception).startswith("HW-COUNT"), str(cm.exception))
+            # HW-P1c: the paths became N-capable / derived; what stays is the metal
+            # proof and the records of an inventory without a measured twin (3090)
+            self.assertIn("[METAL-UNPROVEN]", str(cm.exception))
+            self.assertIn("[RECORDS-NVEC]", str(cm.exception))
+            self.assertNotIn("[BAR1-WINDOW]", str(cm.exception))
 
 
 class Stage2TopologyEnabling(unittest.TestCase):
@@ -307,7 +316,7 @@ class Stage2TopologyEnabling(unittest.TestCase):
             self.assertFalse(t.proven)
             with self.assertRaises(T.TopologyRefused) as cm:
                 T.plan_topology(n)
-            self.assertIn("BAR1 group windows", str(cm.exception))
+            self.assertIn("no release boot on", str(cm.exception))   # METAL-UNPROVEN (HW-P1c)
         for n in (1, 9):
             with self.assertRaises(T.TopologyRefused):
                 T.release_topology(n)

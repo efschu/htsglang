@@ -61,6 +61,6 @@ def test_launcher_raises_on_the_refusal():
 
     src = inspect.getsource(L)
     i = src.index("l15_posts = l15_plan.resolve_posts(")
-    block = src[i:i + 1500]
+    block = src[i:i + 2500]   # S4 grew the L15-POOL boot-line block between the two
     assert "l15_plan.refuse_no_caps(" in block
     assert "raise Weg2LaunchRefused(" in block

@@ -15988,6 +15988,11 @@ class Scheduler(
                 from sglang.srt.weg2.d_kv_evict import scheduler_step as _d_kv_evict_step
 
                 _d_kv_evict_step(self)
+            # PUBLISH-SWEEP-BG (weg2_flush_nonblock part 1b): a few un-backed
+            # finished-request nodes published between D decode rounds so the
+            # flip's flush finds a small backlog. Same group-uniform point as
+            # the evictor above; a dict/env lookup when the switch is off.
+            _weg2_flush_nonblock.bg_publish_tick(self)
 
         # #580: rank-uniform entry into the prefetch-progress collectives.
         # MUST stay above every early return and every loop exit below -- all
@@ -20711,6 +20716,22 @@ class Scheduler(
                     l15_shadow.LEDGER.note_sleep(_hs)
             except Exception as exc:  # noqa: BLE001 - shadow must never block flush
                 logger.warning("L15-SHADOW select failed (ignored): %s: %s", type(exc).__name__, exc)
+            # [L1.5 POOL SHADOW] S1 (docs/L15-POOL-ENTWURF-1004.md): log-only
+            # comparison of the pooled admission (the SUM of all segments, KV +
+            # end anchors, guests in foreign segments) with today's per-rank
+            # hold set. SGLANG_WEG2_L15_POOL_SHADOW, default off; L15 path only
+            # (master on -- --dual-layout refuses it at launch, W-L15-DUAL).
+            # No collective, no state, no behaviour change; never raises.
+            try:
+                from sglang.srt.weg2 import l15_plan as _l15_plan_ps
+                from sglang.srt.weg2 import l15_pool as _l15_pool_ps
+
+                if _l15_pool_ps.pool_shadow_on(os.environ) and _l15_plan_ps.master_on(
+                    os.environ
+                ):
+                    _l15_pool_ps.log_sleep_shadow(self, os.environ, logger.info)
+            except Exception as exc:  # noqa: BLE001 - shadow must never block flush
+                logger.warning("L15-POOL-SHADOW failed (ignored): %s: %s", type(exc).__name__, exc)
             # [L1.5 RETAIN] L15-11c: hold the priced KV prefix across this
             # sleep flush at D instead of dropping it. Master switch
             # SGLANG_WEG2_L15; off means the untouched flush below. Only the
@@ -20781,7 +20802,33 @@ class Scheduler(
                                          "tp_rank", 0) or 0), os.environ)
                     if _l15_flip is not None and int(_l15_flip) >= 0:
                         try:
+                            # L15-RESTAMP (1840 Fix A): the park sidecar of this
+                            # sleep (written between the two flushes) carries the
+                            # manifest's OLD epoch; read it before the restamp
+                            # moves it on. Park off = no read, no file, no change.
+                            _l15_old_ep = None
+                            _l15_pk_rs = None
+                            try:
+                                from sglang.srt.weg2 import l15_park as _l15_pk_mod
+
+                                if _l15_pk_mod.park_on(os.environ):
+                                    _l15_pk_rs = _l15_pk_mod
+                                    _l15_old_m = l15_manifest.read(_l15_mp)
+                                    if _l15_old_m is not None:
+                                        _l15_old_ep = int(_l15_old_m.epoch)
+                            except Exception as _exc:  # noqa: BLE001 -- park stays stale -> wake falls back to L2
+                                _l15_pk_rs = None
+                                logger.info("L15-PARK restamp skipped (%s)", _exc)
                             l15_sleep_once.restamp(_l15_mp, int(_l15_flip))
+                            if _l15_pk_rs is not None and _l15_old_ep is not None:
+                                try:
+                                    _l15_pk_rs.restamp_sidecar(
+                                        int(getattr(getattr(self, "ps", None),
+                                                    "tp_rank", 0) or 0),
+                                        os.environ, int(_l15_flip),
+                                        only_if_epoch=_l15_old_ep)
+                                except Exception as _exc:  # noqa: BLE001 -- park stays stale -> wake falls back to L2
+                                    logger.info("L15-PARK restamp skipped (%s)", _exc)
                         except FileNotFoundError:
                             pass
                     logger.info(
@@ -21013,6 +21060,26 @@ class Scheduler(
                                     self.tree_cache),
                                 log=logger.info),
                         )
+                        # L15-POOL S4: the pricing of the anchor shares of THIS
+                        # sleep (head share bytes per rank from the MambaBlobSpec,
+                        # confirmed against this rank's own slot bytes; KV row
+                        # bytes). Rank-uniform; an S4 round without it is not
+                        # held (plan_round names the skip) -- never a half hold.
+                        try:
+                            from sglang.srt.weg2 import l15_pool_anchor as _l15_pa
+
+                            if _l15_pa.pool_s4_on(os.environ):
+                                _l15_actx, _l15_awhy = _l15_pa.resolve_anchor_ctx(
+                                    self, os.environ, _tp, _l15_rank)
+                                if _l15_actx is None:
+                                    logger.info(
+                                        "L15-POOL-S4 no anchor pricing this sleep "
+                                        "(%s): the round is not held", _l15_awhy)
+                                _l15_kwargs["anchor_ctx"] = _l15_actx
+                        except Exception as _exc:  # noqa: BLE001 -- not held
+                            logger.warning("L15-POOL-S4 pricing failed (%s: %s)",
+                                           type(_exc).__name__, _exc)
+                            _l15_kwargs["anchor_ctx"] = None
                         _l15_tt["bind"] = time.perf_counter() - _l15_tt["bind0"]
                         # L15-12c-C2: alignment probe -- chain host rows vs
                         # the seqlen-1 KV span. L15-FLIPCOST: a diagnostic
@@ -21053,6 +21120,44 @@ class Scheduler(
                 _l15_reuse  # noqa: B018 -- bound when the block above ran
             except NameError:
                 _l15_reuse = None
+            # L15-SLEEP-DECIDE-FIRST (INT8 boot 4cf740ad50: 3 sleeps paid a
+            # retain of 0.38-0.54 s and the POST vote then rolled them back
+            # with cap-0 "owned held token(s) without an L2 source"): the
+            # refusals the POST vote reaches from the MANIFEST are decided
+            # here, from the same planning data, BEFORE the retain moves
+            # anything. ONE gather at a position EVERY rank reaches (outside
+            # the pre-move try above: a rank whose bind raised votes "round
+            # did not arm" instead of skipping the gather, which would pair
+            # its POST gather with the peers' vote gather). Same condition as
+            # the POST gather, so the two stay one-to-one. Any refusal ends
+            # the round on every rank exactly like the PRE refusal: nothing
+            # moved, the POST gather is skipped (same _l15_pre_why guard).
+            # SGLANG_WEG2_L15_SLEEP_DECIDE_FIRST=0: the order of 4cf740ad50.
+            _l15_planned = None
+            _l15_dfirst = False
+            try:
+                _l15_dfirst = bool(_l15_agree_on and _l15_pre_why is None
+                                   and _l15_sa2.decide_first_on(os.environ))
+            except NameError:
+                _l15_dfirst = False
+            if _l15_dfirst:
+                _l15_tt["decide0"] = time.perf_counter()
+                from sglang.srt.weg2 import l15_shadow as _l15_shd2
+
+                _l15_planned, _l15_dec = _l15_sa2.decide_first(
+                    _l15_kwargs, _l15_reuse is not None,
+                    lambda: _l15_shd2.own_cap_rows(self, os.environ),
+                    lambda: _l15_sa2.rank_prefix(self),
+                    _l15_gather, logger.info, logger.warning)
+                _l15_tt["decide"] = time.perf_counter() - _l15_tt["decide0"]
+                if _l15_dec is not None:
+                    logger.info("L15-SLEEP-AGREE pre-retain=off reason=%s (decided "
+                                "before the retain: nothing moved, every rank "
+                                "flushes plain)", _l15_dec)
+                    _l15_pre_why = _l15_dec
+                    _l15_kwargs = None
+                    _l15_planned = None
+                    _l15_reuse = None
             if _l15_reuse is not None:
                 _l15_res = _l15_reuse
             elif _l15_kwargs is not None:
@@ -21065,6 +21170,7 @@ class Scheduler(
                     # values (the old fake kv_slots/anchor_slot writes were
                     # never read); shared visited set is owned by retain.
                     rewrite_tree=l15_bind.rewrite_tree_chain,
+                    planned=_l15_planned,
                     **_l15_kwargs
                 )
                 # L15-CHECK-SNAP (N6e bad=1 foreign at gen=1): a capped rank
@@ -21219,7 +21325,7 @@ class Scheduler(
                 logger.info(
                     "L15-SLEEP-TIMING rank=%d held=%s reuse=%s total_ms=%.0f "
                     "bind_ms=%.0f retain_ms=%.0f arm_ms=%.0f share_ms=%.0f "
-                    "pre_ms=%.0f snap_ms=%.0f post_ms=%.0f",
+                    "pre_ms=%.0f snap_ms=%.0f post_ms=%.0f decide_ms=%.0f",
                     int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
                     _l15_res is not None, _l15_reuse is not None,
                     (time.perf_counter() - _l15_tt["t0"]) * 1000.0,
@@ -21231,7 +21337,11 @@ class Scheduler(
                     # (inside retain_ms), post = the POST gather incl. wait
                     _l15_tt.get("pre", 0.0) * 1000.0,
                     _l15_tt.get("snap", 0.0) * 1000.0,
-                    _l15_tt.get("post", 0.0) * 1000.0)
+                    _l15_tt.get("post", 0.0) * 1000.0,
+                    # L15-SLEEP-DECIDE-FIRST: the vote before the retain (incl.
+                    # the planning, the cap-0 manifest and the wait for the
+                    # slowest rank); 0 when the switch is off
+                    _l15_tt.get("decide", 0.0) * 1000.0)
             if _l15_res is not None:
                 pass
             else:

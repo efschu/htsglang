@@ -136,3 +136,13 @@ DEFAULT_D_SEAT_VRAM_NEXTFLASH = True
 #: PROVISIONAL in the same sense the bs pair is -- "vorerst" is in the order
 #: -- so re-ordering the cut must stay an edit to THIS ONE LINE.
 DEFAULT_PP_ORDERED_CUT = (39, 13, 12)
+
+
+def pp_ordered_cut_for(n_stages: int):
+    """HW-P1c 1003 (PP-CUT-FLOOR): the ordered cut of the user order 2026-09-09
+    ('39,13,12 ...') is a THREE-stage cut: it is the floor's source only for a
+    P group of that many stages. For any other stage count there is no order
+    and no floor (``None``): the planner's cut solver ranks the unfloored
+    makespan over the stages and layers it is given, which is exactly what
+    ``--pp-solve-pool-floor 0`` restores on three stages."""
+    return DEFAULT_PP_ORDERED_CUT if int(n_stages) == len(DEFAULT_PP_ORDERED_CUT) else None
