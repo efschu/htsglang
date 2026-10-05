@@ -86,8 +86,11 @@ def find_tree(explicit: Optional[str] = None) -> Optional[str]:
 
 class ProfilEditor:
     def __init__(self, *, kartenplaner, release_dir: str = DEFAULT_RELEASE_DIR, user_dir: str = DEFAULT_USER_DIR,
-                 tree: Optional[str] = None, catalog_file: str = CATALOG_FILE):
+                 tree: Optional[str] = None, catalog_file: str = CATALOG_FILE, topology=None):
         self.kp = kartenplaner
+        #: Auftrag 1984 (C): ``topology(n) -> {"ok": True, "refused": None | text} | {"ok": False, "error": ..}``, gerechnet im Kindprozess mit der
+        #: sglang-Umgebung (``CouplingsService.topology``); ohne sie rechnet der Trockenlauf wie bisher im Prozess
+        self.topology = topology
         self.release_dir = release_dir
         self.user_dir = user_dir
         self.tree = find_tree(tree)
@@ -395,6 +398,35 @@ class ProfilEditor:
                         "oder die exportierte Datei als <profiles>/%s.env). Lehnt der Planer Werte ab und soll trotzdem gestartet werden: "
                         "FLLIPER_FORCE=1 (Launcher: --force). Das Dashboard startet nichts." % (name, name, name)}
 
+    # ------------------------------------------------------------------ Topologie-Urteil (Kindprozess zuerst, Auftrag 1984 C)
+    def _topology_verdict(self, n: int, tp, notes: List[str]) -> Optional[str]:
+        """Der Text einer Topologie-Ablehnung für ``n`` Karten, oder ``None`` (durchgelassen / nicht prüfbar, dann steht eine Notiz in ``notes``).
+
+        ``topology.plan_topology`` importiert für N != 3 ``weg2/weight_exchange_region`` (import sglang): das geht nur in der sglang-Umgebung, also
+        fragt der Editor zuerst den Kopplungs-Worker (Kindprozess).  Ist keiner da oder antwortet er mit einem Fehler, rechnet die Funktion wie
+        bisher im Prozess (N=3 braucht sglang nicht); scheitert auch das am Import, ist es KEINE Ablehnung und nie ein HTTP 500 (Browsertest 1979 F2),
+        sondern die benannte Notiz "nicht geprüft"."""
+        child_err = ""
+        if self.topology is not None:
+            try:
+                res = self.topology(n)
+            except Exception as exc:    # noqa: BLE001 -- ein kaputter Worker darf den Trockenlauf nicht beenden
+                res = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+            if res.get("ok"):
+                return res.get("refused") or None
+            child_err = str(res.get("error") or "")
+        try:
+            tp.plan_topology(n)
+        except ImportError as exc:
+            notes.append("Topologie für %d Karte(n) nicht geprüft: das Planer-Gate braucht dafür die sglang-Umgebung (%s: %s)%s."
+                         % (n, type(exc).__name__, exc,
+                            "; Kopplungs-Python/Kindprozess nicht verfügbar: " + child_err if child_err else
+                            " (kein Kindprozess mit --couplings-python / RIGDASH_COUPLINGS_PYTHON konfiguriert)"))
+            return None
+        except tp.TopologyRefused as exc:
+            return str(exc)
+        return None
+
     # ------------------------------------------------------------------ Trockenlauf: welche Ablehnungen hätte der Planer
     def dry_run(self, doc: dict, cards_req: list, host_patched: bool = True) -> dict:
         pj, ref = self.mods()
@@ -457,18 +489,12 @@ class ProfilEditor:
             msg = ci.uncalibrated_message(ordered, list(inv), positional, "profile %r" % (doc.get("name") or var("PROFILE_NAME")))
             if msg:
                 found.append({"code": "HW-UNCALIBRATED", "text": msg, "source": "weg2/card_identity.uncalibrated_message"})
-            try:
-                tp.plan_topology(len(cards))
-            except ImportError as exc:
-                # topology.plan_topology prüft für N != 3 mit weg2/weight_exchange_region (import sglang): im Dashboard-Prozess ohne
-                # sglang-Umgebung nicht möglich. Das ist KEINE Ablehnung und darf nicht als HTTP 500 enden (Browsertest 1979).
-                notes.append("Topologie für %d Karte(n) nicht geprüft: das Planer-Gate braucht dafür die sglang-Umgebung (%s: %s)."
-                             % (len(cards), type(exc).__name__, exc))
-            except tp.TopologyRefused as exc:
+            refused = self._topology_verdict(len(cards), tp, notes)
+            if refused:
                 # N inside the range that is only not proven ("N cards would be P = ..., proven on metal only for N in [3]") is the value
                 # refusal HW-COUNT (the 27B line names it so); N with no topology at all is HW-TOPOLOGY (not forceable)
-                code = "HW-COUNT" if (str(exc).startswith("HW-COUNT") or " would be " in str(exc)) else "HW-TOPOLOGY"
-                found.append({"code": code, "text": str(exc), "source": "weg2/topology.plan_topology"})
+                code = "HW-COUNT" if (refused.startswith("HW-COUNT") or " would be " in refused) else "HW-TOPOLOGY"
+                found.append({"code": code, "text": refused, "source": "weg2/topology.plan_topology"})
         st = var("PROFILE_STATUS") or ("platzhalter" if var("PROFILE_PLACEHOLDER") == "1" else "abgenommen")
         if st != "abgenommen":
             found.append({"code": "PROFIL-STATUS", "text": "Profil %r hat den Stand %s (%s)" % (doc.get("name"), st.upper(), var("PROFILE_OWNER") or "Eigentümer offen"),

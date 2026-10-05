@@ -249,7 +249,10 @@ class App:
         self.profil = profil.ProfilEditor(
             kartenplaner=self.kartenplaner,
             release_dir=getattr(args, "profiles_release_dir", None) or profil.DEFAULT_RELEASE_DIR,
-            user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR)
+            user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR,
+            # Auftrag 1984 (C): die Topologie-Prüfung des Trockenlaufs läuft im Kopplungs-Worker (sglang-Umgebung), nicht in diesem Prozess;
+            # self.couplings entsteht erst unten, darum erst beim Aufruf aufgelöst
+            topology=lambda n: self.couplings.topology(n))
         # Modellprofil schätzen (S3): liest nur config.json und Kopfzeilen unter den Modellwurzeln
         self.modellprofil = modellprofil.ModelEstimator(roots=getattr(args, "model_root", None) or None)
         # Profil-Editor S4b (Auftrag 1432): Kopplungen/Balken im langlebigen Worker (startet erst bei der ersten Anfrage)

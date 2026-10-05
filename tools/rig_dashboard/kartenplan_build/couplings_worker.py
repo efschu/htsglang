@@ -16,6 +16,22 @@ import sys
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 
+def topology(req: dict) -> dict:
+    """Auftrag 1984 (C): ``{"what": "topology", "n": N}`` -> ``plan_topology(N)`` in der sglang-Umgebung dieses Kindprozesses.
+
+    ``topology.plan_topology`` importiert fuer N != 3 ``weg2.weight_exchange_region`` (sglang): im Dashboard-Prozess (ohne sglang) geht das nicht,
+    hier schon.  Antwort: ``{"ok": True, "refused": None}`` (durchgelassen) oder ``{"ok": True, "refused": "<Text der TopologyRefused>"}``;
+    ein Import- oder Rechenfehler ist ``{"ok": False, "error": ...}`` (der Aufrufer nennt ihn in der Notiz, es ist keine Ablehnung)."""
+    try:
+        from sglang.srt.weg2 import topology as TP
+        TP.plan_topology(int(req["n"]))
+    except Exception as exc:  # noqa: BLE001 -- TopologyRefused ist die einzige Ablehnung, alles andere ein benannter Fehler
+        if type(exc).__name__ == "TopologyRefused":
+            return {"ok": True, "refused": str(exc)}
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    return {"ok": True, "refused": None}
+
+
 def main() -> int:
     try:
         from sglang.srt.planner import profile_couplings as PC
@@ -24,7 +40,8 @@ def main() -> int:
         PC = None
         boot_error = "profile_couplings.py fehlt im Planer-Baum (%s)" % exc
     out = sys.stdout
-    out.write(json.dumps({"id": 0, "ok": PC is not None, "ready": True, "error": boot_error}) + "\n")
+    # bereit ist der Worker auch ohne profile_couplings: die Topologie braucht es nicht, und ein fehlendes Modul meldet jede Kopplungsanfrage selbst
+    out.write(json.dumps({"id": 0, "ok": True, "ready": True, "error": boot_error}) + "\n")
     out.flush()
     for line in sys.stdin:
         line = line.strip()
@@ -34,7 +51,10 @@ def main() -> int:
         try:
             req = json.loads(line)
             rid = req.pop("id", None)
-            res = PC.run(req) if PC is not None else {"ok": False, "error": boot_error}
+            if req.get("what") == "topology":
+                res = topology(req)
+            else:
+                res = PC.run(req) if PC is not None else {"ok": False, "error": boot_error}
         except Exception as exc:  # noqa: BLE001 -- ein Fehler beendet den Worker nicht
             res = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
         res = dict(res, id=rid)

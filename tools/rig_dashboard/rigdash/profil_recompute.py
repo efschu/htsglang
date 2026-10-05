@@ -168,6 +168,14 @@ class CouplingsService:
                     res.pop("id", None)
                     return res               # eine verspätete Antwort einer früheren Anfrage wird übersprungen
 
+    def topology(self, n: int) -> Dict[str, Any]:
+        """Auftrag 1984 (C): ``topology.plan_topology(n)`` im Kindprozess.  ``{"ok": True, "refused": None | "<Text>"}`` oder ``{"ok": False, "error": ..}``
+        (Kind nicht verfügbar oder Importfehler: das ist keine Ablehnung)."""
+        res = self.request({"what": "topology", "n": int(n)})
+        if res.get("ok"):
+            return {"ok": True, "refused": res.get("refused")}
+        return {"ok": False, "error": str(res.get("error") or "unbekannter Fehler")}
+
     def close(self) -> None:
         with self._lock:
             self._stop()
