@@ -159,6 +159,8 @@ def view(rows: Sequence[dict], model_dir: str = "", planner_only: Sequence[dict]
         res = compute(tp_size=tp, ratios=ratios, kv_heads=(heads or {}).get("kv"), q_heads=(heads or {}).get("q")) if tp or isinstance(ratios, str) \
             else {"status": "unbekannt", "regime": "keins", "kv": None, "q": None, "tp": 0, "notiz": [], "belege": [],
                   "satz": "Gewichte \"%s\" nicht lesbar (Shell-Variable?): nicht gerechnet." % raw}
-        res.update(group=r.get("scope"), ratios=raw, heads=heads, quelle="Profil" if r.get("value") else "Planer")
+        # Dict-Literal mit String-Schlüsseln, kein ``update(quelle=...)``: das Rename-Kit macht aus dem Bezeichner ``quelle`` ein ``source``, der
+        # JSON-Schlüssel muss aber ``quelle`` bleiben (profil.js liest ``r.quelle``)
+        res.update({"group": r.get("scope"), "ratios": raw, "heads": heads, "quelle": "Profil" if r.get("value") else "Planer"})
         out.append(res)
     return out
