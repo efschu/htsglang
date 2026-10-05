@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from sglang.srt.managers.weg2_min_hit import revoke_threshold  # PARK-RETAIN READ
@@ -3950,6 +3951,22 @@ class HiCacheController:
                 operation.completed_tokens
                 != prev_completed_tokens + len(batch_hashes) * self.page_size
             ):
+                if envs.SGLANG_WEG2_READ_FIRST_FAIL_LOG.get():
+                    # 1476: name the batch that under-delivered (read-only
+                    # instrument, default off; no sync, no loop). Fires at
+                    # most once per operation -- the loop breaks below.
+                    logger.warning(
+                        "WEG2 READ-FIRST-FAIL rid=%s batch_first_hash=%s "
+                        "batch_pages=%d expected_tokens=%d completed_tokens=%d "
+                        "prev_completed=%d page_size=%d",
+                        operation.request_id,
+                        str(batch_hashes[0])[:8],
+                        len(batch_hashes),
+                        prev_completed_tokens + len(batch_hashes) * self.page_size,
+                        operation.completed_tokens,
+                        prev_completed_tokens,
+                        self.page_size,
+                    )
                 operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
 

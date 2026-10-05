@@ -396,6 +396,13 @@ class Envs:
     # publishes the resolved value to the front and both groups' ranks.
     SGLANG_WEG2_DRAFT_ON_P = EnvBool(False)
 
+    # 1476: read-thread instrument. When a storage read batch delivers fewer
+    # tokens than expected, the read terminates the operation without naming
+    # the batch that missed (weg2-9-40: pages 47-50 of 1501). With this switch
+    # on, the terminate point logs ONE line naming the batch (first page hash,
+    # page count, token counts). Off by default; read-only, no sync.
+    SGLANG_WEG2_READ_FIRST_FAIL_LOG = EnvBool(False)
+
     # #695: allocate the permanent phase-flip host weight images at their exact
     # size (MAP_ANONYMOUS + cudaHostRegister) instead of through torch's pinned
     # caching allocator, which rounds every request up to a power of two and
