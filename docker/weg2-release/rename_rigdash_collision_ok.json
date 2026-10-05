@@ -1,0 +1,65 @@
+{
+ "_comment": "Auftrag 2012: Dateien des Editor-Pakets, die ALTEN und NEUEN Namen absichtlich nebeneinander schreiben (Schema flliper.server/1, FLLIPER_PROFILE, Prosa 'sglang-Umgebung'). Das Kit bricht bei so einer Datei in Schritt 1 ab (Kollision flliper <- {flliper,sglang}); hier sind genau diese Dateien mit ihren Woertern freigegeben, gedeckt durch test_rename_editor_2012 (umbenanntes Paket: Importe, Katalog, Editor-Tests). Eine NEUE Kollisionsdatei bricht das Skript ab, bis sie gelesen und hier eingetragen ist. Pfade relativ zum Inhalt von tools/rig_dashboard.",
+ "README.md": [
+  "flliper"
+ ],
+ "entrypoint_rigdash.sh": [
+  "flliper"
+ ],
+ "rigdash/README.md": [
+  "flliper"
+ ],
+ "rigdash/deploy/install_510.sh": [
+  "flliper"
+ ],
+ "rigdash/deploy/stage_profil_modules.sh": [
+  "flliper"
+ ],
+ "rigdash/hwprofil.py": [
+  "flliper"
+ ],
+ "rigdash/ipcboot.py": [
+  "PDFLIP"
+ ],
+ "rigdash/modellprofil.py": [
+  "flliper"
+ ],
+ "rigdash/profil.py": [
+  "flliper"
+ ],
+ "rigdash/profil_data/catalog.json": [
+  "PDFLIP",
+  "flliper"
+ ],
+ "rigdash/profil_recompute.py": [
+  "flliper"
+ ],
+ "rigdash/server.py": [
+  "flliper"
+ ],
+ "rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_catalog.py": [
+  "FLLIPER_",
+  "flliper"
+ ],
+ "rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_json.py": [
+  "flliper"
+ ],
+ "rigdash/tests/fixtures/modellprofil/planner_tree/python/sglang/srt/weg2/model_profile.py": [
+  "flliper"
+ ],
+ "rigdash/tests/test_couplings_bridge_1431.py": [
+  "flliper"
+ ],
+ "rigdash/tests/test_hwprofil_950.py": [
+  "flliper"
+ ],
+ "rigdash/tests/test_modellprofil_960.py": [
+  "flliper"
+ ],
+ "rigdash/tests/test_profil_balken_1432.py": [
+  "flliper"
+ ],
+ "rigdash/tests/test_profil_release_edition_1984.py": [
+  "flliper"
+ ]
+}

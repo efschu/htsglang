@@ -16,6 +16,10 @@
 #   make_rigdash_ctx.sh --dry-run --ctx <dir> --rev <sha|ref> [--repo <git-dir>]   wie --check + Dateiliste + Dockerfile-Block, schreibt NICHTS
 #   make_rigdash_ctx.sh --apply   --ctx <dir> --rev <sha|ref> [--repo <git-dir>]   fuehrt aus
 #   Weitere: --keep-entrypoint (Schritt 2 auslassen). Env: REPO (Standard /spinning/htsglang), RIGDASH_REV.
+#   --rename [--rename-kit DIR]: das Editor-Paket im fLLiper-Namensraum (Auftrag 2012, Baustopper L1): nach dem Entpacken laeuft
+#     rename_rigdash.py (die Umbenennungsmaschine des Release-Kits, gleiche Tabelle wie fuer den Planer-Baum) ueber tools/rigdash.
+#     PFLICHT, sobald der Planer-Baum des Kontexts umbenannt ist (src-27b/python/flliper); ohne --rename sonst Exit 3, ebenso --rename
+#     gegen einen nicht umbenannten Baum (gemischte Staende). Env: RELEASE_KIT_TOOLS (Standard /spinning/flliper/tools).
 #   Test-Haken: RIGDASH_ALLOW_UNPUSHED=1 (sonst muss REV auf einem Remote-Zweig liegen, wie bei userdash_ctx.sh).
 # Exit: 0 ok, 2 Aufruf, 3 Pruefung gescheitert (jede Ursache auf stderr, nichts geschrieben), 4 Ausfuehrung gescheitert.
 # NICHT gebaut, kein Docker, keine GPU. Der Aufrufer baut danach wie bisher (host_build.sh).
@@ -32,13 +36,16 @@ err() { echo "make_rigdash_ctx: $*" >&2; }
 
 usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
 
-MODE=check; CTX=""; REV_IN=${RIGDASH_REV:-}; REPO=${REPO:-/spinning/htsglang}; KEEP_EP=0
+MODE=check; CTX=""; REV_IN=${RIGDASH_REV:-}; REPO=${REPO:-/spinning/htsglang}; KEEP_EP=0; RENAME=0; KIT=${RELEASE_KIT_TOOLS:-/spinning/flliper/tools}
+RENAME_PY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rename_rigdash.py
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) MODE=check ;;
     --dry-run) MODE=dry ;;
     --apply) MODE=apply ;;
     --keep-entrypoint) KEEP_EP=1 ;;
+    --rename) RENAME=1 ;;
+    --rename-kit) shift; KIT=${1:-} ;;
     --ctx) shift; CTX=${1:-} ;;
     --rev) shift; REV_IN=${1:-} ;;
     --repo) shift; REPO=${1:-} ;;
@@ -87,6 +94,24 @@ if [ -d "$CTX" ]; then
     fi
   fi
 fi
+# Namensraum des Kontexts (Auftrag 2012): Planer-Baum und Editor-Paket muessen dieselbe Generation tragen
+CTX_RENAMED=unknown
+if [ -d "$CTX" ]; then
+  for _d in "$CTX"/src-27b "$CTX"/src-nf; do
+    [ -d "$_d/python" ] || continue
+    if [ -d "$_d/python/flliper" ]; then _g=renamed; else _g=old; fi
+    if [ "$CTX_RENAMED" = unknown ] || [ "$CTX_RENAMED" = "$_g" ]; then CTX_RENAMED=$_g; else CTX_RENAMED=mixed; fi
+  done
+fi
+case "$CTX_RENAMED:$RENAME" in
+  renamed:0) fail "der Planer-Baum des Kontexts ist umbenannt (python/flliper), das Editor-Paket nicht: --rename angeben (sonst startet der Editor im Image nicht: kein Editor)" ;;
+  old:1)     fail "--rename, aber der Planer-Baum des Kontexts ist nicht umbenannt (python/sglang): gemischte Staende" ;;
+  mixed:*)   fail "src-27b und src-nf des Kontexts tragen verschiedene Namensraeume (alt/umbenannt)" ;;
+esac
+if [ "$RENAME" = 1 ]; then
+  [ -f "$RENAME_PY" ] || fail "rename_rigdash.py fehlt neben dem Skript ($RENAME_PY)"
+  [ -f "$KIT/rename_to_flliper.py" ] && [ -f "$KIT/release/data/merged_0928.json" ] || fail "Release-Kit fehlt ($KIT: rename_to_flliper.py, release/data/merged_0928.json; --rename-kit bzw. RELEASE_KIT_TOOLS)"
+fi
 if [ "${#FAILS[@]}" -gt 0 ]; then
   for m in "${FAILS[@]}"; do err "FEHLT/FALSCH: $m"; done
   err "REFUSED (${#FAILS[@]} Befund(e)); nichts geschrieben"
@@ -112,10 +137,21 @@ EOF
 
 echo "make_rigdash_ctx: ${REV:0:10} ok: ${NFILES} Dateien (ohne rigdash/tests, rigdash/deploy), Kontext $CTX, Entrypoint $([ "$KEEP_EP" = 1 ] && echo "bleibt" || echo "wird ersetzt (md5 ${EPNEW_MD5:0:10})")"
 case "$MODE" in
-  check) echo "make_rigdash_ctx: --check: nichts geschrieben"; exit 0 ;;
+  check)
+    if [ "$RENAME" = 1 ]; then
+      _t=$(mktemp -d "${TMPDIR:-/tmp}/rdren.XXXXXX") || { err "mktemp gescheitert"; exit 4; }
+      if git -C "$REPO" archive "$REV" "${RD_PATHS[@]}" "${RD_EXCLUDES[@]}" | tar -x --strip-components=2 -C "$_t" && _o=$(python3 "$RENAME_PY" "$_t" --kit "$KIT" --dry-run 2>&1); then
+        echo "make_rigdash_ctx: --rename geprueft (Trockenlauf): ${_o##*DRY-RUN }"
+      else
+        err "FEHLT/FALSCH: --rename Trockenlauf: ${_o:-tar/archive gescheitert}"; rm -rf "$_t"; err "REFUSED; nichts geschrieben"; exit 3
+      fi
+      rm -rf "$_t"
+    fi
+    echo "make_rigdash_ctx: --check: nichts geschrieben"; exit 0 ;;
   dry)
     echo "make_rigdash_ctx: --dry-run: wuerde tun:"
     echo "  1. git archive ${REV:0:10} ${RD_PATHS[*]} -> $CTX/tools/rigdash/ (strip 2)"
+    [ "$RENAME" = 0 ] || echo "  1b. python3 $RENAME_PY $CTX/tools/rigdash --kit $KIT   (Editor-Paket im fLLiper-Namensraum, Auftrag 2012)"
     [ "$KEEP_EP" = 1 ] || echo "  2. $EP_REPO_PATH @ ${REV:0:10} -> $CTX/tools/entrypoint.sh"
     echo "  3. an $CTX/Dockerfile anhaengen:"
     block | sed 's/^/     | /'
@@ -132,6 +168,15 @@ if [ ! -f "$CTX/tools/rigdash/rigdash/__main__.py" ] || [ ! -s "$CTX/tools/rigda
    || [ ! -f "$CTX/tools/rigdash/kartenplan_build/couplings_worker.py" ] || [ ! -x "$CTX/tools/rigdash/entrypoint_rigdash.sh" ]; then
   err "Paket unvollstaendig; entferne $CTX/tools/rigdash"; rm -rf "$CTX/tools/rigdash"; exit 4
 fi
+if [ "$RENAME" = 1 ]; then
+  if ! _o=$(python3 "$RENAME_PY" "$CTX/tools/rigdash" --kit "$KIT" 2>&1); then
+    err "Umbenennung des Editor-Pakets gescheitert: ${_o}; entferne $CTX/tools/rigdash"; rm -rf "$CTX/tools/rigdash"; exit 4
+  fi
+  echo "make_rigdash_ctx: ${_o}"
+  if [ ! -f "$CTX/tools/rigdash/rigdash/__main__.py" ] || [ ! -x "$CTX/tools/rigdash/entrypoint_rigdash.sh" ]; then
+    err "umbenanntes Paket unvollstaendig; entferne $CTX/tools/rigdash"; rm -rf "$CTX/tools/rigdash"; exit 4
+  fi
+fi
 if [ "$KEEP_EP" = 0 ]; then
   cp -p "$CTX/tools/entrypoint.sh" "$CTX/tools/entrypoint.sh.vor_rigdash" || { err "Sicherung des Kontext-Entrypoints gescheitert"; exit 4; }
   git -C "$REPO" show "$REV:$EP_REPO_PATH" > "$CTX/tools/entrypoint.sh.new" && chmod --reference="$CTX/tools/entrypoint.sh.vor_rigdash" "$CTX/tools/entrypoint.sh.new" \
@@ -139,5 +184,5 @@ if [ "$KEEP_EP" = 0 ]; then
   rm -f "$CTX/tools/entrypoint.sh.vor_rigdash"
 fi
 block >> "$CTX/Dockerfile" || { err "Dockerfile-Block anhaengen gescheitert"; exit 4; }
-echo "make_rigdash_ctx: ${REV:0:10}: tools/rigdash ($(find "$CTX/tools/rigdash" -type f | wc -l) Dateien) + Dockerfile-Block (COPY, Importprobe, LABEL $RIGDASH_LABEL, EXPOSE 30081)$([ "$KEEP_EP" = 1 ] || echo " + Entrypoint ersetzt")"
+echo "make_rigdash_ctx: ${REV:0:10}: tools/rigdash ($(find "$CTX/tools/rigdash" -type f | wc -l) Dateien) + Dockerfile-Block (COPY, Importprobe, LABEL $RIGDASH_LABEL, EXPOSE 30081)$([ "$KEEP_EP" = 1 ] || echo " + Entrypoint ersetzt")$([ "$RENAME" = 0 ] || echo " + Paket umbenannt (fLLiper)")"
 exit 0

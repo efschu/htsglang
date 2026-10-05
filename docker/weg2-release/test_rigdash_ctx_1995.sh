@@ -142,6 +142,41 @@ else
   echo "SKIP: Commit $BASE_COMMIT nicht im Repo -- Kontext-/Entrypoint-Teile entfallen"
 fi
 
+echo "== --rename (Auftrag 2012): das Editor-Paket im fLLiper-Namensraum"
+KIT=${RELEASE_KIT_TOOLS:-/spinning/flliper/tools}
+if [ -f "$KIT/rename_to_flliper.py" ] && [ -f "$KIT/release/data/merged_0928.json" ]; then
+  mkren() { local c=$1 gen=$2; rm -rf "$c"; mkdir -p "$c/tools" "$c/src-27b/python/$gen" "$c/src-nf/python/$gen"
+    printf 'FROM scratch\nLABEL x=1\n' > "$c/Dockerfile"; printf '#!/bin/sh\n' > "$c/tools/entrypoint.sh"; chmod 755 "$c/tools/entrypoint.sh"; }
+  CR=$T/ctxR; mkren "$CR" flliper
+  rcis 3 "umbenannter Planer-Baum ohne --rename -> 3" "$MK" --apply --keep-entrypoint --ctx "$CR" --rev "$GOOD" --repo "$R"
+  check "  Grund genannt (--rename angeben)" grep -q -- "--rename angeben" <<<"$LAST_OUT"
+  CO=$T/ctxO; mkren "$CO" sglang
+  rcis 3 "--rename gegen nicht umbenannten Baum -> 3" "$MK" --apply --rename --keep-entrypoint --ctx "$CO" --rev "$GOOD" --repo "$R"
+  check "  Grund genannt (gemischte Staende)" grep -q "gemischte Staende" <<<"$LAST_OUT"
+  rcis 3 "--rename mit fehlendem Kit -> 3" "$MK" --check --rename --rename-kit "$T/gibtsnicht" --keep-entrypoint --ctx "$CR" --rev "$GOOD" --repo "$R"
+  check "  Grund genannt (Release-Kit fehlt)" grep -q "Release-Kit fehlt" <<<"$LAST_OUT"
+  SR=$(snap "$CR")
+  rcis 0 "--rename --check (Trockenlauf der Umbenennung)" "$MK" --check --rename --keep-entrypoint --ctx "$CR" --rev "$GOOD" --repo "$R"
+  check "  Trockenlauf genannt" grep -q "rename geprueft" <<<"$LAST_OUT"
+  rcis 0 "--rename --dry-run" "$MK" --dry-run --rename --keep-entrypoint --ctx "$CR" --rev "$GOOD" --repo "$R"
+  check "  nennt rename_rigdash.py" grep -q "rename_rigdash.py" <<<"$LAST_OUT"
+  check "Kontext nach check/dry-run byte-gleich" test "$(snap "$CR")" = "$SR"
+  rcis 0 "--rename --apply" "$MK" --apply --rename --keep-entrypoint --ctx "$CR" --rev "$GOOD" --repo "$R"
+  PR=$CR/tools/rigdash
+  check "  Meldung: Paket umbenannt" grep -q "Paket umbenannt" <<<"$LAST_OUT"
+  check "  entrypoint_rigdash.sh ausfuehrbar" test -x "$PR/entrypoint_rigdash.sh"
+  check "  kein SGLANG_WEG2_ im Paket (ausser den gesperrten Boot-Aufzeichnungen)" bash -c '! grep -rq --exclude-dir=kartenplan_data "SGLANG_WEG2_" "$0"' "$PR"
+  check "  Katalog traegt FLLIPER_PDFLIP_" grep -q "FLLIPER_PDFLIP_" "$PR/rigdash/profil_data/catalog.json"
+  check "  Baumsuche im neuen Namensraum" grep -q '"flliper", "srt", "pdflip"' "$PR/rigdash/profil.py"
+  check "  Start-Skript prueft flliper/srt/pdflip" grep -q 'flliper/srt/pdflip/profile_json.py' "$PR/entrypoint_rigdash.sh"
+  check "  Boot-Aufzeichnungen byte-gleich" diff -rq "$ROOT/tools/rig_dashboard/rigdash/kartenplan_data" "$PR/rigdash/kartenplan_data"
+  check "  bash -n entrypoint_rigdash.sh" bash -n "$PR/entrypoint_rigdash.sh"
+  check "  Importprobe des Dockerfile-Blocks" bash -c 'cd "$0" && CUDA_VISIBLE_DEVICES= PYTHONPATH="$0" "$1" -B -c "import rigdash.server, rigdash.profil, rigdash.profil_recompute, rigdash.hwprofil, rigdash.modellprofil"' "$PR" "$PYTHON"
+  check "  Dockerfile-Block angehaengt" grep -q '^EXPOSE 30081$' "$CR/Dockerfile"
+else
+  echo "SKIP: Release-Kit ($KIT) nicht vorhanden -- --rename-Teile entfallen"
+fi
+
 echo "== Server: Entrypoint MODE=editor startet rigdash wirklich (Wegwerf-Port, Wegwerf-State)"
 if [ -f "$TREE/sglang/srt/weg2/profile_json.py" ] && [ "$HAVE_BASE" = 1 ]; then
   PORT=$("$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
