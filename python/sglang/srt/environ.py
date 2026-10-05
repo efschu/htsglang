@@ -4398,6 +4398,12 @@ class Envs:
     # over the same char ** in C (weg2/front_store.py) -- the same Depth.
     # Marker: 'probe=fast' on the L3-INDEX-PRESENCE line. 0 = the per-stem form.
     SGLANG_WEG2_FRONT_PROBE_FAST = EnvBool(True)
+    # XREF-TRACE (#1970, 05.10., x_refusal tail 1965): one line per side in ONE form
+    # ('WEG2 XREF-TRACE side=front|d stage=verdict|fetch|gate rid=...') -- the front's
+    # anchor credit at the ROUTE-VERDICT beside D's fetch/gate terms of the same rid,
+    # plus rid= on '#1028B FETCH CAP' / '#1035c ZERO-ANSWER'. Instrument only, dual
+    # layout only (front dual_layout / group D); no decision reads it. 0 = no line.
+    SGLANG_WEG2_XREF_TRACE = EnvBool(False)
     # PARK-READ-DETACH (02.10., L15 boot dac8b62b8c D 14:43:49: '#1068 RESET JOIN
     # terminated_ops=1 joined_s=1.29', 'WEG2-SLEEP-SUB alloc_clear=1414'): the sleep
     # flush's reset terminates the open store reads of D's park list and joins their

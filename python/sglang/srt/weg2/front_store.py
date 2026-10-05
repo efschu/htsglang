@@ -90,6 +90,11 @@ class Depth(msgspec.Struct, frozen=True):
     form: str = "list"
     #: stem lookups made (per tier ask, not per tier)
     asked: int = 0
+    #: #1970 XREF-TRACE (filled only with SGLANG_WEG2_XREF_TRACE, else the defaults):
+    #: the pages hashed, the first page hash and the anchor page's hash (12 hex chars)
+    n_keys: int = 0
+    key0: str = ""
+    anchor_key: str = ""
 
 def shared_suffix(store_dir: str) -> Tuple[Optional[str], str]:
     """The suffix every group of the shared-key store scans (the group-wide,
@@ -442,7 +447,7 @@ class StorePresence:
         tier = "none" if pages <= 0 else ("l3_index" if l3_pages >= pages else "l2_arena")
         return Depth(tokens=int(pages) * self.page_size, kv_pages=int(kv), pages=int(pages),
                      ms=(time.perf_counter() - t0) * 1000.0, tier=tier, l3_pages=int(l3_pages),
-                     form="fast", asked=int(st.lookups))
+                     form="fast", asked=int(st.lookups), **_xref_keys(hashes, pages))
 
     def _hash(self, ids: np.ndarray, extra_key: Optional[str]) -> List[str]:
         # the default namespace keeps the 3-argument hasher call (test doubles)
@@ -474,7 +479,17 @@ class StorePresence:
         tier = "none" if pages <= 0 else ("l3_index" if l3_pages >= pages else "l2_arena")
         return Depth(tokens=int(pages) * self.page_size, kv_pages=int(kv), pages=int(pages),
                      ms=(time.perf_counter() - t0) * 1000.0, tier=tier, l3_pages=int(l3_pages),
-                     form="list", asked=len(memo))
+                     form="list", asked=len(memo), **_xref_keys(hashes, pages))
+
+
+def _xref_keys(hashes: Sequence[str], pages: int) -> Dict[str, object]:
+    """#1970 XREF-TRACE: the Depth's key fields (empty = the switch is off)."""
+    from sglang.srt.weg2 import xref_trace
+
+    if not xref_trace.switch_on() or not len(hashes):
+        return {}
+    return {"n_keys": len(hashes), "key0": xref_trace.h12(hashes[0]),
+            "anchor_key": xref_trace.h12(hashes[pages - 1]) if 0 < pages <= len(hashes) else ""}
 
 
 def probe_fast_on() -> bool:

@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.canonical_page_store import (
     kv_extents_for,
 )
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
+from sglang.srt.weg2 import xref_trace as _xref_trace
 from sglang.srt.mem_cache.weg2_store_gates import (
     owner_write_covers_whole_file,
     writes_shared_keys,
@@ -4754,6 +4755,7 @@ class HiCacheFile(HiCacheStorage):
         # old per-key path, and the component pools are asked lazily for
         # exactly the pages the trailing rule inspects.
         kv_fast = self._arena_kv_present_prefix(keys)
+        _xr_hooks: dict = {}  # #1970 XREF-TRACE (instrument only)
         if kv_fast is not None:
             rest = keys[kv_fast:]
             # #1473: LONGEST-PREFIX means STOP AT THE FIRST MISS.  The probe
@@ -4829,6 +4831,10 @@ class HiCacheFile(HiCacheStorage):
                     present = None
                 _l3bulk[name] = present
                 return present
+
+            # #1970 XREF-TRACE: the instrument reads the arena states / L3 presence
+            # through these (switch off: never read)
+            _xr_hooks["states"], _xr_hooks["l3"] = _bulk_states, _bulk_l3
 
             _rbulk: dict = {}
             def _bulk_readable(name: str, states, l3):
@@ -5048,6 +5054,48 @@ class HiCacheFile(HiCacheStorage):
                         hit_count[t.name] = b
                     _moved = True
 
+        # #1970 XREF-TRACE (dual D, SGLANG_WEG2_XREF_TRACE, default off): the D side of
+        # the x_refusal tail comparison -- one line per probe, same fields as the
+        # front's ROUTE-VERDICT-time line (weg2/xref_trace.py). Reads only; a failure
+        # of the instrument is swallowed, it never touches the claim.
+        _xr_cur = _xref_trace.current() if _xref_trace.d_on() else None
+        if _xr_cur:  # only the probes the D controller scoped (a rid), not every caller
+            try:
+                _xr_rid, _xr_k0 = _xr_cur[0], _xr_cur[1]
+                _xr_trail = [
+                    t.name for t in (pool_transfers or [])
+                    if getattr(t, "caps_claim", True) and t.hit_policy != PoolHitPolicy.ALL_PAGES
+                ]
+                _xr_name = _xr_trail[0] if _xr_trail else None
+                if _xr_name is None:
+                    _xr_anchor = -1
+                elif final_pages == kv_pages:
+                    _xr_anchor = final_pages - 1 if final_pages else -1
+                else:
+                    _xr_anchor = _xref_trace.deepest_anchor(has_component, _xr_name, kv_pages)
+                _xr_st = None
+                if _xr_name is not None and "states" in _xr_hooks:
+                    _xr_st = _xr_hooks["states"](_xr_name)
+                if _xref_trace.emit_ok():
+                    logger.info(
+                        _xref_trace.fmt(
+                            "d", "fetch", _xr_rid,
+                            extra={"caps": ",".join(
+                                       "%s:%d" % (_xref_trace.name_of(k), v) for k, v in hit_count.items()
+                                       if k != PoolName.KV) or "-",
+                                   "zero_by": ",".join(_xref_trace.name_of(z) for z in _zero_capped) or "-",
+                                   "trail": _xr_name},
+                            key0=_xr_k0, keys=len(keys), kv=kv_pages,
+                            anchor_page=_xr_anchor,
+                            anchor_key=_xref_trace.h12(keys[_xr_anchor]) if _xr_anchor >= 0 else None,
+                            claimed=final_pages, lost=kv_pages - final_pages,
+                            sib=_xref_trace.siblings(_xr_rid, _xr_k0),
+                            st=_xref_trace.state_hist(_xr_st, kv_pages),
+                        )
+                    )
+            except Exception:  # noqa: BLE001 -- an instrument never raises into the read path
+                pass
+
         # #1028B THE CAP, NAMED. This `min` is the only place that decides how
         # much of an existing KV prefix a prefetch may actually claim, and it
         # printed NOTHING: measured 2026-08-30 on boot `boot_855_1028fence`,
@@ -5117,7 +5165,9 @@ class HiCacheFile(HiCacheStorage):
                     )
                 logger.warning(
                     "#1028B FETCH CAP n=%d: kv=%d claimed=%d lost=%d caps=%s "
-                    "keys=%d #1035b anchors_in_range(count,deepest_idx)=%s",
+                    "keys=%d #1035b anchors_in_range(count,deepest_idx)=%s"
+                    # #1970: the rid, only with the XREF switch (off = the line as before)
+                    + (" rid=%s" if _xr_cur else ""),
                     self._1028b_n,
                     kv_pages,
                     final_pages,
@@ -5125,6 +5175,7 @@ class HiCacheFile(HiCacheStorage):
                     {k: v for k, v in hit_count.items() if k != PoolName.KV},
                     len(keys),
                     _anchor_probe,
+                    *((_xr_cur[0],) if _xr_cur else ()),
                 )
 
         return PoolTransferResult(

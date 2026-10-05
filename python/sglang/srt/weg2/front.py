@@ -6357,6 +6357,11 @@ class Front:
                         rid, type(e).__name__, str(e)[:160])
             return 0, "none"
         self.counters["l3_index_probes"] += 1
+        if getattr(self, "dual_layout", False):
+            from sglang.srt.weg2 import xref_trace as _xref
+
+            if _xref.switch_on():
+                _xref.note_front(rid, d)  # #1970: the ROUTE-VERDICT line prints it beside D's
         if d.tokens > 0:
             logger.info("WEG2 L3-INDEX-PRESENCE rid=%s tier=%s depth=%d pages=%d l3_pages=%d "
                         "kv_pages=%d tokens=%d probe_ms=%.1f probe=%s asked=%d (the shared L2/L3 "
@@ -9266,6 +9271,12 @@ class Front:
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
             len(text),
         )
+        if getattr(self, "dual_layout", False):
+            from sglang.srt.weg2 import xref_trace as _xref
+
+            if _xref.switch_on():  # #1970 XREF-TRACE: the credit in D's fields (instrument only)
+                logger.info(_xref.front_verdict_line(
+                    rid, _xref.take_front(rid), route, remainder, store_span, presence_src))
         Front._pb_resolve(self, rid, _pb_fut, route, remainder)  # PRICE-BARRIER: the verdict, for the SHORTs waiting on it
         if _ef is not None:
             # EARLY-FLIP: the verdict for the flip already under way; not LONG ->
@@ -12685,8 +12696,9 @@ class Front:
         self._rvp_state()
         logger.warning(
             "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%s reason=x_refusal path=fresh n=%d "
-            "verdict=%s -- refused before the first byte: re-routed through P (leg 1, then leg 2)",
-            rid, self._front_price.get(str(rid), "?"), d_extent, n, _verdict)
+            "verdict=%s route_class=%s -- refused before the first byte: re-routed through P (leg 1, then leg 2)",
+            rid, self._front_price.get(str(rid), "?"), d_extent, n, _verdict,
+            _reroute_class(self._front_price.get(str(rid)), d_extent))
         if terminal:
             # W35 counts the POPULATION -- every rid D refused a second time
             # after a full P prefill. W53 is the SUBSET of those for which
@@ -17552,6 +17564,22 @@ def main():
     logger.info("WEG2-FRONT %s:%s -> P=%s D=%s awake=%s weights_tags=%s src_chunk_cards=%s", args.host, args.port,
                 args.prefill, args.decode, args.awake, front.weights_tags, front.src_chunk_cards)
     web.run_app(app, host=args.host, port=args.port, print=None)
+
+
+def _reroute_class(front_price, d_extent) -> str:
+    """#1600 instrument only (never a decision): which price/admit gap a W50-REROUTE x_refusal is.
+
+    ``short_credit`` -- the front priced it SHORT (front_price <= 1: D-direct, from a presence
+    credit) yet D refused: the credit is not backed by what D can read (b9h weg2-0-44.. d_extent
+    70..72); ``anchor_tail`` -- priced long, D's extent below one 4096 anchor step (the 1420 TAIL
+    class); ``long`` -- the rest (arena wall / FULL). ``?`` when a number is missing."""
+    try:
+        fp, de = int(front_price), int(d_extent)
+    except (TypeError, ValueError):
+        return "?"
+    if fp <= 1:
+        return "short_credit"
+    return "anchor_tail" if 0 < de < 4096 else "long"
 
 
 if __name__ == "__main__":

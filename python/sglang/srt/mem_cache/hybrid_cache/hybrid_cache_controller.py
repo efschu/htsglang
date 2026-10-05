@@ -124,6 +124,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
 from sglang.srt.weg2 import p_fork_cut
+from sglang.srt.weg2 import xref_trace as _xref_trace
 from sglang.srt.utils import get_device_module
 from sglang.srt.environ import envs
 
@@ -1122,6 +1123,7 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
+        _xr_tok = None  # #1970 XREF-TRACE scope token (set only on the v2 probe below)
         draft_probe = self._draft_presence_transfer()
         if operation.pool_transfers or draft_probe is not None:
             self._hitq_v2_n = getattr(self, "_hitq_v2_n", 0) + 1
@@ -1133,9 +1135,15 @@ class HybridCacheController(BaseHiCacheController):
                 self, operation.pool_transfers
             )
             probe_transfers = tree_transfers + ([draft_probe] if draft_probe else [])
-            hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, probe_transfers, extra_info
-            )
+            # #1970 XREF-TRACE: the rid for the storage layer's trace (None = off)
+            _xr_tok = _xref_trace.probe_begin(getattr(operation, "request_id", None), hash_value)
+            try:
+                hit_result = self.storage_backend.batch_exists_v2(
+                    hash_value, probe_transfers, extra_info
+                )
+            finally:
+                if _xr_tok is not None:
+                    _xref_trace.probe_clear()
             if host_pools and hit_result.kv_hit_pages:
                 hit_result.extra_pool_hit_pages.update(
                     {t.name: int(hit_result.kv_hit_pages) for t in host_pools}
@@ -1201,6 +1209,8 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
+        if _xr_tok is not None:
+            _xref_trace.probe_done(_xr_tok, kv_hit_pages)  # #1970: the sibling ring
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
         # DP-NACHLAUF: PP0's told clamp reuses this anchor-clamped answer when
         # the read completes exactly this span (weg2_store_told._anchor_clamp)
@@ -1280,7 +1290,9 @@ class HybridCacheController(BaseHiCacheController):
                     "(suppressed_so_far=%d). `by` lists pools capped to EXACTLY "
                     "0 -- they are absent from extra_pool_hit_pages by "
                     "construction, so an empty caps dict there means 'capped to "
-                    "nothing', never 'uncapped'.",
+                    "nothing', never 'uncapped'."
+                    # #1970: the rid, only with the XREF switch (off = the line as before)
+                    + (" rid=%s" if _xr_tok is not None else ""),
                     n,
                     _arm,
                     cause,
@@ -1289,6 +1301,7 @@ class HybridCacheController(BaseHiCacheController):
                     kv_hit_pages,
                     ",".join(hit_result.zero_capped_pools) or "-",
                     max(0, n - min(n, 40) - (n // 256)),
+                    *((_xr_tok[0],) if _xr_tok is not None else ()),
                 )
 
         return (

@@ -191,6 +191,27 @@ def _rearm(req, st: dict, now, env=None) -> bool:
     return True
 
 
+#: the dual layout's store anchors sit on multiples of this many tokens (page-aligned 4096 anchors)
+ANCHOR_STEP = 4096
+
+
+def tail_class(tail: int) -> str:
+    """#1600 instrument only: what kind of tail a refused hand-back priced.
+
+    ``anchor_tail`` -- the tail is shorter than one anchor step (4096) AND the request
+    is long enough to have had an anchor (the 1420 TAIL class: D sees only up to the last
+    complete anchor); ``whole_short`` -- the tail is shorter than 256 tokens (a short
+    request the front priced from its l3_index credit: nothing for a re-read to land,
+    boot b9h weg2-0-44/-45/-47/-48/-56, tail=70..72); ``long`` -- everything else
+    (the FULL / arena-wall class). A label for the log line, never a decision."""
+    t = int(tail)
+    if t < 256:
+        return "whole_short"
+    if t < ANCHOR_STEP:
+        return "anchor_tail"
+    return "long"
+
+
 def begin(req, tail: int, *, now=time.monotonic, env=None) -> bool:
     """The X gate priced ``req`` W31. True = defer it this pass (first time: the
     mark is set); False = refuse as before (not dual D, or the mark is spent --
@@ -218,8 +239,9 @@ def begin(req, tail: int, *, now=time.monotonic, env=None) -> bool:
             return True
         if not st.get("spent"):
             st["spent"] = True
-            _line(st, req, "refused", now, " -- the tail stayed unreadable past the length-priced bound; "
-                  "the refusal (RESUME-VIA-P) follows")
+            _line(st, req, "refused", now, " rearm=%d/%d tail_class=%s -- the tail stayed unreadable past the "
+                  "length-priced bound; the refusal (RESUME-VIA-P) follows"
+                  % (int(st.get("rearm", 0)), rearm_max(env), tail_class(int(st["tail"]))))
         return False
     _N[0] += 1
     st = {"n": _N[0], "t0": float(now()), "passes": 0, "tail": int(tail), "spent": False, "issued": False,

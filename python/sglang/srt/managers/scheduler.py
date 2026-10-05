@@ -14494,6 +14494,18 @@ class Scheduler(
                 None if _v is None else _v[1], None if _v is None else _v[0],
                 None if _v is None else _v[2],
             )
+            # #1970 XREF-TRACE (dual D, switch default off): the gate's terms in the
+            # trace's one line form, so the front's credit, D's fetch and D's refusal
+            # of ONE rid read side by side. Instrument only.
+            from sglang.srt.weg2 import xref_trace as _xref
+
+            if _xref.d_on():
+                logger.warning(_xref.fmt(
+                    "d", "gate", getattr(req, "rid", "?"),
+                    extra={"total": _t[0], "head": _t[1], "store": _t[2], "floor": _t[3],
+                           "uncached": uncached, "x": x, "verdict": verdict,
+                           "my_vote": None if _v is None else _v[1]},
+                ))
         return verdict == "W31"
 
     def _weg2_answer_x_refusals(self, refused: List[Req], head_inputs=None) -> None:
