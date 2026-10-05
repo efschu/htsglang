@@ -218,6 +218,11 @@ def l2_backed(node, root) -> bool:
     return True
 
 
+#: ``head_miss`` window: a chain node lost within this many tokens of the root is the
+#: shared head every request chains through (the 44-token system head of the 27B probe)
+HEAD_TOKENS = 128
+
+
 def diag_on(env: Optional[Mapping[str, str]] = None) -> bool:
     """Default OFF; ``1``/``true``/``on`` enables the loss census line."""
     import os
@@ -227,7 +232,7 @@ def diag_on(env: Optional[Mapping[str, str]] = None) -> bool:
         "1", "true", "on")
 
 
-def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, int]:
+def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, object]:
     """L15-TREE-CAND-DIAG: where the device tips of this rank's tree are lost on
     the way to the TREE-CAND vote. Read-only, no collective, never a decision.
 
@@ -242,6 +247,15 @@ def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, int]:
       published YET;
     * ``l2_ok``: passes :func:`l2_backed` (what the cap-0 rank offers).
 
+    Where in the chain: ``first_miss_tok`` = the sorted distinct token offsets
+    (chain position of the node END, bigram boundary token counted once) of the
+    ROOT-MOST chain node that has no host value and no shadow, over the ``no_kv_host``
+    tips; ``head_miss`` = how many of those tips lose it within the first
+    ``HEAD_TOKENS`` tokens (a shared system head / split parent node that every request
+    chains through shows here). ``shadow_len_mismatch`` = tips with a chain node whose
+    recorded shadow has another length than the node's tokens (``l15_bind`` refuses
+    those, ``l2_backed`` does not look).
+
     ``chain_error`` is counted ACROSS those buckets (any tip whose node keys do not
     compose to a token chain, whatever the L2 verdict).
 
@@ -251,8 +265,11 @@ def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, int]:
     full_t, mamba_t = _mamba_type()
     root = getattr(tree_cache, "root_node", None)
     tips = tips_of(tree_cache)
-    out = {"tips": len(tips), "no_mamba_host": 0, "no_kv_host": 0, "kv_pending": 0,
-           "chain_error": 0, "l2_ok": 0, "kept": 0}
+    out: Dict[str, object] = {
+        "tips": len(tips), "no_mamba_host": 0, "no_kv_host": 0, "kv_pending": 0,
+        "chain_error": 0, "l2_ok": 0, "kept": 0, "head_miss": 0,
+        "shadow_len_mismatch": 0, "first_miss_tok": []}
+    offsets = set()
     inflight = set()
     try:  # keyed by node id (ongoing_backup is keyed by operation id: not used)
         inflight = set((getattr(tree_cache, "ongoing_write_through", None) or {}).keys())
@@ -270,21 +287,48 @@ def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, int]:
         else:
             cur = n
             pending = False
+            chain = []  # tip -> root: (node tokens, lacks host+shadow)
+            sh_bad = False
             while cur is not None and cur is not root:  # whole chain, no early exit
                 try:
                     hv = cur.component_data[full_t].host_value
                 except (AttributeError, KeyError, IndexError, TypeError):
                     hv = None
+                try:
+                    toks, bigram = _key_tokens(cur)
+                except Exception:  # noqa: BLE001 -- length unknown
+                    toks, bigram = [], False
+                par = getattr(cur, "parent", None)
+                # the bigram boundary token of a non-first node is the parent's last
+                ntok = len(toks) - (1 if bigram and par is not None and par is not root
+                                    else 0)
+                missing = False
+                sh = getattr(cur, "_weg2_l2_shadow", None)
+                if sh is not None and len(sh) == 2 and len(sh[0]) and ntok > 0 \
+                        and len(sh[0]) != ntok:
+                    sh_bad = True
                 if hv is None or len(hv) == 0:
-                    sh = getattr(cur, "_weg2_l2_shadow", None)
                     if sh is None or len(sh) != 2 or not len(sh[0]):
                         reason = "no_kv_host"
+                        missing = True
                         if (int(getattr(cur, "host_ref_counter", 0) or 0) > 0
                                 or getattr(cur, "id", None) in inflight):
                             pending = True
-                cur = getattr(cur, "parent", None)
+                chain.append((ntok, missing))
+                cur = par
             if pending:
                 out["kv_pending"] += 1
+            if sh_bad:
+                out["shadow_len_mismatch"] += 1
+            if reason == "no_kv_host":
+                end = 0  # root-most missing node: walk root -> tip, offset = node END
+                for ntok, missing in reversed(chain):
+                    end += max(ntok, 0)
+                    if missing:
+                        offsets.add(end)
+                        if end <= HEAD_TOKENS:
+                            out["head_miss"] += 1
+                        break
         if reason is not None:
             out[reason] += 1
         else:
@@ -294,19 +338,24 @@ def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, int]:
             continue
         if reason is None or not require_l2:
             out["kept"] += 1
+    out["first_miss_tok"] = sorted(offsets)
     return out
 
 
-def loss_line(rank, census: Mapping[str, int], local: int, agreed: int,
+def loss_line(rank, census: Mapping[str, object], local: int, agreed: int,
               require_l2: bool) -> str:
     """``L15-TREE-CAND-LOSS rank=<r> local=.. agreed=.. require_l2=.. tips=.. ...``"""
     return ("L15-TREE-CAND-LOSS rank=%s local=%d agreed=%d require_l2=%d tips=%d "
-            "no_mamba_host=%d no_kv_host=%d kv_pending=%d chain_error=%d l2_ok=%d kept=%d"
+            "no_mamba_host=%d no_kv_host=%d kv_pending=%d chain_error=%d l2_ok=%d kept=%d "
+            "head_miss=%d shadow_len_mismatch=%d first_miss_tok=%s"
             % (rank if rank is not None else "?", local, agreed, int(bool(require_l2)),
                census.get("tips", 0), census.get("no_mamba_host", 0),
                census.get("no_kv_host", 0), census.get("kv_pending", 0),
                census.get("chain_error", 0), census.get("l2_ok", 0),
-               census.get("kept", 0)))
+               census.get("kept", 0), census.get("head_miss", 0),
+               census.get("shadow_len_mismatch", 0),
+               ",".join(str(x) for x in list(census.get("first_miss_tok") or ())[:4])
+               or "-"))
 
 
 class _Chain:

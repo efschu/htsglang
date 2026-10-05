@@ -381,6 +381,28 @@ def test_loss_census_buckets():
     assert l15_tree_cand.loss_census(tree, require_l2=True)["l2_ok"] == 3
 
 
+def test_loss_census_where_in_the_chain():
+    """Shared head lost (the split-parent hypothesis): A (2 tokens) has neither host value
+    nor shadow, B/C below it are backed -> every tip below A loses it at offset 2."""
+    tree, (a, b, c, d) = _tree(host_mamba=True, host_kv=True)
+    a.component_data[FULL].host_value = None
+    cen = l15_tree_cand.loss_census(tree, require_l2=True)
+    assert (cen["no_kv_host"], cen["l2_ok"], cen["kept"]) == (2, 1, 1)  # B, C lost, D fine
+    assert cen["first_miss_tok"] == [2] and cen["head_miss"] == 2
+    # a shadow of the wrong length is flagged (l15_bind would refuse it), not a l2_backed loss
+    tree, (a, b, c, d) = _tree(host_mamba=True, host_kv=True)
+    b._weg2_l2_shadow = ([1, 2, 3], [0, 0, 0])  # B has 2 tokens
+    cen = l15_tree_cand.loss_census(tree, require_l2=True)
+    assert cen["shadow_len_mismatch"] == 1 and cen["l2_ok"] == 3
+    # first_miss_tok is deep when only the tip is missing: A 2 + B 2 = 4 for tip B
+    tree, (a, b, c, d) = _tree(host_mamba=True, host_kv=True)
+    b.component_data[FULL].host_value = None
+    cen = l15_tree_cand.loss_census(tree, require_l2=True)
+    assert cen["first_miss_tok"] == [4] and cen["head_miss"] == 1
+    line = l15_tree_cand.loss_line(1, cen, 0, 0, True)
+    assert line.endswith("head_miss=1 shadow_len_mismatch=0 first_miss_tok=4")
+
+
 def test_diag_line_only_when_switch_on_and_walk_ends_empty():
     tree, _ = _tree()  # three tips, peer votes nothing -> agreed=0
     # switch off (default): no LOSS line, same result
@@ -392,6 +414,7 @@ def test_diag_line_only_when_switch_on_and_walk_ends_empty():
     assert len(loss) == 1
     assert loss[0].startswith("L15-TREE-CAND-LOSS rank=2 local=3 agreed=0 require_l2=0 tips=3 "
                               "no_mamba_host=3 ")
+    assert loss[0].endswith("head_miss=0 shadow_len_mismatch=0 first_miss_tok=-")
     # log-only: the result and every other line are identical
     assert out_on == out_off == []
     assert [x for x in logs_on if "TREE-CAND-LOSS" not in x] == logs_off
