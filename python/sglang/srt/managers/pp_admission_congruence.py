@@ -2702,6 +2702,88 @@ _PREFIX_EXEC_NOOP_SEEN = 0
 #: under-covered. Bounds the per-rid under-coverage line below.
 _PREFIX_EXEC_SHORT_SEEN = 0
 
+#: Q-1930 ANCESTOR-RETARGET (27B NVFP4 dual hb 0ceb3699f8, boot
+#: dkr27bnvfp4dual1mpsleepsharegreentop112bar1fs10050428, P PP1 death
+#: 04:33:13Z, rid weg2-0-4). MEASURED (P log + debug-hold rank1_pid787):
+#:   04:32:40 PP0 only: L3 read of weg2-0-3 lands 51788 (#1423 INSERT-PLACED
+#:            inserted=51788), PF TOLD-FALLBACK told=51788 -> 0 reason=frist;
+#:            PP1/PP2 release their read (pages=0). PP0's tree alone now has a
+#:            node edge at 51788 under a store-loaded, un-backed parent.
+#:   04:32:54 weg2-0-4 (twin of weg2-0-3) told=53248, all ranks ack 53248.
+#:   04:32:57 PP0 EVICT node=34 (51788..53248, host=False) -- the 53248 anchor
+#:            dies on PP0; PP1/PP2 keep node 49152..53248 backed (EVICT
+#:            host=True at 04:33:08/09) with its host-backed state.
+#:   04:33:13 PP0 MAMBA-HOST-RESUME depth=49152 -> #988 LOADBACK 49152 ->
+#:            decision prefix_len=49152; PP1 best_match_node = the 53248 node
+#:            (MAMBA-HOST-RESUME depth=53248), init_load_back serves 53248,
+#:            anchor adopted at 53248 -> #968 SHORTFALL -> W17 group stop.
+#: PP1 also held a host-backed state AT 49152 (TOLD-ANCHOR-HOLD node=31
+#: depth=49152, EVICT node=31 host=True 04:33:10, MAMBA-HOST-RESUME
+#: depth=49152 04:33:10). Executing the decision from that ancestor is the
+#: exact analogue of the `local > scheduled` truncation: same prefix, the
+#: recurrent state that belongs to it. Only an ancestor ending EXACTLY at the
+#: decision with a host-only state (the load-back then plants that state, the
+#: FIX-3 adopted flag is set and applied == deficit) is taken; anything else
+#: leaves `best` untouched and the #968 stop stands. Default OFF.
+ENV_ANCESTOR_RETARGET = "SGLANG_WEG2_968_ANCESTOR_RETARGET"
+_ANCESTOR_RETARGET_N = [0]
+
+
+def _ancestor_retarget_968(req, best, deficit: int):
+    """Return the node to load back from: ``best`` itself, or (gate on) the
+    ancestor of ``best`` ending exactly ``deficit`` tokens below
+    ``req.last_node`` when ``best`` reaches deeper and that ancestor carries a
+    host-backed recurrent state with no device copy. Read-only on the tree."""
+    if (os.environ.get(ENV_ANCESTOR_RETARGET, "") or "").strip() != "1":
+        return best
+    try:
+        stop = getattr(req, "last_node", None)
+        chain = []  # (node, rel_end) from best upwards, rel to req.last_node
+        node, rel = best, 0
+        lens = []
+        while node is not None and node is not stop:
+            key = getattr(node, "key", None)
+            lens.append((node, 0 if key is None else len(key)))
+            node = getattr(node, "parent", None)
+        if node is not stop:
+            return best  # req.last_node is not an ancestor: never guess
+        rel = sum(n for _, n in lens)
+        if rel <= int(deficit):
+            return best
+        best_rel = rel
+        for nd, n in lens:
+            chain.append((nd, rel))
+            rel -= n
+        target = next((nd for nd, r in chain if r == int(deficit)), None)
+        if target is None or target is best:
+            return best
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            ComponentType,
+        )
+
+        comp = target.component_data[ComponentType.MAMBA]
+        if comp is None or getattr(comp, "host_value", None) is None:
+            return best
+        if getattr(comp, "value", None) is not None:
+            return best  # device copy: the load-back plants nothing, not ours
+    except Exception:  # noqa: BLE001 - a retarget never breaks the station
+        return best
+    _ANCESTOR_RETARGET_N[0] += 1
+    logger.warning(
+        "Q-1930 #968 ANCESTOR-RETARGET rid=%s scheduled_rel=%d match_rel=%d "
+        "node=%s -> ancestor=%s (n=%d): this rank's match reaches past the "
+        "decision; loading back from the ancestor that ends at the decision "
+        "with its host-backed recurrent state instead of adopting the deeper "
+        "anchor (#968 stop)",
+        getattr(req, "rid", "?"),
+        int(deficit),
+        best_rel,
+        getattr(best, "id", "?"),
+        getattr(target, "id", "?"),
+        _ANCESTOR_RETARGET_N[0],
+    )
+    return target
+
 
 def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     """#968: make this rank HOLD exactly the scheduled prefix, or die loudly.
@@ -2870,6 +2952,12 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     while True:
         best = getattr(req, "best_match_node", None)
         if best is not None:
+            # Q-1930 ANCESTOR-RETARGET (ENV-gated, default OFF): this rank's
+            # match ends DEEPER than the decision (its host anchor survived
+            # where PP0's did not) -- load back from the ancestor that ends
+            # exactly at the decision, if that ancestor carries a host-backed
+            # recurrent state. Otherwise unchanged (the #968 stop below).
+            best = _ancestor_retarget_968(req, best, deficit)
             # Armed False for THIS attempt only; the mamba component sets it
             # True if the load-back plants a node-END anchor (same protocol
             # as the S1 site in schedule_policy.add_one_req).
