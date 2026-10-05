@@ -276,7 +276,10 @@ def _b_l15(n: int, ctx: TopologyContext) -> List[Blocker]:
     if not ctx.l15:
         return []
     from sglang.srt.weg2 import inventory_view as _iv
-    from sglang.srt.weg2 import l15_plan as _l15
+    try:
+        from sglang.srt.weg2 import l15_plan as _l15
+    except ImportError:  # NF tree: no l15_plan module; L15 is off by default there
+        return []
 
     keys: List[int] = []
     try:

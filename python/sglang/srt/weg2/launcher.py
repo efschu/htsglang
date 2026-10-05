@@ -94,6 +94,14 @@ from sglang.srt.weg2 import shared_cache_release as shared_cache_release_mod
 from sglang.srt.weg2 import state_file as state_file_mod
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
 from sglang.srt.weg2 import form as weg2_form
+# L15 (1.5-stage KV post) is a 27B-line feature: that tree ships
+# weg2/l15_plan.py. On the NF release it lives in front.py and is off by
+# default, so this import is absent here; the guards below degrade to the
+# L15-off base behaviour (no posts, no L15-POSTS blocker).
+try:
+    from sglang.srt.weg2 import l15_plan
+except ImportError:  # NF line: no L1.5 planner module
+    l15_plan = None
 
 #: UNIFY S3: the 27B row of the model-profile registry (weg2/form.py PROFILES).
 #: The module-level measured constants below are ALIASES of this row -- the
@@ -5004,6 +5012,12 @@ COLLECTIVE_CENSUS_INTERVAL = 50
 #: carve-out. It is cited here so P's window is not the one number in this file
 #: a reader has to go looking for.
 P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
+#: DUAL-TP3PP3 (27B line): group P's BAR1 windows while BOTH groups are awake
+#: (metal 30.09. boot f9fch3: with P at the flip default 24+96, D's dcp window
+#: was refused on both 3080s). The NF release ships no dual layout, but the
+#: constant keeps :func:`apply_bar1_windows`' default check well-defined when
+#: the dual flags are set explicitly.
+DUAL_P_BARLINK_BAR1_WINDOW_MIB = "16,PP_0=64"
 #: Group D's BAR1 windows (#1234 C1, the derivation lives at argv_d): the
 #: default of --d-barlink-bar1-window-mib (HW-P1c: derived per N by
 #: weg2/bar1_windows.py; this value is the N = 3 / 256 MiB BAR measurement).
@@ -5775,6 +5789,14 @@ def resolve_cards() -> List[Card]:
     return cards
 
 
+def _live_inventory_or_none() -> Optional[Tuple[str, ...]]:
+    """The live P-stage inventory signature, or None (NVML cannot answer)."""
+    try:
+        return card_identity.inventory_signature(order_cards(resolve_cards()))
+    except Exception:  # noqa: BLE001 - selection degrades to 'no model', never a refusal here
+        return None
+
+
 def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
     """Release table row 27: the power limit and SM clock ceiling of every
     card go into the boot record (``state.cards[i]``: power_limit_w,
@@ -5880,7 +5902,7 @@ def derivation_assessment(ns, cards: Sequence["Card"],
     vec_bad = sorted(k for k, c in positional_vector_lengths(ns).items()
                      if int(c) != len(live) and not _iv.vector_derivable(k, int(c), tuple(vec_inv), live))
     l15_bad = []
-    if l15_plan.master_on(env):
+    if l15_plan is not None and l15_plan.master_on(env):
         mib = str(env.get(l15_plan.L15_MIB_ENV, "") or "")
         try:
             mode, posts = l15_plan.parse_l15_mib(mib)
@@ -5935,7 +5957,7 @@ def inventory_check_line(ns, cards: Sequence["Card"],
                         f"are a SUBSET of it (each has a measured twin of its class), positional "
                         f"values DERIVED not measured: records {', '.join(ok) or '(none)'}; vectors "
                         f"{', '.join(sorted(positional_vector_lengths(ns))) or '(none)'}"
-                        + ("; L15 posts" if l15_plan.master_on(os.environ if environ is None else environ) else "")
+                        + ("; L15 posts" if l15_plan is not None and l15_plan.master_on(os.environ if environ is None else environ) else "")
                         + " (weg2/inventory_view.py; the first boot on these cards is the "
                         "measurement) DERIVED")
             if subset:
@@ -6118,13 +6140,15 @@ def apply_inventory_derivation(ns, cards: Sequence["Card"], log=None,
             setattr(ns, key, " ".join(shlex.quote(x) for x in out))
             note(f"{head} --{key.replace('_', '-')}: {', '.join(dropped)} DROPPED (a cut pinned for another "
                  f"stage count; the cut solver derives it)")
-    # 5. L15 ordinal posts
-    mib = str(env.get(l15_plan.L15_MIB_ENV, "") or "")
-    if l15_plan.master_on(env) and mib:
-        new, why = _iv.derive_l15_override(mib, cal, live)
-        if why and new != mib:
-            env[l15_plan.L15_MIB_ENV] = new
-            note(f"{head} {l15_plan.L15_MIB_ENV} {mib!r} -> {new!r} ({why})")
+    # 5. L15 ordinal posts (L1.5 is a 27B-line feature; the NF tree has no
+    # l15_plan module, so the step is a no-op there)
+    if l15_plan is not None:
+        mib = str(env.get(l15_plan.L15_MIB_ENV, "") or "")
+        if l15_plan.master_on(env) and mib:
+            new, why = _iv.derive_l15_override(mib, cal, live)
+            if why and new != mib:
+                env[l15_plan.L15_MIB_ENV] = new
+                note(f"{head} {l15_plan.L15_MIB_ENV} {mib!r} -> {new!r} ({why})")
     return lines
 
 
@@ -6232,8 +6256,8 @@ def topology_context(ns, environ: Optional[Mapping[str, str]] = None,
         weight_format=str(fmt or ""),
         dual=bool(getattr(ns, "dual_layout", False) or getattr(ns, "dual_share", False)),
         weight_source=str(getattr(ns, "weg2_weight_source", "") or ""),
-        l15=l15_plan.master_on(env),
-        l15_mib=str(env.get(l15_plan.L15_MIB_ENV, "") or ""),
+        l15=bool(l15_plan is not None and l15_plan.master_on(env)),
+        l15_mib=(str(env.get(l15_plan.L15_MIB_ENV, "") or "") if l15_plan is not None else ""),
         vectors=positional_vector_lengths(ns),
         live_inventory=(tuple(card_identity.inventory_signature(cards)) if cards is not None else ()),
         vector_inventory=tuple(calibrated_inventory(ns)[0]),
