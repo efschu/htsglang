@@ -55,7 +55,7 @@ class TestArchGateSm89(unittest.TestCase):
 
     def test_sm89_passes_the_gate_sm80_sm90_do_not(self):
         ci.arch_gate([R4090(0), R4090(1)])  # no raise: never HW-ARCH
-        for cc in ((8, 0), (9, 0), (10, 0), (12, 1)):
+        for cc in ((7, 0), (7, 5), (8, 0), (9, 0), (10, 0), (12, 1), None):  # None = cc not reported
             with self.assertRaises(ci.CardInventoryRefused) as cm:
                 ci.arch_gate([_c(0, "NVIDIA X", 24000, cc)])
             self.assertTrue(str(cm.exception).startswith(ci.CODE_ARCH))

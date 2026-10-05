@@ -124,9 +124,10 @@ REGISTER: Tuple[Refusal, ...] = (
        "HW-COUNT und ist forcebar.",
        "weg2/topology.py plan_topology; launcher.topology_check_line", "launcher"),
     _h("HW-ARCH", "Compute-Capability ohne Kernel im Image",
-       "Keine Wert-Ablehnung: das Image trägt nur Code für sm_86 und sm_120 (Wheel 86;120a). Eine andere Architektur hat keinen "
-       "ausführbaren Kernel, und der Entrypoint verweigert sie schon heute ausdrücklich immer. Force würde einen Absturz im ersten "
-       "Kernel statt einer Meldung liefern.",
+       "Keine Wert-Ablehnung: das Image trägt Code für sm_86 und sm_120 (Wheel 86;120a) und lässt sm_89 über die Binärkompatibilität "
+       "der sm_86-Cubins plus JIT zu (sm_89 ist unkalibriert, siehe HW-UNCALIBRATED). Jede andere Architektur (sm_80, sm_90, sm_100, "
+       "sm_121, nicht gemeldete cc) hat keinen ausführbaren Kernel, und der Entrypoint verweigert sie schon heute ausdrücklich immer. "
+       "Force würde einen Absturz im ersten Kernel statt einer Meldung liefern.",
        "weg2/card_identity.py arch_gate; launcher.resolve_cards", "launcher"),
     _h("KARTE-BELEGT", "Fremder Prozess oder fremdes Fenster auf der Karte",
        "Keine Wert-Ablehnung, sondern Schutz anderer Nutzer: die Belegungsprüfung (NVML-Fremdnutzung, gpuq-Fenster) darf nie "

@@ -186,8 +186,12 @@ class LauncherWiring(Base):
 
     def test_arch_gate_is_not_lifted_by_force(self):
         R.arm(True)
+        # sm_89 is admitted since SM89 1002 (HW-UNCALIBRATED, forcible); an arch with no cubins stays refused
         with self.assertRaises(CI.CardInventoryRefused):
-            CI.arch_gate([card(0, "NVIDIA GeForce RTX 4090", 24564, (8, 9))])
+            CI.arch_gate([card(0, "NVIDIA H100 80GB HBM3", 81559, (9, 0))])
+        with self.assertRaises(CI.CardInventoryRefused):
+            CI.arch_gate([card(0, "NVIDIA A100-SXM4-80GB", 81920, (8, 0))])
+        CI.arch_gate([card(0, "NVIDIA GeForce RTX 4090", 24564, (8, 9))])      # passes the gate, no Force needed
 
 
 class NoRecords(Base):
