@@ -184,6 +184,15 @@ def bg_publish_on() -> bool:
     return bool(envs.SGLANG_WEG2_PUBLISH_SWEEP_BG.get()) and _group_on()
 
 
+def bg_no_evict_on() -> bool:
+    """Option A (desk 1830 §5): True = a background claim must not make room in a full arena (named
+    refusal ``arena_claim``, the node is left to the flush). Replicated inputs only (env + the BG gate);
+    armed only where a BG sweep can run at all, so never under the dual layout."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_NO_EVICT.get()) and bg_publish_on()
+
+
 def bg_gate(scheduler) -> Optional[str]:
     """None = a background pass may run now; else why not. Replicated state
     only (every TP rank reaches the hook once per loop iteration)."""

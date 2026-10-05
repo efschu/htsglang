@@ -5877,6 +5877,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if node is not None and node is not self.root_node and node.weg2_anchor_rid is None:
             node.weg2_anchor_rid = rid
 
+    @staticmethod
+    def _weg2_bg_no_evict() -> bool:
+        from sglang.srt.managers import weg2_flush_nonblock as _nb
+
+        return _nb.bg_no_evict_on()
+
     def _weg2_direct_claim(self, node, comp_xfers=None, kv_only_if_mamba_refused=False):
         """None = not a direct-write pool (take the staging path); False =
         refused (counted); a tensor = the arena rows to write into. The
@@ -5897,7 +5903,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not hashes or dv is None or len(hashes) * int(self.page_size) != int(dv.numel()):
             self._1421_refused("direct_no_hashes", node)
             return False
-        pre = pool.alloc_write(hashes)
+        if getattr(self, "_weg2_bg_publish", False) and self._weg2_bg_no_evict():
+            # PUBLISH-SWEEP-BG option A (desk 1830 §5): a BG claim never makes room (the claim's
+            # ``_evict_for_claim`` / ARENA-DROP cost 19-109 ms of scheduler thread between two decode
+            # rounds in y9e); on a full arena it is the named refusal below and the flush publishes
+            # the node with its spill rights. Switch default OFF: the line below is then the old call.
+            pre = pool.alloc_write(hashes, allow_evict=False)
+            if pre is None:
+                # every later node of this BG pass meets the same full arena: the pass ends here (as it
+                # does on a full mamba arena) instead of claiming+refusing once per node
+                self._weg2_sweep_last_refusal = "arena_full_bg"
+        else:
+            pre = pool.alloc_write(hashes)
         if (pre is None and not getattr(self, "_weg2_bg_publish", False)   # BG: no spill (ARENA-DROP > 100 ms)
                 and self._w3_arena_spill(pool, len(hashes), claimer=node) > 0):
             # W3-ARENA: the spill handed this rank's references back; the
@@ -7065,6 +7082,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
             if _rp.mamba_full_stops_sweep(self._weg2_sweep_last_refusal):
                 stats["stopped"] = "mamba_full"
+                break
+            if background and self._weg2_sweep_last_refusal == "arena_full_bg":
+                stats["stopped"] = "arena_full"   # option A: a BG claim does not make room (flush's job)
                 break
             for child in list(node.children.values()):
                 queue.append(child)

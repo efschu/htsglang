@@ -1993,7 +1993,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         _ARENA_WRITE_N, b, b * 2 * L * block, block, L)
 
     # -- #1427 Stufe 4: direct writes, card -> arena slot -------------------------
-    def _claim_np(self, stems, totals):
+    def _claim_np(self, stems, totals, allow_evict=True):
         """xsn359: the KV/draft pool's claim on numpy arrays -- one C call, the
         pending state as mask/gen/fresh tensors, no per-slot Python."""
         import numpy as np
@@ -2016,7 +2016,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             arena.ref_slots(slots[done2].tolist(), +1)
         bad = (st == 3) | (st == 4)
         if bool(bad.any()):
-            if bool((st == 4).any()):
+            if allow_evict and bool((st == 4).any()):
                 # H81 (27B 479f6eccb0): room in C, no disk round in the claim
                 self._evict_for_claim(arena, int((st == 4).sum()),
                                       claim_stem=stems[0] if stems else None)
@@ -2328,7 +2328,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         ArenaMHAHostPool._257_dropped_without_l3)
         return len(cands) + len(reaped) + len(reaped0)
 
-    def _claim(self, stems):
+    def _claim(self, stems, allow_evict=True):
         """Claim (or join, or find complete) one slot per stem. Returns the
         slot list, or None when a slot could not be had even after the
         claim made room (``_evict_for_claim``, no disk I/O); fresh claims of
@@ -2336,7 +2336,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         arena = self.arena
         totals = [self._page_bytes] * len(stems)
         if self._pending_mask is not None:
-            return self._claim_np(stems, totals)
+            return self._claim_np(stems, totals, allow_evict)
         got = _host_write_claim(arena, stems, totals)
         # xsn327: D's dormant re-reads never find P's pages -- name what P claims
         # (full stem incl. suffix) so the reader's stem can be compared by eye.
@@ -2353,7 +2353,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if early:
             arena.ref_slots(early, +1)
         if any(st in (3, 4) for _, st, _ in got):
-            if any(st == 4 for _, st, _ in got):
+            if allow_evict and any(st == 4 for _, st, _ in got):
                 # H81 (27B 479f6eccb0): room in C, no disk round in the claim
                 self._evict_for_claim(arena, sum(1 for _, st, _ in got if st == 4),
                                       claim_stem=stems[0] if stems else None)
@@ -2386,12 +2386,16 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._pend_mark([slot for slot, st, _ in got if st != 2], True)
         return [slot for slot, _, _ in got]
 
-    def alloc_write(self, hashes) -> Optional[torch.Tensor]:
+    def alloc_write(self, hashes, allow_evict: bool = True) -> Optional[torch.Tensor]:
         """KV role: one arena slot per page hash, claimed for a direct write.
-        Returns the host ids (staging_rows + slot), or None."""
+        Returns the host ids (staging_rows + slot), or None.
+
+        ``allow_evict=False`` (PUBLISH-SWEEP-BG option A, desk 1830 §5): the claim does not make
+        room -- a page that finds no free slot is the same refusal as after a room-making round
+        that freed too little (fresh claims released, early reader references given back)."""
         if self.arena is None or self._backend is None or not hashes:
             return None
-        slots = self._claim(self._stems(hashes))
+        slots = self._claim(self._stems(hashes), allow_evict)
         if slots is None:
             return None
         return self.arena_ids(slots)  # x59: P ids per page hash

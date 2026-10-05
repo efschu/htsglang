@@ -1249,6 +1249,14 @@ class Envs:
     # before. 0 = no size limit.
     SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_TOKENS = EnvInt(8192)
     SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_ISSUE = EnvInt(1)
+    # PUBLISH-SWEEP-BG option A (desk 1830 §5, y9e 4f96e9b89b): a BG claim never makes room. Without it a BG
+    # write_backup on a FULL KV arena runs the claim's room-making (``_evict_for_claim``, ARENA-DROP) in the
+    # scheduler thread between two decode rounds: issue_ms 19-109 ms against 1-16 ms without a drop (12 of 12
+    # passes with a drop, 0 of 22 without). True = a BG claim that needs room is the named refusal
+    # ``arena_claim`` instead; the node stays un-backed for the flip's flush, which keeps its spill rights and
+    # its own room-making (the flush is untouched). Only inside a running BG sweep (flip line; the dual layout
+    # never runs one). Default False = the claim makes room as before.
+    SGLANG_WEG2_PUBLISH_SWEEP_BG_NO_EVICT = EnvBool(False)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).
