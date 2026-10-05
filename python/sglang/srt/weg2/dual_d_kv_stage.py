@@ -637,6 +637,35 @@ def _note_shrink_blocked(actor, reason: Optional[str], need: int, floor: int, p_
                 reason, actor.mapped_tokens, int(need), int(floor), float(p_wait_s))
 
 
+def _publish_floor_flag(sched, actor, blocked: bool, need: int, floor: int, p_wait_s: float) -> None:
+    """#1920 HEAD-BYPASS-FLOOR (switch SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR, default off = this returns at
+    once and writes nothing): D TP0 tells PP0 whether the live floor is what keeps the D shrink from a
+    waiting P head (``blocked``: the tick's SHRINK-BLOCKED reason is live_floor, derived from the group
+    collective values, so every rank would say the same). A set flag is refreshed every
+    FLOOR_SIGNAL_EVERY_S, the way back (False) is written once; PP0 treats an old flag as no flag.
+    Pure file write in its own try: never reaches the tick."""
+    try:
+        on = bool(getattr(actor, "_floor_sig_on", False))
+        if not blocked and not on:
+            return                                     # nothing was published, nothing to take back
+        from sglang.srt.weg2 import dual_parallel as _dpar
+
+        if not _dpar.head_bypass_floor_armed() or int(getattr(sched, "tp_rank", 0) or 0) != 0:
+            return
+        t = _pk._now()
+        if blocked and on and t < float(getattr(actor, "_floor_sig_next", 0.0) or 0.0):
+            return
+        from sglang.srt.weg2 import dual_d_priority as _ddp
+
+        tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
+        _ddp.publish_floor_signal(_ddp.floor_signal_file(tag), blocked=blocked, mapped=actor.mapped_tokens,
+                                  need=need, floor=floor, p_wait_s=p_wait_s, now=time.time())
+        actor._floor_sig_on = bool(blocked)
+        actor._floor_sig_next = t + _ddp.FLOOR_SIGNAL_EVERY_S
+    except Exception as exc:  # noqa: BLE001 -- no flag = PP0 protects its head as before
+        logger.debug("%s #1920 floor flag not published: %r", MARK, exc)
+
+
 def _drop_order_extra(actor) -> list:
     """#1390f: the extra collective element (this rank's proposal of the LAST tick, MAX over the ranks);
     empty with the switch off = the collective is the old one."""
@@ -757,6 +786,11 @@ def tick(sched) -> Optional[str]:
         _instr_shrink_blocked(sched, actor, blocked_reason, need, floor, live_local, p_wait_s, holds,
                               p_missing, recent_grow, avail_min)
         _instr_live_floor(sched, actor, blocked_reason, need, floor, live_local, p_wait_s)
+        _publish_floor_flag(sched, actor, blocked_reason == "live_floor", need, floor, p_wait_s)
+    elif not (live_due and verdict != "shrink"):
+        # #1920: the floor no longer holds the shrink (it went through, P stopped waiting, ...): take the flag
+        # back at once (a yield tick -- ``freed`` -- is neither: it keeps the last word)
+        _publish_floor_flag(sched, actor, False, need, floor, p_wait_s)
     if verdict != "grow" and st is not None and (int(st.pressure.get("P", 0) or 0) > 0
                                                  or int(st.demand.get("D", 0) or 0) > 0):
         # D's demand fits what it maps (seats ended, aborted or shrunk): the pressure

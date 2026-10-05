@@ -87,6 +87,26 @@ def head_age_s(env=None) -> float:
     return max(0.0, v)
 
 
+def head_bypass_floor_armed() -> bool:
+    """#1920: SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR (default off); a bad value never arms it."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def head_bypass_floor_max() -> int:
+    """#1920: at most this many younger grants pass ONE floor-blocked head (>= 0; 0 = none)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR_MAX.get()))
+    except Exception:  # noqa: BLE001
+        return 4
+
+
 def resume_stale_s() -> float:
     """Q-680: how long a paused head may wait on nothing but "P committed"
     while P is idle before the front reads the ledger as stale."""

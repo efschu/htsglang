@@ -298,6 +298,48 @@ def read_d_signal(path: str) -> Optional[dict]:
         return None
 
 
+#: #1920 HEAD-BYPASS-FLOOR: D refreshes its "the live floor keeps the shrink from P" flag at most this often ...
+FLOOR_SIGNAL_EVERY_S = 0.5
+#: ... and a flag older than this is no flag (D stopped publishing / the state changed): the P head is then
+#: protected as before
+FLOOR_SIGNAL_MAX_AGE_S = 3.0
+
+
+def floor_signal_file(tag: str, root: str = "/dev/shm") -> str:
+    import hashlib
+
+    return os.path.join(root, "wkvf-%s.json" % hashlib.sha1(str(tag).encode()).hexdigest()[:10])
+
+
+def publish_floor_signal(path: str, *, blocked: bool, mapped: int, need: int, floor: int, p_wait_s: float,
+                         now: float) -> None:
+    """D TP0 (from the group values of its tick): P waits for a card and the D shrink is held by the live
+    floor (SHRINK-BLOCKED reason=live_floor). ``blocked=False`` is published once on the way back."""
+    import json
+
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump({"ts": float(now), "blocked": 1 if blocked else 0, "mapped": int(mapped), "need": int(need),
+                   "floor": int(floor), "p_wait_s": float(p_wait_s)}, f)
+    os.replace(tmp, path)
+
+
+def floor_signal_blocked(sig: Optional[dict], *, now: float, max_age_s: float = FLOOR_SIGNAL_MAX_AGE_S) -> bool:
+    """D's floor flag -> True only for a fresh, set flag; missing / stale / garbage = False (no bypass)."""
+    if not sig:
+        return False
+    try:
+        if float(now) - float(sig.get("ts", 0.0)) > float(max_age_s):
+            return False
+        return int(sig.get("blocked", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def read_floor_signal(path: str) -> Optional[dict]:
+    return read_d_signal(path)
+
+
 #: Q-660: calm ticks (no pressure on P) before an awake loan of stage 1 comes back
 RECLAIM_AFTER_TICKS_ENV = "SGLANG_WEG2_DUAL_P_RECLAIM_AFTER_TICKS"
 #: 10 x the front's 0.2 s tick = 2 s without D pressure (or sooner: a D seat ended)

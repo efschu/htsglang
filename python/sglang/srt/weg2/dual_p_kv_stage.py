@@ -749,6 +749,78 @@ def infeasible_cards(stages, covered, level_tokens: int) -> list:
         return []
 
 
+#: #1920 head rid -> the level (tokens) of its LAST evaluated grant attempt (PP0-local; only kept while
+#: SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR is on)
+_HEAD_LV: dict = {}
+#: #1920 head rid -> how many younger grants passed it under the floor rule (per head, never reset by the rule)
+_OVERTAKERS: dict = {}
+#: #1920 [monotonic t of the last read, D's floor flag] -- one tiny /dev/shm read per FLOOR_CACHE_S at most
+_FLOOR_CACHE: list = [None, False]
+FLOOR_CACHE_S = 0.25
+FLOOR_MARK = "#1920 HEAD-BYPASS-FLOOR"
+
+
+def head_grantable_now(stages, covered, level_tokens: int) -> bool:
+    """True when ``level_tokens``' group grant fits the ledgers' FREE bytes on every card right now (what the
+    head's own next attempt would see). Anything unreadable answers True: the head is protected, never
+    overtaken on a guess."""
+    try:
+        from sglang.srt.weg2.card_kv_ledger import peek
+
+        step = int(stages[0]["step"])
+        top = min(int(s["top"]) for s in stages)
+        k = min(top, round_up(int(level_tokens), step)) // step
+        for i, s in enumerate(stages):
+            need = max(0, int(s["bytes"][k]) - int(covered.get(i, 0)))
+            st = peek(s["ledger"])
+            if st is None:
+                return True
+            if need > int(st.free):
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def d_floor_blocked(tag: str) -> bool:
+    """D's published flag 'the live floor keeps the shrink from the waiting P' (dual_d_priority), fresh only.
+    Cached for FLOOR_CACHE_S; a failure answers False (no bypass)."""
+    try:
+        t = _now()
+        if _FLOOR_CACHE[0] is not None and t - float(_FLOOR_CACHE[0]) < FLOOR_CACHE_S:
+            return bool(_FLOOR_CACHE[1])
+        import time
+
+        from sglang.srt.weg2 import dual_d_priority as _ddp
+
+        v = _ddp.floor_signal_blocked(_ddp.read_floor_signal(_ddp.floor_signal_file(tag)), now=time.time())
+        _FLOOR_CACHE[0], _FLOOR_CACHE[1] = t, bool(v)
+        return bool(v)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def floor_overtake_head(older, stages, own: int, tag: str) -> Optional[str]:
+    """#1920: the head rid a younger grant may pass although the head has waited past the head age, or
+    None (hold=older-head as before). ALL must hold: the switch is on; the head's overtaker budget is not
+    spent; its last attempted level is known; D reports the live floor as what blocks the shrink; and the
+    head's own grant is NOT satisfiable from the free bytes now (a head that can be served keeps
+    its priority). PP0-local: the grant verdict rides the told, no rank decides anything else."""
+    if not older or not _dpar.head_bypass_floor_armed():
+        return None
+    head, _since = min(older, key=lambda x: x[1])
+    if int(_OVERTAKERS.get(head, 0)) >= _dpar.head_bypass_floor_max():
+        return None
+    lv = _HEAD_LV.get(head)
+    if lv is None:
+        return None
+    if not d_floor_blocked(tag):
+        return None
+    if head_grantable_now(stages, {0: own}, lv):
+        return None
+    return head
+
+
 def _infeasible_line(rid: str, tokens: int, level_tokens: int, cards: list) -> str:
     """'#1640 GRANT-INFEASIBLE' body: per short card the bytes asked and the pool (free + P + D)."""
     return "rid=%s tokens=%d level_tokens=%d cards=[%s]: the grant stays short even with D at zero (only a falling level frees it)" % (
@@ -825,9 +897,12 @@ def pp0_grant(sched, req) -> Optional[int]:
     # pp0_grant runs only where _actor is armed (a dual-layout P rank); the gate is
     # restated here so the bypass can never reach a flip-form PP0.
     older = _older_waits(sched, rid) if _dual_layout_env() else []
+    _ovt_head = None                      # #1920: the floor-blocked head this grant may pass
     if older and not _dpar.grant_may_bypass([t for _r, t in older], now=_now(), age_s=_dpar.head_age_s()):
-        _log_wait(rid, tokens, lambda: _grant_short_detail(stages, {}, tokens, tokens, len(older), "older-head"))
-        return 0
+        _ovt_head = floor_overtake_head(older, stages, int(getattr(actor, "_committed", 0) or 0), tag)
+        if _ovt_head is None:
+            _log_wait(rid, tokens, lambda: _grant_short_detail(stages, {}, tokens, tokens, len(older), "older-head"))
+            return 0
     # Q-697b GRANT HOLD (dual P only): while a card shows D's unmet demand or a pressure
     # on P, no grant -- the bytes P released at idle-except-waiters are D's first. The
     # front's own gate for a PAUSED head is p_resume_ready; a waiter the front no longer
@@ -867,6 +942,14 @@ def pp0_grant(sched, req) -> Optional[int]:
             _log_wait(rid, tokens)
             return 0
         req._dual_kv_tokens = lvl
+        if _ovt_head is not None:
+            # #1920: this grant went past a head that D's live floor keeps short (counted only once it holds)
+            if len(_OVERTAKERS) > 4096:
+                _OVERTAKERS.clear()
+            _OVERTAKERS[_ovt_head] = int(_OVERTAKERS.get(_ovt_head, 0)) + 1
+            logger.info("%s rid=%s head=%s overtakers=%d tokens=%d level=%d: the head's grant is short while D's "
+                        "live floor holds the shrink, this grant fits now (max %d per head)", FLOOR_MARK, rid,
+                        _ovt_head, _OVERTAKERS[_ovt_head], int(tokens), int(lvl), _dpar.head_bypass_floor_max())
         # Q-630: the followers' charges stand on their cards until a follower
         # adopts them from the told (map_granted) -- held on the request until
         # the told is on the wire (with_dual_kv), returned if it never leaves.
@@ -876,6 +959,10 @@ def pp0_grant(sched, req) -> Optional[int]:
                     (" after %d waits over %.1f s" % waited) if waited else "")
     else:
         _lv = min(tokens, int(stages[0]["top"])) if stages else tokens
+        if _dpar.head_bypass_floor_armed():
+            if len(_HEAD_LV) > 4096:
+                _HEAD_LV.clear()
+            _HEAD_LV[rid] = int(_lv)          # #1920: what this waiter asked at its last attempt
         _inf = None
         if _infeasible_skip_armed():
             # evaluated on every wait only while the switch is on (a ledger peek per card); otherwise the
@@ -907,6 +994,9 @@ def _now() -> float:
 def _reset_wait_log() -> None:
     _WAITS.clear()
     _INFEASIBLE.clear()
+    _HEAD_LV.clear()
+    _OVERTAKERS.clear()
+    _FLOOR_CACHE[0], _FLOOR_CACHE[1] = None, False
     _CENSUS.update(next=0.0, iv=1.0, waits=0)
 
 
@@ -980,6 +1070,8 @@ def _wait_granted(rid: str):
     e = _WAITS.pop(rid, None)
     _RETRY.pop(rid, None)                      # #1530: a granted rid starts a fresh throttle
     _INFEASIBLE.pop(rid, None)                 # #1640
+    _HEAD_LV.pop(rid, None)                    # #1920
+    _OVERTAKERS.pop(rid, None)
     if not _WAITS:
         _CENSUS.update(next=0.0, iv=1.0, waits=0)
     return (e[3], _now() - e[0]) if e else None

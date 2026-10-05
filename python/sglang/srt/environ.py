@@ -690,6 +690,18 @@ class Envs:
     # (no collective, no wall clock in the decision); the head keeps retrying itself. The marker
     # '#1640 GRANT-INFEASIBLE' is a pure log line and is written with or without the switch. 0 = off (default).
     SGLANG_WEG2_DUAL_GRANT_INFEASIBLE_SKIP = EnvBool(False)
+    # #1920 HEAD-BYPASS-FLOOR (deskq/done/1890 lever B, 1910): dual b9p/top112 still showed P-KV waits of 63-127 s
+    # and ADMISSION-WEDGEs of 65 s because a RUNNING D request on a high row (``D-LIVE-FLOOR ... live_row=198899``)
+    # blocks the D shrink; the oldest P waiter then holds (``hold=older-head``, ``_older_waits``) every younger
+    # request that would be grantable NOW once it is older than SGLANG_WEG2_DUAL_BYPASS_HEAD_AGE_S. With the
+    # switch on (set it for BOTH groups: D publishes the flag, PP0 reads it) a head whose grant is short while D's
+    # tick reports SHRINK-BLOCKED reason=live_floor does not hold a younger request whose own group grant
+    # succeeds right now (order violation on purpose). Starvation guard: the head keeps priority whenever its
+    # grant is satisfiable from the ledger's free bytes, and at most SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR_MAX
+    # overtakers pass one head (then hold=older-head as before). Dual P, PP0-local decision (the told carries the
+    # grant; no collective, no clock beyond the existing head age). Marker '#1920 HEAD-BYPASS-FLOOR'. 0 = off.
+    SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR = EnvBool(False)
+    SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR_MAX = EnvInt(4)
     # #1720 SEATS-STALL-OFF (deskq/done/1720, F1): on dual group P (--max-running-requests 1) the seat gate
     # declines with 'running=empty' whenever the ONE request slot is held by a mini request flying in the PP
     # ring (self.mbs, not running_batch); IntakeStallWatch never resets on a slot change, so after 1.0 s the
