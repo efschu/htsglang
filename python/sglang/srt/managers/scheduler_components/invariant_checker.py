@@ -1225,6 +1225,31 @@ def _wedge_busy_floor(scheduler, now: float, busy: bool) -> Optional[float]:
     return since
 
 
+def _wedge_stuck_floor(scheduler, now: float, stuck: bool) -> Optional[float]:
+    """deskq 1515 (gap 3b of 1512): the poll time at which the state "queued>0 and running==0" was first seen.
+
+    The classic verdict needs exactly this state, and the busy-set floor does not capture its ENTRY: request A
+    decodes for minutes (running=1), ends, request B arrives within one poll and waits 2-3 s in the queue; no
+    poll saw the set empty, so the busy floor is still the start of A and the first-token clock is old. This
+    stamp is set by the first poll that sees the state and dropped by every poll that does not (running>0 or
+    queued==0), so a real wedge (the state is stable) is judged 20 s after the poll that first saw it. The
+    busy-set floor stays for the PREFILL-LIVELOCK verdict, where the set is never empty."""
+    since = getattr(scheduler, "_wedge_stuck_since", None)
+    if not stuck:
+        if since is not None:
+            scheduler._wedge_stuck_since = None
+        return None
+    if since is None:
+        since = scheduler._wedge_stuck_since = now
+    return since
+
+
+def _wedge_max_floor(*floors: Optional[float]) -> Optional[float]:
+    """The latest of the floors that are set (None = none set)."""
+    live = [f for f in floors if f is not None]
+    return max(live) if live else None
+
+
 def _wedge_clock_age(stamp: float, now: float, floor: Optional[float]) -> float:
     """Seconds since ``stamp``, never counted from before ``floor`` (None = no floor = ``now - stamp``)."""
     return now - (stamp if floor is None else max(stamp, floor))
@@ -1258,12 +1283,23 @@ def check_admission_wedge_once(
     running = len(scheduler.running_batch.reqs)
     # deskq 1507: with SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK both ages start no earlier than the poll that saw the
     # queue/running set become non-empty; off: floor None and nothing is written (the pre-fix numbers).
+    clock_on = _wedge_queue_clock_on()
     floor = (
         _wedge_busy_floor(scheduler, now, queued > 0 or running > 0)
-        if _wedge_queue_clock_on()
+        if clock_on
         else None
     )
-    age = _wedge_clock_age(scheduler.last_first_token_progress_time, now, floor)
+    # deskq 1515: the classic verdict (queued>0, running==0) is also floored by the poll that first saw that state.
+    stuck_floor = (
+        _wedge_stuck_floor(scheduler, now, queued > 0 and running == 0)
+        if clock_on
+        else None
+    )
+    age = _wedge_clock_age(
+        scheduler.last_first_token_progress_time,
+        now,
+        _wedge_max_floor(floor, stuck_floor),
+    )
     # #739: absent on an older scheduler -> None -> the pre-#739 verdict.
     prefill_stamp = getattr(scheduler, "last_prefill_progress_time", None)
     seconds_since_prefill_progress = (
@@ -1458,7 +1494,10 @@ class AdmissionWedgeRecovery:
         _now = time.perf_counter()
         # deskq 1507: the same floor the verdict used (read only here; the poll's check stamps it)
         _floor = (
-            getattr(self._scheduler, "_wedge_busy_since", None)
+            _wedge_max_floor(
+                getattr(self._scheduler, "_wedge_busy_since", None),
+                getattr(self._scheduler, "_wedge_stuck_since", None),
+            )
             if _wedge_queue_clock_on()
             else None
         )

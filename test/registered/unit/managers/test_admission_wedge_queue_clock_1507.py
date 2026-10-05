@@ -195,5 +195,87 @@ class RecoveryDriverUsesTheSameAge(_Base):
         self.assertIsNotNone(self._post(False))
 
 
+class StuckStateStamp1515(_Base):
+    """deskq 1515 (gap 3b of 1512): the busy-set floor never saw the set empty, but the state the classic verdict
+    needs (queued>0, running==0) is new.
+
+    Request A decodes for minutes (running=1, first-token clock old, busy floor = start of A). A ends, request B
+    arrives inside the same 10 s poll interval and waits 2-3 s in the queue; the poll that lands there sees
+    queued=1, running=0 with the busy floor and the first-token clock both ~120 s old -> false alarm."""
+
+    BUSY_POLLS = (0.0, 10.0, 20.0, 60.0, 100.0, 110.0)
+
+    def _flow(self, on):
+        s = _sched(first_token=0.0, running=1)
+        out = []
+        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
+            for t in self.BUSY_POLLS:  # A decodes, the set is never seen empty
+                IC.check_admission_wedge_once(s, now=t)
+            _set(s, queued=1, running=0)  # A ended at 115, B queued at 117
+            for t in (120.0, 125.0, 139.0, 141.0, 150.0):
+                out.append(IC.check_admission_wedge_once(s, now=t)[0])
+        return out
+
+    def test_a_ends_b_queues_within_one_poll_no_false_alarm(self):
+        # state first seen at 120 -> 20 s of its own waiting -> alarm only from 141 on
+        self.assertEqual(self._flow(True), [False, False, False, True, True])
+
+    def test_off_is_the_old_false_alarm(self):
+        self.assertEqual(self._flow(False), [True, True, True, True, True])
+
+    def test_stuck_stamp_is_dropped_when_the_state_ends(self):
+        s = _sched(first_token=0.0, running=1)
+        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
+            IC.check_admission_wedge_once(s, now=0.0)
+            self.assertIsNone(getattr(s, "_wedge_stuck_since", None))
+            _set(s, queued=1, running=0)
+            IC.check_admission_wedge_once(s, now=100.0)
+            self.assertEqual(s._wedge_stuck_since, 100.0)
+            _set(s, running=1)  # B admitted
+            IC.check_admission_wedge_once(s, now=110.0)
+            self.assertIsNone(s._wedge_stuck_since)
+            _set(s, queued=1, running=0)  # B done, C queued: a new entry, a new clock
+            self.assertFalse(IC.check_admission_wedge_once(s, now=150.0)[0])
+            self.assertEqual(s._wedge_stuck_since, 150.0)
+
+    def test_real_wedge_after_a_ends_is_still_found_20s_after_its_first_poll(self):
+        s = _sched(first_token=0.0, running=1)
+        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
+            IC.check_admission_wedge_once(s, now=0.0)
+            _set(s, queued=1, running=0)
+            out = [IC.check_admission_wedge_once(s, now=t)[0] for t in (110.0, 120.0, 129.0, 131.0, 200.0, 400.0)]
+        self.assertEqual(out, [False, False, False, True, True, True])
+
+    def test_livelock_is_judged_by_the_busy_floor_not_the_stuck_stamp(self):
+        def run(on):
+            s = _sched(first_token=0.0, queued=2, running=3, decode=5.0)
+            with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
+                got = [
+                    "PREFILL-LIVELOCK" in IC.check_admission_wedge_once(s, now=t)[1]
+                    for t in (0.0, 10.0, 24.0, 26.0, 40.0)
+                ]
+                return got, getattr(s, "_wedge_stuck_since", None)
+
+        (on_polls, on_stuck), (off_polls, _) = run(True), run(False)
+        self.assertEqual(on_polls, off_polls)
+        self.assertEqual(on_polls, [False, False, False, True, True])
+        self.assertIsNone(on_stuck)
+
+    def test_off_nothing_is_stamped(self):
+        s = _sched(first_token=0.0, queued=1)
+        IC.check_admission_wedge_once(s, now=100.0)
+        self.assertFalse(hasattr(s, "_wedge_stuck_since"))
+
+    def test_recovery_driver_counts_from_the_stuck_stamp_too(self):
+        from sglang.srt.managers.wedge_recovery import RECOVERY_CHANNEL_ATTR
+
+        s = _sched(first_token=time.perf_counter() - 100.0, queued=1)
+        s._wedge_busy_since = time.perf_counter() - 100.0  # A's start: old
+        s._wedge_stuck_since = time.perf_counter() - 1.0  # the state is 1 s old
+        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True), envs.SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS.override(5.0):
+            IC.AdmissionWedgeRecovery(s, clock=lambda: 1000.0).step(True)
+        self.assertIsNone(getattr(s, RECOVERY_CHANNEL_ATTR, None))
+
+
 if __name__ == "__main__":
     unittest.main()
