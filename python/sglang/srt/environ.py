@@ -788,6 +788,15 @@ class Envs:
     # possible (P held while a lend is open), so this is its own observed boot.
     # Default off = front env byte for byte as before.
     SGLANG_WEG2_DUAL_FRONT_KV_TAG_FIX = EnvBool(False)
+    # #1956 WAKE-SEES-LOAN (f9 rc12z30y9f9, 05.10. 05:18:02Z, PP1 W-DUAL-P-WAKE-SHORT): dual FRONT only (the P-stage
+    # ladder). DEFAULT OFF = the old code path byte for byte. The front's wake from sleep is guarded per card by
+    # card_room (free >= that card's loan + one P step + D's look-ahead); without the env tag (#1495) the front read no
+    # stage file, card_room was None and the fallback 'free_min >= weights+grant+air' compared against 0+0+0 -> P woke
+    # the instant a D seat ended, while D's waiting group grant had taken 178782208 B of PP1's 3235905536 B sleep loan.
+    # On: card_room is built from the stage files under the front's own --tag as well (like #1480), a wake from sleep
+    # needs card_room (blind = P stays asleep, one named line) and the sleep leg's RPC answered (the loan is published
+    # at its end). No reserve, no D brake: D may grow into the loan; P returns only once the card has it free again.
+    SGLANG_WEG2_DUAL_WAKE_SEES_LOAN = EnvBool(False)
     # #1540 D-SIGNAL-SEATS (dual front, default off): d_signal (D's id-space / Mamba-arena reading,
     # dual_d_priority.d_signal_short) counts as pressure only while D really has work that needs the
     # rows -- a live seat (front._d_seats_live) or a leg-1-done request waiting for one

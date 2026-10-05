@@ -15440,7 +15440,42 @@ class Front:
             except ValueError:
                 after = _ddp.SLEEP_AFTER_TICKS_DEFAULT
             st = self._dual_stages_obj = _ddp.PressureStages(_ddp.p_sleep_capable(), after)
+            # #1956 WAKE-SEES-LOAN (default off: the attribute stays False, the old wake)
+            st.wake_needs_room = bool(envs.SGLANG_WEG2_DUAL_WAKE_SEES_LOAN.get())
         return st
+
+    def _dual_wake_room_stages(self, stages: list) -> list:
+        """#1956 WAKE-SEES-LOAN: the P stage files the per-card return check reads.
+        The env-tag reading when it found every P rank; else every rank's file under
+        the front's own --tag or the env tag (the ranks write under the boot's tag,
+        launcher.py dual_share_env; the front env has none without #1495). [] when
+        any rank has no readable file -- the caller then has no card_room and a
+        guarded wake holds."""
+        import json
+
+        from sglang.srt.weg2 import dual_p_kv_stage as _pk
+
+        if len(stages) >= _pk.LEND_GATE_RANKS:
+            return stages
+        tags: List[str] = []
+        for t in (str(getattr(self, "tag", "") or ""),
+                  os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")):
+            if t and t not in tags:
+                tags.append(t)
+        out = []
+        for r in range(_pk.LEND_GATE_RANKS):
+            got = None
+            for tag in tags:
+                try:
+                    with open(_pk.stage_file(tag, r)) as f:
+                        got = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                break
+            if not isinstance(got, dict):
+                return []
+            out.append(got)
+        return out
 
     def _dual_p_stage_reading(self) -> dict:
         """One reading of the cards and of P's stage tables: P's committed bytes
@@ -15509,7 +15544,10 @@ class Front:
         # the wake from sleep, PER CARD: that card's free against its loan + one P
         # grant step + D's look-ahead, each priced in that stage's own bytes/token
         card_room = []
-        for t in stages:
+        card_stages = stages
+        if envs.SGLANG_WEG2_DUAL_WAKE_SEES_LOAN.get():
+            card_stages = self._dual_wake_room_stages(stages)
+        for t in card_stages:
             st = peek(str(t.get("ledger", "")))
             if st is None:
                 card_room = None
@@ -15518,6 +15556,10 @@ class Front:
             step_b = int(b[1]) if len(b) > 1 else 0
             tok_b = step_b / max(1, int(t.get("step") or 1))
             card_room.append((int(st.free), int(t.get("lent") or 0) + step_b + int(air_tok * tok_b)))
+        if card_stages and not stages:
+            # #1956 WAKE-SEES-LOAN: the env tag found no stage file, the front's own tag did --
+            # the per-card return check reads those (grant/air/weights above stay the old reading)
+            stages = card_stages
         if envs.SGLANG_WEG2_DUAL_LEND_RESUME_GATE.get():
             lent = self._dual_lend_gate_lent(lent)
         return {"p_committed": committed, "free_min": int(free or 0), "p_grant_bytes": grant,
@@ -15691,6 +15733,10 @@ class Front:
             self.do_stop("W-DUAL-P-SLEEP Weg2DualPSleepRefused",
                          f"P's sleep leg {n} failed HTTP {code}: {body[:400]!r} -- VRAM state undefined")
             return
+        st = getattr(self, "_dual_stages_obj", None)
+        if st is not None:
+            # #1956: every P rank published its sleep loan (sleep_lend) before the leg answered
+            st.sleep_leg_done = True
         logger.warning("WEG2 DUAL-KV-PRESSURE stage=2 p_state=sleeping leg=%d tags=%d done", n, len(tags))
 
     async def _dual_p_lend(self, action: str, why: str = "") -> None:

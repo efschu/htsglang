@@ -378,6 +378,11 @@ class PressureStages:
         self._said = set()
         self.counts = {"stage1": 0, "lend": 0, "stage2": 0, "reclaim": 0, "resume": 0, "wake": 0,
                        "unavailable": 0, "refused": 0}
+        #: #1956 WAKE-SEES-LOAN (SGLANG_WEG2_DUAL_WAKE_SEES_LOAN, set by the front; default
+        #: False = the old wake): a wake from sleep needs the per-card reading and the
+        #: sleep leg's answer (the front sets ``sleep_leg_done`` once the release RPC is 200)
+        self.wake_needs_room = False
+        self.sleep_leg_done = True
 
     def _line(self, stage: str, d_need: int, freed: int, extra: str = "") -> str:
         return "%s stage=%s d_need=%d freed=%d p_state=%s%s" % (LINE, stage, int(d_need), int(freed),
@@ -445,6 +450,8 @@ class PressureStages:
                     return None, None
                 self.p_state = "sleeping"
                 self._seat_mark = int(seats_done)
+                if self.wake_needs_room:
+                    self.sleep_leg_done = False
                 self.counts["stage2"] += 1
                 return "sleep", self._line("2", pressure, int(weights_bytes))
             self._held = 0
@@ -475,6 +482,19 @@ class PressureStages:
                 return "reclaim", self._line("1-reclaim", 0, free_min, " retry")
             return None, None
         # sleeping
+        if self.wake_needs_room:
+            # #1956 WAKE-SEES-LOAN: the loan is per card (f9 PP1: 3235905536 B lent, D's waiting
+            # group grant took 178782208 B of it). Without that card's reading the total
+            # fallback below compares free_min against weights+grant+air, all 0 when the front
+            # reads no stage file -- P stays asleep instead (D shrinks at its seat ends).
+            if not self.sleep_leg_done:
+                return None, None
+            if card_room is None:
+                if "wake_blind" not in self._said:
+                    self._said.add("wake_blind")
+                    return None, self._line("resume", 0, free_min, " held=blind -- #1956 WAKE-SEES-LOAN: no "
+                                            "per-card loan reading, P stays asleep")
+                return None, None
         room_ok = self._room(card_room, free_min, int(weights_bytes) + int(p_grant_bytes) + int(d_air_bytes))
         if pressure <= 0 and int(seats_done) > self._seat_mark and room_ok:
             self.p_state = "serving"
