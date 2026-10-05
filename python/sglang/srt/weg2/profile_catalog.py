@@ -448,9 +448,123 @@ def _refusals_module():
 # ---------------------------------------------------------------------------
 # merge
 
-def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, Mapping], tree_rev: str = "",
-                  server_args_path: str = "", edges_path: str = "", edges_root: str = "",
-                  erklaert: Optional[Mapping[str, Mapping]] = None) -> Dict[str, object]:
+# ---------------------------------------------------------------------------
+# os.environ consumers (names the code reads without an ``Envs`` field)
+
+_RX_SGL_NAME = re.compile(r"^SGLANG_[A-Z0-9_]+$")
+#: how many reading places an entry lists
+MAX_READS = 8
+
+
+def _default_text(node: Optional[ast.AST]) -> Optional[str]:
+    """The literal default of an ``os.environ.get(NAME, default)`` call as the catalog writes it (strings in double quotes), else None."""
+    if node is None:
+        return None
+    try:
+        v = ast.literal_eval(node)
+    except Exception:       # noqa: BLE001
+        return None
+    return '"%s"' % v if isinstance(v, str) else str(v)
+
+
+def _is_os_environ(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "environ" and isinstance(node.value, ast.Name) and node.value.id == "os"
+
+
+def _file_consumers(tree: ast.AST) -> Tuple[Dict[str, Tuple[str, int]], List[Tuple[str, int, Optional[str]]]]:
+    """(``{constant name: (SGLANG_X, line)}``, ``[(SGLANG_X, line, default)]``) of one parsed file: constants named ``*ENV*`` that hold an
+    ``SGLANG_`` name, and ``os.environ.get`` / ``os.getenv`` / ``os.environ[...]`` reads whose first argument is such a literal or constant."""
+    consts: Dict[str, Tuple[str, int]] = {}
+    for node in ast.walk(tree):
+        tgt = val = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            tgt, val = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            tgt, val = node.target, node.value
+        if (isinstance(tgt, ast.Name) and "ENV" in tgt.id and isinstance(val, ast.Constant)
+                and isinstance(val.value, str) and _RX_SGL_NAME.match(val.value)):
+            consts[tgt.id] = (val.value, node.lineno)
+
+    def resolve(arg: ast.AST) -> Optional[str]:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value if _RX_SGL_NAME.match(arg.value) else None
+        if isinstance(arg, ast.Name) and arg.id in consts:
+            return consts[arg.id][0]
+        return None
+
+    reads: List[Tuple[str, int, Optional[str]]] = []
+    used: Dict[str, int] = {}        # a constant that the code USES (through a helper, a comparison ...) is a consumer too
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in consts:
+            used.setdefault(node.id, node.lineno)
+        if isinstance(node, ast.Call) and node.args:
+            f = node.func
+            # ``env.get(NAME_ENV, "1")`` through a local alias of os.environ is an env read only when the key is one of the
+            # ``*ENV*`` constants; a bare literal key needs ``os.environ`` itself (any other dict has ``.get`` too)
+            key_is_const = isinstance(node.args[0], ast.Name) and node.args[0].id in consts
+            is_get = isinstance(f, ast.Attribute) and ((f.attr == "get" and (_is_os_environ(f.value) or key_is_const)) or
+                                                       (f.attr == "getenv" and isinstance(f.value, ast.Name) and f.value.id == "os"))
+            name = resolve(node.args[0]) if is_get else None
+            if name:
+                reads.append((name, node.lineno, _default_text(node.args[1] if len(node.args) > 1 else None)))
+        elif isinstance(node, ast.Subscript) and _is_os_environ(node.value):
+            name = resolve(node.slice)
+            if name:
+                reads.append((name, node.lineno, None))
+    reads.extend((consts[c][0], ln, None) for c, ln in used.items())
+    return consts, reads
+
+
+def environ_constants(srt_dir: str) -> Dict[str, Dict[str, object]]:
+    """``SGLANG_X`` -> ``{default, comment, file, line, reads}`` for every name the code under ``srt_dir`` reads through ``os.environ`` or
+    names in a ``*ENV*`` constant.  ``file``/``line`` = the first reading place (else the constant); ``default`` = the first literal default
+    of a read; ``comment`` = the ``#`` lines directly above the constant (else above the first read).  Nothing is guessed: a name that no
+    code consumes is not listed, and no text is made up from the name."""
+    out: Dict[str, Dict[str, object]] = {}
+    decl: Dict[str, str] = {}        # name -> the comment above its ``*ENV*`` constant
+    for root, dirs, files in os.walk(srt_dir):
+        dirs[:] = sorted(d for d in dirs if d not in ("tests", "__pycache__"))
+        for fn in sorted(files):
+            if not fn.endswith(".py") or fn.startswith("test_"):
+                continue
+            path = os.path.join(root, fn)
+            rel = os.path.relpath(path, srt_dir).replace(os.sep, "/")
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    src = fh.read()
+                tree = ast.parse(src, path)
+            except (OSError, SyntaxError, ValueError):
+                continue
+            lines = src.splitlines()
+            consts, reads = _file_consumers(tree)
+
+            def comment_above(line: int) -> str:
+                j, com = line - 2, []
+                while j >= 0 and lines[j].strip().startswith("#"):
+                    com.append(lines[j].strip().lstrip("#").lstrip(":").strip())     # ``#:`` = Sphinx doc comment
+                    j -= 1
+                return _clean(" ".join(reversed(com)))
+
+            for name, line, dflt in reads:
+                e = out.setdefault(name, {"default": None, "comment": "", "file": rel, "line": line, "reads": []})
+                place = "%s:%d" % (rel, line)
+                if len(e["reads"]) < MAX_READS and place not in e["reads"]:
+                    e["reads"].append(place)
+                if e["default"] is None and dflt is not None:
+                    e["default"] = dflt
+            for _cname, (name, line) in consts.items():
+                decl.setdefault(name, comment_above(line))
+    for name, e in out.items():
+        e["comment"] = decl.get(name, "") or e["comment"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# the catalog
+
+def _harvest(launcher_path: str, environ_path: str, server_args_path: str = "", srt_dir: str = "") -> Dict[str, Dict[str, object]]:
+    """The harvested entries of ONE tree (flags of the launcher and ServerArgs, ``Envs`` fields, and with ``srt_dir`` the names read through
+    ``os.environ``), before any curated text or edge is applied."""
     flags = launcher_flags(launcher_path)
     envs = environ_fields(environ_path)
     entries: Dict[str, Dict[str, object]] = {}
@@ -478,6 +592,21 @@ def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, M
                          "group": "", "planner_derived": False,
                          "source": {"file": "environ.py", "line": r["line"], "kind": "environ"}, "help": txt,
                          "status": "geerntet" if txt else "unerklaert"}
+    if srt_dir and os.path.isdir(srt_dir):
+        for name, r in environ_constants(srt_dir).items():
+            if name in entries:
+                continue        # declared in environ.py: that record stays
+            entries[name] = {"id": name, "kind": "env", "name": name, "type": "os.environ", "default": r["default"], "choices": None,
+                             "bare": False, "nargs": None, "text": "", "gain": "", "cost": "", "depends": [], "level": "experte",
+                             "group": "", "planner_derived": False,
+                             "source": {"file": r["file"], "line": r["line"], "kind": "os.environ"}, "lesestellen": r["reads"],
+                             "help": r["comment"], "status": "geerntet" if r["comment"] else "unerklaert"}
+    return entries
+
+
+def _finish(entries: Dict[str, Dict[str, object]], curated: Mapping[str, Mapping], erklaert: Optional[Mapping[str, Mapping]],
+            tree_rev: str, launcher_path: str, edges_path: str, edges_root: str) -> Dict[str, object]:
+    """Curated and explained texts, the edge catalog, statistics and the wiring statement on top of harvested ``entries`` (in place)."""
     # ``erklaert`` = one-sentence texts written from the code's consumers (``profile_catalog_curated.ERKLAERT``), status
     # "erklaert"; ``curated`` (the hand-curated core) is applied after it and wins on a name clash, status "kuratiert".
     for name, c, stat in [(n, c, "erklaert") for n, c in (erklaert or {}).items()] + [(n, c, "kuratiert") for n, c in curated.items()]:
@@ -507,6 +636,55 @@ def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, M
     return cat
 
 
+def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, Mapping], tree_rev: str = "",
+                  server_args_path: str = "", edges_path: str = "", edges_root: str = "",
+                  erklaert: Optional[Mapping[str, Mapping]] = None, srt_dir: str = "") -> Dict[str, object]:
+    """The catalog of ONE tree.  ``srt_dir`` (optional) also harvests the names the code reads through ``os.environ``."""
+    entries = _harvest(launcher_path, environ_path, server_args_path, srt_dir)
+    return _finish(entries, curated, erklaert, tree_rev, launcher_path, edges_path, edges_root)
+
+
+def _differs(a: Mapping, b: Mapping) -> bool:
+    return str(a.get("default")) != str(b.get("default")) or str(a.get("help") or "") != str(b.get("help") or "")
+
+
+def build_union_catalog(trees: Sequence[Tuple[str, str]], curated: Mapping[str, Mapping], tree_revs: Optional[Mapping[str, str]] = None,
+                        edges_path: str = "", edges_root: str = "", erklaert: Optional[Mapping[str, Mapping]] = None) -> Dict[str, object]:
+    """ONE catalog over several code trees (the release image carries two: the 27B and the NF line).  ``trees`` = ``[(label, python_dir)]`` in
+    priority order: the first tree that has a name gives its record.  Every entry gets ``baeume`` (the labels of the trees that have it); when
+    the trees disagree on default or help text, ``abweichung`` carries each tree's own values.  Edges, refusal wiring and the curated texts
+    come once, from the FIRST tree's launcher (``edges_root`` resolves the edges' evidence lines)."""
+    if not trees:
+        raise ValueError("build_union_catalog: no trees")
+    union: Dict[str, Dict[str, object]] = {}
+    per_tree: Dict[str, Dict[str, Dict[str, object]]] = {}
+    first_launcher = ""
+    for label, py in trees:
+        launcher, environ, sargs = find_tree_files(py)
+        first_launcher = first_launcher or launcher
+        ents = _harvest(launcher, environ, sargs, os.path.join(py, "sglang", "srt"))
+        per_tree[label] = ents
+        for name, e in ents.items():
+            if name not in union:
+                # ``source.baum``: which tree the file:line belongs to (a name in both trees shows the first tree's place)
+                union[name] = dict(e, baeume=[label], source=dict(e["source"], baum=label))
+            else:
+                union[name]["baeume"].append(label)
+    for name, e in union.items():
+        have = [(lb, per_tree[lb][name]) for lb in e["baeume"]]
+        if len(have) > 1 and any(_differs(have[0][1], o) for _lb, o in have[1:]):
+            e["abweichung"] = {lb: {"default": o.get("default"), "help": o.get("help"), "source": o.get("source")} for lb, o in have}
+    revs = dict(tree_revs or {})
+    cat = _finish(union, curated, erklaert, "+".join("%s=%s" % (lb, revs.get(lb, "")) for lb, _p in trees), first_launcher, edges_path,
+                  edges_root)
+    labels = [lb for lb, _p in trees]
+    cat["trees"] = {lb: {"rev": revs.get(lb, ""), "python_dir": py, "entries": len(per_tree[lb])} for lb, py in trees}
+    cat["stats"]["baeume"] = {"nur_" + lb: sum(1 for e in union.values() if e.get("baeume") == [lb]) for lb in labels}
+    cat["stats"]["baeume"]["beide"] = sum(1 for e in union.values() if len(e.get("baeume", [])) == len(labels) > 1)
+    cat["stats"]["baeume"]["abweichung"] = sum(1 for e in union.values() if "abweichung" in e)
+    return cat
+
+
 def coverage(entries: Mapping[str, Mapping]) -> Dict[str, int]:
     n = len(entries)
     return {"entries": n, "kuratiert": sum(1 for e in entries.values() if e["status"] == "kuratiert"),
@@ -528,18 +706,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     import importlib.util
 
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--python-dir", default="", help="<tree>/python (launcher.py and environ.py are read from it)")
+    ap.add_argument("--python-dir", default="", help="<tree>/python (launcher.py and environ.py are read from it); ONE tree")
     ap.add_argument("--rev", default="")
+    ap.add_argument("--tree-27b", default="", help="<tree>/python of the 27B line; with --tree-nf the catalog covers BOTH trees")
+    ap.add_argument("--tree-nf", default="", help="<tree>/python of the NF line")
+    ap.add_argument("--rev-27b", default="")
+    ap.add_argument("--rev-nf", default="")
     ap.add_argument("-o", "--out", default="")
     ns = ap.parse_args(argv)
+    if bool(ns.tree_27b) != bool(ns.tree_nf):
+        ap.error("--tree-27b and --tree-nf come together (one tree: --python-dir)")
+    if ns.tree_27b and ns.python_dir:
+        ap.error("--python-dir and --tree-27b/--tree-nf exclude each other")
     here = os.path.dirname(os.path.abspath(__file__))
     py = ns.python_dir or os.path.abspath(os.path.join(here, "..", "..", ".."))
     spec = importlib.util.spec_from_file_location("profile_catalog_curated", os.path.join(here, "profile_catalog_curated.py"))
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    launcher, environ, sargs = find_tree_files(py)
-    cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs, erklaert=mod.ERKLAERT)
+    if ns.tree_27b:
+        cat = build_union_catalog([("27b", ns.tree_27b), ("nf", ns.tree_nf)], mod.CURATED, {"27b": ns.rev_27b, "nf": ns.rev_nf},
+                                  erklaert=mod.ERKLAERT)
+    else:
+        launcher, environ, sargs = find_tree_files(py)
+        cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs, erklaert=mod.ERKLAERT, srt_dir=os.path.join(py, "sglang", "srt"))
     text = json.dumps(cat, indent=1, sort_keys=True, ensure_ascii=False, default=str) + "\n"
     if ns.out:
         with open(ns.out, "w", encoding="utf-8") as fh:
@@ -548,6 +738,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sys.stdout.write(text)
     st = cat["stats"]
     print("catalog: %(entries)d entries (%(flags)d flags, %(envs)d envs): %(kuratiert)d kuratiert, %(erklaert)d erklaert, %(geerntet)d geerntet, %(unerklaert)d unerklaert" % st, file=sys.stderr)
+    if "baeume" in st:
+        print("trees: %s" % ", ".join("%s=%s" % kv for kv in sorted(st["baeume"].items())), file=sys.stderr)
     return 0
 
 
