@@ -290,6 +290,56 @@ touches no group. A long prompt prefills on P while D keeps decoding; the finish
 * **KV-pressure fix.** An earlier dual boot (`…fs10020008`, `9d50005b75`) died under KV pressure (`W-DUAL-D-RETRACT` on every D rank). The image tree must carry the fix
   (`aba948545a`, `c0fd8ecbca`, `4a632a3a94`, all ancestors of the release candidate `bd2e3bc22d`); the dual acceptance fails if the line appears again.
 
+### 4.2 Your own profile: the profile editor, `FLLIPER_PROFILE=<name>`, `FLLIPER_FORCE=1`
+
+> Status (2026-10-05, prepared in the repository, **not built into an image yet, never booted from a JSON profile on the metal**). The
+> editor service exists only in images built with `RIGDASH_REV` (package at `/opt/htsglang/rigdash`); a boot over a JSON profile and a
+> forced boot are still to be measured (`deskq/done/1995-editor-docker.md`).
+
+The shipped profiles are rig profiles (§4). To run your own form without writing a `.env` by hand, the image carries the **profile editor**
+(`rigdash --edition release --editor-only`, port **30081**): it builds a profile as JSON (`flliper.server/1`), shows the hardware profile and
+the per-card memory bars, runs a dry run against the planner, and **starts nothing**. It does not measure hardware (that needs the rig's GPU
+window service and is shut in the release edition) and it has **no authentication**: publish it on loopback only, or put your own
+authenticating reverse proxy in front and set `FLLIPER_RIGDASH_TRUST_PROXY=1` (without it the editor answers `403` to anything that carries
+an `X-Forwarded-*` header). It writes to the state volume.
+
+```bash
+# 1. the editor alone: no server. --gpus all only lets it READ your cards through NVML (no CUDA context, nothing is started on them);
+#    without it you can still edit, but the hardware view, the memory bars and the card-count checks of the dry run have no cards to work with
+docker run --rm --name flliper-editor --gpus all \
+  -p 127.0.0.1:30081:30081 \
+  -v flliper-state:/var/lib/flliper \
+  -v /your/models-cache:/spinning/llm_stuff/club-3090/models-cache:ro \
+  -e MODE=editor \
+  ghcr.io/efschu/htsglang:<tag>
+# open http://127.0.0.1:30081/ , tab "Profile", build and save a profile, e.g. "my-27b"  ->  /var/lib/flliper/profiles/my-27b.json
+
+# 2. boot it: the same volume, FLLIPER_PROFILE names the JSON file (no release profile of that name may exist)
+docker run -d --name htsglang-mine  <the flags of §3.3>  \
+  -v flliper-state:/var/lib/flliper \
+  -e MODE=weg2 -e FLLIPER_PROFILE=my-27b \
+  ghcr.io/efschu/htsglang:<tag> serve
+```
+
+* **Where profiles live.** `FLLIPER_PROFILES_DIR` (default `/var/lib/flliper/profiles`) is ONE place for the editor and the entrypoint. A
+  profile is a release profile (`<profiles>/<name>.env`, shipped, unchanged) or, if none has that name, `<name>.json` there.
+* **How it boots.** The JSON's `line` (`27b` | `nf`) picks the code state of the image; the entrypoint renders it with
+  `profile_json render` into `/tmp/htsglang/user-profile-<name>.env` and boots exactly like the `.env` path (same argv and environment;
+  pinned by `test_entrypoint_profil_force_930` on the repository side, not yet on the metal).
+* **The editor runs next to the server** too (default on when the package is in the image, like the user dashboard; `FLLIPER_RIGDASH=0` turns
+  it off). It checks profiles against **one** planner tree: the code state of the profile family that booted, or with `MODE=editor` the 27B
+  tree (`FLLIPER_RIGDASH_LINE=nf` for the Flash-Next tree). Other knobs: `FLLIPER_RIGDASH_PORT` (default 30081), `FLLIPER_RIGDASH_BIND`,
+  `FLLIPER_RIGDASH_MODEL_ROOTS=/a:/b` (where the editor may read model `config.json` heads for the estimate). Memory: the editor is
+  stdlib Python; its coupling worker (the planner in the image's Python) held about 600 MiB RSS after its first call on the rig (not yet
+  measured inside the container), so count roughly 0.8 GiB on top of the server when you use the bars.
+* **`PROFILE_STATUS=experimentell`** (a user profile that no one has accepted) runs **only** with `FLLIPER_FORCE=1` (code `PROFIL-STATUS`).
+* **`FLLIPER_FORCE=1` — what it does and does not.** It passes the *value* refusals (capacity, thresholds, proof status, calibration) and
+  lists every one it passed in the log as `FORCED-PAST <CODE> <reason>`. It does **not** pass physical facts: an occupied card, a missing
+  model, a broken file, an unsupported architecture stay hard refusals. It records nothing, and nothing it passes is measured, so a forced
+  boot is *your* experiment. **Honestly, the Flash-Next line wires only 3 of the 6 force codes** (`HW-COUNT`, `HW-UNCALIBRATED`,
+  `HOST-MEM`); the other refusals on that line (D budget, wake credit, P card, topology) still stop the boot even with `FLLIPER_FORCE=1`. The
+  27B release candidate wires all six. There is no force switch in the editor: forcing is only a flag at container start.
+
 ---
 
 ## 5. Transports: barlink BAR1 (default) and NCCL
@@ -347,6 +397,7 @@ the launcher behaves byte-identically to before.
 | `SGLANG_WEG2_STORE_ROOT` | `/var/lib/htsglang/hicache-weg2` | `/spinning/hicache-weg2` | the HiCache file store (disk, up to 150 GB, 32 GiB kept free) |
 | `SGLANG_WEG2_VENV` | `/opt/venv` | `/spinning/htsglang-gpu/.venv` | the environment both groups run in |
 | `SGLANG_WEG2_TMS_OUT_DIR` | `/opt/htsglang/tms` | `$GPU_ARB/weg2/tms` | torch-memory-saver preload |
+| `FLLIPER_PROFILES_DIR` | `/var/lib/flliper/profiles` | — | your own profiles (JSON); written by the editor (§4.2), read by the entrypoint |
 
 Mount evidence, arb and store as volumes: the launcher calibrates from its own earlier boots, so a fresh
 container starts from the seeded reference values and improves with its own history.
@@ -410,6 +461,9 @@ quality claim needs a graded comparison with a same-arm A-vs-A pair. A metric wi
   and there is no recorded needle result for it. The prefill-graph calibration table belongs to the flip cut 49,8,7 and does not apply to the dual cut 45,10,9 (the launcher falls back to
   the uncalibrated policy; no abort).
 * Profiles are calibrated on one machine. On other hardware the preflight refuses rather than guesses.
+* The profile editor (§4.2) is prepared, not built: no image carries it yet, no boot has run over a JSON profile or with `FLLIPER_FORCE=1`
+  on the metal, the editor has no authentication, and its hardware view in a container (NVML read plus whatever probe cache the volume holds, no
+  measuring service) has not been run in an image.
 * Co-location (duplicate `--rank-gpu-id`) is refused with the NCCL this image ships (§2).
 * Multi-node is a direction, not a feature.
 

@@ -476,6 +476,10 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
   .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .kpi .v { font-size: 22px; }
 }
+/* Auftrag 1995 (Docker-Image, server.py --editor-only): nur der Reiter Profil; die Seite liest nichts vom Rig */
+html[data-editor-only="1"] #tabbar, html[data-editor-only="1"] .chips, html[data-editor-only="1"] .livebox,
+html[data-editor-only="1"] header nav, html[data-editor-only="1"] #sub { display: none !important; }
+html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
 </style>
 </head>
 <body>
@@ -657,6 +661,7 @@ const $ = (id) => document.getElementById(id);
 // dort fehlt der untere Teil ganz (der Server liefert die DEV-Blöcke nicht aus)
 const EDITION = document.documentElement.dataset.edition || "rig";
 const DEV = !!document.getElementById("dev-head");
+const EDITOR_ONLY = document.documentElement.dataset.editorOnly === "1";     // Auftrag 1995: Docker-Image, nur der Profil-Editor
 const PAGE_TITLE = EDITION === "release" ? "fLLiper Dashboard" : "Rig-Dashboard";
 document.getElementById("title").textContent = PAGE_TITLE;
 // DASHBOARD-AUS-IPC (Nutzer 29.09.): what still comes from a log line says so; the rest names its IPC source
@@ -1998,6 +2003,7 @@ try {
   const h = (location.hash.match(/t=([a-z]+)/) || [])[1];
   curTab = TABS.includes(h) ? h : (TABS.includes(localStorage.getItem("rigdash.tab")) ? localStorage.getItem("rigdash.tab") : "ueberblick");
 } catch (e) { curTab = "ueberblick"; }
+if (EDITOR_ONLY) curTab = "profil";
 const lastHtml = {};
 // a section whose new HTML equals the drawn one is not touched (no layout, no flicker)
 function put(id, html) {
@@ -2023,7 +2029,7 @@ function setTab(t, fromHash) {
   refresh(true);
 }
 document.querySelectorAll("#tabbar button[data-tab]").forEach((b) => { b.onclick = () => setTab(b.dataset.tab); });
-window.addEventListener("hashchange", () => { const h = (location.hash.match(/t=([a-z]+)/) || [])[1]; if (h && h !== curTab) setTab(h, true); });
+window.addEventListener("hashchange", () => { if (EDITOR_ONLY) return; const h = (location.hash.match(/t=([a-z]+)/) || [])[1]; if (h && h !== curTab) setTab(h, true); });
 let expert = false;
 try { expert = localStorage.getItem("rigdash.expert") === "1"; } catch (e) { expert = false; }
 document.body.classList.toggle("expert", expert);
@@ -2186,6 +2192,7 @@ let failures = 0, inflight = false, refreshAgain = false, devTick = 0, devData =
 // the zoomed stretch a request was made for: an answer for another stretch is never drawn
 const zoomKey = () => { const z = window.RigZoom && RigZoom.get(); return z ? `${z[0].toFixed(3)},${z[1].toFixed(3)}` : ""; };
 async function refresh(force) {
+  if (EDITOR_ONLY) return;       // kein /api/live im Editor-Image: der Server antwortet es nicht
   const why = force ? "" : pauseReason();
   $("pausenote").textContent = why;
   if (why) return;

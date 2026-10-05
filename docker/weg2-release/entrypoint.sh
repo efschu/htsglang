@@ -51,7 +51,8 @@ umask 022
 _ep_log() { printf '[htsglang-weg2 %s] %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
 EP_NAMES_NEW=()
 EP_PRODUCT_NAMES=(PROFILE LINE STAND TREE MODE INSTRUMENTS JIT_MAX_JOBS ALLOW_EXPERIMENTAL EXPECT_GPUS MEMAVAIL_MIN_GIB
-                  FORMAT_CHECK TRANSPORT USERDASH USERDASH_PORT USERDASH_BIND FORCE PROFILES_DIR)
+                  FORMAT_CHECK TRANSPORT USERDASH USERDASH_PORT USERDASH_BIND FORCE PROFILES_DIR
+                  RIGDASH RIGDASH_PORT RIGDASH_BIND RIGDASH_LINE RIGDASH_TRUST_PROXY RIGDASH_MODEL_ROOTS)
 ep_name() {   # ep_name <SUFFIX> [NEUER_NAME]: FLLIPER_<SUFFIX> (bzw. NEUER_NAME) -> HTSGLANG_<SUFFIX>
   local old=HTSGLANG_$1 new=${2:-FLLIPER_$1}
   [ -n "${!new+x}" ] || return 0
@@ -148,6 +149,25 @@ ep_cache_link() {   # preflight: der andere Cache-Name zeigt auf das Volume -- n
   else _ep_log "WARN ENTRYPOINT paths: symlink $from -> $to failed -- a tree reading $from does not see the volume"; fi
 }
 # <<< ENTRYPOINT-NAMES
+
+# Auftrag 1995 (Nutzer-Entscheid 05.10.: Profil-Editor ins Release): MODE=editor = nur der Profil-Editor (rigdash --edition release
+# --editor-only) im Vordergrund, kein Server, keine GPU. Er schreibt Nutzerprofile (JSON) nach $FLLIPER_PROFILES_DIR
+# (Standard /var/lib/flliper/profiles); danach startet FLLIPER_PROFILE=<name> mit MODE=weg2 genau dieses Profil.
+# Das Paket liegt nur in Images, die mit RIGDASH_REV gebaut wurden (/opt/htsglang/rigdash).
+# Test-Haken (nur fuer den hermetischen Test test_rigdash_editor_1995.sh): RIGDASH_DIR, RIGDASH_HOME (statt /opt/htsglang/rigdash, /opt/htsglang).
+if [ "${MODE:-}" = "editor" ]; then
+  ep_resolve_product_names
+  RIGDASH_DIR=${RIGDASH_DIR:-/opt/htsglang/rigdash}
+  if [ ! -f "$RIGDASH_DIR/entrypoint_rigdash.sh" ]; then
+    printf '[htsglang-editor %s] REFUSED EDITOR: dieses Image traegt den Profil-Editor nicht (%s fehlt; Bau mit RIGDASH_REV)\n' "$(date -u +%H:%M:%SZ)" "$RIGDASH_DIR" >&2
+    exit 3
+  fi
+  PY=${SGLANG_WEG2_VENV:-/opt/venv}/bin/python
+  HOME_DIR=${RIGDASH_HOME:-/opt/htsglang}; PROFILE_DIR=$HOME_DIR/profiles; FRONT_PORT=30030
+  : "${HTSGLANG_PROFILES_DIR:=/var/lib/flliper/profiles}"
+  export PY HOME_DIR PROFILE_DIR FRONT_PORT HTSGLANG_PROFILES_DIR RIGDASH_DIR
+  exec "$RIGDASH_DIR/entrypoint_rigdash.sh" "$@"
+fi
 
 # fLLiper (RENAME_PLAN 8.13 Schritt 1, FL5 26.09.): MODE=pdflip ist derselbe Modus wie MODE=weg2.
 if [ "${MODE:-server}" != "weg2" ] && [ "${MODE:-server}" != "pdflip" ]; then
@@ -890,6 +910,7 @@ teardown() {
   say "TEARDOWN ($1)"
   [ -n "$LPID" ] && kill -TERM "$LPID" 2>/dev/null && sleep 2
   if declare -F userdash_stop >/dev/null; then userdash_stop; fi   # userdash (USERDASH-DELTA-1001)
+  if declare -F rigdash_stop >/dev/null; then rigdash_stop; fi     # rigdash Editor (Auftrag 1995)
   if [ -f "$STATE" ]; then
     "$PY" -m "$LAUNCHER_MOD" --tree "$TREE" --tag "$HTSGLANG_TAG" --teardown "$STATE" \
       >> "$LOGCOPY/teardown.log" 2>&1 || say "teardown rc=$? (siehe $LOGCOPY/teardown.log)"
@@ -903,6 +924,10 @@ trap 'teardown SIGTERM; exit 0' TERM INT
 # userdash (Nutzer-Order 01.10. ~12:55Z, USERDASH-DELTA-1001.md): nur wenn das Image es traegt (/opt/htsglang/userdash,
 # Bau mit USERDASH_REV) und HTSGLANG_USERDASH/FLLIPER_USERDASH nicht 0 ist; nur lesend gegen :$FRONT_PORT.
 if [ -f /opt/htsglang/userdash/entrypoint_userdash.sh ]; then . /opt/htsglang/userdash/entrypoint_userdash.sh && userdash_start; fi
+# rigdash Profil-Editor (Auftrag 1995, Nutzer-Entscheid 05.10.): nur wenn das Image das Paket traegt (Bau mit RIGDASH_REV) und
+# HTSGLANG_RIGDASH/FLLIPER_RIGDASH nicht 0 ist; Port 30081, kein Zugriffsschutz (README: -p 127.0.0.1:30081:30081). Der Planer-Baum ist
+# der Stand der gestarteten Profilfamilie ($STAND). Scheitert er, bootet der Server trotzdem.
+if [ -f /opt/htsglang/rigdash/entrypoint_rigdash.sh ]; then . /opt/htsglang/rigdash/entrypoint_rigdash.sh && rigdash_start; fi
 say "LAUNCH: $PY ${LAUNCH[*]} $*"
 "$PY" "${LAUNCH[@]}" "$@" > >(tee -a "$LOGCOPY/launcher.log") 2>&1 &
 LPID=$!

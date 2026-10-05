@@ -276,6 +276,9 @@ class App:
         self.t0 = time.time()
         self.version = _version()
         self.edition = getattr(args, "edition", "rig") or "rig"
+        # Auftrag 1995 (Release-Image): reiner Profil-Editor ohne Messquellen; Proxy-Schalter fuer Betreiber hinter eigenem Reverse-Proxy
+        self.editor_only = bool(getattr(args, "editor_only", False))
+        self.trust_proxy = bool(getattr(args, "trust_proxy", False))
         # Nutzer-Order 01.10. ~07:40Z: rigdash liest die Zeitreihen per PromQL aus VictoriaMetrics
         self.vm = vmpush.VmClient(args.vm_url) if getattr(args, "vm_url", "") else None
         self.vm_boot_cache: dict = {}         # stem -> (fetched_t, vmpush.boot_rates) of finished boots
@@ -316,6 +319,8 @@ class App:
             stop.wait(5.0)
 
     def start(self):
+        if self.editor_only:        # kein Probennehmer, keine Quellen, kein Verlauf: der Editor liest nichts vom Rig
+            return
         loops = [(self.boots.run_forever, "rigdash-ipcboots")]
         if self.sup is None:
             loops += [(self.src.run_forever, "rigdash-sources"), (self.energy_loop, "rigdash-energy")]
@@ -469,7 +474,7 @@ DEV_BEGIN, DEV_END = "<!--DEV:BEGIN-->", "<!--DEV:END-->"
 RELEASE_DROP_KEYS = ("features", "image_changes", "gpuq")
 
 
-def edition_page(html: str, edition: str) -> str:
+def edition_page(html: str, edition: str, editor_only: bool = False) -> str:
     """The page for one edition (Nutzer 30.09.: "im veröffentlichten fLLiper dashboard soll natürlich
     der untere entwicklungsstanddashboard leer sein oder fehlen").  ``rig`` = unchanged.  ``release``
     = every ``<!--DEV:BEGIN-->…<!--DEV:END-->`` block cut out -- no empty shell, the ids are not in
@@ -488,7 +493,8 @@ def edition_page(html: str, edition: str) -> str:
         out.append(html[i:a])
         i = b + len(DEV_END)
     page = "".join(out)
-    return (page.replace('<html lang="de">', '<html lang="de" data-edition="release">', 1)
+    # Auftrag 1995: im Docker-Image laeuft die Release-Ausgabe als reiner Profil-Editor (--editor-only): die Seite zeigt nur den Reiter Profil
+    return (page.replace('<html lang="de">', '<html lang="de" data-edition="release"%s>' % (' data-editor-only="1"' if editor_only else ""), 1)
                 .replace("<title>Rig-Dashboard</title>", "<title>fLLiper Dashboard</title>", 1)
                 .replace('<h1 id="title">Rig-Dashboard</h1>', '<h1 id="title">fLLiper Dashboard</h1>', 1))
 
@@ -540,6 +546,10 @@ def make_handler(app: App):
             self._send(code, redact.guard(json.dumps(obj, default=str)), "application/json")
 
         def _via_proxy(self) -> bool:
+            # --trust-proxy (nur Release, Auftrag 1995): der Betreiber sitzt selbst hinter einem Reverse-Proxy und will den Editor darueber;
+            # die Rig-Ausgabe kennt den Schalter nicht (main() verweigert ihn dort)
+            if getattr(app, "trust_proxy", False):
+                return False
             # the public reverse proxy (LXC 208 nginx, https://efeu.ddnss.de/rigdash/) sets these
             return bool(self.headers.get("X-Forwarded-Prefix") or self.headers.get("X-Forwarded-For"))
 
@@ -661,14 +671,29 @@ def make_handler(app: App):
             return self._send(404, "not found", "text/plain")
 
 
+        def _editor_only_allows(self, method, path) -> bool:
+            """--editor-only (Auftrag 1995): nur die Seite, ihre Module, Gesundheit und die drei Editor-Routengruppen; alles andere 404."""
+            if path in ("/", "/index.html", "/healthz", "/logo.svg", "/logo-dark.svg", "/mark.svg", "/favicon.svg"):
+                return method == "GET"
+            if path in STATIC_FILES:
+                return method == "GET"
+            if path.startswith("/api/profil/") or path.startswith("/api/modellprofil/") or path.startswith("/api/hwprofil"):
+                return True
+            return False
+
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             try:
+                if getattr(app, "editor_only", False) and not self._editor_only_allows("GET", path):
+                    return self._send(404, "not found", "text/plain")
+                if path == "/healthz":
+                    return self._json({"ok": True, "version": app.version, "edition": app.edition, "editor_only": getattr(app, "editor_only", False),
+                                       "uptime_s": round(time.time() - getattr(app, "t0", time.time()), 1)})
                 if path == "/api/hwprofil":
                     return self._hwprofil("GET")
                 if path in ("/", "/index.html"):
                     with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
-                        return self._send(200, edition_page(fh.read(), app.edition), "text/html; charset=utf-8")
+                        return self._send(200, edition_page(fh.read(), app.edition, getattr(app, "editor_only", False)), "text/html; charset=utf-8")
                 if path == "/api/live":
                     series = "noseries" not in self.path
                     zoom = parse_zoom(self.path)
@@ -775,6 +800,8 @@ def make_handler(app: App):
                 # den Körper zuerst lesen (nie ungelesen schließen: das Ende mit ungelesenen Bytes wird ein TCP-RST, der die Antwort verschluckt)
                 n = max(0, int(self.headers.get("Content-Length") or 0))
                 raw = self.rfile.read(min(n, MAX_POST_DRAIN)) if n > 0 else b""
+                if getattr(app, "editor_only", False) and not self._editor_only_allows("POST", path):
+                    return self._send(404, "not found", "text/plain")
                 if path == "/api/modellprofil/schaetzen":
                     # PROFIL-EDITOR S3: Modellpfad -> flliper.model/1.  Liest config.json und Köpfe unter den Modellwurzeln: nur im LAN (auch im Release).
                     if self._via_proxy():
@@ -855,7 +882,15 @@ def main(argv=None):
                     help="rig = with the development state (Soll/Ist, Bausteine, Startflags, Sitze ...); "
                          "release = the published fLLiper edition: speed, efficiency, statistics only "
                          "(env RIGDASH_EDITION)")
+    ap.add_argument("--editor-only", action="store_true", default=os.environ.get("RIGDASH_EDITOR_ONLY") == "1",
+                    help="Auftrag 1995 (Docker-Image): nur der Profil-Editor -- kein Probennehmer, keine Messquellen, /api/live und alle uebrigen "
+                         "Routen 404, die Seite zeigt nur den Reiter Profil; nur mit --edition release (env RIGDASH_EDITOR_ONLY=1)")
+    ap.add_argument("--trust-proxy", action="store_true", default=os.environ.get("RIGDASH_TRUST_PROXY") == "1",
+                    help="Auftrag 1995: der Betreiber sitzt selbst hinter einem Reverse-Proxy (X-Forwarded-*): der Editor antwortet dann auch darueber "
+                         "statt 403. Kein Zugriffsschutz -- der Proxy muss anmelden. Nur mit --edition release (env RIGDASH_TRUST_PROXY=1)")
     args = ap.parse_args(argv)
+    if (args.editor_only or args.trust_proxy) and args.edition != "release":
+        ap.error("--editor-only und --trust-proxy gibt es nur mit --edition release (die Rig-Ausgabe bleibt LAN-only mit ihrem Proxy-Riegel)")
     app = App(args)
     app.start()
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(app))
