@@ -587,6 +587,20 @@ def _arena_census() -> Tuple[int, int]:
     return 0, 0
 
 
+def _arena_pinned() -> Optional[int]:
+    """#1976: the PINNED slots (a reader reference keeps them from eviction) of the arena ``_arena_census``
+    reads; None without one (the front then keeps the old COMPLETE reading)."""
+    from sglang.srt.weg2 import handoff_pending as _hp
+
+    pools = [p for p in (r() for r in list(_hp._POOLS)) if p is not None and getattr(p, "arena", None) is not None]
+    pools.sort(key=lambda p: getattr(p, _hp.ROLE_ATTR, "kv") != "anchor")
+    for pool in pools:
+        arena = pool.arena
+        if hasattr(arena, "ref_census"):
+            return int(arena.ref_census()[0])
+    return None
+
+
 def _arena_fill() -> float:
     """COMPLETE slots / slots of the arena ``_arena_census`` reads (0.0 without one); log field only."""
     try:
@@ -615,8 +629,19 @@ def publish_d_signal(sched, actor) -> None:
         used = size - (int(actor.allocator.available_size()) + evictable)
         complete, slots = _arena_census()
         tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
+        # #1976 D-SIGNAL-LOCKED: the locked rows (mapped - available - evictable = d_locked_rows) over the
+        # id space, and the pinned arena slots -- published always, read by the front only under the env
+        try:
+            locked_frac = float(d_locked_rows(sched, actor)) / max(1, size)
+        except Exception:  # noqa: BLE001 -- no locked reading: the front keeps the old id_frac
+            locked_frac = None
+        try:
+            pinned = _arena_pinned()
+        except Exception:  # noqa: BLE001 -- no pinned reading: the front keeps the old COMPLETE reading
+            pinned = None
         _ddp.publish_d_signal(_ddp.d_signal_file(tag), id_frac=used / max(1, size), arena_complete=complete,
-                              arena_slots=slots, now=time.time())
+                              arena_slots=slots, now=time.time(), locked_frac=locked_frac,
+                              arena_pinned=pinned)
     except Exception as exc:  # noqa: BLE001 -- the front then sees no D signal: the ledger demand still counts
         logger.info("%s D-SIGNAL not published: %r", MARK, exc)
 

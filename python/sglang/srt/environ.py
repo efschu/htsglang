@@ -821,6 +821,15 @@ class Envs:
     # On: no live seat and nothing waiting for one -> d_signal contributes 0 (ledger bytes unchanged).
     # Default off = byte for byte as before.
     SGLANG_WEG2_DUAL_D_SIGNAL_SEATS = EnvBool(False)
+    # #1976 D-SIGNAL-LOCKED (dual front, default off): d_signal reads D's LOCKED rows (mapped - available -
+    # evictable, over the 1M-row id space) and the Mamba arena's PINNED slots instead of the table fill
+    # (id_space = size - available - evictable, which counts the rows D never mapped; arena = COMPLETE
+    # slots, a full cache). f11 (fs10050941) 10:00-10:14Z: id_space 0.91-1.00 and arena 111-112/112 in every
+    # tick, so each D seat (56 of 67 stage-1 events within 1 s of a D-ADMIT) stopped P with d_need = one P
+    # grant step (92274688 B = 4096 tok x 22528 B) while no card was short; 10 P-PAUSE of the 262k leg, 69 %
+    # of the wall clock P asleep (stage 2). On: the front takes locked_frac / arena_pinned from D's published
+    # reading (an older D without them: the old fields). Off = byte for byte as before.
+    SGLANG_WEG2_DUAL_D_SIGNAL_LOCKED = EnvBool(False)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,

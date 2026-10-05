@@ -247,23 +247,44 @@ def d_id_threshold(env=None) -> float:
 
 
 def d_signal_short(sig: Optional[dict], *, now: float, unit: int, id_threshold: float = D_SIGNAL_ID_DEFAULT,
-                   arena_margin: int = D_SIGNAL_ARENA_MARGIN) -> Tuple[int, str]:
+                   arena_margin: int = D_SIGNAL_ARENA_MARGIN, locked: bool = False) -> Tuple[int, str]:
     """D's published reading -> (pressure bytes, why). ``unit``: the bytes one
     reason counts as (one P grant step, so stage 1 sees real pressure); 0 when
-    D is not short or the reading is missing/stale."""
+    D is not short or the reading is missing/stale.
+
+    ``locked`` (#1976 D-SIGNAL-LOCKED, dual front, default off = the readings above byte for byte):
+    read what D can NOT give back instead of how full the tables look. Metal f11 (fs10050941, front log
+    10:00-10:14Z): D's 1M-row id space reads 0.91-1.00 (``used = size - available - evictable`` counts
+    the rows D never mapped -- 'full token usage 0.98' with one running request) and the Mamba arena
+    reads 111-112/112 COMPLETE slots (a full cache, 4-18 of them pinned): both stood above the thresholds
+    in EVERY tick, so every D seat (56 of 67 stage-1 events within 1 s of a D-ADMIT) stopped P with
+    d_need = one P grant step (92274688 B) while no card was short. ``locked_frac`` = D's locked rows
+    (mapped - available - evictable) / size, ``arena_pinned`` = the slots a reader reference keeps from
+    eviction. A reading without those keys (an older D) falls back to the old fields: the danger direction
+    of this switch is P running while D is short, and a missing field never mutes."""
     if not sig:
         return 0, ""
     try:
         if float(now) - float(sig.get("ts", 0.0)) > D_SIGNAL_MAX_AGE_S:
             return 0, ""
         why = []
-        frac = float(sig.get("id_frac", 0.0) or 0.0)
-        if frac >= float(id_threshold):
-            why.append("id_space=%.2f" % frac)
+        if locked and sig.get("locked_frac") is not None:
+            frac = float(sig.get("locked_frac") or 0.0)
+            if frac >= float(id_threshold):
+                why.append("id_locked=%.2f" % frac)
+        else:
+            frac = float(sig.get("id_frac", 0.0) or 0.0)
+            if frac >= float(id_threshold):
+                why.append("id_space=%.2f" % frac)
         slots = int(sig.get("arena_slots", 0) or 0)
-        complete = int(sig.get("arena_complete", 0) or 0)
-        if slots > 0 and complete >= slots - int(arena_margin):
-            why.append("arena=%d/%d" % (complete, slots))
+        if locked and sig.get("arena_pinned") is not None:
+            pinned = int(sig.get("arena_pinned") or 0)
+            if slots > 0 and pinned >= slots - int(arena_margin):
+                why.append("arena_pinned=%d/%d" % (pinned, slots))
+        else:
+            complete = int(sig.get("arena_complete", 0) or 0)
+            if slots > 0 and complete >= slots - int(arena_margin):
+                why.append("arena=%d/%d" % (complete, slots))
     except (TypeError, ValueError):
         return 0, ""
     return (max(1, int(unit)), ",".join(why)) if why else (0, "")
@@ -278,13 +299,21 @@ def d_signal_seat_gate(sig_short: int, sig_why: str, *, d_has_seats: bool, armed
     return sig_short, sig_why
 
 
-def publish_d_signal(path: str, *, id_frac: float, arena_complete: int, arena_slots: int, now: float) -> None:
+def publish_d_signal(path: str, *, id_frac: float, arena_complete: int, arena_slots: int, now: float,
+                     locked_frac: Optional[float] = None, arena_pinned: Optional[int] = None) -> None:
     import json
 
     tmp = "%s.%d.tmp" % (path, os.getpid())
+    doc = {"ts": float(now), "id_frac": float(id_frac), "arena_complete": int(arena_complete),
+           "arena_slots": int(arena_slots)}
+    # #1976 D-SIGNAL-LOCKED: the two readings the front uses when SGLANG_WEG2_DUAL_D_SIGNAL_LOCKED is on
+    # (instrument fields only: without the env the front never reads them, the old keys are unchanged)
+    if locked_frac is not None:
+        doc["locked_frac"] = float(locked_frac)
+    if arena_pinned is not None:
+        doc["arena_pinned"] = int(arena_pinned)
     with open(tmp, "w") as f:
-        json.dump({"ts": float(now), "id_frac": float(id_frac), "arena_complete": int(arena_complete),
-                   "arena_slots": int(arena_slots)}, f)
+        json.dump(doc, f)
     os.replace(tmp, path)
 
 

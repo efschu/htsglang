@@ -15564,7 +15564,8 @@ class Front:
         from sglang.srt.weg2 import dual_d_priority as _ddp
 
         sig_short, sig_why = _ddp.d_signal_short(_ddp.read_d_signal(_ddp.d_signal_file(tag)), now=time.time(),
-                                                 unit=grant, id_threshold=_ddp.d_id_threshold())
+                                                 unit=grant, id_threshold=_ddp.d_id_threshold(),
+                                                 locked=bool(envs.SGLANG_WEG2_DUAL_D_SIGNAL_LOCKED.get()))
         if envs.SGLANG_WEG2_DUAL_D_SIGNAL_SEATS.get() and sig_why:
             # #1540: a standing id-space/arena reading with no D seat and nothing waiting for one is not
             # D's pressure (B9e: P slept and never woke). One front process, so the answer is the same for
