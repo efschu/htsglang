@@ -1189,6 +1189,38 @@ def _admission_wedge_recovery_threshold() -> float:
     return ADMISSION_WEDGE_RECOVERY_SECONDS
 
 
+def _wedge_queue_clock_armed() -> bool:
+    """deskq 1981: SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK on AND the dual layout (default off = pre-fix verdict).
+    Never raises: a bad value reads as off."""
+    try:
+        return bool(envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.get()) and (
+            str(os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() == "1"
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _wedge_progress_age(scheduler, now: float, queued: int) -> float:
+    """Seconds since progress as the verdict reads it.
+
+    Off: ``now - last_first_token_progress_time`` (the pre-fix number). Armed (deskq 1981): never older than the
+    time the waiting_queue has been non-empty as the poll saw it. The stamp is taken by the first poll that finds
+    the queue non-empty (so it is at most one poll late: a real wedge alarms one poll later, never earlier) and
+    dropped when the queue is empty again. A queue that stays non-empty with no first token keeps aging, so a
+    genuine stand (queued, 0 running, nothing for a long time) still alarms."""
+    age = now - scheduler.last_first_token_progress_time
+    if not _wedge_queue_clock_armed():
+        return age
+    since = getattr(scheduler, "_wedge_queue_since", None)
+    if queued <= 0:
+        if since is not None:
+            scheduler._wedge_queue_since = None
+        return age
+    if since is None:
+        since = scheduler._wedge_queue_since = now
+    return min(age, max(0.0, now - since))
+
+
 def check_admission_wedge_once(
     scheduler: Scheduler,
     now: Optional[float] = None,
@@ -1215,7 +1247,7 @@ def check_admission_wedge_once(
     now = now if now is not None else time.perf_counter()
     queued = len(scheduler.waiting_queue)
     running = len(scheduler.running_batch.reqs)
-    age = now - scheduler.last_first_token_progress_time
+    age = _wedge_progress_age(scheduler, now, queued)
     # #739: absent on an older scheduler -> None -> the pre-#739 verdict.
     prefill_stamp = getattr(scheduler, "last_prefill_progress_time", None)
     seconds_since_prefill_progress = (
@@ -1233,6 +1265,8 @@ def check_admission_wedge_once(
         f"(perf_counter={scheduler.last_first_token_progress_time:.1f}): "
         f"{verdict_detail}"
     )
+    if _wedge_queue_clock_armed():
+        detail += " [QUEUE-CLOCK: age = min(first-token age, queue non-empty age)]"
     # #739: SAY WHICH OF THE TWO WEDGES THIS IS.
     #
     # The predicate above is true of a dead pipeline AND of a busy one whose
@@ -1250,6 +1284,12 @@ def check_admission_wedge_once(
         if stamp is None:
             stamp = (now, fwd_now)
             scheduler._wedge_class_sample = stamp
+            if _wedge_queue_clock_armed():
+                # deskq 1981: a new alarm window starts without the previous window's recovery outcome, so the
+                # CLASS line of this window never quotes the last window's state (it said NOT_APPLICABLE long after)
+                _ch = getattr(scheduler, RECOVERY_CHANNEL_ATTR, None)
+                if _ch is not None and getattr(_ch, "last_outcome", None) is not None:
+                    _ch.last_outcome = None
         # Q-696 (dual layout, group P only): a P that waits for a CARD grant is
         # its own class -- named, and the recovery driver posts no corridor relief
         pkv = _dual_p_kv_wait_class(scheduler)
@@ -1441,6 +1481,11 @@ class AdmissionWedgeRecovery:
             return None
         threshold = _admission_wedge_recovery_threshold()
         age = time.perf_counter() - self._scheduler.last_first_token_progress_time
+        if _wedge_queue_clock_armed():
+            # deskq 1981: the same age the verdict used (the queue's own age, not D's last-token age)
+            _since = getattr(self._scheduler, "_wedge_queue_since", None)
+            if _since is not None:
+                age = min(age, max(0.0, time.perf_counter() - _since))
         if age < threshold:
             return None
         now = self._clock()

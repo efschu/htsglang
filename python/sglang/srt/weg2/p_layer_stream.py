@@ -52,6 +52,7 @@ import dataclasses
 import logging
 import os
 import re
+import time
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -357,6 +358,10 @@ class LayerStreamer:
         self._images: Dict[int, List[Tuple[object, object, object]]] = {}
         self._staged: Dict[int, Tuple[List[object], object]] = {}
         self._order: List[int] = []
+        #: deskq 1982 V0 (instrument only, never read by any decision): ms spent in pinned_exact_empty / host.copy_
+        #: of the current stream_out, and tag -> perf_counter stamp of its OUT (for the OUT->REGAIN age)
+        self._img_ms = [0.0, 0.0]
+        self._out_t: Dict[str, float] = {}
         self.counters = {"out": 0, "regain": 0, "staged": 0, "staged_late": 0, "swapped": 0, "waited": 0,
                          "peak_live_sets": 0, "peak_live_bytes": 0}
         layer_bytes = {}
@@ -394,10 +399,16 @@ class LayerStreamer:
         if self._pin:
             from sglang.srt.layers.moe.expert_offload import pinned_exact_empty   # page-locked at its exact size
 
+            _t0 = time.perf_counter()
             host = pinned_exact_empty(tuple(t.size()), t.dtype)
+            self._img_ms[0] += (time.perf_counter() - _t0) * 1000.0
         else:
+            _t0 = time.perf_counter()
             host = torch.empty(tuple(t.size()), dtype=t.dtype, device="cpu")
+            self._img_ms[0] += (time.perf_counter() - _t0) * 1000.0
+        _t1 = time.perf_counter()
         host.copy_(t)
+        self._img_ms[1] += (time.perf_counter() - _t1) * 1000.0
         return host
 
     def stream_out(self, tags: Sequence[str]) -> int:
@@ -409,18 +420,25 @@ class LayerStreamer:
             u = self._by_tag.get(tag)
             if u is None or tag in self.freed:
                 continue
+            _p0 = time.perf_counter()
             self._sync()
+            _p1 = time.perf_counter()
+            self._img_ms[0] = self._img_ms[1] = 0.0
             images = {li: [(t, t.data, self._image(t)) for t in ts] for li, ts in u.tensors.items()}
+            _p2 = time.perf_counter()
             self._sync()
+            _p3 = time.perf_counter()
             # the instrument is THIS process's own mapped bytes of the tag (no D noise on the shared card); only
             # without it the device free delta, capped at the unit's pool (D freeing meanwhile cannot inflate it)
             m0 = self._tag_mapped(tag) if self._tag_mapped is not None else None
             before = self._phys_free() if (self._phys_free is not None and m0 is None) else None
+            _p4 = time.perf_counter()
             _ACTING[0] = True
             try:
                 self._pause(tag)
             finally:
                 _ACTING[0] = False
+            _p5 = time.perf_counter()
             m1 = self._tag_mapped(tag) if m0 is not None else None
             after = self._phys_free() if before is not None else None
             if m0 is not None and m1 is not None:
@@ -446,9 +464,14 @@ class LayerStreamer:
             self._order = sorted(self._images)
             self.counters["out"] += 1
             total += freed
+            self._out_t[tag] = _p5
             logger.warning("%s OUT tag=%s layers=%s freed=%d B (pool %d B) -- PP0 streams these layers' tensors "
-                           "per forward from host, prefetch=%d", MARK, tag, list(u.layers), freed, u.nbytes,
-                           self.prefetch)
+                           "per forward from host, prefetch=%d "
+                           "[ms: sync_pre=%.1f pin=%.1f copy=%.1f images=%.1f sync_post=%.1f tms_pause=%.1f "
+                           "out_total=%.1f]", MARK, tag, list(u.layers), freed, u.nbytes,
+                           self.prefetch, (_p1 - _p0) * 1000.0, self._img_ms[0], self._img_ms[1],
+                           (_p2 - _p1) * 1000.0, (_p3 - _p2) * 1000.0, (_p5 - _p4) * 1000.0,
+                           (_p5 - _p0) * 1000.0)
         if total:
             self._prime()
         return total
@@ -459,13 +482,16 @@ class LayerStreamer:
         if tag not in self.freed:
             return 0
         u = self._by_tag[tag]
+        _r0 = time.perf_counter()
         self.release_ring()
         mine = {id(t) for ts in u.tensors.values() for t in ts}
+        _r0b = time.perf_counter()
         _ACTING[0] = True
         try:
             self._resume(tag)
         finally:
             _ACTING[0] = False
+        _r1 = time.perf_counter()
         # the content comes from OUR host image, never from the saver's backup alone (a weights-resident
         # profile pauses without one): copy back, then point the tensors at their storage again
         done = set()
@@ -475,6 +501,7 @@ class LayerStreamer:
                     orig.copy_(host)
                     done.add(id(t))
         self._sync()
+        _r2 = time.perf_counter()
         for li in u.tensors:
             for t, orig, _h in self._images.get(li, ()):
                 if id(t) in mine:
@@ -492,8 +519,13 @@ class LayerStreamer:
         if not self.freed:
             self.levels_streamed.clear()
         self.counters["regain"] += 1
-        logger.warning("%s REGAIN tag=%s layers=%s %d B -- resident again (graphs valid: same VA)", MARK, tag,
-                       list(u.layers), n)
+        _r3 = time.perf_counter()
+        _o = self._out_t.pop(tag, None)
+        logger.warning("%s REGAIN tag=%s layers=%s %d B -- resident again (graphs valid: same VA) "
+                       "[ms: release_ring=%.1f tms_resume=%.1f h2d_sync=%.1f regain_total=%.1f out_to_regain_s=%s]",
+                       MARK, tag, list(u.layers), n, (_r0b - _r0) * 1000.0,
+                       (_r1 - _r0b) * 1000.0, (_r2 - _r1) * 1000.0, (_r3 - _r0) * 1000.0,
+                       "n/a" if _o is None else "%.1f" % (_r0 - _o))
         return n
 
     # -- per forward ---------------------------------------------------------

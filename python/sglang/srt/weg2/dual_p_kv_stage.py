@@ -838,11 +838,21 @@ def floor_overtake_head(older, stages, own: int, tag: str) -> Optional[str]:
 
 
 def _infeasible_line(rid: str, tokens: int, level_tokens: int, cards: list) -> str:
-    """'#1640 GRANT-INFEASIBLE' body: per short card the bytes asked and the pool (free + P + D)."""
-    return "rid=%s tokens=%d level_tokens=%d cards=[%s]: the grant stays short even with D at zero (only a falling level frees it)" % (
+    """'#1640 GRANT-INFEASIBLE' body: per short card the bytes asked and the pool (free + P + D).
+
+    Text only (deskq 1977): ``tokens`` is the GRANT-SUM of the prompts of this request and every other request
+    holding a stage (``pp0_grant`` / ``live_grant_tokens``), NOT this request's own prompt; ``level_tokens`` is
+    min(sum, top). The verdict (``infeasible_cards``) compares need with have + D and leaves out ``P`` -- the
+    follower pre-charge of grants just taken, which comes back when the follower adopts (about 1 s). When P
+    closes the gap on every listed card the line says 'waits for the return', not 'only a falling level frees it'."""
+    waits_p = bool(cards) and all(have + p + d >= need for _i, need, have, p, d in cards)
+    why = ("the grant waits for the return of the followers' pre-charge of just-taken grants (P covers the gap; "
+           "it frees on adoption, not by a falling level)" if waits_p else
+           "the grant stays short even with D at zero and P returned (only a falling level or a lower grant sum frees it)")
+    return "rid=%s tokens=%d(GRANT-SUM of all held prompts, not this prompt) level_tokens=%d cards=[%s]: %s" % (
         rid, int(tokens), int(level_tokens),
         " ".join("%d:need=%d,pool=%d,have=%d,P=%d,D=%d" % (i, need, have + p + d, have, p, d)
-                 for i, need, have, p, d in cards))
+                 for i, need, have, p, d in cards), why)
 
 
 def _grant_short_detail(stages, covered, level_tokens: int, sum_tokens: int, older: int, hold) -> str:
