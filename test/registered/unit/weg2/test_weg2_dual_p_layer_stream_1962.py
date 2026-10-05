@@ -204,6 +204,14 @@ class StreamSameOutputs(_Base):
         st.stream_out(["weights_0"])
         torch.testing.assert_close(_fwd(m, x), ref)
 
+    def test_swap_under_inference_mode(self):
+        m, x, ref, units, saver, st = self._setup()
+        st.stream_out(["weights_1", "weights_0"])
+        with torch.inference_mode():                         # the serving forward's mode
+            out = _fwd(m, x)
+        torch.testing.assert_close(out, ref)
+        self.assertFalse(m.layers[3].weight.is_inference(), "the parameter never took an inference tensor")
+
     def test_regain_restores_and_unforces(self):
         m, x, ref, units, saver, st = self._setup()
         st.stream_out(["weights_1", "weights_0"])

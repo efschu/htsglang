@@ -538,6 +538,13 @@ class LayerStreamer:
         self._make_room()
         torch = self._torch
         imgs = self._images[li]
+        # the forward runs under inference_mode; a staged copy made there would be an INFERENCE tensor, which
+        # a normal parameter's .data cannot take -- staged copies are ordinary tensors
+        with torch.inference_mode(False):
+            self._stage_into(li, imgs)
+
+    def _stage_into(self, li: int, imgs) -> None:
+        torch = self._torch
         if self._cuda:
             with torch.cuda.stream(self._side):
                 devs = []
@@ -582,16 +589,18 @@ class LayerStreamer:
             cur.wait_event(ev)
             for d in devs:
                 d.record_stream(cur)
-        for (t, _orig, _h), d in zip(self._images[li], devs):
-            t.data = d
+        with self._torch.inference_mode(False):
+            for (t, _orig, _h), d in zip(self._images[li], devs):
+                t.data = d
         self._executing[li] = (devs, self._set_bytes(devs))
         self.counters["swapped"] += 1
         self._ahead(li)
 
     def post_layer(self, li: int) -> None:
         rows = self._images.get(li, ())
-        for t, orig, _h in rows:
-            t.data = orig
+        with self._torch.inference_mode(False):
+            for t, orig, _h in rows:
+                t.data = orig
         got = self._executing.pop(li, None)
         if got is None:
             return
