@@ -231,7 +231,6 @@ test/registered/unit/managers/test_pp_presence_futile_wait_850.py	PARALLEL	solo_
 test/registered/unit/managers/test_pp_presence_stash_on_real_wire_800.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	3b29058313dc43b9	
 test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py	PARALLEL	solo_equals_serial	881563b75486a3af	
 test/registered/unit/managers/test_pp_progress_exit_677.py	PARALLEL	solo_equals_serial	a3938985e54ac20f	
-test/registered/unit/managers/test_pp_proxy_cross_epoch_mispair_795.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	ffb5924affbf9dcd	
 test/registered/unit/managers/test_pp_proxy_readiness_contract_789.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	0b93d601eeddbb95	
 test/registered/unit/managers/test_pp_proxy_readiness_rendezvous_789.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	97672c13c37c386b	
 test/registered/unit/managers/test_pp_proxy_retracted_pass_mispair_791c.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	641b08fadf14dd3e	
