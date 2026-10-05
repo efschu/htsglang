@@ -185,4 +185,4 @@ def test_the_d_solve_is_told_the_seats_and_the_main_resolves_the_nf_default():
     i = src.index("replayssm_spec=d_replayssm_spec_plan_form(ns),")
     assert "seats=d_stated_seats(ns)," in src[i:i + 600]
     j = src.index("    ns = build_parser().parse_args(")  # FL6: the argv goes through _canonical_flags
-    assert "apply_profile_d_bs_default(ns," in src[j:j + 600]  # FL6 state-dir link sits before it
+    assert "apply_profile_d_bs_default(ns," in src[j:j + 800]  # FL6 state-dir link + HW-P1a set_card_selection sit before it

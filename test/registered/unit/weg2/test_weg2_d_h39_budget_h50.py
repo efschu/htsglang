@@ -281,6 +281,7 @@ def _launcher_ns(tmp_path, scratch0, h39=None):
         env += ";SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=%d" % int(h39)
     return types.SimpleNamespace(
         model=str(tmp_path / MODEL),
+        profile="qwen27b",  # Q-694: the extend-rate reader takes ns.profile (the launcher's default --profile row)
         extra_d="--rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
                 "--rank-moe-resident-fraction 0.06,0.51,0.48",
         env_d=env, extra_p="", env_p="SGLANG_MOE_SCRATCH_SLOTS=32",

@@ -231,6 +231,7 @@ def _launcher_ns(tmp_path, fractions):
     (tmp_path / MODEL / "config.json").write_text(json.dumps(cfg))
     return types.SimpleNamespace(
         model=str(tmp_path / MODEL),
+        profile="qwen27b",  # Q-694: the extend-rate reader takes ns.profile (the launcher's default --profile row)
         extra_d=(
             "--rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
             "--rank-moe-resident-fraction " + fractions
