@@ -164,18 +164,75 @@ def pick_foreign_victim(candidates: Iterable[OwnedAnchor], *, rid: str) -> Optio
     return min(pool, key=lambda a: (a.depth, a.rid))
 
 
-def tree_anchors(*, root, anchor_of: Callable[[object], tuple]) -> list:
+def tree_anchors(*, root, anchor_of: Callable[[object], tuple],
+                 include_untagged: bool = False) -> list:
     """Every tagged arena anchor of the tree (BFS, token depths) -- only on
-    the FULL path of a request without an anchor of its own to give."""
+    the FULL path of a request without an anchor of its own to give.
+    ``include_untagged`` (PARK-END-ANCHOR-FIRST) also returns the anchors no
+    request owns (rid ``""``): the ones a D tree holds."""
     out = []
     queue = [(c, len(c.key)) for c in root.children.values()]
     while queue:
         n, depth = queue.pop()
         queue.extend((c, depth + len(c.key)) for c in n.children.values())
-        if n.weg2_anchor_rid is None:
+        if n.weg2_anchor_rid is None and not include_untagged:
             continue
         held, slots = anchor_of(n)
         if held:
-            out.append(OwnedAnchor(node=n, depth=depth, rid=n.weg2_anchor_rid,
+            out.append(OwnedAnchor(node=n, depth=depth, rid=n.weg2_anchor_rid or "",
                                    slots=None if slots is None else tuple(slots)))
     return out
+
+
+# ---------------------------------------------------------------------------
+# PARK-END-ANCHOR-FIRST (NF y9nf4 1004_031945, 03:33:18, auftrag 1303)
+# ---------------------------------------------------------------------------
+#
+# D's sleep at epoch 8 found the mamba anchor arena full (32 slots, 6 staging)
+# of anchors nobody could release: ``#1427 ARENA-CLAIM REFUSED statuses=[4]``
+# x8, ``#1421 BACKUP-REFUSED why=mamba_claim`` on the chain nodes of the parked
+# weg2-8-79 / weg2-8-82 (rid=None: a D tree's nodes carry no writer), the
+# children ``parent_unbacked``, ``FLUSH-SPILL ... victim=none`` and
+# ``WEG2-ANCHOR-LOST at=flush n=20`` incl. the park END anchors 49408 / 76032.
+# The H19 rules never offer an untagged anchor (a D tree's anchors are all
+# untagged), so the flush spill found no victim.
+#
+# The park's chain (every ancestor-or-self of the node a parked request's
+# retraction ended at) outranks the anchors without park reference: its claim
+# may spill one of those -- secured to L3 first, as every flush spill is --
+# and the END node of the chain may also take a park-chain intermediate
+# (shallowest first). Nothing outside a park is touched: no node carries the
+# park mark, no chain exists, no rule below applies.
+
+#: set by ``park_running`` on every request it retracts: the finish insert of
+#: such a request marks the node it ended at (``weg2_park_end``).
+PARK_REQ_ATTR = "_weg2_park_end_req"
+
+
+def park_chain_ids(end_nodes: Iterable[object]) -> set:
+    """``id()`` of every node on the root path (self included) of the marked
+    park END nodes. A node that left the tree (no parent) is skipped."""
+    out: set = set()
+    for end in end_nodes:
+        n = end
+        while n is not None and getattr(n, "parent", None) is not None:
+            if id(n) in out:
+                break
+            out.add(id(n))
+            n = n.parent
+    return out
+
+
+def pick_park_victim(candidates: Iterable[OwnedAnchor], *, chain_ids: set, claimer_is_end: bool):
+    """The anchor a park-chain claim may spill: a releasable one OFF the park
+    chain, shallowest first (node id breaks the tie: the ranks' trees are
+    replicas); for the END node of the chain, with none off the chain, the
+    shallowest releasable park-chain INTERMEDIATE (never another END node).
+    None = nothing may be spilled."""
+    pool = [a for a in candidates if a.slots is not None]
+    off = [a for a in pool if id(a.node) not in chain_ids]
+    if not off and claimer_is_end:
+        off = [a for a in pool if not getattr(a.node, "weg2_park_end", False)]
+    if not off:
+        return None
+    return min(off, key=lambda a: (a.depth, getattr(a.node, "id", 0)))
