@@ -73,7 +73,7 @@ _NOPLAN_SAID: set = set()
 
 def armed(env: Optional[Mapping[str, str]] = None) -> bool:
     e = os.environ if env is None else env
-    if str(e.get(ENV, "") or "").strip().lower() not in ("1", "true", "on"):
+    if str(e.get(ENV, "") or "").strip().lower() not in ("1", "true", "yes", "y"):   # EnvBool's own set
         return False
     if str(e.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip() != "1":
         return False
@@ -192,13 +192,19 @@ def _on_device(t) -> bool:
 
 def catalog(named_modules: Iterable[Tuple[str, object]],
             segments: Mapping[str, Sequence[Mapping]],
-            is_device: Callable[[object], bool] = _on_device) -> Tuple[List[StreamUnit], Dict[str, str]]:
+            is_device: Callable[[object], bool] = _on_device,
+            forbidden: Mapping[int, str] = None) -> Tuple[List[StreamUnit], Dict[str, str]]:
     """Units from the tag pools' live blocks and the tensors found on modules.
 
     ``segments``: tag -> the pool's snapshot segments (``address``,
     ``total_size``, ``blocks`` with ``size``/``state`` and optionally
-    ``address``). Returns (streamable units ordered tail-first, {tag: refusal}).
+    ``address``). ``forbidden``: storage base -> why a reader OUTSIDE the
+    forward touches it (the sleep leg's static-state export of the hull's
+    buffers, the NVFP4 Marlin->native conversion); a unit holding one is refused
+    -- that reader would hit an unmapped page while the unit is paused.
+    Returns (streamable units ordered tail-first, {tag: refusal}).
     """
+    forbidden = forbidden or {}
     spans: List[Tuple[int, int, str]] = []
     live: Dict[str, Dict[int, int]] = {}
     total: Dict[str, int] = {}
@@ -253,6 +259,10 @@ def catalog(named_modules: Iterable[Tuple[str, object]],
             found[tag].setdefault(li, []).append(t)
     units = []
     for tag in segments:
+        hit = sorted(b for b in bases[tag] if b in forbidden)
+        if hit and tag not in refused:
+            refused[tag] = "holds %d storage(s) a reader outside the forward touches (%s)" % (
+                len(hit), forbidden[hit[0]])
         missing = [a for a in live[tag] if a not in bases[tag]]
         if missing and tag not in refused:
             refused[tag] = "coverage: %d of %d live blocks (%d B) belong to no known tensor" % (
@@ -266,6 +276,41 @@ def catalog(named_modules: Iterable[Tuple[str, object]],
     return units, refused
 
 
+def uncatalogued_holders(units: Sequence[StreamUnit], live_bases: Mapping[str, Iterable[int]],
+                         objects: Iterable[object], is_device: Callable[[object], bool] = _on_device
+                         ) -> Dict[str, int]:
+    """tag -> how many Python tensor OBJECTS outside the catalog hold storage of that
+    unit's live blocks (a cached ``.T``, a dict entry, a closure). Such an object is
+    not swapped by the hooks and would be read at a paused address -> the caller
+    refuses the unit. Objects only C++ holds stay invisible (the CUDA smoke)."""
+    import torch
+
+    known = {id(t) for u in units for ts in u.tensors.values() for t in ts}
+    owner: Dict[int, str] = {}
+    for tag, bs in live_bases.items():
+        for b in bs:
+            owner[int(b)] = tag
+    out: Dict[str, int] = {}
+    for o in objects:
+        if not isinstance(o, torch.Tensor) or id(o) in known or not is_device(o):
+            continue
+        try:
+            b = int(o.untyped_storage().data_ptr())
+        except Exception:  # noqa: BLE001
+            continue
+        tag = owner.get(b)
+        if tag is not None:
+            out[tag] = out.get(tag, 0) + 1
+    return out
+
+
+def _rounded(nbytes: int) -> int:
+    """What the caching allocator really takes for one tensor: >1 MiB -> 2 MiB blocks, else 512 B."""
+    n = max(0, int(nbytes))
+    g = (2 << 20) if n > (1 << 20) else 512
+    return (n + g - 1) // g * g
+
+
 # ----------------------------------------------------------------------------- the actuator
 
 
@@ -275,7 +320,9 @@ class LayerStreamer:
     def __init__(self, units: Sequence[StreamUnit], *, pause: Callable[[str], None],
                  resume: Callable[[str], None], prefetch: int = 2, device=None,
                  phys_free: Optional[Callable[[], Optional[int]]] = None,
-                 pin: bool = True, sync: Optional[Callable[[], None]] = None):
+                 pin: bool = True, sync: Optional[Callable[[], None]] = None,
+                 tag_mapped: Optional[Callable[[str], Optional[int]]] = None,
+                 empty_cache: Optional[Callable[[], None]] = None):
         import torch
 
         self._torch = torch
@@ -288,6 +335,17 @@ class LayerStreamer:
         self._phys_free = phys_free
         self._pin = bool(pin)
         self._sync = sync or (lambda: None)
+        self._tag_mapped = tag_mapped
+        self._empty_cache = empty_cache or (lambda: None)
+        #: consumed staging sets whose layer may still run on the GPU: (devs, done event, bytes) -- held until
+        #: the event is done, so the ring is BOUNDED by back-pressure, never by how far the CPU runs ahead
+        import collections
+
+        self._inflight = collections.deque()
+        self._executing: Dict[int, Tuple[List[object], int]] = {}
+        self._live_bytes = 0
+        #: levels a stream-out was already done for (no cascade while D takes the loan)
+        self.levels_streamed: set = set()
         self._cuda = device is not None and getattr(device, "type", str(device)).startswith("cuda")
         self._side = torch.cuda.Stream(device=device) if self._cuda else None
         #: tag -> bytes that pause freed (what the regain must reclaim)
@@ -299,11 +357,13 @@ class LayerStreamer:
         self._images: Dict[int, List[Tuple[object, object, object]]] = {}
         self._staged: Dict[int, Tuple[List[object], object]] = {}
         self._order: List[int] = []
-        self.counters = {"out": 0, "regain": 0, "staged": 0, "staged_late": 0, "swapped": 0}
+        self.counters = {"out": 0, "regain": 0, "staged": 0, "staged_late": 0, "swapped": 0, "waited": 0,
+                         "peak_live_sets": 0, "peak_live_bytes": 0}
         layer_bytes = {}
         for u in self.units:
             for li, ts in u.tensors.items():
-                layer_bytes[li] = layer_bytes.get(li, 0) + sum(int(t.numel()) * int(t.element_size()) for t in ts)
+                layer_bytes[li] = layer_bytes.get(li, 0) + sum(_rounded(int(t.numel()) * int(t.element_size()))
+                                                               for t in ts)
         self.max_layer_bytes = max(layer_bytes.values(), default=0)
 
     # -- state ---------------------------------------------------------------
@@ -314,7 +374,9 @@ class LayerStreamer:
         return int(sum(self.loan.values()))
 
     def staging_bytes(self) -> int:
-        return int(self.prefetch * self.max_layer_bytes)
+        """The ring's bound: ``prefetch`` staged + the executing layer + one whose
+        GPU work is still in flight (back-pressure keeps it there), allocator-rounded."""
+        return int((self.prefetch + 2) * self.max_layer_bytes)
 
     def room(self) -> int:
         """What pausing every remaining unit could still free (net of the ring
@@ -329,8 +391,12 @@ class LayerStreamer:
     # -- out / regain --------------------------------------------------------
     def _image(self, t):
         torch = self._torch
-        host = torch.empty_strided(tuple(t.size()), tuple(t.stride()), dtype=t.dtype, device="cpu",
-                                   pin_memory=self._pin)
+        if self._pin:
+            from sglang.srt.layers.moe.expert_offload import pinned_exact_empty   # page-locked at its exact size
+
+            host = pinned_exact_empty(tuple(t.size()), t.dtype)
+        else:
+            host = torch.empty(tuple(t.size()), dtype=t.dtype, device="cpu")
         host.copy_(t)
         return host
 
@@ -346,16 +412,23 @@ class LayerStreamer:
             self._sync()
             images = {li: [(t, t.data, self._image(t)) for t in ts] for li, ts in u.tensors.items()}
             self._sync()
-            before = self._phys_free() if self._phys_free is not None else None
+            # the instrument is THIS process's own mapped bytes of the tag (no D noise on the shared card); only
+            # without it the device free delta, capped at the unit's pool (D freeing meanwhile cannot inflate it)
+            m0 = self._tag_mapped(tag) if self._tag_mapped is not None else None
+            before = self._phys_free() if (self._phys_free is not None and m0 is None) else None
             _ACTING[0] = True
             try:
                 self._pause(tag)
             finally:
                 _ACTING[0] = False
-            after = self._phys_free() if self._phys_free is not None else None
-            # on a shared card D allocates/frees concurrently: never lend more than the unit's pool holds
-            freed = (min(int(after) - int(before), int(u.nbytes))
-                     if (before is not None and after is not None) else int(u.nbytes))
+            m1 = self._tag_mapped(tag) if m0 is not None else None
+            after = self._phys_free() if before is not None else None
+            if m0 is not None and m1 is not None:
+                freed = min(int(m0) - int(m1), int(u.nbytes))
+            elif before is not None and after is not None:
+                freed = min(int(after) - int(before), int(u.nbytes))
+            else:
+                freed = int(u.nbytes)
             if freed <= 0:
                 _ACTING[0] = True
                 try:
@@ -386,18 +459,26 @@ class LayerStreamer:
         if tag not in self.freed:
             return 0
         u = self._by_tag[tag]
-        self._sync()
+        self.release_ring()
         mine = {id(t) for ts in u.tensors.values() for t in ts}
-        for li in u.tensors:
-            self._staged.pop(li, None)
-            for t, orig, _h in self._images.get(li, ()):
-                if id(t) in mine:
-                    t.data = orig
         _ACTING[0] = True
         try:
             self._resume(tag)
         finally:
             _ACTING[0] = False
+        # the content comes from OUR host image, never from the saver's backup alone (a weights-resident
+        # profile pauses without one): copy back, then point the tensors at their storage again
+        done = set()
+        for li in u.tensors:
+            for t, orig, host in self._images.get(li, ()):
+                if id(t) in mine and id(t) not in done:
+                    orig.copy_(host)
+                    done.add(id(t))
+        self._sync()
+        for li in u.tensors:
+            for t, orig, _h in self._images.get(li, ()):
+                if id(t) in mine:
+                    t.data = orig
         for li in u.tensors:
             rest = [row for row in self._images.get(li, ()) if id(row[0]) not in mine]
             if rest:
@@ -408,15 +489,53 @@ class LayerStreamer:
         n = self.freed.pop(tag)
         self.loan.pop(tag, None)
         _OWNED.discard(tag)
+        if not self.freed:
+            self.levels_streamed.clear()
         self.counters["regain"] += 1
         logger.warning("%s REGAIN tag=%s layers=%s %d B -- resident again (graphs valid: same VA)", MARK, tag,
                        list(u.layers), n)
         return n
 
     # -- per forward ---------------------------------------------------------
+    def _set_bytes(self, devs) -> int:
+        return sum(_rounded(int(d.numel()) * int(d.element_size())) for d in devs)
+
+    def _gauge(self) -> None:
+        sets = len(self._staged) + len(self._inflight) + len(self._executing)
+        self.counters["peak_live_sets"] = max(self.counters["peak_live_sets"], sets)
+        self.counters["peak_live_bytes"] = max(self.counters["peak_live_bytes"], self._live_bytes)
+
+    def _make_room(self) -> None:
+        """Back-pressure: before a new set is staged, the oldest consumed set whose
+        layer may still run is waited for (CPU waits on its done event) until at
+        most ``prefetch`` sets are staged or in flight."""
+        while self._inflight and len(self._staged) + len(self._inflight) >= self.prefetch + 1:
+            devs, ev, nb = self._inflight.popleft()
+            if ev is not None:
+                ev.synchronize()
+                self.counters["waited"] += 1
+            self._live_bytes -= nb
+            del devs
+
+    def release_ring(self) -> None:
+        """Everything staged or in flight is dropped (after the device is idle) and the
+        allocator's cache handed back -- before a regain needs the unit's whole bytes."""
+        self._sync()
+        while self._inflight:
+            _devs, ev, nb = self._inflight.popleft()
+            if ev is not None:
+                ev.synchronize()
+            self._live_bytes -= nb
+        for _li, (devs, _ev) in list(self._staged.items()):
+            self._live_bytes -= self._set_bytes(devs)
+        self._staged.clear()
+        self._live_bytes = max(0, self._live_bytes)
+        self._empty_cache()
+
     def _stage(self, li: int) -> None:
         if li in self._staged or li not in self._images:
             return
+        self._make_room()
         torch = self._torch
         imgs = self._images[li]
         if self._cuda:
@@ -433,7 +552,9 @@ class LayerStreamer:
             devs = [host.clone() for _t, _o, host in imgs]
             ev = None
         self._staged[li] = (devs, ev)
+        self._live_bytes += self._set_bytes(devs)
         self.counters["staged"] += 1
+        self._gauge()
 
     def _prime(self) -> None:
         for li in self._order[: self.prefetch]:
@@ -463,12 +584,24 @@ class LayerStreamer:
                 d.record_stream(cur)
         for (t, _orig, _h), d in zip(self._images[li], devs):
             t.data = d
+        self._executing[li] = (devs, self._set_bytes(devs))
         self.counters["swapped"] += 1
         self._ahead(li)
 
     def post_layer(self, li: int) -> None:
-        for t, orig, _h in self._images.get(li, ()):
+        rows = self._images.get(li, ())
+        for t, orig, _h in rows:
             t.data = orig
+        got = self._executing.pop(li, None)
+        if got is None:
+            return
+        devs, nb = got
+        ev = None
+        if self._cuda:
+            ev = self._torch.cuda.Event()
+            ev.record(self._torch.cuda.current_stream())
+        self._inflight.append((devs, ev, nb))     # held until the layer's GPU work is done (back-pressure)
+        self._gauge()
 
     def install_hooks(self, layers, start: int, end: int) -> int:
         """Forward pre/post hooks on the hull's decoder layers that any unit
@@ -524,7 +657,37 @@ def build_for_runner(runner) -> Optional[LayerStreamer]:
     for r, part in enumerate(getattr(runner, "dual_share_part_models", None) or ()):
         if part is not None:
             named.extend(("part%d.%s" % (r, n), m) for n, m in part.named_modules())
-    units, refused = catalog(named, segments)
+    # readers OUTSIDE the forward (the sleep leg): the hull's buffers (static-state export/import) and the
+    # NVFP4 Marlin<->native flip of flagged linears -- a unit holding their storage is refused
+    forbidden: Dict[int, str] = {}
+    for _n, b in runner.model.named_buffers():
+        try:
+            forbidden[int(b.untyped_storage().data_ptr())] = "hull buffer %s (sleep static-state export)" % _n
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as _mi
+
+        for lay in _mi.flagged_layers([runner.model] + [p for p in (getattr(runner, "dual_share_part_models", None)
+                                                                    or ()) if p is not None]):
+            for t in _module_tensors(lay):
+                if _on_device(t):
+                    forbidden[int(t.untyped_storage().data_ptr())] = "NVFP4 Marlin<->native flip at sleep"
+    except Exception as exc:  # noqa: BLE001 -- unreadable: no unit may be proven free of it
+        logger.warning("%s marlin flag scan failed (%r): every unit refused", MARK, exc)
+        return None
+    units, refused = catalog(named, segments, forbidden=forbidden)
+    # Python objects outside the modules that hold a unit's memory (cached views, dict entries): refuse
+    import gc
+
+    live_bases = {t: [a for seg in segments.get(t, ()) for a in
+                      (int(b.get("address", 0)) for b in seg.get("blocks", ()) if b.get("state") == "active_allocated")]
+                  for t in segments}
+    extra = uncatalogued_holders(units, live_bases, gc.get_objects())
+    if extra:
+        for tag, n in sorted(extra.items()):
+            refused[tag] = "%d Python tensor object(s) outside the modules hold its memory (not swappable)" % n
+        units = [u for u in units if u.tag not in extra]
     # TMS pauses by ITS tag record, not by torch's pool: an allocation tagged weights_<k> outside the tag pool
     # (a load-time transient re-homed elsewhere) would be unmapped too and is in no snapshot -> refuse the unit
     adapter = getattr(runner, "memory_saver_adapter", None)
@@ -552,8 +715,10 @@ def build_for_runner(runner) -> Optional[LayerStreamer]:
     dev = torch.device("cuda", int(runner.gpu_id))
     from sglang.srt.weg2.dual_p_kv_stage import phys_free_bytes
 
+    tag_mapped = getattr(adapter, "tag_mapped_bytes", None)
     st = LayerStreamer(units, pause=adapter.pause, resume=adapter.resume, prefetch=prefetch_layers(),
-                       device=dev, phys_free=phys_free_bytes, sync=lambda: torch.cuda.synchronize(dev))
+                       device=dev, phys_free=phys_free_bytes, sync=lambda: torch.cuda.synchronize(dev),
+                       tag_mapped=tag_mapped, empty_cache=torch.cuda.empty_cache)
     layers = _decoder_layers(runner.model)
     hooked = st.install_hooks(layers, int(getattr(runner, "start_layer", 0) or 0),
                               int(getattr(runner, "end_layer", len(layers)) or len(layers))) if layers is not None else 0
@@ -585,6 +750,15 @@ def try_stream_for_grant(actor, stages: Sequence[Mapping], level_tokens: int, co
             return 0                       # another card is short too: streaming PP0 would not grant it
         if i == 0:
             deficit = short
+    if int(level_tokens) in st.levels_streamed and st.freed and deficit > 0:
+        # this level already paused units and the grant is still short: the loan went to D (legal). No
+        # cascade of further pauses for the same level -- the request waits like any short grant (P never
+        # presses D); a NEW (higher) level may still stream.
+        if int(level_tokens) not in _NOPLAN_SAID:
+            _NOPLAN_SAID.add(int(level_tokens))
+            logger.info("%s STREAM-HELD level=%d deficit=%d B -- units already paused for this level, the card "
+                        "pool gave the loan to D; the request waits", MARK, int(level_tokens), deficit)
+        return 0
     tags = st.plan(deficit)
     if not tags:
         if deficit > 0 and int(level_tokens) not in _NOPLAN_SAID:   # once per level (the grant retries every N ms)
@@ -599,6 +773,7 @@ def try_stream_for_grant(actor, stages: Sequence[Mapping], level_tokens: int, co
     freed = st.stream_out(tags)
     if freed <= 0:
         return 0
+    st.levels_streamed.add(int(level_tokens))
     lent = 0
     for tag in st.paused():
         if tag in before:
@@ -624,6 +799,7 @@ def regain_at_idle(actor, phys_free=None) -> int:
     if st is None or not st.freed or int(getattr(actor, "mapped_tokens", 0) or 0) > 0:
         return 0
     got = 0
+    st.release_ring()                         # the ring's cached blocks back to the driver before the phys check
     for tag in reversed(st.paused()):
         n = int(st.loan.get(tag, st.freed[tag]))
         if phys_free is not None:

@@ -316,7 +316,7 @@ class GrantThroughTheStreamer(_Base):
         self.saver = _FakeSaver(self.units)
         self.st = L.LayerStreamer(self.units, pause=self.saver.pause, resume=self.saver.resume, prefetch=1,
                                   device=None, pin=False)
-        self.st.max_layer_bytes = 100                       # staging ring 100 B
+        self.st.max_layer_bytes = 100                       # ring = (prefetch 1 + 2) x 100 = 300 B
 
     def _write(self, b0, b1):
         for p, st in zip(self.paths, (_stage(self.led[0], b0), _stage(self.led[1], b1))):
@@ -351,10 +351,10 @@ class GrantThroughTheStreamer(_Base):
         actor = _Actor(K.CardKvLedger(self.led[0], "P"), self.st)
         lvl = self._grant(actor)
         self.assertEqual(lvl, 4096)
-        # deficit 4080 - 1100 = 2980 + ring 100 -> 3 units of 1200
+        # deficit 4080 - 1100 = 2980 + ring 300 -> 3 units of 1200
         self.assertEqual(self.st.paused(), ("weights_5", "weights_4", "weights_3"))
-        self.assertEqual(actor._stream_lent, 3500, "3 x 1200 freed, the ring (100) the prefetch keeps is not lent")
-        self.assertEqual(self.st.loan, {"weights_5": 1100, "weights_4": 1200, "weights_3": 1200})
+        self.assertEqual(actor._stream_lent, 3300, "3 x 1200 freed, the ring (300) the prefetch keeps is not lent")
+        self.assertEqual(self.st.loan, {"weights_5": 900, "weights_4": 1200, "weights_3": 1200})
         st = K.peek(self.led[0])
         self.assertEqual(st.committed["D"], 2000, "D untouched: P never presses D")
         self.assertEqual(st.committed["P"], 4080)
@@ -374,7 +374,7 @@ class GrantThroughTheStreamer(_Base):
     def test_infeasible_counts_the_stream_room_only_when_on(self):
         st = [_stage(self.led[0], 4080), _stage(self.led[1], 500)]
         self.assertEqual([c[0] for c in S.infeasible_cards(st, {}, 1064)], [0])
-        self.assertEqual(S.infeasible_cards(st, {}, 1064, self.st.room()), [], "3600 - ring 100 covers it")
+        self.assertEqual(S.infeasible_cards(st, {}, 1064, self.st.room()), [], "3600 - ring 300 covers it")
 
     def test_regain_at_idle_only_through_reclaim(self):
         actor = _Actor(K.CardKvLedger(self.led[0], "P"), self.st)
@@ -387,7 +387,7 @@ class GrantThroughTheStreamer(_Base):
         self.assertEqual(len(self.st.paused()), 3)
         led.release(4080)                                    # the request ended, P released its KV
         got = L.regain_at_idle(actor)
-        self.assertEqual(got, 3500)
+        self.assertEqual(got, 3300)
         self.assertEqual(self.st.paused(), ())
         self.assertEqual(actor._stream_lent, 0)
         self.assertEqual(K.peek(self.led[0]).budget, 3100, "the loan is back out of the pool")
@@ -442,6 +442,8 @@ class FlipUnchanged1962(_Base):
         self.assertFalse(L.armed({"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"}))
         self.assertFalse(L.armed(dict(ARM, SGLANG_WEG2_GROUP="D")))
         self.assertTrue(L.armed(ARM))
+        self.assertTrue(L.armed(dict(ARM, SGLANG_WEG2_DUAL_P_LAYER_STREAM="yes")), "EnvBool's own set")
+        self.assertFalse(L.armed(dict(ARM, SGLANG_WEG2_DUAL_P_LAYER_STREAM="on")), "EnvBool rejects 'on'")
 
     def test_build_refuses_unarmed_and_non_pp0(self):
         runner = type("R", (), {"pp_rank": 0})()
@@ -501,3 +503,107 @@ class GraphsEagerWhilePaused(_Base):
 
         L._OWNED.add("weights_5")
         self.assertFalse(DecodeCudaGraphRunner.can_run_graph(object(), object()))
+
+
+class ReviewMutants1971(_Base):
+    """The four mutants review 1971 found undetected, plus F2/F4/F5/F6b/F7 guards."""
+
+    def _st(self, m, groups, prefetch=1, saver_cls=None, **kw):
+        units = _units(m, groups)
+        saver = (saver_cls or _FakeSaver)(units)
+        st = L.LayerStreamer(units, pause=saver.pause, resume=saver.resume, prefetch=prefetch, device=None,
+                             pin=False, **kw)
+        st.install_hooks(m.layers, 0, len(m.layers))
+        return st, saver, units
+
+    def test_m1_post_layer_points_back_at_the_original(self):
+        m = _toy()
+        ptr = m.layers[3].weight.data_ptr()
+        st, _s, _u = self._st(m, {"weights_1": [3]})
+        st.stream_out(["weights_1"])
+        _fwd(m, torch.randn(2, 8))
+        self.assertEqual(m.layers[3].weight.data_ptr(), ptr, "after the layer the tensor is its paused original")
+
+    def test_m2_m3_ring_is_bounded_and_sized(self):
+        m = _toy(n=12)
+        st, _s, _u = self._st(m, {"weights_1": list(range(1, 12))}, prefetch=2)
+        st.stream_out(["weights_1"])
+        for _ in range(3):
+            _fwd(m, torch.randn(2, 8))
+        self.assertLessEqual(st.counters["peak_live_sets"], st.prefetch + 2,
+                             "staged + executing + in flight never exceed the ring")
+        self.assertEqual(st.staging_bytes(), (st.prefetch + 2) * st.max_layer_bytes)
+        self.assertEqual(L._rounded(10), 512)
+        self.assertEqual(L._rounded((1 << 20) + 1), 2 << 20)
+
+    def test_m4_regain_restores_content_without_the_savers_backup(self):
+        class _NoBackup(_FakeSaver):
+            def resume(self, tag):                      # a weights-resident profile: pages come back undefined
+                self.calls.append(("resume", tag))
+                self.saved.pop(tag)
+
+        m = _toy()
+        x = torch.randn(3, 8)
+        ref = _fwd(m, x).clone()
+        st, _s, _u = self._st(m, {"weights_1": [3, 4]}, saver_cls=_NoBackup)
+        st.stream_out(["weights_1"])
+        st.regain("weights_1")
+        torch.testing.assert_close(_fwd(m, x), ref, msg="the host image was copied back")
+
+    def test_m5_stage_file_lent_excludes_the_stream_loan(self):
+        d = tempfile.mkdtemp(prefix="s1962")
+        actor = type("A", (), {})()
+        actor.ledger = type("Led", (), {"path": os.path.join(d, "led")})()
+        actor.step, actor.top = 4096, 8192
+        actor.table = lambda: [0, 1, 2]
+        actor._stream_lent = 999
+        with mock.patch.object(S, "stage_file", lambda tag, r, root="/dev/shm": os.path.join(d, "st.json")):
+            path = S.publish_stage(actor, "t", 0)
+        with open(path) as f:
+            self.assertEqual(json.load(f)["lent"], 0, "the front's wake gate never waits for the stream loan")
+
+    def test_f4_measures_with_the_tags_own_mapped_bytes(self):
+        m = _toy()
+        mapped = {"weights_1": 800}
+
+        class _S(_FakeSaver):
+            def pause(self, tag):
+                super().pause(tag)
+                mapped[tag] = 0
+
+        st, _s, _u = self._st(m, {"weights_1": [3]}, saver_cls=_S, tag_mapped=lambda t: mapped.get(t),
+                              phys_free=lambda: 10 ** 12)          # a D release would inflate this one
+        self.assertEqual(st.stream_out(["weights_1"]), 800)
+
+    def test_f6b_no_cascade_for_the_same_level(self):
+        m = _toy()
+        st, _s, _u = self._st(m, {"weights_2": [2], "weights_1": [1], "weights_0": [0]})
+        st.max_layer_bytes = 0
+        actor = type("A", (), {})()
+        actor.streamer = st
+        lent = []
+        actor.ledger = type("Led", (), {"lend": lambda self, n: lent.append(n)})()
+        stages = [{"ledger": "a", "step": 4096, "top": 8192, "bytes": [0, 1500, 1500]}]
+        free = {"a": 100}
+        peek = lambda p: type("St", (), {"free": free[p]})()
+        self.assertGreater(L.try_stream_for_grant(actor, stages, 4096, 0, peek), 0)
+        n_paused = len(st.paused())
+        # D took the loan: still short at the same level -> no further pause
+        self.assertEqual(L.try_stream_for_grant(actor, stages, 4096, 0, peek), 0)
+        self.assertEqual(len(st.paused()), n_paused)
+
+    def test_f5_forbidden_storage_refuses_the_unit(self):
+        m = _toy()
+        segs = Catalog()._segs({"weights_0": [m.layers[0].weight, m.layers[0].bias]})
+        forb = {m.layers[0].bias.untyped_storage().data_ptr(): "hull buffer x (sleep static-state export)"}
+        units, refused = L.catalog(m.named_modules(), segs, is_device=lambda t: True, forbidden=forb)
+        self.assertEqual(units, [])
+        self.assertIn("outside the forward", refused["weights_0"])
+
+    def test_f7_python_holder_outside_the_modules_is_found(self):
+        m = _toy()
+        units = _units(m, {"weights_0": [0]})
+        stray = m.layers[0].weight.data.t()           # a cached view nobody swaps
+        bases = {"weights_0": [m.layers[0].weight.untyped_storage().data_ptr()]}
+        out = L.uncatalogued_holders(units, bases, [stray, m.layers[0].weight], is_device=lambda t: True)
+        self.assertEqual(out, {"weights_0": 1})
