@@ -2578,6 +2578,31 @@ def _group_floor_tokens(sched) -> int:
 CAP_LIFT_MARK = "WEG2 D-MEM-SCHED CAP-LIFT"
 
 
+def _chunked_rest(sched) -> int:
+    """REPLICATED (27B condition 2): the tokens of the live ``chunked_req``
+    that are not prefilled yet -- the whole request (``_req_tokens``, what
+    ``used`` counts) minus what its chunks hold. The chunked continuation is
+    the same request on every rank, as are the prefix length and the fill
+    boundary; of the two the SMALLER counts as done (a parked chunk whose
+    ``extend_range`` ran ahead of the prefix is not done): an overestimate is
+    the safe side, the lift only ends on a fresh verdict. 0 without one."""
+    req = getattr(sched, "chunked_req", None)
+    if req is None:
+        return 0
+    done = []
+    pre = getattr(req, "prefix_indices", None)
+    if pre is not None:
+        try:
+            done.append(len(pre))
+        except TypeError:
+            pass
+    ext = getattr(req, "extend_range", None)
+    end = getattr(ext, "end", None)
+    if end is not None:
+        done.append(int(end))
+    return max(0, _req_tokens(req) - (min(done) if done else 0))
+
+
 def free_tokens_below(allocator, tokens: int, page_size: int) -> Optional[int]:
     """Rank-local: the tokens of the FREE page ids at or below the cap of
     ``tokens`` (the only ids an allocation under that cap can take); None
@@ -2826,12 +2851,20 @@ def runtime_tick(sched):
     lifted_before = bool(getattr(ms, "_cap_lifted", False))
     lifted = False
     need = 0
+    rest = 0
     if ms.pending is not None and alloc is not None and (incoming > 0 or used > 0):
         chunk = int(getattr(getattr(sched, "server_args", None), "chunked_prefill_size", 0) or 0)
         first = min(int(incoming), chunk) if chunk > 0 else int(incoming)
-        need = first + len(rids) * max(1, page)
-        lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need, incoming,
-                              len(rids), page)
+        # NF 1528 (K2 20:49:25Z, weg2-54-290: 2176 + 830): the request after its
+        # first chunk is the chunked_req, in ``used`` and no longer in
+        # ``incoming`` -- the lift paid for chunk 1 only, ended itself between
+        # the chunks (need=64) and chunk 2 found 192 free ids under the cap.
+        # The next chunk of a live chunked_req is demand like a first chunk.
+        rest = _chunked_rest(sched)
+        nxt = min(rest, chunk) if chunk > 0 else rest
+        need = first + nxt + len(rids) * max(1, page)
+        lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need,
+                              incoming + rest, len(rids), page)
     ms._cap_lifted = lifted
     if lifted:
         fr["lifted_since"] = True
@@ -2853,10 +2886,16 @@ def runtime_tick(sched):
             _engage_kv_cap(alloc, tokens[want], page)
             if lifted:
                 _reopen_admission(sched)
+            # room= is rank-local (the verdict itself is the group MIN): the free
+            # tokens at or below the PENDING cap, i.e. what the lift was weighed on
+            room = (free_tokens_below(alloc, tokens[ms.pending], page)
+                    if ms.pending is not None else None)
             logger.info(
-                "%s pending=S%s stage=S%d cap=%d used=%d incoming=%d need=%d lifted=%s -- %s",
+                "%s pending=S%s stage=S%d cap=%d used=%d incoming=%d rest=%d need=%d "
+                "room=%s lifted=%s -- %s",
                 CAP_LIFT_MARK, "-" if ms.pending is None else ms.pending, ms.stage,
-                tokens[want], used, incoming, need, "yes" if lifted else "no",
+                tokens[want], used, incoming, rest, need,
+                "-" if room is None else room, "yes" if lifted else "no",
                 "the free ids below the pending cap do not pay the demand: the mapped "
                 "stage pays it" if lifted else "no demand left: the pending cap again")
             return step
