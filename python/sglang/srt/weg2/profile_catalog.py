@@ -449,7 +449,8 @@ def _refusals_module():
 # merge
 
 def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, Mapping], tree_rev: str = "",
-                  server_args_path: str = "", edges_path: str = "", edges_root: str = "") -> Dict[str, object]:
+                  server_args_path: str = "", edges_path: str = "", edges_root: str = "",
+                  erklaert: Optional[Mapping[str, Mapping]] = None) -> Dict[str, object]:
     flags = launcher_flags(launcher_path)
     envs = environ_fields(environ_path)
     entries: Dict[str, Dict[str, object]] = {}
@@ -477,7 +478,9 @@ def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, M
                          "group": "", "planner_derived": False,
                          "source": {"file": "environ.py", "line": r["line"], "kind": "environ"}, "help": txt,
                          "status": "geerntet" if txt else "unerklaert"}
-    for name, c in curated.items():
+    # ``erklaert`` = one-sentence texts written from the code's consumers (``profile_catalog_curated.ERKLAERT``), status
+    # "erklaert"; ``curated`` (the hand-curated core) is applied after it and wins on a name clash, status "kuratiert".
+    for name, c, stat in [(n, c, "erklaert") for n, c in (erklaert or {}).items()] + [(n, c, "kuratiert") for n, c in curated.items()]:
         e = entries.setdefault(name, {"id": name, "kind": c.get("kind", "env"), "name": name, "type": "str", "default": None,
                                       "choices": None, "bare": False, "nargs": None, "help": "",
                                       "source": {"file": "profile", "line": 0, "kind": "kuratiert"}})
@@ -485,7 +488,7 @@ def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, M
             if k in c:
                 e[k] = c[k]
         e["depends"] = [dict(d) for d in c.get("depends", [])]
-        e["status"] = "kuratiert"
+        e["status"] = stat
     ref = _refusals_module()
     edges, einfo = load_edges(edges_path)
     root = edges_root or _repo_root_of(launcher_path)
@@ -507,6 +510,7 @@ def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, M
 def coverage(entries: Mapping[str, Mapping]) -> Dict[str, int]:
     n = len(entries)
     return {"entries": n, "kuratiert": sum(1 for e in entries.values() if e["status"] == "kuratiert"),
+            "erklaert": sum(1 for e in entries.values() if e["status"] == "erklaert"),
             "geerntet": sum(1 for e in entries.values() if e["status"] == "geerntet"),
             "unerklaert": sum(1 for e in entries.values() if e["status"] == "unerklaert"),
             "flags": sum(1 for e in entries.values() if e["kind"] == "flag"),
@@ -535,7 +539,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     launcher, environ, sargs = find_tree_files(py)
-    cat = build_catalog(launcher, environ, {**getattr(mod, "ERKLAERT", {}), **mod.CURATED}, ns.rev, sargs)
+    cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs, erklaert=mod.ERKLAERT)
     text = json.dumps(cat, indent=1, sort_keys=True, ensure_ascii=False, default=str) + "\n"
     if ns.out:
         with open(ns.out, "w", encoding="utf-8") as fh:
@@ -543,7 +547,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         sys.stdout.write(text)
     st = cat["stats"]
-    print("catalog: %(entries)d entries (%(flags)d flags, %(envs)d envs): %(kuratiert)d kuratiert, %(geerntet)d geerntet, %(unerklaert)d unerklaert" % st, file=sys.stderr)
+    print("catalog: %(entries)d entries (%(flags)d flags, %(envs)d envs): %(kuratiert)d kuratiert, %(erklaert)d erklaert, %(geerntet)d geerntet, %(unerklaert)d unerklaert" % st, file=sys.stderr)
     return 0
 
 
