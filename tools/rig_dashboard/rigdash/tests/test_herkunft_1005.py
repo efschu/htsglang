@@ -32,6 +32,10 @@ PROFILE_ARGS=(--model /m --p-bs 2 --pp-stage-ratio 29,11,8 --pp-attn-stage-ratio
 def _editor(tmp, extra_entries=None, glossar=None):
     with open(REPO_CATALOG, encoding="utf-8") as fh:
         cat = json.load(fh)
+    # der ausgelieferte Katalog ist der Union-Katalog: jede Zeile hat baeume; der Test steuert die Herkunftsfelder selbst
+    for e in cat["entries"].values():
+        for field in P.ProfilEditor.ORIGIN_FIELDS:
+            e.pop(field, None)
     for name, fields in (extra_entries or {}).items():
         cat["entries"][name].update(fields)
     if glossar is None:

@@ -142,7 +142,14 @@ class Build(unittest.TestCase):
             self.assertEqual(shipped["schema"], PC.SCHEMA)
             self.assertEqual(shipped["register_wired"], wired)             # regenerate: python -m sglang.srt.weg2.profile_catalog
             self.assertEqual(shipped["stats"]["kuratiert"], st["kuratiert"])
-            self.assertEqual(set(shipped["entries"]), set(cat["entries"]))
+            # Die ausgelieferte Datei ist der Katalog über BEIDE Code-Bäume (--tree-27b/--tree-nf, siehe test_profile_catalog_union_1005): sie
+            # hat mehr Einträge als dieser Baum allein. Was als "27b" markiert ist, muss aber genau dem Baum dieses Branchs entsprechen:
+            # bewegt sich der Baum (Flag, Env, os.environ-Lesestelle), wird diese Prüfung rot = catalog.json neu bauen
+            # (Kommando und Baum-Stände stehen in der Commit-Nachricht der Datei).
+            self.assertEqual(sorted(shipped["trees"]), ["27b", "nf"])
+            here = PC._harvest(os.path.join(WEG2, "launcher.py"), os.path.join(SRT, "environ.py"), os.path.join(SRT, "server_args.py"), SRT)
+            tagged = {n for n, e in shipped["entries"].items() if "27b" in e.get("baeume", [])}
+            self.assertEqual(tagged, set(here))
 
 
 if __name__ == "__main__":

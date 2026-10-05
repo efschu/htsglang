@@ -680,7 +680,8 @@ def build_union_catalog(trees: Sequence[Tuple[str, str]], curated: Mapping[str, 
     cat = _finish(union, curated, erklaert, "+".join("%s=%s" % (lb, revs.get(lb, "")) for lb, _p in trees), first_launcher, edges_path,
                   edges_root)
     labels = [lb for lb, _p in trees]
-    cat["trees"] = {lb: {"rev": revs.get(lb, ""), "python_dir": py, "entries": len(per_tree[lb])} for lb, py in trees}
+    # no ``python_dir``: a build path in the output would make the file differ from machine to machine (reproducible build)
+    cat["trees"] = {lb: {"rev": revs.get(lb, ""), "entries": len(per_tree[lb])} for lb, _py in trees}
     cat["stats"]["baeume"] = {"nur_" + lb: sum(1 for e in union.values() if e.get("baeume") == [lb]) for lb in labels}
     cat["stats"]["baeume"]["beide"] = sum(1 for e in union.values() if len(e.get("baeume", [])) == len(labels) > 1)
     cat["stats"]["baeume"]["abweichung"] = sum(1 for e in union.values() if "abweichung" in e)
