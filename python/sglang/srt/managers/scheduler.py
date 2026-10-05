@@ -14450,6 +14450,15 @@ class Scheduler(
                     "(D decoded this tail itself before its park; P never writes it)",
                     str(getattr(req, "rid", "?"))[:16], uncached, _own_tail - 1, x,
                 )
+        # Q-710 EXTEND-CAP-FLOOR (flip line only: the flag is the launcher's, off
+        # = this block is skipped): a fresh D-direct request longer than the
+        # group's chunk width while the card cannot fund a floor chunk would
+        # crawl (y8vb: 1546 tokens = 860 one-token forwards, 133 s without a
+        # decode step). Refused by the same exit as W31, so the front routes it
+        # through P. The terms are the group's: the MIN-reduced width, the
+        # group-priced extent, a per-rid admit mark kept on every rank.
+        if verdict == "admit" and _weg2_extend_trim.cap_floor_armed():
+            verdict = self._weg2_cap_floor_verdict(req, uncached, verdict)
         logger.info(
             "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
             str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
@@ -14495,6 +14504,30 @@ class Scheduler(
                 None if _v is None else _v[2],
             )
         return verdict == "W31"
+
+    def _weg2_cap_floor_verdict(self, req: Req, uncached: int, verdict: str) -> str:
+        """Q-710: ``W31`` for a fresh request the starved D cannot prefill without
+        crawling, else ``verdict`` unchanged. An admitted rid is marked, so its
+        chunk continuations (priced again on every pass) are never refused."""
+        rid = str(getattr(req, "rid", "") or "")
+        marks = self.__dict__.setdefault("_weg2_ecf_admitted", {})
+        width = self.uniform_corridor_width()
+        page = int(getattr(self, "page_size", 1) or 1)
+        configured = int(getattr(self, "chunked_prefill_size", 0) or 0)
+        if _weg2_extend_trim.refuses_over_width(width, uncached, configured, page, rid in marks):
+            logger.warning(
+                "WEG2 %s route=P rid=%s uncached=%d width=%s floor=%d configured=%d (D cannot fund "
+                "a floor chunk: the group's chunk width is under it, and this request is longer "
+                "than that width -- refused so the front routes it through P instead of "
+                "crawling one forward per few rows)",
+                _weg2_extend_trim.CAP_FLOOR_MARKER, rid[:16], uncached, width,
+                _weg2_extend_trim.floor_rows(configured, page), configured,
+            )
+            return "W31"
+        marks[rid] = None
+        if len(marks) > 4096:
+            marks.pop(next(iter(marks)))
+        return verdict
 
     def _weg2_answer_x_refusals(self, refused: List[Req], head_inputs=None) -> None:
         """Remove the W31-refused requests and answer them BY NAME (C11).

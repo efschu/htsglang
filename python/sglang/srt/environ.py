@@ -1262,6 +1262,26 @@ class Envs:
     # CSV, "0" = no rate). Set by the weg2 launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
     # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
     SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
+    # Q-694b EXTEND-RATE: the rank MEASURES its own extend transient per row
+    # (allocator peak / reserved growth of every target extend of >= 2048 rows)
+    # and votes with max(start rate, measured x 1.15), a per-rank ratchet up
+    # only; the rate above is then only the start value (record or derived from
+    # the model geometry). Written by the weg2 launcher on the flip line's D
+    # group; off = the rate above alone, byte-identical.
+    SGLANG_WEG2_EXTEND_RATE_MEASURE = EnvBool(False)
+    # Q-710 EXTEND-CAP-FLOOR (INT8 y8vb 03.10. 19:34-19:51Z, 3905 one-token D
+    # extends, ~150 ms each, 11x 'GROUP-NARROWED 4096 to 1'): the rc12g vote
+    # floor((card_free_post - 300) / rate) is page-clamped to ONE row once a
+    # card (the 3080, 72-290 MiB free in the D phase) sits under the 300 MiB
+    # line, and an eager extend costs the same ~150 ms at 1 row as at 100. With
+    # this on the vote never drops below a floor chunk (1/16 of the configured
+    # width, bounded by what the free card physically funds at the priced
+    # rate), and a fresh D-direct request longer than the group's width while
+    # that width is under the floor is refused at the X gate so the front
+    # routes it through P. Written by the weg2 launcher only where it wrote
+    # the flip arm's rate (Q-694); off = byte-identical, P0 arm and dual never
+    # set it.
+    SGLANG_WEG2_EXTEND_CAP_FLOOR = EnvBool(False)
     # CORRIDOR BOUND WAKE RESET (y3r Klasse E/A2, D TP1 3080, 23:45:29-34): the
     # '#794 GROUP-NARROWED ... from 4096 to 64' right after every wake is the
     # #1028c bounded-min window (5 s) of the #656 gate still holding the
@@ -2046,6 +2066,15 @@ class Envs:
     # and stays on D. Line 'WEG2 P-ANCHOR-PRESENCE'. Off = no record (#1324:
     # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
     SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(True)
+    # Q-711 SHORT-KEPT-BOUND (INT8 y8vb 03.10.): a SHORT kept for D waits in the
+    # front's _ready_for_d, which no flip trigger reads (they read only the batch
+    # queue) -- it had no upper bound (137 s and 152 s, p90 137 s against 1 s on
+    # y8va). Past this many seconds in D's admission line WITHOUT a free seat it
+    # moves to P's queue (_to_p_batch, arrival order) and the existing flip path
+    # takes it. Profile row ``short_kept_max_wait_s`` (qwen27b 30 s, nextflash
+    # 0); 0 = off, byte-identical (also the value without a form). Not read in
+    # the dual layout.
+    SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S = EnvFloat(_profile_default("SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S", 0.0))
     # RPC-STALL-WATCHDOG (30.09., hauenh P->D epoch 6: D TP0 silent 6 s inside the wake RPC):
     # faulthandler's C watchdog writes every thread's stack into its own file per rank when a sleep
     # (release) or wake (resume) RPC outlives this many seconds (weg2/rpc_stall_watchdog.py). A normal
