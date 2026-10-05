@@ -1188,11 +1188,14 @@ def stratified_check_plan(plan: Sequence[tuple], ranges: Sequence[Tuple[int, int
     checker then reads exactly these rows (it samples evenly again and a
     sample of at most ``k`` entries comes back whole)."""
     entries = sorted(plan, key=lambda e: int(e[1]))
-    in_guest = [e for e in entries
-                if any(lo <= int(e[1]) < hi for lo, hi in ranges)]
+    # one pass: the old ``e not in in_guest`` was a list scan per entry --
+    # O(n * guests), 36 s at 170k rows x 75k guest rows inside the wake RPC
+    # (j4, 05.10. 02:06Z, L15-WAKE-TIMING check_decide_ms=36361).
+    flags = [any(lo <= int(e[1]) < hi for lo, hi in ranges) for e in entries]
+    in_guest = [e for e, f in zip(entries, flags) if f]
     if not in_guest:
         return _even(entries, k)
-    home = [e for e in entries if e not in in_guest]
+    home = [e for e, f in zip(entries, flags) if not f]
     kg = min(len(in_guest), max(1, int(k * guest_share)))
     kh = min(len(home), max(0, k - kg))
     kg = min(len(in_guest), k - kh)
