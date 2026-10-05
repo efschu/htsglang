@@ -472,11 +472,10 @@ def test_keep_skips_write_pending_nodes_and_never_raises():
 @pytest.mark.parametrize("old,new", [
     ("if not enabled() or not _group_d():\n            return 0\n        from sglang.srt.weg2 import l15_plan\n",
      "from sglang.srt.weg2 import l15_plan\n"),
-    ("if not l15_plan.keep_shadow_active(os.environ):\n            return 0", "pass"),
-    ('if getattr(node, "write_through_pending_id", None) is not None:\n                continue',
+    ("kv_on = l15_plan.keep_shadow_active(os.environ)", "kv_on = True"),
+    ('if getattr(node, "write_through_pending_id", None) is not None:\n                    continue',
      "pass"),
-    ("pool = tree._weg2_arena_pools().get(BASE_COMPONENT_TYPE)\n        if pool is None:\n            return 0",
-     "pool = _Pool()"),
+    ("pool = pools.get(BASE_COMPONENT_TYPE)", "pool = _Pool()"),
 ])
 def test_keep_mutants_die(old, new):
     """Each guard is load-bearing: the mutated copy of record_keep_shadow misbehaves in at least
