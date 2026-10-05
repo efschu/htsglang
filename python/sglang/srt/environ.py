@@ -797,6 +797,13 @@ class Envs:
     # needs card_room (blind = P stays asleep, one named line) and the sleep leg's RPC answered (the loan is published
     # at its end). No reserve, no D brake: D may grow into the loan; P returns only once the card has it free again.
     SGLANG_WEG2_DUAL_WAKE_SEES_LOAN = EnvBool(False)
+    # #1969 WAKE-VOTE (b9p 05.10. 06:30:34Z, #973 RingCommitTimeout; second line behind #1956): dual P ranks only (launcher
+    # env of the P group), DEFAULT OFF = the wake handler byte for byte as before. On: a /resume_memory_occupation that finds
+    # NO tag paused (P never slept: the front woke it while the sleep leg still stood in its quiesce, 400) is answered as a
+    # no-op on every rank before wake_reclaim and before the group fence -- the decision reads only the request tags and
+    # offload_tags (set by the sleep leg's fenced group vote), so it is rank-uniform with no new collective. Without it PP0
+    # alone threw Weg2DualPWakeShort (its stage-1 loan stood) and its fence send was never taken by PP1.
+    SGLANG_WEG2_DUAL_WAKE_VOTE = EnvBool(False)
     # #1540 D-SIGNAL-SEATS (dual front, default off): d_signal (D's id-space / Mamba-arena reading,
     # dual_d_priority.d_signal_short) counts as pressure only while D really has work that needs the
     # rows -- a live seat (front._d_seats_live) or a leg-1-done request waiting for one

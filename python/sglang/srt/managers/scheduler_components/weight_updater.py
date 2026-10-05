@@ -10713,6 +10713,12 @@ class SchedulerWeightUpdaterManager:
         # D PRIORITY stage 2 (dual P only): the loan back before anything maps
         from sglang.srt.weg2 import dual_p_kv_stage as _dpk_wake
 
+        # #1969 WAKE-VOTE (dual P, SGLANG_WEG2_DUAL_WAKE_VOTE, default off): P never slept -> the wake is a
+        # no-op on EVERY rank, decided from the request and offload_tags only (see wake_without_sleep), BEFORE
+        # the rank-local wake_reclaim below and before the group fence. Not recorded in the leg ledger: a real
+        # wake of the same epoch later must not replay this answer.
+        if _dpk_wake.wake_without_sleep(self.scheduler, self.offload_tags, recv_req.tags):
+            return ResumeMemoryOccupationReqOutput()
         _dpk_wake.wake_reclaim(self.scheduler)
         if self.scheduler is not None:
             self.scheduler._weg2_resume_t0 = time.perf_counter()  # RW instrument: the leg's start

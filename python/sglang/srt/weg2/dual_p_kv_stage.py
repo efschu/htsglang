@@ -1183,6 +1183,55 @@ def wake_reclaim(sched) -> int:
     return lent
 
 
+WAKE_VOTE_ENV = "SGLANG_WEG2_DUAL_WAKE_VOTE"
+WAKE_VOTE_MARK = "#1969 WAKE-VOTE"
+
+
+def wake_vote_armed(env=None) -> bool:
+    """#1969: the group-uniform "P never slept -> the wake is a no-op" rule exists only on a P rank of the
+    dual layout with ``SGLANG_WEG2_DUAL_WAKE_VOTE=1`` (default off). Anything else (flip form, D, NF, env
+    unset) never reaches the rule: the wake handler runs its old body byte for byte."""
+    env = os.environ if env is None else env
+    if str(env.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() != "1":
+        return False
+    if str(env.get("SGLANG_WEG2_GROUP", "")).strip().upper() != "P":
+        return False
+    return str(env.get(WAKE_VOTE_ENV, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def wake_without_sleep(sched, offload_tags, tags=None, env=None) -> bool:
+    """#1969 (b9p 06:28:34Z, 1966/1969): True = this wake RPC finds P NOT asleep (no tag paused) and must
+    be answered as a no-op BEFORE any rank-local effect (``wake_reclaim``, the group fence).
+
+    WHY THIS IS RANK-UNIFORM WITHOUT A NEW COLLECTIVE. The decision reads two inputs only: the request (one
+    object, forwarded unchanged down the PP chain, so every rank sees the same ``tags``) and
+    ``offload_tags``, the upstream ledger of what is paused. A sleep leg adds to it BEFORE its group fence
+    and the RPC is answered only after every rank joined that fence (``_weg2_group_fence_impl``:
+    monitored_barrier + all_gather of the ok-bit), so at every RPC boundary all ranks hold the same set --
+    the fence IS the vote, taken once at the sleep. Nothing here reads a loan, a clock, a pool or a card:
+    the b9p split (PP0 had ``_awake_lent`` > 0 and threw, PP1/PP2 had 0 and no-op'd) came from exactly such
+    rank-local readings, which this rule does not consult. A rank whose set diverged would have raised
+    KeyError at ``offload_tags.remove`` on the old path anyway.
+
+    Only the fully-awake case (empty set) is a no-op; a wake of a partly paused set is untouched. A
+    stage-1 loan (``_awake_lent``) is NOT touched here: it comes back through ``awake_reclaim`` (the
+    stage-1 RPC), never through a wake of a P that did not sleep."""
+    if not wake_vote_armed(env):
+        return False
+    try:
+        paused = list(offload_tags or ())
+    except TypeError:
+        return False
+    if paused:
+        return False
+    actor = _actor(sched)
+    logger.warning("%s P is not asleep (offload_tags empty, request tags=%s, awake_lent=%d sleep_lent=%d B): the wake "
+                   "is a no-op on every rank, no reclaim, no fence -- the front woke a P that never slept",
+                   WAKE_VOTE_MARK, sorted(str(t) for t in (tags or ())),
+                   int(getattr(actor, "_awake_lent", 0) or 0), int(getattr(actor, "_sleep_lent", 0) or 0))
+    return True
+
+
 # -- Q-660 DUAL-AWAKE-LEND: stage 1 lends what an awake P does not need ----------
 #
 # User rule 03.10. (~15:35Z, verbatim): "wenn auf D kv knapp wird, gibt P seinen kv
