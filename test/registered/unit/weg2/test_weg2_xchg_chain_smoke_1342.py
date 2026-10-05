@@ -282,12 +282,24 @@ def test_the_chain_runs_once_and_produces_the_graded_artifacts(chain, caplog):
     # leaves None -- that number is withdrawn and must not return as a
     # baseline.  A BLANK `NO-COMPARE pieces=0` is still a FAIL: the line has
     # to say WHICH side was unresolved.
-    assert "W74 Weg2XchgSourceMissing" in text, (
+    #
+    # 1533: this chain's manager carries no semaphore set, and the unsplit-form
+    # check in the bounce adapter (W68, "has no semaphore set ... the source of
+    # a cross pair is the peer, whose address this rank cannot resolve") now
+    # answers BEFORE `run_bounce_leg` can name the missing pointer (W74).  Both
+    # are the same property -- a cross-card leg whose source this rank cannot
+    # resolve is refused BY NAME, with the unresolved side in the text, never
+    # compared silently -- so the test accepts either refusal, each with its own
+    # side-naming clause.  A bare NO-COMPARE still fails both branches.
+    refused_late = ("W74 Weg2XchgSourceMissing" in text
+                    and "has no source pointer" in text)
+    refused_early = ("W68 Weg2XchgPlanDisagree" in text
+                     and "cannot resolve" in text
+                     and "cross cards" in text)
+    assert refused_late or refused_early, (
         "the injection hook must refuse BY NAME when its source side is "
-        "unresolved, never compare nothing silently:\n" + text[-3000:]
-    )
-    assert "has no source pointer" in text, (
-        "the refusal must name WHICH side was unresolved:\n" + text[-2000:]
+        "unresolved, and the refusal must name WHICH side was unresolved, "
+        "never compare nothing silently:\n" + text[-3000:]
     )
     assert "verdict=MATCH" not in inject[0], (
         "a MATCH here can only come from a double that filled a pointer "

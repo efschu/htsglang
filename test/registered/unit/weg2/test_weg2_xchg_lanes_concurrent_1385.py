@@ -802,6 +802,18 @@ class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
     #: reason: fast, hermetic, no gigabyte allocations.
     SLOT_BYTES = 512
 
+    #: 1533: the sequential form's host buffers have TWO policies since H44
+    #: (Task #17, 15.09.+): ``SGLANG_WEG2_SEQ_PERSIST_BUFFERS`` (default ON)
+    #: keeps a lane's mapped buffer for the next flip, and the collector then
+    #: does not unlink it; OFF is the form this class was written against
+    #: (every lane a file after the deposit, none after the collect).  The
+    #: first four expectations below are the OFF form, verbatim; the default
+    #: form is pinned beside them so a silent change of the default is a red.
+    #: Under the default the on-card diagonal (c0) stages through IPC and
+    #: writes no host file at all, and the cross lanes (p0, p1) keep theirs.
+    OFF_AFTER_DEPOSIT = {"c0": True, "p0": True, "p1": True}
+    PERSIST_AFTER_DEPOSIT = {"c0": False, "p0": True, "p1": True}
+
     def _terms(self, cap):
         from .test_weg2_xchg_bounce_execution_smoke_1273 import (
             DEPTH,
@@ -823,7 +835,7 @@ class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
             max_tag_bytes=LAYER0_BYTES * 2, **kw,
         )
 
-    def _round_trip(self, *, cap):
+    def _round_trip(self, *, cap, persist=False):
         """Deposit ALL of this rank's lanes for ONE tag, then collect them
         -- two separate calls, matching D's and P's separate processes --
         and return (terms, lane_paths, mismatched_rows)."""
@@ -842,9 +854,15 @@ class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
         )
         from .test_weg2_xchg_transport_1273 import FakeDeviceOps, _fresh_boot
 
+        from unittest import mock
+
         root = tempfile.mkdtemp()
         nonce = _fresh_boot()
         xr.create_semaphores(nonce)
+        _env = mock.patch.dict(
+            os.environ, {bx.SEQ_PERSIST_BUFFERS_ENV: "1" if persist else "0"})
+        _env.start()
+        self.addCleanup(_env.stop)
         try:
             terms = self._terms(cap)
             if cap:
@@ -903,6 +921,14 @@ class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
                 exists_after_collect = {
                     lane: os.path.exists(p) for lane, p in paths_after_deposit.items()
                 }
+                # 1533: the c0 lane no longer has a path of its own to look at
+                # (see EXPECTED_AFTER_DEPOSIT), so the "nothing survives" half
+                # sweeps the whole boot directory instead of three fixed names:
+                # any unit buffer left under it, of ANY lane, counts.
+                import glob as _glob
+
+                exists_after_collect["<any unit buffer under the boot dir>"] = bool(
+                    _glob.glob(os.path.join(root, f"weg2-seq-{nonce}", "*unit_buffer.bin*")))
                 mismatched = _mismatched_rows(ops, descs_all)
             finally:
                 if cap:
@@ -917,7 +943,7 @@ class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
         # All three of THIS rank's lanes were deposited (the deposit side
         # does not know about the cap's runtime enforcement -- it is the
         # collector's job to free what it just finished with).
-        self.assertTrue(all(after_deposit.values()), after_deposit)
+        self.assertEqual(after_deposit, self.OFF_AFTER_DEPOSIT)
         # xsn31/6's own regression: NONE may survive the collector.
         self.assertFalse(any(after_collect.values()),
                          f"a lane file survived its own collector: {after_collect}")
@@ -932,10 +958,26 @@ class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
         with or without a cap -- the #1385 lesson applied at this form's own
         site, where the host-RAM law needs it."""
         _terms, after_deposit, after_collect, mismatched = self._round_trip(cap=0)
-        self.assertTrue(all(after_deposit.values()), after_deposit)
+        self.assertEqual(after_deposit, self.OFF_AFTER_DEPOSIT)
         self.assertFalse(any(after_collect.values()),
                          "the sequential form's lane buffer must be freed by "
                          f"its collector with no cap set: {after_collect}")
+        self.assertEqual(mismatched, [])
+
+    def test_the_default_persists_the_cross_lane_buffers_and_the_diagonal_has_none(self):
+        """1533 -- the DEFAULT form, as the product runs it: the collector does
+        not unlink the cross lanes' buffers (they are reused by the next flip,
+        and the unmap/unregister that freeing them costs was 12.5 s), and the
+        on-card diagonal never had a host file.  This is a pin of a DESIGN
+        CHOICE with a host-memory consequence (the cross lanes' tmpfs pages
+        stay until teardown -- the thing #1385 once fixed for the lane form),
+        so it is a red the day someone flips the default, either way."""
+        _terms, after_deposit, after_collect, mismatched = self._round_trip(
+            cap=0, persist=True)
+        self.assertEqual(after_deposit, self.PERSIST_AFTER_DEPOSIT)
+        self.assertEqual(
+            {k: v for k, v in after_collect.items() if not k.startswith("<")},
+            {"c0": False, "p0": True, "p1": True})
         self.assertEqual(mismatched, [])
 
     def test_unlink_lane_buffer_is_idempotent(self):

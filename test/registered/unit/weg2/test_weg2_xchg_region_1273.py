@@ -1318,7 +1318,11 @@ def test_prepare_and_teardown_round_trip_the_region_and_the_sems(tmp_path):
         region.close()
     finally:
         removed = xr.teardown_region(boot, shm_root=shm_root, log=lines.append)
-    assert removed == {"sems": n_all, "region": 1}
+    # 1533: teardown also reports the bounce slots it unlinked and the foreign
+    # entries it left alone (``slots``/``foreign``, weight_exchange_region.py);
+    # this round trip creates no bounce slot and no stranger, so both are 0 --
+    # the dict is still compared WHOLE, so a new key nobody classified fails.
+    assert removed == {"sems": n_all, "region": 1, "slots": 0, "foreign": 0}
     assert not os.path.exists(xr.region_path(boot, shm_root))
     assert any("WEG2-XCHG-TEARDOWN" in line for line in lines)
 
