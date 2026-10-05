@@ -97,6 +97,16 @@ def _manager(server_args, monkeypatch, *, draft_worker=None):
     """
     monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_server_args",
                         lambda self: server_args, raising=True)
+    # 1533 (#1369): the decision no longer reads the raw argv bit
+    # ``enable_weights_cpu_backup`` (the weg2 launcher sets it unconditionally)
+    # but the PREDICATE ``weights_cpu_backup_armed()``, whose explicit
+    # ``on``/``off`` env knob is the one input a test may set without faking
+    # the predicate itself.  The fake flag drives the product's own predicate:
+    # ``weights_backup=True`` is ``on`` (always armed), ``False`` is ``off``.
+    if server_args is not None:   # None = the undecidable-wake case, no flags to mirror
+        monkeypatch.setenv(wx.WEIGHTS_CPU_BACKUP_ENV,
+                           wx.WEIGHTS_CPU_BACKUP_ON if server_args.enable_weights_cpu_backup
+                           else wx.WEIGHTS_CPU_BACKUP_OFF)
     return wu.SchedulerWeightUpdaterManager(
         tp_worker=_FakeWorker(), draft_worker=draft_worker, tp_cpu_group=None,
         memory_saver_adapter=None, flush_cache=lambda *a, **k: True,

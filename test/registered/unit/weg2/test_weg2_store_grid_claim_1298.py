@@ -390,6 +390,14 @@ def _cache_stub(available, peer_votes, page=PAGE, threshold=THRESHOLD, chunk=CHU
     registered = {}
 
     def _reduce(t, op, label):
+        if label == "prefetch_cut_rank":
+            # 1533 (#249, 27.09.): the truncation branch now names the rank that
+            # set the group MIN with one more MIN.  This stub is rank 0: if its
+            # own length is the group length it voted its rank and keeps it,
+            # else the cutter is a peer (rank 1).  The vote below is untouched.
+            if int(t[0].item()) >= (1 << 30):
+                t[0] = 1
+            return t
         assert label == "prefetch_participation_vote"
         stub.votes.append(int(t[2].item()))
         t[2] = min([int(t[2].item())] + [int(v) for v in peer_votes])
@@ -445,6 +453,11 @@ def _cache_stub(available, peer_votes, page=PAGE, threshold=THRESHOLD, chunk=CHU
         "_log_prefetch_refused",
         "_log_prefetch_truncated",
         "_prefetch_line_terms",
+        # 1533: the real read decides the top-up term through this method
+        # (fnFL2x36, 23.09.); without it the stub is no longer the cache the
+        # test says it drives.  The controller carries no ``weg2_hold_rids``,
+        # so the real method answers False: the fresh-read law under test.
+        "_weg2_extent_topup",
     ):
         setattr(stub, name, MethodType(getattr(UnifiedRadixCache, name), stub))
     return stub
