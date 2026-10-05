@@ -131,12 +131,27 @@
     if (dep && dep.to_kind === "var") return `${to} ist eine Profil-Variable und in diesem Profil nicht gesetzt.`;
     return `${to} ist in diesem Profil nicht gesetzt (im Katalog erklärt, aber nicht Teil dieses Profils).`;
   }
+  // In welchem Code-Baum steht der Wert? Das Release-Image trägt zwei Stände (27B- und NF-Linie): ein Wert nur in einem Baum ist ein Hinweis, kein Fehler.
+  const BAUM = { "27b": "27B-Baum", nf: "NF-Baum" };
+  function drawOrigin(ex) {
+    const b = ex.baeume || [];
+    let out = "";
+    if (b.length === 1) out += `<div class="pf-orig"><span class="pf-chip">nur im ${esc(BAUM[b[0]] || b[0])}</span> <span class="muted">Der andere Code-Baum kennt diesen Wert nicht.</span></div>`;
+    const ab = ex.abweichung;
+    if (ab) {
+      const ks = Object.keys(ab);
+      const helpDiffers = new Set(ks.map((k) => String(ab[k].help || ""))).size > 1;
+      out += `<div class="pf-orig"><span class="pf-chip pf-dep-off">weicht ab</span> ${ks.map((k) => `<span>${esc(BAUM[k] || k)}: Standard <span class="mono">${esc(ab[k].default == null ? "–" : ab[k].default)}</span></span>`).join(" · ")}${helpDiffers ? ' <span class="muted">· die Beschreibung im Code unterscheidet sich</span>' : ""}</div>`;
+    }
+    if (ex.satz_quelle) out += `<div class="muted pf-note">Quelle des Satzes: ${esc(ex.satz_quelle)}</div>`;
+    return out;
+  }
   function drawExplain(r) {
     const ex = r.explain;
     if (!ex.parts.length) return `<div class="pf-unex">Unerklärt: für diesen Wert gibt es weder Katalogtext noch Code-Hilfe noch einen Kommentar im Profil. ${ex.source ? "Quelle: " + esc(ex.source.file) + ":" + esc(ex.source.line) : "Nachlesen im Code (suche " + esc(r.name) + ")."}</div>`;
-    const parts = ex.parts.map((p) => `<div class="pf-part"><span class="pf-chip">${esc({ kuratiert: "Erklärung", code: "Code-Hilfe", profil: "Im Profil begründet" }[p.kind] || p.kind)}</span> ${esc(p.text)} <span class="muted">${esc(p.source)}</span></div>`).join("");
+    const parts = ex.parts.map((p) => `<div class="pf-part"><span class="pf-chip">${esc({ kuratiert: "Erklärung", erklaert: "Erklärung (aus dem Code)", code: "Code-Hilfe", profil: "Im Profil begründet" }[p.kind] || p.kind)}</span> ${esc(p.text)} <span class="muted">${esc(p.source)}</span></div>`).join("");
     const gc = (ex.gain || ex.cost) ? `<div class="pf-gc">${ex.gain ? `<div><b>Bringt:</b> ${esc(ex.gain)}</div>` : ""}${ex.cost ? `<div><b>Kostet:</b> ${esc(ex.cost)}</div>` : ""}</div>` : "";
-    return parts + gc + drawDeps(r);
+    return parts + drawOrigin(ex) + gc + drawDeps(r);
   }
   function inputFor(r) {
     const k = esc(r.key);
@@ -213,6 +228,14 @@
     };
     return `<details class="pf-fold" data-fold="kvh" ${isOpen("kvh", true) ? "open" : ""}><summary><b>KV-Köpfe je Rang</b> · abgeleitet, nicht einstellbar</summary>
       ${k.map(one).join("")}<div class="muted pf-note">Es gibt kein Flag für die Kopfverteilung: sie folgt aus --rank-tp-ratio. Was nicht belegt ist, steht als „nicht gerechnet“.</div></details>`;
+  }
+  // Lesehilfe der Erklärsätze (D, P, Flip, Park, Mamba-Anker): die Sätze erklären diese Wörter nicht noch einmal
+  function drawGlossar() {
+    const g = (st.view && st.view.glossar) || {};
+    const ks = Object.keys(g);
+    if (!ks.length) return "";
+    return `<details class="pf-fold" data-fold="gloss" ${isOpen("gloss", false) ? "open" : ""}><summary>Wörter in den Erklärungen <span class="muted">${esc(ks.join(", "))}</span></summary>
+      <dl class="pf-gloss">${ks.map((k) => `<dt><b>${esc(k)}</b></dt><dd>${esc(g[k])}</dd>`).join("")}</dl></details>`;
   }
   function drawModels() {
     const m = st.models;
@@ -367,6 +390,7 @@
       ${drawHardware()}
       ${drawBars()}
       ${st.doc ? drawKvHeads() : ""}
+      ${st.doc ? drawGlossar() : ""}
       ${drawModels()}
       ${drawExport()}`;
     const hwSlot = root.querySelector("#pf-hwroot");

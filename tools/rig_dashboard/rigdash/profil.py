@@ -395,11 +395,27 @@ class ProfilEditor:
             mod = self._catmod = _load("kp_profile_catalog", cmod)
         return mod.harvest_profile_comments(path)
 
+    #: Felder des Katalogeintrags, die eine Zeile zusätzlich zeigt: in welchem Code-Baum der Wert steht (``baeume``), wo die Bäume bei
+    #: Standardwert oder Beschreibung abweichen (``abweichung``) und woher ein handgeschriebener Satz stammt (``satz_quelle``)
+    ORIGIN_FIELDS = ("baeume", "abweichung", "satz_quelle")
+
+    def _add_origin(self, rows: List[dict]) -> None:
+        entries = self.catalog()["entries"]
+        for r in rows:
+            e = entries.get(r["name"])
+            if e is None:
+                continue
+            for k in self.ORIGIN_FIELDS:
+                if k in e:
+                    r["explain"][k] = e[k]
+
     def render_view(self, doc: dict, comments: Optional[dict] = None) -> dict:
         pj, _ref = self.mods()
         v = pj.view(doc, self.catalog()["entries"], comments, self.specs())
         model_dir = next((str(x.get("value") or "") for x in doc.get("vars") or [] if x.get("name") == "PROFILE_MODEL"), "")
         v["kvheads"] = KVH.view(v["rows"], model_dir, v["planner_only"])
+        v["glossar"] = self.catalog().get("glossar") or {}
+        self._add_origin(v["rows"])
         return {"ok": True, "doc": doc, "view": v, "name": doc.get("name"), "line": doc.get("line"),
                 "groups": sorted({r["explain"]["group"] for r in v["rows"] if r["explain"]["group"]})}
 
