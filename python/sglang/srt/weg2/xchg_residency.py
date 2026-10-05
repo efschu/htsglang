@@ -169,6 +169,11 @@ class CardCensus:
     dormant_proc_used_mib: int
     #: Where that number was read.  Printed; never defaulted.
     dormant_source: str = ""
+    #: AP4 1526: the card CLASS this row was measured on (``card_identity``
+    #: label, e.g. ``RTX3080``), optional.  A donor of a borrowed row is chosen
+    #: by it; a row without one is labelled by the live card that carries its
+    #: UUID (:func:`resolve_census`).
+    card_class: str = ""
 
 
 @dataclass(frozen=True)
@@ -397,12 +402,210 @@ def load_census(path: str) -> XchgCensus:
                 f"card {uuid} dormant_proc_used_mib",
             ),
             dormant_source=str(entry.get("dormant_source", "")),
+            card_class=str(entry.get("card_class", "") or ""),
         )
     return XchgCensus(
         cards=cards,
         waves=tuple(waves),
         provenance=str(blob.get("provenance", "")),
         path=path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# AP4 1526: the census is joined to the LIVE inventory, not to this rig's UUIDs
+
+#: The refusal code of a census row that is BORROWED from another card.  It is
+#: a VALUE refusal in ``refusals.REGISTER`` (``--force`` starts with the
+#: borrowed row and prints ``FORCED-PAST HW-BORROWED``), wired through
+#: ``launcher.load_xchg_census_for_cards``.
+CODE_BORROWED = "HW-BORROWED"
+
+
+@dataclass(frozen=True)
+class CensusBorrow:
+    """One live card whose census row is BORROWED from another census row."""
+
+    uuid: str
+    nvml_index: int
+    name: str
+    card_class: str
+    donor_uuid: str
+    donor_class: str
+    #: ``class`` (a census row of the same card class), ``conservative`` (no
+    #: row of that class: the most demanding row of the census, which can only
+    #: OVER-price a peak) or ``map`` (the operator named the row).
+    kind: str
+
+    def text(self, census_path: str = "") -> str:
+        how = {
+            "class": "the most demanding census row of the SAME card class "
+                     f"({self.card_class})",
+            "conservative": "the census has no row of this card class "
+                            f"({self.card_class}); the most demanding row of the census "
+                            "stands in (it can only over-price the peak)",
+            "map": "the row the operator named (--weg2-xchg-census-map)",
+        }[self.kind]
+        return (
+            f"{CODE_BORROWED}: card {self.uuid} (nvml{self.nvml_index} {self.name}, "
+            f"class {self.card_class}) is not in the census {census_path or '<inline>'}; "
+            f"its row would be BORROWED from census row {self.donor_uuid} "
+            f"(class {self.donor_class or 'unlabelled'}) -- {how}.  The per-tag bytes "
+            "and the dormant residue are another card's measurement, applied here as if "
+            "measured on this one; the serving constants must not stand in -- they "
+            "contain none of the exchange lane's residency.  Measure this inventory "
+            "(weg2/xchg_census.py), name "
+            "the row with --weg2-xchg-census-map <live>=<census uuid>, or start with "
+            "--force"
+        )
+
+
+def parse_census_map(text: str) -> List[Tuple[str, str]]:
+    """``"<live>=<census uuid>[,...]"`` -> ``[(live, donor), ...]``.
+
+    ``<live>`` is a live card UUID, ``nvml<N>`` or a card class label
+    (``RTX3080``); ``<census uuid>`` is a key of the census file.  A malformed
+    item is W71 by name (an operator error, not forceable)."""
+    out: List[Tuple[str, str]] = []
+    for item in str(text or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        live, sep, donor = item.partition("=")
+        if not sep or not live.strip() or not donor.strip():
+            raise Weg2XchgResidencyUnarmable(
+                f"W71 Weg2XchgResidencyUnarmable: --weg2-xchg-census-map item {item!r} is "
+                "not <live>=<census uuid> (live = card UUID, nvml<N> or class label)"
+            )
+        out.append((live.strip(), donor.strip()))
+    return out
+
+
+def _demand_mib(entry: CardCensus) -> int:
+    """How much a census row asks of its card: both groups' tag bytes plus the
+    dormant residue counted twice (the same terms ``solve`` sums)."""
+    return (
+        sum(sum(per.values()) for per in entry.tags.values())
+        + 2 * int(entry.dormant_proc_used_mib)
+    )
+
+
+def resolve_census(
+    census: XchgCensus,
+    cards: Sequence[object],
+    census_map: str = "",
+    class_of: Optional[object] = None,
+) -> Tuple[XchgCensus, List[CensusBorrow], List[str]]:
+    """Give EVERY live card a census row, and say which rows are not its own.
+
+    ``(census', borrows, notes)``.  A live card whose UUID is a key of the
+    census keeps its own row untouched; when every live card is such a card the
+    SAME census object is returned and the lists are empty -- the reference rig
+    (and any inventory the census was measured on) is byte-for-byte what
+    ``solve`` always saw.
+
+    A live card without a row is not an ``is not in the census`` dead end:
+    its row is taken from a donor and reported as a :class:`CensusBorrow`, which
+    the launcher turns into the forcebar refusal ``HW-BORROWED``.  Donor order:
+    the operator's ``census_map`` (``notes`` says so, not a borrow to refuse:
+    the operator named it), else the most demanding row of the SAME card class,
+    else the most demanding row of the whole census.  The class of a donor is
+    its ``card_class`` field when the file states one, else the class of the
+    live card that carries its UUID, else unlabelled.
+
+    The model, format and flip mode are not looked at here and need not be: the
+    census file a profile hands in is already per model (its tag names, waves
+    and bytes), and a borrowed row keeps that model's tags -- the SAME code
+    serves the NF, INT8, FP8, NVFP4 and GGUF lines.
+    """
+    from sglang.srt.weg2 import card_identity
+
+    label = class_of if callable(class_of) else card_identity.class_label
+    live_by_uuid = {getattr(c, "uuid", ""): c for c in cards if getattr(c, "uuid", "")}
+    missing = [
+        c for c in cards
+        if getattr(c, "uuid", "") and getattr(c, "uuid", "") not in census.cards
+    ]
+    if not missing:
+        return census, [], []
+
+    donor_class: Dict[str, str] = {}
+    for duuid, entry in census.cards.items():
+        stated = getattr(entry, "card_class", "") or ""
+        if stated:
+            donor_class[duuid] = stated
+        elif duuid in live_by_uuid:
+            donor_class[duuid] = str(label(live_by_uuid[duuid]))
+        else:
+            donor_class[duuid] = ""
+
+    pairs = parse_census_map(census_map)
+    for _live, donor in pairs:
+        if donor not in census.cards:
+            raise Weg2XchgResidencyUnarmable(
+                f"W71 Weg2XchgResidencyUnarmable: --weg2-xchg-census-map names census row "
+                f"{donor!r}, which census {census.path or '<inline>'} does not carry "
+                f"(rows: {sorted(census.cards)})"
+            )
+
+    def _named(card: object) -> Optional[str]:
+        keys = {
+            getattr(card, "uuid", ""),
+            f"nvml{getattr(card, 'nvml_index', '?')}",
+            str(label(card)),
+        }
+        hit = [donor for live, donor in pairs if live in keys]
+        return hit[-1] if hit else None
+
+    new_cards = dict(census.cards)
+    borrows: List[CensusBorrow] = []
+    notes: List[str] = []
+    for card in missing:
+        uuid = getattr(card, "uuid", "")
+        cls = str(label(card))
+        named = _named(card)
+        if named is not None:
+            donor_uuid, kind = named, "map"
+        else:
+            same = [u for u, k in donor_class.items() if k and k == cls]
+            pool = same or list(census.cards)
+            donor_uuid = max(pool, key=lambda u: (_demand_mib(census.cards[u]), u))
+            kind = "class" if same else "conservative"
+        donor = census.cards[donor_uuid]
+        new_cards[uuid] = CardCensus(
+            uuid=uuid,
+            tags=donor.tags,
+            dormant_proc_used_mib=donor.dormant_proc_used_mib,
+            dormant_source=(
+                f"BORROWED ({kind}) from census row {donor_uuid}: {donor.dormant_source}"
+            ),
+        )
+        b = CensusBorrow(
+            uuid=uuid,
+            nvml_index=int(getattr(card, "nvml_index", -1)),
+            name=str(getattr(card, "name", "")),
+            card_class=cls,
+            donor_uuid=donor_uuid,
+            donor_class=donor_class.get(donor_uuid, ""),
+            kind=kind,
+        )
+        if kind == "map":
+            notes.append(
+                f"WEG2-XCHG-CENSUS-MAP card {uuid} (nvml{b.nvml_index} {b.name}, class "
+                f"{cls}) is priced from census row {donor_uuid} as named by "
+                "--weg2-xchg-census-map"
+            )
+        else:
+            borrows.append(b)
+    return (
+        XchgCensus(
+            cards=new_cards,
+            waves=census.waves,
+            provenance=census.provenance,
+            path=census.path,
+        ),
+        borrows,
+        notes,
     )
 
 

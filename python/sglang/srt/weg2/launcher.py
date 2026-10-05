@@ -10398,6 +10398,51 @@ def refuse_unless_same_form_source(
     )
 
 
+#: AP4 1526: ``--weg2-xchg-census-map`` of THIS launch, set once by ``main`` (the
+#: three census readers below take no ``ns``; their call texts are pinned by
+#: desk tests).  "" = no operator mapping.
+_XCHG_CENSUS_MAP: List[str] = [""]
+
+
+def set_xchg_census_map(text: str) -> None:
+    _XCHG_CENSUS_MAP[0] = str(text or "")
+
+
+def load_xchg_census_for_cards(
+    census_path: str,
+    cards: Sequence[Card],
+    log: Optional[Log] = None,
+    census_map: Optional[str] = None,
+) -> "xchg_residency.XchgCensus":
+    """AP4 1526: ``load_census`` + one row for EVERY live card, or a named refusal.
+
+    The census is a measurement of an inventory; the live inventory is whatever
+    this boot found.  A live card that is a key of the census keeps its row
+    (the reference rig and any inventory the census was measured on: the SAME
+    census object, nothing printed).  A card that is not gets a BORROWED row
+    (``xchg_residency.resolve_census``) -- and the borrow is the forcebar value
+    refusal ``HW-BORROWED`` (``refusals.refuse_value``): without ``--force`` a
+    named W71, with ``--force`` the boot starts and prints
+    ``FORCED-PAST HW-BORROWED``.  A row the operator named with
+    ``--weg2-xchg-census-map`` is an assertion, not a borrow: one
+    ``WEG2-XCHG-CENSUS-MAP`` line and no refusal.  The peak is still graded
+    against the card's LIVE NVML total by ``xchg_residency.solve``."""
+    census = xchg_residency.load_census(census_path)   # raises W71 by name
+    census, borrows, notes = xchg_residency.resolve_census(
+        census, cards, census_map=_XCHG_CENSUS_MAP[0] if census_map is None else census_map)
+    if log is not None:
+        for ln in notes:
+            log(ln)
+    seen = {(d["code"], d["text"]) for d in refusals.forced_list()}
+    for b in borrows:
+        text = "W71 Weg2XchgResidencyUnarmable: " + b.text(census.path)
+        if ("HW-BORROWED", text) in seen:
+            continue        # the second reader of the same census: already past
+        refusals.refuse_value(
+            "HW-BORROWED", text, xchg_residency.Weg2XchgResidencyUnarmable, log=log)
+    return census
+
+
 def prepare_weight_exchange(
     cards: List[Card],
     log: Log,
@@ -10438,7 +10483,7 @@ def prepare_weight_exchange(
     """
     if weight_source != "exchange":
         return None
-    census = xchg_residency.load_census(census_path)   # raises W71 by name
+    census = load_xchg_census_for_cards(census_path, cards, log)   # raises W71 by name
     res = xchg_residency.solve(cards, census, floor_mib)
     for ln in res.lines:
         log(ln)
@@ -22976,6 +23021,16 @@ def build_parser() -> argparse.ArgumentParser:
              "name (W71) rather than invent a table",
     )
     ap.add_argument(
+        "--weg2-xchg-census-map", default="",
+        help="AP4 1526: name the census row that prices a live card the census does "
+             "not carry by UUID: comma list of <live>=<census uuid>, <live> = a live "
+             "card UUID, nvml<N> or a card class label (RTX3080). Accepted as the "
+             "operator's assertion (one WEG2-XCHG-CENSUS-MAP line, no refusal). A live "
+             "card with neither a census row nor a mapping is BORROWED from the "
+             "heaviest row of its class (else of the census) and refused as HW-BORROWED "
+             "unless --force. Ignored when every live card is in the census",
+    )
+    ap.add_argument(
         "--weg2-xchg-census-foreign", action="store_true",
         help="27B line (weg2xsn441): accept a --weg2-xchg-census that was MEASURED "
              "on another checkpoint than --model (named line WEG2 XCHG-CENSUS "
@@ -24115,6 +24170,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     front_log = None if dry else f"{base}.front.log"
     log = Log(front_log)
     log(f"=== WEG2 BOOT tag={ns.tag} tree={tree} @ {tip} ({'DIRTY: ' + dirty[:200] if dirty else 'clean'}) stamp={stamp} dry={dry}")
+    set_xchg_census_map(getattr(ns, "weg2_xchg_census_map", ""))
     if getattr(ns, "force", False):
         # PROFIL-EDITOR S1: one switch for all VALUE refusals (weg2/refusals.py); the sink writes each one to state.json events
         refusals.arm(True, sink=lambda code, text: boot_state_write(log, event=("forced_past", {"code": code, "text": text})))
@@ -26897,9 +26953,7 @@ def xchg_form_dormant_reserve(
     selector, so there is no parallel reserve object; it exists so a boot log
     says WHAT the reserve is and WHERE both numbers came from.
     """
-    from sglang.srt.weg2 import xchg_residency
-
-    census = xchg_residency.load_census(census_path)
+    census = load_xchg_census_for_cards(census_path, cards, log)
     out: Dict[str, int] = {}
     lines: List[str] = []
     census_rules = xchg_census_is_reserve(profile)

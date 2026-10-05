@@ -80,6 +80,14 @@ REGISTER: Tuple[Refusal, ...] = (
        "weg2/card_identity.py uncalibrated_message; launcher.inventory_check_line", "launcher",
        "Die Zahlen des Profils werden auf das fremde Inventar angewendet, als wären sie dafür gemessen (Boot-Log trägt FORCED-PAST). "
        "Zu erwarten: Fehlbudgets, im schlechten Fall OOM beim Laden oder Graph-Aufbau."),
+    _v("HW-BORROWED", "Census-Zeile einer Karte ist von einer anderen Karte geliehen",
+       "AP4 1526: der W71-Residenz-Census (--weg2-xchg-census) ist je Karten-UUID gemessen. Eine Karte des laufenden Inventars, die "
+       "nicht im Census steht (fremdes Rig, andere Kartenzahl, andere Klasse), bekommt die Zeile der schwersten Census-Karte "
+       "gleicher Klasse bzw. (ohne Klasse) der schwersten Zeile ueberhaupt. Eine geliehene Messung ist ein Urteil ueber die Guete "
+       "der Zahlen, nicht ueber die Moeglichkeit zu starten; der Peak wird weiter gegen die LIVE-NVML-Summe der Karte geprueft.",
+       "weg2/xchg_residency.py resolve_census; launcher.load_xchg_census_for_cards", "launcher",
+       "Der Austausch-Peak wird aus der geliehenen Zeile gerechnet (Boot-Log traegt FORCED-PAST HW-BORROWED). Zu erwarten: Peak "
+       "ueber- oder unterschaetzt; eine zu kleine Karte verweigert weiter ueber W71 (Peak gegen NVML-Summe)."),
     _v("HOST-MEM", "Host-Speicher unter der Schwelle",
        "Eine Schwelle (host_ledger-Preflight, MemAvailable >= 40 GiB) gegen einen gemessenen Wert: Kapazität, kein Fehler.",
        "launcher.host_preflight", "launcher",

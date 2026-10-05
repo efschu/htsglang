@@ -208,6 +208,12 @@ CURATED: Dict[str, Dict[str, object]] = {
         "text": "JSON-Datei mit der gemessenen Tabelle je Karte/Tag/Gruppe, aus der W71 die VRAM-Spitze des Austauschs preist.",
         "gain": "Macht den Kartenaustausch preisbar.", "cost": "Muss für genau dieses Modell gemessen sein.",
         "depends": [_d("--weg2-weight-source", "braucht", "Nur mit exchange verlangt.", "text")]},
+    "--weg2-xchg-census-map": {
+        "kind": "flag", "group": "Speicher", "level": "experte", "planner_derived": False,
+        "text": "Benennt die Census-Zeile, aus der eine Karte gepreist wird, die nicht per UUID in der Census-Datei steht: Liste <live>=<Census-UUID>, <live> = Karten-UUID, nvml<N> oder Klasse (RTX3080). Ohne Eintrag leiht der Start die schwerste Zeile der gleichen Klasse (sonst der ganzen Census) und verweigert das als HW-BORROWED, bis Force gesetzt ist.",
+        "gain": "Fremde Karten, andere Kartenzahl oder anderes Rig starten mit dem Austausch, ohne dass die Census-Datei neu gemessen wird.",
+        "cost": "Die Bytes sind die einer anderen Karte; der Peak wird weiter gegen die echte VRAM-Summe der Karte geprueft.",
+        "depends": [_d("--weg2-xchg-census", "braucht", "Benennt eine Zeile dieser Census-Datei.", "text")]},
     "--weg2-vision": {
         "kind": "flag", "group": "Speicher", "level": "einfach", "planner_derived": False,
         "text": "'off' (Standard) startet beide Gruppen ohne Vision-Tower; 'resident' hält ihn geladen.",
