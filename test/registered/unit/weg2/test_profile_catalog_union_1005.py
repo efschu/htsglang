@@ -135,6 +135,16 @@ class Union(unittest.TestCase):
         self.assertEqual(cat["entries"]["--nf-only"]["baeume"], ["nf"])
         self.assertEqual(cat["entries"]["--both"]["baeume"], ["27b", "nf"])
 
+    def test_output_carries_no_build_path(self):
+        """Reproduzierbarer Bau (Wunsch 27B-Sitz 05.10.): derselbe Quellstand ergibt dieselbe Datei, egal in welchem Verzeichnis die Bäume liegen.
+        Ein Baum-Pfad in der Ausgabe (``trees.<baum>.python_dir``) machte sie von Maschine zu Maschine verschieden."""
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            cat = self._build(d, ["SGLANG_A = EnvBool(False)"], ["SGLANG_A = EnvBool(False)"])
+            text = json.dumps(cat, default=str)
+            self.assertNotIn(d, text)
+        self.assertEqual(sorted(cat["trees"]["27b"]), ["entries", "rev"])
+
     def test_cli_wants_both_trees(self):
         with self.assertRaises(SystemExit):
             PC.main(["--tree-27b", "/nonexistent"])
