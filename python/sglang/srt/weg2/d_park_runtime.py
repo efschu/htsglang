@@ -1176,6 +1176,13 @@ def admission(sched, running_batch):
         settle = []
     pending = settle + list(getattr(sched, "weg2_dormant_hold", None) or [])
     avail = sched.uniform_min_avail() if book.margin_tokens >= 0 else None
+    # #1989 (dual D, default off): the seat cap for d_seats' OLDER-LIVE-FREE room --
+    # the same replicated cap displace_for_age reads. Off: None, the gate as before.
+    cap = None
+    if d_seats.older_live_free_armed():
+        cap = seat_cap(sched)
+        if cap is None:
+            cap = int(getattr(getattr(sched, "server_args", None), "max_running_requests", 0) or 0) or None
     gate = d_seats.admission_gate(
         sched.waiting_queue,
         running=list(running_batch.reqs),
@@ -1183,6 +1190,7 @@ def admission(sched, running_batch):
         avail_tokens=avail,
         resume_book=book,
         decode_first=decode_first_facts(sched, running_batch),
+        seat_cap=cap,
     )
     if gate.deferred:
         _note_decode_first(sched, gate)

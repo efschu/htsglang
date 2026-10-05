@@ -283,6 +283,15 @@ class AdmissionGate:
     #: Q-692: every parked request still waiting is ``defer_exempt`` (and none
     #: waits outside the queue) -- the barrier stands for nobody
     newcomers_free: bool = False
+    #: #1989 (dual D, ``SGLANG_WEG2_DUAL_D_PARK_OLDER_LIVE_FREE``): every parked
+    #: request still waiting is a pressure park blocked ONLY because an older
+    #: request RUNS -- none of them can come back this pass. Newcomers may take
+    #: up to ``seat_room`` seats this pass (``seat_cap - running - parked``: the
+    #: parked ones keep theirs). None = the relaxation is off (the barrier as
+    #: before).
+    seat_room: Optional[int] = None
+    #: #1989: the parked rids of this pass (to count the newcomers admitted)
+    parked_rids: FrozenSet[str] = frozenset()
 
     def skip(self, req, admitted=None, skip_extend: bool = False) -> Optional[str]:
         """Census key when ``req`` is skipped this pass, else None.
@@ -298,6 +307,12 @@ class AdmissionGate:
             return "weg2_d_park_decode_first" if str(req.rid) in self.deferred else None
         if not self.barrier or skip_extend or self.newcomers_free:
             return None
+        if self.seat_room is not None:
+            # #1989: the parked ones cannot resume this pass (an older request
+            # runs); a newcomer takes a FREE seat beside them, never theirs.
+            taken = sum(1 for a in (admitted or ()) if str(a) not in self.parked_rids)
+            if taken < self.seat_room:
+                return None
         if self.deferred and self.cohort_wake is not None and in_wake_cohort(req, self.cohort_wake):
             # F3: a member of THIS wake goes ahead of the deferred resume; the
             # resume keeps its seat (the wake counted handoff_n + parked_n)
@@ -481,6 +496,8 @@ def admission_gate(
     avail_tokens: Optional[int] = None,
     resume_book: Optional[ResumeBook] = None,
     decode_first: Optional[DecodeFirst] = None,
+    seat_cap: Optional[int] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> AdmissionGate:
     """The stage-1 rule, per pass.
 
@@ -490,6 +507,9 @@ def admission_gate(
       "ist der aeltere fertig, wird der juengere zurueckgeholt" -- or, only
       with the stage-2 margin armed, after the hysteresis held.
     * While any parked request waits, no newcomer is admitted.
+    * #1989 (dual D, default off, :func:`older_live_free_armed`): unless every
+      parked request still waiting is blocked only by an older RUNNING one --
+      then newcomers take the seats beyond ``seat_cap - running - parked``.
     """
     parked_waiting = [r for r in waiting if park_site(r) is not None]
     parked_outside = [r for r in pending_outside if park_site(r) is not None]
@@ -507,6 +527,7 @@ def admission_gate(
     # spent (d_park_runtime: _lift_holds_when_idle / DISPLACE-EXHAUSTED).
     still_waiting = {str(getattr(q, "rid", "")) for q in list(waiting) + list(pending_outside)}
     held_for_older = 0
+    older_blocked = set()  # #1989: blocked only by the older-live rule
     for r in parked_waiting:
         if park_site(r) != SITE_PRESSURE:
             continue
@@ -530,6 +551,7 @@ def admission_gate(
                 resume_book.note_resume(str(r.rid), avail_tokens=int(avail_tokens), need_tokens=need)
                 continue
         blocked.add(str(r.rid))
+        older_blocked.add(str(r.rid))
     if resume_book is not None:
         resume_book.forget(str(r.rid) for r in parked_waiting)
     deferred = (
@@ -548,7 +570,13 @@ def admission_gate(
         note = note[:-1] + f" defer_exempt={len(exempt)})"
     _waiting_parked = [r for r in holders if str(r.rid) not in blocked] or holders
     oldest = min((_arrival(r) for r in _waiting_parked + parked_outside), default=None)
+    seat_room = _older_live_seat_room(holders, older_blocked, held_for_older, deferred,
+                                      parked_outside, parked_waiting, running, seat_cap, env)
+    if seat_room is not None:
+        note = note[:-1] + f" older_live_free={len(holders)} seat_room={seat_room})"
     return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note,
+                         seat_room=seat_room,
+                         parked_rids=frozenset(str(r.rid) for r in parked_waiting),
                          oldest_parked_age=oldest,
                          parked_in_queue=frozenset(str(r.rid) for r in holders),
                          parked_outside=len(parked_outside),
@@ -580,6 +608,59 @@ def _dual_defer_exempt(parked_waiting: Sequence) -> FrozenSet[str]:
                         "read (D-HANDBACK-DEFER / X-DEFER): it holds no younger newcomer back",
                         str(r.rid)[:16], park_site(r))
     return out
+
+
+OLDER_LIVE_FREE_ENV = "SGLANG_WEG2_DUAL_D_PARK_OLDER_LIVE_FREE"
+
+
+def older_live_free_armed(env: Optional[Mapping[str, str]] = None) -> bool:
+    """#1989: group D of the dual layout AND the switch (default off)."""
+    from sglang.srt.weg2 import dual_handback_defer as _hbd
+
+    e = os.environ if env is None else env
+    if not _hbd.armed(e):
+        return False
+    return str(e.get(OLDER_LIVE_FREE_ENV, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _older_live_seat_room(holders, older_blocked, held_for_older, deferred, parked_outside,
+                          parked_waiting, running, seat_cap, env) -> Optional[int]:
+    """#1989 D-PARK OLDER-LIVE-FREE (pt2 fs10051150, 11:56:02-12:00:05Z): SEAT-AGE
+    parked weg2-0-7 for the older weg2-0-5; once 0-5 ran, 0-7 was blocked by the
+    older-live rule for the whole of 0-5's 243-s decode, and the barrier gave
+    every younger arrival ``weg2_d_park_first`` -- D decoded bs=1 with 5 of 6
+    seats waiting, 0 X-GATE and 0 Prefill batch in 209 s, ~100k rows free.
+
+    A parked request blocked by a RUNNING older one is not coming back to a seat
+    this pass, so the barrier (which exists to keep its seat) need not hold the
+    FREE seats. The seats newcomers may take: ``seat_cap - running - parked``.
+    Only when EVERY parked request still waiting is such a one -- none held for
+    an older one still WAITING (Q-698: that one gets the KV first), no F3
+    deferral, nothing parked outside the queue. Inputs are replicated (queue,
+    running set, rids, the seat cap), so every rank decides alike. None = off."""
+    if seat_cap is None or not holders or held_for_older or deferred or parked_outside:
+        return None
+    if any(str(r.rid) not in older_blocked for r in holders):
+        return None
+    if not older_live_free_armed(env):
+        return None
+    room = int(seat_cap) - len(list(running)) - len(parked_waiting)
+    if room <= 0:
+        return None
+    for r in holders:
+        if not getattr(r, "_weg2_1989_said", False):
+            try:
+                r._weg2_1989_said = True
+            except Exception:  # noqa: BLE001
+                pass
+            older = min((x for x in running if _arrival(x) < _arrival(r)), key=_arrival, default=None)
+            logger.info("WEG2-D-PARK OLDER-LIVE-FREE rid=%s older_running=%s seat_room=%d running=%d "
+                        "parked=%d cap=%d -- parked behind an older RUNNING request, it cannot resume "
+                        "this pass: younger newcomers take the free seats beside it (its own seat "
+                        "stays held)", str(r.rid)[:16],
+                        str(getattr(older, "rid", None))[:16], room, len(list(running)),
+                        len(parked_waiting), int(seat_cap))
+    return room
 
 
 AP_ENV = "SGLANG_WEG2_D_PARK_BARRIER_ADMITTED"

@@ -34,6 +34,8 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-1330 DUAL-SHARE stage 3: the green-context ladder of P (weg2/dual_green.py): no actuator, no stream pick, no
          wire object, graphs never forced eager, fallback hooks inert; the behavioural half is
          test_dual_green_ladder_1330 (three-stage wire, launch order, mutants)
+  #1989  D-PARK OLDER-LIVE-FREE (weg2/d_seats.py): no seat room, the park barrier as before; the behavioural
+         half is test_dual_d_park_older_live_free_1989_1005
 """
 from __future__ import annotations
 
@@ -1066,3 +1068,27 @@ class TestQ1730FrontRejectOverlongFlipUnchanged:
         f._store_probe_info = {"max_kv_per_request": 131072}
         assert f._overlong_gate("r", "/v1/messages", SimpleNamespace(n=10 ** 6, mm=False)) is None
         assert not f.counters
+
+
+# ---------------------------------------------------------------------------------- #1989
+
+class TestQ1989ParkOlderLiveFreeFlipUnchanged:
+    def test_flip_form_keeps_the_park_barrier_even_with_the_switch_on(self, monkeypatch):
+        """#1989: without the dual layout (or on P) no seat room is ever opened -- a pressure park blocked
+        behind an older running request keeps every younger newcomer behind the barrier, as before."""
+        from sglang.srt.weg2 import d_seats
+
+        monkeypatch.setenv("SGLANG_WEG2_DUAL_D_PARK_OLDER_LIVE_FREE", "1")
+        for env in [{}, {"SGLANG_WEG2_GROUP": "D"}, {"SGLANG_WEG2_GROUP": "P", "SGLANG_WEG2_DUAL_LAYOUT": "1"}]:
+            for k in DUAL_KEYS:
+                monkeypatch.delenv(k, raising=False)
+            for k, v in env.items():
+                monkeypatch.setenv(k, v)
+            assert d_seats.older_live_free_armed() is False, env
+            older = SimpleNamespace(rid="weg2-0-5", origin_input_ids=[0], output_ids=[], kv_arrival_seq=5)
+            parked = SimpleNamespace(rid="weg2-0-7", origin_input_ids=[0], output_ids=[], kv_arrival_seq=7)
+            d_seats.mark_parked(parked, d_seats.SITE_PRESSURE)
+            new = SimpleNamespace(rid="weg2-0-18", origin_input_ids=[0], output_ids=[], kv_arrival_seq=18)
+            gate = d_seats.admission_gate([parked, new], running=[older], seat_cap=6)
+            assert gate.seat_room is None, env
+            assert gate.skip(new, admitted=[]) == "weg2_d_park_first", env

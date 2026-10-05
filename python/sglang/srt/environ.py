@@ -837,6 +837,15 @@ class Envs:
     # of the wall clock P asleep (stage 2). On: the front takes locked_frac / arena_pinned from D's published
     # reading (an older D without them: the old fields). Off = byte for byte as before.
     SGLANG_WEG2_DUAL_D_SIGNAL_LOCKED = EnvBool(False)
+    # #1989 D-PARK OLDER-LIVE-FREE (dual D, default off): a SEAT-AGE victim (pressure park) that waits only
+    # because an OLDER request is RUNNING (``d_seats.admission_gate`` older_live; no older one still waiting
+    # for it, no decode-first deferral, nothing parked outside the queue) cannot resume this pass -- so it
+    # no longer holds every younger newcomer behind the barrier while free seats exist. Newcomers take at
+    # most ``seat_cap - running - parked`` seats this pass (the parked one's seat stays held); KV, X gate,
+    # HOL and the adder decide as always. pt2 (fs10051150 11:56:02-12:00:05): weg2-0-7 displaced for
+    # weg2-0-5, 0-5 decoded 12648 tokens for 243 s, D ran bs=1 with 5 of 6 seats waiting (0 X-GATE,
+    # 0 Prefill batch in 209 s), weg2-0-18 (1132 tok) got its first token after 233 s. Off = as before.
+    SGLANG_WEG2_DUAL_D_PARK_OLDER_LIVE_FREE = EnvBool(False)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,
