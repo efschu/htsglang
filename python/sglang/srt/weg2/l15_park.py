@@ -161,6 +161,18 @@ def run_park(direction: str, pieces: Sequence[ParkPiece], rank: int,
                 if rank == to:
                     out = b[to_row + c0:to_row + c0 + n]
                     out_splits[frm] = n
+                if uniform and rank != frm and rank != to:
+                    # barlink-BAR1's a2a refuses ``in`` and ``out`` with the
+                    # same data_ptr ("in and out must not be the same"), and an
+                    # EMPTY tensor's data_ptr is 0: the third rank of a piece
+                    # (neither source nor destination) handed in two empties,
+                    # raised in round 1 and left the other two waiting 60 s
+                    # for it (j2, 05.10. 01:18Z). ``out`` may be larger than
+                    # the receive counts (barlink checks only sum(out_rows) <=
+                    # rows), ``in`` must match its splits exactly: give the
+                    # bystander one row of ``out`` -- every split is 0, so no
+                    # byte is read or written.
+                    out = b[0:1]
                 if uniform:
                     a2a(out, inp, out_splits, in_splits, rows=n)
                 else:

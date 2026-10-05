@@ -98,6 +98,11 @@ class _FakeBar1:
         return 1
 
     def barlink_all_to_all_single(self, comm, output, inp, send_bytes, recv_bytes, rounds=None):
+        # the real extension's TORCH_CHECK (barlink_bar1_ext.py, a2a): an rank that
+        # is neither source nor destination of a piece used to hand in TWO empty
+        # views at row 0 -> same data_ptr -> RuntimeError in round 1 (j2, 05.10.)
+        if inp.data_ptr() == output.data_ptr():
+            raise RuntimeError("barlink-bar1 a2a: in and out must not be the same")
         rb = int(output.shape[1]) * output.element_size()
         self.sim.exchange("bar1", output, inp, [b // rb for b in send_bytes],
                           [b // rb for b in recv_bytes])

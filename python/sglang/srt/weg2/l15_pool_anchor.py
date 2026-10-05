@@ -881,6 +881,11 @@ def run_anchor_park(direction: str, guests: Sequence[Sequence[int]], rank: int,
             if rank == to:
                 out = recv[c0:c0 + n]
                 out_splits[frm] = n
+            if uniform and rank != frm and rank != to:
+                # same as l15_park.run_park: BAR1's a2a refuses in/out with one
+                # data_ptr, and two empties are both 0 -- the bystander gets a
+                # one-row ``out`` (all splits 0: nothing is read or written).
+                out = torch.empty((1, rb), dtype=torch.uint8, device=dev)
             if uniform:
                 a2a(out, inp, out_splits, in_splits, rows=n)
             else:
