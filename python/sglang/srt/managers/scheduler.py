@@ -20802,7 +20802,33 @@ class Scheduler(
                                          "tp_rank", 0) or 0), os.environ)
                     if _l15_flip is not None and int(_l15_flip) >= 0:
                         try:
+                            # L15-RESTAMP (1840 Fix A): the park sidecar of this
+                            # sleep (written between the two flushes) carries the
+                            # manifest's OLD epoch; read it before the restamp
+                            # moves it on. Park off = no read, no file, no change.
+                            _l15_old_ep = None
+                            _l15_pk_rs = None
+                            try:
+                                from sglang.srt.weg2 import l15_park as _l15_pk_mod
+
+                                if _l15_pk_mod.park_on(os.environ):
+                                    _l15_pk_rs = _l15_pk_mod
+                                    _l15_old_m = l15_manifest.read(_l15_mp)
+                                    if _l15_old_m is not None:
+                                        _l15_old_ep = int(_l15_old_m.epoch)
+                            except Exception as _exc:  # noqa: BLE001 -- park stays stale -> wake falls back to L2
+                                _l15_pk_rs = None
+                                logger.info("L15-PARK restamp skipped (%s)", _exc)
                             l15_sleep_once.restamp(_l15_mp, int(_l15_flip))
+                            if _l15_pk_rs is not None and _l15_old_ep is not None:
+                                try:
+                                    _l15_pk_rs.restamp_sidecar(
+                                        int(getattr(getattr(self, "ps", None),
+                                                    "tp_rank", 0) or 0),
+                                        os.environ, int(_l15_flip),
+                                        only_if_epoch=_l15_old_ep)
+                                except Exception as _exc:  # noqa: BLE001 -- park stays stale -> wake falls back to L2
+                                    logger.info("L15-PARK restamp skipped (%s)", _exc)
                         except FileNotFoundError:
                             pass
                     logger.info(

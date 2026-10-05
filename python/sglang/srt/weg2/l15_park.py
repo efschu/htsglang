@@ -255,6 +255,35 @@ def take_sidecar(rank: int, env) -> Optional[Tuple[int, List[ParkPiece]]]:
     return int(d.get("epoch", -1)), [ParkPiece(*map(int, x)) for x in d.get("pieces", ())]
 
 
+def restamp_sidecar(rank: int, env, epoch: int, only_if_epoch: Optional[int] = None) -> bool:
+    """L15-RESTAMP (1840 Fix A): stamp ``epoch`` into this rank's park record
+    WITHOUT consuming it. Used by the reuse branch of the second sleep flush:
+    ``park_at_release`` ran between the two flushes and copied the STALE flip
+    index of flush 1 into the record; the reuse restamp of the manifest then
+    moved the hold epoch on, and the wake refused the park (``park epoch 12 !=
+    hold epoch 14``). Only the ``epoch`` field changes -- pieces, sums and guest
+    lists stay byte for byte. ``only_if_epoch``: leave a record alone whose
+    epoch is another one (it does not belong to the manifest being restamped).
+    Returns True when the record was rewritten; no file -> False, no error."""
+    import json
+    import os
+
+    path = sidecar_path(rank, env)
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return False
+    if only_if_epoch is not None and int(rec.get("epoch", -1)) != int(only_if_epoch):
+        return False
+    rec["epoch"] = int(epoch)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(rec, fh)
+    os.replace(tmp, path)
+    return True
+
+
 # -- S2 pooled hold: source checksum of the guest rows, plan agreement -------------
 
 SAMPLE_ROWS = 16
