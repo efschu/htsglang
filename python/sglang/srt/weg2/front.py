@@ -4046,6 +4046,26 @@ def _decode_collect_window_s() -> float:
     except (TypeError, ValueError):
         return 0.0
 
+
+def _sum_priced_take(entries: List["Pending"], *, carried: int, limit: int) -> Tuple[List["Pending"], List["Pending"]]:
+    """X-SUM-PRICE: X bounds what D prefills IN TOTAL. Take the queued SHORTs
+    oldest first while ``carried`` (already waiting for D) plus the taken
+    ``est_uncached`` stay within ``limit``; the rest is returned as kept back
+    (it stays queued, the flip to P takes it). The first entry is taken when
+    nothing is carried (its own price already passed X)."""
+    taken: List["Pending"] = []
+    kept: List["Pending"] = []
+    total = int(carried)
+    for p in sorted(entries, key=lambda e: float(e.t_arrive)):
+        u = int(p.est_uncached or 0)
+        if total + u <= int(limit):
+            taken.append(p)
+            total += u
+        else:
+            kept.append(p)
+    return taken, kept
+
+
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
@@ -11013,11 +11033,26 @@ class Front:
         x = self._x_band_floor() if d_busy else int(self.tp_prefill_max_tokens)
         def _g(p, k, d=None):  # getattr: partial test doubles (phase_policy's convention)
             return getattr(p, k, d)
-        moved = [p for p in live_q
-                 if _g(p, "d_eligible", False) and not _g(p, "intake_stalled", False)
-                 and not _g(p, "leg1_done", False) and not _g(p, "reroutes", 0)
-                 and not _g(p, "x_requeues", 0) and not _g(p, "p_only", False)
-                 and not _g(p, "x_deferred", False) and 0 <= int(_g(p, "est_uncached", 0) or 0) <= x]
+        eligible = [p for p in live_q
+                    if _g(p, "d_eligible", False) and not _g(p, "intake_stalled", False)
+                    and not _g(p, "leg1_done", False) and not _g(p, "reroutes", 0)
+                    and not _g(p, "x_requeues", 0) and not _g(p, "p_only", False)
+                    and not _g(p, "x_deferred", False) and 0 <= int(_g(p, "est_uncached", 0) or 0) <= x]
+        # X-SUM-PRICE (Nutzer 05.10. "pending token werden gesammelt und als SUMME bepreist"):
+        # X prices what D prefills IN TOTAL, not per request. Boot 063507: the P
+        # phase's seat cap left 8-32/8-34/8-37 (12.2k each) in the queue; each
+        # passed X=12288 alone and D prefilled 36.7k of fresh text (44k in that
+        # minute) -- the very sum DECODE-COLLECT sends to P. Oldest first up to X
+        # (counting what already waits for D); the rest stays queued for P.
+        carried = sum(int(_g(r, "est_uncached", 0) or 0) for r in self._ready_for_d if _g(r, "d_direct", False))
+        moved, kept_back = _sum_priced_take(eligible, carried=carried, limit=x)
+        if kept_back:
+            self.counters["arrival_seat_queue_sum_kept"] += len(kept_back)
+            logger.info("%s X-SUM-PRICE kept=%d rids=%s uncached=%s carried=%d X=%d taken=%d -- the queued SHORTs "
+                        "together exceed X: the oldest %d go to D, the rest stays queued for P (the flip takes "
+                        "it), not prefilled on D one by one", _asr.MARKER, len(kept_back),
+                        [p.rid for p in kept_back][:6], [int(p.est_uncached) for p in kept_back][:6], carried, x,
+                        len(moved), len(moved))
         for p in moved:
             try:
                 self.queue.remove(p)
