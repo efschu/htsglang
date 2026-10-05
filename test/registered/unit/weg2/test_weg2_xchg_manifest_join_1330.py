@@ -1044,10 +1044,27 @@ def test_the_product_write_site_passes_the_group_unique_rank():
     # runner -- pp_rank 0 -- cannot tell), with the runner's own ``self.pp_rank``
     # only as the fallback on a desk without a process group.  Either way the
     # PP axis, and not tp_rank, is what reaches ``arm_coverage_at_load``.
-    assert "pp_rank=_pp_rank_of_process" in runner
+    #
+    # Read over the AST, at the CALL: the same keyword text also sits in the
+    # `_weg2_manifest_identity` dict a few lines below, so a substring check
+    # survives a mutant that hands `tp_rank` to `arm_coverage_at_load` itself
+    # (found by the 1533 mutation run: 59/59 green with `pp_rank=self.tp_rank`).
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(
+        __import__("sglang.srt.model_executor.model_runner",
+                   fromlist=["x"]).ModelRunner.load_model)))
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "id", getattr(n.func, "attr", None)) == "arm_coverage_at_load"]
+    assert len(calls) == 1, f"expected ONE arm_coverage_at_load call, got {len(calls)}"
+    kws = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+    assert kws.get("pp_rank") == "_pp_rank_of_process", kws
+    assert kws.get("tp_size") == "self.tp_size", kws
+    assert kws.get("tp_rank") == "self.tp_rank", kws
     assert 'getattr(_ps, "_PP", None)' in runner
     assert "else int(self.pp_rank)" in runner
-    assert "tp_size=self.tp_size" in runner
 
 
 # ---------------------------------------------------------------------------
