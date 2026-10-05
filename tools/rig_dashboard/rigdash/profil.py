@@ -30,6 +30,7 @@ import time
 from typing import Dict, List, Optional
 
 from . import kartenplan_catalog as CAT
+from .kartenplan import MAX_CARDS
 from . import kvheads as KVH
 from . import kartenplan_transport as TR
 
@@ -559,8 +560,8 @@ class ProfilEditor:
             raise ProfilError("doc ist kein %s" % pj.SCHEMA)
         if not cards_req:
             raise ProfilError("mindestens eine Karte wählen")
-        if len(cards_req) > 6:
-            raise ProfilError("höchstens 6 Karten")
+        if len(cards_req) > MAX_CARDS:
+            raise ProfilError("höchstens %d Karten" % MAX_CARDS)
         rows = {r["name"]: r for r in pj.rows(doc, self.specs()) if r["kind"] == "var"}
 
         def var(n: str) -> str:
