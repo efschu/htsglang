@@ -403,6 +403,15 @@ class Envs:
     # page count, token counts). Off by default; read-only, no sync.
     SGLANG_WEG2_READ_FIRST_FAIL_LOG = EnvBool(False)
 
+    # 1494: mamba-arena fill instrument. No log says how many of the arena's
+    # slots are occupied when a claim is refused or room is made (the Q-1303
+    # measurement had to use ARENA-CLAIM REFUSED / ARENA-DROP as a proxy). With
+    # this switch on, those events (and, rate-limited, successful claims) log
+    # ONE `WEG2 MAMBA-ARENA-FILL` line from the arena's existing counters
+    # (stats(): slots/complete/claimed) and the staging free list. Off by
+    # default; no extra sync, no slot scan.
+    SGLANG_WEG2_MAMBA_ARENA_FILL_LOG = EnvBool(False)
+
     # #695: allocate the permanent phase-flip host weight images at their exact
     # size (MAP_ANONYMOUS + cudaHostRegister) instead of through torch's pinned
     # caching allocator, which rounds every request up to a power of two and

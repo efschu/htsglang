@@ -624,6 +624,32 @@ _COMPLETE_LOST_CALLS = [0]
 _LOST_NAMES = {3: "recycled", 4: "not_claimed", 5: "overflow"}
 
 
+#: 1494: last emit time per (pool class, event) for the fill line (seconds)
+_FILL_LOG_LAST: dict = {}
+_FILL_LOG_MIN_GAP_S = 1.0
+
+
+def _arena_fill_log(pool, event: str) -> None:
+    """1494: ONE ``WEG2 MAMBA-ARENA-FILL`` line from the arena's own counters.
+    used = complete + claimed (arena.c keeps the two states disjoint, so
+    free = slots - used); staging_used = staging rows minus the free list.
+    Reads one 4-word stats call; at most one line per second per pool class
+    and event. Off (default) = a single env read, nothing else."""
+    if not envs.SGLANG_WEG2_MAMBA_ARENA_FILL_LOG.get():
+        return
+    key = (type(pool).__name__, event)
+    now = time.monotonic()
+    if now - _FILL_LOG_LAST.get(key, -_FILL_LOG_MIN_GAP_S) < _FILL_LOG_MIN_GAP_S:
+        return
+    _FILL_LOG_LAST[key] = now
+    st = pool.arena.stats()
+    slots, complete, claimed = int(st["slots"]), int(st["complete"]), int(st["claimed"])
+    logger.info("WEG2 MAMBA-ARENA-FILL event=%s pool=%s used=%d/%d claimed=%d complete=%d free=%d "
+                "staging_used=%d/%d", event, type(pool).__name__, complete + claimed, slots,
+                claimed, complete, slots - complete - claimed,
+                int(pool.staging_rows) - len(pool.free_slots), int(pool.staging_rows))
+
+
 def _host_write_claim(arena, stems, totals):
     """L3FILL-JOINED (30.09.): the direct host writes (write-through, park)
     claim with the host-write role, so a JOIN names them; a fake arena
@@ -2005,6 +2031,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 if k <= 8 or k % 256 == 0:
                     logger.warning("#1427 ARENA-CLAIM REFUSED n=%d pages=%d statuses=%s (4 = no free slot)",
                                    k, len(stems), sorted(set(st.tolist())))
+                _arena_fill_log(self, "claim_refused")
                 return None
         pend = st != 2
         if bool(pend.any()):
@@ -2279,6 +2306,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         l3_state[0], l3_state[1], l3_state[2],
                         ArenaMHAHostPool._257_written_to_l3,
                         ArenaMHAHostPool._257_dropped_without_l3)
+        _arena_fill_log(self, "drop")
         return len(cands) + len(reaped) + len(reaped0)
 
     def _claim(self, stems):
@@ -2332,11 +2360,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 if k <= 8 or k % 256 == 0:
                     logger.warning("#1427 ARENA-CLAIM REFUSED n=%d pages=%d statuses=%s (4 = no free slot)",
                                    k, len(stems), sorted({st for _, st, _ in got}))
+                _arena_fill_log(self, "claim_refused")
                 return None
         # xsn352 (py-spy PP0): the per-slot loop was ~27 ms per 4096-page node
         # in the scheduler thread -- batched: one dict update, one ref call.
         self._pending.update((slot, (gen, st == 0)) for slot, st, gen in got if st != 2)
         self._pend_mark([slot for slot, st, _ in got if st != 2], True)
+        _arena_fill_log(self, "claim")
         return [slot for slot, _, _ in got]
 
     def alloc_write(self, hashes) -> Optional[torch.Tensor]:
