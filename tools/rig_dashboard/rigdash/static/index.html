@@ -118,14 +118,21 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .pf-part { margin: 3px 0; } .pf-gc { margin: 4px 0; font-size: 12px; }
 .pf-deps { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
 .pf-dep { font-size: 11px; padding: 0 7px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); cursor: pointer; }
-.pf-dep-off { opacity: .55; border-style: dashed; }
-.pf-dep-rej { border-color: var(--warn); cursor: help; } .pf-dep i { font-style: normal; font-size: 10px; margin-left: 5px; opacity: .85; }
-.pf-dep-nb { color: var(--warn); } .pf-dep-b { color: var(--good); } .pf-dep-w { color: var(--text-2); }
+.pf-dep-off { border-style: dashed; background: transparent; color: var(--text-2); }
+.pf-dep-rej { border-color: var(--warn); cursor: help; } .pf-dep i { font-style: normal; font-size: 10.5px; margin-left: 3px; font-weight: 600; }
+.pf-dep-nb { color: color-mix(in srgb, var(--warn) 60%, var(--text)); } .pf-dep-b { color: color-mix(in srgb, var(--good) 65%, var(--text)); } .pf-dep-w { color: var(--text-2); font-weight: 400 !important; }
+.pf-cmsg { margin: 4px 0 2px; padding: 4px 8px; font-size: 12px; border-left: 3px solid var(--warn); background: var(--surface-2); overflow-wrap: anywhere; }
 .pf-depl ul { margin: 2px 0 4px 18px; padding: 0; } .pf-depl li { margin: 3px 0; font-size: 12px; overflow-wrap: anywhere; }
 .pf-red { color: var(--bad); font-weight: 600; } .pf-fl { margin: 2px 0 4px 18px; padding: 0; font-size: 12.5px; overflow-wrap: anywhere; }
 .pf-fc { border-left: 3px solid var(--good); padding-left: 6px; list-style: none; margin: 3px 0; } .pf-fo { border-left: 3px solid var(--warn); padding-left: 6px; list-style: none; margin: 3px 0; }
 .pf-red.pf-dep-rej { border-color: var(--bad); }
-.pf-run { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
+.pf-fl li.pf-red { list-style: none; border-left: 3px solid var(--bad); padding-left: 6px; margin: 3px 0; }
+@media (max-width: 640px) {   /* Telefon: Zeilen stapeln statt seitlich im Raster zu wischen (Erklärung und Chips lagen sonst ausserhalb des Bildes) */
+  .pf-t thead { display: none; } .pf-t, .pf-t tbody, .pf-t tr, .pf-t td { display: block; width: auto; }
+  .pf-t tr { border-top: 1px solid var(--line); padding: 6px 0; } .pf-t td, .pf-t td.pf-n, .pf-t td.pf-v, .pf-t td.pf-o, .pf-t td.pf-e { border-top: 0; min-width: 0; padding: 2px 6px; }
+}
+.pf-top label { max-width: 100%; } #pf-pick { max-width: calc(100vw - 90px); }
+#pf-root .pf-run { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
 .pf-flash { animation: pfflash 1.6s; } @keyframes pfflash { 0% { background: color-mix(in srgb, var(--warn) 35%, transparent); } 100% { background: transparent; } }
 .pf-fold { border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; margin: 8px 0; background: var(--surface); } .pf-fold > summary { cursor: pointer; font-size: 13px; }
 .pf-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 6px; margin: 6px 0; }

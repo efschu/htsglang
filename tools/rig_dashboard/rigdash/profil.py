@@ -88,6 +88,19 @@ FORCE_ENV = "FLLIPER_FORCE=1"
 MAX_CODE_TEXT = 400
 
 
+def _clip_text(code: str, text) -> str:
+    """Der Ablehnungstext für die Force-Liste: ein führendes ``<CODE>:`` entfällt (der Code steht schon davor), ein zu langer Text endet an
+    einer Wortgrenze mit ``…`` statt mitten im Wort (nie länger als ``MAX_CODE_TEXT``)."""
+    t = str(text or "").strip()
+    if t.startswith(code + ":"):
+        t = t[len(code) + 1:].strip()
+    if len(t) <= MAX_CODE_TEXT:
+        return t
+    cut = t[:MAX_CODE_TEXT - 1]
+    sp = cut.rfind(" ")
+    return (cut[:sp] if sp > MAX_CODE_TEXT // 2 else cut).rstrip(" ,;:") + "…"
+
+
 def force_verdict(r: dict):
     """(Text, ``force_state``, ``force_via``) für eine Zeile des Ablehnungsregisters ``r`` (leer = Code unbekannt).
 
@@ -120,7 +133,7 @@ def force_hint(dry, register: List[dict], line: str = "") -> dict:
     if isinstance(dry, dict) and isinstance(dry.get("rejections"), list):
         for q in dry["rejections"][:64]:
             if isinstance(q, dict) and isinstance(q.get("code"), str) and 0 < len(q["code"]) <= 40:
-                rejs.append((q["code"], str(q.get("text") or "")[:MAX_CODE_TEXT]))
+                rejs.append((q["code"], _clip_text(q["code"], q.get("text"))))
     have_dry = isinstance(dry, dict) and isinstance(dry.get("rejections"), list)
     force, blocked, openl, seen = [], [], [], set()
     for code, text in rejs:

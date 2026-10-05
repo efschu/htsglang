@@ -35,12 +35,12 @@
   function setView(j) { st.doc = j.doc; st.view = j.view; scheduleRecompute(); }
   const doLoad = (kind, name) => run(async () => {
     const j = await api("load", { kind, name });
-    setView(j); st.loaded = kind + ":" + name; st.dry = null; st.exp = null; st.dirty = false;
+    setView(j); st.loaded = kind + ":" + name; st.dry = null; st.exp = null; st.dirty = false; st.cmsg = null;
     st.msg = (kind === "release" ? "Release-Profil " : "Eigenes Profil ") + name + " geladen.";
   });
   const doEdit = (edits) => run(async () => {
     const j = await api("edit", { doc: st.doc, edits });
-    setView(j); st.dirty = true; st.dry = null; st.exp = null; st.msg = null;
+    setView(j); st.dirty = true; st.dry = null; st.exp = null; st.msg = null; st.cmsg = null;
   });
   const doSave = (name) => run(async () => {
     const j = await api("save", { doc: st.doc, name });
@@ -113,7 +113,7 @@
     const badge = d.belegt === false ? '<i class="pf-dep-nb">ohne Beleg</i>' : d.belegt ? '<i class="pf-dep-b">Beleg</i>' : "";
     const wert = d.wert != null && d.wert !== "" ? `<i class="pf-dep-w">nur bei ${esc(d.wert)}</i>` : "";
     return `<span class="${cls}" data-goto="${esc(d.to)}" title="${esc(depNotes(d).join(" — "))}">
-      ${esc(REL[d.rel] || d.rel)} <b>${esc(d.to)}</b>${wert}${badge}</span>`;
+      ${esc(REL[d.rel] || d.rel)} <b>${esc(d.to)}</b> ${wert} ${badge}</span>`;
   }
   function drawDeps(r) {
     const ds = r.explain.depends;
@@ -162,6 +162,7 @@
       <td class="pf-o"><span class="pf-org pf-org-${r.origin}" title="Herkunft des Werts">${esc(r.origin_label)}</span> ${resets.join(" ")}</td>
       <td class="pf-e"><div class="pf-short" data-open="${esc(r.key)}">${short ? esc(short) : '<span class="pf-unex-s">unerklärt</span>'} <span class="muted">${open ? "▲" : "▼"}</span></div>
         ${r.explain.depends.length ? `<div class="pf-deps">${r.explain.depends.map(depChip).join("")}</div>` : ""}
+        ${st.cmsg && st.cmsg.key === r.key ? `<div class="pf-cmsg" role="status">${esc(st.cmsg.text)}</div>` : ""}
         ${open ? `<div class="pf-full">${drawExplain(r)}</div>` : ""}</td></tr>`;
   }
   function visibleRows() {
@@ -380,7 +381,13 @@
     if (t.dataset.open) { st.open[t.dataset.open] = !st.open[t.dataset.open]; return draw(); }
     if (t.dataset.goto) {
       const row = st.view.rows.find((r) => r.name === t.dataset.goto);
-      if (!row) { st.msg = gotoMessage(t.dataset.goto); return draw(); }
+      st.cmsg = null;
+      if (!row) {
+        // die Meldung steht unter der Zeile des angeklickten Chips (oben auf der langen Seite sähe sie niemand); ohne Zeile (Attrappe) oben
+        const tr = t.closest ? t.closest("tr.pf-r") : null, text = gotoMessage(t.dataset.goto);
+        if (tr && tr.id) st.cmsg = { key: tr.id.replace(/^pfr-/, ""), text }; else st.msg = text;
+        return draw();
+      }
       if (st.mode === "einfach" && row.explain.level !== "einfach") { st.mode = "experte"; draw(); }
       const el = document.getElementById("pfr-" + row.key); if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("pf-flash"); setTimeout(() => el.classList.remove("pf-flash"), 1600); }
       return;
