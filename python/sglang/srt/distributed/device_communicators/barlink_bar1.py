@@ -5492,6 +5492,63 @@ class BarlinkBar1Transport:
 
         return _hook
 
+    def abort_and_rearm(self, reason: str, drain_timeout_s: float = 30.0) -> str:
+        """End the spin kernels queued on this rank's stream, then make the
+        group's abort/status state clean again. Returns a one-line outcome.
+
+        WHY (L15 park, j2 05.10. 01:17Z). ``Bar1CollectiveStalled`` is raised
+        by the host and does NOT touch the device: the kernels that are already
+        queued keep spinning for their own device deadline each
+        (``--barlink-bar1-cap-cycles`` 3e11 = ~150 s), and a park launches up to
+        ~100 rounds without a host sync. The next stream synchronization of the
+        flip then waits for all of them one after the other. Only the host abort
+        word ends them at once (the spin loops poll it); nothing set it on a
+        stall, only ``raise_if_peer_lost`` and the host-wait ``on_abort`` hook do.
+
+        ORDER: trip, drain (BOUNDED, by event query, never ``synchronize``),
+        then clear. Cleared are: the abort word, the sticky ``ctlStatus[0]``
+        the aborted kernels wrote (else the next collective's ``check_aborted``
+        kills the group), the staged copy of it and the watchdog's mirror. If
+        the stream does not drain in time nothing is cleared: the word stays
+        tripped, every later kernel aborts at once and the failure stays loud.
+
+        NOT undone here and not undoable from one rank: the per-rank a2a round
+        words advanced by different amounts (the kernels compare flags for
+        EQUALITY with their own round). The caller must not run another a2a on
+        this group; ``l15_park`` latches that.
+        """
+        import torch
+
+        window = self._abort_window
+        if window is None or self._ctl_dev is None:
+            return "no abort window"
+        window.trip(reason)
+        end = time.monotonic() + float(drain_timeout_s)
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(self.device))
+        while not ev.query():
+            if time.monotonic() >= end:
+                logger.error(
+                    "barlink-BAR1 group %s rank %s: abort_and_rearm: the stream "
+                    "did not drain within %.0f s after the abort word was set; "
+                    "state NOT cleared, the word stays tripped.",
+                    self.group, self.rank, float(drain_timeout_s))
+                return "drain timeout (word stays tripped)"
+            time.sleep(0.001)
+        self._ctl_dev[0:1].zero_()
+        torch.cuda.current_stream(self.device).synchronize()   # drained: returns at once
+        self._ctl_inflight = False
+        self._ctl_lag = 0
+        self._ctl_stall_run = 0
+        self._unchecked_launches = 0
+        self._deferred_launches = 0
+        # the watchdog's private-stream read may have copied the aborted value
+        # just before the zero: let two of its rounds pass, then drop the mirror.
+        time.sleep(min(0.5, 3.0 * max(barlink_abort_gate.poll_interval_s(), 0.001)))
+        self._abort_code_seen = 0
+        window.rearm()
+        return "aborted, drained, rearmed"
+
     @property
     def _abort_host(self) -> int:
         """Device address of the abort word, ``0`` when there is none.

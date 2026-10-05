@@ -476,6 +476,44 @@ def _group_io(sched):
     return rank, world, gather, a2a
 
 
+# 1860 (j2 05.10. 01:17Z): after a FAILED pooled park the BAR1 a2a kernels that
+# the other ranks had already queued spin for their own device deadline each
+# (~150 s x ~100 rounds) and the flip's next stream sync waits for all of them.
+# ``abort_group_after_failure`` ends them through the host abort word and
+# latches the group as a2a-desynced: the per-rank a2a round words advanced by
+# different amounts (the kernels compare flags for equality with their own
+# round), so NO further a2a may run on this group in this process.  Pooled
+# branch only (the latch is only ever set there); default off unchanged.
+_A2A_DESYNC: Optional[str] = None
+
+
+def a2a_desync_reason() -> Optional[str]:
+    return _A2A_DESYNC
+
+
+def _group_transport(sched):
+    from sglang.srt.distributed import get_tp_group
+
+    return getattr(getattr(get_tp_group(), "barlink_comm", None), "transport", None)
+
+
+def abort_group_after_failure(sched, rank: int, err: str, log) -> str:
+    """Pooled park failed on this rank: latch the group, end the queued kernels.
+    Never raises (the caller is already an error path)."""
+    global _A2A_DESYNC
+    if _A2A_DESYNC is None:
+        _A2A_DESYNC = str(err)[:160]
+    try:
+        fn = getattr(_group_transport(sched), "abort_and_rearm", None)
+        out = ("no BAR1 abort_and_rearm" if fn is None
+               else fn("L15 park failed: %s" % (str(err)[:160],)))
+    except Exception as exc:  # noqa: BLE001
+        out = "abort_and_rearm raised %s: %s" % (type(exc).__name__, exc)
+    log("L15-PARK abort rank=%d result=%s -- the a2a group is latched off for this "
+        "process (round words desynced)" % (rank, out))
+    return out
+
+
 def _kv_buffers(sched):
     from sglang.srt.weg2 import l15_shadow
 
@@ -603,6 +641,8 @@ def park_at_release(sched, env, log) -> Optional[int]:
                     [sp.rid for sp in m.spans], list(m.rows_by_rank), caps, pieces)
     except Exception as exc:  # noqa: BLE001 -- votes no
         why = "%s: %s" % (type(exc).__name__, exc)
+    if why is None and _A2A_DESYNC is not None:
+        why = "a2a group desynced by an earlier failed park (%s)" % (_A2A_DESYNC,)
     ok = why is None
     if pooled:
         refusal = agree_plan(ok, fp, gather)
@@ -641,6 +681,8 @@ def park_at_release(sched, env, log) -> Optional[int]:
         torch.cuda.current_stream().synchronize()
     except Exception as exc:  # noqa: BLE001 -- the wake refills from L2
         err = "%s: %s" % (type(exc).__name__, exc)
+        if pooled:
+            abort_group_after_failure(sched, rank, err, log)
     t_x1 = time.perf_counter()
     # the park counts only if it landed on EVERY rank (no sidecar anywhere
     # otherwise -> the wake refills from L2 on every rank)
@@ -703,6 +745,8 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
     why = None
     if not group_ok:
         why = "kv resume refused in the group"
+    elif _A2A_DESYNC is not None:
+        why = "a2a group desynced by an earlier failed park (%s)" % (_A2A_DESYNC,)
     elif rec is None:
         why = "no park record"
     elif int(rec[0]) != int(epoch):
@@ -727,6 +771,7 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
     a_ok = a_bad = 0
     run_a2a, rounds = (_counting(a2a) if pooled else (a2a, [0]))
     t_x0 = time.perf_counter()
+    in_xport = True
     try:
         bufs, _pool = _kv_buffers(sched)
         sent = run_park("back", rec[1], rank, world, bufs, run_a2a, env,
@@ -739,6 +784,7 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
             sent += _lpa.run_anchor_park("back", a_rec, rank, world, _m_v, _kv_v,
                                          run_a2a, env, uniform=pooled)
         torch.cuda.current_stream().synchronize()
+        in_xport = False
         if pooled and sums_before is not None:
             ck_ok, ck_bad = compare_sums(sums_before, guest_sums(rec[1], rank, bufs))
             if ck_bad:
@@ -752,6 +798,8 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
                     a_bad, a_ok + a_bad)
     except Exception as exc:  # noqa: BLE001
         err = "%s: %s" % (type(exc).__name__, exc)
+        if pooled and in_xport:     # a checksum failure is not a transport failure
+            abort_group_after_failure(sched, rank, err, log)
     t_x1 = time.perf_counter()
     if pooled:
         # every sampled row is a guest row in S2 (the home rows never leave

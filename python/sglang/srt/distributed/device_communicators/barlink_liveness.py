@@ -493,6 +493,19 @@ class AbortWindow:
             reason,
         )
 
+    def rearm(self) -> None:
+        """Clear a trip so the word is usable again (L15 park abort, 1860).
+
+        ``trip`` is one-way on purpose: a dead peer is not coming back. The one
+        caller that rearms is a stall recovery that has ALREADY drained every
+        kernel the trip was meant to end (host-verified), so nothing is
+        spinning on the word that is cleared here. Calling it with kernels
+        still queued would let them spin again for their full device deadline.
+        """
+        self._tripped_reason = None
+        if self._buf is not None:
+            self._buf[0] = 0
+
     def close(self) -> None:
         if self._registered and self._host_ptr:
             try:
