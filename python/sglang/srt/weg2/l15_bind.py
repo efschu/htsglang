@@ -400,6 +400,40 @@ def anchor_host_row(node, anchor_slot: int) -> int:
     return -1
 
 
+def anchor_shadow(node, anchor_slot: int):
+    """L15-KEEP-MAMBA-SHADOW: ``(row, recorded gen)`` of the anchor host row of the chain node
+    that carries the req's anchor device slot, from the node attribute
+    ``park_l3.MAMBA_SHADOW_ATTR`` -- only where :func:`anchor_host_row` has none (``reset_keep``
+    nulled ``Mamba.host_value`` of a held tip; the anchor-only backup that follows keeps the anchor
+    in an arena slot that is not in the tree). ``None`` when there is no usable shadow. The caller
+    keeps the row only where the slot STILL carries the recorded generation."""
+    cur = node
+    while cur is not None:
+        try:
+            cd = cur.component_data[ComponentType.MAMBA]
+        except (AttributeError, KeyError, IndexError, TypeError):
+            cd = None
+        val = getattr(cd, "value", None) if cd is not None else None
+        if val is not None:
+            try:
+                ids = [int(x) for x in (val.tolist() if hasattr(val, "tolist") else val)]
+            except TypeError:
+                ids = [int(val)]
+            if anchor_slot in ids:
+                hv = getattr(cd, "host_value", None)
+                if hv is not None and len(hv):
+                    return None  # a live host row wins (anchor_host_row)
+                sh = getattr(cur, "_weg2_l2_mamba_shadow", None)
+                try:
+                    if sh is not None and len(sh) == 2 and int(sh[0]) >= 0 and int(sh[1]) >= 0:
+                        return int(sh[0]), int(sh[1])
+                except (TypeError, ValueError):
+                    pass
+                return None
+        cur = getattr(cur, "parent", None)
+    return None
+
+
 def _group_entry(pool, name: str):
     """L15-FIX-HOSTGROUP: the host pool behind a HostPoolGroup entry.
 
@@ -515,6 +549,7 @@ def build_retain_kwargs(
     # L15-12c-E2a: (rid, mamba anchor host row, -1 when absent) -- the
     # anchor state's L2 identity, snapshot at bind like the KV rows.
     anchor_rows = []
+    anchor_expect_gen: Dict[str, int] = {}  # L15-KEEP-MAMBA-SHADOW: rid -> generation recorded with the shadow row
     skipped = []  # L15-FIX-NOIDX: (rid, reason) of reqs that cannot be held
     parked_by_rid = {}  # L15-FIX-PARKED: rid -> (slots, node, anchor)
     covered_nodes: set = set()  # L15-TREE-CAND: id() of nodes on real reqs' chains
@@ -603,11 +638,17 @@ def build_retain_kwargs(
         # carries the req's anchor device slot; best-effort (-1 on any
         # missing piece -- the anchor columns then read (-1, -1)).
         try:
-            anchor_rows.append(
-                (rid, anchor_host_row(_pk[1], _pk[2]) if _pk is not None
-                 else anchor_host_row(node_of_req(req),
-                                      anchor_slot_of_req(req)))
-            )
+            _anode, _aslot = ((_pk[1], _pk[2]) if _pk is not None
+                              else (node_of_req(req), anchor_slot_of_req(req)))
+            _arow = anchor_host_row(_anode, _aslot)
+            if _arow < 0:
+                # L15-KEEP-MAMBA-SHADOW: a held tip's anchor row was nulled by reset_keep; adopt the
+                # recorded (row, gen) -- below, only where the arena slot still has that generation
+                _ash = anchor_shadow(_anode, _aslot)
+                if _ash is not None:
+                    _arow = _ash[0]
+                    anchor_expect_gen[rid] = _ash[1]
+            anchor_rows.append((rid, _arow))
         except ValueError:
             anchor_rows.append((rid, -1))
         # L15-FLIPCOST-4 (N4f bind 538-945 ms with nothing held): owner_of
@@ -761,6 +802,10 @@ def build_retain_kwargs(
             anchor_l2_by_rid[rid] = (
                 s, int(_agen.get(s, -1)) if s >= 0 else -1
             )
+            _eg = anchor_expect_gen.get(rid)
+            if _eg is not None and anchor_l2_by_rid[rid][1] != _eg:
+                # the slot was re-claimed since the shadow was recorded: a foreign anchor, no identity
+                anchor_l2_by_rid[rid] = (-1, -1)
 
     def node_of(rid: str):
         if rid in parked_by_rid:

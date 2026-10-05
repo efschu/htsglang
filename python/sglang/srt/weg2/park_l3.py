@@ -749,42 +749,98 @@ def record_l2_shadow(pool, shadowed) -> int:
         return 0
 
 
+#: L15-KEEP-MAMBA-SHADOW: the node attribute carrying (host row, arena gen) of the mamba anchor
+#: host row ``reset_keep`` nulls (one state per node, one state per arena slot)
+MAMBA_SHADOW_ATTR = "_weg2_l2_mamba_shadow"
+
+
 def record_keep_shadow(tree, nodes) -> int:
-    """L15-KEEP-SHADOW: ``reset_keep`` is about to null ``Full.host_value`` of every kept
-    node (the hold keeps the node OBJECTS, device only). Record each such node's host rows
-    with their arena generations as the L2 shadow first -- the same attribute and form
-    ``record_l2_shadow`` writes for a store-loaded node -- so that the node still has an L2
-    identity at the next sleep (``l15_tree_cand.l2_backed``, ``l15_bind.chain_host_rows_ex``
-    adopt it only where the slot still carries that generation, a re-claim bumps it).
-    A fresher ``host_value`` replaces an older shadow; a node without host rows keeps what it
-    has. Same guards as :func:`release_loaded_host` (park_l3 on, group D, not a Form A
-    worker, an arena KV pool). Returns the rows recorded; never raises."""
+    """L15-KEEP-SHADOW / L15-KEEP-MAMBA-SHADOW: ``reset_keep`` is about to null the host values
+    of every kept node (the hold keeps the node OBJECTS, device only).
+
+    * KV (``SGLANG_WEG2_L15_KEEP_SHADOW``): record each node's ``Full.host_value`` rows with their
+      arena generations as the L2 shadow first -- the same attribute and form
+      ``record_l2_shadow`` writes for a store-loaded node -- so that the node still has an L2
+      identity at the next sleep (``l15_tree_cand.l2_backed``, ``l15_bind.chain_host_rows_ex``
+      adopt it only where the slot still carries that generation, a re-claim bumps it). A
+      fresher ``host_value`` replaces an older shadow.
+    * Mamba (``SGLANG_WEG2_L15_KEEP_MAMBA_SHADOW``): record the node's ``Mamba.host_value`` row
+      and its arena generation as ``MAMBA_SHADOW_ATTR`` -- the anchor-only backup that follows
+      the reset keeps the anchor in an arena slot that is NOT in the tree (Full has no host
+      copy, the tree invariant forbids a node-visible mamba host row), so without this the held
+      tip has no END-anchor L2 identity at the next sleep (``no_mamba_host``).
+
+    Nodes without host rows keep what they have; write-pending nodes are skipped. Same guards as
+    :func:`release_loaded_host` (park_l3 on, group D, not a Form A worker, an arena pool).
+    Returns the rows recorded; never raises."""
     try:
         if not enabled() or not _group_d():
             return 0
         from sglang.srt.weg2 import l15_plan
 
-        if not l15_plan.keep_shadow_active(os.environ):
+        kv_on = l15_plan.keep_shadow_active(os.environ)
+        mb_on = l15_plan.keep_mamba_shadow_active(os.environ)
+        if not (kv_on or mb_on):
             return 0
         from sglang.srt.mem_cache import form_a_host_shadow as _r12
         from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
 
         if _r12.role() == "worker":
             return 0
-        pool = tree._weg2_arena_pools().get(BASE_COMPONENT_TYPE)
-        if pool is None:
-            return 0
-        shadowed = []
+        pools = tree._weg2_arena_pools()
+        total = 0
+        pool = pools.get(BASE_COMPONENT_TYPE)
+        if kv_on and pool is not None:
+            shadowed = []
+            for node in nodes:
+                hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+                if hv is None or len(hv) == 0:
+                    continue
+                if getattr(node, "write_through_pending_id", None) is not None:
+                    continue  # its page is not COMPLETE yet: no L2 identity to remember
+                shadowed.append((node, [int(x) for x in (hv.tolist() if hasattr(hv, "tolist") else hv)]))
+            if shadowed:
+                total += record_l2_shadow(pool, shadowed)
+        if mb_on:
+            from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+            mpool = pools.get(ComponentType.MAMBA)
+            if mpool is not None:
+                total += _record_mamba_shadow(mpool, nodes, ComponentType.MAMBA)
+        return total
+    except Exception as exc:  # noqa: BLE001 -- the shadow is optional
+        logger.info("L15-KEEP-SHADOW record failed (%s: %s)", type(exc).__name__, exc)
+        return 0
+
+
+def _record_mamba_shadow(mpool, nodes, mamba_type) -> int:
+    """Per kept node with a mamba host row: ``(row, gen)`` as ``MAMBA_SHADOW_ATTR``; a row below
+    the pool's staging rows is staging-only and records gen -1 (no L2 identity). Never raises."""
+    try:
+        s0 = int(getattr(mpool, "staging_rows", 0))
+        items = []
         for node in nodes:
-            hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+            try:
+                cd = node.component_data[mamba_type]
+            except (AttributeError, KeyError, IndexError, TypeError):
+                continue
+            hv = getattr(cd, "host_value", None)
             if hv is None or len(hv) == 0:
                 continue
             if getattr(node, "write_through_pending_id", None) is not None:
-                continue  # its page is not COMPLETE yet: no L2 identity to remember
-            shadowed.append((node, [int(x) for x in (hv.tolist() if hasattr(hv, "tolist") else hv)]))
-        return record_l2_shadow(pool, shadowed) if shadowed else 0
+                continue
+            items.append((node, int(hv.tolist()[0] if hasattr(hv, "tolist") else hv[0])))
+        slots = sorted({r - s0 for _n, r in items if r >= s0})
+        gens = dict(zip(slots, mpool.slot_gens(slots))) if slots else {}
+        for node, row in items:
+            g = int(gens.get(row - s0, -1)) if row >= s0 else -1
+            setattr(node, MAMBA_SHADOW_ATTR, (row, g))
+        if items:
+            logger.info("L15-KEEP-MAMBA-SHADOW recorded nodes=%d (the kept anchors' arena row + generation, "
+                        "adopted by the L1.5 bind where the generation still matches)", len(items))
+        return len(items)
     except Exception as exc:  # noqa: BLE001 -- the shadow is optional
-        logger.info("L15-KEEP-SHADOW record failed (%s: %s)", type(exc).__name__, exc)
+        logger.info("L15-KEEP-MAMBA-SHADOW record failed (%s: %s)", type(exc).__name__, exc)
         return 0
 
 

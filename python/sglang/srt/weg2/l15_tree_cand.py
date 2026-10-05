@@ -194,6 +194,22 @@ def tips_of(tree_cache) -> List[object]:
     return tips
 
 
+#: L15-KEEP-MAMBA-SHADOW: ``park_l3.MAMBA_SHADOW_ATTR`` (kept literal: no import cycle at module load)
+_MAMBA_SHADOW_ATTR = "_weg2_l2_mamba_shadow"
+
+
+def _mamba_shadow_ok(node) -> bool:
+    """The node carries a usable mamba L2 identity: the recorded ``(arena row, generation)`` of
+    the anchor host row ``reset_keep`` nulled (``park_l3.record_keep_shadow``). Row and gen must be
+    known (>= 0): a staging-only row records gen -1 and is no identity. The generation is checked
+    against the live arena at the bind (``l15_bind``), not here -- as for the KV shadow."""
+    sh = getattr(node, _MAMBA_SHADOW_ATTR, None)
+    try:
+        return sh is not None and len(sh) == 2 and int(sh[0]) >= 0 and int(sh[1]) >= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def l2_backed(node, root) -> bool:
     """Every chain node has its KV host rows (or the recorded L2 shadow) and
     the tip has its mamba host row: the cap-0 rank refills the hold from L2,
@@ -204,7 +220,7 @@ def l2_backed(node, root) -> bool:
         mh = node.component_data[mamba_t].host_value
     except (AttributeError, KeyError, IndexError, TypeError):
         return False
-    if mh is None or len(mh) == 0:
+    if (mh is None or len(mh) == 0) and not _mamba_shadow_ok(node):
         return False
     cur = node
     while cur is not None and cur is not root:
@@ -296,7 +312,7 @@ def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, object]:
         except (AttributeError, KeyError, IndexError, TypeError):
             mh = None
         reason = None
-        if mh is None or len(mh) == 0:
+        if (mh is None or len(mh) == 0) and not _mamba_shadow_ok(n):
             reason = "no_mamba_host"
         else:
             cur = n

@@ -1029,6 +1029,17 @@ class Envs:
     # (rows + arena gens, the form ``record_l2_shadow`` uses for store-loaded nodes) first.
     # Default off = ``reset_keep`` unchanged. Read through ``l15_plan.keep_shadow_active``.
     SGLANG_WEG2_L15_KEEP_SHADOW = EnvBool(False)
+    # L15-KEEP-MAMBA-SHADOW (desk 2025, kurz3 21:34-21:38Z, see done/2025-l15-e-gelb.md sec. 9): after
+    # KEEP_SHADOW the cap-0 rank still drops every HELD tip at the next sleep for ``no_mamba_host``
+    # (TREE-CAND-LOSS: no_kv_host 0, no_mamba_host 28 of 55 tips; WEG2-ANCHOR-LOST at=flush lists exactly
+    # the held tips). ``reset_keep`` nulls ``Mamba.host_value`` of the kept nodes; the anchor-only backup
+    # that follows copies the anchor into an arena slot "not in the tree" (Full has no host copy: the
+    # tree invariant forbids a node-visible mamba host row there), so ``l2_backed`` (mamba host row) and
+    # ``l15_bind.anchor_host_row`` (END-anchor L2 identity -> ``manifest_vote``) see none. On (+ L15 master
+    # + group D + not dual + park_l3 enabled): ``reset_keep`` records the about-to-be-nulled mamba host
+    # row + its arena generation as ``_weg2_l2_mamba_shadow``; ``l2_backed``/the census accept it and the
+    # bind adopts it only where the slot still carries that generation. Default off.
+    SGLANG_WEG2_L15_KEEP_MAMBA_SHADOW = EnvBool(False)
     # L15-POOL S4 (docs/L15-POOL-ENTWURF-1004.md sec 1.2/3.3/4.5/5.2 N4/7, KV AND
     # END anchor = a WHOLE request): part switch ON TOP of SGLANG_WEG2_L15_POOL and
     # SGLANG_WEG2_L15_POOL_S3 (S4 without them is refused by name,

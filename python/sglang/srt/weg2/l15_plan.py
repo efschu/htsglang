@@ -181,6 +181,23 @@ def keep_shadow_active(env: Mapping[str, str]) -> bool:
     )
 
 
+KEEP_MAMBA_SHADOW_ENV = "SGLANG_WEG2_L15_KEEP_MAMBA_SHADOW"
+
+
+def keep_mamba_shadow_active(env: Mapping[str, str]) -> bool:
+    """L15-KEEP-MAMBA-SHADOW: True iff ``reset_keep`` must record the mamba host row of the
+    kept nodes as ``_weg2_l2_mamba_shadow``. Same terms as :func:`keep_shadow_active`
+    (master, own switch, group D, not dual; process env only, no collective)."""
+    group = str(env.get("SGLANG_WEG2_GROUP", "") or "").strip().upper()
+    dual = str(env.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip()
+    return bool(
+        master_on(env)
+        and _switch(env, KEEP_MAMBA_SHADOW_ENV)
+        and group == "D"
+        and dual != "1"
+    )
+
+
 def parse_l15_mib(value: Optional[str]) -> Tuple[str, Dict[int, int]]:
     """``SGLANG_WEG2_L15_MIB`` -> ``("auto", {})`` or ``("override", {card: mib})``.
 
