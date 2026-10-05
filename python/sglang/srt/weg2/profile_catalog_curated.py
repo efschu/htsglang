@@ -995,6 +995,14 @@ ERKLAERT.update({
         "satz_quelle": 'NF-Sitz, Bericht 1504 (Baum nf-release-cand-1005 @3bfee09511), Freigabe als Katalogtext 05.10. 19:22Z'},
 })
 
+# Wedge-Alarm-Uhr: derselbe Name in beiden Bäumen, je Baum andere Wirkung (27B nur Dual, NF ohne Gate; 05.10.). Beide Sätze belegt von dem Sitz, dem der Baum gehört;
+# der Editor zeigt zusätzlich die Beschreibungen beider Bäume nebeneinander (abweichung).
+ERKLAERT.update({
+    'SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK': {"kind": "env", "group": "Weitere", "level": "experte", "planner_derived": False,
+        "text": 'Gleicher Name, je Baum andere Wirkung. 27B-Baum (Standard aus, wirkt nur im Dual-Layout): Das Alter für den Wedge-Alarm („Anfrage hängt“, ADMISSION-WEDGE) ist das Minimum aus der Zeit seit dem letzten ersten Token und dem Alter der nicht leeren Warteschlange, wie der Poll sie sah; ein neues Alarmfenster löscht das veraltete letzte Ergebnis des Recovery-Kanals; ein echter Stillstand alarmiert weiter. NF-Baum (Standard aus, ohne Dual-Bedingung, auf Prefill- und Decode-Gruppe gleich): Der Server meldet „Anfrage hängt“ nicht mehr fälschlich, wenn nach einer Ruhepause eine neue Anfrage kommt: die Wartezeit wird erst ab dem Moment gezählt, in dem der Server die Anfrage wirklich sieht, gemeldet wird frühestens nach 20 s eigenem Warten. Das klassische Verdikt hat im Code zusätzlich einen Boden (der erste Poll, der „Anfragen in der Warteschlange und nichts läuft“ sah); das steht nur im Code, nicht im Kommentar, der Code gilt. Das Prefill-Chunk-Alter von mindestens 20 s wird nicht angehoben. Belegt (NF): die Ursache der Fehlalarme (die Uhren laufen durch den Leerlauf, nur der Wake stellt sie neu; zwei Fehlalarme im Boot 1005_185049). Unbelegt (NF): die Wirkung am Metall (im Testlauf mit Schalter an 0 Alarme in der Last, aber nur eine Pause von mindestens 75 s, n=1, kein Nachweis); ein echter Hänger wird mit Schalter an bis ca. 10 s (ein Poll) später gemeldet als ohne; Verhalten im Dauerbetrieb über 60 min noch nicht gemessen. Im NF-Release-Profil nicht gesetzt (nur das Testprofil nf-int4-h6-abl-k2.env); ob die Release-Form ihn künftig setzt, ist offen. In keinem 27B-Profil gesetzt.', "gain": "", "cost": "", "depends": [],
+        "satz_quelle": '27B-Sitz (Commit bbf5fd846e, Bericht 1981, Test test_weg2_admission_wedge_queue_clock_1981) und NF-Sitz (Berichte 1507/1531-03, Code invariant_checker.py:1202-1360 im Baum bce16a6ddf)'},
+})
+
 #: Lesehilfe der NF-Sätze (NF-Sitz, Bericht 1504): wird mit dem Katalog ausgeliefert, die Seite zeigt sie als Glossar/Tooltip, die Sätze erklären die Wörter nicht noch einmal.
 GLOSSAR: Dict[str, str] = {
     "D": "die Decode-Karte (rechnet die Antwort Wort für Wort)",
