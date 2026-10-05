@@ -399,7 +399,7 @@ class ProfilEditor:
         pj, _ref = self.mods()
         v = pj.view(doc, self.catalog()["entries"], comments, self.specs())
         model_dir = next((str(x.get("value") or "") for x in doc.get("vars") or [] if x.get("name") == "PROFILE_MODEL"), "")
-        v["kvheads"] = KVH.view(v["rows"], model_dir)
+        v["kvheads"] = KVH.view(v["rows"], model_dir, v["planner_only"])
         return {"ok": True, "doc": doc, "view": v, "name": doc.get("name"), "line": doc.get("line"),
                 "groups": sorted({r["explain"]["group"] for r in v["rows"] if r["explain"]["group"]})}
 

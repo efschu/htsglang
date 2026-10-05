@@ -133,11 +133,24 @@ def model_heads(model_dir: str) -> Optional[Dict[str, int]]:
     return {"q": q, "kv": kv, "head_dim": t.get("head_dim"), "layers": t.get("num_hidden_layers")}
 
 
-def view(rows: Sequence[dict], model_dir: str = "") -> List[Dict[str, object]]:
-    """Je Gruppe mit ``--rank-tp-ratio`` eine Anzeige. ``rows`` sind die Zeilen von ``profile_json.view`` (name, scope, value, planner_value)."""
+def _planner_rows(planner_only: Sequence[dict], have: Sequence[str]) -> List[dict]:
+    """Vom Planer gerechnete ``--rank-tp-ratio`` (``profile_json.view``: ``planner_only``, Schlüssel ``extra:D:--rank-tp-ratio``) für Gruppen,
+    in denen das Profil keinen Wert setzt."""
+    out = []
+    for p in planner_only:
+        parts = str(p.get("key", "")).split(":")
+        if len(parts) == 3 and parts[0] == "extra" and parts[2] == "--rank-tp-ratio" and parts[1] not in have:
+            out.append({"name": "--rank-tp-ratio", "scope": parts[1], "value": "", "planner_value": p.get("value")})
+    return out
+
+
+def view(rows: Sequence[dict], model_dir: str = "", planner_only: Sequence[dict] = ()) -> List[Dict[str, object]]:
+    """Je Gruppe mit ``--rank-tp-ratio`` eine Anzeige. ``rows`` sind die Zeilen von ``profile_json.view`` (name, scope, value, planner_value),
+    ``planner_only`` die Werte, die der Planer rechnet und das Profil nicht setzt."""
     heads = model_heads(model_dir) if model_dir else None
+    have = [r.get("scope") for r in rows if r.get("name") == "--rank-tp-ratio"]
     out: List[Dict[str, object]] = []
-    for r in rows:
+    for r in list(rows) + _planner_rows(planner_only, have):
         if r.get("name") != "--rank-tp-ratio":
             continue
         raw = r.get("value") or r.get("planner_value") or ""

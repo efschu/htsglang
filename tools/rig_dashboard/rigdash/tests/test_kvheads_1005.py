@@ -104,6 +104,19 @@ class Ansicht(unittest.TestCase):
         self.assertEqual((out[0]["group"], out[0]["regime"], out[0]["kv"], out[0]["q"]), ("D", "repliziert", [2, 2, 2], [24, 0, 0]))
         self.assertEqual(out[0]["heads"], {"q": 24, "kv": 2, "head_dim": 256, "layers": 48})
 
+    def test_planner_solved_ratio_is_shown_when_the_profile_sets_none(self):
+        """27B-Profile setzen kein --rank-tp-ratio, der Planer rechnet es (planner_only, Schlüssel extra:D:...): ohne diesen Weg bliebe die Zeile leer."""
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as fh:
+                json.dump({"text_config": {"num_attention_heads": 24, "num_key_value_heads": 4}}, fh)
+            po = [{"key": "extra:D:--rank-tp-ratio", "value": "58,25,25"}, {"key": "extra:P:--pp-stage-ratio", "value": "45,10,9"}]
+            out = KV.view([{"name": "--pp-stage-ratio", "scope": "P", "value": "45,10,9"}], d, po)
+            self.assertEqual(len(out), 1)
+            self.assertEqual((out[0]["group"], out[0]["quelle"], out[0]["regime"], out[0]["kv"]), ("D", "Planer", "verteilt", [2, 1, 1]))
+            # ein im Profil gesetzter Wert hat Vorrang vor dem Planerwert derselben Gruppe
+            both = KV.view([{"name": "--rank-tp-ratio", "scope": "D", "value": "1,1,1"}], d, po)
+            self.assertEqual((len(both), both[0]["quelle"], both[0]["ratios"]), (1, "Profil", "1,1,1"))
+
     def test_unreadable_model_says_so(self):
         out = KV.view([{"name": "--rank-tp-ratio", "scope": "D", "value": "1,1,1"}], "/nonexistent")
         self.assertEqual((out[0]["status"], out[0]["kv"]), ("unbekannt", None))
