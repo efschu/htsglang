@@ -6146,7 +6146,14 @@ def resolve_prior_cushion(
 
 
 def append_measured_record(path: str, rec: Dict[str, object]) -> None:
-    """Append one sample to the sidecar (append-only: history is evidence)."""
+    """Append one sample to the sidecar (append-only: history is evidence).
+
+    A ``--force`` boot (weg2/refusals.py) writes NO record: what it measures lies outside the promise the planner
+    made, and must never calibrate a later boot (PROFIL-EDITOR S1)."""
+    from sglang.srt.weg2 import refusals as _refusals
+
+    if not _refusals.records_allowed():
+        return
     try:
         with open(path) as f:
             data = json.load(f)

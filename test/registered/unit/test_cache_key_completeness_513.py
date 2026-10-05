@@ -354,8 +354,9 @@ class TestGraphMemAnchorKey(unittest.TestCase):
 
     def test_the_key_is_versioned(self):
         """A key change must be legible, not silent: the version prefix is how
-        a future reader knows why old anchors stopped matching."""
-        self.assertTrue(self._k().startswith("v2|"))
+        a future reader knows why old anchors stopped matching. v3 (K8,
+        SM89-DURCHSPIEL-1002) added the card class."""
+        self.assertTrue(self._k().startswith("v3|"))
 
     def test_the_boot_log_parser_supplies_the_new_fields(self):
         from sglang.srt.planner.graphmem import parse_boot_meta  # noqa: PLC0415

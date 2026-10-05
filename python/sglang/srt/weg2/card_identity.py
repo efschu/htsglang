@@ -36,10 +36,16 @@ index. On the reference rig (nvml0 RTX 3080 20480, nvml1 RTX 5090 32607,
 nvml2 RTX 3080 20480) that is nvml1, nvml0, nvml2 -- exactly the old
 ``order_cards`` ("the 5090 first, then the 3080s by NVML index").
 
-THE ARCH GATE (:func:`arch_gate`): sm_86 and sm_120 only (the wheel arch
-list ``86;120a`` and the JIT prebuild ``8.6,12.0``); every other compute
-capability -- sm_89 explicitly (user: "bevor du sm89 hinzufuegst") -- and an
-UNREPORTED one are refused BY NAME, per card.
+THE ARCH GATE (:func:`arch_gate`): sm_86, sm_89 and sm_120. sm_89 was
+admitted by SM89-DURCHSPIEL-1002 (desk): the wheel's sm_86 cubins run on
+sm_89 under CUDA binary compatibility, the JIT parts (FlashInfer, tvm-ffi,
+barlink) build for 8.9 at first boot, and the one hard trap -- the CUTLASS
+Sm89 FP8 stub in a ``86;120a`` wheel -- is avoided at the FP8 dispatch by
+the FP8-Marlin fallback (layers/quantization/fp8_utils.py, driven by the
+wheel's own cubin records, never by a card name). 8.9 has NO calibration
+class here, so it always reaches the named HW-UNCALIBRATED path. Every
+other compute capability (sm_80, sm_90, sm_100: no cubins in this image)
+and an UNREPORTED one are refused BY NAME, per card.
 
 PURE: stdlib only (launcher, entrypoint CLI and desk tests import it).
 """
@@ -53,9 +59,12 @@ import sys
 from dataclasses import dataclass
 from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
-#: The compute capabilities the release image carries code for. sm_89 is OUT
-#: of scope (user order 02.10.); sm_90/sm_100 have no cubins in the wheel.
-SUPPORTED_ARCHS: Tuple[Tuple[int, int], ...] = ((8, 6), (12, 0))
+#: The compute capabilities the release image carries code for: sm_86 and
+#: sm_120 have SASS in the wheel and measured classes; sm_89 is admitted
+#: UNCALIBRATED (SM89-DURCHSPIEL-1002: sm_86 cubins run on sm_89 by binary
+#: compatibility, JIT covers the rest, the FP8-Sm89 stub is bypassed by the
+#: named FP8-Marlin fallback). sm_90/sm_100 have no cubins in the wheel.
+SUPPORTED_ARCHS: Tuple[Tuple[int, int], ...] = ((8, 6), (8, 9), (12, 0))
 
 #: VRAM-tier band for class membership (same 5 % as planner.flags).
 TOTAL_TOLERANCE = 0.05
@@ -97,6 +106,21 @@ CALIBRATED_CLASSES: Tuple[CalibratedClass, ...] = (
 #: The reference rig's inventory in card order (the records' positional
 #: vectors are measured in this order).
 REFERENCE_INVENTORY: Tuple[str, ...] = ("RTX5090", "RTX3080", "RTX3080")
+
+#: HW-P0 1003: the archs the gate ADMITS although no calibration class of
+#: that arch exists in this release (today: sm_89). A card of such an arch
+#: is never refused HW-ARCH; it takes the NAMED calibration fallback
+#: :data:`CALIBRATION_FALLBACK` -- its record-lookup label is its card key
+#: (``<model>/<MiB>/sm<cc>``), which matches no calibrated record, so every
+#: positional value the plan needs reaches HW-UNCALIBRATED by name until a
+#: calibration boot has written records for it. Derived, never listed by
+#: hand: adding a calibrated class of an arch removes it from here.
+UNCALIBRATED_ARCHS: Tuple[Tuple[int, int], ...] = tuple(
+    a for a in SUPPORTED_ARCHS if a not in {c.cc for c in CALIBRATED_CLASSES})
+
+#: The name of that fallback (printed in the HW-UNCALIBRATED message of an
+#: inventory holding an uncalibrated-arch card).
+CALIBRATION_FALLBACK = "card-key (uncalibrated arch: no class, no borrowed record)"
 
 
 @dataclass(frozen=True)
@@ -216,6 +240,15 @@ def class_label(card) -> str:
     return calibration_class(card) or card_key(card)
 
 
+def arch_uncalibrated(card) -> bool:
+    """True when the card's arch passes the gate but has NO calibration class
+    in this release (:data:`UNCALIBRATED_ARCHS`, today sm_89): the card takes
+    :data:`CALIBRATION_FALLBACK`. An unreported cc is not this case (the gate
+    refuses it)."""
+    p = props_of(card)
+    return p.cc is not None and tuple(p.cc) in UNCALIBRATED_ARCHS
+
+
 def describe(card) -> str:
     p = props_of(card)
     bw = p.peak_membw_gbps
@@ -245,10 +278,14 @@ def arch_gate(cards: Iterable) -> None:
     if bad:
         raise CardInventoryRefused(
             f"{CODE_ARCH}: this release carries kernels for "
-            + " and ".join(f"sm_{a}{b}" for a, b in SUPPORTED_ARCHS)
-            + " only (sgl-kernel wheel 86;120a, JIT prebuild 8.6,12.0); refused: "
-            + "; ".join(bad)
-            + ". sm_89 is out of scope until sm_86/sm_120 are generic (user order 02.10.).")
+            + ", ".join(f"sm_{a}{b}" for a, b in SUPPORTED_ARCHS[:-1])
+            + f" and sm_{SUPPORTED_ARCHS[-1][0]}{SUPPORTED_ARCHS[-1][1]}"
+            + " (sgl-kernel wheel 86;120a or 86;89;120a: sm_86 and sm_120 have"
+            " SASS, sm_89 runs on its own cubins or the sm_86 ones plus JIT at"
+            " first boot; an sm_89 card passes this gate but is UNCALIBRATED --"
+            " measure it with card_rate_pass --run and one calibration boot,"
+            " see HW-GENERISCH-SM86-SM120-1002.md 5); refused: "
+            + "; ".join(bad))
 
 
 def order_key(card) -> Tuple[int, float, int]:
@@ -305,9 +342,13 @@ def uncalibrated_message(ordered_cards: Sequence, calibrated: Sequence[str],
         b = want[i] if i < len(want) else "-"
         if a != b:
             diff.append(f"ordinal {i}: live {a} vs calibrated {b}")
+    archs = sorted({tuple(props_of(c).cc) for c in ordered_cards if arch_uncalibrated(c)})
+    arch_note = ("" if not archs else
+                 " " + ", ".join(_sm(a) for a in archs)
+                 + f" has no calibration class in this release: {CALIBRATION_FALLBACK}.")
     return (f"{CODE_UNCALIBRATED}: {source} was measured on the inventory "
             f"[{', '.join(want)}] (card order), this rig is [{', '.join(live)}] ("
-            + "; ".join(diff) + "). Positional measurements of the other inventory are NOT "
+            + "; ".join(diff) + ")." + arch_note + " Positional measurements of the other inventory are NOT "
             "borrowed: " + (", ".join(what) if what else "(none named)")
             + ". Measure them on this rig: card_rate_pass --run (GEMM/membw/link rates), then "
             "one calibration boot per profile that writes the per-rank records "
