@@ -304,7 +304,7 @@ def test_rule1_a_p_phase_takes_at_most_six_then_flips_with_handoff_n():
             results = await asyncio.wait_for(asyncio.gather(*tasks), 40)
             assert [s for s, _ in results] == [200] * 9
             # rule 2: the wake of D carried the hand-off count on its kv resume
-            kv = [b for b in h.d.resume_bodies if b.get("tags") == ["kv_cache"]]
+            kv = [b for b in h.d.resume_bodies if "kv_cache" in (b.get("tags") or [])]  # H6 (6b8913e519): the kv resume rides the weights leg
             assert kv and kv[0].get("handoff_n") == 6 and kv[0].get("parked_n") == 0, kv
             # the second P phase took the remaining three
             assert h.p.gen_marks.count("c8") == 1 and len(h.p.gen_marks) == 9
@@ -375,7 +375,7 @@ def test_rule3_the_wait_bound_parks_the_running_decode_and_flips_to_p():
             assert h.front.counters["wait_bound_fired"] == 1 and h.front.counters["d_parked"] == 1
             # D wakes again: r0 is resumed (parked_n=1), r1 is the new hand-off
             assert await _until(lambda: h.front.awake == "D" and not h.front._d_parked, 20)
-            kv = [b for b in h.d.resume_bodies if b.get("tags") == ["kv_cache"]]
+            kv = [b for b in h.d.resume_bodies if "kv_cache" in (b.get("tags") or [])]  # H6 (6b8913e519): the kv resume rides the weights leg
             assert kv[-1].get("parked_n") == 1 and kv[-1].get("handoff_n") == 1, kv
             assert rid0 in h.front.groups["D"].outstanding
             h.d.release_all()
