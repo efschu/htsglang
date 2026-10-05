@@ -248,15 +248,119 @@ def load_edges(path: str = "") -> Tuple[List[Dict[str, object]], Dict[str, objec
     return ok, info
 
 
-def _beleg(e: Mapping) -> Optional[Dict[str, object]]:
+# Evidence resolution (Auftrag 2013): the ANCHOR TEXT is the evidence, the stored line number is only a hint.  A line number in
+# ``launcher.py``/``environ.py`` drifts with every edit above it; the anchor does not.  ``resolve_edge_belege`` finds each anchor in
+# its file, so a pure line shift never breaks an edge -- only a missing or ambiguous anchor does.
+ANKER_TOL = 10          # a multi-hit anchor must have a hit within this many lines of where the edge is expected
+ANKER_OK = ("eindeutig", "nah")                      # resolved
+ANKER_PROBLEM = ("veraltet", "mehrdeutig", "datei_fehlt")   # the evidence cannot be trusted: say so, never guess
+_ANKER_REPO_FILE = "python/sglang/srt/weg2/launcher.py"
+
+
+def anchor_lines(text: str, anker: str) -> List[int]:
+    """1-based START lines of every occurrence of ``anker`` in ``text`` (an anchor may span lines; one entry per line)."""
+    out: List[int] = []
+    if not anker:
+        return out
+    pos = text.find(anker)
+    while pos >= 0:
+        ln = text.count("\n", 0, pos) + 1
+        if not out or out[-1] != ln:
+            out.append(ln)
+        pos = text.find(anker, pos + 1)
+    return out
+
+
+def resolve_anchor(hits: Sequence[int], hint: object, drift: int = 0) -> Tuple[Optional[int], str]:
+    """``(line, status)`` for an anchor with the given hit lines.
+
+    * no hit            -> ``(None, "veraltet")``: the anchor text is gone from the file (the evidence is stale);
+    * exactly one hit   -> ``(hit, "eindeutig")`` wherever it is;
+    * several hits      -> the one nearest to ``hint + drift`` (``drift`` = how far this region of the file moved, see
+      :func:`resolve_edge_belege`) is ``"nah"``; when two hits are equally near, or the nearest is farther than ``ANKER_TOL`` from
+      the expectation, the anchor is ``(None, "mehrdeutig")`` -- no silent pick."""
+    if not hits:
+        return None, "veraltet"
+    if len(hits) == 1:
+        return hits[0], "eindeutig"
+    h = hint if isinstance(hint, int) and not isinstance(hint, bool) else 0
+    want = h + drift
+    ranked = sorted(hits, key=lambda x: (abs(x - want), x))
+    d0 = abs(ranked[0] - want)
+    if d0 > ANKER_TOL or abs(ranked[1] - want) == d0:
+        return None, "mehrdeutig"
+    return ranked[0], "nah"
+
+
+def _repo_root_of(launcher_path: str) -> str:
+    """The repo root implied by the launcher path (``<root>/python/sglang/srt/weg2/launcher.py``); ``""`` for any other layout."""
+    p = os.path.abspath(launcher_path).replace(os.sep, "/")
+    return p[:-len(_ANKER_REPO_FILE) - 1] if p.endswith("/" + _ANKER_REPO_FILE) else ""
+
+
+def resolve_edge_belege(edges: Sequence[Mapping], root: str) -> Dict[str, Dict[str, object]]:
+    """Resolve the evidence of every edge by its ANCHOR TEXT.  Returns ``{edge id: {zeile, hinweis, status, treffer, datei}}``.
+
+    ``zeile`` is the resolved line (the stored line stays visible as ``hinweis`` when nothing resolves).  Relative files are
+    read under ``root``, absolute ones as they are (``extern_fehlt`` when such a file is not on this machine: not a problem, not
+    verifiable).  Drift: edges whose anchor is unique show how far their region moved (hit - stored); a multi-hit anchor expects
+    its hit at ``stored + median drift of the nearest unique edges of the same file`` -- so a prepend of N lines moves every hint by N
+    and an ambiguous anchor still lands on its own line instead of a stray namesake."""
+    texts: Dict[str, Optional[str]] = {}
+    rows: List[Dict[str, object]] = []
+    for e in edges:
+        b = e.get("beleg") if isinstance(e, Mapping) else None
+        if not isinstance(b, Mapping) or not b.get("datei"):
+            continue
+        datei = str(b["datei"])
+        path = datei if os.path.isabs(datei) else (os.path.join(root, datei) if root else "")
+        if path not in texts:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    texts[path] = fh.read()
+            except OSError:
+                texts[path] = None
+        text = texts[path]
+        row: Dict[str, object] = {"id": str(e.get("id", "")), "datei": datei, "hinweis": b.get("zeile"), "treffer": 0,
+                                  "zeile": b.get("zeile"), "status": "", "_path": path}
+        if text is None:
+            row["status"] = "extern_fehlt" if os.path.isabs(datei) else "datei_fehlt"
+        else:
+            row["_hits"] = anchor_lines(text, str(b.get("anker") or ""))
+            row["treffer"] = len(row["_hits"])
+        rows.append(row)
+    unique: Dict[str, List[Tuple[int, int]]] = {}
+    for r in rows:
+        h = r.get("_hits")
+        if h is not None and len(h) == 1 and isinstance(r["hinweis"], int):
+            unique.setdefault(str(r["_path"]), []).append((r["hinweis"], h[0] - r["hinweis"]))
+    out: Dict[str, Dict[str, object]] = {}
+    for r in rows:
+        if not r["status"]:
+            near = sorted(unique.get(str(r["_path"]), []), key=lambda t: abs(t[0] - (r["hinweis"] if isinstance(r["hinweis"], int) else 0)))[:3]
+            drifts = sorted(d for _s, d in near)
+            drift = drifts[len(drifts) // 2] if drifts else 0
+            line, r["status"] = resolve_anchor(r["_hits"], r["hinweis"], drift)
+            if line is not None:
+                r["zeile"] = line
+        out[str(r["id"])] = {k: v for k, v in r.items() if not k.startswith("_")}
+    return out
+
+
+def _beleg(e: Mapping, res: Optional[Mapping] = None) -> Optional[Dict[str, object]]:
     b = e.get("beleg")
     if not isinstance(b, dict) or not b.get("datei"):
         return None
-    return {"datei": str(b.get("datei")), "zeile": b.get("zeile"), "anker": str(b.get("anker") or "")}
+    out = {"datei": str(b.get("datei")), "zeile": b.get("zeile"), "anker": str(b.get("anker") or "")}
+    if res is not None:
+        # displayed line = the resolved one; the stored line is kept as a hint, the status says how it was found
+        out.update({"zeile": res["zeile"], "zeile_hinweis": b.get("zeile"), "aufloesung": res["status"]})
+    return out
 
 
 def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping], info: Dict[str, object],
-                refusal_codes: Optional[Sequence[str]] = None) -> Dict[str, object]:
+                refusal_codes: Optional[Sequence[str]] = None,
+                belege: Optional[Mapping[str, Mapping]] = None) -> Dict[str, object]:
     """Merge the edge catalog into ``entries[von]["depends"]`` (key ``(von, nach)``), IN PLACE, and say what happened.
 
     * a curated edge with a catalog edge of the same pair gets ``kante`` (id), ``beleg`` (``datei``/``zeile``/``anker``), ``satz``
@@ -267,8 +371,12 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
     * every edge gets ``to_kind``: ``flag`` / ``env`` / ``var`` (a row of the editor), ``ablehnung`` (a code of the refusal register,
       no row) or ``unbekannt`` -- so a chip never points silently at nothing.
 
+    ``belege`` (from :func:`resolve_edge_belege`): the evidence line shown is the one resolved by its anchor text, the stored line
+    becomes ``zeile_hinweis`` and ``aufloesung`` says how it was found (``eindeutig``/``nah``/``veraltet``/``mehrdeutig``/...).
+
     No rule is evaluated here (Nutzerentscheid 05.10.): the launcher and the dry run judge, the edges only explain."""
     codes = set(refusal_codes or ())
+    belege = belege or {}
     by_pair: Dict[Tuple[str, str], Mapping] = {(str(e["von"]), str(e["nach"])): e for e in edges}
     used = set()
     skipped: List[str] = []
@@ -280,7 +388,7 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
                 d.update({"belegt": False, "quelle": "kuratiert", "beleg": None, "satz": "", "kante": "", "wert": None})
                 continue
             used.add((name, str(d["to"])))
-            d.update({"belegt": True, "quelle": "katalog+kuratiert", "kante": str(e.get("id", "")), "beleg": _beleg(e),
+            d.update({"belegt": True, "quelle": "katalog+kuratiert", "kante": str(e.get("id", "")), "beleg": _beleg(e, belege.get(str(e.get("id", "")))),
                       "satz": str(e.get("satz") or ""), "wert": e.get("wert")})
             if e["rel"] != d.get("rel"):
                 d["rel_katalog"] = e["rel"]
@@ -295,7 +403,7 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
             continue
         ent.setdefault("depends", []).append({
             "to": key[1], "rel": e["rel"], "effect": str(e.get("satz") or ""), "calc": e.get("calc") or "text", "belegt": True,
-            "quelle": "katalog", "kante": str(e.get("id", "")), "beleg": _beleg(e), "satz": str(e.get("satz") or ""),
+            "quelle": "katalog", "kante": str(e.get("id", "")), "beleg": _beleg(e, belege.get(str(e.get("id", "")))), "satz": str(e.get("satz") or ""),
             "wert": e.get("wert")})
         new += 1
     n_with = n_without = n_kind_unknown = 0
@@ -316,6 +424,11 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
     info.update({"verschmolzen": len(used), "neu": new, "uebersprungen_ohne_von": skipped, "rel_abweichend": rel_diff,
                  "kanten_belegt": n_with, "kanten_ohne_beleg": n_without, "ziel_unbekannt": n_kind_unknown,
                  "wertbedingt": sum(1 for e in edges if e.get("wert"))})
+    if belege:
+        stat: Dict[str, int] = {}
+        for r in belege.values():
+            stat[str(r["status"])] = stat.get(str(r["status"]), 0) + 1
+        info["beleg_aufloesung"] = {"status": stat, "problem": sorted(i for i, r in belege.items() if r["status"] in ANKER_PROBLEM)}
     return info
 
 
@@ -336,7 +449,7 @@ def _refusals_module():
 # merge
 
 def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, Mapping], tree_rev: str = "",
-                  server_args_path: str = "", edges_path: str = "") -> Dict[str, object]:
+                  server_args_path: str = "", edges_path: str = "", edges_root: str = "") -> Dict[str, object]:
     flags = launcher_flags(launcher_path)
     envs = environ_fields(environ_path)
     entries: Dict[str, Dict[str, object]] = {}
@@ -375,7 +488,9 @@ def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, M
         e["status"] = "kuratiert"
     ref = _refusals_module()
     edges, einfo = load_edges(edges_path)
-    merge_edges(entries, edges, einfo, [r.code for r in ref.REGISTER] if ref is not None else None)
+    root = edges_root or _repo_root_of(launcher_path)
+    belege = resolve_edge_belege(edges, root) if root else None
+    merge_edges(entries, edges, einfo, [r.code for r in ref.REGISTER] if ref is not None else None, belege)
     cat = {"schema": SCHEMA, "tree_rev": tree_rev, "entries": entries, "stats": coverage(entries), "kanten": einfo}
     try:
         with open(launcher_path, encoding="utf-8") as fh:
