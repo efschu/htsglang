@@ -821,6 +821,13 @@ class Envs:
     # On: no live seat and nothing waiting for one -> d_signal contributes 0 (ledger bytes unchanged).
     # Default off = byte for byte as before.
     SGLANG_WEG2_DUAL_D_SIGNAL_SEATS = EnvBool(False)
+    # #1986 D-SEAT-LONG-FIRST (dual front, default 0 = off): N > 0 -> a request whose finished P leg 1 COMPUTED
+    # >= N tokens (leg1 prompt_tokens - cached_tokens) takes the next free D seat before the waiting requests
+    # that did not (weg2/dual_seat_long_first.py). Only the ORDER OF THE WAITING for a free seat changes: no
+    # running decode is touched or parked, seats/KV gates/backfill unchanged, front-side only (no collective,
+    # no wall clock). pt2 (fs10051150): a 174 s P leg (249962 tok) waited 43 s without a D seat and was dropped
+    # by the client's 300 s timeout. Suggested 32768 for the metal check.
+    SGLANG_WEG2_DUAL_D_SEAT_LONG_P_TOKENS = EnvInt(0)
     # #1976 D-SIGNAL-LOCKED (dual front, default off): d_signal reads D's LOCKED rows (mapped - available -
     # evictable, over the 1M-row id space) and the Mamba arena's PINNED slots instead of the table fill
     # (id_space = size - available - evictable, which counts the rows D never mapped; arena = COMPLETE

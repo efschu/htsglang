@@ -3536,6 +3536,9 @@ class Pending:
     est_uncached: int = 0
     span_known: bool = False
     leg1_prompt_tokens: int = 0
+    #: #1986: tokens P read from its cache on leg 1 (usage cached_tokens); prompt - cached = the P work
+    #: D-SEAT-LONG-FIRST protects.
+    leg1_cached_tokens: int = 0
     #: #49 L3: the INNER mamba anchor depths P's leg-1 prefill donated (sglext / meta_info
     #: weg2_anchor_depths); credited only with the P-anchor witness, see _p_anchor_presence.
     leg1_anchor_depths: tuple = ()
@@ -11068,6 +11071,38 @@ class Front:
         logger.info("WEG2 D-ADMIT rid=%s seat=%d/%d rank=%d oldest_wait_s=%.1f source=%s seat_wait_s=%.1f",
                     rid, self._seats_in_use(), self.d_bs, rank, max(0.0, now - t_arrive), source, _sw)
 
+    def _d_seat_long_first(self) -> bool:
+        """#1986 D-SEAT-LONG-FIRST (weg2/dual_seat_long_first.py): the waiting line for the next free D seat puts a
+        request whose finished P leg computed >= SGLANG_WEG2_DUAL_D_SEAT_LONG_P_TOKENS tokens in front of those
+        that did not. Order of the WAITING only -- no seat, running decode or D-side queue is touched; no
+        collective, no wall clock (integers read off the leg-1 usage + the rid counter). Inert (False) unless
+        ``dual_layout`` and the switch > 0, so the flip form and the default dual path run exactly as before.
+        True when the head changed (a long leg moved ahead of an older one)."""
+        if not getattr(self, "dual_layout", False):
+            return False
+        from sglang.srt.weg2 import dual_seat_long_first as _dslf
+
+        thr = _dslf.threshold()
+        if thr <= 0 or len(self._ready_for_d) < 2:
+            return False
+        before = list(self._ready_for_d)
+        ordered = _dslf.long_first(before, thr)
+        if [id(q) for q in ordered] == [id(q) for q in before]:
+            return False
+        head_changed = ordered[0] is not before[0]
+        self._ready_for_d.clear()
+        self._ready_for_d.extend(ordered)
+        edge = (ordered[0].rid, before[0].rid)
+        if head_changed and getattr(self, "_d_seat_lf_last", None) != edge:
+            self._d_seat_lf_last = edge   # edge trigger: a pass that re-finds the same overtake counts/logs once
+            self.counters["d_seat_long_first"] += 1
+            n = self.counters["d_seat_long_first"]
+            if n <= 16 or n % 64 == 0:
+                logger.info("WEG2 D-SEAT-LONG-FIRST rid=%s p_work=%d (leg 1 computed >= %d tokens) takes the next D "
+                            "seat before older=%s (n=%d; only the order of the waiting changed)",
+                            ordered[0].rid, _dslf.p_work_tokens(ordered[0]), thr, before[0].rid, n)
+        return head_changed
+
     async def d_admitter(self) -> None:
         """Law 2: admit the OLDEST first, ``--d-bs`` at a time, refill on a
         freed seat.
@@ -11123,6 +11158,7 @@ class Front:
                     if [id(q) for q in _ordered] != [id(q) for q in self._ready_for_d]:
                         self._ready_for_d.clear()
                         self._ready_for_d.extend(_ordered)
+                self._d_seat_long_first()   # #1986: dual front + switch only, else a no-op
                 p = self._ready_for_d[0]
                 if p.fut.done():
                     # Already resolved, failed or cancelled (leg 1 error, an
@@ -11416,6 +11452,7 @@ class Front:
                 js = {}
             pt, ct, _, _ = usage_of(js)
             p.leg1_prompt_tokens = pt
+            p.leg1_cached_tokens = int(ct or 0)  # #1986 D-SEAT-LONG-FIRST
             # DUAL-TP3PP3 (metal dual20): P answers an aborted leg 1 with 200 and
             # prompt_tokens=0 (finish_reason abort) -- not a failure, not a finish
             p.leg1_aborted = leg1_aborted(js, pt)
