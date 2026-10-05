@@ -1522,7 +1522,7 @@ def on_idle(sched) -> int:
     if actor is not None:
         phys_check(actor, "P")
     if actor is not None and actor.mapped_tokens <= 0 and getattr(actor, "streamer", None) is not None:
-        _stream_regain(actor)                 # #1962: P holds no KV -- weight units back if the card has them
+        _stream_regain(sched, actor)          # #1962: P holds no KV -- weight units back if the card has them
     if actor is None or actor.mapped_tokens <= 0:
         return 0
     tree = getattr(sched, "tree_cache", None)
@@ -1541,14 +1541,19 @@ def on_idle(sched) -> int:
             return 0
     n = actor.release_all()
     if n and getattr(actor, "streamer", None) is not None:
-        _stream_regain(actor)
+        _stream_regain(sched, actor)
     return n
 
 
-def _stream_regain(actor) -> int:
-    """#1962 regain at idle; a refused resume keeps the unit paused and the loan standing (logged)."""
+def _stream_regain(sched, actor) -> int:
+    """#1962 regain at idle; a refused resume keeps the unit paused and the loan standing (logged).
+    Not while a held request still waits for its card grant: its next attempt would pause the units again
+    (a stream-out/regain cycle per retry); the regain waits for the first idle pass without a waiter."""
     from sglang.srt.weg2 import p_layer_stream as _pls
 
+    held = getattr(sched, "_weg2_store_held", None) or {}
+    if any(getattr(r, "_dual_kv_wait", False) for r in held.values()):
+        return 0
     try:
         return _pls.regain_at_idle(actor, phys_free=phys_free_bytes)
     except Exception as exc:  # noqa: BLE001 -- the unit stays streamed, P serves on

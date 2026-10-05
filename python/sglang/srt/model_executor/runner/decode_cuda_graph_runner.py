@@ -868,6 +868,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return default
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # #1962 (weg2/p_layer_stream.py): a paused weight unit of a dual-P PP0 is unmapped VA that its captured
+        # decode graph reads too -- eager while one is paused. False (inert) in every process that never paused.
+        from sglang.srt.weg2.p_layer_stream import force_eager as _pls_stream_eager
+
+        if _pls_stream_eager():
+            return False
         # #1007: THE TOKEN AXIS, WHICH THIS PREDICATE NEVER CHECKED. Every
         # verdict below reasons about BATCH SIZE (`cuda_graph_bs =
         # forward_batch.batch_size`, `cuda_graph_bs <= self.max_bs`); none of

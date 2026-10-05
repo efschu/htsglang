@@ -213,6 +213,23 @@ class StreamSameOutputs(_Base):
         self.assertFalse(L.force_eager())
         torch.testing.assert_close(_fwd(m, x), ref)
 
+    def test_layer_split_across_two_units_merges(self):
+        m = _toy()
+        x = torch.randn(3, 8)
+        ref = _fwd(m, x).clone()
+        units = [L.StreamUnit("weights_1", 1000, {3: [m.layers[3].weight]}),
+                 L.StreamUnit("weights_0", 1000, {3: [m.layers[3].bias], 2: [m.layers[2].weight]})]
+        saver = _FakeSaver(units)
+        st = L.LayerStreamer(units, pause=saver.pause, resume=saver.resume, prefetch=2, device=None, pin=False)
+        st.install_hooks(m.layers, 0, len(m.layers))
+        st.stream_out(["weights_1", "weights_0"])
+        torch.testing.assert_close(_fwd(m, x), ref)
+        st.regain("weights_1")
+        torch.testing.assert_close(_fwd(m, x), ref, msg="the other unit's half of layer 3 still streams")
+        self.assertEqual(st.paused(), ("weights_0",))
+        st.regain("weights_0")
+        torch.testing.assert_close(_fwd(m, x), ref)
+
     def test_adapter_skips_owned_tags_but_not_the_streamer(self):
         from sglang.srt.utils.torch_memory_saver_adapter import _p_layer_stream_owns
 
@@ -323,7 +340,8 @@ class GrantThroughTheStreamer(_Base):
         self.assertEqual(lvl, 4096)
         # deficit 4080 - 1100 = 2980 + ring 100 -> 3 units of 1200
         self.assertEqual(self.st.paused(), ("weights_5", "weights_4", "weights_3"))
-        self.assertEqual(actor._stream_lent, 3600)
+        self.assertEqual(actor._stream_lent, 3500, "3 x 1200 freed, the ring (100) the prefetch keeps is not lent")
+        self.assertEqual(self.st.loan, {"weights_5": 1100, "weights_4": 1200, "weights_3": 1200})
         st = K.peek(self.led[0])
         self.assertEqual(st.committed["D"], 2000, "D untouched: P never presses D")
         self.assertEqual(st.committed["P"], 4080)
@@ -356,10 +374,24 @@ class GrantThroughTheStreamer(_Base):
         self.assertEqual(len(self.st.paused()), 3)
         led.release(4080)                                    # the request ended, P released its KV
         got = L.regain_at_idle(actor)
-        self.assertEqual(got, 3600)
+        self.assertEqual(got, 3500)
         self.assertEqual(self.st.paused(), ())
         self.assertEqual(actor._stream_lent, 0)
         self.assertEqual(K.peek(self.led[0]).budget, 3100, "the loan is back out of the pool")
+
+    def test_on_idle_regains_only_without_a_grant_waiter(self):
+        actor = _Actor(K.CardKvLedger(self.led[0], "P"), self.st)
+        self._grant(actor)
+        K.CardKvLedger(self.led[0], "P").release(4080)
+        waiter = type("W", (), {"_dual_kv_wait": True, "rid": "weg2-0-2"})()
+        sched = _Sched()
+        sched._weg2_store_held = {"w": waiter}
+        with mock.patch.object(S, "_actor", lambda s: actor), mock.patch.object(S, "phys_free_bytes", lambda: None):
+            self.assertEqual(S.on_idle(sched), 0)
+            self.assertEqual(len(self.st.paused()), 3, "a waiter would pause them again on its next attempt")
+            sched._weg2_store_held = {}
+            S.on_idle(sched)
+        self.assertEqual(self.st.paused(), ())
 
     def test_d_grew_into_the_loan_p_keeps_streaming(self):
         actor = _Actor(K.CardKvLedger(self.led[0], "P"), self.st)
@@ -426,3 +458,33 @@ class FlipUnchanged1962(_Base):
 
         self.assertFalse(envs.SGLANG_WEG2_DUAL_P_LAYER_STREAM.get())
         self.assertEqual(envs.SGLANG_WEG2_DUAL_P_LAYER_STREAM_PREFETCH.get(), 2)
+
+
+class GraphsEagerWhilePaused(_Base):
+    """Both PP0 graph runners refuse a replay while a unit is paused (graphs read the paused VA)."""
+
+    def _prefill(self):
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner
+
+        notes = []
+        fake = type("R", (), {})()
+        fake._is_full_backend = True
+        fake._note_eager = lambda reason, fb: notes.append(reason)
+        fake._full_graph_ineligible_reason = lambda fb: None
+        return PrefillCudaGraphRunner.can_run_graph, fake, notes
+
+    def test_prefill_runner(self):
+        fn, fake, notes = self._prefill()
+        self.assertTrue(fn(fake, object()), "nothing paused: the old verdict")
+        self.assertEqual(notes, [])
+        L._OWNED.add("weights_5")
+        self.assertFalse(fn(fake, object()))
+        self.assertEqual(notes, ["layer_stream"])
+        L._OWNED.clear()
+        self.assertTrue(fn(fake, object()), "after the regain the graphs replay again")
+
+    def test_decode_runner(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import DecodeCudaGraphRunner
+
+        L._OWNED.add("weights_5")
+        self.assertFalse(DecodeCudaGraphRunner.can_run_graph(object(), object()))

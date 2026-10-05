@@ -67,6 +67,8 @@ _STREAMER: Optional["LayerStreamer"] = None
 _OWNED: set = set()
 #: True only while this module itself calls the adapter's pause/resume
 _ACTING = [False]
+#: levels whose NO-PLAN line was written (log rate only)
+_NOPLAN_SAID: set = set()
 
 
 def armed(env: Optional[Mapping[str, str]] = None) -> bool:
@@ -100,6 +102,7 @@ def reset_for_tests() -> None:
     _STREAMER = None
     _OWNED.clear()
     _ACTING[0] = False
+    _NOPLAN_SAID.clear()
 
 
 def owns(tag) -> bool:
@@ -286,6 +289,9 @@ class LayerStreamer:
         self._side = torch.cuda.Stream(device=device) if self._cuda else None
         #: tag -> bytes that pause freed (what the regain must reclaim)
         self.freed: Dict[str, int] = {}
+        #: tag -> bytes LENT to the card pool for it (the first unit's loan is net of the staging ring,
+        #: which the prefetch keeps on the card while anything is paused)
+        self.loan: Dict[str, int] = {}
         #: layer -> [(tensor, its original data, pinned host image)]
         self._images: Dict[int, List[Tuple[object, object, object]]] = {}
         self._staged: Dict[int, Tuple[List[object], object]] = {}
@@ -294,7 +300,7 @@ class LayerStreamer:
         layer_bytes = {}
         for u in self.units:
             for li, ts in u.tensors.items():
-                layer_bytes[li] = layer_bytes.get(li, 0) + sum(int(t.untyped_storage().nbytes()) for t in ts)
+                layer_bytes[li] = layer_bytes.get(li, 0) + sum(int(t.numel()) * int(t.element_size()) for t in ts)
         self.max_layer_bytes = max(layer_bytes.values(), default=0)
 
     # -- state ---------------------------------------------------------------
@@ -302,7 +308,7 @@ class LayerStreamer:
         return tuple(t for t in (u.tag for u in self.units) if t in self.freed)
 
     def lent(self) -> int:
-        return int(sum(self.freed.values()))
+        return int(sum(self.loan.values()))
 
     def staging_bytes(self) -> int:
         return int(self.prefetch * self.max_layer_bytes)
@@ -358,7 +364,8 @@ class LayerStreamer:
                 continue
             self.freed[tag] = freed
             _OWNED.add(tag)
-            self._images.update(images)
+            for li, rows in images.items():          # a layer may have tensors in two units: merge, never replace
+                self._images.setdefault(li, []).extend(rows)
             self._order = sorted(self._images)
             self.counters["out"] += 1
             total += freed
@@ -376,19 +383,26 @@ class LayerStreamer:
             return 0
         u = self._by_tag[tag]
         self._sync()
+        mine = {id(t) for ts in u.tensors.values() for t in ts}
         for li in u.tensors:
             self._staged.pop(li, None)
             for t, orig, _h in self._images.get(li, ()):
-                t.data = orig
+                if id(t) in mine:
+                    t.data = orig
         _ACTING[0] = True
         try:
             self._resume(tag)
         finally:
             _ACTING[0] = False
         for li in u.tensors:
-            self._images.pop(li, None)
+            rest = [row for row in self._images.get(li, ()) if id(row[0]) not in mine]
+            if rest:
+                self._images[li] = rest
+            else:
+                self._images.pop(li, None)
         self._order = sorted(self._images)
         n = self.freed.pop(tag)
+        self.loan.pop(tag, None)
         _OWNED.discard(tag)
         self.counters["regain"] += 1
         logger.warning("%s REGAIN tag=%s layers=%s %d B -- resident again (graphs valid: same VA)", MARK, tag,
@@ -569,17 +583,34 @@ def try_stream_for_grant(actor, stages: Sequence[Mapping], level_tokens: int, co
             deficit = short
     tags = st.plan(deficit)
     if not tags:
-        if deficit > 0:
+        if deficit > 0 and int(level_tokens) not in _NOPLAN_SAID:   # once per level (the grant retries every N ms)
+            if len(_NOPLAN_SAID) > 1024:
+                _NOPLAN_SAID.clear()
+            _NOPLAN_SAID.add(int(level_tokens))
             logger.info("%s NO-PLAN level=%d deficit=%d B room=%d B -- the request waits", MARK, int(level_tokens),
                         deficit, st.room())
         return 0
+    ring = 0 if st.freed else st.staging_bytes()
+    before = set(st.freed)
     freed = st.stream_out(tags)
-    if freed > 0:
-        actor.ledger.lend(freed)
-        actor._stream_lent = int(getattr(actor, "_stream_lent", 0) or 0) + freed
-        logger.warning("%s LEND level=%d deficit=%d B lent=%d B (stream loan total %d B) -- P's own weight bytes, "
-                       "D untouched", MARK, int(level_tokens), deficit, freed, actor._stream_lent)
-    return freed
+    if freed <= 0:
+        return 0
+    lent = 0
+    for tag in st.paused():
+        if tag in before:
+            continue
+        n = int(st.freed[tag])
+        take = min(n, ring)               # the ring the prefetch now holds is not lent (first unit pays it)
+        ring -= take
+        st.loan[tag] = n - take
+        lent += n - take
+    if lent > 0:
+        actor.ledger.lend(lent)
+    actor._stream_lent = int(getattr(actor, "_stream_lent", 0) or 0) + lent
+    logger.warning("%s LEND level=%d deficit=%d B freed=%d B lent=%d B (stream loan total %d B, ring %d B kept) "
+                   "-- P's own weight bytes, D untouched", MARK, int(level_tokens), deficit, freed, lent,
+                   actor._stream_lent, st.staging_bytes())
+    return lent
 
 
 def regain_at_idle(actor, phys_free=None) -> int:
@@ -590,10 +621,10 @@ def regain_at_idle(actor, phys_free=None) -> int:
         return 0
     got = 0
     for tag in reversed(st.paused()):
-        n = int(st.freed[tag])
+        n = int(st.loan.get(tag, st.freed[tag]))
         if phys_free is not None:
             pf = phys_free()
-            if pf is not None and int(pf) < n:
+            if pf is not None and int(pf) < int(st.freed[tag]):   # the resume maps the whole unit
                 break
         if not actor.ledger.reclaim(n):
             if not getattr(actor, "_stream_held_said", False):
