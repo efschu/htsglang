@@ -246,20 +246,21 @@ class App:
         self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
         self.kartenplaner = kartenplan.Kartenplaner()
         # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
+        ptree = getattr(args, "profil_tree", None) or None      # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker
         self.profil = profil.ProfilEditor(
-            kartenplaner=self.kartenplaner,
+            kartenplaner=self.kartenplaner, tree=ptree,
             release_dir=getattr(args, "profiles_release_dir", None) or profil.DEFAULT_RELEASE_DIR,
             user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR,
             # Auftrag 1984 (C): die Topologie-Prüfung des Trockenlaufs läuft im Kopplungs-Worker (sglang-Umgebung), nicht in diesem Prozess;
             # self.couplings entsteht erst unten, darum erst beim Aufruf aufgelöst
             topology=lambda n: self.couplings.topology(n))
         # Modellprofil schätzen (S3): liest nur config.json und Kopfzeilen unter den Modellwurzeln
-        self.modellprofil = modellprofil.ModelEstimator(roots=getattr(args, "model_root", None) or None)
+        self.modellprofil = modellprofil.ModelEstimator(tree=ptree, roots=getattr(args, "model_root", None) or None)
         # Profil-Editor S4b (Auftrag 1432): Kopplungen/Balken im langlebigen Worker (startet erst bei der ersten Anfrage)
         self.couplings = profil_recompute.CouplingsService(self.profil.tree, python=getattr(args, "couplings_python", None))
         # Profil-Editor S2 (Auftrag 950): Hardwareprofil lesen, im gebuchten gpuq-Fenster messen
         self.hwprofil = hwprofil.HwProfil(
-            gpuq=args.gpuq, tree=getattr(args, "hw_tree", None), measure_tree=getattr(args, "hw_measure_tree", None),
+            gpuq=args.gpuq, tree=getattr(args, "hw_tree", None) or ptree, measure_tree=getattr(args, "hw_measure_tree", None),
             python=getattr(args, "hw_python", None), prefix=shlex.split(getattr(args, "hw_prefix", "") or ""),
             state_dir=args.state_dir or None, edition=getattr(args, "edition", "rig") or "rig")
         self.energy = (energy.EnergyReader(self.ring_store, live.BUCKET_S) if self.sup is not None
@@ -823,6 +824,11 @@ def main(argv=None):
                     help="the operator's per-image change list (rev -> fixes, expected gain, metal status)")
     ap.add_argument("--features", default=features.DEFAULT_PATH,
                     help="the feature list (built / in image / active / gain; im Image and aktiv are computed here)")
+    ap.add_argument("--profil-tree", default=os.environ.get("RIGDASH_PROFIL_TREE"),
+                    help="Auftrag 1984: Planer-Baum (<baum>/python) für den Profil-Editor: profile_json/refusals/profile_catalog, model_profile, "
+                         "hardware_profile UND der Kopplungs-Worker (PYTHONPATH). Voller python/sglang der Python-Release-Revision "
+                         "(deploy/stage_profil_modules.sh); ohne Angabe: KARTENPLAN_TREE bzw. /opt/rigdash/kartenplan/current. "
+                         "--hw-tree überstimmt ihn nur für das Hardwareprofil")
     ap.add_argument("--hw-tree", default=os.environ.get("HWPROFIL_TREE"),
                     help="Planer-Baum (<baum>/python) mit sglang/srt/rigmon/hardware_profile.py: Hardwareprofil lesen (Auftrag 950)")
     ap.add_argument("--hw-measure-tree", default=os.environ.get("HWPROFIL_MEASURE_TREE"),

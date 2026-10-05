@@ -324,6 +324,26 @@ unter den Modellwurzeln) antworten auch in `release`, weiter nur im LAN (Proxy 4
 `POST /api/hwprofil/measure|cancel` (bucht gpuq) 403 mit Klartext, Kartenplaner, Startzeile, `/api/launch`, `/api/weg2/*` 404
 (`tests/test_profil_release_edition_1984.py`).
 
+### Profil-Editor deployen: Planer-Module stagen und Unit-Flags (Auftrag 1984)
+
+`install.sh` legt `python/sglang` der DASHBOARD-Revision nach `/opt/rigdash/planner`; die ist eine Dashboard-Linie und trägt die Rechenmodule des
+Editors nicht (`weg2/profile_json, refusals, profile_catalog(+_curated), model_profile, card_identity, topology`, `rigmon/hardware_profile`,
+`planner/profile_couplings, expert_residency, pp_cut`). Sie liegen auf den Python-Release-Zweigen (`desk/profil-editor-release-27b-1005`,
+`-nf-1005`). `deploy/stage_profil_modules.sh <rev>` legt den vollen Baum `python/sglang` der Revision unter
+`/opt/rigdash/kartenplan/profil/releases/<sha>` ab und schaltet `profil/current` (der Kartenplaner-Baum `kartenplan/current` bleibt unberührt):
+
+    deploy/stage_profil_modules.sh --check   fa9e7d5c4c    # prüfen, nichts schreiben (Voreinstellung); Dashboard-Revision -> REFUSED, Exit 3
+    deploy/stage_profil_modules.sh --dry-run fa9e7d5c4c    # dazu die Aktionen, die --apply ausführt
+    deploy/stage_profil_modules.sh --apply   fa9e7d5c4c    # schreibt, nur unter --root (Standard /opt/rigdash/kartenplan), idempotent (Lead)
+    deploy/stage_profil_modules.sh --unit-flags            # die Unit-Zeilen
+
+Danach setzt der Lead in der Unit `RIGDASH_PROFIL_TREE` (= `--profil-tree`, EIN Baum für Editor, Modellprofil, Hardwareprofil und den Kopplungs-Worker;
+`--hw-tree` überstimmt ihn nur für die Hardware), `--couplings-python`/`RIGDASH_COUPLINGS_PYTHON` (Python der sglang-Umgebung), bei Bedarf
+`--profiles-release-dir`, `--profile-dir`, `--model-root`, `--edition release` und, nur in der Rig-Ausgabe, `--hw-measure-tree/--hw-python/--hw-prefix`.
+**MemoryMax:** der Worker (`import sglang`) liegt im cgroup der Unit (gemessen RSS 612 MiB), die Unit stand bei MemoryCurrent 487 MiB / Peak 715 MiB
+gegen `MemoryMax=1G`: auf 2G heben. Der Worker rechnet auch das Topologie-Urteil des Trockenlaufs (Op `topology`); fehlt er, bleibt die Notiz
+"Topologie für N Karte(n) nicht geprüft" (Tests: `tests/test_profil_staging_1984.py`, `tests/test_profil_topology_child_1984.py`).
+
 ### Speicher und Stufen
 
 - `history.py`: `history.sqlite` im `--state-dir`. Tiers p0 (1 s NVML, 5 s Host und Modell), p1 (10 s)
