@@ -147,6 +147,17 @@ class Catalog(_Base):
         self.assertEqual(units[1].layers, (0, 1))
         self.assertIs(units[0].tensors[4][0], m.layers[4].weight)
 
+    def test_tensor_shared_by_two_layers_is_swapped_at_both(self):
+        m = _toy()
+        ws = torch.zeros(16)
+        m.layers[1].ws = ws                                   # one workspace object, two layers' modules
+        m.layers[2].ws = ws
+        segs = self._segs({"weights_0": [m.layers[1].weight, m.layers[1].bias, ws]})
+        units, refused = self._cat(m.named_modules(), segs)
+        self.assertEqual(refused, {})
+        self.assertTrue(any(t is ws for t in units[0].tensors[1]))
+        self.assertTrue(any(t is ws for t in units[0].tensors[2]))
+
     def test_unknown_live_block_refuses_the_unit(self):
         m = _toy()
         ghost = torch.zeros(4)
@@ -222,7 +233,9 @@ class StreamSameOutputs(_Base):
         saver = _FakeSaver(units)
         st = L.LayerStreamer(units, pause=saver.pause, resume=saver.resume, prefetch=2, device=None, pin=False)
         st.install_hooks(m.layers, 0, len(m.layers))
-        st.stream_out(["weights_1", "weights_0"])
+        st.stream_out(["weights_1"])                         # layer 3 staged with ONE row (the weight)
+        torch.testing.assert_close(_fwd(m, x), ref)
+        st.stream_out(["weights_0"])                         # now its bias too: the staged copy must be redone
         torch.testing.assert_close(_fwd(m, x), ref)
         st.regain("weights_1")
         torch.testing.assert_close(_fwd(m, x), ref, msg="the other unit's half of layer 3 still streams")

@@ -229,11 +229,14 @@ def catalog(named_modules: Iterable[Tuple[str, object]],
     found: Dict[str, Dict[int, List[object]]] = {t: {} for t in segments}
     bases: Dict[str, set] = {t: set() for t in segments}
     refused: Dict[str, str] = {}
+    # (tensor, layer) pairs: a tensor object several layers' modules hold (a shared workspace) is swapped at
+    # EACH of those layers -- deduplicated per layer, never "first layer wins" (the others would read the pause)
     seen = set()
     for name, mod in named_modules:
         m = _LAYER_RE.search(str(name))
+        li = int(m.group(1)) if m is not None else None
         for t in _module_tensors(mod):
-            if id(t) in seen or not is_device(t):
+            if (id(t), li) in seen or not is_device(t):
                 continue
             try:
                 base = int(t.untyped_storage().data_ptr())
@@ -242,12 +245,12 @@ def catalog(named_modules: Iterable[Tuple[str, object]],
             tag = tag_of(base)
             if tag is None:
                 continue
-            seen.add(id(t))
+            seen.add((id(t), li))
             bases[tag].add(base)
-            if m is None:
+            if li is None:
                 refused.setdefault(tag, "tensor without a layer index on module %r" % (name,))
                 continue
-            found[tag].setdefault(int(m.group(1)), []).append(t)
+            found[tag].setdefault(li, []).append(t)
     units = []
     for tag in segments:
         missing = [a for a in live[tag] if a not in bases[tag]]
@@ -366,6 +369,7 @@ class LayerStreamer:
             _OWNED.add(tag)
             for li, rows in images.items():          # a layer may have tensors in two units: merge, never replace
                 self._images.setdefault(li, []).extend(rows)
+                self._staged.pop(li, None)            # a copy staged for the old row list would miss the new rows
             self._order = sorted(self._images)
             self.counters["out"] += 1
             total += freed
