@@ -583,11 +583,12 @@ class ReviewMutants1971(_Base):
         actor.streamer = st
         lent = []
         actor.ledger = type("Led", (), {"lend": lambda self, n: lent.append(n)})()
-        stages = [{"ledger": "a", "step": 4096, "top": 8192, "bytes": [0, 1500, 1500]}]
+        stages = [{"ledger": "a", "step": 4096, "top": 8192, "bytes": [0, 1000, 1000]}]   # deficit 900: one unit
         free = {"a": 100}
         peek = lambda p: type("St", (), {"free": free[p]})()
         self.assertGreater(L.try_stream_for_grant(actor, stages, 4096, 0, peek), 0)
         n_paused = len(st.paused())
+        self.assertEqual(n_paused, 1)
         # D took the loan: still short at the same level -> no further pause
         self.assertEqual(L.try_stream_for_grant(actor, stages, 4096, 0, peek), 0)
         self.assertEqual(len(st.paused()), n_paused)
