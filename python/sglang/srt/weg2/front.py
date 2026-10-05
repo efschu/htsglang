@@ -11086,7 +11086,8 @@ class Front:
         if thr <= 0 or len(self._ready_for_d) < 2:
             return False
         before = list(self._ready_for_d)
-        ordered = _dslf.long_first(before, thr)
+        _measure = _dslf.measure()   # #1998: raw prompt with the switch, else the computed P work (as before)
+        ordered = _dslf.long_first(before, thr, work_of=_measure)
         if [id(q) for q in ordered] == [id(q) for q in before]:
             return False
         head_changed = ordered[0] is not before[0]
@@ -11098,9 +11099,15 @@ class Front:
             self.counters["d_seat_long_first"] += 1
             n = self.counters["d_seat_long_first"]
             if n <= 16 or n % 64 == 0:
-                logger.info("WEG2 D-SEAT-LONG-FIRST rid=%s p_work=%d (leg 1 computed >= %d tokens) takes the next D "
-                            "seat before older=%s (n=%d; only the order of the waiting changed)",
-                            ordered[0].rid, _dslf.p_work_tokens(ordered[0]), thr, before[0].rid, n)
+                if _dslf.use_raw_prompt():
+                    logger.info("WEG2 D-SEAT-LONG-FIRST rid=%s p_work=%d raw_prompt=%d (raw prompt >= %d tokens) takes "
+                                "the next D seat before older=%s (n=%d; only the order of the waiting changed)",
+                                ordered[0].rid, _dslf.p_work_tokens(ordered[0]), _measure(ordered[0]), thr,
+                                before[0].rid, n)
+                else:
+                    logger.info("WEG2 D-SEAT-LONG-FIRST rid=%s p_work=%d (leg 1 computed >= %d tokens) takes the next "
+                                "D seat before older=%s (n=%d; only the order of the waiting changed)",
+                                ordered[0].rid, _dslf.p_work_tokens(ordered[0]), thr, before[0].rid, n)
         return head_changed
 
     async def d_admitter(self) -> None:

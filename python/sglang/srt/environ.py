@@ -828,6 +828,11 @@ class Envs:
     # no wall clock). pt2 (fs10051150): a 174 s P leg (249962 tok) waited 43 s without a D seat and was dropped
     # by the client's 300 s timeout. Suggested 32768 for the metal check.
     SGLANG_WEG2_DUAL_D_SEAT_LONG_P_TOKENS = EnvInt(0)
+    # #1998 (dual front, default off): with SGLANG_WEG2_DUAL_D_SEAT_LONG_P_TOKENS > 0 the 'long' measure becomes the
+    # RAW prompt length of the request (leg1 prompt_tokens, est_prompt as fallback) instead of the tokens the LAST
+    # P leg computed (prompt - cached). pt4: the 250k needle, paused 3x and resumed from L2, computed only 8257 in
+    # its last leg and did not count as long. Threshold unchanged (metal: 131072). Off = old measure, byte for byte.
+    SGLANG_WEG2_DUAL_D_SEAT_LONG_USE_RAW_PROMPT = EnvBool(False)
     # #1976 D-SIGNAL-LOCKED (dual front, default off): d_signal reads D's LOCKED rows (mapped - available -
     # evictable, over the 1M-row id space) and the Mamba arena's PINNED slots instead of the table fill
     # (id_space = size - available - evictable, which counts the rows D never mapped; arena = COMPLETE

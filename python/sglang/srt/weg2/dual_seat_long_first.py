@@ -28,7 +28,16 @@ order of the WAITING changes, only at the moment a seat is taken:
 "Computed", not "prompt": ``0-21`` had prompt_tokens=51122 but cached_tokens=47360 -- 6.3 s of P work. The
 cost the rule protects is the P work that would be redone, which is the uncached part.
 
-Inert unless ``Front.dual_layout`` and the switch > 0 (default 0 = byte for byte as before)."""
+Inert unless ``Front.dual_layout`` and the switch > 0 (default 0 = byte for byte as before).
+
+RAW-PROMPT MEASURE (#1998, ENV ``SGLANG_WEG2_DUAL_D_SEAT_LONG_USE_RAW_PROMPT``, default OFF = the measure above,
+byte for byte). pt4 (fs10051332): the 250k needle (weg2-0-61, prompt 249921) was paused 3x and resumed from L2;
+its LAST leg read ``cached_tokens=241664`` and computed 8257 < 32768, so it did not count as long and the rule
+did not protect the very request it was built for (the 65k foreign request went before it). With the switch on
+the measure is the request's RAW prompt length (``leg1_prompt_tokens`` = P's usage prompt_tokens, the whole
+prompt incl. the cached head; ``est_prompt`` when leg 1 reported none), whatever the cache or earlier legs did.
+The threshold stays ``SGLANG_WEG2_DUAL_D_SEAT_LONG_P_TOKENS`` (metal: 131072, so a 40-65k request does not get
+precedence). Same properties: order of the waiting only, front-side integers, no clock, no collective."""
 from __future__ import annotations
 
 from typing import Any, Callable, Iterable, List
@@ -37,6 +46,7 @@ from sglang.srt.environ import envs
 from sglang.srt.weg2.seat_age import rid_age
 
 ENV = "SGLANG_WEG2_DUAL_D_SEAT_LONG_P_TOKENS"
+ENV_RAW_PROMPT = "SGLANG_WEG2_DUAL_D_SEAT_LONG_USE_RAW_PROMPT"
 
 
 def threshold() -> int:
@@ -52,6 +62,26 @@ def p_work_tokens(p: Any) -> int:
     pt = int(getattr(p, "leg1_prompt_tokens", 0) or 0)
     ct = int(getattr(p, "leg1_cached_tokens", 0) or 0)
     return max(0, pt - ct)
+
+
+def raw_prompt_tokens(p: Any) -> int:
+    """The RAW prompt length of the request (cached head included): leg 1's usage prompt_tokens, the front's
+    ``est_prompt`` when leg 1 reported none (same fallback as ``_hs.lost_terms`` in the front)."""
+    pt = int(getattr(p, "leg1_prompt_tokens", 0) or 0)
+    return pt or int(getattr(p, "est_prompt", 0) or 0)
+
+
+def use_raw_prompt() -> bool:
+    """#1998 switch: measure the raw prompt instead of the computed P work (default OFF)."""
+    try:
+        return bool(envs.SGLANG_WEG2_DUAL_D_SEAT_LONG_USE_RAW_PROMPT.get())
+    except Exception:  # noqa: BLE001 -- a bad value is OFF
+        return False
+
+
+def measure() -> Callable[[Any], int]:
+    """The 'how long is this request' function the rule compares with the threshold."""
+    return raw_prompt_tokens if use_raw_prompt() else p_work_tokens
 
 
 def long_first(items: Iterable[Any], min_tokens: int,
