@@ -1258,6 +1258,10 @@ FIELD_CLASS: Dict[str, Tuple[str, str]] = {
     "vision_flip_urgent": ("policy", "SCHALTER-HALBPORT 1002: NF-Front-Schalter 'VISION-FLIP-URGENT'"),
     "bar1_canon_order": ("policy", "SCHALTER-HALBPORT 1002: BAR1 oneshot in kanonischer Rangfolge, NF"),
     "census_o1_evict": ("policy", "SCHALTER-HALBPORT 1002: 'KR CENSUS-O1-EVICT', NF"),
+    # nf-boot-merge-1005b brachte drei weitere NF-Front-/Rang-Schalter in ``form.ModelProfile`` (Release-Merge 1005)
+    "front_park_collect_window": ("policy", "NF: SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW (z30y Sammelfenster), Front"),
+    "deposit_lane_lookahead": ("policy", "NF: SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD (H111b), Rang/weight_updater"),
+    "d_seat_rewake": ("policy", "NF: SGLANG_WEG2_D_SEAT_REWAKE (SITZ-REWAKE 47539d581e), Front + D-Raenge"),
 }
 
 #: Standard der erzeugten Zeile für Pflichtfelder der Klasse ``policy`` (jedes andere Feld nimmt den Dataclass-Standard, Schalter aus)
