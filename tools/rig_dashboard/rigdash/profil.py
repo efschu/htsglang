@@ -30,6 +30,7 @@ import time
 from typing import Dict, List, Optional
 
 from . import kartenplan_catalog as CAT
+from . import kvheads as KVH
 from . import kartenplan_transport as TR
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -397,6 +398,8 @@ class ProfilEditor:
     def render_view(self, doc: dict, comments: Optional[dict] = None) -> dict:
         pj, _ref = self.mods()
         v = pj.view(doc, self.catalog()["entries"], comments, self.specs())
+        model_dir = next((str(x.get("value") or "") for x in doc.get("vars") or [] if x.get("name") == "PROFILE_MODEL"), "")
+        v["kvheads"] = KVH.view(v["rows"], model_dir)
         return {"ok": True, "doc": doc, "view": v, "name": doc.get("name"), "line": doc.get("line"),
                 "groups": sorted({r["explain"]["group"] for r in v["rows"] if r["explain"]["group"]})}
 

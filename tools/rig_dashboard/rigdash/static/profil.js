@@ -198,6 +198,22 @@
     return `<details class="pf-fold" data-fold="rm" ${isOpen("rm", false) ? "open" : ""}><summary>Aus dem Profil entfernt (${rm.length})</summary>
       <table class="pf-t">${rm.map((p) => `<tr><td class="mono">${esc(p.key)}</td><td class="mono pf-val">${esc(p.value)}</td><td><button type="button" data-reset="${esc(p.key)}" data-to="profil">↺ Profil</button></td></tr>`).join("")}</table></details>`;
   }
+  // KV-Köpfe je Rang: reine Anzeige (kein Flag, folgt aus --rank-tp-ratio und der Kopfzahl des Modells; Nutzerentscheid 05.10., Stufe 1a).
+  function drawKvHeads() {
+    const k = (st.view && st.view.kvheads) || [];
+    if (!k.length) return "";
+    const REG = { gleichmaessig: "gleichmäßig", verteilt: "verteilt", repliziert: "repliziert (jeder Rang alle KV-Köpfe)", keins: "nicht gerechnet" };
+    const one = (r) => {
+      const heads = r.heads ? `Modell: ${r.heads.q} Q-Köpfe, ${r.heads.kv} KV-Köpfe` : "Modell: Kopfzahl nicht lesbar";
+      const per = r.kv ? r.kv.map((n, i) => `<span class="mono">Rang ${i}: KV ${n}${r.q ? " · Q " + r.q[i] : ""}</span>`).join(" · ") : "";
+      const notes = (r.notiz || []).map((n) => `<div class="muted pf-note">${esc(n)}</div>`).join("");
+      const src = (r.belege || []).length ? `<div class="muted pf-note">Beleg im Planer-Baum: ${esc(r.belege.join("; "))}</div>` : "";
+      return `<div class="pf-kvh"><b>Gruppe ${esc(r.group)}</b> · Gewichte <span class="mono">${esc(r.ratios)}</span> (${esc(r.quelle)}) · ${esc(REG[r.regime] || r.regime)}
+        <div class="muted pf-note">${esc(heads)}</div><div>${per}</div><div>${esc(r.satz)}</div>${notes}${src}</div>`;
+    };
+    return `<details class="pf-fold" data-fold="kvh" ${isOpen("kvh", true) ? "open" : ""}><summary><b>KV-Köpfe je Rang</b> · abgeleitet, nicht einstellbar</summary>
+      ${k.map(one).join("")}<div class="muted pf-note">Es gibt kein Flag für die Kopfverteilung: sie folgt aus --rank-tp-ratio. Was nicht belegt ist, steht als „nicht gerechnet“.</div></details>`;
+  }
   function drawModels() {
     const m = st.models;
     let body;
@@ -350,6 +366,7 @@
       <details class="pf-fold" data-fold="dry" ${isOpen("dry", false) ? "open" : ""}><summary><b>Trockenlauf</b> · welche Ablehnungen hätte der Planer?</summary>${drawCards()}${drawDry()}</details>
       ${drawHardware()}
       ${drawBars()}
+      ${st.doc ? drawKvHeads() : ""}
       ${drawModels()}
       ${drawExport()}`;
     const hwSlot = root.querySelector("#pf-hwroot");
