@@ -1,7 +1,9 @@
 /* Profil-Editor (Auftrag 930, S1): ein Serverprofil laden, bearbeiten, prüfen, speichern, als .env exportieren.
    Rechnet NICHTS selbst: Zeilen, Herkunft, Erklärungen, Abhängigkeiten, Trockenlauf und Export kommen von /api/profil/*
    (Planer-Baum, stdlib).  Das Dashboard ERSTELLT nur ein Profil und startet nichts; einen Force-Schalter gibt es hier nicht:
-   Force gilt am Serverstart (FLLIPER_FORCE=1).  Nur im Rig-Dashboard (Edition rig) und nur im LAN. */
+   Force gilt am Serverstart (FLLIPER_FORCE=1); der Export zeigt nur als Text eine Beispiel-docker-run-Zeile, mit der Force-Zeile genau dann,
+   wenn der letzte Trockenlauf forcebare Ablehnungen ergab (Auftrag 2002 B).  Kanten (Abhängigkeits-Chips) zeigen Beleg und Satz aus dem
+   Kantenkatalog (2002 C); ausgewertet wird keine Regel.  Nur im Rig-Dashboard (Edition rig) und nur im LAN. */
 (function () {
   "use strict";
   const root = document.getElementById("pf-root");
@@ -57,7 +59,7 @@
     const j = await window.ModellProfil.schaetzen(path);
     st.mprof = { path, profile: j.profile, elapsed: j.elapsed_s, cached: j.cached };
   });
-  const doExport = () => run(async () => { st.exp = await api("export", { doc: st.doc }); });
+  const doExport = () => run(async () => { st.exp = await api("export", { doc: st.doc, dry: st.dry }); });   // dry: letzter Trockenlauf (null = keiner): der Server baut daraus den Force-Hinweis
   const doDry = () => run(async () => { st.dry = await api("dry", { doc: st.doc, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })) }); });
 
   // ------------------------------------------------------------------ Darstellung
@@ -87,18 +89,54 @@
       <div class="muted pf-note">${esc(d.force_note)}</div>
       <ul class="pf-notes">${d.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>`;
   }
+  // ------------------------------------------------------------------ Kanten (Abhängigkeiten): Beleg und Satz aus dem Kantenkatalog (2002 C)
+  const regByCode = () => { const m = {}; ((st.list && st.list.register) || []).forEach((r) => { m[r.code] = r; }); return m; };
+  const belegText = (d) => (d.beleg ? String(d.beleg.datei) + ":" + String(d.beleg.zeile) + (d.beleg.anker ? ` („${d.beleg.anker}“)` : "") : "");
+  function depNotes(d) {
+    // alle Aussagen über eine Kante als Zeilen (Tooltip des Chips UND ausgeklappte Erklärung): kein Hover-Zwang, nichts wird ausgewertet
+    const n = [d.satz || d.effect || ""];
+    if (d.calc === "S4") n.push("Die Folge in MiB/Token/ms rechnet der Planer in den Karten-Balken (Kopplungen, Abschnitt unten); der Chip zeigt sie noch nicht.");
+    if (d.wert != null && d.wert !== "") n.push(`Gilt nur bei Wert: ${d.wert} (die Bedingung wird hier nicht ausgewertet).`);
+    if (d.rel_katalog) n.push(`Der Kantenkatalog führt diese Beziehung als „${REL[d.rel_katalog] || d.rel_katalog}“, kuratiert steht „${REL[d.rel] || d.rel}“.`);
+    if (d.belegt === false) n.push("Ohne Beleg: nur kuratiert, im Kantenkatalog nicht belegt (nicht widerlegt).");
+    else if (d.beleg) n.push("Beleg: " + belegText(d) + (d.kante ? " (Kante " + d.kante + ")" : ""));
+    if (d.to_kind === "ablehnung") {
+      const r = regByCode()[d.to];
+      n.push("Ablehnungscode des Planers, kein Wert im Profil" + (r ? ": " + r.title + ". " + (r.force_scope || "") : "."));
+    } else if (d.to_kind === "unbekannt") n.push("Ziel ohne Katalogeintrag und ohne Ablehnungscode.");
+    else if (!d.present) n.push("In diesem Profil nicht gesetzt.");
+    return n.filter(Boolean);
+  }
   function depChip(d) {
-    const tgt = st.view.rows.find((r) => r.name === d.to);
-    const cls = "pf-dep" + (d.present ? "" : " pf-dep-off");
-    return `<span class="${cls}" data-goto="${esc(d.to)}" title="${esc(d.effect)}${d.calc === "S4" ? " (Folge in MiB/Token/ms: kommt mit Stufe S4)" : ""}${d.present ? "" : " — in diesem Profil nicht gesetzt"}">
-      ${esc(REL[d.rel] || d.rel)} <b>${esc(d.to)}</b></span>`;
+    const rej = d.to_kind === "ablehnung";
+    const cls = "pf-dep" + (rej ? " pf-dep-rej" : d.present ? "" : " pf-dep-off");
+    const badge = d.belegt === false ? '<i class="pf-dep-nb">ohne Beleg</i>' : d.belegt ? '<i class="pf-dep-b">Beleg</i>' : "";
+    const wert = d.wert != null && d.wert !== "" ? `<i class="pf-dep-w">nur bei ${esc(d.wert)}</i>` : "";
+    return `<span class="${cls}" data-goto="${esc(d.to)}" title="${esc(depNotes(d).join(" — "))}">
+      ${esc(REL[d.rel] || d.rel)} <b>${esc(d.to)}</b>${wert}${badge}</span>`;
+  }
+  function drawDeps(r) {
+    const ds = r.explain.depends;
+    if (!ds.length) return "";
+    return `<div class="pf-depl"><b>Abhängigkeiten</b><ul>${ds.map((d) => `<li><span class="pf-chip">${esc(REL[d.rel] || d.rel)}</span> <b class="mono">${esc(d.to)}</b>${d.to_kind === "ablehnung" ? ' <span class="pf-chip pf-dep-rej">Ablehnungscode</span>' : ""}
+      <div class="muted">${depNotes(d).map(esc).join("<br>")}</div></li>`).join("")}</ul></div>`;
+  }
+  function gotoMessage(to, row) {
+    const dep = st.view.rows.reduce((f, r) => f || r.explain.depends.find((d) => d.to === to), null);
+    if (dep && dep.to_kind === "ablehnung") {
+      const r = regByCode()[to];
+      return `${to} ist ein Ablehnungscode des Planers, kein Wert im Profil${r ? ": " + r.title + " (" + (r.force_scope || "") + ")" : ""}. Der Trockenlauf zeigt, ob er hier greift.`;
+    }
+    if (dep && dep.to_kind === "unbekannt") return `${to} hat weder einen Katalogeintrag noch einen Ablehnungscode.`;
+    if (dep && dep.to_kind === "var") return `${to} ist eine Profil-Variable und in diesem Profil nicht gesetzt.`;
+    return `${to} ist in diesem Profil nicht gesetzt (im Katalog erklärt, aber nicht Teil dieses Profils).`;
   }
   function drawExplain(r) {
     const ex = r.explain;
     if (!ex.parts.length) return `<div class="pf-unex">Unerklärt: für diesen Wert gibt es weder Katalogtext noch Code-Hilfe noch einen Kommentar im Profil. ${ex.source ? "Quelle: " + esc(ex.source.file) + ":" + esc(ex.source.line) : "Nachlesen im Code (suche " + esc(r.name) + ")."}</div>`;
     const parts = ex.parts.map((p) => `<div class="pf-part"><span class="pf-chip">${esc({ kuratiert: "Erklärung", code: "Code-Hilfe", profil: "Im Profil begründet" }[p.kind] || p.kind)}</span> ${esc(p.text)} <span class="muted">${esc(p.source)}</span></div>`).join("");
     const gc = (ex.gain || ex.cost) ? `<div class="pf-gc">${ex.gain ? `<div><b>Bringt:</b> ${esc(ex.gain)}</div>` : ""}${ex.cost ? `<div><b>Kostet:</b> ${esc(ex.cost)}</div>` : ""}</div>` : "";
-    return parts + gc;
+    return parts + gc + drawDeps(r);
   }
   function inputFor(r) {
     const k = esc(r.key);
@@ -255,6 +293,20 @@
     }
     return `<details class="pf-fold" data-fold="bars" ${isOpen("bars", false) ? "open" : ""}><summary><b>Karten-Balken</b> · was der Schnitt, die Experten und der Chunk auf jeder Karte belegen (Überlauf rot)</summary>${body}</details>`;
   }
+  // Force-Hinweis des Exports: reiner Text nach dem letzten Trockenlauf (der Server hat den Fall berechnet); es gibt keinen Schalter, nichts startet
+  function drawForce(f) {
+    if (!f) return "";
+    const li = (c, cls) => `<li class="${cls}"><b class="mono">${esc(c.code)}</b> ${esc(c.text)}${c.scope ? ` <span class="muted">(${esc(c.scope)})</span>` : ""}</li>`;
+    const ok = (f.force_codes || []).map((c) => li(c, "pf-fc")).join("");
+    const bad = (f.blocked_codes || []).map((c) => `<li class="pf-red"><b class="mono">${esc(c.code)}</b> bleibt auch mit Force bestehen: ${esc(c.text)}; so startet der Server nicht.</li>`).join("");
+    const open = (f.open_codes || []).map((c) => li(c, "pf-fo")).join("");
+    const head = f.fall === "nur_nicht_forcebar" ? `<div class="pf-red"><b>${esc(f.text)}</b></div>` : `<div class="${f.fall === "gemischt" ? "pf-red" : "muted"}">${esc(f.text)}</div>`;
+    return `<div class="pf-forceinfo" data-fall="${esc(f.fall)}"><div class="muted pf-note">Das Dashboard startet nichts; der Aufruf oben ist ein Beispiel zum Anpassen.</div>${head}
+      ${ok ? `<div class="pf-note">Übergeht der Serverstart mit <span class="mono">${esc(f.force_env || "FLLIPER_FORCE=1")}</span>:</div><ul class="pf-fl">${ok}</ul>` : ""}
+      ${bad ? `<ul class="pf-fl">${bad}</ul>` : ""}
+      ${open ? `<div class="pf-note muted">Der Launcher dieser Linie prüft das noch nicht (kein Force nötig):</div><ul class="pf-fl">${open}</ul>` : ""}
+      ${f.records_note ? `<div class="muted pf-note">${esc(f.records_note)}</div>` : ""}${f.line_note ? `<div class="muted pf-note">${esc(f.line_note)}</div>` : ""}</div>`;
+  }
   function drawExport() {
     const x = st.exp;
     if (!x) return "";
@@ -262,7 +314,8 @@
       <div class="muted pf-note">${esc(x.check)}</div>
       ${x.problems.length ? `<pre class="kp-pre">${esc(x.problems.join("\n"))}</pre>` : ""}
       <div class="pf-row-actions"><button type="button" data-act="copy">In die Zwischenablage</button><button type="button" data-act="download">Als ${esc(x.filename)} speichern</button></div>
-      <div class="pf-use">${esc(x.use.text)}<div class="mono">${esc(x.use.profile_env)} ${esc(x.use.force_env)}</div></div>
+      <div class="pf-use">${esc(x.use.text)}
+        <pre class="kp-pre pf-run" id="pf-run">${esc((x.use.docker_run || []).join("\n"))}</pre>${drawForce(x.use.force)}</div>
       <pre class="kp-pre pf-env" id="pf-env">${esc(x.env)}</pre></section>`;
   }
   function draw() {
@@ -327,7 +380,7 @@
     if (t.dataset.open) { st.open[t.dataset.open] = !st.open[t.dataset.open]; return draw(); }
     if (t.dataset.goto) {
       const row = st.view.rows.find((r) => r.name === t.dataset.goto);
-      if (!row) { st.msg = t.dataset.goto + " ist in diesem Profil nicht gesetzt (im Katalog erklärt, aber nicht Teil dieses Profils)."; return draw(); }
+      if (!row) { st.msg = gotoMessage(t.dataset.goto); return draw(); }
       if (st.mode === "einfach" && row.explain.level !== "einfach") { st.mode = "experte"; draw(); }
       const el = document.getElementById("pfr-" + row.key); if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("pf-flash"); setTimeout(() => el.classList.remove("pf-flash"), 1600); }
       return;

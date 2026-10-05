@@ -18,6 +18,12 @@ der werte aufhebt und trotzdem startet".
   (:func:`wired_codes` greps ``refuse_value("CODE"`` in ``launcher.py``; a test pins the register to it, so the
   register cannot claim more than the launcher does).  A ``wert`` code that is not wired yet is listed as such
   and keeps refusing.
+* The container ENTRYPOINT is a second place that consults the switch (``FLLIPER_FORCE=1`` -> ``refuse_value TAG CODE text``
+  in ``entrypoint.sh``, before the launcher exists): PROFIL-STATUS, SHM, STORE, MEMAVAIL and the GPU gate's HW-COUNT /
+  HW-UNCALIBRATED.  :data:`ENTRYPOINT_FORCE_CODES` names them (a test pins the tuple to the entrypoint source), and
+  :func:`public_register` reports ``wired_at`` = launcher | entrypoint | launcher+entrypoint | none.  A code wired only in
+  the entrypoint is forceable in the Docker start and NOT in a bare launcher call -- the dashboard must say exactly that,
+  never "stays with Force" (wrong for Docker) and never "Force passes it" (wrong for the bare launcher).
 
 PURE: stdlib only.  The dashboard loads this file by path to show, per profile, which refusals the planner would
 raise and whether Force passes them.
@@ -104,7 +110,7 @@ REGISTER: Tuple[Refusal, ...] = (
     _v("PROFIL-STATUS", "Profil ist nicht abgenommen",
        "PROFILE_STATUS (experimentell/formnachweis/vorbereitet/geplant) sagt, wie weit das Profil bewiesen ist: Urteil über den Beweisstand.",
        "docker/entrypoint.sh (PROFILE_STATUS)", "entrypoint",
-       "Wie HTSGLANG_ALLOW_EXPERIMENTAL=1, aber auch für vorbereitet/geplant. Der Entrypoint liegt außerhalb des Repos (gestagter Patch)."),
+       "Wie HTSGLANG_ALLOW_EXPERIMENTAL=1, aber auch für vorbereitet/geplant. Nur im Docker-Start (Entrypoint) forcebar: der Launcher kennt dieses Tor nicht (entrypoint.sh liegt außerhalb dieses Baums)."),
     _v("SHM", "/dev/shm zu klein",
        "Schwelle (PROFILE_SHM_MIN_GIB) gegen die Größe des gemounteten shm: Kapazität.",
        "docker/entrypoint.sh (SHM)", "entrypoint",
@@ -161,6 +167,12 @@ REGISTER: Tuple[Refusal, ...] = (
 )
 
 _BY_CODE: Dict[str, Refusal] = {r.code: r for r in REGISTER}
+
+#: value refusals the container entrypoint passes with ``FLLIPER_FORCE=1`` (entrypoint.sh: ``refuse_value <TAG> <CODE>`` and the
+#: GPU gate's ``FORCED-PAST HW-COUNT|HW-UNCALIBRATED``); pinned to the entrypoint source by test_refusals_force_1003
+ENTRYPOINT_FORCE_CODES: Tuple[str, ...] = ("HW-COUNT", "HW-UNCALIBRATED", "MEMAVAIL", "PROFIL-STATUS", "SHM", "STORE")
+#: the exact scope sentence for a code that only the entrypoint lifts (shown by the dashboard verbatim)
+SCOPE_ENTRYPOINT_ONLY = "im Docker-Start (Entrypoint) forcebar, im reinen Launcher-Aufruf nicht"
 
 
 def by_code(code: str) -> Optional[Refusal]:
@@ -257,6 +269,16 @@ def wired_codes(launcher_source: str) -> List[str]:
     return sorted(set(_RX_CALL.findall(launcher_source)))
 
 
+_RX_EP_CALL = re.compile(r"""refuse_value\s+[A-Z_]+\s+([A-Z][A-Z0-9-]+)""")
+_RX_EP_PAST = re.compile(r"""FORCED-PAST\s+([A-Z][A-Z0-9-]+)""")
+
+
+def entrypoint_wired_codes(entrypoint_source: str) -> List[str]:
+    """Codes the given ``entrypoint.sh`` passes under ``HTSGLANG_FORCE=1``: ``refuse_value <TAG> <CODE> ...`` calls and literal
+    ``FORCED-PAST <CODE>`` lines (the shell function's own ``$2`` is not a code and is not matched)."""
+    return sorted(set(_RX_EP_CALL.findall(entrypoint_source)) | set(_RX_EP_PAST.findall(entrypoint_source)))
+
+
 def launcher_raise_sites(launcher_source: str) -> int:
     """Number of ``raise Weg2LaunchRefused`` statements in the launcher source."""
     return len(re.findall(r"raise Weg2LaunchRefused", launcher_source))
@@ -270,12 +292,29 @@ def classify(text: str) -> Optional[str]:
     return None
 
 
-def public_register(wired: Optional[Sequence[str]] = None) -> List[Dict[str, object]]:
-    """The register as data for the dashboard (``wired``: the codes the launcher of the planner tree consults)."""
+def public_register(wired: Optional[Sequence[str]] = None,
+                    entrypoint_wired: Optional[Sequence[str]] = None) -> List[Dict[str, object]]:
+    """The register as data for the dashboard.
+
+    ``wired``: the codes the launcher of the planner tree consults.  ``entrypoint_wired``: the codes the container entrypoint
+    consults (default :data:`ENTRYPOINT_FORCE_CODES`).  Per forceable code: ``wired`` (launcher, unchanged meaning),
+    ``wired_entrypoint`` and ``wired_at`` (``launcher`` | ``entrypoint`` | ``launcher+entrypoint`` | ``none``); for a hard code
+    all three are ``None``.  ``force_scope`` is the one-line truth about WHERE Force lifts it."""
     w = set(wired or ())
+    e = set(ENTRYPOINT_FORCE_CODES if entrypoint_wired is None else entrypoint_wired)
     out = []
     for r in REGISTER:
+        in_l, in_e = r.code in w, r.code in e
+        if r.forcebar:
+            at = "launcher+entrypoint" if (in_l and in_e) else "launcher" if in_l else "entrypoint" if in_e else "none"
+            scope = {"launcher+entrypoint": "im Docker-Start (Entrypoint) und im Launcher forcebar",
+                     "launcher": "im Launcher forcebar (auch im Docker-Start, der den Launcher aufruft)",
+                     "entrypoint": SCOPE_ENTRYPOINT_ONLY,
+                     "none": "forcebar nach Klasse, aber nirgends verdrahtet: der Start verweigert weiter"}[at]
+        else:
+            at, scope = None, "nicht forcebar"
         out.append({"code": r.code, "klass": r.klass, "klass_label": CLASS_LABEL[r.klass], "forcebar": r.forcebar,
                     "title": r.title, "why_class": r.why_class, "source": r.source, "enforced_by": r.enforced_by,
-                    "consequence": r.consequence, "wired": (r.code in w) if r.forcebar else None})
+                    "consequence": r.consequence, "wired": in_l if r.forcebar else None,
+                    "wired_entrypoint": in_e if r.forcebar else None, "wired_at": at, "force_scope": scope})
     return out

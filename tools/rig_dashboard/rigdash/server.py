@@ -607,7 +607,7 @@ def make_handler(app: App):
             if path == "/api/profil/delete":
                 return self._json(ed.delete(str(body.get("name", ""))))
             if path == "/api/profil/export":
-                return self._json(ed.export_env(body.get("doc")))
+                return self._json(ed.export_env(body.get("doc"), body.get("dry")))
             if path == "/api/profil/dry":
                 return self._json(ed.dry_run(body.get("doc"), body.get("cards") or [], bool(body.get("host_patched", True))))
             if path == "/api/profil/recompute":
