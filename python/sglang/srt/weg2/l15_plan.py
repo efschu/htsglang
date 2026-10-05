@@ -78,6 +78,39 @@ def handover_on(env: Mapping[str, str]) -> bool:
     return _switch(env, HOT_HANDOVER_ENV)
 
 
+#: L15-NOPARK-INIT (desk 2018): lets an idle D (never parked) enter the L15 retain block
+NOPARK_INIT_ENV = "SGLANG_WEG2_L15_NOPARK_INIT"
+
+
+def noparkinit_apply(sched: Any, env: Mapping[str, str]) -> bool:
+    """L15-NOPARK-INIT: give a never-parked D the state a park leaves behind.
+
+    The L15 retain block of the D sleep flush (reuse / SLEEP-AGREE / TREE-CAND /
+    retain / KEEP-CLEAR) is gated on ``sched.weg2_d_parked is not None``, an
+    attribute only ``d_park_runtime.parked_list`` creates -- i.e. only after a
+    ``park_running``. An idle D (outstanding=0 at every flip, boot 1736: 42 of 42)
+    never parks, so the block never ran. ``[]`` is exactly the state ``hold_parked``
+    leaves after a sleep (d_park_runtime.py ``sched.weg2_d_parked = []``) and every
+    other reader treats it as falsy ("nothing parked").
+
+    Sets ``[]`` only when ALL hold: L15 master on, the new switch on, group D, not the
+    dual layout (V1 refuses L15 there, W-L15-DUAL), attribute still None. Group D is
+    load-bearing: P's flush shares this code and was kept out of the block only by the
+    attribute staying None. Returns True iff it set the attribute.
+    """
+    if not (
+        master_on(env)
+        and _switch(env, NOPARK_INIT_ENV)
+        and str(env.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() == "D"
+        and str(env.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip() != "1"
+    ):
+        return False
+    if getattr(sched, "weg2_d_parked", None) is not None:
+        return False
+    sched.weg2_d_parked = []
+    return True
+
+
 def parse_l15_mib(value: Optional[str]) -> Tuple[str, Dict[int, int]]:
     """``SGLANG_WEG2_L15_MIB`` -> ``("auto", {})`` or ``("override", {card: mib})``.
 
