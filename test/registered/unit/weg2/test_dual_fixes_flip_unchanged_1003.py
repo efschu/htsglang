@@ -36,6 +36,8 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
          test_dual_green_ladder_1330 (three-stage wire, launch order, mutants)
   #1989  D-PARK OLDER-LIVE-FREE (weg2/d_seats.py): no seat room, the park barrier as before; the behavioural
          half is test_dual_d_park_older_live_free_1989_1005
+  #2004  D-WANT-LOCKED (weg2/dual_d_kv_stage.py): never armed outside group D of the dual layout, the
+         D tick without the dual actor returns None; the behavioural half is test_dual_d_want_locked_2004_1005
 """
 from __future__ import annotations
 
@@ -1092,3 +1094,26 @@ class TestQ1989ParkOlderLiveFreeFlipUnchanged:
             gate = d_seats.admission_gate([parked, new], running=[older], seat_cap=6)
             assert gate.seat_room is None, env
             assert gate.skip(new, admitted=[]) == "weg2_d_park_first", env
+
+
+# ---------------------------------------------------------------------------------- #2004
+
+class TestQ2004DWantLockedFlipUnchanged:
+    def test_flip_form_never_arms_the_locked_want_even_with_the_switch_on(self, monkeypatch):
+        """#2004: without the dual layout (flip, NF, 27B INT8 row authority) or on P the switch is a dead letter,
+        and the D tick without the dual actor touches nothing (no step, no instrument line)."""
+        monkeypatch.setenv("SGLANG_WEG2_DUAL_D_WANT_LOCKED", "1")
+        monkeypatch.delenv(DK.MAX_TOKENS_ENV, raising=False)
+        for env in _wrong_gates() + [{"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P",
+                                      DK.MAX_TOKENS_ENV: "131072"}]:
+            for k in DUAL_KEYS:
+                monkeypatch.delenv(k, raising=False)
+            for k, v in env.items():
+                monkeypatch.setenv(k, v)
+            assert DK.want_locked_armed() is False, env
+        called = []
+        sched = SimpleNamespace(tp_worker=SimpleNamespace(model_runner=SimpleNamespace()))
+        with mock.patch.object(DK, "_want_locked_step", lambda *a: called.append(a)), \
+                mock.patch.object(DK, "_instr_d_want", lambda *a, **k: called.append(a)):
+            assert DK.tick(sched) is None
+        assert called == []

@@ -757,6 +757,13 @@ class Envs:
     # 5 s per rank and marker, no collective, no behaviour. Inert outside SGLANG_WEG2_DUAL_LAYOUT=1
     # (either group with its KV cap); 0 = no line, no cost.
     SGLANG_WEG2_DUAL_PKVWAIT_INSTR = EnvBool(True)
+    # #2004 D-WANT-LOCKED (deskq/done/2000 B1, Karte-0-Wand 262k): dual D only. DEFAULT OFF = the old
+    # code, byte for byte. On: D's level (``want``) is built from the rows it really holds (mapped - free -
+    # evictable = ``locked``, a prefix the seats share counts ONCE) plus the not yet allocated need of the
+    # queue and the chunked request, instead of the SUM of every request's full token count (pt4: mapped
+    # 308634 for ~149246 occupied rows). Never above the old want; floor_want, the live floor and the
+    # immediate grow stay. The module reads os.environ itself (dual_d_kv_stage.want_locked_armed).
+    SGLANG_WEG2_DUAL_D_WANT_LOCKED = EnvBool(False)
     # #1390f UNBACKED-DROP (y9d4d/B9, desk analysis 1390 Fix 2): dual D only. DEFAULT OFF = the old code
     # path byte for byte. On: while P waits for its card >= DROP_WAIT_S, the D group has no demand and no
     # hold and the shared arena refused a claim recently, D's cache yield drops un-backed childless leaves
