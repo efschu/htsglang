@@ -11,7 +11,7 @@ Every value in the editor is explained from a SOURCE, never from a guess.  The s
    (``harvest_profile_comments``; per profile, at load time).
 5. Nothing found -> ``status: "unerklaert"``, shown as such with the place in the code to read.
 
-``build_catalog`` merges 1-3; ``coverage`` states how much is explained.  A curated dependency edge is checked
+``build_catalog`` merges 1-3 and the EDGE CATALOG (``kantenkatalog_1004.json``, see :func:`merge_edges`); ``coverage`` states how much is explained.  A curated dependency edge is checked
 against the launcher by the test (``test_profile_catalog_1003``): the flags it names must exist.
 
 PURE: stdlib only (AST over source files).  Nothing here imports sglang, starts anything or touches a GPU.
@@ -220,10 +220,123 @@ def harvest_profile_comments(env_path: str) -> Dict[str, Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# edge catalog (Auftrag 2002 C): evidence + one sentence per dependency, merged into ``depends``
+
+EDGES_SCHEMA = "flliper.kanten/1"
+EDGES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kantenkatalog_1004.json")
+_RX_CODE = re.compile(r"^[A-Z]+(?:-[A-Z]+)+$")
+
+
+def load_edges(path: str = "") -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    """The edges of the edge catalog and a status dict.  A missing or unreadable file is NOT an error of the catalog: the
+    dependencies stay as curated, the status says ``geladen: False`` and why (never a silent empty list)."""
+    path = path or EDGES_FILE
+    info: Dict[str, object] = {"datei": os.path.basename(path), "geladen": False, "grund": "", "schema": ""}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        info["grund"] = "nicht lesbar: %s" % exc
+        return [], info
+    info["schema"] = str(doc.get("schema", ""))
+    edges = doc.get("kanten")
+    if info["schema"] != EDGES_SCHEMA or not isinstance(edges, list):
+        info["grund"] = "Schema %r (erwartet %s) oder keine Kantenliste" % (info["schema"], EDGES_SCHEMA)
+        return [], info
+    ok = [e for e in edges if isinstance(e, dict) and e.get("von") and e.get("nach") and e.get("rel")]
+    info.update({"geladen": True, "kanten_gesamt": len(ok), "verworfen": len(edges) - len(ok)})
+    return ok, info
+
+
+def _beleg(e: Mapping) -> Optional[Dict[str, object]]:
+    b = e.get("beleg")
+    if not isinstance(b, dict) or not b.get("datei"):
+        return None
+    return {"datei": str(b.get("datei")), "zeile": b.get("zeile"), "anker": str(b.get("anker") or "")}
+
+
+def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping], info: Dict[str, object],
+                refusal_codes: Optional[Sequence[str]] = None) -> Dict[str, object]:
+    """Merge the edge catalog into ``entries[von]["depends"]`` (key ``(von, nach)``), IN PLACE, and say what happened.
+
+    * a curated edge with a catalog edge of the same pair gets ``kante`` (id), ``beleg`` (``datei``/``zeile``/``anker``), ``satz``
+      (the tradeoff sentence), ``wert`` (the condition, shown as text only -- the editor does NOT evaluate it) and ``belegt: True``;
+      when the catalog names another ``rel``, the curated one stays and ``rel_katalog`` carries the catalog's (no silent overwrite);
+    * a catalog edge with no curated twin is appended (``quelle: "katalog"``);
+    * a curated edge without catalog edge stays and is marked ``belegt: False`` -- "ohne Beleg", not refuted;
+    * every edge gets ``to_kind``: ``flag`` / ``env`` / ``var`` (a row of the editor), ``ablehnung`` (a code of the refusal register,
+      no row) or ``unbekannt`` -- so a chip never points silently at nothing.
+
+    No rule is evaluated here (Nutzerentscheid 05.10.): the launcher and the dry run judge, the edges only explain."""
+    codes = set(refusal_codes or ())
+    by_pair: Dict[Tuple[str, str], Mapping] = {(str(e["von"]), str(e["nach"])): e for e in edges}
+    used = set()
+    skipped: List[str] = []
+    rel_diff: List[str] = []
+    for name, ent in entries.items():
+        for d in ent.get("depends", []):
+            e = by_pair.get((name, str(d.get("to"))))
+            if e is None:
+                d.update({"belegt": False, "quelle": "kuratiert", "beleg": None, "satz": "", "kante": "", "wert": None})
+                continue
+            used.add((name, str(d["to"])))
+            d.update({"belegt": True, "quelle": "katalog+kuratiert", "kante": str(e.get("id", "")), "beleg": _beleg(e),
+                      "satz": str(e.get("satz") or ""), "wert": e.get("wert")})
+            if e["rel"] != d.get("rel"):
+                d["rel_katalog"] = e["rel"]
+                rel_diff.append(str(e.get("id", "")))
+    new = 0
+    for key, e in by_pair.items():
+        if key in used:
+            continue
+        ent = entries.get(key[0])
+        if ent is None:
+            skipped.append(str(e.get("id", key)))
+            continue
+        ent.setdefault("depends", []).append({
+            "to": key[1], "rel": e["rel"], "effect": str(e.get("satz") or ""), "calc": e.get("calc") or "text", "belegt": True,
+            "quelle": "katalog", "kante": str(e.get("id", "")), "beleg": _beleg(e), "satz": str(e.get("satz") or ""),
+            "wert": e.get("wert")})
+        new += 1
+    n_with = n_without = n_kind_unknown = 0
+    for ent in entries.values():
+        for d in ent.get("depends", []):
+            to = str(d.get("to"))
+            if to in entries:
+                d["to_kind"] = str(entries[to].get("kind") or "unbekannt")
+            elif to in codes or (not codes and _RX_CODE.match(to)):
+                d["to_kind"] = "ablehnung"
+            else:
+                d["to_kind"] = "unbekannt"
+                n_kind_unknown += 1
+            if d.get("belegt"):
+                n_with += 1
+            else:
+                n_without += 1
+    info.update({"verschmolzen": len(used), "neu": new, "uebersprungen_ohne_von": skipped, "rel_abweichend": rel_diff,
+                 "kanten_belegt": n_with, "kanten_ohne_beleg": n_without, "ziel_unbekannt": n_kind_unknown,
+                 "wertbedingt": sum(1 for e in edges if e.get("wert"))})
+    return info
+
+
+def _refusals_module():
+    """The register module next to this file (loaded by path, like the dashboard does); ``None`` when it cannot be loaded."""
+    try:
+        from importlib import util as _u
+        spec = _u.spec_from_file_location("kp_refusals", os.path.join(os.path.dirname(os.path.abspath(__file__)), "refusals.py"))
+        mod = _u.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:       # noqa: BLE001 -- optional data
+        return None
+
+
+# ---------------------------------------------------------------------------
 # merge
 
 def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, Mapping], tree_rev: str = "",
-                  server_args_path: str = "") -> Dict[str, object]:
+                  server_args_path: str = "", edges_path: str = "") -> Dict[str, object]:
     flags = launcher_flags(launcher_path)
     envs = environ_fields(environ_path)
     entries: Dict[str, Dict[str, object]] = {}
@@ -260,15 +373,14 @@ def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, M
                 e[k] = c[k]
         e["depends"] = [dict(d) for d in c.get("depends", [])]
         e["status"] = "kuratiert"
-    cat = {"schema": SCHEMA, "tree_rev": tree_rev, "entries": entries, "stats": coverage(entries)}
+    ref = _refusals_module()
+    edges, einfo = load_edges(edges_path)
+    merge_edges(entries, edges, einfo, [r.code for r in ref.REGISTER] if ref is not None else None)
+    cat = {"schema": SCHEMA, "tree_rev": tree_rev, "entries": entries, "stats": coverage(entries), "kanten": einfo}
     try:
         with open(launcher_path, encoding="utf-8") as fh:
             src = fh.read()
-        from importlib import util as _u
-        spec = _u.spec_from_file_location("kp_refusals", os.path.join(os.path.dirname(os.path.abspath(__file__)), "refusals.py"))
-        mod = _u.module_from_spec(spec)
-        sys.modules[spec.name] = mod
-        spec.loader.exec_module(mod)
+        mod = ref
         cat["register_wired"] = mod.wired_codes(src)
         cat["launcher_raise_sites"] = mod.launcher_raise_sites(src)
     except Exception:       # noqa: BLE001 -- the wiring statement is optional data

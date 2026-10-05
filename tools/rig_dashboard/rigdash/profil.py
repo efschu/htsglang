@@ -84,6 +84,105 @@ def find_tree(explicit: Optional[str] = None) -> Optional[str]:
     return None
 
 
+FORCE_ENV = "FLLIPER_FORCE=1"
+MAX_CODE_TEXT = 400
+
+
+def _clip_text(code: str, text) -> str:
+    """Der Ablehnungstext für die Force-Liste: ein führendes ``<CODE>:`` entfällt (der Code steht schon davor), ein zu langer Text endet an
+    einer Wortgrenze mit ``…`` statt mitten im Wort (nie länger als ``MAX_CODE_TEXT``)."""
+    t = str(text or "").strip()
+    if t.startswith(code + ":"):
+        t = t[len(code) + 1:].strip()
+    if len(t) <= MAX_CODE_TEXT:
+        return t
+    cut = t[:MAX_CODE_TEXT - 1]
+    sp = cut.rfind(" ")
+    return (cut[:sp] if sp > MAX_CODE_TEXT // 2 else cut).rstrip(" ,;:") + "…"
+
+
+def force_verdict(r: dict):
+    """(Text, ``force_state``, ``force_via``) für eine Zeile des Ablehnungsregisters ``r`` (leer = Code unbekannt).
+
+    ``force_state``: ``force`` (der Serverstart übergeht es) | ``blockiert`` (auch mit Force nicht) | ``ungeprueft`` (der Launcher dieser Linie
+    prüft es nicht).  ``force_via``: ``launcher`` | ``entrypoint`` | ``None``.  Der Entrypoint (docker/entrypoint.sh) übergeht PROFIL-STATUS, SHM,
+    STORE und MEMAVAIL mit FLLIPER_FORCE=1, der Launcher nicht (Auftrag 2002 A); ein älteres Register ohne ``wired_entrypoint`` wird über
+    ``enforced_by`` gelesen."""
+    if r and not r.get("forcebar"):
+        return "nein, nicht forcebar", "blockiert", None
+    if r.get("wired"):
+        return "ja, Force übergeht es (FORCED-PAST im Boot-Log)", "force", "launcher"
+    ep = r.get("wired_entrypoint")
+    if ep is None:
+        ep = r.get("enforced_by") == "entrypoint"
+    if ep:
+        return ("ja, im Docker-Start (Entrypoint) forcebar, im reinen Launcher-Aufruf nicht (FORCED-PAST im Boot-Log)", "force", "entrypoint")
+    if r.get("enforced_by") == "planner-gate":
+        return "der Launcher dieser Linie prüft das noch nicht: beim Start keine Verweigerung", "ungeprueft", None
+    return "forcebar, aber weder im Launcher noch im Entrypoint dieser Linie verdrahtet: der Start verweigert weiter", "blockiert", None
+
+
+def force_hint(dry, register: List[dict], line: str = "") -> dict:
+    """Der Force-Teil des Export-Hinweises aus dem LETZTEN Trockenlauf (``dry`` = dessen Antwort oder ``None``).  Nur Text; startet nichts.
+
+    Fälle (``fall``): ``kein_trockenlauf`` | ``keine_ablehnung`` | ``nur_forcebar`` | ``gemischt`` | ``nur_nicht_forcebar`` | ``ungeprueft``.
+    Die Zeile ``-e FLLIPER_FORCE=1`` (``show_line``) gibt es genau dann, wenn mindestens eine Ablehnung forcebar ist.  Gerechnet wird NEU aus den
+    Codes gegen das Register: was der Browser als ``force_state`` mitschickt, wird nicht geglaubt; nur Code und (gekürzter) Text werden gelesen."""
+    reg = {r.get("code"): r for r in register or []}
+    rejs = []
+    if isinstance(dry, dict) and isinstance(dry.get("rejections"), list):
+        for q in dry["rejections"][:64]:
+            if isinstance(q, dict) and isinstance(q.get("code"), str) and 0 < len(q["code"]) <= 40:
+                rejs.append((q["code"], _clip_text(q["code"], q.get("text"))))
+    have_dry = isinstance(dry, dict) and isinstance(dry.get("rejections"), list)
+    force, blocked, openl, seen = [], [], [], set()
+    for code, text in rejs:
+        if code in seen:
+            continue
+        seen.add(code)
+        r = reg.get(code) or {}
+        label, state, via = force_verdict(r) if r else ("unbekannter Code: nicht als forcebar behandelt", "blockiert", None)
+        row = {"code": code, "text": text or r.get("title") or code, "via": via, "scope": r.get("force_scope") or label}
+        {"force": force, "blockiert": blocked, "ungeprueft": openl}[state].append(row)
+    if not have_dry:
+        fall, text = "kein_trockenlauf", ("Noch kein Trockenlauf für dieses Profil: ob der Serverstart Force braucht, zeigt der Trockenlauf "
+                                          "(Karten wählen, prüfen lassen), danach erneut exportieren.")
+    elif not rejs:
+        fall, text = "keine_ablehnung", "Der Planer lehnt nichts ab; Force wird nicht gebraucht."
+    elif force and blocked:
+        fall, text = "gemischt", "Force übergeht einen Teil der Ablehnungen, aber nicht alle: so startet der Server nicht."
+    elif force:
+        fall, text = "nur_forcebar", "Mit FLLIPER_FORCE=1 übergeht der Server diese Ablehnungen und listet jede im Boot-Log als FORCED-PAST."
+    elif blocked:
+        fall, text = "nur_nicht_forcebar", "Force hilft hier nicht: diese Ablehnungen bleiben auch mit Force bestehen."
+    else:
+        fall, text = "ungeprueft", "Der Launcher dieser Linie prüft das noch nicht: kein Force nötig."
+    out = {"fall": fall, "text": text, "show_line": bool(force), "force_env": FORCE_ENV if force else None,
+           "force_codes": force, "blocked_codes": blocked, "open_codes": openl,
+           "records_note": ("Ein Force-Boot schreibt keine Records; seine Messwerte zählen nicht als abgenommen." if force else ""),
+           "line_note": ""}
+    if force and str(line) == "nf":
+        out["line_note"] = ("Linie nf: der Launcher übergeht dort nur HW-COUNT, HW-UNCALIBRATED und HOST-MEM; "
+                            "die Entrypoint-Codes (PROFIL-STATUS, SHM, STORE, MEMAVAIL) gelten auch dort.")
+    return out
+
+
+def docker_run_example(name: str, force: dict) -> List[str]:
+    """Beispiel-``docker run`` als Zeilen (Platzhalter in <>, zum Anpassen); die Force-Zeile nur, wenn ``force["show_line"]``.
+    Ein Kommentar steht VOR dem Befehl, nie hinter einem ``\\`` (hinter dem Zeilenumbruch-Backslash bricht Bash die Fortsetzung)."""
+    lines = []
+    if force.get("show_line"):
+        lines.append("# FLLIPER_FORCE=1 nur nötig, weil der Planer ablehnt: %s" % ", ".join(c["code"] for c in force["force_codes"]))
+    lines += ["docker run -d --name htsglang-mine \\",
+              "  <die Flags aus Abschnitt 3.3 der README: --gpus, --shm-size, --memory, -p, Modell-Mounts> \\",
+              "  -v flliper-state:/var/lib/flliper \\",
+              "  -e MODE=weg2 -e FLLIPER_PROFILE=%s \\" % name]
+    if force.get("show_line"):
+        lines.append("  -e %s \\" % FORCE_ENV)
+    lines.append("  ghcr.io/efschu/htsglang:<tag> serve")
+    return lines
+
+
 class ProfilEditor:
     def __init__(self, *, kartenplaner, release_dir: str = DEFAULT_RELEASE_DIR, user_dir: str = DEFAULT_USER_DIR,
                  tree: Optional[str] = None, catalog_file: str = CATALOG_FILE, topology=None):
@@ -368,7 +467,7 @@ class ProfilEditor:
         return {"ok": True, "name": name}
 
     # ------------------------------------------------------------------ Export (.env im heutigen Dialekt)
-    def export_env(self, doc: dict) -> dict:
+    def export_env(self, doc: dict, dry=None) -> dict:
         pj, _ref = self.mods()
         if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
             raise ProfilError("doc ist kein %s" % pj.SCHEMA)
@@ -378,7 +477,7 @@ class ProfilEditor:
         return {"ok": True, "env": text, "filename": "%s.env" % name, "verified": not problems, "problems": problems,
                 "check": "Das exportierte .env wurde mit bash ausgewertet (HTSGLANG_INSTRUMENTS 0 und 1) und mit den Werten des Profils verglichen: "
                          + ("gleich." if not problems else "ABWEICHUNG, nicht verwenden."),
-                "use": self.use_hint(name)}
+                "use": self.use_hint(name, dry, str(doc.get("line") or ""))}
 
     def verify_render(self, doc: dict, text: str) -> List[str]:
         pj, _ref = self.mods()
@@ -390,13 +489,20 @@ class ProfilEditor:
         want = pj.expected_effective(doc)
         return pj.diff_effective(want, got)
 
-    @staticmethod
-    def use_hint(name: str) -> dict:
-        return {"profile_env": "FLLIPER_PROFILE=%s" % name,
-                "force_env": "FLLIPER_FORCE=1",
+    def use_hint(self, name: str, dry=None, line: str = "") -> dict:
+        """Wie das Profil beim Serverstart gebraucht wird: Beispiel-docker-run (nur Text, das Dashboard startet nichts).  ``dry`` = Antwort des
+        letzten Trockenlaufs; nur wenn er forcebare Ablehnungen ergab, steht die Zeile ``-e FLLIPER_FORCE=1`` mit der Code-Liste darin
+        (``force_env`` ist sonst ``None``).  Nicht übergehbare Codes stehen in ``force.blocked_codes`` (die Oberfläche zeigt sie rot)."""
+        try:
+            reg = self.register()
+        except Exception:       # noqa: BLE001 -- ohne Register keine Force-Aussage, aber der Export lebt weiter
+            reg = []
+        fh = force_hint(dry, reg, line)
+        return {"profile_env": "FLLIPER_PROFILE=%s" % name, "force_env": fh["force_env"], "force": fh,
+                "docker_run": docker_run_example(name, fh),
                 "text": "Am Server: das Profil angeben (FLLIPER_PROFILE=%s, JSON aus dem State-Volume /var/lib/flliper/profiles/%s.json "
-                        "oder die exportierte Datei als <profiles>/%s.env). Lehnt der Planer Werte ab und soll trotzdem gestartet werden: "
-                        "FLLIPER_FORCE=1 (Launcher: --force). Das Dashboard startet nichts." % (name, name, name)}
+                        "oder die exportierte Datei als <profiles>/%s.env). Das Dashboard startet nichts; unten steht ein Beispielaufruf zum Anpassen "
+                        "(Image, Mounts und Flags sind Platzhalter)." % (name, name, name)}
 
     # ------------------------------------------------------------------ Topologie-Urteil (Kindprozess zuerst, Auftrag 1984 C)
     def _topology_verdict(self, n: int, tp, notes: List[str]) -> Optional[str]:
@@ -508,17 +614,10 @@ class ProfilEditor:
         out = []
         for f in found:
             r = reg.get(f["code"]) or {}
-            if r and not r.get("forcebar"):
-                force, state = "nein, nicht forcebar", "blockiert"
-            elif r.get("wired"):
-                force, state = "ja, Force übergeht es (FORCED-PAST im Boot-Log)", "force"
-            elif r.get("enforced_by") == "planner-gate":
-                force, state = "der Launcher dieser Linie prüft das noch nicht: beim Start keine Verweigerung", "ungeprueft"
-            else:
-                force, state = "forcebar, aber im Launcher dieser Linie noch nicht verdrahtet: der Start verweigert weiter", "blockiert"
+            force, state, via = force_verdict(r)
             out.append(dict(f, klass=r.get("klass"), klass_label=r.get("klass_label"), forcebar=bool(r.get("forcebar")),
-                            wired=r.get("wired"), force=force, force_state=state, why_class=r.get("why_class"),
-                            consequence=r.get("consequence")))
+                            wired=r.get("wired"), wired_at=r.get("wired_at"), force=force, force_state=state, force_via=via,
+                            why_class=r.get("why_class"), consequence=r.get("consequence")))
         n_force = sum(1 for o in out if o["force_state"] == "force")
         n_open = sum(1 for o in out if o["force_state"] == "ungeprueft")
         n_block = len(out) - n_force - n_open
@@ -526,6 +625,9 @@ class ProfilEditor:
             verdict = "Der Planer lehnt dieses Profil auf den gewählten Karten nicht ab."
         else:
             verdict = "Der Planer lehnt %d Punkt(e) ab: Force übergeht %d beim Serverstart" % (len(out), n_force)
+            n_ep = sum(1 for o in out if o["force_state"] == "force" and o.get("force_via") == "entrypoint")
+            if n_ep:
+                verdict += " (davon %d nur im Docker-Start, nicht im reinen Launcher-Aufruf)" % n_ep
             if n_open:
                 verdict += ", %d prüft der Launcher noch nicht" % n_open
             if n_block:
@@ -534,7 +636,9 @@ class ProfilEditor:
         return {"ok": True, "goes": not out, "verdict": verdict, "rejections": out, "notes": notes,
                 "cards": [{"index": c["index"], "label": c["label"], "arch": c["entry"]["arch"]} for c in cards],
                 "force_note": "Force gibt es nur am Serverstart (FLLIPER_FORCE=1 / --force), nicht im Dashboard. Er hebt alle Wert-Ablehnungen auf, "
-                              "die der Launcher verdrahtet hat, listet jede im Boot-Log als FORCED-PAST <CODE> <Grund> und schreibt keine Records. "
+                              "die der Launcher verdrahtet hat, und im Docker-Start zusätzlich die, die der Entrypoint selbst prüft "
+                              "(PROFIL-STATUS, SHM, STORE, MEMAVAIL: im Docker-Start (Entrypoint) forcebar, im reinen Launcher-Aufruf nicht), "
+                              "listet jede im Boot-Log als FORCED-PAST <CODE> <Grund> und schreibt keine Records. "
                               "Nicht übergangen werden: Belegungsprüfung (fremder Prozess/Fenster auf der Karte), fehlendes oder kaputtes Modell, "
                               "nicht unterstützte Architektur.",
                 "reference": {"inventory": list(ci.REFERENCE_INVENTORY) if ci is not None else None}}

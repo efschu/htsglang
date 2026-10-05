@@ -115,7 +115,8 @@ class Editor(unittest.TestCase):
         self.assertIn("PROFILE_ARGS=(", x["env"])
         self.assertIn("profile_form_env()", x["env"])
         self.assertEqual(x["filename"], "demo.env")
-        self.assertIn("FLLIPER_FORCE=1", x["use"]["force_env"])
+        self.assertIsNone(x["use"]["force_env"])            # 2002 B: die Force-Zeile gibt es nur nach einem Trockenlauf mit forcebaren Ablehnungen
+        self.assertEqual(x["use"]["force"]["fall"], "kein_trockenlauf")
         e = self.ed.edit(r["doc"], [{"key": "env:P:SGLANG_MOE_SCRATCH_SLOTS", "op": "set", "value": "80,50,50"},
                                     {"key": "extra:D:--rank-gpu-memory-mib", "op": "set", "value": "26000,17000,17000"}])
         x2 = self.ed.export_env(e["doc"])
