@@ -995,6 +995,18 @@ ERKLAERT.update({
         "satz_quelle": 'NF-Sitz, Bericht 1504 (Baum nf-release-cand-1005 @3bfee09511), Freigabe als Katalogtext 05.10. 19:22Z'},
 })
 
+# NF-Sitz, Patch cand3-katalog-hunk-1531 (AP4, Commit 13fd36a8d9, Kandidat 3 desk/nf-release-cand3-1005 @bce16a6ddf): wörtlich übernommen, aber als
+# ERKLAERT mit baeume_erwartet ["nf"] statt im Kern: das Flag steht nur im NF-Baum (im 27B-Baum bricht ein Kern-Eintrag test_profile_catalog_1003).
+ERKLAERT.update({
+    "--weg2-xchg-census-map": {
+        "kind": "flag", "group": "Speicher", "level": "experte", "planner_derived": False,
+        "text": 'Benennt die Census-Zeile, aus der eine Karte gepreist wird, die nicht per UUID in der Census-Datei steht: Liste <live>=<Census-UUID>, <live> = Karten-UUID, nvml<N> oder Klasse (RTX3080). Ohne Eintrag leiht der Start die schwerste Zeile der gleichen Klasse (sonst der ganzen Census) und verweigert das als HW-BORROWED, bis Force gesetzt ist.',
+        "gain": 'Fremde Karten, andere Kartenzahl oder anderes Rig starten mit dem Austausch, ohne dass die Census-Datei neu gemessen wird.',
+        "cost": 'Die Bytes sind die einer anderen Karte; der Peak wird weiter gegen die echte VRAM-Summe der Karte geprueft.',
+        "depends": [_d("--weg2-xchg-census", "braucht", 'Benennt eine Zeile dieser Census-Datei.', "text")],
+        "satz_quelle": "NF-Sitz, Patch cand3-katalog-hunk-1531 (AP4, Commit 13fd36a8d9, Kandidat 3 @bce16a6ddf)", "baeume_erwartet": ["nf"]},
+})
+
 #: Lesehilfe der NF-Sätze (NF-Sitz, Bericht 1504): wird mit dem Katalog ausgeliefert, die Seite zeigt sie als Glossar/Tooltip, die Sätze erklären die Wörter nicht noch einmal.
 GLOSSAR: Dict[str, str] = {
     "D": "die Decode-Karte (rechnet die Antwort Wort für Wort)",
