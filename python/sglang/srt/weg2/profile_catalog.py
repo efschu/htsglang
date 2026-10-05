@@ -535,7 +535,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     launcher, environ, sargs = find_tree_files(py)
-    cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs)
+    cat = build_catalog(launcher, environ, {**getattr(mod, "ERKLAERT", {}), **mod.CURATED}, ns.rev, sargs)
     text = json.dumps(cat, indent=1, sort_keys=True, ensure_ascii=False, default=str) + "\n"
     if ns.out:
         with open(ns.out, "w", encoding="utf-8") as fh:
