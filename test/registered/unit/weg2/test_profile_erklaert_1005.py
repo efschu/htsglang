@@ -33,7 +33,12 @@ CU = _load("t_cu_erklaert", os.path.join(WEG2, "profile_catalog_curated.py"))
 def _build(erklaert=None, curated=None):
     return PC.build_catalog(os.path.join(WEG2, "launcher.py"), os.path.join(SRT, "environ.py"),
                             CU.CURATED if curated is None else curated, "t", os.path.join(SRT, "server_args.py"),
-                            erklaert=CU.ERKLAERT if erklaert is None else erklaert)
+                            erklaert=CU.ERKLAERT if erklaert is None else erklaert, srt_dir=SRT)
+
+
+def _local_names():
+    """Namen mit Erklärtext, die in DIESEM Baum stehen (ohne die als ``baeume_erwartet`` gekennzeichneten Namen eines anderen Baums)."""
+    return [n for n, c in CU.ERKLAERT.items() if "baeume_erwartet" not in c]
 
 
 class Erklaert(unittest.TestCase):
@@ -47,29 +52,36 @@ class Erklaert(unittest.TestCase):
     def test_every_name_exists_and_text_is_set(self):
         known = set(PC.launcher_flags(os.path.join(WEG2, "launcher.py"))) \
             | set(PC.server_args_flags(os.path.join(SRT, "server_args.py"))) \
-            | set(PC.environ_fields(os.path.join(SRT, "environ.py")))
+            | set(PC.environ_fields(os.path.join(SRT, "environ.py"))) | set(PC.environ_constants(SRT))
         for name, e in CU.ERKLAERT.items():
-            self.assertIn(name, known, name)
+            if "baeume_erwartet" in e:
+                # nur im NF-Baum vermerkt: steht der Name hier doch, stimmt der Vermerk nicht mehr (Baum nachgezogen) und muss weg
+                self.assertNotIn(name, known, "%s steht jetzt in diesem Baum: baeume_erwartet prüfen" % name)
+                self.assertTrue(e.get("satz_quelle"), name)
+            else:
+                self.assertIn(name, known, name)
             self.assertTrue(str(e.get("text", "")).strip(), name)
             self.assertEqual(e.get("level"), "experte", name)
 
     def test_status_is_erklaert_and_core_stays_kuratiert(self):
-        for name in CU.ERKLAERT:
+        for name in _local_names():
             self.assertEqual(self.cat["entries"][name]["status"], "erklaert", name)
+        for name in set(CU.ERKLAERT) - set(_local_names()):
+            self.assertNotIn(name, self.cat["entries"], "kein Geistereintrag für einen Namen aus dem anderen Baum")
         for name in CU.CURATED:
             self.assertEqual(self.cat["entries"][name]["status"], "kuratiert", name)
         st = self.cat["stats"]
-        self.assertEqual(st["erklaert"], len(CU.ERKLAERT))
+        self.assertEqual(st["erklaert"], len(_local_names()))
 
     def test_curated_wins_on_name_clash(self):
-        name = next(iter(CU.ERKLAERT))
+        name = _local_names()[0]
         both = _build(curated={name: {"kind": "env", "text": "Kern", "gain": "", "cost": "", "depends": []}})
         self.assertEqual(both["entries"][name]["status"], "kuratiert")
         self.assertEqual(both["entries"][name]["text"], "Kern")
 
     def test_explain_row_keeps_the_origin(self):
         PJ = _load("t_pj_erklaert", os.path.join(WEG2, "profile_json.py"))
-        name = next(iter(CU.ERKLAERT))
+        name = _local_names()[0]
         ex = PJ.explain_row({"name": name}, self.cat["entries"], None)
         self.assertEqual(ex["status"], "erklaert")
         self.assertEqual(ex["parts"][0]["kind"], "erklaert")
