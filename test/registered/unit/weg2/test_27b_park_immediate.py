@@ -512,7 +512,9 @@ def test_27b_front_parks_at_once_and_resumes_first(clean):
             assert h.front.counters["wait_bound_fired"] == 0
             assert took < 10.0, took  # floor 2 s + flip; r0 still decodes (held)
             assert await H._until(lambda: h.front.awake == "D" and not h.front._d_parked, 20)
-            kv = [b for b in h.d.resume_bodies if b.get("tags") == ["kv_cache"]]
+            # FLIPCYCLE H6: the kv resume rides the weights leg (tags weights+kv_cache,
+            # kv_late) instead of a call of its own, so select by "kv_cache in tags".
+            kv = [b for b in h.d.resume_bodies if "kv_cache" in b.get("tags", [])]
             assert "handoff_n" not in kv[-1] and "parked_n" not in kv[-1]  # 27B wake body unchanged
             assert h.front.counters["d_parked_resumed"] == 1
             assert rid0 in h.front.groups["D"].outstanding

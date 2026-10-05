@@ -47,7 +47,10 @@ def test_scheduler_holds_the_w88_bound_while_dormant_and_sweep_takes_first():
     src = inspect.getsource(Scheduler._weg2_note_prefetch_progress)
     i = src.index("dormant_standstill_holds")
     assert i < src.index("_weg2_prefetch_stall_passes()"), "the dormant wait must sit before the bounds"
-    assert 'return "stalled"' in src[i:i + 900]
+    # The dormant branch grew (fnFL2x36 comment, pass-count reset, rid-full log),
+    # so a fixed character window no longer reaches its return; bound the search
+    # by the first wall-clock bound that follows the dormant wait instead.
+    assert 'return "stalled"' in src[i:src.index("_weg2_prefetch_stall_s()", i)]
     from sglang.srt.mem_cache import unified_radix_cache as u
     s2 = inspect.getsource(u.UnifiedRadixCache.publish_unbacked_sweep)
     assert "queue = list(first or []) + ([] if chain_only else [self.root_node])" in s2
