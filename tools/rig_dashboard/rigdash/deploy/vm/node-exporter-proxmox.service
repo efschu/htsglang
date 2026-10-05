@@ -1,0 +1,12 @@
+[Unit]
+Description=Prometheus node_exporter (Proxmox-Host: Host-RAM, ZFS-ARC, PSI, CPU; fuer VictoriaMetrics auf CT999)
+After=network-online.target
+
+[Service]
+# nur das LAN-Bein des Hosts, kein Router-/Container-Eingriff; VictoriaMetrics (CT999 192.168.0.88) scrapt
+ExecStart=/opt/node_exporter/node_exporter --web.listen-address=192.168.0.11:9100 --collector.disable-defaults --collector.cpu --collector.meminfo --collector.loadavg --collector.pressure --collector.stat --collector.vmstat --collector.zfs --collector.filesystem --collector.diskstats --collector.netdev --collector.uname --collector.time
+Restart=always
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

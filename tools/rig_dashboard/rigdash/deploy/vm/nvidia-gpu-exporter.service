@@ -1,0 +1,11 @@
+[Unit]
+Description=nvidia_gpu_exporter (NVML-Variante, fuer VictoriaMetrics)
+After=network-online.target
+
+[Service]
+ExecStart=/opt/nvidia_gpu_exporter/nvidia_gpu_exporter --web.listen-address=127.0.0.1:9835
+Restart=always
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

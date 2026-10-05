@@ -2083,6 +2083,16 @@ _MONITOR_DETECT_PORTS = (30000, 30001, 30100, 8000)
 #: TCP pre-scan, so the width costs nothing when the ports are closed.
 _DETECT_SWEEP_PORTS = tuple(range(30000, 30101)) + (8000, 8080)
 
+#: Ports that are NEVER a monitor target even though they answer inside the
+#: sweep: on this rig 30097 and 30099 are the Anthropic-API split routers (the
+#: agents' lifeline), which proxy enough of the API to pass _probe_sglang.
+#: Measured 2026-09-27: with the model on 30030 down, the Monitor attached to
+#: 30099 and showed the router as "Server running".
+_NEVER_MONITOR_PORTS = tuple(
+    int(x) for x in os.environ.get("SGLANG_PLANNER_EXCLUDE_PORTS", "30097,30099").replace(",", " ").split()
+    if x.strip().isdigit()
+)
+
 #: Cache of the last auto-detected endpoint (re-verified first on each poll so
 #: a stable hand-started server is one cheap probe, not a port sweep).
 _DETECTED_ENDPOINT = None
@@ -3054,7 +3064,7 @@ def _detect_external_endpoint(
     # pay for an HTTP probe.
     from concurrent.futures import ThreadPoolExecutor
 
-    scan = [int(x) for x in (ports or _DETECT_SWEEP_PORTS)]
+    scan = [int(x) for x in (ports or _DETECT_SWEEP_PORTS) if int(x) not in _NEVER_MONITOR_PORTS]
     with ThreadPoolExecutor(max_workers=32) as ex:
         open_ports = [
             prt
@@ -5401,6 +5411,50 @@ def video_jobs_payload(q: Optional[dict] = None) -> dict:
     }
 
 
+#: Read-only mode (SGLANG_PLANNER_READONLY=1, set by rig-planner.service).
+#: Since the weg2/Docker rework, boots run through the weg2 launcher inside a
+#: container, inside a gpuq window -- never from this page.  The always-on
+#: planner therefore refuses every POST that would start or stop a server,
+#: put load on a card or a running model, download, switch its own code, or
+#: publish anything; planning, reading and the wizard stay available.
+READONLY = os.environ.get("SGLANG_PLANNER_READONLY", "") not in ("", "0", "false", "no")
+READONLY_BLOCKED_POST = (
+    "/api/server_start", "/api/server_stop", "/api/server_restart",
+    "/api/bench_run", "/api/bench_probe", "/api/quality_run", "/api/measure_power",
+    "/api/card_probe", "/api/split_probe", "/api/commsuite/run",
+    "/api/rig_pair/start", "/api/rig_pair/advance", "/api/model_download",
+    "/api/version/switch", "/api/version/cleanup",
+    # registry: state transitions (serve / demote / delete) start and stop
+    # engine processes; registering writes the registry
+    "/api/registry/state", "/api/registry/engines",
+    "/api/discussion_submit", "/api/share_submit", "/api/share/rig_submit",
+)
+READONLY_MESSAGE = (
+    "read-only planner: boots run through the weg2 launcher in a Docker container "
+    "inside a gpuq window (http://<host>:8770/), and GPU measurements, downloads, "
+    "self-updates and publishing are switched off on this always-on instance. "
+    "Live P/D prefill and decode rates: http://<host>:8890/."
+)
+_READONLY_BANNER = (
+    '<div id="ro_banner" style="background:#3a2c00;color:#ffd666;padding:8px 16px;'
+    'font:13px/1.4 ui-monospace,monospace;border-bottom:1px solid #6b5300">'
+    '<b>Nur-Lese-Betrieb.</b> Boots laufen &uuml;ber den weg2-Launcher im Docker-Container '
+    'innerhalb eines <a id="ro_gpuq" style="color:#ffd666" href="/">gpuq-Fensters</a>; '
+    'Start/Stop, Messl&auml;ufe auf den Karten, Downloads, Versionswechsel und Ver&ouml;ffentlichen '
+    'sind hier gesperrt. Planen, Wizard und Tafeln gehen; der Wizard-Befehl ist die klassische '
+    'launch_server-Form, die Produktionsform (weg2-Launcher mit Profil, im Docker-Container) steht je Boot '
+    'im Rig-Dashboard unter &bdquo;Startform&ldquo;. '
+    '<a id="ro_live" style="color:#ffd666" href="/">Live-Raten (P-/D-Prefill, Decode) &rarr; Rig-Dashboard</a>'
+    '<script>(function(){var h=location.protocol+"//"+location.hostname;'
+    'document.getElementById("ro_gpuq").href=h+":8770/";'
+    'document.getElementById("ro_live").href=h+":8890/";})();</script></div>'
+)
+
+
+def readonly_blocked(path: str) -> bool:
+    return READONLY and any(path.startswith(p) for p in READONLY_BLOCKED_POST)
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
         data = body.encode() if isinstance(body, str) else body
@@ -5420,7 +5474,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            self._send(200, INDEX_HTML, "text/html; charset=utf-8")
+            page = INDEX_HTML
+            if READONLY:
+                # anchor on the real body tag: the bare "<body>" string also
+                # occurs earlier, inside a CSS comment of the page.
+                page = page.replace('<body>\n<div class="hdr">', '<body>\n' + _READONLY_BANNER + '\n<div class="hdr">', 1)
+            self._send(200, page, "text/html; charset=utf-8")
+            return
+        if self.path.startswith("/api/readonly"):
+            self._json(200, {"ok": True, "readonly": READONLY,
+                             "blocked_post": list(READONLY_BLOCKED_POST) if READONLY else [],
+                             "message": READONLY_MESSAGE if READONLY else None})
             return
         if self.path.startswith("/api/knobs"):
             try:
@@ -5699,6 +5763,10 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self):
+        if readonly_blocked(self.path):
+            # Refuse BEFORE reading the body: nothing of the request is acted on.
+            self._json(409, {"ok": False, "readonly": True, "error": READONLY_MESSAGE})
+            return
         try:
             payload = self._read_json()
         except Exception as e:
@@ -6976,6 +7044,16 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   <fieldset data-step="command">
     <legend>command</legend>
     <div id="wz_cmd"><span class="muted">choose a family above.</span></div>
+  </fieldset>
+
+  <fieldset data-step="weg2">
+    <legend>Startform heute &mdash; weg2-Launcher im Docker-Container (Host-Zeile)</legend>
+    <div class="muted" style="margin-bottom:var(--s2)">Der Befehl oben ist die klassische
+      <code>launch_server</code>-Form einer Familie. Auf diesem Rig startet ein Modell heute &uuml;ber
+      <code>host_acceptance.sh serve</code> auf dem Proxmox-Host, mit Release-Profil, Image und Transport, in einem
+      gpuq-Fenster. Die Zeile unten erzeugt das Rig-Dashboard aus den Profil-Dateien und <code>docker images</code>;
+      der Trockenlauf pr&uuml;ft sie ohne Boot.</div>
+    <iframe id="wz_weg2" title="weg2-Startzeile" style="width:100%;height:760px;border:1px solid var(--bd-weak);border-radius:6px" loading="lazy"></iframe>
   </fieldset>
 
   <fieldset class="cfg-section" data-step="expert">
@@ -8643,6 +8721,10 @@ function renderUnusedCards(){
 // while they are marked as belonging to the previous input.
 // ===========================================================================
 const WIZ_STEPS=['model','hardware','goal','families','command','expert'];
+// The weg2 start-line step (after 'command') is served by the rig dashboard on
+// the same host; one inline script per page, so the iframe gets its src here.
+(function(){ const f=document.getElementById('wz_weg2');
+  if(f) f.src=location.protocol+'//'+location.hostname+':8890/weg2?embed=1'; })();
 function wizardInvalidate(from){
   const i=WIZ_STEPS.indexOf(from);
   if(i<0) return;
@@ -9613,11 +9695,22 @@ async function modelsPoll(){
   try{ d = await api('/api/registry/snapshot'+q, {key:'mdl_snapshot'}); }
   catch(e){ if(apiAborted(e)) return; $('mdl_conn').innerHTML='<span class="reasons">'+esc(apiError(e))+'</span>'; return; }
   if (!d.reachable) {
-    $('mdl_conn').innerHTML='<span class="reasons">registry unreachable at '
-      +esc(d.registry_base||'')+(d.error?(': '+esc(d.error)):'')+'</span>';
-    $('mdl_list').innerHTML='<span class="muted">no engines to show -- the registry '
-      +'is not reachable. Start it with <code>python -m sglang.srt.registry</code> '
-      +'or point this tab at the right host:port above.</span>';
+    // A closed port is the rig's normal state since the weg2/Docker rework: engines
+    // are started by host_acceptance.sh, not by a registry. Say that plainly;
+    // any OTHER failure (timeout, bad answer) is still shown as the error it is.
+    if (/refused|Errno 111/i.test(d.error||'')) {
+      $('mdl_conn').innerHTML='<span class="pill">Registry aus</span> <span class="muted">'
+        +esc(d.registry_base||'')+' ist nicht gestartet</span>';
+      const h=location.protocol+'//'+location.hostname;
+      $('mdl_list').innerHTML='<span class="muted">Auf diesem Rig l&auml;uft keine Engine-Registry: Modelle starten '
+        +'heute &uuml;ber den weg2-Launcher im Docker-Container (<code>host_acceptance.sh serve</code>) in einem gpuq-Fenster. '
+        +'Laufendes Modell und Raten: <a href="'+h+':8890/">Rig-Dashboard</a>; Startzeile: <a href="'+h+':8890/weg2">Startzeile</a> '
+        +'(auch im Wizard). Diese Tafel f&uuml;llt sich, sobald oben eine erreichbare Registry eingetragen ist.</span>';
+    } else {
+      $('mdl_conn').innerHTML='<span class="reasons">registry unreachable at '
+        +esc(d.registry_base||'')+(d.error?(': '+esc(d.error)):'')+'</span>';
+      $('mdl_list').innerHTML='<span class="muted">no engines to show -- the registry is not answering.</span>';
+    }
     return;
   }
   $('mdl_conn').innerHTML='<span class="pill">connected: '+esc(d.registry_base)+'</span>';

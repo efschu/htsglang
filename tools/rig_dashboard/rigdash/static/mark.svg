@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="t">
+  <title id="t">fLLiper mark: prefill and decode flip the same three cards</title>
+  <!-- square mark (avatar / favicon). Works on light and dark: the cards sit on their own rounded tile. -->
+  <rect x="0" y="0" width="128" height="128" rx="24" fill="#111827"/>
+  <g transform="translate(4 4)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path stroke="#F97316" stroke-width="14" d="M14 22 V106 H72"/>
+    <path fill="#F97316" d="M70 93 L94 106 L70 119 Z"/>
+    <path stroke="#2DD4BF" stroke-width="14" d="M106 98 V14 H48"/>
+    <path fill="#2DD4BF" d="M50 1 L26 14 L50 27 Z"/>
+    <rect fill="#E6EDF3" x="36" y="40" width="16" height="48" rx="3"/>
+    <rect fill="#E6EDF3" x="58" y="50" width="12" height="38" rx="3" opacity="0.72"/>
+    <rect fill="#E6EDF3" x="76" y="50" width="12" height="38" rx="3" opacity="0.72"/>
+  </g>
+</svg>

@@ -1,0 +1,1 @@
+044316dd1a (NF-Linie, Boot nfint4h6abldauer 03.10.): card_identity.py und topology.py unverändert aus dem Planer-Baum (git show)
