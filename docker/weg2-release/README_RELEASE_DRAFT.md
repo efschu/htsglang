@@ -305,8 +305,9 @@ an `X-Forwarded-*` header). It writes to the state volume.
 
 ```bash
 # 1. the editor alone: no server. --gpus all only lets it READ your cards through NVML (no CUDA context, nothing is started on them);
-#    without it you can still edit, but the hardware view, the memory bars and the card-count checks of the dry run have no cards to work with
-docker run --rm --name flliper-editor --gpus all \
+#    without it you can still edit, but the hardware view, the memory bars and the card-count checks of the dry run have no cards to work with.
+#    --no-healthcheck: the image's HEALTHCHECK knows the server, not the editor-only mode (the editor answers GET /healthz on its own port)
+docker run --rm --name flliper-editor --gpus all --no-healthcheck \
   -p 127.0.0.1:30081:30081 \
   -v flliper-state:/var/lib/flliper \
   -v /your/models-cache:/spinning/llm_stuff/club-3090/models-cache:ro \
