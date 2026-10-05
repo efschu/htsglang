@@ -127,12 +127,19 @@ def chunk_rows(row_bytes: int, env=None) -> int:
 
 
 def run_park(direction: str, pieces: Sequence[ParkPiece], rank: int,
-             world: int, buffers: Sequence, a2a, env=None) -> int:
+             world: int, buffers: Sequence, a2a, env=None,
+             uniform: bool = False) -> int:
     """Move every piece's rows of every buffer: ``direction`` "out" (sleep:
     src -> dst) or "back" (wake: dst -> src). EVERY rank of the group calls
     this with the same pieces and buffers in the same order (one collective
     per (piece, buffer)); ``a2a(output, input, out_splits, in_splits)`` is the
-    group's uneven all_to_all. Returns the bytes this rank sent."""
+    group's uneven all_to_all. Returns the bytes this rank sent.
+
+    ``uniform`` (S2 pooled hold only): every chunk is announced to the a2a as
+    ``a2a(..., rows=n)`` -- ``n`` is the one figure all ranks agree on (the
+    source sends it, the destination receives it, a third rank sees nothing),
+    so the transport choice and the slot check in barlink's a2a do not hinge on
+    the rank-local send sum (0 on all but the source rank: 1780 wedge)."""
     sent = 0
     for p in pieces:
         frm, to = (p.src, p.dst) if direction == "out" else (p.dst, p.src)
@@ -154,7 +161,10 @@ def run_park(direction: str, pieces: Sequence[ParkPiece], rank: int,
                 if rank == to:
                     out = b[to_row + c0:to_row + c0 + n]
                     out_splits[frm] = n
-                a2a(out, inp, out_splits, in_splits)
+                if uniform:
+                    a2a(out, inp, out_splits, in_splits, rows=n)
+                else:
+                    a2a(out, inp, out_splits, in_splits)
     return sent
 
 
@@ -393,7 +403,10 @@ def s4_plan_of_manifest(m, caps: Sequence[int], env, world: int, rank: int,
 # -- scheduler entries --------------------------------------------------------
 
 def _group_io(sched):
-    """(rank, world, gather(obj)->list, a2a(out, inp, osp, isp)) of D's TP group."""
+    """(rank, world, gather(obj)->list, a2a(out, inp, osp, isp, rows=None)) of
+    D's TP group.  ``rows`` (pooled park, rank-uniform rows of this chunk) ->
+    ``largest_block_rows=rows`` (no gloo group_max) and ``select_bytes=
+    rows*row_bytes`` (every rank picks the transport from the same figure)."""
     import torch
 
     from sglang.srt.distributed import get_tp_group
@@ -409,8 +422,15 @@ def _group_io(sched):
         torch.distributed.all_gather_object(out, obj, group=g.cpu_group)
         return out
 
-    def a2a(out, inp, osp, isp):
-        g.all_to_all_single_v(out, inp, osp, isp)
+    def a2a(out, inp, osp, isp, rows=None):
+        if rows is None:
+            g.all_to_all_single_v(out, inp, osp, isp)
+            return
+        row_bytes = int(inp.element_size())
+        for d in inp.shape[1:]:
+            row_bytes *= int(d)
+        g.all_to_all_single_v(out, inp, osp, isp, largest_block_rows=int(rows),
+                              select_bytes=int(rows) * row_bytes)
 
     return rank, world, gather, a2a
 
@@ -470,9 +490,11 @@ def pool_check_line(epoch, rank: int, ok: int, bad: int, pieces: Sequence[ParkPi
 def _counting(a2a):
     box = [0]
 
-    def run(out, inp, osp, isp):
+    def run(out, inp, osp, isp, rows=None):
         box[0] += 1
-        return a2a(out, inp, osp, isp)
+        if rows is None:
+            return a2a(out, inp, osp, isp)
+        return a2a(out, inp, osp, isp, rows=rows)
 
     return run, box
 
@@ -569,10 +591,12 @@ def park_at_release(sched, env, log) -> Optional[int]:
             # the SOURCE checksum of the anchor shares this rank owns, before
             # the send (independent of L2: an anchor share has to arrive intact)
             a_sums = l15_pool_anchor.anchor_sums_of(a_guests, rank, m_v)
-        sent = run_park("out", pieces, rank, world, bufs, run_a2a, env)
+        sent = run_park("out", pieces, rank, world, bufs, run_a2a, env,
+                        uniform=pooled)
         if a_guests:
             a_sent = l15_pool_anchor.run_anchor_park(
-                "out", a_guests, rank, world, m_v, kv_v, run_a2a, env)
+                "out", a_guests, rank, world, m_v, kv_v, run_a2a, env,
+                uniform=pooled)
         torch.cuda.current_stream().synchronize()
     except Exception as exc:  # noqa: BLE001 -- the wake refills from L2
         err = "%s: %s" % (type(exc).__name__, exc)
@@ -664,14 +688,15 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
     t_x0 = time.perf_counter()
     try:
         bufs, _pool = _kv_buffers(sched)
-        sent = run_park("back", rec[1], rank, world, bufs, run_a2a, env)
+        sent = run_park("back", rec[1], rank, world, bufs, run_a2a, env,
+                        uniform=pooled)
         if a_rec:
             from sglang.srt.weg2 import l15_pool_anchor as _lpa
 
             _kv_v = [_lpa._rows2d(b) for b in bufs]
             _m_v = _lpa.mamba_views(sched)
             sent += _lpa.run_anchor_park("back", a_rec, rank, world, _m_v, _kv_v,
-                                         run_a2a, env)
+                                         run_a2a, env, uniform=pooled)
         torch.cuda.current_stream().synchronize()
         if pooled and sums_before is not None:
             ck_ok, ck_bad = compare_sums(sums_before, guest_sums(rec[1], rank, bufs))

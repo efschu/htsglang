@@ -815,13 +815,16 @@ def anchor_sums_of(guests: Sequence[Sequence[int]], rank: int, m_views) -> dict:
 
 
 def run_anchor_park(direction: str, guests: Sequence[Sequence[int]], rank: int,
-                    world: int, m_views, kv_views, a2a, env=None) -> int:
+                    world: int, m_views, kv_views, a2a, env=None,
+                    uniform: bool = False) -> int:
     """Move every anchor guest piece: ``direction`` "out" (sleep: the owner's
     mamba slots -> the host's KV hold rows) or "back" (wake: host rows -> the
     owner's mamba slots).  EVERY rank calls this with the same pieces in the
     same order (one collective per piece and block); ``a2a(output, input,
     out_splits, in_splits)`` is the group's uneven all_to_all, rows = host
-    rows.  Returns the bytes this rank sent."""
+    rows.  ``uniform`` (S2 pooled hold): each block is announced as
+    ``a2a(..., rows=n)``, the rank-uniform row count (see
+    ``l15_park.run_park``).  Returns the bytes this rank sent."""
     import torch
 
     from sglang.srt.weg2 import l15_park
@@ -878,7 +881,10 @@ def run_anchor_park(direction: str, guests: Sequence[Sequence[int]], rank: int,
             if rank == to:
                 out = recv[c0:c0 + n]
                 out_splits[frm] = n
-            a2a(out, inp, out_splits, in_splits)
+            if uniform:
+                a2a(out, inp, out_splits, in_splits, rows=n)
+            else:
+                a2a(out, inp, out_splits, in_splits)
         if rank == to:
             if direction == "out":
                 scatter_stream(kv_views, range(h_lo, h_lo + h_rows), recv)
