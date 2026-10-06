@@ -6916,7 +6916,9 @@ class Scheduler(
         _agreed_due = [int(bool(d) and not a) for d, a in zip(_votes[:_n], _votes[_n:])]
         for req, _ok, _act in zip(settle, _agreed_due, _acts):
             if _act == "capwait":
-                _local.append((req, "wait", False, False))
+                # state "capwait", NOT "wait": wake_cohort.IN_FLIGHT holds "wait", and a cap-waiter has
+                # NO read in flight (its read is not issued yet) -- it must not buy the ready members a hold
+                _local.append((req, "capwait", False, False))
                 continue
             try:
                 state = _refetch(req, now, allow_reissue=bool(_ok))

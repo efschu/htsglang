@@ -327,6 +327,7 @@ def _settle_rank(rank, rv, *, arena_slots, reqs):
                                weg2_hold_rids=set())
     s = types.SimpleNamespace(
         weg2_post_wake_settle=list(reqs), weg2_dormant=False, waiting_queue=[], _weg2_wake_seq=1,
+        ps=types.SimpleNamespace(tp_rank=rank, tp_size=N),   # only for the mutation probes of nf-next-1006-17
         tree_cache=types.SimpleNamespace(check_hicache_events=lambda: None, cache_controller=cc,
                                          prefetch_loaded_tokens_by_reqid={}),
         _weg2_group_min_flags=rv.flags(rank),
@@ -423,6 +424,24 @@ def test_b3_issue_capacity_waiters_raises_on_one_rank_the_settle_collective_stay
     assert errs == [None] * N, [repr(e) for e in errs]
     assert len(set(count)) == 1, count
     assert len({tuple(str(r.rid) for r in s.weg2_post_wake_settle) for s in ranks}) == 1
+
+
+def test_b5_a_cap_waiter_is_no_read_in_flight_it_buys_the_ready_member_no_cohort_hold():
+    """1537b (b) patch, side effect found by this test: the waiter now stays in ``settle`` so
+    ``wake_cohort.asks`` (>= 2 members) and ``hold_vote`` see it. A waiter reported in state "wait"
+    counts as a sibling read in flight (``IN_FLIGHT``) and held the ready, expensive member for up to
+    ``cap_s`` (<= 1 s) although no read of it runs. The base never showed it to the cohort (stripped)."""
+
+    def records(ranks):
+        for s in ranks:
+            # the ready member's extend is the expensive class (>= 8 new tokens): hold_vote would say 1
+            s.tree_cache.prefetch_loaded_tokens_by_reqid["weg2-1-0"] = types.SimpleNamespace(materialized=0)
+
+    ranks, errs, vals, count = _settle_group([100, 100, 100], pre_tick=records)
+    assert errs == [None] * N, [repr(e) for e in errs]
+    assert vals == [1] * N, vals                                   # the ready member is released, no hold
+    assert [[str(r.rid) for r in s.weg2_post_wake_settle] for s in ranks] == [["weg2-1-1"]] * N
+    assert len(set(count)) == 1, count
 
 
 def test_b4_the_capacity_decision_reads_no_rank_identity_and_no_pool_state():
