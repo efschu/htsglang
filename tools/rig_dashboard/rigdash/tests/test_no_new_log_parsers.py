@@ -106,6 +106,11 @@ FROZEN = {
 # (file, sha1[:12]) -> why this regex reads no log line
 NON_LOG_ALLOWED = {
     # AP-A (Profil-Planer 06.10.): Hostpfade aus dem Issue-Text des Hardwareprofils entfernen
+    # AP-I Fix-Runde 3: Geheimnisse nach der Form des Wertes aus dem Issue-Text schneiden
+    ("redact.py", "4179dc5de042"): "schneidet Vendor-Tokens (sk-, hf_, ghp_, xox, AKIA) aus einem Text, der in ein oeffentliches Issue kommt; liest keine Logzeile",
+    ("redact.py", "6c38dd063a10"): "schneidet 'Bearer <token>' aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "df4644c1bdda"): "schneidet das Passwort aus scheme://user:pass@host in einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "30650dce59ee"): "schneidet lange Token-Laeufe hinter = oder : aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "b598ffb1ba83"): "schneidet absolute Pfade (/root/..., /spinning/..., /var/lib/...) aus einem Text, der in ein öffentliches Issue kommt; liest keine Logzeile",
 }
 

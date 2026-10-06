@@ -50,13 +50,44 @@ def paths(text: str) -> str:
     return _HOSTPATH.sub("<Pfad entfernt>", text or "")
 
 
+# a secret recognised by the FORM of its value, whatever the entry is called (a user can name an env anything: ``OPENAI_API_KEYS``, ``HF_AUTH``,
+# ``MY_THING``).  Vendor prefixes: ``sk-`` / ``sk-ant-`` / ``sk-proj-`` / ``sk-or-v1-`` (with a digit, so ``task-...`` and ``sk-learn`` stay), ``hf_``,
+# ``ghp_/gho_/ghu_/ghs_/ghr_``, ``github_pat_``, ``xox[abpr]-``, ``AKIA`` + 16.  Case sensitive on purpose (``hf_hub_cache`` is a name, ``hf_`` + 8 letters is a token).
+_VENDOR = re.compile(r"(?<![A-Za-z0-9_])(?:sk-(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{8,}|hf_[A-Za-z0-9]{8,}|gh[pousr]_[A-Za-z0-9]{16,}"
+                     r"|github_pat_[A-Za-z0-9_]{16,}|xox[abpr]-[A-Za-z0-9\-]{8,}|AKIA[0-9A-Z]{16}(?![A-Za-z0-9]))")
+_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]{8,}")
+# ``scheme://user:pass@host`` -> ``scheme://user:<entfernt>@host``
+_URLCRED = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@]*:)[^\s/@]+@")
+# a long token-looking run right after ``=`` or ``:`` (env / flag lines): >= 32 of [A-Za-z0-9_-], no dot or slash (so model names and paths are not
+# runs), see ``_looks_like_secret`` for what is spared (git SHAs, sha256 digests, UPPER_CASE names).
+_LONGRUN = re.compile(r"(?<=[=:])([ \t]*[`\"']?)([A-Za-z0-9_\-]{32,})(?![A-Za-z0-9_\-./])")
+
+
+def _looks_like_secret(run: str) -> bool:
+    """A long run is a secret unless it is a git SHA / sha256 digest (40 or 64 hex), has no digit or no letter, or is an UPPER_CASE name."""
+    if len(run) in (40, 64) and all(c in "0123456789abcdefABCDEF" for c in run):
+        return False
+    if not any(c.isdigit() for c in run) or not any(c.isalpha() for c in run):
+        return False
+    return not (run.upper() == run and "_" in run)
+
+
+def shapes(text: str) -> str:
+    """Cut secrets by the form of their value: vendor prefixes, ``Bearer <token>``, ``user:pass@`` in a URL, long token runs after ``=`` / ``:``."""
+    text = _URLCRED.sub(lambda m: m.group(1) + "<entfernt>@", text or "")
+    text = _BEARER.sub("Bearer <entfernt>", text)
+    text = _VENDOR.sub("<entfernt>", text)
+    return _LONGRUN.sub(lambda m: m.group(1) + ("<entfernt>" if _looks_like_secret(m.group(2)) else m.group(2)), text)
+
+
 def text_for_issue(text: str) -> str:
-    """Text that is pasted into a public issue: secret lines dropped whole, secret values and host paths cut, line by line."""
+    """Text that is pasted into a public issue: secret lines dropped whole, secret values (by name context AND by the form of the value) and host
+    paths cut, line by line."""
     out = []
     for line in (text or "").split("\n"):
         c = clean(line)
         if c is not None:
-            out.append(paths(c))
+            out.append(paths(shapes(c)))
     return "\n".join(out)
 
 
@@ -69,13 +100,18 @@ def text_for_issue(text: str) -> str:
 # A name that ENDS in ``token`` but carries a token id or a boot marker is on the allow list ``_TOKEN_IS_NOT_SECRET`` (catalog:
 # ``--fork-anchor-token``, ``--turn-anchor-token``, ``SGLANG_WEG2_LANE_COVERAGE_TOKEN``) or counts tokens (``..._PER_KI_TOKEN``, a ``per`` word anywhere,
 # ``--bucket-time-to-first-token``).
-_SECRET_WORDS = frozenset(("secret", "secrets", "password", "passwd", "pwd", "credential", "credentials", "bearer", "authorization", "pat",
-                           "apikey", "adminkey", "accesskey", "privatekey"))
+_SECRET_WORDS = frozenset(("secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "credential", "credentials", "bearer",
+                           "authorization", "pat", "apikey", "apikeys", "adminkey", "accesskey", "privatekey"))
+# words that make a secret only as the LAST word of a name (``HF_AUTH``, ``DB_PASS``); mid-name they are ordinary (``--auth-backend``, ``--pass-through``)
+_LAST_WORD_SECRET = frozenset(("auth", "pass", "pat"))
+# ... except where the word before ``pass`` says it is a forward pass (catalog: ``SGLANG_WEG2_D_TWIN_PASS``)
+_PASS_IS_NOT_SECRET = frozenset(("twin", "forward", "prefill", "decode", "warmup", "draft"))
 _KEY_PREFIX = frozenset(("api", "admin", "access", "private", "auth", "ssh"))
 # ``key`` as the LAST word of a name is a credential whatever precedes it (``OPENROUTER_KEY``, ``WANDB_KEY``, ``ANTHROPIC_KEY``): a user can set any
 # env name, so a closed prefix list lets vendor keys through.  Allow list = catalog names whose ``key`` is a lookup key, not a credential
-# (``SGLANG_LOG_DECODE_GRAPH_KEY``, ``SGLANG_WEG2_TOLD_PROBE_TREE_KEY``): the word before ``key`` is ``graph`` / ``tree``.
-_KEY_IS_NOT_SECRET = frozenset(("graph", "tree"))
+# (``SGLANG_LOG_DECODE_GRAPH_KEY``, ``SGLANG_WEG2_TOLD_PROBE_TREE_KEY``, ``SGLANG_HICACHE_BIGRAM_KEYS``, ``SGLANG_WEG2_MAMBA_STATE_KEYS``): the word
+# before ``key`` / ``keys`` is ``graph`` / ``tree`` / ``bigram`` / ``state``.
+_KEY_IS_NOT_SECRET = frozenset(("graph", "tree", "bigram", "state"))
 _TOKEN_PREFIX = frozenset(("hf", "hub", "huggingface", "github", "gh", "gitlab", "auth", "access", "bearer", "api", "admin", "boot", "refresh",
                            "session", "bot", "slack", "pypi", "npm"))
 _TOKEN_SUFFIX = frozenset(("key", "value", "secret", "string", "file"))
@@ -101,15 +137,22 @@ def secret_name(name: str) -> bool:
     w = _words(name)
     if any(x in _SECRET_WORDS for x in w) or any(a in _KEY_PREFIX and b == "key" for a, b in zip(w, w[1:])):
         return True
-    if w and w[-1] == "key" and (len(w) == 1 or w[-2] not in _KEY_IS_NOT_SECRET):          # the name ENDS in ``key``
+    if w and w[-1] in ("key", "keys") and (len(w) == 1 or w[-2] not in _KEY_IS_NOT_SECRET):      # the name ENDS in ``key`` / ``keys``
+        return True
+    if w and w[-1] in _LAST_WORD_SECRET and not (w[-1] == "pass" and len(w) > 1 and w[-2] in _PASS_IS_NOT_SECRET):   # ``HF_AUTH``, ``DB_PASS``
         return True
     for i, x in enumerate(w):
-        if x != "token":
+        if x not in ("token", "tokens"):
             continue
         prev, nxt = (w[i - 1] if i else None), (w[i + 1] if i + 1 < len(w) else None)
-        if prev in _TOKEN_PREFIX or nxt in _TOKEN_SUFFIX:
+        # ``tokens`` after a bearer-ish word is a credential list (``HF_TOKENS``); ``session`` / ``boot`` / ``bot`` + ``tokens`` is a COUNT
+        # (catalog: ``--kv-session-offload-budget-session-tokens``)
+        if (x == "token" and prev in _TOKEN_PREFIX) or (x == "tokens" and prev in _TOKEN_PREFIX and prev not in ("session", "boot", "bot")):
             return True
-        if nxt is None and prev not in _TOKEN_IS_NOT_SECRET and "per" not in w:        # the name ENDS in ``token`` (or is just ``token``)
+        if x == "token" and nxt in _TOKEN_SUFFIX:
+            return True
+        # the name ENDS in ``token`` (or is just ``token``); a bare ``..._tokens`` counts tokens (``--max-total-tokens``) and is no secret
+        if x == "token" and nxt is None and prev not in _TOKEN_IS_NOT_SECRET and "per" not in w:
             return True
     return False
 

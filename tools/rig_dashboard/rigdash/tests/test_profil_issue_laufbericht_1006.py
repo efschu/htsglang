@@ -354,6 +354,58 @@ class Redaction(Base):
             row = next(x for x in t.split("\n") if x.startswith("| `env:P:%s`" % n))
             self.assertIn("<entfernt>", row)
 
+    def test_reviewer_leaks_appear_as_entfernt_in_the_report(self):
+        # Befund 1 (Fix-Runde 3): Pluralnamen, HF_AUTH und eine URL mit user:pass duerfen nicht im Klartext stehen
+        leaks = {"OPENAI_API_KEYS": "sk-proj-LEAKA0123456789", "HF_AUTH": "hf_LEAKB0123456789abcdef", "MY_STUFF": "ghp_LEAKC0123456789abcdef0123",
+                 "MODEL_MIRROR": "https://alice:hunter2pw@mirror.example.org/models"}
+        doc = self.edited([{"key": "env:P:" + n, "op": "set", "value": v} for n, v in leaks.items()])
+        dry = {"ok": False, "verdict": "x", "notes": ["pull von postgres://dbuser:s3cretpw@db.internal:5432/x"], "rejections": [], "cards": []}
+        t = self.report(doc=doc, dry=dry)["text"]
+        for n, v in leaks.items():
+            for frag in (v, v.split(":")[-1] if "@" in v else v):
+                self.assertNotIn(frag.split("@")[0] if "@" in frag else frag, t, n)
+            row = next(x for x in t.split("\n") if x.startswith("| `env:P:%s`" % n))
+            self.assertIn("<entfernt>", row, n)
+        self.assertNotIn("hunter2pw", t)
+        self.assertNotIn("s3cretpw", t)
+        self.assertIn("dbuser:<entfernt>@db.internal", t)                # Nutzer bleibt lesbar, das Passwort ist weg
+
+    def test_value_shapes_are_cut_whatever_the_name(self):
+        for v in ("sk-abcdefgh12345678", "sk-ant-api03-AbCdEf0123456789xyz", "sk-proj-AbCd0123456789EfGh", "hf_AbCdEfGhIjKlMnOp",
+                  "ghp_AbCdEfGhIjKlMnOp0123456789", "gho_AbCdEfGhIjKlMnOp0123456789", "ghu_AbCdEfGhIjKlMnOp0123456789", "ghs_AbCdEfGhIjKlMnOp0123456789",
+                  "github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuvwx", "xoxb-1234567890-abcdefghij", "xoxp-1234567890-abcdefghij", "xoxa-1234567890-abcdef",
+                  "xoxr-1234567890-abcdef", "AKIAIOSFODNN7EXAMPLE"):
+            for form in (v, "key=" + v, "| `env:P:FOO_BAR` | %s | x |" % v, "export FOO=%s" % v):
+                out = redact.text_for_issue(form)
+                self.assertNotIn(v, out, form)
+                if "github_pat" not in v:                                  # ``GITHUB_PAT`` laesst clean() die ganze Zeile fallen: dann ist sie weg
+                    self.assertIn("<entfernt>", out, form)
+        self.assertEqual(redact.text_for_issue("Authorization-frei: Bearer abcdef0123456789xyz"), "Authorization-frei: Bearer <entfernt>")
+        self.assertEqual(redact.text_for_issue("curl https://alice:hunter2@host.example/x"), "curl https://alice:<entfernt>@host.example/x")
+        self.assertNotIn("hunter2", redact.text_for_issue("redis://:hunter2@cache:6379/0"))
+        long_tok = "Zk3" + "aB9xQ" * 8                                       # 43 Zeichen, gemischt
+        for form in ("FOO=" + long_tok, "foo: " + long_tok, "--bar=" + long_tok, "| FOO=" + long_tok + " |"):
+            out = redact.text_for_issue(form)
+            self.assertNotIn(long_tok, out, form)
+            self.assertIn("<entfernt>", out, form)
+
+    def test_names_ending_in_a_credential_word_are_secrets_singular_and_plural(self):
+        for n in ("OPENAI_API_KEYS", "MY_KEYS", "HF_AUTH", "--auth", "DB_PASS", "--pass", "MY_SECRETS", "DB_PASSWORDS", "SERVICE_CREDENTIALS", "GH_PAT",
+                  "HF_TOKENS", "--auth-tokens", "--credential"):
+            self.assertTrue(redact.secret_name(n), n)
+            self.assertEqual(redact.value_for_issue(n, "x"), "<entfernt>", n)
+        for n in ("--max-total-tokens", "--auth-backend", "--pass-through", "SGLANG_LOG_DECODE_GRAPH_KEY", "SGLANG_X_TREE_KEYS",
+                  "--bypass", "PATH", "KEYS_PER_SEC_X", "--tokens-per-second", "SGLANG_HICACHE_BIGRAM_KEYS", "SGLANG_WEG2_MAMBA_STATE_KEYS",
+                  "SGLANG_WEG2_D_TWIN_PASS", "--kv-session-offload-budget-session-tokens"):
+            self.assertFalse(redact.secret_name(n), n)
+
+    def test_values_that_are_no_secrets_survive_the_shape_layer(self):
+        sha = "173161c595de23e0aa11bb22cc33dd44ee55ff66"
+        for v in (sha, "sha256:" + "ab12" * 16, "tree_sha=" + sha, "image=flliper:0.1.0-cu130", "disk-cache-size=10", "task-runner-big-name-0123456789-abcdef",
+                  "SGLANG_LOG_DECODE_GRAPH_KEY=1", "model=Qwen3.6-27B-AWQ-BF16-INT4-some-very-long-variant-name-v2", "tag: SGLANG_WEG2_LANE_COVERAGE_TOKEN_X_Y_Z_0123456789",
+                  "hf_hub_cache=1", "sk-learn is a library", "https://example.org/path:8080/x", "user@host", "ssh://git@host/repo.git"):
+            self.assertEqual(redact.text_for_issue(v), v, v)
+
     def test_token_as_a_catalog_word_is_not_a_secret_but_a_token_credential_is(self):
         # Befund 1 (Review): ``token`` mitten im Namen oder als Token-ID/Zaehler loescht sonst genau die Werte, die der Laufbericht zeigen soll
         for n, v in (("--d-token-placement", "bandwidth"), ("--d-kv-token-cut", "owned"), ("--turn-anchor-token", "248045"),
