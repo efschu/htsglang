@@ -25,16 +25,35 @@ box-bound like every dry-run golden of this directory (they carry the census/evi
 headers of this box); the tests SKIP, with the reason, where those inputs are absent.
 
 NF (abl form, R9): ``launch_nf-int4-h6-abl.json`` (the argv and environment of the abl profile) is pinned here.  The
-DRY-RUN golden ``plan_nf_abl_n3.txt`` is NOT in the tree: on the box that produced this file the four NF checkpoint dirs
+DRY-RUN golden ``plan_nf_abl_n3.txt`` is NOT in the tree YET: on the box that produced this file the NF checkpoint dirs
 (``Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp`` and the MTP draft ``...albucino-abl-wxp``) are EMPTY mount
-points, and the launcher refuses the plan at W128 (draft header unreadable) -- a refusal of the missing data, not a plan.
-``test_nf_abl_dump_equals_golden`` runs as soon as the checkpoints and the golden exist; generate it on the box that has
-them with::
+points (and no copy, no ZFS snapshot, no recorded header exists anywhere on it), and the launcher refuses the plan at W128
+(draft header unreadable) -- a refusal of the missing data, not a plan.  Nothing is guessed to fill the gap (a sibling
+checkpoint has other tensors, hence other bytes).  The way to the golden is two commands on the box that HAS the checkpoints;
+the header snapshots (a few MB, committed under ``fixtures/planer_1006/checkpoints/<registry name>/``) then make the golden
+run on ANY box, because the launcher reads headers and ``stat`` sizes only and :func:`propose_oracle.materialize_checkpoint`
+rebuilds exactly those (``TestCheckpointSnapshot`` proves the stub is the checkpoint as far as the census can tell)::
 
+    PYTHONPATH=python python3 -m sglang.srt.weg2.propose_oracle snapshot \\
+        --model-dir /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp \\
+        --out test/registered/unit/weg2/fixtures/planer_1006/checkpoints/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp
+    PYTHONPATH=python python3 -m sglang.srt.weg2.propose_oracle snapshot \\
+        --model-dir /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp \\
+        --out test/registered/unit/weg2/fixtures/planer_1006/checkpoints/Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp
     CUDA_VISIBLE_DEVICES= PYTHONPATH=python python3 -m sglang.srt.weg2.propose_oracle golden \\
         --profile test/registered/unit/weg2/fixtures/planer_1006/profiles/nf-int4-h6-abl.env \\
         --replay test/registered/unit/weg2/fixtures/xchg_launch_replay_0911/nvml_devices_1378.json \\
+        --checkpoint-snapshot test/registered/unit/weg2/fixtures/planer_1006/checkpoints/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp \\
+        --checkpoint-snapshot test/registered/unit/weg2/fixtures/planer_1006/checkpoints/Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp \\
         --out test/registered/unit/weg2/fixtures/planer_1006/golden/plan_nf_abl_n3.txt
+
+``test_nf_abl_dump_equals_golden`` runs (never skips) once those snapshots and the golden are committed; until then it
+SKIPS with this reason, which is the one open point of AP0.
+
+LIVE-BOX readings: besides the ``plan_diff.py:6-17`` list, W65 names every ``boot_*.D.log`` of the live evidence dir
+(834 names on 2026-10-06); that enumeration is masked (``LIVE_BOX_RULES``) and ``test_golden_does_not_move_when_the_
+evidence_dir_grows`` proves a new log does not turn the reference red.  The files the PROFILE names (census, PP-CUT stage
+model, rank-dump log of the depth axis) are inputs of the golden and are read from the live evidence dir as named.
 
 REGENERATE the 27B goldens after a change that moves the plan ON PURPOSE (the same command with ``27b-base.env`` /
 ``27b-nvfp4-dual.env`` and ``plan_27b_flip_n3.txt`` / ``plan_27b_dual_n3.txt``; the launch JSONs with the ``launch``
@@ -108,11 +127,28 @@ _NEEDS_27B_DUAL = unittest.skipUnless(
 )
 
 
+_NF_NAMES = ("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp",
+             "Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp")
+CKPT_SNAPSHOTS = os.path.join(FIX, "checkpoints")
+
+
+def _snapshots() -> dict:
+    """``{registry dir name: header snapshot dir}`` of the snapshots committed under ``fixtures/planer_1006/checkpoints``."""
+    out = {}
+    if os.path.isdir(CKPT_SNAPSHOTS):
+        for n in sorted(os.listdir(CKPT_SNAPSHOTS)):
+            if os.path.isfile(os.path.join(CKPT_SNAPSHOTS, n, "manifest.json")):
+                out[O.read_snapshot_manifest(os.path.join(CKPT_SNAPSHOTS, n))["name"]] = os.path.join(CKPT_SNAPSHOTS, n)
+    return out
+
+
 def _nf_checkpoint_present() -> bool:
-    """Target config.json AND a non-empty draft dir (the launcher reads both headers; empty mount points here)."""
-    d = MC + "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp"
-    dd = MC + "Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp"
-    return os.path.isfile(os.path.join(d, "config.json")) and os.path.isdir(dd) and bool(os.listdir(dd))
+    """Both NF checkpoints readable: REAL (target config.json AND a non-empty draft dir; empty mount points on the box
+    that produced this file) or a committed header snapshot of each."""
+    snaps = _snapshots()
+    real = (os.path.isfile(os.path.join(MC + _NF_NAMES[0], "config.json")) and os.path.isdir(MC + _NF_NAMES[1])
+            and bool(os.listdir(MC + _NF_NAMES[1])))
+    return real or all(n in snaps for n in _NF_NAMES)
 
 
 def _load_catalog():
@@ -375,12 +411,27 @@ class TestDumpTools(unittest.TestCase):
         line = ("LIVE nonreclaim=4.67 raw_current=13.10 file_reclaimable=8.00 GiB | c_max=5.00 GiB size=5.03 GiB | "
                 "memavail=113.33 GiB anon=4.67 GiB shmem=0.00 GiB | free=264.1 GiB | which has 247.5 GiB free of | "
                 "against 264.1 GB free on | foreign_load_now=0.00 GiB | /dev/shm/weg2-xchg-1791275135/x | "
-                "WEG2-DRY-RUN-BOX-STATE at=2026-10-06T08:25:35Z | budget 26064 MiB total 32607")
+                "WEG2-DRY-RUN-BOX-STATE at=2026-10-06T08:25:35Z | budget 26064 MiB total 32607\n"
+                "  W65 Weg2MeasuredAnchor: no anchor, heuristic path stands: no boot_*.D.log of this form: "
+                "boot_weg2_a_1_0926_1.D.log: different model (/m/a); boot_weg2_b_2_0926_2.D.log: different model (none)")
         masked, counts = O.mask_live_box(line)
         self.assertEqual({k for k, v in counts.items() if v}, {n for n, _ in O.LIVE_BOX_RULES})
         self.assertIn("budget 26064 MiB total 32607", masked)
         self.assertIn("c_max=5.00 GiB", masked)                    # the ARC limit stays, only the live size goes
         self.assertNotIn("113.33", masked)
+        self.assertNotIn("boot_weg2_a_1", masked)                  # the evidence-dir enumeration goes ...
+        self.assertIn("no anchor, heuristic path stands: no boot_*.D.log of this form: <w65-d-log-enumeration>", masked)
+
+    def test_w65_mask_hides_the_enumeration_not_the_verdict(self):
+        """Another boot logging a D log changes the list, not the plan; an anchor FOUND (other message) is a plan change."""
+        head = "  W65 Weg2MeasuredAnchor: no anchor, heuristic path stands: no boot_*.D.log of this form: "
+        two = head + "boot_a.D.log: different model (/m/x); boot_b.D.log: different model (none)\n"
+        three = head + "boot_new.D.log: different model (/m/y); boot_a.D.log: different model (/m/x); boot_b.D.log: x\n"
+        self.assertEqual(O.diff_lines(two, three), [])
+        found = "  W65 Weg2MeasuredAnchor: anchored on boot_new.D.log (posts 1,2,3)\n"
+        self.assertGreater(len(O.diff_lines(two, found)), 0)
+        # the verdict words themselves are NOT masked: "no anchor" -> "anchor" differs
+        self.assertGreater(len(O.diff_lines(two, two.replace("no anchor, heuristic path stands", "anchor stands"))), 0)
 
     def test_diff_lines_zero_on_equal_and_nonzero_on_one_changed_value(self):
         g = _read(os.path.join(GOLDEN, "plan_27b_dual_n3.txt"))
@@ -427,11 +478,80 @@ class TestDumpTools(unittest.TestCase):
         self.assertEqual(d["pp_cut"]["chosen_pool"], "225914")
 
 
+class TestCheckpointSnapshot(unittest.TestCase):
+    """``snapshot_checkpoint`` / ``materialize_checkpoint``: the headers-only stand-in for a checkpoint that is not on the box."""
+
+    _REAL = MC + "Qwen3.8-27B-NVFP4-RadixArk"          # 3 shards of ~10 GB, index, big tokenizer files: every file kind
+
+    @unittest.skipUnless(os.path.isfile(_REAL + "/config.json"), "NVFP4 RadixArk checkpoint not on this box")
+    def test_the_stub_is_the_checkpoint_as_far_as_the_census_can_tell(self):
+        import struct
+        from sglang.srt.weg2 import checkpoint_census as CC
+
+        with tempfile.TemporaryDirectory(prefix="ap0-snap-") as td:
+            snap = O.snapshot_checkpoint(self._REAL, os.path.join(td, "snap"))
+            stub = O.materialize_checkpoint(snap, os.path.join(td, "farm"))
+            self.assertEqual(os.path.basename(stub), "Qwen3.8-27B-NVFP4-RadixArk")      # the NAME is the identity
+            names = sorted(f for f in os.listdir(self._REAL) if os.path.isfile(os.path.join(self._REAL, f)))
+            self.assertEqual(sorted(os.listdir(stub)), names)
+            for fn in names:
+                real, st = os.path.join(self._REAL, fn), os.path.join(stub, fn)
+                self.assertEqual(os.path.getsize(st), os.path.getsize(real), fn)       # stat sizes: equal
+                if fn.endswith(".safetensors"):
+                    with open(real, "rb") as a, open(st, "rb") as b:
+                        n = struct.unpack("<Q", a.read(8))[0]
+                        a.seek(0)
+                        self.assertEqual(a.read(8 + n), b.read(8 + n), fn)             # header bytes: identical
+                    self.assertLess(os.stat(st).st_blocks * 512, 1 << 24, "stub must be sparse: " + fn)
+                elif os.path.getsize(real) <= O.SNAPSHOT_COPY_MAX:
+                    self.assertEqual(_read(real), _read(st), fn)                       # small files: verbatim
+            kw = dict(exclude_prefixes=("mtp.",), exclude_segments=())
+            a, b = CC.layer_census_from_headers(self._REAL, **kw), CC.layer_census_from_headers(stub, **kw)
+            self.assertEqual((a.layer_bytes, a.unlayered_bytes, a.total_bytes), (b.layer_bytes, b.unlayered_bytes, b.total_bytes))
+            self.assertGreater(a.total_bytes, 1 << 30)
+            # the snapshot itself is small: headers + small files, not weights
+            size = sum(os.path.getsize(os.path.join(dp, f)) for dp, _d, fs in os.walk(snap) for f in fs)
+            self.assertLess(size, 8 << 20)
+
+    @unittest.skipUnless(os.path.isfile(_REAL + "/config.json"), "NVFP4 RadixArk checkpoint not on this box")
+    def test_run_profile_prefers_the_checkpoints_own_snapshot_over_a_sibling(self):
+        with tempfile.TemporaryDirectory(prefix="ap0-snap-") as td:
+            snap = O.snapshot_checkpoint(self._REAL, os.path.join(td, "snap"))
+            empty = os.path.join(td, "empty_mount", "Qwen3.8-27B-NVFP4-RadixArk")
+            os.makedirs(empty)
+            farm = os.path.join(td, "farm")
+            got = O.ensure_model_dir(empty, siblings=[MC + "Qwen3.8-27B-INT8-gdncov"], farm_root=farm, snapshot=snap)
+            self.assertEqual(got, os.path.join(farm, "Qwen3.8-27B-NVFP4-RadixArk"))
+            self.assertFalse(os.path.islink(os.path.join(got, "config.json")))          # a stub, not the sibling's symlink
+            self.assertEqual(_read(os.path.join(got, "config.json")), _read(self._REAL + "/config.json"))
+            # a REAL dir (config.json present) is used as it is, snapshot or not
+            self.assertEqual(O.ensure_model_dir(self._REAL, snapshot=snap, farm_root=farm), self._REAL)
+            # a snapshot of ANOTHER checkpoint is refused by name, never used
+            with self.assertRaises(ValueError):
+                O.ensure_model_dir(os.path.join(td, "empty_mount", "Other-Model"), snapshot=snap, farm_root=farm)
+
+    def test_an_empty_mount_point_cannot_be_snapshotted(self):
+        with tempfile.TemporaryDirectory(prefix="ap0-snap-") as td:
+            with self.assertRaises(FileNotFoundError):
+                O.snapshot_checkpoint(td, os.path.join(td, "out"))
+
+    def test_committed_snapshots_are_well_formed(self):
+        """Whatever snapshot is committed rebuilds, and its headers fit their recorded sizes (nothing truncated)."""
+        for name, d in _snapshots().items():
+            m = O.read_snapshot_manifest(d)
+            self.assertEqual(m["name"], name)
+            with tempfile.TemporaryDirectory(prefix="ap0-snap-") as td:
+                stub = O.materialize_checkpoint(d, td)
+                for e in m["files"]:
+                    self.assertEqual(os.path.getsize(os.path.join(stub, e["name"])), e["size"])
+
+
 # ---------------------------------------------------------------------------
 # (b) the reference test: dump == golden
 # ---------------------------------------------------------------------------
 
 def _dump_of(name: str, devices, **kw):
+    kw.setdefault("snapshots", _snapshots())
     return O.run_profile(_p(name), devices, tree=TREE, **kw)
 
 
@@ -467,6 +587,38 @@ class TestDryRunGolden(unittest.TestCase):
             run = _dump_of("27b-base", rows, scratch=td)
         _assert_zero_diff(self, "plan_27b_flip_n3.txt", run)
 
+    @_NEEDS_27B_FLIP
+    def test_a_forced_two_card_run_leaves_no_state_for_the_next_plan(self):
+        """``launcher.main`` fills process caches (``corridor_guard._RIG_FP_CACHE``) and sets the inventory view / exchange
+        geometry.  Measured 2026-10-06: after a ``--force`` run on two cards the next THREE-card run of the same process was
+        refused (W40) instead of planned.  The oracle restores the module state: the plan after the forced run is the golden."""
+        two = [dict(r, index=i) for i, r in enumerate(d for d in O.read_replay(REPLAY_REF) if d["index"] in (1, 2))]
+        forced = _dump_of("27b-base", two, force=True)
+        self.assertIsNotNone(forced.result.exc_type)
+        from sglang.srt.managers import corridor_guard
+        self.assertEqual(len(corridor_guard._RIG_FP_CACHE), 0)      # the cache the forced run filled is back to its entry state
+        run = _dump_of("27b-base", O.read_replay(REPLAY_REF))
+        _assert_zero_diff(self, "plan_27b_flip_n3.txt", run)
+
+    @_NEEDS_27B_FLIP
+    def test_golden_does_not_move_when_the_evidence_dir_grows(self):
+        """The launcher names every ``boot_*.D.log`` of the evidence dir in W65 (``find_dual_d_measurement``): a boot of the
+        rig adds one.  An OVERLAY of the live dir (every entry linked) plus one NEWER, unrelated D log: the plan is the
+        golden (0 diff), while the RAW W65 line really did change -- the mask is what holds it, nothing else moved."""
+        live = launcher.EVIDENCE_DIR
+        if not os.path.isdir(live):
+            self.skipTest("no evidence dir on this box")
+        name = "boot_weg2_ap0overlayfake_0000000000_1006_000000.D.log"
+        with tempfile.TemporaryDirectory(prefix="ap0-evidence-overlay-") as td:
+            for n in os.listdir(live):
+                os.symlink(os.path.join(live, n), os.path.join(td, n))
+            with open(os.path.join(td, name), "w") as fh:
+                fh.write("not a boot log: the oracle must only list it\n")
+            run = O.run_profile(_p("27b-base"), O.read_replay(REPLAY_REF), tree=TREE, evidence_dir=td)
+        self.assertIn(name, run.result.raw)                       # the overlay really was the evidence dir of the run
+        self.assertNotIn(td, run.result.text)                     # ... and the text is normalised back to the live path
+        _assert_zero_diff(self, "plan_27b_flip_n3.txt", run)
+
     @_NEEDS_27B_DUAL
     def test_27b_dual_dump_equals_golden(self):
         run = _dump_of("27b-nvfp4-dual", O.read_replay(REPLAY_REF))
@@ -479,8 +631,8 @@ class TestDryRunGolden(unittest.TestCase):
 
     @unittest.skipUnless(
         _nf_checkpoint_present() and os.path.exists(os.path.join(GOLDEN, "plan_nf_abl_n3.txt")),
-        "NF abl checkpoints are empty mount points on this box and plan_nf_abl_n3.txt was never generated "
-        "(see the module docstring): the NF dry-run golden needs the box that has them",
+        "NF abl checkpoints are empty mount points on this box, no header snapshot of them is committed and "
+        "plan_nf_abl_n3.txt was never generated (see the module docstring: `snapshot` + `golden` on the box that has them)",
     )
     def test_nf_abl_dump_equals_golden(self):
         run = _dump_of("nf-int4-h6-abl", O.read_replay(REPLAY_REF))

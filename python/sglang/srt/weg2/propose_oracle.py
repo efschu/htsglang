@@ -26,6 +26,11 @@ Five parts, each usable alone:
     dirs, timestamps, epoch, boot token, tree sha) and :func:`mask_live_box` the LIVE-BOX readings the dry run takes from
     the running machine (``plan_diff.py:6-17``); both are listed so a golden diff can never hide a value.
 
+Two hermeticity seams added after review: the live evidence dir (W65 lists every ``boot_*.D.log`` of it; masked, and
+``run_dry_run(evidence_dir=...)`` rebinds it for the proof that a new log changes nothing) and the process state a boot
+leaves behind (:func:`_module_state_guard`); and the stand-in for a checkpoint that is not on the box
+(:func:`snapshot_checkpoint` / :func:`materialize_checkpoint`: headers and sizes, which is all the launcher reads).
+
 What this module does NOT do: choose any value (that is ``propose.py``), judge a refusal (``refusals.py``), start a
 process other than the in-process ``launcher.main``.  GPU-free, NVML-free, Docker-free.
 """
@@ -250,6 +255,16 @@ class DryRunResult:
         return self.header() + self.text
 
 
+def _rebound(d: Any, replacements: Mapping[str, str]) -> Any:
+    """A default value with the patched path constants swapped: a str itself, or the str elements of a tuple
+    (``anchor_evidence_dirs: Sequence[str] = (EVIDENCE_DIR,)``); anything else is returned as it is."""
+    if isinstance(d, str):
+        return replacements.get(d, d)
+    if isinstance(d, tuple) and any(isinstance(x, str) and x in replacements for x in d):
+        return tuple(replacements.get(x, x) if isinstance(x, str) else x for x in d)
+    return d
+
+
 @contextlib.contextmanager
 def _patched_default_args(module, replacements: Mapping[str, str]):
     """Rebind DEFAULT ARGUMENTS of the module's own functions whose default equals a patched constant.
@@ -260,24 +275,95 @@ def _patched_default_args(module, replacements: Mapping[str, str]):
     default-bound path is covered too.  Restored on exit."""
     import inspect
 
-    saved: List[Tuple[Any, tuple]] = []
+    saved: List[Tuple[Any, tuple, Optional[dict]]] = []
     try:
         for _n, f in list(vars(module).items()):
-            if inspect.isfunction(f) and f.__module__ == module.__name__ and f.__defaults__:
-                new = tuple(replacements.get(d, d) if isinstance(d, str) else d for d in f.__defaults__)
-                if new != f.__defaults__:
-                    saved.append((f, f.__defaults__))
-                    f.__defaults__ = new
+            if not (inspect.isfunction(f) and f.__module__ == module.__name__):
+                continue
+            new = tuple(_rebound(d, replacements) for d in (f.__defaults__ or ()))
+            newkw = {k: _rebound(v, replacements) for k, v in (f.__kwdefaults__ or {}).items()}
+            if new != (f.__defaults__ or ()) or newkw != (f.__kwdefaults__ or {}):
+                saved.append((f, f.__defaults__, f.__kwdefaults__))
+                f.__defaults__ = new or None
+                f.__kwdefaults__ = newkw or None
         yield
     finally:
-        for f, d in saved:
+        for f, d, kd in saved:
             f.__defaults__ = d
+            f.__kwdefaults__ = kd
+
+
+#: modules that hold PROCESS STATE the launcher's ``main`` writes (a rig-fingerprint cache, the active inventory view, the
+#: weight-exchange geometry) are imported BEFORE the snapshot, so the guard below knows them from the first run on
+_STATE_MODULES = ("sglang.srt.managers.corridor_guard", "sglang.srt.weg2.inventory_view",
+                  "sglang.srt.weg2.weight_exchange_region", "sglang.srt.planner.pp_cut",
+                  "sglang.srt.planner.pp_cut_launch")
+
+
+@contextlib.contextmanager
+def _module_state_guard(prefix: str = "sglang."):
+    """Give every module-level variable of the ``sglang.*`` modules that exist at entry back its value at exit.
+
+    ``launcher.main`` is a boot, not a pure function: it fills caches (``corridor_guard._RIG_FP_CACHE``), sets the active
+    inventory view and the weight-exchange geometry.  Measured (2026-10-06): a ``--force`` run on TWO cards left the next
+    THREE-card run in the same process refused (W40 PP-cut) instead of planned.  An oracle that answers the second question
+    differently after the first is no oracle; propose() asks many.  A variable is restored by IDENTITY (rebound) and a
+    list/dict/set by CONTENT (in place, the other modules hold the same object).  Variables the run ADDED stay (a lazy
+    import's own globals); ``refusals`` and ``os.environ`` are reset by their own seams."""
+    import importlib
+    import sys
+
+    for m in _STATE_MODULES:
+        try:
+            importlib.import_module(m)
+        except Exception:  # noqa: BLE001 - a build without the module has no state of it to keep
+            pass
+    saved: List[Tuple[Any, Dict[str, Any], Dict[str, Any]]] = []
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not name.startswith(prefix) or name == __name__:
+            continue
+        d = getattr(mod, "__dict__", None)
+        if not isinstance(d, dict):
+            continue
+        ids: Dict[str, Any] = {}
+        content: Dict[str, Any] = {}
+        for k, v in list(d.items()):
+            if k.startswith("__"):
+                continue
+            ids[k] = v
+            if type(v) in (dict, list, set):         # plain containers only: a subclass (lazy mappings) is not ours to copy
+                content[k] = v.copy()
+        saved.append((mod, ids, content))
+    try:
+        yield
+    finally:
+        for mod, ids, content in saved:
+            d = mod.__dict__
+            for k, v in ids.items():
+                if d.get(k, _MISSING) is not v:
+                    d[k] = v
+                c = content.get(k)
+                if c is not None:
+                    if type(v) is dict:
+                        if v != c:
+                            v.clear()
+                            v.update(c)
+                    elif type(v) is list:
+                        if v != c:
+                            v[:] = c
+                    elif v != c:
+                        v.clear()
+                        v.update(c)
+
+
+_MISSING = object()
 
 
 def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any]], *, tree: str,
                 env: Optional[Mapping[str, str]] = None, force: bool = False, tag: str = ORACLE_TAG,
                 scratch: Optional[str] = None, replay_path: Optional[str] = None,
-                keep_scratch: bool = False, farm_root: str = "") -> DryRunResult:
+                keep_scratch: bool = False, farm_root: str = "",
+                evidence_dir: Optional[str] = None) -> DryRunResult:
     """Run ``launcher.main(["--tree", tree, "--tag", tag, "--dry-run", (--force), *launcher_argv])`` hermetically.
 
     * ``devices``: replay rows (:func:`replay_from_hardware_profile` / :func:`replay_from_catalog` / the fixture),
@@ -287,6 +373,12 @@ def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any
       Every ``SGLANG_*`` / ``HTSGLANG_*`` / ``FLLIPER_*`` variable of the surrounding process that ``env`` does not
       name is REMOVED for the run; the whole environment is restored afterwards (including what ``refusals.arm`` writes).
     * ``force``: ``--force`` (value refusals become ``FORCED-PAST`` lines; ``result.forced`` lists them).
+    * ``evidence_dir``: None = the launcher's own ``EVIDENCE_DIR`` (the LIVE evidence dir: boot logs, records, censuses --
+      the plan reads some of them; their enumeration is masked by :data:`LIVE_BOX_RULES`).  A path rebinds
+      ``launcher.EVIDENCE_DIR`` and every default argument bound to it for the run (an import-time constant; the process
+      environment is NOT touched: the group env lines of the plan stay those of the golden), and the
+      text is normalised back to the live path, so a run on an overlay dir (the live dir's entries + one more log) is
+      comparable to the golden -- that is how the test proves the golden does not move when the dir grows.
     * The module state ``refusals`` is reset before and after.
 
     ``launcher.main`` may raise (a refusal): that is a RESULT (``exc_type``), not an error of the oracle.  Only a failure
@@ -315,6 +407,8 @@ def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any
     argv = ["--tree", tree, "--tag", tag, "--dry-run"] + (["--force"] if force else []) + list(launcher_argv)
 
     orig_roots = (launcher.SHM_DIR, launcher.MEMINFO_PATH, launcher.CGROUP_ROOT, launcher.STORE_ROOT)
+    live_evidence = launcher.EVIDENCE_DIR
+    ev_new = evidence_dir or live_evidence
     buf = io.StringIO()
     rc = exc = None
     forced: List[Dict[str, str]] = []
@@ -323,8 +417,9 @@ def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any
                 mock.patch.object(launcher, "SHM_DIR", shm), mock.patch.object(launcher, "MEMINFO_PATH", meminfo), \
                 mock.patch.object(launcher, "CGROUP_ROOT", cg), \
                 mock.patch.object(launcher, "STORE_ROOT", store_root), mock.patch.object(launcher, "STORE_ROOT_TOLD", True), \
+                mock.patch.object(launcher, "EVIDENCE_DIR", ev_new), _module_state_guard(), \
                 _patched_default_args(launcher, {orig_roots[0]: shm, orig_roots[1]: meminfo, orig_roots[2]: cg,
-                                                 orig_roots[3]: store_root}):
+                                                 orig_roots[3]: store_root, live_evidence: ev_new}):
             refusals.arm(False)
             try:
                 with contextlib.redirect_stdout(buf):
@@ -345,6 +440,9 @@ def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any
     raw = buf.getvalue()
     text = normalise_dump(raw, tree=tree, host=host, shm=shm, store=store_root, scratch=scratch, tag=tag,
                           farm_root=farm_root, replay=rpath)
+    if evidence_dir and evidence_dir != live_evidence:
+        text = text.replace(evidence_dir, live_evidence)
+        raw = raw.replace(evidence_dir, live_evidence)
     return DryRunResult(rc, type(exc).__name__ if exc else None, str(exc) if exc else "", text, raw, forced, argv)
 
 
@@ -375,6 +473,14 @@ LIVE_BOX_RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("disk-has-free", re.compile(r"which has [\d.]+ GiB free of")),
     ("l3-disk-free-gb", re.compile(r"against [\d.]+ GB free on")),
     ("foreign-load-now", re.compile(r"foreign_load_now=[\d.]+ GiB")),
+    # W65 (``Weg2MeasuredAnchor``, ``launcher.py:16416``): when no D log of the form exists the launcher names EVERY
+    # ``boot_*.D.log`` of the evidence dir with the reason it was rejected (``dual_w64.find_dual_d_measurement`` listing,
+    # sorted by mtime; 834 names / 164 kB on 2026-10-06).  That list is the CONTENT OF THE LIVE EVIDENCE DIR, not a plan
+    # value: any boot of the rig adds a name and would turn the reference red without a plan change.  Only the
+    # enumeration after the colon is masked; ``W65 Weg2MeasuredAnchor: no anchor, heuristic path stands: no
+    # boot_*.D.log of this form:`` stays in the text, so the day a D log of THIS form exists (an anchor is found, the
+    # message changes, the plan moves) the diff goes red -- which is a real plan change.
+    ("w65-d-log-enumeration", re.compile(r"(?<=no boot_\*\.D\.log of this form: ).*")),
 )
 
 
@@ -637,15 +743,108 @@ DEFAULT_MODEL_SIBLINGS: Mapping[str, Sequence[str]] = {
 }
 
 
-def ensure_model_dir(path: str, *, siblings: Sequence[str] = (), farm_root: str = DEFAULT_FARM_ROOT) -> str:
+#: files up to this size are copied into a checkpoint snapshot verbatim (config.json, tokenizer/generation configs, the
+#: ``*.safetensors.index.json``); a bigger non-safetensors file is recorded by SIZE only
+SNAPSHOT_COPY_MAX = 4 << 20
+_SNAPSHOT_SCHEMA = "planer-oracle-checkpoint-snapshot/1"
+
+
+def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = None) -> str:
+    """Record what the launcher's dry run reads of a checkpoint directory, WITHOUT the weights: every ``*.safetensors``
+    file as its header bytes (``8 + N``: the length word and the JSON) plus its size, every small other file verbatim,
+    every big other file as a size.  The launcher takes per-tensor bytes from the headers and on-disk sizes from
+    ``stat`` (``checkpoint_census`` / ``model_profile`` / ``form``), never from the data region, so a stub rebuilt by
+    :func:`materialize_checkpoint` is the checkpoint as far as the plan can tell (round trip proven by the test).
+
+    Run it on a box that HAS the checkpoint; the snapshot (header bytes only, a few MB) is committed as a fixture and the
+    golden of that profile then runs anywhere.  Returns ``out_dir``; ``name`` (default: the directory name) is the
+    registry name the stub is rebuilt under -- the calibration identity is the directory NAME."""
+    import struct
+
+    src = os.path.abspath(model_dir)
+    name = name or os.path.basename(src.rstrip("/"))
+    if not os.path.isfile(os.path.join(src, "config.json")):
+        raise FileNotFoundError("%s has no config.json: nothing to snapshot (an empty mount point?)" % src)
+    files_dir = os.path.join(out_dir, "files")
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(files_dir)
+    entries: List[Dict[str, Any]] = []
+    skipped_dirs: List[str] = []
+    for fn in sorted(os.listdir(src)):
+        path = os.path.join(src, fn)
+        if os.path.isdir(path):
+            skipped_dirs.append(fn)
+            continue
+        size = os.path.getsize(path)
+        if fn.endswith(".safetensors"):
+            with open(path, "rb") as fh:
+                raw = fh.read(8)
+                (n,) = struct.unpack("<Q", raw)
+                hdr = raw + fh.read(n)
+            if len(hdr) != 8 + n or 8 + n > size:
+                raise ValueError("%s: header of %d bytes does not fit the file (%d bytes)" % (path, 8 + n, size))
+            with open(os.path.join(files_dir, fn + ".hdr"), "wb") as out:
+                out.write(hdr)
+            entries.append({"name": fn, "size": size, "kind": "header", "sha256_header": hashlib.sha256(hdr).hexdigest()})
+        elif size <= SNAPSHOT_COPY_MAX:
+            shutil.copyfile(path, os.path.join(files_dir, fn))
+            entries.append({"name": fn, "size": size, "kind": "copy"})
+        else:
+            entries.append({"name": fn, "size": size, "kind": "zero"})
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump({"schema": _SNAPSHOT_SCHEMA, "name": name, "source": src, "skipped_dirs": skipped_dirs,
+                   "files": entries}, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+    return out_dir
+
+
+def read_snapshot_manifest(snapshot_dir: str) -> Dict[str, Any]:
+    with open(os.path.join(snapshot_dir, "manifest.json"), encoding="utf-8") as fh:
+        m = json.load(fh)
+    if m.get("schema") != _SNAPSHOT_SCHEMA:
+        raise ValueError("%s: not a checkpoint snapshot (schema=%r)" % (snapshot_dir, m.get("schema")))
+    return m
+
+
+def materialize_checkpoint(snapshot_dir: str, dest_parent: str) -> str:
+    """Rebuild ``dest_parent/<name>`` from a :func:`snapshot_checkpoint`: real header bytes, files extended to the real
+    size as SPARSE files (no disk use), copied files verbatim.  Idempotent: the directory is rebuilt from scratch."""
+    m = read_snapshot_manifest(snapshot_dir)
+    dest = os.path.join(dest_parent, m["name"])
+    shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(dest)
+    for e in m["files"]:
+        out = os.path.join(dest, e["name"])
+        if e["kind"] == "copy":
+            shutil.copyfile(os.path.join(snapshot_dir, "files", e["name"]), out)
+        else:
+            with open(out, "wb") as fh:
+                if e["kind"] == "header":
+                    with open(os.path.join(snapshot_dir, "files", e["name"] + ".hdr"), "rb") as hf:
+                        fh.write(hf.read())
+                fh.truncate(int(e["size"]))
+    return dest
+
+
+def ensure_model_dir(path: str, *, siblings: Sequence[str] = (), farm_root: str = DEFAULT_FARM_ROOT,
+                     snapshot: str = "") -> str:
     """The model directory the dry run reads (``config.json``, safetensors headers).
 
     ``path`` itself when it has a ``config.json``.  Otherwise a symlink farm under ``farm_root/<basename(path)>`` (the
     calibration identity is the directory NAME: a registry-named dir whose files point at a sibling checkpoint of the SAME
     config, ``plan_dump.py:46-52``); ``siblings`` are tried in order.  Raises ``FileNotFoundError`` when neither has one --
-    the oracle never invents a model."""
+    the oracle never invents a model.
+
+    ``snapshot`` (a :func:`snapshot_checkpoint` directory of THIS checkpoint, i.e. of the very directory ``path`` names):
+    when ``path`` is empty on this box the stub rebuilt from it is used under ``farm_root/<name>`` BEFORE any sibling --
+    it is the checkpoint's own headers, a sibling is another checkpoint's."""
     if os.path.isfile(os.path.join(path, "config.json")):
         return path
+    if snapshot and os.path.isfile(os.path.join(snapshot, "manifest.json")):
+        if read_snapshot_manifest(snapshot)["name"] != os.path.basename(path.rstrip("/")):
+            raise ValueError("snapshot %s is of %r, not of %r" % (snapshot, read_snapshot_manifest(snapshot)["name"],
+                                                                 os.path.basename(path.rstrip("/"))))
+        return materialize_checkpoint(snapshot, farm_root)
     for sib in siblings:
         if os.path.isfile(os.path.join(sib, "config.json")):
             farm = os.path.join(farm_root, os.path.basename(path.rstrip("/")))
@@ -673,7 +872,8 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
                 instruments: str = "0", extra_args: Sequence[str] = (), tag: str = ORACLE_TAG,
                 scratch: Optional[str] = None, farm_root: str = DEFAULT_FARM_ROOT,
                 siblings: Mapping[str, Sequence[str]] = DEFAULT_MODEL_SIBLINGS,
-                asset_dirs: Sequence[str] = DEFAULT_ASSET_DIRS) -> ProfileRun:
+                asset_dirs: Sequence[str] = DEFAULT_ASSET_DIRS, evidence_dir: Optional[str] = None,
+                snapshots: Optional[Mapping[str, str]] = None) -> ProfileRun:
     """Release profile -> launcher dry run on ``devices``: :func:`profile_launch_input`, the model name farms for model
     dirs that are empty on this box, :func:`run_dry_run`.  The ``plan_dump.py`` recipe as one call.
 
@@ -681,8 +881,10 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
 
     * a profile that names no ``--model`` in PROFILE_ARGS (27b-base) gets ``--model PROFILE_MODEL``; with
       ``--spec-form DFLASH`` and no ``--dflash-draft-path`` also ``--dflash-draft-path PROFILE_DRAFT``;
-    * a model/draft dir without ``config.json`` is replaced by its name farm (:func:`ensure_model_dir`) when
-      ``siblings`` knows a sibling; otherwise it stays and the launcher's own refusal is the result;
+    * a model/draft dir without ``config.json`` is replaced by the stub of its own header ``snapshots`` entry
+      (``{registry dir name: snapshot dir}``, :func:`snapshot_checkpoint`) when there is one, else by its name farm
+      (:func:`ensure_model_dir`) when ``siblings`` knows a sibling; otherwise it stays and the launcher's own refusal is
+      the result;
     * a farm path is not the path the census was measured on: ``--weg2-xchg-census-foreign`` is added when a farm is used
       and the argv names a census (the flag the dual1i profile itself carries)."""
     li = profile_launch_input(env_path, instruments=instruments, tag=tag, asset_dirs=asset_dirs)
@@ -692,13 +894,18 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
     def farm(p: str, what: str) -> str:
         nonlocal farmed
         try:
-            q = ensure_model_dir(p, siblings=siblings.get(os.path.basename(p.rstrip("/")), ()), farm_root=farm_root)
+            bn = os.path.basename(p.rstrip("/"))
+            q = ensure_model_dir(p, siblings=siblings.get(bn, ()), farm_root=farm_root,
+                                 snapshot=(snapshots or {}).get(bn, ""))
         except FileNotFoundError as e:
             notes.append("%s: %s -- kept, the launcher decides" % (what, e))
             return p
         if q != p:
             farmed = True
-            notes.append("%s: %s has no config.json -> name farm %s" % (what, p, q))
+            snap = (snapshots or {}).get(os.path.basename(p.rstrip("/")), "")
+            notes.append("%s: %s has no config.json -> %s %s" % (
+                what, p, "header snapshot stub" if snap and os.path.isfile(os.path.join(snap, "manifest.json"))
+                else "name farm", q))
         return q
 
     argv = list(li.argv)
@@ -722,7 +929,8 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
         pre += ["--weg2-xchg-census-foreign"]
         notes.append("--weg2-xchg-census-foreign added (the census names the registry path, the farm is another path)")
     final = pre + argv + list(extra_args)
-    res = run_dry_run(final, devices, tree=tree, env=li.env, force=force, tag=tag, scratch=scratch, farm_root=farm_root)
+    res = run_dry_run(final, devices, tree=tree, env=li.env, force=force, tag=tag, scratch=scratch, farm_root=farm_root,
+                      evidence_dir=evidence_dir)
     return ProfileRun(res, li, final, notes)
 
 
@@ -753,7 +961,8 @@ def diff_lines(a: str, b: str) -> List[str]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """``python -m sglang.srt.weg2.propose_oracle golden --profile X.env --replay R.json --out D.txt [--tree T] [--force]``:
-    write the golden dump of one profile (the file ``test_planer_referenz_n3_1006`` compares against), or ``parse``
+    write the golden dump of one profile (the file ``test_planer_referenz_n3_1006`` compares against), ``snapshot``
+    the headers of a checkpoint dir (run where the checkpoint exists), ``launch`` a profile's argv/env, or ``parse``
     a dump file to JSON."""
     import argparse
 
@@ -766,6 +975,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     g.add_argument("--tree", default=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")))
     g.add_argument("--force", action="store_true")
     g.add_argument("--instruments", default="0")
+    g.add_argument("--checkpoint-snapshot", action="append", default=[], metavar="DIR",
+                   help="a `snapshot` directory: the stub of that checkpoint stands in for an empty model dir "
+                        "(repeatable; matched by the registry directory name)")
+    sn = sub.add_parser("snapshot", help="record the headers (not the weights) of a checkpoint dir, to be committed")
+    sn.add_argument("--model-dir", required=True)
+    sn.add_argument("--out", required=True)
+    sn.add_argument("--name", default=None, help="registry directory name (default: the model dir's name)")
     lp = sub.add_parser("launch", help="release profile -> {argv, env} JSON (image paths left as they are)")
     lp.add_argument("--profile", required=True)
     lp.add_argument("--out", required=True)
@@ -777,6 +993,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with open(ns.dump, encoding="utf-8") as fh:
             print(json.dumps(parse_plan_dump(fh.read()), indent=1, ensure_ascii=False))
         return 0
+    if ns.cmd == "snapshot":
+        snapshot_checkpoint(ns.model_dir, ns.out, name=ns.name)
+        m = read_snapshot_manifest(ns.out)
+        print("%s: %d files (%d safetensors headers) -> %s" % (
+            m["name"], len(m["files"]), sum(1 for e in m["files"] if e["kind"] == "header"), ns.out))
+        return 0
     if ns.cmd == "launch":
         li = profile_launch_input(ns.profile, instruments=ns.instruments, asset_dirs=())
         with open(ns.out, "w", encoding="utf-8") as fh:
@@ -784,7 +1006,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             fh.write("\n")
         print("%s: argv=%d env=%d -> %s" % (os.path.basename(ns.profile), len(li.argv), len(li.env), ns.out))
         return 0
-    run = run_profile(ns.profile, read_replay(ns.replay), tree=ns.tree, force=ns.force, instruments=ns.instruments)
+    snaps = {read_snapshot_manifest(d)["name"]: d for d in ns.checkpoint_snapshot}
+    run = run_profile(ns.profile, read_replay(ns.replay), tree=ns.tree, force=ns.force, instruments=ns.instruments,
+                      snapshots=snaps)
     with open(ns.out, "w", encoding="utf-8") as fh:
         fh.write(golden_text(run.result))
     for n in run.notes:
