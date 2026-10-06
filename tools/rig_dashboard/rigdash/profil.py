@@ -284,13 +284,14 @@ def _issue_model(model, doc_rows) -> List[str]:
     return L
 
 
-def _issue_cell(row: dict, v) -> str:
-    """Wert einer Zeile für die Tabelle: Schalter ohne Wert = ``an``; fehlt der Wert = ``–``; ein Geheimnis nach Namen = ``<entfernt>``."""
+def _issue_cell(row: dict, v, known) -> str:
+    """Wert einer Zeile für die Tabelle: Schalter ohne Wert = ``an``; fehlt der Wert = ``–``; ein Geheimnis nach Namen = ``<entfernt>``; ein Schlüssel,
+    den der Katalog nicht kennt (``known`` = die Katalognamen), zeigt seinen Wert nie (``redact.HIDDEN_UNKNOWN``)."""
     if v is None:
         return "–"
     if v == "" and row.get("bare"):
         return "an"
-    return _md(redact.value_for_issue(str(row.get("name") or ""), v)) or "(leer)"
+    return _md(redact.value_for_issue(str(row.get("name") or ""), v, known)) or "(leer)"
 
 
 def issue_diff_rows(view: dict) -> dict:
@@ -306,7 +307,7 @@ def issue_diff_rows(view: dict) -> dict:
     return {"rows": sel, "counts": counts}
 
 
-def _issue_proposal(view: dict) -> List[str]:
+def _issue_proposal(view: dict, known) -> List[str]:
     L = ["### Vorschlag und Übersteuerungen", ""]
     d = issue_diff_rows(view)
     c, sel = d["counts"], d["rows"]
@@ -322,8 +323,8 @@ def _issue_proposal(view: dict) -> List[str]:
     if sel:
         L += ["", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
         for r in sel[:ISSUE_MAX_ROWS]:
-            cells = ["`%s`" % _md(r.get("key") or r.get("name")), _issue_cell(r, r.get("value")), _issue_cell(r, r.get("profile_value")),
-                     _issue_cell(r, r.get("planner_value")), _md(r.get("origin_label") or r.get("origin"))]
+            cells = ["`%s`" % _md(r.get("key") or r.get("name")), _issue_cell(r, r.get("value"), known), _issue_cell(r, r.get("profile_value"), known),
+                     _issue_cell(r, r.get("planner_value"), known), _md(r.get("origin_label") or r.get("origin"))]
             for k in extra:
                 v = r.get(k)
                 cells.append(_md((v.get("code") or v.get("text")) if isinstance(v, dict) else v) or "–")
@@ -336,7 +337,7 @@ def _issue_proposal(view: dict) -> List[str]:
     if removed:
         L += ["", "Gegenüber dem geladenen Profil entfernt: " + ", ".join("`%s`" % _md(x.get("key"), 80) for x in removed[:40]) + ("" if len(removed) <= 40 else " …")]
     if only:
-        L += ["", "Vorschlag ohne Zeile im Profil: " + ", ".join("`%s` = %s" % (_md(x.get("key"), 80), _md(redact.value_for_issue(str(x.get("key")), x.get("value")), 80) or "(leer, Schalter an)")
+        L += ["", "Vorschlag ohne Zeile im Profil: " + ", ".join("`%s` = %s" % (_md(x.get("key"), 80), _md(redact.value_for_issue(str(x.get("key")), x.get("value"), known), 80) or "(leer, Schalter an)")
                                                               for x in only[:40]) + ("" if len(only) <= 40 else " …")]
     return L
 
@@ -738,7 +739,8 @@ class ProfilEditor:
         line = str(doc.get("line") or "")
         labels, src = _issue_cards(dry, cards)
         form = issue_betriebsform([r["name"] for r in view["rows"]], len(labels) or None)
-        by_name = {r["name"]: r.get("value") for r in view["rows"] if r["kind"] == "var"}
+        known = frozenset(self.catalog()["entries"])
+        by_name = {r["name"]: redact.value_for_issue(r["name"], r.get("value"), known) for r in view["rows"] if r["kind"] == "var"}
         meta = doc.get("meta") or {}
         based = meta.get("based_on") or {}
         L: List[str] = ["## Laufbericht (Profil-Editor): `%s`" % name, "",
@@ -756,7 +758,7 @@ class ProfilEditor:
               "| Karten (%s) | %d: %s |" % (src, len(labels), _md(", ".join(labels) or "keine", 400)),
               "| Kartenzahl laut Profil | %s |" % _md(by_name.get("PROFILE_CARD_COUNT") or "unbelegt"),
               "| Inventar laut Profil | %s |" % _md(by_name.get("PROFILE_INVENTORY") or "unbelegt")]
-        L += [""] + _issue_proposal(view)
+        L += [""] + _issue_proposal(view, known)
         L += [""] + _issue_verdicts(dry, reg, line)
         pid = str(doc.get("id") or "")
         sha = str(based.get("sha256") or "")

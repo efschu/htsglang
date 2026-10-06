@@ -11,6 +11,7 @@ whole group environment.
 
 from __future__ import annotations
 
+import posixpath
 import re
 
 # a line matching this is dropped whole
@@ -43,29 +44,69 @@ def guard(body: str) -> str:
 
 # an absolute path into the host (or the container) filesystem: nothing about the box's layout leaves in a pasted issue
 _HOSTPATH = re.compile(r"(?<![\w.:/-])/(?:home|root|spinning|opt|var|usr|tmp|mnt|srv|etc|data|run|media|nix|proc|sys|dev)(?:/[^\s|`,;)\]\"'<>]*)*")
+_SYSROOTS = ("home", "root", "spinning", "opt", "var", "usr", "tmp", "mnt", "srv", "etc", "data", "run", "media", "nix", "proc", "sys", "dev")
 
 
 # Every OTHER absolute path (``/nvme/hf``, ``/workspace/models/X``, ``/scratch``) and every ``~/`` / ``$HOME/`` path is a host path too: the Laufbericht
-# shows no path outside the container.  Exempt: the mount points the image itself owns (``CONTAINER_MOUNTS``, ``/app`` = the baked tree).  Everything
-# else shrinks to ``<hostpfad>/<last segment>``; the first pass above keeps its older, stricter ``<Pfad entfernt>`` for the system roots.
-CONTAINER_MOUNTS = ("/app", "/api")                                # ``/api/...`` = a dashboard URL route (the report names them), not a directory
+# shows no path outside the container.  Exempt: the mount points the image itself owns (``CONTAINER_MOUNTS``, ``/app`` = the baked tree,
+# ``/models-cache`` = the model mount of the run example).  Everything else shrinks to ``<hostpfad>/<last segment>``; system roots keep the stricter
+# ``<Pfad entfernt>``.  A path is NORMALISED before it is judged (``/app/../../root/x`` is ``/root/x``), a ``file://`` prefix is stripped, and a quoted
+# path may hold spaces.
+CONTAINER_MOUNTS = ("/app", "/api", "/models-cache")               # ``/api/...`` = a dashboard URL route (the report names them), not a directory
 _PATHTAIL = r"[^\s|`,;)\]\"'<>]*"
 _ANYPATH = re.compile(r"(?<![\w.:/>~<$-])/(?![/\s])" + _PATHTAIL)
 _HOMEPATH = re.compile(r"(?<![\w.:/>~<$-])(?:~|\$\{HOME\}|\$HOME)(?:/" + _PATHTAIL + r")+")
+# ``file:///nvme/x`` / ``file://host/x`` / ``file:/x``: the scheme (and an authority) is dropped, the path behind it is judged like any other
+_FILEURL = re.compile(r"(?i)\bfile:(?://[^/\s]*)?(?=/)")
+# a quoted path may hold spaces: ``"/nvme/my models/Qwen"`` (the quote has to open at the path's first character)
+_QUOTEDPATH = re.compile(r"([\"'`])((?:/|~/|\$HOME/|\$\{HOME\}/)[^\"'`\n]*)\1")
+
+
+def _normal(p: str) -> str:
+    """``p`` with ``.`` / ``..`` / ``//`` folded away (``posixpath.normpath``); ``~`` / ``$HOME`` roots stay as they are."""
+    if "/." not in p and "//" not in p:
+        return p
+    head = ""
+    for h in ("${HOME}", "$HOME", "~"):
+        if p.startswith(h + "/"):
+            head, p = h, p[len(h):]
+            break
+    q = posixpath.normpath(p) if p else p
+    if q.startswith("//"):
+        q = "/" + q.lstrip("/")
+    return head + ("" if (head and q == "/") else q)
+
+
+def _is_mount(p: str) -> bool:
+    return any(p == c or p.startswith(c + "/") for c in CONTAINER_MOUNTS)
 
 
 def _shrink(m) -> str:
-    p = m.group(0)
-    if any(p == c or p.startswith(c + "/") for c in CONTAINER_MOUNTS):
+    return _shrink_path(m.group(0))
+
+
+def _shrink_path(p: str) -> str:
+    p = _normal(p)
+    if _is_mount(p):
         return p
+    first = p.lstrip("/").split("/", 1)[0]
+    if p.startswith("/") and first in _SYSROOTS:
+        return "<Pfad entfernt>"
     last = p.rstrip("/").rsplit("/", 1)[-1].strip(".")
     return "<hostpfad>/" + last if last and last not in ("~", "$HOME", "${HOME}") else "<hostpfad>"
 
 
+def _quoted(m) -> str:
+    return m.group(1) + _shrink_path(m.group(2)) + m.group(1)
+
+
 def paths(text: str) -> str:
     """Replace absolute host paths: the system roots (``/root/...``, ``/spinning/...``, ``/var/lib/...``) by ``<Pfad entfernt>``, any other absolute
-    path and any ``~/...`` path by ``<hostpfad>/<last segment>`` (``CONTAINER_MOUNTS``: the image's ``/app`` and the URL routes ``/api/...`` stay)."""
-    text = _HOSTPATH.sub("<Pfad entfernt>", text or "")
+    path and any ``~/...`` path by ``<hostpfad>/<last segment>`` (``CONTAINER_MOUNTS``: the image's ``/app``, ``/models-cache`` and the URL routes
+    ``/api/...`` stay).  ``..`` segments are folded first, ``file://`` is stripped, a quoted path may hold spaces."""
+    text = _FILEURL.sub("", text or "")
+    text = _QUOTEDPATH.sub(_quoted, text)
+    text = _HOSTPATH.sub(_shrink, text)
     return _ANYPATH.sub(_shrink, _HOMEPATH.sub(_shrink, text))
 
 
@@ -95,7 +136,25 @@ def _bare_secret(run: str) -> bool:
     return any(c.isupper() for c in run) and any(c.islower() for c in run) and any(c.isdigit() for c in run)
 
 
+# standard-alphabet base64 (``/`` and ``+`` inside, ``=`` padding at the end: an AWS secret access key, an Azure storage key): >= 30 characters, upper AND
+# lower case AND a digit (a path is no run: a run never STARTS behind ``/``, ``.`` or ``-``, and a lowercase path or a name stays), see ``_b64_secret``.
+_B64RUN = re.compile(r"(?<![A-Za-z0-9+/_.\-])[A-Za-z0-9+/]{30,}={0,2}(?![A-Za-z0-9+/=_\-])")
+# dot-separated tokens WITHOUT an ``eyJ`` header (a Discord bot token ``<id>.<time>.<hmac>``): see ``_dotted_secret`` for what is spared
+_DOTTED = re.compile(r"(?<![A-Za-z0-9_\-.])[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+(?![A-Za-z0-9_\-])")
 _FULLRUN = re.compile(r"[A-Za-z0-9_\-]{32,}\Z")
+
+
+def _b64_secret(run: str) -> bool:
+    body = run.rstrip("=")
+    return (not body.startswith("/") and len(body) >= 30 and _looks_like_secret(body)
+            and any(c.isupper() for c in body) and any(c.islower() for c in body) and any(c.isdigit() for c in body))
+
+
+def _dotted_secret(tok: str) -> bool:
+    """A dot-separated token is a secret when >= 2 of its parts are >= 16 characters long and the whole mixes upper case, lower case and digits (a
+    host name or a file name is lower case or has one long part: ``registry.example-company-internal.com`` / ``Qwen3.6-27B-AWQ.gguf`` stay)."""
+    return (sum(1 for x in tok.split(".") if len(x) >= 16) >= 2 and any(c.isupper() for c in tok) and any(c.islower() for c in tok)
+            and any(c.isdigit() for c in tok))
 
 
 def _looks_like_secret(run: str) -> bool:
@@ -108,11 +167,14 @@ def _looks_like_secret(run: str) -> bool:
 
 
 def shapes(text: str) -> str:
-    """Cut secrets by the form of their value: vendor prefixes, ``Bearer <token>``, ``user:pass@`` in a URL, long token runs after ``=`` / ``:``."""
+    """Cut secrets by the form of their value: vendor prefixes, ``Bearer <token>``, ``user:pass@`` in a URL, JWT, dot-separated tokens, standard
+    base64 (``/`` ``+`` ``=``), long token runs."""
     text = _URLCRED.sub(lambda m: m.group(1) + "<entfernt>@", text or "")
     text = _BEARER.sub("Bearer <entfernt>", text)
     text = _VENDOR.sub("<entfernt>", text)
     text = _JWT.sub("<entfernt>", text)
+    text = _DOTTED.sub(lambda m: "<entfernt>" if _dotted_secret(m.group(0)) else m.group(0), text)
+    text = _B64RUN.sub(lambda m: "<entfernt>" if _b64_secret(m.group(0)) else m.group(0), text)
     text = _LONGRUN.sub(lambda m: m.group(1) + ("<entfernt>" if _looks_like_secret(m.group(2)) else m.group(2)), text)
     return _BARERUN.sub(lambda m: "<entfernt>" if _bare_secret(m.group(0)) else m.group(0), text)
 
@@ -194,14 +256,40 @@ def secret_name(name: str) -> bool:
     return False
 
 
-def value_for_issue(name: str, value) -> str:
-    """The value of a named entry for a pasted issue: ``<entfernt>`` when the name says secret, else the value with secrets and host paths cut."""
-    if secret_name(name):
+#: what a user-set value of a key the catalog does not know becomes (the key name stays visible)
+HIDDEN_UNKNOWN = "<wert ausgeblendet: unbekannter Schluessel>"
+
+
+def bare_key(name) -> str:
+    """The catalog name of a profile key: ``flag:--p-bs`` -> ``--p-bs``, ``env:P:HF_HOME`` -> ``HF_HOME``, ``var:PROFILE_NAME`` -> ``PROFILE_NAME``
+    (a row's ``name`` is already bare); ``extra:P:--x`` -> ``--x``."""
+    n = str(name or "").strip()
+    for pre in ("flag:", "var:"):
+        if n.startswith(pre):
+            return n[len(pre):]
+    for pre in ("env:", "extra:"):
+        if n.startswith(pre):
+            parts = n.split(":", 2)
+            return parts[2] if len(parts) == 3 else n
+    return n
+
+
+def value_for_issue(name: str, value, known=None) -> str:
+    """The value of a named entry for a pasted issue.  STRUCTURAL rule (allow, not block): a value is shown only for a key the catalog knows
+    (``known`` = the catalog's flag / env / variable names) and that is no secret by name; ``<entfernt>`` when the name says secret, ``HIDDEN_UNKNOWN``
+    for every other key a user set (the key itself stays in the table).  ``known=None`` knows nothing, so nothing is shown (closed by default).
+    What is shown still passes the value-shape layer (``text_for_issue``: vendor prefixes, base64, JWT, runs, host paths)."""
+    key = bare_key(name)
+    if secret_name(key):
         return "<entfernt>"
     text = str(value if value is not None else "")
+    if not text.strip():
+        return text
+    if known is None or key not in known:
+        return HIDDEN_UNKNOWN
     bare = text.strip().strip("`\"'")
-    # a whole value that is one long token run is a secret whatever the entry is called (``MY_THING`` = ``Zq8v...``): the ``=`` / ``:`` the shape layer
-    # looks for is not there when the value is cut out of its line and set into a table cell
+    # a whole value that is one long token run is a secret whatever the entry is called: the ``=`` / ``:`` the shape layer looks for is not there
+    # when the value is cut out of its line and set into a table cell
     if _FULLRUN.match(bare) and _looks_like_secret(bare):
         return "<entfernt>"
     return text_for_issue(text)

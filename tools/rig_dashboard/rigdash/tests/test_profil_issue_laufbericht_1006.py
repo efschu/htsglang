@@ -29,6 +29,9 @@ from rigdash import server as S  # noqa: E402
 
 FIXTURE_TREE = os.path.join(HERE, "fixtures", "kartenplan", "planner_tree", "python")
 REPO_CATALOG = os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json")
+with open(REPO_CATALOG, encoding="utf-8") as _f:
+    KNOWN = frozenset(json.load(_f)["entries"])          # die Katalognamen: nur fuer sie zeigt der Laufbericht einen Wert
+HIDDEN = redact.HIDDEN_UNKNOWN
 STATIC = os.path.join(os.path.dirname(HERE), "static")
 NODE = shutil.which("node") or ("/opt/node-v22.14.0-linux-x64/bin/node" if os.path.exists("/opt/node-v22.14.0-linux-x64/bin/node") else None)
 
@@ -230,7 +233,7 @@ class Proposal(Base):
         doc = self.edited([{"key": "flag:--p-bs", "op": "set", "value": "4"}])
         doc["meta"]["planner"]["flag:--p-bs"] = "6"
         doc["meta"]["planner"]["flag:--pp-stage-ratio"] = "29,11,8"           # Vorschlag = Wert: keine Abweichung
-        doc["meta"]["planner"]["flag:--tp-extra"] = "7"                       # Vorschlag ohne Zeile
+        doc["meta"]["planner"]["flag:--d-token-placement"] = "7"                       # Vorschlag ohne Zeile
         t = self.report(doc=doc, dry=None)["text"]
         sec = t.split("### Vorschlag und Übersteuerungen")[1].split("### Verdikte und Force")[0]
         row = next(x for x in sec.split("\n") if x.startswith("| `flag:--p-bs`"))
@@ -238,7 +241,7 @@ class Proposal(Base):
         self.assertNotIn("`flag:--pp-stage-ratio`", sec)                      # unverändert und gleich dem Vorschlag: nicht im Diff
         self.assertNotIn("`flag:--model`", sec)
         self.assertIn("1 gegenüber dem geladenen Profil geändert, 1 als Nutzer gesetzt, 2 mit Planer-Vorschlag, 1 weichen vom Vorschlag ab", sec)
-        self.assertIn("Vorschlag ohne Zeile im Profil: `flag:--tp-extra` = 7", sec)
+        self.assertIn("Vorschlag ohne Zeile im Profil: `flag:--d-token-placement` = 7", sec)
 
     def test_deleted_value_is_listed(self):
         doc = self.edited([{"key": "flag:--p-bs", "op": "delete"}])
@@ -271,13 +274,13 @@ class Proposal(Base):
                           "changed": True, "state": "übersteuert", "verdict": {"code": "FIT", "text": "x"}},
                          {"key": "flag:--x", "name": "--x", "value": "1", "profile_value": "1", "planner_value": None, "origin": "profil", "changed": False}],
                 "removed": [], "planner_only": []}
-        sec = "\n".join(P._issue_proposal(view))
+        sec = "\n".join(P._issue_proposal(view, KNOWN))
         self.assertIn("| Wert | Aktuell | Profil | Vorschlag (Planer) | Herkunft | Zustand | Verdikt |", sec)
         self.assertIn("| `flag:--p-bs` | 4 | 2 | 6 | Nutzer | übersteuert | FIT |", sec)
 
     def test_long_table_is_cut_with_a_note(self):
         rows = [{"key": "flag:--v%d" % i, "name": "--v%d" % i, "value": "1", "profile_value": "0", "planner_value": None, "origin": "nutzer", "changed": True} for i in range(P.ISSUE_MAX_ROWS + 7)]
-        sec = "\n".join(P._issue_proposal({"rows": rows, "removed": [], "planner_only": []}))
+        sec = "\n".join(P._issue_proposal({"rows": rows, "removed": [], "planner_only": []}, KNOWN))
         self.assertIn("… und 7 weitere abweichende Werte (gekürzt).", sec)
         self.assertEqual(sum(1 for x in sec.split("\n") if x.startswith("| `flag:--v")), P.ISSUE_MAX_ROWS)
 
@@ -308,8 +311,8 @@ class Redaction(Base):
         doc = self.edited([{"key": "env:P:HF_TOKEN", "op": "set", "value": SECRET_VALUE},
                            {"key": "flag:--admin-api-key", "op": "set", "value": "adminschluessel987654"},
                            {"key": "flag:--p-bs", "op": "set", "value": "4"},
-                           {"key": "env:D:CACHE_DIR", "op": "set", "value": "/root/.cache/huggingface/hub"},
-                           {"key": "var:PROFILE_OWNER", "op": "set", "value": "matthias token=abcdefgh12345678"}])
+                           {"key": "env:D:SGLANG_CACHE_DIR", "op": "set", "value": "/root/.cache/huggingface/hub"},
+                           {"key": "var:PROFILE_STATUS", "op": "set", "value": "matthias token=abcdefgh12345678"}])
         doc["meta"]["planner"]["env:P:HF_TOKEN"] = "hf_VORSCHLAG1234567"
         return doc
 
@@ -340,7 +343,7 @@ class Redaction(Base):
             self.assertTrue(redact.secret_name(n), n)
         for n in ("SGLANG_LOG_DECODE_GRAPH_KEY", "SGLANG_WEG2_TOLD_PROBE_TREE_KEY", "--ssl-keyfile", "KEYBOARD", "MONKEY"):
             self.assertFalse(redact.secret_name(n), n)
-        self.assertEqual(redact.value_for_issue("--max-total-tokens", "4096"), "4096")
+        self.assertEqual(redact.value_for_issue("--max-total-tokens", "4096", KNOWN), "4096")
         self.assertEqual(redact.value_for_issue("HF_TOKEN", "x"), "<entfernt>")
 
     def test_user_set_vendor_key_envs_never_reach_the_proposal_block(self):
@@ -365,7 +368,7 @@ class Redaction(Base):
             for frag in (v, v.split(":")[-1] if "@" in v else v):
                 self.assertNotIn(frag.split("@")[0] if "@" in frag else frag, t, n)
             row = next(x for x in t.split("\n") if x.startswith("| `env:P:%s`" % n))
-            self.assertIn("<entfernt>", row, n)
+            self.assertTrue("<entfernt>" in row or HIDDEN in row, n)
         self.assertNotIn("hunter2pw", t)
         self.assertNotIn("s3cretpw", t)
         self.assertIn("dbuser:<entfernt>@db.internal", t)                # Nutzer bleibt lesbar, das Passwort ist weg
@@ -405,8 +408,8 @@ class Redaction(Base):
         # Befund 1/2/3: Wert OHNE ``=`` in einer Tabellenzelle, harmloser Name; Env-Wert, Flag-Wert, Vorschlag, Profilwert
         edits = [{"key": "env:P:MY_THING", "op": "set", "value": self.TOK}, {"key": "env:D:OTHER_THING", "op": "set", "value": self.TOK_LOW},
                  {"key": "env:P:JWT_THING", "op": "set", "value": self.JWT},
-                 {"key": "env:P:HF_HOME", "op": "set", "value": "/nvme/hf"}, {"key": "env:D:CACHE_ONE", "op": "set", "value": "~/cache/hf"},
-                 {"key": "env:D:CACHE_TWO", "op": "set", "value": "$HOME/x/y"},
+                 {"key": "env:P:SGLANG_CACHE_DIR", "op": "set", "value": "/nvme/hf"}, {"key": "env:D:SGLANG_DG_CACHE_DIR", "op": "set", "value": "~/cache/hf"},
+                 {"key": "env:D:SGLANG_DEBUG_HOLD_DIR", "op": "set", "value": "$HOME/x/y"},
                  {"key": "flag:--model", "op": "set", "value": "/workspace/models/Qwen"},
                  {"key": "flag:--download-dir", "op": "set", "value": "/scratch/run1"},
                  {"key": "flag:--extra-thing", "op": "set", "value": self.TOK}]
@@ -415,16 +418,16 @@ class Redaction(Base):
         t = self.report(doc=doc, dry=None)["text"]
         self.assert_clean(t, "Tabellen")
         row = next(x for x in t.split("\n") if x.startswith("| `env:P:MY_THING`"))
-        self.assertEqual(row.count("<entfernt>"), 2, row)
-        self.assertIn("<hostpfad>/hf", next(x for x in t.split("\n") if x.startswith("| `env:P:HF_HOME`")))
+        self.assertEqual(row.count(HIDDEN), 2, row)                         # unbekannter Schluessel: Wert ausgeblendet (aktuell und Vorschlag)
+        self.assertIn("<hostpfad>/hf", next(x for x in t.split("\n") if x.startswith("| `env:P:SGLANG_CACHE_DIR`")))
         self.assertIn("<hostpfad>/Qwen", next(x for x in t.split("\n") if "--model" in x and x.startswith("| `flag:")))
         # die Zeile bleibt, nur das Geheimnis ist weg
         self.assertIn("`env:D:OTHER_THING`", t)
         # der Wert ohne Zeilenkontext (so reicht ihn _issue_cell weiter)
-        self.assertEqual(redact.value_for_issue("MY_THING", self.TOK), "<entfernt>")
-        self.assertEqual(redact.value_for_issue("MY_THING", "`%s`" % self.TOK), "<entfernt>")
-        self.assertEqual(redact.value_for_issue("MY_THING", self.TOK_LOW), "<entfernt>")
-        self.assertEqual(redact.value_for_issue("MY_THING", self.JWT), "<entfernt>")
+        for tok in (self.TOK, "`%s`" % self.TOK, self.TOK_LOW, self.JWT):
+            self.assertEqual(redact.value_for_issue("MY_THING", tok, KNOWN), HIDDEN)                       # unbekannter Schluessel
+            self.assertEqual(redact.value_for_issue("SGLANG_CACHE_DIR", tok, KNOWN), "<entfernt>")        # Katalog-Schluessel: die Wertform schneidet
+            self.assertEqual(redact.value_for_issue("MY_THING", tok), HIDDEN)                              # ohne Katalog: geschlossen
 
     def test_probe_in_free_text_notes_verdict_rejection_hardware_model_and_var(self):
         dry = {"ok": False, "verdict": "Planer lehnt ab: %s und %s" % (self.TOK, self.PATHS[0]),
@@ -436,7 +439,7 @@ class Redaction(Base):
         model = json.loads(json.dumps(MODEL))
         model["weights"]["note"] = "%s %s" % (self.TOK, self.PATHS[1])
         model["path"] = "/nvme/models/Qwen3.8-27B"
-        doc = self.edited([{"key": "var:PROFILE_OWNER", "op": "set", "value": "x %s %s %s" % (self.TOK, self.JWT, self.PATHS[0])}])
+        doc = self.edited([{"key": "var:PROFILE_STATUS", "op": "set", "value": "x %s %s %s" % (self.TOK, self.JWT, self.PATHS[0])}])
         vers = dict(VERSIONS, image="reg/x:1 %s /nvme/img" % self.TOK, driver="575 ~/drv")
         t = self.report(doc=doc, dry=dry, hardware_md=hwprofil.issue_short(hw), model=model, versions=vers)["text"]
         self.assert_clean(t, "Freitext")
@@ -495,7 +498,7 @@ class Redaction(Base):
                      ("SGLANG_UNEVEN_TOKEN_VECTOR", "4,5"), ("--fork-anchor-token", "7"), ("SGLANG_WEG2_LANE_COVERAGE_TOKEN", "x"),
                      ("--bucket-time-to-first-token", "0.1"), ("--kt-max-deferred-experts-per-token", "2")):
             self.assertFalse(redact.secret_name(n), n)
-            self.assertEqual(redact.value_for_issue(n, v), v, n)
+            self.assertEqual(redact.value_for_issue(n, v, KNOWN), v, n)
         for n in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN", "--hf-token", "--token", "MY_SERVICE_TOKEN", "HF_TOKEN_FILE", "SGLANG_WEG2_BOOT_TOKEN",
                   "--auth-token", "SLACK_BOT_TOKEN"):
             self.assertTrue(redact.secret_name(n), n)
@@ -510,7 +513,7 @@ class Redaction(Base):
                                 "SGLANG_WEG2_BOOT_TOKEN"])
         for n in names:
             if "token" in n.lower() and n not in hits:           # jeder harmlose Token-Name behaelt seinen Wert
-                self.assertEqual(redact.value_for_issue(n, "7"), "7", n)
+                self.assertEqual(redact.value_for_issue(n, "7", KNOWN), "7", n)
 
     def test_overriding_a_token_flag_shows_its_value_in_the_proposal_block(self):
         doc = self.edited([{"key": "flag:--d-token-placement", "op": "set", "value": "roundrobin"},
@@ -579,6 +582,113 @@ class Redaction(Base):
     def test_rejects_a_foreign_document(self):
         with self.assertRaises(P.ProfilError):
             self.ed.issue_report({"schema": "x"})
+
+
+
+class StructuralAllowRule(Base):
+    """Fix-Runde 5: Werte nur fuer Katalog-Schluessel (und nicht per Name Geheimnis); jeder andere Schluessel des Nutzers zeigt nur seinen Namen.
+    Die Wertmuster bleiben die zweite Schicht (auch fuer Katalog-Schluessel); Pfade werden normalisiert."""
+    AWS = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    AZURE = "PV2c7Y2ccEFykpwliZwJBl1tQ57j/XHICdb03E6gK109O3L0aonSzrcIKLpVrfCeYUAywgtSDET5eXC4+gYlIQ=="
+    DISCORD = ".".join(("MTk4NjIyNDgz" + "NDcxOTI1MjQ4", "Cl2" + "FMQ", "ZnCjm1XVW7vRze" + "4b7Cq4se7kKWs"))      # zusammengesetzt: kein Wortlaut im Quelltext (Push-Schutz)
+    MIXED24 = "Zq8vN3kLp0Wm7Rt2Yx5Bc9Df"                                  # 24 Zeichen, gemischt, kein Anbieter-Praefix
+    PROBES = {"MY_AWS": AWS, "MY_AZURE": AZURE, "MY_DISCORD": DISCORD, "MY_THING": MIXED24}
+
+    def row(self, t, key):
+        return next(x for x in t.split("\n") if x.startswith("| `%s`" % key))
+
+    def test_secrets_under_neutral_names_are_hidden_end_to_end(self):
+        doc = self.edited([{"key": "env:P:" + n, "op": "set", "value": v} for n, v in self.PROBES.items()])
+        for n, v in self.PROBES.items():
+            doc["meta"]["planner"]["env:P:" + n] = v                       # auch der Vorschlag-Wert
+        t = self.report(doc=doc, dry=None)["text"]
+        for n, v in self.PROBES.items():
+            for frag in (v, v[:20], v[-12:]):
+                self.assertNotIn(frag, t, n)
+            row = self.row(t, "env:P:" + n)
+            self.assertEqual(row.count(HIDDEN), 2, row)                    # aktuell und Vorschlag; der Schluesselname bleibt sichtbar
+        self.assertIn("`env:P:MY_THING`", t)
+
+    def test_the_same_secrets_in_free_text_are_cut_by_the_value_shapes(self):
+        dry = {"ok": False, "verdict": "Planer: %s" % self.AWS, "notes": ["Azure %s" % self.AZURE, "Discord: %s" % self.DISCORD, "x=%s" % self.AWS],
+               "rejections": [{"code": "HW-COUNT", "text": "HW-COUNT: key %s und %s" % (self.AZURE, self.DISCORD)}], "cards": []}
+        t = self.report(dry=dry)["text"]
+        for v in (self.AWS, self.AZURE, self.DISCORD):
+            for frag in (v, v[:20], v[-12:]):
+                self.assertNotIn(frag, t, frag)
+        self.assertIn("<entfernt>", t)
+        for form in (self.AWS, self.AZURE, "| a | %s |" % self.AZURE, "k=" + self.AWS, "\"%s\"" % self.AWS):
+            out = redact.text_for_issue(form)
+            self.assertNotIn(self.AWS, out, form)
+            self.assertNotIn(self.AZURE, out, form)
+            self.assertIn("<entfernt>", out, form)
+
+    def test_catalog_keys_with_harmless_values_stay_visible(self):
+        doc = self.edited([{"key": "flag:--p-bs", "op": "set", "value": "4"},
+                           {"key": "env:P:SGLANG_CACHE_DIR", "op": "set", "value": "/models-cache/Qwen3.8-27B/cache"},
+                           {"key": "flag:--d-token-placement", "op": "set", "value": "roundrobin"}])
+        t = self.report(doc=doc, dry=None)["text"]
+        self.assertIn("| `flag:--p-bs` | 4 |", t)
+        self.assertIn("roundrobin", self.row(t, "flag:--d-token-placement"))
+        row = self.row(t, "env:P:SGLANG_CACHE_DIR")
+        self.assertIn("/models-cache/Qwen3.8-27B/cache", row)               # ein Pfad unter dem Mount des Containers ist kein Hostpfad
+        self.assertNotIn(HIDDEN, row)
+        self.assertNotIn("<hostpfad>", row)
+
+    def test_a_catalog_key_with_a_secret_value_is_cut_by_the_second_layer(self):
+        doc = self.edited([{"key": "env:P:SGLANG_CACHE_DIR", "op": "set", "value": self.AWS}, {"key": "env:D:SGLANG_DG_CACHE_DIR", "op": "set", "value": self.DISCORD}])
+        t = self.report(doc=doc, dry=None)["text"]
+        for v in (self.AWS, self.DISCORD):
+            self.assertNotIn(v[:20], t)
+        self.assertIn("<entfernt>", self.row(t, "env:P:SGLANG_CACHE_DIR"))
+        self.assertIn("<entfernt>", self.row(t, "env:D:SGLANG_DG_CACHE_DIR"))
+
+    def test_a_secret_name_in_the_catalog_stays_entfernt_and_unknown_is_not_entfernt(self):
+        doc = self.edited([{"key": "flag:--api-key", "op": "set", "value": "klartext"}, {"key": "env:P:SOME_FREE_NAME", "op": "set", "value": "1"}])
+        t = self.report(doc=doc, dry=None)["text"]
+        self.assertNotIn("klartext", t)
+        self.assertIn("<entfernt>", self.row(t, "flag:--api-key"))
+        self.assertIn(HIDDEN, self.row(t, "env:P:SOME_FREE_NAME"))          # auch ein harmloser Wert: der Schluessel ist unbekannt
+
+    def test_the_rule_in_redact_directly(self):
+        self.assertEqual(redact.value_for_issue("--p-bs", "4", KNOWN), "4")
+        self.assertEqual(redact.value_for_issue("flag:--p-bs", "4", KNOWN), "4")                   # Profilschluessel mit Praefix
+        self.assertEqual(redact.value_for_issue("env:P:SGLANG_CACHE_DIR", "/app/x", KNOWN), "/app/x")
+        self.assertEqual(redact.value_for_issue("env:P:MY_THING", "4", KNOWN), HIDDEN)
+        self.assertEqual(redact.value_for_issue("extra:P:--nicht-im-katalog", "4", KNOWN), HIDDEN)
+        self.assertEqual(redact.value_for_issue("--p-bs", "4"), HIDDEN)                            # ohne Katalog nichts zeigen
+        self.assertEqual(redact.value_for_issue("--p-bs", "4", frozenset()), HIDDEN)
+        self.assertEqual(redact.value_for_issue("MY_THING", "", KNOWN), "")                        # leer ist kein Geheimnis
+        self.assertEqual(redact.value_for_issue("HF_TOKEN", "x", KNOWN), "<entfernt>")
+        self.assertEqual(redact.bare_key("env:D:HF_HOME"), "HF_HOME")
+        self.assertEqual(redact.bare_key("var:PROFILE_NAME"), "PROFILE_NAME")
+
+    def test_new_shapes_spare_names_hashes_and_hosts(self):
+        for keep in ("registry.example-company-internal.com", "Qwen3.6-27B-AWQ-BF16-INT4.gguf", "model-00001-of-00004.safetensors", "ghcr.io/efschu/htsglang:0.1.0-cu130",
+                     "173161c595de23e0aa11bb22cc33dd44ee55ff66", "/models-cache/Qwen3Coder30BA3BInstructX1/abcDEF12345", "ja/nein", "GB/s", "RTX 3080 / 5090",
+                     "python/sglang/srt/weg2/profile_json.py", "https://host.example/a/b/c", "1.2.3.4"):
+            self.assertEqual(redact.text_for_issue(keep), keep, keep)
+        for secret in (self.DISCORD, "x." + self.MIXED24 + ".Cl2" + "FMQ" + "y" * 16, "Ab1+" * 10 + "==", self.AWS):
+            self.assertEqual(redact.text_for_issue(secret), "<entfernt>", secret)
+
+    def test_paths_are_normalised_before_they_are_judged(self):
+        for src, want in (("file:///nvme/private/model", "<hostpfad>/model"), ("--model=file:///nvme/private/model", "--model=<hostpfad>/model"),
+                          ("file://host/data/x", "<Pfad entfernt>"), ("FILE:///scratch/a", "<hostpfad>/a"),
+                          ("/app/../../root/.ssh/id_rsa", "<Pfad entfernt>"), ("/app/../nvme/x", "<hostpfad>/x"), ("/app/../app/x", "/app/x"),
+                          ("/models-cache/../../etc/shadow", "<Pfad entfernt>"), ("/app/x/./y", "/app/x/y"), ("~/../../etc/x", "<hostpfad>/x"),
+                          ("\"/nvme/my models/Qwen\"", "\"<hostpfad>/Qwen\""), ("'/home/al ice/My Documents/k'", "'<Pfad entfernt>'"),
+                          ("`/app/with space/x`", "`/app/with space/x`"), ("/app/x and /nvme/y", "/app/x and <hostpfad>/y")):
+            self.assertEqual(redact.paths(src), want, src)
+            self.assertEqual(redact.paths(redact.paths(src)), want, "zweimal: " + src)
+
+    def test_path_probes_end_to_end(self):
+        edits = {"--model": "file:///nvme/private/model", "--download-dir": "/app/../../root/.ssh/id_rsa", "--served-model-name": "\"/nvme/my models/Qwen\""}
+        doc = self.edited([{"key": "flag:" + k, "op": "set", "value": v} for k, v in edits.items()])
+        t = self.report(doc=doc, dry=None)["text"]
+        for bad in ("nvme", "private", "/root", ".ssh", "id_rsa", "my models", "file://"):
+            self.assertNotIn(bad, t, bad)
+        self.assertIn("<hostpfad>/model", self.row(t, "flag:--model"))
+        self.assertIn("<Pfad entfernt>", self.row(t, "flag:--download-dir"))
 
 
 class Existing(Base):

@@ -116,6 +116,11 @@ NON_LOG_ALLOWED = {
     ("redact.py", "231d7a884f21"): "schneidet ein JWT (eyJ....) aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "39494d8580a4"): "schneidet lange Token-Laeufe ohne = / : davor aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "d02b41e88f24"): "prueft, ob ein ganzer Wert fuer eine Tabellenzelle ein einziger langer Token-Lauf ist; liest keine Logzeile",
+    # AP-I Fix-Runde 5: Base64 (Standardalphabet), Punkt-geteilte Tokens, file://-Praefix und Pfade in Anfuehrungszeichen aus dem Issue-Text schneiden
+    ("redact.py", "17f772307e9c"): "schneidet Base64-Laeufe (AWS-Secret, Azure-Key) aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "64fd5740307d"): "schneidet Punkt-geteilte Token (Discord) aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "7199860700f8"): "streift file:// vor einem Pfad im Issue-Text ab; liest keine Logzeile",
+    ("redact.py", "ecfef1f2b1e9"): "erkennt einen Pfad mit Leerzeichen in Anfuehrungszeichen im Issue-Text; liest keine Logzeile",
 }
 
 
