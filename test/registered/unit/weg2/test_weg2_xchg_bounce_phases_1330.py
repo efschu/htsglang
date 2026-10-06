@@ -506,32 +506,35 @@ def test_the_per_band_claim_cannot_return(tmp_path):
 def test_the_adapter_passes_deposit_on_source_and_collect_on_the_import_hooks():
     """MUTANT: ignore `hook` and pass `both` -- this test dies.
 
-    It drives the REAL adapter body with a recording stand-in for
-    `run_bounce_leg`, so what is asserted is the argument the product actually
-    passes, not a restatement of the intent.
+    It drives the REAL adapter body with a recording stand-in for the lane's
+    transport, so what is asserted is the argument the product actually passes,
+    not a restatement of the intent.
+
+    1533: the transport the adapter calls is `run_sequential_units` since
+    #1378 xsn45 (the sequential unit transport REPLACED `run_bounce_leg` on
+    this leg), and its desk stand-in is a REAL manager with the two seams the
+    leg reads doubled -- the join's per-lane desc list (`_weg2_seq_lane_descs`)
+    and the group/rank identity -- instead of a hand-written stub, which had
+    drifted by eleven attributes (stage charge, lane turns, peer liveness, ...).
     """
+    from unittest import mock
+
     from sglang.srt.managers.scheduler_components import weight_updater as wu
+    from sglang.srt.weg2 import weight_exchange_region as xr
+    from sglang.srt.weg2 import weight_exchange_transport as tp
+    from .test_weg2_xchg_bounce_execution_smoke_1273 import _manager
+    from .test_weg2_xchg_transport_1273 import _fresh_boot
 
     seen = []
-
-    class _Stub:
-        _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
-
-        # #1358: the adapter reads its own identity for the host-slot lines.
-        def _weg2_group_name(self):
-            return "P"
-
-        def _weg2_rank(self):
-            return 0
-
     rendezvous_seen = []
+    nonce = _fresh_boot()
+    xr.create_semaphores(nonce)   # REAL semaphores, as the lane smokes use: the
+    # hand-written `_FakeSems` of this file lacks `trywait` (the drain prime)
 
-    def _fake_leg(descs, ops, nonce, **kw):
-        rv = kw.get("rendezvous")
-        rendezvous_seen.append(rv)
-        seen.append((kw.get("phase"), rv is not None,
-                     [(d.src_rank, d.dst_rank) for d in descs]))
-        return None
+    def _fake_units(descs, ops, nonce, **kw):
+        seen.append((kw.get("phase"), [(d.src_rank, d.dst_rank) for d in descs],
+                     kw.get("pair"), kw.get("card")))
+        return ""
 
     descs = [_d(1, 2), _d(1, 2)]
     object.__setattr__(descs[0], "src_rank", 0)
@@ -539,47 +542,61 @@ def test_the_adapter_passes_deposit_on_source_and_collect_on_the_import_hooks():
     object.__setattr__(descs[1], "src_rank", 1)   # on-card
     object.__setattr__(descs[1], "dst_rank", 1)
 
-    import sglang.srt.weg2.weight_exchange_bounce as real
+    class _RecordingRendezvous(wb.CrossSlotRendezvous):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            rendezvous_seen.append(self)
 
-    orig = real.run_bounce_leg
-    real.run_bounce_leg = _fake_leg
+    Mgr = wu.SchedulerWeightUpdaterManager
+
+    def _lane_descs(self, *, hook, group, rank, pair, card, tag, log=None):
+        # what the join answers for a lane: the cross pair's descriptors, or
+        # the card's diagonal ones (src == dst)
+        return [d for d in descs if (int(d.src_rank) == int(d.dst_rank)) == (pair is None)]
+
     try:
-        for hook, expect in (("source", wb.PHASE_DEPOSIT),
-                             ("destination", wb.PHASE_COLLECT),
-                             ("authoritative", wb.PHASE_COLLECT)):
-            seen.clear()
-            rendezvous_seen.clear()
-            _Stub()._weg2_xchg_bounce_leg(
-                descs=descs, ops=None, boot_nonce=NONCE, slot_bytes=SLOT,
-                depth=1, mode=wx.INJECT_AUTHORITATIVE, hook=hook,
-                region=object(), sems=_FakeSems())
-            phases = {p for p, _rv, _r in seen}
-            # EVERY LEG IS PHASED, DIAGONAL INCLUDED -- and this assertion was
-            # the OPPOSITE one commit ago, which is the finding worth keeping.
-            # The brief said `both` stays "for the diagonal"; the provider
-            # smoke refuted it on the first run: on the SOURCE hook the
-            # diagonal group raised `_missing_pointer: ... has no destination
-            # pointer`, because on-card means ONE CARD and TWO PROCESSES -- the
-            # co-located pair of ranks -- so the peer's pages are as
-            # unreachable there as across a link. `both` has no cross-process
-            # caller at all; it is the single-process form for tests and tools.
-            assert phases == {expect}, (hook, phases)
-            assert wb.PHASE_BOTH not in phases, (
-                "a flip leg may never run `both`: it asks this rank for the "
-                "peer's device address, which is weg2xsn20's wall")
-            # Both kinds carry a handshake; they differ in WHICH one -- the
-            # cross lane's 24 by pair, the diagonal's 12 by card (#1334).
-            assert len(seen) == 2 and all(s[1] for s in seen), seen
-            pairs = {tuple(s[2][0]) for s in seen}
-            assert pairs == {(0, 1), (1, 1)}, seen
-            kinds = {type(rv).__name__ for rv in rendezvous_seen}
-            assert kinds == {"CrossSlotRendezvous"}, kinds
-            # ONE class, two keyings: the cross pair by pair index, the
-            # diagonal by CARD (#1334). Slice 3 had a second class for the
-            # diagonal whose byte check could not go red; it is gone.
-            assert {(rv.pair is None) for rv in rendezvous_seen} == {True, False}
+        with mock.patch.object(wb, "run_sequential_units", _fake_units), \
+                mock.patch.object(wb, "CrossSlotRendezvous", _RecordingRendezvous), \
+                mock.patch.object(Mgr, "_weg2_seq_lane_descs", _lane_descs), \
+                mock.patch.object(Mgr, "_weg2_group_name", lambda self: "P"), \
+                mock.patch.object(Mgr, "_weg2_rank", lambda self: 0):
+            for hook, expect in (("source", wb.PHASE_DEPOSIT),
+                                 ("destination", wb.PHASE_COLLECT),
+                                 ("authoritative", wb.PHASE_COLLECT)):
+                seen.clear()
+                rendezvous_seen.clear()
+                _manager()._weg2_xchg_bounce_leg(
+                    descs=descs, ops=None, boot_nonce=NONCE, slot_bytes=SLOT,
+                    depth=1, mode=wx.INJECT_AUTHORITATIVE, hook=hook,
+                    region=object(), sems=tp.SemSet(nonce), tag=TAG)
+                phases = {ph for ph, _r, _p, _c in seen}
+                # EVERY LEG IS PHASED, DIAGONAL INCLUDED -- and this assertion was
+                # the OPPOSITE one commit ago, which is the finding worth keeping.
+                # The brief said `both` stays "for the diagonal"; the provider
+                # smoke refuted it on the first run: on the SOURCE hook the
+                # diagonal group raised `_missing_pointer: ... has no destination
+                # pointer`, because on-card means ONE CARD and TWO PROCESSES -- the
+                # co-located pair of ranks -- so the peer's pages are as
+                # unreachable there as across a link. `both` has no cross-process
+                # caller at all; it is the single-process form for tests and tools.
+                assert phases == {expect}, (hook, phases)
+                assert wb.PHASE_BOTH not in phases, (
+                    "a flip leg may never run `both`: it asks this rank for the "
+                    "peer's device address, which is weg2xsn20's wall")
+                # Both kinds carry a handshake; they differ in WHICH one -- the
+                # cross lane's 24 by pair, the diagonal's 12 by card (#1334).
+                assert len(seen) == 2 and len(rendezvous_seen) == 2, (seen, rendezvous_seen)
+                pairs = {tuple(s[1][0]) for s in seen}
+                assert pairs == {(0, 1), (1, 1)}, seen
+                # ONE class, two keyings: the cross pair by pair index, the
+                # diagonal by CARD (#1334). Slice 3 had a second class for the
+                # diagonal whose byte check could not go red; it is gone.
+                assert {(rv.pair is None) for rv in rendezvous_seen} == {True, False}
+                # ... and the transport is told the same keying: pair for the cross
+                # lane, card for the diagonal (never both).
+                assert {(p is None, c is None) for _ph, _r, p, c in seen} == {(False, True), (True, False)}, seen
     finally:
-        real.run_bounce_leg = orig
+        xr.unlink_semaphores(nonce)
 
 
 def test_without_a_handshake_a_cross_leg_is_refused_never_downgraded(tmp_path):
@@ -1029,7 +1046,13 @@ def test_no_second_expression_for_the_shadow_slot_1330():
 
     root = pathlib.Path(xb.__file__).resolve().parent
     owners = []
-    for path in sorted(root.glob("*.py")):
+    # 1533: the idiom is the bounce lane's slot pricing, so the sweep is the lane
+    # family (xchg_*, weight_exchange*).  A repo-wide sweep of weg2/ also finds
+    # park_l3.py:164 (``int(seq) + (1 if dormant else 0)``, a wake counter) --
+    # the same SHAPE of expression, nothing to do with a slot.
+    lane_files = sorted(set(root.glob("xchg_*.py")) | set(root.glob("weight_exchange*.py")))
+    assert pathlib.Path(xb.__file__).resolve() in lane_files, "the sweep lost its own subject"
+    for path in lane_files:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not (isinstance(node, ast.BinOp)

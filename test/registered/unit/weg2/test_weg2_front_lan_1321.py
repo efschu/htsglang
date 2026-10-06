@@ -21,6 +21,8 @@ def _ns(**kw):
         drain_deadline_s=90.0,
         min_dwell_ms=None,
         d_admit_max_tokens=None,
+        # 1533: front_argv_for reads --weg-weight-form since #1444 (16.09.)
+        weg2_weight_source=L.WEIGHT_SOURCE_DEFAULT,
     )
     base.update(kw)
     return SimpleNamespace(**base)

@@ -123,6 +123,23 @@ class TestRiegelDerived(CustomTestCase):
 
 NF_MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist"
 
+# 1539 06b: that models-cache directory is EMPTY on this box, so the test below
+# that reads its config.json was silently SKIPPED (hidden class b). The overlay
+# serves reads below an empty one from the in-tree copy (fixtures/profil_s3_1003
+# config.json, byte-identical to the real one); a restored directory wins.
+import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _models_cache_overlay_1539():
+    with MODEL_FX.overlay():
+        yield
+
+
+with MODEL_FX.overlay():  # the skipUnless below is evaluated at import
+    _NF_CHECKPOINT_PRESENT = os.path.exists(os.path.join(NF_MODEL, "config.json"))
+
 
 class TestArenaOneSource(CustomTestCase):
     def test_ranks_and_ledger_share_the_slot_rule(self):
@@ -155,7 +172,7 @@ class TestArenaOneSource(CustomTestCase):
 
         self.assertIn("arena_gib_into_groups(ns, _ledger_group_envs, _arena_new)", inspect.getsource(launcher))
 
-    @unittest.skipUnless(os.path.exists(os.path.join(NF_MODEL, "config.json")), "NF checkpoint absent")
+    @unittest.skipUnless(_NF_CHECKPOINT_PRESENT, "NF checkpoint absent")
     def test_arena8_group_env_prices_8_not_22(self):
         env = {"SGLANG_HICACHE_ARENA_GIB": "8", "SGLANG_HICACHE_ARENA_MAMBA_SLOTS": "32"}
         t8 = launcher._weg2_arena_ledger_terms(NF_MODEL, [dict(env), dict(env)])
@@ -167,8 +184,19 @@ class TestArenaOneSource(CustomTestCase):
         self.assertLess(t22["arena_gib"] - t8["arena_gib"], 14.0 * 1.25)
 
 
-R27B = "/spinning/docker-acceptance/27b/evidence/weg2_measured_record.json"
-CENSUS27B = "/spinning/docker-acceptance/27b/evidence/host_census_record.json"
+# 1539 06b: FROZEN evidence, not the live 27B tree. The measured record is
+# append-only (this boot's samples are kept verbatim, copied by boot_tag). The
+# census is NOT a copy: the live host_census_record.json has been rewritten by
+# the 05.10./06.10. boots (first entry: nonrank_anon 7.67, arena_handoff 0.22,
+# unbooked_shm 2.38 -> the replay reads 63.74 against the 63.29 bound), and no
+# snapshot of the 29.09. 13:37:58Z record survives; the census the replay
+# docstring names is therefore rebuilt from the values this test file documents
+# for that record (fixtures/host_ledger_evidence_1539/27b_z30y_0929/PROVENANCE.json,
+# key "open": swap in a real snapshot if one turns up).
+_EV27B = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
+                      "host_ledger_evidence_1539", "27b_z30y_0929")
+R27B = os.path.join(_EV27B, "weg2_measured_record.json")
+CENSUS27B = os.path.join(_EV27B, "census_terms_0929_1337.json")
 # [M] mem_rowauthorityz30ybar1fs.csv, boot 09291331: max(cg_current - file) =
 # 62.29 GiB at 13:36:49Z. The mem_<profile>.csv is rewritten by the next boot
 # of the same profile (z30x2's was, 15:34Z), so the reading is pinned here.
@@ -229,10 +257,8 @@ class TestCensusCountsOnce(CustomTestCase):
         (13:36:43 -> :49 +0.23). Red on 1b8d1f25fd (75.8: the 15.75 bounce
         region that no rank maps -- census xchg 0.0006 -- beside the census
         posts that measure the bytes it was a stand-in for)."""
-        from sglang.srt.weg2 import host_census
-
-        entry = next(iter(json.load(open(CENSUS27B)).values()))
-        census = host_census.ledger_terms(entry)
+        with open(CENSUS27B) as fh:
+            census = json.load(fh)  # host_census.ledger_terms() shape, see the note at R27B
         images = host_ledger.ImageTerms(0.0, 0.0, "t", "t", True, True, 0.0, 0.0)
         t = host_ledger.charge_terms(1, 600, 3, images, s_gb_d=4, staging_gb=0.0494, anchor_mib=101,
                                      xchg_bounce_host_bytes=int(15.75 * GIB),

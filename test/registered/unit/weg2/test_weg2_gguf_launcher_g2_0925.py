@@ -42,6 +42,20 @@ from sglang.srt.weg2 import host_ledger as HL  # noqa: E402
 from sglang.srt.weg2 import launcher as L  # noqa: E402
 from sglang.srt.weg2 import ring_table as RT  # noqa: E402
 
+# 1539 06b: the models-cache directory(ies) this file names are EMPTY on this box
+# (1517: class b). model_dir_fixtures_1539.overlay() serves READS below an empty
+# one from the in-tree copy of its config.json / safetensors headers (byte-checked
+# against the real shards, fixtures/model_dirs_1539); every path string in this
+# file stays the real one, and a restored directory is never overlaid.
+import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _models_cache_overlay_1539():
+    with MODEL_FX.overlay():
+        yield
+
+
 N_LAYERS = 64
 REAL_DIR = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-GGUF-unsloth"
 REAL_IQ4 = os.path.join(REAL_DIR, "Qwen3.8-27B-UD-IQ4_XS.gguf")
@@ -244,6 +258,13 @@ def test_no_reader_joins_config_json_onto_the_model_path():
         ("model_config_path", "str(model)"),
         ("_config_path", "model_path"),
         ("_weg2_arena_ledger_terms", "_dp"),
+        # 1533 (H95, 26.09., after this test's date): the INFORMATIONAL seat table
+        # joins config.json onto ns.model itself.  For a GGUF file that is a
+        # NotADirectoryError, which the function's own handler turns into the
+        # "Tabelle entfaellt" info line (the boot is priced by the solve above,
+        # not by this table) -- pinned by ``test_the_seat_table_reader_cannot_...``
+        # below, so the exception is a documented, guarded one and not a hole.
+        ("d_seat_table_lines", "ns.model"),
     }
     for mod in (L, HL, RT):
         tree = ast.parse(inspect.getsource(mod))
@@ -254,6 +275,32 @@ def test_no_reader_joins_config_json_onto_the_model_path():
         }
         assert found <= allowed, (mod.__name__, sorted(found - allowed))
     assert "model_config_path(model)" in inspect.getsource(L.solve_p_cut)
+
+
+def test_the_seat_table_reader_cannot_kill_a_launch_on_a_gguf_path():
+    """The one allowed exception above is only allowed because it is guarded:
+    the join sits in the body of a ``try`` whose broad handler RETURNS the
+    info line, and the only exception let through is the operator's named A/B
+    refusal.  Remove the guard (or let the handler raise) and this goes red --
+    then ``d_seat_table_lines`` must take ``model_config_path`` like the rest."""
+    tree = ast.parse(inspect.getsource(L))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "d_seat_table_lines")
+    guarded = None
+    for tr in (n for n in ast.walk(fn) if isinstance(n, ast.Try)):
+        for node in ast.walk(ast.Module(body=tr.body, type_ignores=[])):
+            if (isinstance(node, ast.Call) and ast.unparse(node.func) == "os.path.join"
+                    and len(node.args) == 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value == "config.json"):
+                guarded = tr
+    assert guarded is not None, "the config.json join is no longer inside a try"
+    broad = [h for h in guarded.handlers
+             if h.type is not None and ast.unparse(h.type) == "Exception"]
+    assert len(broad) == 1 and isinstance(broad[0].body[-1], ast.Return), (
+        "the broad handler must RETURN the info line, never re-raise")
+    narrow = [ast.unparse(h.type) for h in guarded.handlers if h is not broad[0]]
+    assert narrow == ["Weg2DKvStageMaxRefused"], narrow
 
 
 def test_the_tied_head_flag_of_a_gguf(tmp_path):

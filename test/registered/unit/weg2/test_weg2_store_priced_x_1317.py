@@ -151,11 +151,20 @@ def test_x_is_floored_at_the_chunk_size_on_every_path():
         "the override path no longer floors X"
     )
     # and the only call site still passes the chunk size as that floor
+    # 1533: the call grew keyword arguments (``accept=calib_log_accept_of(ns)``,
+    # the override reads ``ns.tp_prefill_max_tokens or None``), so the pin is the
+    # three POSITIONAL arguments that carry the floor, not the whole call text --
+    # and it is still the ONLY call site.
+    import re
+
     main_src = inspect.getsource(launcher)
-    assert (
-        "resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)"
-        in main_src
-    )
+    calls = re.findall(r"(?<![\w.])resolve_x\(([^)]*(?:\([^)]*\)[^)]*)*)\)", main_src)
+    calls = [c for c in calls if not c.lstrip().startswith("override")]
+    assert len(calls) == 1, f"resolve_x must keep ONE call site, found {calls}"
+    assert re.match(
+        r"\s*ns\.tp_prefill_max_tokens(?: or None)?,\s*EVIDENCE_DIR,\s*CHUNKED_PREFILL_TOKENS\s*[,)]?",
+        calls[0] + ")",
+    ), f"the call site no longer passes the chunk size as the floor: {calls[0]!r}"
     assert launcher.CHUNKED_PREFILL_TOKENS == 4096
 
 

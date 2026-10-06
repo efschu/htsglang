@@ -114,7 +114,23 @@ def test_the_adapter_takes_require_agreement_explicitly():
     assert "require_agreement" in sig.parameters, (
         "the adapter must take the narrowing decision from its caller"
     )
-    node = _func_ast("_weg2_shadow_plan")
+    # 1533: since 15.09. (weg2xsn94) `_weg2_shadow_plan` is a per-leg cache that
+    # FORWARDS to `_weg2_shadow_plan_uncached`, where the one derivation sits.
+    # The invariant is on the pair: the wrapper passes `require_agreement` on as
+    # its parameter at every forwarding call (and never decides it), the impl
+    # hands it to the library the same way.
+    wrapper = _func_ast("_weg2_shadow_plan")
+    forwards = _calls_to(wrapper, "_impl")
+    assert len(forwards) == 2, f"expected the two forwarding calls, got {len(forwards)}"
+    for fwd in forwards:
+        kw = _keyword_of_call(fwd, "require_agreement")
+        assert kw is not None and not isinstance(kw.value, ast.Constant), (
+            "the cache wrapper must forward require_agreement, never fix it")
+    assert not _calls_to(wrapper, "derive_leg_plan")
+    node = _func_ast("_weg2_shadow_plan_uncached")
+    sig_u = inspect.signature(
+        wu.SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached)
+    assert "require_agreement" in sig_u.parameters
     calls = _calls_to(node, "derive_leg_plan")
     assert len(calls) == 1, f"expected ONE derive_leg_plan call, got {len(calls)}"
     kw = _keyword_of_call(calls[0], "require_agreement")

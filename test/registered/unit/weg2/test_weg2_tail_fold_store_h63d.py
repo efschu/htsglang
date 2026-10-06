@@ -172,6 +172,11 @@ class _Tree:
     # runs the cap after the #1481 mark; this insert anchors nothing, so the
     # real method caps nothing.
     _weg2_cap_after_insert = _U._weg2_cap_after_insert
+    # 1533: PARK-END-ANCHOR-FIRST (e33931cf96, 04.10.) runs after the handoff
+    # write.  A finish that is no park_running retraction carries no
+    # PARK_REQ_ATTR, so the REAL method returns at its first line -- the fold's
+    # finish under test is exactly that case.
+    _weg2_mark_park_end = _U._weg2_mark_park_end
     disable = False
     is_eagle = True  # NF: MTP, bigram keys
     bigram_anchor_exact = True  # bigram keys + a recurrent component
@@ -394,6 +399,10 @@ class _P0:
 
     flush_cache = _S.flush_cache
     _weg2_join_store_writes_before_reset = getattr(_S, "_weg2_join_store_writes_before_reset", None)
+    # 1533: the flush notes the Mamba anchors the reset drops (ANCHOR-LOST,
+    # 28.09.).  The real method asks the tree for ``weg2_unbacked_anchors``;
+    # the fold's tree has none, so it returns at once.
+    _weg2_note_lost_anchors = _S._weg2_note_lost_anchors
     enable_hierarchical_cache = True
     chunked_req = None
     anchor_tails = None

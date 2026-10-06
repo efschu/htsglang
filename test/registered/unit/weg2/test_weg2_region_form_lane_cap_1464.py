@@ -61,6 +61,14 @@ class Test1464bPriceLaneCap(unittest.TestCase):
             seen.update(kw)
             return _terms(n_lanes=int(kw["n_lanes"]), price_lane_cap=int(kw["price_lane_cap"])), "widest", "w"
 
+        # 1533: the call site now asks `xchg_max_tag_bytes(model_dir)` for the
+        # largest tag first, which refuses (W14) until `main` has published the
+        # weight-chunk length and then reads the checkpoint's headers.  Neither
+        # is this test's subject (the cap reaching the census), so that one
+        # question is answered by a stand-in; its own refusal is pinned where
+        # `publish_weight_chunk_layers` is.
+        orig_tag = launcher.xchg_max_tag_bytes
+        launcher.xchg_max_tag_bytes = lambda model_dir: 0
         checkpoint_census.widest_layer_terms = fake
         try:
             nbytes, lines = launcher.xchg_bounce_terms_for_arm(
@@ -68,6 +76,7 @@ class Test1464bPriceLaneCap(unittest.TestCase):
                 price_lane_cap=5)
         finally:
             checkpoint_census.widest_layer_terms = orig
+            launcher.xchg_max_tag_bytes = orig_tag
         self.assertEqual((seen["n_lanes"], seen["price_lane_cap"]), (9, 5))
         self.assertEqual(nbytes, _terms(n_lanes=5).total_bytes)
 

@@ -40,6 +40,20 @@ import torch
 import sglang.srt.weg2.launcher as L
 from sglang.srt.mem_cache import hicache_storage as hs
 
+# 1539 06b: the models-cache directory(ies) this file names are EMPTY on this box
+# (1517: class b). model_dir_fixtures_1539.overlay() serves READS below an empty
+# one from the in-tree copy of its config.json / safetensors headers (byte-checked
+# against the real shards, fixtures/model_dirs_1539); every path string in this
+# file stays the real one, and a restored directory is never overlaid.
+import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _models_cache_overlay_1539():
+    with MODEL_FX.overlay():
+        yield
+
+
 ENV = "SGLANG_WEG2_HICACHE_DRAFT_TIER"
 
 
@@ -153,7 +167,13 @@ def test_build_env_hands_the_resolved_value_to_both_groups():
     assert src.index("env.pop(HICACHE_DRAFT_TIER_ENV, None)") < src.index(
         "env.update(hicache_draft_tier_env())")
     # build_env has no group branch around it: P and D get the same value
-    assert "group" not in src.split("env.pop(HICACHE_DRAFT_TIER_ENV, None)")[1].split("return env")[0]
+    # 1533: judge the CODE after the pop, not the comments around it (the
+    # 04.10. comment "the same on BOTH groups" is prose, not a group branch)
+    code = "\n".join(
+        ln.split("#", 1)[0]
+        for ln in src.split("env.pop(HICACHE_DRAFT_TIER_ENV, None)")[1].split("return env")[0].splitlines()
+    )
+    assert "group" not in code
 
 
 def test_main_resolves_the_producer_and_names_the_tier():
@@ -304,6 +324,10 @@ class _Store:
     _arena_dir = hs.HiCacheFile._arena_dir
     _arena_for = hs.HiCacheFile._arena_for
     _draft_arena_refused = hs.HiCacheFile._draft_arena_refused
+    # 1533: a created arena starts the L3 write-behind (L3-REUSE 0928).  The
+    # product answers a scaffold that never ran __init__ (no ``_l3wb_armed``)
+    # with False, which is exactly what this stand-in is.
+    _l3_write_behind_start = hs.HiCacheFile._l3_write_behind_start
 
     def __init__(self):
         self._canonical_kv_extents = SimpleNamespace(total_bytes=128)

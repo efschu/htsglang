@@ -169,6 +169,25 @@ def _call_lines(tree: ast.AST, name: str) -> list[int]:
             if isinstance(n, ast.Call) and _callee_name(n) == name]
 
 
+def _reachable_call_lines(tree: ast.AST, name: str) -> list[int]:
+    """Call lines of `name` in `tree`, where a call inside a function DEFINED
+    in `main()` also counts at every line that function is called from.
+
+    1533: `d_tp_ratio_decision` is no longer called from a textual spot after
+    the dry return; it sits in main()'s local `_d_spec_from(...)`, which the
+    real path calls after the spawn (group D's spec).  A purely lexical test
+    cannot see that, and "reachable after the dry return" is a statement about
+    CALLS, not about where the text of a helper's body sits."""
+    out = list(_call_lines(tree, name))
+    fn = tree.body[0]
+    for node in ast.walk(fn):
+        if node is fn or not isinstance(node, ast.FunctionDef):
+            continue
+        if _call_lines(node, name):
+            out.extend(_call_lines(fn, node.name))
+    return sorted(set(out))
+
+
 def _main_tree_and_offset():
     return _fn_ast_with_offset(L.main)
 
@@ -346,8 +365,21 @@ class TestNoLocalSwallowing(CustomTestCase):
         spawn = _spawn_marker_line()
         pre = [r for r in raises if r[0] < spawn]
         post = [r for r in raises if r[0] >= spawn]
-        self.assertEqual(len(pre), 4, f"pre-spawn inline raises: {pre}")
-        self.assertEqual(len(post), 5, f"post-spawn inline raises: {post}")
+        # 1533: the counts moved with main() (it grew from ~1.7k to ~2.5k lines
+        # of the unify merges): 4/5 -> 7/3.  Pre-spawn raises need no teardown
+        # (nothing runs yet); the post-spawn ones are the funnel's subject, and
+        # there are FEWER of them than at the pin's date.  What makes the new
+        # counts safe to pin, and not just a re-count, is the next assertion:
+        # no refusal main() raises sits in the body of a try block, so none can
+        # be caught before it reaches `cli()`.
+        self.assertEqual(len(pre), 7, f"pre-spawn inline raises: {pre}")
+        self.assertEqual(len(post), 3, f"post-spawn inline raises: {post}")
+        try_spans = [(t.lineno + offset, t.body[-1].end_lineno + offset)
+                     for t in ast.walk(tree) if isinstance(t, ast.Try)]
+        inside = [r for r in raises
+                  if any(a <= r[0] <= b for a, b in try_spans)]
+        self.assertEqual(inside, [],
+                         f"a refusal raised in a try body could be swallowed: {inside}")
 
     def test_the_named_helper_set_is_reachable_after_the_dry_return(self):
         """Every helper in NAMED_POST_SPAWN_HELPERS must actually be called
@@ -359,7 +391,7 @@ class TestNoLocalSwallowing(CustomTestCase):
         tree, offset = _main_tree_and_offset()
         dry_ret = _dry_return_line()
         for name in NAMED_POST_SPAWN_HELPERS:
-            calls = [ln + offset for ln in _call_lines(tree, name)]
+            calls = [ln + offset for ln in _reachable_call_lines(tree, name)]
             self.assertTrue(
                 any(c > dry_ret for c in calls),
                 f"{name} is never called after the dry-return line {dry_ret}: {calls}",

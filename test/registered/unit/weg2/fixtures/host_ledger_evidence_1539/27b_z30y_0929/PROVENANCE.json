@@ -1,0 +1,16 @@
+{
+ "census_terms_0929_1337.json": {
+  "fixture_sha256": "e0fc5c807e20bdd1c2b93baf4ad4c8345eeb2230ba005eef228edd4d7318f0df",
+  "open": "if a real 29.09. snapshot of the 27B census record turns up, replace this file with host_census.ledger_terms() of its first entry and re-run; the bracket [62.29, 63.29] must hold.",
+  "source": "NOT A COPY. The 27B census record of 29.09. 13:37:58Z no longer exists: the live /spinning/docker-acceptance/27b/evidence/host_census_record.json holds only the boots of 05.10.-06.10. (key Qwen3.8-27B-INT8-gdncov-vocabembed, window 5 boots) and no earlier snapshot of the 27B record was found (searched /spinning/gpu-arb/docs, tools/creep, evidence/records). The eight values are the ones the test files themselves document for that record: nonrank_anon 7.20, seq_ring 3.00, arena_sidecar 0.0, arena_handoff 0.0 (test_weg2_host_ledger_store_once_riegel_0929.py CENSUS_27B, 'record 13:37:58Z'); arena_measured 31.41, other_tmpfs 0.89, unbooked_shm 1.49 (same file, test_measured_shm_posts_count_once, the 'arena file 31.41' of the replay docstring); xchg_measured 0.0006 (replay docstring: 'census xchg 0.0006'). Shape = host_census.ledger_terms() output (the test used to pass the live entry through it)."
+ },
+ "weg2_measured_record.json": {
+  "fixture_sha256": "bc4188dbe18ea1a63ff6ddd4b0afa92341c6fd00e74e0d03360e8845e4861748",
+  "kept": 11,
+  "kept_rule": "boot_tag == dkr27browauthorityz30ybar1fs09291331",
+  "note": "append-only live sidecar; the test reads it with boot_tag=<TAG>, so only that boot's samples count",
+  "source": "/spinning/docker-acceptance/27b/evidence/weg2_measured_record.json",
+  "source_samples_total": 3293,
+  "source_sha256_at_extraction": "a680ab5e82fadf8b07dd756fc9ff18cfa5ac3c9857c351adc06f2815ec9e7c60"
+ }
+}

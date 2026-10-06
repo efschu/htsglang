@@ -234,15 +234,28 @@ def _census():
     defs: dict = {}
     for path in sorted(ROOT.rglob("*.py")):
         rel = str(path.relative_to(ROOT))
-        if not any(rel.startswith(p) or rel == p for p in LANE):
-            continue
         try:
             tree = ast.parse(path.read_text(), filename=str(path))
         except SyntaxError:  # pragma: no cover -- a broken file is not our news
             continue
-        _Scan(rel, sites, refs, defs).visit(tree)
+        # 1533 (1530's analysis, applied): refusal SITES and DEFS are the lane's
+        # (that is the census this file freezes), but a REFERENCE from anywhere
+        # in the package wires an owner.  Counting references in the lane only
+        # reported four live refusals as unreachable -- kv_stage_pool_tokens
+        # (<- model_runner_kv_cache_mixin), kv_stage_born (<- memory_pool,
+        # qsa_kv_pool) and seat_expert_buffer (<- layers/moe/expert_offload),
+        # all wired from OUTSIDE the lane, all after this test's date (09-12).
+        in_lane = any(rel.startswith(p) or rel == p for p in LANE)
+        _Scan(rel,
+              sites if in_lane else collections.defaultdict(list),
+              refs,
+              defs if in_lane else {}).visit(tree)
     owners = {o for f in sites for (_, _, o) in sites[f]} - {"<module>"}
-    zero = {o for o in owners if refs.get(o, 0) == 0}
+    # Dunders (``__post_init__`` of the d_seat_vram wipe dataclass) are called
+    # implicitly by the language, never by name: a by-name census cannot see
+    # their callers and must not call them dead.
+    zero = {o for o in owners
+            if refs.get(o, 0) == 0 and not (o.startswith("__") and o.endswith("__"))}
     forms_of = {
         o: tuple(sorted(f for f in sites if any(x[2] == o for x in sites[f])))
         for o in owners

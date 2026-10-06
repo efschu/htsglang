@@ -81,7 +81,14 @@ class ThePlanGateDirection(unittest.TestCase):
         plan, reason = xm.leg_plan_from_join(
             hook="source", group="P", rank=0, manifests=emptied)
         self.assertIsNone(plan, "a card with no shared name must refuse")
-        self.assertIn("join-unjoinable", reason or "")
+        # 1533: the refusal is named `join-no-descriptors-for-rank` now (the
+        # join of the OTHER ranks succeeds, and the rank that shares no name
+        # with its counterpart is the one left without a descriptor); it still
+        # refuses, still names the hook/group/rank, and still says why a leg
+        # that moves nothing may not be reported as a flip.
+        self.assertIn("join-no-descriptors-for-rank", reason or "")
+        self.assertIn("group=P rank=0", reason)
+        self.assertIn("none with src_rank=0", reason)
 
 
 if __name__ == "__main__":
