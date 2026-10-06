@@ -21,6 +21,9 @@
                  "posts_mib": 27323.2, "free_mib": 4259.8,
                  "overflow_mib": 0,                  // Posten über dem BUDGET (der Planer lehnt ab)
                  "beyond_card_mib": 0,               // Posten über der KARTE: der Balken wächst über die Kartengrenze, nichts wird abgeschnitten
+                 "outside_budget_mib": 0,            // optional: Posten AUSSERHALB des Budgets (D-Phase: Festposten fremd + nichttorch); Segment trägt ausserhalb_budget:true
+                 "available_mib": 32607,             // optional: Kartengröße − Posten ausserhalb des Budgets
+                 "budget_over_available_mib": 0,     // optional: Budget größer als das Verfügbare (der Launcher lehnt ab)
                  "not_computed": [ "Festposten" ], "over_text": "" }
 
      Segment = { "name":  "weights"|"experts"|"draft"|"kv"|"state"|"activation"|"fixed"|"reserve"|"free",
@@ -30,7 +33,7 @@
                              "Eingabe (Nutzer/Profil)" | "Annahme dieser Rechnung" | "nicht gerechnet",
                  "detail": "Formel/Grund für den Tooltip", "gerechnet": true|false }
 
-   Summenregel: Σ mib aller Segmente = max(total_mib, posts_mib).  Reserve = max(0, total − max(budget, posts)); Frei = max(0, budget − posts).
+   Summenregel: Σ mib aller Segmente = max(total_mib, posts_mib).  Mit in = Posten im Budget, out = Posten ausserhalb (ohne Flag: out = 0).  Reserve = max(0, (total − out) − max(budget, in)); Frei = max(0, min(budget, total − out) − in).
    Ein Orakel darf zusätzliche Felder mitgeben; fehlende optionale Felder (detail, gerechnet, inputs) sind erlaubt.
    Nicht gerechnete Terme: mib = null mit Grund in detail -- NIE geraten.
    ======================================================================================
@@ -117,27 +120,34 @@
   const NC = "nicht gerechnet";
   function normSeg(s) {
     return { key: s.key || s.name, label: s.label || s.key || s.name, mib: s.mib == null ? null : s.mib, origin: s.origin || s.herkunft || "",
-      what: s.what || s.detail || s.label || "", src: s.src, cut: s.cut };
+      what: s.what || s.detail || s.label || "", src: s.src, cut: s.cut, outside: !!(s.ausserhalb_budget || s.outside) };
   }
   function normBar(b) {
     return Object.assign({}, b, { segments: (b.segments || []).map(normSeg) });
   }
   // Vertragsbalken aus Posten (Reihenfolge wie profile_couplings.contract_bar): Posten | Reserve | Frei; Reserve und Frei folgen aus Budget und Posten
+  // Posten mit `outside` (D-Phase: Festposten --d-foreign-context-mib + --d-nontorch-mib) liegen AUSSERHALB des Budgets (Launcher: verfügbar = Karte − fremd − nichttorch − reserve)
   function contractBar(label, phase, total, budget, budgetOrigin, posts) {
     const segs = [], missing = [];
-    let known = 0;
+    let inside = 0, outside = 0;
     posts.forEach((p) => {
       if (p.mib == null) { segs.push({ name: p.name, label: p.label, mib: null, herkunft: NC, detail: p.detail || "", gerechnet: false }); missing.push(p.label); }
-      else if (p.mib > 0) { known += p.mib; segs.push({ name: p.name, label: p.label, mib: p.mib, herkunft: p.herkunft || "", detail: p.detail || "", gerechnet: true }); }
+      else if (p.mib > 0) {
+        if (p.outside) outside += p.mib; else inside += p.mib;
+        const sg = { name: p.name, label: p.label, mib: p.mib, herkunft: p.herkunft || "", detail: p.detail || "", gerechnet: true };
+        if (p.outside) sg.ausserhalb_budget = true;
+        segs.push(sg);
+      }
     });
-    const overflow = Math.max(0, known - budget), beyond = Math.max(0, known - total);
-    const reserve = Math.max(0, total - Math.max(budget, known)), free = Math.max(0, budget - known);
+    const known = inside + outside, available = total - outside;
+    const overflow = Math.max(0, inside - budget), beyond = Math.max(0, known - total), overAvail = Math.max(0, budget - available);
+    const reserve = Math.max(0, available - Math.max(budget, inside)), free = Math.max(0, Math.min(budget, available) - inside);
     if (reserve > 0) segs.push({ name: "reserve", label: "Reserve", mib: reserve, herkunft: budgetOrigin || "", gerechnet: true,
-      detail: LEG_TAIL[0][2] + (overflow > 0 ? " -- Wunsch " + fmt(total - budget) + " MiB, davon " + fmt(overflow) + " MiB aufgezehrt" : "") });
+      detail: LEG_TAIL[0][2] + (overflow > 0 ? " -- Wunsch " + fmt(available - budget) + " MiB, davon " + fmt(overflow) + " MiB aufgezehrt" : "") });
     if (free > 0) segs.push({ name: "free", label: "Frei", mib: free, herkunft: "gerechnet", gerechnet: true,
       detail: LEG_TAIL[1][2] + (missing.length ? " -- OBERGRENZE: nicht gerechnet sind " + missing.join(", ") : "") });
     return { label, phase, total_mib: total, budget_mib: budget, budget_herkunft: budgetOrigin || "", segments: segs, posts_mib: known, free_mib: free,
-      overflow_mib: overflow, beyond_card_mib: beyond, not_computed: missing };
+      overflow_mib: overflow, beyond_card_mib: beyond, outside_budget_mib: outside, available_mib: available, budget_over_available_mib: overAvail, not_computed: missing };
   }
   // Näherungsbalken (barFromTerms: Posten bis zum Budget, Überlauf-Segment mit `cut`) -> Vertragsbalken; nicht gemessene Festposten bleiben "nicht gerechnet"
   function toContract(b, phase) {
@@ -177,6 +187,7 @@
     return "<b>" + esc(s.label) + "</b><br>" + fmt(s.mib) + " MiB (" + gib(s.mib) + " GiB) · " + pct(s.mib, bar.total_mib) + " der Karte<br>" +
       "Herkunft: <b>" + esc(s.origin || "") + "</b>" + (s.src && String(s.origin || "").indexOf(s.src) < 0 ? ' <span class="muted">(' + esc(s.src) + ")</span>" : "") + "<br>" +
       '<span class="muted">' + esc(s.what || s.label) + "</span>" +
+      (s.outside ? '<br><span class="muted">liegt AUSSERHALB des Budgets (verkleinert das Verfügbare der Karte)</span>' : "") +
       (beyond > 0 ? '<br><span class="kp-t-bad">' + fmt(beyond) + " MiB dieses Postens liegen HINTER der Kartengrenze (" + fmt(bar.total_mib) + " MiB): zu erwarten ist OOM.</span>" : "") +
       (s.key === "overflow" ? '<br><span class="kp-t-bad">Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden.</span>' : "");
   }
@@ -203,6 +214,7 @@
   function overNote(b) {
     if (b.beyond_card_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.beyond_card_mib) + " MiB über der Karte.</b> Der Balken wächst über die Kartengrenze. Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden oder beim Graphenaufbau.</div>";
     if (b.overflow_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Die Reserve wird aufgezehrt. Der Planer lehnt ab; mit Force startet es trotzdem.</div>";
+    if (b.budget_over_available_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": Budget " + fmt(b.budget_mib) + " MiB ist " + fmt(b.budget_over_available_mib) + " MiB größer als das Verfügbare</b> (Karte " + fmt(b.total_mib) + " − Festposten " + fmt(b.outside_budget_mib) + " MiB außerhalb des Budgets). Der Planer lehnt ab; mit Force startet es trotzdem.</div>";
     return "";
   }
   function render(bars, opt) {

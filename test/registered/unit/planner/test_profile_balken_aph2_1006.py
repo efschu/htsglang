@@ -198,16 +198,57 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         self.assertIn("--d-foreign-context-mib", seg(d[0], "fixed")["detail"])
         self.assertIn("--d-nontorch-mib", seg(d[0], "fixed")["detail"])
 
+    def test_fixed_posts_sit_outside_the_budget_exactly_as_in_the_launcher(self):
+        # Befund 1 (Fix-Runde 1): Launcher: verfuegbar = Karte - fremd - nichttorch - reserve (pp_cut.d_rank_available_mib), gefragt = Budget.
+        # Budget = Karte - fremd - nichttorch -> die Festposten stehen EINMAL im Balken (nicht noch einmal in der Reserve), Frei = Budget - Posten.
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--rank-gpu-memory-mib"] = "29180,19056,19062"
+        d = nf(pa=pa)["phases"]["D"]["bars"]
+        for b, fx, tot in zip(d, (3427, 1424, 1418), (32607, 20480, 20480)):
+            self.assertTrue(seg(b, "fixed")["ausserhalb_budget"])
+            self.assertEqual(b["outside_budget_mib"], fx)
+            self.assertEqual(b["available_mib"], tot - fx)
+            self.assertIsNone(seg(b, "reserve"))                                   # Budget == verfuegbar: keine Reserve, Festposten nicht doppelt
+            inside = b["posts_mib"] - fx
+            self.assertAlmostEqual(seg(b, "free")["mib"], (tot - fx) - inside, delta=0.01)       # nach Launcher-Semantik, nicht um fx zu klein
+            self.assertAlmostEqual(sum(s["mib"] for s in b["segments"] if s["mib"] is not None), max(tot, b["posts_mib"]), delta=0.01)
+            self.assertEqual(b["budget_over_available_mib"], 0)
+
+    def test_budget_larger_than_the_available_is_named_not_hidden(self):
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--rank-gpu-memory-mib"] = "31583,19456,19456"
+        b = nf(pa=pa)["phases"]["D"]["bars"][0]
+        self.assertAlmostEqual(b["budget_over_available_mib"], 31583 - (32607 - 3427), delta=0.01)
+        self.assertIn("groesser als das Verfuegbare", b["over_text"])
+        self.assertEqual(b["beyond_card_mib"], 0)
+
+    def test_contract_bar_by_hand_outside_posts_shrink_available_not_free(self):
+        st = stage(1000, 600, weights=300, kv=100)
+        st["terms"]["fixed"] = {"v": 150.0, "src": "Profilzeile", "note": "", "outside_budget": True}
+        b = PC.contract_bar(st, "D")
+        self.assertEqual([(s["name"], s["mib"]) for s in b["segments"]], [("weights", 300), ("kv", 100), ("fixed", 150), ("reserve", 250), ("free", 200)])
+        self.assertEqual((b["overflow_mib"], b["beyond_card_mib"], b["budget_over_available_mib"]), (0, 0, 0))
+        st2 = stage(1000, 600, weights=500, kv=200)                                 # 700 im Budget > 600
+        st2["terms"]["fixed"] = {"v": 150.0, "src": "Profilzeile", "note": "", "outside_budget": True}
+        b2 = PC.contract_bar(st2, "D")
+        self.assertEqual(b2["overflow_mib"], 100)
+        self.assertEqual(seg(b2, "reserve")["mib"], 150)                              # 850 verfuegbar - 700 Posten
+        self.assertEqual(sum(s["mib"] for s in b2["segments"]), 1000)
+
     def test_d_budget_defaults_to_card_minus_corridor_and_takes_the_group_flag(self):
         d = nf()["phases"]["D"]["bars"]
-        self.assertEqual([b["budget_mib"] for b in d], [32607 - 1024, 20480 - 1024, 20480 - 1024])
+        # Festposten (fremd + nichttorch) liegen ausserhalb des Budgets (Launcher: verfuegbar = Karte - fremd - nichttorch - reserve)
+        self.assertEqual([b["budget_mib"] for b in d], [32607 - 3427 - 1024, 20480 - 1424 - 1024, 20480 - 1418 - 1024])
         self.assertEqual(d[0]["budget_herkunft"], "gerechnet")
+        for b in d:
+            self.assertEqual(b["budget_over_available_mib"], 0)
+            self.assertEqual(seg(b, "reserve")["mib"], 1024)
         pa = copy.deepcopy(NF_PA)
-        pa["D"]["--rank-gpu-memory-mib"] = "30000,18000,18000"
+        pa["D"]["--rank-gpu-memory-mib"] = "28000,17000,17000"
         d2 = nf(pa=pa)["phases"]["D"]["bars"]
-        self.assertEqual([b["budget_mib"] for b in d2], [30000, 18000, 18000])
+        self.assertEqual([b["budget_mib"] for b in d2], [28000, 17000, 17000])
         self.assertEqual(d2[0]["budget_herkunft"], "Profilzeile")
-        self.assertEqual(seg(d2[0], "reserve")["mib"], 32607 - 30000)
+        self.assertEqual(seg(d2[0], "reserve")["mib"], 32607 - 3427 - 28000)          # verfuegbar - Budget
 
     def test_unsolvable_assignments_are_not_computed_and_say_why(self):
         pa = copy.deepcopy(NF_PA)

@@ -1103,9 +1103,14 @@ def d_stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], cfg: Mapping[
         raise CouplingError("Hardwareprofil: vram_total_mib fehlt auf einer Karte")
     corridor = float(cfg.get("corridor_mib", 1024.0))
     has_budget = cfg.get("budget_mib") is not None
-    budgets = _per_card(cfg.get("budget_mib"), n, "budget_mib", 0.0) if has_budget else [t - corridor for t in totals]
+    # Ohne --rank-gpu-memory-mib: Budget = verfuegbar im Sinn des Launchers (pp_cut.d_rank_available_mib: Karte - fremd - nichttorch - reserve);
+    # die Festposten liegen AUSSERHALB des Budgets, die Annahme "Karte - Korridor" wuerde sie doppelt zaehlen.
+    pre_fixed = _per_card(cfg.get("fixed_mib"), n, "fixed_mib", 0.0) if cfg.get("fixed_mib") is not None else [0.0] * n
+    budgets = _per_card(cfg.get("budget_mib"), n, "budget_mib", 0.0) if has_budget else [t - f - corridor for t, f in zip(totals, pre_fixed)]
     budget_src = SRC_PROFILE if has_budget else SRC_DERIVED
-    budget_note = "--rank-gpu-memory-mib" if has_budget else "Kartengroesse - Korridor %.0f MiB (Annahme)" % corridor
+    budget_note = "--rank-gpu-memory-mib" if has_budget else (
+        "Kartengroesse - Festposten (fremd + nichttorch) - Korridor %.0f MiB (Annahme)" % corridor if any(pre_fixed)
+        else "Kartengroesse - Korridor %.0f MiB (Annahme)" % corridor)
     fams = _families(model)
     w = model["weights"]
     lb, le = list(_val(w["layer_bytes"])), list(_val(w["layer_expert_bytes"]))
@@ -1249,8 +1254,12 @@ def d_stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], cfg: Mapping[
         if fixed_vec is not None:
             parts = cfg.get("fixed_parts") or {}
             f_note = "; ".join("%s %s" % (k, ",".join("%g" % x for x in v)) for k, v in parts.items() if v)
-            t["fixed"] = {"v": fixed_vec[i], "src": SRC_PROFILE,
-                          "note": "--d-foreign-context-mib (CUDA-Kontext der schlafenden Phase) + --d-nontorch-mib: " + f_note}
+            # Launcher-Semantik (pp_cut.d_rank_available_mib): verfuegbar = Karte - fremd - nichttorch - reserve; gefragt = Budget
+            # (--rank-gpu-memory-mib).  Die Festposten liegen also AUSSERHALB des Budgets -> ``outside_budget`` (contract_bar rechnet sie
+            # nicht gegen das Budget und zieht sie von der Reserve ab; sonst stuende derselbe Betrag zweimal im Balken).
+            t["fixed"] = {"v": fixed_vec[i], "src": SRC_PROFILE, "outside_budget": True,
+                          "note": "--d-foreign-context-mib (CUDA-Kontext der schlafenden Phase) + --d-nontorch-mib (liegen AUSSERHALB des Budgets, "
+                                  "wie im Launcher): " + f_note}
         else:
             t["fixed"] = none("CUDA-Kontext, Graphen, Allokator-Reste: nur am Metall zu messen "
                               "(keine --d-foreign-context-mib/--d-nontorch-mib im Profil)")
@@ -1263,14 +1272,18 @@ def d_stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], cfg: Mapping[
 def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
     """Eine Stufe (``terms[k] = {v|None, src, note}``) -> Karten-Balken im Vertrag ``flliper.balken/1``.
 
-    Posten in logischer Reihenfolge, dann ``Reserve`` (Kartengroesse - Budget, von einem Ueberlauf ueber das Budget aufgezehrt) und
-    ``Frei`` (Budget - Posten).  Die Segmente SIND der Balken: Summe = max(Kartengroesse, Posten); ragt sie ueber ``total_mib``, waechst der
-    Balken ueber die Kartengrenze (``beyond_card_mib``) -- nichts wird abgeschnitten.  ``mib: None`` = nicht gerechnet."""
+    Posten in logischer Reihenfolge, dann ``Reserve`` (verfuegbar - Budget, von einem Ueberlauf ueber das Budget aufgezehrt) und ``Frei``
+    (Budget - Posten im Budget).  Posten mit ``outside_budget`` (D-Phase: ``--d-foreign-context-mib`` + ``--d-nontorch-mib``, Launcher:
+    verfuegbar = Karte - fremd - nichttorch - reserve) liegen AUSSERHALB des Budgets: sie zaehlen nicht gegen das Budget, verkleinern aber das
+    Verfuegbare (Segment ``ausserhalb_budget: true``).  Die Segmente SIND der Balken: Summe = max(Kartengroesse, Posten ausserhalb + max(Budget,
+    Posten im Budget)); ragt sie ueber ``total_mib``, waechst der Balken ueber die Kartengrenze (``beyond_card_mib``) -- nichts wird abgeschnitten.
+    ``mib: None`` = nicht gerechnet.  Ist das Budget groesser als das Verfuegbare (``budget_over_available_mib``), lehnt der Launcher ab."""
     total = float(stage["total_mib"])
     budget = float(stage["budget_mib"]["v"])
     segs: List[Dict[str, Any]] = []
     missing: List[str] = []
-    known = 0.0
+    inside = 0.0
+    outside = 0.0
     for key, label, what in BAR_SEGMENTS:
         t = stage["terms"].get(key)
         if t is None:
@@ -1278,20 +1291,30 @@ def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
         if phase == "D":
             what = D_WHAT.get(key, what)
         v = t.get("v")
+        out_b = bool(t.get("outside_budget"))
         if v is None:
             segs.append({"name": key, "label": label, "mib": None, "herkunft": SRC_NONE, "detail": t.get("note") or what, "gerechnet": False})
             missing.append(label)
         elif v > 0:
-            known += float(v)
-            segs.append({"name": key, "label": label, "mib": round(float(v), 3), "herkunft": _origin(t["src"]),
-                         "detail": what + (" -- " + t["note"] if t.get("note") else ""), "gerechnet": True})
-    overflow = max(0.0, known - budget)
+            if out_b:
+                outside += float(v)
+            else:
+                inside += float(v)
+            seg = {"name": key, "label": label, "mib": round(float(v), 3), "herkunft": _origin(t["src"]),
+                   "detail": what + (" -- " + t["note"] if t.get("note") else ""), "gerechnet": True}
+            if out_b:
+                seg["ausserhalb_budget"] = True
+            segs.append(seg)
+    known = inside + outside
+    available = total - outside
+    overflow = max(0.0, inside - budget)
     beyond = max(0.0, known - total)
-    reserve = max(0.0, total - max(budget, known))
-    free = max(0.0, budget - known)
+    over_avail = max(0.0, budget - available)
+    reserve = max(0.0, available - max(budget, inside))
+    free = max(0.0, min(budget, available) - inside)
     bsrc = stage["budget_mib"]
     if reserve > 0:
-        wish = (" -- Wunsch %.0f MiB, davon %.0f MiB aufgezehrt" % (total - budget, overflow)) if overflow > 0 else ""
+        wish = (" -- Wunsch %.0f MiB, davon %.0f MiB aufgezehrt" % (available - budget, overflow)) if overflow > 0 else ""
         segs.append({"name": "reserve", "label": "Reserve", "mib": round(reserve, 3), "herkunft": _origin(bsrc["src"]),
                      "detail": BALKEN_SEGMENTS[-2][2] + (" -- " + bsrc["note"] if bsrc.get("note") else "") + wish, "gerechnet": True})
     if free > 0:
@@ -1300,17 +1323,22 @@ def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
                      "detail": BALKEN_SEGMENTS[-1][2] + obergrenze, "gerechnet": True})
     return {"card": stage.get("ord"), "label": stage["label"], "phase": phase, "total_mib": total, "budget_mib": budget,
             "budget_herkunft": _origin(bsrc["src"]), "segments": segs, "posts_mib": round(known, 3), "free_mib": round(free, 3),
-            "overflow_mib": round(overflow, 3), "beyond_card_mib": round(beyond, 3), "not_computed": missing,
-            "over_text": _over_text(stage["label"], phase, overflow, beyond, budget, total)}
+            "overflow_mib": round(overflow, 3), "beyond_card_mib": round(beyond, 3), "outside_budget_mib": round(outside, 3),
+            "available_mib": round(available, 3), "budget_over_available_mib": round(over_avail, 3), "not_computed": missing,
+            "over_text": _over_text(stage["label"], phase, overflow, beyond, budget, total, over_avail, outside)}
 
 
-def _over_text(label: str, phase: str, overflow: float, beyond: float, budget: float, total: float) -> str:
+def _over_text(label: str, phase: str, overflow: float, beyond: float, budget: float, total: float,
+               over_avail: float = 0.0, outside: float = 0.0) -> str:
     if beyond > 0:
         return ("%s (%s): Posten %.0f MiB ueber der KARTE (%.0f MiB). Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM "
                 "beim Laden oder beim Graphenaufbau." % (label, phase, beyond, total))
     if overflow > 0:
         return ("%s (%s): Posten %.0f MiB ueber dem Budget (%.0f MiB); die Reserve wird aufgezehrt. Der Planer lehnt ab; mit Force startet es "
                 "trotzdem." % (label, phase, overflow, budget))
+    if over_avail > 0:
+        return ("%s (%s): Budget %.0f MiB ist %.0f MiB groesser als das Verfuegbare (Karte %.0f - Festposten %.0f MiB ausserhalb des Budgets). "
+                "Der Planer lehnt ab; mit Force startet es trotzdem." % (label, phase, budget, over_avail, total, outside))
     return ""
 
 

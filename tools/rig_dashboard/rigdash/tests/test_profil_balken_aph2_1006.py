@@ -287,6 +287,21 @@ class TestJsContract(unittest.TestCase):
         self.assertEqual(nc["not_computed"], ["KV"])
         self.assertIn("OBERGRENZE", nc["segments"][-1]["detail"])
 
+    def test_contract_bar_outside_posts_match_the_launcher_semantics(self):
+        # Befund 1: Festposten ausserhalb des Budgets (verfuegbar = Karte - fremd - nichttorch), nicht doppelt in der Reserve
+        o = self.js("const M=require(%r);console.log(JSON.stringify([M.contractBar('K','D',1000,600,'x',[{name:'weights',label:'W',mib:300},{name:'kv',label:'KV',mib:100},{name:'fixed',label:'F',mib:150,outside:true}]),"
+                    "M.contractBar('K','D',1000,900,'x',[{name:'weights',label:'W',mib:300},{name:'fixed',label:'F',mib:150,outside:true}]),"
+                    "M.render([M.contractBar('K','D',1000,900,'x',[{name:'weights',label:'W',mib:300},{name:'fixed',label:'F',mib:150,outside:true}])],{base:0}),"
+                    "M.tip(M.contractBar('K','D',1000,600,'x',[{name:'fixed',label:'F',mib:150,outside:true}]),0)]))" % JS)
+        ok, over, html, tip = o
+        self.assertEqual([(s["name"], s["mib"]) for s in ok["segments"]], [("weights", 300), ("kv", 100), ("fixed", 150), ("reserve", 250), ("free", 200)])
+        self.assertTrue(ok["segments"][2]["ausserhalb_budget"])
+        self.assertEqual((ok["overflow_mib"], ok["outside_budget_mib"], ok["available_mib"], ok["budget_over_available_mib"]), (0, 150, 850, 0))
+        self.assertEqual(over["budget_over_available_mib"], 50)                       # 900 gefragt, 850 verfuegbar
+        self.assertEqual(sum(s["mib"] for s in over["segments"]), 1000)
+        self.assertIn("größer als das Verfügbare", html)
+        self.assertIn("AUSSERHALB des Budgets", tip)
+
     PAYLOAD = {"n_stages": 2, "stage_layers": [2, 2], "layer_dense_mib": [100, 80, 80, 100], "layer_expert_mib": [400, 400, 400, 400],
                "layer_attn": [1, 0, 0, 1], "embed_mib": 50, "lm_head_mib": 70, "replicated_mib": 0, "draft_mib": 0, "draft_layers": 0,
                "buf_fracs": [0.5, 0.25], "cell_mib": 0.001, "context_tokens": 1000, "chunk_rows": 100, "extend_rate_mib": 0.5,
