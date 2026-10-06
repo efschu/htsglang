@@ -195,7 +195,8 @@
     const b = normBar(b0), m = model(b), w = (a) => (100 * a / m.scale).toFixed(3) + "%";
     let html = "";
     m.rows.forEach((r) => { html += '<i class="kp-s ks-' + (CLS[r.s.key] || "o") + (r.s.key === "overflow" ? " kp-beyond" : "") + '" data-s="' + r.i + '" data-b="' + ctx + '" tabindex="0" aria-label="' + esc(r.s.label) + " " + fmt(r.s.mib) + ' MiB" style="width:' + w(r.s.mib) + '"></i>'; });
-    const over = m.sum > b.total_mib + 1e-6;
+    // Toleranz 0,01 MiB: der Server rundet jedes Segment auf 3 Stellen, die Summe kann die Kartengröße um Rundung überschreiten (gemessen 32607.001 bei 32607) -- das ist kein Überlauf
+    const over = m.sum > b.total_mib + 0.01;
     // Überlauf: der Balken wächst über die Kartenkante; der Teil dahinter ist rot schraffiert (Überlagerung), die Kante trägt die Beschriftung
     const zone = over ? '<div class="kp-bz" style="left:' + w(b.total_mib) + '" aria-hidden="true"></div>' : "";
     const edge = over ? '<div class="kp-edge" style="left:' + w(b.total_mib) + '" title="Kartenende ' + fmt(b.total_mib) + ' MiB"><span>Kartenende ' + gib(b.total_mib) + " GiB</span></div>" : "";

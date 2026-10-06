@@ -251,6 +251,15 @@ class TestJsContract(unittest.TestCase):
         self.assertIn("200 MiB dieses Postens liegen HINTER der Kartengrenze", o["tip"])
         self.assertIn("Herkunft: <b>y</b>", o["tip"])
 
+    def test_server_rounding_of_a_full_bar_is_no_card_edge_overflow(self):
+        # Beleg Browser-Gegenprobe 27b-nvfp4-dual-262k, Karte 0, D-Phase: Segmente runden auf 3 Stellen, Summe 32607.001 bei Karte 32607
+        b = self.bar(total_mib=1000, budget_mib=1000, segments=[
+            {"name": "weights", "label": "Gewichte", "mib": 300.0004, "herkunft": "x", "detail": "d"},
+            {"name": "free", "label": "Frei", "mib": 699.6006, "herkunft": "gerechnet", "detail": "d"}], posts_mib=300.0004, free_mib=699.6006)
+        html = self.js("const M=require(%r);console.log(JSON.stringify(M.render([%s],{base:0})))" % (JS, json.dumps(b)))
+        self.assertNotIn("kp-edge", html)
+        self.assertNotIn("kp-bz", html)
+
     def test_over_budget_inside_the_card_is_a_note_without_a_red_zone(self):
         b = self.bar(overflow_mib=50, beyond_card_mib=0)
         html = self.js("const M=require(%r);console.log(JSON.stringify(M.render([%s],{base:0})))" % (JS, json.dumps(b)))
