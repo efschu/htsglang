@@ -6245,7 +6245,12 @@ class Front:
                 (tier if credit > 0 else "none")
         else:
             pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
-        self._x_exact_rid[rid] = (pending, c.n, src)
+        # NF-NEXT-1006-21: which entry (its rid, its kind) the credit came from --
+        # read off the spans AFTER the price was taken; it feeds log lines only
+        win = None if isolated else self.tspans.last_winner
+        entry_rid, entry_src = (win[1], win[2]) if win else ("-", "-")
+        self._x_exact_rid[rid] = (pending, c.n, src,
+                                  (entry_rid, entry_src, (win[0] or "-")[:12] if win else "-"))
         while len(self._x_exact_rid) > 4096:
             self._x_exact_rid.popitem(last=False)
         self.counters["x_exact_priced"] += 1
@@ -6267,9 +6272,10 @@ class Front:
         logger.info("WEG2 X-EXACT-PRICE rid=%s pending=%d tokens=%d credit=%d src=%s known=%d "
                     "(EXACT: D's tokenizer+template, minus the MEASURED cached-on-D token prefix) "
                     "chars3_uncached=%d chars3_prompt=%d delta=%+d count_ms=%.1f wait_ms=%.1f "
-                    "reused=%d encoded=%d%s",
+                    "reused=%d encoded=%d entry_rid=%s entry_src=%s%s",
                     rid, pending, c.n, credit, src, int(known), est_uncached, est_prompt,
-                    est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded, mm_tag)
+                    est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded,
+                    entry_rid, entry_src, mm_tag)
         self._prefix_diverge(rid, c.ids, pending, credit, src, l3, payload=payload)
         from types import SimpleNamespace
 
@@ -7416,7 +7422,8 @@ class Front:
         clamped_tokens = self.tspans.own_text_clamped_tokens
         if not Front._ns_isolated(self, rid):  # Q-530: a namespaced reading credits no other tenant
             self.tspans.record_presence(ids, ct, prompt_tokens=pt,
-                                        held_epoch=held_epoch, resumable_depth=resumable_depth)
+                                        held_epoch=held_epoch, resumable_depth=resumable_depth,
+                                        rid=rid)
         self._seq_record(rid, ids, seq_mark, "finish")  # SEQ-HASH (02.10.)
         if self.tspans.own_text_clamps != clamps:
             # PREFILL-EINBRUCH-0929 K2: a parked + resumed leg 2 counts its
@@ -7433,7 +7440,8 @@ class Front:
         got = self._x_exact_rid.pop(rid, None)
         if got is None:
             return
-        priced, n, src = got
+        priced, n, src = got[:3]
+        origin = got[3] if len(got) > 3 else ("-", "-", "-")  # NF-NEXT-1006-21 (log only)
         via = ("d_direct" if pending is None
                else "d_drain" if getattr(pending, "d_direct", False) else "after_p")
         realised = max(0, int(pt) - int(ct))
@@ -7449,6 +7457,20 @@ class Front:
                     rid, via, priced, realised,
                     ("%+d" % (priced - realised)) if direct else "na",
                     n, int(pt), int(int(pt) == n), src)
+        # NF-NEXT-1006-21 PRESENCE-CONTRADICTED-DRYRUN: log what a retract of the
+        # credit would be about (D read nothing of a credit >= 1024: a whole
+        # loss) -- NOTHING is written, no entry touched, no counter moved
+        page = max(1, int(self.tspans.anchor_page))
+        credited = int(n) - int(priced)
+        if direct and int(pt) == n and credited >= 1024 and int(ct) <= page:
+            logger.info("WEG2 PRESENCE-CONTRADICTED-DRYRUN rid=%s via=%s src=%s credited=%d "
+                        "realised_cached=%d d_uncached=%d tokens_front=%d page=%d entry_rid=%s "
+                        "entry_src=%s source_key=%s own_entry=%d (observation only: D's reading "
+                        "refuted the whole credit; a retract would drop source_key and not "
+                        "keep this request's own held entry; nothing was changed)",
+                        rid, via, src, credited, int(ct), realised, n, page,
+                        origin[0], origin[1], origin[2],
+                        int(held_epoch is not None and int(pt) > 0))
 
     #: H78: the modules the flip / leg path imports lazily on its FIRST use --
     #: credit_pause_order (wake_credit), timed_pause_order (wake_credit_pd),

@@ -672,6 +672,12 @@ class TokenSpans:
         #: clamp lowered the cap (K2). ANCHOR-LOST names D's real anchor depths,
         #: so a clamped entry is retracted by its unclamped depth too.
         self.raw_depths: Dict[str, int] = {}
+        #: NF-NEXT-1006-21 (observation only, never read by a decision): key ->
+        #: rid of the finish reading that recorded the entry, and the entry
+        #: that won the LAST :meth:`pending` call as ``(key, rid, kind)``
+        #: (``None`` = no entry won). ``pending``'s return value is unchanged.
+        self.entry_rid: Dict[str, str] = {}
+        self.last_winner: Optional[Tuple[Optional[str], str, str]] = None
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
@@ -679,9 +685,12 @@ class TokenSpans:
 
     def record_presence(self, ids: Optional[np.ndarray], cached_tokens: int,
                         prompt_tokens: int = 0, held_epoch: Optional[int] = None,
-                        resumable_depth: Optional[int] = None) -> None:
+                        resumable_depth: Optional[int] = None,
+                        rid: Optional[str] = None) -> None:
         """#59: ``resumable_depth`` (D's ``weg2_resumable_depth``, None = not
-        sent) caps every credit of this entry; 0 retracts.
+        sent) caps every credit of this entry; 0 retracts. ``rid``: the
+        request whose reading this is -- only remembered (``entry_rid``) so a
+        price line can name the entry's origin; no credit depends on it.
 
         PREFILL-EINBRUCH-0929 K2: a reading is about THIS text and never
         credits past it. A D leg 2 that was parked and resumed answers with
@@ -699,6 +708,7 @@ class TokenSpans:
         self.entries.pop(key, None)
         self.depth_caps.pop(key, None)
         self.raw_depths.pop(key, None)
+        self.entry_rid.pop(key, None)
         self._unflag_inflight(key)  # D-INFLIGHT: the finish reading replaces it
         reported_depth = resumable_depth
         if not self.agent_span:
@@ -723,6 +733,8 @@ class TokenSpans:
             self.entry_seq.pop(key, None)
             return
         self.entries[key] = (ids, ct, pt, held)
+        if rid is not None:
+            self.entry_rid[key] = str(rid)
         if resumable_depth is not None:
             self.depth_caps[key] = int(resumable_depth)
             if int(reported_depth) != int(resumable_depth):
@@ -819,7 +831,10 @@ class TokenSpans:
             self.depth_caps.pop(old_key, None)
             self.entry_seq.pop(old_key, None)
             self.raw_depths.pop(old_key, None)
+            self.entry_rid.pop(old_key, None)
             self._unflag_inflight(old_key)
+        while len(self.entry_rid) > 2 * self.cap:  # keys retracted elsewhere leave one behind
+            self.entry_rid.pop(next(iter(self.entry_rid)))
 
     # -- SEQ-HASH (02.10.) ------------------------------------------------------
     def record_seq(self, ids: Optional[np.ndarray], depth: int, digest: str) -> bool:
@@ -999,6 +1014,7 @@ class TokenSpans:
         ``since_seq``: only entries recorded after that record count (a FRESH
         D confirmation); None = every entry, as before."""
         best, src, known = 0, "none", False
+        win: Optional[Tuple[Optional[str], str]] = None  # NF-NEXT-1006-21: (key, kind), report only
         for key, (eids, ct, pt, held_epoch) in self.entries.items():
             if since_seq is not None and self.entry_seq.get(key, 0) <= int(since_seq):
                 continue
@@ -1031,9 +1047,24 @@ class TokenSpans:
                        else "d_served_anchor" if served and credit > ct
                        else "d_inflight" if key in self.inflight_keys
                        else self.store_keys.get(key, "d_leg2_cached"))
+                win = (key, "served_epoch" if held and credit > ct
+                       else "served_anchor" if served and credit > ct
+                       else "inflight" if key in self.inflight_keys
+                       else "store" if key in self.store_keys
+                       else "held" if held else "leg2_cached")
         if self.seq_marks:
             # SEQ-HASH: a prompt that extends a previous turn's GENERATED tokens
             seq, _plen = self.seq_credit(ids)
             if seq > best:
                 best, src, known = seq, "d_seq_anchor", True
+                win = (None, "seq")
+        # NF-NEXT-1006-21: name the winner for the price line (a side field; the
+        # return value above is exactly what it was)
+        if win is None:
+            self.last_winner = None
+        else:
+            wkey = win[0]
+            wrid = "-" if wkey is None else (
+                self.inflight_keys.get(wkey) or self.entry_rid.get(wkey) or "-")
+            self.last_winner = (wkey, wrid, win[1])
         return max(0, int(ids.size) - best), best, known, src
