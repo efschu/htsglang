@@ -522,6 +522,28 @@ def simulate(inventory: str, keys: Sequence[str], model: SimModel,
                     cell.blockers.append("P-CHUNK-MODEL")
     finally:
         L.inventory_view_mod.clear_active()
+    # 5d. AP1 1006: the two per-CLASS gates the launcher reaches after the inventory
+    # check -- the W19 dormant-residue selector (every card, every N) and the P-cut
+    # deep attention anchor (the three-stage path only; another stage count derives
+    # its family cost from the reference basis). Both are the value refusal
+    # HW-UNCALIBRATED: without --force the inventory check above already refused
+    # such an inventory (nothing new here); under --force they BORROW the figure of
+    # the calibrated class of the same arch and are listed in ``refusals.forced_list``
+    # (UNMEASURED). What stays refused is a card of an arch without a calibrated twin
+    # (sm_89): no figure to borrow.
+    if not uncalibrated:
+        for c in order:
+            try:
+                L.dc_measured_d_mib(c, str(ns.weg2_weight_source))
+            except L.Weg2LaunchRefused as exc:
+                cell.refuse(CI.CODE_UNCALIBRATED, f"W19: {str(exc)[:300]}")
+                cell.blockers.append("W19-RESIDUE")
+        if len(order) == len(L.P_PP_STAGE_RATIO_SCORES):
+            try:
+                L.attn_anchor_stage(order)
+            except L.Weg2LaunchRefused as exc:
+                cell.refuse(CI.CODE_UNCALIBRATED, f"ATTN-ANCHOR: {str(exc)[:300]}")
+                cell.blockers.append("ATTN-ANCHOR")
     # 6. weight fit. A model with a known checkpoint size keeps the bound of 1003
     # (checkpoint bytes >= the summed VRAM, one card for N = 1; the pinned 27B
     # cells of the line do not move). A model WITHOUT one (``ckpt_mib`` None: the

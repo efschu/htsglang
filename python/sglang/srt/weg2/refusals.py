@@ -77,7 +77,9 @@ REGISTER: Tuple[Refusal, ...] = (
     _v("HW-UNCALIBRATED", "Karteninventar ist nicht das gemessene",
        "Die Positions-Messwerte des Profils (Budgets, Raten, Rest) gelten für ein anderes Inventar. Der Planer weigert sich, "
        "fremde Messungen zu leihen. Das ist ein Urteil über die Güte der Zahlen, nicht über die Möglichkeit zu starten.",
-       "weg2/card_identity.py uncalibrated_message; launcher.inventory_check_line", "launcher",
+       "weg2/card_identity.py uncalibrated_message; launcher.inventory_check_line; "
+       "AP1 1006: launcher.dc_measured_d_mib (W19, borrows the arch twin's residue), launcher.attn_anchor_stage "
+       "(borrows the reference stage), launcher._unpin_foreign_cut (drops an infeasible profile pin)", "launcher",
        "Die Zahlen des Profils werden auf das fremde Inventar angewendet, als wären sie dafür gemessen (Boot-Log trägt FORCED-PAST). "
        "Zu erwarten: Fehlbudgets, im schlechten Fall OOM beim Laden oder Graph-Aufbau."),
     _v("HW-BORROWED", "Census-Zeile einer Karte ist von einer anderen Karte geliehen",
