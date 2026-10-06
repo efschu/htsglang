@@ -29,6 +29,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
+from . import hwprofil as HW
 from . import kartenplan_catalog as CAT
 from . import redact
 from .kartenplan import MAX_CARDS
@@ -761,8 +762,8 @@ class ProfilEditor:
         sha = str(based.get("sha256") or "")
         sha = sha[len("sha256:"):] if sha.startswith("sha256:") else sha
         L += ["", "### Versionen", "", "| Angabe | Wert |", "|---|---|",
-              "| Baum (Revision) | %s |" % _md(v.get("tree_rev") or "unbelegt"),
-              "| Image | %s |" % _md(v.get("image") or "unbelegt (SGLANG_IMAGE_TAG nicht gesetzt)"),
+              "| Baum (Revision) | %s |" % _md(HW.version_tree_text(v)),
+              "| Image | %s |" % _md(HW.version_image_text(v)),
               "| Treiber | %s |" % _md(v.get("driver") or "unbelegt"),
               "| CUDA / torch (Messprozess) | %s / %s |" % (_md(v.get("cuda") or "unbelegt"), _md(v.get("torch") or "unbelegt")),
               "| Dashboard | %s |" % _md(v.get("rigdash") or "unbelegt"),

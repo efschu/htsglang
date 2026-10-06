@@ -63,9 +63,20 @@ def text_for_issue(text: str) -> str:
 # the NAME of a flag, variable or env entry says it carries a secret: its value never goes into a pasted issue.  ``clean`` cannot see these
 # (``HF_TOKEN=...`` has no word boundary before ``TOKEN``, and a table cell ``| HF_TOKEN | abc |`` has no ``=`` at all).  The name is split into
 # its letter runs (``HF_TOKEN`` -> hf, token; ``--max-total-tokens`` -> max, total, tokens), so ``tokens`` / ``tokenizer`` are NOT secrets.
-_SECRET_WORDS = frozenset(("secret", "secrets", "password", "passwd", "pwd", "token", "credential", "credentials", "bearer", "authorization", "pat",
+# ``token`` alone is a secret only where it is the NAME's last word (``HF_TOKEN``, ``--auth-token``, ``--token``) or it pairs with an
+# access word (``hf-token-file``, ``--token-key``): the catalog is full of flags that merely MENTION a token (``--d-token-placement``,
+# ``--uneven-token-vector``, ``SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION``) and their values are exactly what the Laufbericht shows.
+# A name that ENDS in ``token`` but carries a token id or a boot marker is on the allow list ``_TOKEN_IS_NOT_SECRET`` (catalog:
+# ``--fork-anchor-token``, ``--turn-anchor-token``, ``SGLANG_WEG2_LANE_COVERAGE_TOKEN``) or counts tokens (``..._PER_KI_TOKEN``, a ``per`` word anywhere,
+# ``--bucket-time-to-first-token``).
+_SECRET_WORDS = frozenset(("secret", "secrets", "password", "passwd", "pwd", "credential", "credentials", "bearer", "authorization", "pat",
                            "apikey", "adminkey", "accesskey", "privatekey"))
 _KEY_PREFIX = frozenset(("api", "admin", "access", "private", "auth", "ssh"))
+_TOKEN_PREFIX = frozenset(("hf", "hub", "huggingface", "github", "gh", "gitlab", "auth", "access", "bearer", "api", "admin", "boot", "refresh",
+                           "session", "bot", "slack", "pypi", "npm"))
+_TOKEN_SUFFIX = frozenset(("key", "value", "secret", "string", "file"))
+# (word before ``token``) -> the entry is a token ID / a run marker, not a credential
+_TOKEN_IS_NOT_SECRET = frozenset(("anchor", "coverage", "first"))
 
 
 def _words(name: str):
@@ -84,7 +95,17 @@ def _words(name: str):
 def secret_name(name: str) -> bool:
     """True when ``name`` (a flag, profile variable or env name) names a secret, e.g. ``HF_TOKEN``, ``--admin-api-key``, ``GITHUB_PAT``."""
     w = _words(name)
-    return any(x in _SECRET_WORDS for x in w) or any(a in _KEY_PREFIX and b == "key" for a, b in zip(w, w[1:]))
+    if any(x in _SECRET_WORDS for x in w) or any(a in _KEY_PREFIX and b == "key" for a, b in zip(w, w[1:])):
+        return True
+    for i, x in enumerate(w):
+        if x != "token":
+            continue
+        prev, nxt = (w[i - 1] if i else None), (w[i + 1] if i + 1 < len(w) else None)
+        if prev in _TOKEN_PREFIX or nxt in _TOKEN_SUFFIX:
+            return True
+        if nxt is None and prev not in _TOKEN_IS_NOT_SECRET and "per" not in w:        # the name ENDS in ``token`` (or is just ``token``)
+            return True
+    return False
 
 
 def value_for_issue(name: str, value) -> str:

@@ -340,6 +340,88 @@ class Redaction(Base):
         self.assertEqual(redact.value_for_issue("--max-total-tokens", "4096"), "4096")
         self.assertEqual(redact.value_for_issue("HF_TOKEN", "x"), "<entfernt>")
 
+    def test_token_as_a_catalog_word_is_not_a_secret_but_a_token_credential_is(self):
+        # Befund 1 (Review): ``token`` mitten im Namen oder als Token-ID/Zaehler loescht sonst genau die Werte, die der Laufbericht zeigen soll
+        for n, v in (("--d-token-placement", "bandwidth"), ("--d-kv-token-cut", "owned"), ("--turn-anchor-token", "248045"),
+                     ("--uneven-token-vector", "1,2,3"), ("SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION", "1"),
+                     ("SGLANG_UNEVEN_TOKEN_VECTOR", "4,5"), ("--fork-anchor-token", "7"), ("SGLANG_WEG2_LANE_COVERAGE_TOKEN", "x"),
+                     ("--bucket-time-to-first-token", "0.1"), ("--kt-max-deferred-experts-per-token", "2")):
+            self.assertFalse(redact.secret_name(n), n)
+            self.assertEqual(redact.value_for_issue(n, v), v, n)
+        for n in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN", "--hf-token", "--token", "MY_SERVICE_TOKEN", "HF_TOKEN_FILE", "SGLANG_WEG2_BOOT_TOKEN",
+                  "--auth-token", "SLACK_BOT_TOKEN"):
+            self.assertTrue(redact.secret_name(n), n)
+            self.assertEqual(redact.value_for_issue(n, "abc"), "<entfernt>", n)
+
+    def test_secret_names_over_the_whole_catalog_are_exactly_the_expected_list(self):
+        with open(REPO_CATALOG, encoding="utf-8") as f:
+            names = sorted(json.load(f)["entries"])
+        self.assertGreater(len(names), 2000)
+        hits = [n for n in names if redact.secret_name(n)]
+        self.assertEqual(hits, ["--admin-api-key", "--api-key", "--ssl-keyfile-password", "SGLANG_REGISTRY_ADMIN_API_KEY", "SGLANG_REGISTRY_API_KEY",
+                                "SGLANG_WEG2_BOOT_TOKEN"])
+        for n in names:
+            if "token" in n.lower() and n not in hits:           # jeder harmlose Token-Name behaelt seinen Wert
+                self.assertEqual(redact.value_for_issue(n, "7"), "7", n)
+
+    def test_overriding_a_token_flag_shows_its_value_in_the_proposal_block(self):
+        doc = self.edited([{"key": "flag:--d-token-placement", "op": "set", "value": "roundrobin"},
+                           {"key": "flag:--turn-anchor-token", "op": "set", "value": "248046"}])
+        t = self.report(doc=doc, dry=None)["text"]
+        row = next((x for x in t.split("\n") if x.startswith("| `flag:--d-token-placement`")), "")
+        self.assertIn("roundrobin", row)
+        self.assertNotIn("<entfernt>", row)
+        self.assertIn("248046", next((x for x in t.split("\n") if x.startswith("| `flag:--turn-anchor-token`")), ""))
+
+    def test_version_facts_read_the_release_image_sources(self):
+        # Befund 2 (Review): im Release-Image heisst der Baum /opt/htsglang/src, die Revision steht in der Image-ENV bzw. im git-Baum
+        sha = "173161c595de23e0aa11bb22cc33dd44ee55ff66"
+        vf = hwprofil.version_facts({}, {"tree": "/opt/htsglang/src/python"}, environ={"HTSGLANG_REVISION": sha})
+        self.assertEqual((vf["tree_rev"], vf["tree_rev_src"]), (sha, "Image-ENV HTSGLANG_REVISION"))
+        vf = hwprofil.version_facts({}, {"tree": "/nonexistent/python"}, environ={"HTSGLANG_REVISION_NF": "abcdef1234567", "HTSGLANG_REVISION_27B": sha,
+                                                                                  "HTSGLANG_REVISION": "0000000", "STAND": "nf"})
+        self.assertEqual((vf["tree_rev"], vf["tree_rev_src"]), ("abcdef1234567", "Image-ENV HTSGLANG_REVISION_NF"))
+        vf = hwprofil.version_facts({}, {}, environ={"SGLANG_BUILD_COMMIT": sha})
+        self.assertEqual((vf["tree_rev"], vf["tree_rev_src"]), (sha, "Image-ENV SGLANG_BUILD_COMMIT"))
+        # Dockerfile-Defaults sind kein Beleg
+        vf = hwprofil.version_facts({}, {}, environ={"SGLANG_BUILD_COMMIT": "unknown", "SGLANG_IMAGE_TAG": "local/sglang:dev"})
+        self.assertIsNone(vf["tree_rev"])
+        self.assertTrue(vf["image_default"])
+        self.assertEqual(hwprofil.version_tree_text(vf), "unbelegt")
+        self.assertIn("unbelegt (Default local/sglang:dev", hwprofil.version_image_text(vf))
+        # kein Env-Wert, der nach nichts aussieht
+        self.assertIsNone(hwprofil.version_facts({}, {}, environ={"HTSGLANG_REVISION": "not-a-sha"})["tree_rev"])
+
+    def test_version_facts_read_git_head_of_the_tree_and_ignore_a_foreign_repo(self):
+        d = tempfile.mkdtemp()
+        try:
+            def git(*a):
+                return subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t"] + list(a), capture_output=True, text=True, check=True).stdout.strip()
+            git("init", "-q")
+            os.makedirs(os.path.join(d, "python"))
+            with open(os.path.join(d, "python", "f.py"), "w") as f:
+                f.write("x=1\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "c")
+            head = git("rev-parse", "HEAD")
+            for tree in (d, os.path.join(d, "python")):
+                vf = hwprofil.version_facts({}, {"tree": tree}, environ={"HTSGLANG_REVISION": "deadbeef0"})
+                self.assertEqual((vf["tree_rev"], vf["tree_rev_src"]), (head, "git HEAD des Baums"))      # gemessen schlaegt die Soll-Revision
+            self.assertIn("%s (git HEAD des Baums)" % head, hwprofil.version_tree_text(vf))
+            os.makedirs(os.path.join(d, "a", "b"))
+            vf = hwprofil.version_facts({}, {"tree": os.path.join(d, "a", "b")}, environ={})       # Ordner in einem FREMDEN Repository: kein Beleg
+            self.assertIsNone(vf["tree_rev"])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_the_laufbericht_names_the_revision_of_a_release_image(self):
+        sha = "173161c595de23e0aa11bb22cc33dd44ee55ff66"
+        vf = hwprofil.version_facts({"driver": "575.57.08"}, {"tree": "/opt/htsglang/src/python"},
+                                    environ={"HTSGLANG_REVISION": sha, "SGLANG_IMAGE_TAG": "local/sglang:dev"})
+        t = self.report(doc=self.edited([]), versions=vf)["text"]
+        self.assertIn("| Baum (Revision) | %s (Image-ENV HTSGLANG_REVISION) |" % sha, t)
+        self.assertIn("| Image | unbelegt (Default local/sglang:dev", t)
+
     def test_every_markdown_row_stays_one_line(self):
         doc = self.edited([{"key": "flag:--p-bs", "op": "set", "value": "a|b\nc"}])
         t = self.report(doc=doc, dry=None)["text"]

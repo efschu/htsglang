@@ -294,8 +294,12 @@ class TestIssueText(RealBase):
         self.assertIn("nicht gemessen", txt)                      # fp8 der 3080
 
     def test_unknown_versions_say_unbelegt_and_state_whether_stored(self):
+        # ein Baum ohne git und ohne Revisions-ENV (der echte Baum der Testlaeufe ist ein git-Baum und nennt seine Revision, Review 1006 Befund 2)
         hw = self.make()
-        txt = hw.issue()["text"]
+        with mock.patch.dict(os.environ), mock.patch.object(hwprofil, "_git_head", return_value=None):
+            for k in ("HTSGLANG_REVISION", "HTSGLANG_REVISION_27B", "HTSGLANG_REVISION_NF", "SGLANG_BUILD_COMMIT", "SGLANG_IMAGE_TAG", "STAND"):
+                os.environ.pop(k, None)
+            txt = hw.issue()["text"]
         self.assertIn("| Image | unbelegt (SGLANG_IMAGE_TAG nicht gesetzt) |", txt)
         self.assertIn("| Baum | unbelegt |", txt)
         self.assertIn("(gespeichert)", txt)

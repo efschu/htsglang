@@ -39,6 +39,7 @@ import importlib.util
 import inspect
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -154,15 +155,75 @@ def _short_name(name) -> str:
     return n
 
 
-def version_facts(doc: dict, versions: Optional[dict] = None) -> dict:
+def _is_sha(x) -> bool:
+    x = str(x or "").strip().lower()
+    return 7 <= len(x) <= 40 and all(ch in "0123456789abcdef" for ch in x)
+
+
+def _git_head(tree: Optional[str]) -> Optional[str]:
+    """``HEAD`` des git-Baums, der ``tree`` ist (``/opt/htsglang/src`` oder dessen ``python``-Unterordner); sonst ``None``.  Ein ``tree`` in
+    einem fremden Repository zählt nicht (Wurzel muss ``tree`` selbst oder ``tree/..`` mit Namen ``python`` sein)."""
+    if not tree or not os.path.isdir(tree):
+        return None
+    try:
+        r = subprocess.run(["git", "-C", tree, "rev-parse", "--show-toplevel", "HEAD"], capture_output=True, text=True, timeout=5,
+                           env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (r.stdout or "").split()
+    if r.returncode != 0 or len(out) != 2 or not _is_sha(out[1]):
+        return None
+    real, top = os.path.realpath(tree), os.path.realpath(out[0])
+    return out[1] if real in (top, os.path.join(top, "python")) else None
+
+
+def version_facts(doc: dict, versions: Optional[dict] = None, environ: Optional[dict] = None) -> dict:
     """Die Versionsangaben, die ein Issue-Text nennt (Hardwareprofil UND Laufbericht lesen dieselben): Image (``SGLANG_IMAGE_TAG``),
-    Baum-Revision (nur aus einem gestagten Baumpfad ``.../releases/<sha>/python`` oder einer übergebenen ``tree_rev``), Treiber, CUDA/torch des
-    Messprozesses und Dashboard-Version.  Was nicht belegt ist, ist ``None`` (die Texte schreiben dann "unbelegt"); nie geraten."""
+    Baum-Revision, Treiber, CUDA/torch des Messprozesses und Dashboard-Version.  Die Revision kommt der Reihe nach aus: einer übergebenen
+    ``tree_rev``; einem gestagten Baumpfad ``.../releases/<sha>/python``; ``git rev-parse HEAD`` des Baums (Release-Image: ``/opt/htsglang/src``);
+    der Image-ENV ``HTSGLANG_REVISION`` (bzw. ``_27B`` / ``_NF`` je ``STAND``, Soll-Revision des Entrypoints); ``SGLANG_BUILD_COMMIT``.  Die Herkunft
+    steht in ``tree_rev_src``.  Die Build-Defaults ``SGLANG_BUILD_COMMIT=unknown`` und ``SGLANG_IMAGE_TAG=local/sglang:dev`` (Dockerfile) sind
+    KEIN Beleg: Revision ``None`` bzw. ``image_default`` = True.  Was nicht belegt ist, ist ``None`` (die Texte schreiben dann "unbelegt"); nie geraten."""
     versions = versions or {}
-    return {"image": os.environ.get("SGLANG_IMAGE_TAG") or versions.get("image") or None,
-            "tree_rev": _tree_rev(versions.get("tree")) or versions.get("tree_rev") or None,
+    env = os.environ if environ is None else environ
+    rev, src = None, None
+    if versions.get("tree_rev"):
+        rev, src = versions["tree_rev"], "übergeben"
+    elif _tree_rev(versions.get("tree")):
+        rev, src = _tree_rev(versions.get("tree")), "Baumpfad releases/<sha>"
+    else:
+        g = _git_head(versions.get("tree")) if versions.get("tree") else None
+        if g:
+            rev, src = g, "git HEAD des Baums"
+        else:
+            stand = str(env.get("STAND") or "").lower()
+            for k in (("HTSGLANG_REVISION_%s" % stand.upper()) if stand in ("27b", "nf") else None, "HTSGLANG_REVISION"):
+                if k and _is_sha(env.get(k)):
+                    rev, src = str(env[k]).strip().lower(), "Image-ENV %s" % k
+                    break
+            else:
+                if _is_sha(env.get("SGLANG_BUILD_COMMIT")):
+                    rev, src = str(env["SGLANG_BUILD_COMMIT"]).strip().lower(), "Image-ENV SGLANG_BUILD_COMMIT"
+    image = env.get("SGLANG_IMAGE_TAG") or versions.get("image") or None
+    image_default = image == "local/sglang:dev"
+    return {"image": image, "image_default": image_default, "tree_rev": rev or None, "tree_rev_src": src,
             "driver": doc.get("driver") or None, "cuda": doc.get("cuda") or None, "torch": doc.get("torch") or None,
             "rigdash": versions.get("rigdash") or None}
+
+
+def version_image_text(vf: dict) -> str:
+    """Die Image-Zelle: der Tag mit Herkunft, der Dockerfile-Default als "unbelegt (Default)", ohne Angabe wie bisher."""
+    if vf.get("image_default"):
+        return "unbelegt (Default %s, beim Bau nicht gesetzt)" % vf["image"]
+    return vf.get("image") or "unbelegt (SGLANG_IMAGE_TAG nicht gesetzt)"
+
+
+def version_tree_text(vf: dict) -> str:
+    """Die Baum-Zelle: Revision mit Herkunft, sonst "unbelegt"."""
+    if vf.get("tree_rev"):
+        src = vf.get("tree_rev_src") or ""
+        return "%s (%s)" % (vf["tree_rev"], src) if src.startswith(("git", "Image-ENV")) else vf["tree_rev"]     # Pfad/übergeben: der Wert spricht für sich
+    return "unbelegt"
 
 
 def issue_short(doc: dict, *, persist: Optional[dict] = None, level: int = 3) -> str:
@@ -203,7 +264,6 @@ def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[
     cards = doc.get("cards") or []
     now = time.time() if now is None else now
     vf = version_facts(doc, versions)
-    image, rev = vf["image"], vf["tree_rev"]
     L: List[str] = []
     L.append("## Hardwareprofil (`%s`)" % _md(doc.get("schema") or "flliper.hardware/1"))
     L.append("")
@@ -215,8 +275,8 @@ def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[
     L.append("| Erfasst | %s |" % (_utc(cap) + " (gespeichert)" if cap else _utc(doc.get("created")) + " (lebende Sicht, nicht gespeichert)"))
     L.append("| Treiber | %s |" % _md(doc.get("driver") or "unbelegt"))
     L.append("| CUDA / torch (Messprozess) | %s / %s |" % (_md(doc.get("cuda") or "unbelegt"), _md(doc.get("torch") or "unbelegt")))
-    L.append("| Image | %s |" % _md(image or "unbelegt (SGLANG_IMAGE_TAG nicht gesetzt)"))
-    L.append("| Baum | %s |" % _md(rev or "unbelegt"))
+    L.append("| Image | %s |" % _md(version_image_text(vf)))
+    L.append("| Baum | %s |" % _md(version_tree_text(vf)))
     L.append("| Dashboard | %s |" % _md(versions.get("rigdash") or "unbelegt"))
     L.append("| Karten | %d |" % len(cards))
     L.append("")
