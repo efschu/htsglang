@@ -29,6 +29,11 @@ Seam-Staging), stehen in ``fixed_overhead_mib`` und sind OHNE Eingabe NULL -- da
 sagt es (``warnings``).  Die Stufenzeit ist eine Roofline-Naeherung (Decode, Batch 1, Gewichtsbandbreite ``mem_gbs.gemv``); sie
 ersetzt nicht ``pp_cut.stage_costs`` (der braucht eine am Metall kalibrierte Census) und rankt keine Schnitte (#1019).
 
+Dual-Form (``--dual-share``), Belege je Posten (Datei:Zeile im Baum 173161c595, Einzelheiten in ``_dual_share_p_terms``): Gewichte/Experten von P liegen im
+Union-Image von D (weg2/launcher.py:22707-22712 Hilfe ``--dual-share``, :14784 ``UNION_ROLES=main``) -> Referenz, nicht im P-Budget; der Festposten
+``--dual-p-overhead-mib`` liegt AUSSERHALB des P-Budgets (launcher.py:22713-22716, :14976 ``dual_share_planned_dc``); KV bei ``--dual-unified-kv on`` im
+Karten-Ledger (weg2/card_kv_ledger.py Kopf); Mamba-Zustand und Draft sind P-eigen; was sich nicht an D binden laesst (Diff), ist nicht gerechnet.
+
 Einstellungen (``settings``, alles optional ausser ``stage_layers``)::
 
     stage_layers        [int, ...]     Layer je Stufe, Summe = n_layers (``--pp-stage-ratio``)
@@ -1078,6 +1083,11 @@ def d_phase_config(args: Mapping[str, str], env: Mapping[str, str], model: Mappi
         cfg["fixed_parts"] = {"fremd": fo, "nichttorch": nt}
         note("fixed_mib", args.get("--d-foreign-context-mib") or args.get("--d-nontorch-mib"),
              "nur eine der Profilzeilen --d-foreign-context-mib / --d-nontorch-mib")
+    rs = _fl(args.get("--d-reserve-mib"))
+    if rs:
+        cfg["user_reserve_mib"] = rs
+        note("user_reserve_mib", args.get("--d-reserve-mib"),
+             "Profilzeile --d-reserve-mib (Launcher zieht sie vom Verfuegbaren ab: launcher.py:19886, pp_cut.d_rank_available_mib)")
     return dict(cfg, seen=seen)
 
 
@@ -1263,9 +1273,16 @@ def d_stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], cfg: Mapping[
         else:
             t["fixed"] = none("CUDA-Kontext, Graphen, Allokator-Reste: nur am Metall zu messen "
                               "(keine --d-foreign-context-mib/--d-nontorch-mib im Profil)")
-        stages.append({"ord": c.get("ord", i), "label": _label(c), "total_mib": totals[i],
-                       "budget_mib": {"v": budgets[i], "src": budget_src, "note": budget_note}, "terms": t})
+        st = {"ord": c.get("ord", i), "label": _label(c), "total_mib": totals[i],
+              "budget_mib": {"v": budgets[i], "src": budget_src, "note": budget_note}, "terms": t}
+        if cfg.get("user_reserve_mib") is not None:
+            st["user_reserve_mib"] = _per_card(cfg.get("user_reserve_mib"), n, "user_reserve_mib", 0.0)[i]
+        stages.append(st)
     hints = ["D: KV gesamt fuer %d Token Kontext ueber alle Raenge: %.0f MiB (%s)" % (ctx, kv_total, cell_src)]
+    if cfg.get("user_reserve_mib") is not None:
+        hints.append("D: --d-reserve-mib %s geht in den Verfuegbar-Vergleich ein (Launcher: verfuegbar = Karte - fremd - nichttorch - reserve), steht aber nicht "
+                     "als eigenes Segment im Balken: der Launcher haelt darin KV-Pool, Draft und Aktivierung (pp_cut.d_rank_available_mib), die hier einzeln stehen."
+                     % ",".join("%g" % x for x in _per_card(cfg.get("user_reserve_mib"), n, "user_reserve_mib", 0.0)))
     return {"stages": stages, "warnings": [], "hints": hints}
 
 
@@ -1277,10 +1294,18 @@ def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
     verfuegbar = Karte - fremd - nichttorch - reserve) liegen AUSSERHALB des Budgets: sie zaehlen nicht gegen das Budget, verkleinern aber das
     Verfuegbare (Segment ``ausserhalb_budget: true``).  Die Segmente SIND der Balken: Summe = max(Kartengroesse, Posten ausserhalb + max(Budget,
     Posten im Budget)); ragt sie ueber ``total_mib``, waechst der Balken ueber die Kartengrenze (``beyond_card_mib``) -- nichts wird abgeschnitten.
-    ``mib: None`` = nicht gerechnet.  Ist das Budget groesser als das Verfuegbare (``budget_over_available_mib``), lehnt der Launcher ab."""
+    ``mib: None`` = nicht gerechnet.  Ist das Budget groesser als das Verfuegbare (``budget_over_available_mib``), meldet der Launcher DARUEBER
+    und startet trotzdem (launcher.py:19902-19958; kein raise).  ``stage["user_reserve_mib"]`` (``--d-reserve-mib``, launcher.py:19886) geht in
+    den Verfuegbar-Vergleich ein (``pp_cut.d_rank_available_mib``), wird aber nicht als eigenes Segment gezeichnet: der Launcher haelt darin KV-Pool,
+    Draft und Aktivierung, die hier schon einzeln stehen.
+
+    Terme mit ``ref`` (Dual-Form, ``--dual-share``) sind REFERENZ ohne Budgetverbrauch: sie stehen in ``shared_with_d`` (nicht in ``segments``,
+    nicht in der Summe).  ``ref = "shared"``: Bytes liegen in D's Union-Image bzw. im Karten-KV-Pool; ``ref = "in_festposten"``: der Betrag steckt
+    schon im Festposten ``--dual-p-overhead-mib``.  ``stage["ref_extra"]`` traegt Referenzposten ohne Zahl (``mib: None``, nicht gerechnet)."""
     total = float(stage["total_mib"])
     budget = float(stage["budget_mib"]["v"])
     segs: List[Dict[str, Any]] = []
+    refs: List[Dict[str, Any]] = []
     missing: List[str] = []
     inside = 0.0
     outside = 0.0
@@ -1291,6 +1316,11 @@ def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
         if phase == "D":
             what = D_WHAT.get(key, what)
         v = t.get("v")
+        if t.get("ref"):
+            if v is not None and v > 0:
+                refs.append({"name": key, "label": label, "mib": round(float(v), 3), "ref": t["ref"], "herkunft": _origin(t["src"]),
+                             "detail": what + (" -- " + t["note"] if t.get("note") else ""), "gerechnet": True})
+            continue
         out_b = bool(t.get("outside_budget"))
         if v is None:
             segs.append({"name": key, "label": label, "mib": None, "herkunft": SRC_NONE, "detail": t.get("note") or what, "gerechnet": False})
@@ -1305,11 +1335,16 @@ def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
             if out_b:
                 seg["ausserhalb_budget"] = True
             segs.append(seg)
+    for x in stage.get("ref_extra") or ():
+        refs.append(dict(x))
+        if x.get("mib") is None:
+            missing.append(x["label"])
     known = inside + outside
     available = total - outside
+    user_reserve = float(stage.get("user_reserve_mib") or 0.0)
     overflow = max(0.0, inside - budget)
     beyond = max(0.0, known - total)
-    over_avail = max(0.0, budget - available)
+    over_avail = max(0.0, budget - (available - user_reserve))
     reserve = max(0.0, available - max(budget, inside))
     free = max(0.0, min(budget, available) - inside)
     bsrc = stage["budget_mib"]
@@ -1324,21 +1359,23 @@ def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
     return {"card": stage.get("ord"), "label": stage["label"], "phase": phase, "total_mib": total, "budget_mib": budget,
             "budget_herkunft": _origin(bsrc["src"]), "segments": segs, "posts_mib": round(known, 3), "free_mib": round(free, 3),
             "overflow_mib": round(overflow, 3), "beyond_card_mib": round(beyond, 3), "outside_budget_mib": round(outside, 3),
-            "available_mib": round(available, 3), "budget_over_available_mib": round(over_avail, 3), "not_computed": missing,
-            "over_text": _over_text(stage["label"], phase, overflow, beyond, budget, total, over_avail, outside)}
+            "available_mib": round(available, 3), "budget_over_available_mib": round(over_avail, 3), "user_reserve_mib": round(user_reserve, 3),
+            "shared_with_d": refs, "not_computed": missing,
+            "over_text": _over_text(stage["label"], phase, overflow, beyond, budget, total, over_avail, outside, user_reserve)}
 
 
 def _over_text(label: str, phase: str, overflow: float, beyond: float, budget: float, total: float,
-               over_avail: float = 0.0, outside: float = 0.0) -> str:
+               over_avail: float = 0.0, outside: float = 0.0, user_reserve: float = 0.0) -> str:
+    # Belegt ist nur, was der Launcher tut: bei Budget > Verfuegbar protokolliert er "DARUEBER" und bootet weiter (launcher.py:19902-19958,
+    # log_d_rank_vram_solve: kein raise).  Ob der Planer (propose) ablehnt, ist nicht Sache dieses Balkens -> kein "lehnt ab" ohne Beleg.
     if beyond > 0:
-        return ("%s (%s): Posten %.0f MiB ueber der KARTE (%.0f MiB). Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM "
-                "beim Laden oder beim Graphenaufbau." % (label, phase, beyond, total))
+        return ("%s (%s): Posten %.0f MiB ueber der KARTE (%.0f MiB); zu erwarten ist OOM beim Laden oder beim Graphenaufbau." % (label, phase, beyond, total))
     if overflow > 0:
-        return ("%s (%s): Posten %.0f MiB ueber dem Budget (%.0f MiB); die Reserve wird aufgezehrt. Der Planer lehnt ab; mit Force startet es "
-                "trotzdem." % (label, phase, overflow, budget))
+        return ("%s (%s): Posten %.0f MiB ueber dem Budget (%.0f MiB); die Reserve wird aufgezehrt." % (label, phase, overflow, budget))
     if over_avail > 0:
-        return ("%s (%s): Budget %.0f MiB ist %.0f MiB groesser als das Verfuegbare (Karte %.0f - Festposten %.0f MiB ausserhalb des Budgets). "
-                "Der Planer lehnt ab; mit Force startet es trotzdem." % (label, phase, budget, over_avail, total, outside))
+        res = (" - Nutzerreserve %.0f MiB (--d-reserve-mib)" % user_reserve) if user_reserve > 0 else ""
+        return ("%s (%s): Budget %.0f MiB ist %.0f MiB groesser als das Verfuegbare (Karte %.0f - Festposten %.0f MiB ausserhalb des Budgets%s). "
+                "Der Launcher meldet DARUEBER und startet trotzdem." % (label, phase, budget, over_avail, total, outside, res))
     return ""
 
 
@@ -1353,6 +1390,62 @@ def detect_form(args: Mapping[str, str], tokens: Sequence[str], n: int, form: Op
     if "--d-only" in tokens or "--d-only" in args:
         return "d_only"
     return "flip"
+
+
+#: Launcher-Standard fuer --dual-p-overhead-mib (launcher.py:22713, ``default=1500``)
+DUAL_P_OVERHEAD_DEFAULT_MIB = 1500
+
+
+def _dual_share_p_terms(stage: Dict[str, Any], args: Mapping[str, str], seen: Optional[List[Dict[str, str]]]) -> None:
+    """P-Stufe unter ``--dual-share``: was gegen das P-Budget zaehlt und was nur Referenz ist (AP-H2 Fix-Runde 3, Befund 1).
+
+    Belegt aus dem Launcher (Datei:Zeile im Baum 173161c595):
+
+    * ``--dual-share`` Hilfe (weg2/launcher.py:22707-22712): "P's stage computes on D's TP shards (shells over D's three shards of its layers) and binds
+      the shard of the D rank on its card to D's bytes via the union image. D boots right after P as the union OWNER, sized from P's PLANNED budget
+      (+ --dual-p-overhead-mib)".  Die Gewichte (und damit die residenten Experten, UNION_ROLES = ``main``, launcher.py:14784) liegen im Union-Image
+      von D; P haelt davon nichts im eigenen Budget -> Referenz ``shared`` (Gewichte doppelt zu zaehlen waere falsch).  Was sich NICHT an D's
+      Bytes binden laesst, behaelt P (weg2/union_arena_bind.py, Kopf: "What it cannot prove, it keeps"); die Menge ist ohne Boot nicht zu belegen
+      -> Referenzposten ``diff`` "nicht gerechnet".
+    * ``--dual-p-overhead-mib`` (launcher.py:22713-22716, Standard 1500): "what P holds on a card outside its --rank-gpu-memory-mib budget (CUDA
+      context, graphs, activations)" -> Festposten AUSSERHALB des Budgets; die Aktivierung steckt darin (Referenz ``in_festposten``, kein
+      zweiter Abzug).  D wird aus "P's PLAN" bemessen: Budget + dieser Wert (launcher.py:14976 ``dual_share_planned_dc``, :27291).
+    * ``--dual-unified-kv on`` (weg2/card_kv_ledger.py Kopf: "the REST of the card is ONE KV budget K_c, with no split", P und D fragen ein Ledger;
+      weg2/dual_p_kv_stage.py Kopf: P-Pool "born trimmed at 0 tokens", Bytes aus dem Karten-Ledger): P's KV liegt im Karten-KV-Pool, nicht im
+      P-Budget -> Referenz ``shared``.  Ohne ``on`` ist das nicht belegt -> KV zaehlt gegen das P-Budget.
+    * Mamba/GDN-Zustand (card_kv_ledger.py Kopf: "The boot fixes weights, contexts, mamba, graph pools and activation transients") und der Draft
+      (UNION_ROLES = ``main``: der Draft ist nicht geteilt, launcher.py:14781-14784) bleiben P-eigen und zaehlen gegen das P-Budget.
+    """
+    terms = stage["terms"]
+
+    def ref(key: str, kind: str, note: str) -> None:
+        t = terms.get(key)
+        if t is not None and t.get("v") is not None:
+            t["ref"] = kind
+            t["note"] = note + ((" -- " + t["note"]) if t.get("note") else "")
+
+    ref("weights", "shared", "Dual-Share: P rechnet auf D's TP-Shards und bindet sie ueber das Union-Image an D's Bytes (launcher.py:22707-22712); zaehlt nicht gegen das P-Budget")
+    ref("experts", "shared", "Dual-Share: residente Experten liegen im Union-Image von D (UNION_ROLES=main, launcher.py:14784); zaehlt nicht gegen das P-Budget")
+    if str(args.get("--dual-unified-kv", "off")).lower() == "on":
+        ref("kv", "shared", "--dual-unified-kv on: ein KV-Pool je Karte fuer P und D (weg2/card_kv_ledger.py), P-Pool virtuell; zaehlt nicht gegen das P-Budget")
+    ref("activation", "in_festposten", "Aktivierung steckt in --dual-p-overhead-mib (launcher.py:22713-22716: CUDA-Kontext, Graphen, Aktivierungen)")
+    ov_raw = args.get("--dual-p-overhead-mib")
+    try:
+        ov = float(ov_raw) if ov_raw not in (None, "") else float(DUAL_P_OVERHEAD_DEFAULT_MIB)
+    except (TypeError, ValueError):
+        ov = float(DUAL_P_OVERHEAD_DEFAULT_MIB)
+        ov_raw = None
+    given = ov_raw not in (None, "")
+    terms["fixed"] = {"v": ov, "src": SRC_INPUT if given else SRC_DEFAULT, "outside_budget": True,
+                      "note": "--dual-p-overhead-mib: was P je Karte AUSSERHALB seines --rank-gpu-memory-mib haelt (Kontext, Graphen, Aktivierung; launcher.py:22713-22716)"
+                              + ("" if given else "; Standard des Launchers %d MiB (nicht im Profil gesetzt)" % DUAL_P_OVERHEAD_DEFAULT_MIB)}
+    stage["ref_extra"] = [{"name": "diff", "label": "Diff der P-Gewichte", "mib": None, "ref": "shared", "herkunft": SRC_NONE, "gerechnet": False,
+                           "detail": "Was sich nicht an D's Bytes binden laesst, behaelt P selbst (union_arena_bind.py Kopf: \"What it cannot prove, it keeps\"); "
+                                     "die Menge ist ohne Boot nicht zu belegen"}]
+    if seen is not None:
+        seen.append({"was": "dual_p_overhead_mib", "wert": "%g" % ov, "herkunft": ("Profilzeile --dual-p-overhead-mib" if given else
+                     "Standard des Launchers (--dual-p-overhead-mib 1500, launcher.py:22713)")})
+        seen.append({"was": "dual_share", "wert": "an", "herkunft": "Profilzeile --dual-share: Gewichte/Experten (und KV bei --dual-unified-kv on) zaehlen nicht gegen das P-Budget"})
 
 
 def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[str, str], phase_args: Optional[Mapping[str, Any]] = None,
@@ -1375,6 +1468,7 @@ def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[st
     draft = _draft_info(model, all_args)
     carries_p = str(all_args.get("--draft-kv-on-p", "on")).lower() != "off"
     approx: Optional[Dict[str, Any]] = None
+    dual_share = form == "dual" and ("--dual-share" in all_args or "--dual-share" in tokens)
 
     def run_p(name: str, scope: str) -> Dict[str, Any]:
         nonlocal approx
@@ -1390,6 +1484,8 @@ def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[st
             st2 = dict(st)
             st2["_rate_known"] = t["_ctx"]["rate"] > 0
             st2["terms"] = _p_terms_for_contract(st2, draft, carries, i == len(t["stages"]) - 1, settings)
+            if dual_share and name == "P":
+                _dual_share_p_terms(st2, all_args, seen if i == 0 else None)
             stages.append(st2)
         try:
             approx = approx_payload(hw, model, settings)
@@ -1398,8 +1494,10 @@ def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[st
         if name == "P" and draft["kind"] != "none" and not carries:
             seen.append({"was": "draft", "wert": "aus", "herkunft": "Profilzeile --draft-kv-on-p off: P traegt keinen MTP-Kopf"})
         label = "P-Phase (Prefill, Pipeline-Stufen)" if name == "P" else "Einzelkarte (eine Phase)"
+        # Kontext-Boden = Token, die nach den Gewichten ins Budget passen: unter --dual-share zaehlen die Gewichte nicht gegen das P-Budget, die Zahl
+        # waere eine andere Frage -> nicht gerechnet (None) statt einer falschen 0
         return {"ok": True, "label": label, "bars": [contract_bar(s, name) for s in stages], "inputs": seen,
-                "context_floor_tokens": t["context_floor_tokens"], "warnings": t["warnings"]}
+                "context_floor_tokens": None if (dual_share and name == "P") else t["context_floor_tokens"], "warnings": t["warnings"]}
 
     def run_d() -> Dict[str, Any]:
         a = _merged(args, phase_args, "D")
@@ -1426,6 +1524,9 @@ def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[st
     if form == "dual":
         hints.append("Dual: P und D laufen gleichzeitig auf denselben Karten. Die Summe beider Balken ist nicht gerechnet (--dual-share: P rechnet "
                      "auf den Shards von D, die Dual-Passung ist Planer-Rechnung des AP-E, nicht hw_fit).")
+        if dual_share:
+            hints.append("Dual-Share: P's Gewichte und Experten liegen im Union-Image von D und zaehlen nicht gegen das P-Budget (Referenzzeile unter dem "
+                         "Balken); gegen das P-Budget zaehlen die P-eigenen Posten, der Festposten --dual-p-overhead-mib liegt ausserhalb des Budgets.")
     return {"schema": BALKEN_SCHEMA, "form": form, "n_cards": n, "phases": out_phases, "hints": hints, "approx": approx,
             "draft": {k: draft[k] for k in ("kind", "placement", "reason")}}
 

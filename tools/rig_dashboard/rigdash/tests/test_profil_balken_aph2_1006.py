@@ -311,6 +311,41 @@ class TestJsContract(unittest.TestCase):
         self.assertIn("größer als das Verfügbare", html)
         self.assertIn("AUSSERHALB des Budgets", tip)
 
+    def test_dual_share_reference_row_is_not_part_of_the_bar_sum(self):
+        # Fix-Runde 3, Befund 1: Referenzposten (geteilt mit D) stehen als Geisterstreifen + Chips, nicht in den Segmenten und nicht in der Summe
+        b = self.bar(segments=[{"name": "state", "label": "Mamba/GDN-Zustand", "mib": 100, "herkunft": "x", "detail": "d"},
+                               {"name": "fixed", "label": "Festposten", "mib": 150, "herkunft": "x", "detail": "d", "ausserhalb_budget": True},
+                               {"name": "reserve", "label": "Reserve", "mib": 350, "herkunft": "x", "detail": "d"},
+                               {"name": "free", "label": "Frei", "mib": 400, "herkunft": "gerechnet", "detail": "d"}],
+                     shared_with_d=[{"name": "weights", "label": "Gewichte", "mib": 300, "ref": "shared", "herkunft": "Modellprofil", "detail": "im Union-Image von D"},
+                                    {"name": "activation", "label": "Aktivierung", "mib": 40, "ref": "in_festposten", "herkunft": "x", "detail": "im Festposten"},
+                                    {"name": "diff", "label": "Diff der P-Gewichte", "mib": None, "ref": "shared", "herkunft": "nicht gerechnet", "detail": "nicht belegbar"}])
+        o = self.js("const M=require(%r);const b=%s;console.log(JSON.stringify({html:M.render([b],{base:0}),m:M.model(b)}))" % (JS, json.dumps(b)))
+        self.assertAlmostEqual(o["m"]["sum"], 1000)                                   # Summe = Karte; die Referenz ist nicht dabei
+        html = o["html"]
+        self.assertIn('class="kp-ghost"', html)
+        self.assertEqual(html.count('class="kp-gs"'), 1)                              # nur "shared" mit Zahl; "in_festposten" und ohne Zahl kein Streifen
+        self.assertIn("Gewichte</b>: 300 MiB geteilt mit D", html)
+        self.assertIn("Aktivierung</b>: 40 MiB steckt im Festposten", html)
+        self.assertIn("Diff der P-Gewichte</b>: nicht gerechnet", html)
+        self.assertNotIn("kp-bz", html)
+
+    def test_no_refusal_claim_without_a_source_and_the_user_reserve_enters_the_verdict(self):
+        o = self.js("const M=require(%r);const b=M.contractBar('K','D',1000,900,'x',[{name:'weights',label:'W',mib:300}],{userReserve:200});"
+                    "console.log(JSON.stringify({b,html:M.render([b],{base:0}),src:require('fs').readFileSync(%r,'utf8')}))" % (JS, JS))
+        self.assertEqual(o["b"]["budget_over_available_mib"], 100)
+        self.assertEqual(o["b"]["user_reserve_mib"], 200)
+        self.assertIn("Nutzerreserve 200 MiB (--d-reserve-mib)", o["html"])
+        self.assertIn("Der Launcher meldet DARUEBER und startet trotzdem", o["html"])
+        self.assertNotIn("Der Planer lehnt ab", o["src"])                              # kein unbelegter Ablehnungstext in der Darstellung
+
+    def test_contract_bar_dual_extra_counts_the_missing_diff_as_not_computed(self):
+        o = self.js("const M=require(%r);console.log(JSON.stringify(M.contractBar('K','P',1000,600,'x',[{name:'state',label:'S',mib:100}],"
+                    "{shared:[{name:'weights',label:'Gewichte',mib:300,ref:'shared'},{name:'diff',label:'Diff',mib:null,ref:'shared'}]})))" % JS)
+        self.assertEqual(o["not_computed"], ["Diff"])
+        self.assertEqual(len(o["shared_with_d"]), 2)
+        self.assertEqual(sum(s["mib"] for s in o["segments"]), 1000)
+
     PAYLOAD = {"n_stages": 2, "stage_layers": [2, 2], "layer_dense_mib": [100, 80, 80, 100], "layer_expert_mib": [400, 400, 400, 400],
                "layer_attn": [1, 0, 0, 1], "embed_mib": 50, "lm_head_mib": 70, "replicated_mib": 0, "draft_mib": 0, "draft_layers": 0,
                "buf_fracs": [0.5, 0.25], "cell_mib": 0.001, "context_tokens": 1000, "chunk_rows": 100, "extend_rate_mib": 0.5,
@@ -334,13 +369,14 @@ class TestJsContract(unittest.TestCase):
 
     def test_the_page_loads_the_styles_and_the_tab_asks_for_phase_bars(self):
         html = open(os.path.join(STATIC, "index.html"), encoding="utf-8").read()
-        for needle in (".kp-bz", ".ks-r", ".kp-ncs", ".kp-nc "):
+        for needle in (".kp-bz", ".ks-r", ".kp-ncs", ".kp-nc ", ".kp-ghost", ".kp-refs"):
             self.assertIn(needle, html)
         pj = open(os.path.join(STATIC, "profil.js"), encoding="utf-8").read()
         for needle in ('what: "phase_bars"', "renderPhases", "approxContractBars", "draft_error"):
             self.assertIn(needle, pj)
+        self.assertIn('res.form === "dual"', pj)                                      # Dual: keine lineare Browser-Naeherung (kennt die Referenzposten nicht)
         head = open(JS, encoding="utf-8").read().split("(function (root)")[0]
-        for needle in ("flliper.balken/1", '"herkunft"', '"mib":', "NICHT GERECHNET", "Summenregel"):
+        for needle in ("flliper.balken/1", '"herkunft"', '"mib":', "NICHT GERECHNET", "Summenregel", "shared_with_d", "user_reserve_mib"):
             self.assertIn(needle, head)
 
 
@@ -403,6 +439,19 @@ print(json.dumps({"hw": hw, "model": model, "bar": PC.contract_bar(st, "P")}))
                          [(s["name"], s["mib"]) for s in py["segments"] if s["mib"] is not None])
         for k in ("posts_mib", "free_mib", "overflow_mib", "beyond_card_mib"):
             self.assertAlmostEqual(jb[k], py[k], places=6, msg=k)
+
+    def test_dual_share_reference_profile_has_no_overflow_through_the_worker(self):
+        # Fix-Runde 3: P-Budgets des Release-Dual-Profils (6610,5050,5200) -- vorher roter Ueberlauf auf allen drei Karten
+        r = self.ask(server_args={"--pp-stage-ratio": "29,11,8", "--pp-attn-stage-ratio": "7,3,2", "--max-kv-per-request": "262144", "--draft-kv-on-p": "off",
+                                  "--rank-gpu-memory-mib": "9000,5000,5200", "--dual-share": "", "--dual-p-overhead-mib": "2500", "--dual-unified-kv": "on"})
+        self.assertTrue(r["ok"], r)
+        res = r["result"]
+        self.assertEqual(res["form"], "dual")
+        for b in res["phases"]["P"]["bars"]:
+            self.assertEqual((b["overflow_mib"], b["beyond_card_mib"]), (0.0, 0.0))
+            self.assertTrue(any(x["name"] == "weights" for x in b["shared_with_d"]))
+            self.assertFalse(any(x["name"] == "weights" for x in b["segments"]))
+        json.dumps(res)
 
     def test_browser_approximation_stays_within_half_a_mib_of_the_p_phase(self):
         res = self.ask()["result"]

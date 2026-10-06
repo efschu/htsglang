@@ -195,6 +195,13 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .kp-ncs { display: flex; flex-wrap: wrap; gap: 4px 6px; margin: 4px 0 2px; }
 .kp-nc { font-size: 11.5px; padding: 1px 7px; border: 1px dashed var(--muted); border-radius: 10px; color: var(--text-2); cursor: help; background: var(--surface-2); }
 .kp-nc:focus { outline: 2px solid var(--text); outline-offset: 1px; }
+/* Dual-Share: Referenz ohne Budgetverbrauch (Geisterstreifen im Maßstab des Balkens + Chips) */
+.kp-ghost { display: flex; height: 5px; margin-top: 2px; overflow: hidden; border-radius: 3px; }
+.kp-gs { flex: 0 0 auto; box-sizing: border-box; border: 1px dashed var(--muted); border-left-width: 0; background: color-mix(in srgb, var(--muted) 14%, transparent); }
+.kp-gs:first-child { border-left-width: 1px; }
+.kp-refs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin: 3px 0 2px; font-size: 11.5px; }
+.kp-ref { padding: 1px 7px; border: 1px dashed var(--muted); border-radius: 10px; color: var(--text-2); cursor: help; background: var(--surface-2); }
+.kp-ref:focus { outline: 2px solid var(--text); outline-offset: 1px; }
 .kp-ph-chip { display: inline-block; font-size: 11px; font-weight: 650; padding: 0 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); vertical-align: 1px; }
 .pf-fold.kp-in { margin: 2px 0 8px; font-size: 12px; } .pf-fold.kp-in > summary { font-weight: 500; color: var(--text-2); cursor: pointer; }
 @media (max-width: 520px) { .pf-bar-h { line-height: 1.5; } .kp-edge span { font-size: 9.5px; } }

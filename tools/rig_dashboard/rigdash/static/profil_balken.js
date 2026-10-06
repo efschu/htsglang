@@ -19,12 +19,18 @@
                  "segments": [ Segment, ... ],       // IN LOGISCHER REIHENFOLGE, zusammenhängend: Gewichte | Experten | Draft | KV | Mamba |
                                                      //   (Aktivierung | Festposten) | Reserve | Frei -- die Segmente SIND der Balken
                  "posts_mib": 27323.2, "free_mib": 4259.8,
-                 "overflow_mib": 0,                  // Posten über dem BUDGET (der Planer lehnt ab)
+                 "overflow_mib": 0,                  // Posten über dem BUDGET (die Reserve wird aufgezehrt)
                  "beyond_card_mib": 0,               // Posten über der KARTE: der Balken wächst über die Kartengrenze, nichts wird abgeschnitten
                  "outside_budget_mib": 0,            // optional: Posten AUSSERHALB des Budgets (D-Phase: Festposten fremd + nichttorch); Segment trägt ausserhalb_budget:true
                  "available_mib": 32607,             // optional: Kartengröße − Posten ausserhalb des Budgets
-                 "budget_over_available_mib": 0,     // optional: Budget größer als das Verfügbare (der Launcher lehnt ab)
+                 "budget_over_available_mib": 0,     // optional: Budget größer als das Verfügbare (der Launcher meldet DARUEBER und startet trotzdem, launcher.py:19902-19958)
+                 "user_reserve_mib": 0,              // optional: --d-reserve-mib (D-Phase); geht in den Verfügbar-Vergleich ein, wird nicht gezeichnet
+                 "shared_with_d": [ RefSegment, ... ],  // optional (Dual-Form --dual-share, P-Phase): REFERENZ ohne Budgetverbrauch, NICHT in segments und nicht in der Summe
                  "not_computed": [ "Festposten" ], "over_text": "" }
+
+     RefSegment = { "name", "label", "mib": number | null, "ref": "shared" | "in_festposten", "herkunft", "detail", "gerechnet" }
+                 // "shared" = die Bytes liegen in D's Union-Image bzw. im Karten-KV-Pool; "in_festposten" = der Betrag steckt schon im Festposten;
+                 // mib = null = nicht gerechnet (z. B. das Diff, das sich nicht an D's Bytes binden lässt)
 
      Segment = { "name":  "weights"|"experts"|"draft"|"kv"|"state"|"activation"|"fixed"|"reserve"|"free",
                  "label": "Gewichte",
@@ -127,7 +133,9 @@
   }
   // Vertragsbalken aus Posten (Reihenfolge wie profile_couplings.contract_bar): Posten | Reserve | Frei; Reserve und Frei folgen aus Budget und Posten
   // Posten mit `outside` (D-Phase: Festposten --d-foreign-context-mib + --d-nontorch-mib) liegen AUSSERHALB des Budgets (Launcher: verfügbar = Karte − fremd − nichttorch − reserve)
-  function contractBar(label, phase, total, budget, budgetOrigin, posts) {
+  // extra (optional): { userReserve: --d-reserve-mib, shared: [RefSegment] } -- wie stage["user_reserve_mib"] / stage["ref_extra"] in contract_bar
+  function contractBar(label, phase, total, budget, budgetOrigin, posts, extra) {
+    extra = extra || {};
     const segs = [], missing = [];
     let inside = 0, outside = 0;
     posts.forEach((p) => {
@@ -140,14 +148,16 @@
       }
     });
     const known = inside + outside, available = total - outside;
-    const overflow = Math.max(0, inside - budget), beyond = Math.max(0, known - total), overAvail = Math.max(0, budget - available);
+    const userReserve = extra.userReserve || 0;
+    const overflow = Math.max(0, inside - budget), beyond = Math.max(0, known - total), overAvail = Math.max(0, budget - (available - userReserve));
     const reserve = Math.max(0, available - Math.max(budget, inside)), free = Math.max(0, Math.min(budget, available) - inside);
     if (reserve > 0) segs.push({ name: "reserve", label: "Reserve", mib: reserve, herkunft: budgetOrigin || "", gerechnet: true,
       detail: LEG_TAIL[0][2] + (overflow > 0 ? " -- Wunsch " + fmt(available - budget) + " MiB, davon " + fmt(overflow) + " MiB aufgezehrt" : "") });
     if (free > 0) segs.push({ name: "free", label: "Frei", mib: free, herkunft: "gerechnet", gerechnet: true,
       detail: LEG_TAIL[1][2] + (missing.length ? " -- OBERGRENZE: nicht gerechnet sind " + missing.join(", ") : "") });
     return { label, phase, total_mib: total, budget_mib: budget, budget_herkunft: budgetOrigin || "", segments: segs, posts_mib: known, free_mib: free,
-      overflow_mib: overflow, beyond_card_mib: beyond, outside_budget_mib: outside, available_mib: available, budget_over_available_mib: overAvail, not_computed: missing };
+      overflow_mib: overflow, beyond_card_mib: beyond, outside_budget_mib: outside, available_mib: available, budget_over_available_mib: overAvail,
+      user_reserve_mib: userReserve, shared_with_d: (extra.shared || []).slice(), not_computed: missing.concat((extra.shared || []).filter((x) => x.mib == null).map((x) => x.label)) };
   }
   // Näherungsbalken (barFromTerms: Posten bis zum Budget, Überlauf-Segment mit `cut`) -> Vertragsbalken; nicht gemessene Festposten bleiben "nicht gerechnet"
   function toContract(b, phase) {
@@ -189,7 +199,7 @@
       '<span class="muted">' + esc(s.what || s.label) + "</span>" +
       (s.outside ? '<br><span class="muted">liegt AUSSERHALB des Budgets (verkleinert das Verfügbare der Karte)</span>' : "") +
       (beyond > 0 ? '<br><span class="kp-t-bad">' + fmt(beyond) + " MiB dieses Postens liegen HINTER der Kartengrenze (" + fmt(bar.total_mib) + " MiB): zu erwarten ist OOM.</span>" : "") +
-      (s.key === "overflow" ? '<br><span class="kp-t-bad">Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden.</span>' : "");
+      (s.key === "overflow" ? '<br><span class="kp-t-bad">Posten über dem Budget: die Reserve wird aufgezehrt, zu erwarten ist OOM beim Laden.</span>' : "");
   }
   function bar(b0, ctx) {
     const b = normBar(b0), m = model(b), w = (a) => (100 * a / m.scale).toFixed(3) + "%";
@@ -212,10 +222,26 @@
     const nc = (b.segments || []).filter((s) => s.mib == null);
     return nc.length ? '<div class="kp-ncs">' + nc.map((s) => { const n = normSeg(s); return '<span class="kp-nc" tabindex="0" title="' + esc(n.what) + '"><b>' + esc(n.label) + "</b>: nicht gerechnet</span>"; }).join("") + "</div>" : "";
   }
+  // Dual-Form: Referenzposten OHNE Budgetverbrauch (Gewichte/Experten/KV, die in D's Union-Image bzw. im Karten-KV-Pool liegen): dünner Geisterstreifen
+  // unter dem Balken im selben Maßstab (nicht Teil der Summe) plus Chips mit Tooltip; Posten ohne Zahl stehen als "nicht gerechnet"
+  function refNote(r) {
+    return r.ref === "in_festposten" ? "steckt im Festposten" : "geteilt mit D";
+  }
+  function refs(b0, scale) {
+    const b = normBar(b0), rs = (b.shared_with_d || []).map(normRef);
+    if (!rs.length) return "";
+    const strip = rs.filter((r) => r.mib > 0 && r.ref !== "in_festposten").map((r) => '<i class="kp-gs" style="width:' + (100 * r.mib / scale).toFixed(3) + '%" title="' + esc(r.label + " " + fmt(r.mib) + " MiB (geteilt mit D, nicht im Budget)") + '"></i>').join("");
+    const chips = rs.map((r) => '<span class="kp-ref' + (r.mib == null ? " kp-nc" : "") + '" tabindex="0" title="' + esc((r.what || "") + (r.origin ? " | Herkunft: " + r.origin : "")) + '"><b>' + esc(r.label) + "</b>: " +
+      (r.mib == null ? "nicht gerechnet" : fmt(r.mib) + " MiB " + refNote(r)) + "</span>").join("");
+    return (strip ? '<div class="kp-ghost" aria-hidden="true">' + strip + "</div>" : "") + '<div class="kp-refs"><span class="muted">Nicht im Budget:</span> ' + chips + "</div>";
+  }
+  function normRef(s) {
+    return { label: s.label || s.name, mib: s.mib == null ? null : s.mib, ref: s.ref || "shared", origin: s.origin || s.herkunft || "", what: s.what || s.detail || "" };
+  }
   function overNote(b) {
-    if (b.beyond_card_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.beyond_card_mib) + " MiB über der Karte.</b> Der Balken wächst über die Kartengrenze. Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden oder beim Graphenaufbau.</div>";
-    if (b.overflow_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Die Reserve wird aufgezehrt. Der Planer lehnt ab; mit Force startet es trotzdem.</div>";
-    if (b.budget_over_available_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": Budget " + fmt(b.budget_mib) + " MiB ist " + fmt(b.budget_over_available_mib) + " MiB größer als das Verfügbare</b> (Karte " + fmt(b.total_mib) + " − Festposten " + fmt(b.outside_budget_mib) + " MiB außerhalb des Budgets). Der Planer lehnt ab; mit Force startet es trotzdem.</div>";
+    if (b.beyond_card_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.beyond_card_mib) + " MiB über der Karte.</b> Der Balken wächst über die Kartengrenze; zu erwarten ist OOM beim Laden oder beim Graphenaufbau.</div>";
+    if (b.overflow_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Die Reserve wird aufgezehrt.</div>";
+    if (b.budget_over_available_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": Budget " + fmt(b.budget_mib) + " MiB ist " + fmt(b.budget_over_available_mib) + " MiB größer als das Verfügbare</b> (Karte " + fmt(b.total_mib) + " − Festposten " + fmt(b.outside_budget_mib) + " MiB außerhalb des Budgets" + (b.user_reserve_mib > 0 ? " − Nutzerreserve " + fmt(b.user_reserve_mib) + " MiB (--d-reserve-mib)" : "") + "). Der Launcher meldet DARUEBER und startet trotzdem.</div>";
     return "";
   }
   function render(bars, opt) {
@@ -225,9 +251,9 @@
       const head = b.free_mib != null && !(b.overflow_mib > 0) ? "Rest " + fmt(b.free_mib) + " MiB" + (b.not_computed && b.not_computed.length ? " (Obergrenze)" : "") : "Überlauf " + fmt(b.overflow_mib) + " MiB über dem Budget" + (b.beyond_card_mib > 0 ? " · " + fmt(b.beyond_card_mib) + " MiB über der Karte" : "");
       // Altform (Näherung): Überlauf als eigenes Segment, kein overflow_mib-Feld in der Darstellung nötig
       let ov = overNote(b);
-      if (!ov && b.overflow_mib > 0) ov = '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden. " + esc((b.segments.find((s) => s.key === "overflow") || {}).what || "") + "</div>";
+      if (!ov && b.overflow_mib > 0) ov = '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Zu erwarten ist OOM beim Laden. " + esc((b.segments.find((s) => s.key === "overflow") || {}).what || "") + "</div>";
       return '<div class="pf-bar"><div class="pf-bar-h"><b>' + esc(b.label) + '</b>' + (b.phase ? ' <span class="kp-ph-chip">' + esc(b.phase) + "</span>" : "") + ' <span class="muted">Budget ' + fmt(b.budget_mib) + " MiB von " + fmt(b.total_mib) + " MiB · " + head + "</span></div>" +
-        bar(b, (opt.base || 0) + i) + ncChips(b) + ov + "</div>";
+        bar(b, (opt.base || 0) + i) + refs(b, model(b).scale) + ncChips(b) + ov + "</div>";
     }).join("");
     return legend() + rows;
   }

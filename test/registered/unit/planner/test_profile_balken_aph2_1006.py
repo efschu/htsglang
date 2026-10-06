@@ -443,5 +443,131 @@ class TestBridge(unittest.TestCase):
         self.assertFalse(res["ok"])
 
 
+# Dual-Referenzprofil (docker/profiles_release/27b-nvfp4-dual.env, 262k-Variante): P-Budgets 6610,5050,5200, Schnitt 31,17,16, Mamba 8 Slots, Overhead 2500
+DUAL_ARGS = {"--pp-stage-ratio": "31,17,16", "--pp-attn-stage-ratio": "7,5,4", "--max-kv-per-request": "262144", "--draft-kv-on-p": "off",
+             "--rank-gpu-memory-mib": "6610,5050,5200", "--max-mamba-cache-size": "8", "--dual-share": "", "--dual-p-overhead-mib": "2500",
+             "--dual-unified-kv": "on", "--dual-p-kv-max-tokens": "196608", "--p-chunk-max": "1024"}
+
+
+def dual(**kw):
+    a = dict(kw.pop("args", DUAL_ARGS))
+    return PC.phase_bars(hw(), kw.pop("m", model("qwen27b_int8_vocabembed")), a, {}, {}, **kw)
+
+
+class TestDualSharePhase(unittest.TestCase):
+    """Fix-Runde 3, Befund 1: unter --dual-share zaehlen P's Gewichte NICHT gegen das P-Budget (Belege im Kommentar von _dual_share_p_terms)."""
+
+    def test_the_release_dual_form_shows_no_overflow_and_keeps_weights_as_a_reference(self):
+        r = dual()
+        self.assertEqual(r["form"], "dual")
+        p = r["phases"]["P"]
+        for b, bud in zip(p["bars"], (6610, 5050, 5200)):
+            self.assertEqual((b["overflow_mib"], b["beyond_card_mib"], b["budget_over_available_mib"], b["over_text"]), (0.0, 0.0, 0.0, ""))
+            self.assertEqual(b["budget_mib"], bud)
+            names = [x["name"] for x in b["segments"]]
+            self.assertNotIn("weights", names)
+            self.assertNotIn("experts", names)
+            self.assertNotIn("kv", names)                                              # --dual-unified-kv on: Karten-KV-Pool
+            refs = {x["name"]: x for x in b["shared_with_d"]}
+            self.assertGreater(refs["weights"]["mib"], 1000)                           # die vollen Gewichte als Referenz (vorher gegen das Budget gezaehlt)
+            self.assertEqual(refs["weights"]["ref"], "shared")
+            self.assertGreater(refs["kv"]["mib"], 0)
+            self.assertEqual(refs["activation"]["ref"], "in_festposten")
+            self.assertIsNone(refs["diff"]["mib"])                                      # Diff nicht gerechnet, nie geraten
+            self.assertIn("Diff der P-Gewichte", b["not_computed"])
+            self.assertIn("OBERGRENZE", next(x for x in b["segments"] if x["name"] == "free")["detail"])
+            # Summenregel unveraendert: Segmente = Karte, Referenz zaehlt nicht mit
+            self.assertAlmostEqual(sum(x["mib"] for x in b["segments"]), b["total_mib"], places=2)
+        self.assertIsNone(p["context_floor_tokens"])                                     # "Kontext-Boden 0 Token" war eine falsche Zahl
+
+    def test_only_p_own_posts_count_against_the_budget_and_the_overhead_sits_outside(self):
+        b = dual()["phases"]["P"]["bars"][0]
+        inside = {x["name"]: x["mib"] for x in b["segments"] if not x.get("ausserhalb_budget") and x["name"] not in ("reserve", "free")}
+        self.assertEqual(list(inside), ["state"])                                        # Mamba/GDN-Zustand ist P-eigen
+        fx = next(x for x in b["segments"] if x["name"] == "fixed")
+        self.assertEqual((fx["mib"], fx.get("ausserhalb_budget")), (2500.0, True))
+        self.assertEqual(fx["herkunft"], "Eingabe (Nutzer/Profil)")
+        self.assertIn("launcher.py:22713", fx["detail"])
+        self.assertEqual(b["outside_budget_mib"], 2500.0)
+        self.assertEqual(b["available_mib"], b["total_mib"] - 2500.0)
+
+    def test_without_the_overhead_flag_the_launcher_default_1500_is_named_as_an_assumption(self):
+        a = dict(DUAL_ARGS)
+        del a["--dual-p-overhead-mib"]
+        fx = next(x for x in dual(args=a)["phases"]["P"]["bars"][0]["segments"] if x["name"] == "fixed")
+        self.assertEqual(fx["mib"], 1500.0)
+        self.assertEqual(fx["herkunft"], "Annahme dieser Rechnung")
+        self.assertIn("Standard des Launchers", fx["detail"])
+
+    def test_without_unified_kv_the_kv_still_counts_against_the_p_budget(self):
+        a = dict(DUAL_ARGS)
+        a["--dual-unified-kv"] = "off"
+        b = dual(args=a)["phases"]["P"]["bars"][0]
+        self.assertIn("kv", [x["name"] for x in b["segments"]])
+        self.assertNotIn("kv", [x["name"] for x in b["shared_with_d"]])
+        self.assertGreater(b["overflow_mib"], 0)                                          # 262144 Token KV gegen 6610 MiB: das ist dann echt ueber dem Budget
+
+    def test_a_p_own_post_over_the_budget_is_still_an_overflow(self):
+        a = dict(DUAL_ARGS)
+        a["--rank-gpu-memory-mib"] = "100,100,100"
+        for b in dual(args=a)["phases"]["P"]["bars"]:
+            self.assertGreater(b["overflow_mib"], 0)
+            self.assertIn("ueber dem Budget", b["over_text"])
+
+    def test_flip_and_d_only_are_unchanged_by_the_dual_share_branch(self):
+        flip = dual(args={k: v for k, v in DUAL_ARGS.items() if not k.startswith("--dual-")}, form="flip")
+        for b in flip["phases"]["P"]["bars"]:
+            self.assertIn("weights", [x["name"] for x in b["segments"]])                  # Flip: volle Gewichte gegen das Budget
+            self.assertEqual(b["shared_with_d"], [])
+        self.assertTrue(flip["phases"]["P"]["bars"][0]["overflow_mib"] > 0)
+        dual_no_share = {k: v for k, v in DUAL_ARGS.items() if k != "--dual-share"}
+        r = dual(args=dual_no_share, tokens=["--dual-layout"])                            # --dual-layout ohne --dual-share: P haelt eigene Gewichte
+        self.assertIn("weights", [x["name"] for x in r["phases"]["P"]["bars"][0]["segments"]])
+        self.assertEqual(r["phases"]["P"]["bars"][0]["shared_with_d"], [])
+        d = dual(form="d_only")
+        self.assertEqual(list(d["phases"]), ["D"])
+
+    def test_the_hint_explains_the_reference_row(self):
+        self.assertTrue(any("Union-Image von D" in h for h in dual()["hints"]))
+
+
+class TestLauncherSemanticsOfTheTexts(unittest.TestCase):
+    """Fix-Runde 3, Befund 2: der Launcher meldet DARUEBER und bootet weiter (launcher.py:19902-19958); --d-reserve-mib (launcher.py:19886) geht ins Verfuegbare."""
+
+    def test_budget_over_available_names_the_launcher_not_a_refusal(self):
+        b = PC.contract_bar(dict(stage(1000, 900, weights=300, fixed=150), terms={"weights": {"v": 300.0, "src": "Eingabe", "note": ""},
+                                                                                     "fixed": {"v": 150.0, "src": "Eingabe", "note": "", "outside_budget": True}}), "D")
+        self.assertEqual(b["budget_over_available_mib"], 50.0)
+        self.assertIn("Launcher meldet DARUEBER und startet trotzdem", b["over_text"])
+        self.assertNotIn("lehnt ab", b["over_text"])
+        self.assertNotIn("Force", b["over_text"])
+
+    def test_no_text_of_the_contract_claims_a_refusal(self):
+        for b in (PC.contract_bar(stage(1000, 900, weights=700, kv=500), "D"), PC.contract_bar(stage(1000, 900, weights=600, kv=350), "P")):
+            self.assertNotIn("lehnt ab", b["over_text"])
+
+    def test_the_user_reserve_is_subtracted_from_the_available_for_the_verdict(self):
+        st = stage(1000, 900, weights=300)
+        st["user_reserve_mib"] = 200.0
+        b = PC.contract_bar(st, "D")
+        self.assertEqual(b["budget_over_available_mib"], 100.0)                           # 900 gefragt, 1000 - 200 = 800 verfuegbar
+        self.assertEqual(b["user_reserve_mib"], 200.0)
+        self.assertIn("Nutzerreserve 200 MiB (--d-reserve-mib)", b["over_text"])
+        self.assertAlmostEqual(sum(s["mib"] for s in b["segments"]), 1000.0, places=6)    # nicht als eigenes Segment gezeichnet
+        self.assertEqual(PC.contract_bar(stage(1000, 900, weights=300), "D")["budget_over_available_mib"], 0.0)
+
+    def test_d_phase_reads_d_reserve_mib_from_the_group_line(self):
+        m = model("nextflash_int4mixed")
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--d-reserve-mib"] = "1000,1000,1000"
+        r = PC.phase_bars(hw(), m, dict(NF_ARGS), pa, NF_PE)
+        d = r["phases"]["D"]
+        self.assertEqual([b["user_reserve_mib"] for b in d["bars"]], [1000.0] * 3)
+        self.assertIn("user_reserve_mib", [x["was"] for x in d["inputs"]])
+        self.assertTrue(any("--d-reserve-mib" in h for h in d["hints"]))
+        r0 = PC.phase_bars(hw(), m, dict(NF_ARGS), NF_PA, NF_PE)
+        self.assertEqual([b["user_reserve_mib"] for b in r0["phases"]["D"]["bars"]], [0.0] * 3)
+
+
 if __name__ == "__main__":
     unittest.main()

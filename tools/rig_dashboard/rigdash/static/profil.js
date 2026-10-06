@@ -288,7 +288,9 @@
   function scheduleRecompute() {
     if (!st.doc || !window.ProfilBalken || !isOpen("bars", false)) return;
     const counts = stageCounts(), name = cutPhase(st.bars && st.bars.res);
-    if (st.bars && st.bars.approx && counts && name) {
+    // Dual-Share (Referenzposten ohne Budgetverbrauch): die lineare Browser-Näherung kennt sie nicht und würde die Gewichte gegen das P-Budget zeichnen -> der Server rechnet allein
+    const dualRef = st.bars && st.bars.res && st.bars.res.form === "dual";
+    if (st.bars && st.bars.approx && counts && name && !dualRef) {
       try { st.bars.fast = { name, bars: window.ProfilBalken.approxContractBars(st.bars.approx, counts, st.bars.res.phases[name].bars.map((b) => b.label), name) }; }
       catch (e) { st.bars.fast = null; /* Schnitt passt nicht: der Server entscheidet */ }
     }
