@@ -1,0 +1,168 @@
+"""Auftrag 1006: "Hardwareprofil messen" liefert die Werte, die das Dashboard zeigt.
+
+Ende-zu-Ende ohne Karte: das ECHTE ``hardware_profile.py`` des Baums (per Dateipfad geladen, wie der Dienst es tut) baut aus
+einem synthetischen Probe-Cache (so, wie der Messlauf ihn schreibt) das Profil, das echte ``hwprofil.js`` zeichnet es (node),
+und die Zeilen SM-Zahl, L2-Größe, int8 W8A8, NVFP4 W4A8/W4A16/W4A4, H2D-/D2H-Latenz und die BAR1-Matrix stehen mit Zahl und
+Quellenmarke 'gem.' da.  Wo eine Karte eine Zeile nicht kann (W4A4 auf den 3080, W4A8 auf der 5090), steht "nicht gemessen"
+mit dem Grund, nie eine Zahl.  Rot auf der Basis: dort bleiben W4A4 und BAR1 "nicht gemessen", weil die Basis weder die Zeile
+noch den Schritt kennt.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from rigdash import hwprofil, server  # noqa: E402
+
+STATIC = server.STATIC
+REPO_PYTHON = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "python"))
+U = {"3080a": "GPU-0000", "5090": "GPU-1111", "3080b": "GPU-2222"}
+NOW = 1_790_000_000.0
+
+
+def _node():
+    for c in (shutil.which("node"), "/opt/node-v22.14.0-linux-x64/bin/node", shutil.which("bun")):
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def _nvml():
+    spec = [(0, U["3080a"], "NVIDIA GeForce RTX 3080", 20480, [8, 6]), (1, U["5090"], "NVIDIA GeForce RTX 5090", 32607, [12, 0]),
+            (2, U["3080b"], "NVIDIA GeForce RTX 3080", 20480, [8, 6])]
+    cards = [{"nvml_index": i, "uuid": u, "name": n, "total_mib": mib, "cc": cc, "bar1_total_mib": 256 if cc == [8, 6] else 32768,
+              "pcie_max_gen": 4, "pcie_max_width": 16, "pcie_cur_gen": 1, "pcie_cur_width": 8, "mem_bus_width_bits": 320,
+              "mem_clock_max_mhz": 9501, "sm_clock_max_mhz": 2100, "power_limit_w": 230.0, "power_default_w": 320.0,
+              "pci_bus_id": "0000:0%d:00.0" % i} for i, u, n, mib, cc in spec]
+    return cards, "595.58", []
+
+
+def _card(uuid, name, cc, **kw):
+    d = {"uuid": uuid, "name": name, "cuda_index": 0, "total_mib": 20480, "gemm_bf16_tflops": 60.0, "gemm_fp8_tflops": None,
+         "fp8_note": "no fp8", "membw_read_gbs": 700.0, "membw_copy_gbs": 690.0, "membw_gemv_gbs": 650.0, "h2d_gbs": 6.0,
+         "d2h_gbs": 6.5, "h2d_lat_us": 12.5, "d2h_lat_us": 14.0, "h2d_lat_min_us": 9.0, "d2h_lat_min_us": 10.0, "sm_count": 68,
+         "l2_mib": 5.0, "compute_capability": cc, "gemm_int8_tflops": 180.0, "gemm_w4a8_int8_tflops": 62.0,
+         "gemm_w4a16_tflops": 55.0, "lane_notes": {}, "sm_clock_mhz": 1900, "sm_clock_max_mhz": 2100, "temp_c": 60.0,
+         "throttle_reasons": []}
+    d.update(kw)
+    return d
+
+
+def _probe(bar1=True):
+    no_fp4 = {"nvfp4_w4a4": "compute capability 8.6: no native FP4 tensor cores (needs 10.0+)"}
+    cards = [_card(U["3080a"], "RTX 3080", "8.6", lane_notes=no_fp4), _card(U["3080b"], "RTX 3080", "8.6", lane_notes=no_fp4),
+             _card(U["5090"], "RTX 5090", "12.0", sm_count=170, l2_mib=96.0, gemm_fp8_tflops=500.0, fp8_note="",
+                   gemm_w4a8_int8_tflops=None, gemm_w4a4_tflops=910.0,
+                   lane_notes={"nvfp4_w4a8": "compute capability 12.0: the W4A8 kernel is the sm_8x one"})]
+    d = {"version": 1, "created": NOW - 60, "driver": "595.58", "torch_version": "2.11", "cuda_version": "13.0", "cards": cards, "pairs": []}
+    if bar1:
+        ids = list(U.values())
+        d.update(bar1_attempted=True, bar1_reason="", bar1_pairs=[
+            {"src_uuid": a, "dst_uuid": b, "bandwidth_gbs": 4.0 + 0.5 * i, "latency_us": 8.0 + i, "transport": "bar1 (direct write into the destination's BAR1)",
+             "peer_access": True, "note": "n"} for i, (a, b) in enumerate((a, b) for a in ids for b in ids if a != b)])
+    return d
+
+
+class TestMeasuredValuesReachTheRows(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def _doc(self, bar1=True):
+        with open(os.path.join(self.d, "card_probe-x.json"), "w") as f:
+            json.dump(_probe(bar1), f)
+        mod = hwprofil._load_module(REPO_PYTHON)
+        return mod.build(cache_dir=self.d, nvml=_nvml(), now=NOW), mod
+
+    def _render(self, doc):
+        node = _node()
+        if not node:
+            self.skipTest("weder node noch bun vorhanden")
+        script = "const H=require(process.argv[1]);process.stdout.write(H.render(JSON.parse(process.argv[2]),{now:%s}));" % int(NOW)
+        out = subprocess.run([node, "-e", script, os.path.join(STATIC, "hwprofil.js"),
+                              json.dumps({"ok": True, "profile": doc, "problems": [], "window": None, "job": {"state": "idle"}})],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout
+
+    @staticmethod
+    def _row(html, label):
+        m = re.search(r"<tr><td>" + re.escape(label) + r"</td>(.*?)</tr>", html, re.S)
+        assert m, "Zeile fehlt: " + label
+        return m.group(1).split("</td>")[:-1]
+
+    def test_every_asked_row_is_filled_with_a_number_and_the_gem_mark(self):
+        doc, mod = self._doc()
+        self.assertEqual(mod.validate(doc), [])
+        h = self._render(doc)
+        for label in ("SM-Zahl", "L2-Größe", "int8 W8A8", "NVFP4 W4A16 (Marlin)", "H2D Latenz", "D2H Latenz"):
+            cells = self._row(h, label)
+            self.assertEqual(len(cells), 3, label)
+            for c in cells:
+                self.assertNotIn("nicht gemessen", c, label)
+                self.assertIn("<sup>gem.</sup>", c, label)
+
+    def test_w4a4_is_filled_only_on_the_sm120_card_and_the_3080s_say_why(self):
+        doc, _ = self._doc()
+        h = self._render(doc)
+        cells = self._row(h, "NVFP4 W4A4 (nativ)")
+        by_ord = {c["ord"]: c["uuid"] for c in doc["cards"]}
+        for ordinal, cell in enumerate(cells):
+            if by_ord[ordinal] == U["5090"]:
+                self.assertIn("910", cell)
+                self.assertIn("<sup>gem.</sup>", cell)
+            else:
+                self.assertIn("nicht gemessen", cell)
+                self.assertIn("no native FP4 tensor cores", cell)       # der Grund im Hover
+                self.assertNotIn("<sup>gem.</sup>", cell)
+        w4a8 = self._row(h, "NVFP4 W4A8 (int8-Kerne)")                   # auf der 5090 nicht gefragt, mit Grund
+        for ordinal, cell in enumerate(w4a8):
+            if by_ord[ordinal] == U["5090"]:
+                self.assertIn("nicht gemessen", cell)
+                self.assertIn("sm_8x", cell)
+            else:
+                self.assertIn("<sup>gem.</sup>", cell)
+
+    def test_the_bar1_matrix_shows_a_number_per_ordered_pair(self):
+        doc, _ = self._doc()
+        h = self._render(doc)
+        sec = h[h.index("BAR1-Strecke (barlink)"):]
+        sec = sec[:sec.index("</table>")]
+        self.assertEqual(sec.count("<sup>gem.</sup>"), 12)          # 6 Paare x (GB/s + µs)
+        self.assertNotIn("nicht gemessen", sec)
+        self.assertIn("alle 6 geordneten Paare gemessen", h)
+
+    def test_without_the_bar1_step_the_matrix_stays_nicht_gemessen_with_the_note(self):
+        doc, _ = self._doc(bar1=False)
+        h = self._render(doc)
+        sec = h[h.index("BAR1-Strecke (barlink)"):]
+        sec = sec[:sec.index("</table>")]
+        self.assertEqual(sec.count(">nicht gemessen</span>"), 6)   # sichtbar je Paar (der Grund steht im Hover)
+        self.assertNotIn("<sup>gem.</sup>", sec)
+        self.assertIn("NOT MEASURED", h)
+
+    def test_the_hover_of_a_latency_names_median_and_minimum(self):
+        doc, _ = self._doc()
+        h = self._render(doc)
+        cells = self._row(h, "H2D Latenz")
+        self.assertIn("Median", cells[0])
+        self.assertIn("Minimum der Stichprobe 9.0", cells[0])
+
+
+class TestWindowAndBudget(unittest.TestCase):
+    def test_the_window_is_fifteen_minutes_and_the_child_cap_fits_inside_it(self):
+        self.assertEqual(hwprofil.WINDOW, "15m")
+        self.assertLessEqual(hwprofil.CHILD_CAP_S + hwprofil.END_MARGIN_S, 15 * 60)
+        self.assertGreater(hwprofil.CHILD_CAP_S, 10 * 60 - 60)      # mehr als die alten 9 min: der kalte Lauf passt
+        self.assertGreater(hwprofil.MIN_LEFT_S, hwprofil.END_MARGIN_S)
+
+
+if __name__ == "__main__":
+    unittest.main()

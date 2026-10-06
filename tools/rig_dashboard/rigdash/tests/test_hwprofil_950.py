@@ -1,7 +1,7 @@
 """Auftrag 950 (Profil-Editor S2): die Routen /api/hwprofil.  Kein Rig, keine GPU, kein gpuq, kein Kindprozess.
 
 Geprüft wird, was ohne Karte stimmen muss: dass die Messung NUR in einem gebuchten Fenster läuft (Eigentümer
-profil-editor, nur die gewählten Karten, 10 min, kein not_before), dass ein wartendes Fenster nur den Status
+profil-editor, nur die gewählten Karten, 15 min seit Auftrag 1006, kein not_before), dass ein wartendes Fenster nur den Status
 zurückgibt und nichts misst, dass das Fenster nach der Messung SOFORT zurückgegeben wird (auch nach Fehler), dass
 eine belegte Karte nicht gemessen wird, und dass das Token das Haus nie verlässt.  gpuq ist ein Stub (Funktion
 ``http``), das Profilmodul eine kleine Datei im Baum (die echte liegt auf der 27B-Linie und hat ihre eigenen Tests).
@@ -130,7 +130,7 @@ class Base(unittest.TestCase):
 
 
 class TestMeasureOnlyInABookedWindow(Base):
-    def test_books_exactly_the_chosen_cards_for_ten_minutes_as_profil_editor(self):
+    def test_books_exactly_the_chosen_cards_for_fifteen_minutes_as_profil_editor(self):
         hw = self.make()
         m = self.mod(hw)
         out = hw.measure({"cards": [2, 1]})
@@ -139,7 +139,7 @@ class TestMeasureOnlyInABookedWindow(Base):
         body = post[0][2]
         self.assertEqual(body["owner"], "profil-editor")
         self.assertEqual(body["cards"], [1, 2])
-        self.assertEqual(body["duration"], "10m")
+        self.assertEqual(body["duration"], "15m")  # Auftrag 1006: BAR1-Schritt + kalte JIT-Übersetzung
         self.assertNotIn("not_before", body)
         self.assertNotIn("mib", body)  # exklusiv: eine Ratenmessung neben fremder Last misst die Last mit
         self.assertEqual(out["action"], "messung_gestartet")
@@ -242,7 +242,7 @@ class TestMeasureOnlyInABookedWindow(Base):
         m = self.mod(hw)
         hw.measure({"cards": [0]})
         self.assertEqual(m.CALLS[0]["timeout_s"], 175.0)
-        self.gq.seconds_left = 600.0
+        self.gq.seconds_left = 900.0
         hw.measure({"cards": [0]})
         self.assertEqual(m.CALLS[1]["timeout_s"], hwprofil.CHILD_CAP_S)
 
