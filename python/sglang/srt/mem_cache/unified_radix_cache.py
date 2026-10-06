@@ -1920,6 +1920,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "back first)", released, entries, len(todo), ms)
         return released
 
+    def weg2_set_l15_hold(self, entries) -> int:
+        """L15-HOSTLOCK-NAMED: name the arena slots the L1.5 sleep pinned
+        (``l15_hostlock.hold_sleep_refs``) as a holder of THIS tree, so the
+        reset's orphan pass (``_weg2_release_orphan_refs``) keeps them. The
+        pin lives from the sleep to the wake act, which clears the name
+        (``weg2_clear_l15_hold``) right before it gives the references back.
+        ``entries`` is a sequence of (host pool, slot array). A new record
+        replaces the previous one (the sleep hook's second retain pins first,
+        then names, then releases the old record -- l15_hostlock.rearm_sink).
+        Returns the slots named."""
+        ents = [(p, s) for p, s in entries if p is not None and len(s)]
+        self._weg2_l15_hold = ents
+        return sum(len(s) for _, s in ents)
+
+    def weg2_clear_l15_hold(self) -> int:
+        """L15-HOSTLOCK-NAMED: drop the name (the wake act is about to give
+        the references back, or the sleep was undone). Returns the slots
+        that were named."""
+        prev = getattr(self, "_weg2_l15_hold", None) or ()
+        self._weg2_l15_hold = []
+        return sum(len(s) for _, s in prev)
+
     def _weg2_release_orphan_refs(self, where: str) -> int:
         """#1424g (rc12q D-TP0 15:56:23 / 16:00:05: ``ARENA-REF-HOLDERS
         at=reset tree=0 sum=0 own_held=1016 gap=1016``, 18.6 % of the KV arena
@@ -2010,6 +2032,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if p is pool:
                     for v in vals:
                         _name(v)
+            # L15-HOSTLOCK-NAMED: the sleep's HOSTLOCK pin (one reference per
+            # held L2 slot, taken before reset_keep) is a holder too. Without
+            # this the same reset's orphan pass gave every pin back, and P's
+            # write-through recycled the held slots during its phase.
+            for p, slots in list(getattr(self, "_weg2_l15_hold", None) or ()):
+                if p is pool:
+                    s = torch.as_tensor(slots, dtype=torch.int64).reshape(-1)
+                    s = s[(s >= 0) & (s < named.numel())]
+                    if s.numel():
+                        named.index_add_(0, s, torch.ones(s.numel(), dtype=torch.int64))
             recs = list((getattr(self, "ongoing_prefetch", None) or {}).values()) + list(
                 getattr(self, "_retired_prefetch", None) or ())
             for rec in recs:
@@ -2134,13 +2166,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             carrier = sum(arena_ref_pages(pool, v)
                           for p, vals in list((getattr(self, "_weg2_carrier_rows", None) or {}).values())
                           if p is pool for v in vals)
+            l15_hold = sum(len(sl) for p, sl in list(getattr(self, "_weg2_l15_hold", None) or ())
+                           if p is pool)
             dormant = 0
             if ct == BASE_COMPONENT_TYPE:
                 seen = set()
                 for rows in list((getattr(self, "_weg2_dormant_done", None) or {}).values()):
                     seen.update(arena_ref_slots(pool, rows).tolist())
                 dormant = len(seen - tree_slots)
-            total = tree + in_use + prefetch + retired + queue + carrier + dormant
+            total = tree + in_use + prefetch + retired + queue + carrier + dormant + l15_hold
             led = getattr(pool.arena, "_ledger", None)
             own = int(led.held.sum()) if led is not None else None
             orphans = int((getattr(self, "_weg2_reset_orphans", None) or {}).get(ct, 0))
@@ -2150,7 +2184,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             lines.append(
                 f"pool={getattr(ct, 'name', ct)} tree={tree} tree_in_use={in_use} prefetch={prefetch} "
-                f"retired={retired} queue={queue} carrier={carrier} dormant_hold={dormant} sum={total} "
+                f"retired={retired} queue={queue} carrier={carrier} dormant_hold={dormant} "
+                + (f"l15_hold={l15_hold} " if l15_hold else "") + f"sum={total} "
                 f"own_held={own if own is not None else '-'} "
                 f"gap={own - total if own is not None and not torn else '-'} reset_orphans={orphans} "
                 + (f"snapshot=torn own_before={own0} " if torn else "")

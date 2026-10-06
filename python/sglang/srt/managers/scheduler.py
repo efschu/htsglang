@@ -21070,8 +21070,17 @@ class Scheduler(
                             # the wake act (_l15_wake_act / fallback drop).
                             hold_sink=l15_hostlock.rearm_sink(
                                 get=lambda: getattr(self, "_l15_host_hold", None),
-                                put=lambda _rec: setattr(
-                                    self, "_l15_host_hold", _rec),
+                                put=lambda _rec: (
+                                    setattr(self, "_l15_host_hold", _rec),
+                                    # L15-HOSTLOCK-NAMED: the tree's reset
+                                    # (reset_keep, right after this) must name
+                                    # the pin as a holder, else its orphan pass
+                                    # gives it back in the same sleep.
+                                    l15_hostlock.name_hold_on_tree(
+                                        self.tree_cache,
+                                        l15_bind.live_host_pools(
+                                            self.tree_cache),
+                                        _rec, logger.info)),
                                 pools=lambda: l15_bind.live_host_pools(
                                     self.tree_cache),
                                 log=logger.info),

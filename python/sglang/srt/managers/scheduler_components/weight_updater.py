@@ -7599,6 +7599,16 @@ class SchedulerWeightUpdaterManager:
         stated in l15_hostlock's docstring."""
         held = (getattr(sched, "_l15_host_hold", None)
                 if sched is not None else None)
+        # L15-HOSTLOCK-NAMED: drop the tree's name for the pin FIRST (the
+        # references go back below; a name left behind would keep a later
+        # reset's orphan pass from reclaiming anything the release missed).
+        if sched is not None:
+            try:
+                from sglang.srt.weg2 import l15_hostlock as _hl
+
+                _hl.clear_hold_on_tree(getattr(sched, "tree_cache", None))
+            except Exception:  # noqa: BLE001 - cleanup never splits group
+                pass
         if not held:
             return 0
         sched._l15_host_hold = None
