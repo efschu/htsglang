@@ -286,8 +286,8 @@ def test_off_route_verdict_line_is_rc21l_byte_for_byte():
     assert fmt is not None
     vals = ("weg2-3-4", "short", 812, 4096, 3.0, 20100, "d_leg2_cached", 30000, "estimate",
             314553, 2.4, 21000, 63000)
-    assert nargs == len(vals) + 1  # + the #49 suffix
-    off_line = fmt % (vals[:7] + ("",) + vals[7:])
+    assert nargs == len(vals) + 2  # + the #49 suffix + the X-CURVES 1006 x-mode note ("" when live)
+    off_line = fmt % (vals[:7] + ("",) + vals[7:] + ("",))
     assert off_line == REF_ROUTE_VERDICT % vals
     assert "getattr(self.spans, \"agent_span\", False)" in src
 
