@@ -38,12 +38,15 @@ FORMEN: List[Dict[str, Any]] = [
 #: die Abschnitte der Seite und die Namen ihrer Werte (Wireframe Abschnitt 5; jeder Name steht im Katalog, ``test_profil_planer_aph1_1006``)
 ABSCHNITTE: List[Dict[str, Any]] = [
     {"id": "A", "titel": "A  Aufteilung auf die Karten",
-     "satz": "Wie das Modell auf die Karten verteilt wird: Layer je Karte (Prefill), Gewichte je Karte (Decode), Speicherbudget je Karte.",
+     "satz": "Wie das Modell auf die Karten verteilt wird: Layer je Karte (Prefill), Gewichte je Karte (Decode), Speicherbudget und Speicherposten (Fremdkontext, Nicht-Torch, Reserven, L15, Extend-Trim) je Karte.",
      "namen": ["--pp-size", "--tp-size", "--pp-stage-ratio", "--pp-attn-stage-ratio", "--pp-layer-ratio", "--pp-layer-set", "--pp-solve-objective",
                "--pp-solve-pool-floor", "--pp-solve-cut", "--pp-cut-expert-device-fraction", "--pp-cut-expert-lru-rows", "--p-layer-split",
                "--p-attn-head-split", "--rank-gpu-id", "--rank-gpu-memory-mib", "--rank-role", "--rank-tp-ratio", "--rank-mlp-ratio",
                "--rank-moe-ratio", "--rank-vocab-ratio", "--rank-user-reserve-mib", "--rank-auto-reserve-mib", "--user-reserve-mib",
-               "--d-tp-objective"]},
+               "--d-tp-objective",
+               # Positionale Je-Karte-Vektoren des Launchers (POSITIONAL_VECTOR_FLAGS/-TOKENS, launcher.py): Speicherposten je Karte, Release-Profile nf*/27b* setzen sie
+               "--d-foreign-context-mib", "--d-nontorch-mib", "--d-reserve-mib", "--pp-cut-reserve-mib",
+               "SGLANG_WEG2_L15_MIB", "SGLANG_WEG2_EXTEND_TRIM_MIB"]},
     {"id": "B", "titel": "B  KV: Köpfe, Token-Anteile, DCP",
      "satz": "Wo der KV-Cache liegt: wie viele Token je Karte, ob ungleiches DCP gilt. Die KV-Köpfe je Rang sind abgeleitet und nur eine Anzeige.",
      "namen": ["--dcp-size", "--uneven-dcp", "--uneven-dcp-weighted", "--rank-kv-ratio", "SGLANG_UNEVEN_TOKEN_VECTOR", "--uneven-token-vector",

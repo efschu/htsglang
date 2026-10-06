@@ -345,6 +345,7 @@ const row = (name, value) => ({ key: "flag:" + name, name, scope: "launcher", va
   explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Erklaerung " + name, source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", planner_derived: false, source: null, default: null, choices: null } });
 const VIEW = { rows: [row("--pp-stage-ratio", "31,17,16"), row("--p-bs", "2")], planner_only: [], removed: [], kvheads: [],
   coverage: { rows: 2, erklaert: 2, kuratiert: 2, geerntet: 0, profil_kommentar: 0, unerklaert: 0, geaendert: 0 } };
+if (CASE.extra) CASE.extra.forEach((e) => VIEW.rows.push(row(e[0], e[1])));
 const DOC = { name: "p", line: "27b", args: [{ flag: "--pp-stage-ratio", values: ["31,17,16"] }], meta: {}, vars: [] };
 global.fetch = async (url, opt) => {
   const u = String(url);
@@ -435,6 +436,40 @@ class ProfilJs(unittest.TestCase):
             self.assertEqual(o["steps0"], 0)
             self.assertNotIn("pfx-step", o["afterLoad"])
             self.assertIn("Trockenlauf", o["afterLoad"])
+
+
+@unittest.skipUnless(NODE, "node fehlt")
+class AllVectorsAreFields(unittest.TestCase):
+    """Review-Befund 1: auch die positionalen Launcher-Vektoren ausserhalb der Namen A-C (Release-Profile nf*/27b*) bekommen ein Feld je Karte, kein Kommastring."""
+
+    EXTRA = [["--d-foreign-context-mib", "1446,896,894"], ["--d-nontorch-mib", "1981,528,524"], ["SGLANG_WEG2_EXTEND_TRIM_MIB", "1200,0,0"],
+             ["--d-reserve-mib", "100,200,300"], ["--pp-cut-reserve-mib", "10,20,30"],
+             ["--p-barlink-bar1-window-mib", "256,256,256"]]       # nicht in A-C: landet in E und muss trotzdem Felder haben
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ui = PL.ui_info(("flip", "tp"), _catalog()["entries"], True)
+        cls.o = run_harness({"planer": cls.ui, "module": True, "extra": cls.EXTRA})
+        cls.h = cls.o["afterLoad"]
+
+    def test_the_launcher_vectors_are_named_in_the_sections(self):
+        names = PL.all_section_names()
+        for n in ("--d-foreign-context-mib", "--d-nontorch-mib", "--d-reserve-mib", "--pp-cut-reserve-mib", "SGLANG_WEG2_L15_MIB", "SGLANG_WEG2_EXTEND_TRIM_MIB"):
+            self.assertIn(n, names)
+
+    def test_every_vector_is_one_field_per_rank_and_no_comma_text_field(self):
+        for name, val in self.EXTRA:
+            self.assertEqual(len(re.findall(r'data-vk="flag:%s" data-vi="' % re.escape(name), self.h)), len(val.split(",")), name)
+            self.assertNotIn('data-k="flag:%s" value="%s"' % (name, val), self.h, name)
+            self.assertNotRegex(self.h, r'<input type="text" data-k="flag:%s" value="[^"]*,' % re.escape(name))
+
+    def test_the_rest_list_uses_fields_too(self):
+        i = self.h.index("E  Übrige Werte")
+        self.assertIn('data-vk="flag:--p-barlink-bar1-window-mib" data-vi="2"', self.h[i:])
+        self.assertNotIn("--d-foreign-context-mib", self.h[i:])      # steht in A, nicht noch einmal in E
+
+    def test_nothing_unhandled(self):
+        self.assertEqual(self.o["unhandled"], [])
 
 
 class Css(unittest.TestCase):

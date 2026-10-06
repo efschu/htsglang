@@ -241,7 +241,7 @@
     const dis = (r.planner_value != null && r.planner_value !== r.value) ? `<span class="pf-diff" title="Planer-Wert: ${esc(r.planner_value)}">Planer: ${esc(r.planner_value)}</span>` : "";
     return `<tr class="pf-r pf-o-${r.origin}${r.changed ? " pf-ch" : ""}" id="pfr-${esc(r.key)}" data-name="${esc(r.name)}">
       <td class="pf-n"><span class="mono">${esc(r.name)}</span> <span class="pf-chip pf-sc">${esc(SCOPE[r.scope] || r.scope)}</span></td>
-      <td class="pf-v">${inputFor(r)}${dis}</td>
+      <td class="pf-v">${window.ProfilPlaner ? window.ProfilPlaner.valueField(r, planCtx()) : inputFor(r)}${dis}</td>
       <td class="pf-o"><span class="pf-org pf-org-${r.origin}" title="Herkunft des Werts">${esc(r.origin_label)}</span> ${resets.join(" ")}</td>
       <td class="pf-e"><div class="pf-short" data-open="${esc(r.key)}">${short ? esc(short) : '<span class="pf-unex-s">unerklärt</span>'} <span class="muted">${open ? "▲" : "▼"}</span></div>
         ${r.explain.depends.length ? `<div class="pf-deps">${r.explain.depends.map(depChip).join("")}</div>` : ""}
