@@ -1,0 +1,95 @@
+{
+ "method": "windowsxp811203/Qwen3.8-Flash-Next-Abliterated (lambda 1.5, Rang 1) im Zielformat nachgerechnet: dequant -> W - lam r(r^T W) [embed: E - lam (E r) r^T] -> Skalen je Gruppe neu (MSE-Gitter + alte Skala als Kandidat) -> RTN -> projektionstreue Rundung -> gleiche pack-quantized-Packung; BF16-Tensoren direkt",
+ "direction": "refusal_dir.safetensors (SVD des Diffs layers.0.linear_attn.out_proj windowsxp - Basis)",
+ "lambda": 1.5,
+ "source": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-MTP-INT4-g32-albucino",
+ "script": "/spinning/llm_stuff/club-3090/models-cache/nf-abliteration-windowsxp/apply_ablation_minachist.py",
+ "constrained_rounding": true,
+ "hyper_connections": "keine Sonderbehandlung (skalare Injektion, gemeinsame Basis)",
+ "untouched": "vision, lm_head, n-gram-Tabelle, Router/Gates/up/gate_proj, Normen, hyper_connection-Tensoren, ple.key_proj",
+ "n_edited_tensor_files": 2,
+ "per_file": [
+  {
+   "file": "mtp-dense.safetensors",
+   "seconds": 22,
+   "which": "draft"
+  },
+  {
+   "file": "mtp-routed-experts-int4.safetensors",
+   "seconds": 79,
+   "which": "draft"
+  }
+ ],
+ "tensors": [
+  {
+   "tensor": "model.language_model.embed_tokens.weight",
+   "kind": "bf_in",
+   "n_projections": 1,
+   "rel_fro": 0.029007489690209293,
+   "proj_ratio": 0.499879377289608,
+   "bits": 16
+  },
+  {
+   "tensor": "mtp.fc_embedding.weight",
+   "kind": "bf_out",
+   "n_projections": 1,
+   "rel_fro": 0.02655208110809326,
+   "proj_ratio": 0.4997745156288147,
+   "bits": 16
+  },
+  {
+   "tensor": "mtp.fc_hidden.weight",
+   "kind": "bf_out",
+   "n_projections": 1,
+   "rel_fro": 0.030603058636188507,
+   "proj_ratio": 0.49939775466918945,
+   "bits": 16
+  },
+  {
+   "tensor": "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+   "kind": "bf_out",
+   "n_projections": 1,
+   "rel_fro": 0.029884468764066696,
+   "proj_ratio": 0.4998819828033447,
+   "bits": 16
+  },
+  {
+   "tensor": "mtp.layers.0.self_attn.o_proj.weight",
+   "kind": "bf_out",
+   "n_projections": 1,
+   "rel_fro": 0.029033297672867775,
+   "proj_ratio": 0.4998403787612915,
+   "bits": 16
+  },
+  {
+   "tensor": "mtp.layers.0.mlp.experts.down_proj",
+   "kind": "q_exp",
+   "n_projections": 512,
+   "rel_fro": 0.05225890036672354,
+   "rel_fro_min": 0.04662001505494118,
+   "rel_fro_max": 0.05965052917599678,
+   "proj_ratio": 0.5000167029793374,
+   "proj_ratio_min": 0.4994806945323944,
+   "proj_ratio_max": 0.5004938244819641,
+   "proj_ratio_rtn": 0.6830796662252396,
+   "proj_ratio_rtn_min": 0.5948885679244995,
+   "proj_ratio_rtn_max": 0.7507823705673218,
+   "e_rq": 0.04270670258119935,
+   "e_rq_min": 0.03867138549685478,
+   "e_rq_max": 0.04740574210882187,
+   "codes_changed": 0.0351723539752129,
+   "codes_changed_min": 0.031009521335363388,
+   "codes_changed_max": 0.04362121596932411,
+   "codes_changed_by_constraint": 0.030901684822310926,
+   "codes_changed_by_constraint_min": 0.02789977937936783,
+   "codes_changed_by_constraint_max": 0.03610839694738388,
+   "scales_changed": 0.30288570404052734,
+   "scales_changed_min": 0.269453125,
+   "scales_changed_max": 0.35619140625,
+   "bits": 4,
+   "group": 32,
+   "conv": "pos",
+   "scale_dtype": "BF16"
+  }
+ ]
+}

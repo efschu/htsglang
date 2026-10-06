@@ -1,0 +1,108 @@
+{
+ "stages": [
+  {
+   "points": [
+    [
+     256,
+     36.94246846834744
+    ],
+    [
+     512,
+     62.47994266972262
+    ],
+    [
+     1024,
+     111.28489336568408
+    ],
+    [
+     2048,
+     203.2198004906347
+    ],
+    [
+     4096,
+     368.92963308622484
+    ]
+   ],
+   "attn_ms_per_tok_1k": 0.0029868619769607293,
+   "eager_floor_ms": 63.0,
+   "name": "PP0"
+  },
+  {
+   "points": [
+    [
+     256,
+     34.81941553722844
+    ],
+    [
+     512,
+     61.6716646131426
+    ],
+    [
+     1024,
+     121.3433292262852
+    ],
+    [
+     2048,
+     240.6866584525704
+    ],
+    [
+     4096,
+     479.3733169051408
+    ]
+   ],
+   "attn_ms_per_tok_1k": 0.00113558719340681,
+   "eager_floor_ms": 42.0,
+   "name": "PP1"
+  },
+  {
+   "points": [
+    [
+     256,
+     29.787205676569606
+    ],
+    [
+     512,
+     52.52219213921746
+    ],
+    [
+     1024,
+     103.04438427843492
+    ],
+    [
+     2048,
+     204.08876855686984
+    ],
+    [
+     4096,
+     406.1775371137397
+    ]
+   ],
+   "attn_ms_per_tok_1k": 0.0012442486719246683,
+   "eager_floor_ms": 74.0,
+   "name": "PP2"
+  }
+ ],
+ "source": "fit:boot_weg2_dkr27bnvfp4bar1chunka09260045_5425830c95_0926_004542.P.log [0,32k) mscale=nvfp4",
+ "provenance": {
+  "what": "--p-chunk-model JSON fuer Profil 27b-nvfp4 (--p-chunk-policy dynamic). Stufenmodell = launcher.p_chunk_stage_model('fit:<P.log>', 'nvfp4', 3) -- #PGAP-Fit (pgap_stage_fit.fit_rank_lines, Praefixe [0,32k)) plus mscale nvfp4 ist in die Punkte EINGERECHNET; --p-chunk-mscale wirkt auf ein JSON-Modell nicht mehr.",
+  "fit_log": "boot_weg2_dkr27bnvfp4bar1chunka09260045_5425830c95_0926_004542.P.log",
+  "fit_log_sha256": "c439cb4e3ca868f3bdfb2408515368d1f3f4ebe4e24c471e12e18d81a49eaac6",
+  "fit_log_bytes": 18656040,
+  "boot": "dkr27bnvfp4bar1chunka09260045 (Abnahme rc9j chunkab, NVFP4-A fixed)",
+  "tree": "htsglang desk/27b-rc9-0925 @ 5425830c9571c1058d26bf9a91c67718f008994c",
+  "mscale": "nvfp4",
+  "generated_utc": "2026-09-26T01:11:02Z",
+  "generator": "Agent DK 27B-Sitz 26.09."
+ },
+ "power_limit_w": [
+  400.0,
+  230.0,
+  230.0
+ ],
+ "power_limit_cards": [
+  "RTX5090",
+  "RTX3080",
+  "RTX3080"
+ ],
+ "power_limit_source": "nvidia-smi power.limit 24.09. 18:55Z and 26.09. (release table row 27): 5090 400 W, 3080 230 W; fit boot dkr27bnvfp4bar1chunka09260045 (26.09. 00:45Z) lies between the readings and did not record its limit"
+}
