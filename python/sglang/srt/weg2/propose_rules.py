@@ -139,7 +139,8 @@ def rate_table(cards: Sequence[Mapping[str, Any]], *, measured: Optional[Mapping
     """GEMM rate per card (TFLOP/s) on ONE basis: ``(rates, source per card, basis text)``.
 
     Order of trust, per card: the card's own measured node (``card["tflops"]`` with ``tflops_src == "gemessen"``) > the
-    ``measured`` mapping (card name or ``"<name> <GB>GB"`` -> TFLOP/s, e.g. ``card_library.json``) > the datasheet FP16/BF16
+    ``measured`` mapping (card name or ``"<name> <GB>GB"`` -> TFLOP/s) > the measured ``gemm_tflops`` of the card library row
+    (``library`` or, when None, ``card_rate_pass.load_measured_library()`` = ``card_library.json``) > the datasheet FP16/BF16
     peak of the card library seed (``peak_gemm_tflops_fp16``).  A measured achieved rate and a datasheet PEAK are not the same
     quantity (5090: 203 achieved of 419 peak): the table is MEASURED only when EVERY card has a measured rate; otherwise ALL
     cards are priced on the datasheet peak and the basis says ``Datenblatt/unbelegt``.  A card with neither falls back to its
@@ -147,6 +148,21 @@ def rate_table(cards: Sequence[Mapping[str, Any]], *, measured: Optional[Mapping
     """
     from sglang.srt.weg2 import card_identity as ci
 
+    lib = library
+    if lib is None:
+        # the measured library of the rig first (card_rate_pass.load_measured_library: None = no pass was run), the seed-only
+        # CardLibrary only as the datasheet source below
+        try:
+            from sglang.srt.planner.card_rate_pass import load_measured_library
+            lib = load_measured_library()
+        except Exception:  # noqa: BLE001 - no loader / unreadable file: the seed library below names the gap
+            lib = None
+        if lib is None:
+            try:
+                from sglang.srt.planner.card_library import CardLibrary
+                lib = CardLibrary()
+            except Exception:  # noqa: BLE001 - no library: the VRAM fallback below names the gap
+                lib = None
     meas: List[Optional[float]] = []
     src: List[str] = []
     for c in cards:
@@ -159,19 +175,21 @@ def rate_table(cards: Sequence[Mapping[str, Any]], *, measured: Optional[Mapping
                 if measured.get(key):
                     v, s = float(measured[key]), "gemessen (%s)" % key
                     break
+        if v is None and lib is not None:
+            # the MEASURED GEMM rate of the library row (spec.gemm_tflops, written by card_rate_pass), not the datasheet peak
+            try:
+                spec = lib.resolve(str(c.get("name", "")), int(c["total_mib"]))
+                g = getattr(spec, "gemm_tflops", None)
+                if g:
+                    v, s = float(g), "gemessen (card_library)"
+            except Exception:  # noqa: BLE001 - UncalibratedCard / CardCapacityMismatch: no library row for this card
+                pass
         meas.append(v)
         src.append(s)
     if all(v is not None for v in meas) and meas:
         return [float(v) for v in meas], src, "gemessen: GEMM-Rate je Karte"
     # datasheet basis for ALL cards
     peaks: List[Optional[float]] = []
-    lib = library
-    if lib is None:
-        try:
-            from sglang.srt.planner.card_library import CardLibrary
-            lib = CardLibrary()
-        except Exception:  # noqa: BLE001 - no library: the VRAM fallback below names the gap
-            lib = None
     for c in cards:
         p = None
         if lib is not None:

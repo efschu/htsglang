@@ -72,6 +72,8 @@ def setUpModule():
     """Header snapshots -> model/draft profiles (the checkpoints are empty mount points on the dev box)."""
     global _TMP
     _TMP = tempfile.TemporaryDirectory(prefix="apc-models-")
+    # hermetic: a proposal without ``library=`` must not read the rig's ``~/.cache/sglang/card_library.json``
+    os.environ["SGLANG_CARD_LIBRARY"] = os.path.join(_TMP.name, "no-card-library.json")
     for name in _NF + _27B:
         O.materialize_checkpoint(os.path.join(CKPT, name), _TMP.name)
     for key, (model, draft) in (("nf", _NF), ("27b", _27B)):
@@ -81,6 +83,7 @@ def setUpModule():
 
 
 def tearDownModule():
+    os.environ.pop("SGLANG_CARD_LIBRARY", None)
     if _TMP is not None:
         _TMP.cleanup()
 
@@ -127,10 +130,26 @@ def _inventory(name: str):
     return ents, O.replay_from_catalog(ents)
 
 
+def _seed_library():
+    """The seed-only card library (datasheet peaks, no measured rate): the tests never read ``~/.cache/sglang/card_library.json``."""
+    from sglang.srt.planner.card_library import CardLibrary
+    return CardLibrary()
+
+
+def _measured_library(only=("RTX 5090", "RTX 3080 20GB")):
+    """A card library whose rows carry the measured ``gemm_tflops`` of ``MEASURED_RATES`` (what ``card_rate_pass`` writes)."""
+    import dataclasses
+    lib = _seed_library()
+    for name in only:
+        spec = lib.resolve(name, 32607 if "5090" in name else 20480)
+        assert lib.add(dataclasses.replace(spec, gemm_tflops=MEASURED_RATES[name], source="measured"), overwrite=True)
+    return lib
+
+
 def _propose(model: str, inv: str, form: str = "flip", **ziele):
     hw, _ = _inventory(inv)
     modell, draft = _MODELS[model]
-    return P.propose(hw, modell, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES)
+    return P.propose(hw, modell, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES, library=_seed_library())
 
 
 def _dry(model: str, v: dict, rows, *, force: bool = True):
@@ -277,7 +296,8 @@ class TestInputs(unittest.TestCase):
     def test_card_order_is_card_identity_order_key(self):
         rows = _ref_rows()
         shuffled = [rows[0], rows[2], rows[1]]                        # 3080, 3080, 5090 (NVML order scrambled)
-        v = P.propose(shuffled, *[_MODELS["27b"][0]], "flip", {}, basis=_profile("27b"), draft=_MODELS["27b"][1], rates=MEASURED_RATES)
+        v = P.propose(shuffled, *[_MODELS["27b"][0]], "flip", {}, basis=_profile("27b"), draft=_MODELS["27b"][1], rates=MEASURED_RATES,
+                      library=_seed_library())
         self.assertEqual([c["class"] for c in v["cards"]], ["RTX5090", "RTX3080", "RTX3080"])
         self.assertEqual([c["ordinal"] for c in v["cards"]], [0, 1, 2])
         self.assertEqual(v["cards"][0]["name"], "NVIDIA GeForce RTX 5090")
@@ -293,6 +313,48 @@ class TestInputs(unittest.TestCase):
         # ALL cards on the datasheet basis
         m = _propose("27b", "n2_5090_3090")
         self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in m["cards"]), m["cards"])
+
+    def test_rates_of_a_loaded_measured_library_without_rates_argument(self):
+        """The product path: no ``rates=``, the library row's measured ``gemm_tflops`` (card_rate_pass) is the rate, not the peak."""
+        hw, _ = _inventory("ref3")
+        modell, draft = _MODELS["27b"]
+        v = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft, library=_measured_library())
+        self.assertEqual([c["tflops"] for c in v["cards"]], [203.42, 50.97, 50.97])
+        self.assertTrue(all(c["tflops_src"] == "gemessen (card_library)" for c in v["cards"]), v["cards"])
+        self.assertEqual(v["seeds"]["p_cut"]["basis"], "gemessen: GEMM-Rate je Karte")
+        self.assertFalse(any("GEMM-Raten" in u for u in v["unbelegt"]), v["unbelegt"])
+        # the measured ratio is not the datasheet ratio (419/119): the cut seed follows the measurement
+        d = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft, library=_seed_library())
+        self.assertEqual([c["tflops"] for c in d["cards"]], [419.0, 119.0, 119.0])
+        self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in d["cards"]))
+        self.assertNotEqual(v["seeds"]["p_cut"]["layers"], d["seeds"]["p_cut"]["layers"])
+
+    def test_one_measured_library_row_among_datasheet_rows_prices_all_on_the_datasheet(self):
+        hw, _ = _inventory("ref3")
+        modell, draft = _MODELS["27b"]
+        v = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft, library=_measured_library(("RTX 5090",)))
+        self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in v["cards"]), v["cards"])
+
+    def test_default_library_is_the_measured_card_library_file(self):
+        """``library=None`` reads ``card_rate_pass.load_measured_library()`` (``SGLANG_CARD_LIBRARY``), seed-only otherwise."""
+        hw, _ = _inventory("ref3")
+        modell, draft = _MODELS["27b"]
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "card_library.json")
+            _measured_library().save(path)
+            old = os.environ.get("SGLANG_CARD_LIBRARY")
+            try:
+                os.environ["SGLANG_CARD_LIBRARY"] = path
+                v = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft)
+                os.environ["SGLANG_CARD_LIBRARY"] = os.path.join(td, "absent.json")
+                w = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft)
+            finally:
+                if old is None:
+                    os.environ.pop("SGLANG_CARD_LIBRARY", None)
+                else:
+                    os.environ["SGLANG_CARD_LIBRARY"] = old
+        self.assertEqual([c["tflops"] for c in v["cards"]], [203.42, 50.97, 50.97])
+        self.assertEqual([c["tflops"] for c in w["cards"]], [419.0, 119.0, 119.0])
 
     def test_measured_node_of_a_hardware_profile_is_used(self):
         hw = {"schema": "flliper.hardware/1", "cards": [
@@ -559,11 +621,56 @@ class TestSeats(unittest.TestCase):
         self.assertEqual(la.extra_get("p", "--max-mamba-cache-size"), "56")             # 4 per seat + 8 retention
         self.assertEqual(la.env_get("d", "SGLANG_MOE_SCRATCH_SLOTS"), "208,96,96")      # linear in the seats
         self.assertEqual(la.env_get("p", "SGLANG_MOE_SCRATCH_SLOTS"), "64")
-        # everything else is the profile's
+        # the regulator reaches D: NF names no --d-bs, the launcher default would cap D at 6 seats
+        self.assertIsNone(lb.get_flag("--d-bs"))
+        self.assertEqual(la.get_flag("--d-bs"), "12")
+        # the cut and the expert ownership stay the profile's
         self.assertEqual(la.get_flag("--pp-stage-ratio"), lb.get_flag("--pp-stage-ratio"))
         self.assertEqual(la.extra_get("d", "--rank-moe-ratio"), lb.extra_get("d", "--rank-moe-ratio"))
         self.assertTrue(v["vektoren_ok"])
         self.assertEqual(v["ziele"]["seats"], 12)
+
+    def test_seats_derive_fr_p_and_fr_d_from_the_mamba_slots(self):
+        """K4 MoE: more seats = more Mamba slots = less VRAM for resident experts: FR_P / FR_D fall, monotonically, and the
+        shown value says where it comes from; the NF profile's own level is the anchor (profile value + hw_fit difference)."""
+        prev_p, prev_d = None, None
+        base = _propose("nf", "ref3")
+        lb = P.LaunchArgv(base["argv"], base["env"])
+        p6 = [float(x) for x in lb.get_flag("--pp-cut-expert-device-fraction").split(",")]
+        d6 = [float(x) for x in lb.extra_get("d", "--rank-moe-resident-fraction").split(",")]
+        for seats in (12, 24):
+            v = _propose("nf", "ref3", seats=seats)
+            la = P.LaunchArgv(v["argv"], v["env"])
+            fp_ = [float(x) for x in la.get_flag("--pp-cut-expert-device-fraction").split(",")]
+            fd_ = [float(x) for x in la.extra_get("d", "--rank-moe-resident-fraction").split(",")]
+            self.assertEqual((len(fp_), len(fd_)), (3, 3))
+            self.assertTrue(all(a <= b for a, b in zip(fp_, p6)) and fp_ != p6, (seats, fp_, p6))
+            self.assertTrue(all(a <= b for a, b in zip(fd_, d6)) and fd_ != d6, (seats, fd_, d6))
+            self.assertTrue(all(0.0 <= x <= 1.0 for x in fp_ + fd_))
+            if prev_p:
+                self.assertTrue(all(a <= b for a, b in zip(fp_, prev_p)), (fp_, prev_p))
+                self.assertTrue(all(a <= b for a, b in zip(fd_, prev_d)), (fd_, prev_d))
+            prev_p, prev_d = fp_, fd_
+            w = {x["key"]: x for x in v["werte"]}
+            for key in ("--pp-cut-expert-device-fraction", "--extra-d --rank-moe-resident-fraction"):
+                self.assertEqual(w[key]["zustand"], R.UNBELEGT, key)
+                self.assertIn("Sitze gleichzeitig %d" % seats, w[key]["herkunft"] + w[key]["grund"])
+            self.assertTrue(v["vektoren_ok"])
+
+    def test_seats_goal_graph_ladder_follows_the_goal(self):
+        v = _propose("nf", "ref3", seats=12)
+        d = P.LaunchArgv(v["argv"], v["env"]).gtext("extra", "d")
+        self.assertIn("--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 --cuda-graph-backend-decode", d)
+
+    def test_an_explicit_d_bs_of_the_profile_is_edited_not_doubled(self):
+        """A profile that names --d-bs (a told value = the hard bound): the goal edits that value, no second --d-bs."""
+        b = _profile("nf")
+        li = {"argv": list(b.argv) + ["--d-bs", "4"], "env": dict(b.env), "vars": dict(b.vars), "name": "nf-int4-h6-abl.env"}
+        hw, _ = _inventory("ref3")
+        modell, draft = _MODELS["nf"]
+        v = P.propose(hw, modell, "flip", {"seats": 9}, basis=li, draft=draft, rates=MEASURED_RATES, library=_seed_library())
+        self.assertEqual(v["argv"].count("--d-bs"), 1)
+        self.assertEqual(P.LaunchArgv(v["argv"], v["env"]).get_flag("--d-bs"), "9")
 
     def test_without_a_seats_goal_nothing_seat_bound_moves(self):
         v = _propose("nf", "ref3")

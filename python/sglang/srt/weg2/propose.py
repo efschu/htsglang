@@ -507,9 +507,9 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
     dp = R.draft_placement(fp, d_budget[0], host_fixed, kv_mib, d_mamba_mib, fp.draft_mib)
     results["draft"] = dp
     fa = None
+    res_mib = [int(float(x)) for x in reserve] if reserve and len(reserve) == n else [0] * n
     if is_moe:
-        fa = R.form_a_d(fp, cards, d_budget, [int(float(x)) for x in (reserve or ["0"] * n)] if reserve and len(reserve) == n
-                        else [0] * n, kv_tokens=kv_tokens, kv_cell_bytes=kv_cell, draft_mib=fp.draft_mib,
+        fa = R.form_a_d(fp, cards, d_budget, res_mib, kv_tokens=kv_tokens, kv_cell_bytes=kv_cell, draft_mib=fp.draft_mib,
                         d_mamba_slots=asm.d_mamba_slots, mamba_slot_mib=mamba_slot)
         results["form_a"] = fa
         rec.unbelegt += fa["unbelegt"]
@@ -519,6 +519,70 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         results["dense_d_shares"] = R.dense_d_shares(d_budget)
 
     d_obj_old = la.get_flag("--d-tp-objective")
+
+    # --- K4 MoE: the "Sitze gleichzeitig" regulator derives FR_P / FR_D ---------------------------------------------------------
+    # The profile's FR values are valid for the seat count the profile ran (``seats_base``).  A different seat goal changes the
+    # Mamba slots every P stage / D rank holds (``R.mamba_slots_p`` / ``R.mamba_slots_d``), and that VRAM is paid from the
+    # resident experts (the rest rule of K4: KV obligation fixed, the rest buys experts).  The derivation is the DIFFERENCE of the
+    # hw_fit arithmetic at the goal against the one at the base seats, added to the profile's value: the profile's measured /
+    # operator-set level stays, only the seat-bound part moves (a rule value alone would replace a measurement by a model).
+    seats_base = seats_ref or R.D_MAMBA_SEATS_REF
+    seats_changed = bool(z.get("seats")) and int(z["seats"]) != seats_base
+    fit_argv0 = _fit_argv(la.t)
+    seat_cache: Dict[int, Dict[str, Any]] = {}
+
+    def seat_seed(s_: int) -> Dict[str, Any]:
+        """The rule terms at ``s_`` seats: P stage budgets (``sb``) and the Form A D layout (``fa``)."""
+        if s_ not in seat_cache:
+            asm_s = hw_fit.Assumptions(kv_tokens=kv_tokens, kv_dtype=kv_dtype, p_mamba_slots=R.mamba_slots_p(s_),
+                                       d_mamba_slots=R.mamba_slots_d(s_))
+            sb_s = R.stage_budgets(fp, fit_cards, asm_s, fit_argv0, records_profile=prof_name, verdict=hw_fit.Verdict())
+            if foreign and nontorch and len(foreign) == n == len(nontorch):
+                budget_s = d_budget
+            else:
+                budget_s = [int(c["total_mib"] - (c["total_mib"] - sb_s["avail"][i])) for i, c in enumerate(cards)]
+            fa_s = None
+            if is_moe:
+                fa_s = R.form_a_d(fp, cards, budget_s, res_mib, kv_tokens=kv_tokens, kv_cell_bytes=kv_cell,
+                                  draft_mib=fp.draft_mib, d_mamba_slots=asm_s.d_mamba_slots,
+                                  mamba_slot_mib=hw_fit.mamba_slot_mib(fp, sb_s["posts"]))
+            seat_cache[s_] = {"sb": sb_s, "fa": fa_s}
+        return seat_cache[s_]
+
+    def effective_cut() -> List[int]:
+        """The P layer cut in effect: the argv's (when it is a valid cut of this model over N stages), else the rule seed."""
+        for text in (la.get_flag("--pp-stage-ratio"), la.extra_get("p", "--pp-stage-ratio")):
+            v = R.parse_csv(text)
+            if v and len(v) == n and all(x.isdigit() for x in v) and sum(int(x) for x in v) == fp.n_layers:
+                return [int(x) for x in v]
+        return list(layers)
+
+    def seat_fr(pol: str, vec: Sequence[str]) -> Optional[Tuple[str, str]]:
+        """``(new vector, reason)`` of an FR vector of the profile moved to the seat goal; None when it cannot be derived."""
+        if len(vec) != n:
+            return None
+        try:
+            old_v = [float(x) for x in vec]
+        except ValueError:
+            return None
+        a, b_ = seat_seed(seats), seat_seed(seats_base)
+        if pol == "fr_p":
+            cut = effective_cut()
+            fx, _ = R.fr_p(fp, cut, a["sb"]["avail"], a["sb"]["cost"])
+            f0, _ = R.fr_p(fp, cut, b_["sb"]["avail"], b_["sb"]["cost"])
+            if not fx or not f0:
+                return None
+            delta = [x - y for x, y in zip(fx, f0)]
+            what = "P-Stufen (hw_fit: Mamba-Slots %d statt %d je Stufe)" % (R.mamba_slots_p(seats), R.mamba_slots_p(seats_base))
+        else:
+            if not (a["fa"] and b_["fa"] and a["fa"]["ok"] and b_["fa"]["ok"]):
+                return None
+            delta = [x - y for x, y in zip(a["fa"]["fr"], b_["fa"]["fr"])]
+            what = "D-Raenge (Form A: Mamba-Slots %d statt %d)" % (R.mamba_slots_d(seats), R.mamba_slots_d(seats_base))
+        new = [max(0.0, min(1.0, o + d)) for o, d in zip(old_v, delta)]
+        return ",".join("%.3f" % x for x in new), (
+            "Sitze gleichzeitig %d statt %d: die zusaetzlichen Mamba-Slots der %s werden aus den residenten Experten bezahlt "
+            "(KV-Pflicht %d Token bleibt); Profilwert + Differenz der hw_fit-Rechnung" % (seats, seats_base, what, kv_tokens))
 
     def decide(kind: str, group: str, name: str, pol: str) -> None:
         old = _get(la, kind, group, name)
@@ -567,6 +631,14 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                     grund="LRU-Zeilen je Stufe sind eine Pool-Groesse, keine Kartenmessung", policy=pol)
             return
         # cut / cut_attn / fr_p / fr_d / moe_ratio / role / tp_ratio
+        if same_inv and seats_changed and pol in ("fr_p", "fr_d") and is_moe:
+            sf = seat_fr(pol, vec)
+            if sf is not None:
+                _set(la, kind, group, name, sf[0])
+                rec.add(lab, group=group, old=old, new=sf[0], state=R.UNBELEGT, herkunft="Profil %s + Regel K4 (Sitze gleichzeitig %d)" % (
+                    bname, seats), grund=sf[1] + "; am Metall unbelegt (Planer-Rechnung)", policy=pol)
+                return
+            rec.hinweise.append("%s: nicht auf %d Sitze umrechenbar (Vektorlaenge/Form A); Profilwert bleibt" % (lab, seats))
         if same_inv:
             rec.add(lab, group=group, old=old, new=old, state=R.VORGESCHLAGEN, herkunft=carry_h, grund=carry_g, policy=pol)
             return
@@ -703,6 +775,35 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
             la.t.append("--d-only")
         rec.add("--d-only", group="-", old=None, new="", state=R.VORGESCHLAGEN, herkunft="Form nur-TP",
                 grund="nur Gruppe D, TP ueber alle %d Karten, kein Flip" % n, policy="form")
+    if seats_changed and not seats_ref:
+        rec.hinweise.append("Sitze gleichzeitig %d: das Profil nennt keinen Referenzwert (--p-bs / --max-running-requests); nur --d-bs "
+                            "und die FR-Ableitung (gegen %d Sitze, den Launcher-Default D) folgen dem Ziel" % (seats, seats_base))
+    dbs_added = False
+    if seats_changed:
+        # the regulator reaches D: an absent --d-bs leaves the launcher default (``apply_profile_d_bs_default``: 6 seats for
+        # the nextflash profile), so a goal other than the default must be SAID.  An explicit --d-bs is the hard bound (bs_source).
+        if la.get_flag("--d-bs") is None:
+            dbs_added = True
+            la.set_flag("--d-bs", str(seats))
+            rec.add("--d-bs", group="-", old=None, new=str(seats), state=R.VORGESCHLAGEN, herkunft="Ziel Sitze gleichzeitig = %d" % seats,
+                    grund="Decode-bs-Ziel des Anwenders; ohne die Angabe bliebe D beim Launcher-Default (%d Sitze)" % seats_base,
+                    policy="seats")
+        # the decode CUDA graph ladder follows the seats when it is the contiguous 1..k ladder of the profile
+        dtext = la.gtext("extra", "d") or ""
+        m = re.search(r"(?<![\w-])--cuda-graph-bs-decode((?:\s+\d+)+)", dtext)
+        if m:
+            ladder = [int(x) for x in m.group(1).split()]
+            if ladder == list(range(1, len(ladder) + 1)):
+                if ladder[-1] != seats:
+                    newl = " ".join(str(i) for i in range(1, seats + 1))
+                    la.set_gtext("extra", "d", dtext[:m.start(1)] + " " + newl + dtext[m.end(1):])
+                    rec.add("--extra-d --cuda-graph-bs-decode", group="d", old=" ".join(map(str, ladder)), new=newl,
+                            state=R.UNBELEGT, herkunft="Ziel Sitze gleichzeitig = %d" % seats,
+                            grund="die Decode-Graph-Leiter 1..%d des Profils folgt dem bs-Ziel; Graph-Speicher je bs am Metall "
+                                  "unbelegt" % ladder[-1], policy="seats")
+            else:
+                rec.hinweise.append("--cuda-graph-bs-decode ist keine 1..k-Leiter (%s): bleibt, bs ueber der Leiter laeuft ohne Graph"
+                                    % " ".join(map(str, ladder)))
     if z.get("seats") and seats_ref and int(z["seats"]) != seats_ref:
         for kind, group, name, setter in (("flag", "-", "--p-bs", lambda v: la.set_flag("--p-bs", v)),
                                           ("flag", "-", "--d-bs", lambda v: la.set_flag("--d-bs", v)),
@@ -710,7 +811,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                                           ("extra", "d", "--max-running-requests", lambda v: la.extra_set("d", "--max-running-requests", v)),
                                           ("extra", "p", "--max-mamba-cache-size", lambda v: la.extra_set("p", "--max-mamba-cache-size", v))):
             old = _get(la, kind, group, name)
-            if old is None:
+            if old is None or (name == "--d-bs" and dbs_added):
                 continue
             new = str(R.mamba_slots_p(seats)) if name == "--max-mamba-cache-size" else str(seats)
             setter(new)
