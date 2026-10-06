@@ -132,6 +132,7 @@ from sglang.srt.weg2 import idle_clock as _idle_clock_mod  # #55 F2: idle clock 
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 from sglang.srt.weg2 import phase_policy  # H91 part C
+from sglang.srt.weg2 import x_curves as _xcurves  # X-CURVES 1006: X per request from profile curves
 from sglang.srt.weg2 import front_gc_guard as _gcg  # GC-GUARD 02.10.
 from sglang.srt.weg2 import arrival_seat_rule as _asr  # ARRIVAL-SEAT (user 29.09.)
 from sglang.srt.weg2 import p_read_overlap as _ro  # RO: P computes while a store read runs
@@ -4067,6 +4068,14 @@ def _sum_priced_take(entries: List["Pending"], *, carried: int, limit: int) -> T
 
 
 class Front:
+    #: X-CURVES 1006: the X mode (--x-mode); class defaults so a front built
+    #: without __init__ (Front.__new__ desk doubles) is the live mode, as before.
+    x_mode: str = _xcurves.X_MODE_LIVE
+    #: X-CURVES: the front's resolution of the mode (None = live, no --x-mode).
+    _x_setup: Optional[_xcurves.XFrontSetup] = None
+    #: X-CURVES: the newest per-request curve verdict (state / ROUTE-VERDICT).
+    _x_curve_last: Optional[_xcurves.XCurveVerdict] = None
+
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
                  weight_chunks: int = 0, carrier_max_tokens: int = 0,
@@ -4093,7 +4102,10 @@ class Front:
                  p_pool_tokens: int = 0,
                  d_wait_bound_s: float = 0.0,
                  p_leg1_stall_s: float = 0.0,
-                 d_park_immediate: bool = False):
+                 d_park_immediate: bool = False,
+                 x_mode: Optional[str] = None,
+                 x_curves: Optional[str] = None,
+                 x_curves_beyond: Optional[str] = None):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -4331,6 +4343,7 @@ class Front:
         # Never above the X in force (:meth:`_x_band_floor`).
         self.x_busy_tokens: Optional[int] = (
             None if x_busy_tokens is None else max(0, int(x_busy_tokens)))
+        self._init_x_mode(x_mode=x_mode, x_curves=x_curves, x_curves_beyond=x_curves_beyond)
         # C8/K7: None = derive from the last completed flip in that direction.
         self.min_dwell_ms = None if min_dwell_ms is None else float(min_dwell_ms)
         # law 5 / C6: which group is awake when nothing is pending.
@@ -8673,6 +8686,10 @@ class Front:
             "park_unsupported": bool(getattr(self, "_park_unsupported", False)),
             # 27B PARK: only when on, so the 27B state stays byte-identical off.
             **({"d_park_immediate": True} if getattr(self, "d_park_immediate", False) else {}),
+            # X-CURVES 1006: only under an explicit --x-mode (the live state stays byte-identical).
+            **({} if self._x_setup is None else _xcurves.state_block(
+                mode=self.x_mode, source=self._x_setup.source, envelope=self._x_setup.envelope,
+                last=self._x_curve_last)),
         }
 
     async def handle_passthrough_get(self, request: web.Request) -> web.Response:
@@ -9186,7 +9203,14 @@ class Front:
         # X-K-FLIP: the X this arrival is routed on amortises the round trip
         # over the flip it would take -- itself plus the riders queued for P
         # now -- not over the boot's mean P phase (switch off: the X in force).
-        _x_arrival = self._x_for_flip(1 + self._x_riders(), rid, "route")
+        # X-CURVES 1006: under a curve mode the X of THIS request at its cached
+        # depth (store_span), amortised over the same riders; else X-K-FLIP's.
+        try:
+            _x_arrival = Front._x_route_of(self, rid=rid, depth=store_span,
+                                           k_flip=1 + self._x_riders())
+        except _xcurves.XCurvesRefused as _xcr:
+            Front._pb_resolve(self, rid, _pb_fut, "none", 0)
+            return Front._x_curve_refusal(self, request.path, rid, _xcr)
         route = serviceable_route(remainder, carrier_est,
                                   _x_arrival,
                                   self.carrier_max_tokens,
@@ -9270,7 +9294,7 @@ class Front:
             "reading from group D, never a prefill on P%s) carrier_est=%d src=%s "
             "(THE COMPARED VALUE for carrier_max=%d: the WHOLE prompt's KV "
             "through the host staging pool, at CARRIER_CHARS_PER_TOKEN=%.1f) "
-            "est_prompt=%d chars=%d (#1290)",
+            "est_prompt=%d chars=%d (#1290)%s",
             rid, route, remainder, x_route, CHARS_PER_TOKEN,
             store_span, presence_src,
             # NF (P49): the #49 witness is named only when the switch is on,
@@ -9286,7 +9310,7 @@ class Front:
             + (X_EXACT_VERDICT_NOTE if _xx is not None else ""),
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
-            len(text),
+            len(text), Front._x_route_note(self),
         )
         Front._pb_resolve(self, rid, _pb_fut, route, remainder)  # PRICE-BARRIER: the verdict, for the SHORTs waiting on it
         if _ef is not None:
@@ -9450,7 +9474,8 @@ class Front:
                     x_deferred=_x_band_deferred and not short_refused,
                     # #246b: needs P above the X it was routed on (ARRIVAL-SEAT)
                     x_routed=(int(x_route) if route == "long"
-                              and envs.SGLANG_WEG2_ENABLE_X_ROUTED_NEEDS_P.get() else 0),
+                              and (envs.SGLANG_WEG2_ENABLE_X_ROUTED_NEEDS_P.get()
+                                   or self.x_mode in _xcurves.CURVE_MODES) else 0),
                     # 27B idle policy (b): only a request whose OWN route is SHORT
                     # may later be handed to D by --d-short-drain-tokens -- and
                     # only when it is queued because of the PHASE (the field's
@@ -14650,6 +14675,9 @@ class Front:
         """
         if value is None or value <= 0:
             return
+        if self.x_mode != _xcurves.X_MODE_LIVE:
+            # X-CURVES 1006: fixed / curve modes take no live sample and never re-solve
+            return
         buf = self._x_samples.get(kind)
         if buf is None:
             return
@@ -14943,6 +14971,69 @@ class Front:
                 continue
             n += 1
         return n
+
+    def _init_x_mode(self, *, x_mode: Optional[str], x_curves: Optional[str],
+                     x_curves_beyond: Optional[str]) -> None:
+        """X-CURVES 1006: resolve ``--x-mode`` once (x_curves.front_setup).
+        ``fixed`` keeps the start X for the boot; ``curve``/``curve-capped``
+        set the boot-level X to the curves' envelope (every per-request X stays
+        under it, as X_1 bounds X-K-FLIP's X_k) and price each arrival on the
+        curves. Neither collects a live X sample nor re-solves. No --x-mode =
+        live: nothing set, nothing printed (byte-identical)."""
+        setup = _xcurves.front_setup(
+            mode=x_mode, curves_path=x_curves, beyond=x_curves_beyond,
+            form_key=park_form_key() if x_mode in _xcurves.CURVE_MODES else "",
+            x_start=self.x_start_tokens, x_ceiling=self.x_ceiling_tokens)
+        if x_mode is None:
+            return
+        self.x_mode = setup.mode
+        self._x_setup = setup
+        if setup.curves is not None:
+            self.tp_prefill_max_tokens = int(setup.envelope)
+            if self._x_min_work_follows:
+                self.flip_min_work_tokens = int(setup.envelope)
+        logger.info("%s", setup.line)
+
+    def _x_route_of(self, *, rid: str, depth: int, k_flip: int) -> int:
+        """The X this arrival is routed on: under a curve mode the curves'
+        X at the request's cached ``depth`` with ``k_flip`` requests riding
+        the flip (x_curves.x_verdict_from_curves, never above the boot-level
+        X); otherwise X-K-FLIP's :meth:`_x_for_flip` exactly as before. A
+        request deeper than the curves under ``--x-curves-beyond refuse``
+        raises :class:`x_curves.XCurvesRefused` (W193)."""
+        setup = self._x_setup
+        if setup is None or setup.curves is None:
+            return self._x_for_flip(k_flip, rid, "route")
+        cap = int(self.tp_prefill_max_tokens)
+        v = _xcurves.x_verdict_from_curves(
+            depth=int(depth), open_requests=int(k_flip), curves=setup.curves, cap=cap,
+            max_k=float(self.p_phase_max_requests) if self.p_phase_max_requests else None,
+            beyond=setup.beyond)
+        self._x_curve_last = v
+        self.counters["x_curve_verdicts"] += 1
+        if v.depth_used != v.depth:
+            self.counters["x_curve_depth_clamped"] += 1
+        return int(v.x)
+
+    def _x_route_note(self) -> str:
+        """The ROUTE-VERDICT's X-mode suffix: "" in the live mode (the line
+        stays byte-identical), the mode / curve source / this request's X
+        otherwise."""
+        setup = self._x_setup
+        if setup is None or setup.mode == _xcurves.X_MODE_LIVE:
+            return ""
+        if setup.curves is None or self._x_curve_last is None:
+            return _xcurves.fixed_note()
+        return _xcurves.verdict_note(mode=setup.mode, verdict=self._x_curve_last,
+                                     source=setup.source)
+
+    def _x_curve_refusal(self, path: str, rid: str, exc: "_xcurves.XCurvesRefused") -> web.Response:
+        """W193: a request deeper than the curves reach, refused at admission
+        by name (--x-curves-beyond refuse) -- before any verdict, seat or flip."""
+        self.counters["W193_Weg2XCurveDepthBeyond"] += 1
+        detail = f"{exc.code} rid={rid}: {exc.detail}"
+        logger.error("%s", detail)
+        return refusal_response(path, exc.code, detail, 503, {"x_mode": self.x_mode})
 
     def _x_for_flip(self, k_flip: int, rid: str = "", site: str = "") -> int:
         """X-K-FLIP: the X of a flip that carries ``k_flip`` requests -- the
@@ -16441,6 +16532,17 @@ def main():
                          "--x-ceiling-tokens. 0 = the start X (--tp-prefill-max-tokens), so a front "
                          "without it never routes above D's riegel. Requests between the start X "
                          "and the live X go to D only as singletons (WEG2 X-SOLO).")
+    ap.add_argument("--x-mode", choices=_xcurves.X_MODES, default=None,
+                    help="X-CURVES 1006: fixed = --tp-prefill-max-tokens for the whole boot (no live "
+                         "re-solve); curve = X per request from --x-curves; curve-capped = the same, "
+                         "never above --x-ceiling-tokens; live = the live re-solve (DEPRECATED). "
+                         "Unset = live, byte-identical to the front before the flag.")
+    ap.add_argument("--x-curves", default=None,
+                    help="X-CURVES: the curve file (weg2-x-curves/1) of this model x form x hardware; "
+                         "only with --x-mode curve|curve-capped (W194 otherwise, W190 when absent).")
+    ap.add_argument("--x-curves-beyond", choices=_xcurves.BEYOND_POLICIES, default=None,
+                    help="X-CURVES: a request deeper than the curves reach -- clamp (default: priced "
+                         "at the deepest row, named in the ROUTE-VERDICT) or refuse (W193, 503).")
     ap.add_argument("--x-busy-tokens", type=int, default=None,
                     help="27B RC7-X X_busy / UNIFY S4: the floor of the X-SOLO band -- up to it D "
                          "prefills a SHORT request while it decodes others; between it and the live "
@@ -16588,7 +16690,9 @@ def main():
                   p_pool_tokens=args.p_pool_tokens,
                   d_wait_bound_s=args.d_wait_bound_s,
                   p_leg1_stall_s=args.p_leg1_stall_s,
-                  d_park_immediate=args.d_park_immediate == "on")
+                  d_park_immediate=args.d_park_immediate == "on",
+                  x_mode=args.x_mode, x_curves=args.x_curves,
+                  x_curves_beyond=args.x_curves_beyond)
     front.d_residue_context_tokens = int(getattr(args, "d_residue_context_tokens", 0) or 0)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
