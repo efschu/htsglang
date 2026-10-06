@@ -122,10 +122,25 @@ def _blocked_kind(cache: Any, node: Any) -> str:
     return "end_anchor"
 
 
-def _reason(cache: Any, node: Any, pool: Any, skip: set) -> Optional[str]:
+def _has_aux_host_only(cache: Any, node: Any) -> bool:
+    """An aux component (mamba anchor, park_l3) keeps a HOST-ONLY state on this node."""
+    from sglang.srt.mem_cache.unified_radix_cache import _aux_components
+
+    return any(
+        node.component_data[c.component_type].host_value is not None
+        and node.component_data[c.component_type].value is None
+        for c in _aux_components(cache)
+    )
+
+
+def _reason(cache: Any, node: Any, pool: Any, skip: set, allow_aux: bool = False) -> Optional[str]:
     """None = a host-only H-leaf whose host copy may leave L2 once it has an L3 copy; else the NAME of the
     first check that refused it (the order of the checks is the decision: ``_eligible`` is exactly
-    ``_reason is None``). #1500i: the census of ``spill_host_only`` counts these."""
+    ``_reason is None``). #1500i: the census of ``spill_host_only`` counts these.
+
+    ``allow_aux`` (Q-1190b, the AUX stage of a wedged dual arena only -- see ``AUX_MARK``): a leaf whose
+    only refusal is its host-only aux state (the request's END mamba anchor) is a candidate too; every
+    other check keeps its place and its order."""
     from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, _aux_components
 
     if node is cache.root_node:
@@ -150,7 +165,7 @@ def _reason(cache: Any, node: Any, pool: Any, skip: set) -> Optional[str]:
         return "blocked_" + _blocked_kind(cache, node)
     if not getattr(node, "hash_value", None):
         return "no_hash"                  # the page count cannot be checked
-    if any(
+    if not allow_aux and any(
         node.component_data[c.component_type].host_value is not None
         and node.component_data[c.component_type].value is None
         for c in _aux_components(cache)
@@ -161,13 +176,13 @@ def _reason(cache: Any, node: Any, pool: Any, skip: set) -> Optional[str]:
     return None
 
 
-def _eligible(cache: Any, node: Any, pool: Any, skip: set) -> bool:
+def _eligible(cache: Any, node: Any, pool: Any, skip: set, allow_aux: bool = False) -> bool:
     """A host-only H-leaf whose host copy may leave L2 once it has an L3 copy."""
-    return _reason(cache, node, pool, skip) is None
+    return _reason(cache, node, pool, skip, allow_aux) is None
 
 
 def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
-                    budget_s: float = 0.0, who: str = "claim") -> Dict[str, int]:
+                    budget_s: float = 0.0, who: str = "claim", allow_aux: bool = False) -> Dict[str, int]:
     """Spill host-only H-leaves of a dual P tree until ``want`` pages were
     released here (node-id order). Returns the counts; the log line names them.
 
@@ -176,11 +191,23 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     before the NEXT leaf once the budget is spent (``braked`` = 1 in the result).
 
     ``who`` (#1500i, log only): the caller's name in the PKVWAIT-INSTR census line -- ``claim`` (the
-    W3 claim path), ``dyield`` (D-ARENA-YIELD), ``trim`` (V2 ARENA-TRIM)."""
+    W3 claim path), ``dyield`` (D-ARENA-YIELD), ``trim`` (V2 ARENA-TRIM).
+
+    ``allow_aux`` (Q-1190b AUX stage, see ``AUX_MARK``; only the D yield and the V2 trim order pass it,
+    and only after the arena wall has stood for SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S): leaves whose one
+    refusal is a host-only aux state (END mamba anchor) are candidates AFTER every plain one (heap key
+    ``(aux, node id)``); the leaf goes whole (``_evict_host_leaf``: the KV pages after their L3 copy,
+    the anchor's reference back to its own arena, where the slot stays COMPLETE until that arena's
+    clock takes it). False (every other caller, and the default) = the pass is byte for byte the old one."""
     from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
     from sglang.srt.weg2 import dual_pkvwait_instr as _pi
 
     P = max(1, int(page_size or 1))
+    allow_aux = bool(allow_aux)
+
+    def _key(n):
+        return (int(_has_aux_host_only(cache, n)), n.id) if allow_aux else n.id
+
     # #1500i census of the refusals: counted in the same pass that builds the heap, only when the line will
     # be printed (dual gate + switch + rate limit); None = no census, no cost, the pass is the old one
     ins_marker = "spill_" + str(who)
@@ -190,9 +217,9 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     nodes_total = 0
     cand_pages = 0
     for n in cache._collect_all_nodes():
-        r = _reason(cache, n, pool, skip)
+        r = _reason(cache, n, pool, skip, allow_aux)
         if r is None:
-            heap.append((n.id, n))
+            heap.append((_key(n), n))
             if census is not None:
                 cand_pages += _host_pages(n)
         elif census is not None and r != "root":
@@ -203,15 +230,17 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     heapq.heapify(heap)
     released = leaves = unsecured = on_disk = written = braked = 0
     stale = unsec_lost = unsec_short = 0
+    aux_leaves = 0
     t_end = (time.monotonic() + float(budget_s)) if budget_s and budget_s > 0 else None
     while heap and released < want:
         if t_end is not None and time.monotonic() >= t_end:
             braked = 1
             break
         _id, node = heapq.heappop(heap)
-        if not _eligible(cache, node, pool, skip):
+        if not _eligible(cache, node, pool, skip, allow_aux):
             stale += 1
             continue
+        is_aux = allow_aux and _has_aux_host_only(cache, node)
         cd = node.component_data[BASE_COMPONENT_TYPE]
         sec = pool.secure_rows_to_l3(cd.host_value)
         if int(sec.get("lost", 0)) or int(sec.get("pages", 0)) != len(node.hash_value):
@@ -228,8 +257,10 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
         cache._evict_host_leaf(node, tracker)
         released += int(tracker.get(BASE_COMPONENT_TYPE, 0)) // P
         leaves += 1
-        if parent is not None and parent is not cache.root_node and _eligible(cache, parent, pool, skip):
-            heapq.heappush(heap, (parent.id, parent))
+        aux_leaves += int(is_aux)
+        if parent is not None and parent is not cache.root_node and _eligible(cache, parent, pool, skip,
+                                                                               allow_aux):
+            heapq.heappush(heap, (_key(parent), parent))
     _N["calls"] += 1
     k = _N["calls"]
     if k <= 8 or k % 64 == 0 or unsecured:
@@ -244,6 +275,8 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
                       ("candidates", candidates), ("cand_pages", cand_pages), ("nodes", nodes_total),
                       ("unsecured", unsecured), ("unsec_lost", unsec_lost), ("unsec_short", unsec_short),
                       ("stale_pop", stale), ("braked", braked)]
+            if allow_aux:
+                fields += [("allow_aux", 1), ("aux_leaves", aux_leaves)]
             fields += list(_pi.census_fields(census))
             try:
                 st = pool.arena.stats()           # O(1) counters of the shared header
@@ -253,8 +286,11 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
             _pi.emit(ins_marker, fields, ins_sup)
         except Exception:  # noqa: BLE001 -- an instrument never breaks the spill
             logger.debug("%s census failed", _pi.MARK, exc_info=True)
-    return {"released": released, "leaves": leaves, "candidates": candidates, "unsecured": unsecured,
-            "braked": braked}
+    out = {"released": released, "leaves": leaves, "candidates": candidates, "unsecured": unsecured,
+           "braked": braked}
+    if allow_aux:
+        out["aux_leaves"] = aux_leaves
+    return out
 
 
 # ---------------------------------------------------------------- Q-1190 D-ARENA-YIELD
@@ -289,6 +325,91 @@ D_YIELD_MIN_PAGES = 4096
 D_YIELD_EMPTY_BACKOFF_S = 0.5
 
 _Y = {"posts": 0, "yields": 0, "no_pool": 0, "quiet_until": 0.0}
+
+# ---------------------------------------------------------------- Q-1190b AUX STAGE (wedged arena)
+# Q-1190b (27B NVFP4 dual, image int3 = 69cdc118a4, boot dkr27bnvfp4dual262kbar1fs10061713, two
+# needles 190k + 258k at once from 17:25:54Z, 21 min without one token). The shared KV arena stood at
+# complete=718623 pinned=718623 of 720896 slots from 17:27:25 to the end, and EVERY reference was a
+# TREE reference: 'ARENA-REF-HOLDERS pool=FULL tree=718621 tree_in_use=0 prefetch=0 queue=0 gap=0
+# own_held=718621' on every D rank, 'tree=674347 ... gap=0' on P PP0 (refs 4146136 = 3 x 718621 + the
+# three P ranks' own_held 674347 + 670251 + 645675: no stray, no queue leak). Nothing could be freed:
+#   * D: 'PKVWAIT-INSTR marker=spill_dyield nodes=17 n.aux_host_only=9 pg.aux_host_only=371285
+#     n.has_children=8 pg.has_children=347336 candidates=0' (660x, 3219 'D-ARENA-YIELD ...
+#     released_pages=0 candidates=0') -- every leaf of D's tree is a finished request's END node, which
+#     carries its mamba anchor host-only, and ``_reason`` refuses 'aux_host_only' unconditionally; the
+#     8 inner nodes are never leaves while those 9 stay.
+#   * P: 'marker=spill_trim ... n.has_children=133 n.device_resident=47 n.aux_host_only=4
+#     n.blocked_end_anchor=2 candidates=0' -- 21x 'ARENA-TRIM START -> 3 empty orders -> PAUSED (the
+#     holder is not P's tree) -> RESUME', no end.
+#   * the arena's own clock takes only UNREFERENCED slots; there were none.
+# Single needles ran clean because old content + one prompt fit (second boot 18:22Z: arena_pinned
+# max 452626 of 720896); two at once (448k new on top of 579622 pinned at 17:25:24) hit the wall.
+#
+# THE FIX (dual layout only, both groups, switch SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S, default 30 s,
+# 0 = off = the old refusal): once the wall has STOOD that long, the yield / trim also takes leaves
+# whose one refusal is the host-only aux state -- AFTER every plain leaf, still L3 copy first for every
+# KV page (#257), still never a locked, in-flight, END-anchor-held (V1) or claimer's node. The leaf
+# goes whole; its parent becomes a leaf and follows. The clock and the order are RANK-CONGRUENT:
+#   * D: TP0's ``d_take_need`` keeps the clock (first need of a wall -> now; no need for AUX_GAP_S ->
+#     cleared) and, once due, sets AUX_FLAG on the need it puts on the tick's collective; the MAX carries
+#     it to every D rank, every rank runs the same pass over its replica tree.
+#   * P: PP0's ``pp0_decide`` keeps the clock (fill above HI -> now; at or below HI -> cleared) and
+#     sets ``aux=1`` on the ``Weg2DualArenaTrim`` order that rides the request wire to every stage.
+# Named lines: ``Q-1190b DUAL ARENA-AUX-SPILL ON/OFF`` (the decision, with how long the wall stood) and
+# ``aux=1 aux_leaves=N`` on the D-ARENA-YIELD / ARENA-TRIM line of every aux pass.
+AUX_MARK = "Q-1190b DUAL ARENA-AUX-SPILL"
+AUX_ENV = "SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S"
+AUX_DEFAULT_S = 30.0
+#: no need posted for this long = the wall is gone; the next need starts a new clock
+AUX_GAP_S = 10.0
+#: the bit TP0 sets on the need it puts on the D tick's collective (pages stay far below it)
+AUX_FLAG = 1 << 40
+
+_A: Dict[str, Any] = {"d_since": None, "d_last": 0.0, "d_on": False, "d_ons": 0,
+                      "p_since": None, "p_on": False, "p_ons": 0}
+
+
+def _reset_aux_for_tests() -> None:
+    _A.update(d_since=None, d_last=0.0, d_on=False, d_ons=0, d_aux_n=0, p_since=None, p_on=False, p_ons=0)
+
+
+def aux_after_s(env=None) -> float:
+    """How long the arena wall must stand before the AUX stage; 0 (or junk below 0) = never."""
+    e = os.environ if env is None else env
+    try:
+        v = float(str(e.get(AUX_ENV, "") or AUX_DEFAULT_S).strip())
+    except ValueError:
+        v = AUX_DEFAULT_S
+    return max(0.0, v)
+
+
+def _d_aux_clock(cur: int, now: float, env=None) -> bool:
+    """D TP0, once per take: run the wall clock on the need it read (``cur`` pages, 0 = none posted);
+    True = the AUX stage is due for this need."""
+    after = aux_after_s(env)
+    if cur > 0:
+        if _A["d_since"] is None or now - float(_A["d_last"]) > AUX_GAP_S:
+            _A["d_since"] = now
+            _A["d_on"] = False
+        _A["d_last"] = now
+    elif _A["d_since"] is not None and now - float(_A["d_last"]) > AUX_GAP_S:
+        if _A["d_on"]:
+            logger.info("%s OFF side=D: no arena need for %.0f s -- the wall is gone, the aux stage ends",
+                        AUX_MARK, now - float(_A["d_last"]))
+        _A["d_since"], _A["d_on"] = None, False
+    if cur <= 0 or after <= 0.0 or _A["d_since"] is None:
+        return False
+    stood = now - float(_A["d_since"])
+    if stood < after:
+        return False
+    if not _A["d_on"]:
+        _A["d_on"] = True
+        _A["d_ons"] += 1
+        logger.warning("%s ON side=D n=%d stood_s=%.1f need=%d (%s=%.0f): the shared KV arena has refused claims "
+                       "for that long (needs kept coming, no gap of %.0f s) -- D now also gives back leaves whose "
+                       "one hold is a host-only END anchor, after every plain leaf (L3 copy of every KV page first)",
+                       AUX_MARK, _A["d_ons"], stood, int(cur), AUX_ENV, after, AUX_GAP_S)
+    return True
 
 
 def armed_any(env=None) -> bool:
@@ -369,15 +490,25 @@ def d_take_need(sched, env=None) -> int:
         cur = struct.unpack("<q", raw)[0] if len(raw) == 8 else 0
         if cur:
             os.pwrite(fd, struct.pack("<q", 0), 0)
-        return max(0, int(cur))
     finally:
         os.close(fd)
+    cur = max(0, min(int(cur), AUX_FLAG - 1))
+    # Q-1190b: the wall clock (TP0 only -- this function); a due AUX stage rides the collective as a bit
+    if _d_aux_clock(cur, time.monotonic(), env):
+        return cur | AUX_FLAG
+    return cur
 
 
 def d_yield_arena(sched, need: int) -> Dict[str, int]:
     """Every D rank, with the GROUP need (the same number on every rank): spill host-only
     H-leaves of D's tree until ``max(need, D_YIELD_MIN_PAGES)`` pages were released here.
-    The stop is named when the tree has no spill pool."""
+    The stop is named when the tree has no spill pool.
+
+    Q-1190b: ``need`` with AUX_FLAG set (TP0's wall clock was due; the collective's MAX gave the same
+    bit to every rank) runs the pass with ``allow_aux`` -- plain leaves first, then END-anchor leaves."""
+    need = int(need)
+    aux = need >= AUX_FLAG and aux_after_s() > 0.0
+    need = need & (AUX_FLAG - 1)
     tree = getattr(sched, "tree_cache", None)
     get = getattr(tree, "_weg2_direct_pool", None)
     pool = _spill_pool(get()) if callable(get) else None
@@ -388,12 +519,24 @@ def d_yield_arena(sched, need: int) -> Dict[str, int]:
                            "secure_rows_to_l3 -- nothing yielded", YIELD_MARK, _Y["no_pool"], int(need))
         return {"released": 0, "leaves": 0, "candidates": 0, "unsecured": 0}
     want = max(int(need), D_YIELD_MIN_PAGES)
-    got = spill_host_only(tree, pool, want, int(getattr(tree, "page_size", 1) or 1), set(), who="dyield")
+    if aux:
+        got = spill_host_only(tree, pool, want, int(getattr(tree, "page_size", 1) or 1), set(), who="dyield",
+                              allow_aux=True)
+    else:
+        got = spill_host_only(tree, pool, want, int(getattr(tree, "page_size", 1) or 1), set(), who="dyield")
     if got["released"] == 0:
         _Y["quiet_until"] = time.monotonic() + D_YIELD_EMPTY_BACKOFF_S
     _Y["yields"] += 1
     k = _Y["yields"]
-    if k <= 8 or k % 64 == 0 or got["released"] == 0:
+    if aux:
+        _A["d_aux_n"] = int(_A.get("d_aux_n", 0)) + 1
+    if aux and (_A["d_aux_n"] <= 16 or _A["d_aux_n"] % 64 == 0 or got["released"] == 0):
+        logger.info("%s n=%d need=%d want=%d released_pages=%d leaves=%d candidates=%d unsecured_kept=%d "
+                    "aux=1 aux_leaves=%d (the arena wall stood past %s: D gives back host-only leaves "
+                    "including END-anchor ones, plain first, L3 copy of every KV page first)", YIELD_MARK, k,
+                    int(need), want, got["released"], got["leaves"], got["candidates"], got["unsecured"],
+                    int(got.get("aux_leaves", 0)), AUX_ENV)
+    elif not aux and (k <= 8 or k % 64 == 0 or got["released"] == 0):
         logger.info("%s n=%d need=%d want=%d released_pages=%d leaves=%d candidates=%d unsecured_kept=%d "
                     "(a claim on the shared KV arena was refused; D gives back host-only leaves it holds "
                     "but no request uses, L3 copy first)", YIELD_MARK, k, int(need), want, got["released"],
@@ -474,11 +617,14 @@ TRIM_PAUSE_S_DEFAULT = 10.0
 class Weg2DualArenaTrim(NamedTuple):
     """PP0's order for one pass, riding the request wire: give back ``want`` pages of host-only
     leaves (node-id order, L3 copy first). ``fill_ppm`` is PP0's reading when it decided (for the
-    log line only -- no rank branches on it)."""
+    log line only -- no rank branches on it). ``aux`` (Q-1190b): 1 = PP0's wall clock was due, every
+    stage runs this order's pass with ``allow_aux`` (END-anchor leaves after the plain ones); 0 (default,
+    every order before the wall stood AUX_ENV seconds) = the order as before."""
 
     seq: int
     want: int
     fill_ppm: int
+    aux: int = 0
 
 
 _T: Dict[str, Any] = {
@@ -492,6 +638,7 @@ def _reset_trim_for_tests() -> None:
     _T.update(active=False, next_t=0.0, seq=0, episode_cmds=0, orders=0, execs=0, reads=0,
               census_reads=0, no_arena=0, need_posts=0, last_fill=0.0, decided_t=0.0, stops=0, errors=0,
               stale=0, prev_pinned=None, prev_want=0, pauses=0, pause_until=0.0)
+    _reset_aux_for_tests()
 
 
 def trim_enabled(env=None) -> bool:
@@ -597,9 +744,11 @@ def pp0_decide(sched, now: Optional[float] = None, env=None) -> Optional[Weg2Dua
         return None
     if pinned is None:
         _T["pause_until"] = 0.0           # below HI by the header's own bound: a pause is over
+        _p_aux_clock(None, t, cfg["hi"], env)
         return None
     fill = pinned / float(slots)
     _T["last_fill"] = fill
+    aux = _p_aux_clock(fill, t, cfg["hi"], env)
     if _T["pause_until"] > 0.0:
         if t >= _T["pause_until"] or fill <= cfg["hi"]:
             _T["pause_until"] = 0.0
@@ -658,7 +807,35 @@ def pp0_decide(sched, now: Optional[float] = None, env=None) -> Optional[Weg2Dua
     _T["seq"] += 1
     _T["episode_cmds"] += 1
     _T["orders"] += 1
+    if aux:
+        return Weg2DualArenaTrim(int(_T["seq"]), int(want), int(round(fill * 1_000_000)), 1)
     return Weg2DualArenaTrim(int(_T["seq"]), int(want), int(round(fill * 1_000_000)))
+
+
+def _p_aux_clock(fill: Optional[float], now: float, hi: float, env=None) -> bool:
+    """PP0, on every header read of ``pp0_decide``: the Q-1190b wall clock of group P (``fill`` above HI
+    starts it, at or below HI -- or ``None``, below HI by the header's own bound -- clears it). True = the
+    order of this pass carries ``aux=1``."""
+    if fill is None or fill <= hi:
+        if _A["p_on"]:
+            logger.info("%s OFF side=P fill=%s: the arena is at or below HI %.2f again, the aux stage ends",
+                        AUX_MARK, "-" if fill is None else "%.3f" % fill, hi)
+        _A["p_since"], _A["p_on"] = None, False
+        return False
+    if _A["p_since"] is None:
+        _A["p_since"] = now
+    after = aux_after_s(env)
+    stood = now - float(_A["p_since"])
+    if after <= 0.0 or stood < after:
+        return False
+    if not _A["p_on"]:
+        _A["p_on"] = True
+        _A["p_ons"] += 1
+        logger.warning("%s ON side=P n=%d stood_s=%.1f fill=%.3f (%s=%.0f): the shared KV arena has stood above "
+                       "HI %.2f for that long -- PP0's trim orders now also take leaves whose one hold is a "
+                       "host-only END anchor (every P stage, the same order; L3 copy of every KV page first)",
+                       AUX_MARK, _A["p_ons"], stood, fill, AUX_ENV, after, hi)
+    return True
 
 
 def pp0_stamp(sched, wire_reqs: Sequence[Any], now: Optional[float] = None, env=None) -> Tuple[List[Any], Optional[Weg2DualArenaTrim]]:
@@ -728,9 +905,14 @@ def _execute(sched, cmd: Weg2DualArenaTrim, env, none: Dict[str, int]) -> Dict[s
         return none
     cfg = trim_cfg(env)
     t0 = time.monotonic()
+    aux = bool(int(getattr(cmd, "aux", 0) or 0)) and aux_after_s(env) > 0.0
     try:
-        got = spill_host_only(tree, pool, int(cmd.want), int(getattr(tree, "page_size", 1) or 1), set(),
-                              budget_s=cfg["budget_s"], who="trim")
+        if aux:
+            got = spill_host_only(tree, pool, int(cmd.want), int(getattr(tree, "page_size", 1) or 1), set(),
+                                  budget_s=cfg["budget_s"], who="trim", allow_aux=True)
+        else:
+            got = spill_host_only(tree, pool, int(cmd.want), int(getattr(tree, "page_size", 1) or 1), set(),
+                                  budget_s=cfg["budget_s"], who="trim")
     except Exception:  # noqa: BLE001 - L3 I/O or a leaf eviction failed: this order ends here, the
         # next one starts from whatever tree state each leaf's own eviction left (every leaf is evicted
         # whole or not at all); a raise would end the rank, which is what V2 exists to prevent
@@ -744,7 +926,14 @@ def _execute(sched, cmd: Weg2DualArenaTrim, env, none: Dict[str, int]) -> Dict[s
     if rank == 0 and got["released"] == 0:
         # relative to PP0's decision clock (the same clock ``next_t`` runs on)
         _T["next_t"] = max(_T["next_t"], float(_T.get("decided_t", 0.0)) + cfg["backoff_s"])
-    if k <= 8 or k % 64 == 0 or got["released"] == 0 or got.get("braked"):
+    if aux and (k <= 64 or k % 64 == 0 or got["released"] == 0 or got.get("braked")):
+        logger.info("%s n=%d rank=%d seq=%d want=%d released_pages=%d leaves=%d candidates=%d "
+                    "unsecured_kept=%d braked=%d took_ms=%.1f fill=%.3f aux=1 aux_leaves=%d (PP0's order past "
+                    "the wall clock %s: host-only leaves including END-anchor ones, plain first, L3 copy of every "
+                    "KV page first)", TRIM_MARK, k, rank, cmd.seq, int(cmd.want), got["released"], got["leaves"],
+                    got["candidates"], got["unsecured"], int(got.get("braked", 0)), dt * 1000.0,
+                    cmd.fill_ppm / 1_000_000.0, int(got.get("aux_leaves", 0)), AUX_ENV)
+    elif not aux and (k <= 8 or k % 64 == 0 or got["released"] == 0 or got.get("braked")):
         logger.info("%s n=%d rank=%d seq=%d want=%d released_pages=%d leaves=%d candidates=%d "
                     "unsecured_kept=%d braked=%d took_ms=%.1f fill=%.3f (PP0's order, the same on every P "
                     "stage: host-only leaves, node-id order, L3 copy first; the slot frees when every "

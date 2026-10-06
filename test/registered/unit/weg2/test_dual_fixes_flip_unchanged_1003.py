@@ -930,6 +930,50 @@ class TestQ1190DArenaYieldFlipUnchanged:
         assert DDK.tick(sched) is None
 
 
+# ---------------------------------------------------------------------------------- Q-1190b
+
+class TestQ1190bArenaAuxSpillFlipUnchanged:
+    """Q-1190b: the AUX stage (END-anchor leaves after the wall stood SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S) is
+    reached only through the dual D take (TP0's clock) and the dual P trim order (PP0's clock); the spill's
+    default (``allow_aux`` False) keeps the old refusal. Behavioural half:
+    test_dual_arena_aux_spill_q1190b_1006 (wedge red->green, switch 0, gates)."""
+
+    def test_take_runs_no_clock_off_the_gate(self, monkeypatch):
+        from sglang.srt.weg2 import dual_arena_spill as DS
+
+        class Boom:
+            def __getattr__(self, name):
+                raise AssertionError("read %s off the gate" % name)
+
+        DS._reset_aux_for_tests()
+        monkeypatch.setenv(DS.AUX_ENV, "0.0001")
+        for env in TestQ1190DArenaYieldFlipUnchanged.FLIP:
+            assert DS.d_take_need(Boom(), dict(env, **{DS.AUX_ENV: "0.0001"})) == 0, env
+            assert DS._A["d_since"] is None, env
+
+    def test_trim_decides_nothing_off_the_dual_p_gate(self):
+        from sglang.srt.weg2 import dual_arena_spill as DS
+
+        DS._reset_trim_for_tests()
+        sched = SimpleNamespace(ps=SimpleNamespace(pp_rank=0, pp_size=3), tree_cache=None)
+        for env in _wrong_gates() + [{"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"}]:
+            assert DS.pp0_decide(sched, now=1e9, env=dict(env, **{DS.AUX_ENV: "0.0001"})) is None, env
+            assert DS._A["p_since"] is None, env
+
+    def test_default_spill_and_default_order_are_the_old_ones(self):
+        import inspect as _inspect
+
+        from sglang.srt.weg2 import dual_arena_spill as DS
+
+        assert _inspect.signature(DS.spill_host_only).parameters["allow_aux"].default is False
+        assert DS.Weg2DualArenaTrim(1, 2, 3).aux == 0
+        assert DS.aux_after_s({DS.AUX_ENV: "0"}) == 0.0
+        # the W3 claim path (per rank, flip and dual) never passes allow_aux
+        from sglang.srt.mem_cache import unified_radix_cache as URC
+
+        assert "allow_aux" not in _inspect.getsource(URC.UnifiedRadixCache._w3_arena_spill)
+
+
 # ---------------------------------------------------------------------------------- Q-697b
 
 class TestQ697bFlipUnchanged:
