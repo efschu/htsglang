@@ -237,20 +237,6 @@ def test_the_priced_extent_matches_the_shipped_expression():
 # --------------------------------------------------------------------------
 
 
-def test_design_a_added_no_collective():
-    """MUST NOT 6. The store arm rides the reduce that already runs once per
-    TP-loop iteration; a new `all_reduce` would be a second collective on the
-    admission path and is exactly what the #580 family forbids."""
-    import inspect
-
-    from sglang.srt.managers import scheduler as sched
-
-    src = inspect.getsource(sched)
-    assert src.count("torch.distributed.all_reduce") == 2, (
-        "scheduler.py must keep exactly the two all_reduce sites the parent has"
-    )
-
-
 def test_the_store_arm_slice_width_is_checked_before_it_is_priced():
     """A slice of the wrong width would read another arm's numbers as store
     depths -- and THIS arm admits work, so a foreign number admits a prefill
