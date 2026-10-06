@@ -56,6 +56,8 @@ STATIC_FILES = {
     "/hwprofil.js": ("hwprofil.js", "application/javascript; charset=utf-8"),
     # Profil-Editor S4b (Auftrag 1432): Balken je Karte mit Überlauf und Browser-Näherung
     "/profil_balken.js": ("profil_balken.js", "application/javascript; charset=utf-8"),
+    # Profil-Planer, eine Seite (AP-H1): Betriebsform, Regler, Je-Karte-Felder, Zustands- und Verdikt-Chips, Dual-Tabelle (reine Darstellung)
+    "/profil_planer.js": ("profil_planer.js", "application/javascript; charset=utf-8"),
 }
 #: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
 DEV_STATIC_FILES = {

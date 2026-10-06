@@ -203,7 +203,7 @@ class Katalog(unittest.TestCase):
         self.assertTrue(k["geladen"])
         # AP-G 06.10.: 108 Kanten (K62-K108 neu: Form A / ungleiches DCP / Draft / D-only / Dual, alle belegt; neu 10 -> 57, ohne Beleg weiter 24). Davor 61 Kanten seit 05.10.: K60 (Graph-Kalibriertabelle <-> Layer-Schnitt) und K61 (Tabelle wirkt nur bei Politik auto) sind NEU dazugekommen
         # (neu 8 -> 10, alle 61 belegt); die 24 "ohne Beleg" sind kuratierte Kantenwünsche, unverändert
-        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"], k["kanten_ohne_beleg"]), (108, 51, 57, 24))
+        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"], k["kanten_ohne_beleg"]), (116, 51, 65, 24))
         deps = [d for e in cat["entries"].values() for d in e["depends"]]
         self.assertTrue(all("belegt" in d and "to_kind" in d for d in deps))
         self.assertTrue(any(d["to_kind"] == "ablehnung" for d in deps))

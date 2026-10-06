@@ -469,3 +469,21 @@ Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `st
   `MemoryMax=1G`, torch/CUDA gehört in einen eigenen cgroup-Rahmen). Env: `HWPROFIL_TREE`, `HWPROFIL_MEASURE_TREE`, `HWPROFIL_PYTHON`, `HWPROFIL_PREFIX`.
 * Einhängen in eine Seite: `<div id="x"></div><script src="hwprofil.js"></script><script>HwProfil.mount(document.getElementById("x"))</script>`;
   `HwProfil.render(antwort)` liefert nur den HTML-Text.
+
+## Profil-Planer: eine Seite in sechs Schritten (AP-H1, Plan Profil-Planer 06.10.)
+
+Der Reiter Profil führt in einer festen Reihenfolge: **1 Hardware** (Inventar: "Dieses Rig" = Hardwareprofil mit echten NVML-Karten, oder Karten aus dem Katalog,
+synthetisch; die drei vorbelegten Karten zuerst) -> **2 Modell und Profil** -> **3 Betriebsform** (Einzelkarte, Nur TP, Flip PP/TP, Dual PP/TP, je ein erklärender
+Satz; Vorbelegung aus dem Profil: `--dual-layout`/`--dual-share` = Dual, `--d-only` = Nur TP) -> **4 Vorschlag** (Regler "Sitze gleichzeitig" und "Kontext",
+Knopf "Vorschlag" = `POST /api/profil/propose`, "Neu prüfen" = Trockenlauf) -> **5 Anpassen** -> **6 Export**.
+
+* Daten der Seite: `rigdash/profil_planer.py` (`ui_info`, in `GET /api/profil/list` als `planer`): Formen, Abschnitte A (Aufteilung), B (KV), C (Experten) mit den
+  Namen ihrer Werte, die Dual-ENV-Tabelle mit Standardwerten und Quellzeilen, Reglergrenzen. Fehlt `planer` (älterer Dienst) oder `profil_planer.js`, zeichnet
+  `profil.js` die alte Seite. Der Vorschlag gilt für die Formen, die `ProfilEditor.FORMS` kennt (flip, tp); Einzelkarte (AP-F) und Dual (AP-E) zeigen den Grund.
+* Darstellung: `static/profil_planer.js` (kein DOM, kein Netz, Node-testbar). Ein Feld je Rang für Vektoren (Kommalisten mit gleich vielen Einträgen wie Karten;
+  falsche Länge = Warnung), **Zustandschip** je Wert (vorgeschlagen / unbelegt / vom Launcher gelöst / von Ihnen übersteuert / Profil / Standard), **Urteilschip**
+  je Wert (geht / nur mit --force / verweigert / Hinweis / nicht geprüft / ungeprüft seit Ihrer Änderung) mit Code und Grund sichtbar, **Abhängigkeitschips**
+  aus dem Kantenkatalog. Ein Urteil ist ein Hinweis, nie eine Sperre (Nutzerentscheid 4a): jedes Feld bleibt bedienbar, Force steht im Export. Filter Einfach/Experte.
+* Dual-ENV-Tabelle (Abschnitt D, Plan 4c): `SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE` als Tabelle (D-Sitze bis | P-Anteil bei kleinem / großem tau, Stufen 0-3 = 100/75/50/25 %),
+  `..._STARVE_AGE_S`, `..._STARVE_MAX_RUNG`, `SGLANG_WEG2_DUAL_GRANT_RETRY_MS`; Katalogeinträge kuratiert, Kanten K109-K116 mit Beleg.
+* Tests: `tests/test_profil_planer_aph1_1006.py`.

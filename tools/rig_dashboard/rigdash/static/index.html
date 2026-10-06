@@ -147,6 +147,50 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .pf-export { border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; margin: 10px 0; background: var(--surface); } .pf-export h3 { margin: 4px 0; font-size: 14px; } .pf-issue-text { display: block; width: 100%; box-sizing: border-box; min-height: 14em; margin: 6px 0; padding: 8px 10px; background: var(--surface-2); color: inherit; border: 1px solid var(--line); border-radius: 6px; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; resize: vertical; }
 .pf-ok { border-color: var(--good); color: var(--good); } .pf-bad { border-color: var(--bad); color: var(--bad); }
 .pf-env { max-height: 420px; overflow: auto; } .pf-use { font-size: 12.5px; margin: 6px 0; } .pf-val { overflow-wrap: anywhere; max-width: 30em; }
+/* AP-H1: eine Seite, sechs Schritte (Hardware -> Modell -> Form -> Vorschlag -> Anpassen -> Export); Design-Sprache wie oben, Zeilen als Karten statt Tabelle */
+.pfx-step { border: 1px solid var(--line); border-radius: 10px; padding: 6px 12px 10px; margin: 12px 0; background: var(--surface); }
+.pfx-step > h3 { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 4px; font-size: 15px; }
+.pfx-no { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; background: var(--bar); color: var(--surface); font-size: 12px; font-weight: 700; }
+.pfx-view { margin-left: auto; }
+.pfx-seg { display: inline-flex; flex-wrap: wrap; gap: 0; margin: 4px 0 6px; } .pfx-seg button { border-radius: 0; } .pfx-seg button:first-child { border-radius: 6px 0 0 6px; } .pfx-seg button:last-child { border-radius: 0 6px 6px 0; }
+.pfx-cards { list-style: none; padding: 0; margin: 4px 0; display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12.5px; } .pfx-cards li { border: 1px solid var(--line); border-radius: 8px; padding: 2px 10px; background: var(--surface-2); }
+.pfx-forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(230px, 100%), 1fr)); gap: 8px; margin: 6px 0; }
+#pf-root button.pfx-form { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; padding: 8px 10px; border-radius: 8px; font-size: 12.5px; white-space: normal; height: 100%; }
+#pf-root button.pfx-form b { font-size: 13.5px; } .pfx-form span { color: var(--text-2); font-weight: 400; } #pf-root button.pfx-form.sel span { color: var(--surface); }
+.pfx-form .pfx-fh { font-style: normal; font-size: 11.5px; color: var(--warn); } #pf-root button.pfx-form.sel .pfx-fh { color: var(--surface); }
+.pfx-ctl { display: flex; flex-direction: column; gap: 8px; margin: 6px 0; }
+.pfx-reg { display: grid; grid-template-columns: minmax(150px, 190px) minmax(120px, 280px) 110px 1fr; gap: 6px 12px; align-items: center; }
+.pfx-reg input[type=range] { width: 100%; } .pfx-reg input[type=number] { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); }
+.pfx-rl { display: inline-flex; gap: 6px; align-items: center; } .pfx-rn { font-size: 11.5px; } .pfx-why { margin: 0; align-self: center; }
+.pfx-prop .pf-verdict { margin: 6px 0; } .pfx-msg { margin: 6px 0; }
+.pfx-sec { border: 1px solid var(--line); border-radius: 8px; margin: 10px 0; padding: 2px 10px 8px; background: var(--surface); } .pfx-sec > summary { cursor: pointer; padding: 5px 0; font-size: 13.5px; }
+.pfx-row, .pfx-dr { border-top: 1px solid var(--line); padding: 8px 0 6px; display: grid; gap: 4px; min-width: 0; } .pfx-row.pfx-ch { box-shadow: inset 3px 0 0 var(--warn); padding-left: 8px; }
+.pfx-row.pfx-z-vorgeschlagen { box-shadow: inset 3px 0 0 var(--good); padding-left: 8px; }
+.pfx-h { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; } .pfx-n { overflow-wrap: anywhere; font-weight: 600; font-size: 12.5px; }
+.pfx-zchip, .pfx-vchip { font-size: 11px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line); white-space: nowrap; background: var(--surface-2); color: var(--text-2); cursor: help; }
+.pfx-z-vorgeschlagen { border-color: var(--good); color: var(--good); } .pfx-z-unbelegt { border-color: var(--warn); color: var(--warn); border-style: dashed; }
+.pfx-z-uebersteuert { border-color: var(--warn); color: var(--warn); font-weight: 600; } .pfx-z-launcher { border-color: var(--bar); color: var(--text); }
+.pfx-v-geht { border-color: var(--good); color: var(--good); } .pfx-v-force, .pfx-v-ungeprueft { border-color: var(--warn); color: var(--warn); font-weight: 600; }
+.pfx-v-verweigert { border-color: var(--bad); color: var(--bad); font-weight: 600; } .pfx-v-hinweis { color: var(--text); } .pfx-v-keins, .pfx-v-alt { border-style: dashed; }
+.pfx-v { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; min-width: 0; } .pfx-v input[type=text], .pfx-v input[type=number], .pfx-v select { font: inherit; font-size: 12.5px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); max-width: 100%; box-sizing: border-box; }
+.pfx-v > input[type=text] { flex: 1 1 18em; min-width: 8em; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.pfx-vec { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: flex-end; } .pfx-c { display: flex; flex-direction: column; gap: 1px; font-size: 11px; color: var(--text-2); }
+.pfx-c input { width: 6.2em; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px !important; text-align: right; } .pfx-cl { white-space: nowrap; cursor: help; }
+.pfx-sum { font-size: 12px; color: var(--text-2); padding-bottom: 4px; } .pfx-diff { font-size: 11px; color: var(--good); overflow-wrap: anywhere; }
+.pfx-warn { margin: 2px 0; font-size: 12px; } .pfx-vd { margin: 0 0 0 18px; padding: 0; font-size: 12px; overflow-wrap: anywhere; } .pfx-vd li { margin: 2px 0; }
+.pfx-e { min-width: 0; } .pfx-miss { margin: 8px 0 0; font-size: 12.5px; } .pfx-misl { list-style: none; padding: 0; margin: 4px 0; display: grid; gap: 6px; } .pfx-misl li { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.pfx-newv { font: inherit; font-size: 12px; padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); max-width: 100%; }
+.pfx-gt { border-collapse: collapse; margin: 6px 0; } .pfx-gt th { text-align: left; font-size: 11.5px; color: var(--text-2); font-weight: 600; padding: 2px 8px; } .pfx-gt td { padding: 4px 8px; border-top: 1px solid var(--line); }
+.pfx-gt input[type=number], .pfx-gt select { font: inherit; font-size: 12.5px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); } .pfx-gt input[type=number] { width: 8em; } .pfx-inf { color: var(--text-2); font-size: 12px; }
+.pfx-dr { margin-top: 6px; }
+.pfx-step, .pfx-sec, .pfx-row, .pfx-dr { min-width: 0; overflow-wrap: anywhere; } .pfx-sec .pf-dep { white-space: normal; max-width: 100%; }
+.pfx-chg { list-style: none; padding: 0; margin: 4px 0; font-size: 12.5px; display: grid; gap: 4px; overflow-wrap: anywhere; }
+@media (max-width: 640px) {   /* Telefon 390 px: alles stapelt */
+  .pfx-step { padding: 4px 10px 8px; } .pfx-view { margin-left: 0; } .pfx-reg { grid-template-columns: 1fr 100px; } .pfx-reg .pfx-rl, .pfx-reg .pfx-rn { grid-column: 1 / -1; }
+  .pfx-seg { display: flex; width: 100%; } .pfx-seg button { flex: 1 1 100%; border-radius: 6px !important; margin: 2px 0; }
+  .pfx-c input { width: 5.4em; } .pfx-gt, .pfx-gt tbody, .pfx-gt tr, .pfx-gt td { display: block; } .pfx-gt thead { display: none; } .pfx-gt tr { border-top: 1px solid var(--line); padding: 4px 0; }
+  .pfx-gt td { border-top: 0; padding: 2px 0; } .pfx-gt td::before { content: attr(data-l) ": "; font-size: 11.5px; color: var(--text-2); } .pfx-gt input[type=number] { width: 7em; }
+}
 /* Kartenplaner (Item 510): Auswahl, Einfach- und Expertenseite; Farben aus den Seitenvariablen (hell/dunkel).
    Die kp-Klassen tragen auch den Profil-Reiter (Urteil, Balken) und stehen darum auch in der Release-Ausgabe. */
 #kp-root { max-width: 1200px; }
@@ -683,6 +727,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
 <script src="modellprofil.js"></script>
 <script src="hwprofil.js"></script>
 <script src="profil_balken.js"></script>
+<script src="profil_planer.js"></script>
 <script src="profil.js"></script>
 <script>
 "use strict";

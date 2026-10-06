@@ -89,9 +89,29 @@ class Curated(unittest.TestCase):
         for name, c in CU.CURATED.items():
             if c["kind"] == "flag" and name not in self.flags and name not in self.server:
                 miss.append(name)
-            if c["kind"] == "env" and name not in self.envs and name not in self.launcher_src:
+            if c["kind"] == "env" and name not in self.envs and name not in self.launcher_src and not self._composed_env_read(name):
                 miss.append(name)
         self.assertEqual(miss, [])
+
+    #: Envs, die der Code aus ``ENV_PREFIX + "<NAME>"`` zusammensetzt (der volle Name steht nirgends als Literal): Name -> (Datei im weg2-Verzeichnis,
+    #: Quelltext der Stelle, die das Suffix liest).  AP-H1 (Dual-ENV-Tabelle): dual_green.py / dual_share.py lesen sie ueber ``g("TABLE")`` bzw. die Namensliste.
+    COMPOSED_ENV = {
+        "SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE": ("dual_green.py", 'g("TABLE")'),
+        "SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S": ("dual_share.py", '("STARVE_AGE_S", "starve_age_s", float)'),
+        "SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG": ("dual_share.py", '("STARVE_MAX_RUNG", "starve_max_rung", int)'),
+    }
+
+    def _composed_env_read(self, name):
+        """Ein zusammengesetzter Env-Name gilt als belegt, wenn der Praefix im Code steht UND die Lesestelle des Suffixes im genannten Quelltext."""
+        hit = self.COMPOSED_ENV.get(name)
+        if hit is None:
+            return False
+        prefix, suffix_src = "SGLANG_WEG2_DUAL_SHARE_", hit[1]
+        with open(os.path.join(WEG2, "dual_share.py"), encoding="utf-8") as fh:
+            if 'ENV_PREFIX = "%s"' % prefix not in fh.read():
+                return False
+        with open(os.path.join(WEG2, hit[0]), encoding="utf-8") as fh:
+            return suffix_src in fh.read() and name.startswith(prefix)
 
     def test_every_edge_points_at_something_that_exists(self):
         codes = {r.code for r in RF.REGISTER}

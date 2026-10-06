@@ -187,8 +187,8 @@ APG_REL = {
 
 class AuftragG(Basis, unittest.TestCase):
     def test_edge_count_is_pinned(self):
-        self.assertEqual(len(self.kanten), 108)                         # 61 + 47 (K62-K108, AP-G; fix round 1 dropped 2 wrongly typed edges)
-        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in range(1, 109)])
+        self.assertEqual(len(self.kanten), 116)                         # 61 + 47 (K62-K108, AP-G; fix round 1 dropped 2 wrongly typed edges) + 8 (K109-K116, AP-H1: Dual-ENV-Tabelle)
+        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in range(1, 117)])
 
     def test_apg_values_are_curated_and_explained_from_the_source(self):
         for n in APG_NAMES:
