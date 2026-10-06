@@ -368,9 +368,11 @@ def test_b0_equal_ranks_one_read_waits_for_arena_room_every_rank_takes_the_same_
     assert len(set(count)) == 1 and count[0] >= 1, count
 
 
-def test_b1_equal_ranks_every_member_cap_waiting_nobody_enters_a_collective():
-    """The early ``return 0`` after the strip (scheduler.py:6866) is rank-uniform when the waiter set
-    is: every rank leaves before the MIN, none waits in it."""
+def test_b1_equal_ranks_every_member_cap_waiting_every_rank_takes_the_same_collectives():
+    """1537b (b) patch: the cap-waiters are NOT stripped before the vote. With every member cap-waiting
+    on every rank the tick still enters the same two collectives (due|decide, release flags) on each
+    rank, votes 0 for each waiter, releases nothing and keeps both parked (the base returned 0 before
+    any collective: [0,0,0])."""
     from sglang.srt.weg2 import park_l3
 
     def hold_all(ranks):
@@ -382,24 +384,27 @@ def test_b1_equal_ranks_every_member_cap_waiting_nobody_enters_a_collective():
                 setattr(r, park_l3.CAPWAIT_ATTR, True)
                 setattr(r, park_l3.DEFER_ATTR, True)
 
-    _ranks, errs, vals, count = _settle_group([100, 100, 100], pre_tick=hold_all)
-    assert errs == [None] * N and vals == [0] * N and count == [0, 0, 0], (errs, vals, count)
+    ranks, errs, vals, count = _settle_group([100, 100, 100], pre_tick=hold_all)
+    assert errs == [None] * N and vals == [0] * N and count == [2, 2, 2], (errs, vals, count)
+    assert [[str(r.rid) for r in s.weg2_post_wake_settle] for s in ranks] == [["weg2-1-0", "weg2-1-1"]] * N
 
 
-@pytest.mark.xfail(strict=True, raises=(Hang, Mismatch, AssertionError),
-                   reason="1537b (b): a rank without an arena (cap None) issues EVERY hold read, the others "
-                          "keep the 2nd one cap-waiting -> the settle lists (and the vote vector) differ at "
-                          "scheduler.py:6906 (park_l3.arena_capacity reads rank-local mem_pool_host.arena)")
-def test_b2_one_rank_has_no_arena_bound_the_settle_collective_splits():
-    _ranks, errs, _vals, count = _settle_group([100, None, 100])
+def test_b2_one_rank_has_no_arena_bound_the_settle_collective_stays_uniform():
+    """1537b (b) patch: a rank without an arena (cap None) issues EVERY hold read, the others keep the
+    2nd one cap-waiting. The vote vector is now built from the replicated settle, so the three ranks
+    meet in the same collectives with the same length, the 2nd member is not released (a waiter votes
+    0, MIN) and every rank keeps the same settle list. (Red on the base: Mismatch [2,2,4].)"""
+    ranks, errs, vals, count = _settle_group([100, None, 100])
     assert errs == [None] * N, [repr(e) for e in errs]
     assert len(set(count)) == 1, count
+    assert len({tuple(str(r.rid) for r in s.weg2_post_wake_settle) for s in ranks}) == 1
+    assert ["weg2-1-1" in {str(r.rid) for r in s.weg2_post_wake_settle} for s in ranks] == [True] * N
 
 
-@pytest.mark.xfail(strict=True, raises=(Hang, Mismatch, AssertionError),
-                   reason="1537b (b): park_l3.issue_capacity_waiters raising on ONE rank leaves _cap_wait=[] "
-                          "there (scheduler.py:6855-6862) while the peers strip their waiters")
-def test_b3_issue_capacity_waiters_raises_on_one_rank_the_settle_collective_splits(monkeypatch):
+def test_b3_issue_capacity_waiters_raises_on_one_rank_the_settle_collective_stays_uniform(monkeypatch):
+    """1537b (b) patch: park_l3.issue_capacity_waiters raising on ONE rank leaves its ``_cap_wait`` empty
+    (scheduler.py `except`), the peers' waiters stay waiting. No strip any more -> same vector on all
+    ranks; the waiter is not released (peers vote 0) and stays in every settle. (Red on the base.)"""
     from sglang.srt.weg2 import park_l3
 
     real = park_l3.issue_capacity_waiters
@@ -414,9 +419,10 @@ def test_b3_issue_capacity_waiters_raises_on_one_rank_the_settle_collective_spli
     def arm(ranks):
         ranks[1]._boom = True
 
-    _ranks, errs, _vals, count = _settle_group([100, 100, 100], pre_tick=arm)
+    ranks, errs, _vals, count = _settle_group([100, 100, 100], pre_tick=arm)
     assert errs == [None] * N, [repr(e) for e in errs]
     assert len(set(count)) == 1, count
+    assert len({tuple(str(r.rid) for r in s.weg2_post_wake_settle) for s in ranks}) == 1
 
 
 def test_b4_the_capacity_decision_reads_no_rank_identity_and_no_pool_state():

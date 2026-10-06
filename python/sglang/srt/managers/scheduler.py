@@ -6862,11 +6862,11 @@ class Scheduler(
             _cap_wait = [r for r in settle if _pl3f.capacity_waiting(r)]
         except Exception as exc:  # noqa: BLE001 -- a failed issue leaves them waiting
             logger.warning("#248f WAKE-READ capacity issue n/a (%s: %s)", type(exc).__name__, exc)
-        if _cap_wait:
-            _ids = {id(r) for r in _cap_wait}
-            settle = [r for r in settle if id(r) not in _ids]
-            if not settle:
-                return 0
+        # 1537b (b): the cap-waiters are NOT stripped before the vote. Which members wait is a
+        # rank-local view (arena bound here or not, a failed issue); stripping them changed the
+        # vector length / the entry into the collective per rank. The replicated settle is voted
+        # whole, a waiter votes "not due, not ready" (0), the MIN keeps it parked on every rank.
+        _cap_ids = {id(r) for r in _cap_wait}
         now = time.monotonic()
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         keep, release = [], []
@@ -6881,7 +6881,8 @@ class Scheduler(
         # on them goes through the group MIN below.
         from sglang.srt.weg2 import settle_writer as _sw_nw
 
-        _acts = [_weg2_settle_writer_action(self, req) for req in settle]
+        _acts = ["capwait" if id(req) in _cap_ids else _weg2_settle_writer_action(self, req)
+                 for req in settle]
         # P4b-fix (28.09.): the writer view is RANK-LOCAL -- a rank that never read the
         # hand-off record before the wake removed it sees "none" while its peers see P's
         # hand-off. "decide" must not veto the group's re-read then (it did: 0 in the due
@@ -6890,6 +6891,10 @@ class Scheduler(
         # the re-read only when EVERY rank decides. One collective: [due..., decide...].
         _pre, _dec = [], []
         for req, _act in zip(settle, _acts):
+            if _act == "capwait":
+                _pre.append(0)  # 1537b: waits for arena room, no re-read, no release
+                _dec.append(0)
+                continue
             if _act == "wait":
                 _pre.append(0)  # a writer at work: a re-read cannot see pages still being written
                 _dec.append(0)
@@ -6910,6 +6915,9 @@ class Scheduler(
         _n = len(settle)
         _agreed_due = [int(bool(d) and not a) for d, a in zip(_votes[:_n], _votes[_n:])]
         for req, _ok, _act in zip(settle, _agreed_due, _acts):
+            if _act == "capwait":
+                _local.append((req, "wait", False, False))
+                continue
             try:
                 state = _refetch(req, now, allow_reissue=bool(_ok))
                 if state == "due":
@@ -7010,7 +7018,7 @@ class Scheduler(
                 release = _rel2
         except Exception as exc:  # noqa: BLE001 -- the release stands, named
             logger.warning("WEG2 D-NORECOMPUTE n/a (%s: %s) -- released as before", type(exc).__name__, exc)
-        self.weg2_post_wake_settle = keep + _cap_wait
+        self.weg2_post_wake_settle = keep
         if release:
             try:  # #1461: back under the strict claim law
                 _cc = self.tree_cache.cache_controller
