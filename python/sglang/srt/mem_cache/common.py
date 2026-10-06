@@ -1497,6 +1497,36 @@ def _compute_dsv4_state_lens(batch, *, is_decode: bool):
     )
 
 
+def _cap_overask(tree_cache, allocator, num_tokens: int) -> int:
+    """nf-next-1006-07c: extra TREE tokens the pre-allocation eviction of
+    :func:`alloc_paged_token_slots_extend` asks for under an engaged residency cap.
+
+    The pool takes every id freed above the cap straight back out of its free
+    list, so a peel of ``num_tokens`` can pay the pool nothing when its victims
+    sit up there (cand3 05.10. 23:45:03Z: 19200 evictable, 16512 of them in one
+    atomic leaf above the cap, one peel delivered 64 of 868). nf-next-1006-01
+    publishes the GROUP gap ``floor + E - MIN admission`` (``CAP_GAP_ATTR``, built
+    from the reduced values only): asking for ``num_tokens + gap`` evicts on every
+    rank at least ``num_tokens + U_s - A_s`` tree tokens, at most ``U_s`` of which
+    lie above that rank's cap, so at least ``num_tokens - A_s`` reach the pool.
+
+    Rank-uniform: the entry is the SAME predicate :func:`evict_from_tree_cache`
+    uses (``uniform_avail_for_evict < num_tokens``), the amount is a published
+    group value -- no rank-local branch, no collective, no new payload, no env.
+    0 (= the base's ask, byte for byte) without an engaged cap, without a
+    published gap, or when the base would not evict at all."""
+    gap = _published_nonneg_int(tree_cache, CAP_GAP_ATTR)
+    if gap <= 0:
+        return 0
+    from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+    if _ef.engaged_cap_pages(allocator) is None:
+        return 0
+    if uniform_avail_for_evict(tree_cache, allocator) >= num_tokens:
+        return 0
+    return gap
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -1517,7 +1547,9 @@ def alloc_paged_token_slots_extend(
     # rc12k 10:51:00 raised here with "226048 evictable" in the message and
     # no word that the eviction in between had freed nothing.
     payable_before = payable_size(allocator)
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evict_from_tree_cache(
+        tree_cache, num_tokens + _cap_overask(tree_cache, allocator, num_tokens)
+    )
     delivered = max(0, payable_size(allocator) - payable_before)
     evict_asked = max(0, num_tokens - payable_before)
 
