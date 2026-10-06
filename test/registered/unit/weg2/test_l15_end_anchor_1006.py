@@ -21,7 +21,9 @@ puts it first). The insert check is POSITION, not existence: the donated slot
 must hold the state at exactly ``mamba_last_track_seqlen``.
 """
 
+import dataclasses
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -29,6 +31,7 @@ import torch
 import sglang.srt.managers.scheduler_components.batch_result_processor as brp
 import sglang.srt.runtime_context as rc
 from sglang.srt.mem_cache import memory_pool as mp
+from sglang.srt.managers import scheduler as sched_mod
 from sglang.srt.speculative import dflash_worker_v2 as dfw
 
 try:  # absent on the base commit -> the armed tests are red there
@@ -70,6 +73,29 @@ class Req:
 
     def finished(self):
         return len(self.output_ids) >= self.target_out
+
+
+@dataclasses.dataclass
+class FakeSB:
+    """Dataclass stand-in for ScheduleBatch: ``Scheduler._forward_isolation``
+    snapshots/restores ``dataclasses.fields`` of the batch."""
+
+    reqs: Any = None
+    req_to_token_pool: Any = None
+    tree_cache: Any = None
+    spec_algorithm: Any = None
+    mamba_track_indices: Any = None
+    mamba_track_mask: Any = None
+    mamba_track_seqlens: Any = None
+    weg2_end_anchor: Any = None
+    weg2_end_anchor_mask: Any = None
+    sampling_info: Any = None
+    device: Any = "cpu"
+
+
+def _isolated(batch):
+    """The REAL spec-v2 forward isolation (overlap=False: no batch_record_buf)."""
+    return sched_mod.Scheduler._forward_isolation(SimpleNamespace(), batch, overlap=False)
 
 
 class GPU:
@@ -150,7 +176,7 @@ class Sim:
         # unfiltered batch keeps the extend's tensor ("stale")
         self.track_indices = track_indices
         self.mutate = mutate or {}
-        self.batch = SimpleNamespace(
+        self.batch = FakeSB(
             reqs=list(reqs),
             req_to_token_pool=self.pool,
             tree_cache=SimpleNamespace(page_size=1),
@@ -160,9 +186,6 @@ class Sim:
                 if track_indices == "stale"
                 else None
             ),
-            weg2_end_anchor=None,
-            weg2_end_anchor_mask=None,
-            device="cpu",
         )
         self.inserts = []  # (rid, cache_len, donated_slot, state_pos)
         self.extra_forwards = 0
@@ -171,6 +194,20 @@ class Sim:
     def launch(self, commits):
         b = self.batch
         live = [r for r in b.reqs]
+        with _isolated(b):
+            done = self._launch_inner(b, live, commits)
+        # event loop: batch.copy() AFTER run_batch (i.e. after the isolation)
+        snap = SimpleNamespace(
+            reqs=list(live),
+            req_to_token_pool=self.pool,
+            spec_algorithm=b.spec_algorithm,
+            weg2_end_anchor=b.weg2_end_anchor,
+            weg2_end_anchor_mask=b.weg2_end_anchor_mask,
+        )
+        return snap, done
+
+    def _launch_inner(self, b, live, commits):
+        # forward_batch_generation's top: a plan belongs to one verify
         b.weg2_end_anchor = None
         b.weg2_end_anchor_mask = None
         if ea is not None:
@@ -195,14 +232,7 @@ class Sim:
         )
         for r, c in zip(live, commit.tolist()):
             r._device_fed = self._device_fed(r) + c  # the GPU's own length
-        snap = SimpleNamespace(
-            reqs=list(live),
-            req_to_token_pool=self.pool,
-            spec_algorithm=b.spec_algorithm,
-            weg2_end_anchor=b.weg2_end_anchor,
-            weg2_end_anchor_mask=b.weg2_end_anchor_mask,
-        )
-        return snap, {r.rid: c for r, c in zip(live, commit.tolist())}
+        return {r.rid: c for r, c in zip(live, commit.tolist())}
 
     @staticmethod
     def _device_fed(r):
@@ -481,3 +511,39 @@ def test_wiring_plan_before_verify_snapshot_and_steps_in_commit():
     # a stale plan of the previous round is dropped at the top of every forward
     assert fbg.index("batch.weg2_end_anchor = None") < fbg.index("if batch.forward_mode.is_extend()")
     ast.parse(src)
+
+
+def test_forward_isolation_carries_the_plan_to_the_result(env, monkeypatch):
+    """Metal 06:09 boot (..._1006_060930): _forward_isolation restored every
+    ScheduleBatch dataclass field after the spec-v2 forward, the plan was None
+    at batch.copy(), no anchor. The plan must survive; every OTHER field is
+    still restored."""
+    if ea is None:
+        pytest.fail("l15_end_anchor missing (base commit)")
+    _arm(monkeypatch)
+    r = Req("iso", 60054, 48, live=5, pp=[10, 11])
+    b = FakeSB(reqs=[r], req_to_token_pool=FakePool(),
+               tree_cache=SimpleNamespace(page_size=1),
+               spec_algorithm=SimpleNamespace(is_none=lambda: False))
+    with _isolated(b):
+        ea.plan_verify(b, rebuild=_stock_rebuild)
+        assert b.mamba_track_indices is not None
+    assert b.weg2_end_anchor == [0]
+    assert b.weg2_end_anchor_mask is not None
+    assert b.mamba_track_indices is None  # the rest is still undone
+    # every new ScheduleBatch dataclass field of this feature is carried
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+    new = {f.name for f in dataclasses.fields(ScheduleBatch) if "end_anchor" in f.name}
+    assert new == set(sched_mod._FORWARD_ISOLATION_CARRY)
+
+
+def test_armed_request_crossing_the_grid_is_exact(env, monkeypatch):
+    """Point 3 of the metal diagnosis: an armed request that crosses 256 must
+    not get a grid key paired with a round-end slot (pinned keep + stock flip)."""
+    _arm(monkeypatch)
+    r = Req("cross", 60100, 70, live=7, pp=[50, 51])  # 60160 crossed mid-run
+    sim = Sim([r], track_indices="none")
+    inserts = sim.run([{"cross": c} for c in (3, 5, 2, 8, 4, 6, 3, 2, 5, 7, 4, 3, 2, 6, 5, 4, 3)])
+    _assert_exact(inserts, [r])
+    assert inserts[0][1] > 60160

@@ -439,6 +439,10 @@ _POLICY_REASON_DIGITS = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 # Runtime HiCache resize requests are expressed in GiB.
 _GIB = 1024**3
 
+#: L15-END-ANCHOR (weg2/l15_end_anchor.py): ScheduleBatch fields a spec-v2 forward
+#: writes as output for its own result; `_forward_isolation` must not undo them.
+_FORWARD_ISOLATION_CARRY = frozenset(("weg2_end_anchor", "weg2_end_anchor_mask"))
+
 #: #1058b: seconds between told-vs-local census lines. A WALL-CLOCK cadence
 #: on purpose: boot 28 emitted zero census lines because the emitter was
 #: gated on 128 observations and the boot starved at fewer than that, so the
@@ -19061,6 +19065,11 @@ class Scheduler(
         finally:
             if snapshot_v2_full:
                 for name, value in sched_snapshot.items():
+                    if name in _FORWARD_ISOLATION_CARRY:
+                        # L15-END-ANCHOR: this forward's plan is OUTPUT for its
+                        # result (batch.copy() follows run_batch); the next
+                        # forward resets it at its own start.
+                        continue
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
