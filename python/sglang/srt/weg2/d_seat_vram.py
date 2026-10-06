@@ -2902,11 +2902,15 @@ def runtime_tick(sched):
     if fr["ticks"] % FLOOR_CHECK_EVERY == 0:
         logger.info(
             "%s ticks=%d floor_reads=%d floor_cached=%d room_reads=%d room_cached=%d "
-            "collectives=%d pending=S%s lifted=%s recheck_max=%d",
+            "collectives=%d pending=S%s lifted=%s recheck_max=%d used=%d chunk_live=%d",
             FLOOR_CHECK_MARK, fr["ticks"], fr["floor_reads"], fr["floor_cached"],
             fr["room_reads"], fr["room_cached"], fr["floor_reads"] + fr["room_reads"],
             "-" if ms.pending is None else ms.pending, "yes" if lifted else "no",
-            _recheck_max())
+            _recheck_max(), used,
+            # nf-next-1006-30 (observation only, nf-next-1006-28 Fix A tripwire): this
+            # rank's own ``used`` and live-chunked_req bit, appended so a later rank
+            # comparison can show a split the group verdict would not (no collective).
+            1 if getattr(sched, "chunked_req", None) is not None else 0)
     if not step.changed:
         if lifted != lifted_before and alloc is not None:
             want = ms.stage if lifted else ms.pending

@@ -109,6 +109,21 @@ def local_depth(tree_cache: Any, req: Any, *, follow: bool = False) -> int:
     )
 
 
+def _track_field(req: Any, name: str) -> str:
+    """Observation only: a request's mamba track position (``-`` = None / absent),
+    read where the stamp runs. ``mamba_branching_seqlen`` is the match's branching
+    point, ``mamba_last_track_seqlen`` the extend's tracked position the finish cuts
+    the key at (nf-next-1006-29: a branching track displaces the end track). It is
+    None after a finish whose insert already consumed it; then the field reads ``-``."""
+    v = getattr(req, name, None)
+    if v is None:
+        return "-"
+    try:
+        return str(int(v))
+    except (TypeError, ValueError):
+        return "?"
+
+
 def _tp_min(values: Sequence[int]) -> List[int]:
     import torch
     import torch.distributed as dist
@@ -118,6 +133,33 @@ def _tp_min(values: Sequence[int]) -> List[int]:
     t = torch.tensor(list(values), dtype=torch.int64)
     dist.all_reduce(t, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group)
     return [int(v) for v in t.tolist()]
+
+
+def _group_depths_observed(
+    tree_cache: Any,
+    reqs: Sequence[Any],
+    ps: Any,
+    *,
+    reduce_min: Optional[Callable[[Sequence[int]], List[int]]] = None,
+) -> Tuple[Optional[str], Optional[List[int]], Optional[List[int]]]:
+    """:func:`group_depths` plus this rank's OWN pre-reduce depths (the third
+    element, None where ``depths`` is None). Observation only: the same probe,
+    the same single MIN reduce, no collective added (nf-next-1006-30)."""
+    if not reqs:
+        return None, None, None
+    mode = group_mode(ps)
+    if mode in (MODE_NONE, MODE_FOLLOW):
+        return mode, None, None
+    follow = False
+    if mode == MODE_DCP_MIN:
+        from sglang.srt.managers import tp_match_floor
+
+        follow = tp_match_floor.this_rank_follows()
+    depths = [local_depth(tree_cache, r, follow=follow) for r in reqs]
+    own = [max(0, int(d)) for d in depths]
+    if mode in (MODE_MIN, MODE_DCP_MIN):
+        depths = (reduce_min or _tp_min)(depths)
+    return mode, [max(0, int(d)) for d in depths], own
 
 
 def group_depths(
@@ -131,20 +173,8 @@ def group_depths(
     group. ``depths`` is None where this rank names nothing (a Form A worker,
     a group that cannot make the depth uniform). The MIN reduce runs only for
     a non-empty list, so every rank enters it together or not at all."""
-    if not reqs:
-        return None, None
-    mode = group_mode(ps)
-    if mode in (MODE_NONE, MODE_FOLLOW):
-        return mode, None
-    follow = False
-    if mode == MODE_DCP_MIN:
-        from sglang.srt.managers import tp_match_floor
-
-        follow = tp_match_floor.this_rank_follows()
-    depths = [local_depth(tree_cache, r, follow=follow) for r in reqs]
-    if mode in (MODE_MIN, MODE_DCP_MIN):
-        depths = (reduce_min or _tp_min)(depths)
-    return mode, [max(0, int(d)) for d in depths]
+    mode, depths, _own = _group_depths_observed(tree_cache, reqs, ps, reduce_min=reduce_min)
+    return mode, depths
 
 
 def park_depths(
@@ -185,21 +215,40 @@ def stamp_finished(
     same list on every rank (replicated scheduling; the caller's filter is
     ``finished() and not finished_output``). Returns the mode, None when there
     was nothing to stamp (see :func:`group_depths`)."""
-    mode, depths = group_depths(tree_cache, reqs, ps, reduce_min=reduce_min)
+    mode, depths, own = _group_depths_observed(tree_cache, reqs, ps, reduce_min=reduce_min)
     if depths is None:
         return mode
     announce = int(getattr(ps, "attn_tp_rank", 0) or 0) == 0
-    for req, depth in zip(reqs, depths):
+    # nf-next-1006-30 (observation only): a MIN-reduced mode hides which rank
+    # took the group down (nf-next-1006-27, class B). TP0's line carries its own
+    # pre-reduce depth as ``local_depth=`` (appended after ``mode=``); every other
+    # rank logs its own under ``#59 RESUMABLE-LOCAL`` (a different marker, so the
+    # ``#59 RESUMABLE rid=`` readers never see it). No collective, no new value.
+    local_line = mode in (MODE_MIN, MODE_DCP_MIN) and not announce
+    for i, (req, depth) in enumerate(zip(reqs, depths)):
         ts = getattr(req, "time_stats", None)
         if ts is None:
             continue
         ts.weg2_resumable_depth = max(0, int(depth))
-        if announce:
+        if announce or local_line:
             seq = len(req.origin_input_ids) + len(getattr(req, "output_ids", None) or ())
+            local = int(own[i]) if own is not None else ts.weg2_resumable_depth
+        if announce:
             logger.info(
-                "#59 RESUMABLE rid=%s depth=%d seq=%d cached_tokens=%d mode=%s",
+                "#59 RESUMABLE rid=%s depth=%d seq=%d cached_tokens=%d mode=%s local_depth=%d "
+                "branching=%s last_track=%s",
                 str(getattr(req, "rid", "")), ts.weg2_resumable_depth, seq,
-                int(getattr(req, "cached_tokens", 0) or 0), mode,
+                int(getattr(req, "cached_tokens", 0) or 0), mode, local,
+                _track_field(req, "mamba_branching_seqlen"),
+                _track_field(req, "mamba_last_track_seqlen"),
+            )
+        elif local_line:
+            logger.info(
+                "#59 RESUMABLE-LOCAL rid=%s local_depth=%d min=%d seq=%d mode=%s "
+                "branching=%s last_track=%s",
+                str(getattr(req, "rid", "")), local, ts.weg2_resumable_depth, seq, mode,
+                _track_field(req, "mamba_branching_seqlen"),
+                _track_field(req, "mamba_last_track_seqlen"),
             )
     return mode
 
