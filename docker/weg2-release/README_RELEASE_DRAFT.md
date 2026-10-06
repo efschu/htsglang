@@ -399,6 +399,7 @@ the launcher behaves byte-identically to before.
 | `SGLANG_WEG2_VENV` | `/opt/venv` | `/spinning/htsglang-gpu/.venv` | the environment both groups run in |
 | `SGLANG_WEG2_TMS_OUT_DIR` | `/opt/htsglang/tms` | `$GPU_ARB/weg2/tms` | torch-memory-saver preload |
 | `FLLIPER_PROFILES_DIR` | `/var/lib/flliper/profiles` | — | your own profiles (JSON); written by the editor (§4.2), read by the entrypoint |
+| `FLLIPER_HARDWARE_PROFILE` | `/var/lib/flliper/hardware.json` | — | your hardware profile (`flliper.hardware/1`), saved by the editor at the first start; "Neu erfassen" replaces it |
 
 Mount evidence, arb and store as volumes: the launcher calibrates from its own earlier boots, so a fresh
 container starts from the seeded reference values and improves with its own history.

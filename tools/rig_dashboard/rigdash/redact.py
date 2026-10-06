@@ -39,3 +39,22 @@ _DOOR = re.compile(r"ADMIN-KEY|admin-api-key|\.adminkey|auth=bearer|GITHUB_PAT|o
 
 def guard(body: str) -> str:
     return _DOOR.sub("<entfernt>", body)
+
+
+# an absolute path into the host (or the container) filesystem: nothing about the box's layout leaves in a pasted issue
+_HOSTPATH = re.compile(r"(?<![\w.:/-])/(?:home|root|spinning|opt|var|usr|tmp|mnt|srv|etc|data|run|media|nix|proc|sys|dev)(?:/[^\s|`,;)\]\"'<>]*)*")
+
+
+def paths(text: str) -> str:
+    """Replace absolute host paths (``/root/...``, ``/spinning/...``, ``/var/lib/...``) by ``<Pfad entfernt>``."""
+    return _HOSTPATH.sub("<Pfad entfernt>", text or "")
+
+
+def text_for_issue(text: str) -> str:
+    """Text that is pasted into a public issue: secret lines dropped whole, secret values and host paths cut, line by line."""
+    out = []
+    for line in (text or "").split("\n"):
+        c = clean(line)
+        if c is not None:
+            out.append(paths(c))
+    return "\n".join(out)

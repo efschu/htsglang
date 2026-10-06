@@ -104,7 +104,10 @@ FROZEN = {
 }
 
 # (file, sha1[:12]) -> why this regex reads no log line
-NON_LOG_ALLOWED = {}
+NON_LOG_ALLOWED = {
+    # AP-A (Profil-Planer 06.10.): Hostpfade aus dem Issue-Text des Hardwareprofils entfernen
+    ("redact.py", "b598ffb1ba83"): "schneidet absolute Pfade (/root/..., /spinning/..., /var/lib/...) aus einem Text, der in ein öffentliches Issue kommt; liest keine Logzeile",
+}
 
 
 def regex_literals():
