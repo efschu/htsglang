@@ -29,7 +29,9 @@ import threading
 import time
 from typing import Dict, List, Optional
 
+from . import hwprofil as HW
 from . import kartenplan_catalog as CAT
+from . import redact
 from .kartenplan import MAX_CARDS
 from . import kvheads as KVH
 from . import kartenplan_transport as TR
@@ -184,6 +186,197 @@ def docker_run_example(name: str, force: dict) -> List[str]:
         lines.append("  -e %s \\" % FORCE_ENV)
     lines.append("  ghcr.io/efschu/htsglang:<tag> serve")
     return lines
+
+
+# ---------------------------------------------------------------------------------------------------------- Issue-Text "Laufbericht" (AP-I)
+#: Höchstzahl der Zeilen je Tabelle im Laufbericht (ein Issue ist kein Profil-Dump; der Rest steht als "und N weitere")
+ISSUE_MAX_ROWS = 120
+ISSUE_CELL = 200
+#: Überschriften des Laufberichts in fester Reihenfolge (der Test prüft jede)
+ISSUE_BLOCKS = ("Hardwareprofil (Kurzform)", "Modellprofil", "Betriebsform", "Vorschlag und Übersteuerungen", "Verdikte und Force",
+                "Versionen", "Messergebnis / Boot-Log-Auszug")
+
+
+def _md(x, limit: int = ISSUE_CELL) -> str:
+    """Ein Wert in einer Markdown-Tabellenzelle: kein Zeilenumbruch, kein Trennstrich, auf ``limit`` Zeichen gekürzt."""
+    t = str("" if x is None else x).replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
+    return t if len(t) <= limit else t[:limit - 1].rstrip() + "…"
+
+
+def _lv(o):
+    """Wertknoten des Modellprofils ``{v, src}`` -> (Wert, Quelle); alles andere -> (None, None)."""
+    return (o.get("v"), o.get("src")) if isinstance(o, dict) and "v" in o else (None, None)
+
+
+def _gib(n) -> str:
+    return "%.2f GiB" % (float(n) / (1 << 30))
+
+
+def issue_betriebsform(names, n_cards) -> dict:
+    """Die Betriebsform AUS DEN FLAGS DES PROFILS gelesen (nicht vom Planer gewählt: ``propose()`` kommt später): ``--dual-layout`` /
+    ``--dual-share`` = Dual PP/TP, ``--d-only`` = nur TP, ein Karte = Einzelkarte, sonst Flip PP/TP (die Standardform des Launchers).
+    ``names`` = die Zeilennamen des Profils, ``n_cards`` = Kartenzahl im Trockenlauf (``None`` = unbekannt)."""
+    names = set(names)
+    dual = sorted(n for n in names if n in ("--dual-layout", "--dual-share"))
+    if dual:
+        return {"form": "Dual PP/TP", "why": "Flag %s im Profil: P und D gleichzeitig wach auf denselben Karten" % ", ".join(dual)}
+    if "--d-only" in names:
+        return {"form": "nur TP", "why": "Flag --d-only im Profil"}
+    if n_cards == 1:
+        return {"form": "Einzelkarte", "why": "eine Karte im Trockenlauf (der weg2-Launcher braucht mindestens zwei)"}
+    return {"form": "Flip PP/TP", "why": "weder --d-only noch --dual-* im Profil, also die Standardform des Launchers"}
+
+
+def _issue_cards(dry, cards) -> tuple:
+    """(Kartenlabels, Quelle): die Karten des letzten Trockenlaufs, sonst die gewählten Karten (noch ohne Trockenlauf), sonst leer."""
+    if isinstance(dry, dict) and isinstance(dry.get("cards"), list) and dry["cards"]:
+        return [str(c.get("label") or "?") for c in dry["cards"] if isinstance(c, dict)][:16], "Trockenlauf"
+    out = []
+    for rc in (cards if isinstance(cards, list) else [])[:16]:
+        e = CAT.card(rc.get("card")) if isinstance(rc, dict) else None
+        out.append(CAT.label(e) if e else "unbekannte Karte")
+    return out, "gewählt, noch kein Trockenlauf"
+
+
+def _issue_model(model, doc_rows) -> List[str]:
+    """Block Modellprofil: die Werte des Schätzprofils ``flliper.model/1`` mit ihrer Quelle; ohne Profil nur, was das Serverprofil nennt.
+    Der Pfad des Modells steht nie da, nur der Ordnername."""
+    L = ["### Modellprofil", ""]
+    p = model.get("profile") if isinstance(model, dict) and isinstance(model.get("profile"), dict) and "arch" not in model else model
+    if not isinstance(p, dict) or p.get("schema") != "flliper.model/1":
+        name = next((os.path.basename(str(r["value"]).rstrip("/")) for r in doc_rows if r["name"] in ("PROFILE_MODEL", "--model") and r["value"]), "")
+        L.append("Kein Modellprofil geschätzt (Abschnitt Modelle: Modellprofil schätzen, dann den Laufbericht neu erzeugen)."
+                 + (" Das Serverprofil nennt das Modell `%s`." % _md(name) if name else ""))
+        return L
+    out: List[tuple] = []
+
+    def add(label, o, fmt=None):
+        v, src = _lv(o)
+        if v is None or v == "" or v == [] or v == {}:
+            return
+        out.append((label, "%s (%s)" % (fmt(v) if fmt else v, src or "?")))
+
+    a, w, kv, st, ex, dr, cx = (p.get(k) or {} for k in ("arch", "weights", "kv", "state", "experts", "draft", "context"))
+    name = os.path.basename(str(p.get("path") or "").rstrip("/"))
+    out.append(("Modell", "`%s`" % _md(name) if name else "unbelegt"))
+    add("Format", p.get("format"))
+    add("Art", a.get("family"), lambda v: "MoE" if v == "moe" else "dicht")
+    add("Hybrid (GDN/Mamba)", a.get("hybrid"), lambda v: "ja" if v else "nein")
+    add("Layer", a.get("n_layers"))
+    add("Layertypen", a.get("layer_counts"), lambda v: ", ".join("%s %s" % (k, v[k]) for k in sorted(v) if v[k]))
+    add("Hidden-Größe", a.get("hidden"))
+    add("Köpfe Q / KV / Kopfgröße", {"v": "%s / %s / %s" % (_lv(a.get("heads_q"))[0], _lv(a.get("heads_kv"))[0], _lv(a.get("head_dim"))[0]),
+                                      "src": _lv(a.get("heads_q"))[1]} if _lv(a.get("heads_q"))[0] is not None else None)
+    add("Attention", a.get("attention"))
+    add("Gewichte gesamt", w.get("total_bytes"), _gib)
+    add("Experten (Anzahl)", ex.get("n"))
+    add("Experten je Token (top_k)", ex.get("top_k"))
+    add("KV je Token und Attention-Layer", kv.get("cell_bytes_per_attn_layer_token"), lambda v: "%s B" % v)
+    add("Mamba/GDN-Zustand je Linear-Layer und Request", st.get("per_linear_layer_per_slot_mib"), lambda v: "%.4g MiB" % v)
+    add("MTP-Schichten (Draft im Modell)", dr.get("mtp_layers"))
+    if isinstance(dr.get("external"), dict):
+        ext = dr["external"]
+        add("Externer Draft", ext.get("total_bytes"), lambda v: "%s, %s" % (os.path.basename(str(ext.get("path") or "").rstrip("/")) or "?", _gib(v)))
+    add("Kontext (max. Positionen)", cx.get("max_position_embeddings"))
+    if p.get("config_sha"):
+        out.append(("config-Prüfsumme", "`%s`" % _md(p["config_sha"])))
+    L += ["| Angabe | Wert (Quelle) |", "|---|---|"] + ["| %s | %s |" % (_md(k), _md(v)) for k, v in out]
+    L += ["", "Quelle: config = steht in der config.json, Index = aus den Tensorköpfen, geschätzt = gerechnet, stat = Dateigröße."]
+    return L
+
+
+def _issue_cell(row: dict, v, known) -> str:
+    """Wert einer Zeile für die Tabelle: Schalter ohne Wert = ``an``; fehlt der Wert = ``–``; ein Geheimnis nach Namen = ``<entfernt>``; ein Schlüssel,
+    den der Katalog nicht kennt (``known`` = die Katalognamen), zeigt seinen Wert nie (``redact.HIDDEN_UNKNOWN``)."""
+    if v is None:
+        return "–"
+    if v == "" and row.get("bare"):
+        return "an"
+    return _md(redact.value_for_issue(str(row.get("name") or ""), v, known)) or "(leer)"
+
+
+def issue_diff_rows(view: dict) -> dict:
+    """Die Zeilen des Profils, die vom Profil oder vom Planer-Vorschlag abweichen: ``{"rows": [...], "counts": {...}}``.  Eine Zeile zählt, wenn
+    sie gegenüber dem geladenen Profil geändert ist (``changed``), ihre Herkunft ``nutzer`` oder ``planer`` ist oder der Planer-Vorschlag einen
+    anderen Wert nennt.  Zusätzliche Felder (``state``, ``verdict``), die der Orakel-Weg (AP-D) einer Zeile mitgibt, bleiben erhalten."""
+    rows = view.get("rows") or []
+    sel = [r for r in rows if r.get("changed") or r.get("origin") in ("nutzer", "planer")
+           or (r.get("planner_value") is not None and r.get("planner_value") != r.get("value"))]
+    counts = {"rows": len(rows), "geaendert": sum(1 for r in rows if r.get("changed")), "nutzer": sum(1 for r in rows if r.get("origin") == "nutzer"),
+              "mit_vorschlag": sum(1 for r in rows if r.get("planner_value") is not None),
+              "weicht_vom_vorschlag_ab": sum(1 for r in rows if r.get("planner_value") is not None and r.get("planner_value") != r.get("value"))}
+    return {"rows": sel, "counts": counts}
+
+
+def _issue_proposal(view: dict, known) -> List[str]:
+    L = ["### Vorschlag und Übersteuerungen", ""]
+    d = issue_diff_rows(view)
+    c, sel = d["counts"], d["rows"]
+    removed, only = view.get("removed") or [], view.get("planner_only") or []
+    L.append("Quelle: Herkunft, Profilwert und Planer-Vorschlag je Zeile stehen im Profil (meta.origins, meta.profile_values, meta.planner). "
+             "%d Werte, davon %d gegenüber dem geladenen Profil geändert, %d als Nutzer gesetzt, %d mit Planer-Vorschlag, %d weichen vom Vorschlag ab."
+             % (c["rows"], c["geaendert"], c["nutzer"], c["mit_vorschlag"], c["weicht_vom_vorschlag_ab"]))
+    if not c["mit_vorschlag"] and not only:
+        L.append("")
+        L.append("Für dieses Profil liegt kein Planer-Vorschlag vor (meta.planner leer); die Spalte Vorschlag bleibt leer.")
+    extra = [k for k in ("state", "verdict") if any(k in r for r in sel)]
+    head = ["Wert", "Aktuell", "Profil", "Vorschlag (Planer)", "Herkunft"] + [{"state": "Zustand", "verdict": "Verdikt"}[k] for k in extra]
+    if sel:
+        L += ["", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+        for r in sel[:ISSUE_MAX_ROWS]:
+            cells = ["`%s`" % _md(r.get("key") or r.get("name")), _issue_cell(r, r.get("value"), known), _issue_cell(r, r.get("profile_value"), known),
+                     _issue_cell(r, r.get("planner_value"), known), _md(r.get("origin_label") or r.get("origin"))]
+            for k in extra:
+                v = r.get(k)
+                cells.append(_md((v.get("code") or v.get("text")) if isinstance(v, dict) else v) or "–")
+            L.append("| " + " | ".join(cells) + " |")
+        if len(sel) > ISSUE_MAX_ROWS:
+            L.append("")
+            L.append("… und %d weitere abweichende Werte (gekürzt)." % (len(sel) - ISSUE_MAX_ROWS))
+    else:
+        L += ["", "Keine Abweichung: alle Werte stehen wie im geladenen Profil und, wo es einen gibt, wie im Vorschlag."]
+    if removed:
+        L += ["", "Gegenüber dem geladenen Profil entfernt: " + ", ".join("`%s`" % _md(x.get("key"), 80) for x in removed[:40]) + ("" if len(removed) <= 40 else " …")]
+    if only:
+        L += ["", "Vorschlag ohne Zeile im Profil: " + ", ".join("`%s` = %s" % (_md(x.get("key"), 80), _md(redact.value_for_issue(str(x.get("key")), x.get("value"), known), 80) or "(leer, Schalter an)")
+                                                              for x in only[:40]) + ("" if len(only) <= 40 else " …")]
+    return L
+
+
+def _issue_verdicts(dry, reg_rows: List[dict], line: str) -> List[str]:
+    """Block Verdikte und Force: aus dem LETZTEN Trockenlauf; Forcebarkeit wird aus dem Register NEU gelesen (dem Browser wird sie nicht geglaubt)."""
+    L = ["### Verdikte und Force", ""]
+    have = isinstance(dry, dict) and isinstance(dry.get("rejections"), list)
+    if not have:
+        L.append("Kein Trockenlauf gefahren (Abschnitt Trockenlauf: Karten wählen, prüfen lassen, den Laufbericht neu erzeugen).")
+    else:
+        L.append("Trockenlauf: %s" % _md(dry.get("verdict") or ("Der Planer lehnt nichts ab." if not dry["rejections"] else ""), 400))
+    reg = {r.get("code"): r for r in reg_rows or []}
+    if have and dry["rejections"]:
+        L += ["", "| Code | Klasse | Force | Text | Folge |", "|---|---|---|---|---|"]
+        seen = set()
+        for q in dry["rejections"][:64]:
+            if not isinstance(q, dict) or not isinstance(q.get("code"), str) or not 0 < len(q["code"]) <= 40 or q["code"] in seen:
+                continue
+            seen.add(q["code"])
+            r = reg.get(q["code"]) or {}
+            label, state, _via = force_verdict(r) if r else ("unbekannter Code: nicht als forcebar behandelt", "blockiert", None)
+            L.append("| `%s` | %s | %s | %s | %s |" % (_md(q["code"], 40), _md(r.get("klass_label") or r.get("klass") or "?", 60), _md("%s: %s" % (state, label), 160),
+                                                       _md(_clip_text(q["code"], q.get("text")), 300), _md(r.get("consequence") or "–", 240)))
+    fh = force_hint(dry, reg_rows, line)
+    L += ["", "Force: %s" % _md(fh["text"], 400)]
+    if fh["show_line"]:
+        L.append("")
+        L.append("Beim Serverstart `%s` setzen; übergangen werden: %s." % (fh["force_env"], ", ".join("`%s`" % c["code"] for c in fh["force_codes"])))
+    if fh["blocked_codes"]:
+        L.append("")
+        L.append("Auch mit Force bestehen bleiben: %s." % ", ".join("`%s`" % c["code"] for c in fh["blocked_codes"]))
+    if fh["records_note"]:
+        L.append("")
+        L.append(fh["records_note"])
+    if have and dry.get("notes"):
+        L += [""] + ["- Hinweis: " + _md(n, 300) for n in dry["notes"][:8]]
+    return L
 
 
 class ProfilEditor:
@@ -532,6 +725,68 @@ class ProfilEditor:
                 "text": "Am Server: das Profil angeben (FLLIPER_PROFILE=%s, JSON aus dem State-Volume /var/lib/flliper/profiles/%s.json "
                         "oder die exportierte Datei als <profiles>/%s.env). Das Dashboard startet nichts; unten steht ein Beispielaufruf zum Anpassen "
                         "(Image, Mounts und Flags sind Platzhalter)." % (name, name, name)}
+
+    # ------------------------------------------------------------------ Issue-Text "Laufbericht" (AP-I)
+    def issue_report(self, doc: dict, dry=None, cards=None, model=None, hardware_md: str = "", versions: Optional[dict] = None,
+                     now: Optional[float] = None) -> dict:
+        """Der Laufbericht als EIN Markdown-Block für ein GitHub-Issue: Hardwareprofil (Kurzform, ``hardware_md`` kommt aus ``hwprofil.issue_short``),
+        Modellprofil, Betriebsform, Vorschlag + Übersteuerungen, Verdikte/Force, Versionen und der Platzhalter für Messergebnis und Boot-Log-Auszug.
+        Nur Text; das Dashboard startet nichts.  ``dry`` = Antwort des letzten Trockenlaufs (oder ``None``), ``cards`` = die gewählten Karten
+        ``[{card, pcie}]``, ``model`` = ein Modellprofil ``flliper.model/1`` (oder ``None``), ``versions`` = ``hwprofil.version_facts``.
+        Geheimnisse (nach Name und nach Wert) und Hostpfade sind entfernt (``redact``); Forcebarkeit wird aus dem Register NEU gelesen."""
+        pj, _ref = self.mods()
+        if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
+            raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+        view = pj.view(doc, self.catalog()["entries"], None, self.specs())
+        try:
+            reg = self.register()
+        except Exception:       # noqa: BLE001 -- ohne Register keine Force-Aussage (alle Codes "unbekannt"), der Bericht lebt weiter
+            reg = []
+        v = versions or {}
+        now = time.time() if now is None else now
+        name = _md(doc.get("name") or "profil", 80)
+        line = str(doc.get("line") or "")
+        labels, src = _issue_cards(dry, cards)
+        form = issue_betriebsform([r["name"] for r in view["rows"]], len(labels) or None)
+        known = frozenset(self.catalog()["entries"])
+        by_name = {r["name"]: redact.value_for_issue(r["name"], r.get("value"), known) for r in view["rows"] if r["kind"] == "var"}
+        meta = doc.get("meta") or {}
+        based = meta.get("based_on") or {}
+        L: List[str] = ["## Laufbericht (Profil-Editor): `%s`" % name, "",
+                        "Erzeugt %s im Profil-Editor des Dashboards; er startet nichts. Alle Werte stammen aus dem Profil, dem Trockenlauf und den "
+                        "Profilen von Hardware und Modell; was nicht belegt ist, steht als \"unbelegt\"." % time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(now)), ""]
+        L += (hardware_md.strip().split("\n") if hardware_md and hardware_md.strip() else
+              ["### Hardwareprofil (Kurzform)", "", "Hardwareprofil nicht verfügbar (unbelegt)."])
+        L += [""] + _issue_model(model, view["rows"])
+        L += ["", "### Betriebsform", "", "| Angabe | Wert |", "|---|---|",
+              "| Betriebsform | %s |" % _md(form["form"]),
+              "| Abgeleitet aus | %s (aus den Flags des Profils gelesen, keine Wahl des Planers) |" % _md(form["why"]),
+              "| Linie | %s |" % _md(line or "unbelegt"),
+              "| Profil | `%s`%s |" % (name, (", Basis %s `%s`" % (_md(based.get("kind"), 20), _md(based.get("name"), 60))) if based.get("name") else ""),
+              "| Profilstand | %s |" % _md(by_name.get("PROFILE_STATUS") or "unbelegt"),
+              "| Karten (%s) | %d: %s |" % (src, len(labels), _md(", ".join(labels) or "keine", 400)),
+              "| Kartenzahl laut Profil | %s |" % _md(by_name.get("PROFILE_CARD_COUNT") or "unbelegt"),
+              "| Inventar laut Profil | %s |" % _md(by_name.get("PROFILE_INVENTORY") or "unbelegt")]
+        L += [""] + _issue_proposal(view, known)
+        L += [""] + _issue_verdicts(dry, reg, line)
+        pid = str(doc.get("id") or "")
+        sha = str(based.get("sha256") or "")
+        sha = sha[len("sha256:"):] if sha.startswith("sha256:") else sha
+        L += ["", "### Versionen", "", "| Angabe | Wert |", "|---|---|",
+              "| Baum (Revision) | %s |" % _md(HW.version_tree_text(v)),
+              "| Image | %s |" % _md(HW.version_image_text(v)),
+              "| Treiber | %s |" % _md(v.get("driver") or "unbelegt"),
+              "| CUDA / torch (Messprozess) | %s / %s |" % (_md(v.get("cuda") or "unbelegt"), _md(v.get("torch") or "unbelegt")),
+              "| Dashboard | %s |" % _md(v.get("rigdash") or "unbelegt"),
+              "| Profil-ID | `%s` |" % _md(pid[:19] if pid else "unbelegt"),
+              "| Basisprofil (sha256) | %s |" % (("`%s`" % _md(sha[:16])) if sha else "unbelegt")]
+        L += ["", "### Messergebnis / Boot-Log-Auszug", "",
+              "<!-- Ergebnis des Starts eintragen: läuft / bricht ab, Messwerte (Durchsatz, Rundenzeit), die ersten Zeilen des Boot-Logs mit den "
+              "Ablehnungen (REFUSED) und FORCED-PAST-Zeilen. Keine Schlüssel, keine Pfade des Rechners. -->", "",
+              "Ergebnis: _(hier eintragen)_", "", "```text", "(Boot-Log-Auszug hier einfügen)", "```"]
+        text = redact.text_for_issue("\n".join(L)) + "\n"
+        return {"ok": True, "format": "markdown", "text": text, "blocks": [b for b in ISSUE_BLOCKS if ("### " + b) in text],
+                "filename": "laufbericht-%s.md" % (name if NAME_RE.match(name) else "profil")}
 
     # ------------------------------------------------------------------ Topologie-Urteil (Kindprozess zuerst, Auftrag 1984 C)
     def _topology_verdict(self, n: int, tp, notes: List[str]) -> Optional[str]:

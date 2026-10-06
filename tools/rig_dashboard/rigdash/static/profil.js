@@ -9,7 +9,7 @@
   const root = document.getElementById("pf-root");
   if (!root) return;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const st = { list: null, doc: null, view: null, loaded: "", mode: "einfach", search: "", filt: "alle", cards: [], dry: null, exp: null,
+  const st = { list: null, doc: null, view: null, loaded: "", mode: "einfach", search: "", filt: "alle", cards: [], dry: null, exp: null, issue: null,
                busy: false, err: null, msg: null, open: {}, fold: {}, dirty: false, started: false, models: null, mprof: null, mpath: "", bars: null, barBusy: false };
   const isOpen = (id, dflt) => (id in st.fold ? st.fold[id] : dflt);
   try { const v = localStorage.getItem("rigdash.pf.view"); if (v === "einfach" || v === "experte") st.mode = v; } catch (e) { /* private window */ }
@@ -35,7 +35,7 @@
   function setView(j) { st.doc = j.doc; st.view = j.view; scheduleRecompute(); }
   const doLoad = (kind, name) => run(async () => {
     const j = await api("load", { kind, name });
-    setView(j); st.loaded = kind + ":" + name; st.dry = null; st.exp = null; st.dirty = false; st.cmsg = null;
+    setView(j); st.loaded = kind + ":" + name; st.dry = null; st.exp = null; st.issue = null; st.dirty = false; st.cmsg = null;
     st.msg = (kind === "release" ? "Release-Profil " : "Eigenes Profil ") + name + " geladen.";
   });
   const doEdit = (edits) => run(async () => {
@@ -60,11 +60,40 @@
     st.mprof = { path, profile: j.profile, elapsed: j.elapsed_s, cached: j.cached };
   });
   const doExport = () => run(async () => { st.exp = await api("export", { doc: st.doc, dry: st.dry }); });   // dry: letzter Trockenlauf (null = keiner): der Server baut daraus den Force-Hinweis
+  // Issue-Text "Laufbericht" (AP-I): der Server baut den Markdown-Block aus Profil, letztem Trockenlauf, gewählten Karten und Modellprofil; er merkt sich,
+  // wozu er gehört (doc.id, Trockenlauf, Modellprofil), damit die Seite einen veralteten Text kennzeichnet statt ihn still stehen zu lassen
+  const issueKey = () => JSON.stringify([st.doc ? st.doc.id : null, st.dry, st.cards, st.mprof ? st.mprof.path : null]);
+  const doIssue = () => run(async () => {
+    const j = await api("issue", { doc: st.doc, dry: st.dry, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })), model: st.mprof ? st.mprof.profile : null });
+    st.issue = { text: j.text, blocks: j.blocks || [], filename: j.filename || "laufbericht.md", key: issueKey() };
+  });
   const doDry = () => run(async () => { st.dry = await api("dry", { doc: st.doc, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })) }); });
 
   // ------------------------------------------------------------------ Darstellung
+  // Katalog (AP-A): vorbelegt sind RTX 5090, RTX 3080 20 GB, RTX 3090; die übrigen Karten stehen eingeklappt unter "weitere Karten" mit sichtbarer Herkunft.
+  // Ein Dienst ohne ``preset`` (älterer Stand) zeigt alle Karten wie bisher.
+  const hasPreset = () => st.list.cards.some((c) => "preset" in c);
+  const ORIGIN_TIP = { "measured_on_rig": "am Rig gemessen", "Datenblatt": "Datenblatt (Herstellerangabe, nicht gemessen)", "borrowed-unbelegt": "geborgt von einer anderen Variante, unbelegt" };
   function cardOpts(sel) {
-    return st.list.cards.map((c) => `<option value="${c.id}"${c.id === sel ? " selected" : ""}>${esc(c.label)} · ${c.arch}</option>`).join("");
+    // eine bereits gewählte Karte außerhalb der Vorbelegung bleibt in der Auswahl, sonst verlöre die Zeile ihren Wert
+    const vis = st.list.cards.filter((c) => !hasPreset() || c.preset || c.id === sel);
+    return vis.map((c) => `<option value="${c.id}"${c.id === sel ? " selected" : ""}>${esc(c.label)} · ${c.arch}${c.preset || !hasPreset() ? "" : " · " + esc(c.origin || "")}</option>`).join("");
+  }
+  function drawMoreCards() {
+    if (!hasPreset()) return "";
+    const more = st.list.cards.filter((c) => !c.preset);
+    if (!more.length) return "";
+    const rows = more.map((c) => {
+      const of = c.origin_fields || {};
+      const borrowed = of.mem_bw === "borrowed-unbelegt" ? ' <span class="pf-chip" title="Nennbandbreite von einer anderen Variante geborgt, nicht belegt">Bandbreite geborgt</span>' : "";
+      return `<tr data-id="${esc(c.id)}"><td>${esc(c.label)}</td><td>${esc(c.arch)}</td><td>${Math.round((c.usable_mib || 0) / 1024)} GB</td><td>${esc(String(c.mem_bw_gbs))} GB/s</td>
+        <td><span class="pf-chip" title="${esc(c.origin_label || ORIGIN_TIP[c.origin] || "")}">${esc(c.origin || "")}</span>${borrowed}</td>
+        <td><button type="button" data-act="cadd-id" data-id="${esc(c.id)}"${st.cards.length >= 6 ? " disabled" : ""}>+ hinzufügen</button></td></tr>`;
+    }).join("");
+    return `<details class="pf-fold pf-more" data-fold="cmore" ${isOpen("cmore", false) ? "open" : ""}><summary>weitere Karten (Datenblatt, ohne Messraten)</summary>
+      <div class="muted pf-note">Katalogkarten ohne Messung am Rig: die Werte sind Herstellerangaben (Datenblatt) oder geborgt und stehen als solche da. Das eigene Hardwareprofil mit Messraten
+        steht im Abschnitt Hardware; wer eine andere Karte besitzt, hängt es als Issue-Text an (Knopf dort).</div>
+      <table class="pf-more-t"><thead><tr><th>Karte</th><th>Arch</th><th>VRAM</th><th>Nennbandbreite</th><th>Herkunft</th><th></th></tr></thead><tbody>${rows}</tbody></table></details>`;
   }
   function drawCards() {
     const L = st.list;
@@ -72,6 +101,7 @@
       <select data-cf="card">${cardOpts(k.card)}</select>
       <button type="button" data-act="cdel" title="Karte entfernen" aria-label="Karte ${i + 1} entfernen">&times;</button></div>`).join("");
     return `<div class="pf-cards">${rows}</div>
+      ${drawMoreCards()}
       <div class="pf-row-actions"><button type="button" data-act="cadd"${st.cards.length >= 6 ? " disabled" : ""}>+ Karte</button>
       <button type="button" data-act="cpreset" title="${esc((L.rig_preset || {}).src || "")}">Unser Rig einsetzen</button>
       <button type="button" data-act="dry" class="pf-main"${st.cards.length ? "" : " disabled"}>Trockenlauf: was lehnt der Planer ab?</button></div>`;
@@ -361,10 +391,22 @@
       ${open ? `<div class="pf-note muted">Der Launcher dieser Linie prüft das noch nicht (kein Force nötig):</div><ul class="pf-fl">${open}</ul>` : ""}
       ${f.records_note ? `<div class="muted pf-note">${esc(f.records_note)}</div>` : ""}${f.line_note ? `<div class="muted pf-note">${esc(f.line_note)}</div>` : ""}</div>`;
   }
+  function drawIssue() {
+    if (!st.doc) return "";
+    const i = st.issue, stale = i && i.key !== issueKey();
+    const body = i ? `${stale ? '<div class="pf-red">Veraltet: Profil, Trockenlauf, Karten oder Modellprofil haben sich seit dem Erzeugen geändert. Neu erzeugen.</div>' : ""}
+      <div class="muted pf-note">Enthält: ${esc((i.blocks || []).join(" · "))}.</div>
+      <textarea class="pf-issue-text" id="pf-issue-text" readonly spellcheck="false" aria-label="Issue-Text Laufbericht" rows="16">${esc(i.text)}</textarea>
+      <div class="pf-row-actions"><button type="button" data-act="issue-copy">In die Zwischenablage</button><button type="button" data-act="issue-download">Als ${esc(i.filename)} speichern</button><button type="button" data-act="issue-close">Schließen</button></div>` : "";
+    return `<section class="pf-export pf-issue"><h3>Issue-Text: Laufbericht</h3>
+      <div class="muted pf-note">Ein Markdown-Block zum Einfügen in ein GitHub-Issue: Hardwareprofil (Kurzform), Modellprofil, Betriebsform, Vorschlag und Übersteuerungen, Verdikte und Force, Versionen, dazu ein Platzhalter für Messergebnis und Boot-Log-Auszug.
+        Geheimnisse und Pfade des Rechners sind entfernt. Der letzte Trockenlauf geht mit ein; ohne ihn steht dort, dass keiner gefahren wurde.</div>
+      <div class="pf-row-actions"><button type="button" data-act="issue"${st.busy ? " disabled" : ""}>${i ? "Laufbericht neu erzeugen" : "Laufbericht erzeugen"}</button></div>${body}</section>`;
+  }
   function drawExport() {
     const x = st.exp;
-    if (!x) return "";
-    return `<section class="pf-export"><h3>Export <span class="pf-chip ${x.verified ? "pf-ok" : "pf-bad"}">${x.verified ? "geprüft" : "ABWEICHUNG"}</span></h3>
+    if (!x) return drawIssue();
+    return drawIssue() + `<section class="pf-export"><h3>Export <span class="pf-chip ${x.verified ? "pf-ok" : "pf-bad"}">${x.verified ? "geprüft" : "ABWEICHUNG"}</span></h3>
       <div class="muted pf-note">${esc(x.check)}</div>
       ${x.problems.length ? `<pre class="kp-pre">${esc(x.problems.join("\n"))}</pre>` : ""}
       <div class="pf-row-actions"><button type="button" data-act="copy">In die Zwischenablage</button><button type="button" data-act="download">Als ${esc(x.filename)} speichern</button></div>
@@ -457,10 +499,26 @@
     if (a === "save") { const n = (document.getElementById("pf-name").value || "").trim(); if (n) doSave(n); else { st.err = "Einen Namen eingeben (a-z, 0-9, . _ -)."; draw(); } return; }
     if (a === "del") { if (st.loaded.startsWith("user:") && confirm("Profil " + st.loaded.slice(5) + " löschen?")) doDelete(st.loaded.slice(5)); return; }
     if (a === "export") return doExport();
+    if (a === "issue") return doIssue();
+    if (a === "issue-close") { st.issue = null; return draw(); }
+    if (a === "issue-copy") {
+      const i = st.issue; if (!i) return;
+      const done = () => { st.msg = "Laufbericht kopiert."; draw(); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(i.text).then(done, () => { const ta = document.getElementById("pf-issue-text"); if (ta) { ta.select(); } });
+      else { const ta = document.getElementById("pf-issue-text"); if (ta) ta.select(); }
+      return;
+    }
+    if (a === "issue-download") {
+      const i = st.issue; if (!i) return;
+      const url = URL.createObjectURL(new Blob([i.text], { type: "text/markdown" }));
+      const el = document.createElement("a"); el.href = url; el.download = i.filename; el.click(); setTimeout(() => URL.revokeObjectURL(url), 2000);
+      return;
+    }
     if (a === "models") return doModels();
     if (a === "estpath") { const v = (document.getElementById("pf-mpath") || {}).value || ""; if (v.trim()) doEstimate(v.trim()); return; }
     if (a === "dry") return doDry();
     if (a === "cadd") { st.cards.push({ card: st.list.cards[0].id, pcie: { gen: 4, lanes: 8 } }); st.dry = null; return draw(); }
+    if (a === "cadd-id") { if (st.cards.length < 6) st.cards.push({ card: t.dataset.id, pcie: { gen: 4, lanes: 8 } }); st.dry = null; return draw(); }
     if (a === "cdel") { st.cards.splice(+t.closest(".pf-card").dataset.i, 1); st.dry = null; return draw(); }
     if (a === "cpreset") { st.cards = JSON.parse(JSON.stringify((st.list.rig_preset || {}).cards || [])); st.dry = null; return draw(); }
     if (a === "copy") { const x = st.exp; if (x && navigator.clipboard) navigator.clipboard.writeText(x.env).then(() => { st.msg = "Kopiert."; draw(); }); return; }
