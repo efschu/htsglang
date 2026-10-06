@@ -1040,6 +1040,12 @@ class Envs:
     # row + its arena generation as ``_weg2_l2_mamba_shadow``; ``l2_backed``/the census accept it and the
     # bind adopts it only where the slot still carries that generation. Default off.
     SGLANG_WEG2_L15_KEEP_MAMBA_SHADOW = EnvBool(False)
+    # L15-TREE-CAND-MIN-TOKENS (desk 2025, kurz4 00:00-00:05Z, see done/2025-l15-e-gelb.md sec. 11):
+    # the TREE-CAND agreement is capped at SGLANG_WEG2_L15_TREE_CAND_N (8) most-recent tips; with A+B+C on, the
+    # 3999-token warm tip and 7+ 769-token background tips fill it, so only 1-2 of 4 session tips (19.7k)
+    # survive to their k=1 turn. A tip with fewer chain tokens than this is not offered (0 = off = every
+    # tip, today's behaviour). Read where TREE_CAND_N is read (``l15_tree_cand.min_tokens``).
+    SGLANG_WEG2_L15_TREE_CAND_MIN_TOKENS = EnvInt(0)
     # L15-POOL S4 (docs/L15-POOL-ENTWURF-1004.md sec 1.2/3.3/4.5/5.2 N4/7, KV AND
     # END anchor = a WHOLE request): part switch ON TOP of SGLANG_WEG2_L15_POOL and
     # SGLANG_WEG2_L15_POOL_S3 (S4 without them is refused by name,

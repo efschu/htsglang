@@ -44,6 +44,8 @@ TREE_CAND_DIAG_ENV = "SGLANG_WEG2_L15_TREE_CAND_DIAG"
 #: L15-TREE-CAND-DIAG-ALL (desk 2025): with the DIAG switch on, one census line at EVERY vote
 TREE_CAND_DIAG_ALL_ENV = "SGLANG_WEG2_L15_TREE_CAND_DIAG_ALL"
 DEFAULT_MAX_N = 8
+#: L15-TREE-CAND-MIN-TOKENS (desk 2025, kurz4): tips shorter than this are not offered (default 0 = all)
+TREE_CAND_MIN_TOKENS_ENV = "SGLANG_WEG2_L15_TREE_CAND_MIN_TOKENS"
 RID_PREFIX = "tree:"
 # L15-EXTRAKEY (240): a tip whose key carries an extra_key (cache salt,
 # multimodal hash) is published as ``tree:<digest>@<match_key>``: ``digest``
@@ -61,6 +63,26 @@ def env_on(env: Optional[Mapping[str, str]] = None) -> bool:
     env = os.environ if env is None else env
     return str(env.get(TREE_CAND_ENV, "1")).strip().lower() not in (
         "0", "off", "false", "no")
+
+
+def min_tokens(env: Optional[Mapping[str, str]] = None) -> int:
+    """``SGLANG_WEG2_L15_TREE_CAND_MIN_TOKENS``: the shortest tip (chain tokens) a rank offers to
+    the TREE-CAND vote; 0 (default, also for junk) = no floor = today's behaviour.
+
+    Kurz4 (image l15f, A+B+C on): the agreed list is capped at ``max_n`` (8) by recency, and the tree
+    carries 10-12 tips of which 7 are 769-token background tips and the 3999-token warm-up tip (each
+    holding a 39 MB anchor and its KV): they are re-held at every sleep and push the 19.7k session
+    tips out of the 8 (held-tip composition per sleep from L15-L2-SHADOW-ADOPT: 3-4 session tips
+    -> 1-2 -> 0). A floor keeps tips that are not worth an anchor out of the vote. Chain length is
+    the same on every rank (``agree`` already requires one size per digest) and the env is the
+    group's, so every rank filters alike -- no extra collective."""
+    import os
+
+    env = os.environ if env is None else env
+    try:
+        return max(0, int(str(env.get(TREE_CAND_MIN_TOKENS_ENV, 0) or 0).strip()))
+    except ValueError:
+        return 0
 
 
 def max_n(env: Optional[Mapping[str, str]] = None) -> int:
@@ -466,14 +488,16 @@ def _chain_digests(tips: Sequence[object], root
 
 def local_candidates(tree_cache, limit: Optional[int],
                      require_l2: bool = False,
-                     lazy_tokens: bool = False) -> List[TreeCand]:
+                     lazy_tokens: bool = False,
+                     min_n: int = 0) -> List[TreeCand]:
     """This rank's tips, most recently used first.
 
     ``limit`` None = EVERY tip (L15-TREE-DISAGREE: the walk that feeds the
     agreement must not truncate, see :func:`build`); an int keeps at most that
     many. ``require_l2`` (the cap-0 rank): only tips whose chain is L2-backed.
     ``lazy_tokens``: digest every tip by streaming, build the token chain
-    (``tokens``) later for the agreed ones only (:func:`with_tokens`)."""
+    (``tokens``) later for the agreed ones only (:func:`with_tokens`).
+    ``min_n`` > 0: tips with fewer chain tokens are left out (:func:`min_tokens`)."""
     if limit is not None and limit <= 0:
         return []
     root = getattr(tree_cache, "root_node", None)
@@ -492,6 +516,8 @@ def local_candidates(tree_cache, limit: Optional[int],
             got = dig.get(id(n))
             if got is None:
                 continue  # this tip cannot be matched; the next one may
+            if min_n > 0 and got[1] < min_n:
+                continue  # below the floor: not worth an anchor
             out.append(TreeCand(
                 digest=got[0], n_tokens=got[1],
                 last_access=float(getattr(n, "last_access_time", 0) or 0),
@@ -503,6 +529,8 @@ def local_candidates(tree_cache, limit: Optional[int],
             continue  # this tip cannot be matched; the next one may
         if not toks:
             continue
+        if min_n > 0 and len(toks) < min_n:
+            continue  # below the floor: not worth an anchor
         out.append(TreeCand(
             digest=digest_of(toks, ek),
             n_tokens=len(toks),
@@ -771,7 +799,7 @@ def build(tree_cache, gather: Callable[[object], List[object]], n_live: int,
         # recency clock and, with the cap-0 rank's L2 filter, can leave the
         # ranks' windows disjoint: agreed=0 although every tip is common.
         local = local_candidates(tree_cache, None, require_l2=require_l2,
-                                 lazy_tokens=True)
+                                 lazy_tokens=True, min_n=min_tokens(env))
     except Exception as exc:  # noqa: BLE001 -- vote empty, stay in the collective
         err = exc
         local = []
@@ -786,6 +814,10 @@ def build(tree_cache, gather: Callable[[object], List[object]], n_live: int,
                "" if err is None else " walk_failed=%s: %s" % (type(err).__name__, err),
                ",".join("%s(%d)" % (rid_of(c), c.n_tokens)
                         for c in agreed[:6])))
+    if log is not None and min_tokens(env) > 0:
+        log("L15-TREE-CAND floor min_tokens=%d offered=%d agreed=%d (tips with fewer chain tokens are "
+            "not offered: they would take an anchor and a TREE_CAND_N slot from the session tips)"
+            % (min_tokens(env), len(local), len(agreed)))
     if log is not None and ((not local or not agreed) or diag_all(env)) and diag_on(env):
         # L15-TREE-CAND-DIAG: log-only, after the vote -- never changes ``agreed``
         try:
