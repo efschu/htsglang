@@ -266,6 +266,28 @@ class TestJsContract(unittest.TestCase):
         self.assertIn("50 MiB über dem Budget", html)
         self.assertNotIn("kp-bz", html)
 
+    def test_the_over_budget_note_claims_no_oom_the_same_words_as_the_planner_text(self):
+        # Fix-Runde 4, Befund 2: Posten ueber dem Budget innerhalb der Karte -> "die Reserve wird aufgezehrt" (wie profile_couplings._over_text), keine OOM-Folgerung
+        b = self.bar(overflow_mib=50, beyond_card_mib=0,
+                     segments=[{"name": "weights", "label": "Gewichte", "mib": 950, "herkunft": "x", "detail": "d"},
+                               {"name": "free", "label": "Frei", "mib": 50, "herkunft": "gerechnet", "detail": "d"}])
+        o = self.js("const M=require(%r);console.log(JSON.stringify({html:M.render([%s],{base:0}),tip:M.tip(%s,0)}))" % (JS, json.dumps(b), json.dumps(b)))
+        self.assertIn("Die Reserve wird aufgezehrt", o["html"])
+        self.assertNotIn("OOM", o["html"])
+        self.assertNotIn("OOM", o["tip"])
+        legacy = {"total_mib": 1000, "budget_mib": 900, "segments": [{"key": "weights", "label": "G", "mib": 900}, {"key": "overflow", "label": "Ueberlauf", "mib": 50}]}
+        o2 = self.js("const M=require(%r);console.log(JSON.stringify({html:M.render([%s],{base:0}),tip:M.tip(%s,1)}))" % (JS, json.dumps(legacy), json.dumps(legacy)))
+        self.assertNotIn("OOM", o2["html"])
+        self.assertIn("die Reserve wird aufgezehrt", o2["tip"])
+        self.assertNotIn("OOM", o2["tip"])
+
+    def test_chips_use_the_floating_tooltip_not_the_native_title(self):
+        b = self.bar(shared_with_d=[{"name": "weights", "label": "Gewichte", "mib": 300, "ref": "shared", "herkunft": "Modellprofil", "detail": "im Union-Image von D"}])
+        html = self.js("const M=require(%r);console.log(JSON.stringify(M.render([%s],{base:0})))" % (JS, json.dumps(b)))
+        self.assertIn('class="kp-ref" tabindex="0" data-tip="im Union-Image von D | Herkunft: Modellprofil"', html)
+        self.assertIn('class="kp-nc" tabindex="0" data-tip="nur am Metall zu messen"', html)
+        self.assertNotIn('class="kp-ref" tabindex="0" title=', html)
+
     def test_render_phases_lists_each_phase_the_inputs_and_a_failed_phase_as_a_message(self):
         res = {"phases": {"P": {"ok": True, "label": "P-Phase <x>", "bars": [self.bar(), self.bar(label="Karte 1")], "inputs": [{"was": "stage_layers", "wert": "29,11,8", "herkunft": "Profilzeile --pp-stage-ratio"}]},
                           "D": {"ok": False, "label": "D-Phase", "error": "vector_length: <b>zu kurz</b>", "bars": []}}}
@@ -467,7 +489,19 @@ print(json.dumps({"hw": hw, "model": model, "bar": PC.contract_bar(st, "P")}))
     def test_d_phase_has_no_weights_on_zero_weight_ranks_and_reserve_is_the_default_corridor(self):
         d = self.ask()["result"]["phases"]["D"]["bars"]
         self.assertFalse(any(s["name"] == "weights" for s in d[1]["segments"]))
-        self.assertEqual(next(s for s in d[0]["segments"] if s["name"] == "reserve")["mib"], 1024.0)
+        # Korridor ohne Messrecord = 1024 stated law + 404 Wach-Ueberschuss (launcher.py:266-269), Budget auf 8 MiB abgerundet: Reserve 1428 .. 1435
+        res0 = next(s for s in d[0]["segments"] if s["name"] == "reserve")["mib"]
+        self.assertTrue(1428.0 <= res0 < 1436.0, res0)
+
+    def test_dual_share_d_phase_is_sized_from_the_p_plan_through_the_worker(self):
+        # Fix-Runde 4, Befund 1: D-Budget = (Karte - 1428 - (P-Budget + Overhead)) // 8 * 8, P-Budget aus --extra-p (Gruppe P), nicht aus dem Profil
+        r = self.ask(server_args={"--pp-stage-ratio": "29,11,8", "--pp-attn-stage-ratio": "7,3,2", "--max-kv-per-request": "262144", "--draft-kv-on-p": "off",
+                                  "--dual-share": "", "--dual-p-overhead-mib": "2500", "--dual-unified-kv": "on"},
+                     phase_args={"P": {"--rank-gpu-memory-mib": "6610,5050,5200"}, "D": {"--rank-tp-ratio": "1,1,1"}})
+        self.assertTrue(r["ok"], r)
+        d = r["result"]["phases"]["D"]["bars"]
+        self.assertEqual([b["budget_mib"] for b in d], [22064.0, 11496.0, 11352.0])
+        self.assertEqual([b["outside_budget_mib"] for b in d], [9110.0, 7550.0, 7700.0])
 
 
 if __name__ == "__main__":

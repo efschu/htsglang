@@ -17,6 +17,7 @@ import copy
 import json
 import os
 import unittest
+from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -238,11 +239,12 @@ class TestDPhaseHandCalculation(unittest.TestCase):
     def test_d_budget_defaults_to_card_minus_corridor_and_takes_the_group_flag(self):
         d = nf()["phases"]["D"]["bars"]
         # Festposten (fremd + nichttorch) liegen ausserhalb des Budgets (Launcher: verfuegbar = Karte - fremd - nichttorch - reserve)
-        self.assertEqual([b["budget_mib"] for b in d], [32607 - 3427 - 1024, 20480 - 1424 - 1024, 20480 - 1418 - 1024])
+        # Korridor = 1024 stated law + 404 eingebauter Wach-Ueberschuss (launcher.py:266-269), auf 8 MiB abgerundet (launcher.py:15394)
+        self.assertEqual([b["budget_mib"] for b in d], [27752, 17624, 17632])
         self.assertEqual(d[0]["budget_herkunft"], "gerechnet")
-        for b in d:
+        for b, rest in zip(d, (1428, 1432, 1430)):                                   # Reserve = Korridor + Rundungsrest
             self.assertEqual(b["budget_over_available_mib"], 0)
-            self.assertEqual(seg(b, "reserve")["mib"], 1024)
+            self.assertEqual(seg(b, "reserve")["mib"], rest)
         pa = copy.deepcopy(NF_PA)
         pa["D"]["--rank-gpu-memory-mib"] = "28000,17000,17000"
         d2 = nf(pa=pa)["phases"]["D"]["bars"]
@@ -443,15 +445,17 @@ class TestBridge(unittest.TestCase):
         self.assertFalse(res["ok"])
 
 
-# Dual-Referenzprofil (docker/profiles_release/27b-nvfp4-dual.env, 262k-Variante): P-Budgets 6610,5050,5200, Schnitt 31,17,16, Mamba 8 Slots, Overhead 2500
+# Dual-Referenzprofil (docker/profiles_release/27b-nvfp4-dual.env, 262k-Variante): P-Budgets 6610,5050,5200 und Mamba 8 Slots stehen in --extra-p
+# (= Gruppe P, NICHT im gemeinsamen Profil: D darf P's Budgets nicht erben), Schnitt 31,17,16, Overhead 2500
 DUAL_ARGS = {"--pp-stage-ratio": "31,17,16", "--pp-attn-stage-ratio": "7,5,4", "--max-kv-per-request": "262144", "--draft-kv-on-p": "off",
-             "--rank-gpu-memory-mib": "6610,5050,5200", "--max-mamba-cache-size": "8", "--dual-share": "", "--dual-p-overhead-mib": "2500",
+             "--dual-share": "", "--dual-p-overhead-mib": "2500",
              "--dual-unified-kv": "on", "--dual-p-kv-max-tokens": "196608", "--p-chunk-max": "1024"}
+DUAL_PA = {"P": {"--rank-gpu-memory-mib": "6610,5050,5200", "--max-mamba-cache-size": "8"}}
 
 
 def dual(**kw):
     a = dict(kw.pop("args", DUAL_ARGS))
-    return PC.phase_bars(hw(), kw.pop("m", model("qwen27b_int8_vocabembed")), a, {}, {}, **kw)
+    return PC.phase_bars(hw(), kw.pop("m", model("qwen27b_int8_vocabembed")), a, kw.pop("pa", copy.deepcopy(DUAL_PA)), {}, **kw)
 
 
 class TestDualSharePhase(unittest.TestCase):
@@ -508,9 +512,9 @@ class TestDualSharePhase(unittest.TestCase):
         self.assertGreater(b["overflow_mib"], 0)                                          # 262144 Token KV gegen 6610 MiB: das ist dann echt ueber dem Budget
 
     def test_a_p_own_post_over_the_budget_is_still_an_overflow(self):
-        a = dict(DUAL_ARGS)
-        a["--rank-gpu-memory-mib"] = "100,100,100"
-        for b in dual(args=a)["phases"]["P"]["bars"]:
+        pa = copy.deepcopy(DUAL_PA)
+        pa["P"]["--rank-gpu-memory-mib"] = "100,100,100"
+        for b in dual(pa=pa)["phases"]["P"]["bars"]:
             self.assertGreater(b["overflow_mib"], 0)
             self.assertIn("ueber dem Budget", b["over_text"])
 
@@ -567,6 +571,174 @@ class TestLauncherSemanticsOfTheTexts(unittest.TestCase):
         self.assertTrue(any("--d-reserve-mib" in h for h in d["hints"]))
         r0 = PC.phase_bars(hw(), m, dict(NF_ARGS), NF_PA, NF_PE)
         self.assertEqual([b["user_reserve_mib"] for b in r0["phases"]["D"]["bars"]], [0.0] * 3)
+
+
+class TestDualShareDPhase(unittest.TestCase):
+    """Fix-Runde 4, Befund 1: unter --dual-share bemisst der Launcher D aus P's PLAN (dc = P-Budget + --dual-p-overhead-mib je Karte, launcher.py:27289-27301)."""
+
+    def test_the_release_dual_d_bar_holds_p_plan_outside_its_budget(self):
+        d = dual()["phases"]["D"]["bars"]
+        dc = (6610 + 2500, 5050 + 2500, 5200 + 2500)
+        for b, tot, x in zip(d, (32607, 20480, 20480), dc):
+            fx = seg(b, "fixed")
+            self.assertEqual((fx["mib"], fx.get("ausserhalb_budget")), (x, True))
+            self.assertIn("aus P-Plan", fx["detail"])
+            self.assertIn("launcher.py:14976", fx["detail"])
+            self.assertEqual(b["outside_budget_mib"], x)
+            self.assertEqual(b["available_mib"], tot - x)
+            self.assertEqual(b["budget_mib"], (tot - 1428 - x) // 8 * 8)                    # Launcher: (Karte - Korridor 1428 - dc) // 8 * 8
+            self.assertEqual((b["overflow_mib"], b["beyond_card_mib"], b["budget_over_available_mib"]), (0.0, 0.0, 0.0))
+            self.assertNotIn("weights", [r["name"] for r in b["shared_with_d"]])             # D ist der Owner: seine Gewichte zaehlen gegen SEIN Budget
+            self.assertGreater(seg(b, "weights")["mib"], 1000)
+        self.assertEqual([b["budget_mib"] for b in d], [22064, 11496, 11352])                 # Probe: launcher.budgets_from_dc mit dc 9110/7550/7700 (siehe unten)
+
+    def test_the_old_wrong_budget_31583_is_gone_and_d_does_not_inherit_p_budgets(self):
+        d = dual()["phases"]["D"]
+        self.assertNotIn(32607 - 1024, [b["budget_mib"] for b in d["bars"]])
+        # ein --rank-gpu-memory-mib im gemeinsamen Profil gilt fuer P (P erbt es), D bemisst der Launcher trotzdem aus P's Plan
+        a = dict(DUAL_ARGS)
+        a["--rank-gpu-memory-mib"] = "6610,5050,5200"
+        r = dual(args=a, pa={"P": {"--max-mamba-cache-size": "8"}})
+        self.assertEqual([b["budget_mib"] for b in r["phases"]["D"]["bars"]], [22064, 11496, 11352])
+        self.assertEqual([b["budget_mib"] for b in r["phases"]["P"]["bars"]], [6610, 5050, 5200])
+        # eine eigene Zeile der Gruppe D wird als ignoriert benannt, nicht stillschweigend uebernommen
+        pa = copy.deepcopy(DUAL_PA)
+        pa["D"] = {"--rank-gpu-memory-mib": "30000,18000,18000"}
+        r = dual(pa=pa)
+        self.assertEqual([b["budget_mib"] for b in r["phases"]["D"]["bars"]], [22064, 11496, 11352])
+        self.assertTrue(any(x["was"] == "budget_mib" and "ignoriert" in x["herkunft"] for x in r["phases"]["D"]["inputs"]))
+
+    def test_without_the_p_group_budget_the_d_budget_is_an_upper_bound_not_a_number_pretending_to_be_the_plan(self):
+        d = dual(pa={})["phases"]["D"]["bars"]
+        for b, tot in zip(d, (32607, 20480, 20480)):
+            self.assertIsNone(seg(b, "fixed")["mib"])
+            self.assertIn("nicht gerechnet", seg(b, "fixed")["detail"])
+            self.assertEqual(b["budget_mib"], (tot - 1428) // 8 * 8)
+            self.assertIn("fixed", [x["name"] for x in b["segments"]])
+            self.assertIn("Festposten", b["not_computed"])
+
+    def test_the_overhead_default_is_named_when_the_flag_is_absent(self):
+        a = dict(DUAL_ARGS)
+        del a["--dual-p-overhead-mib"]
+        b = dual(args=a)["phases"]["D"]["bars"][0]
+        self.assertEqual(seg(b, "fixed")["mib"], 6610 + 1500)
+        self.assertEqual(seg(b, "fixed")["herkunft"], "Naeherung (nicht der Loeser)")
+        self.assertIn("Standard des Launchers", seg(b, "fixed")["detail"])
+
+    def test_the_hint_names_the_d_side(self):
+        self.assertTrue(any("D-Seite" in h and "P's Plan" in h for h in dual()["hints"]))
+        self.assertFalse(any("D-Seite" in h for h in dual(args={k: v for k, v in DUAL_ARGS.items() if k != "--dual-share"}, tokens=["--dual-layout"])["hints"]))
+
+
+class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
+    """Fix-Runde 4 (Zusatz des Planer-Sitzes): fuer jede Phase (P, D) und jede Form (flip, dual, d_only, single) stimmen Budget, Festposten und
+    Rest mit der Launcher-Formel ueberein; die D-Phase ruft ``launcher.budgets_from_dc`` / ``dual_share_planned_dc`` und ``pp_cut.d_rank_available_mib``
+    selbst auf (der Korridor-Boden kommt aus SGLANG_CORRIDOR_LAW_FLOOR_MIB=1024, host-unabhaengig)."""
+
+    TOTALS = (32607, 20480, 20480)
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from sglang.srt.weg2 import launcher as L
+            from sglang.srt.planner import pp_cut as PP
+        except Exception as exc:                                  # pragma: no cover - ohne Launcher-Import nicht pruefbar
+            raise unittest.SkipTest("launcher import: %r" % (exc,))
+        cls.L, cls.PP = L, PP
+        cls.cards = [L.Card(nvml_index=i, uuid="U%d" % i, name="x", total_mib=t) for i, t in enumerate(cls.TOTALS)]
+
+    def launcher_budgets(self, dc):
+        with mock.patch.dict(os.environ, {"SGLANG_CORRIDOR_LAW_FLOOR_MIB": "1024"}):
+            return self.L.budgets_from_dc(self.cards, {c.uuid: int(dc[i]) for i, c in enumerate(self.cards)}, lambda *_: None, "D",
+                                          corridor_constrain=False)
+
+    def check_d_bar(self, bars, dc, available):
+        """Budget = Launcher-Budget; Festposten = dc ausserhalb; Verfuegbar = d_rank_available_mib; Reserve = Verfuegbar - max(Budget, Posten im Budget)."""
+        want = self.launcher_budgets(dc)
+        self.assertEqual([b["budget_mib"] for b in bars], [float(x) for x in want])
+        for b, x, av, w in zip(bars, dc, available, want):
+            self.assertEqual(b["outside_budget_mib"], float(x))
+            self.assertEqual(b["available_mib"], float(av))
+            inside = b["posts_mib"] - b["outside_budget_mib"]
+            self.assertAlmostEqual(seg(b, "reserve")["mib"], max(0.0, av - max(w, inside)), places=2)
+            self.assertAlmostEqual(sum(x2["mib"] for x2 in b["segments"] if x2["mib"] is not None), max(b["total_mib"], b["posts_mib"] + 0.0), delta=0.01)
+
+    def test_d_phase_flip_and_d_only_foreign_plus_nontorch_is_dc(self):
+        fo, nt = (1446, 896, 894), (1981, 528, 524)
+        dc = [a + b for a, b in zip(fo, nt)]
+        av = self.PP.d_rank_available_mib(card_total_mib=self.TOTALS, foreign_context_mib=fo, nontorch_mib=nt)
+        flip = nf()
+        self.check_d_bar(flip["phases"]["D"]["bars"], dc, av)
+        d_only = nf(form="d_only")
+        self.assertEqual(list(d_only["phases"]), ["D"])
+        self.check_d_bar(d_only["phases"]["D"]["bars"], dc, av)
+        self.assertEqual([b["budget_mib"] for b in d_only["phases"]["D"]["bars"]], [b["budget_mib"] for b in flip["phases"]["D"]["bars"]])
+
+    def test_d_phase_flip_without_fixed_lines_has_dc_zero_and_the_fixed_post_is_not_computed(self):
+        a = {k: v for k, v in NF_ARGS.items() if k not in ("--d-foreign-context-mib", "--d-nontorch-mib")}
+        d = nf(args=a)["phases"]["D"]["bars"]
+        self.assertEqual([b["budget_mib"] for b in d], [float(x) for x in self.launcher_budgets((0, 0, 0))])
+        for b in d:
+            self.assertIsNone(seg(b, "fixed")["mib"])
+            self.assertEqual(b["outside_budget_mib"], 0.0)
+
+    def test_d_phase_dual_share_dc_is_the_launcher_planned_dc(self):
+        pb = [6610, 5050, 5200]
+        dc_launcher = self.L.dual_share_planned_dc(self.cards, pb, "", 2500)
+        dc = [dc_launcher[c.uuid] for c in self.cards]
+        av = [t - x for t, x in zip(self.TOTALS, dc)]
+        self.check_d_bar(dual()["phases"]["D"]["bars"], dc, av)
+        # --extra-p mit kleinerem Wert senkt das Launcher-Budget (min), das Profil nennt nur den Wert der Gruppe P
+        self.assertEqual(self.L.dual_share_planned_dc(self.cards, [9000, 9000, 9000], "--rank-gpu-memory-mib 6610,5050,5200", 2500), dc_launcher)
+
+    def test_d_phase_explicit_budget_is_taken_as_asked_and_the_rest_is_available_minus_budget(self):
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--rank-gpu-memory-mib"] = "28000,17000,17000"
+        for b, dcx in zip(nf(pa=pa)["phases"]["D"]["bars"], (3427, 1424, 1418)):
+            self.assertEqual(b["outside_budget_mib"], float(dcx))
+            self.assertAlmostEqual(seg(b, "reserve")["mib"], b["total_mib"] - dcx - b["budget_mib"], places=2)
+
+    def test_p_phase_flip_budget_is_the_group_line_and_the_rest_is_card_minus_budget(self):
+        pa = copy.deepcopy(NF_PA)
+        pa["P"]["--rank-gpu-memory-mib"] = "30000,18000,18000"
+        for b, bud in zip(nf(pa=pa)["phases"]["P"]["bars"], (30000, 18000, 18000)):
+            self.assertEqual((b["budget_mib"], b["outside_budget_mib"], b["available_mib"]), (bud, 0.0, b["total_mib"]))
+            self.assertIsNone(seg(b, "fixed")["mib"])                                      # kein Festposten gerechnet (nur am Metall zu messen)
+            inside = b["posts_mib"]
+            self.assertAlmostEqual(seg(b, "reserve")["mib"], max(0.0, b["total_mib"] - max(bud, inside)), places=2)
+
+    def test_p_phase_dual_budget_is_the_group_line_and_the_fixed_post_is_the_overhead_outside(self):
+        dc_launcher = self.L.dual_share_planned_dc(self.cards, [6610, 5050, 5200], "", 2500)
+        for b, bud, c in zip(dual()["phases"]["P"]["bars"], (6610, 5050, 5200), self.cards):
+            self.assertEqual(b["budget_mib"], bud)
+            self.assertEqual(seg(b, "fixed")["mib"], float(dc_launcher[c.uuid] - bud))      # Launcher: dc = Budget + Overhead -> Overhead = dc - Budget
+            self.assertEqual(b["available_mib"], b["total_mib"] - 2500)
+            inside = b["posts_mib"] - b["outside_budget_mib"]
+            self.assertAlmostEqual(seg(b, "reserve")["mib"], b["available_mib"] - max(bud, inside), places=2)
+
+    def test_single_one_phase_budget_is_the_flag_and_nothing_sits_outside(self):
+        r = PC.phase_bars(hw(RIG3[:1]), model("qwen27b_int8_vocabembed"), {"--rank-gpu-memory-mib": "30000", "--max-kv-per-request": "4096"}, {}, {})
+        self.assertEqual((r["form"], list(r["phases"])), ("single", ["alle"]))
+        b = r["phases"]["alle"]["bars"][0]
+        self.assertEqual((b["budget_mib"], b["outside_budget_mib"], b["available_mib"]), (30000, 0.0, 32607))
+        self.assertAlmostEqual(seg(b, "reserve")["mib"], max(0.0, 32607 - max(30000, b["posts_mib"])), places=2)
+
+    def test_every_dual_share_rule_of_p_has_a_d_counterpart(self):
+        r = dual()
+        p, d = r["phases"]["P"]["bars"][0], r["phases"]["D"]["bars"][0]
+        # P: Gewichte/Experten/KV als Referenz (shared) -> D (Owner): Gewichte und KV zaehlen gegen das eigene Budget
+        self.assertEqual({x["name"] for x in p["shared_with_d"]} >= {"weights", "kv"}, True)
+        self.assertEqual({"weights", "kv"} <= {x["name"] for x in d["segments"]}, True)
+        self.assertEqual(d["shared_with_d"], [])
+        # P: Festposten = Overhead ausserhalb -> D: Festposten = P's Plan ausserhalb; beide tragen die Launcher-Zeile als Beleg
+        self.assertTrue(seg(p, "fixed")["ausserhalb_budget"] and seg(d, "fixed")["ausserhalb_budget"])
+        self.assertIn("launcher.py:22713", seg(p, "fixed")["detail"])
+        self.assertIn("launcher.py:14976", seg(d, "fixed")["detail"])
+        # P: Kontext-Boden unter --dual-share nicht gerechnet -> D hat keinen Kontext-Boden-Wert, der falsch sein koennte
+        self.assertIsNone(r["phases"]["P"]["context_floor_tokens"])
+        self.assertNotIn("context_floor_tokens", r["phases"]["D"])
+        # P: Hinweiszeile -> D: Hinweiszeile
+        self.assertTrue(any("Union-Image von D" in h for h in r["hints"]) and any("D-Seite" in h for h in r["hints"]))
 
 
 if __name__ == "__main__":

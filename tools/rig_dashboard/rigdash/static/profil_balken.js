@@ -32,12 +32,17 @@
                  // "shared" = die Bytes liegen in D's Union-Image bzw. im Karten-KV-Pool; "in_festposten" = der Betrag steckt schon im Festposten;
                  // mib = null = nicht gerechnet (z. B. das Diff, das sich nicht an D's Bytes binden lässt)
 
+     // D-Phase unter --dual-share (Fix-Runde 4): der Launcher bemisst D aus P's PLAN (launcher.py:27289-27301): Festposten (Segment "fixed",
+     //   ausserhalb_budget:true) = P-Budget + --dual-p-overhead-mib je Karte (launcher.py:14976 dual_share_planned_dc), Budget = (Karte - Korridor 1428 - Festposten) // 8 * 8.
+     //   Fehlt --rank-gpu-memory-mib in der Gruppe P: Festposten mib = null (nicht gerechnet), Budget ist eine Obergrenze.
+
      Segment = { "name":  "weights"|"experts"|"draft"|"kv"|"state"|"activation"|"fixed"|"reserve"|"free",
                  "label": "Gewichte",
                  "mib":   number | null,             // null = NICHT GERECHNET: nicht gezeichnet, nicht in der Summe, steht als Chip unter dem Balken
                  "herkunft": "Modellprofil/Hardwareprofil (config)" | "Profilzeile" | "Naeherung (nicht der Loeser)" | "gerechnet" |
                              "Eingabe (Nutzer/Profil)" | "Annahme dieser Rechnung" | "nicht gerechnet",
-                 "detail": "Formel/Grund für den Tooltip", "gerechnet": true|false }
+                 "detail": "Formel/Grund für den Tooltip", "gerechnet": true|false,
+                 "ausserhalb_budget": true }          // optional: Posten liegt AUSSERHALB des Budgets (verkleinert das Verfügbare der Karte)
 
    Summenregel: Σ mib aller Segmente = max(total_mib, posts_mib).  Mit in = Posten im Budget, out = Posten ausserhalb (ohne Flag: out = 0).  Reserve = max(0, (total − out) − max(budget, in)); Frei = max(0, min(budget, total − out) − in).
    Ein Orakel darf zusätzliche Felder mitgeben; fehlende optionale Felder (detail, gerechnet, inputs) sind erlaubt.
@@ -199,7 +204,7 @@
       '<span class="muted">' + esc(s.what || s.label) + "</span>" +
       (s.outside ? '<br><span class="muted">liegt AUSSERHALB des Budgets (verkleinert das Verfügbare der Karte)</span>' : "") +
       (beyond > 0 ? '<br><span class="kp-t-bad">' + fmt(beyond) + " MiB dieses Postens liegen HINTER der Kartengrenze (" + fmt(bar.total_mib) + " MiB): zu erwarten ist OOM.</span>" : "") +
-      (s.key === "overflow" ? '<br><span class="kp-t-bad">Posten über dem Budget: die Reserve wird aufgezehrt, zu erwarten ist OOM beim Laden.</span>' : "");
+      (s.key === "overflow" ? '<br><span class="kp-t-bad">Posten über dem Budget: die Reserve wird aufgezehrt.</span>' : "");
   }
   function bar(b0, ctx) {
     const b = normBar(b0), m = model(b), w = (a) => (100 * a / m.scale).toFixed(3) + "%";
@@ -220,7 +225,7 @@
   }
   function ncChips(b) {
     const nc = (b.segments || []).filter((s) => s.mib == null);
-    return nc.length ? '<div class="kp-ncs">' + nc.map((s) => { const n = normSeg(s); return '<span class="kp-nc" tabindex="0" title="' + esc(n.what) + '"><b>' + esc(n.label) + "</b>: nicht gerechnet</span>"; }).join("") + "</div>" : "";
+    return nc.length ? '<div class="kp-ncs">' + nc.map((s) => { const n = normSeg(s); return '<span class="kp-nc" tabindex="0" data-tip="' + esc(n.what) + '"><b>' + esc(n.label) + "</b>: nicht gerechnet</span>"; }).join("") + "</div>" : "";
   }
   // Dual-Form: Referenzposten OHNE Budgetverbrauch (Gewichte/Experten/KV, die in D's Union-Image bzw. im Karten-KV-Pool liegen): dünner Geisterstreifen
   // unter dem Balken im selben Maßstab (nicht Teil der Summe) plus Chips mit Tooltip; Posten ohne Zahl stehen als "nicht gerechnet"
@@ -231,7 +236,7 @@
     const b = normBar(b0), rs = (b.shared_with_d || []).map(normRef);
     if (!rs.length) return "";
     const strip = rs.filter((r) => r.mib > 0 && r.ref !== "in_festposten").map((r) => '<i class="kp-gs" style="width:' + (100 * r.mib / scale).toFixed(3) + '%" title="' + esc(r.label + " " + fmt(r.mib) + " MiB (geteilt mit D, nicht im Budget)") + '"></i>').join("");
-    const chips = rs.map((r) => '<span class="kp-ref' + (r.mib == null ? " kp-nc" : "") + '" tabindex="0" title="' + esc((r.what || "") + (r.origin ? " | Herkunft: " + r.origin : "")) + '"><b>' + esc(r.label) + "</b>: " +
+    const chips = rs.map((r) => '<span class="kp-ref' + (r.mib == null ? " kp-nc" : "") + '" tabindex="0" data-tip="' + esc((r.what || "") + (r.origin ? " | Herkunft: " + r.origin : "")) + '"><b>' + esc(r.label) + "</b>: " +
       (r.mib == null ? "nicht gerechnet" : fmt(r.mib) + " MiB " + refNote(r)) + "</span>").join("");
     return (strip ? '<div class="kp-ghost" aria-hidden="true">' + strip + "</div>" : "") + '<div class="kp-refs"><span class="muted">Nicht im Budget:</span> ' + chips + "</div>";
   }
@@ -251,7 +256,7 @@
       const head = b.free_mib != null && !(b.overflow_mib > 0) ? "Rest " + fmt(b.free_mib) + " MiB" + (b.not_computed && b.not_computed.length ? " (Obergrenze)" : "") : "Überlauf " + fmt(b.overflow_mib) + " MiB über dem Budget" + (b.beyond_card_mib > 0 ? " · " + fmt(b.beyond_card_mib) + " MiB über der Karte" : "");
       // Altform (Näherung): Überlauf als eigenes Segment, kein overflow_mib-Feld in der Darstellung nötig
       let ov = overNote(b);
-      if (!ov && b.overflow_mib > 0) ov = '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Zu erwarten ist OOM beim Laden. " + esc((b.segments.find((s) => s.key === "overflow") || {}).what || "") + "</div>";
+      if (!ov && b.overflow_mib > 0) ov = '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Die Reserve wird aufgezehrt. " + esc((b.segments.find((s) => s.key === "overflow") || {}).what || "") + "</div>";
       return '<div class="pf-bar"><div class="pf-bar-h"><b>' + esc(b.label) + '</b>' + (b.phase ? ' <span class="kp-ph-chip">' + esc(b.phase) + "</span>" : "") + ' <span class="muted">Budget ' + fmt(b.budget_mib) + " MiB von " + fmt(b.total_mib) + " MiB · " + head + "</span></div>" +
         bar(b, (opt.base || 0) + i) + refs(b, model(b).scale) + ncChips(b) + ov + "</div>";
     }).join("");
@@ -287,6 +292,9 @@
     };
     const hide = () => { if (tipEl) tipEl.style.display = "none"; };
     const at = (ev) => {
+      // Chips unter dem Balken (Referenz "geteilt mit D", "nicht gerechnet"): derselbe schwebende Tooltip statt des nativen title (der im Browsertest nicht sichtbar wird)
+      const chip = ev.target.closest && ev.target.closest(".pf-bar .kp-refs [data-tip], .pf-bar .kp-ncs [data-tip]");
+      if (chip) return "<b>" + esc((chip.querySelector("b") || {}).textContent || "") + '</b><br><span class="muted">' + esc(chip.getAttribute("data-tip") || "") + "</span>";
       const i = ev.target.closest && ev.target.closest(".pf-bar .kp-bar > i[data-s]");
       if (!i) return null;
       const bars = getBars(), k = parseInt(i.dataset.b, 10);

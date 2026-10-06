@@ -1005,8 +1005,41 @@ def _p_terms_for_contract(stage: Mapping[str, Any], draft: Mapping[str, Any], ca
     return t
 
 
-def d_phase_config(args: Mapping[str, str], env: Mapping[str, str], model: Mapping[str, Any], n: int, draft: Mapping[str, Any]) -> Dict[str, Any]:
-    """Einstellungen der D-Phase (TP-Raenge) aus den Zeilen der Gruppe D; ``seen`` = gelesene Eingaben mit Herkunft."""
+#: Launcher-Standard fuer --dual-p-overhead-mib (launcher.py:22713, ``default=1500``)
+DUAL_P_OVERHEAD_DEFAULT_MIB = 1500
+#: D-Korridor ohne Messrecord, wie ihn ``launcher.budgets_from_dc`` abzieht: ``corridor = cf.mib + D_AWAKE_OVERSHOOT_MIB`` mit dem Boden des
+#: stated law 1024 (``corridor_budget.floors_for_cards``, Quelle UNMEASURED-FALLBACK) und dem eingebauten Wach-Ueberschuss 404
+#: (launcher.py:266-269 ``CORRIDOR_MIB = 1024 + D_AWAKE_OVERSHOOT_MIB``).  Gemessene Records (D_AWAKE_REST_MIB, Korridor-Floor) aendern ihn.
+D_CORRIDOR_STATED_LAW_MIB = 1024
+D_AWAKE_OVERSHOOT_MIB = 404
+D_CORRIDOR_ASSUMED_MIB = D_CORRIDOR_STATED_LAW_MIB + D_AWAKE_OVERSHOOT_MIB
+
+
+def dual_p_plan(p_args: Mapping[str, str], n: int) -> Dict[str, Any]:
+    """Was P unter ``--dual-share`` je Karte nach seinem PLAN haelt, aus den Zeilen der Gruppe P.
+
+    Der Launcher bemisst D in dieser Form aus P's Plan (launcher.py:27289-27301): ``dc = dual_share_planned_dc(cards, budgets_p, extra_p,
+    --dual-p-overhead-mib)`` = effektives P-Budget + Overhead je Karte (launcher.py:14976-14992; ein ``--rank-gpu-memory-mib`` in ``--extra-p`` senkt
+    das Launcher-Budget: ``min``), danach ``budgets_from_dc(cards, dc, ...)`` (launcher.py:27207).  Das eigene P-Budget des Launchers ist ohne Boot
+    nicht zu belegen; fehlt die Zeile in der Gruppe P, ist ``budget`` ``None`` (nicht gerechnet)."""
+    raw = p_args.get("--rank-gpu-memory-mib")
+    vec = _fl(raw) if raw not in (None, "") else None
+    if vec is not None and len(vec) != n:
+        raise CouplingError("vector_length: --rank-gpu-memory-mib der Gruppe P hat %d Werte, es gibt %d Karten" % (len(vec), n))
+    ov_raw = p_args.get("--dual-p-overhead-mib")
+    try:
+        ov = float(ov_raw) if ov_raw not in (None, "") else float(DUAL_P_OVERHEAD_DEFAULT_MIB)
+    except (TypeError, ValueError):
+        ov, ov_raw = float(DUAL_P_OVERHEAD_DEFAULT_MIB), None
+    return {"budget": vec, "budget_raw": raw, "overhead": ov, "overhead_given": ov_raw not in (None, "")}
+
+
+def d_phase_config(args: Mapping[str, str], env: Mapping[str, str], model: Mapping[str, Any], n: int, draft: Mapping[str, Any],
+                   dual_plan: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Einstellungen der D-Phase (TP-Raenge) aus den Zeilen der Gruppe D; ``seen`` = gelesene Eingaben mit Herkunft.
+
+    ``dual_plan`` (``dual_p_plan``, nur Form dual mit ``--dual-share``): der Launcher bemisst D dann aus P's Plan, nicht aus
+    ``--rank-gpu-memory-mib`` / ``--d-foreign-context-mib`` / ``--d-nontorch-mib`` der Gruppe D (launcher.py:27289-27301)."""
     seen: List[Dict[str, str]] = []
 
     def note(what: str, value: Any, herkunft: str) -> None:
@@ -1038,11 +1071,28 @@ def d_phase_config(args: Mapping[str, str], env: Mapping[str, str], model: Mappi
         cfg["scratch"] = [int(x) for x in sc] if len(sc) > 1 else int(sc[0])
         note("scratch", ",".join("%d" % x for x in sc), "Umgebung SGLANG_MOE_SCRATCH_SLOTS (--env-d)")
     bud = _fl(args.get("--rank-gpu-memory-mib"))
-    if bud:
+    if dual_plan is not None:
+        # --dual-share: D = Union-Owner, bemessen aus P's PLAN (dc = P-Budget + --dual-p-overhead-mib je Karte, launcher.py:27289-27301)
+        cfg["dual_share"] = True
+        cfg["dual_p_budget"] = dual_plan.get("budget")
+        cfg["dual_overhead_mib"] = float(dual_plan.get("overhead", DUAL_P_OVERHEAD_DEFAULT_MIB))
+        cfg["dual_overhead_given"] = bool(dual_plan.get("overhead_given"))
+        if dual_plan.get("budget") is not None:
+            note("dual_p_budget", dual_plan.get("budget_raw"), "Profilzeile --rank-gpu-memory-mib der Gruppe P (launcher.py:14976 dual_share_planned_dc)")
+        else:
+            note("dual_p_budget", "nicht im Profil", "kein --rank-gpu-memory-mib in der Gruppe P: P's Budget loest der Launcher, hier nicht gerechnet")
+        note("dual_p_overhead_mib", "%g" % cfg["dual_overhead_mib"],
+             "Profilzeile --dual-p-overhead-mib" if cfg["dual_overhead_given"] else "Standard des Launchers (--dual-p-overhead-mib 1500, launcher.py:22713)")
+        if bud:
+            note("budget_mib", args.get("--rank-gpu-memory-mib"),
+                 "ignoriert unter --dual-share: der Launcher bemisst D aus P's Plan (launcher.py:27289-27301), nicht aus dieser Zeile")
+    elif bud:
         cfg["budget_mib"] = bud
         note("budget_mib", args.get("--rank-gpu-memory-mib"), "Profilzeile --rank-gpu-memory-mib")
     else:
-        note("budget_mib", "Kartengroesse - 1024 MiB", "Annahme dieser Rechnung (kein --rank-gpu-memory-mib in der Gruppe D)")
+        note("budget_mib", "Kartengroesse - Festposten - Korridor %d MiB" % D_CORRIDOR_ASSUMED_MIB,
+             "Annahme dieser Rechnung (kein --rank-gpu-memory-mib in der Gruppe D; Korridor = %d stated law + %d eingebauter Wach-Ueberschuss, "
+             "launcher.py:266-269)" % (D_CORRIDOR_STATED_LAW_MIB, D_AWAKE_OVERSHOOT_MIB))
     for flag in ("--max-kv-per-request", "--context-length"):
         v = args.get(flag)
         if v and str(v).isdigit():
@@ -1073,7 +1123,11 @@ def d_phase_config(args: Mapping[str, str], env: Mapping[str, str], model: Mappi
     if args.get("--d-kv-token-cut"):
         note("kv_token_cut", args.get("--d-kv-token-cut"), "Profilzeile --d-kv-token-cut")
     fo, nt = _fl(args.get("--d-foreign-context-mib")), _fl(args.get("--d-nontorch-mib"))
-    if fo and nt and len(fo) == len(nt):
+    if dual_plan is not None:
+        if fo or nt:
+            note("fixed_mib", "%s + %s" % (args.get("--d-foreign-context-mib") or "-", args.get("--d-nontorch-mib") or "-"),
+                 "nicht Teil der Bemessung unter --dual-share: der Launcher zieht P's Plan ab (dc = P-Budget + Overhead, launcher.py:27289-27301)")
+    elif fo and nt and len(fo) == len(nt):
         cfg["fixed_mib"] = [a + b for a, b in zip(fo, nt)]
         cfg["fixed_parts"] = {"fremd": fo, "nichttorch": nt}
         note("fixed_mib", "%s + %s" % (args.get("--d-foreign-context-mib"), args.get("--d-nontorch-mib")),
@@ -1111,16 +1165,43 @@ def d_stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], cfg: Mapping[
     totals = [float(_val(c.get("vram_total_mib"), 0.0)) for c in cards]
     if any(t <= 0 for t in totals):
         raise CouplingError("Hardwareprofil: vram_total_mib fehlt auf einer Karte")
-    corridor = float(cfg.get("corridor_mib", 1024.0))
+    corridor = float(cfg.get("corridor_mib", D_CORRIDOR_ASSUMED_MIB))
     has_budget = cfg.get("budget_mib") is not None
-    # Ohne --rank-gpu-memory-mib: Budget = verfuegbar im Sinn des Launchers (pp_cut.d_rank_available_mib: Karte - fremd - nichttorch - reserve);
-    # die Festposten liegen AUSSERHALB des Budgets, die Annahme "Karte - Korridor" wuerde sie doppelt zaehlen.
-    pre_fixed = _per_card(cfg.get("fixed_mib"), n, "fixed_mib", 0.0) if cfg.get("fixed_mib") is not None else [0.0] * n
-    budgets = _per_card(cfg.get("budget_mib"), n, "budget_mib", 0.0) if has_budget else [t - f - corridor for t, f in zip(totals, pre_fixed)]
+    # Launcher-Formel (budgets_from_dc, launcher.py:15393-15394): Budget = (Karte - Korridor - dormant_other - ...) // 8 * 8.  ``dormant_other`` (dc)
+    # ist in der Flip-Form der CUDA-Kontext der schlafenden Phase (--d-foreign-context-mib + --d-nontorch-mib), in der Form dual mit --dual-share
+    # P's PLAN (P-Budget + --dual-p-overhead-mib, launcher.py:27289-27301).  Ohne --rank-gpu-memory-mib ist das Budget die Annahme dieser Rechnung.
+    # Die Festposten liegen AUSSERHALB des Budgets (pp_cut.d_rank_available_mib), die Annahme "Karte - Korridor" wuerde sie doppelt zaehlen.
+    dual = bool(cfg.get("dual_share"))
+    dual_dc: Optional[List[float]] = None
+    if dual and cfg.get("dual_p_budget") is not None:
+        dual_dc = [b + float(cfg.get("dual_overhead_mib", DUAL_P_OVERHEAD_DEFAULT_MIB))
+                   for b in _per_card(cfg.get("dual_p_budget"), n, "dual_p_budget", 0.0)]
+    if dual_dc is not None:
+        pre_fixed = dual_dc
+    elif cfg.get("fixed_mib") is not None and not dual:
+        pre_fixed = _per_card(cfg.get("fixed_mib"), n, "fixed_mib", 0.0)
+    else:
+        pre_fixed = [0.0] * n
+    if has_budget:
+        budgets = _per_card(cfg.get("budget_mib"), n, "budget_mib", 0.0)
+    else:
+        budgets = [float(int(max(t - f - corridor, 0.0)) // 8 * 8) for t, f in zip(totals, pre_fixed)]
     budget_src = SRC_PROFILE if has_budget else SRC_DERIVED
-    budget_note = "--rank-gpu-memory-mib" if has_budget else (
-        "Kartengroesse - Festposten (fremd + nichttorch) - Korridor %.0f MiB (Annahme)" % corridor if any(pre_fixed)
-        else "Kartengroesse - Korridor %.0f MiB (Annahme)" % corridor)
+    corr_txt = "Korridor %.0f MiB (Annahme: %d stated law + %d eingebauter Wach-Ueberschuss, launcher.py:266-269; ohne Messrecord)" % (
+        corridor, D_CORRIDOR_STATED_LAW_MIB, D_AWAKE_OVERSHOOT_MIB)
+    if has_budget:
+        budget_note = "--rank-gpu-memory-mib"
+    elif dual_dc is not None:
+        budget_note = ("aus P's Plan (launcher.py:14976 dual_share_planned_dc, :27289-27301): Karte - %s - (P-Budget + --dual-p-overhead-mib), "
+                       "auf 8 MiB abgerundet; P-Budget = Wert der Gruppe P (der Launcher nimmt min(eigenes P-Budget, Wert), dessen Budget ist hier nicht gerechnet)"
+                       % corr_txt)
+    elif dual:
+        budget_note = ("OBERGRENZE: Karte - %s; unter --dual-share zieht der Launcher P's Plan (P-Budget + --dual-p-overhead-mib) ab, im Profil steht aber kein "
+                       "--rank-gpu-memory-mib der Gruppe P: nicht gerechnet" % corr_txt)
+    elif any(pre_fixed):
+        budget_note = "Karte - Festposten (fremd + nichttorch) - %s, auf 8 MiB abgerundet" % corr_txt
+    else:
+        budget_note = "Karte - %s, auf 8 MiB abgerundet" % corr_txt
     fams = _families(model)
     w = model["weights"]
     lb, le = list(_val(w["layer_bytes"])), list(_val(w["layer_expert_bytes"]))
@@ -1261,7 +1342,16 @@ def d_stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], cfg: Mapping[
             "note": "%s; %d Linear-Layer x %.4f MiB x %d Slot(s)" % (share_note, lin_total, state_per, slots)}
         t["activation"] = _term(act_vec[i], SRC_INPUT, "gemessene Spitze (Eingabe)") if act_vec is not None else none(
             "Decode-Aktivierung und Graphen der D-Phase: nur am Metall zu messen")
-        if fixed_vec is not None:
+        if dual_dc is not None:
+            t["fixed"] = {"v": dual_dc[i], "src": SRC_PROFILE if cfg.get("dual_overhead_given") else SRC_APPROX, "outside_budget": True,
+                          "note": "P's Plan auf dieser Karte (dormant_other, AUSSERHALB von D's Budget): P-Budget %g + --dual-p-overhead-mib %g%s "
+                                  "(aus P-Plan, launcher.py:14976 dual_share_planned_dc, :27289-27301)"
+                                  % (float(_per_card(cfg.get("dual_p_budget"), n, "dual_p_budget", 0.0)[i]), float(cfg.get("dual_overhead_mib")),
+                                     "" if cfg.get("dual_overhead_given") else " (Standard des Launchers, nicht im Profil gesetzt)")}
+        elif dual:
+            t["fixed"] = none("unter --dual-share bemisst der Launcher D aus P's Plan (P-Budget + --dual-p-overhead-mib, launcher.py:27289-27301); im Profil "
+                              "fehlt --rank-gpu-memory-mib der Gruppe P, P's Budget loest der Launcher: nicht gerechnet")
+        elif fixed_vec is not None:
             parts = cfg.get("fixed_parts") or {}
             f_note = "; ".join("%s %s" % (k, ",".join("%g" % x for x in v)) for k, v in parts.items() if v)
             # Launcher-Semantik (pp_cut.d_rank_available_mib): verfuegbar = Karte - fremd - nichttorch - reserve; gefragt = Budget
@@ -1392,10 +1482,6 @@ def detect_form(args: Mapping[str, str], tokens: Sequence[str], n: int, form: Op
     return "flip"
 
 
-#: Launcher-Standard fuer --dual-p-overhead-mib (launcher.py:22713, ``default=1500``)
-DUAL_P_OVERHEAD_DEFAULT_MIB = 1500
-
-
 def _dual_share_p_terms(stage: Dict[str, Any], args: Mapping[str, str], seen: Optional[List[Dict[str, str]]]) -> None:
     """P-Stufe unter ``--dual-share``: was gegen das P-Budget zaehlt und was nur Referenz ist (AP-H2 Fix-Runde 3, Befund 1).
 
@@ -1501,7 +1587,9 @@ def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[st
 
     def run_d() -> Dict[str, Any]:
         a = _merged(args, phase_args, "D")
-        cfg = d_phase_config(a, dict(penv.get("D") or {}), model, n, draft)
+        # --dual-share: der Launcher bemisst D aus P's PLAN (launcher.py:27289-27301); die Zeilen der Gruppe P liefern ihn, D erbt sie nicht
+        plan = dual_p_plan(_merged(args, phase_args, "P"), n) if dual_share else None
+        cfg = d_phase_config(a, dict(penv.get("D") or {}), model, n, draft, plan)
         for k in ("context_tokens", "mamba_slots", "ssm_dtype", "kv_dtype", "corridor_mib", "activation_mib"):
             if k in over:
                 cfg[k] = over[k]
@@ -1527,6 +1615,9 @@ def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[st
         if dual_share:
             hints.append("Dual-Share: P's Gewichte und Experten liegen im Union-Image von D und zaehlen nicht gegen das P-Budget (Referenzzeile unter dem "
                          "Balken); gegen das P-Budget zaehlen die P-eigenen Posten, der Festposten --dual-p-overhead-mib liegt ausserhalb des Budgets.")
+            hints.append("Dual-Share, D-Seite: D ist der Union-Owner und haelt Gewichte und Experten in seinem Budget; der Launcher bemisst D aus P's Plan "
+                         "(Festposten = P-Budget + --dual-p-overhead-mib je Karte, ausserhalb von D's Budget, launcher.py:27289-27301). Unter --dual-unified-kv on "
+                         "waechst D's KV-Pool virtuell aus dem Karten-Pool (--dual-d-kv-max-tokens); der Balken zeigt das Kontextziel, nicht den Pool.")
     return {"schema": BALKEN_SCHEMA, "form": form, "n_cards": n, "phases": out_phases, "hints": hints, "approx": approx,
             "draft": {k: draft[k] for k in ("kind", "placement", "reason")}}
 
