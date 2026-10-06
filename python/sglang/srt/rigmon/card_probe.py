@@ -149,6 +149,14 @@ _XFER_BYTES = 64 * 1024 * 1024
 _XFER_ITERS = 12
 _XFER_WARMUP = 3
 
+#: Pipelined host staging (order 1006): chunk size, repeats (median). The serial D2H-then-H2D figure is the SUM of the two
+#: one-way times; a pipelined path overlaps them, which is what the operating host-staging / barlink-host planes do.
+_PIPE_CHUNK = 8 * 1024 * 1024
+_PIPE_REPEATS = 7
+_PIPE_WARMUP = 2
+#: Pair latency (4 kB, blocking copy + sync): median of this many samples.
+_PAIR_LAT_ITERS = 200
+
 #: fp8 GEMM shape. Same M/K/N as ``uneven_perf``'s bf16 GEMM so the two
 #: numbers are directly comparable -- an fp8 figure measured at a different
 #: shape would not answer "how much does fp8 buy on this card".
@@ -246,6 +254,13 @@ class CardProbeMeasurement:
     h2d_lat_min_us: Optional[float] = None
     d2h_lat_min_us: Optional[float] = None
 
+    # -- the card's PCIe link AS READ right after the transfer arm (order 1006; NVML, by UUID) -----
+    #: Generation / width the link had under that traffic (an idle card sits trained down) and the card's maxima.
+    pcie_gen_cur: Optional[int] = None
+    pcie_width_cur: Optional[int] = None
+    pcie_gen_max: Optional[int] = None
+    pcie_width_max: Optional[int] = None
+
     # -- state (#149 tagging convention) ---------------------------------
     sm_clock_mhz: Optional[int] = None
     sm_clock_max_mhz: Optional[int] = None
@@ -296,8 +311,18 @@ class PairMeasurement:
 
     src_uuid: str
     dst_uuid: str
+    #: Headline rate of the path. Host staging (order 1006): the PIPELINED rate (chunked, double buffer, D2H and H2D
+    #: overlapped); ``bandwidth_serial_gbs`` is the serial D2H-then-H2D figure earlier probes stored here.
     bandwidth_gbs: Optional[float] = None
+    #: Host staging only: whole copy D2H, then whole copy H2D, no overlap (the pre-1006 figure). ``None`` on every other
+    #: path, and on probes written before order 1006 (whose ``bandwidth_gbs`` IS this serial figure).
+    bandwidth_serial_gbs: Optional[float] = None
     latency_us: Optional[float] = None
+    #: SECOND latency (order 1006): the same transfer issued back to back in a stream with one host sync at the end, so the
+    #: per-operation launch + sync floor of ``latency_us`` is paid once. ``latency_device_kind`` says exactly what it is
+    #: (BAR1: a write rate per 4 kB write, NOT a round trip; NCCL: ping-pong round trip / 2). ``None`` where not measured.
+    latency_device_us: Optional[float] = None
+    latency_device_kind: str = ""
     transport: str = HOST_STAGING
     #: Whether the driver reports peer access in THIS direction. Recorded even
     #: when the copy ran over host staging, because "no p2p" is the finding.
@@ -338,6 +363,11 @@ class CardProbeProfile:
     bar1_reason: str = ""
     bar1_seconds: Optional[float] = None
     bar1_window_mib: Optional[float] = None
+    #: NCCL send/recv per ORDERED pair (``nccl_probe``): the "without barlink" reference column of the D2D table.
+    nccl_pairs: List[PairMeasurement] = dataclasses.field(default_factory=list)
+    nccl_attempted: bool = False
+    nccl_reason: str = ""
+    nccl_seconds: Optional[float] = None
 
     # -- lookup ----------------------------------------------------------
 
@@ -438,6 +468,10 @@ class CardProbeProfile:
             "bar1_reason": self.bar1_reason,
             "bar1_seconds": self.bar1_seconds,
             "bar1_window_mib": self.bar1_window_mib,
+            "nccl_pairs": [p.to_json() for p in self.nccl_pairs],
+            "nccl_attempted": self.nccl_attempted,
+            "nccl_reason": self.nccl_reason,
+            "nccl_seconds": self.nccl_seconds,
             "caveats": self.caveats(),
         }
 
@@ -460,6 +494,10 @@ class CardProbeProfile:
             bar1_reason=str(d.get("bar1_reason") or ""),
             bar1_seconds=d.get("bar1_seconds"),
             bar1_window_mib=d.get("bar1_window_mib"),
+            nccl_pairs=[PairMeasurement.from_json(p) for p in d.get("nccl_pairs") or []],
+            nccl_attempted=bool(d.get("nccl_attempted")),
+            nccl_reason=str(d.get("nccl_reason") or ""),
+            nccl_seconds=d.get("nccl_seconds"),
         )
 
 
@@ -855,6 +893,28 @@ def _time_copy_gbs(dev, fn, nbytes: int = _XFER_BYTES) -> Optional[float]:
     return nbytes / 1e9 / best
 
 
+def _pcie_link_of(uuid: str) -> Dict[str, Optional[int]]:
+    """The PCIe link of the card ``uuid`` as NVML reports it NOW (generation / width, current and maximum), or ``{}``.
+
+    Read right after the host-transfer arm, so the link is trained up and the "current" values describe the run, not the
+    idle state (an idle card drops to Gen1). By UUID, never by index. NVML trouble is an empty dict, never an exception:
+    the profile then shows the link rows as "nicht gemessen"."""
+    try:
+        from sglang.srt.rigmon.hardware_profile import read_nvml
+
+        for c in read_nvml()[0]:
+            if c.get("uuid") == uuid:
+                return {
+                    "gen_cur": c.get("pcie_cur_gen"),
+                    "width_cur": c.get("pcie_cur_width"),
+                    "gen_max": c.get("pcie_max_gen"),
+                    "width_max": c.get("pcie_max_width"),
+                }
+    except Exception as ex:  # pragma: no cover - depends on the host
+        logger.warning("card probe: no PCIe link state (%s)", ex)
+    return {}
+
+
 def _bench_h2d_d2h_latency(
     dev,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
@@ -1205,6 +1265,7 @@ def measure_card(
     gemm_bf16 = _timed(arm, "bf16", lambda: _bench_gemm_tflops(dev))
     gemm_fp8, fp8_note = _timed(arm, LANE_FP8, lambda: _bench_gemm_fp8_tflops(dev))
     h2d, d2h = _timed(arm, "h2d_d2h", lambda: _bench_h2d_d2h(dev))
+    link = _timed(arm, "pcie_link", lambda: _pcie_link_of(uuid))
     h2d_lat, d2h_lat, *lat_min = _timed(
         arm, "h2d_d2h_lat", lambda: _bench_h2d_d2h_latency(dev)
     )
@@ -1263,6 +1324,10 @@ def measure_card(
         d2h_lat_us=d2h_lat,
         h2d_lat_min_us=h2d_lat_min,
         d2h_lat_min_us=d2h_lat_min,
+        pcie_gen_cur=link.get("gen_cur"),
+        pcie_width_cur=link.get("width_cur"),
+        pcie_gen_max=link.get("gen_max"),
+        pcie_width_max=link.get("width_max"),
         sm_clock_mhz=st.get("sm_clock_mhz"),
         sm_clock_max_mhz=st.get("sm_clock_max_mhz"),
         temp_c=st.get("temp_c"),
@@ -1285,10 +1350,69 @@ def _peer_ok(src: int, dst: int) -> bool:
         return False
 
 
+def _staged_pipelined_gbs(sdev, ddev, a, b, nbytes: int) -> Optional[float]:
+    """Pipelined host staging src -> dst, GB/s (median of ``_PIPE_REPEATS``).
+
+    The copy is cut into ``_PIPE_CHUNK`` pieces and moved through TWO pinned buffers: while chunk k travels host -> destination
+    on a stream of the destination card, chunk k+1 travels source -> host on a stream of the source card. A buffer is reused
+    only after the H2D that read it has finished. Wall clock around the whole copy, synchronised at both ends, so the figure is
+    what one staged transfer achieves end to end -- not either direction alone."""
+    import torch
+
+    n = nbytes // _PIPE_CHUNK
+    if n < 2:
+        return None
+    try:
+        host = [torch.empty(_PIPE_CHUNK, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
+    except (RuntimeError, torch.cuda.OutOfMemoryError):
+        return None
+    s_d = torch.cuda.Stream(device=sdev)
+    s_h = torch.cuda.Stream(device=ddev)
+
+    def once() -> float:
+        d_ev = [torch.cuda.Event() for _ in range(n)]
+        h_ev = [torch.cuda.Event() for _ in range(n)]
+        torch.cuda.synchronize(sdev)
+        torch.cuda.synchronize(ddev)
+        t0 = time.perf_counter()
+        for k in range(n):
+            if k >= 2:
+                h_ev[k - 2].synchronize()          # the buffer of chunk k is free once H2D k-2 has read it
+            with torch.cuda.stream(s_d):
+                host[k % 2].copy_(a[k * _PIPE_CHUNK:(k + 1) * _PIPE_CHUNK], non_blocking=True)
+                d_ev[k].record(s_d)
+            if k >= 1:
+                d_ev[k - 1].synchronize()          # chunk k-1 is in host memory: start its H2D while D2H k runs
+                with torch.cuda.stream(s_h):
+                    b[(k - 1) * _PIPE_CHUNK:k * _PIPE_CHUNK].copy_(host[(k - 1) % 2], non_blocking=True)
+                    h_ev[k - 1].record(s_h)
+        d_ev[n - 1].synchronize()
+        with torch.cuda.stream(s_h):
+            b[(n - 1) * _PIPE_CHUNK:n * _PIPE_CHUNK].copy_(host[(n - 1) % 2], non_blocking=True)
+            h_ev[n - 1].record(s_h)
+        h_ev[n - 1].synchronize()
+        torch.cuda.synchronize(sdev)
+        torch.cuda.synchronize(ddev)
+        return time.perf_counter() - t0
+
+    try:
+        for _ in range(_PIPE_WARMUP):
+            once()
+        times = [once() for _ in range(_PIPE_REPEATS)]
+    finally:
+        del host
+    med = _median(times)
+    return (n * _PIPE_CHUNK) / 1e9 / med if med > 0 else None
+
+
 def _measure_one_pair(
     src: int, dst: int, staging=None
-) -> Tuple[Optional[float], Optional[float], str, bool]:
-    """(bandwidth_gbs, latency_us, transport, peer_access) for src -> dst.
+) -> Tuple[Optional[float], Optional[float], str, bool, Optional[float]]:
+    """(bandwidth_gbs, latency_us, transport, peer_access, bandwidth_serial_gbs) for src -> dst.
+
+    Host staging: ``bandwidth_gbs`` is the PIPELINED rate (``_staged_pipelined_gbs``), ``bandwidth_serial_gbs`` the serial
+    D2H-then-H2D figure (the sum of the two one-way times, which is what earlier probes stored as the pair rate). Over peer
+    access the copy is direct and there is no serial figure (``None``).
 
     With peer access the copy is issued device-to-device and the driver keeps
     it on the bus. Without it the bytes are staged through a pinned host
@@ -1339,23 +1463,29 @@ def _measure_one_pair(
             copy(s, d, stage)
 
         torch.cuda.set_device(sdev)
-        gbs = _time_copy_gbs(sdev, big)
+        gbs = _time_copy_gbs(sdev, big)          # serial for host staging (whole D2H, then whole H2D); direct for p2p
+        pipelined = None if peer else _staged_pipelined_gbs(sdev, ddev, a, b, _XFER_BYTES)
         # Latency at 4 kB: small enough that the number is dominated by the
         # per-transfer cost rather than the bytes, which is what a latency
-        # figure is for.
+        # figure is for. MEDIAN of 200 (order 1006; was best of 20).
         for _ in range(_XFER_WARMUP):
             small()
-        best = float("inf")
-        for _ in range(20):
+        lats = []
+        for _ in range(_PAIR_LAT_ITERS):
             t0 = time.perf_counter()
             small()
-            best = min(best, time.perf_counter() - t0)
-        lat_us = best * 1e6
+            lats.append((time.perf_counter() - t0) * 1e6)
+        lat_us = _median(lats)
+        if peer:
+            head, serial = gbs, None
+        else:
+            head, serial = (pipelined if pipelined is not None else None), gbs
         return (
-            round(gbs, 2) if gbs is not None else None,
+            round(head, 2) if head is not None else None,
             round(lat_us, 1),
             transport,
             peer,
+            round(serial, 2) if serial is not None else None,
         )
     finally:
         del a, b, small_src, small_dst
@@ -1384,7 +1514,7 @@ def measure_pair_matrix(gpus: Sequence[dict]) -> List[PairMeasurement]:
             for b in gpus:
                 if a["uuid"] == b["uuid"]:
                     continue
-                gbs, lat, transport, peer = _measure_one_pair(
+                gbs, lat, transport, peer, serial = _measure_one_pair(
                     a["cuda_index"], b["cuda_index"], staging=staging
                 )
                 out.append(
@@ -1392,6 +1522,7 @@ def measure_pair_matrix(gpus: Sequence[dict]) -> List[PairMeasurement]:
                         src_uuid=a["uuid"],
                         dst_uuid=b["uuid"],
                         bandwidth_gbs=gbs,
+                        bandwidth_serial_gbs=serial,
                         latency_us=lat,
                         transport=transport,
                         peer_access=peer,
@@ -1399,7 +1530,12 @@ def measure_pair_matrix(gpus: Sequence[dict]) -> List[PairMeasurement]:
                             ""
                             if peer
                             else "no peer access in this direction; bytes went "
-                            "device -> pinned host -> device"
+                            "device -> pinned host -> device. bandwidth_gbs = "
+                            f"PIPELINED ({_PIPE_CHUNK >> 20} MiB chunks, two pinned "
+                            "buffers, D2H and H2D overlapped, median of "
+                            f"{_PIPE_REPEATS}); bandwidth_serial_gbs = whole copy "
+                            "D2H then whole copy H2D, no overlap. latency = 4 kB "
+                            f"two-hop copy with a sync after each, median of {_PAIR_LAT_ITERS}"
                         ),
                     )
                 )
@@ -1433,6 +1569,29 @@ def _run_bar1_step(gpus: Sequence[dict], timeout_s: Optional[float]):
         return res
 
 
+def _run_nccl_step(gpus: Sequence[dict], timeout_s: Optional[float]):
+    """NCCL send/recv per ordered pair in child processes; a failure is a reason, never an exception."""
+    try:
+        from sglang.srt.rigmon import nccl_probe
+
+        return nccl_probe.run_nccl_probe(
+            [{"uuid": g["uuid"]} for g in gpus],
+            timeout_s=timeout_s or nccl_probe.DEFAULT_TIMEOUT_S,
+        )
+    except Exception as ex:  # noqa: BLE001
+        from sglang.srt.rigmon.nccl_probe import NcclResult
+
+        res = NcclResult(reason=f"NCCL step failed: {type(ex).__name__}: {ex}")
+        res.pairs = []
+        for a in gpus:
+            for b in gpus:
+                if a["uuid"] != b["uuid"]:
+                    res.pairs.append({"src_uuid": a["uuid"], "dst_uuid": b["uuid"], "bandwidth_gbs": None,
+                                      "latency_us": None, "transport": "nccl send/recv", "peer_access": False,
+                                      "bytes_moved": 0, "note": res.reason})
+        return res
+
+
 def run_card_probe(
     node_id: str = "local",
     include_pairs: bool = True,
@@ -1441,6 +1600,8 @@ def run_card_probe(
     progress=None,
     bar1: bool = False,
     bar1_timeout_s: Optional[float] = None,
+    nccl: bool = False,
+    nccl_timeout_s: Optional[float] = None,
 ) -> CardProbeProfile:
     """Run the short probe over every visible card and cache the result.
 
@@ -1450,6 +1611,10 @@ def run_card_probe(
     for library callers (the planner's card-rate pass, ``rigmon`` CLI): only the
     ``--run`` command line -- the one "Hardwareprofil messen" starts -- turns it
     on (``--no-bar1`` turns it off again).
+
+    ``nccl`` (order 1006, same rules): NCCL send/recv per ordered pair (``nccl_probe``), the "without barlink" reference
+    column of the D2D table. The cache file is written after the card and pair stages and again after each optional way, so a
+    run cut short by the window keeps what it measured.
 
     ``progress(done, total, label)`` is called between steps so a long-running
     endpoint can report where it is without the caller polling the GPU.
@@ -1461,7 +1626,8 @@ def run_card_probe(
 
     n_pairs = len(gpus) * (len(gpus) - 1) if include_pairs else 0
     do_bar1 = bool(bar1 and len(gpus) >= 2)
-    total = len(gpus) + (1 if n_pairs else 0) + (1 if do_bar1 else 0)
+    do_nccl = bool(nccl and len(gpus) >= 2)
+    total = len(gpus) + (1 if n_pairs else 0) + (1 if do_bar1 else 0) + (1 if do_nccl else 0)
     done = 0
 
     cards: List[CardProbeMeasurement] = []
@@ -1485,15 +1651,6 @@ def run_card_probe(
             progress(done, total, f"{n_pairs} ordered pairs")
         pairs = measure_pair_matrix(gpus)
         done += 1
-    bar1_res = None
-    if do_bar1:
-        if progress:
-            progress(done, total, f"BAR1 stretch ({n_pairs or len(gpus) * (len(gpus) - 1)} ordered pairs)")
-        bar1_res = _run_bar1_step(gpus, bar1_timeout_s)
-        done += 1
-    if progress:
-        progress(done, total, "done")
-
     profile = CardProbeProfile(
         version=CARD_PROBE_VERSION,
         created=t0,
@@ -1506,7 +1663,21 @@ def run_card_probe(
         cards=cards,
         pairs=pairs,
     )
-    if bar1_res is not None:
+    if len(gpus) < 2:
+        profile.notes.append(
+            "Only one card is visible, so there is no pair matrix to measure."
+        )
+    if save:
+        # what the card and pair stages measured survives a window that ends during an optional way
+        save_card_probe(profile, path)
+
+    n_ord = len(gpus) * (len(gpus) - 1)
+    bar1_res = None
+    if do_bar1:
+        if progress:
+            progress(done, total, f"BAR1 stretch ({n_ord} ordered pairs)")
+        bar1_res = _run_bar1_step(gpus, bar1_timeout_s)
+        done += 1
         profile.bar1_attempted = True
         profile.bar1_pairs = [PairMeasurement.from_json(p) for p in bar1_res.pairs]
         profile.bar1_reason = bar1_res.reason
@@ -1514,11 +1685,25 @@ def run_card_probe(
         profile.bar1_window_mib = bar1_res.window_mib
         if bar1_res.reason:
             profile.notes.append(f"BAR1 stretch: {bar1_res.reason}")
-    if len(gpus) < 2:
-        profile.notes.append(
-            "Only one card is visible, so there is no pair matrix to measure."
-        )
-    elif bar1_res is None:
+        profile.duration_s = round(time.time() - t0, 1)
+        if save:
+            save_card_probe(profile, path)
+    nccl_res = None
+    if do_nccl:
+        if progress:
+            progress(done, total, f"NCCL send/recv ({n_ord} ordered pairs)")
+        nccl_res = _run_nccl_step(gpus, nccl_timeout_s)
+        done += 1
+        profile.nccl_attempted = True
+        profile.nccl_pairs = [PairMeasurement.from_json(p) for p in nccl_res.pairs]
+        profile.nccl_reason = nccl_res.reason
+        profile.nccl_seconds = nccl_res.seconds
+        if nccl_res.reason:
+            profile.notes.append(f"NCCL send/recv: {nccl_res.reason}")
+    if progress:
+        progress(done, total, "done")
+    profile.duration_s = round(time.time() - t0, 1)
+    if len(gpus) >= 2 and bar1_res is None:
         # The BAR1 step did not run (--no-bar1): say it, the matrix has no BAR1 column.
         profile.notes.append(BAR1_NOT_MEASURED)
     if save:
@@ -1874,6 +2059,11 @@ def format_text(profile: CardProbeProfile) -> str:
                 f"{(dst.name if dst else pr.dst_uuid)[:20]:20s} "
                 f"{_num(pr.bandwidth_gbs, 2):>8s} GB/s  "
                 f"{_num(pr.latency_us, 1):>8s} us   via {pr.transport}"
+                + (
+                    f"  (serial D2H+H2D {_num(pr.bandwidth_serial_gbs, 2)} GB/s)"
+                    if pr.bandwidth_serial_gbs is not None
+                    else ""
+                )
             )
     if profile.bar1_pairs:
         by_uuid = profile.by_uuid()
@@ -1888,6 +2078,20 @@ def format_text(profile: CardProbeProfile) -> str:
                 f"{(dst.name if dst else pr.dst_uuid)[:20]:20s} "
                 f"{_num(pr.bandwidth_gbs, 3):>8s} GB/s  "
                 f"{_num(pr.latency_us, 1):>8s} us{tail}"
+            )
+    if profile.nccl_pairs:
+        by_uuid = profile.by_uuid()
+        lines.append("")
+        lines.append("NCCL send/recv per ordered pair (reference, no barlink):")
+        for pr in profile.nccl_pairs:
+            src = by_uuid.get(pr.src_uuid)
+            dst = by_uuid.get(pr.dst_uuid)
+            tail = "" if pr.bandwidth_gbs is not None else f"   not measured: {pr.note}"
+            lines.append(
+                f"  {(src.name if src else pr.src_uuid)[:20]:20s} -> "
+                f"{(dst.name if dst else pr.dst_uuid)[:20]:20s} "
+                f"{_num(pr.bandwidth_gbs, 3):>8s} GB/s  "
+                f"{_num(pr.latency_us, 1):>8s} us   [{pr.transport}]{tail}"
             )
     for n in profile.notes:
         lines.append(f"note: {n}")
@@ -1930,6 +2134,18 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         default=None,
         help="wall cap of the BAR1 step (default bar1_probe.DEFAULT_TIMEOUT_S)",
     )
+    p.add_argument(
+        "--no-nccl",
+        action="store_true",
+        help="skip NCCL send/recv per ordered pair (child processes, two per pair-run; "
+        "the reference column of the D2D table)",
+    )
+    p.add_argument(
+        "--nccl-timeout-s",
+        type=float,
+        default=None,
+        help="wall cap of the whole NCCL step (default nccl_probe.DEFAULT_TIMEOUT_S)",
+    )
     p.add_argument("--json", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
 
@@ -1940,6 +2156,8 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             path=args.out,
             bar1=not args.no_bar1,
             bar1_timeout_s=args.bar1_timeout_s,
+            nccl=not args.no_nccl,
+            nccl_timeout_s=args.nccl_timeout_s,
         )
         # #310: an interpreter that cannot measure the sgl_kernel lanes says so
         # to the caller, never into the card-keyed cache.

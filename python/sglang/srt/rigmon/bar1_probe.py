@@ -83,7 +83,7 @@ MARKER = "BAR1PROBE "
 
 #: The whole step (children start, JIT-cached extension loads, byte proofs, all pairs).  A cold extension build
 #: is minutes, a warm one seconds; the cap is what the measurement window can afford.
-DEFAULT_TIMEOUT_S = 300.0
+DEFAULT_TIMEOUT_S = 240.0
 
 #: The shared, warm BAR1 extension cache of this rig (the battery's ``BAR1_EXTCACHE`` default).  Used only when
 #: it exists and the caller's environment does not name another ``TORCH_EXTENSIONS_DIR``.
@@ -95,6 +95,8 @@ _BW_REPEATS = 3
 _LAT_BYTES = 4096
 _LAT_ITERS = 200
 _LAT_WARMUP = 10
+_STREAM_N = 1000
+_STREAM_REPEATS = 5
 
 
 class Bar1Result:
@@ -212,6 +214,7 @@ def merge_reports(
                         f"destination's BAR1 window ({row.get('window_mib', '?')} MiB mapped); latency = median of "
                         f"{row.get('lat_n', '?')} x 4 kB write+sync, min {row.get('lat_min_us', '?')} us")
                 lat = row.get("latency_us")
+                lat_dev = row.get("latency_device_us")
             else:
                 if row and row.get("reason"):
                     note = f"BAR1 {s}->{d} not measured: {row['reason']}"
@@ -222,8 +225,13 @@ def merge_reports(
                 else:
                     note = "BAR1 not measured"
                 lat = None
+                lat_dev = None
             pairs.append({"src_uuid": uuids[s], "dst_uuid": uuids[d], "bandwidth_gbs": bw if ok else None,
-                          "latency_us": lat if ok else None, "transport": BAR1_DIRECT, "peer_access": bool(ok),
+                          "latency_us": lat if ok else None,
+                          "latency_device_us": lat_dev if ok else None,
+                          "latency_device_kind": ("4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff "
+                                                  "(KEIN Rundlauf)") if ok and lat_dev is not None else "",
+                          "transport": BAR1_DIRECT, "peer_access": bool(ok),
                           "bytes_moved": int(row.get("nbytes", 0)) if ok else 0, "note": note})
     missing = [p for p in pairs if p["bandwidth_gbs"] is None]
     if not missing:
@@ -409,6 +417,20 @@ def _measure_pair(t, dev, s: int, d: int) -> dict:
     row["latency_us"] = round(_median(lat), 1)
     row["lat_min_us"] = round(min(lat), 1)
     row["lat_n"] = _LAT_ITERS
+    # SECOND number (order 1006, user finding 15:40Z): the figure above carries one kernel launch plus one host synchronisation per
+    # write, a floor of the order of 10 us that is NOT the wire latency.  This one issues ``_STREAM_N`` writes back to back on the
+    # stream and synchronises ONCE, so the per-write floor is paid once: time / N = the cost of one 4 kB posted write inside a
+    # stream.  It is NOT a round trip (a flag round trip needs a kernel that writes a flag and spins on the peer's: not built here).
+    per = []
+    for _ in range(_STREAM_REPEATS):
+        torch.cuda.synchronize(dev)
+        t0 = time.perf_counter()
+        for _ in range(_STREAM_N):
+            t.put(d, src.data_ptr(), _LAT_BYTES, 0)
+        torch.cuda.synchronize(dev)
+        per.append((time.perf_counter() - t0) * 1e6 / _STREAM_N)
+    row["latency_device_us"] = round(_median(per), 2)
+    row["latency_device_n"] = _STREAM_N * _STREAM_REPEATS
     return row
 
 

@@ -59,6 +59,16 @@
     h += sec("Host-Übertragung (gepinnt, 64 MiB / 4 kB)");
     h += row("H2D Bandbreite", (c) => cell(c.h2d.gbs, 1, o)) + row("H2D Latenz", (c) => cell(c.h2d.lat_us, 1, o));
     h += row("D2H Bandbreite", (c) => cell(c.d2h.gbs, 1, o)) + row("D2H Latenz", (c) => cell(c.d2h.lat_us, 1, o));
+    /* Auftrag 1006: der PCIe-Link, wie die Probe ihn unter der Last des Transferarms gelesen hat, und die gemessene H2D-/D2H-Rate
+       gegen die theoretische Linkrate (Rechnung, mit Herkunft im Hover): macht die schmale Karte (x4) sichtbar. */
+    const lk = (c, k) => (c.link && c.link[k]) || null;
+    h += sec("PCIe-Link bei der Messung (Auslastung der Host-Übertragung)");
+    h += row("Link (Generation x Breite)", (c) => !c.link ? '<span class="hwp-x">nicht gemessen</span>'
+      : "Gen" + cell(lk(c, "gen_cur"), 0, { nounit: 1, now: o.now }) + " x" + cell(lk(c, "width_cur"), 0, { nounit: 1, now: o.now })
+        + " <small>(max. Gen" + cell(lk(c, "gen_max"), 0, { nounit: 1, now: o.now }) + " x" + cell(lk(c, "width_max"), 0, { nounit: 1, now: o.now }) + ")</small>");
+    h += row("Theoretisch je Richtung", (c) => cell(lk(c, "theory_gbs"), 2, o));
+    h += row("H2D gemessen / theoretisch", (c) => cell(lk(c, "h2d_pct"), 1, o));
+    h += row("D2H gemessen / theoretisch", (c) => cell(lk(c, "d2h_pct"), 1, o));
     h += sec("Anbindung und Zustand");
     h += row("PCIe max.", (c) => "Gen" + cell(c.pcie.max_gen, 0, { nounit: 1, now: o.now }) + " x" + cell(c.pcie.max_width, 0, { nounit: 1, now: o.now }));
     h += row("PCIe jetzt", (c) => "Gen" + cell(c.pcie.cur_gen, 0, { nounit: 1, now: o.now }) + " x" + cell(c.pcie.cur_width, 0, { nounit: 1, now: o.now }));
@@ -70,20 +80,67 @@
     return h + "</tbody></table>";
   }
 
+  /* Auftrag 1006: D2D je GERICHTETEM Paar, drei Wege nebeneinander.  Kopfspalte = barlink BAR1; die beiden anderen sind
+     Vergleichsspalten.  Ein Weg ohne Messung steht "nicht gemessen" mit Grund; die Kopfspalte wird nie aus einem anderen Weg
+     gefüllt.  Texte (Spaltennamen, Definitionen) kommen vom Dienst; hier steht keine Vergleichsaussage zwischen den Wegen. */
+  function d2dTable(doc, o) {
+    const d = doc.d2d, cs = doc.cards || [];
+    const nm = (i) => { const c = cs.find((x) => x.ord === i); return c ? i + " · " + esc(c.name.replace(/^NVIDIA (GeForce )?/, "")) : String(i); };
+    const lat = (n) => (n && n.v != null ? " · " + cell(n, 1, o) : "");
+    /* zwei Latenzen: 1 = mit Start + Host-Sync je Messung (enthält diesen Boden), 2 = ohne Host-Sync je Runde (Beschriftung im Hover) */
+    const lat2 = (n) => (n && n.v != null ? " · <span title=\"ohne Host-Synchronisation je Runde\">[" + cell(n, 2, o) + "]</span>" : "");
+    const colLabel = {}; (d.columns || []).forEach((c) => { colLabel[c.key] = c.label; });
+    let h = "<h4>Karte zu Karte (D2D) je geordnetem Paar: drei Wege</h4><table><thead><tr><th>von → nach</th>"
+      + "<th>" + esc(colLabel.barlink_bar1 || "barlink BAR1") + "<br><small>GB/s · µs (Start+Sync) · [µs ohne Host-Sync je Runde]</small></th>"
+      + "<th>" + esc(colLabel.nccl || "NCCL") + "<br><small>GB/s · µs (Start+Sync) · [µs ohne Host-Sync je Runde]</small></th>"
+      + "<th>" + esc(colLabel.host_staging || "Host-Staging") + "<br><small>pipelined GB/s · seriell GB/s · µs</small></th></tr></thead><tbody>";
+    (d.pairs || []).forEach((p) => {
+      h += "<tr><td>" + nm(p.src) + " → " + nm(p.dst) + "</td>"
+        + "<td>" + cell(p.barlink_bar1.gbs, 2, o) + lat(p.barlink_bar1.lat_us) + lat2(p.barlink_bar1.lat_dev_us) + "</td>"
+        + "<td>" + cell(p.nccl.gbs, 2, o) + lat(p.nccl.lat_us) + lat2(p.nccl.lat_dev_us) + (p.nccl.gbs && p.nccl.gbs.v != null && p.nccl.transport ? " <small>[" + esc(p.nccl.transport) + "]</small>" : "") + "</td>"
+        + "<td>" + cell(p.host_staging.gbs, 2, o) + " · " + cell(p.host_staging.gbs_serial, 2, o) + lat(p.host_staging.lat_us) + "</td></tr>";
+    });
+    h += "</tbody></table>";
+    Object.keys(d.definitions || {}).forEach((k) => { h += '<p class="hwp-msg"><small><b>' + esc(colLabel[k] || k) + ":</b> " + esc(d.definitions[k]) + "</small></p>"; });
+    if ((d.references || []).length) {
+      h += '<p class="hwp-msg"><small><b>Bereits gemessene Vergleichswerte (Quelle; verschiedene Größen, kein Vergleich in dieser Tabelle):</b></small></p><ul>';
+      d.references.forEach((r) => { h += "<li><small>" + esc(r.what) + " &mdash; <i>" + esc(r.source) + "</i></small></li>"; });
+      h += "</ul>";
+    }
+    [doc.bar1, doc.nccl].forEach((x) => {
+      if (!x) return;
+      const full = x.complete != null ? x.complete : x.measured;
+      h += '<p class="hwp-msg' + (full ? "" : " hwp-warn") + '">' + esc(x.note) + "</p>";
+    });
+    return h;
+  }
+
   /* Paarmatrix je Transportweg: Zeile = Quelle, Spalte = Ziel (geordnet: beide Richtungen eigene Zahlen). */
   function pairTables(doc, o) {
     const cs = doc.cards || [];
     if (cs.length < 2) return '<p class="hwp-msg">Eine Karte: keine Paarmatrix.</p>';
+    if (doc.d2d && doc.d2d.pairs) {
+      /* die Stufe-0-NCCL-Tabelle (eine Richtung gemessen, die andere gespiegelt) bleibt eigene, beschriftete Tabelle */
+      const st0 = (doc.links || []).filter((l) => l.transport === "nccl");
+      if (!st0.length) return d2dTable(doc, o);
+      return d2dTable(doc, o) + pairTablesOld(Object.assign({}, doc, { links: st0, bar1: null }), o);
+    }
+    return pairTablesOld(doc, o);
+  }
+
+  function pairTablesOld(doc, o) {
+    const cs = doc.cards || [];
     const byT = {};
     (doc.links || []).forEach((l) => { (byT[l.transport] = byT[l.transport] || []).push(l); });
-    const title = { p2p: "Karte zu Karte direkt (cuda p2p)", host_staging: "Karte zu Karte über gepinnten Host (host staging)", nccl: "NCCL p2p (Stufe-0-Probe)", bar1: "BAR1-Strecke (barlink)" };
+    const title = { p2p: "Karte zu Karte direkt (cuda p2p)", host_staging: "Karte zu Karte über gepinnten Host (host staging)", nccl: "NCCL über Host (Stufe-0-Probe)", bar1: "BAR1-Strecke (barlink)" };
     let h = "";
     ["p2p", "host_staging", "nccl", "bar1"].concat(Object.keys(byT).filter((k) => !title[k])).forEach((t) => {
       const ls = byT[t];
       if (!ls) return;
       const at = {};
       ls.forEach((l) => { at[l.src + ">" + l.dst] = l; });
-      h += "<h4>" + esc(title[t] || t) + "</h4><table><thead><tr><th>von \\ nach</th>" + cs.map((c) => "<th>" + c.ord + " · NVML " + c.nvml_index + "</th>").join("") + "</tr></thead><tbody>";
+      const label = (t === "nccl" && ls[0] && ls[0].transport_label) ? ls[0].transport_label : (title[t] || t);
+      h += "<h4>" + esc(label) + "</h4><table><thead><tr><th>von \\ nach</th>" + cs.map((c) => "<th>" + c.ord + " · NVML " + c.nvml_index + "</th>").join("") + "</tr></thead><tbody>";
       cs.forEach((a) => {
         h += "<tr><td>" + a.ord + " · " + esc(a.name.replace(/^NVIDIA (GeForce )?/, "")) + "</td>" + cs.map((b) => {
           if (a.ord === b.ord) return "<td>–</td>";
