@@ -2684,6 +2684,25 @@
      "to": "--d-hold-s",
      "to_kind": "flag",
      "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22724,
+      "zeile_hinweis": 22724
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Im Dual-Layout wird --d-short-drain-tokens auf 0 gesetzt (ein Idle-Drain auf D der Flip-Auslegung; im Dual-Layout prefillt D nichts) und der Wechsel im Log genannt, kein Verweigern. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "kante": "K102",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Im Dual-Layout wird --d-short-drain-tokens auf 0 gesetzt (ein Idle-Drain auf D der Flip-Auslegung; im Dual-Layout prefillt D nichts) und der Wechsel im Log genannt, kein Verweigern. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "to": "--dual-d-prefill-tokens",
+     "to_kind": "flag",
+     "wert": "0"
     }
    ],
    "gain": "Kein Flip für kleine Rückstaus.",
@@ -5417,65 +5436,7 @@
    "choices": null,
    "cost": "",
    "default": 0,
-   "depends": [
-    {
-     "beleg": {
-      "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
-      "aufloesung": "eindeutig",
-      "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22724,
-      "zeile_hinweis": 22724
-     },
-     "belegt": true,
-     "calc": "text",
-     "effect": "Im Dual-Layout ersetzt --dual-d-prefill-tokens die Flip-Schwellen --tp-prefill-max-tokens, --x-ceiling-tokens und --d-short-drain-tokens; ohne --dual-layout wird es ignoriert.",
-     "kante": "K100",
-     "quelle": "katalog",
-     "rel": "schliesst_aus",
-     "satz": "Im Dual-Layout ersetzt --dual-d-prefill-tokens die Flip-Schwellen --tp-prefill-max-tokens, --x-ceiling-tokens und --d-short-drain-tokens; ohne --dual-layout wird es ignoriert.",
-     "to": "--tp-prefill-max-tokens",
-     "to_kind": "flag",
-     "wert": null
-    },
-    {
-     "beleg": {
-      "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
-      "aufloesung": "eindeutig",
-      "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22724,
-      "zeile_hinweis": 22724
-     },
-     "belegt": true,
-     "calc": "text",
-     "effect": "Im Dual-Layout ersetzt --dual-d-prefill-tokens auch --x-ceiling-tokens; ohne --dual-layout wird es ignoriert.",
-     "kante": "K101",
-     "quelle": "katalog",
-     "rel": "schliesst_aus",
-     "satz": "Im Dual-Layout ersetzt --dual-d-prefill-tokens auch --x-ceiling-tokens; ohne --dual-layout wird es ignoriert.",
-     "to": "--x-ceiling-tokens",
-     "to_kind": "flag",
-     "wert": null
-    },
-    {
-     "beleg": {
-      "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
-      "aufloesung": "eindeutig",
-      "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22724,
-      "zeile_hinweis": 22724
-     },
-     "belegt": true,
-     "calc": "text",
-     "effect": "Im Dual-Layout ersetzt --dual-d-prefill-tokens auch --d-short-drain-tokens; ohne --dual-layout wird es ignoriert.",
-     "kante": "K102",
-     "quelle": "katalog",
-     "rel": "schliesst_aus",
-     "satz": "Im Dual-Layout ersetzt --dual-d-prefill-tokens auch --d-short-drain-tokens; ohne --dual-layout wird es ignoriert.",
-     "to": "--d-short-drain-tokens",
-     "to_kind": "flag",
-     "wert": null
-    }
-   ],
+   "depends": [],
    "gain": "",
    "group": "Dual",
    "help": "DUAL-TP3PP3 D PREFILL ALLOWANCE, DEFAULT 0 (user decision 01.10.: in the dual layout EVERY prefill runs on P, D only decodes). D's X (its W31 riegel and the front's route bound) becomes 1 + this value: the 1 is the N-1 anchor convention (P holds the last prompt token back, D's first step computes it), anything larger goes to P and a larger remainder at D is refused by name (W31 -> P), never silently recomputed. Ignored outside --dual-layout; replaces --tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
@@ -6581,7 +6542,7 @@
     "line": 22699
    },
    "status": "kuratiert",
-   "text": "DUAL-TP3PP3 (F26, Nutzer 29.09.): BEIDE Gruppen bleiben den ganzen Boot wach, die Front flippt nie. Impliziert --flip-weights resident; P wird nach READY nicht schlafen gelegt, statt dessen wird sein WACH-Fußabdruck gemessen und D danach bemessen (dieselbe PID-Messung wie beim Schlafrest). Das Budget von P selbst senkt man mit --extra-p '--rank-gpu-memory-mib ...' (W100 erlaubt das Senken). Verweigert --weg2-d-adopt on und --idle-layout pp. Standard aus: der Launcher ist byte-identisch.",
+   "text": "DUAL-TP3PP3 (F26, Nutzer 29.09.): BEIDE Gruppen bleiben den ganzen Boot wach, die Front flippt nie. Impliziert --flip-weights resident; P wird nach READY nicht schlafen gelegt, statt dessen wird sein WACH-Fußabdruck gemessen und D danach bemessen (dieselbe PID-Messung wie beim Schlafrest). Das Budget von P selbst senkt man mit --extra-p '--rank-gpu-memory-mib ...' (W100 erlaubt das Senken). Verweigert --weg2-d-adopt on und --idle-layout pp (help=; der Code stellt pp ohne Verweigerung auf tp um, launcher.py:14722). Standard aus: der Launcher ist byte-identisch.",
    "type": "bool"
   },
   "--dual-mps": {
@@ -21378,11 +21339,11 @@
      },
      "belegt": true,
      "calc": "text",
-     "effect": "Die Env SGLANG_UNEVEN_TOKEN_VECTOR (expliziter Vektor) hat Vorrang vor --rank-kv-ratio: ist sie gesetzt, gilt ihr Vektor und das Flag wird überstimmt.",
+     "effect": "Die Env SGLANG_UNEVEN_TOKEN_VECTOR (expliziter Vektor) hat Vorrang vor --rank-kv-ratio: ist sie gesetzt, gilt ihr Vektor und das Flag wird überstimmt (kein Verweigern).",
      "kante": "K69",
      "quelle": "katalog",
-     "rel": "schliesst_aus",
-     "satz": "Die Env SGLANG_UNEVEN_TOKEN_VECTOR (expliziter Vektor) hat Vorrang vor --rank-kv-ratio: ist sie gesetzt, gilt ihr Vektor und das Flag wird überstimmt.",
+     "rel": "abgeleitet_von",
+     "satz": "Die Env SGLANG_UNEVEN_TOKEN_VECTOR (expliziter Vektor) hat Vorrang vor --rank-kv-ratio: ist sie gesetzt, gilt ihr Vektor und das Flag wird überstimmt (kein Verweigern).",
      "to": "SGLANG_UNEVEN_TOKEN_VECTOR",
      "to_kind": "env",
      "wert": null
@@ -25453,6 +25414,25 @@
      "to": "--d-only",
      "to_kind": "flag",
      "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22724,
+      "zeile_hinweis": 22724
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Im Dual-Layout wird --tp-prefill-max-tokens aus --dual-d-prefill-tokens abgeleitet (X wird 1 plus dieser Wert, für Gruppe D und Front); ein gesetztes --tp-prefill-max-tokens wird dabei ersetzt, nicht verweigert. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "kante": "K100",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Im Dual-Layout wird --tp-prefill-max-tokens aus --dual-d-prefill-tokens abgeleitet (X wird 1 plus dieser Wert, für Gruppe D und Front); ein gesetztes --tp-prefill-max-tokens wird dabei ersetzt, nicht verweigert. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "to": "--dual-d-prefill-tokens",
+     "to_kind": "flag",
+     "wert": null
     }
    ],
    "gain": "Kurze Anfragen laufen sofort auf D ohne Flip.",
@@ -27889,6 +27869,25 @@
      "to": "--tp-prefill-max-tokens",
      "to_kind": "flag",
      "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22724,
+      "zeile_hinweis": 22724
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Im Dual-Layout wird die X-Obergrenze der Front auf 0 (aus) gesetzt; die Schwelle kommt aus --dual-d-prefill-tokens. Ein gesetztes --x-ceiling-tokens wird ersetzt, nicht verweigert. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "kante": "K101",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Im Dual-Layout wird die X-Obergrenze der Front auf 0 (aus) gesetzt; die Schwelle kommt aus --dual-d-prefill-tokens. Ein gesetztes --x-ceiling-tokens wird ersetzt, nicht verweigert. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "to": "--dual-d-prefill-tokens",
+     "to_kind": "flag",
+     "wert": "0"
     }
    ],
    "gain": "X darf sich der Lage anpassen.",
@@ -83770,7 +83769,7 @@
   "uebersprungen_ohne_von": [],
   "verschmolzen": 51,
   "verworfen": 0,
-  "wertbedingt": 19,
+  "wertbedingt": 21,
   "ziel_unbekannt": 0
  },
  "launcher_raise_sites": 97,

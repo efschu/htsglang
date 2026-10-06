@@ -179,6 +179,9 @@ APG_REL = {
     ("--dual-share", "--dual-layout"): "braucht", ("--flip-weights", "--dual-layout"): "abgeleitet_von",
     ("--idle-layout", "--dual-layout"): "abgeleitet_von", ("--dual-layout", "--weg2-d-adopt"): "schliesst_aus",
     ("--rank-kv-ratio", "--rank-tp-ratio"): "braucht",
+    # review fix round 3: the code sets these values itself / the env wins, no raise -> abgeleitet_von (von = the forced/overruled flag, as K44)
+    ("--tp-prefill-max-tokens", "--dual-d-prefill-tokens"): "abgeleitet_von", ("--x-ceiling-tokens", "--dual-d-prefill-tokens"): "abgeleitet_von",
+    ("--d-short-drain-tokens", "--dual-d-prefill-tokens"): "abgeleitet_von", ("--rank-kv-ratio", "SGLANG_UNEVEN_TOKEN_VECTOR"): "abgeleitet_von",
 }
 
 

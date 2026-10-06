@@ -418,7 +418,7 @@ CURATED: Dict[str, Dict[str, object]] = {
     # ---- Dual (launcher.py resolve_dual_layout, argparse :22699-22798)
     "--dual-layout": {
         "kind": "flag", "group": "Dual", "level": "einfach", "planner_derived": False,
-        "text": "DUAL-TP3PP3 (F26, Nutzer 29.09.): BEIDE Gruppen bleiben den ganzen Boot wach, die Front flippt nie. Impliziert --flip-weights resident; P wird nach READY nicht schlafen gelegt, statt dessen wird sein WACH-Fußabdruck gemessen und D danach bemessen (dieselbe PID-Messung wie beim Schlafrest). Das Budget von P selbst senkt man mit --extra-p '--rank-gpu-memory-mib ...' (W100 erlaubt das Senken). Verweigert --weg2-d-adopt on und --idle-layout pp. Standard aus: der Launcher ist byte-identisch.",
+        "text": "DUAL-TP3PP3 (F26, Nutzer 29.09.): BEIDE Gruppen bleiben den ganzen Boot wach, die Front flippt nie. Impliziert --flip-weights resident; P wird nach READY nicht schlafen gelegt, statt dessen wird sein WACH-Fußabdruck gemessen und D danach bemessen (dieselbe PID-Messung wie beim Schlafrest). Das Budget von P selbst senkt man mit --extra-p '--rank-gpu-memory-mib ...' (W100 erlaubt das Senken). Verweigert --weg2-d-adopt on und --idle-layout pp (help=; der Code stellt pp ohne Verweigerung auf tp um, launcher.py:14722). Standard aus: der Launcher ist byte-identisch.",
         "gain": "", "cost": "Kein Flip; verweigert --weg2-d-adopt on; ein gesetztes --idle-layout pp wird auf tp umgestellt (kein Verweigern).",
         "satz_quelle": "launcher.py --dual-layout (help=)", "depends": []},
     "--dual-share": {

@@ -64,7 +64,7 @@ class RealCatalog(unittest.TestCase):
         self.assertEqual(k["kanten_belegt"], 108)
         self.assertEqual(k["uebersprungen_ohne_von"], [])
         self.assertEqual(k["ziel_unbekannt"], 0)
-        self.assertEqual(k["wertbedingt"], 19)
+        self.assertEqual(k["wertbedingt"], 21)
 
     def test_every_catalog_edge_is_a_dependency_with_evidence_and_sentence(self):
         for e in self.edges:
@@ -117,7 +117,7 @@ class RealCatalog(unittest.TestCase):
         d = self.dep("--rank-tp-ratio", "--rank-gpu-memory-mib")    # K08
         self.assertEqual(d["wert"], "auto")
         self.assertTrue(d["belegt"])
-        self.assertEqual(sum(1 for e in self.ent.values() for x in e["depends"] if x.get("wert")), 19)
+        self.assertEqual(sum(1 for e in self.ent.values() for x in e["depends"] if x.get("wert")), 21)
 
     def test_curated_is_not_mutated_by_the_merge(self):
         for c in CU.CURATED.values():
