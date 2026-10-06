@@ -235,6 +235,27 @@ def calibration_class(card) -> Optional[str]:
     return None
 
 
+def arch_twin_class(card) -> Optional[str]:
+    """AP1 1006 (HW-BORROWED by arch): the calibration class a card of NO
+    calibrated class may BORROW a per-class figure from -- the first class of
+    :data:`CALIBRATED_CLASSES` of the SAME compute capability (sm_86 -> RTX3080,
+    sm_120 -> RTX5090). ``None`` when no calibrated class shares the arch (sm_89,
+    unreported cc): there is nothing to borrow, the refusal stays hard.
+
+    This is a NAME for the borrow, never a measurement: every caller that uses
+    it prints the figure as UNMEASURED on this card and passes the value
+    refusal ``HW-UNCALIBRATED`` through ``refusals.refuse_value`` (without
+    ``--force`` it refuses exactly as before). A card that HAS a calibrated
+    class never reaches this function's answer (its own class wins)."""
+    p = props_of(card)
+    if p.cc is None:
+        return None
+    for cls in CALIBRATED_CLASSES:
+        if tuple(cls.cc) == tuple(p.cc):
+            return cls.label
+    return None
+
+
 def class_label(card) -> str:
     """The record-lookup label: the calibration class, else :func:`card_key`."""
     return calibration_class(card) or card_key(card)
