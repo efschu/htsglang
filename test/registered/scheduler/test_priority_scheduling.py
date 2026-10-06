@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import shutil
 import unittest
 from typing import Any, List, Optional, Tuple
 
@@ -21,6 +22,22 @@ register_cuda_ci(est_time=149, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 
+def _no_server_here() -> Optional[str]:
+    """Why this file cannot run where ``sglang`` is not installed, else None.
+
+    It is NOT hermetic: every ``setUpClass`` launches a real server through
+    ``popen_launch_server`` (a ``sglang serve`` subprocess plus a model fetch).
+    Where the ``sglang`` console script is not on PATH it errors in setup
+    (nb14: ``FileNotFoundError: 'sglang'``, 7 setup errors, also alone) -- an
+    environment fact, not a result about priority scheduling. On the CUDA
+    runner it is registered for, the script exists and nothing changes.
+    """
+    if shutil.which("sglang") is None:
+        return "needs the installed `sglang` entry point (popen_launch_server)"
+    return None
+
+
+@unittest.skipIf(_no_server_here() is not None, _no_server_here() or "")
 class TestPriorityScheduling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -230,6 +247,7 @@ class TestPriorityScheduling(CustomTestCase):
         assert e2e_latencies[0] < e2e_latencies[1]
 
 
+@unittest.skipIf(_no_server_here() is not None, _no_server_here() or "")
 class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
     @classmethod
     def setUpClass(cls):

@@ -90,7 +90,14 @@ def _dir_allocated_bytes(path: str, suffix: str = ".bin") -> int:
         for name in filenames:
             if not name.endswith(suffix):
                 continue
-            st = os.stat(os.path.join(dirpath, name))
+            try:
+                st = os.stat(os.path.join(dirpath, name))
+            except FileNotFoundError:
+                # os.walk listed it, then its owner evicted it before we got
+                # here (TOCTOU, nb14: n0017_K.bin in a loaded chunk run). A file
+                # that is gone is not on disk: it counts for nothing -- the
+                # same answer a scan one tick later would have given.
+                continue
             blocks = getattr(st, "st_blocks", None)
             total += st.st_size if blocks is None else max(int(blocks) * 512, st.st_size)
     return total

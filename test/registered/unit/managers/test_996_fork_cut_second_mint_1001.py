@@ -113,6 +113,17 @@ def adder(monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
     monkeypatch.delenv("SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL", raising=False)
     monkeypatch.delenv("SGLANG_WEG2_FORM", raising=False)
+    # schedule_policy reads the group ONCE per process (_weg2_chunk_admit /
+    # _weg2_park_on cache their verdict in module globals).  With
+    # SGLANG_WEG2_GROUP=P that verdict is True and it outlives this test's
+    # monkeypatch: every later file in the same pytest process that builds a
+    # real PrefillAdder then prices the next CHUNK instead of the whole extend,
+    # the NO_TOKEN gate falls away and the add is refused OTHER (nb14:
+    # test_nf_form_a_admission_follow_h105 4 red in a chunk run, 13/13 green
+    # alone).  Plain assignment, not monkeypatch: the undo of a monkeypatch
+    # would put back whatever a polluter left before this test.
+    sp._WEG2_CHUNK_ADMIT = None
+    sp._WEG2_PARK_ON = None
     sp._SECOND_CONTINUATION_REFUSALS.clear()
     running = MagicMock()
     running.reqs = []
@@ -129,6 +140,8 @@ def adder(monkeypatch):
     )
     yield a
     sp._SECOND_CONTINUATION_REFUSALS.clear()
+    sp._WEG2_CHUNK_ADMIT = None  # see above: never leave the P verdict behind
+    sp._WEG2_PARK_ON = None
 
 
 def _admit(adder, req):

@@ -35,11 +35,13 @@ first). RED on 9417507cd2: the host refuses, the worker admits. GREEN with H105.
 
 from __future__ import annotations
 
+import os
 import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.managers import schedule_policy as sp
 from sglang.srt.managers import tp_match_floor as m
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -54,6 +56,30 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 FILL = 82081
 HOST_HIT = 75264
 TP0_AVAILABLE = 80000  # below the host's price (82081 + 64 + 1), far above a worker's (6817 + 65)
+
+
+def _isolate_weg2_group(testcase):
+    """These cases price the WHOLE extend (82081 > TP0_AVAILABLE) at the NO_TOKEN
+    gate.  That holds only in a process whose WEG2 group reads as "no chunk
+    admission": ``schedule_policy._weg2_chunk_admit`` / ``_weg2_park_on`` read
+    SGLANG_WEG2_GROUP ONCE and cache the verdict in module globals.  A file that
+    ran earlier in the same pytest process with the group set to P (e.g.
+    test_996_fork_cut_second_mint_1001) leaves ``True`` behind; the gate then
+    prices the next CHUNK (4096 < 80000), NO_TOKEN falls away and the add is
+    refused OTHER by the #996 second-continuation sperre (nb14 chunk run: 4 red,
+    13/13 green alone).  Belt and braces next to the 996 fixture's own reset."""
+    env = patch.dict(os.environ)
+    env.start()
+    testcase.addCleanup(env.stop)
+    os.environ.pop("SGLANG_WEG2_GROUP", None)
+    sp._WEG2_CHUNK_ADMIT = None
+    sp._WEG2_PARK_ON = None
+
+    def _reset():
+        sp._WEG2_CHUNK_ADMIT = None
+        sp._WEG2_PARK_ON = None
+
+    testcase.addCleanup(_reset)
 
 
 def _tree_cache():
@@ -163,6 +189,7 @@ def _install(adder, sched, tp_rank):
 
 class DprAdmissionIsTheHostsTest(unittest.TestCase):
     def setUp(self):
+        _isolate_weg2_group(self)
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     def _run_dpr(self):
@@ -313,6 +340,7 @@ class GateCallCountTest(unittest.TestCase):
     stops by NAME at the next broadcast -- never a hang, never a guess."""
 
     def setUp(self):
+        _isolate_weg2_group(self)
         self.assertTrue(hasattr(m, "form_a_extend_set_check"), "H105 absent")
 
     def test_worker_skips_the_rid_the_host_gates(self):
@@ -368,6 +396,7 @@ class NoStarvationTest(unittest.TestCase):
     agree in every pass, and the wait is on the log with both prices."""
 
     def setUp(self):
+        _isolate_weg2_group(self)
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         m._ADMISSION_WAIT.clear() if hasattr(m, "_ADMISSION_WAIT") else None
 
