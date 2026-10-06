@@ -355,6 +355,8 @@ from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.weg2 import tail_handoff
 from sglang.srt.weg2 import p_intake as _p_intake
 from sglang.srt.mem_cache.common import (
+    cap_above_evictable,  # F1 (nf-next-1006-01)
+    publish_cap_blind_gap,  # F1 (nf-next-1006-01)
     release_admission_acquired_mamba_slot,
     evict_from_tree_cache,
     maybe_cache_unfinished_req,
@@ -10352,6 +10354,14 @@ class Scheduler(
             # path. The host and mamba floors are a different axis and keep
             # their None; only the evict floor is being made total here.
             self._publish_uniform_evict_floor(local_avail)
+            # F1 (nf-next-1006-01): nothing is pinned on one rank; clear what a
+            # previous (TP) layout published so a flip cannot read it
+            publish_cap_blind_gap(
+                getattr(self, "tree_cache", None),
+                allocator=getattr(self, "token_to_kv_pool_allocator", None),
+                pin_admission=False, min_avail=0, min_admission=0,
+                local_evict_full=0, local_cap_above=0,
+            )
             # SF (b23 #1004): on pp > 1 this "group min" is THIS rank's own
             # value and the ranks that must agree are not in the group; the
             # load-back reads the mark and loads in the same pass instead of
@@ -10417,6 +10427,8 @@ class Scheduler(
 
         pin_admission = uneven_dcp_active(self.server_args.dcp_size)
         local_admission = 0
+        local_evict_full = 0
+        local_cap_above = 0
         if pin_admission:
             tree = self.tree_cache
             fe = getattr(tree, "full_evictable_size", None)
@@ -10425,6 +10437,18 @@ class Scheduler(
             # `swa_evictable_size` instead. SWA models route to
             # UnifiedRadixCache and are out of this path's reach.
             local_evict = int(fe() if fe is not None else tree.evictable_size())
+            # F1 (nf-next-1006-01): the evictable tokens above the engaged
+            # residency cap are not fundable (the pool takes every id they free
+            # straight back). They go into THIS rank's vote, through the MIN this
+            # reduce already takes -- no new site, no new payload element, no new
+            # guard -- so every rank admits against the same group number.
+            local_evict_full = local_evict
+            local_cap_above = cap_above_evictable(
+                tree,
+                allocator=getattr(self, "token_to_kv_pool_allocator", None),
+                page_size=int(getattr(self, "page_size", 1) or 1),
+            )
+            local_evict = local_evict - local_cap_above
             local_admission = local_avail + local_evict
         # #616g: `-local_avail` rides the SAME reduce so one MIN yields both
         # the group minimum and (negated) the group MAXIMUM. The pair is what
@@ -10881,6 +10905,16 @@ class Scheduler(
         mamba_at = 5 if pin_admission else 4
         self._publish_uniform_evict_floor(
             int(t[0].item()), max_avail=-int(t[max_avail_at].item())
+        )
+        # F1 (nf-next-1006-01): the cap-blind gap, from the REDUCED values only.
+        publish_cap_blind_gap(
+            getattr(self, "tree_cache", None),
+            allocator=getattr(self, "token_to_kv_pool_allocator", None),
+            pin_admission=pin_admission,
+            min_avail=int(t[0].item()),
+            min_admission=int(t[1].item()) if pin_admission else 0,
+            local_evict_full=local_evict_full,
+            local_cap_above=local_cap_above,
         )
         self._publish_uniform_host_floor(
             int(t[host_at].item()), max_host_avail=-int(t[host_at + 1].item())

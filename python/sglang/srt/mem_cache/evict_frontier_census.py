@@ -226,3 +226,91 @@ def log_census(c: Dict[str, object], request: int, got_before: int, got_after: i
         int(c["device_child_tokens"]), int(c["leaves_before"]), int(c["leaves_after"]),
         int(c["stale_added"]), c["aux_locked_ids"], int(c["nodes"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# F1 (nf-next-1006-01): evictable tokens ABOVE the engaged residency cap
+# ---------------------------------------------------------------------------
+#: allocator attribute the stage cap (``KvRowCap``) is kept on (d_seat_vram.py
+#: ``_engage_kv_cap``); the only cap setter on the NF D boot.
+STAGE_CAP_ATTR = "_weg2_kv_stage_cap"
+#: cache attribute: the last scan, ``(cap_pages, monotonic_t, value)``.
+_ABOVE_MEMO_ATTR = "_ef_cap_above_memo"
+#: a repeat scan under the SAME cap is reused for this long (seconds). The
+#: scan walks every tree node and reads one device tensor; the number only
+#: falls while a shrink is pending (evictions peel the high leaves) and a cap
+#: change always rescans, so a reused value is stale on the HIGH side (the
+#: admission parks a little longer, never admits more).
+_ABOVE_TTL_S = 0.25
+
+
+def engaged_cap_pages(allocator):
+    """The engaged residency cap of ``allocator`` in PAGES (the unit of its
+    free-list ids), or None when no cap is engaged (then nothing is above)."""
+    cap = getattr(allocator, STAGE_CAP_ATTR, None) if allocator is not None else None
+    if cap is None:
+        return None
+    try:
+        if not bool(cap.engaged) or cap.cap is None:
+            return None
+        return int(cap.cap)
+    except Exception:  # noqa: BLE001 - a stand-in without the cap protocol has none
+        return None
+
+
+def above_cap_tokens(cache, base_ct, cap_pages: int, page_size: int) -> int:
+    """FULL-evictable device tokens whose slot lies ABOVE page id ``cap_pages``.
+
+    The pool hands out only free ids at or below the cap (``KvRowCap`` pulls
+    every freed id above it straight back out of the free list), so a leaf the
+    peel frees up there pays the TREE and the POOL nothing. A token slot ``s``
+    belongs to page ``s // page_size``; page ids are 1-based and a page is above
+    the cap when its id is greater than ``cap_pages`` (``free_tokens_below``,
+    d_seat_vram.py, counts ``ids <= cap``).
+
+    One scan over the unlocked FULL nodes (the census' own definition of
+    evictable) and ONE device read. Rank-LOCAL by construction: slot ids are the
+    rank's own, which is why the caller pins it through the group MIN."""
+    import torch
+
+    root = cache.root_node
+    vals = []
+    for n in cache._collect_all_nodes():
+        if n is root or getattr(n, "evicted", False):
+            continue
+        cd = n.component_data[base_ct]
+        if cd.value is None or cd.lock_ref > 0 or len(cd.value) == 0:
+            continue
+        vals.append(cd.value)
+    if not vals:
+        return 0
+    flat = torch.cat([v if isinstance(v, torch.Tensor) else torch.as_tensor(v, dtype=torch.int64)
+                      for v in vals])
+    lim = (int(cap_pages) + 1) * max(1, int(page_size))
+    return int((flat >= lim).sum().item())
+
+
+def cap_above_tokens_memo(cache, base_ct, allocator, page_size: int) -> int:
+    """:func:`above_cap_tokens` for the engaged cap of ``allocator`` (0 without
+    one), rescanned on a cap change or after ``_ABOVE_TTL_S``. Never raises: a
+    failed scan reads 0 = the pre-F1 behaviour (the guard then counts what it
+    always counted)."""
+    import time
+
+    cap = engaged_cap_pages(allocator)
+    if cap is None:
+        return 0
+    now = time.monotonic()
+    memo = getattr(cache, _ABOVE_MEMO_ATTR, None)
+    if memo is not None and memo[0] == cap and now - memo[1] < _ABOVE_TTL_S:
+        return memo[2]
+    try:
+        val = above_cap_tokens(cache, base_ct, cap, page_size)
+    except Exception:  # noqa: BLE001 - an admission input must not raise
+        logger.warning("CAP-BLIND-ADMIT scan failed; counted as 0 above the cap", exc_info=True)
+        val = 0
+    try:
+        setattr(cache, _ABOVE_MEMO_ATTR, (cap, now, val))
+    except Exception:  # noqa: BLE001
+        pass
+    return val

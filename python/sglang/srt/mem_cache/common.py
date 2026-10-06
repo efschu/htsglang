@@ -793,7 +793,9 @@ def fundable_extend_tokens(tree_cache) -> int:
         evictable = deliverable_evictable_or(tree_cache, tree_cache.evictable_size)
     except Exception:  # noqa: BLE001 - a cache without the accessor evicts none
         evictable = 0
-    return max(0, avail) + max(0, evictable)
+    # F1 (nf-next-1006-01): minus the group's cap-blind gap (0 unless a residency
+    # cap is engaged AND the iteration's reduce published one)
+    return max(0, max(0, avail) + max(0, evictable) - cap_blind_gap_published(tree_cache))
 
 
 def published_fundable_floor(tree_cache) -> Optional[int]:
@@ -869,6 +871,148 @@ def deliverable_evictable_or(tree_cache, fallback) -> int:
         if isinstance(v, int) and not isinstance(v, bool):
             return v
     return int(fallback())
+
+
+#: F1 (nf-next-1006-01): what the scheduler's iteration reduce publishes on the
+#: tree cache when a residency cap (``KvRowCap``) is engaged and the ranks'
+#: admission is pinned to the group MIN (uneven DCP). Absent / 0 everywhere
+#: else, which is the whole byte-for-byte argument: with neither attribute set
+#: every reader below returns exactly what it returned before.
+#:
+#: ``CAP_ABOVE_ATTR``: THIS rank's evictable tokens above the cap (rank-local;
+#: it also went into this rank's vote, so it cancels in ``dcp_avail_deficit``).
+#: ``CAP_GAP_ATTR``: the GROUP's gap ``floor - (MIN admission - evictable)``,
+#: the same number on every rank (it is built only from the reduced values).
+CAP_ABOVE_ATTR = "uniform_cap_above_tokens"
+CAP_GAP_ATTR = "uniform_cap_blind_gap"
+
+
+def _published_nonneg_int(tree_cache, attr: str) -> int:
+    v = getattr(tree_cache, attr, 0) if tree_cache is not None else 0
+    if isinstance(v, bool) or not isinstance(v, int):
+        return 0
+    return max(0, v)
+
+
+def cap_above_published(tree_cache) -> int:
+    """This iteration's evictable tokens above the engaged cap on THIS rank (0
+    when none was published)."""
+    return _published_nonneg_int(tree_cache, CAP_ABOVE_ATTR)
+
+
+def cap_blind_gap_published(tree_cache) -> int:
+    """The group-uniform gap ``fundable_extend_tokens`` is cut by (0 when none
+    was published)."""
+    return _published_nonneg_int(tree_cache, CAP_GAP_ATTR)
+
+
+def cap_above_evictable(tree_cache, *, allocator, page_size: int) -> int:
+    """F1 (nf-next-1006-01): THIS rank's DELIVERABLE evictable tokens whose slots
+    lie above the engaged residency cap, 0 when no cap is engaged.
+
+    Rank-local (the ids are this rank's own), read once per iteration BEFORE the
+    scheduler's reduce, so the same number goes into the vote and into the adder
+    (:func:`publish_cap_blind_gap`). Never raises: a failed read is 0 = the
+    admission counts what it counted before F1."""
+    from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+    try:
+        if _ef.engaged_cap_pages(allocator) is None:
+            return 0
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            BASE_COMPONENT_TYPE,
+        )
+
+        above = _ef.cap_above_tokens_memo(
+            tree_cache, BASE_COMPONENT_TYPE, allocator, int(page_size)
+        )
+        if above <= 0:
+            return 0
+        fe = getattr(tree_cache, "full_evictable_size", None)
+        deliverable = deliverable_evictable_or(
+            tree_cache, fe if fe is not None else tree_cache.evictable_size
+        )
+        return max(0, min(int(above), int(deliverable)))
+    except Exception:  # noqa: BLE001 - an admission input must not raise
+        return 0
+
+
+def publish_cap_blind_gap(
+    tree_cache,
+    *,
+    allocator,
+    pin_admission: bool,
+    min_avail: int,
+    min_admission: int,
+    local_evict_full: int,
+    local_cap_above: int,
+) -> None:
+    """F1 (nf-next-1006-01): publish on the tree cache what the cap-aware
+    admission reads after this iteration's reduce.
+
+    ``CAP_ABOVE_ATTR`` (rank-local: the number that went into this rank's vote,
+    so it cancels in ``dcp_avail_deficit``) and ``CAP_GAP_ATTR`` = ``floor + E -
+    MIN admission``, the group's cut of :func:`fundable_extend_tokens`. The gap
+    is built from REDUCED values only, so it is the same on every rank; it is 0
+    unless a residency cap is engaged on a pinned (uneven-DCP) group, and 0 when
+    no rank has evictable tokens above the cap (MIN admission then equals
+    ``floor + E``). NO collective is taken here."""
+    if tree_cache is None:
+        return
+    from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+    gap = 0
+    if pin_admission and _ef.engaged_cap_pages(allocator) is not None:
+        gap = max(0, int(min_avail) + int(local_evict_full) - int(min_admission))
+    try:
+        setattr(tree_cache, CAP_ABOVE_ATTR, int(local_cap_above) if pin_admission else 0)
+        setattr(tree_cache, CAP_GAP_ATTR, int(gap))
+    except Exception:  # noqa: BLE001 - a tree that takes no attribute reads 0
+        pass
+
+
+def deliverable_evictable_cap_aware_or(tree_cache, fallback) -> int:
+    """F1 (nf-next-1006-01): :func:`deliverable_evictable_or` minus the
+    evictable tokens whose slots lie above the engaged residency cap -- the
+    pool takes every id freed up there straight back, so counting them as
+    fundable is what let the cand3 admission see 832 + 19200 while the pool
+    delivered 64 (D.log 05.10. 23:45:03Z). Equal to the plain count whenever
+    nothing was published (no cap engaged, no pin): byte-identical there."""
+    v = deliverable_evictable_or(tree_cache, fallback)
+    above = cap_above_published(tree_cache)
+    if above <= 0:
+        return v
+    return v - min(above, max(0, v))
+
+
+#: F1 instrument: one line per second per process (= per rank).
+_CAP_BLIND_LOG_EVERY_S = 1.0
+_cap_blind_last_log = [0.0]
+
+
+def note_cap_blind_admit(
+    *, rid, avail: int, evictable_reported: int, above_cap: int, grant: int
+) -> bool:
+    """``WEG2 CAP-BLIND-ADMIT``: an admission was cut because evictable tokens
+    sit above the engaged cap. Called only where the cut happened and
+    ``above_cap > 0``; at most one line per second per rank (the early-warning
+    counter of nf-next-1006-02/03). Returns whether a line was written."""
+    import time
+
+    if int(above_cap) <= 0:
+        return False
+    now = time.monotonic()
+    if now - _cap_blind_last_log[0] < _CAP_BLIND_LOG_EVERY_S:
+        return False
+    _cap_blind_last_log[0] = now
+    logger.warning(
+        "WEG2 CAP-BLIND-ADMIT rid=%s avail=%d evictable_reported=%d above_cap=%d grant=%d "
+        "(the admission did not count the above_cap evictable tokens: their slot ids lie "
+        "above the engaged residency cap, so the pool would take every id they free straight "
+        "back; the request was cut to what the ids below the cap can pay)",
+        rid, int(avail), int(evictable_reported), int(above_cap), int(grant),
+    )
+    return True
 
 
 def chunk_tokens_the_pool_can_fund(

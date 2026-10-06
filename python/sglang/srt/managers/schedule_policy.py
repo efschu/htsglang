@@ -849,6 +849,12 @@ def _weg2_park_on() -> bool:
 
 
 from sglang.srt.mem_cache.common import deliverable_evictable_or  # ED
+from sglang.srt.mem_cache.common import (  # F1
+    cap_above_published,
+    cap_blind_gap_published,
+    deliverable_evictable_cap_aware_or,
+    note_cap_blind_admit,
+)
 
 
 def _h105c_follow(adder, req, lb_extent, follow, new_indices) -> torch.Tensor:
@@ -1319,6 +1325,71 @@ class PrefillAdder:
                 self.lifetime_refusal = (str(req.rid), int(total_tokens), int(budget))
             except Exception:  # noqa: BLE001 -- bookkeeping on every group's gate path (review 1140, 3c)
                 pass
+        self._note_cap_blind_refusal(req, total_tokens, budget)
+
+    def _cap_lifetime_waiver(self, total_tokens, born_input_tokens, rem_total) -> bool:
+        """F1 (nf-next-1006-01): the cap-aware budget guards the IMMEDIATE
+        allocation (extend + load-back + page + mamba gap = ``born_input_tokens``);
+        the decode reserve (``max_new``) is future growth, which the D-MEM-SCHED
+        tick prices (``_room_ok``) and lifts for. Counting it against the
+        cap-aware number would park a request the pool under the cap can serve
+        for as long as the tree holds evictable tokens above the cap (nothing
+        lifts a cap for a request whose immediate demand fits). So the lifetime
+        gate keeps the pre-F1 (cap-blind) budget = this one + the group's gap.
+        The gap is a reduced value, the same on every rank; 0 without an engaged
+        cap and without the uneven-DCP pin -> False, the gate is as it was."""
+        try:
+            gap = cap_blind_gap_published(self.tree_cache)
+            if gap <= 0:
+                return False
+            return int(born_input_tokens) < int(rem_total) and int(total_tokens) < int(rem_total) + gap
+        except Exception:  # noqa: BLE001 -- the gate may not raise on a stand-in
+            return False
+
+    def _note_cap_blind_chunk(self, req: Req, fundable: int, grant: int) -> None:
+        """F1 instrument (nf-next-1006-01) for the CHUNKED gate: the grant was
+        cut below what the cap-blind count would have granted. Silent unless a
+        residency cap is engaged with evictable tokens above it. Bookkeeping
+        only: no admission decision reads it."""
+        try:
+            from sglang.srt.mem_cache.common import chunk_tokens_the_pool_can_fund
+
+            gap = cap_blind_gap_published(self.tree_cache)
+            above = cap_above_published(self.tree_cache)
+            if gap <= 0 and above <= 0:
+                return
+            blind = chunk_tokens_the_pool_can_fund(
+                int(fundable) + gap, self.page_size, self.rem_chunk_tokens
+            )
+            if grant >= blind:
+                return
+            note_cap_blind_admit(
+                rid=req.rid,
+                avail=int(self.token_to_kv_pool_allocator.available_size()),
+                evictable_reported=int(self.tree_cache.full_evictable_size()),
+                above_cap=above if above > 0 else gap,
+                grant=int(grant),
+            )
+        except Exception:  # noqa: BLE001 -- an instrument may not raise on the gate path
+            pass
+
+    def _note_cap_blind_refusal(self, req: Req, total_tokens, budget) -> None:
+        """F1 instrument for the NEW-request gate: the lifetime budget refused
+        a request the cap-blind budget (this one plus the tokens above the cap)
+        would have admitted. Bookkeeping only."""
+        try:
+            above = cap_above_published(self.tree_cache)
+            if above <= 0 or int(total_tokens) >= int(budget) + above:
+                return
+            note_cap_blind_admit(
+                rid=req.rid,
+                avail=int(self.token_to_kv_pool_allocator.available_size()),
+                evictable_reported=int(self.tree_cache.full_evictable_size()),
+                above_cap=above,
+                grant=int(budget),
+            )
+        except Exception:  # noqa: BLE001 -- an instrument may not raise on the gate path
+            pass
 
     def released_by_leaving(self, req: Req) -> int:
         """Q-702: what the lifetime budget regains when the RUNNING request
@@ -1353,7 +1424,7 @@ class PrefillAdder:
             # (mamba-locked nodes and their ancestors are counted but unpeelable).
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + deliverable_evictable_or(self.tree_cache, self.tree_cache.full_evictable_size)
+                + deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)
             )
         else:
             available_and_evictable = (
@@ -1415,7 +1486,7 @@ class PrefillAdder:
             # (mamba-locked nodes and their ancestors are counted but unpeelable).
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + deliverable_evictable_or(self.tree_cache, self.tree_cache.full_evictable_size)
+                + deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)
             )
         else:
             available_and_evictable = (
@@ -2292,6 +2363,7 @@ class PrefillAdder:
                 grant = chunk_tokens_the_pool_can_fund(
                     fundable, self.page_size, self.rem_chunk_tokens
                 )
+                self._note_cap_blind_chunk(req, fundable, grant)
                 if grant <= 0:
                     req.set_extend_range(
                         len(req.prefix_indices), len(req.prefix_indices)
@@ -2652,7 +2724,9 @@ class PrefillAdder:
         _fa_follow = self.form_a_admission_follow
         _gate = None
         _rem_total = self.rem_total_tokens
-        if total_tokens >= _rem_total:
+        if total_tokens >= _rem_total and not self._cap_lifetime_waiver(
+            total_tokens, born_input_tokens, _rem_total
+        ):
             # Lifetime doesn't fit VRAM: wedge -- UNLESS Prefill-Spill can admit
             # it born-spilled (input transiently fits, a host region is free),
             # or -- PS2, the strict complement -- born-spilled DEEP (not even
@@ -2687,7 +2761,13 @@ class PrefillAdder:
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             _rem_total = self.rem_total_tokens if _gate is None else None
-            if _gate is None and total_tokens >= _rem_total:
+            if (
+                _gate is None
+                and total_tokens >= _rem_total
+                and not self._cap_lifetime_waiver(
+                    total_tokens, born_input_tokens, _rem_total
+                )
+            ):
                 # Prefill-Spill: a prompt already admitted born-spilled at the
                 # pre-lock gate stays admitted as long as its input still fits
                 # the (possibly shrunk) device budget; otherwise wedge as usual.
