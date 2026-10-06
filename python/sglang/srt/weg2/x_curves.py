@@ -14,11 +14,12 @@ User decisions (binding, AUFTRAG-x-kurven-1006):
 4. (CHANGE 06.10. ~11:00Z, replaces the first decision 4) ``--x-mode`` has
    ONLY ``fixed`` and ``curve`` -- "es soll kein live geben und kein
    curve-capped". Without ``--x-mode`` the front behaves exactly as before
-   the flag (not changed silently; see :data:`X_MODE_LIVE`). Under ``curve``
-   D's W50 riegel stays a hard bound: the launcher sizes it to the curves'
-   envelope and the front never routes above it; a MANUAL ceiling beside
-   ``curve`` is refused (W195) -- whether it should be allowed is an open
-   user decision.
+   the flag (not changed silently; see :data:`X_MODE_LIVE`).
+5. (NF seat, user decision 06.10.) ``--x-ceiling-tokens`` MAY be set beside
+   ``--x-mode curve``: the manual ceiling clamps X from above, the curve
+   decides below it; D's W50 riegel stays on the LOWER of the curves'
+   envelope and the manual ceiling (never below the start X, H84). Without
+   the ceiling everything is as before (riegel = envelope).
 
 This module is PURE (msgspec + stdlib): the schema, the loader with its named
 refusals, the identity check, the interpolation, :func:`x_from_curves` and the
@@ -93,9 +94,6 @@ W_X_CURVES_FOREIGN = "W192 Weg2XCurvesForeign"
 W_X_CURVE_DEPTH_BEYOND = "W193 Weg2XCurveDepthBeyond"
 #: ``--x-curves`` / ``--x-curves-beyond`` given while the mode reads no curve.
 W_X_CURVES_WITHOUT_MODE = "W194 Weg2XCurvesWithoutCurveMode"
-#: ``--x-ceiling-tokens`` given under ``--x-mode curve``: D's riegel is the
-#: curves' envelope there; a manual ceiling beside it is an OPEN user decision.
-W_X_CEILING_UNCAPPED_MODE = "W195 Weg2XCeilingInCurveMode"
 #: an unknown ``--x-mode`` (incl. the removed ``live`` / ``curve-capped``)
 #: or ``--x-curves-beyond`` value.
 W_X_MODE_UNKNOWN = "W196 Weg2XModeUnknown"
@@ -107,7 +105,7 @@ W_X_MODE_IN_DUAL = "W197 Weg2XModeInDualLayout"
 
 REFUSAL_CODES: Tuple[str, ...] = (
     W_X_CURVES_MISSING, W_X_CURVES_MALFORMED, W_X_CURVES_FOREIGN, W_X_CURVE_DEPTH_BEYOND,
-    W_X_CURVES_WITHOUT_MODE, W_X_CEILING_UNCAPPED_MODE, W_X_MODE_UNKNOWN, W_X_MODE_IN_DUAL,
+    W_X_CURVES_WITHOUT_MODE, W_X_MODE_UNKNOWN, W_X_MODE_IN_DUAL,
 )
 
 DEPTH_INTERP_LINEAR = "linear"
@@ -589,11 +587,6 @@ def _check_mode_words(mode: Optional[str], curves_path: Optional[str],
             f"silently. Use --x-mode curve, or drop the curve flags"))
     if m in CURVE_MODES and not curves_path:
         raise XCurvesRefused(W_X_CURVES_MISSING, f"--x-mode {m} without --x-curves <file>")
-    if m == X_MODE_CURVE and ceiling > 0:
-        raise XCurvesRefused(W_X_CEILING_UNCAPPED_MODE, (
-            f"--x-ceiling-tokens {ceiling} under --x-mode curve: D's W50 riegel is sized to the "
-            f"curves' envelope there, and a manual ceiling beside the curve is an open user "
-            f"decision (curve-capped was removed 06.10.). Drop the flag"))
     return m
 
 
@@ -619,7 +612,8 @@ def resolve_launch(*, mode: Optional[str], curves_path: Optional[str], beyond: O
 
     ``ceiling_for_d`` is what the launcher hands :func:`resolve_x_ceiling`:
     the flag unchanged, except under ``curve`` where D's riegel is the
-    curves' envelope (a flag beside it is refused, W195)."""
+    curves' envelope under the manual ceiling (user 06.10.: the LOWER of the
+    two; the ceiling clamps X from above, the curve decides below it)."""
     if dual:
         refuse_in_dual(mode=mode, curves_path=curves_path, beyond=beyond)
     ceiling = int(ceiling_flag or 0)
@@ -635,19 +629,30 @@ def resolve_launch(*, mode: Optional[str], curves_path: Optional[str], beyond: O
                            " [x-mode=fixed: no live re-solve -- the front's X stays the start X]")
     curves = load(curves_path)
     ident = check_identity(curves, model=model, form=form, hardware=hardware)
-    env = x_envelope(curves)
+    env_free = x_envelope(curves)
+    cap = ceiling if ceiling > 0 else None
+    env = x_envelope(curves, cap=cap)
     ceiling_for_d = env
+    if cap is None:
+        cap_txt = "no manual ceiling (--x-ceiling-tokens unset)"
+    else:
+        cap_txt = (f"manual ceiling --x-ceiling-tokens {ceiling} "
+                   + ("BINDS" if ceiling < env_free else "does not bind")
+                   + f" (curves' own envelope {env_free})")
     line = (f"X MODE: --x-mode {m} --x-curves {os.path.abspath(str(curves_path))} "
             f"--x-curves-beyond {beyond or BEYOND_CLAMP} -- {describe(curves)} {ident}; X PER "
             f"REQUEST from the D/P prefill curves and the flip price, k = 1 + requests queued for "
-            f"P; envelope X={env} (lone request, max over the measured depths); D's W50 riegel = "
-            f"{max(int(x_tokens), ceiling_for_d)} (the envelope, never below the start X): the hard "
-            f"bound no per-request X crosses; no live X samples, no re-solve")
+            f"P; {cap_txt}; envelope X={env} (lone request, max over the measured depths, under the "
+            f"ceiling); D's W50 riegel = {max(int(x_tokens), ceiling_for_d)} (the LOWER of envelope "
+            f"and ceiling, never below the start X): the hard bound no per-request X crosses; no "
+            f"live X samples, no re-solve")
     prov = (f"; x-mode={m} curves={os.path.basename(str(curves_path))} "
-            f"source={curves.identity.source} envelope X={env} (the start X above is the "
-            f"X-SOLO band floor only)")
+            f"source={curves.identity.source} envelope X={env}"
+            + ("" if cap is None else f" ceiling={ceiling}")
+            + " (the start X above is the X-SOLO band floor only)")
     note = (f" [x-mode={m}: no live re-solve -- 'the live X' above is the per-request curve X; "
-            f"this ceiling is the curves' envelope, set by the launcher, not a flag]")
+            + ("this ceiling is the curves' envelope, set by the launcher, not a flag]" if cap is None
+               else f"this ceiling is min(envelope {env_free}, --x-ceiling-tokens {ceiling})]"))
     return XModeLaunch(m, True, int(ceiling_for_d), argv, line, prov, note)
 
 
@@ -662,12 +667,14 @@ def describe(curves: XCurves) -> str:
             f"reach depth {reach_depth(curves)}]")
 
 
-def verdict_note(*, mode: str, verdict: XCurveVerdict, source: str) -> str:
+def verdict_note(*, mode: str, verdict: XCurveVerdict, source: str,
+                 cap: Optional[int] = None) -> str:
     """The ROUTE-VERDICT suffix of a curve-mode arrival (instrument text
-    names the mode, the curve source and THIS request's X)."""
+    names the mode, the ceiling in force, the curve source and THIS
+    request's X)."""
     notes = ",".join(verdict.notes) or "none"
     return (f"; x_mode={mode} X_req={verdict.x} (curve {verdict.x_curve}, {verdict.why}, "
-            f"clamp={verdict.clamp}) depth={verdict.depth}"
+            f"clamp={verdict.clamp}, ceiling={cap if cap else 'none'}) depth={verdict.depth}"
             + (f"->{verdict.depth_used}" if verdict.depth_used != verdict.depth else "")
             + f" k={verdict.k:g} price={verdict.price_s:.2f}s notes={notes} curves={source}")
 
@@ -752,6 +759,6 @@ def front_setup(*, mode: Optional[str], curves_path: Optional[str], beyond: Opti
     source = f"{os.path.basename(str(curves_path))}@{curves.identity.source}"
     line = (f"WEG2 X MODE {m}: X PER REQUEST from {os.path.abspath(str(curves_path))} "
             f"{describe(curves)} {ident}; cap={cap} (D's W50 riegel: --x-ceiling-tokens as the "
-            f"launcher sizes it to the envelope, else the start X) envelope X={env} (the boot-level X: lone request, max over the measured "
+            f"launcher sets it = min(envelope, manual ceiling), else the start X) envelope X={env} (the boot-level X: lone request, max over the measured "
             f"depths); beyond the reach: {pol}; no live X samples, no re-solve")
     return XFrontSetup(m, curves, source, pol, cap, env, line)

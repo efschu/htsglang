@@ -13,8 +13,10 @@ The user's decisions this file pins:
   are refused by name (W196). No flag = today's front and launcher byte for
   byte (what the unflagged default should become is the user's call). Under
   ``curve`` D's W50 riegel = the curves' envelope, a hard bound no request X
-  crosses; a manual ``--x-ceiling-tokens`` beside it is refused (W195) -- an
-  open user decision, not decided here;
+  crosses;
+* user decision 06.10. (NF seat): ``--x-ceiling-tokens`` MAY stand beside
+  ``curve`` -- it clamps X from above, the curve decides below it, D's riegel
+  is the LOWER of envelope and ceiling (was W195 before);
 * refusals by name (W190..W196), no silent fallback, no silent extrapolation.
 
 NOTE on the monotony the Auftrag's test list states ("mehr offene Requests ->
@@ -285,7 +287,6 @@ def test_no_flag_is_the_live_mode_with_nothing_added():
     (dict(mode="curve-capped", curves_path="x.json"), xc.W_X_MODE_UNKNOWN),     # removed 06.10.
     (dict(mode="live"), xc.W_X_MODE_UNKNOWN),                                  # removed 06.10.
     (dict(mode="curve", curves_path="/nonexistent/x.json"), xc.W_X_CURVES_MISSING),
-    (dict(mode="curve", curves_path="x.json", ceiling_flag=CEILING), xc.W_X_CEILING_UNCAPPED_MODE),
     (dict(mode="adaptive"), xc.W_X_MODE_UNKNOWN),
 ])
 def test_launch_words_are_refused_by_name(kw, code):
@@ -442,6 +443,41 @@ def test_the_route_site_and_the_verdict_line_are_wired():
     assert "self._x_for_flip(1 + self._x_riders(), rid, \"route\")" not in src
 
 
+
+# ------------------------------------------- user decision 06.10.: manual ceiling
+
+
+def test_a_manual_ceiling_beside_curve_clamps_x_and_sets_ds_riegel_to_the_lower(tmp_path):
+    """Red before: W195 refused --x-ceiling-tokens under --x-mode curve. Now the
+    ceiling clamps X from above, the curve decides below it, and D's W50 riegel
+    is the LOWER of the curves' envelope and the ceiling."""
+    path = _write(tmp_path, _curves())
+    env_free = xc.x_envelope(_curves())
+    assert START_X < 4500 < env_free
+    binds = _resolve(mode="curve", curves_path=path, ceiling_flag=4500)
+    assert binds.ceiling_for_d == 4500
+    assert "manual ceiling --x-ceiling-tokens 4500 BINDS" in binds.line
+    assert "ceiling=4500" in binds.provenance and "min(envelope" in binds.ceiling_note
+    loose = _resolve(mode="curve", curves_path=path, ceiling_flag=CEILING)
+    assert loose.ceiling_for_d == env_free and "does not bind" in loose.line
+    free = _resolve(mode="curve", curves_path=path)
+    assert free.ceiling_for_d == env_free and "no manual ceiling" in free.line
+    d_x, front_c, _ = L.resolve_x_ceiling(binds.ceiling_for_d, START_X)
+    assert d_x == front_c == 4500
+
+
+def test_the_front_under_a_manual_ceiling_names_it_on_the_route_verdict(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_WEG2_FORM", FORM_ENV_VALUE)
+    path = _write(tmp_path, _curves())
+    f = _front(x_mode="curve", x_curves=path, x_ceiling_tokens=4500)   # as the launcher hands it
+    assert f.tp_prefill_max_tokens == 4500
+    x = Front._x_route_of(f, rid="a", depth=0, k_flip=1)
+    assert x == 4500 and f._x_curve_last.x_curve > 4500 and f._x_curve_last.clamp == "cap"
+    assert "clamp=cap, ceiling=4500)" in Front._x_route_note(f)
+    deep = Front._x_route_of(f, rid="b", depth=200000, k_flip=2)
+    assert deep < 4500 and "clamp=none, ceiling=4500)" in Front._x_route_note(f)
+
+
 # ------------------------------------------------------------ 27B port: Dual refuses, flip form byte-identical
 
 
@@ -512,3 +548,12 @@ def test_curve_x_is_capped_by_the_boot_level_riegel_and_says_so(tmp_path, monkey
     f.tp_prefill_max_tokens = 1024          # D's W50 riegel lower than the curve's X: the riegel wins
     assert Front._x_route_of(f, rid="b", depth=0, k_flip=1) == 1024
     assert "cap" in f._x_curve_last.clamp and "clamp=" in Front._x_route_note(f)
+
+
+def test_a_manual_ceiling_is_no_longer_refused_and_w195_is_gone():
+    assert not hasattr(xc, "W_X_CEILING_UNCAPPED_MODE")
+    assert not any(c.startswith("W195") for c in xc.REFUSAL_CODES)
+    # the 27B-specific W197 stays even with a manual ceiling given
+    with pytest.raises(xc.XCurvesRefused) as e:
+        _resolve(dual=True, mode="curve", curves_path="x.json", ceiling_flag=CEILING)
+    assert e.value.code == xc.W_X_MODE_IN_DUAL
