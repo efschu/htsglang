@@ -1713,7 +1713,9 @@ function flipParts(f, dir) {
   if (!f || f.last_ms == null || !f.parts) return "";
   const x = f.parts, p = (k, v) => `${k} ${sec(v)}`;
   const vor = x.leer_ms != null
-    ? ` <span class="muted">(Vorlauf = leer ohne Request ${sec(x.leer_ms)} + Halt ${sec(x.halt_ms)} + Park ${sec(x.park_ms)} + Rest ${sec(x.vor_rest_ms)})</span>`
+    // Nutzer 06.10.: Server-Leerlauf (letztes D-Token -> Ankunft des Wartenden) ist keine Flipzeit; der Start ist
+    // max(letztes D-Token, Ankunft), "leer" ist also 0 und erscheint nur noch in alten Marken (> 0)
+    ? ` <span class="muted">(Vorlauf = ${x.leer_ms > 0 ? `leer ohne Request ${sec(x.leer_ms)} + ` : ""}Halt ${sec(x.halt_ms)} + Park ${sec(x.park_ms)} + Rest ${sec(x.vor_rest_ms)})</span>`
     : (dir === "D>P" ? ` <span class="muted">(Vorlauf-Zerlegung fehlt: keine Ankunft des Requests)</span>` : "");
   return `Zerlegung: ${p("Vorlauf", x.vorlauf_ms)} + ${p("Layer-Tausch", x.layer_ms)} + ${p("Wake-KV/DC", x.wake_kv_dc_ms)} + ${p("Nachlauf", x.nachlauf_ms)} + ${p("Rest", x.rest_ms)} = ${sec(f.last_ms)} s` + vor;
 }
