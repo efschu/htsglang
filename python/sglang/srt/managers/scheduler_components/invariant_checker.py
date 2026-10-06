@@ -47,6 +47,7 @@ from sglang.srt.utils.common import (
     ceil_align,
     raise_error_or_warn,
 )
+from sglang.srt import guard_switches
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
@@ -1009,6 +1010,39 @@ ADMISSION_WEDGE_SECONDS: float = 20.0
 ADMISSION_WEDGE = "ADMISSION-WEDGE"
 
 
+def _admission_wedge_threshold() -> float:
+    """WAECHTER-SCHALTER 06.10.: the alarm threshold in seconds. SGLANG_ADMISSION_WEDGE_SECONDS if > 0, else the
+    documented ``ADMISSION_WEDGE_SECONDS`` (20 s) -- unset reproduces the pre-switch verdict exactly. Never raises."""
+    return guard_switches.positive_float(envs.SGLANG_ADMISSION_WEDGE_SECONDS, ADMISSION_WEDGE_SECONDS)
+
+
+def _admission_wedge_mode() -> str:
+    """SGLANG_ADMISSION_WEDGE_MODE: ``act`` (default: alarm + status + recovery driver), ``log`` (alarm + status,
+    no recovery attempt) or ``off`` (no watchdog thread). Unknown word = ``act``."""
+    return guard_switches.mode_of(
+        envs.SGLANG_ADMISSION_WEDGE_MODE,
+        (guard_switches.MODE_ACT, guard_switches.MODE_LOG, guard_switches.MODE_OFF),
+        guard_switches.MODE_ACT,
+    )
+
+
+def _prefill_livelock_threshold() -> float:
+    """SGLANG_PREFILL_LIVELOCK_SECONDS if > 0, else 20 s (``ADMISSION_WEDGE_SECONDS``, the constant the livelock
+    verdict has always shared). Independent of SGLANG_ADMISSION_WEDGE_SECONDS on purpose: the two clocks answer
+    different questions (first token vs decode round)."""
+    return guard_switches.positive_float(envs.SGLANG_PREFILL_LIVELOCK_SECONDS, ADMISSION_WEDGE_SECONDS)
+
+
+def _prefill_livelock_mode() -> str:
+    """SGLANG_PREFILL_LIVELOCK_MODE: ``log`` (default, report only) or ``off`` (no livelock verdict). Unknown word =
+    ``log``."""
+    return guard_switches.mode_of(
+        envs.SGLANG_PREFILL_LIVELOCK_MODE,
+        (guard_switches.MODE_LOG, guard_switches.MODE_OFF),
+        guard_switches.MODE_LOG,
+    )
+
+
 def admission_wedge_verdict(
     queued: int,
     running: int,
@@ -1189,6 +1223,26 @@ def _admission_wedge_recovery_threshold() -> float:
     return ADMISSION_WEDGE_RECOVERY_SECONDS
 
 
+def _wedge_threshold_order_warning() -> Optional[str]:
+    """Nutzerentscheid 06.10.: the recovery threshold is its OWN value, not coupled to the alarm threshold -- but a
+    start-up WARNING names the case where it is LARGER than the alarm threshold (recovery then acts later than the
+    alarm speaks; the recovery clock itself runs on top of the alarm, so it fires at alarm + recovery seconds).
+
+    Returns the warning text, or None. None at the all-default pair (alarm 20 s / recovery 60 s, the code defaults
+    without a form): that pair has always been this way and the boot log stays as it was. A form's 2.0 s recovery
+    (nextflash / qwen27b) is below 20 s -> None as well."""
+    alarm = _admission_wedge_threshold()
+    rec = _admission_wedge_recovery_threshold()
+    if rec <= alarm or (alarm, rec) == (ADMISSION_WEDGE_SECONDS, ADMISSION_WEDGE_RECOVERY_SECONDS):
+        return None
+    return (
+        f"{ADMISSION_WEDGE}: the recovery threshold ({rec:.1f}s, SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS) is LARGER "
+        f"than the alarm threshold ({alarm:.1f}s, SGLANG_ADMISSION_WEDGE_SECONDS): the alarm speaks at {alarm:.1f}s "
+        f"but recovery acts only after {rec:.1f}s of continuous alarm (i.e. about {alarm + rec:.1f}s into the wedge). "
+        f"The two values are independent by design."
+    )
+
+
 def _wedge_queue_clock_armed() -> bool:
     """deskq 1981: SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK on AND the dual layout (default off = pre-fix verdict).
     Never raises: a bad value reads as off."""
@@ -1258,6 +1312,7 @@ def check_admission_wedge_once(
         queued,
         running,
         age,
+        threshold=_admission_wedge_threshold(),
         seconds_since_prefill_progress=seconds_since_prefill_progress,
     )
     detail = (
@@ -1305,7 +1360,11 @@ def check_admission_wedge_once(
             scheduler._wedge_p_kv_wait = None
     if alarm and log_on_alarm:
         logger.error(detail)
-    if not alarm and not getattr(scheduler, "weg2_dormant", False):
+    if (
+        not alarm
+        and not getattr(scheduler, "weg2_dormant", False)
+        and _prefill_livelock_mode() != guard_switches.MODE_OFF
+    ):
         # Q-698b: REPORT ONLY. The recovery driver (corridor relief) stays on
         # the classic alarm -- relief frees memory, a livelock is a policy loop.
         decode_stamp = getattr(scheduler, "last_decode_progress_time", None)
@@ -1314,6 +1373,7 @@ def check_admission_wedge_once(
             running,
             None if decode_stamp is None else now - decode_stamp,
             seconds_since_prefill_progress,
+            threshold=_prefill_livelock_threshold(),
         )
         if live:
             detail = f"{detail} | {live_detail}"
@@ -1733,7 +1793,9 @@ def make_admission_wedge_poller(scheduler: Scheduler):
         elif not alarm:
             scheduler._wedge_census_dumped = False
         try:
-            driver.step(alarm)
+            # WAECHTER-SCHALTER 06.10.: mode log = report + status only, no recovery attempt (act = as before).
+            if _admission_wedge_mode() != guard_switches.MODE_LOG:
+                driver.step(alarm)
         except Exception as e:  # noqa: BLE001 - a watchdog must not die
             logger.error("%s RECOVERY: attempt wrapper failed: %s", ADMISSION_WEDGE, e)
         _publish(alarm, detail, driver.recovery_status())
@@ -1744,9 +1806,9 @@ def make_admission_wedge_poller(scheduler: Scheduler):
 
 def create_admission_wedge_watchdog(
     scheduler: Scheduler,
-    poll_interval: float = ADMISSION_WEDGE_POLL_SECONDS,
+    poll_interval: Optional[float] = None,
     stop: Optional[threading.Event] = None,
-) -> threading.Thread:
+) -> Optional[threading.Thread]:
     """#699: log-only admission-wedge watchdog, wired to the real progress clock.
 
     Deliberately NOT a ``WatchdogRaw``: that class's signal is forward_ct
@@ -1794,6 +1856,30 @@ def create_admission_wedge_watchdog(
     of what the ladder did when it is.
     """
 
+    # WAECHTER-SCHALTER 06.10.: off = no thread at all (returns None). Unset env = the code below unchanged.
+    if _admission_wedge_mode() == guard_switches.MODE_OFF:
+        logger.warning(
+            "%s watchdog NOT started (SGLANG_ADMISSION_WEDGE_MODE=off): no alarm line, no status file, no "
+            "recovery on this rank",
+            ADMISSION_WEDGE,
+        )
+        return None
+    if poll_interval is None:
+        # Half the alarm threshold, as before (20 s -> 10 s); a configured threshold moves the poll with it.
+        poll_interval = (
+            ADMISSION_WEDGE_POLL_SECONDS
+            if not envs.SGLANG_ADMISSION_WEDGE_SECONDS.is_set()
+            else _admission_wedge_threshold() / 2.0
+        )
+    _order_warning = _wedge_threshold_order_warning()
+    if _order_warning is not None:
+        logger.warning("%s", _order_warning)
+    _wedge_cfg = (_admission_wedge_threshold(), _admission_wedge_mode())
+    if _wedge_cfg != (ADMISSION_WEDGE_SECONDS, guard_switches.MODE_ACT):
+        logger.info(
+            "%s watchdog configured: alarm after %.1fs (SGLANG_ADMISSION_WEDGE_SECONDS; default %.0fs), mode=%s "
+            "(SGLANG_ADMISSION_WEDGE_MODE; default act), poll %.1fs",
+            ADMISSION_WEDGE, _wedge_cfg[0], ADMISSION_WEDGE_SECONDS, _wedge_cfg[1], poll_interval)
     poll = make_admission_wedge_poller(scheduler)
     # LS12 (30.09.): the metal proof of SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS
     # -- the threshold this watchdog will actually use, once, and only when the
