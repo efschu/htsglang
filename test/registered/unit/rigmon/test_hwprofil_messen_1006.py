@@ -34,6 +34,7 @@ from test_hardware_profile_950 import (  # noqa: E402
 from sglang.srt.rigmon import bar1_probe as bp  # noqa: E402
 from sglang.srt.rigmon import card_probe as cp  # noqa: E402
 from sglang.srt.rigmon import hardware_profile as hp  # noqa: E402
+from sglang.srt.rigmon import nccl_probe as npb  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 from sglang.test.test_utils import CustomTestCase  # noqa: E402
 
@@ -107,6 +108,16 @@ class TestBar1Merge(CustomTestCase):
                     self.assertEqual(p["transport"], bp.BAR1_DIRECT)
         self.assertEqual(res.window_mib, 40.0)
         self.assertIn("one-sided posted writes", res.pairs[0]["note"])
+
+    def test_the_second_latency_travels_with_its_kind_and_is_absent_where_the_pair_has_no_number(self):
+        rows0 = [_row(0, 1, latency_device_us=1.3), _row(0, 2, bw=None, latency_us=None, reason="no proof")]
+        res = bp.merge_reports(UUIDS, [_out(_report(0, rows=rows0)), _out(_report(1)), _out(_report(2))])
+        by = {(p["src_uuid"], p["dst_uuid"]): p for p in res.pairs}
+        self.assertEqual(by[(U0, U1)]["latency_device_us"], 1.3)
+        self.assertIn("KEIN Rundlauf", by[(U0, U1)]["latency_device_kind"])
+        self.assertIsNone(by[(U0, U2)]["latency_device_us"])
+        self.assertEqual(by[(U0, U2)]["latency_device_kind"], "")
+        self.assertIsNone(by[(U1, U0)]["latency_device_us"])           # that sender did not report one: absent, not zero
 
     def test_a_pair_whose_byte_proof_failed_is_a_pair_without_number_with_its_reason_and_the_rest_stays(self):
         rows1 = [_row(1, 0, bw=None, latency_us=None, reason="no byte-level proof for this direction"), _row(1, 2)]
@@ -367,7 +378,9 @@ def _write_bar1_probe(d, name, created, pairs, attempted=True, reason="", cards=
                                   compute_capability="12.0")]
     with open(os.path.join(d, name), "w") as f:
         json.dump({"version": 1, "created": created, "driver": "595.58", "torch_version": "2.9", "cuda_version": "13.0",
-                   "cards": cards, "pairs": [], "bar1_pairs": pairs, "bar1_attempted": attempted, "bar1_reason": reason}, f)
+                   "cards": cards, "pairs": [], "bar1_pairs": pairs, "bar1_attempted": attempted, "bar1_reason": reason,
+                   # the NCCL step ran and said why it has no numbers: final, so these tests keep their meaning
+                   "nccl_attempted": True, "nccl_reason": "NCCL did not come up", "nccl_pairs": []}, f)
 
 
 class TestProfileBar1Column(CustomTestCase):
@@ -410,7 +423,9 @@ class TestProfileBar1Column(CustomTestCase):
         doc = self._build()
         self.assertEqual(len([l for l in doc["links"] if l["transport"] == "host_staging"]), 6)
         self.assertEqual({l["gbs"]["v"] for l in doc["links"] if l["transport"] == "bar1"}, {4.0})
-        self.assertEqual({l["gbs"]["v"] for l in doc["links"] if l["transport"] == "host_staging"}, {2.0})
+        # these staging pairs are in the pre-1006 format (no serial field): their number is the SERIAL one, the pipelined rate is open
+        self.assertEqual({l["gbs_serial"]["v"] for l in doc["links"] if l["transport"] == "host_staging"}, {2.0})
+        self.assertEqual({l["gbs"]["v"] for l in doc["links"] if l["transport"] == "host_staging"}, {None})
 
     def test_a_pair_without_number_is_nicht_gemessen_with_its_own_reason_the_rest_stays_measured(self):
         pairs = [_bar1_pair(a, b, 3.0) for a, b in ALL6]
@@ -611,6 +626,612 @@ class TestNativeW4A4(CustomTestCase):
         txt = cp.format_text(cp.CardProbeProfile(created=time.time(), cards=[c]))
         self.assertIn("w4a4", txt)
         self.assertIn("910.5", txt)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Auftrag 1006, Nachtrag 14:30-14:40Z: pipelined host staging, PCIe link, NCCL way, D2D table with three ways
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class _FT:
+    """A tensor stand-in that only records WHAT is copied and in which order (no torch kernels, no GPU)."""
+
+    def __init__(self, name, log, off=0, n=0):
+        self.name, self.log, self.off, self.n = name, log, off, n
+
+    def __getitem__(self, sl):
+        return _FT(self.name, self.log, sl.start, sl.stop - sl.start)
+
+    def copy_(self, src, non_blocking=False):
+        ch = cp._PIPE_CHUNK
+        if self.name.startswith("host"):                      # device -> host buffer: a D2H of chunk off/ch
+            self.log.append(("D2H", src.off // ch, self.name))
+        else:                                                 # host buffer -> destination slice: an H2D of chunk off/ch
+            self.log.append(("H2D", self.off // ch, src.name))
+        return self
+
+
+class TestPipelinedStaging(CustomTestCase):
+    def _run(self, per_run_s=0.01, nbytes=cp._XFER_BYTES):
+        import itertools
+
+        import torch
+
+        log = []
+        hosts = itertools.count()
+        ev_n = itertools.count()
+        n = nbytes // cp._PIPE_CHUNK
+
+        class Ev:
+            def __init__(self):
+                i = next(ev_n) % (2 * n)
+                self.kind, self.k = ("d", i) if i < n else ("h", i - n)
+
+            def record(self, stream):
+                log.append(("rec", self.kind, self.k))
+
+            def synchronize(self):
+                log.append(("sync", self.kind, self.k))
+
+        calls = itertools.count()
+
+        def clock():
+            c = next(calls)
+            return (c // 2) * 1.0 + (per_run_s if c % 2 else 0.0)      # every once(): t0, t0 + per_run_s
+
+        a, b = _FT("a", log), _FT("b", log)
+        with mock.patch.object(torch, "empty", lambda *x, **k: _FT("host%d" % next(hosts), log)), \
+             mock.patch.object(torch.cuda, "Stream", lambda device=None: object()), \
+             mock.patch.object(torch.cuda, "Event", Ev), \
+             mock.patch.object(torch.cuda, "stream", lambda s: __import__("contextlib").nullcontext()), \
+             mock.patch.object(torch.cuda, "synchronize", lambda *x, **k: None), \
+             mock.patch.object(cp.time, "perf_counter", clock):
+            gbs = cp._staged_pipelined_gbs("cuda:0", "cuda:1", a, b, nbytes)
+        return gbs, log
+
+    def test_rate_is_bytes_over_the_median_of_whole_copies(self):
+        gbs, _ = self._run(per_run_s=0.01)
+        self.assertAlmostEqual(gbs, cp._XFER_BYTES / 1e9 / 0.01, places=6)
+
+    def test_every_chunk_goes_down_and_up_exactly_once_in_order(self):
+        _, log = self._run()
+        n = cp._XFER_BYTES // cp._PIPE_CHUNK
+        one_run = [x for x in log if x[0] in ("D2H", "H2D")]
+        per = 2 * n
+        first = one_run[:per]
+        self.assertEqual([x[1] for x in first if x[0] == "D2H"], list(range(n)))
+        self.assertEqual([x[1] for x in first if x[0] == "H2D"], list(range(n)))
+
+    def test_d2h_of_the_next_chunk_is_issued_before_the_h2d_of_the_previous_one_that_is_the_overlap(self):
+        # MUTANT guard "serial instead of pipeline": a serial staging waits for H2D k-1 before it issues D2H k
+        _, log = self._run()
+        n = cp._XFER_BYTES // cp._PIPE_CHUNK
+        ops = [x for x in log if x[0] in ("D2H", "H2D")][: 2 * n]
+        idx = {(op, k): i for i, (op, k, _b) in enumerate(ops)}
+        for k in range(1, n):
+            self.assertLess(idx[("D2H", k)], idx[("H2D", k - 1)], f"chunk {k}")
+
+    def test_the_h2d_of_a_chunk_is_not_waited_for_before_the_next_d2h_is_issued(self):
+        # MUTANT guard "serial instead of pipeline" (a wait on H2D k-1 right after issuing it): D2H k must come before that wait
+        _, log = self._run()
+        n = cp._XFER_BYTES // cp._PIPE_CHUNK
+        run = log[: next(i for i, x in enumerate(log) if x == ("sync", "h", n - 1)) + 1]
+        for k in range(1, n - 1):                  # H2D n-2 is never waited for on its own: stream order covers it
+            d2h_k = next(i for i, x in enumerate(run) if x[:2] == ("D2H", k))
+            wait_prev = next(i for i, x in enumerate(run) if x == ("sync", "h", k - 1))
+            self.assertLess(d2h_k, wait_prev, f"chunk {k}")
+
+    def test_the_pair_headline_is_the_pipelined_rate_and_the_serial_one_sits_beside_it(self):
+        # MUTANT guard "headline swapped": bandwidth_gbs must be the pipelined figure, bandwidth_serial_gbs the serial one
+        import torch
+
+        with mock.patch.object(cp, "_peer_ok", lambda a, b: False), \
+             mock.patch.object(cp, "_time_copy_gbs", lambda dev, fn, nbytes=cp._XFER_BYTES: 3.0), \
+             mock.patch.object(cp, "_staged_pipelined_gbs", lambda *a, **k: 9.0), \
+             mock.patch.object(torch, "empty", lambda *a, **k: _FT("x", [])), \
+             mock.patch.object(torch.cuda, "set_device", lambda *a: None), \
+             mock.patch.object(torch.cuda, "synchronize", lambda *a, **k: None), \
+             mock.patch.object(torch.cuda, "empty_cache", lambda: None):
+            gbs, lat, transport, peer, serial = cp._measure_one_pair(0, 1, staging=_FT("host", []))
+        self.assertEqual((gbs, serial), (9.0, 3.0))
+        self.assertEqual((transport, peer), (cp.HOST_STAGING, False))
+
+    def test_over_peer_access_the_rate_is_direct_and_there_is_no_serial_figure(self):
+        import torch
+
+        with mock.patch.object(cp, "_peer_ok", lambda a, b: True), \
+             mock.patch.object(cp, "_time_copy_gbs", lambda dev, fn, nbytes=cp._XFER_BYTES: 3.0), \
+             mock.patch.object(torch, "empty", lambda *a, **k: _FT("x", [])), \
+             mock.patch.object(torch.cuda, "set_device", lambda *a: None), \
+             mock.patch.object(torch.cuda, "synchronize", lambda *a, **k: None), \
+             mock.patch.object(torch.cuda, "empty_cache", lambda: None):
+            gbs, _lat, transport, _peer, serial = cp._measure_one_pair(0, 1)
+        self.assertEqual((gbs, serial, transport), (3.0, None, cp.P2P_DIRECT))
+
+    def test_a_buffer_is_reused_only_after_the_h2d_that_read_it_was_waited_for(self):
+        _, log = self._run()
+        n = cp._XFER_BYTES // cp._PIPE_CHUNK
+        run = log[: next(i for i, x in enumerate(log) if x == ("sync", "h", n - 1)) + 1]
+        for k in range(2, n):
+            d2h_k = next(i for i, x in enumerate(run) if x[:2] == ("D2H", k))
+            sync_prev = next(i for i, x in enumerate(run) if x == ("sync", "h", k - 2))
+            self.assertLess(sync_prev, d2h_k, f"chunk {k}")
+        bufs = {(x[1], x[2]) for x in run if x[0] == "D2H"}
+        self.assertEqual({b for _k, b in bufs}, {"host0", "host1"})        # exactly two pinned buffers, alternating
+
+    def test_too_small_a_copy_is_not_pipelined_and_gives_no_number(self):
+        gbs, _ = self._run(nbytes=cp._PIPE_CHUNK)
+        self.assertIsNone(gbs)
+
+
+class TestPcieLink(CustomTestCase):
+    def test_theory_rates_per_generation_and_width(self):
+        self.assertEqual(hp.pcie_theory_gbs(4, 4), 7.88)
+        self.assertEqual(hp.pcie_theory_gbs(4, 8), 15.75)
+        self.assertEqual(hp.pcie_theory_gbs(4, 16), 31.51)
+        self.assertIsNone(hp.pcie_theory_gbs(6, 16))      # not tabulated: no number, not a guess
+        self.assertIsNone(hp.pcie_theory_gbs(None, 8))
+        self.assertIsNone(hp.pcie_theory_gbs(4, 0))
+
+    def test_link_of_a_card_is_read_by_uuid(self):
+        cards = [{"uuid": U0, "pcie_cur_gen": 4, "pcie_cur_width": 4, "pcie_max_gen": 4, "pcie_max_width": 16},
+                 {"uuid": U1, "pcie_cur_gen": 5, "pcie_cur_width": 8, "pcie_max_gen": 5, "pcie_max_width": 16}]
+        with mock.patch.object(hp, "read_nvml", lambda: (cards, "d", [])):
+            self.assertEqual(cp._pcie_link_of(U1), {"gen_cur": 5, "width_cur": 8, "gen_max": 5, "width_max": 16})
+            self.assertEqual(cp._pcie_link_of("GPU-unknown"), {})
+
+    def test_nvml_trouble_is_an_empty_link_never_an_exception(self):
+        with mock.patch.object(hp, "read_nvml", side_effect=RuntimeError("nvml gone")):
+            self.assertEqual(cp._pcie_link_of(U0), {})
+
+    def test_the_view_shows_link_and_utilisation_against_the_CURRENT_width_not_the_maximum(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_probe(d, "card_probe-a.json", NOW - 5, [
+                _probe_card(U0, "RTX 3080", h2d_gbs=6.5, d2h_gbs=6.6, pcie_gen_cur=4, pcie_width_cur=4,
+                            pcie_gen_max=4, pcie_width_max=16)])
+            doc = hp.build(cache_dir=d, nvml=_nvml(1), now=NOW)
+        k = doc["cards"][0]["link"]
+        self.assertEqual((k["gen_cur"]["v"], k["width_cur"]["v"], k["width_max"]["v"]), (4, 4, 16))
+        self.assertEqual(k["gen_cur"]["src"], hp.SRC_NVML)
+        self.assertEqual(k["theory_gbs"]["v"], 7.88)
+        self.assertEqual(k["theory_gbs"]["src"], hp.SRC_DATASHEET)
+        self.assertAlmostEqual(k["h2d_pct"]["v"], 82.5, places=1)       # 6.5 / 7.88, NOT 6.5 / 31.51
+        self.assertAlmostEqual(k["d2h_pct"]["v"], 83.8, places=1)
+        self.assertEqual(k["h2d_pct"]["src"], hp.SRC_ESTIMATED)         # a calculation, labelled as one
+        self.assertIn("Rechnung", k["h2d_pct"]["note"])
+        self.assertEqual(hp.validate(doc), [])
+
+    def test_a_probe_without_link_fields_shows_the_link_as_nicht_gemessen_with_reason_and_keeps_the_button_lit(self):
+        card = _probe_card(U0, "RTX 3080")
+        for key in ("pcie_gen_cur", "pcie_width_cur", "pcie_gen_max", "pcie_width_max"):
+            card.pop(key)
+        with tempfile.TemporaryDirectory() as d:
+            _write_probe(d, "card_probe-old.json", NOW - 5, [card])
+            doc = hp.build(cache_dir=d, nvml=_nvml(1), now=NOW)
+        k = doc["cards"][0]["link"]
+        for key in ("gen_cur", "width_cur", "theory_gbs", "h2d_pct", "d2h_pct"):
+            self.assertIsNone(k[key]["v"], key)
+            self.assertTrue(k[key]["note"], key)
+        self.assertIn("link", doc["unmeasured"]["0"])
+        self.assertEqual(hp.validate(doc), [])
+
+    def test_measure_card_records_the_link_it_read_after_the_transfer_arm(self):
+        import torch
+
+        from sglang.srt import uneven_perf as up
+
+        rates = up.MembwRates(read_gbs=1.0, copy_gbs=1.0, gemv_gbs=1.0)
+        with mock.patch.object(torch.cuda, "set_device"), \
+             mock.patch.object(up, "_bench_membw_rates", lambda dev: rates), \
+             mock.patch.object(up, "_bench_gemm_tflops", lambda dev: 60.0), \
+             mock.patch.object(cp, "_device_properties", lambda dev: (68, 5.0, "8.6")), \
+             mock.patch.object(cp, "_bench_gemm_fp8_tflops", lambda dev: (None, "x")), \
+             mock.patch.object(cp, "_bench_h2d_d2h", lambda dev: (6.0, 6.5)), \
+             mock.patch.object(cp, "_pcie_link_of", lambda uuid: {"gen_cur": 4, "width_cur": 4, "gen_max": 4, "width_max": 16}
+                               if uuid == "u0" else {}), \
+             mock.patch.object(cp, "_bench_h2d_d2h_latency", lambda dev: (12.5, 14.0, 9.0, 10.0)), \
+             mock.patch.object(cp, "lane_environment_issue", lambda: "x"):
+            m = cp.measure_card(0, "u0", "card", 1)
+            m2 = cp.measure_card(0, "u9", "card", 1)
+        self.assertEqual((m.pcie_gen_cur, m.pcie_width_cur, m.pcie_gen_max, m.pcie_width_max), (4, 4, 4, 16))
+        self.assertEqual(m2.pcie_width_cur, None)
+        self.assertIn("pcie_link", m.arm_seconds)
+
+
+class TestNcclWay(CustomTestCase):
+    VIA_P2P = "nccl INFO Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM/read"
+    VIA_SHM = "nccl INFO Channel 00/0 : 0[0] -> 1[1] via SHM/direct/direct\nnccl INFO Channel 01/0 : 1[1] -> 0[0] via SHM/direct/direct"
+
+    def _rep(self, rank, uuid, rate=None, lat=None, failed=None):
+        r = {"rank": rank, "uuid": uuid}
+        if failed:
+            r["failed"] = failed
+        else:
+            r["rate"] = rate or []
+            r["lat"] = lat or []
+        return r
+
+    def _results(self, via=VIA_SHM, a_rates=(None, 9.0), b_rates=(8.0, None)):
+        # rank 0 = U0, rank 1 = U1.  The RECEIVER owns the rate of a direction; the SENDER owns its latency.
+        r0 = self._rep(0, U0, rate=[{"src": 1, "dst": 0, "gbs": a_rates[1]}] if a_rates[1] else [],
+                       lat=[{"src": 0, "dst": 1, "latency_us": 31.0, "n": 200}])
+        r1 = self._rep(1, U1, rate=[{"src": 0, "dst": 1, "gbs": b_rates[0]}] if b_rates[0] else [],
+                       lat=[{"src": 1, "dst": 0, "latency_us": 33.0, "n": 200}])
+        return [(0, "x\n" + npb.MARKER + json.dumps(r0) + "\n", via), (0, npb.MARKER + json.dumps(r1) + "\n", via)]
+
+    def test_command_and_env_nccl_debug_only_in_the_child_and_nothing_else_forced(self):
+        base = {"PATH": "/bin", "NCCL_P2P_DISABLE": "1", "CUDA_VISIBLE_DEVICES": "0"}
+        e = npb.rank_env([U0, U1], 4711, base=base)
+        self.assertEqual(e["NCCL_DEBUG"], "INFO")
+        self.assertEqual(e["NCCL_P2P_DISABLE"], "1")                       # the operating environment is kept
+        self.assertEqual(e["CUDA_VISIBLE_DEVICES"], f"{U0},{U1}")
+        self.assertEqual(e["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertNotIn("NCCL_DEBUG", base)                               # the caller's dict is untouched
+        c = npb.rank_command("/py", 1, [U0, U1], 100.0)
+        self.assertEqual(c[c.index("--rank") + 1], "1")
+        self.assertEqual(c[c.index("--uuids") + 1], f"{U0},{U1}")
+
+    def test_the_chosen_transport_is_read_from_the_nccl_log(self):
+        self.assertEqual(npb.parse_transports(self.VIA_P2P), ["P2P/CUMEM/read"])
+        self.assertEqual(npb.parse_transports(self.VIA_SHM), ["SHM/direct/direct"])
+        self.assertEqual(npb.parse_transports("nothing useful"), [])
+
+    def test_merge_gives_each_direction_the_numbers_of_its_owner_and_names_the_transport(self):
+        pairs, tr = npb.merge_pair([U0, U1], self._results(a_rates=(None, 9.0), b_rates=(8.0, None)))
+        by = {(p["src_uuid"], p["dst_uuid"]): p for p in pairs}
+        self.assertEqual(by[(U0, U1)]["bandwidth_gbs"], 8.0)      # measured by the RECEIVER U1
+        self.assertEqual(by[(U1, U0)]["bandwidth_gbs"], 9.0)      # measured by the RECEIVER U0
+        self.assertEqual(by[(U0, U1)]["latency_us"], 31.0)        # started by the SENDER U0
+        self.assertEqual(by[(U1, U0)]["latency_us"], 33.0)
+        self.assertIn("SHM/direct/direct", by[(U0, U1)]["transport"])
+        self.assertIn("SHM/direct/direct", by[(U0, U1)]["note"])
+        self.assertEqual(tr, ["SHM/direct/direct"])
+
+    def test_the_device_side_latency_comes_from_the_sender_of_the_direction_and_is_labelled(self):
+        res = self._results()
+        r0 = json.loads(res[0][1].split(npb.MARKER)[1])
+        r1 = json.loads(res[1][1][len(npb.MARKER):])
+        r0["lat"][0]["latency_device_us"] = 11.5
+        r1["lat"][0]["latency_device_us"] = 12.5
+        res[0] = (0, npb.MARKER + json.dumps(r0) + "\n", res[0][2])
+        res[1] = (0, npb.MARKER + json.dumps(r1) + "\n", res[1][2])
+        pairs, _ = npb.merge_pair([U0, U1], res)
+        by = {(p["src_uuid"], p["dst_uuid"]): p for p in pairs}
+        self.assertEqual(by[(U0, U1)]["latency_device_us"], 11.5)
+        self.assertEqual(by[(U1, U0)]["latency_device_us"], 12.5)
+        self.assertIn("ein Synchronize am Ende", by[(U0, U1)]["latency_device_kind"])
+        self.assertIn("Rundlauf / 2", by[(U0, U1)]["latency_device_kind"])
+
+    def test_a_pair_run_that_died_is_two_pairs_without_number_with_the_reason(self):
+        pairs, _ = npb.merge_pair([U0, U1], [(1, "", "Traceback: NCCL error"), (-9, "", "")])
+        self.assertTrue(all(p["bandwidth_gbs"] is None and p["latency_us"] is None for p in pairs))
+        self.assertTrue(all("not measured" in p["note"] for p in pairs))
+
+    def test_numbers_of_a_child_on_the_wrong_card_are_discarded(self):
+        res = self._results()
+        wrong = json.loads(res[1][1][len(npb.MARKER):])
+        wrong["uuid"] = "GPU-9999"
+        res[1] = (0, npb.MARKER + json.dumps(wrong) + "\n", "")
+        pairs, _ = npb.merge_pair([U0, U1], res)
+        by = {(p["src_uuid"], p["dst_uuid"]): p for p in pairs}
+        self.assertIsNone(by[(U0, U1)]["bandwidth_gbs"])
+        self.assertIn("reported card", by[(U0, U1)]["note"])
+
+    def test_nccl_that_did_not_come_up_is_the_reason(self):
+        f = {"stage": "worker", "reason": "RuntimeError: NCCL init timeout"}
+        res = [(0, npb.MARKER + json.dumps(self._rep(0, U0, failed=f)) + "\n", ""),
+               (0, npb.MARKER + json.dumps(self._rep(1, U1, failed=f)) + "\n", "")]
+        pairs, _ = npb.merge_pair([U0, U1], res)
+        self.assertTrue(all(p["bandwidth_gbs"] is None and "NCCL init timeout" in p["note"] for p in pairs))
+
+    def test_run_one_pair_run_per_unordered_pair_each_with_its_own_cap_and_result_sorted_by_card_order(self):
+        seen = []
+
+        def runner(cmds, env, timeout):
+            seen.append((cmds, env, timeout))
+            u = cmds[0][cmds[0].index("--uuids") + 1].split(",")
+            r0 = self._rep(0, u[0], rate=[{"src": 1, "dst": 0, "gbs": 5.0}], lat=[{"src": 0, "dst": 1, "latency_us": 20.0, "n": 200}])
+            r1 = self._rep(1, u[1], rate=[{"src": 0, "dst": 1, "gbs": 6.0}], lat=[{"src": 1, "dst": 0, "latency_us": 21.0, "n": 200}])
+            return [(0, npb.MARKER + json.dumps(r0) + "\n", self.VIA_P2P), (0, npb.MARKER + json.dumps(r1) + "\n", self.VIA_P2P)]
+
+        res = npb.run_nccl_probe([{"uuid": u} for u in UUIDS], timeout_s=240.0, runner=runner, env={"PATH": "/bin"}, port=1)
+        self.assertEqual(len(seen), 3)                                       # (0,1) (0,2) (1,2)
+        self.assertTrue(all(t == 80.0 for _c, _e, t in seen))                # own cap per pair-run
+        self.assertEqual(len(res.pairs), 6)
+        self.assertEqual([(p["src_uuid"], p["dst_uuid"]) for p in res.pairs],
+                         [(a, b) for a in UUIDS for b in UUIDS if a != b])
+        self.assertEqual(res.reason, "")
+        self.assertEqual(res.transports, ["P2P/CUMEM/read"])
+
+    def test_a_runner_that_raises_or_a_used_up_budget_is_a_reason_not_an_exception(self):
+        def boom(*a):
+            raise OSError("no fork")
+
+        res = npb.run_nccl_probe([{"uuid": u} for u in UUIDS], runner=boom)
+        self.assertEqual(len(res.pairs), 6)
+        self.assertTrue(all(p["bandwidth_gbs"] is None for p in res.pairs))
+        self.assertIn("no fork", res.reason)
+
+    def test_fewer_than_two_cards_has_no_nccl_step(self):
+        self.assertIn("fewer than two", npb.run_nccl_probe([{"uuid": U0}], runner=lambda *a: []).reason)
+
+
+class TestCardProbeNcclWiring(CustomTestCase):
+    def _run(self, **kw):
+        gpus = [{"cuda_index": i, "uuid": u, "name": f"c{i}", "total_mib": 1} for i, u in enumerate(UUIDS)]
+        with mock.patch.object(cp, "_inventory", lambda: (gpus, "d")), \
+             mock.patch.object(cp, "_card_states", lambda: {}), \
+             mock.patch.object(cp, "measure_card",
+                               lambda cuda_index, uuid, name, total_mib=None, state_fn=None:
+                               cp.CardProbeMeasurement(uuid=uuid, name=name, cuda_index=cuda_index, gemm_bf16_tflops=60.0)), \
+             mock.patch.object(cp, "measure_pair_matrix", lambda g: []):
+            return cp.run_card_probe(**kw)
+
+    def test_off_for_library_callers(self):
+        with mock.patch.object(npb, "run_nccl_probe", side_effect=AssertionError("must not run")):
+            prof = self._run(save=False)
+        self.assertFalse(prof.nccl_attempted)
+
+    def test_result_is_stored_in_its_own_list_and_round_trips(self):
+        fake = npb.NcclResult(pairs=[
+            {"src_uuid": U0, "dst_uuid": U1, "bandwidth_gbs": 5.0, "latency_us": 30.0, "transport": "nccl send/recv (SHM/direct/direct)",
+             "peer_access": False, "bytes_moved": 1, "note": "n"}], reason="", seconds=12.0)
+        with mock.patch.object(npb, "run_nccl_probe", return_value=fake) as m:
+            prof = self._run(save=False, nccl=True)
+        self.assertEqual([[g["uuid"] for g in c.args[0]] for c in m.call_args_list], [UUIDS])
+        self.assertTrue(prof.nccl_attempted)
+        self.assertEqual(prof.pairs, [])
+        self.assertEqual(prof.bar1_pairs, [])
+        back = cp.CardProbeProfile.from_json(json.loads(json.dumps(prof.to_json())))
+        self.assertEqual((back.nccl_pairs[0].bandwidth_gbs, back.nccl_attempted, back.nccl_seconds), (5.0, True, 12.0))
+        self.assertIn("NCCL send/recv per ordered pair", cp.format_text(prof))
+
+    def test_a_failing_step_keeps_the_card_rates_and_records_why(self):
+        with mock.patch.object(npb, "run_nccl_probe", side_effect=RuntimeError("nccl missing")):
+            prof = self._run(save=False, nccl=True)
+        self.assertTrue(prof.nccl_attempted)
+        self.assertEqual([c.gemm_bf16_tflops for c in prof.cards], [60.0] * 3)
+        self.assertIn("nccl missing", prof.nccl_reason)
+        self.assertEqual(len(prof.nccl_pairs), 6)
+
+    def test_the_cache_file_exists_after_the_card_stage_before_any_optional_way_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "card_probe-x.json")
+            seen = {}
+
+            def bar1(gpus, **kw):
+                seen["file_when_bar1_starts"] = os.path.exists(path)
+                return bp.Bar1Result(reason="x")
+
+            with mock.patch.object(bp, "run_bar1_probe", bar1), \
+                 mock.patch.object(npb, "run_nccl_probe", return_value=npb.NcclResult(reason="y")):
+                self._run(path=path, bar1=True, nccl=True)
+            self.assertTrue(seen["file_when_bar1_starts"])
+            with open(path) as fh:
+                final = json.load(fh)
+            self.assertTrue(final["bar1_attempted"])                # re-saved after the way
+
+    def test_cli_nccl_flags(self):
+        seen = []
+
+        def fake_run(**kw):
+            seen.append(kw)
+            return cp.CardProbeProfile(created=time.time())
+
+        with mock.patch.object(cp, "run_card_probe", side_effect=fake_run), mock.patch.object(cp, "lane_environment_issue", lambda: ""):
+            cp._main(["--run", "--json"])
+            cp._main(["--run", "--json", "--no-nccl"])
+            cp._main(["--run", "--json", "--nccl-timeout-s", "99"])
+        self.assertEqual([k["nccl"] for k in seen], [True, False, True])
+        self.assertEqual(seen[2]["nccl_timeout_s"], 99.0)
+
+    def test_the_two_ways_together_stay_inside_eight_minutes(self):
+        self.assertLessEqual(bp.DEFAULT_TIMEOUT_S + npb.DEFAULT_TIMEOUT_S, 8 * 60)
+
+
+def _nccl_pair(s, d, bw, lat=30.0, via="SHM/direct/direct"):
+    return {"src_uuid": s, "dst_uuid": d, "bandwidth_gbs": bw, "latency_us": lat if bw is not None else None,
+            "transport": f"nccl send/recv ({via})", "peer_access": False, "note": f"NCCL chose: {via}" if bw is not None else "NCCL not measured: x"}
+
+
+def _stage_pair(s, d, pipe, serial, lat=21.0):
+    return {"src_uuid": s, "dst_uuid": d, "bandwidth_gbs": pipe, "bandwidth_serial_gbs": serial, "latency_us": lat,
+            "transport": cp.HOST_STAGING, "peer_access": False, "note": "staged"}
+
+
+class TestD2DTable(CustomTestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+
+    def _doc(self, bar1=None, nccl=None, stage=None, **extra):
+        cards = [_probe_card(U0, "RTX 3080", lane_notes={"nvfp4_w4a4": "no native FP4 tensor cores"}),
+                 _probe_card(U2, "RTX 3080", lane_notes={"nvfp4_w4a4": "no native FP4 tensor cores"}),
+                 _probe_card(U1, "RTX 5090", gemm_w4a4_tflops=900.0, compute_capability="12.0",
+                             lane_notes={"nvfp4_w4a8": "sm_8x"})]
+        kw = dict(pairs=stage if stage is not None else [])
+        if bar1 is not None:
+            kw.update(bar1_attempted=True, bar1_pairs=bar1, bar1_reason="" if bar1 else "dmabuf_holder not available")
+        if nccl is not None:
+            kw.update(nccl_attempted=True, nccl_pairs=nccl, nccl_reason="" if nccl else "NCCL did not come up")
+        kw.update(extra)
+        _write_probe(self.d.name, "card_probe-a.json", NOW - 30, cards, **kw)
+        return hp.build(cache_dir=self.d.name, nvml=_nvml(), now=NOW)
+
+    def _row(self, doc, a, b):
+        ord_of = {c["uuid"]: c["ord"] for c in doc["cards"]}
+        return next(r for r in doc["d2d"]["pairs"] if (r["src"], r["dst"]) == (ord_of[a], ord_of[b]))
+
+    def test_the_headline_is_barlink_bar1_and_the_columns_come_in_that_order(self):
+        doc = self._doc()
+        self.assertEqual(doc["d2d"]["headline"], "barlink_bar1")
+        self.assertEqual([c["key"] for c in doc["d2d"]["columns"]], ["barlink_bar1", "nccl", "host_staging"])
+        self.assertIn("Betriebsweg", doc["d2d"]["columns"][0]["label"])
+        self.assertIn("Fallback, nicht der Betriebsweg", doc["d2d"]["columns"][2]["label"])
+        self.assertEqual(len(doc["d2d"]["pairs"]), 6)
+
+    def test_without_a_bar1_measurement_the_headline_is_nicht_gemessen_even_if_staging_and_nccl_are_measured(self):
+        # MUTANT guard: "host staging (or NCCL) as the headline number"
+        ST = [_stage_pair(a, b, 12.0, 6.0) for a in UUIDS for b in UUIDS if a != b]
+        NC = [_nccl_pair(a, b, 9.0) for a in UUIDS for b in UUIDS if a != b]
+        doc = self._doc(bar1=None, nccl=NC, stage=ST)
+        for r in doc["d2d"]["pairs"]:
+            for k in ("gbs", "lat_us"):
+                n = r["barlink_bar1"][k]
+                self.assertIsNone(n["v"])
+                self.assertEqual(n["src"], hp.SRC_NONE)
+                self.assertTrue(n["note"])
+            self.assertEqual(r["host_staging"]["gbs"]["v"], 12.0)
+            self.assertEqual(r["nccl"]["gbs"]["v"], 9.0)
+        self.assertEqual(hp.validate(doc), [])
+
+    def test_all_three_ways_side_by_side_each_with_rate_and_latency_and_never_swapped(self):
+        # every way gets different numbers, so a swapped column cannot pass
+        BA = [_bar1_pair(a, b, 4.0 + i, lat=7.0 + i) for i, (a, b) in enumerate((a, b) for a in UUIDS for b in UUIDS if a != b)]
+        NC = [_nccl_pair(a, b, 20.0 + i, lat=40.0 + i) for i, (a, b) in enumerate((a, b) for a in UUIDS for b in UUIDS if a != b)]
+        ST = [_stage_pair(a, b, 60.0 + i, 30.0 + i, lat=80.0 + i) for i, (a, b) in enumerate((a, b) for a in UUIDS for b in UUIDS if a != b)]
+        doc = self._doc(bar1=BA, nccl=NC, stage=ST)
+        for i, (a, b) in enumerate((a, b) for a in UUIDS for b in UUIDS if a != b):
+            r = self._row(doc, a, b)
+            self.assertEqual((r["barlink_bar1"]["gbs"]["v"], r["barlink_bar1"]["lat_us"]["v"]), (4.0 + i, 7.0 + i))
+            self.assertEqual((r["nccl"]["gbs"]["v"], r["nccl"]["lat_us"]["v"]), (20.0 + i, 40.0 + i))
+            self.assertEqual((r["host_staging"]["gbs"]["v"], r["host_staging"]["gbs_serial"]["v"], r["host_staging"]["lat_us"]["v"]),
+                             (60.0 + i, 30.0 + i, 80.0 + i))
+            for way in (r["barlink_bar1"], r["nccl"], r["host_staging"]):
+                self.assertEqual(way["gbs"]["src"], hp.SRC_MEASURED)
+            self.assertIn("SHM/direct/direct", r["nccl"]["transport"])
+        self.assertTrue(doc["bar1"]["complete"] and doc["nccl"]["complete"])
+        self.assertFalse(doc["measure_needed"], doc["unmeasured"])
+        self.assertEqual(hp.validate(doc), [])
+
+    def test_a_failed_nccl_way_is_nicht_gemessen_with_its_reason_in_its_own_column_only(self):
+        BA = [_bar1_pair(a, b, 4.0) for a in UUIDS for b in UUIDS if a != b]
+        ST = [_stage_pair(a, b, 12.0, 6.0) for a in UUIDS for b in UUIDS if a != b]
+        doc = self._doc(bar1=BA, nccl=[], stage=ST)
+        for r in doc["d2d"]["pairs"]:
+            self.assertIsNone(r["nccl"]["gbs"]["v"])
+            self.assertIn("NCCL did not come up", r["nccl"]["gbs"]["note"])
+            self.assertEqual(r["barlink_bar1"]["gbs"]["v"], 4.0)
+        self.assertFalse(doc["nccl"]["measured"])
+        self.assertNotIn("nccl", doc["unmeasured"])                  # ran and said why: final
+
+    def test_an_nccl_step_that_never_ran_is_an_open_gap(self):
+        doc = self._doc(bar1=[])
+        self.assertEqual(len(doc["unmeasured"]["nccl"]), 6)
+        self.assertTrue(doc["measure_needed"])
+        self.assertIn("nicht gemessen", doc["d2d"]["pairs"][0]["nccl"]["gbs"]["note"])
+
+    def test_a_pre_pipelined_probe_shows_its_number_as_the_serial_one_and_the_pipelined_rate_as_not_measured(self):
+        old = [{"src_uuid": a, "dst_uuid": b, "bandwidth_gbs": 6.9, "latency_us": 21.0, "transport": cp.HOST_STAGING,
+                "peer_access": False} for a in UUIDS for b in UUIDS if a != b]            # no bandwidth_serial_gbs: the old format
+        doc = self._doc(stage=old)
+        r = doc["d2d"]["pairs"][0]["host_staging"]
+        self.assertIsNone(r["gbs"]["v"])
+        self.assertIn("pipelined nicht gemessen", r["gbs"]["note"])
+        self.assertEqual(r["gbs_serial"]["v"], 6.9)                                    # never relabelled as pipelined
+
+    def test_no_bar1_number_ever_comes_from_the_nccl_or_the_staging_pairs(self):
+        # MUTANT guard "NCCL number in the BAR1 column": only NCCL measured -> the BAR1 headline stays empty
+        NC = [_nccl_pair(a, b, 99.0) for a in UUIDS for b in UUIDS if a != b]
+        doc = self._doc(nccl=NC)
+        self.assertEqual({r["barlink_bar1"]["gbs"]["v"] for r in doc["d2d"]["pairs"]}, {None})
+        self.assertEqual({l["gbs"]["v"] for l in doc["links"] if l["transport"] == "bar1"}, {None})
+        self.assertEqual({l["gbs"]["v"] for l in doc["links"] if l["transport"] == "nccl_pair"}, {99.0})
+
+    def test_the_view_makes_no_capability_or_faster_slower_claim(self):
+        doc = self._doc()
+        text = json.dumps([doc["d2d"], doc["bar1"], doc["nccl"]], ensure_ascii=False).lower()
+        for bad in ("schneller", "langsamer", "fähigkeit", "kann der link", "faster", "slower", "capability of the link"):
+            self.assertNotIn(bad, text)
+        for k, v in hp.D2D_DEFINITIONS.items():
+            self.assertTrue(v, k)
+        # the definitions say what each latency IS, in the plain words the reader needs
+        self.assertIn("SENDERseite", hp.D2D_DEFINITIONS["barlink_bar1"])
+        self.assertIn("keine Zustellzeit", hp.D2D_DEFINITIONS["barlink_bar1"])
+        self.assertIn("Rückweg / 2", hp.D2D_DEFINITIONS["nccl"])
+        self.assertIn("seriell", hp.D2D_DEFINITIONS["host_staging"])
+
+
+class TestSecondLatencyAndReferences(CustomTestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+
+    def _doc(self, **kw):
+        cards = [_probe_card(U0, "RTX 3080"), _probe_card(U2, "RTX 3080"), _probe_card(U1, "RTX 5090")]
+        _write_probe(self.d.name, "card_probe-a.json", NOW - 30, cards, **kw)
+        return hp.build(cache_dir=self.d.name, nvml=_nvml(), now=NOW)
+
+    def test_both_latencies_sit_in_their_own_nodes_per_way_with_the_kind_in_the_note(self):
+        ordered = [(a, b) for a in UUIDS for b in UUIDS if a != b]
+        BA = [dict(_bar1_pair(a, b, 4.0, lat=10.5), latency_device_us=1.25, latency_device_kind="4-kB-Schreibzugriffe hintereinander im Stream (KEIN Rundlauf)")
+              for a, b in ordered]
+        NC = [dict(_nccl_pair(a, b, 9.0, lat=31.0), latency_device_us=14.0, latency_device_kind="Ping-Pong 200 Runden, Rundlauf / 2") for a, b in ordered]
+        doc = self._doc(bar1_attempted=True, bar1_pairs=BA, bar1_reason="", nccl_attempted=True, nccl_pairs=NC, nccl_reason="")
+        r = doc["d2d"]["pairs"][0]
+        self.assertEqual((r["barlink_bar1"]["lat_us"]["v"], r["barlink_bar1"]["lat_dev_us"]["v"]), (10.5, 1.25))
+        self.assertEqual((r["nccl"]["lat_us"]["v"], r["nccl"]["lat_dev_us"]["v"]), (31.0, 14.0))
+        self.assertIn("KEIN Rundlauf", r["barlink_bar1"]["lat_dev_us"]["note"])
+        self.assertIn("Start", r["barlink_bar1"]["lat_us"]["note"])
+        self.assertIn("keine Wire-Latenz", r["barlink_bar1"]["lat_us"]["note"])
+        self.assertEqual(hp.validate(doc), [])
+
+    def test_a_probe_without_the_second_latency_says_so_and_shows_no_number(self):
+        ordered = [(a, b) for a in UUIDS for b in UUIDS if a != b]
+        doc = self._doc(bar1_attempted=True, bar1_pairs=[_bar1_pair(a, b, 4.0) for a, b in ordered], bar1_reason="",
+                        nccl_attempted=True, nccl_pairs=[], nccl_reason="NCCL did not come up")
+        r = doc["d2d"]["pairs"][0]
+        self.assertIsNone(r["barlink_bar1"]["lat_dev_us"]["v"])
+        self.assertTrue(r["barlink_bar1"]["lat_dev_us"]["note"])
+        self.assertIsNone(r["nccl"]["lat_dev_us"]["v"])
+
+    def test_the_references_carry_the_measured_values_with_file_and_line_and_no_comparison(self):
+        refs = hp.D2D_REFERENCES
+        blob = " ".join(r["what"] + " " + r["source"] for r in refs)
+        for needle in ("28,22", "323,2", "6,02", "7,30", "37,41", "45,59", "0,08 ms", "0,53-0,80", "SHM/direct/direct", "32,4", "361,3"):
+            self.assertIn(needle, blob, needle)
+        for src in ("barlink_bar1.py:75-83", "roundbench_fixed_0907.out:19", "bench_host_transport.py:10-12", "ANALYSE_732_bar1_repricing.md:58-64",
+                    "27b-nvfp4-dual.env:122", "nccl_transport.json", "hw_profile-9a5e9b49b7dc.json"):
+            self.assertIn(src, blob, src)
+        self.assertTrue(all(r["what"] and r["source"] for r in refs))
+        low = blob.lower()
+        for bad in ("schneller", "langsamer", "fähigkeit", "faster", "slower"):
+            self.assertNotIn(bad, low)
+        self.assertEqual(list(self._doc()["d2d"]["references"]), list(refs))
+
+    def test_the_cited_numbers_are_really_in_the_cited_places(self):
+        # the references are only worth anything if they match their sources: check the ones that live in this tree
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..")
+
+        def lines(rel):
+            with open(os.path.join(root, rel), encoding="utf-8") as fh:
+                return fh.read().splitlines()
+
+        bb = lines("python/sglang/srt/distributed/device_communicators/barlink_bar1.py")
+        self.assertIn("28.22", " ".join(bb[74:83]))
+        self.assertIn("4077.43", " ".join(bb[74:83]))
+        self.assertTrue(bb[1527].startswith("DEFAULT_ROUND_US = 323.2"))
+        self.assertTrue(bb[1536].startswith("DEFAULT_WIRE_GBPS = 6.02"))
+        host = " ".join(lines("benchmark/bench_host_transport.py")[9:12])
+        self.assertIn("7.30 us", host)
+        self.assertIn("37.41 us", host)
+        an = lines("docs/dev/ANALYSE_732_bar1_repricing.md")
+        self.assertIn("45.59", an[57])
+
+    def test_the_stage0_nccl_row_is_not_called_p2p_it_goes_over_the_host_and_carries_its_date(self):
+        # MUTANT guard: the old label claimed peer-to-peer on a rig that has none
+        created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NOW - 100))
+        with open(os.path.join(self.d.name, "hw_profile-x.json"), "w") as f:
+            json.dump({"version": 3, "driver": "595.58", "created": created, "gpus": {U0: {"name": "n"}, U1: {"name": "n"}},
+                       "links": {f"{U0}|{U1}": {"p2p_gbs": 5.1}}}, f)
+        doc = hp.build(cache_dir=self.d.name, nvml=_nvml(), now=NOW)
+        nccl = [l for l in doc["links"] if l["transport"] == "nccl"]
+        self.assertEqual(len(nccl), 2)                                   # measured direction + the mirrored one
+        want = time.strftime("%d.%m.%Y", time.localtime(NOW - 100))
+        for l in nccl:
+            self.assertEqual(l["transport_label"], f"NCCL über Host (Stufe-0-Probe, {want})")
+            self.assertNotIn("p2p", l["transport_label"].lower())
+        self.assertEqual({l["gbs"]["src"] for l in nccl}, {hp.SRC_MEASURED, hp.SRC_ESTIMATED})
 
 
 if __name__ == "__main__":
