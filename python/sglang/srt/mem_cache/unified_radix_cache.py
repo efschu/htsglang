@@ -7936,6 +7936,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             form_a_host_base_vote as _fa_host_base_vote,
             form_a_null_tier_span as _fa_null_tier_span,
         )
+        from sglang.srt.managers.tp_match_floor import (
+            SPAN_REGROUP_ARMED_ATTR as _SPAN_REGROUP_ARMED_ATTR,
+            SPAN_REGROUP_ATTR as _SPAN_REGROUP_ATTR,
+        )
 
         _end_base = _fa_end_base(span_base) if symmetric else None
         _local_end = group_end = 0
@@ -8433,6 +8437,58 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # reduce downstream reports agreement. That is the #580 family
                 # -- ranks acting on different facts -- and the law is to stop,
                 # not to reconcile a span nobody voted for.
+                #
+                # W65-REGROUP (27B INT8 matrix 06.10., D 11:47:15, rid weg2-22-115,
+                # min=2958 max=3448): the ONE way past the stop that is not a
+                # reconciliation. The scheduler's intake (`_prefetch_kvcache`,
+                # rematch=True, armed via `SPAN_REGROUP_ARMED_ATTR`) asks for it:
+                # the vote already told EVERY rank (both reduced values are
+                # group-uniform) that the matches this prefetch was priced on
+                # differ, and the shallowest start -- the MAX span -- is a depth
+                # every rank held a usable anchor at by the match's own walk
+                # (the deeper rank passed it on its way down). Nothing is
+                # registered on this pass: the host rows and the anchor lock go
+                # back exactly as at `vote_negative`, and each rank leaves the
+                # mark (rid -> group start) for the scheduler, which re-matches
+                # THIS rank's key capped at that start and asks again -- spans
+                # equal by construction, or the second vote raises this very
+                # stop (the retry is never armed). Never armed (default, every
+                # other caller, Form A, no `span_base`): the raise below, as
+                # before.
+                _regroup = self.__dict__.get(_SPAN_REGROUP_ARMED_ATTR, False)
+                if (
+                    _regroup
+                    and _end_base is None
+                    and span_base is not None
+                    and int(span_base) + int(local_span) - int(span_hi) >= 0
+                ):
+                    _group_start = int(span_base) + int(local_span) - int(span_hi)
+                    _note_prefetch_gate("vote_negative", prefetch_length)
+                    _note_prefetch_gate("span_regroup", prefetch_length)
+                    logger.warning(
+                        "W65 Weg2PrefetchSpanSplit REGROUP rid=%s local_start=%d "
+                        "local_span=%d spans min=%d max=%d group_len=%d -> "
+                        "group_start=%d: the ranks matched different prefix "
+                        "depths at intake; nothing is registered on this pass, "
+                        "every rank re-matches capped at group_start and asks "
+                        "once more (a second split is the W65 stop).",
+                        str(req_id)[:16], int(span_base), int(local_span),
+                        span_lo, span_hi, group_len, _group_start,
+                    )
+                    if host_indices is not None:
+                        self.cache_controller.append_host_mem_release(
+                            host_indices=host_indices,
+                            extra_pools=[
+                                x for xfers in comp_xfers.values() for x in xfers
+                            ],
+                        )
+                    if anchor_lock_params is not None:
+                        self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+                    _marks = self.__dict__.setdefault(_SPAN_REGROUP_ATTR, {})
+                    _marks[str(req_id)] = (
+                        _group_start, span_lo, span_hi, int(group_len),
+                    )
+                    return
                 raise HiCacheCollectiveDesyncError(
                     "W65 Weg2PrefetchSpanSplit: the ranks entered "
                     "prefetch_participation_vote with DIFFERENT pre-vote spans "
