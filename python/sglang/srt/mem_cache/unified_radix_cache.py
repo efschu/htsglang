@@ -6594,6 +6594,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req=None,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
+        if req is not None:
+            # H105e: True only when THIS call is refused by the group floor
+            # below (schedule_policy._h105c_follow reads it right after).
+            req._h105e_floor_refused = False
         if self.cache_controller is None:
             return False
 
@@ -6758,6 +6762,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         int(kv_tokens) - int(floor), _ev,
                         int(getattr(_res, "num_tokens_evicted", 0) or 0), _n,
                     )
+            if req is not None:
+                req._h105e_floor_refused = True  # H105e: the floor, not the tier
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False

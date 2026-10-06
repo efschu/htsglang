@@ -863,17 +863,64 @@ def _h105c_follow(adder, req, lb_extent, follow, new_indices) -> torch.Tensor:
     ADMIT (a follower reads the verdict before its load-back), must not WAIT
     alone -- that ended the workers' loop one gate call short of the host's.
     It follows (:func:`_h105c_follow_load_back`); anything else passes
-    ``new_indices`` through untouched."""
+    ``new_indices`` through untouched.
+
+    H105e: under the #239 token cut the same holds for a KV-ONLY rank (no
+    anchor adopted) whose load-back the group FLOOR refused (see
+    :func:`_h105e_kv_only_floor_refused`)."""
     if (
         int(new_indices.numel()) == 0
         and lb_extent
         and int(lb_extent) > 0
-        and getattr(req, "mamba_loadback_anchor_adopted", False)
         and follow is not None
         and not getattr(follow, "host_decides_load_back", False)
+        and (
+            getattr(req, "mamba_loadback_anchor_adopted", False)
+            or _h105e_kv_only_floor_refused(req, int(lb_extent))
+        )
     ):
         return _h105c_follow_load_back(adder, req, int(lb_extent))
     return new_indices
+
+
+#: H105e: how often a KV-only rank followed the gathered ADMIT.
+_H105E_FOLLOWED = {"n": 0}
+
+
+def _h105e_kv_only_floor_refused(req, lb_extent: int) -> bool:
+    """H105e (NF xc boot dkrnfint4h6ablxcbar1dauer10061548, 220e3f8b70, D log
+    227758-227879, 16:52:04Z, weg2-72-531, FormAAdmissionSplit EXTEND-SET
+    SPLIT host=(16640, 18729) local=(0, 2688)): under the token cut every rank
+    took the gathered ADMIT before its load-back (H105d had found each rank's
+    room). The group floor then refused the load-back on EVERY rank (0 rows).
+    TP0 had adopted its GDN anchor and followed (H105c, ``FOLLOW-ROOM ...
+    available=65536`` -> 16640); TP1/TP2 walk ``MambaComponent:absent`` --
+    KV-only, no anchor -- so H105c's condition missed them, they took the
+    #1048 "served 0" arm, re-prefilled from 0 and split from the host.
+
+    A rank-local 0 the FLOOR made is the follow case, anchor or not
+    (``req._h105e_floor_refused``, written by ``load_back`` at that refusal
+    only). Any other 0 (a stale stamp, an unservable component) keeps the
+    #1048 arm. Token cut only: off the cut the host decides first (H105b) and
+    nothing here changes."""
+    if getattr(req, "_h105e_floor_refused", False) is not True:
+        return False
+    from sglang.srt.rank_role import form_a_token_cut_active
+
+    if not form_a_token_cut_active():
+        return False
+    _H105E_FOLLOWED["n"] += 1
+    n = _H105E_FOLLOWED["n"]
+    if n <= 20 or (n & (n - 1)) == 0:
+        logger.info(
+            "H105e FORM-A-CUT KV-ONLY FOLLOW rid=%s extent=%d (n=%d): the group "
+            "floor refused this rank's load-back after it took the gathered "
+            "ADMIT and no GDN anchor was adopted (KV-only walk); it follows "
+            "the ADMIT through its own room like an anchor rank (H105c), "
+            "instead of re-prefilling from its device prefix alone",
+            getattr(req, "rid", "?"), int(lb_extent), n,
+        )
+    return True
 
 
 def _h105c_follow_load_back(adder, req, lb_extent: int) -> torch.Tensor:
