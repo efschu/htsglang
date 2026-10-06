@@ -106,15 +106,20 @@
   function vecFields(r, parts, ctx) {
     const k = esc(r.key);
     const n = ctx.n;
+    /* je RANG statt je Karte (ctx.rankNames, ui_info "je_rang", z. B. --rank-gpu-id): die Eintragszahl ist die Rangzahl, Duplikate legen mehrere Ränge auf eine Karte;
+       darum kein Kartenname am Feld, keine Summe und kein "N Einträge, aber M Karten". */
+    const perRank = !!(ctx.rankNames && ctx.rankNames.has(r.name));
     const cells = parts.map((p, i) => {
-      const rk = ctx.ranks && ctx.ranks[i];
+      const rk = !perRank && ctx.ranks && ctx.ranks[i];
       const lab = "Rang " + i + (rk && rk.name ? " · " + shortName(rk.name) : "");
-      const tipc = "Rang " + i + (i === 0 ? " (Host: größte Karte)" : "") + (rk ? ": " + rk.name + (rk.mib ? ", " + rk.mib + " MiB" : "") : "");
+      const tipc = perRank ? "Rang " + i + ": Index der physischen Karte, auf der dieser Rang läuft" : "Rang " + i + (i === 0 ? " (Host: größte Karte)" : "") + (rk ? ": " + rk.name + (rk.mib ? ", " + rk.mib + " MiB" : "") : "");
       return `<label class="pfx-c"><span class="pfx-cl" title="${esc(tipc)}">${esc(lab)}</span><input type="text" inputmode="decimal" size="6" data-vk="${k}" data-vi="${i}" data-fid="vk:${k}:${i}" value="${esc(p)}" spellcheck="false" autocomplete="off" aria-label="${esc(r.name + " " + lab)}"></label>`;
     }).join("");
-    const sum = vecSum(parts);
+    const sum = perRank ? null : vecSum(parts);
     const pos = ctx.posNames && ctx.posNames.has(r.name);
-    const warn = n != null && parts.length !== n ? `<div class="pfx-warn"><span class="pfx-vchip pfx-v-hinweis">${parts.length} Einträge, aber ${n} Karte${n === 1 ? "" : "n"}</span> <span class="muted">${pos ? "Der Launcher führt diesen Wert als Vektor je Karte (PROFILE-VECTORS verweigert eine andere Zahl); " : ""}Jeder Eintrag gehört zu einem Rang.</span></div>` : "";
+    const warn = perRank
+      ? `<div class="pfx-warn"><span class="pfx-vchip pfx-v-geht">${parts.length} Ränge</span> <span class="muted">Je Rang ein Eintrag: die Nummer der physischen Karte; dieselbe Nummer mehrfach legt mehrere Ränge auf diese Karte.</span></div>`
+      : n != null && parts.length !== n ? `<div class="pfx-warn"><span class="pfx-vchip pfx-v-hinweis">${parts.length} Einträge, aber ${n} Karte${n === 1 ? "" : "n"}</span> <span class="muted">${pos ? "Der Launcher führt diesen Wert als Vektor je Karte (PROFILE-VECTORS verweigert eine andere Zahl); " : ""}Jeder Eintrag gehört zu einem Rang.</span></div>` : "";
     return `<div class="pfx-vec" data-vrow="${k}" role="group" aria-label="${esc(r.name)} je Rang">${cells}${sum != null ? `<span class="pfx-sum" title="Summe der Einträge">Σ ${esc(fmtNum(sum))}</span>` : ""}</div>${warn}`;
   }
   /* Felder je Rang NUR für einen ausdrücklich benannten Vektor (ctx.vecNames, vom Server: ui_info "vektoren").  Jede andere Kommaliste

@@ -134,12 +134,12 @@ const dep = (d) => '<i class="dep">' + d.to + '</i>';
 const base = (o) => Object.assign({ key: "flag:--pp-stage-ratio", name: "--pp-stage-ratio", scope: "launcher", value: "31,17,16", bare: false, multi: false, origin: "profil", origin_label: "Profil",
   profile_value: "31,17,16", planner_value: null, changed: false,
   explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Layer je Karte", source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", choices: null } }, o || {});
-const ctx = (o) => Object.assign({ vecNames: new Set(__VEC__), posNames: new Set(__POS__), n: 3, ranks: [], mode: "experte", prop: null, vsrc: "prop", dry: null, open: {}, cmsg: null, hasProfileValues: true,
+const ctx = (o) => Object.assign({ vecNames: new Set(__VEC__), posNames: new Set(__POS__), rankNames: new Set(__RANK__), n: 3, ranks: [], mode: "experte", prop: null, vsrc: "prop", dry: null, open: {}, cmsg: null, hasProfileValues: true,
   short: (r) => (r.explain.parts[0] || {}).text || "", explain: () => "<div>voll</div>", depChip: dep, isOpen: () => true }, o || {});
 """
 
 
-JS_HEAD = JS_HEAD.replace("__VEC__", json.dumps(PL.vector_names())).replace("__POS__", json.dumps(PL.POSITIONAL_FLAGS + [t.rstrip("=") for t in PL.POSITIONAL_TOKENS]))
+JS_HEAD = JS_HEAD.replace("__VEC__", json.dumps(PL.vector_names())).replace("__POS__", json.dumps(PL.POSITIONAL_FLAGS + [t.rstrip("=") for t in PL.POSITIONAL_TOKENS])).replace("__RANK__", json.dumps(PL.RANK_VECTORS))
 
 
 def run_node(body):
@@ -453,8 +453,7 @@ class AllVectorsAreFields(unittest.TestCase):
     """Review-Befund 1: auch die positionalen Launcher-Vektoren ausserhalb der Namen A-C (Release-Profile nf*/27b*) bekommen ein Feld je Karte, kein Kommastring."""
 
     EXTRA = [["--d-foreign-context-mib", "1446,896,894"], ["--d-nontorch-mib", "1981,528,524"], ["SGLANG_WEG2_EXTEND_TRIM_MIB", "1200,0,0"],
-             ["--d-reserve-mib", "100,200,300"], ["--pp-cut-reserve-mib", "10,20,30"],
-             ["--p-barlink-bar1-window-mib", "256,256,256"]]       # nicht in A-C: landet in E und muss trotzdem Felder haben
+             ["--d-reserve-mib", "100,200,300"], ["--pp-cut-reserve-mib", "10,20,30"]]
 
     @classmethod
     def setUpClass(cls):
@@ -473,9 +472,8 @@ class AllVectorsAreFields(unittest.TestCase):
             self.assertNotIn('data-k="flag:%s" value="%s"' % (name, val), self.h, name)
             self.assertNotRegex(self.h, r'<input type="text" data-k="flag:%s" value="[^"]*,' % re.escape(name))
 
-    def test_the_rest_list_uses_fields_too(self):
+    def test_the_rest_list_does_not_repeat_them(self):
         i = self.h.index("E  Übrige Werte")
-        self.assertIn('data-vk="flag:--p-barlink-bar1-window-mib" data-vi="2"', self.h[i:])
         self.assertNotIn("--d-foreign-context-mib", self.h[i:])      # steht in A, nicht noch einmal in E
 
     def test_nothing_unhandled(self):
@@ -486,12 +484,14 @@ class AllVectorsAreFields(unittest.TestCase):
 class OnlyNamedVectorsAreFields(unittest.TestCase):
     """Review-Befund 1 (Runde 2): Felder je Rang nur fuer eine ausdrueckliche Vektormenge, jede andere Kommaliste bleibt ein Textfeld."""
 
-    EXTRA = [["--dual-share-actuators", "green,duty"], ["--cuda-graph-bs", "1,2,4,8"], ["--pp-layer-set", "0-2,4-6,7-9"]]
+    EXTRA = [["--dual-share-actuators", "green,duty"], ["--cuda-graph-bs", "1,2,4,8"], ["--pp-layer-set", "0-2,4-6,7-9"],
+             # Runde 3: vom Launcher aus der Je-Karte-Zaehlung genommen (_TOPOLOGY_VECTOR_FLAGS/-TOKENS): Textfeld, nie "N Einträge, aber M Karten"
+             ["--p-barlink-bar1-window-mib", "24,PP_0=96"], ["--d-reshard-presets", "a:1,b:2"], ["SGLANG_WEG2_L15_MIB", "512,512"]]
 
     @classmethod
     def setUpClass(cls):
         cls.ui = PL.ui_info(("flip", "tp"), _catalog()["entries"], True)
-        cls.o = run_harness({"planer": cls.ui, "module": True, "extra": cls.EXTRA + [["--p-barlink-bar1-window-mib", "256,256"]]})
+        cls.o = run_harness({"planer": cls.ui, "module": True, "extra": cls.EXTRA})
         cls.h = cls.o["afterLoad"]
 
     def test_non_vector_comma_lists_stay_one_text_field(self):
@@ -500,24 +500,38 @@ class OnlyNamedVectorsAreFields(unittest.TestCase):
             self.assertIn('data-k="flag:%s" value="%s"' % (name, val), self.h, name)
 
     def test_no_made_up_rank_hint_for_them(self):
-        self.assertEqual(self.h.count("2 Einträge, aber 3 Karten"), 1)       # nur der benannte Vektor --p-barlink-bar1-window-mib (256,256) warnt
-        self.assertNotIn("4 Einträge, aber 3 Karten", self.h)
+        self.assertNotIn("Einträge, aber", self.h)
 
-    def test_a_named_vector_with_the_wrong_count_still_warns_and_names_the_launcher_code(self):
-        self.assertIn("2 Einträge, aber 3 Karten", self.h)
-        self.assertIn("PROFILE-VECTORS", self.h)                      # --p-barlink-bar1-window-mib steht in POSITIONAL_VECTOR_FLAGS
+    def test_the_launcher_excluded_ones_are_text_fields_not_vectors(self):
+        """Review-Befund 1 (Runde 3): BAR1-Fenster, d_reshard-Presets, L1.5 zaehlt der Launcher nicht je Karte; kein PROFILE-VECTORS-Satz fuer sie."""
+        for n in PL.LAUNCHER_NICHT_JE_KARTE:
+            self.assertNotIn(n, PL.vector_names())
+            self.assertNotIn(n, self.ui["vektoren"])
+            self.assertNotIn(n, self.ui["positional"])
+            self.assertNotRegex(self.h, r'data-vk="[a-z]+:%s"' % re.escape(n))
+        for name, val in self.EXTRA[3:]:
+            self.assertIn('data-k="flag:%s" value="%s"' % (name, val), self.h, name)
+        self.assertNotIn("PROFILE-VECTORS", self.h)
 
-    def test_the_vector_set_is_the_launchers_plus_named_section_vectors(self):
-        src = _src("launcher.py")
-        tree = ast.parse(src)
-        got = {}
+    def test_the_vector_set_is_the_launchers_topology_set_plus_named_section_vectors(self):
+        """vector_names()/POSITIONAL_* sind exakt das, was der Launcher je Karte zaehlt: _TOPOLOGY_VECTOR_FLAGS/-TOKENS, aus dem Quelltext nachgebildet (nicht abgeschrieben)."""
+        tree = ast.parse(_src("launcher.py"))
+        ns = {}
+        want = ("POSITIONAL_VECTOR_FLAGS", "POSITIONAL_VECTOR_TOKENS", "_TOPOLOGY_VECTOR_FLAGS", "_TOPOLOGY_VECTOR_TOKENS")
         for node in tree.body:
-            if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") in ("POSITIONAL_VECTOR_FLAGS", "POSITIONAL_VECTOR_TOKENS"):
-                got[node.targets[0].id] = [e.value for e in node.value.elts]
-        flags = ["--" + d.replace("_", "-") for d in got["POSITIONAL_VECTOR_FLAGS"]]
-        toks = [t.rstrip("=") for t in got["POSITIONAL_VECTOR_TOKENS"]]
-        self.assertEqual(sorted(set(PL.POSITIONAL_FLAGS)), sorted(set(flags)))
-        self.assertEqual(sorted(set(t.rstrip("=") for t in PL.POSITIONAL_TOKENS)), sorted(set(toks)))
+            if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") in want:
+                ns[node.targets[0].id] = eval(compile(ast.Expression(node.value), "launcher.py", "eval"), {}, dict(ns))
+        self.assertEqual(sorted(ns), sorted(want))
+        flags = ["--" + d.replace("_", "-") for d in ns["_TOPOLOGY_VECTOR_FLAGS"]]
+        toks = [t.rstrip("=") for t in ns["_TOPOLOGY_VECTOR_TOKENS"]]
+        self.assertEqual(PL.POSITIONAL_FLAGS, flags)
+        self.assertEqual([t.rstrip("=") for t in PL.POSITIONAL_TOKENS], toks)
+        # die volle Launcher-Liste minus genau die ausgenommenen
+        full_f = ["--" + d.replace("_", "-") for d in ns["POSITIONAL_VECTOR_FLAGS"]]
+        full_t = [t.rstrip("=") for t in ns["POSITIONAL_VECTOR_TOKENS"]]
+        self.assertEqual(sorted(PL.POSITIONAL_FLAGS_ALL), sorted(full_f))
+        self.assertEqual(sorted(t.rstrip("=") for t in PL.POSITIONAL_TOKENS_ALL), sorted(full_t))
+        self.assertEqual(sorted(set(full_f + full_t) - set(flags + toks)), sorted(PL.LAUNCHER_NICHT_JE_KARTE))
         names = set(PL.vector_names())
         self.assertTrue(set(flags) | set(toks) <= names)
         self.assertEqual(len(PL.vector_names()), len(names))
@@ -527,6 +541,33 @@ class OnlyNamedVectorsAreFields(unittest.TestCase):
             self.assertIn(n, entries, n)
         for n in ("--dual-share-actuators", "--cuda-graph-bs", "--pp-layer-set", "--p-layer-split", "--kv-reshard-vectors"):
             self.assertNotIn(n, names)
+
+
+@unittest.skipUnless(NODE, "node fehlt")
+class RankIdIsPerRank(unittest.TestCase):
+    """Review-Befund 2 (Runde 3): --rank-gpu-id hat je RANG ein Feld; Duplikate legen mehrere Raenge auf eine Karte."""
+
+    def test_ui_info_names_it(self):
+        self.assertEqual(PL.ui_info()["je_rang"], ["--rank-gpu-id"])
+        self.assertIn("--rank-gpu-id", PL.vector_names())
+
+    def test_fields_per_rank_without_card_names_sum_or_mismatch_warning(self):
+        o = run_node("""
+const c = ctx({ n: 3, ranks: [{ name: "NVIDIA GeForce RTX 5090", mib: 32607 }, { name: "RTX 3080", mib: 20480 }, { name: "RTX 3080", mib: 20480 }] });
+const row = (v) => base({ key: "flag:--rank-gpu-id", name: "--rank-gpu-id", value: v });
+out.four = PX.renderRow(row("1,1,0,2"), c);
+out.three = PX.renderRow(row("1,0,2"), c);
+out.other = PX.renderRow(base({ key: "flag:--rank-tp-ratio", name: "--rank-tp-ratio", value: "1,1,1" }), c);
+""")
+        for k, n in (("four", 4), ("three", 3)):
+            self.assertEqual(len(re.findall(r'data-vi="', o[k])), n, k)
+            self.assertIn("%d Ränge" % n, o[k])
+            self.assertNotIn("Einträge, aber", o[k])
+            self.assertNotIn("Σ", o[k])
+            self.assertNotIn("RTX", o[k])                          # kein Kartenname am Rangfeld
+            self.assertIn("Rang 3" if n == 4 else "Rang 2", o[k])
+        self.assertIn("Σ 3", o["other"])                           # die anderen Vektoren bleiben je Karte mit Summe
+        self.assertIn("Rang 0 · RTX 5090", o["other"])
 
 
 class Css(unittest.TestCase):

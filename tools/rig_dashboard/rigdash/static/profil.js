@@ -456,7 +456,7 @@
     const PX = window.ProfilPlaner;
     const cards = st.prop && st.prop.vorschlag && st.prop.vorschlag.cards ? st.prop.vorschlag.cards.map((c) => ({ name: c.name, mib: c.total_mib })) : [];
     const pl = (st.list && st.list.planer) || {};
-    return { vecNames: new Set(pl.vektoren || []), posNames: new Set(pl.positional || []), n: nCards(), ranks: cards, mode: st.mode, prop: st.prop, vsrc: st.vsrc, dry: st.dry, open: st.open, cmsg: st.cmsg, isOpen,
+    return { vecNames: new Set(pl.vektoren || []), posNames: new Set(pl.positional || []), rankNames: new Set(pl.je_rang || []), n: nCards(), ranks: cards, mode: st.mode, prop: st.prop, vsrc: st.vsrc, dry: st.dry, open: st.open, cmsg: st.cmsg, isOpen,
              hasProfileValues: !!(st.doc && Object.keys((st.doc.meta || {}).profile_values || {}).length),
              input: inputFor, short: (r) => { const f = r.explain.parts.length ? r.explain.parts[0].text : ""; return f.length > 170 ? f.slice(0, 168) + "…" : f; },
              explain: drawExplain, depChip, PX };
