@@ -489,18 +489,19 @@ print(json.dumps({"hw": hw, "model": model, "bar": PC.contract_bar(st, "P")}))
     def test_d_phase_has_no_weights_on_zero_weight_ranks_and_reserve_is_the_default_corridor(self):
         d = self.ask()["result"]["phases"]["D"]["bars"]
         self.assertFalse(any(s["name"] == "weights" for s in d[1]["segments"]))
-        # Korridor ohne Messrecord = 1024 stated law + 404 Wach-Ueberschuss (launcher.py:266-269), Budget auf 8 MiB abgerundet: Reserve 1428 .. 1435
+        # Fix-Runde 5: ohne --profile gilt der Standard des Launchers (qwen27b): der gebuchte Rest D_AWAKE_REST_BOOKED_MIB (3191 auf Karte 0) ersetzt Boden + 404,
+        # dc = 0 (keine Festposten im Profil), Budget auf 8 MiB abgerundet: Reserve 3191 .. 3198
         res0 = next(s for s in d[0]["segments"] if s["name"] == "reserve")["mib"]
-        self.assertTrue(1428.0 <= res0 < 1436.0, res0)
+        self.assertTrue(3191.0 <= res0 < 3199.0, res0)
 
     def test_dual_share_d_phase_is_sized_from_the_p_plan_through_the_worker(self):
-        # Fix-Runde 4, Befund 1: D-Budget = (Karte - 1428 - (P-Budget + Overhead)) // 8 * 8, P-Budget aus --extra-p (Gruppe P), nicht aus dem Profil
+        # Fix-Runde 5: D-Budget = (Karte - (P-Budget + Overhead) - gebuchter Rest) // 8 * 8 (Profil qwen27b), P-Budget aus --extra-p (Gruppe P), nicht aus dem Profil
         r = self.ask(server_args={"--pp-stage-ratio": "29,11,8", "--pp-attn-stage-ratio": "7,3,2", "--max-kv-per-request": "262144", "--draft-kv-on-p": "off",
                                   "--dual-share": "", "--dual-p-overhead-mib": "2500", "--dual-unified-kv": "on"},
                      phase_args={"P": {"--rank-gpu-memory-mib": "6610,5050,5200"}, "D": {"--rank-tp-ratio": "1,1,1"}})
         self.assertTrue(r["ok"], r)
         d = r["result"]["phases"]["D"]["bars"]
-        self.assertEqual([b["budget_mib"] for b in d], [22064.0, 11496.0, 11352.0])
+        self.assertEqual([b["budget_mib"] for b in d], [20304.0, 10848.0, 10712.0])      # qwen27b: (Karte - dc - gebuchter Rest 3191/2079/2067) // 8 * 8
         self.assertEqual([b["outside_budget_mib"] for b in d], [9110.0, 7550.0, 7700.0])
 
 

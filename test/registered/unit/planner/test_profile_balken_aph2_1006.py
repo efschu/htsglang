@@ -16,6 +16,7 @@ Gepinnt:
 import copy
 import json
 import os
+import types
 import unittest
 from unittest import mock
 
@@ -46,7 +47,8 @@ def hw(cards=RIG3):
 # Profilzeilen der NF-abl-Form (docker/profiles/nf-int4-h6-abl.env), auf die hier relevanten Flags gekuerzt
 NF_ARGS = {"--pp-stage-ratio": "29,11,8", "--pp-attn-stage-ratio": "7,3,2", "--pp-cut-expert-device-fraction": "0.330,0.701,0.652",
            "--pp-cut-expert-lru-rows": "32,32,32", "--max-kv-per-request": "262144", "--d-foreign-context-mib": "1446,896,894",
-           "--d-nontorch-mib": "1981,528,524", "--draft-kv-on-p": "off", "--d-kv-token-cut": "owned"}
+           "--d-nontorch-mib": "1981,528,524", "--draft-kv-on-p": "off", "--d-kv-token-cut": "owned",
+           "--profile": "nextflash", "--user-reserve-mib": "0,0,0"}
 NF_PA = {"P": {"--kv-cache-dtype": "fp8_e4m3", "--max-mamba-cache-size": "32", "--mamba-ssm-dtype": "bfloat16", "--chunked-prefill-size": "16384"},
          "D": {"--rank-role": "host,worker,worker", "--rank-tp-ratio": "1,0,0", "--rank-moe-ratio": "183,137,168",
                "--rank-moe-resident-fraction": "0.06,0.51,0.48", "--speculative-draft-placement": "solo", "--speculative-algorithm": "NEXTN",
@@ -240,11 +242,14 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         d = nf()["phases"]["D"]["bars"]
         # Festposten (fremd + nichttorch) liegen ausserhalb des Budgets (Launcher: verfuegbar = Karte - fremd - nichttorch - reserve)
         # Korridor = 1024 stated law + 404 eingebauter Wach-Ueberschuss (launcher.py:266-269), auf 8 MiB abgerundet (launcher.py:15394)
-        self.assertEqual([b["budget_mib"] for b in d], [27752, 17624, 17632])
+        # Fix-Runde 5: Launcher-Formel MIT den Records des Profils nextflash (--profile nextflash, --user-reserve-mib 0,0,0):
+        #   Karte 0: 32607 - Boden 1024 (Wach-Rest-Record 2672 ersetzt die 404) - dc 3427 - Wachstum 482 - Wach-Rest 2672 = 25002 -> 25000
+        #   Karte 1: 20480 - (1024 + 404) - dc 1424 - Wachstum 572 = 17056;  Karte 2: 20480 - 1428 - dc 1418 - Wachstum 384 = 17250 -> 17248
+        self.assertEqual([b["budget_mib"] for b in d], [25000, 17056, 17248])
         self.assertEqual(d[0]["budget_herkunft"], "gerechnet")
-        for b, rest in zip(d, (1428, 1432, 1430)):                                   # Reserve = Korridor + Rundungsrest
+        for b in d:
             self.assertEqual(b["budget_over_available_mib"], 0)
-            self.assertEqual(seg(b, "reserve")["mib"], rest)
+            self.assertAlmostEqual(seg(b, "reserve")["mib"], b["available_mib"] - b["budget_mib"], places=2)
         pa = copy.deepcopy(NF_PA)
         pa["D"]["--rank-gpu-memory-mib"] = "28000,17000,17000"
         d2 = nf(pa=pa)["phases"]["D"]["bars"]
@@ -449,7 +454,8 @@ class TestBridge(unittest.TestCase):
 # (= Gruppe P, NICHT im gemeinsamen Profil: D darf P's Budgets nicht erben), Schnitt 31,17,16, Overhead 2500
 DUAL_ARGS = {"--pp-stage-ratio": "31,17,16", "--pp-attn-stage-ratio": "7,5,4", "--max-kv-per-request": "262144", "--draft-kv-on-p": "off",
              "--dual-share": "", "--dual-p-overhead-mib": "2500",
-             "--dual-unified-kv": "on", "--dual-p-kv-max-tokens": "196608", "--p-chunk-max": "1024"}
+             "--dual-unified-kv": "on", "--dual-p-kv-max-tokens": "196608", "--p-chunk-max": "1024",
+             "--user-reserve-mib": "1800,1400,1400"}                      # vererbt aus 27b-base.env:78 (Release-Dual); --profile fehlt: Standard qwen27b
 DUAL_PA = {"P": {"--rank-gpu-memory-mib": "6610,5050,5200", "--max-mamba-cache-size": "8"}}
 
 
@@ -579,18 +585,20 @@ class TestDualShareDPhase(unittest.TestCase):
     def test_the_release_dual_d_bar_holds_p_plan_outside_its_budget(self):
         d = dual()["phases"]["D"]["bars"]
         dc = (6610 + 2500, 5050 + 2500, 5200 + 2500)
-        for b, tot, x in zip(d, (32607, 20480, 20480), dc):
+        for b, tot, x, rb in zip(d, (32607, 20480, 20480), dc, (3191, 2079, 2067)):
             fx = seg(b, "fixed")
             self.assertEqual((fx["mib"], fx.get("ausserhalb_budget")), (x, True))
             self.assertIn("aus P-Plan", fx["detail"])
             self.assertIn("launcher.py:14976", fx["detail"])
             self.assertEqual(b["outside_budget_mib"], x)
             self.assertEqual(b["available_mib"], tot - x)
-            self.assertEqual(b["budget_mib"], (tot - 1428 - x) // 8 * 8)                    # Launcher: (Karte - Korridor 1428 - dc) // 8 * 8
+            # Launcher qwen27b (budget_rest_from_records): (Karte - dc - gebuchter Rest D_AWAKE_REST_BOOKED_MIB) // 8 * 8; --user-reserve-mib 1800,1400,1400
+            # und die 404 werden daneben NICHT gebucht (launcher.py:15316-15322)
+            self.assertEqual(b["budget_mib"], (tot - x - rb) // 8 * 8)
             self.assertEqual((b["overflow_mib"], b["beyond_card_mib"], b["budget_over_available_mib"]), (0.0, 0.0, 0.0))
             self.assertNotIn("weights", [r["name"] for r in b["shared_with_d"]])             # D ist der Owner: seine Gewichte zaehlen gegen SEIN Budget
             self.assertGreater(seg(b, "weights")["mib"], 1000)
-        self.assertEqual([b["budget_mib"] for b in d], [22064, 11496, 11352])                 # Probe: launcher.budgets_from_dc mit dc 9110/7550/7700 (siehe unten)
+        self.assertEqual([b["budget_mib"] for b in d], [20304, 10848, 10712])                 # Probe: launcher.budgets_from_dc mit allen Argumenten, dc 9110/7550/7700 (Klasse unten)
 
     def test_the_old_wrong_budget_31583_is_gone_and_d_does_not_inherit_p_budgets(self):
         d = dual()["phases"]["D"]
@@ -599,21 +607,22 @@ class TestDualShareDPhase(unittest.TestCase):
         a = dict(DUAL_ARGS)
         a["--rank-gpu-memory-mib"] = "6610,5050,5200"
         r = dual(args=a, pa={"P": {"--max-mamba-cache-size": "8"}})
-        self.assertEqual([b["budget_mib"] for b in r["phases"]["D"]["bars"]], [22064, 11496, 11352])
+        self.assertEqual([b["budget_mib"] for b in r["phases"]["D"]["bars"]], [20304, 10848, 10712])
         self.assertEqual([b["budget_mib"] for b in r["phases"]["P"]["bars"]], [6610, 5050, 5200])
         # eine eigene Zeile der Gruppe D wird als ignoriert benannt, nicht stillschweigend uebernommen
         pa = copy.deepcopy(DUAL_PA)
         pa["D"] = {"--rank-gpu-memory-mib": "30000,18000,18000"}
         r = dual(pa=pa)
-        self.assertEqual([b["budget_mib"] for b in r["phases"]["D"]["bars"]], [22064, 11496, 11352])
+        self.assertEqual([b["budget_mib"] for b in r["phases"]["D"]["bars"]], [20304, 10848, 10712])
         self.assertTrue(any(x["was"] == "budget_mib" and "ignoriert" in x["herkunft"] for x in r["phases"]["D"]["inputs"]))
 
     def test_without_the_p_group_budget_the_d_budget_is_an_upper_bound_not_a_number_pretending_to_be_the_plan(self):
         d = dual(pa={})["phases"]["D"]["bars"]
-        for b, tot in zip(d, (32607, 20480, 20480)):
+        for b, tot, rb in zip(d, (32607, 20480, 20480), (3191, 2079, 2067)):
             self.assertIsNone(seg(b, "fixed")["mib"])
             self.assertIn("nicht gerechnet", seg(b, "fixed")["detail"])
-            self.assertEqual(b["budget_mib"], (tot - 1428) // 8 * 8)
+            self.assertNotIn("CUDA-Kontext der schlafenden Phase", seg(b, "fixed")["detail"])    # Befund 2: Text je Form, unter --dual-share ist es P's Plan
+            self.assertEqual(b["budget_mib"], (tot - rb) // 8 * 8)
             self.assertIn("fixed", [x["name"] for x in b["segments"]])
             self.assertIn("Festposten", b["not_computed"])
 
@@ -630,10 +639,16 @@ class TestDualShareDPhase(unittest.TestCase):
         self.assertFalse(any("D-Seite" in h for h in dual(args={k: v for k, v in DUAL_ARGS.items() if k != "--dual-share"}, tokens=["--dual-layout"])["hints"]))
 
 
+FLIP27_ARGS = {"--pp-stage-ratio": "31,17,16", "--pp-attn-stage-ratio": "7,5,4", "--max-kv-per-request": "262144", "--draft-kv-on-p": "off",
+               "--d-foreign-context-mib": "1446,896,894", "--d-nontorch-mib": "1981,528,524", "--user-reserve-mib": "1800,1400,1400"}   # Release-Flip 27b-base (qwen27b)
+
+
 class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
-    """Fix-Runde 4 (Zusatz des Planer-Sitzes): fuer jede Phase (P, D) und jede Form (flip, dual, d_only, single) stimmen Budget, Festposten und
-    Rest mit der Launcher-Formel ueberein; die D-Phase ruft ``launcher.budgets_from_dc`` / ``dual_share_planned_dc`` und ``pp_cut.d_rank_available_mib``
-    selbst auf (der Korridor-Boden kommt aus SGLANG_CORRIDOR_LAW_FLOOR_MIB=1024, host-unabhaengig)."""
+    """Fix-Runde 5 (Zusatz des Planer-Sitzes): fuer jede Phase (P, D) und jede Form (flip, dual, d_only, single) stimmen Budget, Festposten und
+    Rest mit der Launcher-Formel ueberein.  Die D-Phase wird gegen ``launcher.budgets_from_dc`` gehalten, aufgerufen mit ALLEN Argumenten, die der
+    Launcher in ``_d_spec_from`` uebergibt (launcher.py:27207-27214: overshoot, corridor_sample_path, corridor_constrain=True, user_reserve_by_card,
+    dormant_growth, charge_driver_carve, driver_carve_min_total_mib, awake_rest, terms_out, booked_rest_kwargs) -- fuer Release-Flip (27b-base),
+    Release-Dual, NF abl und d_only.  Der Korridor-Boden kommt aus SGLANG_CORRIDOR_LAW_FLOOR_MIB=1024 (host-unabhaengig)."""
 
     TOTALS = (32607, 20480, 20480)
 
@@ -645,16 +660,36 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
         except Exception as exc:                                  # pragma: no cover - ohne Launcher-Import nicht pruefbar
             raise unittest.SkipTest("launcher import: %r" % (exc,))
         cls.L, cls.PP = L, PP
-        cls.cards = [L.Card(nvml_index=i, uuid="U%d" % i, name="x", total_mib=t) for i, t in enumerate(cls.TOTALS)]
 
-    def launcher_budgets(self, dc):
-        with mock.patch.dict(os.environ, {"SGLANG_CORRIDOR_LAW_FLOOR_MIB": "1024"}):
-            return self.L.budgets_from_dc(self.cards, {c.uuid: int(dc[i]) for i, c in enumerate(self.cards)}, lambda *_: None, "D",
-                                          corridor_constrain=False)
+    def cards(self, reserved=(0, 0, 0)):
+        names = ("NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 3080", "NVIDIA GeForce RTX 3080")     # kalibrierte Klassen: driver_carve_charged liest den Namen
+        return [self.L.Card(nvml_index=i, uuid="U%d" % i, name=nm, total_mib=t, reserved_mib=r) for i, (nm, t, r) in enumerate(zip(names, self.TOTALS, reserved))]
 
-    def check_d_bar(self, bars, dc, available):
+    def launcher_budgets(self, dc, profile="qwen27b", reserve="0", env_d="", reserved=(0, 0, 0)):
+        """``_d_spec_from`` (launcher.py:27199-27214) Zeile fuer Zeile mit dem echten Launcher-Code."""
+        L, cards = self.L, self.cards(reserved)
+        ns = types.SimpleNamespace(profile=profile, env_d=env_d)
+        L.apply_profile_torch_cache_cap_default(ns)               # Registerzeile -> --env-d (launcher.py:14257)
+        urc = L.parse_user_reserve(reserve, cards)
+        _grow, _grow_prov = L.served_dormant_growth(cards, ns.profile)
+        _rest, _rest_prov = L.d_awake_rest(cards, ns.profile)
+        _over, _over_prov = L.d_overshoot_record(ns.profile)
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_WEG2_BUDGET_REST_RECORD"}
+        env["SGLANG_CORRIDOR_LAW_FLOOR_MIB"] = "1024"
+        terms = []
+        with mock.patch.dict(os.environ, env, clear=True):
+            out = L.budgets_from_dc(
+                cards, {c.uuid: int(dc[i]) for i, c in enumerate(cards)}, lambda *_: None, "D", overshoot_mib=_over,
+                overshoot_provenance=_over_prov, corridor_sample_path=None, corridor_constrain=True, user_reserve_by_card=urc,
+                dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
+                charge_driver_carve=L.budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=L.driver_carve_min_total_mib(ns.profile),
+                awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=terms,
+                **L.booked_rest_kwargs(cards, ns.profile, "D", None, capped=L.torch_cache_cap_armed(ns)))
+        return out
+
+    def check_d_bar(self, bars, dc, available, **kw):
         """Budget = Launcher-Budget; Festposten = dc ausserhalb; Verfuegbar = d_rank_available_mib; Reserve = Verfuegbar - max(Budget, Posten im Budget)."""
-        want = self.launcher_budgets(dc)
+        want = self.launcher_budgets(dc, **kw)
         self.assertEqual([b["budget_mib"] for b in bars], [float(x) for x in want])
         for b, x, av, w in zip(bars, dc, available, want):
             self.assertEqual(b["outside_budget_mib"], float(x))
@@ -663,33 +698,92 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
             self.assertAlmostEqual(seg(b, "reserve")["mib"], max(0.0, av - max(w, inside)), places=2)
             self.assertAlmostEqual(sum(x2["mib"] for x2 in b["segments"] if x2["mib"] is not None), max(b["total_mib"], b["posts_mib"] + 0.0), delta=0.01)
 
+    def test_release_flip_27b_base_books_the_measured_rest_and_not_the_user_reserve(self):
+        fo, nt = (1446, 896, 894), (1981, 528, 524)
+        dc = [a + b for a, b in zip(fo, nt)]
+        av = self.PP.d_rank_available_mib(card_total_mib=self.TOTALS, foreign_context_mib=fo, nontorch_mib=nt)
+        r = PC.phase_bars(hw(), model("qwen27b_int8_vocabembed"), dict(FLIP27_ARGS), {}, {})
+        self.assertEqual(r["form"], "flip")
+        d = r["phases"]["D"]["bars"]
+        self.check_d_bar(d, dc, av, profile="qwen27b", reserve="1800,1400,1400")
+        # von Hand: (Karte - dc - gebuchter Rest 3191/2079/2067) // 8 * 8; die Nutzerreserve 1800/1400/1400 wird daneben nicht gebucht
+        self.assertEqual([b["budget_mib"] for b in d], [(t - x - rb) // 8 * 8 for t, x, rb in zip(self.TOTALS, dc, (3191, 2079, 2067))])
+        self.assertIn("gebuchter Rest", d[0]["budget_note"] if "budget_note" in d[0] else seg(d[0], "reserve")["detail"])
+        self.assertIn("--user-reserve-mib (1800)", seg(d[0], "reserve")["detail"])
+
+    def test_the_reserve_path_charges_user_reserve_in_the_floor_where_no_booked_rest_exists(self):
+        """Befund 1 der Runde 5: --user-reserve-mib hebt den Korridor-Boden und senkt das D-Budget um genau diesen Betrag (Profil ohne gebuchten Rest)."""
+        fo, nt = (1446, 896, 894), (1981, 528, 524)
+        dc = [a + b for a, b in zip(fo, nt)]
+        av = self.PP.d_rank_available_mib(card_total_mib=self.TOTALS, foreign_context_mib=fo, nontorch_mib=nt)
+        a0, a1 = dict(NF_ARGS, **{"--user-reserve-mib": "0,0,0"}), dict(NF_ARGS, **{"--user-reserve-mib": "1800,1400,1400"})
+        b0 = [b["budget_mib"] for b in nf(args=a0, form="d_only")["phases"]["D"]["bars"]]
+        r1 = nf(args=a1, form="d_only")["phases"]["D"]["bars"]
+        self.check_d_bar(r1, dc, av, profile="nextflash", reserve="1800,1400,1400")
+        for x0, b1, res in zip(b0, r1, (1800, 1400, 1400)):
+            self.assertAlmostEqual(x0 - b1["budget_mib"], res, delta=7.01)                    # um genau die Reserve (Rundung auf 8)
+        self.assertIn("Nutzerreserve 1800", seg(r1[0], "reserve")["detail"])
+
     def test_d_phase_flip_and_d_only_foreign_plus_nontorch_is_dc(self):
         fo, nt = (1446, 896, 894), (1981, 528, 524)
         dc = [a + b for a, b in zip(fo, nt)]
         av = self.PP.d_rank_available_mib(card_total_mib=self.TOTALS, foreign_context_mib=fo, nontorch_mib=nt)
         flip = nf()
-        self.check_d_bar(flip["phases"]["D"]["bars"], dc, av)
+        self.check_d_bar(flip["phases"]["D"]["bars"], dc, av, profile="nextflash", reserve="0,0,0")
         d_only = nf(form="d_only")
         self.assertEqual(list(d_only["phases"]), ["D"])
-        self.check_d_bar(d_only["phases"]["D"]["bars"], dc, av)
+        self.check_d_bar(d_only["phases"]["D"]["bars"], dc, av, profile="nextflash", reserve="0,0,0")
         self.assertEqual([b["budget_mib"] for b in d_only["phases"]["D"]["bars"]], [b["budget_mib"] for b in flip["phases"]["D"]["bars"]])
 
     def test_d_phase_flip_without_fixed_lines_has_dc_zero_and_the_fixed_post_is_not_computed(self):
         a = {k: v for k, v in NF_ARGS.items() if k not in ("--d-foreign-context-mib", "--d-nontorch-mib")}
         d = nf(args=a)["phases"]["D"]["bars"]
-        self.assertEqual([b["budget_mib"] for b in d], [float(x) for x in self.launcher_budgets((0, 0, 0))])
+        self.assertEqual([b["budget_mib"] for b in d], [float(x) for x in self.launcher_budgets((0, 0, 0), profile="nextflash", reserve="0,0,0")])
         for b in d:
             self.assertIsNone(seg(b, "fixed")["mib"])
             self.assertEqual(b["outside_budget_mib"], 0.0)
 
     def test_d_phase_dual_share_dc_is_the_launcher_planned_dc(self):
         pb = [6610, 5050, 5200]
-        dc_launcher = self.L.dual_share_planned_dc(self.cards, pb, "", 2500)
-        dc = [dc_launcher[c.uuid] for c in self.cards]
+        dc_launcher = self.L.dual_share_planned_dc(self.cards(), pb, "", 2500)
+        dc = [dc_launcher[c.uuid] for c in self.cards()]
         av = [t - x for t, x in zip(self.TOTALS, dc)]
-        self.check_d_bar(dual()["phases"]["D"]["bars"], dc, av)
+        self.check_d_bar(dual()["phases"]["D"]["bars"], dc, av, profile="qwen27b", reserve="1800,1400,1400")
         # --extra-p mit kleinerem Wert senkt das Launcher-Budget (min), das Profil nennt nur den Wert der Gruppe P
-        self.assertEqual(self.L.dual_share_planned_dc(self.cards, [9000, 9000, 9000], "--rank-gpu-memory-mib 6610,5050,5200", 2500), dc_launcher)
+        self.assertEqual(self.L.dual_share_planned_dc(self.cards(), [9000, 9000, 9000], "--rank-gpu-memory-mib 6610,5050,5200", 2500), dc_launcher)
+
+    def test_every_booked_path_of_the_launcher_is_met_cap_switch_scalar_reserve_and_known_carve(self):
+        fo, nt = (1446, 896, 894), (1981, 528, 524)
+        dc = [a + b for a, b in zip(fo, nt)]
+        av = self.PP.d_rank_available_mib(card_total_mib=self.TOTALS, foreign_context_mib=fo, nontorch_mib=nt)
+        # Torch-Cache-Kappe: --env-d nennt den Schalter (0 = ungekappter Rest), sonst gilt die Registerzeile
+        for env in ("SGLANG_WEG2_TORCH_CACHE_CAP=0", "SGLANG_WEG2_TORCH_CACHE_CAP=1"):
+            pe = {"D": {"SGLANG_WEG2_TORCH_CACHE_CAP": env.split("=")[1]}}
+            r = PC.phase_bars(hw(), model("qwen27b_int8_vocabembed"), dict(FLIP27_ARGS), {}, pe)
+            self.check_d_bar(r["phases"]["D"]["bars"], dc, av, profile="qwen27b", reserve="1800,1400,1400", env_d=env)
+        # skalare Reserve gilt fuer jede Karte (launcher.py:14152-14158)
+        a = dict(NF_ARGS, **{"--user-reserve-mib": "1000"})
+        self.check_d_bar(nf(args=a, form="d_only")["phases"]["D"]["bars"], dc, av, profile="nextflash", reserve="1000")
+        # bekannter Treiber-Carve (Hardwareprofil driver_reserved_mib): nextflash bucht ihn auf jeder Karte, qwen27b im gebuchten-Rest-Pfad ebenfalls (launcher.py:15331)
+        carve = (518, 425, 425)
+        h = hw()
+        for c, v in zip(h["cards"], carve):
+            c["driver_reserved_mib"] = {"v": float(v), "src": "NVML"}
+        for prof, args, m in (("qwen27b", FLIP27_ARGS, model("qwen27b_int8_vocabembed")), ("nextflash", NF_ARGS, model("nextflash_int4mixed"))):
+            pa = NF_PA if prof == "nextflash" else {}
+            r = PC.phase_bars(h, m, dict(args), pa, NF_PE if prof == "nextflash" else {})
+            self.check_d_bar(r["phases"]["D"]["bars"], dc, av, profile=prof, reserve=args["--user-reserve-mib"], reserved=carve)
+
+    def test_a_wrong_reserve_vector_is_refused_like_the_launcher(self):
+        a = dict(NF_ARGS, **{"--user-reserve-mib": "1800,1400"})
+        r = nf(args=a, form="d_only")["phases"]["D"]
+        self.assertFalse(r["ok"])
+        self.assertIn("--user-reserve-mib", r["error"])
+
+    def test_the_unpriced_inputs_are_named_in_the_budget_tooltip(self):
+        t = seg(nf()["phases"]["D"]["bars"][1], "reserve")["detail"]
+        for word in ("NICHT GERECHNET", "Treiber-Carve", "Korridor-Boden", "Korridor-Pass"):
+            self.assertIn(word, t)
 
     def test_d_phase_explicit_budget_is_taken_as_asked_and_the_rest_is_available_minus_budget(self):
         pa = copy.deepcopy(NF_PA)
@@ -708,8 +802,8 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
             self.assertAlmostEqual(seg(b, "reserve")["mib"], max(0.0, b["total_mib"] - max(bud, inside)), places=2)
 
     def test_p_phase_dual_budget_is_the_group_line_and_the_fixed_post_is_the_overhead_outside(self):
-        dc_launcher = self.L.dual_share_planned_dc(self.cards, [6610, 5050, 5200], "", 2500)
-        for b, bud, c in zip(dual()["phases"]["P"]["bars"], (6610, 5050, 5200), self.cards):
+        dc_launcher = self.L.dual_share_planned_dc(self.cards(), [6610, 5050, 5200], "", 2500)
+        for b, bud, c in zip(dual()["phases"]["P"]["bars"], (6610, 5050, 5200), self.cards()):
             self.assertEqual(b["budget_mib"], bud)
             self.assertEqual(seg(b, "fixed")["mib"], float(dc_launcher[c.uuid] - bud))      # Launcher: dc = Budget + Overhead -> Overhead = dc - Budget
             self.assertEqual(b["available_mib"], b["total_mib"] - 2500)
