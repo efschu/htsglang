@@ -72,6 +72,10 @@ def text_for_issue(text: str) -> str:
 _SECRET_WORDS = frozenset(("secret", "secrets", "password", "passwd", "pwd", "credential", "credentials", "bearer", "authorization", "pat",
                            "apikey", "adminkey", "accesskey", "privatekey"))
 _KEY_PREFIX = frozenset(("api", "admin", "access", "private", "auth", "ssh"))
+# ``key`` as the LAST word of a name is a credential whatever precedes it (``OPENROUTER_KEY``, ``WANDB_KEY``, ``ANTHROPIC_KEY``): a user can set any
+# env name, so a closed prefix list lets vendor keys through.  Allow list = catalog names whose ``key`` is a lookup key, not a credential
+# (``SGLANG_LOG_DECODE_GRAPH_KEY``, ``SGLANG_WEG2_TOLD_PROBE_TREE_KEY``): the word before ``key`` is ``graph`` / ``tree``.
+_KEY_IS_NOT_SECRET = frozenset(("graph", "tree"))
 _TOKEN_PREFIX = frozenset(("hf", "hub", "huggingface", "github", "gh", "gitlab", "auth", "access", "bearer", "api", "admin", "boot", "refresh",
                            "session", "bot", "slack", "pypi", "npm"))
 _TOKEN_SUFFIX = frozenset(("key", "value", "secret", "string", "file"))
@@ -96,6 +100,8 @@ def secret_name(name: str) -> bool:
     """True when ``name`` (a flag, profile variable or env name) names a secret, e.g. ``HF_TOKEN``, ``--admin-api-key``, ``GITHUB_PAT``."""
     w = _words(name)
     if any(x in _SECRET_WORDS for x in w) or any(a in _KEY_PREFIX and b == "key" for a, b in zip(w, w[1:])):
+        return True
+    if w and w[-1] == "key" and (len(w) == 1 or w[-2] not in _KEY_IS_NOT_SECRET):          # the name ENDS in ``key``
         return True
     for i, x in enumerate(w):
         if x != "token":

@@ -335,10 +335,24 @@ class Redaction(Base):
         self.assertFalse(redact.secret_name("--max-total-tokens"))
         self.assertFalse(redact.secret_name("--tokenizer"))
         self.assertFalse(redact.secret_name("--tp-prefill-max-tokens"))
-        for n in ("HF_TOKEN", "--hf-token", "GITHUB_PAT", "OPENAI_API_KEY", "--admin-api-key", "DB_PASSWORD", "SECRET_KEY", "--api-key"):
+        for n in ("HF_TOKEN", "--hf-token", "GITHUB_PAT", "OPENAI_API_KEY", "--admin-api-key", "DB_PASSWORD", "SECRET_KEY", "--api-key",
+                  "OPENROUTER_KEY", "OPENAI_KEY", "WANDB_KEY", "ANTHROPIC_KEY", "--key"):
             self.assertTrue(redact.secret_name(n), n)
+        for n in ("SGLANG_LOG_DECODE_GRAPH_KEY", "SGLANG_WEG2_TOLD_PROBE_TREE_KEY", "--ssl-keyfile", "KEYBOARD", "MONKEY"):
+            self.assertFalse(redact.secret_name(n), n)
         self.assertEqual(redact.value_for_issue("--max-total-tokens", "4096"), "4096")
         self.assertEqual(redact.value_for_issue("HF_TOKEN", "x"), "<entfernt>")
+
+    def test_user_set_vendor_key_envs_never_reach_the_proposal_block(self):
+        # Befund 1 (Fix-Runde 2): ein vom Nutzer gesetzter Env mit beliebigem Praefix + KEY darf nicht im Klartext stehen
+        leaks = {"OPENROUTER_KEY": "sk-or-v1-LEAKME0123456789", "WANDB_KEY": "wandbLEAK0123456789", "OPENAI_KEY": "sk-openaiLEAK0123456789",
+                 "ANTHROPIC_KEY": "sk-ant-LEAK0123456789"}
+        doc = self.edited([{"key": "env:P:" + n, "op": "set", "value": v} for n, v in leaks.items()])
+        t = self.report(doc=doc, dry=None)["text"]
+        for n, v in leaks.items():
+            self.assertNotIn(v, t, n)
+            row = next(x for x in t.split("\n") if x.startswith("| `env:P:%s`" % n))
+            self.assertIn("<entfernt>", row)
 
     def test_token_as_a_catalog_word_is_not_a_secret_but_a_token_credential_is(self):
         # Befund 1 (Review): ``token`` mitten im Namen oder als Token-ID/Zaehler loescht sonst genau die Werte, die der Laufbericht zeigen soll
