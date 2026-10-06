@@ -349,7 +349,8 @@ def ttft_series(client: VmClient, model: str, ts: List[int], step: int) -> dict:
 VIEW_PARTS = (("total", "total_ms"), ("vorlauf", "vorlauf_ms"), ("layer", "layer_ms"), ("wake_kv_dc", "wake_kv_dc_ms"),
               ("nachlauf", "nachlauf_ms"), ("rest", "rest_ms"), ("d_extend", "nachlauf_d_extend_ms"),
               ("leer", "leer_ms"), ("halt", "halt_ms"), ("park", "park_ms"), ("vor_rest", "vor_rest_ms"),
-              ("leer_d_prefill", "leer_d_prefill_ms"))
+              ("leer_d_prefill", "leer_d_prefill_ms"),
+              ("leer_excl", "leer_excl_ms"))     # D's last token -> arrival of the waiter: Server-Leerlauf, NOT in total
 
 
 def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -> List[str]:
