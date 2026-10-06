@@ -4715,6 +4715,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         scratch = {ct: 0 for ct in self.tree_components}
         released = 0
         end_anchors = 0
+        # Q-1500 V3: END anchors released WITH a mamba host value (the hand-back the V1 guard kept;
+        # D's copy stays kept by the arena's hand-off order, handoff_pending #243)
+        end_yielded = 0
         for d in descendants:
             if not self._is_host_leaf(d):
                 logger.warning(
@@ -4727,10 +4730,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return
             if getattr(d, "_weg2_end_anchor", False):
                 end_anchors += 1
+                _mcd = d.component_data[ComponentType.MAMBA] if ComponentType.MAMBA in self.tree_components else None
+                if _mcd is not None and _mcd.host_value is not None:
+                    end_yielded += 1
             self._evict_host_leaf(d, scratch)
             released += 1
         if node.children:  # defensive: the verdict named every descendant
             return
+        if getattr(node, "_weg2_end_anchor", False) and ComponentType.MAMBA in self.tree_components \
+                and node.component_data[ComponentType.MAMBA].host_value is not None:
+            end_yielded += 1
         before = tracker.get(BASE_COMPONENT_TYPE, 0)
         self._ud_drop_unbacked_leaf(node, tracker)
         from sglang.srt.weg2 import pp_slot_fidelity as _sf
@@ -4738,7 +4747,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _sf.note_unbacked_drop(
             self, node, tracker.get(BASE_COMPONENT_TYPE, 0) - before,
             subtree_nodes=released, host_tokens=int(scratch.get(BASE_COMPONENT_TYPE, 0)),
-            end_anchors=end_anchors,
+            end_anchors=end_anchors, end_anchors_yielded=end_yielded,
         )
 
     def _evict_host_leaf(

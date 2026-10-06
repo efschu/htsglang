@@ -271,9 +271,27 @@ def ud_host_children_enabled(env=None, tree=None) -> bool:
     return True
 
 
-def _subtree_blocked(tree, n, ongoing) -> bool:
+def _end_anchor_told_held(tree, n) -> bool:
+    """Q-1500 V3: the END anchor a standing told names (y9d4 told-anchor hold, END depth == told) stays:
+    between that told and the admission the follower's admission reads it (Weg2StoreToldMismatch
+    otherwise). Without a hold (not dual P, switch off, nothing standing) False."""
+    held = getattr(tree, "_weg2_told_held", None)
+    if not callable(held):
+        return False
+    try:
+        return bool(held(n))
+    except Exception:  # noqa: BLE001 -- cannot tell: keep it (the V1 behaviour for this node)
+        return True
+
+
+def _subtree_blocked(tree, n, ongoing, end_anchor_yield: bool = False) -> bool:
     """A node the drop must not release (True = keep everything, the old behaviour). Asked of the
     leaf AND every descendant.
+
+    ``end_anchor_yield`` (Q-1500 V3, only ``unbacked_drop_subtree`` passes True; the V2 trim census
+    in ``dual_arena_spill._reason`` keeps the default): a host-backed END anchor below the refused,
+    un-backed leaf no longer keeps the subtree, unless a standing told names it
+    (``_end_anchor_told_held``). See ``unbacked_drop_subtree``, section V3.
 
     * in flight: ``ongoing_write_through`` by id, AND ``write_through_pending_id`` (after
       ``_replace_pending_write_through_node`` a split node's key stays the OLD node id, so the id
@@ -295,7 +313,7 @@ def _subtree_blocked(tree, n, ongoing) -> bool:
             from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 
             if n.component_data[ComponentType.MAMBA].host_value is not None:
-                return True
+                return (not end_anchor_yield) or _end_anchor_told_held(tree, n)
         except Exception:  # noqa: BLE001 -- no mamba component on this tree: no END anchor to hold
             pass
     return False
@@ -347,7 +365,36 @@ def unbacked_drop_subtree(tree, node):
         every host-leaf eviction (W3 spill, host LRU) and is NOT closed here: the tree does not
         know which request ids the scheduler holds as satisfied. Named residual; ``pp0`` removes it
         for the followers.
-    The cache content below the leaf is lost (hand-off pages without an L3 copy)."""
+    The cache content below the leaf is lost (hand-off pages without an L3 copy).
+
+    V3 -- A HOST-BACKED END ANCHOR NO LONGER KEEPS THE SUBTREE (27B NVFP4 dual P/D stages, boot
+    ...dualstufenbar1fs10060932 @173161c595, P PP1 09:48:38Z, rid weg2-0-50; desk dual-evict-oom-1006).
+    METAL. weg2-0-50 (129552 tokens) was prefilled by P, D read 32768 of it (handoff_kept=32768/129551,
+    STORE READ INCOMPLETE) and handed it back (W50-REROUTE); P's re-run was paused (DUAL P-PAUSE) and
+    re-admitted at told=0. PP1's tree still held the old copy: 126976 un-backed device tokens, the
+    un-backed leaf 221 (2573 tokens, depth 129549, #1421 parent_unbacked: the arena was full) and below
+    it node 220, the END anchor (#1481) at 129551 -- KV and mamba backed, evicted to the host by the
+    peel (#1469 EVICT node=220 backuped=True host=True parent=221). V1 refused the subtree for that
+    END anchor, UD refused 221 for its child, EVICT-FRONTIER-CENSUS on_frontier=2573
+    behind_device_child=126976 delivered 0 of 1024, alloc_token_slots raised: W17 group death. On PP0
+    the same END anchor was NOT host-backed (its claim was refused), so plain UD dropped node 220 and
+    then 221 (EVICT-UNBACKED-DROP node=220 tokens=2, node=221 tokens=2573) and PP0 lived on -- the
+    same END anchor, dropped on one rank, fatal on the other.
+    WHY THE V1 GUARD IS NOT NEEDED HERE. (1) The carrier hold it cites (``_weg2_carrier_rotate``) holds
+    the rows the RESET collected from a tree it then drops; a node of the live tree carries only its own
+    reference. (2) The hand-off to D is kept by ARENA EVICTION ORDER, not by P's tree reference
+    (``handoff_pending``, #243: "THE HOLDER IS AN EVICTION ORDER, NOT A REFERENCE"): giving the tree's
+    reference back leaves the slot COMPLETE, and for a marked rid kept (KV chain pages + END anchor keys,
+    ``keep_for``) until D takes it. (3) Every END anchor this
+    verdict reaches sits AT or BELOW the refused leaf, whose device rows have no host copy -- the KV chain
+    up to the anchor's depth was never published by P, so the anchor cannot complete a hand-back through P's
+    tree anyway. (4) Plain UD (``unbacked_drop_allowed``) has always dropped a childless un-backed END
+    anchor; V1 was stricter for the host-backed one than for the device one.
+    KEPT: the END anchor a standing told names (y9d4 told-anchor hold, ``_end_anchor_told_held``) --
+    its follower admission reads it; every other V1 guard (in flight, direct mamba rows, host/device
+    locks, a descendant that is not plain host-only) is unchanged. Gate and switch are V1's
+    (``ud_host_children_enabled``: dual P only, ``SGLANG_WEG2_DUAL_UD_HOST_CHILDREN`` 1/pp0/0). The V2
+    trim census (``dual_arena_spill._reason``) keeps the V1 guard as it was."""
     if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
         return None
     if not ud_host_children_enabled(tree=tree):
@@ -356,7 +403,7 @@ def unbacked_drop_subtree(tree, node):
     if not children:
         return None  # a childless leaf is the plain UD case
     ongoing = getattr(tree, "ongoing_write_through", None) or {}
-    if _subtree_blocked(tree, node, ongoing):
+    if _subtree_blocked(tree, node, ongoing, end_anchor_yield=True):
         return None
     pre = []
     stack = list(children.values())
@@ -366,7 +413,7 @@ def unbacked_drop_subtree(tree, node):
         if (
             not getattr(d, "evicted", False)
             or not getattr(d, "backuped", False)
-            or _subtree_blocked(tree, d, ongoing)
+            or _subtree_blocked(tree, d, ongoing, end_anchor_yield=True)
         ):
             return None
         for cd in d.component_data:
@@ -378,19 +425,20 @@ def unbacked_drop_subtree(tree, node):
 
 
 def note_unbacked_drop(tree, node, tokens: int, subtree_nodes: int = 0, host_tokens: int = 0,
-                       end_anchors: int = 0) -> None:
+                       end_anchors: int = 0, end_anchors_yielded: int = 0) -> None:
     if subtree_nodes:
         n = _sampled(tree, "_weg2_sf_unbacked_drop_subtree")
         if n is not None:
             logger.warning(
                 "EVICT-UNBACKED-DROP SUBTREE node=%s tokens=%d freed=%d subtree_nodes=%d "
-                "subtree_host_tokens=%d end_anchors=%d rank=pp%s (n=%d): Q-1500 dual P -- a write_back leaf whose backup the "
+                "subtree_host_tokens=%d end_anchors=%d end_anchors_yielded=%d rank=pp%s (n=%d): Q-1500 dual P -- a write_back leaf whose backup the "
                 "arena refused carried host-only children; they were released bottom-up (their arena "
                 "references went back) and the leaf dropped, instead of the eviction delivering "
                 "nothing and alloc_token_slots raising (y9d3 P PP0: rank death, W17). The cache "
-                "content below it is lost (recomputable / re-routed)",
+                "content below it is lost (recomputable / re-routed); end_anchors_yielded = host-backed "
+                "END anchors given up (V3, 1006 PP1 W17: D's copy stays kept by the hand-off order)",
                 getattr(node, "id", "?"), len(getattr(node, "key", []) or []), int(tokens),
-                int(subtree_nodes), int(host_tokens), int(end_anchors),
+                int(subtree_nodes), int(host_tokens), int(end_anchors), int(end_anchors_yielded),
                 getattr(tree, "pp_rank", "?"), n)
         return
     n = _sampled(tree, "_weg2_sf_unbacked_drop")

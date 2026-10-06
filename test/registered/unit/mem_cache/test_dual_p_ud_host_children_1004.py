@@ -281,13 +281,25 @@ class DualPUdHostChildren(CustomTestCase):
             cache._weg2_direct_mamba_rows = {n[key].id: object()}
             self.assertIsNone(SF.unbacked_drop_subtree(cache, n[5]), key)
 
-    def test_a_host_backed_end_anchor_keeps_the_subtree_and_an_empty_one_does_not(self):
-        """The reset path holds the END anchor one D phase on purpose (_weg2_carrier_rotate, mamba
-        HOLD-END-ANCHOR); a flag without a mamba host value holds nothing."""
-        for key in (13, 5):
+    def test_a_host_backed_end_anchor_yields_unless_a_told_names_it(self):
+        """Q-1500 V3 (1006 PP1 W17, test_dual_p_evict_end_anchor_1006): a host-backed END anchor at or below
+        the refused leaf no longer keeps the subtree -- the carrier hold owns only the RESET's rows, D's
+        hand-off is kept by the arena's order (handoff_pending #243). The END anchor a standing told names
+        (y9d4) still keeps it. Was (V1): kept whenever it carried a mamba host value."""
+
+        class _Told:
+            def __init__(self, depth):
+                self.depth = depth
+
+            def depths(self, tick=False):
+                return {self.depth: ["r"]}
+
+        for key, depth in ((13, 16), (5, 8)):
             cache, alloc, n = _tree()
             n[key]._weg2_end_anchor = True
             n[key].component_data[MAMBA].host_value = torch.tensor([555], dtype=torch.int64)
+            self.assertIsNotNone(SF.unbacked_drop_subtree(cache, n[5]), key)
+            cache._weg2_told_hold = _Told(depth)                         # a standing told at its END depth
             self.assertIsNone(SF.unbacked_drop_subtree(cache, n[5]), key)
         cache, alloc, n = _tree()
         n[13]._weg2_end_anchor = True                                    # no mamba host value
