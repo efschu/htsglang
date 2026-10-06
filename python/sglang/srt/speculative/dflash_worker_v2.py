@@ -63,6 +63,7 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     capture_safe_tp_broadcast,
     mamba_track_grid,
+    prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -3766,6 +3767,17 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
+
+        # upstream 44fd17b696 (the hunk the fork had not ported; the
+        # post-verify-lengths half is #37818 above): the decode batch's mamba
+        # track fields are None after any filter/merge and spec batches skip
+        # the refresh in prepare_for_decode, so rebuild the track indices from
+        # the requests (and clear the stale mask/seqlens) BEFORE the verify
+        # ForwardBatch snapshots them and before the post-verify commit reads
+        # them. Without it the GPU wrote no track while the scheduler still
+        # recorded the grid anchor (mamba_last_track_seqlen). Inert unless
+        # enable_mamba_extra_buffer (checked inside the helper).
+        prepare_mamba_track_for_verify(batch)
 
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
