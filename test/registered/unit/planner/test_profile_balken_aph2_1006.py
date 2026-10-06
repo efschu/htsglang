@@ -1,0 +1,406 @@
+"""AP-H2 (Auftrag 880, Plan 1006 §3 AP-H Teil 2): Balken je Karte und Phase im Datenvertrag ``flliper.balken/1`` (GPU-frei).
+
+Gepinnt:
+
+* Summenregel des Vertrags: Segmente zusammenhaengend in logischer Reihenfolge, Summe = max(Kartengroesse, Posten); Reserve und Frei folgen aus
+  Budget und Posten; ein Ueberlauf ueber das Budget zehrt die Reserve auf, erst ein Posten ueber der KARTE laesst den Balken ueber die
+  Kartengrenze wachsen (``beyond_card_mib``), nichts wird abgeschnitten;
+* D-Phase (neu): Handrechnung gegen das Modellprofil (Anteile aus ``--rank-tp-ratio``, Besitz aus ``--rank-moe-ratio``, Pufferregel aus FR_D und
+  Scratch), Festposten aus ``--d-foreign-context-mib`` + ``--d-nontorch-mib``;
+* Draft-Term (neu): P traegt den MTP-Kopf nur ohne ``--draft-kv-on-p off``, D solo nur auf dem Host-Rang, Gewicht aus dem Draft-Profil
+  (``model["draft"]["external"]``), DFlash2 = nicht gerechnet;
+* nicht belegbare Terme sind ``mib: None`` ("nicht gerechnet") mit Grund, nie 0 und nie geraten; ``Frei`` nennt dann die Obergrenze;
+* Betriebsformen: Einzelkarte (eine Phase), nur TP, Flip, Dual (beide Phasen, keine Summe); eine unrechenbare Phase laesst die andere stehen.
+"""
+
+import copy
+import json
+import os
+import unittest
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+from sglang.srt.planner import expert_residency as ER  # noqa: E402
+from sglang.srt.planner import profile_couplings as PC  # noqa: E402
+from sglang.srt.weg2 import model_profile as MP  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FX = os.path.join(HERE, "..", "weg2", "fixtures", "profil_s3_1003")
+MIB = 1024.0 * 1024.0
+RIG3 = [("NVIDIA GeForce RTX 5090", 32607, 1400.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0)]
+ORDER = ["weights", "experts", "draft", "kv", "state", "activation", "fixed", "reserve", "free"]
+_M = {}
+
+
+def model(name):
+    if name not in _M:
+        _M[name] = MP.estimate(os.path.join(FX, name))
+    return _M[name]
+
+
+def hw(cards=RIG3):
+    return PC.synthetic_hardware(cards)
+
+
+# Profilzeilen der NF-abl-Form (docker/profiles/nf-int4-h6-abl.env), auf die hier relevanten Flags gekuerzt
+NF_ARGS = {"--pp-stage-ratio": "29,11,8", "--pp-attn-stage-ratio": "7,3,2", "--pp-cut-expert-device-fraction": "0.330,0.701,0.652",
+           "--pp-cut-expert-lru-rows": "32,32,32", "--max-kv-per-request": "262144", "--d-foreign-context-mib": "1446,896,894",
+           "--d-nontorch-mib": "1981,528,524", "--draft-kv-on-p": "off", "--d-kv-token-cut": "owned"}
+NF_PA = {"P": {"--kv-cache-dtype": "fp8_e4m3", "--max-mamba-cache-size": "32", "--mamba-ssm-dtype": "bfloat16", "--chunked-prefill-size": "16384"},
+         "D": {"--rank-role": "host,worker,worker", "--rank-tp-ratio": "1,0,0", "--rank-moe-ratio": "183,137,168",
+               "--rank-moe-resident-fraction": "0.06,0.51,0.48", "--speculative-draft-placement": "solo", "--speculative-algorithm": "NEXTN",
+               "--kv-cache-dtype": "fp8_e4m3", "--max-mamba-cache-size": "32", "--mamba-ssm-dtype": "bfloat16"}}
+NF_PE = {"P": {"SGLANG_MOE_SCRATCH_SLOTS": "32"}, "D": {"SGLANG_MOE_SCRATCH_SLOTS": "104,48,48", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION": "0.06,0.51,0.48"}}
+
+
+def nf(**kw):
+    a = dict(kw.pop("args", NF_ARGS))
+    return PC.phase_bars(hw(), kw.pop("m", model("nextflash_int4mixed")), a, kw.pop("pa", NF_PA), kw.pop("pe", NF_PE), **kw)
+
+
+def seg(bar, name):
+    return next((s for s in bar["segments"] if s["name"] == name), None)
+
+
+def stage(total, budget, **posts):
+    """Eine Vertrags-Stufe von Hand: posts = {name: mib | None}."""
+    terms = {k: {"v": v, "src": "Eingabe", "note": ""} for k, v in posts.items()}
+    return {"ord": 0, "label": "Karte 0", "total_mib": float(total), "budget_mib": {"v": float(budget), "src": "Profilzeile", "note": "--rank-gpu-memory-mib"},
+            "terms": terms}
+
+
+class TestContractSumRule(unittest.TestCase):
+    def test_fits_inside_the_budget_the_segments_fill_exactly_the_card(self):
+        b = PC.contract_bar(stage(1000, 900, weights=300, kv=200), "P")
+        self.assertEqual([s["name"] for s in b["segments"]], ["weights", "kv", "reserve", "free"])
+        self.assertEqual((seg(b, "reserve")["mib"], seg(b, "free")["mib"]), (100.0, 400.0))
+        self.assertAlmostEqual(sum(s["mib"] for s in b["segments"]), 1000.0, places=6)
+        self.assertEqual((b["overflow_mib"], b["beyond_card_mib"], b["over_text"]), (0.0, 0.0, ""))
+
+    def test_over_the_budget_eats_the_reserve_but_not_the_card(self):
+        b = PC.contract_bar(stage(1000, 900, weights=600, kv=350), "P")          # 950 Posten: 50 ueber dem Budget, 50 von 100 Reserve
+        self.assertEqual(b["overflow_mib"], 50.0)
+        self.assertEqual(b["beyond_card_mib"], 0.0)
+        self.assertEqual(seg(b, "reserve")["mib"], 50.0)
+        self.assertIsNone(seg(b, "free"))
+        self.assertAlmostEqual(sum(s["mib"] for s in b["segments"]), 1000.0, places=6)
+        self.assertIn("ueber dem Budget", b["over_text"])
+        self.assertIn("aufgezehrt", seg(b, "reserve")["detail"])
+
+    def test_over_the_card_the_bar_grows_past_the_edge_and_nothing_is_clipped(self):
+        b = PC.contract_bar(stage(1000, 900, weights=700, kv=500), "D")          # 1200 Posten auf einer 1000er Karte
+        self.assertEqual(b["beyond_card_mib"], 200.0)
+        self.assertEqual(b["overflow_mib"], 300.0)
+        self.assertEqual([s["name"] for s in b["segments"]], ["weights", "kv"])
+        self.assertEqual(sum(s["mib"] for s in b["segments"]), 1200.0)          # Summe = Posten > Kartengroesse
+        self.assertIn("ueber der KARTE", b["over_text"])
+
+    def test_not_computed_terms_are_null_not_zero_and_bound_the_free_figure(self):
+        b = PC.contract_bar(stage(1000, 900, weights=300, kv=None, fixed=None), "P")
+        self.assertEqual(b["not_computed"], ["KV", "Festposten"])
+        kv = seg(b, "kv")
+        self.assertIsNone(kv["mib"])
+        self.assertEqual((kv["herkunft"], kv["gerechnet"]), ("nicht gerechnet", False))
+        self.assertEqual(b["posts_mib"], 300.0)
+        self.assertIn("OBERGRENZE", seg(b, "free")["detail"])
+        self.assertIn("KV", seg(b, "free")["detail"])
+
+    def test_zero_terms_are_left_out_and_the_order_is_the_contract_order(self):
+        b = PC.contract_bar(stage(1000, 900, fixed=5, kv=7, weights=3, draft=0, state=9, experts=11, activation=13), "P")
+        self.assertEqual([s["name"] for s in b["segments"]], ["weights", "experts", "kv", "state", "activation", "fixed", "reserve", "free"])
+        self.assertEqual([k for k in ORDER if k in {s["name"] for s in b["segments"]}], [s["name"] for s in b["segments"]])
+
+
+class TestEveryBarOfTheReferenceRig(unittest.TestCase):
+    def setUp(self):
+        self.res = nf()
+
+    def test_schema_form_and_phases(self):
+        self.assertEqual(self.res["schema"], "flliper.balken/1")
+        self.assertEqual((self.res["form"], list(self.res["phases"])), ("flip", ["P", "D"]))
+        self.assertTrue(all(ph["ok"] for ph in self.res["phases"].values()))
+        json.dumps(self.res)
+
+    def test_sum_rule_and_order_hold_for_every_card_and_phase(self):
+        for name, ph in self.res["phases"].items():
+            self.assertEqual(len(ph["bars"]), 3, name)
+            for b in ph["bars"]:
+                names = [s["name"] for s in b["segments"]]
+                self.assertEqual([k for k in ORDER if k in names], names, (name, b["label"]))
+                got = sum(s["mib"] for s in b["segments"] if s["mib"] is not None)
+                self.assertAlmostEqual(got, max(b["total_mib"], b["posts_mib"]), delta=0.01, msg=(name, b["label"]))
+                for s in b["segments"]:
+                    self.assertTrue(s["herkunft"], (name, b["label"], s["name"]))
+                    self.assertTrue(s["detail"], (name, b["label"], s["name"]))
+
+    def test_unmeasured_fixed_posts_are_not_computed_in_p_not_zero(self):
+        for b in self.res["phases"]["P"]["bars"]:
+            self.assertIsNone(seg(b, "fixed")["mib"])
+            self.assertIn("Festposten", b["not_computed"])
+
+    def test_the_geometry_overshoot_on_a_3080_is_shown_with_the_reserve_eaten(self):
+        # ohne gemessene Aktivierungsspitze rechnet die Engine die Geometrie (benannte Grenze, Test 1432): Karte 1 laeuft ueber das Budget
+        b = self.res["phases"]["P"]["bars"][1]
+        self.assertGreater(b["overflow_mib"], 0)
+        self.assertEqual(b["beyond_card_mib"], 0.0)
+        self.assertTrue(any("Budget" in h for h in self.res["hints"]))
+
+    def test_p_inputs_name_the_profile_lines_they_came_from(self):
+        seen = {x["was"]: x for x in self.res["phases"]["P"]["inputs"]}
+        self.assertIn("--pp-stage-ratio", seen["stage_layers"]["herkunft"])
+        self.assertIn("--pp-cut-expert-device-fraction", seen["moe_resident_fraction"]["herkunft"])
+        self.assertIn("--pp-cut-expert-lru-rows", seen["scratch_rows"]["herkunft"])
+        self.assertIn("Annahme", seen["budget_mib"]["herkunft"])
+
+
+class TestDPhaseHandCalculation(unittest.TestCase):
+    def test_dense_model_even_tp_splits_weights_state_and_kv_by_rank(self):
+        m = copy.deepcopy(model("qwen27b_int8_vocabembed"))
+        m["weights"]["mtp_bytes"] = {"v": 0, "src": "Index"}          # ohne Draft: der KV-Anteil ist rein der des Ziels
+        w = m["weights"]
+        dense = (sum(w["layer_bytes"]["v"]) + w["embed_bytes"]["v"] + w["lm_head_bytes"]["v"]) / MIB
+        res = PC.phase_bars(hw([("A", 32607, 1000.0), ("A", 32607, 1000.0)]), m, {"--max-kv-per-request": "65536"},
+                            {"P": {}, "D": {}}, {}, form="d_only")
+        self.assertEqual(list(res["phases"]), ["D"])
+        for b in res["phases"]["D"]["bars"]:
+            self.assertAlmostEqual(seg(b, "weights")["mib"], dense / 2, delta=0.01)
+            self.assertIsNone(seg(b, "experts"))                       # dichtes Modell
+            self.assertIn("gleichmaessiger TP", seg(b, "weights")["detail"])
+        attn = sum(1 for f in m["arch"]["layer_families"]["v"] if f == "attn")
+        cell = m["kv"]["cell_bytes_per_attn_layer_token"]["v"]
+        if m["arch"]["heads_kv"]["v"] % 2 == 0:
+            self.assertAlmostEqual(seg(res["phases"]["D"]["bars"][0], "kv")["mib"], 65536 * attn * cell / MIB / 2, delta=0.01)
+        else:
+            self.assertIsNone(seg(res["phases"]["D"]["bars"][0], "kv")["mib"])
+
+    def test_uneven_tp_and_moe_ratio_on_the_reference_form(self):
+        m = model("nextflash_int4mixed")
+        w = m["weights"]
+        E = m["experts"]["n"]["v"]
+        dense = (sum(w["layer_bytes"]["v"]) + w["embed_bytes"]["v"] + w["lm_head_bytes"]["v"]) / MIB
+        d = nf()["phases"]["D"]["bars"]
+        # --rank-tp-ratio 1,0,0: der Host traegt alle dichten Gewichte, die Worker keine
+        self.assertAlmostEqual(seg(d[0], "weights")["mib"], dense, delta=0.01)
+        self.assertIsNone(seg(d[1], "weights"))
+        self.assertIsNone(seg(d[2], "weights"))
+        # Experten: Besitz je Rang aus --rank-moe-ratio, Zeilen aus der Pufferregel (FR_D, Scratch), MiB je Zeile ueber alle Layer
+        per_expert = sum(w["layer_expert_bytes"]["v"]) / E / MIB
+        own = [183, 137, 168] if sum([183, 137, 168]) == E else [int(round(E * r / 488.0)) for r in (183, 137, 168)]
+        for i, (fr, sc) in enumerate(zip((0.06, 0.51, 0.48), (104, 48, 48))):
+            rows = ER.buffer_rows(local_experts=own[i], fraction=fr, scratch_rows=sc)
+            self.assertAlmostEqual(seg(d[i], "experts")["mib"], rows * per_expert, delta=0.01, msg="Rang %d" % i)
+            self.assertEqual(seg(d[i], "experts")["herkunft"], "Naeherung (nicht der Loeser)")
+
+    def test_fixed_post_is_the_sum_of_the_two_profile_lines(self):
+        d = nf()["phases"]["D"]["bars"]
+        self.assertEqual([seg(b, "fixed")["mib"] for b in d], [1446 + 1981, 896 + 528, 894 + 524])
+        self.assertEqual(seg(d[0], "fixed")["herkunft"], "Profilzeile")
+        self.assertIn("--d-foreign-context-mib", seg(d[0], "fixed")["detail"])
+        self.assertIn("--d-nontorch-mib", seg(d[0], "fixed")["detail"])
+
+    def test_d_budget_defaults_to_card_minus_corridor_and_takes_the_group_flag(self):
+        d = nf()["phases"]["D"]["bars"]
+        self.assertEqual([b["budget_mib"] for b in d], [32607 - 1024, 20480 - 1024, 20480 - 1024])
+        self.assertEqual(d[0]["budget_herkunft"], "gerechnet")
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--rank-gpu-memory-mib"] = "30000,18000,18000"
+        d2 = nf(pa=pa)["phases"]["D"]["bars"]
+        self.assertEqual([b["budget_mib"] for b in d2], [30000, 18000, 18000])
+        self.assertEqual(d2[0]["budget_herkunft"], "Profilzeile")
+        self.assertEqual(seg(d2[0], "reserve")["mib"], 32607 - 30000)
+
+    def test_unsolvable_assignments_are_not_computed_and_say_why(self):
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--rank-tp-ratio"] = "auto"
+        pa["D"]["--rank-moe-ratio"] = "link"
+        d = nf(pa=pa)["phases"]["D"]["bars"]
+        for b in d:
+            self.assertIsNone(seg(b, "weights")["mib"])
+            self.assertIn("loest der Launcher", seg(b, "weights")["detail"])
+            self.assertIsNone(seg(b, "experts")["mib"])
+            self.assertIn("link", seg(b, "experts")["detail"])
+
+    def test_kv_is_only_computed_where_the_distribution_is_known(self):
+        d = nf()["phases"]["D"]["bars"]                               # ungleicher TP + Token-Schnitt: nicht gerechnet
+        for b in d:
+            self.assertIsNone(seg(b, "kv")["mib"])
+            self.assertIn("--d-kv-token-cut", seg(b, "kv")["detail"])
+        a = dict(NF_ARGS)
+        a.pop("--d-kv-token-cut")
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--rank-kv-ratio"] = "2,1,1"                            # ausdruecklicher Token-Eigentumsvektor: Anteile belegt
+        pa["D"].pop("--speculative-algorithm")
+        m = copy.deepcopy(model("nextflash_int4mixed"))
+        m["weights"]["mtp_bytes"] = {"v": 0, "src": "Index"}          # ohne Draft: keine Draft-KV-Zeile auf dem Host
+        kvs = [seg(b, "kv")["mib"] for b in nf(m=m, args=a, pa=pa)["phases"]["D"]["bars"]]
+        self.assertAlmostEqual(kvs[0] / kvs[1], 2.0, places=3)
+        self.assertAlmostEqual(kvs[1], kvs[2], places=6)
+        # der Gesamtpreis steht als Hinweis, auch wenn die Verteilung nicht gerechnet ist
+        self.assertTrue(any("KV gesamt" in h for h in nf()["hints"]))
+
+
+class TestDraftTerm(unittest.TestCase):
+    def ext_model(self, p_mib=500.0, d_mib=300.0):
+        m = copy.deepcopy(model("nextflash_int4mixed"))
+        m["draft"]["external"] = {"bytes_without_lm_head": {"v": int(p_mib * MIB), "src": "Index"},
+                                  "bytes_without_embed_lm_head": {"v": int(d_mib * MIB), "src": "Index"}, "kv": {"attn_layers": {"v": 1, "src": "Index"}}}
+        return m
+
+    def test_p_carries_the_head_only_without_draft_kv_on_p_off(self):
+        m = self.ext_model()
+        off = nf(m=m)["phases"]["P"]["bars"]
+        self.assertTrue(all(seg(b, "draft") is None for b in off))
+        a = dict(NF_ARGS)
+        a["--draft-kv-on-p"] = "on"
+        on = nf(m=m, args=a)["phases"]["P"]["bars"]
+        self.assertIsNone(seg(on[0], "draft"))
+        self.assertIsNone(seg(on[1], "draft"))
+        d = seg(on[2], "draft")                                        # letzte Stufe, Gewicht ohne lm_head aus dem Draft-Profil
+        self.assertAlmostEqual(d["mib"], 500.0, delta=0.01)
+        self.assertEqual(d["herkunft"], "Modellprofil/Hardwareprofil (Index)")
+        self.assertIn("lm_head", d["detail"])
+
+    def test_p_default_is_on_when_the_flag_is_absent(self):
+        a = dict(NF_ARGS)
+        a.pop("--draft-kv-on-p")
+        on = nf(m=self.ext_model(), args=a)["phases"]["P"]["bars"]
+        self.assertAlmostEqual(seg(on[2], "draft")["mib"], 500.0, delta=0.01)
+
+    def test_d_solo_lands_on_the_host_rank_only_with_the_shared_embedding_left_out(self):
+        d = nf(m=self.ext_model())["phases"]["D"]["bars"]
+        self.assertAlmostEqual(seg(d[0], "draft")["mib"], 300.0, delta=0.01)
+        self.assertIsNone(seg(d[1], "draft"))
+        self.assertIsNone(seg(d[2], "draft"))
+        self.assertIn("solo auf Rang 0", seg(d[0], "draft")["detail"])
+        self.assertIn("Einbettung und lm_head", seg(d[0], "draft")["detail"])
+
+    def test_d_solo_draft_adds_one_kv_row_on_the_host_only(self):
+        a = dict(NF_ARGS)
+        a.pop("--d-kv-token-cut")
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--rank-kv-ratio"] = "1,1,1"
+        with_d = [seg(b, "kv")["mib"] for b in nf(m=self.ext_model(), args=a, pa=pa)["phases"]["D"]["bars"]]
+        m0 = copy.deepcopy(model("nextflash_int4mixed"))
+        m0["weights"]["mtp_bytes"] = {"v": 0, "src": "Index"}
+        pa0 = copy.deepcopy(pa)
+        pa0["D"].pop("--speculative-algorithm")
+        without = [seg(b, "kv")["mib"] for b in nf(m=m0, args=a, pa=pa0)["phases"]["D"]["bars"]]
+        cell = 1088.0 / MIB                                             # fp8_e4m3: 1088 B je Attention-Layer und Token (Metall fnFL2w123)
+        self.assertAlmostEqual(with_d[0] - without[0], 262144 * 1 * cell, delta=0.01)       # eine Draft-Attention-Zeile (aus dem Draft-Profil)
+        self.assertAlmostEqual(with_d[1], without[1], places=6)
+        self.assertAlmostEqual(with_d[2], without[2], places=6)
+
+    def test_d_split_follows_the_tp_share(self):
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--speculative-draft-placement"] = "split"
+        pa["D"]["--rank-tp-ratio"] = "2,1,1"
+        d = nf(m=self.ext_model(), pa=pa)["phases"]["D"]["bars"]
+        self.assertEqual([round(seg(b, "draft")["mib"], 3) for b in d], [150.0, 75.0, 75.0])
+
+    def test_dflash_and_unprofiled_drafts_are_not_computed(self):
+        a = dict(NF_ARGS)
+        a["--dflash-draft-path"] = "/m/dflash"
+        a["--draft-kv-on-p"] = "on"
+        r = nf(args=a)
+        self.assertEqual(r["draft"]["kind"], "dflash")
+        self.assertIsNone(seg(r["phases"]["P"]["bars"][2], "draft")["mib"])
+        self.assertIn("DFlash2", seg(r["phases"]["P"]["bars"][2], "draft")["detail"])
+        self.assertTrue(all(seg(b, "draft")["mib"] is None for b in r["phases"]["D"]["bars"]))
+        m = copy.deepcopy(model("nextflash_int4mixed"))
+        m["weights"]["mtp_bytes"] = {"v": 0, "src": "Index"}
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--speculative-draft-model-path"] = "/m/draft"
+        r2 = nf(m=m, pa=pa)
+        self.assertEqual(r2["draft"]["kind"], "nextn")
+        self.assertIsNone(seg(r2["phases"]["D"]["bars"][0], "draft")["mib"])
+        self.assertIn("nicht profiliert", seg(r2["phases"]["D"]["bars"][0], "draft")["detail"])
+
+    def test_no_spec_flag_and_no_mtp_head_means_no_draft(self):
+        m = copy.deepcopy(model("nextflash_int4mixed"))
+        m["weights"]["mtp_bytes"] = {"v": 0, "src": "Index"}
+        pa = copy.deepcopy(NF_PA)
+        pa["D"].pop("--speculative-algorithm")
+        r = nf(m=m, pa=pa)
+        self.assertEqual(r["draft"]["kind"], "none")
+        for ph in r["phases"].values():
+            self.assertTrue(all(seg(b, "draft") is None for b in ph["bars"]))
+
+    def test_draft_mib_override_replaces_the_target_models_mtp_bytes(self):
+        s = {"stage_layers": [29, 11, 8], "budget_mib": [28440, 17568, 18200], "kv_dtype": "fp8_e4m3", "draft": True, "draft_mib": 123.0,
+             "draft_src": "Index", "draft_note": "aus dem Draft-Profil"}
+        st = PC._stage_terms(hw(), model("nextflash_int4mixed"), s)["stages"]
+        self.assertEqual(st[2]["terms"]["draft"]["v"], 123.0)
+        self.assertEqual(st[2]["terms"]["draft"]["src"], "Index")
+        self.assertEqual(st[0]["terms"]["draft"]["v"], 0.0)
+
+
+class TestForms(unittest.TestCase):
+    def test_detect_form(self):
+        self.assertEqual(PC.detect_form({}, [], 1), "single")
+        self.assertEqual(PC.detect_form({}, ["--d-only"], 3), "d_only")
+        self.assertEqual(PC.detect_form({"--dual-share": ""}, [], 3), "dual")
+        self.assertEqual(PC.detect_form({}, ["--dual-layout"], 3), "dual")
+        self.assertEqual(PC.detect_form({}, [], 3), "flip")
+        self.assertEqual(PC.detect_form({}, [], 3, "d_only"), "d_only")
+        self.assertEqual(PC.detect_form({}, [], 3, "unsinn"), "flip")
+
+    def test_single_card_is_one_phase_with_all_layers_on_the_card(self):
+        m = model("qwen27b_int8_vocabembed")
+        r = PC.phase_bars(hw([("NVIDIA GeForce RTX 5090", 32607, 1400.0)]), m, {"--max-kv-per-request": "32768"}, {}, {})
+        self.assertEqual((r["form"], list(r["phases"])), ("single", ["alle"]))
+        (b,) = r["phases"]["alle"]["bars"]
+        self.assertEqual(b["phase"], "alle")
+        self.assertIn("stage_layers", [x["was"] for x in r["phases"]["alle"]["inputs"]])
+        self.assertIsNotNone(seg(b, "weights"))
+
+    def test_dual_shows_both_phases_and_forms_no_sum(self):
+        a = dict(NF_ARGS)
+        a["--dual-share"] = ""
+        r = nf(args=a)
+        self.assertEqual((r["form"], list(r["phases"])), ("dual", ["P", "D"]))
+        self.assertTrue(any("Summe beider Balken ist nicht gerechnet" in h for h in r["hints"]))
+        self.assertNotIn("Summe", r["phases"])
+
+    def test_one_unsolvable_phase_leaves_the_other_standing(self):
+        a = dict(NF_ARGS)
+        a.pop("--pp-stage-ratio")
+        r = nf(args=a)
+        self.assertFalse(r["phases"]["P"]["ok"])
+        self.assertIn("--pp-stage-ratio fehlt", r["phases"]["P"]["error"])
+        self.assertTrue(r["phases"]["D"]["ok"])
+        pa = copy.deepcopy(NF_PA)
+        pa["D"]["--rank-tp-ratio"] = "1,0"                                # falsche Vektorlaenge
+        r2 = nf(pa=pa)
+        self.assertTrue(r2["phases"]["P"]["ok"])
+        self.assertIn("vector_length", r2["phases"]["D"]["error"])
+
+    def test_user_overrides_apply_to_the_phase_settings(self):
+        r = nf(overrides={"activation_mib": [5984, 2952, 2944], "ssm_dtype": "bfloat16"})
+        for b, tr in zip(r["phases"]["P"]["bars"], (5984, 2952, 2944)):
+            self.assertAlmostEqual(seg(b, "activation")["mib"], tr, delta=0.01)
+            self.assertEqual(seg(b, "activation")["herkunft"], "Eingabe (Nutzer/Profil)")
+
+
+class TestBridge(unittest.TestCase):
+    def test_run_phase_bars_answers_the_contract_and_the_approx_payload(self):
+        res = PC.run({"what": "phase_bars", "hardware": hw(), "model": model("nextflash_int4mixed"), "server_args": NF_ARGS,
+                      "phase_args": NF_PA, "phase_env": NF_PE})
+        self.assertTrue(res["ok"], res)
+        r = res["result"]
+        self.assertEqual(r["schema"], "flliper.balken/1")
+        self.assertEqual(r["approx"]["stage_layers"], [29, 11, 8])
+        self.assertEqual(r["approx"]["slots"], 32)
+        json.dumps(res)
+
+    def test_legacy_bars_and_server_args_are_unchanged(self):
+        res = PC.run({"what": "bars", "hardware": hw(), "model": model("nextflash_int4mixed"), "server_args": {"--pp-stage-ratio": "29,11,8"}})
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(list(res["result"]["phases"]), ["alle"])
+
+    def test_bad_input_is_a_named_error_not_a_crash(self):
+        res = PC.run({"what": "phase_bars", "hardware": {"cards": []}, "model": model("nextflash_int4mixed"), "server_args": {}})
+        self.assertFalse(res["ok"])
+
+
+if __name__ == "__main__":
+    unittest.main()

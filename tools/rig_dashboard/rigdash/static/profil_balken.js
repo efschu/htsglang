@@ -1,6 +1,42 @@
-/* Profil-Editor S4b (Auftrag 1432): VRAM-Balken je Karte aus den Kopplungen, Überlauf als eigenes rotes Segment, Näherung im Browser.
-   Rechnet nur die LINEARE Näherung (Layer-Schnitt verschieben); die Kopplungen selbst rechnet der Server (/api/profil/recompute,
-   planner/profile_couplings.py).  `approx` ist Zeile für Zeile die Arithmetik von profile_couplings.approx_terms (Python-Referenz);
+/* Profil-Editor S4b (Auftrag 1432) + AP-H2 (Auftrag 880): VRAM-Balken je Karte und Phase.
+
+   ============================ DATENVERTRAG flliper.balken/1 ============================
+   Die Darstellung kennt NUR diese Form.  Der heutige Weg (POST /api/profil/recompute what=phase_bars ->
+   planner/profile_couplings.phase_bars) und ein späteres Orakel (propose()/Dry-Run, AP-C/AP-D) liefern DIESELBE Form; wer Werte
+   einspeist, ändert die Darstellung nicht.
+
+     { "schema": "flliper.balken/1",
+       "form":   "single" | "d_only" | "flip" | "dual",          // Einzelkarte | nur TP | Flip PP/TP | Dual PP/TP
+       "phases": {                                               // P und D (Dual: beide zugleich); d_only: nur D; single: nur "alle"
+         "P": { "ok": true (fehlt = ok), "label": "P-Phase (...)", "bars": [ CardBar, ... ], "inputs": [ {was, wert, herkunft} ], "error"?: "..." },
+         "D": { ... } },
+       "hints": [ "..." ] }
+
+     CardBar = { "card": 0, "label": "Karte 0 (RTX 5090)", "phase": "P",
+                 "total_mib": 32607,                 // Kartengröße (NVML)
+                 "budget_mib": 31583,                // Budget der Phase auf dieser Karte
+                 "budget_herkunft": "Profilzeile" | "gerechnet" | ...,
+                 "segments": [ Segment, ... ],       // IN LOGISCHER REIHENFOLGE, zusammenhängend: Gewichte | Experten | Draft | KV | Mamba |
+                                                     //   (Aktivierung | Festposten) | Reserve | Frei -- die Segmente SIND der Balken
+                 "posts_mib": 27323.2, "free_mib": 4259.8,
+                 "overflow_mib": 0,                  // Posten über dem BUDGET (der Planer lehnt ab)
+                 "beyond_card_mib": 0,               // Posten über der KARTE: der Balken wächst über die Kartengrenze, nichts wird abgeschnitten
+                 "not_computed": [ "Festposten" ], "over_text": "" }
+
+     Segment = { "name":  "weights"|"experts"|"draft"|"kv"|"state"|"activation"|"fixed"|"reserve"|"free",
+                 "label": "Gewichte",
+                 "mib":   number | null,             // null = NICHT GERECHNET: nicht gezeichnet, nicht in der Summe, steht als Chip unter dem Balken
+                 "herkunft": "Modellprofil/Hardwareprofil (config)" | "Profilzeile" | "Naeherung (nicht der Loeser)" | "gerechnet" |
+                             "Eingabe (Nutzer/Profil)" | "Annahme dieser Rechnung" | "nicht gerechnet",
+                 "detail": "Formel/Grund für den Tooltip", "gerechnet": true|false }
+
+   Summenregel: Σ mib aller Segmente = max(total_mib, posts_mib).  Reserve = max(0, total − max(budget, posts)); Frei = max(0, budget − posts).
+   Ein Orakel darf zusätzliche Felder mitgeben; fehlende optionale Felder (detail, gerechnet, inputs) sind erlaubt.
+   Nicht gerechnete Terme: mib = null mit Grund in detail -- NIE geraten.
+   ======================================================================================
+
+   Der Browser rechnet nur die LINEARE Näherung (Layer-Schnitt verschieben, P-Phase); die Kopplungen selbst rechnet der Server
+   (planner/profile_couplings.py).  `approx` ist Zeile für Zeile die Arithmetik von profile_couplings.approx_terms (Python-Referenz);
    ein Test vergleicht beide.  Reine Funktionen (Node/Bun-tauglich) plus `attach` für den Tooltip.  Nur Rig-Ausgabe. */
 (function (root) {
   "use strict";
@@ -19,7 +55,8 @@
     ["activation", "Aktivierung", "Chunk-Zeilen × Extend-Rate (Spitze beim Prefill)"],
     ["fixed", "Festposten", "CUDA-Kontext, Graphen, Allokator-Reste, Seam-Staging: nur am Metall zu messen (ohne Eingabe 0)"],
   ];
-  const CLS = { weights: "w", experts: "x", draft: "d", kv: "k", state: "s", activation: "g", fixed: "c", free_in_budget: "f", corridor: "c", overflow: "over" };
+  const CLS = { weights: "w", experts: "x", draft: "d", kv: "k", state: "s", activation: "g", fixed: "c", free_in_budget: "f", corridor: "r", overflow: "over", reserve: "r", free: "f" };
+  const LEG_TAIL = [["reserve", "Reserve", "Kartengröße − Budget: bleibt frei (Reserve-Semantik)"], ["free", "Frei", "Budget − Posten"]];
 
   // ---- Näherung: dieselbe Arithmetik wie profile_couplings.approx_terms ----------------------------------------------------------
   function sum(a, from, to) { let s = 0; for (let i = from; i < to; i++) s += a[i]; return s; }
@@ -75,43 +112,129 @@
     return approx(pl, stageLayers).map((t, i) => barFromTerms(t, pl.budget_mib[i], pl.total_mib[i], (labels && labels[i]) || ("Karte " + (i + 1))));
   }
 
+  // ---- Vertrag flliper.balken/1: Normalisierung, Umrechnung aus der Näherung ---------------------------------------------------------
+  // Ein Segment des Vertrags (name/herkunft/detail) und eines der Näherung (key/origin/what) werden zu EINER inneren Form.
+  const NC = "nicht gerechnet";
+  function normSeg(s) {
+    return { key: s.key || s.name, label: s.label || s.key || s.name, mib: s.mib == null ? null : s.mib, origin: s.origin || s.herkunft || "",
+      what: s.what || s.detail || s.label || "", src: s.src, cut: s.cut };
+  }
+  function normBar(b) {
+    return Object.assign({}, b, { segments: (b.segments || []).map(normSeg) });
+  }
+  // Vertragsbalken aus Posten (Reihenfolge wie profile_couplings.contract_bar): Posten | Reserve | Frei; Reserve und Frei folgen aus Budget und Posten
+  function contractBar(label, phase, total, budget, budgetOrigin, posts) {
+    const segs = [], missing = [];
+    let known = 0;
+    posts.forEach((p) => {
+      if (p.mib == null) { segs.push({ name: p.name, label: p.label, mib: null, herkunft: NC, detail: p.detail || "", gerechnet: false }); missing.push(p.label); }
+      else if (p.mib > 0) { known += p.mib; segs.push({ name: p.name, label: p.label, mib: p.mib, herkunft: p.herkunft || "", detail: p.detail || "", gerechnet: true }); }
+    });
+    const overflow = Math.max(0, known - budget), beyond = Math.max(0, known - total);
+    const reserve = Math.max(0, total - Math.max(budget, known)), free = Math.max(0, budget - known);
+    if (reserve > 0) segs.push({ name: "reserve", label: "Reserve", mib: reserve, herkunft: budgetOrigin || "", gerechnet: true,
+      detail: LEG_TAIL[0][2] + (overflow > 0 ? " -- Wunsch " + fmt(total - budget) + " MiB, davon " + fmt(overflow) + " MiB aufgezehrt" : "") });
+    if (free > 0) segs.push({ name: "free", label: "Frei", mib: free, herkunft: "gerechnet", gerechnet: true,
+      detail: LEG_TAIL[1][2] + (missing.length ? " -- OBERGRENZE: nicht gerechnet sind " + missing.join(", ") : "") });
+    return { label, phase, total_mib: total, budget_mib: budget, budget_herkunft: budgetOrigin || "", segments: segs, posts_mib: known, free_mib: free,
+      overflow_mib: overflow, beyond_card_mib: beyond, not_computed: missing };
+  }
+  // Näherungsbalken (barFromTerms: Posten bis zum Budget, Überlauf-Segment mit `cut`) -> Vertragsbalken; nicht gemessene Festposten bleiben "nicht gerechnet"
+  function toContract(b, phase) {
+    const kept = {}, meta = {};
+    let overflowSeg = null;
+    (b.segments || []).forEach((s) => {
+      const k = s.key || s.name;
+      if (k === "overflow") overflowSeg = s;
+      else if (k !== "free_in_budget" && k !== "corridor" && k !== "free" && k !== "reserve") { kept[k] = (kept[k] || 0) + s.mib; meta[k] = s; }
+    });
+    ((overflowSeg && overflowSeg.cut) || []).forEach((c) => { kept[c.key] = (kept[c.key] || 0) + c.mib; if (!meta[c.key]) meta[c.key] = { label: c.label }; });
+    const posts = SEGS.map(([key, lab, what]) => {
+      if (key === "fixed" && !(kept.fixed > 0)) return { name: key, label: lab, mib: null, detail: what };
+      const m = meta[key] || {};
+      return { name: key, label: lab, mib: kept[key] || 0, herkunft: m.origin || "Näherung (Browser)", detail: m.what || what };
+    });
+    const out = contractBar(b.label, phase, b.total_mib, b.budget_mib, "Eingabe/gerechnet", posts);
+    out.card = b.ord;
+    return out;
+  }
+  function approxContractBars(pl, stageLayers, labels, phase) {
+    return approxBars(pl, stageLayers, labels).map((b) => toContract(b, phase || "P"));
+  }
+
   // ---- Zeichnen ------------------------------------------------------------------------------------------------------------------
   function model(bar) {
     const rows = [];
     let at = 0;
-    (bar.segments || []).filter((s) => s.mib > 0).forEach((s, i) => { rows.push({ i, s, a: at, b: at + s.mib }); at += s.mib; });
+    (bar.segments || []).map(normSeg).filter((s) => s.mib != null && s.mib > 0).forEach((s, i) => { rows.push({ i, s, a: at, b: at + s.mib }); at += s.mib; });
     return { rows, sum: at, scale: Math.max(bar.total_mib, at) };
   }
-  function tip(bar, idx) {
-    const m = model(bar), r = m.rows[idx];
+  function tip(bar0, idx) {
+    const bar = normBar(bar0), m = model(bar), r = m.rows[idx];
     if (!r) return "";
     const s = r.s;
+    const beyond = Math.max(0, r.b - Math.max(bar.total_mib, r.a));         // Teil dieses Segments hinter der Kartengrenze
     return "<b>" + esc(s.label) + "</b><br>" + fmt(s.mib) + " MiB (" + gib(s.mib) + " GiB) · " + pct(s.mib, bar.total_mib) + " der Karte<br>" +
       "Herkunft: <b>" + esc(s.origin || "") + "</b>" + (s.src && String(s.origin || "").indexOf(s.src) < 0 ? ' <span class="muted">(' + esc(s.src) + ")</span>" : "") + "<br>" +
       '<span class="muted">' + esc(s.what || s.label) + "</span>" +
+      (beyond > 0 ? '<br><span class="kp-t-bad">' + fmt(beyond) + " MiB dieses Postens liegen HINTER der Kartengrenze (" + fmt(bar.total_mib) + " MiB): zu erwarten ist OOM.</span>" : "") +
       (s.key === "overflow" ? '<br><span class="kp-t-bad">Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden.</span>' : "");
   }
-  function bar(b, ctx) {
-    const m = model(b), w = (a) => (100 * a / m.scale).toFixed(3) + "%";
+  function bar(b0, ctx) {
+    const b = normBar(b0), m = model(b), w = (a) => (100 * a / m.scale).toFixed(3) + "%";
     let html = "";
     m.rows.forEach((r) => { html += '<i class="kp-s ks-' + (CLS[r.s.key] || "o") + (r.s.key === "overflow" ? " kp-beyond" : "") + '" data-s="' + r.i + '" data-b="' + ctx + '" tabindex="0" aria-label="' + esc(r.s.label) + " " + fmt(r.s.mib) + ' MiB" style="width:' + w(r.s.mib) + '"></i>'; });
-    const over = m.sum > b.total_mib;
+    const over = m.sum > b.total_mib + 1e-6;
+    // Überlauf: der Balken wächst über die Kartenkante; der Teil dahinter ist rot schraffiert (Überlagerung), die Kante trägt die Beschriftung
+    const zone = over ? '<div class="kp-bz" style="left:' + w(b.total_mib) + '" aria-hidden="true"></div>' : "";
     const edge = over ? '<div class="kp-edge" style="left:' + w(b.total_mib) + '" title="Kartenende ' + fmt(b.total_mib) + ' MiB"><span>Kartenende ' + gib(b.total_mib) + " GiB</span></div>" : "";
-    return '<div class="kp-barw' + (b.overflow_mib > 0 ? " kp-ov" : "") + '" data-bar="' + ctx + '"><div class="kp-bar">' + html + "</div>" + edge + "</div>";
+    return '<div class="kp-barw' + (over || b.overflow_mib > 0 || b.beyond_card_mib > 0 ? " kp-ov" : "") + '" data-bar="' + ctx + '"><div class="kp-bar">' + html + "</div>" + zone + edge + "</div>";
   }
   // Legende und Zeilen: Name · Zahlen · Überlauf in Klartext
   function legend() {
     return '<div class="kp-leg">' + SEGS.map(([k, l]) => '<span><i class="kp-s ks-' + CLS[k] + '"></i>' + esc(l) + "</span>").join("") +
-      '<span><i class="kp-s ks-over kp-beyond"></i>Überlauf</span><span><i class="kp-s ks-c"></i>Korridor/Reserve</span></div>';
+      LEG_TAIL.map(([k, l]) => '<span><i class="kp-s ks-' + CLS[k] + '"></i>' + esc(l) + "</span>").join("") +
+      '<span><i class="kp-s ks-over kp-beyond"></i>Überlauf</span></div>';
+  }
+  function ncChips(b) {
+    const nc = (b.segments || []).filter((s) => s.mib == null);
+    return nc.length ? '<div class="kp-ncs">' + nc.map((s) => { const n = normSeg(s); return '<span class="kp-nc" tabindex="0" title="' + esc(n.what) + '"><b>' + esc(n.label) + "</b>: nicht gerechnet</span>"; }).join("") + "</div>" : "";
+  }
+  function overNote(b) {
+    if (b.beyond_card_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.beyond_card_mib) + " MiB über der Karte.</b> Der Balken wächst über die Kartengrenze. Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden oder beim Graphenaufbau.</div>";
+    if (b.overflow_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Die Reserve wird aufgezehrt. Der Planer lehnt ab; mit Force startet es trotzdem.</div>";
+    return "";
   }
   function render(bars, opt) {
     opt = opt || {};
-    const rows = bars.map((b, i) => {
-      const ov = b.overflow_mib > 0 ? '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden. " + esc((b.segments.find((s) => s.key === "overflow") || {}).what || "") + "</div>" : "";
-      return '<div class="pf-bar"><div class="pf-bar-h"><b>' + esc(b.label) + '</b> <span class="muted">Budget ' + fmt(b.budget_mib) + " MiB von " + fmt(b.total_mib) + " MiB · " +
-        (b.overflow_mib > 0 ? "Überlauf " + fmt(b.overflow_mib) : "Rest " + fmt(b.free_mib)) + " MiB</span></div>" + bar(b, (opt.base || 0) + i) + ov + "</div>";
+    const rows = bars.map((b0, i) => {
+      const b = normBar(b0);
+      const head = b.free_mib != null && !(b.overflow_mib > 0) ? "Rest " + fmt(b.free_mib) + " MiB" + (b.not_computed && b.not_computed.length ? " (Obergrenze)" : "") : "Überlauf " + fmt(b.overflow_mib) + " MiB über dem Budget" + (b.beyond_card_mib > 0 ? " · " + fmt(b.beyond_card_mib) + " MiB über der Karte" : "");
+      // Altform (Näherung): Überlauf als eigenes Segment, kein overflow_mib-Feld in der Darstellung nötig
+      let ov = overNote(b);
+      if (!ov && b.overflow_mib > 0) ov = '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden. " + esc((b.segments.find((s) => s.key === "overflow") || {}).what || "") + "</div>";
+      return '<div class="pf-bar"><div class="pf-bar-h"><b>' + esc(b.label) + '</b>' + (b.phase ? ' <span class="kp-ph-chip">' + esc(b.phase) + "</span>" : "") + ' <span class="muted">Budget ' + fmt(b.budget_mib) + " MiB von " + fmt(b.total_mib) + " MiB · " + head + "</span></div>" +
+        bar(b, (opt.base || 0) + i) + ncChips(b) + ov + "</div>";
     }).join("");
     return legend() + rows;
+  }
+  // Alle Phasen eines Vertrags (res.phases) als HTML; `bars` ist die flache Liste für den Tooltip (Index = data-b)
+  function renderPhases(res, opt) {
+    opt = opt || {};
+    const base = opt.base || 0;
+    let html = "", all = [];
+    Object.keys(res.phases || {}).forEach((name) => {
+      const ph = res.phases[name];
+      html += '<h3 class="pf-h3">' + esc(ph.label || name) + "</h3>";
+      if (ph.ok === false) { html += '<div class="kp-verdict bad">' + esc(ph.error || "nicht gerechnet") + "</div>"; return; }
+      html += render(ph.bars, { base: base + all.length });
+      all = all.concat(ph.bars);
+      if (ph.inputs && ph.inputs.length) {
+        html += '<details class="pf-fold kp-in"><summary>Eingaben dieser Phase (' + ph.inputs.length + ")</summary><ul class=\"pf-notes\">" +
+          ph.inputs.map((x) => "<li><b>" + esc(x.was) + "</b> = <span class=\"mono\">" + esc(x.wert) + "</span> <span class=\"muted\">· " + esc(x.herkunft) + "</span></li>").join("") + "</ul></details>";
+      }
+    });
+    return { html, bars: all };
   }
   // Tooltip: ein schwebendes Feld für alle Balken (Hover, Fokus, Antippen); `bars` liefert zur Zeit der Anzeige die aktuellen Balken
   function attach(el, getBars) {
@@ -138,7 +261,7 @@
     el.addEventListener("click", (ev) => { const t = at(ev); if (t) show(t, ev.clientX, ev.clientY); else hide(); });
   }
 
-  const api = { approx, approxBars, barFromTerms, render, tip, attach, model, SEGS };
+  const api = { approx, approxBars, barFromTerms, render, renderPhases, tip, attach, model, SEGS, contractBar, toContract, approxContractBars, normBar, SCHEMA: "flliper.balken/1" };
   root.ProfilBalken = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof window !== "undefined" ? window : globalThis);

@@ -13,11 +13,12 @@ from __future__ import annotations
 import json
 import os
 import select
+import shlex
 import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(os.path.dirname(HERE), "kartenplan_build", "couplings_worker.py")
@@ -26,7 +27,10 @@ DEFAULT_PYTHON = os.environ.get("RIGDASH_COUPLINGS_PYTHON") or "/spinning/htsgla
 TIMEOUT_S = 60.0
 START_TIMEOUT_S = 120.0
 #: Operationen, die der Editor verlangen darf
-WHAT = ("bars", "compute", "move", "chunk", "context")
+WHAT = ("bars", "phase_bars", "compute", "move", "chunk", "context")
+#: Gruppenzeilen des Profils: ``--extra-p/-d`` tragen Flags der Gruppe, ``--env-p/-d`` ihre Umgebung (AP-H2: Balken je Phase)
+GROUP_EXTRA = {"--extra-p": "P", "--extra-d": "D"}
+GROUP_ENV = {"--env-p": "P", "--env-d": "D"}
 
 
 class RecomputeError(ValueError):
@@ -41,6 +45,100 @@ def args_of(doc: Mapping[str, Any]) -> Dict[str, str]:
             v = e.get("values") or []
             out[str(e["flag"])] = " ".join(str(x) for x in v) if v else ""
     return out
+
+
+def _entry_text(e: Mapping[str, Any]) -> str:
+    """Der Text eines Argumenteintrags wie er im Profil stand (``flag=wert`` bei ``eq``, sonst ``flag wert...``)."""
+    vals = [str(v) for v in (e.get("values") or [])]
+    if e.get("eq") and vals:
+        return str(e["flag"]) + "=" + vals[0]
+    return " ".join([str(e["flag"])] + vals)
+
+
+def group_texts(doc: Mapping[str, Any]) -> Dict[str, str]:
+    """``--extra-p`` / ``--extra-d`` / ``--env-p`` / ``--env-d`` -> Text.  Zwei Darstellungen kommen vor: der Wert steht in ``values``
+    (Profil mit Launcher-Specs) oder -- ohne Specs importiert -- als eigener Eintrag danach (der ganze Text steht dann in ``flag``)."""
+    args = [e for e in (doc.get("args") or []) if isinstance(e, Mapping)]
+    out: Dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        e = args[i]
+        f = e.get("flag")
+        if f in GROUP_EXTRA or f in GROUP_ENV:
+            text = " ".join(str(v) for v in (e.get("values") or []))
+            if not text and i + 1 < len(args) and "flag" in args[i + 1] and (" " in str(args[i + 1]["flag"]) or "=" in str(args[i + 1]["flag"])):
+                text = _entry_text(args[i + 1])
+                i += 1
+            if text:
+                out[str(f)] = text
+        i += 1
+    return out
+
+
+def scoped_args(text: str) -> Dict[str, str]:
+    """Flags eines ``--extra-p/-d``-Textes: Flag -> Wert (mehrere Werte mit Leerzeichen, ``--flag=wert`` und ``--flag wert`` beide)."""
+    try:
+        toks = shlex.split(text)
+    except ValueError:
+        toks = text.split()
+    out: Dict[str, str] = {}
+    cur: Optional[str] = None
+    vals: List[str] = []
+
+    def flush() -> None:
+        if cur is not None:
+            out[cur] = " ".join(vals)
+
+    for t in toks:
+        if t.startswith("--"):
+            flush()
+            if "=" in t:
+                cur, v = t.split("=", 1)
+                vals = [v]
+            else:
+                cur, vals = t, []
+        elif cur is not None:
+            vals.append(t)
+    flush()
+    return out
+
+
+def env_map(text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for item in str(text).split(";"):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def phase_inputs(doc: Mapping[str, Any]) -> Dict[str, Any]:
+    """Gruppenzeilen eines Profils fuer ``what=phase_bars``: ``phase_args`` und ``phase_env`` je ``P``/``D`` und die nackten Token."""
+    gt = group_texts(doc)
+    pa = {ph: scoped_args(gt.get(f, "")) for f, ph in GROUP_EXTRA.items()}
+    pe = {ph: env_map(gt.get(f, "")) for f, ph in GROUP_ENV.items()}
+    tokens = [str(e["token"]) for e in (doc.get("args") or []) if isinstance(e, Mapping) and "token" in e]
+    return {"phase_args": pa, "phase_env": pe, "tokens": tokens}
+
+
+def draft_path_of(doc: Mapping[str, Any], body: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+    """Das Draft-Verzeichnis des Profils: Koerper, ``--dflash-draft-path``, ``--speculative-draft-model-path`` (Gruppenzeilen), ``PROFILE_DRAFT``."""
+    if body and body.get("draft_path"):
+        return str(body["draft_path"])
+    a = args_of(doc)
+    if a.get("--dflash-draft-path"):
+        return a["--dflash-draft-path"]
+    pi = phase_inputs(doc)
+    for ph in ("D", "P"):
+        v = pi["phase_args"][ph].get("--speculative-draft-model-path")
+        if v:
+            return v
+    if a.get("--speculative-draft-model-path"):
+        return a["--speculative-draft-model-path"]
+    for v in (doc.get("vars") or []):
+        if isinstance(v, Mapping) and v.get("name") == "PROFILE_DRAFT" and v.get("value"):
+            return str(v["value"])
+    return None
 
 
 def build_request(body: Mapping[str, Any], *, hardware: Mapping[str, Any], model: Mapping[str, Any]) -> Dict[str, Any]:
@@ -61,6 +159,10 @@ def build_request(body: Mapping[str, Any], *, hardware: Mapping[str, Any], model
     for k in ("src", "dst", "n", "new_chunk_tokens"):
         if k in body:
             req[k] = body[k]
+    if what == "phase_bars":
+        req.update(phase_inputs(doc))
+        if body.get("form"):
+            req["form"] = str(body["form"])
     return req
 
 

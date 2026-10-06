@@ -12,7 +12,7 @@ Routes
   GET /api/hwprofil   Hardwareprofil flliper.hardware/1 (Auftrag 950, nur rig, nur LAN)
   POST /api/hwprofil/measure   {cards:[nvml,...]}: gpuq-Fenster buchen und messen; pending = nur Status
   POST /api/hwprofil/cancel    wartendes Fenster zurückgeben
-  POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|compute|move|chunk|context, settings?, phases?}
+  POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|phase_bars|compute|move|chunk|context, settings?, phases?, form?}
 """
 
 from __future__ import annotations
@@ -639,10 +639,26 @@ def make_handler(app: App):
             if not mpath:
                 return self._json({"ok": False, "error": "kein Modellpfad: das Profil nennt weder PROFILE_MODEL noch --model-path"}, 200)
             kv = args_.get("--kv-cache-dtype")
-            est = app.modellprofil.estimate({"path": str(mpath), "kv_dtype": kv if kv in ("auto", "fp8_e4m3") else None})
+            mreq = {"path": str(mpath), "kv_dtype": kv if kv in ("auto", "fp8_e4m3") else None}
+            draft_error = None
+            if str(body.get("what") or "bars") == "phase_bars":
+                # AP-H2: das Draft-Verzeichnis wird mitprofiliert (Draft-Term der Balken); ist es nicht lesbar, rechnet der Balken ohne und sagt es
+                dpath = profil_recompute.draft_path_of(doc, body)
+                if dpath:
+                    try:
+                        est = app.modellprofil.estimate(dict(mreq, draft_path=dpath))
+                    except ValueError as exc:
+                        draft_error = "Draft-Verzeichnis %s nicht profiliert: %s" % (dpath, exc)
+                        est = app.modellprofil.estimate(mreq)
+                else:
+                    est = app.modellprofil.estimate(mreq)
+            else:
+                est = app.modellprofil.estimate(mreq)
             req = profil_recompute.build_request(body, hardware=hw["profile"], model=est["profile"])
             res = app.couplings.request(req)
             res["model_path"] = str(mpath)
+            if draft_error:
+                res["draft_error"] = draft_error
             return self._json(res, 200)
 
         def _hwprofil(self, method, n=0, raw=b""):

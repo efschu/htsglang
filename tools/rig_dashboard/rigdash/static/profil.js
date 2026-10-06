@@ -270,20 +270,27 @@
     if (!hwEl) { hwEl = document.createElement("div"); window.HwProfil.mount(hwEl, { edition: document.documentElement.getAttribute("data-edition") || "rig" }); }
     return `<details class="pf-fold" data-fold="hw" ${isOpen("hw", false) ? "open" : ""}><summary><b>Hardware</b> · Karten und Messwerte (Hardwareprofil lesen, im gebuchten gpuq-Fenster messen)</summary><div id="pf-hwroot"></div></details>`;
   }
-  // ------------------------------------------------------------------ Balken (Auftrag 1432, S4b)
-  // Der Server rechnet die Kopplungen (/api/profil/recompute, entprellt); beim Verschieben des Layer-Schnitts zeigt der Browser sofort die
-  // lineare Näherung (ProfilBalken.approx) und ersetzt sie durch die Server-Antwort.  Gerechnet wird nur bei geöffnetem Faltbereich.
+  // ------------------------------------------------------------------ Balken (Auftrag 1432, S4b; AP-H2 Auftrag 880)
+  // Der Server rechnet die Kopplungen (/api/profil/recompute what=phase_bars, entprellt) und liefert den Vertrag flliper.balken/1
+  // (Modulkopf von profil_balken.js): je Karte und Phase EIN zusammenhängender Balken.  Beim Verschieben des Layer-Schnitts zeigt der Browser
+  // sofort die lineare Näherung der P-Phase (ProfilBalken.approx) und ersetzt sie durch die Server-Antwort.  Gerechnet wird nur bei geöffnetem Faltbereich.
   let barTimer = null, barSeq = 0, barsDrawn = [];
   function stageCounts() {
     const e = st.doc && (st.doc.args || []).find((a) => a.flag === "--pp-stage-ratio");
     const v = e && e.values && e.values[0] ? String(e.values[0]).split(",").map((x) => parseInt(x, 10)) : null;
     return v && v.every((x) => Number.isFinite(x)) ? v : null;
   }
+  // die Phase, in der der Layer-Schnitt gilt: P (Flip/Dual) bzw. die eine Phase der Einzelkarte
+  function cutPhase(res) {
+    const ph = res && res.phases;
+    return ph ? (ph.P && ph.P.ok !== false ? "P" : (ph.alle && ph.alle.ok !== false ? "alle" : null)) : null;
+  }
   function scheduleRecompute() {
     if (!st.doc || !window.ProfilBalken || !isOpen("bars", false)) return;
-    const counts = stageCounts();
-    if (st.bars && st.bars.approx && counts) {
-      try { st.bars.fast = window.ProfilBalken.approxBars(st.bars.approx, counts, st.bars.labels); } catch (e) { st.bars.fast = null; /* Schnitt passt nicht: der Server entscheidet */ }
+    const counts = stageCounts(), name = cutPhase(st.bars && st.bars.res);
+    if (st.bars && st.bars.approx && counts && name) {
+      try { st.bars.fast = { name, bars: window.ProfilBalken.approxContractBars(st.bars.approx, counts, st.bars.res.phases[name].bars.map((b) => b.label), name) }; }
+      catch (e) { st.bars.fast = null; /* Schnitt passt nicht: der Server entscheidet */ }
     }
     clearTimeout(barTimer);
     barTimer = setTimeout(recompute, 300);
@@ -292,17 +299,16 @@
     const seq = ++barSeq;
     st.barBusy = true; draw();
     try {
-      const j = await api("recompute", { doc: st.doc, what: "bars" });
+      const j = await api("recompute", { doc: st.doc, what: "phase_bars" });
       if (seq !== barSeq) return;          // veraltete Antwort: eine neuere Eingabe ist unterwegs
-      const phases = j.result.phases, names = Object.keys(phases);
-      const labels = phases[names[0]].bars.map((b) => b.label);
-      st.bars = { phases, peak: j.result.Spitze || null, hints: j.result.hints || [], approx: j.result.approx, labels, fast: null, err: null, model: j.model_path };
+      st.bars = { res: j.result, hints: j.result.hints || [], approx: j.result.approx, fast: null, err: null, model: j.model_path, draftError: j.draft_error || null };
     } catch (e) {
       if (seq !== barSeq) return;
       st.bars = Object.assign(st.bars || {}, { err: e.message, fast: null });
     }
     st.barBusy = false; draw();
   }
+  const FORM_NAME = { single: "Einzelkarte (eine Phase)", d_only: "nur TP (Phase D)", flip: "Flip PP/TP (Phasen P und D)", dual: "Dual PP/TP (P und D zugleich)" };
   function drawBars() {
     if (!window.ProfilBalken) return "";
     const PB = window.ProfilBalken, b = st.bars;
@@ -312,28 +318,32 @@
     else if (!st.doc) body = `<div class="muted pf-note">Erst ein Profil laden.</div>`;
     else if (!b) body = `<div class="muted pf-note">${st.barBusy ? "rechnet …" : "Noch nicht gerechnet."}</div>`;
     else {
-      // Fehler der ERSTEN Rechnung: es gibt noch keine Balken (b.phases fehlt); nur die Meldung zeigen, nie in b.phases greifen (sonst wirft draw() und der ganze Reiter friert ein)
+      // Fehler der ERSTEN Rechnung: es gibt noch keine Balken (b.res fehlt); nur die Meldung zeigen, nie in b.res greifen (sonst wirft draw() und der ganze Reiter friert ein)
       // Fehler einer Folgerechnung: die alten Balken bleiben stehen, sind aber ausdrücklich als veraltet gekennzeichnet
-      const note = b.err ? `<div class="kp-verdict bad">${esc(b.err)}${b.phases ? " &middot; die Balken darunter stammen aus der letzten erfolgreichen Rechnung und sind VERALTET" : ""}</div>` : "";
-      if (!b.phases && !b.fast) body = note || `<div class="muted pf-note">Keine Balken: ${esc("die Rechnung lieferte nichts")}.</div>`;
-      else if (b.fast) {
-        barsDrawn = barsDrawn.concat(b.fast);
-        body = `${note}<div class="muted pf-note"><b>Näherung im Browser</b> (lineare Rechnung für den geänderten Layer-Schnitt; der Server rechnet gerade nach)</div>${PB.render(b.fast, { base: 0 })}`;
-      } else {
-        const names = Object.keys(b.phases).concat(b.peak ? ["Spitze"] : []);
-        names.forEach((n) => {
-          const bars = n === "Spitze" ? b.peak.bars : b.phases[n].bars, base = barsDrawn.length;
-          barsDrawn = barsDrawn.concat(bars);
-          body += `<h3 class="pf-h3">${n === "alle" ? "Profil" : esc(n) + (n === "Spitze" ? " (je Karte die größere Phase)" : "-Phase")}</h3>${PB.render(bars, { base })}`;
-        });
-        const ctxf = b.phases[Object.keys(b.phases)[0]].context_floor_tokens;
-        body = `${note}${st.barBusy ? '<div class="muted pf-note">rechnet nach …</div>' : ""}${body}` +
+      const note = b.err ? `<div class="kp-verdict bad">${esc(b.err)}${b.res ? " &middot; die Balken darunter stammen aus der letzten erfolgreichen Rechnung und sind VERALTET" : ""}</div>` : "";
+      if (!b.res) body = note || `<div class="muted pf-note">Keine Balken: ${esc("die Rechnung lieferte nichts")}.</div>`;
+      else {
+        let res = b.res, fastNote = "";
+        if (b.fast && res.phases[b.fast.name]) {
+          // Näherung nur für die P-Phase: die anderen Phasen bleiben die des Servers
+          res = Object.assign({}, res, { phases: Object.assign({}, res.phases, { [b.fast.name]: Object.assign({}, res.phases[b.fast.name], { bars: b.fast.bars, inputs: [] }) }) });
+          fastNote = `<div class="muted pf-note"><b>Näherung im Browser</b> (lineare Rechnung der ${esc(b.fast.name)}-Phase für den geänderten Layer-Schnitt; der Server rechnet gerade nach)</div>`;
+        }
+        const r = PB.renderPhases(res, { base: 0 });
+        barsDrawn = r.bars;
+        const names = Object.keys(res.phases), first = res.phases[names.find((n) => res.phases[n].ok !== false) || names[0]] || {};
+        const ctxf = first.context_floor_tokens;
+        const nc = [...new Set(barsDrawn.flatMap((x) => x.not_computed || []))];
+        body = `${note}${st.barBusy ? '<div class="muted pf-note">rechnet nach …</div>' : ""}${fastNote}` +
+          `<div class="muted pf-note">Betriebsform: <b>${esc(FORM_NAME[res.form] || res.form || "")}</b>${res.draft && res.draft.kind && res.draft.kind !== "none" ? " · Draft: " + esc(res.draft.kind) + (res.draft.placement ? " (" + esc(res.draft.placement) + ")" : "") : ""}</div>` +
+          r.html +
           (ctxf != null ? `<div class="muted pf-note">Kontext-Boden (kleinste KV-Kapazität über die Stufen): ${ctxf.toLocaleString("de-DE")} Token</div>` : "") +
+          (b.draftError ? `<div class="kp-verdict bad">${esc(b.draftError)}</div>` : "") +
           (b.hints && b.hints.length ? `<ul class="pf-hints">${b.hints.map((h) => `<li>${esc(h)}</li>`).join("")}</ul>` : "") +
-          `<div class="muted pf-note">Modell: <span class="mono">${esc(b.model || "")}</span>. Festposten (CUDA-Kontext, Graphen, Allokator-Reste) sind nur am Metall zu messen und stehen ohne Messung auf 0: „Rest“ ist eine Obergrenze. Die Aktivierung ist eine Geometrie-Näherung, solange keine gemessene Spitze eingetragen ist.</div>`;
+          `<div class="muted pf-note">Modell: <span class="mono">${esc(b.model || "")}</span>. ${nc.length ? "<b>Nicht gerechnet:</b> " + esc(nc.join(", ")) + " (Chips unter dem Balken, Tooltip nennt den Grund); „Frei“ ist dann eine Obergrenze. " : ""}Festposten (CUDA-Kontext, Graphen, Allokator-Reste) sind nur am Metall zu messen. Werte mit Herkunft „Näherung“ sind Rechnungen des Editors, nicht die des Launcher-Lösers.</div>`;
       }
     }
-    return `<details class="pf-fold" data-fold="bars" ${isOpen("bars", false) ? "open" : ""}><summary><b>Karten-Balken</b> · was der Schnitt, die Experten und der Chunk auf jeder Karte belegen (Überlauf rot)</summary>${body}</details>`;
+    return `<details class="pf-fold" data-fold="bars" ${isOpen("bars", false) ? "open" : ""}><summary><b>Karten-Balken</b> · je Karte und Phase ein Balken: Gewichte | Experten | Draft | KV | Mamba | Reserve | Frei (Überlauf rot, über die Kartengrenze)</summary>${body}</details>`;
   }
   // Force-Hinweis des Exports: reiner Text nach dem letzten Trockenlauf (der Server hat den Fall berechnet); es gibt keinen Schalter, nichts startet
   function drawForce(f) {

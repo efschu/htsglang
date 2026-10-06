@@ -79,6 +79,14 @@ __all__ = [
     "bars_for",
     "approx_payload",
     "approx_terms",
+    "BALKEN_SCHEMA",
+    "BALKEN_SEGMENTS",
+    "phase_bars",
+    "contract_bar",
+    "d_stage_terms",
+    "d_phase_config",
+    "p_phase_settings",
+    "detect_form",
 ]
 
 SCHEMA = "flliper.couplings/1"
@@ -262,13 +270,19 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
     exp_b = _val(w["layer_expert_bytes"])
     bounds = _stage_bounds(counts)
     mtp_b = float(_val(w.get("mtp_bytes"), 0.0)) if draft else 0.0
+    draft_src = _src(w.get("mtp_bytes"))
+    draft_note = "MTP-Layer auf der letzten Stufe" if draft else ""
+    if draft and settings.get("draft_mib") is not None:
+        # AP-H2: das Gewicht des Drafts kommt aus dem Profil des Draft-Verzeichnisses (model["draft"]["external"]), nicht aus dem Zielmodell
+        mtp_b = float(settings["draft_mib"]) * MIB
+        draft_src = str(settings.get("draft_src") or draft_src)
+        draft_note = str(settings.get("draft_note") or draft_note)
     if "mtp" in replicated:
         mtp_b = 0.0        # schon als replizierter Posten in den Gewichten
     draft_bytes = [0.0] * n
     if draft:
         draft_bytes[-1] = mtp_b
     weights_b = [f + d for f, d in zip(weights_full, draft_bytes)]
-    draft_note = "MTP-Layer auf der letzten Stufe" if draft else ""
 
     # Attention / Linear je Stufe
     pinned = settings.get("attn_layers")
@@ -342,7 +356,7 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
                                  "dichte Gewichte der Layer + Einbettung/lm_head der Rolle"),
                 "experts": _term(experts_mib, _src(w["total_bytes"]) if "total_bytes" in w else SRC_DEFAULT,
                                  "residente Expertenzeilen %.0f %% (Pufferregel)" % (100 * buf_fracs[i]) if moe else "keine Experten"),
-                "draft": _term(draft_mib, _src(w.get("mtp_bytes")) if draft else SRC_DEFAULT, draft_note if draft_mib else "kein Draft"),
+                "draft": _term(draft_mib, draft_src if draft else SRC_DEFAULT, draft_note if draft_mib else "kein Draft"),
                 "kv": _term(kv_mib, cell_src, "%d Token x %d Attention-Layer%s x %.0f B" % (ctx, attn[i], " + Draft" if draft_attn[i] else "", cell)),
                 "state": _term(state_mib, _src(state_node), "%d Linear-Layer x %.4f MiB x %d Slot(s)" % (lin[i], state_per, slots)),
                 "activation": _term(act_mib, SRC_INPUT if act_vec is not None else rate_src,
@@ -823,6 +837,572 @@ def approx_terms(pl: Mapping[str, Any], stage_layers: Sequence[int]) -> List[Dic
 
 
 # ---------------------------------------------------------------------------
+# AP-H2: Balken je Karte und Phase im Datenvertrag ``flliper.balken/1``
+# ---------------------------------------------------------------------------
+#
+# EIN zusammenhaengender Balken je Karte und Phase in logischer Reihenfolge
+#     Gewichte | Experten | Draft | KV | Mamba | (Aktivierung | Festposten) | Reserve | Frei
+# Phasen: ``P`` (Prefill, Pipeline-Stufen) und ``D`` (Decode, TP-Raenge); Dual zeigt beide zugleich, nur-TP nur ``D``, Einzelkarte eine
+# Phase ``alle``.  Der Vertrag steht im Modulkopf von ``static/profil_balken.js``; ein Orakel (propose/Dry-Run, AP-C/AP-D) kann Werte in
+# DIESELBE Form liefern, ohne dass die Darstellung sich aendert.
+#
+# EHRLICHKEIT.  Ein Term, der sich aus den Profilzeilen und dem Modellprofil nicht belegen laesst, hat ``mib: None`` und
+# ``herkunft: "nicht gerechnet"`` mit Grund (``detail``); er zaehlt nicht in die Summe, ``Frei`` ist dann eine Obergrenze.  Nichts wird
+# geraten (Hochrechnung != Messung).  Werte "Naeherung" sind Rechnungen dieses Moduls, nicht die des Loesers/Launchers.
+
+BALKEN_SCHEMA = "flliper.balken/1"
+SRC_PROFILE = "Profilzeile"
+SRC_APPROX = "Naeherung"
+SRC_NONE = "nicht gerechnet"
+FORMS = ("single", "d_only", "flip", "dual")
+
+BALKEN_SEGMENTS: Tuple[Tuple[str, str, str], ...] = BAR_SEGMENTS + (
+    ("reserve", "Reserve", "Kartengroesse - Budget: bleibt frei (Reserve-Semantik); wird von Posten ueber dem Budget aufgezehrt"),
+    ("free", "Frei", "Budget - Posten (Obergrenze, solange Posten nicht gerechnet sind)"),
+)
+#: Erklaerung je Posten der D-Phase (TP-Raenge): die Texte von BAR_SEGMENTS beschreiben die P-Stufen (Layer-Schnitt, letzte Stufe)
+D_WHAT = {
+    "weights": "dichte Gewichte, Einbettung und lm_head dieses Ranges (TP-Anteil)",
+    "experts": "Expertenzeilen dieses Ranges nach Pufferregel min(R + Scratch, eigene Experten) je Layer",
+    "draft": "Gewicht des Drafts auf diesem Rang",
+    "kv": "KV-Anteil dieses Ranges fuer das Kontextziel",
+    "state": "Mamba/GDN-Zustand-Anteil dieses Ranges: Linear-Layer x Zustand je Layer und Slot x Slots x TP-Anteil",
+    "activation": "Decode-Aktivierung dieses Ranges",
+    "fixed": "CUDA-Kontext der schlafenden Phase und VRAM ausserhalb des Torch-Allokators (D-Seite)",
+}
+_ORIGIN.update({SRC_PROFILE: "Profilzeile", SRC_APPROX: "Naeherung (nicht der Loeser)", SRC_NONE: "nicht gerechnet"})
+
+_SPEC_FLAGS = ("--speculative-algorithm", "--speculative-draft-model-path", "--dflash-draft-path", "--spec-form")
+
+
+def _fl(s: Any) -> Optional[List[float]]:
+    """``"1,0,0"`` -> ``[1.0, 0.0, 0.0]``; leer oder unlesbar -> ``None``."""
+    try:
+        out = [float(x) for x in str(s).replace(" ", "").split(",") if x != ""]
+    except ValueError:
+        return None
+    return out or None
+
+
+def _merged(args: Mapping[str, str], phase_args: Optional[Mapping[str, Any]], phase: str) -> Dict[str, str]:
+    """Flag -> Wert einer Phase: die Zeilen des Profils, darueber die ``--extra-p`` / ``--extra-d`` der Gruppe (argparse: Gruppe gewinnt)."""
+    out = dict(args or {})
+    out.update(dict((phase_args or {}).get(phase) or {}))
+    return out
+
+
+def _draft_info(model: Mapping[str, Any], all_args: Mapping[str, str]) -> Dict[str, Any]:
+    """Was der Draft ist und was er wiegt -- nur aus Profilzeilen und Modellprofil.
+
+    ``kind``: ``none`` | ``nextn`` (MTP-Kopf, launcher.SPEC_FORM_DEFAULT = NEXTN) | ``dflash`` (Platzierung nicht gerechnet).
+    ``p_mib``/``d_mib``: Gewichte auf P (teilt ``lm_head`` mit dem Ziel, ``draft_post.P_SHARED_WITH_TARGET``) bzw. D (teilt Einbettung und
+    ``lm_head``, ``draft_post.D_SHARED_WITH_TARGET``), ohne Laufzeitpuffer; ``None`` = nicht belegbar."""
+    w = model.get("weights") or {}
+    mtp = float(_val(w.get("mtp_bytes"), 0.0) or 0.0) / MIB
+    ext = (model.get("draft") or {}).get("external")
+    flagged = any(all_args.get(f) for f in _SPEC_FLAGS)
+    form = str(all_args.get("--spec-form") or "").upper()
+    algo = str(all_args.get("--speculative-algorithm") or "").upper()
+    info: Dict[str, Any] = {"kind": "none", "p_mib": 0.0, "d_mib": 0.0, "src": SRC_DEFAULT, "p_note": "", "d_note": "", "reason": "",
+                            "attn_layers": 1, "placement": str(all_args.get("--speculative-draft-placement") or "split"),
+                            "gpu": all_args.get("--speculative-draft-gpu")}
+    if all_args.get("--dflash-draft-path") or form == "DFLASH" or algo == "DFLASH":
+        info.update(kind="dflash", p_mib=None, d_mib=None,
+                    reason="DFlash2-Draft: Platzierung und Gewicht je Gruppe sind nicht gerechnet (Orakel/AP-D)")
+        return info
+    if not (flagged or mtp > 0):
+        info["reason"] = "kein Draft: kein --speculative-*/--dflash-*-Flag im Profil und kein MTP-Kopf im Modell"
+        return info
+    info["kind"] = "nextn"
+    if ext and "bytes_without_lm_head" in ext:
+        info["p_mib"] = float(_val(ext["bytes_without_lm_head"])) / MIB
+        info["d_mib"] = float(_val(ext["bytes_without_embed_lm_head"])) / MIB if "bytes_without_embed_lm_head" in ext else None
+        info["src"] = _src(ext["bytes_without_lm_head"])
+        info["p_note"] = "Draft-Verzeichnis ohne lm_head (P teilt ihn mit dem Ziel), ohne Laufzeitpuffer"
+        info["d_note"] = "Draft-Verzeichnis ohne Einbettung und lm_head (D teilt sie mit dem Ziel), ohne Laufzeitpuffer"
+        if info["d_mib"] is None:
+            info["reason"] = "Draft-Verzeichnis ohne Aufteilung Einbettung/lm_head im Profil"
+        info["attn_layers"] = int(_val((ext.get("kv") or {}).get("attn_layers"), 1) or 1)
+    elif mtp > 0:
+        info["p_mib"] = info["d_mib"] = mtp
+        info["src"] = _src(w.get("mtp_bytes"))
+        info["p_note"] = info["d_note"] = "MTP-Kopf des Ziel-Checkpoints (mtp.*)"
+    else:
+        info.update(p_mib=None, d_mib=None, reason="Draft-Verzeichnis ist im Profil genannt, aber nicht profiliert (kein Modellprofil des Drafts)")
+    return info
+
+
+def p_phase_settings(args: Mapping[str, str], env: Mapping[str, str], model: Mapping[str, Any], n: int, draft: Mapping[str, Any],
+                     *, carries_draft: bool) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+    """Einstellungen fuer ``_stage_terms`` aus den Zeilen der P-Phase (oder der Einzelkarte) und die Liste der gelesenen Eingaben."""
+    s = settings_from_server(args, model)
+    seen: List[Dict[str, str]] = []
+
+    def note(what: str, value: Any, herkunft: str) -> None:
+        seen.append({"was": what, "wert": str(value), "herkunft": herkunft})
+
+    for key, flag in (("stage_layers", "--pp-stage-ratio"), ("attn_layers", "--pp-attn-stage-ratio"), ("budget_mib", "--rank-gpu-memory-mib"),
+                      ("chunk_tokens", "--chunked-prefill-size"), ("context_tokens", "--max-kv-per-request")):
+        if key in s:
+            note(key, args.get(flag, ""), "Profilzeile " + flag)
+    if n == 1 and "stage_layers" not in s:
+        s["stage_layers"] = [len(_families(model))]
+        note("stage_layers", s["stage_layers"][0], "Einzelkarte: alle Layer auf der einen Karte")
+    if "moe_resident_fraction" not in s:
+        fr = _fl(args.get("--pp-cut-expert-device-fraction")) or _fl(env.get("SGLANG_MOE_RESIDENT_EXPERT_FRACTION"))
+        if fr:
+            s["moe_resident_fraction"] = fr if len(fr) > 1 else fr[0]
+            note("moe_resident_fraction", ",".join("%g" % x for x in fr),
+                 "Profilzeile --pp-cut-expert-device-fraction" if args.get("--pp-cut-expert-device-fraction")
+                 else "Umgebung SGLANG_MOE_RESIDENT_EXPERT_FRACTION (--env-p)")
+    else:
+        note("moe_resident_fraction", args.get("--rank-moe-resident-fraction", ""), "Profilzeile --rank-moe-resident-fraction")
+    sc = _fl(args.get("--pp-cut-expert-lru-rows")) or _fl(env.get("SGLANG_MOE_SCRATCH_SLOTS"))
+    if sc:
+        s["scratch_rows"] = [int(x) for x in sc] if len(sc) > 1 else int(sc[0])
+        note("scratch_rows", ",".join("%d" % x for x in sc),
+             "Profilzeile --pp-cut-expert-lru-rows" if args.get("--pp-cut-expert-lru-rows") else "Umgebung SGLANG_MOE_SCRATCH_SLOTS (--env-p)")
+    slots = args.get("--max-mamba-cache-size")
+    if slots and str(slots).isdigit():
+        s["mamba_slots"] = int(slots)
+        note("mamba_slots", slots, "Profilzeile --max-mamba-cache-size")
+    ssm = args.get("--mamba-ssm-dtype")
+    if ssm and ssm in ((model.get("state") or {}).get("variants_mib") or {}):
+        s["ssm_dtype"] = ssm
+        note("ssm_dtype", ssm, "Profilzeile --mamba-ssm-dtype")
+    if "budget_mib" not in s:
+        note("budget_mib", "Kartengroesse - 1024 MiB", "Annahme dieser Rechnung (kein --rank-gpu-memory-mib im Profil)")
+    for key, default, why in (("chunk_tokens", 2048, "kein --chunked-prefill-size/--p-chunk-max im Profil"),
+                              ("context_tokens", 262144, "kein --max-kv-per-request/--context-length im Profil"),
+                              ("mamba_slots", 1, "kein --max-mamba-cache-size im Profil")):
+        if key not in s:
+            note(key, default, "Annahme dieser Rechnung (%s)" % why)
+    # Draft: P traegt den MTP-Kopf nur mit --draft-kv-on-p on (Standard on; launcher.py --draft-kv-on-p Hilfe)
+    s["draft"] = False
+    if carries_draft and draft["kind"] == "nextn" and draft["p_mib"] is not None:
+        s["draft"] = True
+        s["draft_mib"] = draft["p_mib"]
+        s["draft_src"] = draft["src"]
+        s["draft_note"] = draft["p_note"]
+    return s, seen
+
+
+def _p_terms_for_contract(stage: Mapping[str, Any], draft: Mapping[str, Any], carries_draft: bool, is_last: bool,
+                          settings: Mapping[str, Any]) -> Dict[str, Any]:
+    """Posten der ``_stage_terms``-Stufe im Vertragsformat: nicht belegbare Posten werden ``None`` (nicht gerechnet), nie 0."""
+    t = {k: dict(v) for k, v in stage["terms"].items()}
+    if settings.get("fixed_overhead_mib") is None:
+        t["fixed"] = {"v": None, "src": SRC_NONE, "note": "CUDA-Kontext, Graphen, Allokator-Reste, Seam-Staging: nur am Metall zu messen"}
+    if settings.get("activation_mib") is None and not stage.get("_rate_known", True):
+        t["activation"] = {"v": None, "src": SRC_NONE, "note": "Extend-Rate des Modells unbekannt"}
+    if is_last and carries_draft and draft["kind"] != "none" and not settings.get("draft"):
+        t["draft"] = {"v": None, "src": SRC_NONE, "note": draft["reason"] or "Draftgewicht nicht belegbar"}
+    return t
+
+
+def d_phase_config(args: Mapping[str, str], env: Mapping[str, str], model: Mapping[str, Any], n: int, draft: Mapping[str, Any]) -> Dict[str, Any]:
+    """Einstellungen der D-Phase (TP-Raenge) aus den Zeilen der Gruppe D; ``seen`` = gelesene Eingaben mit Herkunft."""
+    seen: List[Dict[str, str]] = []
+
+    def note(what: str, value: Any, herkunft: str) -> None:
+        seen.append({"was": what, "wert": str(value), "herkunft": herkunft})
+
+    cfg: Dict[str, Any] = {"n": n, "draft": draft}
+    tp = str(args.get("--rank-tp-ratio") or "").strip()
+    if tp in ("auto", "auto-performance"):
+        cfg["tp_ratio"] = tp
+        note("tp_ratio", tp, "Profilzeile --rank-tp-ratio")
+    elif _fl(tp):
+        cfg["tp_ratio"] = _fl(tp)
+        note("tp_ratio", tp, "Profilzeile --rank-tp-ratio")
+    mr = str(args.get("--rank-moe-ratio") or "").strip()
+    if mr and _fl(mr):
+        cfg["moe_ratio"] = _fl(mr)
+        note("moe_ratio", mr, "Profilzeile --rank-moe-ratio")
+    elif mr:
+        cfg["moe_ratio"] = mr
+        note("moe_ratio", mr, "Profilzeile --rank-moe-ratio")
+    fr = _fl(args.get("--rank-moe-resident-fraction")) or _fl(env.get("SGLANG_MOE_RESIDENT_EXPERT_FRACTION"))
+    if fr:
+        cfg["moe_fraction"] = fr if len(fr) > 1 else fr[0]
+        note("moe_fraction", ",".join("%g" % x for x in fr),
+             "Profilzeile --rank-moe-resident-fraction" if args.get("--rank-moe-resident-fraction")
+             else "Umgebung SGLANG_MOE_RESIDENT_EXPERT_FRACTION (--env-d)")
+    sc = _fl(env.get("SGLANG_MOE_SCRATCH_SLOTS"))
+    if sc:
+        cfg["scratch"] = [int(x) for x in sc] if len(sc) > 1 else int(sc[0])
+        note("scratch", ",".join("%d" % x for x in sc), "Umgebung SGLANG_MOE_SCRATCH_SLOTS (--env-d)")
+    bud = _fl(args.get("--rank-gpu-memory-mib"))
+    if bud:
+        cfg["budget_mib"] = bud
+        note("budget_mib", args.get("--rank-gpu-memory-mib"), "Profilzeile --rank-gpu-memory-mib")
+    else:
+        note("budget_mib", "Kartengroesse - 1024 MiB", "Annahme dieser Rechnung (kein --rank-gpu-memory-mib in der Gruppe D)")
+    for flag in ("--max-kv-per-request", "--context-length"):
+        v = args.get(flag)
+        if v and str(v).isdigit():
+            cfg["context_tokens"] = int(v)
+            note("context_tokens", v, "Profilzeile " + flag)
+            break
+    slots = args.get("--max-mamba-cache-size")
+    if slots and str(slots).isdigit():
+        cfg["mamba_slots"] = int(slots)
+        note("mamba_slots", slots, "Profilzeile --max-mamba-cache-size")
+    for key, default, why in (("context_tokens", 262144, "kein --max-kv-per-request/--context-length in der Gruppe D"),
+                              ("mamba_slots", 1, "kein --max-mamba-cache-size in der Gruppe D")):
+        if key not in cfg:
+            note(key, default, "Annahme dieser Rechnung (%s)" % why)
+    kd = args.get("--kv-cache-dtype")
+    if kd and kd in ((model.get("kv") or {}).get("variants") or {}):
+        cfg["kv_dtype"] = kd
+        note("kv_dtype", kd, "Profilzeile --kv-cache-dtype")
+    ssm = args.get("--mamba-ssm-dtype")
+    if ssm and ssm in ((model.get("state") or {}).get("variants_mib") or {}):
+        cfg["ssm_dtype"] = ssm
+        note("ssm_dtype", ssm, "Profilzeile --mamba-ssm-dtype")
+    kr = str(args.get("--rank-kv-ratio") or "coupled").strip()
+    cfg["kv_ratio"] = _fl(kr) if _fl(kr) else kr
+    if args.get("--rank-kv-ratio"):
+        note("kv_ratio", kr, "Profilzeile --rank-kv-ratio")
+    cfg["kv_token_cut"] = bool(args.get("--d-kv-token-cut")) or bool(env.get("SGLANG_UNEVEN_TOKEN_VECTOR"))
+    if args.get("--d-kv-token-cut"):
+        note("kv_token_cut", args.get("--d-kv-token-cut"), "Profilzeile --d-kv-token-cut")
+    fo, nt = _fl(args.get("--d-foreign-context-mib")), _fl(args.get("--d-nontorch-mib"))
+    if fo and nt and len(fo) == len(nt):
+        cfg["fixed_mib"] = [a + b for a, b in zip(fo, nt)]
+        cfg["fixed_parts"] = {"fremd": fo, "nichttorch": nt}
+        note("fixed_mib", "%s + %s" % (args.get("--d-foreign-context-mib"), args.get("--d-nontorch-mib")),
+             "Profilzeilen --d-foreign-context-mib (CUDA-Kontext der schlafenden Phase) + --d-nontorch-mib (VRAM ausserhalb des Torch-Allokators)")
+    elif fo or nt:
+        cfg["fixed_mib"] = fo or nt
+        cfg["fixed_parts"] = {"fremd": fo, "nichttorch": nt}
+        note("fixed_mib", args.get("--d-foreign-context-mib") or args.get("--d-nontorch-mib"),
+             "nur eine der Profilzeilen --d-foreign-context-mib / --d-nontorch-mib")
+    return dict(cfg, seen=seen)
+
+
+def _norm_shares(ratio: Sequence[float], n: int, name: str) -> List[float]:
+    if len(ratio) != n:
+        raise CouplingError("vector_length: %s hat %d Werte, es gibt %d Raenge" % (name, len(ratio), n))
+    tot = float(sum(ratio))
+    if tot <= 0:
+        raise CouplingError("%s: Summe der Gewichte ist 0" % name)
+    return [float(r) / tot for r in ratio]
+
+
+def d_stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Posten je Karte der D-Phase (TP-Raenge) im selben Stufenformat wie ``_stage_terms`` (``terms[k] = {v|None, src, note}``).
+
+    Gewichte, Experten und Zustand folgen den Anteilen aus ``--rank-tp-ratio`` / ``--rank-moe-ratio`` (ohne Zeile: gleichmaessiger TP);
+    Experten halten je Rang ``buffer_rows(owned, FR_D, Scratch)`` Zeilen je Layer (Pufferregel).  KV nur dort, wo sich die Verteilung
+    belegen laesst (gleichmaessiger TP oder ein ausdruecklicher ``--rank-kv-ratio``-Vektor); sonst ``None``."""
+    cards = _cards(hw)
+    n = len(cards)
+    totals = [float(_val(c.get("vram_total_mib"), 0.0)) for c in cards]
+    if any(t <= 0 for t in totals):
+        raise CouplingError("Hardwareprofil: vram_total_mib fehlt auf einer Karte")
+    corridor = float(cfg.get("corridor_mib", 1024.0))
+    has_budget = cfg.get("budget_mib") is not None
+    budgets = _per_card(cfg.get("budget_mib"), n, "budget_mib", 0.0) if has_budget else [t - corridor for t in totals]
+    budget_src = SRC_PROFILE if has_budget else SRC_DERIVED
+    budget_note = "--rank-gpu-memory-mib" if has_budget else "Kartengroesse - Korridor %.0f MiB (Annahme)" % corridor
+    fams = _families(model)
+    w = model["weights"]
+    lb, le = list(_val(w["layer_bytes"])), list(_val(w["layer_expert_bytes"]))
+    dense_total = (sum(lb) + float(_val(w.get("embed_bytes"), 0.0)) + float(_val(w.get("lm_head_bytes"), 0.0))) / MIB
+    E = int(_val(model.get("experts", {}).get("n"), 0) or 0)
+    ctx = int(cfg.get("context_tokens", 262144))
+    slots = int(cfg.get("mamba_slots", 1))
+
+    def none(note: str) -> Dict[str, Any]:
+        return {"v": None, "src": SRC_NONE, "note": note}
+
+    # --- Anteile ------------------------------------------------------------------------------------------------------------------
+    tp = cfg.get("tp_ratio")
+    shares: Optional[List[float]]
+    if isinstance(tp, str):
+        shares, share_note = None, "--rank-tp-ratio %s: die Gewichte loest der Launcher, nicht gerechnet" % tp
+    elif tp:
+        shares, share_note = _norm_shares(tp, n, "--rank-tp-ratio"), "Anteil nach --rank-tp-ratio %s" % ",".join("%g" % x for x in tp)
+    else:
+        shares, share_note = [1.0 / n] * n, "gleichmaessiger TP (kein --rank-tp-ratio im Profil)"
+    share_src = SRC_PROFILE if (tp and not isinstance(tp, str)) else SRC_APPROX
+
+    # --- Experten ---------------------------------------------------------------------------------------------------------------------
+    exp_terms: List[Dict[str, Any]] = []
+    mr = cfg.get("moe_ratio")
+    if E <= 0:
+        exp_terms = [_term(0.0, SRC_DEFAULT, "keine Experten") for _ in range(n)]
+    elif isinstance(mr, str):
+        exp_terms = [none("--rank-moe-ratio %s: die Zuteilung loest der Launcher" % mr) for _ in range(n)]
+    else:
+        fracs = _per_card(cfg.get("moe_fraction"), n, "moe_fraction", 1.0)
+        scr = _per_card(cfg.get("scratch"), n, "scratch", 0.0)
+        per_expert = sum(le) / float(E) / MIB
+        if mr:
+            ratio = [float(x) for x in mr]
+            if len(ratio) != n:
+                raise CouplingError("vector_length: --rank-moe-ratio hat %d Werte, es gibt %d Raenge" % (len(ratio), n))
+            as_counts = abs(sum(ratio) - E) < 1e-9
+            counts = [int(x) for x in ratio] if as_counts else [int(round(E * r / sum(ratio))) for r in ratio]
+            how = ("Besitz %s von %d Experten" % (",".join(str(c) for c in counts), E)) if as_counts else \
+                "Besitz aus dem Verhaeltnis auf %d Experten normiert: %s" % (E, ",".join(str(c) for c in counts))
+            for i in range(n):
+                try:
+                    rows = _er.buffer_rows(local_experts=counts[i], fraction=fracs[i], scratch_rows=int(scr[i])) if counts[i] > 0 else 0
+                except ValueError as exc:
+                    exp_terms.append(none(str(exc)))
+                    continue
+                exp_terms.append({"v": rows * per_expert, "src": SRC_APPROX,
+                                  "note": "%s; %d von %d eigenen Zeilen je Layer resident (FR %.3g, Scratch %d), %.3f MiB je Zeile ueber alle Layer"
+                                          % (how, rows, counts[i], fracs[i], int(scr[i]), per_expert)})
+        elif shares is not None:
+            for i in range(n):
+                bf = _mp.expert_buffer_fraction(E, fracs[i], int(scr[i]))
+                exp_terms.append({"v": shares[i] * sum(le) / MIB * bf, "src": SRC_APPROX,
+                                  "note": "%s; Pufferregel %.0f %% (FR %.3g, Scratch %d); kein --rank-moe-ratio" % (share_note, 100 * bf, fracs[i], int(scr[i]))})
+        else:
+            exp_terms = [none(share_note) for _ in range(n)]
+
+    # --- Zustand (Mamba/GDN) ------------------------------------------------------------------------------------------------------------
+    attn_total = sum(1 for f in fams if f == "attn")
+    lin_total = len(fams) - attn_total
+    state_per = float(_val((model.get("state") or {}).get("per_linear_layer_per_slot_mib"), 0.0))
+    if cfg.get("ssm_dtype"):
+        state_per = float(model["state"]["variants_mib"][cfg["ssm_dtype"]])
+    state_total = lin_total * state_per * slots
+
+    # --- KV ------------------------------------------------------------------------------------------------------------------------------
+    draft = cfg.get("draft") or {"kind": "none"}
+    cell, cell_src = _cell_bytes(model, cfg.get("kv_dtype"))
+    cell_mib = cell / MIB
+    kv_total = ctx * attn_total * cell_mib
+    kvr = cfg.get("kv_ratio")
+    kv_shares: Optional[List[float]] = None
+    if isinstance(kvr, list):
+        kv_shares = _norm_shares(kvr, n, "--rank-kv-ratio")
+        kv_note = "Token-Eigentum nach --rank-kv-ratio %s (jeder Rang haelt alle KV-Koepfe seiner Token)" % ",".join("%g" % x for x in kvr)
+    elif kvr not in (None, "coupled"):
+        kv_note = "--rank-kv-ratio %s: der Loeser verteilt die Token kapazitaetsgewichtet" % kvr
+    elif cfg.get("kv_token_cut"):
+        kv_note = "--d-kv-token-cut/SGLANG_UNEVEN_TOKEN_VECTOR gesetzt: das Token-Eigentum loest der Planer"
+    elif tp:
+        kv_note = ("ungleicher TP (--rank-tp-ratio): die Verteilung der KV-Koepfe/Token folgt dem Plan der Laufzeit (Reiter KV-Koepfe), "
+                   "nicht gerechnet")
+    else:
+        h = int(_val(model["arch"].get("heads_kv"), 0) or 0)
+        if h and h >= n and h % n == 0:
+            kv_shares, kv_note = [1.0 / n] * n, "gleichmaessiger TP: %d KV-Koepfe / %d Raenge" % (h, n)
+        else:
+            kv_note = "%d KV-Koepfe auf %d Raenge: Standardpfad der Laufzeit (Replikation/Token-Achse), nicht gerechnet" % (h, n)
+
+    # --- Draft ------------------------------------------------------------------------------------------------------------------------------
+    host: Optional[int] = 0
+    if draft.get("gpu") not in (None, ""):
+        match = [i for i, c in enumerate(cards) if str(c.get("nvml_index")) == str(draft["gpu"])]
+        host = match[0] if match else None
+    draft_terms: List[Dict[str, Any]] = [_term(0.0, SRC_DEFAULT, draft.get("reason") or "kein Draft") for _ in range(n)]
+    draft_share: List[float] = [0.0] * n
+    if draft["kind"] != "none":
+        solo = draft.get("placement") == "solo"
+        if draft["d_mib"] is None:
+            draft_terms = [none(draft.get("reason") or "Draftgewicht nicht belegbar") for _ in range(n)]
+        elif solo:
+            if host is None:
+                draft_terms = [none("--speculative-draft-gpu %s: Rang nicht aus dem Hardwareprofil ableitbar" % draft.get("gpu")) for _ in range(n)]
+            else:
+                draft_terms = [_term(draft["d_mib"] if i == host else 0.0, draft["src"], "solo auf Rang %d: %s" % (host, draft["d_note"]))
+                               for i in range(n)]
+                draft_share = [1.0 if i == host else 0.0 for i in range(n)]
+        elif shares is not None:
+            draft_terms = [_term(draft["d_mib"] * shares[i], SRC_APPROX,
+                                 "geteilt (--speculative-draft-placement split) nach TP-Anteil: %s" % draft["d_note"]) for i in range(n)]
+            draft_share = list(shares)
+        else:
+            draft_terms = [none(share_note) for _ in range(n)]
+
+    fixed = cfg.get("fixed_mib")
+    fixed_vec = _per_card(fixed, n, "fixed_mib", 0.0) if fixed is not None else None
+    act = cfg.get("activation_mib")
+    act_vec = _per_card(act, n, "activation_mib", 0.0) if act is not None else None
+
+    stages = []
+    for i, c in enumerate(cards):
+        t: Dict[str, Any] = {}
+        t["weights"] = none(share_note) if shares is None else {
+            "v": shares[i] * dense_total, "src": share_src,
+            "note": "%s (Vokabular folgt hier dem TP-Anteil, nicht --rank-vocab-ratio)" % share_note}
+        t["experts"] = exp_terms[i]
+        t["draft"] = draft_terms[i]
+        if kv_shares is None:
+            t["kv"] = none(kv_note)
+        else:
+            drows = draft.get("attn_layers", 1) if (draft["kind"] == "nextn" and draft_share[i] > 0) else 0
+            kv_i = kv_shares[i] * kv_total + (ctx * drows * cell_mib * draft_share[i] if drows else 0.0)
+            t["kv"] = {"v": kv_i, "src": SRC_APPROX, "note": "%s: %d Token x %d Attention-Layer x %.0f B%s" % (
+                kv_note, ctx, attn_total, cell, " + Draft-KV" if drows else "")}
+        t["state"] = none(share_note) if shares is None else {
+            "v": shares[i] * state_total, "src": SRC_APPROX,
+            "note": "%s; %d Linear-Layer x %.4f MiB x %d Slot(s)" % (share_note, lin_total, state_per, slots)}
+        t["activation"] = _term(act_vec[i], SRC_INPUT, "gemessene Spitze (Eingabe)") if act_vec is not None else none(
+            "Decode-Aktivierung und Graphen der D-Phase: nur am Metall zu messen")
+        if fixed_vec is not None:
+            parts = cfg.get("fixed_parts") or {}
+            f_note = "; ".join("%s %s" % (k, ",".join("%g" % x for x in v)) for k, v in parts.items() if v)
+            t["fixed"] = {"v": fixed_vec[i], "src": SRC_PROFILE,
+                          "note": "--d-foreign-context-mib (CUDA-Kontext der schlafenden Phase) + --d-nontorch-mib: " + f_note}
+        else:
+            t["fixed"] = none("CUDA-Kontext, Graphen, Allokator-Reste: nur am Metall zu messen "
+                              "(keine --d-foreign-context-mib/--d-nontorch-mib im Profil)")
+        stages.append({"ord": c.get("ord", i), "label": _label(c), "total_mib": totals[i],
+                       "budget_mib": {"v": budgets[i], "src": budget_src, "note": budget_note}, "terms": t})
+    hints = ["D: KV gesamt fuer %d Token Kontext ueber alle Raenge: %.0f MiB (%s)" % (ctx, kv_total, cell_src)]
+    return {"stages": stages, "warnings": [], "hints": hints}
+
+
+def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
+    """Eine Stufe (``terms[k] = {v|None, src, note}``) -> Karten-Balken im Vertrag ``flliper.balken/1``.
+
+    Posten in logischer Reihenfolge, dann ``Reserve`` (Kartengroesse - Budget, von einem Ueberlauf ueber das Budget aufgezehrt) und
+    ``Frei`` (Budget - Posten).  Die Segmente SIND der Balken: Summe = max(Kartengroesse, Posten); ragt sie ueber ``total_mib``, waechst der
+    Balken ueber die Kartengrenze (``beyond_card_mib``) -- nichts wird abgeschnitten.  ``mib: None`` = nicht gerechnet."""
+    total = float(stage["total_mib"])
+    budget = float(stage["budget_mib"]["v"])
+    segs: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    known = 0.0
+    for key, label, what in BAR_SEGMENTS:
+        t = stage["terms"].get(key)
+        if t is None:
+            continue
+        if phase == "D":
+            what = D_WHAT.get(key, what)
+        v = t.get("v")
+        if v is None:
+            segs.append({"name": key, "label": label, "mib": None, "herkunft": SRC_NONE, "detail": t.get("note") or what, "gerechnet": False})
+            missing.append(label)
+        elif v > 0:
+            known += float(v)
+            segs.append({"name": key, "label": label, "mib": round(float(v), 3), "herkunft": _origin(t["src"]),
+                         "detail": what + (" -- " + t["note"] if t.get("note") else ""), "gerechnet": True})
+    overflow = max(0.0, known - budget)
+    beyond = max(0.0, known - total)
+    reserve = max(0.0, total - max(budget, known))
+    free = max(0.0, budget - known)
+    bsrc = stage["budget_mib"]
+    if reserve > 0:
+        wish = (" -- Wunsch %.0f MiB, davon %.0f MiB aufgezehrt" % (total - budget, overflow)) if overflow > 0 else ""
+        segs.append({"name": "reserve", "label": "Reserve", "mib": round(reserve, 3), "herkunft": _origin(bsrc["src"]),
+                     "detail": BALKEN_SEGMENTS[-2][2] + (" -- " + bsrc["note"] if bsrc.get("note") else "") + wish, "gerechnet": True})
+    if free > 0:
+        obergrenze = (" -- OBERGRENZE: nicht gerechnet sind " + ", ".join(missing)) if missing else ""
+        segs.append({"name": "free", "label": "Frei", "mib": round(free, 3), "herkunft": "gerechnet",
+                     "detail": BALKEN_SEGMENTS[-1][2] + obergrenze, "gerechnet": True})
+    return {"card": stage.get("ord"), "label": stage["label"], "phase": phase, "total_mib": total, "budget_mib": budget,
+            "budget_herkunft": _origin(bsrc["src"]), "segments": segs, "posts_mib": round(known, 3), "free_mib": round(free, 3),
+            "overflow_mib": round(overflow, 3), "beyond_card_mib": round(beyond, 3), "not_computed": missing,
+            "over_text": _over_text(stage["label"], phase, overflow, beyond, budget, total)}
+
+
+def _over_text(label: str, phase: str, overflow: float, beyond: float, budget: float, total: float) -> str:
+    if beyond > 0:
+        return ("%s (%s): Posten %.0f MiB ueber der KARTE (%.0f MiB). Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM "
+                "beim Laden oder beim Graphenaufbau." % (label, phase, beyond, total))
+    if overflow > 0:
+        return ("%s (%s): Posten %.0f MiB ueber dem Budget (%.0f MiB); die Reserve wird aufgezehrt. Der Planer lehnt ab; mit Force startet es "
+                "trotzdem." % (label, phase, overflow, budget))
+    return ""
+
+
+def detect_form(args: Mapping[str, str], tokens: Sequence[str], n: int, form: Optional[str] = None) -> str:
+    """Betriebsform aus dem Profil: ``single`` (eine Karte) | ``d_only`` (``--d-only``) | ``dual`` (``--dual-*``) | ``flip`` (Standard)."""
+    if form in FORMS:
+        return str(form)
+    if n == 1:
+        return "single"
+    if any(str(k).startswith("--dual-") for k in args) or any(str(t).startswith("--dual-") for t in tokens):
+        return "dual"
+    if "--d-only" in tokens or "--d-only" in args:
+        return "d_only"
+    return "flip"
+
+
+def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[str, str], phase_args: Optional[Mapping[str, Any]] = None,
+               phase_env: Optional[Mapping[str, Any]] = None, form: Optional[str] = None, tokens: Sequence[str] = (),
+               overrides: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Balken je Karte und Phase im Vertrag ``flliper.balken/1`` aus dem Serverprofil (Flag -> Wert, Gruppenzeilen getrennt).
+
+    Phase ``P``: Pipeline-Stufen (``_stage_terms``).  Phase ``D``: TP-Raenge (``d_stage_terms``).  Dual: beide zugleich auf denselben Karten --
+    eine Summe wird NICHT gebildet (``--dual-share``: P rechnet auf den Shards von D, Gewichte doppelt zu zaehlen waere falsch; die
+    Dual-Passung ist Aufgabe des Planers AP-E).  Eine Phase, die sich nicht rechnen laesst, steht mit ``ok: False`` und Grund da."""
+    n = len(_cards(hw))
+    form = detect_form(args, tokens, n, form)
+    over = dict(overrides or {})
+    penv = dict(phase_env or {})
+    out_phases: Dict[str, Any] = {}
+    hints: List[str] = []
+    all_args: Dict[str, str] = dict(args or {})
+    for ph in ("P", "D"):
+        all_args.update(dict((phase_args or {}).get(ph) or {}))
+    draft = _draft_info(model, all_args)
+    carries_p = str(all_args.get("--draft-kv-on-p", "on")).lower() != "off"
+    approx: Optional[Dict[str, Any]] = None
+
+    def run_p(name: str, scope: str) -> Dict[str, Any]:
+        nonlocal approx
+        a = _merged(args, phase_args, scope) if scope != "-" else dict(args)
+        carries = carries_p or form == "single"
+        settings, seen = p_phase_settings(a, dict(penv.get("P") or {}), model, n, draft, carries_draft=carries)
+        settings.update({k: v for k, v in over.items() if k != "what"})
+        if "stage_layers" not in settings:
+            raise CouplingError("--pp-stage-ratio fehlt im Profil: der Layer-Schnitt der P-Phase ist unbekannt")
+        t = _stage_terms(hw, model, settings)
+        stages = []
+        for i, st in enumerate(t["stages"]):
+            st2 = dict(st)
+            st2["_rate_known"] = t["_ctx"]["rate"] > 0
+            st2["terms"] = _p_terms_for_contract(st2, draft, carries, i == len(t["stages"]) - 1, settings)
+            stages.append(st2)
+        try:
+            approx = approx_payload(hw, model, settings)
+        except (CouplingError, KeyError, ValueError, TypeError):
+            approx = None
+        if name == "P" and draft["kind"] != "none" and not carries:
+            seen.append({"was": "draft", "wert": "aus", "herkunft": "Profilzeile --draft-kv-on-p off: P traegt keinen MTP-Kopf"})
+        label = "P-Phase (Prefill, Pipeline-Stufen)" if name == "P" else "Einzelkarte (eine Phase)"
+        return {"ok": True, "label": label, "bars": [contract_bar(s, name) for s in stages], "inputs": seen,
+                "context_floor_tokens": t["context_floor_tokens"], "warnings": t["warnings"]}
+
+    def run_d() -> Dict[str, Any]:
+        a = _merged(args, phase_args, "D")
+        cfg = d_phase_config(a, dict(penv.get("D") or {}), model, n, draft)
+        for k in ("context_tokens", "mamba_slots", "ssm_dtype", "kv_dtype", "corridor_mib", "activation_mib"):
+            if k in over:
+                cfg[k] = over[k]
+        t = d_stage_terms(hw, model, cfg)
+        return {"ok": True, "label": "D-Phase (Decode, TP-Raenge)", "bars": [contract_bar(s, "D") for s in t["stages"]],
+                "inputs": cfg["seen"], "hints": t["hints"], "warnings": t["warnings"]}
+
+    plan = {"single": [("alle", lambda: run_p("alle", "-"))], "d_only": [("D", run_d)],
+            "flip": [("P", lambda: run_p("P", "P")), ("D", run_d)], "dual": [("P", lambda: run_p("P", "P")), ("D", run_d)]}[form]
+    for name, fn in plan:
+        try:
+            out_phases[name] = fn()
+        except (CouplingError, KeyError, ValueError, TypeError) as exc:
+            out_phases[name] = {"ok": False, "label": name, "error": "%s: %s" % (type(exc).__name__, exc), "bars": [], "inputs": []}
+    for ph in out_phases.values():
+        for b in ph["bars"]:
+            if b["over_text"]:
+                hints.append(b["over_text"])
+        hints.extend(ph.get("hints") or [])
+    if form == "dual":
+        hints.append("Dual: P und D laufen gleichzeitig auf denselben Karten. Die Summe beider Balken ist nicht gerechnet (--dual-share: P rechnet "
+                     "auf den Shards von D, die Dual-Passung ist Planer-Rechnung des AP-E, nicht hw_fit).")
+    return {"schema": BALKEN_SCHEMA, "form": form, "n_cards": n, "phases": out_phases, "hints": hints, "approx": approx,
+            "draft": {k: draft[k] for k in ("kind", "placement", "reason")}}
+
+
+# ---------------------------------------------------------------------------
 # Brueckenaufruf: eine JSON-Anfrage -> eine JSON-Antwort (Dashboard-Kindprozess, Auftrag 1431/1432)
 # ---------------------------------------------------------------------------
 
@@ -836,7 +1416,8 @@ def run(req: Mapping[str, Any]) -> Dict[str, Any]:
         hw, model = req["hardware"], req["model"]
         settings = dict(req.get("settings") or {})
         if req.get("server_args"):
-            settings = dict(settings_from_server(req["server_args"], model), **settings)
+            if req.get("what") != "phase_bars":      # phase_bars liest die Zeilen selbst (je Gruppe getrennt)
+                settings = dict(settings_from_server(req["server_args"], model), **settings)
         what = req.get("what", "compute")
         if what == "compute":
             res = compute(hw, model, settings)
@@ -848,6 +1429,11 @@ def run(req: Mapping[str, Any]) -> Dict[str, Any]:
             res = c4_context_target(hw, model, settings)
         elif what == "bars":
             res = dict(bars_for(hw, model, settings, phases=req.get("phases")), approx=approx_payload(hw, model, settings))
+        elif what == "phase_bars":
+            # AP-H2: Vertrag flliper.balken/1.  ``settings`` (Eingaben des Nutzers) gelten als Uebersteuerung; die Zeilen des Profils kommen aus
+            # ``server_args`` (Flag -> Wert) sowie ``phase_args`` / ``phase_env`` (je Gruppe P/D: --extra-p/-d und --env-p/-d)
+            res = phase_bars(hw, model, dict(req.get("server_args") or {}), req.get("phase_args"), req.get("phase_env"), req.get("form"),
+                             tuple(req.get("tokens") or ()), overrides=settings)
         else:
             raise CouplingError("unbekannte Anfrage %r (compute|move|chunk|context)" % what)
         return {"ok": True, "result": res}
