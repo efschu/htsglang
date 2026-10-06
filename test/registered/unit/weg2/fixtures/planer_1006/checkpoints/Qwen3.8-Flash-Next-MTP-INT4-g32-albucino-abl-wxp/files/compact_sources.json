@@ -1,0 +1,12 @@
+{
+  "format": "qwen38-flash-next-mtp-int4-g32-compact-v1",
+  "source": {
+    "repo": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594"
+  },
+  "dense_tensors": 31,
+  "expert_tensors": 4608,
+  "tensor_payload_bytes": 4139535872,
+  "packing": "MTP routed experts locally RTN-quantized to INT4 symmetric group-32 with min/max scales; other MTP tensors unchanged",
+  "compaction": "All indexed non-expert tensors were copied bit-for-bit into mtp-dense.safetensors; no symlinks or unindexed target tensors are included."
+}
