@@ -355,10 +355,15 @@ class CardKvLedger:
             st.contrib[self.group] = 0
 
     def close(self) -> None:
+        """Release the mmap and the lock fd. IDEMPOTENT: the fd is an int from ``os.open``
+        (no finalizer closes it -- a dropped ledger leaks it until the process dies), and a
+        second ``os.close`` of the same number could close a different, reused descriptor."""
+        fd, self._lock_fd = getattr(self, "_lock_fd", -1), -1
         try:
             self._mm.close()
         finally:
-            os.close(self._lock_fd)
+            if fd >= 0:
+                os.close(fd)
 
 
 def peek(path: str) -> Optional[LedgerState]:

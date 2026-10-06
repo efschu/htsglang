@@ -582,6 +582,36 @@ def publish_stage(actor: "PKvStage", tag: str, pp_rank: int) -> str:
     return path
 
 
+def _close_all(taken) -> None:
+    """Close the ledgers of ``(index, ledger, bytes)`` charges (a ``CardKvLedger`` holds an mmap
+    and a lock fd, and nothing but ``close()`` gives the fd back -- 06.10. dual rc12z30y9nf21:
+    ~172k leaked rounds x 3 cards hit the 524288 fd limit, EMFILE in ``CardKvLedger.__init__``).
+    Never raises; a fake without ``close`` is skipped."""
+    for _i, led, _g in taken:
+        close = getattr(led, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 -- closing is cleanup, never a reason to fail the round
+                pass
+
+
+def _give_back(taken) -> None:
+    """Return every charge in ``(index, ledger, bytes)`` to its card (all-or-none)."""
+    for _i, led, got in taken:
+        if got:
+            led.release(got)
+
+
+def _close_untold(req) -> None:
+    """The follower cards' charge of ``req`` is no longer PP0's to return (the told is on the wire,
+    or it was returned): drop it and close the ledgers ``pp0_grant`` kept open for it."""
+    untold = getattr(req, "_dual_grant_untold", None)
+    req._dual_grant_untold = None
+    if untold:
+        _close_all(untold)
+
+
 def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optional[dict] = None,
                 taken_out: Optional[list] = None) -> int:
     """ATOMIC over all P stages (operator order 30.09.: all or none, fixed card
@@ -614,18 +644,39 @@ def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optio
     k = want // step
     order = sorted(range(len(stages)), key=lambda i: str(stages[i]["ledger"]))
     taken = []
-    for i in order:
-        need = max(0, int(stages[i]["bytes"][k]) - int(covered.get(i, 0)))
-        led = open_ledger(stages[i]["ledger"])
-        got, _ = led.request(need)
-        taken.append((i, led, got))
-        if got < need:
-            for _i2, l2, g2 in taken:
-                if g2:
-                    l2.release(g2)
-            return 0
+    short = False
+    try:
+        for i in order:
+            need = max(0, int(stages[i]["bytes"][k]) - int(covered.get(i, 0)))
+            led = open_ledger(stages[i]["ledger"])
+            try:
+                got, _ = led.request(need)
+            except BaseException:
+                _close_all([(i, led, 0)])
+                raise
+            taken.append((i, led, got))
+            if got < need:
+                short = True
+                break
+    except BaseException:
+        # an open/request failed half way (EMFILE, a ledger error): the cards already charged
+        # get their bytes back, and no ledger opened here outlives the call
+        try:
+            _give_back(taken)
+        finally:
+            _close_all(taken)
+        raise
+    if short:
+        try:
+            _give_back(taken)
+        finally:
+            _close_all(taken)
+        return 0
     if taken_out is not None:
+        # the caller owns these open ledgers now (pp0_grant: closes them or hands the followers' to the req)
         taken_out.extend(taken)
+    else:
+        _close_all(taken)
     return want
 
 
@@ -967,9 +1018,10 @@ def pp0_grant(sched, req) -> Optional[int]:
             # have. Every card's charge goes back, PP0's ledger is reconciled
             # against cuMemGetInfo (the next grant is priced on what is really
             # there) and the request is HELD -- a wait, never a rank death.
-            for _i, led, got in taken:
-                if got:
-                    led.release(got)
+            try:
+                _give_back(taken)
+            finally:
+                _close_all(taken)
             phys = phys_free_bytes()
             over = actor.ledger.reconcile(phys) if phys is not None else 0
             logger.warning("%s MAP-SHORT-WAIT rid=%s tokens=%d: %s -- every card's grant returned, PP0's "
@@ -977,6 +1029,9 @@ def pp0_grant(sched, req) -> Optional[int]:
                            MARK, rid, lvl, exc, int(over), phys)
             _log_wait(rid, tokens)
             return 0
+        except BaseException:
+            _close_all(taken)
+            raise
         req._dual_kv_tokens = lvl
         if _ovt_head is not None:
             # #1920: this grant went past a head that D's live floor keeps short (counted only once it holds)
@@ -989,7 +1044,12 @@ def pp0_grant(sched, req) -> Optional[int]:
         # Q-630: the followers' charges stand on their cards until a follower
         # adopts them from the told (map_granted) -- held on the request until
         # the told is on the wire (with_dual_kv), returned if it never leaves.
-        req._dual_grant_untold = [(i, led, got) for i, led, got in taken if i != 0 and got] or None
+        _keep = [(i, led, got) for i, led, got in taken if i != 0 and got]
+        req._dual_grant_untold = _keep or None
+        # the ledgers kept for the req stay open until the told leaves / the charge goes back;
+        # PP0's own card and zero-charge cards are nobody's: closed now
+        _kept = {id(led) for _i, led, _g in _keep}
+        _close_all([t for t in taken if id(t[1]) not in _kept])
         waited = _wait_granted(rid)
         logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards%s", MARK, rid, lvl, pp,
                     (" after %d waits over %.1f s" % waited) if waited else "")
@@ -1309,7 +1369,7 @@ def with_dual_kv(told, req):
         setattr(told, WIRE_DUAL_KV, lvl)
         # Q-630: the grant is on the wire -- from here every follower adopts its
         # charge (on_told -> map_granted), nobody may return it a second time.
-        req._dual_grant_untold = None
+        _close_untold(req)
     return told
 
 
@@ -1332,12 +1392,15 @@ def return_untold_grant(sched, req, why: str) -> int:
         return 0
     req._dual_grant_untold = None
     n = 0
-    for pp, led, got in untold:
-        led.release(got)
-        n += int(got)
-        logger.warning("%s P-KV GRANT-RETURN rid=%s pp=%d bytes=%d why=%s: the told carrying PP0's group "
-                       "grant never left -- this follower card's charge goes back to the card pool",
-                       MARK, str(getattr(req, "rid", "?"))[:16], int(pp), int(got), why)
+    try:
+        for pp, led, got in untold:
+            led.release(got)
+            n += int(got)
+            logger.warning("%s P-KV GRANT-RETURN rid=%s pp=%d bytes=%d why=%s: the told carrying PP0's group "
+                           "grant never left -- this follower card's charge goes back to the card pool",
+                           MARK, str(getattr(req, "rid", "?"))[:16], int(pp), int(got), why)
+    finally:
+        _close_all(untold)
     return n
 
 
