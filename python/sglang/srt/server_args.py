@@ -3139,7 +3139,7 @@ class ServerArgs:
     random_seed: A[Optional[int], "The random seed."] = None
     watchdog_timeout: A[
         float,
-        "Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        "Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging. With the env SGLANG_ENABLE_SCHEDULER_WATCHDOG_KILL=0 the timeout is only dumped and logged (no SIGQUIT), like --soft-watchdog-timeout.",
     ] = 300
     soft_watchdog_timeout: A[
         Optional[float],

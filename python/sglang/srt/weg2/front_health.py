@@ -53,6 +53,9 @@ import os
 import re
 from typing import Callable, Iterable, List, NamedTuple, Optional
 
+from sglang.srt import guard_switches
+from sglang.srt.environ import envs
+
 ENV = "SGLANG_WEG2_FRONT_HEALTH_FACTS"
 POLL_S = 5.0
 PROBE_TIMEOUT_S = 8.0
@@ -70,6 +73,17 @@ def enabled(env=None) -> bool:
     e = os.environ if env is None else env
     raw = (e.get(ENV, "") or "").strip().lower()
     return raw not in ("0", "false", "no", "off")
+
+
+#: W17's streak of consecutive /health failures (the old literal 2). WAECHTER-SCHALTER 06.10.:
+#: SGLANG_WEG2_GROUP_DEAD_STREAK (int >= 1) replaces it for BOTH consumers -- the front's W17 stop gate and the 503 of the
+#: front's own /health (``unhealthy_reason``) -- so a raised streak does not make /health report a group dead that
+#: W17 still tolerates. Unset / invalid / < 1 = 2.
+W17_STREAK_DEFAULT = 2
+
+
+def w17_streak() -> int:
+    return guard_switches.positive_int(envs.SGLANG_WEG2_GROUP_DEAD_STREAK, W17_STREAK_DEFAULT)
 
 
 def poll_interval_s() -> float:
@@ -178,6 +192,6 @@ def unhealthy_reason(facts: GroupFacts, state: str) -> Optional[str]:
         return dead
     if state == "flipping":
         return None
-    if not facts.http_ok and facts.streak >= 2:
+    if not facts.http_ok and facts.streak >= w17_streak():
         return f"http_ok=False streak={facts.streak}"
     return None

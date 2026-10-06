@@ -12,6 +12,7 @@ from typing import Callable, List, Optional, Tuple
 
 import psutil
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
@@ -252,6 +253,14 @@ class WatchdogRaw:
         print(file=sys.stdout, flush=True)
 
         if not self.soft:
+            # WAECHTER-SCHALTER 06.10. (deskq 52): the hard stop has its own switch (default on = the kill below, as
+            # ever). Off: the dump and the line above stay, the parent is not signalled.
+            if not envs.SGLANG_ENABLE_SCHEDULER_WATCHDOG_KILL.get():
+                logger.error(
+                    f"{self.debug_name} watchdog: SIGQUIT to the parent process "
+                    "suppressed (SGLANG_ENABLE_SCHEDULER_WATCHDOG_KILL=0)"
+                )
+                return
             # Wait for some time so that the parent process can print the error.
             time.sleep(5)
             self.parent_process.send_signal(signal.SIGQUIT)
@@ -367,6 +376,8 @@ class SubprocessWatchdog:
         # rather than an absolute nobody can interpret.
         self._oom_kills_at_start = _oom_kill_count()
         self._reported: set = set()
+        # WAECHTER-SCHALTER 06.10.: the suppressed-kill line is written once, not every poll.
+        self._kill_suppressed_logged = False
 
     def processes_with_names(self) -> List[Tuple[Process, str]]:
         """Tracked (process, name) pairs, for external liveness checks."""
@@ -454,6 +465,17 @@ class SubprocessWatchdog:
             self._report_death(proc, name)
             if proc.exitcode != 0:
                 crashed = True
+
+        if crashed and not envs.SGLANG_ENABLE_SUBPROCESS_WATCHDOG_KILL.get():
+            # WAECHTER-SCHALTER 06.10. (deskq 52): the stop has its own switch (default on). Off: every death above is
+            # reported, nothing is signalled, the watch goes on.
+            if not self._kill_suppressed_logged:
+                self._kill_suppressed_logged = True
+                logger.error(
+                    "A subprocess crashed; SIGQUIT for cleanup suppressed "
+                    "(SGLANG_ENABLE_SUBPROCESS_WATCHDOG_KILL=0)"
+                )
+            return False
 
         if crashed:
             logger.error("Triggering SIGQUIT for cleanup...")
