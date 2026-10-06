@@ -1904,6 +1904,7 @@ def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admiss
             if time.monotonic() > deadline:
                 capped = True
                 break  # named below: the tree is still short
+            _drain_revokes_while_waiting(tree)
             time.sleep(0.002)
     wait_s = time.monotonic() - t0
     spent_map[rid] = float(spent_map.get(rid, 0.0)) + wait_s
@@ -1931,6 +1932,35 @@ def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admiss
         scheduler.ps.pp_rank, _rt(rid), int(told), after, verdict, wait_s * 1e3, site, n2,
     )
     return int(told)
+
+
+def _drain_revokes_while_waiting(tree) -> None:
+    """#1400 (NF cand4c 06.10. 11:08:10Z, PP2, weg2-74-260): a wait for the
+    rank's own read runs ON the scheduler thread, and a read whose probe came
+    back below the threshold is not terminated -- it is REVOKED, and the record
+    leaves ``ongoing_prefetch`` only when the scheduler thread drains the
+    revoke queue, which it does once per round. The wait holds the thread, so
+    the round never comes and ``check_prefetch_progress`` answers False until
+    the cap kills the group (``drain_prefetch_revokes_uncoordinated`` has the
+    measured case). Draining the revokes inside the wait is what the next round
+    would do anyway; the tree does it only where that needs no peer (group P)
+    and a tree without the method (27B hi-mamba, test doubles) keeps the
+    unchanged wait."""
+    drain = getattr(tree, "drain_prefetch_revokes_uncoordinated", None)
+    if callable(drain):
+        drain()
+
+
+def _read_wait_exceeded(scheduler, rid: str, told: int) -> Weg2StoreToldMismatch:
+    """The named stop of a wait that spent WAIT_CAP_S (one text for both waits
+    of :func:`admission`)."""
+    return Weg2StoreToldMismatch(
+        f"#1400 STORE-TOLD WAIT EXCEEDED rank pp={scheduler.ps.pp_rank} "
+        f"rid={_rt(rid)} told={told}: this rank's own store read did not "
+        f"terminate within {WAIT_CAP_S:g}s although the revoke queue was "
+        f"drained inside the wait; the prefetch policy should have cut it "
+        f"long before, so the storage thread is stuck."
+    )
 
 
 def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional[int]:
@@ -1965,7 +1995,13 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         _dl = time.monotonic() + WAIT_CAP_S
         while not tree.check_prefetch_progress(rid):
             if time.monotonic() > _dl:
-                break   # the wait below names the stuck read
+                # #1400 (06.10. weg2-74-260): a read that did not terminate in
+                # the whole budget is named HERE. It used to `break` into the
+                # settle below and wait the budget a second time for the same
+                # read (11:06:10 -> 11:08:10, two minutes with the scheduler
+                # thread held).
+                raise _read_wait_exceeded(scheduler, rid, told)
+            _drain_revokes_while_waiting(tree)
             time.sleep(0.002)
         _own = _completed_prefix(tree, rid)
         _tst = getattr(scheduler, getattr(_twin, "_ATTR", "_weg2_twin_state"), None)
@@ -2001,12 +2037,8 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     while not tree.check_prefetch_progress(rid):
         waited = True
         if time.monotonic() > deadline:
-            raise Weg2StoreToldMismatch(
-                f"#1400 STORE-TOLD WAIT EXCEEDED rank pp={scheduler.ps.pp_rank} "
-                f"rid={_rt(rid)} told={told}: this rank's own store read did not "
-                f"terminate within {WAIT_CAP_S:g}s; the prefetch policy should "
-                f"have cut it long before, so the storage thread is stuck."
-            )
+            raise _read_wait_exceeded(scheduler, rid, told)
+        _drain_revokes_while_waiting(tree)
         time.sleep(0.002)
     own = _completed_prefix(tree, rid)
     if _twin.take_follower_twin(scheduler, rid):
