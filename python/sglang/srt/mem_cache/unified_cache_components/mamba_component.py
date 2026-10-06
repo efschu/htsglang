@@ -94,6 +94,89 @@ def _1469_note(kind: str, _uncapped: bool = False, **kw) -> None:
         pass
 
 
+def _obs_track(v) -> str:
+    """Observation only: a track position as text (``-`` = None / absent)."""
+    if v is None:
+        return "-"
+    try:
+        return str(int(v))
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _obs_is_tp0() -> bool:
+    """Observation only: True on attention-TP rank 0, and wherever the group is
+    not initialised (unit tests). No collective."""
+    try:
+        from sglang.srt.distributed.parallel_state import (
+            get_attn_tensor_model_parallel_rank,
+        )
+
+        return int(get_attn_tensor_model_parallel_rank()) == 0
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _obs_finish_track(
+    req, cache_len, token_ids_len: int, is_finished: bool, extra_buffer: bool
+) -> None:
+    """nf-next-1006-37 (log text only): the position the finish INSERT cuts at,
+    read where ``cache_len`` is taken. ``#59 RESUMABLE`` (nf-next-1006-30) reads
+    ``mamba_last_track_seqlen`` after the insert, where the non-extra-buffer path
+    has already set it to None (``cleanup_after_caching_req``). Every rank logs its
+    own line; no collective, no behaviour."""
+    if not is_finished:
+        return
+    try:
+        logger.info(
+            "#59 FINISH-TRACK rid=%s cache_len=%s branching=%s tokens=%d extra_buffer=%d",
+            getattr(req, "rid", None),
+            _obs_track(cache_len),
+            _obs_track(getattr(req, "mamba_branching_seqlen", None)),
+            int(token_ids_len),
+            1 if extra_buffer else 0,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+#: nf-next-1006-37: a hit shallower than this is not logged by MATCH-CENSUS-DEEP
+#: (fixed, no env); lines per request are capped by ``_DEEP_CENSUS_PER_REQ``.
+_DEEP_CENSUS_MIN_DEPTH = 1000
+_DEEP_CENSUS_PER_REQ = 4
+
+
+def _obs_match_census_deep(
+    req, reached: int, accepted: int, branching, prefix: int
+) -> None:
+    """nf-next-1006-37 (log text only): the ``[#904 match-census]`` line is
+    emitted for a hit only every Nth walk (SGLANG_MATCH_REFUSAL_CENSUS_EVERY), so
+    the hit that carried the branching point of a class-B request was never seen
+    (nf-next-1006-29). Log every deep hit (accepted >= 1000) of an ARMED census
+    on attention-TP rank 0 only, once per distinct (reached, accepted, prefix)
+    per request and at most ``_DEEP_CENSUS_PER_REQ`` lines per request (a parked
+    request re-matches every pass). ``reached``/``accepted`` are the finalize-time
+    key-token sums of the match chunks (all / up to the best anchor)."""
+    if req is None or accepted < _DEEP_CENSUS_MIN_DEPTH:
+        return
+    try:
+        from sglang.srt.mem_cache.match_refusal_census import census_every
+
+        if census_every() <= 0 or not _obs_is_tp0():
+            return
+        sig = (int(reached), int(accepted), int(prefix))
+        last_sig, n = getattr(req, "_weg2_deep_census", (None, 0))
+        if sig == last_sig or n >= _DEEP_CENSUS_PER_REQ:
+            return
+        req._weg2_deep_census = (sig, n + 1)
+        logger.info(
+            "MATCH-CENSUS-DEEP rid=%s reached=%d accepted=%d branching=%s prefix=%d",
+            getattr(req, "rid", None), sig[0], sig[1], _obs_track(branching), sig[2],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 _NO_PROGRESS_N = 0
 
 
@@ -491,6 +574,15 @@ class MambaComponent(TreeComponent):
             branching_seqlen = aligned_seqlen if aligned_seqlen > 0 else None
         else:
             branching_seqlen = None
+
+        # nf-next-1006-37 (log text only): every deep hit, TP0 only, see the helper.
+        _obs_match_census_deep(
+            req,
+            sum(len(v) for v in value_chunks),
+            sum(len(v) for v in value_chunks[:effective_best_len]),
+            branching_seqlen,
+            len(result.device_indices) + int(result.host_hit_length or 0),
+        )
 
         if zeroed_by_strict_resume:
             # Full re-prefill; the branching seqlen still points at the grid
@@ -1291,6 +1383,7 @@ class MambaComponent(TreeComponent):
 
         if self.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen
+            _obs_finish_track(req, cache_len, token_ids_len, is_finished, True)
             # #747 cache_len seam (mirrors mamba_radix_cache.py:626-640 and
             # :795-809): the tracked position is on the checkpoint grid by
             # construction (prefill targets and decode tracking both use the
@@ -1326,6 +1419,7 @@ class MambaComponent(TreeComponent):
                 return _decline_retention(is_finished)
         else:
             cache_len = token_ids_len
+            _obs_finish_track(req, cache_len, token_ids_len, is_finished, False)
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
             # slot's unflushed ring depth (`write_pos`), so on request finish cap
             # the donate to the last flush boundary (where temporal is current)
