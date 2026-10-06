@@ -22,6 +22,10 @@ THE REFERENCE RIG (3080, 5090, 3080 = N = 3) IS PLAN-IDENTICAL: no entry in ``re
 ``--force``, the same W19 figures, the same anchor stage, the same plan fingerprint armed and unarmed (the golden of
 test_hw_generic_launcher_1002 pins the unarmed one against the base).
 
+hw_sim step 5d (AP1 merge with the NF line, 06.10.): the pre-boot simulator asks the same two gates; the class
+TestHwSimSeesTheGates is the NF file's, verbatim, so the AP1 code is the same in both lines (the 27B file keeps its
+own register cases on top).
+
 Honesty: every borrowed figure is UNMEASURED on the card it is applied to; a green test here is the Vorab-gate, not
 a boot ("HOCHRECHNUNG != MESSUNG").
 
@@ -309,6 +313,48 @@ class TestPinnedCutFallback(_Armed):
         self.assertTrue(hasattr(L.solve_p_cut, "__wrapped__"))
         self.assertIn("def solve_p_cut(", inspect.getsource(L.solve_p_cut))
         self.assertIn("cut = solve_p_cut(", inspect.getsource(L.main))
+
+
+class TestHwSimSeesTheGates(_Armed):
+    def cell(self, keys, model="NF", force=False):
+        if force:
+            R.arm(True)
+        try:
+            c = HS.simulate("t", keys, HS.MODELS[model])
+            return c, R.forced_list()
+        finally:
+            R.arm(False)
+            os.environ.pop(R.ENV_FORCED_BOOT, None)
+
+    def test_a_5090_and_two_sm86_cards_run_under_force_with_the_borrows_listed(self):
+        for inv in (["3090", "5090", "3090"], ["5090", "3080-10G", "3080-10G"], ["5090", "A6000", "A6000"]):
+            c, forced = self.cell(inv, force=True)
+            self.assertEqual((c.result, c.blockers), (HS.RUNS, []), inv)
+            texts = [f["text"] for f in forced]
+            self.assertTrue(any("W19 dormant-residue" in t and "BORROWS" in t for t in texts), inv)
+            self.assertTrue(any("deep attention anchor" in t and "BORROWS" in t for t in texts), inv)
+
+    def test_without_force_the_cell_is_the_same_uncalibrated_refusal_as_before(self):
+        c, forced = self.cell(["3090", "5090", "3090"])
+        self.assertEqual((c.result, c.code, c.blockers), (HS.REFUSED, "HW-UNCALIBRATED", ["UNCALIBRATED"]))
+        self.assertEqual(forced, [])
+
+    def test_sm89_is_still_refused_under_force_and_by_the_new_gate(self):
+        c, _ = self.cell(["5090", "4090", "3090"], force=True)
+        self.assertEqual(c.result, HS.REFUSED)
+        self.assertIn("W19-RESIDUE", c.blockers)
+
+    def test_the_reference_cell_is_green_and_forces_nothing_in_both_models(self):
+        for model in ("NF", "27B-INT8"):
+            c, forced = self.cell(list(HS.REFERENCE_RIG), model=model, force=True)
+            self.assertEqual((c.result, c.blockers), (HS.RUNS, []), model)
+            self.assertEqual(forced, [], model)
+
+    def test_another_stage_count_does_not_price_the_anchor(self):
+        """Two stages derive the family cost from the reference basis (AP3): the anchor is not asked there."""
+        c, forced = self.cell(["5090", "3090"], force=True)
+        self.assertNotIn("ATTN-ANCHOR", c.blockers)
+        self.assertFalse(any("deep attention anchor" in f["text"] for f in forced))
 
 
 class TestRegisterShape27B(_Armed):
