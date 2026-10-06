@@ -15028,7 +15028,7 @@ class Front:
         if setup.curves is None or self._x_curve_last is None:
             return _xcurves.fixed_note()
         return _xcurves.verdict_note(mode=setup.mode, verdict=self._x_curve_last,
-                                     source=setup.source)
+                                     source=setup.source, cap=setup.cap)
 
     def _x_curve_refusal(self, path: str, rid: str, exc: "_xcurves.XCurvesRefused") -> web.Response:
         """W193: a request deeper than the curves reach, refused at admission
@@ -16539,8 +16539,8 @@ def main():
                     help="X-CURVES 1006 (user 06.10.: only fixed and curve): fixed = "
                          "--tp-prefill-max-tokens for the whole boot (no live re-solve); curve = X per "
                          "request from --x-curves, never above D's W50 riegel (--x-ceiling-tokens, "
-                         "which the launcher sizes to the curves' envelope). Unset = the front exactly "
-                         "as before the flag.")
+                         "which the launcher sets to min(curves' envelope, manual ceiling)). Unset = "
+                         "the front exactly as before the flag.")
     ap.add_argument("--x-curves", default=None,
                     help="X-CURVES: the curve file (weg2-x-curves/1) of this model x form x hardware; "
                          "only with --x-mode curve (W194 otherwise, W190 when absent).")

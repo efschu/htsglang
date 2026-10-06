@@ -9,12 +9,13 @@ gehören dem 27B-Sitz / Nutzer und werden hier nicht geändert. Code: Branch
 | Form | Profilzeilen | Wirkung |
 |---|---|---|
 | fest | `--x-mode fixed` `--tp-prefill-max-tokens N` | X = N für den ganzen Boot; keine Live-Samples, keine Neulösung, keine Hysterese |
-| Kurve | `--x-mode curve --x-curves <Datei>` | X je Anfrage aus der Kurvendatei; D's W50-Riegel = Hüllkurve der Datei (der Launcher setzt ihn, harte Grenze); ein manuelles `--x-ceiling-tokens` daneben = W195 (offene Nutzerentscheidung, s. u.) |
+| Kurve | `--x-mode curve --x-curves <Datei>` | X je Anfrage aus der Kurvendatei; D's W50-Riegel = Hüllkurve der Datei (der Launcher setzt ihn, harte Grenze) |
+| Kurve mit Deckel | `--x-mode curve --x-curves <Datei> --x-ceiling-tokens N` | Nutzerentscheid 06.10. (NF-Sitz): der manuelle Deckel klemmt X von oben, die Kurve entscheidet darunter; D's W50-Riegel = der NIEDRIGERE von Hüllkurve und Deckel (nie unter dem Start-X, H84). Ohne Deckel wie die Zeile darüber |
 | (ohne Flag) | kein `--x-mode` | die Front genau wie vor dem Flag (heute: Live-Neulösung, `SGLANG_WEG2_ENABLE_X_COST_LINE` Default True). Nicht still geändert — was der Default werden soll, entscheidet der Nutzer |
 
 `--x-mode live` und `--x-mode curve-capped` werden abgewiesen (argparse-Choices; im Code W196).
 
-**Offene Nutzerentscheidung — manueller Deckel in `curve`?** Der W50-Riegel ist
+**Manueller Deckel in `curve` — entschieden 06.10. (NF-Sitz): erlaubt, klemmt von oben; Riegel = min(Hüllkurve, Deckel).** Beleg, warum der Riegel hart ist: der W50-Riegel ist
 eine echte D-Grenze: D verweigert jede Anfrage, deren ungecachter Umfang nach
 dem Prefix-Match über seinem eigenen `--tp-prefill-max-tokens` liegt
 (`python/sglang/srt/managers/scheduler.py:14089` `_weg2_x_refuses`, Meldung
@@ -27,9 +28,11 @@ der Launcher (`launcher.py` `resolve_x_ceiling`, D bekommt `--tp-prefill-max-tok
 Hüllkurve (`x_curves.resolve_launch`, `ceiling_for_d = envelope`), die Front
 klemmt jedes Anfrage-X darunter (`front.py` `_x_route_of`, `cap = tp_prefill_max_tokens`
 = Hüllkurve ≤ `x_ceiling_tokens`). Ob man zusätzlich einen manuellen, niedrigeren
-Deckel (z. B. 12288) neben `curve` setzen darf, ist NICHT entschieden: heute
-W195. Freigabe wäre eine Zeile in `_check_mode_words` + `resolve_launch`
-(cap = max(Flag, Start-X), Riegel = Flag).
+Deckel neben `curve` setzen darf, ist entschieden (ja): `x_curves.resolve_launch`
+rechnet die Hüllkurve unter dem Deckel (`x_envelope(curves, cap=Deckel)`), das ist
+`ceiling_for_d`; `resolve_x_ceiling` hebt ihn wie bisher nie unter das Start-X.
+Launcher-Zeile `X MODE: ... manual ceiling --x-ceiling-tokens N BINDS|does not bind
+(curves' own envelope E)`; ROUTE-VERDICT `... clamp=cap, ceiling=N)`. W195 entfällt.
 
 `--x-curves-beyond clamp|refuse` (optional, Default `clamp`): eine Anfrage
 tiefer als die Kurve reicht wird an der tiefsten Zeile bepreist und in der
@@ -42,7 +45,7 @@ ROUTE-VERDICT benannt (`clamp`), oder mit W193 (503) abgewiesen (`refuse`).
  ...
  PROFILE_ARGS=(
  ...
--  --x-ceiling-tokens 12288                             # RC2 (H84) = Registry nextflash x_ceiling_tokens; bb3 nannte es nicht (Registry-Default derselbe Wert)
+   --x-ceiling-tokens 12288                             # RC2 (H84); unter curve: manueller Deckel, Riegel = min(Hüllkurve, 12288)
 +  --x-mode curve                                       # X-CURVES 1006: X je Anfrage aus den Profilkurven (Nutzer 06.10.), nicht live
 +  --x-curves "$PROFILE_X_CURVES"                       # EINE Kurvendatei je Modell x Form x Hardware; D's W50-Riegel = ihre Hüllkurve
  )
@@ -65,7 +68,7 @@ nicht mehr auf. Der Schalter wirkt dann nur noch auf die P-Kostenring-Lesung
  ...
 -  # RC7-X (X-Review V, Operator 25.09.): Start-X ausdruecklich 4096 -- ...
 -  --tp-prefill-max-tokens 4096
--  --x-ceiling-tokens 12288
+   --x-ceiling-tokens 12288                             # unter curve: manueller Deckel, Riegel = min(Hüllkurve, 12288)
 +  --x-mode curve                                       # X-CURVES 1006 (Nutzer 06.10.): X je Anfrage aus den Profilkurven
 +  --x-curves "$PROFILE_X_CURVES"
 ```
@@ -75,8 +78,9 @@ Der Launcher-Default ist ebenfalls 4096; ohne die Zeile ändert sich das
 Start-X also nicht, es ist nur kein „Dauerwert X“ im Profil mehr. Wer bis zur
 27B-Kurve weiterbooten will: `--x-mode fixed --tp-prefill-max-tokens 4096`
 (fest, ohne Live-Neulösung) oder vorläufig gar nichts (ohne Flag wie heute).
-`--x-ceiling-tokens 12288` fällt in beiden Profilen weg, solange die offene
-Nutzerentscheidung (manueller Deckel in `curve`) nicht gefallen ist (sonst W195).
+`--x-ceiling-tokens 12288` darf in beiden Profilen stehen bleiben (Nutzerentscheid
+06.10.): unter `curve` klemmt er X von oben; ohne die Zeile entscheidet allein die
+Hüllkurve.
 
 **Dual-Profile** (`27b-nvfp4-dual*.env`): keine X-Zeilen, keine Änderung
 (Nutzerentscheid 1).
@@ -122,7 +126,7 @@ Nicht gebaut, nur festgehalten:
   `--x-curves-beyond {clamp,refuse}`,
   `--tp-prefill-max-tokens <N>` (nur bei `fixed` sinnvoll). Abhängigkeiten:
   `--x-curves`/`--x-curves-beyond` nur bei `curve` (sonst W194);
-  `curve` + `--x-ceiling-tokens` = W195 (offene Nutzerentscheidung); `curve` ohne
+  `curve` + `--x-ceiling-tokens` = Deckel (Riegel = min(Hüllkurve, Deckel)); `curve` ohne
   Datei = W190; `live`/`curve-capped` = abgewiesen (W196).
 * **Kurvendatei lesen**: `x_curves.load(path)` → `XCurves`; Anzeige mit
   `x_curves.text_table(curves, cap=…)` oder direkt aus den Zeilen (Plot P/D ms
