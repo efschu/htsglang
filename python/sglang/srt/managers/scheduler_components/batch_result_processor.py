@@ -1248,6 +1248,14 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
+        if getattr(batch, "weg2_end_anchor", None) is not None:
+            # L15-END-ANCHOR (weg2/l15_end_anchor.py): an armed request's slot
+            # was chosen at plan time; record (position, slot) of THIS round.
+            from sglang.srt.weg2 import l15_end_anchor as _l15_ea
+
+            if _l15_ea.on_result(req, batch, i):
+                return
+
         lazy = get_server_args().enable_mamba_extra_buffer_lazy()
         at_boundary, track_seqlen = self._mamba_check_track_boundary(
             req, batch, result, i

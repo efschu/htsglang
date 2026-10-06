@@ -3376,6 +3376,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
     # TURN ANCHOR (weg2/turn_anchor.py): this extend's second tracks, or None
     weg2_turn_tracks: Optional[Any] = None
+    # L15-END-ANCHOR (weg2/l15_end_anchor.py): this verify's per-request end
+    # track plan (slot index written, -1 not armed, -2 armed but not written)
+    # and its device mask; None = off / not planned
+    weg2_end_anchor: Optional[Any] = None
+    weg2_end_anchor_mask: Optional[Any] = None
     # TWIN ANCHOR (weg2/twin_anchor.py): rid -> twin boundaries of this new
     # prefill batch (stamped by the scheduler before prepare_for_extend), or None
     weg2_twin_bounds: Optional[Any] = None
@@ -5054,6 +5059,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         self.weg2_turn_tracks = None
+        self.weg2_end_anchor = None
+        self.weg2_end_anchor_mask = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -5156,6 +5163,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         self.weg2_turn_tracks = None
+        self.weg2_end_anchor = None
+        self.weg2_end_anchor_mask = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -5253,6 +5262,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             weg2_turn_tracks=self.weg2_turn_tracks,
+            weg2_end_anchor=self.weg2_end_anchor,
+            weg2_end_anchor_mask=self.weg2_end_anchor_mask,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,

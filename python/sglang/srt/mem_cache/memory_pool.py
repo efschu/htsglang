@@ -2608,7 +2608,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         In lazy mode the valid state stays at next_track_idx (no eager swap).
         In normal mode it is at the "other" index (swapped after each track).
+        L15-END-ANCHOR (weg2/l15_end_anchor.py): an armed request names its
+        keep slot explicitly (its slots alternate at plan time, not here).
         """
+        if getattr(req, "_weg2_ea_keep", None) is not None:
+            from sglang.srt.weg2.l15_end_anchor import keep_override
+
+            k = keep_override(req)
+            if k is not None:
+                return k
         if self.enable_mamba_extra_buffer_lazy:
             return req.mamba_next_track_idx
         return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)

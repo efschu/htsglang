@@ -2762,6 +2762,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 torch.full_like(to_track_ith, -1, dtype=torch.int64),
             )
 
+        if getattr(batch, "weg2_end_anchor", None) is not None:
+            # L15-END-ANCHOR: armed rows track their last committed step
+            from sglang.srt.weg2 import l15_end_anchor as _l15_ea
+
+            mamba_steps_to_track = _l15_ea.steps_to_track(
+                batch, last_correct_step_indices, mamba_steps_to_track
+            )
+
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
@@ -3168,6 +3176,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         # compute_spec_v2_logprobs, see _dflash_verify_logprobs); the refusal
         # that stood here is gone. The target prefill computes its own.
         self._validate_phase1_sampling_support(batch)
+        if getattr(batch, "weg2_end_anchor", None) is not None:
+            # L15-END-ANCHOR: a plan belongs to ONE verify; a forward that does
+            # not reach the verify must not hand the last round's to its result
+            batch.weg2_end_anchor = None
+            batch.weg2_end_anchor_mask = None
         # seq_lens_cpu_ready (SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU): the scheduler
         # deferred the host half of this batch's length read; batch.seq_lens_cpu
         # / seq_lens_sum are None until it is called. Idempotent. The decode
@@ -3770,6 +3783,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
+        if self._need_mamba_verify_commit:
+            # L15-END-ANCHOR (weg2/l15_end_anchor.py, default off): rebuild the
+            # track destinations from the requests (upstream 44fd17b696) and
+            # plan the per-round end track of the armed requests BEFORE the
+            # verify ForwardBatch snapshots them.
+            from sglang.srt.weg2 import l15_end_anchor as _l15_ea
+
+            _l15_ea.plan_verify(batch)
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:

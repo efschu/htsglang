@@ -1046,6 +1046,15 @@ class Envs:
     # survive to their k=1 turn. A tip with fewer chain tokens than this is not offered (0 = off = every
     # tip, today's behaviour). Read where TREE_CAND_N is read (``l15_tree_cand.min_tokens``).
     SGLANG_WEG2_L15_TREE_CAND_MIN_TOKENS = EnvInt(0)
+    # L15-END-ANCHOR (desk 06.10., l15long3 ..._1006_024639: 33 of 35 long leg-2 finishes on D left a
+    # mamba tombstone because they crossed no 256 track point; weg2/l15_end_anchor.py). On (with the
+    # L15 master; extra_buffer non-lazy, no checkpoint interval, page 1, PP 1, DFLASH -- refused by name
+    # otherwise): every verify rebuilds the track destinations from the requests (upstream 44fd17b696,
+    # unported until now), and a request with origin >= SGLANG_WEG2_L15_TREE_CAND_MIN_TOKENS writes its
+    # COMMITTED post-verify state into its ping-pong slots, alternating per round at plan time, so the
+    # overlap extra forward never touches the slot of the last processed round; the finish insert donates
+    # that slot at exactly kv_committed_len. No new slot. Default off = today byte for byte.
+    SGLANG_WEG2_L15_END_ANCHOR = EnvBool(False)
     # L15-POOL S4 (docs/L15-POOL-ENTWURF-1004.md sec 1.2/3.3/4.5/5.2 N4/7, KV AND
     # END anchor = a WHOLE request): part switch ON TOP of SGLANG_WEG2_L15_POOL and
     # SGLANG_WEG2_L15_POOL_S3 (S4 without them is refused by name,
