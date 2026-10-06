@@ -264,6 +264,16 @@ SLOTS: Tuple[Tuple[str, str, str, str], ...] = (
     ("extra", "p", "--rank-gpu-memory-mib", "advisory"),
     ("extra", "d", "--rank-gpu-memory-mib", "advisory"),
 )
+#: origin text per slot policy (what the rule is, in words; the policy key itself is an internal name and never shown)
+RULE_ORIGIN = {
+    "cut": "Regel: Schicht-Schnitt der P-Stufen nach GEMM-Rate und Speicherkapazitaet",
+    "cut_attn": "Regel: Voll-Attention-Schichten je P-Stufe aus dem Schichtschnitt",
+    "fr_p": "Regel: residenter Expertenanteil je P-Stufe aus dem Rest der Stufe",
+    "fr_d": "Regel Form A: residenter Expertenanteil je D-Rang",
+    "moe_ratio": "Regel Form A: Experten-Eigentum je D-Rang",
+    "role": "Regel Form A: Rang 0 Attention-Host, alle anderen Experten-Worker",
+    "tp_ratio": "Regel Form A: nur der Host traegt die dichten Gewichte",
+}
 #: launcher flags whose value is a measurement (boot logs) of the profile's own inventory
 INVENTORY_BOUND_FLAGS = ("--wake-credit-reference-logs", "--p-card-reference-logs", "--d-card-reference-logs",
                          "--d-residency-reference-logs")
@@ -460,10 +470,23 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
     pin_mode = str(z.get("p_cut") or "auto")
     apply_cut = (pin_mode == "pin" or (pin_mode == "auto" and pin_in_basis))
     frp, frp_notes = R.fr_p(fp, layers, sb["avail"], sb["cost"])
-    rec.hinweise += ["FR_P: " + x for x in frp_notes]
+    rec.hinweise += ["Residenter Expertenanteil der P-Stufen: " + x for x in frp_notes]
 
     carry_h = "Profil %s, gleiches Inventar [%s]" % (bname, ",".join(live_cls))
     carry_g = "Wert des Profils (gemessen bzw. vom Betreiber gesetzt) unveraendert: das Profil gilt fuer genau diese Karten"
+    # A value of the profile that is handed to ANOTHER inventory is never "vorgeschlagen / gleiches Inventar": the profile's
+    # measurement or pin was taken on its own cards (review round 3, finding 1).  ``carried()`` binds state and origin to ``same_inv``.
+    inv_txt = ",".join(binv) if binv else "unbekannt (das Profil nennt kein PROFILE_INVENTORY)"
+    carry_x = "aus Profil %s fuer [%s] uebernommen, Inventar hier [%s]" % (bname, inv_txt, ",".join(live_cls))
+    carry_gx = ("Wert des Profils unveraendert uebertragen; er wurde auf den Karten des Profils gemessen bzw. gesetzt und ist fuer "
+                "diese Karten nicht belegt")
+
+    def carried() -> Tuple[str, str, str]:
+        """``(state, origin, reason)`` of a profile value kept as it is."""
+        return (R.VORGESCHLAGEN, carry_h, carry_g) if same_inv else (R.UNBELEGT, carry_x, carry_gx)
+
+    def rule_origin(pol: str) -> str:
+        return "%s fuer die Karten [%s]" % (RULE_ORIGIN.get(pol, "Regel des Planers"), ",".join(live_cls))
 
     # --- first the per-class measured values (the D context is an input of the D layout) --------------------------------
     results: Dict[str, Any] = {}
@@ -477,7 +500,8 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         if vec is None:
             return
         if same_inv or (len(vec) == n and binv is None):
-            rec.add(lab, group=group, old=old, new=old, state=R.VORGESCHLAGEN, herkunft=carry_h, grund=carry_g, policy="class")
+            st, hk, gr = carried()
+            rec.add(lab, group=group, old=old, new=old, state=st, herkunft=hk, grund=gr, policy="class")
             return
         if binv is not None and len(vec) == len(binv):
             new, srcs = R.class_rekey(vec, binv, cards)
@@ -617,17 +641,30 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                 nt = R.csv(R.scale_by_seats(base, tgt_s, ref_s))
             if nt != old:
                 _set(la, kind, group, name, nt)
-            # a value moved by the seat goal is an extrapolation from ONE measured point (the profile's), whatever the inventory:
-            # "unbelegt"; only an unchanged value is the profile's own (measured / operator-set) one.
-            rec.add(lab, group=group, old=old, new=nt, state=R.VORGESCHLAGEN if nt == old else R.UNBELEGT,
-                    herkunft=(carry_h if nt == old else "Profil %s, Rang-Rolle (erster/mittlerer/letzter Eintrag) und linear in den "
-                              "Sitzen (%d -> %d), Hochrechnung aus einem Messpunkt" % (bname, ref_s, tgt_s)),
-                    grund=carry_g if nt == old else "Scratch-Zeilen skalieren mit den gleichzeitigen Sitzen; nur ein Messpunkt "
-                    "im Profil: unbelegt", policy=pol)
+            rekeyed = vec is not None and len(vec) != n
+            by_seats = tgt_s != ref_s
+            if nt == old:
+                st, hk, gr = carried()
+            else:
+                # a value that was moved is a transfer: by the seat goal (an extrapolation from ONE measured point) and / or by the
+                # rank role (first / middle / last entry) onto another card count -- either way not measured on these cards: unbelegt
+                parts = []
+                if rekeyed:
+                    parts.append("auf %d Karten nach Rang-Rolle umgeschluesselt (erster/mittlerer/letzter Eintrag des Profils mit %d "
+                                 "Eintraegen)" % (n, len(vec)))
+                if by_seats:
+                    parts.append("linear in den Sitzen skaliert (%d -> %d), Hochrechnung aus einem Messpunkt" % (ref_s, tgt_s))
+                st, hk = R.UNBELEGT, "Profil %s: %s" % (bname, "; ".join(parts))
+                if not same_inv:
+                    hk += "; Inventar des Profils [%s], hier [%s]" % (inv_txt, ",".join(live_cls))
+                gr = ("Scratch-Zeilen gehoeren zu Rang-Rolle und Sitzzahl; im Profil steht nur EIN Messpunkt, die Umrechnung ist "
+                      "nicht belegt")
+            rec.add(lab, group=group, old=old, new=nt, state=st, herkunft=hk, grund=gr, policy=pol)
             return
         if pol == "advisory":
             if vec is None or same_inv or len(vec) == n:
-                rec.add(lab, group=group, old=old, new=old, state=R.VORGESCHLAGEN, herkunft=carry_h, grund=carry_g, policy=pol)
+                st, hk, gr = carried()
+                rec.add(lab, group=group, old=old, new=old, state=st, herkunft=hk, grund=gr, policy=pol)
             else:
                 _del(la, kind, group, name)
                 rec.add(lab, group=group, old=old, new=None, state=R.UNBELEGT,
@@ -642,16 +679,17 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                 return
             new = R.csv(R.role_rekey(vec, n))
             _set(la, kind, group, name, new)
-            rec.add(lab, group=group, old=old, new=new, state=R.VORGESCHLAGEN,
-                    herkunft="Profil %s: Rang-Rolle (erster/mittlerer/letzter Eintrag) auf %d Karten" % (bname, n),
-                    grund="LRU-Zeilen je Stufe sind eine Pool-Groesse, keine Kartenmessung", policy=pol)
+            rec.add(lab, group=group, old=old, new=new, state=R.UNBELEGT,
+                    herkunft="Profil %s: nach Rang-Rolle (erster/mittlerer/letzter Eintrag) auf %d Karten umgeschluesselt; Inventar "
+                             "des Profils [%s], hier [%s]" % (bname, n, inv_txt, ",".join(live_cls)),
+                    grund="LRU-Zeilen je Stufe sind eine Pool-Groesse, keine Kartenmessung; fuer diese Karten nicht belegt", policy=pol)
             return
         # cut / cut_attn / fr_p / fr_d / moe_ratio / role / tp_ratio
         if same_inv and seats_changed and pol in ("fr_p", "fr_d") and is_moe and (pol == "fr_d" or p_coupled):
             sf = seat_fr(pol, vec)
             if sf is not None:
                 _set(la, kind, group, name, sf[0])
-                rec.add(lab, group=group, old=old, new=sf[0], state=R.UNBELEGT, herkunft="Profil %s + Regel K4 (Sitze gleichzeitig %d)" % (
+                rec.add(lab, group=group, old=old, new=sf[0], state=R.UNBELEGT, herkunft="Profil %s + Regel fuer den Regler Sitze gleichzeitig (%d)" % (
                     bname, seats), grund=sf[1] + "; am Metall unbelegt (Planer-Rechnung)", policy=pol)
                 return
             rec.hinweise.append("%s: nicht auf %d Sitze umrechenbar (Vektorlaenge/Form A); Profilwert bleibt" % (lab, seats))
@@ -687,14 +725,14 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                 return
             _del(la, kind, group, name)
             rec.add(lab, group=group, old=old, new=None, state=R.UNBELEGT,
-                    herkunft="nicht ableitbar fuer [%s]%s" % (",".join(live_cls), " (Form A passt nicht)" if pol in (
+                    herkunft="nicht ableitbar fuer die Karten [%s]%s" % (",".join(live_cls), " (Form A passt nicht)" if pol in (
                         "fr_d", "moe_ratio", "role", "tp_ratio") and fa is not None and not fa["ok"] else ""),
                     grund="entfernt (kein Wert erfunden)", in_argv=False, policy=pol)
             return
         _set(la, kind, group, name, new)
         if pol in ("fr_p", "fr_d", "moe_ratio", "role", "tp_ratio"):
             stt = R.UNBELEGT if pol != "role" and pol != "tp_ratio" else R.VORGESCHLAGEN
-        rec.add(lab, group=group, old=old, new=new, state=stt, herkunft="Regel (%s) fuer [%s]" % (pol, ",".join(live_cls)),
+        rec.add(lab, group=group, old=old, new=new, state=stt, herkunft=rule_origin(pol),
                 grund=why + ("; am Metall unbelegt (Planer-Rechnung)" if stt == R.UNBELEGT else ""), policy=pol)
 
     for kind, group, name, pol in SLOTS:
@@ -715,7 +753,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
     # the P cut seed, shown when it is not applied (the launcher plans group P in BOTH forms: ``--d-only`` keeps "P's resting
     # residue planned, exactly the D form of the flip boot", ``launcher.py:27160``)
     rec.add("--pp-stage-ratio (Seed)", group="-", old=None, new=R.csv(layers), state=R.UNBELEGT if rate_basis.startswith((
-        "Datenblatt", "unbelegt")) else R.VORGESCHLAGEN, herkunft="Regel P-Schnitt: " + rate_basis,
+        "Datenblatt", "unbelegt")) else R.VORGESCHLAGEN, herkunft="Regel: P-Schnitt nach GEMM-Rate; Rate: " + rate_basis,
             grund="Schicht-Schnitt proportional zur GEMM-Rate, je Stufe auf die Speicher-Kapazitaet begrenzt; Attention-"
                   "Schichten je Stufe %s" % R.csv(attn) + ("" if apply_cut else "; NICHT gesetzt: der Launcher loest den "
                                                             "Schnitt selbst (p_cut=pin setzt ihn)"),
@@ -731,7 +769,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
             if la.get_flag(flag) is None:
                 la.set_flag(flag, val)
                 rec.add(flag, group="p", old=None, new=val, state=R.UNBELEGT if "fraction" in flag else R.VORGESCHLAGEN,
-                        herkunft="Regel K4 (MoE)", grund=why + ("; am Metall unbelegt (Planer-Rechnung)" if "fraction" in flag else ""),
+                        herkunft="Regel: Rest der P-Stufe kauft residente Experten (MoE)", grund=why + ("; am Metall unbelegt (Planer-Rechnung)" if "fraction" in flag else ""),
                         policy="fr_p" if "fraction" in flag else "lru")
 
     # --- Form A skeleton when no profile names it (no basis) ---------------------------------------------------------------
@@ -743,7 +781,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                                      "Form-A-Loesung: residenter Anteil")):
             la.extra_set("d", flag, val)
             rec.add("--extra-d " + flag, group="d", old=None, new=val, state=R.UNBELEGT if pol in ("moe_ratio", "fr_d") else R.VORGESCHLAGEN,
-                    herkunft="Regel Form A (MoE)", grund=why, policy=pol)
+                    herkunft="Regel Form A: Aufteilung der D-Raenge (MoE)", grund=why, policy=pol)
 
     # --- K3: the draft ------------------------------------------------------------------------------------------------------
     plc_old = la.extra_get("d", "--speculative-draft-placement") or la.get_flag("--speculative-draft-placement")
@@ -752,17 +790,17 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         if plc_old is None and not b["argv"]:
             la.extra_set("d", "--speculative-draft-placement", want)
             rec.add("--extra-d --speculative-draft-placement", group="d", old=None, new=want, state=R.VORGESCHLAGEN,
-                    herkunft="Regel K3", grund=dp["why"], policy="draft")
+                    herkunft="Regel: Draft solo auf Rang 0, wenn er mit den dichten Gewichten und der KV-Pflicht passt", grund=dp["why"], policy="draft")
         elif plc_old is not None:
             rec.add("--extra-d --speculative-draft-placement", group="d", old=plc_old, new=plc_old, state=R.VORGESCHLAGEN,
-                    herkunft="Profil %s (unveraendert)" % bname, grund="Regel K3 sagt " + want + ": " + dp["why"], policy="draft")
+                    herkunft="Profil %s (unveraendert)" % bname, grund="die Draft-Regel sagt fuer diese Karten %s: %s" % (want, dp["why"]), policy="draft")
             if want != plc_old and plc_old == "solo":
-                rec.hinweise.append("Draft: das Profil setzt solo, aber hier passt es nicht (%s). Form A verweigert split." % dp["why"])
+                rec.hinweise.append("Draft: das Profil setzt solo, aber fuer diese Karten passt es nicht (%s). Form A verweigert die Aufteilung auf alle Raenge." % dp["why"])
         if dp["placement"] == "split":
-            rec.hinweise.append("Draft solo passt nicht auf Rang 0: " + dp["why"])
+            rec.hinweise.append("Draft solo passt nicht auf Rang 0 (%s). Ohne ihn auf Rang 0 bliebe nur die Aufteilung auf alle Raenge, die Form A verweigert." % dp["why"])
             rec.blocker.append("Draft solo auf Rang 0 passt nicht (Form A verlangt solo)")
     else:
-        rec.hinweise.append("Draft: %s (Regel K3 gilt fuer die Form-A-MoE-Linie; dichtes Modell: der Draft laeuft nach Profil)" % dp["why"])
+        rec.hinweise.append("Draft: %s (die Draft-Regel gilt fuer die Form-A-MoE-Linie; bei einem dichten Modell laeuft der Draft nach Profil)" % dp["why"])
     d_kv_old = la.get_flag("--draft-kv-on-p")
     if z.get("draft_kv_on_p") in ("on", "off"):
         la.set_flag("--draft-kv-on-p", z["draft_kv_on_p"])
@@ -783,7 +821,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                 grund="der Zielwert des Profils bleibt (ein Skalar der Form, keine Kartenmessung)", policy="knob")
     else:
         la.set_flag("--d-tp-objective", "maxkv")
-        rec.add("--d-tp-objective", group="-", old=None, new="maxkv", state=R.VORGESCHLAGEN, herkunft="Regel K2/K4",
+        rec.add("--d-tp-objective", group="-", old=None, new="maxkv", state=R.VORGESCHLAGEN, herkunft="Regel: Standardziel der Form (kein Wert im Profil)",
                 grund=("Dense: TP-symmetrisch, VRAM-proportional" if not is_moe else "MoE: Rest an KV/Experten nach VRAM")
                 + " (maxkv = die groesste KV-Platzzahl; der Launcher loest die Raenge selbst)", policy="knob")
     if form == "tp":
@@ -841,8 +879,38 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         old = la.get_flag("--max-kv-per-request")
         la.set_flag("--max-kv-per-request", str(kv_tokens))
         rec.add("--max-kv-per-request", group="-", old=old, new=str(kv_tokens), state=R.VORGESCHLAGEN,
-                herkunft="Ziel kv_tokens" if z.get("kv_tokens") else "Regel K1 (KV-Pflicht 262144, Nutzer 05.10.)",
+                herkunft="Ziel kv_tokens" if z.get("kv_tokens") else "Regel: KV-Pflicht 262144 Token (Nutzer 05.10.)",
                 grund="ein Request traegt diesen Kontext (P muss 262144 Token Prefill-Kontext tragen)", policy="knob")
+
+    # --- K4 regulators that are scalars of the profile: the pool floor and the X ceiling ---------------------------------------
+    # ``--pp-solve-pool-floor`` is a hard lower bound, in WORLD KV tokens, on the priced pool the P cut solve ranks over
+    # (launcher help of the flag; plan section 4c: Dual asks the KV obligation 262144 as the floor).  When the goal ``kv_tokens`` moves
+    # and the profile names a positive floor, the floor follows the obligation.  A profile without the flag keeps the launcher's own
+    # default (the floor of its ordered 3-stage cut); the planner does not type a number there.
+    pf_old = la.get_flag("--pp-solve-pool-floor")
+    pf_expl = ("untere Grenze der bepreisten KV-Pool-Groesse (in Welt-KV-Token), ueber der der Schnitt-Loeser ranked; 0 = aus; "
+               "ohne Flag gilt der Launcher-Standard (der Pool des geordneten 3-Stufen-Schnitts, bei anderer Stufenzahl keine Grenze)")
+    if pf_old is not None:
+        if z.get("kv_tokens") and str(pf_old).lstrip("-").isdigit() and int(pf_old) > 0 and int(pf_old) != kv_tokens:
+            la.set_flag("--pp-solve-pool-floor", str(kv_tokens))
+            rec.add("--pp-solve-pool-floor", group="-", old=pf_old, new=str(kv_tokens), state=R.VORGESCHLAGEN,
+                    herkunft="Ziel kv_tokens: der Pool-Floor folgt der KV-Pflicht (Profil %s hatte %s)" % (bname, pf_old),
+                    grund=pf_expl + "; ob dieser Schnitt auf der Frontier liegt, entscheidet der Loeser beim Boot (W67 sonst)", policy="knob")
+        else:
+            rec.add("--pp-solve-pool-floor", group="-", old=pf_old, new=pf_old, state=R.VORGESCHLAGEN,
+                    herkunft="Profil %s (unveraendert)" % bname, grund=pf_expl, policy="knob")
+    else:
+        rec.add("--pp-solve-pool-floor", group="-", old=None, new=None, state=R.VORGESCHLAGEN,
+                herkunft="nicht im Profil %s: Launcher-Standard" % bname, grund=pf_expl, in_argv=False, policy="knob")
+    xc_old = la.get_flag("--x-ceiling-tokens")
+    xc_expl = ("Obergrenze, bis zu der die Front das X (Token, ab denen ein Request zu D statt P geht) zur Laufzeit anheben darf, und "
+               "zugleich der Riegel --tp-prefill-max-tokens von D; 0 = aus (D und Front behalten das Start-X)")
+    if xc_old is not None:
+        rec.add("--x-ceiling-tokens", group="-", old=xc_old, new=xc_old, state=R.VORGESCHLAGEN,
+                herkunft="vom Profil %s (unveraendert; ein Skalar der Form, keine Kartenmessung)" % bname, grund=xc_expl, policy="knob")
+    else:
+        rec.add("--x-ceiling-tokens", group="-", old=None, new=None, state=R.VORGESCHLAGEN,
+                herkunft="nicht im Profil %s: Launcher-Standard 0 (aus)" % bname, grund=xc_expl, in_argv=False, policy="knob")
 
     # --- the checks and the result -------------------------------------------------------------------------------------------
     lens = vector_lengths(la.t, la.env)

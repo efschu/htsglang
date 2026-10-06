@@ -241,8 +241,8 @@ def split_layers(n_layers: int, weights: Sequence[float], caps: Sequence[Optiona
     layers = [fixed.get(i, 1) for i in range(k)]
     diff = n_layers - sum(layers)
     if diff != 0:
-        notes.append("memory capacity of the stages (%s layers) does not hold %d layers: surplus %d placed on the stage "
-                     "with the most spare capacity" % (csv([c if c < n_layers else "-" for c in capv]), n_layers, diff))
+        notes.append("Die Speicherkapazitaet der Stufen (%s Schichten) fasst %d Schichten nicht: der Rest von %d Schichten liegt auf "
+                     "der Stufe mit der meisten freien Kapazitaet" % (csv([c if c < n_layers else "-" for c in capv]), n_layers, diff))
         spare = sorted(range(k), key=lambda i: (-(capv[i] - layers[i]), i))
         layers[spare[0]] += diff
     return layers, notes
@@ -412,8 +412,8 @@ def fr_p(p: Any, layers: Sequence[int], avail: Sequence[float], costs: Sequence[
         f = 0.0 if exp <= 0 else max(0.0, min(fmax, spare / exp))
         out.append(math.floor(f * 1000.0) / 1000.0)
         if spare < 0:
-            notes.append("stage %d: the layers' floor (%.0f MiB) exceeds what the card offers (%.0f MiB): FR 0" % (
-                i, floor, avail[i]))
+            notes.append("Stufe %d: die Grundlast ihrer Schichten (%.0f MiB) uebersteigt, was die Karte anbietet (%.0f MiB): "
+                         "residenter Expertenanteil 0" % (i, floor, avail[i]))
     return out, notes
 
 
@@ -453,9 +453,9 @@ def draft_placement(p: Any, host_budget_mib: float, host_fixed_mib: float, kv_mi
     margin = host_budget_mib - need
     return {"placement": "solo" if margin >= 0 else "split", "need_mib": need, "budget_mib": host_budget_mib,
             "margin_mib": margin,
-            "why": ("draft %.0f + dense %.0f + KV %.0f + mamba %.0f = %.0f MiB %s the host budget %.0f MiB (margin %.0f)" % (
-                draft_mib, host_fixed_mib, kv_mib, mamba_mib, need, "fit" if margin >= 0 else "exceed", host_budget_mib,
-                margin))}
+            "why": ("Draft %.0f + dichte Gewichte %.0f + KV-Pflicht %.0f + Mamba-Zustand %.0f = %.0f MiB; Budget von Rang 0 %.0f MiB: "
+                    "%s (Spielraum %.0f MiB)" % (draft_mib, host_fixed_mib, kv_mib, mamba_mib, need, host_budget_mib,
+                                                  "passt" if margin >= 0 else "passt nicht", margin))}
 
 
 def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[int], reserves_mib: Sequence[int], *,
@@ -488,14 +488,14 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
     cb = [FA.CardBudget(rank=i, name=str(c.get("name", "")), nameplate_mib=int(c["total_mib"]), budget_mib=int(budgets_mib[i]),
                         reserve_mib=int(reserves_mib[i]), link_gib_s=link_rate(c)[0], role="host" if i == 0 else "worker")
           for i, c in enumerate(cards)]
-    unb = ["runtime posts of Form A (host %.2f / worker %.2f GiB, corridor %.2f, dispatch %.2f, router %.2f, spec state %.2f) "
-           "are the measured posts of boot fn8ah: BORROWED, unbelegt for this model and these cards" % (
+    unb = ["Laufzeitposten von Form A (Host %.2f / Worker %.2f GiB, Korridor %.2f, Dispatch %.2f, Router %.2f, Spekulativ-Zustand %.2f) "
+           "sind die gemessenen Posten des Boots fn8ah: geborgt, fuer dieses Modell und diese Karten unbelegt" % (
                ref.host_runtime_gib, ref.worker_runtime_gib, ref.corridor_gib, ref.dispatch_buffer_gib, ref.worker_router_gib,
                ref.spec_state_gib)]
     try:
         plan = FA.solve_form_a(cb, posts, geom)
     except FA.FormAInfeasible as exc:
-        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc), "unbelegt": unb}
+        return {"ok": False, "error": "der Form-A-Loeser findet keine Aufteilung (%s: %s)" % (type(exc).__name__, exc), "unbelegt": unb}
     return {"ok": True, "error": "", "role": ["host"] + ["worker"] * (n - 1), "tp_ratio": [1] + [0] * (n - 1),
             "moe_ratio": [int(o) for o in plan.owned],
             "fr": [round(math.floor(f * 1000.0) / 1000.0, 3) for f in plan.resident_fraction],

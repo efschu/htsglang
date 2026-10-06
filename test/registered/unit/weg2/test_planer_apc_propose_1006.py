@@ -216,7 +216,7 @@ class TestRules(unittest.TestCase):
         self.assertEqual(layers, [2, 1, 1])
         layers, notes = R.split_layers(48, [1, 1], [10, 10])                     # 20 < 48: nothing can hold it
         self.assertEqual(sum(layers), 48)
-        self.assertTrue(notes and "does not hold" in notes[0], notes)
+        self.assertTrue(notes and "fasst" in notes[0], notes)
 
     def test_attn_counts_are_exact_from_the_family_list(self):
         fam = (["gdn"] * 3 + ["attn"]) * 12                                      # NF: period 4, 12 attention layers
@@ -712,6 +712,109 @@ class TestSeats(unittest.TestCase):
         v = _propose("nf", "ref3")
         self.assertEqual(v["ziele"]["seats"], 6)
         self.assertEqual(v["argv"], list(_profile("nf").argv))
+
+
+class TestOriginOfTransferredValues(unittest.TestCase):
+    """Review round 3: a value of the profile handed to a FOREIGN inventory is never 'vorgeschlagen' with the origin 'gleiches Inventar';
+    the origin texts are German prose without the planner's internal keys."""
+
+    _INTERNAL = re.compile(r"Regel \((cut|cut_attn|fr_p|fr_d|moe_ratio|role|tp_ratio|lru|scratch|class)\)|\bK[1-5]\b|\bFR_[PD]\b")
+    _ENGLISH = ("exceed the host budget", "does not hold", "does not fit", "runtime posts of Form A")
+
+    def _check(self, v):
+        for w in v["werte"]:
+            if not v["inventory"]["gleich_wie_profil"]:
+                if w["zustand"] == R.VORGESCHLAGEN:
+                    self.assertNotIn("gleiches Inventar", w["herkunft"], w)
+                    self.assertNotIn("gilt fuer genau diese Karten", w["grund"], w)
+                if w["herkunft"].startswith("aus Profil"):
+                    self.assertEqual(w["zustand"], R.UNBELEGT, w)
+                    self.assertIn("Inventar hier [", w["herkunft"], w)
+            self.assertIsNone(self._INTERNAL.search(w["herkunft"]), w["herkunft"])
+        for text in v["hinweise"] + v["blocker"] + v["unbelegt"]:
+            self.assertIsNone(self._INTERNAL.search(text), text)
+            for en in self._ENGLISH:
+                self.assertNotIn(en, text)
+
+    def test_no_foreign_inventory_value_claims_the_same_inventory(self):
+        for model in ("nf", "27b"):
+            for inv in ("n2", "n2_5090_3090", "n4_3090", "n4_mixed", "n5_3090"):
+                for form in ("flip", "tp"):
+                    with self.subTest(model=model, inv=inv, form=form):
+                        v = _propose(model, inv, form)
+                        self.assertFalse(v["inventory"]["gleich_wie_profil"])
+                        self._check(v)
+
+    def test_the_review_case_3x3090_nf_scratch_is_unbelegt_with_the_transfer_origin(self):
+        v = _propose("nf", "n4_3090")
+        v3 = P.propose([dict(r) for r in _inventory("n4_3090")[0][:3]], _MODELS["nf"][0], "flip", {}, basis=_profile("nf"),
+                       draft=_MODELS["nf"][1], rates=MEASURED_RATES, library=_seed_library())
+        w = {x["key"]: x for x in v3["werte"]}["--env-d SGLANG_MOE_SCRATCH_SLOTS"]
+        self.assertEqual(w["zustand"], R.UNBELEGT)
+        self.assertTrue(w["herkunft"].startswith("aus Profil nf-int4-h6-abl.env fuer ["), w["herkunft"])
+        self.assertIn("Inventar hier [RTX3090", w["herkunft"])
+        self._check(v3)
+        self._check(v)
+
+    def test_a_role_rekey_with_an_unchanged_seat_goal_is_not_called_a_seat_extrapolation(self):
+        v = _propose("nf", "n2")
+        w = {x["key"]: x for x in v["werte"]}
+        for key in ("--env-d SGLANG_MOE_SCRATCH_SLOTS", "--env-p SGLANG_MOE_SCRATCH_SLOTS"):
+            if w[key]["alt"] != w[key]["wert"]:
+                self.assertIn("umgeschluesselt", w[key]["herkunft"], key)
+                self.assertNotIn("linear in den Sitzen", w[key]["herkunft"], key)
+                self.assertNotIn("6 -> 6", w[key]["herkunft"], key)
+        v12 = _propose("nf", "n2", seats=12)
+        w12 = {x["key"]: x for x in v12["werte"]}["--env-d SGLANG_MOE_SCRATCH_SLOTS"]
+        self.assertIn("linear in den Sitzen skaliert (6 -> 12)", w12["herkunft"])
+
+    def test_the_reference_inventory_keeps_the_profile_origin(self):
+        v = _propose("nf", "ref3")
+        self.assertTrue(v["inventory"]["gleich_wie_profil"])
+        w = {x["key"]: x for x in v["werte"]}["--env-d SGLANG_MOE_SCRATCH_SLOTS"]
+        self.assertEqual(w["zustand"], R.VORGESCHLAGEN)
+        self.assertIn("gleiches Inventar", w["herkunft"])
+
+
+class TestK4ScalarRegulators(unittest.TestCase):
+    """Plan 1.2 K4: --pp-solve-pool-floor and --x-ceiling-tokens are carried with an origin line; the floor follows a moved KV goal."""
+
+    def _vals(self, v):
+        return {x["key"]: x for x in v["werte"]}
+
+    def test_profile_scalars_are_listed_with_origin_and_explanation(self):
+        v = _propose("nf", "ref3")
+        w = self._vals(v)
+        self.assertEqual((w["--pp-solve-pool-floor"]["wert"], w["--x-ceiling-tokens"]["wert"]), ("0", "12288"))
+        for key in ("--pp-solve-pool-floor", "--x-ceiling-tokens"):
+            self.assertTrue(w[key]["herkunft"].startswith("Profil") or w[key]["herkunft"].startswith("vom Profil"), w[key])
+            self.assertTrue(w[key]["grund"], key)
+        self.assertEqual(v["argv"], list(_profile("nf").argv))
+        v27 = _propose("27b", "ref3")
+        w27 = self._vals(v27)
+        self.assertIsNone(w27["--pp-solve-pool-floor"]["wert"])                 # 27B profile: no flag, launcher default
+        self.assertIn("Launcher-Standard", w27["--pp-solve-pool-floor"]["herkunft"])
+        self.assertEqual(w27["--x-ceiling-tokens"]["wert"], "12288")
+        self.assertEqual(v27["argv"], list(_profile("27b").argv))
+
+    def test_a_positive_pool_floor_follows_the_kv_goal(self):
+        b = _profile("nf")
+        argv = list(b.argv)
+        i = argv.index("--pp-solve-pool-floor")
+        argv[i + 1] = "262144"
+        basis = {"argv": argv, "env": dict(b.env), "vars": dict(b.vars), "name": "nf-int4-h6-abl.env"}
+        hw, _ = _inventory("ref3")
+        modell, draft = _MODELS["nf"]
+        v0 = P.propose(hw, modell, "flip", {}, basis=basis, draft=draft, rates=MEASURED_RATES, library=_seed_library())
+        self.assertEqual(self._vals(v0)["--pp-solve-pool-floor"]["wert"], "262144")        # no goal: stays
+        v1 = P.propose(hw, modell, "flip", {"kv_tokens": 131072}, basis=basis, draft=draft, rates=MEASURED_RATES,
+                       library=_seed_library())
+        w = self._vals(v1)["--pp-solve-pool-floor"]
+        self.assertEqual((w["alt"], w["wert"]), ("262144", "131072"))
+        self.assertEqual(P.LaunchArgv(v1["argv"], v1["env"]).get_flag("--pp-solve-pool-floor"), "131072")
+        self.assertIn("KV-Pflicht", w["herkunft"])
+        v_off = _propose("nf", "ref3", kv_tokens=131072)                                   # floor 0 = OFF: never pulled
+        self.assertEqual(P.LaunchArgv(v_off["argv"], v_off["env"]).get_flag("--pp-solve-pool-floor"), "0")
 
 
 class TestKvObligation(unittest.TestCase):
