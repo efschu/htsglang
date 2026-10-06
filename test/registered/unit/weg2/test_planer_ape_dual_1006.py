@@ -60,6 +60,12 @@ _NEEDS_DUAL = unittest.skipUnless(
     "27B NVFP4 checkpoints / census not on this box (the Dual golden is box-bound, like AP0's)")
 MEASURED_RATES = {"RTX 5090": 203.42, "RTX 3080 20GB": 50.97}
 
+#: tolerance (MiB per card) of the planer's shift rule against the 27B seat's own 262k computation.  The seat's coefficients (90 MiB/layer on the
+#: 5090, 205 on a 3080) are "GERECHNET from the dual1e revision terms" (``profiles/27b-nvfp4-dual1h.env`` header), not measured; the planer's follow
+#: the INSTALLED D vector (58,25,25: ~116 / ~192 MiB per layer, fix round 1), which the measured D weights confirm (12236 vs 12308 MiB on card 0).
+#: Card 0 moves 14 layers between the two cuts: 14 x 26 MiB = ~364 MiB of difference that is the seat's estimate, not a planer error.
+TOL_SEAT = 400
+
 _STATE = {}
 
 
@@ -173,25 +179,26 @@ class TestPureRules(unittest.TestCase):
         self.assertEqual(PD.round_budget(6604.9), 6600)
         self.assertEqual(PD.round_budget(5050.0), 5050)
 
-    def test_shares_sum_to_one_and_follow_the_preset(self):
+    def test_shares_sum_to_one_and_follow_the_installed_vector(self):
         sh, why = PD.d_shares("nvfp4", [32607, 20480, 20480], True)
         self.assertAlmostEqual(sum(sh), 1.0)
-        self.assertEqual(sh[0], 0.72)
-        self.assertIn("Preset", why)
-        sh, why = PD.d_shares("nvfp4", [32607, 20480, 20480], False)           # no reshard at wake: capacity-first
+        self.assertAlmostEqual(sh[0], 58 / 108.0)                              # RC9_BASE (58,25,25): the vector D is INSTALLED with
+        self.assertAlmostEqual(sh[1], 25 / 108.0)
+        self.assertIn("installierter D-Vektor", why)
+        self.assertNotIn("Preset 'dec' (Host", why)
+        sh, why = PD.d_shares("nvfp4", [32607, 20480, 20480], False)           # no reshard: capacity-first (planer assumption)
         self.assertAlmostEqual(sum(sh), 1.0)
         self.assertAlmostEqual(sh[0], 32607 / 73567.0)
         self.assertIn("proportional", why)
-        sh, _ = PD.d_shares("int4", [30000, 20000], True)                      # no preset for the format: capacity-first
+        sh, _ = PD.d_shares("int4", [30000, 20000], True)                      # RC9_BASE is a three-rank vector: other N capacity-first
         self.assertAlmostEqual(sh[1], 0.4)
 
-    def test_measured_share_table_equals_d_reshard(self):
+    def test_installed_vector_equals_d_reshard_base(self):
         try:
             from sglang.srt.weg2 import d_reshard
         except Exception as exc:  # pragma: no cover - the distributed stack is not importable here
             self.skipTest("d_reshard not importable: %s" % exc)
-        for fmt, host in PD.PRESET_HOST_SHARE.items():
-            self.assertEqual(d_reshard.RC9_PRESET_SHARES[fmt]["dec"], host, fmt)
+        self.assertEqual(tuple(d_reshard.RC9_BASE), PD.INSTALLED_D_BASE)
 
     def test_calibration_point_is_the_ledger_bytes_of_its_boot(self):
         """``POOL_REF`` pool MiB = the ``LEDGER-PHYS ... budget=`` bytes of boot b9p (done/1959-dual-p-262k.md section A and
@@ -314,6 +321,38 @@ class TestReferenceDual(unittest.TestCase):
         self.assertEqual([r["d_budget_mib"] for r in d["karten"]], [18176, 12901, 12413])
         self.assertEqual(d["draft"]["p"], "keiner (--draft-kv-on-p off)")
 
+    def test_d_weights_on_card_0_meet_the_measured_dual_boot(self):
+        """Fix round 1, finding 1: D's weights of the Passung are the shard of the INSTALLED vector (RC9_BASE 58,25,25), measured at boot a3t5js:
+        D TP0 weights 12.020 GiB = 12308 MiB (``dual_w64.py`` docstring; the family model of the launcher prices 13362).  The old line priced
+        card 0 at 10523 MiB (capacity-proportional 0.443 share, 1785 MiB too low)."""
+        self.assertEqual(PD.D_WEIGHTS_K0_MEASURED_MIB, 12308)
+        for kw in ({}, {"force_rules": True}):
+            d = _propose("ref3", **kw)["dual"]
+            k0 = d["karten"][0]
+            self.assertLessEqual(abs(k0["d_gewichte_mib"] - 12308), 123, k0)               # model vs measurement: within 1 %
+            self.assertGreater(k0["d_gewichte_mib"], 10523 + 1000, k0)                      # the old, too-low value is gone
+            # D's Mamba pool follows the same vector: card 0 holds the 58/108 share of it (measured 1.388 GiB = 1421 MiB, +-10 %)
+            self.assertLessEqual(abs(k0["d_mamba_mib"] - 1421), 142, k0)
+
+    def test_p_private_and_d_weights_of_a_card_are_one_vector(self):
+        """Fix round 1, finding 1: P-private weights (what P holds beyond D's shard) and D's weights come from the SAME D vector on every card:
+        the sum is a real state of D.  Recomputed here from the installed vector with the planer's own byte model."""
+        v = _propose("ref3")
+        d = v["dual"]
+        fp = R.fit_profile_from_model(_STATE["modell"], _STATE["draft"])
+        m = PD.model_bytes(fp)
+        tot = float(sum(PD.INSTALLED_D_BASE))
+        sh = [x / tot for x in PD.INSTALLED_D_BASE]
+        cut = d["regeln"]["schnitt"]
+        argv = list(_dual_profile().argv)
+        vision = argv[argv.index("--weg2-vision") + 1] if "--weg2-vision" in argv else ""
+        t = PD.stage_terms(m, cut, sh, slots=8, slot_mib=1.0, cell_b=1.0, boot_tokens=1, vision_in_p=vision != "transient")
+        for k, r in enumerate(d["karten"]):
+            self.assertAlmostEqual(r["d_gewichte_mib"], t[k]["d_total"], delta=0.2)
+            self.assertAlmostEqual(r["p_privat_mib"], t[k]["priv"], delta=0.2)
+        self.assertTrue(any("EIN Vektor" in a for a in d["annahmen"]), d["annahmen"])
+        self.assertFalse(any("0.72" in a for a in d["annahmen"]), d["annahmen"])
+
     def test_hw_fit_is_told_the_form_is_dual_and_its_verdict_never_blocks_it(self):
         v = _propose("ref3")
         self.assertTrue(any("NOT modelled" in m for m in v["fit"]["marks"]), v["fit"]["marks"])      # hw_fit.py: "Dual ... NOT modelled"
@@ -367,8 +406,8 @@ class TestLiveProfile(unittest.TestCase):
         self.assertEqual((p["pool_floor_in_kraft"], p["pool_floor_pflicht"]), (263168, 263168))
         self.assertIs(p["erfuellt"], True, p["grund"])
         self.assertEqual([r["bedarf_mib"] for r in d["karten"]], [3640.0, 2600.0, 2080.0])       # the seat's need column for 31,17,16
-        for r, want in zip(d["karten"], (4563, 4627, 4330)):                                    # the seat's pool column; the planner states +-300 MiB
-            self.assertLessEqual(abs(r["pool_mib"] - want), 300, (r["pool_mib"], want))
+        for r, want in zip(d["karten"], (4563, 4627, 4330)):                                    # the seat's pool column; tolerance: see TOL_SEAT
+            self.assertLessEqual(abs(r["pool_mib"] - want), TOL_SEAT, (r["pool_mib"], want))
         self.assertEqual(d["passung"]["stufe"], "ja")
         # the profile's budgets ARE the calibration of the rule: at its own cut the rule returns them
         w = _propose("ref3", profile=self.LIVE, dual_cut=[31, 17, 16])["dual"]
@@ -459,16 +498,16 @@ class TestRuleMode(unittest.TestCase):
 
     def test_the_shift_rule_against_the_27b_seats_own_262k_computation(self):
         """``done/dual-schnitt-262k-1006.md`` section 3/4 (dual1h method, measured coefficients 90 / 205 MiB per layer): cut 31,17,16 / 7,5,4 ->
-        P budgets 6610,5050,5200 and pool 4563/4627/4330 MiB.  The planner's coefficients come from the model's layer sizes and D's preset share,
-        not from fitted per-class numbers: it must agree within the tolerance the planner states (300 MiB per card) and never claim more."""
+        P budgets 6610,5050,5200 and pool 4563/4627/4330 MiB.  The planner's coefficients come from the model's layer sizes and D's installed vector,
+        not from fitted per-class numbers: it must agree within TOL_SEAT (400 MiB per card, see there) and never claim more."""
         v = _propose("ref3", dual_cut=[31, 17, 16])
         d = v["dual"]
         self.assertEqual(d["regeln"]["schnitt"], [31, 17, 16])
         self.assertEqual(d["regeln"]["attn"], [7, 5, 4])                                  # the natural FA count of 31,17,16 (the seat's W40 note)
         for got, want in zip(d["regeln"]["budgets"], (6610, 5050, 5200)):
-            self.assertLessEqual(abs(got - want), 300, (d["regeln"]["budgets"], want))
+            self.assertLessEqual(abs(got - want), TOL_SEAT, (d["regeln"]["budgets"], want))
         for r, want in zip(d["karten"], (4563, 4627, 4330)):
-            self.assertLessEqual(abs(r["pool_mib"] - want), 300, (r["pool_mib"], want))
+            self.assertLessEqual(abs(r["pool_mib"] - want), TOL_SEAT, (r["pool_mib"], want))
         # the 262k obligation holds at this cut on all three cards (the seat's margin +923/+2027/+2250 at D -> 0)
         self.assertIs(d["pflicht"]["erfuellt"], True)
         self.assertEqual([r["bedarf_mib"] for r in d["karten"]], [3640.0, 2600.0, 2080.0])

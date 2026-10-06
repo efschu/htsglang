@@ -55,9 +55,16 @@ PAGE_TOKENS = 1
 #: budgets are written in steps of 10 MiB (the style of ``dual1h`` / ``dual-schnitt-262k-1006``: 6607 -> 6610)
 BUDGET_ROUND_MIB = 10
 
-#: D's host-rank weight share of the ``--d-reshard`` preset ``dec`` per checkpoint format (``d_reshard.RC9_PRESET_SHARES``).  A COPY
-#: (``d_reshard`` imports the distributed stack); ``test_planer_ape_dual_1006`` pins it equal.  The remaining ranks split the rest evenly.
-PRESET_HOST_SHARE = {"int8": 0.65, "nvfp4": 0.72}
+#: D's INSTALLED weight vector in the Dual boot when the profile arms ``--d-reshard`` (``launcher.py`` ``ReshardSpec(policy, RC9_BASE, ...)``): D boots
+#: at ``d_reshard.RC9_BASE`` (MLP units per rank), and P binds the part of its stage that is NOT this shard (``dual_share_env``: D owns the image
+#: and publishes its installed vectors).  MEASURED: ``dual_w64.py`` (boot a3t5js: D TP0 weights 12.020 GiB = 12308 MiB) and the D log read by
+#: ``deskq/done/dual-schnitt-262k-1006.md`` section 3 ("D-Gewichte [58,25,25]").  The ``--d-reshard`` preset ``dec`` (host share 0.65 / 0.72) is a
+#: state AFTER a wake reshard and is NOT what the Dual-Passung rests on.  A COPY (``d_reshard`` imports the distributed stack);
+#: ``test_planer_ape_dual_1006`` pins it equal.  The planer uses this ONE vector for P-private weights AND D's weights AND D's Mamba pool of a card
+#: (one state of D per sum; the review of fix round 1: two different D shards in one line fit no real state).
+INSTALLED_D_BASE = (58, 25, 25)
+#: D's weights on card 0 of the reference boot (``dual_w64.py`` docstring: 12.020 GiB): the planer's model of the installed vector is checked against it
+D_WEIGHTS_K0_MEASURED_MIB = 12308
 
 #: THE measured calibration point of the Dual form: boot b9p (05.10., 27B NVFP4, 5090 + 2x 3080, cut 45,10,9, P budgets 8740,3000,3500,
 #: ``--dual-p-overhead-mib 2500``, P mamba 8 slots): the card KV ledger's pool per card (``LEDGER-PHYS ... budget=`` 3332374528 /
@@ -135,17 +142,19 @@ def kv_payload_bytes(modell: Mapping[str, Any], fp: Any, kv_dtype: str) -> Tuple
 
 
 def d_shares(fmt: str, totals: Sequence[float], reshard_wake: bool) -> Tuple[List[float], str]:
-    """D's weight share per card for the P-private weights: the host share of the measured ``dec`` preset when the profile reshards at wake
-    and the format has one, else proportional to the card sizes (the capacity-first rule; the launcher solves the real vector by
-    ``--d-tp-objective``)."""
+    """D's weight share per card (ONE vector for every term of a card: P-private weights, D's weights, D's Mamba pool): the installed
+    vector ``INSTALLED_D_BASE`` when the profile reshards (``--d-reshard`` armed, D boots at RC9_BASE, three ranks), else proportional to the
+    card sizes (the capacity-first rule; the launcher solves the real vector by ``--d-tp-objective``: planer assumption, unbelegt)."""
     n = len(totals)
-    host = PRESET_HOST_SHARE.get(fmt)
-    if reshard_wake and host is not None and n >= 2:
-        return [host] + [(1.0 - host) / (n - 1)] * (n - 1), (
-            "D-Gewichtsanteil: Host-Anteil %.2f des gemessenen Presets 'dec' (--d-reshard wake, Format %s), der Rest gleich verteilt" % (host, fmt))
+    if reshard_wake and n == len(INSTALLED_D_BASE):
+        tot = float(sum(INSTALLED_D_BASE))
+        return [x / tot for x in INSTALLED_D_BASE], (
+            "D-Gewichtsanteil: installierter D-Vektor %s (RC9_BASE, --d-reshard bootet D dort; gemessen: D-Gewichte [58,25,25] im Dual-Boot, "
+            "Karte 0 %d MiB); der Preset 'dec' nach einem Wake ist ein anderer Zustand und nicht gerechnet. EIN Vektor fuer P-private Gewichte, "
+            "D-Gewichte und D-Mamba einer Karte" % (",".join(str(x) for x in INSTALLED_D_BASE), D_WEIGHTS_K0_MEASURED_MIB))
     tot = float(sum(totals))
-    return [t / tot for t in totals], ("D-Gewichtsanteil: proportional zur Kartengroesse (Planer-Annahme; der Launcher loest den Vektor "
-                                       "nach --d-tp-objective)")
+    return [t / tot for t in totals], ("D-Gewichtsanteil: proportional zur Kartengroesse (Planer-Annahme, unbelegt: der Launcher loest den Vektor "
+                                       "nach --d-tp-objective). EIN Vektor fuer P-private Gewichte, D-Gewichte und D-Mamba einer Karte")
 
 
 def model_bytes(fp: Any) -> DL.ModelBytes:
@@ -296,7 +305,7 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
         for c in cards:
             by_cls.setdefault(c["class"], float(c["total_mib"]))
         ref_tot = [by_cls.get(c) for c in binv]
-        preset = reshard_wake and fmt in PRESET_HOST_SHARE
+        preset = reshard_wake and n_ref == len(INSTALLED_D_BASE)
         if preset or all(t is not None for t in ref_tot):
             sh_ref, _ = d_shares(fmt, [t or 0.0 for t in ref_tot], reshard_wake)
             t_ref = terms(cut_ref, sh_ref, slots_old if slots_old is not None else slots)
@@ -309,16 +318,17 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
                 bname, ", ".join("%.0f" % x for x in e_ref))
     annahmen.append(resid_note)
 
-    # --- D's side of the coupling: awake rest (record) and D's own weights (capacity-first shard, draft included) ----------------
+    # --- D's side of the coupling: awake rest (record) and D's own weights (the installed shard, draft included) ----------------
     aw = posts.vec("D_AWAKE_REST_BOOKED_MIB")
     if aw is None:
         annahmen.append("D_AWAKE_REST_BOOKED_MIB: kein Record fuer das Profil: 0 MiB gerechnet (unbelegt)")
         unb.append("D_AWAKE_REST_BOOKED_MIB: kein Record -- die Ruhe-Posten von D sind in der Dual-Passung nicht gerechnet")
     ruhe = [0.0 if aw is None else _role(aw, k, n) for k in range(n)]
-    d_w_shares = [t / sum(totals) for t in totals]
-    d_w = [t["d_total"] for t in terms([int(x) for x in layers], d_w_shares, slots)]
-    # D's Mamba pool (d_slots slots x the linear layers) is paid from D's budget whatever the vector: split like D's weights
-    d_mam = [fp.linear_layers * slot_mib * d_slots * d_w_shares[k] for k in range(n)]
+    # D's weights and Mamba pool are the shard of the SAME installed vector the P-private weights are the difference to (``sh_new``): one state of D
+    # per card sum.  The D weights do not depend on P's cut (the cut only moves what P holds beyond them): any cut gives the same d_total.
+    d_w = [t["d_total"] for t in terms([int(x) for x in layers], sh_new, slots)]
+    # D's Mamba pool (d_slots slots x the linear layers) is paid from D's budget: split like D's weights
+    d_mam = [fp.linear_layers * slot_mib * d_slots * sh_new[k] for k in range(n)]
 
     # --- the KV obligation: flags and the level ----------------------------------------------------------------------------------
     lvl = level_tokens(kv_tokens)
@@ -494,10 +504,10 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
     out_cards: List[Dict[str, Any]] = []
     level = "ja"
     first = ""
-    sh_cur, _ = d_shares(fmt, totals, reshard_wake)
+    sh_cur = sh_new
     tc = terms(cut_cur, sh_cur, cur_slots) if cut_cur and len(cut_cur) == n and sum(cut_cur) == fp.n_layers else None
-    # D's own weights: its boot shard (capacity-first), draft included
-    td = terms(cut_cur, d_w_shares, cur_slots) if tc is not None else None
+    # D's own weights: its installed shard (the vector of the P-private terms above), draft included
+    td = tc
     pool_cur = pool_of(cut_cur, sh_cur, cur_slots, ovh) if tc is not None else None
     need_cur = need_of(cut_cur) if tc is not None else None
     for k in range(n):
