@@ -432,25 +432,37 @@ class CensusBorrow:
     card_class: str
     donor_uuid: str
     donor_class: str
-    #: ``class`` (a census row of the same card class), ``conservative`` (no
-    #: row of that class: the most demanding row of the census, which can only
-    #: OVER-price a peak) or ``map`` (the operator named the row).
+    #: ``class`` (a census row of the same card class), ``twin`` (AP2b 1006: no
+    #: row of that class, but one of its ARCH TWIN -- ``card_identity.
+    #: arch_twin_class``, the AP1 W19 rule, sm_86 -> RTX3080), ``conservative``
+    #: (neither: the most demanding row of the census, which can only OVER-price
+    #: a peak) or ``map`` (the operator named the row).
     kind: str
+    #: AP2b 1006: where the donor's class came from when the census row states
+    #: none and no live card carries its UUID -- the reference rig's card
+    #: registry (:func:`reference_census_classes`).  "" = stated / live card.
+    donor_class_from: str = ""
 
     def text(self, census_path: str = "") -> str:
         how = {
             "class": "the most demanding census row of the SAME card class "
                      f"({self.card_class})",
+            "twin": "the census has no row of this card class "
+                    f"({self.card_class}); the most demanding row of its ARCH TWIN "
+                    f"class {self.donor_class} (same compute capability, the AP1 W19 "
+                    "rule) stands in",
             "conservative": "the census has no row of this card class "
                             f"({self.card_class}); the most demanding row of the census "
                             "stands in (it can only over-price the peak)",
             "map": "the row the operator named (--weg2-xchg-census-map)",
         }[self.kind]
+        src = (f", class read from {self.donor_class_from}"
+               if self.donor_class_from else "")
         return (
             f"{CODE_BORROWED}: card {self.uuid} (nvml{self.nvml_index} {self.name}, "
             f"class {self.card_class}) is not in the census {census_path or '<inline>'}; "
             f"its row would be BORROWED from census row {self.donor_uuid} "
-            f"(class {self.donor_class or 'unlabelled'}) -- {how}.  The per-tag bytes "
+            f"(class {self.donor_class or 'unlabelled'}{src}) -- {how}.  The per-tag bytes "
             "and the dormant residue are another card's measurement, applied here as if "
             "measured on this one; the serving constants must not stand in -- they "
             "contain none of the exchange lane's residency.  Measure this inventory "
@@ -490,11 +502,48 @@ def _demand_mib(entry: CardCensus) -> int:
     )
 
 
+#: AP2b 1006: the source named for a donor class read from the reference rig's
+#: card registry (:func:`reference_census_classes`).
+REFERENCE_CLASS_SOURCE = (
+    "the reference rig's card registry (planner/power_limit.py RIG_5090 / "
+    "RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)"
+)
+
+
+def reference_census_classes() -> Dict[str, str]:
+    """AP2b 1006: ``census UUID -> card class`` of the reference rig's cards.
+
+    The shipped census files under ``weg2/census/`` predate AP2's ``card_class``
+    field: their rows are keyed by the reference rig's UUIDs and say nothing
+    else about the board.  On that rig the live card carrying the UUID names the
+    class (:func:`resolve_census`); on ANY other inventory nobody did, every row
+    was "unlabelled", and a 3080 borrowed the census's heaviest row (the 5090
+    image, 24330 MiB on a 20480 MiB board: W71 at N = 4).
+
+    The UUID -> board mapping of the reference rig is recorded in the tree
+    already, keyed by physical UUID on purpose (``planner/power_limit.py``, the
+    ``NVML -> CUDA ordinal map`` of boots fnFL2x148/x160/x162/x163); the class
+    is the SAME ``card_identity.calibration_class`` every record lookup uses.
+    No census file is read or changed here; a UUID this registry does not name
+    stays unlabelled (and borrows conservatively, as before)."""
+    from sglang.srt.planner import power_limit as _pl
+    from sglang.srt.weg2 import card_identity as _ci
+
+    out: Dict[str, str] = {}
+    for uuid, nvml, name in (_pl.RIG_5090, _pl.RIG_3080_NVML0, _pl.RIG_3080_NVML2):
+        cls = _ci.calibration_class({"uuid": uuid, "nvml_index": nvml, "name": name})
+        if cls:
+            out[str(uuid)] = cls
+    return out
+
+
 def resolve_census(
     census: XchgCensus,
     cards: Sequence[object],
     census_map: str = "",
     class_of: Optional[object] = None,
+    known_classes: Optional[Mapping[str, str]] = None,
+    twin_of: Optional[object] = None,
 ) -> Tuple[XchgCensus, List[CensusBorrow], List[str]]:
     """Give EVERY live card a census row, and say which rows are not its own.
 
@@ -509,9 +558,16 @@ def resolve_census(
     the launcher turns into the forcebar refusal ``HW-BORROWED``.  Donor order:
     the operator's ``census_map`` (``notes`` says so, not a borrow to refuse:
     the operator named it), else the most demanding row of the SAME card class,
-    else the most demanding row of the whole census.  The class of a donor is
-    its ``card_class`` field when the file states one, else the class of the
-    live card that carries its UUID, else unlabelled.
+    else (AP2b 1006) the most demanding row of the card's ARCH TWIN class
+    (``twin_of``, default ``card_identity.arch_twin_class`` -- the AP1 W19 rule:
+    a 3090 borrows a 3080 row, not the 5090's), else the most demanding row of
+    the whole census.  The class of a donor is its ``card_class`` field when the
+    file states one, else the class of the live card that carries its UUID,
+    else (AP2b 1006) ``known_classes[uuid]`` -- the reference rig's registry
+    (:func:`reference_census_classes`, named in the borrow line) -- else
+    unlabelled.  A derived donor is still a BORROW (HW-BORROWED, forcebar):
+    the class picks the row, it does not make the row a measurement of this
+    card; only ``census_map`` (the operator's assertion) is not refused.
 
     The model, format and flip mode are not looked at here and need not be: the
     census file a profile hands in is already per model (its tag names, waves
@@ -529,15 +585,21 @@ def resolve_census(
     if not missing:
         return census, [], []
 
+    known = dict(known_classes or {})
     donor_class: Dict[str, str] = {}
+    donor_from: Dict[str, str] = {}
     for duuid, entry in census.cards.items():
         stated = getattr(entry, "card_class", "") or ""
         if stated:
             donor_class[duuid] = stated
         elif duuid in live_by_uuid:
             donor_class[duuid] = str(label(live_by_uuid[duuid]))
+        elif known.get(duuid):
+            donor_class[duuid] = str(known[duuid])
+            donor_from[duuid] = REFERENCE_CLASS_SOURCE
         else:
             donor_class[duuid] = ""
+    twin_fn = twin_of if callable(twin_of) else card_identity.arch_twin_class
 
     pairs = parse_census_map(census_map)
     for _live, donor in pairs:
@@ -568,9 +630,11 @@ def resolve_census(
             donor_uuid, kind = named, "map"
         else:
             same = [u for u, k in donor_class.items() if k and k == cls]
-            pool = same or list(census.cards)
+            twin = "" if same else str(twin_fn(card) or "")
+            kin = [u for u, k in donor_class.items() if twin and k == twin]
+            pool = same or kin or list(census.cards)
             donor_uuid = max(pool, key=lambda u: (_demand_mib(census.cards[u]), u))
-            kind = "class" if same else "conservative"
+            kind = "class" if same else ("twin" if kin else "conservative")
         donor = census.cards[donor_uuid]
         new_cards[uuid] = CardCensus(
             uuid=uuid,
@@ -588,6 +652,7 @@ def resolve_census(
             donor_uuid=donor_uuid,
             donor_class=donor_class.get(donor_uuid, ""),
             kind=kind,
+            donor_class_from=donor_from.get(donor_uuid, ""),
         )
         if kind == "map":
             notes.append(

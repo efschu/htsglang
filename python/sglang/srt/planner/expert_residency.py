@@ -199,6 +199,40 @@ def largest_fraction_for_rows(
     return f
 
 
+def d_rank_fraction_caps(
+    owned: Sequence[int], pad_experts_per_rank: int = 1
+) -> List[Optional[float]]:
+    """AP2b 1006: die OBERGRENZE des Planer-Vorschlags FR_D je D-Rang -- die
+    groesste Fraction, bei der der Rang seinen Platztausch-Puffer noch baut.
+
+    Ein D-Rang haelt ``owned + pad`` lokale Zeilen je Layer (seine Experten
+    aus ``--rank-moe-ratio`` plus der Null-Pad-Experte, #82 -- dieselbe
+    Zaehlung wie ``expert_map.unbuilt_platztausch_buffers``). Bei FR_D 1.000
+    (Form A auf 4 Karten: jede Karte fasst ihren ganzen Anteil) baut er
+    KEINEN Puffer; der Dry-Run verweigert das als W120 und nennt je Rang
+    "groesste Fraction mit Puffer" -- das ist genau diese Zahl
+    (:func:`largest_fraction_for_rows` mit ``max_rows = E``: ``R = E - 2``,
+    3 Stellen abgerundet, gegen ``resident_rows`` nachgeprueft). Ein Planer,
+    der mehr vorschlaegt, schlaegt einen Wert vor, den der Launcher verweigert.
+
+    Keine Reserve: der Puffer ist keine VRAM-Rueckstellung, sondern die zwei
+    Scratch-Zeilen, ohne die die Runtime den Platztausch nicht baut
+    (``scratch_slot_count``, ``MIN_SCRATCH_ROWS``). ``None`` fuer einen Rang
+    mit weniger als 3 lokalen Zeilen (er baut bei keiner Fraction einen
+    Puffer -- das sagt die Verweigerung, nicht der Planer).
+
+    ``owned`` ist das Eigentum je Rang mit Summe = Expertenzahl (Form A
+    ``FormAPlan.owned``); dann ist es Element fuer Element die Spanne, die
+    ``expert_map.scaled_spans`` (``partition_units``) daraus schneidet."""
+    pad = max(0, int(pad_experts_per_rank))
+    out: List[Optional[float]] = []
+    for o in owned:
+        e = int(o) + pad
+        out.append(largest_fraction_for_rows(local_experts=e, scratch_rows=0, max_rows=e)
+                   if e > 0 else None)
+    return out
+
+
 def scratch_edge(
     *, local_experts: int, fraction: float, max_rows: int
 ) -> Tuple[int, Optional[int]]:

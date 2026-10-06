@@ -10585,8 +10585,14 @@ def load_xchg_census_for_cards(
     ``WEG2-XCHG-CENSUS-MAP`` line and no refusal.  The peak is still graded
     against the card's LIVE NVML total by ``xchg_residency.solve``."""
     census = xchg_residency.load_census(census_path)   # raises W71 by name
+    # AP2b 1006: on a foreign inventory the launcher derives the donor of every
+    # missing row ITSELF (no --weg2-xchg-census-map needed): a census row without
+    # a card_class field is labelled from the reference rig's card registry
+    # (UUID -> board), a live card borrows the row of its own class, else of its
+    # arch twin (AP1 W19 rule).  Still a named HW-BORROWED borrow (forcebar).
     census, borrows, notes = xchg_residency.resolve_census(
-        census, cards, census_map=_XCHG_CENSUS_MAP[0] if census_map is None else census_map)
+        census, cards, census_map=_XCHG_CENSUS_MAP[0] if census_map is None else census_map,
+        known_classes=xchg_residency.reference_census_classes())
     if log is not None:
         for ln in notes:
             log(ln)

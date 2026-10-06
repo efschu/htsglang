@@ -160,8 +160,12 @@ class TwoIdenticalForeignCards(Base):
         self.assertEqual(res.order, ["GPU-aaaa-3090-0", "GPU-aaaa-3090-1"])
         # the peak is graded against the LIVE total of the foreign card, not the donor's
         self.assertEqual({r.total_mib for r in res.rows}, {24576})
-        # conservative: the heaviest row of the census (the 5090 row) stands in
-        self.assertIn(BIG[:12], past[0])
+        # AP2b 1006: the census rows are labelled from the reference rig's registry (BIG = RTX5090, SM1/SM2 = RTX3080),
+        # so a 3090 (sm_86) borrows the heaviest row of its ARCH TWIN class RTX3080 (SM1), no longer the 5090 row
+        # (before: "conservative", the heaviest row of the census -- 24330 MiB of a 5090 image on 4x3090 was W71)
+        self.assertIn("ARCH TWIN", past[0])
+        self.assertIn(SM1[:12], past[0])
+        self.assertNotIn("from census row " + BIG, past[0])
 
     def test_with_force_the_second_reader_adds_no_second_line(self):
         # known class (the W19 class selector, AP1, is a separate stop for classes without a record), unknown UUIDs
