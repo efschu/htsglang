@@ -240,10 +240,12 @@ class DryRunResult:
     ``rc`` the return value (None when ``main`` raised), ``exc_type``/``exc_msg`` the refusal that did,
     ``forced`` the ``refusals.forced_list()`` of the run (``[{code, text}]``), ``events`` nothing else."""
 
-    __slots__ = ("rc", "exc_type", "exc_msg", "text", "raw", "forced", "argv", "exc_where")
+    __slots__ = ("rc", "exc_type", "exc_msg", "text", "raw", "forced", "argv", "exc_where", "exc_mro")
 
-    def __init__(self, rc, exc_type, exc_msg, text, raw, forced, argv, exc_where=""):
+    def __init__(self, rc, exc_type, exc_msg, text, raw, forced, argv, exc_where="", exc_mro=()):
         self.rc, self.exc_type, self.exc_msg = rc, exc_type, exc_msg
+        #: class names of the exception's MRO (``type(exc).__mro__`` without ``object``/``BaseException``): tells a refusal from a crash
+        self.exc_mro = tuple(exc_mro)
         self.text, self.raw, self.forced, self.argv = text, raw, forced, argv
         #: AP-D: ``file:line in function`` of the innermost frame of the exception (empty = no exception); the verdict of a launcher
         #: CRASH (``IndexError`` inside the dry run) names where it happened, the golden header does not carry it
@@ -448,7 +450,8 @@ def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any
         text = text.replace(evidence_dir, live_evidence)
         raw = raw.replace(evidence_dir, live_evidence)
     return DryRunResult(rc, type(exc).__name__ if exc else None, str(exc) if exc else "", text, raw, forced, argv,
-                        _exc_where(exc, tree) if exc else "")
+                        _exc_where(exc, tree) if exc else "",
+                        [c.__name__ for c in type(exc).__mro__ if c not in (object, BaseException, Exception)] if exc else ())
 
 
 def _exc_where(exc: BaseException, tree: str) -> str:

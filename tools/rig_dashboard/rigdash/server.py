@@ -250,7 +250,10 @@ class App:
         # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
         ptree = getattr(args, "profil_tree", None) or None      # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker
         # AP-D: das Orakel (Launcher-Trockenlauf im Kindprozess + Cache); startet erst bei der ersten Anfrage, nie im Hintergrund
-        self.oracle = profil_oracle.OracleService(profil.find_tree(ptree), python=getattr(args, "couplings_python", None))
+        # eigener cgroup-Scope (Spitze 1,75 GiB RSS > Rest der Unit-Grenze, Review AP-D); args ohne Feld (Tests) = kein Praefix
+        opf = getattr(args, "oracle_prefix", None)
+        oprefix = profil_oracle.default_prefix() if opf == "auto" else (shlex.split(opf) if opf and opf != "none" else [])
+        self.oracle = profil_oracle.OracleService(profil.find_tree(ptree), python=getattr(args, "couplings_python", None), prefix=oprefix)
         self.profil = profil.ProfilEditor(
             kartenplaner=self.kartenplaner, tree=ptree,
             oracle=self.oracle, hardware=lambda: self.hwprofil.get(), check_path=lambda p, what: self.modellprofil.check_path(p, what),
@@ -869,6 +872,9 @@ def main(argv=None):
                     help="voller sglang-Baum (<baum>/python) für den Messlauf; leer = --hw-tree (dann muss card_probe darin liegen)")
     ap.add_argument("--couplings-python", default=os.environ.get("RIGDASH_COUPLINGS_PYTHON"),
                     help="Profil-Editor S4b: Python der sglang-Umgebung für den Kopplungs-Worker (Standard /spinning/htsglang-gpu/.venv/bin/python)")
+    ap.add_argument("--oracle-prefix", default=os.environ.get("RIGDASH_ORACLE_PREFIX", "auto"),
+                    help="Befehlspräfix des Orakel-Kindprozesses (Launcher-Trockenlauf, Spitze 1,75 GiB RSS gemessen): 'auto' = systemd-run --scope -q -p "
+                         "MemoryMax=4G (eigener cgroup-Rahmen ausserhalb der Unit), 'none' = ohne, sonst der Befehl selbst")
     ap.add_argument("--hw-python", default=os.environ.get("HWPROFIL_PYTHON"),
                     help="Interpreter mit torch + sgl_kernel für den Messlauf (Kindprozess, außerhalb dieses Prozesses)")
     ap.add_argument("--hw-prefix", default=os.environ.get("HWPROFIL_PREFIX", ""),

@@ -75,7 +75,10 @@ _W_CODE = {"W40": "PP-CUT", "W42": "PP-CUT", "W43": "PP-CUT"}
 
 _SPLIT_BLOCKERS_RX = re.compile(r";\s+(?=\[[A-Z])")
 _VEC_ITEM_RX = re.compile(r"^(\S.*?) \((\d+) entries\)$")
-_W_RX = re.compile(r"\bW(\d+[a-z]?)\b")
+#: the launcher W-code at the START of a refusal text ("W10 Weg2DrafterIdentityMismatch: ...")
+_W_START_RX = re.compile(r"^\s*W(\d+[a-z]?)\b(?![-.\w])")
+#: a W-code as a whole token inside a refusal text: not part of a path or name (``-W8-``, ``/W8``, ``xW8``)
+_W_TOKEN_RX = re.compile(r"(?<![\w/.-])W(\d+[a-z]?)(?![\w/.-])")
 _NAMED_RX = re.compile(r"\((HW-[A-Z]+)\)")
 
 
@@ -209,20 +212,35 @@ def verdikt(code: str, *, ebene: str = "lauf", text: str = "", grund: Optional[s
 # what the launcher said -> verdicts
 # ---------------------------------------------------------------------------
 
-def classify_exception(exc_type: Optional[str], exc_msg: str) -> Dict[str, Optional[str]]:
+def _is_refusal_class(exc_type: str, exc_mro: Optional[Sequence[str]]) -> bool:
+    """Is the exception a launcher refusal?  By the MRO when the harness sent it (``Weg2LaunchRefused`` and every subclass, ``SystemExit``
+    refusals of the ``Weg2*`` family), else by the launcher's own naming (``Weg2*``, ``*Refused``, ``*Unproven``).  A stdlib exception
+    (``KeyError``, ``IndexError``, ``FileNotFoundError`` ...) is never a refusal, whatever its text says."""
+    names = [str(n) for n in (exc_mro or ())]
+    if names:
+        return any(n == "Weg2LaunchRefused" or n.startswith("Weg2") or n.endswith("Refused") or n.endswith("Unproven") for n in names)
+    return exc_type.startswith("Weg2") or exc_type.endswith("Refused") or exc_type.endswith("Unproven")
+
+
+def classify_exception(exc_type: Optional[str], exc_msg: str, exc_mro: Optional[Sequence[str]] = None) -> Dict[str, Optional[str]]:
     """The register code and the launcher W-code of the exception that ended a dry run.
 
-    ``kind``: ``ablehnung`` (a launcher refusal), ``optionen`` (argparse / ``SystemExit``), ``absturz`` (anything that is not a refusal:
-    ``IndexError``, ``KeyError``, ``AssertionError``, ... -- a defect of the launcher for this form, not a judgement of values)."""
+    ``kind``: ``ablehnung`` (a launcher refusal: ``Weg2LaunchRefused`` and subclasses), ``optionen`` (argparse / ``SystemExit``), ``absturz``
+    (anything that is not a refusal: ``IndexError``, ``KeyError``, ``FileNotFoundError``, ... -- a defect of the launcher for this form, not a
+    judgement of values).  The W-code is read at the START of the message (``W10 Weg2DrafterIdentityMismatch: ...``); only a refusal may
+    carry it further inside, and then only as a whole token (``Qwen3.8-27B-DFlash2-W8-lued`` is a path, not the code W8)."""
     from sglang.srt.weg2 import refusals
 
     msg = str(exc_msg or "")
-    mw = _W_RX.search(msg)
-    wcode = "W" + mw.group(1) if mw else None
     if exc_type is None:
         return {"kind": None, "code": None, "launcher_code": None}
     if exc_type == "SystemExit" or msg.startswith("usage:"):
-        return {"kind": "optionen", "code": "OPTIONEN", "launcher_code": wcode}
+        mw = _W_START_RX.match(msg)
+        return {"kind": "optionen", "code": "OPTIONEN", "launcher_code": "W" + mw.group(1) if mw else None}
+    if not _is_refusal_class(exc_type, exc_mro):
+        return {"kind": "absturz", "code": "ORAKEL-ABSTURZ", "launcher_code": None}
+    mw = _W_START_RX.match(msg) or _W_TOKEN_RX.search(msg)
+    wcode = "W" + mw.group(1) if mw else None
     hw = refusals.classify(msg)
     if hw:
         return {"kind": "ablehnung", "code": hw, "launcher_code": wcode}
@@ -230,9 +248,7 @@ def classify_exception(exc_type: Optional[str], exc_msg: str) -> Dict[str, Optio
         return {"kind": "ablehnung", "code": _CLASS_CODE[exc_type], "launcher_code": wcode}
     if wcode in _W_CODE:
         return {"kind": "ablehnung", "code": _W_CODE[wcode], "launcher_code": wcode}
-    if exc_type.startswith("Weg2") or exc_type.endswith("Refused") or exc_type.endswith("Unproven") or wcode:
-        return {"kind": "ablehnung", "code": "LAUNCHER-UNKLASSIFIZIERT", "launcher_code": wcode}
-    return {"kind": "absturz", "code": "ORAKEL-ABSTURZ", "launcher_code": wcode}
+    return {"kind": "ablehnung", "code": "LAUNCHER-UNKLASSIFIZIERT", "launcher_code": wcode}
 
 
 def blockers_of(text: str) -> List[Dict[str, str]]:
@@ -278,7 +294,7 @@ def vector_keys_of(text: str) -> List[str]:
 
 
 def _run_summary(res: Any) -> Dict[str, Any]:
-    cls = classify_exception(res.exc_type, res.exc_msg)
+    cls = classify_exception(res.exc_type, res.exc_msg, getattr(res, "exc_mro", None))
     return {"rc": res.rc, "exc_type": res.exc_type, "exc_msg": _clip(res.exc_msg, 1200), "exc_where": getattr(res, "exc_where", ""),
             "code": cls["code"], "launcher_code": cls["launcher_code"], "kind": cls["kind"], "forced": [dict(f) for f in res.forced],
             "zeilen": res.text.count("\n")}
@@ -483,7 +499,7 @@ def ask(li: Any, devices: Sequence[Mapping[str, Any]], *, tree: str, form: Optio
         res1, notes = r1.result, list(r1.notes)
         res2 = None
         runs = 1
-        if res1.exc_type is not None and classify_exception(res1.exc_type, res1.exc_msg)["kind"] != "absturz":
+        if res1.exc_type is not None and classify_exception(res1.exc_type, res1.exc_msg, getattr(res1, "exc_mro", None))["kind"] != "absturz":
             r2 = O.run_profile("", devices, tree=tree, force=True, launch_input=li, snapshots=snapshots, evidence_dir=evidence_dir,
                                scratch=scratch, extra_args=extra_args, **run_kw)
             res2 = r2.result

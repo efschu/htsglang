@@ -332,6 +332,44 @@ class TestCrashIsAVerdict(unittest.TestCase):
         self.assertEqual(crash["hangt_an"], "RECORDS-NVEC")
         self.assertIn("HW-COUNT", [v["code"] for v in d["verdikte"]])
 
+    def test_a_stdlib_exception_naming_a_w_path_is_a_crash_not_a_refusal(self):
+        """Review AP-D 1: ``-W8-`` inside the text of a ``FileNotFoundError`` (the real 27B draft path) is no launcher W-code."""
+        path = "/models/Qwen3.8-27B-DFlash2-W8-lued/config.json"
+        for etype, msg in (("FileNotFoundError", "[Errno 2] No such file or directory: '%s'" % path), ("KeyError", "'W8'"),
+                           ("IndexError", "list index out of range"), ("ValueError", "bad draft %s" % path)):
+            c = PV.classify_exception(etype, msg)
+            self.assertEqual((c["kind"], c["code"], c["launcher_code"]), ("absturz", "ORAKEL-ABSTURZ", None), etype)
+
+        def main(argv):
+            raise FileNotFoundError(2, "No such file or directory: '%s'" % path)
+
+        with mock.patch.object(launcher, "main", side_effect=main) as m:
+            d = PV.ask(self._li(), self._four(), tree=TREE)
+        self.assertEqual(d["ausgang"], "absturz")
+        self.assertEqual(d["verdikte"][-1]["code"], "ORAKEL-ABSTURZ")
+        self.assertEqual(d["verdikte"][-1]["exc_type"], "FileNotFoundError")
+        self.assertEqual(m.call_count, 1)                                   # a crash is final: no second run with --force
+        self.assertEqual(d["orakel"]["laeufe"], 1)
+
+    def test_the_w_code_of_a_refusal_is_read_at_the_start_or_as_a_whole_token(self):
+        c = PV.classify_exception("Weg2LaunchRefused", "W10 Weg2DrafterIdentityMismatch: P=a D=b")
+        self.assertEqual((c["kind"], c["launcher_code"]), ("ablehnung", "W10"))
+        c = PV.classify_exception("Weg2LaunchRefused", "draft /m/Qwen3.8-27B-DFlash2-W8-lued is not resident")
+        self.assertEqual((c["kind"], c["code"], c["launcher_code"]), ("ablehnung", "LAUNCHER-UNKLASSIFIZIERT", None))
+        c = PV.classify_exception("Weg2LaunchRefused", "cut refused (W40: 3 layers unfunded)")
+        self.assertEqual((c["code"], c["launcher_code"]), ("PP-CUT", "W40"))
+        # the harness sends the MRO: a subclass of Weg2LaunchRefused with an unrelated name is a refusal too, a stdlib class is not
+        c = PV.classify_exception("OddName", "W11b over budget", ["OddName", "Weg2LaunchRefused", "RuntimeError"])
+        self.assertEqual((c["kind"], c["launcher_code"]), ("ablehnung", "W11b"))
+        c = PV.classify_exception("KeyError", "W40", ["KeyError", "LookupError"])
+        self.assertEqual(c["kind"], "absturz")
+
+    def test_the_harness_sends_the_mro_of_the_exception(self):
+        self.assertIn("exc_mro", O.DryRunResult.__slots__)
+        res = O.DryRunResult(None, "Weg2DKvStageWavesRefused", "x", "", "", [], [], "", ["Weg2DKvStageWavesRefused", "Weg2DKvStageMaxRefused",
+                                                                                         "Weg2LaunchRefused", "RuntimeError"])
+        self.assertEqual(PV._run_summary(res)["kind"], "ablehnung")
+
     def test_argparse_system_exit_is_optionen(self):
         with mock.patch.object(launcher, "main", side_effect=SystemExit(2)):
             d = PV.ask(self._li(), self._four(), tree=TREE)

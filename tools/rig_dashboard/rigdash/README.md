@@ -360,8 +360,14 @@ steht in jedem Verdikt und im Schlüssel.
 das Startprofil `flliper.server/1` (Basisprofil + die Werte des Vorschlags, Herkunft `planer`) mit Herkunft, Verdikt und Kanten je Wert, die Verdikte des
 Laufs und die Anfrage für die Balken (`what=phase_bars`, `form` flip|d_only, Vertrag `flliper.balken/1` von AP-H2). Dual und Einzelkarte sind AP-E/AP-F.
 Der Orakel-Kindprozess importiert den Launcher: der Planer-Baum der Unit muss `weg2/launcher.py`, `propose*.py`, `hw_fit.py` und `fit_profiles_data`
-tragen (der volle Baum `python/sglang` der Revision, wie bei `stage_profil_modules.sh`), und die Unit braucht mehr Speicher (Kindprozess zusätzlich
-zum Kopplungs-Worker: unbelegt, nicht gemessen).
+tragen (der volle Baum `python/sglang` der Revision, wie bei `stage_profil_modules.sh`).
+
+**Speicher des Orakel-Kindprozesses (GEMESSEN 06.10., Review AP-D):** ein voller NF-Trockenlauf auf dem Referenz-Rig (`nf-int4-h6-abl`, NVML-Replay) braucht
+in der Spitze **1,75 GiB RSS** (`/usr/bin/time -v`: Maximum resident set size 1789432 kB; 47,98 s unter CPUQuota 200%). Gegen `MemoryMax=2G` der Unit
+(MemoryCurrent dort 409 MB) ginge das nicht. Darum startet der Dienst den Kindprozess in einem EIGENEN Scope: `--oracle-prefix auto` (Standard; Env
+`RIGDASH_ORACLE_PREFIX`) = `systemd-run --scope -q -p MemoryMax=4G`, der Scope zählt nicht gegen die Unit. `none` startet ohne Rahmen, jeder andere Wert ist
+der Befehlspräfix selbst. Scheitert der Präfix sofort (kein `systemd-run`, kein D-Bus), läuft der Kindprozess einmal ohne ihn
+(`OracleService.prefix_fallback`); dann gilt wieder die Unit-Grenze. Die Unit-Datei trägt `MemoryMax=2G` (Kopplungs-Worker, 612 MiB RSS, s. o.).
 
 ### Speicher und Stufen
 

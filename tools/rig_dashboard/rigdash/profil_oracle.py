@@ -21,7 +21,7 @@ import json
 import os
 import threading
 from collections import OrderedDict
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .profil_recompute import CouplingsService
 
@@ -31,6 +31,18 @@ WORKER = os.path.join(os.path.dirname(HERE), "kartenplan_build", "oracle_worker.
 TIMEOUT_S = 300.0
 START_TIMEOUT_S = 180.0
 CACHE_SIZE = 48
+#: Speicherrahmen des Kindprozesses.  GEMESSEN 06.10. (Review AP-D): ein voller NF-Trockenlauf auf dem Referenz-Rig braucht in der Spitze
+#: 1,75 GiB RSS (1789432 kB, 48 s); die Unit hat MemoryMax=2G und belegt ~0,4 GiB -- im Unit-cgroup kaeme es zum OOM.  Darum ein EIGENER Scope
+#: (``systemd-run --scope``), 4 GiB Luft ueber der Spitze; er zaehlt nicht gegen die Unit.
+ORACLE_SCOPE_MEMORY = "4G"
+ORACLE_PREFIX = ("systemd-run", "--scope", "-q", "-p", "MemoryMax=" + ORACLE_SCOPE_MEMORY)
+
+
+def default_prefix() -> List[str]:
+    """Der Scope-Praefix, wenn ``systemd-run`` da ist, sonst leer (Entwicklungsbox ohne systemd: Kindprozess ohne eigenen Rahmen)."""
+    import shutil
+    exe = shutil.which("systemd-run")
+    return [exe] + list(ORACLE_PREFIX[1:]) if exe else []
 #: die Quellen, von denen ein Verdikt abhaengt (relativ zu ``<Baum>/sglang/srt/weg2/``)
 SOURCES = ("launcher.py", "refusals.py", "hw_fit.py", "topology.py", "propose.py", "propose_rules.py", "propose_oracle.py",
            "propose_verdict.py", "card_identity.py", "model_profile.py", "profile_json.py")
@@ -56,8 +68,9 @@ class OracleService(CouplingsService):
     """Orakel-Worker + Cache (siehe Modulkopf).  ``ask(kind, req, parts)``: ``kind`` ``verdikt`` | ``propose``."""
 
     def __init__(self, tree_python: Optional[str], python: Optional[str] = None, worker: str = WORKER, timeout_s: float = TIMEOUT_S,
-                 start_timeout_s: float = START_TIMEOUT_S, cache_size: int = CACHE_SIZE, request_extra: Optional[Mapping[str, Any]] = None):
-        super().__init__(tree_python, python=python, worker=worker, timeout_s=timeout_s, start_timeout_s=start_timeout_s)
+                 start_timeout_s: float = START_TIMEOUT_S, cache_size: int = CACHE_SIZE, request_extra: Optional[Mapping[str, Any]] = None,
+                 prefix: Optional[Sequence[str]] = None):
+        super().__init__(tree_python, python=python, worker=worker, timeout_s=timeout_s, start_timeout_s=start_timeout_s, prefix=prefix)
         #: Felder, die jede Anfrage zusaetzlich traegt (z. B. ``snapshots``: Kopf-Snapshots fuer leere Modell-Mountpunkte einer Entwicklungs-Box);
         #: sie gehoeren zum Cache-Schluessel
         self.request_extra: Dict[str, Any] = dict(request_extra or {})

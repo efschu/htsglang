@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
@@ -303,6 +304,63 @@ class OracleServiceCache(unittest.TestCase):
         res = svc.ask("verdikt", {}, {"p": 1})                                # no such python: the service says so
         self.assertFalse(res["ok"])
         self.assertIn("/nowhere/python", res["error"])
+
+
+class OracleChildScope(unittest.TestCase):
+    """Review AP-D 1: der Kindprozess laeuft hinter einem Befehlspraefix (eigener cgroup-Scope), faellt bei einem kaputten Praefix einmal zurueck."""
+
+    WORKER = (
+        "import json, os, sys\n"
+        "print(json.dumps({'ok': True}), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    r = json.loads(line)\n"
+        "    print(json.dumps({'id': r['id'], 'ok': True, 'prefix_seen': os.environ.get('ORACLE_PREFIX_SEEN')}), flush=True)\n")
+
+    def _worker(self):
+        d = tempfile.mkdtemp(prefix="oracle-scope-")
+        self.addCleanup(shutil.rmtree, d, True)
+        w = os.path.join(d, "w.py")
+        with open(w, "w") as fh:
+            fh.write(self.WORKER)
+        return w
+
+    def _svc(self, prefix):
+        svc = ORA.OracleService(FIXTURE_TREE, python=sys.executable, worker=self._worker(), start_timeout_s=20, timeout_s=20, prefix=prefix)
+        self.addCleanup(svc._stop)
+        return svc
+
+    def test_the_child_starts_behind_the_prefix(self):
+        svc = self._svc(["env", "ORACLE_PREFIX_SEEN=1"])
+        # the child's env is scrubbed by _env(); the prefix process is the one that sets it for the command it execs
+        r = svc.request({"what": "ping"})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["prefix_seen"], "1")
+        self.assertFalse(svc.prefix_fallback)
+
+    def test_a_broken_prefix_falls_back_once_and_says_so(self):
+        for prefix in (["/nonexistent/prefix-cmd"], ["false"]):
+            svc = self._svc(prefix)
+            r = svc.request({"what": "ping"})
+            self.assertTrue(r["ok"], (prefix, r))
+            self.assertIsNone(r["prefix_seen"])
+            self.assertTrue(svc.prefix_fallback)
+
+    def test_no_prefix_is_the_old_start(self):
+        svc = self._svc(None)
+        self.assertEqual(svc.prefix, [])
+        self.assertTrue(svc.request({"what": "ping"})["ok"])
+        self.assertFalse(svc.prefix_fallback)
+
+    def test_the_default_prefix_is_an_own_scope_above_the_measured_peak(self):
+        # peak RSS of a full NF dry run on the reference rig, measured 06.10. (review AP-D): 1789432 kB
+        self.assertEqual(ORA.ORACLE_PREFIX[:3], ("systemd-run", "--scope", "-q"))
+        limit = [a for a in ORA.ORACLE_PREFIX if a.startswith("MemoryMax=")][0]
+        self.assertEqual(limit, "MemoryMax=4G")
+        self.assertGreater(4 * 1024 * 1024, 1789432)
+        with mock.patch("shutil.which", return_value=None):
+            self.assertEqual(ORA.default_prefix(), [])
+        with mock.patch("shutil.which", return_value="/usr/bin/systemd-run"):
+            self.assertEqual(ORA.default_prefix()[0], "/usr/bin/systemd-run")
 
 
 class ProposeRequests(unittest.TestCase):
