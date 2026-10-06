@@ -18,15 +18,17 @@ What lives here, by criterion of the plan (section 1.2):
 * **K3 draft**       :func:`draft_placement` -- ``solo`` on rank 0 when draft + dense weights + the KV obligation fit rank 0,
   else ``split`` and a hint.
 * **K4 rest rules**  :func:`fr_p` (MoE: whatever a P stage has left goes to resident experts), :func:`form_a_d` (MoE: the
-  Form A solve ``form_a_plan.solve_form_a``: host + expert workers), :func:`dense_d_shares` (dense: TP shares proportional to
+  Form A solve ``form_a_plan.solve_form_a``: host + expert workers; FR_D capped per rank at the largest fraction WITH a
+  Platztausch buffer, :func:`fr_d_with_buffer`, AP2b 1006), :func:`dense_d_shares` (dense: TP shares proportional to
   the VRAM budget), :func:`mamba_slots_p` / :func:`mamba_slots_d` (the "Sitze gleichzeitig" regulator).
 
 Nothing here chooses a value the launcher solves itself at boot (the exact layer cut under ``--pp-solve-objective``, the
 D rank VRAM fractions, the KV cut): those the launcher prints in its plan (stage B, the oracle).  A seed that is not applied
 is shown, not hidden.
 
-STDLIB ONLY at module level; ``card_identity`` / ``hw_fit`` / ``form_a_plan`` / ``planner.card_library`` are imported inside
-the functions that need them (all four are stdlib/msgspec-only, none imports torch).
+STDLIB ONLY at module level; ``card_identity`` / ``hw_fit`` / ``form_a_plan`` / ``planner.card_library`` /
+``planner.expert_residency`` are imported inside the functions that need them (all five are stdlib/msgspec-only, none
+imports torch).
 """
 
 from __future__ import annotations
@@ -496,11 +498,50 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
         plan = FA.solve_form_a(cb, posts, geom)
     except FA.FormAInfeasible as exc:
         return {"ok": False, "error": "der Form-A-Loeser findet keine Aufteilung (%s: %s)" % (type(exc).__name__, exc), "unbelegt": unb}
+    fr, caps, capped = fr_d_with_buffer(plan.resident_fraction, plan.owned, geom.pad_experts_per_rank)
     return {"ok": True, "error": "", "role": ["host"] + ["worker"] * (n - 1), "tp_ratio": [1] + [0] * (n - 1),
             "moe_ratio": [int(o) for o in plan.owned],
-            "fr": [round(math.floor(f * 1000.0) / 1000.0, 3) for f in plan.resident_fraction],
+            "fr": fr, "fr_cap": caps, "fr_capped": capped,
+            "fr_raw": [round(math.floor(f * 1000.0) / 1000.0, 3) for f in plan.resident_fraction],
             "capacity": [int(c) for c in plan.capacity], "owned": [int(o) for o in plan.owned],
             "host_breakdown": dict(plan.host_breakdown), "unbelegt": unb}
+
+
+def fr_d_with_buffer(fractions: Sequence[float], owned: Sequence[int], pad: int = 1
+                     ) -> Tuple[List[float], List[Optional[float]], List[int]]:
+    """FR_D je D-Rang, auf die groesste Fraction MIT Platztausch-Puffer begrenzt.
+
+    Form A gibt einem Rang, dessen Karte seinen ganzen Experten-Anteil fasst, den Anteil 1.000 (``min(capacity, owned) /
+    owned``) -- am Orakel: 4 Karten (2x RTX 5090 + 2x RTX 3080, 4x RTX 3090) ergeben FR_D 1.000 auf jedem Rang.  Ein Rang
+    ohne zwei Scratch-Zeilen baut keinen Platztausch-Puffer, und der Launcher verweigert das zu Recht (W120
+    Weg2PlatztauschBufferUnbuilt, "groesste Fraction mit Puffer 0.978").  Die Obergrenze gehoert deshalb in den Vorschlag,
+    nicht in die Verweigerung (die bleibt als Schutz): je Rang ``expert_residency.d_rank_fraction_caps`` (lokale Zeilen =
+    owned + Pad-Experte, dieselbe Zaehlung wie ``expert_map.unbuilt_platztausch_buffers``).  Keine Reserve: die zwei Zeilen
+    sind der Puffer selbst.  Rueckgabe ``(fr, caps, capped)`` -- ``fr`` auf 3 Stellen abgerundet, ``caps`` die Obergrenze je
+    Rang (None: der Rang baut bei keiner Fraction einen Puffer), ``capped`` die Raenge, die die Grenze beschnitten hat."""
+    from sglang.srt.planner import expert_residency as ER
+
+    caps = ER.d_rank_fraction_caps([int(o) for o in owned], int(pad))
+    out: List[float] = []
+    capped: List[int] = []
+    for i, f in enumerate(fractions):
+        v = round(math.floor(float(f) * 1000.0) / 1000.0, 3)
+        c = caps[i] if i < len(caps) else None
+        if c is not None and v > c:
+            v = float(c)
+            capped.append(i)
+        out.append(v)
+    return out, caps, capped
+
+
+def fr_d_cap_note(fa: Mapping[str, Any]) -> str:
+    """Der Begruendungstext eines beschnittenen FR_D-Vektors ("" ohne Beschnitt): Rang, Form-A-Wert, Obergrenze."""
+    capped = list(fa.get("fr_capped") or [])
+    if not capped:
+        return ""
+    raw, fr = fa.get("fr_raw") or [], fa.get("fr") or []
+    return ("; je Rang hoechstens die groesste Fraction mit Platztausch-Puffer (zwei Scratch-Zeilen je Layer, sonst verweigert "
+            "der Launcher W120): " + ", ".join("Rang %d %.3f -> %.3f" % (i, raw[i], fr[i]) for i in capped))
 
 
 # ---------------------------------------------------------------------------

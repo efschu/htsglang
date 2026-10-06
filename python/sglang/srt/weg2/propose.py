@@ -713,7 +713,8 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                                                               "Slots kauft residente Experten (hw_fit-Terme)" % kv_tokens)
         elif fa is not None and fa["ok"]:
             if pol == "fr_d":
-                new, why = ",".join("%.3f" % f for f in fa["fr"]), "Form-A-Loesung: residenter Anteil der eigenen Experten je Rang"
+                new, why = ",".join("%.3f" % f for f in fa["fr"]), ("Form-A-Loesung: residenter Anteil der eigenen Experten je "
+                                                                   "Rang" + R.fr_d_cap_note(fa))
             elif pol == "moe_ratio":
                 new, why = R.csv(fa["moe_ratio"]), "Form-A-Loesung: Experten-Eigentum je Rang (Kapazitaet + Spill nach PCIe-Rate)"
             elif pol == "role":
@@ -778,7 +779,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                                     ("tp_ratio", "--rank-tp-ratio", R.csv(fa["tp_ratio"]), "Form A: nur der Host traegt dichte Gewichte"),
                                     ("moe_ratio", "--rank-moe-ratio", R.csv(fa["moe_ratio"]), "Form-A-Loesung: Experten-Eigentum"),
                                     ("fr_d", "--rank-moe-resident-fraction", ",".join("%.3f" % f for f in fa["fr"]),
-                                     "Form-A-Loesung: residenter Anteil")):
+                                     "Form-A-Loesung: residenter Anteil" + R.fr_d_cap_note(fa))):
             la.extra_set("d", flag, val)
             rec.add("--extra-d " + flag, group="d", old=None, new=val, state=R.UNBELEGT if pol in ("moe_ratio", "fr_d") else R.VORGESCHLAGEN,
                     herkunft="Regel Form A: Aufteilung der D-Raenge (MoE)", grund=why, policy=pol)
