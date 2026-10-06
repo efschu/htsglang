@@ -79,7 +79,12 @@ def test_the_wake_starts_only_host_planned_layers(ops):
     assert ops.events == [] and not fill.started and fill.pending == [d]
 
 
-def test_dormant_group_issues_nothing_the_open_one_issues_once(ops):
+_PER_LAYER = "SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER"
+
+
+def _group_opens_and_the_first_extend_ticks(ops):
+    """The #284b half every form shares: dormant -> nothing issued; kv cleared ->
+    the rows go once, nobody waits them (idempotent). Returns (cache, fill)."""
     c = _cache()
     c.rearm_after_wake(defer=HOST)
     fill = eo.deferred_rows_fill()
@@ -91,8 +96,27 @@ def test_dormant_group_issues_nothing_the_open_one_issues_once(ops):
     assert len(ops.events) == 1 and ops.waited == [] and fill.started
     assert _manager(dormant=False)() is False  # idempotent
     assert len(ops.events) == 1
-    eo.deferred_rows_tick(_extend())  # P's first forward waits the event
+    eo.deferred_rows_tick(_extend())  # P's first forward: an extend
+    return c, fill
+
+
+def test_dormant_group_issues_nothing_the_open_one_issues_once(ops):
+    """FLIPCYCLE H2 (02.10., default): P's first extend does NOT wait the rows still
+    in flight (layer 0 computes while later rows stream); each layer's own
+    ``land_deferred_rows`` makes the forward stream wait THAT layer's event."""
+    c, fill = _group_opens_and_the_first_extend_ticks(ops)
+    assert ops.waited == [] and fill.pending == [c]  # tick: nothing landed yet
+    assert c.land_deferred_rows() is True  # this layer's MoE: waits its own event
     assert ops.waited == ops.events and not fill.pending
+    assert _rows_digest(c) == _rows_digest(_serial())
+
+
+def test_dormant_group_open_one_waits_the_whole_forward_when_per_layer_is_off(ops, monkeypatch):
+    """The pre-H2 form, kept behind its switch (SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER=0):
+    the first extend's tick makes the forward stream wait every early layer."""
+    monkeypatch.setenv(_PER_LAYER, "0")
+    c, fill = _group_opens_and_the_first_extend_ticks(ops)
+    assert ops.waited == ops.events and not fill.pending  # P's first forward waits the event
     assert _rows_digest(c) == _rows_digest(_serial())
 
 
@@ -107,6 +131,21 @@ def test_no_scheduler_issues_nothing(ops):
 
 
 def test_tick_backstop_starts_and_lands_when_the_wake_never_did(ops):
+    """The first tick starts the fill itself; since H2 the layer lands it in its MoE."""
+    c = _cache(pool=True)
+    c.rearm_after_wake(defer=HOST)
+    eo.deferred_rows_tick(_extend())
+    assert len(ops.events) == 1 and ops.waited == []  # started by the tick, not waited yet
+    assert c._deferred_rows is not None and eo.deferred_rows_fill().pending == [c]
+    assert c.land_deferred_rows() is True
+    assert ops.waited == ops.events
+    assert c._deferred_rows is None and not eo.deferred_rows_fill().pending
+    assert _rows_digest(c) == _rows_digest(_serial(pool=True))
+
+
+def test_tick_backstop_waits_the_whole_forward_when_per_layer_is_off(ops, monkeypatch):
+    """Pre-H2 form behind SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER=0."""
+    monkeypatch.setenv(_PER_LAYER, "0")
     c = _cache(pool=True)
     c.rearm_after_wake(defer=HOST)
     eo.deferred_rows_tick(_extend())
