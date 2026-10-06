@@ -94,6 +94,8 @@ from sglang.srt.weg2 import shared_cache_release as shared_cache_release_mod
 from sglang.srt.weg2 import state_file as state_file_mod
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
 from sglang.srt.weg2 import form as weg2_form
+# X-CURVES 1006: --x-mode / --x-curves (X per request from profile curves).
+from sglang.srt.weg2 import x_curves as weg2_x_curves
 # L15 (1.5-stage KV post) is a 27B-line feature: that tree ships
 # weg2/l15_plan.py. On the NF release it lives in front.py and is off by
 # default, so this import is absent here; the guards below degrade to the
@@ -4036,6 +4038,25 @@ def resolve_x_ceiling(ceiling_flag: Optional[int], x_tokens: int,
         f"{ceiling}: the live X re-solves within [{CHUNKED_PREFILL_TOKENS}, {ceiling}] and a request "
         f"between {x if x_busy is None else min(int(x_busy), x)} and the live X goes to D only as a "
         f"singleton (WEG2 X-SOLO); group P unchanged{busy}")
+def resolve_x_mode_launch(ns, cards, x_tokens: int) -> "weg2_x_curves.XModeLaunch":
+    """X-CURVES 1006: ``--x-mode`` / ``--x-curves`` / ``--x-curves-beyond``
+    resolved ONCE, before D's riegel: the words checked, the curve file loaded
+    and checked against THIS boot's checkpoint, form and live cards. A
+    refusal is a SystemExit naming its W-code (W190..W196), like W155 beside
+    it -- main() keeps its zero try/except law. No flag = the live mode and
+    every argv / line byte-identical."""
+    boot_form = ns.weg2_boot_form
+    try:
+        return weg2_x_curves.resolve_launch(
+            mode=ns.x_mode, curves_path=ns.x_curves, beyond=ns.x_curves_beyond,
+            ceiling_flag=ns.x_ceiling_tokens, x_tokens=int(x_tokens),
+            model=weg2_form.model_key(ns.model),
+            form=weg2_x_curves.form_axes_of(boot_form) if boot_form is not None else "",
+            hardware=",".join(card_identity.inventory_signature(cards)))
+    except weg2_x_curves.XCurvesRefused as e:
+        raise SystemExit(str(e)) from e
+
+
 #: RC2 review (L1): the name a --d-short-drain-tokens above X is refused with.
 SHORT_DRAIN_ABOVE_X_NAME = "W153 Weg2ShortDrainAboveX"
 
@@ -22061,6 +22082,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "rise up to it; a request between the start X and the live X goes to D "
                          "only when nothing else is in flight (WEG2 X-SOLO). Lifted to the start X "
                          "when below it. Group P is not affected.")
+    ap.add_argument("--x-mode", choices=weg2_x_curves.X_MODES, default=None,
+                    help="X-CURVES 1006 (user 06.10.: only fixed and curve): how the front sets X. "
+                         "fixed = --tp-prefill-max-tokens for the whole boot, no live re-solve; curve = "
+                         "X PER REQUEST from --x-curves (the D/P prefill curves and the flip price of "
+                         "this model x form x hardware); --x-ceiling-tokens beside it clamps X from "
+                         "above (user 06.10.), D's W50 riegel = the LOWER of the curves' envelope and "
+                         "that ceiling. Unset = the front exactly as before the flag, argv "
+                         "byte-identical.")
+    ap.add_argument("--x-curves", default=None,
+                    help="X-CURVES: the curve file (weg2-x-curves/1, tools/build_x_curves.py). Only "
+                         "with --x-mode curve (W194 otherwise); absent/unreadable W190, "
+                         "malformed W191, another model/form/hardware W192 -- refused at launch.")
+    ap.add_argument("--x-curves-beyond", choices=weg2_x_curves.BEYOND_POLICIES, default=None,
+                    help="X-CURVES: a request deeper than the curves reach: clamp (default, priced at "
+                         "the deepest row and named) or refuse (W193 at the front).")
     ap.add_argument("--x-busy-tokens", type=int, default=None,
                     help="27B RC7-X / UNIFY S4: the floor of the front's X-SOLO band -- up to it "
                          "D prefills a SHORT request while it decodes others, above it (up to the "
@@ -24446,9 +24482,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     x_seed = resolve_x(ns.tp_prefill_max_tokens or None, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS,
                        accept=calib_log_accept_of(ns))
     x_tokens, x_provenance = x_seed.tokens, x_seed.provenance
+    # X-CURVES 1006: the X mode, checked before D's riegel is fixed (curve: the
+    # riegel admits the curves' envelope). No --x-mode: the ceiling flag as is.
+    x_mode_launch = resolve_x_mode_launch(ns, cards, x_tokens)
     # H84: D's riegel and the front's live-X ceiling, one number (0 = off).
     d_x_tokens, front_x_ceiling, x_ceiling_line = resolve_x_ceiling(
-        ns.x_ceiling_tokens, x_tokens, getattr(ns, "x_busy_tokens", None))
+        x_mode_launch.ceiling_for_d, x_tokens, getattr(ns, "x_busy_tokens", None))
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
     if int(ns.d_short_drain_tokens or 0) < 0 or (ns.d_hold_s is not None and float(ns.d_hold_s) < 0):
@@ -24476,8 +24515,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"--drain-deadline-s {ns.drain_deadline_s}; --min-dwell-ms "
         f"{'derived from the last flip in that direction' if ns.min_dwell_ms is None else ns.min_dwell_ms}")
     log(f"X PROVENANCE: {x_provenance}; --flip-min-work-tokens {flip_min_work_tokens} "
-        f"({'= X, the same break-even at aggregate granularity' if ns.flip_min_work_tokens is None else 'operator override'})")
-    log(x_ceiling_line)
+        f"({'= X, the same break-even at aggregate granularity' if ns.flip_min_work_tokens is None else 'operator override'})"
+        f"{x_mode_launch.provenance}")
+    log(x_ceiling_line + x_mode_launch.ceiling_note)
+    if x_mode_launch.given:
+        log(x_mode_launch.line)
     log(f"IDLE POLICY (27B, user order 2026-09-24): (a) --idle-layout {ns.idle_layout} -> the "
         f"front rests on {idle_layout_front}; (b) --d-short-drain-tokens "
         f"{int(ns.d_short_drain_tokens or 0)} ({'off' if not ns.d_short_drain_tokens else 'a queued SHORT-only backlog up to this many tokens is served on D, each request <= X=' + str(x_tokens)}); "
@@ -26402,7 +26444,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             flip_min_work_tokens, idle_layout_front, admin_key_file=admin_key_file,
             wake_credit_plan=_WAKE_CREDIT_FRONT_PLAN,
             anon_preboot_bytes=anon_preboot_bytes, front_host=ns.front_host,
-            x_ceiling_tokens=front_x_ceiling)))
+            x_ceiling_tokens=front_x_ceiling, x_mode_argv=x_mode_launch.front_argv)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
     # BOOTZEIT 3 (--weg2-d-early-start): D starts NOW, planned from the
@@ -26898,6 +26940,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         anon_preboot_bytes=anon_preboot_bytes,
         front_host=ns.front_host,
         x_ceiling_tokens=front_x_ceiling,
+        x_mode_argv=x_mode_launch.front_argv,
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -27148,7 +27191,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
                    admin_key_file: str = "",
                    anon_preboot_bytes: int = 0,
                    front_host: str = DEFAULT_FRONT_HOST,
-                   x_ceiling_tokens: int = 0) -> List[str]:
+                   x_ceiling_tokens: int = 0,
+                   x_mode_argv: Sequence[str] = ()) -> List[str]:
     """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
 
     C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
@@ -27201,6 +27245,9 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         argv += ["--x-ceiling-tokens", str(int(x_ceiling_tokens))]
     if getattr(ns, "x_busy_tokens", None) is not None:
         argv += ["--x-busy-tokens", str(int(ns.x_busy_tokens))]
+    # X-CURVES 1006: --x-mode / --x-curves / --x-curves-beyond, each only when
+    # given (resolve_x_mode_launch); none = the argv byte-identical.
+    argv += list(x_mode_argv)
     # #1269 fix 4 follow-up: THE PRE-BOOT ANON BASELINE, MEASURED ONCE AND
     # CARRIED. The W22 guard splits its reading into `sglang=` and `foreign=`
     # by subtracting this baseline, and the split is only subtractable because
