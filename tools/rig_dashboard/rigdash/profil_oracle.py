@@ -45,7 +45,7 @@ def default_prefix() -> List[str]:
     return [exe] + list(ORACLE_PREFIX[1:]) if exe else []
 #: die Quellen, von denen ein Verdikt abhaengt (relativ zu ``<Baum>/sglang/srt/weg2/``)
 SOURCES = ("launcher.py", "refusals.py", "hw_fit.py", "topology.py", "propose.py", "propose_rules.py", "propose_oracle.py",
-           "propose_verdict.py", "card_identity.py", "model_profile.py", "profile_json.py")
+           "propose_dual.py", "dual_layout_plan.py", "propose_verdict.py", "card_identity.py", "model_profile.py", "profile_json.py")
 
 
 def canonical(obj: Any) -> str:
