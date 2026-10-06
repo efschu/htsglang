@@ -8,6 +8,8 @@
      <script>HwProfil.mount(document.getElementById("hwprofil-root"));</script>
 
    HwProfil.render(antwort, {now}) liefert dasselbe als HTML-Text (ohne DOM, ohne Netz) für Tests und Einbettung.
+   Gespeichert (AP-A): der Dienst legt das Profil beim ersten Start ab (antwort.persist); die Seite zeigt den Zustand, "Neu erfassen"
+   ersetzt die Datei (auch in der Release-Ausgabe: kein GPU-Fenster), "Issue-Text" holt den Markdown-Block zum Kopieren.
    Jeder Wert trägt seine Quelle als Marke: gemessen / NVML / Datenblatt / geschätzt; ein Wert ohne Messung steht als
    "nicht gemessen" mit dem Grund im Hover, nie als Zahl.  Nur im Rig-Dashboard (Edition rig, nur LAN). */
 (function (root) {
@@ -19,7 +21,9 @@
     + ".hwp th:first-child,.hwp td:first-child{text-align:left}.hwp h4{margin:1em 0 .2em}"
     + ".hwp .hwp-x{opacity:.6;font-style:italic}.hwp sup{font-size:.7em;opacity:.7;margin-left:2px}"
     + ".hwp .hwp-e{font-style:italic}.hwp .hwp-warn{color:var(--hwp-warn,#b45309)}.hwp .hwp-sec td{font-weight:600;background:var(--hwp-sec,#8882)}"
-    + ".hwp .hwp-bar{display:flex;gap:1em;flex-wrap:wrap;align-items:center;margin:.4em 0}.hwp .hwp-msg{margin:.4em 0}";
+    + ".hwp .hwp-bar{display:flex;gap:1em;flex-wrap:wrap;align-items:center;margin:.4em 0}.hwp .hwp-msg{margin:.4em 0}"
+    + ".hwp .hwp-chip{display:inline-block;border:1px solid var(--hwp-line,#8884);border-radius:9px;padding:0 7px;font-size:.85em;margin-left:4px}"
+    + ".hwp .hwp-issue{width:100%;min-height:14em;font:12px/1.4 ui-monospace,monospace;box-sizing:border-box}";
 
   function age(at, now) {
     if (at == null) return "";
@@ -49,11 +53,17 @@
     const sec = (t) => '<tr class="hwp-sec"><td colspan="' + (cs.length + 1) + '">' + esc(t) + "</td></tr>";
     let h = "<table><thead><tr><th>Karte</th>" + cs.map((c) => "<th>" + c.ord + " · NVML " + c.nvml_index + "<br>" + esc(c.name.replace(/^NVIDIA (GeForce )?/, "")) + "</th>").join("") + "</tr></thead><tbody>";
     h += row("Klasse", (c) => esc(c.class_key)) + row("Compute Capability", (c) => esc((c.cc || []).join(".")));
+    if (cs.some((c) => "catalog" in c)) h += row("Katalogkarte", (c) => catalogCell(c.catalog));
     h += row("SM-Zahl", (c) => cell(c.sm_count, 0, o)) + row("L2-Größe", (c) => cell(c.l2_mib, 1, o));
     h += sec("Speicher");
     h += row("Größe", (c) => cell(c.vram_total_mib, 0, o)) + row("BAR1", (c) => cell(c.bar1_total_mib, 0, o));
     h += row("Bandbreite lesen", (c) => cell(c.mem_gbs.read, 0, o)) + row("Bandbreite kopieren (D2D)", (c) => cell(c.mem_gbs.copy, 0, o));
     h += row("Bandbreite GEMV (Decode)", (c) => cell(c.mem_gbs.gemv, 0, o)) + row("Datenblatt-Spitze", (c) => cell(c.mem_gbs.nameplate, 0, o));
+    if (cs.some((c) => c.mem_gbs && "nominal" in c.mem_gbs)) h += row("Nennbandbreite (Katalog)", (c) => cell(c.mem_gbs.nominal, 0, o));
+    if (cs.some((c) => c.clocks)) {
+      h += row("SM-Takt max.", (c) => cell(c.clocks && c.clocks.sm_max_mhz, 0, o)) + row("Speichertakt max.", (c) => cell(c.clocks && c.clocks.mem_max_mhz, 0, o));
+      h += row("Speicher-Busbreite", (c) => cell(c.mem_bus_bits, 0, o));
+    }
     h += sec("Rechenleistung je Format (Prefill-Form)");
     (doc.formats || []).forEach((f) => { h += row(f.label, (c) => cell(c.compute[f.key], 1, o)); });
     h += sec("Host-Übertragung (gepinnt, 64 MiB / 4 kB)");
@@ -68,6 +78,28 @@
     h += row("Gemessen", (c) => c.probed_at == null ? '<span class="hwp-x">noch nie</span>'
       : esc(age(c.probed_at, o.now)) + (c.stale ? ' <span class="hwp-warn">veraltet</span>' : "") + (c.driver_mismatch ? ' <span class="hwp-warn" title="Treiber der Messung: ' + esc(c.driver_mismatch.probe) + ', jetzt: ' + esc(c.driver_mismatch.live) + '">Treiber geändert</span>' : ""));
     return h + "</tbody></table>";
+  }
+
+  /* Katalogkarte einer NVML-Karte mit der Herkunft ihrer Datenblattwerte (measured_on_rig / Datenblatt / borrowed-unbelegt). */
+  function catalogCell(k) {
+    if (!k) return '<span class="hwp-x" title="kein Katalogeintrag mit diesem NVML-Namen und dieser Größe">kein Eintrag</span>';
+    const of = k.origin_fields || {};
+    const tip = "Herkunft: " + (k.origin_label || k.origin || "") + (of.mem_bw && of.mem_bw !== k.origin ? " · Nennbandbreite: " + of.mem_bw : "");
+    return esc(k.label || k.id) + '<span class="hwp-chip" title="' + esc(tip) + '">' + esc(k.origin || "?") + "</span>"
+      + (of.mem_bw === "borrowed-unbelegt" ? '<span class="hwp-chip hwp-warn" title="Nennbandbreite von einer anderen Variante geborgt, nicht belegt">Bandbreite borgt</span>' : "");
+  }
+
+  /* Zustand der gespeicherten Datei (antwort.persist).  Kein Pfad: der Ort ist Sache des Betreibers. */
+  function persistLine(r, o) {
+    const p = r && r.persist;
+    if (!p || !p.enabled) return '<p class="hwp-msg hwp-x">Das Profil wird in dieser Ausgabe nicht gespeichert (kein Speicherort eingerichtet).</p>';
+    const bad = p.state === "abweichend" || p.state === "nicht_schreibbar" || p.state === "keine_karten";
+    let h = '<p class="hwp-msg' + (bad ? " hwp-warn" : "") + '">Gespeichertes Profil: <b>' + esc(p.label || p.state) + "</b>"
+      + (p.captured_at != null ? " · erfasst " + esc(age(p.captured_at, o && o.now)) : "") + (p.reason ? " (" + esc(p.reason) + ")" : "")
+      + (p.id ? ' · <span title="' + esc(p.id) + '">ID ' + esc(String(p.id).slice(7, 19)) + "</span>" : "") + "</p>";
+    ((p.drift && p.drift.changes) || []).forEach((x) => { h += '<div class="hwp-msg hwp-warn">' + esc(x) + "</div>"; });
+    if (p.error) h += '<div class="hwp-msg hwp-warn">' + esc(p.error) + "</div>";
+    return h;
   }
 
   /* Paarmatrix je Transportweg: Zeile = Quelle, Spalte = Ziel (geordnet: beide Richtungen eigene Zahlen). */
@@ -125,7 +157,7 @@
     if (!r || r.ok === false) return '<div class="hwp"><p class="hwp-msg hwp-warn">' + esc((r && r.error) || "keine Antwort") + "</p></div>";
     const doc = r.profile;
     return '<div class="hwp"><style>' + CSS + "</style><h4>Hardwareprofil</h4>" + cardsTable(doc, o)
-      + "<h4>Paarmatrix (geordnet)</h4>" + pairTables(doc, o) + sourcesLine(doc, o) + windowLine(r)
+      + "<h4>Paarmatrix (geordnet)</h4>" + pairTables(doc, o) + sourcesLine(doc, o) + persistLine(r, o) + windowLine(r)
       + ((r.problems || []).length ? '<p class="hwp-msg hwp-warn">Profilprüfung: ' + esc(r.problems.join("; ")) + "</p>" : "") + "</div>";
   }
 
@@ -144,7 +176,7 @@
     const edition = opts.edition || (typeof document !== "undefined" && document.documentElement && document.documentElement.getAttribute
       && document.documentElement.getAttribute("data-edition")) || "rig";
     const noMeasure = edition === "release";
-    const st = { last: null, sel: null, busy: false, msg: "" };
+    const st = { last: null, sel: null, busy: false, msg: "", issue: null };
     async function refresh() { st.last = await call(api); paint(); }
     function paint() {
       const r = st.last;
@@ -157,10 +189,16 @@
         : ' <button type="button" data-act="measure"' + (st.busy || !st.sel.length ? " disabled" : "") + ">Hardwareprofil messen</button>";
       const bar = '<div class="hwp hwp-bar">' + box + measureUi
         + ' <button type="button" data-act="refresh">Aktualisieren</button>'
+        + (r && r.persist && r.persist.enabled ? ' <button type="button" data-act="recapture" title="NVML neu lesen und das gespeicherte Hardwareprofil ersetzen (kein GPU-Fenster)"' + (st.busy ? " disabled" : "") + ">Neu erfassen</button>" : "")
+        + ' <button type="button" data-act="issue" title="Hardwareprofil als Markdown-Block zum Einfügen in ein GitHub-Issue">Issue-Text (Hardwareprofil)</button>'
         + (!noMeasure && r && r.window && r.window.state === "pending" ? ' <button type="button" data-act="cancel">Wartendes Fenster zurückgeben</button>' : "")
         + (st.msg ? " <span>" + esc(st.msg) + "</span>" : "")
         + (r && r.profile && r.profile.measure_needed ? ' <span class="hwp-warn">Es fehlen Messwerte.</span>' : "") + "</div>";
-      el.innerHTML = bar + render(r, {});
+      const issue = st.issue == null ? "" : '<div class="hwp"><h4>Issue-Text: Hardwareprofil</h4><p class="hwp-msg">Markdown zum Einfügen in ein GitHub-Issue. Geheimnisse und Pfade des Rechners sind entfernt; '
+        + 'UUID und PCI-Bus der Karten stehen drin, damit die Messwerte zuzuordnen sind.</p>'
+        + '<textarea class="hwp-issue" readonly spellcheck="false" aria-label="Issue-Text Hardwareprofil">' + esc(st.issue) + "</textarea>"
+        + '<div class="hwp-bar"><button type="button" data-act="copy">In die Zwischenablage kopieren</button> <button type="button" data-act="issue-close">Schließen</button></div></div>';
+      el.innerHTML = bar + render(r, {}) + issue;
     }
     el.addEventListener("change", (e) => {
       const n = e.target && e.target.getAttribute && e.target.getAttribute("data-nvml");
@@ -172,6 +210,26 @@
       const act = e.target && e.target.getAttribute && e.target.getAttribute("data-act");
       if (!act) return;
       if (act === "refresh") return refresh();
+      if (act === "issue-close") { st.issue = null; return paint(); }
+      if (act === "issue") {
+        const j = await call(api + "/issue");
+        st.issue = j.ok ? j.text : null; st.msg = j.ok ? "" : (j.error || "Issue-Text nicht verfügbar");
+        return paint();
+      }
+      if (act === "copy") {
+        const ta = el.querySelector && el.querySelector("textarea.hwp-issue");
+        try {
+          if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(st.issue || "");
+          else if (ta) { ta.select(); document.execCommand("copy"); }
+          st.msg = "Kopiert.";
+        } catch (err) { if (ta) ta.select(); st.msg = "Kopieren nicht erlaubt: Text ist markiert, bitte Strg+C drücken."; }
+        return paint();
+      }
+      if (act === "recapture") {
+        st.busy = true; paint();
+        try { const res = await call(api + "/recapture", {}); st.msg = res.ok ? "Hardwareprofil neu erfasst." : (res.error || "Neu erfassen fehlgeschlagen"); } finally { st.busy = false; }
+        return refresh();
+      }
       if (noMeasure) return;
       st.busy = true; paint();
       try {

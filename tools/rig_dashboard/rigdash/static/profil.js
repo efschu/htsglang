@@ -63,8 +63,30 @@
   const doDry = () => run(async () => { st.dry = await api("dry", { doc: st.doc, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })) }); });
 
   // ------------------------------------------------------------------ Darstellung
+  // Katalog (AP-A): vorbelegt sind RTX 5090, RTX 3080 20 GB, RTX 3090; die übrigen Karten stehen eingeklappt unter "weitere Karten" mit sichtbarer Herkunft.
+  // Ein Dienst ohne ``preset`` (älterer Stand) zeigt alle Karten wie bisher.
+  const hasPreset = () => st.list.cards.some((c) => "preset" in c);
+  const ORIGIN_TIP = { "measured_on_rig": "am Rig gemessen", "Datenblatt": "Datenblatt (Herstellerangabe, nicht gemessen)", "borrowed-unbelegt": "geborgt von einer anderen Variante, unbelegt" };
   function cardOpts(sel) {
-    return st.list.cards.map((c) => `<option value="${c.id}"${c.id === sel ? " selected" : ""}>${esc(c.label)} · ${c.arch}</option>`).join("");
+    // eine bereits gewählte Karte außerhalb der Vorbelegung bleibt in der Auswahl, sonst verlöre die Zeile ihren Wert
+    const vis = st.list.cards.filter((c) => !hasPreset() || c.preset || c.id === sel);
+    return vis.map((c) => `<option value="${c.id}"${c.id === sel ? " selected" : ""}>${esc(c.label)} · ${c.arch}${c.preset || !hasPreset() ? "" : " · " + esc(c.origin || "")}</option>`).join("");
+  }
+  function drawMoreCards() {
+    if (!hasPreset()) return "";
+    const more = st.list.cards.filter((c) => !c.preset);
+    if (!more.length) return "";
+    const rows = more.map((c) => {
+      const of = c.origin_fields || {};
+      const borrowed = of.mem_bw === "borrowed-unbelegt" ? ' <span class="pf-chip" title="Nennbandbreite von einer anderen Variante geborgt, nicht belegt">Bandbreite geborgt</span>' : "";
+      return `<tr data-id="${esc(c.id)}"><td>${esc(c.label)}</td><td>${esc(c.arch)}</td><td>${Math.round((c.usable_mib || 0) / 1024)} GB</td><td>${esc(String(c.mem_bw_gbs))} GB/s</td>
+        <td><span class="pf-chip" title="${esc(c.origin_label || ORIGIN_TIP[c.origin] || "")}">${esc(c.origin || "")}</span>${borrowed}</td>
+        <td><button type="button" data-act="cadd-id" data-id="${esc(c.id)}"${st.cards.length >= 6 ? " disabled" : ""}>+ hinzufügen</button></td></tr>`;
+    }).join("");
+    return `<details class="pf-fold pf-more" data-fold="cmore" ${isOpen("cmore", false) ? "open" : ""}><summary>weitere Karten (Datenblatt, ohne Messraten)</summary>
+      <div class="muted pf-note">Katalogkarten ohne Messung am Rig: die Werte sind Herstellerangaben (Datenblatt) oder geborgt und stehen als solche da. Das eigene Hardwareprofil mit Messraten
+        steht im Abschnitt Hardware; wer eine andere Karte besitzt, hängt es als Issue-Text an (Knopf dort).</div>
+      <table class="pf-more-t"><thead><tr><th>Karte</th><th>Arch</th><th>VRAM</th><th>Nennbandbreite</th><th>Herkunft</th><th></th></tr></thead><tbody>${rows}</tbody></table></details>`;
   }
   function drawCards() {
     const L = st.list;
@@ -72,6 +94,7 @@
       <select data-cf="card">${cardOpts(k.card)}</select>
       <button type="button" data-act="cdel" title="Karte entfernen" aria-label="Karte ${i + 1} entfernen">&times;</button></div>`).join("");
     return `<div class="pf-cards">${rows}</div>
+      ${drawMoreCards()}
       <div class="pf-row-actions"><button type="button" data-act="cadd"${st.cards.length >= 6 ? " disabled" : ""}>+ Karte</button>
       <button type="button" data-act="cpreset" title="${esc((L.rig_preset || {}).src || "")}">Unser Rig einsetzen</button>
       <button type="button" data-act="dry" class="pf-main"${st.cards.length ? "" : " disabled"}>Trockenlauf: was lehnt der Planer ab?</button></div>`;
@@ -449,6 +472,7 @@
     if (a === "estpath") { const v = (document.getElementById("pf-mpath") || {}).value || ""; if (v.trim()) doEstimate(v.trim()); return; }
     if (a === "dry") return doDry();
     if (a === "cadd") { st.cards.push({ card: st.list.cards[0].id, pcie: { gen: 4, lanes: 8 } }); st.dry = null; return draw(); }
+    if (a === "cadd-id") { if (st.cards.length < 6) st.cards.push({ card: t.dataset.id, pcie: { gen: 4, lanes: 8 } }); st.dry = null; return draw(); }
     if (a === "cdel") { st.cards.splice(+t.closest(".pf-card").dataset.i, 1); st.dry = null; return draw(); }
     if (a === "cpreset") { st.cards = JSON.parse(JSON.stringify((st.list.rig_preset || {}).cards || [])); st.dry = null; return draw(); }
     if (a === "copy") { const x = st.exp; if (x && navigator.clipboard) navigator.clipboard.writeText(x.env).then(() => { st.msg = "Kopiert."; draw(); }); return; }

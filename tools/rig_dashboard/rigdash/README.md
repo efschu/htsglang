@@ -414,6 +414,15 @@ Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `st
   HTTP 409) · `laeuft_bereits`. Das gpuq-Token verlässt den Prozess nie; die Buchung steht zusätzlich in `<state-dir>/hwprofil_window.json`, damit
   ein Neustart ein verwaistes Fenster zurückgibt.
 * `POST /api/hwprofil/cancel` gibt ein wartendes Fenster zurück.
+* **Gespeichert (AP-A, Profil-Planer 06.10.).** Beim ersten Aufruf schreibt der Dienst das Profil nach `--hw-profile-file` (Env `FLLIPER_HARDWARE_PROFILE`,
+  Voreinstellung `/var/lib/flliper/hardware.json`; Rig und Release gleich; ein Schreibfehler ist nur ein Zustand, kein Absturz). `GET /api/hwprofil`
+  trägt dazu `persist` = `{enabled, state, label, captured_at, reason, id, drift, error, from_persisted, file}`; `state` = `erst_erfasst` | `neu_erfasst` |
+  `vorhanden` | `abweichend` (Datei bleibt, `drift.changes` nennt den Unterschied) | `nur_gespeichert` (NVML schweigt: die Datei gilt) | `keine_karten` |
+  `nicht_schreibbar`. `POST /api/hwprofil/recapture` ("Neu erfassen") liest NVML neu und ersetzt die Datei: kein gpuq-Fenster, auch in release; eine
+  erfolgreiche Messung erfasst ebenfalls neu. SM-Zahl (`weg2/hw_sim.py`) und Nennbandbreite (`kartenplan_catalog.py`, Feld `mem_gbs.nominal`) kommen als
+  `Datenblatt` ins Profil, eine gemessene SM-Zahl gewinnt; `cards[].catalog` nennt Katalogkarte, `preset` und Herkunft (`measured_on_rig` | `Datenblatt` |
+  `borrowed-unbelegt`, je Feld in `origin_fields`). `GET /api/hwprofil/issue` liefert den Issue-Text "Hardwareprofil" als Markdown (`{ok, format, text}`);
+  Geheimnisse und Hostpfade sind entfernt (`redact.text_for_issue`).
 * Kein Hintergrund-Poller: nur wer die Seite bedient fragt. Ein laufendes Fenster, das nach 180 s nicht benutzt wurde, geht beim nächsten Aufruf zurück.
 * Dienst-Parameter (Deploy durch den Lead): `--hw-tree` (gestagter Baum mit `hardware_profile.py` + `weg2/card_identity.py`, `deploy/stage_hwprofil.sh`),
   `--hw-measure-tree` (voller sglang-Baum für den Kindprozess), `--hw-python` (Interpreter mit torch + sgl_kernel; ohne sgl_kernel bleiben die Arme
