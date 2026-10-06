@@ -98,7 +98,12 @@ TOTAL_S_DEFAULT = 16.0
 
 #: the ack stream's own point-to-point tag (1268 = idle vote, 580 = the
 #: prefetch vote collective, 0 = the typed proxy/output channel).
-WEG2_TOLD_ACK_TAG = 1416
+#: int8abn-tod-1005: NOT a small number. gloo's monitored_barrier sends/receives
+#: on the RAW slot ``collectiveCounter_`` of the same world cpu_group (4 per
+#: group fence); at t1 == 1416 PP0's two standing ack frames swallowed both
+#: followers' barrier messages (fence #337, flip 223, boot fs10052155). Keep
+#: every fixed p2p tag on this group far above any reachable counter value.
+WEG2_TOLD_ACK_TAG = (1 << 30) + 1416
 #: wire markers: INSTANCE attributes, present only on the armed path.
 WIRE_ACK = "ack"
 WIRE_FALLBACK = "fallback"
