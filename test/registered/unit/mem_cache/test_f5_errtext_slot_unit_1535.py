@@ -122,7 +122,21 @@ class TheAdmissionGuardTextIsAccurate(unittest.TestCase):
         text = "\n".join(logged.output)
         self.assertIn("chunk_tokens_the_pool_can_fund on the _rem_tokens <= 0", text)
         self.assertIn("PrefillAdder.rem_total_tokens", text)
-        self.assertIn("does not subtract a residency cap", text)
+        # nf-next-1006-13: the admission guard (nf-next-1006-01) subtracts the
+        # evictable tokens above an engaged cap, Option C (nf-next-1006-07c) is
+        # the alloc-site over-ask; the text must say both and must not claim
+        # the old state ("does not subtract a residency cap") again.
+        self.assertIn("subtracts the evictable tokens above an engaged residency cap", text)
+        self.assertIn("counts evictable only below the cap", text)
+        self.assertIn("num_tokens + gap", text)
+        self.assertIn("deliverable_evictable_cap_aware_or", text)
+        self.assertIn("_cap_overask", text)
+        self.assertIn("not a provider", text)
+        self.assertIn("That is not 'no net'", text)
+        self.assertNotIn("does not subtract", text)
+        self.assertNotIn("alloc-site net is empty", text)
+        self.assertIn("NO relief provider is registered", text)
+        self.assertIn("admission let through work the pool could not fund", text)
 
 
 if __name__ == "__main__":

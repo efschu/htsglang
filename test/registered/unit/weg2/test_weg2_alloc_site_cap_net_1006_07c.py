@@ -412,6 +412,10 @@ def test_01_cand3_state_of_the_log_and_the_death_on_the_product(caplog):
     assert "EVICTION UNDER-DELIVERED" in msg and "the pool received 64" in msg, msg
     assert "A RESIDENCY CAP IS ENGAGED" in msg
     assert any("NO relief provider is registered" in r.getMessage() for r in caplog.records)
+    # nf-next-1006-13: the line separates "no provider" from "no net" (Option C is a net, not a provider)
+    # and no longer claims the admission count ignores the cap.
+    relief_lines = [r.getMessage() for r in caplog.records if "NO relief provider is registered" in r.getMessage()]
+    assert all("not a provider" in m and "does not subtract" not in m for m in relief_lines), relief_lines
     assert tree.evict_calls == 1, "the paged path makes ONE peel and never a second"
     assert mc._attempt_extend_relief(1) == 0
 

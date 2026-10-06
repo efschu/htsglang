@@ -1078,7 +1078,9 @@ def _attempt_extend_relief(num_tokens: int) -> int:
     error, which is strictly more informative than a relief bug's traceback.
     """
     if not _extend_relief_providers:
-        # SAY THAT THE NET IS EMPTY, ONCE. Nothing registers a provider today:
+        # SAY THAT THE PROVIDER REGISTER IS EMPTY, ONCE (the alloc-site
+        # over-ask _cap_overask is a net at the allocation site, not a
+        # provider, so it does not fill this register). Nothing registers a provider today:
         # the rank-local reliefs that could pay here (eviction) are already
         # spent by the time this runs, and the ones that could genuinely free
         # tokens -- retraction, session spill -- are collective and belong on
@@ -1093,13 +1095,18 @@ def _attempt_extend_relief(num_tokens: int) -> int:
             _announced_empty_relief = True
             logger.warning(
                 "extend allocation failed and NO relief provider is "
-                "registered: the alloc-site net is empty on this boot, so the "
-                "guarantee against this crash is entirely the admission guard "
+                "registered: no rank-local relief provider is registered on "
+                "this boot. That is not 'no net': under an engaged residency "
+                "cap with a published gap the allocation site asks the tree "
+                "for num_tokens + gap (_cap_overask, a net at the allocation "
+                "site, not a provider), and admission "
                 "(chunk_tokens_the_pool_can_fund on the _rem_tokens <= 0 path; "
                 "otherwise PrefillAdder.rem_total_tokens = available_size() + "
-                "deliverable evictable, which does not subtract a residency "
-                "cap). If you are reading this line, admission let through "
-                "work the pool could not fund."
+                "deliverable evictable) subtracts the evictable tokens above "
+                "an engaged residency cap on a pinned group "
+                "(deliverable_evictable_cap_aware_or), so it counts evictable "
+                "only below the cap there. If you are reading this line, "
+                "admission let through work the pool could not fund."
             )
         return 0
     freed = 0
