@@ -1506,5 +1506,83 @@ def adopt_host_prefetch_span(tree_cache: Any, req: Any, match_end: int) -> Optio
     return m0
 
 
+# --------------------------------------------------------------------------
+# W65-REGROUP: the intake prefetch asks on a depth the whole group agreed on
+# (27B INT8 decode matrix, boot 113226, D 11:47:15, rid weg2-22-115)
+# --------------------------------------------------------------------------
+#
+# MEASURED (D log, TP0/TP1/TP2, one rid, one intake, one second): the warm
+# stream's prompt (N=103231, match end 103225) was matched on the ranks' OWN
+# trees -- TP0 and TP2 ended their host chain at the 99776 anchor, TP1 one
+# 490-token node deeper at 100266 (``FA PREFETCH-FROM-ANCHOR ... anchor=99776``
+# x2, ``anchor=100266``; ``#1042 EXTENT 2898 / 3388 / 2898``). Same tokens,
+# same match end, spans 3448 / 2958 / 3448 -> W65 on all three ranks and the
+# group stood in #1223 DEBUG-HOLD. Every earlier D log of the 27B line on file
+# (36 boots, ~3.5k rids with an #1042 EXTENT line) shows ZERO rids whose ranks
+# disagree on the intake extent: the host tier's lifecycle is asynchronous per
+# rank (write-back publish, claim_room drops, completion acks), so the radix
+# trees are replicas by insertion and ONLY transiently by lifecycle.
+#
+# WHY THE SPANS MUST BE EQUAL (so that agreeing on them is a requirement, not
+# a convenience): the registration is one rid, one hash chain, one token
+# range; the completion reduces (can_terminate_prefetch, min_completed_tokens)
+# are over LENGTHS and the insert is rooted at the node the prefetch was
+# registered under. Different starts under one rid register different ranges
+# while every length reduce reports agreement -- the #580 family, and the
+# reason W65 stops instead of trimming.
+#
+# WHY THE SHALLOWEST START IS THE ONE THE GROUP CAN TAKE: the deeper rank
+# reached its deeper anchor by walking down THROUGH the shallower one, and the
+# same radix path on every rank carries the same nodes (replicas by
+# insertion). It does not take the group's start on faith: the second pass
+# re-matches ITS key capped at that start (``_weg2_prefix_cap``, the #1419
+# hook every rank already honours) and prices the span from that match; if it
+# cannot realize the depth the spans differ again and the second vote raises
+# W65 as before. The admission seam does the same thing with the same shape
+# (H96 ``rematch_at_group_depth``: cap at the group depth, CAP-MISS is a named
+# stop); this is its twin at the one consumer of the match start that had no
+# agreement before the vote.
+#
+# The mechanism is armed per call by the scheduler (``SPAN_REGROUP_ARMED_ATTR``
+# on the tree, only for an intake-style call: rematch, no told limit, a group
+# that decides participation, and not Form A) and a second split on the retry
+# is never regrouped again -- so every path that raised W65 before still does,
+# except the one split the retry resolves.
+
+#: Tree attribute: rid -> (group_start, span_min, span_max, group_len) of a
+#: regroup the vote asked for on THIS rank (identical on every rank).
+SPAN_REGROUP_ATTR = "_weg2_span_regroup"
+
+#: Tree attribute the scheduler sets for the one ``prefetch_from_storage``
+#: call it will answer a regroup for. Absent/False = the W65 stop, unchanged.
+SPAN_REGROUP_ARMED_ATTR = "_weg2_span_regroup_armed"
+
+
+def span_regroup_allowed(*, rematch: bool, limit_tokens: Any, group_decides: bool) -> bool:
+    """May this ``_prefetch_kvcache`` call answer a W65 span split with a
+    regroup? Group-uniform: every input is the call's own shape or a switch
+    every rank reads identically (Form A follow)."""
+    return bool(
+        group_decides
+        and rematch
+        and limit_tokens is None
+        and not form_a_follow_active()
+    )
+
+
+def take_span_regroup(tree_cache: Any, rid: Any) -> Optional[tuple]:
+    """Pop this rank's regroup mark for ``rid`` (None = the vote agreed)."""
+    marks = getattr(tree_cache, SPAN_REGROUP_ATTR, None)
+    if not marks:
+        return None
+    return marks.pop(str(rid), None)
+
+
+def regroup_raw_cap(group_start: int, is_eagle: bool) -> int:
+    """The raw-token ``limit`` of a match that ends at ``group_start`` units
+    (a bigram key of N units spans N+1 raw tokens, ``can_realize`` the same)."""
+    return int(group_start) + (1 if is_eagle else 0)
+
+
 def stats() -> Dict[str, int]:
     return dict(_STATS)

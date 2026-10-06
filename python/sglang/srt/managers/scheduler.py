@@ -1379,6 +1379,37 @@ def _weg2_dormant_admit_armed() -> bool:
 _HEAD_VOTE_ANCHOR_N = [0]
 
 
+def _weg2_regroup_chain_tail(node, depth: int = 5) -> str:
+    """W65-REGROUP instrument (log only): the last ``depth`` nodes of this
+    rank's matched host chain, deepest first -- node key length and whether the
+    node is host-backed and carries a recurrent state on device / on host. It
+    prints, per rank, what the split was made of; nothing branches on it."""
+    out = []
+    try:
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            ComponentType,
+        )
+
+        for _ in range(depth):
+            if node is None or getattr(node, "parent", None) is None:
+                break
+            data = getattr(node, "component_data", None)
+            cd = data[ComponentType.MAMBA] if data is not None else None
+            out.append(
+                "%s:%s/%s/%s"
+                % (
+                    len(getattr(node, "key", None) or ()),
+                    int(bool(getattr(node, "backuped", False))),
+                    "?" if cd is None else int(getattr(cd, "value", None) is not None),
+                    "?" if cd is None else int(getattr(cd, "host_value", None) is not None),
+                )
+            )
+            node = node.parent
+    except Exception as exc:  # noqa: BLE001 - an instrument, never a gate
+        out.append(f"n/a({type(exc).__name__})")
+    return ",".join(out) or "-"
+
+
 def _len_or_zero(x) -> int:
     """``len(x)`` for a list or a tensor, 0 for None -- never ``x or ()``: the
     truth value of an empty tensor raises (27B rc12z9 D 08:23:24, all three
@@ -7695,7 +7726,11 @@ class Scheduler(
 
     @_pass_timed("_1474_prefetch_ms")  # #1474
     def _prefetch_kvcache(
-        self, req: Req, rematch: bool = True, limit_tokens: Optional[int] = None
+        self,
+        req: Req,
+        rematch: bool = True,
+        limit_tokens: Optional[int] = None,
+        _regroup: bool = False,
     ) -> str:
         """Issue a storage prefetch for ``req``. Returns WHAT ACTUALLY HAPPENED.
 
@@ -8078,24 +8113,43 @@ class Scheduler(
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
         if group_decides:
-            self.tree_cache.prefetch_from_storage(
-                req.rid,
-                last_host_node,
-                new_input_tokens,
-                last_hash,
-                prefix_keys,
-                locally_eligible=locally_eligible,
-                # HP1: the span's absolute start, so a Form A group votes ENDS
-                # (the rest of the tree ignores it off Form A).
-                span_base=int(_matched_len),
-                # #1442: P's handed-over chain is sliced at the span's
-                # absolute start (the fallback key list of the tree)
-                key_base=int(_matched_len),
-                **_tail_kw,
+            # W65-REGROUP (tp_match_floor, "W65-REGROUP"): armed for exactly this
+            # call, and only an intake-style one that has not been regrouped yet;
+            # every other call keeps the W65 stop.
+            _regroup_armed = (not _regroup) and tp_match_floor.span_regroup_allowed(
+                rematch=rematch, limit_tokens=limit_tokens, group_decides=group_decides
             )
+            if _regroup_armed:
+                setattr(self.tree_cache, tp_match_floor.SPAN_REGROUP_ARMED_ATTR, True)
+            try:
+                self.tree_cache.prefetch_from_storage(
+                    req.rid,
+                    last_host_node,
+                    new_input_tokens,
+                    last_hash,
+                    prefix_keys,
+                    locally_eligible=locally_eligible,
+                    # HP1: the span's absolute start, so a Form A group votes ENDS
+                    # (the rest of the tree ignores it off Form A).
+                    span_base=int(_matched_len),
+                    # #1442: P's handed-over chain is sliced at the span's
+                    # absolute start (the fallback key list of the tree)
+                    key_base=int(_matched_len),
+                    **_tail_kw,
+                )
+            finally:
+                if _regroup_armed:
+                    setattr(
+                        self.tree_cache, tp_match_floor.SPAN_REGROUP_ARMED_ATTR, False
+                    )
             # H99: on a Form A expert worker the span bookkeeping is the host's
             # (the vote carried it); a no-op on every other rank and boot.
             tp_match_floor.adopt_host_prefetch_span(self.tree_cache, req, _match_end)
+            _regroup_mark = tp_match_floor.take_span_regroup(self.tree_cache, req.rid)
+            if _regroup_mark is not None:
+                return self._weg2_prefetch_span_regroup(
+                    req, _regroup_mark, limit_tokens, _matched_len
+                )
         else:
             self.tree_cache.prefetch_from_storage(
                 req.rid,
@@ -8146,6 +8200,59 @@ class Scheduler(
             _note_prefetch_gate(_reason)
             self._note_prefetch_unregistered(req, _reason)
         return f"declined:{_reason}"
+
+    def _weg2_prefetch_span_regroup(
+        self, req, mark, limit_tokens: Optional[int], local_matched: int
+    ) -> str:
+        """W65-REGROUP, the scheduler half (see ``tp_match_floor``): the
+        participation vote found the ranks' intake matches split and every rank
+        declined this pass. Ask once more with the match capped at the group's
+        start (the shallowest depth any rank matched), so the spans are equal
+        by construction; a split that survives the cap is the W65 stop again.
+
+        The cap is the request's own ``_weg2_prefix_cap`` (the #1419 hook of
+        ``init_next_round_input``), restored afterwards, and the request is
+        re-matched uncapped on the way out: it leaves this function matched
+        exactly as the unarmed path leaves it, whatever the retry decided."""
+        from sglang.srt.managers import tp_match_floor as _tmf
+
+        group_start, span_lo, span_hi, group_len = (int(x) for x in mark)
+        tc = self.tree_cache
+        raw_cap = _tmf.regroup_raw_cap(group_start, bool(getattr(tc, "is_eagle", False)))
+        n = getattr(self, "_w65_regroup_n", 0) + 1
+        self._w65_regroup_n = n
+        if n <= 40 or n % 256 == 0:
+            _lhn = getattr(req, "last_host_node", None)
+            logger.warning(
+                "W65 REGROUP rid=%s n=%d this_rank: local_match=%d (device %d + host %d) "
+                "state_anchor_depth=%s key_match_depth=%s last_host_node_backuped=%s "
+                "-> group_start=%d raw_cap=%d (spans min=%d max=%d group_len=%d) "
+                "chain_tail(depth_len:backuped/mamba_dev/mamba_host, deepest first)=%s",
+                str(getattr(req, "rid", "?"))[:16], n, int(local_matched),
+                _len_or_zero(getattr(req, "prefix_indices", None)),
+                int(getattr(req, "host_hit_length", 0) or 0),
+                getattr(req, "state_anchor_depth", None),
+                getattr(req, "key_match_depth", None),
+                getattr(_lhn, "backuped", None),
+                group_start, raw_cap, span_lo, span_hi, group_len,
+                _weg2_regroup_chain_tail(_lhn),
+            )
+        prev = getattr(req, "_weg2_prefix_cap", None)
+        req._weg2_prefix_cap = raw_cap if prev is None else min(int(prev), raw_cap)
+        try:
+            verdict = self._prefetch_kvcache(
+                req, rematch=True, limit_tokens=limit_tokens, _regroup=True
+            )
+        finally:
+            if prev is None:
+                try:
+                    del req._weg2_prefix_cap
+                except AttributeError:
+                    pass
+            else:
+                req._weg2_prefix_cap = prev
+        req.init_next_round_input(tc, cow_mamba=False)
+        return verdict
 
     def _note_prefetch_unregistered(self, req, verdict: str) -> None:
         """L4 (#1068 slice 4, G12): `_prefetch_kvcache` observed NO
