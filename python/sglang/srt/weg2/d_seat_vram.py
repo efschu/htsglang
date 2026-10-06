@@ -2797,6 +2797,99 @@ def boot_phase(sched) -> Optional[PhaseState]:
     return st
 
 
+def _cap_lift_verdict(sched, ms, fr, alloc, tokens, used: int, incoming: int, admissible, rids,
+                      page: int):
+    """NF1d / 1528: does a pending shrink's cap go back up to the mapped stage
+    for the demand of this iteration? Sets ``ms._cap_lifted`` and the floor
+    cache; returns (lifted, need, rest). The group verdict (``_room_ok``) is
+    replicated, so every rank calls this in the same iterations. Shared by
+    ``runtime_tick`` and ``cap_lift_after_seat_move``."""
+    from sglang.srt.weg2.park import chunk_admit_tokens
+
+    lifted_before = bool(getattr(ms, "_cap_lifted", False))
+    lifted = False
+    need = 0
+    rest = 0
+    if ms.pending is not None and alloc is not None and (incoming > 0 or used > 0):
+        chunk = int(getattr(getattr(sched, "server_args", None), "chunked_prefill_size", 0) or 0)
+        # NF 1540 (cand3 bce16a6ddf 23:45:03Z, weg2-62-415: 26048 host-backed
+        # prefix + 1572): the host load-back is NOT chunked -- ``add_one_req`` /
+        # ``chunk_admit_tokens`` (Q-700) charge it WHOLE, the allocator takes it
+        # at admission. ``first`` as one chunk counted 4096 against room 26880,
+        # the load-back took 26048 of it and the 1572 extend found 832.
+        first = chunk_admit_tokens(int(incoming), chunk, load_back=_queued_load_back(admissible))
+        # NF 1528 (K2 20:49:25Z, weg2-54-290: 2176 + 830): the request after its
+        # first chunk is the chunked_req, in ``used`` and no longer in
+        # ``incoming`` -- the lift paid for chunk 1 only, ended itself between
+        # the chunks (need=64) and chunk 2 found 192 free ids under the cap.
+        # The next chunk of a live chunked_req is demand like a first chunk.
+        rest = _chunked_rest(sched)
+        nxt = min(rest, chunk) if chunk > 0 else rest
+        need = first + nxt + len(rids) * max(1, page)
+        # NF 1536: the cache bypass of ``_room_ok`` (``incoming <= 0``) must be a
+        # RANK-UNIFORM bit. ``rest`` is read from the rank's own prefix_indices /
+        # extend_range: 0 on one rank and > 0 on another would send one rank to the
+        # group collective and the other to its cache (collective #0 without partners).
+        # A live chunked_req is replicated (it is in ``used``), so the bit is that.
+        chunk_live = 1 if getattr(sched, "chunked_req", None) is not None else 0
+        lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need,
+                              incoming + chunk_live, len(rids), page)
+    ms._cap_lifted = lifted
+    if lifted:
+        fr["lifted_since"] = True
+    elif lifted_before:
+        fr["floor"] = None                      # the lift ended: read the floor afresh
+    return lifted, need, rest
+
+
+def cap_lift_after_seat_move(sched) -> None:
+    """NF 1534 F6 (4p5am6 22:10:15Z TP0: ``D-SEAT-REWAKE GROW n=2->3`` between chunk 2
+    and chunk 3 of weg2-40-295 at a pending S3): the iteration of a D-SEAT-REWAKE
+    GROW/SHRINK skips the stage tick (``d_seat_rewake.round_boundary``) but admission
+    runs on in the same iteration, so a pending shrink's cap stayed down for the next
+    chunk (K2: 13 of 25 GROWs at a pending cap with lifted=no). This runs ONLY the
+    cap-lift verdict of the tick, on the machine the last tick built (no stage step, no
+    shrink, no apply_stage; a missing machine or one built for another seat count waits
+    for the next tick). Same gates as the tick: not armed / dormant / no stage form ->
+    the plain noop count, so P, the 27B and a D without a form never reach the verdict."""
+    if not armed() or not elastic_on() or getattr(sched, "weg2_dormant", False):
+        return _tick_noop(sched)
+    st = getattr(sched, PHASE_ATTR, None)
+    form = stage_form()
+    ms = getattr(sched, MEM_SCHED_ATTR, None)
+    if st is None or st.stage is None or not st.done or form is None or ms is None:
+        return _tick_noop(sched)
+    n = max(1, min(int(st.n or st.cap), int(st.cap)))
+    tokens = tuple(form.tokens[: form.max_stage(n) + 1])
+    if ms.stage_tokens != tokens or getattr(ms, "_epoch", None) != st.epoch or ms.pending is None:
+        return _tick_noop(sched)
+    alloc = _kv_allocator(sched)
+    if alloc is None:
+        return _tick_noop(sched)
+    page = _page_size(sched)
+    running, admissible = _demand_lists(sched)
+    used = sum(_req_tokens(r) for r in running)
+    incoming = sum(_req_tokens(r) for r in admissible)
+    rids = frozenset(getattr(r, "rid", id(r)) for r in running)
+    fr = _floor_room_state(ms)
+    lifted_before = bool(getattr(ms, "_cap_lifted", False))
+    lifted, need, rest = _cap_lift_verdict(sched, ms, fr, alloc, tokens, used, incoming, admissible, rids, page)
+    if lifted == lifted_before:
+        return None
+    _engage_kv_cap(alloc, tokens[ms.stage if lifted else ms.pending], page)
+    if lifted:
+        _reopen_admission(sched)
+    room = free_tokens_below(alloc, tokens[ms.pending], page)
+    logger.info(
+        "%s pending=S%s stage=S%d cap=%d used=%d incoming=%d rest=%d need=%d room=%s lifted=%s "
+        "-- seat move iteration (no stage tick): %s", CAP_LIFT_MARK, ms.pending, ms.stage,
+        tokens[ms.stage if lifted else ms.pending], used, incoming, rest, need,
+        "-" if room is None else room, "yes" if lifted else "no",
+        "the free ids below the pending cap do not pay the demand: the mapped stage pays it"
+        if lifted else "no demand left: the pending cap again")
+    return None
+
+
 def runtime_tick(sched):
     """Once per scheduler iteration of an AWAKE D (after the write-through
     acks are flushed): the KV stage follows the global demand between wakes
@@ -2867,38 +2960,7 @@ def runtime_tick(sched):
     # group has demand the cap goes back to the stage unless the free ids
     # below it pay (replicated verdict); with no demand it returns to pending.
     lifted_before = bool(getattr(ms, "_cap_lifted", False))
-    lifted = False
-    need = 0
-    rest = 0
-    if ms.pending is not None and alloc is not None and (incoming > 0 or used > 0):
-        chunk = int(getattr(getattr(sched, "server_args", None), "chunked_prefill_size", 0) or 0)
-        # NF 1540 (cand3 bce16a6ddf 23:45:03Z, weg2-62-415: 26048 host-backed
-        # prefix + 1572): the host load-back is NOT chunked -- ``add_one_req`` /
-        # ``chunk_admit_tokens`` (Q-700) charge it WHOLE, the allocator takes it
-        # at admission. ``first`` as one chunk counted 4096 against room 26880,
-        # the load-back took 26048 of it and the 1572 extend found 832.
-        first = chunk_admit_tokens(int(incoming), chunk, load_back=_queued_load_back(admissible))
-        # NF 1528 (K2 20:49:25Z, weg2-54-290: 2176 + 830): the request after its
-        # first chunk is the chunked_req, in ``used`` and no longer in
-        # ``incoming`` -- the lift paid for chunk 1 only, ended itself between
-        # the chunks (need=64) and chunk 2 found 192 free ids under the cap.
-        # The next chunk of a live chunked_req is demand like a first chunk.
-        rest = _chunked_rest(sched)
-        nxt = min(rest, chunk) if chunk > 0 else rest
-        need = first + nxt + len(rids) * max(1, page)
-        # NF 1536: the cache bypass of ``_room_ok`` (``incoming <= 0``) must be a
-        # RANK-UNIFORM bit. ``rest`` is read from the rank's own prefix_indices /
-        # extend_range: 0 on one rank and > 0 on another would send one rank to the
-        # group collective and the other to its cache (collective #0 without partners).
-        # A live chunked_req is replicated (it is in ``used``), so the bit is that.
-        chunk_live = 1 if getattr(sched, "chunked_req", None) is not None else 0
-        lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need,
-                              incoming + chunk_live, len(rids), page)
-    ms._cap_lifted = lifted
-    if lifted:
-        fr["lifted_since"] = True
-    elif lifted_before:
-        fr["floor"] = None                      # the lift ended: read the floor afresh
+    lifted, need, rest = _cap_lift_verdict(sched, ms, fr, alloc, tokens, used, incoming, admissible, rids, page)
     if fr["ticks"] % FLOOR_CHECK_EVERY == 0:
         logger.info(
             "%s ticks=%d floor_reads=%d floor_cached=%d room_reads=%d room_cached=%d "

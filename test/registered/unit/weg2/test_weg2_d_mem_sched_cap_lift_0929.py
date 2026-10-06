@@ -376,3 +376,117 @@ def test_n_flip_unchanged_a_queued_load_back_adds_nothing_outside_the_stage_form
         assert dsv.runtime_tick(sched) is None
     assert hits == [] and calls == []
     assert not hasattr(sched, dsv.MEM_SCHED_ATTR)
+
+
+# ---------------------------------------------------------------------------
+# NF 4p5am6 (06.10. 22:10:12Z, weg2-40-295): "lifted=no bei rest+64>room" between chunks
+# ---------------------------------------------------------------------------
+# D log of boot dkrnfint4h6ablxcbar1dauer10062134_50632b25e1 (TP0/1/2 alike):
+#   CAP-LIFT pending=S3 stage=S4 used=73158 incoming=0 rest=9982 need=4224 room=5120 lifted=no
+# The evaluation rule read it as a violation (rest 9982 + 64 > room 5120). It is not: the
+# lift prices the NEXT chunk (``min(rest, chunked_prefill_size)`` = 4096) + one page per
+# seat (2 x 64), i.e. need 4224 <= room 5120 -- lifted=no is the verdict of the code, and
+# ``rest`` is only the (over-estimated, tick-before-stash) tail of the whole request.
+# The real gap between two chunks is another one (1534 F6, tests q..s below): a
+# D-SEAT-REWAKE GROW/SHRINK iteration skipped the whole tick, so the room that chunk 2
+# ate was never weighed against chunk 3 before admission.
+
+
+def test_o_the_4p5am6_line_prices_one_chunk_not_the_whole_rest(floor_env, caplog):
+    import logging
+
+    dsv, sched, caps, floor = floor_env
+    # 80 free ids below the cap = 5120 tokens: first a lift (1 id), then the room of the log
+    sched.token_to_kv_pool_allocator = _alloc([100])
+    ms = _pending_s0(dsv, sched, caps, floor)
+    caplog.set_level(logging.INFO)
+    sched.chunked_req = _chunked("weg2-40-295", 12000, 12000 - 9982)
+    sched.running_batch.reqs = [_req("weg2-40-294", 1000, 100)]   # the second seat
+    dsv.runtime_tick(sched)
+    assert ms._cap_lifted is True
+    sched.token_to_kv_pool_allocator = _alloc(list(range(100, 180)))   # 5120 tokens below
+    dsv.runtime_tick(sched)
+    line = _caplift_lines(caplog, dsv)[-1]
+    assert ms._cap_lifted is False and "lifted=no" in line
+    assert "rest=9982 need=4224 room=5120" in line, line
+    # the invariant an evaluation may check: lifted=no <=> the priced need fits the room
+    need, room = (int(line.split(k + "=")[1].split()[0]) for k in ("need", "room"))
+    assert need <= room < 9982 + 64
+
+
+def _seat_move(monkeypatch, moved="grow"):
+    """The iteration of a D-SEAT-REWAKE GROW/SHRINK: ``tick`` moved n, so
+    ``round_boundary`` does not run the stage tick (``V.runtime_tick``)."""
+    from sglang.srt.weg2 import d_seat_rewake as rw
+
+    monkeypatch.setattr(rw, "tick", lambda sched: moved)
+    return rw
+
+
+def test_q_a_seat_move_iteration_weighs_the_next_chunk_against_the_pending_cap(
+        floor_env, caplog, monkeypatch):
+    """1534 F6 on the 4p5am6 shape: chunk 2 took the room, chunk 3 (4096 + 2 seats)
+    needs more than is left below the pending cap, and the iteration between them
+    is a GROW (22:10:15 TP0 ``D-SEAT-REWAKE GROW n=2->3``) that skipped the tick."""
+    import logging
+
+    dsv, sched, caps, floor = floor_env
+    rw = _seat_move(monkeypatch)
+    sched.token_to_kv_pool_allocator = _alloc(list(range(100, 180)))   # 5120 below: pays 4224
+    ms = _pending_s0(dsv, sched, caps, floor)
+    sched.chunked_req = _chunked("weg2-40-295", 12000, 12000 - 9982)
+    sched.running_batch.reqs = [_req("weg2-40-294", 1000, 100)]
+    dsv.runtime_tick(sched)
+    assert ms._cap_lifted is False
+    caplog.set_level(logging.INFO)
+    sched.token_to_kv_pool_allocator = _alloc(list(range(100, 140)))   # chunk 2 ate 2560 of it
+    sched.chunked_req = _chunked("weg2-40-295", 12000, 12000 - 7358)
+    assert rw.round_boundary(sched) == "grow"
+    assert ms._cap_lifted is True, "the seat-move iteration let chunk 3 allocate under the pending cap"
+    assert caps[-1] == FLOOR_LADDER[1]
+    line = _caplift_lines(caplog, dsv)[-1]
+    assert "lifted=yes" in line and "rest=7358" in line and "need=4224" in line and "room=2560" in line
+
+
+def test_r_a_seat_move_iteration_runs_no_stage_step(floor_env, monkeypatch):
+    """Only the lift verdict runs there: no ``MemSched.step`` (its round counter and
+    floor reads stay), no ``apply_stage``, and a room that pays keeps the cap."""
+    dsv, sched, caps, floor = floor_env
+    rw = _seat_move(monkeypatch)
+    sched.token_to_kv_pool_allocator = _alloc(list(range(100, 180)))
+    ms = _pending_s0(dsv, sched, caps, floor)
+    sched.chunked_req = _chunked("weg2-40-295", 12000, 12000 - 9982)
+    sched.running_batch.reqs = [_req("weg2-40-294", 1000, 100)]
+    steps = []
+    real_step = ms.step
+    monkeypatch.setattr(ms, "step", lambda *a, **k: steps.append(1) or real_step(*a, **k))
+    fr = dsv._floor_room_state(ms)
+    ticks, n = fr["ticks"], len(caps)
+    assert rw.round_boundary(sched) == "grow"
+    assert steps == [] and fr["ticks"] == ticks          # no stage step, no tick count
+    assert ms._cap_lifted is False and len(caps) == n    # the room pays: the cap is untouched
+
+
+@pytest.mark.parametrize("group,stage_tokens", [("", None), ("P", None), ("D", None), ("D", "262144")])
+def test_s_flip_unchanged_a_seat_move_adds_nothing_outside_the_stage_form(
+        monkeypatch, group, stage_tokens):
+    from test_weg2_d_mem_sched_0929 import _no_side_effects
+
+    from sglang.srt.weg2 import d_seat_vram as dsv
+
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", group)
+    monkeypatch.setenv("SGLANG_OPT_WEG2_D_SEAT_VRAM", "1")
+    if stage_tokens is None:
+        monkeypatch.delenv("SGLANG_WEG2_D_KV_STAGE_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_WEG2_D_KV_STAGE_TOKENS", stage_tokens)
+    hits, sched = _no_side_effects(monkeypatch, dsv)
+    sched.chunked_req = _chunked("weg2-54-290", 3006, 2176)
+    setattr(sched, dsv.PHASE_ATTR, dsv.PhaseState(epoch="e", n=6, cap=6, done=True))
+    rw = _seat_move(monkeypatch)
+    calls = []
+    monkeypatch.setattr(dsv, "_chunked_rest", lambda s: calls.append(1) or 0)
+    for _ in range(3):
+        assert rw.round_boundary(sched) == "grow"
+    assert hits == [] and calls == []
+    assert not hasattr(sched, dsv.MEM_SCHED_ATTR)

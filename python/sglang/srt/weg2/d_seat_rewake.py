@@ -335,7 +335,9 @@ def round_boundary(sched: Any) -> Optional[str]:
     if moved is None:
         V.runtime_tick(sched)
         return None
-    V._tick_noop(sched)
+    # 1534 F6: the stage tick is skipped, admission is not -- the cap-lift verdict
+    # still has to stand before the next chunk (the only part of the tick run here)
+    V.cap_lift_after_seat_move(sched)
     return moved
 
 
