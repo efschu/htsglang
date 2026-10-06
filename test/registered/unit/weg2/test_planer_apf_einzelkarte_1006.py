@@ -161,10 +161,12 @@ class TestRig5090Qwen27(unittest.TestCase):
         self.assertEqual(flags["--speculative-algorithm"]["wert"], "NEXTN")
         self.assertEqual(flags["--context-length"]["wert"], 131072)
         self.assertEqual(flags["--max-running-requests"]["wert"], 1)
-        # Reserve (Handrechnung 4050) -> Bruchteil = floor3((32607 - 4050) / 32607)
-        self.assertAlmostEqual(flags["--mem-fraction-static"]["wert"], math.floor((32607 - 4050) / 32607 * 1000) / 1000, places=6)
-        self.assertEqual(flags["--mem-fraction-static"]["wert"], 0.875)
-        budget = 0.875 * 32607
+        # Reserve (Handrechnung 4050); die Runtime wendet den Bruchteil auf den freien Speicher VOR dem Laden an (Karte - Kontext/Treiber 400):
+        # Bruchteil = floor3((32607 - 400 - 4050) / (32607 - 400))
+        pre = 32607 - PS.CONTEXT_OVERHEAD_DEFAULT_MIB
+        self.assertAlmostEqual(flags["--mem-fraction-static"]["wert"], math.floor((pre - 4050) / pre * 1000) / 1000, places=6)
+        self.assertEqual(flags["--mem-fraction-static"]["wert"], 0.874)
+        budget = 0.874 * pre
         # unabhaengige Handrechnung der Posten mit den ENDGUELTIGEN Pool-Groessen
         kv_tokens = flags["--max-total-tokens"]["wert"]
         slots = flags["--max-mamba-cache-size"]["wert"]
@@ -199,7 +201,7 @@ class TestRig5090Qwen27(unittest.TestCase):
         main2, drf, kv, kv_d, mamba, spec = hand_posten_nvfp4_fp8(mp, flags["--max-total-tokens"]["wert"], flags["--max-mamba-cache-size"]["wert"], draft=False)
         self.assertAlmostEqual(main2, main)
         need = main + kv + mamba
-        budget = 0.875 * 32607
+        budget = 0.874 * (32607 - PS.CONTEXT_OVERHEAD_DEFAULT_MIB)
         self.assertGreater(need, budget)
         self.assertAlmostEqual(p["fit"]["fehlt_mib"], need - budget, delta=0.7)
         self.assertNotIn("frei_mib", p["fit"])
@@ -233,7 +235,7 @@ class TestRig5090Qwen27(unittest.TestCase):
         main, _, _, _, _, _ = hand_posten_nvfp4_fp8(mp, 0, 0, draft=False)
         kv_auto = 131072 * mp["kv"]["variants"]["auto"]["cell_bytes_per_attn_layer_token"]["v"] * 16 / MIB
         self.assertAlmostEqual(kv_auto, 8192.0)
-        self.assertGreater(main + kv_auto + 3 * mp["state"]["per_request_bytes"]["v"] / MIB, 0.875 * 32607)
+        self.assertGreater(main + kv_auto + 3 * mp["state"]["per_request_bytes"]["v"] / MIB, 0.874 * (32607 - PS.CONTEXT_OVERHEAD_DEFAULT_MIB))
 
     def test_kleinerer_kontext_mit_bf16_kv_passt(self):
         mp = q27("q27_nvfp4")
@@ -313,7 +315,8 @@ class TestRig5090Qwen27(unittest.TestCase):
         self.assertEqual(p["fit"]["reserve_bedarf_mib"], 2000.0)
         self.assertEqual(p["fit"]["reserve_herkunft"], "Ziel")
         f = {e["flag"]: e for e in p["flags"]}
-        self.assertEqual(f["--mem-fraction-static"]["wert"], math.floor((32607 - 2000) / 32607 * 1000) / 1000)
+        pre = 32607 - PS.CONTEXT_OVERHEAD_DEFAULT_MIB
+        self.assertEqual(f["--mem-fraction-static"]["wert"], math.floor((pre - 2000) / pre * 1000) / 1000)
 
     def test_deterministisch_und_json(self):
         mp = q27("q27_nvfp4")
@@ -340,6 +343,117 @@ class TestRig5090Qwen27(unittest.TestCase):
             PS.card_from_hardware(hw, 3)
 
 
+class TestKontextTreiberBudget(unittest.TestCase):
+    """Review-Befund 1 (FIX-RUNDE 1): das statische Budget der Runtime ist ``fraction x pre_model_load_memory`` (freier Speicher NACH CUDA-Kontext/Init,
+    model_runner.py:2301; model_runner_kv_cache_mixin.py:959-962, 987-992), nicht ``fraction x Karte``.  Kontext + Treiber gehen gegen das Budget."""
+
+    def runtime_pool_mib(self, f, pre, weights_mib):
+        """Handrechnung der Runtime: rest = (pre - Gewichte) - pre x (1 - f) = f x pre - Gewichte."""
+        return (pre - weights_mib) - pre * (1.0 - f)
+
+    def test_budget_ist_bruchteil_mal_frei_vor_dem_laden(self):
+        mp = q27("q27_nvfp4")
+        p = PS.propose_single(mp, CARD_5090)
+        f = p["fit"]
+        fr = next(e for e in p["flags"] if e["flag"] == "--mem-fraction-static")["wert"]
+        pre = 32607 - 400.0
+        self.assertEqual(f["pre_load_free_mib"], pre)
+        self.assertEqual(f["kontext_treiber_mib"], 400.0)
+        self.assertTrue(f["kontext_treiber_standard"])
+        self.assertAlmostEqual(f["statisch_budget_mib"], fr * pre, delta=0.1)
+        self.assertLess(f["statisch_budget_mib"], fr * 32607 - 300)            # NICHT mehr fraction x Karte
+        # Reserve = Slack der Runtime = pre x (1 - f) (Hostpool entfaellt auf der diskreten Karte)
+        self.assertAlmostEqual(f["reserve_gegeben_mib"], pre * (1 - fr), delta=0.1)
+        self.assertGreaterEqual(f["reserve_gegeben_mib"], f["reserve_bedarf_mib"])
+        # eigener Posten, Herkunft unbelegt, nicht in der statischen Summe
+        post = next(x for x in f["posten"] if x["name"].startswith("CUDA-Kontext + Treiber"))
+        self.assertEqual(post["mib"], 400.0)
+        self.assertIn("unbelegt", post["herkunft"])
+        self.assertAlmostEqual(f["statisch_summe_mib"], sum(x["mib"] for x in f["posten"] if not x["name"].startswith("CUDA-Kontext")), delta=0.6)
+        # Der Pool, den die Runtime wirklich haelt (f x pre - Gewichte), deckt KV + Mamba des Vorschlags (Rest-Regel fuellt gegen DASSELBE Budget)
+        w = f["posten"][0]["mib"] + next(x for x in f["posten"] if x["name"].startswith("Gewichte (Draft")) ["mib"]
+        pool_need = f["statisch_summe_mib"] - w
+        self.assertGreaterEqual(self.runtime_pool_mib(fr, pre, w) + 1e-6, pool_need)
+        self.assertLess(self.runtime_pool_mib(fr, pre, w) - pool_need, 100.0)    # und ist bis auf Slot-/Seitengranularitaet ausgeschoepft
+
+    def test_flags_und_verdikt_tragen_die_annahme_als_unbelegt(self):
+        p = PS.propose_single(q27("q27_nvfp4"), CARD_5090)
+        flags = {e["flag"]: e for e in p["flags"]}
+        for fl in ("--mem-fraction-static", "--max-total-tokens", "--max-mamba-cache-size"):
+            self.assertEqual(flags[fl]["zustand"], "unbelegt", fl)
+            self.assertIn("Kontext + Treiber 400 MiB angenommen", flags[fl]["begruendung"], fl)
+        self.assertIn("Kontext/Treiber 400 MiB angenommen, unbelegt", p["verdikt"]["text"])
+        self.assertTrue(any("CUDA-Kontext + Treiber 400 MiB" in u for u in p["unbelegt"]))
+        self.assertTrue(any("Kontext + Treiber 400 MiB" in h for h in p["fit"]["hinweise"]))
+        # die alte Zahl (Budget gegen die ganze Karte, 88 MiB frei, Kontext bis 154837) darf nicht mehr vorkommen
+        self.assertNotIn("154837", p["verdikt"]["text"])
+        self.assertNotIn(28531, [round(p["fit"]["statisch_budget_mib"])])
+
+    def test_gemessener_wert_ersetzt_den_standard_und_ist_nicht_unbelegt(self):
+        mp = q27("q27_nvfp4")
+        base = PS.propose_single(mp, CARD_5090)
+        kv0 = next(e for e in base["flags"] if e["flag"] == "--max-total-tokens")["wert"]
+        toks = []
+        for overhead in (500, 700, 900):
+            p = PS.propose_single(mp, CARD_5090, {"pre_load_free_mib": 32607 - overhead})
+            self.assertEqual(p["verdikt"]["state"], "passt", p["verdikt"]["text"])
+            f = p["fit"]
+            self.assertEqual(f["kontext_treiber_mib"], float(overhead))
+            self.assertFalse(f["kontext_treiber_standard"])
+            self.assertEqual(f["kontext_treiber_herkunft"], "Ziel (pre_load_free_mib)")
+            flags = {e["flag"]: e for e in p["flags"]}
+            self.assertEqual(flags["--mem-fraction-static"]["zustand"], "vorgeschlagen")
+            self.assertNotIn("angenommen", flags["--max-total-tokens"]["begruendung"])
+            self.assertFalse(any("CUDA-Kontext" in u for u in p["unbelegt"]))
+            pre = 32607 - overhead
+            self.assertAlmostEqual(f["statisch_budget_mib"], flags["--mem-fraction-static"]["wert"] * pre, delta=0.1)
+            toks.append(flags["--max-total-tokens"]["wert"])
+            self.assertGreaterEqual(flags["--max-total-tokens"]["wert"], 131072)
+        self.assertEqual(toks, sorted(toks, reverse=True))                      # mehr Kontext/Treiber -> weniger Pool
+        self.assertLess(toks[-1], kv0)
+        with self.assertRaises(PS.ProposeSingleError):
+            PS.propose_single(mp, CARD_5090, {"pre_load_free_mib": 40000})
+        with self.assertRaises(PS.ProposeSingleError):
+            PS.propose_single(mp, CARD_5090, {"pre_load_free_mib": 0})
+
+    def test_grenzfall_kippt_auf_passt_nicht(self):
+        """Ein Pool, der gegen ``fraction x Karte`` (alte, zu guenstige Rechnung) noch passte, gegen ``fraction x (Karte - Kontext)`` aber nicht."""
+        mp = q27("q27_nvfp4")
+        base = PS.propose_single(mp, CARD_5090)
+        flags = {e["flag"]: e for e in base["flags"]}
+        fr = flags["--mem-fraction-static"]["wert"]
+        bpt = base["fit"]["kv_bytes_je_token"]
+        frei = base["fit"]["frei_mib"]
+        extra = int((frei + 0.5 * fr * 400.0) * MIB // bpt)                     # 200 MiB ueber dem alten Budgetrand? -> zwischen neuem und altem Budget
+        over = PS.propose_single(mp, CARD_5090, overrides={"--max-total-tokens": flags["--max-total-tokens"]["wert"] + extra})
+        fo = {e["flag"]: e for e in over["flags"]}
+        old_budget = fr * 32607
+        self.assertLessEqual(over["fit"]["statisch_summe_mib"], old_budget)     # nach der alten Rechnung "passt"
+        self.assertGreater(over["fit"]["statisch_summe_mib"], over["fit"]["statisch_budget_mib"])
+        self.assertEqual(over["verdikt"]["state"], "passt nicht")
+        self.assertEqual(fo["--max-total-tokens"]["verdikt"]["code"], "FIT-STATIC")
+        self.assertIn("freier Speicher vor dem Laden", fo["--max-total-tokens"]["verdikt"]["grund"])
+
+    def test_max_context_fit_gegen_dasselbe_budget(self):
+        mp = q27("q27_nvfp4")
+        p = PS.propose_single(mp, CARD_5090)
+        flags = {e["flag"]: e for e in p["flags"]}
+        # Der berechnete Hoechstkontext haelt exakt im neuen Budget: ein Pool dieser Groesse passt, 3 Seiten mehr nicht
+        mx = p["fit"]["max_context_tokens_fit"]
+        ok = PS.propose_single(mp, CARD_5090, overrides={"--max-total-tokens": mx, "--context-length": 4096})
+        self.assertTrue(ok["fit"]["passt"], ok["verdikt"]["text"])
+        no = PS.propose_single(mp, CARD_5090, overrides={"--max-total-tokens": mx + 3000, "--context-length": 4096})
+        self.assertFalse(no["fit"]["passt"])
+
+    def test_apu_kontext_verengt_die_decke(self):
+        """APU/Hostpool: FIT-CARD rechnet gegen Decke - Kontext/Treiber - Hostpool."""
+        p = PS.propose_single(synthetic_laptop_profile(), CARD_LAPTOP, {"seats": 2, "context_tokens": 131072, "host_ram_mib": 2000})
+        card = next(c for c in p["fit"]["checks"] if c["code"] == "FIT-CARD")
+        self.assertTrue(card["ok"], card["text"])
+        self.assertIn("Kontext/Treiber 400 MiB", card["text"])
+        self.assertLessEqual(p["fit"]["statisch_budget_mib"], 25600 - 400 - 2000 + 1e-6)
+
+
 class TestLaptopSynthetisch(unittest.TestCase):
     """Abnahme: Laptop-Profil synthetisch (APU 25600 MiB adressierbar, 35B-A3B-Hybrid) -> der Vorschlag passt; alles geborgte ist "unbelegt"."""
 
@@ -354,13 +468,14 @@ class TestLaptopSynthetisch(unittest.TestCase):
         self.assertEqual(p["verdikt"]["state"], "passt", p["verdikt"]["text"])
         # ROCm: Reserve ohne Prefill-Graph-Posten, 512 + 3072 + 128 + max_bs(2) x 2 = 3716; Hostpool 2000 zaehlt gegen die Decke (APU)
         self.assertEqual(p["fit"]["reserve_bedarf_mib"], 3716.0)
-        fr = math.floor((25600 - 2000 - 3716) / 25600 * 1000) / 1000
+        pre = 25600 - PS.CONTEXT_OVERHEAD_DEFAULT_MIB       # freier Speicher vor dem Laden (Standard-Kontext/Treiber, unbelegt)
+        fr = math.floor((pre - 2000 - 3716) / pre * 1000) / 1000
         self.assertEqual(self.f["--mem-fraction-static"]["wert"], fr)
-        budget = fr * 25600
-        # gegebene Reserve = Karte - Budget - Hostpool, nie unter dem Bedarf und hoechstens 0,1 % der Karte darueber (Abrundung auf 3 Stellen)
+        budget = fr * pre
+        # gegebene Reserve = frei vor dem Laden - Budget - Hostpool, nie unter dem Bedarf und hoechstens 0,1 % darueber (Abrundung auf 3 Stellen)
         self.assertGreaterEqual(p["fit"]["reserve_gegeben_mib"], 3716.0)
         self.assertLess(p["fit"]["reserve_gegeben_mib"], 3716.0 + 25.6 + 0.1)
-        self.assertAlmostEqual(p["fit"]["reserve_gegeben_mib"], 25600 - budget - 2000, delta=0.1)
+        self.assertAlmostEqual(p["fit"]["reserve_gegeben_mib"], pre - budget - 2000, delta=0.1)
         # Posten per Handrechnung
         kv_tokens = self.f["--max-total-tokens"]["wert"]
         slots = self.f["--max-mamba-cache-size"]["wert"]
@@ -378,7 +493,7 @@ class TestLaptopSynthetisch(unittest.TestCase):
         host = next(x for x in p["fit"]["posten"] if x["name"].startswith("HiCache-Hostpool"))
         self.assertEqual(host["mib"], 2000.0)
         # das Hostpool liegt NICHT im statischen Posten, sondern verengt den Bruchteil
-        self.assertAlmostEqual(p["fit"]["statisch_summe_mib"], sum(x["mib"] for x in p["fit"]["posten"] if not x["name"].startswith("HiCache")), delta=0.6)
+        self.assertAlmostEqual(p["fit"]["statisch_summe_mib"], sum(x["mib"] for x in p["fit"]["posten"] if not x["name"].startswith(("HiCache", "CUDA-Kontext"))), delta=0.6)
 
     def test_hicache(self):
         self.assertTrue(self.f["--enable-hierarchical-cache"]["wert"])

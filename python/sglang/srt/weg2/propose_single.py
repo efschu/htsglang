@@ -30,7 +30,12 @@ Datenstruktur (AP-C uebernimmt sie oder bildet sie ab; Plan §2 Stufe C ``fllipe
                     "art": "Planer-Rechnung", "parse": "nicht geprüft" | "ok" | "Fehler" | "veraltet (Alias)"}``.
                     ``nur mit --force`` gibt es bei N=1 nicht (kein Refusal-Register ohne Launcher).
 * ``fit``: ``{"passt", "posten": [{"name","mib","herkunft","formel"}], "statisch_summe_mib", "statisch_budget_mib",
-  "frei_mib" | "fehlt_mib", "reserve_*", "checks": [{"code","ok","text"}], "max_context_tokens_fit", "hinweise": [...]}``
+  "frei_mib" | "fehlt_mib", "reserve_*", "pre_load_free_mib", "kontext_treiber_mib", "kontext_treiber_herkunft", "kontext_treiber_standard",
+  "checks": [{"code","ok","text"}], "max_context_tokens_fit", "hinweise": [...]}``
+
+  Statisches Budget = ``--mem-fraction-static`` x ``pre_load_free_mib`` (freier Speicher VOR dem Modellladen, wie die Runtime es rechnet,
+  model_runner_kv_cache_mixin.py:959-962), NICHT x Karte.  Der Posten "CUDA-Kontext + Treiber" (``kontext_treiber_mib``, Standard 400 MiB,
+  Herkunft unbelegt, ``goals['pre_load_free_mib']`` ersetzt ihn) steht in ``posten``, zaehlt aber nicht in ``statisch_summe_mib``.
 * ``verdikt``: ``{"state": "passt" | "passt nicht" | "unbelegt", "art": "Planer-Rechnung", "text": str}``
 * ``relaxations``: Schritte, die der Planer selbst gegangen ist, damit es passt (KV fp8, Draft aus), je mit Zahlen;
 * ``argv``: die ServerArgs-Argumentliste (nur Eintraege mit ``wert`` != ``None``);
@@ -87,6 +92,13 @@ NEXTN_STEPS, NEXTN_TOPK, NEXTN_DRAFT_TOKENS = 3, 1, 4
 HICACHE_PAGE_SIZE = 64
 #: Kleinster Host/Geraet-Anteil, ab dem HiCache sich lohnt; darunter lasse ich HiCache aus (Planer-Entscheid, unbelegt am Metall).
 HICACHE_MIN_RATIO = 0.05
+#: CUDA-Kontext + Treiber-Abzweig, der VOR dem Modellladen schon belegt ist.  Die Runtime misst ``pre_model_load_memory`` = freier Speicher nach
+#: Kontext/Init (model_runner.py:2301, utils/common.py:849 ``mem_get_info``) und rechnet den KV-/Mamba-Pool als
+#: ``frei_nach_Gewichten - pre_model_load_memory x (1 - mem_fraction_static)`` (model_runner_kv_cache_mixin.py:959-962, 987-992), also ist das
+#: statische Budget ``fraction x pre_model_load_memory`` und NICHT ``fraction x Karte``; Kontext + Treiber gehen gegen das Budget, nicht gegen die Reserve.
+#: Standardwert: ~400 MiB GEMESSEN am 5090 im weg2-Launcher-Format (Boot weg2onebackup2 06.09.2026, launcher.py:253: "CUDA context + BAR1 windows"),
+#: am Einzelserver UNBELEGT -> der Vorschlag markiert die davon abhaengigen Flags ``unbelegt``; ``goals['pre_load_free_mib']`` ersetzt ihn durch eine Messung.
+CONTEXT_OVERHEAD_DEFAULT_MIB = 400.0
 #: ``--max-prefill-tokens`` Standard (server_args.py:1399-1407), wenn chunked_prefill_size <= 0.
 _MAX_PREFILL_TOKENS_DEFAULT = 16384
 
@@ -156,7 +168,8 @@ def reserve_mib(total_mib: float, cps: int, max_bs_decode: int, prefill_graph_bs
     ``512 + max(chunked_prefill_size, 2048) x 1.5 + tp x pp / 8 x 1024 + decode max_bs x 2 [+ Zahl der Prefill-Graph-Groessen x 8, nur CUDA]``,
     bei mehr als 60 GiB Karte mindestens 10 GiB.  Der Kommentar bei server_args.py:14487-14499 haelt fest, dass der Rig-Ledger sie am 05.08.
     als zu hoch widerlegt hat (gebucht 3968 MiB, frei 1766): sie ist hier die OBERE Schranke; ``goals['reserve_mib']`` ersetzt sie durch
-    eine gemessene Zahl.  Der CUDA-Kontext ist in der Heuristik nicht getrennt ausgewiesen (unbelegt)."""
+    eine gemessene Zahl.  Der CUDA-Kontext gehoert NICHT zur Reserve: er liegt vor ``pre_model_load_memory`` und mindert das statische Budget
+    (:func:`pre_load_free`, Posten "CUDA-Kontext + Treiber" in :func:`account`)."""
     act_tokens = max(int(cps), 2048) if int(cps) > 0 else max(_MAX_PREFILL_TOKENS_DEFAULT, 2048)
     r = 512.0 + act_tokens * 1.5 + tp * pp / 8.0 * 1024.0
     r += int(max_bs_decode) * 2.0
@@ -179,6 +192,23 @@ def _floor_to(n: float, mult: int) -> int:
 def _ceil_to(n: float, mult: int) -> int:
     n = int(math.ceil(n))
     return n + (-n % mult) if mult > 1 else n
+
+
+def pre_load_free(card: Mapping[str, Any], goals: Mapping[str, Any]) -> Tuple[float, float, str, bool]:
+    """``(pre_load_free_mib, kontext_treiber_mib, herkunft, ist_standard)``: freier Speicher VOR dem Modellladen (Nenner von ``--mem-fraction-static``
+    in der Runtime, model_runner_kv_cache_mixin.py:959-962) und der Kontext/Treiber-Posten, der ihn von der Kartengroesse trennt.
+    ``goals['pre_load_free_mib']`` (gemessen) ersetzt den Standard ``Karte - CONTEXT_OVERHEAD_DEFAULT_MIB``."""
+    total = float(card["total_mib"])
+    given = goals.get("pre_load_free_mib")
+    if given is not None:
+        pre = float(given)
+        if pre <= 0 or pre > total:
+            raise ProposeSingleError("pre_load_free_mib %s muss in (0, Karte %.0f MiB] liegen" % (given, total))
+        return pre, total - pre, "%s (pre_load_free_mib)" % H_GOAL, False
+    pre = total - CONTEXT_OVERHEAD_DEFAULT_MIB
+    if pre <= 0:
+        raise ProposeSingleError("Karte %.0f MiB kleiner als der Kontext/Treiber-Standard %.0f MiB" % (total, CONTEXT_OVERHEAD_DEFAULT_MIB))
+    return pre, CONTEXT_OVERHEAD_DEFAULT_MIB, "unbelegt (Messung am Launcher-Format, launcher.py:253; am Einzelserver nicht gemessen)", True
 
 
 # ===========================================================================
@@ -415,28 +445,32 @@ def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any],
         reserve_need = reserve_mib(total, cps, int(v.get("max_bs") or 1), len(prefill_graph_sizes(max(pf_max, 0))), cuda=card["platform"] == "cuda")
         reserve_src = "ServerArgs-Heuristik (server_args.py:14509-14536)"
     fraction = v.get("fraction")
-    budget = float(fraction) * total if fraction is not None else None
+    # Statisches Budget wie die Runtime es rechnet: fraction x freier Speicher VOR dem Laden (nicht x Karte); Kontext + Treiber liegen davor.
+    pre, overhead, overhead_src, overhead_default = pre_load_free(card, goals)
+    add("CUDA-Kontext + Treiber (vor dem Laden belegt, nicht im statischen Budget)", overhead * MIB, overhead_src,
+        "Karte %.0f MiB - freier Speicher vor dem Laden %.0f MiB (model_runner.py:2301 pre_model_load_memory); mindert das Budget, nicht die Reserve" % (total, pre))
+    budget = float(fraction) * pre if fraction is not None else None
     # APU: das Hostpool liegt im selben Speicher und verengt den Bruchteil (_plan_values); es ist KEINE Reserve.
-    reserve_given = (total - budget - host) if budget is not None else None
+    reserve_given = (pre - budget - host) if budget is not None else None
     checks: List[Dict[str, Any]] = []
     if budget is None:
         checks.append({"code": "FIT-RESERVE", "ok": False,
-                       "text": "Reserve %.0f MiB (%s) laesst keinen Bruchteil der Karte %.0f MiB fuer --mem-fraction-static" % (reserve_need, reserve_src, total)})
+                       "text": "Reserve %.0f MiB (%s) laesst keinen Bruchteil des freien Speichers %.0f MiB (Karte %.0f MiB - Kontext/Treiber %.0f MiB) fuer --mem-fraction-static" % (reserve_need, reserve_src, pre, total, overhead)})
     else:
         ok_static = static_sum <= budget + 1e-6
         checks.append({"code": "FIT-STATIC", "ok": ok_static,
-                       "text": ("Gewichte + Draft + KV + Mamba %.0f MiB %s statisches Budget %.0f MiB (= --mem-fraction-static %.3f x %.0f MiB)%s"
-                                % (static_sum, "<=" if ok_static else ">", budget, fraction, total,
+                       "text": ("Gewichte + Draft + KV + Mamba %.0f MiB %s statisches Budget %.0f MiB (= --mem-fraction-static %.3f x freier Speicher vor dem Laden %.0f MiB = Karte %.0f - Kontext/Treiber %.0f)%s"
+                                % (static_sum, "<=" if ok_static else ">", budget, fraction, pre, total, overhead,
                                    "" if ok_static else "; es fehlen %.0f MiB" % (static_sum - budget)))})
         ok_res = reserve_given + 1e-6 >= reserve_need
         checks.append({"code": "FIT-RESERVE", "ok": ok_res,
-                       "text": ("Reserve %.0f MiB (= (1 - fraction) x Karte%s) %s Bedarf %.0f MiB (%s)" % (reserve_given, " - Hostpool" if host else "", ">=" if ok_res else "<", reserve_need, reserve_src))})
-        usable_eff = usable - host
+                       "text": ("Reserve %.0f MiB (= (1 - fraction) x freier Speicher%s) %s Bedarf %.0f MiB (%s)" % (reserve_given, " - Hostpool" if host else "", ">=" if ok_res else "<", reserve_need, reserve_src))})
+        usable_eff = usable - overhead - host
         if usable < total or host:
             ok_card = budget <= usable_eff + 1e-6
             checks.append({"code": "FIT-CARD", "ok": ok_card,
                            "text": "statisches Budget %.0f MiB %s adressierbare Decke %.0f MiB%s" % (
-                               budget, "<=" if ok_card else ">", usable_eff, " (abzueglich Hostpool %.0f MiB)" % host if host else "")})
+                               budget, "<=" if ok_card else ">", usable_eff, " (abzueglich Kontext/Treiber %.0f MiB%s)" % (overhead, ", Hostpool %.0f MiB" % host if host else ""))})
     if v.get("context") and kv_tokens:
         ok_ctx = int(v["context"]) <= kv_tokens
         checks.append({"code": "FIT-CTX", "ok": ok_ctx, "text": "Kontext %d Token %s KV-Pool %d Token" % (int(v["context"]), "<=" if ok_ctx else ">", kv_tokens)})
@@ -449,12 +483,17 @@ def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any],
         hinweise.append("Kontext %d liegt ueber max_position_embeddings %d des Modells: Rope-Erweiterung ist nicht belegt" % (int(v["context"]), F["maxpos"]))
     if F["family"] == "moe":
         hinweise.append("MoE im einzelnen Server: alle Experten muessen auf der Karte liegen (kein Experten-Offload in dieser Form); Teilauslagerung ist Sache des weg2-Launchers (N>=2)")
+    if overhead_default:
+        hinweise.append("Kontext + Treiber %.0f MiB sind der Standardwert (am Einzelserver unbelegt): das statische Budget ist fraction x (Karte - Kontext/Treiber); "
+                        "gemessenes pre_model_load_memory als goals['pre_load_free_mib'] setzen" % overhead)
     if card["unified"]:
         hinweise.append("APU: Geraet und Host teilen den Speicher; torch-Gesamtspeicher der APU ist hier = adressierbare Decke angenommen (unbelegt am Rig)")
     out = {"passt": all(c["ok"] for c in checks) and not unb, "posten": posten, "statisch_summe_mib": round(static_sum, 1),
            "statisch_budget_mib": round(budget, 1) if budget is not None else None,
            "reserve_bedarf_mib": round(reserve_need, 1), "reserve_herkunft": reserve_src,
            "reserve_gegeben_mib": round(reserve_given, 1) if reserve_given is not None else None,
+           "pre_load_free_mib": round(pre, 1), "kontext_treiber_mib": round(overhead, 1), "kontext_treiber_herkunft": overhead_src,
+           "kontext_treiber_standard": overhead_default,
            "checks": checks, "hinweise": hinweise, "unbelegt": unb,
            "kv_bytes_je_token": kv_bpt, "mamba_floor_slots": floor_slots,
            "_numbers": {"w_main": w_main, "w_draft": w_draft, "mamba_spec": mamba_spec, "kv_main": kv_main, "kv_draft": kv_draft, "mamba_main": mamba_main, "host": host}}
@@ -471,7 +510,7 @@ def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any],
 
 def _defaults_goals(goals: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     g = {"context_tokens": None, "kv_tokens": None, "seats": 1, "draft": "auto", "kv_dtype": None, "vision": False, "host_ram_mib": None,
-         "chunked_prefill_size": None, "reserve_mib": None, "disable_radix": False}
+         "chunked_prefill_size": None, "reserve_mib": None, "disable_radix": False, "pre_load_free_mib": None}
     for k, val in (goals or {}).items():
         if k not in g:
             raise ProposeSingleError("unbekanntes Ziel %r (bekannt: %s)" % (k, ", ".join(sorted(g))))
@@ -484,6 +523,7 @@ def _defaults_goals(goals: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 def _plan_values(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str, Any], dtype: str, draft: Optional[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Mindest-Werte (KV = Ziel-Kontext, Mamba = Untergrenze) fuer EINE Stufe der Leiter; passt es, wird der Rest verteilt."""
     total, usable = float(card["total_mib"]), float(card["usable_mib"])
+    pre, overhead, _, _ = pre_load_free(card, g)
     cps_tier, bs_tier = capacity_tier(total)
     cps = int(g["chunked_prefill_size"] or cps_tier)
     seats = int(g["seats"])
@@ -509,9 +549,11 @@ def _plan_values(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str, 
     if reserve is None:
         reserve = reserve_mib(total, cps, v["max_bs"], len(prefill_graph_sizes(min(cps, ctx, kv_goal))), cuda=card["platform"] == "cuda")
     host_unified = float(host) if (card["unified"] and hicache) else 0.0
-    f = _floor3(min(0.99, (usable - host_unified - reserve) / total)) if total > 0 else 0.0
+    # Die Runtime wendet den Bruchteil auf den freien Speicher VOR dem Laden an (pre_model_load_memory, model_runner_kv_cache_mixin.py:959-962), nicht auf
+    # die Karte: Budget = f x pre, Reserve (Slack) = pre x (1 - f).  Gewollt: Budget = Decke - Kontext/Treiber - Hostpool - Reserve.
+    f = _floor3(min(0.99, (usable - overhead - host_unified - reserve) / pre)) if pre > 0 else 0.0
     v["fraction"] = f if f > 0 else None
-    return v, {"reserve": reserve, "ctx": ctx, "kv_goal": kv_goal, "page": page, "host_unified": host_unified}
+    return v, {"reserve": reserve, "pre": pre, "overhead": overhead, "ctx": ctx, "kv_goal": kv_goal, "page": page, "host_unified": host_unified}
 
 
 def _spend_rest(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str, Any], v: Dict[str, Any], aux: Mapping[str, Any]) -> None:
@@ -649,10 +691,11 @@ def build_entries(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str,
     fr = v.get("fraction")
     out["--mem-fraction-static"] = _entry(
         "--mem-fraction-static", fr, H_RULE,
-        ("(Decke %s MiB - Reserve %s MiB) / Karte %s MiB, abgerundet auf 3 Stellen -- Formel wie server_args.py:14538-14541; Reserve aus %s%s" % (
-            _fmt(card["usable_mib"] - aux["host_unified"]), _fmt(aux["reserve"]), _fmt(card["total_mib"]), acc["reserve_herkunft"],
+        ("(Decke %s MiB - Kontext/Treiber %s MiB - Reserve %s MiB) / freier Speicher vor dem Laden %s MiB, abgerundet auf 3 Stellen -- die Runtime wendet den Bruchteil "
+         "auf pre_model_load_memory an (model_runner_kv_cache_mixin.py:959-962), nicht auf die Karte (Abweichung von server_args.py:14538-14541, das durch die Karte teilt); Reserve aus %s%s" % (
+            _fmt(card["usable_mib"] - aux["host_unified"]), _fmt(aux["overhead"]), _fmt(aux["reserve"]), _fmt(aux["pre"]), acc["reserve_herkunft"],
             "; Hostpool %s MiB abgezogen (APU)" % _fmt(aux["host_unified"]) if aux["host_unified"] else ""))
-        if fr is not None else "Reserve %s MiB uebersteigt die Karte: kein Bruchteil moeglich" % _fmt(aux["reserve"]),
+        if fr is not None else "Reserve %s MiB (+ Kontext/Treiber %s MiB) uebersteigt die Karte: kein Bruchteil moeglich" % (_fmt(aux["reserve"]), _fmt(aux["overhead"])),
         state=fit_state if fr is not None else V_NO, code=fit_code if fr is not None else "FIT-RESERVE", grund=fit_grund if fr is not None else "Reserve groesser als die Karte")
     if F["n_lin"] and v.get("slots") is not None:
         out["--max-mamba-cache-size"] = _entry(
@@ -720,7 +763,8 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
     ``goals`` (alle optional): ``context_tokens`` (Standard min(Modell-Maximum, 131072)), ``kv_tokens`` (Standard = Kontext), ``seats`` (Standard 1),
     ``draft`` ``auto|on|off|nextn|external`` (Standard auto: MTP-Kopf bzw. Draft-Profil nutzen, wenn es passt), ``kv_dtype`` (``None`` = der Planer waehlt;
     ``auto`` = Modell-Dtype, ``fp8_e4m3`` ...), ``vision`` (Standard ``False``), ``host_ram_mib`` (HiCache-Host-Budget; ohne Angabe kein HiCache),
-    ``chunked_prefill_size``, ``reserve_mib`` (gemessene Reserve statt der ServerArgs-Heuristik), ``disable_radix``.
+    ``chunked_prefill_size``, ``reserve_mib`` (gemessene Reserve statt der ServerArgs-Heuristik), ``disable_radix``,
+    ``pre_load_free_mib`` (gemessenes ``pre_model_load_memory`` in MiB, 0 < Wert <= Karte; ohne Angabe Karte - ``CONTEXT_OVERHEAD_DEFAULT_MIB``, unbelegt).
     ``overrides``: ``{flag: wert}`` -- jeder Wert ist setzbar; die Passung wird mit den uebersteuerten Werten NEU gerechnet."""
     c = normalize_card(card)
     F = model_facts(model_profile, draft_profile)
@@ -750,6 +794,13 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
             if e["zustand"] == Z_PROPOSED and e["wert"] is not None and (e["flag"] in _FIT_FLAGS or e["flag"] in ("--kv-cache-dtype", "--hicache-ratio", "--speculative-algorithm") or "unbelegt" in e["herkunft"]):
                 e["zustand"] = Z_UNBELEGT
                 e["begruendung"] += " [geborgt, unbelegt: %s]" % ", ".join(borrowed)
+    if acc["kontext_treiber_standard"]:
+        # Der Kontext/Treiber-Posten ist ein geborgter Standardwert; alles, was am statischen Budget haengt, traegt das (nur wenn nicht schon uebersteuert).
+        for e in entries:
+            if e["flag"] in ("--mem-fraction-static", "--max-total-tokens", "--max-mamba-cache-size", "--hicache-ratio") and e["wert"] is not None:
+                if e["zustand"] == Z_PROPOSED:
+                    e["zustand"] = Z_UNBELEGT
+                e["begruendung"] += " [Kontext + Treiber %s MiB angenommen, am Einzelserver unbelegt; goals pre_load_free_mib ersetzt ihn]" % _fmt(acc["kontext_treiber_mib"])
     max_ctx = max_context_fit(F, c, v, g)
     fit = {k: val for k, val in acc.items() if not k.startswith("_")}
     fit["max_context_tokens_fit"] = max_ctx
@@ -757,8 +808,9 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
     nums = acc["_numbers"]
     if fit["passt"]:
         verdict = {"state": "passt", "art": VERDICT_ART,
-                   "text": "passt: statisch %s von %s MiB (Gewichte %s, Draft %s, KV %s, Mamba %s + %s Spekulation), %s MiB frei; Reserve %s MiB; Kontext bis %s Token" % (
-                       _fmt(fit["statisch_summe_mib"]), _fmt(fit["statisch_budget_mib"] or 0), _fmt(nums["w_main"]), _fmt(nums["w_draft"]),
+                   "text": "passt: statisch %s von %s MiB (= fraction x frei vor dem Laden; Kontext/Treiber %s MiB%s; Gewichte %s, Draft %s, KV %s, Mamba %s + %s Spekulation), %s MiB frei; Reserve %s MiB; Kontext bis %s Token" % (
+                       _fmt(fit["statisch_summe_mib"]), _fmt(fit["statisch_budget_mib"] or 0), _fmt(fit["kontext_treiber_mib"]),
+                       " angenommen, unbelegt" if fit["kontext_treiber_standard"] else " (Ziel)", _fmt(nums["w_main"]), _fmt(nums["w_draft"]),
                        _fmt(nums["kv_main"] + nums["kv_draft"]), _fmt(nums["mamba_main"]), _fmt(nums["mamba_spec"]), _fmt(fit.get("frei_mib", 0.0)),
                        _fmt(fit["reserve_gegeben_mib"] or 0), max_ctx if max_ctx is not None else "?")}
     elif acc["unbelegt"] and not any(not ch["ok"] for ch in acc["checks"]):
@@ -769,6 +821,9 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
                    "text": "passt nicht: " + " | ".join(failing) + ("; Posten: Gewichte %s + Draft %s + KV %s + Mamba %s + Spekulation %s MiB; mit diesen Werten haelt der KV-Pool %s Token Kontext" % (
                        _fmt(nums["w_main"]), _fmt(nums["w_draft"]), _fmt(nums["kv_main"] + nums["kv_draft"]), _fmt(nums["mamba_main"]), _fmt(nums["mamba_spec"]),
                        max_ctx if max_ctx is not None else "?"))}
+    if acc["kontext_treiber_standard"]:
+        unb.append("CUDA-Kontext + Treiber %.0f MiB (Standardwert, Messung am Launcher-Format launcher.py:253): am Einzelserver unbelegt; goals['pre_load_free_mib'] = gemessenes pre_model_load_memory"
+                   % acc["kontext_treiber_mib"])
     unb.append("ServerArgs.__post_init__ (Geraeteerkennung, Kompatibilitaets-Refusals) ist nicht gelaufen: braucht einen Beschleuniger; nur argparse-Parse (serverargs_parse)")
     if c["unified"]:
         unb.append("APU-Speichermodell (torch-Gesamtspeicher = adressierbare Decke) unbelegt am Rig")
