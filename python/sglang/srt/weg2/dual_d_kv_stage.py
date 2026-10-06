@@ -457,6 +457,12 @@ def attach(runner) -> Optional[DKvStage]:
     actor._committed = boot_bytes
     actor._engage_cap(actor.allocator, boot, actor.page)
     _arm_low_first(actor.allocator)
+    from sglang.srt.weg2 import dual_d_compact as _dc
+
+    if _dc.armed():
+        logger.info("%s D-COMPACT armed (%s, default on in the dual D): when P waits past the live-yield bound "
+                    "and live rows above the shrink target hold the span, they move down first", MARK,
+                    _dc.SWITCH_ENV)
     setattr(runner, ACTOR_ATTR, actor)
     logger.info("%s JOIN card=%s boot_tokens=%d contributed=%d B (kept mapped) top=%d", MARK, card[-12:],
                 boot, boot_bytes, actor.top)
@@ -837,6 +843,32 @@ def _drop_order_step(actor, g, arena_need: int, p_waiting: bool, p_wait_s: float
     return order
 
 
+def _compact_step(sched, actor, *, want: int, floor: int, live_due: bool, p_waiting: bool,
+                  p_wait_s: float, avail_min: int, air: int, holds: bool, p_missing: bool, recent_grow: bool,
+                  group_demand: int) -> int:
+    """D-COMPACT gate + call (the tick's floor back; a lower one only after a compaction every rank
+    completed). Every input is a GROUP value (the tick's collective, the replicated mapping), so all D
+    ranks enter ``dual_d_compact.run`` -- and its collectives -- together or not at all."""
+    from sglang.srt.weg2 import dual_d_compact as _dc
+
+    if not _dc.armed():
+        return floor
+    if not p_waiting:
+        _dc.reset(actor)
+        return floor
+    if not live_due or holds or p_missing or recent_grow:
+        return floor
+    guarded = (int(group_demand) > 0 or holds) and avail_min < NO_AVAIL
+    verdict, target = decide(actor.mapped_tokens, want, True, 0, actor.step,
+                             avail_min=avail_min if guarded else None, air=air, holds=holds)
+    if verdict != "shrink" or int(target) >= _pk.round_up(floor, actor.step):
+        return floor                                         # the shrink is not held by a live row
+    if not _dc.due(actor, p_wait_s):
+        return floor
+    new = _dc.run(sched, actor, target=int(target), floor=int(floor), p_wait_s=p_wait_s)
+    return floor if new is None else int(new)
+
+
 def tick(sched) -> Optional[str]:
     """Once per scheduler iteration on every D rank. ONE collective per tick
     (MAX of want, P-waiting and the highest live row), so every rank decides on
@@ -910,6 +942,12 @@ def tick(sched) -> Optional[str]:
         # is still not demand. Unlocked nodes only (a running seat's rows are
         # locked); a held context (D-PARK, W50, D-HOLD-FOR-GROW) keeps its rows.
         freed = cache_yield(sched, actor, live=(floor, p_wait_s))
+    # D-COMPACT (switch SGLANG_WEG2_DUAL_D_COMPACT, default on in the dual D): when P has waited past the
+    # live-yield bound and only live rows above the shrink target hold D's span, move them down first --
+    # the floor then falls in THIS tick and the shrink below gives P its card (dual_d_compact.py)
+    floor = _compact_step(sched, actor, want=want, floor=floor, live_due=live_due, p_waiting=p_waiting,
+                          p_wait_s=p_wait_s, avail_min=avail_min, air=air, holds=holds, p_missing=p_missing,
+                          recent_grow=recent_grow, group_demand=-int(g[3]))
     want = max(want, _pk.round_up(floor, actor.step))       # never below a live row of any rank
     below = actor._below + 1 if want < actor.mapped_tokens else 0
     # the room rule of decide() guards running, queued or held work; an idle D's

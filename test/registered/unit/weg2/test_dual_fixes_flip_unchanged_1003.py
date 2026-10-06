@@ -38,6 +38,9 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
          half is test_dual_d_park_older_live_free_1989_1005
   #2004  D-WANT-LOCKED (weg2/dual_d_kv_stage.py): never armed outside group D of the dual layout, the
          D tick without the dual actor returns None; the behavioural half is test_dual_d_want_locked_2004_1005
+  D-COMPACT (weg2/dual_d_compact.py, default ON only in the dual D): never armed outside group D of the dual
+         layout; the D tick without the dual actor never reaches it; the behavioural half (moves, three ranks,
+         rollback, draft carry, mutants) is test_dual_d_compact_1006
 """
 from __future__ import annotations
 
@@ -1116,6 +1119,41 @@ class TestQ2004DWantLockedFlipUnchanged:
         with mock.patch.object(DK, "_want_locked_step", lambda *a: called.append(a)), \
                 mock.patch.object(DK, "_instr_d_want", lambda *a, **k: called.append(a)):
             assert DK.tick(sched) is None
+        assert called == []
+
+
+# ---------------------------------------------------------------------------------- D-COMPACT 1006
+
+class TestDCompactFlipUnchanged:
+    def test_flip_form_never_arms_the_compaction_even_with_the_switch_on(self, monkeypatch):
+        """D-COMPACT (weg2/dual_d_compact.py, default ON only in the dual D): without the dual layout (flip, NF,
+        27B INT8 row authority), on P, or without the D KV stage the switch is a dead letter; the D tick without
+        the dual actor never reaches the compaction (no plan, no collective, no row moved)."""
+        from sglang.srt.weg2 import dual_d_compact as DC
+
+        monkeypatch.setenv(DC.SWITCH_ENV, "1")
+        monkeypatch.delenv(DK.MAX_TOKENS_ENV, raising=False)
+        for env in _wrong_gates() + [{"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P",
+                                      DK.MAX_TOKENS_ENV: "131072"},
+                                     {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D"}]:
+            for k in DUAL_KEYS:
+                monkeypatch.delenv(k, raising=False)
+            monkeypatch.delenv(DK.MAX_TOKENS_ENV, raising=False)
+            for k, v in env.items():
+                monkeypatch.setenv(k, v)
+            assert DC.armed() is False, env
+        called = []
+        sched = SimpleNamespace(tp_worker=SimpleNamespace(model_runner=SimpleNamespace()))
+        with mock.patch.object(DC, "run", lambda *a, **k: called.append(a)), \
+                mock.patch.object(DK, "_compact_step", lambda *a, **k: called.append(a)):
+            assert DK.tick(sched) is None
+        assert called == []
+        # an actor without the gate (cannot happen in the flip form, the gate is checked anyway): floor unchanged
+        actor = SimpleNamespace(mapped_tokens=240, step=16)
+        with mock.patch.object(DC, "run", lambda *a, **k: called.append(a)):
+            assert DK._compact_step(sched, actor, want=96, floor=239, live_due=True, p_waiting=True, p_wait_s=9.0,
+                                    avail_min=150, air=4, holds=False, p_missing=False, recent_grow=False,
+                                    group_demand=10) == 239
         assert called == []
 
 
