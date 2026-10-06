@@ -2603,6 +2603,23 @@ def _chunked_rest(sched) -> int:
     return max(0, _req_tokens(req) - (min(done) if done else 0))
 
 
+def _queued_load_back(admissible) -> int:
+    """The host load-back tokens the queued requests the next admission takes
+    will put on the device in ONE step (``pp_load_back_extent``, stamped at the
+    request's own match of an earlier pass; 0 until it was matched -- the
+    guard then still stands). Rank-LOCAL by construction (``#1046``: each rank
+    chose its extent at its own match): it enters only this rank's room
+    (``free ids below the cap - need``), whose verdict is the group MIN, so a
+    rank with more to load back is exactly the one that must lift the cap.
+    Each request's extent is clamped to its own prompt."""
+    total = 0
+    for r in admissible:
+        ext = getattr(r, "pp_load_back_extent", None)
+        if ext:
+            total += max(0, min(int(ext), _req_tokens(r)))
+    return total
+
+
 def free_tokens_below(allocator, tokens: int, page_size: int) -> Optional[int]:
     """Rank-local: the tokens of the FREE page ids at or below the cap of
     ``tokens`` (the only ids an allocation under that cap can take); None
@@ -2800,6 +2817,7 @@ def runtime_tick(sched):
     if form is None:
         return _tick_noop(sched)
     from sglang.srt.weg2.d_mem_sched import MemSched
+    from sglang.srt.weg2.park import chunk_admit_tokens
 
     n = max(1, min(int(st.n or st.cap), int(st.cap)))
     tokens = tuple(form.tokens[: form.max_stage(n) + 1])
@@ -2854,7 +2872,12 @@ def runtime_tick(sched):
     rest = 0
     if ms.pending is not None and alloc is not None and (incoming > 0 or used > 0):
         chunk = int(getattr(getattr(sched, "server_args", None), "chunked_prefill_size", 0) or 0)
-        first = min(int(incoming), chunk) if chunk > 0 else int(incoming)
+        # NF 1540 (cand3 bce16a6ddf 23:45:03Z, weg2-62-415: 26048 host-backed
+        # prefix + 1572): the host load-back is NOT chunked -- ``add_one_req`` /
+        # ``chunk_admit_tokens`` (Q-700) charge it WHOLE, the allocator takes it
+        # at admission. ``first`` as one chunk counted 4096 against room 26880,
+        # the load-back took 26048 of it and the 1572 extend found 832.
+        first = chunk_admit_tokens(int(incoming), chunk, load_back=_queued_load_back(admissible))
         # NF 1528 (K2 20:49:25Z, weg2-54-290: 2176 + 830): the request after its
         # first chunk is the chunked_req, in ``used`` and no longer in
         # ``incoming`` -- the lift paid for chunk 1 only, ended itself between

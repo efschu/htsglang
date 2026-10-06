@@ -262,3 +262,117 @@ def test_h_flip_unchanged_a_live_chunked_req_adds_nothing_outside_the_stage_form
         assert dsv.runtime_tick(sched) is None
     assert hits == [] and calls == []
     assert not hasattr(sched, dsv.MEM_SCHED_ATTR)
+
+
+# ---------------------------------------------------------------------------
+# NF 1540 (cand3 bce16a6ddf, 05.10. 23:45:03Z): the lift did not count the load-back
+# ---------------------------------------------------------------------------
+# weg2-62-415: 27620 tokens, 26048 of them a HOST-backed prefix (``pp_load_back_extent``
+# 26048), 1572 to extend. Pending S0 (cap 32768) with 26880 free tokens (420 ids) below
+# it, 19200 evictable tokens above it. The tick weighed one chunk (4096 + 0 seats) against
+# 26880 -> no lift; ``init_load_back`` put the 26048 on the device in one step, 832 were
+# left for the 1572 extend ("Prefill out of memory", EVICTION UNDER-DELIVERED 64 of 868).
+
+
+def _hosted(rid, n_in, load_back):
+    r = _req(rid, n_in)
+    r.pp_load_back_extent = load_back
+    return r
+
+
+def test_i_a_host_load_back_is_paid_whole_by_the_lift(floor_env, caplog):
+    import logging
+
+    dsv, sched, caps, floor = floor_env
+    # page 64, cap 32768 = page 512: 420 free ids below it = 26880 tokens, the rest above
+    sched.token_to_kv_pool_allocator = _alloc(list(range(10, 430)) + list(range(600, 700)))
+    ms = _pending_s0(dsv, sched, caps, floor)
+    caplog.set_level(logging.INFO)
+    sched.waiting_queue = [_hosted("weg2-62-415", 27620, 26048)]
+    dsv.runtime_tick(sched)
+    assert ms.pending == 0, "the machine itself keeps the pending shrink (27620 fits S0)"
+    lines = _caplift_lines(caplog, dsv)
+    assert ms._cap_lifted is True and caps[-1] == FLOOR_LADDER[1], (
+        "the pending cap stayed at 32768: the 26048-token load-back + 1572 extend need "
+        "27620 and only 26880 ids are free below it (NF 1540: Prefill out of memory)")
+    assert lines and "lifted=yes" in lines[-1]
+    assert "need=27620" in lines[-1] and "room=26880" in lines[-1]
+
+
+def test_j_a_load_back_the_room_pays_keeps_the_pending_cap(floor_env, caplog):
+    import logging
+
+    dsv, sched, caps, floor = floor_env
+    sched.token_to_kv_pool_allocator = _alloc(list(range(10, 450)) + list(range(600, 700)))  # 28160
+    ms = _pending_s0(dsv, sched, caps, floor)
+    caplog.set_level(logging.INFO)
+    n = len(caps)
+    sched.waiting_queue = [_hosted("weg2-62-415", 27620, 26048)]
+    dsv.runtime_tick(sched)
+    assert ms._cap_lifted is False and len(caps) == n and caps[-1] == FLOOR_LADDER[0]
+    assert not _caplift_lines(caplog, dsv)
+
+
+def test_k_without_a_load_back_extent_the_need_is_one_chunk(floor_env):
+    """The request has not been matched yet (no extent) or has no host hit: the
+    need stays the first chunk, byte-for-byte what 1528 computed."""
+    dsv, sched, caps, floor = floor_env
+    sched.token_to_kv_pool_allocator = _alloc(list(range(10, 430)) + list(range(600, 700)))
+    ms = _pending_s0(dsv, sched, caps, floor)
+    for ext in (None, 0):
+        n = len(caps)
+        sched.waiting_queue = [_hosted("weg2-62-415", 27620, ext)]
+        dsv.runtime_tick(sched)
+        assert ms._cap_lifted is False and len(caps) == n and caps[-1] == FLOOR_LADDER[0]
+    plain = _req("weg2-62-416", 27620)          # a double without the field at all
+    sched.waiting_queue = [plain]
+    dsv.runtime_tick(sched)
+    assert ms._cap_lifted is False and caps[-1] == FLOOR_LADDER[0]
+
+
+def test_l_queued_load_backs_add_up_and_stay_inside_their_prompt():
+    from sglang.srt.weg2 import d_seat_vram as dsv
+
+    assert dsv._queued_load_back([]) == 0
+    assert dsv._queued_load_back([_req("a", 100), _hosted("b", 100, None)]) == 0
+    assert dsv._queued_load_back([_hosted("a", 14000, 13000), _hosted("b", 14000, 13000)]) == 26000
+    assert dsv._queued_load_back([_hosted("a", 1000, 5000)]) == 1000      # clamped to its own prompt
+    assert dsv._queued_load_back([_hosted("a", 1000, -5)]) == 0
+
+
+def test_m_two_queued_load_backs_are_paid_together(floor_env):
+    dsv, sched, caps, floor = floor_env
+    sched.token_to_kv_pool_allocator = _alloc(list(range(10, 430)) + list(range(600, 700)))  # 26880
+    ms = _pending_s0(dsv, sched, caps, floor)
+    sched.waiting_queue = [_hosted("a", 14000, 13000)]       # one alone fits: 13000 + 1000
+    dsv.runtime_tick(sched)
+    assert ms._cap_lifted is False
+    sched.waiting_queue = [_hosted("a", 14000, 13000), _hosted("b", 14000, 13000)]
+    dsv.runtime_tick(sched)                                  # 26000 + 2000 > 26880
+    assert ms._cap_lifted is True and caps[-1] == FLOOR_LADDER[1]
+
+
+@pytest.mark.parametrize("group,stage_tokens", [("", None), ("P", None), ("D", None), ("D", "262144")])
+def test_n_flip_unchanged_a_queued_load_back_adds_nothing_outside_the_stage_form(
+        monkeypatch, group, stage_tokens):
+    """The 27B flip / P / a D without stage form leave the tick before the
+    cap-lift block: a queued load-back is never read there."""
+    from test_weg2_d_mem_sched_0929 import _no_side_effects
+
+    from sglang.srt.weg2 import d_seat_vram as dsv
+
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", group)
+    monkeypatch.setenv("SGLANG_OPT_WEG2_D_SEAT_VRAM", "1")
+    if stage_tokens is None:
+        monkeypatch.delenv("SGLANG_WEG2_D_KV_STAGE_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_WEG2_D_KV_STAGE_TOKENS", stage_tokens)
+    hits, sched = _no_side_effects(monkeypatch, dsv)
+    sched.waiting_queue = [_hosted("weg2-62-415", 27620, 26048)]
+    setattr(sched, dsv.PHASE_ATTR, dsv.PhaseState(epoch="e", n=6, cap=6, done=True))
+    calls = []
+    monkeypatch.setattr(dsv, "_queued_load_back", lambda adm: calls.append(1) or 0)
+    for _ in range(3):
+        assert dsv.runtime_tick(sched) is None
+    assert hits == [] and calls == []
+    assert not hasattr(sched, dsv.MEM_SCHED_ATTR)
