@@ -916,7 +916,8 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
                 scratch: Optional[str] = None, farm_root: str = DEFAULT_FARM_ROOT,
                 siblings: Mapping[str, Sequence[str]] = DEFAULT_MODEL_SIBLINGS,
                 asset_dirs: Sequence[str] = DEFAULT_ASSET_DIRS, evidence_dir: Optional[str] = None,
-                snapshots: Optional[Mapping[str, str]] = None) -> ProfileRun:
+                snapshots: Optional[Mapping[str, str]] = None,
+                launch_input: Optional["LaunchInput"] = None) -> ProfileRun:
     """Release profile -> launcher dry run on ``devices``: :func:`profile_launch_input`, the model name farms for model
     dirs that are empty on this box, :func:`run_dry_run`.  The ``plan_dump.py`` recipe as one call.
 
@@ -930,7 +931,10 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
       the result;
     * a farm path is not the path the census was measured on: ``--weg2-xchg-census-foreign`` is added when a farm is used
       and the argv names a census (the flag the dual1i profile itself carries)."""
-    li = profile_launch_input(env_path, instruments=instruments, tag=tag, asset_dirs=asset_dirs)
+    # AP-C: ``launch_input`` = a ready LaunchInput (a ``propose()`` result: argv + env + the profile's model/draft vars) instead
+    # of reading ``env_path``; everything below is the same recipe
+    li = launch_input if launch_input is not None else profile_launch_input(
+        env_path, instruments=instruments, tag=tag, asset_dirs=asset_dirs)
     notes: List[str] = []
     farmed = False
 

@@ -313,10 +313,18 @@ class TestProfileLaunchInput(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), want, name)
 
     def test_launch_input_equals_golden_json(self):
+        # the dual profile's ``--p-chunk-policy-file`` token is an ABSOLUTE path inside the worktree that made the golden
+        # (``.../worktrees/planer-ap0-1006/test/...``): compare with the worktree root replaced (AP-C fix: the test failed in
+        # every other worktree, measured 2026-10-06 in planer-apc-1006)
+        root = os.path.join(TREE, "")
+
+        def norm(doc):
+            return json.loads(json.dumps(doc).replace(root, "<TREE>/").replace("/spinning/htsglang/.claude/worktrees/planer-ap0-1006/", "<TREE>/"))
+
         for key, name in PROFILE_FILES.items():
             li = O.profile_launch_input(_p(name), asset_dirs=())
             want = json.loads(_read(os.path.join(GOLDEN, "launch_%s.json" % name)))
-            self.assertEqual(O.launch_input_doc(li), want, name)
+            self.assertEqual(norm(O.launch_input_doc(li)), norm(want), name)
 
     def test_bash_arrays_are_read_whole(self):
         for name in PROFILE_FILES.values():
