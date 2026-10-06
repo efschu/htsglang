@@ -15,7 +15,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from rigdash import history, ipcboot, vmpush  # noqa: E402
+from rigdash import flipzeit, history, ipcboot, vmpush  # noqa: E402
 
 T = 1790943000.0
 
@@ -105,11 +105,10 @@ class FlipzeitDP(unittest.TestCase):
         self.assertEqual(x["kind"], "fehlt")
         self.assertIsNone(x["total_ms"])
         self.assertIn("forward_ct", x["missing"])
-        fl = ipcboot.flip_last([x])["D>P"]
-        self.assertEqual((fl["n"], fl["newest"]["kind"]), (0, "fehlt"))
-        ft = ipcboot.flip_times_of([x])
-        self.assertIsNone(ft["D>P"]["last"])
-        self.assertIn("forward_ct", ft["D>P"]["missing"])
+        self.assertEqual(flipzeit.stats(flipzeit.from_views([x]), "D>P")["n"], 0)        # a missing end is never a point
+        dg = ipcboot.flip_diag([x])["D>P"]
+        self.assertEqual(dg["missing_n"], 1)
+        self.assertIn("forward_ct", dg["missing"])
 
 
 def _ipc_pd(first_work=11.063, what="decode_token"):
@@ -175,10 +174,6 @@ class FlipzeitPush(unittest.TestCase):
         self.assertEqual(pts, [])
         self.assertGreater(newest, 0.0)
 
-    def test_vm_flip_stats(self):
-        st = vmpush.flip_stats_from({"D>P": [(1, 9814.0), (2, 8523.0), (3, 10191.0)]})["D>P"]
-        self.assertEqual((st["n"], st["median"], st["max"]), (3, 9814.0, 10191.0))
-
 
 class FlipzeitHistory(unittest.TestCase):
     def test_history_tiles_read_only_the_t2t_marks(self):
@@ -191,7 +186,7 @@ class FlipzeitHistory(unittest.TestCase):
         fl = v["tiles"]["flip"]
         self.assertEqual((fl["D>P"]["last_ms"], fl["D>P"]["n"]), (9814.0, 1))
         self.assertEqual((fl["P>D"]["last_ms"], fl["P>D"]["n"]), (2603.0, 1))
-        self.assertEqual(v["tiles"]["flip_last_ms"], 2603.0)
+        self.assertNotIn("flip_last_ms", v["tiles"])                       # one tile payload: tiles["flip"]
         vals = [(m["kind"], m["v"]) for m in v["marks"] if m["kind"].startswith("flip")]
         self.assertNotIn(("flip_user", 2513.0), vals)
         self.assertNotIn(("flip", 2601.0), vals)

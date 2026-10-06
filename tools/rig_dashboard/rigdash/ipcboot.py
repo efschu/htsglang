@@ -11,7 +11,7 @@ Replaces live.LiveLogs as the source of /api/live ``boots``.  Per boot state dir
 
 Every second a sample of every non-terminal boot's rank counters goes into a 16-min ring; the rates,
 windows, bursts, 15-min curves and the phase bar are deltas over that ring.  The view keeps the keys
-the page already reads (prefill/decode/totals/cache/series/timeline/flip_times/...), so the card
+the page already reads (prefill/decode/totals/cache/series/timeline/...), so the card
 renders unchanged; a value without an IPC source is None and the page says "fehlt in IPC" with the
 writer that would have to write it (ipcfields.MISSING_WRITER).  Pure view functions, unit-tested.
 """
@@ -24,7 +24,7 @@ import time
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
-from . import activity, grouplog, ipcfields, ipcstate, stops
+from . import activity, flipzeit, grouplog, ipcfields, ipcstate, stops
 
 SAMPLE_S = 1.0
 RING_S = 16 * 60.0
@@ -600,22 +600,15 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
             "states": list(activity.STATES)}
 
 
-def _q(xs, p):
-    xs = sorted(x for x in xs if x is not None)
-    return xs[max(0, math.ceil(p * len(xs)) - 1)] if xs else None
-
-
 # ----------------------------------------------------------------------------- Flipzeit in Nutzersicht
-# Nutzer 02.10. (ersetzt 29.09./01.10.): FLIPZEIT = vom LETZTEN Token der abgebenden Phase bis zum ERSTEN Token
-# der annehmenden, fuer beide Richtungen und beide Modelle, die eine und einzige Flipzeit (Wortlaut 17:50Z:
-# "letztes decode token wurde erzeugt ->(alles hier ist flipzeit)->erster chunk prefill -> letzer cunk prefill
-# -> (alles hier ist flipzeit)->erstes decode token wurde erzeugt"):
-#   P->D: Ende des letzten P-Prefill-Chunks (P's eigener Chunk-Stempel) -> erstes erzeugtes Decode-Token auf D
-#   D->P: letztes erzeugtes Decode-Token auf D (D's eigene Runde) -> Beginn des ersten Prefill-Forwards auf P (PP0)
-# Nie ein Front-Marker (Park, flip_begin, Ankunft, Leg-1-Ende) als Endpunkt: alles dazwischen -- Halten,
-# MIN-DWELL, Zaehlung, Drain, Park -- ist Flipzeit.
-# Die kleine Zahl (flip_ms, done-begin, Leg-1-Dispatch) ist nirgends mehr eine Flipzeit, nur ein Teil der
-# Zerlegung (flip_partition: Vorlauf + Layer + Wake-KV/DC + Nachlauf + Rest = total).
+# Nutzer 06.10. (EINZIGE Definition, flipzeit.DEFINITION), fuer beide Richtungen und beide Modelle:
+#   P>D = letzter P-Chunk fertig            -> erstes Decode-Token erzeugt
+#   D>P = letztes Decode-Token erzeugt      -> erster Prefill-Chunk beginnt zu rechnen (erster Forward auf PP0)
+# Ausnahme (Nutzer): kein Flip zaehlt, wenn kein Prefill oder Decode ansteht (kind "leerlauf").
+# flip_views misst je Flip diese eine Zahl (total_ms) und zerlegt sie (flip_partition: Vorlauf + Layer + Wake-KV/DC +
+# Nachlauf + Rest = total); gezaehlt, gemittelt und angezeigt wird sie ausschliesslich ueber flipzeit.py.
+# Nie ein Front-Marker (Park, flip_begin, Ankunft, Leg-1-Dispatch/-Ende) als Endpunkt, und keine Teilzahl
+# (flip_ms, done-begin) als Flipzeit: alles dazwischen -- Halten, MIN-DWELL, Zaehlung, Drain, Park -- ist Flipzeit.
 FLIP_IDLE_S = 120.0          # no work this long after flip_done (or before the next flip): Leerlauf-Flip
 
 
@@ -970,45 +963,21 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
     return out
 
 
-def _stats(vals: List[float]) -> dict:
-    return {"n": len(vals), "median": _q(vals, 0.5), "p90": _q(vals, 0.9), "max": max(vals) if vals else None}
-
-
-def flip_last(views: List[dict]) -> dict:
-    """Per direction: the newest measured flip (bold on the page), p50/p90/max of the measured totals in the
-    ring, the newest flip whose endpoint is missing (the page says "fehlt (Feld X)"), idle and open flips."""
+def flip_diag(views: List[dict]) -> dict:
+    """What the Flipzeit tiles do NOT count, named per direction (Nutzer 06.10.: the numbers themselves are
+    flipzeit.py's, from the history marks, one window): flips whose endpoint is missing (``missing_n``, the
+    newest one's field in ``missing``), a flip still open, and -- for a P>D -- the depth the P side reached
+    after the flip's last counted chunk (``p_depth`` at ``p_depth_t``).  Ring window only; no figure of it
+    is a Flipzeit."""
     out = {}
-    for d in ("P>D", "D>P"):
+    for d in flipzeit.DIRS:
         mine = [x for x in views if x["dir"] == d]
-        ok = [x for x in mine if x["kind"] == "ok" and x.get("total_ms") is not None]
-        idle = [x for x in mine if x["kind"] == "leerlauf"]
-        miss = [x for x in mine if x["kind"] == "fehlt"]
         newest = next((x for x in reversed(mine) if x["kind"] in ("ok", "fehlt")), None)
-        out[d] = dict(_stats([x["total_ms"] for x in ok]), last=ok[-1] if ok else None,
-                      newest=newest, missing_n=len(miss), missing_last=miss[-1] if miss else None,
-                      idle_n=len(idle), idle_last=idle[-1] if idle else None,
-                      open=next((x for x in reversed(mine) if x["kind"] == "offen"), None))
-    return out
-
-
-def flip_times_of(views: List[dict]) -> dict:
-    """flip_times for the card, from flip_views only (Nutzer 02.10.: the layer-only number disappears as a
-    Flipzeit everywhere): per direction n/last/p50/p90/max of total_ms, ``recent`` = total per flip."""
-    fl = flip_last(views)
-    out = {"instruments": {"total": "Flipzeit = letztes Token -> erstes Token (flip_views)"}, "headline": "total"}
-    for d in ("P>D", "D>P"):
-        x = fl[d]
-        last = x["last"]
-        nw = x["newest"] or {}
-        out[d] = {"n": x["n"], "last": last["total_ms"] if last else None, "last_t": last["begin"] if last else None,
-                  "median": x["median"], "p90": x["p90"], "max": x["max"], "open": x["open"] is not None,
-                  "src": last.get("src") if last else None,
-                  "missing": nw.get("missing") if nw.get("kind") == "fehlt" else None,
-                  "missing_n": x["missing_n"], "no_work": x["idle_n"]}
-    out["recent"] = [{"t": x["begin"], "dir": x["dir"], "ms": x["total_ms"], "kind": x["kind"], "missing": x.get("missing"),
-                      "parts": {k: x.get(k) for k in PARTS + VOR_PARTS}, "provisional": x.get("provisional"),
-                      "state": x["kind"], "src": "ipc"}
-                     for x in views if x["kind"] in ("ok", "fehlt")][-24:]
+        last = next((x for x in reversed(mine) if flipzeit.counted(x)), None)
+        out[d] = {"missing_n": sum(1 for x in mine if x["kind"] == "fehlt"),
+                  "missing": newest.get("missing") if newest and newest["kind"] == "fehlt" else None,
+                  "open": any(x["kind"] == "offen" for x in mine),
+                  "p_depth": last.get("p_depth") if last else None, "p_depth_t": last["begin"] if last else None}
     return out
 
 
@@ -1379,7 +1348,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
         "flip_open": bool(b6.get("open")),
         "flips": flip_done[-12:],
         "flip_count": len(flip_done),
-        "flip_times": None,             # below, from flip_views (the one Flipzeit)
+        "flip_diag": None,              # below, from flip_views (what is not counted); the Flipzeit itself: flipzeit.py
         "health": health,
         "errors": [{"t": x.get("t"), "group": x.get("group"), "text": x.get("text") or x.get("exc") or ""}
                    for x in (a13.get("last") or [])],
@@ -1410,8 +1379,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
     # Nutzer 01.10. ~08:20Z: Flipzeit in Nutzersicht mit Vorlauf/Layer-Tausch/Nachlauf, und die Phase jetzt
     fv = flip_views(v["timeline"]["segs"], ipc, now, ring)
     v["flip_views"] = fv[-24:]
-    v["flip_last"] = flip_last(fv)
-    v["flip_times"] = flip_times_of(fv)
+    v["flip_diag"] = flip_diag(fv)
     v["phase_now"] = phase_now(v["timeline"]["segs"], ipc, front, fv, live, now)
     view_ipc = {k: x for k, x in ipc.items() if k not in ("ipc_events", "flip_first_work", "flip_user_time", "request_done")}
     v["ipc"] = view_ipc

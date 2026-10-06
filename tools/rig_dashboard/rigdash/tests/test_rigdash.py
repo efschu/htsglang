@@ -1105,8 +1105,10 @@ IMAGES = {
 
 
 class FlipTimeTests(unittest.TestCase):
-    """Flipzeit (Nutzer 29.09.) = WEG2-FLIP begin -> erstes Decode-Token, nicht flip_total."""
+    """Flipzeit (Nutzer 06.10.): ONE definition, ONE computation (flipzeit.py).  The old log reader keeps none of its
+    own: no begin -> first-work-line figure, no flip_total headline, no per-model headline switch, no IPC override."""
 
+    # helpers of the WachOhneArbeit tests below (they feed the log reader's phase bar, not a Flipzeit)
     @staticmethod
     def _stamp(t, frac=False):
         s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))
@@ -1120,61 +1122,16 @@ class FlipTimeTests(unittest.TestCase):
             "[%s TP0] Decode rank batch, rank: 0, #round: 7, t: %.3f, bs: 1, #rows: 4, #fwd: 1, gpu-ms: 30.0 (x)"
             % (self._stamp(t), t)))
 
-    def _prefill(self, b, t):
-        b._ingest("P", parse.parse_line(
-            "[%s PP0] Prefill batch, #new-seq: 1, #new-token: 16384, #cached-token: 0, full token usage: 0.26, "
-            "#running-req: 0, #queue-req: 1, input throughput (token/s): 4898.99" % self._stamp(t)))
-
-    def test_p_to_d_is_begin_to_first_decode_token_and_flip_total_is_only_the_layer_swap(self):
-        base = 1790500000.0
-        b = live.Boot("x", "/tmp")
-        for k in range(20):                                     # D decoded before (earlier phase)
-            self._decode(b, base - 100 + k * 0.05)
-        for i, (fliptime, layer) in enumerate(((2.4, 1948), (3.1, 2100), (2.0, 1800))):
-            t = base + i * 60
-            self._front(b, t, "WEG2-FLIP begin epoch=%d sleep=P wake=D outstanding=0 queue=1" % (2 * i))
-            self._front(b, t + layer / 1000.0, "WEG2-FLIP done epoch=%d slept=P woke=D drain+quiesce=100 ms "
-                        "sleep=1000 ms wake=1000 ms flip_total=%d ms weights_tags=17" % (2 * i + 1, layer))
-            for k in range(10):
-                self._decode(b, t + fliptime + k * 0.05)
-            # D->P: first PP0 'Prefill batch' 5 s after its begin
-            self._front(b, t + 30, "WEG2-FLIP begin epoch=%d sleep=D wake=P outstanding=0 queue=1" % (2 * i + 1))
-            self._prefill(b, t + 35.4)
-        ft = b.flip_times_view()
-        pd = ft["P>D"]
-        self.assertEqual(pd["n"], 3)
-        self.assertEqual(pd["last"], 2000)
-        self.assertEqual(pd["median"], 2400)
-        self.assertEqual(pd["p90"], 3100)
-        self.assertEqual(pd["layer_last"], 1800)            # flip_total rides beside it, never as the Flipzeit
-        dp = ft["D>P"]
-        self.assertEqual(dp["n"], 3)
-        self.assertTrue(4000 <= dp["last"] <= 5000, dp)      # whole-second stamp of the PP0 line
-        self.assertEqual(dp["resolution_s"], 1.0)
-        self.assertEqual(b.view(base + 200, with_series=False)["flip_times"]["P>D"]["n"], 3)
-
-    def test_a_flip_without_follow_up_work_has_no_flip_time_and_the_newest_is_open(self):
-        base = 1790600000.0
-        b = live.Boot("x", "/tmp")
-        self._front(b, base, "WEG2-FLIP begin epoch=0 sleep=P wake=D outstanding=0 queue=0")
-        self._front(b, base + 20, "WEG2-FLIP begin epoch=1 sleep=D wake=P outstanding=0 queue=0")
-        self._decode(b, base + 21)                              # after the NEXT begin: not this flip's token
-        self._front(b, base + 40, "WEG2-FLIP begin epoch=2 sleep=P wake=D outstanding=0 queue=0")
-        ft = b.flip_times_view()
-        self.assertEqual(ft["P>D"]["n"], 0)
-        self.assertEqual(ft["P>D"]["no_work"], 1)
-        self.assertTrue(ft["P>D"]["open"])
-        self.assertEqual([r["state"] for r in ft["recent"]], ["ohne Folgearbeit", "ohne Folgearbeit", "offen"])
-
-    def test_every_value_names_its_instrument_and_a_27b_boot_leads_with_flip_total(self):
-        # 27B-Review 29.09.: the 27B history is flip_total -- no silent switch of definition under it
-        for stem, tag, headline in (("boot_weg2_dkrnfh91x_0929", "dkrnfh91x", "first_token"),
-                                    ("boot_weg2_dkr27bb1_0929", "dkr27bb1", "flip_total")):
-            b = live.Boot(stem, "/tmp")
-            b.meta["tag"] = tag
-            ft = b.view(1790700000.0, with_series=False)["flip_times"]
-            self.assertEqual(ft["headline"], headline)
-            self.assertEqual(set(ft["instruments"]), {"first_token", "flip_total"})
+    def test_the_log_reader_carries_no_flipzeit_definition(self):
+        for name in ("apply_ipc_first_work", "FIRST_TOKEN_HEADLINE_FOR_27B", "INSTRUMENTS", "is_27b_boot",
+                     "IPC_FIRST_WORK_MATCH_S", "FLIP_MARK_GAP_S"):
+            self.assertFalse(hasattr(live, name), name)
+        for name in ("flip_times_view", "flip_rows", "_flip_rows", "_flip_mark"):
+            self.assertFalse(hasattr(live.Boot, name), name)
+        b = live.Boot("boot_weg2_dkr27bb1_0929", "/tmp")
+        b.meta["tag"] = "dkr27bb1"
+        v = b.view(1790700000.0, with_series=False)
+        self.assertNotIn("flip_times", v)                  # 27B and NF boots show the same (here: no) log figure
 
 
 class ImageChangesTests(unittest.TestCase):

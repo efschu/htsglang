@@ -20,7 +20,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from rigdash import history, ipcboot  # noqa: E402
+from rigdash import flipzeit, history, ipcboot  # noqa: E402
 
 PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -86,12 +86,14 @@ class TestBuildView(unittest.TestCase):
         self.assertAlmostEqual(t["p_rate_gpu"], 2000.0)
         c = self.v["cache"]["D"]["boot"]
         self.assertEqual((c["cached"], c["new"]), (20000, 10))
-        ft = self.v["flip_times"]
-        # Nutzer 02.10.: the Flipzeit is P-Ende -> erstes Decode-Token, never the layer-only 1,8 s; 17:50Z: P-Ende
-        # is P's own last chunk stamp (prefill.last.t 1020,0 on the last stage), not the front's leg-1 end 1020,4
-        self.assertEqual(ft["P>D"]["n"], 1)
-        self.assertAlmostEqual(ft["P>D"]["last"], 2600.0, delta=0.5)
-        self.assertNotIn("layer_newest", ft["P>D"])
+        # Nutzer 06.10.: the Flipzeit is P-Ende -> erstes Decode-Token, never the layer-only 1,8 s; 17:50Z: P-Ende
+        # is P's own last chunk stamp (prefill.last.t 1020,0 on the last stage), not the front's leg-1 end 1020,4;
+        # the card payload carries no figure of its own (flipzeit.py over the history marks is the only one)
+        st = flipzeit.stats(flipzeit.from_views(self.v["flip_views"]), "P>D")
+        self.assertEqual(st["n"], 1)
+        self.assertAlmostEqual(st["last_ms"], 2600.0, delta=0.5)
+        self.assertNotIn("flip_times", self.v)
+        self.assertNotIn("flip_last", self.v)
         self.assertEqual(self.v["flip_count"], 1)
         self.assertTrue(any(x["k"] == "flip_pd" for x in self.v["timeline"]["segs"]))
 
