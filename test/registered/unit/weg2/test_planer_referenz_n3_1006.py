@@ -21,8 +21,16 @@ Parts
 The profiles are SNAPSHOTS under ``fixtures/planer_1006/profiles`` (copies of ``/spinning/gpu-arb/docker/profiles_release/
 27b-base.env``, ``27b-nvfp4-dual.env`` + its ``27b-nvfp4.pchunk.json``, and ``docker/profiles/nf-int4-h6-abl.env``; sha256 in
 ``PROVENANCE`` below): a golden of a profile that moves under it would be a test that moves with the rig.  The goldens are
-box-bound like every dry-run golden of this directory (they carry the census/evidence files and the sibling checkpoint
-headers of this box); the tests SKIP, with the reason, where those inputs are absent.
+box-bound like every dry-run golden of this directory (they carry the census/evidence files of this box); the tests SKIP,
+with the reason, where those inputs are absent.  The checkpoint headers are NOT box-bound: every golden of a profile whose
+checkpoint dir is an empty mount point here (27B Flip model+draft, NF model+draft) is made from the header snapshots of the
+RELEASE checkpoints (below), never from a sibling checkpoint -- measured 2026-10-06 the siblings differ (index total_size
+30819147232 vs 29548245472 B for the 27B model, draft 3848817896 vs 2172742656 B).  Each golden has a
+``<golden>.provenance.json`` (profile sha256, census, checkpoint config/index sha256); ``test_golden_provenance`` ties the
+three together, ``test_profile_snapshots_vs_live`` REPORTS (skip with the reason) when the live release profile has moved
+under its snapshot.  The 27B Dual golden is of the profile with the P/D-stage block (``--dual-priority dynamic``,
+``--dual-share-actuators green,duty``, ``--dual-green-ladder on`` and the ``_form`` GREEN_TABLE/STARVE_* values); the dry run
+passes ``refuse_dual_priority`` (rc=0, nothing forced).
 
 NF (abl form, R9): ``launch_nf-int4-h6-abl.json`` (the argv and environment of the abl profile) and the DRY-RUN golden
 ``plan_nf_abl_n3.txt`` are pinned.  The NF checkpoint dirs (``Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp`` and
@@ -98,7 +106,7 @@ MC = "/spinning/llm_stuff/club-3090/models-cache/"
 #: sha256 of the snapshot files (the live files they were copied from, 2026-10-06)
 PROVENANCE = {
     "27b-base.env": "7f48188299747a86c76b7eb591b57de07cd4897cd65a058fa9859295ca6026b9",
-    "27b-nvfp4-dual.env": "b758c03aa60632872b51756a7c466b6ae2f2c5adc5183635ae1015e7b0065005",
+    "27b-nvfp4-dual.env": "1cc8890ccece7f9bd1097c30072ec6d87031bf4a8d5e9afb03646992ab39a24e",
     "27b-nvfp4.pchunk.json": "a56d1c7a4fb93206e6251540db80dc36656355daed95a3faf1e19de5fc99237c",
     "nf-int4-h6-abl.env": "12f9a824b3d9fc66e065ae6856ca91f2c48be43225c55e302ddfab4fd5cb8092",
 }
@@ -119,10 +127,9 @@ def _have(*paths: str) -> bool:
 
 
 _CENSUS_27B = "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json"
-_NEEDS_27B_FLIP = unittest.skipUnless(
-    _have(_CENSUS_27B, MC + "Qwen3.8-27B-INT8-gdncov/config.json", MC + "Qwen3.8-27B-DFlash2/config.json"),
-    "27B INT8 sibling checkpoints / census not on this box",
-)
+_NEEDS_27B_FLIP = unittest.skipUnless(_have(_CENSUS_27B), "27B census not on this box")
+#: the RELEASE checkpoints of the 27B Flip profile (empty mount points on the dev box; their header snapshots are committed)
+_FLIP_NAMES = ("Qwen3.8-27B-INT8-gdncov-vocabembed", "Qwen3.8-27B-DFlash2-W8-lued")
 _NEEDS_27B_DUAL = unittest.skipUnless(
     _have(_CENSUS_27B, MC + "Qwen3.8-27B-NVFP4-RadixArk/config.json", MC + "Qwen3.8-27B-DFlash2-NVFP4-RTNcal/config.json"),
     "27B NVFP4 checkpoints / census not on this box",
@@ -142,6 +149,12 @@ def _snapshots() -> dict:
             if os.path.isfile(os.path.join(CKPT_SNAPSHOTS, n, "manifest.json")):
                 out[O.read_snapshot_manifest(os.path.join(CKPT_SNAPSHOTS, n))["name"]] = os.path.join(CKPT_SNAPSHOTS, n)
     return out
+
+
+def _flip_snapshots_present() -> bool:
+    """Both release checkpoints of 27b-base readable: committed header snapshots (the siblings are NOT a stand-in)."""
+    snaps = _snapshots()
+    return all(n in snaps for n in _FLIP_NAMES)
 
 
 def _nf_checkpoint_present() -> bool:
@@ -579,10 +592,15 @@ class TestDryRunGolden(unittest.TestCase):
 
     @_NEEDS_27B_FLIP
     def test_27b_flip_dump_equals_golden(self):
+        self.assertTrue(_flip_snapshots_present(), "27B Flip release-checkpoint header snapshots missing under fixtures/planer_1006/checkpoints")
         run = _dump_of("27b-base", O.read_replay(REPLAY_REF))
         _assert_zero_diff(self, "plan_27b_flip_n3.txt", run)
-        self.assertEqual(len(run.notes), 3)           # model farm, draft farm, census-foreign: nothing silent
+        self.assertEqual(len(run.notes), 3)           # model stub, draft stub, census-foreign: nothing silent
+        self.assertEqual(sum("header snapshot stub" in n for n in run.notes), 2)    # both from the release headers, NOT a name farm/sibling
+        self.assertFalse(any("name farm" in n or "sibling" in n for n in run.notes), run.notes)
         self.assertEqual(run.result.forced, [])
+        # the plan is priced on the RELEASE model, not the sibling: the launcher recognises it as the reference model
+        self.assertTrue(any("WEG2-HOST-REFERENCE-MODEL" in ln and "APPLY to this boot" in ln for ln in run.result.text.splitlines()))
 
     @_NEEDS_27B_FLIP
     def test_27b_flip_golden_does_not_depend_on_the_run(self):
@@ -629,6 +647,14 @@ class TestDryRunGolden(unittest.TestCase):
         run = _dump_of("27b-nvfp4-dual", O.read_replay(REPLAY_REF))
         _assert_zero_diff(self, "plan_27b_dual_n3.txt", run)
         self.assertEqual(run.notes, [])               # nothing substituted: the NVFP4 checkpoints are on the box
+        self.assertEqual(run.result.forced, [])       # refuse_dual_priority let the P/D-stage block through
+        for flag, val in (("--dual-priority", "dynamic"), ("--dual-share-actuators", "green,duty"), ("--dual-green-ladder", "on")):
+            i = run.argv.index(flag)
+            self.assertEqual(run.argv[i + 1], val, flag)
+        text = run.result.text
+        self.assertIn("SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE=1:1:1;2:2:2;1000000000:3:3", text)
+        self.assertIn("SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG=1", text)
+        self.assertIn("SGLANG_WEG2_DUAL_GRANT_RETRY_MS=20", text)
         # the dual-only form really ran (MPS opt-in env reached the launcher process; two groups on the same cards)
         p = O.parse_plan_dump(run.result.text)
         self.assertTrue(any(k.startswith("WEG2-DUAL-SHARE") for k in p["kinds"]), sorted(p["kinds"]))
@@ -643,22 +669,64 @@ class TestDryRunGolden(unittest.TestCase):
         self.assertEqual(run.result.forced, [])
         self.assertTrue(any("d_draft_host=1587 MiB" in ln for ln in run.result.text.splitlines()))   # W128 priced, not refused
 
-    def test_nf_abl_golden_provenance(self):
-        """The golden names the profile and the checkpoint files it was made from, by sha256 (the three agree)."""
+    _GOLDEN_PROVENANCE = (("plan_27b_flip_n3", "27b-base"), ("plan_27b_dual_n3", "27b-nvfp4-dual"), ("plan_nf_abl_n3", "nf-int4-h6-abl"))
+
+    def test_golden_provenance(self):
+        """Each golden names the profile and the checkpoint files it was made from, by sha256 (provenance json, committed
+        profile snapshot and the ``PROVENANCE`` table agree; header snapshots reproduce the recorded config/index)."""
         import hashlib
 
-        side = json.loads(_read(os.path.join(GOLDEN, "plan_nf_abl_n3.provenance.json")))
-        self.assertEqual(side["profile"]["sha256"], PROVENANCE["nf-int4-h6-abl.env"])
-        with open(_p("nf-int4-h6-abl"), "rb") as fh:
-            self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), side["profile"]["sha256"])
+        def sha(path):
+            with open(path, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+
         snaps = _snapshots()
-        for name, rec in side["checkpoints"].items():
-            self.assertIn(name, snaps)
-            with tempfile.TemporaryDirectory(prefix="ap0-prov-") as td:
-                stub = O.materialize_checkpoint(snaps[name], td)
-                for fn, want in rec["files_sha256_on_host"].items():
-                    with open(os.path.join(stub, fn), "rb") as fh:
-                        self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), want, "%s/%s" % (name, fn))
+        for golden, prof in self._GOLDEN_PROVENANCE:
+            side = json.loads(_read(os.path.join(GOLDEN, golden + ".provenance.json")))
+            self.assertEqual(side["golden"], golden + ".txt")
+            self.assertTrue(os.path.isfile(os.path.join(GOLDEN, side["golden"])), golden)
+            self.assertEqual(side["profile"]["sha256"], PROVENANCE[prof + ".env"], golden)
+            self.assertEqual(sha(_p(prof)), side["profile"]["sha256"], golden)
+            for inp in side.get("profile_inputs", {}).values():
+                if not inp["file"].startswith("/"):                         # committed snapshot of a file
+                    self.assertEqual(sha(os.path.join(FIX, inp["file"])), inp["sha256"], golden)
+            for name, rec in side.get("checkpoints", {}).items():
+                self.assertIn(name, snaps)
+                with tempfile.TemporaryDirectory(prefix="ap0-prov-") as td:
+                    stub = O.materialize_checkpoint(snaps[name], td)
+                    for fn, want in rec["files_sha256_on_host"].items():
+                        self.assertEqual(sha(os.path.join(stub, fn)), want, "%s/%s" % (name, fn))
+
+    def test_flip_golden_is_not_made_from_the_sibling_checkpoints(self):
+        """The release model/draft are the snapshots, and they are NOT the sibling checkpoints of the dev box (sizes measured
+        2026-10-06 on the Proxmox host): index total_size 29548245472 B (release) vs 30819147232 B (gdncov sibling)."""
+        snaps = _snapshots()
+        for n in _FLIP_NAMES:
+            self.assertIn(n, snaps)
+        with tempfile.TemporaryDirectory(prefix="ap0-flipsnap-") as td:
+            stub = O.materialize_checkpoint(snaps[_FLIP_NAMES[0]], td)
+            idx = json.loads(_read(os.path.join(stub, "model.safetensors.index.json")))
+            self.assertEqual(idx["metadata"]["total_size"], 29548245472)
+            dstub = O.materialize_checkpoint(snaps[_FLIP_NAMES[1]], td)
+            self.assertEqual(os.path.getsize(os.path.join(dstub, "model.safetensors")), 2172742656)
+
+    def test_profile_snapshots_vs_live(self):
+        """REPORT, never silently follow: when the live release profile has moved under its committed snapshot the golden is
+        of an old form (AP0 round 2 found the Dual snapshot 3 additions behind).  Skips with the names, passes when equal."""
+        import hashlib
+
+        live_dir = {"27b-base": "/spinning/gpu-arb/docker/profiles_release", "27b-nvfp4-dual": "/spinning/gpu-arb/docker/profiles_release",
+                    "nf-int4-h6-abl": "/spinning/gpu-arb/docker/profiles"}
+        moved = []
+        for prof, d in live_dir.items():
+            live = os.path.join(d, prof + ".env")
+            if os.path.isfile(live):
+                with open(live, "rb") as fh:
+                    if hashlib.sha256(fh.read()).hexdigest() != PROVENANCE[prof + ".env"]:
+                        moved.append(live)
+        if moved:
+            self.skipTest("LIVE PROFILE MOVED under its snapshot (re-snapshot, regenerate golden + launch json, update PROVENANCE): "
+                          + ", ".join(moved))
 
     def test_foreign_environment_does_not_leak_into_the_run(self):
         """A SGLANG_* / HTSGLANG_* variable of the surrounding process is not seen by the launcher, the profile's own env is,

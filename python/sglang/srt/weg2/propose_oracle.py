@@ -740,7 +740,11 @@ DEFAULT_FARM_ROOT = "/tmp/planer_oracle_models"
 _MC = "/spinning/llm_stuff/club-3090/models-cache/"
 #: registry-named model dirs that are EMPTY on the rig box -> the sibling checkpoint of the same config
 #: (``deskq/work/hw1004/plan_dump.py:41-52``; the calibration identity is the directory NAME, the sibling gives
-#: ``config.json`` and the safetensors headers).  UNBELEGT: that the sibling's headers equal the empty dir's checkpoint.
+#: ``config.json`` and the safetensors headers).  MEASURED 2026-10-06 (read-only ssh, Proxmox host): the siblings are NOT the
+#: release checkpoints -- index total_size 29548245472 (gdncov-vocabembed) vs 30819147232 (gdncov sibling), draft safetensors
+#: 2172742656 (DFlash2-W8-lued) vs 3848817896 (DFlash2 sibling).  A sibling is a LAST RESORT for a dry run that only needs
+#: a plan to exist; a golden/reference run passes ``snapshots`` (``snapshot_checkpoint`` of the real directory), which
+#: :func:`run_profile` prefers over any sibling.
 DEFAULT_MODEL_SIBLINGS: Mapping[str, Sequence[str]] = {
     "Qwen3.8-27B-INT8-gdncov-vocabembed": (_MC + "Qwen3.8-27B-INT8-gdncov",),
     "Qwen3.8-27B-DFlash2-W8-lued": (_MC + "Qwen3.8-27B-DFlash2",),
