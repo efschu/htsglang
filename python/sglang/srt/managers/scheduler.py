@@ -4980,6 +4980,12 @@ class Scheduler(
             return_health_check_ipc=lambda ipc: self.return_health_check_ipcs.append(
                 ipc
             ),
+            # #1158b: a probe dropped ahead of a release in the same intake is
+            # answered at once (the server is idle; the deque above only drains
+            # after the next batch result).
+            answer_health_check_now=lambda ipc: self.ipc_channels.send_to_tokenizer.send_output(
+                HealthCheckOutput(http_worker_ipc=ipc)
+            ),
             # WEG2 VISION: PP0's named aborts of refused stages, injected at
             # the origin so every rank drops the same rids in the same pass.
             origin_extra_reqs_hook=_vision_origin_aborts,

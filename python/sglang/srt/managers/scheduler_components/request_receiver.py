@@ -24,6 +24,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     TokenizedEmbeddingReqInput,
+    ReleaseMemoryOccupationReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
 )
@@ -114,6 +115,12 @@ class SchedulerRequestReceiver:
     # The ipc of a dropped probe goes back through this so the tokenizer's
     # /health_generate still gets its answer (the scheduler's deque).
     return_health_check_ipc: Optional[Callable[[Any], None]] = None
+    # #1158b: answers a probe AT ONCE (sends the HealthCheckOutput now). Used
+    # only for a probe dropped ahead of a ReleaseMemoryOccupation in the same
+    # intake: the server is idle there, so the deque behind
+    # ``return_health_check_ipc`` (drained after the next BATCH RESULT) would
+    # leave the prober unanswered until the wake. None falls back to the deque.
+    answer_health_check_now: Optional[Callable[[Any], None]] = None
     # WEG2 VISION (in-rank stage): returns the origin's own requests to add to
     # this pass -- the named aborts of a refused vision stage on PP0 -- so
     # they ride the SAME relay the tokenizer's requests do and every rank
@@ -347,9 +354,40 @@ class SchedulerRequestReceiver:
         kept: List = []
         verdict: Optional[Tuple[bool, int, int]] = None
         kept_probe = False
-        for req in recv_reqs:
+        # #1158b BOOT RACE (boot ..._09757b0a44_1006_055847, D 06:02:01): a probe
+        # that rides the SAME intake as a ReleaseMemoryOccupation, AHEAD of it
+        # (tokenizer socket is read before the rpc socket, so a probe always
+        # precedes), is judged by the gate BEFORE the sleep exists -> idle ->
+        # kept -> enqueued on every rank -> the release leg's drain reads
+        # waiting_queue=[probe] as a non-HiCache blocker -> W120 on all ranks.
+        # The gate cannot know the release is next in this very list; the
+        # origin can. Such a probe is answered busy-and-alive now and never
+        # leaves this process. A probe BEHIND the release (the group is
+        # already dormant when it runs) keeps the old path (W25). Nothing
+        # changes for a list without a release.
+        last_release = max(
+            (
+                i
+                for i, r in enumerate(recv_reqs)
+                if isinstance(r, ReleaseMemoryOccupationReqInput)
+            ),
+            default=-1,
+        )
+        for idx, req in enumerate(recv_reqs):
             if not is_health_check_generate_req(req):
                 kept.append(req)
+                continue
+            if idx < last_release:
+                answer = self.answer_health_check_now or self.return_health_check_ipc
+                if answer is not None:
+                    answer(getattr(req, "http_worker_ipc", None))
+                logger.info(
+                    "#1158b HEALTH-CHECK dropped at origin before broadcast rid=%s "
+                    "ahead of ReleaseMemoryOccupation in the same intake "
+                    "(answered %s; a queued probe is a sleep-drain blocker, W120)",
+                    getattr(req, "rid", None),
+                    "now" if self.answer_health_check_now is not None else "via deque",
+                )
                 continue
             if verdict is None:
                 verdict = self.health_check_gate()
