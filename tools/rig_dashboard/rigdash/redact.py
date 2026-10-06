@@ -58,3 +58,37 @@ def text_for_issue(text: str) -> str:
         if c is not None:
             out.append(paths(c))
     return "\n".join(out)
+
+
+# the NAME of a flag, variable or env entry says it carries a secret: its value never goes into a pasted issue.  ``clean`` cannot see these
+# (``HF_TOKEN=...`` has no word boundary before ``TOKEN``, and a table cell ``| HF_TOKEN | abc |`` has no ``=`` at all).  The name is split into
+# its letter runs (``HF_TOKEN`` -> hf, token; ``--max-total-tokens`` -> max, total, tokens), so ``tokens`` / ``tokenizer`` are NOT secrets.
+_SECRET_WORDS = frozenset(("secret", "secrets", "password", "passwd", "pwd", "token", "credential", "credentials", "bearer", "authorization", "pat",
+                           "apikey", "adminkey", "accesskey", "privatekey"))
+_KEY_PREFIX = frozenset(("api", "admin", "access", "private", "auth", "ssh"))
+
+
+def _words(name: str):
+    out, cur = [], []
+    for ch in str(name or "").lower():
+        if "a" <= ch <= "z":
+            cur.append(ch)
+        elif cur:
+            out.append("".join(cur))
+            cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def secret_name(name: str) -> bool:
+    """True when ``name`` (a flag, profile variable or env name) names a secret, e.g. ``HF_TOKEN``, ``--admin-api-key``, ``GITHUB_PAT``."""
+    w = _words(name)
+    return any(x in _SECRET_WORDS for x in w) or any(a in _KEY_PREFIX and b == "key" for a, b in zip(w, w[1:]))
+
+
+def value_for_issue(name: str, value) -> str:
+    """The value of a named entry for a pasted issue: ``<entfernt>`` when the name says secret, else the value with secrets and host paths cut."""
+    if secret_name(name):
+        return "<entfernt>"
+    return text_for_issue(str(value if value is not None else ""))

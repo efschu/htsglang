@@ -154,6 +154,47 @@ def _short_name(name) -> str:
     return n
 
 
+def version_facts(doc: dict, versions: Optional[dict] = None) -> dict:
+    """Die Versionsangaben, die ein Issue-Text nennt (Hardwareprofil UND Laufbericht lesen dieselben): Image (``SGLANG_IMAGE_TAG``),
+    Baum-Revision (nur aus einem gestagten Baumpfad ``.../releases/<sha>/python`` oder einer übergebenen ``tree_rev``), Treiber, CUDA/torch des
+    Messprozesses und Dashboard-Version.  Was nicht belegt ist, ist ``None`` (die Texte schreiben dann "unbelegt"); nie geraten."""
+    versions = versions or {}
+    return {"image": os.environ.get("SGLANG_IMAGE_TAG") or versions.get("image") or None,
+            "tree_rev": _tree_rev(versions.get("tree")) or versions.get("tree_rev") or None,
+            "driver": doc.get("driver") or None, "cuda": doc.get("cuda") or None, "torch": doc.get("torch") or None,
+            "rigdash": versions.get("rigdash") or None}
+
+
+def issue_short(doc: dict, *, persist: Optional[dict] = None, level: int = 3) -> str:
+    """Hardwareprofil in KURZFORM als Markdown-Block für den Laufbericht: eine Zeile je Karte (Name, cc, SM-Zahl, VRAM, PCIe, Speicherbandbreite
+    mit Herkunft).  Dieselben Zellenbausteine wie ``issue_text``; die Langform (Takt, Messraten, Katalogherkunft) steht dort.  Redigiert."""
+    cards = doc.get("cards") or []
+    h = "#" * level
+    cap = (persist or {}).get("captured_at")
+    L: List[str] = ["%s Hardwareprofil (Kurzform)" % h, ""]
+    pid = str(doc.get("id") or "")
+    L.append("Profil `%s`, %s; %d Karte(n). Die Langform (Takt, Messraten, Katalogherkunft) steht im Issue-Text des Abschnitts Hardware."
+             % (_md(pid[:19] if pid else "unbelegt"), _utc(cap) + " gespeichert" if cap else "lebende Sicht, nicht gespeichert", len(cards)))
+    L.append("")
+    L.append("| Ord | NVML | Name | cc | SM-Zahl | VRAM | PCIe max. | Speicherbandbreite |")
+    L.append("|---|---|---|---|---|---|---|---|")
+    for c in cards:
+        pc = c.get("pcie") or {}
+        gen, wd = (pc.get("max_gen") or {}).get("v"), (pc.get("max_width") or {}).get("v")
+        g = c.get("mem_gbs") or {}
+        bw = g.get("read") if (g.get("read") or {}).get("v") is not None else (g.get("nominal") if (g.get("nominal") or {}).get("v") is not None else g.get("nameplate"))
+        L.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % tuple(_md(x) for x in (
+            c.get("ord"), c.get("nvml_index"), _short_name(c.get("name")), ".".join(str(x) for x in (c.get("cc") or [])) or "?",
+            _cell(c.get("sm_count"), 0), _cell(c.get("vram_total_mib"), 0),
+            ("Gen%s x%s" % (gen, wd)) if gen is not None and wd is not None else "nicht gemessen", _cell(bw, 0))))
+    if not cards:
+        L.append("| | | keine Karte gemeldet | | | | | |")
+    if doc.get("measure_needed"):
+        L.append("")
+        L.append("Das Profil ist unvollständig: es fehlen Messwerte.")
+    return redact.text_for_issue("\n".join(L)) + "\n"
+
+
 def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[dict] = None, now: Optional[float] = None) -> str:
     """Der Issue-Text "Hardwareprofil" (GitHub-Markdown): NVML-Identität, Größen, cc, SM, Takt, Messraten (soweit vorhanden),
     Treiber/Image/Baum.  Geheimnisse und Hostpfade sind entfernt (``redact.text_for_issue``).  Ein Wert ohne Messung steht als
@@ -161,8 +202,8 @@ def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[
     versions = versions or {}
     cards = doc.get("cards") or []
     now = time.time() if now is None else now
-    image = os.environ.get("SGLANG_IMAGE_TAG") or versions.get("image")
-    rev = _tree_rev(versions.get("tree")) or versions.get("tree_rev")
+    vf = version_facts(doc, versions)
+    image, rev = vf["image"], vf["tree_rev"]
     L: List[str] = []
     L.append("## Hardwareprofil (`%s`)" % _md(doc.get("schema") or "flliper.hardware/1"))
     L.append("")
@@ -495,6 +536,16 @@ class HwProfil:
         v = dict(self.versions() or {}) if self.versions else {}
         v.setdefault("tree", self.tree)
         return {"ok": True, "format": "markdown", "text": issue_text(got["profile"], persist=got.get("persist"), versions=v, now=self.clock())}
+
+    def issue_parts(self) -> dict:
+        """Bausteine für den Laufbericht des Profil-Editors: der Hardwareprofil-Block in Kurzform und die Versionsangaben (``version_facts``)."""
+        got = self.get()
+        if not got.get("ok"):
+            return {"ok": False, "error": got.get("error") or "kein Profil"}
+        v = dict(self.versions() or {}) if self.versions else {}
+        v.setdefault("tree", os.path.realpath(self.tree) if self.tree else None)     # ``current`` -> ``releases/<sha>``: so der Baum seine Revision nennt
+        return {"ok": True, "short": issue_short(got["profile"], persist=got.get("persist")), "versions": version_facts(got["profile"], v),
+                "profile_id": got["profile"].get("id")}
 
     def _housekeeping(self, b: dict, live: Optional[dict], now: float) -> None:
         """Ein beendetes oder verfallenes Fenster verlässt den Speicher; ein ungenutzt laufendes geht zurück."""

@@ -9,7 +9,7 @@
   const root = document.getElementById("pf-root");
   if (!root) return;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const st = { list: null, doc: null, view: null, loaded: "", mode: "einfach", search: "", filt: "alle", cards: [], dry: null, exp: null,
+  const st = { list: null, doc: null, view: null, loaded: "", mode: "einfach", search: "", filt: "alle", cards: [], dry: null, exp: null, issue: null,
                busy: false, err: null, msg: null, open: {}, fold: {}, dirty: false, started: false, models: null, mprof: null, mpath: "", bars: null, barBusy: false };
   const isOpen = (id, dflt) => (id in st.fold ? st.fold[id] : dflt);
   try { const v = localStorage.getItem("rigdash.pf.view"); if (v === "einfach" || v === "experte") st.mode = v; } catch (e) { /* private window */ }
@@ -35,7 +35,7 @@
   function setView(j) { st.doc = j.doc; st.view = j.view; scheduleRecompute(); }
   const doLoad = (kind, name) => run(async () => {
     const j = await api("load", { kind, name });
-    setView(j); st.loaded = kind + ":" + name; st.dry = null; st.exp = null; st.dirty = false; st.cmsg = null;
+    setView(j); st.loaded = kind + ":" + name; st.dry = null; st.exp = null; st.issue = null; st.dirty = false; st.cmsg = null;
     st.msg = (kind === "release" ? "Release-Profil " : "Eigenes Profil ") + name + " geladen.";
   });
   const doEdit = (edits) => run(async () => {
@@ -60,6 +60,13 @@
     st.mprof = { path, profile: j.profile, elapsed: j.elapsed_s, cached: j.cached };
   });
   const doExport = () => run(async () => { st.exp = await api("export", { doc: st.doc, dry: st.dry }); });   // dry: letzter Trockenlauf (null = keiner): der Server baut daraus den Force-Hinweis
+  // Issue-Text "Laufbericht" (AP-I): der Server baut den Markdown-Block aus Profil, letztem Trockenlauf, gewählten Karten und Modellprofil; er merkt sich,
+  // wozu er gehört (doc.id, Trockenlauf, Modellprofil), damit die Seite einen veralteten Text kennzeichnet statt ihn still stehen zu lassen
+  const issueKey = () => JSON.stringify([st.doc ? st.doc.id : null, st.dry, st.cards, st.mprof ? st.mprof.path : null]);
+  const doIssue = () => run(async () => {
+    const j = await api("issue", { doc: st.doc, dry: st.dry, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })), model: st.mprof ? st.mprof.profile : null });
+    st.issue = { text: j.text, blocks: j.blocks || [], filename: j.filename || "laufbericht.md", key: issueKey() };
+  });
   const doDry = () => run(async () => { st.dry = await api("dry", { doc: st.doc, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })) }); });
 
   // ------------------------------------------------------------------ Darstellung
@@ -372,10 +379,22 @@
       ${open ? `<div class="pf-note muted">Der Launcher dieser Linie prüft das noch nicht (kein Force nötig):</div><ul class="pf-fl">${open}</ul>` : ""}
       ${f.records_note ? `<div class="muted pf-note">${esc(f.records_note)}</div>` : ""}${f.line_note ? `<div class="muted pf-note">${esc(f.line_note)}</div>` : ""}</div>`;
   }
+  function drawIssue() {
+    if (!st.doc) return "";
+    const i = st.issue, stale = i && i.key !== issueKey();
+    const body = i ? `${stale ? '<div class="pf-red">Veraltet: Profil, Trockenlauf, Karten oder Modellprofil haben sich seit dem Erzeugen geändert. Neu erzeugen.</div>' : ""}
+      <div class="muted pf-note">Enthält: ${esc((i.blocks || []).join(" · "))}.</div>
+      <textarea class="pf-issue-text" id="pf-issue-text" readonly spellcheck="false" aria-label="Issue-Text Laufbericht" rows="16">${esc(i.text)}</textarea>
+      <div class="pf-row-actions"><button type="button" data-act="issue-copy">In die Zwischenablage</button><button type="button" data-act="issue-download">Als ${esc(i.filename)} speichern</button><button type="button" data-act="issue-close">Schließen</button></div>` : "";
+    return `<section class="pf-export pf-issue"><h3>Issue-Text: Laufbericht</h3>
+      <div class="muted pf-note">Ein Markdown-Block zum Einfügen in ein GitHub-Issue: Hardwareprofil (Kurzform), Modellprofil, Betriebsform, Vorschlag und Übersteuerungen, Verdikte und Force, Versionen, dazu ein Platzhalter für Messergebnis und Boot-Log-Auszug.
+        Geheimnisse und Pfade des Rechners sind entfernt. Der letzte Trockenlauf geht mit ein; ohne ihn steht dort, dass keiner gefahren wurde.</div>
+      <div class="pf-row-actions"><button type="button" data-act="issue"${st.busy ? " disabled" : ""}>${i ? "Laufbericht neu erzeugen" : "Laufbericht erzeugen"}</button></div>${body}</section>`;
+  }
   function drawExport() {
     const x = st.exp;
-    if (!x) return "";
-    return `<section class="pf-export"><h3>Export <span class="pf-chip ${x.verified ? "pf-ok" : "pf-bad"}">${x.verified ? "geprüft" : "ABWEICHUNG"}</span></h3>
+    if (!x) return drawIssue();
+    return drawIssue() + `<section class="pf-export"><h3>Export <span class="pf-chip ${x.verified ? "pf-ok" : "pf-bad"}">${x.verified ? "geprüft" : "ABWEICHUNG"}</span></h3>
       <div class="muted pf-note">${esc(x.check)}</div>
       ${x.problems.length ? `<pre class="kp-pre">${esc(x.problems.join("\n"))}</pre>` : ""}
       <div class="pf-row-actions"><button type="button" data-act="copy">In die Zwischenablage</button><button type="button" data-act="download">Als ${esc(x.filename)} speichern</button></div>
@@ -468,6 +487,21 @@
     if (a === "save") { const n = (document.getElementById("pf-name").value || "").trim(); if (n) doSave(n); else { st.err = "Einen Namen eingeben (a-z, 0-9, . _ -)."; draw(); } return; }
     if (a === "del") { if (st.loaded.startsWith("user:") && confirm("Profil " + st.loaded.slice(5) + " löschen?")) doDelete(st.loaded.slice(5)); return; }
     if (a === "export") return doExport();
+    if (a === "issue") return doIssue();
+    if (a === "issue-close") { st.issue = null; return draw(); }
+    if (a === "issue-copy") {
+      const i = st.issue; if (!i) return;
+      const done = () => { st.msg = "Laufbericht kopiert."; draw(); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(i.text).then(done, () => { const ta = document.getElementById("pf-issue-text"); if (ta) { ta.select(); } });
+      else { const ta = document.getElementById("pf-issue-text"); if (ta) ta.select(); }
+      return;
+    }
+    if (a === "issue-download") {
+      const i = st.issue; if (!i) return;
+      const url = URL.createObjectURL(new Blob([i.text], { type: "text/markdown" }));
+      const el = document.createElement("a"); el.href = url; el.download = i.filename; el.click(); setTimeout(() => URL.revokeObjectURL(url), 2000);
+      return;
+    }
     if (a === "models") return doModels();
     if (a === "estpath") { const v = (document.getElementById("pf-mpath") || {}).value || ""; if (v.trim()) doEstimate(v.trim()); return; }
     if (a === "dry") return doDry();
