@@ -14,6 +14,19 @@ import pytest
 import sglang.srt.weg2.launcher as L
 from sglang.srt.speculative import dflash_pricing as P
 
+# 1539 06b: the models-cache directory(ies) this file names are EMPTY on this box
+# (1517: class b). model_dir_fixtures_1539.overlay() serves READS below an empty
+# one from the in-tree copy of its config.json / safetensors headers (byte-checked
+# against the real shards, fixtures/model_dirs_1539); every path string in this
+# file stays the real one, and a restored directory is never overlaid.
+import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _models_cache_overlay_1539():
+    with MODEL_FX.overlay():
+        yield
+
 
 @pytest.fixture
 def restore_form():

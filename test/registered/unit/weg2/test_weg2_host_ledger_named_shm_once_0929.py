@@ -33,11 +33,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 GIB = int(host_ledger.GIB)
-EV = "/spinning/docker-acceptance/nf/evidence"
+# 1539 06b: the evidence is a FROZEN COPY, not the live tree. The live
+# /spinning/docker-acceptance/nf/evidence files are append-only and written by
+# every boot: its host_census_record.json first entry now holds boots from 10.02.
+# on and replays 84.06 GiB against the 81.55 bound, while the 29.09. 16:18:07Z
+# snapshot of that record (the state the 16:34 z30y3b boot, i.e. this test, was
+# written against) replays 81.364 -- the 81.36 test_nf1c_arm_funds pins to the
+# cent. Provenance and sha256: fixtures/host_ledger_evidence_1539/nf_0929/PROVENANCE.json.
+EV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
+                  "host_ledger_evidence_1539", "nf_0929")
 REC = f"{EV}/weg2_measured_record.json"
 CENSUS = f"{EV}/host_census_record.json"
 TAG_1559 = "dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2bar1dauer09291559"
-MEMTS_1559 = f"{EV}/docker_{TAG_1559}/memts_weg2_{TAG_1559}.csv"
+MEMTS_1559 = f"{EV}/memts_weg2_09291559.csv.txt"
 HARD_BOUND = 82.53  # 09291634 W21 line: reap 84.00 - margin 1.47
 
 

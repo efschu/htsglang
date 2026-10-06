@@ -29,6 +29,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -46,6 +47,20 @@ except Exception as exc:  # pragma: no cover - no weg2 launcher in this build
 
 GIB = host_ledger.GIB
 GB = host_ledger.GB
+
+# 1539 06b: the models-cache directory(ies) this file names are EMPTY on this box
+# (1517: class b). model_dir_fixtures_1539.overlay() serves READS below an empty
+# one from the in-tree copy of its config.json / safetensors headers (byte-checked
+# against the real shards, fixtures/model_dirs_1539); every path string in this
+# file stays the real one, and a restored directory is never overlaid.
+import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _models_cache_overlay_1539():
+    with MODEL_FX.overlay():
+        yield
+
 
 MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
 BUDGETS = [28904, 17704, 17672]
@@ -71,7 +86,9 @@ _MODEL_PATH = _RECORDED["checkpoint_dependency"]["model_path"]
 
 
 def _checkpoint_present() -> bool:
-    return bool(glob.glob(os.path.join(_MODEL_PATH, "*.safetensors")))
+    # evaluated at IMPORT, so the overlay must be on here too (1539 06b)
+    with MODEL_FX.overlay():
+        return bool(glob.glob(os.path.join(_MODEL_PATH, "*.safetensors")))
 
 
 _NEEDS_CHECKPOINT = unittest.skipUnless(
@@ -178,8 +195,22 @@ class _HermeticMainBase(unittest.TestCase):
         self._cgroup_patch = mock.patch.object(launcher, "CGROUP_ROOT", cg)
         self._meminfo_patch.start()
         self._cgroup_patch.start()
+        # 1539 06b: W57 (28.09., after this file's 14.09. fixtures) refuses a dry
+        # run whose store root was not TOLD (SGLANG_WEG2_STORE_ROOT unset): it
+        # would measure the rig default's filesystem. These tests are about the
+        # hicache-disabled argv and ledger, not about the store disk, so the
+        # root is told here -- a private empty directory, the same seam
+        # test_weg2_store_disk_w57_fs_0928 patches (launcher.STORE_ROOT[_TOLD]).
+        self._store_tmp = tempfile.mkdtemp(prefix="weg2-1386-store-root-")
+        self.addCleanup(shutil.rmtree, self._store_tmp, ignore_errors=True)
+        self._store_root_patch = mock.patch.object(launcher, "STORE_ROOT", self._store_tmp)
+        self._store_told_patch = mock.patch.object(launcher, "STORE_ROOT_TOLD", True)
+        self._store_root_patch.start()
+        self._store_told_patch.start()
 
     def tearDown(self):
+        self._store_told_patch.stop()
+        self._store_root_patch.stop()
         self._cgroup_patch.stop()
         self._meminfo_patch.stop()
         self._shm_patch.stop()

@@ -42,6 +42,20 @@ from sglang.srt.weg2 import host_ledger as HL  # noqa: E402
 from sglang.srt.weg2 import launcher as L  # noqa: E402
 from sglang.srt.weg2 import ring_table as RT  # noqa: E402
 
+# 1539 06b: the models-cache directory(ies) this file names are EMPTY on this box
+# (1517: class b). model_dir_fixtures_1539.overlay() serves READS below an empty
+# one from the in-tree copy of its config.json / safetensors headers (byte-checked
+# against the real shards, fixtures/model_dirs_1539); every path string in this
+# file stays the real one, and a restored directory is never overlaid.
+import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _models_cache_overlay_1539():
+    with MODEL_FX.overlay():
+        yield
+
+
 N_LAYERS = 64
 REAL_DIR = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-GGUF-unsloth"
 REAL_IQ4 = os.path.join(REAL_DIR, "Qwen3.8-27B-UD-IQ4_XS.gguf")

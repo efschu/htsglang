@@ -1,0 +1,25 @@
+{
+ "host_census_record.json": {
+  "fixture_sha256": "c3a157d9f9706562e9572ffe74777909deaabde08a63efd2870cbc4fb578a879",
+  "note": "copy of the NF census record as it stood on 29.09. 16:18:07Z, before the 16:34 z30y3b boot the test reproduces; the LIVE record (/spinning/docker-acceptance/nf/evidence/host_census_record.json) has since grown boots from 10.02. on under the same first key, and replays 84.06 instead of 81.36",
+  "source": "/spinning/gpu-arb/docs/host_census_record.nf.pre-shmtotal-0929.json",
+  "source_mtime_utc": "2026-09-29T16:18:07Z",
+  "source_sha256": "c3a157d9f9706562e9572ffe74777909deaabde08a63efd2870cbc4fb578a879"
+ },
+ "memts_weg2_09291559.csv.txt": {
+  "fixture_sha256": "a7e6e13e59690283394cc8e013e37274e3ebaa5511a97b13e221f0c21a855bc7",
+  "note": "renamed .csv -> .csv.txt only because .gitignore:204 drops *.csv; bytes identical to the source (sha256 above)",
+  "source": "/spinning/docker-acceptance/nf/evidence/docker_dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2bar1dauer09291559/memts_weg2_dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2bar1dauer09291559.csv",
+  "source_mtime_utc": "2026-09-29T16:18:47Z (boot ended)",
+  "source_sha256": "a7e6e13e59690283394cc8e013e37274e3ebaa5511a97b13e221f0c21a855bc7"
+ },
+ "weg2_measured_record.json": {
+  "fixture_sha256": "da0ffaa6abc41cfa6a5bf11d09274d7a36b81e0d93ea14c1c1df73b36ba45914",
+  "kept": 6,
+  "kept_rule": "boot_tag == dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2bar1dauer09291559",
+  "note": "append-only live sidecar; the test reads it with boot_tag=<TAG>, so only that boot's samples count",
+  "source": "/spinning/docker-acceptance/nf/evidence/weg2_measured_record.json",
+  "source_samples_total": 4253,
+  "source_sha256_at_extraction": "aed56c073e01422a103909d079d7657acb0695c022136c68a40d076347e2db68"
+ }
+}

@@ -1,0 +1,36 @@
+{
+ "8d7ddbd01be1c9f532173e604ade35f32bb1bd769cd6693793ddbd0bc8fa3ead|arch=moe,experts=offload,draft=mtp,p_draft=none,kv=qsa_forma_dcp,flip=family,vision=transient,profile=nextflash,model=Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist": {
+  "last_at": "2026-09-29T16:18:07Z",
+  "roles_anon_gib": {
+   "detokenizer": 2.1813278198242188,
+   "front": 1.1348609924316406,
+   "inductor_compile_worker": 1.7655105590820312,
+   "mp_resource_tracker": 0.019428253173828125,
+   "other": 0.003936767578125,
+   "ple_pread_worker": 0.14029312133789062,
+   "rank": 17.72909927368164,
+   "server_main": 2.167743682861328
+  },
+  "samples": 15,
+  "shm_classes_gib": {
+   "anon_shared": 4.218043327331543,
+   "arena_booked": 5.784236907958984,
+   "arena_handoff": 0.22672653198242188,
+   "arena_sidecar": 0.260589599609375,
+   "bar1": 4.57763671875e-05,
+   "l3idx": 0.12500381469726562,
+   "other_tmpfs": 0.9733390808105469,
+   "seq_ring": 1.501220703125,
+   "store": 41.694153785705566,
+   "xchg": 0.0009765625
+  },
+  "sources": [
+   "live /proc smaps(_rollup) + memory.stat",
+   "live /proc smaps(_rollup) + memory.stat",
+   "live /proc smaps(_rollup) + memory.stat",
+   "live /proc smaps(_rollup) + memory.stat",
+   "live /proc smaps(_rollup) + memory.stat"
+  ],
+  "unattributed_shm_gib": 6.260000714111328
+ }
+}
