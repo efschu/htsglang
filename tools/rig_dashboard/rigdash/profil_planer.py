@@ -96,6 +96,29 @@ DUAL = {
 ZIELE = {"seats": [1, 256], "kv_tokens": [1024, 8 << 20], "kontext_presets": [32768, 65536, 131072, 262144]}
 
 
+#: Positionale Vektoren des Launchers (launcher.py:5964-5973 POSITIONAL_VECTOR_FLAGS = Flag-dest-Namen, POSITIONAL_VECTOR_TOKENS = --extra-/--env-Tokens;
+#: ein Test liest beide Tupel aus dem Quelltext und vergleicht).  Je Eintrag ein Rang; der Launcher verweigert so einen Vektor, wenn die Zahl nicht zum Inventar passt.
+POSITIONAL_FLAGS = ["--d-foreign-context-mib", "--d-nontorch-mib", "--pp-stage-ratio", "--pp-attn-stage-ratio", "--pp-cut-expert-device-fraction",
+                    "--pp-cut-expert-lru-rows", "--user-reserve-mib", "--d-reserve-mib", "--pp-cut-reserve-mib", "--d-reshard-presets", "--p-barlink-bar1-window-mib"]
+POSITIONAL_TOKENS = ["--rank-role", "--rank-tp-ratio", "--rank-moe-ratio", "--rank-moe-resident-fraction", "--rank-user-reserve-mib", "--rank-gpu-memory-mib",
+                     "--pp-stage-ratio", "--pp-attn-stage-ratio", "SGLANG_MOE_SCRATCH_SLOTS", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "SGLANG_WEG2_L15_MIB",
+                     "SGLANG_WEG2_EXTEND_TRIM_MIB"]
+#: Je-Karte-Vektoren aus den Abschnitten A-C, die der Launcher nicht positional fuehrt (je Eintrag ein Rang bzw. eine Stufe laut Katalogtext).
+#: Bewusst NICHT dabei: Kommalisten, die keine Rang-Vektoren sind (--pp-layer-set, --p-layer-split, --p-attn-head-split, --kv-reshard-vectors,
+#: --expert-placement-override, --d-kv-token-cut, --d-token-placement) und die Dual-/Planer-Listen (--dual-share-actuators, --cuda-graph-bs ...): die bleiben ein Textfeld.
+SECTION_VECTORS = ["--pp-layer-ratio", "--rank-gpu-id", "--rank-mlp-ratio", "--rank-vocab-ratio", "--rank-auto-reserve-mib", "--rank-kv-ratio",
+                   "SGLANG_UNEVEN_TOKEN_VECTOR", "--uneven-token-vector", "--d-uneven-token-vector", "SGLANG_UNEVEN_MOE_VECTOR"]
+
+
+def vector_names() -> List[str]:
+    """Die Namen, die als ein Feld je Rang gezeichnet werden (jeder genau einmal, Reihenfolge stabil)."""
+    out: List[str] = []
+    for n in POSITIONAL_FLAGS + [t.rstrip("=") for t in POSITIONAL_TOKENS] + SECTION_VECTORS:
+        if n not in out:
+            out.append(n)
+    return out
+
+
 def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[str, Any]]] = None, oracle: bool = False) -> Dict[str, Any]:
     """Das ``planer``-Objekt der ``list``-Antwort.
 
@@ -122,7 +145,8 @@ def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[s
         e = ents.get(name) or {}
         dual["werte"][name] = {"name": name, "rolle": key, "text": e.get("text") or "", "help": e.get("help") or "", "depends": [dict(d) for d in e.get("depends") or []],
                                "level": e.get("level"), "gain": e.get("gain") or "", "cost": e.get("cost") or ""}
-    return {"schema": SCHEMA, "formen": formen, "abschnitte": [dict(a) for a in ABSCHNITTE], "dual": dual, "ziele": dict(ZIELE), "oracle": bool(oracle)}
+    return {"schema": SCHEMA, "formen": formen, "abschnitte": [dict(a) for a in ABSCHNITTE], "vektoren": vector_names(),
+            "positional": POSITIONAL_FLAGS + [t.rstrip("=") for t in POSITIONAL_TOKENS], "dual": dual, "ziele": dict(ZIELE), "oracle": bool(oracle)}
 
 
 def all_section_names() -> List[str]:

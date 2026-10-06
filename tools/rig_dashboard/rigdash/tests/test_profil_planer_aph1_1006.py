@@ -12,6 +12,7 @@ Gepinnt:
   * ``profil.js`` mit ``planer`` in der Antwort: sechs Schritte; Vorschlag POSTet {basis, form, inventar, ziele}; ohne ``planer`` bleibt die alte Seite.
 """
 
+import ast
 import json
 import os
 import re
@@ -133,9 +134,12 @@ const dep = (d) => '<i class="dep">' + d.to + '</i>';
 const base = (o) => Object.assign({ key: "flag:--pp-stage-ratio", name: "--pp-stage-ratio", scope: "launcher", value: "31,17,16", bare: false, multi: false, origin: "profil", origin_label: "Profil",
   profile_value: "31,17,16", planner_value: null, changed: false,
   explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Layer je Karte", source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", choices: null } }, o || {});
-const ctx = (o) => Object.assign({ n: 3, ranks: [], mode: "experte", prop: null, vsrc: "prop", dry: null, open: {}, cmsg: null, hasProfileValues: true,
+const ctx = (o) => Object.assign({ vecNames: new Set(__VEC__), posNames: new Set(__POS__), n: 3, ranks: [], mode: "experte", prop: null, vsrc: "prop", dry: null, open: {}, cmsg: null, hasProfileValues: true,
   short: (r) => (r.explain.parts[0] || {}).text || "", explain: () => "<div>voll</div>", depChip: dep, isOpen: () => true }, o || {});
 """
+
+
+JS_HEAD = JS_HEAD.replace("__VEC__", json.dumps(PL.vector_names())).replace("__POS__", json.dumps(PL.POSITIONAL_FLAGS + [t.rstrip("=") for t in PL.POSITIONAL_TOKENS]))
 
 
 def run_node(body):
@@ -219,8 +223,10 @@ const c = ctx({ n: 3, ranks: [{ name: "NVIDIA GeForce RTX 5090", mib: 32607 }, {
 out.ok = PX.renderRow(base(), c);
 out.bad = PX.renderRow(base({ value: "1,2" }), c);
 out.scalar = PX.renderRow(base({ key: "flag:--d-tp-objective", name: "--d-tp-objective", value: "decode-bs1" }), c);
-out.choice = PX.renderRow(base({ key: "flag:--x", name: "--x", value: "a,b", explain: Object.assign({}, base().explain, { choices: ["a,b", "c"] }) }), c);
-out.nonum = PX.renderRow(base({ key: "flag:--x", name: "--x", value: "a:1,b:2" }), c);
+out.choice = PX.renderRow(base({ key: "flag:--rank-tp-ratio", name: "--rank-tp-ratio", value: "a,b", explain: Object.assign({}, base().explain, { choices: ["a,b", "c"] }) }), c);
+out.nonum = PX.renderRow(base({ key: "flag:--rank-tp-ratio", name: "--rank-tp-ratio", value: "a:1,b:2" }), c);
+out.unnamed = PX.renderRow(base({ key: "flag:--dual-share-actuators", name: "--dual-share-actuators", value: "green,duty" }), c);
+out.nolist = PX.renderRow(base(), Object.assign({}, c, { vecNames: undefined }));
 """)
         self.assertEqual(len(re.findall(r'data-vi="', o["ok"])), 3)
         self.assertIn("Rang 0 · RTX 5090", o["ok"])
@@ -232,6 +238,10 @@ out.nonum = PX.renderRow(base({ key: "flag:--x", name: "--x", value: "a:1,b:2" }
         self.assertIn('data-k="flag:--d-tp-objective"', o["scalar"])
         self.assertNotIn("data-vi", o["choice"])                    # eine Auswahl bleibt eine Auswahl
         self.assertNotIn("data-vi", o["nonum"])
+        self.assertNotIn("data-vi", o["unnamed"])                   # Review Runde 2: ein Kommatext allein ist noch kein Rang-Vektor
+        self.assertNotIn("Einträge, aber", o["unnamed"])
+        self.assertIn('data-k="flag:--dual-share-actuators" value="green,duty"', o["unnamed"])
+        self.assertNotIn("data-vi", o["nolist"])                    # ohne Vektorliste vom Server: Textfeld
 
     def test_html_is_escaped(self):
         o = run_node("""
@@ -470,6 +480,53 @@ class AllVectorsAreFields(unittest.TestCase):
 
     def test_nothing_unhandled(self):
         self.assertEqual(self.o["unhandled"], [])
+
+
+@unittest.skipUnless(NODE, "node fehlt")
+class OnlyNamedVectorsAreFields(unittest.TestCase):
+    """Review-Befund 1 (Runde 2): Felder je Rang nur fuer eine ausdrueckliche Vektormenge, jede andere Kommaliste bleibt ein Textfeld."""
+
+    EXTRA = [["--dual-share-actuators", "green,duty"], ["--cuda-graph-bs", "1,2,4,8"], ["--pp-layer-set", "0-2,4-6,7-9"]]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ui = PL.ui_info(("flip", "tp"), _catalog()["entries"], True)
+        cls.o = run_harness({"planer": cls.ui, "module": True, "extra": cls.EXTRA + [["--p-barlink-bar1-window-mib", "256,256"]]})
+        cls.h = cls.o["afterLoad"]
+
+    def test_non_vector_comma_lists_stay_one_text_field(self):
+        for name, val in self.EXTRA:
+            self.assertNotIn('data-vk="flag:%s"' % name, self.h, name)
+            self.assertIn('data-k="flag:%s" value="%s"' % (name, val), self.h, name)
+
+    def test_no_made_up_rank_hint_for_them(self):
+        self.assertEqual(self.h.count("2 Einträge, aber 3 Karten"), 1)       # nur der benannte Vektor --p-barlink-bar1-window-mib (256,256) warnt
+        self.assertNotIn("4 Einträge, aber 3 Karten", self.h)
+
+    def test_a_named_vector_with_the_wrong_count_still_warns_and_names_the_launcher_code(self):
+        self.assertIn("2 Einträge, aber 3 Karten", self.h)
+        self.assertIn("PROFILE-VECTORS", self.h)                      # --p-barlink-bar1-window-mib steht in POSITIONAL_VECTOR_FLAGS
+
+    def test_the_vector_set_is_the_launchers_plus_named_section_vectors(self):
+        src = _src("launcher.py")
+        tree = ast.parse(src)
+        got = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") in ("POSITIONAL_VECTOR_FLAGS", "POSITIONAL_VECTOR_TOKENS"):
+                got[node.targets[0].id] = [e.value for e in node.value.elts]
+        flags = ["--" + d.replace("_", "-") for d in got["POSITIONAL_VECTOR_FLAGS"]]
+        toks = [t.rstrip("=") for t in got["POSITIONAL_VECTOR_TOKENS"]]
+        self.assertEqual(sorted(set(PL.POSITIONAL_FLAGS)), sorted(set(flags)))
+        self.assertEqual(sorted(set(t.rstrip("=") for t in PL.POSITIONAL_TOKENS)), sorted(set(toks)))
+        names = set(PL.vector_names())
+        self.assertTrue(set(flags) | set(toks) <= names)
+        self.assertEqual(len(PL.vector_names()), len(names))
+        self.assertEqual(self.ui["vektoren"], PL.vector_names())
+        entries = _catalog()["entries"]
+        for n in names:
+            self.assertIn(n, entries, n)
+        for n in ("--dual-share-actuators", "--cuda-graph-bs", "--pp-layer-set", "--p-layer-split", "--kv-reshard-vectors"):
+            self.assertNotIn(n, names)
 
 
 class Css(unittest.TestCase):

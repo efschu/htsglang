@@ -113,11 +113,14 @@
       return `<label class="pfx-c"><span class="pfx-cl" title="${esc(tipc)}">${esc(lab)}</span><input type="text" inputmode="decimal" size="6" data-vk="${k}" data-vi="${i}" data-fid="vk:${k}:${i}" value="${esc(p)}" spellcheck="false" autocomplete="off" aria-label="${esc(r.name + " " + lab)}"></label>`;
     }).join("");
     const sum = vecSum(parts);
-    const warn = n != null && parts.length !== n ? `<div class="pfx-warn"><span class="pfx-vchip pfx-v-hinweis">${parts.length} Einträge, aber ${n} Karte${n === 1 ? "" : "n"}</span> <span class="muted">Der Launcher kann so einen Vektor nicht ableiten (PROFILE-VECTORS); jeder Eintrag gehört zu einem Rang.</span></div>` : "";
+    const pos = ctx.posNames && ctx.posNames.has(r.name);
+    const warn = n != null && parts.length !== n ? `<div class="pfx-warn"><span class="pfx-vchip pfx-v-hinweis">${parts.length} Einträge, aber ${n} Karte${n === 1 ? "" : "n"}</span> <span class="muted">${pos ? "Der Launcher führt diesen Wert als Vektor je Karte (PROFILE-VECTORS verweigert eine andere Zahl); " : ""}Jeder Eintrag gehört zu einem Rang.</span></div>` : "";
     return `<div class="pfx-vec" data-vrow="${k}" role="group" aria-label="${esc(r.name)} je Rang">${cells}${sum != null ? `<span class="pfx-sum" title="Summe der Einträge">Σ ${esc(fmtNum(sum))}</span>` : ""}</div>${warn}`;
   }
+  /* Felder je Rang NUR für einen ausdrücklich benannten Vektor (ctx.vecNames, vom Server: ui_info "vektoren").  Jede andere Kommaliste
+     (--dual-share-actuators green,duty; --cuda-graph-bs 1,2,4,8) bleibt ein Textfeld: ein Muster allein sagt nicht, dass ein Eintrag zu einem Rang gehört. */
   function valueField(r, ctx) {
-    if (!r.bare && !(r.explain && Array.isArray(r.explain.choices) && r.explain.choices.length)) {
+    if (ctx.vecNames && ctx.vecNames.has(r.name) && !r.bare && !(r.explain && Array.isArray(r.explain.choices) && r.explain.choices.length)) {
       const parts = vecSplit(r.value);
       if (parts) return vecFields(r, parts, ctx);
     }
