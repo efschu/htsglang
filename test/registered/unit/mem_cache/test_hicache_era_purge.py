@@ -267,9 +267,20 @@ class TestEraAdmissionRingPredicate(CustomTestCase):
             "_pp_recv_admission_decision",
             "_pp_try_recv_admission_decision",
             "_pp_commit_admission_send_work",
-            "_pp_reconcile_incoming_admission",
             "_pp_void_retracted_pass",
         }
+        # 1539 06b: `_pp_reconcile_incoming_admission` was in this set and is NOT
+        # any more, by the product's own statement: scheduler_pp_mixin.py
+        # `_pp_reconcile_incoming_admission` docstring, "RESTORED VERBATIM from
+        # the pre-#1015 tree (01a391fa03^) for the #631 ROW AUTHORITY cut ... the
+        # row now arrives on the PROXY FRAME, before planning, so the receive that
+        # feeds this is non-blocking by construction". It is the reconciliation
+        # of a row, not the dedicated wire this test is about (the send/recv
+        # functions below stay removed and uncalled). Pinned as restored, not
+        # merely dropped from the list, so the next deletion or rename is seen.
+        restored_names = {"_pp_reconcile_incoming_admission"}
+        missing = sorted(n for n in restored_names if not hasattr(mod.SchedulerPPMixin, n))
+        self.assertEqual(missing, [], f"#631 restored these; found missing: {missing}")
 
         # (1) None of the names exist as module or class attributes any more.
         still_present = sorted(
@@ -343,7 +354,24 @@ class TestEraAdmissionRingPredicate(CustomTestCase):
 
         from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
-        src = inspect.getsource(SchedulerPPMixin._pp_commit_comm_work)
+        # 1539 06b: since #1015e `_pp_commit_comm_work` only hands the list to
+        # `_pp_post_send`; the deadline lives in `_pp_join_comm_work`
+        # (`bounded_wait` under `_pp_ring_commit_budget_s()`), reached through
+        # `_pp_post_send` -> `self._pp_drain_due_sends()` -> `self._pp_join_comm_work(`
+        # (scheduler_pp_mixin.py; the #973 timeout comment at the event loop
+        # names the same chain). The pin follows the bound: the hand-over must
+        # still route through that chain, and the join must keep the deadline
+        # and stay free of a literal-zero budget.
+        commit_src = inspect.getsource(SchedulerPPMixin._pp_commit_comm_work)
+        self.assertIn("self._pp_post_send(", commit_src)
+        self.assertIn(
+            "self._pp_drain_due_sends(", inspect.getsource(SchedulerPPMixin._pp_post_send)
+        )
+        self.assertIn(
+            "self._pp_join_comm_work(",
+            inspect.getsource(SchedulerPPMixin._pp_drain_due_sends),
+        )
+        src = inspect.getsource(SchedulerPPMixin._pp_join_comm_work)
         tree = ast.parse(textwrap.dedent(src))
         zero_budget_assignments = [
             node
