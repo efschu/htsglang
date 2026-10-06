@@ -229,10 +229,19 @@ def _calib_rows():
     for depth, (t0, dp, pd) in ((4000, (t + 100, 1800, 2200)), (200000, (t + 200, 2600, 3400))):
         rows.append({"role": "calib_prefix", "depth_target": depth, "prompt_tokens": depth + 120,
                      "t_send": t0 - 1, "t_end": t0 + 6})
+        # 06.10. flip-time order: the price is the USER flip time (flip_user_ms), never begin->done
+        # (flip_total_ms, here always 700 ms shorter, as in the real boot where it is the smaller number)
         rows.append({"role": "flip", "t": t0 + dp / 1000.0, "epoch": 1, "direction": "D>P",
-                     "flip_total_ms": dp})
-        rows.append({"role": "flip", "t": t0 + 5, "epoch": 2, "direction": "P>D", "flip_total_ms": pd})
+                     "flip_user_ms": dp, "flip_total_ms": dp - 700})
+        rows.append({"role": "flip", "t": t0 + 5, "epoch": 2, "direction": "P>D",
+                     "flip_user_ms": pd, "flip_total_ms": pd - 700})
     return rows
+
+
+def _only_total(rows):
+    """The same harvest as the old calibration wrote it: begin->done only."""
+    return [({k: v for k, v in r.items() if k != "flip_user_ms"} if r["role"] == "flip" else r)
+            for r in rows]
 
 
 def test_builder_turns_a_harvest_into_a_valid_curve_file(tmp_path):
@@ -262,6 +271,59 @@ def test_builder_without_a_prefix_window_names_a_depthless_price():
         xb.build([r for r in rows if r["role"] != "flip"], model=MODEL, form=FORM_AXES, hardware=HW,
                  source="s", p_chunk_tokens=4096, d_chunk_tokens=4096)
     assert e.value.code == xc.W_X_CURVES_MALFORMED
+
+
+def test_flip_price_is_the_user_flip_time_not_begin_to_done():
+    curves, notes = xb.build(_calib_rows(), model=MODEL, form=FORM_AXES, hardware=HW, source="s",
+                             p_chunk_tokens=4096, d_chunk_tokens=4096)
+    # 1800+2200 and 2600+3400 from flip_user_ms; the flip_total_ms sums would be 2.6 / 4.6 s
+    assert curves.flip_price.seconds == (4.0, 6.0)
+    assert "FALLBACK" not in curves.flip_price.attribution
+    assert any("flip_user_ms" in n for n in notes) and not any("WARNING" in n for n in notes)
+
+
+def test_total_only_flip_rows_are_refused_without_the_fallback_flag():
+    with pytest.raises(xc.XCurvesRefused) as e:
+        xb.build(_only_total(_calib_rows()), model=MODEL, form=FORM_AXES, hardware=HW, source="s",
+                 p_chunk_tokens=4096, d_chunk_tokens=4096)
+    assert e.value.code == xc.W_X_CURVES_MALFORMED
+    assert "flip_user_ms" in str(e.value) and "flip_total_ms" in str(e.value)
+
+
+def test_total_fallback_flag_builds_but_names_the_price_as_the_wrong_number():
+    curves, notes = xb.build(_only_total(_calib_rows()), model=MODEL, form=FORM_AXES, hardware=HW,
+                             source="s", p_chunk_tokens=4096, d_chunk_tokens=4096,
+                             allow_flip_total_fallback=True)
+    assert curves.flip_price.seconds == (2.6, 4.6)               # begin->done sums, named as such
+    assert curves.flip_price.attribution.endswith("flip_total_ms-FALLBACK")
+    assert any(n.startswith("WARNING") and "begin->done" in n for n in notes)
+
+
+def test_a_missing_or_negative_user_endpoint_never_falls_back_to_the_total():
+    rows = _calib_rows()
+    for r in rows:
+        if r["role"] == "flip" and r["direction"] == "P>D":
+            r["flip_user_ms"] = None                       # endpoint missing: 'fehlt', no smaller substitute
+    with pytest.raises(xc.XCurvesRefused):
+        xb.build(rows, model=MODEL, form=FORM_AXES, hardware=HW, source="s", p_chunk_tokens=4096,
+                 d_chunk_tokens=4096, allow_flip_total_fallback=True)
+    rows = _calib_rows()
+    for r in rows:
+        if r["role"] == "flip" and r["direction"] == "D>P":
+            r["flip_user_ms"] = -8279                      # a clock artefact is a missing reading
+    with pytest.raises(xc.XCurvesRefused):
+        xb.build(rows, model=MODEL, form=FORM_AXES, hardware=HW, source="s", p_chunk_tokens=4096,
+                 d_chunk_tokens=4096, allow_flip_total_fallback=True)
+
+
+def test_cli_total_only_is_refused_and_the_flag_opens_the_warned_fallback(tmp_path, capsys):
+    src = tmp_path / "calib.jsonl"
+    src.write_text("\n".join(json.dumps(r) for r in _only_total(_calib_rows())) + "\n")
+    base = [str(src), "--out", str(tmp_path / "o.json"), "--model", MODEL, "--form", FORM_AXES,
+            "--hardware", HW, "--p-chunk-tokens", "4096", "--d-chunk-tokens", "4096"]
+    assert xb.main(base) == 2
+    assert xb.main(base + ["--allow-flip-total-fallback"]) == 0
+    assert "WARNING" in capsys.readouterr().out
 
 
 # ----------------------------------------------------- C/D: launcher half
