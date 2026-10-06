@@ -2282,26 +2282,47 @@
    ],
    "bare": true,
    "choices": null,
-   "cost": "",
+   "cost": "Kein P, kein Flip, keine Front.",
    "default": null,
-   "depends": [],
-   "gain": "",
-   "group": "",
+   "depends": [
+    {
+     "beleg": {
+      "anker": "(--tp-prefill-max-tokens = --max-kv-per-request)",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22852,
+      "zeile_hinweis": 22852
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Unter --d-only ist die D-Prefill-Schwelle das KV-Ziel je Anfrage: was D an Kontext annimmt, ist genau das, was --max-kv-per-request erlaubt.",
+     "kante": "K81",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Unter --d-only ist die D-Prefill-Schwelle das KV-Ziel je Anfrage: was D an Kontext annimmt, ist genau das, was --max-kv-per-request erlaubt.",
+     "to": "--max-kv-per-request",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
+   "gain": "Für Hosts, deren RAM den Flip nicht trägt.",
+   "group": "Start",
    "help": "Nutzer 25.09.: NUR Gruppe D (TP3 auf allen Karten), kein P, kein Flip, keine Front. D wird mit derselben Env und demselben argv gebaut wie im Flip-Boot (Budgets aus der Erwartung wie im Dry-Run), nimmt aber jede ungecachte Laenge selbst an (--tp-prefill-max-tokens = --max-kv-per-request) und wird direkt auf :{…} angesprochen. Fuer Hosts, deren RAM den Flip nicht traegt.",
    "id": "--d-only",
    "kind": "flag",
-   "level": "experte",
+   "level": "einfach",
    "name": "--d-only",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --d-only (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22848
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Nur Gruppe D (TP3 auf allen Karten), kein P, kein Flip, keine Front (Nutzer 25.09.). D wird mit derselben Env und demselben argv gebaut wie im Flip-Boot (Budgets aus der Erwartung wie im Dry-Run), nimmt aber jede ungecachte Länge selbst an (--tp-prefill-max-tokens = --max-kv-per-request) und wird direkt auf dem Port angesprochen.",
    "type": "bool"
   },
   "--d-rank-perf-tune": {
@@ -2663,6 +2684,25 @@
      "to": "--d-hold-s",
      "to_kind": "flag",
      "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22724,
+      "zeile_hinweis": 22724
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Im Dual-Layout wird --d-short-drain-tokens auf 0 gesetzt (ein Idle-Drain auf D der Flip-Auslegung; im Dual-Layout prefillt D nichts) und der Wechsel im Log genannt, kein Verweigern. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "kante": "K102",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Im Dual-Layout wird --d-short-drain-tokens auf 0 gesetzt (ein Idle-Drain auf D der Flip-Auslegung; im Dual-Layout prefillt D nichts) und der Wechsel im Log genannt, kein Verweigern. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "to": "--dual-d-prefill-tokens",
+     "to_kind": "flag",
+     "wert": "0"
     }
    ],
    "gain": "Kein Flip für kleine Rückstaus.",
@@ -2952,9 +2992,48 @@
    "choices": null,
    "cost": "",
    "default": 1,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "Uneven DCP: auto-set dcp_size=%d (= tp_size) for token-axis",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 12577,
+      "zeile_hinweis": 12577
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Bei einem ungleichen --rank-tp-ratio-Plan setzt der Start dcp_size automatisch auf tp_size, wenn dcp_size noch 1 ist und SGLANG_UNEVEN_DCP=1 gilt oder --rank-kv-ratio ungleich 'coupled' ist (nicht unter Form A, die ihre DCP-Größe selbst auflöst).",
+     "kante": "K65",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Bei einem ungleichen --rank-tp-ratio-Plan setzt der Start dcp_size automatisch auf tp_size, wenn dcp_size noch 1 ist und SGLANG_UNEVEN_DCP=1 gilt oder --rank-kv-ratio ungleich 'coupled' ist (nicht unter Form A, die ihre DCP-Größe selbst auflöst).",
+     "to": "--rank-tp-ratio",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "self.dcp_size = res.dcp_size",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 11177,
+      "zeile_hinweis": 11177
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Unter Form A löst rank_role.resolve_dcp_under_host_kv die DCP-Größe selbst auf: ohne Token-Schnitt dcp 1 (der Host hält den ganzen KV), mit einem Token-Schnitt über die Ränge dcp gleich Rangzahl.",
+     "kante": "K72",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Unter Form A löst rank_role.resolve_dcp_under_host_kv die DCP-Größe selbst auf: ohne Token-Schnitt dcp 1 (der Host hält den ganzen KV), mit einem Token-Schnitt über die Ränge dcp gleich Rangzahl.",
+     "to": "--rank-role",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Aufteilung",
    "help": "The decode context parallelism size.",
    "id": "--dcp-size",
    "kind": "flag",
@@ -2962,6 +3041,7 @@
    "name": "--dcp-size",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "server_args.py dcp_size (Arg help=)",
    "scope": "server",
    "source": {
     "baum": "27b",
@@ -2969,8 +3049,8 @@
     "kind": "argparse",
     "line": 1815
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Die Größe der Decode-Context-Parallelität (Standard 1; Alias --decode-context-parallel-size).",
    "type": "str"
   },
   "--debug-cuda-graph": {
@@ -4909,7 +4989,7 @@
     "on",
     "off"
    ],
-   "cost": "Mehr Arbeit und Speicher auf P.",
+   "cost": "'on': der MTP-Kopf liegt auf Ps letzter Stufe. 'off': P bootet ohne Draft; D parkt seine Draft im pinned System-RAM, solange P läuft (WEG2-DRAFT-PARK/UNPARK), und startet jede geflippte Anfrage DRAFT-COLD.",
    "default": null,
    "depends": [
     {
@@ -4924,9 +5004,66 @@
      "to": "--spec-form",
      "to_kind": "flag",
      "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "Only '--speculative-draft-placement solo' with an explicit",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 3694,
+      "zeile_hinweis": 3694
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Mit 'off' trägt P keinen Draft; D parkt dann seinen Draft im pinned Host-RAM (nur im Austausch-Pfad: Gewichtsquelle exchange, --flip-weights family, Draft im D-argv). Bepreist wird nur --speculative-draft-placement solo mit ausdrücklichem --speculative-draft-model-path (Rang 0 hält den Draft); sonst verweigert der Start mit W128 Weg2DraftParkUnpriced.",
+     "kante": "K76",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Mit 'off' trägt P keinen Draft; D parkt dann seinen Draft im pinned Host-RAM (nur im Austausch-Pfad: Gewichtsquelle exchange, --flip-weights family, Draft im D-argv). Bepreist wird nur --speculative-draft-placement solo mit ausdrücklichem --speculative-draft-model-path (Rang 0 hält den Draft); sonst verweigert der Start mit W128 Weg2DraftParkUnpriced.",
+     "to": "--speculative-draft-placement",
+     "to_kind": "flag",
+     "wert": "off"
+    },
+    {
+     "beleg": {
+      "anker": "H25 (Nutzer-Order 24.09.): D's MTP draft parks in ONE pinned host image",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/host_ledger.py",
+      "zeile": 2930,
+      "zeile_hinweis": 2930
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Mit 'off' parkt Ds Draft in EINEM pinned Host-Image, einem permanenten Host-Posten, der für beide Momente angerechnet wird (host_ledger.charge_terms, d_draft_host_gib); ein vom Host-Ledger abgelehntes Urteil nimmt nur --host-ledger-deviation unter benanntem Grund an (K38).",
+     "kante": "K78",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Mit 'off' parkt Ds Draft in EINEM pinned Host-Image, einem permanenten Host-Posten, der für beide Momente angerechnet wird (host_ledger.charge_terms, d_draft_host_gib); ein vom Host-Ledger abgelehntes Urteil nimmt nur --host-ledger-deviation unter benanntem Grund an (K38).",
+     "to": "--host-ledger-deviation",
+     "to_kind": "flag",
+     "wert": "off"
+    },
+    {
+     "beleg": {
+      "anker": "none (--flip-weights resident: nothing sleeps)",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 3679,
+      "zeile_hinweis": 3679
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Der geparkte D-Draft-Posten im Host-RAM entsteht nur, wenn Gewichte wechseln: unter --flip-weights resident schläft nichts und der Posten ist 0 (ebenso, wenn P den Draft trägt oder die Gewichtsquelle nicht exchange ist).",
+     "kante": "K79",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Der geparkte D-Draft-Posten im Host-RAM entsteht nur, wenn Gewichte wechseln: unter --flip-weights resident schläft nichts und der Posten ist 0 (ebenso, wenn P den Draft trägt oder die Gewichtsquelle nicht exchange ist).",
+     "to": "--flip-weights",
+     "to_kind": "flag",
+     "wert": "off"
     }
    ],
-   "gain": "D muss die Draft-KV nicht selbst aufbauen.",
+   "gain": "'on': D nimmt nach einem Flip mit warmer Draft-KV wieder auf.",
    "group": "Decode",
    "help": "",
    "id": "--draft-kv-on-p",
@@ -4935,6 +5072,7 @@
    "name": "--draft-kv-on-p",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --draft-kv-on-p (help=) und launcher.draft_on_p_line",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
@@ -4942,7 +5080,7 @@
     "line": 23068
    },
    "status": "kuratiert",
-   "text": "Ob Gruppe P auch die Draft-KV erzeugt (on/off).",
+   "text": "Ob Gruppe P der reine Draft-KV-ERZEUGER ist (#1264). 'on' (Standard; stehender Nutzerauftrag vom 2026-09-07: Draft-KV über den Flip hinweg) legt den mtp.*-Kopf des Checkpoints auf Ps letzte Stufe, damit D nach einem Flip mit warmer Draft-KV wieder aufnimmt. 'off' bootet die rg6-bewiesene Form: P trägt KEIN Speculative-Flag und keinen MTP-Kopf (der Launcher sagt es in einer Zeile; die Serving-Basis / der A-B-Arm, nie still). Gruppe D bleibt bei beiden Werten unverändert: sie behält ihren eigenen NEXTN-Kopf, denn 'off' nimmt den Erzeuger weg, nicht die spekulative Dekodierung.",
    "type": "str"
   },
   "--drain-deadline-s": {
@@ -5171,9 +5309,29 @@
    ],
    "cost": "",
    "default": "off",
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "--dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 15097,
+      "zeile_hinweis": 15097
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Graph-Aufnahme auf dem Stream höchster Priorität gilt nur für Gruppe D des Dual-Layouts; ohne --dual-layout verweigert der Start beim Namen.",
+     "kante": "K92",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die Graph-Aufnahme auf dem Stream höchster Priorität gilt nur für Gruppe D des Dual-Layouts; ohne --dual-layout verweigert der Start beim Namen.",
+     "to": "--dual-layout",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-SHARE stage 1a: D captures its CUDA graphs on the device's highest-priority stream (graph nodes keep the capture stream's priority). Group D of the dual layout only.",
    "id": "--dual-d-capture-prio",
    "kind": "flag",
@@ -5181,14 +5339,15 @@
    "name": "--dual-d-capture-prio",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-d-capture-prio (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22762
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-SHARE Stufe 1a: D nimmt seine CUDA-Graphen auf dem Stream höchster Priorität des Geräts auf (Graph-Knoten behalten die Priorität des Capture-Streams). Nur Gruppe D des Dual-Layouts.",
    "type": "str"
   },
   "--dual-d-kv-max-tokens": {
@@ -5199,9 +5358,29 @@
    "choices": null,
    "cost": "",
    "default": 1048576,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "DUAL-TP3PP3 --dual-unified-kv: D's KV pool in GLOBAL tokens",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22795,
+      "zeile_hinweis": 22795
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Gilt für --dual-unified-kv: Ds KV-Pool in globalen Token ist virtuell (D behält seinen Boot-Stand gemappt und wächst aus dem Karten-Pool) und muss Ds Boot-Kontext übersteigen.",
+     "kante": "K106",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Gilt für --dual-unified-kv: Ds KV-Pool in globalen Token ist virtuell (D behält seinen Boot-Stand gemappt und wächst aus dem Karten-Pool) und muss Ds Boot-Kontext übersteigen.",
+     "to": "--dual-unified-kv",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3 --dual-unified-kv: D's KV pool in GLOBAL tokens (virtual; D keeps its boot level mapped and grows from the card pool). Must exceed D's boot context; each buffer is born at its owner share of this and trimmed at once.",
    "id": "--dual-d-kv-max-tokens",
    "kind": "flag",
@@ -5209,14 +5388,15 @@
    "name": "--dual-d-kv-max-tokens",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-d-kv-max-tokens (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22794
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3 --dual-unified-kv (Standard 1048576): Ds KV-Pool in GLOBALEN Token (virtuell; D behält seinen Boot-Stand gemappt und wächst aus dem Karten-Pool). Muss Ds Boot-Kontext übersteigen; jeder Puffer wird in seinem Owner-Anteil davon angelegt und sofort gekürzt.",
    "type": "int"
   },
   "--dual-d-min-rate-tps": {
@@ -5229,7 +5409,7 @@
    "default": 0.0,
    "depends": [],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-SHARE: D's minimum decode rate per request (tok/s, measured from the leg-2 token stream); below it the rung steps toward D. 0 = off.",
    "id": "--dual-d-min-rate-tps",
    "kind": "flag",
@@ -5237,14 +5417,15 @@
    "name": "--dual-d-min-rate-tps",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-d-min-rate-tps (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22747
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-SHARE: Ds Mindest-Decode-Rate je Anfrage (Token/s, gemessen am Leg-2-Token-Strom); darunter geht die Stufe in Richtung D. 0 = aus.",
    "type": "float"
   },
   "--dual-d-prefill-tokens": {
@@ -5257,7 +5438,7 @@
    "default": 0,
    "depends": [],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3 D PREFILL ALLOWANCE, DEFAULT 0 (user decision 01.10.: in the dual layout EVERY prefill runs on P, D only decodes). D's X (its W31 riegel and the front's route bound) becomes 1 + this value: the 1 is the N-1 anchor convention (P holds the last prompt token back, D's first step computes it), anything larger goes to P and a larger remainder at D is refused by name (W31 -> P), never silently recomputed. Ignored outside --dual-layout; replaces --tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
    "id": "--dual-d-prefill-tokens",
    "kind": "flag",
@@ -5265,14 +5446,15 @@
    "name": "--dual-d-prefill-tokens",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-d-prefill-tokens (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22717
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3 D-Prefill-Zulassung, Standard 0 (Nutzer 01.10.: im Dual-Layout läuft JEDER Prefill auf P, D decodet nur). Ds X (sein W31-Riegel und die Routing-Grenze der Front) wird zu 1 + diesem Wert: die 1 ist die N-1-Anker-Konvention (P hält das letzte Prompt-Token zurück, Ds erster Schritt rechnet es); alles Größere geht an P, und ein größerer Rest an D wird beim Namen verweigert (W31 -> P), nie still neu gerechnet. Ohne --dual-layout ignoriert; ersetzt dort --tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens.",
    "type": "int"
   },
   "--dual-green-ladder": {
@@ -5285,26 +5467,123 @@
     "on",
     "hold"
    ],
-   "cost": "",
+   "cost": "Braucht --dual-priority, 'green' in --dual-share-actuators, --dual-mps on und kein --dual-p-sm-pct.",
    "default": "off",
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "--dual-green-ladder needs --dual-priority",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 15113,
+      "zeile_hinweis": 15113
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Green-Leiter braucht --dual-priority: der Regler der Front schreibt die Stufe, der die grünen Streams folgen; sonst verweigert der Start.",
+     "kante": "K94",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die Green-Leiter braucht --dual-priority: der Regler der Front schreibt die Stufe, der die grünen Streams folgen; sonst verweigert der Start.",
+     "to": "--dual-priority",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "needs 'green' in --dual-share-actuators",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 15117,
+      "zeile_hinweis": 15117
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Green-Leiter braucht 'green' in --dual-share-actuators (z. B. green,duty: duty ist der benannte Rückfall für Stufen, die die Leiter nicht bedienen kann); sonst verweigert der Start.",
+     "kante": "K95",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die Green-Leiter braucht 'green' in --dual-share-actuators (z. B. green,duty: duty ist der benannte Rückfall für Stufen, die die Leiter nicht bedienen kann); sonst verweigert der Start.",
+     "to": "--dual-share-actuators",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "--dual-green-ladder needs --dual-mps on",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 15121,
+      "zeile_hinweis": 15121
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die grünen Streams teilen die Karte mit D über MPS (die Metall-Probe lief unter MPS): ohne --dual-mps on verweigert der Start.",
+     "kante": "K96",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die grünen Streams teilen die Karte mit D über MPS (die Metall-Probe lief unter MPS): ohne --dual-mps on verweigert der Start.",
+     "to": "--dual-mps",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "needs --dual-p-kv-max-tokens > 0",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 15125,
+      "zeile_hinweis": 15125
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Das P-seitige Dual-Gate (dual_p_kv_stage.armed) liest --dual-p-kv-max-tokens; mit 0 würde die Leiter auf den P-Rängen still nie scharf, darum verweigert der Start.",
+     "kante": "K97",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Das P-seitige Dual-Gate (dual_p_kv_stage.armed) liest --dual-p-kv-max-tokens; mit 0 würde die Leiter auf den P-Rängen still nie scharf, darum verweigert der Start.",
+     "to": "--dual-p-kv-max-tokens",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "--dual-green-ladder and --dual-p-sm-pct below 100 exclude each other",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 15129,
+      "zeile_hinweis": 15129
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Ein statischer MPS-Prozentsatz unter 100 deckelt P beim Client-Start und die Leiter könnte ihn nie heben (P's CUDA_MPS_ACTIVE_THREAD_PERCENTAGE muss ungesetzt bleiben): beide schließen einander aus, der Start verweigert.",
+     "kante": "K98",
+     "quelle": "katalog",
+     "rel": "schliesst_aus",
+     "satz": "Ein statischer MPS-Prozentsatz unter 100 deckelt P beim Client-Start und die Leiter könnte ihn nie heben (P's CUDA_MPS_ACTIVE_THREAD_PERCENTAGE muss ungesetzt bleiben): beide schließen einander aus, der Start verweigert.",
+     "to": "--dual-p-sm-pct",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
-   "help": "DUAL-SHARE stage 3 (weg2/dual_green.py): P's SM share as a green-context LADDER (100/75/50/25 % per forward, dynamic, up AND down; PP0 stamps the stage on the request wire so all three stages run the same one). 'on' = ladder + hold OBSERVER (the P-STUFE log carries would_hold), 'hold' = additionally PP0 really holds (0 %) while the arena is full. Needs --dual-priority, 'green' in --dual-share-actuators, --dual-mps on, no --dual-p-sm-pct. Default off = argv/env/launch path byte-identical.",
+   "group": "Dual",
+   "help": "DUAL-SHARE stage 3 (weg2/dual_green.py): P's SM share as a green-context LADDER (100/75/50/25 %% per forward, dynamic, up AND down; PP0 stamps the stage on the request wire so all three stages run the same one). 'on' = ladder + hold OBSERVER (the P-STUFE log carries would_hold), 'hold' = additionally PP0 really holds (0 %%) while the arena is full. Needs --dual-priority, 'green' in --dual-share-actuators, --dual-mps on, no --dual-p-sm-pct. Default off = argv/env/launch path byte-identical.",
    "id": "--dual-green-ladder",
    "kind": "flag",
    "level": "experte",
    "name": "--dual-green-ladder",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-green-ladder (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22755
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-SHARE Stufe 3 (weg2/dual_green.py): Ps SM-Anteil als Green-Context-LEITER (100/75/50/25 % je Forward, dynamisch, hoch UND runter; PP0 stempelt die Stufe auf den Request-Draht, damit alle drei Stufen dieselbe fahren). 'on' = Leiter + Halte-BEOBACHTER (die P-STUFE-Zeile trägt would_hold), 'hold' = zusätzlich hält PP0 wirklich (0 %), solange die Arena voll ist. Standard off = argv/env/Startpfad byte-identisch.",
    "type": "str"
   },
   "--dual-group-lane": {
@@ -6194,7 +6473,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 21694
+      "line": 21739
      }
     }
    },
@@ -6204,26 +6483,66 @@
    ],
    "bare": true,
    "choices": null,
-   "cost": "",
+   "cost": "Kein Flip; verweigert --weg2-d-adopt on; ein gesetztes --idle-layout pp wird auf tp umgestellt (kein Verweigern).",
    "default": false,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "WEG2-DUAL --dual-share implies --dual-layout",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 14693,
+      "zeile_hinweis": 14693
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Wird --dual-share gesetzt, schaltet der Start --dual-layout selbst ein (Logzeile 'WEG2-DUAL --dual-share implies --dual-layout').",
+     "kante": "K85",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Wird --dual-share gesetzt, schaltet der Start --dual-layout selbst ein (Logzeile 'WEG2-DUAL --dual-share implies --dual-layout').",
+     "to": "--dual-share",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "with --weg2-d-adopt on -- D would hold placeholder",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 14720,
+      "zeile_hinweis": 14720
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "--dual-layout mit --weg2-d-adopt on wird verweigert: D hielte Platzhalter-Gewichte, die erst der erste Flip füllt, und das Dual-Layout flippt nie.",
+     "kante": "K87",
+     "quelle": "katalog",
+     "rel": "schliesst_aus",
+     "satz": "--dual-layout mit --weg2-d-adopt on wird verweigert: D hielte Platzhalter-Gewichte, die erst der erste Flip füllt, und das Dual-Layout flippt nie.",
+     "to": "--weg2-d-adopt",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3 (F26, user 29.09.): BOTH groups stay awake for the whole boot and the front never flips. Implies --flip-weights resident; P is NOT put to sleep after READY, its AWAKE footprint is measured in its place and D is sized from that measurement (the same per-PID reading the dormant residue uses). P's own budget is lowered with --extra-p '--rank-gpu-memory-mib ...' (W100 allows lowering). Refuses --weg2-d-adopt on and --idle-layout pp. Default off: the launcher is byte-identical.",
    "id": "--dual-layout",
    "kind": "flag",
-   "level": "experte",
+   "level": "einfach",
    "name": "--dual-layout",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-layout (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22699
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3 (F26, Nutzer 29.09.): BEIDE Gruppen bleiben den ganzen Boot wach, die Front flippt nie. Impliziert --flip-weights resident; P wird nach READY nicht schlafen gelegt, statt dessen wird sein WACH-Fußabdruck gemessen und D danach bemessen (dieselbe PID-Messung wie beim Schlafrest). Das Budget von P selbst senkt man mit --extra-p '--rank-gpu-memory-mib ...' (W100 erlaubt das Senken). Verweigert --weg2-d-adopt on und --idle-layout pp (help=; der Code stellt pp ohne Verweigerung auf tp um, launcher.py:14722). Standard aus: der Launcher ist byte-identisch.",
    "type": "bool"
   },
   "--dual-mps": {
@@ -6235,11 +6554,31 @@
     "off",
     "on"
    ],
-   "cost": "",
+   "cost": "VERWEIGERT, solange SGLANG_WEG2_DUAL_MPS_OPT_IN=1 fehlt: gemessen, beide Gruppen hängen unter Extend-großen Collectives (Repro v2 scjhru S1, Boots kw6pft/ndktv4). Das Dual-Layout läuft ohne MPS; Latenzwächter ist --dual-p-duty.",
    "default": "off",
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "--dual-mps on needs --dual-layout",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 14700,
+      "zeile_hinweis": 14700
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "--dual-mps on braucht --dual-layout (MPS lohnt nur, wenn beide Gruppen gleichzeitig Kernels laufen lassen); sonst verweigert der Start.",
+     "kante": "K89",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "--dual-mps on braucht --dual-layout (MPS lohnt nur, wenn beide Gruppen gleichzeitig Kernels laufen lassen); sonst verweigert der Start.",
+     "to": "--dual-layout",
+     "to_kind": "flag",
+     "wert": "on"
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir under the boot's run dir) so P and D kernels run concurrently on a card instead of time-slicing. Only with --dual-layout. REFUSED unless SGLANG_WEG2_DUAL_MPS_OPT_IN=1: measured to wedge both groups under extend-sized collectives (repro v2 scjhru S1, boots kw6pft/ndktv4); the dual layout runs without MPS, latency guard --dual-p-duty.",
    "id": "--dual-mps",
    "kind": "flag",
@@ -6247,14 +6586,15 @@
    "name": "--dual-mps",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-mps (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22798
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3: startet vor den Gruppen einen privaten MPS-Control-Daemon (Pipe-Verzeichnis unter dem Run-Verzeichnis des Boots), damit P- und D-Kernels auf einer Karte gleichzeitig laufen statt zeitgeteilt. Nur mit --dual-layout.",
    "type": "str"
   },
   "--dual-p-duty": {
@@ -6267,7 +6607,7 @@
    "default": 1.0,
    "depends": [],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3 PAUSE ALLOWANCE (Pausenzulassung), DEFAULT 0 = 1.0 = no pause: P and D run at once and share every card, only physics limits them (user decision 01.10.). Below 1.0 P MAY pause while D holds decodes: the share of wall time P's first stage may compute (weg2/dual_duty.py). Plain form: PP0 idles t_fwd*(1-duty)/duty after each forward. With env SGLANG_WEG2_DUAL_P_GANG_CHUNKS=K (gang window): PP0 runs K chunks, waits for the pipeline to drain, then holds so D is alone on all cards.",
    "id": "--dual-p-duty",
    "kind": "flag",
@@ -6275,14 +6615,15 @@
    "name": "--dual-p-duty",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-p-duty (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22725
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3 Pausenzulassung (Standard 1.0 = keine Pause): P und D laufen gleichzeitig und teilen jede Karte, nur die Physik begrenzt sie (Nutzer 01.10.). Unter 1.0 DARF P pausieren, während D Decodes hält: der Anteil der Wanduhrzeit, in dem Ps erste Stufe rechnen darf (weg2/dual_duty.py). Einfache Form: PP0 wartet nach jedem Forward t_fwd*(1-duty)/duty. Mit der Env SGLANG_WEG2_DUAL_P_GANG_CHUNKS=K (Gang-Fenster): PP0 rechnet K Chunks, wartet, bis die Pipeline leer ist, und hält dann, damit D allein auf allen Karten ist.",
    "type": "float"
   },
   "--dual-p-kv-max-tokens": {
@@ -6293,9 +6634,29 @@
    "choices": null,
    "cost": "",
    "default": 196608,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "DUAL-TP3PP3 --dual-unified-kv: P's KV pool rows",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22791,
+      "zeile_hinweis": 22791
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Gilt für --dual-unified-kv: Ps KV-Pool-Zeilen sind virtuell (Seiten kommen aus dem Karten-Pool), jeder K/V-Puffer wird in dieser Größe angelegt und sofort gekürzt.",
+     "kante": "K105",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Gilt für --dual-unified-kv: Ps KV-Pool-Zeilen sind virtuell (Seiten kommen aus dem Karten-Pool), jeder K/V-Puffer wird in dieser Größe angelegt und sofort gekürzt.",
+     "to": "--dual-unified-kv",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3 --dual-unified-kv: P's KV pool rows (virtual; pages from the card pool). Each K/V buffer is born at this size and trimmed at once, so the boot transient is one buffer (tokens x bytes per token per layer).",
    "id": "--dual-p-kv-max-tokens",
    "kind": "flag",
@@ -6303,14 +6664,15 @@
    "name": "--dual-p-kv-max-tokens",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-p-kv-max-tokens (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22790
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3 --dual-unified-kv (Standard 196608): Ps KV-Pool-Zeilen (virtuell; Seiten kommen aus dem Karten-Pool). Jeder K/V-Puffer wird in dieser Größe angelegt und sofort gekürzt, die Boot-Spitze ist also ein Puffer (Token x Bytes je Token je Layer).",
    "type": "int"
   },
   "--dual-p-min-share": {
@@ -6323,7 +6685,7 @@
    "default": 0.25,
    "depends": [],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-SHARE: floor of P's share (rungs below it are never used).",
    "id": "--dual-p-min-share",
    "kind": "flag",
@@ -6331,14 +6693,15 @@
    "name": "--dual-p-min-share",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-p-min-share (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22750
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-SHARE: Untergrenze von Ps Anteil (Stufen darunter werden nie benutzt; Standard 0.25).",
    "type": "float"
   },
   "--dual-p-mps-low-prio": {
@@ -6350,11 +6713,50 @@
     "off",
     "on"
    ],
-   "cost": "",
+   "cost": "Braucht --dual-mps on, sonst steht eine benannte W-DUAL-SHARE-FALLBACK-Zeile im Log.",
    "default": "off",
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "Needs --dual-mps on, else a named W-DUAL-SHARE-FALLBACK line",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22767,
+      "zeile_hinweis": 22767
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Ps niedrige MPS-Priorität braucht --dual-mps on, sonst steht eine benannte W-DUAL-SHARE-FALLBACK-Zeile im Log.",
+     "kante": "K90",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Ps niedrige MPS-Priorität braucht --dual-mps on, sonst steht eine benannte W-DUAL-SHARE-FALLBACK-Zeile im Log.",
+     "to": "--dual-mps",
+     "to_kind": "flag",
+     "wert": "on"
+    },
+    {
+     "beleg": {
+      "anker": "--dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 15097,
+      "zeile_hinweis": 15097
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Ps niedrige MPS-Priorität gibt es nur, solange beide Gruppen gleichzeitig laufen; ohne --dual-layout verweigert der Start beim Namen.",
+     "kante": "K93",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Ps niedrige MPS-Priorität gibt es nur, solange beide Gruppen gleichzeitig laufen; ohne --dual-layout verweigert der Start beim Namen.",
+     "to": "--dual-layout",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-SHARE stage 1b: P starts with CUDA_MPS_CLIENT_PRIORITY=1 (below normal; read at connect, boot only). Needs --dual-mps on, else a named W-DUAL-SHARE-FALLBACK line.",
    "id": "--dual-p-mps-low-prio",
    "kind": "flag",
@@ -6362,14 +6764,15 @@
    "name": "--dual-p-mps-low-prio",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-p-mps-low-prio (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22765
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-SHARE Stufe 1b: P startet mit CUDA_MPS_CLIENT_PRIORITY=1 (unter normal; beim Verbinden gelesen, nur beim Boot).",
    "type": "str"
   },
   "--dual-p-overhead-mib": {
@@ -6380,9 +6783,48 @@
    "choices": null,
    "cost": "",
    "default": 1500,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "DUAL-TP3PP3 --dual-share: what P holds on a card outside its",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22714,
+      "zeile_hinweis": 22714
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Der Überhang gehört zu --dual-share: D wird aus Ps GEPLANTEM Budget plus diesem Überhang bemessen, statt aus Ps Messung.",
+     "kante": "K103",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Der Überhang gehört zu --dual-share: D wird aus Ps GEPLANTEM Budget plus diesem Überhang bemessen, statt aus Ps Messung.",
+     "to": "--dual-share",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "DUAL-TP3PP3 --dual-share: what P holds on a card outside its",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22714,
+      "zeile_hinweis": 22714
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Der Überhang ist, was P auf einer Karte außerhalb seines --rank-gpu-memory-mib-Budgets hält (CUDA-Kontext, Graphen, Aktivierungen); er wird bei der Bemessung von D angerechnet.",
+     "kante": "K104",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Der Überhang ist, was P auf einer Karte außerhalb seines --rank-gpu-memory-mib-Budgets hält (CUDA-Kontext, Graphen, Aktivierungen); er wird bei der Bemessung von D angerechnet.",
+     "to": "--rank-gpu-memory-mib",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3 --dual-share: what P holds on a card outside its --rank-gpu-memory-mib budget (CUDA context, graphs, activations), charged when D is sized from P's plan instead of P's measurement.",
    "id": "--dual-p-overhead-mib",
    "kind": "flag",
@@ -6390,14 +6832,15 @@
    "name": "--dual-p-overhead-mib",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-p-overhead-mib (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22713
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3 --dual-share (Standard 1500): was P auf einer Karte außerhalb seines --rank-gpu-memory-mib-Budgets hält (CUDA-Kontext, Graphen, Aktivierungen); wird angerechnet, wenn D aus Ps Plan statt aus Ps Messung bemessen wird.",
    "type": "int"
   },
   "--dual-p-sleep": {
@@ -6409,11 +6852,50 @@
     "off",
     "on"
    ],
-   "cost": "",
+   "cost": "Der Hilfetext nennt außerdem die Verweigerung W-DUAL-P-SLEEP-SHARE für 'on' zusammen mit --dual-share, solange der Baum Ps union-gebundenen Teil nicht außerhalb des Pools lädt (launcher.dual_p_sleep_armed prüft das am Baum).",
    "default": null,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "DEFAULT: ON with --dual-share, OFF otherwise",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22769,
+      "zeile_hinweis": 22769
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Ohne ausdrücklichen Wert ist --dual-p-sleep AN mit --dual-share und AUS sonst (launcher.dual_p_sleep_choice).",
+     "kante": "K107",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Ohne ausdrücklichen Wert ist --dual-p-sleep AN mit --dual-share und AUS sonst (launcher.dual_p_sleep_choice).",
+     "to": "--dual-share",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "D PRIORITY stage 2 is armed: dual layout + unified KV",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 14886,
+      "zeile_hinweis": 14886
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die D-Priorität Stufe 2 (P schläft und parkt seine Gewichte im Host-RAM) ist nur scharf mit Dual-Layout, --dual-unified-kv on und --dual-p-sleep on.",
+     "kante": "K108",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die D-Priorität Stufe 2 (P schläft und parkt seine Gewichte im Host-RAM) ist nur scharf mit Dual-Layout, --dual-unified-kv on und --dual-p-sleep on.",
+     "to": "--dual-unified-kv",
+     "to_kind": "flag",
+     "wert": "on"
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DEFAULT: ON with --dual-share, OFF otherwise (since gmps12, dkr27bnvfp4dual1mpsleepbar1fs10020008: P slept and woke under --dual-share on all three stages, SLEEP-LEND/WAKE-RECLAIM; the metal probe SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S stays off by default). History: default off since gmps9 (dkr27bnvfp4dual1mbar1fs10012051, P-PP0 init_memory_pool: 'per-rank budget leaves no GPU memory for the KV cache'): 'on' loads P's weights inside the memory-saver's private MemPool (not resident), and the --dual-share union bind frees P's own copies into that pool, which empty_cache never returns ('WEG2-UNION PEER ... card free 3.35 -> 3.35 GiB', resident gmps7: 3.31 -> 11.74 GiB). 'on' together with --dual-share is therefore REFUSED at launch (W-DUAL-P-SLEEP-SHARE) until P's union-bound part loads outside the pool. DUAL-TP3PP3 with --dual-unified-kv on: D PRIORITY stage 2 (user decision 01.10.) -- when D is still short after P stopped and released its KV, P sleeps and parks its weights in host RAM (P boots with --enable-weights-cpu-backup and NOT resident; the vendored torch_memory_saver allocates the host image at the pause and frees it after the restore, tms_csrc/core.cpp -- no resting image, KEIN-DAUER-HOSTRAM). off = stage 1 only, the front prints 'stage=2 unavailable (weights resident)'.",
    "id": "--dual-p-sleep",
    "kind": "flag",
@@ -6421,14 +6903,15 @@
    "name": "--dual-p-sleep",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-p-sleep (help=; Verlaufsteil des Hilfetexts nicht übernommen)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22768
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Standard: AN mit --dual-share, sonst AUS. Mit --dual-unified-kv on: D-PRIORITÄT Stufe 2 (Nutzer 01.10.): ist D noch knapp, nachdem P gestoppt und sein KV freigegeben hat, schläft P und parkt seine Gewichte im Host-RAM (P bootet mit --enable-weights-cpu-backup und NICHT resident; das Host-Image wird bei der Pause angelegt und nach der Wiederherstellung freigegeben, kein ruhendes Image, KEIN-DAUER-HOSTRAM). off = nur Stufe 1; die Front druckt 'stage=2 unavailable (weights resident)'.",
    "type": "str"
   },
   "--dual-p-sm-pct": {
@@ -6437,11 +6920,11 @@
    ],
    "bare": false,
    "choices": null,
-   "cost": "",
+   "cost": "Gemessen am 29.09. (risk-1 bench, 5090): unbegrenztes P nimmt ~90 % der Karte und Ds Schritt läuft ~7x langsamer; 50 teilt ~50/50; die Summe beider Anteile bleibt in beiden Fällen ~1,0.",
    "default": 100,
    "depends": [],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3 with --dual-mps on: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for group P, i.e. the share of SMs P's kernels may occupy while D decodes. MEASURED 29.09. (risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs ~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. 100 = no limit.",
    "id": "--dual-p-sm-pct",
    "kind": "flag",
@@ -6449,14 +6932,15 @@
    "name": "--dual-p-sm-pct",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-p-sm-pct (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22732
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3 mit --dual-mps on (Standard 100): CUDA_MPS_ACTIVE_THREAD_PERCENTAGE für Gruppe P, also der Anteil der SMs, den Ps Kernels belegen dürfen, während D decodet. 100 = keine Grenze.",
    "type": "int"
   },
   "--dual-priority": {
@@ -6467,9 +6951,29 @@
    "choices": null,
    "cost": "",
    "default": null,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "--dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 15097,
+      "zeile_hinweis": 15097
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Der P/D-Anteilsregler gibt es nur, solange beide Gruppen gleichzeitig laufen; ohne --dual-layout verweigert der Start beim Namen (die Flip-Form bleibt unberührt).",
+     "kante": "K91",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Der P/D-Anteilsregler gibt es nur, solange beide Gruppen gleichzeitig laufen; ohne --dual-layout verweigert der Start beim Namen (die Flip-Form bleibt unberührt).",
+     "to": "--dual-layout",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-SHARE stage 2: the front's P/D share controller writes a rung (P's share 1.0/0.75/0.5/0.25, profile env SGLANG_WEG2_DUAL_SHARE_RUNGS) to <busy>.ctl; P acts through --dual-share-actuators. p = P full (today), balanced/d = a static rung while D decodes, dynamic = matrix of tau (queued prefill tokens / P full rate) x D bs. Switchable at runtime: POST /weg2/dual-priority on the front. Unset = off.",
    "id": "--dual-priority",
    "kind": "flag",
@@ -6477,14 +6981,15 @@
    "name": "--dual-priority",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-priority (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22741
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-SHARE Stufe 2: der P/D-Anteilsregler der Front schreibt eine Stufe (Ps Anteil 1.0/0.75/0.5/0.25, Profil-Env SGLANG_WEG2_DUAL_SHARE_RUNGS) nach <busy>.ctl; P wirkt über --dual-share-actuators. p = P voll (heute), balanced/d = eine feste Stufe, solange D decodet, dynamic = Matrix aus tau (wartende Prefill-Token / Ps volle Rate) x D-bs. Zur Laufzeit umschaltbar: POST /weg2/dual-priority an der Front. Ungesetzt = aus.",
    "type": "str"
   },
   "--dual-share": {
@@ -6504,7 +7009,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 21698
+      "line": 21743
      }
     }
    },
@@ -6516,24 +7021,45 @@
    "choices": null,
    "cost": "",
    "default": false,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "WEG2-DUAL --dual-share implies --dual-layout",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 14693,
+      "zeile_hinweis": 14693
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "--dual-share impliziert --dual-layout: der Start schaltet es selbst ein und schreibt 'WEG2-DUAL --dual-share implies --dual-layout' ins Log.",
+     "kante": "K84",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "--dual-share impliziert --dual-layout: der Start schaltet es selbst ein und schreibt 'WEG2-DUAL --dual-share implies --dual-layout' ins Log.",
+     "to": "--dual-layout",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3 stage 1b (implies --dual-layout): P's stage computes on D's TP shards (shells over D's three shards of its layers) and binds the shard of the D rank on its card to D's bytes via the union image. D boots right after P as the union OWNER, sized from P's PLANNED budget (+ --dual-p-overhead-mib); P waits for D's image before it loads anything.",
    "id": "--dual-share",
    "kind": "flag",
-   "level": "experte",
+   "level": "einfach",
    "name": "--dual-share",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-share (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22707
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3 Stufe 1b (impliziert --dual-layout): Ps Stufe rechnet auf Ds TP-Shards (Hüllen über Ds drei Shards ihrer Layer) und bindet den Shard des D-Rangs auf ihrer Karte über das Union-Image an Ds Bytes. D bootet direkt nach P als Union-OWNER, bemessen aus Ps GEPLANTEM Budget (+ --dual-p-overhead-mib); P wartet auf Ds Image, bevor es etwas lädt.",
    "type": "bool"
   },
   "--dual-share-actuators": {
@@ -6544,9 +7070,29 @@
    "choices": null,
    "cost": "",
    "default": "chunk",
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "--dual-share-actuators duty with --dual-p-duty below 1",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 15135,
+      "zeile_hinweis": 15135
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Mit --dual-priority und 'duty' in --dual-share-actuators wird --dual-p-duty unter 1 verweigert: zwei Duty-Drosseln auf PP0, eine wählen (die Duty der Stufe folgt der Stufe, --dual-p-duty ist konstant).",
+     "kante": "K99",
+     "quelle": "katalog",
+     "rel": "schliesst_aus",
+     "satz": "Mit --dual-priority und 'duty' in --dual-share-actuators wird --dual-p-duty unter 1 verweigert: zwei Duty-Drosseln auf PP0, eine wählen (die Duty der Stufe folgt der Stufe, --dual-p-duty ist konstant).",
+     "to": "--dual-p-duty",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-SHARE: comma list of P actuators: chunk (PP0's chunk cap), duty (P duty throttle at the rung's fraction), green (stage 3, NOT built: named fallback to chunk).",
    "id": "--dual-share-actuators",
    "kind": "flag",
@@ -6554,14 +7100,15 @@
    "name": "--dual-share-actuators",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-share-actuators (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22752
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-SHARE: Komma-Liste der P-Stellglieder (Standard 'chunk'): chunk (PP0s Chunk-Obergrenze), duty (P-Duty-Drossel beim Anteil der Stufe), green (Stufe 3, NICHT gebaut: benannter Rückfall auf chunk).",
    "type": "str"
   },
   "--dual-unified-kv": {
@@ -6575,9 +7122,29 @@
    ],
    "cost": "",
    "default": "off",
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "--dual-unified-kv on needs --dual-share",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 14690,
+      "zeile_hinweis": 14690
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "--dual-unified-kv on braucht --dual-share (der Karten-KV-Ledger liegt neben dem Union-Image; Ps Seiten sind Ds Karte); sonst verweigert der Start.",
+     "kante": "K88",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "--dual-unified-kv on braucht --dual-share (der Karten-KV-Ledger liegt neben dem Union-Image; Ps Seiten sind Ds Karte); sonst verweigert der Start.",
+     "to": "--dual-share",
+     "to_kind": "flag",
+     "wert": "on"
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Dual",
    "help": "DUAL-TP3PP3: one KV pool per card shared by P and D at runtime (user orders 30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P maps KV only while it prefills and pauses when D is short. Needs --dual-share.",
    "id": "--dual-unified-kv",
    "kind": "flag",
@@ -6585,14 +7152,15 @@
    "name": "--dual-unified-kv",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --dual-unified-kv (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22786
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "DUAL-TP3PP3: ein KV-Pool je Karte, den P und D zur Laufzeit teilen (Nutzer-Order 30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P bildet KV nur ab, solange es prefillt, und pausiert, wenn D knapp ist. Braucht --dual-share.",
    "type": "str"
   },
   "--duplex-probe": {
@@ -10582,6 +11150,25 @@
      "to": "--rank-gpu-memory-mib",
      "to_kind": "flag",
      "wert": "resident"
+    },
+    {
+     "beleg": {
+      "anker": "(both groups stay awake, no weight ever sleeps)",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 14730,
+      "zeile_hinweis": 14730
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Mit --dual-layout bleiben beide Gruppen wach und kein Gewicht schläft: der Start setzt --flip-weights selbst auf 'resident' (ein gesetztes 'family' wird umgestellt und im Log genannt) -- kein Verweigern, sondern ein erzwungener Wert.",
+     "kante": "K86",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Mit --dual-layout bleiben beide Gruppen wach und kein Gewicht schläft: der Start setzt --flip-weights selbst auf 'resident' (ein gesetztes 'family' wird umgestellt und im Log genannt) -- kein Verweigern, sondern ein erzwungener Wert.",
+     "to": "--dual-layout",
+     "to_kind": "flag",
+     "wert": "resident"
     }
    ],
    "gain": "resident: kein Gewichtstransport im Flip.",
@@ -10620,7 +11207,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 21750
+      "line": 21795
      }
     }
    },
@@ -11923,14 +12510,14 @@
      },
      "belegt": true,
      "calc": "text",
-     "effect": "Das Idle-Layout ist eine Flip-Regel; das Dual-Layout flippt nie -- der Launcher zwingt 'pp' deshalb zurück auf 'tp' und sagt es.",
+     "effect": "Das Idle-Layout ist eine Flip-Regel; das Dual-Layout flippt nie -- der Start setzt --idle-layout selbst auf 'tp' (ein gesetztes 'pp' wird umgestellt und im Log genannt: pp -> tp) -- kein Verweigern, sondern ein erzwungener Wert.",
      "kante": "K44",
      "quelle": "katalog",
-     "rel": "schliesst_aus",
-     "satz": "Das Idle-Layout ist eine Flip-Regel; das Dual-Layout flippt nie -- der Launcher zwingt 'pp' deshalb zurück auf 'tp' und sagt es.",
+     "rel": "abgeleitet_von",
+     "satz": "Das Idle-Layout ist eine Flip-Regel; das Dual-Layout flippt nie -- der Start setzt --idle-layout selbst auf 'tp' (ein gesetztes 'pp' wird umgestellt und im Log genannt: pp -> tp) -- kein Verweigern, sondern ein erzwungener Wert.",
      "to": "--dual-layout",
      "to_kind": "flag",
-     "wert": "pp"
+     "wert": "tp"
     }
    ],
    "gain": "Ruhe auf P bedient die erste Anfrage ohne Flip.",
@@ -17453,7 +18040,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23151
+      "line": 23206
      }
     }
    },
@@ -18157,7 +18744,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22440
+      "line": 22485
      }
     }
    },
@@ -20275,11 +20862,31 @@
    ],
    "bare": false,
    "choices": null,
-   "cost": "",
+   "cost": "Abweichendes Inventar: HW-UNCALIBRATED.",
    "default": "",
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "is refused BY NAME (HW-UNCALIBRATED)",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22628,
+      "zeile_hinweis": 22628
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Das Inventar, auf dem die positionalen Vektoren des Profils gemessen wurden, muss zum Live-Inventar passen, sonst verweigert der Start beim Namen (HW-UNCALIBRATED); positionale Messungen anderer Karten werden nie geliehen.",
+     "kante": "K82",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Das Inventar, auf dem die positionalen Vektoren des Profils gemessen wurden, muss zum Live-Inventar passen, sonst verweigert der Start beim Namen (HW-UNCALIBRATED); positionale Messungen anderer Karten werden nie geliehen.",
+     "to": "HW-UNCALIBRATED",
+     "to_kind": "ablehnung",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Hardware",
    "help": "HW-GENERIC 1002: the card inventory (calibration-class labels in card order, weg2/card_identity.py, e.g. 'RTX5090,RTX3080,RTX3080') the profile's positional vectors were measured on. Default: the inventory the profile's measured records declare (profile_records_data/<profile>.json 'inventory'). A live inventory that differs is refused BY NAME (HW-UNCALIBRATED) -- positional measurements of other cards are never borrowed.",
    "id": "--profile-inventory",
    "kind": "flag",
@@ -20287,14 +20894,15 @@
    "name": "--profile-inventory",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --profile-inventory (help=)",
    "source": {
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
     "line": 22622
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "HW-GENERIC 1002: das Karteninventar (Kalibrierklassen-Labels in Kartenreihenfolge, weg2/card_identity.py, z. B. 'RTX5090,RTX3080,RTX3080'), auf dem die positionalen Vektoren des Profils gemessen wurden. Standard: das Inventar, das die gemessenen Records des Profils angeben (profile_records_data/<Profil>.json, Feld 'inventory'). Ein abweichendes Live-Inventar wird beim Namen verweigert (HW-UNCALIBRATED); positionale Messungen anderer Karten werden nie geliehen.",
    "type": "str"
   },
   "--prompt-tokens-buckets": {
@@ -20661,11 +21269,88 @@
    ],
    "bare": false,
    "choices": null,
-   "cost": "",
+   "cost": "'capacity' verlagert bei tiefem Kontext Attention-Arbeit auf die Karten, die mehr Token halten. 'speed' braucht die Bandbreitenwerte je Rang (--rank-tp-ratio auto-performance), sonst fällt es auf 'capacity' zurück und sagt es. Werte ungleich 'coupled' verlangen --rank-gpu-id mit einem ungleichen --rank-tp-ratio-Plan. 'corridor': eine Karte, die Reserve plus noch nicht angefallenen Bedarf nicht tragen kann, bricht den Boot mit den Zahlen je Karte ab.",
    "default": "coupled",
-   "depends": [],
-   "gain": "",
-   "group": "",
+   "depends": [
+    {
+     "beleg": {
+      "anker": "--rank-kv-ratio (other than 'coupled') requires",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 11974,
+      "zeile_hinweis": 11974
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Ein --rank-kv-ratio ungleich 'coupled' verlangt --rank-gpu-id mit einem ungleichen --rank-tp-ratio-Plan (die gewichtete Token-Achsen-KV-Aufteilung); ohne ihn verweigert der Start -- was es bringt, ist freie Wahl des KV-Besitzes; was es kostet, ist der ungleiche Gewichtsplan als Voraussetzung.",
+     "kante": "K62",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Ein --rank-kv-ratio ungleich 'coupled' verlangt --rank-gpu-id mit einem ungleichen --rank-tp-ratio-Plan (die gewichtete Token-Achsen-KV-Aufteilung); ohne ihn verweigert der Start -- was es bringt, ist freie Wahl des KV-Besitzes; was es kostet, ist der ungleiche Gewichtsplan als Voraussetzung.",
+     "to": "--rank-tp-ratio",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "'dec' therefore also selects --rank-kv-ratio",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 2816,
+      "zeile_hinweis": 2816
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Bleibt --rank-kv-ratio auf dem Standard 'coupled', wählt --rank-perf-tune dec den Modus 'speed' und --rank-perf-tune maxkv den Modus 'capacity'; ein ausdrückliches --rank-kv-ratio gewinnt immer. Gemessen (#210): 'speed' senkt den kontextabhängigen Teil des Decode-Schritts bei 120k Token um 24,5 %.",
+     "kante": "K63",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Bleibt --rank-kv-ratio auf dem Standard 'coupled', wählt --rank-perf-tune dec den Modus 'speed' und --rank-perf-tune maxkv den Modus 'capacity'; ein ausdrückliches --rank-kv-ratio gewinnt immer. Gemessen (#210): 'speed' senkt den kontextabhängigen Teil des Decode-Schritts bei 120k Token um 24,5 %.",
+     "to": "--rank-perf-tune",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "would be INERT here",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 12347,
+      "zeile_hinweis": 12347
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Ohne --rank-gpu-id bleibt dcp_size 1 und --rank-kv-ratio wäre wirkungslos (der KV-Besitz bliebe an die Gewichtsaufteilung gekoppelt); der Start verweigert es beim Namen. Entweder --rank-gpu-id (schaltet DCP automatisch ein) oder --dcp-size gleich tp_size ausdrücklich.",
+     "kante": "K64",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Ohne --rank-gpu-id bleibt dcp_size 1 und --rank-kv-ratio wäre wirkungslos (der KV-Besitz bliebe an die Gewichtsaufteilung gekoppelt); der Start verweigert es beim Namen. Entweder --rank-gpu-id (schaltet DCP automatisch ein) oder --dcp-size gleich tp_size ausdrücklich.",
+     "to": "--dcp-size",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "environment variable SGLANG_UNEVEN_TOKEN_VECTOR (explicit",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 3063,
+      "zeile_hinweis": 3063
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Env SGLANG_UNEVEN_TOKEN_VECTOR (expliziter Vektor) hat Vorrang vor --rank-kv-ratio: ist sie gesetzt, gilt ihr Vektor und das Flag wird überstimmt (kein Verweigern).",
+     "kante": "K69",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Die Env SGLANG_UNEVEN_TOKEN_VECTOR (expliziter Vektor) hat Vorrang vor --rank-kv-ratio: ist sie gesetzt, gilt ihr Vektor und das Flag wird überstimmt (kein Verweigern).",
+     "to": "SGLANG_UNEVEN_TOKEN_VECTOR",
+     "to_kind": "env",
+     "wert": null
+    }
+   ],
+   "gain": "'capacity' maximiert max_total_num_tokens (Konvergenz in einem Boot). Gemessen (#210, 27B FP8 TP=3, ungleiches DCP, 120k Token im Speicher, bs=1, ohne Spec): Vektor [2,3,3] auf [2,1,1] senkte den kontextabhängigen Teil des Decode-Schritts um 24,5 % (2,296 auf 1,732 ms; Rauschen von Boot zu Boot 1,07 %), das sind -2,5 % Schrittzeit insgesamt, mit dem Kontext linear wachsend.",
+   "group": "Aufteilung",
    "help": "Uneven-DCP KV-TOKEN ownership vector, DECOUPLED from the projection/weight split: under weighted-DCP token-axis KV sharding, moving a context token's home rank only moves where that token's attention math runs (query broadcast + LSE merge stay KB-sized per step), so token ownership is a free placement knob. 'coupled' (default): exactly the previous behavior (the SGLANG_UNEVEN_DCP/_WEIGHTED env-gated estimate vector plus the restart-hint self-calibration). 'capacity' (alias 'auto'): capacity-weighted ownership — after the post-weight-load memory profiling, every rank installs the measured optimal vector proportional to its actual free-VRAM-after-weights token capacity (one-boot convergence; maximizes max_total_num_tokens; the honest cost is that deep-context decode shifts attention work to the cards holding more tokens). 'speed': the derived counterpart — ownership shifted from the capacity proportion toward the MEMORY-BANDWIDTH proportion of the ranks, as far as --rank-perf-loose-ctx-percent allows, because under DCP each rank runs attention over the tokens IT owns and at bs=1 the slowest rank sets the pace. Measured (#210, 27B FP8 TP=3 uneven DCP, 120 k resident tokens, bs=1, no spec): moving the vector from [2,3,3] to [2,1,1] cut the context-dependent part of the decode step by 24.5 %% (2.296 -> 1.732 ms, boot-to-boot noise floor 1.07 %%), worth -2.5 %% step time end to end and growing linearly with resident context. 'speed' needs the per-rank bandwidth scores, so it requires --rank-tp-ratio auto-performance; without them it degrades to 'capacity' and says so. 'corridor'  ...",
    "id": "--rank-kv-ratio",
    "kind": "flag",
@@ -20673,6 +21358,7 @@
    "name": "--rank-kv-ratio",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "server_args.py rank_kv_ratio (Arg help=)",
    "scope": "server",
    "source": {
     "baum": "27b",
@@ -20680,8 +21366,8 @@
     "kind": "argparse",
     "line": 3014
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Wem die KV-Token gehören (ungleiches DCP), entkoppelt von der Gewichtsaufteilung: Wo ein Kontext-Token liegt, verschiebt nur, wo seine Attention-Rechnung läuft. 'coupled' (Standard): das bisherige Verhalten. 'capacity' (Alias 'auto'): Besitz proportional zur tatsächlich freien Token-Kapazität jedes Rangs nach dem Laden der Gewichte. 'speed': vom Kapazitätsanteil in Richtung des Speicherbandbreiten-Anteils verschoben, soweit --rank-perf-loose-ctx-percent es erlaubt. 'corridor' (#602): 'capacity' plus eine harte Freiraum-Untergrenze je Karte. Eine Liste positiver ganzer Zahlen (ein Eintrag je Rang) legt den Besitzvektor fest. Werte ungleich 'coupled' schalten den gewichteten-DCP-Weg ein. Die Env SGLANG_UNEVEN_TOKEN_VECTOR (expliziter Vektor) hat Vorrang vor diesem Flag; die Gewichtsaufteilung (--rank-tp-ratio, --rank-mlp-ratio, ...) bleibt unberührt.",
    "type": "str"
   },
   "--rank-mlp-ratio": {
@@ -20979,11 +21665,69 @@
    ],
    "bare": false,
    "choices": null,
-   "cost": "",
+   "cost": "Braucht ein ausdrückliches --rank-tp-ratio; nur reine Tensor-Parallelität auf einem Knoten.",
    "default": null,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "--rank-role requires an explicit --rank-tp-ratio",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 12197,
+      "zeile_hinweis": 12197
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Form A braucht ein ausdrückliches --rank-tp-ratio: die Rollen sagen, WER die dichte Seite hält, die Ratio sagt, wie viel; ohne sie verweigert der Start und nennt den passenden Vektor (1 für den Host, 0 für jeden Worker).",
+     "kante": "K70",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Form A braucht ein ausdrückliches --rank-tp-ratio: die Rollen sagen, WER die dichte Seite hält, die Ratio sagt, wie viel; ohne sie verweigert der Start und nennt den passenden Vektor (1 für den Host, 0 für jeden Worker).",
+     "to": "--rank-tp-ratio",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "was set explicitly, but under",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/rank_role.py",
+      "zeile": 1085,
+      "zeile_hinweis": 1085
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Unter Form A ohne Token-Schnitt wird ein ausdrücklich gesetztes --dcp-size größer 1 verweigert: der Host hält den ganzen KV und alle Köpfe, es gibt keinen zweiten Rang zum Mergen. Weglassen, oder die Worker-Rollen weglassen.",
+     "kante": "K73",
+     "quelle": "katalog",
+     "rel": "schliesst_aus",
+     "satz": "Unter Form A ohne Token-Schnitt wird ein ausdrücklich gesetztes --dcp-size größer 1 verweigert: der Host hält den ganzen KV und alle Köpfe, es gibt keinen zweiten Rang zum Mergen. Weglassen, oder die Worker-Rollen weglassen.",
+     "to": "--dcp-size",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "--rank-role (Form A) requires --speculative-draft-placement",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 11126,
+      "zeile_hinweis": 11126
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Form A verlangt bei eingeschalteter spekulativer Dekodierung --speculative-draft-placement solo: der Draft läuft ungeteilt auf dem Host-Rang, die Worker halten keine Draft-Gewichte, keinen Draft-KV-Pool und keine Draft-Backends; sonst verweigert der Start.",
+     "kante": "K74",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Form A verlangt bei eingeschalteter spekulativer Dekodierung --speculative-draft-placement solo: der Draft läuft ungeteilt auf dem Host-Rang, die Worker halten keine Draft-Gewichte, keinen Draft-KV-Pool und keine Draft-Backends; sonst verweigert der Start.",
+     "to": "--speculative-draft-placement",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Aufteilung",
    "help": "FORM A (attention-host layout): comma-separated roles, one per rank, each 'host' or 'worker'. Exactly one rank may be the host. Example for one 5090 plus two 3080s: --rank-role host,worker,worker. The HOST runs every dense part of the model (attention and the QSA indexer, GDN/linear attention, o_proj, the hyper-connection mixer, norms, embeddings, PLE, lm_head), holds the whole KV cache for the full context, the GDN recurrent states, the speculative draft and the CUDA graphs, plus its own share of the MoE experts. A WORKER holds its own experts and NOTHING else: it computes them for the rows the host broadcasts and sends the partial sums back. This flag is what makes a ZERO in --rank-tp-ratio legible as a LAYOUT rather than an arithmetic accident: a zero is admitted only for a rank this flag names a worker, and every worker must have one. Without --rank-role, --rank-tp-ratio entries must still be positive, unchanged. Requires an explicit --rank-tp-ratio; pure single-node tensor parallelism only.",
    "id": "--rank-role",
    "kind": "flag",
@@ -20991,6 +21735,7 @@
    "name": "--rank-role",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "server_args.py rank_role (Arg help=)",
    "scope": "server",
    "source": {
     "baum": "27b",
@@ -20998,8 +21743,8 @@
     "kind": "argparse",
     "line": 2626
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Form A (Attention-Host-Layout): je Rang eine Rolle, 'host' oder 'worker' (z. B. host,worker,worker für eine 5090 und zwei 3080). Genau ein Rang darf Host sein. Der Host rechnet alle dichten Teile des Modells, hält den ganzen KV-Cache für den vollen Kontext, die GDN-Zustände, den spekulativen Draft und die CUDA-Graphen sowie seinen Anteil an den MoE-Experten; ein Worker hält nur seine eigenen Experten und sonst nichts: er rechnet sie für die Zeilen, die der Host verteilt, und schickt die Teilsummen zurück. Erst dieses Flag macht eine Null in --rank-tp-ratio als Layout lesbar: eine Null ist nur für einen Rang erlaubt, den dieses Flag Worker nennt, und jeder Worker braucht eine.",
    "type": "str"
   },
   "--rank-tp-ratio": {
@@ -21047,6 +21792,44 @@
      "rel": "braucht",
      "satz": "Der Performance-Arm (auto-performance) bewegt nur den Dense-MLP-Vektor; der Attention-Split bleibt stehen -- wer den MLP-Share ändert, tut es über diesen Weg.",
      "to": "--rank-mlp-ratio",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "decode-context-parallel group must span the whole TP group",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 12562,
+      "zeile_hinweis": 12562
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Ein ungleiches --rank-tp-ratio stellt den Full-Attention-KV von Kopf- auf Token-Aufteilung um; die DCP-Gruppe muss dann die ganze TP-Gruppe umfassen (dcp_size gleich tp_size, jeder Rang ein DCP-Rang).",
+     "kante": "K66",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Ein ungleiches --rank-tp-ratio stellt den Full-Attention-KV von Kopf- auf Token-Aufteilung um; die DCP-Gruppe muss dann die ganze TP-Gruppe umfassen (dcp_size gleich tp_size, jeder Rang ein DCP-Rang).",
+     "to": "--dcp-size",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "A zero is only legible as a layout together",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 12231,
+      "zeile_hinweis": 12231
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Eine Null in --rank-tp-ratio ist nur zusammen mit --rank-role (Form A) als Layout lesbar; allein ist sie ein Rechenfehler und wird verweigert.",
+     "kante": "K71",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Eine Null in --rank-tp-ratio ist nur zusammen mit --rank-role (Form A) als Layout lesbar; allein ist sie ein Rechenfehler und wird verweigert.",
+     "to": "--rank-role",
      "to_kind": "flag",
      "wert": null
     }
@@ -21108,11 +21891,31 @@
    ],
    "bare": false,
    "choices": null,
-   "cost": "",
+   "cost": "Verlangt einen aktiven --rank-tp-ratio-Plan. Standard AUS: ohne das Flag bleibt die Vokabular-Aufteilung gleichmäßig und das Verhalten unverändert.",
    "default": null,
-   "depends": [],
-   "gain": "",
-   "group": "",
+   "depends": [
+    {
+     "beleg": {
+      "anker": "--rank-vocab-ratio requires an active uneven-TP base plan",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 12646,
+      "zeile_hinweis": 12646
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "'auto' braucht einen aktiven ungleichen --rank-tp-ratio-Plan (ohne ihn nutzt jede Familie schon die gleichmäßige Aufteilung) und verweigert sonst; es leitet die Gewichte aus den Speicherbandbreiten-Werten des gecachten Hardwareprofils ab, sonst aus dem aufgelösten --rank-tp-ratio-Vektor.",
+     "kante": "K83",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "'auto' braucht einen aktiven ungleichen --rank-tp-ratio-Plan (ohne ihn nutzt jede Familie schon die gleichmäßige Aufteilung) und verweigert sonst; es leitet die Gewichte aus den Speicherbandbreiten-Werten des gecachten Hardwareprofils ab, sonst aus dem aufgelösten --rank-tp-ratio-Vektor.",
+     "to": "--rank-tp-ratio",
+     "to_kind": "flag",
+     "wert": "auto"
+    }
+   ],
+   "gain": "Gewichten nach Speicherbandbreite gleicht die Lesezeit des lm_head aus statt der Anteilsbreite.",
+   "group": "Aufteilung",
    "help": "Ratio-weighted vocab sharding for the tied vocab layers (VocabParallelEmbedding / ParallelLMHead, shared with NEXTN/EAGLE drafts): 'auto' or comma-separated positive integer weights, one per rank (length must equal --tp-size). The lm_head matvec streams the whole weight shard every decode step, so on heterogeneous cards the EVEN vocab split (the default, kept even under --rank-tp-ratio) is bounded by the SLOWEST card; weighting the shard widths by memory bandwidth balances the read TIME instead. 'auto' derives the weights from the cached auto-performance hardware profile's memory-bandwidth scores when available, else falls back to the resolved --rank-tp-ratio vector. The environment variable SGLANG_UNEVEN_VOCAB_VECTOR (explicit vector) takes precedence over this flag. Requires an active --rank-tp-ratio plan. Default OFF: without the flag, vocab sharding stays even and behavior is unchanged.",
    "id": "--rank-vocab-ratio",
    "kind": "flag",
@@ -21120,6 +21923,7 @@
    "name": "--rank-vocab-ratio",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "server_args.py rank_vocab_ratio (Arg help=)",
    "scope": "server",
    "source": {
     "baum": "27b",
@@ -21127,8 +21931,8 @@
     "kind": "argparse",
     "line": 2886
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Gewichtete Aufteilung der gekoppelten Vokabular-Schichten (VocabParallelEmbedding / ParallelLMHead, auch von NEXTN/EAGLE-Drafts geteilt): 'auto' oder je Rang eine positive ganze Zahl (Länge gleich --tp-size). Der lm_head-Matvec liest bei jedem Decode-Schritt den ganzen Gewichtsanteil; bei ungleichen Karten wird die gleichmäßige Aufteilung (Standard, bleibt auch unter --rank-tp-ratio gleichmäßig) von der langsamsten Karte begrenzt. 'auto' leitet die Gewichte aus den Speicherbandbreiten-Werten des gecachten auto-performance-Hardwareprofils ab, sonst aus dem aufgelösten --rank-tp-ratio-Vektor. Die Env SGLANG_UNEVEN_VOCAB_VECTOR (expliziter Vektor) hat Vorrang vor diesem Flag.",
    "type": "str"
   },
   "--ready-deadline-s": {
@@ -23090,18 +23894,58 @@
     "split",
     "solo"
    ],
-   "cost": "",
+   "cost": "'solo' (v1): nur Familie EAGLE/EAGLE3/NEXTN, topk == 1, kein Rejection Sampling, reine Single-Node-TP.",
    "default": "split",
-   "depends": [],
-   "gain": "",
-   "group": "",
+   "depends": [
+    {
+     "beleg": {
+      "anker": "Under Form A the draft is UNSHARDED on rank",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 11129,
+      "zeile_hinweis": 11129
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Unter Form A läuft der 'solo'-Draft ungeteilt auf dem Host-Rang; die Worker bauen das Draft-Modell nicht und treten keinem geteilten Draft-Forward bei.",
+     "kante": "K75",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Unter Form A läuft der 'solo'-Draft ungeteilt auf dem Host-Rang; die Worker bauen das Draft-Modell nicht und treten keinem geteilten Draft-Forward bei.",
+     "to": "--rank-role",
+     "to_kind": "flag",
+     "wert": "solo"
+    },
+    {
+     "beleg": {
+      "anker": "placement != \"solo\" or mib is None",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 3688,
+      "zeile_hinweis": 3688
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Bei 'solo' hält Rang 0 den Draft ungeteilt; ist --draft-kv-on-p off und parkt D, wird genau dieser Draft als Host-Seite bepreist (aus den Headern des Draft-Checkpoints, Ledger-Post d_draft_host). Bei 'split' ist dieser Fall unbepreist und wird verweigert.",
+     "kante": "K77",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Bei 'solo' hält Rang 0 den Draft ungeteilt; ist --draft-kv-on-p off und parkt D, wird genau dieser Draft als Host-Seite bepreist (aus den Headern des Draft-Checkpoints, Ledger-Post d_draft_host). Bei 'split' ist dieser Fall unbepreist und wird verweigert.",
+     "to": "--draft-kv-on-p",
+     "to_kind": "flag",
+     "wert": "solo"
+    }
+   ],
+   "gain": "Auf Rigs ohne P2P ersetzt 'solo' die k host-gestagten Draft-All-Reduces je Runde durch einen kleinen Broadcast.",
+   "group": "Decode",
    "help": "Where the speculative draft model runs. 'split' (default): the draft is tensor-parallel-sharded across all TP ranks exactly like today -- byte-identical behavior whether this flag is omitted or set to 'split'. 'solo': the draft runs UNSHARDED on ONE designated rank (see --speculative-draft-gpu) and broadcasts its k draft-token ids to the other ranks once per round; the other ranks build the draft model on the meta device (no draft weights, no draft KV pool, no draft CUDA graphs) and skip the draft forward entirely. On no-P2P rigs this replaces the k per-round host-staged draft all-reduces with one small broadcast. Solo scope (v1): EAGLE/EAGLE3/NEXTN family, topk == 1, no rejection sampling, pure single-node TP.",
    "id": "--speculative-draft-placement",
    "kind": "flag",
-   "level": "experte",
+   "level": "einfach",
    "name": "--speculative-draft-placement",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "server_args.py speculative_draft_placement (Arg help=)",
    "scope": "server",
    "source": {
     "baum": "27b",
@@ -23109,8 +23953,8 @@
     "kind": "argparse",
     "line": 4158
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Wo das spekulative Draft-Modell läuft. 'split' (Standard): der Draft ist wie bisher über alle TP-Ränge tensor-parallel geteilt (byte-identisch, ob das Flag fehlt oder 'split' heißt). 'solo': der Draft läuft UNGETEILT auf EINEM festgelegten Rang (siehe --speculative-draft-gpu) und sendet seine k Draft-Token-IDs einmal je Runde an die übrigen Ränge; diese bauen das Draft-Modell auf dem meta-Gerät (keine Draft-Gewichte, kein Draft-KV-Pool, keine Draft-CUDA-Graphen) und überspringen den Draft-Forward.",
    "type": "str"
   },
   "--speculative-draft-window-size": {
@@ -24551,6 +25395,44 @@
      "to": "--d-short-drain-tokens",
      "to_kind": "flag",
      "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "(--tp-prefill-max-tokens = --max-kv-per-request)",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22852,
+      "zeile_hinweis": 22852
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Mit --d-only nimmt D jede ungecachte Länge selbst an (--tp-prefill-max-tokens gleich --max-kv-per-request) und wird direkt auf dem Port angesprochen: kein P, kein Flip, keine Front.",
+     "kante": "K80",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Mit --d-only nimmt D jede ungecachte Länge selbst an (--tp-prefill-max-tokens gleich --max-kv-per-request) und wird direkt auf dem Port angesprochen: kein P, kein Flip, keine Front.",
+     "to": "--d-only",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22724,
+      "zeile_hinweis": 22724
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Im Dual-Layout wird --tp-prefill-max-tokens aus --dual-d-prefill-tokens abgeleitet (X wird 1 plus dieser Wert, für Gruppe D und Front); ein gesetztes --tp-prefill-max-tokens wird dabei ersetzt, nicht verweigert. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "kante": "K100",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Im Dual-Layout wird --tp-prefill-max-tokens aus --dual-d-prefill-tokens abgeleitet (X wird 1 plus dieser Wert, für Gruppe D und Front); ein gesetztes --tp-prefill-max-tokens wird dabei ersetzt, nicht verweigert. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "to": "--dual-d-prefill-tokens",
+     "to_kind": "flag",
+     "wert": null
     }
    ],
    "gain": "Kurze Anfragen laufen sofort auf D ohne Flip.",
@@ -25131,9 +26013,29 @@
    "choices": null,
    "cost": "",
    "default": null,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "Superseded in most cases by --rank-kv-ratio.",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 6213,
+      "zeile_hinweis": 6213
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Der Hilfetext nennt --rank-kv-ratio den Nachfolger: in den meisten Fällen löst ein --rank-kv-ratio ungleich 'coupled' das ungleiche DCP aus, ohne dieses Flag.",
+     "kante": "K67",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Der Hilfetext nennt --rank-kv-ratio den Nachfolger: in den meisten Fällen löst ein --rank-kv-ratio ungleich 'coupled' das ungleiche DCP aus, ohne dieses Flag.",
+     "to": "--rank-kv-ratio",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Aufteilung",
    "help": "Enable uneven DCP. Promoted from SGLANG_UNEVEN_DCP (#781). Superseded in most cases by --rank-kv-ratio.",
    "id": "--uneven-dcp",
    "kind": "flag",
@@ -25141,6 +26043,7 @@
    "name": "--uneven-dcp",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "server_args.py uneven_dcp (Arg help=)",
    "scope": "server",
    "source": {
     "baum": "27b",
@@ -25148,8 +26051,8 @@
     "kind": "argparse",
     "line": 6209
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Schaltet ungleiches DCP ein. Aus der Env SGLANG_UNEVEN_DCP (#781) zum Flag befördert; in den meisten Fällen durch --rank-kv-ratio abgelöst.",
    "type": "str"
   },
   "--uneven-dcp-weighted": {
@@ -25161,9 +26064,29 @@
    "choices": null,
    "cost": "",
    "default": null,
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "def uneven_weighted_dcp_enabled",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/server_args.py",
+      "zeile": 10870,
+      "zeile_hinweis": 10870
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Der gewichtete Token-Vektor wird installiert, wenn SGLANG_UNEVEN_DCP_WEIGHTED=1 gilt (das Flag veröffentlicht sie), oder bei jedem --rank-kv-ratio ungleich 'coupled', oder bei einem Form-A-Token-Schnitt: dieselbe Besitzer-Regel auf drei Wegen.",
+     "kante": "K68",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Der gewichtete Token-Vektor wird installiert, wenn SGLANG_UNEVEN_DCP_WEIGHTED=1 gilt (das Flag veröffentlicht sie), oder bei jedem --rank-kv-ratio ungleich 'coupled', oder bei einem Form-A-Token-Schnitt: dieselbe Besitzer-Regel auf drei Wegen.",
+     "to": "--rank-kv-ratio",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
    "gain": "",
-   "group": "",
+   "group": "Aufteilung",
    "help": "Enable weighted uneven DCP. Promoted from SGLANG_UNEVEN_DCP_WEIGHTED (#781).",
    "id": "--uneven-dcp-weighted",
    "kind": "flag",
@@ -25171,6 +26094,7 @@
    "name": "--uneven-dcp-weighted",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "server_args.py uneven_dcp_weighted (Arg help=)",
    "scope": "server",
    "source": {
     "baum": "27b",
@@ -25178,8 +26102,8 @@
     "kind": "argparse",
     "line": 6216
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Schaltet gewichtetes ungleiches DCP ein. Aus der Env SGLANG_UNEVEN_DCP_WEIGHTED (#781) zum Flag befördert.",
    "type": "str"
   },
   "--uneven-token-vector": {
@@ -25988,6 +26912,34 @@
    "status": "geerntet",
    "text": "",
    "type": "bool"
+  },
+  "--weg2-xchg-census-map": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "AP4 1526: name the census row that prices a live card the census does not carry by UUID: comma list of <live>=<census uuid>, <live> = a live card UUID, nvml<N> or a card class label (RTX3080). Accepted as the operator's assertion (one WEG2-XCHG-CENSUS-MAP line, no refusal). A live card with neither a census row nor a mapping is BORROWED from the heaviest row of its class (else of the census) and refused as HW-BORROWED unless --force. Ignored when every live card is in the census",
+   "id": "--weg2-xchg-census-map",
+   "kind": "flag",
+   "level": "experte",
+   "name": "--weg2-xchg-census-map",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/launcher.py",
+    "kind": "argparse",
+    "line": 23023
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "str"
   },
   "--weg2-xchg-inject": {
    "baeume": [
@@ -26917,6 +27869,25 @@
      "to": "--tp-prefill-max-tokens",
      "to_kind": "flag",
      "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 22724,
+      "zeile_hinweis": 22724
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Im Dual-Layout wird die X-Obergrenze der Front auf 0 (aus) gesetzt; die Schwelle kommt aus --dual-d-prefill-tokens. Ein gesetztes --x-ceiling-tokens wird ersetzt, nicht verweigert. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "kante": "K101",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Im Dual-Layout wird die X-Obergrenze der Front auf 0 (aus) gesetzt; die Schwelle kommt aus --dual-d-prefill-tokens. Ein gesetztes --x-ceiling-tokens wird ersetzt, nicht verweigert. Ohne --dual-layout wird --dual-d-prefill-tokens ignoriert.",
+     "to": "--dual-d-prefill-tokens",
+     "to_kind": "flag",
+     "wert": "0"
     }
    ],
    "gain": "X darf sich der Lage anpassen.",
@@ -28186,7 +29157,7 @@
    "default": "False",
    "depends": [],
    "gain": "",
-   "group": "",
+   "group": "Weitere",
    "help": "deskq 1981 (f11 false alarms): the ADMISSION-WEDGE 'queue age' is the time since D's LAST FIRST TOKEN, not the age of the waiting request -- a long decode or an idle D makes the clock old before the request arrives, and the first poll that sees it alarms. 1 = (dual layout only, SGLANG_WEG2_DUAL_LAYOUT=1) the age is min(that clock, time the waiting_queue has been non-empty as seen by the poll), and a new alarm window clears the recovery channel's stale last_outcome. 0 = off (default): the pre-fix verdict, byte for byte.",
    "id": "SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK",
    "kind": "env",
@@ -28194,14 +29165,15 @@
    "name": "SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "27B-Sitz (Commit bbf5fd846e, Bericht 1981, Test test_weg2_admission_wedge_queue_clock_1981) und NF-Sitz (Berichte 1507/1531-03, Code invariant_checker.py:1202-1360 im Baum bce16a6ddf)",
    "source": {
     "baum": "27b",
     "file": "environ.py",
     "kind": "environ",
     "line": 2686
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "erklaert",
+   "text": "Gleicher Name, je Baum andere Wirkung. 27B-Baum (Standard aus, wirkt nur im Dual-Layout): Das Alter für den Wedge-Alarm („Anfrage hängt“, ADMISSION-WEDGE) ist das Minimum aus der Zeit seit dem letzten ersten Token und dem Alter der nicht leeren Warteschlange, wie der Poll sie sah; ein neues Alarmfenster löscht das veraltete letzte Ergebnis des Recovery-Kanals; ein echter Stillstand alarmiert weiter. NF-Baum (Standard aus, ohne Dual-Bedingung, auf Prefill- und Decode-Gruppe gleich): Der Server meldet „Anfrage hängt“ nicht mehr fälschlich, wenn nach einer Ruhepause eine neue Anfrage kommt: die Wartezeit wird erst ab dem Moment gezählt, in dem der Server die Anfrage wirklich sieht, gemeldet wird frühestens nach 20 s eigenem Warten. Das klassische Verdikt hat im Code zusätzlich einen Boden (der erste Poll, der „Anfragen in der Warteschlange und nichts läuft“ sah); das steht nur im Code, nicht im Kommentar, der Code gilt. Das Prefill-Chunk-Alter von mindestens 20 s wird nicht angehoben. Belegt (NF): die Ursache der Fehlalarme (die Uhren laufen durch den Leerlauf, nur der Wake stellt sie neu; zwei Fehlalarme im Boot 1005_185049). Unbelegt (NF): die Wirkung am Metall (im Testlauf mit Schalter an 0 Alarme in der Last, aber nur eine Pause von mindestens 75 s, n=1, kein Nachweis); ein echter Hänger wird mit Schalter an bis ca. 10 s (ein Poll) später gemeldet als ohne; Verhalten im Dauerbetrieb über 60 min noch nicht gemessen. Im NF-Release-Profil nicht gesetzt (nur das Testprofil nf-int4-h6-abl-k2.env); ob die Release-Form ihn künftig setzt, ist offen. In keinem 27B-Profil gesetzt.",
    "type": "EnvBool"
   },
   "SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS": {
@@ -34665,7 +35637,7 @@
    "id": "SGLANG_DFLASH_ACCEPT_SYNC_FUSED",
    "kind": "env",
    "lesestellen": [
-    "speculative/dflash_worker_v2.py:99"
+    "speculative/dflash_worker_v2.py:100"
    ],
    "level": "experte",
    "name": "SGLANG_DFLASH_ACCEPT_SYNC_FUSED",
@@ -34675,7 +35647,7 @@
     "baum": "27b",
     "file": "speculative/dflash_worker_v2.py",
     "kind": "os.environ",
-    "line": 99
+    "line": 100
    },
    "status": "unerklaert",
    "text": "",
@@ -34697,7 +35669,7 @@
    "id": "SGLANG_DFLASH_DISABLE_SELECTOR",
    "kind": "env",
    "lesestellen": [
-    "speculative/dflash_worker_v2.py:591"
+    "speculative/dflash_worker_v2.py:592"
    ],
    "level": "experte",
    "name": "SGLANG_DFLASH_DISABLE_SELECTOR",
@@ -34707,7 +35679,7 @@
     "baum": "27b",
     "file": "speculative/dflash_worker_v2.py",
     "kind": "os.environ",
-    "line": 591
+    "line": 592
    },
    "status": "unerklaert",
    "text": "",
@@ -34786,7 +35758,7 @@
    "id": "SGLANG_DFLASH_SLOT_TRACE",
    "kind": "env",
    "lesestellen": [
-    "speculative/dflash_worker_v2.py:3906"
+    "speculative/dflash_worker_v2.py:3918"
    ],
    "level": "experte",
    "name": "SGLANG_DFLASH_SLOT_TRACE",
@@ -34796,7 +35768,7 @@
     "baum": "27b",
     "file": "speculative/dflash_worker_v2.py",
     "kind": "os.environ",
-    "line": 3906
+    "line": 3918
    },
    "status": "unerklaert",
    "text": "",
@@ -34818,7 +35790,7 @@
    "id": "SGLANG_DFLASH_SOLO_COMPACT",
    "kind": "env",
    "lesestellen": [
-    "speculative/dflash_worker_v2.py:576"
+    "speculative/dflash_worker_v2.py:577"
    ],
    "level": "experte",
    "name": "SGLANG_DFLASH_SOLO_COMPACT",
@@ -34828,7 +35800,7 @@
     "baum": "27b",
     "file": "speculative/dflash_worker_v2.py",
     "kind": "os.environ",
-    "line": 576
+    "line": 577
    },
    "status": "unerklaert",
    "text": "",
@@ -34994,7 +35966,7 @@
    "kind": "env",
    "lesestellen": [
     "model_executor/pool_configurator.py:332",
-    "speculative/dflash_worker_v2.py:1154"
+    "speculative/dflash_worker_v2.py:1155"
    ],
    "level": "experte",
    "name": "SGLANG_DFLASH_WINDOW_POOL",
@@ -35894,7 +36866,7 @@
    "id": "SGLANG_DP_RANK",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:23598"
+    "managers/scheduler.py:23604"
    ],
    "level": "experte",
    "name": "SGLANG_DP_RANK",
@@ -35904,7 +36876,7 @@
     "baum": "27b",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 23598
+    "line": 23604
    },
    "status": "unerklaert",
    "text": "",
@@ -41244,7 +42216,7 @@
    "id": "SGLANG_GIL_SWITCH_INTERVAL_MS",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:23796"
+    "managers/scheduler.py:23802"
    ],
    "level": "experte",
    "name": "SGLANG_GIL_SWITCH_INTERVAL_MS",
@@ -41254,7 +42226,7 @@
     "baum": "27b",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 23796
+    "line": 23802
    },
    "status": "unerklaert",
    "text": "",
@@ -42436,8 +43408,8 @@
    "id": "SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:20549",
-    "managers/scheduler.py:21470"
+    "managers/scheduler.py:20555",
+    "managers/scheduler.py:21476"
    ],
    "level": "experte",
    "name": "SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP",
@@ -42447,7 +43419,7 @@
     "baum": "27b",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 20549
+    "line": 20555
    },
    "status": "unerklaert",
    "text": "",
@@ -60612,7 +61584,7 @@
    "id": "SGLANG_TP_HEAD_CONGRUENCE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:11296"
+    "managers/scheduler.py:11302"
    ],
    "level": "experte",
    "name": "SGLANG_TP_HEAD_CONGRUENCE",
@@ -60622,7 +61594,7 @@
     "baum": "27b",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 11296
+    "line": 11302
    },
    "status": "unerklaert",
    "text": "",
@@ -61024,8 +61996,8 @@
    "cost": "",
    "default": "None",
    "depends": [],
-   "gain": "",
-   "group": "",
+   "gain": "Beim nächsten Boot zurückgespeist, konvergieren die KV-Pools je Rang auf das profilierte Optimum.",
+   "group": "Aufteilung",
    "help": "Uneven DCP token-axis split vector (\"a,b,c\", one positive integer per DCP rank). Overrides the budget-estimate vector resolve_cp_token_ratios would otherwise derive. Emitted by the KV-pool self-calibration as a restart hint (measured optimal from the actual per-rank profiled token capacity); feeding it back on the next boot converges the per-rank KV pools to the profiled optimum. Model-type-agnostic (keys off measured capacity, which is dtype-independent).",
    "id": "SGLANG_UNEVEN_TOKEN_VECTOR",
    "kind": "env",
@@ -61033,14 +62005,15 @@
    "name": "SGLANG_UNEVEN_TOKEN_VECTOR",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "environ.py SGLANG_UNEVEN_TOKEN_VECTOR (Kommentar)",
    "source": {
     "baum": "27b",
     "file": "environ.py",
     "kind": "environ",
     "line": 2902
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Aufteilungsvektor der Token-Achse bei ungleichem DCP (\"a,b,c\", je DCP-Rang eine positive ganze Zahl). Er überstimmt den aus dem Budget geschätzten Vektor, den resolve_cp_token_ratios sonst ableiten würde. Die KV-Pool-Selbstkalibrierung gibt ihn als Neustart-Hinweis aus (gemessenes Optimum aus der tatsächlich profilierten Token-Kapazität je Rang). Modelltyp-unabhängig: er richtet sich nach der gemessenen Kapazität, die dtype-unabhängig ist.",
    "type": "EnvStr"
   },
   "SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE": {
@@ -64002,7 +64975,7 @@
    "id": "SGLANG_WEG2_DC_SNAPSHOT",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:23763",
+    "managers/scheduler.py:23769",
     "managers/scheduler_components/weight_updater.py:1933"
    ],
    "level": "experte",
@@ -64013,7 +64986,7 @@
     "baum": "27b",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 23763
+    "line": 23769
    },
    "status": "unerklaert",
    "text": "",
@@ -72843,7 +73816,7 @@
    "id": "SGLANG_WEG2_L15_ALIGN_PROBE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:21087"
+    "managers/scheduler.py:21093"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_L15_ALIGN_PROBE",
@@ -72853,7 +73826,7 @@
     "baum": "27b",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 21087
+    "line": 21093
    },
    "status": "unerklaert",
    "text": "",
@@ -72905,7 +73878,7 @@
    "id": "SGLANG_WEG2_L15_DEPOSIT",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:8295",
+    "managers/scheduler.py:8301",
     "managers/scheduler_components/weight_updater.py:12348",
     "weg2/front.py:11561",
     "weg2/l15_deposit_hook.py:42",
@@ -72919,7 +73892,7 @@
     "baum": "27b",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 8295
+    "line": 8301
    },
    "status": "unerklaert",
    "text": "",
@@ -73002,8 +73975,8 @@
    "id": "SGLANG_WEG2_L15_HOT_SHARE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:8280",
-    "managers/scheduler.py:21280",
+    "managers/scheduler.py:8286",
+    "managers/scheduler.py:21286",
     "managers/scheduler_components/weight_updater.py:12467",
     "weg2/front.py:11522",
     "weg2/front.py:7062",
@@ -73018,7 +73991,7 @@
     "baum": "27b",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 8280
+    "line": 8286
    },
    "status": "unerklaert",
    "text": "",
@@ -76222,7 +77195,7 @@
    "id": "SGLANG_WEG2_PREFETCH_STALL_PASSES",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:9012"
+    "managers/scheduler.py:9018"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_PREFETCH_STALL_PASSES",
@@ -76232,7 +77205,7 @@
     "baum": "27b",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 9012
+    "line": 9018
    },
    "status": "unerklaert",
    "text": "",
@@ -79347,7 +80320,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 914
+      "line": 916
      }
     }
    },
@@ -80040,7 +81013,7 @@
    "id": "SGLANG_WEG2_TOLD_FALLBACK_CAP_S",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:136"
+    "managers/weg2_told_fallback.py:141"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_FALLBACK_CAP_S",
@@ -80050,7 +81023,7 @@
     "baum": "27b",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 136
+    "line": 141
    },
    "status": "unerklaert",
    "text": "",
@@ -80072,7 +81045,7 @@
    "id": "SGLANG_WEG2_TOLD_FALLBACK_GRACE_S",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:135"
+    "managers/weg2_told_fallback.py:140"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_FALLBACK_GRACE_S",
@@ -80082,7 +81055,7 @@
     "baum": "27b",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 135
+    "line": 140
    },
    "status": "unerklaert",
    "text": "",
@@ -80104,7 +81077,7 @@
    "id": "SGLANG_WEG2_TOLD_FALLBACK_TOTAL_S",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:141"
+    "managers/weg2_told_fallback.py:146"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_FALLBACK_TOTAL_S",
@@ -80114,7 +81087,7 @@
     "baum": "27b",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 141
+    "line": 146
    },
    "status": "unerklaert",
    "text": "",
@@ -82775,17 +83748,17 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
-    "eindeutig": 35,
+    "eindeutig": 82,
     "nah": 26
    }
   },
   "datei": "kantenkatalog_1004.json",
   "geladen": true,
   "grund": "",
-  "kanten_belegt": 61,
-  "kanten_gesamt": 61,
+  "kanten_belegt": 108,
+  "kanten_gesamt": 108,
   "kanten_ohne_beleg": 24,
-  "neu": 10,
+  "neu": 57,
   "rel_abweichend": [
    "K12",
    "K19",
@@ -82796,7 +83769,7 @@
   "uebersprungen_ohne_von": [],
   "verschmolzen": 51,
   "verworfen": 0,
-  "wertbedingt": 8,
+  "wertbedingt": 21,
   "ziel_unbekannt": 0
  },
  "launcher_raise_sites": 97,
@@ -82814,25 +83787,25 @@
    "abweichung": 36,
    "beide": 2448,
    "nur_27b": 174,
-   "nur_nf": 28
+   "nur_nf": 29
   },
-  "entries": 2665,
+  "entries": 2666,
   "envs": 1792,
-  "erklaert": 303,
-  "flags": 858,
-  "geerntet": 1694,
-  "kuratiert": 67,
+  "erklaert": 304,
+  "flags": 859,
+  "geerntet": 1666,
+  "kuratiert": 95,
   "unerklaert": 601
  },
- "tree_rev": "27b=58b67e218a+nf=54f8fb3413",
+ "tree_rev": "27b=173161c595+nf=369f31e2e2",
  "trees": {
   "27b": {
    "entries": 2622,
-   "rev": "58b67e218a"
+   "rev": "173161c595"
   },
   "nf": {
-   "entries": 2476,
-   "rev": "54f8fb3413"
+   "entries": 2477,
+   "rev": "369f31e2e2"
   }
  },
  "warnungen": []

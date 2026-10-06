@@ -4,7 +4,7 @@ Gepinnt (rot -> gruen gegen ``ae25180e67``, wo es weder ``resolve_edge_belege`` 
   * ``resolve_anchor``: genau ein Treffer = eindeutig; mehrere = naechster zur erwarteten Zeile (``nah``); Gleichstand oder
     zu weit weg = ``mehrdeutig``; kein Treffer = ``veraltet`` (nie ein stilles Raten).
   * Verschiebung: der echte Quelltext (launcher.py, environ.py, profile_couplings.py) wird in einem Temp-Verzeichnis um N Zeilen
-    verschoben (Prepend am Dateianfang UND Einschub mitten in launcher.py); JEDE der 61 Kanten loest weiter auf, auf genau
+    verschoben (Prepend am Dateianfang UND Einschub mitten in launcher.py); JEDE der 108 Kanten loest weiter auf, auf genau
     die verschobene Zeile -- auch die mit Mehrfachtreffer-Ankern (``exchange`` 229x, ``DFLASH`` 73x, ``entries`` 30x).
   * Mutant: ein entfernter Anker wird ``veraltet`` und macht die Pruefung rot; ein verdoppelter eindeutiger Anker mit
     Gleichstand wird ``mehrdeutig``.
@@ -93,9 +93,9 @@ class ResolveAnchor(unittest.TestCase):
 
 
 class ResolveEdges(unittest.TestCase):
-    def test_real_tree_resolves_all_61(self):
+    def test_real_tree_resolves_all_108(self):
         res = PC.resolve_edge_belege(KANTEN, REPO_ROOT)
-        self.assertEqual(len(res), 61)
+        self.assertEqual(len(res), 108)
         self.assertEqual(problems(res), {})
         for i, r in res.items():
             self.assertIn(r["status"], PC.ANKER_OK + ("extern_fehlt",), i)
@@ -184,15 +184,15 @@ class CatalogShowsResolvedLine(unittest.TestCase):
 
     def test_resolved_line_displayed_stored_line_kept_as_hint(self):
         with tempfile.TemporaryDirectory() as d:
-            # a shifted COPY of the tree the catalog is built from (launcher/environ/couplings, same relative layout)
-            for rel in ("python/sglang/srt/weg2/launcher.py", "python/sglang/srt/environ.py",
-                        "python/sglang/srt/planner/profile_couplings.py", "python/sglang/srt/weg2/refusals.py"):
+            # a shifted COPY of the tree the catalog is built from (every file an edge points at, same relative layout; AP-G 06.10.:
+            # the edges now also point at server_args.py, rank_role.py and host_ledger.py, not only launcher/environ/couplings)
+            copy_tree(d)
+            for rel in ("python/sglang/srt/weg2/launcher.py", "python/sglang/srt/environ.py", "python/sglang/srt/weg2/refusals.py"):
                 t = os.path.join(d, rel)
                 os.makedirs(os.path.dirname(t), exist_ok=True)
                 shutil.copyfile(os.path.join(REPO_ROOT, rel), t)
             n = 31
-            for rel in ("python/sglang/srt/weg2/launcher.py", "python/sglang/srt/environ.py",
-                        "python/sglang/srt/planner/profile_couplings.py"):
+            for rel in REPO_FILES:
                 edit(d, rel, lambda t: "# pad\n" * n + t)
             cat = PC.build_catalog(os.path.join(d, "python/sglang/srt/weg2/launcher.py"), os.path.join(d, "python/sglang/srt/environ.py"),
                                    CU.CURATED, "t", os.path.join(SRT, "server_args.py"))
@@ -210,7 +210,7 @@ class CatalogShowsResolvedLine(unittest.TestCase):
                     self.assertEqual(b["zeile_hinweis"], stored)
                     self.assertEqual(b["zeile"] - stored, n, dep["kante"])      # shown line = resolved line
                     self.assertIn(b["aufloesung"], PC.ANKER_OK)
-            self.assertEqual(seen, 61 - sum(1 for k in KANTEN if os.path.isabs(k["beleg"]["datei"])))
+            self.assertEqual(seen, 108 - sum(1 for k in KANTEN if os.path.isabs(k["beleg"]["datei"])))
 
     def test_unresolvable_layout_leaves_the_catalog_as_before(self):
         # ``edges_root`` given but empty tree and a launcher outside the repo layout: no extra fields, no crash

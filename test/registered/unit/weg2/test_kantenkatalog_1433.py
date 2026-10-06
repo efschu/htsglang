@@ -150,6 +150,81 @@ class Abdeckung(Basis, unittest.TestCase):
         self.assertGreaterEqual(coverage, 0.5)
 
 
+# AP-G (Planer-Workflow 06.10.): die Werte, die der Katalog neu kuratiert erklaert (Text aus argparse help= / environ.py-Kommentar),
+# und die Kanten K62ff dazu. Der Pin zaehlt die Kanten: wer eine Kante hinzufuegt oder streicht, hebt ihn bewusst.
+APG_NAMES = (
+    "--rank-role", "--rank-kv-ratio", "--dcp-size", "--uneven-dcp", "--uneven-dcp-weighted", "SGLANG_UNEVEN_TOKEN_VECTOR",
+    "--rank-vocab-ratio", "--speculative-draft-placement", "--draft-kv-on-p", "--d-only", "--profile-inventory",
+    "--dual-layout", "--dual-share", "--dual-p-overhead-mib", "--dual-d-prefill-tokens", "--dual-p-duty", "--dual-p-sm-pct",
+    "--dual-priority", "--dual-d-min-rate-tps", "--dual-p-min-share", "--dual-share-actuators", "--dual-green-ladder",
+    "--dual-d-capture-prio", "--dual-p-mps-low-prio", "--dual-p-sleep", "--dual-unified-kv", "--dual-p-kv-max-tokens",
+    "--dual-d-kv-max-tokens", "--dual-mps",
+)
+APG_PAIRS = (
+    # C8 D-Seite: --rank-tp-ratio <-> --rank-kv-ratio / --dcp-size / --rank-role, Form A x DCP
+    ("--rank-kv-ratio", "--rank-tp-ratio"), ("--rank-kv-ratio", "--dcp-size"),
+    ("--dcp-size", "--rank-tp-ratio"), ("--rank-tp-ratio", "--dcp-size"), ("--rank-role", "--rank-tp-ratio"),
+    ("--rank-tp-ratio", "--rank-role"), ("--dcp-size", "--rank-role"), ("--rank-role", "--dcp-size"),
+    ("--uneven-dcp", "--rank-kv-ratio"), ("--uneven-dcp-weighted", "--rank-kv-ratio"),
+    # Draft: Platzierung <-> Draft-KV auf P <-> Host-Budget
+    ("--draft-kv-on-p", "--speculative-draft-placement"), ("--speculative-draft-placement", "--draft-kv-on-p"),
+    ("--draft-kv-on-p", "--host-ledger-deviation"), ("--rank-role", "--speculative-draft-placement"),
+    # Dual: --dual-share impliziert --dual-layout, erzwingt resident und idle tp, verweigert --weg2-d-adopt on
+    ("--dual-share", "--dual-layout"), ("--flip-weights", "--dual-layout"), ("--idle-layout", "--dual-layout"),
+    ("--dual-layout", "--weg2-d-adopt"),
+)
+# rel of the mandatory pairs where it is a danger direction (review fix 1/2, 06.10.): a forced value is a derivation, NOT an exclusion;
+# only a real raise is schliesst_aus; --rank-kv-ratio never touches the weight split, so there is NO skaliert_mit edge tp-ratio -> kv-ratio.
+APG_REL = {
+    ("--dual-share", "--dual-layout"): "braucht", ("--flip-weights", "--dual-layout"): "abgeleitet_von",
+    ("--idle-layout", "--dual-layout"): "abgeleitet_von", ("--dual-layout", "--weg2-d-adopt"): "schliesst_aus",
+    ("--rank-kv-ratio", "--rank-tp-ratio"): "braucht",
+    # review fix round 3: the code sets these values itself / the env wins, no raise -> abgeleitet_von (von = the forced/overruled flag, as K44)
+    ("--tp-prefill-max-tokens", "--dual-d-prefill-tokens"): "abgeleitet_von", ("--x-ceiling-tokens", "--dual-d-prefill-tokens"): "abgeleitet_von",
+    ("--d-short-drain-tokens", "--dual-d-prefill-tokens"): "abgeleitet_von", ("--rank-kv-ratio", "SGLANG_UNEVEN_TOKEN_VECTOR"): "abgeleitet_von",
+}
+
+
+class AuftragG(Basis, unittest.TestCase):
+    def test_edge_count_is_pinned(self):
+        self.assertEqual(len(self.kanten), 108)                         # 61 + 47 (K62-K108, AP-G; fix round 1 dropped 2 wrongly typed edges)
+        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in range(1, 109)])
+
+    def test_apg_values_are_curated_and_explained_from_the_source(self):
+        for n in APG_NAMES:
+            self.assertIn(n, CU.CURATED, n)
+            c = CU.CURATED[n]
+            self.assertGreater(len(c["text"]), 40, n)
+            self.assertTrue(c.get("satz_quelle"), n)                    # where the sentence comes from (help= / environ comment)
+            # edges of the new values live ONLY in the edge catalog (with evidence): no unproven curated edge is added
+            if n != "--draft-kv-on-p":
+                self.assertEqual(c["depends"], [], n)
+
+    def test_apg_edges_exist_and_each_one_is_new(self):
+        have = {(k["von"], k["nach"]) for k in self.kanten}
+        for pair in APG_PAIRS:
+            self.assertIn(pair, have, pair)
+        pairs = [(k["von"], k["nach"]) for k in self.kanten]
+        self.assertEqual(len(pairs), len(set(pairs)))                   # the loader keys edges by (von, nach): a duplicate would be lost silently
+
+    def test_apg_pair_rels_are_pinned(self):
+        by = {(k["von"], k["nach"]): k for k in self.kanten}
+        for pair, rel in APG_REL.items():
+            self.assertEqual(by[pair]["rel"], rel, pair)
+        # a forced-and-logged value is never an exclusion: the 'resident' edge names the forced value
+        self.assertEqual(by[("--flip-weights", "--dual-layout")]["wert"], "resident")
+        # the weight split is never affected by --rank-kv-ratio (server_args.py help): no coupling edge in either direction but 'braucht'
+        self.assertNotIn(("--rank-tp-ratio", "--rank-kv-ratio"), by)
+        # dual-layout may never be 'schliesst_aus' against a flag it merely forces
+        self.assertNotIn(("--dual-layout", "--flip-weights"), by)
+        self.assertNotIn(("--dual-layout", "--idle-layout"), by)
+
+    def test_every_apg_edge_has_a_repo_anchor_in_a_source_file(self):
+        for k in self.kanten[61:]:
+            self.assertFalse(os.path.isabs(k["beleg"]["datei"]), k["id"])
+            self.assertTrue(k["beleg"]["datei"].startswith("python/sglang/srt/"), k["id"])
+
+
 class Offen(Basis, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
