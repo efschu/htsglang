@@ -24,7 +24,8 @@ from __future__ import annotations
 
 from typing import Callable, Optional, Sequence, Tuple
 
-__all__ = ["hold_sleep_refs", "release_wake_refs"]
+__all__ = ["hold_sleep_refs", "release_wake_refs", "name_hold_on_tree",
+           "clear_hold_on_tree"]
 
 
 def _distinct(slots: Sequence[int]) -> Tuple[int, ...]:
@@ -100,6 +101,64 @@ def release_wake_refs(kv_pool, mamba_pool, held: Tuple[Sequence[int], ...],
     gave += len(_ref_pool(mamba_pool, _distinct(an), -1, log,
                           "anchor-wake-release"))
     return gave
+
+
+def name_hold_on_tree(tree, pools: Tuple[object, object], held,
+                      log: Callable[[str], None]) -> int:
+    """L15-HOSTLOCK-NAMED: tell the tree its reset's orphan pass has a holder.
+
+    The pins of ``hold_sleep_refs`` are taken BEFORE ``reset_keep``; that
+    reset's #1424g orphan pass (UnifiedRadixCache._weg2_release_orphan_refs)
+    gives back every reference of this process that no holder names -- and
+    the pin, recorded only on the scheduler, had no name: N6 ..._1006_050049
+    gave all 129792 pins back in the same sleep (``RESET-ORPHANS released=
+    129792``), the wake's release then took 0/44/59, and the first full arena
+    let P recycle the held L2 slots (L15-CHECK REFUSED epoch 66). The tree
+    now names the recorded slots next to its carrier rows. A tree without the
+    API (a stub) names nothing: today's behaviour. Returns the slots named."""
+    fn = getattr(tree, "weg2_set_l15_hold", None)
+    if fn is None or not held:
+        return 0
+    import numpy as np
+
+    kv_pool, mamba_pool = pools
+    kv, an = (tuple(held) + ((), ()))[:2]
+    entries = []
+    for pool, slots in ((kv_pool, kv), (mamba_pool, an)):
+        if pool is not None and slots:
+            entries.append((pool, np.asarray(_distinct(slots), dtype=np.int64)))
+    try:
+        n = int(fn(entries))
+    except Exception as exc:  # noqa: BLE001 - naming is best effort, never fatal
+        log(f"L15-HOSTLOCK-NAMED failed ({type(exc).__name__}: {exc}): the "
+            "reset's orphan pass will give the pins back")
+        return 0
+    share = ""
+    try:
+        for pool, slots in entries:
+            led = getattr(getattr(pool, "arena", None), "_ledger", None)
+            if led is not None and int(led.held.numel()):
+                share += " %s=%.1f%%" % (
+                    "kv" if pool is kv_pool else "anchor",
+                    100.0 * len(slots) / int(led.held.numel()))
+    except Exception:  # noqa: BLE001 - instrument only
+        share = ""
+    log(f"L15-HOSTLOCK-NAMED slots={n} (kept by the reset's orphan pass until "
+        f"the wake act releases them; share of the arena:{share or ' ?'})")
+    return n
+
+
+def clear_hold_on_tree(tree) -> int:
+    """L15-HOSTLOCK-NAMED partner of ``name_hold_on_tree``: drop the name (the
+    wake act / an undone sleep is about to give the references back). No API
+    -> 0. Never raises."""
+    fn = getattr(tree, "weg2_clear_l15_hold", None)
+    if fn is None:
+        return 0
+    try:
+        return int(fn())
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def rearm_sink(get: Callable[[], object], put: Callable[[object], None],
