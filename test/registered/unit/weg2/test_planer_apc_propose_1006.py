@@ -672,6 +672,42 @@ class TestSeats(unittest.TestCase):
         self.assertEqual(v["argv"].count("--d-bs"), 1)
         self.assertEqual(P.LaunchArgv(v["argv"], v["env"]).get_flag("--d-bs"), "9")
 
+    def test_the_regulator_reaches_d_on_the_27b_profile_whose_p_bs_is_not_the_d_default(self):
+        """27B names --p-bs 1 and no --d-bs: D runs the LAUNCHER default (weg2.DEFAULT_D_BS = 6), so the reference of the regulator
+        is that default, not --p-bs.  Goal 1 and 4 must be SAID to D (--d-bs), goal 6 changes nothing, the reason names the default."""
+        from sglang.srt.weg2 import DEFAULT_D_BS
+        self.assertIsNone(P.LaunchArgv(_profile("27b").argv, _profile("27b").env).get_flag("--d-bs"))
+        self.assertEqual(P.LaunchArgv(_profile("27b").argv, _profile("27b").env).get_flag("--p-bs"), "1")
+        for seats in (1, 4):
+            v = _propose("27b", "ref3", seats=seats)
+            la = P.LaunchArgv(v["argv"], v["env"])
+            self.assertEqual(la.get_flag("--d-bs"), str(seats), seats)
+            self.assertEqual(la.get_flag("--p-bs"), "1")                  # P keeps its own seat count
+            self.assertEqual(v["ziele"]["seats"], seats)
+            w = {x["key"]: x for x in v["werte"]}
+            self.assertIn("%d Sitzen (Launcher-Default" % DEFAULT_D_BS, w["--d-bs"]["grund"])
+            self.assertNotIn("(1 Sitze)", w["--d-bs"]["grund"])
+            self.assertTrue(v["vektoren_ok"])
+        v6 = _propose("27b", "ref3", seats=DEFAULT_D_BS)
+        self.assertEqual(v6["argv"], list(_profile("27b").argv))          # goal == what D runs: nothing moves
+        v0 = _propose("27b", "ref3")
+        self.assertEqual(v0["ziele"]["seats"], DEFAULT_D_BS)
+
+    def test_scratch_slots_scaled_from_one_measurement_are_unbelegt_with_the_same_inventory(self):
+        """A seat goal moves SGLANG_MOE_SCRATCH_SLOTS by extrapolation from ONE measured point: unbelegt (also on the profile's own
+        inventory), listed in the unbelegt list; the unchanged value stays the profile's."""
+        v = _propose("nf", "ref3", seats=12)
+        w = {x["key"]: x for x in v["werte"]}
+        for key in ("--env-d SGLANG_MOE_SCRATCH_SLOTS", "--env-p SGLANG_MOE_SCRATCH_SLOTS"):
+            self.assertIn(key, w)
+            self.assertEqual(w[key]["zustand"], R.UNBELEGT, key)
+            self.assertTrue(any(u.startswith(key + ":") for u in v["unbelegt"]), (key, v["unbelegt"]))
+            self.assertIn("Hochrechnung", w[key]["herkunft"])
+        b = _propose("nf", "ref3")
+        wb = {x["key"]: x for x in b["werte"]}
+        for key in ("--env-d SGLANG_MOE_SCRATCH_SLOTS", "--env-p SGLANG_MOE_SCRATCH_SLOTS"):
+            self.assertEqual(wb[key]["zustand"], R.VORGESCHLAGEN, key)
+
     def test_without_a_seats_goal_nothing_seat_bound_moves(self):
         v = _propose("nf", "ref3")
         self.assertEqual(v["ziele"]["seats"], 6)

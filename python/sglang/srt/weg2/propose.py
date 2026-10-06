@@ -427,9 +427,22 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         if src and str(src).isdigit():
             seats_ref = int(src)
             break
-    seats = int(z.get("seats") or seats_ref or 1)
+    # The regulator "Sitze gleichzeitig" is the DECODE bs goal, so its reference is what group D runs today: an explicit --d-bs of the
+    # profile, else the D group's --max-running-requests, else the LAUNCHER's own default (``weg2.DEFAULT_D_BS``, argparse default of
+    # --d-bs, also ``DEFAULT_D_BS_NEXTFLASH`` for the nextflash profile) -- never the P side's --p-bs (27B: --p-bs 1, D runs 6).
+    from sglang.srt.weg2 import DEFAULT_D_BS
+    d_seats_base, d_seats_src = DEFAULT_D_BS, "Launcher-Default DEFAULT_D_BS"
+    for src, what in ((la.get_flag("--d-bs"), "--d-bs des Profils"), (la.extra_get("d", "--max-running-requests"), "--max-running-requests D des Profils")):
+        if src and str(src).isdigit():
+            d_seats_base, d_seats_src = int(src), what
+            break
+    seats = int(z.get("seats") or d_seats_base)
+    # group P's seat-bound values (--p-bs, P --max-running-requests, --max-mamba-cache-size, P scratch) follow the goal only when the
+    # profile couples them to D (same seat count, NF: 6 and 6); a profile that runs P at another count (27B: --p-bs 1) keeps its P side.
+    p_coupled = seats_ref is None or seats_ref == d_seats_base
+    seats_p = seats if p_coupled else seats_ref       # the seat count P's stages are priced for
     prof_name = la.get_flag("--profile") or ("nextflash" if is_moe else "qwen27b")
-    asm = hw_fit.Assumptions(kv_tokens=kv_tokens, kv_dtype=kv_dtype, p_mamba_slots=R.mamba_slots_p(seats),
+    asm = hw_fit.Assumptions(kv_tokens=kv_tokens, kv_dtype=kv_dtype, p_mamba_slots=R.mamba_slots_p(seats_p),
                              d_mamba_slots=R.mamba_slots_d(seats))
     fit_cards = [hw_fit.FitCard(total_mib=c["total_mib"], arch=c["arch"], cls=c["class"] if c["calibrated"] else "",
                                 label="%s/%d" % (c["class"], c["total_mib"])) for c in cards]
@@ -526,7 +539,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
     # resident experts (the rest rule of K4: KV obligation fixed, the rest buys experts).  The derivation is the DIFFERENCE of the
     # hw_fit arithmetic at the goal against the one at the base seats, added to the profile's value: the profile's measured /
     # operator-set level stays, only the seat-bound part moves (a rule value alone would replace a measurement by a model).
-    seats_base = seats_ref or R.D_MAMBA_SEATS_REF
+    seats_base = d_seats_base
     seats_changed = bool(z.get("seats")) and int(z["seats"]) != seats_base
     fit_argv0 = _fit_argv(la.t)
     seat_cache: Dict[int, Dict[str, Any]] = {}
@@ -534,7 +547,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
     def seat_seed(s_: int) -> Dict[str, Any]:
         """The rule terms at ``s_`` seats: P stage budgets (``sb``) and the Form A D layout (``fa``)."""
         if s_ not in seat_cache:
-            asm_s = hw_fit.Assumptions(kv_tokens=kv_tokens, kv_dtype=kv_dtype, p_mamba_slots=R.mamba_slots_p(s_),
+            asm_s = hw_fit.Assumptions(kv_tokens=kv_tokens, kv_dtype=kv_dtype, p_mamba_slots=R.mamba_slots_p(s_ if p_coupled else seats_p),
                                        d_mamba_slots=R.mamba_slots_d(s_))
             sb_s = R.stage_budgets(fp, fit_cards, asm_s, fit_argv0, records_profile=prof_name, verdict=hw_fit.Verdict())
             if foreign and nontorch and len(foreign) == n == len(nontorch):
@@ -593,19 +606,22 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         if pol == "scratch":
             if vec is None and not str(old).replace(".", "").isdigit():
                 return
+            ref_s = seats_base if (group != "p" or p_coupled) else (seats_ref or seats_base)
+            tgt_s = seats if (group != "p" or p_coupled) else ref_s
             if vec is None:
-                new = R.scale_by_seats([old], seats, seats_ref or seats)[0] if seats != (seats_ref or seats) else old
-                nt = new
-            elif same_inv and seats == (seats_ref or seats):
+                nt = R.scale_by_seats([old], tgt_s, ref_s)[0]
+            elif same_inv and tgt_s == ref_s:
                 nt = old
             else:
                 base = vec if len(vec) == n else R.role_rekey(vec, n)
-                nt = R.csv(R.scale_by_seats(base, seats, seats_ref or seats))
+                nt = R.csv(R.scale_by_seats(base, tgt_s, ref_s))
             if nt != old:
                 _set(la, kind, group, name, nt)
-            rec.add(lab, group=group, old=old, new=nt, state=R.VORGESCHLAGEN if nt == old or same_inv else R.UNBELEGT,
+            # a value moved by the seat goal is an extrapolation from ONE measured point (the profile's), whatever the inventory:
+            # "unbelegt"; only an unchanged value is the profile's own (measured / operator-set) one.
+            rec.add(lab, group=group, old=old, new=nt, state=R.VORGESCHLAGEN if nt == old else R.UNBELEGT,
                     herkunft=(carry_h if nt == old else "Profil %s, Rang-Rolle (erster/mittlerer/letzter Eintrag) und linear in den "
-                              "Sitzen (%s -> %d)" % (bname, seats_ref, seats)),
+                              "Sitzen (%d -> %d), Hochrechnung aus einem Messpunkt" % (bname, ref_s, tgt_s)),
                     grund=carry_g if nt == old else "Scratch-Zeilen skalieren mit den gleichzeitigen Sitzen; nur ein Messpunkt "
                     "im Profil: unbelegt", policy=pol)
             return
@@ -631,7 +647,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                     grund="LRU-Zeilen je Stufe sind eine Pool-Groesse, keine Kartenmessung", policy=pol)
             return
         # cut / cut_attn / fr_p / fr_d / moe_ratio / role / tp_ratio
-        if same_inv and seats_changed and pol in ("fr_p", "fr_d") and is_moe:
+        if same_inv and seats_changed and pol in ("fr_p", "fr_d") and is_moe and (pol == "fr_d" or p_coupled):
             sf = seat_fr(pol, vec)
             if sf is not None:
                 _set(la, kind, group, name, sf[0])
@@ -775,9 +791,9 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
             la.t.append("--d-only")
         rec.add("--d-only", group="-", old=None, new="", state=R.VORGESCHLAGEN, herkunft="Form nur-TP",
                 grund="nur Gruppe D, TP ueber alle %d Karten, kein Flip" % n, policy="form")
-    if seats_changed and not seats_ref:
-        rec.hinweise.append("Sitze gleichzeitig %d: das Profil nennt keinen Referenzwert (--p-bs / --max-running-requests); nur --d-bs "
-                            "und die FR-Ableitung (gegen %d Sitze, den Launcher-Default D) folgen dem Ziel" % (seats, seats_base))
+    if seats_changed and seats_ref is not None and not p_coupled:
+        rec.hinweise.append("Sitze gleichzeitig %d: das Profil faehrt P mit %d Sitzen (--p-bs / --max-running-requests) und D mit %d (%s); "
+                            "das Ziel ist das Decode-bs-Ziel, die P-Seite des Profils bleibt" % (seats, seats_ref, d_seats_base, d_seats_src))
     dbs_added = False
     if seats_changed:
         # the regulator reaches D: an absent --d-bs leaves the launcher default (``apply_profile_d_bs_default``: 6 seats for
@@ -786,7 +802,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
             dbs_added = True
             la.set_flag("--d-bs", str(seats))
             rec.add("--d-bs", group="-", old=None, new=str(seats), state=R.VORGESCHLAGEN, herkunft="Ziel Sitze gleichzeitig = %d" % seats,
-                    grund="Decode-bs-Ziel des Anwenders; ohne die Angabe bliebe D beim Launcher-Default (%d Sitze)" % seats_base,
+                    grund="Decode-bs-Ziel des Anwenders; ohne die Angabe bliebe D bei %d Sitzen (%s)" % (seats_base, d_seats_src),
                     policy="seats")
         # the decode CUDA graph ladder follows the seats when it is the contiguous 1..k ladder of the profile
         dtext = la.gtext("extra", "d") or ""
@@ -804,7 +820,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
             else:
                 rec.hinweise.append("--cuda-graph-bs-decode ist keine 1..k-Leiter (%s): bleibt, bs ueber der Leiter laeuft ohne Graph"
                                     % " ".join(map(str, ladder)))
-    if z.get("seats") and seats_ref and int(z["seats"]) != seats_ref:
+    if seats_changed:
         for kind, group, name, setter in (("flag", "-", "--p-bs", lambda v: la.set_flag("--p-bs", v)),
                                           ("flag", "-", "--d-bs", lambda v: la.set_flag("--d-bs", v)),
                                           ("extra", "p", "--max-running-requests", lambda v: la.extra_set("p", "--max-running-requests", v)),
@@ -813,6 +829,9 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
             old = _get(la, kind, group, name)
             if old is None or (name == "--d-bs" and dbs_added):
                 continue
+            if group == "p" or name == "--p-bs":
+                if not p_coupled:
+                    continue            # the profile runs P at another seat count than D: the decode goal does not move P
             new = str(R.mamba_slots_p(seats)) if name == "--max-mamba-cache-size" else str(seats)
             setter(new)
             rec.add(slot_label(kind, group, name), group=group, old=old, new=new, state=R.VORGESCHLAGEN, herkunft="Ziel Sitze gleichzeitig = %d" % seats,
