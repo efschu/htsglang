@@ -150,6 +150,59 @@ class Abdeckung(Basis, unittest.TestCase):
         self.assertGreaterEqual(coverage, 0.5)
 
 
+# AP-G (Planer-Workflow 06.10.): die Werte, die der Katalog neu kuratiert erklaert (Text aus argparse help= / environ.py-Kommentar),
+# und die Kanten K62ff dazu. Der Pin zaehlt die Kanten: wer eine Kante hinzufuegt oder streicht, hebt ihn bewusst.
+APG_NAMES = (
+    "--rank-role", "--rank-kv-ratio", "--dcp-size", "--uneven-dcp", "--uneven-dcp-weighted", "SGLANG_UNEVEN_TOKEN_VECTOR",
+    "--rank-vocab-ratio", "--speculative-draft-placement", "--draft-kv-on-p", "--d-only", "--profile-inventory",
+    "--dual-layout", "--dual-share", "--dual-p-overhead-mib", "--dual-d-prefill-tokens", "--dual-p-duty", "--dual-p-sm-pct",
+    "--dual-priority", "--dual-d-min-rate-tps", "--dual-p-min-share", "--dual-share-actuators", "--dual-green-ladder",
+    "--dual-d-capture-prio", "--dual-p-mps-low-prio", "--dual-p-sleep", "--dual-unified-kv", "--dual-p-kv-max-tokens",
+    "--dual-d-kv-max-tokens", "--dual-mps",
+)
+APG_PAIRS = (
+    # C8 D-Seite: --rank-tp-ratio <-> --rank-kv-ratio / --dcp-size / --rank-role, Form A x DCP
+    ("--rank-kv-ratio", "--rank-tp-ratio"), ("--rank-tp-ratio", "--rank-kv-ratio"), ("--rank-kv-ratio", "--dcp-size"),
+    ("--dcp-size", "--rank-tp-ratio"), ("--rank-tp-ratio", "--dcp-size"), ("--rank-role", "--rank-tp-ratio"),
+    ("--rank-tp-ratio", "--rank-role"), ("--dcp-size", "--rank-role"), ("--rank-role", "--dcp-size"),
+    ("--uneven-dcp", "--rank-kv-ratio"), ("--uneven-dcp-weighted", "--rank-kv-ratio"),
+    # Draft: Platzierung <-> Draft-KV auf P <-> Host-Budget
+    ("--draft-kv-on-p", "--speculative-draft-placement"), ("--speculative-draft-placement", "--draft-kv-on-p"),
+    ("--draft-kv-on-p", "--host-ledger-deviation"), ("--rank-role", "--speculative-draft-placement"),
+    # Dual: --dual-share impliziert --dual-layout, erzwingt resident und idle tp, verweigert --weg2-d-adopt on
+    ("--dual-share", "--dual-layout"), ("--dual-layout", "--flip-weights"), ("--dual-layout", "--idle-layout"),
+    ("--dual-layout", "--weg2-d-adopt"),
+)
+
+
+class AuftragG(Basis, unittest.TestCase):
+    def test_edge_count_is_pinned(self):
+        self.assertEqual(len(self.kanten), 110)                         # 61 + 49 (K62-K110, AP-G)
+        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in range(1, 111)])
+
+    def test_apg_values_are_curated_and_explained_from_the_source(self):
+        for n in APG_NAMES:
+            self.assertIn(n, CU.CURATED, n)
+            c = CU.CURATED[n]
+            self.assertGreater(len(c["text"]), 40, n)
+            self.assertTrue(c.get("satz_quelle"), n)                    # where the sentence comes from (help= / environ comment)
+            # edges of the new values live ONLY in the edge catalog (with evidence): no unproven curated edge is added
+            if n != "--draft-kv-on-p":
+                self.assertEqual(c["depends"], [], n)
+
+    def test_apg_edges_exist_and_each_one_is_new(self):
+        have = {(k["von"], k["nach"]) for k in self.kanten}
+        for pair in APG_PAIRS:
+            self.assertIn(pair, have, pair)
+        pairs = [(k["von"], k["nach"]) for k in self.kanten]
+        self.assertEqual(len(pairs), len(set(pairs)))                   # the loader keys edges by (von, nach): a duplicate would be lost silently
+
+    def test_every_apg_edge_has_a_repo_anchor_in_a_source_file(self):
+        for k in self.kanten[61:]:
+            self.assertFalse(os.path.isabs(k["beleg"]["datei"]), k["id"])
+            self.assertTrue(k["beleg"]["datei"].startswith("python/sglang/srt/"), k["id"])
+
+
 class Offen(Basis, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
