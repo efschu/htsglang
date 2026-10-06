@@ -21957,15 +21957,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "only when nothing else is in flight (WEG2 X-SOLO). Lifted to the start X "
                          "when below it. Group P is not affected.")
     ap.add_argument("--x-mode", choices=weg2_x_curves.X_MODES, default=None,
-                    help="X-CURVES 1006 (user 06.10.): how the front sets X. fixed = "
-                         "--tp-prefill-max-tokens for the whole boot, no live re-solve; curve = X PER "
-                         "REQUEST from --x-curves (the D/P prefill curves and the flip price of this "
-                         "model x form x hardware); curve-capped = the same, never above "
-                         "--x-ceiling-tokens; live = the live re-solve (DEPRECATED, until the profiles "
-                         "are migrated). Unset = live, argv byte-identical.")
+                    help="X-CURVES 1006 (user 06.10.: only fixed and curve): how the front sets X. "
+                         "fixed = --tp-prefill-max-tokens for the whole boot, no live re-solve; curve = "
+                         "X PER REQUEST from --x-curves (the D/P prefill curves and the flip price of "
+                         "this model x form x hardware), D's W50 riegel sized to the curves' envelope "
+                         "(a manual --x-ceiling-tokens beside it is refused, W195). Unset = the front "
+                         "exactly as before the flag, argv byte-identical.")
     ap.add_argument("--x-curves", default=None,
                     help="X-CURVES: the curve file (weg2-x-curves/1, tools/build_x_curves.py). Only "
-                         "with --x-mode curve|curve-capped (W194 otherwise); absent/unreadable W190, "
+                         "with --x-mode curve (W194 otherwise); absent/unreadable W190, "
                          "malformed W191, another model/form/hardware W192 -- refused at launch.")
     ap.add_argument("--x-curves-beyond", choices=weg2_x_curves.BEYOND_POLICIES, default=None,
                     help="X-CURVES: a request deeper than the curves reach: clamp (default, priced at "

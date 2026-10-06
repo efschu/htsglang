@@ -14978,8 +14978,8 @@ class Front:
     def _init_x_mode(self, *, x_mode: Optional[str], x_curves: Optional[str],
                      x_curves_beyond: Optional[str]) -> None:
         """X-CURVES 1006: resolve ``--x-mode`` once (x_curves.front_setup).
-        ``fixed`` keeps the start X for the boot; ``curve``/``curve-capped``
-        set the boot-level X to the curves' envelope (every per-request X stays
+        ``fixed`` keeps the start X for the boot; ``curve`` sets the
+        boot-level X to the curves' envelope (every per-request X stays
         under it, as X_1 bounds X-K-FLIP's X_k) and price each arrival on the
         curves. Neither collects a live X sample nor re-solves. No --x-mode =
         live: nothing set, nothing printed (byte-identical)."""
@@ -16536,13 +16536,14 @@ def main():
                          "without it never routes above D's riegel. Requests between the start X "
                          "and the live X go to D only as singletons (WEG2 X-SOLO).")
     ap.add_argument("--x-mode", choices=_xcurves.X_MODES, default=None,
-                    help="X-CURVES 1006: fixed = --tp-prefill-max-tokens for the whole boot (no live "
-                         "re-solve); curve = X per request from --x-curves; curve-capped = the same, "
-                         "never above --x-ceiling-tokens; live = the live re-solve (DEPRECATED). "
-                         "Unset = live, byte-identical to the front before the flag.")
+                    help="X-CURVES 1006 (user 06.10.: only fixed and curve): fixed = "
+                         "--tp-prefill-max-tokens for the whole boot (no live re-solve); curve = X per "
+                         "request from --x-curves, never above D's W50 riegel (--x-ceiling-tokens, "
+                         "which the launcher sizes to the curves' envelope). Unset = the front exactly "
+                         "as before the flag.")
     ap.add_argument("--x-curves", default=None,
                     help="X-CURVES: the curve file (weg2-x-curves/1) of this model x form x hardware; "
-                         "only with --x-mode curve|curve-capped (W194 otherwise, W190 when absent).")
+                         "only with --x-mode curve (W194 otherwise, W190 when absent).")
     ap.add_argument("--x-curves-beyond", choices=_xcurves.BEYOND_POLICIES, default=None,
                     help="X-CURVES: a request deeper than the curves reach -- clamp (default: priced "
                          "at the deepest row, named in the ROUTE-VERDICT) or refuse (W193, 503).")

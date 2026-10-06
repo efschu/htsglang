@@ -8,9 +8,13 @@ The user's decisions this file pins:
   measured once per model x form x hardware, one file the profile points at;
 * the front sets X PER REQUEST from them, at the request's cached depth, and
   more open requests make the flip pay more;
-* manual stays: ``fixed``, ``curve``, ``curve-capped`` (the curve under
-  ``--x-ceiling-tokens``, D's W50 riegel); the live mode stays as the named,
-  deprecated ``live``, and no flag = today's front and launcher byte for byte;
+* CHANGE 06.10. ~11:00Z: ``--x-mode`` has ONLY ``fixed`` and ``curve`` ("es
+  soll kein live geben und kein curve-capped"); ``live`` / ``curve-capped``
+  are refused by name (W196). No flag = today's front and launcher byte for
+  byte (what the unflagged default should become is the user's call). Under
+  ``curve`` D's W50 riegel = the curves' envelope, a hard bound no request X
+  crosses; a manual ``--x-ceiling-tokens`` beside it is refused (W195) -- an
+  open user decision, not decided here;
 * refusals by name (W190..W196), no silent fallback, no silent extrapolation.
 
 NOTE on the monotony the Auftrag's test list states ("mehr offene Requests ->
@@ -171,7 +175,8 @@ def test_deeper_d_prefill_lowers_x_and_the_lone_request_is_the_envelope():
                for d in range(0, 262145, 8192) for k in (1, 2, 4))
 
 
-def test_curve_capped_clamps_and_says_so():
+def test_ds_riegel_caps_the_curve_x_and_says_so():
+    """The front's cap is D's W50 riegel (x_ceiling): no per-request X above it."""
     v = xc.x_verdict_from_curves(depth=0, open_requests=1, curves=_curves(), cap=3000)
     assert (v.x, v.clamp) == (3000, "cap") and v.x_curve > 3000
     assert xc.x_envelope(_curves(), cap=3000) == 3000
@@ -276,7 +281,9 @@ def test_no_flag_is_the_live_mode_with_nothing_added():
 @pytest.mark.parametrize("kw,code", [
     (dict(mode="fixed", curves_path="x.json"), xc.W_X_CURVES_WITHOUT_MODE),
     (dict(mode=None, beyond="clamp"), xc.W_X_CURVES_WITHOUT_MODE),
-    (dict(mode="curve-capped"), xc.W_X_CURVES_MISSING),
+    (dict(mode="curve"), xc.W_X_CURVES_MISSING),
+    (dict(mode="curve-capped", curves_path="x.json"), xc.W_X_MODE_UNKNOWN),     # removed 06.10.
+    (dict(mode="live"), xc.W_X_MODE_UNKNOWN),                                  # removed 06.10.
     (dict(mode="curve", curves_path="/nonexistent/x.json"), xc.W_X_CURVES_MISSING),
     (dict(mode="curve", curves_path="x.json", ceiling_flag=CEILING), xc.W_X_CEILING_UNCAPPED_MODE),
     (dict(mode="adaptive"), xc.W_X_MODE_UNKNOWN),
@@ -292,10 +299,9 @@ def test_curve_modes_size_ds_riegel_and_hand_the_front_its_flags(tmp_path):
     env = xc.x_envelope(_curves())
     cur = _resolve(mode="curve", curves_path=path)
     assert cur.ceiling_for_d == env and cur.front_argv == ("--x-mode", "curve", "--x-curves", path)
-    cap = _resolve(mode="curve-capped", curves_path=path, ceiling_flag=3000, beyond="refuse")
-    assert cap.ceiling_for_d == 3000
-    assert cap.front_argv[-2:] == ("--x-curves-beyond", "refuse")
-    assert "envelope X=4096" in cap.line          # capped by D's riegel = max(3000, start X 4096)
+    assert f"D's W50 riegel = {max(env, START_X)}" in cur.line
+    ref = _resolve(mode="curve", curves_path=path, beyond="refuse")
+    assert ref.front_argv[-2:] == ("--x-curves-beyond", "refuse")
     with pytest.raises(xc.XCurvesRefused) as e:
         _resolve(mode="curve", curves_path=path, hardware="RTX5090")
     assert e.value.code == xc.W_X_CURVES_FOREIGN
@@ -305,11 +311,16 @@ def test_launcher_refuses_foreign_cards_at_launch_and_passes_its_own(tmp_path):
     from sglang.srt.weg2 import form as weg2_form
     path = _write(tmp_path, _curves())
     boot_form = weg2_form.parse_form(FORM_ENV_VALUE)
-    ns = L.build_parser().parse_args(["--tree", "/t", "--tag", "t", "--x-mode", "curve-capped",
-                                      "--x-curves", path, "--x-ceiling-tokens", str(CEILING)])
+    ns = L.build_parser().parse_args(["--tree", "/t", "--tag", "t", "--x-mode", "curve",
+                                      "--x-curves", path])
     ns.weg2_boot_form, ns.model = boot_form, f"/models/{MODEL}"
     xm = L.resolve_x_mode_launch(ns, CARDS, START_X)
-    assert xm.mode == "curve-capped" and xm.ceiling_for_d == CEILING
+    assert xm.mode == "curve" and xm.ceiling_for_d == xc.x_envelope(_curves())
+    d_x, front_c, line = L.resolve_x_ceiling(xm.ceiling_for_d, START_X)
+    assert d_x == front_c == max(START_X, xm.ceiling_for_d)      # D's riegel admits every curve X
+    for removed in ("live", "curve-capped"):
+        with pytest.raises(SystemExit):
+            L.build_parser().parse_args(["--tree", "/t", "--tag", "t", "--x-mode", removed])
     with pytest.raises(SystemExit, match="W192 Weg2XCurvesForeign"):
         L.resolve_x_mode_launch(ns, CARDS[:2], START_X)
 
@@ -358,29 +369,32 @@ def test_fixed_pins_x_no_sample_no_resolve(monkeypatch):
     assert Front._x_route_note(f) == "; x_mode=fixed (no live re-solve)"
 
 
-def test_curve_capped_front_routes_each_request_on_its_own_x(tmp_path, monkeypatch, caplog):
+def test_curve_front_routes_each_request_on_its_own_x(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("SGLANG_WEG2_FORM", FORM_ENV_VALUE)
     monkeypatch.setattr(Front, "resolve_x_live", lambda self: pytest.fail("curve X re-solved"))
     caplog.set_level(logging.INFO, logger="weg2.front")
     path = _write(tmp_path, _curves())
-    f = _front(x_mode="curve-capped", x_curves=path, x_ceiling_tokens=CEILING)
-    env = xc.x_envelope(_curves(), cap=CEILING)
+    env = xc.x_envelope(_curves())
+    f = _front(x_mode="curve", x_curves=path, x_ceiling_tokens=env)   # as the launcher hands it
     assert f.tp_prefill_max_tokens == env and f.flip_min_work_tokens == env
-    assert any(m.startswith("WEG2 X MODE curve-capped") for m in caplog.messages)
+    assert any(m.startswith("WEG2 X MODE curve:") for m in caplog.messages)
     shallow = Front._x_route_of(f, rid="a", depth=0, k_flip=1)
     deep = Front._x_route_of(f, rid="b", depth=200000, k_flip=1)
     shared = Front._x_route_of(f, rid="c", depth=200000, k_flip=4)
     assert env >= shallow > deep > shared
     assert deep == xc.x_from_curves(depth=200000, open_requests=1, curves=_curves(), cap=env)
     note = Front._x_route_note(f)
-    assert note.startswith(f"; x_mode=curve-capped X_req={shared} ") and "k=4" in note
+    assert note.startswith(f"; x_mode=curve X_req={shared} ") and "k=4" in note
     assert "curves=nf.xcurves.json@synthetic" in note
     assert F.serviceable_route(deep + 1, deep + 1, deep, 373536) == "long"
     _feed(f)
     assert not any(f._x_samples.values())
     st = xc.state_block(mode=f.x_mode, source=f._x_setup.source, envelope=f._x_setup.envelope,
                         last=f._x_curve_last)
-    assert st["x_mode"] == "curve-capped" and st["x_curves_last"]["k"] == 4.0
+    assert st["x_mode"] == "curve" and st["x_curves_last"]["k"] == 4.0
+    with pytest.raises(xc.XCurvesRefused) as e:
+        _front(x_mode="live")
+    assert e.value.code == xc.W_X_MODE_UNKNOWN
 
 
 def test_curve_front_refuses_without_a_published_form_and_beyond_the_reach(tmp_path, monkeypatch):

@@ -4,14 +4,32 @@ Teil F des AUFTRAG-x-kurven-1006. **Nur Vorschlag**: `docker/profiles/*.env`
 gehören dem 27B-Sitz / Nutzer und werden hier nicht geändert. Code: Branch
 `desk/x-curves-1006` (Basis cand4c `369f31e2e2`).
 
-## 1. Die drei manuellen Formen (Nutzerentscheid 4)
+## 1. Die zwei Formen (ÄNDERUNG 06.10. ~11:00Z: „kein live und kein curve-capped, nur fixed|curve“)
 
 | Form | Profilzeilen | Wirkung |
 |---|---|---|
-| (a) fest | `--x-mode fixed` `--tp-prefill-max-tokens N` | X = N für den ganzen Boot; keine Live-Samples, keine Neulösung, keine Hysterese |
-| (b) Kurve | `--x-mode curve --x-curves <Datei>` | X je Anfrage aus der Kurvendatei; D's W50-Riegel = Hüllkurve der Datei (der Launcher setzt ihn); `--x-ceiling-tokens` daneben = W195 |
-| (c) Kurve mit Deckel | `--x-mode curve-capped --x-curves <Datei> --x-ceiling-tokens 12288` | wie (b), X nie über dem Deckel (= D's W50-Riegel, H84) |
-| (alt) live | kein `--x-mode` oder `--x-mode live` | die heutige Live-Neulösung, unverändert (veraltet; bleibt bis die Profile migriert sind) |
+| fest | `--x-mode fixed` `--tp-prefill-max-tokens N` | X = N für den ganzen Boot; keine Live-Samples, keine Neulösung, keine Hysterese |
+| Kurve | `--x-mode curve --x-curves <Datei>` | X je Anfrage aus der Kurvendatei; D's W50-Riegel = Hüllkurve der Datei (der Launcher setzt ihn, harte Grenze); ein manuelles `--x-ceiling-tokens` daneben = W195 (offene Nutzerentscheidung, s. u.) |
+| (ohne Flag) | kein `--x-mode` | die Front genau wie vor dem Flag (heute: Live-Neulösung, `SGLANG_WEG2_ENABLE_X_COST_LINE` Default True). Nicht still geändert — was der Default werden soll, entscheidet der Nutzer |
+
+`--x-mode live` und `--x-mode curve-capped` werden abgewiesen (argparse-Choices; im Code W196).
+
+**Offene Nutzerentscheidung — manueller Deckel in `curve`?** Der W50-Riegel ist
+eine echte D-Grenze: D verweigert jede Anfrage, deren ungecachter Umfang nach
+dem Prefix-Match über seinem eigenen `--tp-prefill-max-tokens` liegt
+(`python/sglang/srt/managers/scheduler.py:14089` `_weg2_x_refuses`, Meldung
+`W50 Weg2TpPrefillExceeded` Z. 14242-14247; Ausnahmen davor: Kapazitäts-Park
+Z. 14225 und RESUME-VIA-P Z. 14239), die Front leitet sie dann durch P um
+(`python/sglang/srt/weg2/front.py:12802` `WEG2 W50-REROUTE ... reason=x_refusal`,
+X-REQUEUE; die zweite Verweigerung nach P ist terminal W35/W53). Den Riegel setzt
+der Launcher (`launcher.py` `resolve_x_ceiling`, D bekommt `--tp-prefill-max-tokens`
+= Deckel bzw. Start-X). In `curve` bleibt er hart: der Launcher setzt ihn auf die
+Hüllkurve (`x_curves.resolve_launch`, `ceiling_for_d = envelope`), die Front
+klemmt jedes Anfrage-X darunter (`front.py` `_x_route_of`, `cap = tp_prefill_max_tokens`
+= Hüllkurve ≤ `x_ceiling_tokens`). Ob man zusätzlich einen manuellen, niedrigeren
+Deckel (z. B. 12288) neben `curve` setzen darf, ist NICHT entschieden: heute
+W195. Freigabe wäre eine Zeile in `_check_mode_words` + `resolve_launch`
+(cap = max(Flag, Start-X), Riegel = Flag).
 
 `--x-curves-beyond clamp|refuse` (optional, Default `clamp`): eine Anfrage
 tiefer als die Kurve reicht wird an der tiefsten Zeile bepreist und in der
@@ -25,9 +43,8 @@ ROUTE-VERDICT benannt (`clamp`), oder mit W193 (503) abgewiesen (`refuse`).
  PROFILE_ARGS=(
  ...
 -  --x-ceiling-tokens 12288                             # RC2 (H84) = Registry nextflash x_ceiling_tokens; bb3 nannte es nicht (Registry-Default derselbe Wert)
-+  --x-mode curve-capped                                # X-CURVES 1006: X je Anfrage aus den Profilkurven (Nutzer 06.10.), nicht live
-+  --x-curves "$PROFILE_X_CURVES"                       # EINE Kurvendatei je Modell x Form x Hardware
-+  --x-ceiling-tokens 12288                             # Deckel = D's W50-Riegel (H84), bleibt manuell
++  --x-mode curve                                       # X-CURVES 1006: X je Anfrage aus den Profilkurven (Nutzer 06.10.), nicht live
++  --x-curves "$PROFILE_X_CURVES"                       # EINE Kurvendatei je Modell x Form x Hardware; D's W50-Riegel = ihre Hüllkurve
  )
 ```
 
@@ -37,7 +54,7 @@ X-SOLO-Bandes (`_x_band_floor`), solange `SGLANG_WEG2_X_BAND_FOLLOWS_PRICE`
 es nicht ohnehin auf das geltende X hebt.
 
 `_form SGLANG_WEG2_ENABLE_X_COST_LINE 1` kann stehen bleiben: unter
-`--x-mode curve*` ruft die Front `resolve_x_live` / `_resolve_x_cost_line`
+`--x-mode curve` ruft die Front `resolve_x_live` / `_resolve_x_cost_line`
 nicht mehr auf. Der Schalter wirkt dann nur noch auf die P-Kostenring-Lesung
 (Instrument) und auf `_x_excursion_band_off` (X-SOLO-Bandboden = geltendes X).
 
@@ -49,16 +66,17 @@ nicht mehr auf. Der Schalter wirkt dann nur noch auf die P-Kostenring-Lesung
 -  # RC7-X (X-Review V, Operator 25.09.): Start-X ausdruecklich 4096 -- ...
 -  --tp-prefill-max-tokens 4096
 -  --x-ceiling-tokens 12288
-+  --x-mode curve-capped                                # X-CURVES 1006 (Nutzer 06.10.): X je Anfrage aus den Profilkurven
++  --x-mode curve                                       # X-CURVES 1006 (Nutzer 06.10.): X je Anfrage aus den Profilkurven
 +  --x-curves "$PROFILE_X_CURVES"
-+  --x-ceiling-tokens 12288                             # Deckel = D's W50-Riegel
 ```
 
 Die feste `--tp-prefill-max-tokens 4096`-Zeile fällt weg (Nutzerentscheid 1).
 Der Launcher-Default ist ebenfalls 4096; ohne die Zeile ändert sich das
 Start-X also nicht, es ist nur kein „Dauerwert X“ im Profil mehr. Wer bis zur
 27B-Kurve weiterbooten will: `--x-mode fixed --tp-prefill-max-tokens 4096`
-(fest, ohne Live-Neulösung) oder vorläufig gar nichts (live wie heute).
+(fest, ohne Live-Neulösung) oder vorläufig gar nichts (ohne Flag wie heute).
+`--x-ceiling-tokens 12288` fällt in beiden Profilen weg, solange die offene
+Nutzerentscheidung (manueller Deckel in `curve`) nicht gefallen ist (sonst W195).
 
 **Dual-Profile** (`27b-nvfp4-dual*.env`): keine X-Zeilen, keine Änderung
 (Nutzerentscheid 1).
@@ -100,11 +118,12 @@ Bau: `tools/build_x_curves.py calib_x_<Boot>.jsonl --out <Datei> --model … --f
 
 Nicht gebaut, nur festgehalten:
 
-* **Profilzeilen**: `--x-mode {fixed,curve,curve-capped,live}`, `--x-curves <Pfad>`,
-  `--x-curves-beyond {clamp,refuse}`, `--x-ceiling-tokens <N>`,
+* **Profilzeilen**: `--x-mode {fixed,curve}`, `--x-curves <Pfad>`,
+  `--x-curves-beyond {clamp,refuse}`,
   `--tp-prefill-max-tokens <N>` (nur bei `fixed` sinnvoll). Abhängigkeiten:
-  `--x-curves`/`--x-curves-beyond` nur bei `curve*` (sonst W194);
-  `curve` + `--x-ceiling-tokens` = W195; `curve*` ohne Datei = W190.
+  `--x-curves`/`--x-curves-beyond` nur bei `curve` (sonst W194);
+  `curve` + `--x-ceiling-tokens` = W195 (offene Nutzerentscheidung); `curve` ohne
+  Datei = W190; `live`/`curve-capped` = abgewiesen (W196).
 * **Kurvendatei lesen**: `x_curves.load(path)` → `XCurves`; Anzeige mit
   `x_curves.text_table(curves, cap=…)` oder direkt aus den Zeilen (Plot P/D ms
   über n je Tiefe, Flip-Preis über Tiefe, X über Tiefe für k = 1, 2, 4).
