@@ -13,6 +13,8 @@ Routes
   POST /api/hwprofil/measure   {cards:[nvml,...]}: gpuq-Fenster buchen und messen; pending = nur Status
   POST /api/hwprofil/cancel    wartendes Fenster zurückgeben
   POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|compute|move|chunk|context, settings?, phases?}
+  POST /api/profil/propose     Startprofil des Planers (AP-D, nur LAN): {basis: {kind, name}, form: flip|tp, inventar: "rig" | [{card, pcie}], ziele?, model_path?, draft_path?}
+                               -> propose() + Orakel (Launcher-Trockenlauf im Kindprozess, Cache) + Verdikte; flliper.server/1 mit Herkunft/Verdikt/Kanten je Wert
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 from . import (energy, features, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
-               modellprofil, profil, profil_recompute, redact, sampler, sources, vmpush, weg2line)
+               modellprofil, profil, profil_oracle, profil_recompute, redact, sampler, sources, vmpush, weg2line)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -247,8 +249,11 @@ class App:
         self.kartenplaner = kartenplan.Kartenplaner()
         # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
         ptree = getattr(args, "profil_tree", None) or None      # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker
+        # AP-D: das Orakel (Launcher-Trockenlauf im Kindprozess + Cache); startet erst bei der ersten Anfrage, nie im Hintergrund
+        self.oracle = profil_oracle.OracleService(profil.find_tree(ptree), python=getattr(args, "couplings_python", None))
         self.profil = profil.ProfilEditor(
             kartenplaner=self.kartenplaner, tree=ptree,
+            oracle=self.oracle, hardware=lambda: self.hwprofil.get(), check_path=lambda p, what: self.modellprofil.check_path(p, what),
             release_dir=getattr(args, "profiles_release_dir", None) or profil.DEFAULT_RELEASE_DIR,
             user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR,
             # Auftrag 1984 (C): die Topologie-Prüfung des Trockenlaufs läuft im Kopplungs-Worker (sglang-Umgebung), nicht in diesem Prozess;
@@ -622,6 +627,8 @@ def make_handler(app: App):
                 return self._json(ed.dry_run(body.get("doc"), body.get("cards") or [], bool(body.get("host_patched", True))))
             if path == "/api/profil/recompute":
                 return self._profil_recompute(body)
+            if path == "/api/profil/propose":
+                return self._json(ed.propose(body))
             return self._send(404, "not found", "text/plain")
 
         def _profil_recompute(self, body):
