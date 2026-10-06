@@ -106,8 +106,9 @@ class ModelEstimator:
             return self._mod
 
     # ------------------------------------------------------------------ Pfade
-    def check_path(self, raw, what: str = "path") -> str:
-        """Absoluter, wirklicher Pfad unter einer Wurzel -- sonst ``ValueError`` mit dem Grund."""
+    def check_path(self, raw, what: str = "path", must_exist: bool = True) -> str:
+        """Absoluter, wirklicher Pfad unter einer Wurzel -- sonst ``ValueError`` mit dem Grund.  ``must_exist=False`` lässt einen
+        fehlenden Pfad zu (:meth:`status` meldet ihn dann als Zustand ``not_mounted``)."""
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError("%s fehlt (Modellverzeichnis oder .gguf-Datei)" % what)
         if len(raw) > MAX_PATH or "\x00" in raw:
@@ -117,7 +118,7 @@ class ModelEstimator:
         real = os.path.realpath(raw)
         if not any(real == r or real.startswith(r + os.sep) for r in self.roots):
             raise ValueError("%s liegt nicht unter einer Modellwurzel (%s)" % (what, ", ".join(self.roots)))
-        if not os.path.exists(real):
+        if must_exist and not os.path.exists(real):
             raise ValueError("%s existiert nicht" % what)
         return real
 
@@ -143,6 +144,23 @@ class ModelEstimator:
                 out.append({"name": n, "path": p, "shards": len(shards), "gguf": [f for f in files if f.endswith(".gguf")],
                             "index": "model.safetensors.index.json" in files})
         return {"ok": True, "roots": list(self.roots), "models": out, "planner_tree": self.tree}
+
+    # ------------------------------------------------------------------ Zustand (AP-B 06.10.2026)
+    def status(self, req: dict) -> dict:
+        """Der Zustand eines Modellpfads als Daten (``model_profile.probe``): ``not_mounted`` | ``empty`` | ``no_model_files`` |
+        ``no_config`` | ``config_only`` | ``index_only`` | ``complete`` | ``gguf_incomplete`` | ``ambiguous`` | ``unreadable`` mit ``estimable``
+        und Grund.  Nur Dateinamen werden gelesen.  Der Pfad muss unter einer Modellwurzel liegen, darf aber FEHLEN -- das ist der
+        Fall "nicht gemountet", den der Planer als ``unbelegt`` liest, nicht als Fehler."""
+        if not isinstance(req, dict):
+            raise ValueError("Anfrage muss ein JSON-Objekt sein: {path, gguf_file?}")
+        path = self.check_path(req.get("path"), "path", must_exist=False)
+        gguf = req.get("gguf_file") or None
+        if gguf is not None and (not isinstance(gguf, str) or os.sep in gguf or gguf.startswith(".") or not gguf.endswith(".gguf")):
+            raise ValueError("gguf_file ist ein Dateiname im Modellverzeichnis")
+        mp = self.module()
+        if not hasattr(mp, "probe"):
+            raise ModellprofilUnavailable("model_profile.py dieses Planer-Baums kennt probe() nicht (zu alte Linie)")
+        return dict(mp.probe(path, gguf_file=gguf), ok=True, planner_module=os.path.join(self.tree, MODULE_REL))
 
     # ------------------------------------------------------------------ Schätzung
     def _fingerprint(self, path: str) -> tuple:
