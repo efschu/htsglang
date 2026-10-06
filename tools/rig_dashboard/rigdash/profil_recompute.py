@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(os.path.dirname(HERE), "kartenplan_build", "couplings_worker.py")
@@ -68,8 +68,12 @@ class CouplingsService:
     """Ein langlebiger Worker, eine Anfrage nach der anderen (Sperre)."""
 
     def __init__(self, tree_python: Optional[str], python: Optional[str] = None, worker: str = WORKER,
-                 timeout_s: float = TIMEOUT_S, start_timeout_s: float = START_TIMEOUT_S):
+                 timeout_s: float = TIMEOUT_S, start_timeout_s: float = START_TIMEOUT_S, prefix: Optional[Sequence[str]] = None):
         self.tree_python = tree_python
+        #: Befehlspraefix des Kindprozesses (z. B. ``systemd-run --scope -q -p MemoryMax=4G``: eigener cgroup-Rahmen ausserhalb der Unit);
+        #: startet der Kindprozess mit Praefix sofort nicht (kein systemd-run / kein D-Bus), laeuft er einmal ohne ihn (``prefix_fallback``)
+        self.prefix: List[str] = list(prefix or [])
+        self.prefix_fallback = False
         self.python = python or DEFAULT_PYTHON
         self.worker = worker
         self.timeout_s = timeout_s
@@ -121,10 +125,24 @@ class CouplingsService:
             return "kein Planer-Baum mit planner/profile_couplings.py (KARTENPLAN_TREE bzw. install_510.sh)"
         if not os.path.isfile(self.python):
             return "Python der sglang-Umgebung fehlt: %s (RIGDASH_COUPLINGS_PYTHON)" % self.python
-        self._proc = subprocess.Popen([self.python, self.worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                      env=self._env(), close_fds=True)
-        self.starts += 1
-        line = self._readline(self.start_timeout_s)
+
+        def spawn(cmd: List[str]) -> Optional[str]:
+            try:
+                self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                              env=self._env(), close_fds=True)
+            except OSError:
+                return ""                 # wie EOF: der Befehl (Praefix) war nicht startbar
+            self.starts += 1
+            return self._readline(self.start_timeout_s)
+
+        line = spawn((([] if self.prefix_fallback else self.prefix)) + [self.python, self.worker])
+        if line == "" and self.prefix and not self.prefix_fallback:
+            # der Praefix selbst scheiterte (nicht startbar / EOF vor dem ersten Wort): einmal ohne ihn, mit Vermerk
+            self._stop()
+            self.prefix_fallback = True
+            line = spawn([self.python, self.worker])
+        if self._proc is None:
+            return "Kopplungs-Worker startet nicht (Befehl nicht startbar)"
         if not line:
             self._stop()
             return "Kopplungs-Worker startet nicht (Zeitüberschreitung oder sofort beendet)"

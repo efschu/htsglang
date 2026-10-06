@@ -31,7 +31,8 @@ Environment=HOME=/root
 Restart=always
 RestartSec=3
 Nice=5
-MemoryMax=1G
+# 2G: Kopplungs-Worker (RSS 612 MiB) + Dienst; der Orakel-Kindprozess (Spitze 1,75 GiB) laeuft in eigenem Scope (--oracle-prefix auto)
+MemoryMax=2G
 NoNewPrivileges=yes
 ProtectSystem=full
 
