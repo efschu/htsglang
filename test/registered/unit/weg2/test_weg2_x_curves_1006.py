@@ -412,5 +412,6 @@ def test_the_route_site_and_the_verdict_line_are_wired():
     assert "_x_arrival = Front._x_route_of(self, rid=rid, depth=store_span," in src
     assert "return Front._x_curve_refusal(self, request.path, rid, _xcr)" in src
     assert '"est_prompt=%d chars=%d (#1290)%s",' in src
-    assert "len(text), Front._x_route_note(self)," in src
+    assert "_x_note = Front._x_route_note(self)\n        route = serviceable_route(" in src
+    assert "len(text), _x_note," in src
     assert "self._x_for_flip(1 + self._x_riders(), rid, \"route\")" not in src

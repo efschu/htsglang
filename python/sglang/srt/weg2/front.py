@@ -9211,6 +9211,9 @@ class Front:
         except _xcurves.XCurvesRefused as _xcr:
             Front._pb_resolve(self, rid, _pb_fut, "none", 0)
             return Front._x_curve_refusal(self, request.path, rid, _xcr)
+        # read NOW, before any await below: another arrival's verdict must never
+        # be printed on this request's ROUTE-VERDICT line
+        _x_note = Front._x_route_note(self)
         route = serviceable_route(remainder, carrier_est,
                                   _x_arrival,
                                   self.carrier_max_tokens,
@@ -9310,7 +9313,7 @@ class Front:
             + (X_EXACT_VERDICT_NOTE if _xx is not None else ""),
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
-            len(text), Front._x_route_note(self),
+            len(text), _x_note,
         )
         Front._pb_resolve(self, rid, _pb_fut, route, remainder)  # PRICE-BARRIER: the verdict, for the SHORTs waiting on it
         if _ef is not None:
