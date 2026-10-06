@@ -50,6 +50,8 @@ from sglang.srt.constants import (
 from sglang.srt.managers.scheduler_components import weight_updater as wu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+GPU_MEMORY_TYPE_WEIGHTS_NAME = "GPU_MEMORY_TYPE_WEIGHTS"
+
 # ---------------------------------------------------------------------------
 # AST helpers -- the campaign (a) matched check.  py_compile is structurally
 # blind to "a device-touching call sits AFTER pause() in the same tag block",
@@ -68,7 +70,32 @@ def _func_ast(func_name: str) -> ast.FunctionDef:
 
 
 def _tag_block(func: ast.FunctionDef, tag_name: str) -> List[ast.stmt]:
-    """The body of ``if <tag_name> in tags:`` inside ``func``."""
+    """The body of the top-level block ``func`` runs for ``tag_name``.
+
+    KV / CUDA-graph: ``if <tag_name> in tags:``. WEIGHTS: since 5418eb6eac
+    ("one-backup flip ... chunk the weights tag", 07.09.) the weights region is
+    not one tag but a FAMILY (``weights`` + ``weights_<k>``), and both RPCs run
+    their weights block as ``if weights_tags:`` with
+    ``weights_tags = [t for t in tags if is_weights_family_tag(t)]`` -- the
+    same block, now entered for any member of the family. The WEIGHTS pin
+    therefore binds to that guard and checks that it IS the family filter
+    (``is_weights_family_tag``), so a block guarded by anything else stays red.
+    """
+    if tag_name == GPU_MEMORY_TYPE_WEIGHTS_NAME:
+        assert any(
+            isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "weights_tags" for t in n.targets)
+            and "is_weights_family_tag" in ast.unparse(n.value)
+            for n in func.body
+        ), f"weights_tags is not the is_weights_family_tag filter of tags in {func.name}"
+        for node in func.body:
+            if (
+                isinstance(node, ast.If)
+                and isinstance(node.test, ast.Name)
+                and node.test.id == "weights_tags"
+            ):
+                return node.body
+        raise AssertionError(f"no `if weights_tags:` block in {func.name}")
     for node in func.body:
         if not isinstance(node, ast.If):
             continue
@@ -91,6 +118,28 @@ def _call_index(body: List[ast.stmt], needle: str) -> int:
                 if needle in ast.unparse(sub):
                     return i
     return -1
+
+
+def _call_lines(body: List[ast.stmt], needle: str) -> List[int]:
+    """Source lines of every call in ``body`` (at ANY nesting depth) naming ``needle``.
+
+    ``_call_index`` answers "which TOP-LEVEL statement", which is the same index
+    for two calls that sit in one big ``with`` -- since the weights legs moved
+    into the PCIe-lock/H111b ``with`` and the per-tag loop, ``reload < import``
+    reads ``49 < 49``. Source order inside a straight-line RPC body is the
+    execution order, so the line is the honest key. A needle with an opening
+    parenthesis is matched against the whole call text, a bare name against
+    the called function only (so ``f(g(x))`` is not a hit for ``g``).
+    """
+    lines: List[int] = []
+    for stmt in body:
+        for sub in ast.walk(stmt):
+            if not isinstance(sub, ast.Call):
+                continue
+            text = ast.unparse(sub) if "(" in needle else ast.unparse(sub.func)
+            if needle in text:
+                lines.append(sub.lineno)
+    return sorted(lines)
 
 
 def _child_bodies(stmt: ast.stmt) -> List[Tuple[str, List[ast.stmt]]]:
@@ -182,6 +231,37 @@ def _assert_nothing_runs_after_the_call(
             )
 
 
+def _calls_running_after(body: List[ast.stmt], needle: str, block_name: str) -> List[str]:
+    """``unparse(func)`` of every call that can still run after ``needle``'s statement.
+
+    The strict form (``_assert_nothing_runs_after_the_call``) says "the pause is
+    the block's last statement".  Since the kv block grew the host-only tail of
+    Q-570 / the dormant marker (W25 K2) / the L3 evictor park (S1 boot killer K2,
+    NF review 2), the intent -- nothing runs after the pause that touches the
+    pages it has just unmapped -- is graded by NAME: every call after the pause,
+    at every nesting level, is collected, and the caller holds that set against
+    an explicit allow-list of host-only names. A new call after the pause is red
+    until somebody decides, per name, that it does not touch the released pool.
+    """
+    path = _stmt_path_to_call(body, needle)
+    assert path is not None, f"{needle} is never called in the {block_name} block"
+    names: List[str] = []
+    for level, (enclosing, index, _field) in enumerate(path):
+        if level + 1 < len(path):
+            stmt = enclosing[index]
+            running_after = _bodies_running_after(stmt, path[level + 1][2])
+            assert not running_after, (
+                f"{needle} is nested inside a {type(stmt).__name__} whose "
+                f"{', '.join(running_after)} still runs after it in the "
+                f"{block_name} block"
+            )
+        for later in enclosing[index + 1 :]:
+            for sub in ast.walk(later):
+                if isinstance(sub, ast.Call):
+                    names.append(ast.unparse(sub.func))
+    return names
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
@@ -247,6 +327,17 @@ class FakeDeviceModule:
         self.calls.append("empty_cache")
 
 
+BACKUP_ARM_ENV = "SGLANG_WEG2_WEIGHTS_CPU_BACKUP"
+
+
+@pytest.fixture(autouse=True)
+def _publish_backup_arm(monkeypatch):
+    """Snapshot/restore the backup arm that ``FakeServerArgs`` publishes."""
+    monkeypatch.setenv(BACKUP_ARM_ENV, "auto")
+    monkeypatch.delenv("SGLANG_WEG2_WEIGHT_SOURCE", raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_XCHG_INJECT", raising=False)
+
+
 class FakeServerArgs:
     def __init__(
         self,
@@ -257,6 +348,16 @@ class FakeServerArgs:
         speculative_draft_model_path: Optional[str] = None,
     ):
         self.enable_weights_cpu_backup = enable_weights_cpu_backup
+        # THE BACKUP VERDICT IS NOT THIS FLAG ANY MORE (#1369, 14.09.): the weg2
+        # launcher passes ``--enable-weights-cpu-backup`` unconditionally, so the
+        # carrier decision reads ``weight_exchange.weights_cpu_backup_armed()``
+        # -- the published ``SGLANG_WEG2_WEIGHTS_CPU_BACKUP`` arm, ``auto`` =
+        # armed unless exchange+authoritative. Under ``auto`` every fake here
+        # would read "TMS carried the bytes" whatever this flag says, so the fake
+        # publishes the arm it stands for ("on" / "off"), exactly as
+        # ``prepare_xchg_env`` does for a real boot. ``_publish_backup_arm``
+        # (autouse) puts the environment back after every test.
+        os.environ[BACKUP_ARM_ENV] = "on" if enable_weights_cpu_backup else "off"
         # model_runner.py:2342-2344 builds the WEIGHTS region with
         # `enable_weights_cpu_backup or (is_draft_worker and
         # enable_draft_weights_cpu_backup)`, so the draft shard's backup verdict
@@ -272,6 +373,10 @@ class FakeScheduler:
     def __init__(self, server_args):
         self.server_args = server_args
         self.disaggregation_mode = None
+        # read directly (no getattr) by the sleep's HiCache drain since
+        # 04f78527df (23.09., fnFL2x105): a scheduler without a hierarchical
+        # cache says so, and the drain returns at once.
+        self.enable_hierarchical_cache = False
 
 
 class FakeModelConfig:
@@ -355,6 +460,25 @@ def _record_disk_reload(monkeypatch, outcome=None) -> List[Any]:
     return calls
 
 
+def _release_the_whole_sleep(manager) -> None:
+    """The two RPCs of ONE complete sleep: the weights chunk, then the kv chunk.
+
+    Since the interleaved-sleep rework (5418eb6eac, 07.09.) the tail that is
+    Weg-2's own -- ``empty_cache()``, the lmem park and the acceptance census --
+    runs only once the sleep POPULATION is complete (``WEG2_SLEEP_TAGS`` ⊆
+    ``offload_tags``); a chunk RPC only logs ``WEG2-SLEEP-CHUNK``. A test that
+    sends the kv tag alone therefore never reaches it. The first RPC also takes
+    the pre-pause census reading (``sleep_begins``), so the order is the
+    product's: weights first, kv last (the order the front sends them in).
+    """
+    manager.release_memory_occupation(
+        wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+    )
+    manager.release_memory_occupation(
+        wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+    )
+
+
 @pytest.fixture()
 def fake_device(monkeypatch):
     dev = FakeDeviceModule()
@@ -390,11 +514,19 @@ def test_kv_block_flushes_before_pause():
     body = _tag_block(
         _func_ast("release_memory_occupation"), "GPU_MEMORY_TYPE_KV_CACHE"
     )
-    flush_at = _call_index(body, "self.flush_cache")
+    # Q-570: the release leg's flush is ``self._weg2_sleep_flush()`` (the flush
+    # run until no rank's tree holds a device value, a group-reduced refusal
+    # before any pause); the pinned flush_cache() lives one call down.
+    flush_at = _call_index(body, "self._weg2_sleep_flush")
     pause_at = _call_index(body, "pause(GPU_MEMORY_TYPE_KV_CACHE)")
     print(
         f"kv_cache block statements: {len(body)} / "
         f"pause at [{pause_at}] / flush at [{flush_at}]"
+    )
+    helper = _func_ast("_weg2_sleep_flush")
+    assert _call_index(helper.body, "self.flush_cache") >= 0, (
+        "the sleep flush no longer calls flush_cache(): the pool would be paused "
+        "unquiesced"
     )
     assert flush_at >= 0, "flush_cache() not called in the kv_cache block"
     assert pause_at >= 0, "pause(kv_cache) not called in the kv_cache block"
@@ -409,28 +541,55 @@ def test_kv_block_flushes_before_pause():
     assert isinstance(flush_stmt, ast.Expr) and isinstance(
         flush_stmt.value, ast.Call
     ), (
-        f"flush_cache() is not an unconditional statement of the kv_cache "
+        f"the sleep flush is not an unconditional statement of the kv_cache "
         f"block; it sits inside a {type(flush_stmt).__name__}, so the pool may "
         "never be quiesced before the pause unmaps its pages"
     )
 
 
+#: Calls the kv block may still make AFTER ``pause(KV_CACHE)``: all of them touch
+#: host state (the dormant marker flag, the L3 evictor park, the parked-request
+#: hold, log lines, the phase stamp) or a DIFFERENT tag (the swing weights of
+#: --p-layer-split, outside the exchanged family, paused with the KV pool).
+#: None reads the unmapped KV / req-index / mamba pages. Extending this set is a
+#: per-name decision, which is what the test is for.
+_HOST_ONLY_AFTER_THE_KV_PAUSE = {
+    "self.memory_saver_adapter.pause",  # the swing-weights tag, see above
+    "_weg2_ph",
+    "self._weg2_pause_l3_evictor",
+    "logger.info",
+    "getattr",
+    "callable",
+    "_hold_parked",
+}
+
+
 def test_kv_block_pause_is_the_last_statement():
-    """Nothing device-touching may follow the pause inside the same block.
+    """Nothing that touches the released pool may follow the pause in the block.
 
     NESTING-AWARE (own mutant RB2-M2 on the sibling tag): a top-level statement
     index is satisfied by anything appended INSIDE a ``with``/``if`` that ends
-    the block, and the weights leg already has exactly such a ``with`` (the
-    PCIe lock).  The kv leg has no lock today, so this assertion carries the
-    same shape in advance -- the gate must stay correct if one is ever added
-    here, not go quietly blind the day it is.
+    the block. Since the W25 dormant marker (S1 boot killer K2) the pause is no
+    longer the literal last statement: host-only statements follow (flag,
+    evictor park, held-parked, logs). The gate is therefore a NAME gate over
+    everything that can still run after the pause, at every nesting level --
+    ``_HOST_ONLY_AFTER_THE_KV_PAUSE`` -- and the strict last-statement form is
+    kept on the weights block.
     """
     body = _tag_block(
         _func_ast("release_memory_occupation"), "GPU_MEMORY_TYPE_KV_CACHE"
     )
-    _assert_nothing_runs_after_the_call(
-        body, "pause(GPU_MEMORY_TYPE_KV_CACHE)", "kv_cache"
+    after = _calls_running_after(body, "pause(GPU_MEMORY_TYPE_KV_CACHE)", "kv_cache")
+    print(f"kv_cache block: calls after the pause: {sorted(set(after))}")
+    unknown = sorted(set(after) - _HOST_ONLY_AFTER_THE_KV_PAUSE)
+    assert not unknown, (
+        f"call(s) {unknown} run after pause(GPU_MEMORY_TYPE_KV_CACHE) and are not "
+        "on the host-only list: if one reads the KV / req-index / mamba pools it "
+        "touches pages the pause has already unmapped (illegal memory access); "
+        "if it is host-only, add it to _HOST_ONLY_AFTER_THE_KV_PAUSE"
     )
+    # the dormant marker is the point of the tail: it must still be there
+    assert "self._weg2_pause_l3_evictor" in after
 
 
 # ---------------------------------------------------------------------------
@@ -530,12 +689,16 @@ def test_first_sleep_does_not_pause_anything_when_it_refuses():
 # ---------------------------------------------------------------------------
 
 
-def test_release_rpc_empties_the_allocator_cache(fake_device):
+def test_release_rpc_empties_the_allocator_cache(fake_device, stock_boot_stubs):
     adapter = FakeAdapter(enabled=True)
-    manager = _make_manager(adapter=adapter)
-    manager.release_memory_occupation(
-        wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+    manager = _make_manager(
+        adapter=adapter,
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False, enable_memory_saver=True
+        ),
+        tp_worker=FakeTpWorker(),
     )
+    _release_the_whole_sleep(manager)
     assert "empty_cache" in fake_device.calls, (
         "release_memory_occupation did not empty the allocator cache; the "
         "TAGGED regions release without it (campaign (a), measured), but the "
@@ -717,34 +880,79 @@ def _with_items_around(body: List[ast.stmt], needle: str) -> List[str]:
     return found
 
 
-def test_sleep_d2h_is_serialised_on_the_card():
+def test_sleep_d2h_whole_leg_card_lock_is_retired_by_name():
+    """The leg's D2H runs under the NAMED no-op, never under the real card lock.
+
+    The original gate ("the weights D2H sits under ``_weg2_pcie_lock``") was
+    overtaken by d491500c71 (#1378 xsn36, 14.09.): the WHOLE-LEG card lock
+    deadlocked the co-located pair by construction (the holder waits inside it
+    for the sibling's semaphore posts, which the sibling cannot produce without
+    the same lock; weg2xsn35 PcieLockTimeout 124 s, weg2xsn36 W68 after 600 s).
+    The call site keeps its shape as ``_weg2_pcie_lock_retired`` -- a
+    nullcontext -- and that is now the property worth a gate: putting the real
+    lock back around the pause is the deadlock. The per-COPY replacement is
+    ``test_flip_leg_copies_are_serialised_per_copy_on_the_card`` (xfail).
+    """
     body = _tag_block(_func_ast("release_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
-    guards = _with_items_around(body, "pause(GPU_MEMORY_TYPE_WEIGHTS)")
-    assert any("_weg2_pcie_lock" in g for g in guards), (
-        "the weights D2H is not under the per-physical-GPU PCIe lock; a "
-        "co-located rank's wake-H2D would halve both legs"
+    guards = _with_items_around(body, "self.memory_saver_adapter.pause(tag)")
+    assert any("_weg2_pcie_lock_retired(" in g and "sleep-D2H" in g for g in guards), guards
+    assert not any("_weg2_pcie_lock(" in g for g in guards), (
+        "the real whole-leg card lock is back around the weights D2H: the "
+        "co-located pair deadlocks (#1378 xsn35/xsn36)"
+    )
+    # and the retired form is what it says it is
+    retired = _func_ast("_weg2_pcie_lock_retired")
+    assert "nullcontext" in ast.unparse(retired), "the retired lock is not a no-op"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "OPEN INTENT, not a regression of this test: since a60ef6efc9 (#1378 "
+        "xsn45 (a), 14.09.) BOTH flip legs run bx.run_sequential_units, and no "
+        "caller passes pcie_uuid any more (run_bounce_leg, the only holder of "
+        "the per-copy pcie_copy_lock, is retired; _weg2_leg_pcie_uuid has no "
+        "caller). The per-physical-GPU serialisation the original test pinned "
+        "('a co-located rank's wake-H2D would halve both legs') is therefore "
+        "carried by nothing on the flip legs. Product decision for the xchg/flip "
+        "seat (wire the copy lock into run_sequential_units, or record that the "
+        "sequential form makes it moot); strict, so the day it is wired this "
+        "XPASSes and the mark must go."
+    ),
+)
+def test_flip_leg_copies_are_serialised_per_copy_on_the_card():
+    from sglang.srt.weg2 import weight_exchange_bounce as bx
+
+    src = inspect.getsource(bx.run_sequential_units)
+    assert "pcie_copy_lock" in src or "pcie_transfer_lock" in src, (
+        "run_sequential_units copies bands with no per-card PCIe lock"
     )
 
 
-def test_wake_h2d_is_serialised_on_the_card():
-    """BOTH wake legs, because only one of them transfers in each arm.
+def test_wake_h2d_whole_leg_card_lock_is_retired_by_name():
+    """BOTH wake legs; the backup-ON one is now the retired no-op, the OFF one the real lock.
 
-    With ``--enable-weights-cpu-backup`` the H2D is inside
-    ``resume(GPU_MEMORY_TYPE_WEIGHTS)``.  With it OFF -- the V1 arm of record
-    (record 1b round-2 Q2, option (ii)) -- that resume is a pure VMM recommit
-    that moves no bytes, and the whole 12-17 s refill is the
-    ``update_weights_from_disk`` leg inside ``_weg2_wake_reload_weights``.
-    A gate that pins only the first arm leaves the configured arm unserialised.
+    With the TMS backup the H2D is inside the tag resume (``weg2_tms_resume``,
+    since weg2xsn269 the rc-raising form of ``resume(tag)``); its leg lock is
+    the named no-op for the reason in
+    ``test_sleep_d2h_whole_leg_card_lock_is_retired_by_name``. With the backup
+    OFF -- the V1 arm of record (record 1b round-2 Q2, option (ii)) -- the
+    resume is a pure VMM recommit that moves no bytes, and the whole 12-17 s
+    refill is the ``update_weights_from_disk`` leg inside
+    ``_weg2_wake_reload_weights``: a SINGLE copy with no rendezvous wait inside
+    it, which keeps the REAL lock (the retirement docstring says so).
     """
     body = _tag_block(_func_ast("resume_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
-    guards = _with_items_around(body, "resume(GPU_MEMORY_TYPE_WEIGHTS)")
-    assert any(
-        "_weg2_pcie_lock" in g for g in guards
-    ), "the backup-ON wake H2D is not under the per-physical-GPU PCIe lock"
+    guards = _with_items_around(body, "weg2_tms_resume(")
+    assert any("_weg2_pcie_lock_retired(" in g and "wake-H2D" in g for g in guards), guards
+    assert not any("_weg2_pcie_lock(" in g for g in guards), (
+        "the real whole-leg card lock is back around the weights wake: the "
+        "co-located pair deadlocks (#1378 xsn35/xsn36)"
+    )
 
     reload_body = _func_ast("_weg2_wake_reload_weights").body
     reload_guards = _with_items_around(reload_body, "update_weights_from_disk")
-    assert any("_weg2_pcie_lock" in g for g in reload_guards), (
+    assert any("_weg2_pcie_lock(" in g for g in reload_guards), (
         "the backup-OFF wake refill (update_weights_from_disk, the only leg "
         "that moves bytes in the V1 arm) runs OUTSIDE the PCIe lock; a "
         "co-located sibling's sleep-D2H halves both"
@@ -870,10 +1078,12 @@ def test_resume_rpc_calls_the_wake_reload_inside_the_weights_block():
 def test_wake_reload_precedes_the_static_state_import():
     """The stash was exported from the live model; it is the last writer."""
     body = _tag_block(_func_ast("resume_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
-    reload_at = _call_index(body, "_weg2_wake_reload_weights")
-    import_at = _call_index(body, "_import_static_state")
-    assert reload_at >= 0 and import_at >= 0
-    assert reload_at < import_at
+    # source lines, not top-level indices: both calls sit inside the same
+    # ``if weights_tags:`` -> ``if family_complete:`` statement (49 < 49)
+    reload_at = _call_lines(body, "_weg2_wake_reload_weights")
+    import_at = _call_lines(body, "_import_static_state")
+    assert reload_at and import_at
+    assert reload_at[0] < import_at[0]
 
 
 # ---------------------------------------------------------------------------
@@ -883,10 +1093,13 @@ def test_wake_reload_precedes_the_static_state_import():
 
 def test_release_exports_static_state_and_barriers_before_pausing_weights():
     body = _tag_block(_func_ast("release_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
-    export_at = _call_index(body, "_export_static_state")
-    barrier_at = _call_index(body, "torch.distributed.barrier")
-    pause_at = _call_index(body, "pause(GPU_MEMORY_TYPE_WEIGHTS)")
-    assert 0 <= export_at < barrier_at < pause_at
+    # the stash is exported (device or, +254 MiB fix (b), host form), the group
+    # barriers, then the per-tag step pauses -- by source line (see _call_lines)
+    export_at = _call_lines(body, "export_static_state")
+    barrier_at = _call_lines(body, "torch.distributed.barrier")
+    pause_at = _call_lines(body, "self.memory_saver_adapter.pause(tag)")
+    assert export_at and barrier_at and pause_at
+    assert export_at[0] < barrier_at[0] < pause_at[0]
 
 
 def test_resume_order_is_graph_then_weights_then_kv():
@@ -901,7 +1114,9 @@ def test_resume_order_is_graph_then_weights_then_kv():
             "GPU_MEMORY_TYPE_WEIGHTS",
             "GPU_MEMORY_TYPE_KV_CACHE",
         ):
-            if tag in text:
+            # the weights block is entered as ``if weights_tags:`` (the family
+            # filter, see _tag_block), the other two as ``if <tag> in tags:``
+            if tag in text or (tag == "GPU_MEMORY_TYPE_WEIGHTS" and text == "weights_tags"):
                 seen.append(tag)
     assert seen == [
         "GPU_MEMORY_TYPE_CUDA_GRAPH",
@@ -912,10 +1127,14 @@ def test_resume_order_is_graph_then_weights_then_kv():
 
 def test_resume_barriers_between_weights_resume_and_static_import():
     body = _tag_block(_func_ast("resume_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
-    resume_at = _call_index(body, "resume(GPU_MEMORY_TYPE_WEIGHTS)")
-    barrier_at = _call_index(body, "torch.distributed.barrier")
-    import_at = _call_index(body, "_import_static_state")
-    assert 0 <= resume_at < barrier_at < import_at
+    # the per-tag resume is ``weg2_tms_resume(adapter, tag)`` (weg2xsn269: the
+    # rc-raising form of ``resume(tag)``); all three sit in one statement, so
+    # the order is graded by source line
+    resume_at = _call_lines(body, "weg2_tms_resume")
+    barrier_at = _call_lines(body, "torch.distributed.barrier")
+    import_at = _call_lines(body, "_import_static_state")
+    assert resume_at and barrier_at and import_at
+    assert resume_at[0] < barrier_at[-1] < import_at[0]
 
 
 def test_offload_tags_are_still_tracked_both_ways():
@@ -1427,10 +1646,9 @@ def test_sleep_rpc_grades_the_census_against_a_pre_pause_reading(
         server_args=FakeServerArgs(
             enable_weights_cpu_backup=False, enable_memory_saver=True
         ),
+        tp_worker=FakeTpWorker(),
     )
-    manager.release_memory_occupation(
-        wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
-    )
+    _release_the_whole_sleep(manager)
 
     assert len(seen) == 2, (
         f"expected a pre-pause reading and a post-pause verdict, saw {len(seen)} "
@@ -1449,8 +1667,12 @@ def test_sleep_rpc_grades_the_census_against_a_pre_pause_reading(
     assert seen[1].get("min_released_fraction") == 0.5
     # Both calls must declare the POPULATION they read, or the printed verdict
     # cannot be attributed to the request that produced it.
-    assert seen[0].get("tags") == [GPU_MEMORY_TYPE_KV_CACHE]
-    assert seen[1].get("tags") == [GPU_MEMORY_TYPE_KV_CACHE]
+    # The first reading is taken by the FIRST rpc of the sleep and names that
+    # rpc's population; the verdict names everything the sleep paused.
+    assert seen[0].get("tags") == [GPU_MEMORY_TYPE_WEIGHTS]
+    assert seen[1].get("tags") == sorted(
+        [GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS]
+    )
 
 
 def test_first_sleep_refuses_a_genuine_sleep_on_a_flagless_boot(fake_device):
@@ -1522,14 +1744,36 @@ def test_weg2_sleep_still_empties_the_cache_and_censuses(fake_device, stock_boot
         ),
         tp_worker=FakeTpWorker(),
     )
-    manager.release_memory_occupation(
-        wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
-    )
+    _release_the_whole_sleep(manager)
     assert "empty_cache" in fake_device.calls
 
 
+def test_a_chunk_rpc_of_an_incomplete_sleep_does_not_empty_the_cache(
+    fake_device, stock_boot_stubs
+):
+    """The other half of the sleep_complete gate (5418eb6eac): the kv chunk alone
+    is NOT the sleep -- the census grades the whole-process residency once, at
+    the end, so the Weg-2 tail must not run (and not read NVML) on a chunk."""
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False, enable_memory_saver=True
+        ),
+        tp_worker=FakeTpWorker(),
+    )
+    manager.release_memory_occupation(
+        wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+    )
+    assert "empty_cache" not in fake_device.calls
+
+
+#: What a read of the model's weight pages looks like in the weights block. After
+#: ``pause(weights tag)`` such a call touches pages the pause has unmapped.
+_DEVICE_READS_OF_THE_WEIGHTS = ("export_static_state", ".clone(", ".zero_(", ".fill_(")
+
+
 def test_weights_block_pause_is_the_last_statement():
-    """The kv block's gate, mirrored onto its sibling tag (own mutant RB-M1).
+    """No read of the weights runs after the weights pause (own mutant RB-M1).
 
     ``_export_static_state`` clones every named buffer of a model allocated
     inside ``region(GPU_MEMORY_TYPE_WEIGHTS)`` (model_runner.py:2344-2348), so
@@ -1537,21 +1781,33 @@ def test_weights_block_pause_is_the_last_statement():
     campaign (a) fault on the weights tag.  The existing order gate uses the
     FIRST matching statement and stays green under exactly that duplicate.
 
-    NESTING-AWARE since fix 4.  The previous form compared TOP-LEVEL statement
-    indices, and fix 1 had since nested the pause inside
-    ``with self._weg2_pcie_lock("sleep-D2H weights"):`` -- which IS the last
-    top-level statement of the block no matter what is appended after the pause
-    inside it.  Own mutant RB2-M2 (a second ``_export_static_state`` in exactly
-    that position, i.e. the shape this docstring names) survived the whole
-    suite 80/80; only the control one level further out was killed.  A gate that
-    cannot fail on the hazard its own docstring names is not a gate, so the
-    assertion now walks the nesting path and requires "nothing after" at EVERY
-    level.
+    FORM, since H111b / PAUSE-OVERLAP: the pause is no longer one statement
+    that can be "last".  It is ``self.memory_saver_adapter.pause(tag)`` inside
+    the closure ``_weg2_pause_step`` of the per-tag loop, inside the
+    (retired-lock / H111b / pause-overlap) ``with``; source order after it
+    legitimately contains the NEXT tag's deposit and the leg's census lines.
+    The "nothing runs after" form (nesting-aware since fix 4, own mutant
+    RB2-M2) therefore cannot be kept literally.  Its INTENT -- nothing reads the
+    weights after they are paused -- is graded as: every call that reads the
+    weight pages (``_DEVICE_READS_OF_THE_WEIGHTS``) sits on a source line BEFORE
+    the first pause, and the pause is made from nowhere but the per-tag step.
+    RB2-M2's shape (a second export appended after the pause) is red here.
     """
     body = _tag_block(_func_ast("release_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
-    _assert_nothing_runs_after_the_call(
-        body, "pause(GPU_MEMORY_TYPE_WEIGHTS)", "weights"
+    pause_lines = _call_lines(body, "self.memory_saver_adapter.pause(tag)")
+    assert len(pause_lines) == 1, (
+        "the weights pause is made from exactly one site (the per-tag step); "
+        f"saw {pause_lines}"
     )
+    first_pause = pause_lines[0]
+    for needle in _DEVICE_READS_OF_THE_WEIGHTS:
+        late = [ln for ln in _call_lines(body, needle) if ln > first_pause]
+        assert not late, (
+            f"a call naming {needle!r} runs after the weights pause "
+            f"(line {first_pause}) at line(s) {late}: it reads pages the pause "
+            "has already unmapped"
+        )
+    assert _call_lines(body, "export_static_state"), "the stash export is gone"
 
 
 def test_census_reads_this_pid_not_the_colocated_sibling():
@@ -1822,15 +2078,27 @@ def test_partial_tag_set_still_grades_against_a_supplied_ceiling():
 
 
 def test_wake_reload_is_lexically_inside_the_weights_region():
-    """AST gate, same shape as test_sleep_d2h_is_serialised_on_the_card."""
+    """AST gate: the refill runs inside the weights region, now opened by ``weights_region``.
+
+    #1273 S2 (refuter F6) replaced the bare ``region(GPU_MEMORY_TYPE_WEIGHTS)``
+    with ``weights_region(adapter, tag, enable_cpu_backup=...)``: the ONE opener
+    that also publishes the tag, so the roll-forward's repack cannot tag the
+    reloaded parameters into another family. The gate follows: the refill sits
+    inside ``weights_region(...)`` opened with the reload's own tag, and that
+    opener opens an adapter ``region`` (so the allocation is tagged at all).
+    """
+    from sglang.srt.managers import weg2_memory_saver as wms
+
     reload_body = _func_ast("_weg2_wake_reload_weights").body
     guards = _with_items_around(reload_body, "update_weights_from_disk")
-    assert any("region" in g and "GPU_MEMORY_TYPE_WEIGHTS" in g for g in guards), (
-        "the backup-OFF refill runs OUTSIDE region(GPU_MEMORY_TYPE_WEIGHTS); "
+    assert any("weights_region(" in g and "weights_reload_tag" in g for g in guards), (
+        "the backup-OFF refill runs OUTSIDE weights_region(...); "
         "the repacked parameters it allocates are then untagged and the next "
         f"pause(weights) releases a region the model no longer points at. "
         f"guards seen: {guards}"
     )
+    opener = inspect.getsource(wms.weights_region)
+    assert "adapter.region(" in opener, "weights_region no longer opens the saver region"
 
 
 def test_wake_reload_allocates_under_the_weights_tag(monkeypatch, noop_pcie_lock):
