@@ -704,17 +704,46 @@ def dc_measured_d_mib(card: Card, weight_source: str) -> int:
     # 3080 used to borrow the 20 GB card's residue here.
     cls = card_identity.calibration_class(card)
     sel = DC_MEASURED_D_BY_CLASS.get(cls or "")
-    if sel is not None:
-        # UNIFY S3: the published profile's row (weg2/form.py), not the 27B alias.
-        const_name, xchg_index = sel
-        return _pconst("DC_MEASURED_D_XCHG_MIB")[xchg_index] if xchg else _pconst(const_name)
-    raise Weg2LaunchRefused(
-        f"W19 dormant-residue reserve ({card_identity.CODE_UNCALIBRATED}): board {name!r} (nvml"
-        f"{getattr(card, 'nvml_index', '?')}, {card_identity.card_key(card)}) belongs to no "
-        "calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: "
-        + ", ".join(sorted(DC_MEASURED_D_BY_CLASS)) + ") -- a third card's dormant residue "
-        "is not a property either of them has.  Measure it, do not borrow it."
-    )
+    if sel is None:
+        # AP1 1006 (HW-BORROWED by arch, Q-710: flags instead of code): a board of
+        # NO calibrated class is refused as before -- but as the VALUE refusal
+        # HW-UNCALIBRATED (``refusals.refuse_value``), so ``--force`` can pass it and
+        # the boot takes the figure of the calibrated class of the SAME ARCH (sm_86 ->
+        # RTX3080, sm_120 -> RTX5090; ``card_identity.arch_twin_class``), named
+        # UNMEASURED on this card (FORCED-PAST line). No twin of the arch (sm_89):
+        # the refusal stays hard. A calibrated card never gets here (its own class
+        # wins above): the reference rig is byte for byte what it was.
+        twin = card_identity.arch_twin_class(card)
+        twin_sel = DC_MEASURED_D_BY_CLASS.get(twin or "")
+        text = (
+            f"W19 dormant-residue reserve ({card_identity.CODE_UNCALIBRATED}): board {name!r} (nvml"
+            f"{getattr(card, 'nvml_index', '?')}, {card_identity.card_key(card)}) belongs to no "
+            "calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: "
+            + ", ".join(sorted(DC_MEASURED_D_BY_CLASS)) + ") -- a third card's dormant residue "
+            "is not a property either of them has.  Measure it, do not borrow it."
+        )
+        if twin_sel is None:
+            raise Weg2LaunchRefused(text)
+        _refuse_value_once(
+            card_identity.CODE_UNCALIBRATED,
+            text + f"  --force BORROWS the dormant residue of class {twin} (same arch "
+            f"{card_identity._sm(card_identity.props_of(card).cc)}) for this card: "
+            "UNMEASURED here (HW-UNCALIBRATED).")
+        sel = twin_sel
+    # UNIFY S3: the published profile's row (weg2/form.py), not the 27B alias.
+    const_name, xchg_index = sel
+    return _pconst("DC_MEASURED_D_XCHG_MIB")[xchg_index] if xchg else _pconst(const_name)
+
+
+def _refuse_value_once(code: str, text: str, log: Optional["Log"] = None) -> None:
+    """AP1 1006: ``refusals.refuse_value(code, text, Weg2LaunchRefused)`` -- the
+    SAME (code, text) is remembered once per forced boot (the W19 selector is read
+    by several passes per card; AP4's ``load_xchg_census_for_cards`` dedups the
+    same way). Without ``--force`` it raises every time, exactly as before."""
+    if refusals.forced_boot() and (code, text) in {
+            (d["code"], d["text"]) for d in refusals.forced_list()}:
+        return
+    refusals.refuse_value(code, text, Weg2LaunchRefused, log=log)
 
 
 #: HW-GENERIC 1002: calibration class -> (the record constant of the serving
@@ -4832,19 +4861,34 @@ ATTN_ANCHOR_MS = 400.0
 ATTN_ANCHOR_CARD_CLASS = "RTX3080"
 
 
-def attn_anchor_stage(cards: Sequence["Card"]) -> int:
+def attn_anchor_stage(cards: Sequence["Card"], log: Optional["Log"] = None) -> int:
     """The first P stage whose card is of :data:`ATTN_ANCHOR_CARD_CLASS`.
     No such card: refused BY NAME (HW-UNCALIBRATED) -- the anchor is a
     measurement of that class, and pricing another card's attention layer
-    with it would be a borrow."""
+    with it would be a borrow.
+
+    AP1 1006 (Q-710, flags instead of code): that refusal is the VALUE refusal
+    HW-UNCALIBRATED (``refusals.refuse_value``); without ``--force`` it reads and
+    raises as before. With ``--force`` the anchor is BORROWED onto the stage the
+    reference rig measured it on (the position of the anchor class in
+    ``card_identity.REFERENCE_INVENTORY``, clamped to the stage count): the
+    positional ``MEASURED_MS_PER_LAYER`` entry of that stage is the one the anchor
+    is combined with, so the pair stays the reference's pair. UNMEASURED on the
+    live card; the FORCED-PAST line says so."""
     for i, c in enumerate(cards):
         if card_identity.calibration_class(c) == ATTN_ANCHOR_CARD_CLASS:
             return i
-    raise Weg2LaunchRefused(
+    ref_stage = min(max(0, len(cards) - 1), card_identity.REFERENCE_INVENTORY.index(ATTN_ANCHOR_CARD_CLASS))
+    _refuse_value_once(
+        card_identity.CODE_UNCALIBRATED,
         f"{card_identity.CODE_UNCALIBRATED}: the P-cut deep attention anchor (--pp-cut-attn-anchor-ms, "
         f"{ATTN_ANCHOR_MS:g} ms/layer) was measured on class {ATTN_ANCHOR_CARD_CLASS}; no P stage "
         "carries that class (" + ", ".join(card_identity.class_label(c) for c in cards)
-        + "). Measure the anchor on this rig (a 262k-prefix chunk on the slowest stage) -- not borrowed.")
+        + "). Measure the anchor on this rig (a 262k-prefix chunk on the slowest stage) -- not borrowed."
+        f"  --force BORROWS it onto P stage {ref_stage} ({card_identity.class_label(cards[ref_stage])}), "
+        f"the stage the reference rig measured it on: UNMEASURED on this card (HW-UNCALIBRATED).",
+        log=log)
+    return ref_stage
 #: PP-COST (01.10.): the stage model the 27B INT8 P cut is priced on under
 #: --pp-cut-stage-model auto (rank-line fit of 09290020 cut 43,11,10 and four
 #: 44,10,10 boots of 01.10., weg2/p_stage_model_data/)
@@ -15317,6 +15361,17 @@ def budgets_from_dc(
     suffix.
     """
     out = []
+    if overshoot_mib is not None and len(overshoot_mib) < len(cards):
+        # AP1 1006 (c): a record vector written for fewer cards than the inventory
+        # (P_OVERSHOOT_MIB holds three entries) used to die here as a bare
+        # IndexError at ``overshoot_mib[i]``. Same refusal, now by name; a longer
+        # vector is read as before (the first N entries).
+        raise Weg2LaunchRefused(
+            f"{card_identity.CODE_UNCALIBRATED}: the awake-overshoot vector of group {label} "
+            f"({overshoot_provenance or 'record'}) has {len(overshoot_mib)} entries for {len(cards)} cards; "
+            "a positional measurement is not stretched over cards it was not taken on "
+            "(weg2/inventory_view.py derives it by card class for a subset of the calibrated inventory) "
+            "-- measure this inventory or name the vector.")
     l15_given = l15_mib is not None
     l15_vec: List[int] = [None] * len(cards) if not l15_given else [int(v) for v in l15_mib]
     if l15_given and len(l15_vec) != len(cards):
@@ -21440,6 +21495,77 @@ def derived_family_cost(ns, cards: Sequence["Card"], families, chunk_tokens: int
                   f"[{', '.join(cal)}] by card class (slowest same-class stage): " + ref_prov)
 
 
+def _drop_cut_pins(ns) -> List[str]:
+    """Clear the P-cut pins of ``ns`` (``--pp-stage-ratio`` / ``--pp-attn-stage-ratio``,
+    also inside ``--extra-p/-d`` words); the texts dropped, for the log."""
+    defaults = build_parser().parse_args(["--tree", "/", "--tag", "x"])
+    dropped: List[str] = []
+    for dest in ("pp_stage_ratio", "pp_attn_stage_ratio"):
+        v = getattr(ns, dest, None)
+        if v not in (None, ""):
+            dropped.append(f"--{dest.replace('_', '-')} {v}")
+            setattr(ns, dest, getattr(defaults, dest, None))
+    for key in ("extra_p", "extra_d"):
+        blob = str(getattr(ns, key, "") or "")
+        try:
+            words = shlex.split(blob) if blob else []
+        except ValueError:
+            continue
+        out: List[str] = []
+        i = 0
+        hit = False
+        while i < len(words):
+            if words[i] in ("--pp-stage-ratio", "--pp-attn-stage-ratio") and i + 1 < len(words):
+                dropped.append(f"--{key.replace('_', '-')}: {words[i]} {words[i + 1]}")
+                hit = True
+                i += 2
+                continue
+            out.append(words[i])
+            i += 1
+        if hit:
+            setattr(ns, key, " ".join(shlex.quote(x) for x in out))
+    return dropped
+
+
+def _unpin_foreign_cut(solve):
+    """AP1 1006 (d), as a decorator so the call sites (and the tests that pin their text)
+    stay as they are: when the cut the profile PINS (NF ``--pp-stage-ratio 29,11,8``) is
+    priced infeasible by the planner on a FOREIGN inventory (the live cards are not the
+    ones the pin was solved for: 3 x RTX 3090 puts rank 0 1897 MiB over its budget, 1520),
+    a FORCED boot drops the pin and lets the cut solver derive the cut from the live
+    budgets -- the planner's verdict decides, not a second table. Printed and remembered
+    as the value refusal HW-UNCALIBRATED (FORCED-PAST). Everything else is unchanged:
+    without ``--force``, on the calibrated inventory, with an inventory the operator named
+    (``--profile-inventory``), without a pin, or when the solver finds no cut either, the
+    planner's refusal propagates as before."""
+
+    @functools.wraps(solve)
+    def wrapper(ns, cards, budgets_p, model, log, *args, **kwargs):
+        from sglang.srt.planner import pp_cut_launch as _cut
+
+        try:
+            return solve(ns, cards, budgets_p, model, log, *args, **kwargs)
+        except _cut.PPCutRefused as exc:
+            pinned = any(str(getattr(ns, d, "") or "") for d in ("pp_stage_ratio", "pp_attn_stage_ratio"))
+            if not (pinned and refusals.forced_boot() and derivation_assessment(ns, cards) is not None):
+                raise
+            prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
+            cal, _ = records_inventory(prof)
+            live = card_identity.inventory_signature(cards)
+            dropped = _drop_cut_pins(ns)
+            _refuse_value_once(
+                card_identity.CODE_UNCALIBRATED,
+                f"{card_identity.CODE_UNCALIBRATED}: the P cut the profile pins ({'; '.join(dropped)}) was solved "
+                f"for [{', '.join(cal)}]; on [{', '.join(live)}] the planner prices it infeasible "
+                f"({' '.join(str(exc).split())[:260]}) -> the pin is DROPPED, the cut solver (planner/pp_cut.py) "
+                "derives the cut from the live budgets and the (borrowed, UNMEASURED) stage costs.",
+                log=log)
+            return solve(ns, cards, budgets_p, model, log, *args, **kwargs)
+
+    return wrapper
+
+
+@_unpin_foreign_cut
 def solve_p_cut(
     ns,
     cards: List[Card],
@@ -22027,7 +22153,7 @@ def solve_p_cut(
         # attention anchor (ATTN_ANCHOR_MS, "a 3080 ... 0.4 s per chunk") was
         # measured on -- by calibration class, not "the first card that is not a
         # 5090". On the reference rig that is stage 1, as before.
-        anchor_stage = attn_anchor_stage(cards)
+        anchor_stage = attn_anchor_stage(cards, log)
         family_cost, family_prov = _pp_cut.family_costs_from_measurement(
             measured_ms_per_layer=ms,
             measured_counts=incumbent,
@@ -25505,6 +25631,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"{'RECORD' if _dc_from_record is not None else 'CONSTANT'}: {_dc_record_prov}; "
         f"reserve incl. {slack_mib} MiB slack = "
         + ", ".join(f"nvml{c.nvml_index} {dc_expect_d[c.uuid]}" for c in cards) + " MiB")
+    refusals.flush(log)         # AP1 1006: the W19 twin borrow (dc_measured_d_mib has no logger); nothing without --force
     if ns.transport == "nccl":
         log(
             f"TRANSPORT=nccl (development mode, user order 2026-09-07): barlink flags dropped from both groups; "
