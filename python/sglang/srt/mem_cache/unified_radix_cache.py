@@ -10663,6 +10663,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return True
         return int(getattr(self, "tp_world_size", 1) or 1) > 1
 
+    def drain_prefetch_revokes_uncoordinated(self) -> bool:
+        """#1400 (NF cand4c 06.10. 11:08:10Z, PP2, rid weg2-74-260; ported to the
+        27B tree): drain the PREFETCH REVOKES of THIS rank, and nothing else,
+        for a caller that holds the scheduler thread while it waits for a read.
+
+        WHY IT EXISTS. A probe that answers below the prefetch threshold does
+        not terminate its operation: the io thread queues the rid on
+        ``prefetch_revoke_queue`` and only ``_drain_revoke`` (scheduler thread,
+        ``check_hicache_events``, once per round) pops the record from
+        ``ongoing_prefetch``. ``check_prefetch_progress`` keeps answering False
+        for the revoked rid until then (empty ``hash_value`` is never
+        "completed"; the timeout is priced on the whole span, ~258 s for 262144
+        tokens). The told admission gate (``weg2_store_told.admission``) spins
+        on that very call, ON the scheduler thread, for up to WAIT_CAP_S: the
+        round that would drain the revoke never comes (NF: PP2 spun 2 x 60 s and
+        died with 'the storage thread is stuck' -- it had long answered).
+
+        WHEN IT IS SAFE. Only where the drain needs no agreement with a peer:
+        the same condition under which the round drain is local anyway
+        (:meth:`_drain_agreement_is_collective` False: group P, TP 1, PP 3).
+        Then this call does exactly what the next round would do with the
+        revoke queue, one round early; no collective, no order change among
+        ranks. Anywhere else (an attention group > 1: group D) it does nothing
+        and returns False -- the unchanged behaviour.
+        """
+        if self._drain_agreement_is_collective():
+            return False
+        self._drain_storage_control_queues_impl(
+            n_revoke=None,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts=None,
+            log_metrics=False,
+        )
+        return True
+
     def _gated_drain_storage_control_queues(self, every: int) -> None:
         """The storage-queue agreement on a rank-uniform cadence (27B D rounds).
 
