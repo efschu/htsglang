@@ -94,7 +94,12 @@
       });
       h += "</tbody></table>";
     });
-    if (doc.bar1 && !doc.bar1.measured) h += '<p class="hwp-msg hwp-warn">' + esc(doc.bar1.note) + "</p>";
+    if (doc.bar1) {
+      /* Auftrag 1006: die BAR1-Strecke wird gemessen; 'complete' sagt, ob alle geordneten Paare eine Zahl haben (ältere
+         Antworten ohne das Feld: nur 'measured').  Ein Rest steht mit seinem Grund da, nie als Zahl. */
+      const full = doc.bar1.complete != null ? doc.bar1.complete : doc.bar1.measured;
+      h += '<p class="hwp-msg' + (full ? "" : " hwp-warn") + '">' + esc(doc.bar1.note) + "</p>";
+    }
     return h;
   }
 

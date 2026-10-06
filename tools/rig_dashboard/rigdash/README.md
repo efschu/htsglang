@@ -408,12 +408,16 @@ Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `st
   `{v, src, at, probe, note}` mit `src` = `gemessen` | `NVML` | `Datenblatt` | `geschätzt` | `nicht gemessen` (dann `v: null` und `note` = Grund).
   Gebaut wird in `sglang/srt/rigmon/hardware_profile.py` des Planer-Baums (per Dateipfad geladen, kein `import sglang` in diesem Prozess).
 * `POST /api/hwprofil/measure` `{"cards": [<NVML-Index>, ...]}` bucht **selbst** ein gpuq-Fenster (Eigentümer `profil-editor`, nur diese Karten,
-  10 min, ohne `not_before`, exklusiv; `mib` nur wenn der Body es verlangt) und misst darin. Antwort `action`:
+  15 min (Auftrag 1006: alle Rechenformate inkl. nativ W4A4 + BAR1-Strecke je Paar in Kindprozessen), ohne `not_before`, exklusiv; `mib` nur wenn der Body es verlangt) und misst darin. Antwort `action`:
   `messung_gestartet` (Kindprozess läuft, Fenster geht danach SOFORT zurück, auch nach Fehler) · `wartet` (Fenster `pending`: Status, **nichts
   gemessen**, Buchung bleibt; erneuter Druck nimmt sie wieder auf) · `abgelehnt` (unplanbar, Karte belegt trotz Fenster, zu wenig Restzeit, gpuq weg;
   HTTP 409) · `laeuft_bereits`. Das gpuq-Token verlässt den Prozess nie; die Buchung steht zusätzlich in `<state-dir>/hwprofil_window.json`, damit
   ein Neustart ein verwaistes Fenster zurückgibt.
 * `POST /api/hwprofil/cancel` gibt ein wartendes Fenster zurück.
+* Messumfang (Auftrag 1006, `card_probe --run`): je Karte SM-Zahl, L2, membw/GEMV, bf16, fp8, int8 W8A8, NVFP4 W4A8 (nur sm_8x), W4A16 Marlin, W4A4 nativ
+  (nur sm_12x; ältere Karten tragen den Grund), H2D/D2H Bandbreite und Latenz (Median 4 kB, Minimum im Hover); je geordnetem Paar Host-Staging/p2p und die
+  **BAR1-Strecke** (`rigmon/bar1_probe.py`: ein Kindprozess je Karte, Produktions-Transport mit Byte-Beweis, `--no-bar1` schaltet ab). Ein Wert, den ein
+  Mikrobench nicht liefern kann, bleibt „nicht gemessen“ mit Grund. `profile.bar1` = `{measured, complete, pairs_measured, pairs_total, note}`.
 * Kein Hintergrund-Poller: nur wer die Seite bedient fragt. Ein laufendes Fenster, das nach 180 s nicht benutzt wurde, geht beim nächsten Aufruf zurück.
 * Dienst-Parameter (Deploy durch den Lead): `--hw-tree` (gestagter Baum mit `hardware_profile.py` + `weg2/card_identity.py`, `deploy/stage_hwprofil.sh`),
   `--hw-measure-tree` (voller sglang-Baum für den Kindprozess), `--hw-python` (Interpreter mit torch + sgl_kernel; ohne sgl_kernel bleiben die Arme

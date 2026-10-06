@@ -61,12 +61,21 @@ planner stops ranking cards off a datasheet.
 this probe's caches with the stage-0 profile into one ``flliper.hardware/1``
 view, so the probe also carries what that view shows per card and nothing
 else measures: the int8 W8A8 rate, the NVFP4 W4A8-on-int8 rate (sm_8x only:
-that is the only place the serving path takes it) and the NVFP4 W4A16 Marlin
-rate -- each through the kernel the serving path calls, at the probe shape of
+that is the only place the serving path takes it), the NVFP4 W4A16 Marlin
+rate, and (order 1006) the NATIVE NVFP4 W4A4 rate on the FP4 tensor cores (sm_12x
+only; every older card stores "no native FP4 tensor cores" as its reason) -- each through the kernel the serving path calls, at the probe shape of
 ``uneven_perf`` -- the 4 kB host<->device latency per card, and SM count, L2
 size and compute capability from the device properties. A lane that cannot run
-stores its REASON in ``lane_notes``, never a number. The BAR1 stretch per pair
-is NOT measured here and says so (see ``BAR1_NOT_MEASURED``).
+stores its REASON in ``lane_notes``, never a number.
+
+**The BAR1 stretch per pair (order 1006).** ``bar1_probe`` measures it: one child
+process per card, the production transport (``barlink_bar1.build_bar1`` with its
+byte-level proof), the transport's own pair sensor for the rate and a 4 kB
+write+sync for the latency, one directed pair at a time. The result sits in
+``CardProbeProfile.bar1_pairs`` (never mixed into ``pairs``: a BAR1 write and a
+host-staged copy are different quantities) and ``bar1_reason`` says why a pair
+has no number. ``--no-bar1`` skips the step and then says so
+(``BAR1_NOT_MEASURED``).
 
 **State travels with the numbers.** Driver version, SM clock, clock ceiling,
 temperature and active throttle reasons are captured per card at measurement
@@ -150,11 +159,12 @@ _FP8_WARMUP = 8
 #: Minimum compute capability with an fp8 tensor path (Ada/Hopper and up).
 _FP8_MIN_CC = (8, 9)
 
-#: Host<->device latency: one 4 kB pinned copy, best of N. 4 kB is the same
-#: size the pair latency uses, so the card-to-host and card-to-card figures
-#: are directly comparable.
+#: Host<->device latency: one 4 kB pinned copy, MEDIAN of N (order 1006: the
+#: headline is the typical latency; the minimum is stored beside it). 4 kB is
+#: the same size the pair latency uses, so the card-to-host and card-to-card
+#: figures are directly comparable in size (the pair latency is best-of-N).
 _LAT_BYTES = 4096
-_LAT_ITERS = 40
+_LAT_ITERS = 200
 
 #: The NVFP4 W4A8-on-int8 kernel is the sm_8x one (``nvfp4_w4a8_int8``: "sm_86
 #: W4A8 kernel for native-mixed"); native-mixed resolves it on sm_8x only. On
@@ -168,6 +178,13 @@ LANE_INT8 = "int8_native"
 LANE_W4A8_INT8 = "nvfp4_w4a8"
 LANE_W4A16 = "nvfp4_marlin"
 LANE_FP8 = "fp8_native"
+LANE_W4A4 = "nvfp4_w4a4"
+
+#: Native NVFP4 (W4A4) needs FP4 tensor cores: Blackwell (compute capability 10.0+). The path the serving model
+#: takes on a consumer Blackwell card (sm_12x) is the fork's sm_120a CUTLASS GEMM behind ``fp4_gemm`` (what the
+#: ``auto`` backend resolves there); datacenter Blackwell resolves another backend (cute-dsl) this probe does not ask.
+_W4A4_MIN_MAJOR = 10
+_W4A4_PROBE_MAJOR = 12
 
 
 
@@ -196,6 +213,11 @@ class CardProbeMeasurement:
     gemm_int8_tflops: Optional[float] = None
     gemm_w4a8_int8_tflops: Optional[float] = None
     gemm_w4a16_tflops: Optional[float] = None
+    #: Native NVFP4 W4A4 on the FP4 tensor cores (sm_12x): the model's apply path
+    #: (activation quantisation + the fork's sm_120a CUTLASS GEMM), TFLOPS.
+    #: ``None`` = not measured; ``lane_notes["nvfp4_w4a4"]`` says why (a card
+    #: without FP4 tensor cores has its reason there, never a number).
+    gemm_w4a4_tflops: Optional[float] = None
     #: lane key -> why that lane has no number on this card.
     lane_notes: Dict[str, str] = dataclasses.field(default_factory=dict)
     #: Device properties (no kernel needed): SM count, L2 size, "M.m".
@@ -216,9 +238,13 @@ class CardProbeMeasurement:
     # -- host <-> device -------------------------------------------------
     h2d_gbs: Optional[float] = None
     d2h_gbs: Optional[float] = None
-    #: 4 kB pinned copy, best of N, wall clock (microseconds).
+    #: 4 kB pinned copy, median of N, wall clock (microseconds).
     h2d_lat_us: Optional[float] = None
     d2h_lat_us: Optional[float] = None
+    #: Same measurement, the minimum of the N samples (order 1006: the headline
+    #: above is the median). ``None`` in probes written before that order.
+    h2d_lat_min_us: Optional[float] = None
+    d2h_lat_min_us: Optional[float] = None
 
     # -- state (#149 tagging convention) ---------------------------------
     sm_clock_mhz: Optional[int] = None
@@ -303,6 +329,15 @@ class CardProbeProfile:
     cards: List[CardProbeMeasurement] = dataclasses.field(default_factory=list)
     pairs: List[PairMeasurement] = dataclasses.field(default_factory=list)
     notes: List[str] = dataclasses.field(default_factory=list)
+    #: The BAR1 stretch per ORDERED pair (``bar1_probe``), transport label
+    #: ``bar1_probe.BAR1_DIRECT``. Empty together with ``bar1_attempted=False``
+    #: = the step did not run (an older probe, ``--no-bar1``, one card).
+    bar1_pairs: List[PairMeasurement] = dataclasses.field(default_factory=list)
+    bar1_attempted: bool = False
+    #: Why at least one BAR1 pair has no number ("" = all measured).
+    bar1_reason: str = ""
+    bar1_seconds: Optional[float] = None
+    bar1_window_mib: Optional[float] = None
 
     # -- lookup ----------------------------------------------------------
 
@@ -398,6 +433,11 @@ class CardProbeProfile:
             "pairs": [p.to_json() for p in self.pairs],
             "transports": self.transports,
             "notes": list(self.notes),
+            "bar1_pairs": [p.to_json() for p in self.bar1_pairs],
+            "bar1_attempted": self.bar1_attempted,
+            "bar1_reason": self.bar1_reason,
+            "bar1_seconds": self.bar1_seconds,
+            "bar1_window_mib": self.bar1_window_mib,
             "caveats": self.caveats(),
         }
 
@@ -415,6 +455,11 @@ class CardProbeProfile:
             cards=[CardProbeMeasurement.from_json(c) for c in d.get("cards") or []],
             pairs=[PairMeasurement.from_json(p) for p in d.get("pairs") or []],
             notes=list(d.get("notes") or []),
+            bar1_pairs=[PairMeasurement.from_json(p) for p in d.get("bar1_pairs") or []],
+            bar1_attempted=bool(d.get("bar1_attempted")),
+            bar1_reason=str(d.get("bar1_reason") or ""),
+            bar1_seconds=d.get("bar1_seconds"),
+            bar1_window_mib=d.get("bar1_window_mib"),
         )
 
 
@@ -810,39 +855,53 @@ def _time_copy_gbs(dev, fn, nbytes: int = _XFER_BYTES) -> Optional[float]:
     return nbytes / 1e9 / best
 
 
-def _bench_h2d_d2h_latency(dev) -> Tuple[Optional[float], Optional[float]]:
-    """(h2d_us, d2h_us): one 4 kB pinned copy each way, best of N, wall clock.
+def _bench_h2d_d2h_latency(
+    dev,
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """(h2d_p50_us, d2h_p50_us, h2d_min_us, d2h_min_us): one 4 kB pinned copy
+    each way, ``_LAT_ITERS`` samples, wall clock, blocking copy + device sync.
 
-    Same size and same clock as the pair latency (``_measure_one_pair``), so a
-    card-to-host and a card-to-card latency can stand in one table. Best-of,
-    because one descheduled iteration is noise, not the link."""
+    The headline is the MEDIAN (the typical latency a staged transfer pays);
+    the minimum is returned beside it so a noisy run can be told from a clean
+    one. Same size and same clock as the pair latency (``_measure_one_pair``)."""
     import torch
 
     try:
         host = torch.empty(_LAT_BYTES, dtype=torch.uint8, pin_memory=True)
         dst = torch.empty(_LAT_BYTES, dtype=torch.uint8, device=dev)
     except (RuntimeError, torch.cuda.OutOfMemoryError):
-        return None, None
+        return None, None, None, None
 
-    def best_us(fn) -> float:
+    def samples_us(fn) -> List[float]:
         for _ in range(_XFER_WARMUP):
             fn()
         torch.cuda.synchronize(dev)
-        best = float("inf")
+        out = []
         for _ in range(_LAT_ITERS):
             t0 = time.perf_counter()
             fn()
             torch.cuda.synchronize(dev)
-            best = min(best, time.perf_counter() - t0)
-        return best * 1e6
+            out.append((time.perf_counter() - t0) * 1e6)
+        return out
 
     try:
-        h2d = best_us(lambda dst=dst, host=host: dst.copy_(host, non_blocking=False))
-        d2h = best_us(lambda dst=dst, host=host: host.copy_(dst, non_blocking=False))
-        return round(h2d, 1), round(d2h, 1)
+        h2d = samples_us(lambda dst=dst, host=host: dst.copy_(host, non_blocking=False))
+        d2h = samples_us(lambda dst=dst, host=host: host.copy_(dst, non_blocking=False))
+        return (
+            round(_median(h2d), 1),
+            round(_median(d2h), 1),
+            round(min(h2d), 1),
+            round(min(d2h), 1),
+        )
     finally:
         del host, dst
         torch.cuda.empty_cache()
+
+
+def _median(xs: Sequence[float]) -> float:
+    s = sorted(xs)
+    m = len(s) // 2
+    return s[m] if len(s) % 2 else 0.5 * (s[m - 1] + s[m])
 
 
 def _device_properties(dev) -> Tuple[Optional[int], Optional[float], Optional[str]]:
@@ -1013,6 +1072,98 @@ def _bench_gemm_w4a16(dev) -> Tuple[Optional[float], str]:
         torch.cuda.empty_cache()
 
 
+def _w4a4_unsupported_reason(cc: Optional[str]) -> str:
+    """Why this card has no native NVFP4 W4A4 lane, or ``""`` when it is asked.
+
+    A card fact (compute capability), independent of the interpreter, so the reason is stored even when the
+    sgl_kernel lanes are skipped. Asked only on sm_12x, where the serving path takes the fork's sm_120a kernel."""
+    try:
+        major = int(str(cc).split(".")[0])
+    except (TypeError, ValueError):
+        return f"compute capability unknown ({cc!r}): native NVFP4 not asked"
+    if major < _W4A4_MIN_MAJOR:
+        return (
+            f"compute capability {cc}: no native FP4 tensor cores (needs {_W4A4_MIN_MAJOR}.0+); "
+            "this card serves NVFP4 through Marlin (W4A16) or the int8 cores (W4A8), not natively"
+        )
+    if major != _W4A4_PROBE_MAJOR:
+        return (
+            f"compute capability {cc}: native FP4 exists, but the kernel the serving path takes here is not the "
+            f"sm_{_W4A4_PROBE_MAJOR}0a CUTLASS GEMM this probe measures; not asked on this architecture"
+        )
+    return ""
+
+
+def _bench_gemm_w4a4_native(dev) -> Tuple[Optional[float], str]:
+    """Native NVFP4 W4A4 on the FP4 tensor cores, or ``(None, why)``.
+
+    The model's own path: ``ModelOptFp4LinearMethod.apply`` with the fork's CUTLASS backend -- per-block FP4
+    activation quantisation (``fp4_quantize``), padding, then ``fp4_gemm`` -> ``cutlass_scaled_fp4_mm`` (the sm_120a
+    arm; what ``--fp4-gemm-backend auto`` resolves on a consumer Blackwell). The layer is built the way
+    ``benchmark/nvfp4_native/bench_5090_nvfp4`` builds it (random valid E2M1 bytes / E4M3 scales), at the probe
+    shape of ``uneven_perf`` (M x 5120 x 17408: the 27B MLP width), so the figure is comparable with the other
+    lanes. It INCLUDES the activation quantisation, as the W4A8 lane does; the backend global is restored."""
+    import torch
+
+    from sglang.srt import uneven_perf as up
+
+    m, k, n = up._PROBE_GEMM_M, up._PROBE_GEMM_K, up._PROBE_GEMM_N
+    layer = x = None
+    changed = False
+    saved = None
+    fp4_utils = None
+    try:
+        from sglang.srt.layers.quantization import fp4_utils
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp4Config,
+            ModelOptFp4LinearMethod,
+        )
+
+        if not fp4_utils.has_fork_nvfp4_cutlass_kernel():
+            return None, (
+                "the fork's sm_120a NVFP4 CUTLASS GEMM is not available on this device "
+                "(has_fork_nvfp4_cutlass_kernel() is False)"
+            )
+    except Exception as ex:
+        return None, f"NVFP4 native kernels unavailable: {type(ex).__name__}: {ex}"
+    try:
+        saved, changed = fp4_utils.FP4_GEMM_RUNNER_BACKEND, True
+        fp4_utils.FP4_GEMM_RUNNER_BACKEND = fp4_utils.Fp4GemmRunnerBackend.CUTLASS
+        method = ModelOptFp4LinearMethod(
+            ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16)
+        )
+        layer = torch.nn.Module()
+        with torch.device(dev):
+            method.create_weights(
+                layer, k, [n], k, n, torch.bfloat16, weight_loader=None
+            )
+        layer.weight.data.copy_(
+            torch.randint(0, 256, layer.weight.shape, dtype=torch.uint8, device=dev)
+        )
+        layer.weight_scale.data.copy_(
+            (torch.rand(layer.weight_scale.shape, device=dev) * 2 + 0.25).to(
+                torch.float8_e4m3fn
+            )
+        )
+        layer.input_scale.data.fill_(0.01)
+        layer.weight_scale_2.data.fill_(0.001)
+        method.process_weights_after_loading(layer)
+        x = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
+
+        def fn(method=method, layer=layer, x=x):
+            return method.apply(layer, x)
+
+        fn()  # a dispatch/JIT failure must surface as a note, not in the warmup loop
+        return up._time_gemm_tflops(dev, fn), ""
+    except Exception as ex:
+        return None, f"NVFP4 native GEMM did not run: {type(ex).__name__}: {ex}"
+    finally:
+        if changed:
+            fp4_utils.FP4_GEMM_RUNNER_BACKEND = saved
+        del layer, x
+        torch.cuda.empty_cache()
+
+
 def _timed(arm_seconds: Dict[str, float], key: str, fn):
     """Run ``fn()`` and record its wall seconds under ``key``."""
     t0 = time.time()
@@ -1029,7 +1180,7 @@ def measure_card(
     total_mib: Optional[int] = None,
     state_fn=None,
 ) -> CardProbeMeasurement:
-    """Measure one card: membw (D2D), GEMM bf16 + fp8 + int8 + NVFP4 lanes,
+    """Measure one card: membw (D2D), GEMM bf16 + fp8 + int8 + NVFP4 lanes (W4A8, Marlin W4A16, native W4A4),
     H2D and D2H (rate and latency), and the device properties.
 
     The membw and bf16 GEMM kernels are ``uneven_perf``'s, called directly.
@@ -1054,12 +1205,19 @@ def measure_card(
     gemm_bf16 = _timed(arm, "bf16", lambda: _bench_gemm_tflops(dev))
     gemm_fp8, fp8_note = _timed(arm, LANE_FP8, lambda: _bench_gemm_fp8_tflops(dev))
     h2d, d2h = _timed(arm, "h2d_d2h", lambda: _bench_h2d_d2h(dev))
-    h2d_lat, d2h_lat = _timed(arm, "h2d_d2h_lat", lambda: _bench_h2d_d2h_latency(dev))
+    h2d_lat, d2h_lat, *lat_min = _timed(
+        arm, "h2d_d2h_lat", lambda: _bench_h2d_d2h_latency(dev)
+    )
+    h2d_lat_min, d2h_lat_min = (lat_min + [None, None])[:2]
 
     # The sgl_kernel-backed lanes. An interpreter that cannot measure them
     # honestly leaves them empty WITHOUT a persisted note (#310).
     lane_notes: Dict[str, str] = {}
-    int8 = w4a8 = w4a16 = None
+    int8 = w4a8 = w4a16 = w4a4 = None
+    # Native W4A4: the card's own verdict first (compute capability), asked only where the serving path takes it.
+    w4a4_why = _w4a4_unsupported_reason(cc)
+    if w4a4_why:
+        lane_notes[LANE_W4A4] = w4a4_why
     env_issue = lane_environment_issue()
     if env_issue:
         logger.warning("card probe: lanes int8/w4a8/w4a16 skipped -- %s", env_issue)
@@ -1073,6 +1231,10 @@ def measure_card(
         w4a16, note = _timed(arm, LANE_W4A16, lambda: _bench_gemm_w4a16(dev))
         if w4a16 is None:
             lane_notes[LANE_W4A16] = note
+        if not w4a4_why:
+            w4a4, note = _timed(arm, LANE_W4A4, lambda: _bench_gemm_w4a4_native(dev))
+            if w4a4 is None:
+                lane_notes[LANE_W4A4] = note
 
     st: dict = (state_fn or (lambda: {}))() or {}
     return CardProbeMeasurement(
@@ -1086,6 +1248,7 @@ def measure_card(
         gemm_int8_tflops=round(int8, 2) if int8 is not None else None,
         gemm_w4a8_int8_tflops=round(w4a8, 2) if w4a8 is not None else None,
         gemm_w4a16_tflops=round(w4a16, 2) if w4a16 is not None else None,
+        gemm_w4a4_tflops=round(w4a4, 2) if w4a4 is not None else None,
         lane_notes=lane_notes,
         sm_count=sm_count,
         l2_mib=l2_mib,
@@ -1098,6 +1261,8 @@ def measure_card(
         d2h_gbs=round(d2h, 2) if d2h is not None else None,
         h2d_lat_us=h2d_lat,
         d2h_lat_us=d2h_lat,
+        h2d_lat_min_us=h2d_lat_min,
+        d2h_lat_min_us=d2h_lat_min,
         sm_clock_mhz=st.get("sm_clock_mhz"),
         sm_clock_max_mhz=st.get("sm_clock_max_mhz"),
         temp_c=st.get("temp_c"),
@@ -1249,14 +1414,42 @@ def measure_pair_matrix(gpus: Sequence[dict]) -> List[PairMeasurement]:
 # ---------------------------------------------------------------------------
 
 
+def _run_bar1_step(gpus: Sequence[dict], timeout_s: Optional[float]):
+    """The BAR1 stretch in child processes; a failure is a reason, never an exception.
+
+    The cards go to the children by UUID, in the probe's own (CUDA) order."""
+    try:
+        from sglang.srt.rigmon import bar1_probe
+
+        return bar1_probe.run_bar1_probe(
+            [{"uuid": g["uuid"]} for g in gpus],
+            timeout_s=timeout_s or bar1_probe.DEFAULT_TIMEOUT_S,
+        )
+    except Exception as ex:  # noqa: BLE001 -- the card rates above are worth keeping
+        from sglang.srt.rigmon.bar1_probe import Bar1Result, merge_reports
+
+        res = merge_reports([g["uuid"] for g in gpus], [])
+        res.reason = f"BAR1 step failed: {type(ex).__name__}: {ex}"
+        return res
+
+
 def run_card_probe(
     node_id: str = "local",
     include_pairs: bool = True,
     path: Optional[str] = None,
     save: bool = True,
     progress=None,
+    bar1: bool = False,
+    bar1_timeout_s: Optional[float] = None,
 ) -> CardProbeProfile:
     """Run the short probe over every visible card and cache the result.
+
+    ``bar1`` (order 1006): with two or more cards, also measure the BAR1 stretch
+    per ordered pair in child processes (``bar1_probe``); a failed or skipped
+    step is recorded with its reason, it never fails the probe. Off by default
+    for library callers (the planner's card-rate pass, ``rigmon`` CLI): only the
+    ``--run`` command line -- the one "Hardwareprofil messen" starts -- turns it
+    on (``--no-bar1`` turns it off again).
 
     ``progress(done, total, label)`` is called between steps so a long-running
     endpoint can report where it is without the caller polling the GPU.
@@ -1267,7 +1460,8 @@ def run_card_probe(
     gpus, driver = _inventory()
 
     n_pairs = len(gpus) * (len(gpus) - 1) if include_pairs else 0
-    total = len(gpus) + (1 if n_pairs else 0)
+    do_bar1 = bool(bar1 and len(gpus) >= 2)
+    total = len(gpus) + (1 if n_pairs else 0) + (1 if do_bar1 else 0)
     done = 0
 
     cards: List[CardProbeMeasurement] = []
@@ -1291,6 +1485,12 @@ def run_card_probe(
             progress(done, total, f"{n_pairs} ordered pairs")
         pairs = measure_pair_matrix(gpus)
         done += 1
+    bar1_res = None
+    if do_bar1:
+        if progress:
+            progress(done, total, f"BAR1 stretch ({n_pairs or len(gpus) * (len(gpus) - 1)} ordered pairs)")
+        bar1_res = _run_bar1_step(gpus, bar1_timeout_s)
+        done += 1
     if progress:
         progress(done, total, "done")
 
@@ -1306,12 +1506,20 @@ def run_card_probe(
         cards=cards,
         pairs=pairs,
     )
+    if bar1_res is not None:
+        profile.bar1_attempted = True
+        profile.bar1_pairs = [PairMeasurement.from_json(p) for p in bar1_res.pairs]
+        profile.bar1_reason = bar1_res.reason
+        profile.bar1_seconds = bar1_res.seconds
+        profile.bar1_window_mib = bar1_res.window_mib
+        if bar1_res.reason:
+            profile.notes.append(f"BAR1 stretch: {bar1_res.reason}")
     if len(gpus) < 2:
         profile.notes.append(
             "Only one card is visible, so there is no pair matrix to measure."
         )
-    else:
-        # Said in every multi-card run: the BAR1 stretch is not in this matrix.
+    elif bar1_res is None:
+        # The BAR1 step did not run (--no-bar1): say it, the matrix has no BAR1 column.
         profile.notes.append(BAR1_NOT_MEASURED)
     if save:
         saved = save_card_probe(profile, path)
@@ -1633,19 +1841,21 @@ def format_text(profile: CardProbeProfile) -> str:
         c.gemm_int8_tflops is not None
         or c.gemm_w4a8_int8_tflops is not None
         or c.gemm_w4a16_tflops is not None
+        or c.gemm_w4a4_tflops is not None
         or c.sm_count is not None
         for c in profile.cards
     ):
         lines.append("")
         lines.append(
-            f"{'card':28s} {'int8':>8s} {'w4a8':>8s} {'w4a16':>8s} {'H2D lat':>8s} "
+            f"{'card':28s} {'int8':>8s} {'w4a8':>8s} {'w4a16':>8s} {'w4a4':>8s} {'H2D lat':>8s} "
             f"{'D2H lat':>8s} {'SMs':>5s} {'L2 MiB':>7s} {'cc':>5s}"
         )
         for c in profile.cards:
             lines.append(
                 f"{c.name[:28]:28s} {_num(c.gemm_int8_tflops, 1):>8s} "
                 f"{_num(c.gemm_w4a8_int8_tflops, 1):>8s} "
-                f"{_num(c.gemm_w4a16_tflops, 1):>8s} {_num(c.h2d_lat_us, 1):>8s} "
+                f"{_num(c.gemm_w4a16_tflops, 1):>8s} {_num(c.gemm_w4a4_tflops, 1):>8s} "
+                f"{_num(c.h2d_lat_us, 1):>8s} "
                 f"{_num(c.d2h_lat_us, 1):>8s} "
                 f"{'-' if c.sm_count is None else c.sm_count:>5} "
                 f"{_num(c.l2_mib, 1):>7s} {c.compute_capability or '-':>5s}"
@@ -1664,6 +1874,20 @@ def format_text(profile: CardProbeProfile) -> str:
                 f"{(dst.name if dst else pr.dst_uuid)[:20]:20s} "
                 f"{_num(pr.bandwidth_gbs, 2):>8s} GB/s  "
                 f"{_num(pr.latency_us, 1):>8s} us   via {pr.transport}"
+            )
+    if profile.bar1_pairs:
+        by_uuid = profile.by_uuid()
+        lines.append("")
+        lines.append("BAR1 stretch per ordered pair (writes src -> dst's BAR1):")
+        for pr in profile.bar1_pairs:
+            src = by_uuid.get(pr.src_uuid)
+            dst = by_uuid.get(pr.dst_uuid)
+            tail = "" if pr.bandwidth_gbs is not None else f"   not measured: {pr.note}"
+            lines.append(
+                f"  {(src.name if src else pr.src_uuid)[:20]:20s} -> "
+                f"{(dst.name if dst else pr.dst_uuid)[:20]:20s} "
+                f"{_num(pr.bandwidth_gbs, 3):>8s} GB/s  "
+                f"{_num(pr.latency_us, 1):>8s} us{tail}"
             )
     for n in profile.notes:
         lines.append(f"note: {n}")
@@ -1694,6 +1918,18 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument(
         "--no-pairs", action="store_true", help="cards only, skip the pair matrix"
     )
+    p.add_argument(
+        "--no-bar1",
+        action="store_true",
+        help="skip the BAR1 stretch per pair (child processes; needs the "
+        "dmabuf_holder module and the driver's peer-BAR1 reg key)",
+    )
+    p.add_argument(
+        "--bar1-timeout-s",
+        type=float,
+        default=None,
+        help="wall cap of the BAR1 step (default bar1_probe.DEFAULT_TIMEOUT_S)",
+    )
     p.add_argument("--json", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
 
@@ -1702,12 +1938,14 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             node_id=args.node_id,
             include_pairs=not args.no_pairs,
             path=args.out,
+            bar1=not args.no_bar1,
+            bar1_timeout_s=args.bar1_timeout_s,
         )
         # #310: an interpreter that cannot measure the sgl_kernel lanes says so
         # to the caller, never into the card-keyed cache.
         issue = lane_environment_issue()
         if issue:
-            print(f"WARNING lanes int8/w4a8/w4a16 not measured: {issue}", file=sys.stderr)
+            print(f"WARNING lanes int8/w4a8/w4a16/w4a4 not measured: {issue}", file=sys.stderr)
     else:
         cached = load_card_probe(args.out)
         if cached is None:
