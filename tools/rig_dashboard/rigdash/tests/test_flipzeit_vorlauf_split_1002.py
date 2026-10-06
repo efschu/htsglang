@@ -133,10 +133,11 @@ class VorlaufSplitNF(unittest.TestCase):
         u["flip_user_time"][0]["rid"] = None
         rounds = [(1790963325.600, 1790963325.628), (BNF + 30.0, BNF + 30.03)]
         x = ipcboot.flip_views(SEGS_NF, u, BNF + 60, None, d_rounds=rounds, arrivals={})[0]
-        self.assertEqual(x["kind"], "ok")
+        # Nutzer 06.10.: without the waiter's arrival the idle span cannot be taken out -- missing, no total
+        self.assertEqual((x["kind"], x["total_ms"]), ("fehlt", None))
+        self.assertEqual(x["missing"], ipcboot.F_DP_ARRIVAL_UNKNOWN)
         self.assertIsNone(x["leer_ms"])
         self.assertIsNone(x["halt_ms"])
-        self.assertIsNotNone(x["vorlauf_ms"])
 
 
 class FrontArrivalReader(unittest.TestCase):

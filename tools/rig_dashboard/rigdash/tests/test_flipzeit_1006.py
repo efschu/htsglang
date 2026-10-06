@@ -227,7 +227,7 @@ class DefinitionEndpoints(unittest.TestCase):
         dispatch (46,608) and P's last stage (53,23) are not."""
         ipc = base._ipc_dp("pp_first_forward", 47.21)
         ipc["flip_user_time"][0]["pp_last_start_ts"] = base.T + 53.23
-        x = ipcboot.flip_views(base.SEGS, ipc, base.T + 60.0, base._ring(), d_rounds=base.D_ROUNDS + [(base.T + 58, base.T + 58.03)])[0]
+        x = ipcboot.flip_views(base.SEGS, ipc, base.T + 60.0, base._ring(), d_rounds=base.D_ROUNDS + [(base.T + 58, base.T + 58.03)], arrivals=base.ARR)[0]
         self.assertEqual(x["kind"], "ok")
         self.assertAlmostEqual(x["end"], base.T + 47.21, places=3)
         self.assertAlmostEqual(x["total_ms"], (47.21 - 44.096) * 1000, delta=1)
@@ -267,7 +267,7 @@ class DefinitionEndpoints(unittest.TestCase):
         self.assertEqual([m["kind"] for m in db.marks("NF", 0, base.T + 100)], ["flip_skip"])
 
     def test_real_provisional_row_is_not_counted(self):
-        x = ipcboot.flip_views(base.SEGS, base._ipc_dp(), base.T + 60.0, base._ring(), d_rounds=base.D_ROUNDS, arrivals={})[0]
+        x = ipcboot.flip_views(base.SEGS, base._ipc_dp(), base.T + 60.0, base._ring(), d_rounds=base.D_ROUNDS, arrivals=base.ARR)[0]
         self.assertTrue(x["provisional"] and x["kind"] == "ok")
         self.assertFalse(flipzeit.counted(x))
         self.assertEqual(vmpush.flip_view_points([x], "NF", "b", set()), [])

@@ -154,11 +154,14 @@ class DefinitionGuards(unittest.TestCase):
         self.assertEqual(x["kind"], "ok")
         self.assertAlmostEqual(x["start"], T + 42.45, places=3)
 
-    def test_unknown_arrival_is_named_on_the_row_the_idle_span_cannot_be_taken_out(self):
-        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS, arrivals={}))
-        self.assertTrue(x["arrival_unknown"])
-        self.assertAlmostEqual(x["start"], T + 30.4, places=3)
-        self.assertIsNone(x["leer_excl_ms"])
+    def test_unknown_arrival_is_missing_never_a_total_from_the_last_d_token(self):
+        for arr in ({}, None):
+            x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS, arrivals=arr))
+            self.assertEqual((x["kind"], x["total_ms"]), ("fehlt", None), arr)
+            self.assertEqual(x["missing"], ipcboot.F_DP_ARRIVAL_UNKNOWN)
+            self.assertTrue(x["arrival_unknown"])
+            self.assertFalse(flipzeit.counted(x))
+            self.assertEqual(vmpush.flip_view_points([x], "NF", "boot-x", set()), [])
 
     def test_idle_span_is_never_in_the_total_and_never_in_the_points_total(self):
         x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS, arrivals={"weg2-2-16": T + 39.0}))

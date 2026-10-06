@@ -730,6 +730,7 @@ F_DP_START_NOLOG = "D-Log nicht gefunden (Decode rank batch rank 0)"
 #: flip_views(..., d_rounds=AUTO) reads D's rounds through grouplog; tests pass the list (or None)
 AUTO = object()
 F_DP_ARRIVAL = "front WEG2 SESSION Ankunft des Wartenden liegt nach dem ersten Prefill-Forward (rid/Uhr)"
+F_DP_ARRIVAL_UNKNOWN = "front WEG2 SESSION Ankunft des Wartenden (rid) bzw. oldest_waiter_arrival fehlt: Server-Leerlauf vor dem Wartenden nicht herausrechenbar"
 #: tolerance between the front's arrival stamp and the rank clock before an arrival "after the first forward" is a defect
 ARRIVAL_SKEW_S = 0.5
 F_DP_END = "rankstats P.tp0pp0.work.forward_ct im Ring / flip_user_time.prefill_start_ts (pp_first_forward)"
@@ -781,8 +782,8 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
            Flip 2: D dekodierte 1,9 s VOR flip_done (waehrend wake-kv/dc).
       D>P  start = max(letztes erzeugtes Decode-Token auf D, Ankunft des wartenden Requests) (Nutzer 06.10.: "held";
            Server-Leerlauf D-Token -> Ankunft zaehlt nicht, bleibt als ``leer_excl_ms`` ausserhalb der Summe sichtbar;
-           ist die Ankunft unbekannt, bleibt der Start das letzte D-Token und die Zeile traegt ``arrival_unknown``:
-           ein Leerlauf davor ist dann NICHT herausgerechnet) -- das letzte D-Token: Ende der letzten D-Runde (D-Log TP0 ``Decode rank batch``,
+           ist die Ankunft unbekannt, ist der Flip kind "fehlt" (F_DP_ARRIVAL_UNKNOWN): kein Total, ein Leerlauf
+           davor liesse sich nicht herausrechnen) -- das letzte D-Token: Ende der letzten D-Runde (D-Log TP0 ``Decode rank batch``,
            t + gpu-ms) nach dem vorigen Flip und vor flip_done -- nicht flip_user_time.start_ts (Park-RPC,
            aeltester Wartender): NF y7w/y7x/y7y Erstflip D dekodierte zuletzt 5,5-8,4 s vor dem Park-Stempel.
            end = Beginn des ersten Prefill-Batches auf P
@@ -975,7 +976,11 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                 row["missing"] = F_DP_START if d_rounds is not None else F_DP_START_NOLOG
             else:
                 row["kind"] = "ok"
-        if d == "D>P" and start is not None and end is not None and dp_arrival is not None \
+        if d == "D>P" and start is not None and end is not None and dp_arrival is None and row["kind"] == "ok":
+            # no arrival stamp of the waiter: whether D's last token -> arrival was idle cannot be told, and the
+            # total from D's last token could contain Server-Leerlauf (Nutzer 06.10.: never a wrong, too large figure)
+            row["kind"], row["missing"] = "fehlt", F_DP_ARRIVAL_UNKNOWN
+        elif d == "D>P" and start is not None and end is not None and dp_arrival is not None \
                 and float(dp_arrival) > end + ARRIVAL_SKEW_S and row["kind"] == "ok":
             # the waiter "arrived" after P's first forward started: a stamp of another request / another clock.  Never
             # a total of ~0 from it, and never the idle span counted instead -- the point is missing, named
