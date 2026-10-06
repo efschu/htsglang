@@ -4337,6 +4337,29 @@ def p_activation_record(profile: Optional[str] = None) -> Tuple[Optional[Tuple[f
     return vals, _pconst_boots(P_ACTIVATION_RECORD, profile)
 
 
+def _live_stage_support(base):
+    """AP2 1006: the builtin transient support (measured per P stage on the
+    3-stage reference rig) for the P stage count of THIS launch. Only while an
+    inventory view is installed (``apply_inventory_derivation``: a subset of the
+    calibrated cards, or a boot forced past HW-UNCALIBRATED) whose card count --
+    P = PP<N> -- differs from the support's: each live stage takes the measured
+    points of the reference stage of the same ROLE (``p_card_chunk.role_stage_map``:
+    first, middle, last). Everywhere else (the reference rig, desk callers
+    without a view) ``base`` comes back unchanged."""
+    from sglang.srt.weg2 import inventory_view as _iv
+
+    act = _iv.active()
+    if act is None or not base.points or len(act[2]) == base.n_stages:
+        return base
+    smap = _p_card.role_stage_map(len(act[2]), base.n_stages)
+    if smap is None:
+        return base
+    tag = " RESTAGE %d->%d Stufen %s" % (base.n_stages, len(act[2]), ",".join(str(m) for m in smap))
+    return _p_card.TransientSupport(model=base.model, points=tuple(
+        _p_card.TransientPoint(chunk=p.chunk, mib=tuple(p.mib[m] for m in smap), source=p.source + tag)
+        for p in base.points))
+
+
 def p_transient_support(profile: Optional[str] = None, *, card: bool = False):
     """#242: the support table the launcher prices from -- the builtin one,
     with the point at :data:`P_ACTIVATION_RECORD_CHUNK` replaced by the
@@ -4351,7 +4374,7 @@ def p_transient_support(profile: Optional[str] = None, *, card: bool = False):
     the card reference is re-measured on this form (--p-card-reference-logs),
     only the second direction may reach it.
     """
-    base = P_PREFILL_TRANSIENT_SUPPORT
+    base = _live_stage_support(P_PREFILL_TRANSIENT_SUPPORT)
     rec, boots = p_activation_record(profile)
     if rec is None or len(rec) != base.n_stages or P_ACTIVATION_RECORD_CHUNK not in base.chunks:
         return base
@@ -6098,6 +6121,43 @@ def _derive_csv(policy: str, text: str, calibrated: Sequence[str], live: Sequenc
     return None if got is None else (got if isinstance(got, str) else ",".join(str(x) for x in got))
 
 
+_derive_csv_strict = _derive_csv
+
+
+def _forced_record_borrow(prof: str, cal: Sequence[str], live: Sequence[str],
+                          cards: Sequence["Card"]) -> Tuple[Dict[str, Tuple[str, str]], Dict[str, str]]:
+    """AP2 1006: the positional records of ``prof`` that :func:`inventory_view.borrow_vector`
+    can place on the live cards (name -> (old text, borrowed text)) and the arch twins it
+    used (live class label -> calibrated class, AP1 ``card_identity.arch_twin_class``).
+    Only for a boot forced past HW-UNCALIBRATED; a record with no borrow is not listed."""
+    from sglang.srt.weg2 import inventory_view as _iv
+    from sglang.srt.weg2 import profile_records as _pr
+
+    twins: Dict[str, str] = {}
+    for c in cards:
+        label = card_identity.class_label(c)
+        if label not in cal:
+            twin = card_identity.calibration_class(c) or card_identity.arch_twin_class(c)
+            if twin:
+                twins[label] = twin
+    out: Dict[str, Tuple[str, str]] = {}
+    for r in _pr.records(prof):
+        if not _pr.is_positional(r.value, len(cal)):
+            continue
+        pol = _iv.RECORD_POLICY.get(r.name)
+        if pol in (_iv.CONSUMER, _iv.CUT_GATED, _iv.ADVISORY, _iv.CUT_PIN):
+            continue
+        got = _iv.borrow_vector(pol, r.value, tuple(cal), tuple(live), twins)
+        if got is None:
+            continue
+
+        def _t(v):
+            return v if isinstance(v, str) else ",".join(str(x) for x in v)
+
+        out[r.name] = (_t(r.value), _t(got))
+    return out, twins
+
+
 def apply_inventory_derivation(ns, cards: Sequence["Card"], log=None,
                                environ: Optional[Dict[str, str]] = None) -> List[str]:
     """HW-P1c 1003 (PROFILE-VECTORS / RECORDS-NVEC / L15-POSTS / PP-CUT-PIN):
@@ -6123,17 +6183,49 @@ def apply_inventory_derivation(ns, cards: Sequence["Card"], log=None,
         _iv.clear_active()
         return lines
     subset, _ok, bad_rec, bad_vec, bad_l15 = da
-    if not subset or bad_rec or bad_vec or bad_l15:
-        _iv.clear_active()
-        return lines
     prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
     cal, _ = records_inventory(prof)
     vcal, _ = calibrated_inventory(ns)
     live = tuple(card_identity.inventory_signature(cards))
-    _iv.set_active(prof, tuple(cal), live)
+    borrow = None
+    if not subset or bad_rec or bad_vec or bad_l15:
+        if not refusals.forced_boot():
+            _iv.clear_active()
+            return lines
+        # AP2 1006 (Q-710, flags instead of code): a boot FORCED past HW-UNCALIBRATED
+        # used to keep the reference rig's 3-vectors (N = 2 read the first two
+        # entries silently, N = 4 died at the 4th card: AP1 (c)). It now BORROWS
+        # every positional record for the live cards (inventory_view.borrow_vector:
+        # class-max by class or AP1 arch twin, else the stage/rank ROLE) and names
+        # each one UNMEASURED; what has no borrow stays as it was.
+        borrow, twins = _forced_record_borrow(prof, cal, live, cards)
+        _iv.set_active(prof, tuple(cal), live, borrow=sorted(borrow), twins=twins)
+    else:
+        twins = {}
+        _iv.set_active(prof, tuple(cal), live)
     n = len(live)
     defaults = build_parser().parse_args(["--tree", "/", "--tag", "x"])
     head = f"HW-DERIVE [{','.join(cal)}] -> [{','.join(live)}]"
+
+    def _derive_csv(policy, text, calibrated, live_):   # noqa: F811 - the forced borrow shadows the module helper
+        if borrow is None:
+            return _derive_csv_strict(policy, text, calibrated, live_)
+        got = _iv.borrow_vector(policy, str(text), tuple(calibrated), tuple(live_), twins)
+        return None if got is None else (got if isinstance(got, str) else ",".join(str(x) for x in got))
+
+    if borrow is not None:
+        for name in sorted(borrow):
+            note(f"{head} record {name} {borrow[name][0]} -> {borrow[name][1]} "
+                 f"(FORCED BORROW, {_iv.RECORD_POLICY.get(name) or 'role'}; UNMEASURED on these cards)")
+        refusals.refuse_value(
+            card_identity.CODE_UNCALIBRATED,
+            f"{card_identity.CODE_UNCALIBRATED}: profile {prof!r} positional records measured on "
+            f"[{', '.join(cal)}] are BORROWED for [{', '.join(live)}] (--force): "
+            + (", ".join(sorted(borrow)) or "(none)")
+            + " -- class-max by card class (a class without a calibrated card: its arch twin), otherwise "
+            "by stage/rank role (first, middle, last); UNMEASURED here, the first boot on these cards is "
+            "the measurement (weg2/inventory_view.py borrow_vector)",
+            Weg2LaunchRefused, log=log)
     # 1. launcher flags that carry a per-card vector or a pinned P cut
     for dest in _TOPOLOGY_VECTOR_FLAGS:
         flag = "--" + dest.replace("_", "-")
@@ -10493,8 +10585,14 @@ def load_xchg_census_for_cards(
     ``WEG2-XCHG-CENSUS-MAP`` line and no refusal.  The peak is still graded
     against the card's LIVE NVML total by ``xchg_residency.solve``."""
     census = xchg_residency.load_census(census_path)   # raises W71 by name
+    # AP2b 1006: on a foreign inventory the launcher derives the donor of every
+    # missing row ITSELF (no --weg2-xchg-census-map needed): a census row without
+    # a card_class field is labelled from the reference rig's card registry
+    # (UUID -> board), a live card borrows the row of its own class, else of its
+    # arch twin (AP1 W19 rule).  Still a named HW-BORROWED borrow (forcebar).
     census, borrows, notes = xchg_residency.resolve_census(
-        census, cards, census_map=_XCHG_CENSUS_MAP[0] if census_map is None else census_map)
+        census, cards, census_map=_XCHG_CENSUS_MAP[0] if census_map is None else census_map,
+        known_classes=xchg_residency.reference_census_classes())
     if log is not None:
         for ln in notes:
             log(ln)
@@ -18185,6 +18283,48 @@ def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
     return cost, prov + " | " + verdict, fitted
 
 
+def forced_lane_borrow(cards: Sequence[Card], lanes: Sequence[Optional[int]],
+                       log=None) -> List[Optional[int]]:
+    """AP2 1006: the PCIe width per ordinal the crossing price is looked up at.
+    The measured link table (``MEASURED_GBPS_BY_LANES``) holds this rig's widths
+    only (x4, x8); a card at another width (x16 on most boards) or one NVML does
+    not report used to drop every candidate crossing it as UNPRICED, so a
+    foreign inventory ended in W40 "not one cut ... priceable" even with --force.
+
+    Unchanged whenever every width has a measured entry (the reference rig: the
+    list comes back as it went in). Otherwise the value refusal HW-UNCALIBRATED:
+    without --force refused by name; with it the ordinal is priced at the
+    largest MEASURED width not above its own (x16 -> x8: never faster than
+    measured), an unreported width at the smallest measured one, named
+    UNMEASURED. A width below every measured one (x1, x2) gets no borrow -- any
+    measured price would be optimistic -- and stays unpriced."""
+    from sglang.srt.distributed.pp_crossing_transport import MEASURED_GBPS_BY_LANES
+
+    have = sorted(int(k) for k in MEASURED_GBPS_BY_LANES)
+    out = [None if x is None else int(x) for x in lanes]
+    moved = []
+    for i, w in enumerate(out):
+        if w is not None and w in have:
+            continue
+        below = [k for k in have if w is None or k <= w]
+        if not below:
+            continue
+        new = below[0] if w is None else below[-1]
+        moved.append(f"ordinal {i} ({card_identity.class_label(cards[i]) if i < len(cards) else '?'}) "
+                     f"x{w if w is not None else '?'} -> x{new}")
+        out[i] = new
+    if not moved:
+        return list(lanes)
+    refusals.refuse_value(
+        card_identity.CODE_UNCALIBRATED,
+        f"{card_identity.CODE_UNCALIBRATED}: PP-CUT crossing prices are measured at PCIe widths "
+        f"{', '.join('x%d' % k for k in have)} only; " + "; ".join(moved)
+        + " -- --force prices these at the nearest measured width not faster than their own: UNMEASURED "
+        "on this board (a crossing measurement of this rig writes the table)",
+        Weg2LaunchRefused, log=log)
+    return out
+
+
 def per_pair_crossing_ms(
     lanes: Sequence[Optional[int]], payload_bytes: int
 ) -> Dict[Tuple[int, int], float]:
@@ -20367,6 +20507,60 @@ def apply_p_draft_post(ns, cards, fracs, stage_layers, row_mib: float,
     return new
 
 
+def _restage_p_card_reference(ns, cards, reference, support, co_tenant, stage_layers, log, *,
+                              layer_kinds, dense_mib_per_layer, mamba_mib_per_linear_layer_per_slot):
+    """AP2 1006 (W167 at N != 3): the P-card reference (built in, or from
+    ``--p-card-reference-logs``) was measured on its own stage count -- the NF
+    built-in one on 3 stages of [RTX5090, RTX3080, RTX3080]. A launch of another
+    card count used to stop at W167 ("Stufenzahl 2 gegen 3") even with --force.
+
+    Now the reference is RE-STAGED (``p_card_chunk.restage_reference``): each
+    live stage takes the measured row of the reference stage of the SAME ROLE
+    (first / middle / last, ``role_stage_map``) and its K0 is shifted by its
+    layer count exactly as a same-count recut. When every live stage sits on a
+    card of the class its reference stage was measured on (5090 + 3080 from the
+    reference rig) the row is the class's own measurement: one ``PP-CUT RESTAGE``
+    line, DERIVED. When a stage borrows another class's row (a middle 5090 of
+    2 x 5090 + 2 x 3080, any 3090) it is the value refusal HW-UNCALIBRATED:
+    without ``--force`` refused by name as before, with it FORCED-PAST and named
+    UNMEASURED. A reference that cannot be re-staged (layer types / Dense /
+    Mamba price unknown, one stage) stays W167."""
+    smap = _p_card.role_stage_map(len(stage_layers), len(reference.stage_layers))
+    if smap is None:
+        _p_card.recut_check(reference.stage_layers, stage_layers, layer_kinds, _p_card.CARD_MARKER)
+        raise _p_card.PCutRecutRefused(   # pragma: no cover - recut_check refuses every count mismatch
+            f"{_p_card.RECUT_REFUSAL_CODE}: {_p_card.CARD_MARKER} -- no stage role to place")
+    ref_new, sup_new, co_new = _p_card.restage_reference(
+        reference, support, co_tenant, stage_layers, smap, layer_kinds=layer_kinds,
+        dense_mib_per_layer=dense_mib_per_layer,
+        mamba_mib_per_linear_layer_per_slot=mamba_mib_per_linear_layer_per_slot)
+    prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
+    ref_classes, _ = records_inventory(prof)
+    ref_classes = tuple(ref_classes) if len(ref_classes) == len(reference.stage_layers) else ()
+    live = [card_identity.class_label(cards[s]) if s < len(cards) else "?" for s in range(len(stage_layers))]
+    rows = "; ".join(
+        f"stage{s} ({live[s]}) <- reference stage{m} ({ref_classes[m] if ref_classes else '?'}, "
+        f"{int(reference.stage_layers[m])} -> {int(stage_layers[s])} layers, K0 "
+        f"{float(reference.headroom0_mib[m]):.0f} -> {float(ref_new.headroom0_mib[s]):.0f} MiB)"
+        for s, m in enumerate(smap))
+    head = (f"{_p_card.CARD_MARKER} RESTAGE ref={_p_card.split_text(reference.stage_layers)} "
+            f"({reference.source}) -> {_p_card.split_text(stage_layers)}: {rows}")
+    borrowed = [s for s, m in enumerate(smap) if not ref_classes or live[s] != ref_classes[m]]
+    if not borrowed:
+        log(head + " -- every stage on a card of the class its reference stage was measured on: "
+            "DERIVED by role and layer count, not measured (the first boot of this cut is the measurement)")
+        return ref_new, sup_new, co_new
+    refusals.refuse_value(
+        card_identity.CODE_UNCALIBRATED,
+        f"{_p_card.RECUT_REFUSAL_CODE} {card_identity.CODE_UNCALIBRATED}: {head} -- stage(s) "
+        + ", ".join(str(s) for s in borrowed)
+        + " sit on a card of ANOTHER class than the reference stage they take the row from "
+        f"(reference cards [{', '.join(ref_classes) or 'unknown'}]); --force BORROWS that row: UNMEASURED on "
+        "this card. Without --force: give boots of this cut on these cards (--p-card-reference-logs).",
+        Weg2LaunchRefused, log=log)
+    return ref_new, sup_new, co_new
+
+
 def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                    fracs: Sequence[float], lru_rows: Sequence[int],
                    stage_layers: Sequence[int], kv_mib, num_experts: int,
@@ -20485,10 +20679,16 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     if tuple(int(x) for x in stage_layers) != tuple(reference.stage_layers):
         recut_from = tuple(reference.stage_layers)
         try:
-            reference = _p_card.recut_reference(
-                reference, stage_layers, layer_kinds=layer_kinds,
-                dense_mib_per_layer=dense_mib_per_layer,
-                mamba_mib_per_linear_layer_per_slot=mamba_mib_per_linear_layer_per_slot)
+            if len(stage_layers) != len(reference.stage_layers):
+                reference, support, co_tenant = _restage_p_card_reference(
+                    ns, cards, reference, support, co_tenant, stage_layers, log,
+                    layer_kinds=layer_kinds, dense_mib_per_layer=dense_mib_per_layer,
+                    mamba_mib_per_linear_layer_per_slot=mamba_mib_per_linear_layer_per_slot)
+            else:
+                reference = _p_card.recut_reference(
+                    reference, stage_layers, layer_kinds=layer_kinds,
+                    dense_mib_per_layer=dense_mib_per_layer,
+                    mamba_mib_per_linear_layer_per_slot=mamba_mib_per_linear_layer_per_slot)
         except _p_card.PCutRecutRefused as exc:
             log(f"{_p_card.CARD_MARKER} {exc}")
             raise Weg2LaunchRefused(str(exc)) from None
@@ -20687,12 +20887,22 @@ def derived_family_cost(ns, cards: Sequence["Card"], families, chunk_tokens: int
     )
     live = tuple(card_identity.inventory_signature(cards))
     lin, att = [], []
-    for c in live:
+    for j, c in enumerate(live):
         idx = [i for i, k in enumerate(cal) if k == c]
         if not idx:
-            raise Weg2LaunchRefused(
-                f"{card_identity.CODE_UNCALIBRATED}: stage card class {c} has no measured twin in "
-                f"[{', '.join(cal)}]; the P-cut family cost is not derived across classes")
+            text = (f"{card_identity.CODE_UNCALIBRATED}: stage card class {c} has no measured twin in "
+                    f"[{', '.join(cal)}]; the P-cut family cost is not derived across classes")
+            # AP2 1006 (the AP1 W19 rule, Q-710): --force borrows the cost of the
+            # calibrated class of the SAME ARCH (sm_86 -> RTX3080, sm_120 -> RTX5090),
+            # named UNMEASURED; no twin of the arch (sm_89) stays refused.
+            twin = card_identity.arch_twin_class(cards[j]) if j < len(cards) else None
+            idx = [i for i, k in enumerate(cal) if twin and k == twin]
+            if not idx:
+                raise Weg2LaunchRefused(text)
+            _refuse_value_once(
+                card_identity.CODE_UNCALIBRATED,
+                text + f"  --force BORROWS the per-layer cost of class {twin} (same arch) for this stage: "
+                "UNMEASURED here (HW-UNCALIBRATED).")
         lin.append(max(ref_cost.linear_ms_per_layer[i] for i in idx))
         att.append(max(ref_cost.attn_ms_per_layer_at_ref[i] for i in idx))
     cost = _pp_cut.FamilyDepthCost(
@@ -21379,7 +21589,7 @@ def solve_p_cut(
     # one PPProxyTensors hidden-states frame, [chunk, hidden] in the model
     # dtype. Derived here from the same three numbers rather than restated.
     payload_bytes = int(chunk_tokens) * int(text_cfg["hidden_size"]) * 2
-    lanes = pcie_lanes(cards)
+    lanes = forced_lane_borrow(cards, pcie_lanes(cards), log)
     pair_ms = per_pair_crossing_ms(lanes, payload_bytes)
     log(
         "PP-CUT depth axis: design_prefix=%d tokens (%s); calibration prefix "

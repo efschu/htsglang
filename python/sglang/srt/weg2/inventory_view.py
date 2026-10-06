@@ -173,6 +173,66 @@ def derive_vector(policy: str, value, calibrated: Sequence[str], live: Sequence[
     return None
 
 
+def role_index(j: int, n_live: int, n_cal: int) -> Optional[int]:
+    """The ROLE rule as an index: live ordinal ``j`` of ``n_live`` takes the
+    calibrated ordinal of the same role -- 0 (first: rank 0 / PP0 holds the
+    embedding, D-TP0 the host role), ``n_cal - 1`` (last: the head), any other
+    the first middle one (1). None when a role cannot be placed (fewer than
+    two ordinals on either side)."""
+    if n_live < 2 or n_cal < 2 or not 0 <= j < n_live:
+        return None
+    if j == 0:
+        return 0
+    if j == n_live - 1:
+        return n_cal - 1
+    return 1 if n_cal > 2 else n_cal - 1
+
+
+def borrow_vector(policy: Optional[str], value, calibrated: Sequence[str], live: Sequence[str],
+                  twins: Optional[Mapping[str, str]] = None):
+    """AP2 1006 (Q-710, flags instead of code): the FORCED borrow -- only ever
+    called for a boot that went past ``HW-UNCALIBRATED`` with ``--force``.
+
+    :func:`derive_vector` first (a subset keeps its derivation); where it has no
+    answer:
+
+    * ``class-max`` / ``class-min``: each live card takes the max/min over the
+      calibrated cards of ITS class even when the class occurs more often live
+      than calibrated (2 x 5090 + 2 x 3080 from [5090, 3080, 3080]); a live card
+      of NO calibrated class takes the class ``twins`` names for it (the AP1
+      arch twin, ``card_identity.arch_twin_class``: sm_86 -> RTX3080, sm_120 ->
+      RTX5090); no twin -> None;
+    * ``role`` / ``uniform`` / NO policy (the NF records, measured per rank or
+      stage on the reference rig): the ROLE rule by ordinal (:func:`role_index`);
+    * ``consumer`` / ``cut-gated`` / ``advisory`` / ``cut-pin``: as derive_vector.
+
+    Every borrowed value is UNMEASURED on this inventory; the launcher names it
+    (HW-UNCALIBRATED FORCED-PAST). None when not even a borrow exists."""
+    got = derive_vector(policy, value, calibrated, live) if policy is not None else None
+    if got is not None:
+        return got
+    vec = _as_list(value)
+    if vec is None or len(vec) != len(calibrated):
+        return None
+    n = len(live)
+    if policy in (CLASS_MAX, CLASS_MIN):
+        pick = max if policy == CLASS_MAX else min
+        out = []
+        for c in live:
+            k = c if c in calibrated else (twins or {}).get(c)
+            same = [vec[i] for i, kk in enumerate(calibrated) if kk == k and vec[i] is not None]
+            if not same:
+                return None
+            out.append(pick(same, key=_num))
+        return _render(value, out)
+    if policy in (None, ROLE, UNIFORM):
+        idx = [role_index(j, n, len(vec)) for j in range(n)]
+        if any(i is None for i in idx):
+            return None
+        return _render(value, [vec[i] for i in idx])
+    return None
+
+
 @dataclass(frozen=True)
 class Assessment:
     """Which positional values of a profile are derivable for a live inventory."""
@@ -224,17 +284,27 @@ def vector_derivable(flag: str, count: int, calibrated: Sequence[str],
 # the active view: profile_constant reads it (weg2/form.py)
 
 _ACTIVE: Optional[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = None
+#: AP2 1006: the FORCED borrow of this launch -- ``(record names, twins)``: the
+#: positional records :func:`apply_active` reads through :func:`borrow_vector`
+#: (set only for a boot forced past HW-UNCALIBRATED; None otherwise).
+_BORROW: Optional[Tuple[frozenset, Dict[str, str]]] = None
 
 
-def set_active(profile: str, calibrated: Sequence[str], live: Sequence[str]) -> None:
-    """Install the view of this launch (``live`` differs from ``calibrated``)."""
-    global _ACTIVE
+def set_active(profile: str, calibrated: Sequence[str], live: Sequence[str], *,
+               borrow: Optional[Sequence[str]] = None,
+               twins: Optional[Mapping[str, str]] = None) -> None:
+    """Install the view of this launch (``live`` differs from ``calibrated``).
+    ``borrow`` (AP2 1006, ``--force`` only): the positional record names read
+    through :func:`borrow_vector` instead of :func:`derive_vector`."""
+    global _ACTIVE, _BORROW
     _ACTIVE = (str(profile), tuple(calibrated), tuple(live))
+    _BORROW = None if borrow is None else (frozenset(borrow), dict(twins or {}))
 
 
 def clear_active() -> None:
-    global _ACTIVE
+    global _ACTIVE, _BORROW
     _ACTIVE = None
+    _BORROW = None
 
 
 def active() -> Optional[Tuple[str, Tuple[str, ...], Tuple[str, ...]]]:
@@ -251,6 +321,9 @@ def apply_active(name: str, profile: str, value):
     if tuple(calibrated) == tuple(live):
         return value
     pol = RECORD_POLICY.get(name)
+    if _BORROW is not None and name in _BORROW[0]:
+        got = borrow_vector(pol, value, calibrated, live, _BORROW[1])
+        return value if got is None else got
     if pol is None:
         return value
     got = derive_vector(pol, value, calibrated, live)
