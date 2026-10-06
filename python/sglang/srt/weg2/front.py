@@ -13942,8 +13942,19 @@ class Front:
         # DASHBOARD-AUS-IPC (a): the begin as a record (IPC thread, not on the flip).
         # The woken group's first work is timed from here (armed at the begin, not at
         # `done`: with the tail overlap D can stream before the front logs `done`).
-        self._ipc_publish("flip_begin", {"epoch_before": self.epoch, "sleep": src, "wake": dst,
-                                         "flip_begin_ts": round(t_flip0, 3)})
+        _fb = {"epoch_before": self.epoch, "sleep": src, "wake": dst, "flip_begin_ts": round(t_flip0, 3)}
+        if src == "P" and dst == "D":
+            # DASHBOARD flipzeit 06.10. (marker only, no behaviour): the P->D mirror of the D->P ``idle_flip``
+            # (DpFlipClock.begin): nothing is waiting for D at the begin, so the Flipzeit does not count this flip
+            try:
+                from sglang.srt.weg2 import front_state_ipc as _fsi_idle
+
+                _fb["idle_flip"] = _fsi_idle.pd_idle_flip(
+                    len(self._ready_for_d), int(self._handoff_in_flight()),
+                    len(self.groups["D"].outstanding), len(self.__dict__.get("_d_parked") or ()))
+            except Exception:  # noqa: BLE001 -- an instrument never breaks the flip
+                pass
+        self._ipc_publish("flip_begin", _fb)
         _fw_none = self._ipc_first_work_clock().arm(self.epoch + 1, src, dst, t_flip0)
         Front._flip_phase(self).layer(f"{src}>{dst}", t_flip0, Front._flip_vorlauf_reason(self, src, dst))
         Front._ipc_live_kick(self)

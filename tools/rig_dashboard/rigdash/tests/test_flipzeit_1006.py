@@ -183,11 +183,22 @@ class OneNumberOneSet(unittest.TestCase):
         server.App.flip_zeit(app, boots, NOW)
         ue, _, boot = self.tiles()
         self.assertEqual(_numbers(live["flip_zeit"]), _numbers(ue))
-        self.assertNotIn("flip_boot", live)                                  # a live boot is a card, not a list row
+        # the Ueberblick switch "seit Boot": a live boot gets the same function over [its start, now]
+        self.assertEqual(live["flip_boot"]["window"]["label"], "seit Boot")
+        self.assertEqual(_numbers(live["flip_boot"]), _numbers(self.tiles()[2]))
+        self.assertEqual(live["flip_zeit"]["window"]["label"], "letzte 60 min")
         self.assertEqual(_numbers(done["flip_boot"]), _numbers(boot))
         self.assertEqual(server.lean_boot(done)["flip_boot"], done["flip_boot"])
         # the list row carries no ring figure of its own any more
         self.assertNotIn("flip_last", server.lean_boot(done))
+
+    def test_overview_switch_is_stored_and_both_windows_are_labelled(self):
+        html = open(os.path.join(STATIC, "index.html"), encoding="utf-8").read()
+        for needle in ('localStorage.getItem("rigdash.flipWin")', 'localStorage.setItem("rigdash.flipWin"',
+                       "function setFlipWin(", "flipWinOf = (b) =>", "seit Boot", "60 min"):
+            self.assertIn(needle, html, needle)
+        # no tile reads b.flip_zeit directly any more: the switch decides the window
+        self.assertEqual(html.count("b.flip_zeit"), 3)           # flipWinOf + two comments
 
     def test_features_row_reads_the_same_tile(self):
         from rigdash import features
@@ -233,6 +244,27 @@ class DefinitionEndpoints(unittest.TestCase):
         self.assertIsNotNone(x["total_ms"])
         self.assertFalse(flipzeit.counted(x))
         self.assertEqual(flipzeit.from_views([x]), [])
+
+    def test_pd_flip_the_front_marks_idle_is_not_counted(self):
+        """Front marker flip_begin.idle_flip (front_state_ipc.pd_idle_flip: nothing waited for D at the begin, Nutzer
+        06.10.): the P>D row keeps its measured total and is a Leerlauf flip.  Without the marker the same flip counts."""
+        ring = base._ring_pd()
+        plain = ipcboot.flip_views(base.SEGS_PD, base._ipc_pd(), base.T + 60.0, ring, d_rounds=None)[0]
+        self.assertEqual(plain["kind"], "ok")
+        self.assertTrue(flipzeit.counted(plain))
+        idle_row = None
+        for marker, kind in ((True, "leerlauf"), (False, "ok")):
+            ipc = base._ipc_pd()
+            for e in ipc["ipc_events"]:
+                if e["type"] == "flip_begin":
+                    e["data"]["idle_flip"] = marker
+            x = ipcboot.flip_views(base.SEGS_PD, ipc, base.T + 60.0, ring, d_rounds=None)[0]
+            self.assertEqual(x["kind"], kind)
+            self.assertAlmostEqual(x["total_ms"], 2603, delta=1)          # measured either way
+            self.assertEqual(flipzeit.counted(x), kind == "ok")
+            idle_row = x if marker else idle_row
+        db = _db_from_views([idle_row])
+        self.assertEqual([m["kind"] for m in db.marks("NF", 0, base.T + 100)], ["flip_skip"])
 
     def test_real_provisional_row_is_not_counted(self):
         x = ipcboot.flip_views(base.SEGS, base._ipc_dp(), base.T + 60.0, base._ring(), d_rounds=base.D_ROUNDS, arrivals={})[0]

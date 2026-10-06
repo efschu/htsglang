@@ -304,8 +304,8 @@ class App:
     def flip_zeit(self, boots: list, now: float) -> None:
         """Nutzer 06.10.: THE Flipzeit figures of the page, one function (history.flip_tile -> flipzeit.tile) over the
         history marks.  Ueberblick: ``flip_zeit`` = the last flipzeit.OVERVIEW_S of the boot's model (all its boots);
-        Boot-Liste: ``flip_boot`` = the whole boot (start .. last sign of life) of a finished boot.  The Verlauf tile
-        is the same function over its own range."""
+        ``flip_boot`` = the whole boot (start .. last sign of life, "seit Boot" while it lives): the Boot-Liste row and
+        the Ueberblick switch.  The Verlauf tile is the same function over its own range."""
         by_model: dict = {}
         for b in boots:
             model = history.model_of_ipc(b.get("ipc") or {})
@@ -313,7 +313,11 @@ class App:
                 by_model[model] = history.flip_tile(self.hist, model, now - flipzeit.OVERVIEW_S, now,
                                                     flipzeit.window_label(flipzeit.OVERVIEW_S))
             b["flip_zeit"] = by_model[model]
-            if b.get("live") or b.get("first_t") is None:
+            if b.get("first_t") is None:
+                continue
+            if b.get("live"):
+                # Nutzer 06.10.: the Ueberblick switch "seit Boot": the same function, this boot's start .. now
+                b["flip_boot"] = history.flip_tile(self.hist, model, b["first_t"], now, "seit Boot")
                 continue
             hit = self.flip_boot_cache.get(b["stem"])
             if hit is None or (now - hit[0] >= 60.0 and (b.get("age_s") or 0) <= 1800.0):

@@ -853,6 +853,18 @@ function setPhaseSpan(v) {
   try { localStorage.setItem("rigdash.phaseSpan", String(v)); } catch (e) { /* private window */ }
   refresh(true);
 }
+// Nutzer 06.10.: Fenster der Flipzeit-Kachel im Überblick, Schalter "60 min" / "seit Boot" (beide: flipzeit.tile über die
+// Marken, b.flip_zeit bzw. b.flip_boot); der Wert bleibt wie die anderen Schalter der Seite im localStorage
+let flipWinMode = "60";
+try { flipWinMode = localStorage.getItem("rigdash.flipWin") === "boot" ? "boot" : "60"; } catch (e) { flipWinMode = "60"; }
+function setFlipWin(v) {
+  flipWinMode = v === "boot" ? "boot" : "60";
+  try { localStorage.setItem("rigdash.flipWin", flipWinMode); } catch (e) { /* private window */ }
+  refresh(true);
+}
+const flipWinOf = (b) => (flipWinMode === "boot" ? b.flip_boot : b.flip_zeit) || {};
+const flipWinSwitch = () => `<span class="span">${[["60", "60 min"], ["boot", "seit Boot"]].map(([v, t]) =>
+  `<button type="button" class="${flipWinMode === v ? "sel" : ""}" onclick="setFlipWin('${v}')">${t}</button>`).join("")}</span>`;
 const dur = (s) => s < 90 ? fmt(s, s < 10 ? 1 : 0) + " s" : fmt(s / 60, 1) + " min";
 function phaseName(k, single) { return single && k === "P" ? "Prefill" : (PHASE[k] || [k])[0]; }
 /* DEPTH-BEGIN -- Nutzer 02.10. ~12:04Z/~12:15Z: beim Hover nicht nur wie viele Token, sondern
@@ -1312,7 +1324,7 @@ function bootCard(b, now, binders) {
   const topo = topoSrc ? Object.entries(topoSrc).map(([g, t]) => `${g}: TP${t.tp || 1}${t.pp > 1 ? "·PP" + t.pp : ""}`).join(", ") : "";
   const q = fr ? fr.queue : (b.queue ? b.queue.queue : null);
   // Flipzeit (Nutzer 06.10.): EINE Berechnung (flipzeit.py, b.flip_zeit = Fenster der Überblick-Kachel), Balken = die gezählten Flips
-  const recent = ((b.flip_zeit || {}).recent || []).filter((r) => r.ms != null);
+  const recent = (flipWinOf(b).recent || []).filter((r) => r.ms != null);
   let flipHtml = "";
   if (recent.length) {
     const mx = Math.max(...recent.map((r) => r.ms), 1);
@@ -1349,7 +1361,7 @@ function bootCard(b, now, binders) {
         <div class="state">${lastFlip ? `letzter ${esc(lastFlip.slept)}→${esc(lastFlip.woke)} vor ${ago(now - lastFlip.t)}` : "noch kein Flip"}</div>
         ${kv([
           ...["P>D", "D>P"].map((dir) => {
-            const fz = b.flip_zeit || {}, f = flipWin(fz, dir), miss = flipMissing(b, dir);
+            const fz = flipWinOf(b), f = flipWin(fz, dir), miss = flipMissing(b, dir);
             return [`<b>Flipzeit ${dir.replace(">", "&rarr;")}</b> <span class="muted" title="${esc(FLIP_DEF[dir])}">(letzte)</span>`,
               (miss ? `<b>neuester: ${miss}</b>` + (f.n ? "<br>" : "") : "")
               + (f.n ? `<b>${sec(f.last_ms)} s</b> <span class="muted">&middot; ${flipStats(f)} &middot; ${esc(flipWinLabel(fz))}${f.idle_n ? " &middot; Leerlauf-Flips " + f.idle_n : ""}</span><br><span class="muted">${flipParts(f, dir)}</span>`
@@ -1764,12 +1776,12 @@ function actKey(b) {
   return {P: "P", single: "P", D: "D", dec: "dec"}[p.k] || "";
 }
 function flipKpi(b, dir, now) {
-  const fz = b.flip_zeit || {}, f = flipWin(fz, dir), dg = ((b.flip_diag || {})[dir]) || {};
+  const fz = flipWinOf(b), f = flipWin(fz, dir), dg = ((b.flip_diag || {})[dir]) || {};
   const miss = flipMissing(b, dir);
   const sub = [miss ? `<b>neuester Flip: ${miss}</b>` : null,
     f.n ? flipParts(f, dir) : (b.flip_count ? "noch kein gezählter Flip im Fenster" : "noch kein Flip"),
     f.n ? `<span class="muted">${ago(now - f.last_t)} her &middot; ${flipStats(f)}</span>` : null,
-    `<span class="muted">${esc(flipWinLabel(fz))} (alle Boots dieses Modells)</span>`,
+    `<span class="muted">${esc(flipWinLabel(fz))}${flipWinMode === "60" ? " (alle Boots dieses Modells)" : " (dieser Boot)"}</span> ${flipWinSwitch()}`,
     dg.missing_n ? `<span class="muted">${dg.missing_n} Flips mit fehlendem Endpunkt im 16-min-Ring, nicht gezählt</span>` : null,
     f.idle_n ? `<span class="muted">Leerlauf-Flips (kein Prefill/Decode stand an): ${f.idle_n}, nicht gezählt</span>` : null].filter(Boolean).join("<br>");
   return kpi(`Flipzeit ${dir.replace(">", "&rarr;")} &middot; letzte`, miss && !f.n ? {na: miss} : f.n ? sec(f.last_ms) : null, "s", sub,

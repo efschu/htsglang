@@ -891,6 +891,10 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                     row["kind"], row["missing"] = "fehlt", F_PD_START
             else:
                 row["kind"] = "ok"
+            if bd.get("idle_flip"):
+                # the front's marker (front_state_ipc.pd_idle_flip, Nutzer 06.10.): nothing waited for D at the begin --
+                # the user's exception, the flip is not a Flipzeit (the total, if measured, stays on the row)
+                row["kind"], row["missing"] = "leerlauf", None
         else:
             u = next((x for x in ut if fd.get("epoch") is not None and x.get("epoch") == fd.get("epoch")), None) or \
                 next((x for x in ut if (x.get("prefill_start_ts") or 0) >= b and (nxt is None or (x.get("prefill_start_ts") or 0) < nxt)), None)
