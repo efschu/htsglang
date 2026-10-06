@@ -112,6 +112,10 @@ NON_LOG_ALLOWED = {
     ("redact.py", "df4644c1bdda"): "schneidet das Passwort aus scheme://user:pass@host in einem Issue-Text; liest keine Logzeile",
     ("redact.py", "30650dce59ee"): "schneidet lange Token-Laeufe hinter = oder : aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "b598ffb1ba83"): "schneidet absolute Pfade (/root/..., /spinning/..., /var/lib/...) aus einem Text, der in ein öffentliches Issue kommt; liest keine Logzeile",
+    # AP-I Fix-Runde 4: JWT, nackte Token-Laeufe (Freitext, Tabellenzelle) und ein ganzer Wert als Token-Lauf aus dem Issue-Text schneiden
+    ("redact.py", "231d7a884f21"): "schneidet ein JWT (eyJ....) aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "39494d8580a4"): "schneidet lange Token-Laeufe ohne = / : davor aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "d02b41e88f24"): "prueft, ob ein ganzer Wert fuer eine Tabellenzelle ein einziger langer Token-Lauf ist; liest keine Logzeile",
 }
 
 

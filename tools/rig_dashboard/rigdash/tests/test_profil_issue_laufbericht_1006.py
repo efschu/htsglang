@@ -389,6 +389,88 @@ class Redaction(Base):
             self.assertNotIn(long_tok, out, form)
             self.assertIn("<entfernt>", out, form)
 
+    # ---- Fix-Runde 4: jeder Ausgabepfad des Laufberichts mit derselben Sonde (Praefix-loses Token, JWT, Hostpfade) ----
+    TOK = "Zq8vN3kLp0Wm7Rt2Yx5Bc9Df4Gh6Jk1Ls"                           # 33 Zeichen, gemischt, kein Anbieter-Praefix
+    TOK_LOW = "a1b2c3d4e5f60718293a4b5c6d7e8f90"                       # 32 Zeichen klein, hex-artig (kein SHA: 32 != 40/64)
+    JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    PATHS = ("/nvme/hf", "/workspace/models/Qwen", "~/cache/hf", "/scratch/run1", "/models/Qwen3-27B", "$HOME/x/y")
+    # Teilstrings, die NIE im Text stehen duerfen (die Ordner davor); die letzte Pfadkomponente darf bleiben
+    PATH_LEAKS = ("/nvme", "/workspace", "~/", "/scratch", "/models/", "$HOME", "cache/hf", "models/Qwen", "x/y")
+
+    def assert_clean(self, t, where):
+        for bad in (self.TOK, self.TOK_LOW, self.JWT, self.JWT.split(".")[1], self.JWT.split(".")[2]) + self.PATH_LEAKS:
+            self.assertNotIn(bad, t, "%s: %s" % (where, bad))
+
+    def test_probe_in_env_value_flag_value_and_proposal(self):
+        # Befund 1/2/3: Wert OHNE ``=`` in einer Tabellenzelle, harmloser Name; Env-Wert, Flag-Wert, Vorschlag, Profilwert
+        edits = [{"key": "env:P:MY_THING", "op": "set", "value": self.TOK}, {"key": "env:D:OTHER_THING", "op": "set", "value": self.TOK_LOW},
+                 {"key": "env:P:JWT_THING", "op": "set", "value": self.JWT},
+                 {"key": "env:P:HF_HOME", "op": "set", "value": "/nvme/hf"}, {"key": "env:D:CACHE_ONE", "op": "set", "value": "~/cache/hf"},
+                 {"key": "env:D:CACHE_TWO", "op": "set", "value": "$HOME/x/y"},
+                 {"key": "flag:--model", "op": "set", "value": "/workspace/models/Qwen"},
+                 {"key": "flag:--download-dir", "op": "set", "value": "/scratch/run1"},
+                 {"key": "flag:--extra-thing", "op": "set", "value": self.TOK}]
+        doc = self.edited([e for e in edits if not e["key"].startswith("flag:--extra")])
+        doc["meta"]["planner"]["env:P:MY_THING"] = self.TOK                # auch der Vorschlag-Wert
+        t = self.report(doc=doc, dry=None)["text"]
+        self.assert_clean(t, "Tabellen")
+        row = next(x for x in t.split("\n") if x.startswith("| `env:P:MY_THING`"))
+        self.assertEqual(row.count("<entfernt>"), 2, row)
+        self.assertIn("<hostpfad>/hf", next(x for x in t.split("\n") if x.startswith("| `env:P:HF_HOME`")))
+        self.assertIn("<hostpfad>/Qwen", next(x for x in t.split("\n") if "--model" in x and x.startswith("| `flag:")))
+        # die Zeile bleibt, nur das Geheimnis ist weg
+        self.assertIn("`env:D:OTHER_THING`", t)
+        # der Wert ohne Zeilenkontext (so reicht ihn _issue_cell weiter)
+        self.assertEqual(redact.value_for_issue("MY_THING", self.TOK), "<entfernt>")
+        self.assertEqual(redact.value_for_issue("MY_THING", "`%s`" % self.TOK), "<entfernt>")
+        self.assertEqual(redact.value_for_issue("MY_THING", self.TOK_LOW), "<entfernt>")
+        self.assertEqual(redact.value_for_issue("MY_THING", self.JWT), "<entfernt>")
+
+    def test_probe_in_free_text_notes_verdict_rejection_hardware_model_and_var(self):
+        dry = {"ok": False, "verdict": "Planer lehnt ab: %s und %s" % (self.TOK, self.PATHS[0]),
+               "notes": ["Token %s im Log" % self.TOK_LOW, "JWT %s" % self.JWT, "Cache bei %s und %s" % (self.PATHS[2], self.PATHS[3]),
+                         "Modell %s" % self.PATHS[1], "Home %s" % self.PATHS[5]],
+               "rejections": [{"code": "HW-COUNT", "text": "HW-COUNT: Pfad %s, Token %s, Home %s" % (self.PATHS[4], self.TOK, self.PATHS[2])}],
+               "cards": [{"label": "RTX 3080 20 GB"}]}
+        hw = dict(HW, cards=[dict(HW["cards"][0], name="NVIDIA RTX 5090 %s %s %s %s" % (self.TOK, self.JWT, self.PATHS[0], self.PATHS[2]))])
+        model = json.loads(json.dumps(MODEL))
+        model["weights"]["note"] = "%s %s" % (self.TOK, self.PATHS[1])
+        model["path"] = "/nvme/models/Qwen3.8-27B"
+        doc = self.edited([{"key": "var:PROFILE_OWNER", "op": "set", "value": "x %s %s %s" % (self.TOK, self.JWT, self.PATHS[0])}])
+        vers = dict(VERSIONS, image="reg/x:1 %s /nvme/img" % self.TOK, driver="575 ~/drv")
+        t = self.report(doc=doc, dry=dry, hardware_md=hwprofil.issue_short(hw), model=model, versions=vers)["text"]
+        self.assert_clean(t, "Freitext")
+        self.assertIn("Qwen3.8-27B", t)                                   # nur der Ordnername des Modells, wie bisher
+
+    def test_probe_in_the_force_and_docker_run_blocks(self):
+        dry = {"ok": False, "verdict": "x", "notes": [], "cards": [],
+               "rejections": [{"code": "PROFIL-STATUS", "text": "PROFIL-STATUS: %s %s" % (self.TOK, "/nvme/hf")}]}
+        t = self.report(dry=dry)["text"]
+        self.assert_clean(t, "Force")
+        use = self.ed.use_hint("demo", dry=dry)
+        self.assert_clean("\n".join(use["docker_run"]) + use["text"], "docker run")
+
+    def test_paths_rules(self):
+        for src, want in (("/nvme/hf", "<hostpfad>/hf"), ("x /workspace/models/Qwen y", "x <hostpfad>/Qwen y"), ("~/a/b", "<hostpfad>/b"),
+                          ("$HOME/a", "<hostpfad>/a"), ("--model=/nvme/m", "--model=<hostpfad>/m"), ("/scratch", "<hostpfad>/scratch"),
+                          ("/root/x", "<Pfad entfernt>"), ("/app/python", "/app/python"), ("POST /api/profil/issue", "POST /api/profil/issue")):
+            self.assertEqual(redact.paths(src), want, src)
+        for keep in ("https://host.example/a/b", "ja/nein", "GB/s", "RTX 3080 / 5090", "a / b", "1/2", "~", "25 %"):
+            self.assertEqual(redact.paths(keep), keep, keep)
+        once = redact.text_for_issue("p=/nvme/hf ~/x")
+        self.assertEqual(redact.text_for_issue(once), once)               # zweimal gelaufen (Hardware-Block, dann Gesamttext) aendert nichts
+
+    def test_jwt_and_bare_runs(self):
+        for form in (self.JWT, "Bearer-frei " + self.JWT, "x=" + self.JWT, "| a | %s |" % self.JWT, "token " + self.TOK, "| a | %s |" % self.TOK_LOW):
+            out = redact.text_for_issue(form)
+            self.assertNotIn(self.JWT, out, form)
+            self.assertNotIn(self.TOK, out, form)
+            self.assertNotIn(self.TOK_LOW, out, form)
+            self.assertIn("<entfernt>", out, form)
+        for keep in ("task-runner-big-name-0123456789-abcdef", "173161c595de23e0aa11bb22cc33dd44ee55ff66", "sha256:" + "ab12" * 16,
+                     "SGLANG_WEG2_LANE_COVERAGE_TOKEN_X_Y_Z_0123456789", "eyJ", "eyJ.a.b", "Qwen3.6-27B-AWQ-BF16-INT4-some-very-long-variant-name-v2"):
+            self.assertEqual(redact.text_for_issue(keep), keep, keep)
+
     def test_names_ending_in_a_credential_word_are_secrets_singular_and_plural(self):
         for n in ("OPENAI_API_KEYS", "MY_KEYS", "HF_AUTH", "--auth", "DB_PASS", "--pass", "MY_SECRETS", "DB_PASSWORDS", "SERVICE_CREDENTIALS", "GH_PAT",
                   "HF_TOKENS", "--auth-tokens", "--credential"):

@@ -45,9 +45,28 @@ def guard(body: str) -> str:
 _HOSTPATH = re.compile(r"(?<![\w.:/-])/(?:home|root|spinning|opt|var|usr|tmp|mnt|srv|etc|data|run|media|nix|proc|sys|dev)(?:/[^\s|`,;)\]\"'<>]*)*")
 
 
+# Every OTHER absolute path (``/nvme/hf``, ``/workspace/models/X``, ``/scratch``) and every ``~/`` / ``$HOME/`` path is a host path too: the Laufbericht
+# shows no path outside the container.  Exempt: the mount points the image itself owns (``CONTAINER_MOUNTS``, ``/app`` = the baked tree).  Everything
+# else shrinks to ``<hostpfad>/<last segment>``; the first pass above keeps its older, stricter ``<Pfad entfernt>`` for the system roots.
+CONTAINER_MOUNTS = ("/app", "/api")                                # ``/api/...`` = a dashboard URL route (the report names them), not a directory
+_PATHTAIL = r"[^\s|`,;)\]\"'<>]*"
+_ANYPATH = re.compile(r"(?<![\w.:/>~<$-])/(?![/\s])" + _PATHTAIL)
+_HOMEPATH = re.compile(r"(?<![\w.:/>~<$-])(?:~|\$\{HOME\}|\$HOME)(?:/" + _PATHTAIL + r")+")
+
+
+def _shrink(m) -> str:
+    p = m.group(0)
+    if any(p == c or p.startswith(c + "/") for c in CONTAINER_MOUNTS):
+        return p
+    last = p.rstrip("/").rsplit("/", 1)[-1].strip(".")
+    return "<hostpfad>/" + last if last and last not in ("~", "$HOME", "${HOME}") else "<hostpfad>"
+
+
 def paths(text: str) -> str:
-    """Replace absolute host paths (``/root/...``, ``/spinning/...``, ``/var/lib/...``) by ``<Pfad entfernt>``."""
-    return _HOSTPATH.sub("<Pfad entfernt>", text or "")
+    """Replace absolute host paths: the system roots (``/root/...``, ``/spinning/...``, ``/var/lib/...``) by ``<Pfad entfernt>``, any other absolute
+    path and any ``~/...`` path by ``<hostpfad>/<last segment>`` (``CONTAINER_MOUNTS``: the image's ``/app`` and the URL routes ``/api/...`` stay)."""
+    text = _HOSTPATH.sub("<Pfad entfernt>", text or "")
+    return _ANYPATH.sub(_shrink, _HOMEPATH.sub(_shrink, text))
 
 
 # a secret recognised by the FORM of its value, whatever the entry is called (a user can name an env anything: ``OPENAI_API_KEYS``, ``HF_AUTH``,
@@ -61,6 +80,22 @@ _URLCRED = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@]*:)[^\s/@]+@")
 # a long token-looking run right after ``=`` or ``:`` (env / flag lines): >= 32 of [A-Za-z0-9_-], no dot or slash (so model names and paths are not
 # runs), see ``_looks_like_secret`` for what is spared (git SHAs, sha256 digests, UPPER_CASE names).
 _LONGRUN = re.compile(r"(?<=[=:])([ \t]*[`\"']?)([A-Za-z0-9_\-]{32,})(?![A-Za-z0-9_\-./])")
+# a JWT (three base64url parts, the header starts ``eyJ``): the dots keep it from being a run, so it has its own shape
+_JWT = re.compile(r"(?<![A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]*")
+# a long token with NO ``=`` / ``:`` before it (free text, a bare table cell): only the forms no name or hash has -- pure letters+digits (not a 40/64-hex
+# SHA), or separators with upper AND lower case AND a digit.  A lowercase hyphenated name (``task-runner-big-name-0123456789``) stays.
+_BARERUN = re.compile(r"(?<![A-Za-z0-9_\-./])[A-Za-z0-9_\-]{32,}(?![A-Za-z0-9_\-./])")
+
+
+def _bare_secret(run: str) -> bool:
+    if not _looks_like_secret(run):
+        return False
+    if run.isalnum():
+        return True
+    return any(c.isupper() for c in run) and any(c.islower() for c in run) and any(c.isdigit() for c in run)
+
+
+_FULLRUN = re.compile(r"[A-Za-z0-9_\-]{32,}\Z")
 
 
 def _looks_like_secret(run: str) -> bool:
@@ -77,7 +112,9 @@ def shapes(text: str) -> str:
     text = _URLCRED.sub(lambda m: m.group(1) + "<entfernt>@", text or "")
     text = _BEARER.sub("Bearer <entfernt>", text)
     text = _VENDOR.sub("<entfernt>", text)
-    return _LONGRUN.sub(lambda m: m.group(1) + ("<entfernt>" if _looks_like_secret(m.group(2)) else m.group(2)), text)
+    text = _JWT.sub("<entfernt>", text)
+    text = _LONGRUN.sub(lambda m: m.group(1) + ("<entfernt>" if _looks_like_secret(m.group(2)) else m.group(2)), text)
+    return _BARERUN.sub(lambda m: "<entfernt>" if _bare_secret(m.group(0)) else m.group(0), text)
 
 
 def text_for_issue(text: str) -> str:
@@ -161,4 +198,10 @@ def value_for_issue(name: str, value) -> str:
     """The value of a named entry for a pasted issue: ``<entfernt>`` when the name says secret, else the value with secrets and host paths cut."""
     if secret_name(name):
         return "<entfernt>"
-    return text_for_issue(str(value if value is not None else ""))
+    text = str(value if value is not None else "")
+    bare = text.strip().strip("`\"'")
+    # a whole value that is one long token run is a secret whatever the entry is called (``MY_THING`` = ``Zq8v...``): the ``=`` / ``:`` the shape layer
+    # looks for is not there when the value is cut out of its line and set into a table cell
+    if _FULLRUN.match(bare) and _looks_like_secret(bare):
+        return "<entfernt>"
+    return text_for_issue(text)
