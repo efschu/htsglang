@@ -628,6 +628,15 @@ def census_from_logs(
             "dormant_proc_used_mib": int(mib),
             "dormant_source": source,
         }
+        # AP2 1006: the card class the row was measured on (AP4's optional field,
+        # xchg_residency.resolve_census): on another inventory a card of the same
+        # class borrows THIS row instead of the census's heaviest (a 5090 image lent
+        # to a 3080 is 24330 MiB on a 20480 MiB board -- W71 at N = 4).
+        from sglang.srt.weg2 import card_identity as _ci
+
+        _cls = _ci.class_label(card)
+        if _cls and _cls != "-":
+            entries[uuid]["card_class"] = _cls
     bounds: List[str] = []
     for group in GROUPS:
         glog = ring_table.parse_group_log(os.path.join(evidence_dir, f"{stem}.{group}.log"))
