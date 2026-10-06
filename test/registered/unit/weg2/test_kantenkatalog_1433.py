@@ -177,7 +177,7 @@ APG_PAIRS = (
 # only a real raise is schliesst_aus; --rank-kv-ratio never touches the weight split, so there is NO skaliert_mit edge tp-ratio -> kv-ratio.
 APG_REL = {
     ("--dual-share", "--dual-layout"): "braucht", ("--flip-weights", "--dual-layout"): "abgeleitet_von",
-    ("--idle-layout", "--dual-layout"): "schliesst_aus", ("--dual-layout", "--weg2-d-adopt"): "schliesst_aus",
+    ("--idle-layout", "--dual-layout"): "abgeleitet_von", ("--dual-layout", "--weg2-d-adopt"): "schliesst_aus",
     ("--rank-kv-ratio", "--rank-tp-ratio"): "braucht",
 }
 

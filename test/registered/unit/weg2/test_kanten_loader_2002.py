@@ -93,7 +93,7 @@ class RealCatalog(unittest.TestCase):
 
     def test_new_edges_are_appended_with_source_katalog(self):
         d = self.dep("--idle-layout", "--dual-layout")  # K44, not curated
-        self.assertEqual((d["quelle"], d["kante"], d["rel"]), ("katalog", "K44", "schliesst_aus"))
+        self.assertEqual((d["quelle"], d["kante"], d["rel"]), ("katalog", "K44", "abgeleitet_von"))
         self.assertEqual(d["effect"], d["satz"])
 
     def test_a_different_relation_keeps_the_curated_one_and_names_the_catalog_one(self):

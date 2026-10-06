@@ -6522,7 +6522,7 @@
    ],
    "bare": true,
    "choices": null,
-   "cost": "Kein Flip; verweigert --weg2-d-adopt on und --idle-layout pp.",
+   "cost": "Kein Flip; verweigert --weg2-d-adopt on; ein gesetztes --idle-layout pp wird auf tp umgestellt (kein Verweigern).",
    "default": false,
    "depends": [
     {
@@ -12549,14 +12549,14 @@
      },
      "belegt": true,
      "calc": "text",
-     "effect": "Das Idle-Layout ist eine Flip-Regel; das Dual-Layout flippt nie -- der Launcher zwingt 'pp' deshalb zurück auf 'tp' und sagt es.",
+     "effect": "Das Idle-Layout ist eine Flip-Regel; das Dual-Layout flippt nie -- der Start setzt --idle-layout selbst auf 'tp' (ein gesetztes 'pp' wird umgestellt und im Log genannt: pp -> tp) -- kein Verweigern, sondern ein erzwungener Wert.",
      "kante": "K44",
      "quelle": "katalog",
-     "rel": "schliesst_aus",
-     "satz": "Das Idle-Layout ist eine Flip-Regel; das Dual-Layout flippt nie -- der Launcher zwingt 'pp' deshalb zurück auf 'tp' und sagt es.",
+     "rel": "abgeleitet_von",
+     "satz": "Das Idle-Layout ist eine Flip-Regel; das Dual-Layout flippt nie -- der Start setzt --idle-layout selbst auf 'tp' (ein gesetztes 'pp' wird umgestellt und im Log genannt: pp -> tp) -- kein Verweigern, sondern ein erzwungener Wert.",
      "to": "--dual-layout",
      "to_kind": "flag",
-     "wert": "pp"
+     "wert": "tp"
     }
    ],
    "gain": "Ruhe auf P bedient die erste Anfrage ohne Flip.",
