@@ -18,6 +18,13 @@ Vektorlaenge = Mismatch; fehlender Partner innerhalb der Frist = Hang).
 
 Rot/Gruen: ``xfail(strict=True)`` = der Fall ist ROT (der Fehlerfall ist belegt), und der
 Test faellt auf, sobald er gruen wird. Siehe done/1536-bericht.md.
+
+nf-next-1006-16 (Rang-Gleichschritt-Fix): ``runtime_tick`` reicht dem Raum-Cache von ``_room_ok``
+jetzt ``incoming + chunk_live`` (replizierter Bit: ``chunked_req`` lebt) statt ``incoming + rest``
+(rang-lokal gelesen). a3c/a4 sind damit Pflicht-gruen (vorher xfail strict); a5 bleibt xfail strict
+(K2-vorbestehend, anderer Spaltpunkt: ``used``, der Eintritt in ``_room_ok``). a6..a9 pruefen den
+Fix selbst: Cache bleibt ohne chunked_req aktiv, Preis in Kollektiven, Zusammenspiel mit 1540
+(``load_back`` rang-lokal) und die F6-Kollektiv-Spaltung (nur wenn F6 im Baum ist).
 """
 from __future__ import annotations
 
@@ -244,9 +251,11 @@ def test_a3b_without_the_1528_rest_the_same_state_is_rank_uniform(group, monkeyp
     assert len(set(rv.count())) == 1, rv.count()
 
 
-@pytest.mark.xfail(strict=True, reason="1536 (a): K>1 cache of _room_ok keyed on need/incoming+rest; "
-                   "rest 0 on one rank, >0 on two -> collective count differs (d_seat_vram.py _room_ok)")
-def test_a3c_rest_zero_on_one_rank_positive_on_two_k64_collective_count_diverges(group, monkeypatch):
+def test_a3c_rest_zero_on_one_rank_positive_on_two_k64_collective_count_is_uniform(group, monkeypatch):
+    """1536 a3c, nf-next-1006-16: with the cache primed (RECHECK_ROUNDS=64) a rank whose own ``rest``
+    is 0 while two peers hold rest > 0 used to be served from the cache while the peers read the
+    group collective (Hang: collective #0 without partners). The bypass bit is now ``chunked_req``
+    alive (replicated), not the rank-local ``rest``: every rank reads."""
     dsv, scheds, rv = group
     _primed_cache(dsv, scheds, rv, monkeypatch, 64)
     for i, s in enumerate(scheds):
@@ -259,9 +268,8 @@ def test_a3c_rest_zero_on_one_rank_positive_on_two_k64_collective_count_diverges
 # ---------------------------------------------------------------------------
 # (c') the same hazard for the cache hit at the chunk END (rest -> 0 skewed by one tick)
 # ---------------------------------------------------------------------------
-@pytest.mark.xfail(strict=True, reason="1536 (a): one rank finishes the chunked_req one tick earlier "
-                   "(rest 0) while the peers still hold rest>0 with a primed cache")
-def test_a4_chunk_end_one_tick_apart_diverges(group, monkeypatch):
+def test_a4_chunk_end_one_tick_apart_is_uniform(group, monkeypatch):
+    """Same hazard at the chunk END: one rank sees rest 0 one tick before its peers."""
     dsv, scheds, rv = group
     _primed_cache(dsv, scheds, rv, monkeypatch, 64)
     for i, s in enumerate(scheds):
@@ -271,8 +279,9 @@ def test_a4_chunk_end_one_tick_apart_diverges(group, monkeypatch):
     assert len(set(rv.count())) == 1, rv.count()
 
 
-@pytest.mark.xfail(strict=True, reason="1536 (a): PRE-EXISTING in K2, not introduced by 1528: a chunked_req alive "
-                   "on two ranks and gone on one splits `used` and so the entry into _room_ok")
+@pytest.mark.xfail(strict=True, reason="1536 (a): K2-vorbestehend, anderer Spaltpunkt (`used`): a chunked_req alive "
+                   "on two ranks and gone on one splits `used` and so the entry into _room_ok; not 1528, "
+                   "not solved by nf-next-1006-16 (chunk_live is the bit INSIDE _room_ok)")
 def test_a5_k2_behaviour_chunked_req_alive_on_two_ranks_only_already_diverges(group, monkeypatch):
     dsv, scheds, rv = group
     _pending_s0(dsv, scheds, rv)
@@ -282,6 +291,159 @@ def test_a5_k2_behaviour_chunked_req_alive_on_two_ranks_only_already_diverges(gr
     errs = _tick(dsv, scheds)
     assert errs == [None] * N, [repr(e) for e in errs]
     assert len(set(rv.count())) == 1, rv.count()
+
+
+# ---------------------------------------------------------------------------
+# (d) nf-next-1006-16: the fix itself -- bypass bit = chunked_req alive, price, 1540, F6
+# ---------------------------------------------------------------------------
+def _decode_only_cache(dsv, scheds, rv, monkeypatch, k=64, ticks=4):
+    """K>1, NO chunked_req, one running request, nothing queued: the cache the 1528 comment
+    wants to keep (a pure decode round under an unchanged pending cap)."""
+    monkeypatch.setenv("SGLANG_WEG2_D_MEM_RECHECK_ROUNDS", str(k))
+    _pending_s0(dsv, scheds, rv)
+    for s in scheds:
+        s.token_to_kv_pool_allocator = _alloc(list(range(100, 200)))   # room 6400 tokens
+        s.running_batch.reqs = [_req("weg2-1-1", 1000, 10)]
+        s.chunked_req = None
+    for _ in range(ticks):
+        assert _tick(dsv, scheds) == [None] * N
+    rv.reset()
+
+
+def _room_stats(scheds, dsv):
+    return [(fr["room_reads"], fr["room_cached"]) for fr in
+            (getattr(s, dsv.MEM_SCHED_ATTR)._weg2_floor_room for s in scheds)]
+
+
+def test_a6_without_a_chunked_req_the_room_cache_still_serves_a_decode_round(group, monkeypatch):
+    """The fix must not cost the cache its job (nf-y6k 01.10.: a pending shrink re-read the group
+    every decode round). chunk_live = 0 on every rank -> the cached verdict is reused, ZERO
+    collectives in that tick, on every rank alike."""
+    dsv, scheds, rv = group
+    _decode_only_cache(dsv, scheds, rv, monkeypatch)
+    before = _room_stats(scheds, dsv)
+    assert _tick(dsv, scheds) == [None] * N
+    after = _room_stats(scheds, dsv)
+    assert rv.count() == [0, 0, 0], rv.count()
+    assert [a[1] - b[1] for a, b in zip(after, before)] == [1, 1, 1], (before, after)
+
+
+def test_a7_price_collectives_per_tick_by_chunk_state(group, monkeypatch):
+    """The price of the bypass, counted (not argued): FRESH ROOM READS (= group collectives of
+    ``_room_ok``) PER RANK per tick under a pending cap with the cache primed (K=64); the total
+    collective count must be the same on every rank in every tick. No chunked_req: 0 (two ticks,
+    both served from the cache). A live chunked_req with rest > 0: 1 per tick (as before the fix).
+    A live chunked_req whose prefix is complete (rest 0): 1 per tick, four ticks -- the case the
+    cache used to serve in the third tick (a new key re-reads after 1, 2, 4 rounds), i.e. the whole
+    price of the fix (measured on 369f31e2e2: [1, 1, 0, 1] for it).
+    (Other collectives -- the periodic floor re-read -- are not the subject and are not counted.)"""
+    dsv, scheds, rv = group
+    _decode_only_cache(dsv, scheds, rv, monkeypatch)
+    per_state = {}
+    for name, done, n_ticks in (("none", None, 2), ("live_rest_830", 2176, 4), ("live_rest_0", 3006, 4)):
+        for s in scheds:
+            s.chunked_req = None if done is None else _chunked("weg2-54-290", 3006, done)
+        ticks = []
+        for _ in range(n_ticks):
+            rv.reset()
+            before = _room_stats(scheds, dsv)
+            assert _tick(dsv, scheds) == [None] * N
+            assert len(set(rv.count())) == 1, (name, rv.count())
+            reads = {a[0] - b[0] for a, b in zip(_room_stats(scheds, dsv), before)}
+            assert len(reads) == 1, (name, reads)
+            ticks.append(reads.pop())
+        per_state[name] = ticks
+    assert per_state == {"none": [0, 0], "live_rest_830": [1] * 4, "live_rest_0": [1] * 4}, per_state
+
+
+def test_a8_1540_load_back_is_rank_local_and_changes_no_collective_count(group, monkeypatch):
+    """1540 tick change (``chunk_admit_tokens(..., load_back=_queued_load_back(admissible))``) next to
+    the 1536 bit: the host load-back extent is stamped at each rank's OWN match (22000 on TP0, 0 on
+    TP1, 8000 on TP2) while a chunked_req is alive with rest 800/0/800 (``need`` 24864 / 4160 / 12960
+    per rank). One fresh room read each (equal collective counts), no Hang, and the group MIN lifts
+    the cap on every rank because TP0's room (22400) cannot pay its own need."""
+    dsv, scheds, rv = group
+    _primed_cache(dsv, scheds, rv, monkeypatch, 64)
+    for i, s in enumerate(scheds):
+        s.token_to_kv_pool_allocator = _alloc(list(range(10, 360)) + list(range(600, 700)))  # 22400
+        r = _req("weg2-62-415", 24000)
+        r.pp_load_back_extent = (22000, 0, 8000)[i]
+        s.waiting_queue = [r]
+        s.chunked_req = _chunked("weg2-54-290", 1500, 700 if i != 1 else 1500)
+    rv.reset()
+    before = _room_stats(scheds, dsv)
+    errs = _tick(dsv, scheds)
+    assert errs == [None] * N, [repr(e) for e in errs]
+    assert len(set(rv.count())) == 1, rv.count()
+    assert [a[0] - b[0] for a, b in zip(_room_stats(scheds, dsv), before)] == [1, 1, 1]
+    assert _state(dsv, scheds) == [(True, FLOOR_LADDER[1])] * N
+
+
+def test_a8b_the_load_back_skew_alone_keeps_every_rank_in_the_same_collective(group, monkeypatch):
+    """Same skew, no chunked_req, cache primed on a queued head (incoming > 0 is the other
+    bypass bit and is replicated): still one fresh room read on every rank."""
+    dsv, scheds, rv = group
+    _decode_only_cache(dsv, scheds, rv, monkeypatch)
+    for i, s in enumerate(scheds):
+        s.token_to_kv_pool_allocator = _alloc(list(range(10, 360)) + list(range(600, 700)))
+        r = _req("weg2-62-415", 24000)
+        r.pp_load_back_extent = (22000, 0, 8000)[i]
+        s.waiting_queue = [r]
+    rv.reset()
+    before = _room_stats(scheds, dsv)
+    assert _tick(dsv, scheds) == [None] * N
+    assert len(set(rv.count())) == 1, rv.count()
+    assert [a[0] - b[0] for a, b in zip(_room_stats(scheds, dsv), before)] == [1, 1, 1]
+
+
+@pytest.mark.parametrize("group_env,stage_tokens", [("", None), ("P", None), ("D", None)])
+def test_a9_flip_unchanged_no_stage_form_never_reaches_the_new_bit(monkeypatch, group_env, stage_tokens):
+    """27B / P / a D without stage form leave ``runtime_tick`` before the lift block: a live
+    chunked_req costs no collective, builds no machine and ``chunk_live`` is never read."""
+    from test_weg2_d_mem_sched_0929 import _no_side_effects
+
+    from sglang.srt.weg2 import d_seat_vram as dsv
+
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", group_env)
+    monkeypatch.setenv("SGLANG_OPT_WEG2_D_SEAT_VRAM", "1")
+    monkeypatch.delenv("SGLANG_WEG2_D_KV_STAGE_TOKENS", raising=False)
+    hits, sched = _no_side_effects(monkeypatch, dsv)
+
+    class _Probe(types.SimpleNamespace):
+        reads = 0
+
+        def __getattribute__(self, name):
+            if name == "chunked_req":
+                type(self).reads += 1
+            return super().__getattribute__(name)
+
+    probe = _Probe(**vars(sched))
+    probe.chunked_req = _chunked("weg2-54-290", 3006, 2176)
+    setattr(probe, dsv.PHASE_ATTR, dsv.PhaseState(epoch="e", n=6, cap=6, done=True))
+    for _ in range(3):
+        assert dsv.runtime_tick(probe) is None
+    assert hits == [] and _Probe.reads == 0
+    assert not hasattr(probe, dsv.MEM_SCHED_ATTR)
+
+
+def test_a10_f6_seat_move_verdict_enters_the_same_collective_on_every_rank(group, monkeypatch):
+    """F6 (desk/nf-f6-grow-lift-1534 300c17669b, NOT in this tree): ``d_seat_rewake.round_boundary`` of
+    a moved seat runs ``cap_lift_after_seat_move`` -> the same ``_room_ok``. Same state as a3c
+    (primed cache, rest 830/0/830) through the seat-move path: red on F6 without the fix, green with
+    it. Skipped while F6 is not in the tree (the resume test: apply F6, then this runs)."""
+    dsv, scheds, rv = group
+    if not hasattr(dsv, "cap_lift_after_seat_move"):
+        pytest.skip("F6 (cap_lift_after_seat_move) is not in this tree; see done/nf-next-1006-16-bericht.md")
+    from sglang.srt.weg2 import d_seat_rewake as R
+
+    _primed_cache(dsv, scheds, rv, monkeypatch, 64)
+    monkeypatch.setattr(R, "tick", lambda s: "grow")             # the seat moved: the stage tick is skipped
+    for i, s in enumerate(scheds):
+        s.chunked_req = _chunked("weg2-54-290", 3006, 2176 if i != 1 else 3006)
+    res = lockstep(scheds, R.round_boundary)
+    assert [e for _v, e in res] == [None] * N, [repr(e) for _v, e in res]
+    assert [v for v, _e in res] == ["grow"] * N
+    assert len(set(rv.count())) == 1 and rv.count()[0] >= 1, rv.count()
 
 
 # ---------------------------------------------------------------------------

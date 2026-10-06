@@ -2886,8 +2886,14 @@ def runtime_tick(sched):
         rest = _chunked_rest(sched)
         nxt = min(rest, chunk) if chunk > 0 else rest
         need = first + nxt + len(rids) * max(1, page)
+        # NF 1536: the cache bypass of ``_room_ok`` (``incoming <= 0``) must be a
+        # RANK-UNIFORM bit. ``rest`` is read from the rank's own prefix_indices /
+        # extend_range: 0 on one rank and > 0 on another would send one rank to the
+        # group collective and the other to its cache (collective #0 without partners).
+        # A live chunked_req is replicated (it is in ``used``), so the bit is that.
+        chunk_live = 1 if getattr(sched, "chunked_req", None) is not None else 0
         lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need,
-                              incoming + rest, len(rids), page)
+                              incoming + chunk_live, len(rids), page)
     ms._cap_lifted = lifted
     if lifted:
         fr["lifted_since"] = True
