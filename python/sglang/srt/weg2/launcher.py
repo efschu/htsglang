@@ -22888,10 +22888,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="X-CURVES 1006 (user 06.10.: only fixed and curve): how the front sets X. "
                          "fixed = --tp-prefill-max-tokens for the whole boot, no live re-solve; curve = "
                          "X PER REQUEST from --x-curves (the D/P prefill curves and the flip price of "
-                         "this model x form x hardware), D's W50 riegel sized to the curves' envelope "
-                         "(a manual --x-ceiling-tokens beside it is refused, W195). Unset = the front "
-                         "exactly as before the flag, argv byte-identical. Refused in the dual layout "
-                         "(W197).")
+                         "this model x form x hardware); --x-ceiling-tokens beside it clamps X from "
+                         "above (user 06.10.), D's W50 riegel = the LOWER of the curves' envelope and "
+                         "that ceiling. Unset = the front exactly as before the flag, argv "
+                         "byte-identical. Refused in the dual layout (W197).")
     ap.add_argument("--x-curves", default=None,
                     help="X-CURVES: the curve file (weg2-x-curves/1, tools/build_x_curves.py). Only "
                          "with --x-mode curve (W194 otherwise); absent/unreadable W190, "
