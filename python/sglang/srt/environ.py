@@ -744,6 +744,16 @@ class Envs:
     # max_live_id falls. A pure function of the replicated call count (never wall time), so every D
     # rank holds the same list. Inert outside the dual layout + group D. 0 = off (default).
     SGLANG_WEG2_DUAL_D_LOW_FIRST = EnvInt(0)
+    # D-COMPACT (dual262kbar1fs10061152: P's KV grant waited 473 s because two running seats held D rows
+    # 198716/198717 and the D-KV span shrinks only from the top): when P has waited past
+    # SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S and live rows above the shrink target hold the span, every D rank
+    # moves them (KV bytes of all layers, owner-class preserving under uneven DCP; req_to_token, tree values,
+    # prefix_indices, DFlash draft rows via the alias carry) to free ids below the target and shrinks in the
+    # same tick. Three group collectives (plan fingerprint / copy ok / new floor), rollback before any
+    # reference changes, named REFUSED otherwise (weg2/dual_d_compact.py). DEFAULT ON, but inert outside
+    # SGLANG_WEG2_DUAL_LAYOUT=1 + group D + SGLANG_WEG2_DUAL_D_KV_MAX_TOKENS > 0; 0 = off. The module reads
+    # os.environ itself.
+    SGLANG_WEG2_DUAL_D_COMPACT = EnvBool(True)
     # #1420r DEFER-REARM (desk 1420 point 5): D-HANDBACK-DEFER is single-shot -- the one re-read lands
     # empty while P's write-through of the tail anchor is still in flight, the second W31 spends the
     # mark and the request goes back over P (second prefill, ~58 s). N > 0 = a mark whose read has
