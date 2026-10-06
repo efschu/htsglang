@@ -38,6 +38,7 @@ process other than the in-process ``launcher.main``.  GPU-free, NVML-free, Docke
 from __future__ import annotations
 
 import contextlib
+import gzip
 import hashlib
 import io
 import json
@@ -481,6 +482,9 @@ LIVE_BOX_RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     # boot_*.D.log of this form:`` stays in the text, so the day a D log of THIS form exists (an anchor is found, the
     # message changes, the plan moves) the diff goes red -- which is a real plan change.
     ("w65-d-log-enumeration", re.compile(r"(?<=no boot_\*\.D\.log of this form: ).*")),
+    # the D-RANK VRAM fraction solve prints its own WALL TIME (``1295 Budget-Loesungen in 0.2 s``; 0.2-0.5 s between two
+    # runs of the same plan on 2026-10-06): a clock reading, not a plan value.  The count before it stays.
+    ("solver-wall-time", re.compile(r"(?<=Budget-Loesungen in )[\d.]+(?= s)")),
 )
 
 
@@ -747,9 +751,35 @@ DEFAULT_MODEL_SIBLINGS: Mapping[str, Sequence[str]] = {
 #: ``*.safetensors.index.json``); a bigger non-safetensors file is recorded by SIZE only
 SNAPSHOT_COPY_MAX = 4 << 20
 _SNAPSHOT_SCHEMA = "planer-oracle-checkpoint-snapshot/1"
+#: the mtime every materialised stub file carries (2026-09-26 23:00:00 UTC: the host files' own day, a constant)
+SNAPSHOT_MTIME_NS = 1790463600 * 10**9
 
 
-def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = None) -> str:
+#: stored blobs above this size are gzip-compressed (deterministic: mtime 0), so a snapshot of a 160 GB checkpoint (33 MB
+#: of safetensors headers, a 25 MB index) is a few MB in the tree, not 58
+SNAPSHOT_GZ_MIN = 64 << 10
+
+
+def _store_blob(path: str, data: bytes) -> bool:
+    """Write ``data`` to ``path`` (gzip to ``path + '.gz'`` above ``SNAPSHOT_GZ_MIN``); True when compressed."""
+    if len(data) <= SNAPSHOT_GZ_MIN:
+        with open(path, "wb") as out:
+            out.write(data)
+        return False
+    with open(path + ".gz", "wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0) as out:
+        out.write(data)
+    return True
+
+
+def _load_blob(path: str, gz: bool) -> bytes:
+    if gz:
+        with gzip.open(path + ".gz", "rb") as fh:
+            return fh.read()
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = None, source: Optional[str] = None) -> str:
     """Record what the launcher's dry run reads of a checkpoint directory, WITHOUT the weights: every ``*.safetensors``
     file as its header bytes (``8 + N``: the length word and the JSON) plus its size, every small other file verbatim,
     every big other file as a size.  The launcher takes per-tensor bytes from the headers and on-disk sizes from
@@ -758,7 +788,10 @@ def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = N
 
     Run it on a box that HAS the checkpoint; the snapshot (header bytes only, a few MB) is committed as a fixture and the
     golden of that profile then runs anywhere.  Returns ``out_dir``; ``name`` (default: the directory name) is the
-    registry name the stub is rebuilt under -- the calibration identity is the directory NAME."""
+    registry name the stub is rebuilt under -- the calibration identity is the directory NAME.  ``source`` (default: the
+    absolute ``model_dir``) is the provenance string written to the manifest; pass it when ``model_dir`` is a local header
+    mirror of a checkpoint that lives elsewhere (e.g. read over ssh).  A ``*.safetensors.index.json`` is ALWAYS copied
+    verbatim whatever its size (the launcher reads its ``weight_map``/``total_size``; a 25 MB index is real input)."""
     import struct
 
     src = os.path.abspath(model_dir)
@@ -783,16 +816,17 @@ def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = N
                 hdr = raw + fh.read(n)
             if len(hdr) != 8 + n or 8 + n > size:
                 raise ValueError("%s: header of %d bytes does not fit the file (%d bytes)" % (path, 8 + n, size))
-            with open(os.path.join(files_dir, fn + ".hdr"), "wb") as out:
-                out.write(hdr)
-            entries.append({"name": fn, "size": size, "kind": "header", "sha256_header": hashlib.sha256(hdr).hexdigest()})
-        elif size <= SNAPSHOT_COPY_MAX:
-            shutil.copyfile(path, os.path.join(files_dir, fn))
-            entries.append({"name": fn, "size": size, "kind": "copy"})
+            gz = _store_blob(os.path.join(files_dir, fn + ".hdr"), hdr)
+            entries.append({"name": fn, "size": size, "kind": "header", "sha256_header": hashlib.sha256(hdr).hexdigest(),
+                            **({"gz": True} if gz else {})})
+        elif size <= SNAPSHOT_COPY_MAX or fn.endswith(".safetensors.index.json"):
+            with open(path, "rb") as fh:
+                gz = _store_blob(os.path.join(files_dir, fn), fh.read())
+            entries.append({"name": fn, "size": size, "kind": "copy", **({"gz": True} if gz else {})})
         else:
             entries.append({"name": fn, "size": size, "kind": "zero"})
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
-        json.dump({"schema": _SNAPSHOT_SCHEMA, "name": name, "source": src, "skipped_dirs": skipped_dirs,
+        json.dump({"schema": _SNAPSHOT_SCHEMA, "name": name, "source": source or src, "skipped_dirs": skipped_dirs,
                    "files": entries}, fh, indent=1, sort_keys=True)
         fh.write("\n")
     return out_dir
@@ -815,14 +849,19 @@ def materialize_checkpoint(snapshot_dir: str, dest_parent: str) -> str:
     os.makedirs(dest)
     for e in m["files"]:
         out = os.path.join(dest, e["name"])
+        gz = bool(e.get("gz"))
         if e["kind"] == "copy":
-            shutil.copyfile(os.path.join(snapshot_dir, "files", e["name"]), out)
+            with open(out, "wb") as fh:
+                fh.write(_load_blob(os.path.join(snapshot_dir, "files", e["name"]), gz))
         else:
             with open(out, "wb") as fh:
                 if e["kind"] == "header":
-                    with open(os.path.join(snapshot_dir, "files", e["name"] + ".hdr"), "rb") as hf:
-                        fh.write(hf.read())
+                    fh.write(_load_blob(os.path.join(snapshot_dir, "files", e["name"] + ".hdr"), gz))
                 fh.truncate(int(e["size"]))
+        # a FIXED mtime: the launcher's L3 weights fingerprint (``l3_weights_fingerprint``) hashes (name, size, mtime_ns)
+        # of the weight files, which names the store dir and the persisted identity in the plan -- a stub built "now"
+        # would move that line on every run (measured 2026-10-06: two runs, two different dir hashes)
+        os.utime(out, ns=(SNAPSHOT_MTIME_NS, SNAPSHOT_MTIME_NS))
     return dest
 
 
@@ -925,11 +964,29 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
         nd = farm(argv[i + 1], "draft")
         if nd != argv[i + 1]:
             argv[i + 1] = nd
+    # the model/draft dirs are ALSO named inside the quoted --extra-p/--extra-d/--extra values (NF:
+    # ``--speculative-draft-model-path $PROFILE_DRAFT``, which the launcher prices at W128 from the draft's own headers):
+    # a dir that was stood in for is stood in for EVERYWHERE the argv (and the profile's environment) names it
+    subs: Dict[str, str] = {}
+    env = dict(li.env)
+    for what, orig in (("model", li.model), ("draft", li.draft)):
+        o = (orig or "").rstrip("/")
+        if o and (any(o in t for t in pre + argv) or any(o in str(v) for v in env.values())):
+            q = farm(o, what)
+            if q != o:
+                subs[o] = q
+    if subs:
+        def _sub(t: str) -> str:
+            for o, q in subs.items():
+                t = t.replace(o, q)
+            return t
+        pre, argv = [_sub(t) for t in pre], [_sub(t) for t in argv]
+        env = {k: _sub(str(v)) for k, v in env.items()}
     if farmed and "--weg2-xchg-census" in argv and "--weg2-xchg-census-foreign" not in argv:
         pre += ["--weg2-xchg-census-foreign"]
         notes.append("--weg2-xchg-census-foreign added (the census names the registry path, the farm is another path)")
     final = pre + argv + list(extra_args)
-    res = run_dry_run(final, devices, tree=tree, env=li.env, force=force, tag=tag, scratch=scratch, farm_root=farm_root,
+    res = run_dry_run(final, devices, tree=tree, env=env, force=force, tag=tag, scratch=scratch, farm_root=farm_root,
                       evidence_dir=evidence_dir)
     return ProfileRun(res, li, final, notes)
 

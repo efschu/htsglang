@@ -24,31 +24,33 @@ The profiles are SNAPSHOTS under ``fixtures/planer_1006/profiles`` (copies of ``
 box-bound like every dry-run golden of this directory (they carry the census/evidence files and the sibling checkpoint
 headers of this box); the tests SKIP, with the reason, where those inputs are absent.
 
-NF (abl form, R9): ``launch_nf-int4-h6-abl.json`` (the argv and environment of the abl profile) is pinned here.  The
-DRY-RUN golden ``plan_nf_abl_n3.txt`` is NOT in the tree YET: on the box that produced this file the NF checkpoint dirs
-(``Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp`` and the MTP draft ``...albucino-abl-wxp``) are EMPTY mount
-points (and no copy, no ZFS snapshot, no recorded header exists anywhere on it), and the launcher refuses the plan at W128
-(draft header unreadable) -- a refusal of the missing data, not a plan.  Nothing is guessed to fill the gap (a sibling
-checkpoint has other tensors, hence other bytes).  The way to the golden is two commands on the box that HAS the checkpoints;
-the header snapshots (a few MB, committed under ``fixtures/planer_1006/checkpoints/<registry name>/``) then make the golden
-run on ANY box, because the launcher reads headers and ``stat`` sizes only and :func:`propose_oracle.materialize_checkpoint`
-rebuilds exactly those (``TestCheckpointSnapshot`` proves the stub is the checkpoint as far as the census can tell)::
+NF (abl form, R9): ``launch_nf-int4-h6-abl.json`` (the argv and environment of the abl profile) and the DRY-RUN golden
+``plan_nf_abl_n3.txt`` are pinned.  The NF checkpoint dirs (``Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp`` and
+the MTP draft ``...albucino-abl-wxp``) are empty mount points on the dev LXC; the real files live on the Proxmox host
+(``/spinning/subvol-999-disk-0/spinning/llm_stuff/club-3090/models-cache/``).  What the launcher reads of a checkpoint is its
+headers and ``stat`` sizes only, so ``fixtures/planer_1006/checkpoints/<registry name>/`` holds the HEADER SNAPSHOTS
+(:func:`propose_oracle.snapshot_checkpoint`: safetensors header bytes, config/index verbatim, sizes; gzip above 64 KiB, ~4 MB
+for 164 GB of weights) taken read-only over ``ssh proxmox`` (no weight byte read; sha256 of every header, config and index in
+``golden/plan_nf_abl_n3.provenance.json`` and in the snapshot manifests) and :func:`propose_oracle.materialize_checkpoint`
+rebuilds exactly those, so the golden runs on ANY box (``TestCheckpointSnapshot`` proves the stub is the checkpoint as far as
+the census can tell).  The dry run with the snapshots is a full plan (rc=0, 376 lines, D parks a 1587 MiB solo draft priced
+from the draft snapshot's headers at W128) -- no refusal asks for weight bytes.  REGENERATE on a box that has the files
+(or after a header change on the host)::
 
     PYTHONPATH=python python3 -m sglang.srt.weg2.propose_oracle snapshot \\
-        --model-dir /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp \\
+        --model-dir <models-cache>/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp \\
         --out test/registered/unit/weg2/fixtures/planer_1006/checkpoints/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp
-    PYTHONPATH=python python3 -m sglang.srt.weg2.propose_oracle snapshot \\
-        --model-dir /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp \\
-        --out test/registered/unit/weg2/fixtures/planer_1006/checkpoints/Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp
+    (the same for ...MTP-INT4-g32-albucino-abl-wxp)
     CUDA_VISIBLE_DEVICES= PYTHONPATH=python python3 -m sglang.srt.weg2.propose_oracle golden \\
         --profile test/registered/unit/weg2/fixtures/planer_1006/profiles/nf-int4-h6-abl.env \\
         --replay test/registered/unit/weg2/fixtures/xchg_launch_replay_0911/nvml_devices_1378.json \\
-        --checkpoint-snapshot test/registered/unit/weg2/fixtures/planer_1006/checkpoints/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp \\
-        --checkpoint-snapshot test/registered/unit/weg2/fixtures/planer_1006/checkpoints/Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp \\
+        --checkpoint-snapshot test/registered/unit/weg2/fixtures/planer_1006/checkpoints/<model snapshot> \\
+        --checkpoint-snapshot test/registered/unit/weg2/fixtures/planer_1006/checkpoints/<draft snapshot> \\
         --out test/registered/unit/weg2/fixtures/planer_1006/golden/plan_nf_abl_n3.txt
 
-``test_nf_abl_dump_equals_golden`` runs (never skips) once those snapshots and the golden are committed; until then it
-SKIPS with this reason, which is the one open point of AP0.
+``test_nf_abl_dump_equals_golden`` never skips: a missing snapshot or golden FAILS it.  The model/draft dir is stood in for
+everywhere the argv names it, including inside the quoted ``--extra-p``/``--extra-d`` values
+(``--speculative-draft-model-path``).
 
 LIVE-BOX readings: besides the ``plan_diff.py:6-17`` list, W65 names every ``boot_*.D.log`` of the live evidence dir
 (834 names on 2026-10-06); that enumeration is masked (``LIVE_BOX_RULES``) and ``test_golden_does_not_move_when_the_
@@ -411,12 +413,15 @@ class TestDumpTools(unittest.TestCase):
         line = ("LIVE nonreclaim=4.67 raw_current=13.10 file_reclaimable=8.00 GiB | c_max=5.00 GiB size=5.03 GiB | "
                 "memavail=113.33 GiB anon=4.67 GiB shmem=0.00 GiB | free=264.1 GiB | which has 247.5 GiB free of | "
                 "against 264.1 GB free on | foreign_load_now=0.00 GiB | /dev/shm/weg2-xchg-1791275135/x | "
-                "WEG2-DRY-RUN-BOX-STATE at=2026-10-06T08:25:35Z | budget 26064 MiB total 32607\n"
+                "WEG2-DRY-RUN-BOX-STATE at=2026-10-06T08:25:35Z | budget 26064 MiB total 32607 | "
+                "1295 Budget-Loesungen in 0.2 s\n"
                 "  W65 Weg2MeasuredAnchor: no anchor, heuristic path stands: no boot_*.D.log of this form: "
                 "boot_weg2_a_1_0926_1.D.log: different model (/m/a); boot_weg2_b_2_0926_2.D.log: different model (none)")
         masked, counts = O.mask_live_box(line)
         self.assertEqual({k for k, v in counts.items() if v}, {n for n, _ in O.LIVE_BOX_RULES})
         self.assertIn("budget 26064 MiB total 32607", masked)
+        self.assertIn("1295 Budget-Loesungen in <solver-wall-time> s", masked)   # the count stays, the clock goes
+        self.assertNotIn("in 0.2 s", masked)
         self.assertIn("c_max=5.00 GiB", masked)                    # the ARC limit stays, only the live size goes
         self.assertNotIn("113.33", masked)
         self.assertNotIn("boot_weg2_a_1", masked)                  # the evidence-dir enumeration goes ...
@@ -629,14 +634,31 @@ class TestDryRunGolden(unittest.TestCase):
         self.assertTrue(any(k.startswith("WEG2-DUAL-SHARE") for k in p["kinds"]), sorted(p["kinds"]))
         self.assertNotIn("SGLANG_WEG2_DUAL_MPS_OPT_IN", os.environ)
 
-    @unittest.skipUnless(
-        _nf_checkpoint_present() and os.path.exists(os.path.join(GOLDEN, "plan_nf_abl_n3.txt")),
-        "NF abl checkpoints are empty mount points on this box, no header snapshot of them is committed and "
-        "plan_nf_abl_n3.txt was never generated (see the module docstring: `snapshot` + `golden` on the box that has them)",
-    )
     def test_nf_abl_dump_equals_golden(self):
+        self.assertTrue(_nf_checkpoint_present(), "NF abl header snapshots missing under fixtures/planer_1006/checkpoints")
+        self.assertTrue(os.path.isfile(os.path.join(GOLDEN, "plan_nf_abl_n3.txt")))
         run = _dump_of("nf-int4-h6-abl", O.read_replay(REPLAY_REF))
         _assert_zero_diff(self, "plan_nf_abl_n3.txt", run)
+        self.assertEqual(len(run.notes), 3)           # model stub, draft stub, census-foreign: nothing silent
+        self.assertEqual(run.result.forced, [])
+        self.assertTrue(any("d_draft_host=1587 MiB" in ln for ln in run.result.text.splitlines()))   # W128 priced, not refused
+
+    def test_nf_abl_golden_provenance(self):
+        """The golden names the profile and the checkpoint files it was made from, by sha256 (the three agree)."""
+        import hashlib
+
+        side = json.loads(_read(os.path.join(GOLDEN, "plan_nf_abl_n3.provenance.json")))
+        self.assertEqual(side["profile"]["sha256"], PROVENANCE["nf-int4-h6-abl.env"])
+        with open(_p("nf-int4-h6-abl"), "rb") as fh:
+            self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), side["profile"]["sha256"])
+        snaps = _snapshots()
+        for name, rec in side["checkpoints"].items():
+            self.assertIn(name, snaps)
+            with tempfile.TemporaryDirectory(prefix="ap0-prov-") as td:
+                stub = O.materialize_checkpoint(snaps[name], td)
+                for fn, want in rec["files_sha256_on_host"].items():
+                    with open(os.path.join(stub, fn), "rb") as fh:
+                        self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), want, "%s/%s" % (name, fn))
 
     def test_foreign_environment_does_not_leak_into_the_run(self):
         """A SGLANG_* / HTSGLANG_* variable of the surrounding process is not seen by the launcher, the profile's own env is,
