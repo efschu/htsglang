@@ -1199,6 +1199,22 @@ def _admission_wedge_recovery_threshold() -> float:
     return ADMISSION_WEDGE_RECOVERY_SECONDS
 
 
+def _wedge_alarm_threshold() -> float:
+    """deskq 52: seconds without a first token before the ADMISSION-WEDGE
+    alarm: SGLANG_ADMISSION_WEDGE_SECONDS, unset or non-positive = the
+    constant ``ADMISSION_WEDGE_SECONDS`` (20.0, as ever)."""
+    v = envs.SGLANG_ADMISSION_WEDGE_SECONDS.get()
+    return float(v) if v is not None and v > 0 else ADMISSION_WEDGE_SECONDS
+
+
+def _prefill_livelock_threshold() -> float:
+    """deskq 52: seconds without a decode round before the PREFILL-LIVELOCK
+    line: SGLANG_PREFILL_LIVELOCK_SECONDS, unset or non-positive = the
+    constant ``ADMISSION_WEDGE_SECONDS`` (20.0, as ever)."""
+    v = envs.SGLANG_PREFILL_LIVELOCK_SECONDS.get()
+    return float(v) if v is not None and v > 0 else ADMISSION_WEDGE_SECONDS
+
+
 def _wedge_queue_clock_on() -> bool:
     """deskq 1507: SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK (default off = the pre-fix verdict). Never raises."""
     try:
@@ -1310,6 +1326,7 @@ def check_admission_wedge_once(
         queued,
         running,
         age,
+        threshold=_wedge_alarm_threshold(),
         seconds_since_prefill_progress=seconds_since_prefill_progress,
     )
     detail = (
@@ -1352,6 +1369,7 @@ def check_admission_wedge_once(
             running,
             None if decode_stamp is None else _wedge_clock_age(decode_stamp, now, floor),
             seconds_since_prefill_progress,
+            threshold=_prefill_livelock_threshold(),
         )
         if live:
             detail = f"{detail} | {live_detail}"

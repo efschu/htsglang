@@ -2415,6 +2415,43 @@ class Envs:
     # without the dual-layout gate.
     SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK = EnvBool(False)
 
+    # deskq 52 (user decision 06.10.): switches and thresholds for the watchdogs that STOP the group or the process
+    # hard. Every default is today's behaviour byte for byte (switch on, threshold as before); an unset env changes
+    # nothing. A switch set to 0 keeps the watchdog's detection, its logging and its dumps and removes only the
+    # stop. WAIT_CAP_S of weg2_store_told.py and the request-abort watchdogs (H102, W88, client liveness) are not
+    # part of this block on purpose.
+    #
+    # Scheduler watchdog (WatchdogRaw, soft=False; --watchdog-timeout is its threshold): 1 = after the dump and 5 s,
+    # SIGQUIT to the parent process (kill_process_tree) as before; 0 = the timeout is dumped and logged (as the
+    # soft watchdog does) and the process lives on.
+    SGLANG_ENABLE_SCHEDULER_WATCHDOG_KILL = EnvBool(True)
+    # SubprocessWatchdog (engine.py): 1 = a scheduler/detokenizer child that exited non-zero makes the watchdog send
+    # SIGQUIT to its own process (cleanup, whole server down) as before; 0 = every death is still reported, nothing
+    # is signalled.
+    SGLANG_ENABLE_SUBPROCESS_WATCHDOG_KILL = EnvBool(True)
+    # Front W17 Weg2GroupDead: 1 = a group whose /health failed for >= SGLANG_WEG2_GROUP_DEAD_STREAK polls with a
+    # dead process (or a held rank) stops the front (STOP, 503) as before; 0 = the WEG2-HEALTH lines and the /health
+    # facts stay, the stop does not happen. Streak: consecutive failed polls (5 s apart) before W17 may fire
+    # (minimum 1).
+    SGLANG_WEG2_ENABLE_GROUP_DEAD_STOP = EnvBool(True)
+    SGLANG_WEG2_GROUP_DEAD_STREAK = EnvInt(2)
+    # Front W2 Weg2DrainStuck: 1 = this many W1 DrainRefused in a row stop the front as before; 0 = every W1 still
+    # refuses its flip and is logged, the stop never follows. Refusals: the "in a row" count (minimum 1).
+    SGLANG_WEG2_ENABLE_DRAIN_STUCK_STOP = EnvBool(True)
+    SGLANG_WEG2_DRAIN_STUCK_REFUSALS = EnvInt(3)
+    # Front CONTROLLER-DEAD (#1264): 1 = an exception that escapes an OPEN flip stops the front by name as before;
+    # 0 = the CONTROLLER-DEAD line and the traceback are written, the stop is not (the front then stays in
+    # 'flipping': the controller skips every later iteration).
+    SGLANG_WEG2_ENABLE_CONTROLLER_DEAD_STOP = EnvBool(True)
+    # Flip-stall detector (#1262 tier 3, feeds the deadman): a flip is named stalled after this many times the
+    # boot's last measured flip. Non-positive reads as the default 4.0.
+    SGLANG_WEG2_FLIP_STALL_SLACK = EnvFloat(4.0)
+    # Seconds without a first token (ADMISSION-WEDGE alarm, #699; it feeds the wedge status file, the recovery and
+    # the intake-stall handover) and seconds without a decode round (PREFILL-LIVELOCK, Q-698b). The poll cadence
+    # stays 10 s. Non-positive reads as the default 20.0.
+    SGLANG_ADMISSION_WEDGE_SECONDS = EnvFloat(20.0)
+    SGLANG_PREFILL_LIVELOCK_SECONDS = EnvFloat(20.0)
+
     # #788: per-rank admission-verdict trace. OFF by default -- it exists to
     # convert a MECHANISM proof into a captured value on one instrumented
     # boot, not to run permanently. Under PP every rank re-derives the

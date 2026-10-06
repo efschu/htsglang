@@ -652,6 +652,15 @@ class SidecarView:
 #: specimen it must catch overran by more than 100x (weg2t2a: 7 min against a
 #: 3-5 s flip).
 FLIP_STALL_SLACK = 4.0
+
+
+def flip_stall_slack() -> float:
+    """The slack the stall bound is derived with: ``SGLANG_WEG2_FLIP_STALL_SLACK``
+    (deskq 52), non-positive or unset = ``FLIP_STALL_SLACK`` (4.0, as ever)."""
+    v = envs.SGLANG_WEG2_FLIP_STALL_SLACK.get()
+    return float(v) if v is not None and v > 0 else FLIP_STALL_SLACK
+
+
 #: How often the stall watcher LOOKS.  A poll period, never the bound: the
 #: bound is derived per flip by `Front._flip_stall_bound_s`.  Matches the
 #: corridor sampler's existing cadence so the front gains no new timing
@@ -13890,8 +13899,8 @@ class Front:
                              "not flipping (%d in a row)",
                              src, len(S.outstanding), self.drain_deadline_s, sorted(S.outstanding)[:8],
                              self.counters.get("suspended_now", 0), self.drain_refusals_in_a_row)
-                if self.drain_refusals_in_a_row >= 3:
-                    self.do_stop("W2 Weg2DrainStuck", f"three W1 in a row on {src}: {sorted(S.outstanding)[:8]}")
+                if self.drain_stuck_should_stop():
+                    self.do_stop("W2 Weg2DrainStuck", f"{'three' if self.drain_refusals_in_a_row == 3 else self.drain_refusals_in_a_row} W1 in a row on {src}: {sorted(S.outstanding)[:8]}")
                 self._enter_state("serving")
                 return
         self.drain_refusals_in_a_row = 0
@@ -16030,12 +16039,59 @@ class Front:
                     )
                     self.counters["controller_dead"] += 1
                     logger.exception("controller error during flip: %s", e)
-                    self.do_stop(*verdict)
+                    if self.controller_dead_should_stop():
+                        self.do_stop(*verdict)
                 else:
                     logger.exception("controller error: %s", e)
 
+    def drain_stuck_should_stop(self) -> bool:
+        """W2's gate (deskq 52): enough W1 DrainRefused in a row
+        (``SGLANG_WEG2_DRAIN_STUCK_REFUSALS``, default 3) AND the stop not
+        switched off (``SGLANG_WEG2_ENABLE_DRAIN_STUCK_STOP``, default on).
+        Switched off, the W1 keeps refusing its flip and W2 is only logged."""
+        if self.drain_refusals_in_a_row < max(1, envs.SGLANG_WEG2_DRAIN_STUCK_REFUSALS.get()):
+            return False
+        if not envs.SGLANG_WEG2_ENABLE_DRAIN_STUCK_STOP.get():
+            logger.error(
+                "W2 Weg2DrainStuck suppressed (SGLANG_WEG2_ENABLE_DRAIN_STUCK_STOP=0): "
+                "%d W1 in a row -- no STOP", self.drain_refusals_in_a_row)
+            return False
+        return True
+
+    def controller_dead_should_stop(self) -> bool:
+        """CONTROLLER-DEAD's gate (deskq 52): the stop after a controller
+        exception inside an OPEN flip, unless
+        ``SGLANG_WEG2_ENABLE_CONTROLLER_DEAD_STOP=0`` (default on). Switched
+        off, the CONTROLLER-DEAD line and the traceback are written and the
+        front stays in 'flipping'."""
+        if not envs.SGLANG_WEG2_ENABLE_CONTROLLER_DEAD_STOP.get():
+            logger.error(
+                "WEG2-FLIP CONTROLLER-DEAD stop suppressed "
+                "(SGLANG_WEG2_ENABLE_CONTROLLER_DEAD_STOP=0): state stays 'flipping'")
+            return False
+        return True
+
     def group_dead_should_stop(self, *, state: str, ok: bool, alive: bool,
                                streak: int, hold: bool = False) -> bool:
+        """W17's gate as the pollers call it: the verdict of
+        :meth:`_group_dead_verdict`, unless the stop is switched off
+        (``SGLANG_WEG2_ENABLE_GROUP_DEAD_STOP=0``, deskq 52: default on = the
+        verdict as ever). Off, a verdict that would have stopped is logged
+        (ERROR, the streak's own cadence) and nothing stops; the WEG2-HEALTH
+        lines and the /health facts are untouched."""
+        stop = self._group_dead_verdict(
+            state=state, ok=ok, alive=alive, streak=streak, hold=hold)
+        if stop and not envs.SGLANG_WEG2_ENABLE_GROUP_DEAD_STOP.get():
+            if streak <= 12 or streak % 12 == 0:
+                logger.error(
+                    "W17 Weg2GroupDead suppressed (SGLANG_WEG2_ENABLE_GROUP_DEAD_STOP=0): "
+                    "state=%s http_ok=%s process_alive=%s streak=%d hold=%s -- no STOP",
+                    state, ok, alive, streak, hold)
+            return False
+        return stop
+
+    def _group_dead_verdict(self, *, state: str, ok: bool, alive: bool,
+                            streak: int, hold: bool = False) -> bool:
         """W17's gate, ONE decision for the poller.
 
         #1378 xsn39 (measured): the flip legs RUN in the groups' event loops
@@ -16056,7 +16112,8 @@ class Front:
         """
         if hold:
             return True
-        if streak < 2:
+        # deskq 52: the streak is SGLANG_WEG2_GROUP_DEAD_STREAK (default 2).
+        if streak < max(1, envs.SGLANG_WEG2_GROUP_DEAD_STREAK.get()):
             return False
         if health_is_serving_fact(ok, alive):
             return False
@@ -16274,12 +16331,13 @@ class Front:
         detector can arm would leave the first flip of each direction
         unwatched -- which is the specimen.
         """
+        slack = flip_stall_slack()
         for rec in reversed(self.flip_log):
             ms = float(rec.get("flip_ms") or 0.0)
             if ms > 0:
                 return (
-                    FLIP_STALL_SLACK * ms / 1000.0,
-                    f"{FLIP_STALL_SLACK:.0f}x this boot's last measured flip "
+                    slack * ms / 1000.0,
+                    f"{slack:g}x this boot's last measured flip "
                     f"({rec.get('sleep')}->{rec.get('wake')}, {ms:.0f} ms)",
                 )
         return (
