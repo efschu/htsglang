@@ -35,21 +35,21 @@ class TestSupplement(unittest.TestCase):
     def test_the_launcher_register_is_not_changed_and_has_neither_code(self):
         self.assertEqual(len(refusals.REGISTER), 22)
         codes = {r.code for r in refusals.REGISTER}
-        for c in ("W71", "W64", "W71-CENSUS", "W64-DUAL-D"):
+        for c in ("W71", "W64", "W71-CENSUS", "W64-OPPOINT", "W64-DUAL-D"):
             self.assertNotIn(c, codes)
 
     def test_w71_and_w64_are_classified_by_their_own_code(self):
         a = PV.classify_exception("Weg2XchgResidencyUnarmable", W71_MSG)
         b = PV.classify_exception("Weg2TpOperatingPointInfeasible", W64_MSG)
         self.assertEqual((a["kind"], a["code"], a["launcher_code"]), ("ablehnung", "W71-CENSUS", "W71"))
-        self.assertEqual((b["kind"], b["code"], b["launcher_code"]), ("ablehnung", "W64-DUAL-D", "W64"))
+        self.assertEqual((b["kind"], b["code"], b["launcher_code"]), ("ablehnung", "W64-OPPOINT", "W64"))
 
     def test_other_launcher_codes_stay_unclassified(self):
         c = PV.classify_exception("Weg2PCutRecutRefused", "W167 Weg2PCutRecutRefused: x")
         self.assertEqual(c["code"], "LAUNCHER-UNKLASSIFIZIERT")
 
     def test_the_verdict_carries_class_not_forceable_reason_and_source(self):
-        for exc, msg, code in (("Weg2XchgResidencyUnarmable", W71_MSG, "W71-CENSUS"), ("Weg2TpOperatingPointInfeasible", W64_MSG, "W64-DUAL-D")):
+        for exc, msg, code in (("Weg2XchgResidencyUnarmable", W71_MSG, "W71-CENSUS"), ("Weg2TpOperatingPointInfeasible", W64_MSG, "W64-OPPOINT")):
             d = PV.build_verdikt(3, _result("Weg2LaunchRefused", "HW-COUNT: x"), _result(exc, msg, forced=[{"code": "HW-COUNT", "text": "HW-COUNT: x"}]))
             last = [v for v in d["verdikte"] if v["ebene"] == "lauf"][-1]
             self.assertEqual(last["code"], code)
@@ -62,6 +62,27 @@ class TestSupplement(unittest.TestCase):
             self.assertTrue(last["ergaenzung"])
             self.assertEqual(d["ausgang"], "verweigert")
             self.assertEqual(d["zaehlung"][PV.BLOCKED], 1)
+
+    def test_w64_is_form_neutral_without_the_dual_marker_and_dual_worded_with_it(self):
+        """Der Launcher wirft W64 auch ohne dual_layout (Flip/nur TP); den Dual-Wortlaut gibt es nur, wenn die Meldung 'W64-DUAL:' traegt."""
+        flip = PV.verdikt("W64-OPPOINT", ebene="lauf", text=W64_MSG, force_state=PV.BLOCKED)
+        self.assertNotIn("Dual", flip["titel"])
+        self.assertNotIn("Dual-D-Log", flip["konsequenz"] + flip["klasse_grund"])
+        self.assertNotIn("W64-DUAL", flip["grund"])
+        self.assertEqual((flip["forcebar"], flip["klasse"]), (False, "nicht_forcebar"))
+        dual_msg = W64_MSG + " W64-DUAL: no measured dual-share D log of m with weights [20, 12, 8] under /x; the model verdict stands"
+        dual = PV.verdikt("W64-OPPOINT", ebene="lauf", text=dual_msg, force_state=PV.BLOCKED)
+        self.assertIn("Dual-D", dual["titel"])
+        self.assertIn("Dual-D-Log", dual["konsequenz"])
+        self.assertEqual((dual["code"], flip["code"]), ("W64-OPPOINT", "W64-OPPOINT"))
+        # ohne Text (Fallback auf den Launcher-Wortlaut) bleibt es neutral
+        self.assertNotIn("Dual", PV.verdikt("W64-OPPOINT", ebene="lauf")["titel"])
+        # durch classify/build_verdikt: Flip-W64 und Dual-W64 tragen denselben Code
+        for msg in (W64_MSG, dual_msg):
+            d = PV.build_verdikt(3, _result("Weg2LaunchRefused", "HW-COUNT: x"), _result("Weg2TpOperatingPointInfeasible", msg, forced=[{"code": "HW-COUNT", "text": "HW-COUNT: x"}]))
+            last = [v for v in d["verdikte"] if v["ebene"] == "lauf"][-1]
+            self.assertEqual(last["code"], "W64-OPPOINT")
+            self.assertEqual("Dual-D" in last["titel"], "W64-DUAL:" in msg)
 
     def test_verdikt_without_text_falls_back_to_the_launcher_wording(self):
         v = PV.verdikt("W71-CENSUS", ebene="lauf")
@@ -83,6 +104,9 @@ class TestSupplement(unittest.TestCase):
         self.assertIn("def load_census", span(xl, 313, 316))
         self.assertIn("W64 Weg2TpOperatingPointInfeasible: position", span(ll, 16986, 16992))
         self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17242, 17243))
+        self.assertIn("if mine and dual_layout:", span(ll, 17340, 17340))        # Override nur im Dual ...
+        self.assertIn("raise Weg2LaunchRefused(mine[0]", span(ll, 17349, 17352))  # ... die Verweigerung gilt in jeder Form
+        self.assertIn("if not dual_layout or not str(refusal).startswith", span(ll, 17231, 17231))
         for w in PV.SUPPLEMENT_CODES.values():
             for m in re.finditer(r"(\w+/)?[\w.]+\.py:(\d+)(?:-(\d+))?", w["quelle"]):
                 self.assertGreater(int(m.group(2)), 0)

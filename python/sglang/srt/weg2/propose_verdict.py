@@ -112,18 +112,35 @@ SUPPLEMENT_CODES: Dict[str, Dict[str, Any]] = {
                      "Run --weg2-weight-source ring, or re-cut the schedule. [Launcher-Text xchg_residency.py:714-723]",
             "konsequenz": "Bleibt auch mit Force bestehen. Der Census ist je UUID gemessen und an die Karten gebunden; fremde Karten haben keinen. "
                           "Ausweg laut Launcher: --weg2-weight-source ring oder den Schnitt neu legen."},
-    "W64": {"code": "W64-DUAL-D", "klass": "nicht_forcebar", "forcebar": False,
-            "titel": "W64 Dual-D: Betriebspunkt ohne gemessenes Dual-D-Log nicht belegt",
-            "quelle": "launcher.py:16986-16992 (Weg2TpOperatingPointInfeasible), :17242-17243 (kein gemessenes Dual-D-Log)",
-            "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells (PerfCostModel.predict_capacity feasible=False) ohne Sicherheitsfaktor; "
-                            "im Dual hebt nur ein gemessenes Dual-D-Log der Gewichte die Ablehnung auf (dual_w64.find_dual_d_measurement), nicht Force.",
+    "W64": {"code": "W64-OPPOINT", "klass": "nicht_forcebar", "forcebar": False,
+            "titel": "W64 Betriebspunkt: das Modell ergibt keinen positiven KV-Pool",
+            "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17349-17352 (fatal fuer die ausgelieferte Position, auch ohne dual_layout)",
+            "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells (PerfCostModel.predict_capacity feasible=False) ohne Sicherheitsfaktor und "
+                            "ohne Force-Pfad: es gibt keinen Wert, mit dem ein erzwungener Start laufen koennte.",
             "grund": "W64 Weg2TpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
                      "plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank. Refused. This is the model's own verdict, "
-                     "not a margin chosen here. W64-DUAL: no measured dual-share D log of the model with these weights; the model verdict stands. "
-                     "[Launcher-Text launcher.py:16986-16992, :17242-17243]",
-            "konsequenz": "Bleibt auch mit Force bestehen. Aufgehoben wird es nur durch ein gemessenes Dual-D-Log dieser Gewichte (Evidence-Verzeichnis); "
-                          "ohne Messung gilt das Urteil des Modells."},
+                     "not a margin chosen here. [Launcher-Text launcher.py:16986-16993]",
+            "konsequenz": "Bleibt auch mit Force bestehen. Das Urteil ist das des Modells; hilft nur, Budgets, Gewichtsaufteilung oder Kartenzahl zu aendern.",
+            # nur wenn die Meldung 'W64-DUAL:' traegt (der Launcher haengt es nur bei dual_layout an, launcher.py:17231/17242): Dual-Wortlaut
+            "dual": {"titel": "W64 Dual-D: Betriebspunkt ohne gemessenes Dual-D-Log nicht belegt",
+                     "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17242-17243 (kein gemessenes Dual-D-Log)",
+                     "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells (PerfCostModel.predict_capacity feasible=False) ohne Sicherheitsfaktor; "
+                                     "im Dual hebt nur ein gemessenes Dual-D-Log der Gewichte die Ablehnung auf (dual_w64.find_dual_d_measurement), nicht Force.",
+                     "grund": "W64 Weg2TpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
+                              "plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank. Refused. This is the model's own verdict, "
+                              "not a margin chosen here. W64-DUAL: no measured dual-share D log of the model with these weights; the model verdict stands. "
+                              "[Launcher-Text launcher.py:16986-16993, :17242-17243]",
+                     "konsequenz": "Bleibt auch mit Force bestehen. Aufgehoben wird es nur durch ein gemessenes Dual-D-Log dieser Gewichte (Evidence-Verzeichnis); "
+                                   "ohne Messung gilt das Urteil des Modells."}},
 }
+
+def _supp_view(supp: Mapping[str, Any], text: Any) -> Dict[str, Any]:
+    """The supplement row, with the Dual wording when the refusal text carries ``W64-DUAL:`` (the launcher appends it only with ``dual_layout``)."""
+    d = supp.get("dual")
+    if d and "W64-DUAL:" in str(text or ""):
+        return {**supp, **d}
+    return supp
+
 
 #: launcher exception CLASS name -> register code (the class names of ``launcher.py`` / ``weg2/__init__``); a name not here is judged by
 #: its W-code or stays ``LAUNCHER-UNKLASSIFIZIERT``
@@ -241,6 +258,7 @@ def verdikt(code: str, *, ebene: str = "lauf", text: str = "", grund: Optional[s
     reg = register_rows()
     supp = next((x for x in SUPPLEMENT_CODES.values() if x["code"] == code), None)
     if supp is not None and code not in reg:
+        supp = _supp_view(supp, grund if grund is not None else text)
         out = {"code": code, "ebene": ebene, "titel": supp["titel"], "forcebar": False, "force_state": BLOCKED, "force_via": None,
                "klasse": supp["klass"], "klasse_grund": supp["klasse_grund"], "wired_at": None, "force_scope": None,
                "konsequenz": konsequenz if konsequenz is not None else supp["konsequenz"],

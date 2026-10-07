@@ -131,6 +131,17 @@ class F2Endpoint(unittest.TestCase):
         self.assertFalse(has(None, "--pp-stage-ratio", "1"))
         self.assertFalse(has({"argv": ["--pp-stage-ratio"]}, "--pp-stage-ratio", "1"))
 
+    def test_argv_has_finds_the_flag_at_any_position_of_an_extra_token(self):
+        has = P.ProfilEditor.argv_has
+        L = {"argv": ["--extra-p=--a 1 --pp-attn-stage-ratio 9,3,3 --b 2", "--extra-d=--c --d-flag 7"]}
+        self.assertTrue(has(L, "--pp-attn-stage-ratio", "9,3,3"))                 # in der Mitte
+        self.assertTrue(has(L, "--a", "1"))                                       # am Anfang
+        self.assertTrue(has(L, "--b", "2"))                                       # am Ende
+        self.assertTrue(has(L, "--d-flag", "7"))
+        self.assertFalse(has(L, "--pp-attn-stage-ratio", "9,3"))                  # kein Teilstring-Treffer
+        self.assertFalse(has(L, "--a", "9,3,3"))
+        self.assertTrue(has({"argv": ["--extra-p=--x '1 2' --y 3"]}, "--x", "1 2"))   # Anfuehrung bleibt ein Token
+
     def _propose(self, seed_wert, argv):
         tmp = tempfile.mkdtemp(prefix="nach1006_")
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -177,13 +188,13 @@ class F3Laufbericht(Base):
 
     def test_a_code_without_register_row_shows_its_class_and_consequence_but_stays_blocked(self):
         vd = {"schema": "flliper.verdikt/1", "ausgang": "verweigert", "orakel": {"laeufe": 2},
-              "verdikte": [{"code": "W64-DUAL-D", "ebene": "lauf", "text": "W64 Weg2TpOperatingPointInfeasible: x", "klasse": "nicht_forcebar",
+              "verdikte": [{"code": "W64-OPPOINT", "ebene": "lauf", "text": "W64 Weg2TpOperatingPointInfeasible: x", "klasse": "nicht_forcebar",
                             "konsequenz": "Bleibt auch mit Force bestehen.", "forcebar": True, "force_state": "force"}]}       # der Browser behauptet forcebar: nicht geglaubt
         t = self.report(dry=None, vorschlag=vd)["text"]
-        row = [x for x in t.split("\n") if x.startswith("| `W64-DUAL-D`")][0]
+        row = [x for x in t.split("\n") if x.startswith("| `W64-OPPOINT`")][0]
         self.assertIn("| nicht forcebar | blockiert:", row)
         self.assertIn("Bleibt auch mit Force bestehen.", row)
-        self.assertIn("Auch mit Force bestehen bleiben: `W64-DUAL-D`", t)
+        self.assertIn("Auch mit Force bestehen bleiben: `W64-OPPOINT`", t)
         self.assertNotIn("FLLIPER_FORCE=1", t.split("### Versionen")[0].split("### Verdikte und Force")[1])
 
     def test_without_both_it_still_says_no_dry_run(self):
@@ -247,3 +258,55 @@ class F5AriaLabel(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class F1LaufberichtOhneLauf(Base):
+    """Vorschlag ohne Launcher-Lauf (Einzelkarte passt_nicht / unbelegt, Orakel-Fehler): ein eigener Block, kein ``Trockenlauf:`` und kein Force-Satz
+    ``Der Planer lehnt nichts ab``."""
+
+    @staticmethod
+    def VD(ausgang, verdikte, laeufe=0):
+        return {"schema": "flliper.verdikt/1", "ausgang": ausgang, "orakel": {"laeufe": laeufe}, "verdikte": verdikte}
+
+    def _v(self, vd):
+        t = self.report(dry=None, vorschlag=vd)["text"]
+        return t.split("### Verdikte und Force")[1].split("### Versionen")[0]
+
+    def test_passt_nicht_is_a_planer_calculation_block_without_force_claims(self):
+        vd = self.VD("passt_nicht", [{"code": "EINZEL-PASSUNG", "ebene": "fit", "text": "passt nicht: 3 MiB zu wenig"},
+                                     {"code": "KV-MIN", "ebene": "fit", "text": "KV-Pool unter dem Minimum"}])
+        v = self._v(vd)
+        self.assertIn("Planer-Rechnung: passt nicht (kein Launcher-Lauf).", v)
+        self.assertIn("`KV-MIN`: KV-Pool unter dem Minimum", v)
+        for bad in ("Trockenlauf:", "Orakel-Lauf des Vorschlags", "Der Planer lehnt nichts ab", "Force wird nicht gebraucht", "0 Lauf", "FLLIPER_FORCE"):
+            self.assertNotIn(bad, v)
+        self.assertIn("Kein Launcher-Lauf", v)
+        self.assertIn("zeigt erst ein Trockenlauf", v)
+
+    def test_unbelegt_and_zero_runs_are_no_dry_run_either(self):
+        v = self._v(self.VD("unbelegt", []))
+        self.assertIn("Planer-Rechnung: nicht rechenbar.", v)
+        self.assertNotIn("Trockenlauf:", v)
+        v0 = self._v(self.VD("geht", [], laeufe=0))              # laeufe 0 allein genuegt
+        self.assertNotIn("Orakel-Lauf des Vorschlags", v0)
+        self.assertNotIn("Der Planer lehnt nichts ab", v0)
+
+    def test_orakel_fehler_is_named_and_force_does_not_help_is_not_said(self):
+        vd = self.VD("orakel_fehler", [{"code": "ORAKEL-FEHLER", "ebene": "orakel", "text": "OSError: kein Kindprozess"}])
+        v = self._v(vd)
+        self.assertIn("Orakel-Fehler: OSError: kein Kindprozess.", v)
+        self.assertIn("kein Urteil", v)
+        for bad in ("Force hilft hier nicht", "Trockenlauf:", "Der Planer lehnt nichts ab", "0 Lauf"):
+            self.assertNotIn(bad, v)
+
+    def test_a_real_run_keeps_its_header_and_the_run_count(self):
+        vd = self.VD("geht_mit_force", [{"code": "HW-COUNT", "ebene": "lauf", "text": "HW-COUNT: x"}], laeufe=2)
+        t = self.report(dry=None, vorschlag=vd)["text"]
+        self.assertIn("Orakel-Lauf des Vorschlags (Launcher-Trockenlauf, 2 Lauf/Läufe): geht nur mit Force durch.", t)
+
+    def test_dry_from_vorschlag_shape_for_no_run(self):
+        d = P.dry_from_vorschlag(self.VD("passt_nicht", []))
+        self.assertIs(d["kein_lauf"], True)
+        self.assertEqual(d["rejections"], [])
+        fh = P.force_hint(d, [])
+        self.assertEqual((fh["fall"], fh["show_line"]), ("kein_launcher_lauf", False))
