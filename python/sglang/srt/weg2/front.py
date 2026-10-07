@@ -2656,6 +2656,43 @@ def refusal_status(measured_tokens: Optional[int], static_capacity: int) -> int:
     return 413 if int(measured_tokens) > int(static_capacity) else 503
 
 
+class FrontTemplateRefused(ValueError):
+    """TEMPLATE-GATE: the chat template itself refused the request's messages (a Jinja
+    ``raise_exception`` -- e.g. ``Unexpected message role.``). A fault of the REQUEST, the
+    same one every group would answer 400: it is raised out of the exact count so the
+    arrival is answered 400 before any route, seat, flip or park."""
+
+
+def is_template_refusal(exc: BaseException) -> bool:
+    """True only for the two faults of the REQUEST that every group answers 400 as well: the
+    ValueError the OpenAI serving layer builds from a ``jinja2.TemplateError`` (serving_chat
+    ``except (jinja2.TemplateError, TypeError) -> raise ValueError(...) from``, e.g. a
+    ``developer`` role the Qwen template does not know) and a pydantic ``ValidationError``
+    of the request schema (e.g. a role outside the OpenAI set). Any other ValueError /
+    timeout / state of the front tokenizer is NOT a request fault and keeps the chars/3
+    fallback."""
+    try:
+        import jinja2
+        import pydantic
+    except Exception:  # noqa: BLE001 -- no jinja2 / pydantic: nothing to recognise
+        return False
+    if isinstance(exc, pydantic.ValidationError):
+        return True
+    return isinstance(exc, ValueError) and isinstance(exc.__cause__, jinja2.TemplateError)
+
+
+def template_refusal_response(path: str, detail: str) -> web.Response:
+    """The 400 of a TEMPLATE-GATE refusal in the wire of ``path`` (the Anthropic error
+    object on ``/v1/messages``, the OpenAI one elsewhere). No Retry-After: a retry of
+    the same messages cannot help."""
+    if path == "/v1/messages":
+        body: Dict[str, object] = {"type": "error",
+                                   "error": {"type": "invalid_request_error", "message": detail}}
+    else:
+        body = {"error": {"message": detail, "type": "BadRequestError", "param": None, "code": 400}}
+    return web.json_response(body, status=400)
+
+
 def refusal_response(path: str, code: str, detail: str, status: int,
                      extra: Optional[Dict[str, object]] = None) -> web.Response:
     """A named refusal in the wire of ``path``: the Anthropic error object on
@@ -6212,6 +6249,11 @@ class Front:
             except asyncio.TimeoutError:
                 reason = "timeout"
             except Exception as e:  # noqa: BLE001 -- the estimate stands, named
+                if is_template_refusal(e):
+                    # TEMPLATE-GATE: the chat template refused the messages themselves
+                    # (``Unexpected message role.``) -- a fault of the request, not of the
+                    # count: it goes up to the arrival, which answers 400 before any flip
+                    raise FrontTemplateRefused(str(e)) from e
                 reason = f"{type(e).__name__}: {str(e)[:160]}"
         wait_ms = (time.monotonic() - t0) * 1000.0
         if c is None:
@@ -9199,9 +9241,24 @@ class Front:
         # X-EXACT: the count replaces the chars/3 figures (off: never entered).
         _xx = None
         if self.x_exact:
-            _xx = await self._x_exact_price(rid, request.path, payload, text,
-                                            remainder, est_prompt,
-                                            multimodal=bool(_img or _vid or _emb))
+            try:
+                _xx = await self._x_exact_price(rid, request.path, payload, text,
+                                                remainder, est_prompt,
+                                                multimodal=bool(_img or _vid or _emb))
+            except FrontTemplateRefused as _tpl:
+                # TEMPLATE-GATE: the chat template refused the messages (the same 400 every
+                # group would give) -- answered HERE, before any verdict, seat, flip or park.
+                # Without it an agent retrying the request paid a D->P flip and the flip
+                # back for every attempt (NF dkrnfint4h6abl 07.10.: 3 s a retry, no decode).
+                self.counters["template_gate_refused"] += 1
+                logger.warning("WEG2 TEMPLATE-GATE REFUSED rid=%s path=%s reason=%s (400 before any "
+                               "route, seat, flip or park -- the chat template refuses these "
+                               "messages, every group would answer the same)",
+                               rid, request.path, str(_tpl)[:200])
+                Front._pb_resolve(self, rid, _pb_fut, "none", 0)
+                if _ef is not None and not _ef.gate.done():
+                    _ef.gate.set_result(False)  # EARLY-FLIP: no verdict, nothing sleeps
+                return template_refusal_response(request.path, str(_tpl))
             if _xx is not None:
                 remainder, est_prompt, known = _xx.pending, _xx.n, _xx.known
                 store_span, presence_src = _xx.credit, _xx.src

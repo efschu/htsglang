@@ -448,7 +448,8 @@ def test_off_constructs_and_imports_nothing():
 
     src = inspect.getsource(F.Front.handle_generate)
     # every X-EXACT statement in the handler sits behind the switch
-    assert "if self.x_exact:\n            _xx = await self._x_exact_price(" in src
+    # (TEMPLATE-GATE 07.10.: the call sits in a try that answers a template refusal 400)
+    assert "if self.x_exact:\n            try:\n                _xx = await self._x_exact_price(" in src
     assert src.count("self._x_exact_price(") == 1
     init = inspect.getsource(F.Front.__init__)
     assert "if self.x_exact:\n            from sglang.srt.weg2.front_tokens import" in init
