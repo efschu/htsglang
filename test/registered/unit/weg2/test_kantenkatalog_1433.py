@@ -124,22 +124,23 @@ class Beleg(Basis, unittest.TestCase):
                 self.files[path] = fh.readlines()
         return self.files[path]
 
-    @unittest.skipUnless(hasattr(PC, "resolve_edge_belege"),
-                         "the catalog tool of the NF line (profile_catalog.py) has no anchor resolution (resolve_edge_belege, 27B line); the anchors "
-                         "of kantenkatalog_1004.json are written against the 27B launcher: measured 07.10. with the 27B tool on the NF tree 2e68b3f94b, "
-                         "56 of 120 edges do not resolve (31 veraltet, 13 mehrdeutig, 12 datei_fehlt: dual_*.py, x_curves.py, invariant_checker.py)")
     def test_every_edge_has_a_readable_anchor(self):
         """Der ANKER-TEXT ist der Beleg (Auftrag 2013): er muss in der Datei stehen und sich eindeutig aufloesen lassen.
 
         Eine bloss verschobene Zeilennummer bricht den Test NICHT mehr; es bricht nur ein fehlender (``veraltet``), ein
         nicht aufloesbar mehrdeutiger (``mehrdeutig``) Anker oder eine fehlende Repo-Datei (``datei_fehlt``)."""
-        res = PC.resolve_edge_belege(self.kanten, REPO_ROOT)
+        # Two lines (07.10.): an edge with ``baeume: ["27b"]`` documents code only the 27B line carries (the Dual form) and is ``andere_linie``
+        # on the NF tree; every other edge must resolve in THIS tree (the same file holds for both lines).
+        res = PC.resolve_edge_belege(self.kanten, REPO_ROOT, "27b" if DUAL_LINE else "nf")
         self.assertEqual(set(res), {k["id"] for k in self.kanten})
         problems = {i: (r["status"], r["datei"], r["treffer"]) for i, r in res.items() if r["status"] in PC.ANKER_PROBLEM}
         self.assertEqual(problems, {})
         for i, r in res.items():
             if r["status"] == "extern_fehlt":
                 self.skipped_external.append(i)
+            elif r["status"] in PC.ANKER_FREMD:
+                self.assertFalse(DUAL_LINE, i)                            # the 27B tree checks every edge
+                self.assertEqual(next(k for k in self.kanten if k["id"] == i).get("baeume"), ["27b"], i)
             else:
                 self.assertIn(r["status"], PC.ANKER_OK, i)
                 self.assertIsInstance(r["zeile"], int, i)

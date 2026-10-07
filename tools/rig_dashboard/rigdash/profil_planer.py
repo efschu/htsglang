@@ -131,15 +131,19 @@ def vector_names() -> List[str]:
     return out
 
 
-def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[str, Any]]] = None, oracle: bool = False) -> Dict[str, Any]:
+def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[str, Any]]] = None, oracle: bool = False, dual: bool = True) -> Dict[str, Any]:
     """Das ``planer``-Objekt der ``list``-Antwort.
 
     ``vorschlag_formen``: die Formen, die ``ProfilEditor.propose`` kann (``ProfilEditor.FORMS``); eine Seitenform mit anderem Namen bekommt
     ``vorschlag: False`` und einen Hinweis (heute bedient ``propose`` alle vier Formen: ``flip``, ``tp``, ``dual``, ``single``).  ``entries``: der Katalog (für Text und Kanten der
-    Dual-ENV-Werte, auch wenn das Profil sie nicht setzt).  ``oracle``: ob das Orakel konfiguriert ist (ohne es gibt es keinen Vorschlag)."""
+    Dual-ENV-Werte, auch wenn das Profil sie nicht setzt).  ``oracle``: ob das Orakel konfiguriert ist (ohne es gibt es keinen Vorschlag).
+    ``dual``: ob der Planer-Baum die Dual-Form traegt (``profil.dual_line_probe``); ohne sie (NF-Linie, Nutzerentscheid 07.10.) steht Dual weder in ``formen`` noch
+    als Dual-ENV-Tabelle (kein Schluessel ``dual``) in der Antwort, ``dual_verfuegbar`` sagt es."""
     can = set(vorschlag_formen or ())
     formen = []
     for f in FORMEN:
+        if f["id"] == "dual" and not dual:
+            continue
         back = FORM_BACKEND[f["id"]]
         d = dict(f, backend=back, vorschlag=bool(oracle and back in can))
         if not d["vorschlag"]:
@@ -149,14 +153,18 @@ def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[s
                 d["hinweis"] = "Für diese Form gibt es in diesem Stand keinen Vorschlag; die Werte lassen sich von Hand setzen."
         formen.append(d)
     ents = entries or {}
-    dual = dict(DUAL)
-    dual["werte"] = {}
-    for key, name in DUAL_ENV.items():
-        e = ents.get(name) or {}
-        dual["werte"][name] = {"name": name, "rolle": key, "text": e.get("text") or "", "help": e.get("help") or "", "depends": [dict(d) for d in e.get("depends") or []],
-                               "level": e.get("level"), "gain": e.get("gain") or "", "cost": e.get("cost") or ""}
-    return {"schema": SCHEMA, "formen": formen, "abschnitte": [dict(a) for a in ABSCHNITTE], "vektoren": vector_names(),
-            "positional": POSITIONAL_FLAGS + [t.rstrip("=") for t in POSITIONAL_TOKENS], "je_rang": list(RANK_VECTORS), "dual": dual, "ziele": dict(ZIELE), "oracle": bool(oracle)}
+    out = {"schema": SCHEMA, "formen": formen, "abschnitte": [dict(a) for a in ABSCHNITTE], "vektoren": vector_names(),
+           "positional": POSITIONAL_FLAGS + [t.rstrip("=") for t in POSITIONAL_TOKENS], "je_rang": list(RANK_VECTORS), "ziele": dict(ZIELE), "oracle": bool(oracle),
+           "dual_verfuegbar": bool(dual)}
+    if dual:
+        tab = dict(DUAL)
+        tab["werte"] = {}
+        for key, name in DUAL_ENV.items():
+            e = ents.get(name) or {}
+            tab["werte"][name] = {"name": name, "rolle": key, "text": e.get("text") or "", "help": e.get("help") or "", "depends": [dict(d) for d in e.get("depends") or []],
+                                  "level": e.get("level"), "gain": e.get("gain") or "", "cost": e.get("cost") or ""}
+        out["dual"] = tab
+    return out
 
 
 def all_section_names() -> List[str]:

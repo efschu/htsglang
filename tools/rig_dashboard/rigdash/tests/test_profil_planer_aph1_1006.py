@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
@@ -123,6 +124,11 @@ class Daten(unittest.TestCase):
             pl = ed.list()["planer"]
             self.assertEqual(pl["schema"], PL.SCHEMA)
             self.assertTrue(pl["oracle"])
+            # the fixture planner tree carries no Dual module (NF line 07.10.: Dual is offered only where weg2/dual_layout_plan.py and dual_green.py exist)
+            self.assertEqual([f["id"] for f in pl["formen"]], ["einzel", "tp", "flip"])
+            self.assertNotIn("dual", pl)
+            with mock.patch.object(P, "dual_line_probe", return_value=True):                         # the 27B line: all four forms, as before
+                pl = ed.list()["planer"]
             self.assertEqual([f["vorschlag"] for f in pl["formen"]], [True, True, True, True])      # einzel, tp, flip, dual: AP-D Runde 2
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

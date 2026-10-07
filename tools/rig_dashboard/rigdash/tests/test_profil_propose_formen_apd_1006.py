@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
@@ -155,7 +156,8 @@ class SingleRequests(unittest.TestCase):
             ans = copy.deepcopy(_canned_single())
             ans["vorschlag"].update(form="dual", n=3)
             orc.propose = ans
-            r = ed.propose({"basis": {"kind": "release", "name": "demo"}, "form": "dual", "inventar": "rig"})
+            with mock.patch.object(P, "dual_line_probe", return_value=True):         # the fixture tree has no Dual module: this is the 27B line's Dual proposal
+                r = ed.propose({"basis": {"kind": "release", "name": "demo"}, "form": "dual", "inventar": "rig"})
         finally:
             shutil.rmtree(self.tmp + "_d", ignore_errors=True)
         self.assertTrue(r["ok"], r)

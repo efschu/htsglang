@@ -735,7 +735,8 @@ def explain_row(r: Mapping, catalog: Optional[Mapping], comments: Optional[Mappi
                               "planner_derived": False, "source": None, "default": None, "choices": None}
     if ent:
         if ent.get("text"):
-            parts.append({"kind": "kuratiert", "text": str(ent["text"]), "source": "profile_catalog_curated.py"})
+            parts.append({"kind": "erklaert" if ent.get("status") == "erklaert" else "kuratiert", "text": str(ent["text"]),
+                          "source": "profile_catalog_curated.py"})
         if ent.get("help"):
             src = ent.get("source") or {}
             parts.append({"kind": "code", "text": str(ent["help"])[:1400],
@@ -749,7 +750,7 @@ def explain_row(r: Mapping, catalog: Optional[Mapping], comments: Optional[Mappi
         parts.append({"kind": "profil", "text": str(c["text"]), "source": str(c.get("source", ""))})
     if parts:
         if ent and ent.get("text"):
-            out["status"] = "kuratiert"
+            out["status"] = "erklaert" if ent.get("status") == "erklaert" else "kuratiert"
         elif ent and ent.get("help"):
             out["status"] = "geerntet"
         else:
@@ -770,7 +771,8 @@ def view(doc: Mapping, catalog: Optional[Mapping] = None, comments: Optional[Map
         key = r["key"]
         ex = explain_row(r, catalog, comments)
         for d in ex["depends"]:
-            d["present"] = d["to"] in present
+            # a refusal code is no value of the profile: "set in this profile" does not apply (None), the chip points at the register
+            d["present"] = None if d.get("to_kind") == "ablehnung" else d["to"] in present
         origin = origins.get(key) or (ORIGIN_PROFIL if (key in pv or not pv) else ORIGIN_NUTZER)
         row = dict(r)
         row.update({"origin": origin, "origin_label": ORIGIN_LABEL[origin],
@@ -780,6 +782,7 @@ def view(doc: Mapping, catalog: Optional[Mapping] = None, comments: Optional[Map
         out.append(row)
     n = len(out)
     cov = {"rows": n, "kuratiert": sum(1 for x in out if x["explain"]["status"] == "kuratiert"),
+           "maschinell": sum(1 for x in out if x["explain"]["status"] == "erklaert"),
            "geerntet": sum(1 for x in out if x["explain"]["status"] == "geerntet"),
            "profil_kommentar": sum(1 for x in out if x["explain"]["status"] == "profil-kommentar"),
            "unerklaert": sum(1 for x in out if x["explain"]["status"] == "unerklaert"),
