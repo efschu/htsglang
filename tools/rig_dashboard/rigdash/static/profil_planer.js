@@ -309,7 +309,10 @@
         ${why ? `<span class="muted pf-note pfx-why">${esc(why)}</span>` : ""}</div></div>`;
   }
   const AUSGANG = { geht: ["ok", "Der Launcher-Trockenlauf geht ohne Force durch."], geht_mit_force: ["force", "Der Trockenlauf geht nur mit Force durch."], verweigert: ["bad", "Der Launcher verweigert, auch mit Force."],
-                    absturz: ["bad", "Der Launcher-Trockenlauf stürzte ab (kein Urteil über die Werte, Force ändert daran nichts)."], orakel_fehler: ["bad", "Das Orakel konnte nicht fragen: es gibt kein Urteil."] };
+                    absturz: ["bad", "Der Launcher-Trockenlauf stürzte ab (kein Urteil über die Werte, Force ändert daran nichts)."], orakel_fehler: ["bad", "Das Orakel konnte nicht fragen: es gibt kein Urteil."],
+                    // Einzelkarte (kein weg2-Launcher, AP-F): das Urteil ist eine Planer-Rechnung, kein Launcher-Lauf; Force gibt es dort nicht
+                    passt: ["ok", "Planer-Rechnung: passt (kein Launcher-Lauf, die Einzelkarte hat keinen weg2-Launcher)."], passt_nicht: ["bad", "Planer-Rechnung: passt nicht (kein Launcher-Lauf; ein Force gibt es bei einer Karte nicht)."],
+                    unbelegt: ["", "Planer-Rechnung: nicht rechenbar (Eingaben ohne Beleg, siehe Hinweise)."] };
   function renderProposal(p) {
     if (!p) return "";
     const werte = p.werte || [];
@@ -324,9 +327,13 @@
     }).join("");
     const runV = (vd.verdikte || []).filter((x) => x.ebene === "lauf" || x.ebene === "absturz" || x.ebene === "orakel" || x.ebene === "blocker" || x.ebene === "planer").map((x) =>
       `<li><span class="pfx-vchip pfx-v-${x.forcebar === false || x.force_state === "blockiert" || x.ebene === "absturz" ? "verweigert" : x.forcebar ? "force" : "hinweis"}">${x.forcebar === false || x.force_state === "blockiert" || x.ebene === "absturz" ? "verweigert" : x.forcebar ? "nur mit --force" : "Hinweis"} <b class="mono">${esc(x.code)}</b></span> ${esc(clip(x.grund || x.titel || "", 260))}</li>`).join("");
+    // Passung als Planer-Rechnung (Dual-Passung, Dual-Pflicht, Einzelkarte): nicht hw_fit und kein Launcher-Lauf, darum eigene Zeilen
+    const planerV = (vd.verdikte || []).filter((x) => x.ebene === "fit" && x.code !== "FIT" && x.code !== "HW-BORROWED").map((x) =>
+      `<li><span class="pfx-vchip pfx-v-${x.force_state === "blockiert" ? "verweigert" : "hinweis"}">${x.force_state === "geht" ? "ok" : x.force_state === "blockiert" ? "passt nicht" : "Hinweis"} <b class="mono">${esc(x.code)}</b></span> ${esc(clip(x.grund || x.titel || "", 260))}</li>`).join("");
     const hints = [].concat(p.notes || [], v.hinweise || [], v.blocker || []).filter(Boolean);
     return `<div class="pfx-prop"><div class="pf-verdict ${a[0] === "ok" ? "ok" : a[0] === "force" ? "" : "bad"}"><b>Vorschlag für ${esc(p.n)} Karte${p.n === 1 ? "" : "n"}, Form ${esc(p.form)}</b>: ${esc(nCh)} Werte geändert, ${esc(nUnb)} unbelegt. ${esc(a[1])}
-        ${fit ? `<div class="muted">Passung (hw_fit, notwendige Bedingung): <b>${esc(fit.level)}</b>${fit.margin_mib != null ? ", Rand " + esc(Math.round(Number(fit.margin_mib))) + " MiB" : ""}${fit.first ? " · " + esc(fit.first) : ""}</div>` : ""}</div>
+        ${fit ? `<div class="muted">Passung (${esc(fit.art || "hw_fit, notwendige Bedingung")}): <b>${esc(fit.level)}</b>${fit.margin_mib != null ? ", Rand " + esc(Math.round(Number(fit.margin_mib))) + " MiB" : ""}${fit.first ? " · " + esc(fit.first) : ""}</div>` : ""}</div>
+      ${planerV ? `<div class="pfx-runv"><b>Passung als Planer-Rechnung</b> <span class="muted">(eine Rechnung des Planers aus Modellgrößen, kein Launcher-Lauf und keine Messung)</span><ul class="pfx-vd">${planerV}</ul></div>` : ""}
       ${runV ? `<div class="pfx-runv"><b>Was der Launcher zum Lauf sagt</b> <span class="muted">(gilt für den ganzen Start, nicht für einen einzelnen Wert; nie eine Sperre in dieser Seite)</span><ul class="pfx-vd">${runV}</ul></div>` : ""}
       ${changed ? `<details class="pf-fold" data-fold="propchg" open><summary>Was der Vorschlag geändert hat (${nCh})</summary><ul class="pfx-chg">${changed}</ul></details>` : ""}
       ${cards ? `<details class="pf-fold" data-fold="propcards"><summary>Rangfolge der Karten (Rang 0 = Host)</summary><ul class="pfx-cards">${cards}</ul></details>` : ""}

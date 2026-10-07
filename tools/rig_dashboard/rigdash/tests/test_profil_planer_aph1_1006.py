@@ -61,7 +61,10 @@ class Daten(unittest.TestCase):
 
     def test_proposal_only_for_forms_the_editor_can_and_with_an_oracle(self):
         ui = PL.ui_info(P.ProfilEditor.FORMS, self.cat["entries"], True)
-        self.assertEqual({f["id"]: f["vorschlag"] for f in ui["formen"]}, {"einzel": False, "tp": True, "flip": True, "dual": False})
+        self.assertEqual({f["id"]: f["vorschlag"] for f in ui["formen"]}, {"einzel": True, "tp": True, "flip": True, "dual": True})      # AP-D Runde 2: alle vier Formen
+        old = PL.ui_info(("flip", "tp"), self.cat["entries"], True)                        # ein Editor, der nur flip und tp kann: ehrlicher Hinweis statt "späteres Arbeitspaket"
+        self.assertEqual({f["id"]: f["vorschlag"] for f in old["formen"]}, {"einzel": False, "tp": True, "flip": True, "dual": False})
+        self.assertFalse(any("Arbeitspaket" in f.get("hinweis", "") for f in old["formen"]))
         for f in ui["formen"]:
             self.assertEqual("hinweis" in f, not f["vorschlag"], f["id"])
         no = PL.ui_info(P.ProfilEditor.FORMS, self.cat["entries"], False)
@@ -118,7 +121,7 @@ class Daten(unittest.TestCase):
             pl = ed.list()["planer"]
             self.assertEqual(pl["schema"], PL.SCHEMA)
             self.assertTrue(pl["oracle"])
-            self.assertEqual([f["vorschlag"] for f in pl["formen"]], [False, True, True, False])
+            self.assertEqual([f["vorschlag"] for f in pl["formen"]], [True, True, True, True])      # einzel, tp, flip, dual: AP-D Runde 2
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         with open(os.path.join(os.path.dirname(HERE), "server.py"), encoding="utf-8") as fh:
@@ -327,7 +330,7 @@ out.prop = PX.renderProposal({ n: 3, form: "flip", werte: [{ label: "--d-bs", al
         self.assertNotIn("Passt nicht", o["pick1"].split('data-form="einzel"')[1].split("</button>")[0])
         self.assertRegex(o["c_ok"], r'data-act="propose"(?! disabled)')
         self.assertRegex(o["c_dual"], r'data-act="propose" disabled')
-        self.assertIn("AP-E", o["c_dual"])                                       # der Grund steht da, nicht nur ein grauer Knopf
+        self.assertIn("keinen Vorschlag", o["c_dual"])                           # der Grund steht da, nicht nur ein grauer Knopf (kein Verweis auf ein späteres Paket)
         self.assertRegex(o["c_no"], r'data-act="propose" disabled')
         self.assertIn("Erst ein Profil laden", o["c_no"])
         self.assertIn("rechnet …", o["c_busy"])

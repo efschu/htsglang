@@ -17,6 +17,10 @@ launcher did into a document ``flliper.verdikt/1``:
   launch input the oracle really got, plus the hash of the argv/env and of the sources of the oracle (launcher, refusals, hw_fit), so a
   verdict can always be attributed to the profile state it was asked about.
 
+The SINGLE CARD form (AP-F, ``run_propose_single``) has no launcher (``topology.py`` MIN_CARDS=2) and so no oracle run: its document is the same
+shape (values, ``flliper.verdikt/1``, verdicts per value, ``launch``) but the verdict is a PLANER-RECHNUNG of ``propose_single`` plus the ServerArgs parse
+(``ausgang`` passt | passt_nicht | unbelegt, ``lauf`` None, ``laeufe`` 0, no Force), and every verdict of it says so.
+
 Nothing in here judges a value or re-implements a solver (R1/Q-710): every number in a verdict is a number the launcher or ``hw_fit``
 printed.  A verdict the oracle cannot give (the harness itself failed) is ``ORAKEL-FEHLER`` and says so.  GPU-free, NVML-free, Docker-free.
 """
@@ -52,6 +56,23 @@ OWN_CODES: Dict[str, Dict[str, Any]] = {
                      "konsequenz": "P muss die KV-Pflicht (Standard 262144 Token) als EINEN Prompt tragen: Deckel, Level des P-Pools und der gemeinsame Pool "
                                    "jeder Karte. Der Pool je Karte ist nur fuer die Karten und das Modell des Referenzboots geeicht; sonst steht dort "
                                    "'nicht gerechnet'. Einen Dual-Pool-Riegel im Launcher gibt es nach dem 27B-Sitz nicht (done/dual-schnitt-262k-1006.md Abschnitt 5): diese Rechnung ist der einzige Schutz davor."},
+    "EINZEL-PASSUNG": {"ebene": "fit", "parent": None, "titel": "Einzelkarte: Passung als Planer-Rechnung (kein Launcher-Lauf)",
+                       "konsequenz": "Die Einzelkarte hat keinen weg2-Launcher (topology.py MIN_CARDS=2): der Planer rechnet Gewichte + Draft + KV-Pflicht + Mamba-Pool "
+                                     "+ Reserve gegen das statische Budget (Bruchteil x freier Speicher vor dem Laden). Das ist eine NOTWENDIGE Bedingung aus "
+                                     "Modellgroessen, keine Messung; ein Force gibt es bei N=1 nicht."},
+    "EINZEL-PARSE": {"ebene": "fit", "parent": None, "titel": "Einzelkarte: ServerArgs-Parse (nur argparse, ohne Geraet)",
+                     "konsequenz": "Der Parse prueft Flag-Namen, Auswahlwerte und Typen von ServerArgs.add_cli_args; ServerArgs.__post_init__ (Geraeteerkennung, "
+                                   "Kompatibilitaets-Refusals) braucht einen Beschleuniger und ist NICHT gelaufen."},
+    "FIT-STATIC": {"ebene": "fit", "parent": None, "titel": "Gewichte + Draft + KV + Mamba gegen das statische Budget",
+                   "konsequenz": "Der Pool ist groesser als --mem-fraction-static x freier Speicher vor dem Laden; die Runtime wuerde beim Laden oder Poolbau am Speicher scheitern."},
+    "FIT-RESERVE": {"ebene": "fit", "parent": None, "titel": "Reserve ausserhalb des statischen Budgets zu klein",
+                    "konsequenz": "Aktivierungen, CUDA-Graphen und Fragmentierung brauchen mehr als (1 - Bruchteil) des freien Speichers: ein Lauf kann an der Reserve scheitern."},
+    "FIT-CARD": {"ebene": "fit", "parent": None, "titel": "Statisches Budget groesser als die adressierbare Decke der Karte",
+                 "konsequenz": "Auf einer APU oder bei Hostpool teilen Geraet und Host den Speicher; das Budget liegt ueber der Decke."},
+    "FIT-CTX": {"ebene": "fit", "parent": None, "titel": "Kontext groesser als der KV-Pool",
+                "konsequenz": "Ein Prompt der Kontextlaenge passt nicht in den KV-Pool."},
+    "MAMBA-FLOOR": {"ebene": "fit", "parent": None, "titel": "Mamba-Pool unter der Untergrenze",
+                    "konsequenz": "Weniger Slots als Anfragen x Slots je Anfrage (mamba_pool_floor.py): der Server verweigert oder haelt Anfragen nicht."},
     "PROFILE-VECTORS": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Positionsvektoren des Profils nicht fuer dieses Inventar",
                         "konsequenz": "Das Profil traegt Vektoren (je Karte ein Eintrag) mit anderer Laenge als die Kartenzahl; der Launcher kann sie "
                                       "nicht ableiten. Mit Vorschlag des Planers haben alle Vektoren genau N Eintraege."},
@@ -419,6 +440,13 @@ def _tail(key: str) -> str:
     return str(key).split()[-1].rstrip("=") if str(key).split() else str(key)
 
 
+def slim_verdikt(v: Mapping[str, Any], grund: Optional[str] = None) -> Dict[str, Any]:
+    """A verdict as it hangs on ONE value: without the (long) ``text`` and ``werte`` fields."""
+    d = {k: v.get(k) for k in ("code", "ebene", "forcebar", "force_state", "konsequenz", "titel")}
+    d["grund"] = _clip(grund if grund is not None else v.get("grund"), 400)
+    return d
+
+
 def werte_verdikte(vorschlag: Mapping[str, Any], verdikt_doc: Mapping[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     """``{wert-key: [verdikt, ...]}`` for every value of a proposal (``vorschlag["werte"]``): an empty list = the oracle has no objection.
 
@@ -437,10 +465,7 @@ def werte_verdikte(vorschlag: Mapping[str, Any], verdikt_doc: Mapping[str, Any])
     uncal = by_code.get("HW-UNCALIBRATED")
     out: Dict[str, List[Dict[str, Any]]] = {}
 
-    def slim(v: Mapping[str, Any], grund: Optional[str] = None) -> Dict[str, Any]:
-        d = {k: v.get(k) for k in ("code", "ebene", "forcebar", "force_state", "konsequenz", "titel")}
-        d["grund"] = _clip(grund if grund is not None else v.get("grund"), 400)
-        return d
+    slim = slim_verdikt
 
     for w in vorschlag.get("werte") or []:
         key = str(w.get("key"))
@@ -610,15 +635,174 @@ def _model_profiles(li: Any, req: Mapping[str, Any]) -> Tuple[Optional[Dict[str,
     return modell, draft, notes
 
 
+# ---------------------------------------------------------------------------
+# the SINGLE CARD form (AP-F): no launcher, so no oracle run -- the verdicts are a Planer-Rechnung and say so
+# ---------------------------------------------------------------------------
+
+#: the names of the single-card form in a request (the dashboard sends ``single``, the plan says ``einzel``)
+SINGLE_FORMS = ("single", "einzel", "einzelkarte")
+#: dashboard goal -> goal of ``propose_single`` (the "Kontext" regulator of the page is the context per request); the rest of the dashboard's goals
+#: (p_cut, d_objective, draft_kv_on_p, force_rules) are group-P/D knobs and do not exist for one card
+_SINGLE_GOALS = (("seats", "seats"), ("kv_tokens", "context_tokens"), ("kv_dtype", "kv_dtype"), ("draft", "draft"), ("host_ram_mib", "host_ram_mib"),
+                 ("pre_load_free_mib", "pre_load_free_mib"), ("reserve_mib", "reserve_mib"))
+_SINGLE_STATE = {"passt": ("passt", GOES), "passt nicht": ("passt_nicht", BLOCKED), "unbelegt": ("unbelegt", HINT)}
+
+
+class _NoLaunch:
+    """What ``_model_profiles`` reads of a launch input when the single-card request has no base profile."""
+
+    def __init__(self, model: str = "") -> None:
+        self.model, self.draft = model, ""
+
+
+def _single_card(req: Mapping[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """``(card for propose_single, note)``: the ONE card of the request.  ``inventar.hardware`` takes card ``inventar.karte`` (ordinal, default 0) of the
+    hardware profile; ``devices`` / ``cards`` must be exactly one."""
+    from sglang.srt.weg2 import propose_single as PS
+
+    inv = req.get("inventar") or {}
+    if inv.get("hardware"):
+        ordinal = int(inv.get("karte") or 0)
+        card = PS.card_from_hardware(inv["hardware"], ordinal)
+        return card, "Karte %d des Hardwareprofils: %s, %d MiB (%s)" % (ordinal, card["name"], card["total_mib"], card["total_src"])
+    rows = _devices_of(req)
+    if len(rows) != 1:
+        raise PS.ProposeSingleError("die Einzelkarte braucht genau eine Karte, nicht %d" % len(rows))
+    d = rows[0]
+    total = int(d.get("total_bytes", 0)) >> 20
+    card = PS.normalize_card({"name": d.get("name"), "total_mib": total, "total_src": "Kartenkatalog (usable_mib, Datenblatt-Eintrag der Karte)",
+                              "cc": [d.get("cc_major"), d.get("cc_minor")]})
+    return card, "Karte: %s, %d MiB (Kartenkatalog)" % (card["name"], total)
+
+
+def _single_werte(p: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The flags of ``propose_single`` as the list of values of the propose document (``propose.py`` ``werte``): there is no profile before, so every value that
+    is set is new (``geaendert``); a switch is the empty value (like ``--d-only``)."""
+    out = []
+    for e in p["flags"]:
+        wert = e["wert"]
+        sval = None if wert is None else ("" if wert is True else str(wert))
+        out.append({"key": e["flag"], "group": "-", "policy": "single", "alt": None, "wert": sval, "eintraege": 1, "zustand": e["zustand"],
+                    "herkunft": e["herkunft"], "grund": e["begruendung"], "in_argv": wert is not None, "geaendert": wert is not None})
+    return out
+
+
+def single_verdikt(p: Mapping[str, Any], card_note: str, notes: Sequence[str], profil: Mapping[str, Any], t0: float) -> Dict[str, Any]:
+    """The ``flliper.verdikt/1`` document of a single-card proposal: the fit as a Planer-Rechnung, the failing checks, the ServerArgs parse.  There is NO
+    launcher run (``lauf`` / ``ohne_force`` / ``mit_force`` are None, ``laeufe`` 0) and no Force (nothing here is a register code)."""
+    v = p["verdikt"]
+    ausgang, st = _SINGLE_STATE.get(v["state"], ("unbelegt", HINT))
+    fit = p["fit"]
+    v_list: List[Dict[str, Any]] = [verdikt("EINZEL-PASSUNG", ebene="fit", text=v["text"], grund=v["text"], force_state=st,
+                                            extra={"stufe": {"passt": "ja", "passt nicht": "nein"}.get(v["state"], "unbelegt"), "art": v.get("art"),
+                                                   "etikett": "Planer-Rechnung", "rest_mib": fit.get("frei_mib")})]
+    for ch in fit.get("checks") or []:
+        if not ch["ok"]:
+            v_list.append(verdikt(str(ch["code"]), ebene="fit", text=ch["text"], grund=ch["text"], force_state=BLOCKED, extra={"etikett": "Planer-Rechnung"}))
+    for u in fit.get("unbelegt") or []:
+        v_list.append(verdikt("UNBELEGT", ebene="fit", text=str(u), grund=str(u), force_state=HINT, extra={"etikett": "Planer-Rechnung"}))
+    par = p.get("parse") or {}
+    if par.get("available") and par.get("ok") is False:
+        v_list.append(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs-Parse verweigert: %s" % par.get("error"), grund=str(par.get("error")), force_state=BLOCKED))
+    elif par.get("available") and par.get("ok"):
+        v_list.append(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs-Parse ok (argparse; __post_init__ nicht gelaufen)", force_state=GOES))
+    elif par:
+        v_list.append(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs-Parse nicht geprueft: %s" % (par.get("error") or "nicht verfuegbar"), force_state=HINT))
+    n_block = sum(1 for x in v_list if x["force_state"] == BLOCKED)
+    argv = list(p["argv"])
+    return {"schema": SCHEMA, "n": 1, "form": "einzel", "art": v.get("art"), "verdikte": v_list, "lauf": None,
+            "vektoren": {"laengen": {}, "nicht_n": {}}, "ohne_force": None, "mit_force": None, "forced": [], "plan": {},
+            "ausgang": ausgang, "geht": ausgang == "passt", "geht_mit_force": ausgang == "passt",
+            "zaehlung": {FORCE: 0, BLOCKED: n_block, UNCHECKED: 0}, "profil": dict(profil), "argv_sha256": launch_hash(argv, {}),
+            "inventar": [{"index": 0, "name": p["card"]["name"], "total_mib": int(p["card"]["total_mib"])}],
+            "orakel": {"version": {"propose_single": (file_sha256(_single_file()) or "")[:16] or None}, "dauer_s": round(time.time() - t0, 2),
+                       "notizen": [card_note] + list(notes), "laeufe": 0, "art": v.get("art")}}
+
+
+def _num(x: Any) -> Any:
+    return int(x) if isinstance(x, str) and x.isdigit() else x
+
+
+def _single_file() -> str:
+    from sglang.srt.weg2 import propose_single as PS
+
+    return getattr(PS, "__file__", "") or ""
+
+
+def single_je_wert(p: Mapping[str, Any], vorschlag: Mapping[str, Any], verd: Mapping[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """Verdicts per flag: ``werte_verdikte`` (borrowed / unbelegt values) plus what the fit check and the parse said about the flag itself."""
+    out = werte_verdikte(vorschlag, verd)
+    for e in p["flags"]:
+        vd = e["verdikt"]
+        lst = out.setdefault(e["flag"], [])
+        if vd["state"] == "verweigert" and vd.get("code"):
+            for code in str(vd["code"]).split("+"):
+                lst.append(slim_verdikt(verdikt(code, ebene="fit", text=vd["grund"], grund=vd["grund"], force_state=BLOCKED)))
+        if vd.get("parse") == "veraltet (Alias)":
+            lst.append(slim_verdikt(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs kennt dieses Flag nur als veralteten Alias", force_state=HINT)))
+    return out
+
+
+def run_propose_single(req: Mapping[str, Any]) -> Dict[str, Any]:
+    """propose() of the form single card (``propose_single``, plan row AP-F) in the shape of ``run_propose``: ``vorschlag`` (the values in the list of
+    ``propose.py``), ``verdikt`` (Planer-Rechnung, no launcher run), ``je_wert``, ``launch`` ({argv, env: {}}: the arguments of ``python -m sglang.launch_server``).
+    Model: ``model_path`` or the base profile's ``PROFILE_MODEL``; a draft only when ``draft_path`` is given (the base profile's draft is a weg2 draft)."""
+    from sglang.srt.weg2 import propose_single as PS
+
+    t0 = time.time()
+    with tempfile.TemporaryDirectory(prefix="apd-") as scratch:
+        li = _basis_from(req, scratch) if req.get("basis") else None
+        mreq = dict(req)
+        mreq["draft_path"] = req.get("draft_path") or ""
+        modell, draft, notes = _model_profiles(_NoLaunch(str(getattr(li, "model", "") or "")), mreq)
+        if modell is None:
+            return {"ok": False, "error": "kein Modellprofil: %s" % ("; ".join(notes) or "Modellpfad fehlt"), "notizen": notes}
+        z = dict(req.get("ziele") or {})
+        goals = {dst: z[src] for src, dst in _SINGLE_GOALS if z.get(src) not in (None, "")}
+        ignored = sorted(k for k in z if k not in {s for s, _ in _SINGLE_GOALS} and z.get(k) not in (None, "", False))
+        if ignored:
+            notes.append("Ziele ohne Bedeutung fuer eine Karte (ignoriert): %s" % ", ".join(ignored))
+        try:
+            card, card_note = _single_card(req)
+            p = PS.propose_single(modell, card, goals, draft_profile=draft)
+        except (PS.ProposeSingleError, ValueError, KeyError) as exc:
+            return {"ok": False, "error": "Einzelkarte: %s" % exc, "notizen": notes}
+        if req.get("parse", True):
+            p = PS.check(p)
+        else:
+            p["parse"] = {"available": False, "ok": None, "error": "nicht angefragt"}
+        werte = _single_werte(p)
+        fit = p["fit"]
+        lvl = {"passt": "ja", "passt nicht": "nein"}.get(p["verdikt"]["state"], "unbelegt")
+        flag_of = {w["key"]: w["wert"] for w in werte}.get          # what the proposal settled on (the goals may be defaults)
+        hinweise = [str(r.get("grund") or r.get("schritt")) for r in p.get("relaxations") or []] + list(fit.get("hinweise") or [])
+        vorschlag = {"schema": "flliper.propose-a/1", "form": "einzel", "n": 1, "werte": werte,
+                     "cards": [{"name": p["card"]["name"], "total_mib": int(p["card"]["total_mib"]), "tflops_src": None}],
+                     "inventory": {"gleich_wie_profil": False, "n": 1}, "seeds": {},
+                     "fit": {"level": lvl, "first": p["verdikt"]["text"], "margin_mib": fit.get("frei_mib"), "lines": [], "marks": [],
+                             "art": p["verdikt"].get("art") or PS.VERDICT_ART},
+                     "ziele": {"seats": _num(flag_of("--max-running-requests")), "kv_tokens": _num(flag_of("--context-length")), "kv_dtype": flag_of("--kv-cache-dtype")},
+                     "unbelegt": list(p.get("unbelegt") or []), "hinweise": hinweise, "blocker": [], "vektorlaengen": {}, "vektoren_ok": True,
+                     "vektoren_falsch": {}, "basis": os.path.basename(str(getattr(li, "source", "") or "")) or "(kein Profil)",
+                     "argv": list(p["argv"]), "env": {}, "einzelkarte": p}
+        profil = dict(profile_identity(li), rolle="basis") if li is not None else {"rolle": "keines", "quelle": "", "datei_sha256": None, "eingabe_sha256": None}
+        profil["vorschlag_sha256"] = launch_hash(p["argv"], {})
+        verd = single_verdikt(p, card_note, notes, profil, t0)
+        return {"ok": True, "schema": PROPOSE_SCHEMA, "vorschlag": vorschlag, "verdikt": verd, "je_wert": single_je_wert(p, vorschlag, verd),
+                "launch": {"argv": list(p["argv"]), "env": {}}, "notizen": notes}
+
+
 def run_propose(req: Mapping[str, Any], *, tree: str) -> Dict[str, Any]:
     """propose() (stage A) + the oracle (stage B) + the verdicts per value (stage C) for one request of the dashboard worker.
 
-    ``req``: ``basis`` {env_path | env_text}, ``inventar`` {hardware | devices | cards}, ``form`` flip|tp, ``ziele``, ``model_path``,
+    ``req``: ``basis`` {env_path | env_text}, ``inventar`` {hardware | devices | cards}, ``form`` flip|tp|dual|single, ``ziele``, ``model_path``,
     ``draft_path``, ``snapshots`` {registry name: header snapshot dir}, ``instruments``.  Returns ``{"ok": True, "schema": PROPOSE_SCHEMA,
     "vorschlag": <flliper.propose-a/1>, "verdikt": <flliper.verdikt/1>, "je_wert": {key: [verdikt]}, "launch": {argv, env}}`` or
     ``{"ok": False, "error": ...}`` for a request the planner cannot answer at all (no model profile, wrong form)."""
     from sglang.srt.weg2 import propose as P
 
+    if str(req.get("form") or "").lower() in SINGLE_FORMS:
+        return run_propose_single(req)                     # N=1: no launcher, no oracle run (topology.py MIN_CARDS=2)
     with tempfile.TemporaryDirectory(prefix="apd-") as scratch:
         li = _basis_from(req, scratch)
         devices = _devices_of(req)
