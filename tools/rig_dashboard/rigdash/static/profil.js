@@ -10,7 +10,9 @@
   if (!root) return;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const st = { list: null, doc: null, view: null, loaded: "", mode: "einfach", search: "", filt: "alle", cards: [], dry: null, exp: null, issue: null,
-               busy: false, err: null, msg: null, open: {}, fold: {}, dirty: false, started: false, models: null, mprof: null, mpath: "", bars: null, barBusy: false };
+               busy: false, err: null, msg: null, open: {}, fold: {}, dirty: false, started: false, models: null, mprof: null, mpath: "", bars: null, barBusy: false,
+               // AP-H1 (eine Seite): Betriebsform, Inventar, Regler, Vorschlag
+               basis: null, form: "flip", formUser: false, inv: "rig", seats: 6, seatsOn: false, ctx: 262144, ctxOn: false, prop: null, vsrc: "prop", rigHw: null, vecTimer: null };
   const isOpen = (id, dflt) => (id in st.fold ? st.fold[id] : dflt);
   try { const v = localStorage.getItem("rigdash.pf.view"); if (v === "einfach" || v === "experte") st.mode = v; } catch (e) { /* private window */ }
   const REL = { tauscht: "tauscht mit", braucht: "braucht", schliesst_aus: "schließt aus", abgeleitet_von: "abgeleitet von", skaliert_mit: "skaliert mit" };
@@ -36,11 +38,12 @@
   const doLoad = (kind, name) => run(async () => {
     const j = await api("load", { kind, name });
     setView(j); st.loaded = kind + ":" + name; st.dry = null; st.exp = null; st.issue = null; st.dirty = false; st.cmsg = null;
+    st.basis = { kind, name }; st.prop = null; st.formUser = false; st.vsrc = "prop"; inferForm();
     st.msg = (kind === "release" ? "Release-Profil " : "Eigenes Profil ") + name + " geladen.";
   });
   const doEdit = (edits) => run(async () => {
     const j = await api("edit", { doc: st.doc, edits });
-    setView(j); st.dirty = true; st.dry = null; st.exp = null; st.msg = null; st.cmsg = null;
+    setView(j); st.dirty = true; st.dry = null; st.vsrc = "prop"; st.exp = null; st.msg = null; st.cmsg = null;
   });
   const doSave = (name) => run(async () => {
     const j = await api("save", { doc: st.doc, name });
@@ -67,7 +70,39 @@
     const j = await api("issue", { doc: st.doc, dry: st.dry, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })), model: st.mprof ? st.mprof.profile : null });
     st.issue = { text: j.text, blocks: j.blocks || [], filename: j.filename || "laufbericht.md", key: issueKey() };
   });
-  const doDry = () => run(async () => { st.dry = await api("dry", { doc: st.doc, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })) }); });
+  const doDry = () => run(async () => { st.dry = await api("dry", { doc: st.doc, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })) }); st.vsrc = "dry"; });
+
+  // ------------------------------------------------------------------ Planer: Vorschlag, Neu prüfen, Inventar (AP-H1)
+  const planer = () => (window.ProfilPlaner && st.list && st.list.planer ? window.ProfilPlaner : null);
+  const nCards = () => {
+    if (st.prop && st.prop.n) return st.prop.n;
+    if (st.inv === "syn") return st.cards.length || null;
+    return st.rigHw ? st.rigHw.cards.length : null;
+  };
+  function inferForm() { const PX = planer(); if (PX && !st.formUser && st.doc) st.form = PX.formOf(st.doc, nCards()); }
+  const backendForm = () => { const f = ((st.list.planer || {}).formen || []).find((x) => x.id === st.form); return f ? f.backend : null; };
+  const doPropose = () => run(async () => {
+    if (!st.basis) throw new Error("Erst ein Profil laden (Schritt 2): der Vorschlag geht von diesem Profil aus.");
+    const ziele = {};
+    if (st.seatsOn) ziele.seats = st.seats;
+    if (st.ctxOn) ziele.kv_tokens = st.ctx;
+    const inventar = st.inv === "rig" ? "rig" : st.cards.map((c) => ({ card: c.card, pcie: c.pcie }));
+    const j = await api("propose", { basis: st.basis, form: backendForm(), inventar, ziele });
+    st.prop = j; st.vsrc = "prop"; st.dry = null; st.exp = null; st.dirty = true; st.cmsg = null;
+    setView({ doc: j.startprofil.doc, view: j.startprofil.view });
+    st.msg = "Vorschlag eingesetzt als " + j.startprofil.name + " (noch nicht gespeichert).";
+  });
+  // Neu prüfen: der Trockenlauf mit den gewählten Karten; "Dieses Rig" nimmt die Vorbelegung des Rigs (die NVML-Karten dieses Rigs, wenn sie passen)
+  const doRecheck = () => { if (st.inv === "rig" || !st.cards.length) st.cards = JSON.parse(JSON.stringify((st.list.rig_preset || {}).cards || [])); st.fold.dry = true; return doDry(); };
+  async function loadRig() {
+    try {
+      const r = await fetch("api/hwprofil", { cache: "no-store" });
+      const j = JSON.parse(await r.text());
+      const cs = (j && j.ok !== false && j.profile && j.profile.cards) || [];
+      st.rigHw = cs.length ? { cards: cs.map((c) => ({ name: c.name, mib: c.vram_total_mib && typeof c.vram_total_mib === "object" ? c.vram_total_mib.v : c.vram_total_mib })) } : null;
+    } catch (e) { st.rigHw = null; /* Release ohne Hardwaredienst: der Vorschlag meldet es selbst */ }
+    inferForm(); draw();
+  }
 
   // ------------------------------------------------------------------ Darstellung
   // Katalog (AP-A): vorbelegt sind RTX 5090, RTX 3080 20 GB, RTX 3090; die übrigen Karten stehen eingeklappt unter "weitere Karten" mit sichtbarer Herkunft.
@@ -95,7 +130,7 @@
         steht im Abschnitt Hardware; wer eine andere Karte besitzt, hängt es als Issue-Text an (Knopf dort).</div>
       <table class="pf-more-t"><thead><tr><th>Karte</th><th>Arch</th><th>VRAM</th><th>Nennbandbreite</th><th>Herkunft</th><th></th></tr></thead><tbody>${rows}</tbody></table></details>`;
   }
-  function drawCards() {
+  function drawCardPicker(withDry) {
     const L = st.list;
     const rows = st.cards.map((k, i) => `<div class="pf-card" data-i="${i}"><b>Karte ${i + 1}</b>
       <select data-cf="card">${cardOpts(k.card)}</select>
@@ -104,8 +139,9 @@
       ${drawMoreCards()}
       <div class="pf-row-actions"><button type="button" data-act="cadd"${st.cards.length >= 6 ? " disabled" : ""}>+ Karte</button>
       <button type="button" data-act="cpreset" title="${esc((L.rig_preset || {}).src || "")}">Unser Rig einsetzen</button>
-      <button type="button" data-act="dry" class="pf-main"${st.cards.length ? "" : " disabled"}>Trockenlauf: was lehnt der Planer ab?</button></div>`;
+      ${withDry ? `<button type="button" data-act="dry" class="pf-main"${st.cards.length ? "" : " disabled"}>Trockenlauf: was lehnt der Planer ab?</button>` : ""}</div>`;
   }
+  const drawCards = () => drawCardPicker(true);
   function drawDry() {
     const d = st.dry;
     if (!d) return `<div class="muted pf-note">Karten wählen und prüfen lassen. Rechnet mit dem Planer-Gate (card_identity, topology) und den Profil-Werten; nichts wird gestartet.</div>`;
@@ -205,16 +241,17 @@
     const dis = (r.planner_value != null && r.planner_value !== r.value) ? `<span class="pf-diff" title="Planer-Wert: ${esc(r.planner_value)}">Planer: ${esc(r.planner_value)}</span>` : "";
     return `<tr class="pf-r pf-o-${r.origin}${r.changed ? " pf-ch" : ""}" id="pfr-${esc(r.key)}" data-name="${esc(r.name)}">
       <td class="pf-n"><span class="mono">${esc(r.name)}</span> <span class="pf-chip pf-sc">${esc(SCOPE[r.scope] || r.scope)}</span></td>
-      <td class="pf-v">${inputFor(r)}${dis}</td>
+      <td class="pf-v">${window.ProfilPlaner ? window.ProfilPlaner.valueField(r, planCtx()) : inputFor(r)}${dis}</td>
       <td class="pf-o"><span class="pf-org pf-org-${r.origin}" title="Herkunft des Werts">${esc(r.origin_label)}</span> ${resets.join(" ")}</td>
       <td class="pf-e"><div class="pf-short" data-open="${esc(r.key)}">${short ? esc(short) : '<span class="pf-unex-s">unerklärt</span>'} <span class="muted">${open ? "▲" : "▼"}</span></div>
         ${r.explain.depends.length ? `<div class="pf-deps">${r.explain.depends.map(depChip).join("")}</div>` : ""}
         ${st.cmsg && st.cmsg.key === r.key ? `<div class="pf-cmsg" role="status">${esc(st.cmsg.text)}</div>` : ""}
         ${open ? `<div class="pf-full">${drawExplain(r)}</div>` : ""}</td></tr>`;
   }
-  function visibleRows() {
+  function visibleRows(exclude) {
     const q = st.search.trim().toLowerCase();
     return st.view.rows.filter((r) => {
+      if (exclude && exclude.has(r.key)) return false;      // AP-H1: was ein Abschnitt A-D schon zeigt, steht nicht noch einmal in der Liste
       if (st.mode === "einfach") return r.explain.level === "einfach" && r.explain.status !== "unerklaert";
       if (st.filt === "geaendert" && !r.changed) return false;
       if (st.filt === "planer" && r.planner_value == null) return false;
@@ -223,8 +260,8 @@
       return true;
     });
   }
-  function drawRows() {
-    const vr = visibleRows();
+  function drawRows(exclude) {
+    const vr = visibleRows(exclude);
     const groups = {};
     vr.forEach((r) => { const g = r.explain.group || ({ P: "Gruppe P", D: "Gruppe D", form: "Formschalter", instr: "Instrumente", launcher: "Launcher", profile: "Profil", all: "Umgebung" }[r.scope] || "Sonstiges"); (groups[g] = groups[g] || []).push(r); });
     const names = Object.keys(groups).sort((a, b) => a.localeCompare(b, "de"));
@@ -414,11 +451,93 @@
         <pre class="kp-pre pf-run" id="pf-run">${esc((x.use.docker_run || []).join("\n"))}</pre>${drawForce(x.use.force)}</div>
       <pre class="kp-pre pf-env" id="pf-env">${esc(x.env)}</pre></section>`;
   }
+  // ------------------------------------------------------------------ Seite: Hardware -> Modell -> Form -> Vorschlag -> Anpassen -> Export (AP-H1, R12)
+  function planCtx() {
+    const PX = window.ProfilPlaner;
+    const cards = st.prop && st.prop.vorschlag && st.prop.vorschlag.cards ? st.prop.vorschlag.cards.map((c) => ({ name: c.name, mib: c.total_mib })) : [];
+    const pl = (st.list && st.list.planer) || {};
+    return { vecNames: new Set(pl.vektoren || []), posNames: new Set(pl.positional || []), rankNames: new Set(pl.je_rang || []), n: nCards(), ranks: cards, mode: st.mode, prop: st.prop, vsrc: st.vsrc, dry: st.dry, open: st.open, cmsg: st.cmsg, isOpen,
+             hasProfileValues: !!(st.doc && Object.keys((st.doc.meta || {}).profile_values || {}).length),
+             input: inputFor, short: (r) => { const f = r.explain.parts.length ? r.explain.parts[0].text : ""; return f.length > 170 ? f.slice(0, 168) + "…" : f; },
+             explain: drawExplain, depChip, PX };
+  }
+  function rigSummary() {
+    if (!st.rigHw) return `<div class="muted pf-note">Das Hardwareprofil dieses Rigs ist nicht lesbar (Release ohne Hardwaredienst?). Der Vorschlag meldet es; Sie können stattdessen Karten aus dem Katalog wählen.</div>`;
+    const cs = st.rigHw.cards.map((c) => `<li>${esc(window.ProfilPlaner.shortName(c.name))} <span class="muted">${c.mib ? Math.round(c.mib / 1024) + " GB" : ""}</span></li>`).join("");
+    return `<div class="pf-note">Das Hardwareprofil dieses Rigs: <b>${st.rigHw.cards.length} Karte${st.rigHw.cards.length === 1 ? "" : "n"}</b> (echte NVML-Karten mit UUID).</div><ul class="pfx-cards pfx-rig">${cs}</ul>`;
+  }
+  function planerHtml() {
+    const PX = window.ProfilPlaner, L = st.list, info = L.planer, ctx = planCtx(), n = ctx.n;
+    const relOpts = L.release.map((p) => `<option value="release:${esc(p.name)}"${st.loaded === "release:" + p.name ? " selected" : ""}>${esc(p.name)}${p.status ? " · " + esc(p.status) : ""}${p.format ? " · " + esc(p.format) : ""}</option>`).join("");
+    const usrOpts = L.user.map((p) => `<option value="user:${esc(p.name)}"${st.loaded === "user:" + p.name ? " selected" : ""}>${esc(p.name)}</option>`).join("");
+    const isUser = st.loaded.startsWith("user:"), cov = st.view ? st.view.coverage : null;
+    const form = (info.formen || []).find((f) => f.id === st.form) || {};
+    const canCards = st.inv === "rig" || st.cards.length > 0;
+    const whyNot = !st.basis ? "Erst ein Profil laden (Schritt 2): der Vorschlag geht von diesem Profil aus." : !canCards ? "Erst Karten wählen (Schritt 1)." : "";
+    // Schritt 1: Hardware
+    const s1 = `<section class="pfx-step" aria-labelledby="pfx-h1"><h3 id="pfx-h1"><span class="pfx-no">1</span> Hardware</h3>
+      <div class="pfx-seg" role="radiogroup" aria-label="Inventar"><button type="button" data-inv="rig" role="radio" aria-checked="${st.inv === "rig"}" class="${st.inv === "rig" ? "sel" : ""}">Dieses Rig (Hardwareprofil)</button><button type="button" data-inv="syn" role="radio" aria-checked="${st.inv === "syn"}" class="${st.inv === "syn" ? "sel" : ""}">Aus dem Katalog (synthetisch)</button></div>
+      ${st.inv === "rig" ? rigSummary() : `<div class="muted pf-note">Karten aus dem Katalog: die drei vorbelegten (RTX 5090, RTX 3080 20 GB, RTX 3090) zuerst, die übrigen unter „weitere Karten“ (Datenblatt, ohne Messraten, jeder geborgte Wert steht als unbelegt da).</div>${drawCardPicker(false)}`}
+      ${drawHardware()}</section>`;
+    // Schritt 2: Modell / Profil
+    const s2 = `<section class="pfx-step" aria-labelledby="pfx-h2"><h3 id="pfx-h2"><span class="pfx-no">2</span> Modell und Profil</h3>
+      <div class="pf-top"><label>Profil <select id="pf-pick"><option value="">— wählen —</option><optgroup label="Release-Profile (.env)">${relOpts}</optgroup>${usrOpts ? `<optgroup label="Eigene Profile (State-Volume)">${usrOpts}</optgroup>` : ""}</select></label>
+        <button type="button" data-act="load"${st.busy ? " disabled" : ""}>Laden</button>
+        <label>Name <input type="text" id="pf-name" value="${esc(st.doc ? st.doc.name : "")}" placeholder="mein-profil" size="22" spellcheck="false"></label>
+        <button type="button" data-act="save" class="pf-main"${st.doc && !st.busy ? "" : " disabled"}>Speichern</button>
+        <button type="button" data-act="del"${isUser && !st.busy ? "" : " disabled"}>Löschen</button></div>
+      <div class="muted pf-note">Das Profil gibt Modell, Draft und Ausgangswerte vor. Das Dashboard <b>erstellt</b> nur das Profil und startet nichts; beim Serverstart geben Sie es an (<span class="mono">FLLIPER_PROFILE=&lt;name&gt;</span>).</div>
+      ${st.doc ? `<div class="pf-stat"><b>${esc(st.doc.name)}</b> · Linie ${esc(st.doc.line || "?")} · ${cov.rows} Werte, <b>${cov.erklaert}</b> erklärt, <span class="${cov.unerklaert ? "pf-warn" : ""}">${cov.unerklaert} unerklärt</span> · <b>${cov.geaendert}</b> geändert${st.dirty ? ' · <span class="pf-warn">nicht gespeichert</span>' : ""}</div>` : ""}
+      ${drawModels()}</section>`;
+    // Schritt 3: Betriebsform
+    const s3 = `<section class="pfx-step" aria-labelledby="pfx-h3"><h3 id="pfx-h3"><span class="pfx-no">3</span> Betriebsform</h3>${PX.renderFormPick(info, st.form, n)}</section>`;
+    // Schritt 4: Vorschlag
+    const s4 = `<section class="pfx-step" aria-labelledby="pfx-h4"><h3 id="pfx-h4"><span class="pfx-no">4</span> Vorschlag</h3>
+      ${PX.renderControls(info, { form: st.form, seats: st.seats, seatsOn: st.seatsOn, ctx: st.ctx, ctxOn: st.ctxOn, busy: st.busy, canPropose: !!st.basis && canCards, whyNot, canCheck: !!st.doc && canCards })}
+      ${PX.renderProposal(st.prop)}</section>`;
+    // Schritt 5: Anpassen
+    let s5body = `<div class="muted pf-note">Erst ein Profil laden (Schritt 2).</div>`;
+    if (st.doc) {
+      const rows = st.view.rows, used = new Set(), po = st.view.planner_only || [];
+      const secs = (info.abschnitte || []).map((sec) => {
+        const r = PX.renderSection(sec, rows, ctx, sec.id === "B" ? drawKvHeads() : "", po);
+        r.keys.forEach((k) => used.add(k));
+        return r.html;
+      });
+      const dualNames = new Set(PX.DUAL_NAMES(info));
+      const hasDual = st.form === "dual" || rows.some((r) => dualNames.has(r.name));
+      let dual = "";
+      if (hasDual) { dual = PX.renderDual(rows, info, ctx); rows.forEach((r) => { if (dualNames.has(r.name)) used.add(r.key); }); }
+      const filt = st.mode === "experte" ? `<div class="pf-filter"><input type="search" id="pf-search" placeholder="Wert oder Erklärung suchen" value="${esc(st.search)}">
+        ${["alle", "geaendert", "planer", "unerklaert"].map((f) => `<button type="button" data-filt="${f}" class="${st.filt === f ? "sel" : ""}">${{ alle: "alle", geaendert: "geändert", planer: "mit Planer-Wert", unerklaert: "unerklärt" }[f]}</button>`).join("")}</div>` : "";
+      s5body = `${secs.join("")}${dual}
+        <details class="pf-fold pfx-rest" data-fold="rest" ${isOpen("rest", st.mode === "experte") ? "open" : ""}><summary><b>E  Übrige Werte</b> <span class="muted">alles, was nicht in A bis D steht</span></summary>
+          ${st.mode === "einfach" ? `<div class="muted pf-note">Einfache Ansicht: die wichtigsten Werte. Alle ${cov.rows} Werte, Instrumente und Umgebung stehen in der Expertenansicht.</div>` : ""}
+          ${filt}${drawRows(used)}${st.mode === "experte" ? drawPlannerOnly() : ""}${drawRemoved()}</details>
+        <details class="pf-fold" data-fold="dry" ${isOpen("dry", false) ? "open" : ""}><summary><b>Trockenlauf</b> · welche Ablehnungen hätte der Planer? <span class="muted">(Knopf „Neu prüfen“ in Schritt 4)</span></summary>${drawDry()}</details>
+        ${drawBars()}${drawGlossar()}`;
+    }
+    const s5 = `<section class="pfx-step" aria-labelledby="pfx-h5"><h3 id="pfx-h5"><span class="pfx-no">5</span> Anpassen
+        <span class="pf-seg pfx-view"><button type="button" data-mode="einfach" class="${st.mode === "einfach" ? "sel" : ""}">Einfach</button><button type="button" data-mode="experte" class="${st.mode === "experte" ? "sel" : ""}">Experte</button></span></h3>
+      <div class="muted pf-note">Jedes Feld ist bedienbar. Der Chip „Zustand“ sagt, woher der Wert kommt; der Chip „Urteil“, was der Launcher dazu sagt (geht, nur mit --force, verweigert). Ein Urteil ist ein Hinweis, keine Sperre.</div>
+      ${s5body}</section>`;
+    // Schritt 6: Export
+    const s6 = `<section class="pfx-step" aria-labelledby="pfx-h6"><h3 id="pfx-h6"><span class="pfx-no">6</span> Export</h3>
+      <div class="pf-row-actions"><button type="button" data-act="export" class="pf-main"${st.doc && !st.busy ? "" : " disabled"}>Als .env exportieren</button></div>${drawExport()}</section>`;
+    return `${st.err ? `<div class="kp-verdict bad">${esc(st.err)}</div>` : ""}${st.msg ? `<div class="muted pf-note pfx-msg">${esc(st.msg)}</div>` : ""}${s1}${s2}${s3}${s4}${s5}${s6}`;
+  }
   function draw() {
     const act = document.activeElement;
-    const keep = act && act.dataset && act.dataset.k ? act.dataset.k : null;
+    const keep = act && act.dataset && act.dataset.k ? { sel: `[data-k="${act.dataset.k}"]` } : act && act.dataset && act.dataset.fid ? { sel: `[data-fid="${act.dataset.fid}"]` } : null;
     const L = st.list;
     if (!L) { root.innerHTML = st.err ? `<div class="kp-verdict bad">${esc(st.err)}</div>` : `<div class="muted">lädt …</div>`; return; }
+    if (planer()) {
+      root.innerHTML = planerHtml();
+      const hwSlot = root.querySelector("#pf-hwroot");
+      if (hwSlot && hwEl) hwSlot.appendChild(hwEl);
+      if (keep) { const el = root.querySelector(keep.sel); if (el) el.focus(); }
+      return;
+    }
     const relOpts = L.release.map((p) => `<option value="release:${esc(p.name)}"${st.loaded === "release:" + p.name ? " selected" : ""}>${esc(p.name)}${p.status ? " · " + esc(p.status) : ""}${p.format ? " · " + esc(p.format) : ""}</option>`).join("");
     const usrOpts = L.user.map((p) => `<option value="user:${esc(p.name)}"${st.loaded === "user:" + p.name ? " selected" : ""}>${esc(p.name)}</option>`).join("");
     const isUser = st.loaded.startsWith("user:");
@@ -451,7 +570,7 @@
       ${drawExport()}`;
     const hwSlot = root.querySelector("#pf-hwroot");
     if (hwSlot && hwEl) hwSlot.appendChild(hwEl);
-    if (keep) { const el = root.querySelector(`[data-k="${CSS.escape(keep)}"]`); if (el) el.focus(); }
+    if (keep) { const el = root.querySelector(keep.sel); if (el) el.focus(); }
   }
 
   // ------------------------------------------------------------------ Ereignisse
@@ -465,11 +584,48 @@
     const t = e.target;
     if (t.id === "pf-pick") return;
     if (t.dataset.cf === "card") { const i = +t.closest(".pf-card").dataset.i; st.cards[i].card = t.value; st.dry = null; return draw(); }
+    if (t.dataset.regOn) { if (t.dataset.regOn === "seats") st.seatsOn = t.checked; else st.ctxOn = t.checked; return draw(); }
+    if (t.dataset.vk) return vecChanged(t);
+    if (t.dataset.gt) return greenChanged(t);
     if (t.dataset.k) {
       if (t.dataset.bare) return doEdit([{ key: t.dataset.k, op: t.checked ? "set" : "delete", value: "" }]);
       return doEdit([{ key: t.dataset.k, op: "set", value: t.value }]);
     }
   });
+  // Je-Karte-Felder: ein Eintrag je Rang, geschrieben wird EIN Vektor; entprellt, damit Tab von Feld zu Feld die Seite nicht neu zeichnet
+  function vecChanged(t) {
+    const wrap = t.closest("[data-vrow]"), key = t.dataset.vk;
+    const vals = [...wrap.querySelectorAll("input[data-vk]")].map((x) => x.value.trim());
+    if (vals.some((v) => !v || /[,\s]/.test(v))) { st.err = "Jeder Eintrag braucht einen Wert ohne Komma und Leerzeichen."; return draw(); }
+    const sum = wrap.querySelector(".pfx-sum"), PX = window.ProfilPlaner, sm = PX.vecSum(vals);
+    if (sum && sm != null) sum.textContent = "Σ " + sm.toLocaleString("de-DE", { maximumFractionDigits: 6 });
+    clearTimeout(st.vecTimer);
+    st.vecTimer = setTimeout(() => doEdit([{ key, op: "set", value: PX.vecJoin(vals) }]), 650);
+  }
+  function greenChanged(t) {
+    const tab = t.closest("table[data-gtab]"), PX = window.ProfilPlaner;
+    const rows = [...tab.querySelectorAll("tbody tr")].map((tr) => {
+      const g = (f) => parseInt((tr.querySelector(`[data-gt="${f}"]`) || {}).value, 10);
+      return { bs: g("bs"), lo: g("lo"), hi: g("hi") };
+    });
+    if (rows.some((r) => !(r.bs >= 0 && r.lo >= 0 && r.hi >= 0))) { st.err = "Die Tabelle braucht ganze Zahlen (D-Sitze, Stufen)."; return draw(); }
+    return doEdit([{ key: tab.dataset.gtab, op: "set", value: PX.serializeGreen(rows) }]);
+  }
+  // Regler (Sitze, Kontext): Zustand und Geschwister-Felder werden ohne neues Zeichnen nachgeführt (ein Neuzeichnen würde den gezogenen Regler zerstören)
+  function regInput(t) {
+    const name = t.dataset.reg, PX = window.ProfilPlaner, wrap = t.closest(".pfx-reg");
+    let v;
+    if (name === "ctx" && t.type === "range") v = PX.CTX_STEPS[Math.max(0, Math.min(PX.CTX_STEPS.length - 1, parseInt(t.value, 10) || 0))];
+    else v = parseInt(t.value, 10);
+    if (!(v > 0)) return;
+    if (name === "seats") { st.seats = v; st.seatsOn = true; } else { st.ctx = v; st.ctxOn = true; }
+    wrap.querySelectorAll("[data-reg]").forEach((x) => {
+      if (x === t) return;
+      if (x.type === "range") x.value = name === "ctx" ? PX.ctxIndex(v) : Math.min(32, v); else x.value = v;
+    });
+    const on = wrap.querySelector("[data-reg-on]"); if (on) on.checked = true;
+  }
+  root.addEventListener("input", (e) => { if (e.target.dataset && e.target.dataset.reg) return regInput(e.target); });
   root.addEventListener("input", (e) => { if (e.target.id === "pf-search") { st.search = e.target.value; const p = e.target.selectionStart; draw(); const s = document.getElementById("pf-search"); if (s) { s.focus(); s.setSelectionRange(p, p); } } });
   root.addEventListener("click", (e) => {
     const t = e.target.closest("button, [data-open], [data-goto]");
@@ -488,6 +644,13 @@
       if (st.mode === "einfach" && row.explain.level !== "einfach") { st.mode = "experte"; draw(); }
       const el = document.getElementById("pfr-" + row.key); if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("pf-flash"); setTimeout(() => el.classList.remove("pf-flash"), 1600); }
       return;
+    }
+    if (t.dataset.inv) { st.inv = t.dataset.inv; inferForm(); return draw(); }
+    if (t.dataset.form) { st.form = t.dataset.form; st.formUser = true; return draw(); }
+    if (t.dataset.addflag) {
+      const inp = root.querySelector(`input[data-newflag="${CSS.escape(t.dataset.addflag)}"]`), v = inp ? inp.value.trim() : "";
+      if (!v) { st.err = "Einen Wert für " + t.dataset.addflag + " eingeben."; return draw(); }
+      return doEdit([{ key: "flag:" + t.dataset.addflag, op: "set", value: v }]);
     }
     if (t.dataset.mode) { st.mode = t.dataset.mode; try { localStorage.setItem("rigdash.pf.view", st.mode); } catch (er) { /* private window */ } return draw(); }
     if (t.dataset.filt) { st.filt = t.dataset.filt; return draw(); }
@@ -517,6 +680,8 @@
     if (a === "models") return doModels();
     if (a === "estpath") { const v = (document.getElementById("pf-mpath") || {}).value || ""; if (v.trim()) doEstimate(v.trim()); return; }
     if (a === "dry") return doDry();
+    if (a === "propose") return doPropose();
+    if (a === "recheck") return doRecheck();
     if (a === "cadd") { st.cards.push({ card: st.list.cards[0].id, pcie: { gen: 4, lanes: 8 } }); st.dry = null; return draw(); }
     if (a === "cadd-id") { if (st.cards.length < 6) st.cards.push({ card: t.dataset.id, pcie: { gen: 4, lanes: 8 } }); st.dry = null; return draw(); }
     if (a === "cdel") { st.cards.splice(+t.closest(".pf-card").dataset.i, 1); st.dry = null; return draw(); }
@@ -534,6 +699,7 @@
     if (st.started) return; st.started = true;
     try { st.list = await api("list"); st.cards = JSON.parse(JSON.stringify((st.list.rig_preset || {}).cards || [])); } catch (e) { st.err = e.message; st.started = false; }
     draw();
+    if (planer()) loadRig();
   }
   window.RigProfil = { show: start };
   if (document.getElementById("tab-profil") && !document.getElementById("tab-profil").hidden) start();

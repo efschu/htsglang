@@ -944,7 +944,7 @@
       "anker": "def c3_chunk",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 515,
+      "zeile": 573,
       "zeile_hinweis": 515
      },
      "belegt": true,
@@ -15533,7 +15533,7 @@
       "anker": "def c4_context_target",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 545,
+      "zeile": 603,
       "zeile_hinweis": 545
      },
      "belegt": true,
@@ -19306,7 +19306,7 @@
       "anker": "def c1_layer_split",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 383,
+      "zeile": 441,
       "zeile_hinweis": 383
      },
      "belegt": true,
@@ -20316,7 +20316,7 @@
       "anker": "def c1_layer_split",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 383,
+      "zeile": 441,
       "zeile_hinweis": 383
      },
      "belegt": true,
@@ -20335,7 +20335,7 @@
       "anker": "def c4_context_target",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 545,
+      "zeile": 603,
       "zeile_hinweis": 545
      },
      "belegt": true,
@@ -21208,7 +21208,7 @@
       "anker": "def c1_layer_split",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 383,
+      "zeile": 441,
       "zeile_hinweis": 383
      },
      "belegt": true,
@@ -21227,7 +21227,7 @@
       "anker": "def c2_expert_residency",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 459,
+      "zeile": 517,
       "zeile_hinweis": 459
      },
      "belegt": true,
@@ -21455,7 +21455,7 @@
       "anker": "def c2_expert_residency",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 459,
+      "zeile": 517,
       "zeile_hinweis": 459
      },
      "belegt": true,
@@ -21524,7 +21524,7 @@
       "anker": "def c2_expert_residency",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 459,
+      "zeile": 517,
       "zeile_hinweis": 459
      },
      "belegt": true,
@@ -50835,7 +50835,8 @@
    "kind": "env",
    "lesestellen": [
     "registry/nvml.py:359",
-    "registry/nvml.py:815"
+    "registry/nvml.py:815",
+    "weg2/propose_oracle.py:409"
    ],
    "level": "experte",
    "name": "SGLANG_NVML_REPLAY_JSON",
@@ -66916,9 +66917,29 @@
    "choices": null,
    "cost": "",
    "default": "0",
-   "depends": [],
-   "gain": "",
-   "group": "",
+   "depends": [
+    {
+     "beleg": {
+      "anker": "_ms = _retry_ms() if _dual_layout_env() else 0",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/dual_p_kv_stage.py",
+      "zeile": 893,
+      "zeile_hinweis": 893
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Drosselung der Vergabe-Wiederholung gilt nur im Dual-Layout; sonst bleibt sie 0 (aus).",
+     "kante": "K116",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die Drosselung der Vergabe-Wiederholung gilt nur im Dual-Layout; sonst bleibt sie 0 (aus).",
+     "to": "--dual-layout",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
+   "gain": "Entlastet PP0 (CPU unter der GIL), solange P-Anfragen auf KV-Platz warten.",
+   "group": "Dual",
    "help": "#1530 GRANT-RETRY throttle (dual layout, PP0 only; 0 = OFF = every pass retries as before). B9g boot 5 (04.10. 20:10-20:22Z): PP0 retried 9 held legs on EVERY scheduler pass (~2000 grants/s: stage JSON + ledger reads each), CPU 101 % under the GIL, forward/publish starved (stop-and-go, Deadman HAENGT 2x ~90 s). With N > 0 a held rid retries at most every N ms unless a card ledger record changed since its last attempt; stage tables are cached by mtime.",
    "id": "SGLANG_WEG2_DUAL_GRANT_RETRY_MS",
    "kind": "env",
@@ -66926,14 +66947,15 @@
    "name": "SGLANG_WEG2_DUAL_GRANT_RETRY_MS",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "environ.py SGLANG_WEG2_DUAL_GRANT_RETRY_MS (Kommentar, Zeilen 679-684); dual_p_kv_stage.py (Zeilen 668-681, 893)",
    "source": {
     "baum": "27b",
     "file": "environ.py",
     "kind": "environ",
     "line": 684
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Drosselung der KV-Vergabe-Wiederholung (#1530, nur Dual-Layout, nur PP0; 0 = AUS, dann probiert jede Scheduler-Runde es erneut). Mit N > 0 probiert eine wartende Anfrage höchstens alle N ms erneut, außer ein Karten-Ledger-Eintrag hat sich seit ihrem letzten Versuch geändert; Stufen-Tabellen werden nach mtime zwischengespeichert. Anlass im Code-Kommentar: Boot B9g 5 (04.10.), PP0 wiederholte neun wartende Beine in JEDER Runde (~2000 Vergaben/s), CPU 101 % unter der GIL, Forward und Publish verhungerten.",
    "type": "EnvInt"
   },
   "SGLANG_WEG2_DUAL_GRANT_WAIT": {
@@ -68189,6 +68211,217 @@
    "status": "geerntet",
    "text": "",
    "type": "os.environ"
+  },
+  "SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [
+    {
+     "beleg": {
+      "anker": "``--dual-priority dynamic`` with the ladder armed",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/dual_green.py",
+      "zeile": 1162,
+      "zeile_hinweis": 1162
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Tabelle der Eintrittsstufen gehört dem Regler der Front und wirkt nur mit --dual-priority dynamic (balanced und d behalten ihre feste Stufe, p bleibt bei 100 %).",
+     "kante": "K109",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die Tabelle der Eintrittsstufen gehört dem Regler der Front und wirkt nur mit --dual-priority dynamic (balanced und d behalten ihre feste Stufe, p bleibt bei 100 %).",
+     "to": "--dual-priority",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "return \"green\" in acts and bool(str(e.get(_ds.CTL_ENV",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/dual_green.py",
+      "zeile": 150,
+      "zeile_hinweis": 150
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Ohne 'green' unter den Stellgliedern ist die Leiter nicht scharf; dann gibt es keine SM-Stufen, die die Tabelle wählen könnte.",
+     "kante": "K110",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Ohne 'green' unter den Stellgliedern ist die Leiter nicht scharf; dann gibt es keine SM-Stufen, die die Tabelle wählen könnte.",
+     "to": "--dual-share-actuators",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "if not ladder_switch(e):",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/dual_green.py",
+      "zeile": 140,
+      "zeile_hinweis": 140
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Leiter muss an sein (on oder hold), sonst ist sie auf P nicht scharf und die Tabelle wird nicht gelesen.",
+     "kante": "K111",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die Leiter muss an sein (on oder hold), sonst ist sie auf P nicht scharf und die Tabelle wird nicht gelesen.",
+     "to": "--dual-green-ladder",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "return k, f\"model(rmin={rmin:g},tsolo={ts:.0f}{src[0]})\"",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/dual_green.py",
+      "zeile": 1214,
+      "zeile_hinweis": 1214
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Ist --dual-d-min-rate-tps größer 0, wählt die Front die Eintrittsstufe aus dem Modell (Ziel-Rundenzeit gegen Ds Solo-Zeit); die Tabelle gilt dafür nicht.",
+     "kante": "K112",
+     "quelle": "katalog",
+     "rel": "abgeleitet_von",
+     "satz": "Ist --dual-d-min-rate-tps größer 0, wählt die Front die Eintrittsstufe aus dem Modell (Ziel-Rundenzeit gegen Ds Solo-Zeit); die Tabelle gilt dafür nicht.",
+     "to": "--dual-d-min-rate-tps",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
+   "gain": "",
+   "group": "Dual",
+   "help": "",
+   "id": "SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "dual_green.py GreenConfig.table (Zeile 1071), from_env (Zeile 1097), start_stage (Zeilen 1204-1224); dual_share.py ShareConfig (Zeilen 139-141)",
+   "source": {
+    "file": "profile",
+    "kind": "kuratiert",
+    "line": 0
+   },
+   "status": "kuratiert",
+   "text": "Eintrittsstufe von Ps SM-Anteil, wenn D nach Leerlauf wieder decodet und keine Mindestrate (--dual-d-min-rate-tps) gesetzt ist: Zeilen \"bs-Schwelle:Stufe tau niedrig:Stufe tau hoch\", getrennt durch Semikolon (Beispiel im Code: \"2:1:0;4:2:1;99:3:2\"). Es gilt die erste Zeile, deren Schwelle D-bs erreicht oder übersteigt; tau ist die wartende P-Arbeit in Sekunden (hoch = über der oberen tau-Kante, Standard 2 und 10 s). Stufe 0/1/2/3 = Ps Anteil 100/75/50/25 % (Standard der Stufen SGLANG_WEG2_DUAL_SHARE_RUNGS = 1,0.75,0.5,0.25). Standard im Code: 2:1:0;4:2:1;1000000000:3:2. Ist D leer (bs 0), steht P sofort auf 100 %. Danach regelt die Front auf die gemessene D-Rundenzeit nach; die Aushungerungs-Klemme gilt zusätzlich. Nur im Dual-Layout (27B-Linie).",
+   "type": "str"
+  },
+  "SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [
+    {
+     "beleg": {
+      "anker": "if self.mode != \"p\" and oldest_age_s > cfg.starve_age_s and target > cfg.starve_max_rung:",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/dual_share.py",
+      "zeile": 414,
+      "zeile_hinweis": 414
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Klemme greift erst, wenn beide Bedingungen zugleich gelten: die Wartezeit der ältesten P-Anfrage über STARVE_AGE_S und die Zielstufe tiefer als STARVE_MAX_RUNG.",
+     "kante": "K113",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Die Klemme greift erst, wenn beide Bedingungen zugleich gelten: die Wartezeit der ältesten P-Anfrage über STARVE_AGE_S und die Zielstufe tiefer als STARVE_MAX_RUNG.",
+     "to": "SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG",
+     "to_kind": "env",
+     "wert": null
+    },
+    {
+     "beleg": {
+      "anker": "if self.mode != \"p\" and oldest_age_s > cfg.starve_age_s and target > cfg.starve_max_rung:",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/dual_share.py",
+      "zeile": 414,
+      "zeile_hinweis": 414
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Klemme ist Teil des Reglers der Front (--dual-priority); im Modus p (P voll) ist sie aus.",
+     "kante": "K114",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die Klemme ist Teil des Reglers der Front (--dual-priority); im Modus p (P voll) ist sie aus.",
+     "to": "--dual-priority",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
+   "gain": "",
+   "group": "Dual",
+   "help": "",
+   "id": "SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "dual_share.py ShareConfig.starve_age_s (Zeile 157) und Klemme (Zeilen 414-417); dual_green.py (Zeilen 1319-1322)",
+   "source": {
+    "file": "profile",
+    "kind": "kuratiert",
+    "line": 0
+   },
+   "status": "kuratiert",
+   "text": "Aushungerungs-Klemme, Teil 1 (Dual-Regler der Front): wartet die älteste P-Anfrage länger als diese Sekunden, wird Ps Stufe auf höchstens SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG begrenzt, egal was Matrix oder Tabelle sagen. Standard 60. Im Modus p (P voll) ist die Klemme aus.",
+   "type": "str"
+  },
+  "SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [
+    {
+     "beleg": {
+      "anker": "if self.mode != \"p\" and oldest_age_s > cfg.starve_age_s and target > cfg.starve_max_rung:",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/dual_share.py",
+      "zeile": 414,
+      "zeile_hinweis": 414
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Die Klemme ist Teil des Reglers der Front (--dual-priority); im Modus p (P voll) ist sie aus.",
+     "kante": "K115",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Die Klemme ist Teil des Reglers der Front (--dual-priority); im Modus p (P voll) ist sie aus.",
+     "to": "--dual-priority",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
+   "gain": "",
+   "group": "Dual",
+   "help": "",
+   "id": "SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "dual_share.py ShareConfig.starve_max_rung (Zeile 158) und Klemme (Zeilen 414-417); Profilkommentar 27b-nvfp4-dual.env",
+   "source": {
+    "file": "profile",
+    "kind": "kuratiert",
+    "line": 0
+   },
+   "status": "kuratiert",
+   "text": "Aushungerungs-Klemme, Teil 2: die tiefste Stufe, auf die Ps Anteil begrenzt wird, wenn die älteste P-Anfrage länger als SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S wartet (0/1/2/3 = 100/75/50/25 %). Standard 1, also P bekommt dann mindestens 75 %. Die tiefste Stufe der Leiter (3 bei vier Stufen) schaltet die Klemme aus, weil sie nie senkt; weicher wird sie mit höherem SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S oder Stufe 2 (Kommentar der Release-Datei 27b-nvfp4-dual.env).",
+   "type": "str"
   },
   "SGLANG_WEG2_DUAL_SHORT_BYPASS_TOKENS": {
    "baeume": [
@@ -72456,6 +72689,26 @@
    "type": "os.environ"
   },
   "SGLANG_WEG2_FORCED_BOOT": {
+   "abweichung": {
+    "27b": {
+     "default": "\"\"",
+     "help": "the ``refusals`` marker variable ``refusals.arm(True)`` writes into ``os.environ``",
+     "source": {
+      "file": "weg2/refusals.py",
+      "kind": "os.environ",
+      "line": 205
+     }
+    },
+    "nf": {
+     "default": "\"\"",
+     "help": "set by the launcher in ITS environment when ``--force`` is on, so the front and the groups (separate processes) inherit it; read by :func:`forced_boot`",
+     "source": {
+      "file": "weg2/refusals.py",
+      "kind": "os.environ",
+      "line": 200
+     }
+    }
+   },
    "baeume": [
     "27b",
     "nf"
@@ -72467,7 +72720,7 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "set by the launcher in ITS environment when ``--force`` is on, so the front and the groups (separate processes) inherit it; read by :func:`forced_boot`",
+   "help": "the ``refusals`` marker variable ``refusals.arm(True)`` writes into ``os.environ``",
    "id": "SGLANG_WEG2_FORCED_BOOT",
    "kind": "env",
    "lesestellen": [
@@ -81309,6 +81562,26 @@
    "type": "EnvBool"
   },
   "SGLANG_WEG2_TORCH_CACHE_CAP": {
+   "abweichung": {
+    "27b": {
+     "default": "\"0\"",
+     "help": "Umgebungsschalter der Torch-Cache-Kappe (launcher.py:5487); steht er in ``--env-d``, gilt er, sonst der Standard der Registerzeile",
+     "source": {
+      "file": "planner/profile_couplings.py",
+      "kind": "os.environ",
+      "line": 1155
+     }
+    },
+    "nf": {
+     "default": "\"0\"",
+     "help": "P0 (torch cache cap) must be armed in the SAME D group: the edge leaves ~0 MiB after KV, and without a bounded cache the allocator swing (0.7-3.5 GiB, WEG2-VRAM-PEAK rc12z26) takes that memory back at the next peak.",
+     "source": {
+      "file": "weg2/launcher.py",
+      "kind": "os.environ",
+      "line": 5392
+     }
+    }
+   },
    "baeume": [
     "27b",
     "nf"
@@ -81320,10 +81593,11 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "P0 (torch cache cap) must be armed in the SAME D group: the edge leaves ~0 MiB after KV, and without a bounded cache the allocator swing (0.7-3.5 GiB, WEG2-VRAM-PEAK rc12z26) takes that memory back at the next peak.",
+   "help": "Umgebungsschalter der Torch-Cache-Kappe (launcher.py:5487); steht er in ``--env-d``, gilt er, sonst der Standard der Registerzeile",
    "id": "SGLANG_WEG2_TORCH_CACHE_CAP",
    "kind": "env",
    "lesestellen": [
+    "planner/profile_couplings.py:1155",
     "weg2/launcher.py:5536",
     "weg2/launcher.py:5572",
     "weg2/launcher.py:14252",
@@ -81338,9 +81612,9 @@
    "planner_derived": false,
    "source": {
     "baum": "27b",
-    "file": "weg2/launcher.py",
+    "file": "planner/profile_couplings.py",
     "kind": "os.environ",
-    "line": 5536
+    "line": 1155
    },
    "status": "geerntet",
    "text": "",
@@ -83748,17 +84022,17 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
-    "eindeutig": 82,
+    "eindeutig": 90,
     "nah": 26
    }
   },
   "datei": "kantenkatalog_1004.json",
   "geladen": true,
   "grund": "",
-  "kanten_belegt": 108,
-  "kanten_gesamt": 108,
+  "kanten_belegt": 116,
+  "kanten_gesamt": 116,
   "kanten_ohne_beleg": 24,
-  "neu": 57,
+  "neu": 65,
   "rel_abweichend": [
    "K12",
    "K19",
@@ -83784,17 +84058,17 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "baeume": {
-   "abweichung": 36,
+   "abweichung": 38,
    "beide": 2448,
    "nur_27b": 174,
    "nur_nf": 29
   },
-  "entries": 2666,
-  "envs": 1792,
+  "entries": 2669,
+  "envs": 1795,
   "erklaert": 304,
   "flags": 859,
-  "geerntet": 1666,
-  "kuratiert": 95,
+  "geerntet": 1665,
+  "kuratiert": 99,
   "unerklaert": 601
  },
  "tree_rev": "27b=173161c595+nf=369f31e2e2",

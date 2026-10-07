@@ -464,6 +464,23 @@ CURATED: Dict[str, Dict[str, object]] = {
         "text": "DUAL-SHARE Stufe 3 (weg2/dual_green.py): Ps SM-Anteil als Green-Context-LEITER (100/75/50/25 % je Forward, dynamisch, hoch UND runter; PP0 stempelt die Stufe auf den Request-Draht, damit alle drei Stufen dieselbe fahren). 'on' = Leiter + Halte-BEOBACHTER (die P-STUFE-Zeile trägt would_hold), 'hold' = zusätzlich hält PP0 wirklich (0 %), solange die Arena voll ist. Standard off = argv/env/Startpfad byte-identisch.",
         "gain": "", "cost": "Braucht --dual-priority, 'green' in --dual-share-actuators, --dual-mps on und kein --dual-p-sm-pct.",
         "satz_quelle": "launcher.py --dual-green-ladder (help=)", "depends": []},
+    "SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE": {
+        "kind": "env", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "Eintrittsstufe von Ps SM-Anteil, wenn D nach Leerlauf wieder decodet und keine Mindestrate (--dual-d-min-rate-tps) gesetzt ist: Zeilen \"bs-Schwelle:Stufe tau niedrig:Stufe tau hoch\", getrennt durch Semikolon (Beispiel im Code: \"2:1:0;4:2:1;99:3:2\"). Es gilt die erste Zeile, deren Schwelle D-bs erreicht oder übersteigt; tau ist die wartende P-Arbeit in Sekunden (hoch = über der oberen tau-Kante, Standard 2 und 10 s). Stufe 0/1/2/3 = Ps Anteil 100/75/50/25 % (Standard der Stufen SGLANG_WEG2_DUAL_SHARE_RUNGS = 1,0.75,0.5,0.25). Standard im Code: 2:1:0;4:2:1;1000000000:3:2. Ist D leer (bs 0), steht P sofort auf 100 %. Danach regelt die Front auf die gemessene D-Rundenzeit nach; die Aushungerungs-Klemme gilt zusätzlich. Nur im Dual-Layout (27B-Linie).",
+        "gain": "", "cost": "", "satz_quelle": "dual_green.py GreenConfig.table (Zeile 1071), from_env (Zeile 1097), start_stage (Zeilen 1204-1224); dual_share.py ShareConfig (Zeilen 139-141)", "depends": []},
+    "SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S": {
+        "kind": "env", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "Aushungerungs-Klemme, Teil 1 (Dual-Regler der Front): wartet die älteste P-Anfrage länger als diese Sekunden, wird Ps Stufe auf höchstens SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG begrenzt, egal was Matrix oder Tabelle sagen. Standard 60. Im Modus p (P voll) ist die Klemme aus.",
+        "gain": "", "cost": "", "satz_quelle": "dual_share.py ShareConfig.starve_age_s (Zeile 157) und Klemme (Zeilen 414-417); dual_green.py (Zeilen 1319-1322)", "depends": []},
+    "SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG": {
+        "kind": "env", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "Aushungerungs-Klemme, Teil 2: die tiefste Stufe, auf die Ps Anteil begrenzt wird, wenn die älteste P-Anfrage länger als SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S wartet (0/1/2/3 = 100/75/50/25 %). Standard 1, also P bekommt dann mindestens 75 %. Die tiefste Stufe der Leiter (3 bei vier Stufen) schaltet die Klemme aus, weil sie nie senkt; weicher wird sie mit höherem SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S oder Stufe 2 (Kommentar der Release-Datei 27b-nvfp4-dual.env).",
+        "gain": "", "cost": "", "satz_quelle": "dual_share.py ShareConfig.starve_max_rung (Zeile 158) und Klemme (Zeilen 414-417); Profilkommentar 27b-nvfp4-dual.env", "depends": []},
+    "SGLANG_WEG2_DUAL_GRANT_RETRY_MS": {
+        "kind": "env", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "Drosselung der KV-Vergabe-Wiederholung (#1530, nur Dual-Layout, nur PP0; 0 = AUS, dann probiert jede Scheduler-Runde es erneut). Mit N > 0 probiert eine wartende Anfrage höchstens alle N ms erneut, außer ein Karten-Ledger-Eintrag hat sich seit ihrem letzten Versuch geändert; Stufen-Tabellen werden nach mtime zwischengespeichert. Anlass im Code-Kommentar: Boot B9g 5 (04.10.), PP0 wiederholte neun wartende Beine in JEDER Runde (~2000 Vergaben/s), CPU 101 % unter der GIL, Forward und Publish verhungerten.",
+        "gain": "Entlastet PP0 (CPU unter der GIL), solange P-Anfragen auf KV-Platz warten.", "cost": "",
+        "satz_quelle": "environ.py SGLANG_WEG2_DUAL_GRANT_RETRY_MS (Kommentar, Zeilen 679-684); dual_p_kv_stage.py (Zeilen 668-681, 893)", "depends": []},
     "--dual-d-capture-prio": {
         "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
         "text": "DUAL-SHARE Stufe 1a: D nimmt seine CUDA-Graphen auf dem Stream höchster Priorität des Geräts auf (Graph-Knoten behalten die Priorität des Capture-Streams). Nur Gruppe D des Dual-Layouts.",

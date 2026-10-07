@@ -36,6 +36,7 @@ from .kartenplan import MAX_CARDS
 from . import kvheads as KVH
 from . import kartenplan_transport as TR
 from . import profil_oracle as ORA
+from . import profil_planer as PLANER
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "profil_data")
@@ -465,7 +466,9 @@ class ProfilEditor:
                 "cards": CAT.catalog_public(), "pcie": {"gens": list(TR.GENS), "lanes": list(TR.LANES)},
                 "rig_preset": self.kp.catalog().get("rig_preset"),
                 "register": self.register(), "coverage": cat.get("stats"), "tree_rev": cat.get("tree_rev"),
-                "planner_tree": self.tree}
+                "planner_tree": self.tree,
+                # AP-H1: die Daten der einen Seite (Betriebsformen, Abschnitte, Dual-ENV-Tabelle, Reglergrenzen); fehlt der Schlüssel, zeichnet die Seite wie bisher
+                "planer": PLANER.ui_info(self.FORMS, cat.get("entries"), self.oracle is not None)}
 
     def known_models(self) -> dict:
         """Every model / draft path the release profiles name, with what THIS container can read of it.  A path that is not readable here
