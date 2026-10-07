@@ -169,6 +169,21 @@ class TestTables(unittest.TestCase):
         self.assertEqual(R.POSITIONAL_VECTOR_FLAGS, launcher.POSITIONAL_VECTOR_FLAGS)
         self.assertEqual(R.POSITIONAL_VECTOR_TOKENS, launcher.POSITIONAL_VECTOR_TOKENS)
 
+    def test_topology_subset_equals_the_launchers(self):
+        """the set ``vector_lengths`` counts is the launcher's topology probe set (``_TOPOLOGY_VECTOR_FLAGS/-TOKENS``), read from it"""
+        self.assertEqual(R.TOPOLOGY_VECTOR_FLAGS, launcher._TOPOLOGY_VECTOR_FLAGS)
+        self.assertEqual(R.TOPOLOGY_VECTOR_TOKENS, launcher._TOPOLOGY_VECTOR_TOKENS)
+        for dest in ("p_barlink_bar1_window_mib", "d_reshard_presets"):
+            self.assertNotIn(dest, R.TOPOLOGY_VECTOR_FLAGS)
+        self.assertNotIn("SGLANG_WEG2_L15_MIB=", R.TOPOLOGY_VECTOR_TOKENS)
+
+    def test_window_presets_and_l15_are_no_vectors_in_vector_lengths(self):
+        """review round 4: BAR1 window spec / reshard presets / L15 posts are no Je-Karte vectors (no PROFILE-VECTORS from them)"""
+        argv = ["--p-barlink-bar1-window-mib", "24,PP_0=96", "--d-reshard-presets", "a,b,c",
+                "--extra-p", "--rank-user-reserve-mib 1,2", "--env-p", "SGLANG_WEG2_L15_MIB=1,2,3,4;SGLANG_MOE_SCRATCH_SLOTS=1,2"]
+        lens = P.vector_lengths(argv, {"SGLANG_WEG2_L15_MIB": "1,2,3,4,5"})
+        self.assertEqual(lens, {"--extra-p --rank-user-reserve-mib": 2, "--env-p SGLANG_MOE_SCRATCH_SLOTS": 2}, lens)
+
     def test_every_flag_and_token_has_a_slot(self):
         flags = {n for k, _g, n, _p in P.SLOTS if k == "flag"}
         extra = {n for k, _g, n, _p in P.SLOTS if k == "extra"}
@@ -774,6 +789,41 @@ class TestOriginOfTransferredValues(unittest.TestCase):
         w = {x["key"]: x for x in v["werte"]}["--env-d SGLANG_MOE_SCRATCH_SLOTS"]
         self.assertEqual(w["zustand"], R.VORGESCHLAGEN)
         self.assertIn("gleiches Inventar", w["herkunft"])
+
+
+class TestNonTopologyValuesStayAsTheProfileHasThem(unittest.TestCase):
+    """Review round 4: the BAR1 window spec, the d_reshard presets and SGLANG_WEG2_L15_MIB are no per-card vectors of the launcher's
+    topology probe; the proposal keeps them as the profile has them and the verdict sees no PROFILE-VECTORS in them."""
+
+    FLAGS = {"--p-barlink-bar1-window-mib": "24,PP_0=96", "--d-reshard-presets": "2,4,6"}
+
+    def _basis(self, model):
+        b = _profile(model)
+        argv = list(b.argv)
+        for f, val in self.FLAGS.items():
+            self.assertNotIn(f, argv)
+            argv += [f, val]
+        env = dict(b.env)
+        env["SGLANG_WEG2_L15_MIB"] = "1000,2000,3000"
+        return O.LaunchInput(argv, env, b.vars, b.unresolved_paths, b.source, b.instruments)
+
+    def test_values_unchanged_and_not_counted(self):
+        for model in ("nf", "27b"):
+            for inv in ("ref3", "n2", "n4_3090"):
+                with self.subTest(model=model, inv=inv):
+                    hw, _ = _inventory(inv)
+                    modell, draft = _MODELS[model]
+                    v = P.propose(hw, modell, "flip", {}, basis=self._basis(model), draft=draft, rates=MEASURED_RATES,
+                                  library=_seed_library())
+                    la = P.LaunchArgv(v["argv"], v["env"])
+                    for f, val in self.FLAGS.items():
+                        self.assertEqual(la.get_flag(f), val, (f, v["argv"]))
+                    self.assertEqual(v["env"].get("SGLANG_WEG2_L15_MIB"), "1000,2000,3000")
+                    lens = P.vector_lengths(v["argv"], v["env"])
+                    for k in lens:
+                        for bad in ("bar1", "reshard", "L15"):
+                            self.assertNotIn(bad, k)
+                    self.assertTrue(v["vektoren_ok"], (lens, v.get("vektoren_falsch")))
 
 
 class TestK4ScalarRegulators(unittest.TestCase):

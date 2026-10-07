@@ -26,8 +26,9 @@ What it decides, by the criteria K1-K5 (rules in ``propose_rules.py``):
   BORROWED (``class_rekey``), the P cut by the GEMM rates, the resident expert fractions from what a stage has left, the D side by
   the Form A solve (MoE) or VRAM-proportional TP shares (dense).  A value no rule and no record can give is DROPPED and named
   in ``unbelegt`` -- the launcher then says what it needs (HW-UNCALIBRATED), the planner invents nothing.
-* **EVERY positional flag/token of ``launcher.POSITIONAL_VECTOR_FLAGS/TOKENS`` the proposal carries has exactly N entries**
-  (:func:`vector_lengths`, checked into ``vector_ok``).
+* **EVERY per-card flag/token the launcher's topology probe counts (``launcher.POSITIONAL_VECTOR_FLAGS/TOKENS`` minus the BAR1
+  window spec, the d_reshard presets and ``SGLANG_WEG2_L15_MIB``: ``launcher._TOPOLOGY_VECTOR_FLAGS/-TOKENS``) the proposal
+  carries has exactly N entries** (:func:`vector_lengths`, checked into ``vector_ok``); those three are kept as the profile has them.
 * **The scalars of the profile are kept** (``--d-tp-objective decode-bs1`` of the 27B profile stays) unless a goal names them;
   the rule defaults (``maxkv``, ``--max-kv-per-request`` = KV obligation) fill only what the profile does not say.
 
@@ -229,7 +230,9 @@ class LaunchArgv:
 # the slots: every place a positional per-card value lives, and how it is decided
 # ---------------------------------------------------------------------------
 
-# kind: "flag" | "extra" | "env" | "proc"; group: "-" | "p" | "d"; name; policy
+# kind: "flag" | "extra" | "env" | "proc"; group: "-" | "p" | "d"; name; policy.  Policy "carry" = a value the launcher's topology probe
+# does NOT count as a per-card vector (BAR1 window spec, d_reshard presets, SGLANG_WEG2_L15_MIB; ``propose_rules.NON_TOPOLOGY_*``):
+# it is kept exactly as the profile has it, never re-keyed to the cards and never dropped for its entry count.
 SLOTS: Tuple[Tuple[str, str, str, str], ...] = (
     ("flag", "-", "--d-foreign-context-mib", "class"),
     ("flag", "-", "--d-nontorch-mib", "class"),
@@ -240,10 +243,10 @@ SLOTS: Tuple[Tuple[str, str, str, str], ...] = (
     ("extra", "d", "--rank-user-reserve-mib", "class"),
     ("env", "p", "SGLANG_WEG2_EXTEND_TRIM_MIB", "class"),
     ("env", "d", "SGLANG_WEG2_EXTEND_TRIM_MIB", "class"),
-    ("env", "p", "SGLANG_WEG2_L15_MIB", "class"),
-    ("env", "d", "SGLANG_WEG2_L15_MIB", "class"),
+    ("env", "p", "SGLANG_WEG2_L15_MIB", "carry"),
+    ("env", "d", "SGLANG_WEG2_L15_MIB", "carry"),
     ("proc", "-", "SGLANG_WEG2_EXTEND_TRIM_MIB", "class"),
-    ("proc", "-", "SGLANG_WEG2_L15_MIB", "class"),
+    ("proc", "-", "SGLANG_WEG2_L15_MIB", "carry"),
     ("flag", "-", "--pp-stage-ratio", "cut"),
     ("flag", "-", "--pp-attn-stage-ratio", "cut_attn"),
     ("extra", "p", "--pp-stage-ratio", "cut"),
@@ -259,8 +262,8 @@ SLOTS: Tuple[Tuple[str, str, str, str], ...] = (
     ("env", "d", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "fr_d"),
     ("env", "p", "SGLANG_MOE_SCRATCH_SLOTS", "scratch"),
     ("env", "d", "SGLANG_MOE_SCRATCH_SLOTS", "scratch"),
-    ("flag", "-", "--d-reshard-presets", "advisory"),
-    ("flag", "-", "--p-barlink-bar1-window-mib", "advisory"),
+    ("flag", "-", "--d-reshard-presets", "carry"),
+    ("flag", "-", "--p-barlink-bar1-window-mib", "carry"),
     ("extra", "p", "--rank-gpu-memory-mib", "advisory"),
     ("extra", "d", "--rank-gpu-memory-mib", "advisory"),
 )
@@ -319,8 +322,10 @@ def _del(la: LaunchArgv, kind: str, group: str, name: str) -> None:
 
 def vector_lengths(argv: Sequence[str], env: Optional[Mapping[str, str]] = None) -> Dict[str, int]:
     """Every positional per-card vector of a launch -> its entry count (the stdlib twin of ``launcher.positional_vector_lengths``:
-    the flags of :data:`propose_rules.POSITIONAL_VECTOR_FLAGS` at top level, the tokens of :data:`POSITIONAL_VECTOR_TOKENS`
-    inside the group strings, and the two process variables ``SGLANG_WEG2_L15_MIB`` / ``SGLANG_WEG2_EXTEND_TRIM_MIB``).  The
+    the flags of :data:`propose_rules.TOPOLOGY_VECTOR_FLAGS` at top level, the tokens of :data:`TOPOLOGY_VECTOR_TOKENS`
+    inside the group strings, and the process variable ``SGLANG_WEG2_EXTEND_TRIM_MIB``) -- the SAME set the launcher's topology
+    probe counts: the BAR1 window spec, the d_reshard presets and ``SGLANG_WEG2_L15_MIB`` are no per-card vectors there and stay
+    as the profile has them.  The
     key says WHERE: ``"<name>"`` or ``"--extra-d <name>"``; a scalar value is no vector and does not appear."""
     la = LaunchArgv(argv, env or {})
     out: Dict[str, int] = {}
@@ -330,17 +335,17 @@ def vector_lengths(argv: Sequence[str], env: Optional[Mapping[str, str]] = None)
         if v is not None:
             out[key] = len(v)
 
-    for dest in R.POSITIONAL_VECTOR_FLAGS:
+    for dest in R.TOPOLOGY_VECTOR_FLAGS:
         flag = "--" + dest.replace("_", "-")
         add(flag, la.get_flag(flag))
     for g in ("p", "d"):
-        for tok in R.POSITIONAL_VECTOR_TOKENS:
+        for tok in R.TOPOLOGY_VECTOR_TOKENS:
             name = tok.rstrip("=")
             if tok.endswith("="):
                 add("--env-%s %s" % (g, name), la.env_get(g, name))
             else:
                 add("--extra-%s %s" % (g, name), la.extra_get(g, name))
-    for name in ("SGLANG_WEG2_L15_MIB", "SGLANG_WEG2_EXTEND_TRIM_MIB"):
+    for name in ("SGLANG_WEG2_EXTEND_TRIM_MIB",):
         add("env " + name, la.env.get(name))
     return out
 
@@ -520,9 +525,19 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                 grund="entfernt (kein Wert erfunden); der Launcher nennt, was er statt dessen braucht", in_argv=False,
                 policy="class")
 
+    def keep_as_is(kind: str, group: str, name: str) -> None:
+        old = _get(la, kind, group, name)
+        if old is None:
+            return
+        st, hk, gr = carried()
+        rec.add(slot_label(kind, group, name), group=group, old=old, new=old, state=st, herkunft=hk,
+                grund=gr + " (kein Kartenvektor der Topologie-Pruefung des Launchers: unveraendert vom Profil)", policy="carry")
+
     for kind, group, name, pol in SLOTS:
         if pol == "class":
             per_class(kind, group, name)
+        elif pol == "carry":
+            keep_as_is(kind, group, name)
 
     # --- the D side ------------------------------------------------------------------------------------------------------
     foreign = R.parse_csv(la.get_flag("--d-foreign-context-mib"))
@@ -736,7 +751,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                 grund=why + ("; am Metall unbelegt (Planer-Rechnung)" if stt == R.UNBELEGT else ""), policy=pol)
 
     for kind, group, name, pol in SLOTS:
-        if pol != "class":
+        if pol not in ("class", "carry"):
             decide(kind, group, name, pol)
 
     # measured REFERENCE logs of a boot on the profile's inventory: they describe THAT inventory's stages and ranks; the launcher

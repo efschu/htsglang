@@ -51,6 +51,15 @@ POSITIONAL_VECTOR_TOKENS = (
     "SGLANG_WEG2_L15_MIB=", "SGLANG_WEG2_EXTEND_TRIM_MIB=",
 )
 
+#: HW-P1a: the SUBSET of the two tables the launcher's topology probe counts as per-card vectors (``launcher._TOPOLOGY_VECTOR_FLAGS``
+#: / ``_TOPOLOGY_VECTOR_TOKENS``, ``weg2/launcher.py:6319-6328``).  Left out there, and so here: the BAR1 window (a window spec
+#: ``"24,PP_0=96"``, refused by BAR1-WINDOW), the d_reshard presets (not per card) and SGLANG_WEG2_L15_MIB (own probe L15-POSTS).
+#: Derived by the SAME filter as the launcher's; ``test_planer_apc_propose_1006`` pins both equal to the launcher's tuples.
+NON_TOPOLOGY_VECTOR_FLAGS = ("p_barlink_bar1_window_mib", "d_reshard_presets")
+NON_TOPOLOGY_VECTOR_TOKENS = ("SGLANG_WEG2_L15_MIB=",)
+TOPOLOGY_VECTOR_FLAGS = tuple(f for f in POSITIONAL_VECTOR_FLAGS if f not in NON_TOPOLOGY_VECTOR_FLAGS)
+TOPOLOGY_VECTOR_TOKENS = tuple(t for t in POSITIONAL_VECTOR_TOKENS if t not in NON_TOPOLOGY_VECTOR_TOKENS)
+
 #: state words of a value
 VORGESCHLAGEN = "vorgeschlagen"
 UNBELEGT = "unbelegt"
