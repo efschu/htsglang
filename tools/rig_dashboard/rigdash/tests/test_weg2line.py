@@ -87,11 +87,11 @@ class BuildTests(unittest.TestCase):
     def test_27b_line_from_image_profile(self):
         b = self.w.build("27b-release-draft", "htsglang:cu130-weg2-rc12k27-27b-nf")
         self.assertIn("CTX=%s IMAGE=htsglang:cu130-weg2-rc12k27-27b-nf LINE=27b PROFILE=27b-release-draft "
-                      "PROFILE_MOUNT=0 ALLOW_EXPERIMENTAL=1 HOUSE_GUARD=memlimit GPUQ_ID=<fenster-id> bash " % self.ctx,
+                      "PROFILE_MOUNT=0 ALLOW_EXPERIMENTAL=1 HOUSE_GUARD=memlimit GPUQ_ID=<window-id> bash " % self.ctx,
                       b["command"])
         self.assertTrue(b["command"].endswith("/spinning/gpu-arb/docker/host_acceptance.sh serve bar1"))
-        self.assertTrue(b["notes"][0].startswith("ZUERST ein gpuq-Fenster buchen"))
-        self.assertTrue(any("weicht" in n for n in b["notes"]))   # image copy differs from host file
+        self.assertTrue(b["notes"][0].startswith("FIRST book a gpuq window"))
+        self.assertTrue(any("differs" in n for n in b["notes"]))   # image copy differs from host file
 
     def test_nf_profile_not_in_image_is_mounted_and_nccl_warned(self):
         b = self.w.build("nf-h91", "htsglang:cu130-weg2-rc12k27-27b-nf", transport="nccl")

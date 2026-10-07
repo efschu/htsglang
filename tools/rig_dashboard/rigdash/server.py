@@ -130,8 +130,8 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
             death = (b.get("end") or {}).get("death")
             if death:
                 # the harness named it a death (deadman verdict / hold end "Container-tot")
-                reason = "tot (%s)" % ({"deadman": "Deadman", "state.json": death.get("text") or "state.json"}
-                                       .get(death.get("src"), "Container-tot"))
+                reason = "dead (%s)" % ({"deadman": "deadman", "state.json": death.get("text") or "state.json"}
+                                       .get(death.get("src"), "container dead"))
     keys = [k for k in ser if k.endswith("_tps")]
     if gap_from is not None:
         for k in keys + [k for k in ser if k.endswith(("_rate", "_seats", "_stream"))]:
@@ -963,7 +963,7 @@ def main(argv=None):
     ap.add_argument("--release-profile", action="append", default=[],
                     help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
     ap.add_argument("--edition", choices=EDITIONS, default=os.environ.get("RIGDASH_EDITION", "rig"),
-                    help="rig = with the development state (Soll/Ist, Bausteine, Startflags, Sitze ...); "
+                    help="rig = with the development state (target/actual, building blocks, launch flags, seats ...); "
                          "release = the published fLLiper edition: speed, efficiency, statistics only "
                          "(env RIGDASH_EDITION)")
     ap.add_argument("--editor-only", action="store_true", default=os.environ.get("RIGDASH_EDITOR_ONLY") == "1",

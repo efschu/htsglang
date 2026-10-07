@@ -13,7 +13,7 @@ group D (TP<N>) awake together on the SAME cards; the 27B NVFP4 tree.  GPU-free,
 * ``TestRuleMode``         ``force_rules`` / ``kv_tokens`` / ``dual_cut``: the shift rule against the 27B seat's own 262k computation
                            (``done/dual-schnitt-262k-1006.md``), the pool search, the pin, the flags of the obligation.
 * ``TestOtherInventories`` N=2 (5090 + 3080) and foreign classes: no crash, vectors of N entries, the Dual-Passung and the obligation verdicts
-                           present and labelled "Planer-Rechnung, nicht hw_fit", the launcher dry run ends in a NAMED verdict (never an
+                           present and labelled "planner calculation, not hw_fit", the launcher dry run ends in a NAMED verdict (never an
                            exception that is not a refusal).
 """
 
@@ -184,7 +184,7 @@ class TestPureRules(unittest.TestCase):
         self.assertAlmostEqual(sum(sh), 1.0)
         self.assertAlmostEqual(sh[0], 58 / 108.0)                              # RC9_BASE (58,25,25): the vector D is INSTALLED with
         self.assertAlmostEqual(sh[1], 25 / 108.0)
-        self.assertIn("installierter D-Vektor", why)
+        self.assertIn("installed D vector", why)
         self.assertNotIn("Preset 'dec' (Host", why)
         sh, why = PD.d_shares("nvfp4", [32607, 20480, 20480], False)           # no reshard: capacity-first (planer assumption)
         self.assertAlmostEqual(sum(sh), 1.0)
@@ -262,7 +262,7 @@ class TestReferenceDual(unittest.TestCase):
             if w["policy"] in ("class", "cut", "cut_attn", "advisory", "dual_pflicht", "dual_knob", "dual_env"):
                 self.assertFalse(w["geaendert"], w["key"])
                 if w["key"] != "--pp-solve-pool-floor":                    # the floor is no profile value: its origin is the obligation
-                    self.assertTrue(w["herkunft"].startswith("Profil "), w)
+                    self.assertTrue(w["herkunft"].startswith("Profile "), w)
         json.dumps(v)                                                     # the worker returns it over a pipe
 
     def test_the_dual_values_of_the_profile_are_recorded_with_their_origin(self):
@@ -297,21 +297,21 @@ class TestReferenceDual(unittest.TestCase):
         self.assertIs(p["erfuellt"], False)
         self.assertTrue(p["pool_geeicht"])
         text = " | ".join(p["grund"])
-        self.assertIn("--dual-p-kv-max-tokens 196608 < Level 266240", text)
+        self.assertIn("--dual-p-kv-max-tokens 196608 < level 266240", text)
         self.assertIn("--max-kv-per-request 131072 < 262144", text)
         # the numbers of done/1959-dual-p-262k.md: K0 pool 3178 MiB < need 5720 MiB (11 FA layers x 2048 B x 266240), short 2542
         k0 = d["karten"][0]
         self.assertEqual((k0["pool_mib"], k0["bedarf_mib"], k0["pool_rest_mib"]), (3178.0, 5720.0, -2542.0))
-        self.assertIn("Karte 0 (RTX5090): Pool 3178 MiB < Bedarf 5720 MiB (Fehlbetrag 2542 MiB", text)
+        self.assertIn("Card 0 (RTX5090): pool 3178 MiB < need 5720 MiB (shortfall 2542 MiB", text)
         for k in (1, 2):                                              # K1 / K2 have room (1959: "nur K0 scheitert")
             self.assertGreater(d["karten"][k]["pool_rest_mib"], 0)
         self.assertEqual([c["bedarf_mib"] for c in d["karten"]], [5720.0, 1040.0, 1560.0])
 
     def test_the_dual_passung_is_a_planner_calculation_and_says_so(self):
         d = _propose("ref3")["dual"]
-        self.assertEqual(d["etikett"], "Dual-Passung: Planer-Rechnung, nicht hw_fit")
+        self.assertEqual(d["etikett"], "Dual fit: planner calculation, not hw_fit")
         self.assertEqual(d["passung"]["stufe"], "ja")
-        self.assertIn("Dual-Passung: Planer-Rechnung, nicht hw_fit", d["verdikte"][0]["text"])
+        self.assertIn("Dual fit: planner calculation, not hw_fit", d["verdikte"][0]["text"])
         for r in d["karten"]:
             # the coupling: P budget + overhead + D rest + D weights (draft inside) + D mamba <= card, exactly as the rows state it
             self.assertAlmostEqual(r["summe_mib"], r["p_budget_mib"] + r["overhead_mib"] + r["d_ruhe_mib"] + r["d_gewichte_mib"] + r["d_mamba_mib"], delta=0.2)
@@ -319,7 +319,7 @@ class TestReferenceDual(unittest.TestCase):
             self.assertGreater(r["d_draft_mib"], 0)
         # D is sized from P's plan: the card's D budget of the launcher ("D sized from P's PLAN") is total - P - overhead - awake rest
         self.assertEqual([r["d_budget_mib"] for r in d["karten"]], [18176, 12901, 12413])
-        self.assertEqual(d["draft"]["p"], "keiner (--draft-kv-on-p off)")
+        self.assertEqual(d["draft"]["p"], "none (--draft-kv-on-p off)")
 
     def test_d_weights_on_card_0_meet_the_measured_dual_boot(self):
         """Fix round 1, finding 1: D's weights of the Passung are the shard of the INSTALLED vector (RC9_BASE 58,25,25), measured at boot a3t5js:
@@ -350,7 +350,7 @@ class TestReferenceDual(unittest.TestCase):
         for k, r in enumerate(d["karten"]):
             self.assertAlmostEqual(r["d_gewichte_mib"], t[k]["d_total"], delta=0.2)
             self.assertAlmostEqual(r["p_privat_mib"], t[k]["priv"], delta=0.2)
-        self.assertTrue(any("EIN Vektor" in a for a in d["annahmen"]), d["annahmen"])
+        self.assertTrue(any("ONE vector" in a for a in d["annahmen"]), d["annahmen"])
         self.assertFalse(any("0.72" in a for a in d["annahmen"]), d["annahmen"])
 
     def test_hw_fit_is_told_the_form_is_dual_and_its_verdict_never_blocks_it(self):
@@ -459,7 +459,7 @@ class TestRuleMode(unittest.TestCase):
             self.assertGreaterEqual(r["pool_rest_mib"], 0.0, r)                          # the search kept every card above the level
             self.assertTrue(r["ok"], r)
         # the cut is the FASTEST that fits: the search ran, the note says so, the values are labelled a Planer-Rechnung
-        self.assertIn("Schnitt gesucht", d["regeln"]["suche"])
+        self.assertIn("Cut searched", d["regeln"]["suche"])
         for k in ("--pp-stage-ratio", "--pp-attn-stage-ratio", "--extra-p --rank-gpu-memory-mib"):
             self.assertEqual(w[k]["zustand"], "unbelegt", k)
             self.assertTrue(w[k]["geaendert"], k)
@@ -540,7 +540,7 @@ class TestRuleMode(unittest.TestCase):
         v = P.propose(hw, _STATE["modell"], "dual", {}, basis=li, draft=_STATE["draft"], rates=MEASURED_RATES)
         self.assertIn("--dual-share", v["argv"])
         self.assertEqual(v["argv"][v["argv"].index("--dual-unified-kv") + 1], "on")
-        self.assertTrue(any("kein Dual-Profil" in h for h in v["hinweise"]), v["hinweise"])
+        self.assertTrue(any("no dual profile" in h for h in v["hinweise"]), v["hinweise"])
         self.assertEqual(v["dual"]["modus"], "regel")
 
     def test_the_w64_note_names_what_decides_it(self):
@@ -564,7 +564,7 @@ class TestOtherInventories(unittest.TestCase):
         self.assertEqual(sum(d["regeln"]["schnitt"]), 64)
         self.assertEqual(len(d["karten"]), n)
         self.assertEqual([x["code"] for x in d["verdikte"]], ["DUAL-PASSUNG", "DUAL-PFLICHT"])
-        self.assertTrue(all("Planer-Rechnung, nicht hw_fit" in x["text"] for x in d["verdikte"]))
+        self.assertTrue(all("planner calculation, not hw_fit" in x["text"] for x in d["verdikte"]))
         json.dumps(v)
         run = _dry(v, rows, force=True)
         res = run.result
@@ -581,7 +581,7 @@ class TestOtherInventories(unittest.TestCase):
         self.assertEqual(len(d["regeln"]["budgets"]), 2)
         self.assertIs(d["pflicht"]["pool_geeicht"], False)                        # the pool calibration is the 3-card reference boot's
         self.assertIsNone(d["pflicht"]["erfuellt"])                                 # flags are met, the pool is not computable: "nicht gerechnet"
-        self.assertTrue(any("nicht gerechnet" in x["text"] for x in d["verdikte"] if x["code"] == "DUAL-PFLICHT"))
+        self.assertTrue(any("not calculated" in x["text"] for x in d["verdikte"] if x["code"] == "DUAL-PFLICHT"))
         # the launcher cannot price the profile's 3-entry alloc-cache record on two cards: a NAMED refusal (record of another inventory)
         self.assertEqual(run.result.exc_type, "Weg2LaunchRefused")
         self.assertIn("D_DUAL_ALLOC_CACHE_BOOK_MIB has 3 entries for 2 cards", run.result.exc_msg)
@@ -600,11 +600,11 @@ class TestOtherInventories(unittest.TestCase):
         self.assertIn("DUAL-PFLICHT", codes)
         self.assertIn("FIT", codes)
         fit = next(x for x in verd["verdikte"] if x["code"] == "FIT")
-        self.assertIn("Dual nicht modelliert", fit["text"])
+        self.assertIn("dual not modelled", fit["text"])
         self.assertEqual(fit["force_state"], "hinweis")                            # hw_fit does not block a form it does not model
         pas = next(x for x in verd["verdikte"] if x["code"] == "DUAL-PASSUNG")
-        self.assertIn("Planer-Rechnung, nicht hw_fit", pas["text"])
-        self.assertEqual(pas["titel"], "Dual-Passung: Planer-Rechnung, nicht hw_fit")
+        self.assertIn("planner calculation, not hw_fit", pas["text"])
+        self.assertEqual(pas["titel"], "Dual fit: planner calculation, not hw_fit")
         self.assertTrue(any(x["ebene"] == "lauf" for x in verd["verdikte"]))      # the launcher's own refusal is a verdict too
         self.assertEqual(set(res["je_wert"]), {w["key"] for w in res["vorschlag"]["werte"]})
 
@@ -615,7 +615,7 @@ class TestOtherInventories(unittest.TestCase):
                 for r in v["dual"]["karten"]:
                     self.assertIn("p_budget_mib", r)
                 # a card class without a twin in the profile has no calibration residual: its budget is a model value, said so
-                self.assertTrue(any("kein Eichrest" in u or "Eichrest" in u for u in v["unbelegt"]) or inv == "n4_mixed", v["unbelegt"])
+                self.assertTrue(any("no calibration residue" in u or "calibration residue" in u for u in v["unbelegt"]) or inv == "n4_mixed", v["unbelegt"])
 
     def test_the_launcher_refusal_of_foreign_cards_is_not_hidden_by_the_planer(self):
         v, run = self._check("n3_3090", n=3)

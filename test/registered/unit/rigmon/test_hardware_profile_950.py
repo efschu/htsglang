@@ -210,7 +210,7 @@ class TestProfileView(CustomTestCase):
         for l in bar1:
             self.assertIsNone(l["gbs"]["v"])
             self.assertEqual(l["gbs"]["src"], hp.SRC_NONE)
-            self.assertIn("nicht gemessen", l["gbs"]["note"])
+            self.assertIn("not measured", l["gbs"]["note"])
         self.assertFalse(doc["bar1"]["measured"])
         self.assertIn("NOT MEASURED", doc["bar1"]["note"])
         self.assertEqual(hp.validate(doc), [])
@@ -224,7 +224,7 @@ class TestProfileView(CustomTestCase):
         o1 = next(c["ord"] for c in doc["cards"] if c["uuid"] == U1)
         self.assertEqual(nccl[(o0, o1)]["gbs"]["src"], hp.SRC_MEASURED)
         self.assertEqual(nccl[(o1, o0)]["gbs"]["src"], hp.SRC_ESTIMATED)
-        self.assertIn("gespiegelt", nccl[(o1, o0)]["gbs"]["note"])
+        self.assertIn("mirrored", nccl[(o1, o0)]["gbs"]["note"])
         self.assertEqual(hp.validate(doc), [])
 
     def test_stale_probe_and_driver_change_are_marked(self):

@@ -41,7 +41,7 @@ class TestSegmentDetails(unittest.TestCase):
                 for g in "PD":
                     for s in b[g]["segments"]:
                         self.assertIn(s["phase"], ("P", "D", "gemeinsam"), (prof, s["key"]))
-                        self.assertIn(s["origin"], ("gemessen", "Planerwert"))
+                        self.assertIn(s["origin"], ("measured", "planner value"))
                         self.assertTrue(s["origin_note"])
                         self.assertGreater(len(s["what"]), 20, (prof, s["key"]))
 
@@ -59,9 +59,9 @@ class TestSegmentDetails(unittest.TestCase):
 
     def test_measured_vs_planner_value(self):
         segs = {s["key"]: s for s in plan("27b-int8")[0]["D"]["segments"]}
-        self.assertEqual(segs["weights"]["origin"], "gemessen")        # Rang-Log
-        self.assertEqual(segs["carve"]["origin"], "gemessen")          # NVML
-        self.assertEqual(segs["awake_rest"]["origin"], "Planerwert")
+        self.assertEqual(segs["weights"]["origin"], "measured")        # Rang-Log
+        self.assertEqual(segs["carve"]["origin"], "measured")          # NVML
+        self.assertEqual(segs["awake_rest"]["origin"], "planner value")
 
 
 class TestPhaseBlocksContiguous(unittest.TestCase):

@@ -1048,7 +1048,7 @@ function phaseHtml(b, pre) {
     let full = "", short = "";
     if (x.k === "flip_pd" || x.k === "flip_dp") { full = short = fmt(x.e - x.s, 1) + " s"; }
     else if (x.k === "P" && CO_KEY[x.co] && x.tps != null) {
-      if (x.co_resume) { short = fmt(x.tps) + " / Tk. " + (x.co_n != null ? Math.max(1, x.co_n) : ""); full = "P " + fmt(x.tps) + " tok/s · D takes over " + (x.co_n != null ? Math.max(1, x.co_n) : "") + " from the cache"; }
+      if (x.co_resume) { short = fmt(x.tps) + " / tok. " + (x.co_n != null ? Math.max(1, x.co_n) : ""); full = "P " + fmt(x.tps) + " tok/s · D takes over " + (x.co_n != null ? Math.max(1, x.co_n) : "") + " from the cache"; }
       else { const d = x.co === "dec" ? 1 : 0; short = fmt(x.tps) + " / " + fmt(x.co_tps, d); full = "P " + fmt(x.tps) + " · D " + fmt(x.co_tps, d) + " tok/s"; }
     }
     else if ((x.k === "P" || x.k === "D" || x.k === "dec") && x.tps != null) { const d = x.k === "dec" ? 1 : 0; short = fmt(x.tps, d); full = short + " tok/s"; }

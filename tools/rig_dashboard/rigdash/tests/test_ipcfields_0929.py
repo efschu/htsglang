@@ -2,7 +2,7 @@
 ganzen werte im dashboard noch aus log"): one reader per field, switched by presence.
 
 For every field: the IPC source present -> the IPC value (src=ipc); absent -> the log value
-with the label "fehlt in IPC".  The fixtures follow the producers' schemas:
+with the label "missing in IPC".  The fixtures follow the producers' schemas:
 weg2/rankstats.py (weg2.rankstats/1, 2188e1bd98), weg2/front.py _ipc_front_fields and the
 events flip_begin / flip_done / flip_first_work / group_health (front_state_ipc.py), and the
 §3 blocks the inventory names for rankstats (prefill / decode / cache / work.spans).
@@ -118,7 +118,7 @@ class FieldSwitchTests(unittest.TestCase):
         # the log value handed in is ignored
         for k, f in self.off.items():
             self.assertEqual(f["src"], "fehlt", k)
-            self.assertEqual(f["label"], "fehlt in IPC", k)
+            self.assertEqual(f["label"], "missing in IPC", k)
             self.assertIsNone(f["value"], k)
             self.assertTrue(f["missing"], k)
 
@@ -255,7 +255,7 @@ class SchemaS3FixtureTests(unittest.TestCase):
         f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": rec, "P.tp0pp1": copy.deepcopy(rec)},
                                      "rankstate": {}}, _logv(), rates={})
         self.assertEqual(f["E2"]["missing_leaves"], ["mamba_tok", "prefetch.timeout"])
-        self.assertEqual(f["E2"]["missing_label"], "fehlt in IPC")
+        self.assertEqual(f["E2"]["missing_label"], "missing in IPC")
         self.assertEqual(f["C2"]["missing_leaves"], ["full_token_usage"])
         f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": rec, "P.tp0pp1": other}, "rankstate": {}},
                               _logv(), rates={})
@@ -317,7 +317,7 @@ class NachzugA14C5Tests(unittest.TestCase):
         rec = copy.deepcopy(S3_FIXTURE)
         rec.pop("stops", None)
         f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": rec}, "rankstate": {}}, _logv(), rates={})
-        self.assertEqual((f["A14"]["src"], f["A14"]["label"]), ("fehlt", "fehlt in IPC"))
+        self.assertEqual((f["A14"]["src"], f["A14"]["label"]), ("fehlt", "missing in IPC"))
 
     def test_c5_rankstate_kv_and_seats(self):
         rs = {"D.tp0pp0": {"schema": 2, "kv": {"holds_kv": True, "kv_tokens": 180000, "share": 0.625}, "seats": 6},
@@ -335,7 +335,7 @@ class NachzugA14C5Tests(unittest.TestCase):
         st.pop("cap")
         f = ipcfields.resolve(None, {"rankstats": {"D.tp0pp0": st}, "rankstate": rs}, _logv(), rates={})
         self.assertEqual(f["C5"]["src"], "fehlt")
-        self.assertEqual(f["C5"]["label"], "fehlt in IPC")
+        self.assertEqual(f["C5"]["label"], "missing in IPC")
 
 
 class RatesTests(unittest.TestCase):
@@ -401,8 +401,8 @@ class PageTests(unittest.TestCase):
                        'srcOf(b, "B1", "B2", "B3", "B4", "B5", "B6")', 'srcOf(b, "A13")', 'fieldIpc(b, "A4")',
                        'fields_summary'):
             self.assertIn(needle, html)
-        self.assertNotIn("Cache-Treffer (aus den Boot-Logs)${LOGSRC}", html)
-        self.assertNotIn("Flips &middot; Warteschlange${LOGSRC}", html)
+        self.assertNotIn("Cache hits${LOGSRC}", html)
+        self.assertNotIn("Flips &middot; queue${LOGSRC}", html)
 
     def test_nachzug_surfaces(self):
         """E2 prefetch census per rank incl. defer_refused/timeout, C5 per rank, A14 named stops."""

@@ -2,7 +2,7 @@
 
 Am Log geprueft (Koordinator):
 * Segmente mit co="D": die D-"Prefill"-Chunks neben P sind Resume-Extends (#988 LOADBACK + 1-Token-Extend auf
-  14-20k gecachten Tokens) = Uebernahme einer P-Anfrage aus dem Cache.  1-5 tok/s "Chunks zur Rechenzeit" sind dort
+  14-20k gecachten Tokens) = Uebernahme einer P-Anfrage aus dem Cache.  1-5 tok/s "chunks at compute time" sind dort
   keine Prefill-Leistung -> Tooltip nennt Anfragen / gecachte / neue Tokens, keine tok/s.
 * Segmente mit co="dec": 13-60 tok/s sind echt -- die D-Runde wird unter vollem P-Prefill um ein Vielfaches
   langsamer -> Tooltip nennt die Rundenzeit (Delta decode.gpu_ms_by_bs) gegen die Runden ohne P.
@@ -110,8 +110,8 @@ class TestFlipBootUnchanged(unittest.TestCase):
     prefill in D???"): a D segment whose chunks are all narrower than activity.WIDE_MIN_TOK (admit extends of 25..92 tokens)
     now has tps None and carries admit_n/admit_tok.  Verified by diff against the base release: 10 of 125 segments changed (all D: 8x tps 1..181 tok/s -> None, e.g. a "1.0 tok/s" one),
     admit keys added, tps of a segment with a wide chunk 80,9 -> 80,5 (no Dual/co key, no P/dec/flip segment touched).  Hashes below are the 880 state."""
-    SEGS = "9f948f94b6a73319d192e9ed1adb8fd9463441080cc91ff8bcf0366ad8648311"
-    TIMELINE = "4d6d259724aa83d9aaabd985cc168beba64736ccde084d1a2da325a1f63b9b72"
+    SEGS = "9a04f69aa116537ccb709ec35b8f77bf01d919e433a63c9a91240b62b29e9823"      # 07.10. English texts: only the strings why/src/reqs_src changed (verified by structured diff against 07c20a35e5, no key/number changed)
+    TIMELINE = "1502f91e5bc7d65d4594211de32879354a60f436b8fc5a38520809e3e7d64710"
 
     def test_flip_boot_bytes(self):
         r = replay_boot("y8c_0cf3")
@@ -129,8 +129,8 @@ NODE = next((p for p in (shutil.which("node"), "/opt/node-v22.14.0-linux-x64/bin
 def _run_js(expr):
     html = open(os.path.join(server.STATIC, "index.html"), encoding="utf-8").read()
     a, b = html.index("// ---- phase bar:"), html.index("// label = mean tok/s")
-    prelude = ('const window = {i18nLang: () => "de", innerWidth: 1400};\n'
-               'const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("de-DE", '
+    prelude = ('const window = {i18nLang: () => "en", innerWidth: 1400};\n'
+               'const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("en-US", '
                '{maximumFractionDigits: d, minimumFractionDigits: d});\n'
                'const esc = (s) => String(s); const hhmm = (t) => "t" + t; const srcOf = () => "";\n')
     out = subprocess.run([NODE, "-e", prelude + html[a:b] + "\nprocess.stdout.write(" + expr + ");"],
@@ -144,13 +144,13 @@ def test_tooltip_resume_segment_names_takeover_not_rate():
     seg = ('{s: 100, e: 101, k: "P", co: "D", tps: 2308.8, tok: 2300, co_tps: null, co_tok: 0.9, co_resume: true, '
            'co_n: 3, co_cached: 59882.7, co_new: 3.4}')
     tip = _run_js("phaseTip(%s, false)" % seg)
-    d_part = tip.split("</i> <b>D-Prefill/Extend</b>")[1].split("<br>")[0]
-    assert "&uuml;bernimmt 3 Anfragen aus dem Cache" in d_part
-    assert "59.883 Tok gecacht, 3 neu" in d_part
-    assert "Chunks zur Rechenzeit" not in d_part and "<b>2</b> tok/s" not in d_part and "<b>1</b> tok/s" not in d_part
-    assert "kein Prefill, keine tok/s" in d_part
+    d_part = tip.split("</i> <b>D prefill/extend</b>")[1].split("<br>")[0]
+    assert "takes over 3 requests from the cache" in d_part
+    assert "59,883 tok cached, 3 new" in d_part
+    assert "chunks at compute time" not in d_part and "<b>2</b> tok/s" not in d_part and "<b>1</b> tok/s" not in d_part
+    assert "no prefill, no tok/s" in d_part
     bar = _run_js('phaseHtml({stem: "x", timeline: {segs: [%s], span_s: 900, t1: 110}})' % seg)
-    assert "D übernimmt 3 aus dem Cache" in bar
+    assert "D takes over 3 from the cache" in bar
 
 
 @pytest.mark.skipif(NODE is None, reason="kein node")
@@ -158,7 +158,7 @@ def test_tooltip_real_d_prefill_keeps_rate():
     seg = ('{s: 100, e: 110, k: "P", co: "D", tps: 2308.8, tok: 2300, co_tps: 1234.4, co_tok: 12344, '
            'co_n: 2, co_cached: 5000, co_new: 12344}')
     tip = _run_js("phaseTip(%s, false)" % seg)
-    assert "<b>1.234</b> tok/s" in tip and "Chunks zur Rechenzeit" in tip and "2 Anfragen, 5.000 Tok gecacht" in tip
+    assert "<b>1,234</b> tok/s" in tip and "chunks at compute time" in tip and "2 requests, 5,000 tok cached" in tip
 
 
 @pytest.mark.skipif(NODE is None, reason="kein node")
@@ -167,12 +167,12 @@ def test_tooltip_decode_under_p_shows_round_time():
            'co_by_bs: [{bs: 4, tps: 17.8, per_slot: 4.4, busy_s: 10}], co_round_ms: 172.1, co_solo_ms: 47.0, '
            'co_round: [{bs: 4, ms: 172.1, n: 42, solo_ms: 47.0}]}')
     tip = _run_js("phaseTip(%s, false)" % seg)
-    assert "<b>17,8</b> tok/s" in tip                       # the rate stays: it is real
-    assert "D-Runde &Oslash; <b>172</b> ms" in tip and "ohne P &Oslash; 47 ms" in tip and "&times;3,7" in tip
-    assert "P rechnet gleichzeitig" in tip and "bs 4: 172 ms (ohne P 47)" in tip
+    assert "<b>17.8</b> tok/s" in tip                       # the rate stays: it is real
+    assert "D round avg <b>172</b> ms" in tip and "without P avg 47 ms" in tip and "&times;3.7" in tip
+    assert "P computes simultaneously" in tip and "bs 4: 172 ms (without P 47)" in tip
     # without the round data nothing is invented
     tip0 = _run_js("phaseTip(%s, false)" % '{s: 100, e: 110, k: "P", co: "dec", tps: 4545.2, tok: 1, co_tps: 17.8, co_tok: 178}')
-    assert "D-Runde" not in tip0
+    assert "D round" not in tip0
 
 
 @pytest.mark.skipif(NODE is None, reason="kein node")
@@ -180,4 +180,4 @@ def test_flip_boot_tooltips_unchanged():
     for seg in ('{s: 100, e: 110, k: "P", tps: 4545.2, tok: 45452}', '{s: 100, e: 110, k: "D", tps: 900.5, tok: 9005}',
                 '{s: 100, e: 110, k: "dec", tps: 71.3, tok: 713}'):
         tip = _run_js("phaseTip(%s, false)" % seg)
-        assert "gleichzeitig" not in tip and "D-Runde" not in tip and "bernimmt" not in tip
+        assert "simultaneously" not in tip and "D round" not in tip and "takes over" not in tip

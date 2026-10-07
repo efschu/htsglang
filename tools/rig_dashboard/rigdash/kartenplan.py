@@ -375,7 +375,7 @@ def _annotate_segments(segs: List[dict], group: str, dual: bool) -> List[dict]:
     for s in segs:
         s["phase"] = _seg_phase(s["key"], group, other)
         measured = str(s["src"]).startswith("Rank log") or s["key"] == "carve"
-        s["origin"] = "gemessen" if measured else "planner value"
+        s["origin"] = "measured" if measured else "planner value"
         s["origin_note"] = ("NVML reservation of the card" if s["key"] == "carve" else ("Rank log of the reference boot" if measured
                             else "vram_plan or budget line of the launcher"))
         s["what"] = SEG_WHAT.get(s["key"], s["label"])

@@ -143,7 +143,7 @@ class OneNumberOneSet(unittest.TestCase):
         self.assertEqual(_numbers(ue)["P>D"], (4, 3000.0, 2600.0, 3000.0, 3000.0))
         self.assertEqual(_numbers(ue)["D>P"], (2, 5300.0, 3800.0, 5300.0, 5300.0))
         self.assertEqual(ue["window"]["label"], vt["window"]["label"])
-        self.assertEqual(vt["window"]["label"], "letzte 60 min")
+        self.assertEqual(vt["window"]["label"], "last 60 min")
         # the diagram draws exactly the marks the tile counted: its own mean/p50/max over those points
         pts = [m for m in vl["marks"] if m["kind"] == "flip_t2t" and m["v"] is not None]
         for d in flipzeit.DIRS:
@@ -165,13 +165,13 @@ class OneNumberOneSet(unittest.TestCase):
         # a Verlauf range that covers the boot gives the boot's numbers (same marks, same function)
         v24 = history.view(self.db, None, "NF", "24h", now=NOW)["tiles"]["flip"]
         self.assertEqual(_numbers(v24), _numbers(boot))
-        self.assertEqual(v24["window"]["label"], "letzte 24 h")
+        self.assertEqual(v24["window"]["label"], "last 24 h")
         # ... and a different window is labelled as different, with its own numbers
         self.assertNotEqual(_numbers(ue), _numbers(boot))
 
     def test_zoom_window_is_labelled(self):
         z = history.view(self.db, None, "NF", "1h", now=NOW, lo_hi=(NOW - 3100, NOW - 1500))["tiles"]["flip"]
-        self.assertEqual(z["window"]["label"], "gezoomter Ausschnitt (27 min)")
+        self.assertEqual(z["window"]["label"], "zoomed section (27 min)")
         self.assertEqual((z["P>D"]["n"], z["D>P"]["n"]), (2, 2))
 
     def test_server_attaches_both_windows_from_the_marks(self):
@@ -183,10 +183,10 @@ class OneNumberOneSet(unittest.TestCase):
         server.App.flip_zeit(app, boots, NOW)
         ue, _, boot = self.tiles()
         self.assertEqual(_numbers(live["flip_zeit"]), _numbers(ue))
-        # the Ueberblick switch "seit Boot": a live boot gets the same function over [its start, now]
-        self.assertEqual(live["flip_boot"]["window"]["label"], "seit Boot")
+        # the Ueberblick switch "since boot": a live boot gets the same function over [its start, now]
+        self.assertEqual(live["flip_boot"]["window"]["label"], "since boot")
         self.assertEqual(_numbers(live["flip_boot"]), _numbers(self.tiles()[2]))
-        self.assertEqual(live["flip_zeit"]["window"]["label"], "letzte 60 min")
+        self.assertEqual(live["flip_zeit"]["window"]["label"], "last 60 min")
         self.assertEqual(_numbers(done["flip_boot"]), _numbers(boot))
         self.assertEqual(server.lean_boot(done)["flip_boot"], done["flip_boot"])
         # the list row carries no ring figure of its own any more
@@ -195,7 +195,7 @@ class OneNumberOneSet(unittest.TestCase):
     def test_overview_switch_is_stored_and_both_windows_are_labelled(self):
         html = open(os.path.join(STATIC, "index.html"), encoding="utf-8").read()
         for needle in ('localStorage.getItem("rigdash.flipWin")', 'localStorage.setItem("rigdash.flipWin"',
-                       "function setFlipWin(", "flipWinOf = (b) =>", "seit Boot", "60 min"):
+                       "function setFlipWin(", "flipWinOf = (b) =>", "since boot", "60 min"):
             self.assertIn(needle, html, needle)
         # no tile reads b.flip_zeit directly any more: the switch decides the window
         self.assertEqual(html.count("b.flip_zeit"), 3)           # flipWinOf + two comments
@@ -204,8 +204,8 @@ class OneNumberOneSet(unittest.TestCase):
         from rigdash import features
         ue, _, _ = self.tiles()
         val, src = features._cur_flip({"flip_zeit": ue, "flip_count": 8}, None, None)
-        self.assertIn("P→D Median 2,60 s", val)
-        self.assertIn("letzte 60 min", src)
+        self.assertIn("P→D median 2,60 s", val)
+        self.assertIn("last 60 min", src)
 
 
 class RedOnBase(unittest.TestCase):

@@ -120,73 +120,73 @@ class AllBlocks(Base):
             pos.append(t.index("### " + b))
         self.assertEqual(pos, sorted(pos), "Blöcke in fester Reihenfolge")
         self.assertEqual(r["blocks"], list(P.ISSUE_BLOCKS))
-        self.assertTrue(t.startswith("## Laufbericht (Profil-Editor): `demo`"))
+        self.assertTrue(t.startswith("## Run report (profile editor): `demo`"))
         self.assertEqual(r["filename"], "laufbericht-demo.md")
 
     def test_hardware_short_form_is_the_ap_a_block_and_not_the_long_form(self):
         t = self.report()["text"]
         self.assertIn("RTX 5090", t)
-        self.assertIn("170 (Datenbl.)", t)                         # SM-Zahl mit Herkunft: dieselben Zellenbausteine wie issue_text
-        self.assertIn("1650 GB/s (gem.)", t)
+        self.assertIn("170 (datasheet)", t)                         # SM-Zahl mit Herkunft: dieselben Zellenbausteine wie issue_text
+        self.assertIn("1650 GB/s (meas.)", t)
         self.assertIn("32607 MiB (NVML)", t)
         self.assertIn("Gen5 x16", t)
-        self.assertNotIn("### Karten (NVML-Identität)", t)          # die Langform bleibt im Hardware-Abschnitt
+        self.assertNotIn("### Cards (NVML identity)", t)          # die Langform bleibt im Hardware-Abschnitt
         self.assertNotIn("UUID", t)
 
     def test_hardware_missing_says_so(self):
         t = self.report(hardware_md="")["text"]
-        self.assertIn("### Hardwareprofil (Kurzform)", t)
-        self.assertIn("Hardwareprofil nicht verfügbar (unbelegt)", t)
+        self.assertIn("### Hardware profile (short form)", t)
+        self.assertIn("Hardware profile not available (unverified)", t)
 
     def test_model_block_carries_values_with_source_and_only_the_folder_name(self):
         t = self.report()["text"]
         self.assertIn("`Qwen3.8-27B`", t)
         self.assertIn("29.00 GiB (Index)", t)
-        self.assertIn("dicht (config)", t)
+        self.assertIn("dense (config)", t)
         self.assertIn("attn 16, gdn 48 (config)", t)
         self.assertIn("24 / 4 / 256 (config)", t)
-        self.assertIn("1088 B (geschätzt)", t)
+        self.assertIn("1088 B (estimated)", t)
         self.assertIn("262144 (config)", t)
         self.assertNotIn("models-cache", t)
 
     def test_no_model_profile_names_the_model_of_the_profile(self):
         t = self.report(model=None)["text"]
-        self.assertIn("Kein Modellprofil geschätzt", t)
+        self.assertIn("No model profile estimated", t)
         self.assertIn("`Qwen3.8-27B`", t)                           # --model des Profils, nur der Ordnername
         t2 = self.report(model={"schema": "falsch"})["text"]
-        self.assertIn("Kein Modellprofil geschätzt", t2)
+        self.assertIn("No model profile estimated", t2)
 
     def test_betriebsform_block(self):
         t = self.report()["text"]
-        self.assertIn("| Betriebsform | Flip PP/TP |", t)
-        self.assertIn("| Abgeleitet aus | weder --d-only noch --dual-* im Profil, also die Standardform des Launchers (aus den Flags des Profils gelesen, keine Wahl des Planers) |", t)
-        self.assertIn("| Linie | nf |", t)
-        self.assertIn("| Profilstand | experimentell |", t)
-        self.assertIn("| Karten (Trockenlauf) | 2: ", t)
-        self.assertIn("| Kartenzahl laut Profil | 3 |", t)
-        self.assertIn("| Inventar laut Profil | RTX5090,RTX3080,RTX3080 |", t)
+        self.assertIn("| Operating mode | Flip PP/TP |", t)
+        self.assertIn("| Derived from | neither --d-only nor --dual-* in the profile, so the launcher's standard form (read from the flags of the profile, not a choice of the planner) |", t)
+        self.assertIn("| Line | nf |", t)
+        self.assertIn("| Profile status | experimentell |", t)
+        self.assertIn("| Cards (Dry run) | 2: ", t)
+        self.assertIn("| Card count per profile | 3 |", t)
+        self.assertIn("| Inventory per profile | RTX5090,RTX3080,RTX3080 |", t)
         self.assertIn("Basis release `demo`", t)
 
     def test_versions_block(self):
         t = self.report()["text"]
-        for want in ("| Baum (Revision) | 173161c595de23e0 |", "| Image | ghcr.io/efschu/htsglang:0.1.0-cu130 |", "| Treiber | 575.57.08 |",
-                     "| CUDA / torch (Messprozess) | 13.0 / 2.9.1 |", "| Dashboard | r1006 |"):
+        for want in ("| Tree (revision) | 173161c595de23e0 |", "| Image | ghcr.io/efschu/htsglang:0.1.0-cu130 |", "| Driver | 575.57.08 |",
+                     "| CUDA / torch (measuring process) | 13.0 / 2.9.1 |", "| Dashboard | r1006 |"):
             self.assertIn(want, t)
-        self.assertRegex(t, r"\| Basisprofil \(sha256\) \| `[0-9a-f]{16}` \|")
+        self.assertRegex(t, r"\| Base profile \(sha256\) \| `[0-9a-f]{16}` \|")
 
     def test_versions_missing_are_unbelegt_never_guessed(self):
         os.environ.pop("SGLANG_IMAGE_TAG", None)
         t = self.report(versions={})["text"]
-        self.assertIn("| Baum (Revision) | unbelegt |", t)
-        self.assertIn("| Image | unbelegt (SGLANG_IMAGE_TAG nicht gesetzt) |", t)
-        self.assertIn("| Treiber | unbelegt |", t)
+        self.assertIn("| Tree (revision) | unverified |", t)
+        self.assertIn("| Image | unverified (SGLANG_IMAGE_TAG not set) |", t)
+        self.assertIn("| Driver | unverified |", t)
 
     def test_placeholder_for_measurement_and_boot_log(self):
         t = self.report()["text"]
-        tail = t.split("### Messergebnis / Boot-Log-Auszug")[1]
+        tail = t.split("### Measurement result / boot log excerpt")[1]
         self.assertIn("```text", tail)
-        self.assertIn("(Boot-Log-Auszug hier einfügen)", tail)
-        self.assertIn("Ergebnis:", tail)
+        self.assertIn("(paste the boot log excerpt here)", tail)
+        self.assertIn("Result:", tail)
         self.assertIn("<!--", tail)
         self.assertEqual(t.count("```"), 2)                         # der Block ist geschlossen: ein Issue-Rendern bleibt heil
 
@@ -194,38 +194,38 @@ class AllBlocks(Base):
 class VerdictsAndForce(Base):
     def test_no_dry_run_is_said_not_hidden(self):
         t = self.report(dry=None)["text"]
-        self.assertIn("Kein Trockenlauf gefahren", t)
-        self.assertIn("Noch kein Trockenlauf für dieses Profil", t)       # force_hint "kein_trockenlauf"
-        self.assertIn("| Karten (gewählt, noch kein Trockenlauf) | 2: ", t)
+        self.assertIn("No dry run was made", t)
+        self.assertIn("No dry run for this profile yet", t)       # force_hint "kein_trockenlauf"
+        self.assertIn("| Cards (selected, no dry run yet) | 2: ", t)
 
     def test_rejections_with_register_state(self):
         dry = self.ed.dry_run(self.doc, RIG[:2])
         codes = {q["code"] for q in dry["rejections"]}
         self.assertIn("HW-COUNT", codes)
         t = self.report(dry=dry)["text"]
-        self.assertIn("Der Planer lehnt", t)
+        self.assertIn("The planner refuses", t)
         self.assertIn("| `HW-COUNT` |", t)
         self.assertIn("FLLIPER_FORCE=1", t)                               # forcebar im Register: die Force-Zeile steht da
         row = next(x for x in t.split("\n") if x.startswith("| `HW-COUNT`"))
         self.assertIn("force:", row)
 
     def test_a_forged_force_claim_from_the_browser_is_not_believed(self):
-        forged = {"ok": True, "verdict": "alles gut", "rejections": [{"code": "HW-ARCH", "text": "HW-ARCH: x", "forcebar": True, "force_state": "force"},
+        forged = {"ok": True, "verdict": "all good", "rejections": [{"code": "HW-ARCH", "text": "HW-ARCH: x", "forcebar": True, "force_state": "force"},
                                                                        {"code": "ERFUNDEN-1", "text": "?", "forcebar": True, "force_state": "force"}], "notes": []}
         t = self.report(dry=forged)["text"]
         row = next(x for x in t.split("\n") if x.startswith("| `HW-ARCH`"))
-        self.assertIn("blockiert", row)
+        self.assertIn("blocked", row)
         self.assertNotIn("force:", row)
         row2 = next(x for x in t.split("\n") if x.startswith("| `ERFUNDEN-1`"))
-        self.assertIn("unbekannter Code", row2)
-        self.assertIn("bleiben auch mit Force bestehen", t.replace("Auch mit Force bestehen bleiben", "bleiben auch mit Force bestehen"))
-        self.assertNotIn("Beim Serverstart `FLLIPER_FORCE=1` setzen", t)  # nichts forcebar
+        self.assertIn("unknown code", row2)
+        self.assertIn("remain even with force", t.replace("Remaining even with force", "remain even with force"))
+        self.assertNotIn("Set `FLLIPER_FORCE=1` at the server start", t)  # nichts forcebar
 
     def test_clean_dry_run(self):
-        t = self.report(dry={"ok": True, "verdict": "Der Planer lehnt dieses Profil auf den gewählten Karten nicht ab.", "rejections": [], "notes": ["Hinweis eins"]})["text"]
-        self.assertIn("nicht ab.", t)
-        self.assertIn("Der Planer lehnt nichts ab; Force wird nicht gebraucht.", t)
-        self.assertIn("- Hinweis: Hinweis eins", t)
+        t = self.report(dry={"ok": True, "verdict": "The planner does not refuse this profile on the chosen cards.", "rejections": [], "notes": ["note one"]})["text"]
+        self.assertIn("not refuse this profile", t)
+        self.assertIn("The planner refuses nothing; force is not needed.", t)
+        self.assertIn("- Note: note one", t)
 
 
 class Proposal(Base):
@@ -235,37 +235,37 @@ class Proposal(Base):
         doc["meta"]["planner"]["flag:--pp-stage-ratio"] = "29,11,8"           # Vorschlag = Wert: keine Abweichung
         doc["meta"]["planner"]["flag:--d-token-placement"] = "7"                       # Vorschlag ohne Zeile
         t = self.report(doc=doc, dry=None)["text"]
-        sec = t.split("### Vorschlag und Übersteuerungen")[1].split("### Verdikte und Force")[0]
+        sec = t.split("### Proposal and overrides")[1].split("### Verdicts and force")[0]
         row = next(x for x in sec.split("\n") if x.startswith("| `flag:--p-bs`"))
         self.assertEqual([c.strip() for c in row.strip("|").split("|")], ["`flag:--p-bs`", "4", "2", "6", "Nutzer"])     # aktuell / Profil / Vorschlag / Herkunft
         self.assertNotIn("`flag:--pp-stage-ratio`", sec)                      # unverändert und gleich dem Vorschlag: nicht im Diff
         self.assertNotIn("`flag:--model`", sec)
-        self.assertIn("1 gegenüber dem geladenen Profil geändert, 1 als Nutzer gesetzt, 2 mit Planer-Vorschlag, 1 weichen vom Vorschlag ab", sec)
-        self.assertIn("Vorschlag ohne Zeile im Profil: `flag:--d-token-placement` = 7", sec)
+        self.assertIn("1 changed against the loaded profile, 1 set by the user, 2 with a planner proposal, 1 differ from the proposal", sec)
+        self.assertIn("Proposal without a row in the profile: `flag:--d-token-placement` = 7", sec)
 
     def test_deleted_value_is_listed(self):
         doc = self.edited([{"key": "flag:--p-bs", "op": "delete"}])
-        sec = self.report(doc=doc, dry=None)["text"].split("### Vorschlag und Übersteuerungen")[1]
-        self.assertIn("Gegenüber dem geladenen Profil entfernt: `flag:--p-bs`", sec)
+        sec = self.report(doc=doc, dry=None)["text"].split("### Proposal and overrides")[1]
+        self.assertIn("Removed against the loaded profile: `flag:--p-bs`", sec)
 
     def test_a_profile_without_proposal_says_so(self):
-        sec = self.report(dry=None)["text"].split("### Vorschlag und Übersteuerungen")[1].split("### Verdikte und Force")[0]
-        self.assertIn("kein Planer-Vorschlag vor", sec)
-        self.assertIn("Keine Abweichung", sec)
+        sec = self.report(dry=None)["text"].split("### Proposal and overrides")[1].split("### Verdicts and force")[0]
+        self.assertIn("no planner proposal for this profile", sec)
+        self.assertIn("No deviation", sec)
 
     def test_vectors_render_and_a_deleted_bare_flag_with_a_proposal_is_listed_twice(self):
         doc = self.edited([{"key": "flag:--p-hostgap", "op": "delete"}, {"key": "extra:P:--rank-moe-ratio", "op": "set", "value": "1,2,3"}])
         doc["meta"]["planner"]["flag:--p-hostgap"] = ""
-        sec = self.report(doc=doc, dry=None)["text"].split("### Vorschlag und Übersteuerungen")[1]
+        sec = self.report(doc=doc, dry=None)["text"].split("### Proposal and overrides")[1]
         row = next(x for x in sec.split("\n") if x.startswith("| `extra:P:--rank-moe-ratio`"))
         self.assertEqual([c.strip() for c in row.strip("|").split("|")], ["`extra:P:--rank-moe-ratio`", "1,2,3", "183,137,168", "–", "Nutzer"])
-        self.assertIn("Gegenüber dem geladenen Profil entfernt: `flag:--p-hostgap`", sec)
-        self.assertIn("Vorschlag ohne Zeile im Profil: `flag:--p-hostgap` = (leer, Schalter an)", sec)
+        self.assertIn("Removed against the loaded profile: `flag:--p-hostgap`", sec)
+        self.assertIn("Proposal without a row in the profile: `flag:--p-hostgap` = (empty, switch on)", sec)
 
     def test_a_bare_flag_shows_as_on(self):
         doc = self.doc
         doc["meta"]["planner"]["flag:--p-hostgap"] = "1"                        # Vorschlag nennt einen Wert, das Profil den Schalter
-        sec = self.report(doc=doc, dry=None)["text"].split("### Vorschlag und Übersteuerungen")[1]
+        sec = self.report(doc=doc, dry=None)["text"].split("### Proposal and overrides")[1]
         row = next(x for x in sec.split("\n") if x.startswith("| `flag:--p-hostgap`"))
         self.assertEqual([c.strip() for c in row.strip("|").split("|")], ["`flag:--p-hostgap`", "an", "an", "1", "Profil"])
 
@@ -275,13 +275,13 @@ class Proposal(Base):
                          {"key": "flag:--x", "name": "--x", "value": "1", "profile_value": "1", "planner_value": None, "origin": "profil", "changed": False}],
                 "removed": [], "planner_only": []}
         sec = "\n".join(P._issue_proposal(view, KNOWN))
-        self.assertIn("| Wert | Aktuell | Profil | Vorschlag (Planer) | Herkunft | Zustand | Verdikt |", sec)
+        self.assertIn("| Value | Current | Profile | Proposal (planner) | Origin | State | Verdict |", sec)
         self.assertIn("| `flag:--p-bs` | 4 | 2 | 6 | Nutzer | übersteuert | FIT |", sec)
 
     def test_long_table_is_cut_with_a_note(self):
         rows = [{"key": "flag:--v%d" % i, "name": "--v%d" % i, "value": "1", "profile_value": "0", "planner_value": None, "origin": "nutzer", "changed": True} for i in range(P.ISSUE_MAX_ROWS + 7)]
         sec = "\n".join(P._issue_proposal({"rows": rows, "removed": [], "planner_only": []}, KNOWN))
-        self.assertIn("… und 7 weitere abweichende Werte (gekürzt).", sec)
+        self.assertIn("… and 7 more deviating values (truncated).", sec)
         self.assertEqual(sum(1 for x in sec.split("\n") if x.startswith("| `flag:--v")), P.ISSUE_MAX_ROWS)
 
 
@@ -290,8 +290,8 @@ class Betriebsform(unittest.TestCase):
         f = P.issue_betriebsform
         self.assertEqual(f(["--p-bs", "--dual-share"], 3)["form"], "Dual PP/TP")
         self.assertEqual(f(["--dual-layout"], 3)["form"], "Dual PP/TP")
-        self.assertEqual(f(["--d-only", "--p-bs"], 3)["form"], "nur TP")
-        self.assertEqual(f(["--p-bs"], 1)["form"], "Einzelkarte")
+        self.assertEqual(f(["--d-only", "--p-bs"], 3)["form"], "TP only")
+        self.assertEqual(f(["--p-bs"], 1)["form"], "Single card")
         self.assertEqual(f(["--p-bs"], 3)["form"], "Flip PP/TP")
         self.assertEqual(f(["--p-bs"], None)["form"], "Flip PP/TP")
         self.assertEqual(f(["--d-only", "--dual-share"], 2)["form"], "Dual PP/TP")     # Dual schlägt --d-only, wie der Launcher --dual-share impliziert
@@ -302,8 +302,8 @@ class Betriebsform(unittest.TestCase):
         ed = editor(tmp)
         doc = ed.edit(ed.load("release", "demo")["doc"], [{"key": "flag:--dual-share", "op": "set", "value": ""}])["doc"]
         t = ed.issue_report(doc, dry=None, cards=RIG, versions=VERSIONS)["text"]
-        self.assertIn("| Betriebsform | Dual PP/TP |", t)
-        self.assertIn("| Abgeleitet aus | Flag --dual-share im Profil", t)
+        self.assertIn("| Operating mode | Dual PP/TP |", t)
+        self.assertIn("| Derived from | Flag --dual-share in the profile", t)
 
 
 class Redaction(Base):
@@ -329,9 +329,9 @@ class Redaction(Base):
             self.assertNotIn(bad, t, bad)
         self.assertIn("`env:P:HF_TOKEN`", t)                               # die Zeile bleibt sichtbar, nur der Wert ist weg
         row = next(x for x in t.split("\n") if x.startswith("| `env:P:HF_TOKEN`"))
-        self.assertEqual(row.count("<entfernt>"), 2)                       # aktuell und Vorschlag; das Profil trug die Zeile nicht (–)
+        self.assertEqual(row.count("<redacted>"), 2)                       # aktuell und Vorschlag; das Profil trug die Zeile nicht (–)
         self.assertTrue(row.rstrip().endswith("Nutzer |"))
-        self.assertIn("<Pfad entfernt>", t)
+        self.assertIn("<path redacted>", t)
         self.assertIn("| `flag:--p-bs` | 4 |", t)                           # gewöhnliche Werte bleiben lesbar
 
     def test_tokens_in_a_flag_name_are_not_secrets(self):
@@ -344,7 +344,7 @@ class Redaction(Base):
         for n in ("SGLANG_LOG_DECODE_GRAPH_KEY", "SGLANG_WEG2_TOLD_PROBE_TREE_KEY", "--ssl-keyfile", "KEYBOARD", "MONKEY"):
             self.assertFalse(redact.secret_name(n), n)
         self.assertEqual(redact.value_for_issue("--max-total-tokens", "4096", KNOWN), "4096")
-        self.assertEqual(redact.value_for_issue("HF_TOKEN", "x"), "<entfernt>")
+        self.assertEqual(redact.value_for_issue("HF_TOKEN", "x"), "<redacted>")
 
     def test_user_set_vendor_key_envs_never_reach_the_proposal_block(self):
         # Befund 1 (Fix-Runde 2): ein vom Nutzer gesetzter Env mit beliebigem Praefix + KEY darf nicht im Klartext stehen
@@ -355,7 +355,7 @@ class Redaction(Base):
         for n, v in leaks.items():
             self.assertNotIn(v, t, n)
             row = next(x for x in t.split("\n") if x.startswith("| `env:P:%s`" % n))
-            self.assertIn("<entfernt>", row)
+            self.assertIn("<redacted>", row)
 
     def test_reviewer_leaks_appear_as_entfernt_in_the_report(self):
         # Befund 1 (Fix-Runde 3): Pluralnamen, HF_AUTH und eine URL mit user:pass duerfen nicht im Klartext stehen
@@ -368,10 +368,10 @@ class Redaction(Base):
             for frag in (v, v.split(":")[-1] if "@" in v else v):
                 self.assertNotIn(frag.split("@")[0] if "@" in frag else frag, t, n)
             row = next(x for x in t.split("\n") if x.startswith("| `env:P:%s`" % n))
-            self.assertTrue("<entfernt>" in row or HIDDEN in row, n)
+            self.assertTrue("<redacted>" in row or HIDDEN in row, n)
         self.assertNotIn("hunter2pw", t)
         self.assertNotIn("s3cretpw", t)
-        self.assertIn("dbuser:<entfernt>@db.internal", t)                # Nutzer bleibt lesbar, das Passwort ist weg
+        self.assertIn("dbuser:<redacted>@db.internal", t)                # Nutzer bleibt lesbar, das Passwort ist weg
 
     def test_value_shapes_are_cut_whatever_the_name(self):
         for v in ("sk-abcdefgh12345678", "sk-ant-api03-AbCdEf0123456789xyz", "sk-proj-AbCd0123456789EfGh", "hf_AbCdEfGhIjKlMnOp",
@@ -382,15 +382,15 @@ class Redaction(Base):
                 out = redact.text_for_issue(form)
                 self.assertNotIn(v, out, form)
                 if "github_pat" not in v:                                  # ``GITHUB_PAT`` laesst clean() die ganze Zeile fallen: dann ist sie weg
-                    self.assertIn("<entfernt>", out, form)
-        self.assertEqual(redact.text_for_issue("Authorization-frei: Bearer abcdef0123456789xyz"), "Authorization-frei: Bearer <entfernt>")
-        self.assertEqual(redact.text_for_issue("curl https://alice:hunter2@host.example/x"), "curl https://alice:<entfernt>@host.example/x")
+                    self.assertIn("<redacted>", out, form)
+        self.assertEqual(redact.text_for_issue("Authorization-frei: Bearer abcdef0123456789xyz"), "Authorization-frei: Bearer <redacted>")
+        self.assertEqual(redact.text_for_issue("curl https://alice:hunter2@host.example/x"), "curl https://alice:<redacted>@host.example/x")
         self.assertNotIn("hunter2", redact.text_for_issue("redis://:hunter2@cache:6379/0"))
         long_tok = "Zk3" + "aB9xQ" * 8                                       # 43 Zeichen, gemischt
         for form in ("FOO=" + long_tok, "foo: " + long_tok, "--bar=" + long_tok, "| FOO=" + long_tok + " |"):
             out = redact.text_for_issue(form)
             self.assertNotIn(long_tok, out, form)
-            self.assertIn("<entfernt>", out, form)
+            self.assertIn("<redacted>", out, form)
 
     # ---- Fix-Runde 4: jeder Ausgabepfad des Laufberichts mit derselben Sonde (Praefix-loses Token, JWT, Hostpfade) ----
     TOK = "Zq8vN3kLp0Wm7Rt2Yx5Bc9Df4Gh6Jk1Ls"                           # 33 Zeichen, gemischt, kein Anbieter-Praefix
@@ -426,7 +426,7 @@ class Redaction(Base):
         # der Wert ohne Zeilenkontext (so reicht ihn _issue_cell weiter)
         for tok in (self.TOK, "`%s`" % self.TOK, self.TOK_LOW, self.JWT):
             self.assertEqual(redact.value_for_issue("MY_THING", tok, KNOWN), HIDDEN)                       # unbekannter Schluessel
-            self.assertEqual(redact.value_for_issue("SGLANG_CACHE_DIR", tok, KNOWN), "<entfernt>")        # Katalog-Schluessel: die Wertform schneidet
+            self.assertEqual(redact.value_for_issue("SGLANG_CACHE_DIR", tok, KNOWN), "<redacted>")        # Katalog-Schluessel: die Wertform schneidet
             self.assertEqual(redact.value_for_issue("MY_THING", tok), HIDDEN)                              # ohne Katalog: geschlossen
 
     def test_probe_in_free_text_notes_verdict_rejection_hardware_model_and_var(self):
@@ -456,7 +456,7 @@ class Redaction(Base):
     def test_paths_rules(self):
         for src, want in (("/nvme/hf", "<hostpfad>/hf"), ("x /workspace/models/Qwen y", "x <hostpfad>/Qwen y"), ("~/a/b", "<hostpfad>/b"),
                           ("$HOME/a", "<hostpfad>/a"), ("--model=/nvme/m", "--model=<hostpfad>/m"), ("/scratch", "<hostpfad>/scratch"),
-                          ("/root/x", "<Pfad entfernt>"), ("/app/python", "/app/python"), ("POST /api/profil/issue", "POST /api/profil/issue")):
+                          ("/root/x", "<path redacted>"), ("/app/python", "/app/python"), ("POST /api/profil/issue", "POST /api/profil/issue")):
             self.assertEqual(redact.paths(src), want, src)
         for keep in ("https://host.example/a/b", "ja/nein", "GB/s", "RTX 3080 / 5090", "a / b", "1/2", "~", "25 %"):
             self.assertEqual(redact.paths(keep), keep, keep)
@@ -469,7 +469,7 @@ class Redaction(Base):
             self.assertNotIn(self.JWT, out, form)
             self.assertNotIn(self.TOK, out, form)
             self.assertNotIn(self.TOK_LOW, out, form)
-            self.assertIn("<entfernt>", out, form)
+            self.assertIn("<redacted>", out, form)
         for keep in ("task-runner-big-name-0123456789-abcdef", "173161c595de23e0aa11bb22cc33dd44ee55ff66", "sha256:" + "ab12" * 16,
                      "SGLANG_WEG2_LANE_COVERAGE_TOKEN_X_Y_Z_0123456789", "eyJ", "eyJ.a.b", "Qwen3.6-27B-AWQ-BF16-INT4-some-very-long-variant-name-v2"):
             self.assertEqual(redact.text_for_issue(keep), keep, keep)
@@ -492,7 +492,7 @@ class Redaction(Base):
         for probe in ("AbcdEfghIjklMnopQrstUvwxYz12Ab", "Abcd1Efgh2Ijkl3Mnop4Qrst5Uvwx6Yzab", "Weg2AbcdEfghIjklMnopQrstUvwxYz12"):
             out = redact.text_for_issue("note " + probe)
             self.assertNotIn(probe, out, probe)
-            self.assertIn("<entfernt>", out, probe)
+            self.assertIn("<redacted>", out, probe)
         self.assertEqual(redact.text_for_issue("W64 Weg2TpOperatingPointInfeasible: x"), "W64 Weg2TpOperatingPointInfeasible: x")
         # die Liste kommt aus dem Quelltext: ein Name, der dort als Klasse steht, bleibt lesbar (Beleg: class Weg2DKvStageWavesRefused)
         self.assertIn("Weg2DKvStageWavesRefused", redact.known_idents())
@@ -521,7 +521,7 @@ class Redaction(Base):
         for n in ("OPENAI_API_KEYS", "MY_KEYS", "HF_AUTH", "--auth", "DB_PASS", "--pass", "MY_SECRETS", "DB_PASSWORDS", "SERVICE_CREDENTIALS", "GH_PAT",
                   "HF_TOKENS", "--auth-tokens", "--credential"):
             self.assertTrue(redact.secret_name(n), n)
-            self.assertEqual(redact.value_for_issue(n, "x"), "<entfernt>", n)
+            self.assertEqual(redact.value_for_issue(n, "x"), "<redacted>", n)
         for n in ("--max-total-tokens", "--auth-backend", "--pass-through", "SGLANG_LOG_DECODE_GRAPH_KEY", "SGLANG_X_TREE_KEYS",
                   "--bypass", "PATH", "KEYS_PER_SEC_X", "--tokens-per-second", "SGLANG_HICACHE_BIGRAM_KEYS", "SGLANG_WEG2_MAMBA_STATE_KEYS",
                   "SGLANG_WEG2_D_TWIN_PASS", "--kv-session-offload-budget-session-tokens"):
@@ -545,7 +545,7 @@ class Redaction(Base):
         for n in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN", "--hf-token", "--token", "MY_SERVICE_TOKEN", "HF_TOKEN_FILE", "SGLANG_WEG2_BOOT_TOKEN",
                   "--auth-token", "SLACK_BOT_TOKEN"):
             self.assertTrue(redact.secret_name(n), n)
-            self.assertEqual(redact.value_for_issue(n, "abc"), "<entfernt>", n)
+            self.assertEqual(redact.value_for_issue(n, "abc"), "<redacted>", n)
 
     def test_secret_names_over_the_whole_catalog_are_exactly_the_expected_list(self):
         with open(REPO_CATALOG, encoding="utf-8") as f:
@@ -564,7 +564,7 @@ class Redaction(Base):
         t = self.report(doc=doc, dry=None)["text"]
         row = next((x for x in t.split("\n") if x.startswith("| `flag:--d-token-placement`")), "")
         self.assertIn("roundrobin", row)
-        self.assertNotIn("<entfernt>", row)
+        self.assertNotIn("<redacted>", row)
         self.assertIn("248046", next((x for x in t.split("\n") if x.startswith("| `flag:--turn-anchor-token`")), ""))
 
     def test_version_facts_read_the_release_image_sources(self):
@@ -581,8 +581,8 @@ class Redaction(Base):
         vf = hwprofil.version_facts({}, {}, environ={"SGLANG_BUILD_COMMIT": "unknown", "SGLANG_IMAGE_TAG": "local/sglang:dev"})
         self.assertIsNone(vf["tree_rev"])
         self.assertTrue(vf["image_default"])
-        self.assertEqual(hwprofil.version_tree_text(vf), "unbelegt")
-        self.assertIn("unbelegt (Default local/sglang:dev", hwprofil.version_image_text(vf))
+        self.assertEqual(hwprofil.version_tree_text(vf), "unverified")
+        self.assertIn("unverified (default local/sglang:dev", hwprofil.version_image_text(vf))
         # kein Env-Wert, der nach nichts aussieht
         self.assertIsNone(hwprofil.version_facts({}, {}, environ={"HTSGLANG_REVISION": "not-a-sha"})["tree_rev"])
 
@@ -600,8 +600,8 @@ class Redaction(Base):
             head = git("rev-parse", "HEAD")
             for tree in (d, os.path.join(d, "python")):
                 vf = hwprofil.version_facts({}, {"tree": tree}, environ={"HTSGLANG_REVISION": "deadbeef0"})
-                self.assertEqual((vf["tree_rev"], vf["tree_rev_src"]), (head, "git HEAD des Baums"))      # gemessen schlaegt die Soll-Revision
-            self.assertIn("%s (git HEAD des Baums)" % head, hwprofil.version_tree_text(vf))
+                self.assertEqual((vf["tree_rev"], vf["tree_rev_src"]), (head, "git HEAD of the tree"))      # gemessen schlaegt die Soll-Revision
+            self.assertIn("%s (git HEAD of the tree)" % head, hwprofil.version_tree_text(vf))
             os.makedirs(os.path.join(d, "a", "b"))
             vf = hwprofil.version_facts({}, {"tree": os.path.join(d, "a", "b")}, environ={})       # Ordner in einem FREMDEN Repository: kein Beleg
             self.assertIsNone(vf["tree_rev"])
@@ -613,8 +613,8 @@ class Redaction(Base):
         vf = hwprofil.version_facts({"driver": "575.57.08"}, {"tree": "/opt/htsglang/src/python"},
                                     environ={"HTSGLANG_REVISION": sha, "SGLANG_IMAGE_TAG": "local/sglang:dev"})
         t = self.report(doc=self.edited([]), versions=vf)["text"]
-        self.assertIn("| Baum (Revision) | %s (Image-ENV HTSGLANG_REVISION) |" % sha, t)
-        self.assertIn("| Image | unbelegt (Default local/sglang:dev", t)
+        self.assertIn("| Tree (revision) | %s (Image-ENV HTSGLANG_REVISION) |" % sha, t)
+        self.assertIn("| Image | unverified (default local/sglang:dev", t)
 
     def test_every_markdown_row_stays_one_line(self):
         doc = self.edited([{"key": "flag:--p-bs", "op": "set", "value": "a|b\nc"}])
@@ -659,12 +659,12 @@ class StructuralAllowRule(Base):
         for v in (self.AWS, self.AZURE, self.DISCORD):
             for frag in (v, v[:20], v[-12:]):
                 self.assertNotIn(frag, t, frag)
-        self.assertIn("<entfernt>", t)
+        self.assertIn("<redacted>", t)
         for form in (self.AWS, self.AZURE, "| a | %s |" % self.AZURE, "k=" + self.AWS, "\"%s\"" % self.AWS):
             out = redact.text_for_issue(form)
             self.assertNotIn(self.AWS, out, form)
             self.assertNotIn(self.AZURE, out, form)
-            self.assertIn("<entfernt>", out, form)
+            self.assertIn("<redacted>", out, form)
 
     def test_catalog_keys_with_harmless_values_stay_visible(self):
         doc = self.edited([{"key": "flag:--p-bs", "op": "set", "value": "4"},
@@ -683,14 +683,14 @@ class StructuralAllowRule(Base):
         t = self.report(doc=doc, dry=None)["text"]
         for v in (self.AWS, self.DISCORD):
             self.assertNotIn(v[:20], t)
-        self.assertIn("<entfernt>", self.row(t, "env:P:SGLANG_CACHE_DIR"))
-        self.assertIn("<entfernt>", self.row(t, "env:D:SGLANG_DG_CACHE_DIR"))
+        self.assertIn("<redacted>", self.row(t, "env:P:SGLANG_CACHE_DIR"))
+        self.assertIn("<redacted>", self.row(t, "env:D:SGLANG_DG_CACHE_DIR"))
 
     def test_a_secret_name_in_the_catalog_stays_entfernt_and_unknown_is_not_entfernt(self):
         doc = self.edited([{"key": "flag:--api-key", "op": "set", "value": "klartext"}, {"key": "env:P:SOME_FREE_NAME", "op": "set", "value": "1"}])
         t = self.report(doc=doc, dry=None)["text"]
         self.assertNotIn("klartext", t)
-        self.assertIn("<entfernt>", self.row(t, "flag:--api-key"))
+        self.assertIn("<redacted>", self.row(t, "flag:--api-key"))
         self.assertIn(HIDDEN, self.row(t, "env:P:SOME_FREE_NAME"))          # auch ein harmloser Wert: der Schluessel ist unbekannt
 
     def test_the_rule_in_redact_directly(self):
@@ -702,7 +702,7 @@ class StructuralAllowRule(Base):
         self.assertEqual(redact.value_for_issue("--p-bs", "4"), HIDDEN)                            # ohne Katalog nichts zeigen
         self.assertEqual(redact.value_for_issue("--p-bs", "4", frozenset()), HIDDEN)
         self.assertEqual(redact.value_for_issue("MY_THING", "", KNOWN), "")                        # leer ist kein Geheimnis
-        self.assertEqual(redact.value_for_issue("HF_TOKEN", "x", KNOWN), "<entfernt>")
+        self.assertEqual(redact.value_for_issue("HF_TOKEN", "x", KNOWN), "<redacted>")
         self.assertEqual(redact.bare_key("env:D:HF_HOME"), "HF_HOME")
         self.assertEqual(redact.bare_key("var:PROFILE_NAME"), "PROFILE_NAME")
 
@@ -712,14 +712,14 @@ class StructuralAllowRule(Base):
                      "python/sglang/srt/weg2/profile_json.py", "https://host.example/a/b/c", "1.2.3.4"):
             self.assertEqual(redact.text_for_issue(keep), keep, keep)
         for secret in (self.DISCORD, "x." + self.MIXED24 + ".Cl2" + "FMQ" + "y" * 16, "Ab1+" * 10 + "==", self.AWS):
-            self.assertEqual(redact.text_for_issue(secret), "<entfernt>", secret)
+            self.assertEqual(redact.text_for_issue(secret), "<redacted>", secret)
 
     def test_paths_are_normalised_before_they_are_judged(self):
         for src, want in (("file:///nvme/private/model", "<hostpfad>/model"), ("--model=file:///nvme/private/model", "--model=<hostpfad>/model"),
-                          ("file://host/data/x", "<Pfad entfernt>"), ("FILE:///scratch/a", "<hostpfad>/a"),
-                          ("/app/../../root/.ssh/id_rsa", "<Pfad entfernt>"), ("/app/../nvme/x", "<hostpfad>/x"), ("/app/../app/x", "/app/x"),
-                          ("/models-cache/../../etc/shadow", "<Pfad entfernt>"), ("/app/x/./y", "/app/x/y"), ("~/../../etc/x", "<hostpfad>/x"),
-                          ("\"/nvme/my models/Qwen\"", "\"<hostpfad>/Qwen\""), ("'/home/al ice/My Documents/k'", "'<Pfad entfernt>'"),
+                          ("file://host/data/x", "<path redacted>"), ("FILE:///scratch/a", "<hostpfad>/a"),
+                          ("/app/../../root/.ssh/id_rsa", "<path redacted>"), ("/app/../nvme/x", "<hostpfad>/x"), ("/app/../app/x", "/app/x"),
+                          ("/models-cache/../../etc/shadow", "<path redacted>"), ("/app/x/./y", "/app/x/y"), ("~/../../etc/x", "<hostpfad>/x"),
+                          ("\"/nvme/my models/Qwen\"", "\"<hostpfad>/Qwen\""), ("'/home/al ice/My Documents/k'", "'<path redacted>'"),
                           ("`/app/with space/x`", "`/app/with space/x`"), ("/app/x and /nvme/y", "/app/x and <hostpfad>/y")):
             self.assertEqual(redact.paths(src), want, src)
             self.assertEqual(redact.paths(redact.paths(src)), want, "zweimal: " + src)
@@ -731,7 +731,7 @@ class StructuralAllowRule(Base):
         for bad in ("nvme", "private", "/root", ".ssh", "id_rsa", "my models", "file://"):
             self.assertNotIn(bad, t, bad)
         self.assertIn("<hostpfad>/model", self.row(t, "flag:--model"))
-        self.assertIn("<Pfad entfernt>", self.row(t, "flag:--download-dir"))
+        self.assertIn("<path redacted>", self.row(t, "flag:--download-dir"))
 
 
 class Existing(Base):
@@ -777,7 +777,7 @@ class Routes(unittest.TestCase):
         self.assertEqual(st, 200, txt)
         j = json.loads(txt)
         self.assertEqual(j["blocks"], list(P.ISSUE_BLOCKS))
-        self.assertIn("170 (Datenbl.)", j["text"])
+        self.assertIn("170 (datasheet)", j["text"])
         self.assertIn("| `HW-COUNT` |", j["text"])
         self.assertIn("173161c595de23e0", j["text"])
 
@@ -791,7 +791,7 @@ class Routes(unittest.TestCase):
         doc = json.loads(self.call(port, "/api/profil/load", {"kind": "release", "name": "demo"})[1])["doc"]
         st, txt = self.call(port, "/api/profil/issue", {"doc": doc})
         self.assertEqual(st, 200, txt)
-        self.assertIn("Hardwareprofil nicht verfügbar (unbelegt)", json.loads(txt)["text"])
+        self.assertIn("Hardware profile not available (unverified)", json.loads(txt)["text"])
         port2 = self.serve()                                                # gar kein Hardware-Dienst im App-Objekt
         self.assertEqual(self.call(port2, "/api/profil/issue", {"doc": doc})[0], 200)
 
@@ -806,7 +806,7 @@ class Routes(unittest.TestCase):
 class HwProfilBlocks(unittest.TestCase):
     def test_short_form_is_a_subset_of_the_long_form_cells(self):
         short, long_ = hwprofil.issue_short(HW), hwprofil.issue_text(HW)
-        for cell in ("170 (Datenbl.)", "32607 MiB (NVML)", "1650 GB/s (gem.)", "Gen5 x16"):
+        for cell in ("170 (datasheet)", "32607 MiB (NVML)", "1650 GB/s (meas.)", "Gen5 x16"):
             self.assertIn(cell, short)
             self.assertIn(cell, long_)
         self.assertLess(len(short), len(long_))
@@ -816,8 +816,8 @@ class HwProfilBlocks(unittest.TestCase):
         f = hwprofil.version_facts(HW, {"tree": "/opt/x/releases/173161c595de23e0/python", "rigdash": "r"})
         self.assertEqual((f["tree_rev"], f["driver"], f["image"], f["rigdash"]), ("173161c595de23e0", "575.57.08", None, "r"))
         t = hwprofil.issue_text(HW, versions={"tree": "/opt/x/releases/173161c595de23e0/python"})
-        self.assertIn("| Baum | 173161c595de23e0 |", t)
-        self.assertIn("| Image | unbelegt (SGLANG_IMAGE_TAG nicht gesetzt) |", t)
+        self.assertIn("| Tree | 173161c595de23e0 |", t)
+        self.assertIn("| Image | unverified (SGLANG_IMAGE_TAG not set) |", t)
 
 
 HARNESS = r"""
@@ -845,7 +845,7 @@ global.fetch = async (url, opt) => {
   if (p === "list") out = { ok: true, release: [{ name: "p" }], user: [], cards: [{ id: "a", label: "A", arch: "sm86" }], rig_preset: { cards: [{ card: "a", pcie: { gen: 4, lanes: 8 } }] }, register: [] };
   else if (p === "load") out = { ok: true, doc: DOC, view: VIEW, name: "p", line: "nf", groups: [] };
   else if (p === "dry") out = { ok: true, goes: true, verdict: "ok", rejections: [], notes: [], cards: [] };
-  else if (p === "issue") out = { ok: true, format: "markdown", text: "## Laufbericht <b>x</b>\n### Modellprofil", blocks: ["Modellprofil"], filename: "laufbericht-p.md" };
+  else if (p === "issue") out = { ok: true, format: "markdown", text: "## Run report <b>x</b>\n### Model profile", blocks: ["Model profile"], filename: "run-report-p.md" };
   else out = { ok: false, error: "unerwartet " + p };
   return { ok: out.ok, status: out.ok ? 200 : 400, text: async () => JSON.stringify(out) };
 };
@@ -864,16 +864,16 @@ const click = (dataset) => root._h.click({ target: { closest: () => ({ dataset }
   const c = calls.filter((x) => x.p === "issue");
   out.issueCalls = c.length;
   out.body = c[0] && c[0].body;
-  out.shown = root.innerHTML.indexOf("Laufbericht &lt;b&gt;x&lt;/b&gt;") >= 0;          // maskiert, nie als HTML
+  out.shown = root.innerHTML.indexOf("Run report &lt;b&gt;x&lt;/b&gt;") >= 0;          // maskiert, nie als HTML
   out.rawHtml = root.innerHTML.indexOf("<b>x</b>") >= 0;
-  out.contains = root.innerHTML.indexOf("Modellprofil") >= 0;
-  out.fresh = root.innerHTML.indexOf("Veraltet") < 0;
+  out.contains = root.innerHTML.indexOf("Model profile") >= 0;
+  out.fresh = root.innerHTML.indexOf("Stale") < 0;
   click({ act: "issue-copy" }); await sleep(30);
   out.copied = copied;
   click({ act: "dry" }); await sleep(60);                                                // der Trockenlauf ändert die Grundlage
-  out.stale = root.innerHTML.indexOf("Veraltet") >= 0;
+  out.stale = root.innerHTML.indexOf("Stale") >= 0;
   click({ act: "issue" }); await sleep(60);
-  out.freshAgain = root.innerHTML.indexOf("Veraltet") < 0;
+  out.freshAgain = root.innerHTML.indexOf("Stale") < 0;
   click({ act: "issue-close" }); await sleep(10);
   out.closed = root.innerHTML.indexOf("pf-issue-text") < 0;
   click({ act: "issue" }); await sleep(60);
@@ -908,7 +908,7 @@ class UiJs(unittest.TestCase):
         self.assertFalse(o["rawHtml"])
         self.assertTrue(o["contains"])
         self.assertTrue(o["fresh"])
-        self.assertIn("### Modellprofil", o["copied"])
+        self.assertIn("### Model profile", o["copied"])
         self.assertTrue(o["stale"])
         self.assertTrue(o["freshAgain"])
         self.assertTrue(o["closed"])

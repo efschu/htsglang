@@ -740,7 +740,7 @@ def attach_current(fv: dict, live_boots: list, gpus: Optional[dict]) -> dict:
             run = _formats_running(m, fb.get("format"))
             cur[m]["format"] = _clean(fb.get("format"))
             cur[m]["je_format"] = {f: ("dieser Boot" if f in run else
-                                       ("kein Boot in diesem Format" if fb.get("format") else "Format des Boots unbekannt"))
+                                       ("no boot in this format" if fb.get("format") else "boot format unknown"))
                                    for f in AKTUELL_FORMATE[m]}
         p["aktuell"] = cur
         for z in (p.get("untertabelle") or {}).get("zeilen") or []:

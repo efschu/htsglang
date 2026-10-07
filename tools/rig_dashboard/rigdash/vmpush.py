@@ -502,7 +502,7 @@ def pcie_series(client: VmClient, ts: List[int], step: int) -> dict:
                                         ts[0] + step, ts[-1] + step, step, "gpu")
             for g, vals in got.items():
                 out["g%s.%s" % (g, d)] = [vals.get(t + step) for t in ts]
-        return {"series": out, "error": None, "src": "VictoriaMetrics weg2_gpu_pcie_bytes_per_second (NVML im 1-s-Takt)"}
+        return {"series": out, "error": None, "src": "VictoriaMetrics weg2_gpu_pcie_bytes_per_second (NVML at a 1 s cadence)"}
     except Exception as e:  # noqa: BLE001
         return {"series": {}, "error": "%s: %s" % (type(e).__name__, e)}
 

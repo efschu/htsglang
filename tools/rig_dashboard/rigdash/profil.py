@@ -220,6 +220,12 @@ def _md(x, limit: int = ISSUE_CELL) -> str:
     return t if len(t) <= limit else t[:limit - 1].rstrip() + "…"
 
 
+#: display words of the source tags of the model profile (the schema value ``geschätzt`` stays the key; the report shows English)
+_SRC_DISPLAY = {"geschätzt": "estimated"}
+#: display words of the ``force_state`` values in the run report (the API values stay German: ``force`` | ``blockiert`` | ``ungeprueft``)
+_STATE_DISPLAY = {"force": "force", "blockiert": "blocked", "ungeprueft": "unchecked"}
+
+
 def _lv(o):
     """Wertknoten des Modellprofils ``{v, src}`` -> (Wert, Quelle); alles andere -> (None, None)."""
     return (o.get("v"), o.get("src")) if isinstance(o, dict) and "v" in o else (None, None)
@@ -312,7 +318,7 @@ def dry_from_vorschlag(vd) -> Optional[dict]:
         seen.add(code)
         q = {"code": code, "text": str(x.get("text") or x.get("grund") or "")[:2000]}
         if x.get("klasse") == "nicht_forcebar":                    # nur zur Anzeige eines Codes ohne Registerzeile (W71-CENSUS, W64-OPPOINT): die Forcebarkeit bleibt "blockiert"
-            q["klass_label"] = "nicht forcebar"
+            q["klass_label"] = "not forceable"
         if x.get("konsequenz"):
             q["consequence"] = str(x["konsequenz"])[:400]
         rej.append(q)
@@ -338,7 +344,7 @@ def _issue_model(model, doc_rows) -> List[str]:
         v, src = _lv(o)
         if v is None or v == "" or v == [] or v == {}:
             return
-        out.append((label, "%s (%s)" % (fmt(v) if fmt else v, src or "?")))
+        out.append((label, "%s (%s)" % (fmt(v) if fmt else v, _SRC_DISPLAY.get(src, src) or "?")))
 
     a, w, kv, st, ex, dr, cx = (p.get(k) or {} for k in ("arch", "weights", "kv", "state", "experts", "draft", "context"))
     name = os.path.basename(str(p.get("path") or "").rstrip("/"))
@@ -448,8 +454,8 @@ def _issue_verdicts(dry, reg_rows: List[dict], line: str) -> List[str]:
             seen.add(q["code"])
             r = reg.get(q["code"]) or {}
             label, state, _via = force_verdict(r) if r else (("not forceable: remains even with force (code of the planner verdict, not in the launcher register)"
-                                                              if q.get("klass_label") == "nicht forcebar" else "unknown code: not treated as forceable"), "blockiert", None)
-            L.append("| `%s` | %s | %s | %s | %s |" % (_md(q["code"], 40), _md(r.get("klass_label") or r.get("klass") or q.get("klass_label") or "?", 60), _md("%s: %s" % (state, label), 160),
+                                                              if q.get("klass_label") == "not forceable" else "unknown code: not treated as forceable"), "blockiert", None)
+            L.append("| `%s` | %s | %s | %s | %s |" % (_md(q["code"], 40), _md(r.get("klass_label") or r.get("klass") or q.get("klass_label") or "?", 60), _md("%s: %s" % (_STATE_DISPLAY.get(state, state), label), 160),
                                                        _md(_clip_text(q["code"], q.get("text")), 300), _md(r.get("consequence") or q.get("consequence") or "–", 240)))
     fh = force_hint(dry, reg_rows, line)
     L += ["", "Force: %s" % _md(fh["text"], 400)]
@@ -1105,7 +1111,7 @@ class ProfilEditor:
         r = reg.get(f["code"])
         if r is None and f.get("verdikt"):
             v = f["verdikt"]
-            return {"code": f["code"], "klass": "nicht_forcebar", "klass_label": "nicht forcebar", "forcebar": False, "wired": None,
+            return {"code": f["code"], "klass": "nicht_forcebar", "klass_label": "not forceable", "forcebar": False, "wired": None,
                     "wired_at": None, "why_class": "%s: %s" % (v.get("titel") or f["code"], v.get("konsequenz") or ""), "consequence": v.get("konsequenz")}
         return r or {}
 

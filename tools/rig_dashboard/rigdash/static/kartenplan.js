@@ -8,6 +8,7 @@
   if (!root) return;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const fmt = (n) => (n == null ? "–" : Math.round(n).toLocaleString("en-US"));
+  const srcDisp = (t) => ({ "Datenblatt": "datasheet", "NVML-Record": "NVML record" })[t] || t;   // display words of the catalog source tags (the tags stay German keys)
   const gib = (n) => (n == null ? "–" : (n / 1024).toLocaleString("en-US", { maximumFractionDigits: 1 }));
   const state = { cat: null, profile: null, cards: [], hostPatched: true, view: "einfach", res: null, busy: false, err: null, envFilter: "" };
   try { const v = localStorage.getItem("rigdash.kp.view"); if (v === "einfach" || v === "experte") state.view = v; } catch (e) { /* private window */ }
@@ -48,7 +49,7 @@
           <label><input type="checkbox" data-f="rebar"${k.pcie.rebar ? " checked" : ""}> Resizable BAR</label>
           <label><input type="checkbox" data-f="chipset"${k.pcie.chipset ? " checked" : ""}> via chipset</label>
         </div>
-        <div class="muted kp-meta">${e ? `${e.arch} (cc ${e.cc.join(".")}) · ${fmt(e.usable_mib)} MiB <i>(${esc(e.usable_src.split(" (")[0])})</i> · ${e.mem_bw_gbs} GB/s <i>(${esc(e.mem_bw_src.split(" (")[0])})</i> · PCIe native Gen${e.pcie_native.gen} x${e.pcie_native.lanes}` : ""}</div>
+        <div class="muted kp-meta">${e ? `${e.arch} (cc ${e.cc.join(".")}) · ${fmt(e.usable_mib)} MiB <i>(${esc(srcDisp(e.usable_src.split(" (")[0]))})</i> · ${e.mem_bw_gbs} GB/s <i>(${esc(srcDisp(e.mem_bw_src.split(" (")[0]))})</i> · PCIe native Gen${e.pcie_native.gen} x${e.pcie_native.lanes}` : ""}</div>
       </div>`;
     }).join("");
     return `<div class="kp-top">

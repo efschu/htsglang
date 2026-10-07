@@ -26,7 +26,7 @@ def rs(g, t, ts, pnew=0, pcached=0, dtok=0, rounds=0, dgpu=0.0, running=None, kv
 class TestIpcHelpers(unittest.TestCase):
     def test_model_src_label(self):
         self.assertEqual(history.model_src([None, 1.0]), history.IPC_LABEL)
-        self.assertEqual(history.model_src([None, None]), "keine Daten (vor IPC-Aufzeichnung)")
+        self.assertEqual(history.model_src([None, None]), "no data (before IPC recording)")
 
     def test_boot_ts_from_id(self):
         self.assertEqual(history.boot_ts("nfh91-boot-20260930T153426Z-051f"), 1790782466.0)
@@ -191,7 +191,7 @@ class TestViewPowerSum(unittest.TestCase):
         v = history.view(db, None, "27B", "15m", now=now)
         self.assertEqual(v["series"]["gsum.power"][v["t"].index(9901)], 360.0)
         self.assertEqual(v["series"]["g1.power"][v["t"].index(9901)], 250.0)
-        self.assertEqual(v["src"]["power"], "NVML, Summe aller Karten")
+        self.assertEqual(v["src"]["power"], "NVML, sum of all cards")
         self.assertNotIn("now_tiles", v["src"])                        # the log "jetzt" tiles are gone
 
 

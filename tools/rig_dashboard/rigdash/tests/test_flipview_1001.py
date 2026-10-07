@@ -77,10 +77,10 @@ def test_phase_now_flip_running_and_decode():
     ipc["ipc_events"] = ipc["ipc_events"][:4] + [{"type": "flip_begin", "ts": 410.0, "data": {"flip_begin_ts": 410.0, "sleep": "D", "wake": "P"}}]
     v = ipcboot.flip_views(SEGS, ipc, 411.0)
     p = ipcboot.phase_now(SEGS, ipc, {"state": "flipping"}, v, True, 411.0)
-    assert p["k"] == "flip" and p["sub"] == "Layer-Tausch" and p["since"] == 410.0
+    assert p["k"] == "flip" and p["sub"] == "layer swap" and p["since"] == 410.0
     segs = SEGS[:4]
     p2 = ipcboot.phase_now(segs, {}, {}, [], True, 199.5)
-    assert p2["label"] == "D aktiv: Decode" and p2["since"] == 105.0
+    assert p2["label"] == "D active: decode" and p2["since"] == 105.0
 
 
 def test_phase_now_flip_has_a_direction_for_the_active_frame():
@@ -127,7 +127,7 @@ def test_pd_first_decode_comes_from_the_front_event_not_the_rank_raster():
     pd = ipcboot.flip_views(segs, ipc, 140.0)[0]
     # Nutzer 02.10. ~17:50Z: the flip starts at P's last chunk end (99,9; no ring here: the P segment), the
     # front's leg-1 end (99,95) is only named -- the 50 ms between are flip time
-    assert pd["end_src"].startswith("front flip_first_work") and pd["start_src"].startswith("P-Segment-Ende")
+    assert pd["end_src"].startswith("front flip_first_work") and pd["start_src"].startswith("P segment end")
     assert pd["p_end_front"] == 99.95
     assert round(pd["nachlauf_ms"]) == 450 and round(pd["total_ms"]) == 3210
     assert round(pd["nachlauf_d_extend_ms"]) == 450                 # only the extend before the real first token

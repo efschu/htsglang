@@ -72,22 +72,22 @@ class TestSupplement(unittest.TestCase):
         """Der Launcher wirft W64 auch ohne dual_layout (Flip/nur TP); den Dual-Wortlaut gibt es nur, wenn die Meldung 'W64-DUAL:' traegt."""
         flip = PV.verdikt("W64-OPPOINT", ebene="lauf", text=W64_MSG, force_state=PV.BLOCKED)
         self.assertNotIn("Dual", flip["titel"])
-        self.assertNotIn("Dual-D-Log", flip["konsequenz"] + flip["klasse_grund"])
+        self.assertNotIn("dual D log", flip["konsequenz"] + flip["klasse_grund"])
         self.assertNotIn("W64-DUAL", flip["grund"])
         self.assertEqual((flip["forcebar"], flip["klasse"]), (False, "nicht_forcebar"))
         dual_msg = W64_MSG + " W64-DUAL: no measured dual-share D log of m with weights [20, 12, 8] under /x; the model verdict stands"
         dual = PV.verdikt("W64-OPPOINT", ebene="lauf", text=dual_msg, force_state=PV.BLOCKED)
-        self.assertIn("Dual-D", dual["titel"])
-        self.assertIn("Dual-D-Log", dual["konsequenz"])
+        self.assertIn("dual D", dual["titel"])
+        self.assertIn("dual D log", dual["konsequenz"])
         self.assertEqual((dual["code"], flip["code"]), ("W64-OPPOINT", "W64-OPPOINT"))
         # ohne Text (Fallback auf den Launcher-Wortlaut) bleibt es neutral
-        self.assertNotIn("Dual", PV.verdikt("W64-OPPOINT", ebene="lauf")["titel"])
+        self.assertNotIn("dual", PV.verdikt("W64-OPPOINT", ebene="lauf")["titel"])
         # durch classify/build_verdikt: Flip-W64 und Dual-W64 tragen denselben Code
         for msg in (W64_MSG, dual_msg):
             d = PV.build_verdikt(3, _result("Weg2LaunchRefused", "HW-COUNT: x"), _result("Weg2TpOperatingPointInfeasible", msg, forced=[{"code": "HW-COUNT", "text": "HW-COUNT: x"}]))
             last = [v for v in d["verdikte"] if v["ebene"] == "lauf"][-1]
             self.assertEqual(last["code"], "W64-OPPOINT")
-            self.assertEqual("Dual-D" in last["titel"], "W64-DUAL:" in msg)
+            self.assertEqual("dual D" in last["titel"], "W64-DUAL:" in msg)
 
     def test_w64_three_dual_cases_each_get_their_own_wording(self):
         """Nacharbeit 1006 Runde 6, Befund 3: kein Dual / Dual ohne Messung / Dual mit Messung INFEASIBLE / Meldung ohne Gewichtsvektor sind vier Woerter,
@@ -104,18 +104,18 @@ class TestSupplement(unittest.TestCase):
             self.assertEqual((v["code"], v["forcebar"], v["klasse"]), ("W64-OPPOINT", False, "nicht_forcebar"))
         # kein Dual: formneutral, ohne Dual-Wort
         self.assertNotIn("Dual", neutral["titel"])
-        self.assertNotIn("Dual-D-Log", neutral["konsequenz"])
-        # Dual ohne Messung: der Wortlaut "ohne gemessenes Dual-D-Log"
-        self.assertIn("ohne gemessenes Dual-D-Log", ohne["titel"])
-        self.assertIn("Dual-D-Log", ohne["konsequenz"])
-        # Dual mit Messung INFEASIBLE: sagt, dass gemessen wurde, nie "ohne gemessenes Dual-D-Log"
-        self.assertIn("gemessenes Dual-D-Log bestaetigt", gemessen["titel"])
-        self.assertNotIn("ohne gemessenes", gemessen["titel"] + gemessen["konsequenz"] + gemessen["klasse_grund"])
-        self.assertIn("bestaetigt", gemessen["konsequenz"])
+        self.assertNotIn("dual D log", neutral["konsequenz"])
+        # Dual ohne Messung: der Wortlaut "without a measured dual D log"
+        self.assertIn("without a measured dual D log", ohne["titel"])
+        self.assertIn("dual D log", ohne["konsequenz"])
+        # Dual mit Messung INFEASIBLE: sagt, dass gemessen wurde, nie "without a measured dual D log"
+        self.assertIn("measured dual D log confirms", gemessen["titel"])
+        self.assertNotIn("without a measured", gemessen["titel"] + gemessen["konsequenz"] + gemessen["klasse_grund"])
+        self.assertIn("confirms", gemessen["konsequenz"])
         self.assertRegex(gemessen["quelle"], r"17343-17347.*dual_w64\.py:117")
-        # Meldung ohne Gewichtsvektor: keine Suche, also nicht "ohne gemessenes Dual-D-Log"
-        self.assertNotIn("ohne gemessenes", kein_vektor["titel"] + kein_vektor["konsequenz"])
-        self.assertIn("ohne Gewichtsvektor", kein_vektor["titel"])
+        # Meldung ohne Gewichtsvektor: keine Suche, also nicht "without a measured dual D log"
+        self.assertNotIn("without a measured", kein_vektor["titel"] + kein_vektor["konsequenz"])
+        self.assertIn("without weight vector", kein_vektor["titel"])
         self.assertRegex(kein_vektor["quelle"], r"17235")
         self.assertEqual(len({neutral["titel"], ohne["titel"], gemessen["titel"], kein_vektor["titel"]}), 4)
 

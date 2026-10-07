@@ -106,7 +106,7 @@ class TestWorkerTopology(unittest.TestCase):
     def test_no_python_or_tree_is_named(self):
         r = R.CouplingsService(None).topology(5)
         self.assertFalse(r["ok"])
-        self.assertIn("kein Planer-Baum", r["error"])
+        self.assertIn("no planner tree", r["error"])
 
 
 class TestDryRunUsesTheChild(unittest.TestCase):
@@ -143,7 +143,7 @@ class TestDryRunUsesTheChild(unittest.TestCase):
         self.assertEqual(self.calls, [4])
         top = [r for r in d["rejections"] if r["source"] == "weg2/topology.plan_topology"]
         self.assertEqual([r["code"] for r in top], ["HW-COUNT"])
-        self.assertFalse([n for n in d["notes"] if "nicht geprüft" in n])
+        self.assertFalse([n for n in d["notes"] if "not checked" in n])
 
     def test_the_childs_missing_topology_is_hw_topology(self):
         self.ed.topology = lambda n: {"ok": True, "refused": "no topology for 9 cards"}
@@ -154,19 +154,19 @@ class TestDryRunUsesTheChild(unittest.TestCase):
         self.ed.topology = lambda n: {"ok": True, "refused": None}
         d = self.dry(4)
         self.assertFalse([r for r in d["rejections"] if r["source"] == "weg2/topology.plan_topology"])
-        self.assertFalse([n for n in d["notes"] if "nicht geprüft" in n])
+        self.assertFalse([n for n in d["notes"] if "not checked" in n])
 
     def test_without_a_child_the_old_path_and_its_note_remain(self):
         self.ed.topology = None
         d = self.dry(4)                                  # N=4: im Prozess ImportError (kein sglang) -> Notiz, kein 500
-        self.assertTrue([n for n in d["notes"] if "Topologie für 4 Karte(n) nicht geprüft" in n], d["notes"])
+        self.assertTrue([n for n in d["notes"] if "Topology for 4 card(s) not checked" in n], d["notes"])
 
     def test_a_child_that_cannot_work_falls_back_and_names_both(self):
-        self.ed.topology = lambda n: {"ok": False, "error": "kein Planer-Baum mit planner/profile_couplings.py"}
+        self.ed.topology = lambda n: {"ok": False, "error": "no planner tree with planner/profile_couplings.py"}
         d = self.dry(4)
-        note = [n for n in d["notes"] if "nicht geprüft" in n]
+        note = [n for n in d["notes"] if "not checked" in n]
         self.assertTrue(note, d["notes"])
-        self.assertIn("kein Planer-Baum", note[0])         # der Grund des Kindes steht in der Notiz
+        self.assertIn("no planner tree", note[0])         # der Grund des Kindes steht in der Notiz
         self.assertTrue(d["ok"])
 
     def test_a_child_that_raises_is_a_note_not_a_500(self):
@@ -179,7 +179,7 @@ class TestDryRunUsesTheChild(unittest.TestCase):
     def test_n3_without_a_child_is_still_judged_in_process(self):
         self.ed.topology = lambda n: {"ok": False, "error": "kein Kind"}
         d = self.dry(3)
-        self.assertFalse([n for n in d["notes"] if "nicht geprüft" in n], d["notes"])
+        self.assertFalse([n for n in d["notes"] if "not checked" in n], d["notes"])
 
 
 class TestAppWiring(unittest.TestCase):

@@ -8,7 +8,7 @@ Nutzer-Entscheid 05.10.: der Profil-Editor kommt INS Release.  Gepinnt:
   schaetzen sind in Release erreichbar -- im LAN, ueber den oeffentlichen Proxy weiter 403.
 * Rig-Eingriffe bleiben in Release zu: Hardware MESSEN und Fenster zurueckgeben (bucht gpuq) -> 403 mit Klartext, keine Buchung;
   Kartenplaner, Startzeile, /api/launch, /api/weg2/* -> 404.
-* hwprofil.js: in Release ist der Messknopf aus und sagt "braucht gpuq".
+* hwprofil.js: in Release ist der Messknopf aus und sagt "needs gpuq".
 """
 
 import http.client
@@ -204,7 +204,7 @@ class TestReleaseRigActionsStayClosed(Served):
             j = json.loads(txt)
             self.assertFalse(j["ok"])
             self.assertIn("gpuq", j["error"])
-            self.assertIn("Release", j["error"])
+            self.assertIn("release edition", j["error"])
         self.assertEqual(self.gq.log, [])
 
     def test_the_class_itself_refuses_in_release(self):
@@ -260,14 +260,14 @@ m.refresh().then(() => { process.stdout.write(el.innerHTML); });
     def test_release_has_no_measure_button_but_says_why(self):
         h = self.run_mount({"edition": "release"})
         self.assertNotIn('data-act="measure"', h)
-        self.assertIn("braucht gpuq", h)
+        self.assertIn("needs gpuq", h)
         self.assertIn('data-act="refresh"', h)
-        self.assertIn("Hardwareprofil", h)
+        self.assertIn("hardware profile", h)
 
     def test_rig_keeps_the_measure_button(self):
         h = self.run_mount({"edition": "rig"})
         self.assertIn('data-act="measure"', h)
-        self.assertNotIn("braucht gpuq", h)
+        self.assertNotIn("needs gpuq", h)
 
     def test_profil_js_hands_the_page_edition_to_the_module(self):
         with open(os.path.join(STATIC, "profil.js"), encoding="utf-8") as fh:

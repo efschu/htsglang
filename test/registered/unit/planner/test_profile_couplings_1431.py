@@ -122,11 +122,11 @@ class TestTermsAreAccountedFor(unittest.TestCase):
             for name, t in s["terms"].items():
                 self.assertTrue(t["src"], name)
         self.assertEqual(out["stages"][0]["terms"]["fixed"]["src"], PC.SRC_DEFAULT)
-        self.assertTrue(any("OBERGRENZE" in w for w in out["warnings"]), "ohne fixed_overhead_mib muss die Obergrenze benannt sein")
+        self.assertTrue(any("UPPER BOUND" in w for w in out["warnings"]), "ohne fixed_overhead_mib muss die Obergrenze benannt sein")
 
     def test_fixed_overhead_given_removes_the_upper_bound_warning(self):
         out = PC.c1_layer_split(hw3(), model("nextflash_int4mixed"), rec_settings(fixed_overhead_mib=1000))
-        self.assertFalse(any("OBERGRENZE" in w for w in out["warnings"]))
+        self.assertFalse(any("UPPER BOUND" in w for w in out["warnings"]))
         self.assertEqual(out["stages"][1]["terms"]["fixed"]["src"], PC.SRC_INPUT)
 
 
@@ -152,7 +152,7 @@ class TestC1MoveLayers(unittest.TestCase):
         self.assertGreater(row_dst["weights_mib"][1], row_dst["weights_mib"][0])
         self.assertGreater(row_src["free_mib"][1], row_src["free_mib"][0])
         self.assertLess(row_dst["free_mib"][1], row_dst["free_mib"][0])
-        self.assertTrue(any("Du verschiebst 2 Layer" in h for h in r["hints"]))
+        self.assertTrue(any("You move 2 layers" in h for h in r["hints"]))
 
     def test_non_adjacent_stages_and_too_many_layers_are_refused(self):
         with self.assertRaises(PC.CouplingError):
@@ -168,7 +168,7 @@ class TestC1MoveLayers(unittest.TestCase):
         for s in over:
             self.assertLess(s["free_mib"], 0.0)
             self.assertAlmostEqual(s["overflow_mib"], -s["free_mib"], delta=0.01)
-        self.assertTrue(any("ueber dem Budget" in h for h in out["hints"]))
+        self.assertTrue(any("over the budget" in h for h in out["hints"]))
         self.assertTrue(out["c1"]["overflow_cards"])
 
 
@@ -183,7 +183,7 @@ class TestC2ExpertResidency(unittest.TestCase):
         # eine gesetzte Fraction oberhalb der Obergrenze wird als nicht passend gemeldet, mit Hinweis
         r2 = PC.c2_expert_residency(hw3(), m, rec_settings(scratch_rows=32, moe_resident_fraction=1.0, budget_mib=[10000, 6000, 6000]))
         self.assertTrue(any(not row["fits"] for row in r2["rows"]))
-        self.assertTrue(any("zu gross" in h or "nicht einmal" in h for h in r2["hints"]))
+        self.assertTrue(any("too large" in h or "not even" in h for h in r2["hints"]))
 
     def test_more_kv_budget_pressure_means_a_smaller_fraction(self):
         m = model("nextflash_int4mixed")
@@ -212,7 +212,7 @@ class TestC3ChunkAndC4Context(unittest.TestCase):
         m = copy.deepcopy(model("qwen27b_int8_vocabembed"))
         m["activation"]["extend_rate_mib_per_row"] = {"v": None, "src": "nicht gemessen"}
         r = PC.c3_chunk(hw3(), m, {"stage_layers": [32, 16, 16]}, new_chunk_tokens=4096)
-        self.assertTrue(any("unbekannt" in h for h in r["hints"]))
+        self.assertTrue(any("unknown" in h for h in r["hints"]))
 
     def test_context_target_fits_or_names_what_is_missing(self):
         m = model("qwen27b_int8_vocabembed")
@@ -221,7 +221,7 @@ class TestC3ChunkAndC4Context(unittest.TestCase):
         no = PC.c4_context_target(hw3(), m, {"stage_layers": [32, 16, 16], "kv_dtype": "fp8_e4m3", "context_tokens": 4000000,
                                               "budget_mib": [31000, 19000, 19000]})
         self.assertFalse(no["fits"])
-        self.assertTrue(any("es fehlen" in h for h in no["hints"]))
+        self.assertTrue(any("are missing" in h for h in no["hints"]))
         for row in no["rows"]:
             self.assertEqual(row["fits"], row["missing_mib"] <= 0.0)
 
@@ -264,7 +264,7 @@ class TestInventories(unittest.TestCase):
         hw = PC.synthetic_hardware([("NVIDIA GeForce RTX 4090", 24564, None), ("NVIDIA GeForce RTX 4090", 24564, 900.0)])
         out = PC.c1_layer_split(hw, m, {"stage_layers": [32, 32], "kv_dtype": "fp8_e4m3"})
         self.assertIsNone(out["stages"][0]["decode_ms"])
-        self.assertIn("nicht gemessen", out["stages"][0]["decode_src"])
+        self.assertIn("not measured", out["stages"][0]["decode_src"])
         self.assertIsNone(out["makespan_ms"])
 
     def test_stage_time_follows_the_slower_card(self):

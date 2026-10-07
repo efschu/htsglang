@@ -97,7 +97,7 @@ class VisionPhases(unittest.TestCase):
         self.assertTrue(last.get("running"))
         self.assertEqual(last.get("vis_live"), "load")
         pn = ipcboot.phase_now(tl["segs"], {}, {"state": "serving", "awake": "P"}, [], True, T2)
-        self.assertEqual(pn["label"], "Vision laden")
+        self.assertEqual(pn["label"], "Vision load")
         self.assertIn("weg2-1-5", pn["sub"])
 
     def test_states_and_history_fractions_carry_the_vision_phases(self):

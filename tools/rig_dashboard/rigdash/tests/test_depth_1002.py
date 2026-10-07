@@ -190,7 +190,7 @@ def _js_block():
 
 def _run_js(expr, lang="de"):
     prelude = ('const window = {i18nLang: () => "%s"};\n'
-               'const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("de-DE", '
+               'const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("en-US", '
                '{maximumFractionDigits: d, minimumFractionDigits: d});\n'
                'const esc = (s) => String(s);\n' % lang)
     out = subprocess.run([NODE, "-e", prelude + _js_block() + "\nprocess.stdout.write(" + expr + ");"],
@@ -204,16 +204,16 @@ def test_hover_text_prefill_and_decode_de_and_en():
     d = ('{x: 77824, y: 214537, n: 136713, tps_start: 4312.4, tps_end: 2391.0, exact: true, '
          'src: "events request_done (prefill.P cached/prompt/tokens)", reqs: [{rid: "weg2-22-59", x: 77824, y: 214537, n: 136713}]}')
     de = _run_js("depthTip(%s)" % d)
-    assert "Token 77.824&ndash;214.537 (136.713 neu)" in de
-    assert "4.312 &rarr; 2.391</b> tok/s" in de and "weg2-22-59" in de
+    assert "Token 77,824&ndash;214,537 (136,713 neu)" in de
+    assert "4,312 &rarr; 2,391</b> tok/s" in de and "weg2-22-59" in de
     en = _run_js("depthTip(%s)" % d, "en")
-    assert "Tokens 77.824&ndash;214.537 (136.713 new)" in en and "(start &rarr; end)" in en
+    assert "Tokens 77,824&ndash;214,537 (136,713 new)" in en and "(start &rarr; end)" in en
     approx = _run_js('depthTip({x: 4096, y: 77349, n: 73253, exact: false, src: "rankstats prefill.cached_tokens (x)", reqs: []})')
     assert "Summe der Präfixe" in approx
     x = ('{by_bs: [{bs: 1, tps: 52.3, per_slot: 52.3, busy_s: 40}, {bs: 2, tps: 90.2, per_slot: 45.1, busy_s: 20}], '
          'reqs: [{rid: "a", x: 25110, y: 25410, n: 300, tps: 50, est: false}], reqs_n: 1, reqs_src: "rankstats decode.reqs (je Probe)"}')
     dec = _run_js("decodeDetailTip(%s)" % x)
-    assert "bs 1: <b>52,3</b> tok/s &middot; 52,3 je Platz" in dec and "bs 2: <b>90,2</b> tok/s &middot; 45,1 je Platz" in dec
-    assert "<span class=\"mono\">a</span> Token 25.110&ndash;25.410 (300 neu) &middot; <b>50,0</b> tok/s" in dec
+    assert "bs 1: <b>52.3</b> tok/s &middot; 52.3 je Platz" in dec and "bs 2: <b>90.2</b> tok/s &middot; 45.1 je Platz" in dec
+    assert "<span class=\"mono\">a</span> Token 25,110&ndash;25,410 (300 neu) &middot; <b>50.0</b> tok/s" in dec
     none = _run_js('decodeDetailTip({by_bs: [], reqs: [], reqs_n: 0, reqs_src: null})')
     assert "fehlt in IPC (rankstats decode.reqs)" in none

@@ -128,15 +128,15 @@ class TestEstimator(Base):
         self.assertEqual(r["profile"]["state"]["ssm_dtype"]["v"], "bfloat16")
 
     def test_path_checks(self):
-        bad = [({"path": "tiny"}, "absolut"), ({"path": ""}, "fehlt"), ({}, "fehlt"), ({"path": None}, "fehlt"),
-               ({"path": self.model + "\x00"}, "unzulässig"), ({"path": "/etc"}, "Modellwurzel"),
-               ({"path": os.path.join(self.model, "..", "..", "etc")}, "Modellwurzel"),
-               ({"path": os.path.join(self.root, "gibt-es-nicht")}, "existiert nicht"),
+        bad = [({"path": "tiny"}, "absolut"), ({"path": ""}, "missing"), ({}, "missing"), ({"path": None}, "missing"),
+               ({"path": self.model + "\x00"}, "not allowed"), ({"path": "/etc"}, "model root"),
+               ({"path": os.path.join(self.model, "..", "..", "etc")}, "model root"),
+               ({"path": os.path.join(self.root, "gibt-es-nicht")}, "does not exist"),
                ({"path": self.model, "draft_path": "/etc"}, "draft_path"),
                ({"path": self.model, "kv_dtype": "int3"}, "kv_dtype"),
                ({"path": self.model, "mamba_ssm_dtype": "f8"}, "mamba_ssm_dtype"),
                ({"path": self.model, "gguf_file": "../x.gguf"}, "gguf_file"),
-               ({"path": self.model, "registry": "Groß Geschrieben"}, "Kennung")]
+               ({"path": self.model, "registry": "Groß Geschrieben"}, "identifier")]
         for req, word in bad:
             with self.assertRaises(ValueError, msg=str(req)) as cm:
                 self.est.estimate(req)
@@ -151,7 +151,7 @@ class TestEstimator(Base):
             os.symlink(os.path.join(outside, "fremd"), link)
             with self.assertRaises(ValueError) as cm:
                 self.est.estimate({"path": link})
-            self.assertIn("Modellwurzel", str(cm.exception))
+            self.assertIn("model root", str(cm.exception))
 
     def test_cache_and_invalidation(self):
         a = self.est.estimate({"path": self.model})
@@ -232,7 +232,7 @@ class TestRoute(Base):
     def test_body_limit(self):
         st, _, raw = self.call("/api/modellprofil/schaetzen", json.dumps({"path": "/" + "x" * 70000}).encode(), method="POST")
         self.assertEqual(st, 400)
-        self.assertIn("zu groß", json.loads(raw)["error"])
+        self.assertIn("too large", json.loads(raw)["error"])
 
     def test_lan_only_not_via_proxy(self):
         st, _, raw = self.call("/api/modellprofil/schaetzen", {"path": self.model}, headers={"X-Forwarded-For": "1.2.3.4"})
@@ -285,12 +285,12 @@ class TestJsModule(Base):
         prof["format"]["v"] = "<b>x</b>"
         js = ("const M = require(%r);\nconst p = %s;\nconst rows = M.zeilen(p);\n"
               "const out = {n: rows.length, groups: [...new Set(rows.map(r => r.gruppe))], allsrc: rows.every(r => ['config','Index','geschätzt','stat'].includes(r.src)),\n"
-              "  total: rows.find(r => r.label === 'Gewichte gesamt'), html: M.tabelle(p), bytes: [M.bytes(512), M.bytes(1536), M.bytes(3*1048576), M.bytes(5*1073741824)]};\n"
+              "  total: rows.find(r => r.label === 'Weights total'), html: M.tabelle(p), bytes: [M.bytes(512), M.bytes(1536), M.bytes(3*1048576), M.bytes(5*1073741824)]};\n"
               "console.log(JSON.stringify(out));\n" % (JS, json.dumps(prof)))
         o = json.loads(self.run_js(js))
         self.assertGreater(o["n"], 10)
         self.assertTrue(o["allsrc"])
-        self.assertIn("Gewichte", o["groups"])
+        self.assertIn("Weights", o["groups"])
         self.assertEqual(o["total"]["src"], "Index")
         self.assertEqual(o["total"]["roh"], self.total)
         self.assertNotIn("<b>x</b>", o["html"])
@@ -300,17 +300,17 @@ class TestJsModule(Base):
     def test_schaetzen_posts_json_and_surfaces_errors(self):
         js = ("const M = require(%r);\nconst calls = [];\n"
               "globalThis.fetch = async (url, o) => { calls.push([url, o && o.method, o && o.body]); "
-              "if (url.includes('fehler')) return {ok: false, status: 400, text: async () => JSON.stringify({ok: false, error: 'liegt nicht unter einer Modellwurzel'})}; "
+              "if (url.includes('fehler')) return {ok: false, status: 400, text: async () => JSON.stringify({ok: false, error: 'is not under a model root'})}; "
               "return {ok: true, status: 200, text: async () => JSON.stringify({ok: true, profile: {schema: 'flliper.model/1'}})}; };\n"
               "(async () => { const r = await M.schaetzen('/m/x', {kv_dtype: 'fp8_e4m3', registry: true}); let err = null;\n"
-              "  try { globalThis.fetch = async () => ({ok: false, status: 400, text: async () => JSON.stringify({ok: false, error: 'liegt nicht unter einer Modellwurzel'})}); await M.schaetzen('/etc'); } catch (e) { err = e.message; }\n"
+              "  try { globalThis.fetch = async () => ({ok: false, status: 400, text: async () => JSON.stringify({ok: false, error: 'is not under a model root'})}); await M.schaetzen('/etc'); } catch (e) { err = e.message; }\n"
               "  console.log(JSON.stringify({calls, schema: r.profile.schema, err})); })();\n" % JS)
         o = json.loads(self.run_js(js))
         self.assertEqual(o["calls"][0][0], "api/modellprofil/schaetzen")
         self.assertEqual(o["calls"][0][1], "POST")
         self.assertEqual(json.loads(o["calls"][0][2]), {"path": "/m/x", "kv_dtype": "fp8_e4m3", "registry": True})
         self.assertEqual(o["schema"], "flliper.model/1")
-        self.assertIn("Modellwurzel", o["err"])
+        self.assertIn("model root", o["err"])
 
 
 if __name__ == "__main__":

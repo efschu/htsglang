@@ -412,7 +412,7 @@ class TestSyntheticMoE(unittest.TestCase):
                 fh.write(struct.pack("<Q", 1000) + b"{}")
             with self.assertRaises(MP.ModelProfileError) as cm:
                 MP.estimate(tmp)
-        self.assertIn("abgeschnitten", str(cm.exception))
+        self.assertIn("truncated", str(cm.exception))
 
     def test_unknown_dtype_is_flagged_not_silent(self):
         with tempfile.TemporaryDirectory() as tmp:

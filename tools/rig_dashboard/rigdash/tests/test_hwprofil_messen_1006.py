@@ -110,37 +110,37 @@ class TestMeasuredValuesReachTheRows(unittest.TestCase):
         doc, mod = self._doc()
         self.assertEqual(mod.validate(doc), [])
         h = self._render(doc)
-        for label in ("SM-Zahl", "L2-Größe", "int8 W8A8", "NVFP4 W4A16 (Marlin)", "H2D Latenz", "D2H Latenz"):
+        for label in ("SM count", "L2 size", "int8 W8A8", "NVFP4 W4A16 (Marlin)", "H2D latency", "D2H latency"):
             cells = self._row(h, label)
             self.assertEqual(len(cells), 3, label)
             for c in cells:
-                self.assertNotIn("nicht gemessen", c, label)
-                self.assertIn("<sup>gem.</sup>", c, label)
+                self.assertNotIn("not measured", c, label)
+                self.assertIn("<sup>meas.</sup>", c, label)
 
     def test_w4a4_is_filled_only_on_the_sm120_card_and_the_3080s_say_why(self):
         doc, _ = self._doc()
         h = self._render(doc)
-        cells = self._row(h, "NVFP4 W4A4 (nativ)")
+        cells = self._row(h, "NVFP4 W4A4 (native)")
         by_ord = {c["ord"]: c["uuid"] for c in doc["cards"]}
         for ordinal, cell in enumerate(cells):
             if by_ord[ordinal] == U["5090"]:
                 self.assertIn("910", cell)
-                self.assertIn("<sup>gem.</sup>", cell)
+                self.assertIn("<sup>meas.</sup>", cell)
             else:
-                self.assertIn("nicht gemessen", cell)
+                self.assertIn("not measured", cell)
                 self.assertIn("no native FP4 tensor cores", cell)       # der Grund im Hover
-                self.assertNotIn("<sup>gem.</sup>", cell)
-        w4a8 = self._row(h, "NVFP4 W4A8 (int8-Kerne)")                   # auf der 5090 nicht gefragt, mit Grund
+                self.assertNotIn("<sup>meas.</sup>", cell)
+        w4a8 = self._row(h, "NVFP4 W4A8 (int8 cores)")                   # auf der 5090 nicht gefragt, mit Grund
         for ordinal, cell in enumerate(w4a8):
             if by_ord[ordinal] == U["5090"]:
-                self.assertIn("nicht gemessen", cell)
+                self.assertIn("not measured", cell)
                 self.assertIn("sm_8x", cell)
             else:
-                self.assertIn("<sup>gem.</sup>", cell)
+                self.assertIn("<sup>meas.</sup>", cell)
 
     @staticmethod
     def _d2d_rows(h):
-        sec = h[h.index("Karte zu Karte (D2D) je geordnetem Paar"):]
+        sec = h[h.index("Card to card (D2D) per ordered pair"):]
         sec = sec[:sec.index("</table>")]
         rows = re.findall(r"<tr><td>(.*?)</td><td>(.*?)</td><td>(.*?)</td><td>(.*?)</td></tr>", sec, re.S)
         return sec, rows
@@ -150,16 +150,16 @@ class TestMeasuredValuesReachTheRows(unittest.TestCase):
         sec, rows = self._d2d_rows(self._render(doc))
         heads = re.findall(r"<th>([^<]*)<br>", sec)
         self.assertEqual(len(heads), 3)
-        self.assertIn("barlink BAR1 direkt (Betriebsweg", heads[0])
+        self.assertIn("barlink BAR1 direct (operating path", heads[0])
         self.assertIn("NCCL", heads[1])
-        self.assertIn("Host-Staging gepinnt (Fallback, nicht der Betriebsweg)", heads[2])
+        self.assertIn("Host staging pinned (fallback, not the operating path)", heads[2])
         self.assertEqual(len(rows), 6)                                     # one row per ORDERED pair
         for _pair, bar1, nccl, stage in rows:
-            self.assertIn("<sup>gem.</sup>", bar1)
-            self.assertIn("<sup>gem.</sup>", nccl)
+            self.assertIn("<sup>meas.</sup>", bar1)
+            self.assertIn("<sup>meas.</sup>", nccl)
             self.assertIn("SHM/direct/direct", nccl)                        # the transport NCCL chose
-            self.assertEqual(stage.count("<sup>gem.</sup>"), 3)             # pipelined, serial, latency
-        self.assertNotIn("nicht gemessen", "".join(r[1] for r in rows))      # the headline column is all numbers
+            self.assertEqual(stage.count("<sup>meas.</sup>"), 3)             # pipelined, serial, latency
+        self.assertNotIn("not measured", "".join(r[1] for r in rows))      # the headline column is all numbers
 
     def test_the_bar1_column_is_nicht_gemessen_while_the_staging_column_has_numbers_never_filled_from_it(self):
         # MUTANT guard: "staging as the headline"
@@ -167,17 +167,17 @@ class TestMeasuredValuesReachTheRows(unittest.TestCase):
         sec, rows = self._d2d_rows(self._render(doc))
         self.assertEqual(len(rows), 6)
         for _pair, bar1, nccl, stage in rows:
-            self.assertIn(">nicht gemessen<", bar1)
-            self.assertNotIn("<sup>gem.</sup>", bar1)
-            self.assertIn(">nicht gemessen<", nccl)
-            self.assertEqual(stage.count("<sup>gem.</sup>"), 3)
+            self.assertIn(">not measured<", bar1)
+            self.assertNotIn("<sup>meas.</sup>", bar1)
+            self.assertIn(">not measured<", nccl)
+            self.assertEqual(stage.count("<sup>meas.</sup>"), 3)
         self.assertIn("NOT MEASURED", self._render(doc))
 
     def test_the_definitions_are_shown_and_no_faster_slower_or_capability_claim_is_in_the_page_or_the_script(self):
         doc, _ = self._doc(bar1=True, nccl=True)
         h = self._render(doc)
-        self.assertIn("keine Zustellzeit beim Empfänger", h)
-        self.assertIn("Hin- und Rückweg / 2", h)
+        self.assertIn("no delivery time at the receiver", h)
+        self.assertIn("round trip / 2", h)
         with open(os.path.join(STATIC, "hwprofil.js"), encoding="utf-8") as fh:
             js = fh.read()
         for bad in ("schneller", "langsamer", "Fähigkeit des Links", "kann der Link", "faster than", "slower than"):
@@ -190,40 +190,40 @@ class TestMeasuredValuesReachTheRows(unittest.TestCase):
         for r in doc["d2d"]["pairs"]:
             for w in ("barlink_bar1", "nccl"):
                 r[w]["lat_dev_us"] = {"v": 1.5, "src": "gemessen", "at": 1.0, "probe": "p", "unit": "µs", "note": "ohne Host-Sync"}
-        doc["links"].append({"src": 0, "dst": 1, "transport": "nccl", "transport_label": "NCCL über Host (Stufe-0-Probe, 30.07.2026)",
+        doc["links"].append({"src": 0, "dst": 1, "transport": "nccl", "transport_label": "NCCL via host (stage-0 probe, 30.07.2026)",
                              "gbs": {"v": 5.1, "src": "gemessen", "at": 1.0, "probe": "hw_profile-x.json", "unit": "GB/s"},
                              "lat_us": {"v": None, "src": "nicht gemessen", "note": "keine Latenz"}})
         h = self._render(doc)
         sec, rows = self._d2d_rows(h)
-        self.assertIn("µs ohne Host-Sync je Runde", sec)
+        self.assertIn("µs without host sync per round", sec)
         for _pair, bar1, nccl, _stage in rows:
-            self.assertEqual(bar1.count("<sup>gem.</sup>"), 3)          # rate, latency 1, latency 2
+            self.assertEqual(bar1.count("<sup>meas.</sup>"), 3)          # rate, latency 1, latency 2
             self.assertIn("[", bar1)
-        self.assertIn("Bereits gemessene Vergleichswerte", h)
+        self.assertIn("Already measured reference values", h)
         self.assertIn("barlink_bar1.py:75-83", h)
         self.assertIn("27b-nvfp4-dual.env:122", h)
-        self.assertIn("NCCL über Host (Stufe-0-Probe, 30.07.2026)", h)
+        self.assertIn("NCCL via host (stage-0 probe, 30.07.2026)", h)
         self.assertNotIn("nccl p2p", h.lower())
         self.assertNotIn("NCCL p2p", h)
 
     def test_the_link_rows_show_the_narrow_card_and_the_utilisation_against_the_current_width(self):
         doc, _ = self._doc()
         h = self._render(doc)
-        cells = [re.sub(r"<[^>]+>", "", re.sub(r"<sup>.*?</sup>", "", c)) for c in self._row(h, "Link (Generation x Breite)")]
+        cells = [re.sub(r"<[^>]+>", "", re.sub(r"<sup>.*?</sup>", "", c)) for c in self._row(h, "Link (generation x width)")]
         self.assertEqual(len(cells), 3)
         self.assertIn("Gen4 x4", cells[0])
-        self.assertIn("max. Gen4 x16", cells[0])
-        self.assertEqual(self._row(h, "Theoretisch je Richtung")[0].count("7,88"), 1)
-        h2d = self._row(h, "H2D gemessen / theoretisch")[0]
-        self.assertIn("82,5", h2d)                                          # 6.5 / 7.88
-        self.assertIn("<sup>gesch.</sup>", h2d)                             # a calculation, labelled as derived
+        self.assertIn("max Gen4 x16", cells[0])
+        self.assertEqual(self._row(h, "Theoretical per direction")[0].count("7.88"), 1)
+        h2d = self._row(h, "H2D measured / theoretical")[0]
+        self.assertIn("82.5", h2d)                                          # 6.5 / 7.88
+        self.assertIn("<sup>est.</sup>", h2d)                             # a calculation, labelled as derived
 
     def test_the_hover_of_a_latency_names_median_and_minimum(self):
         doc, _ = self._doc()
         h = self._render(doc)
-        cells = self._row(h, "H2D Latenz")
-        self.assertIn("Median", cells[0])
-        self.assertIn("Minimum der Stichprobe 9.0", cells[0])
+        cells = self._row(h, "H2D latency")
+        self.assertIn("median", cells[0])
+        self.assertIn("minimum of the sample 9.0", cells[0])
 
 
 class TestWindowAndBudget(unittest.TestCase):

@@ -30,7 +30,7 @@ DIRS = ("P>D", "D>P")
 #: die EINE Definition (Wortlaut des Nutzers 06.10.); index.html (FLIP_DEF) und grafik.js tragen denselben Text,
 #: tests/test_flipzeit_1006.py prueft die Gleichheit
 DEFINITION = {
-    "P>D": "last P chunk finished → first decode token produced",
+    "P>D": "last P chunk done → first decode token produced",
     "D>P": "last decode token produced → first prefill chunk starts computing (first forward on PP0)",
 }
 EXCEPTION = "No flip counts when no prefill or decode is pending (idle flip)."
@@ -50,14 +50,14 @@ VOR_KEYS = ("leer_ms", "halt_ms", "park_ms", "vor_rest_ms")
 
 
 def window_label(span_s: float, zoomed: bool = False) -> str:
-    """Die Beschriftung des Fensters: "letzte 60 min" / "letzte 6 h" / "letzte 7 d" bzw. "gezoomter Ausschnitt (n min)"."""
+    """Die Beschriftung des Fensters: "last 60 min" / "last 6 h" / "last 7 d" or "zoomed section (n min)"."""
     if span_s <= 5400:
         w = "%d min" % round(span_s / 60.0)
     elif span_s < 48 * 3600:
         w = "%d h" % round(span_s / 3600.0)
     else:
         w = "%d d" % round(span_s / 86400.0)
-    return "gezoomter Ausschnitt (%s)" % w if zoomed else "letzte " + w
+    return "zoomed section (%s)" % w if zoomed else "last " + w
 
 
 def counted(row: dict) -> bool:

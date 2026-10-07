@@ -144,48 +144,48 @@ PROBE_FORMATS = ("bf16", "fp8_native", "int8", "nvfp4_w4a8", "nvfp4_marlin", "nv
 #: refused by the view (HOCHRECHNUNG != MESSUNG), never shown as measured.
 FORMAT_MIN_CC: Dict[str, Tuple[int, int]] = {"nvfp4_w4a4": (10, 0)}
 
-BAR1_SHORT = "BAR1-Strecke nicht gemessen: der Messlauf hat diesen Schritt noch nicht ausgeführt (Begründung: bar1.note)"
-NCCL_SHORT = "NCCL-send/recv nicht gemessen: der Messlauf hat diesen Schritt noch nicht ausgeführt"
+BAR1_SHORT = "BAR1 stretch not measured: the measuring run has not executed this step yet (reason: bar1.note)"
+NCCL_SHORT = "NCCL send/recv not measured: the measuring run has not executed this step yet"
 
 #: What each D2D column measures, in the words the dashboard shows.  Three DIFFERENT quantities: nothing here says one way is
 #: faster or slower than another -- that statement needs both measured on the same rig and is made by whoever reads the numbers.
 D2D_DEFINITIONS = {
-    "barlink_bar1": ("Rate: einseitige Schreibzugriffe der Quellkarte in das BAR1-Fenster der Zielkarte (16 MiB, Median aus 3). "
-                     "Latenz 1 (Start + Sync): Abschlusszeit EINES 4-kB-Schreibzugriffs auf der SENDERseite mit einem Kernel-/Kopierstart und "
-                     "einer Host-Synchronisation (Median aus 200); enthält diesen Boden, keine Wire-Latenz, und ein gebuchter Schreibzugriff ist "
-                     "keine Zustellzeit beim Empfänger. Latenz 2 (ohne Host-Sync je Runde): 1000 solche Schreibzugriffe hintereinander im Stream, ein "
-                     "Synchronize am Ende, Zeit je Schreibzugriff; KEIN Rundlauf (ein Flag-Rundlauf im Kernel ist nicht gebaut). barlink bietet "
-                     "selbst nur Kollektive, kein send/recv."),
-    "nccl": ("Rate: send/recv, 4 x 64 MiB, Empfängerzeit, Median aus 5. Latenz 1 (Start + Sync): 4-kB-Ping-Pong, Hin- und Rückweg / 2, mit "
-             "Host-Synchronisation je Runde, Median aus 200 (Zustellzeit inkl. Wendezeit des Empfängers, enthält den Start-/Synchronisationsboden). "
-             "Latenz 2 (ohne Host-Sync je Runde): derselbe Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2. "
-             "NCCL wählt den Transport selbst; er steht je Paar im Hover."),
-    "host_staging": ("pipelined: 8-MiB-Chunks über zwei gepinnte Puffer, D2H und H2D überlappt (Median aus 7); seriell: ganze Kopie D2H, "
-                     "danach ganze Kopie H2D, ohne Überlappung. Latenz: 4-kB-Kopie in zwei Sprüngen über den Host mit Synchronisation "
-                     "nach jedem (Median aus 200); enthält den Start-/Synchronisationsboden."),
+    "barlink_bar1": ("Rate: one-sided writes of the source card into the BAR1 window of the target card (16 MiB, median of 3). "
+                     "Latency 1 (start + sync): completion time of ONE 4 kB write on the SENDER side with one kernel/copy launch and "
+                     "one host synchronisation (median of 200); contains this floor, no wire latency, and a posted write is "
+                     "no delivery time at the receiver. Latency 2 (without host sync per round): 1000 such writes back to back in the stream, one "
+                     "synchronize at the end, time per write; NOT a round trip (a flag round trip in the kernel is not built). barlink offers "
+                     "only collectives itself, no send/recv."),
+    "nccl": ("Rate: send/recv, 4 x 64 MiB, receiver time, median of 5. Latency 1 (start + sync): 4 kB ping-pong, round trip / 2, with "
+             "host synchronisation per round, median of 200 (delivery time incl. turnaround time of the receiver, contains the start/synchronisation floor). "
+             "Latency 2 (without host sync per round): the same ping-pong, 200 rounds back to back in the stream, one synchronize at the end, round trip / 2. "
+             "NCCL chooses the transport itself; it is shown per pair on hover."),
+    "host_staging": ("pipelined: 8 MiB chunks over two pinned buffers, D2H and H2D overlapped (median of 7); serial: whole copy D2H, "
+                     "then whole copy H2D, without overlap. Latency: 4 kB copy in two hops via the host with synchronisation "
+                     "after each (median of 200); contains the start/synchronisation floor."),
 }
 
 #: Values ALREADY measured on this rig (nothing invented here): what each is, the value, and where it stands.  They are listed next to
 #: the D2D table so nobody has to search; they are different quantities, and the list makes no comparison between them.
 D2D_REFERENCES = (
-    {"what": "barlink BAR1 Kollektive, 3 Ranks, p50, ganze Operation (gemessen 07.09.): all_reduce 20 KiB Hub 28,22 µs, 80 KiB mesh 50,81 µs, "
-             "1 MiB ring 328,60 µs, 4 MiB mesh 1301,05 µs, 16 MiB ring 4077,43 µs (NCCL derselben Läufe: 41,75 / 73,58 / 372,79 / 1356,69 / 5172,83 µs)",
-     "source": "python/sglang/srt/distributed/device_communicators/barlink_bar1.py:75-83 (Modul-Docstring)"},
-    {"what": "barlink BAR1 Rundenterm 323,2 µs je Runde und Draht 6,02 GB/s (gemeinsamer Fit, gpuq-Fenster jpvycx, 07.09.)",
+    {"what": "barlink BAR1 collectives, 3 ranks, p50, whole operation (measured 07.09.): all_reduce 20 KiB hub 28.22 µs, 80 KiB mesh 50.81 µs, "
+             "1 MiB ring 328.60 µs, 4 MiB mesh 1301.05 µs, 16 MiB ring 4077.43 µs (NCCL of the same runs: 41.75 / 73.58 / 372.79 / 1356.69 / 5172.83 µs)",
+     "source": "python/sglang/srt/distributed/device_communicators/barlink_bar1.py:75-83 (module docstring)"},
+    {"what": "barlink BAR1 round term 323.2 µs per round and wire 6.02 GB/s (joint fit, gpuq window jpvycx, 07.09.)",
      "source": "/spinning/gpu-arb/weg2/barlink-0907/roundbench_fixed_0907.out:19; barlink_bar1.py:1528 (DEFAULT_ROUND_US), :1537 (DEFAULT_WIRE_GBPS)"},
-    {"what": "barlink_host (gepinnter Host, Flags im Host-Speicher) Ping-Pong 20 KiB 7,30 µs gegen NCCL 37,41 µs (gemessen auf diesem Rig)",
-     "source": "benchmark/bench_host_transport.py:10-12; docs/dev/ANALYSE_732_bar1_repricing.md (Abschnitt B)"},
-    {"what": "BAR1 Drei-Rang-all_reduce 20 KiB 45,59 µs; Blende 3080 256 MiB (96 MiB zusammenhängend), 5090 32 GiB (ReBAR)",
-     "source": "docs/dev/ANALYSE_732_bar1_repricing.md:58-64 (Quelle dort: FEATURES_VS_UPSTREAM.md:1339,1341)"},
-    {"what": "D-Decode-Kollektiv unter gleichzeitiger P-Last: ~0,08 ms mit --dual-mps on gegenüber 0,53-0,80 ms ohne (Messung 29.09.); "
-             "ein Wert zur Auslastung durch P, keine Link-Latenz",
+    {"what": "barlink_host (pinned host, flags in host memory) ping-pong 20 KiB 7.30 µs against NCCL 37.41 µs (measured on this rig)",
+     "source": "benchmark/bench_host_transport.py:10-12; docs/dev/ANALYSE_732_bar1_repricing.md (section B)"},
+    {"what": "BAR1 three-rank all_reduce 20 KiB 45.59 µs; aperture 3080 256 MiB (96 MiB contiguous), 5090 32 GiB (ReBAR)",
+     "source": "docs/dev/ANALYSE_732_bar1_repricing.md:58-64 (source there: FEATURES_VS_UPSTREAM.md:1339,1341)"},
+    {"what": "D decode collective under simultaneous P load: ~0.08 ms with --dual-mps on against 0.53-0.80 ms without (measurement 29.09.); "
+             "a value for the utilisation by P, not a link latency",
      "source": "/spinning/gpu-arb/docker/profiles_release/27b-nvfp4-dual.env:122"},
-    {"what": "NCCL-Transport auf diesem Rig: SHM/direct/direct für die gemessenen Paare; CUDA-Peer-Zugriff für alle 6 gerichteten Paare false (30.07.)",
+    {"what": "NCCL transport on this rig: SHM/direct/direct for the measured pairs; CUDA peer access false for all 6 directed pairs (30.07.)",
      "source": "/spinning/gpu-battery-results/2026-07-30_bar1/s01_p2p_reprobe/results/nccl_transport.json; capability_matrix.json"},
-    {"what": "NCCL all_reduce der Stufe-0-Gruppe (3 Karten): 10 KB 32,4 µs, 1 MB 361,3 µs (30.07.)",
+    {"what": "NCCL all_reduce of the stage-0 group (3 cards): 10 KB 32.4 µs, 1 MB 361.3 µs (30.07.)",
      "source": "~/.cache/sglang/hw_profile-9a5e9b49b7dc.json (links.__group__.ar_10kb_us / ar_1mb_us)"},
-    {"what": "Stufe-0-NCCL-Rate je Paar, eine Richtung gemessen, Gegenrichtung gespiegelt (geschätzt) (30.07.): siehe Tabelle \"NCCL über Host (Stufe-0-Probe)\"",
-     "source": "~/.cache/sglang/hw_profile-9a5e9b49b7dc.json (links[*].p2p_gbs; Schlüsselname historisch, es gibt hier kein P2P)"},
+    {"what": "Stage-0 NCCL rate per pair, one direction measured, reverse direction mirrored (estimated) (30.07.): see table \"NCCL via host (stage-0 probe)\"",
+     "source": "~/.cache/sglang/hw_profile-9a5e9b49b7dc.json (links[*].p2p_gbs; historical key name, there is no P2P here)"},
 )
 
 #: The compute formats of the view, in display order: key, unit, label.  A format
@@ -193,12 +193,12 @@ D2D_REFERENCES = (
 COMPUTE_FORMATS: Tuple[Tuple[str, str, str], ...] = (
     ("bf16", "TFLOPS", "bf16"),
     ("fp8_native", "TFLOPS", "fp8 (native, _scaled_mm)"),
-    ("fp8_marlin", "TFLOPS", "fp8 Marlin (nur Gewicht)"),
+    ("fp8_marlin", "TFLOPS", "fp8 Marlin (weights only)"),
     ("fp8_w8a16", "TFLOPS", "fp8 W8A16 (Dequant)"),
     ("int8", "TOPS", "int8 W8A8"),
-    ("nvfp4_w4a8", "TOPS", "NVFP4 W4A8 (int8-Kerne)"),
+    ("nvfp4_w4a8", "TOPS", "NVFP4 W4A8 (int8 cores)"),
     ("nvfp4_marlin", "TFLOPS", "NVFP4 W4A16 (Marlin)"),
-    ("nvfp4_w4a4", "TFLOPS", "NVFP4 W4A4 (nativ)"),
+    ("nvfp4_w4a4", "TFLOPS", "NVFP4 W4A4 (native)"),
 )
 
 
@@ -301,7 +301,7 @@ def hw_sim_datasheet(row: dict) -> Dict[str, Any]:
     if len(counts) != 1:
         return {}
     return {"sm_count": counts.pop(),
-            "sm_note": "Datenblatt-Katalog weg2/hw_sim.py CATALOG[%s].sm_count (nicht gemessen)" % ",".join(c.key for c in pick)}
+            "sm_note": "Datasheet catalog weg2/hw_sim.py CATALOG[%s].sm_count (not measured)" % ",".join(c.key for c in pick)}
 
 
 # ---------------------------------------------------------------------------
@@ -420,17 +420,17 @@ def read_nvml() -> Tuple[List[dict], Optional[str], List[str]]:
         cards, driver = _read_pynvml()
         if cards:
             return cards, driver, issues
-        issues.append("pynvml: keine Karte gemeldet")
+        issues.append("pynvml: no card reported")
     except Exception as e:
-        issues.append(f"pynvml nicht lesbar ({type(e).__name__}: {e})")
+        issues.append(f"pynvml not readable ({type(e).__name__}: {e})")
     try:
         cards, driver = _read_smi()
         if cards:
-            issues.append("Fallback nvidia-smi: BAR1-Größe und Speicher-Busbreite fehlen")
+            issues.append("Fallback nvidia-smi: BAR1 size and memory bus width are missing")
             return cards, driver, issues
-        issues.append("nvidia-smi: keine Karte gemeldet")
+        issues.append("nvidia-smi: no card reported")
     except Exception as e:
-        issues.append(f"nvidia-smi nicht lesbar ({type(e).__name__}: {e})")
+        issues.append(f"nvidia-smi not readable ({type(e).__name__}: {e})")
     return [], None, issues
 
 
@@ -529,7 +529,7 @@ class _Pick:
 def _nv(v, unit: Optional[str], what: str, note: Optional[str] = None) -> Dict[str, Any]:
     """An NVML value, or "nicht gemessen" naming what NVML did not report."""
     if v is None:
-        return missing(f"NVML meldet {what} nicht", unit)
+        return missing(f"NVML does not report {what}", unit)
     return node(v, SRC_NVML, unit=unit, note=note)
 
 
@@ -543,7 +543,7 @@ def _lane_node(unit: str, pick: _Pick, notes: Dict[str, str], key: str) -> Dict[
     if pick.best is not None and pick.best[2] is not None:
         at, probe, v, _ = pick.best
         return node(v, SRC_MEASURED, at=at, probe=probe, unit=unit)
-    return missing(notes.get(key) or "Messarm noch nicht gelaufen (Hardwareprofil messen)", unit)
+    return missing(notes.get(key) or "measuring arm has not run yet (measure the hardware profile)", unit)
 
 
 #: Usable PCIe bandwidth per lane and direction in GB/s after line coding (Gen1/2: 8b/10b, Gen3-5: 128b/130b).
@@ -563,35 +563,35 @@ def _link_view(latest) -> Dict[str, Any]:
     """The card's PCIe link as the probe read it (NVML, by UUID, right after the host-transfer arm) and the measured
     H2D / D2H rate against its theoretical rate.  The percentage is a CALCULATION (measured / theoretical), labelled as
     derived, never as a measurement of its own."""
-    no = "Probe hat den PCIe-Link nicht gelesen (Probe aus der Zeit vor der Link-Erfassung oder NVML nicht lesbar)"
+    no = "the probe did not read the PCIe link (probe from before the link capture, or NVML not readable)"
     if not latest:
         keys = ("gen_cur", "width_cur", "gen_max", "width_max")
-        miss = {k: missing("Messarm noch nicht gelaufen (Hardwareprofil messen)") for k in keys}
-        miss.update(theory_gbs=missing("kein Link gelesen", "GB/s"), h2d_pct=missing("kein Link gelesen", "%"),
-                    d2h_pct=missing("kein Link gelesen", "%"))
+        miss = {k: missing("measuring arm has not run yet (measure the hardware profile)") for k in keys}
+        miss.update(theory_gbs=missing("no link read", "GB/s"), h2d_pct=missing("no link read", "%"),
+                    d2h_pct=missing("no link read", "%"))
         return miss
     at, f, c, _data = latest
 
     def nv(key, what):
         v = _num(c.get(key))
-        return node(int(v), SRC_NVML, at=at, probe=f, note="bei der Messung gelesen (unter der Last des Transferarms)") if v is not None \
+        return node(int(v), SRC_NVML, at=at, probe=f, note="read during the measurement (under the load of the transfer arm)") if v is not None \
             else missing(f"{what}: {no}")
 
-    out = {"gen_cur": nv("pcie_gen_cur", "Generation"), "width_cur": nv("pcie_width_cur", "Breite"),
-           "gen_max": nv("pcie_gen_max", "Generation (Maximum)"), "width_max": nv("pcie_width_max", "Breite (Maximum)")}
+    out = {"gen_cur": nv("pcie_gen_cur", "Generation"), "width_cur": nv("pcie_width_cur", "Width"),
+           "gen_max": nv("pcie_gen_max", "Generation (maximum)"), "width_max": nv("pcie_width_max", "Width (maximum)")}
     th = pcie_theory_gbs(c.get("pcie_gen_cur"), c.get("pcie_width_cur"))
     if th is None:
-        why = "kein theoretischer Wert: " + (no if _num(c.get("pcie_gen_cur")) is None else "Generation nicht tabelliert")
+        why = "no theoretical value: " + (no if _num(c.get("pcie_gen_cur")) is None else "generation not tabulated")
         out.update(theory_gbs=missing(why, "GB/s"), h2d_pct=missing(why, "%"), d2h_pct=missing(why, "%"))
         return out
     basis = f"Gen{int(c['pcie_gen_cur'])} x{int(c['pcie_width_cur'])}"
     out["theory_gbs"] = node(th, SRC_DATASHEET, unit="GB/s",
-                             note=f"theoretische Rate je Richtung für {basis} (gemessene Generation und Breite, nach Leitungscodierung): Rechenwert, kein Messwert")
+                             note=f"theoretical rate per direction for {basis} (measured generation and width, after line coding): a calculated value, not a measurement")
     for key, rate_key in (("h2d_pct", "h2d_gbs"), ("d2h_pct", "d2h_gbs")):
         r = _num(c.get(rate_key))
         out[key] = (node(round(100.0 * r / th, 1), SRC_ESTIMATED, at=at, probe=f, unit="%",
-                         note=f"abgeleitet: gemessene {rate_key.split('_')[0].upper()}-Rate {r} GB/s / theoretische {th} GB/s ({basis}); Rechnung, keine eigene Messung")
-                    if r is not None else missing("Rate nicht gemessen", "%"))
+                         note=f"derived: measured {rate_key.split('_')[0].upper()} rate {r} GB/s / theoretical {th} GB/s ({basis}); a calculation, no measurement of its own")
+                    if r is not None else missing("rate not measured", "%"))
     return out
 
 
@@ -678,8 +678,8 @@ def build(
             w4a4 = _num(c.get("gemm_w4a4_tflops"))
             if w4a4 is not None and r.get("cc") and tuple(r["cc"]) < FORMAT_MIN_CC["nvfp4_w4a4"]:
                 # a number for a lane this card cannot run is not a measurement: refuse it and say so
-                notes["nvfp4_w4a4"] = (f"Wert verworfen: Compute Capability {'.'.join(map(str, r['cc']))} hat keine nativen "
-                                       f"FP4-Tensorkerne (ab {FORMAT_MIN_CC['nvfp4_w4a4'][0]}.0), die Probe {f} enthielt trotzdem eine Zahl")
+                notes["nvfp4_w4a4"] = (f"value discarded: compute capability {'.'.join(map(str, r['cc']))} has no native "
+                                       f"FP4 tensor cores (from {FORMAT_MIN_CC['nvfp4_w4a4'][0]}.0), the probe {f} contained a number anyway")
                 w4a4 = None
             pk("nvfp4_w4a4").offer(at, f, w4a4)
             for lane, why in (c.get("lane_notes") or {}).items():
@@ -709,15 +709,15 @@ def build(
         def lat(name: str, minname: str, what: str) -> Dict[str, Any]:
             """A host latency: the MEDIAN of the probe's samples; the minimum of the same samples in the note."""
             mn = pk(minname).best
-            tail = f"; Minimum der Stichprobe {mn[2]} µs" if mn is not None else ""
-            return val(name, "µs", ni, f"{what}: Median, 4 kB gepinnt, Kopie + Synchronisation{tail}")
+            tail = f"; minimum of the sample {mn[2]} µs" if mn is not None else ""
+            return val(name, "µs", ni, f"{what}: median, 4 kB pinned, copy + synchronisation{tail}")
 
-        ni = "Messarm noch nicht gelaufen (Hardwareprofil messen)"
+        ni = "measuring arm has not run yet (measure the hardware profile)"
         latest_state = max(probe_card_seen, key=lambda t: t[0], default=None)
         state = None
         if latest_state:
             at, f, c, _data = latest_state
-            why = "Zustand wurde bei der Messung nicht gelesen (kein NVML im Probe-Prozess)"
+            why = "state was not read during the measurement (no NVML in the probe process)"
             state = {
                 "sm_mhz": _m(_num(c.get("sm_clock_mhz")), at, f, "MHz", why),
                 "sm_max_mhz": _m(_num(c.get("sm_clock_max_mhz")), at, f, "MHz", why),
@@ -730,32 +730,32 @@ def build(
             try:
                 ds = dict(ds_fn(r) or {})
             except Exception as e:  # a broken lookup must not hide the card
-                issues.append(f"Datenblatt-Suche für {r.get('name')} fehlgeschlagen ({type(e).__name__}: {e})")
+                issues.append(f"Datasheet lookup for {r.get('name')} failed ({type(e).__name__}: {e})")
         bus, memclk = r.get("mem_bus_width_bits"), r.get("mem_clock_max_mhz")
         nameplate = (
             node(
                 round(bus / 8.0 * memclk * 2.0 / 1000.0, 1),
                 SRC_DATASHEET,
                 unit="GB/s",
-                note="Busbreite x max. Speichertakt x 2 aus NVML (Spitzenwert, kein Messwert)",
+                note="bus width x max memory clock x 2 from NVML (peak value, not a measurement)",
             )
             if bus and memclk
-            else missing("NVML meldet Busbreite oder Speichertakt nicht", "GB/s")
+            else missing("NVML does not report bus width or memory clock", "GB/s")
         )
         copy_pick = pk("mem_copy")
         d2d = (
             node(copy_pick.best[2], SRC_MEASURED, at=copy_pick.best[0], probe=copy_pick.best[1], unit="GB/s",
-                 note="Kopier-Kernel innerhalb der Karte (lesen+schreiben), dieselbe Messung wie mem_gbs.copy")
+                 note="copy kernel inside the card (read+write), the same measurement as mem_gbs.copy")
             if copy_pick.best
             else missing(ni, "GB/s")
         )
         probed_at = max((t[0] for t in probe_card_seen), default=None)
         link = _link_view(latest_state)
         # the SM count: a measurement wins; without one the data sheet fills it, labelled as such (never as measured)
-        sm_measured = val("sm_count", None, "Geräteeigenschaft wird vom Messarm gelesen (Hardwareprofil messen)")
+        sm_measured = val("sm_count", None, "device property is read by the measuring arm (measure the hardware profile)")
         sm_node = sm_measured
         if sm_measured["v"] is None and ds.get("sm_count"):
-            sm_node = node(ds["sm_count"], SRC_DATASHEET, note=ds.get("sm_note") or "Datenblatt")
+            sm_node = node(ds["sm_count"], SRC_DATASHEET, note=ds.get("sm_note") or "Datasheet")
         entry = {
             "ord": ordinal,
             "nvml_index": r["nvml_index"],
@@ -766,9 +766,9 @@ def build(
             "card_key": key,
             "cc": r["cc"],
             "sm_count": sm_node,
-            "l2_mib": val("l2_mib", "MiB", "Geräteeigenschaft (torch L2_cache_size) wird vom Messarm gelesen"),
-            "vram_total_mib": _nv(r.get("total_mib") or None, "MiB", "Speichergröße"),
-            "bar1_total_mib": _nv(r.get("bar1_total_mib"), "MiB", "BAR1-Größe (nvidia-smi-Fallback kennt sie nicht)"),
+            "l2_mib": val("l2_mib", "MiB", "device property (torch L2_cache_size) is read by the measuring arm"),
+            "vram_total_mib": _nv(r.get("total_mib") or None, "MiB", "memory size"),
+            "bar1_total_mib": _nv(r.get("bar1_total_mib"), "MiB", "BAR1 size (the nvidia-smi fallback does not know it)"),
             "pcie": {
                 "max_gen": _nv(r.get("pcie_max_gen"), None, "PCIe-Generation (Maximum)"),
                 "max_width": _nv(r.get("pcie_max_width"), None, "PCIe-Breite (Maximum)"),
@@ -785,17 +785,17 @@ def build(
             },
             "compute": compute,
             "d2d_intra_gbs": d2d,
-            "h2d": {"gbs": val("h2d_gbs", "GB/s", ni), "lat_us": lat("h2d_lat", "h2d_lat_min", "H2D-Latenz")},
-            "d2h": {"gbs": val("d2h_gbs", "GB/s", ni), "lat_us": lat("d2h_lat", "d2h_lat_min", "D2H-Latenz")},
+            "h2d": {"gbs": val("h2d_gbs", "GB/s", ni), "lat_us": lat("h2d_lat", "h2d_lat_min", "H2D latency")},
+            "d2h": {"gbs": val("d2h_gbs", "GB/s", ni), "lat_us": lat("d2h_lat", "d2h_lat_min", "D2H latency")},
             "power": {
                 "limit_w": _nv(r.get("power_limit_w"), "W", "Leistungsgrenze"),
                 "default_w": _nv(r.get("power_default_w"), "W", "Standard-Leistungsgrenze"),
             },
             "clocks": {
                 "sm_max_mhz": _nv(r.get("sm_clock_max_mhz"), "MHz", "maximalen SM-Takt"),
-                "mem_max_mhz": _nv(r.get("mem_clock_max_mhz"), "MHz", "maximalen Speichertakt"),
+                "mem_max_mhz": _nv(r.get("mem_clock_max_mhz"), "MHz", "maximum memory clock"),
             },
-            "mem_bus_bits": _nv(r.get("mem_bus_width_bits"), "bit", "Speicher-Busbreite (nvidia-smi-Fallback kennt sie nicht)"),
+            "mem_bus_bits": _nv(r.get("mem_bus_width_bits"), "bit", "memory bus width (the nvidia-smi fallback does not know it)"),
             "state": state,
             "link": link,
             "probed_at": probed_at,
@@ -804,9 +804,9 @@ def build(
             # the nominal bandwidth of the catalog card (a data-sheet figure, not NVML's bus x clock peak above)
             if ds.get("mem_bw_gbs"):
                 entry["mem_gbs"]["nominal"] = node(ds["mem_bw_gbs"], SRC_DATASHEET, unit="GB/s",
-                                                   note=ds.get("bw_note") or "Datenblatt-Nennbandbreite des Katalogs")
+                                                   note=ds.get("bw_note") or "Datasheet nominal bandwidth of the catalog")
             else:
-                entry["mem_gbs"]["nominal"] = missing("kein Katalogeintrag mit Nennbandbreite für diese Karte", "GB/s")
+                entry["mem_gbs"]["nominal"] = missing("no catalog entry with a nominal bandwidth for this card", "GB/s")
             entry["catalog"] = ds.get("catalog") or None
         if probed_at is not None:
             age = now - probed_at
@@ -857,13 +857,13 @@ def build(
             # number is shown as the serial one and the pipelined rate is "nicht gemessen" -- never relabelled.
             if "bandwidth_serial_gbs" in p:
                 link["gbs"] = node(_num(p.get("bandwidth_gbs")), SRC_MEASURED, at=at, probe=f, unit="GB/s",
-                                   note="pipelined: 8-MiB-Chunks, zwei gepinnte Puffer, D2H und H2D überlappt, Median aus 7")
+                                   note="pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7")
                 link["gbs_serial"] = node(_num(p.get("bandwidth_serial_gbs")), SRC_MEASURED, at=at, probe=f, unit="GB/s",
-                                          note="seriell: ganze Kopie D2H, danach ganze Kopie H2D (Summe der beiden Einzelzeiten)")
+                                          note="serial: whole copy D2H, then whole copy H2D (sum of the two single times)")
             else:
-                link["gbs"] = missing("pipelined nicht gemessen: Probe aus der Zeit vor der pipelined-Messung (Auftrag 1006)", "GB/s")
+                link["gbs"] = missing("pipelined not measured: probe from before the pipelined measurement (order 1006)", "GB/s")
                 link["gbs_serial"] = node(_num(p.get("bandwidth_gbs")), SRC_MEASURED, at=at, probe=f, unit="GB/s",
-                                          note="seriell: ganze Kopie D2H, danach ganze Kopie H2D (ältere Probe)")
+                                          note="serial: whole copy D2H, then whole copy H2D (older probe)")
         links.append(link)
     # the stage-0 NCCL table: one direction measured, the reverse mirrored
     nccl_seen: Dict[Tuple[int, int], Tuple[float, str, float]] = {}
@@ -881,16 +881,16 @@ def build(
     for (a, b), (at, f, gbs) in sorted(nccl_seen.items()):
         # Order 1006 (user finding 15:40Z): there is NO peer-to-peer on this rig (peer_access is false for every pair); NCCL moves
         # the bytes through the host.  The key ``p2p_gbs`` of the stage-0 file is historical and stays internal.
-        s0_label = "NCCL über Host (Stufe-0-Probe, %s)" % time.strftime("%d.%m.%Y", time.localtime(at))
+        s0_label = "NCCL via host (stage-0 probe, %s)" % time.strftime("%d.%m.%Y", time.localtime(at))
         links.append({"src": a, "dst": b, "transport": "nccl", "transport_label": s0_label,
                       "gbs": node(gbs, SRC_MEASURED, at=at, probe=f, unit="GB/s"),
-                      "lat_us": missing("Stufe-0-Probe misst keine Latenz je Paar", "µs"),
+                      "lat_us": missing("the stage-0 probe measures no latency per pair", "µs"),
                       "peer_access": None, "note": ""})
         if (b, a) not in nccl_seen:
             links.append({"src": b, "dst": a, "transport": "nccl", "transport_label": s0_label,
                           "gbs": node(gbs, SRC_ESTIMATED, at=at, probe=f, unit="GB/s",
-                                      note="gespiegelt aus der Gegenrichtung, nicht gemessen"),
-                          "lat_us": missing("Stufe-0-Probe misst keine Latenz je Paar", "µs"),
+                                      note="mirrored from the reverse direction, not measured"),
+                          "lat_us": missing("the stage-0 probe measures no latency per pair", "µs"),
                           "peer_access": None, "note": ""})
     # One optional card-to-card WAY per ordered pair, stored by ``card_probe`` as a list + ``*_attempted`` + ``*_reason``:
     # the BAR1 stretch (``bar1_probe``) and NCCL send/recv (``nccl_probe``).  The newest MEASURED value per pair wins (a later
@@ -931,19 +931,19 @@ def build(
                                   "gbs": node(_num(p.get("bandwidth_gbs")), SRC_MEASURED, at=at, probe=f, unit="GB/s",
                                               note=p.get("note") or None),
                                   "lat_us": (node(lat_v, SRC_MEASURED, at=at, probe=f, unit="µs",
-                                                  note=("4 kB, ein Start + ein Synchronize je Messung (enthält den Start-/Synchronisationsboden, "
-                                                        "keine Wire-Latenz). " + (p.get("note") or "")).strip())
-                                             if lat_v is not None else missing("Probe lieferte keine Latenz für dieses Paar", "µs")),
+                                                  note=("4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, "
+                                                        "no wire latency). " + (p.get("note") or "")).strip())
+                                             if lat_v is not None else missing("the probe delivered no latency for this pair", "µs")),
                                   "lat_dev_us": (node(dev_v, SRC_MEASURED, at=at, probe=f, unit="µs",
-                                                      note=str(p.get("latency_device_kind") or "ohne Host-Synchronisation je Runde"))
+                                                      note=str(p.get("latency_device_kind") or "without host synchronisation per round"))
                                                  if dev_v is not None
-                                                 else missing("diese Probe lieferte die zweite Latenz (ohne Host-Sync je Runde) nicht", "µs")),
+                                                 else missing("this probe did not deliver the second latency (without host sync per round)", "µs")),
                                   "peer_access": bool(p.get("peer_access")), "note": ""})
                     continue
                 why = (failed[k][1] if k in failed and failed[k][1] else reason_newest[1] if reason_newest[1] else short)
                 if attempted_at is None:
                     gap.append(f"{a}>{b}")      # the step never ran: an open gap, "Hardwareprofil messen" stays lit
-                txt = why if why.startswith(label.split()[0]) else f"{label} nicht gemessen: {why}"
+                txt = why if why.startswith(label.split()[0]) else f"{label} not measured: {why}"
                 links.append({"src": a, "dst": b, "transport": kind, "transport_label": label,
                               "gbs": missing(txt, "GB/s"), "lat_us": missing(txt, "µs"), "lat_dev_us": missing(txt, "µs"),
                               "peer_access": None, "note": ""})
@@ -956,20 +956,20 @@ def build(
     bar1_attempted_at, bar1_reason_newest = b1["attempted_at"], (0.0, b1["reason"])
     nccl_missing = nc["gap"]
     if bar1_total and bar1_done == bar1_total:
-        bar1_note = "BAR1-Strecke: alle %d geordneten Paare gemessen (Schreibrate in das BAR1-Fenster des Ziels, über die Produktions-Transportschicht)." % bar1_total
+        bar1_note = "BAR1 stretch: all %d ordered pairs measured (write rate into the BAR1 window of the target, through the production transport layer)." % bar1_total
     elif bar1_done:
-        bar1_note = ("BAR1-Strecke: %d von %d geordneten Paaren gemessen; die übrigen sind 'nicht gemessen' mit ihrem Grund. %s"
+        bar1_note = ("BAR1 stretch: %d of %d ordered pairs measured; the rest are 'not measured' with their reason. %s"
                      % (bar1_done, bar1_total, bar1_reason_newest[1]))
     elif bar1_attempted_at is not None:
         bar1_note = "BAR1 stretch per pair: NOT MEASURED. The probe ran the BAR1 step; reason: %s" % (bar1_reason_newest[1] or "no pair delivered a rate")
     else:
         bar1_note = BAR1_NOT_MEASURED
     if nc["total"] and nc["seen"] == nc["total"]:
-        nccl_note = "NCCL send/recv: alle %d geordneten Paare gemessen." % nc["total"]
+        nccl_note = "NCCL send/recv: all %d ordered pairs measured." % nc["total"]
     elif nc["seen"]:
-        nccl_note = "NCCL send/recv: %d von %d geordneten Paaren gemessen. %s" % (nc["seen"], nc["total"], nc["reason"])
+        nccl_note = "NCCL send/recv: %d of %d ordered pairs measured. %s" % (nc["seen"], nc["total"], nc["reason"])
     elif nc["attempted_at"] is not None:
-        nccl_note = "NCCL send/recv: nicht gemessen. Der Schritt lief; Grund: %s" % (nc["reason"] or "kein Paar lieferte eine Rate")
+        nccl_note = "NCCL send/recv: not measured. The step ran; reason: %s" % (nc["reason"] or "no pair delivered a rate")
     else:
         nccl_note = NCCL_SHORT
 
@@ -984,11 +984,11 @@ def build(
                 continue
             st = by_way.get(("host_staging", a, b)) or by_way.get(("p2p", a, b))
             if st is None:
-                st_cols = {"gbs": missing("Host-Staging nicht gemessen: kein Paar-Eintrag in einer Probe", "GB/s"),
-                           "gbs_serial": missing("Host-Staging nicht gemessen: kein Paar-Eintrag in einer Probe", "GB/s"),
-                           "lat_us": missing("Host-Staging nicht gemessen: kein Paar-Eintrag in einer Probe", "µs"), "path": None}
+                st_cols = {"gbs": missing("host staging not measured: no pair entry in any probe", "GB/s"),
+                           "gbs_serial": missing("host staging not measured: no pair entry in any probe", "GB/s"),
+                           "lat_us": missing("host staging not measured: no pair entry in any probe", "µs"), "path": None}
             else:
-                st_cols = {"gbs": st["gbs"], "gbs_serial": st.get("gbs_serial") or missing("kein serieller Wert auf diesem Pfad", "GB/s"),
+                st_cols = {"gbs": st["gbs"], "gbs_serial": st.get("gbs_serial") or missing("no serial value on this path", "GB/s"),
                            "lat_us": st["lat_us"], "path": st["transport"]}
             d2d_rows.append({"src": a, "dst": b,
                              "barlink_bar1": {"gbs": by_way[("bar1", a, b)]["gbs"], "lat_us": by_way[("bar1", a, b)]["lat_us"],
@@ -1000,9 +1000,9 @@ def build(
     d2d = {
         "headline": "barlink_bar1",
         "columns": [
-            {"key": "barlink_bar1", "label": "barlink BAR1 direkt (Betriebsweg, Kopfzahl)"},
-            {"key": "nccl", "label": "NCCL Karte-zu-Karte (Vergleich ohne barlink)"},
-            {"key": "host_staging", "label": "Host-Staging gepinnt (Fallback, nicht der Betriebsweg)"},
+            {"key": "barlink_bar1", "label": "barlink BAR1 direct (operating path, headline figure)"},
+            {"key": "nccl", "label": "NCCL card to card (comparison without barlink)"},
+            {"key": "host_staging", "label": "Host staging pinned (fallback, not the operating path)"},
         ],
         "definitions": D2D_DEFINITIONS,
         "references": D2D_REFERENCES,
@@ -1073,15 +1073,15 @@ def validate(doc: dict) -> List[str]:
             if "src" in x and "v" in x:
                 src, v = x["src"], x["v"]
                 if src not in SOURCES:
-                    problems.append(f"{path}: unbekannte Quelle {src!r}")
+                    problems.append(f"{path}: unknown source {src!r}")
                 if src == SRC_MEASURED and (v is None or x.get("at") is None or not x.get("probe")):
-                    problems.append(f"{path}: 'gemessen' ohne Wert/Zeit/Probe")
+                    problems.append(f"{path}: 'gemessen' without value/time/probe")
                 if v is None and src != SRC_NONE:
-                    problems.append(f"{path}: leerer Wert als {src!r} statt 'nicht gemessen'")
+                    problems.append(f"{path}: empty value as {src!r} instead of 'nicht gemessen'")
                 if src == SRC_NONE and (v is not None or not x.get("note")):
-                    problems.append(f"{path}: 'nicht gemessen' braucht v=null und einen Grund")
+                    problems.append(f"{path}: 'nicht gemessen' needs v=null and a reason")
                 if src == SRC_ESTIMATED and not x.get("note"):
-                    problems.append(f"{path}: 'geschätzt' braucht eine Herleitung")
+                    problems.append(f"{path}: 'geschätzt' needs a derivation")
                 return
             for k, v in x.items():
                 walk(f"{path}.{k}" if path else k, v)
@@ -1117,9 +1117,9 @@ def load_profile(path: str) -> Tuple[Optional[dict], Optional[str]]:
     except (FileNotFoundError, NotADirectoryError):
         return None, None
     except (OSError, ValueError) as e:
-        return None, f"nicht lesbar ({type(e).__name__}: {e})"
+        return None, f"not readable ({type(e).__name__}: {e})"
     if not isinstance(d, dict) or d.get("schema") != SCHEMA or not isinstance(d.get("cards"), list):
-        return None, f"kein {SCHEMA}-Dokument"
+        return None, f"no {SCHEMA} document"
     return d, None
 
 
@@ -1162,15 +1162,15 @@ def compare(persisted: dict, live: dict) -> Dict[str, Any]:
     b, db = _identity(live)
     changes: List[str] = []
     for u in sorted(set(a) - set(b)):
-        changes.append(f"Karte {a[u][0]} ({u}) ist nicht mehr da")
+        changes.append(f"Card {a[u][0]} ({u}) is gone")
     for u in sorted(set(b) - set(a)):
-        changes.append(f"neue Karte {b[u][0]} ({u})")
+        changes.append(f"new card {b[u][0]} ({u})")
     for u in sorted(set(a) & set(b)):
-        for what, x, y in zip(("Name", "VRAM MiB", "cc", "PCI-Bus"), a[u], b[u]):
+        for what, x, y in zip(("name", "VRAM MiB", "cc", "PCI bus"), a[u], b[u]):
             if x != y:
-                changes.append(f"Karte {u}: {what} war {x}, jetzt {y}")
+                changes.append(f"Card {u}: {what} was {x}, now {y}")
     if da is not None and db is not None and da != db:
-        changes.append(f"Treiber war {da}, jetzt {db}")
+        changes.append(f"Driver was {da}, now {db}")
     return {"same": not changes, "changes": changes}
 
 
@@ -1200,7 +1200,7 @@ def capture(
     if force or persisted is None:
         if not has_cards:
             res.update(state="keine_karten", show=persisted or live,
-                       error=(res["error"] + "; " if res["error"] else "") + "NVML meldet keine Karte: nichts gespeichert, nichts überschrieben")
+                       error=(res["error"] + "; " if res["error"] else "") + "NVML reports no card: nothing saved, nothing overwritten")
             return res
         why = reason or ("Neu erfassen" if force else "erster Start")
         w = save_profile(live, path, reason=why, now=now)
@@ -1265,7 +1265,7 @@ def run_measurement(
     by_idx = {c["nvml_index"]: c for c in cards}
     unknown = [i for i in nvml_indexes if i not in by_idx]
     if unknown:
-        raise ValueError(f"unbekannte Karte(n) {unknown}; NVML kennt {sorted(by_idx)}")
+        raise ValueError(f"unknown card(s) {unknown}; NVML knows {sorted(by_idx)}")
     uuids = [by_idx[i]["uuid"] for i in nvml_indexes]
     cmd = probe_command(python or sys.executable, prefix)
     env = probe_env(uuids, pythonpath=pythonpath)
@@ -1275,7 +1275,7 @@ def run_measurement(
             p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout_s, check=False)
             rc, out, err = p.returncode, p.stdout, p.stderr
         except subprocess.TimeoutExpired:
-            rc, out, err = 124, "", f"Zeitüberschreitung nach {timeout_s:.0f} s"
+            rc, out, err = 124, "", f"timeout after {timeout_s:.0f} s"
     else:
         rc, out, err = runner(cmd, env, timeout_s)
     seconds = round(time.time() - t0, 1)

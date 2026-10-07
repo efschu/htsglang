@@ -459,7 +459,7 @@ def build_verdikt(n: int, first: Any, second: Any = None, *, lens: Optional[Mapp
             st = {"ja": GOES, "knapp": HINT, "nein": BLOCKED}.get(lvl, HINT)
             if vorschlag.get("form") == "dual":
                 st = HINT          # hw_fit does not model the Dual: its Flip bound neither clears nor blocks it (DUAL-PASSUNG below does)
-            txt = "hw_fit%s: %s%s%s" % (" (flip bound, dual not modelled)" if vorschlag.get("form") == "dual" else "", lvl, (" (rest %s MiB)" % fit["margin_mib"]) if fit.get("margin_mib") is not None else "",
+            txt = "hw_fit%s: %s%s%s" % (" (flip bound, dual not modelled)" if vorschlag.get("form") == "dual" else "", {"ja": "yes", "knapp": "tight", "nein": "no"}.get(lvl, lvl), (" (rest %s MiB)" % fit["margin_mib"]) if fit.get("margin_mib") is not None else "",
                                       ("; " + str(fit["first"])) if fit.get("first") else "")
             v_list.append(verdikt("FIT", ebene="fit", text=txt, grund=txt, force_state=st, extra={"stufe": lvl, "rest_mib": fit.get("margin_mib"),
                                                                                               "zeilen": list(fit.get("lines") or [])[:12]}))

@@ -1,7 +1,7 @@
 """Auftrag 1979 (Browsertest des Profil-Editors): die Fehler, die im Browser gesehen wurden, als Regressionstests.
 
 * ``profil.js``: schlägt die ERSTE Balken-Rechnung fehl, darf ``draw()`` nicht werfen (vorher: ``Object.keys(b.phases)`` auf undefined,
-  der ganze Reiter fror auf "rechnet …" ein); ein Fehler NACH erfolgreicher Rechnung kennzeichnet die alten Balken als veraltet;
+  der ganze Reiter fror auf "computing …" ein); ein Fehler NACH erfolgreicher Rechnung kennzeichnet die alten Balken als veraltet;
   die Rechnung läuft beim Öffnen des Faltbereichs nur einmal (nicht je Neuzeichnen).  Läuft in node mit einer Attrappe des DOM.
 * ``ProfilEditor.dry_run``: ``topology.plan_topology`` importiert für N != 3 ``sglang`` (``weg2/weight_exchange_region``); im Dashboard-
   Prozess ohne sglang-Umgebung ist das KEINE Ablehnung und darf nicht als HTTP 500 enden, sondern wird als nicht geprüft vermerkt.
@@ -72,7 +72,7 @@ const click = (dataset) => root._h.click({ target: { closest: () => ({ dataset }
   const loadsBefore = calls.filter((c) => c === "load").length;
   click({ act: "load" }); await sleep(80);
   out.reloaded = calls.filter((c) => c === "load").length - loadsBefore;
-  out.msgAfterReload = root.innerHTML.indexOf("Release-Profil p geladen") >= 0;
+  out.msgAfterReload = root.innerHTML.indexOf("Release profile p loaded") >= 0;
   if (MODE === "stale") {
     recomputeAnswer = () => [200, GOOD];
     click({ act: "load" }); await sleep(600);
@@ -102,7 +102,7 @@ class ProfilJsBars(unittest.TestCase):
         o = self.run_js("first")
         self.assertEqual(o["unhandled"], [], "draw() darf bei fehlgeschlagener erster Rechnung nicht werfen")
         self.assertIn("kaputt-1979", o["afterFirstError"])
-        self.assertNotIn("rechnet …", o["afterFirstError"])
+        self.assertNotIn("computing …", o["afterFirstError"])
         self.assertEqual(o["reloaded"], 1)
         self.assertTrue(o["msgAfterReload"], "der Reiter muss nach dem Fehler weiter neu zeichnen")
 
@@ -113,7 +113,7 @@ class ProfilJsBars(unittest.TestCase):
         o = self.run_js("stale")
         self.assertTrue(o["good"])
         self.assertIn("spaeter-kaputt", o["afterLaterError"])
-        self.assertIn("VERALTET", o["afterLaterError"])
+        self.assertIn("STALE", o["afterLaterError"])
         self.assertEqual(o["unhandled"], [])
 
 
@@ -134,7 +134,7 @@ class DryRunWithoutSglang(unittest.TestCase):
         ed.kp._mods = lambda: (ci, NoSglangTopology)
         d = ed.dry_run(ed.load("release", "demo")["doc"], RIG[:2])
         self.assertTrue(d["ok"])
-        self.assertTrue(any("Topologie für 2 Karte(n) nicht geprüft" in n for n in d["notes"]), d["notes"])
+        self.assertTrue(any("Topology for 2 card(s) not checked" in n for n in d["notes"]), d["notes"])
         self.assertNotIn("HW-TOPOLOGY", [q["code"] for q in d["rejections"]])
 
 

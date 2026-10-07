@@ -145,8 +145,8 @@ NODE = next((p for p in (shutil.which("node"), "/opt/node-v22.14.0-linux-x64/bin
 def _run_js(expr):
     html = open(os.path.join(server.STATIC, "index.html"), encoding="utf-8").read()
     a, b = html.index("// ---- phase bar:"), html.index("// label = mean tok/s")
-    prelude = ('const window = {i18nLang: () => "de", innerWidth: 1400};\n'
-               'const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("de-DE", '
+    prelude = ('const window = {i18nLang: () => "en", innerWidth: 1400};\n'
+               'const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("en-US", '
                '{maximumFractionDigits: d, minimumFractionDigits: d});\n'
                'const esc = (s) => String(s); const hhmm = (t) => "t" + t; const srcOf = () => "";\n')
     out = subprocess.run([NODE, "-e", prelude + html[a:b] + "\nprocess.stdout.write(" + expr + ");"],
@@ -160,14 +160,14 @@ def test_hover_and_bar_show_both_phases():
     seg = ('{s: 100, e: 110, k: "P", co: "dec", tps: 4545.2, tok: 45452, co_tps: 82.4, co_tok: 824, '
            'co_by_bs: [{bs: 6, tps: 82.4, per_slot: 13.7, busy_s: 10}]}')
     tip = _run_js("phaseTip(%s, false)" % seg)
-    assert "P-Prefill + D-Decode gleichzeitig" in tip
-    assert "<b>P-Prefill</b> &middot; <b>4.545</b> tok/s" in tip
-    assert "<b>D-Decode</b> &middot; <b>82,4</b> tok/s" in tip and "bs 6: <b>82,4</b> tok/s" in tip
+    assert "P prefill + D decode simultaneously" in tip
+    assert "<b>P prefill</b> &middot; <b>4,545</b> tok/s" in tip
+    assert "<b>D decode</b> &middot; <b>82.4</b> tok/s" in tip and "bs 6: <b>82.4</b> tok/s" in tip
     bar = _run_js('phaseHtml({stem: "x", timeline: {segs: [%s], span_s: 900, t1: 110}})' % seg)
-    assert 'class="seg ph-k-P co-dec"' in bar and "P-Prefill + D-Decode gleichzeitig" in bar
+    assert 'class="seg ph-k-P co-dec"' in bar and "P prefill + D decode simultaneously" in bar
     # a flip boot's P segment: one phase, as before
     plain = '{s: 100, e: 110, k: "P", tps: 4545.2, tok: 45452}'
     tip0 = _run_js("phaseTip(%s, false)" % plain)
-    assert "gleichzeitig" not in tip0 and tip0.startswith("<b>P-Prefill</b> &middot; <b>4.545</b> tok/s")
+    assert "gleichzeitig" not in tip0 and tip0.startswith("<b>P prefill</b> &middot; <b>4,545</b> tok/s")
     bar0 = _run_js('phaseHtml({stem: "x", timeline: {segs: [%s], span_s: 900, t1: 110}})' % plain)
     assert 'class="seg ph-k-P"' in bar0 and "gleichzeitig" not in bar0

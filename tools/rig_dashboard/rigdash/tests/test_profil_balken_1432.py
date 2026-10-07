@@ -119,7 +119,7 @@ class TestWorkerLifecycle(unittest.TestCase):
         svc.request({"what": "bars"})
         dead = svc.request({"what": "die"})
         self.assertFalse(dead["ok"])
-        self.assertIn("gestorben", dead["error"])
+        self.assertIn("died", dead["error"])
         again = svc.request({"what": "bars", "x": 3})
         self.assertTrue(again["ok"], again)
         self.assertEqual(svc.starts, 2)
@@ -129,7 +129,7 @@ class TestWorkerLifecycle(unittest.TestCase):
         self.addCleanup(svc.close)
         slow = svc.request({"what": "sleep"})
         self.assertFalse(slow["ok"])
-        self.assertIn("nicht fertig", slow["error"])
+        self.assertIn("not finished", slow["error"])
         self.assertTrue(svc.request({"what": "bars"})["ok"])
         self.assertEqual(svc.starts, 2)
 
@@ -143,10 +143,10 @@ class TestWorkerLifecycle(unittest.TestCase):
     def test_missing_tree_or_python_is_named(self):
         r = R.CouplingsService(None).request({"what": "bars"})
         self.assertFalse(r["ok"])
-        self.assertIn("kein Planer-Baum", r["error"])
+        self.assertIn("no planner tree", r["error"])
         r = R.CouplingsService(self.tmp, python="/nicht/da/python").request({"what": "bars"})
         self.assertFalse(r["ok"])
-        self.assertIn("Python der sglang-Umgebung fehlt", r["error"])
+        self.assertIn("Python of the sglang environment is missing", r["error"])
 
     def test_a_tree_without_the_module_is_named_by_the_real_worker(self):
         fixture = os.path.join(HERE, "fixtures", "kartenplan", "planner_tree", "python")
@@ -233,9 +233,9 @@ class TestRoute(unittest.TestCase):
         st, j = self.call(port, {"doc": self.DOC})
         self.assertEqual(st, 200)
         self.assertFalse(j["ok"])
-        self.assertIn("Hardwareprofil nicht verfügbar", j["error"])
+        self.assertIn("Hardware profile not available", j["error"])
         port = self.serve(tmp=self.tmp)
-        self.assertIn("kein Modellpfad", self.call(port, {"doc": {"args": []}})[1]["error"])
+        self.assertIn("no model path", self.call(port, {"doc": {"args": []}})[1]["error"])
         st, j = self.call(port, {"doc": {"vars": [{"name": "PROFILE_MODEL", "value": "/nicht/hier"}]}})
         self.assertEqual(st, 400)
         self.assertIn("Modellwurzel", j["error"])
@@ -303,7 +303,7 @@ class TestJsApprox(unittest.TestCase):
             "const M=require(%r);let err=null;try{M.approx(%s,[1,1])}catch(e){err=e.message}\n"
             "const bar={label:'<b>K</b>',total_mib:100,budget_mib:80,overflow_mib:0,free_mib:10,segments:[{key:'kv',label:'<i>KV</i>',mib:70,origin:'x'}]};\n"
             "console.log(JSON.stringify({err,html:M.render([bar],{base:0}),tip:M.tip(bar,0)}))" % (JS, json.dumps(self.PAYLOAD)))
-        self.assertIn("passt nicht zum Modell", o["err"])
+        self.assertIn("does not fit the model", o["err"])
         self.assertNotIn("<b>K</b>", o["html"])
         self.assertIn("&lt;b&gt;K&lt;/b&gt;", o["html"])
         self.assertNotIn("<i>KV</i>", o["tip"])

@@ -204,7 +204,7 @@ def _per_card(x: Any, n: int, name: str, default: float) -> List[float]:
         return [float(x)] * n
     xs = [float(v) for v in x]
     if len(xs) != n:
-        raise CouplingError("vector_length: %s hat %d Werte, es gibt %d Karten/Stufen" % (name, len(xs), n))
+        raise CouplingError("vector_length: %s has %d values, there are %d cards/stages" % (name, len(xs), n))
     return xs
 
 
@@ -344,7 +344,7 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
     geo = _kv_geometry(model, settings.get("kv_dtype"), cell)
     cross = _pp.kv_cell_bytes_per_attention_layer(**geo)
     if abs(cross - cell) > 0.5:
-        warnings.append("KV-Zelle: Modellprofil %.0f B, pp_cut-Geometrie %.0f B je Attention-Layer (Modellprofil gilt)" % (cell, cross))
+        warnings.append("KV cell: model profile %.0f B, pp_cut geometry %.0f B per attention layer (the model profile applies)" % (cell, cross))
         geo = dict(geo, kv_dtype_bytes=geo["kv_dtype_bytes"] * cell / cross)
     state_node = model["state"].get("per_linear_layer_per_slot_mib")
     state_per = float(_val(state_node, 0.0))
@@ -451,11 +451,11 @@ def c1_move_layers(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Ma
     Der Schnitt ist zusammenhaengend; nur Nachbarstufen tauschen Layer (der Rand-Layer wechselt den Besitzer)."""
     counts = [int(c) for c in settings.get("stage_layers") or []]
     if abs(int(src) - int(dst)) != 1:
-        raise CouplingError("Layer wechseln nur zwischen NACHBARSTUFEN (src=%s dst=%s)" % (src, dst))
+        raise CouplingError("Layers move only between ADJACENT STAGES (src=%s dst=%s)" % (src, dst))
     if not (0 <= src < len(counts) and 0 <= dst < len(counts)):
-        raise CouplingError("Stufe ausserhalb 0..%d" % (len(counts) - 1))
+        raise CouplingError("Stage outside 0..%d" % (len(counts) - 1))
     if n < 1 or counts[src] < n:
-        raise CouplingError("Stufe %d hat nur %d Layer, %d verlangt" % (src, counts[src], n))
+        raise CouplingError("Stage %d has only %d layers, %d requested" % (src, counts[src], n))
     after_counts = list(counts)
     after_counts[src] -= n
     after_counts[dst] += n
@@ -723,7 +723,7 @@ BAR_SEGMENTS: Tuple[Tuple[str, str, str], ...] = (
     ("fixed", "Fixed items", "CUDA context, graphs, allocator remainders, seam staging: measurable only on the hardware (0 without input)"),
 )
 
-_ORIGIN = {SRC_INPUT: "Input (user/profile)", SRC_DEFAULT: "Assumption of this calculation", SRC_DERIVED: "gerechnet"}
+_ORIGIN = {SRC_INPUT: "Input (user/profile)", SRC_DEFAULT: "Assumption of this calculation", SRC_DERIVED: "computed"}
 
 
 def _origin(src: str) -> str:
@@ -766,11 +766,11 @@ def stage_bar(stage: Mapping[str, Any]) -> Dict[str, Any]:
     free = max(0.0, budget - sum(s["mib"] for s in kept))
     out = list(kept)
     if overflow > 0:
-        out.append({"key": "overflow", "label": "Overflow", "mib": overflow, "src": SRC_DERIVED, "origin": "gerechnet",
+        out.append({"key": "overflow", "label": "Overflow", "mib": overflow, "src": SRC_DERIVED, "origin": "computed",
                     "what": "Items over the budget (%.0f MiB): %s" % (budget, ", ".join("%s %.0f MiB" % (c["label"], c["mib"]) for c in cut)),
                     "cut": cut})
     elif free > 0:
-        out.append({"key": "free_in_budget", "label": "Rest in the budget", "mib": round(free, 3), "src": SRC_DERIVED, "origin": "gerechnet",
+        out.append({"key": "free_in_budget", "label": "Rest in the budget", "mib": round(free, 3), "src": SRC_DERIVED, "origin": "computed",
                     "what": "Budget - items (upper bound as long as fixed items are not measured)"})
     reserve = max(0.0, total - budget)
     if reserve > 0:
@@ -967,7 +967,7 @@ def _draft_info(model: Mapping[str, Any], all_args: Mapping[str, str]) -> Dict[s
     elif mtp > 0:
         info["p_mib"] = info["d_mib"] = mtp
         info["src"] = _src(w.get("mtp_bytes"))
-        info["p_note"] = info["d_note"] = "MTP-Kopf des Ziel-Checkpoints (mtp.*)"
+        info["p_note"] = info["d_note"] = "MTP head of the target checkpoint (mtp.*)"
     else:
         info.update(p_mib=None, d_mib=None, reason="Draft directory is named in the profile but not profiled (no model profile of the draft)")
     return info
@@ -1269,7 +1269,7 @@ def d_phase_config(args: Mapping[str, str], env: Mapping[str, str], model: Mappi
     sc = _fl(env.get("SGLANG_MOE_SCRATCH_SLOTS"))
     if sc:
         cfg["scratch"] = [int(x) for x in sc] if len(sc) > 1 else int(sc[0])
-        note("scratch", ",".join("%d" % x for x in sc), "Umgebung SGLANG_MOE_SCRATCH_SLOTS (--env-d)")
+        note("scratch", ",".join("%d" % x for x in sc), "Environment SGLANG_MOE_SCRATCH_SLOTS (--env-d)")
     bud = _fl(args.get("--rank-gpu-memory-mib"))
     if dual_plan is not None:
         # --dual-share: D = Union-Owner, bemessen aus P's PLAN (dc = P-Budget + --dual-p-overhead-mib je Karte, launcher.py:27289-27301)
@@ -1674,7 +1674,7 @@ def _over_text(label: str, phase: str, overflow: float, beyond: float, budget: f
         return ("%s (%s): items %.0f MiB over the budget (%.0f MiB); the reserve is consumed." % (label, phase, overflow, budget))
     if over_avail > 0:
         res = (" - user reserve %.0f MiB (--d-reserve-mib)" % user_reserve) if user_reserve > 0 else ""
-        return ("%s (%s): budget %.0f MiB is %.0f MiB larger than the available (card %.0f - fixed items %.0f MiB outside the budget%s). The launcher reports ABOVE and starts anyway." % (label, phase, budget, over_avail, total, outside, res))
+        return ("%s (%s): budget %.0f MiB is %.0f MiB larger than what is available (card %.0f - fixed items %.0f MiB outside the budget%s). The launcher reports THIS and starts anyway." % (label, phase, budget, over_avail, total, outside, res))
     return ""
 
 

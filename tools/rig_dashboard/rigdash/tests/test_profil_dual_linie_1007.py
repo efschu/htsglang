@@ -112,7 +112,7 @@ class EditorBothLines(unittest.TestCase):
             self.assertIs(planer["dual_verfuegbar"], False)
             with self.assertRaises(P.ProfilError) as cm:
                 self.ed.propose(self.base._body(form="dual"))
-            self.assertEqual(str(cm.exception), "Dual auf dieser Linie nicht verfuegbar")
+            self.assertEqual(str(cm.exception), "Dual is not available on this line")
             self.assertEqual(self.orc.calls, [], "the child must not be asked (ImportError in the child before this fix)")
             r = self.ed.propose(self.base._body(form="flip"))                                  # the other forms are untouched
             self.assertTrue(r["ok"], r)
@@ -156,7 +156,7 @@ class ProposeRouteDualLine(unittest.TestCase):
             self.assertEqual(st, 400, txt[:300])
             js = json.loads(txt)
             self.assertIs(js["ok"], False)
-            self.assertEqual(js["error"], "Dual auf dieser Linie nicht verfuegbar")
+            self.assertEqual(js["error"], "Dual is not available on this line")
             self.assertNotIn("ImportError", txt)
             self.assertEqual(base.orc.calls, [])
             st, txt = self.call(port, "/api/profil/propose", base._body(form="flip"))
