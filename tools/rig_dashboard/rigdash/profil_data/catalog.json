@@ -29542,7 +29542,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2421
+      "line": 2424
      }
     }
    },
@@ -29597,7 +29597,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2411
+    "line": 2414
    },
    "status": "geerntet",
    "text": "",
@@ -29620,7 +29620,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2457
+      "line": 2460
      }
     }
    },
@@ -38339,7 +38339,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4522
+    "line": 4525
    },
    "status": "unerklaert",
    "text": "",
@@ -38657,7 +38657,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4521
+    "line": 4524
    },
    "status": "geerntet",
    "text": "",
@@ -39205,7 +39205,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2432
+      "line": 2435
      }
     }
    },
@@ -39374,7 +39374,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2436
+      "line": 2439
      }
     }
    },
@@ -47482,6 +47482,34 @@
    "status": "geerntet",
    "text": "",
    "type": "EnvInt"
+  },
+  "SGLANG_LOG_WEG2_D_LEAD_MS": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "D-LEAD-MS-1007: every rank of group D logs, at a request's first extend, its scheduler arrival and extend start in epoch ms (weg2/d_lead_probe.py).",
+   "id": "SGLANG_LOG_WEG2_D_LEAD_MS",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_LOG_WEG2_D_LEAD_MS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2109
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
   },
   "SGLANG_MAMBA_CKPT_DEBUG": {
    "baeume": [
@@ -70841,7 +70869,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3557
+      "line": 3560
      }
     }
    },
@@ -71200,7 +71228,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4229
+      "line": 4232
      }
     }
    },
@@ -71279,7 +71307,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2450
+      "line": 2453
      }
     }
    },
@@ -71818,7 +71846,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2441
+      "line": 2444
      }
     }
    },
@@ -72040,7 +72068,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4209
+      "line": 4212
      }
     }
    },
@@ -75178,7 +75206,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4329
+      "line": 4332
      }
     }
    },
@@ -77298,7 +77326,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4138
+      "line": 4141
      }
     }
    },
@@ -77859,7 +77887,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2317
+    "line": 2320
    },
    "status": "erklaert",
    "text": "Wenn eine angehaltene (geparkte) Anfrage später weiterlaufen soll und der Platz für Mamba-Anker im Host-RAM voll ist, bekommt ihr Wiedereinstiegspunkt Vorrang: andere Zwischenstände ohne Park-Bezug werden zuerst auf die Platte ausgelagert, damit der Einstiegspunkt der geparkten Anfrage nicht verloren geht. Aus: der alte Weg; geparkte Anfragen können ihren Einstiegspunkt verlieren und neu rechnen. Ohne Park ändert sich nichts. Wirkt nur auf Knoten, die als geparkt markiert sind. Standard an. Unbelegt: Abhängigkeit zu einem anderen Schalter; ob der Nutzer ihn ändern soll (belegt ist nur der Entscheid „bleibt an“ vom 05.10. ~17:47Z); Nutzen am Metall (laut Bericht „active, effect not shown“).",
@@ -81792,7 +81820,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 917
+      "line": 918
      }
     }
    },
@@ -84496,7 +84524,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4316
+      "line": 4319
      }
     }
    },
@@ -85277,25 +85305,25 @@
    "abweichung": 43,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 32
+   "nur_nf": 33
   },
-  "entries": 2691,
-  "envs": 1814,
+  "entries": 2692,
+  "envs": 1815,
   "erklaert": 304,
   "flags": 862,
-  "geerntet": 1666,
+  "geerntet": 1667,
   "kuratiert": 119,
   "unerklaert": 602
  },
- "tree_rev": "27b=65fc0e2076+nf=89999eede5+hebel3b",
+ "tree_rev": "27b=65fc0e2076+nf=cb555dbc8f+hebel3a",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "65fc0e2076"
   },
   "nf": {
-   "entries": 2493,
-   "rev": "89999eede5+hebel3b"
+   "entries": 2494,
+   "rev": "cb555dbc8f+hebel3a"
   }
  },
  "warnungen": []

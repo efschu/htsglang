@@ -2104,6 +2104,9 @@ class Envs:
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
+    # D-LEAD-MS-1007: every rank of group D logs, at a request's first extend,
+    # its scheduler arrival and extend start in epoch ms (weg2/d_lead_probe.py).
+    SGLANG_LOG_WEG2_D_LEAD_MS = EnvBool(False)
     # #540: what the Anthropic front sends downstream for output_config.effort
     # == "xhigh". Default "xhigh" = pass the client's value through unchanged,
     # which is what the Qwen3.8 family's chat template accepts ('xhigh',

@@ -241,6 +241,7 @@ from sglang.srt.weg2 import twin_anchor as _weg2_twin_anchor  # TWIN ANCHOR (y4a
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
 from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progress beacon
+from sglang.srt.weg2.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
@@ -1739,6 +1740,9 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
+    # D-LEAD-MS-1007: set in init_weg2_d_lead_probe; None = no lead line.
+    weg2_d_lead_probe = None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -2154,6 +2158,8 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+
+        self.init_weg2_d_lead_probe()
 
         self.init_kv_events_publisher()
 
@@ -5025,6 +5031,11 @@ class Scheduler(
             ),
         )
 
+    def init_weg2_d_lead_probe(self) -> None:
+        self.weg2_d_lead_probe = build_d_lead_probe(
+            group=os.environ.get("SGLANG_WEG2_GROUP", "")
+        )
+
     def init_parked_decode_set(self) -> None:
         """#677 phase 1: stop charging undecodable carriers to the cap.
 
@@ -7239,6 +7250,8 @@ class Scheduler(
         # intake).  The terms are recorded by the decorated methods on their
         # own holders and read here; one line per intake over 200 ms.
         _t0 = time.perf_counter()
+        if self.weg2_d_lead_probe is not None:
+            self.weg2_d_lead_probe.note_recv(rid=recv_req.rid)
         try:
             return self._handle_generate_request_impl(recv_req)
         finally:
@@ -18748,6 +18761,11 @@ class Scheduler(
         # forward progress off a 32-byte mmap -- a busy group is not a dead one.
         _weg2_beacon.beat_start(self.forward_ct)
         self._weg2_d_seat_guard(batch)  # H95c W-SEAT: never wider than the phase's n
+        if self.weg2_d_lead_probe is not None and batch.forward_mode.is_extend():
+            self.weg2_d_lead_probe.note_extend(
+                rids=[req.rid for req in batch.reqs],
+                skip=batch.weg2_skip_extend,
+            )
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
         # nothing wrote must not speculate over them. Here, and not in the
