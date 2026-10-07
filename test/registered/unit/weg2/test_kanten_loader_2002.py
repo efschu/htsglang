@@ -188,14 +188,14 @@ class Synthetic(unittest.TestCase):
         edges, info = PC.load_edges("/nonexistent/kanten.json")
         self.assertEqual(edges, [])
         self.assertFalse(info["geladen"])
-        self.assertIn("nicht lesbar", info["grund"])
+        self.assertIn("not readable", info["grund"])
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "k.json")
             with open(p, "w") as fh:
                 json.dump({"schema": "falsch/9", "kanten": []}, fh)
             _e, info2 = PC.load_edges(p)
             self.assertFalse(info2["geladen"])
-            self.assertIn("Schema", info2["grund"])
+            self.assertIn("schema", info2["grund"])
         cat = build(edges_path="/nonexistent/kanten.json")
         self.assertFalse(cat["kanten"]["geladen"])
         n_curated = sum(len(c.get("depends", [])) for c in CU.CURATED.values())
