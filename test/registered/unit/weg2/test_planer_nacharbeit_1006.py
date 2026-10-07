@@ -1,0 +1,107 @@
+"""Nacharbeit nach der Abnahme AP-J, Befund 6: W71 (UUID-gebundener Census) und W64 (kein gemessenes Dual-D-Log) sind im Verdikt-Register des Planers
+(``propose_verdict.SUPPLEMENT_CODES``) mit Klasse, ``forcebar=False``, Grund und Quelle, nicht mehr ``LAUNCHER-UNKLASSIFIZIERT``.  ``refusals.REGISTER`` (der Launcher)
+bleibt unveraendert (R1).  GPU-frei.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import re
+import unittest
+
+import pytest
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+try:
+    from sglang.srt.weg2 import launcher, refusals, xchg_residency
+    from sglang.srt.weg2 import propose_oracle as O
+    from sglang.srt.weg2 import propose_verdict as PV
+except Exception as exc:  # pragma: no cover
+    pytest.skip(f"weg2 launcher unavailable: {exc}", allow_module_level=True)
+
+W71_MSG = ("W71 Weg2XchgResidencyUnarmable: the exchange's predicted VRAM residency does not fit on 1 (card x direction) case(s).  This is spec section 5's arithmetic "
+           "over a MEASURED census")
+W64_MSG = ("W64 Weg2TpOperatingPointInfeasible: position tp3 derives weights [20, 12, 8], which PerfCostModel.predict_capacity marks feasible=False against this "
+           "boot's budgets [15000, 15000, 15000] -- the weight shards plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank.")
+
+
+def _result(exc_type, exc_msg, forced=()):
+    return O.DryRunResult(None, exc_type, exc_msg, "PLAN\n", "PLAN\n", [dict(f) for f in forced], ["--x"], "")
+
+
+class TestSupplement(unittest.TestCase):
+    def test_the_launcher_register_is_not_changed_and_has_neither_code(self):
+        self.assertEqual(len(refusals.REGISTER), 22)
+        codes = {r.code for r in refusals.REGISTER}
+        for c in ("W71", "W64", "W71-CENSUS", "W64-DUAL-D"):
+            self.assertNotIn(c, codes)
+
+    def test_w71_and_w64_are_classified_by_their_own_code(self):
+        a = PV.classify_exception("Weg2XchgResidencyUnarmable", W71_MSG)
+        b = PV.classify_exception("Weg2TpOperatingPointInfeasible", W64_MSG)
+        self.assertEqual((a["kind"], a["code"], a["launcher_code"]), ("ablehnung", "W71-CENSUS", "W71"))
+        self.assertEqual((b["kind"], b["code"], b["launcher_code"]), ("ablehnung", "W64-DUAL-D", "W64"))
+
+    def test_other_launcher_codes_stay_unclassified(self):
+        c = PV.classify_exception("Weg2PCutRecutRefused", "W167 Weg2PCutRecutRefused: x")
+        self.assertEqual(c["code"], "LAUNCHER-UNKLASSIFIZIERT")
+
+    def test_the_verdict_carries_class_not_forceable_reason_and_source(self):
+        for exc, msg, code in (("Weg2XchgResidencyUnarmable", W71_MSG, "W71-CENSUS"), ("Weg2TpOperatingPointInfeasible", W64_MSG, "W64-DUAL-D")):
+            d = PV.build_verdikt(3, _result("Weg2LaunchRefused", "HW-COUNT: x"), _result(exc, msg, forced=[{"code": "HW-COUNT", "text": "HW-COUNT: x"}]))
+            last = [v for v in d["verdikte"] if v["ebene"] == "lauf"][-1]
+            self.assertEqual(last["code"], code)
+            self.assertIs(last["forcebar"], False)
+            self.assertEqual(last["force_state"], PV.BLOCKED)
+            self.assertEqual(last["klasse"], "nicht_forcebar")
+            self.assertTrue(last["klasse_grund"] and last["konsequenz"] and last["titel"])
+            self.assertIn(msg[:40], last["grund"])                      # der Text der Launcher-Meldung, nicht ein Platzhalter
+            self.assertRegex(last["quelle"], r"\.py:\d+")
+            self.assertTrue(last["ergaenzung"])
+            self.assertEqual(d["ausgang"], "verweigert")
+            self.assertEqual(d["zaehlung"][PV.BLOCKED], 1)
+
+    def test_verdikt_without_text_falls_back_to_the_launcher_wording(self):
+        v = PV.verdikt("W71-CENSUS", ebene="lauf")
+        self.assertIn("W71 Weg2XchgResidencyUnarmable", v["grund"])
+        self.assertIs(v["forcebar"], False)
+
+    def test_the_cited_lines_hold_the_launcher_text(self):
+        """Die Quellenangaben sind keine Behauptung: der zitierte Text steht an der genannten Stelle des Quelltexts dieses Baums."""
+        def lines(mod):
+            return pathlib.Path(mod.__file__).read_text(encoding="utf-8").split("\n")
+
+        xl, ll = lines(xchg_residency), lines(launcher)
+
+        def span(src, a, b):
+            return " ".join(src[a - 1:b])
+
+        self.assertIn("W71 Weg2XchgResidencyUnarmable: the exchange's predicted VRAM residency", span(xl, 711, 723))
+        self.assertIn("--weg2-weight-source ring", span(xl, 711, 723))
+        self.assertIn("def load_census", span(xl, 313, 316))
+        self.assertIn("W64 Weg2TpOperatingPointInfeasible: position", span(ll, 16986, 16992))
+        self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17242, 17243))
+        for w in PV.SUPPLEMENT_CODES.values():
+            for m in re.finditer(r"(\w+/)?[\w.]+\.py:(\d+)(?:-(\d+))?", w["quelle"]):
+                self.assertGreater(int(m.group(2)), 0)
+
+    def test_the_dashboard_shows_the_supplement_code_as_a_not_forceable_row(self):
+        """Ohne Registerzeile baut das Dashboard die Zeile aus dem Verdikt (``ProfilEditor._register_row``): nicht forcebar, mit Titel und Folge."""
+        import sys
+
+        tools = str(pathlib.Path(launcher.__file__).resolve().parents[4] / "tools" / "rig_dashboard")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from rigdash import profil as P
+
+        v = PV.verdikt("W71-CENSUS", ebene="lauf", text=W71_MSG, force_state=PV.BLOCKED, extra={"launcher_code": "W71"})
+        row = P.ProfilEditor._register_row({"code": "W71-CENSUS", "verdikt": v}, {})
+        self.assertEqual((row["klass"], row["forcebar"]), ("nicht_forcebar", False))
+        self.assertIn("W71", row["why_class"])
+        self.assertTrue(row["consequence"])
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

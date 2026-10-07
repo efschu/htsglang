@@ -239,6 +239,40 @@ def _issue_cards(dry, cards) -> tuple:
     return out, "gewählt, noch kein Trockenlauf"
 
 
+_AUSGANG_TEXT = {"geht": "geht ohne Force durch", "geht_mit_force": "geht nur mit Force durch", "verweigert": "verweigert, auch mit Force",
+                 "absturz": "Absturz des Trockenlaufs (kein Urteil über die Werte)", "orakel_fehler": "das Orakel konnte nicht fragen (kein Urteil)",
+                 "passt": "Planer-Rechnung: passt (kein Launcher-Lauf)", "passt_nicht": "Planer-Rechnung: passt nicht (kein Launcher-Lauf)",
+                 "unbelegt": "Planer-Rechnung: nicht rechenbar"}
+
+
+def dry_from_vorschlag(vd) -> Optional[dict]:
+    """Der Orakel-Lauf des Vorschlags (``verdikt`` der Antwort von ``propose``, ``flliper.verdikt/1``) in der Form eines Trockenlaufs, damit der Laufbericht
+    auch ohne ``Neu prüfen`` sagt, was der Launcher zum Vorschlag gesagt hat.  Gelesen werden nur Code, Ebene und Text der Verdikte der Ebene Lauf/Absturz/Orakel;
+    die Forcebarkeit rechnet der Bericht aus dem Register neu (dem Browser wird sie nicht geglaubt).  ``None`` = kein gültiges Verdikt."""
+    if not isinstance(vd, dict) or vd.get("schema") != "flliper.verdikt/1" or not isinstance(vd.get("verdikte"), list):
+        return None
+    rej, seen = [], set()
+    for x in vd["verdikte"][:128]:
+        if not isinstance(x, dict) or x.get("ebene") not in ("lauf", "absturz", "orakel") or x.get("parent"):
+            continue
+        code = x.get("code")
+        if not isinstance(code, str) or not 0 < len(code) <= 40 or code in seen:
+            continue
+        seen.add(code)
+        q = {"code": code, "text": str(x.get("text") or x.get("grund") or "")[:2000]}
+        if x.get("klasse") == "nicht_forcebar":                    # nur zur Anzeige eines Codes ohne Registerzeile (W71-CENSUS, W64-DUAL-D): die Forcebarkeit bleibt "blockiert"
+            q["klass_label"] = "nicht forcebar"
+        if x.get("konsequenz"):
+            q["consequence"] = str(x["konsequenz"])[:400]
+        rej.append(q)
+    ausgang = str(vd.get("ausgang") or "")
+    orakel = vd.get("orakel") if isinstance(vd.get("orakel"), dict) else {}
+    laeufe = orakel.get("laeufe")
+    head = "Orakel-Lauf des Vorschlags%s: %s." % (" (Launcher-Trockenlauf, %s Lauf/Läufe)" % laeufe if isinstance(laeufe, int) else "", _AUSGANG_TEXT.get(ausgang, ausgang or "ohne Ausgang"))
+    return {"rejections": rej, "verdict": head, "quelle": "vorschlag",
+            "notes": ["Der Orakel-Lauf gilt für den Vorschlag, wie er war; Änderungen danach sind darin nicht geprüft (Neu prüfen fragt noch einmal)."]}
+
+
 def _issue_model(model, doc_rows) -> List[str]:
     """Block Modellprofil: die Werte des Schätzprofils ``flliper.model/1`` mit ihrer Quelle; ohne Profil nur, was das Serverprofil nennt.
     Der Pfad des Modells steht nie da, nur der Ordnername."""
@@ -361,9 +395,10 @@ def _issue_verdicts(dry, reg_rows: List[dict], line: str) -> List[str]:
                 continue
             seen.add(q["code"])
             r = reg.get(q["code"]) or {}
-            label, state, _via = force_verdict(r) if r else ("unbekannter Code: nicht als forcebar behandelt", "blockiert", None)
-            L.append("| `%s` | %s | %s | %s | %s |" % (_md(q["code"], 40), _md(r.get("klass_label") or r.get("klass") or "?", 60), _md("%s: %s" % (state, label), 160),
-                                                       _md(_clip_text(q["code"], q.get("text")), 300), _md(r.get("consequence") or "–", 240)))
+            label, state, _via = force_verdict(r) if r else (("nicht forcebar: bleibt auch mit Force bestehen (Code des Planer-Verdikts, nicht im Launcher-Register)"
+                                                              if q.get("klass_label") == "nicht forcebar" else "unbekannter Code: nicht als forcebar behandelt"), "blockiert", None)
+            L.append("| `%s` | %s | %s | %s | %s |" % (_md(q["code"], 40), _md(r.get("klass_label") or r.get("klass") or q.get("klass_label") or "?", 60), _md("%s: %s" % (state, label), 160),
+                                                       _md(_clip_text(q["code"], q.get("text")), 300), _md(r.get("consequence") or q.get("consequence") or "–", 240)))
     fh = force_hint(dry, reg_rows, line)
     L += ["", "Force: %s" % _md(fh["text"], 400)]
     if fh["show_line"]:
@@ -731,15 +766,19 @@ class ProfilEditor:
 
     # ------------------------------------------------------------------ Issue-Text "Laufbericht" (AP-I)
     def issue_report(self, doc: dict, dry=None, cards=None, model=None, hardware_md: str = "", versions: Optional[dict] = None,
-                     now: Optional[float] = None) -> dict:
+                     now: Optional[float] = None, vorschlag=None) -> dict:
         """Der Laufbericht als EIN Markdown-Block für ein GitHub-Issue: Hardwareprofil (Kurzform, ``hardware_md`` kommt aus ``hwprofil.issue_short``),
         Modellprofil, Betriebsform, Vorschlag + Übersteuerungen, Verdikte/Force, Versionen und der Platzhalter für Messergebnis und Boot-Log-Auszug.
         Nur Text; das Dashboard startet nichts.  ``dry`` = Antwort des letzten Trockenlaufs (oder ``None``), ``cards`` = die gewählten Karten
         ``[{card, pcie}]``, ``model`` = ein Modellprofil ``flliper.model/1`` (oder ``None``), ``versions`` = ``hwprofil.version_facts``.
-        Geheimnisse (nach Name und nach Wert) und Hostpfade sind entfernt (``redact``); Forcebarkeit wird aus dem Register NEU gelesen."""
+        Geheimnisse (nach Name und nach Wert) und Hostpfade sind entfernt (``redact``); Forcebarkeit wird aus dem Register NEU gelesen.
+        ``vorschlag`` = das ``verdikt`` der letzten Antwort von ``propose``: gibt es keinen Trockenlauf (``Neu prüfen``), nimmt der Block Verdikte/Force den
+        Orakel-Lauf des Vorschlags (``dry_from_vorschlag``); ein Trockenlauf ist jünger und geht vor."""
         pj, _ref = self.mods()
         if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
             raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+        if not (isinstance(dry, dict) and isinstance(dry.get("rejections"), list)):
+            dry = dry_from_vorschlag(vorschlag) or dry
         view = pj.view(doc, self.catalog()["entries"], None, self.specs())
         try:
             reg = self.register()
@@ -1170,6 +1209,18 @@ class ProfilEditor:
             return "flag:" + lab
         return None
 
+    @staticmethod
+    def argv_has(launch, flag: str, value: str) -> bool:
+        """Steht ``flag value`` im argv des Vorschlags (``launch = {argv, env}``): als zwei Tokens (``--pp-stage-ratio 31,17,16``) oder als ``--extra-p=--flag value`` /
+        ``--flag=value``?  Nur der Vergleich der Zeichenketten, keine Rechnung."""
+        argv = [str(t) for t in ((launch or {}).get("argv") or [])]
+        for i, t in enumerate(argv):
+            if t == flag and i + 1 < len(argv) and argv[i + 1] == value:
+                return True
+            if t.endswith("=" + flag + " " + value) or t == flag + "=" + value or t.endswith(" " + flag + " " + value):
+                return True
+        return False
+
     def _startprofil(self, base: dict, vorschlag: dict, basis_name: str) -> tuple:
         """Das Startprofil ``flliper.server/1``: das Basisprofil mit den Werten, die der Vorschlag ändert (Herkunft ``planer``).  Gibt
         ``(doc, keys, nicht_uebernommen)``: ``keys`` = Label -> Profilschlüssel der geänderten Zeilen."""
@@ -1332,6 +1383,17 @@ class ProfilEditor:
             wv = {"key": dkey, "label": w["key"], "wert": w.get("wert"), "alt": w.get("alt"), "zustand": w.get("zustand"), "herkunft": w.get("herkunft"),
                   "grund": w.get("grund"), "geaendert": bool(w.get("geaendert")), "in_argv": bool(w.get("in_argv")), "eintraege": w.get("eintraege"),
                   "verdikte": je_wert.get(w["key"], []), "kanten": kanten}
+            if dkey is None and str(w["key"]).endswith(" (Seed)"):
+                # der P-Schnitt-Seed ist keine Profilzeile: ``seed`` + der Wert, den das Profil unter diesem Namen schon hat (None = setzt es nicht), damit die
+                # Seite weder "nicht gesetzt" sagt, wo das Profil den Wert setzt, noch einen Wert als Änderung zählt, der nicht im argv steht
+                sname = str(w["key"])[: -len(" (Seed)")]
+                pw = next((r["value"] for r in pj.rows(doc, self.specs()) if r.get("name") == sname and r.get("value") not in (None, "")), None)    # das BASISprofil, nicht das Startprofil (der Vorschlag kann die Zeile entfernen)
+                wv["seed"] = True
+                wv["profil_wert"] = None if pw is None else str(pw)
+                # ``in_argv`` des Planers heisst "der Planer wendet den Seed an", nicht "der Wert steht im argv": im Dual (Profil-Modus) bleibt der Schnitt des Profils im
+                # argv, und der Seed (GEMM-Rate) ist nur die Rechnung dahinter.  Fuer die Seite zaehlt, was der Launcher wirklich bekommt.
+                wv["in_argv_planer"] = wv["in_argv"]
+                wv["in_argv"] = bool(wv["in_argv"]) and w.get("wert") is not None and self.argv_has(res.get("launch"), sname, str(w["wert"]))
             werte.append(wv)
             if row is not None:
                 row["vorschlag"] = {k: wv[k] for k in ("zustand", "herkunft", "grund", "verdikte", "kanten", "geaendert")}

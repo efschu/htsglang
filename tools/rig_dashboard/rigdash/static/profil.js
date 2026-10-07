@@ -65,9 +65,16 @@
   const doExport = () => run(async () => { st.exp = await api("export", { doc: st.doc, dry: st.dry }); });   // dry: letzter Trockenlauf (null = keiner): der Server baut daraus den Force-Hinweis
   // Issue-Text "Laufbericht" (AP-I): der Server baut den Markdown-Block aus Profil, letztem Trockenlauf, gewählten Karten und Modellprofil; er merkt sich,
   // wozu er gehört (doc.id, Trockenlauf, Modellprofil), damit die Seite einen veralteten Text kennzeichnet statt ihn still stehen zu lassen
-  const issueKey = () => JSON.stringify([st.doc ? st.doc.id : null, st.dry, st.cards, st.mprof ? st.mprof.path : null]);
+  // Orakel-Lauf des Vorschlags (Verdikt der letzten propose-Antwort): ohne "Neu prüfen" sagt der Bericht damit, was der Launcher zum Vorschlag gesagt hat
+  const propVerdikt = () => {
+    const v = st.prop && st.prop.verdikt;
+    if (!v) return null;
+    return { schema: v.schema, ausgang: v.ausgang, orakel: { laeufe: (v.orakel || {}).laeufe },
+             verdikte: (v.verdikte || []).map((x) => ({ code: x.code, ebene: x.ebene, parent: x.parent, text: x.text, grund: x.grund, klasse: x.klasse, konsequenz: x.konsequenz })) };
+  };
+  const issueKey = () => JSON.stringify([st.doc ? st.doc.id : null, st.dry, st.cards, st.mprof ? st.mprof.path : null, propVerdikt() ? propVerdikt().ausgang : null]);
   const doIssue = () => run(async () => {
-    const j = await api("issue", { doc: st.doc, dry: st.dry, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })), model: st.mprof ? st.mprof.profile : null });
+    const j = await api("issue", { doc: st.doc, dry: st.dry, vorschlag: propVerdikt(), cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })), model: st.mprof ? st.mprof.profile : null });
     st.issue = { text: j.text, blocks: j.blocks || [], filename: j.filename || "laufbericht.md", key: issueKey() };
   });
   const doDry = () => run(async () => { st.dry = await api("dry", { doc: st.doc, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })) }); st.vsrc = "dry"; });
@@ -133,7 +140,7 @@
   function drawCardPicker(withDry) {
     const L = st.list;
     const rows = st.cards.map((k, i) => `<div class="pf-card" data-i="${i}"><b>Karte ${i + 1}</b>
-      <select data-cf="card">${cardOpts(k.card)}</select>
+      <select data-cf="card" aria-label="Karte ${i + 1} wählen">${cardOpts(k.card)}</select>
       <button type="button" data-act="cdel" title="Karte entfernen" aria-label="Karte ${i + 1} entfernen">&times;</button></div>`).join("");
     return `<div class="pf-cards">${rows}</div>
       ${drawMoreCards()}

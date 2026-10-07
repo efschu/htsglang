@@ -84,7 +84,10 @@
   function verdiktOf(r, ctx) {
     const src = verdictItems(r, ctx);
     if (!src) return { id: "keins", label: "nicht geprüft", tip: "Noch kein Vorschlag und kein Trockenlauf: das Orakel hat diesen Wert nicht beurteilt.", items: [] };
-    if (r.origin === "nutzer") return { id: "alt", label: "ungeprüft seit Ihrer Änderung", tip: "Das Urteil (" + src.src + ") gilt für den Wert davor. „Neu prüfen“ fragt das Orakel noch einmal.", items: src.list };
+    /* "ungeprüft seit Ihrer Änderung" gilt nur bis zum nächsten Lauf: ein Trockenlauf ("Neu prüfen") nach der Änderung setzt den Chip aus dem Verdikt.
+       Jede Änderung leert ctx.dry und setzt vsrc auf "prop" (profil.js doEdit), ein Trockenlauf-Ergebnis in ctx ist also immer jünger als die Änderung. */
+    const frisch = ctx.vsrc === "dry" && !!ctx.dry;
+    if (r.origin === "nutzer" && !frisch) return { id: "alt", label: "ungeprüft seit Ihrer Änderung", tip: "Das Urteil (" + src.src + ") gilt für den Wert davor. „Neu prüfen“ fragt das Orakel noch einmal.", items: src.list };
     const L = src.list;
     const codes = [...new Set(L.map((v) => v.code))];
     const tip = L.length ? L.map((v) => v.code + ": " + (v.grund || v.titel || "") + (v.konsequenz ? " Folge: " + v.konsequenz : "")).join("\n") : "Das Orakel (" + src.src + ") hat nichts einzuwenden.";
@@ -316,13 +319,23 @@
   function renderProposal(p) {
     if (!p) return "";
     const werte = p.werte || [];
-    const nCh = werte.filter((w) => w.geaendert).length, nUnb = werte.filter((w) => w.zustand === "unbelegt").length;
+    // "geändert" = ein Wert, der im argv des Vorschlags steht (oder aus dem Profil entfernt wurde) und vom Profil abweicht.  Der P-Schnitt-Seed ist keine
+    // Profilzeile: steht er nicht im argv (der Launcher löst den Schnitt selbst) oder hat das Profil denselben Wert schon, ist er eine Rechnung des Planers, keine Änderung.
+    const istAenderung = (w) => !!w.geaendert && (w.in_argv !== false || w.wert == null) && !(w.seed && w.profil_wert != null && w.profil_wert === w.wert);
+    const nCh = werte.filter(istAenderung).length, nUnb = werte.filter((w) => w.zustand === "unbelegt").length;
+    const nurRechnung = werte.filter((w) => w.geaendert && !istAenderung(w) && w.wert != null).map((w) => {
+      const wo = w.seed && w.profil_wert != null && w.profil_wert === w.wert ? "Das Profil setzt denselben Wert schon."
+        : w.seed && w.profil_wert != null ? "Steht nicht im argv: dort bleibt der Wert des Profils (" + clip(w.profil_wert, 60) + "); dieser Wert ist die Rechnung des Planers."
+        : "Steht nicht im argv: der Launcher löst den Wert selbst.";
+      return `<li><span class="mono">${esc(w.label)}</span> <b class="mono">${esc(clip(w.wert, 80))}</b> <span class="muted">${esc(wo)}</span></li>`;
+    }).join("");
     const vd = p.verdikt || {}, a = AUSGANG[vd.ausgang] || ["", vd.ausgang || ""];
     const v = p.vorschlag || {}, fit = v.fit;
     const cards = (v.cards || []).map((c, i) => `<li><span class="mono">Rang ${i}</span> ${esc(shortName(c.name))} <span class="muted">${esc(c.total_mib)} MiB${c.tflops_src ? ", Rate: " + esc(c.tflops_src) : ""}</span></li>`).join("");
-    const changed = werte.filter((w) => w.geaendert).map((w) => {
+    const changed = werte.filter(istAenderung).map((w) => {
       const vs = (w.verdikte || []).map((x) => x.code);
-      return `<li><span class="mono">${esc(w.label)}</span> <span class="muted">${esc(w.alt == null ? "nicht gesetzt" : clip(w.alt, 60))}</span> → <b class="mono">${esc(w.wert == null ? "entfernt" : clip(w.wert, 80))}</b>
+      const alt = w.alt != null ? w.alt : (w.seed && w.profil_wert != null ? w.profil_wert : null);
+      return `<li><span class="mono">${esc(w.label)}</span> <span class="muted">${esc(alt == null ? "nicht gesetzt" : clip(alt, 60))}</span> → <b class="mono">${esc(w.wert == null ? "entfernt" : clip(w.wert, 80))}</b>
         <span class="pfx-zchip pfx-z-${w.zustand === "unbelegt" ? "unbelegt" : "vorgeschlagen"}" title="${esc([w.herkunft, w.grund].filter(Boolean).join(" "))}">${esc(w.zustand || "vorgeschlagen")}</span>${vs.length ? ` <span class="pfx-vchip pfx-v-hinweis">${esc(vs.join(", "))}</span>` : ""}</li>`;
     }).join("");
     const runV = (vd.verdikte || []).filter((x) => x.ebene === "lauf" || x.ebene === "absturz" || x.ebene === "orakel" || x.ebene === "blocker" || x.ebene === "planer").map((x) =>
@@ -336,6 +349,7 @@
       ${planerV ? `<div class="pfx-runv"><b>Passung als Planer-Rechnung</b> <span class="muted">(eine Rechnung des Planers aus Modellgrößen, kein Launcher-Lauf und keine Messung)</span><ul class="pfx-vd">${planerV}</ul></div>` : ""}
       ${runV ? `<div class="pfx-runv"><b>Was der Launcher zum Lauf sagt</b> <span class="muted">(gilt für den ganzen Start, nicht für einen einzelnen Wert; nie eine Sperre in dieser Seite)</span><ul class="pfx-vd">${runV}</ul></div>` : ""}
       ${changed ? `<details class="pf-fold" data-fold="propchg" open><summary>Was der Vorschlag geändert hat (${nCh})</summary><ul class="pfx-chg">${changed}</ul></details>` : ""}
+      ${nurRechnung ? `<details class="pf-fold" data-fold="proprech"><summary>Rechnung des Planers ohne Änderung am Profil</summary><ul class="pfx-chg">${nurRechnung}</ul></details>` : ""}
       ${cards ? `<details class="pf-fold" data-fold="propcards"><summary>Rangfolge der Karten (Rang 0 = Host)</summary><ul class="pfx-cards">${cards}</ul></details>` : ""}
       ${hints.length ? `<details class="pf-fold" data-fold="prophints"><summary>${hints.length} Hinweis${hints.length === 1 ? "" : "e"} des Planers</summary><ul class="pf-notes">${hints.map((h) => `<li>${esc(h)}</li>`).join("")}</ul></details>` : ""}
       <div class="muted pf-note">Die Werte unten tragen ihren Zustand und ihr Urteil. Ein Urteil ist ein Hinweis, keine Sperre: Sie können jeden Wert setzen; was Force braucht, steht im Export.</div></div>`;

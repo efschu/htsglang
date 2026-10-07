@@ -96,6 +96,35 @@ OWN_CODES: Dict[str, Dict[str, Any]] = {
                       "konsequenz": "Der Trockenlauf kam nicht zustande (Harness, Modellpfad, Kindprozess): es gibt KEIN Urteil, weder 'geht' noch 'verweigert'."},
 }
 
+#: launcher codes WITHOUT a row in ``refusals.REGISTER`` (R1: the launcher and the register are not changed from here).  Without this table the
+#: dashboard showed them as ``LAUNCHER-UNKLASSIFIZIERT``.  Key = the launcher W-code; ``code`` is the name the verdict carries; the class is
+#: ``nicht_forcebar`` and ``forcebar`` is False for both: neither is passed by ``refuse_value`` (the launcher raises them as plain refusals),
+#: and Force changes neither (a missing census / a missing measurement is not a number Force could start with).  ``grund`` is the launcher's
+#: own wording with the place it is printed (file:line of THIS tree, pinned by a test against the source text).
+SUPPLEMENT_CODES: Dict[str, Dict[str, Any]] = {
+    "W71": {"code": "W71-CENSUS", "klass": "nicht_forcebar", "forcebar": False,
+            "titel": "W71 UUID-gebundener Exchange-Census: Residenz-Rechnung nicht belegt",
+            "quelle": "weg2/xchg_residency.py:711-723 (refusal_head), :313-387 (load_census)",
+            "klasse_grund": "Der Launcher verweigert W71 als Weg2XchgResidencyUnarmable ohne Force-Pfad: die Rechnung braucht einen gemessenen Census "
+                            "dieser Karten (je UUID), und ohne ihn gibt es keinen Wert, mit dem ein erzwungener Start laufen koennte.",
+            "grund": "W71 Weg2XchgResidencyUnarmable: the exchange's predicted VRAM residency does not fit (or the census file is missing/unreadable); "
+                     "there is no fallback that makes an over-committed card fit: the boot REFUSES by name and exits 2, BEFORE either group starts. "
+                     "Run --weg2-weight-source ring, or re-cut the schedule. [Launcher-Text xchg_residency.py:714-723]",
+            "konsequenz": "Bleibt auch mit Force bestehen. Der Census ist je UUID gemessen und an die Karten gebunden; fremde Karten haben keinen. "
+                          "Ausweg laut Launcher: --weg2-weight-source ring oder den Schnitt neu legen."},
+    "W64": {"code": "W64-DUAL-D", "klass": "nicht_forcebar", "forcebar": False,
+            "titel": "W64 Dual-D: Betriebspunkt ohne gemessenes Dual-D-Log nicht belegt",
+            "quelle": "launcher.py:16986-16992 (Weg2TpOperatingPointInfeasible), :17242-17243 (kein gemessenes Dual-D-Log)",
+            "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells (PerfCostModel.predict_capacity feasible=False) ohne Sicherheitsfaktor; "
+                            "im Dual hebt nur ein gemessenes Dual-D-Log der Gewichte die Ablehnung auf (dual_w64.find_dual_d_measurement), nicht Force.",
+            "grund": "W64 Weg2TpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
+                     "plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank. Refused. This is the model's own verdict, "
+                     "not a margin chosen here. W64-DUAL: no measured dual-share D log of the model with these weights; the model verdict stands. "
+                     "[Launcher-Text launcher.py:16986-16992, :17242-17243]",
+            "konsequenz": "Bleibt auch mit Force bestehen. Aufgehoben wird es nur durch ein gemessenes Dual-D-Log dieser Gewichte (Evidence-Verzeichnis); "
+                          "ohne Messung gilt das Urteil des Modells."},
+}
+
 #: launcher exception CLASS name -> register code (the class names of ``launcher.py`` / ``weg2/__init__``); a name not here is judged by
 #: its W-code or stays ``LAUNCHER-UNKLASSIFIZIERT``
 _CLASS_CODE = {"Weg2PPCutRefused": "PP-CUT", "Weg2DepthUnfunded": "PP-CUT", "Weg2DepthGapped": "PP-CUT"}
@@ -210,6 +239,18 @@ def verdikt(code: str, *, ebene: str = "lauf", text: str = "", grund: Optional[s
     class of its parent and its OWN words; a code that is no refusal (``FIT``, ``HW-BORROWED`` ...) has ``forcebar: None``.  ``force_state``
     is derived from the register unless the caller gives it (``geht`` / ``hinweis`` for what is no refusal, or a run-specific state)."""
     reg = register_rows()
+    supp = next((x for x in SUPPLEMENT_CODES.values() if x["code"] == code), None)
+    if supp is not None and code not in reg:
+        out = {"code": code, "ebene": ebene, "titel": supp["titel"], "forcebar": False, "force_state": BLOCKED, "force_via": None,
+               "klasse": supp["klass"], "klasse_grund": supp["klasse_grund"], "wired_at": None, "force_scope": None,
+               "konsequenz": konsequenz if konsequenz is not None else supp["konsequenz"],
+               "grund": _clip(grund if grund is not None else text) or _clip(supp["grund"]), "text": str(text or ""), "werte": list(werte),
+               "quelle": supp["quelle"], "ergaenzung": True}
+        if force_state is not None:
+            out["force_state"] = force_state
+        if extra:
+            out.update(extra)
+        return out
     own = OWN_CODES.get(code) or {}
     parent = parent or own.get("parent")
     row = reg.get(code) or (reg.get(parent) if parent else None)
@@ -277,6 +318,8 @@ def classify_exception(exc_type: Optional[str], exc_msg: str, exc_mro: Optional[
         return {"kind": "ablehnung", "code": _CLASS_CODE[exc_type], "launcher_code": wcode}
     if wcode in _W_CODE:
         return {"kind": "ablehnung", "code": _W_CODE[wcode], "launcher_code": wcode}
+    if wcode in SUPPLEMENT_CODES:
+        return {"kind": "ablehnung", "code": SUPPLEMENT_CODES[wcode]["code"], "launcher_code": wcode}
     return {"kind": "ablehnung", "code": "LAUNCHER-UNKLASSIFIZIERT", "launcher_code": wcode}
 
 

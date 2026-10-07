@@ -856,7 +856,7 @@ class UiJs(unittest.TestCase):
         self.assertTrue(o["button"])
         self.assertTrue(o["noTextYet"])
         self.assertEqual(o["issueCalls"], 1)
-        self.assertEqual(set(o["body"]), {"doc", "dry", "cards", "model"})
+        self.assertEqual(set(o["body"]), {"doc", "dry", "cards", "model", "vorschlag"})
         self.assertEqual(o["body"]["doc"]["name"], "p")
         self.assertIsNone(o["body"]["dry"])                                  # noch kein Trockenlauf
         self.assertEqual(o["body"]["cards"], [{"card": "a", "pcie": {"gen": 4, "lanes": 8}}])

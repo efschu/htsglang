@@ -1,0 +1,249 @@
+"""Nacharbeit nach der Abnahme AP-J (done/planer-abnahme-1006.md, Abschnitt "Neu aus AP-J"): fuenf der sechs Befunde im Dashboard (der sechste, W71/W64 im
+Verdikt-Register, steht in test/registered/unit/weg2/test_planer_nacharbeit_1006.py).
+
+  F1  Verdikt-Chip: nach "Neu pruefen" steht der Chip eines uebersteuerten Werts auf dem Urteil des Trockenlaufs; "ungeprueft seit Ihrer Aenderung" nur bis zum naechsten Lauf.
+  F2  Seed-Zeile ``--pp-stage-ratio (Seed)``: nie "nicht gesetzt", wo das Profil den Wert setzt; als Aenderung zaehlt nur, was im argv steht.
+  F3  Laufbericht: nimmt den Orakel-Lauf des Vorschlags auf, wenn es keinen Trockenlauf gibt; ein Trockenlauf geht vor.
+  F4  Hardware-Issue-Text: die UUID steht nie drin (Tabelle und Erklaertext sagen dasselbe).
+  F5  Kartenauswahl im synthetischen Inventar hat ein aria-label.
+"""
+
+import json
+import os
+import shutil
+import re
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+sys.path.insert(0, HERE)
+
+from rigdash import hwprofil  # noqa: E402
+from rigdash import profil as P  # noqa: E402
+from test_profil_issue_laufbericht_1006 import Base, RIG  # noqa: E402
+from test_profil_planer_aph1_1006 import NODE, STATIC, run_node  # noqa: E402
+
+
+@unittest.skipUnless(NODE, "node fehlt")
+class F1ChipNachNeuPruefen(unittest.TestCase):
+    BODY = """
+const V = (code, o) => Object.assign({ code, ebene: "lauf", forcebar: true, force_state: "force", grund: code + " grund", konsequenz: "k", werte: ["--pp-stage-ratio"] }, o || {});
+const nutzer = base({ origin: "nutzer", value: "1,2,3" });
+const W = { key: "flag:--pp-stage-ratio", wert: "9,9,9", zustand: "vorgeschlagen", geaendert: true, verdikte: [] };
+// vor dem Lauf: Vorschlag vorhanden, Wert uebersteuert, kein Trockenlauf seit der Aenderung
+out.vor = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "prop", dry: null })).id;
+// nach "Neu pruefen" (profil.js doDry: st.dry gesetzt, vsrc "dry"): das Urteil des Trockenlaufs
+out.nachForce = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { verdikte: [V("W40")] } })).id;
+out.nachGeht = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { verdikte: [V("W77", { werte: ["--anderer"] })] } })).id;
+out.nachVerweigert = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { verdikte: [V("X", { forcebar: false, force_state: "blockiert" })] } })).id;
+// ohne Vorschlag, nur Trockenlauf
+out.nurDry = PX.verdiktOf(nutzer, ctx({ prop: null, vsrc: "dry", dry: { verdikte: [] } })).id;
+// jede neue Aenderung leert den Trockenlauf (doEdit: st.dry = null, vsrc "prop"): wieder "ungeprueft seit Ihrer Aenderung"
+out.nachEdit = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "prop", dry: null })).label;
+out.html = PX.renderRow(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { verdikte: [V("W40")] } }));
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.o = run_node(cls.BODY)
+
+    def test_before_the_run_the_chip_says_unchecked_since_your_change(self):
+        self.assertEqual(self.o["vor"], "alt")
+        self.assertEqual(self.o["nachEdit"], "ungeprüft seit Ihrer Änderung")
+
+    def test_after_recheck_the_chip_is_the_verdict_of_the_dry_run(self):
+        self.assertEqual((self.o["nachForce"], self.o["nachGeht"], self.o["nachVerweigert"], self.o["nurDry"]), ("force", "geht", "verweigert", "geht"))
+
+    def test_the_row_after_recheck_shows_the_verdict_and_stays_overridden(self):
+        h = self.o["html"]
+        self.assertIn("pfx-v-force", h)
+        self.assertNotIn("pfx-v-alt", h)
+        self.assertIn("pfx-z-uebersteuert", h)                 # der Zustand "von Ihnen uebersteuert" bleibt: er sagt, wer den Wert gesetzt hat
+
+
+@unittest.skipUnless(NODE, "node fehlt")
+class F2SeedZeile(unittest.TestCase):
+    BODY = """
+const w = (o) => Object.assign({ key: null, label: "--pp-stage-ratio (Seed)", alt: null, wert: "31,17,16", zustand: "unbelegt", herkunft: "H", grund: "G", geaendert: true, in_argv: true, verdikte: [], seed: true, profil_wert: null }, o || {});
+const p = (werte) => ({ n: 3, form: "dual", werte, verdikt: { ausgang: "geht", verdikte: [] }, vorschlag: {} });
+const real = { key: "flag:--p-bs", label: "--p-bs", alt: "1", wert: "2", zustand: "vorgeschlagen", herkunft: "H", grund: "G", geaendert: true, in_argv: true, verdikte: [] };
+const removed = { key: "flag:--x", label: "--x", alt: "5", wert: null, zustand: "unbelegt", herkunft: "H", grund: "entfernt", geaendert: true, in_argv: false, verdikte: [] };
+// Dual: das Profil setzt 31,17,16 schon (Referenz-Dual): keine Aenderung, kein "nicht gesetzt"
+out.dual = PX.renderProposal(p([w({ profil_wert: "31,17,16" })]));
+// Flip: der Seed steht nicht im argv: keine Aenderung
+out.flip = PX.renderProposal(p([w({ in_argv: false, geaendert: true })]));
+// Seed im argv, Profil hat den Wert nicht: eine Aenderung, "nicht gesetzt" ist hier wahr
+out.neu = PX.renderProposal(p([w()]));
+// Seed im argv, Profil hat einen anderen Wert: der Profilwert steht als alt
+out.anders = PX.renderProposal(p([w({ profil_wert: "30,18,16" })]));
+// ein echter Wert + ein entfernter Wert (in_argv false, wert null) zaehlen weiter
+out.mix = PX.renderProposal(p([real, removed, w({ in_argv: false })]));
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.o = run_node(cls.BODY)
+
+    @staticmethod
+    def _n(h):
+        return int(re.search(r"(\d+) Werte geändert", h).group(1))
+
+    def test_dual_profile_value_equal_is_no_change_and_never_says_not_set(self):
+        h = self.o["dual"]
+        self.assertEqual(self._n(h), 0)
+        self.assertNotIn("nicht gesetzt", h)
+        self.assertNotIn("Was der Vorschlag geändert hat", h)
+        self.assertIn("Das Profil setzt denselben Wert schon", h)
+
+    def test_flip_seed_outside_argv_is_not_counted(self):
+        h = self.o["flip"]
+        self.assertEqual(self._n(h), 0)
+        self.assertIn("Steht nicht im argv", h)
+        self.assertNotIn("Was der Vorschlag geändert hat", h)
+
+    def test_seed_in_argv_and_new_is_a_change(self):
+        h = self.o["neu"]
+        self.assertEqual(self._n(h), 1)
+        self.assertIn("nicht gesetzt", h)
+
+    def test_seed_in_argv_shows_the_profile_value_as_the_old_one(self):
+        h = self.o["anders"]
+        self.assertEqual(self._n(h), 1)
+        self.assertIn("30,18,16", h)
+        self.assertNotIn("nicht gesetzt", h)
+
+    def test_real_and_removed_values_still_count(self):
+        self.assertEqual(self._n(self.o["mix"]), 2)
+
+
+class F2Endpoint(unittest.TestCase):
+    """Der Server nennt ``seed``, ``profil_wert`` (Wert des BASISprofils) und ein ``in_argv``, das sagt, was der Launcher wirklich bekommt."""
+
+    def test_argv_has(self):
+        has = P.ProfilEditor.argv_has
+        L = {"argv": ["--p-bs", "2", "--pp-stage-ratio", "31,17,16", "--extra-p=--pp-attn-stage-ratio 9,3,3"]}
+        self.assertTrue(has(L, "--pp-stage-ratio", "31,17,16"))
+        self.assertFalse(has(L, "--pp-stage-ratio", "42,11,11"))
+        self.assertTrue(has(L, "--pp-attn-stage-ratio", "9,3,3"))                 # als --extra-p=...
+        self.assertTrue(has({"argv": ["--pp-stage-ratio=1,2"]}, "--pp-stage-ratio", "1,2"))
+        self.assertFalse(has(None, "--pp-stage-ratio", "1"))
+        self.assertFalse(has({"argv": ["--pp-stage-ratio"]}, "--pp-stage-ratio", "1"))
+
+    def _propose(self, seed_wert, argv):
+        tmp = tempfile.mkdtemp(prefix="nach1006_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        from test_profil_orakel_apd_1006 import FakeOracle, _doc, _hw_profile, _rows, editor
+        werte = [{"key": "--pp-stage-ratio (Seed)", "group": "-", "policy": "cut_seed", "alt": None, "wert": seed_wert, "eintraege": 3, "zustand": "unbelegt",
+                  "herkunft": "H", "grund": "G", "in_argv": True, "geaendert": True}]
+        answer = {"vorschlag": {"schema": "flliper.propose-a/1", "form": "dual", "n": 3, "werte": werte, "ziele": {}, "cards": [], "inventory": {}, "seeds": {},
+                                "fit": {"level": "ja"}, "unbelegt": [], "hinweise": [], "blocker": [], "vektorlaengen": {}, "vektoren_ok": True, "vektoren_falsch": {}, "basis": "demo.env"},
+                  "verdikt": _doc([], n=3, ausgang="geht"), "je_wert": {}, "launch": {"argv": argv, "env": {}}}
+        ed = editor(tmp, oracle=FakeOracle(propose=answer), hardware=lambda: {"ok": True, "profile": _hw_profile(_rows(3))})
+        return ed.propose({"basis": {"kind": "release", "name": "demo"}, "form": "dual", "inventar": "rig"})
+
+    def test_seed_that_the_launcher_does_not_get_is_not_in_argv_and_names_the_profile_value(self):
+        # demo.env setzt --pp-stage-ratio 29,11,8; der argv des Vorschlags traegt weiter diesen Wert, nicht den Seed (Profil-Modus des Dual)
+        r = self._propose("42,11,11", ["--pp-stage-ratio", "29,11,8"])
+        w = [x for x in r["werte"] if x.get("seed")][0]
+        self.assertEqual((w["key"], w["wert"], w["profil_wert"]), (None, "42,11,11", "29,11,8"))
+        self.assertIs(w["in_argv"], False)
+        self.assertIs(w["in_argv_planer"], True)
+
+    def test_seed_that_is_in_the_argv_stays_in_argv(self):
+        r = self._propose("42,11,11", ["--pp-stage-ratio", "42,11,11"])
+        w = [x for x in r["werte"] if x.get("seed")][0]
+        self.assertIs(w["in_argv"], True)
+        self.assertEqual(w["profil_wert"], "29,11,8")
+
+
+class F3Laufbericht(Base):
+    VD = {"schema": "flliper.verdikt/1", "ausgang": "geht_mit_force", "orakel": {"laeufe": 2},
+          "verdikte": [{"code": "HW-COUNT", "ebene": "lauf", "text": "HW-COUNT: 2 cards would be P = TP1 x PP2 ...", "grund": "g"},
+                       {"code": "METAL-UNPROVEN", "ebene": "blocker", "parent": "HW-COUNT", "text": "no release boot", "grund": "g"},
+                       {"code": "W64", "ebene": "lauf", "text": "W64 Weg2TpOperatingPointInfeasible: x", "grund": "g"},
+                       {"code": "FIT", "ebene": "fit", "text": "hw_fit: ja", "grund": "g"}]}
+
+    def test_without_a_dry_run_the_report_takes_the_oracle_run_of_the_proposal(self):
+        t = self.report(dry=None, vorschlag=self.VD)["text"]
+        self.assertNotIn("Kein Trockenlauf gefahren", t)
+        self.assertIn("Orakel-Lauf des Vorschlags (Launcher-Trockenlauf, 2 Lauf/Läufe): geht nur mit Force durch.", t)
+        self.assertIn("`HW-COUNT`", t)
+        self.assertIn("`W64`", t)
+        self.assertNotIn("`METAL-UNPROVEN`", t)             # Blocker und Fit-Verdikte sind keine Ablehnung des Laufs
+        self.assertNotIn("`FIT`", t)
+        self.assertIn("Änderungen danach sind darin nicht geprüft", t)
+
+    def test_a_code_without_register_row_shows_its_class_and_consequence_but_stays_blocked(self):
+        vd = {"schema": "flliper.verdikt/1", "ausgang": "verweigert", "orakel": {"laeufe": 2},
+              "verdikte": [{"code": "W64-DUAL-D", "ebene": "lauf", "text": "W64 Weg2TpOperatingPointInfeasible: x", "klasse": "nicht_forcebar",
+                            "konsequenz": "Bleibt auch mit Force bestehen.", "forcebar": True, "force_state": "force"}]}       # der Browser behauptet forcebar: nicht geglaubt
+        t = self.report(dry=None, vorschlag=vd)["text"]
+        row = [x for x in t.split("\n") if x.startswith("| `W64-DUAL-D`")][0]
+        self.assertIn("| nicht forcebar | blockiert:", row)
+        self.assertIn("Bleibt auch mit Force bestehen.", row)
+        self.assertIn("Auch mit Force bestehen bleiben: `W64-DUAL-D`", t)
+        self.assertNotIn("FLLIPER_FORCE=1", t.split("### Versionen")[0].split("### Verdikte und Force")[1])
+
+    def test_without_both_it_still_says_no_dry_run(self):
+        self.assertIn("Kein Trockenlauf gefahren", self.report(dry=None)["text"])
+        self.assertIn("Kein Trockenlauf gefahren", self.report(dry=None, vorschlag={"schema": "x"})["text"])
+
+    def test_a_dry_run_is_younger_and_wins(self):
+        dry = {"rejections": [], "verdict": "Der Planer lehnt nichts ab.", "cards": [{"label": "RTX 5090"}]}
+        t = self.report(dry=dry, vorschlag=self.VD)["text"]
+        self.assertIn("Trockenlauf: Der Planer lehnt nichts ab.", t)
+        self.assertNotIn("Orakel-Lauf des Vorschlags", t)
+
+    def test_forceability_is_read_from_the_register_not_from_the_browser(self):
+        vd = json.loads(json.dumps(self.VD))
+        vd["verdikte"][0].update(forcebar=False, force_state="blockiert")
+        a = self.report(dry=None, vorschlag=vd)["text"]
+        b = self.report(dry=None, vorschlag=self.VD)["text"]
+        self.assertEqual(a, b)
+
+    def test_dry_from_vorschlag_is_none_for_garbage(self):
+        for bad in (None, {}, [], "x", {"schema": "flliper.verdikt/1"}, {"schema": "flliper.verdikt/1", "verdikte": "x"}):
+            self.assertIsNone(P.dry_from_vorschlag(bad))
+
+    def test_the_page_sends_the_proposal_verdict_with_the_issue_request(self):
+        with open(os.path.join(STATIC, "profil.js"), encoding="utf-8") as fh:
+            js = fh.read()
+        self.assertIn("vorschlag: propVerdikt()", js)
+        with open(os.path.join(os.path.dirname(HERE), "server.py"), encoding="utf-8") as fh:
+            self.assertIn('vorschlag=body.get("vorschlag")', fh.read())
+
+
+class F4HardwareIssueText(unittest.TestCase):
+    DOC = {"schema": "flliper.hardware/1", "cards": [
+        {"ord": 0, "nvml_index": 1, "name": "NVIDIA GeForce RTX 5090", "uuid": "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "pci_bus_id": "00000000:01:00.0",
+         "vram_total_mib": {"v": 32607, "src": "NVML"}},
+        {"ord": 1, "nvml_index": 0, "name": "NVIDIA GeForce RTX 3080", "pci_bus_id": "00000000:02:00.0", "vram_total_mib": {"v": 20480, "src": "NVML"}}]}
+
+    def test_the_uuid_is_never_in_the_text_even_when_it_does_not_look_like_a_secret(self):
+        t = hwprofil.issue_text(self.DOC)
+        self.assertNotIn("GPU-aaaaaaaa", t)
+        row = [x for x in t.split("\n") if "RTX 5090" in x and "00000000:01:00.0" in x][0]
+        self.assertTrue(row.rstrip().endswith("| 00000000:01:00.0 | <entfernt> |"), row)
+        self.assertIn("00000000:02:00.0 | unbelegt |", t)         # keine UUID gemeldet: "unbelegt", nicht "entfernt"
+
+    def test_the_explanation_says_what_the_table_does(self):
+        with open(os.path.join(STATIC, "hwprofil.js"), encoding="utf-8") as fh:
+            js = fh.read()
+        self.assertNotIn("UUID und PCI-Bus der Karten stehen drin", js)
+        self.assertIn("UUID der Karten ist immer als", js)
+        self.assertIn("PCI-Bus stehen drin", js)
+
+
+class F5AriaLabel(unittest.TestCase):
+    def test_card_select_of_the_synthetic_inventory_has_a_label(self):
+        with open(os.path.join(STATIC, "profil.js"), encoding="utf-8") as fh:
+            js = fh.read()
+        sels = re.findall(r"<select data-cf=\"card\"[^>]*>", js)
+        self.assertEqual(len(sels), 1)
+        self.assertIn('aria-label="Karte ${i + 1} wählen"', sels[0])
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
