@@ -1,0 +1,37 @@
+{
+ "checkpoints": {
+  "Qwen3.8-27B-DFlash2-W8-lued": {
+   "files_sha256_on_host": {
+    "config.json": "1c63a70cd7fa0e8be7276b3597e464ab9a0e609b70611354e9fb76e76b2e42d6",
+    "model.safetensors.index.json": "1bc0fa7ef5c8078dd427dd735a6912d4755bc49a605ba18a1a85e751619d4cc0"
+   },
+   "host": "proxmox:/spinning/subvol-999-disk-0/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "role": "PROFILE_DRAFT (27b-base.env:45)"
+  },
+  "Qwen3.8-27B-INT8-gdncov-vocabembed": {
+   "files_sha256_on_host": {
+    "config.json": "02adafaa809837662bf120b90aa4dee2985f6070930905dc5f8d6e672c66c4ff",
+    "model.safetensors.index.json": "8e9b9c2b2867411c3845fca6cff3772ce2b04a0c54e56f42a1cf4d8240288b4d"
+   },
+   "host": "proxmox:/spinning/subvol-999-disk-0/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "role": "PROFILE_MODEL (27b-base.env:44)"
+  }
+ },
+ "date": "2026-10-06",
+ "golden": "plan_27b_flip_n3.txt",
+ "note": "Header snapshots of the RELEASE checkpoints (not the sibling gdncov/DFlash2 the dev box holds): read-only ssh to the Proxmox host, safetensors header bytes 8+N per file, small files and index verbatim; no weight byte was read. Measured: index total_size 29548245472 (release) vs 30819147232 (sibling Qwen3.8-27B-INT8-gdncov); draft model.safetensors 2172742656 vs 3848817896 (sibling Qwen3.8-27B-DFlash2).",
+ "profile": {
+  "file": "profiles/27b-base.env",
+  "live": "/spinning/gpu-arb/docker/profiles_release/27b-base.env (identical sha256 on 2026-10-06)",
+  "sha256": "7f48188299747a86c76b7eb591b57de07cd4897cd65a058fa9859295ca6026b9"
+ },
+ "profile_inputs": {
+  "census": {
+   "file": "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json",
+   "sha256": "1a8f1c51e93182b83b45e73192f78b69ba921f80beb6098646621fbb6d3ac953"
+  }
+ },
+ "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
+ "schema": "planer-ap0-golden-provenance/1",
+ "tree": "173161c595 + desk/planer-ap0-1006"
+}

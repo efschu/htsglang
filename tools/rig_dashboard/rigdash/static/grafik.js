@@ -90,6 +90,10 @@
   const tile = (h, body, sub, src) => `<div class="vtile"><div class="vt-h">${esc(h)}</div>${body}<div class="vt-f"><span class="vt-sub" title="${esc(String(sub).replace(/<[^>]+>/g, ""))}">${sub}</span>${srcBadge(src)}</div></div>`;
   const big = (v, unit) => `<div class="vt-big num">${v}${unit && v !== "–" ? `<small>${unit}</small>` : ""}</div>`;
 
+  // die EINE Definition (flipzeit.DEFINITION; tests/test_flipzeit_1006.py prüft die Gleichheit mit index.html)
+  const FLIP_DEF = {"P>D": "letzter P-Chunk fertig → erstes Decode-Token erzeugt",
+    "D>P": "letztes Decode-Token erzeugt → erster Prefill-Chunk beginnt zu rechnen (erster Forward auf PP0)"};
+
   function tiles(d) {
     const t = d.tiles || {}, s = d.src || {};
     const over = d.zoom ? "im Zoom-Bereich" : `über ${d.range}`;
@@ -106,11 +110,13 @@
       tile("Prefix-Cache-Treffer", gauge(hitPct == null ? null : hitPct / 100, hitPct == null ? "–" : fmtN(hitPct, 1) + " %", C.s1),
         `aus Cache / (Cache + neu gerechnet); Übergabe P→D nie Cache (${t.handoff_share == null ? "–" : fmtN(100 * t.handoff_share, 1) + " %"} der Input-Tokens) · ${tierTxt}`, s.cache),
       ...["P>D", "D>P"].map((dir) => {
-        const f = (t.flip || {})[dir] || {}, sx = (v) => v == null ? "–" : fmtN(v / 1000, 2);
+        // Nutzer 06.10.: dieselbe Berechnung wie die Überblick-Kachel (flipzeit.tile über die Marken flip_t2t); nur das
+        // Fenster ist ein anderes und steht dabei
+        const fw = t.flip || {}, f = fw[dir] || {}, sx = (v) => v == null ? "–" : fmtN(v / 1000, 2);
         const age = f.last_t ? Math.max(0, d.now - f.last_t) : null;
         return tile("Flipzeit " + dir.replace(">", "→"), big(sx(f.last_ms), "s"),
-          `zuletzt${age != null ? " vor " + fmtN(age / 60, 0) + " min" : ""} · p50 ${sx(f.p50_ms)} · p90 ${sx(f.p90_ms)} · max ${sx(f.max_ms)} s (n=${f.n || 0}) · `
-          + (dir === "P>D" ? "P-Chunk-Ende → erstes Decode-Token" : "Decode-Ende → erster Prefill-Forward auf P (PP0)"), s.flip);
+          `zuletzt${age != null ? " vor " + fmtN(age / 60, 0) + " min" : ""} · p50 ${sx(f.p50_ms)} · p90 ${sx(f.p90_ms)} · max ${sx(f.max_ms)} s (n=${f.n || 0}, Fenster: ${(fw.window || {}).label || "?"}) · `
+          + FLIP_DEF[dir] + (f.idle_n ? ` · Leerlauf-Flips (kein Prefill/Decode stand an), nicht gezählt: ${f.idle_n}` : ""), s.flip);
       }),
     ].join("");
     $("hw-tiles").innerHTML = [
@@ -373,7 +379,7 @@
       scales: { y: { range: zeroUp(1000) } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " s")],
       series: [{}, line("P→D", C.s1, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s1 }, noDot: true }),
-        line("D→P (Decode-Ende → erster Prefill-Forward auf P (PP0))", C.s2, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s2 }, noDot: true })],
+        line("D→P", C.s2, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s2 }, noDot: true })],
     }, rowsFlips(d));
     // Karten: Leistungsaufnahme als Summe (kräftig, Fläche), die Einzelkarten dünn darunter
     charts.power = mk("hw-c-power", {
@@ -445,9 +451,9 @@
     }
     return [d.t, c1, c2, c3, h.map((v) => (v == null ? null : v))];
   }
-  // Flipzeit (Nutzer 02.10.) = letztes Token der abgebenden Phase -> erstes Token der annehmenden, beide
-  // Richtungen aus den Marken flip_t2t (ipcboot.flip_views); ältere Marken (flip_user, flip_pd_user, Front-Werte)
-  // waren andere Definitionen und werden nicht gezeichnet
+  // Flipzeit (Nutzer 06.10.): P>D = letzter P-Chunk fertig -> erstes Decode-Token erzeugt, D>P = letztes Decode-Token
+  // erzeugt -> erster Prefill-Chunk beginnt zu rechnen; beide aus den Marken flip_t2t (dieselben wie die Kacheln,
+  // flipzeit.py); ältere Marken (flip_user, flip_pd_user, Front-Werte) waren andere Definitionen, nicht gezeichnet
   function rowsFlips(d) {
     const fl = (d.marks || []).filter((m) => m.kind === "flip_t2t" && m.v != null).sort((a, b) => a.t - b.t);
     const isPd = (m) => (m.label || "").startsWith("P>D");
@@ -475,7 +481,8 @@
     const s = d.src || {};
     const set = (id, src) => { const el = $(id); if (el) el.innerHTML = srcBadge(src); };
     set("vl-s-pre", s.prefill); set("vl-s-dec", s.decode); set("vl-s-cache", s.cache); set("vl-s-kv", s.kv);
-    set("vl-s-flip", s.flip); set("vl-s-ttft", (d.ttft || {}).error ? "VictoriaMetrics: " + d.ttft.error : (d.ttft || {}).src); set("hw-s-power", s.power); set("hw-s-temp", s.temp); set("hw-s-clock", s.cards);
+    const fw = (d.tiles || {}).flip || {};
+    set("vl-s-flip", `Fenster ${(fw.window || {}).label || "?"}: P→D n=${(fw["P>D"] || {}).n || 0}, D→P n=${(fw["D>P"] || {}).n || 0} · ` + (s.flip || "")); set("vl-s-ttft", (d.ttft || {}).error ? "VictoriaMetrics: " + d.ttft.error : (d.ttft || {}).src); set("hw-s-power", s.power); set("hw-s-temp", s.temp); set("hw-s-clock", s.cards);
     set("hw-s-host", s.host); set("hw-s-pcie", (d.pcie || {}).error ? "VictoriaMetrics: " + d.pcie.error : (d.pcie || {}).src); set("hw-s-memclk", "NVML");
     const err = Object.entries(d.errors || {}).map(([k, v]) => k + ": " + v).join(" · ");
     const nb = (d.marks || []).filter((m) => m.kind === "boot").length;

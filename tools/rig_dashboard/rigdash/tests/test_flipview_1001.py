@@ -1,6 +1,6 @@
 """Flipzeit in Nutzersicht und Phase jetzt (Nutzer 01.10. ~08:20Z)."""
 
-from rigdash import ipcboot
+from rigdash import flipzeit, ipcboot
 
 
 def _ipc(front_first_ts):
@@ -12,7 +12,7 @@ def _ipc(front_first_ts):
           {"type": "flip_done", "ts": 302.0, "data": {"flip_begin_ts": 300.0, "t": 302.0, "flip_ms": 2000, "epoch": 7, "sleep": "P", "wake": "D"}}]
     return {"ipc_events": ev,
             "flip_first_work": [{"dir": "P>D", "flip_begin_ts": 100.0, "first_work_ts": front_first_ts, "flip_time_ms": (front_first_ts - 100) * 1000, "what": "decode_token"}],
-            "flip_user_time": [{"epoch": 6, "flip_user_ms": 2300, "start_ts": 199.6, "prefill_start_ts": 201.9, "idle_flip": False,
+            "flip_user_time": [{"epoch": 6, "flip_user_ms": 2300, "rid": "r6", "start_ts": 199.6, "prefill_start_ts": 201.9, "idle_flip": False,
                                 "parts": {"pre_begin_ms": 400, "legs_ms": 1500, "first_chunk_ms": 400, "park_rpc_ms": 400}}]}
 
 
@@ -49,7 +49,7 @@ def test_pd_early_front_event_is_never_a_small_flipzeit():
 
 def test_dp_ends_at_the_last_stage_forward_and_idle_pd_flip():
     # D's last TP0 round of the D phase ends at 199,6 (open 199,55 + 50 gpu-ms)
-    v = ipcboot.flip_views(SEGS, _ipc(102.5), 450.0, _ring(p_rise_ts=204.0), d_rounds=[(150.0, 150.05), (199.55, 199.6)])
+    v = ipcboot.flip_views(SEGS, _ipc(102.5), 450.0, _ring(p_rise_ts=204.0), d_rounds=[(150.0, 150.05), (199.55, 199.6)], arrivals={"r6": 199.0})
     dp = v[1]
     assert dp["dir"] == "D>P" and dp["kind"] == "ok"
     assert round(dp["total_ms"]) == 4400              # 199,6 -> 204,0 (first forward on PP0), not the front's 2300
@@ -57,9 +57,16 @@ def test_dp_ends_at_the_last_stage_forward_and_idle_pd_flip():
             round(dp["rest_ms"])) == (400, 1500, 0, 1500, 1000)
     idle = v[2]
     assert idle["dir"] == "P>D" and idle["kind"] == "leerlauf" and idle["total_ms"] is None
-    last = ipcboot.flip_last(v)
-    assert last["P>D"]["n"] == 1 and last["P>D"]["idle_n"] == 1 and last["D>P"]["n"] == 1
-    assert last["D>P"]["max"] == dp["total_ms"]
+    pts = flipzeit.from_views(v)                      # the one counting rule: the Leerlauf flip is no point
+    assert flipzeit.stats(pts, "P>D")["n"] == 1
+    assert sum(1 for x in v if x["dir"] == "P>D" and x["kind"] == "leerlauf") == 1
+    # D's log has no round after flip_done yet: the D>P start is provisional and (Nutzer 06.10.) counted nowhere
+    assert dp["provisional"] and flipzeit.stats(pts, "D>P")["n"] == 0
+    # once D logged a round of the next phase the start is final and the flip counts with its measured total
+    fin = ipcboot.flip_views(SEGS, _ipc(102.5), 450.0, _ring(p_rise_ts=204.0),
+                             d_rounds=[(150.0, 150.05), (199.55, 199.6), (300.0, 300.05)], arrivals={"r6": 199.0})[1]
+    assert not fin["provisional"] and round(fin["total_ms"]) == 4400
+    assert flipzeit.stats(flipzeit.from_views([fin]), "D>P")["max_ms"] == fin["total_ms"]
     # without the last stage's counter in the ring: missing, not the leg-1 dispatch
     miss = ipcboot.flip_views(SEGS, _ipc(102.5), 450.0)[1]
     assert miss["kind"] == "fehlt" and "forward_ct" in miss["missing"] and miss["total_ms"] is None

@@ -565,13 +565,14 @@ def _fmt_s(ms) -> str:
 
 
 def _cur_flip(lb, fb, gpus):
-    ft = lb.get("flip_times") or {}
-    pd, dp = ft.get("P>D") or {}, ft.get("D>P") or {}
+    fz = lb.get("flip_zeit") or {}
+    pd, dp = fz.get("P>D") or {}, fz.get("D>P") or {}
     if not pd.get("n") and not dp.get("n"):
         return None
+    win = (fz.get("window") or {}).get("label") or "Fenster fehlt"
     return ("P→D Median %s, p90 %s (n=%s); D→P Median %s (n=%s); Flips %s" % (
-        _fmt_s(pd.get("median")), _fmt_s(pd.get("p90")), pd.get("n"), _fmt_s(dp.get("median")), dp.get("n"),
-        lb.get("flip_count")), "flip_views: letztes Token -> erstes Token (events.jsonl + rankstats, IPC)")
+        _fmt_s(pd.get("p50_ms")), _fmt_s(pd.get("p90_ms")), pd.get("n"), _fmt_s(dp.get("p50_ms")), dp.get("n"),
+        lb.get("flip_count")), "Flipzeit (flipzeit.py, %s): letzter P-Chunk / letztes Decode-Token -> erstes Decode-Token / erster Prefill-Chunk" % win)
 
 
 def _cur_decode(lb, fb, gpus):

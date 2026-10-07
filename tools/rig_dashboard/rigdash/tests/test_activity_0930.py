@@ -17,7 +17,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from rigdash import activity, ipcboot  # noqa: E402
+from rigdash import activity, flipzeit, ipcboot  # noqa: E402
 
 CH = 16384
 PP_MS = (3.0, 2.5, 1.0)
@@ -272,8 +272,8 @@ class TestWhatNone(unittest.TestCase):
                "flip_first_work": fw}
         v = ipcboot.flip_views([{"s": 0.0, "e": 60.0, "k": "unknown"}], ipc, 300.0)
         self.assertEqual([x["kind"] for x in v], ["leerlauf"])
-        ft = ipcboot.flip_times_of(v)
-        self.assertEqual((ft["P>D"]["n"], ft["P>D"]["no_work"], ft["recent"]), (0, 1, []))
+        self.assertEqual(flipzeit.from_views(v), [])                       # a Leerlauf flip is no point anywhere
+        self.assertEqual(sum(1 for x in v if x["dir"] == "P>D" and x["kind"] == "leerlauf"), 1)
         m = activity.Model(ring_until(60.0), FLIP_DONE + [{"sleep": "D", "wake": "P", "flip_begin_ts": 50.0, "t": 51.0}], fw)
         self.assertEqual(len(m.tails()), 1)
         ev = [{"type": "flip_first_work", "data": x} for x in fw]

@@ -43,75 +43,9 @@ WIDE_MIN_TOK = 64         # D: a prefill line with fewer new tokens is an admit 
 ANON_EXTEND_MIN_MS = 50.0     # HOST-ANON-PASS phase=EXTEND below this is the empty follow-up pass
 ANON_EXTEND_WINDOW_S = 8.0    # the D rank line trails its extend by about one pass
 FLIP_TAIL_MAX_S = 60.0        # a 'first decode' later than this after FLIP done is not the flip's
-# Flipzeit (user 29.09.): P-Ende -> erstes Decode-Token, NOT flip_total (the layer swap).
-# Marks are the first work line of the woken group after a pause of this length:
-# TP0 'Decode rank batch' (its own ms stamp) for P->D, PP0 'Prefill batch' (whole
-# seconds only) for D->P.  The woken group slept through the flip, so its first line
-# after the begin always opens a run.
-FLIP_MARK_GAP_S = 0.5
-FLIP_MARKS_MAX = 100000
-# IPC (30.09.): where the boot's events.jsonl carries ``flip_first_work`` (the front's
-# own clock, ms), apply_ipc_first_work replaces both directions with it.  The D->P
-# log mark was the wrong event: PP0 writes 'Prefill batch' only after the first chunk
-# has run through all PP stages, so it carried 5-8 s of prefill compute (y4i: 9.6 s
-# median vs 2.0 s to the first P leg).  The log scan stays for boots without IPC.
-#
-# Instrument per value (27B-Review 29.09.): 'first_token' = P-Ende -> erstes Token,
-# 'flip_total' = flip_total (reconciled) of WEG2-FLIP done.  The 27B history was
-# measured as flip_total; until a 27B boot is measured and accepted under the new
-# definition, a 27B boot's headline stays flip_total, so it does not read as a
-# 27B regression.  Flip this when that boot exists.
-FIRST_TOKEN_HEADLINE_FOR_27B = False
-INSTRUMENTS = {"first_token": "P-Ende→erstes Token", "flip_total": "flip_total (reconciled)"}
-
-
-IPC_FIRST_WORK_MATCH_S = 0.05   # a log row and an IPC event share the front's flip_begin stamp
-
-
-def apply_ipc_first_work(ft: dict, first_work: List[dict]) -> dict:
-    """Flipzeit per direction from the front's ``flip_first_work`` events (IPC, ms).
-
-    D>P ends at the dispatch of the first P leg (``what=p_leg1_dispatch``), P>D at the
-    first decode token (``what=decode_token``); both are flip_begin -> that moment on
-    the front's one clock.  A direction without IPC events keeps its log figures; the
-    layer-swap figures (flip_total) stay from the log.  ``recent`` rows take the IPC
-    value when an event carries the row's begin stamp.
-    """
-    out = dict(ft)
-    by_dir: Dict[str, List[dict]] = {}
-    for x in first_work:
-        if x.get("dir") in ("P>D", "D>P") and x.get("flip_time_ms") is not None:
-            by_dir.setdefault(x["dir"], []).append(x)
-
-    def q(xs, p):
-        return xs[max(0, math.ceil(p * len(xs)) - 1)] if xs else None
-
-    for d, evs in by_dir.items():
-        evs = sorted(evs, key=lambda x: x.get("flip_begin_ts") or 0)
-        vals = sorted(int(x["flip_time_ms"]) for x in evs)
-        s = dict(out.get(d) or {})
-        s.update({"n": len(vals), "last": int(evs[-1]["flip_time_ms"]), "last_t": evs[-1].get("flip_begin_ts"),
-                  "median": q(vals, 0.5), "p90": q(vals, 0.9), "resolution_s": 0.001, "open": False,
-                  "src": "IPC flip_first_work (%s)" % (evs[-1].get("what") or "?")})
-        out[d] = s
-    begins = sorted((x.get("flip_begin_ts") or 0, x) for evs in by_dir.values() for x in evs)
-    keys = [b for b, _ in begins]
-    recent = []
-    for r in out.get("recent") or []:
-        r = dict(r)
-        i = bisect.bisect_left(keys, r["t"] - IPC_FIRST_WORK_MATCH_S)
-        hit = next((x for b, x in begins[i:i + 3] if abs(b - r["t"]) <= IPC_FIRST_WORK_MATCH_S
-                    and x.get("dir") == r.get("dir")), None)
-        if hit is not None:
-            r.update(ms=int(hit["flip_time_ms"]), state="ok", src="ipc")
-        recent.append(r)
-    out["recent"] = recent
-    return out
-
-
-def is_27b_boot(meta: dict, stem: str) -> bool:
-    text = " ".join(str(x) for x in (meta.get("model"), meta.get("tag"), meta.get("model_path"), stem) if x)
-    return bool(re.search(r"27b", text, re.IGNORECASE))
+# Flipzeit: NOT computed here (Nutzer 06.10.: one definition, one computation -- flipzeit.py over the IPC flip
+# views).  The log reader keeps no flip time: no flip_marks scan (begin -> first work line), no flip_total
+# headline, no per-model headline switch, no IPC override of its figures.
 
 # Launcher summary lines worth showing as the boot's "start form" (read-only
 # view of what the weg2 launcher actually emitted; the full list is ~250 lines).
@@ -641,14 +575,12 @@ class Boot:
         self.last = {}          # kind -> last event
         self.health = {}        # group -> last health event
         self.flip_open = None
-        self.flip_marks = {"D": [], "P": []}   # sorted run starts of TP0 decode / PP0 prefill
         # exact work times per (group, rank): FWD-TIMING-PREFILL (+ first TIMING-FLUSH-WAIT of that
         # forward) and HOST-ANON-PASS phase=EXTEND; the rank lines come a pipeline / a pass late
         self._fwd = collections.defaultdict(lambda: collections.deque(maxlen=64))
         self._flush0 = collections.OrderedDict()
         self._anon = collections.defaultdict(lambda: collections.deque(maxlen=64))
         self.post_wake0 = collections.deque(maxlen=512)
-        self._mark_last = {}
         self.counts = collections.Counter()
         self._last_t = {}       # group -> newest log timestamp seen in that file
         self.first_t = None     # first timestamp of this boot's logs
@@ -796,10 +728,6 @@ class Boot:
             if k == "decode_rank" and rank0 and ev.get("gpu_ms"):
                 self.tot[group]["dec_gpu_ms"] += ev["gpu_ms"]
                 self.tot[group]["dec_rounds"] += 1
-            if k == "decode_rank" and group == "D" and rank0:
-                self._flip_mark("D", ev.get("t_exact") or ev["t"])
-            if k == "prefill_batch" and group == "P" and rank0:
-                self._flip_mark("P", ev["t"])
             if k == "prefill_batch" and rank0:
                 # one "Prefill batch" line per chunk on the FIRST rank only (PP0/TP0):
                 # the other ranks log the same chunk again
@@ -934,80 +862,7 @@ class Boot:
             out.append({"s": s, "e": e, "ms": round((e - s) * 1000), "parts": parts})
         return out
 
-    def _flip_mark(self, group: str, t: float):
-        last = self._mark_last.get(group)
-        if last is None or t - last > FLIP_MARK_GAP_S:
-            marks = self.flip_marks[group]
-            bisect.insort(marks, t)
-            if len(marks) > FLIP_MARKS_MAX:
-                del marks[:len(marks) - FLIP_MARKS_MAX]
-        if last is None or t > last:
-            self._mark_last[group] = t
-
     # ---------------------------------------------------------------- views
-
-    def _flip_rows(self) -> list:
-        begins = sorted(self.ev["flip_begins"], key=lambda e: e["t"])
-        dones = sorted(self.ev["flips"], key=lambda e: e["t"])
-        rows = []
-        for i, b in enumerate(begins):
-            sleep, wake = b.get("sleep"), b.get("wake")
-            if wake not in ("P", "D"):
-                continue
-            nxt = begins[i + 1]["t"] if i + 1 < len(begins) else None
-            marks = self.flip_marks[wake]
-            lo = b["t"] if wake == "D" else math.floor(b["t"])
-            j = bisect.bisect_left(marks, lo)
-            m = marks[j] if j < len(marks) else None
-            if m is not None and nxt is not None and m >= nxt:
-                m = None
-            done = next((d for d in dones if d["t"] >= b["t"] and (nxt is None or d["t"] < nxt)
-                         and d.get("slept") == sleep and d.get("woke") == wake), None)
-            rows.append({
-                "t": b["t"], "epoch": b.get("epoch"), "dir": "%s>%s" % (sleep, wake),
-                "ms": round(max(0.0, m - b["t"]) * 1000.0) if m is not None else None,
-                "state": "ok" if m is not None else ("offen" if nxt is None else "ohne Folgearbeit"),
-                "layer_ms": done.get("total_ms") if done else None,
-            })
-
-        return rows
-
-    def flip_rows(self) -> list:
-        """Every flip of the kept history with its Flipzeit (see flip_times_view)."""
-        return self._flip_rows()
-
-    def flip_times_view(self) -> dict:
-        """Flipzeit je Flip = WEG2-FLIP begin -> erste Arbeitszeile der geweckten Gruppe.
-
-        P->D: first TP0 'Decode rank batch' after the begin (= erstes Decode-Token);
-        D->P: first PP0 'Prefill batch' after the begin (whole-second stamp, so the
-        second of the begin counts and the value is floored at 0).  A flip whose
-        woken group did no work before the next flip began has no Flipzeit
-        ('ohne Folgearbeit'); the newest one still waiting is 'offen'.  flip_total
-        of the matching WEG2-FLIP done is kept beside it as 'davon Layer-Tausch'.
-        """
-        rows = self._flip_rows()
-
-        def stats(direction):
-            rs = [r for r in rows if r["dir"] == direction]
-            vals = sorted(r["ms"] for r in rs if r["ms"] is not None)
-            lay = sorted(r["layer_ms"] for r in rs if r["layer_ms"] is not None)
-            done_rows = [r for r in rs if r["ms"] is not None]
-            last = done_rows[-1] if done_rows else None
-
-            def q(xs, p):
-                return xs[max(0, math.ceil(p * len(xs)) - 1)] if xs else None
-            return {
-                "n": len(vals), "last": last["ms"] if last else None, "last_t": last["t"] if last else None,
-                "median": q(vals, 0.5), "p90": q(vals, 0.9),
-                "layer_last": last["layer_ms"] if last else None, "layer_median": q(lay, 0.5),
-                "layer_p90": q(lay, 0.9), "layer_n": len(lay),
-                "layer_newest": next((r["layer_ms"] for r in reversed(rs) if r["layer_ms"] is not None), None),
-                "no_work": sum(1 for r in rs if r["state"] == "ohne Folgearbeit"),
-                "open": any(r["state"] == "offen" for r in rs),
-                "resolution_s": 0.001 if direction == "P>D" else 1.0,
-            }
-        return {"P>D": stats("P>D"), "D>P": stats("D>P"), "recent": rows[-24:]}
 
     @staticmethod
     def _prefill_window(ranks, batches, t0, wide_only=False):
@@ -1358,9 +1213,6 @@ class Boot:
             "flip_open": self.flip_open,
             "flips": list(self.ev["flips"])[-12:],
             "flip_count": self.counts.get("flip_done", 0),
-            "flip_times": dict(self.flip_times_view(), instruments=INSTRUMENTS, headline=(
-                "flip_total" if is_27b_boot(self.meta, self.stem) and not FIRST_TOKEN_HEADLINE_FOR_27B
-                else "first_token")),
             "health": self.health,
             "errors": list(self.ev["errors"])[-8:],
             "stops": list(self.ev["stops"])[-12:],
@@ -1574,9 +1426,7 @@ class LiveLogs:
             if v["ipc"]:
                 v["ipc"].pop("ipc_events", None)
             if v["ipc"]:
-                fw = v["ipc"].pop("flip_first_work", None)
-                if fw:
-                    v["flip_times"] = apply_ipc_first_work(v["flip_times"], fw)
+                v["ipc"].pop("flip_first_work", None)    # a front raw value, no Flipzeit (flipzeit.py is the only one)
                 v["end"] = stops.classify_ipc(v["ipc"])
             else:
                 v["end"] = stops.classify(b.stem, b.first_t, last_line or b.newest_mtime or None,

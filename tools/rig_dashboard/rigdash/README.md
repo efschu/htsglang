@@ -35,14 +35,17 @@ unter `:3000` mit der Tafel „Rig – Verlauf“. Installiert wird mit `deploy/
 wenn danach gebootet wurde, rot ab 24 h. Darunter stehen die **Commits der Image-Linie (48 h) ohne Baustein**,
 aus git gerechnet (`features.new_commits`). Der Zähler steht im Tab-Titel. Eintragen wie unten mit `features_update.py`.
 
-## Flipzeit (Nutzer-Korrektur 29.09.)
+## Flipzeit (EINE Definition, Nutzer 06.10.2026)
 
-Flipzeit = `WEG2-FLIP begin` → erstes Decode-Token (P→D) bzw. erste PP0-`Prefill batch` (D→P);
-`flip_total` (reconciled) ist nur der Layer-Tausch darin. Jeder Wert nennt sein Instrument.
-Ein 27B-Boot führt mit `flip_total`, bis ein 27B-Boot unter der neuen Definition gemessen ist
-(`FIRST_TOKEN_HEADLINE_FOR_27B` in `live.py`) — sonst sähe die 27B-Historie wie ein Rückschritt aus.
-
-Seit 30.09.: Flipzeiten nur aus `events.jsonl` (`flip_first_work`, `flip_done`), kein Log-Scan mehr (ipcboot.py).
+P→D = letzter P-Chunk fertig → erstes Decode-Token erzeugt; D→P = letztes Decode-Token erzeugt → erster
+Prefill-Chunk beginnt zu rechnen (erster Forward auf PP0, `flip_user_time.prefill_start_source=pp_first_forward`,
+nie der Leg-1-Dispatch). Ausnahme: kein Flip zählt, wenn kein Prefill oder Decode ansteht (Leerlauf-Flip,
+D→P: `flip_user_time.idle_flip`). Layer-Tausch, Vorlauf, Nachlauf sind nur die ZERLEGUNG der einen Zahl, nie eine eigene
+Flipzeit. Es gibt EINE Berechnung, `flipzeit.py`: `ipcboot.flip_views` misst je Flip, die Historie schreibt jeden
+gezählten Flip einmal als Marke `flip_t2t` (offen, vorläufig, ohne Endpunkt, Leerlauf: nie), und jede Zahl der Seite
+(Kachel Überblick, Kachel Verlauf, Diagramm, Boot-Liste) ist `flipzeit.tile` über diese Marken. Nur das FENSTER
+unterscheidet sich und steht in der Beschriftung: Überblick = letzte 60 min des Modells, Verlauf = gewählter
+Bereich/Zoom, Boot-Liste = ganzer Boot. Tests: `tests/test_flipzeit_1006.py`.
 
 **Phasenleiste mit echter Arbeitszeit (WACH-OHNE-ARBEIT-0929):** Die Rang-Zeilen kommen zu spät
 (P nach dem Pipeline-Durchlauf, D einen Pass später). P-Arbeit zeichnet deshalb von
@@ -77,7 +80,7 @@ Anlass: Der Features-Sitz deployte von `desk/dashboard-features-0929`. Ein Deplo
 Flips kommen aus den Ereignissen. Grund: Der kumulative Zähler springt um einen ganzen Chunk; Δ Zähler / Δ Probe gab 16.384 tok/s
 und P/D-Überlappung. Kacheln: „Rate laufender Schub“, „beste Schub-Rate“, „Rate Schübe 60 s“ (je Tokens / Wanduhr des Schubs, P/D), Decode nur über stetige Proben, je Stream
 nur mit Decode davor und danach. Verlauf: 1-s-Modellzeilen unter dem Präfix `mi.`; die alten `m.`-Zeilen aus dem falschen Instrument
-werden nicht mehr gezeigt. Flipzeit: P→D `flip_first_work` (ohne `what="none"`), D→P nur `flip_user_time` (ab Build y4z).
+werden nicht mehr gezeigt. Flipzeit: siehe Abschnitt „Flipzeit“ oben (eine Definition, `flipzeit.py`).
 Audit aller Werte: `/spinning/gpu-arb/docs/DASHBOARD-PLAUSI-AUDIT-0930.md`; Tests `tests/test_activity_0930.py`.
 
 ### D-Prefill: Admit-Extends sind keine Prefill-Rate (Auftrag 880, Nutzer 03.10. „6 token/s prefill in D???“)
@@ -295,7 +298,7 @@ Log-Sammlers, der erst nach einer Runde über alle Logs pollt) jede Boot-Zustand
 | KV-Belegung D / P | `sched.full_token_usage` (Pegel) |
 | Input-Tokens | P: `cached_tokens` = aus Cache, `new_tokens` = neu gerechnet P; D: `new_tokens` = neu gerechnet D, `cached_tokens` = Übergabe P→D |
 | Cache-Stufen | `state.json front.served_tokens.*.cached_tier` |
-| Flipzeit | `events.jsonl flip_first_work` |
+| Flipzeit | `flipzeit.py` über Marken `flip_t2t` (aus `events.jsonl` flip_begin/flip_done/flip_user_time + rankstats) |
 
 Eine lebende, aber ruhende Gruppe liefert 0 (durchgehende Linie), ein Rang mit einer Datei älter als
 20 s liefert nichts (Lücke). `m.<Modell>.ipc` = 1 markiert jedes Intervall, in dem der Sampler einen
@@ -343,6 +346,36 @@ Danach setzt der Lead in der Unit `RIGDASH_PROFIL_TREE` (= `--profil-tree`, EIN 
 **MemoryMax:** der Worker (`import sglang`) liegt im cgroup der Unit (gemessen RSS 612 MiB), die Unit stand bei MemoryCurrent 487 MiB / Peak 715 MiB
 gegen `MemoryMax=1G`: auf 2G heben. Der Worker rechnet auch das Topologie-Urteil des Trockenlaufs (Op `topology`); fehlt er, bleibt die Notiz
 "Topologie für N Karte(n) nicht geprüft" (Tests: `tests/test_profil_staging_1984.py`, `tests/test_profil_topology_child_1984.py`).
+
+### Orakel und Vorschlag (AP-D, Plan Profil-Planer 06.10.)
+
+Der Trockenlauf (`POST /api/profil/dry`) fragt seit AP-D den LAUNCHER selbst: `profil_oracle.OracleService` hält einen eigenen Kindprozess
+(`kartenplan_build/oracle_worker.py`, Python der sglang-Umgebung wie `--couplings-python`), der `launcher.main(--dry-run)` auf einem NVML-Replay der
+gewählten Karten fährt (`weg2/propose_oracle`), erst ohne und bei einer Ablehnung noch einmal mit `--force`, und daraus das Dokument
+`flliper.verdikt/1` baut (`weg2/propose_verdict`): je Ding ein Verdikt `{code, forcebar (aus refusals.by_code), force_state, grund, konsequenz}`, dazu
+`PROFILE-VECTORS`, `RECORDS-NVEC`, `METAL-UNPROVEN` (die Blocker im Text von HW-COUNT), `FIT` (hw_fit), `HW-BORROWED`, `HW-UNCALIBRATED` und ein Absturz des
+Launchers als `ORAKEL-ABSTURZ`. Das Rückgabeformat des Trockenlaufs bleibt; neu sind `quelle` (`orakel` | `gate`), `orakel` (Ausgang, Profil-Hash, Cache) und
+`verdikte`. Kann das Orakel nicht fragen (Kindprozess, Python, Modellpfade), gilt die Teilprüfung des Planer-Gates MIT Notiz. Ein Lauf bis zum Ende dauert
+16-18 s (gemessen 06.10.), darum der Cache je (Inventar, Form, Argv-Hash, Stand der Quellen); Live-Profile driften: der Profil-Hash (Datei und Launch-Eingabe)
+steht in jedem Verdikt und im Schlüssel.
+
+`POST /api/profil/propose` ({basis: {kind, name}, form: flip|tp|dual|single, inventar: "rig" | [{card, pcie}], karte?, ziele?, model_path?, draft_path?}) ruft
+`propose()` (AP-C) und liefert das Startprofil `flliper.server/1` (Basisprofil + die Werte des Vorschlags, Herkunft `planer`) mit Herkunft, Verdikt und Kanten je
+Wert, die Verdikte und die Anfrage für die Balken (`what=phase_bars`, `form` flip|d_only|dual|single, Vertrag `flliper.balken/1` von AP-H2). Alle vier Formen:
+`flip`, `tp` und `dual` fragen den Launcher-Trockenlauf (Orakel); Dual (AP-E) trägt zusätzlich die Dual-Passung als Verdikt "Planer-Rechnung, nicht hw_fit"
+(`DUAL-PASSUNG`, `DUAL-PFLICHT`). `single` (Einzelkarte, AP-F; `einzel` ist ein Name dafür) hat keinen Launcher: genau EINE Karte (`karte` = Ordinal im
+Hardwareprofil, Standard 0), ein Modellpfad (`model_path` oder das `PROFILE_MODEL` des Basisprofils; ohne Basisprofil geht es auch), das Verdikt ist eine
+Planer-Rechnung (`ausgang` passt | passt_nicht | unbelegt, `art` Planer-Rechnung, kein Force) plus ServerArgs-Parse, das Startprofil ein neues Profil aus den
+Argumenten des normalen Servers (`launch.argv` für `python -m sglang.launch_server`).
+Der Orakel-Kindprozess importiert den Launcher: der Planer-Baum der Unit muss `weg2/launcher.py`, `propose*.py`, `hw_fit.py` und `fit_profiles_data`
+tragen (der volle Baum `python/sglang` der Revision, wie bei `stage_profil_modules.sh`).
+
+**Speicher des Orakel-Kindprozesses (GEMESSEN 06.10., Review AP-D):** ein voller NF-Trockenlauf auf dem Referenz-Rig (`nf-int4-h6-abl`, NVML-Replay) braucht
+in der Spitze **1,75 GiB RSS** (`/usr/bin/time -v`: Maximum resident set size 1789432 kB; 47,98 s unter CPUQuota 200%). Gegen `MemoryMax=2G` der Unit
+(MemoryCurrent dort 409 MB) ginge das nicht. Darum startet der Dienst den Kindprozess in einem EIGENEN Scope: `--oracle-prefix auto` (Standard; Env
+`RIGDASH_ORACLE_PREFIX`) = `systemd-run --scope -q -p MemoryMax=4G`, der Scope zählt nicht gegen die Unit. `none` startet ohne Rahmen, jeder andere Wert ist
+der Befehlspräfix selbst. Scheitert der Präfix sofort (kein `systemd-run`, kein D-Bus), läuft der Kindprozess einmal ohne ihn
+(`OracleService.prefix_fallback`); dann gilt wieder die Unit-Grenze. Die Unit-Datei trägt `MemoryMax=2G` (Kopplungs-Worker, 612 MiB RSS, s. o.).
 
 ### Speicher und Stufen
 
@@ -408,12 +441,39 @@ Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `st
   `{v, src, at, probe, note}` mit `src` = `gemessen` | `NVML` | `Datenblatt` | `geschätzt` | `nicht gemessen` (dann `v: null` und `note` = Grund).
   Gebaut wird in `sglang/srt/rigmon/hardware_profile.py` des Planer-Baums (per Dateipfad geladen, kein `import sglang` in diesem Prozess).
 * `POST /api/hwprofil/measure` `{"cards": [<NVML-Index>, ...]}` bucht **selbst** ein gpuq-Fenster (Eigentümer `profil-editor`, nur diese Karten,
-  10 min, ohne `not_before`, exklusiv; `mib` nur wenn der Body es verlangt) und misst darin. Antwort `action`:
+  15 min (Auftrag 1006: alle Rechenformate inkl. nativ W4A4 + BAR1-Strecke je Paar in Kindprozessen), ohne `not_before`, exklusiv; `mib` nur wenn der Body es verlangt) und misst darin. Antwort `action`:
   `messung_gestartet` (Kindprozess läuft, Fenster geht danach SOFORT zurück, auch nach Fehler) · `wartet` (Fenster `pending`: Status, **nichts
   gemessen**, Buchung bleibt; erneuter Druck nimmt sie wieder auf) · `abgelehnt` (unplanbar, Karte belegt trotz Fenster, zu wenig Restzeit, gpuq weg;
   HTTP 409) · `laeuft_bereits`. Das gpuq-Token verlässt den Prozess nie; die Buchung steht zusätzlich in `<state-dir>/hwprofil_window.json`, damit
   ein Neustart ein verwaistes Fenster zurückgibt.
 * `POST /api/hwprofil/cancel` gibt ein wartendes Fenster zurück.
+* Messumfang (Auftrag 1006, `card_probe --run`): je Karte SM-Zahl, L2, membw/GEMV, bf16, fp8, int8 W8A8, NVFP4 W4A8 (nur sm_8x), W4A16 Marlin, W4A4 nativ
+  (nur sm_12x; ältere Karten tragen den Grund), H2D/D2H Bandbreite und Latenz (Median 4 kB, Minimum im Hover); je geordnetem Paar Host-Staging/p2p und die
+  **BAR1-Strecke** (`rigmon/bar1_probe.py`: ein Kindprozess je Karte, Produktions-Transport mit Byte-Beweis, `--no-bar1` schaltet ab). Ein Wert, den ein
+  Mikrobench nicht liefern kann, bleibt „nicht gemessen“ mit Grund. `profile.bar1` = `{measured, complete, pairs_measured, pairs_total, note}`.
+* **Gespeichert (AP-A, Profil-Planer 06.10.).** Beim ersten Aufruf schreibt der Dienst das Profil nach `--hw-profile-file` (Env `FLLIPER_HARDWARE_PROFILE`,
+  Voreinstellung `/var/lib/flliper/hardware.json`; Rig und Release gleich; ein Schreibfehler ist nur ein Zustand, kein Absturz). `GET /api/hwprofil`
+  trägt dazu `persist` = `{enabled, state, label, captured_at, reason, id, drift, error, from_persisted, file}`; `state` = `erst_erfasst` | `neu_erfasst` |
+  `vorhanden` | `abweichend` (Datei bleibt, `drift.changes` nennt den Unterschied) | `nur_gespeichert` (NVML schweigt: die Datei gilt) | `keine_karten` |
+  `nicht_schreibbar`. `POST /api/hwprofil/recapture` ("Neu erfassen") liest NVML neu und ersetzt die Datei: kein gpuq-Fenster, auch in release; eine
+  erfolgreiche Messung erfasst ebenfalls neu. SM-Zahl (`weg2/hw_sim.py`) und Nennbandbreite (`kartenplan_catalog.py`, Feld `mem_gbs.nominal`) kommen als
+  `Datenblatt` ins Profil, eine gemessene SM-Zahl gewinnt; `cards[].catalog` nennt Katalogkarte, `preset` und Herkunft (`measured_on_rig` | `Datenblatt` |
+  `borrowed-unbelegt`, je Feld in `origin_fields`). `GET /api/hwprofil/issue` liefert den Issue-Text "Hardwareprofil" als Markdown (`{ok, format, text}`);
+  Geheimnisse und Hostpfade sind entfernt (`redact.text_for_issue`).
+* **Issue-Text "Laufbericht" (AP-I, Profil-Planer 06.10.).** `POST /api/profil/issue` mit `{doc, dry?, cards?, model?}` (Profil, Antwort des letzten
+  Trockenlaufs, die gewählten Karten `[{card, pcie}]`, ein Modellprofil `flliper.model/1`) liefert `{ok, format: "markdown", text, blocks, filename}`: ein
+  Block zum Einfügen in ein GitHub-Issue mit den Abschnitten Hardwareprofil (Kurzform, `hwprofil.issue_short`, aus dem Hardware-Dienst), Modellprofil
+  (Werte mit Quelle, nur der Ordnername), Betriebsform (aus den Flags gelesen: `--dual-layout`/`--dual-share` = Dual, `--d-only` = nur TP, eine Karte =
+  Einzelkarte, sonst Flip), Vorschlag und Übersteuerungen (Zeilen mit `changed`, Herkunft `nutzer`/`planer` oder abweichendem `planner_value`; Spalten
+  Aktuell/Profil/Vorschlag/Herkunft, dazu `state`/`verdict`, sobald eine Zeile sie trägt), Verdikte und Force (Codes mit Klasse und Force-Zustand, neu aus dem
+  Register gelesen; ohne Trockenlauf steht das da), Versionen (Baum-Revision, Image, Treiber, CUDA/torch, Dashboard) und dem Platzhalter "Messergebnis /
+  Boot-Log-Auszug". Redigiert (`redact.text_for_issue`; Werte von Zeilen, deren NAME ein Geheimnis nennt, `redact.secret_name`, fallen ganz weg). Auch nach der Form: Anbieter-Präfixe, JWT, lange Token-Läufe (mit und ohne `=`/`:` davor, ein ganzer Zellenwert als Lauf), `user:pass@`; jeder
+  absolute Pfad außerhalb von `/app` und jeder `~/`-/`$HOME/`-Pfad wird `<hostpfad>/<letztes Segment>` (Systemwurzeln wie `/root`, `/spinning`: `<Pfad entfernt>`).
+  Strukturregel (Fix-Runde 5): einen WERT zeigt der Bericht nur für Schlüssel, die im Katalog (`catalog.json`: Flags, Envs, Profilvariablen) stehen und nach Namen kein Geheimnis sind; jeder andere vom Nutzer
+  gesetzte Schlüssel zeigt nur seinen Namen und `<wert ausgeblendet: unbekannter Schluessel>` (`redact.value_for_issue(name, value, known)`; ohne `known` wird nichts gezeigt). Die Wertformen bleiben die zweite Schicht
+  (auch für Katalog-Schlüssel): zusätzlich Base64 mit `/` `+` `=` (AWS-Secret, Azure-Key) und Punkt-geteilte Token (Discord). Pfade werden vor dem Urteil normalisiert (`/app/../../root/x` ist `/root/x`),
+  `file://` entfällt, ein Pfad mit Leerzeichen in Anführungszeichen zählt als ein Pfad; `/models-cache` (Modell-Mount des Containers) bleibt wie `/app`.
+  Ohne Hardware-Dienst entsteht der Bericht trotzdem ("nicht verfügbar"). Oberfläche: Abschnitt "Issue-Text: Laufbericht" unter dem Export in `profil.js`.
 * Kein Hintergrund-Poller: nur wer die Seite bedient fragt. Ein laufendes Fenster, das nach 180 s nicht benutzt wurde, geht beim nächsten Aufruf zurück.
 * Dienst-Parameter (Deploy durch den Lead): `--hw-tree` (gestagter Baum mit `hardware_profile.py` + `weg2/card_identity.py`, `deploy/stage_hwprofil.sh`),
   `--hw-measure-tree` (voller sglang-Baum für den Kindprozess), `--hw-python` (Interpreter mit torch + sgl_kernel; ohne sgl_kernel bleiben die Arme
@@ -421,3 +481,21 @@ Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `st
   `MemoryMax=1G`, torch/CUDA gehört in einen eigenen cgroup-Rahmen). Env: `HWPROFIL_TREE`, `HWPROFIL_MEASURE_TREE`, `HWPROFIL_PYTHON`, `HWPROFIL_PREFIX`.
 * Einhängen in eine Seite: `<div id="x"></div><script src="hwprofil.js"></script><script>HwProfil.mount(document.getElementById("x"))</script>`;
   `HwProfil.render(antwort)` liefert nur den HTML-Text.
+
+## Profil-Planer: eine Seite in sechs Schritten (AP-H1, Plan Profil-Planer 06.10.)
+
+Der Reiter Profil führt in einer festen Reihenfolge: **1 Hardware** (Inventar: "Dieses Rig" = Hardwareprofil mit echten NVML-Karten, oder Karten aus dem Katalog,
+synthetisch; die drei vorbelegten Karten zuerst) -> **2 Modell und Profil** -> **3 Betriebsform** (Einzelkarte, Nur TP, Flip PP/TP, Dual PP/TP, je ein erklärender
+Satz; Vorbelegung aus dem Profil: `--dual-layout`/`--dual-share` = Dual, `--d-only` = Nur TP) -> **4 Vorschlag** (Regler "Sitze gleichzeitig" und "Kontext",
+Knopf "Vorschlag" = `POST /api/profil/propose`, "Neu prüfen" = Trockenlauf) -> **5 Anpassen** -> **6 Export**.
+
+* Daten der Seite: `rigdash/profil_planer.py` (`ui_info`, in `GET /api/profil/list` als `planer`): Formen, Abschnitte A (Aufteilung), B (KV), C (Experten) mit den
+  Namen ihrer Werte, die Dual-ENV-Tabelle mit Standardwerten und Quellzeilen, Reglergrenzen. Fehlt `planer` (älterer Dienst) oder `profil_planer.js`, zeichnet
+  `profil.js` die alte Seite. Der Vorschlag gilt für die Formen, die `ProfilEditor.FORMS` kennt (flip, tp); Einzelkarte (AP-F) und Dual (AP-E) zeigen den Grund.
+* Darstellung: `static/profil_planer.js` (kein DOM, kein Netz, Node-testbar). Ein Feld je Rang für Vektoren (Kommalisten mit gleich vielen Einträgen wie Karten;
+  falsche Länge = Warnung), **Zustandschip** je Wert (vorgeschlagen / unbelegt / vom Launcher gelöst / von Ihnen übersteuert / Profil / Standard), **Urteilschip**
+  je Wert (geht / nur mit --force / verweigert / Hinweis / nicht geprüft / ungeprüft seit Ihrer Änderung) mit Code und Grund sichtbar, **Abhängigkeitschips**
+  aus dem Kantenkatalog. Ein Urteil ist ein Hinweis, nie eine Sperre (Nutzerentscheid 4a): jedes Feld bleibt bedienbar, Force steht im Export. Filter Einfach/Experte.
+* Dual-ENV-Tabelle (Abschnitt D, Plan 4c): `SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE` als Tabelle (D-Sitze bis | P-Anteil bei kleinem / großem tau, Stufen 0-3 = 100/75/50/25 %),
+  `..._STARVE_AGE_S`, `..._STARVE_MAX_RUNG`, `SGLANG_WEG2_DUAL_GRANT_RETRY_MS`; Katalogeinträge kuratiert, Kanten K109-K116 mit Beleg.
+* Tests: `tests/test_profil_planer_aph1_1006.py`.

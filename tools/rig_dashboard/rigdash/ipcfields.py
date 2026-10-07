@@ -76,8 +76,8 @@ MISSING_WRITER = {
 }
 MISSING_LABEL = "fehlt in IPC"
 #: Nutzer 02.10.: the front's own flip numbers (B1/B2) are raw instruments, never the Flipzeit -- that is
-#: ipcboot.flip_views (letztes Token -> erstes Token), shown as flip_last / flip_times
-NOT_FLIPZEIT = "Front-Rohwert, keine Flipzeit (Flipzeit: flip_last, letztes -> erstes Token)"
+#: the Flipzeit is flipzeit.py's one number (Nutzer 06.10., from ipcboot.flip_views over the history marks)
+NOT_FLIPZEIT = "Front-Rohwert, keine Flipzeit (Flipzeit: flipzeit.py, eine Definition, siehe Flipzeit-Kacheln)"
 
 
 def field(key: str, ipc_value, ipc_src: Optional[str], log_value=None, from_log: Optional[List[str]] = None) -> dict:
@@ -345,8 +345,7 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     f["A15"] = field("A15", a15, "rankstats.ts + work.forward_ct", logv.get("last_activity"))
 
     # B1/B2 flip time from the front's one clock
-    lft = logv.get("flip_times") or {}
-    f["B1"] = field("B1", _flip_first_work(ipc, "P>D"), "events flip_first_work P>D", lft.get("p2d") or lft)
+    f["B1"] = field("B1", _flip_first_work(ipc, "P>D"), "events flip_first_work P>D", None)
     # D>P (NF-Operator 30.09.): only flip_user_time.flip_user_ms -- no fallback on flip_first_work
     f["B2"] = field("B2", _flip_user_time(ipc), "events flip_user_time", None)
 
@@ -456,7 +455,7 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     # D3 flip grey / tail class: B1 + B3 + B7 together
     d3 = ({"first_work": f["B1"]["value"], "done": f["B3"]["value"], "post_wake": f["B7"]["value"]}
           if f["B1"]["src"] == "ipc" and f["B3"]["src"] == "ipc" else None)
-    f["D3"] = field("D3", d3, "events flip_first_work + flip_done + post_wake", logv.get("flip_times"))
+    f["D3"] = field("D3", d3, "events flip_first_work + flip_done + post_wake", None)
 
     # D4 boot loading before first work: lifecycle + group_ready + serving_since_ts
     ready = {_data(e).get("group") or e.get("group"): _data(e).get("after_s") for e in _ev(ipc, "group_ready")}

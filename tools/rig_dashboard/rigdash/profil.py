@@ -29,10 +29,14 @@ import threading
 import time
 from typing import Dict, List, Optional
 
+from . import hwprofil as HW
 from . import kartenplan_catalog as CAT
+from . import redact
 from .kartenplan import MAX_CARDS
 from . import kvheads as KVH
 from . import kartenplan_transport as TR
+from . import profil_oracle as ORA
+from . import profil_planer as PLANER
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "profil_data")
@@ -185,10 +189,209 @@ def docker_run_example(name: str, force: dict) -> List[str]:
     return lines
 
 
+# ---------------------------------------------------------------------------------------------------------- Issue-Text "Laufbericht" (AP-I)
+#: Höchstzahl der Zeilen je Tabelle im Laufbericht (ein Issue ist kein Profil-Dump; der Rest steht als "und N weitere")
+ISSUE_MAX_ROWS = 120
+ISSUE_CELL = 200
+#: Überschriften des Laufberichts in fester Reihenfolge (der Test prüft jede)
+ISSUE_BLOCKS = ("Hardwareprofil (Kurzform)", "Modellprofil", "Betriebsform", "Vorschlag und Übersteuerungen", "Verdikte und Force",
+                "Versionen", "Messergebnis / Boot-Log-Auszug")
+
+
+def _md(x, limit: int = ISSUE_CELL) -> str:
+    """Ein Wert in einer Markdown-Tabellenzelle: kein Zeilenumbruch, kein Trennstrich, auf ``limit`` Zeichen gekürzt."""
+    t = str("" if x is None else x).replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
+    return t if len(t) <= limit else t[:limit - 1].rstrip() + "…"
+
+
+def _lv(o):
+    """Wertknoten des Modellprofils ``{v, src}`` -> (Wert, Quelle); alles andere -> (None, None)."""
+    return (o.get("v"), o.get("src")) if isinstance(o, dict) and "v" in o else (None, None)
+
+
+def _gib(n) -> str:
+    return "%.2f GiB" % (float(n) / (1 << 30))
+
+
+def issue_betriebsform(names, n_cards) -> dict:
+    """Die Betriebsform AUS DEN FLAGS DES PROFILS gelesen (nicht vom Planer gewählt: ``propose()`` kommt später): ``--dual-layout`` /
+    ``--dual-share`` = Dual PP/TP, ``--d-only`` = nur TP, ein Karte = Einzelkarte, sonst Flip PP/TP (die Standardform des Launchers).
+    ``names`` = die Zeilennamen des Profils, ``n_cards`` = Kartenzahl im Trockenlauf (``None`` = unbekannt)."""
+    names = set(names)
+    dual = sorted(n for n in names if n in ("--dual-layout", "--dual-share"))
+    if dual:
+        return {"form": "Dual PP/TP", "why": "Flag %s im Profil: P und D gleichzeitig wach auf denselben Karten" % ", ".join(dual)}
+    if "--d-only" in names:
+        return {"form": "nur TP", "why": "Flag --d-only im Profil"}
+    if n_cards == 1:
+        return {"form": "Einzelkarte", "why": "eine Karte im Trockenlauf (der weg2-Launcher braucht mindestens zwei)"}
+    return {"form": "Flip PP/TP", "why": "weder --d-only noch --dual-* im Profil, also die Standardform des Launchers"}
+
+
+def _issue_cards(dry, cards) -> tuple:
+    """(Kartenlabels, Quelle): die Karten des letzten Trockenlaufs, sonst die gewählten Karten (noch ohne Trockenlauf), sonst leer."""
+    if isinstance(dry, dict) and isinstance(dry.get("cards"), list) and dry["cards"]:
+        return [str(c.get("label") or "?") for c in dry["cards"] if isinstance(c, dict)][:16], "Trockenlauf"
+    out = []
+    for rc in (cards if isinstance(cards, list) else [])[:16]:
+        e = CAT.card(rc.get("card")) if isinstance(rc, dict) else None
+        out.append(CAT.label(e) if e else "unbekannte Karte")
+    return out, "gewählt, noch kein Trockenlauf"
+
+
+def _issue_model(model, doc_rows) -> List[str]:
+    """Block Modellprofil: die Werte des Schätzprofils ``flliper.model/1`` mit ihrer Quelle; ohne Profil nur, was das Serverprofil nennt.
+    Der Pfad des Modells steht nie da, nur der Ordnername."""
+    L = ["### Modellprofil", ""]
+    p = model.get("profile") if isinstance(model, dict) and isinstance(model.get("profile"), dict) and "arch" not in model else model
+    if not isinstance(p, dict) or p.get("schema") != "flliper.model/1":
+        name = next((os.path.basename(str(r["value"]).rstrip("/")) for r in doc_rows if r["name"] in ("PROFILE_MODEL", "--model") and r["value"]), "")
+        L.append("Kein Modellprofil geschätzt (Abschnitt Modelle: Modellprofil schätzen, dann den Laufbericht neu erzeugen)."
+                 + (" Das Serverprofil nennt das Modell `%s`." % _md(name) if name else ""))
+        return L
+    out: List[tuple] = []
+
+    def add(label, o, fmt=None):
+        v, src = _lv(o)
+        if v is None or v == "" or v == [] or v == {}:
+            return
+        out.append((label, "%s (%s)" % (fmt(v) if fmt else v, src or "?")))
+
+    a, w, kv, st, ex, dr, cx = (p.get(k) or {} for k in ("arch", "weights", "kv", "state", "experts", "draft", "context"))
+    name = os.path.basename(str(p.get("path") or "").rstrip("/"))
+    out.append(("Modell", "`%s`" % _md(name) if name else "unbelegt"))
+    add("Format", p.get("format"))
+    add("Art", a.get("family"), lambda v: "MoE" if v == "moe" else "dicht")
+    add("Hybrid (GDN/Mamba)", a.get("hybrid"), lambda v: "ja" if v else "nein")
+    add("Layer", a.get("n_layers"))
+    add("Layertypen", a.get("layer_counts"), lambda v: ", ".join("%s %s" % (k, v[k]) for k in sorted(v) if v[k]))
+    add("Hidden-Größe", a.get("hidden"))
+    add("Köpfe Q / KV / Kopfgröße", {"v": "%s / %s / %s" % (_lv(a.get("heads_q"))[0], _lv(a.get("heads_kv"))[0], _lv(a.get("head_dim"))[0]),
+                                      "src": _lv(a.get("heads_q"))[1]} if _lv(a.get("heads_q"))[0] is not None else None)
+    add("Attention", a.get("attention"))
+    add("Gewichte gesamt", w.get("total_bytes"), _gib)
+    add("Experten (Anzahl)", ex.get("n"))
+    add("Experten je Token (top_k)", ex.get("top_k"))
+    add("KV je Token und Attention-Layer", kv.get("cell_bytes_per_attn_layer_token"), lambda v: "%s B" % v)
+    add("Mamba/GDN-Zustand je Linear-Layer und Request", st.get("per_linear_layer_per_slot_mib"), lambda v: "%.4g MiB" % v)
+    add("MTP-Schichten (Draft im Modell)", dr.get("mtp_layers"))
+    if isinstance(dr.get("external"), dict):
+        ext = dr["external"]
+        add("Externer Draft", ext.get("total_bytes"), lambda v: "%s, %s" % (os.path.basename(str(ext.get("path") or "").rstrip("/")) or "?", _gib(v)))
+    add("Kontext (max. Positionen)", cx.get("max_position_embeddings"))
+    if p.get("config_sha"):
+        out.append(("config-Prüfsumme", "`%s`" % _md(p["config_sha"])))
+    L += ["| Angabe | Wert (Quelle) |", "|---|---|"] + ["| %s | %s |" % (_md(k), _md(v)) for k, v in out]
+    L += ["", "Quelle: config = steht in der config.json, Index = aus den Tensorköpfen, geschätzt = gerechnet, stat = Dateigröße."]
+    return L
+
+
+def _issue_cell(row: dict, v, known) -> str:
+    """Wert einer Zeile für die Tabelle: Schalter ohne Wert = ``an``; fehlt der Wert = ``–``; ein Geheimnis nach Namen = ``<entfernt>``; ein Schlüssel,
+    den der Katalog nicht kennt (``known`` = die Katalognamen), zeigt seinen Wert nie (``redact.HIDDEN_UNKNOWN``)."""
+    if v is None:
+        return "–"
+    if v == "" and row.get("bare"):
+        return "an"
+    return _md(redact.value_for_issue(str(row.get("name") or ""), v, known)) or "(leer)"
+
+
+def issue_diff_rows(view: dict) -> dict:
+    """Die Zeilen des Profils, die vom Profil oder vom Planer-Vorschlag abweichen: ``{"rows": [...], "counts": {...}}``.  Eine Zeile zählt, wenn
+    sie gegenüber dem geladenen Profil geändert ist (``changed``), ihre Herkunft ``nutzer`` oder ``planer`` ist oder der Planer-Vorschlag einen
+    anderen Wert nennt.  Zusätzliche Felder (``state``, ``verdict``), die der Orakel-Weg (AP-D) einer Zeile mitgibt, bleiben erhalten."""
+    rows = view.get("rows") or []
+    sel = [r for r in rows if r.get("changed") or r.get("origin") in ("nutzer", "planer")
+           or (r.get("planner_value") is not None and r.get("planner_value") != r.get("value"))]
+    counts = {"rows": len(rows), "geaendert": sum(1 for r in rows if r.get("changed")), "nutzer": sum(1 for r in rows if r.get("origin") == "nutzer"),
+              "mit_vorschlag": sum(1 for r in rows if r.get("planner_value") is not None),
+              "weicht_vom_vorschlag_ab": sum(1 for r in rows if r.get("planner_value") is not None and r.get("planner_value") != r.get("value"))}
+    return {"rows": sel, "counts": counts}
+
+
+def _issue_proposal(view: dict, known) -> List[str]:
+    L = ["### Vorschlag und Übersteuerungen", ""]
+    d = issue_diff_rows(view)
+    c, sel = d["counts"], d["rows"]
+    removed, only = view.get("removed") or [], view.get("planner_only") or []
+    L.append("Quelle: Herkunft, Profilwert und Planer-Vorschlag je Zeile stehen im Profil (meta.origins, meta.profile_values, meta.planner). "
+             "%d Werte, davon %d gegenüber dem geladenen Profil geändert, %d als Nutzer gesetzt, %d mit Planer-Vorschlag, %d weichen vom Vorschlag ab."
+             % (c["rows"], c["geaendert"], c["nutzer"], c["mit_vorschlag"], c["weicht_vom_vorschlag_ab"]))
+    if not c["mit_vorschlag"] and not only:
+        L.append("")
+        L.append("Für dieses Profil liegt kein Planer-Vorschlag vor (meta.planner leer); die Spalte Vorschlag bleibt leer.")
+    extra = [k for k in ("state", "verdict") if any(k in r for r in sel)]
+    head = ["Wert", "Aktuell", "Profil", "Vorschlag (Planer)", "Herkunft"] + [{"state": "Zustand", "verdict": "Verdikt"}[k] for k in extra]
+    if sel:
+        L += ["", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+        for r in sel[:ISSUE_MAX_ROWS]:
+            cells = ["`%s`" % _md(r.get("key") or r.get("name")), _issue_cell(r, r.get("value"), known), _issue_cell(r, r.get("profile_value"), known),
+                     _issue_cell(r, r.get("planner_value"), known), _md(r.get("origin_label") or r.get("origin"))]
+            for k in extra:
+                v = r.get(k)
+                cells.append(_md((v.get("code") or v.get("text")) if isinstance(v, dict) else v) or "–")
+            L.append("| " + " | ".join(cells) + " |")
+        if len(sel) > ISSUE_MAX_ROWS:
+            L.append("")
+            L.append("… und %d weitere abweichende Werte (gekürzt)." % (len(sel) - ISSUE_MAX_ROWS))
+    else:
+        L += ["", "Keine Abweichung: alle Werte stehen wie im geladenen Profil und, wo es einen gibt, wie im Vorschlag."]
+    if removed:
+        L += ["", "Gegenüber dem geladenen Profil entfernt: " + ", ".join("`%s`" % _md(x.get("key"), 80) for x in removed[:40]) + ("" if len(removed) <= 40 else " …")]
+    if only:
+        L += ["", "Vorschlag ohne Zeile im Profil: " + ", ".join("`%s` = %s" % (_md(x.get("key"), 80), _md(redact.value_for_issue(str(x.get("key")), x.get("value"), known), 80) or "(leer, Schalter an)")
+                                                              for x in only[:40]) + ("" if len(only) <= 40 else " …")]
+    return L
+
+
+def _issue_verdicts(dry, reg_rows: List[dict], line: str) -> List[str]:
+    """Block Verdikte und Force: aus dem LETZTEN Trockenlauf; Forcebarkeit wird aus dem Register NEU gelesen (dem Browser wird sie nicht geglaubt)."""
+    L = ["### Verdikte und Force", ""]
+    have = isinstance(dry, dict) and isinstance(dry.get("rejections"), list)
+    if not have:
+        L.append("Kein Trockenlauf gefahren (Abschnitt Trockenlauf: Karten wählen, prüfen lassen, den Laufbericht neu erzeugen).")
+    else:
+        L.append("Trockenlauf: %s" % _md(dry.get("verdict") or ("Der Planer lehnt nichts ab." if not dry["rejections"] else ""), 400))
+    reg = {r.get("code"): r for r in reg_rows or []}
+    if have and dry["rejections"]:
+        L += ["", "| Code | Klasse | Force | Text | Folge |", "|---|---|---|---|---|"]
+        seen = set()
+        for q in dry["rejections"][:64]:
+            if not isinstance(q, dict) or not isinstance(q.get("code"), str) or not 0 < len(q["code"]) <= 40 or q["code"] in seen:
+                continue
+            seen.add(q["code"])
+            r = reg.get(q["code"]) or {}
+            label, state, _via = force_verdict(r) if r else ("unbekannter Code: nicht als forcebar behandelt", "blockiert", None)
+            L.append("| `%s` | %s | %s | %s | %s |" % (_md(q["code"], 40), _md(r.get("klass_label") or r.get("klass") or "?", 60), _md("%s: %s" % (state, label), 160),
+                                                       _md(_clip_text(q["code"], q.get("text")), 300), _md(r.get("consequence") or "–", 240)))
+    fh = force_hint(dry, reg_rows, line)
+    L += ["", "Force: %s" % _md(fh["text"], 400)]
+    if fh["show_line"]:
+        L.append("")
+        L.append("Beim Serverstart `%s` setzen; übergangen werden: %s." % (fh["force_env"], ", ".join("`%s`" % c["code"] for c in fh["force_codes"])))
+    if fh["blocked_codes"]:
+        L.append("")
+        L.append("Auch mit Force bestehen bleiben: %s." % ", ".join("`%s`" % c["code"] for c in fh["blocked_codes"]))
+    if fh["records_note"]:
+        L.append("")
+        L.append(fh["records_note"])
+    if have and dry.get("notes"):
+        L += [""] + ["- Hinweis: " + _md(n, 300) for n in dry["notes"][:8]]
+    return L
+
+
 class ProfilEditor:
     def __init__(self, *, kartenplaner, release_dir: str = DEFAULT_RELEASE_DIR, user_dir: str = DEFAULT_USER_DIR,
-                 tree: Optional[str] = None, catalog_file: str = CATALOG_FILE, topology=None):
+                 tree: Optional[str] = None, catalog_file: str = CATALOG_FILE, topology=None, oracle=None, hardware=None, check_path=None):
         self.kp = kartenplaner
+        #: AP-D: das Orakel (``profil_oracle.OracleService``: Kindprozess mit dem Launcher-Trockenlauf + Cache).  ``None`` = ohne Orakel
+        #: rechnet der Trockenlauf mit der Teilliste des Planer-Gates (die einzige Ausnahme: Orakel nicht konfiguriert oder nicht startbar)
+        self.oracle = oracle
+        #: ``hardware() -> {"ok", "profile": flliper.hardware/1}`` (der Dienst ``hwprofil.get``); gewaehlte Karten, die genau die NVML-Karten
+        #: dieses Rigs sind, fragen das Orakel mit ihren echten UUIDs statt mit synthetischen
+        self.hardware = hardware
+        #: ``check_path(path, what) -> path`` (der Modellwurzel-Wachposten ``modellprofil.check_path``) fuer Modellpfade im Vorschlags-Aufruf
+        self.check_path = check_path
         #: Auftrag 1984 (C): ``topology(n) -> {"ok": True, "refused": None | text} | {"ok": False, "error": ..}``, gerechnet im Kindprozess mit der
         #: sglang-Umgebung (``CouplingsService.topology``); ohne sie rechnet der Trockenlauf wie bisher im Prozess
         self.topology = topology
@@ -263,7 +466,9 @@ class ProfilEditor:
                 "cards": CAT.catalog_public(), "pcie": {"gens": list(TR.GENS), "lanes": list(TR.LANES)},
                 "rig_preset": self.kp.catalog().get("rig_preset"),
                 "register": self.register(), "coverage": cat.get("stats"), "tree_rev": cat.get("tree_rev"),
-                "planner_tree": self.tree}
+                "planner_tree": self.tree,
+                # AP-H1: die Daten der einen Seite (Betriebsformen, Abschnitte, Dual-ENV-Tabelle, Reglergrenzen); fehlt der Schlüssel, zeichnet die Seite wie bisher
+                "planer": PLANER.ui_info(self.FORMS, cat.get("entries"), self.oracle is not None)}
 
     def known_models(self) -> dict:
         """Every model / draft path the release profiles name, with what THIS container can read of it.  A path that is not readable here
@@ -524,6 +729,68 @@ class ProfilEditor:
                         "oder die exportierte Datei als <profiles>/%s.env). Das Dashboard startet nichts; unten steht ein Beispielaufruf zum Anpassen "
                         "(Image, Mounts und Flags sind Platzhalter)." % (name, name, name)}
 
+    # ------------------------------------------------------------------ Issue-Text "Laufbericht" (AP-I)
+    def issue_report(self, doc: dict, dry=None, cards=None, model=None, hardware_md: str = "", versions: Optional[dict] = None,
+                     now: Optional[float] = None) -> dict:
+        """Der Laufbericht als EIN Markdown-Block für ein GitHub-Issue: Hardwareprofil (Kurzform, ``hardware_md`` kommt aus ``hwprofil.issue_short``),
+        Modellprofil, Betriebsform, Vorschlag + Übersteuerungen, Verdikte/Force, Versionen und der Platzhalter für Messergebnis und Boot-Log-Auszug.
+        Nur Text; das Dashboard startet nichts.  ``dry`` = Antwort des letzten Trockenlaufs (oder ``None``), ``cards`` = die gewählten Karten
+        ``[{card, pcie}]``, ``model`` = ein Modellprofil ``flliper.model/1`` (oder ``None``), ``versions`` = ``hwprofil.version_facts``.
+        Geheimnisse (nach Name und nach Wert) und Hostpfade sind entfernt (``redact``); Forcebarkeit wird aus dem Register NEU gelesen."""
+        pj, _ref = self.mods()
+        if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
+            raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+        view = pj.view(doc, self.catalog()["entries"], None, self.specs())
+        try:
+            reg = self.register()
+        except Exception:       # noqa: BLE001 -- ohne Register keine Force-Aussage (alle Codes "unbekannt"), der Bericht lebt weiter
+            reg = []
+        v = versions or {}
+        now = time.time() if now is None else now
+        name = _md(doc.get("name") or "profil", 80)
+        line = str(doc.get("line") or "")
+        labels, src = _issue_cards(dry, cards)
+        form = issue_betriebsform([r["name"] for r in view["rows"]], len(labels) or None)
+        known = frozenset(self.catalog()["entries"])
+        by_name = {r["name"]: redact.value_for_issue(r["name"], r.get("value"), known) for r in view["rows"] if r["kind"] == "var"}
+        meta = doc.get("meta") or {}
+        based = meta.get("based_on") or {}
+        L: List[str] = ["## Laufbericht (Profil-Editor): `%s`" % name, "",
+                        "Erzeugt %s im Profil-Editor des Dashboards; er startet nichts. Alle Werte stammen aus dem Profil, dem Trockenlauf und den "
+                        "Profilen von Hardware und Modell; was nicht belegt ist, steht als \"unbelegt\"." % time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(now)), ""]
+        L += (hardware_md.strip().split("\n") if hardware_md and hardware_md.strip() else
+              ["### Hardwareprofil (Kurzform)", "", "Hardwareprofil nicht verfügbar (unbelegt)."])
+        L += [""] + _issue_model(model, view["rows"])
+        L += ["", "### Betriebsform", "", "| Angabe | Wert |", "|---|---|",
+              "| Betriebsform | %s |" % _md(form["form"]),
+              "| Abgeleitet aus | %s (aus den Flags des Profils gelesen, keine Wahl des Planers) |" % _md(form["why"]),
+              "| Linie | %s |" % _md(line or "unbelegt"),
+              "| Profil | `%s`%s |" % (name, (", Basis %s `%s`" % (_md(based.get("kind"), 20), _md(based.get("name"), 60))) if based.get("name") else ""),
+              "| Profilstand | %s |" % _md(by_name.get("PROFILE_STATUS") or "unbelegt"),
+              "| Karten (%s) | %d: %s |" % (src, len(labels), _md(", ".join(labels) or "keine", 400)),
+              "| Kartenzahl laut Profil | %s |" % _md(by_name.get("PROFILE_CARD_COUNT") or "unbelegt"),
+              "| Inventar laut Profil | %s |" % _md(by_name.get("PROFILE_INVENTORY") or "unbelegt")]
+        L += [""] + _issue_proposal(view, known)
+        L += [""] + _issue_verdicts(dry, reg, line)
+        pid = str(doc.get("id") or "")
+        sha = str(based.get("sha256") or "")
+        sha = sha[len("sha256:"):] if sha.startswith("sha256:") else sha
+        L += ["", "### Versionen", "", "| Angabe | Wert |", "|---|---|",
+              "| Baum (Revision) | %s |" % _md(HW.version_tree_text(v)),
+              "| Image | %s |" % _md(HW.version_image_text(v)),
+              "| Treiber | %s |" % _md(v.get("driver") or "unbelegt"),
+              "| CUDA / torch (Messprozess) | %s / %s |" % (_md(v.get("cuda") or "unbelegt"), _md(v.get("torch") or "unbelegt")),
+              "| Dashboard | %s |" % _md(v.get("rigdash") or "unbelegt"),
+              "| Profil-ID | `%s` |" % _md(pid[:19] if pid else "unbelegt"),
+              "| Basisprofil (sha256) | %s |" % (("`%s`" % _md(sha[:16])) if sha else "unbelegt")]
+        L += ["", "### Messergebnis / Boot-Log-Auszug", "",
+              "<!-- Ergebnis des Starts eintragen: läuft / bricht ab, Messwerte (Durchsatz, Rundenzeit), die ersten Zeilen des Boot-Logs mit den "
+              "Ablehnungen (REFUSED) und FORCED-PAST-Zeilen. Keine Schlüssel, keine Pfade des Rechners. -->", "",
+              "Ergebnis: _(hier eintragen)_", "", "```text", "(Boot-Log-Auszug hier einfügen)", "```"]
+        text = redact.text_for_issue("\n".join(L)) + "\n"
+        return {"ok": True, "format": "markdown", "text": text, "blocks": [b for b in ISSUE_BLOCKS if ("### " + b) in text],
+                "filename": "laufbericht-%s.md" % (name if NAME_RE.match(name) else "profil")}
+
     # ------------------------------------------------------------------ Topologie-Urteil (Kindprozess zuerst, Auftrag 1984 C)
     def _topology_verdict(self, n: int, tp, notes: List[str]) -> Optional[str]:
         """Der Text einer Topologie-Ablehnung für ``n`` Karten, oder ``None`` (durchgelassen / nicht prüfbar, dann steht eine Notiz in ``notes``).
@@ -554,19 +821,11 @@ class ProfilEditor:
         return None
 
     # ------------------------------------------------------------------ Trockenlauf: welche Ablehnungen hätte der Planer
-    def dry_run(self, doc: dict, cards_req: list, host_patched: bool = True) -> dict:
-        pj, ref = self.mods()
-        if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
-            raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+    def _build_cards(self, cards_req: list) -> List[dict]:
         if not cards_req:
             raise ProfilError("mindestens eine Karte wählen")
         if len(cards_req) > MAX_CARDS:
             raise ProfilError("höchstens %d Karten" % MAX_CARDS)
-        rows = {r["name"]: r for r in pj.rows(doc, self.specs()) if r["kind"] == "var"}
-
-        def var(n: str) -> str:
-            return str((rows.get(n) or {}).get("value", ""))
-
         cards = []
         for i, rc in enumerate(cards_req):
             e = CAT.card(rc.get("card"))
@@ -574,14 +833,24 @@ class ProfilEditor:
                 raise ProfilError("Karte %r nicht im Katalog" % rc.get("card"))
             link = TR.per_card_link(e, rc.get("pcie"))
             cards.append({"index": i, "entry": e, "label": CAT.label(e), "link": link})
-        found: List[dict] = []
-        notes: List[str] = []
-        gate_rows = []
+        return cards
+
+    @staticmethod
+    def _gate_rows(cards: List[dict]) -> List[dict]:
+        out = []
         for c in cards:
             e, l = c["entry"], c["link"]
-            gate_rows.append({"nvml_index": c["index"], "uuid": "synthetisch-%d" % c["index"], "name": e["nvml_name"],
-                              "total_mib": e["usable_mib"], "cc": e["cc"], "bar1_total_mib": l["bar1_mib"],
-                              "pcie_max_gen": l["effective"]["gen"], "pcie_max_width": l["effective"]["lanes"]})
+            out.append({"nvml_index": c["index"], "uuid": "synthetisch-%d" % c["index"], "name": e["nvml_name"],
+                        "total_mib": e["usable_mib"], "cc": e["cc"], "bar1_total_mib": l["bar1_mib"],
+                        "pcie_max_gen": l["effective"]["gen"], "pcie_max_width": l["effective"]["lanes"]})
+        return out
+
+    def _gate_found(self, pj, doc: dict, cards: List[dict], var, notes: List[str]) -> List[dict]:
+        """Die Teilprüfung des Planer-Gates (Karten, Kartenzahl, Inventar, Topologie) ohne Launcher: NUR der Rückfall, wenn kein Orakel
+        konfiguriert oder nicht startbar ist (die Notiz sagt es).  Der Orakel-Weg (``_dry_oracle``) ersetzt diese Liste durch das, was der
+        Launcher selbst sagt."""
+        found: List[dict] = []
+        gate_rows = self._gate_rows(cards)
         try:
             ci, tp = self.kp._mods()
         except Exception as exc:        # noqa: BLE001
@@ -621,6 +890,146 @@ class ProfilEditor:
                 # refusal HW-COUNT (the 27B line names it so); N with no topology at all is HW-TOPOLOGY (not forceable)
                 code = "HW-COUNT" if (refused.startswith("HW-COUNT") or " would be " in refused) else "HW-TOPOLOGY"
                 found.append({"code": code, "text": refused, "source": "weg2/topology.plan_topology"})
+        return found
+
+    def _count_found(self, cards: List[dict], var) -> List[dict]:
+        """``PROFILE_CARD_COUNT`` gegen die gewählten Karten (das prüft der Entrypoint, nicht der Launcher): dieselbe Prüfung und derselbe Text
+        wie im Rückfall-Gate; der Orakel-Weg ergänzt sie, damit sie nicht verloren geht."""
+        try:
+            want_n = int(var("PROFILE_CARD_COUNT") or 0) or None
+        except ValueError:
+            want_n = None
+        if want_n is None:
+            return []
+        try:
+            ci, _tp = self.kp._mods()
+        except Exception:               # noqa: BLE001 -- ohne Gate keine Zählung; das Orakel urteilt trotzdem
+            return []
+        from . import kartenplan_gate as GATE
+
+        try:
+            ci.order_cards([GATE._row(r) for r in self._gate_rows(cards)], want_n, gate=False)
+        except ci.CardInventoryRefused as exc:
+            return [{"code": "HW-COUNT", "text": str(exc), "source": "weg2/card_identity.order_cards (PROFILE_CARD_COUNT=%s)" % want_n}]
+        return []
+
+    @staticmethod
+    def _hw_cards_match(hw: dict, cards: List[dict]) -> bool:
+        """Sind die gewählten Karten genau die NVML-Karten dieses Rigs (gleiche Namen, gleiche Größen, gleiche Zahl)?"""
+        try:
+            have = sorted((str(c["name"]), int((c["vram_total_mib"] or {}).get("v") if isinstance(c["vram_total_mib"], dict) else c["vram_total_mib"]))
+                          for c in hw.get("cards") or [])
+            want = sorted((str(c["entry"]["nvml_name"]), int(c["entry"]["usable_mib"])) for c in cards)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return bool(have) and have == want
+
+    def _hardware_profile(self) -> Optional[dict]:
+        if self.hardware is None:
+            return None
+        try:
+            hw = self.hardware()
+        except Exception:               # noqa: BLE001 -- ohne Hardwareprofil gibt es synthetische Karten
+            return None
+        prof = hw.get("profile") if isinstance(hw, dict) else None
+        return prof if isinstance(prof, dict) and prof.get("cards") else None
+
+    def _inventar_for(self, cards: List[dict], notes: List[str]) -> dict:
+        """Das Inventar der Orakel-Frage: die NVML-Karten dieses Rigs (echte UUIDs), wenn die gewählten Karten genau sie sind, sonst
+        synthetische Karten aus dem Katalog (Datenblatt, synthetische UUID: der Launcher kennt solche UUIDs nicht, z. B. im Census)."""
+        hw = self._hardware_profile()
+        if hw is not None and self._hw_cards_match(hw, cards):
+            notes.append("Die gewählten Karten sind die NVML-Karten dieses Rigs (Hardwareprofil): der Trockenlauf läuft mit ihren echten UUIDs.")
+            return {"hardware": hw}
+        notes.append("Synthetische Karten aus dem Katalog (Datenblatt, synthetische UUID): was der Launcher an Karten-UUIDs bindet (Census), "
+                     "kennt sie nicht.")
+        return {"cards": [{"entry": c["entry"], "link": c["link"]} for c in cards]}
+
+    @staticmethod
+    def _inventar_key(inv: dict) -> list:
+        if inv.get("hardware"):
+            return [["nvml", str(c.get("uuid")), str(c.get("name")), c.get("vram_total_mib"), c.get("cc")] for c in inv["hardware"].get("cards") or []]
+        return [["katalog", str(c["entry"].get("id")), (c.get("link") or {}).get("effective"), (c.get("link") or {}).get("bar1_mib")]
+                for c in inv.get("cards") or []]
+
+    def _dry_oracle(self, doc: dict, cards: List[dict], var, notes: List[str]) -> Optional[dict]:
+        """Das Orakel zum Profil auf den gewählten Karten: ``{"found": [...], "verdikt": ..., "res": ...}``; ``None`` (mit Notiz), wenn es
+        nicht fragen konnte -- dann gilt die Teilprüfung des Planer-Gates."""
+        pj, _ref = self.mods()
+        try:
+            text = pj.render_env(doc)
+        except Exception as exc:        # noqa: BLE001 -- ein Profil, das sich nicht darstellen lässt, geht an den Rückfall
+            notes.append("Orakel nicht gefragt: das Profil lässt sich nicht als .env darstellen (%s: %s). Es gilt die Teilprüfung des Planer-Gates."
+                         % (type(exc).__name__, exc))
+            return None
+        inv = self._inventar_for(cards, notes)
+        parts = {"inventar": self._inventar_key(inv), "env_sha256": ORA.sha256_text(text), "form": None}
+        based = (doc.get("meta") or {}).get("based_on") or {}
+        res = self.oracle.ask("verdikt", {"basis": {"env_text": text, "source": "%s.env" % (based.get("name") or doc.get("name") or "profil")}, "inventar": inv}, parts)
+        if not res.get("ok"):
+            notes.append("Orakel (Launcher-Trockenlauf) nicht verfügbar: %s. Es gilt die Teilprüfung des Planer-Gates (Karten, Kartenzahl, "
+                         "Topologie); die Rechnung des Launchers fehlt." % (res.get("error") or "unbekannter Fehler"))
+            return None
+        v = res.get("verdikt") or {}
+        if v.get("ausgang") == "orakel_fehler":
+            why = next((x.get("text") for x in v.get("verdikte") or [] if x.get("code") == "ORAKEL-FEHLER"), "")
+            notes.append("Das Orakel konnte nicht fragen: %s. Es gilt die Teilprüfung des Planer-Gates." % why)
+            return None
+        found = self._found_from_verdikt(v)
+        for f in self._count_found(cards, var):
+            if not any(x["code"] == "HW-COUNT" and x["text"] == f["text"] for x in found):
+                found.append(f)
+        return {"found": found, "verdikt": v, "res": res}
+
+    @staticmethod
+    def _found_from_verdikt(v: dict) -> List[dict]:
+        """Ablehnungen der Rückgabeform ``{code, text, source}`` aus den Verdikten der Ebene Lauf (durchgelassen oder beendend); die Blocker
+        im Text von HW-COUNT, FIT und Hinweise stehen in ``verdikte`` der Antwort, nicht als eigene Ablehnung."""
+        out = []
+        for x in v.get("verdikte") or []:
+            if x.get("ebene") in ("lauf", "absturz", "orakel") and not x.get("parent"):
+                src = "Launcher-Trockenlauf (Orakel, weg2/propose_verdict)"
+                if x.get("launcher_code"):
+                    src += ", %s" % x["launcher_code"]
+                if x.get("wo"):
+                    src += ", %s" % x["wo"]
+                out.append({"code": x["code"], "text": x.get("text") or x.get("grund") or x["code"], "source": src, "verdikt": x})
+        return out
+
+    @staticmethod
+    def _register_row(f: dict, reg: dict) -> dict:
+        """Die Registerzeile zu einer Ablehnung; ein Orakel-Code ohne Registerzeile (ORAKEL-ABSTURZ ...) bekommt eine nicht forcebare aus seinem Verdikt."""
+        r = reg.get(f["code"])
+        if r is None and f.get("verdikt"):
+            v = f["verdikt"]
+            return {"code": f["code"], "klass": "nicht_forcebar", "klass_label": "nicht forcebar", "forcebar": False, "wired": None,
+                    "wired_at": None, "why_class": "%s: %s" % (v.get("titel") or f["code"], v.get("konsequenz") or ""), "consequence": v.get("konsequenz")}
+        return r or {}
+
+    def dry_run(self, doc: dict, cards_req: list, host_patched: bool = True) -> dict:
+        """Trockenlauf: welche Ablehnungen hätte der Planer für dieses Profil auf diesen Karten.
+
+        AP-D: mit Orakel (``self.oracle``) sagt der LAUNCHER selbst, was er daraus macht (Trockenlauf auf einem NVML-Replay der gewählten Karten,
+        erst ohne, dann mit ``--force``: jede Wert-Ablehnung, die Force übergeht, und was auch dann noch beendet; ein Absturz des Launchers ist
+        ein Verdikt ``ORAKEL-ABSTURZ``).  Das Rückgabeformat bleibt (``ok, goes, verdict, rejections, notes, cards, force_note, reference``);
+        neu sind ``quelle`` (``orakel`` | ``gate``), ``orakel`` (Ausgang, Profil-Hash, Cache) und ``verdikte`` (alle Verdikte, auch Blocker und Hinweise)."""
+        pj, ref = self.mods()
+        if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
+            raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+        rows = {r["name"]: r for r in pj.rows(doc, self.specs()) if r["kind"] == "var"}
+
+        def var(n: str) -> str:
+            return str((rows.get(n) or {}).get("value", ""))
+
+        cards = self._build_cards(cards_req)
+        notes: List[str] = []
+        orakel = self._dry_oracle(doc, cards, var, notes) if self.oracle is not None else None
+        if orakel is not None:
+            found = list(orakel["found"])
+            quelle = "orakel"
+        else:
+            found = self._gate_found(pj, doc, cards, var, notes)
+            quelle = "gate"
         st = var("PROFILE_STATUS") or ("platzhalter" if var("PROFILE_PLACEHOLDER") == "1" else "abgenommen")
         if st != "abgenommen":
             found.append({"code": "PROFIL-STATUS", "text": "Profil %r hat den Stand %s (%s)" % (doc.get("name"), st.upper(), var("PROFILE_OWNER") or "Eigentümer offen"),
@@ -628,16 +1037,25 @@ class ProfilEditor:
         transport = TR.choose_transport([c["link"] for c in cards], [c["label"] for c in cards], host_patched=host_patched)
         if transport["transport"] == "nccl":
             notes.append("Transport NCCL statt barlink BAR1: " + " ".join(transport["reasons"]))
-        notes.append("Nicht geprüft (das Dashboard sieht den Host nicht): Pfade des Modells, Drafts und Stores, SHM-Größe, freier Host-Speicher, "
-                     "Belegung der Karten. Der Server prüft sie beim Start; die Belegungsprüfung hebt Force nie auf.")
+        if orakel is not None:
+            notes.append("Nicht geprüft (der Trockenlauf des Launchers läuft auf einem Abbild der Karten und einem festen ruhigen Host): Modell- und Draft-Dateien "
+                         "(Kopf-Snapshots bzw. Geschwister-Checkpoints stehen für leere Mountpunkte), echter freier Host-Speicher, SHM-Größe, Belegung der Karten. "
+                         "Der Server prüft sie beim Start; die Belegungsprüfung hebt Force nie auf.")
+            notes += [str(x) for x in (orakel["verdikt"].get("orakel") or {}).get("notizen") or []]
+        else:
+            notes.append("Nicht geprüft (das Dashboard sieht den Host nicht): Pfade des Modells, Drafts und Stores, SHM-Größe, freier Host-Speicher, "
+                         "Belegung der Karten. Der Server prüft sie beim Start; die Belegungsprüfung hebt Force nie auf.")
         reg = {r["code"]: r for r in self.register()}
         out = []
         for f in found:
-            r = reg.get(f["code"]) or {}
+            r = self._register_row(f, reg)
             force, state, via = force_verdict(r)
-            out.append(dict(f, klass=r.get("klass"), klass_label=r.get("klass_label"), forcebar=bool(r.get("forcebar")),
-                            wired=r.get("wired"), wired_at=r.get("wired_at"), force=force, force_state=state, force_via=via,
-                            why_class=r.get("why_class"), consequence=r.get("consequence")))
+            row = dict({k: v for k, v in f.items() if k != "verdikt"}, klass=r.get("klass"), klass_label=r.get("klass_label"), forcebar=bool(r.get("forcebar")),
+                       wired=r.get("wired"), wired_at=r.get("wired_at"), force=force, force_state=state, force_via=via,
+                       why_class=r.get("why_class"), consequence=r.get("consequence"))
+            if f.get("verdikt"):
+                row["verdikt"] = f["verdikt"]
+            out.append(row)
         n_force = sum(1 for o in out if o["force_state"] == "force")
         n_open = sum(1 for o in out if o["force_state"] == "ungeprueft")
         n_block = len(out) - n_force - n_open
@@ -653,15 +1071,293 @@ class ProfilEditor:
             if n_block:
                 verdict += ", %d bleiben auch mit Force bestehen (nicht forcebar bzw. noch nicht verdrahtet)" % n_block
             verdict += "."
-        return {"ok": True, "goes": not out, "verdict": verdict, "rejections": out, "notes": notes,
-                "cards": [{"index": c["index"], "label": c["label"], "arch": c["entry"]["arch"]} for c in cards],
-                "force_note": "Force gibt es nur am Serverstart (FLLIPER_FORCE=1 / --force), nicht im Dashboard. Er hebt alle Wert-Ablehnungen auf, "
-                              "die der Launcher verdrahtet hat, und im Docker-Start zusätzlich die, die der Entrypoint selbst prüft "
-                              "(PROFIL-STATUS, SHM, STORE, MEMAVAIL: im Docker-Start (Entrypoint) forcebar, im reinen Launcher-Aufruf nicht), "
-                              "listet jede im Boot-Log als FORCED-PAST <CODE> <Grund> und schreibt keine Records. "
-                              "Nicht übergangen werden: Belegungsprüfung (fremder Prozess/Fenster auf der Karte), fehlendes oder kaputtes Modell, "
-                              "nicht unterstützte Architektur.",
-                "reference": {"inventory": list(ci.REFERENCE_INVENTORY) if ci is not None else None}}
+        res = {"ok": True, "goes": not out, "verdict": verdict, "rejections": out, "notes": notes,
+               "cards": [{"index": c["index"], "label": c["label"], "arch": c["entry"]["arch"]} for c in cards],
+               "force_note": "Force gibt es nur am Serverstart (FLLIPER_FORCE=1 / --force), nicht im Dashboard. Er hebt alle Wert-Ablehnungen auf, "
+                             "die der Launcher verdrahtet hat, und im Docker-Start zusätzlich die, die der Entrypoint selbst prüft "
+                             "(PROFIL-STATUS, SHM, STORE, MEMAVAIL: im Docker-Start (Entrypoint) forcebar, im reinen Launcher-Aufruf nicht), "
+                             "listet jede im Boot-Log als FORCED-PAST <CODE> <Grund> und schreibt keine Records. "
+                             "Nicht übergangen werden: Belegungsprüfung (fremder Prozess/Fenster auf der Karte), fehlendes oder kaputtes Modell, "
+                             "nicht unterstützte Architektur.",
+               "reference": {"inventory": list(ci.REFERENCE_INVENTORY) if (ci := self._ci()) is not None else None},
+               "quelle": quelle}
+        if orakel is not None:
+            v = orakel["verdikt"]
+            res["verdikte"] = v.get("verdikte") or []
+            based = (doc.get("meta") or {}).get("based_on") or {}
+            res["orakel"] = {"ausgang": v.get("ausgang"), "geht": v.get("geht"), "geht_mit_force": v.get("geht_mit_force"), "profil": v.get("profil"),
+                             # Plan 4c: der Hash des Profils, nach dem gefragt wurde: Text (wie dem Orakel gegeben), Datei des Release-Profils (beim Laden)
+                             "profil_text_sha256": ORA.sha256_text(pj.render_env(doc)), "profil_datei_sha256": based.get("sha256"), "basis": based or None,
+                             "argv_sha256": v.get("argv_sha256"), "dauer_s": (v.get("orakel") or {}).get("dauer_s"),
+                             "version": (v.get("orakel") or {}).get("version"), "laeufe": (v.get("orakel") or {}).get("laeufe"),
+                             "cached": bool(orakel["res"].get("cached")), "cache_key": orakel["res"].get("cache_key"), "plan": v.get("plan"),
+                             "zaehlung": v.get("zaehlung")}
+        return res
+
+    def _ci(self):
+        try:
+            return self.kp._mods()[0]
+        except Exception:               # noqa: BLE001 -- ohne Gate keine Referenzliste
+            return None
+
+    # ------------------------------------------------------------------ Vorschlag (Stufe A + Orakel + Verdikte, AP-D)
+    PROPOSE_SCHEMA = "flliper.propose-d/1"
+    #: die Formen des Vorschlags: flip, tp und dual = Planer + Launcher-Trockenlauf (Orakel); single = die Einzelkarte, Planer-Rechnung ohne Launcher
+    #: (``weg2/propose_single``, kein weg2-Launcher bei N=1: ``topology.py`` MIN_CARDS=2)
+    FORMS = ("flip", "tp", "dual", "single")
+    #: Namen der Einzelkarte in einer Anfrage (der Plan sagt ``einzel``, die Seite schickt ``single``)
+    FORM_ALIAS = {"einzel": "single", "einzelkarte": "single"}
+    #: Betriebsform des Vorschlags -> Form des Balkenvertrags ``flliper.balken/1`` (AP-H2: ``what=phase_bars``, ``form``; ``profile_couplings.FORMS``)
+    BALKEN_FORM = {"flip": "flip", "tp": "d_only", "dual": "dual", "single": "single"}
+    ZIELE_INT = {"seats": (1, 256), "kv_tokens": (1024, 8 << 20)}
+    ZIELE_CHOICE = {"kv_dtype": ("auto", "fp8_e4m3"), "p_cut": ("auto", "pin", "seed"), "draft_kv_on_p": ("on", "off")}
+    #: Ziele, die nur die Einzelkarte kennt (``propose_single``: Host-RAM-Budget fuer HiCache, gemessenes ``pre_model_load_memory``, gemessene Reserve, Draft-Wahl)
+    ZIELE_INT_EINZEL = {"host_ram_mib": (1, 8 << 20), "pre_load_free_mib": (1, 1 << 20), "reserve_mib": (0, 1 << 20)}
+    ZIELE_CHOICE_EINZEL = {"draft": ("auto", "on", "off", "nextn", "external")}
+
+    def _ziele(self, z, form: str = "flip") -> dict:
+        """Die Ziele des Vorschlags (``propose(ziele)``), geprüft: nur bekannte Schlüssel, Zahlen im Bereich, Auswahl aus der Liste."""
+        if z in (None, {}):
+            return {}
+        if not isinstance(z, dict):
+            raise ProfilError("ziele muss ein JSON-Objekt sein")
+        ints, choices = dict(self.ZIELE_INT), dict(self.ZIELE_CHOICE)
+        if form == "single":
+            ints.update(self.ZIELE_INT_EINZEL)
+            choices.update(self.ZIELE_CHOICE_EINZEL)
+        known = set(ints) | set(choices) | {"d_objective", "force_rules"}
+        bad = sorted(set(z) - known)
+        if bad:
+            raise ProfilError("unbekannte Ziele: %s (erlaubt: %s)" % (", ".join(bad), ", ".join(sorted(known))))
+        out: dict = {}
+        for k, (lo, hi) in ints.items():
+            if z.get(k) not in (None, ""):
+                try:
+                    v = int(z[k])
+                except (TypeError, ValueError):
+                    raise ProfilError("Ziel %s muss eine ganze Zahl sein" % k)
+                if not lo <= v <= hi:
+                    raise ProfilError("Ziel %s muss zwischen %d und %d liegen" % (k, lo, hi))
+                out[k] = v
+        for k, opts in choices.items():
+            if z.get(k) not in (None, ""):
+                if z[k] not in opts:
+                    raise ProfilError("Ziel %s muss eines von %s sein" % (k, ", ".join(opts)))
+                out[k] = z[k]
+        if z.get("d_objective") not in (None, ""):
+            v = str(z["d_objective"])
+            if not (0 < len(v) <= 32 and all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in v)):
+                raise ProfilError("Ziel d_objective: Kleinbuchstaben, Ziffern und - (höchstens 32 Zeichen)")
+            out["d_objective"] = v
+        if z.get("force_rules"):
+            out["force_rules"] = True
+        return out
+
+    @staticmethod
+    def doc_key(label: str) -> Optional[str]:
+        """Schlüssel der Profilzeile (``profile_json.rows``) zur Bezeichnung eines Werts im Vorschlag (``propose.slot_label``): ``--flag`` ->
+        ``flag:--flag``, ``--extra-p --x`` -> ``extra:P:--x``, ``--env-d NAME`` -> ``env:D:NAME``, ``env NAME`` -> ``export:NAME``; ``None`` für
+        eine Zeile, die keine Profilzeile ist (der P-Schnitt-Seed ``--pp-stage-ratio (Seed)``)."""
+        lab = str(label)
+        if lab.endswith(" (Seed)"):
+            return None
+        for pre, kind in (("--extra-p ", "extra:P:"), ("--extra-d ", "extra:D:"), ("--env-p ", "env:P:"), ("--env-d ", "env:D:")):
+            if lab.startswith(pre):
+                return kind + lab[len(pre):]
+        if lab.startswith("env "):
+            return "export:" + lab[4:]
+        if lab.startswith("--"):
+            return "flag:" + lab
+        return None
+
+    def _startprofil(self, base: dict, vorschlag: dict, basis_name: str) -> tuple:
+        """Das Startprofil ``flliper.server/1``: das Basisprofil mit den Werten, die der Vorschlag ändert (Herkunft ``planer``).  Gibt
+        ``(doc, keys, nicht_uebernommen)``: ``keys`` = Label -> Profilschlüssel der geänderten Zeilen."""
+        pj, _ref = self.mods()
+        edits, keys, skipped = [], {}, []
+        planner_only: Dict[str, str] = {}
+        for w in vorschlag.get("werte") or []:
+            if not w.get("geaendert"):
+                continue
+            key = self.doc_key(w["key"])
+            if key is None:
+                if w.get("wert") is not None:          # der P-Schnitt-Seed: kein Profilwert, aber die Rechnung des Planers (planner_only)
+                    planner_only["flag:" + str(w["key"]).replace(" (Seed)", "")] = str(w["wert"])
+                else:
+                    skipped.append(w["key"])
+                continue
+            keys[w["key"]] = key
+            if w.get("wert") is None:
+                if w.get("alt") is not None:
+                    edits.append({"key": key, "op": "delete"})
+            else:
+                edits.append({"key": key, "op": "set", "value": str(w["wert"])})
+        new = pj.apply_edits(base, edits, self.specs())
+        meta = new.setdefault("meta", {"origins": {}, "planner": {}, "notes": []})
+        for e in edits:                                  # ein Wert des Planers ist nicht "vom Nutzer": Herkunft planer
+            meta["origins"][e["key"]] = pj.ORIGIN_PLANER
+            if e["op"] == "set":
+                meta.setdefault("planner", {})[e["key"]] = e["value"]
+        meta.setdefault("planner", {}).update(planner_only)
+        new["name"] = ("%s-vorschlag" % basis_name)[:64]
+        return new, keys, skipped
+
+    def _single_base(self, name: str, model_path: str) -> dict:
+        """Das leere Profil der Einzelkarte (``flliper.server/1`` ohne weg2-Zeilen): nur Name, Linie und Modellpfad; die Argumente des normalen Servers setzt
+        der Vorschlag hinein.  Kein Release-Profil als Grundlage: dessen Zeilen (``--pp-size``, ``--d-bs`` ...) gehören zum weg2-Launcher, den die Einzelkarte nicht hat."""
+        pj, _ref = self.mods()
+        doc = {"schema": pj.SCHEMA, "name": ("%s" % name)[:64], "line": "einzel", "source": {"kind": "planer", "file": "", "sha256": "", "rc": 0},
+               "vars": [{"name": "PROFILE_LINE", "value": "einzel"}, {"name": "PROFILE_MODEL", "value": model_path}, {"name": "PROFILE_NAME", "value": name}],
+               "exports": [], "args": [], "form": [], "instr": [], "meta": {"origins": {}, "planner": {}, "notes": [], "caller_switches": []}}
+        doc["id"] = pj.doc_id(doc)
+        return doc
+
+    def propose(self, body: dict) -> dict:
+        """``POST /api/profil/propose``: Vorschlag (``weg2/propose.propose``) + Orakel (Launcher-Trockenlauf) + Verdikte je Wert, als Startprofil
+        ``flliper.server/1`` mit Herkunft, Verdikt und Kanten je Wert.
+
+        Körper: ``basis`` {kind: release|user, name}, ``form`` flip|tp|dual|single (``einzel`` ist ein Name für ``single``), ``inventar`` ``"rig"`` (das
+        Hardwareprofil dieses Rigs) oder eine Kartenliste ``[{card, pcie}]`` (Katalog, wie der Trockenlauf), ``ziele`` {seats, kv_tokens, kv_dtype, p_cut,
+        d_objective, draft_kv_on_p, force_rules; nur single: host_ram_mib, pre_load_free_mib, reserve_mib, draft}, ``model_path`` / ``draft_path`` (sonst die
+        des Basisprofils).  Läuft im Kindprozess (``self.oracle``), Cache je (Inventar, Form, Ziele, Profil-Hash, Modell); ein Fehler des Kindprozesses kommt
+        als ``ok: false`` mit Grund, nie als Absturz.
+
+        Die Form ``single`` (Einzelkarte, genau EINE Karte; ``karte`` = Ordinal im Hardwareprofil, Standard 0) hat keinen Launcher-Lauf: ihr Verdikt ist
+        eine Planer-Rechnung (``ausgang`` passt | passt_nicht | unbelegt, ``art`` Planer-Rechnung) und ihr Startprofil ein neues Profil aus den Argumenten des
+        normalen Servers (kein Basisprofil nötig; ``model_path`` oder das ``PROFILE_MODEL`` des Basisprofils)."""
+        pj, _ref = self.mods()
+        if self.oracle is None:
+            raise ProfilError("Das Orakel ist nicht konfiguriert (Kindprozess mit dem Python der sglang-Umgebung: --couplings-python / RIGDASH_COUPLINGS_PYTHON)")
+        if not isinstance(body, dict):
+            raise ProfilError("Körper muss ein JSON-Objekt sein")
+        basis = body.get("basis") or {}
+        if not isinstance(basis, dict):
+            raise ProfilError("basis muss {kind, name} sein")
+        kind, name = str(basis.get("kind") or "release"), str(basis.get("name") or "")
+        form = str(body.get("form") or "flip")
+        form = self.FORM_ALIAS.get(form, form)
+        if form not in self.FORMS:
+            raise ProfilError("form muss flip, tp, dual oder single (Einzelkarte) sein")
+        single = form == "single"
+        ziele = self._ziele(body.get("ziele"), form)
+        notes: List[str] = []
+        if single and not name:
+            doc, bas, bsha, comments = None, None, "", {}                 # die Einzelkarte braucht kein Profil: Modellpfad + Karte genügen
+            name = "einzelkarte"
+            kind = "keines"
+        elif kind == "release":
+            doc = self._import_release(name)
+            path = self._release_path(name)
+            bas = {"env_path": path}
+            bsha = ORA.sha256_file(path) or ""
+            comments = self._profile_comments(path)
+        elif kind == "user":
+            doc = self.read_user(name)
+            text = pj.render_env(doc)
+            bas = {"env_text": text, "source": name + ".json"}
+            bsha = ORA.sha256_text(text)
+            comments = {}
+        else:
+            raise ProfilError("basis.kind muss release oder user sein")
+        vars_ = {v["name"]: str(v.get("value", "")) for v in (doc or {}).get("vars") or [] if "name" in v}
+        paths = {}
+        for fld, var_name in (("model_path", "PROFILE_MODEL"), ("draft_path", "PROFILE_DRAFT")):
+            p = body.get(fld)
+            if p:
+                if self.check_path is None:
+                    raise ProfilError("%s: ohne Modellwurzel-Prüfung nicht erlaubt (nur der Pfad des Basisprofils)" % fld)
+                try:
+                    p = self.check_path(p, fld)
+                except ValueError as exc:
+                    raise ProfilError(str(exc))
+            else:
+                # das Draft-Verzeichnis eines weg2-Profils ist ein weg2-Draft: die Einzelkarte nimmt nur einen ausdrücklich genannten
+                p = "" if (single and fld == "draft_path") else (vars_.get(var_name) or "")
+            if p:
+                paths[fld] = str(p)
+        if single and not paths.get("model_path"):
+            raise ProfilError("Einzelkarte: model_path angeben (oder ein Basisprofil mit PROFILE_MODEL wählen)")
+        inv_req = body.get("inventar", "rig")
+        if inv_req == "rig":
+            hw = self._hardware_profile()
+            if hw is None:
+                raise ProfilError("Hardwareprofil dieses Rigs nicht verfügbar: für ein synthetisches Inventar die Kartenliste [{card, pcie}] angeben")
+            inventar = {"hardware": hw}
+            notes.append("Inventar: die NVML-Karten dieses Rigs (Hardwareprofil), echte UUIDs.")
+            if single:
+                try:
+                    karte = int(body.get("karte") or 0)
+                except (TypeError, ValueError):
+                    raise ProfilError("karte muss das Ordinal einer Karte des Hardwareprofils sein")
+                if not 0 <= karte < len(hw["cards"]):
+                    raise ProfilError("karte %d: das Hardwareprofil hat %d Karten" % (karte, len(hw["cards"])))
+                inventar["karte"] = karte
+                notes.append("Einzelkarte: Karte %d des Hardwareprofils (andere Karte: karte=<Ordinal>); die übrigen Karten des Rigs bleiben unberücksichtigt." % karte)
+        elif isinstance(inv_req, list):
+            if single and len(inv_req) != 1:
+                raise ProfilError("Einzelkarte: genau eine Karte wählen (nicht %d)" % len(inv_req))
+            cards = self._build_cards(inv_req)
+            inventar = self._inventar_for(cards, notes)
+        else:
+            raise ProfilError('inventar muss "rig" oder eine Kartenliste [{card, pcie}] sein')
+        parts = {"inventar": self._inventar_key(inventar) + ([["karte", inventar.get("karte")]] if single and "karte" in inventar else []), "form": form, "ziele": ziele, "basis_sha256": bsha, "basis": [kind, name], "paths": paths,
+                 "modell": [self._path_stamp(p) for p in paths.values()]}
+        req = {"basis": bas, "inventar": inventar, "form": form, "ziele": ziele, "model_path": paths.get("model_path"), "draft_path": paths.get("draft_path")}
+        res = self.oracle.ask("propose", req, parts)
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error") or "unbekannter Fehler", "schema": self.PROPOSE_SCHEMA, "notes": notes + list(res.get("notizen") or [])}
+        v = res["vorschlag"]
+        if single:
+            doc = self._single_base(name, paths["model_path"])
+        new, keys, skipped = self._startprofil(doc, v, name)
+        problems = self.verify_render(new, pj.render_env(new))
+        new["meta"]["vorschlag"] = {"schema": self.PROPOSE_SCHEMA, "form": form, "n": v["n"], "ziele": v["ziele"], "basis": [kind, name], "basis_sha256": bsha,
+                                    "ausgang": res["verdikt"].get("ausgang"), "argv_sha256": res["verdikt"].get("argv_sha256")}
+        if single:
+            new["meta"].setdefault("notes", []).append("Startprofil der Einzelkarte (Planer-Rechnung, kein weg2-Launcher): die Argumente des normalen Servers "
+                                                       "(python -m sglang.launch_server) für Modell %s" % paths["model_path"])
+        else:
+            new["meta"].setdefault("notes", []).append("Startprofil des Planers aus %s (%s) für %d Karten, Form %s" % (name, bsha[:12], v["n"], form))
+        new["id"] = pj.doc_id(new)
+        view = self.render_view(new, comments)
+        by_key = {r["key"]: r for r in view["view"]["rows"]}
+        entries = self.catalog()["entries"]
+        werte = []
+        je_wert = res.get("je_wert") or {}
+        for w in v.get("werte") or []:
+            dkey = keys.get(w["key"]) or self.doc_key(w["key"])
+            row = by_key.get(dkey) if dkey else None
+            ent = entries.get(dkey.split(":", 2)[-1].split("#")[0] if dkey else "") or entries.get(str(w["key"]).split()[-1]) or {}
+            kanten = (row["explain"]["depends"] if row else [dict(d) for d in ent.get("depends", [])])
+            wv = {"key": dkey, "label": w["key"], "wert": w.get("wert"), "alt": w.get("alt"), "zustand": w.get("zustand"), "herkunft": w.get("herkunft"),
+                  "grund": w.get("grund"), "geaendert": bool(w.get("geaendert")), "in_argv": bool(w.get("in_argv")), "eintraege": w.get("eintraege"),
+                  "verdikte": je_wert.get(w["key"], []), "kanten": kanten}
+            werte.append(wv)
+            if row is not None:
+                row["vorschlag"] = {k: wv[k] for k in ("zustand", "herkunft", "grund", "verdikte", "kanten", "geaendert")}
+        keep = ("schema", "form", "n", "cards", "inventory", "seeds", "fit", "ziele", "unbelegt", "hinweise", "blocker", "vektorlaengen", "vektoren_ok", "vektoren_falsch", "basis",
+                "dual", "einzelkarte")
+        vd = res["verdikt"]
+        return {"ok": True, "schema": self.PROPOSE_SCHEMA, "form": form, "n": v["n"],
+                "basis": {"kind": kind, "name": name, "sha256": bsha, "profil": vd.get("profil")},
+                "startprofil": {"schema": pj.SCHEMA, "doc": new, "view": view["view"], "name": new["name"], "line": new.get("line"),
+                                "verifiziert": not problems, "probleme": problems},
+                "werte": werte, "verdikt": vd, "vorschlag": {k: v[k] for k in keep if k in v},
+                "launch": res.get("launch"),
+                "nicht_uebernommen": skipped,
+                "balken": {"route": "/api/profil/recompute", "what": "phase_bars", "form": self.BALKEN_FORM[form], "doc": new},
+                "orakel": {"cached": bool(res.get("cached")), "cache_key": res.get("cache_key"), "dauer_s": (vd.get("orakel") or {}).get("dauer_s"),
+                           "version": (vd.get("orakel") or {}).get("version")},
+                "notes": notes + [str(x) for x in res.get("notizen") or []]}
+
+    @staticmethod
+    def _path_stamp(path: str) -> list:
+        """Stand eines Modellverzeichnisses für den Cache-Schlüssel (config.json: Größe, mtime; fehlt sie: nur der Pfad)."""
+        try:
+            st = os.stat(os.path.join(path, "config.json"))
+            return [path, st.st_size, st.st_mtime_ns]
+        except OSError:
+            return [path, None, None]
 
 
 def _is_vector(value: str, n: int) -> bool:

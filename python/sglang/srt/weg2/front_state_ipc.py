@@ -527,6 +527,14 @@ class DpFlipClock:
                 "definition": "Decode-Ende -> P-Prefill-Start", "clock": "time.time front"}
 
 
+def pd_idle_flip(ready_for_d: int, handoff_in_flight: int, d_outstanding: int, d_parked: int) -> bool:
+    """P->D ``idle_flip`` marker (dashboard Flipzeit 06.10., the mirror of DpFlipClock's D->P ``idle_flip``):
+    True when, at the flip's begin, no request is waiting for D -- nothing prefilled in ``_ready_for_d``, no
+    hand-off in flight, nothing outstanding or parked on D -- i.e. no Decode is pending and the flip is the idle
+    layout swap.  The dashboard does not count such a flip as a Flipzeit (the user's exception).  Pure."""
+    return not (int(ready_for_d) or int(handoff_in_flight) or int(d_outstanding) or int(d_parked))
+
+
 class FirstWorkClock:
     """Flip time from ONE clock (time.time() of the front's own process): the flip's
     begin stamp and the woken group's first work are both taken here.

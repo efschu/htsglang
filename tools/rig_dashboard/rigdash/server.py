@@ -12,7 +12,13 @@ Routes
   GET /api/hwprofil   Hardwareprofil flliper.hardware/1 (Auftrag 950, nur rig, nur LAN)
   POST /api/hwprofil/measure   {cards:[nvml,...]}: gpuq-Fenster buchen und messen; pending = nur Status
   POST /api/hwprofil/cancel    wartendes Fenster zurückgeben
-  POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|compute|move|chunk|context, settings?, phases?}
+  POST /api/hwprofil/recapture "Neu erfassen" (AP-A): gespeichertes Hardwareprofil aus NVML ersetzen (kein GPU-Fenster, auch release)
+  GET  /api/hwprofil/issue     Issue-Text "Hardwareprofil" (Markdown zum Kopieren, redigiert)
+  POST /api/profil/issue       Issue-Text "Laufbericht" (AP-I, Markdown zum Kopieren, redigiert): {doc, dry?, cards?, model?}
+  POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|phase_bars|compute|move|chunk|context, settings?, phases?, form?}
+  POST /api/profil/propose     Startprofil des Planers (AP-D, nur LAN): {basis: {kind, name}, form: flip|tp|dual|single, inventar: "rig" | [{card, pcie}], karte?, ziele?, model_path?, draft_path?}
+                               -> propose() + Orakel (Launcher-Trockenlauf im Kindprozess, Cache) + Verdikte; flip/tp/dual: Orakel, single (Einzelkarte, genau eine Karte): Planer-Rechnung
+                               ohne Launcher (AP-F); flliper.server/1 mit Herkunft/Verdikt/Kanten je Wert
 """
 
 from __future__ import annotations
@@ -29,8 +35,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import (energy, features, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
-               modellprofil, profil, profil_recompute, redact, sampler, sources, vmpush, weg2line)
+from . import (energy, features, flipzeit, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
+               modellprofil, profil, profil_oracle, profil_recompute, redact, sampler, sources, vmpush, weg2line)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -51,6 +57,8 @@ STATIC_FILES = {
     "/hwprofil.js": ("hwprofil.js", "application/javascript; charset=utf-8"),
     # Profil-Editor S4b (Auftrag 1432): Balken je Karte mit Überlauf und Browser-Näherung
     "/profil_balken.js": ("profil_balken.js", "application/javascript; charset=utf-8"),
+    # Profil-Planer, eine Seite (AP-H1): Betriebsform, Regler, Je-Karte-Felder, Zustands- und Verdikt-Chips, Dual-Tabelle (reine Darstellung)
+    "/profil_planer.js": ("profil_planer.js", "application/javascript; charset=utf-8"),
 }
 #: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
 DEV_STATIC_FILES = {
@@ -247,8 +255,14 @@ class App:
         self.kartenplaner = kartenplan.Kartenplaner()
         # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
         ptree = getattr(args, "profil_tree", None) or None      # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker
+        # AP-D: das Orakel (Launcher-Trockenlauf im Kindprozess + Cache); startet erst bei der ersten Anfrage, nie im Hintergrund
+        # eigener cgroup-Scope (Spitze 1,75 GiB RSS > Rest der Unit-Grenze, Review AP-D); args ohne Feld (Tests) = kein Praefix
+        opf = getattr(args, "oracle_prefix", None)
+        oprefix = profil_oracle.default_prefix() if opf == "auto" else (shlex.split(opf) if opf and opf != "none" else [])
+        self.oracle = profil_oracle.OracleService(profil.find_tree(ptree), python=getattr(args, "couplings_python", None), prefix=oprefix)
         self.profil = profil.ProfilEditor(
             kartenplaner=self.kartenplaner, tree=ptree,
+            oracle=self.oracle, hardware=lambda: self.hwprofil.get(), check_path=lambda p, what: self.modellprofil.check_path(p, what),
             release_dir=getattr(args, "profiles_release_dir", None) or profil.DEFAULT_RELEASE_DIR,
             user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR,
             # Auftrag 1984 (C): die Topologie-Prüfung des Trockenlaufs läuft im Kopplungs-Worker (sglang-Umgebung), nicht in diesem Prozess;
@@ -262,7 +276,10 @@ class App:
         self.hwprofil = hwprofil.HwProfil(
             gpuq=args.gpuq, tree=getattr(args, "hw_tree", None) or ptree, measure_tree=getattr(args, "hw_measure_tree", None),
             python=getattr(args, "hw_python", None), prefix=shlex.split(getattr(args, "hw_prefix", "") or ""),
-            state_dir=args.state_dir or None, edition=getattr(args, "edition", "rig") or "rig")
+            state_dir=args.state_dir or None, edition=getattr(args, "edition", "rig") or "rig",
+            # AP-A: das Profil wird beim ersten Aufruf gespeichert (Rig und Release): --hw-profile-file / FLLIPER_HARDWARE_PROFILE
+            persist_path=getattr(args, "hw_profile_file", None) or None,
+            versions=lambda: {"rigdash": self.version, "edition": self.edition})
         self.energy = (energy.EnergyReader(self.ring_store, live.BUCKET_S) if self.sup is not None
                        else energy.EnergyBook(args.state_dir or None, live.BUCKET_S))
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
@@ -282,6 +299,7 @@ class App:
         # Nutzer-Order 01.10. ~07:40Z: rigdash liest die Zeitreihen per PromQL aus VictoriaMetrics
         self.vm = vmpush.VmClient(args.vm_url) if getattr(args, "vm_url", "") else None
         self.vm_boot_cache: dict = {}         # stem -> (fetched_t, vmpush.boot_rates) of finished boots
+        self.flip_boot_cache: dict = {}       # stem -> (fetched_t, flipzeit tile of that boot) of finished boots
         self.live_cache = LiveCache(lambda: self.snapshot(True, None))
 
     def vm_boot(self, b: dict, now: float) -> Optional[dict]:
@@ -299,6 +317,31 @@ class App:
             v = {"prefill": {}, "decode": None, "error": "%s: %s" % (type(e).__name__, e)}
         self.vm_boot_cache[b["stem"]] = (now, v)
         return v
+
+    def flip_zeit(self, boots: list, now: float) -> None:
+        """Nutzer 06.10.: THE Flipzeit figures of the page, one function (history.flip_tile -> flipzeit.tile) over the
+        history marks.  Ueberblick: ``flip_zeit`` = the last flipzeit.OVERVIEW_S of the boot's model (all its boots);
+        ``flip_boot`` = the whole boot (start .. last sign of life, "seit Boot" while it lives): the Boot-Liste row and
+        the Ueberblick switch.  The Verlauf tile is the same function over its own range."""
+        by_model: dict = {}
+        for b in boots:
+            model = history.model_of_ipc(b.get("ipc") or {})
+            if model not in by_model:
+                by_model[model] = history.flip_tile(self.hist, model, now - flipzeit.OVERVIEW_S, now,
+                                                    flipzeit.window_label(flipzeit.OVERVIEW_S))
+            b["flip_zeit"] = by_model[model]
+            if b.get("first_t") is None:
+                continue
+            if b.get("live"):
+                # Nutzer 06.10.: the Ueberblick switch "seit Boot": the same function, this boot's start .. now
+                b["flip_boot"] = history.flip_tile(self.hist, model, b["first_t"], now, "seit Boot")
+                continue
+            hit = self.flip_boot_cache.get(b["stem"])
+            if hit is None or (now - hit[0] >= 60.0 and (b.get("age_s") or 0) <= 1800.0):
+                hi = (b.get("last_log_t") or now) + 5.0
+                hit = (now, history.flip_tile(self.hist, model, b["first_t"], hi, "ganzer Boot"))
+                self.flip_boot_cache[b["stem"]] = hit
+            b["flip_boot"] = hit[1]
 
     def energy_loop(self, stop: threading.Event):
         """Every 5 s: account the closed 5-s intervals of every live boot (energy.py); which class
@@ -368,6 +411,7 @@ class App:
                 finish_series(b, gser, now, live.BUCKET_S, key="series_zoom")
             b["energy"] = self.energy.view(b["stem"], (b.get("totals") or {}).get("boot_wall_s"))
             b["vm_boot"] = self.vm_boot(b, now)
+        self.flip_zeit(boots, now)
         with self.imgchg_lock:
             images, img_err = self.imgchg.load()
         return {
@@ -398,7 +442,7 @@ class App:
 LIVE_TTL_S = 1.0
 #: what the "Letzte Boots" table reads of a boot that is not shown as a card (lean page payload)
 LEAN_KEEP = ("stem", "meta", "age_s", "live", "primary", "first_t", "last_log_t", "flip_count", "totals",
-             "alarm", "container", "end", "stop_count", "error_count", "boot_s", "dur_s", "vm_boot")
+             "alarm", "container", "end", "stop_count", "error_count", "boot_s", "dur_s", "vm_boot", "flip_boot")
 
 
 def lean_boot(b: dict) -> dict:
@@ -410,10 +454,6 @@ def lean_boot(b: dict) -> dict:
                      for g, v in (b.get("decode") or {}).items()}
     ipc = b.get("ipc") or {}
     out["ipc"] = {k: ipc.get(k) for k in ("lifecycle", "terminal", "model", "tag", "boot_id", "cause") if k in ipc}
-    # Nutzer 02.10.: "Letzte Boots" shows the Flipzeit p50/p90/max per direction (and "fehlt (Feld X)")
-    out["flip_last"] = {d: {k: (x or {}).get(k) for k in ("n", "median", "p90", "max")}
-                        | {"newest": {k: ((x or {}).get("newest") or {}).get(k) for k in ("kind", "missing")}}
-                        for d, x in (b.get("flip_last") or {}).items()}
     out["lean"] = True
     return out
 
@@ -620,9 +660,23 @@ def make_handler(app: App):
                 return self._json(ed.export_env(body.get("doc"), body.get("dry")))
             if path == "/api/profil/dry":
                 return self._json(ed.dry_run(body.get("doc"), body.get("cards") or [], bool(body.get("host_patched", True))))
+            if path == "/api/profil/issue":
+                return self._profil_issue(body)
             if path == "/api/profil/recompute":
                 return self._profil_recompute(body)
+            if path == "/api/profil/propose":
+                return self._json(ed.propose(body))
             return self._send(404, "not found", "text/plain")
+
+        def _profil_issue(self, body):
+            """AP-I: Issue-Text "Laufbericht" (Markdown zum Kopieren).  Hardwareprofil (nur lesen, nichts messen) und Versionen kommen vom Hardware-Dienst,
+            Profil, Trockenlauf, gewählte Karten und Modellprofil vom Browser; die Antwort ist redigiert (Geheimnisse, Hostpfade)."""
+            try:
+                parts = app.hwprofil.issue_parts()
+            except Exception as e:      # noqa: BLE001 -- ohne Hardwareprofil entsteht der Bericht trotzdem, der Block sagt "nicht verfügbar"
+                parts = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+            return self._json(app.profil.issue_report(body.get("doc"), dry=body.get("dry"), cards=body.get("cards"), model=body.get("model"),
+                                                      hardware_md=parts.get("short") if parts.get("ok") else "", versions=parts.get("versions") if parts.get("ok") else {}))
 
         def _profil_recompute(self, body):
             """S4b: Kopplungen und Balken für das Serverprofil im Editor.  Hardwareprofil (nur lesen, nichts messen) und Modellprofil (Desk-Schätzung,
@@ -639,10 +693,26 @@ def make_handler(app: App):
             if not mpath:
                 return self._json({"ok": False, "error": "kein Modellpfad: das Profil nennt weder PROFILE_MODEL noch --model-path"}, 200)
             kv = args_.get("--kv-cache-dtype")
-            est = app.modellprofil.estimate({"path": str(mpath), "kv_dtype": kv if kv in ("auto", "fp8_e4m3") else None})
+            mreq = {"path": str(mpath), "kv_dtype": kv if kv in ("auto", "fp8_e4m3") else None}
+            draft_error = None
+            if str(body.get("what") or "bars") == "phase_bars":
+                # AP-H2: das Draft-Verzeichnis wird mitprofiliert (Draft-Term der Balken); ist es nicht lesbar, rechnet der Balken ohne und sagt es
+                dpath = profil_recompute.draft_path_of(doc, body)
+                if dpath:
+                    try:
+                        est = app.modellprofil.estimate(dict(mreq, draft_path=dpath))
+                    except ValueError as exc:
+                        draft_error = "Draft-Verzeichnis %s nicht profiliert: %s" % (dpath, exc)
+                        est = app.modellprofil.estimate(mreq)
+                else:
+                    est = app.modellprofil.estimate(mreq)
+            else:
+                est = app.modellprofil.estimate(mreq)
             req = profil_recompute.build_request(body, hardware=hw["profile"], model=est["profile"])
             res = app.couplings.request(req)
             res["model_path"] = str(mpath)
+            if draft_error:
+                res["draft_error"] = draft_error
             return self._json(res, 200)
 
         def _hwprofil(self, method, n=0, raw=b""):
@@ -653,6 +723,13 @@ def make_handler(app: App):
             path = self.path.split("?", 1)[0]
             if method == "GET" and path == "/api/hwprofil":
                 return self._json(app.hwprofil.get())
+            if method == "GET" and path == "/api/hwprofil/issue":
+                out = app.hwprofil.issue()
+                return self._json(out, 200 if out.get("ok") else 503)
+            if method == "POST" and path == "/api/hwprofil/recapture":
+                # NVML lesen und die Datei ersetzen: kein GPU-Fenster, darum auch in der Release-Ausgabe
+                out = app.hwprofil.recapture()
+                return self._json(out, 200 if out.get("ok") else 409)
             if method == "POST" and path in ("/api/hwprofil/measure", "/api/hwprofil/cancel"):
                 if app.edition == "release":
                     return self._json({"ok": False, "error": hwprofil.RELEASE_NO_MEASURE}, 403)
@@ -689,7 +766,7 @@ def make_handler(app: App):
                 if path == "/healthz":
                     return self._json({"ok": True, "version": app.version, "edition": app.edition, "editor_only": getattr(app, "editor_only", False),
                                        "uptime_s": round(time.time() - getattr(app, "t0", time.time()), 1)})
-                if path == "/api/hwprofil":
+                if path in ("/api/hwprofil", "/api/hwprofil/issue"):
                     return self._hwprofil("GET")
                 if path in ("/", "/index.html"):
                     with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
@@ -858,10 +935,16 @@ def main(argv=None):
                          "--hw-tree überstimmt ihn nur für das Hardwareprofil")
     ap.add_argument("--hw-tree", default=os.environ.get("HWPROFIL_TREE"),
                     help="Planer-Baum (<baum>/python) mit sglang/srt/rigmon/hardware_profile.py: Hardwareprofil lesen (Auftrag 950)")
+    ap.add_argument("--hw-profile-file", default=hwprofil.default_persist_path(),
+                    help="AP-A: Datei, in der das Hardwareprofil beim ersten Start gespeichert wird (Env FLLIPER_HARDWARE_PROFILE; "
+                         "Voreinstellung /var/lib/flliper/hardware.json, Rig und Release gleich); Neu erfassen ersetzt sie")
     ap.add_argument("--hw-measure-tree", default=os.environ.get("HWPROFIL_MEASURE_TREE"),
                     help="voller sglang-Baum (<baum>/python) für den Messlauf; leer = --hw-tree (dann muss card_probe darin liegen)")
     ap.add_argument("--couplings-python", default=os.environ.get("RIGDASH_COUPLINGS_PYTHON"),
                     help="Profil-Editor S4b: Python der sglang-Umgebung für den Kopplungs-Worker (Standard /spinning/htsglang-gpu/.venv/bin/python)")
+    ap.add_argument("--oracle-prefix", default=os.environ.get("RIGDASH_ORACLE_PREFIX", "auto"),
+                    help="Befehlspräfix des Orakel-Kindprozesses (Launcher-Trockenlauf, Spitze 1,75 GiB RSS gemessen): 'auto' = systemd-run --scope -q -p "
+                         "MemoryMax=4G (eigener cgroup-Rahmen ausserhalb der Unit), 'none' = ohne, sonst der Befehl selbst")
     ap.add_argument("--hw-python", default=os.environ.get("HWPROFIL_PYTHON"),
                     help="Interpreter mit torch + sgl_kernel für den Messlauf (Kindprozess, außerhalb dieses Prozesses)")
     ap.add_argument("--hw-prefix", default=os.environ.get("HWPROFIL_PREFIX", ""),

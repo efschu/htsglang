@@ -1,0 +1,7 @@
+default_stage:
+  default_modifiers:
+    QuantizationModifier:
+      targets: [Linear]
+      ignore: ['candidate_selector', 're:.*_conv.*']
+      scheme: W8A16
+      bypass_divisibility_checks: false

@@ -50,7 +50,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from . import activity, cacheacct, ipcstate
+from . import activity, cacheacct, flipzeit, ipcstate
 
 NO_DATA_LABEL = "keine Daten (vor IPC-Aufzeichnung)"
 TIERS = (("p0", 1, 3 * 3600), ("p1", 10, 3 * 86400), ("p2", 60, 30 * 86400))
@@ -645,18 +645,19 @@ class Recorder:
         self._flips_done[key] = len(rows)
 
     def _mark_flip_views(self, key: str, model: str, ipc: dict, m, now: float) -> None:
-        """Nutzer 02.10.: the Flipzeit of every measured flip, both directions (ipcboot.flip_views: letztes Token
-        -> erstes Token), one mark each (kind flip_t2t, value = total); the partition in the label."""
+        """Nutzer 06.10.: the Flipzeit of every COUNTED flip (flipzeit.counted: kind ok, measured, not provisional),
+        both directions (ipcboot.flip_views), one mark each (kind flip_t2t, value = total, label = the partition,
+        flipzeit.mark_label).  A Leerlauf flip (nothing was waiting: no Prefill or Decode pending) is not counted;
+        only its tally is written (kind flip_skip, no value)."""
         from . import ipcboot
         segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc),
                                      detail=False)["segs"]
         for x in ipcboot.flip_views(segs, ipc, now, m.ring):
-            if x.get("kind") != "ok" or x.get("total_ms") is None or x.get("provisional"):
+            if x.get("kind") == "leerlauf" and x.get("begin") is not None and x.get("dir") in flipzeit.DIRS:
+                self.db.mark(x["begin"], model, flipzeit.SKIP_KIND, "%s leerlauf ipc" % x["dir"])
+            if not flipzeit.counted(x):
                 continue
-            parts = "v=%d l=%d w=%d n=%d r=%d" % tuple(int(round(x.get(k) or 0)) for k in ipcboot.PARTS)
-            if x.get("leer_ms") is not None:
-                parts += " (leer=%d halt=%d park=%d vr=%d)" % tuple(int(round(x.get(k) or 0)) for k in ipcboot.VOR_PARTS)
-            self.db.mark(x["begin"], model, "flip_t2t", "%s %s ipc" % (x["dir"], parts), x["total_ms"])
+            self.db.mark(x["begin"], model, flipzeit.MARK_KIND, flipzeit.mark_label(x) + " ipc", x["total_ms"])
 
     # --- loop ----------------------------------------------------------------
     def publish(self, now: Optional[float] = None) -> None:
@@ -790,6 +791,14 @@ def _hold(arr: List[Optional[float]], max_buckets: int) -> int:
     return n
 
 
+def flip_tile(db: HistoryDB, model: str, lo: float, hi: float, label: str) -> dict:
+    """The Flipzeit tile of one window out of the history marks: THE function behind the Ueberblick tile (last
+    flipzeit.OVERVIEW_S), the Verlauf tile (its range) and the Boot-Liste (one boot) -- same marks, same
+    ``flipzeit.tile``, so the same set gives the same numbers."""
+    marks = [dict(m, label=m["label"][:-4]) for m in db.marks(model, lo, hi) if (m["label"] or "").endswith(" ipc")]
+    return flipzeit.tile(marks, lo, hi, label)
+
+
 def zoom_step(span_s: float) -> int:
     return next((s for s in STEPS if s >= span_s / MAX_POINTS), STEPS[-1])
 
@@ -878,15 +887,9 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             continue
         m["label"] = lab[:-4]
         marks.append(m)
-    # Nutzer 02.10.: Flipzeit = letztes Token -> erstes Token (marks flip_t2t, both directions); the older marks
-    # (flip with the front's P>D value, flip_user = D>P up to the leg-1 dispatch, flip_pd_user) were other
-    # definitions and are neither a tile value nor a point any more
-    def _flip_tile(d):
-        ms = [m for m in marks if m["kind"] == "flip_t2t" and m["v"] is not None and (m["label"] or "").startswith(d)]
-        vals = [m["v"] for m in ms]
-        return {"last_ms": ms[-1]["v"] if ms else None, "last_t": ms[-1]["t"] if ms else None,
-                "p50_ms": _pct(vals, 0.5), "p90_ms": _pct(vals, 0.9), "max_ms": max(vals) if vals else None, "n": len(vals)}
-    flip_pd, flip_dp = _flip_tile("P>D"), _flip_tile("D>P")
+    # Nutzer 06.10.: ONE Flipzeit computation (flipzeit.tile over the flip_t2t marks of exactly this window); the
+    # Ueberblick tile and the Boot-Liste call the same function (flip_tile below) over their own window
+    flip_win = flipzeit.tile(marks, lo, hi, flipzeit.window_label(hi - lo, zoomed=zoom is not None))
     roles = {m: (db.get("roles." + m) or {}) for m in MODELS}
     card_info = [dict(c, roles={m: roles[m].get(c["uuid"], []) for m in MODELS}) for c in cards]
     tiles = {
@@ -902,13 +905,11 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         "power_sum_w": sum(p for p in powers if p is not None) if any(p is not None for p in powers) else None,
         "cpu_pct": latest("host.cpu"),
         "live": latest("m.ipc") is not None,
-        "flip_last_ms": flip_pd["last_ms"], "flip_last_t": flip_pd["last_t"],
-        "flip_median_ms": flip_pd["p50_ms"], "flip_n": flip_pd["n"],
-        "flip": {"P>D": flip_pd, "D>P": flip_dp},
+        "flip": flip_win,
     }
     tiles.update(seat_tiles(series))
-    thin = [m for m in marks if m["kind"] not in ("flip", "flip_user", "flip_pd_user", "flip_t2t")] + \
-        [m for m in marks if m["kind"] == "flip_t2t"]
+    thin = [m for m in marks if m["kind"] not in ("flip", "flip_user", "flip_pd_user", flipzeit.MARK_KIND, flipzeit.SKIP_KIND)] + \
+        [m for m in marks if m["kind"] == flipzeit.MARK_KIND]
     fl = [dict(m, v=None) for m in marks if m["kind"] == "flip"]
     if len(fl) > 800:
         k = len(fl) / 800.0
@@ -930,7 +931,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             "power": "NVML, Summe aller Karten",
             "cache_tiers": ("state.json front.served_tokens.*.cached_tier" if src_tiers == "ipc"
                             else "– (Feld served_tokens.*.cached_tier ab Image z30y2, 9266bdfb8d)"),
-            "flip": "Flipzeit = letztes Token → erstes Token (ipcboot.flip_views, flip_t2t, ab 02.10.): P→D P-Chunk-Ende → erstes Decode-Token, D→P Decode-Ende → erster Prefill-Forward auf P (PP0)",
+            "flip": "Flipzeit (flipzeit.py, Nutzer 06.10.): P→D %s; D→P %s. %s Zählung: nur abgeschlossene, gemessene Flips (Marken flip_t2t)" % (flipzeit.DEFINITION["P>D"], flipzeit.DEFINITION["D>P"], flipzeit.EXCEPTION),
             "marks": "state.json (Boot-ID, lifecycle) + events.jsonl flip_first_work",
         },
         "errors": dict(rec.errors) if rec else dict((db.get("rec.state") or {}).get("errors") or {}),

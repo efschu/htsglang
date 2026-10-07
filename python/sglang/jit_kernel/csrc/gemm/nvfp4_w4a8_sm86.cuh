@@ -503,10 +503,17 @@ template <int WARPS_N, int WARPS_M, int MT, int NT, int STAGES, int MIN_BLOCKS =
 inline void launch_cfg(const GemmParams& p, DLDevice device) {
   using C = Cfg<WARPS_N, WARPS_M, MT, NT, STAGES>;
   auto kernel = w4a8_nvfp4_gemm_kernel<WARPS_N, WARPS_M, MT, NT, STAGES, MIN_BLOCKS, EPI>;
-  static bool attr_set = false;  // per instantiation; the attribute is per function, idempotent
-  if (!attr_set) {
+  // cudaFuncSetAttribute acts on the CURRENT device, and a function's attributes are per device. A plain
+  // `static bool` is per process: the first card sets the attribute, every further card in the same process skips
+  // it and the launch dies with "invalid argument" (two 3080 in one measurement process). Track it per device.
+  constexpr int kMaxDevices = 64;
+  static bool attr_set[kMaxDevices] = {};
+  int cur_dev = -1;
+  RuntimeDeviceCheck(cudaGetDevice(&cur_dev));
+  const bool tracked = cur_dev >= 0 && cur_dev < kMaxDevices;
+  if (!tracked || !attr_set[cur_dev]) {
     RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::kSmemBytes));
-    attr_set = true;
+    if (tracked) attr_set[cur_dev] = true;
   }
   const dim3 grid((p.Nw + kBN - 1) / kBN, (p.M + C::BM - 1) / C::BM, p.splits);
   host::LaunchKernel(grid, dim3(C::kThreads), device, C::kSmemBytes)(kernel, p);

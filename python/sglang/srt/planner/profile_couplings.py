@@ -29,6 +29,49 @@ Seam-Staging), stehen in ``fixed_overhead_mib`` und sind OHNE Eingabe NULL -- da
 sagt es (``warnings``).  Die Stufenzeit ist eine Roofline-Naeherung (Decode, Batch 1, Gewichtsbandbreite ``mem_gbs.gemv``); sie
 ersetzt nicht ``pp_cut.stage_costs`` (der braucht eine am Metall kalibrierte Census) und rankt keine Schnitte (#1019).
 
+Dual-Form (``--dual-share``), Belege je Posten (Datei:Zeile im Baum 173161c595, Einzelheiten in ``_dual_share_p_terms``): Gewichte/Experten von P liegen im
+Union-Image von D (weg2/launcher.py:22707-22712 Hilfe ``--dual-share``, :14784 ``UNION_ROLES=main``) -> Referenz, nicht im P-Budget; der Festposten
+``--dual-p-overhead-mib`` liegt AUSSERHALB des P-Budgets (launcher.py:22713-22716, :14976 ``dual_share_planned_dc``); KV bei ``--dual-unified-kv on`` im
+Karten-Ledger (weg2/card_kv_ledger.py Kopf); Mamba-Zustand und Draft sind P-eigen; was sich nicht an D binden laesst (Diff), ist nicht gerechnet.
+
+Eingaenge der Launcher-Budgetrechnung der D-Phase (AP-H2 Fix-Runde 5).  ``launcher.budgets_from_dc`` (launcher.py:15252-15394) bekommt vom Launcher in
+``_d_spec_from`` (launcher.py:27207-27214) die Eingaenge unten; jede Zeile sagt, ob der Balken sie rechnet (Datei:Zeile hier) oder ob sie ``nicht gerechnet``
+ist -- dann nennt der Tooltip des Budgets sie so (``gaps`` aus ``launcher_d_budgets``).  Der Test ``TestLauncherFormulaForEveryPhaseAndForm`` ruft
+``budgets_from_dc`` mit ALLEN diesen Argumenten auf (Release-Flip 27b-base, Release-Dual, NF abl, d_only) und haelt den Balken dagegen::
+
+    Eingang (Launcher)                                       | im Balken gerechnet                                | nicht gerechnet
+    ---------------------------------------------------------+----------------------------------------------------+------------------------------------------
+    dc je Form (dc_src): Flip/d_only = --d-foreign-context-  | ``d_stage_terms`` pre_fixed: profile_couplings.py:1389           | im echten Lauf der gemessene Rest von P
+      mib + --d-nontorch-mib; dual-share = P-Budget +        | ``dual_p_plan``: profile_couplings.py:1060                     |   nach sleep(P), nicht der Profilwert
+      --dual-p-overhead-mib (dual_share_planned_dc)          |                                                    |
+    user_reserve_by_card (--user-reserve-mib, Ordinal-       | ``parse_user_reserve``: profile_couplings.py:1083,      | im gebuchten Pfad bucht der Launcher sie
+      Reihenfolge, 5090 zuerst; auch geerbt per ``source``)  | ``launcher_d_budgets`` Boden + Reserve: profile_couplings.py:1200  |   nicht (Tooltip sagt es)
+    Korridor-Boden transient (CorridorFloor.mib = transient  | ``launcher_d_budgets``: stated law 1024            | gemessener Boden (Digest) und
+      + reserve)                                             |   (``D_CORRIDOR_STATED_LAW_MIB``)                  |   SGLANG_CORRIDOR_LAW_FLOOR_MIB
+    eingebauter Wach-Ueberschuss 404 (D_AWAKE_OVERSHOOT_MIB) | ``launcher_d_budgets``: profile_couplings.py:1198                  | --
+    Overshoot-Record D_OVERSHOOT_MIB (overshoot_mib)         | ``launcher_d_budgets``: profile_couplings.py:1197 (Registerzeile)     | --
+    Wach-Rest-Record D_AWAKE_REST_MIB (awake_rest_mib)       | ``launcher_d_budgets``: profile_couplings.py:1196 (ersetzt die 404)   | --
+    P_DORMANT_SERVED_GROWTH_MIB (dormant_growth_mib)         | ``launcher_d_budgets``: profile_couplings.py:1149                     | --
+    gebuchter Rest D_AWAKE_REST_BOOKED_MIB / ..._CAPPED_MIB  | ``launcher_d_budgets``: profile_couplings.py:1154 (Registerzeile    | Umgebung SGLANG_WEG2_BUDGET_REST_RECORD
+      (booked_rest_kwargs; Torch-Cache-Kappe aus --env-d)    |   ``budget_rest_from_records``, Kappe aus env_d)   |   des Launchers
+    Treiber-Carve (charge_driver_carve, driver_carve_min_    | ``launcher_d_budgets``: profile_couplings.py:1166, nur wenn die      | sonst: das Hardwareprofil traegt Card.
+      total_mib, Card.reserved_mib)                          |   Hardwarekarte ``driver_reserved_mib`` traegt      |   reserved_mib nicht -> Tooltip nennt es
+    Rundung auf 8 MiB (``// 8 * 8``)                         | ``launcher_d_budgets``: profile_couplings.py:1202                    | --
+    corridor_constrain=True + corridor_sample_path (Pass     | --                                                 | nicht gerechnet (Messprobe; kann nur senken)
+      mit Messprobe, launcher.py:15425-15462)                |                                                    |
+    l15_mib (L1.5-Posten)                                    | kein Eingang der D-Phase (im Aufruf 27207-27214    | P-Aufruf (launcher.py:25663-25669):
+                                                             |   nicht uebergeben)                                |   nicht gerechnet
+    --d-reserve-mib (Verfuegbar-Vergleich, pp_cut.d_rank_    | ``contract_bar`` over_avail: profile_couplings.py:1665          | nicht Teil des Budgets (Launcher
+      available_mib), NICHT budgets_from_dc                  |                                                    |   zieht es nur vom Verfuegbaren ab)
+    --rank-user-reserve-mib / --rank-auto-reserve-mib        | --                                                 | Rang-Argumente der Laufzeit (server_args.py:
+                                                             |                                                    |   2651, 2700), kein Eingang von
+                                                             |                                                    |   budgets_from_dc: nicht gerechnet
+    min mit --extra-p-Budget (dual_share_planned_dc,         | ``dual_p_plan``: Wert der Gruppe P als P-Budget    | eigenes P-Budget des Launchers
+      launcher.py:14976-14992)                               |                                                    |   (budgets_from_dc('P'), :25663): nicht
+    Records fuer eine andere Kartenzahl (inventory_view)     | --                                                 | nicht gerechnet, Tooltip nennt es
+    explizites --rank-gpu-memory-mib der Gruppe D            | ``d_stage_terms`` has_budget: profile_couplings.py:1397         | --user-reserve-mib dort nicht gerechnet
+                                                             |                                                    |   (Tooltip sagt es)
+
 Einstellungen (``settings``, alles optional ausser ``stage_layers``)::
 
     stage_layers        [int, ...]     Layer je Stufe, Summe = n_layers (``--pp-stage-ratio``)
@@ -79,6 +122,14 @@ __all__ = [
     "bars_for",
     "approx_payload",
     "approx_terms",
+    "BALKEN_SCHEMA",
+    "BALKEN_SEGMENTS",
+    "phase_bars",
+    "contract_bar",
+    "d_stage_terms",
+    "d_phase_config",
+    "p_phase_settings",
+    "detect_form",
 ]
 
 SCHEMA = "flliper.couplings/1"
@@ -262,13 +313,19 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
     exp_b = _val(w["layer_expert_bytes"])
     bounds = _stage_bounds(counts)
     mtp_b = float(_val(w.get("mtp_bytes"), 0.0)) if draft else 0.0
+    draft_src = _src(w.get("mtp_bytes"))
+    draft_note = "MTP-Layer auf der letzten Stufe" if draft else ""
+    if draft and settings.get("draft_mib") is not None:
+        # AP-H2: das Gewicht des Drafts kommt aus dem Profil des Draft-Verzeichnisses (model["draft"]["external"]), nicht aus dem Zielmodell
+        mtp_b = float(settings["draft_mib"]) * MIB
+        draft_src = str(settings.get("draft_src") or draft_src)
+        draft_note = str(settings.get("draft_note") or draft_note)
     if "mtp" in replicated:
         mtp_b = 0.0        # schon als replizierter Posten in den Gewichten
     draft_bytes = [0.0] * n
     if draft:
         draft_bytes[-1] = mtp_b
     weights_b = [f + d for f, d in zip(weights_full, draft_bytes)]
-    draft_note = "MTP-Layer auf der letzten Stufe" if draft else ""
 
     # Attention / Linear je Stufe
     pinned = settings.get("attn_layers")
@@ -336,13 +393,14 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
             "layers": counts[i],
             "attn_layers": attn[i],
             "linear_layers": lin[i],
-            "budget_mib": _term(budgets[i], budget_src, "Kartengroesse - Korridor %.0f MiB" % corridor if budget_src == SRC_DERIVED else ""),
+            "budget_mib": _term(budgets[i], budget_src, ("Kartengroesse - Korridor %.0f MiB (Annahme; den P-Budget des Launchers rechnet budgets_from_dc('P', ...) mit dc_expect_d, P_OVERSHOOT_MIB, "
+                                                              "--user-reserve-mib und dem L1.5-Posten, launcher.py:25663-25669: hier nicht gerechnet)" % corridor) if budget_src == SRC_DERIVED else ""),
             "terms": {
                 "weights": _term(dense_mib, _src(w["total_bytes"]) if "total_bytes" in w else SRC_DEFAULT,
                                  "dichte Gewichte der Layer + Einbettung/lm_head der Rolle"),
                 "experts": _term(experts_mib, _src(w["total_bytes"]) if "total_bytes" in w else SRC_DEFAULT,
                                  "residente Expertenzeilen %.0f %% (Pufferregel)" % (100 * buf_fracs[i]) if moe else "keine Experten"),
-                "draft": _term(draft_mib, _src(w.get("mtp_bytes")) if draft else SRC_DEFAULT, draft_note if draft_mib else "kein Draft"),
+                "draft": _term(draft_mib, draft_src if draft else SRC_DEFAULT, draft_note if draft_mib else "kein Draft"),
                 "kv": _term(kv_mib, cell_src, "%d Token x %d Attention-Layer%s x %.0f B" % (ctx, attn[i], " + Draft" if draft_attn[i] else "", cell)),
                 "state": _term(state_mib, _src(state_node), "%d Linear-Layer x %.4f MiB x %d Slot(s)" % (lin[i], state_per, slots)),
                 "activation": _term(act_mib, SRC_INPUT if act_vec is not None else rate_src,
@@ -823,6 +881,976 @@ def approx_terms(pl: Mapping[str, Any], stage_layers: Sequence[int]) -> List[Dic
 
 
 # ---------------------------------------------------------------------------
+# AP-H2: Balken je Karte und Phase im Datenvertrag ``flliper.balken/1``
+# ---------------------------------------------------------------------------
+#
+# EIN zusammenhaengender Balken je Karte und Phase in logischer Reihenfolge
+#     Gewichte | Experten | Draft | KV | Mamba | (Aktivierung | Festposten) | Reserve | Frei
+# Phasen: ``P`` (Prefill, Pipeline-Stufen) und ``D`` (Decode, TP-Raenge); Dual zeigt beide zugleich, nur-TP nur ``D``, Einzelkarte eine
+# Phase ``alle``.  Der Vertrag steht im Modulkopf von ``static/profil_balken.js``; ein Orakel (propose/Dry-Run, AP-C/AP-D) kann Werte in
+# DIESELBE Form liefern, ohne dass die Darstellung sich aendert.
+#
+# EHRLICHKEIT.  Ein Term, der sich aus den Profilzeilen und dem Modellprofil nicht belegen laesst, hat ``mib: None`` und
+# ``herkunft: "nicht gerechnet"`` mit Grund (``detail``); er zaehlt nicht in die Summe, ``Frei`` ist dann eine Obergrenze.  Nichts wird
+# geraten (Hochrechnung != Messung).  Werte "Naeherung" sind Rechnungen dieses Moduls, nicht die des Loesers/Launchers.
+
+BALKEN_SCHEMA = "flliper.balken/1"
+SRC_PROFILE = "Profilzeile"
+SRC_APPROX = "Naeherung"
+SRC_NONE = "nicht gerechnet"
+FORMS = ("single", "d_only", "flip", "dual")
+
+BALKEN_SEGMENTS: Tuple[Tuple[str, str, str], ...] = BAR_SEGMENTS + (
+    ("reserve", "Reserve", "Kartengroesse - Budget: bleibt frei (Reserve-Semantik); wird von Posten ueber dem Budget aufgezehrt"),
+    ("free", "Frei", "Budget - Posten (Obergrenze, solange Posten nicht gerechnet sind)"),
+)
+#: Erklaerung je Posten der D-Phase (TP-Raenge): die Texte von BAR_SEGMENTS beschreiben die P-Stufen (Layer-Schnitt, letzte Stufe)
+D_WHAT = {
+    "weights": "dichte Gewichte, Einbettung und lm_head dieses Ranges (TP-Anteil)",
+    "experts": "Expertenzeilen dieses Ranges nach Pufferregel min(R + Scratch, eigene Experten) je Layer",
+    "draft": "Gewicht des Drafts auf diesem Rang",
+    "kv": "KV-Anteil dieses Ranges fuer das Kontextziel",
+    "state": "Mamba/GDN-Zustand-Anteil dieses Ranges: Linear-Layer x Zustand je Layer und Slot x Slots x TP-Anteil",
+    "activation": "Decode-Aktivierung dieses Ranges",
+    "fixed": "CUDA-Kontext der schlafenden Phase und VRAM ausserhalb des Torch-Allokators (D-Seite)",
+}
+#: Erklaertext des D-Festpostens unter --dual-share: dort ist er P's wacher Plan (dc = P-Budget + Overhead), NICHT der CUDA-Kontext einer schlafenden Phase
+DUAL_D_FIXED_WHAT = ("P's Plan auf dieser Karte unter --dual-share (P-Budget + --dual-p-overhead-mib): P ist wach und haelt das, wenn D als Union-Owner "
+                     "bemessen wird; der Launcher zieht es als dormant_other ab (launcher.py:14976, :27289-27301)")
+_ORIGIN.update({SRC_PROFILE: "Profilzeile", SRC_APPROX: "Naeherung (nicht der Loeser)", SRC_NONE: "nicht gerechnet"})
+
+_SPEC_FLAGS = ("--speculative-algorithm", "--speculative-draft-model-path", "--dflash-draft-path", "--spec-form")
+
+
+def _fl(s: Any) -> Optional[List[float]]:
+    """``"1,0,0"`` -> ``[1.0, 0.0, 0.0]``; leer oder unlesbar -> ``None``."""
+    try:
+        out = [float(x) for x in str(s).replace(" ", "").split(",") if x != ""]
+    except ValueError:
+        return None
+    return out or None
+
+
+def _merged(args: Mapping[str, str], phase_args: Optional[Mapping[str, Any]], phase: str) -> Dict[str, str]:
+    """Flag -> Wert einer Phase: die Zeilen des Profils, darueber die ``--extra-p`` / ``--extra-d`` der Gruppe (argparse: Gruppe gewinnt)."""
+    out = dict(args or {})
+    out.update(dict((phase_args or {}).get(phase) or {}))
+    return out
+
+
+def _draft_info(model: Mapping[str, Any], all_args: Mapping[str, str]) -> Dict[str, Any]:
+    """Was der Draft ist und was er wiegt -- nur aus Profilzeilen und Modellprofil.
+
+    ``kind``: ``none`` | ``nextn`` (MTP-Kopf, launcher.SPEC_FORM_DEFAULT = NEXTN) | ``dflash`` (Platzierung nicht gerechnet).
+    ``p_mib``/``d_mib``: Gewichte auf P (teilt ``lm_head`` mit dem Ziel, ``draft_post.P_SHARED_WITH_TARGET``) bzw. D (teilt Einbettung und
+    ``lm_head``, ``draft_post.D_SHARED_WITH_TARGET``), ohne Laufzeitpuffer; ``None`` = nicht belegbar."""
+    w = model.get("weights") or {}
+    mtp = float(_val(w.get("mtp_bytes"), 0.0) or 0.0) / MIB
+    ext = (model.get("draft") or {}).get("external")
+    flagged = any(all_args.get(f) for f in _SPEC_FLAGS)
+    form = str(all_args.get("--spec-form") or "").upper()
+    algo = str(all_args.get("--speculative-algorithm") or "").upper()
+    info: Dict[str, Any] = {"kind": "none", "p_mib": 0.0, "d_mib": 0.0, "src": SRC_DEFAULT, "p_note": "", "d_note": "", "reason": "",
+                            "attn_layers": 1, "placement": str(all_args.get("--speculative-draft-placement") or "split"),
+                            "gpu": all_args.get("--speculative-draft-gpu")}
+    if all_args.get("--dflash-draft-path") or form == "DFLASH" or algo == "DFLASH":
+        info.update(kind="dflash", p_mib=None, d_mib=None,
+                    reason="DFlash2-Draft: Platzierung und Gewicht je Gruppe sind nicht gerechnet (Orakel/AP-D)")
+        return info
+    if not (flagged or mtp > 0):
+        info["reason"] = "kein Draft: kein --speculative-*/--dflash-*-Flag im Profil und kein MTP-Kopf im Modell"
+        return info
+    info["kind"] = "nextn"
+    if ext and "bytes_without_lm_head" in ext:
+        info["p_mib"] = float(_val(ext["bytes_without_lm_head"])) / MIB
+        info["d_mib"] = float(_val(ext["bytes_without_embed_lm_head"])) / MIB if "bytes_without_embed_lm_head" in ext else None
+        info["src"] = _src(ext["bytes_without_lm_head"])
+        info["p_note"] = "Draft-Verzeichnis ohne lm_head (P teilt ihn mit dem Ziel), ohne Laufzeitpuffer"
+        info["d_note"] = "Draft-Verzeichnis ohne Einbettung und lm_head (D teilt sie mit dem Ziel), ohne Laufzeitpuffer"
+        if info["d_mib"] is None:
+            info["reason"] = "Draft-Verzeichnis ohne Aufteilung Einbettung/lm_head im Profil"
+        info["attn_layers"] = int(_val((ext.get("kv") or {}).get("attn_layers"), 1) or 1)
+    elif mtp > 0:
+        info["p_mib"] = info["d_mib"] = mtp
+        info["src"] = _src(w.get("mtp_bytes"))
+        info["p_note"] = info["d_note"] = "MTP-Kopf des Ziel-Checkpoints (mtp.*)"
+    else:
+        info.update(p_mib=None, d_mib=None, reason="Draft-Verzeichnis ist im Profil genannt, aber nicht profiliert (kein Modellprofil des Drafts)")
+    return info
+
+
+def p_phase_settings(args: Mapping[str, str], env: Mapping[str, str], model: Mapping[str, Any], n: int, draft: Mapping[str, Any],
+                     *, carries_draft: bool) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+    """Einstellungen fuer ``_stage_terms`` aus den Zeilen der P-Phase (oder der Einzelkarte) und die Liste der gelesenen Eingaben."""
+    s = settings_from_server(args, model)
+    seen: List[Dict[str, str]] = []
+
+    def note(what: str, value: Any, herkunft: str) -> None:
+        seen.append({"was": what, "wert": str(value), "herkunft": herkunft})
+
+    for key, flag in (("stage_layers", "--pp-stage-ratio"), ("attn_layers", "--pp-attn-stage-ratio"), ("budget_mib", "--rank-gpu-memory-mib"),
+                      ("chunk_tokens", "--chunked-prefill-size"), ("context_tokens", "--max-kv-per-request")):
+        if key in s:
+            note(key, args.get(flag, ""), "Profilzeile " + flag)
+    if n == 1 and "stage_layers" not in s:
+        s["stage_layers"] = [len(_families(model))]
+        note("stage_layers", s["stage_layers"][0], "Einzelkarte: alle Layer auf der einen Karte")
+    if "moe_resident_fraction" not in s:
+        fr = _fl(args.get("--pp-cut-expert-device-fraction")) or _fl(env.get("SGLANG_MOE_RESIDENT_EXPERT_FRACTION"))
+        if fr:
+            s["moe_resident_fraction"] = fr if len(fr) > 1 else fr[0]
+            note("moe_resident_fraction", ",".join("%g" % x for x in fr),
+                 "Profilzeile --pp-cut-expert-device-fraction" if args.get("--pp-cut-expert-device-fraction")
+                 else "Umgebung SGLANG_MOE_RESIDENT_EXPERT_FRACTION (--env-p)")
+    else:
+        note("moe_resident_fraction", args.get("--rank-moe-resident-fraction", ""), "Profilzeile --rank-moe-resident-fraction")
+    sc = _fl(args.get("--pp-cut-expert-lru-rows")) or _fl(env.get("SGLANG_MOE_SCRATCH_SLOTS"))
+    if sc:
+        s["scratch_rows"] = [int(x) for x in sc] if len(sc) > 1 else int(sc[0])
+        note("scratch_rows", ",".join("%d" % x for x in sc),
+             "Profilzeile --pp-cut-expert-lru-rows" if args.get("--pp-cut-expert-lru-rows") else "Umgebung SGLANG_MOE_SCRATCH_SLOTS (--env-p)")
+    slots = args.get("--max-mamba-cache-size")
+    if slots and str(slots).isdigit():
+        s["mamba_slots"] = int(slots)
+        note("mamba_slots", slots, "Profilzeile --max-mamba-cache-size")
+    ssm = args.get("--mamba-ssm-dtype")
+    if ssm and ssm in ((model.get("state") or {}).get("variants_mib") or {}):
+        s["ssm_dtype"] = ssm
+        note("ssm_dtype", ssm, "Profilzeile --mamba-ssm-dtype")
+    if "budget_mib" not in s:
+        note("budget_mib", "Kartengroesse - 1024 MiB", "Annahme dieser Rechnung (kein --rank-gpu-memory-mib im Profil)")
+    for key, default, why in (("chunk_tokens", 2048, "kein --chunked-prefill-size/--p-chunk-max im Profil"),
+                              ("context_tokens", 262144, "kein --max-kv-per-request/--context-length im Profil"),
+                              ("mamba_slots", 1, "kein --max-mamba-cache-size im Profil")):
+        if key not in s:
+            note(key, default, "Annahme dieser Rechnung (%s)" % why)
+    # Draft: P traegt den MTP-Kopf nur mit --draft-kv-on-p on (Standard on; launcher.py --draft-kv-on-p Hilfe)
+    s["draft"] = False
+    if carries_draft and draft["kind"] == "nextn" and draft["p_mib"] is not None:
+        s["draft"] = True
+        s["draft_mib"] = draft["p_mib"]
+        s["draft_src"] = draft["src"]
+        s["draft_note"] = draft["p_note"]
+    return s, seen
+
+
+def _p_terms_for_contract(stage: Mapping[str, Any], draft: Mapping[str, Any], carries_draft: bool, is_last: bool,
+                          settings: Mapping[str, Any]) -> Dict[str, Any]:
+    """Posten der ``_stage_terms``-Stufe im Vertragsformat: nicht belegbare Posten werden ``None`` (nicht gerechnet), nie 0."""
+    t = {k: dict(v) for k, v in stage["terms"].items()}
+    if settings.get("fixed_overhead_mib") is None:
+        t["fixed"] = {"v": None, "src": SRC_NONE, "note": "CUDA-Kontext, Graphen, Allokator-Reste, Seam-Staging: nur am Metall zu messen"}
+    if settings.get("activation_mib") is None and not stage.get("_rate_known", True):
+        t["activation"] = {"v": None, "src": SRC_NONE, "note": "Extend-Rate des Modells unbekannt"}
+    if is_last and carries_draft and draft["kind"] != "none" and not settings.get("draft"):
+        t["draft"] = {"v": None, "src": SRC_NONE, "note": draft["reason"] or "Draftgewicht nicht belegbar"}
+    return t
+
+
+#: Launcher-Standard fuer --dual-p-overhead-mib (launcher.py:22713, ``default=1500``)
+DUAL_P_OVERHEAD_DEFAULT_MIB = 1500
+#: D-Korridor ohne Messrecord, wie ihn ``launcher.budgets_from_dc`` abzieht: ``corridor = cf.mib + D_AWAKE_OVERSHOOT_MIB`` mit dem Boden des
+#: stated law 1024 (``corridor_budget.floors_for_cards``, Quelle UNMEASURED-FALLBACK) und dem eingebauten Wach-Ueberschuss 404
+#: (launcher.py:266-269 ``CORRIDOR_MIB = 1024 + D_AWAKE_OVERSHOOT_MIB``).  Gemessene Records (D_AWAKE_REST_MIB, Korridor-Floor) aendern ihn.
+D_CORRIDOR_STATED_LAW_MIB = 1024
+D_AWAKE_OVERSHOOT_MIB = 404
+D_CORRIDOR_ASSUMED_MIB = D_CORRIDOR_STATED_LAW_MIB + D_AWAKE_OVERSHOOT_MIB
+
+
+def dual_p_plan(p_args: Mapping[str, str], n: int) -> Dict[str, Any]:
+    """Was P unter ``--dual-share`` je Karte nach seinem PLAN haelt, aus den Zeilen der Gruppe P.
+
+    Der Launcher bemisst D in dieser Form aus P's Plan (launcher.py:27289-27301): ``dc = dual_share_planned_dc(cards, budgets_p, extra_p,
+    --dual-p-overhead-mib)`` = effektives P-Budget + Overhead je Karte (launcher.py:14976-14992; ein ``--rank-gpu-memory-mib`` in ``--extra-p`` senkt
+    das Launcher-Budget: ``min``), danach ``budgets_from_dc(cards, dc, ...)`` (launcher.py:27207).  Das eigene P-Budget des Launchers ist ohne Boot
+    nicht zu belegen; fehlt die Zeile in der Gruppe P, ist ``budget`` ``None`` (nicht gerechnet)."""
+    raw = p_args.get("--rank-gpu-memory-mib")
+    vec = _fl(raw) if raw not in (None, "") else None
+    if vec is not None and len(vec) != n:
+        raise CouplingError("vector_length: --rank-gpu-memory-mib der Gruppe P hat %d Werte, es gibt %d Karten" % (len(vec), n))
+    ov_raw = p_args.get("--dual-p-overhead-mib")
+    try:
+        ov = float(ov_raw) if ov_raw not in (None, "") else float(DUAL_P_OVERHEAD_DEFAULT_MIB)
+    except (TypeError, ValueError):
+        ov, ov_raw = float(DUAL_P_OVERHEAD_DEFAULT_MIB), None
+    return {"budget": vec, "budget_raw": raw, "overhead": ov, "overhead_given": ov_raw not in (None, "")}
+
+
+#: Umgebungsschalter der Torch-Cache-Kappe (launcher.py:5487); steht er in ``--env-d``, gilt er, sonst der Standard der Registerzeile
+TORCH_CACHE_CAP_ENV = "SGLANG_WEG2_TORCH_CACHE_CAP"
+
+
+def parse_user_reserve(raw: Any, n: int) -> List[int]:
+    """``--user-reserve-mib`` -> MiB je Karte in RANG-/CUDA-ORDINAL-Reihenfolge (5090 zuerst) -- Spiegel von ``launcher.parse_user_reserve``
+    (launcher.py:14118-14165): ein Skalar gilt fuer jede Karte, eine Liste braucht genau einen Wert je Karte, Werte >= 0; leer = 0.
+    Der Launcher bricht bei einem Fehler ab (SystemExit); hier ist es ein ``CouplingError`` (die Phase steht dann mit ``ok: False`` da)."""
+    text = str(raw if raw is not None else 0).strip()
+    if not text:
+        return [0] * n
+    try:
+        vals = [int(p) for p in text.split(",")]
+    except ValueError:
+        raise CouplingError("--user-reserve-mib muss eine ganze Zahl oder eine kommagetrennte Liste sein, ist %r (launcher.py:14150)" % text)
+    if any(v < 0 for v in vals):
+        raise CouplingError("--user-reserve-mib: Werte muessen >= 0 sein, sind %s (launcher.py:14155)" % vals)
+    if len(vals) == 1:
+        vals = vals * n
+    if len(vals) != n:
+        raise CouplingError("vector_length: --user-reserve-mib hat %d Werte, es gibt %d Karten (launcher.py:14160)" % (len(vals), n))
+    return vals
+
+
+def launcher_d_budgets(totals: Sequence[float], dc: Sequence[float], *, profile: str, user_reserve: Sequence[int],
+                       carve: Optional[Sequence[Optional[float]]] = None, env_d: Optional[Mapping[str, str]] = None,
+                       stated_law_mib: float = float(D_CORRIDOR_STATED_LAW_MIB)) -> Dict[str, Any]:
+    """Das D-Budget je Karte, wie ``launcher.budgets_from_dc`` es fuer die Gruppe D rechnet (launcher.py:15252-15394), mit denselben Eingaengen.
+
+    Zwei Pfade je Karte, wie im Launcher:
+
+    * **gebuchter Rest** (Record ``D_AWAKE_REST_BOOKED_MIB`` des Profils, Registerzeile ``budget_rest_from_records``; launcher.py:15318-15353):
+      ``(Karte - Carve - dc - Wachstum - Rest) // 8 * 8``.  Der Rest enthaelt den Korridor-Boden; Nutzerreserve, 404 und Ueberschuss werden NICHT
+      daneben gebucht (launcher.py:15316-15322).
+    * **Boden + Reserve** (kein Record fuer diese Karte): ``corridor = Boden + Nutzerreserve + (404 ohne Wach-Rest-Record)``,
+      ``(Karte - corridor - dc - Wachstum - Ueberschuss - Carve - Wach-Rest) // 8 * 8`` (launcher.py:15373-15394).
+
+    Records kommen aus der Registerzeile des Profils (``weg2/form.py``, dieselbe Quelle wie ``launcher._pconst``).  Nicht gerechnet (und in
+    ``gaps`` benannt, damit der Tooltip es sagt): gemessener Korridor-Boden und ``SGLANG_CORRIDOR_LAW_FLOOR_MIB`` (hier das stated law 1024), der
+    Korridor-Pass mit Messprobe (launcher.py:15425-15462; er kann das Budget nur senken), der Treiber-Carve (``Card.reserved_mib``, NVML; das
+    Hardwareprofil traegt ihn nicht), der Umgebungsschalter ``SGLANG_WEG2_BUDGET_REST_RECORD`` des Launchers.
+    ``carve`` ist je Karte MiB oder ``None`` (unbekannt)."""
+    n = len(totals)
+    gaps: List[str] = []
+    seen: List[Dict[str, str]] = []
+    form_mod = None
+    row = None
+    try:
+        from sglang.srt.weg2 import form as form_mod  # noqa: F811
+        row = form_mod.profile_row(profile)
+    except Exception as exc:  # pragma: no cover - ohne weg2-Baum nicht pruefbar
+        gaps.append("Profil-Records nicht lesbar (%s: %s)" % (type(exc).__name__, exc))
+    if row is None and form_mod is not None:
+        gaps.append("Profil %r ist in der Registry unbekannt: Records (Wachstum, Wach-Rest, Ueberschuss, gebuchter Rest) nicht gerechnet" % profile)
+
+    def record(name: str, conv: Any) -> Tuple[Optional[List[Any]], str]:
+        if row is None:
+            return None, ""
+        try:
+            vals = list(form_mod.profile_constant(name, profile))
+        except KeyError:
+            return None, ""
+        if len(vals) != n:
+            gaps.append("Record %s hat %d Eintraege, es gibt %d Karten (der Launcher leitet sie fuer die Teilmenge ab, weg2/inventory_view.py): nicht gerechnet"
+                        % (name, len(vals), n))
+            return None, ""
+        rec = row.constants.get(name)
+        boots = tuple(getattr(rec, "boots", ()) or ()) if rec is not None else ()
+        return [None if v is None else conv(v) for v in vals], ("%d Boots, erster %s" % (len(boots), boots[0])) if boots else "Record des Profils"
+
+    grow, grow_src = record("P_DORMANT_SERVED_GROWTH_MIB", int)
+    rest, rest_src = record("D_AWAKE_REST_MIB", int)
+    over_rec, over_src = record("D_OVERSHOOT_MIB", int)
+    booked: Optional[List[Optional[int]]] = None
+    booked_src = ""
+    if row is not None and bool(getattr(row, "budget_rest_from_records", False)):
+        capped_env = (env_d or {}).get(TORCH_CACHE_CAP_ENV)
+        capped = (str(capped_env).strip() == "1") if capped_env is not None else bool(getattr(row, "torch_cache_cap", False))
+        name = "D_AWAKE_REST_BOOKED_MIB"
+        if capped:
+            cap_vals, cap_src = record("D_AWAKE_REST_CAPPED_MIB", int)
+            if cap_vals is not None:
+                booked, booked_src = cap_vals, "D_AWAKE_REST_CAPPED_MIB " + cap_src
+        if booked is None:
+            booked, booked_src = record(name, int)
+            booked_src = ("%s %s" % (name, booked_src)) if booked is not None else ""
+        gaps.append("Umgebung SGLANG_WEG2_BUDGET_REST_RECORD des Launchers (=0 schaltet den gebuchten Rest ab; die Umgebung des Launchers ist im Profil nicht sichtbar)")
+    carve_on = row is not None and bool(getattr(row, "budget_charges_driver_carve", False))
+    if carve_on or booked is not None:
+        min_total = int(getattr(row, "driver_carve_min_total_mib", 0) or 0) if row is not None else 0
+        if carve is None or any(c is None for c in carve):
+            gaps.append("Treiber-Carve (Card.reserved_mib aus NVML; Profil %s bucht ihn %s%s): das Hardwareprofil traegt ihn nicht, nicht gerechnet -- das Budget "
+                        "liegt um den Carve (518 MiB 5090 / 425 MiB 3080, kartenplan_catalog.py:24-25) hoeher als im Launcher" % (
+                            profile, ("ab %d MiB Karte" % min_total) if (carve_on and min_total) else "auf jeder Karte",
+                            "; im gebuchten-Rest-Pfad auf jeder Karte, launcher.py:15331" if booked is not None else ""))
+        charged = [carve_on and (min_total <= t or _uncalibrated(totals[i])) for i, t in enumerate(totals)]
+    else:
+        charged = [False] * n
+    gaps.append("gemessener Korridor-Boden und SGLANG_CORRIDOR_LAW_FLOOR_MIB (corridor_guard.corridor_floor_mib, launcher.py:15323): hier das stated law %d MiB" % int(stated_law_mib))
+    gaps.append("Korridor-Pass mit Messprobe (--corridor-budget-sample, launcher.py:15425-15462): kann das Budget nur senken")
+
+    budgets: List[float] = []
+    notes: List[str] = []
+    for i in range(n):
+        t, d = float(totals[i]), float(dc[i])
+        g = float(grow[i]) if grow and grow[i] is not None else 0.0
+        cvk = float(carve[i]) if (carve is not None and carve[i] is not None) else 0.0
+        cv = cvk if charged[i] else 0.0
+        carve_txt = (" - Carve %.0f" % (cvk if (booked is not None and booked[i] is not None) else cv)) if (cv or (cvk and booked is not None and booked[i] is not None)) else ""
+        grow_txt = (" - Wachstum %.0f (P_DORMANT_SERVED_GROWTH_MIB, %s)" % (g, grow_src)) if g else ""
+        if booked is not None and booked[i] is not None:
+            rb = float(booked[i])
+            b = (int(t - cvk - d - g - rb) // 8) * 8                  # der gebuchte-Rest-Pfad bucht den Carve auf JEDER Karte (launcher.py:15331)
+            notes.append("Launcher-Formel budgets_from_dc, gebuchter Rest (launcher.py:15318-15353): Karte %.0f%s - dc %.0f%s - gebuchter Rest %.0f (%s), auf 8 MiB abgerundet. "
+                         "Der Rest enthaelt den Korridor-Boden; --user-reserve-mib (%d), 404 und Ueberschuss werden daneben nicht gebucht (launcher.py:15316-15322)"
+                         % (t, carve_txt, d, grow_txt, rb, booked_src, user_reserve[i]))
+        else:
+            rs = rest[i] if rest and rest[i] is not None else None
+            ov = 0.0 if rs is not None else (float(over_rec[i]) if over_rec and over_rec[i] is not None else 0.0)
+            builtin = 0.0 if rs is not None else float(D_AWAKE_OVERSHOOT_MIB)
+            res = float(user_reserve[i])
+            corridor = stated_law_mib + res + builtin
+            awake = float(rs) if rs is not None else 0.0
+            b = (int(t - corridor - d - g - ov - cv - awake) // 8) * 8
+            parts = "Korridor %.0f (Boden %.0f + Nutzerreserve %.0f (--user-reserve-mib)%s)" % (
+                corridor, stated_law_mib, res, (" + eingebauter Wach-Ueberschuss %d" % D_AWAKE_OVERSHOOT_MIB) if rs is None else "")
+            notes.append("Launcher-Formel budgets_from_dc (launcher.py:15373-15394): Karte %.0f - %s - dc %.0f%s%s%s%s, auf 8 MiB abgerundet"
+                         % (t, parts, d, grow_txt, (" - gemessener Ueberschuss %.0f (D_OVERSHOOT_MIB, %s)" % (ov, over_src)) if ov else "", carve_txt,
+                            (" - Wach-Rest %.0f (D_AWAKE_REST_MIB, %s; ersetzt die 404)" % (awake, rest_src)) if rs is not None else ""))
+        budgets.append(float(max(b, 0)))
+    for what, vec, src in (("P_DORMANT_SERVED_GROWTH_MIB", grow, grow_src), ("D_AWAKE_REST_MIB", rest, rest_src),
+                           ("D_OVERSHOOT_MIB", over_rec, over_src)):
+        if vec is not None:
+            seen.append({"was": what, "wert": ",".join("-" if v is None else str(v) for v in vec),
+                         "herkunft": "Record des Profils %s (%s; Quelle weg2/form.py, wie launcher._pconst)" % (profile, src)})
+    if booked is not None:
+        seen.append({"was": "D_AWAKE_REST_BOOKED_MIB", "wert": ",".join("-" if v is None else str(v) for v in booked),
+                     "herkunft": "Record des Profils %s (%s); gebucht statt Boden + Reserve + 404 (launcher.py:15318-15353)" % (profile, booked_src)})
+    return {"budgets": budgets, "notes": notes, "gaps": gaps, "seen": seen, "profile": profile}
+
+
+def _uncalibrated(total_mib: float) -> bool:
+    """Karte ohne Kalibrierklasse bucht den Carve immer (launcher.driver_carve_charged, launcher.py:14642): im Profil steht nur die Groesse, ein Modell
+    gibt es nicht -- die beiden kalibrierten Klassen (3080 20 GB, 5090 32 GB) haben ihre Groesse; jede andere Groesse gilt als unkalibriert."""
+    return not any(abs(total_mib - c) <= c * 0.02 for c in (20480.0, 32607.0))
+
+
+def d_phase_config(args: Mapping[str, str], env: Mapping[str, str], model: Mapping[str, Any], n: int, draft: Mapping[str, Any],
+                   dual_plan: Optional[Mapping[str, Any]] = None, launcher_args: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+    """Einstellungen der D-Phase (TP-Raenge) aus den Zeilen der Gruppe D; ``seen`` = gelesene Eingaben mit Herkunft.
+
+    ``dual_plan`` (``dual_p_plan``, nur Form dual mit ``--dual-share``): der Launcher bemisst D dann aus P's Plan, nicht aus
+    ``--rank-gpu-memory-mib`` / ``--d-foreign-context-mib`` / ``--d-nontorch-mib`` der Gruppe D (launcher.py:27289-27301).
+    ``launcher_args``: die Zeilen des Profils fuer den LAUNCHER selbst (``--user-reserve-mib``, ``--profile``), ohne ``--extra-d``: argparse des
+    Launchers liest sie, nicht der Rang."""
+    seen: List[Dict[str, str]] = []
+
+    def note(what: str, value: Any, herkunft: str) -> None:
+        seen.append({"was": what, "wert": str(value), "herkunft": herkunft})
+
+    cfg: Dict[str, Any] = {"n": n, "draft": draft}
+    la = dict(launcher_args or {})
+    prof = str(la.get("--profile") or "").strip()
+    if not prof:
+        try:
+            from sglang.srt.weg2 import form as _form
+            prof = str(_form.DEFAULT_PROFILE)
+        except Exception:  # pragma: no cover
+            prof = "qwen27b"
+        note("profile", prof, "Standard des Launchers (--profile, launcher.py:22562; nicht im Profil gesetzt)")
+    else:
+        note("profile", prof, "Profilzeile --profile")
+    cfg["profile"] = prof
+    cfg["user_reserve_card"] = parse_user_reserve(la.get("--user-reserve-mib"), n)
+    note("user_reserve_card", ",".join("%d" % v for v in cfg["user_reserve_card"]),
+         "Profilzeile --user-reserve-mib (Rang-/Ordinal-Reihenfolge, 5090 zuerst; hebt den Korridor-Boden, senkt das D-Budget um genau diesen Betrag, "
+         "launcher.py:15316-15323)" if la.get("--user-reserve-mib") not in (None, "") else
+         "Standard 0 des Launchers (kein --user-reserve-mib im Profil)")
+    cfg["env_d"] = dict(env or {})
+    tp = str(args.get("--rank-tp-ratio") or "").strip()
+    if tp in ("auto", "auto-performance"):
+        cfg["tp_ratio"] = tp
+        note("tp_ratio", tp, "Profilzeile --rank-tp-ratio")
+    elif _fl(tp):
+        cfg["tp_ratio"] = _fl(tp)
+        note("tp_ratio", tp, "Profilzeile --rank-tp-ratio")
+    mr = str(args.get("--rank-moe-ratio") or "").strip()
+    if mr and _fl(mr):
+        cfg["moe_ratio"] = _fl(mr)
+        note("moe_ratio", mr, "Profilzeile --rank-moe-ratio")
+    elif mr:
+        cfg["moe_ratio"] = mr
+        note("moe_ratio", mr, "Profilzeile --rank-moe-ratio")
+    fr = _fl(args.get("--rank-moe-resident-fraction")) or _fl(env.get("SGLANG_MOE_RESIDENT_EXPERT_FRACTION"))
+    if fr:
+        cfg["moe_fraction"] = fr if len(fr) > 1 else fr[0]
+        note("moe_fraction", ",".join("%g" % x for x in fr),
+             "Profilzeile --rank-moe-resident-fraction" if args.get("--rank-moe-resident-fraction")
+             else "Umgebung SGLANG_MOE_RESIDENT_EXPERT_FRACTION (--env-d)")
+    sc = _fl(env.get("SGLANG_MOE_SCRATCH_SLOTS"))
+    if sc:
+        cfg["scratch"] = [int(x) for x in sc] if len(sc) > 1 else int(sc[0])
+        note("scratch", ",".join("%d" % x for x in sc), "Umgebung SGLANG_MOE_SCRATCH_SLOTS (--env-d)")
+    bud = _fl(args.get("--rank-gpu-memory-mib"))
+    if dual_plan is not None:
+        # --dual-share: D = Union-Owner, bemessen aus P's PLAN (dc = P-Budget + --dual-p-overhead-mib je Karte, launcher.py:27289-27301)
+        cfg["dual_share"] = True
+        cfg["dual_p_budget"] = dual_plan.get("budget")
+        cfg["dual_overhead_mib"] = float(dual_plan.get("overhead", DUAL_P_OVERHEAD_DEFAULT_MIB))
+        cfg["dual_overhead_given"] = bool(dual_plan.get("overhead_given"))
+        if dual_plan.get("budget") is not None:
+            note("dual_p_budget", dual_plan.get("budget_raw"), "Profilzeile --rank-gpu-memory-mib der Gruppe P (launcher.py:14976 dual_share_planned_dc)")
+        else:
+            note("dual_p_budget", "nicht im Profil", "kein --rank-gpu-memory-mib in der Gruppe P: P's Budget loest der Launcher, hier nicht gerechnet")
+        note("dual_p_overhead_mib", "%g" % cfg["dual_overhead_mib"],
+             "Profilzeile --dual-p-overhead-mib" if cfg["dual_overhead_given"] else "Standard des Launchers (--dual-p-overhead-mib 1500, launcher.py:22713)")
+        if bud:
+            note("budget_mib", args.get("--rank-gpu-memory-mib"),
+                 "ignoriert unter --dual-share: der Launcher bemisst D aus P's Plan (launcher.py:27289-27301), nicht aus dieser Zeile")
+    elif bud:
+        cfg["budget_mib"] = bud
+        note("budget_mib", args.get("--rank-gpu-memory-mib"), "Profilzeile --rank-gpu-memory-mib")
+    else:
+        note("budget_mib", "Kartengroesse - Festposten - Korridor %d MiB" % D_CORRIDOR_ASSUMED_MIB,
+             "Annahme dieser Rechnung (kein --rank-gpu-memory-mib in der Gruppe D; Korridor = %d stated law + %d eingebauter Wach-Ueberschuss, "
+             "launcher.py:266-269)" % (D_CORRIDOR_STATED_LAW_MIB, D_AWAKE_OVERSHOOT_MIB))
+    for flag in ("--max-kv-per-request", "--context-length"):
+        v = args.get(flag)
+        if v and str(v).isdigit():
+            cfg["context_tokens"] = int(v)
+            note("context_tokens", v, "Profilzeile " + flag)
+            break
+    slots = args.get("--max-mamba-cache-size")
+    if slots and str(slots).isdigit():
+        cfg["mamba_slots"] = int(slots)
+        note("mamba_slots", slots, "Profilzeile --max-mamba-cache-size")
+    for key, default, why in (("context_tokens", 262144, "kein --max-kv-per-request/--context-length in der Gruppe D"),
+                              ("mamba_slots", 1, "kein --max-mamba-cache-size in der Gruppe D")):
+        if key not in cfg:
+            note(key, default, "Annahme dieser Rechnung (%s)" % why)
+    kd = args.get("--kv-cache-dtype")
+    if kd and kd in ((model.get("kv") or {}).get("variants") or {}):
+        cfg["kv_dtype"] = kd
+        note("kv_dtype", kd, "Profilzeile --kv-cache-dtype")
+    ssm = args.get("--mamba-ssm-dtype")
+    if ssm and ssm in ((model.get("state") or {}).get("variants_mib") or {}):
+        cfg["ssm_dtype"] = ssm
+        note("ssm_dtype", ssm, "Profilzeile --mamba-ssm-dtype")
+    kr = str(args.get("--rank-kv-ratio") or "coupled").strip()
+    cfg["kv_ratio"] = _fl(kr) if _fl(kr) else kr
+    if args.get("--rank-kv-ratio"):
+        note("kv_ratio", kr, "Profilzeile --rank-kv-ratio")
+    cfg["kv_token_cut"] = bool(args.get("--d-kv-token-cut")) or bool(env.get("SGLANG_UNEVEN_TOKEN_VECTOR"))
+    if args.get("--d-kv-token-cut"):
+        note("kv_token_cut", args.get("--d-kv-token-cut"), "Profilzeile --d-kv-token-cut")
+    fo, nt = _fl(args.get("--d-foreign-context-mib")), _fl(args.get("--d-nontorch-mib"))
+    if dual_plan is not None:
+        if fo or nt:
+            note("fixed_mib", "%s + %s" % (args.get("--d-foreign-context-mib") or "-", args.get("--d-nontorch-mib") or "-"),
+                 "nicht Teil der Bemessung unter --dual-share: der Launcher zieht P's Plan ab (dc = P-Budget + Overhead, launcher.py:27289-27301)")
+    elif fo and nt and len(fo) == len(nt):
+        cfg["fixed_mib"] = [a + b for a, b in zip(fo, nt)]
+        cfg["fixed_parts"] = {"fremd": fo, "nichttorch": nt}
+        note("fixed_mib", "%s + %s" % (args.get("--d-foreign-context-mib"), args.get("--d-nontorch-mib")),
+             "Profilzeilen --d-foreign-context-mib (CUDA-Kontext der schlafenden Phase) + --d-nontorch-mib (VRAM ausserhalb des Torch-Allokators)")
+    elif fo or nt:
+        cfg["fixed_mib"] = fo or nt
+        cfg["fixed_parts"] = {"fremd": fo, "nichttorch": nt}
+        note("fixed_mib", args.get("--d-foreign-context-mib") or args.get("--d-nontorch-mib"),
+             "nur eine der Profilzeilen --d-foreign-context-mib / --d-nontorch-mib")
+    rs = _fl(args.get("--d-reserve-mib"))
+    if rs:
+        cfg["user_reserve_mib"] = rs
+        note("user_reserve_mib", args.get("--d-reserve-mib"),
+             "Profilzeile --d-reserve-mib (Launcher zieht sie vom Verfuegbaren ab: launcher.py:19886, pp_cut.d_rank_available_mib)")
+    return dict(cfg, seen=seen)
+
+
+def _norm_shares(ratio: Sequence[float], n: int, name: str) -> List[float]:
+    if len(ratio) != n:
+        raise CouplingError("vector_length: %s hat %d Werte, es gibt %d Raenge" % (name, len(ratio), n))
+    tot = float(sum(ratio))
+    if tot <= 0:
+        raise CouplingError("%s: Summe der Gewichte ist 0" % name)
+    return [float(r) / tot for r in ratio]
+
+
+def d_stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Posten je Karte der D-Phase (TP-Raenge) im selben Stufenformat wie ``_stage_terms`` (``terms[k] = {v|None, src, note}``).
+
+    Gewichte, Experten und Zustand folgen den Anteilen aus ``--rank-tp-ratio`` / ``--rank-moe-ratio`` (ohne Zeile: gleichmaessiger TP);
+    Experten halten je Rang ``buffer_rows(owned, FR_D, Scratch)`` Zeilen je Layer (Pufferregel).  KV nur dort, wo sich die Verteilung
+    belegen laesst (gleichmaessiger TP oder ein ausdruecklicher ``--rank-kv-ratio``-Vektor); sonst ``None``."""
+    cards = _cards(hw)
+    n = len(cards)
+    totals = [float(_val(c.get("vram_total_mib"), 0.0)) for c in cards]
+    if any(t <= 0 for t in totals):
+        raise CouplingError("Hardwareprofil: vram_total_mib fehlt auf einer Karte")
+    corridor = float(cfg.get("corridor_mib", D_CORRIDOR_ASSUMED_MIB))
+    has_budget = cfg.get("budget_mib") is not None
+    # Launcher-Formel (budgets_from_dc, launcher.py:15393-15394): Budget = (Karte - Korridor - dormant_other - ...) // 8 * 8.  ``dormant_other`` (dc)
+    # ist in der Flip-Form der CUDA-Kontext der schlafenden Phase (--d-foreign-context-mib + --d-nontorch-mib), in der Form dual mit --dual-share
+    # P's PLAN (P-Budget + --dual-p-overhead-mib, launcher.py:27289-27301).  Ohne --rank-gpu-memory-mib ist das Budget die Annahme dieser Rechnung.
+    # Die Festposten liegen AUSSERHALB des Budgets (pp_cut.d_rank_available_mib), die Annahme "Karte - Korridor" wuerde sie doppelt zaehlen.
+    dual = bool(cfg.get("dual_share"))
+    dual_dc: Optional[List[float]] = None
+    if dual and cfg.get("dual_p_budget") is not None:
+        dual_dc = [b + float(cfg.get("dual_overhead_mib", DUAL_P_OVERHEAD_DEFAULT_MIB))
+                   for b in _per_card(cfg.get("dual_p_budget"), n, "dual_p_budget", 0.0)]
+    if dual_dc is not None:
+        pre_fixed = dual_dc
+    elif cfg.get("fixed_mib") is not None and not dual:
+        pre_fixed = _per_card(cfg.get("fixed_mib"), n, "fixed_mib", 0.0)
+    else:
+        pre_fixed = [0.0] * n
+    override = "corridor_mib" in cfg                      # Eingabe des Nutzers (Uebersteuerung): ersetzt die Launcher-Formel
+    lb_res: Optional[Dict[str, Any]] = None
+    if has_budget:
+        budgets = _per_card(cfg.get("budget_mib"), n, "budget_mib", 0.0)
+    elif override:
+        budgets = [float(int(max(t - f - corridor, 0.0)) // 8 * 8) for t, f in zip(totals, pre_fixed)]
+    else:
+        carve = [(float(_val(c.get("driver_reserved_mib"))) if c.get("driver_reserved_mib") is not None else None) for c in cards]
+        lb_res = launcher_d_budgets(totals, pre_fixed, profile=str(cfg.get("profile") or "qwen27b"),
+                                    user_reserve=cfg.get("user_reserve_card") or [0] * n, carve=carve, env_d=cfg.get("env_d"))
+        budgets = lb_res["budgets"]
+    budget_src = SRC_PROFILE if has_budget else (SRC_INPUT if override else SRC_DERIVED)
+    gaps_txt = ("; NICHT GERECHNET (der Launcher kann tiefer landen): " + "; ".join(lb_res["gaps"])) if lb_res is not None else ""
+    ur_all = list(cfg.get("user_reserve_card") or [0] * n)
+    corr_txt = "Korridor %.0f MiB (Eingabe, ersetzt die Launcher-Formel)" % corridor if override else "Korridor nach Launcher-Formel"
+    budget_notes: List[str]
+    if has_budget:
+        res_txt = ("; --user-reserve-mib %s hebt den Korridor-Boden im Launcher, ist im ausdruecklichen Budget nicht gerechnet" % ",".join("%d" % v for v in ur_all)
+                   if any(ur_all) else "")
+        budget_notes = ["--rank-gpu-memory-mib" + res_txt] * n
+    elif override:
+        budget_notes = ["Karte - Festposten - %s, auf 8 MiB abgerundet" % corr_txt] * n
+    else:
+        assert lb_res is not None
+        if dual_dc is not None:
+            head = ("aus P's Plan (launcher.py:14976 dual_share_planned_dc, :27289-27301; P-Budget = Wert der Gruppe P, der Launcher nimmt min(eigenes P-Budget, Wert), "
+                    "dessen Budget ist hier nicht gerechnet): dc = P-Budget + --dual-p-overhead-mib. ")
+        elif dual:
+            head = ("OBERGRENZE: unter --dual-share zieht der Launcher P's Plan (P-Budget + --dual-p-overhead-mib) als dc ab, im Profil steht aber kein "
+                    "--rank-gpu-memory-mib der Gruppe P: dc hier 0, nicht gerechnet. ")
+        elif any(pre_fixed):
+            head = "dc = Festposten (--d-foreign-context-mib + --d-nontorch-mib; im echten Lauf der gemessene Rest von P nach sleep(P)). "
+        else:
+            head = "dc = 0 (keine --d-foreign-context-mib/--d-nontorch-mib im Profil: nicht gebucht, nicht gerechnet). "
+        budget_notes = [head + x + gaps_txt for x in lb_res["notes"]]
+    d_inputs = list(lb_res["seen"]) if lb_res is not None else []
+    fams = _families(model)
+    w = model["weights"]
+    lb, le = list(_val(w["layer_bytes"])), list(_val(w["layer_expert_bytes"]))
+    dense_total = (sum(lb) + float(_val(w.get("embed_bytes"), 0.0)) + float(_val(w.get("lm_head_bytes"), 0.0))) / MIB
+    E = int(_val(model.get("experts", {}).get("n"), 0) or 0)
+    ctx = int(cfg.get("context_tokens", 262144))
+    slots = int(cfg.get("mamba_slots", 1))
+
+    def none(note: str) -> Dict[str, Any]:
+        return {"v": None, "src": SRC_NONE, "note": note}
+
+    # --- Anteile ------------------------------------------------------------------------------------------------------------------
+    tp = cfg.get("tp_ratio")
+    shares: Optional[List[float]]
+    if isinstance(tp, str):
+        shares, share_note = None, "--rank-tp-ratio %s: die Gewichte loest der Launcher, nicht gerechnet" % tp
+    elif tp:
+        shares, share_note = _norm_shares(tp, n, "--rank-tp-ratio"), "Anteil nach --rank-tp-ratio %s" % ",".join("%g" % x for x in tp)
+    else:
+        shares, share_note = [1.0 / n] * n, "gleichmaessiger TP (kein --rank-tp-ratio im Profil)"
+    share_src = SRC_PROFILE if (tp and not isinstance(tp, str)) else SRC_APPROX
+
+    # --- Experten ---------------------------------------------------------------------------------------------------------------------
+    exp_terms: List[Dict[str, Any]] = []
+    mr = cfg.get("moe_ratio")
+    if E <= 0:
+        exp_terms = [_term(0.0, SRC_DEFAULT, "keine Experten") for _ in range(n)]
+    elif isinstance(mr, str):
+        exp_terms = [none("--rank-moe-ratio %s: die Zuteilung loest der Launcher" % mr) for _ in range(n)]
+    else:
+        fracs = _per_card(cfg.get("moe_fraction"), n, "moe_fraction", 1.0)
+        scr = _per_card(cfg.get("scratch"), n, "scratch", 0.0)
+        per_expert = sum(le) / float(E) / MIB
+        if mr:
+            ratio = [float(x) for x in mr]
+            if len(ratio) != n:
+                raise CouplingError("vector_length: --rank-moe-ratio hat %d Werte, es gibt %d Raenge" % (len(ratio), n))
+            as_counts = abs(sum(ratio) - E) < 1e-9
+            counts = [int(x) for x in ratio] if as_counts else [int(round(E * r / sum(ratio))) for r in ratio]
+            how = ("Besitz %s von %d Experten" % (",".join(str(c) for c in counts), E)) if as_counts else \
+                "Besitz aus dem Verhaeltnis auf %d Experten normiert: %s" % (E, ",".join(str(c) for c in counts))
+            for i in range(n):
+                try:
+                    rows = _er.buffer_rows(local_experts=counts[i], fraction=fracs[i], scratch_rows=int(scr[i])) if counts[i] > 0 else 0
+                except ValueError as exc:
+                    exp_terms.append(none(str(exc)))
+                    continue
+                exp_terms.append({"v": rows * per_expert, "src": SRC_APPROX,
+                                  "note": "%s; %d von %d eigenen Zeilen je Layer resident (FR %.3g, Scratch %d), %.3f MiB je Zeile ueber alle Layer"
+                                          % (how, rows, counts[i], fracs[i], int(scr[i]), per_expert)})
+        elif shares is not None:
+            for i in range(n):
+                bf = _mp.expert_buffer_fraction(E, fracs[i], int(scr[i]))
+                exp_terms.append({"v": shares[i] * sum(le) / MIB * bf, "src": SRC_APPROX,
+                                  "note": "%s; Pufferregel %.0f %% (FR %.3g, Scratch %d); kein --rank-moe-ratio" % (share_note, 100 * bf, fracs[i], int(scr[i]))})
+        else:
+            exp_terms = [none(share_note) for _ in range(n)]
+
+    # --- Zustand (Mamba/GDN) ------------------------------------------------------------------------------------------------------------
+    attn_total = sum(1 for f in fams if f == "attn")
+    lin_total = len(fams) - attn_total
+    state_per = float(_val((model.get("state") or {}).get("per_linear_layer_per_slot_mib"), 0.0))
+    if cfg.get("ssm_dtype"):
+        state_per = float(model["state"]["variants_mib"][cfg["ssm_dtype"]])
+    state_total = lin_total * state_per * slots
+
+    # --- KV ------------------------------------------------------------------------------------------------------------------------------
+    draft = cfg.get("draft") or {"kind": "none"}
+    cell, cell_src = _cell_bytes(model, cfg.get("kv_dtype"))
+    cell_mib = cell / MIB
+    kv_total = ctx * attn_total * cell_mib
+    kvr = cfg.get("kv_ratio")
+    kv_shares: Optional[List[float]] = None
+    if isinstance(kvr, list):
+        kv_shares = _norm_shares(kvr, n, "--rank-kv-ratio")
+        kv_note = "Token-Eigentum nach --rank-kv-ratio %s (jeder Rang haelt alle KV-Koepfe seiner Token)" % ",".join("%g" % x for x in kvr)
+    elif kvr not in (None, "coupled"):
+        kv_note = "--rank-kv-ratio %s: der Loeser verteilt die Token kapazitaetsgewichtet" % kvr
+    elif cfg.get("kv_token_cut"):
+        kv_note = "--d-kv-token-cut/SGLANG_UNEVEN_TOKEN_VECTOR gesetzt: das Token-Eigentum loest der Planer"
+    elif tp:
+        kv_note = ("ungleicher TP (--rank-tp-ratio): die Verteilung der KV-Koepfe/Token folgt dem Plan der Laufzeit (Reiter KV-Koepfe), "
+                   "nicht gerechnet")
+    else:
+        h = int(_val(model["arch"].get("heads_kv"), 0) or 0)
+        if h and h >= n and h % n == 0:
+            kv_shares, kv_note = [1.0 / n] * n, "gleichmaessiger TP: %d KV-Koepfe / %d Raenge" % (h, n)
+        else:
+            kv_note = "%d KV-Koepfe auf %d Raenge: Standardpfad der Laufzeit (Replikation/Token-Achse), nicht gerechnet" % (h, n)
+
+    # --- Draft ------------------------------------------------------------------------------------------------------------------------------
+    host: Optional[int] = 0
+    if draft.get("gpu") not in (None, ""):
+        match = [i for i, c in enumerate(cards) if str(c.get("nvml_index")) == str(draft["gpu"])]
+        host = match[0] if match else None
+    draft_terms: List[Dict[str, Any]] = [_term(0.0, SRC_DEFAULT, draft.get("reason") or "kein Draft") for _ in range(n)]
+    draft_share: List[float] = [0.0] * n
+    if draft["kind"] != "none":
+        solo = draft.get("placement") == "solo"
+        if draft["d_mib"] is None:
+            draft_terms = [none(draft.get("reason") or "Draftgewicht nicht belegbar") for _ in range(n)]
+        elif solo:
+            if host is None:
+                draft_terms = [none("--speculative-draft-gpu %s: Rang nicht aus dem Hardwareprofil ableitbar" % draft.get("gpu")) for _ in range(n)]
+            else:
+                draft_terms = [_term(draft["d_mib"] if i == host else 0.0, draft["src"], "solo auf Rang %d: %s" % (host, draft["d_note"]))
+                               for i in range(n)]
+                draft_share = [1.0 if i == host else 0.0 for i in range(n)]
+        elif shares is not None:
+            draft_terms = [_term(draft["d_mib"] * shares[i], SRC_APPROX,
+                                 "geteilt (--speculative-draft-placement split) nach TP-Anteil: %s" % draft["d_note"]) for i in range(n)]
+            draft_share = list(shares)
+        else:
+            draft_terms = [none(share_note) for _ in range(n)]
+
+    fixed = cfg.get("fixed_mib")
+    fixed_vec = _per_card(fixed, n, "fixed_mib", 0.0) if fixed is not None else None
+    act = cfg.get("activation_mib")
+    act_vec = _per_card(act, n, "activation_mib", 0.0) if act is not None else None
+
+    stages = []
+    for i, c in enumerate(cards):
+        t: Dict[str, Any] = {}
+        t["weights"] = none(share_note) if shares is None else {
+            "v": shares[i] * dense_total, "src": share_src,
+            "note": "%s (Vokabular folgt hier dem TP-Anteil, nicht --rank-vocab-ratio)" % share_note}
+        t["experts"] = exp_terms[i]
+        t["draft"] = draft_terms[i]
+        if kv_shares is None:
+            t["kv"] = none(kv_note)
+        else:
+            drows = draft.get("attn_layers", 1) if (draft["kind"] == "nextn" and draft_share[i] > 0) else 0
+            kv_i = kv_shares[i] * kv_total + (ctx * drows * cell_mib * draft_share[i] if drows else 0.0)
+            t["kv"] = {"v": kv_i, "src": SRC_APPROX, "note": "%s: %d Token x %d Attention-Layer x %.0f B%s" % (
+                kv_note, ctx, attn_total, cell, " + Draft-KV" if drows else "")}
+        t["state"] = none(share_note) if shares is None else {
+            "v": shares[i] * state_total, "src": SRC_APPROX,
+            "note": "%s; %d Linear-Layer x %.4f MiB x %d Slot(s)" % (share_note, lin_total, state_per, slots)}
+        t["activation"] = _term(act_vec[i], SRC_INPUT, "gemessene Spitze (Eingabe)") if act_vec is not None else none(
+            "Decode-Aktivierung und Graphen der D-Phase: nur am Metall zu messen")
+        if dual_dc is not None:
+            t["fixed"] = {"v": dual_dc[i], "src": SRC_PROFILE if cfg.get("dual_overhead_given") else SRC_APPROX, "outside_budget": True,
+                          "what": DUAL_D_FIXED_WHAT,
+                          "note": "P's Plan auf dieser Karte (dormant_other, AUSSERHALB von D's Budget): P-Budget %g + --dual-p-overhead-mib %g%s "
+                                  "(aus P-Plan, launcher.py:14976 dual_share_planned_dc, :27289-27301)"
+                                  % (float(_per_card(cfg.get("dual_p_budget"), n, "dual_p_budget", 0.0)[i]), float(cfg.get("dual_overhead_mib")),
+                                     "" if cfg.get("dual_overhead_given") else " (Standard des Launchers, nicht im Profil gesetzt)")}
+        elif dual:
+            t["fixed"] = dict(what=DUAL_D_FIXED_WHAT, **none("unter --dual-share bemisst der Launcher D aus P's Plan (P-Budget + --dual-p-overhead-mib, launcher.py:27289-27301); im Profil "
+                              "fehlt --rank-gpu-memory-mib der Gruppe P, P's Budget loest der Launcher: nicht gerechnet"))
+        elif fixed_vec is not None:
+            parts = cfg.get("fixed_parts") or {}
+            f_note = "; ".join("%s %s" % (k, ",".join("%g" % x for x in v)) for k, v in parts.items() if v)
+            # Launcher-Semantik (pp_cut.d_rank_available_mib): verfuegbar = Karte - fremd - nichttorch - reserve; gefragt = Budget
+            # (--rank-gpu-memory-mib).  Die Festposten liegen also AUSSERHALB des Budgets -> ``outside_budget`` (contract_bar rechnet sie
+            # nicht gegen das Budget und zieht sie von der Reserve ab; sonst stuende derselbe Betrag zweimal im Balken).
+            t["fixed"] = {"v": fixed_vec[i], "src": SRC_PROFILE, "outside_budget": True,
+                          "note": "--d-foreign-context-mib (CUDA-Kontext der schlafenden Phase) + --d-nontorch-mib (liegen AUSSERHALB des Budgets, "
+                                  "wie im Launcher): " + f_note}
+        else:
+            t["fixed"] = none("CUDA-Kontext, Graphen, Allokator-Reste: nur am Metall zu messen "
+                              "(keine --d-foreign-context-mib/--d-nontorch-mib im Profil)")
+        st = {"ord": c.get("ord", i), "label": _label(c), "total_mib": totals[i],
+              "budget_mib": {"v": budgets[i], "src": budget_src, "note": budget_notes[i]}, "terms": t}
+        if cfg.get("user_reserve_mib") is not None:
+            st["user_reserve_mib"] = _per_card(cfg.get("user_reserve_mib"), n, "user_reserve_mib", 0.0)[i]
+        stages.append(st)
+    hints = ["D: KV gesamt fuer %d Token Kontext ueber alle Raenge: %.0f MiB (%s)" % (ctx, kv_total, cell_src)]
+    if cfg.get("user_reserve_mib") is not None:
+        hints.append("D: --d-reserve-mib %s geht in den Verfuegbar-Vergleich ein (Launcher: verfuegbar = Karte - fremd - nichttorch - reserve), steht aber nicht "
+                     "als eigenes Segment im Balken: der Launcher haelt darin KV-Pool, Draft und Aktivierung (pp_cut.d_rank_available_mib), die hier einzeln stehen."
+                     % ",".join("%g" % x for x in _per_card(cfg.get("user_reserve_mib"), n, "user_reserve_mib", 0.0)))
+    return {"stages": stages, "warnings": [], "hints": hints, "inputs": d_inputs}
+
+
+def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
+    """Eine Stufe (``terms[k] = {v|None, src, note}``) -> Karten-Balken im Vertrag ``flliper.balken/1``.
+
+    Posten in logischer Reihenfolge, dann ``Reserve`` (verfuegbar - Budget, von einem Ueberlauf ueber das Budget aufgezehrt) und ``Frei``
+    (Budget - Posten im Budget).  Posten mit ``outside_budget`` (D-Phase: ``--d-foreign-context-mib`` + ``--d-nontorch-mib``, Launcher:
+    verfuegbar = Karte - fremd - nichttorch - reserve) liegen AUSSERHALB des Budgets: sie zaehlen nicht gegen das Budget, verkleinern aber das
+    Verfuegbare (Segment ``ausserhalb_budget: true``).  Die Segmente SIND der Balken: Summe = max(Kartengroesse, Posten ausserhalb + max(Budget,
+    Posten im Budget)); ragt sie ueber ``total_mib``, waechst der Balken ueber die Kartengrenze (``beyond_card_mib``) -- nichts wird abgeschnitten.
+    ``mib: None`` = nicht gerechnet.  Ist das Budget groesser als das Verfuegbare (``budget_over_available_mib``), meldet der Launcher DARUEBER
+    und startet trotzdem (launcher.py:19902-19958; kein raise).  ``stage["user_reserve_mib"]`` (``--d-reserve-mib``, launcher.py:19886) geht in
+    den Verfuegbar-Vergleich ein (``pp_cut.d_rank_available_mib``), wird aber nicht als eigenes Segment gezeichnet: der Launcher haelt darin KV-Pool,
+    Draft und Aktivierung, die hier schon einzeln stehen.
+
+    Terme mit ``ref`` (Dual-Form, ``--dual-share``) sind REFERENZ ohne Budgetverbrauch: sie stehen in ``shared_with_d`` (nicht in ``segments``,
+    nicht in der Summe).  ``ref = "shared"``: Bytes liegen in D's Union-Image bzw. im Karten-KV-Pool; ``ref = "in_festposten"``: der Betrag steckt
+    schon im Festposten ``--dual-p-overhead-mib``.  ``stage["ref_extra"]`` traegt Referenzposten ohne Zahl (``mib: None``, nicht gerechnet)."""
+    total = float(stage["total_mib"])
+    budget = float(stage["budget_mib"]["v"])
+    segs: List[Dict[str, Any]] = []
+    refs: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    inside = 0.0
+    outside = 0.0
+    for key, label, what in BAR_SEGMENTS:
+        t = stage["terms"].get(key)
+        if t is None:
+            continue
+        if phase == "D":
+            what = D_WHAT.get(key, what)
+            if t.get("what"):                       # Text je Form/Herkunft (Beispiel: Festposten unter --dual-share = P's Plan, nicht CUDA-Kontext)
+                what = str(t["what"])
+        v = t.get("v")
+        if t.get("ref"):
+            if v is not None and v > 0:
+                refs.append({"name": key, "label": label, "mib": round(float(v), 3), "ref": t["ref"], "herkunft": _origin(t["src"]),
+                             "detail": what + (" -- " + t["note"] if t.get("note") else ""), "gerechnet": True})
+            continue
+        out_b = bool(t.get("outside_budget"))
+        if v is None:
+            segs.append({"name": key, "label": label, "mib": None, "herkunft": SRC_NONE, "detail": t.get("note") or what, "gerechnet": False})
+            missing.append(label)
+        elif v > 0:
+            if out_b:
+                outside += float(v)
+            else:
+                inside += float(v)
+            seg = {"name": key, "label": label, "mib": round(float(v), 3), "herkunft": _origin(t["src"]),
+                   "detail": what + (" -- " + t["note"] if t.get("note") else ""), "gerechnet": True}
+            if out_b:
+                seg["ausserhalb_budget"] = True
+            segs.append(seg)
+    for x in stage.get("ref_extra") or ():
+        refs.append(dict(x))
+        if x.get("mib") is None:
+            missing.append(x["label"])
+    known = inside + outside
+    available = total - outside
+    user_reserve = float(stage.get("user_reserve_mib") or 0.0)
+    overflow = max(0.0, inside - budget)
+    beyond = max(0.0, known - total)
+    over_avail = max(0.0, budget - (available - user_reserve))
+    reserve = max(0.0, available - max(budget, inside))
+    free = max(0.0, min(budget, available) - inside)
+    bsrc = stage["budget_mib"]
+    if reserve > 0:
+        wish = (" -- Wunsch %.0f MiB, davon %.0f MiB aufgezehrt" % (available - budget, overflow)) if overflow > 0 else ""
+        segs.append({"name": "reserve", "label": "Reserve", "mib": round(reserve, 3), "herkunft": _origin(bsrc["src"]),
+                     "detail": BALKEN_SEGMENTS[-2][2] + (" -- " + bsrc["note"] if bsrc.get("note") else "") + wish, "gerechnet": True})
+    if free > 0:
+        obergrenze = (" -- OBERGRENZE: nicht gerechnet sind " + ", ".join(missing)) if missing else ""
+        segs.append({"name": "free", "label": "Frei", "mib": round(free, 3), "herkunft": "gerechnet",
+                     "detail": BALKEN_SEGMENTS[-1][2] + obergrenze, "gerechnet": True})
+    return {"card": stage.get("ord"), "label": stage["label"], "phase": phase, "total_mib": total, "budget_mib": budget,
+            "budget_herkunft": _origin(bsrc["src"]), "segments": segs, "posts_mib": round(known, 3), "free_mib": round(free, 3),
+            "overflow_mib": round(overflow, 3), "beyond_card_mib": round(beyond, 3), "outside_budget_mib": round(outside, 3),
+            "available_mib": round(available, 3), "budget_over_available_mib": round(over_avail, 3), "user_reserve_mib": round(user_reserve, 3),
+            "shared_with_d": refs, "not_computed": missing,
+            "over_text": _over_text(stage["label"], phase, overflow, beyond, budget, total, over_avail, outside, user_reserve)}
+
+
+def _over_text(label: str, phase: str, overflow: float, beyond: float, budget: float, total: float,
+               over_avail: float = 0.0, outside: float = 0.0, user_reserve: float = 0.0) -> str:
+    # Belegt ist nur, was der Launcher tut: bei Budget > Verfuegbar protokolliert er "DARUEBER" und bootet weiter (launcher.py:19902-19958,
+    # log_d_rank_vram_solve: kein raise).  Ob der Planer (propose) ablehnt, ist nicht Sache dieses Balkens -> kein "lehnt ab" ohne Beleg.
+    if beyond > 0:
+        return ("%s (%s): Posten %.0f MiB ueber der KARTE (%.0f MiB); zu erwarten ist OOM beim Laden oder beim Graphenaufbau." % (label, phase, beyond, total))
+    if overflow > 0:
+        return ("%s (%s): Posten %.0f MiB ueber dem Budget (%.0f MiB); die Reserve wird aufgezehrt." % (label, phase, overflow, budget))
+    if over_avail > 0:
+        res = (" - Nutzerreserve %.0f MiB (--d-reserve-mib)" % user_reserve) if user_reserve > 0 else ""
+        return ("%s (%s): Budget %.0f MiB ist %.0f MiB groesser als das Verfuegbare (Karte %.0f - Festposten %.0f MiB ausserhalb des Budgets%s). "
+                "Der Launcher meldet DARUEBER und startet trotzdem." % (label, phase, budget, over_avail, total, outside, res))
+    return ""
+
+
+def detect_form(args: Mapping[str, str], tokens: Sequence[str], n: int, form: Optional[str] = None) -> str:
+    """Betriebsform aus dem Profil: ``single`` (eine Karte) | ``d_only`` (``--d-only``) | ``dual`` (``--dual-*``) | ``flip`` (Standard)."""
+    if form in FORMS:
+        return str(form)
+    if n == 1:
+        return "single"
+    if any(str(k).startswith("--dual-") for k in args) or any(str(t).startswith("--dual-") for t in tokens):
+        return "dual"
+    if "--d-only" in tokens or "--d-only" in args:
+        return "d_only"
+    return "flip"
+
+
+def _dual_share_p_terms(stage: Dict[str, Any], args: Mapping[str, str], seen: Optional[List[Dict[str, str]]]) -> None:
+    """P-Stufe unter ``--dual-share``: was gegen das P-Budget zaehlt und was nur Referenz ist (AP-H2 Fix-Runde 3, Befund 1).
+
+    Belegt aus dem Launcher (Datei:Zeile im Baum 173161c595):
+
+    * ``--dual-share`` Hilfe (weg2/launcher.py:22707-22712): "P's stage computes on D's TP shards (shells over D's three shards of its layers) and binds
+      the shard of the D rank on its card to D's bytes via the union image. D boots right after P as the union OWNER, sized from P's PLANNED budget
+      (+ --dual-p-overhead-mib)".  Die Gewichte (und damit die residenten Experten, UNION_ROLES = ``main``, launcher.py:14784) liegen im Union-Image
+      von D; P haelt davon nichts im eigenen Budget -> Referenz ``shared`` (Gewichte doppelt zu zaehlen waere falsch).  Was sich NICHT an D's
+      Bytes binden laesst, behaelt P (weg2/union_arena_bind.py, Kopf: "What it cannot prove, it keeps"); die Menge ist ohne Boot nicht zu belegen
+      -> Referenzposten ``diff`` "nicht gerechnet".
+    * ``--dual-p-overhead-mib`` (launcher.py:22713-22716, Standard 1500): "what P holds on a card outside its --rank-gpu-memory-mib budget (CUDA
+      context, graphs, activations)" -> Festposten AUSSERHALB des Budgets; die Aktivierung steckt darin (Referenz ``in_festposten``, kein
+      zweiter Abzug).  D wird aus "P's PLAN" bemessen: Budget + dieser Wert (launcher.py:14976 ``dual_share_planned_dc``, :27291).
+    * ``--dual-unified-kv on`` (weg2/card_kv_ledger.py Kopf: "the REST of the card is ONE KV budget K_c, with no split", P und D fragen ein Ledger;
+      weg2/dual_p_kv_stage.py Kopf: P-Pool "born trimmed at 0 tokens", Bytes aus dem Karten-Ledger): P's KV liegt im Karten-KV-Pool, nicht im
+      P-Budget -> Referenz ``shared``.  Ohne ``on`` ist das nicht belegt -> KV zaehlt gegen das P-Budget.
+    * Mamba/GDN-Zustand (card_kv_ledger.py Kopf: "The boot fixes weights, contexts, mamba, graph pools and activation transients") und der Draft
+      (UNION_ROLES = ``main``: der Draft ist nicht geteilt, launcher.py:14781-14784) bleiben P-eigen und zaehlen gegen das P-Budget.
+    """
+    terms = stage["terms"]
+
+    def ref(key: str, kind: str, note: str) -> None:
+        t = terms.get(key)
+        if t is not None and t.get("v") is not None:
+            t["ref"] = kind
+            t["note"] = note + ((" -- " + t["note"]) if t.get("note") else "")
+
+    ref("weights", "shared", "Dual-Share: P rechnet auf D's TP-Shards und bindet sie ueber das Union-Image an D's Bytes (launcher.py:22707-22712); zaehlt nicht gegen das P-Budget")
+    ref("experts", "shared", "Dual-Share: residente Experten liegen im Union-Image von D (UNION_ROLES=main, launcher.py:14784); zaehlt nicht gegen das P-Budget")
+    if str(args.get("--dual-unified-kv", "off")).lower() == "on":
+        ref("kv", "shared", "--dual-unified-kv on: ein KV-Pool je Karte fuer P und D (weg2/card_kv_ledger.py), P-Pool virtuell; zaehlt nicht gegen das P-Budget")
+    ref("activation", "in_festposten", "Aktivierung steckt in --dual-p-overhead-mib (launcher.py:22713-22716: CUDA-Kontext, Graphen, Aktivierungen)")
+    ov_raw = args.get("--dual-p-overhead-mib")
+    try:
+        ov = float(ov_raw) if ov_raw not in (None, "") else float(DUAL_P_OVERHEAD_DEFAULT_MIB)
+    except (TypeError, ValueError):
+        ov = float(DUAL_P_OVERHEAD_DEFAULT_MIB)
+        ov_raw = None
+    given = ov_raw not in (None, "")
+    terms["fixed"] = {"v": ov, "src": SRC_INPUT if given else SRC_DEFAULT, "outside_budget": True,
+                      "note": "--dual-p-overhead-mib: was P je Karte AUSSERHALB seines --rank-gpu-memory-mib haelt (Kontext, Graphen, Aktivierung; launcher.py:22713-22716)"
+                              + ("" if given else "; Standard des Launchers %d MiB (nicht im Profil gesetzt)" % DUAL_P_OVERHEAD_DEFAULT_MIB)}
+    stage["ref_extra"] = [{"name": "diff", "label": "Diff der P-Gewichte", "mib": None, "ref": "shared", "herkunft": SRC_NONE, "gerechnet": False,
+                           "detail": "Was sich nicht an D's Bytes binden laesst, behaelt P selbst (union_arena_bind.py Kopf: \"What it cannot prove, it keeps\"); "
+                                     "die Menge ist ohne Boot nicht zu belegen"}]
+    if seen is not None:
+        seen.append({"was": "dual_p_overhead_mib", "wert": "%g" % ov, "herkunft": ("Profilzeile --dual-p-overhead-mib" if given else
+                     "Standard des Launchers (--dual-p-overhead-mib 1500, launcher.py:22713)")})
+        seen.append({"was": "dual_share", "wert": "an", "herkunft": "Profilzeile --dual-share: Gewichte/Experten (und KV bei --dual-unified-kv on) zaehlen nicht gegen das P-Budget"})
+
+
+def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[str, str], phase_args: Optional[Mapping[str, Any]] = None,
+               phase_env: Optional[Mapping[str, Any]] = None, form: Optional[str] = None, tokens: Sequence[str] = (),
+               overrides: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Balken je Karte und Phase im Vertrag ``flliper.balken/1`` aus dem Serverprofil (Flag -> Wert, Gruppenzeilen getrennt).
+
+    Phase ``P``: Pipeline-Stufen (``_stage_terms``).  Phase ``D``: TP-Raenge (``d_stage_terms``).  Dual: beide zugleich auf denselben Karten --
+    eine Summe wird NICHT gebildet (``--dual-share``: P rechnet auf den Shards von D, Gewichte doppelt zu zaehlen waere falsch; die
+    Dual-Passung ist Aufgabe des Planers AP-E).  Eine Phase, die sich nicht rechnen laesst, steht mit ``ok: False`` und Grund da."""
+    n = len(_cards(hw))
+    form = detect_form(args, tokens, n, form)
+    over = dict(overrides or {})
+    penv = dict(phase_env or {})
+    out_phases: Dict[str, Any] = {}
+    hints: List[str] = []
+    all_args: Dict[str, str] = dict(args or {})
+    for ph in ("P", "D"):
+        all_args.update(dict((phase_args or {}).get(ph) or {}))
+    draft = _draft_info(model, all_args)
+    carries_p = str(all_args.get("--draft-kv-on-p", "on")).lower() != "off"
+    approx: Optional[Dict[str, Any]] = None
+    dual_share = form == "dual" and ("--dual-share" in all_args or "--dual-share" in tokens)
+
+    def run_p(name: str, scope: str) -> Dict[str, Any]:
+        nonlocal approx
+        a = _merged(args, phase_args, scope) if scope != "-" else dict(args)
+        carries = carries_p or form == "single"
+        settings, seen = p_phase_settings(a, dict(penv.get("P") or {}), model, n, draft, carries_draft=carries)
+        settings.update({k: v for k, v in over.items() if k != "what"})
+        if "stage_layers" not in settings:
+            raise CouplingError("--pp-stage-ratio fehlt im Profil: der Layer-Schnitt der P-Phase ist unbekannt")
+        t = _stage_terms(hw, model, settings)
+        stages = []
+        for i, st in enumerate(t["stages"]):
+            st2 = dict(st)
+            st2["_rate_known"] = t["_ctx"]["rate"] > 0
+            st2["terms"] = _p_terms_for_contract(st2, draft, carries, i == len(t["stages"]) - 1, settings)
+            if dual_share and name == "P":
+                _dual_share_p_terms(st2, all_args, seen if i == 0 else None)
+            stages.append(st2)
+        try:
+            approx = approx_payload(hw, model, settings)
+        except (CouplingError, KeyError, ValueError, TypeError):
+            approx = None
+        if name == "P" and draft["kind"] != "none" and not carries:
+            seen.append({"was": "draft", "wert": "aus", "herkunft": "Profilzeile --draft-kv-on-p off: P traegt keinen MTP-Kopf"})
+        label = "P-Phase (Prefill, Pipeline-Stufen)" if name == "P" else "Einzelkarte (eine Phase)"
+        # Kontext-Boden = Token, die nach den Gewichten ins Budget passen: unter --dual-share zaehlen die Gewichte nicht gegen das P-Budget, die Zahl
+        # waere eine andere Frage -> nicht gerechnet (None) statt einer falschen 0
+        return {"ok": True, "label": label, "bars": [contract_bar(s, name) for s in stages], "inputs": seen,
+                "context_floor_tokens": None if (dual_share and name == "P") else t["context_floor_tokens"], "warnings": t["warnings"]}
+
+    def run_d() -> Dict[str, Any]:
+        a = _merged(args, phase_args, "D")
+        # --dual-share: der Launcher bemisst D aus P's PLAN (launcher.py:27289-27301); die Zeilen der Gruppe P liefern ihn, D erbt sie nicht
+        plan = dual_p_plan(_merged(args, phase_args, "P"), n) if dual_share else None
+        cfg = d_phase_config(a, dict(penv.get("D") or {}), model, n, draft, plan, launcher_args=args)
+        for k in ("context_tokens", "mamba_slots", "ssm_dtype", "kv_dtype", "corridor_mib", "activation_mib"):
+            if k in over:
+                cfg[k] = over[k]
+        t = d_stage_terms(hw, model, cfg)
+        return {"ok": True, "label": "D-Phase (Decode, TP-Raenge)", "bars": [contract_bar(s, "D") for s in t["stages"]],
+                "inputs": cfg["seen"] + t.get("inputs", []), "hints": t["hints"], "warnings": t["warnings"]}
+
+    plan = {"single": [("alle", lambda: run_p("alle", "-"))], "d_only": [("D", run_d)],
+            "flip": [("P", lambda: run_p("P", "P")), ("D", run_d)], "dual": [("P", lambda: run_p("P", "P")), ("D", run_d)]}[form]
+    for name, fn in plan:
+        try:
+            out_phases[name] = fn()
+        except (CouplingError, KeyError, ValueError, TypeError) as exc:
+            out_phases[name] = {"ok": False, "label": name, "error": "%s: %s" % (type(exc).__name__, exc), "bars": [], "inputs": []}
+    for ph in out_phases.values():
+        for b in ph["bars"]:
+            if b["over_text"]:
+                hints.append(b["over_text"])
+        hints.extend(ph.get("hints") or [])
+    if form == "dual":
+        hints.append("Dual: P und D laufen gleichzeitig auf denselben Karten. Die Summe beider Balken ist nicht gerechnet (--dual-share: P rechnet "
+                     "auf den Shards von D, die Dual-Passung ist Planer-Rechnung des AP-E, nicht hw_fit).")
+        if dual_share:
+            hints.append("Dual-Share: P's Gewichte und Experten liegen im Union-Image von D und zaehlen nicht gegen das P-Budget (Referenzzeile unter dem "
+                         "Balken); gegen das P-Budget zaehlen die P-eigenen Posten, der Festposten --dual-p-overhead-mib liegt ausserhalb des Budgets.")
+            hints.append("Dual-Share, D-Seite: D ist der Union-Owner und haelt Gewichte und Experten in seinem Budget; der Launcher bemisst D aus P's Plan "
+                         "(Festposten = P-Budget + --dual-p-overhead-mib je Karte, ausserhalb von D's Budget, launcher.py:27289-27301). Unter --dual-unified-kv on "
+                         "waechst D's KV-Pool virtuell aus dem Karten-Pool (--dual-d-kv-max-tokens); der Balken zeigt das Kontextziel, nicht den Pool.")
+    return {"schema": BALKEN_SCHEMA, "form": form, "n_cards": n, "phases": out_phases, "hints": hints, "approx": approx,
+            "draft": {k: draft[k] for k in ("kind", "placement", "reason")}}
+
+
+# ---------------------------------------------------------------------------
 # Brueckenaufruf: eine JSON-Anfrage -> eine JSON-Antwort (Dashboard-Kindprozess, Auftrag 1431/1432)
 # ---------------------------------------------------------------------------
 
@@ -836,7 +1864,8 @@ def run(req: Mapping[str, Any]) -> Dict[str, Any]:
         hw, model = req["hardware"], req["model"]
         settings = dict(req.get("settings") or {})
         if req.get("server_args"):
-            settings = dict(settings_from_server(req["server_args"], model), **settings)
+            if req.get("what") != "phase_bars":      # phase_bars liest die Zeilen selbst (je Gruppe getrennt)
+                settings = dict(settings_from_server(req["server_args"], model), **settings)
         what = req.get("what", "compute")
         if what == "compute":
             res = compute(hw, model, settings)
@@ -848,6 +1877,11 @@ def run(req: Mapping[str, Any]) -> Dict[str, Any]:
             res = c4_context_target(hw, model, settings)
         elif what == "bars":
             res = dict(bars_for(hw, model, settings, phases=req.get("phases")), approx=approx_payload(hw, model, settings))
+        elif what == "phase_bars":
+            # AP-H2: Vertrag flliper.balken/1.  ``settings`` (Eingaben des Nutzers) gelten als Uebersteuerung; die Zeilen des Profils kommen aus
+            # ``server_args`` (Flag -> Wert) sowie ``phase_args`` / ``phase_env`` (je Gruppe P/D: --extra-p/-d und --env-p/-d)
+            res = phase_bars(hw, model, dict(req.get("server_args") or {}), req.get("phase_args"), req.get("phase_env"), req.get("form"),
+                             tuple(req.get("tokens") or ()), overrides=settings)
         else:
             raise CouplingError("unbekannte Anfrage %r (compute|move|chunk|context)" % what)
         return {"ok": True, "result": res}

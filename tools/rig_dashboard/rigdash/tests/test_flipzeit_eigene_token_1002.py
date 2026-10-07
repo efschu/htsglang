@@ -33,18 +33,19 @@ def _ipc_dp():
     """y7y Erstflip D>P: park_rpc_sent 32,463, begin 33,891, done 37,571, PP0 first forward 37,776."""
     ev = [_ev("flip_begin", T + 33.891, flip_begin_ts=T + 33.891, sleep="D", wake="P", epoch_before=0),
           _ev("flip_done", T + 37.571, flip_begin_ts=T + 33.891, t=T + 37.571, flip_ms=1703, epoch=1, sleep="D", wake="P")]
-    ut = [{"dir": "D>P", "epoch": 1, "flip_user_ms": 5313, "idle_flip": False, "start_ts": T + 32.463,
+    ut = [{"dir": "D>P", "epoch": 1, "flip_user_ms": 5313, "idle_flip": False, "rid": "weg2-1-1", "start_ts": T + 32.463,
            "start_source": "park_rpc_sent", "prefill_start_ts": T + 37.776, "prefill_start_source": "pp_first_forward"}]
     return {"ipc_events": ev, "flip_user_time": ut, "flip_first_work": []}
 
 
 SEGS = [{"s": T + 0.0, "e": T + 120.0, "k": "unknown"}]
+ARR = {"weg2-1-1": T + 26.0}       # the waiter arrived before D's last token: start = that token
 D_ROUNDS = [(T + 26.39, T + 26.405), (T + 26.40, T + 26.417)]
 
 
 class DPStartIsDsLastToken(unittest.TestCase):
     def test_dp_starts_at_ds_last_round_not_the_park_stamp(self):
-        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 120.0, None, d_rounds=D_ROUNDS)[0]
+        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 120.0, None, d_rounds=D_ROUNDS, arrivals=ARR)[0]
         self.assertEqual(x["kind"], "ok")
         self.assertAlmostEqual(x["start"], T + 26.417, places=3)
         self.assertAlmostEqual(x["total_ms"], (37.776 - 26.417) * 1000, delta=1)   # 11,36 s, not 5,31 s
@@ -56,7 +57,7 @@ class DPStartIsDsLastToken(unittest.TestCase):
     def test_round_after_flip_begin_still_counts_until_d_sleeps(self):
         # D finished a round 20 ms after flip_begin (drain): the flip starts there, vorlauf 0
         x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 120.0, None,
-                               d_rounds=D_ROUNDS + [(T + 33.89, T + 33.911)])[0]
+                               d_rounds=D_ROUNDS + [(T + 33.89, T + 33.911)], arrivals=ARR)[0]
         self.assertAlmostEqual(x["start"], T + 33.911, places=3)
         self.assertEqual(x["vorlauf_ms"], 0.0)
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)

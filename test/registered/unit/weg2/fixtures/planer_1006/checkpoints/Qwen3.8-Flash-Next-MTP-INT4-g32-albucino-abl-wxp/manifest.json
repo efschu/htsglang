@@ -1,0 +1,42 @@
+{
+ "files": [
+  {
+   "kind": "copy",
+   "name": "ABLIT_META_abl_wxp.json",
+   "size": 3157
+  },
+  {
+   "kind": "copy",
+   "name": "compact_sources.json",
+   "size": 563
+  },
+  {
+   "kind": "copy",
+   "name": "config.json",
+   "size": 6439
+  },
+  {
+   "gz": true,
+   "kind": "copy",
+   "name": "model.safetensors.index.json",
+   "size": 451501
+  },
+  {
+   "kind": "header",
+   "name": "mtp-dense.safetensors",
+   "sha256_header": "21f0b108db9c3b7ca4f24b0cee9f197ceb3a775ea5f1a78fb5f43c8763466015",
+   "size": 2723937440
+  },
+  {
+   "gz": true,
+   "kind": "header",
+   "name": "mtp-routed-experts-int4.safetensors",
+   "sha256_header": "8f6974ba561b8ff49dc92990310f5294b7aa371690fc0aea6002cac637cf2e4e",
+   "size": 1416156712
+  }
+ ],
+ "name": "Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp",
+ "schema": "planer-oracle-checkpoint-snapshot/1",
+ "skipped_dirs": [],
+ "source": "proxmox:/spinning/subvol-999-disk-0/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp (read-only; headers via ssh, 6 files)"
+}

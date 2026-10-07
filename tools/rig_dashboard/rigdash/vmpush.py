@@ -21,6 +21,8 @@ import time
 import urllib.request
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from . import flipzeit
+
 DEFAULT_URL = "http://127.0.0.1:8428"
 PUSH_S = 5.0
 
@@ -347,7 +349,8 @@ def ttft_series(client: VmClient, model: str, ts: List[int], step: int) -> dict:
 VIEW_PARTS = (("total", "total_ms"), ("vorlauf", "vorlauf_ms"), ("layer", "layer_ms"), ("wake_kv_dc", "wake_kv_dc_ms"),
               ("nachlauf", "nachlauf_ms"), ("rest", "rest_ms"), ("d_extend", "nachlauf_d_extend_ms"),
               ("leer", "leer_ms"), ("halt", "halt_ms"), ("park", "park_ms"), ("vor_rest", "vor_rest_ms"),
-              ("leer_d_prefill", "leer_d_prefill_ms"))
+              ("leer_d_prefill", "leer_d_prefill_ms"),
+              ("leer_excl", "leer_excl_ms"))     # D's last token -> arrival of the waiter: Server-Leerlauf, NOT in total
 
 
 def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -> List[str]:
@@ -359,7 +362,7 @@ def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -
     vorlaeufigem Start (D's Log hat seine letzten Runden noch nicht geschrieben) erst, wenn er feststeht."""
     out = []
     for x in views:
-        if x.get("kind") != "ok" or x.get("total_ms") is None or x.get("begin") is None or x.get("provisional"):
+        if not flipzeit.counted(x) or x.get("begin") is None:    # the one counting rule (Nutzer 06.10.)
             continue
         key = (boot, round(float(x["begin"]), 3))
         if key in done_keys:
@@ -454,34 +457,17 @@ def boot_rates_from(series: Dict[Tuple[str, str, str], List[Tuple[float, float]]
                    "Decode weg2_boot_decode_* (1-s-Ring des Samplers, stetige Intervalle, ganzer Boot)"}
 
 
-def flip_stats_from(points: Dict[str, List[Tuple[float, float]]]) -> Dict[str, dict]:
-    """{dir: [(t, total_ms)]} -> {dir: {n, median, p90, max}} -- one point per flip (the push writes each once at
-    its flip_begin).  Pure, unit-tested."""
-    import math as _m
-    out = {}
-    for d, pts in points.items():
-        vals = sorted(v for _, v in pts if v is not None)
-        q = (lambda p: vals[max(0, _m.ceil(p * len(vals)) - 1)] if vals else None)  # noqa: E731
-        out[d] = {"n": len(vals), "median": q(0.5), "p90": q(0.9), "max": vals[-1] if vals else None,
-                  "src": "VictoriaMetrics weg2_flip_user_view_ms{def=t2t,part=total}"}
-    return out
-
-
 def boot_rates(client: "VmClient", boot_id: str, span_s: int = 12 * 3600) -> dict:
-    """boot_rates_from over what VictoriaMetrics holds for one boot (label boot = short_boot), plus the
-    Flipzeit per direction (Nutzer 02.10.: letztes Token -> erstes Token, def="t2t")."""
+    """boot_rates_from over what VictoriaMetrics holds for one boot (label boot = short_boot)."""
     sel = 'boot="%s"' % short_boot(boot_id)
     series: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = {}
     names = ["weg2_rank_prefill_new_tokens_total", "weg2_rank_prefill_compute_ms_total"] + [n for _, n in BOOT_DECODE_FIELDS]
     for m in names:
         for met, pts in client.raw("%s{%s}" % (m, sel), span_s):
             series[(m, met.get("group", ""), met.get("rank", ""))] = pts
-    out = boot_rates_from(series)
-    fl: Dict[str, List[Tuple[float, float]]] = {}
-    for met, pts in client.raw('weg2_flip_user_view_ms{%s,def="t2t",part="total"}' % sel, span_s):
-        fl.setdefault(met.get("dir", "?"), []).extend(pts)
-    out["flips"] = flip_stats_from(fl)
-    return out
+    # the Flipzeit of a boot is NOT read from here (Nutzer 06.10.: one computation, flipzeit.py over the history marks;
+    # the Grafana points weg2_flip_user_view_ms stay a view of the same counted flips)
+    return boot_rates_from(series)
 
 
 def ttft_last(client: "VmClient", now: Optional[float] = None, span_s: int = 900) -> Dict[str, dict]:

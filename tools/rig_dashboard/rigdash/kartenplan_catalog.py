@@ -9,7 +9,18 @@ ihre Quelle:
                        einige MiB weniger, das ist NICHT gemessen)
   * ``abgeleitet``   = aus den obigen Angaben gerechnet, Rechenweg im Feld ``src``
 
-Nie ein geratener Wert ohne dieses Etikett.  Turing (sm75) ist als deaktivierter
+Nie ein geratener Wert ohne dieses Etikett.
+
+Vorbelegt (``preset``, Plan Profil-Planer 06.10. R5): nur RTX 5090, RTX 3080 20 GB und RTX 3090.  Die übrigen Karten
+bleiben im Katalog (Datenblatt, ohne Messraten) und stehen in der Oberfläche eingeklappt.  Jeder Eintrag trägt seine
+``origin`` (wie ``planner/card_library.py`` ``CardSpec.source``: ein Eintrag, der nicht beweisen kann, dass er gemessen
+wurde, ist nicht gemessen):
+
+  * ``measured_on_rig``   = die Speichergröße stammt aus einem NVML-Record des Rigs
+  * ``Datenblatt``        = Herstellerangabe, am Rig nicht gemessen
+  * ``borrowed-unbelegt`` = ein Wert ist von einer anderen Variante geborgt und nicht belegt
+
+``origin_fields`` nennt die Herkunft je Feld (vram, mem_bw, pcie); ein geborgtes Feld macht den Eintrag nicht zum Rig-Eintrag.  Turing (sm75) ist als deaktivierter
 Eintrag vorbereitet (Nutzer 03.10.: erst nach sm75-Port in den Katalog).
 """
 
@@ -18,6 +29,15 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 MIB_PER_GB = 1024
+
+ORIGIN_MEASURED = "measured_on_rig"
+ORIGIN_DATASHEET = "Datenblatt"
+ORIGIN_BORROWED = "borrowed-unbelegt"
+ORIGIN_LABELS = {
+    ORIGIN_MEASURED: "am Rig gemessen",
+    ORIGIN_DATASHEET: "Datenblatt (Herstellerangabe, nicht gemessen)",
+    ORIGIN_BORROWED: "geborgt von einer anderen Variante, unbelegt",
+}
 
 #: Referenz-Rig, in NVML-Reihenfolge (vram_plan.json cards, Boot 27bbf-boot-20261003T090641Z-30ca)
 RIG_NVML = {
@@ -36,7 +56,7 @@ ARCHS: Dict[str, dict] = {
 
 def _card(cid, name, gb, arch, bw, pcie_gen, pcie_lanes, *, usable=None, usable_src=None,
           bw_src="Datenblatt", pcie_src="Datenblatt", variant="", enabled=True, off_reason="",
-          note="", bus_bits=None, nvml_name=None):
+          note="", bus_bits=None, nvml_name=None, preset=False, borrowed=()):
     usable_mib = usable if usable is not None else gb * MIB_PER_GB
     return {
         "id": cid, "name": name, "variant": variant, "vram_gb": gb,
@@ -49,13 +69,14 @@ def _card(cid, name, gb, arch, bw, pcie_gen, pcie_lanes, *, usable=None, usable_
         "nvml_name": nvml_name or ("NVIDIA GeForce " + name),
         "enabled": enabled, "off_reason": off_reason, "note": note,
         "driver_reserved_mib": None,
+        "preset": bool(preset), "borrowed": sorted(borrowed),
     }
 
 
 def _build_catalog() -> List[dict]:
     c: List[dict] = []
     c.append(_card("rtx5090-32", "RTX 5090", 32, "sm120", 1792, 5, 16, usable=32607,
-                   usable_src="NVML-Record (Rig, vram_plan.json cards, nvml1)", bus_bits=512,
+                   usable_src="NVML-Record (Rig, vram_plan.json cards, nvml1)", bus_bits=512, preset=True,
                    note="Referenzkarte des Rigs (TP0/PP0, Form-A-Host)"))
     c.append(_card("rtx5080-16", "RTX 5080", 16, "sm120", 960, 5, 16, bus_bits=256))
     c.append(_card("rtx5070ti-16", "RTX 5070 Ti", 16, "sm120", 896, 5, 16, bus_bits=256))
@@ -74,7 +95,7 @@ def _build_catalog() -> List[dict]:
     c.append(_card("rtx4060ti-8", "RTX 4060 Ti", 8, "sm89", 288, 4, 8, variant="8 GB", bus_bits=128))
 
     c.append(_card("rtx3090ti-24", "RTX 3090 Ti", 24, "sm86", 1008, 4, 16, bus_bits=384))
-    c.append(_card("rtx3090-24", "RTX 3090", 24, "sm86", 936, 4, 16, bus_bits=384))
+    c.append(_card("rtx3090-24", "RTX 3090", 24, "sm86", 936, 4, 16, bus_bits=384, preset=True))
     # Datenblatt: 8 GB GDDR6, 256 Bit, 448 GB/s, PCIe 4.0 x16 (GA104); Compute Capability 8.6 wie die übrigen 30er-Karten (Ampere), nicht am Rig gemessen
     c.append(_card("rtx3070-8", "RTX 3070", 8, "sm86", 448, 4, 16, bus_bits=256))
     c.append(_card("rtx3080ti-12", "RTX 3080 Ti", 12, "sm86", 912, 4, 16, bus_bits=384))
@@ -83,7 +104,7 @@ def _build_catalog() -> List[dict]:
     c.append(_card("rtx3080-20", "RTX 3080", 20, "sm86", 760, 4, 16, variant="20 GB (Umbau)", usable=20480,
                    usable_src="NVML-Record (Rig, vram_plan.json cards, nvml0/nvml2)",
                    bw_src="Datenblatt der 10-GB-Karte (gleiche 320-Bit-Platine; Umbau-Karte am Rig nicht separat gemessen)",
-                   bus_bits=320, note="Umbau-Karte, wie unser Rig (2 Stück)"))
+                   bus_bits=320, note="Umbau-Karte, wie unser Rig (2 Stück)", preset=True, borrowed=("mem_bw",)))
     # Turing: vorbereitet, aber deaktiviert (Nutzer 03.10.)
     c.append(_card("rtx2080ti-11", "RTX 2080 Ti", 11, "sm75", 616, 3, 16, variant="11 GB", bus_bits=352,
                    enabled=False, off_reason="sm75 (Turing) ist noch nicht im Image/Planer: kein bf16, kein FP8, kein NVFP4; "
@@ -94,6 +115,12 @@ def _build_catalog() -> List[dict]:
         rig = e["usable_src"].startswith("NVML-Record")
         e["driver_reserved_mib"] = (518 if e["id"] == "rtx5090-32" else 425) if rig else None
         e["measured_on_rig"] = rig
+        # Herkunft je Feld und des Eintrags (Quelle: usable_src/bw_src/pcie_src der Eintragung, ``borrowed`` ausdrücklich)
+        fields = {"vram": ORIGIN_MEASURED if rig else ORIGIN_DATASHEET,
+                  "mem_bw": ORIGIN_BORROWED if "mem_bw" in e["borrowed"] else ORIGIN_DATASHEET,
+                  "pcie": ORIGIN_DATASHEET if e["pcie_native"]["src"] == "Datenblatt" else ORIGIN_MEASURED}
+        e["origin_fields"] = fields
+        e["origin"] = ORIGIN_MEASURED if rig else (ORIGIN_BORROWED if ORIGIN_BORROWED in fields.values() else ORIGIN_DATASHEET)
     return c
 
 
@@ -118,8 +145,48 @@ def catalog_public(include_disabled: bool = False) -> List[dict]:
             continue
         d = dict(e)
         d["label"] = label(e)
+        d["origin_label"] = ORIGIN_LABELS[e["origin"]]
         out.append(d)
     return out
+
+
+def presets() -> List[dict]:
+    """Die vorbelegten Karten (RTX 5090, RTX 3080 20 GB, RTX 3090): der sichtbare Teil des Katalogs."""
+    return [e for e in CATALOG if e["preset"]]
+
+
+def _norm_name(text) -> str:
+    return " ".join(str(text or "").lower().split())
+
+
+def match_nvml(name: str, total_mib: Optional[int] = None, cc=None) -> Optional[dict]:
+    """Der Katalogeintrag zu einer NVML-Karte (Name, Größe, Compute Capability) oder ``None``.
+
+    Der NVML-Name muss gleich sein (Groß/Klein und Leerraum egal), ebenso die cc, wenn sie bekannt ist.  Mehrere Einträge
+    gleichen Namens (RTX 3080 mit 10/12/20 GB) trennt die Größe: der mit der nächsten ``usable_mib`` gewinnt, aber nur
+    innerhalb von 3 % (fremde Karten melden NVML-seitig einige MiB unter Nennwert).  Passt keiner: ``None``, nie geraten."""
+    cands = [e for e in CATALOG if _norm_name(e["nvml_name"]) == _norm_name(name)
+             and (cc is None or list(cc) == e["cc"])]
+    if not cands:
+        return None
+    if total_mib is None:
+        return cands[0] if len(cands) == 1 else None
+    best = min(cands, key=lambda e: abs(e["usable_mib"] - total_mib))
+    return best if abs(best["usable_mib"] - total_mib) <= 0.03 * best["usable_mib"] else None
+
+
+def datasheet_of(row: dict) -> dict:
+    """Datenblatt-Angaben für das Hardwareprofil (``hardware_profile.build(datasheet=...)``): Nennbandbreite und
+    Katalogkarte einer NVML-Zeile ``{name, total_mib, cc}``, oder ``{}``.  Die Herkunft steht im Notiztext des Knotens."""
+    e = match_nvml(row.get("name"), row.get("total_mib"), row.get("cc"))
+    if e is None:
+        return {}
+    why = e["mem_bw_src"] + " [Katalog kartenplan_catalog.py: %s]" % e["id"]
+    if ORIGIN_BORROWED in e["origin_fields"].values() and e["origin_fields"]["mem_bw"] == ORIGIN_BORROWED:
+        why = "GEBORGT, unbelegt: " + why
+    return {"mem_bw_gbs": e["mem_bw_gbs"], "bw_note": why,
+            "catalog": {"id": e["id"], "label": label(e), "preset": e["preset"], "origin": e["origin"],
+                        "origin_label": ORIGIN_LABELS[e["origin"]], "origin_fields": dict(e["origin_fields"])}}
 
 
 # --------------------------------------------------------------------------- Profile
