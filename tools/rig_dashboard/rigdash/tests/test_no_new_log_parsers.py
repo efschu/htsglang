@@ -106,7 +106,21 @@ FROZEN = {
 # (file, sha1[:12]) -> why this regex reads no log line
 NON_LOG_ALLOWED = {
     # AP-A (Profil-Planer 06.10.): Hostpfade aus dem Issue-Text des Hardwareprofils entfernen
+    # AP-I Fix-Runde 3: Geheimnisse nach der Form des Wertes aus dem Issue-Text schneiden
+    ("redact.py", "4179dc5de042"): "schneidet Vendor-Tokens (sk-, hf_, ghp_, xox, AKIA) aus einem Text, der in ein oeffentliches Issue kommt; liest keine Logzeile",
+    ("redact.py", "6c38dd063a10"): "schneidet 'Bearer <token>' aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "df4644c1bdda"): "schneidet das Passwort aus scheme://user:pass@host in einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "30650dce59ee"): "schneidet lange Token-Laeufe hinter = oder : aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "b598ffb1ba83"): "schneidet absolute Pfade (/root/..., /spinning/..., /var/lib/...) aus einem Text, der in ein öffentliches Issue kommt; liest keine Logzeile",
+    # AP-I Fix-Runde 4: JWT, nackte Token-Laeufe (Freitext, Tabellenzelle) und ein ganzer Wert als Token-Lauf aus dem Issue-Text schneiden
+    ("redact.py", "231d7a884f21"): "schneidet ein JWT (eyJ....) aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "39494d8580a4"): "schneidet lange Token-Laeufe ohne = / : davor aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "d02b41e88f24"): "prueft, ob ein ganzer Wert fuer eine Tabellenzelle ein einziger langer Token-Lauf ist; liest keine Logzeile",
+    # AP-I Fix-Runde 5: Base64 (Standardalphabet), Punkt-geteilte Tokens, file://-Praefix und Pfade in Anfuehrungszeichen aus dem Issue-Text schneiden
+    ("redact.py", "17f772307e9c"): "schneidet Base64-Laeufe (AWS-Secret, Azure-Key) aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "64fd5740307d"): "schneidet Punkt-geteilte Token (Discord) aus einem Issue-Text; liest keine Logzeile",
+    ("redact.py", "7199860700f8"): "streift file:// vor einem Pfad im Issue-Text ab; liest keine Logzeile",
+    ("redact.py", "ecfef1f2b1e9"): "erkennt einen Pfad mit Leerzeichen in Anfuehrungszeichen im Issue-Text; liest keine Logzeile",
 }
 
 

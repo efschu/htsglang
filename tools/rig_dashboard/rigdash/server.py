@@ -14,6 +14,7 @@ Routes
   POST /api/hwprofil/cancel    wartendes Fenster zurückgeben
   POST /api/hwprofil/recapture "Neu erfassen" (AP-A): gespeichertes Hardwareprofil aus NVML ersetzen (kein GPU-Fenster, auch release)
   GET  /api/hwprofil/issue     Issue-Text "Hardwareprofil" (Markdown zum Kopieren, redigiert)
+  POST /api/profil/issue       Issue-Text "Laufbericht" (AP-I, Markdown zum Kopieren, redigiert): {doc, dry?, cards?, model?}
   POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|phase_bars|compute|move|chunk|context, settings?, phases?, form?}
   POST /api/profil/propose     Startprofil des Planers (AP-D, nur LAN): {basis: {kind, name}, form: flip|tp, inventar: "rig" | [{card, pcie}], ziele?, model_path?, draft_path?}
                                -> propose() + Orakel (Launcher-Trockenlauf im Kindprozess, Cache) + Verdikte; flliper.server/1 mit Herkunft/Verdikt/Kanten je Wert
@@ -656,11 +657,23 @@ def make_handler(app: App):
                 return self._json(ed.export_env(body.get("doc"), body.get("dry")))
             if path == "/api/profil/dry":
                 return self._json(ed.dry_run(body.get("doc"), body.get("cards") or [], bool(body.get("host_patched", True))))
+            if path == "/api/profil/issue":
+                return self._profil_issue(body)
             if path == "/api/profil/recompute":
                 return self._profil_recompute(body)
             if path == "/api/profil/propose":
                 return self._json(ed.propose(body))
             return self._send(404, "not found", "text/plain")
+
+        def _profil_issue(self, body):
+            """AP-I: Issue-Text "Laufbericht" (Markdown zum Kopieren).  Hardwareprofil (nur lesen, nichts messen) und Versionen kommen vom Hardware-Dienst,
+            Profil, Trockenlauf, gewählte Karten und Modellprofil vom Browser; die Antwort ist redigiert (Geheimnisse, Hostpfade)."""
+            try:
+                parts = app.hwprofil.issue_parts()
+            except Exception as e:      # noqa: BLE001 -- ohne Hardwareprofil entsteht der Bericht trotzdem, der Block sagt "nicht verfügbar"
+                parts = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+            return self._json(app.profil.issue_report(body.get("doc"), dry=body.get("dry"), cards=body.get("cards"), model=body.get("model"),
+                                                      hardware_md=parts.get("short") if parts.get("ok") else "", versions=parts.get("versions") if parts.get("ok") else {}))
 
         def _profil_recompute(self, body):
             """S4b: Kopplungen und Balken für das Serverprofil im Editor.  Hardwareprofil (nur lesen, nichts messen) und Modellprofil (Desk-Schätzung,

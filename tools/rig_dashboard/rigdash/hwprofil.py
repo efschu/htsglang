@@ -39,6 +39,7 @@ import importlib.util
 import inspect
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -158,6 +159,107 @@ def _short_name(name) -> str:
     return n
 
 
+def _is_sha(x) -> bool:
+    x = str(x or "").strip().lower()
+    return 7 <= len(x) <= 40 and all(ch in "0123456789abcdef" for ch in x)
+
+
+def _git_head(tree: Optional[str]) -> Optional[str]:
+    """``HEAD`` des git-Baums, der ``tree`` ist (``/opt/htsglang/src`` oder dessen ``python``-Unterordner); sonst ``None``.  Ein ``tree`` in
+    einem fremden Repository zählt nicht (Wurzel muss ``tree`` selbst oder ``tree/..`` mit Namen ``python`` sein)."""
+    if not tree or not os.path.isdir(tree):
+        return None
+    try:
+        r = subprocess.run(["git", "-C", tree, "rev-parse", "--show-toplevel", "HEAD"], capture_output=True, text=True, timeout=5,
+                           env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (r.stdout or "").split()
+    if r.returncode != 0 or len(out) != 2 or not _is_sha(out[1]):
+        return None
+    real, top = os.path.realpath(tree), os.path.realpath(out[0])
+    return out[1] if real in (top, os.path.join(top, "python")) else None
+
+
+def version_facts(doc: dict, versions: Optional[dict] = None, environ: Optional[dict] = None) -> dict:
+    """Die Versionsangaben, die ein Issue-Text nennt (Hardwareprofil UND Laufbericht lesen dieselben): Image (``SGLANG_IMAGE_TAG``),
+    Baum-Revision, Treiber, CUDA/torch des Messprozesses und Dashboard-Version.  Die Revision kommt der Reihe nach aus: einer übergebenen
+    ``tree_rev``; einem gestagten Baumpfad ``.../releases/<sha>/python``; ``git rev-parse HEAD`` des Baums (Release-Image: ``/opt/htsglang/src``);
+    der Image-ENV ``HTSGLANG_REVISION`` (bzw. ``_27B`` / ``_NF`` je ``STAND``, Soll-Revision des Entrypoints); ``SGLANG_BUILD_COMMIT``.  Die Herkunft
+    steht in ``tree_rev_src``.  Die Build-Defaults ``SGLANG_BUILD_COMMIT=unknown`` und ``SGLANG_IMAGE_TAG=local/sglang:dev`` (Dockerfile) sind
+    KEIN Beleg: Revision ``None`` bzw. ``image_default`` = True.  Was nicht belegt ist, ist ``None`` (die Texte schreiben dann "unbelegt"); nie geraten."""
+    versions = versions or {}
+    env = os.environ if environ is None else environ
+    rev, src = None, None
+    if versions.get("tree_rev"):
+        rev, src = versions["tree_rev"], "übergeben"
+    elif _tree_rev(versions.get("tree")):
+        rev, src = _tree_rev(versions.get("tree")), "Baumpfad releases/<sha>"
+    else:
+        g = _git_head(versions.get("tree")) if versions.get("tree") else None
+        if g:
+            rev, src = g, "git HEAD des Baums"
+        else:
+            stand = str(env.get("STAND") or "").lower()
+            for k in (("HTSGLANG_REVISION_%s" % stand.upper()) if stand in ("27b", "nf") else None, "HTSGLANG_REVISION"):
+                if k and _is_sha(env.get(k)):
+                    rev, src = str(env[k]).strip().lower(), "Image-ENV %s" % k
+                    break
+            else:
+                if _is_sha(env.get("SGLANG_BUILD_COMMIT")):
+                    rev, src = str(env["SGLANG_BUILD_COMMIT"]).strip().lower(), "Image-ENV SGLANG_BUILD_COMMIT"
+    image = env.get("SGLANG_IMAGE_TAG") or versions.get("image") or None
+    image_default = image == "local/sglang:dev"
+    return {"image": image, "image_default": image_default, "tree_rev": rev or None, "tree_rev_src": src,
+            "driver": doc.get("driver") or None, "cuda": doc.get("cuda") or None, "torch": doc.get("torch") or None,
+            "rigdash": versions.get("rigdash") or None}
+
+
+def version_image_text(vf: dict) -> str:
+    """Die Image-Zelle: der Tag mit Herkunft, der Dockerfile-Default als "unbelegt (Default)", ohne Angabe wie bisher."""
+    if vf.get("image_default"):
+        return "unbelegt (Default %s, beim Bau nicht gesetzt)" % vf["image"]
+    return vf.get("image") or "unbelegt (SGLANG_IMAGE_TAG nicht gesetzt)"
+
+
+def version_tree_text(vf: dict) -> str:
+    """Die Baum-Zelle: Revision mit Herkunft, sonst "unbelegt"."""
+    if vf.get("tree_rev"):
+        src = vf.get("tree_rev_src") or ""
+        return "%s (%s)" % (vf["tree_rev"], src) if src.startswith(("git", "Image-ENV")) else vf["tree_rev"]     # Pfad/übergeben: der Wert spricht für sich
+    return "unbelegt"
+
+
+def issue_short(doc: dict, *, persist: Optional[dict] = None, level: int = 3) -> str:
+    """Hardwareprofil in KURZFORM als Markdown-Block für den Laufbericht: eine Zeile je Karte (Name, cc, SM-Zahl, VRAM, PCIe, Speicherbandbreite
+    mit Herkunft).  Dieselben Zellenbausteine wie ``issue_text``; die Langform (Takt, Messraten, Katalogherkunft) steht dort.  Redigiert."""
+    cards = doc.get("cards") or []
+    h = "#" * level
+    cap = (persist or {}).get("captured_at")
+    L: List[str] = ["%s Hardwareprofil (Kurzform)" % h, ""]
+    pid = str(doc.get("id") or "")
+    L.append("Profil `%s`, %s; %d Karte(n). Die Langform (Takt, Messraten, Katalogherkunft) steht im Issue-Text des Abschnitts Hardware."
+             % (_md(pid[:19] if pid else "unbelegt"), _utc(cap) + " gespeichert" if cap else "lebende Sicht, nicht gespeichert", len(cards)))
+    L.append("")
+    L.append("| Ord | NVML | Name | cc | SM-Zahl | VRAM | PCIe max. | Speicherbandbreite |")
+    L.append("|---|---|---|---|---|---|---|---|")
+    for c in cards:
+        pc = c.get("pcie") or {}
+        gen, wd = (pc.get("max_gen") or {}).get("v"), (pc.get("max_width") or {}).get("v")
+        g = c.get("mem_gbs") or {}
+        bw = g.get("read") if (g.get("read") or {}).get("v") is not None else (g.get("nominal") if (g.get("nominal") or {}).get("v") is not None else g.get("nameplate"))
+        L.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % tuple(_md(x) for x in (
+            c.get("ord"), c.get("nvml_index"), _short_name(c.get("name")), ".".join(str(x) for x in (c.get("cc") or [])) or "?",
+            _cell(c.get("sm_count"), 0), _cell(c.get("vram_total_mib"), 0),
+            ("Gen%s x%s" % (gen, wd)) if gen is not None and wd is not None else "nicht gemessen", _cell(bw, 0))))
+    if not cards:
+        L.append("| | | keine Karte gemeldet | | | | | |")
+    if doc.get("measure_needed"):
+        L.append("")
+        L.append("Das Profil ist unvollständig: es fehlen Messwerte.")
+    return redact.text_for_issue("\n".join(L)) + "\n"
+
+
 def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[dict] = None, now: Optional[float] = None) -> str:
     """Der Issue-Text "Hardwareprofil" (GitHub-Markdown): NVML-Identität, Größen, cc, SM, Takt, Messraten (soweit vorhanden),
     Treiber/Image/Baum.  Geheimnisse und Hostpfade sind entfernt (``redact.text_for_issue``).  Ein Wert ohne Messung steht als
@@ -165,8 +267,7 @@ def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[
     versions = versions or {}
     cards = doc.get("cards") or []
     now = time.time() if now is None else now
-    image = os.environ.get("SGLANG_IMAGE_TAG") or versions.get("image")
-    rev = _tree_rev(versions.get("tree")) or versions.get("tree_rev")
+    vf = version_facts(doc, versions)
     L: List[str] = []
     L.append("## Hardwareprofil (`%s`)" % _md(doc.get("schema") or "flliper.hardware/1"))
     L.append("")
@@ -178,8 +279,8 @@ def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[
     L.append("| Erfasst | %s |" % (_utc(cap) + " (gespeichert)" if cap else _utc(doc.get("created")) + " (lebende Sicht, nicht gespeichert)"))
     L.append("| Treiber | %s |" % _md(doc.get("driver") or "unbelegt"))
     L.append("| CUDA / torch (Messprozess) | %s / %s |" % (_md(doc.get("cuda") or "unbelegt"), _md(doc.get("torch") or "unbelegt")))
-    L.append("| Image | %s |" % _md(image or "unbelegt (SGLANG_IMAGE_TAG nicht gesetzt)"))
-    L.append("| Baum | %s |" % _md(rev or "unbelegt"))
+    L.append("| Image | %s |" % _md(version_image_text(vf)))
+    L.append("| Baum | %s |" % _md(version_tree_text(vf)))
     L.append("| Dashboard | %s |" % _md(versions.get("rigdash") or "unbelegt"))
     L.append("| Karten | %d |" % len(cards))
     L.append("")
@@ -499,6 +600,16 @@ class HwProfil:
         v = dict(self.versions() or {}) if self.versions else {}
         v.setdefault("tree", self.tree)
         return {"ok": True, "format": "markdown", "text": issue_text(got["profile"], persist=got.get("persist"), versions=v, now=self.clock())}
+
+    def issue_parts(self) -> dict:
+        """Bausteine für den Laufbericht des Profil-Editors: der Hardwareprofil-Block in Kurzform und die Versionsangaben (``version_facts``)."""
+        got = self.get()
+        if not got.get("ok"):
+            return {"ok": False, "error": got.get("error") or "kein Profil"}
+        v = dict(self.versions() or {}) if self.versions else {}
+        v.setdefault("tree", os.path.realpath(self.tree) if self.tree else None)     # ``current`` -> ``releases/<sha>``: so der Baum seine Revision nennt
+        return {"ok": True, "short": issue_short(got["profile"], persist=got.get("persist")), "versions": version_facts(got["profile"], v),
+                "profile_id": got["profile"].get("id")}
 
     def _housekeeping(self, b: dict, live: Optional[dict], now: float) -> None:
         """Ein beendetes oder verfallenes Fenster verlässt den Speicher; ein ungenutzt laufendes geht zurück."""

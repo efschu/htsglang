@@ -455,6 +455,20 @@ Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `st
   `Datenblatt` ins Profil, eine gemessene SM-Zahl gewinnt; `cards[].catalog` nennt Katalogkarte, `preset` und Herkunft (`measured_on_rig` | `Datenblatt` |
   `borrowed-unbelegt`, je Feld in `origin_fields`). `GET /api/hwprofil/issue` liefert den Issue-Text "Hardwareprofil" als Markdown (`{ok, format, text}`);
   Geheimnisse und Hostpfade sind entfernt (`redact.text_for_issue`).
+* **Issue-Text "Laufbericht" (AP-I, Profil-Planer 06.10.).** `POST /api/profil/issue` mit `{doc, dry?, cards?, model?}` (Profil, Antwort des letzten
+  Trockenlaufs, die gewählten Karten `[{card, pcie}]`, ein Modellprofil `flliper.model/1`) liefert `{ok, format: "markdown", text, blocks, filename}`: ein
+  Block zum Einfügen in ein GitHub-Issue mit den Abschnitten Hardwareprofil (Kurzform, `hwprofil.issue_short`, aus dem Hardware-Dienst), Modellprofil
+  (Werte mit Quelle, nur der Ordnername), Betriebsform (aus den Flags gelesen: `--dual-layout`/`--dual-share` = Dual, `--d-only` = nur TP, eine Karte =
+  Einzelkarte, sonst Flip), Vorschlag und Übersteuerungen (Zeilen mit `changed`, Herkunft `nutzer`/`planer` oder abweichendem `planner_value`; Spalten
+  Aktuell/Profil/Vorschlag/Herkunft, dazu `state`/`verdict`, sobald eine Zeile sie trägt), Verdikte und Force (Codes mit Klasse und Force-Zustand, neu aus dem
+  Register gelesen; ohne Trockenlauf steht das da), Versionen (Baum-Revision, Image, Treiber, CUDA/torch, Dashboard) und dem Platzhalter "Messergebnis /
+  Boot-Log-Auszug". Redigiert (`redact.text_for_issue`; Werte von Zeilen, deren NAME ein Geheimnis nennt, `redact.secret_name`, fallen ganz weg). Auch nach der Form: Anbieter-Präfixe, JWT, lange Token-Läufe (mit und ohne `=`/`:` davor, ein ganzer Zellenwert als Lauf), `user:pass@`; jeder
+  absolute Pfad außerhalb von `/app` und jeder `~/`-/`$HOME/`-Pfad wird `<hostpfad>/<letztes Segment>` (Systemwurzeln wie `/root`, `/spinning`: `<Pfad entfernt>`).
+  Strukturregel (Fix-Runde 5): einen WERT zeigt der Bericht nur für Schlüssel, die im Katalog (`catalog.json`: Flags, Envs, Profilvariablen) stehen und nach Namen kein Geheimnis sind; jeder andere vom Nutzer
+  gesetzte Schlüssel zeigt nur seinen Namen und `<wert ausgeblendet: unbekannter Schluessel>` (`redact.value_for_issue(name, value, known)`; ohne `known` wird nichts gezeigt). Die Wertformen bleiben die zweite Schicht
+  (auch für Katalog-Schlüssel): zusätzlich Base64 mit `/` `+` `=` (AWS-Secret, Azure-Key) und Punkt-geteilte Token (Discord). Pfade werden vor dem Urteil normalisiert (`/app/../../root/x` ist `/root/x`),
+  `file://` entfällt, ein Pfad mit Leerzeichen in Anführungszeichen zählt als ein Pfad; `/models-cache` (Modell-Mount des Containers) bleibt wie `/app`.
+  Ohne Hardware-Dienst entsteht der Bericht trotzdem ("nicht verfügbar"). Oberfläche: Abschnitt "Issue-Text: Laufbericht" unter dem Export in `profil.js`.
 * Kein Hintergrund-Poller: nur wer die Seite bedient fragt. Ein laufendes Fenster, das nach 180 s nicht benutzt wurde, geht beim nächsten Aufruf zurück.
 * Dienst-Parameter (Deploy durch den Lead): `--hw-tree` (gestagter Baum mit `hardware_profile.py` + `weg2/card_identity.py`, `deploy/stage_hwprofil.sh`),
   `--hw-measure-tree` (voller sglang-Baum für den Kindprozess), `--hw-python` (Interpreter mit torch + sgl_kernel; ohne sgl_kernel bleiben die Arme
