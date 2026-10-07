@@ -607,9 +607,14 @@ class TestSyntheticDryRun(unittest.TestCase):
 
     @_NEEDS_BOX
     def test_n4_3090_foreign_class_refusal_is_named(self):
-        """4x RTX 3090 (sm86, 24576 MiB): no calibrated class -> W19 dormant-residue reserve (HW-UNCALIBRATED, not forceable)."""
+        """4x RTX 3090 (sm86, 24576 MiB).  Before the AP1 port (tree 173161c595) the first refusal was W19 (dormant-residue reserve of an
+        uncalibrated class).  AP-J 07.10.: the integ base 752537e7b6 carries AP1 (HW-GENERISCH), W19 is passed under --force
+        (HW-UNCALIBRATED), and the dry run now stops at the next named blocker, W71: the exchange census is UUID-bound and the synthetic
+        cards are not in it (the same blocker as ``n4_mixed`` below)."""
         for model in ("27b", "nf"):
-            v, run = self._check(model, "n4_3090", "flip", refused="W19")
+            v, run = self._check(model, "n4_3090", "flip", refused="W71")
+            self.assertNotIn("W19", run.result.exc_msg[:200])
+            self.assertIn("is not in the census", run.result.exc_msg)
             self.assertEqual(v["n"], 4)
             self.assertIn("RTX 3090", run.result.exc_msg)
             self.assertEqual({f["code"] for f in run.result.forced}, {"HW-COUNT", "HW-UNCALIBRATED"})

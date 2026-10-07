@@ -619,8 +619,12 @@ class TestOtherInventories(unittest.TestCase):
 
     def test_the_launcher_refusal_of_foreign_cards_is_not_hidden_by_the_planer(self):
         v, run = self._check("n3_3090", n=3)
-        self.assertEqual(run.result.exc_type, "Weg2LaunchRefused")
-        self.assertIn("W19", run.result.exc_msg)                                  # an uncalibrated third class: AP1's port, not the planner's
+        # AP-J 07.10.: before the AP1 port (173161c595) this was W19 (an uncalibrated third class, Weg2LaunchRefused).  The integ base
+        # 752537e7b6 carries AP1: W19 no longer refuses, the launcher now stops at W71 (the exchange census is UUID-bound, the synthetic
+        # cards are not in it).  Either way the planner does not hide the launcher's own verdict.
+        self.assertEqual(run.result.exc_type, "Weg2XchgResidencyUnarmable", run.result.exc_msg[:300])
+        self.assertIn("W71", run.result.exc_msg[:200])
+        self.assertNotIn("W19", run.result.exc_msg[:200])
 
 
 if __name__ == "__main__":  # pragma: no cover
