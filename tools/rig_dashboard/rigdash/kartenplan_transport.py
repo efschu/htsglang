@@ -102,7 +102,7 @@ def choose_transport(links: List[dict], labels: List[str], *, host_patched: bool
         e = l["effective"]
         notes.append("%s: PCIe Gen%d x%d = %.1f GB/s gross (%s limited), BAR1 %d MiB%s%s"
                      % (labels[i], e["gen"], e["lanes"], e["gbs"], l["limited_by"], l["bar1_mib"],
-                        " (Resizable BAR %s)" % ("an" if l["slot"]["rebar"] else "aus"),
+                        " (Resizable BAR %s)" % ("on" if l["slot"]["rebar"] else "off"),
                         ", via chipset" if l["chipset"] else ""))
     if not host_patched:
         reasons.append("The host does NOT have the patched nvidia-open 595.58.03 with RMSmallBarP2PPeerBar1=1/PeerMappingOverride=1 and dmabuf_holder: barlink BAR1 refused (source: " + FACTS["host"] + ").")

@@ -142,7 +142,7 @@ JS_HEAD = r"""
 const PX = require(process.argv[2] + "/profil_planer.js");
 const out = {};
 const dep = (d) => '<i class="dep">' + d.to + '</i>';
-const base = (o) => Object.assign({ key: "flag:--pp-stage-ratio", name: "--pp-stage-ratio", scope: "launcher", value: "31,17,16", bare: false, multi: false, origin: "profil", origin_label: "Profil",
+const base = (o) => Object.assign({ key: "flag:--pp-stage-ratio", name: "--pp-stage-ratio", scope: "launcher", value: "31,17,16", bare: false, multi: false, origin: "profil", origin_label: "Profile",
   profile_value: "31,17,16", planner_value: null, changed: false,
   explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Layer je Karte", source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", choices: null } }, o || {});
 const ctx = (o) => Object.assign({ vecNames: new Set(__VEC__), posNames: new Set(__POS__), rankNames: new Set(__RANK__), n: 3, ranks: [], mode: "experte", prop: null, vsrc: "prop", dry: null, open: {}, cmsg: null, hasProfileValues: true,
@@ -362,7 +362,7 @@ global.localStorage = { getItem() { return null; }, setItem() {} };
 global.CSS = { escape: (s) => s };
 const posted = [];
 const PLANER = CASE.planer;
-const row = (name, value) => ({ key: "flag:" + name, name, scope: "launcher", value, bare: false, origin: "profil", origin_label: "Profil", changed: false, profile_value: value, planner_value: null,
+const row = (name, value) => ({ key: "flag:" + name, name, scope: "launcher", value, bare: false, origin: "profil", origin_label: "Profile", changed: false, profile_value: value, planner_value: null,
   explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Erklaerung " + name, source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", planner_derived: false, source: null, default: null, choices: null } });
 const VIEW = { rows: [row("--pp-stage-ratio", "31,17,16"), row("--p-bs", "2")], planner_only: [], removed: [], kvheads: [],
   coverage: { rows: 2, erklaert: 2, kuratiert: 2, geerntet: 0, profil_kommentar: 0, unerklaert: 0, geaendert: 0 } };
@@ -378,7 +378,7 @@ global.fetch = async (url, opt) => {
     else if (p === "load") body = { ok: true, doc: DOC, view: VIEW, name: "p", line: "27b", groups: [] };
     else if (p === "propose") { posted.push(JSON.parse(opt.body)); body = { ok: true, n: 3, form: "flip", werte: [{ key: "flag:--pp-stage-ratio", label: "--pp-stage-ratio", wert: "30,18,16", alt: "31,17,16", zustand: "vorgeschlagen", herkunft: "H", grund: "G", geaendert: true, verdikte: [] }],
       verdikt: { ausgang: "geht", verdikte: [] }, vorschlag: { cards: [{ name: "RTX 5090", total_mib: 32607 }, { name: "RTX 3080", total_mib: 20480 }, { name: "RTX 3080", total_mib: 20480 }], fit: { level: "ja", margin_mib: 100 } }, notes: [],
-      startprofil: { doc: Object.assign({}, DOC, { name: "p-vorschlag" }), view: Object.assign({}, VIEW, { rows: [Object.assign(row("--pp-stage-ratio", "30,18,16"), { origin: "planer", origin_label: "Planer", changed: true }), row("--p-bs", "2")] }), name: "p-vorschlag" } }; }
+      startprofil: { doc: Object.assign({}, DOC, { name: "p-vorschlag" }), view: Object.assign({}, VIEW, { rows: [Object.assign(row("--pp-stage-ratio", "30,18,16"), { origin: "planer", origin_label: "Planner", changed: true }), row("--p-bs", "2")] }), name: "p-vorschlag" } }; }
     else if (p === "recompute") body = { ok: false, error: "nicht im Test" };
     else body = { ok: false, error: "unerwartet " + p };
   }

@@ -251,7 +251,7 @@ global.document = {
 global.localStorage = { getItem() { return null; }, setItem() {} };
 global.CSS = { escape: (s) => s };
 const posted = {};
-const row = (name, deps) => ({ key: "flag:" + name, name, scope: "launcher", value: "1", bare: false, origin: "profil", origin_label: "Profil", changed: false,
+const row = (name, deps) => ({ key: "flag:" + name, name, scope: "launcher", value: "1", bare: false, origin: "profil", origin_label: "Profile", changed: false,
   profile_value: "1", planner_value: null, explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Erklaerung " + name, source: "c.py" }], depends: deps,
   gain: "", cost: "", group: "", level: "einfach", planner_derived: false, source: null, default: null, choices: null } });
 const VIEW = { rows: [row("--a", CASE.deps)], planner_only: [], removed: [], coverage: { rows: 1, erklaert: 1, kuratiert: 1, geerntet: 0, profil_kommentar: 0, unerklaert: 0, geaendert: 0 } };

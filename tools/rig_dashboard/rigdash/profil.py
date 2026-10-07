@@ -376,13 +376,13 @@ def _issue_model(model, doc_rows) -> List[str]:
 
 
 def _issue_cell(row: dict, v, known) -> str:
-    """Wert einer Zeile für die Tabelle: Schalter ohne Wert = ``an``; fehlt der Wert = ``–``; ein Geheimnis nach Namen = ``<redacted>``; ein Schlüssel,
+    """Wert einer Zeile für die Tabelle: Schalter ohne Wert = ``on``; fehlt der Wert = ``–``; ein Geheimnis nach Namen = ``<redacted>``; ein Schlüssel,
     den der Katalog nicht kennt (``known`` = die Katalognamen), zeigt seinen Wert nie (``redact.HIDDEN_UNKNOWN``)."""
     if v is None:
         return "–"
     if v == "" and row.get("bare"):
-        return "an"
-    return _md(redact.value_for_issue(str(row.get("name") or ""), v, known)) or "(leer)"
+        return "on"
+    return _md(redact.value_for_issue(str(row.get("name") or ""), v, known)) or "(empty)"
 
 
 def issue_diff_rows(view: dict) -> dict:

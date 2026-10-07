@@ -363,7 +363,7 @@ def switch_state(sw: dict, st: Optional[dict], profile_text: Optional[str]) -> d
         on_any = any(v[1] for v in vals)
         state = "an" if on_all else ("teilweise" if on_any else "aus")
         return {"state": state, "src": "state.json launch " + ",".join(g for g, _, _ in vals),
-                "value": "; ".join("%s=%s" % (g, v if v is not None else "(default %s)" % ("an" if default_on else "aus"))
+                "value": "; ".join("%s=%s" % (g, v if v is not None else "(default %s)" % ("on" if default_on else "off"))
                                    for g, _, v in vals)}
     if profile_text is not None:
         if art == "env":

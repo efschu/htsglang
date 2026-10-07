@@ -723,7 +723,7 @@ PD_END_WHATS = ("decode_token", "d_first_forward_done", "d_first_forward_done_ap
 
 #: the endpoint fields, named where the page says "fehlt (Feld X)"
 F_PD_START = "rankstats P prefill.last.t (last chunk, last P stage) in the ring"
-F_PD_END = "D-Log Decode rank batch rank 0 / flip_first_work.first_work_ts what=decode_token / rankstats D im Ring"
+F_PD_END = "D-Log Decode rank batch rank 0 / flip_first_work.first_work_ts what=decode_token / rankstats D in the ring"
 F_DP_START = "D log Decode rank batch rank 0 (last round of the D phase)"
 F_DP_START_NOLOG = "D log not found (Decode rank batch rank 0)"
 
@@ -733,7 +733,7 @@ F_DP_ARRIVAL = "front WEG2 SESSION arrival of the waiter is after the first pref
 F_DP_ARRIVAL_UNKNOWN = "front WEG2 SESSION arrival of the waiter (rid) or oldest_waiter_arrival is missing: server idle before the waiter cannot be calculated out"
 #: tolerance between the front's arrival stamp and the rank clock before an arrival "after the first forward" is a defect
 ARRIVAL_SKEW_S = 0.5
-F_DP_END = "rankstats P.tp0pp0.work.forward_ct im Ring / flip_user_time.prefill_start_ts (pp_first_forward)"
+F_DP_END = "rankstats P.tp0pp0.work.forward_ct in the ring / flip_user_time.prefill_start_ts (pp_first_forward)"
 
 
 def _p_last_chunk_end(ring, key: Optional[str], t_from: float, t_to: float) -> Optional[float]:

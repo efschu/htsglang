@@ -237,7 +237,7 @@ class Proposal(Base):
         t = self.report(doc=doc, dry=None)["text"]
         sec = t.split("### Proposal and overrides")[1].split("### Verdicts and force")[0]
         row = next(x for x in sec.split("\n") if x.startswith("| `flag:--p-bs`"))
-        self.assertEqual([c.strip() for c in row.strip("|").split("|")], ["`flag:--p-bs`", "4", "2", "6", "Nutzer"])     # aktuell / Profil / Vorschlag / Herkunft
+        self.assertEqual([c.strip() for c in row.strip("|").split("|")], ["`flag:--p-bs`", "4", "2", "6", "User"])     # aktuell / Profil / Vorschlag / Herkunft
         self.assertNotIn("`flag:--pp-stage-ratio`", sec)                      # unverändert und gleich dem Vorschlag: nicht im Diff
         self.assertNotIn("`flag:--model`", sec)
         self.assertIn("1 changed against the loaded profile, 1 set by the user, 2 with a planner proposal, 1 differ from the proposal", sec)
@@ -258,7 +258,7 @@ class Proposal(Base):
         doc["meta"]["planner"]["flag:--p-hostgap"] = ""
         sec = self.report(doc=doc, dry=None)["text"].split("### Proposal and overrides")[1]
         row = next(x for x in sec.split("\n") if x.startswith("| `extra:P:--rank-moe-ratio`"))
-        self.assertEqual([c.strip() for c in row.strip("|").split("|")], ["`extra:P:--rank-moe-ratio`", "1,2,3", "183,137,168", "–", "Nutzer"])
+        self.assertEqual([c.strip() for c in row.strip("|").split("|")], ["`extra:P:--rank-moe-ratio`", "1,2,3", "183,137,168", "–", "User"])
         self.assertIn("Removed against the loaded profile: `flag:--p-hostgap`", sec)
         self.assertIn("Proposal without a row in the profile: `flag:--p-hostgap` = (empty, switch on)", sec)
 
@@ -267,16 +267,16 @@ class Proposal(Base):
         doc["meta"]["planner"]["flag:--p-hostgap"] = "1"                        # Vorschlag nennt einen Wert, das Profil den Schalter
         sec = self.report(doc=doc, dry=None)["text"].split("### Proposal and overrides")[1]
         row = next(x for x in sec.split("\n") if x.startswith("| `flag:--p-hostgap`"))
-        self.assertEqual([c.strip() for c in row.strip("|").split("|")], ["`flag:--p-hostgap`", "an", "an", "1", "Profil"])
+        self.assertEqual([c.strip() for c in row.strip("|").split("|")], ["`flag:--p-hostgap`", "on", "on", "1", "Profile"])
 
     def test_extra_fields_from_the_oracle_become_columns_without_a_rebuild(self):
-        view = {"rows": [{"key": "flag:--p-bs", "name": "--p-bs", "value": "4", "profile_value": "2", "planner_value": "6", "origin": "nutzer", "origin_label": "Nutzer",
+        view = {"rows": [{"key": "flag:--p-bs", "name": "--p-bs", "value": "4", "profile_value": "2", "planner_value": "6", "origin": "nutzer", "origin_label": "User",
                           "changed": True, "state": "übersteuert", "verdict": {"code": "FIT", "text": "x"}},
                          {"key": "flag:--x", "name": "--x", "value": "1", "profile_value": "1", "planner_value": None, "origin": "profil", "changed": False}],
                 "removed": [], "planner_only": []}
         sec = "\n".join(P._issue_proposal(view, KNOWN))
         self.assertIn("| Value | Current | Profile | Proposal (planner) | Origin | State | Verdict |", sec)
-        self.assertIn("| `flag:--p-bs` | 4 | 2 | 6 | Nutzer | übersteuert | FIT |", sec)
+        self.assertIn("| `flag:--p-bs` | 4 | 2 | 6 | User | übersteuert | FIT |", sec)
 
     def test_long_table_is_cut_with_a_note(self):
         rows = [{"key": "flag:--v%d" % i, "name": "--v%d" % i, "value": "1", "profile_value": "0", "planner_value": None, "origin": "nutzer", "changed": True} for i in range(P.ISSUE_MAX_ROWS + 7)]
@@ -330,7 +330,7 @@ class Redaction(Base):
         self.assertIn("`env:P:HF_TOKEN`", t)                               # die Zeile bleibt sichtbar, nur der Wert ist weg
         row = next(x for x in t.split("\n") if x.startswith("| `env:P:HF_TOKEN`"))
         self.assertEqual(row.count("<redacted>"), 2)                       # aktuell und Vorschlag; das Profil trug die Zeile nicht (–)
-        self.assertTrue(row.rstrip().endswith("Nutzer |"))
+        self.assertTrue(row.rstrip().endswith("User |"))
         self.assertIn("<path redacted>", t)
         self.assertIn("| `flag:--p-bs` | 4 |", t)                           # gewöhnliche Werte bleiben lesbar
 
