@@ -439,6 +439,29 @@ Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `st
   HTTP 409) · `laeuft_bereits`. Das gpuq-Token verlässt den Prozess nie; die Buchung steht zusätzlich in `<state-dir>/hwprofil_window.json`, damit
   ein Neustart ein verwaistes Fenster zurückgibt.
 * `POST /api/hwprofil/cancel` gibt ein wartendes Fenster zurück.
+* **Gespeichert (AP-A, Profil-Planer 06.10.).** Beim ersten Aufruf schreibt der Dienst das Profil nach `--hw-profile-file` (Env `FLLIPER_HARDWARE_PROFILE`,
+  Voreinstellung `/var/lib/flliper/hardware.json`; Rig und Release gleich; ein Schreibfehler ist nur ein Zustand, kein Absturz). `GET /api/hwprofil`
+  trägt dazu `persist` = `{enabled, state, label, captured_at, reason, id, drift, error, from_persisted, file}`; `state` = `erst_erfasst` | `neu_erfasst` |
+  `vorhanden` | `abweichend` (Datei bleibt, `drift.changes` nennt den Unterschied) | `nur_gespeichert` (NVML schweigt: die Datei gilt) | `keine_karten` |
+  `nicht_schreibbar`. `POST /api/hwprofil/recapture` ("Neu erfassen") liest NVML neu und ersetzt die Datei: kein gpuq-Fenster, auch in release; eine
+  erfolgreiche Messung erfasst ebenfalls neu. SM-Zahl (`weg2/hw_sim.py`) und Nennbandbreite (`kartenplan_catalog.py`, Feld `mem_gbs.nominal`) kommen als
+  `Datenblatt` ins Profil, eine gemessene SM-Zahl gewinnt; `cards[].catalog` nennt Katalogkarte, `preset` und Herkunft (`measured_on_rig` | `Datenblatt` |
+  `borrowed-unbelegt`, je Feld in `origin_fields`). `GET /api/hwprofil/issue` liefert den Issue-Text "Hardwareprofil" als Markdown (`{ok, format, text}`);
+  Geheimnisse und Hostpfade sind entfernt (`redact.text_for_issue`).
+* **Issue-Text "Laufbericht" (AP-I, Profil-Planer 06.10.).** `POST /api/profil/issue` mit `{doc, dry?, cards?, model?}` (Profil, Antwort des letzten
+  Trockenlaufs, die gewählten Karten `[{card, pcie}]`, ein Modellprofil `flliper.model/1`) liefert `{ok, format: "markdown", text, blocks, filename}`: ein
+  Block zum Einfügen in ein GitHub-Issue mit den Abschnitten Hardwareprofil (Kurzform, `hwprofil.issue_short`, aus dem Hardware-Dienst), Modellprofil
+  (Werte mit Quelle, nur der Ordnername), Betriebsform (aus den Flags gelesen: `--dual-layout`/`--dual-share` = Dual, `--d-only` = nur TP, eine Karte =
+  Einzelkarte, sonst Flip), Vorschlag und Übersteuerungen (Zeilen mit `changed`, Herkunft `nutzer`/`planer` oder abweichendem `planner_value`; Spalten
+  Aktuell/Profil/Vorschlag/Herkunft, dazu `state`/`verdict`, sobald eine Zeile sie trägt), Verdikte und Force (Codes mit Klasse und Force-Zustand, neu aus dem
+  Register gelesen; ohne Trockenlauf steht das da), Versionen (Baum-Revision, Image, Treiber, CUDA/torch, Dashboard) und dem Platzhalter "Messergebnis /
+  Boot-Log-Auszug". Redigiert (`redact.text_for_issue`; Werte von Zeilen, deren NAME ein Geheimnis nennt, `redact.secret_name`, fallen ganz weg). Auch nach der Form: Anbieter-Präfixe, JWT, lange Token-Läufe (mit und ohne `=`/`:` davor, ein ganzer Zellenwert als Lauf), `user:pass@`; jeder
+  absolute Pfad außerhalb von `/app` und jeder `~/`-/`$HOME/`-Pfad wird `<hostpfad>/<letztes Segment>` (Systemwurzeln wie `/root`, `/spinning`: `<Pfad entfernt>`).
+  Strukturregel (Fix-Runde 5): einen WERT zeigt der Bericht nur für Schlüssel, die im Katalog (`catalog.json`: Flags, Envs, Profilvariablen) stehen und nach Namen kein Geheimnis sind; jeder andere vom Nutzer
+  gesetzte Schlüssel zeigt nur seinen Namen und `<wert ausgeblendet: unbekannter Schluessel>` (`redact.value_for_issue(name, value, known)`; ohne `known` wird nichts gezeigt). Die Wertformen bleiben die zweite Schicht
+  (auch für Katalog-Schlüssel): zusätzlich Base64 mit `/` `+` `=` (AWS-Secret, Azure-Key) und Punkt-geteilte Token (Discord). Pfade werden vor dem Urteil normalisiert (`/app/../../root/x` ist `/root/x`),
+  `file://` entfällt, ein Pfad mit Leerzeichen in Anführungszeichen zählt als ein Pfad; `/models-cache` (Modell-Mount des Containers) bleibt wie `/app`.
+  Ohne Hardware-Dienst entsteht der Bericht trotzdem ("nicht verfügbar"). Oberfläche: Abschnitt "Issue-Text: Laufbericht" unter dem Export in `profil.js`.
 * Kein Hintergrund-Poller: nur wer die Seite bedient fragt. Ein laufendes Fenster, das nach 180 s nicht benutzt wurde, geht beim nächsten Aufruf zurück.
 * Dienst-Parameter (Deploy durch den Lead): `--hw-tree` (gestagter Baum mit `hardware_profile.py` + `weg2/card_identity.py`, `deploy/stage_hwprofil.sh`),
   `--hw-measure-tree` (voller sglang-Baum für den Kindprozess), `--hw-python` (Interpreter mit torch + sgl_kernel; ohne sgl_kernel bleiben die Arme
@@ -446,3 +469,21 @@ Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `st
   `MemoryMax=1G`, torch/CUDA gehört in einen eigenen cgroup-Rahmen). Env: `HWPROFIL_TREE`, `HWPROFIL_MEASURE_TREE`, `HWPROFIL_PYTHON`, `HWPROFIL_PREFIX`.
 * Einhängen in eine Seite: `<div id="x"></div><script src="hwprofil.js"></script><script>HwProfil.mount(document.getElementById("x"))</script>`;
   `HwProfil.render(antwort)` liefert nur den HTML-Text.
+
+## Profil-Planer: eine Seite in sechs Schritten (AP-H1, Plan Profil-Planer 06.10.)
+
+Der Reiter Profil führt in einer festen Reihenfolge: **1 Hardware** (Inventar: "Dieses Rig" = Hardwareprofil mit echten NVML-Karten, oder Karten aus dem Katalog,
+synthetisch; die drei vorbelegten Karten zuerst) -> **2 Modell und Profil** -> **3 Betriebsform** (Einzelkarte, Nur TP, Flip PP/TP, Dual PP/TP, je ein erklärender
+Satz; Vorbelegung aus dem Profil: `--dual-layout`/`--dual-share` = Dual, `--d-only` = Nur TP) -> **4 Vorschlag** (Regler "Sitze gleichzeitig" und "Kontext",
+Knopf "Vorschlag" = `POST /api/profil/propose`, "Neu prüfen" = Trockenlauf) -> **5 Anpassen** -> **6 Export**.
+
+* Daten der Seite: `rigdash/profil_planer.py` (`ui_info`, in `GET /api/profil/list` als `planer`): Formen, Abschnitte A (Aufteilung), B (KV), C (Experten) mit den
+  Namen ihrer Werte, die Dual-ENV-Tabelle mit Standardwerten und Quellzeilen, Reglergrenzen. Fehlt `planer` (älterer Dienst) oder `profil_planer.js`, zeichnet
+  `profil.js` die alte Seite. Der Vorschlag gilt für die Formen, die `ProfilEditor.FORMS` kennt (flip, tp); Einzelkarte (AP-F) und Dual (AP-E) zeigen den Grund.
+* Darstellung: `static/profil_planer.js` (kein DOM, kein Netz, Node-testbar). Ein Feld je Rang für Vektoren (Kommalisten mit gleich vielen Einträgen wie Karten;
+  falsche Länge = Warnung), **Zustandschip** je Wert (vorgeschlagen / unbelegt / vom Launcher gelöst / von Ihnen übersteuert / Profil / Standard), **Urteilschip**
+  je Wert (geht / nur mit --force / verweigert / Hinweis / nicht geprüft / ungeprüft seit Ihrer Änderung) mit Code und Grund sichtbar, **Abhängigkeitschips**
+  aus dem Kantenkatalog. Ein Urteil ist ein Hinweis, nie eine Sperre (Nutzerentscheid 4a): jedes Feld bleibt bedienbar, Force steht im Export. Filter Einfach/Experte.
+* Dual-ENV-Tabelle (Abschnitt D, Plan 4c): `SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE` als Tabelle (D-Sitze bis | P-Anteil bei kleinem / großem tau, Stufen 0-3 = 100/75/50/25 %),
+  `..._STARVE_AGE_S`, `..._STARVE_MAX_RUNG`, `SGLANG_WEG2_DUAL_GRANT_RETRY_MS`; Katalogeinträge kuratiert, Kanten K109-K116 mit Beleg.
+* Tests: `tests/test_profil_planer_aph1_1006.py`.

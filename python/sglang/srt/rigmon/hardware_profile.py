@@ -36,6 +36,15 @@ without a measurement is never shown as measured, and a lane that cannot run on
 a card (no fp8 on sm_86) is "nicht gemessen" with the card's own reason -- not a
 substitute number (HOCHRECHNUNG != MESSUNG).
 
+**Persisted at the first start (AP-A, plan 06.10.).**  The view is still assembled on every call, but the
+first call on a machine also WRITES it (``capture``): ``/var/lib/flliper/hardware.json`` (env
+``FLLIPER_HARDWARE_PROFILE``), in the rig and in the release edition alike.  The file is the machine's identity
+(NVML names, sizes, cc, SM, clocks, the measured rates known at that moment); a later call compares it with the live
+cards and reports a difference instead of overwriting it, ``capture(force=True)`` ("Neu erfassen") replaces it.  Where
+NVML says nothing (editor-only container without a GPU) the persisted file is the profile.  A card's SM count and
+nominal bandwidth are merged in from the data sheets (``datasheet``: ``weg2/hw_sim.py`` for SM, the dashboard's card
+catalog for the bandwidth), always labelled "Datenblatt"; a measured SM count wins over the data sheet.
+
 **No rig constants.**  Card classes, order and count come from NVML and from
 ``weg2.card_identity`` (loaded by path, so this file also runs inside the
 stdlib-only dashboard process); the file names the cards of the machine it runs
@@ -80,6 +89,14 @@ __all__ = [
     "read_nvml",
     "run_measurement",
     "duration_line",
+    "PERSIST_ENV",
+    "DEFAULT_PERSIST_PATH",
+    "persist_path",
+    "load_profile",
+    "save_profile",
+    "compare",
+    "capture",
+    "hw_sim_datasheet",
 ]
 
 SCHEMA = "flliper.hardware/1"
@@ -90,6 +107,10 @@ SRC_DATASHEET = "Datenblatt"
 SRC_ESTIMATED = "geschätzt"
 SRC_NONE = "nicht gemessen"
 SOURCES = (SRC_MEASURED, SRC_NVML, SRC_DATASHEET, SRC_ESTIMATED, SRC_NONE)
+
+#: Where the profile is persisted (first start); the env names another file (container volume, test).
+PERSIST_ENV = "FLLIPER_HARDWARE_PROFILE"
+DEFAULT_PERSIST_PATH = "/var/lib/flliper/hardware.json"
 
 #: Same horizon as ``card_probe.DEFAULT_MAX_AGE_S`` (one convention, not two).
 MAX_AGE_S = 7 * 24 * 3600.0
@@ -185,6 +206,46 @@ def _load_identity():
     except Exception:  # pragma: no cover - a broken sibling must not break the view
         sys.modules.pop(name, None)
         return None
+
+
+def _load_hw_sim():
+    """``weg2/hw_sim.py`` of the tree this file sits in (stdlib at module level), or ``None``."""
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "weg2", "hw_sim.py"))
+    if not os.path.isfile(path):
+        return None
+    name = "hwprofile_hw_sim"
+    if name in sys.modules:
+        return sys.modules[name]
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod  # @dataclass resolves types through sys.modules[__module__]
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:  # pragma: no cover - a broken sibling must not break the view
+        sys.modules.pop(name, None)
+        return None
+
+
+def hw_sim_datasheet(row: dict) -> Dict[str, Any]:
+    """The data-sheet SM count of one NVML card row from ``weg2/hw_sim.py`` ``CATALOG`` (``SimCard.sm_count``).
+
+    The match is the NVML name and the compute capability; among several entries of that name the one with the same
+    total MiB wins, and when the total matches none the answer is given only if every candidate agrees (the 10 GB and
+    the 20 GB RTX 3080 are both 68 SM).  No match, or candidates that disagree: ``{}`` -- never a guess."""
+    sim = _load_hw_sim()
+    cat = getattr(sim, "CATALOG", None) if sim is not None else None
+    if not cat:
+        return {}
+    cc = tuple(row.get("cc") or ())
+    cands = [c for c in cat.values() if c.name == row.get("name") and tuple(c.cc) == cc]
+    exact = [c for c in cands if c.total_mib == row.get("total_mib")]
+    pick = exact or cands
+    counts = {c.sm_count for c in pick}
+    if len(counts) != 1:
+        return {}
+    return {"sm_count": counts.pop(),
+            "sm_note": "Datenblatt-Katalog weg2/hw_sim.py CATALOG[%s].sm_count (nicht gemessen)" % ",".join(c.key for c in pick)}
 
 
 # ---------------------------------------------------------------------------
@@ -435,9 +496,15 @@ def build(
     nvml: Optional[Tuple[List[dict], Optional[str], List[str]]] = None,
     now: Optional[float] = None,
     identity: Any = "auto",
+    datasheet: Any = "auto",
 ) -> Dict[str, Any]:
-    """Assemble the ``flliper.hardware/1`` document.  Reads only; starts nothing."""
+    """Assemble the ``flliper.hardware/1`` document.  Reads only; starts nothing.
+
+    ``datasheet(row) -> dict`` is the data-sheet lookup of one NVML card row (keys ``sm_count`` + ``sm_note``,
+    ``mem_bw_gbs`` + ``bw_note``, ``catalog``); ``"auto"`` = ``hw_sim_datasheet`` (SM count only), ``None`` = off (the
+    document then has none of the data-sheet fields)."""
     now = time.time() if now is None else now
+    ds_fn = hw_sim_datasheet if datasheet == "auto" else datasheet
     cache_dir = cache_dir or default_cache_dir()
     cards_nvml, driver, issues = nvml if nvml is not None else read_nvml()
     ci = _load_identity() if identity == "auto" else identity
@@ -538,6 +605,12 @@ def build(
                 "throttle": list(c.get("throttle_reasons") or []),
                 "throttled": bool(c.get("throttle_reasons")),
             }
+        ds: Dict[str, Any] = {}
+        if ds_fn is not None:
+            try:
+                ds = dict(ds_fn(r) or {})
+            except Exception as e:  # a broken lookup must not hide the card
+                issues.append(f"Datenblatt-Suche für {r.get('name')} fehlgeschlagen ({type(e).__name__}: {e})")
         bus, memclk = r.get("mem_bus_width_bits"), r.get("mem_clock_max_mhz")
         nameplate = (
             node(
@@ -557,6 +630,11 @@ def build(
             else missing(ni, "GB/s")
         )
         probed_at = max((t[0] for t in probe_card_seen), default=None)
+        # the SM count: a measurement wins; without one the data sheet fills it, labelled as such (never as measured)
+        sm_measured = val("sm_count", None, "Geräteeigenschaft wird vom Messarm gelesen (Hardwareprofil messen)")
+        sm_node = sm_measured
+        if sm_measured["v"] is None and ds.get("sm_count"):
+            sm_node = node(ds["sm_count"], SRC_DATASHEET, note=ds.get("sm_note") or "Datenblatt")
         entry = {
             "ord": ordinal,
             "nvml_index": r["nvml_index"],
@@ -566,7 +644,7 @@ def build(
             "class_key": class_label,
             "card_key": key,
             "cc": r["cc"],
-            "sm_count": val("sm_count", None, "Geräteeigenschaft wird vom Messarm gelesen (Hardwareprofil messen)"),
+            "sm_count": sm_node,
             "l2_mib": val("l2_mib", "MiB", "Geräteeigenschaft (torch L2_cache_size) wird vom Messarm gelesen"),
             "vram_total_mib": _nv(r.get("total_mib") or None, "MiB", "Speichergröße"),
             "bar1_total_mib": _nv(r.get("bar1_total_mib"), "MiB", "BAR1-Größe (nvidia-smi-Fallback kennt sie nicht)"),
@@ -592,9 +670,22 @@ def build(
                 "limit_w": _nv(r.get("power_limit_w"), "W", "Leistungsgrenze"),
                 "default_w": _nv(r.get("power_default_w"), "W", "Standard-Leistungsgrenze"),
             },
+            "clocks": {
+                "sm_max_mhz": _nv(r.get("sm_clock_max_mhz"), "MHz", "maximalen SM-Takt"),
+                "mem_max_mhz": _nv(r.get("mem_clock_max_mhz"), "MHz", "maximalen Speichertakt"),
+            },
+            "mem_bus_bits": _nv(r.get("mem_bus_width_bits"), "bit", "Speicher-Busbreite (nvidia-smi-Fallback kennt sie nicht)"),
             "state": state,
             "probed_at": probed_at,
         }
+        if ds_fn is not None:
+            # the nominal bandwidth of the catalog card (a data-sheet figure, not NVML's bus x clock peak above)
+            if ds.get("mem_bw_gbs"):
+                entry["mem_gbs"]["nominal"] = node(ds["mem_bw_gbs"], SRC_DATASHEET, unit="GB/s",
+                                                   note=ds.get("bw_note") or "Datenblatt-Nennbandbreite des Katalogs")
+            else:
+                entry["mem_gbs"]["nominal"] = missing("kein Katalogeintrag mit Nennbandbreite für diese Karte", "GB/s")
+            entry["catalog"] = ds.get("catalog") or None
         if probed_at is not None:
             age = now - probed_at
             entry["age_s"] = round(age, 1)
@@ -607,7 +698,9 @@ def build(
         # W4A8 on sm_12x: its reason is stored) is final, and the stage-0-only lanes (fp8 Marlin / W8A16) are
         # not the probe's to measure -- neither keeps "Hardwareprofil messen" lit forever.
         gaps = [k for k in PROBE_FORMATS if compute[k]["v"] is None and k not in notes]
-        gaps += [k for k in ("sm_count", "l2_mib", "d2d_intra_gbs") if entry[k]["v"] is None]
+        # a data-sheet SM count is no measurement: the gap stays open until the probe has read it
+        gaps += ["sm_count"] if sm_measured["v"] is None else []
+        gaps += [k for k in ("l2_mib", "d2d_intra_gbs") if entry[k]["v"] is None]
         gaps += [f"h2d.{k}" for k, n in entry["h2d"].items() if n["v"] is None]
         gaps += [f"d2h.{k}" for k, n in entry["d2h"].items() if n["v"] is None]
         unmeasured[str(ordinal)] = gaps
@@ -739,6 +832,130 @@ def validate(doc: dict) -> List[str]:
 
     walk("", {"cards": doc.get("cards"), "links": doc.get("links")})
     return problems
+
+
+# ---------------------------------------------------------------------------
+# persistence: written at the first start, replaced only on request
+# ---------------------------------------------------------------------------
+
+#: ``capture`` states.  ``erst_erfasst`` = first start, written now; ``neu_erfasst`` = replaced on request;
+#: ``vorhanden`` = file and live cards agree; ``abweichend`` = they differ (file kept); ``nur_gespeichert`` = NVML says
+#: nothing, the file is the profile; ``keine_karten`` = nothing to persist; ``nicht_schreibbar`` = the write failed.
+CAPTURE_STATES = ("erst_erfasst", "neu_erfasst", "vorhanden", "abweichend", "nur_gespeichert", "keine_karten", "nicht_schreibbar")
+
+
+def persist_path(env: Optional[dict] = None) -> str:
+    """The persisted profile's file: ``$FLLIPER_HARDWARE_PROFILE`` or ``/var/lib/flliper/hardware.json``."""
+    e = os.environ if env is None else env
+    return e.get(PERSIST_ENV) or DEFAULT_PERSIST_PATH
+
+
+def load_profile(path: str) -> Tuple[Optional[dict], Optional[str]]:
+    """``(document, problem)``.  Missing file: ``(None, None)``; unreadable or another schema: ``(None, why)``."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (FileNotFoundError, NotADirectoryError):
+        return None, None
+    except (OSError, ValueError) as e:
+        return None, f"nicht lesbar ({type(e).__name__}: {e})"
+    if not isinstance(d, dict) or d.get("schema") != SCHEMA or not isinstance(d.get("cards"), list):
+        return None, f"kein {SCHEMA}-Dokument"
+    return d, None
+
+
+def save_profile(doc: dict, path: str, *, reason: str, now: Optional[float] = None) -> Dict[str, Any]:
+    """Write ``doc`` (plus a ``capture`` stamp) to ``path`` atomically.  Never raises: ``{"ok", "error"}``."""
+    now = time.time() if now is None else now
+    out = dict(doc)
+    out["capture"] = {"at": now, "reason": reason}
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(out, fh, indent=1, ensure_ascii=False, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return {"ok": False, "error": f"{type(e).__name__}: {e.strerror or e}"}
+    return {"ok": True, "error": None, "at": now}
+
+
+def _identity(doc: dict) -> Tuple[Dict[str, tuple], Optional[str]]:
+    cards = {}
+    for c in doc.get("cards") or []:
+        vram = (c.get("vram_total_mib") or {}).get("v")
+        cards[str(c.get("uuid"))] = (c.get("name"), vram, tuple(c.get("cc") or ()), c.get("pci_bus_id"))
+    return cards, doc.get("driver")
+
+
+def compare(persisted: dict, live: dict) -> Dict[str, Any]:
+    """Whether the persisted profile still describes the live cards: ``{"same", "changes": [text, ...]}``.
+
+    Compared: the set of card UUIDs, each card's name / VRAM / cc / PCI bus, and the driver.  Measured values are not
+    compared (a new measurement is not a different machine)."""
+    a, da = _identity(persisted)
+    b, db = _identity(live)
+    changes: List[str] = []
+    for u in sorted(set(a) - set(b)):
+        changes.append(f"Karte {a[u][0]} ({u}) ist nicht mehr da")
+    for u in sorted(set(b) - set(a)):
+        changes.append(f"neue Karte {b[u][0]} ({u})")
+    for u in sorted(set(a) & set(b)):
+        for what, x, y in zip(("Name", "VRAM MiB", "cc", "PCI-Bus"), a[u], b[u]):
+            if x != y:
+                changes.append(f"Karte {u}: {what} war {x}, jetzt {y}")
+    if da is not None and db is not None and da != db:
+        changes.append(f"Treiber war {da}, jetzt {db}")
+    return {"same": not changes, "changes": changes}
+
+
+def capture(
+    path: str,
+    *,
+    live: Optional[dict] = None,
+    force: bool = False,
+    reason: Optional[str] = None,
+    now: Optional[float] = None,
+    **build_kwargs,
+) -> Dict[str, Any]:
+    """First-start persistence (and "Neu erfassen" with ``force``).
+
+    ``live`` is an assembled document (default: ``build(**build_kwargs)``).  Returns ``{"state", "show", "persisted",
+    "live", "drift", "error", "path"}`` where ``show`` is the document to display: the live one when it has cards, else
+    the persisted one.  Rules: no file -> write the live profile (``erst_erfasst``); file and live agree ->
+    ``vorhanden``; they differ -> ``abweichend`` and the file stays; ``force`` replaces the file when the live profile
+    has cards (an empty live view never overwrites a persisted one); no cards anywhere -> ``keine_karten``."""
+    live = live if live is not None else build(**build_kwargs)
+    has_cards = bool(live.get("cards"))
+    persisted, problem = load_profile(path)
+    res: Dict[str, Any] = {"state": None, "show": live, "persisted": persisted, "live": live, "drift": None,
+                           "error": None, "path": path}
+    if problem:
+        res["error"] = f"gespeicherte Datei {problem}"
+    if force or persisted is None:
+        if not has_cards:
+            res.update(state="keine_karten", show=persisted or live,
+                       error=(res["error"] + "; " if res["error"] else "") + "NVML meldet keine Karte: nichts gespeichert, nichts überschrieben")
+            return res
+        why = reason or ("Neu erfassen" if force else "erster Start")
+        w = save_profile(live, path, reason=why, now=now)
+        if not w["ok"]:
+            res.update(state="nicht_schreibbar", error=(res["error"] + "; " if res["error"] else "") + f"Speichern fehlgeschlagen: {w['error']}")
+            return res
+        res.update(state="neu_erfasst" if force else "erst_erfasst", persisted=load_profile(path)[0])
+        return res
+    if not has_cards:
+        res.update(state="nur_gespeichert", show=persisted)
+        return res
+    drift = compare(persisted, live)
+    res.update(state="vorhanden" if drift["same"] else "abweichend", drift=drift)
+    return res
 
 
 # ---------------------------------------------------------------------------

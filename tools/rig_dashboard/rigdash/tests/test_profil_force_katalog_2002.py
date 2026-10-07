@@ -201,9 +201,9 @@ class Katalog(unittest.TestCase):
         cat = json.load(open(os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json"), encoding="utf-8"))
         k = cat["kanten"]
         self.assertTrue(k["geladen"])
-        # 61 Kanten seit 05.10.: K60 (Graph-Kalibriertabelle <-> Layer-Schnitt) und K61 (Tabelle wirkt nur bei Politik auto) sind NEU dazugekommen
+        # AP-G 06.10.: 108 Kanten (K62-K108 neu: Form A / ungleiches DCP / Draft / D-only / Dual, alle belegt; neu 10 -> 57, ohne Beleg weiter 24). Davor 61 Kanten seit 05.10.: K60 (Graph-Kalibriertabelle <-> Layer-Schnitt) und K61 (Tabelle wirkt nur bei Politik auto) sind NEU dazugekommen
         # (neu 8 -> 10, alle 61 belegt); die 24 "ohne Beleg" sind kuratierte Kantenwünsche, unverändert
-        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"], k["kanten_ohne_beleg"]), (61, 51, 10, 24))
+        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"], k["kanten_ohne_beleg"]), (116, 51, 65, 24))
         deps = [d for e in cat["entries"].values() for d in e["depends"]]
         self.assertTrue(all("belegt" in d and "to_kind" in d for d in deps))
         self.assertTrue(any(d["to_kind"] == "ablehnung" for d in deps))
