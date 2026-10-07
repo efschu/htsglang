@@ -29542,7 +29542,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2424
+      "line": 2428
      }
     }
    },
@@ -29597,7 +29597,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2414
+    "line": 2418
    },
    "status": "geerntet",
    "text": "",
@@ -29620,7 +29620,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2460
+      "line": 2464
      }
     }
    },
@@ -38339,7 +38339,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4525
+    "line": 4529
    },
    "status": "unerklaert",
    "text": "",
@@ -38657,7 +38657,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4524
+    "line": 4528
    },
    "status": "geerntet",
    "text": "",
@@ -39188,6 +39188,34 @@
    "text": "",
    "type": "EnvBool"
   },
+  "SGLANG_ENABLE_REUSE_TEXT_ONLY_PROMPT_IDS": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "REUSE-TEXT-IDS-1007 (upstream _can_reuse_text_only_prompt_ids): group D's chat serving hands a text-only request's rendered ids to the tokenizer manager instead of the decoded text it would encode again.",
+   "id": "SGLANG_ENABLE_REUSE_TEXT_ONLY_PROMPT_IDS",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_ENABLE_REUSE_TEXT_ONLY_PROMPT_IDS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2104
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
   "SGLANG_ENABLE_SCHEDULER_WATCHDOG_KILL": {
    "abweichung": {
     "27b": {
@@ -39205,7 +39233,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2435
+      "line": 2439
      }
     }
    },
@@ -39374,7 +39402,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2439
+      "line": 2443
      }
     }
    },
@@ -47505,7 +47533,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2109
+    "line": 2113
    },
    "status": "geerntet",
    "text": "",
@@ -70869,7 +70897,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3560
+      "line": 3564
      }
     }
    },
@@ -71228,7 +71256,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4232
+      "line": 4236
      }
     }
    },
@@ -71307,7 +71335,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2453
+      "line": 2457
      }
     }
    },
@@ -71846,7 +71874,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2444
+      "line": 2448
      }
     }
    },
@@ -72068,7 +72096,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4212
+      "line": 4216
      }
     }
    },
@@ -75206,7 +75234,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4332
+      "line": 4336
      }
     }
    },
@@ -77326,7 +77354,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4141
+      "line": 4145
      }
     }
    },
@@ -77887,7 +77915,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2320
+    "line": 2324
    },
    "status": "erklaert",
    "text": "Wenn eine angehaltene (geparkte) Anfrage später weiterlaufen soll und der Platz für Mamba-Anker im Host-RAM voll ist, bekommt ihr Wiedereinstiegspunkt Vorrang: andere Zwischenstände ohne Park-Bezug werden zuerst auf die Platte ausgelagert, damit der Einstiegspunkt der geparkten Anfrage nicht verloren geht. Aus: der alte Weg; geparkte Anfragen können ihren Einstiegspunkt verlieren und neu rechnen. Ohne Park ändert sich nichts. Wirkt nur auf Knoten, die als geparkt markiert sind. Standard an. Unbelegt: Abhängigkeit zu einem anderen Schalter; ob der Nutzer ihn ändern soll (belegt ist nur der Entscheid „bleibt an“ vom 05.10. ~17:47Z); Nutzen am Metall (laut Bericht „active, effect not shown“).",
@@ -84524,7 +84552,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4319
+      "line": 4323
      }
     }
    },
@@ -85305,25 +85333,25 @@
    "abweichung": 43,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 33
+   "nur_nf": 34
   },
-  "entries": 2692,
-  "envs": 1815,
+  "entries": 2693,
+  "envs": 1816,
   "erklaert": 304,
   "flags": 862,
-  "geerntet": 1667,
+  "geerntet": 1668,
   "kuratiert": 119,
   "unerklaert": 602
  },
- "tree_rev": "27b=65fc0e2076+nf=cb555dbc8f+hebel3a",
+ "tree_rev": "27b=65fc0e2076+nf=45f9766894+hebel2a",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "65fc0e2076"
   },
   "nf": {
-   "entries": 2494,
-   "rev": "cb555dbc8f+hebel3a"
+   "entries": 2495,
+   "rev": "45f9766894+hebel2a"
   }
  },
  "warnungen": []

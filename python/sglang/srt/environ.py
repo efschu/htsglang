@@ -2098,6 +2098,10 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # REUSE-TEXT-IDS-1007 (upstream _can_reuse_text_only_prompt_ids): group D's
+    # chat serving hands a text-only request's rendered ids to the tokenizer
+    # manager instead of the decoded text it would encode again.
+    SGLANG_ENABLE_REUSE_TEXT_ONLY_PROMPT_IDS = EnvBool(False)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from enum import Enum
@@ -74,6 +75,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.weg2 import handoff as weg2_handoff
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -275,6 +277,134 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         except Exception:
             self._tokenizer_auto_adds_specials = True
+
+        # REUSE-TEXT-IDS-1007 (Hebel 2a): group D hands a text-only request's
+        # rendered ids to the tokenizer manager instead of the decoded text.
+        self._reuse_text_only_prompt_ids = self._resolve_reuse_text_only_prompt_ids()
+
+    #: REUSE-TEXT-IDS-1007: the decode/encode probe's user turn -- the shapes a
+    #: decode cleanup or a normalizer would change (space before punctuation,
+    #: contractions, a decomposed accent, CJK, an emoji, tabs, runs of spaces
+    #: and newlines).
+    _DECODE_ROUND_TRIP_PROBE = (
+        "Hello , world . it 's n't ... Cafe\u0301 caf\u00e9 \u65e5\u672c\u8a9e "
+        "\U0001f642\tTab  two  spaces\n\n\nend ?! a - b"
+    )
+
+    def _resolve_reuse_text_only_prompt_ids(self) -> bool:
+        """REUSE-TEXT-IDS-1007 (upstream ``_can_reuse_text_only_prompt_ids``).
+
+        A multimodal model's text-only request leaves the chat template as ids,
+        is decoded to text here and encoded again by the tokenizer manager.
+        Handing the ids on skips the second encode -- the same ids exactly when
+        ``encode(decode(ids)) == ids``. Armed only with
+        ``SGLANG_ENABLE_REUSE_TEXT_ONLY_PROMPT_IDS`` on group D, and only when
+        both probes say the round trip loses nothing: upstream's (rendering to
+        text and encoding equals encoding straight to ids) and the decode one
+        (the text path re-encodes the DECODED prompt)."""
+        if not envs.SGLANG_ENABLE_REUSE_TEXT_ONLY_PROMPT_IDS.get():
+            return False
+        if os.environ.get("SGLANG_WEG2_GROUP", "").strip().upper() != "D":
+            return False
+        if self._tokenizer_auto_adds_specials:
+            reason = "the tokenizer adds specials to every encode"
+        elif self._probe_prompt_text_round_trip():
+            reason = "rendering to text and re-encoding is lossy"
+        elif self._probe_decode_round_trip():
+            reason = "encode(decode(ids)) != ids"
+        else:
+            reason = ""
+        logger.info(
+            "REUSE-TEXT-IDS-1007 %s",
+            (
+                f"not armed: {reason}"
+                if reason
+                else "armed: text-only chat requests pass their rendered ids "
+                "to the tokenizer manager"
+            ),
+        )
+        return not reason
+
+    def _probe_prompt_text_round_trip(self) -> bool:
+        """Does rendering the chat template to text and re-encoding lose anything?
+
+        mistral_common tokenizers emit control tokens ([INST],
+        [AVAILABLE_TOOLS], ...) that have no text form. Rendering to a string
+        turns them into literal characters and re-encoding also prepends a
+        second BOS, so the model sees the letters "AVAILABLE_TOOLS" instead of
+        the control token that frames the tool block. Encoding straight to ids
+        is the only faithful route on such tokenizers, so compare the two here
+        once and remember which to trust.
+        """
+        probe = [{"role": "user", "content": "x"}]
+        try:
+            tokenizer = self.tokenizer_manager.tokenizer
+            rendered = tokenizer.apply_chat_template(
+                probe, tokenize=False, add_generation_prompt=True, return_dict=False
+            )
+            encode_kwargs = (
+                {"add_special_tokens": False}
+                if self._tokenizer_auto_adds_specials
+                else {}
+            )
+            via_text = tokenizer.encode(rendered, **encode_kwargs)
+            via_ids = tokenizer.apply_chat_template(
+                probe, tokenize=True, add_generation_prompt=True, return_dict=False
+            )
+            return list(via_text) != list(via_ids)
+        except Exception:
+            # A template that needs kwargs this probe does not supply tells us
+            # nothing; keep the long-standing text path.
+            return False
+
+    def _probe_decode_round_trip(self) -> bool:
+        """REUSE-TEXT-IDS-1007: True when the text path would re-encode the
+        decoded probe prompt to other ids. Unknown (the probe raised) counts as
+        lossy: the ids are reused only where the round trip is shown sound."""
+        probe = [{"role": "user", "content": self._DECODE_ROUND_TRIP_PROBE}]
+        try:
+            tokenizer = self.tokenizer_manager.tokenizer
+            rendered = tokenizer.apply_chat_template(
+                probe, tokenize=False, add_generation_prompt=True, return_dict=False
+            )
+            ids = list(tokenizer.encode(rendered))
+            return list(tokenizer.encode(tokenizer.decode(ids))) != ids
+        except Exception:
+            return True
+
+    def _can_reuse_text_only_prompt_ids(
+        self,
+        processed_messages: MessageProcessingResult,
+        is_multimodal: bool,
+        request: ChatCompletionRequest,
+    ) -> bool:
+        """Upstream's conditions, plus two of this fork's: no continued final
+        message (its prefix ids are appended to the render's, the decoded text
+        may re-encode across that seam differently) and no #1442 hand-off for
+        the rid (group D's leg 2 takes P's ids, as before)."""
+        if not self._reuse_text_only_prompt_ids:
+            return False
+        # Moss-VL invokes its processor for text-only requests, and that processor
+        # requires the rendered text rather than pre-tokenized ids.
+        is_moss_vl = (
+            "MossVLForConditionalGeneration"
+            in self.tokenizer_manager.model_config.hf_config.architectures
+        )
+        return (
+            is_multimodal
+            and not is_moss_vl
+            and self.chat_encoding_spec is None
+            and self.template_manager.chat_template_name is None
+            and not self._tokenizer_auto_adds_specials
+            and not request.continue_final_message
+            and isinstance(processed_messages.prompt_ids, list)
+            and bool(processed_messages.prompt_ids)
+            and not processed_messages.image_data
+            and not processed_messages.video_data
+            and not processed_messages.audio_data
+            and not processed_messages.modalities
+            and not weg2_handoff.exists(request.rid)
+        )
 
     def _handle_last_assistant_message(
         self,
@@ -621,7 +751,9 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
-        if request.input_ids is not None:
+        if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
+            processed_messages, is_multimodal, request
+        ):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}

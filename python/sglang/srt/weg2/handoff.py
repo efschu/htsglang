@@ -79,6 +79,14 @@ def write(rid: str, input_ids: Sequence[int], page_keys: Sequence[str]) -> bool:
         return False
 
 
+def exists(rid: Optional[str]) -> bool:
+    """A hand-off for this rid is waiting (REUSE-TEXT-IDS-1007: D's chat serving
+    leaves such a request on the text path, whose tokenizer manager takes P's
+    ids). No file read, one stat."""
+    p = path(rid) if isinstance(rid, str) else ""
+    return bool(p) and os.path.exists(p)
+
+
 def read(rid: str) -> Optional[dict]:
     p = path(rid)
     if not p or not os.path.exists(p):
