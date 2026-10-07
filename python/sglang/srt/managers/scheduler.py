@@ -4756,13 +4756,24 @@ class Scheduler(
             return
         from sglang.srt.managers import tp_match_floor as _tmf
 
-        _tmf.form_a_extend_set_check(
+        follow = _tmf.form_a_extend_set_check(
             _tmf.form_a_extend_set(can_run_list),
             is_host=is_host,
             exchange=lambda p: self._form_a_tp_exchange(
                 "form-a-admission/tp<-extend-set", p
             ),
+            # H105f: this rank's prompt length per entry -- a difference in the
+            # end of a chunk that stays chunked is the host's to decide
+            fill_lens=[
+                len(getattr(r, "full_untruncated_fill_ids", ()) or ())
+                for r in can_run_list
+            ],
         )
+        if follow:
+            for r in can_run_list:
+                end = follow.get(str(getattr(r, "rid", "?")))
+                if end is not None:
+                    r.set_extend_range(int(r.extend_range.start), int(end))
 
     def init_request_receiver(self) -> None:
         # #1233 (WEG 2, S0): both were built only under the flip, to let an

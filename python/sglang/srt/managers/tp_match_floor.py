@@ -1325,11 +1325,53 @@ def form_a_extend_set(reqs: Sequence[Any]) -> List[tuple]:
     return out
 
 
-def form_a_extend_set_check(local: Sequence[tuple], *, is_host: bool, exchange: Any) -> None:
+def _chunk_end_follow(local: Sequence[tuple], host: Sequence[tuple],
+                      fill_lens: Optional[Sequence[int]]) -> Optional[dict]:
+    """H105f: ``{rid: host end}`` when the two extend sets differ ONLY in the end
+    of non-final chunks, else None (the named stop stays).
+
+    The width of a chunk that does not reach the end of the prompt is not a
+    group-uniform number on a Form A group: ``PrefillAdder.add_chunked_req``
+    takes ``min(rem_chunk_tokens, int(rem_total_tokens))``, the second term being
+    this rank's own available + evictable, which the host and the workers do not
+    share under the token cut. NF cand4 ytwa2e (D 00:41:55Z, weg2-82-573): host
+    (33280, 35840), workers (33280, 35828). Like every other admission decision
+    on this group the host's is the group's. Same size, same rids in the same
+    order, same starts, and both ends short of the prompt's end (the request
+    stays chunked on every rank); a final chunk or any other difference is a
+    different batch, not a width."""
+    if fill_lens is None or len(fill_lens) != len(local) or len(host) != len(local):
+        return None
+    out = {}
+    for (rid, start, end), (hrid, hstart, hend), fill in zip(local, host, fill_lens):
+        if rid != hrid or start is None or end is None or hstart is None or hend is None:
+            return None
+        if start != hstart:
+            return None
+        if end == hend:
+            continue
+        if not (start < end < int(fill) and start < hend < int(fill)):
+            return None
+        out[str(rid)] = int(hend)
+    return out
+
+
+def form_a_extend_set_check(
+    local: Sequence[tuple],
+    *,
+    is_host: bool,
+    exchange: Any,
+    fill_lens: Optional[Sequence[int]] = None,
+) -> Optional[dict]:
     """The riegel after the admission loop: the host's built extend set
     (rid, start, end) against this rank's. A difference is a named stop here,
     before the forward it would otherwise hang (dpr: the workers inside the
-    extend's collectives, the host in a decode pass)."""
+    extend's collectives, the host in a decode pass).
+
+    H105f: with ``fill_lens`` (this rank's prompt length per entry, same order)
+    a difference in the END of non-final chunks alone is not a stop: the return
+    is ``{rid: the host's end}`` for the caller to apply (None when the sets are
+    equal)."""
     local = [tuple(x) for x in local]
     got = exchange(list(local) if is_host else None)
     if not isinstance(got, list):
@@ -1341,6 +1383,20 @@ def form_a_extend_set_check(local: Sequence[tuple], *, is_host: bool, exchange: 
         )
     host = [tuple(x) for x in got]
     if host != local:
+        follow = None if is_host else _chunk_end_follow(local, host, fill_lens)
+        if follow:
+            _STATS["chunk_end_follow"] = _STATS.get("chunk_end_follow", 0) + 1
+            n = _STATS["chunk_end_follow"]
+            if n <= 20 or (n & (n - 1)) == 0:
+                logger.warning(
+                    "H105f FORM-A CHUNK-END FOLLOW host=%s local=%s (n=%d): the "
+                    "chunk width of a request that stays chunked is the attention "
+                    "host's -- this rank's pool term in add_chunked_req "
+                    "(min(rem_chunk_tokens, int(rem_total_tokens))) is its own, "
+                    "not the group's; it takes the host's end",
+                    host[:6], local[:6], n,
+                )
+            return follow
         raise FormAAdmissionSplit(
             f"H105 RU FORM-A EXTEND-SET SPLIT host={host[:6]} local={local[:6]} "
             f"(n_host={len(host)} n_local={len(local)}): this rank built a "
@@ -1348,6 +1404,7 @@ def form_a_extend_set_check(local: Sequence[tuple], *, is_host: bool, exchange: 
             "would pair a decode with an extend -- stopping by name instead "
             "(raenge-nie-uneins)."
         )
+    return None
 
 
 # --------------------------------------------------------------------------
