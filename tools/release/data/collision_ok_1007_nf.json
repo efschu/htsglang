@@ -1,0 +1,192 @@
+{
+ "python/sglang/srt/environ.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/managers/scheduler.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/managers/scheduler_components/weight_updater.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/managers/weg2_sleep_drain.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/planner/profile_couplings.py": [
+  "flliper"
+ ],
+ "python/sglang/srt/rigmon/card_probe.py": [
+  "flliper"
+ ],
+ "python/sglang/srt/rigmon/hardware_profile.py": [
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/front.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/weg2/kantenkatalog_1004.json": [
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/model_profile.py": [
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/profile_catalog.py": [
+  "FLLIPER_",
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/profile_json.py": [
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/progress_beacon.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/weg2/propose.py": [
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/propose_dual.py": [
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/propose_oracle.py": [
+  "FLLIPER_",
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/propose_rules.py": [
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/propose_single.py": [
+  "flliper"
+ ],
+ "python/sglang/srt/weg2/propose_verdict.py": [
+  "flliper"
+ ],
+ "test/registered/unit/planner/test_profile_balken_aph2_1006.py": [
+  "flliper"
+ ],
+ "test/registered/unit/rigmon/test_hardware_profile_950.py": [
+  "flliper"
+ ],
+ "test/registered/unit/rigmon/test_hardware_profile_persist_1006.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_entrypoint_profil_force_930.py": [
+  "pdflip"
+ ],
+ "test/registered/unit/weg2/test_kantenkatalog_1433.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_pdflip_parked_prefetch_1002.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_planer_apb_modell_1006.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_planer_apc_propose_1006.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_planer_apd_formen_1006.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_planer_referenz_n3_1006.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_profil_s3_modell_1003.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_profile_catalog_union_1005.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_profile_json_1003.py": [
+  "flliper"
+ ],
+ "test/registered/unit/weg2/test_weg2_flipzeit_dp_ppfwd_1002.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_weg2_release_flush_dedup_1002.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_weg2_scheduling_slice_a_0907.py": [
+  "PDFLIP"
+ ],
+ "tools/rig_dashboard/entrypoint_rigdash.sh": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/kartenplan_build/oracle_worker.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/README.md": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/deploy/install_510.sh": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/deploy/stage_profil_modules.sh": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/hwprofil.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/ipcboot.py": [
+  "PDFLIP"
+ ],
+ "tools/rig_dashboard/rigdash/modellprofil.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/profil.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/profil_data/catalog.json": [
+  "PDFLIP",
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/profil_recompute.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/server.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_catalog.py": [
+  "FLLIPER_",
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_json.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/fixtures/modellprofil/planner_tree/python/sglang/srt/weg2/model_profile.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_couplings_bridge_1431.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_hwprofil_950.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_hwprofil_apa_1006.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_modellprofil_960.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_profil_balken_1432.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_profil_balken_aph2_1006.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_profil_issue_laufbericht_1006.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_profil_release_edition_1984.py": [
+  "flliper"
+ ]
+}

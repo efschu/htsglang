@@ -1,0 +1,1335 @@
+{
+ "_comment": "F0-A 07.10.2026: ident_precheck.py of data/ident_map_1007.json (+ identfix_map.json as merged base, --web) against the committed trees of the 27B head 07c20a35e5 and the NF head c5da548b7c. collisions = strict ident_fix rule, collisions_refined = only where a merge is possible; conflicts = other kit tables; unreached = file types ident_fix does not rewrite (.cu/.h/.c/.service/.gitignore/.jsonl); file_stem = renamed with git mv.",
+ "27b": {
+  "tree": "07c20a35e5",
+  "summary": {
+   "collisions": 157,
+   "collisions_refined": 62,
+   "dup_target": 1,
+   "conflicts": 6,
+   "words_with_dir_component": 0,
+   "words_with_file_stem": 4,
+   "words_with_unreached_files": 9,
+   "unreached_files": 7
+  },
+  "collisions_refined": [
+   {
+    "file": "python/sglang/srt/weg2/launcher.py",
+    "old": "grund",
+    "new": "reason",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_single.py",
+    "old": "grund",
+    "new": "reason",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "test/registered/unit/distributed/_bar1_marker_source.py",
+    "old": "grund",
+    "new": "reason",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "grund",
+    "new": "reason",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "docker/weg2-release/entrypoint.sh",
+    "old": "BAUM",
+    "new": "TREE",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py",
+    "old": "FORMEN",
+    "new": "FORMS",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/profile_catalog.py",
+    "old": "baeume",
+    "new": "trees",
+    "as": [
+     "name",
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil_data/catalog.json",
+    "old": "baeume",
+    "new": "trees",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_balken.js",
+    "old": "balken",
+    "new": "bar",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "docker/weg2-release/entrypoint.sh",
+    "old": "baum",
+    "new": "tree",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "docker/weg2-release/test_rigdash_ctx_1995.sh",
+    "old": "baum",
+    "new": "tree",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/profile_catalog.py",
+    "old": "baum",
+    "new": "tree",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "baum",
+    "new": "tree",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "scripts/nvfp4/launch_when_free.sh",
+    "old": "beleg",
+    "new": "evidence",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/index.html",
+    "old": "beleg",
+    "new": "evidence",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/profile_catalog.py",
+    "old": "datei",
+    "new": "file",
+    "as": [
+     "name",
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil_data/catalog.json",
+    "old": "datei",
+    "new": "file",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "datei",
+    "new": "file",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_catalog.py",
+    "old": "datei",
+    "new": "file",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "ebene",
+    "new": "level",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "ebene",
+    "new": "level",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "eintraege",
+    "new": "entries",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "einzel",
+    "new": "single",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "einzel",
+    "new": "single",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "geaendert",
+    "new": "changed",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "geaendert",
+    "new": "changed",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "herkunft",
+    "new": "source",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "herkunft",
+    "new": "source",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "hinweis",
+    "new": "note",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/modellprofil.js",
+    "old": "hinweis",
+    "new": "note",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "hinweise",
+    "new": "notes",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "hinweise",
+    "new": "notes",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "hinweise",
+    "new": "notes",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "klasse",
+    "new": "class",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "scripts/probe/crossrig_ladder_run.sh",
+    "old": "klasse",
+    "new": "class",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "konsequenz",
+    "new": "consequence",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "konsequenz",
+    "new": "consequence",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "orakel",
+    "new": "oracle",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "orakel",
+    "new": "oracle",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "test/registered/unit/weg2/test_planer_ape_dual_1006.py",
+    "old": "passung",
+    "new": "fit",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "profil_wert",
+    "new": "profile_value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_dual.py",
+    "old": "schnitt",
+    "new": "cut",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "test/registered/unit/weg2/test_planer_ape_dual_1006.py",
+    "old": "schnitt",
+    "new": "cut",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/index.html",
+    "old": "titel",
+    "new": "title",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "verdikt",
+    "new": "verdict",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "verdikt",
+    "new": "verdict",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "verdikt",
+    "new": "verdict",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/features.py",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/index.html",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "werte",
+    "new": "values",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/features_update.py",
+    "old": "werte",
+    "new": "values",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "werte",
+    "new": "values",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py",
+    "old": "werte",
+    "new": "values",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_single.py",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "name",
+     "string"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "scripts/translator/wait_for_cards.sh",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "name"
+    ]
+   }
+  ],
+  "conflicts": [
+   {
+    "table": "merged_0928.json",
+    "key": "verdikt",
+    "this": "verdict",
+    "other": "budget_verdict"
+   },
+   {
+    "table": "merged_0928.json",
+    "key": "frei_mib",
+    "this": "free_mib",
+    "same_target_as": "frei"
+   },
+   {
+    "table": "merged_0928.json",
+    "key": "herkunft",
+    "this": "source",
+    "same_target_as": "quelle"
+   },
+   {
+    "table": "merged_0928.json",
+    "key": "verdikt",
+    "this": "verdict",
+    "same_target_as": "urteil"
+   },
+   {
+    "table": "identfix_map.json",
+    "key": "grund",
+    "this": "reason",
+    "other": "refuse_reason"
+   },
+   {
+    "table": "identfix_map.json",
+    "key": "seed_wert",
+    "this": "seed_value",
+    "same_target_as": "keim"
+   }
+  ],
+  "dup_target": [
+   {
+    "new": "seed_value",
+    "old": [
+     "keim",
+     "seed_wert"
+    ]
+   }
+  ],
+  "unreached": {
+   "abbruch": [
+    "scripts/probe/ramrelay.cu"
+   ],
+   "folge": [
+    "test/registered/unit/distributed/fixtures/gpu_battery/s12_wait_analyse/punkte.jsonl"
+   ],
+   "punkte": [
+    ".gitignore"
+   ],
+   "Daten": [
+    "scripts/probe/ramrelay.cu"
+   ],
+   "Orakel": [
+    "tools/rig_dashboard/rigdash/deploy/rig-dashboard.service"
+   ],
+   "Spitze": [
+    "tools/rig_dashboard/rigdash/deploy/rig-dashboard.service"
+   ],
+   "braucht": [
+    "scripts/probe/gpurdma_04_bench.c",
+    "scripts/probe/p2pproof.cu",
+    "scripts/probe/ramrelay.cu"
+   ],
+   "erreicht": [
+    "python/sglang/srt/weg2/tms_csrc/utils.h"
+   ],
+   "verdikt": [
+    "scripts/probe/p2pproof.cu"
+   ]
+  },
+  "file_stem": {
+   "punkte": [
+    "test/registered/unit/distributed/fixtures/gpu_battery/s12_wait_analyse/punkte.jsonl"
+   ],
+   "s12_prefill_kurve": [
+    "scripts/gpu_battery/s12_prefill_kurve.py",
+    "scripts/gpu_battery/s12_prefill_kurve.sh"
+   ],
+   "profil_oracle": [
+    "tools/rig_dashboard/rigdash/profil_oracle.py"
+   ],
+   "profil_recompute": [
+    "tools/rig_dashboard/rigdash/profil_recompute.py"
+   ]
+  },
+  "dir_component": {},
+  "strict_collision_files": [
+   "docker/weg2-release/entrypoint.sh",
+   "docker/weg2-release/test_rigdash_ctx_1995.sh",
+   "python/sglang/srt/managers/scheduler.py",
+   "python/sglang/srt/planner/power_limit.py",
+   "python/sglang/srt/planner/profile_couplings.py",
+   "python/sglang/srt/weg2/form.py",
+   "python/sglang/srt/weg2/kantenkatalog_1004.json",
+   "python/sglang/srt/weg2/launcher.py",
+   "python/sglang/srt/weg2/model_profile.py",
+   "python/sglang/srt/weg2/profile_catalog.py",
+   "python/sglang/srt/weg2/propose.py",
+   "python/sglang/srt/weg2/propose_dual.py",
+   "python/sglang/srt/weg2/propose_single.py",
+   "python/sglang/srt/weg2/propose_verdict.py",
+   "python/sglang/srt/weg2/wake_credit.py",
+   "python/sglang/srt/weg2/wake_credit_pd.py",
+   "scripts/nvfp4/launch_when_free.sh",
+   "scripts/probe/crossrig_ladder_run.sh",
+   "scripts/translator/wait_for_cards.sh",
+   "test/registered/unit/distributed/_bar1_marker_source.py",
+   "test/registered/unit/planner/test_profile_balken_aph2_1006.py",
+   "test/registered/unit/weg2/test_planer_apc_propose_1006.py",
+   "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py",
+   "test/registered/unit/weg2/test_planer_ape_dual_1006.py",
+   "test/registered/unit/weg2/test_planer_nacharbeit_1006.py",
+   "test/registered/unit/weg2/test_profile_erklaert_1005.py",
+   "test/registered/unit/weg2/test_weg2_power_limit_h57.py",
+   "tools/rig_dashboard/rigdash/README.md",
+   "tools/rig_dashboard/rigdash/features.py",
+   "tools/rig_dashboard/rigdash/features_update.py",
+   "tools/rig_dashboard/rigdash/ipcfields.py",
+   "tools/rig_dashboard/rigdash/kartenplan.py",
+   "tools/rig_dashboard/rigdash/kartenplan_catalog.py",
+   "tools/rig_dashboard/rigdash/kartenplan_preview.py",
+   "tools/rig_dashboard/rigdash/modellprofil.py",
+   "tools/rig_dashboard/rigdash/profil.py",
+   "tools/rig_dashboard/rigdash/profil_data/catalog.json",
+   "tools/rig_dashboard/rigdash/redact.py",
+   "tools/rig_dashboard/rigdash/server.py",
+   "tools/rig_dashboard/rigdash/static/hwprofil.js",
+   "tools/rig_dashboard/rigdash/static/index.html",
+   "tools/rig_dashboard/rigdash/static/modellprofil.js",
+   "tools/rig_dashboard/rigdash/static/profil.js",
+   "tools/rig_dashboard/rigdash/static/profil_balken.js",
+   "tools/rig_dashboard/rigdash/static/profil_planer.js",
+   "tools/rig_dashboard/rigdash/static/zoom.js",
+   "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_catalog.py",
+   "tools/rig_dashboard/rigdash/tests/fixtures/modellprofil/planner_tree/python/sglang/srt/weg2/model_profile.py",
+   "tools/rig_dashboard/rigdash/tests/test_ipcfields_0929.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_balken_aph2_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_dual_linie_1007.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_force_katalog_2002.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_rigdash.py"
+  ]
+ },
+ "nf": {
+  "tree": "c5da548b7c",
+  "summary": {
+   "collisions": 154,
+   "collisions_refined": 59,
+   "dup_target": 1,
+   "conflicts": 6,
+   "words_with_dir_component": 0,
+   "words_with_file_stem": 4,
+   "words_with_unreached_files": 9,
+   "unreached_files": 7
+  },
+  "collisions_refined": [
+   {
+    "file": "python/sglang/srt/weg2/launcher.py",
+    "old": "grund",
+    "new": "reason",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_single.py",
+    "old": "grund",
+    "new": "reason",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "test/registered/unit/distributed/_bar1_marker_source.py",
+    "old": "grund",
+    "new": "reason",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "grund",
+    "new": "reason",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py",
+    "old": "FORMEN",
+    "new": "FORMS",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/profile_catalog.py",
+    "old": "baeume",
+    "new": "trees",
+    "as": [
+     "name",
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil_data/catalog.json",
+    "old": "baeume",
+    "new": "trees",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_balken.js",
+    "old": "balken",
+    "new": "bar",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/profile_catalog.py",
+    "old": "baum",
+    "new": "tree",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "baum",
+    "new": "tree",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "scripts/nvfp4/launch_when_free.sh",
+    "old": "beleg",
+    "new": "evidence",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/index.html",
+    "old": "beleg",
+    "new": "evidence",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/profile_catalog.py",
+    "old": "datei",
+    "new": "file",
+    "as": [
+     "name",
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil_data/catalog.json",
+    "old": "datei",
+    "new": "file",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "datei",
+    "new": "file",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_catalog.py",
+    "old": "datei",
+    "new": "file",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "ebene",
+    "new": "level",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "ebene",
+    "new": "level",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "eintraege",
+    "new": "entries",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "einzel",
+    "new": "single",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "einzel",
+    "new": "single",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "geaendert",
+    "new": "changed",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "geaendert",
+    "new": "changed",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "herkunft",
+    "new": "source",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "herkunft",
+    "new": "source",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "hinweis",
+    "new": "note",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/modellprofil.js",
+    "old": "hinweis",
+    "new": "note",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "hinweise",
+    "new": "notes",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "hinweise",
+    "new": "notes",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "hinweise",
+    "new": "notes",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "klasse",
+    "new": "class",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "scripts/probe/crossrig_ladder_run.sh",
+    "old": "klasse",
+    "new": "class",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "konsequenz",
+    "new": "consequence",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "konsequenz",
+    "new": "consequence",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "orakel",
+    "new": "oracle",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "orakel",
+    "new": "oracle",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "test/registered/unit/weg2/test_planer_ape_dual_1006.py",
+    "old": "passung",
+    "new": "fit",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "profil_wert",
+    "new": "profile_value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_dual.py",
+    "old": "schnitt",
+    "new": "cut",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "test/registered/unit/weg2/test_planer_ape_dual_1006.py",
+    "old": "schnitt",
+    "new": "cut",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/index.html",
+    "old": "titel",
+    "new": "title",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "verdikt",
+    "new": "verdict",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "verdikt",
+    "new": "verdict",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "verdikt",
+    "new": "verdict",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/README.md",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/features.py",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/index.html",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil.js",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "wert",
+    "new": "value",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "werte",
+    "new": "values",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/features_update.py",
+    "old": "werte",
+    "new": "values",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "werte",
+    "new": "values",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py",
+    "old": "werte",
+    "new": "values",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_single.py",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "name",
+     "string"
+    ]
+   },
+   {
+    "file": "python/sglang/srt/weg2/propose_verdict.py",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "scripts/translator/wait_for_cards.sh",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "name"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/profil.py",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "string"
+    ]
+   },
+   {
+    "file": "tools/rig_dashboard/rigdash/static/profil_planer.js",
+    "old": "zustand",
+    "new": "state",
+    "as": [
+     "name"
+    ]
+   }
+  ],
+  "conflicts": [
+   {
+    "table": "merged_0928.json",
+    "key": "verdikt",
+    "this": "verdict",
+    "other": "budget_verdict"
+   },
+   {
+    "table": "merged_0928.json",
+    "key": "frei_mib",
+    "this": "free_mib",
+    "same_target_as": "frei"
+   },
+   {
+    "table": "merged_0928.json",
+    "key": "herkunft",
+    "this": "source",
+    "same_target_as": "quelle"
+   },
+   {
+    "table": "merged_0928.json",
+    "key": "verdikt",
+    "this": "verdict",
+    "same_target_as": "urteil"
+   },
+   {
+    "table": "identfix_map.json",
+    "key": "grund",
+    "this": "reason",
+    "other": "refuse_reason"
+   },
+   {
+    "table": "identfix_map.json",
+    "key": "seed_wert",
+    "this": "seed_value",
+    "same_target_as": "keim"
+   }
+  ],
+  "dup_target": [
+   {
+    "new": "seed_value",
+    "old": [
+     "keim",
+     "seed_wert"
+    ]
+   }
+  ],
+  "unreached": {
+   "abbruch": [
+    "scripts/probe/ramrelay.cu"
+   ],
+   "folge": [
+    "test/registered/unit/distributed/fixtures/gpu_battery/s12_wait_analyse/punkte.jsonl"
+   ],
+   "punkte": [
+    ".gitignore"
+   ],
+   "Daten": [
+    "scripts/probe/ramrelay.cu"
+   ],
+   "Orakel": [
+    "tools/rig_dashboard/rigdash/deploy/rig-dashboard.service"
+   ],
+   "Spitze": [
+    "tools/rig_dashboard/rigdash/deploy/rig-dashboard.service"
+   ],
+   "braucht": [
+    "scripts/probe/gpurdma_04_bench.c",
+    "scripts/probe/p2pproof.cu",
+    "scripts/probe/ramrelay.cu"
+   ],
+   "erreicht": [
+    "python/sglang/srt/weg2/tms_csrc/utils.h"
+   ],
+   "verdikt": [
+    "scripts/probe/p2pproof.cu"
+   ]
+  },
+  "file_stem": {
+   "punkte": [
+    "test/registered/unit/distributed/fixtures/gpu_battery/s12_wait_analyse/punkte.jsonl"
+   ],
+   "s12_prefill_kurve": [
+    "scripts/gpu_battery/s12_prefill_kurve.py",
+    "scripts/gpu_battery/s12_prefill_kurve.sh"
+   ],
+   "profil_oracle": [
+    "tools/rig_dashboard/rigdash/profil_oracle.py"
+   ],
+   "profil_recompute": [
+    "tools/rig_dashboard/rigdash/profil_recompute.py"
+   ]
+  },
+  "dir_component": {},
+  "strict_collision_files": [
+   "python/sglang/srt/managers/scheduler.py",
+   "python/sglang/srt/planner/power_limit.py",
+   "python/sglang/srt/planner/profile_couplings.py",
+   "python/sglang/srt/weg2/form.py",
+   "python/sglang/srt/weg2/kantenkatalog_1004.json",
+   "python/sglang/srt/weg2/launcher.py",
+   "python/sglang/srt/weg2/model_profile.py",
+   "python/sglang/srt/weg2/profile_catalog.py",
+   "python/sglang/srt/weg2/propose.py",
+   "python/sglang/srt/weg2/propose_dual.py",
+   "python/sglang/srt/weg2/propose_single.py",
+   "python/sglang/srt/weg2/propose_verdict.py",
+   "python/sglang/srt/weg2/wake_credit.py",
+   "python/sglang/srt/weg2/wake_credit_pd.py",
+   "scripts/nvfp4/launch_when_free.sh",
+   "scripts/probe/crossrig_ladder_run.sh",
+   "scripts/translator/wait_for_cards.sh",
+   "test/registered/unit/distributed/_bar1_marker_source.py",
+   "test/registered/unit/planner/test_profile_balken_aph2_1006.py",
+   "test/registered/unit/weg2/test_planer_apc_propose_1006.py",
+   "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py",
+   "test/registered/unit/weg2/test_planer_ape_dual_1006.py",
+   "test/registered/unit/weg2/test_planer_nacharbeit_1006.py",
+   "test/registered/unit/weg2/test_profile_erklaert_1005.py",
+   "test/registered/unit/weg2/test_weg2_power_limit_h57.py",
+   "tools/rig_dashboard/rigdash/README.md",
+   "tools/rig_dashboard/rigdash/features.py",
+   "tools/rig_dashboard/rigdash/features_update.py",
+   "tools/rig_dashboard/rigdash/ipcfields.py",
+   "tools/rig_dashboard/rigdash/kartenplan.py",
+   "tools/rig_dashboard/rigdash/kartenplan_catalog.py",
+   "tools/rig_dashboard/rigdash/kartenplan_preview.py",
+   "tools/rig_dashboard/rigdash/modellprofil.py",
+   "tools/rig_dashboard/rigdash/profil.py",
+   "tools/rig_dashboard/rigdash/profil_data/catalog.json",
+   "tools/rig_dashboard/rigdash/redact.py",
+   "tools/rig_dashboard/rigdash/server.py",
+   "tools/rig_dashboard/rigdash/static/hwprofil.js",
+   "tools/rig_dashboard/rigdash/static/index.html",
+   "tools/rig_dashboard/rigdash/static/modellprofil.js",
+   "tools/rig_dashboard/rigdash/static/profil.js",
+   "tools/rig_dashboard/rigdash/static/profil_balken.js",
+   "tools/rig_dashboard/rigdash/static/profil_planer.js",
+   "tools/rig_dashboard/rigdash/static/zoom.js",
+   "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_catalog.py",
+   "tools/rig_dashboard/rigdash/tests/fixtures/modellprofil/planner_tree/python/sglang/srt/weg2/model_profile.py",
+   "tools/rig_dashboard/rigdash/tests/test_ipcfields_0929.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_balken_aph2_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_dual_linie_1007.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_force_katalog_2002.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py",
+   "tools/rig_dashboard/rigdash/tests/test_rigdash.py"
+  ]
+ },
+ "27b_without_web": {
+  "summary": {
+   "collisions": 129,
+   "dup_target": 1,
+   "conflicts": 0,
+   "words_with_dir_component": 0,
+   "words_with_file_stem": 4,
+   "words_with_unreached_files": 72,
+   "unreached_files": 18
+  },
+  "unreached_js_html": [
+   "python/sglang/srt/translator/client/index.dev.html",
+   "python/sglang/srt/translator/client/index.html",
+   "tools/rig_dashboard/rigdash/static/grafik.js",
+   "tools/rig_dashboard/rigdash/static/hwprofil.js",
+   "tools/rig_dashboard/rigdash/static/index.html",
+   "tools/rig_dashboard/rigdash/static/kartenplan.js",
+   "tools/rig_dashboard/rigdash/static/modellprofil.js",
+   "tools/rig_dashboard/rigdash/static/profil.js",
+   "tools/rig_dashboard/rigdash/static/profil_balken.js",
+   "tools/rig_dashboard/rigdash/static/profil_planer.js",
+   "tools/rig_dashboard/rigdash/static/zoom.js"
+  ]
+ }
+}
