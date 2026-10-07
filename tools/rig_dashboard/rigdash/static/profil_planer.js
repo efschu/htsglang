@@ -5,7 +5,7 @@
    Die Datei hat kein DOM und kein Netz (Node-testbar); profil.js verdrahtet sie.
 
    Zustand je Wert (der Seite, nicht des Launchers): vorgeschlagen | unbelegt | vom Launcher gelöst | von Ihnen übersteuert | Profil.
-   Verdikt je Wert: geht | nur mit --force | verweigert | Hinweis | Force ungeprüft | nicht geprüft | ungeprüft seit Ihrer Änderung.
+   Verdikt je Wert (chipFor, Tabelle dort): geht | nur mit --force | verweigert | Hinweis | Force ungeprüft | nicht beurteilt | Planer-Rechnung | Orakel-Fehler | kein Lauf | ungeprüft seit Ihrer Änderung.
    Ein Verdikt ist ein HINWEIS, nie eine Sperre (Nutzerentscheid 4a, Wireframe 13): jedes Feld bleibt bedienbar, Force steht im Export.
 
    ctx = { n, ranks:[{name,mib}], mode:"einfach"|"experte", prop, dry, open:{key:bool}, cmsg:{key,text}|null, hasProfileValues:bool,
@@ -68,31 +68,106 @@
     if (r.absent) return { id: "standard", label: "Standard (nicht im Profil)", tip: "Das Profil setzt diesen Wert nicht; es gilt der Standard des Codes." };
     return { id: "profil", label: "Profil", tip: w && w.herkunft ? w.herkunft : "Wert aus dem geladenen Profil." };
   }
-  /* Verdikte zu einer Zeile: die des Vorschlags (je Wert), sonst die des Trockenlaufs (``werte`` nennt Bezeichnungen; verglichen wird der Flag-/Env-Name) */
+  /* Verdikte zu einer Zeile: die des Vorschlags (je Wert), sonst die des Trockenlaufs (``werte`` nennt Bezeichnungen; verglichen wird der Flag-/Env-Name).
+     ``doc`` = {ausgang, laufEbene} des Dokuments, aus dem die Liste stammt: laufEbene = ALLE Verdikte des Dokuments der Ebene lauf/absturz (nicht nur die des Werts). */
+  const RUN_LEVELS = new Set(["lauf", "absturz"]);
+  const docOf = (ausgang, all) => ({ ausgang, laufEbene: (all || []).filter((v) => RUN_LEVELS.has(v.ebene)) });
   function verdictItems(r, ctx) {
     const w = propEntry(ctx, r.key);
-    if (w && ctx.prop && ctx.vsrc !== "dry") return { list: w.verdikte || [], src: "Vorschlag (Orakel)" };
+    if (w && ctx.prop && ctx.vsrc !== "dry") {
+      const vd = ctx.prop.verdikt || {};
+      return { list: w.verdikte || [], src: "Vorschlag (Orakel)", doc: docOf(vd.ausgang, vd.verdikte) };
+    }
     const d = ctx && ctx.dry && ctx.dry.verdikte;
     if (d) {
       const list = d.filter((v) => (v.werte || []).some((x) => tail(x) === r.name));
-      return { list, src: "Trockenlauf (Orakel)" };
+      return { list, src: "Trockenlauf (Orakel)", doc: docOf((ctx.dry.orakel || {}).ausgang, d) };
     }
     return null;
   }
   const isBlocked = (v) => v.forcebar === false || v.force_state === "blockiert";
   const isForce = (v) => v.forcebar === true && v.force_state === "force";
+
+  /* ------------------------------------------------------------------ chipFor: DIE Chip-Entscheidung je Wert (eine reine Funktion, eine Tabelle)
+     chipFor(ausgang, laufEbene, wertVerdikte, quelle) -> {id, label, tip, code?}
+       ausgang      = Ausgang des Verdikt-Dokuments (``verdikt.ausgang``), undefined = es gibt kein Dokument
+       laufEbene    = die Verdikte des Dokuments der Ebene lauf/absturz (die ganze Liste, nicht die des Werts); ein Verdikt mit durchgelassen === false hat den Lauf BEENDET
+       wertVerdikte = die Verdikte, die diesen Wert nennen (Vorschlag: w.verdikte; Trockenlauf: ``werte`` enthält den Namen)
+       quelle       = "Vorschlag (Orakel)" | "Trockenlauf (Orakel)" (nur für den Tooltip)
+     Die Spalte wählt allein ``wertVerdikte`` (die Rangfolge: ok < verweigert < nur mit --force < Force ungeprüft < Hinweis), die Zeile ``ausgang``.  Nennt ein Verdikt den
+     Wert, gilt SEIN Urteil, in jeder Zeile gleich; nur die Spalte N (nicht genannt) hängt vom Ausgang ab, denn dort entscheidet allein, ob der Lauf den Wert gesehen hat.
+
+     Ausgang \ Wert        | N: nicht genannt                              | OK: genannt, ok | F: verweigert, forcebar | B: verweigert, nicht forcebar | H: Hinweis | U: Force ungeprüft
+     ----------------------+-----------------------------------------------+-----------------+-------------------------+-------------------------------+------------+--------------------
+     geht                  | geht                                          | geht            | nur mit --force         | verweigert                    | Hinweis    | Force ungeprüft
+     geht_mit_force        | geht (durchgelaufen, Force nur am Start) [1]  | geht            | nur mit --force         | verweigert                    | Hinweis    | Force ungeprüft
+     verweigert            | nicht beurteilt (Lauf verweigert: <Code>) [2] | geht            | nur mit --force         | verweigert                    | Hinweis    | Force ungeprüft
+     absturz               | nicht beurteilt (Lauf verweigert: <Code>) [2] | geht            | nur mit --force         | verweigert                    | Hinweis    | Force ungeprüft
+     orakel_fehler         | Orakel-Fehler                                 | geht            | nur mit --force         | verweigert                    | Hinweis    | Force ungeprüft
+     passt (Einzelkarte)   | Planer-Rechnung: passt                        | geht            | nur mit --force         | verweigert                    | Hinweis    | Force ungeprüft
+     passt_nicht (Einzel.) | Planer-Rechnung: passt nicht                  | geht            | nur mit --force         | verweigert                    | Hinweis    | Force ungeprüft
+     unbelegt (Einzel.)    | Planer-Rechnung: unbelegt                     | geht            | nur mit --force         | verweigert                    | Hinweis    | Force ungeprüft
+     kein_dokument         | kein Lauf                                     | geht            | nur mit --force         | verweigert                    | Hinweis    | Force ungeprüft
+     [1] Ein Lauf mit Ausgang geht_mit_force ist durchgelaufen (rc 0, keine Ausnahme: propose_verdict.py build_verdikt), die geforcten Verdikte tragen durchgelassen=true; der
+         Launcher hat alle späteren Prüfungen gefahren.  Der Hinweis "mit --force" steht auf der STARTEBENE (startChip), nicht je Wert.  Gibt es dennoch ein lauf/absturz-Verdikt mit
+         durchgelassen === false (ein Widerspruch im Dokument), gilt die Zeile verweigert.
+     [2] Nur wenn ein lauf/absturz-Verdikt mit durchgelassen === false den Lauf beendet hat; <Code> = dessen Code.  Fehlt es (Ausgang verweigert/absturz ohne Lauf-Verdikt, ein Defekt des
+         Dokuments), steht "nicht beurteilt (Ausgang: <Ausgang>, ohne Lauf-Verdikt)": nie "geht", nie ein erfundener Code.
+     "Launcher" steht nur in den Zellen, in denen ein Launcher-Lauf gelaufen ist (geht, geht_mit_force, verweigert, absturz); Einzelkarte, Orakel-Fehler und kein Dokument sagen es nicht.
+     Ein unbekannter Ausgang ist kein_dokument.  Die Tabelle steht als TABLE-Test in test_profil_nacharbeit_1006.py (eine Zelle = ein Fall). */
+  const AUSGAENGE = ["geht", "geht_mit_force", "verweigert", "absturz", "orakel_fehler", "passt", "passt_nicht", "unbelegt", "kein_dokument"];
+  const SPALTEN = ["N", "OK", "F", "B", "H", "U"];
+  function spalteOf(wertVerdikte) {
+    const L = wertVerdikte || [];
+    if (!L.length) return "N";
+    if (L.every((v) => v.force_state === "geht")) return "OK";
+    if (L.some(isBlocked)) return "B";
+    if (L.some(isForce)) return "F";
+    if (L.some((v) => v.force_state === "ungeprueft")) return "U";
+    return "H";
+  }
+  const ausgangOf = (a) => (AUSGAENGE.indexOf(a) >= 0 ? a : "kein_dokument");
+  function chipFor(ausgang, laufEbene, wertVerdikte, quelle) {
+    const aus = ausgangOf(ausgang), L = wertVerdikte || [], col = spalteOf(L), q = quelle || "Orakel";
+    if (col !== "N") {
+      const codes = [...new Set(L.map((v) => v.code))];
+      const tip = L.map((v) => v.code + ": " + (v.grund || v.titel || "") + (v.konsequenz ? " Folge: " + v.konsequenz : "")).join("\n");
+      if (col === "OK") return { id: "geht", label: "geht", tip: tip || "Das Orakel (" + q + ") nennt diesen Wert ausdrücklich als ok." };
+      if (col === "B") return { id: "verweigert", label: "verweigert", code: codes.join(", "), tip };
+      if (col === "F") return { id: "force", label: "nur mit --force", code: codes.join(", "), tip };
+      if (col === "U") return { id: "ungeprueft", label: "Force ungeprüft", code: codes.join(", "), tip };
+      return { id: "hinweis", label: "Hinweis", code: codes.join(", "), tip };
+    }
+    const stop = (laufEbene || []).filter((v) => v.durchgelassen === false);
+    const stopCodes = [...new Set(stop.map((v) => v.code))].join(", ");
+    if (aus === "geht" || (aus === "geht_mit_force" && !stop.length)) {
+      return { id: "geht", label: "geht", tip: aus === "geht"
+        ? "Der Launcher-Lauf (" + q + ") ging ohne Verweigerung durch; kein Verdikt nennt diesen Wert."
+        : "Der Launcher-Lauf (" + q + ") ging durch, weil Force die Werteverweigerungen übergangen hat; danach hat der Launcher alle weiteren Prüfungen gefahren und diesen Wert nicht beanstandet. Dass der Start --force braucht, steht am Start, nicht an diesem Wert." };
+    }
+    if (aus === "verweigert" || aus === "absturz" || aus === "geht_mit_force") {
+      if (stop.length) return { id: "nichtbeurteilt", label: "nicht beurteilt (Lauf verweigert: " + stopCodes + ")", tip: "Der Launcher-Lauf (" + q + ") ist bei " + stopCodes + " abgebrochen" + (aus === "absturz" ? " (abgestürzt)" : "") + "; was dahinter geprüft wird, hat er für diesen Wert nie gesehen. Erst wenn das behoben oder übergangen ist, sagt ein neuer Lauf etwas zu ihm." };
+      return { id: "nichtbeurteilt", label: "nicht beurteilt (Ausgang: " + aus + ", ohne Lauf-Verdikt)", tip: "Das Dokument (" + q + ") meldet den Ausgang " + aus + ", nennt aber kein Verdikt, das den Lauf beendet hat; es gibt kein Urteil zu diesem Wert." };
+    }
+    if (aus === "orakel_fehler") return { id: "orakelfehler", label: "Orakel-Fehler", tip: "Das Orakel selbst ist gescheitert (" + q + "): es gibt kein Urteil zu diesem Wert und keinen Lauf." };
+    if (aus === "passt") return { id: "planerpasst", label: "Planer-Rechnung: passt", tip: "Die Passung ist eine Rechnung des Planers aus Modellgrößen (" + q + "), kein Lauf und keine Messung; sie beurteilt diesen Wert nicht einzeln." };
+    if (aus === "passt_nicht") return { id: "planerpasstnicht", label: "Planer-Rechnung: passt nicht", tip: "Die Rechnung des Planers (" + q + ") sagt: passt nicht; Details stehen im Vorschlag. Ein Hinweis, keine Sperre; es gibt hier keinen Lauf und kein Force." };
+    if (aus === "unbelegt") return { id: "planerunbelegt", label: "Planer-Rechnung: unbelegt", tip: "Die Rechnung des Planers (" + q + ") ist nicht rechenbar (Eingaben ohne Beleg); es gibt keinen Lauf." };
+    return { id: "keinlauf", label: "kein Lauf", tip: "Noch kein Vorschlag und kein Trockenlauf mit Ausgang: kein Lauf hat diesen Wert beurteilt." };
+  }
+  /* Der Hinweis der STARTEBENE (nicht je Wert): ein Lauf, der nur mit Force durchging.  Sonst null. */
+  function startChip(ausgang, verdikte) {
+    if (ausgang !== "geht_mit_force" || docOf(ausgang, verdikte).laufEbene.some((v) => v.durchgelassen === false)) return null;
+    return { id: "mitforce", label: "mit --force", tip: "Der Start geht nur mit --force durch: der Launcher hat die genannten Werteverweigerungen übergangen (sie stehen in der Liste zum Lauf und im Export)." };
+  }
   function verdiktOf(r, ctx) {
     const src = verdictItems(r, ctx);
-    if (!src) return { id: "keins", label: "nicht geprüft", tip: "Noch kein Vorschlag und kein Trockenlauf: das Orakel hat diesen Wert nicht beurteilt.", items: [] };
-    if (r.origin === "nutzer") return { id: "alt", label: "ungeprüft seit Ihrer Änderung", tip: "Das Urteil (" + src.src + ") gilt für den Wert davor. „Neu prüfen“ fragt das Orakel noch einmal.", items: src.list };
-    const L = src.list;
-    const codes = [...new Set(L.map((v) => v.code))];
-    const tip = L.length ? L.map((v) => v.code + ": " + (v.grund || v.titel || "") + (v.konsequenz ? " Folge: " + v.konsequenz : "")).join("\n") : "Das Orakel (" + src.src + ") hat nichts einzuwenden.";
-    if (!L.length) return { id: "geht", label: "geht", tip, items: L };
-    if (L.some(isBlocked)) return { id: "verweigert", label: "verweigert", code: codes.join(", "), tip, items: L };
-    if (L.some(isForce)) return { id: "force", label: "nur mit --force", code: codes.join(", "), tip, items: L };
-    if (L.some((v) => v.force_state === "ungeprueft")) return { id: "ungeprueft", label: "Force ungeprüft", code: codes.join(", "), tip, items: L };
-    return { id: "hinweis", label: "Hinweis", code: codes.join(", "), tip, items: L };
+    if (!src) return Object.assign(chipFor(undefined, [], [], ""), { items: [] });
+    /* "ungeprüft seit Ihrer Änderung" gilt nur bis zum nächsten Lauf: ein Trockenlauf ("Neu prüfen") nach der Änderung setzt den Chip aus dem Verdikt.
+       Jede Änderung leert ctx.dry und setzt vsrc auf "prop" (profil.js doEdit), ein Trockenlauf-Ergebnis in ctx ist also immer jünger als die Änderung. */
+    const frisch = ctx.vsrc === "dry" && !!ctx.dry;
+    if (r.origin === "nutzer" && !frisch) return { id: "alt", label: "ungeprüft seit Ihrer Änderung", tip: "Das Urteil (" + src.src + ") gilt für den Wert davor. „Neu prüfen“ fragt das Orakel noch einmal.", items: src.list };
+    return Object.assign(chipFor(src.doc.ausgang, src.doc.laufEbene, src.list, src.src), { items: src.list });
   }
   const zChip = (z) => `<span class="pfx-zchip pfx-z-${esc(z.id)}" title="${esc(z.tip)}">${esc(z.label)}</span>`;
   const vChip = (v) => `<span class="pfx-vchip pfx-v-${esc(v.id)}" title="${esc(v.tip)}">${esc(v.label)}${v.code ? ` <b class="mono">${esc(v.code)}</b>` : ""}</span>`;
@@ -316,13 +391,24 @@
   function renderProposal(p) {
     if (!p) return "";
     const werte = p.werte || [];
-    const nCh = werte.filter((w) => w.geaendert).length, nUnb = werte.filter((w) => w.zustand === "unbelegt").length;
+    // "geändert" = ein Wert, der im argv des Vorschlags steht (oder aus dem Profil entfernt wurde) und vom Profil abweicht.  Der P-Schnitt-Seed ist keine
+    // Profilzeile: steht er nicht im argv (der Launcher löst den Schnitt selbst) oder hat das Profil denselben Wert schon, ist er eine Rechnung des Planers, keine Änderung.
+    const istAenderung = (w) => !!w.geaendert && (w.in_argv !== false || w.wert == null) && !(w.seed && w.profil_wert != null && w.profil_wert === w.wert);
+    const nCh = werte.filter(istAenderung).length, nUnb = werte.filter((w) => w.zustand === "unbelegt").length;
+    const nurRechnung = werte.filter((w) => w.geaendert && !istAenderung(w) && w.wert != null).map((w) => {
+      const wo = w.seed && w.profil_wert != null && w.profil_wert === w.wert ? "Das Profil setzt denselben Wert schon."
+        : w.seed && w.profil_wert != null ? "Steht nicht im argv: dort bleibt der Wert des Profils (" + clip(w.profil_wert, 60) + "); dieser Wert ist die Rechnung des Planers."
+        : "Steht nicht im argv: der Launcher löst den Wert selbst.";
+      return `<li><span class="mono">${esc(w.label)}</span> <b class="mono">${esc(clip(w.wert, 80))}</b> <span class="muted">${esc(wo)}</span></li>`;
+    }).join("");
     const vd = p.verdikt || {}, a = AUSGANG[vd.ausgang] || ["", vd.ausgang || ""];
+    const sc = startChip(vd.ausgang, vd.verdikte);       // "mit --force": Hinweis der Startebene, nicht je Wert
     const v = p.vorschlag || {}, fit = v.fit;
     const cards = (v.cards || []).map((c, i) => `<li><span class="mono">Rang ${i}</span> ${esc(shortName(c.name))} <span class="muted">${esc(c.total_mib)} MiB${c.tflops_src ? ", Rate: " + esc(c.tflops_src) : ""}</span></li>`).join("");
-    const changed = werte.filter((w) => w.geaendert).map((w) => {
+    const changed = werte.filter(istAenderung).map((w) => {
       const vs = (w.verdikte || []).map((x) => x.code);
-      return `<li><span class="mono">${esc(w.label)}</span> <span class="muted">${esc(w.alt == null ? "nicht gesetzt" : clip(w.alt, 60))}</span> → <b class="mono">${esc(w.wert == null ? "entfernt" : clip(w.wert, 80))}</b>
+      const alt = w.alt != null ? w.alt : (w.seed && w.profil_wert != null ? w.profil_wert : null);
+      return `<li><span class="mono">${esc(w.label)}</span> <span class="muted">${esc(alt == null ? "nicht gesetzt" : clip(alt, 60))}</span> → <b class="mono">${esc(w.wert == null ? "entfernt" : clip(w.wert, 80))}</b>
         <span class="pfx-zchip pfx-z-${w.zustand === "unbelegt" ? "unbelegt" : "vorgeschlagen"}" title="${esc([w.herkunft, w.grund].filter(Boolean).join(" "))}">${esc(w.zustand || "vorgeschlagen")}</span>${vs.length ? ` <span class="pfx-vchip pfx-v-hinweis">${esc(vs.join(", "))}</span>` : ""}</li>`;
     }).join("");
     const runV = (vd.verdikte || []).filter((x) => x.ebene === "lauf" || x.ebene === "absturz" || x.ebene === "orakel" || x.ebene === "blocker" || x.ebene === "planer").map((x) =>
@@ -331,17 +417,18 @@
     const planerV = (vd.verdikte || []).filter((x) => x.ebene === "fit" && x.code !== "FIT" && x.code !== "HW-BORROWED").map((x) =>
       `<li><span class="pfx-vchip pfx-v-${x.force_state === "blockiert" ? "verweigert" : "hinweis"}">${x.force_state === "geht" ? "ok" : x.force_state === "blockiert" ? "passt nicht" : "Hinweis"} <b class="mono">${esc(x.code)}</b></span> ${esc(clip(x.grund || x.titel || "", 260))}</li>`).join("");
     const hints = [].concat(p.notes || [], v.hinweise || [], v.blocker || []).filter(Boolean);
-    return `<div class="pfx-prop"><div class="pf-verdict ${a[0] === "ok" ? "ok" : a[0] === "force" ? "" : "bad"}"><b>Vorschlag für ${esc(p.n)} Karte${p.n === 1 ? "" : "n"}, Form ${esc(p.form)}</b>: ${esc(nCh)} Werte geändert, ${esc(nUnb)} unbelegt. ${esc(a[1])}
+    return `<div class="pfx-prop"><div class="pf-verdict ${a[0] === "ok" ? "ok" : a[0] === "force" ? "" : "bad"}"><b>Vorschlag für ${esc(p.n)} Karte${p.n === 1 ? "" : "n"}, Form ${esc(p.form)}</b>: ${esc(nCh)} Werte geändert, ${esc(nUnb)} unbelegt. ${esc(a[1])}${sc ? " " + vChip(sc) : ""}
         ${fit ? `<div class="muted">Passung (${esc(fit.art || "hw_fit, notwendige Bedingung")}): <b>${esc(fit.level)}</b>${fit.margin_mib != null ? ", Rand " + esc(Math.round(Number(fit.margin_mib))) + " MiB" : ""}${fit.first ? " · " + esc(fit.first) : ""}</div>` : ""}</div>
       ${planerV ? `<div class="pfx-runv"><b>Passung als Planer-Rechnung</b> <span class="muted">(eine Rechnung des Planers aus Modellgrößen, kein Launcher-Lauf und keine Messung)</span><ul class="pfx-vd">${planerV}</ul></div>` : ""}
       ${runV ? `<div class="pfx-runv"><b>Was der Launcher zum Lauf sagt</b> <span class="muted">(gilt für den ganzen Start, nicht für einen einzelnen Wert; nie eine Sperre in dieser Seite)</span><ul class="pfx-vd">${runV}</ul></div>` : ""}
       ${changed ? `<details class="pf-fold" data-fold="propchg" open><summary>Was der Vorschlag geändert hat (${nCh})</summary><ul class="pfx-chg">${changed}</ul></details>` : ""}
+      ${nurRechnung ? `<details class="pf-fold" data-fold="proprech"><summary>Rechnung des Planers ohne Änderung am Profil</summary><ul class="pfx-chg">${nurRechnung}</ul></details>` : ""}
       ${cards ? `<details class="pf-fold" data-fold="propcards"><summary>Rangfolge der Karten (Rang 0 = Host)</summary><ul class="pfx-cards">${cards}</ul></details>` : ""}
       ${hints.length ? `<details class="pf-fold" data-fold="prophints"><summary>${hints.length} Hinweis${hints.length === 1 ? "" : "e"} des Planers</summary><ul class="pf-notes">${hints.map((h) => `<li>${esc(h)}</li>`).join("")}</ul></details>` : ""}
       <div class="muted pf-note">Die Werte unten tragen ihren Zustand und ihr Urteil. Ein Urteil ist ein Hinweis, keine Sperre: Sie können jeden Wert setzen; was Force braucht, steht im Export.</div></div>`;
   }
 
-  const api = { esc, tail, vecSplit, vecJoin, vecSum, formOf, formMismatch, zustandOf, verdiktOf, zChip, vChip, renderRow, renderSection, renderDual, renderFormPick, renderControls,
+  const api = { esc, tail, vecSplit, vecJoin, vecSum, formOf, formMismatch, zustandOf, verdiktOf, chipFor, startChip, AUSGAENGE, SPALTEN, zChip, vChip, renderRow, renderSection, renderDual, renderFormPick, renderControls,
                 renderProposal, parseGreen, serializeGreen, rungPercents, pseudoRow, valueField, DUAL_NAMES, CTX_STEPS, ctxIndex, shortName, missingList };
   root.ProfilPlaner = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;

@@ -199,7 +199,7 @@ out.tip = z(base({ origin: "nutzer" }), { prop: { werte: [W()] } }).tip;
         o = run_node("""
 const V = (code, o) => Object.assign({ code, ebene: "lauf", forcebar: true, force_state: "force", grund: code + " grund", konsequenz: "k" }, o || {});
 const W = (vs) => ({ key: "flag:--pp-stage-ratio", wert: "1", zustand: "vorgeschlagen", geaendert: true, verdikte: vs });
-const v = (vs, row, c) => PX.verdiktOf(row || base(), ctx(Object.assign({ prop: { werte: [W(vs)] } }, c || {})));
+const v = (vs, row, c) => PX.verdiktOf(row || base(), ctx(Object.assign({ prop: { werte: [W(vs)], verdikt: { ausgang: "geht", verdikte: [] } } }, c || {})));      // der Lauf des Vorschlags ging durch
 out.ids = [v([]).id, v([V("W40")]).id, v([V("W40"), V("X", { forcebar: false, force_state: "blockiert" })]).id, v([V("H", { forcebar: null, force_state: "hinweis" })]).id,
            v([V("U", { force_state: "ungeprueft" })]).id, PX.verdiktOf(base(), ctx()).id, v([V("W40")], base({ origin: "nutzer" })).id];
 out.label = v([V("W40")]).label;
@@ -211,7 +211,7 @@ out.dryWins = PX.verdiktOf(base(), ctx({ prop: { werte: [W([])] }, vsrc: "dry", 
 const html = PX.renderRow(base(), ctx({ prop: { werte: [W([V("X", { forcebar: false, force_state: "blockiert" })])] } }));
 out.html = html;
 """)
-        self.assertEqual(o["ids"], ["geht", "force", "verweigert", "hinweis", "ungeprueft", "keins", "alt"])
+        self.assertEqual(o["ids"], ["geht", "force", "verweigert", "hinweis", "ungeprueft", "keinlauf", "alt"])
         self.assertEqual((o["label"], o["code"]), ("nur mit --force", "W40"))
         self.assertEqual(o["dry"], "W77")
         self.assertEqual(o["dryWins"], "force")

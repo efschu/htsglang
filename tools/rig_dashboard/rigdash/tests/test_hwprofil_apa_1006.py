@@ -281,8 +281,9 @@ class TestIssueText(RealBase):
                        "### Karte-zu-Karte (gemessen)", "### Herkunft der Werte"):
             self.assertIn(needle, txt)
         for c in self.fx.nvml()[0]:                               # NVML-Identität: Index, Name, UUID, PCI-Bus
-            self.assertIn(c["uuid"], txt)
+            self.assertNotIn(c["uuid"], txt)                      # Nacharbeit 06.10.: die UUID steht nie im Issue-Text (immer "<entfernt>")
             self.assertIn(c["pci_bus_id"], txt)
+        self.assertIn("| <entfernt> |", txt)
         self.assertIn("RTX 5090", txt)
         self.assertIn("| 170 (gem.) |", txt)                      # SM-Zahl, gemessen
         self.assertIn("32607 MiB (NVML)", txt)                    # Größe

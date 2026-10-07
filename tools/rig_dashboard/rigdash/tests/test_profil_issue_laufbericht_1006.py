@@ -474,6 +474,49 @@ class Redaction(Base):
                      "SGLANG_WEG2_LANE_COVERAGE_TOKEN_X_Y_Z_0123456789", "eyJ", "eyJ.a.b", "Qwen3.6-27B-AWQ-BF16-INT4-some-very-long-variant-name-v2"):
             self.assertEqual(redact.text_for_issue(keep), keep, keep)
 
+    def test_launcher_class_names_stay_readable_but_real_base64_does_not(self):
+        """Nacharbeit 1006 Runde 6, Befund 2: ``Weg2TpOperatingPointInfeasible`` (30 Zeichen, Gross/Klein/Ziffer) war als Base64 geschwaerzt."""
+        for text in ("W64 Weg2TpOperatingPointInfeasible: position 3 derives weights [20, 12, 8]",
+                     "W71 Weg2XchgResidencyUnarmable: the exchange's predicted VRAM residency does not fit",
+                     "W64 Weg2TpOperatingPointInfeasible: x | W71 Weg2XchgResidencyUnarmable: y",
+                     "Weg2XchgSemaphoreNotRearmed Weg2FlipPeerLegAborted Weg2DualCompactBreach"):
+            self.assertEqual(redact.text_for_issue(text), text, text)
+        # ein echtes Geheimnis neben dem Klassennamen wird weiter geschnitten
+        out = redact.text_for_issue("W64 Weg2TpOperatingPointInfeasible key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY and Ab3dE9xQ2mZpL0vK7sT4wY8nR1cF6hJ5gU")
+        self.assertIn("Weg2TpOperatingPointInfeasible", out)
+        self.assertNotIn("wJalrXUtnFEMI", out)
+        self.assertNotIn("Ab3dE9xQ2mZpL0vK7sT4wY8nR1cF6hJ5gU", out)
+
+    def test_a_token_shaped_camelcase_run_is_cut_only_source_names_stay(self):
+        """Nacharbeit 1006 Runde 7, Befund 3: die Ausnahme ist eine LISTE (Bezeichner aus dem Launcher-/weg2-Quelltext), keine Form."""
+        for probe in ("AbcdEfghIjklMnopQrstUvwxYz12Ab", "Abcd1Efgh2Ijkl3Mnop4Qrst5Uvwx6Yzab", "Weg2AbcdEfghIjklMnopQrstUvwxYz12"):
+            out = redact.text_for_issue("note " + probe)
+            self.assertNotIn(probe, out, probe)
+            self.assertIn("<entfernt>", out, probe)
+        self.assertEqual(redact.text_for_issue("W64 Weg2TpOperatingPointInfeasible: x"), "W64 Weg2TpOperatingPointInfeasible: x")
+        # die Liste kommt aus dem Quelltext: ein Name, der dort als Klasse steht, bleibt lesbar (Beleg: class Weg2DKvStageWavesRefused)
+        self.assertIn("Weg2DKvStageWavesRefused", redact.known_idents())
+        self.assertIn("Weg2TpOperatingPointInfeasible", redact.known_idents())
+        self.assertNotIn("AbcdEfghIjklMnopQrstUvwxYz12Ab", redact.known_idents())
+
+    def test_without_a_source_tree_only_the_builtin_names_stay(self):
+        saved = (redact._known_cache, os.environ.get("HWPROFIL_TREE"), os.environ.get("KARTENPLAN_TREE"), redact._tree_candidates)
+        try:
+            redact._known_cache = None
+            os.environ.pop("HWPROFIL_TREE", None)
+            os.environ.pop("KARTENPLAN_TREE", None)
+            redact._tree_candidates = lambda: []
+            self.assertEqual(redact.known_idents(), redact._KNOWN_IDENT_BUILTIN)
+            self.assertEqual(redact.text_for_issue("W64 Weg2TpOperatingPointInfeasible: x"), "W64 Weg2TpOperatingPointInfeasible: x")
+            self.assertNotIn("AbcdEfghIjklMnopQrstUvwxYz12Ab", redact.text_for_issue("note AbcdEfghIjklMnopQrstUvwxYz12Ab"))
+            self.assertIsNone(redact._known_cache)            # ohne Baum nichts gemerkt: der naechste Aufruf sucht neu
+        finally:
+            redact._known_cache, redact._tree_candidates = saved[0], saved[3]
+            if saved[1] is not None:
+                os.environ["HWPROFIL_TREE"] = saved[1]
+            if saved[2] is not None:
+                os.environ["KARTENPLAN_TREE"] = saved[2]
+
     def test_names_ending_in_a_credential_word_are_secrets_singular_and_plural(self):
         for n in ("OPENAI_API_KEYS", "MY_KEYS", "HF_AUTH", "--auth", "DB_PASS", "--pass", "MY_SECRETS", "DB_PASSWORDS", "SERVICE_CREDENTIALS", "GH_PAT",
                   "HF_TOKENS", "--auth-tokens", "--credential"):
@@ -856,7 +899,7 @@ class UiJs(unittest.TestCase):
         self.assertTrue(o["button"])
         self.assertTrue(o["noTextYet"])
         self.assertEqual(o["issueCalls"], 1)
-        self.assertEqual(set(o["body"]), {"doc", "dry", "cards", "model"})
+        self.assertEqual(set(o["body"]), {"doc", "dry", "cards", "model", "vorschlag"})
         self.assertEqual(o["body"]["doc"]["name"], "p")
         self.assertIsNone(o["body"]["dry"])                                  # noch kein Trockenlauf
         self.assertEqual(o["body"]["cards"], [{"card": "a", "pcie": {"gen": 4, "lanes": 8}}])

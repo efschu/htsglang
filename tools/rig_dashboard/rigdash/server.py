@@ -675,7 +675,7 @@ def make_handler(app: App):
                 parts = app.hwprofil.issue_parts()
             except Exception as e:      # noqa: BLE001 -- ohne Hardwareprofil entsteht der Bericht trotzdem, der Block sagt "nicht verfügbar"
                 parts = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
-            return self._json(app.profil.issue_report(body.get("doc"), dry=body.get("dry"), cards=body.get("cards"), model=body.get("model"),
+            return self._json(app.profil.issue_report(body.get("doc"), dry=body.get("dry"), cards=body.get("cards"), model=body.get("model"), vorschlag=body.get("vorschlag"),
                                                       hardware_md=parts.get("short") if parts.get("ok") else "", versions=parts.get("versions") if parts.get("ok") else {}))
 
         def _profil_recompute(self, body):
