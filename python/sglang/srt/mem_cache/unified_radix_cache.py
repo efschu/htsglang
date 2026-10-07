@@ -5415,6 +5415,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # claim of the same node)
             pre = pool.alloc_write(hashes)
         if pre is None:
+            self._weg2_sweep_last_refusal = "arena_claim"   # SWEEP-FULL-ARENA: the sweep reads it
             self._1421_refused("arena_claim", node)
             return False
         mxfer = mct = None
@@ -6469,6 +6470,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _issue_s = 0.0
         _walked = 0
         self._weg2_sweep_last_refusal = None
+        # SWEEP-FULL-ARENA: armed for this sweep; engaged by its first arena_claim refusal
+        _full_arena_armed = self._weg2_full_arena_skip_armed()
+        _full_arena = False
         queue = list(first or []) + ([] if chain_only else [self.root_node])   # xsn344: the retain's own chain first
         while queue:
             node = queue.pop(0)
@@ -6544,6 +6548,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stats["skipped_pending"] += 1
                 continue
             _t_iss = time.perf_counter()
+            if _full_arena and self._weg2_full_arena_refuses(node):
+                _issue_s += time.perf_counter() - _t_iss
+                stats["refused"] += 1
+                stats["arena_full_skipped"] = stats.get("arena_full_skipped", 0) + 1
+                continue
+            if _full_arena_armed:
+                self._weg2_sweep_last_refusal = None   # this attempt's own refusal reason only
             try:
                 got = self.write_backup(node)
             except Exception as e:  # noqa: BLE001 -- the sweep must not kill the flush
@@ -6555,6 +6566,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stats["issued"] += 1
             else:
                 stats["refused"] += 1
+                _full_arena = _full_arena or (
+                    _full_arena_armed and self._weg2_sweep_last_refusal == "arena_claim")
         stats["walked"] = _walked
         stats["issue_ms"] = round(_issue_s * 1000.0, 1)
         stats["sweep_ms"] = round((time.perf_counter() - _t_sweep0) * 1000.0, 1)
@@ -6579,13 +6592,46 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "in_flight_after=%d pins=%d/%d draft_issued=%d draft_refused=%d "
                 "(denominator: un-backed device nodes at this flush poll; the draft terms are "
                 "the controller's CUMULATIVE L3 draft write counts, #1233 C18) "
-                "walked=%d sweep_ms=%.1f issue_ms=%.1f",
+                "walked=%d sweep_ms=%.1f issue_ms=%.1f%s",
                 n, stats["unbacked"], stats["issued"], stats["refused"], stats["skipped_pending"],
                 stats["pending"], self._mamba_pins_held(), self._mamba_pin_budget,
                 stats["draft_issued"], stats["draft_refused"],
                 stats["walked"], stats["sweep_ms"], stats["issue_ms"],
+                _full_arena_suffix(stats),
             )
         return stats
+
+    def _weg2_full_arena_skip_armed(self) -> bool:
+        """SWEEP-FULL-ARENA gate, fixed for one sweep: the switch, no Form A
+        shadow (R12 mirrors every refusal TP0 records onto its workers), and
+        no D park recording its arena refusals (HY, park_hold_yield)."""
+        return (
+            envs.SGLANG_WEG2_ENABLE_SWEEP_FULL_ARENA_SKIP.get()
+            and self._weg2_park_track is None
+            and _r12.role() is None
+        )
+
+    def _weg2_full_arena_refuses(self, node) -> bool:
+        """SWEEP-FULL-ARENA (NF boot 1007_2142): once this sweep's KV arena
+        refused a claim (#1421 arena_claim), would ``write_backup(node)`` be
+        refused for room too? Its parent rule claims the topmost un-backed
+        ancestor first, so that claim is the one asked about; the W3 spill the
+        refused claim would run comes first (a release answers False). The
+        claim itself -- ~70 ms each over the hand-off keep list on P's PP
+        ranks, freed=0 -- is not made. False = make the claim as before."""
+        top = node
+        while (
+            top.parent is not self.root_node
+            and not top.parent.backuped
+            and not top.parent.l3_present
+        ):
+            top = top.parent
+        pool = self._weg2_direct_pool()
+        if pool is None or not top.hash_value:
+            return False
+        if self._w3_arena_spill(pool, len(top.hash_value), claimer=top) > 0:
+            return False
+        return pool.claim_would_refuse(top.hash_value)
 
     def load_back(
         self,
@@ -12248,6 +12294,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             for child in node.children.values():
                 stack.append((child, indent + 2))
+
+
+def _full_arena_suffix(stats: dict) -> str:
+    """The PUBLISH-SWEEP line's SWEEP-FULL-ARENA tail; empty unless it skipped."""
+    n = int(stats.get("arena_full_skipped", 0))
+    if not n:
+        return ""
+    return (" arena_full_skipped=%d (SWEEP-FULL-ARENA: counted refused without the claim -- "
+            "the KV arena has no room for them after this sweep's arena_claim refusal)" % n)
 
 
 def _aux_components(tree) -> tuple:

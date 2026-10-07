@@ -1025,6 +1025,18 @@ class Envs:
     # stands where that round left it, a repeat round cannot issue (kvs2 W3), so
     # the poll skips its ~1.2 s sweep (P.log 144297 sweep_ms=1221.1 per poll).
     SGLANG_WEG2_FLUSH_SWEEP_MEMO = EnvBool(False)
+    # SWEEP-FULL-ARENA (NF boot 1007_2142, P->D flip epoch 2: drain+quiesce
+    # 41730 ms, sleep-kv 8883 ms, cards idle): once a publish sweep's backup
+    # was refused for KV arena room (#1421 arena_claim), every later node
+    # whose claim the arena provably cannot serve (ArenaMHAHostPool.
+    # claim_would_refuse: free + reapable + unreferenced-complete room smaller
+    # than its absent pages, W3 spill asked first) is counted refused without
+    # the claim -- each such claim walked the hand-off keep list for nothing
+    # (~70 ms, 58 per sweep = 4.1 s per PP loop pass and per quiesce poll).
+    # Same nodes backed, same refusals; groups without the Form A shadow
+    # (R12) only, never while a D park records its refusals (HY). Off = every
+    # refused claim is made as before.
+    SGLANG_WEG2_ENABLE_SWEEP_FULL_ARENA_SKIP = EnvBool(True)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).

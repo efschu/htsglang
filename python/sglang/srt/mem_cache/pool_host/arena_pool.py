@@ -540,6 +540,13 @@ def _partial_reap_age_s() -> float:
         return 30.0
 
 
+def _arena_free_slots(arena) -> int:
+    """FREE slots of the arena now (arena.c keeps COMPLETE and CLAIMED
+    disjoint, so free = slots - complete - claimed)."""
+    st = arena.stats()
+    return int(st["slots"]) - int(st["complete"]) - int(st["claimed"])
+
+
 def _reap_orphan_claims(arena) -> list:
     """#231 (rc12m-dpr 09271152, the P mamba arena of 32 slots): claim-time
     room from CLAIMED slots whose writers stopped -- the stem some P ranks
@@ -1098,6 +1105,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     #: #243: a pending hand-off keeps every page of its chain in this arena
     _weg2_handoff_keep = "kv"
+
+    #: #231: the KV arena reaps orphan claims FIRST in its claim-time room
+    #: (``_evict_for_claim``); the mamba anchor arena overrides this with True
+    _weg2_reaps_orphan_claims = False
 
     arena_read = True
 
@@ -2378,6 +2389,29 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if slots is None:
             return None
         return self.arena_ids(slots)  # x59: P ids per page hash
+
+    def claim_would_refuse(self, hashes) -> bool:
+        """SWEEP-FULL-ARENA (NF boot 1007_2142, P->D flip epoch 2): would
+        ``alloc_write(hashes)`` be refused right now for want of room?
+
+        The claim's room is: free slots, plus the orphan claims its own reap
+        frees first (#231, the KV arena's first step -- taken here exactly as
+        the claim takes it), plus every COMPLETE slot no reader references
+        (the clock of ``_evict_for_claim``, all stages). A page already in the
+        arena (claimed or complete) needs no room. Pins are not subtracted, so
+        the room can only be OVER-estimated -- an over-estimate answers False
+        and the caller claims as before. Never claims, never evicts.
+        False when the pool has no bound arena (the claim decides)."""
+        arena = self.arena
+        if arena is None or self._backend is None or not hashes:
+            return False
+        absent = sum(1 for s in arena.find_states(self._stems(hashes)) if int(s) == 0)
+        if absent <= _arena_free_slots(arena):
+            return False   # the claim needs no room-making: it is not refused for room
+        if not self._weg2_reaps_orphan_claims:
+            _reap_orphan_claims(arena)   # the claim's own first step (#231 / OS)
+        referenced, _refs, complete = arena.ref_census()
+        return absent > _arena_free_slots(arena) + int(complete) - int(referenced)
 
     def alloc_write_draft(self, kv_host_indices: torch.Tensor, hashes, comp: str) -> bool:
         """Draft role: claim the draft slot behind each KV arena row."""
