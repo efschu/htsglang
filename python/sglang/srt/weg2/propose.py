@@ -9,8 +9,9 @@ goals -> a candidate launch (argv + environment) with the ORIGIN of every value.
   rows (``index, uuid, name, total_bytes, cc_major, ...``) or ``rigdash.kartenplan_catalog`` rows (``usable_mib, nvml_name``).
 * ``modell``    a ``flliper.model/1`` profile (``weg2/model_profile.estimate``); ``draft`` the optional separate draft profile
   (``model_profile.estimate_draft``).
-* ``form``      ``"flip"`` (P = PP<N>, D = TP<N>, the standard form) or ``"tp"`` (``--d-only``: pure tensor parallel).  Dual
-  (AP-E) and a single card (AP-F) are other packages: they raise :class:`ProposeError`, they are not guessed.
+* ``form``      ``"flip"`` (P = PP<N>, D = TP<N>, the standard form), ``"tp"`` (``--d-only``: pure tensor parallel) or ``"dual"``
+  (AP-E, ``propose_dual``: P and D awake together on the SAME cards; the 27B tree).  A single card (AP-F) is another package:
+  it raises :class:`ProposeError`, it is not guessed.
 * ``ziele``     the goals (all optional): ``seats`` (the "Sitze gleichzeitig" regulator = decode-bs target), ``kv_tokens``
   (K1 obligation, default 262144), ``kv_dtype``, ``p_cut`` (``auto`` | ``pin`` | ``seed``), ``d_objective``,
   ``draft_kv_on_p``, ``force_rules`` (derive everything by rule even where the profile's own inventory is the live one).
@@ -46,9 +47,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from sglang.srt.weg2 import propose_rules as R
 
 SCHEMA = "flliper.propose-a/1"
-FORMS = ("flip", "tp")
-#: the forms of the plan that are other packages (AP-E dual, AP-F single card)
-OTHER_FORMS = {"dual": "AP-E (Dual)", "single": "AP-F (Einzelkarte)", "einzel": "AP-F (Einzelkarte)"}
+FORMS = ("flip", "tp", "dual")
+#: the forms of the plan that are other packages (AP-F single card)
+OTHER_FORMS = {"single": "AP-F (Einzelkarte)", "einzel": "AP-F (Einzelkarte)"}
 
 KV_TOKENS_DEFAULT = 262144
 KV_DTYPE_DEFAULT = "fp8_e4m3"
@@ -317,6 +318,12 @@ def _del(la: LaunchArgv, kind: str, group: str, name: str) -> None:
         la.env.pop(name, None)
 
 
+#: launcher flags that look like a comma list but are NOT a per-card vector: the BAR1 window spec ("16,PP_0=64": a default window plus a
+#: per-stage override) and the D reshard presets (``launcher._TOPOLOGY_VECTOR_FLAGS`` = ``POSITIONAL_VECTOR_FLAGS`` minus these two; the Dual
+#: profile of the 27B carries both).  They are carried as written and never counted against the card count.
+WINDOW_SPEC_FLAGS = ("--p-barlink-bar1-window-mib", "--d-reshard-presets")
+
+
 def vector_lengths(argv: Sequence[str], env: Optional[Mapping[str, str]] = None) -> Dict[str, int]:
     """Every positional per-card vector of a launch -> its entry count (the stdlib twin of ``launcher.positional_vector_lengths``:
     the flags of :data:`propose_rules.POSITIONAL_VECTOR_FLAGS` at top level, the tokens of :data:`POSITIONAL_VECTOR_TOKENS`
@@ -332,6 +339,8 @@ def vector_lengths(argv: Sequence[str], env: Optional[Mapping[str, str]] = None)
 
     for dest in R.POSITIONAL_VECTOR_FLAGS:
         flag = "--" + dest.replace("_", "-")
+        if flag in WINDOW_SPEC_FLAGS:
+            continue                                 # a window spec / preset list, not one entry per card (launcher._TOPOLOGY_VECTOR_FLAGS)
         add(flag, la.get_flag(flag))
     for g in ("p", "d"):
         for tok in R.POSITIONAL_VECTOR_TOKENS:
@@ -411,9 +420,9 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
 
     form = str(form or "flip").lower()
     if form in OTHER_FORMS:
-        raise ProposeError("form %r is %s, not stage A of AP-C (flip | tp)" % (form, OTHER_FORMS[form]))
+        raise ProposeError("form %r is %s, not stage A of AP-C (flip | tp | dual)" % (form, OTHER_FORMS[form]))
     if form not in FORMS:
-        raise ProposeError("unknown form %r (flip | tp)" % form)
+        raise ProposeError("unknown form %r (flip | tp | dual)" % form)
     z = dict(ziele or {})
     cards = R.order_cards(cards_from_hardware(hardware))
     n = len(cards)
@@ -422,6 +431,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
     rec = _Rec()
     b = _basis_of(basis)
     la = LaunchArgv(b["argv"], b["env"])
+    la0 = LaunchArgv(b["argv"], b["env"])               # the profile as it is: the Dual form reads its own calibration from it
     bname = b["name"] or "(kein Profil)"
     live_cls = tuple(c["class"] for c in cards)
     binv = _inventory_of(b["vars"])
@@ -453,7 +463,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
     seats_p = seats if p_coupled else seats_ref       # the seat count P's stages are priced for
     prof_name = la.get_flag("--profile") or ("nextflash" if is_moe else "qwen27b")
     asm = hw_fit.Assumptions(kv_tokens=kv_tokens, kv_dtype=kv_dtype, p_mamba_slots=R.mamba_slots_p(seats_p),
-                             d_mamba_slots=R.mamba_slots_d(seats))
+                             d_mamba_slots=R.mamba_slots_d(seats), dual=(form == "dual"))
     fit_cards = [hw_fit.FitCard(total_mib=c["total_mib"], arch=c["arch"], cls=c["class"] if c["calibrated"] else "",
                                 label="%s/%d" % (c["class"], c["total_mib"])) for c in cards]
     verdict = hw_fit.Verdict()
@@ -572,7 +582,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         """The rule terms at ``s_`` seats: P stage budgets (``sb``) and the Form A D layout (``fa``)."""
         if s_ not in seat_cache:
             asm_s = hw_fit.Assumptions(kv_tokens=kv_tokens, kv_dtype=kv_dtype, p_mamba_slots=R.mamba_slots_p(s_ if p_coupled else seats_p),
-                                       d_mamba_slots=R.mamba_slots_d(s_))
+                                       d_mamba_slots=R.mamba_slots_d(s_), dual=(form == "dual"))
             sb_s = R.stage_budgets(fp, fit_cards, asm_s, fit_argv0, records_profile=prof_name, verdict=hw_fit.Verdict())
             if foreign and nontorch and len(foreign) == n == len(nontorch):
                 budget_s = d_budget
@@ -662,7 +672,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
             rec.add(lab, group=group, old=old, new=nt, state=st, herkunft=hk, grund=gr, policy=pol)
             return
         if pol == "advisory":
-            if vec is None or same_inv or len(vec) == n:
+            if vec is None or same_inv or len(vec) == n or name in WINDOW_SPEC_FLAGS:
                 st, hk, gr = carried()
                 rec.add(lab, group=group, old=old, new=old, state=st, herkunft=hk, grund=gr, policy=pol)
             else:
@@ -799,7 +809,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         if dp["placement"] == "split":
             rec.hinweise.append("Draft solo passt nicht auf Rang 0 (%s). Ohne ihn auf Rang 0 bliebe nur die Aufteilung auf alle Raenge, die Form A verweigert." % dp["why"])
             rec.blocker.append("Draft solo auf Rang 0 passt nicht (Form A verlangt solo)")
-    else:
+    elif form != "dual":                      # the Dual form states its own draft rule (propose_dual: D shards the draft, P holds none)
         rec.hinweise.append("Draft: %s (die Draft-Regel gilt fuer die Form-A-MoE-Linie; bei einem dichten Modell laeuft der Draft nach Profil)" % dp["why"])
     d_kv_old = la.get_flag("--draft-kv-on-p")
     if z.get("draft_kv_on_p") in ("on", "off"):
@@ -912,6 +922,15 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         rec.add("--x-ceiling-tokens", group="-", old=None, new=None, state=R.VORGESCHLAGEN,
                 herkunft="nicht im Profil %s: Launcher-Standard 0 (aus)" % bname, grund=xc_expl, in_argv=False, policy="knob")
 
+    # --- the Dual form (AP-E): what is specific to P and D awake together on the same cards -------------------------------------
+    dual = None
+    if form == "dual":
+        from sglang.srt.weg2 import propose_dual as PD
+
+        dual = PD.apply_dual(la=la, la0=la0, rec=rec, cards=cards, fp=fp, modell=modell, z=z, bname=bname, binv=binv, same_inv=same_inv, live_cls=live_cls,
+                             kv_tokens=kv_tokens, kv_dtype=kv_dtype, rate=rate, rate_src=rate_src, layers=layers, attn=attn, posts=sb["posts"], d_slots=asm.d_mamba_slots,
+                             carried=carried, inv_txt=inv_txt, get=_get, set_=_set, slot_label=slot_label)
+
     # --- the checks and the result -------------------------------------------------------------------------------------------
     lens = vector_lengths(la.t, la.env)
     bad = {k: v for k, v in lens.items() if v != n}
@@ -928,7 +947,7 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
                   "fr_p": frp, "draft": dp, "form_a": fa, "dense_d_shares": results.get("dense_d_shares")},
         "fit": {"level": fv.level, "first": fv.first, "margin_mib": fv.margin_mib, "lines": list(fv.lines),
                 "marks": sorted(set(fv.marks + verdict.marks))},
-        "ziele": {"seats": seats, "kv_tokens": kv_tokens, "kv_dtype": kv_dtype, "p_cut": pin_mode},
+        "ziele": {"seats": seats, "kv_tokens": kv_tokens, "kv_dtype": kv_dtype, "p_cut": pin_mode}, "dual": dual,
         "unbelegt": rec.unbelegt, "hinweise": rec.hinweise, "blocker": rec.blocker,
         "vektorlaengen": lens, "vektoren_ok": not bad, "vektoren_falsch": bad,
     }

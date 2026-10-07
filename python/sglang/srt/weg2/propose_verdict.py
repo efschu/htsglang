@@ -44,6 +44,14 @@ OWN_CODES: Dict[str, Dict[str, Any]] = {
     "FIT": {"ebene": "fit", "parent": None, "titel": "Passung nach hw_fit (notwendige Bedingung)",
             "konsequenz": "hw_fit prueft nur die NOTWENDIGE Bedingung (Gewichte + KV + Mamba-Slots + Posten gegen Karte minus Residuum); "
                           "ob der Start laeuft, sagt der Launcher-Lauf (die uebrigen Verdikte)."},
+    "DUAL-PASSUNG": {"ebene": "fit", "parent": None, "titel": "Dual-Passung: Planer-Rechnung, nicht hw_fit",
+                     "konsequenz": "hw_fit rechnet das Dual nicht (es druckt 'Dual ... NOT modelled'); der Planer rechnet je Karte P-Budget + Overhead + "
+                                   "Ruhe-Posten von D + D-Gewichte (mit Draft) gegen die Karte. Das ist eine NOTWENDIGE Bedingung aus Modellgroessen und "
+                                   "Records, keine Messung; ob der Start laeuft, sagt der Launcher-Lauf (die uebrigen Verdikte)."},
+    "DUAL-PFLICHT": {"ebene": "fit", "parent": None, "titel": "P-KV-Pflicht der Dual-Form je Karte (Planer-Rechnung)",
+                     "konsequenz": "P muss die KV-Pflicht (Standard 262144 Token) als EINEN Prompt tragen: Deckel, Level des P-Pools und der gemeinsame Pool "
+                                   "jeder Karte. Der Pool je Karte ist nur fuer die Karten und das Modell des Referenzboots geeicht; sonst steht dort "
+                                   "'nicht gerechnet'. Einen Dual-Pool-Riegel im Launcher gibt es nach dem 27B-Sitz nicht (done/dual-schnitt-262k-1006.md Abschnitt 5): diese Rechnung ist der einzige Schutz davor."},
     "PROFILE-VECTORS": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Positionsvektoren des Profils nicht fuer dieses Inventar",
                         "konsequenz": "Das Profil traegt Vektoren (je Karte ein Eintrag) mit anderer Laenge als die Kartenzahl; der Launcher kann sie "
                                       "nicht ableiten. Mit Vorschlag des Planers haben alle Vektoren genau N Eintraege."},
@@ -364,13 +372,21 @@ def build_verdikt(n: int, first: Any, second: Any = None, *, lens: Optional[Mapp
         lvl = str(fit.get("level") or "")
         if lvl:
             st = {"ja": GOES, "knapp": HINT, "nein": BLOCKED}.get(lvl, HINT)
-            txt = "hw_fit: %s%s%s" % (lvl, (" (Rest %s MiB)" % fit["margin_mib"]) if fit.get("margin_mib") is not None else "",
+            if vorschlag.get("form") == "dual":
+                st = HINT          # hw_fit does not model the Dual: its Flip bound neither clears nor blocks it (DUAL-PASSUNG below does)
+            txt = "hw_fit%s: %s%s%s" % (" (Flip-Schranke, Dual nicht modelliert)" if vorschlag.get("form") == "dual" else "", lvl, (" (Rest %s MiB)" % fit["margin_mib"]) if fit.get("margin_mib") is not None else "",
                                       ("; " + str(fit["first"])) if fit.get("first") else "")
             v_list.append(verdikt("FIT", ebene="fit", text=txt, grund=txt, force_state=st, extra={"stufe": lvl, "rest_mib": fit.get("margin_mib"),
                                                                                               "zeilen": list(fit.get("lines") or [])[:12]}))
         for m in fit.get("marks") or []:
             if str(m).startswith("HW-BORROWED") or "HW-BORROWED" in str(m):
                 v_list.append(verdikt("HW-BORROWED", ebene="fit", text=str(m), grund=str(m), force_state=HINT, extra={"quelle": "hw_fit"}))
+        # the Dual form: its own coupling (``propose_dual``), labelled as a Planer-Rechnung and never as hw_fit
+        for dv in (vorschlag.get("dual") or {}).get("verdikte") or []:
+            stufe = str(dv.get("stufe") or "")
+            v_list.append(verdikt(str(dv["code"]), ebene="fit", text=str(dv.get("text", "")), grund=str(dv.get("text", "")),
+                                  force_state={"ja": GOES, "nein": BLOCKED if dv["code"] == "DUAL-PASSUNG" else HINT}.get(stufe, HINT),
+                                  extra={"stufe": stufe, "etikett": dv.get("etikett"), "rest_mib": dv.get("rest_mib")}))
         for b in vorschlag.get("blocker") or []:
             v_list.append(verdikt("PLANER", ebene="planer", text=str(b), grund=str(b), force_state=BLOCKED))
         falsch = {k: int(c) for k, c in (vorschlag.get("vektoren_falsch") or {}).items()}
