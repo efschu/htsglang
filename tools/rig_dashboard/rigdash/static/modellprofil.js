@@ -6,11 +6,13 @@
 (function (root) {
   "use strict";
   const QUELLE = {
-    "config": "steht in der config.json des Modells",
-    "Index": "aus den Kopfzeilen der Safetensors-/GGUF-Dateien (exakte Tensorgrößen)",
-    "geschätzt": "aus der Geometrie gerechnet, nicht gemessen",
-    "stat": "Dateigröße auf der Platte",
+    "config": "stated in the model's config.json",
+    "Index": "from the header lines of the Safetensors/GGUF files (exact tensor sizes)",
+    "geschätzt": "computed from the geometry, not measured",
+    "stat": "file size on disk",
   };
+  // display labels of the source tags (the tag itself is the API value and stays as is)
+  const QUELLE_LABEL = { "geschätzt": "estimated" };
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   async function json(url, opts) {
@@ -19,7 +21,7 @@
     const text = await r.text();
     let j;
     try { j = JSON.parse(text); } catch (e) {
-      throw new Error("HTTP " + r.status + ", keine JSON-Antwort von " + url + ": " + text.slice(0, 80));
+      throw new Error("HTTP " + r.status + ", no JSON response from " + url + ": " + text.slice(0, 80));
     }
     if (!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
     return j;
@@ -38,12 +40,12 @@
   function bytes(n) {
     if (n == null) return "–";
     const a = Math.abs(n);
-    if (a >= 1073741824) return (n / 1073741824).toLocaleString("de-DE", { maximumFractionDigits: 2 }) + " GiB";
-    if (a >= 1048576) return (n / 1048576).toLocaleString("de-DE", { maximumFractionDigits: 1 }) + " MiB";
-    if (a >= 1024) return (n / 1024).toLocaleString("de-DE", { maximumFractionDigits: 1 }) + " KiB";
-    return n.toLocaleString("de-DE") + " B";
+    if (a >= 1073741824) return (n / 1073741824).toLocaleString("en-US", { maximumFractionDigits: 2 }) + " GiB";
+    if (a >= 1048576) return (n / 1048576).toLocaleString("en-US", { maximumFractionDigits: 1 }) + " MiB";
+    if (a >= 1024) return (n / 1024).toLocaleString("en-US", { maximumFractionDigits: 1 }) + " KiB";
+    return n.toLocaleString("en-US") + " B";
   }
-  const zahl = (n) => (n == null ? "–" : n.toLocaleString("de-DE"));
+  const zahl = (n) => (n == null ? "–" : n.toLocaleString("en-US"));
   const leaf = (o) => (o && typeof o === "object" && "v" in o ? o : { v: null, src: "" });
 
   /* Das Schätzprofil als flache Zeilenliste, gruppiert wie der Editor sie braucht. */
@@ -57,53 +59,53 @@
       out.push({ gruppe: gruppe, label: label, wert: wert, roh: l.v, src: l.src, hinweis: hinweis || l.note || "" });
     };
     const a = p.arch || {}, w = p.weights || {}, kv = p.kv || {}, st = p.state || {}, ex = p.experts || {}, dr = p.draft || {}, cx = p.context || {};
-    add("Modell", "Format", p.format, null, "Registry-Name; " + (leaf(p.format).src === "Index" ? "aus den Tensoren" : "aus der Config"));
-    add("Modell", "Art", a.family, (v) => (v === "moe" ? "MoE" : "dicht"));
-    add("Modell", "Layer", a.n_layers, zahl);
+    add("Model", "Format", p.format, null, "registry name; " + (leaf(p.format).src === "Index" ? "from the tensors" : "from the config"));
+    add("Model", "Type", a.family, (v) => (v === "moe" ? "MoE" : "dense"));
+    add("Model", "Layers", a.n_layers, zahl);
     const lc = leaf(a.layer_counts).v;
-    if (lc) out.push({ gruppe: "Modell", label: "Layertypen", wert: "Attention " + lc.attn + " · GDN " + lc.gdn + (lc.mamba ? " · Mamba " + lc.mamba : ""), roh: lc, src: leaf(a.layer_counts).src, hinweis: "" });
-    add("Modell", "Attention", a.attention, (v) => (v === "qsa" ? "QSA (Indexer)" : "voll"));
-    add("Modell", "Hidden-Größe", a.hidden, zahl);
-    add("Gewichte", "Gewichte gesamt", w.total_bytes, bytes, leaf(w.total_bytes).note);
+    if (lc) out.push({ gruppe: "Model", label: "Layer types", wert: "Attention " + lc.attn + " · GDN " + lc.gdn + (lc.mamba ? " · Mamba " + lc.mamba : ""), roh: lc, src: leaf(a.layer_counts).src, hinweis: "" });
+    add("Model", "Attention", a.attention, (v) => (v === "qsa" ? "QSA (indexer)" : "full"));
+    add("Model", "Hidden size", a.hidden, zahl);
+    add("Weights", "Weights total", w.total_bytes, bytes, leaf(w.total_bytes).note);
     const fam = w.per_family_mean_bytes || {};
-    add("Gewichte", "je Attention-Layer", fam.attn, bytes);
-    add("Gewichte", "je GDN-Layer", fam.gdn, bytes);
-    add("Gewichte", "je Mamba-Layer", fam.mamba, bytes);
-    add("Gewichte", "Layer ohne Experten", w.layers_bytes_nonexpert, bytes);
-    add("Gewichte", "Experten gesamt", w.layers_bytes_expert, (v) => (v ? bytes(v) : null));
-    add("Gewichte", "Einbettung", w.embed_bytes, bytes);
-    add("Gewichte", "lm_head", w.lm_head_bytes, bytes);
-    add("Gewichte", "Sichtturm", w.visual_bytes, bytes, "wird bei language_model_only nicht geladen");
-    add("Gewichte", "MTP-Kopf", w.mtp_bytes, bytes);
+    add("Weights", "per attention layer", fam.attn, bytes);
+    add("Weights", "per GDN layer", fam.gdn, bytes);
+    add("Weights", "per Mamba layer", fam.mamba, bytes);
+    add("Weights", "Layers without experts", w.layers_bytes_nonexpert, bytes);
+    add("Weights", "Experts total", w.layers_bytes_expert, (v) => (v ? bytes(v) : null));
+    add("Weights", "Embedding", w.embed_bytes, bytes);
+    add("Weights", "lm_head", w.lm_head_bytes, bytes);
+    add("Weights", "Vision tower", w.visual_bytes, bytes, "not loaded with language_model_only");
+    add("Weights", "MTP head", w.mtp_bytes, bytes);
     const ple = (w.ple || {}).ngram_table_bytes;
-    add("Gewichte", "n-gram-Tabelle", ple, bytes, "bleibt auf der Platte (mmap), erreicht das Gerät nie");
-    add("KV", "KV je Token und Attention-Layer", kv.cell_bytes_per_attn_layer_token, (v) => zahl(v) + " B", "Wahl: " + leaf(kv.chosen).v);
+    add("Weights", "n-gram table", ple, bytes, "stays on disk (mmap), never reaches the device");
+    add("KV", "KV per token and attention layer", kv.cell_bytes_per_attn_layer_token, (v) => zahl(v) + " B", "choice: " + leaf(kv.chosen).v);
     const vfp8 = ((kv.variants || {}).fp8_e4m3 || {}).bytes_per_token_all_attn_layers;
-    add("KV", "KV je Token (fp8, alle Attention-Layer)", vfp8, (v) => zahl(v) + " B");
-    add("Zustand", "Mamba/GDN-Zustand je Linear-Layer und Request", st.per_linear_layer_per_slot_mib, (v) => v.toLocaleString("de-DE", { maximumFractionDigits: 4 }) + " MiB",
-        "SSM-Dtype " + leaf(st.ssm_dtype).v + (st.variants_mib ? " (float32 " + st.variants_mib.float32 + " / bfloat16 " + st.variants_mib.bfloat16 + " MiB)" : ""));
+    add("KV", "KV per token (fp8, all attention layers)", vfp8, (v) => zahl(v) + " B");
+    add("State", "Mamba/GDN state per linear layer and request", st.per_linear_layer_per_slot_mib, (v) => v.toLocaleString("en-US", { maximumFractionDigits: 4 }) + " MiB",
+        "SSM dtype " + leaf(st.ssm_dtype).v + (st.variants_mib ? " (float32 " + st.variants_mib.float32 + " / bfloat16 " + st.variants_mib.bfloat16 + " MiB)" : ""));
     if (leaf(ex.n).v) {
-      add("Experten", "Anzahl", ex.n, zahl);
-      add("Experten", "top_k", ex.top_k, zahl);
-      add("Experten", "Bytes je Experte", ex.bytes_per_expert, bytes);
+      add("Experts", "Count", ex.n, zahl);
+      add("Experts", "top_k", ex.top_k, zahl);
+      add("Experts", "Bytes per expert", ex.bytes_per_expert, bytes);
     }
-    add("Draft", "MTP-Schichten", dr.mtp_layers, zahl);
-    if (dr.external) add("Draft", "externer Draft", dr.external.total_bytes, bytes, (dr.external.architectures || {}).v ? dr.external.architectures.v.join(", ") : "");
-    add("Kontext", "max. Positionen", cx.max_position_embeddings, zahl);
+    add("Draft", "MTP layers", dr.mtp_layers, zahl);
+    if (dr.external) add("Draft", "external draft", dr.external.total_bytes, bytes, (dr.external.architectures || {}).v ? dr.external.architectures.v.join(", ") : "");
+    add("Context", "max positions", cx.max_position_embeddings, zahl);
     const rp = (cx.rope || {});
-    add("Kontext", "Rope", rp.type, (v) => v + (leaf(rp.theta).v ? " · θ " + zahl(leaf(rp.theta).v) : ""));
-    add("Kontext", "Rope-erweitert", cx.rope_extended_tokens, zahl);
-    add("Aktivierung", "Extend-Rate je Zeile", (p.activation || {}).extend_rate_mib_per_row, (v) => v.toLocaleString("de-DE", { maximumFractionDigits: 4 }) + " MiB",
-        "Startwert aus der Geometrie; die Messung am Rang ersetzt ihn");
+    add("Context", "Rope", rp.type, (v) => v + (leaf(rp.theta).v ? " · θ " + zahl(leaf(rp.theta).v) : ""));
+    add("Context", "Rope extended", cx.rope_extended_tokens, zahl);
+    add("Activation", "Extend rate per row", (p.activation || {}).extend_rate_mib_per_row, (v) => v.toLocaleString("en-US", { maximumFractionDigits: 4 }) + " MiB",
+        "initial value from the geometry; the measurement on the rank replaces it");
     return out;
   }
 
   function tabelle(p) {
     const rows = zeilen(p);
-    let g = null, h = "<table class=\"mp-tab\"><thead><tr><th>Wert</th><th>Größe</th><th>Quelle</th></tr></thead><tbody>";
+    let g = null, h = "<table class=\"mp-tab\"><thead><tr><th>Value</th><th>Size</th><th>Source</th></tr></thead><tbody>";
     rows.forEach((r) => {
       if (r.gruppe !== g) { g = r.gruppe; h += "<tr class=\"mp-grp\"><th colspan=\"3\">" + esc(g) + "</th></tr>"; }
-      h += "<tr><td title=\"" + esc(r.hinweis) + "\">" + esc(r.label) + "</td><td>" + esc(r.wert) + "</td><td title=\"" + esc(QUELLE[r.src] || "") + "\">" + esc(r.src) + "</td></tr>";
+      h += "<tr><td title=\"" + esc(r.hinweis) + "\">" + esc(r.label) + "</td><td>" + esc(r.wert) + "</td><td title=\"" + esc(QUELLE[r.src] || "") + "\">" + esc(QUELLE_LABEL[r.src] || r.src) + "</td></tr>";
     });
     return h + "</tbody></table>";
   }
