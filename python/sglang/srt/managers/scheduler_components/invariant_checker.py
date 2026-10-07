@@ -59,6 +59,19 @@ logger = logging.getLogger(__name__)
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 
+def idle_mamba_check_every(*, group: str, every: int) -> int:
+    """D-IDLE-MAMBA-1007: on how many idle passes the Mamba pool ledger runs
+    once. ``every`` (``SGLANG_WEG2_IDLE_MAMBA_CHECK_EVERY``) binds group D
+    alone; any other group -- the flip path's included -- checks on every
+    pass, as before. The ledger is rank-local (allocator free list, the
+    rank's own radix tree, no collective), so a rank that skips a pass cannot
+    disagree with one that does not; a leak is reported up to ``every - 1``
+    idle passes later, never missed."""
+    if group.strip().upper() != "D":
+        return 1
+    return max(1, int(every))
+
+
 def _dcp_global_slot_total(
     server_args: ServerArgs,
     allocator: BaseTokenToKVPoolAllocator,
@@ -111,6 +124,10 @@ class SchedulerInvariantChecker:
     #: may actually run, and what it cost when it did. See the module
     #: docstring of `idle_census_cadence` for the boot this exists for.
     idle_census: IdleCensusCadence = field(default_factory=IdleCensusCadence)
+    #: D-IDLE-MAMBA-1007: :func:`idle_mamba_check_every`; 1 = every pass.
+    idle_mamba_check_every: int = 1
+    #: idle passes seen, for :meth:`take_idle_mamba_turn`
+    idle_mamba_passes: int = 0
 
     def _allocator(self):
         """The KV allocator AS BOUND RIGHT NOW.
@@ -967,8 +984,19 @@ class SchedulerInvariantChecker:
             msg,
         )
 
+    def take_idle_mamba_turn(self) -> bool:
+        """Count one idle pass; True on the passes whose Mamba ledger runs
+        (the first, then every ``idle_mamba_check_every``-th)."""
+        due = self.idle_mamba_passes % self.idle_mamba_check_every == 0
+        self.idle_mamba_passes += 1
+        return due
+
     def _check_all_pools(
-        self, ps: PoolStats, uncached: int = 0, allow_enumeration: bool = True
+        self,
+        ps: PoolStats,
+        uncached: int = 0,
+        allow_enumeration: bool = True,
+        check_mamba: bool = True,
     ) -> Tuple[bool, List[str]]:
         """Check memory invariant across all pools. Returns (has_leak, messages).
 
@@ -976,6 +1004,9 @@ class SchedulerInvariantChecker:
         message already queued, so the O(1) ledger still runs but the row
         census that would explain a disagreement is postponed rather than
         made to compete with the loop's service of that message.
+
+        ``check_mamba=False`` is D-IDLE-MAMBA-1007: this idle pass is not the
+        Mamba ledger's turn (:meth:`take_idle_mamba_turn`).
         """
         has_leak = False
         messages = []
@@ -991,7 +1022,7 @@ class SchedulerInvariantChecker:
             has_leak |= swa_leak
             messages.append(swa_msg)
 
-        if self.is_hybrid_ssm and self.tree_cache.supports_mamba():
+        if check_mamba and self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             mamba_leak, mamba_msg = self._check_mamba_pool(ps)
             has_leak |= mamba_leak
             messages.append(mamba_msg)

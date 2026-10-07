@@ -915,6 +915,11 @@ class Envs:
     # (weg2/gc_instrument.arm_after_boot) when --gc-warning-threshold-secs is
     # 0; the launcher sets 0.5 for group P by default (--env-p states another).
     SGLANG_WEG2_GC_WARN_SECS = EnvFloat(0.0)
+    # D-IDLE-MAMBA-1007: group D runs the idle Mamba pool ledger
+    # (invariant_checker._check_mamba_pool, rank-local, 20-120 ms measured on
+    # NF D) only on every K-th idle pass. 1 = every pass, as before; every
+    # other group ignores it, so the flip path keeps its check per pass.
+    SGLANG_WEG2_IDLE_MAMBA_CHECK_EVERY = EnvInt(1)
     # the sleeping group(s) that take the lookahead (comma list, default the
     # P->D direction only: P sleeps, PP0's chain is the Flipzeit's legs).
     SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD_GROUPS = EnvStr("P")

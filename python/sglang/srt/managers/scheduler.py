@@ -303,6 +303,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_admission_wedge_watchdog,
     create_scheduler_watchdog,
+    idle_mamba_check_every,
 )
 from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
@@ -5018,6 +5019,10 @@ class Scheduler(
             # the on-idle ledger keeps auditing the boot phase's pool for the
             # rest of the process -- see SchedulerInvariantChecker._allocator.
             get_token_to_kv_pool_allocator=lambda: self.token_to_kv_pool_allocator,
+            idle_mamba_check_every=idle_mamba_check_every(
+                group=os.environ.get("SGLANG_WEG2_GROUP", ""),
+                every=envs.SGLANG_WEG2_IDLE_MAMBA_CHECK_EVERY.get(),
+            ),
         )
 
     def init_parked_decode_set(self) -> None:
@@ -19588,6 +19593,7 @@ class Scheduler(
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
                 allow_enumeration=allow_enumeration,
+                check_mamba=self.invariant_checker.take_idle_mamba_turn(),
             )
             if has_leak:
                 # The ledger names the SIZE of the evictable term, never who

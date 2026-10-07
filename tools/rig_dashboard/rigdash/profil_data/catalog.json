@@ -29542,7 +29542,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2416
+      "line": 2421
      }
     }
    },
@@ -29597,7 +29597,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2406
+    "line": 2411
    },
    "status": "geerntet",
    "text": "",
@@ -29620,7 +29620,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2452
+      "line": 2457
      }
     }
    },
@@ -38339,7 +38339,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4517
+    "line": 4522
    },
    "status": "unerklaert",
    "text": "",
@@ -38657,7 +38657,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4516
+    "line": 4521
    },
    "status": "geerntet",
    "text": "",
@@ -39205,7 +39205,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2427
+      "line": 2432
      }
     }
    },
@@ -39374,7 +39374,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2431
+      "line": 2436
      }
     }
    },
@@ -53576,7 +53576,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1613
+    "line": 1618
    },
    "status": "geerntet",
    "text": "",
@@ -65124,7 +65124,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1552
+    "line": 1557
    },
    "status": "erklaert",
    "text": "Schutz gegen eine gegenseitige Blockade beim Aufwecken von D zu P: zwei Gruppen warten im Kreis auf Speicherplatz. An: der wartende Teil zählt sein eigenes Warten schon ab dem Beginn der Wartezeit; die Auflösung (Rest in den Host-RAM auslagern) beginnt nach ca. 0,1 s statt ca. 0,6 s. Aus: erst nachdem die Warte-Flagge nach 0,5 s hochgegangen ist. Standard aus (Vorbereitung/Experiment, „Default off until metal A/B“). Laut Code nötig, bevor SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED (steht auf aus) wieder an geht. Verwandt: SGLANG_WEG2_BAR1_SPILL_GRACE_S (0,1 s). Wirkt nur für die sendende Seite. Am Metall nicht einzeln belegt. Kein Nutzerwert erkennbar.",
@@ -65749,7 +65749,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1861
+      "line": 1866
      }
     }
    },
@@ -69810,7 +69810,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 959
+    "line": 964
    },
    "status": "erklaert",
    "text": "Schwelle in Millisekunden für SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH: wie viel geschätzte Nachlade-Wartezeit mindestens anfallen muss, damit die Kurz-Anfrage zu P ausweicht. Die Schätzung ist fest 624 ms (eine Welle) bzw. 1248 ms (zwei Wellen, ab 190 ungecachten Tokens). Wert bis 624: jede Anfrage ab 8 Tokens weicht aus; 625 bis 1248: nur die ab 190 Tokens; über 1248: nie. Standard 600. Wirkungslos ohne SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH=1 und ohne SGLANG_WEG2_ENABLE_D_DIRECT_YIELD. Hinweis: Der Kommentar in environ.py („raising it past 1248 exposes only the two-wave SHORTs“) widerspricht der Logik im Code (liegt die Schätzung unter der Schwelle, bleibt die Anfrage auf D); diese Erklärung folgt der Logik. Einstellzahl für ein Experiment. Unbelegt: ob und wie der Nutzer sie ändern soll.",
@@ -70841,7 +70841,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3552
+      "line": 3557
      }
     }
    },
@@ -71122,7 +71122,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1959
+      "line": 1964
      }
     }
    },
@@ -71200,7 +71200,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4224
+      "line": 4229
      }
     }
    },
@@ -71279,7 +71279,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2445
+      "line": 2450
      }
     }
    },
@@ -71479,7 +71479,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 949
+    "line": 954
    },
    "status": "geerntet",
    "text": "",
@@ -71508,7 +71508,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 955
+    "line": 960
    },
    "status": "erklaert",
    "text": "Eine kurze Anfrage, die auf D direkt vorgerechnet würde, dort aber hauptsächlich auf das Nachladen von Experten-Gewichten aus dem RAM wartet (ca. 0,6 s je Durchlauf), wird stattdessen mit P gemeinsam gerechnet, auch wenn gerade kein Flip absehbar ist. Aus: sie bleibt auf D. Standard aus (Experimentier-Schalter). Braucht SGLANG_WEG2_ENABLE_D_DIRECT_YIELD (Standard an); wirkt nur, wenn keine P-Anfrage in der Warteschlange wartet und die Anfrage mindestens 8 ungecachte Tokens hat. Schwelle: SGLANG_WEG2_D_DIRECT_YIELD_FETCH_MS. Am Metall: feuert (yield=d_direct_fetch 59/132/60 Zeilen), Wirkung auf Latenz/Durchsatz laut Bericht „not evidenced“. Unbelegt: ob er dem Nutzer etwas bringt.",
@@ -71593,7 +71593,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1979
+    "line": 1984
    },
    "status": "geerntet",
    "text": "",
@@ -71795,7 +71795,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1883
+    "line": 1888
    },
    "status": "geerntet",
    "text": "",
@@ -71818,7 +71818,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2436
+      "line": 2441
      }
     }
    },
@@ -71930,7 +71930,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 971
+    "line": 976
    },
    "status": "geerntet",
    "text": "",
@@ -72040,7 +72040,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4204
+      "line": 4209
      }
     }
    },
@@ -72498,7 +72498,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 964
+    "line": 969
    },
    "status": "geerntet",
    "text": "",
@@ -72729,7 +72729,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1894
+    "line": 1899
    },
    "status": "geerntet",
    "text": "",
@@ -72757,7 +72757,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1889
+    "line": 1894
    },
    "status": "geerntet",
    "text": "",
@@ -73256,7 +73256,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1131
+      "line": 1136
      }
     }
    },
@@ -73310,7 +73310,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1134
+    "line": 1139
    },
    "status": "geerntet",
    "text": "",
@@ -73460,7 +73460,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 977
+    "line": 982
    },
    "status": "geerntet",
    "text": "",
@@ -73702,7 +73702,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1022
+    "line": 1027
    },
    "status": "erklaert",
    "text": "Vor dem Schlaf räumt das System den Zwischenspeicher auf („Veröffentlichungsrunde“, ca. 1,2 s je Abfrage). An: eine Runde, die nichts bewegen konnte, wird bei der nächsten Abfrage nicht noch einmal gemacht, solange sich nichts geändert hat (spart die ca. 1,2 s). Aus: jede Abfrage macht die Runde neu. Standard aus (optionaler Beschleuniger, „until metal“). Wirkt nur, wenn der hierarchische Cache an ist, SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP nicht 0 ist (Standard 1), nichts läuft und kein Chunk offen ist. Am Metall feuert er (MEMO-SKIP 106/97 Zeilen); dass der 1177-ms-Stall dadurch wegfällt, ist nicht gezeigt. Unbelegt: ob der Nutzer ihn einschalten soll.",
@@ -75043,6 +75043,34 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_WEG2_IDLE_MAMBA_CHECK_EVERY": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "1",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "D-IDLE-MAMBA-1007: group D runs the idle Mamba pool ledger (invariant_checker._check_mamba_pool, rank-local, 20-120 ms measured on NF D) only on every K-th idle pass. 1 = every pass, as before; every other group ignores it, so the flip path keeps its check per pass.",
+   "id": "SGLANG_WEG2_IDLE_MAMBA_CHECK_EVERY",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_IDLE_MAMBA_CHECK_EVERY",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 922
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvInt"
+  },
   "SGLANG_WEG2_IDLE_VOTE_NO_REWANT": {
    "baeume": [
     "27b",
@@ -75150,7 +75178,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4324
+      "line": 4329
      }
     }
    },
@@ -77270,7 +77298,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4133
+      "line": 4138
      }
     }
    },
@@ -77831,7 +77859,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2312
+    "line": 2317
    },
    "status": "erklaert",
    "text": "Wenn eine angehaltene (geparkte) Anfrage später weiterlaufen soll und der Platz für Mamba-Anker im Host-RAM voll ist, bekommt ihr Wiedereinstiegspunkt Vorrang: andere Zwischenstände ohne Park-Bezug werden zuerst auf die Platte ausgelagert, damit der Einstiegspunkt der geparkten Anfrage nicht verloren geht. Aus: der alte Weg; geparkte Anfragen können ihren Einstiegspunkt verlieren und neu rechnen. Ohne Park ändert sich nichts. Wirkt nur auf Knoten, die als geparkt markiert sind. Standard an. Unbelegt: Abhängigkeit zu einem anderen Schalter; ob der Nutzer ihn ändern soll (belegt ist nur der Entscheid „bleibt an“ vom 05.10. ~17:47Z); Nutzen am Metall (laut Bericht „active, effect not shown“).",
@@ -77980,7 +78008,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1807
+    "line": 1812
    },
    "status": "geerntet",
    "text": "",
@@ -78037,7 +78065,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1830
+    "line": 1835
    },
    "status": "geerntet",
    "text": "",
@@ -80999,7 +81027,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1590
+      "line": 1595
      }
     }
    },
@@ -81764,7 +81792,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 916
+      "line": 917
      }
     }
    },
@@ -84468,7 +84496,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4311
+      "line": 4316
      }
     }
    },
@@ -85249,25 +85277,25 @@
    "abweichung": 43,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 31
+   "nur_nf": 32
   },
-  "entries": 2690,
-  "envs": 1813,
+  "entries": 2691,
+  "envs": 1814,
   "erklaert": 304,
   "flags": 862,
-  "geerntet": 1665,
+  "geerntet": 1666,
   "kuratiert": 119,
   "unerklaert": 602
  },
- "tree_rev": "27b=65fc0e2076+nf=c5da548b7c+hebel1",
+ "tree_rev": "27b=65fc0e2076+nf=89999eede5+hebel3b",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "65fc0e2076"
   },
   "nf": {
-   "entries": 2492,
-   "rev": "c5da548b7c+hebel1"
+   "entries": 2493,
+   "rev": "89999eede5+hebel3b"
   }
  },
  "warnungen": []
