@@ -260,6 +260,12 @@ def issue_short(doc: dict, *, persist: Optional[dict] = None, level: int = 3) ->
     return redact.text_for_issue("\n".join(L)) + "\n"
 
 
+#: Die UUID einer Karte steht NIE im Issue-Text: sie kennzeichnet genau diese Karte und ihren Rechner (Entscheid Nacharbeit 06.10.: sie wurde bisher nur von der
+#: Geheimnis-Heuristik von ``redact`` entfernt, wenn sie wie eines aussah; jetzt immer, damit Text und Tabelle dasselbe sagen).  Die Messwerte ordnen NVML-Index,
+#: Ord und die PCI-Bus-Adresse zu.
+UUID_REDACTED = "<entfernt>"
+
+
 def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[dict] = None, now: Optional[float] = None) -> str:
     """Der Issue-Text "Hardwareprofil" (GitHub-Markdown): NVML-Identität, Größen, cc, SM, Takt, Messraten (soweit vorhanden),
     Treiber/Image/Baum.  Geheimnisse und Hostpfade sind entfernt (``redact.text_for_issue``).  Ein Wert ohne Messung steht als
@@ -297,7 +303,7 @@ def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[
             ".".join(str(x) for x in (c.get("cc") or [])) or "?", _cell(c.get("sm_count"), 0), _cell(c.get("vram_total_mib"), 0),
             _cell(c.get("bar1_total_mib"), 0), ("Gen%s x%s" % (gen, wd)) if gen is not None and wd is not None else "nicht gemessen",
             _cell(ck.get("sm_max_mhz"), 0), _cell(ck.get("mem_max_mhz"), 0), _cell(c.get("mem_bus_bits"), 0),
-            _cell((c.get("power") or {}).get("limit_w"), 0), c.get("pci_bus_id") or "unbelegt", c.get("uuid") or "unbelegt")))
+            _cell((c.get("power") or {}).get("limit_w"), 0), c.get("pci_bus_id") or "unbelegt", UUID_REDACTED if c.get("uuid") else "unbelegt")))
     L.append("")
     L.append("### Speicher und Rechenleistung")
     L.append("")

@@ -257,7 +257,7 @@
         + (st.msg ? " <span>" + esc(st.msg) + "</span>" : "")
         + (r && r.profile && r.profile.measure_needed ? ' <span class="hwp-warn">Es fehlen Messwerte.</span>' : "") + "</div>";
       const issue = st.issue == null ? "" : '<div class="hwp"><h4>Issue-Text: Hardwareprofil</h4><p class="hwp-msg">Markdown zum Einfügen in ein GitHub-Issue. Geheimnisse und Pfade des Rechners sind entfernt; '
-        + 'UUID und PCI-Bus der Karten stehen drin, damit die Messwerte zuzuordnen sind.</p>'
+        + 'Die UUID der Karten ist immer als „&lt;entfernt&gt;“ geschwärzt (sie kennzeichnet genau Ihre Karte); NVML-Index und PCI-Bus stehen drin, damit die Messwerte zuzuordnen sind.</p>'
         + '<textarea class="hwp-issue" readonly spellcheck="false" aria-label="Issue-Text Hardwareprofil">' + esc(st.issue) + "</textarea>"
         + '<div class="hwp-bar"><button type="button" data-act="copy">In die Zwischenablage kopieren</button> <button type="button" data-act="issue-close">Schließen</button></div></div>';
       el.innerHTML = bar + render(r, {}) + issue;

@@ -24,6 +24,7 @@ import importlib.util
 import json
 import os
 import sys
+import shlex
 import tempfile
 import threading
 import time
@@ -131,7 +132,7 @@ def force_verdict(r: dict):
 def force_hint(dry, register: List[dict], line: str = "") -> dict:
     """Der Force-Teil des Export-Hinweises aus dem LETZTEN Trockenlauf (``dry`` = dessen Antwort oder ``None``).  Nur Text; startet nichts.
 
-    Fälle (``fall``): ``kein_trockenlauf`` | ``keine_ablehnung`` | ``nur_forcebar`` | ``gemischt`` | ``nur_nicht_forcebar`` | ``ungeprueft``.
+    Fälle (``fall``): ``kein_trockenlauf`` | ``kein_launcher_lauf`` (Vorschlag ohne Launcher-Lauf: Planer-Rechnung oder Orakel-Fehler, kein Urteil über Force) | ``keine_ablehnung`` | ``nur_forcebar`` | ``gemischt`` | ``nur_nicht_forcebar`` | ``ungeprueft``.
     Die Zeile ``-e FLLIPER_FORCE=1`` (``show_line``) gibt es genau dann, wenn mindestens eine Ablehnung forcebar ist.  Gerechnet wird NEU aus den
     Codes gegen das Register: was der Browser als ``force_state`` mitschickt, wird nicht geglaubt; nur Code und (gekürzter) Text werden gelesen."""
     reg = {r.get("code"): r for r in register or []}
@@ -153,6 +154,8 @@ def force_hint(dry, register: List[dict], line: str = "") -> dict:
     if not have_dry:
         fall, text = "kein_trockenlauf", ("Noch kein Trockenlauf für dieses Profil: ob der Serverstart Force braucht, zeigt der Trockenlauf "
                                           "(Karten wählen, prüfen lassen), danach erneut exportieren.")
+    elif dry.get("kein_lauf"):
+        fall, text = "kein_launcher_lauf", str(dry.get("force_satz") or "Kein Launcher-Lauf: über Force sagt der Vorschlag nichts; ein Trockenlauf (Neu prüfen) fragt den Launcher.")[:600]
     elif not rejs:
         fall, text = "keine_ablehnung", "Der Planer lehnt nichts ab; Force wird nicht gebraucht."
     elif force and blocked:
@@ -237,6 +240,73 @@ def _issue_cards(dry, cards) -> tuple:
         e = CAT.card(rc.get("card")) if isinstance(rc, dict) else None
         out.append(CAT.label(e) if e else "unbekannte Karte")
     return out, "gewählt, noch kein Trockenlauf"
+
+
+_AUSGANG_TEXT = {"geht": "geht ohne Force durch", "geht_mit_force": "geht nur mit Force durch", "verweigert": "verweigert, auch mit Force",
+                 "absturz": "Absturz des Trockenlaufs (kein Urteil über die Werte)", "orakel_fehler": "das Orakel konnte nicht fragen (kein Urteil)",
+                 "passt": "Planer-Rechnung: passt (kein Launcher-Lauf)", "passt_nicht": "Planer-Rechnung: passt nicht (kein Launcher-Lauf)",
+                 "unbelegt": "Planer-Rechnung: nicht rechenbar"}
+
+
+#: Ausgänge eines Vorschlags, bei denen KEIN Launcher-Lauf stattfand (Planer-Rechnung der Einzelkarte, Orakel nicht erreichbar)
+_OHNE_LAUF = ("passt", "passt_nicht", "unbelegt", "orakel_fehler")
+
+
+def _dry_ohne_lauf(vd: dict, ausgang: str) -> dict:
+    """Der Vorschlag ohne Launcher-Lauf in der Form eines Trockenlaufs: ``kein_lauf`` True, KEINE Ablehnungen (``rejections`` leer) und ein eigener Block statt
+    ``Trockenlauf:``: ``Planer-Rechnung: <Ausgang>`` mit den Prüfungen der Ebene ``fit`` oder ``Orakel-Fehler: <Text>``.  ``force_satz`` sagt ehrlich, dass daraus
+    kein Force-Urteil folgt (nicht ``Der Planer lehnt nichts ab``)."""
+    zeilen = []
+    for x in vd["verdikte"][:128]:
+        if not isinstance(x, dict):
+            continue
+        if ausgang == "orakel_fehler":
+            if x.get("ebene") == "orakel" and not zeilen:
+                zeilen.append(str(x.get("text") or x.get("grund") or x.get("code") or "")[:600])
+        elif x.get("ebene") == "fit" and isinstance(x.get("code"), str) and x["code"] != "EINZEL-PASSUNG":
+            zeilen.append("`%s`: %s" % (x["code"][:40], str(x.get("text") or x.get("grund") or "")[:300]))
+    if ausgang == "orakel_fehler":
+        t = zeilen[0] if zeilen else "ohne Text"
+        return {"rejections": [], "kein_lauf": True, "quelle": "vorschlag", "block_titel": "Orakel-Fehler: %s" % t, "block_zeilen": [],
+                "verdict": "Orakel-Fehler: %s" % t,
+                "force_satz": "Das Orakel konnte nicht fragen: es gibt kein Urteil, auch keines über Force; Neu prüfen fragt noch einmal.",
+                "notes": ["Kein Launcher-Lauf: der Vorschlag ist nicht geprüft."]}
+    titel = "Planer-Rechnung: %s" % _AUSGANG_TEXT.get(ausgang, ausgang or "ohne Ausgang").replace("Planer-Rechnung: ", "")
+    return {"rejections": [], "kein_lauf": True, "quelle": "vorschlag", "block_titel": titel, "block_zeilen": zeilen[:40], "verdict": titel,
+            "force_satz": "Kein Launcher-Lauf: die Planer-Rechnung nennt keinen Register-Code, den Force übergehen könnte; ob der Start eine Verweigerung bringt, "
+                          "zeigt erst ein Trockenlauf (Neu prüfen).",
+            "notes": ["Das ist eine Rechnung des Planers, kein Urteil des Launchers."]}
+
+
+def dry_from_vorschlag(vd) -> Optional[dict]:
+    """Der Orakel-Lauf des Vorschlags (``verdikt`` der Antwort von ``propose``, ``flliper.verdikt/1``) in der Form eines Trockenlaufs, damit der Laufbericht
+    auch ohne ``Neu prüfen`` sagt, was der Launcher zum Vorschlag gesagt hat.  Gelesen werden nur Code, Ebene und Text der Verdikte der Ebene Lauf/Absturz/Orakel;
+    die Forcebarkeit rechnet der Bericht aus dem Register neu (dem Browser wird sie nicht geglaubt).  ``None`` = kein gültiges Verdikt."""
+    if not isinstance(vd, dict) or vd.get("schema") != "flliper.verdikt/1" or not isinstance(vd.get("verdikte"), list):
+        return None
+    ausgang = str(vd.get("ausgang") or "")
+    orakel = vd.get("orakel") if isinstance(vd.get("orakel"), dict) else {}
+    laeufe = orakel.get("laeufe")
+    if ausgang in _OHNE_LAUF or laeufe == 0:
+        return _dry_ohne_lauf(vd, ausgang)
+    rej, seen = [], set()
+    for x in vd["verdikte"][:128]:
+        if not isinstance(x, dict) or x.get("ebene") not in ("lauf", "absturz", "orakel") or x.get("parent"):
+            continue
+        code = x.get("code")
+        if not isinstance(code, str) or not 0 < len(code) <= 40 or code in seen:
+            continue
+        seen.add(code)
+        q = {"code": code, "text": str(x.get("text") or x.get("grund") or "")[:2000]}
+        if x.get("klasse") == "nicht_forcebar":                    # nur zur Anzeige eines Codes ohne Registerzeile (W71-CENSUS, W64-OPPOINT): die Forcebarkeit bleibt "blockiert"
+            q["klass_label"] = "nicht forcebar"
+        if x.get("konsequenz"):
+            q["consequence"] = str(x["konsequenz"])[:400]
+        rej.append(q)
+    head = "Orakel-Lauf des Vorschlags%s: %s." % (" (Launcher-Trockenlauf, %s Lauf/Läufe)" % laeufe if isinstance(laeufe, int) and laeufe > 0 else "",
+                                                 _AUSGANG_TEXT.get(ausgang, ausgang or "ohne Ausgang"))
+    return {"rejections": rej, "verdict": head, "quelle": "vorschlag",
+            "notes": ["Der Orakel-Lauf gilt für den Vorschlag, wie er war; Änderungen danach sind darin nicht geprüft (Neu prüfen fragt noch einmal)."]}
 
 
 def _issue_model(model, doc_rows) -> List[str]:
@@ -350,6 +420,10 @@ def _issue_verdicts(dry, reg_rows: List[dict], line: str) -> List[str]:
     have = isinstance(dry, dict) and isinstance(dry.get("rejections"), list)
     if not have:
         L.append("Kein Trockenlauf gefahren (Abschnitt Trockenlauf: Karten wählen, prüfen lassen, den Laufbericht neu erzeugen).")
+    elif dry.get("kein_lauf"):
+        L.append(_md(dry.get("block_titel") or dry.get("verdict"), 600).rstrip(".") + ".")
+        if dry.get("block_zeilen"):
+            L += [""] + ["- %s" % _md(z, 400) for z in dry["block_zeilen"][:40]]
     else:
         L.append("Trockenlauf: %s" % _md(dry.get("verdict") or ("Der Planer lehnt nichts ab." if not dry["rejections"] else ""), 400))
     reg = {r.get("code"): r for r in reg_rows or []}
@@ -361,9 +435,10 @@ def _issue_verdicts(dry, reg_rows: List[dict], line: str) -> List[str]:
                 continue
             seen.add(q["code"])
             r = reg.get(q["code"]) or {}
-            label, state, _via = force_verdict(r) if r else ("unbekannter Code: nicht als forcebar behandelt", "blockiert", None)
-            L.append("| `%s` | %s | %s | %s | %s |" % (_md(q["code"], 40), _md(r.get("klass_label") or r.get("klass") or "?", 60), _md("%s: %s" % (state, label), 160),
-                                                       _md(_clip_text(q["code"], q.get("text")), 300), _md(r.get("consequence") or "–", 240)))
+            label, state, _via = force_verdict(r) if r else (("nicht forcebar: bleibt auch mit Force bestehen (Code des Planer-Verdikts, nicht im Launcher-Register)"
+                                                              if q.get("klass_label") == "nicht forcebar" else "unbekannter Code: nicht als forcebar behandelt"), "blockiert", None)
+            L.append("| `%s` | %s | %s | %s | %s |" % (_md(q["code"], 40), _md(r.get("klass_label") or r.get("klass") or q.get("klass_label") or "?", 60), _md("%s: %s" % (state, label), 160),
+                                                       _md(_clip_text(q["code"], q.get("text")), 300), _md(r.get("consequence") or q.get("consequence") or "–", 240)))
     fh = force_hint(dry, reg_rows, line)
     L += ["", "Force: %s" % _md(fh["text"], 400)]
     if fh["show_line"]:
@@ -731,15 +806,19 @@ class ProfilEditor:
 
     # ------------------------------------------------------------------ Issue-Text "Laufbericht" (AP-I)
     def issue_report(self, doc: dict, dry=None, cards=None, model=None, hardware_md: str = "", versions: Optional[dict] = None,
-                     now: Optional[float] = None) -> dict:
+                     now: Optional[float] = None, vorschlag=None) -> dict:
         """Der Laufbericht als EIN Markdown-Block für ein GitHub-Issue: Hardwareprofil (Kurzform, ``hardware_md`` kommt aus ``hwprofil.issue_short``),
         Modellprofil, Betriebsform, Vorschlag + Übersteuerungen, Verdikte/Force, Versionen und der Platzhalter für Messergebnis und Boot-Log-Auszug.
         Nur Text; das Dashboard startet nichts.  ``dry`` = Antwort des letzten Trockenlaufs (oder ``None``), ``cards`` = die gewählten Karten
         ``[{card, pcie}]``, ``model`` = ein Modellprofil ``flliper.model/1`` (oder ``None``), ``versions`` = ``hwprofil.version_facts``.
-        Geheimnisse (nach Name und nach Wert) und Hostpfade sind entfernt (``redact``); Forcebarkeit wird aus dem Register NEU gelesen."""
+        Geheimnisse (nach Name und nach Wert) und Hostpfade sind entfernt (``redact``); Forcebarkeit wird aus dem Register NEU gelesen.
+        ``vorschlag`` = das ``verdikt`` der letzten Antwort von ``propose``: gibt es keinen Trockenlauf (``Neu prüfen``), nimmt der Block Verdikte/Force den
+        Orakel-Lauf des Vorschlags (``dry_from_vorschlag``); ein Trockenlauf ist jünger und geht vor."""
         pj, _ref = self.mods()
         if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
             raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+        if not (isinstance(dry, dict) and isinstance(dry.get("rejections"), list)):
+            dry = dry_from_vorschlag(vorschlag) or dry
         view = pj.view(doc, self.catalog()["entries"], None, self.specs())
         try:
             reg = self.register()
@@ -1170,6 +1249,42 @@ class ProfilEditor:
             return "flag:" + lab
         return None
 
+    @staticmethod
+    def _argv_tokens(argv) -> List[str]:
+        """Die Tokens des argv, wie der Launcher sie sieht: ein Token mit Leerzeichen (``--extra-p=--flag a b``) wird mit ``shlex`` zerlegt, ``--flag=wert`` an
+        der ersten ``=`` getrennt; so steht ein Flag an JEDER Stelle eines ``--extra-*=...``-Tokens als eigenes Token da (nicht nur am Ende)."""
+        out: List[str] = []
+
+        def eq(x: str) -> None:                       # ``--flag=wert`` -> ``--flag``, ``wert`` (auch ``--extra-p=--flag=wert``); ein Wert mit Leerzeichen bleibt EIN Token
+            if x.startswith("--") and "=" in x:
+                k, v = x.split("=", 1)
+                out.append(k)
+                eq(v)
+            else:
+                out.append(x)
+
+        def add(t: str) -> None:
+            if " " in t.strip():
+                try:
+                    parts = shlex.split(t)
+                except ValueError:
+                    parts = t.split()
+                for x in parts:
+                    eq(x)
+            else:
+                eq(t)
+
+        for t in argv:
+            add(str(t))
+        return out
+
+    @staticmethod
+    def argv_has(launch, flag: str, value: str) -> bool:
+        """Steht ``flag value`` im argv des Vorschlags (``launch = {argv, env}``): als zwei Tokens (``--pp-stage-ratio 31,17,16``) oder als ``--flag=value`` /
+        ``--extra-p=... --flag value ...`` an jeder Position des Tokens (``ProfilEditor._argv_tokens``).  Nur der Vergleich der Zeichenketten, keine Rechnung."""
+        toks = ProfilEditor._argv_tokens((launch or {}).get("argv") or [])
+        return any(t == flag and toks[i + 1] == value for i, t in enumerate(toks[:-1]))
+
     def _startprofil(self, base: dict, vorschlag: dict, basis_name: str) -> tuple:
         """Das Startprofil ``flliper.server/1``: das Basisprofil mit den Werten, die der Vorschlag ändert (Herkunft ``planer``).  Gibt
         ``(doc, keys, nicht_uebernommen)``: ``keys`` = Label -> Profilschlüssel der geänderten Zeilen."""
@@ -1332,6 +1447,17 @@ class ProfilEditor:
             wv = {"key": dkey, "label": w["key"], "wert": w.get("wert"), "alt": w.get("alt"), "zustand": w.get("zustand"), "herkunft": w.get("herkunft"),
                   "grund": w.get("grund"), "geaendert": bool(w.get("geaendert")), "in_argv": bool(w.get("in_argv")), "eintraege": w.get("eintraege"),
                   "verdikte": je_wert.get(w["key"], []), "kanten": kanten}
+            if dkey is None and str(w["key"]).endswith(" (Seed)"):
+                # der P-Schnitt-Seed ist keine Profilzeile: ``seed`` + der Wert, den das Profil unter diesem Namen schon hat (None = setzt es nicht), damit die
+                # Seite weder "nicht gesetzt" sagt, wo das Profil den Wert setzt, noch einen Wert als Änderung zählt, der nicht im argv steht
+                sname = str(w["key"])[: -len(" (Seed)")]
+                pw = next((r["value"] for r in pj.rows(doc, self.specs()) if r.get("name") == sname and r.get("value") not in (None, "")), None)    # das BASISprofil, nicht das Startprofil (der Vorschlag kann die Zeile entfernen)
+                wv["seed"] = True
+                wv["profil_wert"] = None if pw is None else str(pw)
+                # ``in_argv`` des Planers heisst "der Planer wendet den Seed an", nicht "der Wert steht im argv": im Dual (Profil-Modus) bleibt der Schnitt des Profils im
+                # argv, und der Seed (GEMM-Rate) ist nur die Rechnung dahinter.  Fuer die Seite zaehlt, was der Launcher wirklich bekommt.
+                wv["in_argv_planer"] = wv["in_argv"]
+                wv["in_argv"] = bool(wv["in_argv"]) and w.get("wert") is not None and self.argv_has(res.get("launch"), sname, str(w["wert"]))
             werte.append(wv)
             if row is not None:
                 row["vorschlag"] = {k: wv[k] for k in ("zustand", "herkunft", "grund", "verdikte", "kanten", "geaendert")}
