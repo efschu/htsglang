@@ -269,6 +269,26 @@ class MMExpansion:
     ends: List[int] = dataclasses.field(default_factory=list)
 
 
+def _mm_expand_widths(compact: np.ndarray, pos: np.ndarray, keys: Sequence[str],
+                      widths: Sequence[int]) -> MMExpansion:
+    """``compact`` with placeholder ``i`` replaced by ``widths[i]`` copies of its
+    key's surrogate; ``pos`` are the placeholder positions."""
+    parts: List[np.ndarray] = []
+    ends: List[int] = []
+    last = width_sum = 0
+    for p, k, width in zip(pos.tolist(), keys, widths):
+        parts.append(compact[last:p])
+        width_sum += p - last
+        parts.append(np.full(int(width), mm_surrogate_value(k), dtype=np.int32))
+        width_sum += int(width)
+        ends.append(width_sum)
+        last = p + 1
+    parts.append(compact[last:])
+    ids = np.concatenate(parts).astype(np.int32, copy=False)
+    return MMExpansion(ids=ids, image_end=int(ends[-1]), first_image=int(pos[0]),
+                       n_images=len(keys), ends=ends)
+
+
 def mm_expand(compact: np.ndarray, image_token_id: Optional[int], keys: Sequence[str],
               ktok: Dict[str, int]) -> Optional[MMExpansion]:
     """``compact`` with each image placeholder replaced by K surrogate ids;
@@ -279,21 +299,41 @@ def mm_expand(compact: np.ndarray, image_token_id: Optional[int], keys: Sequence
     pos = np.flatnonzero(compact == int(image_token_id))
     if pos.size != len(keys) or any(k not in ktok for k in keys):
         return None
-    parts: List[np.ndarray] = []
-    ends: List[int] = []
-    last = width_sum = 0
-    for p, k in zip(pos.tolist(), keys):
-        parts.append(compact[last:p])
-        width_sum += p - last
-        width = int(ktok[k])
-        parts.append(np.full(width, mm_surrogate_value(k), dtype=np.int32))
-        width_sum += width
-        ends.append(width_sum)
-        last = p + 1
-    parts.append(compact[last:])
-    ids = np.concatenate(parts).astype(np.int32, copy=False)
-    return MMExpansion(ids=ids, image_end=int(ends[-1]), first_image=int(pos[0]),
-                       n_images=len(keys), ends=ends)
+    return _mm_expand_widths(compact, pos, keys, [int(ktok[k]) for k in keys])
+
+
+def mm_expand_sum(compact: np.ndarray, image_token_id: Optional[int], keys: Sequence[str],
+                  total: Optional[int]) -> Optional[MMExpansion]:
+    """MM-SUM-1007: the expansion of a request whose images the front never learned ONE
+    BY ONE but whose exact image set (the ordered tuple of image hashes) a group
+    served before: ``total`` = the sum of ALL its images' token counts, as realised.
+
+    The prompt length (``compact - n_images + total``) and the end of the LAST image are
+    exact whatever each image's own K is -- every image sits before or at the last one.
+    The positions inside the run of images are an equal split (deterministic for the
+    same tuple, so every later request of the set matches its predecessor token for
+    token); a request is never sent these ids, they are the front's own keys."""
+    if image_token_id is None or not keys or total is None:
+        return None
+    compact = np.asarray(compact, dtype=np.int32)
+    pos = np.flatnonzero(compact == int(image_token_id))
+    n = len(keys)
+    if pos.size != n or int(total) < n:
+        return None
+    base, rest = divmod(int(total), n)
+    widths = [base] * n
+    widths[-1] += rest
+    return _mm_expand_widths(compact, pos, keys, widths)
+
+
+def mm_sum_learn(n_compact: int, keys: Sequence[str], realised: int) -> Optional[int]:
+    """MM-SUM-1007: the sum of all the images' token counts of a request from the prompt
+    length a group realised; None when it is not a plausible count."""
+    n = len(keys)
+    if n == 0 or int(realised) <= 0:
+        return None
+    total = int(realised) - (int(n_compact) - n)
+    return total if total >= n else None
 
 
 def mm_d_reach(credit: int, n_tokens: int, page: int = ANCHOR_PAGE) -> Tuple[int, int]:

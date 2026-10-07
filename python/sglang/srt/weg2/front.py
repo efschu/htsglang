@@ -102,6 +102,18 @@ def _ft_mm_learn(*args):
     return mm_learn(*args)
 
 
+def _ft_mm_expand_sum(*args):
+    from sglang.srt.weg2.front_tokens import mm_expand_sum
+
+    return mm_expand_sum(*args)
+
+
+def _ft_mm_sum_learn(*args):
+    from sglang.srt.weg2.front_tokens import mm_sum_learn
+
+    return mm_sum_learn(*args)
+
+
 def _FtCount(**kw):
     from sglang.srt.weg2.front_tokens import Count
 
@@ -6240,6 +6252,14 @@ class Front:
                         lb.popitem(last=False)
                     mm = _ft_mm_expand(c0.ids, ft.image_token_id, mm_keys, self._mm_ktok())
                     if mm is None:
+                        # MM-SUM-1007: images never learned ONE BY ONE (several unseen at
+                        # once) but this exact image set (the ordered hashes) was served by a
+                        # group: its summed token count prices the request exactly
+                        mm = _ft_mm_expand_sum(c0.ids, ft.image_token_id, mm_keys,
+                                               self._mm_sums().get(tuple(mm_keys)))
+                        if mm is not None:
+                            self.counters["x_exact_mm_sum_priced"] += 1
+                    if mm is None:
                         reason = "multimodal-unseen-image"
                     else:
                         c = _FtCount(n=int(mm.ids.size), ids=mm.ids, ms=c0.ms,
@@ -6502,6 +6522,16 @@ class Front:
                 m.update(pers.ktok())
         return m
 
+    def _mm_sums(self) -> "collections.OrderedDict":
+        """MM-SUM-1007: ordered tuple of image keys -> the SUM of that set's image token
+        counts as a group realised it (front-local, this boot). It prices a request
+        whose images were never learned one by one -- the agent that sends the same
+        five screenshots every turn."""
+        m = self.__dict__.get("_mm_sum_map")
+        if m is None:
+            m = self.__dict__["_mm_sum_map"] = collections.OrderedDict()
+        return m
+
     def _mm_persist(self) -> Any:
         """MM-PERSIST-1002: the image table of the store directory
         (weg2/front_mm_persist.py), opened once; None when switched off."""
@@ -6550,7 +6580,9 @@ class Front:
         ft = getattr(self, "ftok", None)
         if info is None or ft is None:
             return None
-        return _ft_mm_expand(info[0], getattr(ft, "image_token_id", None), info[1], self._mm_ktok())
+        itid = getattr(ft, "image_token_id", None)
+        return (_ft_mm_expand(info[0], itid, info[1], self._mm_ktok())
+                or _ft_mm_expand_sum(info[0], itid, info[1], self._mm_sums().get(tuple(info[1]))))
 
     def _mm_learn(self, rid: str, text: str, realised: int) -> None:
         """A P leg 1 of an image request served ``realised`` prompt tokens (P's
@@ -6582,6 +6614,24 @@ class Front:
                         "images=%d%s (the image's token count as P served it; later requests "
                         "carrying it are priced exactly)", rid, key[:12], int(k), int(realised),
                         int(compact.size), len(keys), relearn)
+        # MM-SUM-1007: whatever one-by-one learning could say, the SUM of this exact image
+        # set is a plain fact of the prompt a group realised -- it prices every later
+        # request of the set (several unseen images at once could never be learned alone)
+        total = _ft_mm_sum_learn(int(compact.size), keys, int(realised or 0))
+        if total is not None:
+            sums = self._mm_sums()
+            tkey = tuple(keys)
+            if sums.get(tkey) != int(total):
+                sums[tkey] = int(total)
+                self.counters["x_exact_mm_sum_learned"] += 1
+                logger.info("WEG2 X-EXACT-MM-SUM rid=%s images=%d total_image_tokens=%d realised=%d "
+                            "compact=%d (the image set's summed token count as P served it; a later "
+                            "request carrying exactly these images is priced exactly and an image "
+                            "already inside D's cached prefix forces no flip)",
+                            rid, len(keys), int(total), int(realised), int(compact.size))
+            sums.move_to_end(tkey)
+            while len(sums) > 256:
+                sums.popitem(last=False)
         if ft.ids_for(text) is None:
             exp = self._mm_ids(rid)
             if exp is not None:
