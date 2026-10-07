@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Startzeile weg2</title>
+<title>weg2 launch line</title>
 <link rel="icon" type="image/svg+xml" href="mark.svg">
 <style>
 :root { color-scheme: light; --bg: #f4f4f2; --surface: #fcfcfb; --surface-2: #efeeea; --line: #dcdad4;
@@ -39,23 +39,23 @@ td b { color: var(--text); font-weight: 600; }
 </head>
 <body>
 <main>
-  <h1>Startzeile heute &mdash; weg2-Launcher im Docker-Container</h1>
-  <div class="muted">Erzeugt die Host-Zeile f&uuml;r <span id="ha">host_acceptance.sh</span> aus den Profil-Dateien, dem Build-Kontext und
-    <code>docker images</code> auf dem Proxmox-Host. Nichts davon ist fest eingetragen. Die Seite startet nichts.</div>
-  <div class="gpuq"><b>Zuerst ein gpuq-Fenster buchen</b> (Karten 0,1,2, ganze Karten) &mdash; <a id="gpuqlink" href="/" target="_blank" rel="noopener">GPU-Fensterplan</a>.
-    Dessen id ersetzt <code>&lt;fenster-id&gt;</code>. Ohne laufendes Fenster wird nicht gebootet. Die Zeile l&auml;uft als root auf dem Proxmox-Host.</div>
+  <h1>Launch line today &mdash; weg2 launcher in the Docker container</h1>
+  <div class="muted">Builds the host line for <span id="ha">host_acceptance.sh</span> from the profile files, the build context and
+    <code>docker images</code> on the Proxmox host. Nothing of this is hard-coded. The page starts nothing.</div>
+  <div class="gpuq"><b>Book a gpuq window first</b> (cards 0,1,2, whole cards) &mdash; <a id="gpuqlink" href="/" target="_blank" rel="noopener">GPU window plan</a>.
+    Its id replaces <code>&lt;fenster-id&gt;</code>. Without a running window nothing is booted. The line runs as root on the Proxmox host.</div>
   <div class="form">
-    <div><label for="profile">Release-Profil</label><select id="profile"></select></div>
-    <div><label for="image">Image (docker images auf dem Host)</label><select id="image"></select></div>
+    <div><label for="profile">Release profile</label><select id="profile"></select></div>
+    <div><label for="image">Image (docker images on the host)</label><select id="image"></select></div>
     <div><label for="transport">Transport</label><select id="transport"></select></div>
-    <div><label for="house">Haus-Schutz (HOUSE_GUARD)</label><select id="house"></select></div>
+    <div><label for="house">House guard (HOUSE_GUARD)</label><select id="house"></select></div>
   </div>
   <div id="profinfo"></div>
-  <pre id="cmd">lade&hellip;</pre>
-  <button id="copy">Zeile kopieren</button>
+  <pre id="cmd">loading&hellip;</pre>
+  <button id="copy">Copy line</button>
   <ul id="notes"></ul>
-  <div style="margin-top:10px"><button id="dry" class="primary">Trockenlauf (ohne Boot, ohne Karte)</button>
-    <span class="muted" id="drynote">f&uuml;hrt auf dem Host die Parameter-, Image-, Profil- und Haus-Argument-Pr&uuml;fung von host_acceptance.sh aus; startet keinen Container</span></div>
+  <div style="margin-top:10px"><button id="dry" class="primary">Dry run (no boot, no card)</button>
+    <span class="muted" id="drynote">runs the parameter, image, profile and house-argument checks of host_acceptance.sh on the host; starts no container</span></div>
   <div id="dryres"></div>
 </main>
 <script>
@@ -77,10 +77,10 @@ async function load() {
   const r = await fetch("api/weg2/options"); const d = await r.json();
   if (!d.ok) { $("cmd").textContent = d.error; return; }
   opts = d; $("ha").textContent = d.host_acceptance;
-  fill($("profile"), d.profiles.map((p) => [p.name, `${p.name} (Linie ${p.line}, Status ${p.status || "?"})`]), params.get("profile"));
+  fill($("profile"), d.profiles.map((p) => [p.name, `${p.name} (line ${p.line}, status ${p.status || "?"})`]), params.get("profile"));
   fill($("image"), d.images.filter((i) => i.ctx).map((i) => [i.image, `${i.image}${i.created ? "  · " + i.created.slice(0, 16) : ""}`]), params.get("image") || d.default_image);
   fill($("transport"), d.transports.map((t) => [t, t]), "bar1");
-  fill($("house"), d.house_guards.map((h) => [h, h === "memlimit" ? "memlimit (CT999 läuft weiter, Container gedeckelt)" : "ct999-ruht (CT999 ruht — nur der Nutzer)"]), "memlimit");
+  fill($("house"), d.house_guards.map((h) => [h, h === "memlimit" ? "memlimit (CT999 keeps running, container capped)" : "ct999-ruht (CT999 paused — user only)"]), "memlimit");
   if (d.images_error) $("notes").innerHTML = `<li class="err">docker images: ${esc(d.images_error)}</li>`;
   line();
 }
@@ -91,18 +91,18 @@ async function line() {
   $("cmd").textContent = d.command;
   $("notes").innerHTML = d.notes.map((n) => `<li>${esc(n)}</li>`).join("");
   const p = d.profile;
-  $("profinfo").innerHTML = `<table><tr><td>Kontext</td><td><b>${esc(d.ctx)}</b></td></tr>
-    <tr><td>Revision (Linie ${esc(p.line)})</td><td><b>${esc((d.revision || "").slice(0, 10))}</b></td></tr>
-    <tr><td>Profil</td><td><b>${esc(p.name)}</b> &middot; ${p.in_image ? "im Image" : "Host-Datei (PROFILE_MOUNT=1)"} &middot; Status ${esc(p.status || "?")}${p.nccl_status ? " &middot; nccl " + esc(p.nccl_status) : ""}</td></tr></table>`;
+  $("profinfo").innerHTML = `<table><tr><td>Context</td><td><b>${esc(d.ctx)}</b></td></tr>
+    <tr><td>Revision (line ${esc(p.line)})</td><td><b>${esc((d.revision || "").slice(0, 10))}</b></td></tr>
+    <tr><td>Profile</td><td><b>${esc(p.name)}</b> &middot; ${p.in_image ? "in the image" : "host file (PROFILE_MOUNT=1)"} &middot; status ${esc(p.status || "?")}${p.nccl_status ? " &middot; nccl " + esc(p.nccl_status) : ""}</td></tr></table>`;
 }
-$("copy").onclick = async () => { try { await navigator.clipboard.writeText($("cmd").textContent); $("copy").textContent = "kopiert"; } catch (e) { $("copy").textContent = "bitte markieren + kopieren"; } setTimeout(() => $("copy").textContent = "Zeile kopieren", 2000); };
+$("copy").onclick = async () => { try { await navigator.clipboard.writeText($("cmd").textContent); $("copy").textContent = "copied"; } catch (e) { $("copy").textContent = "please select + copy"; } setTimeout(() => $("copy").textContent = "Copy line", 2000); };
 $("dry").onclick = async () => {
-  $("dry").disabled = true; $("dryres").innerHTML = `<div class="muted">Trockenlauf läuft auf dem Host&hellip;</div>`;
+  $("dry").disabled = true; $("dryres").innerHTML = `<div class="muted">Dry run is running on the host&hellip;</div>`;
   try {
     const r = await fetch("api/weg2/dry?" + qs()); const d = await r.json();
     if (!d.ok) { $("dryres").innerHTML = `<div class="err">${esc(d.error)}</div>`; return; }
     const lines = (d.output || "").split("\n").filter((l) => /^DRY/.test(l));
-    $("dryres").innerHTML = `<div class="verdict ${d.green ? "green" : "red"}">${d.green ? "GRÜN" : "ROT"} &middot; rc ${d.rc} &middot; ${d.duration_s} s &middot; ${new Date(d.t * 1000).toLocaleTimeString("de-DE")}</div><pre>${esc(lines.join("\n"))}</pre>`;
+    $("dryres").innerHTML = `<div class="verdict ${d.green ? "green" : "red"}">${d.green ? "GREEN" : "RED"} &middot; rc ${d.rc} &middot; ${d.duration_s} s &middot; ${new Date(d.t * 1000).toLocaleTimeString("en-GB")}</div><pre>${esc(lines.join("\n"))}</pre>`;
   } finally { $("dry").disabled = false; }
 };
 ["profile", "image", "transport", "house"].forEach((id) => $(id).addEventListener("change", line));

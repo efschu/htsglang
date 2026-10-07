@@ -55,22 +55,22 @@
 (function (root) {
   "use strict";
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const fmt = (n) => (n == null ? "–" : Math.round(n).toLocaleString("de-DE"));
-  const gib = (n) => (n == null ? "–" : (n / 1024).toLocaleString("de-DE", { maximumFractionDigits: 1 }));
-  const pct = (a, t) => (t ? (100 * a / t).toLocaleString("de-DE", { maximumFractionDigits: 1 }) : "–") + " %";
+  const fmt = (n) => (n == null ? "–" : Math.round(n).toLocaleString("en-US"));
+  const gib = (n) => (n == null ? "–" : (n / 1024).toLocaleString("en-US", { maximumFractionDigits: 1 }));
+  const pct = (a, t) => (t ? (100 * a / t).toLocaleString("en-US", { maximumFractionDigits: 1 }) : "–") + " %";
 
   // Reihenfolge, Beschriftung, Erklärung: wie profile_couplings.BAR_SEGMENTS
   const SEGS = [
-    ["weights", "Gewichte", "dichte Gewichte der Layer dieser Stufe plus Einbettung (erste Stufe) bzw. lm_head (letzte Stufe)"],
-    ["experts", "Experten (resident)", "Expertenzeilen auf der Karte nach Pufferregel min(R + Scratch, E) je Layer"],
-    ["draft", "Draft/MTP", "Gewicht der MTP-Layer auf der letzten Stufe"],
-    ["kv", "KV", "Kontextziel × Attention-Layer der Stufe (+ eine Draft-Zeile) × KV-Zelle"],
-    ["state", "Mamba/GDN-Zustand", "Linear-Layer der Stufe × Zustand je Layer und Slot × Slots"],
-    ["activation", "Aktivierung", "Chunk-Zeilen × Extend-Rate (Spitze beim Prefill)"],
-    ["fixed", "Festposten", "CUDA-Kontext, Graphen, Allokator-Reste, Seam-Staging: nur am Metall zu messen (ohne Eingabe 0)"],
+    ["weights", "Weights", "dense weights of the layers of this stage plus embedding (first stage) or lm_head (last stage)"],
+    ["experts", "Experts (resident)", "expert rows on the card by the buffer rule min(R + scratch, E) per layer"],
+    ["draft", "Draft/MTP", "weight of the MTP layers on the last stage"],
+    ["kv", "KV", "context target × attention layers of the stage (+ one draft row) × KV cell"],
+    ["state", "Mamba/GDN state", "linear layers of the stage × state per layer and slot × slots"],
+    ["activation", "Activation", "chunk rows × extend rate (peak during prefill)"],
+    ["fixed", "Fixed items", "CUDA context, graphs, allocator remainders, seam staging: measurable only on the hardware (0 without input)"],
   ];
   const CLS = { weights: "w", experts: "x", draft: "d", kv: "k", state: "s", activation: "g", fixed: "c", free_in_budget: "f", corridor: "r", overflow: "over", reserve: "r", free: "f" };
-  const LEG_TAIL = [["reserve", "Reserve", "Kartengröße − Budget: bleibt frei (Reserve-Semantik)"], ["free", "Frei", "Budget − Posten"]];
+  const LEG_TAIL = [["reserve", "Reserve", "card size − budget: stays free (reserve semantics)"], ["free", "Free", "budget − items"]];
 
   // ---- Näherung: dieselbe Arithmetik wie profile_couplings.approx_terms ----------------------------------------------------------
   function sum(a, from, to) { let s = 0; for (let i = from; i < to; i++) s += a[i]; return s; }
@@ -78,7 +78,7 @@
     const n = pl.n_stages;
     const counts = stageLayers.map((c) => Math.trunc(c));
     if (counts.length !== n || sum(counts, 0, n) !== pl.layer_dense_mib.length || Math.min.apply(null, counts) < 0) {
-      throw new Error("Layer-Schnitt passt nicht zum Modell: " + counts.join(","));
+      throw new Error("Layer cut does not fit the model: " + counts.join(","));
     }
     const out = [];
     let start = 0;
@@ -105,7 +105,7 @@
   // Balken aus Posten (Näherung): Segmente bis zum Budget, der Rest als Überlauf, dann Rest/Reserve — wie profile_couplings.stage_bar
   function barFromTerms(t, budget, total, label) {
     const segs = [];
-    SEGS.forEach(([key, lab, what]) => { if (t[key] > 0) segs.push({ key, label: lab, mib: t[key], origin: "Näherung (Browser)", what }); });
+    SEGS.forEach(([key, lab, what]) => { if (t[key] > 0) segs.push({ key, label: lab, mib: t[key], origin: "approximation (browser)", what }); });
     let at = 0;
     const kept = [], cut = [];
     segs.forEach((s) => {
@@ -117,18 +117,18 @@
     const overflow = cut.reduce((a, c) => a + c.mib, 0);
     const free = Math.max(0, budget - kept.reduce((a, s) => a + s.mib, 0));
     const out = kept.slice();
-    if (overflow > 0) out.push({ key: "overflow", label: "Überlauf", mib: overflow, origin: "gerechnet", cut, what: "Posten über dem Budget (" + fmt(budget) + " MiB): " + cut.map((c) => c.label + " " + fmt(c.mib) + " MiB").join(", ") });
-    else if (free > 0) out.push({ key: "free_in_budget", label: "Rest im Budget", mib: free, origin: "gerechnet", what: "Budget − Posten (Obergrenze, solange Festposten nicht gemessen sind)" });
-    if (total - budget > 0) out.push({ key: "corridor", label: "Korridor/Reserve", mib: total - budget, origin: "Eingabe/gerechnet", what: "Kartengröße − Budget: bleibt frei (Reserve-Semantik)" });
+    if (overflow > 0) out.push({ key: "overflow", label: "Overflow", mib: overflow, origin: "computed", cut, what: "items over the budget (" + fmt(budget) + " MiB): " + cut.map((c) => c.label + " " + fmt(c.mib) + " MiB").join(", ") });
+    else if (free > 0) out.push({ key: "free_in_budget", label: "Remainder in budget", mib: free, origin: "computed", what: "budget − items (upper bound as long as fixed items are not measured)" });
+    if (total - budget > 0) out.push({ key: "corridor", label: "Corridor/reserve", mib: total - budget, origin: "input/computed", what: "card size − budget: stays free (reserve semantics)" });
     return { label, total_mib: total, budget_mib: budget, segments: out, free_mib: free, overflow_mib: overflow, needs_mib: t.needs };
   }
   function approxBars(pl, stageLayers, labels) {
-    return approx(pl, stageLayers).map((t, i) => barFromTerms(t, pl.budget_mib[i], pl.total_mib[i], (labels && labels[i]) || ("Karte " + (i + 1))));
+    return approx(pl, stageLayers).map((t, i) => barFromTerms(t, pl.budget_mib[i], pl.total_mib[i], (labels && labels[i]) || ("Card " + (i + 1))));
   }
 
   // ---- Vertrag flliper.balken/1: Normalisierung, Umrechnung aus der Näherung ---------------------------------------------------------
   // Ein Segment des Vertrags (name/herkunft/detail) und eines der Näherung (key/origin/what) werden zu EINER inneren Form.
-  const NC = "nicht gerechnet";
+  const NC = "not computed";
   function normSeg(s) {
     return { key: s.key || s.name, label: s.label || s.key || s.name, mib: s.mib == null ? null : s.mib, origin: s.origin || s.herkunft || "",
       what: s.what || s.detail || s.label || "", src: s.src, cut: s.cut, outside: !!(s.ausserhalb_budget || s.outside) };
@@ -157,9 +157,9 @@
     const overflow = Math.max(0, inside - budget), beyond = Math.max(0, known - total), overAvail = Math.max(0, budget - (available - userReserve));
     const reserve = Math.max(0, available - Math.max(budget, inside)), free = Math.max(0, Math.min(budget, available) - inside);
     if (reserve > 0) segs.push({ name: "reserve", label: "Reserve", mib: reserve, herkunft: budgetOrigin || "", gerechnet: true,
-      detail: LEG_TAIL[0][2] + (overflow > 0 ? " -- Wunsch " + fmt(available - budget) + " MiB, davon " + fmt(overflow) + " MiB aufgezehrt" : "") });
-    if (free > 0) segs.push({ name: "free", label: "Frei", mib: free, herkunft: "gerechnet", gerechnet: true,
-      detail: LEG_TAIL[1][2] + (missing.length ? " -- OBERGRENZE: nicht gerechnet sind " + missing.join(", ") : "") });
+      detail: LEG_TAIL[0][2] + (overflow > 0 ? " -- requested " + fmt(available - budget) + " MiB, of which " + fmt(overflow) + " MiB consumed" : "") });
+    if (free > 0) segs.push({ name: "free", label: "Free", mib: free, herkunft: "computed", gerechnet: true,
+      detail: LEG_TAIL[1][2] + (missing.length ? " -- UPPER BOUND: not computed are " + missing.join(", ") : "") });
     return { label, phase, total_mib: total, budget_mib: budget, budget_herkunft: budgetOrigin || "", segments: segs, posts_mib: known, free_mib: free,
       overflow_mib: overflow, beyond_card_mib: beyond, outside_budget_mib: outside, available_mib: available, budget_over_available_mib: overAvail,
       user_reserve_mib: userReserve, shared_with_d: (extra.shared || []).slice(), not_computed: missing.concat((extra.shared || []).filter((x) => x.mib == null).map((x) => x.label)) };
@@ -177,9 +177,9 @@
     const posts = SEGS.map(([key, lab, what]) => {
       if (key === "fixed" && !(kept.fixed > 0)) return { name: key, label: lab, mib: null, detail: what };
       const m = meta[key] || {};
-      return { name: key, label: lab, mib: kept[key] || 0, herkunft: m.origin || "Näherung (Browser)", detail: m.what || what };
+      return { name: key, label: lab, mib: kept[key] || 0, herkunft: m.origin || "approximation (browser)", detail: m.what || what };
     });
-    const out = contractBar(b.label, phase, b.total_mib, b.budget_mib, "Eingabe/gerechnet", posts);
+    const out = contractBar(b.label, phase, b.total_mib, b.budget_mib, "input/computed", posts);
     out.card = b.ord;
     return out;
   }
@@ -199,12 +199,12 @@
     if (!r) return "";
     const s = r.s;
     const beyond = Math.max(0, r.b - Math.max(bar.total_mib, r.a));         // Teil dieses Segments hinter der Kartengrenze
-    return "<b>" + esc(s.label) + "</b><br>" + fmt(s.mib) + " MiB (" + gib(s.mib) + " GiB) · " + pct(s.mib, bar.total_mib) + " der Karte<br>" +
-      "Herkunft: <b>" + esc(s.origin || "") + "</b>" + (s.src && String(s.origin || "").indexOf(s.src) < 0 ? ' <span class="muted">(' + esc(s.src) + ")</span>" : "") + "<br>" +
+    return "<b>" + esc(s.label) + "</b><br>" + fmt(s.mib) + " MiB (" + gib(s.mib) + " GiB) · " + pct(s.mib, bar.total_mib) + " of the card<br>" +
+      "Source: <b>" + esc(s.origin || "") + "</b>" + (s.src && String(s.origin || "").indexOf(s.src) < 0 ? ' <span class="muted">(' + esc(s.src) + ")</span>" : "") + "<br>" +
       '<span class="muted">' + esc(s.what || s.label) + "</span>" +
-      (s.outside ? '<br><span class="muted">liegt AUSSERHALB des Budgets (verkleinert das Verfügbare der Karte)</span>' : "") +
-      (beyond > 0 ? '<br><span class="kp-t-bad">' + fmt(beyond) + " MiB dieses Postens liegen HINTER der Kartengrenze (" + fmt(bar.total_mib) + " MiB): zu erwarten ist OOM.</span>" : "") +
-      (s.key === "overflow" ? '<br><span class="kp-t-bad">Posten über dem Budget: die Reserve wird aufgezehrt.</span>' : "");
+      (s.outside ? '<br><span class="muted">lies OUTSIDE the budget (reduces what is available on the card)</span>' : "") +
+      (beyond > 0 ? '<br><span class="kp-t-bad">' + fmt(beyond) + " MiB of this item lie BEYOND the card limit (" + fmt(bar.total_mib) + " MiB): expect OOM.</span>" : "") +
+      (s.key === "overflow" ? '<br><span class="kp-t-bad">Items over the budget: the reserve is consumed.</span>' : "");
   }
   function bar(b0, ctx) {
     const b = normBar(b0), m = model(b), w = (a) => (100 * a / m.scale).toFixed(3) + "%";
@@ -214,50 +214,50 @@
     const over = m.sum > b.total_mib + 0.01;
     // Überlauf: der Balken wächst über die Kartenkante; der Teil dahinter ist rot schraffiert (Überlagerung), die Kante trägt die Beschriftung
     const zone = over ? '<div class="kp-bz" style="left:' + w(b.total_mib) + '" aria-hidden="true"></div>' : "";
-    const edge = over ? '<div class="kp-edge" style="left:' + w(b.total_mib) + '" title="Kartenende ' + fmt(b.total_mib) + ' MiB"><span>Kartenende ' + gib(b.total_mib) + " GiB</span></div>" : "";
+    const edge = over ? '<div class="kp-edge" style="left:' + w(b.total_mib) + '" title="End of card ' + fmt(b.total_mib) + ' MiB"><span>End of card ' + gib(b.total_mib) + " GiB</span></div>" : "";
     return '<div class="kp-barw' + (over || b.overflow_mib > 0 || b.beyond_card_mib > 0 ? " kp-ov" : "") + '" data-bar="' + ctx + '"><div class="kp-bar">' + html + "</div>" + zone + edge + "</div>";
   }
   // Legende und Zeilen: Name · Zahlen · Überlauf in Klartext
   function legend() {
     return '<div class="kp-leg">' + SEGS.map(([k, l]) => '<span><i class="kp-s ks-' + CLS[k] + '"></i>' + esc(l) + "</span>").join("") +
       LEG_TAIL.map(([k, l]) => '<span><i class="kp-s ks-' + CLS[k] + '"></i>' + esc(l) + "</span>").join("") +
-      '<span><i class="kp-s ks-over kp-beyond"></i>Überlauf</span></div>';
+      '<span><i class="kp-s ks-over kp-beyond"></i>Overflow</span></div>';
   }
   function ncChips(b) {
     const nc = (b.segments || []).filter((s) => s.mib == null);
-    return nc.length ? '<div class="kp-ncs">' + nc.map((s) => { const n = normSeg(s); return '<span class="kp-nc" tabindex="0" data-tip="' + esc(n.what) + '"><b>' + esc(n.label) + "</b>: nicht gerechnet</span>"; }).join("") + "</div>" : "";
+    return nc.length ? '<div class="kp-ncs">' + nc.map((s) => { const n = normSeg(s); return '<span class="kp-nc" tabindex="0" data-tip="' + esc(n.what) + '"><b>' + esc(n.label) + "</b>: not computed</span>"; }).join("") + "</div>" : "";
   }
   // Dual-Form: Referenzposten OHNE Budgetverbrauch (Gewichte/Experten/KV, die in D's Union-Image bzw. im Karten-KV-Pool liegen): dünner Geisterstreifen
   // unter dem Balken im selben Maßstab (nicht Teil der Summe) plus Chips mit Tooltip; Posten ohne Zahl stehen als "nicht gerechnet"
   function refNote(r) {
-    return r.ref === "in_festposten" ? "steckt im Festposten" : "geteilt mit D";
+    return r.ref === "in_festposten" ? "included in the fixed items" : "shared with D";
   }
   function refs(b0, scale) {
     const b = normBar(b0), rs = (b.shared_with_d || []).map(normRef);
     if (!rs.length) return "";
-    const strip = rs.filter((r) => r.mib > 0 && r.ref !== "in_festposten").map((r) => '<i class="kp-gs" style="width:' + (100 * r.mib / scale).toFixed(3) + '%" title="' + esc(r.label + " " + fmt(r.mib) + " MiB (geteilt mit D, nicht im Budget)") + '"></i>').join("");
-    const chips = rs.map((r) => '<span class="kp-ref' + (r.mib == null ? " kp-nc" : "") + '" tabindex="0" data-tip="' + esc((r.what || "") + (r.origin ? " | Herkunft: " + r.origin : "")) + '"><b>' + esc(r.label) + "</b>: " +
-      (r.mib == null ? "nicht gerechnet" : fmt(r.mib) + " MiB " + refNote(r)) + "</span>").join("");
-    return (strip ? '<div class="kp-ghost" aria-hidden="true">' + strip + "</div>" : "") + '<div class="kp-refs"><span class="muted">Nicht im Budget:</span> ' + chips + "</div>";
+    const strip = rs.filter((r) => r.mib > 0 && r.ref !== "in_festposten").map((r) => '<i class="kp-gs" style="width:' + (100 * r.mib / scale).toFixed(3) + '%" title="' + esc(r.label + " " + fmt(r.mib) + " MiB (shared with D, not in the budget)") + '"></i>').join("");
+    const chips = rs.map((r) => '<span class="kp-ref' + (r.mib == null ? " kp-nc" : "") + '" tabindex="0" data-tip="' + esc((r.what || "") + (r.origin ? " | source: " + r.origin : "")) + '"><b>' + esc(r.label) + "</b>: " +
+      (r.mib == null ? "not computed" : fmt(r.mib) + " MiB " + refNote(r)) + "</span>").join("");
+    return (strip ? '<div class="kp-ghost" aria-hidden="true">' + strip + "</div>" : "") + '<div class="kp-refs"><span class="muted">Not in the budget:</span> ' + chips + "</div>";
   }
   function normRef(s) {
     return { label: s.label || s.name, mib: s.mib == null ? null : s.mib, ref: s.ref || "shared", origin: s.origin || s.herkunft || "", what: s.what || s.detail || "" };
   }
   function overNote(b) {
-    if (b.beyond_card_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.beyond_card_mib) + " MiB über der Karte.</b> Der Balken wächst über die Kartengrenze; zu erwarten ist OOM beim Laden oder beim Graphenaufbau.</div>";
-    if (b.overflow_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Die Reserve wird aufgezehrt.</div>";
-    if (b.budget_over_available_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": Budget " + fmt(b.budget_mib) + " MiB ist " + fmt(b.budget_over_available_mib) + " MiB größer als das Verfügbare</b> (Karte " + fmt(b.total_mib) + " − Festposten " + fmt(b.outside_budget_mib) + " MiB außerhalb des Budgets" + (b.user_reserve_mib > 0 ? " − Nutzerreserve " + fmt(b.user_reserve_mib) + " MiB (--d-reserve-mib)" : "") + "). Der Launcher meldet DARUEBER und startet trotzdem.</div>";
+    if (b.beyond_card_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.beyond_card_mib) + " MiB over the card.</b> The bar grows beyond the card limit; expect OOM during loading or graph capture.</div>";
+    if (b.overflow_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB over the budget.</b> The reserve is consumed.</div>";
+    if (b.budget_over_available_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": budget " + fmt(b.budget_mib) + " MiB is " + fmt(b.budget_over_available_mib) + " MiB larger than what is available</b> (card " + fmt(b.total_mib) + " − fixed items " + fmt(b.outside_budget_mib) + " MiB outside the budget" + (b.user_reserve_mib > 0 ? " − user reserve " + fmt(b.user_reserve_mib) + " MiB (--d-reserve-mib)" : "") + "). The launcher reports THIS and starts anyway.</div>";
     return "";
   }
   function render(bars, opt) {
     opt = opt || {};
     const rows = bars.map((b0, i) => {
       const b = normBar(b0);
-      const head = b.free_mib != null && !(b.overflow_mib > 0) ? "Rest " + fmt(b.free_mib) + " MiB" + (b.not_computed && b.not_computed.length ? " (Obergrenze)" : "") : "Überlauf " + fmt(b.overflow_mib) + " MiB über dem Budget" + (b.beyond_card_mib > 0 ? " · " + fmt(b.beyond_card_mib) + " MiB über der Karte" : "");
+      const head = b.free_mib != null && !(b.overflow_mib > 0) ? "Remainder " + fmt(b.free_mib) + " MiB" + (b.not_computed && b.not_computed.length ? " (upper bound)" : "") : "Overflow " + fmt(b.overflow_mib) + " MiB over the budget" + (b.beyond_card_mib > 0 ? " · " + fmt(b.beyond_card_mib) + " MiB over the card" : "");
       // Altform (Näherung): Überlauf als eigenes Segment, kein overflow_mib-Feld in der Darstellung nötig
       let ov = overNote(b);
-      if (!ov && b.overflow_mib > 0) ov = '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB über dem Budget.</b> Die Reserve wird aufgezehrt. " + esc((b.segments.find((s) => s.key === "overflow") || {}).what || "") + "</div>";
-      return '<div class="pf-bar"><div class="pf-bar-h"><b>' + esc(b.label) + '</b>' + (b.phase ? ' <span class="kp-ph-chip">' + esc(b.phase) + "</span>" : "") + ' <span class="muted">Budget ' + fmt(b.budget_mib) + " MiB von " + fmt(b.total_mib) + " MiB · " + head + "</span></div>" +
+      if (!ov && b.overflow_mib > 0) ov = '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.overflow_mib) + " MiB over the budget.</b> The reserve is consumed. " + esc((b.segments.find((s) => s.key === "overflow") || {}).what || "") + "</div>";
+      return '<div class="pf-bar"><div class="pf-bar-h"><b>' + esc(b.label) + '</b>' + (b.phase ? ' <span class="kp-ph-chip">' + esc(b.phase) + "</span>" : "") + ' <span class="muted">Budget ' + fmt(b.budget_mib) + " MiB of " + fmt(b.total_mib) + " MiB · " + head + "</span></div>" +
         bar(b, (opt.base || 0) + i) + refs(b, model(b).scale) + ncChips(b) + ov + "</div>";
     }).join("");
     return legend() + rows;
@@ -270,11 +270,11 @@
     Object.keys(res.phases || {}).forEach((name) => {
       const ph = res.phases[name];
       html += '<h3 class="pf-h3">' + esc(ph.label || name) + "</h3>";
-      if (ph.ok === false) { html += '<div class="kp-verdict bad">' + esc(ph.error || "nicht gerechnet") + "</div>"; return; }
+      if (ph.ok === false) { html += '<div class="kp-verdict bad">' + esc(ph.error || "not computed") + "</div>"; return; }
       html += render(ph.bars, { base: base + all.length });
       all = all.concat(ph.bars);
       if (ph.inputs && ph.inputs.length) {
-        html += '<details class="pf-fold kp-in"><summary>Eingaben dieser Phase (' + ph.inputs.length + ")</summary><ul class=\"pf-notes\">" +
+        html += '<details class="pf-fold kp-in"><summary>Inputs of this phase (' + ph.inputs.length + ")</summary><ul class=\"pf-notes\">" +
           ph.inputs.map((x) => "<li><b>" + esc(x.was) + "</b> = <span class=\"mono\">" + esc(x.wert) + "</span> <span class=\"muted\">· " + esc(x.herkunft) + "</span></li>").join("") + "</ul></details>";
       }
     });
