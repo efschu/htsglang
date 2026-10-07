@@ -63,8 +63,8 @@ Everything is optional and degrades gracefully:
   (duplicate `--rank-gpu-id`) are summed onto their shared card. Tooltips give
   GB and %, the origin (measured in the boot log) and a one-line explanation.
   If the posts add up to more than the card, the bar grows past the card edge
-  (edge marked, excess hatched red) and a notice "Karte N: X MiB über dem VRAM –
-  Profil passt nicht" names the largest posts. The live service's Kartenplaner tab
+  (edge marked, excess hatched red) and a notice "Card N: X MiB over the VRAM –
+  profile does not fit" names the largest posts. The live service's card planner tab
   (`rigdash/`) has the per-phase variant, see `rigdash/README.md`.
 * **Head / unit distribution** — Q heads as boxes colored by owning rank.
   Under replicated KV (TP > kv-heads) the split is taken **materialized** from
@@ -120,19 +120,19 @@ the DCP log line contains both a restart *recommendation*
 (`SGLANG_UNEVEN_TOKEN_VECTOR=…`) and the *active* materialized vector — the
 parser must take the active one.
 
-## Profil-Editor (Auftrag 930, S1)
+## Profile editor (order 930, S1)
 
-Reiter **Profil** (beide Ausgaben `rig` und `release` seit Nutzer-Entscheid 05.10., Auftrag 1984; nur im LAN, über den öffentlichen Proxy 403;
-in `release` bleibt Hardware MESSEN gesperrt: es bucht gpuq, 403 mit Klartext, der Knopf fehlt): ein Serverprofil laden (Release-`.env` aus `--profiles-release-dir`
-oder ein eigenes JSON aus `--profile-dir`, Env `FLLIPER_PROFILES_DIR`, Standard `/var/lib/flliper/profiles` -- derselbe Ort, den der Entrypoint liest), jeden Wert mit Erklärung, Herkunft (Profil / Nutzer / Planer / Default),
-Rücksetzknopf und Abhängigkeits-Chips bearbeiten, den Trockenlauf gegen gewählte Karten sehen (Ablehnungen mit Code, Klasse und der Aussage, was
-**Force am Serverstart** damit tut), speichern und als geprüftes `.env` exportieren.
+Tab **Profile** (both editions `rig` and `release` since user decision 05.10., order 1984; LAN only, 403 via the public proxy;
+in `release` measuring hardware stays locked: it books gpuq, 403 with plain text, the button is missing): load a server profile (release `.env` from `--profiles-release-dir`
+or a user JSON from `--profile-dir`, env `FLLIPER_PROFILES_DIR`, default `/var/lib/flliper/profiles` -- the same place the entrypoint reads), edit every value with explanation, origin (profile / user / planner / default),
+reset button and dependency chips, see the dry run against selected cards (refusals with code, class and the statement what
+**force at the server start** does with them), save and export as a checked `.env`.
 
-* Das Dashboard **erstellt** nur ein Profil und startet nichts; es hat keinen Force-Schalter. Am Server: `FLLIPER_PROFILE=<name>` und bei Bedarf
-  `FLLIPER_FORCE=1` (Launcher `--force`). Entrypoint-Patch gestaged: `/spinning/gpu-arb/docker/entrypoint.sh.profil-force-staged` (+ `.diff`).
-* Die Rechnung liegt im Planer-Baum (stdlib, per Dateipfad geladen): `weg2/profile_json.py`, `weg2/refusals.py`; Erklärungen aus
-  `rigdash/profil_data/catalog.json` (neu erzeugen: `python -m sglang.srt.weg2.profile_catalog --rev <sha> -o rigdash/profil_data/catalog.json`).
-* Ansicht Einfach (die wichtigsten Werte) / Experte (alle, Suche, Filter geändert / mit Planer-Wert / unerklärt).
-* `.env` bleibt die maßgebliche Quelle, bis der Round-Trip-Golden über alle Release-Profile dauerhaft grün ist
+* The dashboard only **creates** a profile and starts nothing; it has no force switch. On the server: `FLLIPER_PROFILE=<name>` and if needed
+  `FLLIPER_FORCE=1` (launcher `--force`). Entrypoint patch staged: `/spinning/gpu-arb/docker/entrypoint.sh.profil-force-staged` (+ `.diff`).
+* The calculation lives in the planner tree (stdlib, loaded by file path): `weg2/profile_json.py`, `weg2/refusals.py`; explanations from
+  `rigdash/profil_data/catalog.json` (regenerate: `python -m sglang.srt.weg2.profile_catalog --rev <sha> -o rigdash/profil_data/catalog.json`).
+* View simple (the most important values) / expert (all, search, filter changed / with planner value / unexplained).
+* `.env` stays the authoritative source until the round-trip golden over all release profiles is permanently green
   (`python -m sglang.srt.weg2.profile_json check /spinning/gpu-arb/docker/profiles_release`).
-* Deploy (Lead): `deploy/install_510.sh --check <sha>`, dann `deploy/install_510.sh <sha>` (stagt auch die Planer-Module des Editors).
+* Deploy (lead): `deploy/install_510.sh --check <sha>`, then `deploy/install_510.sh <sha>` (also stages the planner modules of the editor).

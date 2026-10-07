@@ -45,55 +45,42 @@ FORCE, BLOCKED, UNCHECKED, GOES, HINT = "force", "blockiert", "ungeprueft", "geh
 #: codes of THIS module that are not in ``refusals.REGISTER``: ``ebene`` says where they come from, ``parent`` the register code whose
 #: text names them (a blocker inside the ``HW-COUNT`` text is judged by its parent's class), ``titel`` / ``konsequenz`` are the fixed words
 OWN_CODES: Dict[str, Dict[str, Any]] = {
-    "FIT": {"ebene": "fit", "parent": None, "titel": "Passung nach hw_fit (notwendige Bedingung)",
-            "konsequenz": "hw_fit prueft nur die NOTWENDIGE Bedingung (Gewichte + KV + Mamba-Slots + Posten gegen Karte minus Residuum); "
-                          "ob der Start laeuft, sagt der Launcher-Lauf (die uebrigen Verdikte)."},
-    "DUAL-PASSUNG": {"ebene": "fit", "parent": None, "titel": "Dual-Passung: Planer-Rechnung, nicht hw_fit",
-                     "konsequenz": "hw_fit rechnet das Dual nicht (es druckt 'Dual ... NOT modelled'); der Planer rechnet je Karte P-Budget + Overhead + "
-                                   "Ruhe-Posten von D + D-Gewichte (mit Draft) gegen die Karte. Das ist eine NOTWENDIGE Bedingung aus Modellgroessen und "
-                                   "Records, keine Messung; ob der Start laeuft, sagt der Launcher-Lauf (die uebrigen Verdikte)."},
-    "DUAL-PFLICHT": {"ebene": "fit", "parent": None, "titel": "P-KV-Pflicht der Dual-Form je Karte (Planer-Rechnung)",
-                     "konsequenz": "P muss die KV-Pflicht (Standard 262144 Token) als EINEN Prompt tragen: Deckel, Level des P-Pools und der gemeinsame Pool "
-                                   "jeder Karte. Der Pool je Karte ist nur fuer die Karten und das Modell des Referenzboots geeicht; sonst steht dort "
-                                   "'nicht gerechnet'. Einen Dual-Pool-Riegel im Launcher gibt es nach dem 27B-Sitz nicht (done/dual-schnitt-262k-1006.md Abschnitt 5): diese Rechnung ist der einzige Schutz davor."},
-    "EINZEL-PASSUNG": {"ebene": "fit", "parent": None, "titel": "Einzelkarte: Passung als Planer-Rechnung (kein Launcher-Lauf)",
-                       "konsequenz": "Die Einzelkarte hat keinen weg2-Launcher (topology.py MIN_CARDS=2): der Planer rechnet Gewichte + Draft + KV-Pflicht + Mamba-Pool "
-                                     "+ Reserve gegen das statische Budget (Bruchteil x freier Speicher vor dem Laden). Das ist eine NOTWENDIGE Bedingung aus "
-                                     "Modellgroessen, keine Messung; ein Force gibt es bei N=1 nicht."},
-    "EINZEL-PARSE": {"ebene": "fit", "parent": None, "titel": "Einzelkarte: ServerArgs-Parse (nur argparse, ohne Geraet)",
-                     "konsequenz": "Der Parse prueft Flag-Namen, Auswahlwerte und Typen von ServerArgs.add_cli_args; ServerArgs.__post_init__ (Geraeteerkennung, "
-                                   "Kompatibilitaets-Refusals) braucht einen Beschleuniger und ist NICHT gelaufen."},
-    "FIT-STATIC": {"ebene": "fit", "parent": None, "titel": "Gewichte + Draft + KV + Mamba gegen das statische Budget",
-                   "konsequenz": "Der Pool ist groesser als --mem-fraction-static x freier Speicher vor dem Laden; die Runtime wuerde beim Laden oder Poolbau am Speicher scheitern."},
-    "FIT-RESERVE": {"ebene": "fit", "parent": None, "titel": "Reserve ausserhalb des statischen Budgets zu klein",
-                    "konsequenz": "Aktivierungen, CUDA-Graphen und Fragmentierung brauchen mehr als (1 - Bruchteil) des freien Speichers: ein Lauf kann an der Reserve scheitern."},
-    "FIT-CARD": {"ebene": "fit", "parent": None, "titel": "Statisches Budget groesser als die adressierbare Decke der Karte",
-                 "konsequenz": "Auf einer APU oder bei Hostpool teilen Geraet und Host den Speicher; das Budget liegt ueber der Decke."},
-    "FIT-CTX": {"ebene": "fit", "parent": None, "titel": "Kontext groesser als der KV-Pool",
-                "konsequenz": "Ein Prompt der Kontextlaenge passt nicht in den KV-Pool."},
-    "MAMBA-FLOOR": {"ebene": "fit", "parent": None, "titel": "Mamba-Pool unter der Untergrenze",
-                    "konsequenz": "Weniger Slots als Anfragen x Slots je Anfrage (mamba_pool_floor.py): der Server verweigert oder haelt Anfragen nicht."},
-    "PROFILE-VECTORS": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Positionsvektoren des Profils nicht fuer dieses Inventar",
-                        "konsequenz": "Das Profil traegt Vektoren (je Karte ein Eintrag) mit anderer Laenge als die Kartenzahl; der Launcher kann sie "
-                                      "nicht ableiten. Mit Vorschlag des Planers haben alle Vektoren genau N Eintraege."},
-    "RECORDS-NVEC": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Gemessene Records sind Vektoren eines anderen Inventars",
-                     "konsequenz": "Die Records des Profils (weg2/profile_records_data) sind Vektoren eines Inventars und fuer dieses nicht "
-                                   "ableitbar; ein Kalibrierboot dieser Karten muss sie schreiben. Im Launcher kann das spaeter als Absturz oder "
-                                   "Verweigerung auftreten (siehe ORAKEL-ABSTURZ)."},
-    "METAL-UNPROVEN": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Kartenzahl am Metall nicht bewiesen",
-                       "konsequenz": "Es gibt kein Release-Boot mit dieser Kartenzahl; die Rechnung des Planers ist Hochrechnung, keine Messung."},
-    "HW-BORROWED": {"ebene": "wert", "parent": None, "titel": "Wert von einer anderen Karte oder einem anderen Profil geborgt",
-                    "konsequenz": "Kein Ablehnungscode: der Wert ist von einer Zwillingskarte der Architektur oder einem anderen Profil geliehen "
-                                  "(unbelegt) und am Metall dieser Karten nicht gemessen."},
-    "UNBELEGT": {"ebene": "wert", "parent": None, "titel": "Wert ist Planer-Rechnung, nicht gemessen",
-                 "konsequenz": "Kein Ablehnungscode: der Wert ist Hochrechnung des Planers und am Metall dieser Karten nicht belegt."},
-    "PLANER": {"ebene": "planer", "parent": None, "titel": "Der Vorschlag des Planers kann diese Form nicht belegen",
-               "konsequenz": "Stufe A (propose) hat fuer diese Karten keine passende Aufteilung gefunden; der Launcher-Lauf zeigt, was er daraus macht."},
-    "ORAKEL-ABSTURZ": {"ebene": "absturz", "parent": None, "titel": "Der Launcher-Trockenlauf stuerzte ab",
-                       "konsequenz": "Kein Urteil ueber die Werte, sondern ein Fehler des Launchers fuer diese Form (Ausnahme statt Verweigerung). "
-                                     "Force aendert daran nichts; der echte Start bricht an derselben Stelle ab."},
-    "ORAKEL-FEHLER": {"ebene": "orakel", "parent": None, "titel": "Das Orakel konnte nicht fragen",
-                      "konsequenz": "Der Trockenlauf kam nicht zustande (Harness, Modellpfad, Kindprozess): es gibt KEIN Urteil, weder 'geht' noch 'verweigert'."},
+    "FIT": {"ebene": "fit", "parent": None, "titel": "Fit according to hw_fit (necessary condition)",
+            "konsequenz": "hw_fit checks only the NECESSARY condition (weights + KV + Mamba slots + items against card minus residue); whether the start runs is told by the launcher run (the other verdicts)."},
+    "DUAL-PASSUNG": {"ebene": "fit", "parent": None, "titel": "Dual fit: planner calculation, not hw_fit",
+                     "konsequenz": "hw_fit does not calculate the dual (it prints 'Dual ... NOT modelled'); the planner calculates per card P budget + overhead + rest items of D + D weights (with draft) against the card. This is a NECESSARY condition from model sizes and records, not a measurement; whether the start runs is told by the launcher run (the other verdicts)."},
+    "DUAL-PFLICHT": {"ebene": "fit", "parent": None, "titel": "P KV obligation of the dual form per card (planner calculation)",
+                     "konsequenz": "P must carry the KV obligation (default 262144 tokens) as ONE prompt: cap, level of the P pool and the shared pool of each card. The pool per card is calibrated only for the cards and the model of the reference boot; otherwise it says 'not calculated'. There is no dual pool bar in the launcher according to the 27B seat (done/dual-schnitt-262k-1006.md section 5): this calculation is the only protection against it."},
+    "EINZEL-PASSUNG": {"ebene": "fit", "parent": None, "titel": "Single card: fit as a planner calculation (no launcher run)",
+                       "konsequenz": "The single card has no weg2 launcher (topology.py MIN_CARDS=2): the planner calculates weights + draft + KV obligation + Mamba pool + reserve against the static budget (fraction x free memory before loading). This is a NECESSARY condition from model sizes, not a measurement; there is no force at N=1."},
+    "EINZEL-PARSE": {"ebene": "fit", "parent": None, "titel": "Single card: ServerArgs parse (argparse only, without device)",
+                     "konsequenz": "The parse checks flag names, choice values and types of ServerArgs.add_cli_args; ServerArgs.__post_init__ (device detection, compatibility refusals) needs an accelerator and has NOT run."},
+    "FIT-STATIC": {"ebene": "fit", "parent": None, "titel": "Weights + draft + KV + Mamba against the static budget",
+                   "konsequenz": "The pool is larger than --mem-fraction-static x free memory before loading; the runtime would fail on memory while loading or building the pool."},
+    "FIT-RESERVE": {"ebene": "fit", "parent": None, "titel": "Reserve outside the static budget too small",
+                    "konsequenz": "Activations, CUDA graphs and fragmentation need more than (1 - fraction) of the free memory: a run can fail on the reserve."},
+    "FIT-CARD": {"ebene": "fit", "parent": None, "titel": "Static budget larger than the addressable ceiling of the card",
+                 "konsequenz": "On an APU or with a host pool, device and host share the memory; the budget is above the ceiling."},
+    "FIT-CTX": {"ebene": "fit", "parent": None, "titel": "Context larger than the KV pool",
+                "konsequenz": "A prompt of the context length does not fit into the KV pool."},
+    "MAMBA-FLOOR": {"ebene": "fit", "parent": None, "titel": "Mamba pool below the lower bound",
+                    "konsequenz": "Fewer slots than requests x slots per request (mamba_pool_floor.py): the server refuses or does not hold requests."},
+    "PROFILE-VECTORS": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Positional vectors of the profile not for this inventory",
+                        "konsequenz": "The profile carries vectors (one entry per card) with a length other than the card count; the launcher cannot derive them. With a proposal of the planner all vectors have exactly N entries."},
+    "RECORDS-NVEC": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Measured records are vectors of another inventory",
+                     "konsequenz": "The records of the profile (weg2/profile_records_data) are vectors of one inventory and cannot be derived for this one; a calibration boot of these cards must write them. In the launcher this may later appear as a crash or a refusal (see ORAKEL-ABSTURZ)."},
+    "METAL-UNPROVEN": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Card count not proven on the hardware",
+                       "konsequenz": "There is no release boot with this card count; the planner calculation is an extrapolation, not a measurement."},
+    "HW-BORROWED": {"ebene": "wert", "parent": None, "titel": "Value borrowed from another card or another profile",
+                    "konsequenz": "No refusal code: the value is borrowed from a twin card of the architecture or another profile (unverified) and not measured on the hardware of these cards."},
+    "UNBELEGT": {"ebene": "wert", "parent": None, "titel": "Value is a planner calculation, not measured",
+                 "konsequenz": "No refusal code: the value is an extrapolation of the planner and not verified on the hardware of these cards."},
+    "PLANER": {"ebene": "planer", "parent": None, "titel": "The proposal of the planner cannot verify this form",
+               "konsequenz": "Stage A (propose) found no suitable split for these cards; the launcher run shows what it makes of it."},
+    "ORAKEL-ABSTURZ": {"ebene": "absturz", "parent": None, "titel": "The launcher dry run crashed",
+                       "konsequenz": "No verdict on the values, but an error of the launcher for this form (exception instead of refusal). Force changes nothing about it; the real start aborts at the same place."},
+    "ORAKEL-FEHLER": {"ebene": "orakel", "parent": None, "titel": "The oracle could not be asked",
+                      "konsequenz": "The dry run did not take place (harness, model path, child process): there is NO verdict, neither 'goes' nor 'refused'."},
 }
 
 #: launcher codes WITHOUT a row in ``refusals.REGISTER`` (R1: the launcher and the register are not changed from here).  Without this table the
@@ -103,53 +90,45 @@ OWN_CODES: Dict[str, Dict[str, Any]] = {
 #: own wording with the place it is printed (file:line of THIS tree, pinned by a test against the source text).
 SUPPLEMENT_CODES: Dict[str, Dict[str, Any]] = {
     "W71": {"code": "W71-CENSUS", "klass": "nicht_forcebar", "forcebar": False,
-            "titel": "W71 UUID-gebundener Exchange-Census: Residenz-Rechnung nicht belegt",
+            "titel": "W71 UUID-bound exchange census: residency calculation not verified",
             "quelle": "weg2/xchg_residency.py:711-723 (refusal_head), :313-387 (load_census)",
-            "klasse_grund": "Der Launcher verweigert W71 als Weg2XchgResidencyUnarmable ohne Force-Pfad: die Rechnung braucht einen gemessenen Census "
-                            "dieser Karten (je UUID), und ohne ihn gibt es keinen Wert, mit dem ein erzwungener Start laufen koennte.",
+            "klasse_grund": "The launcher refuses W71 as Weg2XchgResidencyUnarmable without a force path: the calculation needs a measured census of these cards (per UUID), and without it there is no value with which a forced start could run.",
             "grund": "W71 Weg2XchgResidencyUnarmable: the exchange's predicted VRAM residency does not fit (or the census file is missing/unreadable); "
                      "there is no fallback that makes an over-committed card fit: the boot REFUSES by name and exits 2, BEFORE either group starts. "
                      "Run --weg2-weight-source ring, or re-cut the schedule. [Launcher-Text xchg_residency.py:714-723]",
-            "konsequenz": "Bleibt auch mit Force bestehen. Der Census ist je UUID gemessen und an die Karten gebunden; fremde Karten haben keinen. "
-                          "Ausweg laut Launcher: --weg2-weight-source ring oder den Schnitt neu legen."},
+            "konsequenz": "Remains even with force. The census is measured per UUID and bound to the cards; foreign cards have none. Way out according to the launcher: --weg2-weight-source ring or re-cut the schedule."},
     "W64": {"code": "W64-OPPOINT", "klass": "nicht_forcebar", "forcebar": False,
-            "titel": "W64 Betriebspunkt: das Modell ergibt keinen positiven KV-Pool",
-            "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17349-17352 (fatal fuer die ausgelieferte Position, auch ohne dual_layout)",
-            "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells (PerfCostModel.predict_capacity feasible=False) ohne Sicherheitsfaktor und "
-                            "ohne Force-Pfad: es gibt keinen Wert, mit dem ein erzwungener Start laufen koennte.",
+            "titel": "W64 operating point: the model yields no positive KV pool",
+            "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17349-17352 (fatal for the shipped position, even without dual_layout)",
+            "klasse_grund": "The launcher refuses W64 as a verdict of the model (PerfCostModel.predict_capacity feasible=False) without a safety factor and without a force path: there is no value with which a forced start could run.",
             "grund": "W64 Weg2TpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
                      "plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank. Refused. This is the model's own verdict, "
                      "not a margin chosen here. [Launcher-Text launcher.py:16986-16993]",
-            "konsequenz": "Bleibt auch mit Force bestehen. Das Urteil ist das des Modells; hilft nur, Budgets, Gewichtsaufteilung oder Kartenzahl zu aendern.",
+            "konsequenz": "Remains even with force. The verdict is that of the model; the only help is to change budgets, weight split or card count.",
             # nur wenn die Meldung 'W64-DUAL:' traegt (der Launcher haengt es nur bei dual_layout an, launcher.py:17231/17242): Dual-Wortlaut
-            "dual": {"titel": "W64 Dual-D: Betriebspunkt ohne gemessenes Dual-D-Log nicht belegt",
-                     "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17242-17243 (kein gemessenes Dual-D-Log)",
-                     "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells (PerfCostModel.predict_capacity feasible=False) ohne Sicherheitsfaktor; "
-                                     "im Dual hebt nur ein gemessenes Dual-D-Log der Gewichte die Ablehnung auf (dual_w64.find_dual_d_measurement), nicht Force.",
+            "dual": {"titel": "W64 dual D: operating point not verified without a measured dual D log",
+                     "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17242-17243 (no measured dual D log)",
+                     "klasse_grund": "The launcher refuses W64 as a verdict of the model (PerfCostModel.predict_capacity feasible=False) without a safety factor; in the dual only a measured dual D log of the weights lifts the refusal (dual_w64.find_dual_d_measurement), not force.",
                      "grund": "W64 Weg2TpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
                               "plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank. Refused. This is the model's own verdict, "
                               "not a margin chosen here. W64-DUAL: no measured dual-share D log of the model with these weights; the model verdict stands. "
                               "[Launcher-Text launcher.py:16986-16993, :17242-17243]",
-                     "konsequenz": "Bleibt auch mit Force bestehen. Aufgehoben wird es nur durch ein gemessenes Dual-D-Log dieser Gewichte (Evidence-Verzeichnis); "
-                                   "ohne Messung gilt das Urteil des Modells."},
+                     "konsequenz": "Remains even with force. It is lifted only by a measured dual D log of these weights (evidence directory); without a measurement the verdict of the model stands."},
             # 'W64-DUAL: the refusal names no weight vector' (launcher.py:17235): die Meldung nennt keinen Gewichtsvektor, es gab also keine Suche
-            "dual_ohne_gewichte": {"titel": "W64 Dual: Betriebspunkt nicht belegt (Meldung ohne Gewichtsvektor, kein Dual-D-Log gesucht)",
+            "dual_ohne_gewichte": {"titel": "W64 dual: operating point not verified (message without weight vector, no dual D log searched)",
                      "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17235 (the refusal names no weight vector)",
-                     "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells ohne Sicherheitsfaktor; im Dual konnte er das Dual-D-Log nicht suchen, weil "
-                                     "die Meldung keinen Gewichtsvektor nennt (dual_w64.find_dual_d_measurement braucht ihn).",
+                     "klasse_grund": "The launcher refuses W64 as a verdict of the model without a safety factor; in the dual it could not search for the dual D log because the message names no weight vector (dual_w64.find_dual_d_measurement needs it).",
                      "grund": "W64 Weg2TpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
                               "W64-DUAL: the refusal names no weight vector; the model verdict stands. [Launcher-Text launcher.py:16986-16993, :17235]",
-                     "konsequenz": "Bleibt auch mit Force bestehen. Es wurde kein Dual-D-Log gesucht (kein Gewichtsvektor in der Meldung); das Urteil des Modells gilt."},
+                     "konsequenz": "Remains even with force. No dual D log was searched (no weight vector in the message); the verdict of the model stands."},
             # 'W64-DUAL MEASURED (...) -> INFEASIBLE' (dual_w64.py:117, angehaengt launcher.py:17343-17347): ein Dual-D-Log WURDE gefunden und urteilt selbst
-            "dual_gemessen": {"titel": "W64 Dual-D: gemessenes Dual-D-Log bestaetigt: kein ausreichender KV-Pool",
-                     "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17343-17347 (Messung angehaengt), dual_w64.py:117 (judge)",
-                     "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells; im Dual wurde ein gemessenes Dual-D-Log dieser Gewichte gefunden "
-                                     "(dual_w64.find_dual_d_measurement) und urteilt auf den eigenen Posten des Laufs INFEASIBLE. Force aendert die Messung nicht.",
+            "dual_gemessen": {"titel": "W64 dual D: measured dual D log confirms: no sufficient KV pool",
+                     "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17343-17347 (measurement appended), dual_w64.py:117 (judge)",
+                     "klasse_grund": "The launcher refuses W64 as a verdict of the model; in the dual a measured dual D log of these weights was found (dual_w64.find_dual_d_measurement) and judges INFEASIBLE on the own items of the run. Force does not change the measurement.",
                      "grund": "W64 Weg2TpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
                               "W64-DUAL MEASURED (...) -> INFEASIBLE: a measured dual-share D log of these weights also leaves less than the minimum tokens on at least "
                               "one rank. [Launcher-Text launcher.py:16986-16993, dual_w64.py:117]",
-                     "konsequenz": "Bleibt auch mit Force bestehen. Die Messung dieser Gewichte bestaetigt das Urteil; hilft nur, Budgets, Gewichtsaufteilung oder "
-                                   "Kartenzahl zu aendern."}},
+                     "konsequenz": "Remains even with force. The measurement of these weights confirms the verdict; the only help is to change budgets, weight split or card count."}},
 }
 
 def _supp_view(supp: Mapping[str, Any], text: Any) -> Dict[str, Any]:
@@ -466,7 +445,7 @@ def build_verdikt(n: int, first: Any, second: Any = None, *, lens: Optional[Mapp
             v_list.append(verdikt(code, ebene="lauf", text=fin["exc_msg"], grund=fin["exc_msg"], force_state=state if row else BLOCKED,
                                   extra=extra))
     elif fin["rc"] not in (0, None):
-        v_list.append(verdikt("LAUNCHER-UNKLASSIFIZIERT", ebene="lauf", text="Rueckgabewert %r ohne Ausnahme" % (fin["rc"],),
+        v_list.append(verdikt("LAUNCHER-UNKLASSIFIZIERT", ebene="lauf", text="Return value %r without an exception" % (fin["rc"],),
                               force_state=BLOCKED, extra={"durchgelassen": False}))
     # (3) the vectors of the launch: the launcher DERIVES a vector for a live subset of the cards where every card has a measured twin (the
     # HW gate lists ``PROFILE-VECTORS`` only for the vectors it cannot derive), so a vector that is not N entries long is DATA here (``vektoren``),
@@ -480,7 +459,7 @@ def build_verdikt(n: int, first: Any, second: Any = None, *, lens: Optional[Mapp
             st = {"ja": GOES, "knapp": HINT, "nein": BLOCKED}.get(lvl, HINT)
             if vorschlag.get("form") == "dual":
                 st = HINT          # hw_fit does not model the Dual: its Flip bound neither clears nor blocks it (DUAL-PASSUNG below does)
-            txt = "hw_fit%s: %s%s%s" % (" (Flip-Schranke, Dual nicht modelliert)" if vorschlag.get("form") == "dual" else "", lvl, (" (Rest %s MiB)" % fit["margin_mib"]) if fit.get("margin_mib") is not None else "",
+            txt = "hw_fit%s: %s%s%s" % (" (flip bound, dual not modelled)" if vorschlag.get("form") == "dual" else "", lvl, (" (rest %s MiB)" % fit["margin_mib"]) if fit.get("margin_mib") is not None else "",
                                       ("; " + str(fit["first"])) if fit.get("first") else "")
             v_list.append(verdikt("FIT", ebene="fit", text=txt, grund=txt, force_state=st, extra={"stufe": lvl, "rest_mib": fit.get("margin_mib"),
                                                                                               "zeilen": list(fit.get("lines") or [])[:12]}))
@@ -497,9 +476,9 @@ def build_verdikt(n: int, first: Any, second: Any = None, *, lens: Optional[Mapp
             v_list.append(verdikt("PLANER", ebene="planer", text=str(b), grund=str(b), force_state=BLOCKED))
         falsch = {k: int(c) for k, c in (vorschlag.get("vektoren_falsch") or {}).items()}
         if falsch and not any(v["code"] == "PROFILE-VECTORS" for v in v_list):
-            txt = "Der Vorschlag traegt Vektoren mit anderer Laenge als die Kartenzahl %d: %s" % (n, ", ".join("%s (%d)" % kv for kv in sorted(falsch.items())))
+            txt = "The proposal carries vectors with a length other than the card count %d: %s" % (n, ", ".join("%s (%d)" % kv for kv in sorted(falsch.items())))
             v_list.append(verdikt("PROFILE-VECTORS", ebene="blocker", text=txt, grund=txt, werte=sorted(falsch), parent="HW-COUNT",
-                                  extra={"durchgelassen": False, "wo": "propose.vector_lengths (Vorschlag)"}))
+                                  extra={"durchgelassen": False, "wo": "propose.vector_lengths (proposal)"}))
     doc = {"schema": SCHEMA, "n": int(n), "verdikte": v_list, "lauf": fin,
            "vektoren": {"laengen": {k: int(c) for k, c in (lens or {}).items()}, "nicht_n": n_bad},
            "ohne_force": _run_summary(first), "mit_force": _run_summary(second) if second is not None else None,
@@ -556,12 +535,12 @@ def werte_verdikte(vorschlag: Mapping[str, Any], verdikt_doc: Mapping[str, Any])
         key = str(w.get("key"))
         lst: List[Dict[str, Any]] = []
         if key in bad_keys or _tail(key) in bad_tails:
-            lst.append(slim(by_code["PROFILE-VECTORS"], "Vektor mit anderer Laenge als die Kartenzahl: %s" % key))
+            lst.append(slim(by_code["PROFILE-VECTORS"], "Vector with a length other than the card count: %s" % key))
         if uncal is not None and w.get("policy") == "class":
             lst.append(slim(uncal))
         herk = "%s %s" % (w.get("herkunft", ""), w.get("grund", ""))
         if w.get("zustand") == "unbelegt":
-            if "geborgt" in herk or "HW-BORROWED" in herk:
+            if "geborgt" in herk or "borrowed" in herk or "HW-BORROWED" in herk:
                 lst.append(slim(verdikt("HW-BORROWED", ebene="wert", text=herk, grund=w.get("herkunft"), force_state=HINT)))
             elif not lst:
                 lst.append(slim(verdikt("UNBELEGT", ebene="wert", text=herk, grund=w.get("herkunft"), force_state=HINT)))
@@ -668,7 +647,7 @@ def _basis_from(req: Mapping[str, Any], scratch: str) -> Any:
         if b.get("source"):
             li.source = str(b["source"])
         return li
-    raise ValueError("basis braucht env_path oder env_text")
+    raise ValueError("basis needs env_path or env_text")
 
 
 def _devices_of(req: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -681,7 +660,7 @@ def _devices_of(req: Mapping[str, Any]) -> List[Dict[str, Any]]:
         return [dict(d) for d in inv["devices"]]
     if inv.get("cards"):
         return devices_from_cards(inv["cards"])
-    raise ValueError("inventar braucht hardware, devices oder cards")
+    raise ValueError("inventar needs hardware, devices or cards")
 
 
 def _model_profiles(li: Any, req: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[str]]:
@@ -709,14 +688,14 @@ def _model_profiles(li: Any, req: Mapping[str, Any]) -> Tuple[Optional[Dict[str,
         if mp.get("ok"):
             modell = mp["profile"]
         else:
-            notes.append("Modellprofil: %s (%s)" % (mp.get("reason") or mp.get("state") or mp, mp.get("state")))
+            notes.append("Model profile: %s (%s)" % (mp.get("reason") or mp.get("state") or mp, mp.get("state")))
     draft = None
     dpath = str(req.get("draft_path") or li.draft or "")
     if dpath:
         try:
             draft = MP.estimate_draft(stub(dpath))
         except Exception as exc:  # noqa: BLE001 -- no draft profile: propose() runs without the draft term, and says so
-            notes.append("Draft-Profil nicht lesbar (%s: %s)" % (type(exc).__name__, exc))
+            notes.append("Draft profile not readable (%s: %s)" % (type(exc).__name__, exc))
     return modell, draft, notes
 
 
@@ -749,15 +728,15 @@ def _single_card(req: Mapping[str, Any]) -> Tuple[Dict[str, Any], str]:
     if inv.get("hardware"):
         ordinal = int(inv.get("karte") or 0)
         card = PS.card_from_hardware(inv["hardware"], ordinal)
-        return card, "Karte %d des Hardwareprofils: %s, %d MiB (%s)" % (ordinal, card["name"], card["total_mib"], card["total_src"])
+        return card, "Card %d of the hardware profile: %s, %d MiB (%s)" % (ordinal, card["name"], card["total_mib"], card["total_src"])
     rows = _devices_of(req)
     if len(rows) != 1:
-        raise PS.ProposeSingleError("die Einzelkarte braucht genau eine Karte, nicht %d" % len(rows))
+        raise PS.ProposeSingleError("the single card needs exactly one card, not %d" % len(rows))
     d = rows[0]
     total = int(d.get("total_bytes", 0)) >> 20
-    card = PS.normalize_card({"name": d.get("name"), "total_mib": total, "total_src": "Kartenkatalog (usable_mib, Datenblatt-Eintrag der Karte)",
+    card = PS.normalize_card({"name": d.get("name"), "total_mib": total, "total_src": "Card catalog (usable_mib, datasheet entry of the card)",
                               "cc": [d.get("cc_major"), d.get("cc_minor")]})
-    return card, "Karte: %s, %d MiB (Kartenkatalog)" % (card["name"], total)
+    return card, "Card: %s, %d MiB (card catalog)" % (card["name"], total)
 
 
 def _single_werte(p: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -780,19 +759,19 @@ def single_verdikt(p: Mapping[str, Any], card_note: str, notes: Sequence[str], p
     fit = p["fit"]
     v_list: List[Dict[str, Any]] = [verdikt("EINZEL-PASSUNG", ebene="fit", text=v["text"], grund=v["text"], force_state=st,
                                             extra={"stufe": {"passt": "ja", "passt nicht": "nein"}.get(v["state"], "unbelegt"), "art": v.get("art"),
-                                                   "etikett": "Planer-Rechnung", "rest_mib": fit.get("frei_mib")})]
+                                                   "etikett": "Planner calculation", "rest_mib": fit.get("frei_mib")})]
     for ch in fit.get("checks") or []:
         if not ch["ok"]:
-            v_list.append(verdikt(str(ch["code"]), ebene="fit", text=ch["text"], grund=ch["text"], force_state=BLOCKED, extra={"etikett": "Planer-Rechnung"}))
+            v_list.append(verdikt(str(ch["code"]), ebene="fit", text=ch["text"], grund=ch["text"], force_state=BLOCKED, extra={"etikett": "Planner calculation"}))
     for u in fit.get("unbelegt") or []:
-        v_list.append(verdikt("UNBELEGT", ebene="fit", text=str(u), grund=str(u), force_state=HINT, extra={"etikett": "Planer-Rechnung"}))
+        v_list.append(verdikt("UNBELEGT", ebene="fit", text=str(u), grund=str(u), force_state=HINT, extra={"etikett": "Planner calculation"}))
     par = p.get("parse") or {}
     if par.get("available") and par.get("ok") is False:
-        v_list.append(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs-Parse verweigert: %s" % par.get("error"), grund=str(par.get("error")), force_state=BLOCKED))
+        v_list.append(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs parse refused: %s" % par.get("error"), grund=str(par.get("error")), force_state=BLOCKED))
     elif par.get("available") and par.get("ok"):
-        v_list.append(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs-Parse ok (argparse; __post_init__ nicht gelaufen)", force_state=GOES))
+        v_list.append(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs parse ok (argparse; __post_init__ has not run)", force_state=GOES))
     elif par:
-        v_list.append(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs-Parse nicht geprueft: %s" % (par.get("error") or "nicht verfuegbar"), force_state=HINT))
+        v_list.append(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs parse not checked: %s" % (par.get("error") or "not available"), force_state=HINT))
     n_block = sum(1 for x in v_list if x["force_state"] == BLOCKED)
     argv = list(p["argv"])
     return {"schema": SCHEMA, "n": 1, "form": "einzel", "art": v.get("art"), "verdikte": v_list, "lauf": None,
@@ -824,7 +803,7 @@ def single_je_wert(p: Mapping[str, Any], vorschlag: Mapping[str, Any], verd: Map
             for code in str(vd["code"]).split("+"):
                 lst.append(slim_verdikt(verdikt(code, ebene="fit", text=vd["grund"], grund=vd["grund"], force_state=BLOCKED)))
         if vd.get("parse") == "veraltet (Alias)":
-            lst.append(slim_verdikt(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs kennt dieses Flag nur als veralteten Alias", force_state=HINT)))
+            lst.append(slim_verdikt(verdikt("EINZEL-PARSE", ebene="fit", text="ServerArgs knows this flag only as a deprecated alias", force_state=HINT)))
     return out
 
 
@@ -841,21 +820,21 @@ def run_propose_single(req: Mapping[str, Any]) -> Dict[str, Any]:
         mreq["draft_path"] = req.get("draft_path") or ""
         modell, draft, notes = _model_profiles(_NoLaunch(str(getattr(li, "model", "") or "")), mreq)
         if modell is None:
-            return {"ok": False, "error": "kein Modellprofil: %s" % ("; ".join(notes) or "Modellpfad fehlt"), "notizen": notes}
+            return {"ok": False, "error": "no model profile: %s" % ("; ".join(notes) or "Model path missing"), "notizen": notes}
         z = dict(req.get("ziele") or {})
         goals = {dst: z[src] for src, dst in _SINGLE_GOALS if z.get(src) not in (None, "")}
         ignored = sorted(k for k in z if k not in {s for s, _ in _SINGLE_GOALS} and z.get(k) not in (None, "", False))
         if ignored:
-            notes.append("Ziele ohne Bedeutung fuer eine Karte (ignoriert): %s" % ", ".join(ignored))
+            notes.append("Goals without meaning for one card (ignored): %s" % ", ".join(ignored))
         try:
             card, card_note = _single_card(req)
             p = PS.propose_single(modell, card, goals, draft_profile=draft)
         except (PS.ProposeSingleError, ValueError, KeyError) as exc:
-            return {"ok": False, "error": "Einzelkarte: %s" % exc, "notizen": notes}
+            return {"ok": False, "error": "Single card: %s" % exc, "notizen": notes}
         if req.get("parse", True):
             p = PS.check(p)
         else:
-            p["parse"] = {"available": False, "ok": None, "error": "nicht angefragt"}
+            p["parse"] = {"available": False, "ok": None, "error": "not requested"}
         werte = _single_werte(p)
         fit = p["fit"]
         lvl = {"passt": "ja", "passt nicht": "nein"}.get(p["verdikt"]["state"], "unbelegt")
@@ -868,7 +847,7 @@ def run_propose_single(req: Mapping[str, Any]) -> Dict[str, Any]:
                              "art": p["verdikt"].get("art") or PS.VERDICT_ART},
                      "ziele": {"seats": _num(flag_of("--max-running-requests")), "kv_tokens": _num(flag_of("--context-length")), "kv_dtype": flag_of("--kv-cache-dtype")},
                      "unbelegt": list(p.get("unbelegt") or []), "hinweise": hinweise, "blocker": [], "vektorlaengen": {}, "vektoren_ok": True,
-                     "vektoren_falsch": {}, "basis": os.path.basename(str(getattr(li, "source", "") or "")) or "(kein Profil)",
+                     "vektoren_falsch": {}, "basis": os.path.basename(str(getattr(li, "source", "") or "")) or "(no profile)",
                      "argv": list(p["argv"]), "env": {}, "einzelkarte": p}
         profil = dict(profile_identity(li), rolle="basis") if li is not None else {"rolle": "keines", "quelle": "", "datei_sha256": None, "eingabe_sha256": None}
         profil["vorschlag_sha256"] = launch_hash(p["argv"], {})
@@ -893,7 +872,7 @@ def run_propose(req: Mapping[str, Any], *, tree: str) -> Dict[str, Any]:
         devices = _devices_of(req)
         modell, draft, notes = _model_profiles(li, req)
         if modell is None:
-            return {"ok": False, "error": "kein Modellprofil: %s" % ("; ".join(notes) or "Modellpfad fehlt"), "notizen": notes}
+            return {"ok": False, "error": "no model profile: %s" % ("; ".join(notes) or "Model path missing"), "notizen": notes}
         try:
             v = P.propose(devices, modell, str(req.get("form") or "flip"), dict(req.get("ziele") or {}), basis=li, draft=draft,
                           rates=req.get("rates"))

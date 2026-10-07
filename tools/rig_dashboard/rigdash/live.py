@@ -417,7 +417,7 @@ def _run_stats(cls, evs, span_s=None):
         rb = [e["bs"] for e in evs if e.get("kind") == "decode_rank" and e.get("bs") is not None]
         rounds = sum(1 for e in evs if e.get("kind") == "decode_rank")
         wall, _covered = _decode_wall(lines)
-        return {"tps": wall, "tps_src": "Σ(gen throughput × Zeilenabstand) / Σ Zeilenabstand", "n": len(g),
+        return {"tps": wall, "tps_src": "Σ(gen throughput × line spacing) / Σ line spacing", "n": len(g),
                 "rounds": rounds,
                 "bs_min": min(rb) if rb else None, "bs_max": max(rb) if rb else None,
                 "bs_mean": (sum(rb) / len(rb)) if rb else None,
@@ -435,7 +435,7 @@ def _run_stats(cls, evs, span_s=None):
     r0 = per.get("PP0") or per.get("TP0") or (next(iter(per.values())) if per else None)
     tok = r0[0] if r0 else 0
     return {"tps": (tok / span_s) if (tok and span_s and span_s > 0) else None,
-            "tps_src": "Σ #new-token (erste Stufe) / Laufdauer (Wanduhr)",
+            "tps_src": "Σ #new-token (first stage) / run time (wall clock)",
             "tps_gpu": min(rated) if rated else None, "tok": tok,
             "n": r0[2] if r0 else len(evs)}
 
@@ -1431,7 +1431,7 @@ class LiveLogs:
             else:
                 v["end"] = stops.classify(b.stem, b.first_t, last_line or b.newest_mtime or None,
                                           self.harness.for_dir(b.dir))
-                v["end"]["src"] = "Harness-Log (Übergang)"
+                v["end"]["src"] = "Harness log (transition)"
             views.append(v)
         views.sort(key=lambda v: (not v["live"], not v["primary"],
                                   v["age_s"] if v["age_s"] is not None else 1e12))

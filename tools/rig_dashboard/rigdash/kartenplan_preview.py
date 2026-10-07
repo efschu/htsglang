@@ -57,7 +57,7 @@ def make_handler(kp: kartenplan.Kartenplaner):
                 if path == "/api/kartenplan/plan":
                     raw = (parse_qs(urlsplit(self.path).query).get("q") or [""])[0]
                     return self._json(kp.plan(json.loads(raw)))
-                return self._json({"ok": False, "error": "Vorschau: nur der Kartenplaner antwortet"}, 404)
+                return self._json({"ok": False, "error": "Preview: only the card planner answers"}, 404)
             except ValueError as exc:
                 return self._json({"ok": False, "error": str(exc)}, 400)
             except Exception as exc:  # noqa: BLE001
@@ -69,11 +69,11 @@ def make_handler(kp: kartenplan.Kartenplaner):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=18890)
-    ap.add_argument("--tree", default=None, help="Planer-Baum (<baum>/python) mit card_identity.py/topology.py")
+    ap.add_argument("--tree", default=None, help="Planner tree (<tree>/python) with card_identity.py/topology.py")
     ns = ap.parse_args(argv)
     kp = kartenplan.Kartenplaner(tree=ns.tree)
     srv = ThreadingHTTPServer(("127.0.0.1", ns.port), make_handler(kp))
-    print("Kartenplaner-Vorschau http://127.0.0.1:%d/#t=kartenplan  (Planer-Baum: %s)" % (ns.port, kp.tree), flush=True)
+    print("Card planner preview http://127.0.0.1:%d/#t=kartenplan  (planner tree: %s)" % (ns.port, kp.tree), flush=True)
     srv.serve_forever()
     return 0
 

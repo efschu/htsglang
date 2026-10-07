@@ -128,7 +128,7 @@ class ImageChanges:
                     d = json.load(fh)
                 imgs = d.get("images") if isinstance(d, dict) else None
                 if not isinstance(imgs, dict):
-                    raise ValueError("kein Objekt 'images'")
+                    raise ValueError("no object 'images'")
                 self.images, self.error = imgs, None
             except (OSError, ValueError) as e:
                 # keep the last good content; name the broken read

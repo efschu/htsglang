@@ -1,4 +1,79 @@
-# Dashboard glossary DE -> EN (rigdash)
+# Dashboard glossary DE -> EN (merged: part 1 UI terms + part 2 Python terms)
+
+Merge note (part 4): Part 1 (static JS/HTML) and Part 2 (Python texts) each created this file. Both term lists are kept
+below unchanged, Part 2 table first as "Python-text terms", then the Part 1 sections. Where both define the same German
+term the English wording agrees except: `unbelegt` (Part 2: unverified / Part 1: unverified), `Vorschlag` (proposal in both),
+`Verdikt` (verdict in both; Part 1 lists "judgement / verdict" for Urteil). The catalog glossary lives separately in
+`python/sglang/srt/weg2/GLOSSARY_EN.md`.
+
+## Part 2: Python-text terms
+
+One English term per German term, used by the UI (static/*.js, index.html), the Python texts (rigdash/*.py,
+weg2/propose*.py, planner/profile_couplings.py) and the catalog texts. Machine-readable names (JSON keys, flags,
+env names, refusal codes, enum values such as `zustand`/`force_state`) are NOT translated.
+
+| German | English |
+|---|---|
+| Karte | card (GPU card) |
+| Rang | rank |
+| Lauf | run |
+| Boot | boot |
+| Trockenlauf, Dry-Run | dry run |
+| Orakel | oracle (the launcher dry run that answers for the planner) |
+| Verdikt, Urteil | verdict |
+| Verweigerung, Ablehnung | refusal |
+| verweigert, abgelehnt | refused |
+| forcebar | forceable (can be overridden with `--force`) |
+| nicht forcebar | not forceable |
+| Force uebergeht | force overrides / passes |
+| Abhaengigkeit | dependency |
+| Kante (Kantenkatalog) | edge (edge catalog) |
+| Betriebsform, Form | operating mode (form) |
+| Einzelkarte | single card |
+| nur TP | TP only |
+| Flip PP/TP | flip PP/TP |
+| Dual PP/TP | dual PP/TP |
+| Hardwareprofil | hardware profile |
+| Modellprofil | model profile |
+| Startprofil, Serverprofil | server profile |
+| Profil-Planer, Planer | profile planner, planner |
+| Vorschlag | proposal |
+| vorgeschlagen | proposed |
+| uebersteuert | overridden |
+| geloest (vom Launcher) | solved (by the launcher) |
+| unbelegt | unverified (no evidence / not measured) |
+| belegt | verified |
+| geborgt | borrowed |
+| Datenblatt | datasheet |
+| gemessen / geschaetzt | measured / estimated |
+| Geheimnis | secret |
+| Laufbericht | run report |
+| Gewichte | weights |
+| Experten | experts |
+| Sitze (gleichzeitig) | seats (concurrent) |
+| Kontext | context |
+| Reserve | reserve |
+| Balken | bar |
+| Ueberlauf | overflow |
+| (P-)Schnitt | (P) cut |
+| Wert | value |
+| Zeile | row / line |
+| Schalter | switch |
+| Erklaerung | explanation |
+| Konsequenz | consequence |
+| Grund | reason |
+| Hinweis | note |
+| Pfad | path |
+| Treiber | driver |
+| Baum | tree (source tree) |
+| Zustand | state |
+| Ausgang | outcome |
+| Messergebnis | measurement result |
+| Passung | fit |
+| Eingabe | input |
+| Anwender | user |
+
+## Part 1: UI terms (rigdash)
 
 Single word list for the English UI. Part 1 (static JS/HTML) created it; Part 2 (Python texts, `weg2/propose*.py`,
 `profile_couplings.py`) and Part 3 (catalog files) append to it and use the same terms. Style: terse developer English.

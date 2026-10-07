@@ -34,7 +34,7 @@ Sources -- IPC and hardware only; no series and no mark is read from a boot log 
                cache), cache tiers from state.json front.served_tokens.*.cached_tier;
                flips: events.jsonl flip_first_work.
                A stretch the recorder did not watch live (rigdash was down, or before this image had
-               rankstats) stays empty: "keine Daten (vor IPC-Aufzeichnung)", never a log backfill.
+               rankstats) stays empty: "no data (before IPC recording)", never a log backfill.
                Boot start/end marks: state.json (boot id stamp, lifecycle since_ts).
 """
 
@@ -52,7 +52,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import activity, cacheacct, flipzeit, ipcstate
 
-NO_DATA_LABEL = "keine Daten (vor IPC-Aufzeichnung)"
+NO_DATA_LABEL = "no data (before IPC recording)"
 TIERS = (("p0", 1, 3 * 3600), ("p1", 10, 3 * 86400), ("p2", 60, 30 * 86400))
 MAX_MB = 256
 MODEL_BUCKET_S = 5.0        # the recorder's loop period
@@ -67,7 +67,7 @@ IPC_LABEL = "rankstats (IPC)"
 IPC_STALE_S = 20.0          # a rank file older than this: the rank is gone, its group gives no value
 #: model series prefix.  "mi." since 30.09. ~17Z: the rows written before under "m." came from the
 #: per-sample counter deltas (a whole 16k chunk in the bucket its counter moved in -- "16k/s"); they
-#: are not shown any more, that stretch reads "keine Daten (vor IPC-Aufzeichnung)"
+#: are not shown any more, that stretch reads "no data (before IPC recording)"
 SERIES = "mi.%s."
 HIST_LAG_S = 20.0           # buckets are written once the last pipeline stage has reported their chunks
 
@@ -625,7 +625,7 @@ class Recorder:
         if ipc.get("terminal") and not self.db.get("ipcend." + key):
             t1 = ipc.get("lifecycle_since")
             if t1:
-                self.db.mark(t1, model, "end", "Boot-Ende (%s) ipc" % (ipc.get("lifecycle") or "?"))
+                self.db.mark(t1, model, "end", "Boot end (%s) ipc" % (ipc.get("lifecycle") or "?"))
                 self.db.set("ipcend." + key, True)
         if ipc.get("launch") and not ipc.get("terminal"):
             roles = card_roles(ipc["launch"], self.cards)
@@ -858,7 +858,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     series["gsum.power"] = [(sum(a[i] for a in pw) if pw and all(i < len(a) and a[i] is not None for a in pw)
                              else None) for i in range(len(ts))]
     # only what the IPC sampler wrote: rows an older rigdash derived from boot logs (buckets without
-    # m.ipc) are not shown -- that part is "keine Daten (vor IPC-Aufzeichnung)", a gap, not a log
+    # m.ipc) are not shown -- that part is "no data (before IPC recording)", a gap, not a log
     alive = series["m.ipc"]
     for k in msr:
         if k != "ipc":
@@ -920,19 +920,19 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         "series": series, "cards": card_info, "marks": sorted(thin + fl, key=lambda m: m["t"]),
         "marks_total": len(marks), "tiles": tiles,
         "src": {
-            "cards": "NVML", "temp": "NVML GPU-Kern (Hotspot/Junction per NVML nicht lesbar)",
-            "host": ("Proxmox-Host /proc + memory.current der htsglang-Container"
+            "cards": "NVML", "temp": "NVML GPU core (hotspot/junction not readable via NVML)",
+            "host": ("Proxmox host /proc + memory.current of the htsglang containers"
                      if (getattr(rec, "host_where", None) if rec else (db.get("rec.state") or {}).get("host_where")) == "proxmox"
                      else "LXC /proc"),
             "roles": "state.json groups.launch",
             "prefill": src_model, "decode": src_model, "kv": src_model, "cache": src_model,
-            "rates": "Tokens / Zeit, in der die Phase arbeitete (dec_busy/p_busy/d_busy); Pausen = Lücke",
-            "seats": "rankstats D decode.gpu_ms_by_bs (Δ je Probe, nach Rundenzeit gewichtet), sonst decode.running",
-            "power": "NVML, Summe aller Karten",
+            "rates": "Tokens / time in which the phase worked (dec_busy/p_busy/d_busy); pauses = gap",
+            "seats": "rankstats D decode.gpu_ms_by_bs (Δ per sample, weighted by round time), otherwise decode.running",
+            "power": "NVML, sum of all cards",
             "cache_tiers": ("state.json front.served_tokens.*.cached_tier" if src_tiers == "ipc"
-                            else "– (Feld served_tokens.*.cached_tier ab Image z30y2, 9266bdfb8d)"),
-            "flip": "Flipzeit (flipzeit.py, Nutzer 06.10.): P→D %s; D→P %s. %s Zählung: nur abgeschlossene, gemessene Flips (Marken flip_t2t)" % (flipzeit.DEFINITION["P>D"], flipzeit.DEFINITION["D>P"], flipzeit.EXCEPTION),
-            "marks": "state.json (Boot-ID, lifecycle) + events.jsonl flip_first_work",
+                            else "– (field served_tokens.*.cached_tier from image z30y2, 9266bdfb8d)"),
+            "flip": "Flip time (flipzeit.py, user 06.10.): P→D %s; D→P %s. %s Count: only completed, measured flips (marks flip_t2t)" % (flipzeit.DEFINITION["P>D"], flipzeit.DEFINITION["D>P"], flipzeit.EXCEPTION),
+            "marks": "state.json (boot id, lifecycle) + events.jsonl flip_first_work",
         },
         "errors": dict(rec.errors) if rec else dict((db.get("rec.state") or {}).get("errors") or {}),
         "held": {"view_filled": held_view, "recorder": (rec.held_view() if rec else (db.get("rec.state") or {}).get("held"))},

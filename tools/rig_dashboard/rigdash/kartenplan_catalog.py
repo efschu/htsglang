@@ -34,9 +34,9 @@ ORIGIN_MEASURED = "measured_on_rig"
 ORIGIN_DATASHEET = "Datenblatt"
 ORIGIN_BORROWED = "borrowed-unbelegt"
 ORIGIN_LABELS = {
-    ORIGIN_MEASURED: "am Rig gemessen",
-    ORIGIN_DATASHEET: "Datenblatt (Herstellerangabe, nicht gemessen)",
-    ORIGIN_BORROWED: "geborgt von einer anderen Variante, unbelegt",
+    ORIGIN_MEASURED: "measured on the rig",
+    ORIGIN_DATASHEET: "datasheet (manufacturer value, not measured)",
+    ORIGIN_BORROWED: "borrowed from another variant, unverified",
 }
 
 #: Referenz-Rig, in NVML-Reihenfolge (vram_plan.json cards, Boot 27bbf-boot-20261003T090641Z-30ca)
@@ -61,7 +61,7 @@ def _card(cid, name, gb, arch, bw, pcie_gen, pcie_lanes, *, usable=None, usable_
     return {
         "id": cid, "name": name, "variant": variant, "vram_gb": gb,
         "usable_mib": usable_mib,
-        "usable_src": usable_src or "Datenblatt (Nennwert GB x 1024; NVML meldet fremde Karten leicht darunter, ungemessen)",
+        "usable_src": usable_src or "datasheet (nominal GB x 1024; NVML reports foreign cards slightly below, unmeasured)",
         "arch": arch, "cc": list(ARCHS[arch]["cc"]),
         "mem_bw_gbs": bw, "mem_bw_src": bw_src,
         "bus_bits": bus_bits,
@@ -77,7 +77,7 @@ def _build_catalog() -> List[dict]:
     c: List[dict] = []
     c.append(_card("rtx5090-32", "RTX 5090", 32, "sm120", 1792, 5, 16, usable=32607,
                    usable_src="NVML-Record (Rig, vram_plan.json cards, nvml1)", bus_bits=512, preset=True,
-                   note="Referenzkarte des Rigs (TP0/PP0, Form-A-Host)"))
+                   note="Reference card of the rig (TP0/PP0, form A host)"))
     c.append(_card("rtx5080-16", "RTX 5080", 16, "sm120", 960, 5, 16, bus_bits=256))
     c.append(_card("rtx5070ti-16", "RTX 5070 Ti", 16, "sm120", 896, 5, 16, bus_bits=256))
     c.append(_card("rtx5070-12", "RTX 5070", 12, "sm120", 672, 5, 16, bus_bits=192))
@@ -101,16 +101,16 @@ def _build_catalog() -> List[dict]:
     c.append(_card("rtx3080ti-12", "RTX 3080 Ti", 12, "sm86", 912, 4, 16, bus_bits=384))
     c.append(_card("rtx3080-12", "RTX 3080", 12, "sm86", 912, 4, 16, variant="12 GB", bus_bits=384))
     c.append(_card("rtx3080-10", "RTX 3080", 10, "sm86", 760, 4, 16, variant="10 GB", bus_bits=320))
-    c.append(_card("rtx3080-20", "RTX 3080", 20, "sm86", 760, 4, 16, variant="20 GB (Umbau)", usable=20480,
+    c.append(_card("rtx3080-20", "RTX 3080", 20, "sm86", 760, 4, 16, variant="20 GB (modded)", usable=20480,
                    usable_src="NVML-Record (Rig, vram_plan.json cards, nvml0/nvml2)",
-                   bw_src="Datenblatt der 10-GB-Karte (gleiche 320-Bit-Platine; Umbau-Karte am Rig nicht separat gemessen)",
-                   bus_bits=320, note="Umbau-Karte, wie unser Rig (2 Stück)", preset=True, borrowed=("mem_bw",)))
+                   bw_src="datasheet of the 10 GB card (same 320-bit board; modded card not measured separately on the rig)",
+                   bus_bits=320, note="Modded card, like our rig (2 pieces)", preset=True, borrowed=("mem_bw",)))
     # Turing: vorbereitet, aber deaktiviert (Nutzer 03.10.)
     c.append(_card("rtx2080ti-11", "RTX 2080 Ti", 11, "sm75", 616, 3, 16, variant="11 GB", bus_bits=352,
-                   enabled=False, off_reason="sm75 (Turing) ist noch nicht im Image/Planer: kein bf16, kein FP8, kein NVFP4; "
-                   "Image baut nur sm86/sm120. Eintrag vorbereitet, aktiv erst nach dem sm75-Port."))
-    c.append(_card("rtx2080ti-22", "RTX 2080 Ti", 22, "sm75", 616, 3, 16, variant="22 GB (Umbau)", bus_bits=352,
-                   enabled=False, off_reason="sm75 (Turing) ist noch nicht im Image/Planer: kein bf16, kein FP8, kein NVFP4; Image baut nur sm86/sm120. Eintrag vorbereitet, aktiv erst nach dem sm75-Port."))
+                   enabled=False, off_reason="sm75 (Turing) is not in the image/planner yet: no bf16, no FP8, no NVFP4; "
+                   "the image builds only sm86/sm120. Entry prepared, active only after the sm75 port."))
+    c.append(_card("rtx2080ti-22", "RTX 2080 Ti", 22, "sm75", 616, 3, 16, variant="22 GB (modded)", bus_bits=352,
+                   enabled=False, off_reason="sm75 (Turing) is not in the image/planner yet: no bf16, no FP8, no NVFP4; the image builds only sm86/sm120. Entry prepared, active only after the sm75 port."))
     for e in c:
         rig = e["usable_src"].startswith("NVML-Record")
         e["driver_reserved_mib"] = (518 if e["id"] == "rtx5090-32" else 425) if rig else None
@@ -181,9 +181,9 @@ def datasheet_of(row: dict) -> dict:
     e = match_nvml(row.get("name"), row.get("total_mib"), row.get("cc"))
     if e is None:
         return {}
-    why = e["mem_bw_src"] + " [Katalog kartenplan_catalog.py: %s]" % e["id"]
+    why = e["mem_bw_src"] + " [catalog kartenplan_catalog.py: %s]" % e["id"]
     if ORIGIN_BORROWED in e["origin_fields"].values() and e["origin_fields"]["mem_bw"] == ORIGIN_BORROWED:
-        why = "GEBORGT, unbelegt: " + why
+        why = "BORROWED, unverified: " + why
     return {"mem_bw_gbs": e["mem_bw_gbs"], "bw_note": why,
             "catalog": {"id": e["id"], "label": label(e), "preset": e["preset"], "origin": e["origin"],
                         "origin_label": ORIGIN_LABELS[e["origin"]], "origin_fields": dict(e["origin_fields"])}}
@@ -196,22 +196,22 @@ def datasheet_of(row: dict) -> dict:
 PROFILES: List[dict] = [
     {"id": "27b-int8", "label": "27B INT8 (gdncov)", "line": "27b", "format": "int8", "flip": True,
      "release_profile": "27b", "boot_profile": "27b-row-authority-cut43", "record": "27b-int8",
-     "note": "Release-Form: P = PP3 (Prefill), D = TP3 (Decode), Flip; Draft DFlash2"},
+     "note": "Release form: P = PP3 (prefill), D = TP3 (decode), flip; draft DFlash2"},
     {"id": "nf-int4-abl", "label": "NF INT4 (abl)", "line": "nf", "format": "int4", "flip": True,
      "release_profile": "nf-int4", "boot_profile": "nf-int4-h6-abl", "record": "nf-int4-abl",
-     "note": "Qwen3.8-Flash-Next (MoE, Experten im Host, MTP-Draft), Flip"},
+     "note": "Qwen3.8-Flash-Next (MoE, experts in the host, MTP draft), flip"},
     {"id": "27b-nvfp4-dual", "label": "27B NVFP4 Dual", "line": "27b", "format": "nvfp4", "flip": True,
      "release_profile": "27b-nvfp4-dual", "boot_profile": "27b-nvfp4-dual1m-psleep", "record": "27b-nvfp4-dual",
-     "note": "Dual-Form: P und D im Wechsel, NVFP4-Gewichte"},
+     "note": "Dual form: P and D alternating, NVFP4 weights"},
     {"id": "27b-fp8", "label": "27B FP8", "line": "27b", "format": "fp8", "flip": True,
      "release_profile": "27b-fp8", "boot_profile": "27b-fp8", "record": "27b-fp8",
-     "note": "Metallbeleg nur aus dem Docker-Boot 26.09. (vor dem IPC-Zustand), daher ohne state.json"},
+     "note": "Hardware evidence only from the Docker boot of 26.09. (before the IPC state), hence without state.json"},
     {"id": "27b-gguf-iq4xs", "label": "27B GGUF UD-IQ4_XS", "line": "27b", "format": "gguf", "flip": True,
      "release_profile": "27b-gguf", "boot_profile": "27b-gguf", "record": "27b-gguf-iq4xs",
-     "note": "Einzige am Metall gebootete GGUF-Variante des 27B; Q8_K_XL liegt auf Platte, wurde nie gebootet",
+     "note": "The only GGUF variant of the 27B booted on the hardware; Q8_K_XL is on disk, was never booted",
      "variants": [{"id": "UD-IQ4_XS", "file": "Qwen3.8-27B-UD-IQ4_XS.gguf",
                    "path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-GGUF-unsloth/Qwen3.8-27B-UD-IQ4_XS.gguf",
-                   "size_bytes": 14252845984, "size_src": "ls -l, gemessen",
+                   "size_bytes": 14252845984, "size_src": "ls -l, measured",
                    "boots": ["weg2rc5gg (25.09., RC5)", "weg2rc7gg2 (25.09.)",
                              "dkr27bggufbar109251311 / ...1743 / ...1825 (Docker, 25.09.)",
                              "dkr27bggufbar1final09260238 (Docker, 26.09., serving)"]}]},
@@ -230,14 +230,11 @@ def arch_status(cc: List[int], fmt: str) -> dict:
     tup = tuple(cc)
     if tup in ((8, 6), (12, 0)):
         return {"level": "metall", "ok": True,
-                "why": "sm%d%d: im Release-Image gebaut (sgl-kernel-Wheel 86;120a, JIT-Prebuild 8.6,12.0); am Rig gebootet." % tup}
+                "why": "sm%d%d: built in the release image (sgl-kernel wheel 86;120a, JIT prebuild 8.6,12.0); booted on the rig." % tup}
     if tup == (8, 9):
         return {"level": "ungebaut", "ok": False,
-                "why": "sm89: das Release-Image enthält keinen sm89-Code (Wheel 86;120a); der Arch-Gate des Launchers verweigert "
-                       "cc 8.9 (HW-ARCH, NF-Linie 7a8f4087a9). Der Port ist gelandet (Item 230: NF ec9e28cfa1, 27B-Teilstand 4c7eda3016; "
-                       "FP8 läuft dort über den benannten Marlin-Rückfall FP8-SM89-FALLBACK), der sm89-Image-Bau ist nur gestaged "
-                       "(Item 270, /spinning/gpu-arb/docker/sm89-1002/BUILD_SM89.md), ungebaut und am Metall ungetestet."}
+                "why": "sm89: the release image contains no sm89 code (wheel 86;120a); the arch gate of the launcher refuses cc 8.9 (HW-ARCH, NF line 7a8f4087a9). The port has landed (item 230: NF ec9e28cfa1, 27B partial state 4c7eda3016; FP8 runs there via the named Marlin fallback FP8-SM89-FALLBACK), the sm89 image build is only staged (item 270, /spinning/gpu-arb/docker/sm89-1002/BUILD_SM89.md), unbuilt and untested on the hardware."}
     if tup == (7, 5):
         return {"level": "gesperrt", "ok": False,
-                "why": "sm75 (Turing): kein bf16, kein FP8, kein NVFP4; das Image baut nur für sm86/sm120. Eintrag deaktiviert, bis sm75 hinzugefügt ist."}
-    return {"level": "gesperrt", "ok": False, "why": "Architektur sm%d%d nicht im Image." % tup}
+                "why": "sm75 (Turing): no bf16, no FP8, no NVFP4; the image builds only for sm86/sm120. Entry disabled until sm75 is added."}
+    return {"level": "gesperrt", "ok": False, "why": "Architecture sm%d%d not in the image." % tup}
