@@ -29542,7 +29542,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2428
+      "line": 2439
      }
     }
    },
@@ -29597,7 +29597,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2418
+    "line": 2429
    },
    "status": "geerntet",
    "text": "",
@@ -29620,7 +29620,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2464
+      "line": 2475
      }
     }
    },
@@ -38339,7 +38339,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4529
+    "line": 4540
    },
    "status": "unerklaert",
    "text": "",
@@ -38657,7 +38657,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4528
+    "line": 4539
    },
    "status": "geerntet",
    "text": "",
@@ -39210,7 +39210,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2104
+    "line": 2110
    },
    "status": "geerntet",
    "text": "",
@@ -39233,7 +39233,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2439
+      "line": 2450
      }
     }
    },
@@ -39402,7 +39402,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2443
+      "line": 2454
      }
     }
    },
@@ -39575,6 +39575,34 @@
     "file": "environ.py",
     "kind": "environ",
     "line": 2823
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_ENABLE_WEG2_FRONT_SEND_IDS": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "FRONT-SEND-IDS-1007 (Hebel 2b): a text-only /v1/chat/completions leg that D prefills itself carries the front's exact X-EXACT ids as input_ids, so D neither renders nor encodes it -- only when every segment of the render passed the decode/encode round trip (weg2/front_tokens.send_ids_eligible). Enable only after the FRONT-IDS / D-IDS shadow lines matched on the metal.",
+   "id": "SGLANG_ENABLE_WEG2_FRONT_SEND_IDS",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_ENABLE_WEG2_FRONT_SEND_IDS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1887
    },
    "status": "geerntet",
    "text": "",
@@ -47533,7 +47561,35 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2113
+    "line": 2119
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_LOG_WEG2_PROMPT_IDS_DIGEST": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "FRONT-SEND-IDS-1007 shadow comparison: the front logs WEG2 FRONT-IDS (its X-EXACT ids of a text-only request) and group D's tokenizer manager logs WEG2 D-IDS (the ids it hands the scheduler), each with length and digest, joined by rid on the metal. Log only.",
+   "id": "SGLANG_LOG_WEG2_PROMPT_IDS_DIGEST",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_LOG_WEG2_PROMPT_IDS_DIGEST",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2124
    },
    "status": "geerntet",
    "text": "",
@@ -65503,7 +65559,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4074
+      "line": 4086
      }
     }
    },
@@ -70897,7 +70953,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3564
+      "line": 3575
      }
     }
    },
@@ -71178,7 +71234,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1964
+      "line": 1970
      }
     }
    },
@@ -71256,7 +71312,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4236
+      "line": 4247
      }
     }
    },
@@ -71335,7 +71391,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2457
+      "line": 2468
      }
     }
    },
@@ -71649,7 +71705,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1984
+    "line": 1990
    },
    "status": "geerntet",
    "text": "",
@@ -71851,7 +71907,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1888
+    "line": 1894
    },
    "status": "geerntet",
    "text": "",
@@ -71874,7 +71930,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2448
+      "line": 2459
      }
     }
    },
@@ -72096,7 +72152,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4216
+      "line": 4227
      }
     }
    },
@@ -72785,7 +72841,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1899
+    "line": 1905
    },
    "status": "geerntet",
    "text": "",
@@ -72813,7 +72869,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1894
+    "line": 1900
    },
    "status": "geerntet",
    "text": "",
@@ -75234,7 +75290,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4336
+      "line": 4347
      }
     }
    },
@@ -76629,7 +76685,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 1170
+      "line": 1182
      }
     }
    },
@@ -77354,7 +77410,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4145
+      "line": 4156
      }
     }
    },
@@ -77915,7 +77971,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2324
+    "line": 2335
    },
    "status": "erklaert",
    "text": "Wenn eine angehaltene (geparkte) Anfrage später weiterlaufen soll und der Platz für Mamba-Anker im Host-RAM voll ist, bekommt ihr Wiedereinstiegspunkt Vorrang: andere Zwischenstände ohne Park-Bezug werden zuerst auf die Platte ausgelagert, damit der Einstiegspunkt der geparkten Anfrage nicht verloren geht. Aus: der alte Weg; geparkte Anfragen können ihren Einstiegspunkt verlieren und neu rechnen. Ohne Park ändert sich nichts. Wirkt nur auf Knoten, die als geparkt markiert sind. Standard an. Unbelegt: Abhängigkeit zu einem anderen Schalter; ob der Nutzer ihn ändern soll (belegt ist nur der Entscheid „bleibt an“ vom 05.10. ~17:47Z); Nutzen am Metall (laut Bericht „active, effect not shown“).",
@@ -83262,7 +83318,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4189
+      "line": 4201
      }
     }
    },
@@ -84552,7 +84608,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4323
+      "line": 4334
      }
     }
    },
@@ -85333,25 +85389,25 @@
    "abweichung": 43,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 34
+   "nur_nf": 36
   },
-  "entries": 2693,
-  "envs": 1816,
+  "entries": 2695,
+  "envs": 1818,
   "erklaert": 304,
   "flags": 862,
-  "geerntet": 1668,
+  "geerntet": 1670,
   "kuratiert": 119,
   "unerklaert": 602
  },
- "tree_rev": "27b=65fc0e2076+nf=45f9766894+hebel2a",
+ "tree_rev": "27b=65fc0e2076+nf=66a895898e+hebel2b",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "65fc0e2076"
   },
   "nf": {
-   "entries": 2495,
-   "rev": "45f9766894+hebel2a"
+   "entries": 2497,
+   "rev": "66a895898e+hebel2b"
   }
  },
  "warnungen": []

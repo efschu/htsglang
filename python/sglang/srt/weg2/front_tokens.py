@@ -88,7 +88,7 @@ class SegmentEncoder:
     ``enabled`` is False and every call encodes the whole text."""
 
     def __init__(self, tok, marker: str = SEGMENT_MARKER,
-                 cap_tokens: int = SEGMENT_CACHE_TOKENS):
+                 cap_tokens: int = SEGMENT_CACHE_TOKENS, track_round_trip: bool = False):
         self.tok = tok
         self.marker = marker
         self.cap_tokens = int(cap_tokens)
@@ -98,6 +98,13 @@ class SegmentEncoder:
         #: per call: tokens taken from the cache / tokens encoded now
         self.last_reused = 0
         self.last_encoded = 0
+        #: FRONT-SEND-IDS-1007: every new segment is decoded and encoded once;
+        #: ``last_round_trip_ok`` = every segment of the last call came back as
+        #: its ids (None while not tracking). ``rt_lossy`` = the cached keys that
+        #: did not.
+        self.track_round_trip = bool(track_round_trip)
+        self.rt_lossy: set = set()
+        self.last_round_trip_ok: Optional[bool] = None
         self.lock = threading.Lock()
 
     def _probe(self) -> Tuple[bool, str]:
@@ -124,14 +131,28 @@ class SegmentEncoder:
         out.extend(self.marker + p for p in parts[1:])
         return out
 
+    def round_trip_ok(self, ids: Sequence[int], **kw) -> bool:
+        """``encode(decode(ids)) == ids`` -- group D's text path decodes the
+        rendered ids and its tokenizer manager encodes that text again, so the
+        front's ids are D's ids exactly where this holds (per segment: each
+        starts with the special marker, which the encode splits out first)."""
+        want = list(ids)
+        try:
+            return list(self.tok.encode(self.tok.decode(want), **kw)) == want
+        except Exception:  # noqa: BLE001 -- unknown is not sound
+            return False
+
     def encode(self, text: str, **kw) -> List[int]:
         if not self.enabled:
             ids = self.tok.encode(text, **kw)
             self.last_reused, self.last_encoded = 0, len(ids)
+            self.last_round_trip_ok = (self.round_trip_ok(ids, **kw)
+                                       if self.track_round_trip else None)
             return ids
         kwkey = json.dumps(kw, sort_keys=True, default=str)
         out: List[int] = []
         reused = encoded = 0
+        rt_ok = True
         with self.lock:
             for seg in self.split(text):
                 key = (_sha(seg), kwkey)
@@ -142,13 +163,18 @@ class SegmentEncoder:
                 else:
                     hit = array.array("i", self.tok.encode(seg, **kw))
                     encoded += len(hit)
+                    if self.track_round_trip and not self.round_trip_ok(hit, **kw):
+                        self.rt_lossy.add(key)
                     self.cache[key] = hit
                     self.cached_tokens += len(hit)
                     while self.cached_tokens > self.cap_tokens and len(self.cache) > 1:
-                        _, old = self.cache.popitem(last=False)
+                        old_key, old = self.cache.popitem(last=False)
                         self.cached_tokens -= len(old)
+                        self.rt_lossy.discard(old_key)
+                rt_ok = rt_ok and key not in self.rt_lossy
                 out.extend(hit)
         self.last_reused, self.last_encoded = reused, encoded
+        self.last_round_trip_ok = rt_ok if self.track_round_trip else None
         return out
 
 
@@ -180,6 +206,8 @@ class Count:
     ms: float
     reused: int
     encoded: int
+    #: FRONT-SEND-IDS-1007: SegmentEncoder.last_round_trip_ok of the render
+    round_trip_ok: Optional[bool] = None
 
 
 def _server_args_namespace(server_args: Dict[str, Any]) -> SimpleNamespace:
@@ -430,7 +458,8 @@ class FrontTokens:
                                 trust_remote_code=ns.trust_remote_code,
                                 tokenizer_revision=getattr(ns, "revision", None),
                                 tokenizer_backend=getattr(ns, "tokenizer_backend", "huggingface"))
-            seg = SegmentEncoder(tok)
+            seg = SegmentEncoder(
+                tok, track_round_trip=envs.SGLANG_ENABLE_WEG2_FRONT_SEND_IDS.get())
             wrapped = _TokWrapper(tok, seg)
             hf = _hf_config_stub(ns.model_path or path)
             mc = SimpleNamespace(
@@ -541,7 +570,8 @@ class FrontTokens:
             ids = self._tok.encode(ids)
         arr = np.asarray(ids, dtype=np.int32)
         return Count(n=int(arr.size), ids=arr, ms=(time.perf_counter() - t0) * 1000.0,
-                     reused=seg.last_reused, encoded=seg.last_encoded), image_data
+                     reused=seg.last_reused, encoded=seg.last_encoded,
+                     round_trip_ok=seg.last_round_trip_ok), image_data
 
     def remember(self, text: str, ids: np.ndarray) -> None:
         key = _sha(text)
@@ -552,6 +582,64 @@ class FrontTokens:
 
     def ids_for(self, text: str) -> Optional[np.ndarray]:
         return self.ids_by_text.get(_sha(text))
+
+
+# ---------------------------------------------------------------------------
+# FRONT-SEND-IDS-1007 (Hebel 2b): the D leg carries the front's ids
+# ---------------------------------------------------------------------------
+# A text-only chat turn is rendered and encoded twice today: by the front (the
+# X-EXACT count, with D's own serving code and tokenizer) and by group D
+# (render, encode, decode, and the tokenizer manager's encode of the decoded
+# text). With SGLANG_ENABLE_WEG2_FRONT_SEND_IDS the leg D prefills itself
+# carries the front's ids as ``input_ids`` and D's chat serving skips the
+# template (``_process_messages``: ``request.input_ids`` given). The ids are
+# D's ids exactly when D would render the same text and its decode/encode
+# round trip is the identity on every segment -- the second is checked here,
+# per new segment; the first is what the FRONT-IDS / D-IDS shadow lines
+# (SGLANG_LOG_WEG2_PROMPT_IDS_DIGEST) prove on the metal before the switch
+# is turned on.
+
+#: the one path whose D leg may carry the front's ids (the brief's scope; the
+#: Anthropic /v1/messages body is converted on D first)
+SEND_IDS_PATH = "/v1/chat/completions"
+
+
+def payload_has_media(payload: Dict[str, Any]) -> bool:
+    """Any message content part that is not text (an image, audio, video)."""
+    for msg in payload.get("messages") or ():
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list) and any(
+                not (isinstance(part, dict) and part.get("type") == "text") for part in content):
+            return True
+    return False
+
+
+def send_ids_eligible(*, path: str, payload: Any, count: Count) -> bool:
+    """May the D leg of this request carry ``count.ids`` instead of its text?
+
+    Not when D would render other text than the front counted: a continued
+    final message (its prefix ids are appended by a separate encode, whose
+    round trip the segment bit does not see), and ``reasoning_effort`` inside
+    ``chat_template_kwargs`` (D's ``_convert_to_internal_request`` pops it
+    before ``_process_messages``, the front's count does not)."""
+    if path != SEND_IDS_PATH or not isinstance(payload, dict):
+        return False
+    ctk = payload.get("chat_template_kwargs")
+    return (
+        count.round_trip_ok is True
+        and count.n > 0
+        and payload.get("input_ids") is None
+        and not payload.get("continue_final_message")
+        and not (isinstance(ctk, dict) and "reasoning_effort" in ctk)
+        and not payload_has_media(payload)
+    )
+
+
+def ids_digest(ids: Sequence[int]) -> str:
+    """The FRONT-IDS / D-IDS shadow key (weg2/prompt_ids_digest.py)."""
+    from sglang.srt.weg2.prompt_ids_digest import ids_digest as _digest
+
+    return _digest(ids)
 
 
 def token_lcp(a: np.ndarray, b: np.ndarray) -> int:

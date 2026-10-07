@@ -118,6 +118,18 @@ def _FtCount(**kw):
     from sglang.srt.weg2.front_tokens import Count
 
     return Count(**kw)
+
+
+def _ft_send_ids_eligible(**kw):
+    from sglang.srt.weg2.front_tokens import send_ids_eligible
+
+    return send_ids_eligible(**kw)
+
+
+def _ft_ids_digest(ids):
+    from sglang.srt.weg2.front_tokens import ids_digest
+
+    return ids_digest(ids)
 from sglang.srt.weg2.intake_stall import STALL_MARK as _INTAKE_STALL_MARK  # H91 part C
 
 #: weg2xsn291: the least a woken group keeps the cards even when fairness or
@@ -6289,6 +6301,8 @@ class Front:
             return None
         ft.remember(text, c.ids)
         self._sess_prefix(rid, c.ids)  # SESSION-TRACE
+        if mm is None:
+            Front._send_ids_note(self, rid, path, payload, c)  # FRONT-SEND-IDS-1007
         # L3-INDEX PRICE (y7d weg2-0-2 / 2-19): the page-granular store prefix
         # of these exact ids, earlier boots and this one -- a store fact like
         # P's END-ANCHOR, recorded before the measured prefix is read.
@@ -6367,6 +6381,43 @@ class Front:
                                mm=mm is not None, mm_cached=mm_cached,
                                image_end=(mm.image_end if mm is not None else 0),
                                d_reach=d_reach, d_floor=d_floor)
+
+    #: FRONT-SEND-IDS-1007: priced ids kept for a leg 2 that has not been posted
+    SEND_IDS_KEEP = 256
+
+    def _send_ids_note(self, rid: str, path: str, payload: Any, c: Any) -> None:
+        """FRONT-SEND-IDS-1007: the shadow line of this text-only count, and
+        (switch on) its ids kept for the D leg when ``send_ids_eligible``."""
+        if envs.SGLANG_LOG_WEG2_PROMPT_IDS_DIGEST.get():
+            logger.info("WEG2 FRONT-IDS rid=%s n=%d sha=%s rt_ok=%s path=%s",
+                        rid, int(c.n), _ft_ids_digest(c.ids), c.round_trip_ok, path)
+        if not envs.SGLANG_ENABLE_WEG2_FRONT_SEND_IDS.get():
+            return
+        if not _ft_send_ids_eligible(path=path, payload=payload, count=c):
+            self.counters["front_send_ids_ineligible"] += 1
+            return
+        book = self.__dict__.setdefault("_send_ids", collections.OrderedDict())
+        book[rid] = c.ids
+        while len(book) > Front.SEND_IDS_KEEP:
+            book.popitem(last=False)
+
+    def _send_ids_body(self, rid: str, payload: dict, pending: Optional["Pending"],
+                       single_prefill: bool) -> dict:
+        """FRONT-SEND-IDS-1007: the body D's leg 2 is posted with -- ``payload``
+        itself unless this rid's ids were kept and no P leg 1 ran for it (then
+        D tokenizes from scratch, and the ids take its place). Taken once: a
+        re-queued leg posts the text."""
+        book = self.__dict__.get("_send_ids")
+        ids = None if book is None else book.pop(rid, None)
+        no_p_leg = pending is None or pending.d_direct or pending.skip_leg1 or single_prefill
+        if ids is None or not no_p_leg:
+            return payload
+        body = dict(payload)
+        body["input_ids"] = ids.tolist()
+        self.counters["front_send_ids"] += 1
+        logger.info("WEG2 FRONT-SEND-IDS rid=%s n=%d (D's leg carries the front's ids; "
+                    "D renders and encodes nothing)", rid, int(ids.size))
+        return body
 
     def _d_page_size(self) -> int:
         """IMAGE-CACHED-1002: the groups' KV page size (their server info: NF 64,
@@ -12137,8 +12188,9 @@ class Front:
             # Feld 2 (Operator 29.09.): the internal hop asks for the tier split;
             # the client gets it only if it asked itself (strip below).
             _strip_tier = not cached_tier_asked(payload) and request.path in CACHED_TIER_ASK_PATHS
+            _d_body = Front._send_ids_body(self, rid, payload, pending, single_prefill)
             async with self.session.post(f"{g.url}{request.path}",
-                                         json=with_cached_tier_ask(payload, request.path)) as r:
+                                         json=with_cached_tier_ask(_d_body, request.path)) as r:
                 # FIX 2 (round 1): LAW 4's RE-ROUTE IS DECIDED BEFORE THE
                 # RESPONSE IS COMMITTED, ON BOTH WIRE SHAPES.  The check used
                 # to sit below the `if stream:` branch, which returns; so for

@@ -318,6 +318,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # D-MM-ITEM-CACHE-1007: set in maybe_init_d_mm_item_cache; None = the
     # processor runs for every image request, as before.
     d_mm_item_cache = None
+    # FRONT-SEND-IDS-1007: set in init_weg2_prompt_ids_digest; False = no
+    # D-IDS shadow line.
+    weg2_prompt_ids_digest = False
 
     @property
     def serving_chat_class(self):
@@ -354,6 +357,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init group D's image item cache (weg2, off by default)
         self.maybe_init_d_mm_item_cache()
+
+        # Init group D's prompt-ids shadow line (weg2, off by default)
+        self.init_weg2_prompt_ids_digest()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -532,6 +538,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             server_args=self.server_args,
             model_config=self.model_config,
             mm_processor=self.mm_processor,
+        )
+
+    def init_weg2_prompt_ids_digest(self):
+        from sglang.srt.weg2.prompt_ids_digest import d_digest_armed
+
+        self.weg2_prompt_ids_digest = d_digest_armed(
+            group=os.environ.get("SGLANG_WEG2_GROUP", "")
         )
 
     def init_ipc_channels(self, port_args: PortArgs):
@@ -1129,6 +1142,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
+        if self.weg2_prompt_ids_digest and mm_inputs is None:
+            from sglang.srt.weg2.prompt_ids_digest import log_d_ids
+
+            log_d_ids(
+                rid=obj.rid,
+                ids=input_ids,
+                src=(
+                    "text"
+                    if text_ids is not None
+                    else "ids" if obj.input_ids is not None else "handoff"
+                ),
+            )
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids

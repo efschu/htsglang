@@ -1879,6 +1879,12 @@ class Envs:
     # its /health and every route decision are unchanged; a client that does
     # not wait is held exactly as before. 0 = serving at once, no warm render.
     SGLANG_WEG2_FRONT_TOKENIZER_PREWARM = EnvBool(True)
+    # FRONT-SEND-IDS-1007 (Hebel 2b): a text-only /v1/chat/completions leg that
+    # D prefills itself carries the front's exact X-EXACT ids as input_ids, so
+    # D neither renders nor encodes it -- only when every segment of the render
+    # passed the decode/encode round trip (weg2/front_tokens.send_ids_eligible).
+    # Enable only after the FRONT-IDS / D-IDS shadow lines matched on the metal.
+    SGLANG_ENABLE_WEG2_FRONT_SEND_IDS = EnvBool(False)
     # MM-PERSIST-1002 (y7t weg2-10-10: the first image after a restart was
     # priced by chars/3, routed LONG and flipped D->P for 23 new tokens, the
     # image KV in the persistent L3 store): the front keeps the learned image
@@ -2111,6 +2117,11 @@ class Envs:
     # D-LEAD-MS-1007: every rank of group D logs, at a request's first extend,
     # its scheduler arrival and extend start in epoch ms (weg2/d_lead_probe.py).
     SGLANG_LOG_WEG2_D_LEAD_MS = EnvBool(False)
+    # FRONT-SEND-IDS-1007 shadow comparison: the front logs WEG2 FRONT-IDS (its
+    # X-EXACT ids of a text-only request) and group D's tokenizer manager logs
+    # WEG2 D-IDS (the ids it hands the scheduler), each with length and digest,
+    # joined by rid on the metal. Log only.
+    SGLANG_LOG_WEG2_PROMPT_IDS_DIGEST = EnvBool(False)
     # #540: what the Anthropic front sends downstream for output_config.effort
     # == "xhigh". Default "xhigh" = pass the client's value through unchanged,
     # which is what the Qwen3.8 family's chat template accepts ('xhigh',
