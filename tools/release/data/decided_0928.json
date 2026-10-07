@@ -1,0 +1,12 @@
+{
+ "STUECKELUNG_FLOOR_MIB": "CHUNKING_FLOOR_MIB",
+ "STUECKELUNG_MARKER": "CHUNKING_MARKER",
+ "x_d_riegel": "x_d_guard",
+ "test_d_env_only_with_the_split_and_a_raised_riegel": "test_d_env_only_with_the_split_and_a_raised_guard",
+ "test_rechnung_pins": "test_computation_pins",
+ "test_stau_plans_the_stream_not_the_head": "test_queue_plans_the_stream_not_the_head",
+ "test_the_nf_arm_extra_passes_the_riegel_on_both_groups": "test_the_nf_arm_extra_passes_the_guard_on_both_groups",
+ "test_without_the_term_it_still_entfaellt": "test_without_the_term_it_is_still_dropped",
+ "test_worker_at_a_gate_while_the_host_is_in_the_riegel": "test_worker_at_a_gate_while_the_host_is_in_the_guard",
+ "_comment": " Single common German words (abbruch, belege, blockiert, folge, grund, keim, marke, punkte, runden, schief, schranke, variante(n), verteilung, vorlauf) are NOT mapped: as identifiers they are locals, and a word-token map would also hit prose and collide per file (measured FL7: grund->reason collides in launcher.py; 8 of them collide). The prose pass translates them. FL7 run 2: identifiers that also occur inside a string literal (source pins, hasattr/getattr, monkeypatch names) or in non-Python files (shell env names; the ident map only rewrites Python NAME tokens) are NOT mapped -- mapping them broke 21 tests (test_bar1_host_cleanup, gpu_battery checks, source pins on _platzhalter/_karte)."
+}

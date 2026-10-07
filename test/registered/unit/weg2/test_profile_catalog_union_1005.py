@@ -177,9 +177,10 @@ class Union(unittest.TestCase):
 
 
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
-#: rename_rigdash.py lebt auf desk/rename-editor-1005 (docker/weg2-release/); RENAME_RIGDASH überschreibt den Pfad, das Kit liegt unter /spinning/flliper/tools
+#: rename_rigdash.py liegt im Baum (docker/weg2-release/), das Umbenennungs-Kit ebenfalls (tools/release/, F0-A 07.10.);
+#: RENAME_RIGDASH bzw. RELEASE_KIT_TOOLS überschreiben die Pfade
 RENAME = os.environ.get("RENAME_RIGDASH") or os.path.join(REPO, "docker", "weg2-release", "rename_rigdash.py")
-KIT = os.environ.get("RELEASE_KIT_TOOLS") or "/spinning/flliper/tools"
+KIT = os.environ.get("RELEASE_KIT_TOOLS") or os.path.join(REPO, "tools", "release")
 
 
 @unittest.skipUnless(os.path.isfile(RENAME) and os.path.isdir(KIT), "rename_rigdash.py oder das Release-Kit fehlt")
