@@ -487,6 +487,36 @@ class Redaction(Base):
         self.assertNotIn("wJalrXUtnFEMI", out)
         self.assertNotIn("Ab3dE9xQ2mZpL0vK7sT4wY8nR1cF6hJ5gU", out)
 
+    def test_a_token_shaped_camelcase_run_is_cut_only_source_names_stay(self):
+        """Nacharbeit 1006 Runde 7, Befund 3: die Ausnahme ist eine LISTE (Bezeichner aus dem Launcher-/weg2-Quelltext), keine Form."""
+        for probe in ("AbcdEfghIjklMnopQrstUvwxYz12Ab", "Abcd1Efgh2Ijkl3Mnop4Qrst5Uvwx6Yzab", "Weg2AbcdEfghIjklMnopQrstUvwxYz12"):
+            out = redact.text_for_issue("note " + probe)
+            self.assertNotIn(probe, out, probe)
+            self.assertIn("<entfernt>", out, probe)
+        self.assertEqual(redact.text_for_issue("W64 Weg2TpOperatingPointInfeasible: x"), "W64 Weg2TpOperatingPointInfeasible: x")
+        # die Liste kommt aus dem Quelltext: ein Name, der dort als Klasse steht, bleibt lesbar (Beleg: class Weg2DKvStageWavesRefused)
+        self.assertIn("Weg2DKvStageWavesRefused", redact.known_idents())
+        self.assertIn("Weg2TpOperatingPointInfeasible", redact.known_idents())
+        self.assertNotIn("AbcdEfghIjklMnopQrstUvwxYz12Ab", redact.known_idents())
+
+    def test_without_a_source_tree_only_the_builtin_names_stay(self):
+        saved = (redact._known_cache, os.environ.get("HWPROFIL_TREE"), os.environ.get("KARTENPLAN_TREE"), redact._tree_candidates)
+        try:
+            redact._known_cache = None
+            os.environ.pop("HWPROFIL_TREE", None)
+            os.environ.pop("KARTENPLAN_TREE", None)
+            redact._tree_candidates = lambda: []
+            self.assertEqual(redact.known_idents(), redact._KNOWN_IDENT_BUILTIN)
+            self.assertEqual(redact.text_for_issue("W64 Weg2TpOperatingPointInfeasible: x"), "W64 Weg2TpOperatingPointInfeasible: x")
+            self.assertNotIn("AbcdEfghIjklMnopQrstUvwxYz12Ab", redact.text_for_issue("note AbcdEfghIjklMnopQrstUvwxYz12Ab"))
+            self.assertIsNone(redact._known_cache)            # ohne Baum nichts gemerkt: der naechste Aufruf sucht neu
+        finally:
+            redact._known_cache, redact._tree_candidates = saved[0], saved[3]
+            if saved[1] is not None:
+                os.environ["HWPROFIL_TREE"] = saved[1]
+            if saved[2] is not None:
+                os.environ["KARTENPLAN_TREE"] = saved[2]
+
     def test_names_ending_in_a_credential_word_are_secrets_singular_and_plural(self):
         for n in ("OPENAI_API_KEYS", "MY_KEYS", "HF_AUTH", "--auth", "DB_PASS", "--pass", "MY_SECRETS", "DB_PASSWORDS", "SERVICE_CREDENTIALS", "GH_PAT",
                   "HF_TOKENS", "--auth-tokens", "--credential"):

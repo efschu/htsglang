@@ -211,7 +211,7 @@ out.dryWins = PX.verdiktOf(base(), ctx({ prop: { werte: [W([])] }, vsrc: "dry", 
 const html = PX.renderRow(base(), ctx({ prop: { werte: [W([V("X", { forcebar: false, force_state: "blockiert" })])] } }));
 out.html = html;
 """)
-        self.assertEqual(o["ids"], ["geht", "force", "verweigert", "hinweis", "ungeprueft", "keins", "alt"])
+        self.assertEqual(o["ids"], ["geht", "force", "verweigert", "hinweis", "ungeprueft", "keinlauf", "alt"])
         self.assertEqual((o["label"], o["code"]), ("nur mit --force", "W40"))
         self.assertEqual(o["dry"], "W77")
         self.assertEqual(o["dryWins"], "force")

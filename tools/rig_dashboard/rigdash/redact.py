@@ -11,8 +11,11 @@ whole group environment.
 
 from __future__ import annotations
 
+import glob
+import os
 import posixpath
 import re
+from typing import List, Optional
 
 # a line matching this is dropped whole
 DROP_LINE = re.compile(r"ADMIN-KEY|admin-api-key|\.adminkey\b|auth=bearer|Authorization:|WEG2-GROUP-ENV|GITHUB_PAT|openrouter\.key",
@@ -144,15 +147,56 @@ _DOTTED = re.compile(r"(?<![A-Za-z0-9_\-.])[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+
 _FULLRUN = re.compile(r"[A-Za-z0-9_\-]{32,}\Z")
 
 
-# a CamelCase identifier (a launcher exception class such as ``Weg2TpOperatingPointInfeasible``): >= 3 words, each an upper-case letter followed by lower-case
-# letters (and optional digits), no ``+`` / ``/`` / ``=``.  A random base64 token does not have this shape (its capitals are not all isolated), so the
-# exemption does not open a leak; it is what keeps refusal class names readable in the run report.
-_CAMEL_IDENT = re.compile(r"(?:[A-Z][a-z]+[0-9]*){3,}\Z")
+# a CamelCase identifier the LAUNCHER / weg2 source really contains (the exception class of a refusal, ``Weg2TpOperatingPointInfeasible``, or any ``class X``
+# of ``srt/weg2``): such a name is a word of the refusal text, not a secret, and stays readable in the run report.  The exemption is a LIST, never a shape:
+# a token-like run of capital+lower-case groups (``AbcdEfghIjklMnopQrstUvwxYz12Ab``) is no source name and is cut like any other base64-looking run.
+# Read once from the source tree (``HWPROFIL_TREE`` / ``KARTENPLAN_TREE`` / the tree candidates of ``hwprofil``): every ``Weg2<Word>...`` identifier of
+# ``srt/weg2/*.py`` and ``srt/flip_*.py`` (the launcher prints some as text, ``Weg2TpOperatingPointInfeasible`` is no class) plus every ``class X``
+# of those files.  No tree found -> only the built-in names below (the ones the run report is known to quote), everything else is cut: the safe side.
+_KNOWN_IDENT_BUILTIN = frozenset(("Weg2TpOperatingPointInfeasible", "Weg2XchgResidencyUnarmable", "Weg2XchgSemaphoreNotRearmed", "Weg2FlipPeerLegAborted",
+                                  "Weg2DualCompactBreach"))
+_IDENT_IN_SOURCE = re.compile(r"\bWeg2[A-Z][A-Za-z0-9]+\b|^class ([A-Z][A-Za-z0-9]+)", re.M)
+_known_cache: Optional[frozenset] = None
+
+
+def _tree_candidates() -> List[str]:
+    out = [os.environ.get("HWPROFIL_TREE"), os.environ.get("KARTENPLAN_TREE")]
+    try:
+        from . import hwprofil
+        out += list(hwprofil.TREE_CANDIDATES)
+    except Exception:       # noqa: BLE001 -- no candidate list: the environment variables alone
+        pass
+    return [t for t in out if t]
+
+
+def _scan_known_idents(tree: str) -> frozenset:
+    names = set()
+    for sub, pat in (("sglang/srt/weg2", "*.py"), ("sglang/srt", "flip_*.py")):
+        for f in glob.glob(os.path.join(tree, sub, pat)):
+            try:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    for m in _IDENT_IN_SOURCE.finditer(fh.read()):
+                        names.add(m.group(1) or m.group(0))
+            except OSError:
+                continue
+    return frozenset(names)
+
+
+def known_idents() -> frozenset:
+    """The identifiers the exemption lets through (built-ins + the source tree).  A scan that found no tree is not cached (the next call looks again)."""
+    global _known_cache
+    if _known_cache is not None:
+        return _known_cache
+    for t in _tree_candidates():
+        if os.path.isdir(os.path.join(t, "sglang", "srt", "weg2")):
+            _known_cache = _KNOWN_IDENT_BUILTIN | _scan_known_idents(t)
+            return _known_cache
+    return _KNOWN_IDENT_BUILTIN
 
 
 def _b64_secret(run: str) -> bool:
     body = run.rstrip("=")
-    if run == body and _CAMEL_IDENT.match(body):      # ``Weg2TpOperatingPointInfeasible``: Weg2 + 3 Worte
+    if run == body and body in known_idents():      # ``Weg2TpOperatingPointInfeasible``: a name of the launcher source, not a key
         return False
     return (not body.startswith("/") and len(body) >= 30 and _looks_like_secret(body)
             and any(c.isupper() for c in body) and any(c.islower() for c in body) and any(c.isdigit() for c in body))

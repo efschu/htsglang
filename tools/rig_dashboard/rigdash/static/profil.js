@@ -157,7 +157,8 @@
       <div class="pf-force">Beim Serverstart: ${esc(r.force)}</div>
       <details><summary>Warum diese Zuordnung · Folge · Quelle</summary><div class="muted">${esc(r.why_class || "")}</div>
         ${r.consequence ? `<div class="muted">Folge mit Force: ${esc(r.consequence)}</div>` : ""}<div class="muted">Quelle: ${esc(r.source || "")}</div></details></li>`).join("");
-    return `<div class="pf-verdict ${d.goes ? "ok" : "bad"}"><b>${esc(d.verdict)}</b></div>
+    const PX = window.ProfilPlaner, sc = PX && PX.startChip((d.orakel || {}).ausgang, d.verdikte);      // Trockenlauf: "mit --force" steht am Start, nicht an einem Wert
+    return `<div class="pf-verdict ${d.goes ? "ok" : "bad"}"><b>${esc(d.verdict)}</b>${sc ? " " + PX.vChip(sc) : ""}</div>
       ${rj ? `<ul class="pf-rejs">${rj}</ul>` : ""}
       <div class="muted pf-note">${esc(d.force_note)}</div>
       <ul class="pf-notes">${d.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>`;

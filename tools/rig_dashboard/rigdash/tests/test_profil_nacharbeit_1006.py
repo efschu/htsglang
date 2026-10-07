@@ -66,11 +66,11 @@ out.html = PX.renderRow(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { 
 
 @unittest.skipUnless(NODE, "node fehlt")
 class F6NieGehtWasNichtBeurteiltIst(unittest.TestCase):
-    """Runde 6, Befund 1: der Launcher bricht bei der ersten Verweigerung ab (launcher.py:17349-17352); W64 urteilt gegen die Budgets, aus denen
+    """Runde 6, Befund 1 (Runde 7: geht_mit_force und Einzelkarte stehen jetzt in der Tabelle von chipFor, Klasse F7): der Launcher bricht bei der ersten Verweigerung ab (launcher.py:17349-17352); W64 urteilt gegen die Budgets, aus denen
     --rank-gpu-memory-mib / --user-reserve-mib stammen.  Ein Wert, den kein Verdikt nennt, ist darum nach einem verweigerten Lauf NICHT 'geht'."""
     BODY = """
 const V = (code, o) => Object.assign({ code, ebene: "lauf", forcebar: false, force_state: "blockiert", grund: code + " grund", konsequenz: "k", werte: [] }, o || {});
-const w64 = V("W64-OPPOINT", { werte: [] });
+const w64 = V("W64-OPPOINT", { werte: [], durchgelassen: false });
 const reserve = base({ name: "--user-reserve-mib", key: "flag:--user-reserve-mib", origin: "nutzer", value: "9999" });
 const mib = base({ name: "--rank-gpu-memory-mib", key: "flag:--rank-gpu-memory-mib", value: "15000" });
 const W = (key) => ({ key, wert: "1", zustand: "vorgeschlagen", geaendert: true, verdikte: [] });
@@ -79,9 +79,9 @@ const id = (row, c) => PX.verdiktOf(row, ctx(c));
 // Trockenlauf (frisch, "Neu pruefen"): W64 verweigert, kein Verdikt nennt den Wert -> nicht beurteilt, auch der uebersteuerte
 out.dryReserve = id(reserve, { prop: { werte: [W("flag:--user-reserve-mib")] }, vsrc: "dry", dry: dry("verweigert", [w64]) });
 out.dryMib = id(mib, { prop: null, vsrc: "dry", dry: dry("verweigert", [w64]) });
-// Absturz / geht_mit_force: ebenso
-out.dryAbsturz = id(mib, { prop: null, vsrc: "dry", dry: dry("absturz", [V("ABSTURZ", { ebene: "absturz" })]) }).id;
-out.dryForce = id(mib, { prop: null, vsrc: "dry", dry: dry("geht_mit_force", [V("W40", { forcebar: true, force_state: "force", werte: ["--anderer"] })]) }).id;
+// Absturz: ebenso; geht_mit_force (Runde 7): der Lauf ging DURCH, der Wert ist beurteilt: geht
+out.dryAbsturz = id(mib, { prop: null, vsrc: "dry", dry: dry("absturz", [V("ABSTURZ", { ebene: "absturz", durchgelassen: false })]) }).id;
+out.dryForce = id(mib, { prop: null, vsrc: "dry", dry: dry("geht_mit_force", [V("W40", { forcebar: true, force_state: "force", werte: ["--anderer"], durchgelassen: true })]) }).id;
 // der Lauf ging durch: geht
 out.dryGeht = id(mib, { prop: null, vsrc: "dry", dry: dry("geht", []) }).id;
 // der Wert wird ausdruecklich genannt: sein eigenes Urteil gilt, nicht 'nicht beurteilt'
@@ -92,7 +92,7 @@ out.okGenannt = id(mib, { prop: null, vsrc: "dry", dry: dry("verweigert", [w64, 
 const prop = (ausgang, vs) => ({ werte: [W("flag:--rank-gpu-memory-mib")], verdikt: { ausgang, verdikte: vs } });
 out.propRefused = id(mib, { prop: prop("verweigert", [w64]), vsrc: "prop" });
 out.propGeht = id(mib, { prop: prop("geht", []), vsrc: "prop" }).id;
-out.propEinzel = id(mib, { prop: prop("passt", []), vsrc: "prop" }).id;
+out.propEinzel = id(mib, { prop: prop("passt", []), vsrc: "prop" }).id;      // Runde 7: Planer-Rechnung, nie "geht"
 out.propOhneAusgang = id(mib, { prop: { werte: [W("flag:--rank-gpu-memory-mib")] }, vsrc: "prop" }).id;
 out.html = PX.renderRow(reserve, ctx({ prop: null, vsrc: "dry", dry: dry("verweigert", [w64]) }));
 """
@@ -106,13 +106,14 @@ out.html = PX.renderRow(reserve, ctx({ prop: null, vsrc: "dry", dry: dry("verwei
             self.assertEqual(self.o[k]["id"], "nichtbeurteilt", k)
             self.assertEqual(self.o[k]["label"], "nicht beurteilt (Lauf verweigert: W64-OPPOINT)", k)
         self.assertEqual(self.o["dryAbsturz"], "nichtbeurteilt")
-        self.assertEqual(self.o["dryForce"], "nichtbeurteilt")
 
     def test_goes_only_when_the_run_went_through_or_the_value_is_named_ok(self):
-        self.assertEqual((self.o["dryGeht"], self.o["propGeht"], self.o["propEinzel"]), ("geht", "geht", "geht"))
+        self.assertEqual((self.o["dryGeht"], self.o["propGeht"]), ("geht", "geht"))
+        self.assertEqual(self.o["dryForce"], "geht")             # Runde 7, Befund 1: ein Lauf, der mit --force durchlief, hat alle Werte gesehen
+        self.assertEqual(self.o["propEinzel"], "planerpasst")    # Runde 7, Befund 2: kein Launcher-Lauf, also nicht "geht"
         self.assertEqual(self.o["okGenannt"], "geht")
         self.assertEqual(self.o["genannt"], "verweigert")        # der eigene Befund, nicht der Lauf
-        self.assertEqual(self.o["propOhneAusgang"], "nichtbeurteilt")   # kein Ausgang = nicht belegt, nie 'geht'
+        self.assertEqual(self.o["propOhneAusgang"], "keinlauf")   # kein Ausgang = nicht belegt, nie 'geht'
 
     def test_the_row_chip_for_the_w64_case(self):
         h = self.o["html"]
@@ -373,3 +374,131 @@ class F1LaufberichtOhneLauf(Base):
         self.assertEqual(d["rejections"], [])
         fh = P.force_hint(d, [])
         self.assertEqual((fh["fall"], fh["show_line"]), ("kein_launcher_lauf", False))
+
+
+# Runde 7: die Chip-Entscheidung je Wert ist EINE Tabelle (chipFor in profil_planer.js); eine Zelle = ein Fall.
+# Spalten: N nicht genannt | OK genannt ok | F verweigert, forcebar | B verweigert, nicht forcebar | H Hinweis | U Force ungeprueft
+_COLS = {"OK": ("geht", "geht"), "F": ("force", "nur mit --force"), "B": ("verweigert", "verweigert"), "H": ("hinweis", "Hinweis"), "U": ("ungeprueft", "Force ungeprüft")}
+_N = {
+    "geht": ("geht", "geht"),
+    "geht_mit_force": ("geht", "geht"),
+    "verweigert": ("nichtbeurteilt", "nicht beurteilt (Lauf verweigert: W64-OPPOINT)"),
+    "absturz": ("nichtbeurteilt", "nicht beurteilt (Lauf verweigert: ORAKEL-ABSTURZ)"),
+    "orakel_fehler": ("orakelfehler", "Orakel-Fehler"),
+    "passt": ("planerpasst", "Planer-Rechnung: passt"),
+    "passt_nicht": ("planerpasstnicht", "Planer-Rechnung: passt nicht"),
+    "unbelegt": ("planerunbelegt", "Planer-Rechnung: unbelegt"),
+    "kein_dokument": ("keinlauf", "kein Lauf"),
+}
+TABLE = {(a, c): (_N[a] if c == "N" else _COLS[c]) for a in _N for c in ("N", "OK", "F", "B", "H", "U")}
+LAUNCHER_LAEUFE = ("geht", "geht_mit_force", "verweigert", "absturz")
+
+
+@unittest.skipUnless(NODE, "node fehlt")
+class F7ChipForTabelle(unittest.TestCase):
+    """Runde 7, Befunde 1 und 2: EINE reine Funktion chipFor(ausgang, laufEbene, wertVerdikte, quelle); die Tabelle steht im Kommentar der Funktion."""
+    BODY = """
+const V = (code, o) => Object.assign({ code, ebene: "lauf", forcebar: true, force_state: "force", grund: code + " grund", konsequenz: "k", werte: ["--x"] }, o || {});
+const COLS = { N: [], OK: [V("FIT", { ebene: "fit", forcebar: null, force_state: "geht" })], F: [V("W40")], B: [V("X", { forcebar: false, force_state: "blockiert" })],
+  H: [V("H", { ebene: "hinweis", forcebar: null, force_state: "hinweis" })], U: [V("U", { force_state: "ungeprueft" })] };
+const LAUF = {
+  geht: [], geht_mit_force: [V("W40", { durchgelassen: true })], verweigert: [V("W64-OPPOINT", { forcebar: false, force_state: "blockiert", durchgelassen: false })],
+  absturz: [V("ORAKEL-ABSTURZ", { ebene: "absturz", forcebar: false, force_state: "blockiert", durchgelassen: false })] };
+out.cells = {};
+for (const a of PX.AUSGAENGE) for (const c of PX.SPALTEN) {
+  const r = PX.chipFor(a, LAUF[a] || [], COLS[c], "Trockenlauf (Orakel)");
+  out.cells[a + "|" + c] = { id: r.id, label: r.label, tip: r.tip, code: r.code || null };
+}
+out.axes = [PX.AUSGAENGE.length, PX.SPALTEN.length];
+const n = (a, lauf) => PX.chipFor(a, lauf, [], "Vorschlag (Orakel)");
+// Widerspruch im Dokument: geht_mit_force MIT einem beendenden Verdikt ist nicht durchgelaufen
+out.forceWiderspruch = n("geht_mit_force", [V("W64-OPPOINT", { durchgelassen: false })]);
+// verweigert / absturz ohne beendendes Verdikt: nie "geht", nie ein erfundener Code
+out.verwOhne = n("verweigert", []);
+out.absOhne = n("absturz", []);
+// unbekannter / fehlender Ausgang = kein Dokument
+out.unbekannt = n("quark", []);
+out.fehlt = n(undefined, []);
+// durchgelassen=true allein beendet keinen Lauf
+out.nurDurchgelassen = n("verweigert", [V("W40", { durchgelassen: true })]);
+// der Hinweis der Startebene
+out.start = ["geht", "geht_mit_force", "verweigert", "passt", undefined].map((a) => PX.startChip(a, []));
+out.startWiderspruch = PX.startChip("geht_mit_force", [V("W64-OPPOINT", { durchgelassen: false })]);
+// Zeilen: geht_mit_force traegt den Start-Chip im Vorschlag, geht nicht
+const p = (a, vs) => ({ n: 3, form: "dual", werte: [], verdikt: { ausgang: a, verdikte: vs }, vorschlag: {} });
+out.propForce = PX.renderProposal(p("geht_mit_force", [V("W40", { durchgelassen: true })]));
+out.propGeht = PX.renderProposal(p("geht", []));
+// eine Zeile nach geht_mit_force: nicht genannter Wert = geht, nicht "nicht beurteilt"
+const row = base({ name: "--rank-gpu-memory-mib", key: "flag:--rank-gpu-memory-mib" });
+const W = { key: row.key, wert: "1", zustand: "vorgeschlagen", geaendert: true, verdikte: [] };
+out.zeileForce = PX.renderRow(row, ctx({ prop: { werte: [W], verdikt: { ausgang: "geht_mit_force", verdikte: [V("W40", { durchgelassen: true })] } }, vsrc: "prop" }));
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.o = run_node(cls.BODY)
+
+    def test_the_table_has_nine_rows_and_six_columns(self):
+        self.assertEqual(self.o["axes"], [9, 6])
+        self.assertEqual(len(self.o["cells"]), 54)
+
+    def test_every_cell_of_the_table(self):
+        for (a, c), (ident, label) in sorted(TABLE.items()):
+            with self.subTest(ausgang=a, spalte=c):
+                cell = self.o["cells"][a + "|" + c]
+                self.assertEqual((cell["id"], cell["label"]), (ident, label))
+                self.assertTrue(cell["tip"], "jede Zelle hat einen Tooltip")
+
+    def test_goes_only_for_a_run_that_went_through_or_a_value_named_ok(self):
+        for key, cell in self.o["cells"].items():
+            a, c = key.split("|")
+            if cell["id"] == "geht" and c == "N":
+                self.assertIn(a, ("geht", "geht_mit_force"), key)
+
+    def test_the_word_launcher_is_only_in_cells_where_a_launcher_run_happened(self):
+        for key, cell in self.o["cells"].items():
+            a, c = key.split("|")
+            if c != "N":
+                continue
+            text = cell["label"] + " " + cell["tip"]
+            if a in LAUNCHER_LAEUFE:
+                self.assertIn("Launcher", text, key)
+            else:
+                self.assertNotIn("Launcher", text, key)
+
+    def test_a_named_value_has_its_own_verdict_in_every_row(self):
+        for key, cell in self.o["cells"].items():
+            a, c = key.split("|")
+            if c in ("F", "B", "H", "U"):
+                self.assertTrue(cell["code"], key)
+
+    def test_force_run_value_is_judged_not_unjudged_and_the_force_note_is_at_the_start(self):
+        o = self.o
+        self.assertEqual(o["cells"]["geht_mit_force|N"]["label"], "geht")
+        self.assertNotIn("Lauf verweigert", o["zeileForce"])
+        self.assertIn("pfx-v-geht", o["zeileForce"])
+        self.assertNotIn("pfx-v-nichtbeurteilt", o["zeileForce"])
+        self.assertIn("mit --force", o["propForce"])
+        self.assertIn("pfx-v-mitforce", o["propForce"])
+        self.assertNotIn("pfx-v-mitforce", o["propGeht"])
+        self.assertEqual([x["label"] if x else None for x in o["start"]], [None, "mit --force", None, None, None])
+        self.assertIsNone(o["startWiderspruch"])
+        self.assertNotIn("mit --force", o["zeileForce"].replace("nur mit --force", ""))      # nie je Wert
+
+    def test_edge_cells_never_invent_a_judgement(self):
+        o = self.o
+        self.assertEqual(o["forceWiderspruch"]["id"], "nichtbeurteilt")
+        self.assertIn("W64-OPPOINT", o["forceWiderspruch"]["label"])
+        for k in ("verwOhne", "absOhne", "nurDurchgelassen"):
+            self.assertEqual(o[k]["id"], "nichtbeurteilt", k)
+            self.assertIn("ohne Lauf-Verdikt", o[k]["label"], k)
+            self.assertNotIn("Lauf verweigert", o[k]["label"], k)
+        self.assertEqual((o["unbekannt"]["id"], o["fehlt"]["id"]), ("keinlauf", "keinlauf"))
+
+    def test_every_chip_id_has_a_style(self):
+        html = open(os.path.join(STATIC, "index.html"), encoding="utf-8").read()
+        ids = {cell["id"] for cell in self.o["cells"].values()} | {"mitforce", "alt"}
+        for i in sorted(ids):
+            if i in ("geht", "force", "verweigert", "hinweis", "ungeprueft"):
+                continue
+            self.assertIn(".pfx-v-" + i, html, i)
