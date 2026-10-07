@@ -144,8 +144,16 @@ _DOTTED = re.compile(r"(?<![A-Za-z0-9_\-.])[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+
 _FULLRUN = re.compile(r"[A-Za-z0-9_\-]{32,}\Z")
 
 
+# a CamelCase identifier (a launcher exception class such as ``Weg2TpOperatingPointInfeasible``): >= 3 words, each an upper-case letter followed by lower-case
+# letters (and optional digits), no ``+`` / ``/`` / ``=``.  A random base64 token does not have this shape (its capitals are not all isolated), so the
+# exemption does not open a leak; it is what keeps refusal class names readable in the run report.
+_CAMEL_IDENT = re.compile(r"(?:[A-Z][a-z]+[0-9]*){3,}\Z")
+
+
 def _b64_secret(run: str) -> bool:
     body = run.rstrip("=")
+    if run == body and _CAMEL_IDENT.match(body):      # ``Weg2TpOperatingPointInfeasible``: Weg2 + 3 Worte
+        return False
     return (not body.startswith("/") and len(body) >= 30 and _looks_like_secret(body)
             and any(c.isupper() for c in body) and any(c.islower() for c in body) and any(c.isdigit() for c in body))
 

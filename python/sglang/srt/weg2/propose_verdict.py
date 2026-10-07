@@ -131,14 +131,38 @@ SUPPLEMENT_CODES: Dict[str, Dict[str, Any]] = {
                               "not a margin chosen here. W64-DUAL: no measured dual-share D log of the model with these weights; the model verdict stands. "
                               "[Launcher-Text launcher.py:16986-16993, :17242-17243]",
                      "konsequenz": "Bleibt auch mit Force bestehen. Aufgehoben wird es nur durch ein gemessenes Dual-D-Log dieser Gewichte (Evidence-Verzeichnis); "
-                                   "ohne Messung gilt das Urteil des Modells."}},
+                                   "ohne Messung gilt das Urteil des Modells."},
+            # 'W64-DUAL: the refusal names no weight vector' (launcher.py:17235): die Meldung nennt keinen Gewichtsvektor, es gab also keine Suche
+            "dual_ohne_gewichte": {"titel": "W64 Dual: Betriebspunkt nicht belegt (Meldung ohne Gewichtsvektor, kein Dual-D-Log gesucht)",
+                     "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17235 (the refusal names no weight vector)",
+                     "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells ohne Sicherheitsfaktor; im Dual konnte er das Dual-D-Log nicht suchen, weil "
+                                     "die Meldung keinen Gewichtsvektor nennt (dual_w64.find_dual_d_measurement braucht ihn).",
+                     "grund": "W64 Weg2TpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
+                              "W64-DUAL: the refusal names no weight vector; the model verdict stands. [Launcher-Text launcher.py:16986-16993, :17235]",
+                     "konsequenz": "Bleibt auch mit Force bestehen. Es wurde kein Dual-D-Log gesucht (kein Gewichtsvektor in der Meldung); das Urteil des Modells gilt."},
+            # 'W64-DUAL MEASURED (...) -> INFEASIBLE' (dual_w64.py:117, angehaengt launcher.py:17343-17347): ein Dual-D-Log WURDE gefunden und urteilt selbst
+            "dual_gemessen": {"titel": "W64 Dual-D: gemessenes Dual-D-Log bestaetigt: kein ausreichender KV-Pool",
+                     "quelle": "launcher.py:16986-16993 (Weg2TpOperatingPointInfeasible), :17343-17347 (Messung angehaengt), dual_w64.py:117 (judge)",
+                     "klasse_grund": "Der Launcher verweigert W64 als Urteil des Modells; im Dual wurde ein gemessenes Dual-D-Log dieser Gewichte gefunden "
+                                     "(dual_w64.find_dual_d_measurement) und urteilt auf den eigenen Posten des Laufs INFEASIBLE. Force aendert die Messung nicht.",
+                     "grund": "W64 Weg2TpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
+                              "W64-DUAL MEASURED (...) -> INFEASIBLE: a measured dual-share D log of these weights also leaves less than the minimum tokens on at least "
+                              "one rank. [Launcher-Text launcher.py:16986-16993, dual_w64.py:117]",
+                     "konsequenz": "Bleibt auch mit Force bestehen. Die Messung dieser Gewichte bestaetigt das Urteil; hilft nur, Budgets, Gewichtsaufteilung oder "
+                                   "Kartenzahl zu aendern."}},
 }
 
 def _supp_view(supp: Mapping[str, Any], text: Any) -> Dict[str, Any]:
-    """The supplement row, with the Dual wording when the refusal text carries ``W64-DUAL:`` (the launcher appends it only with ``dual_layout``)."""
-    d = supp.get("dual")
-    if d and "W64-DUAL:" in str(text or ""):
-        return {**supp, **d}
+    """The supplement row in the wording the refusal text earns.  The launcher prints W64 in four shapes (``dual_layout`` adds the last three): no Dual
+    marker (form-neutral base); ``W64-DUAL MEASURED (...) -> INFEASIBLE`` (a measured log was found, dual_w64.py:117, launcher.py:17343-17347);
+    ``W64-DUAL: the refusal names no weight vector`` (no search happened, :17235); ``W64-DUAL: no measured dual-share D log`` (searched, none, :17242)."""
+    t = str(text or "")
+    if "W64-DUAL MEASURED" in t and supp.get("dual_gemessen"):
+        return {**supp, **supp["dual_gemessen"]}
+    if "W64-DUAL: the refusal names no weight vector" in t and supp.get("dual_ohne_gewichte"):
+        return {**supp, **supp["dual_ohne_gewichte"]}
+    if "W64-DUAL:" in t and supp.get("dual"):
+        return {**supp, **supp["dual"]}
     return supp
 
 

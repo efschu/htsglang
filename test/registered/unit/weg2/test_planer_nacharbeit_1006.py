@@ -84,6 +84,47 @@ class TestSupplement(unittest.TestCase):
             self.assertEqual(last["code"], "W64-OPPOINT")
             self.assertEqual("Dual-D" in last["titel"], "W64-DUAL:" in msg)
 
+    def test_w64_three_dual_cases_each_get_their_own_wording(self):
+        """Nacharbeit 1006 Runde 6, Befund 3: kein Dual / Dual ohne Messung / Dual mit Messung INFEASIBLE / Meldung ohne Gewichtsvektor sind vier Woerter,
+        nicht zwei (launcher.py:17235, :17242-17243, :17343-17347, dual_w64.py:117)."""
+        neutral = PV.verdikt("W64-OPPOINT", ebene="lauf", text=W64_MSG, force_state=PV.BLOCKED)
+        ohne = PV.verdikt("W64-OPPOINT", ebene="lauf", force_state=PV.BLOCKED,
+                          text=W64_MSG + " | W64-DUAL: no measured dual-share D log of m with weights [20, 12, 8] under /x; the model verdict stands")
+        measured_line = ("W64-DUAL MEASURED (/ev/boot_x.D.log, D weights [20, 12, 8], cell 18432 B): r0 budget=15000 - measured posts=14853 => 9000 tokens; "
+                         "r1 budget=15000 - measured posts=15100 => -5000 tokens  <-- BELOW 1024 -> INFEASIBLE")
+        gemessen = PV.verdikt("W64-OPPOINT", ebene="lauf", force_state=PV.BLOCKED, text=W64_MSG + " | " + measured_line)
+        kein_vektor = PV.verdikt("W64-OPPOINT", ebene="lauf", force_state=PV.BLOCKED,
+                                 text="W64 Weg2TpOperatingPointInfeasible: x | W64-DUAL: the refusal names no weight vector; the model verdict stands")
+        for v in (neutral, ohne, gemessen, kein_vektor):
+            self.assertEqual((v["code"], v["forcebar"], v["klasse"]), ("W64-OPPOINT", False, "nicht_forcebar"))
+        # kein Dual: formneutral, ohne Dual-Wort
+        self.assertNotIn("Dual", neutral["titel"])
+        self.assertNotIn("Dual-D-Log", neutral["konsequenz"])
+        # Dual ohne Messung: der Wortlaut "ohne gemessenes Dual-D-Log"
+        self.assertIn("ohne gemessenes Dual-D-Log", ohne["titel"])
+        self.assertIn("Dual-D-Log", ohne["konsequenz"])
+        # Dual mit Messung INFEASIBLE: sagt, dass gemessen wurde, nie "ohne gemessenes Dual-D-Log"
+        self.assertIn("gemessenes Dual-D-Log bestaetigt", gemessen["titel"])
+        self.assertNotIn("ohne gemessenes", gemessen["titel"] + gemessen["konsequenz"] + gemessen["klasse_grund"])
+        self.assertIn("bestaetigt", gemessen["konsequenz"])
+        self.assertRegex(gemessen["quelle"], r"17343-17347.*dual_w64\.py:117")
+        # Meldung ohne Gewichtsvektor: keine Suche, also nicht "ohne gemessenes Dual-D-Log"
+        self.assertNotIn("ohne gemessenes", kein_vektor["titel"] + kein_vektor["konsequenz"])
+        self.assertIn("ohne Gewichtsvektor", kein_vektor["titel"])
+        self.assertRegex(kein_vektor["quelle"], r"17235")
+        self.assertEqual(len({neutral["titel"], ohne["titel"], gemessen["titel"], kein_vektor["titel"]}), 4)
+
+    def test_the_w64_dual_marker_texts_exist_in_the_launcher_sources(self):
+        """Die drei Marker, nach denen _supp_view unterscheidet, stehen so im Quelltext (nicht aus dem Gedaechtnis)."""
+        import inspect
+
+        from sglang.srt.weg2 import dual_w64
+        lsrc, dsrc = inspect.getsource(launcher), inspect.getsource(dual_w64)
+        self.assertIn('"W64-DUAL: the refusal names no weight vector', lsrc)
+        self.assertIn('"W64-DUAL: no measured dual-share D log of', lsrc)
+        self.assertIn("W64-DUAL MEASURED (", dsrc)
+        self.assertIn('"INFEASIBLE"', dsrc)
+
     def test_verdikt_without_text_falls_back_to_the_launcher_wording(self):
         v = PV.verdikt("W71-CENSUS", ebene="lauf")
         self.assertIn("W71 Weg2XchgResidencyUnarmable", v["grund"])

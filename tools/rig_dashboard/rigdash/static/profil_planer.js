@@ -68,14 +68,27 @@
     if (r.absent) return { id: "standard", label: "Standard (nicht im Profil)", tip: "Das Profil setzt diesen Wert nicht; es gilt der Standard des Codes." };
     return { id: "profil", label: "Profil", tip: w && w.herkunft ? w.herkunft : "Wert aus dem geladenen Profil." };
   }
+  /* Der Lauf hinter einem Verdikt-Dokument: hat er verweigert oder ist er abgestürzt, hat der Launcher nur bis zur ERSTEN Verweigerung geurteilt
+     (launcher.py:17349-17352 bricht ab), alles dahinter, auch die Budgets (W64, launcher.py:16986-16993), hat er nie beurteilt.  ``geht`` gilt nur für einen
+     Lauf, der durchlief (ausgang "geht", bei der Einzelkarte "passt": keine Verweigerung, nichts geforced).  Gibt {ok, code} zurück: ok = der Lauf lief durch. */
+  const RUN_LEVELS = new Set(["lauf", "absturz"]);
+  function runOf(ausgang, list) {
+    const ref = (list || []).filter((v) => RUN_LEVELS.has(v.ebene));
+    const codes = [...new Set(ref.map((v) => v.code))];
+    if ((ausgang === "geht" || ausgang === "passt") && !ref.length) return { ok: true, code: "" };
+    return { ok: false, code: codes.join(", ") || String(ausgang || "kein Ausgang") };
+  }
   /* Verdikte zu einer Zeile: die des Vorschlags (je Wert), sonst die des Trockenlaufs (``werte`` nennt Bezeichnungen; verglichen wird der Flag-/Env-Name) */
   function verdictItems(r, ctx) {
     const w = propEntry(ctx, r.key);
-    if (w && ctx.prop && ctx.vsrc !== "dry") return { list: w.verdikte || [], src: "Vorschlag (Orakel)" };
+    if (w && ctx.prop && ctx.vsrc !== "dry") {
+      const vd = ctx.prop.verdikt || {};
+      return { list: w.verdikte || [], src: "Vorschlag (Orakel)", run: runOf(vd.ausgang, vd.verdikte) };
+    }
     const d = ctx && ctx.dry && ctx.dry.verdikte;
     if (d) {
       const list = d.filter((v) => (v.werte || []).some((x) => tail(x) === r.name));
-      return { list, src: "Trockenlauf (Orakel)" };
+      return { list, src: "Trockenlauf (Orakel)", run: runOf((ctx.dry.orakel || {}).ausgang, d) };
     }
     return null;
   }
@@ -91,7 +104,10 @@
     const L = src.list;
     const codes = [...new Set(L.map((v) => v.code))];
     const tip = L.length ? L.map((v) => v.code + ": " + (v.grund || v.titel || "") + (v.konsequenz ? " Folge: " + v.konsequenz : "")).join("\n") : "Das Orakel (" + src.src + ") hat nichts einzuwenden.";
+    /* nie "geht", was der Launcher nicht beurteilt hat: ein verweigerter oder abgestürzter Lauf hat die Werte hinter der Verweigerung nicht gesehen */
+    if (!L.length && !src.run.ok) return { id: "nichtbeurteilt", label: "nicht beurteilt (Lauf verweigert: " + src.run.code + ")", tip: "Der Lauf des Orakels (" + src.src + ") ist bei " + src.run.code + " abgebrochen; der Launcher hat diesen Wert danach nicht beurteilt. Erst wenn die Verweigerung behoben oder übergangen ist, sagt ein neuer Lauf etwas zu ihm.", items: L };
     if (!L.length) return { id: "geht", label: "geht", tip, items: L };
+    if (L.every((v) => v.force_state === "geht")) return { id: "geht", label: "geht", tip, items: L };
     if (L.some(isBlocked)) return { id: "verweigert", label: "verweigert", code: codes.join(", "), tip, items: L };
     if (L.some(isForce)) return { id: "force", label: "nur mit --force", code: codes.join(", "), tip, items: L };
     if (L.some((v) => v.force_state === "ungeprueft")) return { id: "ungeprueft", label: "Force ungeprüft", code: codes.join(", "), tip, items: L };
@@ -101,7 +117,7 @@
   const vChip = (v) => `<span class="pfx-vchip pfx-v-${esc(v.id)}" title="${esc(v.tip)}">${esc(v.label)}${v.code ? ` <b class="mono">${esc(v.code)}</b>` : ""}</span>`;
   /* Code + Grund sichtbar (nicht nur im Tooltip), nie als Sperre formuliert */
   function vDetail(v) {
-    if (!v.items.length || v.id === "alt" || v.id === "geht") return "";
+    if (!v.items.length || v.id === "alt" || v.id === "geht" || v.id === "nichtbeurteilt") return "";
     return `<ul class="pfx-vd">${v.items.map((x) => `<li><b class="mono">${esc(x.code)}</b> ${esc(clip(x.grund || x.titel || "", 200))}${x.forcebar === true ? ' <span class="muted">(Force übergeht das)</span>' : x.forcebar === false ? ' <span class="muted">(auch mit Force nicht übergehbar)</span>' : ""}</li>`).join("")}</ul>`;
   }
 

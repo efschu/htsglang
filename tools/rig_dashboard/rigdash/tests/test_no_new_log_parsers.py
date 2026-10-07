@@ -113,6 +113,8 @@ NON_LOG_ALLOWED = {
     ("redact.py", "30650dce59ee"): "schneidet lange Token-Laeufe hinter = oder : aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "b598ffb1ba83"): "schneidet absolute Pfade (/root/..., /spinning/..., /var/lib/...) aus einem Text, der in ein öffentliches Issue kommt; liest keine Logzeile",
     # AP-I Fix-Runde 4: JWT, nackte Token-Laeufe (Freitext, Tabellenzelle) und ein ganzer Wert als Token-Lauf aus dem Issue-Text schneiden
+    # Nacharbeit 1006 Runde 6: ein Launcher-Klassenname (CamelCase, z. B. Weg2TpOperatingPointInfeasible) ist kein Base64-Geheimnis
+    ("redact.py", "d20c61276dee"): "erkennt einen CamelCase-Bezeichner (Launcher-Klassenname) in einem Issue-Text, damit er nicht als Token geschwaerzt wird; liest keine Logzeile",
     ("redact.py", "231d7a884f21"): "schneidet ein JWT (eyJ....) aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "39494d8580a4"): "schneidet lange Token-Laeufe ohne = / : davor aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "d02b41e88f24"): "prueft, ob ein ganzer Wert fuer eine Tabellenzelle ein einziger langer Token-Lauf ist; liest keine Logzeile",

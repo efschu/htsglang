@@ -36,10 +36,11 @@ const W = { key: "flag:--pp-stage-ratio", wert: "9,9,9", zustand: "vorgeschlagen
 out.vor = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "prop", dry: null })).id;
 // nach "Neu pruefen" (profil.js doDry: st.dry gesetzt, vsrc "dry"): das Urteil des Trockenlaufs
 out.nachForce = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { verdikte: [V("W40")] } })).id;
-out.nachGeht = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { verdikte: [V("W77", { werte: ["--anderer"] })] } })).id;
+// der Lauf ging durch (ausgang "geht"), ein Hinweis betrifft nur einen anderen Wert
+out.nachGeht = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { orakel: { ausgang: "geht" }, verdikte: [V("H1", { ebene: "hinweis", forcebar: null, force_state: "hinweis", werte: ["--anderer"] })] } })).id;
 out.nachVerweigert = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { verdikte: [V("X", { forcebar: false, force_state: "blockiert" })] } })).id;
 // ohne Vorschlag, nur Trockenlauf
-out.nurDry = PX.verdiktOf(nutzer, ctx({ prop: null, vsrc: "dry", dry: { verdikte: [] } })).id;
+out.nurDry = PX.verdiktOf(nutzer, ctx({ prop: null, vsrc: "dry", dry: { orakel: { ausgang: "geht" }, verdikte: [] } })).id;
 // jede neue Aenderung leert den Trockenlauf (doEdit: st.dry = null, vsrc "prop"): wieder "ungeprueft seit Ihrer Aenderung"
 out.nachEdit = PX.verdiktOf(nutzer, ctx({ prop: { werte: [W] }, vsrc: "prop", dry: null })).label;
 out.html = PX.renderRow(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { verdikte: [V("W40")] } }));
@@ -61,6 +62,68 @@ out.html = PX.renderRow(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { 
         self.assertIn("pfx-v-force", h)
         self.assertNotIn("pfx-v-alt", h)
         self.assertIn("pfx-z-uebersteuert", h)                 # der Zustand "von Ihnen uebersteuert" bleibt: er sagt, wer den Wert gesetzt hat
+
+
+@unittest.skipUnless(NODE, "node fehlt")
+class F6NieGehtWasNichtBeurteiltIst(unittest.TestCase):
+    """Runde 6, Befund 1: der Launcher bricht bei der ersten Verweigerung ab (launcher.py:17349-17352); W64 urteilt gegen die Budgets, aus denen
+    --rank-gpu-memory-mib / --user-reserve-mib stammen.  Ein Wert, den kein Verdikt nennt, ist darum nach einem verweigerten Lauf NICHT 'geht'."""
+    BODY = """
+const V = (code, o) => Object.assign({ code, ebene: "lauf", forcebar: false, force_state: "blockiert", grund: code + " grund", konsequenz: "k", werte: [] }, o || {});
+const w64 = V("W64-OPPOINT", { werte: [] });
+const reserve = base({ name: "--user-reserve-mib", key: "flag:--user-reserve-mib", origin: "nutzer", value: "9999" });
+const mib = base({ name: "--rank-gpu-memory-mib", key: "flag:--rank-gpu-memory-mib", value: "15000" });
+const W = (key) => ({ key, wert: "1", zustand: "vorgeschlagen", geaendert: true, verdikte: [] });
+const dry = (ausgang, vs) => ({ orakel: { ausgang }, verdikte: vs });
+const id = (row, c) => PX.verdiktOf(row, ctx(c));
+// Trockenlauf (frisch, "Neu pruefen"): W64 verweigert, kein Verdikt nennt den Wert -> nicht beurteilt, auch der uebersteuerte
+out.dryReserve = id(reserve, { prop: { werte: [W("flag:--user-reserve-mib")] }, vsrc: "dry", dry: dry("verweigert", [w64]) });
+out.dryMib = id(mib, { prop: null, vsrc: "dry", dry: dry("verweigert", [w64]) });
+// Absturz / geht_mit_force: ebenso
+out.dryAbsturz = id(mib, { prop: null, vsrc: "dry", dry: dry("absturz", [V("ABSTURZ", { ebene: "absturz" })]) }).id;
+out.dryForce = id(mib, { prop: null, vsrc: "dry", dry: dry("geht_mit_force", [V("W40", { forcebar: true, force_state: "force", werte: ["--anderer"] })]) }).id;
+// der Lauf ging durch: geht
+out.dryGeht = id(mib, { prop: null, vsrc: "dry", dry: dry("geht", []) }).id;
+// der Wert wird ausdruecklich genannt: sein eigenes Urteil gilt, nicht 'nicht beurteilt'
+out.genannt = id(mib, { prop: null, vsrc: "dry", dry: dry("verweigert", [V("W64-OPPOINT", { werte: ["--rank-gpu-memory-mib"] })]) }).id;
+// ausdruecklich als ok genannt (force_state 'geht')
+out.okGenannt = id(mib, { prop: null, vsrc: "dry", dry: dry("verweigert", [w64, V("FIT", { ebene: "fit", forcebar: null, force_state: "geht", werte: ["--rank-gpu-memory-mib"] })]) }).id;
+// Quelle Vorschlag: die Verdikte des Vorschlags tragen den Ausgang des Orakel-Laufs
+const prop = (ausgang, vs) => ({ werte: [W("flag:--rank-gpu-memory-mib")], verdikt: { ausgang, verdikte: vs } });
+out.propRefused = id(mib, { prop: prop("verweigert", [w64]), vsrc: "prop" });
+out.propGeht = id(mib, { prop: prop("geht", []), vsrc: "prop" }).id;
+out.propEinzel = id(mib, { prop: prop("passt", []), vsrc: "prop" }).id;
+out.propOhneAusgang = id(mib, { prop: { werte: [W("flag:--rank-gpu-memory-mib")] }, vsrc: "prop" }).id;
+out.html = PX.renderRow(reserve, ctx({ prop: null, vsrc: "dry", dry: dry("verweigert", [w64]) }));
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.o = run_node(cls.BODY)
+
+    def test_a_refused_run_leaves_unnamed_values_not_judged_never_goes(self):
+        for k in ("dryReserve", "dryMib", "propRefused"):
+            self.assertEqual(self.o[k]["id"], "nichtbeurteilt", k)
+            self.assertEqual(self.o[k]["label"], "nicht beurteilt (Lauf verweigert: W64-OPPOINT)", k)
+        self.assertEqual(self.o["dryAbsturz"], "nichtbeurteilt")
+        self.assertEqual(self.o["dryForce"], "nichtbeurteilt")
+
+    def test_goes_only_when_the_run_went_through_or_the_value_is_named_ok(self):
+        self.assertEqual((self.o["dryGeht"], self.o["propGeht"], self.o["propEinzel"]), ("geht", "geht", "geht"))
+        self.assertEqual(self.o["okGenannt"], "geht")
+        self.assertEqual(self.o["genannt"], "verweigert")        # der eigene Befund, nicht der Lauf
+        self.assertEqual(self.o["propOhneAusgang"], "nichtbeurteilt")   # kein Ausgang = nicht belegt, nie 'geht'
+
+    def test_the_row_chip_for_the_w64_case(self):
+        h = self.o["html"]
+        self.assertIn("pfx-v-nichtbeurteilt", h)
+        self.assertNotIn("pfx-v-geht", h)
+        self.assertIn("nicht beurteilt (Lauf verweigert: W64-OPPOINT)", h)
+        self.assertIn("pfx-z-uebersteuert", h)
+
+    def test_the_chip_has_a_style(self):
+        html = open(os.path.join(STATIC, "index.html"), encoding="utf-8").read()
+        self.assertIn(".pfx-v-nichtbeurteilt", html)
 
 
 @unittest.skipUnless(NODE, "node fehlt")
