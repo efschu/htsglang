@@ -42,9 +42,10 @@ EDGES_JSON = os.path.join(WEG2, "kantenkatalog_1004.json")
 #: line probe (module exists, never a sha or a branch name): the Dual form (dual_green.py ...) is a 27B-line feature
 DUAL_LINE = os.path.isfile(os.path.join(WEG2, "dual_green.py"))
 BAUM = "27b" if DUAL_LINE else "nf"
-#: curated edges without a catalog edge (``belegt: False``): 24 on the 27B line; the NF line's own curated entry --weg2-xchg-census-map carries one more
-#: (its ``braucht`` --weg2-xchg-census, no edge K.. for it)
-OHNE_BELEG = 24 if DUAL_LINE else 25
+#: curated edges without a catalog edge (``belegt: False``): 24 for the 27B entries plus one for the NF line's own curated entry --weg2-xchg-census-map
+#: (its ``braucht`` --weg2-xchg-census, no edge K.. for it).  The curated catalog is shared by both lines, so the count is 25 on both (the entry stays
+#: curated on the 27B line too: user/27B seat 07.10., do not delete it).
+OHNE_BELEG = 25
 #: edge targets that are no row of THIS tree's catalog (``to_kind`` unbekannt): none on the 27B line; on the NF line K123 names the 27B-only
 #: Dual env SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S (the edge says ``baeume: [27b]``)
 ZIEL_UNBEKANNT = 0 if DUAL_LINE else 1

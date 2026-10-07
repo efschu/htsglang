@@ -38,6 +38,10 @@ ABSENT_ON_NF_LINE = frozenset((
     "SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE", "SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S", "SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG",
     "SGLANG_WEG2_DUAL_GRANT_RETRY_MS", "SGLANG_WEG2_DUAL_D_COMPACT", "SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S",
     "SGLANG_WEG2_HOST_GUARD_W22", "SGLANG_WEG2_HOST_GUARD_W98", "SGLANG_ADMISSION_WEDGE_MODE", "SGLANG_PREFILL_LIVELOCK_MODE"))
+#: curated names the code of the 27B line does not carry: the NF line's own curated entry (``baeume`` ["nf"] in the catalog; measured 07.10. on
+#: 65fc0e2076: --weg2-xchg-census-map is neither a launcher flag nor a server_args flag of the 27B tree).  It stays curated (user/27B seat 07.10.:
+#: do not delete it) and this test names it.  The curated total is therefore 119 on both lines (118 + this entry).
+ABSENT_ON_27B_LINE = frozenset(("--weg2-xchg-census-map",))
 
 
 def _load(name, path):
@@ -111,8 +115,8 @@ class Curated(unittest.TestCase):
             if c["kind"] == "env" and name not in self.envs and name not in self.launcher_src and not self._composed_env_read(name) \
                     and name not in self.env_constants:
                 miss.append(name)
-        if DUAL_LINE:
-            self.assertEqual(miss, [])
+        if DUAL_LINE:       # 27B line: exactly the NF-only curated entry (the curated catalog is shared by both lines), no more and no fewer
+            self.assertEqual(sorted(miss), sorted(ABSENT_ON_27B_LINE))
         else:       # NF line: exactly the named names, no more (a new miss is a defect) and no fewer (a stale entry hides one)
             self.assertEqual(sorted(miss), sorted(ABSENT_ON_NF_LINE))
 
