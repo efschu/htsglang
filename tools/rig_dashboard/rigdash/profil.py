@@ -95,7 +95,7 @@ def find_tree(explicit: Optional[str] = None) -> Optional[str]:
 #: traegt sie.  Auf der NF-Linie fehlen sie (Nutzerentscheid 07.10. "2 nein": der NF-Editor bietet Dual nicht an; vorher endete der Dual-Vorschlag dort mit
 #: ImportError).
 DUAL_MODULES = ("dual_layout_plan.py", "dual_green.py")
-DUAL_FEHLT = "Dual auf dieser Linie nicht verfuegbar"
+DUAL_FEHLT = "Dual is not available on this line"
 
 
 def dual_line_probe(tree: Optional[str]) -> bool:
@@ -131,17 +131,17 @@ def force_verdict(r: dict):
     STORE und MEMAVAIL mit FLLIPER_FORCE=1, der Launcher nicht (Auftrag 2002 A); ein älteres Register ohne ``wired_entrypoint`` wird über
     ``enforced_by`` gelesen."""
     if r and not r.get("forcebar"):
-        return "nein, nicht forcebar", "blockiert", None
+        return "no, not forceable", "blockiert", None
     if r.get("wired"):
-        return "ja, Force übergeht es (FORCED-PAST im Boot-Log)", "force", "launcher"
+        return "yes, force overrides it (FORCED-PAST in the boot log)", "force", "launcher"
     ep = r.get("wired_entrypoint")
     if ep is None:
         ep = r.get("enforced_by") == "entrypoint"
     if ep:
-        return ("ja, im Docker-Start (Entrypoint) forcebar, im reinen Launcher-Aufruf nicht (FORCED-PAST im Boot-Log)", "force", "entrypoint")
+        return ("yes, forceable in the Docker start (entrypoint), not in a plain launcher call (FORCED-PAST in the boot log)", "force", "entrypoint")
     if r.get("enforced_by") == "planner-gate":
-        return "der Launcher dieser Linie prüft das noch nicht: beim Start keine Verweigerung", "ungeprueft", None
-    return "forcebar, aber weder im Launcher noch im Entrypoint dieser Linie verdrahtet: der Start verweigert weiter", "blockiert", None
+        return "the launcher of this line does not check this yet: no refusal at start", "ungeprueft", None
+    return "forceable, but wired neither in the launcher nor in the entrypoint of this line: the start still refuses", "blockiert", None
 
 
 def force_hint(dry, register: List[dict], line: str = "") -> dict:
@@ -163,31 +163,29 @@ def force_hint(dry, register: List[dict], line: str = "") -> dict:
             continue
         seen.add(code)
         r = reg.get(code) or {}
-        label, state, via = force_verdict(r) if r else ("unbekannter Code: nicht als forcebar behandelt", "blockiert", None)
+        label, state, via = force_verdict(r) if r else ("unknown code: not treated as forceable", "blockiert", None)
         row = {"code": code, "text": text or r.get("title") or code, "via": via, "scope": r.get("force_scope") or label}
         {"force": force, "blockiert": blocked, "ungeprueft": openl}[state].append(row)
     if not have_dry:
-        fall, text = "kein_trockenlauf", ("Noch kein Trockenlauf für dieses Profil: ob der Serverstart Force braucht, zeigt der Trockenlauf "
-                                          "(Karten wählen, prüfen lassen), danach erneut exportieren.")
+        fall, text = "kein_trockenlauf", ("No dry run for this profile yet: whether the server start needs force is shown by the dry run (select cards, have it checked); export again afterwards.")
     elif dry.get("kein_lauf"):
-        fall, text = "kein_launcher_lauf", str(dry.get("force_satz") or "Kein Launcher-Lauf: über Force sagt der Vorschlag nichts; ein Trockenlauf (Neu prüfen) fragt den Launcher.")[:600]
+        fall, text = "kein_launcher_lauf", str(dry.get("force_satz") or "No launcher run: the proposal says nothing about force; a dry run (Check again) asks the launcher.")[:600]
     elif not rejs:
-        fall, text = "keine_ablehnung", "Der Planer lehnt nichts ab; Force wird nicht gebraucht."
+        fall, text = "keine_ablehnung", "The planner refuses nothing; force is not needed."
     elif force and blocked:
-        fall, text = "gemischt", "Force übergeht einen Teil der Ablehnungen, aber nicht alle: so startet der Server nicht."
+        fall, text = "gemischt", "Force overrides part of the refusals but not all: the server does not start this way."
     elif force:
-        fall, text = "nur_forcebar", "Mit FLLIPER_FORCE=1 übergeht der Server diese Ablehnungen und listet jede im Boot-Log als FORCED-PAST."
+        fall, text = "nur_forcebar", "With FLLIPER_FORCE=1 the server overrides these refusals and lists each one in the boot log as FORCED-PAST."
     elif blocked:
-        fall, text = "nur_nicht_forcebar", "Force hilft hier nicht: diese Ablehnungen bleiben auch mit Force bestehen."
+        fall, text = "nur_nicht_forcebar", "Force does not help here: these refusals remain even with force."
     else:
-        fall, text = "ungeprueft", "Der Launcher dieser Linie prüft das noch nicht: kein Force nötig."
+        fall, text = "ungeprueft", "The launcher of this line does not check this yet: no force needed."
     out = {"fall": fall, "text": text, "show_line": bool(force), "force_env": FORCE_ENV if force else None,
            "force_codes": force, "blocked_codes": blocked, "open_codes": openl,
-           "records_note": ("Ein Force-Boot schreibt keine Records; seine Messwerte zählen nicht als abgenommen." if force else ""),
+           "records_note": ("A force boot writes no records; its measured values do not count as accepted." if force else ""),
            "line_note": ""}
     if force and str(line) == "nf":
-        out["line_note"] = ("Linie nf: der Launcher übergeht dort nur HW-COUNT, HW-UNCALIBRATED und HOST-MEM; "
-                            "die Entrypoint-Codes (PROFIL-STATUS, SHM, STORE, MEMAVAIL) gelten auch dort.")
+        out["line_note"] = ("Line nf: the launcher there overrides only HW-COUNT, HW-UNCALIBRATED and HOST-MEM; the entrypoint codes (PROFIL-STATUS, SHM, STORE, MEMAVAIL) apply there too.")
     return out
 
 
@@ -196,9 +194,9 @@ def docker_run_example(name: str, force: dict) -> List[str]:
     Ein Kommentar steht VOR dem Befehl, nie hinter einem ``\\`` (hinter dem Zeilenumbruch-Backslash bricht Bash die Fortsetzung)."""
     lines = []
     if force.get("show_line"):
-        lines.append("# FLLIPER_FORCE=1 nur nötig, weil der Planer ablehnt: %s" % ", ".join(c["code"] for c in force["force_codes"]))
+        lines.append("# FLLIPER_FORCE=1 is needed only because the planner refuses: %s" % ", ".join(c["code"] for c in force["force_codes"]))
     lines += ["docker run -d --name htsglang-mine \\",
-              "  <die Flags aus Abschnitt 3.3 der README: --gpus, --shm-size, --memory, -p, Modell-Mounts> \\",
+              "  <the flags from section 3.3 of the README: --gpus, --shm-size, --memory, -p, model mounts> \\",
               "  -v flliper-state:/var/lib/flliper \\",
               "  -e MODE=weg2 -e FLLIPER_PROFILE=%s \\" % name]
     if force.get("show_line"):
@@ -212,8 +210,8 @@ def docker_run_example(name: str, force: dict) -> List[str]:
 ISSUE_MAX_ROWS = 120
 ISSUE_CELL = 200
 #: Überschriften des Laufberichts in fester Reihenfolge (der Test prüft jede)
-ISSUE_BLOCKS = ("Hardwareprofil (Kurzform)", "Modellprofil", "Betriebsform", "Vorschlag und Übersteuerungen", "Verdikte und Force",
-                "Versionen", "Messergebnis / Boot-Log-Auszug")
+ISSUE_BLOCKS = ("Hardware profile (short form)", "Model profile", "Operating mode", "Proposal and overrides", "Verdicts and force",
+                "Versions", "Measurement result / boot log excerpt")
 
 
 def _md(x, limit: int = ISSUE_CELL) -> str:
@@ -238,29 +236,29 @@ def issue_betriebsform(names, n_cards) -> dict:
     names = set(names)
     dual = sorted(n for n in names if n in ("--dual-layout", "--dual-share"))
     if dual:
-        return {"form": "Dual PP/TP", "why": "Flag %s im Profil: P und D gleichzeitig wach auf denselben Karten" % ", ".join(dual)}
+        return {"form": "Dual PP/TP", "why": "Flag %s in the profile: P and D awake at the same time on the same cards" % ", ".join(dual)}
     if "--d-only" in names:
-        return {"form": "nur TP", "why": "Flag --d-only im Profil"}
+        return {"form": "TP only", "why": "Flag --d-only in the profile"}
     if n_cards == 1:
-        return {"form": "Einzelkarte", "why": "eine Karte im Trockenlauf (der weg2-Launcher braucht mindestens zwei)"}
-    return {"form": "Flip PP/TP", "why": "weder --d-only noch --dual-* im Profil, also die Standardform des Launchers"}
+        return {"form": "Single card", "why": "one card in the dry run (the weg2 launcher needs at least two)"}
+    return {"form": "Flip PP/TP", "why": "neither --d-only nor --dual-* in the profile, so the launcher's standard form"}
 
 
 def _issue_cards(dry, cards) -> tuple:
     """(Kartenlabels, Quelle): die Karten des letzten Trockenlaufs, sonst die gewählten Karten (noch ohne Trockenlauf), sonst leer."""
     if isinstance(dry, dict) and isinstance(dry.get("cards"), list) and dry["cards"]:
-        return [str(c.get("label") or "?") for c in dry["cards"] if isinstance(c, dict)][:16], "Trockenlauf"
+        return [str(c.get("label") or "?") for c in dry["cards"] if isinstance(c, dict)][:16], "Dry run"
     out = []
     for rc in (cards if isinstance(cards, list) else [])[:16]:
         e = CAT.card(rc.get("card")) if isinstance(rc, dict) else None
-        out.append(CAT.label(e) if e else "unbekannte Karte")
-    return out, "gewählt, noch kein Trockenlauf"
+        out.append(CAT.label(e) if e else "unknown card")
+    return out, "selected, no dry run yet"
 
 
-_AUSGANG_TEXT = {"geht": "geht ohne Force durch", "geht_mit_force": "geht nur mit Force durch", "verweigert": "verweigert, auch mit Force",
-                 "absturz": "Absturz des Trockenlaufs (kein Urteil über die Werte)", "orakel_fehler": "das Orakel konnte nicht fragen (kein Urteil)",
-                 "passt": "Planer-Rechnung: passt (kein Launcher-Lauf)", "passt_nicht": "Planer-Rechnung: passt nicht (kein Launcher-Lauf)",
-                 "unbelegt": "Planer-Rechnung: nicht rechenbar"}
+_AUSGANG_TEXT = {"geht": "passes without force", "geht_mit_force": "passes only with force", "verweigert": "refused, even with force",
+                 "absturz": "dry run crashed (no verdict on the values)", "orakel_fehler": "the oracle could not be asked (no verdict)",
+                 "passt": "Planner calculation: fits (no launcher run)", "passt_nicht": "Planner calculation: does not fit (no launcher run)",
+                 "unbelegt": "Planner calculation: cannot be calculated"}
 
 
 #: Ausgänge eines Vorschlags, bei denen KEIN Launcher-Lauf stattfand (Planer-Rechnung der Einzelkarte, Orakel nicht erreichbar)
@@ -281,16 +279,16 @@ def _dry_ohne_lauf(vd: dict, ausgang: str) -> dict:
         elif x.get("ebene") == "fit" and isinstance(x.get("code"), str) and x["code"] != "EINZEL-PASSUNG":
             zeilen.append("`%s`: %s" % (x["code"][:40], str(x.get("text") or x.get("grund") or "")[:300]))
     if ausgang == "orakel_fehler":
-        t = zeilen[0] if zeilen else "ohne Text"
-        return {"rejections": [], "kein_lauf": True, "quelle": "vorschlag", "block_titel": "Orakel-Fehler: %s" % t, "block_zeilen": [],
-                "verdict": "Orakel-Fehler: %s" % t,
-                "force_satz": "Das Orakel konnte nicht fragen: es gibt kein Urteil, auch keines über Force; Neu prüfen fragt noch einmal.",
-                "notes": ["Kein Launcher-Lauf: der Vorschlag ist nicht geprüft."]}
-    titel = "Planer-Rechnung: %s" % _AUSGANG_TEXT.get(ausgang, ausgang or "ohne Ausgang").replace("Planer-Rechnung: ", "")
+        t = zeilen[0] if zeilen else "no text"
+        return {"rejections": [], "kein_lauf": True, "quelle": "vorschlag", "block_titel": "Oracle error: %s" % t, "block_zeilen": [],
+                "verdict": "Oracle error: %s" % t,
+                "force_satz": "The oracle could not be asked: there is no verdict, none on force either; Check again asks once more.",
+                "notes": ["No launcher run: the proposal is not checked."]}
+    titel = "Planner calculation: %s" % _AUSGANG_TEXT.get(ausgang, ausgang or "no outcome").replace("Planner calculation: ", "")
     return {"rejections": [], "kein_lauf": True, "quelle": "vorschlag", "block_titel": titel, "block_zeilen": zeilen[:40], "verdict": titel,
-            "force_satz": "Kein Launcher-Lauf: die Planer-Rechnung nennt keinen Register-Code, den Force übergehen könnte; ob der Start eine Verweigerung bringt, "
-                          "zeigt erst ein Trockenlauf (Neu prüfen).",
-            "notes": ["Das ist eine Rechnung des Planers, kein Urteil des Launchers."]}
+            "force_satz": "No launcher run: the planner calculation names no register code that force could override; whether the start brings a refusal is shown only "
+                          "by a dry run (Check again).",
+            "notes": ["This is a planner calculation, not a verdict of the launcher."]}
 
 
 def dry_from_vorschlag(vd) -> Optional[dict]:
@@ -318,21 +316,21 @@ def dry_from_vorschlag(vd) -> Optional[dict]:
         if x.get("konsequenz"):
             q["consequence"] = str(x["konsequenz"])[:400]
         rej.append(q)
-    head = "Orakel-Lauf des Vorschlags%s: %s." % (" (Launcher-Trockenlauf, %s Lauf/Läufe)" % laeufe if isinstance(laeufe, int) and laeufe > 0 else "",
-                                                 _AUSGANG_TEXT.get(ausgang, ausgang or "ohne Ausgang"))
+    head = "Oracle run of the proposal%s: %s." % (" (launcher dry run, %s run(s))" % laeufe if isinstance(laeufe, int) and laeufe > 0 else "",
+                                                 _AUSGANG_TEXT.get(ausgang, ausgang or "no outcome"))
     return {"rejections": rej, "verdict": head, "quelle": "vorschlag",
-            "notes": ["Der Orakel-Lauf gilt für den Vorschlag, wie er war; Änderungen danach sind darin nicht geprüft (Neu prüfen fragt noch einmal)."]}
+            "notes": ["The oracle run applies to the proposal as it was; changes made afterwards are not checked in it (Check again asks once more)."]}
 
 
 def _issue_model(model, doc_rows) -> List[str]:
     """Block Modellprofil: die Werte des Schätzprofils ``flliper.model/1`` mit ihrer Quelle; ohne Profil nur, was das Serverprofil nennt.
     Der Pfad des Modells steht nie da, nur der Ordnername."""
-    L = ["### Modellprofil", ""]
+    L = ["### Model profile", ""]
     p = model.get("profile") if isinstance(model, dict) and isinstance(model.get("profile"), dict) and "arch" not in model else model
     if not isinstance(p, dict) or p.get("schema") != "flliper.model/1":
         name = next((os.path.basename(str(r["value"]).rstrip("/")) for r in doc_rows if r["name"] in ("PROFILE_MODEL", "--model") and r["value"]), "")
-        L.append("Kein Modellprofil geschätzt (Abschnitt Modelle: Modellprofil schätzen, dann den Laufbericht neu erzeugen)."
-                 + (" Das Serverprofil nennt das Modell `%s`." % _md(name) if name else ""))
+        L.append("No model profile estimated (Models section: estimate the model profile, then regenerate the run report)."
+                 + (" The server profile names the model `%s`." % _md(name) if name else ""))
         return L
     out: List[tuple] = []
 
@@ -344,35 +342,35 @@ def _issue_model(model, doc_rows) -> List[str]:
 
     a, w, kv, st, ex, dr, cx = (p.get(k) or {} for k in ("arch", "weights", "kv", "state", "experts", "draft", "context"))
     name = os.path.basename(str(p.get("path") or "").rstrip("/"))
-    out.append(("Modell", "`%s`" % _md(name) if name else "unbelegt"))
+    out.append(("Model", "`%s`" % _md(name) if name else "unverified"))
     add("Format", p.get("format"))
-    add("Art", a.get("family"), lambda v: "MoE" if v == "moe" else "dicht")
-    add("Hybrid (GDN/Mamba)", a.get("hybrid"), lambda v: "ja" if v else "nein")
+    add("Type", a.get("family"), lambda v: "MoE" if v == "moe" else "dense")
+    add("Hybrid (GDN/Mamba)", a.get("hybrid"), lambda v: "yes" if v else "no")
     add("Layer", a.get("n_layers"))
-    add("Layertypen", a.get("layer_counts"), lambda v: ", ".join("%s %s" % (k, v[k]) for k in sorted(v) if v[k]))
-    add("Hidden-Größe", a.get("hidden"))
-    add("Köpfe Q / KV / Kopfgröße", {"v": "%s / %s / %s" % (_lv(a.get("heads_q"))[0], _lv(a.get("heads_kv"))[0], _lv(a.get("head_dim"))[0]),
+    add("Layer types", a.get("layer_counts"), lambda v: ", ".join("%s %s" % (k, v[k]) for k in sorted(v) if v[k]))
+    add("Hidden size", a.get("hidden"))
+    add("Heads Q / KV / head size", {"v": "%s / %s / %s" % (_lv(a.get("heads_q"))[0], _lv(a.get("heads_kv"))[0], _lv(a.get("head_dim"))[0]),
                                       "src": _lv(a.get("heads_q"))[1]} if _lv(a.get("heads_q"))[0] is not None else None)
     add("Attention", a.get("attention"))
-    add("Gewichte gesamt", w.get("total_bytes"), _gib)
-    add("Experten (Anzahl)", ex.get("n"))
-    add("Experten je Token (top_k)", ex.get("top_k"))
-    add("KV je Token und Attention-Layer", kv.get("cell_bytes_per_attn_layer_token"), lambda v: "%s B" % v)
-    add("Mamba/GDN-Zustand je Linear-Layer und Request", st.get("per_linear_layer_per_slot_mib"), lambda v: "%.4g MiB" % v)
-    add("MTP-Schichten (Draft im Modell)", dr.get("mtp_layers"))
+    add("Total weights", w.get("total_bytes"), _gib)
+    add("Experts (count)", ex.get("n"))
+    add("Experts per token (top_k)", ex.get("top_k"))
+    add("KV per token and attention layer", kv.get("cell_bytes_per_attn_layer_token"), lambda v: "%s B" % v)
+    add("Mamba/GDN state per linear layer and request", st.get("per_linear_layer_per_slot_mib"), lambda v: "%.4g MiB" % v)
+    add("MTP layers (draft in the model)", dr.get("mtp_layers"))
     if isinstance(dr.get("external"), dict):
         ext = dr["external"]
-        add("Externer Draft", ext.get("total_bytes"), lambda v: "%s, %s" % (os.path.basename(str(ext.get("path") or "").rstrip("/")) or "?", _gib(v)))
-    add("Kontext (max. Positionen)", cx.get("max_position_embeddings"))
+        add("External draft", ext.get("total_bytes"), lambda v: "%s, %s" % (os.path.basename(str(ext.get("path") or "").rstrip("/")) or "?", _gib(v)))
+    add("Context (max. positions)", cx.get("max_position_embeddings"))
     if p.get("config_sha"):
-        out.append(("config-Prüfsumme", "`%s`" % _md(p["config_sha"])))
-    L += ["| Angabe | Wert (Quelle) |", "|---|---|"] + ["| %s | %s |" % (_md(k), _md(v)) for k, v in out]
-    L += ["", "Quelle: config = steht in der config.json, Index = aus den Tensorköpfen, geschätzt = gerechnet, stat = Dateigröße."]
+        out.append(("config checksum", "`%s`" % _md(p["config_sha"])))
+    L += ["| Item | Value (source) |", "|---|---|"] + ["| %s | %s |" % (_md(k), _md(v)) for k, v in out]
+    L += ["", "Source: config = stated in config.json, index = from the tensor headers, estimated = calculated, stat = file size."]
     return L
 
 
 def _issue_cell(row: dict, v, known) -> str:
-    """Wert einer Zeile für die Tabelle: Schalter ohne Wert = ``an``; fehlt der Wert = ``–``; ein Geheimnis nach Namen = ``<entfernt>``; ein Schlüssel,
+    """Wert einer Zeile für die Tabelle: Schalter ohne Wert = ``an``; fehlt der Wert = ``–``; ein Geheimnis nach Namen = ``<redacted>``; ein Schlüssel,
     den der Katalog nicht kennt (``known`` = die Katalognamen), zeigt seinen Wert nie (``redact.HIDDEN_UNKNOWN``)."""
     if v is None:
         return "–"
@@ -395,18 +393,17 @@ def issue_diff_rows(view: dict) -> dict:
 
 
 def _issue_proposal(view: dict, known) -> List[str]:
-    L = ["### Vorschlag und Übersteuerungen", ""]
+    L = ["### Proposal and overrides", ""]
     d = issue_diff_rows(view)
     c, sel = d["counts"], d["rows"]
     removed, only = view.get("removed") or [], view.get("planner_only") or []
-    L.append("Quelle: Herkunft, Profilwert und Planer-Vorschlag je Zeile stehen im Profil (meta.origins, meta.profile_values, meta.planner). "
-             "%d Werte, davon %d gegenüber dem geladenen Profil geändert, %d als Nutzer gesetzt, %d mit Planer-Vorschlag, %d weichen vom Vorschlag ab."
+    L.append("Source: origin, profile value and planner proposal per row are in the profile (meta.origins, meta.profile_values, meta.planner). %d values, of which %d changed against the loaded profile, %d set by the user, %d with a planner proposal, %d differ from the proposal."
              % (c["rows"], c["geaendert"], c["nutzer"], c["mit_vorschlag"], c["weicht_vom_vorschlag_ab"]))
     if not c["mit_vorschlag"] and not only:
         L.append("")
-        L.append("Für dieses Profil liegt kein Planer-Vorschlag vor (meta.planner leer); die Spalte Vorschlag bleibt leer.")
+        L.append("There is no planner proposal for this profile (meta.planner empty); the Proposal column stays empty.")
     extra = [k for k in ("state", "verdict") if any(k in r for r in sel)]
-    head = ["Wert", "Aktuell", "Profil", "Vorschlag (Planer)", "Herkunft"] + [{"state": "Zustand", "verdict": "Verdikt"}[k] for k in extra]
+    head = ["Value", "Current", "Profile", "Proposal (planner)", "Origin"] + [{"state": "State", "verdict": "Verdict"}[k] for k in extra]
     if sel:
         L += ["", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
         for r in sel[:ISSUE_MAX_ROWS]:
@@ -418,55 +415,55 @@ def _issue_proposal(view: dict, known) -> List[str]:
             L.append("| " + " | ".join(cells) + " |")
         if len(sel) > ISSUE_MAX_ROWS:
             L.append("")
-            L.append("… und %d weitere abweichende Werte (gekürzt)." % (len(sel) - ISSUE_MAX_ROWS))
+            L.append("… and %d more deviating values (truncated)." % (len(sel) - ISSUE_MAX_ROWS))
     else:
-        L += ["", "Keine Abweichung: alle Werte stehen wie im geladenen Profil und, wo es einen gibt, wie im Vorschlag."]
+        L += ["", "No deviation: all values stand as in the loaded profile and, where there is one, as in the proposal."]
     if removed:
-        L += ["", "Gegenüber dem geladenen Profil entfernt: " + ", ".join("`%s`" % _md(x.get("key"), 80) for x in removed[:40]) + ("" if len(removed) <= 40 else " …")]
+        L += ["", "Removed against the loaded profile: " + ", ".join("`%s`" % _md(x.get("key"), 80) for x in removed[:40]) + ("" if len(removed) <= 40 else " …")]
     if only:
-        L += ["", "Vorschlag ohne Zeile im Profil: " + ", ".join("`%s` = %s" % (_md(x.get("key"), 80), _md(redact.value_for_issue(str(x.get("key")), x.get("value"), known), 80) or "(leer, Schalter an)")
+        L += ["", "Proposal without a row in the profile: " + ", ".join("`%s` = %s" % (_md(x.get("key"), 80), _md(redact.value_for_issue(str(x.get("key")), x.get("value"), known), 80) or "(empty, switch on)")
                                                               for x in only[:40]) + ("" if len(only) <= 40 else " …")]
     return L
 
 
 def _issue_verdicts(dry, reg_rows: List[dict], line: str) -> List[str]:
-    """Block Verdikte und Force: aus dem LETZTEN Trockenlauf; Forcebarkeit wird aus dem Register NEU gelesen (dem Browser wird sie nicht geglaubt)."""
-    L = ["### Verdikte und Force", ""]
+    """Block Verdicts and force: aus dem LETZTEN Trockenlauf; Forcebarkeit wird aus dem Register NEU gelesen (dem Browser wird sie nicht geglaubt)."""
+    L = ["### Verdicts and force", ""]
     have = isinstance(dry, dict) and isinstance(dry.get("rejections"), list)
     if not have:
-        L.append("Kein Trockenlauf gefahren (Abschnitt Trockenlauf: Karten wählen, prüfen lassen, den Laufbericht neu erzeugen).")
+        L.append("No dry run was made (Dry run section: select cards, have it checked, regenerate the run report).")
     elif dry.get("kein_lauf"):
         L.append(_md(dry.get("block_titel") or dry.get("verdict"), 600).rstrip(".") + ".")
         if dry.get("block_zeilen"):
             L += [""] + ["- %s" % _md(z, 400) for z in dry["block_zeilen"][:40]]
     else:
-        L.append("Trockenlauf: %s" % _md(dry.get("verdict") or ("Der Planer lehnt nichts ab." if not dry["rejections"] else ""), 400))
+        L.append("Dry run: %s" % _md(dry.get("verdict") or ("The planner refuses nothing." if not dry["rejections"] else ""), 400))
     reg = {r.get("code"): r for r in reg_rows or []}
     if have and dry["rejections"]:
-        L += ["", "| Code | Klasse | Force | Text | Folge |", "|---|---|---|---|---|"]
+        L += ["", "| Code | Class | Force | Text | Consequence |", "|---|---|---|---|---|"]
         seen = set()
         for q in dry["rejections"][:64]:
             if not isinstance(q, dict) or not isinstance(q.get("code"), str) or not 0 < len(q["code"]) <= 40 or q["code"] in seen:
                 continue
             seen.add(q["code"])
             r = reg.get(q["code"]) or {}
-            label, state, _via = force_verdict(r) if r else (("nicht forcebar: bleibt auch mit Force bestehen (Code des Planer-Verdikts, nicht im Launcher-Register)"
-                                                              if q.get("klass_label") == "nicht forcebar" else "unbekannter Code: nicht als forcebar behandelt"), "blockiert", None)
+            label, state, _via = force_verdict(r) if r else (("not forceable: remains even with force (code of the planner verdict, not in the launcher register)"
+                                                              if q.get("klass_label") == "nicht forcebar" else "unknown code: not treated as forceable"), "blockiert", None)
             L.append("| `%s` | %s | %s | %s | %s |" % (_md(q["code"], 40), _md(r.get("klass_label") or r.get("klass") or q.get("klass_label") or "?", 60), _md("%s: %s" % (state, label), 160),
                                                        _md(_clip_text(q["code"], q.get("text")), 300), _md(r.get("consequence") or q.get("consequence") or "–", 240)))
     fh = force_hint(dry, reg_rows, line)
     L += ["", "Force: %s" % _md(fh["text"], 400)]
     if fh["show_line"]:
         L.append("")
-        L.append("Beim Serverstart `%s` setzen; übergangen werden: %s." % (fh["force_env"], ", ".join("`%s`" % c["code"] for c in fh["force_codes"])))
+        L.append("Set `%s` at the server start; overridden: %s." % (fh["force_env"], ", ".join("`%s`" % c["code"] for c in fh["force_codes"])))
     if fh["blocked_codes"]:
         L.append("")
-        L.append("Auch mit Force bestehen bleiben: %s." % ", ".join("`%s`" % c["code"] for c in fh["blocked_codes"]))
+        L.append("Remaining even with force: %s." % ", ".join("`%s`" % c["code"] for c in fh["blocked_codes"]))
     if fh["records_note"]:
         L.append("")
         L.append(fh["records_note"])
     if have and dry.get("notes"):
-        L += [""] + ["- Hinweis: " + _md(n, 300) for n in dry["notes"][:8]]
+        L += [""] + ["- Note: " + _md(n, 300) for n in dry["notes"][:8]]
     return L
 
 
@@ -506,7 +503,7 @@ class ProfilEditor:
     def mods(self):
         if self._mods is None:
             if not self.tree:
-                raise ProfilError("kein Planer-Baum mit weg2/profile_json.py und refusals.py gefunden (KARTENPLAN_TREE bzw. install_510.sh)")
+                raise ProfilError("no planner tree with weg2/profile_json.py and refusals.py found (KARTENPLAN_TREE or install_510.sh)")
             base = os.path.join(self.tree, "sglang", "srt", "weg2")
             self._mods = (_load("kp_profile_json", os.path.join(base, "profile_json.py")),
                           _load("kp_refusals", os.path.join(base, "refusals.py")))
@@ -518,7 +515,7 @@ class ProfilEditor:
                 with open(self.catalog_file, encoding="utf-8") as fh:
                     self._cat = json.load(fh)
             except (OSError, ValueError) as exc:
-                raise ProfilError("Katalog %s nicht lesbar: %s (python -m sglang.srt.weg2.profile_catalog -o ...)" % (self.catalog_file, exc))
+                raise ProfilError("Catalog %s not readable: %s (python -m sglang.srt.weg2.profile_catalog -o ...)" % (self.catalog_file, exc))
         return self._cat
 
     def specs(self) -> dict:
@@ -528,10 +525,10 @@ class ProfilEditor:
     # ------------------------------------------------------------------ Profile auflisten
     def _release_path(self, name: str) -> str:
         if not NAME_RE.match(name or ""):
-            raise ProfilError("ungültiger Profilname %r" % name)
+            raise ProfilError("invalid profile name %r" % name)
         p = os.path.join(self.release_dir, name + ".env")
         if not os.path.isfile(p):
-            raise ProfilError("Release-Profil %r nicht gefunden in %s" % (name, self.release_dir))
+            raise ProfilError("Release profile %r not found in %s" % (name, self.release_dir))
         return p
 
     def list(self) -> dict:
@@ -583,7 +580,7 @@ class ProfilEditor:
             except Exception:       # noqa: BLE001 -- one broken profile must not hide the others
                 continue
             vars_ = {v["name"]: v for v in doc.get("vars") or []}
-            for var, role in (("PROFILE_MODEL", "Modell"), ("PROFILE_DRAFT", "Draft")):
+            for var, role in (("PROFILE_MODEL", "Model"), ("PROFILE_DRAFT", "Draft")):
                 path = str((vars_.get(var) or {}).get("value") or "")
                 if not path:
                     continue
@@ -601,16 +598,16 @@ class ProfilEditor:
     @staticmethod
     def _mount_state(path: str):
         if os.path.isfile(path):
-            return "lesbar", "Datei lesbar (%s Bytes)" % os.path.getsize(path)
+            return "lesbar", "File readable (%s bytes)" % os.path.getsize(path)
         if not os.path.isdir(path):
-            return "nicht_gemountet", "Modell im Container nicht gemountet (Pfad fehlt)"
+            return "nicht_gemountet", "Model not mounted in the container (path missing)"
         try:
             entries = os.listdir(path)
         except OSError as exc:
-            return "nicht_gemountet", "Modell im Container nicht gemountet (Verzeichnis nicht lesbar: %s)" % exc
+            return "nicht_gemountet", "Model not mounted in the container (directory not readable: %s)" % exc
         if not entries:
-            return "nicht_gemountet", "Modell im Container nicht gemountet (Verzeichnis leer: Mountpunkt)"
-        return "lesbar", "%d Einträge" % len(entries)
+            return "nicht_gemountet", "Model not mounted in the container (directory empty: mount point)"
+        return "lesbar", "%d entries" % len(entries)
 
     def register(self) -> List[dict]:
         """The refusal register of the planner tree.  ``wired`` (which forcebar codes the launcher consults) is read from the launcher.py
@@ -696,7 +693,7 @@ class ProfilEditor:
                 comments = self._profile_comments(self._release_path(based["name"]))
                 doc.setdefault("meta", {})["planner"] = self._planner_values(based["name"], doc)
         else:
-            raise ProfilError("kind muss release oder user sein")
+            raise ProfilError("kind must be release or user")
         return self.render_view(doc, comments)
 
     def _profile_comments(self, path: str) -> dict:
@@ -736,10 +733,10 @@ class ProfilEditor:
     def edit(self, doc: dict, edits: list) -> dict:
         pj, _ref = self.mods()
         if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
-            raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+            raise ProfilError("doc is not a %s" % pj.SCHEMA)
         for e in edits or []:
             if not isinstance(e, dict) or "key" not in e:
-                raise ProfilError("jede Änderung braucht key")
+                raise ProfilError("every change needs key")
         new = pj.apply_edits(doc, edits or [], self.specs())
         comments = {}
         based = (new.get("meta") or {}).get("based_on") or {}
@@ -753,7 +750,7 @@ class ProfilEditor:
     # ------------------------------------------------------------------ Nutzerprofile (State-Volume)
     def _user_path(self, name: str) -> str:
         if not NAME_RE.match(name or ""):
-            raise ProfilError("Profilname muss [a-z0-9][a-z0-9._-]* sein (höchstens 64 Zeichen), nicht %r" % name)
+            raise ProfilError("Profile name must be [a-z0-9][a-z0-9._-]* (at most 64 characters), not %r" % name)
         return os.path.join(self.user_dir, name + ".json")
 
     def read_user(self, name: str) -> dict:
@@ -761,14 +758,14 @@ class ProfilEditor:
             with open(self._user_path(name), encoding="utf-8") as fh:
                 return json.load(fh)
         except OSError:
-            raise ProfilError("Nutzerprofil %r nicht gefunden in %s" % (name, self.user_dir))
+            raise ProfilError("User profile %r not found in %s" % (name, self.user_dir))
         except ValueError as exc:
-            raise ProfilError("Nutzerprofil %r ist kein gültiges JSON: %s" % (name, exc))
+            raise ProfilError("User profile %r is not valid JSON: %s" % (name, exc))
 
     def save(self, doc: dict, name: str) -> dict:
         pj, _ref = self.mods()
         if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
-            raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+            raise ProfilError("doc is not a %s" % pj.SCHEMA)
         path = self._user_path(name)
         d = json.loads(json.dumps(doc))
         d["name"] = name
@@ -786,7 +783,7 @@ class ProfilEditor:
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
         except OSError as exc:
-            raise ProfilError("Speichern nach %s scheitert: %s (State-Volume beschreibbar? --profile-dir)" % (self.user_dir, exc))
+            raise ProfilError("Saving to %s fails: %s (state volume writable? --profile-dir)" % (self.user_dir, exc))
         return {"ok": True, "name": name, "path": path, "id": d["id"], "saved": meta["saved"]}
 
     def delete(self, name: str) -> dict:
@@ -794,22 +791,22 @@ class ProfilEditor:
         try:
             os.unlink(path)
         except FileNotFoundError:
-            raise ProfilError("Nutzerprofil %r nicht gefunden" % name)
+            raise ProfilError("User profile %r not found" % name)
         except OSError as exc:
-            raise ProfilError("Löschen scheitert: %s" % exc)
+            raise ProfilError("Deleting fails: %s" % exc)
         return {"ok": True, "name": name}
 
     # ------------------------------------------------------------------ Export (.env im heutigen Dialekt)
     def export_env(self, doc: dict, dry=None) -> dict:
         pj, _ref = self.mods()
         if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
-            raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+            raise ProfilError("doc is not a %s" % pj.SCHEMA)
         text = pj.render_env(doc)
         problems = self.verify_render(doc, text)
         name = str(doc.get("name") or "profil")
         return {"ok": True, "env": text, "filename": "%s.env" % name, "verified": not problems, "problems": problems,
-                "check": "Das exportierte .env wurde mit bash ausgewertet (HTSGLANG_INSTRUMENTS 0 und 1) und mit den Werten des Profils verglichen: "
-                         + ("gleich." if not problems else "ABWEICHUNG, nicht verwenden."),
+                "check": "The exported .env was evaluated with bash (HTSGLANG_INSTRUMENTS 0 and 1) and compared with the values of the profile: "
+                         + ("gleich." if not problems else "DEVIATION, do not use."),
                 "use": self.use_hint(name, dry, str(doc.get("line") or ""))}
 
     def verify_render(self, doc: dict, text: str) -> List[str]:
@@ -833,9 +830,7 @@ class ProfilEditor:
         fh = force_hint(dry, reg, line)
         return {"profile_env": "FLLIPER_PROFILE=%s" % name, "force_env": fh["force_env"], "force": fh,
                 "docker_run": docker_run_example(name, fh),
-                "text": "Am Server: das Profil angeben (FLLIPER_PROFILE=%s, JSON aus dem State-Volume /var/lib/flliper/profiles/%s.json "
-                        "oder die exportierte Datei als <profiles>/%s.env). Das Dashboard startet nichts; unten steht ein Beispielaufruf zum Anpassen "
-                        "(Image, Mounts und Flags sind Platzhalter)." % (name, name, name)}
+                "text": "On the server: name the profile (FLLIPER_PROFILE=%s, JSON from the state volume /var/lib/flliper/profiles/%s.json or the exported file as <profiles>/%s.env). The dashboard starts nothing; an example call to adapt is below (image, mounts and flags are placeholders)." % (name, name, name)}
 
     # ------------------------------------------------------------------ Issue-Text "Laufbericht" (AP-I)
     def issue_report(self, doc: dict, dry=None, cards=None, model=None, hardware_md: str = "", versions: Optional[dict] = None,
@@ -849,7 +844,7 @@ class ProfilEditor:
         Orakel-Lauf des Vorschlags (``dry_from_vorschlag``); ein Trockenlauf ist jünger und geht vor."""
         pj, _ref = self.mods()
         if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
-            raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+            raise ProfilError("doc is not a %s" % pj.SCHEMA)
         if not (isinstance(dry, dict) and isinstance(dry.get("rejections"), list)):
             dry = dry_from_vorschlag(vorschlag) or dry
         view = pj.view(doc, self.catalog()["entries"], None, self.specs())
@@ -867,38 +862,36 @@ class ProfilEditor:
         by_name = {r["name"]: redact.value_for_issue(r["name"], r.get("value"), known) for r in view["rows"] if r["kind"] == "var"}
         meta = doc.get("meta") or {}
         based = meta.get("based_on") or {}
-        L: List[str] = ["## Laufbericht (Profil-Editor): `%s`" % name, "",
-                        "Erzeugt %s im Profil-Editor des Dashboards; er startet nichts. Alle Werte stammen aus dem Profil, dem Trockenlauf und den "
-                        "Profilen von Hardware und Modell; was nicht belegt ist, steht als \"unbelegt\"." % time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(now)), ""]
+        L: List[str] = ["## Run report (profile editor): `%s`" % name, "",
+                        "Generated %s in the profile editor of the dashboard; it starts nothing. All values come from the profile, the dry run and the hardware and model profiles; what is not verified is shown as \"unverified\"." % time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(now)), ""]
         L += (hardware_md.strip().split("\n") if hardware_md and hardware_md.strip() else
-              ["### Hardwareprofil (Kurzform)", "", "Hardwareprofil nicht verfügbar (unbelegt)."])
+              ["### Hardware profile (short form)", "", "Hardware profile not available (unverified)."])
         L += [""] + _issue_model(model, view["rows"])
-        L += ["", "### Betriebsform", "", "| Angabe | Wert |", "|---|---|",
-              "| Betriebsform | %s |" % _md(form["form"]),
-              "| Abgeleitet aus | %s (aus den Flags des Profils gelesen, keine Wahl des Planers) |" % _md(form["why"]),
-              "| Linie | %s |" % _md(line or "unbelegt"),
-              "| Profil | `%s`%s |" % (name, (", Basis %s `%s`" % (_md(based.get("kind"), 20), _md(based.get("name"), 60))) if based.get("name") else ""),
-              "| Profilstand | %s |" % _md(by_name.get("PROFILE_STATUS") or "unbelegt"),
-              "| Karten (%s) | %d: %s |" % (src, len(labels), _md(", ".join(labels) or "keine", 400)),
-              "| Kartenzahl laut Profil | %s |" % _md(by_name.get("PROFILE_CARD_COUNT") or "unbelegt"),
-              "| Inventar laut Profil | %s |" % _md(by_name.get("PROFILE_INVENTORY") or "unbelegt")]
+        L += ["", "### Operating mode", "", "| Item | Value |", "|---|---|",
+              "| Operating mode | %s |" % _md(form["form"]),
+              "| Derived from | %s (read from the flags of the profile, not a choice of the planner) |" % _md(form["why"]),
+              "| Line | %s |" % _md(line or "unverified"),
+              "| Profile | `%s`%s |" % (name, (", Basis %s `%s`" % (_md(based.get("kind"), 20), _md(based.get("name"), 60))) if based.get("name") else ""),
+              "| Profile status | %s |" % _md(by_name.get("PROFILE_STATUS") or "unverified"),
+              "| Cards (%s) | %d: %s |" % (src, len(labels), _md(", ".join(labels) or "none", 400)),
+              "| Card count per profile | %s |" % _md(by_name.get("PROFILE_CARD_COUNT") or "unverified"),
+              "| Inventory per profile | %s |" % _md(by_name.get("PROFILE_INVENTORY") or "unverified")]
         L += [""] + _issue_proposal(view, known)
         L += [""] + _issue_verdicts(dry, reg, line)
         pid = str(doc.get("id") or "")
         sha = str(based.get("sha256") or "")
         sha = sha[len("sha256:"):] if sha.startswith("sha256:") else sha
-        L += ["", "### Versionen", "", "| Angabe | Wert |", "|---|---|",
-              "| Baum (Revision) | %s |" % _md(HW.version_tree_text(v)),
+        L += ["", "### Versions", "", "| Item | Value |", "|---|---|",
+              "| Tree (revision) | %s |" % _md(HW.version_tree_text(v)),
               "| Image | %s |" % _md(HW.version_image_text(v)),
-              "| Treiber | %s |" % _md(v.get("driver") or "unbelegt"),
-              "| CUDA / torch (Messprozess) | %s / %s |" % (_md(v.get("cuda") or "unbelegt"), _md(v.get("torch") or "unbelegt")),
-              "| Dashboard | %s |" % _md(v.get("rigdash") or "unbelegt"),
-              "| Profil-ID | `%s` |" % _md(pid[:19] if pid else "unbelegt"),
-              "| Basisprofil (sha256) | %s |" % (("`%s`" % _md(sha[:16])) if sha else "unbelegt")]
-        L += ["", "### Messergebnis / Boot-Log-Auszug", "",
-              "<!-- Ergebnis des Starts eintragen: läuft / bricht ab, Messwerte (Durchsatz, Rundenzeit), die ersten Zeilen des Boot-Logs mit den "
-              "Ablehnungen (REFUSED) und FORCED-PAST-Zeilen. Keine Schlüssel, keine Pfade des Rechners. -->", "",
-              "Ergebnis: _(hier eintragen)_", "", "```text", "(Boot-Log-Auszug hier einfügen)", "```"]
+              "| Driver | %s |" % _md(v.get("driver") or "unverified"),
+              "| CUDA / torch (measuring process) | %s / %s |" % (_md(v.get("cuda") or "unverified"), _md(v.get("torch") or "unverified")),
+              "| Dashboard | %s |" % _md(v.get("rigdash") or "unverified"),
+              "| Profile ID | `%s` |" % _md(pid[:19] if pid else "unverified"),
+              "| Base profile (sha256) | %s |" % (("`%s`" % _md(sha[:16])) if sha else "unverified")]
+        L += ["", "### Measurement result / boot log excerpt", "",
+              "<!-- Enter the result of the start: runs / aborts, measured values (throughput, round time), the first lines of the boot log with the refusals (REFUSED) and FORCED-PAST lines. No keys, no paths of the machine. -->", "",
+              "Result: _(enter here)_", "", "```text", "(paste the boot log excerpt here)", "```"]
         text = redact.text_for_issue("\n".join(L)) + "\n"
         return {"ok": True, "format": "markdown", "text": text, "blocks": [b for b in ISSUE_BLOCKS if ("### " + b) in text],
                 "filename": "laufbericht-%s.md" % (name if NAME_RE.match(name) else "profil")}
@@ -923,10 +916,10 @@ class ProfilEditor:
         try:
             tp.plan_topology(n)
         except ImportError as exc:
-            notes.append("Topologie für %d Karte(n) nicht geprüft: das Planer-Gate braucht dafür die sglang-Umgebung (%s: %s)%s."
+            notes.append("Topology for %d card(s) not checked: the planner gate needs the sglang environment for it (%s: %s)%s."
                          % (n, type(exc).__name__, exc,
-                            "; Kopplungs-Python/Kindprozess nicht verfügbar: " + child_err if child_err else
-                            " (kein Kindprozess mit --couplings-python / RIGDASH_COUPLINGS_PYTHON konfiguriert)"))
+                            "; couplings Python / child process not available: " + child_err if child_err else
+                            " (no child process with --couplings-python / RIGDASH_COUPLINGS_PYTHON configured)"))
             return None
         except tp.TopologyRefused as exc:
             return str(exc)
@@ -935,14 +928,14 @@ class ProfilEditor:
     # ------------------------------------------------------------------ Trockenlauf: welche Ablehnungen hätte der Planer
     def _build_cards(self, cards_req: list) -> List[dict]:
         if not cards_req:
-            raise ProfilError("mindestens eine Karte wählen")
+            raise ProfilError("select at least one card")
         if len(cards_req) > MAX_CARDS:
-            raise ProfilError("höchstens %d Karten" % MAX_CARDS)
+            raise ProfilError("at most %d cards" % MAX_CARDS)
         cards = []
         for i, rc in enumerate(cards_req):
             e = CAT.card(rc.get("card"))
             if e is None:
-                raise ProfilError("Karte %r nicht im Katalog" % rc.get("card"))
+                raise ProfilError("Card %r not in the catalog" % rc.get("card"))
             link = TR.per_card_link(e, rc.get("pcie"))
             cards.append({"index": i, "entry": e, "label": CAT.label(e), "link": link})
         return cards
@@ -967,7 +960,7 @@ class ProfilEditor:
             ci, tp = self.kp._mods()
         except Exception as exc:        # noqa: BLE001
             ci = tp = None
-            notes.append("Planer-Gate nicht verfügbar (%s): HW-Ablehnungen können nicht gezeigt werden." % exc)
+            notes.append("Planner gate not available (%s): HW refusals cannot be shown." % exc)
         if ci is not None:
             from . import kartenplan_gate as GATE
 
@@ -979,7 +972,7 @@ class ProfilEditor:
                 except ci.CardInventoryRefused as exc:
                     bad.append(str(exc))
             if bad:
-                found.append({"code": "HW-ARCH", "text": bad[0] + ("  [gleiche Meldung für %d weitere Karte(n)]" % (len(bad) - 1) if len(bad) > 1 else ""),
+                found.append({"code": "HW-ARCH", "text": bad[0] + ("  [same message for %d more card(s)]" % (len(bad) - 1) if len(bad) > 1 else ""),
                               "source": "weg2/card_identity.arch_gate"})
             try:
                 want_n = int(var("PROFILE_CARD_COUNT") or 0) or None
@@ -1051,10 +1044,9 @@ class ProfilEditor:
         synthetische Karten aus dem Katalog (Datenblatt, synthetische UUID: der Launcher kennt solche UUIDs nicht, z. B. im Census)."""
         hw = self._hardware_profile()
         if hw is not None and self._hw_cards_match(hw, cards):
-            notes.append("Die gewählten Karten sind die NVML-Karten dieses Rigs (Hardwareprofil): der Trockenlauf läuft mit ihren echten UUIDs.")
+            notes.append("The selected cards are the NVML cards of this rig (hardware profile): the dry run runs with their real UUIDs.")
             return {"hardware": hw}
-        notes.append("Synthetische Karten aus dem Katalog (Datenblatt, synthetische UUID): was der Launcher an Karten-UUIDs bindet (Census), "
-                     "kennt sie nicht.")
+        notes.append("Synthetic cards from the catalog (datasheet, synthetic UUID): what the launcher binds to card UUIDs (census) does not know them.")
         return {"cards": [{"entry": c["entry"], "link": c["link"]} for c in cards]}
 
     @staticmethod
@@ -1071,7 +1063,7 @@ class ProfilEditor:
         try:
             text = pj.render_env(doc)
         except Exception as exc:        # noqa: BLE001 -- ein Profil, das sich nicht darstellen lässt, geht an den Rückfall
-            notes.append("Orakel nicht gefragt: das Profil lässt sich nicht als .env darstellen (%s: %s). Es gilt die Teilprüfung des Planer-Gates."
+            notes.append("Oracle not asked: the profile cannot be rendered as .env (%s: %s). The partial check of the planner gate applies."
                          % (type(exc).__name__, exc))
             return None
         inv = self._inventar_for(cards, notes)
@@ -1079,13 +1071,12 @@ class ProfilEditor:
         based = (doc.get("meta") or {}).get("based_on") or {}
         res = self.oracle.ask("verdikt", {"basis": {"env_text": text, "source": "%s.env" % (based.get("name") or doc.get("name") or "profil")}, "inventar": inv}, parts)
         if not res.get("ok"):
-            notes.append("Orakel (Launcher-Trockenlauf) nicht verfügbar: %s. Es gilt die Teilprüfung des Planer-Gates (Karten, Kartenzahl, "
-                         "Topologie); die Rechnung des Launchers fehlt." % (res.get("error") or "unbekannter Fehler"))
+            notes.append("Oracle (launcher dry run) not available: %s. The partial check of the planner gate applies (cards, card count, topology); the launcher calculation is missing." % (res.get("error") or "unknown error"))
             return None
         v = res.get("verdikt") or {}
         if v.get("ausgang") == "orakel_fehler":
             why = next((x.get("text") for x in v.get("verdikte") or [] if x.get("code") == "ORAKEL-FEHLER"), "")
-            notes.append("Das Orakel konnte nicht fragen: %s. Es gilt die Teilprüfung des Planer-Gates." % why)
+            notes.append("The oracle could not be asked: %s. The partial check of the planner gate applies." % why)
             return None
         found = self._found_from_verdikt(v)
         for f in self._count_found(cards, var):
@@ -1100,7 +1091,7 @@ class ProfilEditor:
         out = []
         for x in v.get("verdikte") or []:
             if x.get("ebene") in ("lauf", "absturz", "orakel") and not x.get("parent"):
-                src = "Launcher-Trockenlauf (Orakel, weg2/propose_verdict)"
+                src = "Launcher dry run (oracle, weg2/propose_verdict)"
                 if x.get("launcher_code"):
                     src += ", %s" % x["launcher_code"]
                 if x.get("wo"):
@@ -1127,7 +1118,7 @@ class ProfilEditor:
         neu sind ``quelle`` (``orakel`` | ``gate``), ``orakel`` (Ausgang, Profil-Hash, Cache) und ``verdikte`` (alle Verdikte, auch Blocker und Hinweise)."""
         pj, ref = self.mods()
         if not isinstance(doc, dict) or doc.get("schema") != pj.SCHEMA:
-            raise ProfilError("doc ist kein %s" % pj.SCHEMA)
+            raise ProfilError("doc is not a %s" % pj.SCHEMA)
         rows = {r["name"]: r for r in pj.rows(doc, self.specs()) if r["kind"] == "var"}
 
         def var(n: str) -> str:
@@ -1144,19 +1135,16 @@ class ProfilEditor:
             quelle = "gate"
         st = var("PROFILE_STATUS") or ("platzhalter" if var("PROFILE_PLACEHOLDER") == "1" else "abgenommen")
         if st != "abgenommen":
-            found.append({"code": "PROFIL-STATUS", "text": "Profil %r hat den Stand %s (%s)" % (doc.get("name"), st.upper(), var("PROFILE_OWNER") or "Eigentümer offen"),
+            found.append({"code": "PROFIL-STATUS", "text": "Profile %r has the status %s (%s)" % (doc.get("name"), st.upper(), var("PROFILE_OWNER") or "owner open"),
                           "source": "docker/entrypoint.sh (PROFILE_STATUS)"})
         transport = TR.choose_transport([c["link"] for c in cards], [c["label"] for c in cards], host_patched=host_patched)
         if transport["transport"] == "nccl":
-            notes.append("Transport NCCL statt barlink BAR1: " + " ".join(transport["reasons"]))
+            notes.append("Transport NCCL instead of barlink BAR1: " + " ".join(transport["reasons"]))
         if orakel is not None:
-            notes.append("Nicht geprüft (der Trockenlauf des Launchers läuft auf einem Abbild der Karten und einem festen ruhigen Host): Modell- und Draft-Dateien "
-                         "(Kopf-Snapshots bzw. Geschwister-Checkpoints stehen für leere Mountpunkte), echter freier Host-Speicher, SHM-Größe, Belegung der Karten. "
-                         "Der Server prüft sie beim Start; die Belegungsprüfung hebt Force nie auf.")
+            notes.append("Not checked (the launcher dry run runs on a replica of the cards and a fixed quiet host): model and draft files (header snapshots or sibling checkpoints stand in for empty mount points), real free host memory, SHM size, occupancy of the cards. The server checks them at start; force never lifts the occupancy check.")
             notes += [str(x) for x in (orakel["verdikt"].get("orakel") or {}).get("notizen") or []]
         else:
-            notes.append("Nicht geprüft (das Dashboard sieht den Host nicht): Pfade des Modells, Drafts und Stores, SHM-Größe, freier Host-Speicher, "
-                         "Belegung der Karten. Der Server prüft sie beim Start; die Belegungsprüfung hebt Force nie auf.")
+            notes.append("Not checked (the dashboard cannot see the host): paths of the model, drafts and stores, SHM size, free host memory, occupancy of the cards. The server checks them at start; force never lifts the occupancy check.")
         reg = {r["code"]: r for r in self.register()}
         out = []
         for f in found:
@@ -1172,25 +1160,20 @@ class ProfilEditor:
         n_open = sum(1 for o in out if o["force_state"] == "ungeprueft")
         n_block = len(out) - n_force - n_open
         if not out:
-            verdict = "Der Planer lehnt dieses Profil auf den gewählten Karten nicht ab."
+            verdict = "The planner does not refuse this profile on the selected cards."
         else:
-            verdict = "Der Planer lehnt %d Punkt(e) ab: Force übergeht %d beim Serverstart" % (len(out), n_force)
+            verdict = "The planner refuses %d item(s): force overrides %d at the server start" % (len(out), n_force)
             n_ep = sum(1 for o in out if o["force_state"] == "force" and o.get("force_via") == "entrypoint")
             if n_ep:
-                verdict += " (davon %d nur im Docker-Start, nicht im reinen Launcher-Aufruf)" % n_ep
+                verdict += " (of which %d only in the Docker start, not in a plain launcher call)" % n_ep
             if n_open:
-                verdict += ", %d prüft der Launcher noch nicht" % n_open
+                verdict += ", %d the launcher does not check yet" % n_open
             if n_block:
-                verdict += ", %d bleiben auch mit Force bestehen (nicht forcebar bzw. noch nicht verdrahtet)" % n_block
+                verdict += ", %d remain even with force (not forceable or not wired yet)" % n_block
             verdict += "."
         res = {"ok": True, "goes": not out, "verdict": verdict, "rejections": out, "notes": notes,
                "cards": [{"index": c["index"], "label": c["label"], "arch": c["entry"]["arch"]} for c in cards],
-               "force_note": "Force gibt es nur am Serverstart (FLLIPER_FORCE=1 / --force), nicht im Dashboard. Er hebt alle Wert-Ablehnungen auf, "
-                             "die der Launcher verdrahtet hat, und im Docker-Start zusätzlich die, die der Entrypoint selbst prüft "
-                             "(PROFIL-STATUS, SHM, STORE, MEMAVAIL: im Docker-Start (Entrypoint) forcebar, im reinen Launcher-Aufruf nicht), "
-                             "listet jede im Boot-Log als FORCED-PAST <CODE> <Grund> und schreibt keine Records. "
-                             "Nicht übergangen werden: Belegungsprüfung (fremder Prozess/Fenster auf der Karte), fehlendes oder kaputtes Modell, "
-                             "nicht unterstützte Architektur.",
+               "force_note": "Force exists only at the server start (FLLIPER_FORCE=1 / --force), not in the dashboard. It lifts all value refusals that the launcher has wired and, in the Docker start, additionally those the entrypoint checks itself (PROFIL-STATUS, SHM, STORE, MEMAVAIL: forceable in the Docker start (entrypoint), not in a plain launcher call), lists each one in the boot log as FORCED-PAST <CODE> <reason> and writes no records. Not overridden: the occupancy check (foreign process/window on the card), a missing or broken model, an unsupported architecture.",
                "reference": {"inventory": list(ci.REFERENCE_INVENTORY) if (ci := self._ci()) is not None else None},
                "quelle": quelle}
         if orakel is not None:
@@ -1232,7 +1215,7 @@ class ProfilEditor:
         if z in (None, {}):
             return {}
         if not isinstance(z, dict):
-            raise ProfilError("ziele muss ein JSON-Objekt sein")
+            raise ProfilError("ziele must be a JSON object")
         ints, choices = dict(self.ZIELE_INT), dict(self.ZIELE_CHOICE)
         if form == "single":
             ints.update(self.ZIELE_INT_EINZEL)
@@ -1240,26 +1223,26 @@ class ProfilEditor:
         known = set(ints) | set(choices) | {"d_objective", "force_rules"}
         bad = sorted(set(z) - known)
         if bad:
-            raise ProfilError("unbekannte Ziele: %s (erlaubt: %s)" % (", ".join(bad), ", ".join(sorted(known))))
+            raise ProfilError("unknown goals: %s (allowed: %s)" % (", ".join(bad), ", ".join(sorted(known))))
         out: dict = {}
         for k, (lo, hi) in ints.items():
             if z.get(k) not in (None, ""):
                 try:
                     v = int(z[k])
                 except (TypeError, ValueError):
-                    raise ProfilError("Ziel %s muss eine ganze Zahl sein" % k)
+                    raise ProfilError("Goal %s must be an integer" % k)
                 if not lo <= v <= hi:
-                    raise ProfilError("Ziel %s muss zwischen %d und %d liegen" % (k, lo, hi))
+                    raise ProfilError("Goal %s must be between %d and %d" % (k, lo, hi))
                 out[k] = v
         for k, opts in choices.items():
             if z.get(k) not in (None, ""):
                 if z[k] not in opts:
-                    raise ProfilError("Ziel %s muss eines von %s sein" % (k, ", ".join(opts)))
+                    raise ProfilError("Goal %s must be one of %s" % (k, ", ".join(opts)))
                 out[k] = z[k]
         if z.get("d_objective") not in (None, ""):
             v = str(z["d_objective"])
             if not (0 < len(v) <= 32 and all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in v)):
-                raise ProfilError("Ziel d_objective: Kleinbuchstaben, Ziffern und - (höchstens 32 Zeichen)")
+                raise ProfilError("Goal d_objective: lowercase letters, digits and - (at most 32 characters)")
             out["d_objective"] = v
         if z.get("force_rules"):
             out["force_rules"] = True
@@ -1377,17 +1360,17 @@ class ProfilEditor:
         if isinstance(body, dict) and self.FORM_ALIAS.get(str(body.get("form") or ""), str(body.get("form") or "")) == "dual" and not self.dual_available():
             raise ProfilError(DUAL_FEHLT)              # NF-Linie: kein Dual-Vorschlag, kein ImportError im Kindprozess (HTTP 400)
         if self.oracle is None:
-            raise ProfilError("Das Orakel ist nicht konfiguriert (Kindprozess mit dem Python der sglang-Umgebung: --couplings-python / RIGDASH_COUPLINGS_PYTHON)")
+            raise ProfilError("The oracle is not configured (child process with the Python of the sglang environment: --couplings-python / RIGDASH_COUPLINGS_PYTHON)")
         if not isinstance(body, dict):
-            raise ProfilError("Körper muss ein JSON-Objekt sein")
+            raise ProfilError("Body must be a JSON object")
         basis = body.get("basis") or {}
         if not isinstance(basis, dict):
-            raise ProfilError("basis muss {kind, name} sein")
+            raise ProfilError("basis must be {kind, name}")
         kind, name = str(basis.get("kind") or "release"), str(basis.get("name") or "")
         form = str(body.get("form") or "flip")
         form = self.FORM_ALIAS.get(form, form)
         if form not in self.FORMS:
-            raise ProfilError("form muss flip, tp, dual oder single (Einzelkarte) sein")
+            raise ProfilError("form must be flip, tp, dual or single (single card)")
         single = form == "single"
         ziele = self._ziele(body.get("ziele"), form)
         notes: List[str] = []
@@ -1408,14 +1391,14 @@ class ProfilEditor:
             bsha = ORA.sha256_text(text)
             comments = {}
         else:
-            raise ProfilError("basis.kind muss release oder user sein")
+            raise ProfilError("basis.kind must be release or user")
         vars_ = {v["name"]: str(v.get("value", "")) for v in (doc or {}).get("vars") or [] if "name" in v}
         paths = {}
         for fld, var_name in (("model_path", "PROFILE_MODEL"), ("draft_path", "PROFILE_DRAFT")):
             p = body.get(fld)
             if p:
                 if self.check_path is None:
-                    raise ProfilError("%s: ohne Modellwurzel-Prüfung nicht erlaubt (nur der Pfad des Basisprofils)" % fld)
+                    raise ProfilError("%s: not allowed without a model root check (only the path of the base profile)" % fld)
                 try:
                     p = self.check_path(p, fld)
                 except ValueError as exc:
@@ -1426,36 +1409,36 @@ class ProfilEditor:
             if p:
                 paths[fld] = str(p)
         if single and not paths.get("model_path"):
-            raise ProfilError("Einzelkarte: model_path angeben (oder ein Basisprofil mit PROFILE_MODEL wählen)")
+            raise ProfilError("Single card: give model_path (or choose a base profile with PROFILE_MODEL)")
         inv_req = body.get("inventar", "rig")
         if inv_req == "rig":
             hw = self._hardware_profile()
             if hw is None:
-                raise ProfilError("Hardwareprofil dieses Rigs nicht verfügbar: für ein synthetisches Inventar die Kartenliste [{card, pcie}] angeben")
+                raise ProfilError("Hardware profile of this rig not available: for a synthetic inventory give the card list [{card, pcie}]")
             inventar = {"hardware": hw}
-            notes.append("Inventar: die NVML-Karten dieses Rigs (Hardwareprofil), echte UUIDs.")
+            notes.append("Inventory: the NVML cards of this rig (hardware profile), real UUIDs.")
             if single:
                 try:
                     karte = int(body.get("karte") or 0)
                 except (TypeError, ValueError):
-                    raise ProfilError("karte muss das Ordinal einer Karte des Hardwareprofils sein")
+                    raise ProfilError("karte must be the ordinal of a card of the hardware profile")
                 if not 0 <= karte < len(hw["cards"]):
-                    raise ProfilError("karte %d: das Hardwareprofil hat %d Karten" % (karte, len(hw["cards"])))
+                    raise ProfilError("karte %d: the hardware profile has %d cards" % (karte, len(hw["cards"])))
                 inventar["karte"] = karte
-                notes.append("Einzelkarte: Karte %d des Hardwareprofils (andere Karte: karte=<Ordinal>); die übrigen Karten des Rigs bleiben unberücksichtigt." % karte)
+                notes.append("Single card: card %d of the hardware profile (other card: karte=<ordinal>); the remaining cards of the rig are not taken into account." % karte)
         elif isinstance(inv_req, list):
             if single and len(inv_req) != 1:
-                raise ProfilError("Einzelkarte: genau eine Karte wählen (nicht %d)" % len(inv_req))
+                raise ProfilError("Single card: select exactly one card (not %d)" % len(inv_req))
             cards = self._build_cards(inv_req)
             inventar = self._inventar_for(cards, notes)
         else:
-            raise ProfilError('inventar muss "rig" oder eine Kartenliste [{card, pcie}] sein')
+            raise ProfilError('inventar must be "rig" or a card list [{card, pcie}]')
         parts = {"inventar": self._inventar_key(inventar) + ([["karte", inventar.get("karte")]] if single and "karte" in inventar else []), "form": form, "ziele": ziele, "basis_sha256": bsha, "basis": [kind, name], "paths": paths,
                  "modell": [self._path_stamp(p) for p in paths.values()]}
         req = {"basis": bas, "inventar": inventar, "form": form, "ziele": ziele, "model_path": paths.get("model_path"), "draft_path": paths.get("draft_path")}
         res = self.oracle.ask("propose", req, parts)
         if not res.get("ok"):
-            return {"ok": False, "error": res.get("error") or "unbekannter Fehler", "schema": self.PROPOSE_SCHEMA, "notes": notes + list(res.get("notizen") or [])}
+            return {"ok": False, "error": res.get("error") or "unknown error", "schema": self.PROPOSE_SCHEMA, "notes": notes + list(res.get("notizen") or [])}
         v = res["vorschlag"]
         if single:
             doc = self._single_base(name, paths["model_path"])
@@ -1464,10 +1447,9 @@ class ProfilEditor:
         new["meta"]["vorschlag"] = {"schema": self.PROPOSE_SCHEMA, "form": form, "n": v["n"], "ziele": v["ziele"], "basis": [kind, name], "basis_sha256": bsha,
                                     "ausgang": res["verdikt"].get("ausgang"), "argv_sha256": res["verdikt"].get("argv_sha256")}
         if single:
-            new["meta"].setdefault("notes", []).append("Startprofil der Einzelkarte (Planer-Rechnung, kein weg2-Launcher): die Argumente des normalen Servers "
-                                                       "(python -m sglang.launch_server) für Modell %s" % paths["model_path"])
+            new["meta"].setdefault("notes", []).append("Server profile of the single card (planner calculation, no weg2 launcher): the arguments of the normal server (python -m sglang.launch_server) for model %s" % paths["model_path"])
         else:
-            new["meta"].setdefault("notes", []).append("Startprofil des Planers aus %s (%s) für %d Karten, Form %s" % (name, bsha[:12], v["n"], form))
+            new["meta"].setdefault("notes", []).append("Planner server profile from %s (%s) for %d cards, form %s" % (name, bsha[:12], v["n"], form))
         new["id"] = pj.doc_id(new)
         view = self.render_view(new, comments)
         by_key = {r["key"]: r for r in view["view"]["rows"]}

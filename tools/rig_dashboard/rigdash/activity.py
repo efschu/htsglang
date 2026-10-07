@@ -127,7 +127,7 @@ def dp_prefill_start(ring, keys, u: Optional[dict], t_from: float, t_to: float):
     r = first_rise(ring, k0, ("fwd",), t_from, t_to)
     if r is None:
         return None
-    return r[0], r[1], "rankstats %s work.forward_ct (erster Prefill-Forward auf P, Rang-Takt)" % k0
+    return r[0], r[1], "rankstats %s work.forward_ct (first prefill forward on P, rank cycle)" % k0
 
 
 def chunks(ring, keys, g: str, kind: Optional[str] = None) -> List[dict]:
@@ -303,7 +303,7 @@ def prefill_depth(b: dict, done: Optional[List[dict]] = None, g: str = "P") -> d
             r["x"] = max(0, min(r["x"], r["y"] - n))
             r["n"] = r["y"] - r["x"]
         out.update(x=min(r["x"] for r in reqs), y=max(r["y"] for r in reqs), reqs=reqs, exact=True,
-                   src="rankstats prefill.last.ext (#969 EXTENT je Chunk)")
+                   src="rankstats prefill.last.ext (#969 EXTENT per chunk)")
         return out
     lo, hi = b["s"] - REQ_END_TOL_S[0], b["e"] + REQ_END_TOL_S[1]
     reqs = []
@@ -320,7 +320,7 @@ def prefill_depth(b: dict, done: Optional[List[dict]] = None, g: str = "P") -> d
                    src="events request_done (prefill.%s cached/prompt/tokens)" % ("D" if g == "D" else "P"))
         return out
     c = int(round(b.get("cached") or 0))
-    out.update(x=c, y=c + n, src="rankstats prefill.cached_tokens (Präfix am ersten Chunk der Anfrage)")
+    out.update(x=c, y=c + n, src="rankstats prefill.cached_tokens (prefix at the first chunk of the request)")
     return out
 
 
@@ -466,7 +466,7 @@ def decode_reqs(ring, key: Optional[str], s: float, e: float, done: Optional[Lis
         rows.append({"rid": r.get("rid"), "x": int(round(x)), "y": int(round(y)), "n": int(round(y - x)),
                      "tps": rate, "est": True})
     rows.sort(key=lambda r: -r["y"])
-    return rows, ("events request_done (Ø der Anfrage, linear über ihre Decode-Zeit)" if rows else None)
+    return rows, ("events request_done (avg of the request, linear over its decode time)" if rows else None)
 
 
 def flip_windows(flip_done: List[dict]) -> List[Tuple[float, float]]:
@@ -909,8 +909,8 @@ class Model:
             if x["k"] == "unknown":
                 x["why"] = self._why_unknown(x)
             if x["k"] == "off":
-                x["why"] = "lädt (vor serving)" if ss is not None and x["e"] <= ss + 1e-6 else \
-                    "aus/tot (%s)" % (self.life.get("terminal_state") or "beendet")
+                x["why"] = "loading (before serving)" if ss is not None and x["e"] <= ss + 1e-6 else \
+                    "off/dead (%s)" % (self.life.get("terminal_state") or "beendet")
         return segs
 
     def _why_unknown(self, x) -> str:
@@ -919,11 +919,11 @@ class Model:
     def _why_unknown_base(self, x) -> str:
         pairs = [(a, b) for a, b in zip(self.ring, self.ring[1:]) if a["t"] < x["e"] and b["t"] > x["s"]]
         if not pairs or any(b["t"] - a["t"] > SAMPLE_GAP_S for a, b in pairs):
-            return "keine IPC-Probe in dieser Zeit"
+            return "no IPC sample in this time"
         if any(any((_d(b["r"].get(k) or {}, a["r"].get(k) or {}, f) or 0) > 0 for k in self.keys for f in ("fwd", "pchunks"))
                for a, b in pairs):
-            return "Rang-Zähler bewegt sich, aber ohne zuordenbare Tokens"
-        return "Anfragen offen (queue/outstanding > 0), aber kein Rang arbeitet"
+            return "Rank counter moves, but without assignable tokens"
+        return "Requests open (queue/outstanding > 0), but no rank is working"
 
     def overlap_s(self) -> Dict[str, float]:
         """Seconds in which P prefill and D work (prefill or decode) ran at the same time -- outside

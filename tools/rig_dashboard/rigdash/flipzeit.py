@@ -30,10 +30,10 @@ DIRS = ("P>D", "D>P")
 #: die EINE Definition (Wortlaut des Nutzers 06.10.); index.html (FLIP_DEF) und grafik.js tragen denselben Text,
 #: tests/test_flipzeit_1006.py prueft die Gleichheit
 DEFINITION = {
-    "P>D": "letzter P-Chunk fertig → erstes Decode-Token erzeugt",
-    "D>P": "letztes Decode-Token erzeugt → erster Prefill-Chunk beginnt zu rechnen (erster Forward auf PP0)",
+    "P>D": "last P chunk finished → first decode token produced",
+    "D>P": "last decode token produced → first prefill chunk starts computing (first forward on PP0)",
 }
-EXCEPTION = "Kein Flip zählt, wenn kein Prefill oder Decode ansteht (Leerlauf-Flip)."
+EXCEPTION = "No flip counts when no prefill or decode is pending (idle flip)."
 
 #: Fenster der Ueberblick-Kachel (= der Bereich "1h" des Verlaufs)
 OVERVIEW_S = 3600.0

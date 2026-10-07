@@ -24,10 +24,10 @@ from .features import last_boot
 
 MODELS = (("27B", "/spinning/docker-acceptance/27b/state"), ("NF", "/spinning/docker-acceptance/nf/state"))
 LAYERS = ("container", "front", "P", "D")
-#: Präfix-Gruppen der Flags in dieser Reihenfolge; was keiner passt, steht unter "übrige"
+#: Präfix-Gruppen der Flags in dieser Reihenfolge; was keiner passt, is listed under "other"
 FLAG_GROUPS = (("--weg2-*", "--weg2-"), ("--p-*", "--p-"), ("--d-*", "--d-"),
                ("--hicache*", "--hicache"), ("--speculative*", "--speculative"))
-FLAG_REST = "übrige"
+FLAG_REST = "other"
 #: vom Image mitgebracht, auch wenn der Launcher sie unter env führt
 IMAGE_BASE_KEYS = ("CUDA_HOME", "CUDA_VERSION", "CUDA_PATH", "CUDA_ROOT", "PATH", "LD_LIBRARY_PATH",
                    "PYTHONPATH", "HOME", "HOSTNAME", "LANG", "LC_ALL", "TERM", "SHLVL", "PWD", "OLDPWD",

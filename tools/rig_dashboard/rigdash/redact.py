@@ -33,8 +33,8 @@ def clean(text: str):
         return None
     if DROP_LINE.search(text):
         return None
-    text = _VALUE.sub(lambda m: m.group(1) + m.group(2) + "<entfernt>", text)
-    return _KEYFILE.sub("<Schluesseldatei entfernt>", text)
+    text = _VALUE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", text)
+    return _KEYFILE.sub("<key file redacted>", text)
 
 
 # the door: a serialized answer must not contain any of these
@@ -42,7 +42,7 @@ _DOOR = re.compile(r"ADMIN-KEY|admin-api-key|\.adminkey|auth=bearer|GITHUB_PAT|o
 
 
 def guard(body: str) -> str:
-    return _DOOR.sub("<entfernt>", body)
+    return _DOOR.sub("<redacted>", body)
 
 
 # an absolute path into the host (or the container) filesystem: nothing about the box's layout leaves in a pasted issue
@@ -53,7 +53,7 @@ _SYSROOTS = ("home", "root", "spinning", "opt", "var", "usr", "tmp", "mnt", "srv
 # Every OTHER absolute path (``/nvme/hf``, ``/workspace/models/X``, ``/scratch``) and every ``~/`` / ``$HOME/`` path is a host path too: the Laufbericht
 # shows no path outside the container.  Exempt: the mount points the image itself owns (``CONTAINER_MOUNTS``, ``/app`` = the baked tree,
 # ``/models-cache`` = the model mount of the run example).  Everything else shrinks to ``<hostpfad>/<last segment>``; system roots keep the stricter
-# ``<Pfad entfernt>``.  A path is NORMALISED before it is judged (``/app/../../root/x`` is ``/root/x``), a ``file://`` prefix is stripped, and a quoted
+# ``<path redacted>``.  A path is NORMALISED before it is judged (``/app/../../root/x`` is ``/root/x``), a ``file://`` prefix is stripped, and a quoted
 # path may hold spaces.
 CONTAINER_MOUNTS = ("/app", "/api", "/models-cache")               # ``/api/...`` = a dashboard URL route (the report names them), not a directory
 _PATHTAIL = r"[^\s|`,;)\]\"'<>]*"
@@ -94,7 +94,7 @@ def _shrink_path(p: str) -> str:
         return p
     first = p.lstrip("/").split("/", 1)[0]
     if p.startswith("/") and first in _SYSROOTS:
-        return "<Pfad entfernt>"
+        return "<path redacted>"
     last = p.rstrip("/").rsplit("/", 1)[-1].strip(".")
     return "<hostpfad>/" + last if last and last not in ("~", "$HOME", "${HOME}") else "<hostpfad>"
 
@@ -104,7 +104,7 @@ def _quoted(m) -> str:
 
 
 def paths(text: str) -> str:
-    """Replace absolute host paths: the system roots (``/root/...``, ``/spinning/...``, ``/var/lib/...``) by ``<Pfad entfernt>``, any other absolute
+    """Replace absolute host paths: the system roots (``/root/...``, ``/spinning/...``, ``/var/lib/...``) by ``<path redacted>``, any other absolute
     path and any ``~/...`` path by ``<hostpfad>/<last segment>`` (``CONTAINER_MOUNTS``: the image's ``/app``, ``/models-cache`` and the URL routes
     ``/api/...`` stay).  ``..`` segments are folded first, ``file://`` is stripped, a quoted path may hold spaces."""
     text = _FILEURL.sub("", text or "")
@@ -119,7 +119,7 @@ def paths(text: str) -> str:
 _VENDOR = re.compile(r"(?<![A-Za-z0-9_])(?:sk-(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{8,}|hf_[A-Za-z0-9]{8,}|gh[pousr]_[A-Za-z0-9]{16,}"
                      r"|github_pat_[A-Za-z0-9_]{16,}|xox[abpr]-[A-Za-z0-9\-]{8,}|AKIA[0-9A-Z]{16}(?![A-Za-z0-9]))")
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]{8,}")
-# ``scheme://user:pass@host`` -> ``scheme://user:<entfernt>@host``
+# ``scheme://user:pass@host`` -> ``scheme://user:<redacted>@host``
 _URLCRED = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@]*:)[^\s/@]+@")
 # a long token-looking run right after ``=`` or ``:`` (env / flag lines): >= 32 of [A-Za-z0-9_-], no dot or slash (so model names and paths are not
 # runs), see ``_looks_like_secret`` for what is spared (git SHAs, sha256 digests, UPPER_CASE names).
@@ -221,14 +221,14 @@ def _looks_like_secret(run: str) -> bool:
 def shapes(text: str) -> str:
     """Cut secrets by the form of their value: vendor prefixes, ``Bearer <token>``, ``user:pass@`` in a URL, JWT, dot-separated tokens, standard
     base64 (``/`` ``+`` ``=``), long token runs."""
-    text = _URLCRED.sub(lambda m: m.group(1) + "<entfernt>@", text or "")
-    text = _BEARER.sub("Bearer <entfernt>", text)
-    text = _VENDOR.sub("<entfernt>", text)
-    text = _JWT.sub("<entfernt>", text)
-    text = _DOTTED.sub(lambda m: "<entfernt>" if _dotted_secret(m.group(0)) else m.group(0), text)
-    text = _B64RUN.sub(lambda m: "<entfernt>" if _b64_secret(m.group(0)) else m.group(0), text)
-    text = _LONGRUN.sub(lambda m: m.group(1) + ("<entfernt>" if _looks_like_secret(m.group(2)) else m.group(2)), text)
-    return _BARERUN.sub(lambda m: "<entfernt>" if _bare_secret(m.group(0)) else m.group(0), text)
+    text = _URLCRED.sub(lambda m: m.group(1) + "<redacted>@", text or "")
+    text = _BEARER.sub("Bearer <redacted>", text)
+    text = _VENDOR.sub("<redacted>", text)
+    text = _JWT.sub("<redacted>", text)
+    text = _DOTTED.sub(lambda m: "<redacted>" if _dotted_secret(m.group(0)) else m.group(0), text)
+    text = _B64RUN.sub(lambda m: "<redacted>" if _b64_secret(m.group(0)) else m.group(0), text)
+    text = _LONGRUN.sub(lambda m: m.group(1) + ("<redacted>" if _looks_like_secret(m.group(2)) else m.group(2)), text)
+    return _BARERUN.sub(lambda m: "<redacted>" if _bare_secret(m.group(0)) else m.group(0), text)
 
 
 def text_for_issue(text: str) -> str:
@@ -309,7 +309,7 @@ def secret_name(name: str) -> bool:
 
 
 #: what a user-set value of a key the catalog does not know becomes (the key name stays visible)
-HIDDEN_UNKNOWN = "<wert ausgeblendet: unbekannter Schluessel>"
+HIDDEN_UNKNOWN = "<value hidden: unknown key>"
 
 
 def bare_key(name) -> str:
@@ -328,12 +328,12 @@ def bare_key(name) -> str:
 
 def value_for_issue(name: str, value, known=None) -> str:
     """The value of a named entry for a pasted issue.  STRUCTURAL rule (allow, not block): a value is shown only for a key the catalog knows
-    (``known`` = the catalog's flag / env / variable names) and that is no secret by name; ``<entfernt>`` when the name says secret, ``HIDDEN_UNKNOWN``
+    (``known`` = the catalog's flag / env / variable names) and that is no secret by name; ``<redacted>`` when the name says secret, ``HIDDEN_UNKNOWN``
     for every other key a user set (the key itself stays in the table).  ``known=None`` knows nothing, so nothing is shown (closed by default).
     What is shown still passes the value-shape layer (``text_for_issue``: vendor prefixes, base64, JWT, runs, host paths)."""
     key = bare_key(name)
     if secret_name(key):
-        return "<entfernt>"
+        return "<redacted>"
     text = str(value if value is not None else "")
     if not text.strip():
         return text
@@ -343,5 +343,5 @@ def value_for_issue(name: str, value, known=None) -> str:
     # a whole value that is one long token run is a secret whatever the entry is called: the ``=`` / ``:`` the shape layer looks for is not there
     # when the value is cut out of its line and set into a table cell
     if _FULLRUN.match(bare) and _looks_like_secret(bare):
-        return "<entfernt>"
+        return "<redacted>"
     return text_for_issue(text)

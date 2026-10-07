@@ -123,10 +123,10 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
         # planned stop (stops.py): grey, from the first teardown sign or the log's end
         gap_from = ps.get("teardown_t") or (b["last_log_t"] if ended else None)
         if gap_from is not None:
-            reason, kind = "gestoppt (geplant)", "planned"
+            reason, kind = "stopped (planned)", "planned"
     elif ended:
         if gap_from is None or b["last_log_t"] < gap_from:
-            gap_from, reason, kind = b["last_log_t"], "Boot beendet / Container weg", "ended"
+            gap_from, reason, kind = b["last_log_t"], "Boot ended / container gone", "ended"
             death = (b.get("end") or {}).get("death")
             if death:
                 # the harness named it a death (deadman verdict / hold end "Container-tot")
@@ -321,7 +321,7 @@ class App:
     def flip_zeit(self, boots: list, now: float) -> None:
         """Nutzer 06.10.: THE Flipzeit figures of the page, one function (history.flip_tile -> flipzeit.tile) over the
         history marks.  Ueberblick: ``flip_zeit`` = the last flipzeit.OVERVIEW_S of the boot's model (all its boots);
-        ``flip_boot`` = the whole boot (start .. last sign of life, "seit Boot" while it lives): the Boot-Liste row and
+        ``flip_boot`` = the whole boot (start .. last sign of life, "since boot" while it lives): the Boot-Liste row and
         the Ueberblick switch.  The Verlauf tile is the same function over its own range."""
         by_model: dict = {}
         for b in boots:
@@ -333,13 +333,13 @@ class App:
             if b.get("first_t") is None:
                 continue
             if b.get("live"):
-                # Nutzer 06.10.: the Ueberblick switch "seit Boot": the same function, this boot's start .. now
-                b["flip_boot"] = history.flip_tile(self.hist, model, b["first_t"], now, "seit Boot")
+                # Nutzer 06.10.: the Ueberblick switch "since boot": the same function, this boot's start .. now
+                b["flip_boot"] = history.flip_tile(self.hist, model, b["first_t"], now, "since boot")
                 continue
             hit = self.flip_boot_cache.get(b["stem"])
             if hit is None or (now - hit[0] >= 60.0 and (b.get("age_s") or 0) <= 1800.0):
                 hi = (b.get("last_log_t") or now) + 5.0
-                hit = (now, history.flip_tile(self.hist, model, b["first_t"], hi, "ganzer Boot"))
+                hit = (now, history.flip_tile(self.hist, model, b["first_t"], hi, "whole boot"))
                 self.flip_boot_cache[b["stem"]] = hit
             b["flip_boot"] = hit[1]
 
@@ -529,12 +529,18 @@ def edition_page(html: str, edition: str, editor_only: bool = False) -> str:
             break
         b = html.find(DEV_END, a)
         if b < 0:
-            raise ValueError("index.html: DEV:BEGIN ohne DEV:END")
+            raise ValueError("index.html: DEV:BEGIN without DEV:END")
         out.append(html[i:a])
         i = b + len(DEV_END)
     page = "".join(out)
     # Auftrag 1995: im Docker-Image laeuft die Release-Ausgabe als reiner Profil-Editor (--editor-only): die Seite zeigt nur den Reiter Profil
-    return (page.replace('<html lang="de">', '<html lang="de" data-edition="release"%s>' % (' data-editor-only="1"' if editor_only else ""), 1)
+    # the language attribute of the shipped page is "de" or "en" (index.html is being translated): match either, keep it as it is
+    for lang in ("de", "en"):
+        tag = '<html lang="%s">' % lang
+        if tag in page:
+            page = page.replace(tag, '<html lang="%s" data-edition="release"%s>' % (lang, ' data-editor-only="1"' if editor_only else ""), 1)
+            break
+    return (page
                 .replace("<title>Rig-Dashboard</title>", "<title>fLLiper Dashboard</title>", 1)
                 .replace('<h1 id="title">Rig-Dashboard</h1>', '<h1 id="title">fLLiper Dashboard</h1>', 1))
 
@@ -596,12 +602,12 @@ def make_handler(app: App):
         def _weg2(self, path):
             if self._via_proxy():
                 # the dry run executes a check script on the Proxmox host: LAN only
-                return self._json({"ok": False, "error": "Startzeile und Trockenlauf nur im LAN (http://192.168.0.88:8890/weg2)"}, 403)
+                return self._json({"ok": False, "error": "Start line and dry run only in the LAN (http://192.168.0.88:8890/weg2)"}, 403)
             from urllib.parse import parse_qs, urlsplit
 
             q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
             if not app.weg2.release_profiles:
-                return self._json({"ok": False, "error": "keine Release-Profile konfiguriert (--release-profile)"}, 400)
+                return self._json({"ok": False, "error": "no release profiles configured (--release-profile)"}, 400)
             if path == "/api/weg2/options":
                 return self._json(dict(app.weg2.options(), ok=True))
             built = app.weg2.build(q.get("profile", ""), q.get("image", ""), q.get("transport", "bar1"),
@@ -618,7 +624,7 @@ def make_handler(app: App):
             (Nutzer-Entscheid 05.10.: "ein Release, das außer mir niemand nutzen kann, ist kein Release"; Auftrag 1984): it only
             builds a profile and starts nothing; what touches the rig (measuring hardware = booking gpuq) stays shut, see _hwprofil."""
             if self._via_proxy():
-                return 403, "Der Profil-Editor ist nur im LAN erreichbar (http://192.168.0.88:8890/#t=profil)"
+                return 403, "The profile editor is reachable only in the LAN (http://192.168.0.88:8890/#t=profil)"
             return None
 
         def _profil_get(self, path):
@@ -640,13 +646,13 @@ def make_handler(app: App):
             if bad:
                 return self._json({"ok": False, "error": bad[1]}, bad[0]) if bad[0] != 404 else self._send(404, "not found", "text/plain")
             if n > profil.MAX_BODY:
-                return self._json({"ok": False, "error": "Anfrage zu groß"}, 413)
+                return self._json({"ok": False, "error": "Request too large"}, 413)
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
             except ValueError:
-                return self._json({"ok": False, "error": "Körper ist kein JSON"}, 400)
+                return self._json({"ok": False, "error": "Body is not JSON"}, 400)
             if not isinstance(body, dict):
-                return self._json({"ok": False, "error": "Körper muss ein JSON-Objekt sein"}, 400)
+                return self._json({"ok": False, "error": "Body must be a JSON object"}, 400)
             ed = app.profil
             if path == "/api/profil/load":
                 return self._json(ed.load(str(body.get("kind", "")), str(body.get("name", ""))))
@@ -683,15 +689,15 @@ def make_handler(app: App):
             gemerkt) kommen von den vorhandenen Diensten; gerechnet wird im Worker.  Fehler kommen als ``ok: false`` mit Grund, nie als Absturz."""
             doc = body.get("doc") or {}
             if not isinstance(doc, dict):
-                raise ValueError("doc muss ein JSON-Objekt sein")
+                raise ValueError("doc must be a JSON object")
             hw = app.hwprofil.get()
             if not hw.get("ok", True) or not hw.get("profile"):
-                return self._json({"ok": False, "error": "Hardwareprofil nicht verfügbar: %s" % (hw.get("error") or "leer")}, 200)
+                return self._json({"ok": False, "error": "Hardware profile not available: %s" % (hw.get("error") or "leer")}, 200)
             args_ = profil_recompute.args_of(doc)
             vars_ = {v.get("name"): v.get("value") for v in (doc.get("vars") or []) if isinstance(v, dict)}
             mpath = body.get("model_path") or vars_.get("PROFILE_MODEL") or args_.get("--model-path") or args_.get("--model")
             if not mpath:
-                return self._json({"ok": False, "error": "kein Modellpfad: das Profil nennt weder PROFILE_MODEL noch --model-path"}, 200)
+                return self._json({"ok": False, "error": "no model path: the profile names neither PROFILE_MODEL nor --model-path"}, 200)
             kv = args_.get("--kv-cache-dtype")
             mreq = {"path": str(mpath), "kv_dtype": kv if kv in ("auto", "fp8_e4m3") else None}
             draft_error = None
@@ -702,7 +708,7 @@ def make_handler(app: App):
                     try:
                         est = app.modellprofil.estimate(dict(mreq, draft_path=dpath))
                     except ValueError as exc:
-                        draft_error = "Draft-Verzeichnis %s nicht profiliert: %s" % (dpath, exc)
+                        draft_error = "Draft directory %s not profiled: %s" % (dpath, exc)
                         est = app.modellprofil.estimate(mreq)
                 else:
                     est = app.modellprofil.estimate(mreq)
@@ -719,7 +725,7 @@ def make_handler(app: App):
             """Profil-Editor S2: nur LAN.  ANZEIGEN (GET) gibt es in beiden Ausgaben; MESSEN und Fenster zurückgeben bucht GPU-Fenster und
             startet einen Messlauf: nur Rig-Ausgabe, in der Release-Ausgabe 403 mit Klartext (Auftrag 1984)."""
             if self._via_proxy():
-                return self._json({"ok": False, "error": "Hardwareprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
+                return self._json({"ok": False, "error": "Hardware profile only in the LAN (http://192.168.0.88:8890/)"}, 403)
             path = self.path.split("?", 1)[0]
             if method == "GET" and path == "/api/hwprofil":
                 return self._json(app.hwprofil.get())
@@ -734,13 +740,13 @@ def make_handler(app: App):
                 if app.edition == "release":
                     return self._json({"ok": False, "error": hwprofil.RELEASE_NO_MEASURE}, 403)
                 if n > 4096:
-                    raise ValueError("Body zu groß")
+                    raise ValueError("Body too large")
                 try:
                     req = json.loads(raw.decode() or "{}") if n else {}
                 except ValueError:
-                    raise ValueError('Body muss JSON sein: {"cards": [0, 1, 2]}')
+                    raise ValueError('Body must be JSON: {"cards": [0, 1, 2]}')
                 if not isinstance(req, dict):
-                    raise ValueError("Body muss ein JSON-Objekt sein")
+                    raise ValueError("Body must be a JSON object")
                 if path.endswith("/cancel"):
                     return self._json(app.hwprofil.cancel())
                 out = app.hwprofil.measure(req)
@@ -798,7 +804,7 @@ def make_handler(app: App):
                     q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
                     model = q.get("model", "27B")
                     if model not in history.MODELS:
-                        raise ValueError("model muss 27B oder NF sein")
+                        raise ValueError("model must be 27B or NF")
                     lo_hi = None
                     if q.get("from") and q.get("to"):
                         lo_hi = (float(q["from"]), float(q["to"]))     # a zoomed stretch (Klicken und Ziehen)
@@ -818,13 +824,13 @@ def make_handler(app: App):
                         try:
                             req = json.loads(raw)
                         except ValueError:
-                            raise ValueError("q= muss JSON sein: {profile, cards:[{card, pcie:{gen,lanes,rebar,chipset}}], host_patched}")
+                            raise ValueError("q= must be JSON: {profile, cards:[{card, pcie:{gen,lanes,rebar,chipset}}], host_patched}")
                         return self._json(app.kartenplaner.plan(req))
                     return self._send(404, "not found", "text/plain")
                 if path == "/api/modellprofil/modelle":
                     # welche Modellverzeichnisse unter den Wurzeln liegen (nur stat); wie das Schätzen nur im LAN (auch im Release: der Reiter Profil braucht es)
                     if self._via_proxy():
-                        return self._json({"ok": False, "error": "Modellprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
+                        return self._json({"ok": False, "error": "Model profile only in the LAN (http://192.168.0.88:8890/)"}, 403)
                     return self._json(app.modellprofil.models())
                 if path in DEV_STATIC_FILES and app.edition != "release":
                     name, ctype = DEV_STATIC_FILES[path]
@@ -842,7 +848,7 @@ def make_handler(app: App):
                                                  or path.startswith("/api/weg2/")):
                     return self._send(404, "not found", "text/plain")
                 if path in ("/weg2", "/weg2.html") and self._via_proxy():
-                    return self._send(403, "Startzeile nur im LAN: http://192.168.0.88:8890/weg2", "text/plain; charset=utf-8")
+                    return self._send(403, "Start line only in the LAN: http://192.168.0.88:8890/weg2", "text/plain; charset=utf-8")
                 if path in ("/weg2", "/weg2.html"):
                     with open(os.path.join(STATIC, "weg2.html"), "rb") as fh:
                         return self._send(200, fh.read(), "text/html; charset=utf-8")
@@ -882,13 +888,13 @@ def make_handler(app: App):
                 if path == "/api/modellprofil/schaetzen":
                     # PROFIL-EDITOR S3: Modellpfad -> flliper.model/1.  Liest config.json und Köpfe unter den Modellwurzeln: nur im LAN (auch im Release).
                     if self._via_proxy():
-                        return self._json({"ok": False, "error": "Modellprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
+                        return self._json({"ok": False, "error": "Model profile only in the LAN (http://192.168.0.88:8890/)"}, 403)
                     if n > MAX_POST_BODY:
-                        raise ValueError("Anfrage zu groß (%d Byte, höchstens %d)" % (n, MAX_POST_BODY))
+                        raise ValueError("Request too large (%d bytes, at most %d)" % (n, MAX_POST_BODY))
                     try:
                         req = json.loads(raw.decode("utf-8") or "null")
                     except (ValueError, UnicodeDecodeError):
-                        raise ValueError("Körper muss JSON sein: {path, draft_path?, kv_dtype?, mamba_ssm_dtype?, gguf_file?, registry?}")
+                        raise ValueError("Body must be JSON: {path, draft_path?, kv_dtype?, mamba_ssm_dtype?, gguf_file?, registry?}")
                     return self._json(app.modellprofil.estimate(req))
                 if path.startswith("/api/hwprofil/"):
                     return self._hwprofil("POST", n, raw)
@@ -920,45 +926,39 @@ def main(argv=None):
                     help="weg2 front base URL to read /weg2/state from (repeatable)")
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
     ap.add_argument("--vm-url", default=os.environ.get("RIGDASH_VM_URL", vmpush.DEFAULT_URL),
-                    help="VictoriaMetrics (PromQL lesen; der Probennehmer schreibt die IPC dorthin); '' = aus")
+                    help="VictoriaMetrics (read PromQL; the sampler writes the IPC there); '' = off")
     ap.add_argument("--sampler", choices=("prozess", "thread"), default=None,
                     help="prozess = the readings in their own process (default with --state-dir); thread = in this one")
     ap.add_argument("--state-dir", default="", help="keeps the card history and history.sqlite (the panels' days)")
     ap.add_argument("--image-changes", default=imagechanges.DEFAULT_PATH,
                     help="the operator's per-image change list (rev -> fixes, expected gain, metal status)")
     ap.add_argument("--features", default=features.DEFAULT_PATH,
-                    help="the feature list (built / in image / active / gain; im Image and aktiv are computed here)")
+                    help="the feature list (built / in image / active / gain; in image and active are computed here)")
     ap.add_argument("--profil-tree", default=os.environ.get("RIGDASH_PROFIL_TREE"),
-                    help="Auftrag 1984: Planer-Baum (<baum>/python) für den Profil-Editor: profile_json/refusals/profile_catalog, model_profile, "
-                         "hardware_profile UND der Kopplungs-Worker (PYTHONPATH). Voller python/sglang der Python-Release-Revision "
-                         "(deploy/stage_profil_modules.sh); ohne Angabe: KARTENPLAN_TREE bzw. /opt/rigdash/kartenplan/current. "
-                         "--hw-tree überstimmt ihn nur für das Hardwareprofil")
+                    help="Order 1984: planner tree (<tree>/python) for the profile editor: profile_json/refusals/profile_catalog, model_profile, hardware_profile AND the couplings worker (PYTHONPATH). Full python/sglang of the Python release revision (deploy/stage_profil_modules.sh); if omitted: KARTENPLAN_TREE or /opt/rigdash/kartenplan/current. --hw-tree overrides it only for the hardware profile")
     ap.add_argument("--hw-tree", default=os.environ.get("HWPROFIL_TREE"),
-                    help="Planer-Baum (<baum>/python) mit sglang/srt/rigmon/hardware_profile.py: Hardwareprofil lesen (Auftrag 950)")
+                    help="Planner tree (<tree>/python) with sglang/srt/rigmon/hardware_profile.py: read the hardware profile (order 950)")
     ap.add_argument("--hw-profile-file", default=hwprofil.default_persist_path(),
-                    help="AP-A: Datei, in der das Hardwareprofil beim ersten Start gespeichert wird (Env FLLIPER_HARDWARE_PROFILE; "
-                         "Voreinstellung /var/lib/flliper/hardware.json, Rig und Release gleich); Neu erfassen ersetzt sie")
+                    help="AP-A: file in which the hardware profile is saved at the first start (env FLLIPER_HARDWARE_PROFILE; default /var/lib/flliper/hardware.json, rig and release alike); Capture again replaces it")
     ap.add_argument("--hw-measure-tree", default=os.environ.get("HWPROFIL_MEASURE_TREE"),
-                    help="voller sglang-Baum (<baum>/python) für den Messlauf; leer = --hw-tree (dann muss card_probe darin liegen)")
+                    help="full sglang tree (<tree>/python) for the measuring run; empty = --hw-tree (then card_probe must be in it)")
     ap.add_argument("--couplings-python", default=os.environ.get("RIGDASH_COUPLINGS_PYTHON"),
-                    help="Profil-Editor S4b: Python der sglang-Umgebung für den Kopplungs-Worker (Standard /spinning/htsglang-gpu/.venv/bin/python)")
+                    help="Profile editor S4b: Python of the sglang environment for the couplings worker (default /spinning/htsglang-gpu/.venv/bin/python)")
     ap.add_argument("--oracle-prefix", default=os.environ.get("RIGDASH_ORACLE_PREFIX", "auto"),
-                    help="Befehlspräfix des Orakel-Kindprozesses (Launcher-Trockenlauf, Spitze 1,75 GiB RSS gemessen): 'auto' = systemd-run --scope -q -p "
-                         "MemoryMax=4G (eigener cgroup-Rahmen ausserhalb der Unit), 'none' = ohne, sonst der Befehl selbst")
+                    help="Command prefix of the oracle child process (launcher dry run, peak 1.75 GiB RSS measured): 'auto' = systemd-run --scope -q -p MemoryMax=4G (own cgroup frame outside the unit), 'none' = without, otherwise the command itself")
     ap.add_argument("--hw-python", default=os.environ.get("HWPROFIL_PYTHON"),
-                    help="Interpreter mit torch + sgl_kernel für den Messlauf (Kindprozess, außerhalb dieses Prozesses)")
+                    help="Interpreter with torch + sgl_kernel for the measuring run (child process, outside this process)")
     ap.add_argument("--hw-prefix", default=os.environ.get("HWPROFIL_PREFIX", ""),
-                    help="Befehlspräfix des Messlaufs, z. B. 'systemd-run --scope -q -p MemoryMax=6G' (eigener cgroup-Rahmen)")
+                    help="Command prefix of the measuring run, e.g. 'systemd-run --scope -q -p MemoryMax=6G' (own cgroup frame)")
     ap.add_argument("--features-repo", default=features.DEFAULT_REPO,
                     help="git repo holding the image revs and feature commits")
     ap.add_argument("--profiles-release-dir", default=os.environ.get("RIGDASH_PROFILES_RELEASE_DIR", profil.DEFAULT_RELEASE_DIR),
-                    help="the release profiles (<name>.env) the Profil editor can load")
+                    help="the release profiles (<name>.env) the profile editor can load")
     ap.add_argument("--profile-dir", default=profil.DEFAULT_USER_DIR,
-                    help="where the Profil editor keeps user profiles (JSON): ONE place for the dashboard and the container entrypoint, "
+                    help="where the profile editor keeps user profiles (JSON): ONE place for the dashboard and the container entrypoint, "
                          "env FLLIPER_PROFILES_DIR, default /var/lib/flliper/profiles")
     ap.add_argument("--model-root", action="append", default=[],
-                    help="Verzeichnis, unter dem Modelle liegen dürfen (Modellprofil schätzen; wiederholbar; env RIGDASH_MODEL_ROOTS; "
-                         "Standard: der Modell-Cache des Rigs)")
+                    help="directory under which models may lie (estimate model profile; repeatable; env RIGDASH_MODEL_ROOTS; default: the model cache of the rig)")
     ap.add_argument("--release-profile", action="append", default=[],
                     help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
     ap.add_argument("--edition", choices=EDITIONS, default=os.environ.get("RIGDASH_EDITION", "rig"),
@@ -966,14 +966,12 @@ def main(argv=None):
                          "release = the published fLLiper edition: speed, efficiency, statistics only "
                          "(env RIGDASH_EDITION)")
     ap.add_argument("--editor-only", action="store_true", default=os.environ.get("RIGDASH_EDITOR_ONLY") == "1",
-                    help="Auftrag 1995 (Docker-Image): nur der Profil-Editor -- kein Probennehmer, keine Messquellen, /api/live und alle uebrigen "
-                         "Routen 404, die Seite zeigt nur den Reiter Profil; nur mit --edition release (env RIGDASH_EDITOR_ONLY=1)")
+                    help="Order 1995 (Docker image): only the profile editor -- no sampler, no measurement sources, /api/live and all other routes 404, the page shows only the Profile tab; only with --edition release (env RIGDASH_EDITOR_ONLY=1)")
     ap.add_argument("--trust-proxy", action="store_true", default=os.environ.get("RIGDASH_TRUST_PROXY") == "1",
-                    help="Auftrag 1995: der Betreiber sitzt selbst hinter einem Reverse-Proxy (X-Forwarded-*): der Editor antwortet dann auch darueber "
-                         "statt 403. Kein Zugriffsschutz -- der Proxy muss anmelden. Nur mit --edition release (env RIGDASH_TRUST_PROXY=1)")
+                    help="Order 1995: the operator sits behind a reverse proxy (X-Forwarded-*) themselves: the editor then answers through it too instead of 403. No access protection -- the proxy must authenticate. Only with --edition release (env RIGDASH_TRUST_PROXY=1)")
     args = ap.parse_args(argv)
     if (args.editor_only or args.trust_proxy) and args.edition != "release":
-        ap.error("--editor-only und --trust-proxy gibt es nur mit --edition release (die Rig-Ausgabe bleibt LAN-only mit ihrem Proxy-Riegel)")
+        ap.error("--editor-only and --trust-proxy exist only with --edition release (the rig edition stays LAN-only with its proxy bar)")
     app = App(args)
     app.start()
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(app))

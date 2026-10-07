@@ -55,18 +55,18 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 SCHEMA = "flliper.server.single/1"
 FORM = "einzelkarte"
-VERDICT_ART = "Planer-Rechnung"
+VERDICT_ART = "Planner calculation"
 MIB = float(1 << 20)
 
 # --- Herkunft / Zustand / Verdikt (Vokabular) ---------------------------------------------------------------
-H_MODEL = "Modellprofil"
-H_CARD = "Kartenprofil"
-H_GOAL = "Ziel"
-H_RULE = "Planer-Rechnung"
-H_DOC = "Doku"
-H_DEFAULT = "ServerArgs-Standard"
-H_OVERRIDE = "übersteuert"
-H_UNKNOWN = "unbelegt"
+H_MODEL = "Model profile"
+H_CARD = "Card profile"
+H_GOAL = "Goal"
+H_RULE = "Planner calculation"
+H_DOC = "Docs"
+H_DEFAULT = "ServerArgs default"
+H_OVERRIDE = "overridden"
+H_UNKNOWN = "unverified"
 
 Z_PROPOSED = "vorgeschlagen"
 Z_OVERRIDDEN = "übersteuert"
@@ -203,12 +203,12 @@ def pre_load_free(card: Mapping[str, Any], goals: Mapping[str, Any]) -> Tuple[fl
     if given is not None:
         pre = float(given)
         if pre <= 0 or pre > total:
-            raise ProposeSingleError("pre_load_free_mib %s muss in (0, Karte %.0f MiB] liegen" % (given, total))
+            raise ProposeSingleError("pre_load_free_mib %s must lie in (0, card %.0f MiB]" % (given, total))
         return pre, total - pre, "%s (pre_load_free_mib)" % H_GOAL, False
     pre = total - CONTEXT_OVERHEAD_DEFAULT_MIB
     if pre <= 0:
-        raise ProposeSingleError("Karte %.0f MiB kleiner als der Kontext/Treiber-Standard %.0f MiB" % (total, CONTEXT_OVERHEAD_DEFAULT_MIB))
-    return pre, CONTEXT_OVERHEAD_DEFAULT_MIB, "unbelegt (Messung am Launcher-Format, launcher.py:253; am Einzelserver nicht gemessen)", True
+        raise ProposeSingleError("Card %.0f MiB smaller than the context/driver default %.0f MiB" % (total, CONTEXT_OVERHEAD_DEFAULT_MIB))
+    return pre, CONTEXT_OVERHEAD_DEFAULT_MIB, "unverified (measurement in the launcher format, launcher.py:253; not measured on the single server)", True
 
 
 # ===========================================================================
@@ -225,15 +225,15 @@ def normalize_card(card: Mapping[str, Any]) -> Dict[str, Any]:
     * ``platform``   ``cuda`` (Standard) oder ``rocm``: ohne CUDA entfaellt der Prefill-Graph-Posten der Reserve
       (``model_executor/cuda_graph_config.py``: ``default_prefill_backend`` ist nur auf CUDA ``breakable``)."""
     if not isinstance(card, Mapping):
-        raise ProposeSingleError("Karte ist kein Dict")
+        raise ProposeSingleError("Card is not a dict")
     total = card.get("total_mib")
     src = card.get("total_src") or H_CARD
     if total is None and isinstance(card.get("vram_total_mib"), Mapping):  # flliper.hardware/1
         node = card["vram_total_mib"]
-        total, src = node.get("v"), "Kartenprofil (%s)" % node.get("src", "?")
+        total, src = node.get("v"), "Card profile (%s)" % node.get("src", "?")
     usable = card.get("usable_mib")
     if total is None and usable is None:
-        raise ProposeSingleError("Karte ohne Speichergroesse (total_mib / vram_total_mib)")
+        raise ProposeSingleError("Card without memory size (total_mib / vram_total_mib)")
     total = float(total if total is not None else usable)
     usable = float(usable) if usable is not None else total
     bw = card.get("bandwidth_gbs")
@@ -252,7 +252,7 @@ def card_from_hardware(profile: Mapping[str, Any], ordinal: int = 0) -> Dict[str
             return normalize_card(c)
     if 0 <= ordinal < len(cards):
         return normalize_card(cards[ordinal])
-    raise ProposeSingleError("Hardwareprofil hat keine Karte %d (hat %d)" % (ordinal, len(cards)))
+    raise ProposeSingleError("Hardware profile has no card %d (has %d)" % (ordinal, len(cards)))
 
 
 def _n(profile: Mapping[str, Any], path: str) -> Optional[Mapping[str, Any]]:
@@ -275,11 +275,11 @@ def _src(profile: Mapping[str, Any], path: str) -> str:
 
 
 def model_facts(profile: Mapping[str, Any], draft_profile: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """Die Zahlen aus ``flliper.model/1`` (und einem optionalen getrennten Draft-Profil, ``model_profile.estimate_draft``), die die Rechnung braucht."""
+    """Die Zahlen aus ``flliper.model/1`` (und einem optionalen getrennten Draft profile, ``model_profile.estimate_draft``), die die Rechnung braucht."""
     unb: List[str] = []
     total = _val(profile, "weights.total_bytes")
     if total is None:
-        raise ProposeSingleError("Modellprofil ohne weights.total_bytes")
+        raise ProposeSingleError("Model profile without weights.total_bytes")
     counts = _val(profile, "arch.layer_counts", {}) or {}
     n_attn = int(_val(profile, "kv.attn_layers", counts.get("attn", 0)) or 0)
     n_lin = int((_val(profile, "state.linear_layers", 0)) or 0)
@@ -289,10 +289,10 @@ def model_facts(profile: Mapping[str, Any], draft_profile: Optional[Mapping[str,
         if c is not None:
             cell[key] = float(c)
     if n_attn and not cell:
-        unb.append("KV-Zelle fehlt im Modellprofil (kv.variants)")
+        unb.append("KV cell is missing in the model profile (kv.variants)")
     per_req = _val(profile, "state.per_request_bytes")
     if n_lin and per_req is None:
-        unb.append("Mamba-Zustand je Slot fehlt im Modellprofil (state.per_request_bytes)")
+        unb.append("Mamba state per slot is missing in the model profile (state.per_request_bytes)")
     mtp_layers = int(_val(profile, "draft.mtp_layers", 0) or 0)
     mtp_bytes = float(_val(profile, "weights.mtp_bytes", 0) or 0)
     mtp_found = bool(_val(profile, "draft.mtp_tensors_found", False)) or mtp_bytes > 0
@@ -309,7 +309,7 @@ def model_facts(profile: Mapping[str, Any], draft_profile: Optional[Mapping[str,
         ext["window"] = int(sl["window_tokens"]["v"]) if sl and sl.get("window_tokens") else None
         ext["window_layers"] = int(sl["layers"]["v"]) if sl and sl.get("layers") else None
         if tb is None:
-            unb.append("Draft-Profil ohne total_bytes")
+            unb.append("Draft profile without total_bytes")
     kvs = (profile.get("kv") or {}).get("sliding")
     return {
         "path": profile.get("path"), "id": profile.get("id"), "format": _val(profile, "format"),
@@ -334,13 +334,13 @@ def model_facts(profile: Mapping[str, Any], draft_profile: Optional[Mapping[str,
 def _cell_for(F: Mapping[str, Any], dtype: str) -> Tuple[Optional[float], str]:
     """KV-Zelle je Attention-Layer und Token fuer ``--kv-cache-dtype``; ``(None, Grund)`` wenn nicht belegt."""
     if dtype in ("auto",):
-        return F["cell"].get("auto"), "auto = Modell-Dtype"
+        return F["cell"].get("auto"), "auto = model dtype"
     if dtype in ("fp8_e4m3", "fp8_e5m2"):
         # fp8_e5m2 hat dieselbe Bytezahl; ob e4m3 den Skalenpuffer anders traegt als e5m2, ist im Profil nicht getrennt (unbelegt) -> e4m3-Zelle.
-        return F["cell"].get("fp8_e4m3"), "fp8 (1 B + Skalenpuffer)" + ("; e5m2 = e4m3-Zelle (unbelegt)" if dtype == "fp8_e5m2" else "")
+        return F["cell"].get("fp8_e4m3"), "fp8 (1 B + scale buffer)" + ("; e5m2 = e4m3 cell (unverified)" if dtype == "fp8_e5m2" else "")
     if dtype in ("bf16", "bfloat16"):
-        return F["cell"].get("auto"), "bf16 = auto-Zelle, gilt nur, wenn der Modell-Dtype bf16 ist (unbelegt, sonst)"
-    return None, "kv_dtype %s: Zelle nicht im Modellprofil (unbelegt)" % dtype
+        return F["cell"].get("auto"), "bf16 = auto cell, applies only if the model dtype is bf16 (unverified, otherwise)"
+    return None, "kv_dtype %s: cell not in the model profile (unverified)" % dtype
 
 
 def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any], goals: Mapping[str, Any]) -> Dict[str, Any]:
@@ -357,23 +357,23 @@ def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any],
         return mib
 
     w_main_b = F["total_bytes"] - F["mtp_bytes"] - (F["visual_bytes"] if v.get("no_vision") else 0.0)
-    w_main = add("Gewichte (Hauptmodell)", w_main_b, F["src"]["total"],
-                 "Summe aller Tensoren - mtp (der Ziel-Lader ueberspringt 'mtp', models/qwen3_5.py:2127-2129)"
-                 + (" - Sichttuerm (--no-enable-multimodal, server_args.py:1061-1076)" if v.get("no_vision") else ""))
+    w_main = add("Weights (main model)", w_main_b, F["src"]["total"],
+                 "Sum of all tensors - mtp (the target loader skips 'mtp', models/qwen3_5.py:2127-2129)"
+                 + (" - vision tower (--no-enable-multimodal, server_args.py:1061-1076)" if v.get("no_vision") else ""))
     spec = v.get("spec_algo")
     draft_kind = None
     w_draft = kv_draft = 0.0
     if spec and str(spec).upper() == "NEXTN":
         draft_kind = "nextn"
-        w_draft = add("Gewichte (Draft: MTP-Kopf)", F["mtp_bytes"], F["src"]["mtp"], "mtp-Tensoren des Checkpoints (Index)")
+        w_draft = add("Weights (draft: MTP head)", F["mtp_bytes"], F["src"]["mtp"], "mtp tensors of the checkpoint (index)")
     elif spec:
         draft_kind = "external"
         e = F["ext"]
         if e and e.get("total_bytes") is not None:
-            w_draft = add("Gewichte (Draft: %s)" % e.get("kind"), e["total_bytes"], "%s (%s)" % (H_MODEL, "Draft-Profil"),
-                          "Gesamtbytes des Draft-Verzeichnisses; Teilen von Einbettung/lm_head mit dem Ziel ist im einzelnen Server unbelegt (obere Schranke)")
+            w_draft = add("Weights (draft: %s)" % e.get("kind"), e["total_bytes"], "%s (%s)" % (H_MODEL, "Draft profile"),
+                          "Total bytes of the draft directory; sharing of embedding/lm_head with the goal is unverified in the single server (upper bound)")
         else:
-            unb.append("Draft %r ohne Draft-Profil: Gewichte nicht gerechnet" % spec)
+            unb.append("Draft %r without draft profile: weights not calculated" % spec)
 
     kv_tokens = int(v.get("kv_tokens") or 0)
     dtype = str(v.get("kv_dtype") or "auto")
@@ -385,51 +385,51 @@ def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any],
             unb.append(cell_note)
         else:
             kv_bpt_main = cell * F["n_attn"]
-            kv_main = add("KV-Pool (Hauptmodell)", kv_bpt_main * kv_tokens, F["src"]["cell"],
-                          "%d Token x %d Attention-Layer x %.0f B (%s)" % (kv_tokens, F["n_attn"], cell, cell_note))
+            kv_main = add("KV pool (main model)", kv_bpt_main * kv_tokens, F["src"]["cell"],
+                          "%d tokens x %d attention layers x %.0f B (%s)" % (kv_tokens, F["n_attn"], cell, cell_note))
             kv_bpt += kv_bpt_main
             if F["kv_sliding"]:
-                hinweise.append("Gleitfenster-Layer des Hauptmodells sind NICHT abgezogen (obere Schranke)")
+                hinweise.append("Sliding-window layers of the main model are NOT deducted (upper bound)")
     if draft_kind == "nextn" and cell is not None:
         per_tok = cell * F["mtp_layers"]
-        kv_draft = add("KV-Pool (Draft: MTP)", per_tok * kv_tokens, F["src"]["cell"],
-                       "%d Token x %d MTP-Layer x %.0f B (MTP-Layer = volle Attention-Schicht, model_profile.estimate_draft)" % (kv_tokens, F["mtp_layers"], cell))
+        kv_draft = add("KV pool (draft: MTP)", per_tok * kv_tokens, F["src"]["cell"],
+                       "%d tokens x %d MTP layers x %.0f B (MTP layer = full attention layer, model_profile.estimate_draft)" % (kv_tokens, F["mtp_layers"], cell))
         kv_bpt += per_tok
     elif draft_kind == "external" and F["ext"] and F["ext"].get("cell"):
         e = F["ext"]
         ec = e["cell"].get("fp8_e4m3" if dtype.startswith("fp8") else "auto")
         if ec is not None and e.get("n_attn"):
             tok = kv_tokens
-            note = "%d Token" % kv_tokens
+            note = "%d tokens" % kv_tokens
             if e.get("window") and e.get("window_layers") == e.get("n_attn"):
                 tok = min(kv_tokens, int(e["window"]))
-                note = "min(%d Token, Gleitfenster %d)" % (kv_tokens, e["window"])
-            kv_draft = add("KV-Pool (Draft: %s)" % e.get("kind"), ec * e["n_attn"] * tok, "%s (Draft-Profil)" % H_MODEL,
+                note = "min(%d tokens, sliding window %d)" % (kv_tokens, e["window"])
+            kv_draft = add("KV pool (draft: %s)" % e.get("kind"), ec * e["n_attn"] * tok, "%s (Draft profile)" % H_MODEL,
                            "%s x %d Layer x %.0f B" % (note, e["n_attn"], ec))
             if tok == kv_tokens:
                 kv_bpt += ec * e["n_attn"]
         else:
-            unb.append("Draft-KV-Zelle nicht im Draft-Profil")
+            unb.append("Draft KV cell not in the draft profile")
 
     slots = int(v.get("slots") or 0)
     mamba_main = mamba_spec = 0.0
     seats = int(v.get("seats") or 1)
     floor_slots = (MAMBA_SLOTS_PER_REQ_NO_RADIX if goals.get("disable_radix") else MAMBA_SLOTS_PER_REQ_RADIX) * seats
     if F["n_lin"] and F["per_req"] is not None:
-        mamba_main = add("Mamba-Zustandspool", F["per_req"] * slots, F["src"]["state"],
-                         "%d Slots x %.2f MiB (conv + ssm aller %d Linear-Layer, ein Slot)" % (slots, F["per_req"] / MIB, F["n_lin"]))
+        mamba_main = add("Mamba state pool", F["per_req"] * slots, F["src"]["state"],
+                         "%d slots x %.2f MiB (conv + ssm of all %d linear layers, one slot)" % (slots, F["per_req"] / MIB, F["n_lin"]))
         if draft_kind:
             D = int(v.get("spec_draft_tokens") or v.get("spec_block") or 0)
             ratio = MAMBA_SLOTS_PER_REQ_NO_RADIX if goals.get("disable_radix") else MAMBA_SLOTS_PER_REQ_RADIX
             capped = min(seats, slots // ratio) if ratio else seats
-            mamba_spec = add("Mamba-Zwischenzustaende (Spekulation)", F["per_req"] * capped * D, F["src"]["state"],
-                             "min(max-running-requests %d, Slots/%d) x %d Draft-Token x %.2f MiB (model_runner_kv_cache_mixin.py:2736-2745)" % (seats, ratio, D, F["per_req"] / MIB))
+            mamba_spec = add("Mamba intermediate states (speculation)", F["per_req"] * capped * D, F["src"]["state"],
+                             "min(max-running-requests %d, slots/%d) x %d draft tokens x %.2f MiB (model_runner_kv_cache_mixin.py:2736-2745)" % (seats, ratio, D, F["per_req"] / MIB))
 
     host = 0.0
     host_mib = goals.get("host_ram_mib")
     if card["unified"] and v.get("hicache") and host_mib:
-        host = add("HiCache-Hostpool (gleicher Speicher)", float(host_mib) * MIB, H_GOAL,
-                   "APU: Geraet und Host teilen den Speicher; das Host-Budget des Ziels zaehlt gegen die adressierbare Decke")
+        host = add("HiCache host pool (same memory)", float(host_mib) * MIB, H_GOAL,
+                   "APU: device and host share the memory; the host budget of the goal counts against the addressable ceiling")
 
     static_sum = w_main + w_draft + kv_main + kv_draft + mamba_main + mamba_spec
     # Reserve und statisches Budget (server_args.py:14538-14541: fraction = (gpu_mem - reserved) / gpu_mem)
@@ -443,51 +443,50 @@ def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any],
     reserve_src = H_GOAL
     if reserve_need is None:
         reserve_need = reserve_mib(total, cps, int(v.get("max_bs") or 1), len(prefill_graph_sizes(max(pf_max, 0))), cuda=card["platform"] == "cuda")
-        reserve_src = "ServerArgs-Heuristik (server_args.py:14509-14536)"
+        reserve_src = "ServerArgs heuristic (server_args.py:14509-14536)"
     fraction = v.get("fraction")
     # Statisches Budget wie die Runtime es rechnet: fraction x freier Speicher VOR dem Laden (nicht x Karte); Kontext + Treiber liegen davor.
     pre, overhead, overhead_src, overhead_default = pre_load_free(card, goals)
-    add("CUDA-Kontext + Treiber (vor dem Laden belegt, nicht im statischen Budget)", overhead * MIB, overhead_src,
-        "Karte %.0f MiB - freier Speicher vor dem Laden %.0f MiB (model_runner.py:2301 pre_model_load_memory); mindert das Budget, nicht die Reserve" % (total, pre))
+    add("CUDA context + driver (occupied before loading, not in the static budget)", overhead * MIB, overhead_src,
+        "Card %.0f MiB - free memory before loading %.0f MiB (model_runner.py:2301 pre_model_load_memory); reduces the budget, not the reserve" % (total, pre))
     budget = float(fraction) * pre if fraction is not None else None
     # APU: das Hostpool liegt im selben Speicher und verengt den Bruchteil (_plan_values); es ist KEINE Reserve.
     reserve_given = (pre - budget - host) if budget is not None else None
     checks: List[Dict[str, Any]] = []
     if budget is None:
         checks.append({"code": "FIT-RESERVE", "ok": False,
-                       "text": "Reserve %.0f MiB (%s) laesst keinen Bruchteil des freien Speichers %.0f MiB (Karte %.0f MiB - Kontext/Treiber %.0f MiB) fuer --mem-fraction-static" % (reserve_need, reserve_src, pre, total, overhead)})
+                       "text": "Reserve %.0f MiB (%s) leaves no fraction of the free memory %.0f MiB (card %.0f MiB - context/driver %.0f MiB) for --mem-fraction-static" % (reserve_need, reserve_src, pre, total, overhead)})
     else:
         ok_static = static_sum <= budget + 1e-6
         checks.append({"code": "FIT-STATIC", "ok": ok_static,
-                       "text": ("Gewichte + Draft + KV + Mamba %.0f MiB %s statisches Budget %.0f MiB (= --mem-fraction-static %.3f x freier Speicher vor dem Laden %.0f MiB = Karte %.0f - Kontext/Treiber %.0f)%s"
+                       "text": ("Weights + draft + KV + Mamba %.0f MiB %s static budget %.0f MiB (= --mem-fraction-static %.3f x free memory before loading %.0f MiB = card %.0f - context/driver %.0f)%s"
                                 % (static_sum, "<=" if ok_static else ">", budget, fraction, pre, total, overhead,
-                                   "" if ok_static else "; es fehlen %.0f MiB" % (static_sum - budget)))})
+                                   "" if ok_static else "; %.0f MiB are missing" % (static_sum - budget)))})
         ok_res = reserve_given + 1e-6 >= reserve_need
         checks.append({"code": "FIT-RESERVE", "ok": ok_res,
-                       "text": ("Reserve %.0f MiB (= (1 - fraction) x freier Speicher%s) %s Bedarf %.0f MiB (%s)" % (reserve_given, " - Hostpool" if host else "", ">=" if ok_res else "<", reserve_need, reserve_src))})
+                       "text": ("Reserve %.0f MiB (= (1 - fraction) x free memory%s) %s need %.0f MiB (%s)" % (reserve_given, " - host pool" if host else "", ">=" if ok_res else "<", reserve_need, reserve_src))})
         usable_eff = usable - overhead - host
         if usable < total or host:
             ok_card = budget <= usable_eff + 1e-6
             checks.append({"code": "FIT-CARD", "ok": ok_card,
-                           "text": "statisches Budget %.0f MiB %s adressierbare Decke %.0f MiB%s" % (
-                               budget, "<=" if ok_card else ">", usable_eff, " (abzueglich Kontext/Treiber %.0f MiB%s)" % (overhead, ", Hostpool %.0f MiB" % host if host else ""))})
+                           "text": "static budget %.0f MiB %s addressable ceiling %.0f MiB%s" % (
+                               budget, "<=" if ok_card else ">", usable_eff, " (minus context/driver %.0f MiB%s)" % (overhead, ", host pool %.0f MiB" % host if host else ""))})
     if v.get("context") and kv_tokens:
         ok_ctx = int(v["context"]) <= kv_tokens
-        checks.append({"code": "FIT-CTX", "ok": ok_ctx, "text": "Kontext %d Token %s KV-Pool %d Token" % (int(v["context"]), "<=" if ok_ctx else ">", kv_tokens)})
+        checks.append({"code": "FIT-CTX", "ok": ok_ctx, "text": "Context %d tokens %s KV pool %d tokens" % (int(v["context"]), "<=" if ok_ctx else ">", kv_tokens)})
     if F["n_lin"]:
         ok_floor = slots >= floor_slots
         checks.append({"code": "MAMBA-FLOOR", "ok": ok_floor,
-                       "text": "Mamba-Slots %d %s Untergrenze %d (%d Anfragen x %d Slots; mamba_pool_floor.py:264)" % (
+                       "text": "Mamba slots %d %s lower bound %d (%d requests x %d slots; mamba_pool_floor.py:264)" % (
                            slots, ">=" if ok_floor else "<", floor_slots, seats, floor_slots // max(seats, 1))})
     if v.get("context") and F["maxpos"] and int(v["context"]) > F["maxpos"]:
-        hinweise.append("Kontext %d liegt ueber max_position_embeddings %d des Modells: Rope-Erweiterung ist nicht belegt" % (int(v["context"]), F["maxpos"]))
+        hinweise.append("Context %d is above max_position_embeddings %d of the model: rope extension is unverified" % (int(v["context"]), F["maxpos"]))
     if F["family"] == "moe":
-        hinweise.append("MoE im einzelnen Server: alle Experten muessen auf der Karte liegen (kein Experten-Offload in dieser Form); Teilauslagerung ist Sache des weg2-Launchers (N>=2)")
+        hinweise.append("MoE in the single server: all experts must be on the card (no expert offload in this form); partial offloading is a matter for the weg2 launcher (N>=2)")
     if overhead_default:
-        hinweise.append("Kontext + Treiber %.0f MiB sind der Standardwert (am Einzelserver unbelegt): das statische Budget ist fraction x (Karte - Kontext/Treiber); "
-                        "gemessenes pre_model_load_memory als goals['pre_load_free_mib'] setzen" % overhead)
+        hinweise.append("Context + driver %.0f MiB are the default value (unverified on the single server): the static budget is fraction x (card - context/driver); set the measured pre_model_load_memory as goals['pre_load_free_mib']" % overhead)
     if card["unified"]:
-        hinweise.append("APU: Geraet und Host teilen den Speicher; torch-Gesamtspeicher der APU ist hier = adressierbare Decke angenommen (unbelegt am Rig)")
+        hinweise.append("APU: device and host share the memory; torch total memory of the APU is assumed here = addressable ceiling (unverified on the rig)")
     out = {"passt": all(c["ok"] for c in checks) and not unb, "posten": posten, "statisch_summe_mib": round(static_sum, 1),
            "statisch_budget_mib": round(budget, 1) if budget is not None else None,
            "reserve_bedarf_mib": round(reserve_need, 1), "reserve_herkunft": reserve_src,
@@ -513,10 +512,10 @@ def _defaults_goals(goals: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
          "chunked_prefill_size": None, "reserve_mib": None, "disable_radix": False, "pre_load_free_mib": None}
     for k, val in (goals or {}).items():
         if k not in g:
-            raise ProposeSingleError("unbekanntes Ziel %r (bekannt: %s)" % (k, ", ".join(sorted(g))))
+            raise ProposeSingleError("unknown goal %r (known: %s)" % (k, ", ".join(sorted(g))))
         g[k] = val
     if int(g["seats"]) < 1:
-        raise ProposeSingleError("seats muss >= 1 sein")
+        raise ProposeSingleError("seats must be >= 1")
     return g
 
 
@@ -550,7 +549,7 @@ def _plan_values(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str, 
         reserve = reserve_mib(total, cps, v["max_bs"], len(prefill_graph_sizes(min(cps, ctx, kv_goal))), cuda=card["platform"] == "cuda")
     host_unified = float(host) if (card["unified"] and hicache) else 0.0
     # Die Runtime wendet den Bruchteil auf den freien Speicher VOR dem Laden an (pre_model_load_memory, model_runner_kv_cache_mixin.py:959-962), nicht auf
-    # die Karte: Budget = f x pre, Reserve (Slack) = pre x (1 - f).  Gewollt: Budget = Decke - Kontext/Treiber - Hostpool - Reserve.
+    # die Karte: Budget = f x pre, Reserve (Slack) = pre x (1 - f).  Gewollt: Budget = Decke - Kontext/Treiber - host pool - Reserve.
     f = _floor3(min(0.99, (usable - overhead - host_unified - reserve) / pre)) if pre > 0 else 0.0
     v["fraction"] = f if f > 0 else None
     return v, {"reserve": reserve, "pre": pre, "overhead": overhead, "ctx": ctx, "kv_goal": kv_goal, "page": page, "host_unified": host_unified}
@@ -599,11 +598,11 @@ def derive(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str, Any]) 
         if acc["passt"]:
             break
         if dtype_goal is None and dtype == "auto" and F["cell"].get("fp8_e4m3") is not None:
-            relax.append({"schritt": "KV-Dtype fp8_e4m3", "grund": "mit Modell-Dtype fehlen %.0f MiB (KV %.0f MiB)" % (acc.get("fehlt_mib", 0.0), acc["_numbers"]["kv_main"])})
+            relax.append({"schritt": "KV dtype fp8_e4m3", "grund": "with the model dtype %.0f MiB are missing (KV %.0f MiB)" % (acc.get("fehlt_mib", 0.0), acc["_numbers"]["kv_main"])})
             dtype = "fp8_e4m3"
             continue
         if draft is not None and draft_goal == "auto":
-            relax.append({"schritt": "Draft weggelassen", "grund": "es fehlen %.0f MiB; der Draft kostet %.0f MiB Gewichte + %.0f MiB KV + %.0f MiB Spekulationszustand"
+            relax.append({"schritt": "Draft omitted", "grund": "%.0f MiB are missing; the draft costs %.0f MiB of weights + %.0f MiB KV + %.0f MiB speculation state"
                           % (acc.get("fehlt_mib", 0.0), acc["_numbers"]["w_draft"], acc["_numbers"]["kv_draft"], acc["_numbers"]["mamba_spec"])})
             draft = None
             continue
@@ -619,7 +618,7 @@ def derive(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str, Any]) 
             v["hicache"] = False
             v["page_size"] = None
             v["hicache_ratio"] = None
-            aux = dict(aux, hicache_skipped="Host-Budget %.0f MiB = %.3f x KV-Pool %.0f MiB < %.2f" % (host, ratio, kv_main_mib, HICACHE_MIN_RATIO))
+            aux = dict(aux, hicache_skipped="Host budget %.0f MiB = %.3f x KV pool %.0f MiB < %.2f" % (host, ratio, kv_main_mib, HICACHE_MIN_RATIO))
         else:
             v["hicache_ratio"] = ratio
             aux = dict(aux, host_kv_mib=round(ratio * kv_main_mib, 1), kv_main_mib=round(kv_main_mib, 1))
@@ -666,74 +665,73 @@ def build_entries(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str,
     fit_code = "+".join(sorted(failing)) if failing else None
     fit_grund = " | ".join(failing.values()) if failing else ("; ".join(acc["unbelegt"]) if acc["unbelegt"] else "")
     out: Dict[str, Dict[str, Any]] = {}
-    out["--model-path"] = _entry("--model-path", v["model_path"], "%s (%s)" % (H_MODEL, "Pfad"), "Modellordner des Profils %s (Format %s, %s)" % (F["id"], F["format"], F["family"]))
+    out["--model-path"] = _entry("--model-path", v["model_path"], "%s (%s)" % (H_MODEL, "Path"), "Model folder of profile %s (format %s, %s)" % (F["id"], F["format"], F["family"]))
     if F["vision"]:
         out["--no-enable-multimodal"] = _entry(
             "--no-enable-multimodal", True if v["no_vision"] else None, H_GOAL if v["no_vision"] else H_DEFAULT,
-            ("Sichttuerm aus: spart %s MiB Gewichte (%s); server_args.py:1061-1076 nennt 879 MiB gemessen (Boot weg2xsn27)" % (_fmt(F["visual_bytes"] / MIB), F["src"]["visual"]))
-            if v["no_vision"] else "Ziel 'vision': Sichttuerm bleibt geladen (%s MiB)" % _fmt(F["visual_bytes"] / MIB))
+            ("Vision tower off: saves %s MiB of weights (%s); server_args.py:1061-1076 names 879 MiB measured (boot weg2xsn27)" % (_fmt(F["visual_bytes"] / MIB), F["src"]["visual"]))
+            if v["no_vision"] else "Goal 'vision': vision tower stays loaded (%s MiB)" % _fmt(F["visual_bytes"] / MIB))
     dtype = str(v["kv_dtype"])
-    dreason = "Modell-Dtype (auto)" if dtype == "auto" else "fp8"
-    if relax and any(r["schritt"].startswith("KV-Dtype") for r in relax):
-        dreason = "Leiter: " + next(r["grund"] for r in relax if r["schritt"].startswith("KV-Dtype"))
+    dreason = "Model dtype (auto)" if dtype == "auto" else "fp8"
+    if relax and any(r["schritt"].startswith("KV dtype") for r in relax):
+        dreason = "Ladder: " + next(r["grund"] for r in relax if r["schritt"].startswith("KV dtype"))
     elif g["kv_dtype"]:
-        dreason = "Ziel"
+        dreason = "Goal"
     out["--kv-cache-dtype"] = _entry("--kv-cache-dtype", dtype, H_GOAL if g["kv_dtype"] else H_RULE,
-                                     "%s; KV-Zelle %s B je Attention-Layer und Token (%s)" % (dreason, _fmt(_cell_for(F, dtype)[0] or 0), F["src"]["cell"]))
+                                     "%s; KV cell %s B per attention layer and token (%s)" % (dreason, _fmt(_cell_for(F, dtype)[0] or 0), F["src"]["cell"]))
     out["--context-length"] = _entry("--context-length", v["context"], H_GOAL if g["context_tokens"] else H_RULE,
-                                     ("Ziel-Kontext" if g["context_tokens"] else "Standardziel min(max_position_embeddings %d, %d) (MiniCPM-V-4_6.mdx:63)" % (F["maxpos"], DEFAULT_CONTEXT_TOKENS)),
+                                     ("Goal context" if g["context_tokens"] else "Standard goal min(max_position_embeddings %d, %d) (MiniCPM-V-4_6.mdx:63)" % (F["maxpos"], DEFAULT_CONTEXT_TOKENS)),
                                      state=V_NO if "FIT-CTX" in failing else V_OK, code="FIT-CTX" if "FIT-CTX" in failing else None, grund=failing.get("FIT-CTX", ""))
     out["--max-total-tokens"] = _entry("--max-total-tokens", v["kv_tokens"], H_RULE,
-                                       "KV-Pool: Pflicht %d Token (Ziel) + Rest im Verhaeltnis %.1f zu Mamba (server_args.py:4405); Seitengroesse %d; %s MiB" % (
+                                       "KV pool: obligation %d tokens (goal) + rest in the ratio %.1f to Mamba (server_args.py:4405); page size %d; %s MiB" % (
                                            aux["kv_goal"], MAMBA_FULL_MEMORY_RATIO, aux["page"], _fmt(n["kv_main"] + n["kv_draft"])),
                                        state=fit_state if v["kv_tokens"] else V_UNK, code=fit_code, grund=fit_grund)
-    out["--max-running-requests"] = _entry("--max-running-requests", v["seats"], H_GOAL, "Ziel 'Sitze gleichzeitig' (Standard 1)")
+    out["--max-running-requests"] = _entry("--max-running-requests", v["seats"], H_GOAL, "Goal 'seats at the same time' (default 1)")
     fr = v.get("fraction")
     out["--mem-fraction-static"] = _entry(
         "--mem-fraction-static", fr, H_RULE,
-        ("(Decke %s MiB - Kontext/Treiber %s MiB - Reserve %s MiB) / freier Speicher vor dem Laden %s MiB, abgerundet auf 3 Stellen -- die Runtime wendet den Bruchteil "
-         "auf pre_model_load_memory an (model_runner_kv_cache_mixin.py:959-962), nicht auf die Karte (Abweichung von server_args.py:14538-14541, das durch die Karte teilt); Reserve aus %s%s" % (
+        ("(ceiling %s MiB - context/driver %s MiB - reserve %s MiB) / free memory before loading %s MiB, rounded down to 3 digits -- the runtime applies the fraction to pre_model_load_memory (model_runner_kv_cache_mixin.py:959-962), not to the card (deviation from server_args.py:14538-14541, which divides by the card); reserve from %s%s" % (
             _fmt(card["usable_mib"] - aux["host_unified"]), _fmt(aux["overhead"]), _fmt(aux["reserve"]), _fmt(aux["pre"]), acc["reserve_herkunft"],
-            "; Hostpool %s MiB abgezogen (APU)" % _fmt(aux["host_unified"]) if aux["host_unified"] else ""))
-        if fr is not None else "Reserve %s MiB (+ Kontext/Treiber %s MiB) uebersteigt die Karte: kein Bruchteil moeglich" % (_fmt(aux["reserve"]), _fmt(aux["overhead"])),
-        state=fit_state if fr is not None else V_NO, code=fit_code if fr is not None else "FIT-RESERVE", grund=fit_grund if fr is not None else "Reserve groesser als die Karte")
+            "; host pool %s MiB deducted (APU)" % _fmt(aux["host_unified"]) if aux["host_unified"] else ""))
+        if fr is not None else "Reserve %s MiB (+ context/driver %s MiB) exceeds the card: no fraction possible" % (_fmt(aux["reserve"]), _fmt(aux["overhead"])),
+        state=fit_state if fr is not None else V_NO, code=fit_code if fr is not None else "FIT-RESERVE", grund=fit_grund if fr is not None else "Reserve larger than the card")
     if F["n_lin"] and v.get("slots") is not None:
         out["--max-mamba-cache-size"] = _entry(
             "--max-mamba-cache-size", v["slots"], H_RULE,
-            "Untergrenze %d (= %d Anfragen x %d Slots, mamba_pool_floor.py:264) + Rest; je Slot %s MiB (%s)" % (
+            "Lower bound %d (= %d requests x %d slots, mamba_pool_floor.py:264) + rest; per slot %s MiB (%s)" % (
                 acc["mamba_floor_slots"], v["seats"], acc["mamba_floor_slots"] // max(v["seats"], 1), _fmt((F["per_req"] or 0) / MIB), F["src"]["state"]),
             state=fit_state, code=fit_code, grund=fit_grund)
     out["--chunked-prefill-size"] = _entry("--chunked-prefill-size", v["cps"], H_GOAL if g["chunked_prefill_size"] else H_DEFAULT,
-                                           "Kartenklasse %s MiB (server_args.py:12767-12837); bestimmt die Aktivierungsreserve" % _fmt(card["total_mib"]))
+                                           "Card class %s MiB (server_args.py:12767-12837); determines the activation reserve" % _fmt(card["total_mib"]))
     out["--cuda-graph-max-bs-decode"] = _entry("--cuda-graph-max-bs-decode", v["max_bs"], H_RULE,
-                                               "min(Kartenklassen-Standard, max-running-requests): groessere Decode-Graphen wuerden nie benutzt, ihre Reserve waechst mit max_bs (server_args.py:14847); kanonischer Name, '--cuda-graph-max-bs' ist veralteter Alias (server_args.py:19969-19977)")
+                                               "min(card class default, max-running-requests): larger decode graphs would never be used, their reserve grows with max_bs (server_args.py:14847); canonical name, '--cuda-graph-max-bs' is a deprecated alias (server_args.py:19969-19977)")
     out["--enable-hierarchical-cache"] = _entry(
         "--enable-hierarchical-cache", True if v["hicache"] else None, H_GOAL if v["hicache"] else H_UNKNOWN,
-        "Host-Budget %s MiB vorhanden (Ziel)" % _fmt(float(g.get("host_ram_mib") or 0)) if v["hicache"] else
-        ("HiCache aus: " + aux["hicache_skipped"] if aux.get("hicache_skipped") else "kein Host-RAM-Budget im Ziel (host_ram_mib): HiCache nicht vorgeschlagen"),
+        "Host budget %s MiB present (goal)" % _fmt(float(g.get("host_ram_mib") or 0)) if v["hicache"] else
+        ("HiCache off: " + aux["hicache_skipped"] if aux.get("hicache_skipped") else "no host RAM budget in the goal (host_ram_mib): HiCache not proposed"),
         zustand=Z_PROPOSED if v["hicache"] or aux.get("hicache_skipped") else Z_UNBELEGT)
     if v["hicache"]:
         out["--hicache-ratio"] = _entry("--hicache-ratio", v["hicache_ratio"], H_RULE,
-                                        "Host-Budget %s MiB / Geraete-KV-Pool %s MiB (nur Hauptmodell; ob der Draft-Pool mitgerechnet wird, ist unbelegt) -> Host-KV %s MiB"
+                                        "Host budget %s MiB / device KV pool %s MiB (main model only; whether the draft pool is included is unverified) -> host KV %s MiB"
                                         % (_fmt(float(g.get("host_ram_mib") or 0)), _fmt(aux.get("kv_main_mib", 0.0)), _fmt(aux.get("host_kv_mib", 0.0))))
-        out["--page-size"] = _entry("--page-size", v["page_size"], "%s (hicache_best_practices.mdx:16)" % H_DOC, "HiCache-Empfehlung der Doku: Seitengroesse 64; der KV-Pool ist auf ein Vielfaches gerundet")
+        out["--page-size"] = _entry("--page-size", v["page_size"], "%s (hicache_best_practices.mdx:16)" % H_DOC, "HiCache recommendation of the docs: page size 64; the KV pool is rounded to a multiple")
     if v.get("spec_algo"):
-        src_d = "Doku (Qwen3.5.mdx:245-248)" if str(v["spec_algo"]).upper() == "NEXTN" else "Draft-Profil"
-        why = ("Draft: MTP-Kopf im Checkpoint (%s MiB, %s); NEXTN-Form des Kochbuchs" % (_fmt(F["mtp_bytes"] / MIB), F["src"]["mtp"])
-               if str(v["spec_algo"]).upper() == "NEXTN" else "Draft: getrenntes Verzeichnis (%s)" % (F["ext"] or {}).get("kind"))
+        src_d = "Docs (Qwen3.5.mdx:245-248)" if str(v["spec_algo"]).upper() == "NEXTN" else "Draft profile"
+        why = ("Draft: MTP head in the checkpoint (%s MiB, %s); NEXTN form of the cookbook" % (_fmt(F["mtp_bytes"] / MIB), F["src"]["mtp"])
+               if str(v["spec_algo"]).upper() == "NEXTN" else "Draft: separate directory (%s)" % (F["ext"] or {}).get("kind"))
         out["--speculative-algorithm"] = _entry("--speculative-algorithm", v["spec_algo"], src_d, why)
         if str(v["spec_algo"]).upper() == "NEXTN":
-            out["--speculative-num-steps"] = _entry("--speculative-num-steps", v["spec_steps"], src_d, "Kochbuch-Form (Qwen3.5.mdx:246)")
-            out["--speculative-eagle-topk"] = _entry("--speculative-eagle-topk", v["spec_topk"], src_d, "lineare Kette, topk 1 (Qwen3.5.mdx:247)")
-            out["--speculative-num-draft-tokens"] = _entry("--speculative-num-draft-tokens", v["spec_draft_tokens"], src_d, "Kochbuch-Form (Qwen3.5.mdx:248); Spekulations-Zwischenzustaende rechnen mit diesem D")
+            out["--speculative-num-steps"] = _entry("--speculative-num-steps", v["spec_steps"], src_d, "Cookbook form (Qwen3.5.mdx:246)")
+            out["--speculative-eagle-topk"] = _entry("--speculative-eagle-topk", v["spec_topk"], src_d, "linear chain, topk 1 (Qwen3.5.mdx:247)")
+            out["--speculative-num-draft-tokens"] = _entry("--speculative-num-draft-tokens", v["spec_draft_tokens"], src_d, "Cookbook form (Qwen3.5.mdx:248); speculation intermediate states calculate with this D")
         else:
-            out["--speculative-draft-model-path"] = _entry("--speculative-draft-model-path", v["spec_draft_path"], "%s (Draft-Profil)" % H_MODEL, "Pfad des Draft-Verzeichnisses")
+            out["--speculative-draft-model-path"] = _entry("--speculative-draft-model-path", v["spec_draft_path"], "%s (Draft profile)" % H_MODEL, "Path of the draft directory")
             if v.get("spec_block"):
-                out["--speculative-dflash-block-size"] = _entry("--speculative-dflash-block-size", v["spec_block"], "%s (dflash_config.block_size)" % H_MODEL, "Verifikationsfenster des Drafts")
+                out["--speculative-dflash-block-size"] = _entry("--speculative-dflash-block-size", v["spec_block"], "%s (dflash_config.block_size)" % H_MODEL, "Verification window of the draft")
     else:
-        reason = ("kein Draft verfuegbar (MTP-Kopf/Draft-Profil fehlt)" if g["draft"] != "off" and not F["mtp_found"] and not F["ext"]
-                  else ("Ziel: kein Draft" if g["draft"] == "off" else "Leiter: " + next((r["grund"] for r in relax if r["schritt"].startswith("Draft")), "nicht gewaehlt")))
-        out["--speculative-algorithm"] = _entry("--speculative-algorithm", None, H_RULE, "kein Draft: " + reason, zustand=Z_PROPOSED)
+        reason = ("no draft available (MTP head/draft profile missing)" if g["draft"] != "off" and not F["mtp_found"] and not F["ext"]
+                  else ("Goal: no draft" if g["draft"] == "off" else "Ladder: " + next((r["grund"] for r in relax if r["schritt"].startswith("Draft")), "not chosen")))
+        out["--speculative-algorithm"] = _entry("--speculative-algorithm", None, H_RULE, "no draft: " + reason, zustand=Z_PROPOSED)
     return [out[k] for k in _ORDER if k in out]
 
 
@@ -743,11 +741,11 @@ def _apply_overrides(entries: List[Dict[str, Any]], overrides: Mapping[str, Any]
     for flag, val in overrides.items():
         if flag in by:
             e = by[flag]
-            e["begruendung"] = "übersteuert (vorgeschlagen war %r): %s" % (proposed.get(flag), e["begruendung"])
+            e["begruendung"] = "overridden (proposed was %r): %s" % (proposed.get(flag), e["begruendung"])
             e["wert"], e["herkunft"], e["zustand"] = val, H_OVERRIDE, Z_OVERRIDDEN
         else:
-            entries.append(_entry(flag, val, H_OVERRIDE, "übersteuert: dieses Flag kennt die Einzelkarten-Rechnung nicht; nur der ServerArgs-Parse prueft es",
-                                  state=V_UNK, grund="nicht in der Passungsrechnung", zustand=Z_OVERRIDDEN))
+            entries.append(_entry(flag, val, H_OVERRIDE, "overridden: the single card calculation does not know this flag; only the ServerArgs parse checks it",
+                                  state=V_UNK, grund="not in the fit calculation", zustand=Z_OVERRIDDEN))
     return entries
 
 
@@ -761,7 +759,7 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
     """Vorschlag der Form Einzelkarte aus ``model_profile`` (``flliper.model/1``) und ``card`` (:func:`normalize_card`).
 
     ``goals`` (alle optional): ``context_tokens`` (Standard min(Modell-Maximum, 131072)), ``kv_tokens`` (Standard = Kontext), ``seats`` (Standard 1),
-    ``draft`` ``auto|on|off|nextn|external`` (Standard auto: MTP-Kopf bzw. Draft-Profil nutzen, wenn es passt), ``kv_dtype`` (``None`` = der Planer waehlt;
+    ``draft`` ``auto|on|off|nextn|external`` (Standard auto: MTP-Kopf bzw. Draft profile nutzen, wenn es passt), ``kv_dtype`` (``None`` = der Planer waehlt;
     ``auto`` = Modell-Dtype, ``fp8_e4m3`` ...), ``vision`` (Standard ``False``), ``host_ram_mib`` (HiCache-Host-Budget; ohne Angabe kein HiCache),
     ``chunked_prefill_size``, ``reserve_mib`` (gemessene Reserve statt der ServerArgs-Heuristik), ``disable_radix``,
     ``pre_load_free_mib`` (gemessenes ``pre_model_load_memory`` in MiB, 0 < Wert <= Karte; ohne Angabe Karte - ``CONTEXT_OVERHEAD_DEFAULT_MIB``, unbelegt).
@@ -788,19 +786,19 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
         v = v2
         entries = build_entries(F, c, g, v, aux, relax, acc)
         entries = _apply_overrides(entries, overrides, proposed)
-    borrowed = [k for k, lab in F["src"].items() if "unbelegt" in lab] + (["Karte"] if "unbelegt" in str(c.get("total_src")) + str(c.get("usable_src")) else [])
+    borrowed = [k for k, lab in F["src"].items() if "unbelegt" in lab or "unverified" in lab] + (["Card"] if any(w in str(c.get("total_src")) + str(c.get("usable_src")) for w in ("unbelegt", "unverified")) else [])
     if borrowed:
         for e in entries:
-            if e["zustand"] == Z_PROPOSED and e["wert"] is not None and (e["flag"] in _FIT_FLAGS or e["flag"] in ("--kv-cache-dtype", "--hicache-ratio", "--speculative-algorithm") or "unbelegt" in e["herkunft"]):
+            if e["zustand"] == Z_PROPOSED and e["wert"] is not None and (e["flag"] in _FIT_FLAGS or e["flag"] in ("--kv-cache-dtype", "--hicache-ratio", "--speculative-algorithm") or "unbelegt" in e["herkunft"] or "unverified" in e["herkunft"]):
                 e["zustand"] = Z_UNBELEGT
-                e["begruendung"] += " [geborgt, unbelegt: %s]" % ", ".join(borrowed)
+                e["begruendung"] += " [borrowed, unverified: %s]" % ", ".join(borrowed)
     if acc["kontext_treiber_standard"]:
         # Der Kontext/Treiber-Posten ist ein geborgter Standardwert; alles, was am statischen Budget haengt, traegt das (nur wenn nicht schon uebersteuert).
         for e in entries:
             if e["flag"] in ("--mem-fraction-static", "--max-total-tokens", "--max-mamba-cache-size", "--hicache-ratio") and e["wert"] is not None:
                 if e["zustand"] == Z_PROPOSED:
                     e["zustand"] = Z_UNBELEGT
-                e["begruendung"] += " [Kontext + Treiber %s MiB angenommen, am Einzelserver unbelegt; goals pre_load_free_mib ersetzt ihn]" % _fmt(acc["kontext_treiber_mib"])
+                e["begruendung"] += " [context + driver %s MiB assumed, unverified on the single server; goals pre_load_free_mib replaces it]" % _fmt(acc["kontext_treiber_mib"])
     max_ctx = max_context_fit(F, c, v, g)
     fit = {k: val for k, val in acc.items() if not k.startswith("_")}
     fit["max_context_tokens_fit"] = max_ctx
@@ -808,25 +806,25 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
     nums = acc["_numbers"]
     if fit["passt"]:
         verdict = {"state": "passt", "art": VERDICT_ART,
-                   "text": "passt: statisch %s von %s MiB (= fraction x frei vor dem Laden; Kontext/Treiber %s MiB%s; Gewichte %s, Draft %s, KV %s, Mamba %s + %s Spekulation), %s MiB frei; Reserve %s MiB; Kontext bis %s Token" % (
+                   "text": "fits: static %s of %s MiB (= fraction x free before loading; context/driver %s MiB%s; weights %s, draft %s, KV %s, Mamba %s + %s speculation), %s MiB free; reserve %s MiB; context up to %s tokens" % (
                        _fmt(fit["statisch_summe_mib"]), _fmt(fit["statisch_budget_mib"] or 0), _fmt(fit["kontext_treiber_mib"]),
-                       " angenommen, unbelegt" if fit["kontext_treiber_standard"] else " (Ziel)", _fmt(nums["w_main"]), _fmt(nums["w_draft"]),
+                       " assumed, unverified" if fit["kontext_treiber_standard"] else " (goal)", _fmt(nums["w_main"]), _fmt(nums["w_draft"]),
                        _fmt(nums["kv_main"] + nums["kv_draft"]), _fmt(nums["mamba_main"]), _fmt(nums["mamba_spec"]), _fmt(fit.get("frei_mib", 0.0)),
                        _fmt(fit["reserve_gegeben_mib"] or 0), max_ctx if max_ctx is not None else "?")}
     elif acc["unbelegt"] and not any(not ch["ok"] for ch in acc["checks"]):
-        verdict = {"state": "unbelegt", "art": VERDICT_ART, "text": "nicht rechenbar: " + "; ".join(acc["unbelegt"])}
+        verdict = {"state": "unbelegt", "art": VERDICT_ART, "text": "cannot be calculated: " + "; ".join(acc["unbelegt"])}
     else:
         failing = [ch["text"] for ch in acc["checks"] if not ch["ok"]]
         verdict = {"state": "passt nicht", "art": VERDICT_ART,
-                   "text": "passt nicht: " + " | ".join(failing) + ("; Posten: Gewichte %s + Draft %s + KV %s + Mamba %s + Spekulation %s MiB; mit diesen Werten haelt der KV-Pool %s Token Kontext" % (
+                   "text": "does not fit: " + " | ".join(failing) + ("; items: weights %s + draft %s + KV %s + Mamba %s + speculation %s MiB; with these values the KV pool holds %s tokens of context" % (
                        _fmt(nums["w_main"]), _fmt(nums["w_draft"]), _fmt(nums["kv_main"] + nums["kv_draft"]), _fmt(nums["mamba_main"]), _fmt(nums["mamba_spec"]),
                        max_ctx if max_ctx is not None else "?"))}
     if acc["kontext_treiber_standard"]:
-        unb.append("CUDA-Kontext + Treiber %.0f MiB (Standardwert, Messung am Launcher-Format launcher.py:253): am Einzelserver unbelegt; goals['pre_load_free_mib'] = gemessenes pre_model_load_memory"
+        unb.append("CUDA context + driver %.0f MiB (default value, measurement in the launcher format launcher.py:253): unverified on the single server; goals['pre_load_free_mib'] = measured pre_model_load_memory"
                    % acc["kontext_treiber_mib"])
-    unb.append("ServerArgs.__post_init__ (Geraeteerkennung, Kompatibilitaets-Refusals) ist nicht gelaufen: braucht einen Beschleuniger; nur argparse-Parse (serverargs_parse)")
+    unb.append("ServerArgs.__post_init__ (device detection, compatibility refusals) has not run: needs an accelerator; argparse parse only (serverargs_parse)")
     if c["unified"]:
-        unb.append("APU-Speichermodell (torch-Gesamtspeicher = adressierbare Decke) unbelegt am Rig")
+        unb.append("APU memory model (torch total memory = addressable ceiling) unverified on the rig")
     argv: List[str] = []
     for e in entries:
         if e["wert"] is None:
@@ -899,7 +897,7 @@ def serverargs_parse_batch(argvs: Sequence[Sequence[str]], *, tree_python: Optio
     for line in reversed(cp.stdout.splitlines()):
         if line.startswith("FLLIPER_PARSE_JSON:"):
             return json.loads(line[len("FLLIPER_PARSE_JSON:"):])
-    return {"available": False, "error": "kein Parse-Ergebnis (rc=%s): %s" % (cp.returncode, (cp.stderr or "")[-300:]), "results": []}
+    return {"available": False, "error": "no parse result (rc=%s): %s" % (cp.returncode, (cp.stderr or "")[-300:]), "results": []}
 
 
 def serverargs_parse(argv: Sequence[str], **kw: Any) -> Dict[str, Any]:
@@ -931,9 +929,9 @@ def apply_parse(proposal: Dict[str, Any], parse: Mapping[str, Any]) -> Dict[str,
         else:
             e["verdikt"]["parse"] = "nicht geprüft"
     if parse.get("available") and parse.get("ok") is False:
-        proposal["verdikt"] = {"state": "passt nicht", "art": VERDICT_ART + " + ServerArgs-Parse", "text": "ServerArgs-Parse verweigert: %s" % parse.get("error")}
+        proposal["verdikt"] = {"state": "passt nicht", "art": VERDICT_ART + " + ServerArgs parse", "text": "ServerArgs parse refused: %s" % parse.get("error")}
     elif parse.get("available") and parse.get("ok"):
-        proposal["verdikt"] = dict(proposal["verdikt"], art=VERDICT_ART + " + ServerArgs-Parse")
+        proposal["verdikt"] = dict(proposal["verdikt"], art=VERDICT_ART + " + ServerArgs parse")
     return proposal
 
 
@@ -944,8 +942,8 @@ def check(proposal: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
 
 def format_text(proposal: Mapping[str, Any]) -> str:
     """Kurzer Text fuer Log/Issue: Verdikt, Posten, Flags."""
-    lines = ["Einzelkarte %s: %s" % (proposal["card"]["name"], proposal["verdikt"]["text"]), "Posten (MiB):"]
+    lines = ["Single card %s: %s" % (proposal["card"]["name"], proposal["verdikt"]["text"]), "Items (MiB):"]
     for p in proposal["fit"]["posten"]:
         lines.append("  %-42s %9.1f  %s" % (p["name"], p["mib"], p["herkunft"]))
-    lines.append("Argumente: " + " ".join(proposal["argv"]))
+    lines.append("Arguments: " + " ".join(proposal["argv"]))
     return "\n".join(lines)

@@ -101,7 +101,7 @@ class ModelEstimator:
             if self._mod is None:
                 if not self.tree:
                     raise ModellprofilUnavailable(
-                        "kein Planer-Baum mit sglang/srt/weg2/model_profile.py gefunden (MODELLPROFIL_TREE bzw. KARTENPLAN_TREE)")
+                        "no planner tree with sglang/srt/weg2/model_profile.py found (MODELLPROFIL_TREE or KARTENPLAN_TREE)")
                 self._mod = _load(os.path.join(self.tree, MODULE_REL))
             return self._mod
 
@@ -110,16 +110,16 @@ class ModelEstimator:
         """Absoluter, wirklicher Pfad unter einer Wurzel -- sonst ``ValueError`` mit dem Grund.  ``must_exist=False`` lässt einen
         fehlenden Pfad zu (:meth:`status` meldet ihn dann als Zustand ``not_mounted``)."""
         if not isinstance(raw, str) or not raw.strip():
-            raise ValueError("%s fehlt (Modellverzeichnis oder .gguf-Datei)" % what)
+            raise ValueError("%s is missing (model directory or .gguf file)" % what)
         if len(raw) > MAX_PATH or "\x00" in raw:
-            raise ValueError("%s ist unzulässig" % what)
+            raise ValueError("%s is not allowed" % what)
         if not os.path.isabs(raw):
-            raise ValueError("%s muss ein absoluter Pfad sein" % what)
+            raise ValueError("%s must be an absolute path" % what)
         real = os.path.realpath(raw)
         if not any(real == r or real.startswith(r + os.sep) for r in self.roots):
-            raise ValueError("%s liegt nicht unter einer Modellwurzel (%s)" % (what, ", ".join(self.roots)))
+            raise ValueError("%s is not under a model root (%s)" % (what, ", ".join(self.roots)))
         if must_exist and not os.path.exists(real):
-            raise ValueError("%s existiert nicht" % what)
+            raise ValueError("%s does not exist" % what)
         return real
 
     def models(self) -> dict:
@@ -152,14 +152,14 @@ class ModelEstimator:
         und Grund.  Nur Dateinamen werden gelesen.  Der Pfad muss unter einer Modellwurzel liegen, darf aber FEHLEN -- das ist der
         Fall "nicht gemountet", den der Planer als ``unbelegt`` liest, nicht als Fehler."""
         if not isinstance(req, dict):
-            raise ValueError("Anfrage muss ein JSON-Objekt sein: {path, gguf_file?}")
+            raise ValueError("Request must be a JSON object: {path, gguf_file?}")
         path = self.check_path(req.get("path"), "path", must_exist=False)
         gguf = req.get("gguf_file") or None
         if gguf is not None and (not isinstance(gguf, str) or os.sep in gguf or gguf.startswith(".") or not gguf.endswith(".gguf")):
-            raise ValueError("gguf_file ist ein Dateiname im Modellverzeichnis")
+            raise ValueError("gguf_file is a file name in the model directory")
         mp = self.module()
         if not hasattr(mp, "probe"):
-            raise ModellprofilUnavailable("model_profile.py dieses Planer-Baums kennt probe() nicht (zu alte Linie)")
+            raise ModellprofilUnavailable("model_profile.py of this planner tree does not know probe() (line too old)")
         return dict(mp.probe(path, gguf_file=gguf), ok=True, planner_module=os.path.join(self.tree, MODULE_REL))
 
     # ------------------------------------------------------------------ Schätzung
@@ -177,18 +177,18 @@ class ModelEstimator:
 
     def estimate(self, req: dict) -> dict:
         if not isinstance(req, dict):
-            raise ValueError("Anfrage muss ein JSON-Objekt sein: {path, draft_path?, kv_dtype?, mamba_ssm_dtype?, gguf_file?, registry?}")
+            raise ValueError("Request must be a JSON object: {path, draft_path?, kv_dtype?, mamba_ssm_dtype?, gguf_file?, registry?}")
         path = self.check_path(req.get("path"), "path")
         draft = self.check_path(req["draft_path"], "draft_path") if req.get("draft_path") else None
         kv = req.get("kv_dtype") or None
         ssm = req.get("mamba_ssm_dtype") or None
         if kv not in KV_DTYPES:
-            raise ValueError("kv_dtype muss auto oder fp8_e4m3 sein")
+            raise ValueError("kv_dtype must be auto or fp8_e4m3")
         if ssm not in SSM_DTYPES:
-            raise ValueError("mamba_ssm_dtype muss float32 oder bfloat16 sein")
+            raise ValueError("mamba_ssm_dtype must be float32 or bfloat16")
         gguf = req.get("gguf_file") or None
         if gguf is not None and (not isinstance(gguf, str) or os.sep in gguf or gguf.startswith(".") or not gguf.endswith(".gguf")):
-            raise ValueError("gguf_file ist ein Dateiname im Modellverzeichnis")
+            raise ValueError("gguf_file is a file name in the model directory")
         reg = req.get("registry")
         reg_id = None
         if reg:
@@ -196,7 +196,7 @@ class ModelEstimator:
             if reg is True or not isinstance(reg, str):
                 reg_id = _slug(reg_id).strip("-")[:64] or "modell"
             if not ID_RE.match(reg_id):
-                raise ValueError("registry: Kennung muss [a-z0-9._-]{1,64} sein")
+                raise ValueError("registry: identifier must be [a-z0-9._-]{1,64}")
         mp = self.module()
         key = (path, draft, kv, ssm, gguf, reg_id, self._fingerprint(path), self._fingerprint(draft) if draft else None)
         hit = self._cache.get(key)

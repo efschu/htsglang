@@ -78,7 +78,7 @@ class FeatureFile:
                     d = json.load(fh)
                 feats = d.get("features") if isinstance(d, dict) else None
                 if not isinstance(feats, list):
-                    raise ValueError("kein Array 'features'")
+                    raise ValueError("no array 'features'")
                 prod = d.get("produkt")
                 self.features, self.error = [f for f in feats if isinstance(f, dict)], None
                 self.produkt = [x for x in prod if isinstance(x, dict)] if isinstance(prod, list) else []
@@ -191,11 +191,11 @@ class LineIndex:
 def in_image(repo: str, rev: str, zweige: list, line: Optional[LineIndex]) -> dict:
     """{state: ja|nein|unbekannt, how: vorfahr|patch-id|subject, sha, line_sha, detail}."""
     if not rev:
-        return {"state": "unbekannt", "detail": "kein Image-Rev im Zustand"}
+        return {"state": "unbekannt", "detail": "no image rev in the state"}
     if not zweige:
-        return {"state": "unbekannt", "detail": "kein Commit eingetragen"}
+        return {"state": "unbekannt", "detail": "no commit entered"}
     if _git(repo, "cat-file", "-e", rev + "^{commit}").returncode != 0:
-        return {"state": "unbekannt", "detail": "Image-Rev %s fehlt lokal in %s" % (rev, repo)}
+        return {"state": "unbekannt", "detail": "Image rev %s is missing locally in %s" % (rev, repo)}
     missing = []
     for z in zweige:
         sha = (z or {}).get("sha") or ""
@@ -214,8 +214,8 @@ def in_image(repo: str, rev: str, zweige: list, line: Optional[LineIndex]) -> di
             if subj and subj in line.subjects:
                 return {"state": "ja", "how": "subject", "sha": sha, "line_sha": line.subjects[subj][:10]}
     if missing and len(missing) == len([z for z in zweige if (z or {}).get("sha")]):
-        return {"state": "unbekannt", "detail": "Commit(s) fehlen lokal: " + ", ".join(missing)}
-    return {"state": "nein", "detail": "weder Vorfahr noch patch-/subject-gleich auf " + rev}
+        return {"state": "unbekannt", "detail": "Commit(s) missing locally: " + ", ".join(missing)}
+    return {"state": "nein", "detail": "neither ancestor nor patch/subject-equal on " + rev}
 
 
 # --------------------------------------------------------------------------- Stand (Nutzer 01.10.)
@@ -256,7 +256,7 @@ def new_commits(repo: str, rev: str, feats: list, im: dict, hours: int = NEW_COM
     """Commits on the image rev of the last ``hours`` that no Baustein names: not a ``zweige`` sha (prefix), not the
     line commit a Baustein was matched to by patch-id/subject (``im_image.line_sha``)."""
     if not rev:
-        return {"rev": rev, "commits": [], "error": "kein Image-Rev"}
+        return {"rev": rev, "commits": [], "error": "no image rev"}
     out = _git(repo, "log", "--no-merges", "--since=%d hours ago" % hours, "--format=%H%x00%ct%x00%s", rev)
     if out.returncode != 0:
         return {"rev": rev, "commits": [], "error": out.stderr.decode(errors="replace").strip()[:200]}
@@ -370,22 +370,22 @@ def switch_state(sw: dict, st: Optional[dict], profile_text: Optional[str]) -> d
             hits = re.findall(r"(?<![A-Za-z0-9_])%s=([^;\"'\s]*)" % re.escape(name), profile_text)
             if hits:
                 v = hits[-1]
-                return {"state": "an" if _is_on(v, an_wert) else "aus", "src": "Profil (kein launch-Schnappschuss)", "value": v}
+                return {"state": "an" if _is_on(v, an_wert) else "aus", "src": "Profile (no launch snapshot)", "value": v}
         else:
             m = re.search(r"(?<![\w-])%s(?:[ =]([^\s'\"]+))?" % re.escape(name), profile_text)
             if m:
                 v = m.group(1) or ""
                 on = _is_on(v, an_wert) if (an_wert not in (None, "")) else True
-                return {"state": "an" if on else "aus", "src": "Profil (kein launch-Schnappschuss)", "value": v}
-        return {"state": "an" if default_on else "aus", "src": "Profil (nicht gesetzt -> default)", "value": None}
-    return {"state": "unbekannt", "src": "kein Zustand und kein Profil", "value": None}
+                return {"state": "an" if on else "aus", "src": "Profile (no launch snapshot)", "value": v}
+        return {"state": "an" if default_on else "aus", "src": "Profile (not set -> default)", "value": None}
+    return {"state": "unbekannt", "src": "no state and no profile", "value": None}
 
 
 def aktiv(feature: dict, st: Optional[dict], profile_text: Optional[str], im: dict) -> dict:
     sws = [s for s in feature.get("schalter") or [] if isinstance(s, dict) and s.get("name")]
     if not sws:
         if im.get("state") == "ja":
-            return {"state": "an", "detail": [], "note": "ohne Schalter: wirkt, sobald im Image"}
+            return {"state": "an", "detail": [], "note": "without switch: takes effect as soon as it is in the image"}
         return {"state": "aus" if im.get("state") == "nein" else "unbekannt", "detail": []}
     det = [dict(switch_state(s, st, profile_text), name=s.get("name"), gruppe=s.get("gruppe")) for s in sws]
     states = {d["state"] for d in det}
@@ -418,37 +418,37 @@ def validate(feats: list) -> list:
         fid = f.get("id") if isinstance(f, dict) else None
         where = fid or "#%d" % i
         if not isinstance(f, dict) or not fid:
-            out.append("%s: ohne id" % where)
+            out.append("%s: without id" % where)
             continue
         if fid in seen:
-            out.append("%s: id doppelt" % fid)
+            out.append("%s: duplicate id" % fid)
         seen.add(fid)
         if f.get("modell") not in MODELL_VALUES:
-            out.append("%s: modell %r nicht in %s" % (fid, f.get("modell"), "/".join(MODELL_VALUES)))
+            out.append("%s: model %r not in %s" % (fid, f.get("modell"), "/".join(MODELL_VALUES)))
         for z in f.get("zweige") or []:
             if not isinstance(z, dict) or not z.get("branch") or not re.fullmatch(r"[0-9a-f]{7,40}", z.get("sha") or ""):
-                out.append("%s: Zweig %r braucht branch + sha" % (fid, z))
+                out.append("%s: branch %r needs branch + sha" % (fid, z))
         for s in f.get("schalter") or []:
             if not isinstance(s, dict) or not s.get("name"):
-                out.append("%s: Schalter ohne name" % fid)
+                out.append("%s: switch without name" % fid)
                 continue
             if s.get("art") not in SWITCH_ART:
-                out.append("%s: Schalter %s art %r nicht env/flag" % (fid, s["name"], s.get("art")))
+                out.append("%s: switch %s art %r not env/flag" % (fid, s["name"], s.get("art")))
             if (s.get("gruppe") or "") not in SWITCH_GROUPS:
-                out.append("%s: Schalter %s gruppe %r nicht P/D/beide/front/launcher" % (fid, s["name"], s.get("gruppe")))
+                out.append("%s: switch %s gruppe %r not P/D/beide/front/launcher" % (fid, s["name"], s.get("gruppe")))
             if s.get("default") not in ("an", "aus"):
-                out.append("%s: Schalter %s ohne default an|aus" % (fid, s["name"]))
+                out.append("%s: switch %s without default an|aus" % (fid, s["name"]))
         for g in f.get("gewinn") or []:
             if not isinstance(g, dict) or not g.get("metrik"):
-                out.append("%s: Gewinn ohne metrik" % fid)
+                out.append("%s: gain without metrik" % fid)
                 continue
             if g.get("art") not in GAIN_ART:
-                out.append("%s: Gewinn %s art %r nicht %s" % (fid, g["metrik"], g.get("art"), "/".join(GAIN_ART)))
+                out.append("%s: gain %s art %r not %s" % (fid, g["metrik"], g.get("art"), "/".join(GAIN_ART)))
             gm = g.get("modell")
             if f.get("modell") == "beide" and gm not in ("27B", "NF"):
-                out.append("%s: Gewinn '%s' ohne Feld modell (Pflicht bei modell=beide)" % (fid, g["metrik"]))
+                out.append("%s: gain '%s' without field modell (required for modell=beide)" % (fid, g["metrik"]))
             elif gm and f.get("modell") in ("27B", "NF") and gm != f.get("modell"):
-                out.append("%s: Gewinn '%s' modell %s gegen Feature-modell %s" % (fid, g["metrik"], gm, f.get("modell")))
+                out.append("%s: gain '%s' modell %s against feature modell %s" % (fid, g["metrik"], gm, f.get("modell")))
     return out
 
 
@@ -458,9 +458,9 @@ def validate(feats: list) -> list:
 # features with Soll and Ist per model; the commits/fixes above are only their
 # Bausteine (building blocks), shown collapsed under the feature they serve.
 PRODUKT_STATUS = ("fertig+aktiv", "im Image aber aus", "Desk", "offen", "unbelegt", "entfällt")
-KREUZ_ACHSEN = (("tp", "uneven TP"), ("dcp", "uneven DCP / Token-Schnitt"),
-                ("moe", "uneven Experten-Shard (--rank-moe-ratio)"), ("pp", "PP-Schnitt uneven"),
-                ("forma", "Form A host/worker"), ("kvonly", "KV-only-Rang"))
+KREUZ_ACHSEN = (("tp", "uneven TP"), ("dcp", "uneven DCP / token cut"),
+                ("moe", "uneven expert shard (--rank-moe-ratio)"), ("pp", "PP cut uneven"),
+                ("forma", "Form A host/worker"), ("kvonly", "KV-only rank"))
 # "Soll erreicht?" (Koordinator 29.09.) is separate from the status: fertig+aktiv only says it runs.
 SOLL_ERREICHT = ("ja", "teilweise", "nein")
 KREUZ_STATUS = ("am Metall belegt", "unterstützt", "nur Desk", "nein", "unbelegt")
@@ -478,46 +478,46 @@ def validate_produkt(prod: list, baustein_ids) -> list:
     for i, p in enumerate(prod):
         pid = p.get("id") if isinstance(p, dict) else None
         if not pid:
-            out.append("Produkt #%d: ohne id" % i)
+            out.append("Product #%d: without id" % i)
             continue
         if pid in seen:
-            out.append("Produkt %s: id doppelt" % pid)
+            out.append("Product %s: duplicate id" % pid)
         seen.add(pid)
         if not p.get("titel") or not p.get("soll"):
-            out.append("Produkt %s: titel und soll sind Pflicht" % pid)
+            out.append("Product %s: titel and soll are required" % pid)
         for m, x in (p.get("ist") or {}).items():
             if m not in MODELS:
-                out.append("Produkt %s: ist-Modell %r nicht 27B/NF" % (pid, m))
+                out.append("Product %s: ist model %r not 27B/NF" % (pid, m))
             elif (x or {}).get("status") not in PRODUKT_STATUS:
-                out.append("Produkt %s: %s status %r nicht %s" % (pid, m, (x or {}).get("status"), "/".join(PRODUKT_STATUS)))
+                out.append("Product %s: %s status %r not %s" % (pid, m, (x or {}).get("status"), "/".join(PRODUKT_STATUS)))
             elif (x or {}).get("erreicht") and x["erreicht"] not in SOLL_ERREICHT:
-                out.append("Produkt %s: %s erreicht %r nicht %s" % (pid, m, x["erreicht"], "/".join(SOLL_ERREICHT)))
+                out.append("Product %s: %s erreicht %r not %s" % (pid, m, x["erreicht"], "/".join(SOLL_ERREICHT)))
             elif (x or {}).get("belegt_am") and belegt_ts(x["belegt_am"]) is None:
-                out.append("Produkt %s: %s belegt_am %r (ISO, z. B. 2026-09-29T07:10Z)" % (pid, m, x["belegt_am"]))
+                out.append("Product %s: %s belegt_am %r (ISO, e.g. 2026-09-29T07:10Z)" % (pid, m, x["belegt_am"]))
         for b in p.get("bausteine") or []:
             if b not in baustein_ids:
-                out.append("Produkt %s: Baustein %s steht nicht in features" % (pid, b))
+                out.append("Product %s: building block %s is not in features" % (pid, b))
         for m, cells in ((p.get("kreuztabelle") or {}).get("zellen") or {}).items():
             for k, c in (cells or {}).items():
                 a, _, b = k.partition("+")
                 if a not in _KREUZ_KEYS or b not in _KREUZ_KEYS or kreuz_key(a, b) != k:
-                    out.append("Produkt %s: Kreuz-Zelle %r (Achsen %s, Schlüssel in Achsenfolge)" % (pid, k, ",".join(_KREUZ_KEYS)))
+                    out.append("Product %s: cross cell %r (axes %s, key in axis order)" % (pid, k, ",".join(_KREUZ_KEYS)))
                 elif (c or {}).get("status") not in KREUZ_STATUS:
-                    out.append("Produkt %s: Kreuz %s %s status %r" % (pid, m, k, (c or {}).get("status")))
+                    out.append("Product %s: cross %s %s status %r" % (pid, m, k, (c or {}).get("status")))
         for f in (p.get("untertabelle") or {}).get("zeilen") or []:
             if not f.get("name"):
-                out.append("Produkt %s: Unterzeile ohne name" % pid)
+                out.append("Product %s: sub-row without name" % pid)
             for m in MODELS:
                 ba = ((f.get("ist") or {}).get(m) or {}).get("belegt_am")
                 if ba and belegt_ts(ba) is None:
-                    out.append("Produkt %s: Zeile %s %s belegt_am %r (ISO, z. B. 2026-09-29T07:10Z)" % (pid, f.get("name"), m, ba))
+                    out.append("Product %s: row %s %s belegt_am %r (ISO, e.g. 2026-09-29T07:10Z)" % (pid, f.get("name"), m, ba))
                 st = ((f.get("ist") or {}).get(m) or {}).get("status")
                 if st is not None and st not in PRODUKT_STATUS:
-                    out.append("Produkt %s: Zeile %s %s status %r" % (pid, f.get("name"), m, st))
+                    out.append("Product %s: row %s %s status %r" % (pid, f.get("name"), m, st))
         for m, cells in ((p.get("matrix") or {}).get("zellen") or {}).items():
             for k in cells or {}:
                 if matrix_key_error(k):
-                    out.append("Produkt %s: Matrix-Zelle %s %r: %s" % (pid, m, k, matrix_key_error(k)))
+                    out.append("Product %s: matrix cell %s %r: %s" % (pid, m, k, matrix_key_error(k)))
     return out
 
 
@@ -527,7 +527,7 @@ def unassigned_bausteine(prod: list, baustein_ids) -> list:
     if not prod:
         return []
     used = {b for p in prod if isinstance(p, dict) for b in p.get("bausteine") or []}
-    return ["Baustein %s gehört zu keinem Produkt-Feature (set --produkt Fx)" % b
+    return ["Building block %s belongs to no product feature (set --produkt Fx)" % b
             for b in sorted(set(baustein_ids) - used)]
 
 
@@ -550,11 +550,11 @@ def matrix_key(form, bs, tiefe, text) -> str:
 def matrix_key_error(k: str) -> Optional[str]:
     parts = k.split("|")
     if len(parts) != 4 or not parts[0]:
-        return "Schlüssel form|bs|tiefe|text"
+        return "Key form|bs|depth|text"
     for name, allowed, v in (("bs", MATRIX_BS, parts[1]), ("tiefe", MATRIX_TIEFE, parts[2]),
                              ("text", MATRIX_TEXT, parts[3])):
         if v not in allowed:
-            return "%s=%r nicht in %s" % (name, v, "/".join(allowed))
+            return "%s=%r not in %s" % (name, v, "/".join(allowed))
     return None
 
 
@@ -569,10 +569,10 @@ def _cur_flip(lb, fb, gpus):
     pd, dp = fz.get("P>D") or {}, fz.get("D>P") or {}
     if not pd.get("n") and not dp.get("n"):
         return None
-    win = (fz.get("window") or {}).get("label") or "Fenster fehlt"
-    return ("P→D Median %s, p90 %s (n=%s); D→P Median %s (n=%s); Flips %s" % (
+    win = (fz.get("window") or {}).get("label") or "Window missing"
+    return ("P→D median %s, p90 %s (n=%s); D→P median %s (n=%s); flips %s" % (
         _fmt_s(pd.get("p50_ms")), _fmt_s(pd.get("p90_ms")), pd.get("n"), _fmt_s(dp.get("p50_ms")), dp.get("n"),
-        lb.get("flip_count")), "Flipzeit (flipzeit.py, %s): letzter P-Chunk / letztes Decode-Token -> erstes Decode-Token / erster Prefill-Chunk" % win)
+        lb.get("flip_count")), "Flip time (flipzeit.py, %s): last P chunk / last decode token -> first decode token / first prefill chunk" % win)
 
 
 def _cur_decode(lb, fb, gpus):
@@ -581,8 +581,8 @@ def _cur_decode(lb, fb, gpus):
     parts = ["bs%s %s ms (n=%s)" % (bs, str(v["median_ms"]).replace(".", ","), v["n"]) for bs, v in rb.items()]  # Mittel
     if not parts and dec.get("gen_tps_last") is None:
         return None
-    return ("Runde " + (", ".join(parts) or "—") + "; gen %s tok/s" % dec.get("gen_tps_last"),
-            "rankstats decode.gpu_ms_by_bs (Mittel je bs, Tiefe/Text gemischt) + Δdecode.tokens (IPC)")
+    return ("Round " + (", ".join(parts) or "—") + "; gen %s tok/s" % dec.get("gen_tps_last"),
+            "rankstats decode.gpu_ms_by_bs (mean per bs, depth/text mixed) + Δdecode.tokens (IPC)")
 
 
 def _cur_prefill(lb, fb, gpus):
@@ -590,16 +590,16 @@ def _cur_prefill(lb, fb, gpus):
     lb_ = pp.get("last_burst") or {}
     if not lb_.get("tps"):
         return None
-    return ("letzter Schub %s tok/s (langsamste Stufe, %s Chunks, Ø %s Tok)" % (
+    return ("last burst %s tok/s (slowest stage, %s chunks, avg %s tok)" % (
         round(lb_["tps"]), lb_.get("chunks"), round(lb_.get("mean_chunk") or 0)),
-        "rankstats Δprefill.new_tokens / Δcompute_ms je Rang (IPC)")
+        "rankstats Δprefill.new_tokens / Δcompute_ms per rank (IPC)")
 
 
 def _cur_spec(lb, fb, gpus):
     dec = (lb.get("decode") or {}).get("D") or {}
     if dec.get("accept_len") is None:
         return None
-    return ("Akzeptanzlänge %s (Rate %s)" % (dec.get("accept_len"), dec.get("accept_rate")),
+    return ("Acceptance length %s (rate %s)" % (dec.get("accept_len"), dec.get("accept_rate")),
             "rankstats decode.accept_len_ewma (IPC)")
 
 
@@ -607,7 +607,7 @@ def _cur_kv(lb, fb, gpus):
     dec = (lb.get("decode") or {}).get("D") or {}
     if dec.get("max_total_tokens") is None:
         return None
-    return ("D max_total_num_tokens %s; brachliegende GiB: kein Instrument (Marker: freier KV-VRAM je Rang)"
+    return ("D max_total_num_tokens %s; idle GiB: no instrument (marker: free KV VRAM per rank)"
             % dec["max_total_tokens"], "rankstats cap.kv_tokens TP0 (IPC)")
 
 
@@ -616,7 +616,7 @@ def _cur_seats(lb, fb, gpus):
     s, rb = dec.get("seats") or {}, dec.get("round_bs") or {}
     if not s and not rb:
         return None
-    return ("Sitze %s von %s, Runde bs %s" % (s.get("n"), s.get("cap"), rb.get("bs")),
+    return ("Seats %s of %s, round bs %s" % (s.get("n"), s.get("cap"), rb.get("bs")),
             "state.json front.d_seats/d_phase_n + rankstats cap.seats (IPC)")
 
 
@@ -626,14 +626,14 @@ def _cur_form(lb, fb, gpus):
 
 
 def _cur_boot(lb, fb, gpus):
-    return ("%s s bis serving" % fb["boot_s"], "state.json serving_since_ts − Boot-Start (boot_id)") \
+    return ("%s s until serving" % fb["boot_s"], "state.json serving_since_ts − boot start (boot_id)") \
         if fb and fb.get("boot_s") else None
 
 
 def _cur_lifecycle(lb, fb, gpus):
     if not fb:
         return None
-    return ("lifecycle %s%s" % (fb.get("lifecycle"), " (Override: %s)" % fb["override_beleg"] if fb.get("override_beleg") else ""),
+    return ("lifecycle %s%s" % (fb.get("lifecycle"), " (override: %s)" % fb["override_beleg"] if fb.get("override_beleg") else ""),
             "state.json lifecycle")
 
 
@@ -643,7 +643,7 @@ def _cur_transport(lb, fb, gpus):
         return ("Transport %s" % t, "state.json groups.launch.env HTSGLANG_TRANSPORT")
     tag = ((lb.get("meta") or {}).get("tag") or lb.get("stem") or "").lower()
     t = "bar1" if "bar1" in tag else ("nccl" if "nccl" in tag else None)
-    return ("Transport %s" % t, "Boot-Tag (state.json launch.env HTSGLANG_TRANSPORT ab z30s)") if t else None
+    return ("Transport %s" % t, "Boot tag (state.json launch.env HTSGLANG_TRANSPORT from z30s)") if t else None
 
 
 def _cur_power(lb, fb, gpus):
@@ -651,39 +651,39 @@ def _cur_power(lb, fb, gpus):
     w = [c.get("power.draw") for c in cards if c.get("power.draw") is not None]
     if not w:
         return None
-    return ("Karten jetzt %d W (%s); Leerlauf-Watt: kein Instrument" % (round(sum(w)), " / ".join("%d" % x for x in w)),
-            "nvidia-smi power.draw (Momentwert, nicht Leerlauf)")
+    return ("Cards now %d W (%s); idle watts: no instrument" % (round(sum(w)), " / ".join("%d" % x for x in w)),
+            "nvidia-smi power.draw (instantaneous value, not idle)")
 
 
 def _cur_context(lb, fb, gpus):
-    return ("Kontext je Request %s" % fb["max_kv"], "Profil --max-kv-per-request") if fb and fb.get("max_kv") else None
+    return ("Context per request %s" % fb["max_kv"], "Profile --max-kv-per-request") if fb and fb.get("max_kv") else None
 
 
 def _cur_api(lb, fb, gpus):
     served = (lb.get("front") or {}).get("served")
     if isinstance(served, dict) and served:
-        return ("%s Anfragen bedient (P %s / D %s)" % (served.get("D", 0), served.get("P", 0), served.get("D", 0)),
+        return ("%s requests served (P %s / D %s)" % (served.get("D", 0), served.get("P", 0), served.get("D", 0)),
                 "Front /weg2/state served")
     tot = lb.get("totals") or {}
-    return ("%s Anfragen bedient" % tot["served_requests"], "state.json front.served (IPC)") if tot.get("served_requests") else None
+    return ("%s requests served" % tot["served_requests"], "state.json front.served (IPC)") if tot.get("served_requests") else None
 
 
 def _cur_format(lb, fb, gpus):
-    return ("läuft: %s" % fb["format"], "Profil PROFILE_FORMAT") if fb and fb.get("format") else None
+    return ("running: %s" % fb["format"], "Profile PROFILE_FORMAT") if fb and fb.get("format") else None
 
 
 CURRENT = {"F1": _cur_flip, "F2": _cur_form, "F3": _cur_transport, "F5": _cur_kv, "F11": _cur_power,
            "F12": _cur_format, "F13": _cur_spec, "F14": _cur_context, "F15": _cur_seats, "F17": _cur_boot,
            "F20": _cur_lifecycle, "F21": _cur_api, "F22": _cur_flip, "F23": _cur_prefill, "F24": _cur_decode,
            "F4": _cur_format}
-MISSING = {"F6": "Expertenzeilen je Rang (Marker MOE-POOL rows / LRU-Zeilen)",
-           "F7": "Chunk-Plan je Request (Marker P-CHUNK-PLAN)",
-           "F8": "Reshard je Wake (Marker D-SPEED / RESHARD)",
-           "F9": "L3-Treffer je Request (Marker HiCacheFile index / STORE READ)",
-           "F10": "Vision-Stufe (Marker W102 / VISION-STAGE)",
-           "F16": "Präfix-Treffer je Folgeturn (Marker #cached-token je rid)",
-           "F18": "Store-Belegung (Marker WEG2-HOST WATERMARK)",
-           "F19": "Planer-Budget je Rang (Marker BUDGET-REACH / budget P/D)"}
+MISSING = {"F6": "Expert rows per rank (marker MOE-POOL rows / LRU rows)",
+           "F7": "Chunk plan per request (marker P-CHUNK-PLAN)",
+           "F8": "Reshard per wake (marker D-SPEED / RESHARD)",
+           "F9": "L3 hits per request (marker HiCacheFile index / STORE READ)",
+           "F10": "Vision stage (marker W102 / VISION-STAGE)",
+           "F16": "Prefix hits per follow-up turn (marker #cached-token per rid)",
+           "F18": "Store occupancy (marker WEG2-HOST WATERMARK)",
+           "F19": "Planner budget per rank (marker BUDGET-REACH / budget P/D)"}
 
 
 # "Wert im aktuellen Boot" je Format (Nutzer 29.09.): NF INT4/NVFP4, 27B INT8/NVFP4/W4A8. W4A8 is the
@@ -719,20 +719,20 @@ def attach_current(fv: dict, live_boots: list, gpus: Optional[dict]) -> dict:
             lb, fb = newest.get(m) or {}, fboot.get(m)
             ex = CURRENT.get(p["id"])
             if ex is None:
-                cur[m] = {"kein_instrument": MISSING.get(p["id"], "kein Marker benannt")}
+                cur[m] = {"kein_instrument": MISSING.get(p["id"], "no marker named")}
                 continue
             if not lb and not fb:
-                cur[m] = {"leer": "kein Boot dieses Modells gefunden"}
+                cur[m] = {"leer": "no boot of this model found"}
                 continue
             try:
                 r = ex(lb, fb, gpus)
             except (KeyError, TypeError, ValueError) as e:
-                r, cur[m] = None, {"kein_instrument": "Auswertung fehlgeschlagen: %s" % e}
+                r, cur[m] = None, {"kein_instrument": "Evaluation failed: %s" % e}
                 continue
             tag = (lb.get("meta") or {}).get("tag") or lb.get("stem")
             cur[m] = {"wert": _clean(r[0]), "instrument": r[1], "boot": _clean(tag) or (fb or {}).get("rc")} if r \
-                else {"leer": "Instrument vorhanden, in diesem Boot noch kein Wert" if lb else
-                      "kein IPC-Boot dieses Modells in den letzten 6 h", "boot": _clean(tag)}
+                else {"leer": "Instrument present, no value yet in this boot" if lb else
+                      "no IPC boot of this model in the last 6 h", "boot": _clean(tag)}
         for m in MODELS:
             fb = fboot.get(m)
             if not fb:
@@ -752,7 +752,7 @@ def attach_current(fv: dict, live_boots: list, gpus: Optional[dict]) -> dict:
                     continue
                 name = z.get("name", "").lower()
                 if p["id"] == "F12":
-                    z["aktuell"][m] = "läuft in diesem Boot" if fmt and fmt in name else "kein Boot in diesem Format"
+                    z["aktuell"][m] = "runs in this boot" if fmt and fmt in name else "no boot in this format"
     return fv
 
 
@@ -840,7 +840,7 @@ def gains_for(feature: dict, model: str) -> tuple:
             continue
         gm = g.get("modell")
         if both and not gm:
-            problems.append("%s: Gewinn '%s' ohne Feld modell (Pflicht bei modell=beide)" % (feature.get("id"), g.get("metrik")))
+            problems.append("%s: gain '%s' without field modell (required for modell=beide)" % (feature.get("id"), g.get("metrik")))
             continue
         if gm and gm != model:
             continue
@@ -854,7 +854,7 @@ class Features:
 
     The git work (one ``git log -p | git patch-id`` over the image line, then one
     check per feature) runs in a background thread once per (model, image rev,
-    file signature); until it is done the column says "wird berechnet" -- a
+    file signature); until it is done the column says "being calculated" -- a
     request never waits on git.
     """
 
@@ -945,9 +945,9 @@ class Features:
             rows = []
             for f in mine:
                 im = imc.get(f.get("id")) or (
-                    {"state": "unbekannt", "detail": "wird berechnet"} if hit is None else {"state": "unbekannt"})
+                    {"state": "unbekannt", "detail": "being calculated"} if hit is None else {"state": "unbekannt"})
                 if im.get("state") == "nein":
-                    ak = {"state": "aus", "detail": [], "note": "nicht im Image"}
+                    ak = {"state": "aus", "detail": [], "note": "not in the image"}
                 else:
                     ak = aktiv(f, st, ptxt, im)
                 gains, prob = gains_for(f, model)
