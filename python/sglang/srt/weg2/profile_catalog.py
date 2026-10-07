@@ -254,6 +254,7 @@ def load_edges(path: str = "") -> Tuple[List[Dict[str, object]], Dict[str, objec
 ANKER_TOL = 10          # a multi-hit anchor must have a hit within this many lines of where the edge is expected
 ANKER_OK = ("eindeutig", "nah")                      # resolved
 ANKER_PROBLEM = ("veraltet", "mehrdeutig", "datei_fehlt")   # the evidence cannot be trusted: say so, never guess
+ANKER_FREMD = ("andere_linie",)         # the edge's ``baeume`` does not name the tree being resolved (code of the other line): not checked here, no problem
 _ANKER_REPO_FILE = "python/sglang/srt/weg2/launcher.py"
 
 
@@ -298,14 +299,19 @@ def _repo_root_of(launcher_path: str) -> str:
     return p[:-len(_ANKER_REPO_FILE) - 1] if p.endswith("/" + _ANKER_REPO_FILE) else ""
 
 
-def resolve_edge_belege(edges: Sequence[Mapping], root: str) -> Dict[str, Dict[str, object]]:
+def resolve_edge_belege(edges: Sequence[Mapping], root: str, baum: str = "") -> Dict[str, Dict[str, object]]:
     """Resolve the evidence of every edge by its ANCHOR TEXT.  Returns ``{edge id: {zeile, hinweis, status, treffer, datei}}``.
 
     ``zeile`` is the resolved line (the stored line stays visible as ``hinweis`` when nothing resolves).  Relative files are
     read under ``root``, absolute ones as they are (``extern_fehlt`` when such a file is not on this machine: not a problem, not
     verifiable).  Drift: edges whose anchor is unique show how far their region moved (hit - stored); a multi-hit anchor expects
     its hit at ``stored + median drift of the nearest unique edges of the same file`` -- so a prepend of N lines moves every hint by N
-    and an ambiguous anchor still lands on its own line instead of a stray namesake."""
+    and an ambiguous anchor still lands on its own line instead of a stray namesake.
+
+    ``baum`` (the label of the code tree under ``root``, ``"27b"`` or ``"nf"``; ``""`` = no filter, every edge is checked): an edge may
+    carry ``baeume`` (the labels of the trees whose code it documents; absent = both lines).  An edge that does not name ``baum`` is
+    ``andere_linie`` -- its evidence lives in the other line's code (the Dual form is a 27B-line feature), so it is NOT looked up in
+    this tree (no ``veraltet`` for code that was never here), and it is not a problem either."""
     texts: Dict[str, Optional[str]] = {}
     rows: List[Dict[str, object]] = []
     for e in edges:
@@ -314,6 +320,10 @@ def resolve_edge_belege(edges: Sequence[Mapping], root: str) -> Dict[str, Dict[s
             continue
         datei = str(b["datei"])
         path = datei if os.path.isabs(datei) else (os.path.join(root, datei) if root else "")
+        if baum and isinstance(e.get("baeume"), list) and baum not in e["baeume"]:
+            rows.append({"id": str(e.get("id", "")), "datei": datei, "hinweis": b.get("zeile"), "treffer": 0, "zeile": b.get("zeile"),
+                         "status": "andere_linie", "_path": path})
+            continue
         if path not in texts:
             try:
                 with open(path, encoding="utf-8") as fh:
@@ -390,6 +400,8 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
             used.add((name, str(d["to"])))
             d.update({"belegt": True, "quelle": "katalog+kuratiert", "kante": str(e.get("id", "")), "beleg": _beleg(e, belege.get(str(e.get("id", "")))),
                       "satz": str(e.get("satz") or ""), "wert": e.get("wert")})
+            if isinstance(e.get("baeume"), list):
+                d["baeume"] = list(e["baeume"])      # the edge documents the code of these trees only (absent = both lines)
             if e["rel"] != d.get("rel"):
                 d["rel_katalog"] = e["rel"]
                 rel_diff.append(str(e.get("id", "")))
@@ -405,6 +417,8 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
             "to": key[1], "rel": e["rel"], "effect": str(e.get("satz") or ""), "calc": e.get("calc") or "text", "belegt": True,
             "quelle": "katalog", "kante": str(e.get("id", "")), "beleg": _beleg(e, belege.get(str(e.get("id", "")))), "satz": str(e.get("satz") or ""),
             "wert": e.get("wert")})
+        if isinstance(e.get("baeume"), list):
+            ent["depends"][-1]["baeume"] = list(e["baeume"])
         new += 1
     n_with = n_without = n_kind_unknown = 0
     for ent in entries.values():
@@ -605,7 +619,7 @@ def _harvest(launcher_path: str, environ_path: str, server_args_path: str = "", 
 
 
 def _finish(entries: Dict[str, Dict[str, object]], curated: Mapping[str, Mapping], erklaert: Optional[Mapping[str, Mapping]],
-            tree_rev: str, launcher_path: str, edges_path: str, edges_root: str) -> Dict[str, object]:
+            tree_rev: str, launcher_path: str, edges_path: str, edges_root: str, baum: str = "") -> Dict[str, object]:
     """Curated and explained texts, the edge catalog, statistics and the wiring statement on top of harvested ``entries`` (in place)."""
     # ``erklaert`` = one-sentence texts written from the code's consumers (``profile_catalog_curated.ERKLAERT``), status
     # "erklaert"; ``curated`` (the hand-curated core) is applied after it and wins on a name clash, status "kuratiert".
@@ -623,7 +637,7 @@ def _finish(entries: Dict[str, Dict[str, object]], curated: Mapping[str, Mapping
     ref = _refusals_module()
     edges, einfo = load_edges(edges_path)
     root = edges_root or _repo_root_of(launcher_path)
-    belege = resolve_edge_belege(edges, root) if root else None
+    belege = resolve_edge_belege(edges, root, baum) if root else None
     merge_edges(entries, edges, einfo, [r.code for r in ref.REGISTER] if ref is not None else None, belege)
     cat = {"schema": SCHEMA, "tree_rev": tree_rev, "entries": entries, "stats": coverage(entries), "kanten": einfo}
     try:
@@ -640,10 +654,11 @@ def _finish(entries: Dict[str, Dict[str, object]], curated: Mapping[str, Mapping
 
 def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, Mapping], tree_rev: str = "",
                   server_args_path: str = "", edges_path: str = "", edges_root: str = "",
-                  erklaert: Optional[Mapping[str, Mapping]] = None, srt_dir: str = "") -> Dict[str, object]:
-    """The catalog of ONE tree.  ``srt_dir`` (optional) also harvests the names the code reads through ``os.environ``."""
+                  erklaert: Optional[Mapping[str, Mapping]] = None, srt_dir: str = "", baum: str = "") -> Dict[str, object]:
+    """The catalog of ONE tree.  ``srt_dir`` (optional) also harvests the names the code reads through ``os.environ``.  ``baum`` = the
+    label of this tree (``"27b"`` / ``"nf"``, see :func:`resolve_edge_belege`); ``""`` checks every edge's evidence in this tree."""
     entries = _harvest(launcher_path, environ_path, server_args_path, srt_dir)
-    return _finish(entries, curated, erklaert, tree_rev, launcher_path, edges_path, edges_root)
+    return _finish(entries, curated, erklaert, tree_rev, launcher_path, edges_path, edges_root, baum)
 
 
 def _differs(a: Mapping, b: Mapping) -> bool:
@@ -678,8 +693,22 @@ def build_union_catalog(trees: Sequence[Tuple[str, str]], curated: Mapping[str, 
             e["abweichung"] = {lb: {"default": o.get("default"), "help": o.get("help"), "source": o.get("source")} for lb, o in have}
     revs = dict(tree_revs or {})
     cat = _finish(union, curated, erklaert, "+".join("%s=%s" % (lb, revs.get(lb, "")) for lb, _p in trees), first_launcher, edges_path,
-                  edges_root)
+                  edges_root, baum=trees[0][0])
     labels = [lb for lb, _p in trees]
+    # The edges' evidence lines shown above are the FIRST tree's.  Every tree's own anchors are checked here (an edge that names only the
+    # other line's tree in ``baeume`` is ``andere_linie``, not a problem), so a stale anchor in EITHER tree shows in the file.
+    edges, _info = load_edges(edges_path)
+    per = {}
+    for i, (lb, py) in enumerate(trees):
+        root = (edges_root if i == 0 and edges_root else "") or _repo_root_of(find_tree_files(py)[0])
+        if root:
+            res = resolve_edge_belege(edges, root, lb)
+            stat: Dict[str, int] = {}
+            for r in res.values():
+                stat[str(r["status"])] = stat.get(str(r["status"]), 0) + 1
+            per[lb] = {"status": stat, "problem": sorted(i2 for i2, r in res.items() if r["status"] in ANKER_PROBLEM)}
+    if per:
+        cat["kanten"]["beleg_aufloesung_baeume"] = per
     # no ``python_dir``: a build path in the output would make the file differ from machine to machine (reproducible build)
     cat["trees"] = {lb: {"rev": revs.get(lb, ""), "entries": len(per_tree[lb])} for lb, _py in trees}
     cat["stats"]["baeume"] = {"nur_" + lb: sum(1 for e in union.values() if e.get("baeume") == [lb]) for lb in labels}
@@ -717,6 +746,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--python-dir", default="", help="<tree>/python (launcher.py and environ.py are read from it); ONE tree")
     ap.add_argument("--rev", default="")
+    ap.add_argument("--baum", default="", help="with --python-dir: the label of this tree (27b|nf); edges that name only the other tree are not checked")
     ap.add_argument("--tree-27b", default="", help="<tree>/python of the 27B line; with --tree-nf the catalog covers BOTH trees")
     ap.add_argument("--tree-nf", default="", help="<tree>/python of the NF line")
     ap.add_argument("--rev-27b", default="")
@@ -738,7 +768,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   erklaert=mod.ERKLAERT)
     else:
         launcher, environ, sargs = find_tree_files(py)
-        cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs, erklaert=mod.ERKLAERT, srt_dir=os.path.join(py, "sglang", "srt"))
+        cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs, erklaert=mod.ERKLAERT, srt_dir=os.path.join(py, "sglang", "srt"),
+                            baum=ns.baum)
     cat["glossar"] = dict(mod.GLOSSAR)
     text = json.dumps(cat, indent=1, sort_keys=True, ensure_ascii=False, default=str) + "\n"
     if ns.out:

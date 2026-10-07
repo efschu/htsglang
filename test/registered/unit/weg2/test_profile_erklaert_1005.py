@@ -26,6 +26,10 @@ def _load(name, path):
     return mod
 
 
+#: line probe (module exists, never a sha or a branch name): the Dual form (dual_green.py ...) is a 27B-line feature
+DUAL_LINE = os.path.isfile(os.path.join(WEG2, "dual_green.py"))
+TREE = "27b" if DUAL_LINE else "nf"
+
 PC = _load("t_pc_erklaert", os.path.join(WEG2, "profile_catalog.py"))
 CU = _load("t_cu_erklaert", os.path.join(WEG2, "profile_catalog_curated.py"))
 
@@ -36,9 +40,15 @@ def _build(erklaert=None, curated=None):
                             erklaert=CU.ERKLAERT if erklaert is None else erklaert, srt_dir=SRT)
 
 
+def _here(name, c):
+    """True when the explained name is expected in THIS tree: a ``baeume_erwartet`` mark names the trees that carry it (the NF-only schalter
+    ``["nf"]``, the seven 27B-only Dual names ``["27b"]``); an unmarked name is in both trees."""
+    return TREE in c.get("baeume_erwartet", [TREE])
+
+
 def _local_names():
-    """Namen mit Erklärtext, die in DIESEM Baum stehen (ohne die als ``baeume_erwartet`` gekennzeichneten Namen eines anderen Baums)."""
-    return [n for n, c in CU.ERKLAERT.items() if "baeume_erwartet" not in c]
+    """Namen mit Erklärtext, die in DIESEM Baum stehen (ohne die Namen, die nur der andere Baum trägt)."""
+    return [n for n, c in CU.ERKLAERT.items() if _here(n, c)]
 
 
 class Erklaert(unittest.TestCase):
@@ -54,12 +64,13 @@ class Erklaert(unittest.TestCase):
             | set(PC.server_args_flags(os.path.join(SRT, "server_args.py"))) \
             | set(PC.environ_fields(os.path.join(SRT, "environ.py"))) | set(PC.environ_constants(SRT))
         for name, e in CU.ERKLAERT.items():
-            if "baeume_erwartet" in e:
-                # nur im NF-Baum vermerkt: steht der Name hier doch, stimmt der Vermerk nicht mehr (Baum nachgezogen) und muss weg
-                self.assertNotIn(name, known, "%s steht jetzt in diesem Baum: baeume_erwartet prüfen" % name)
-                self.assertTrue(e.get("satz_quelle"), name)
-            else:
+            if _here(name, e):
                 self.assertIn(name, known, name)
+            else:
+                # nur im anderen Baum vermerkt: steht der Name hier doch, stimmt der Vermerk nicht mehr (Baum nachgezogen) und muss weg
+                self.assertNotIn(name, known, "%s steht jetzt in diesem Baum: baeume_erwartet prüfen" % name)
+                if "baeume_erwartet" in e:
+                    self.assertTrue(e.get("satz_quelle"), name)
             self.assertTrue(str(e.get("text", "")).strip(), name)
             self.assertEqual(e.get("level"), "experte", name)
 

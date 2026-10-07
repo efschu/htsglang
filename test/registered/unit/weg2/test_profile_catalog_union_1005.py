@@ -135,6 +135,32 @@ class Union(unittest.TestCase):
         self.assertEqual(cat["entries"]["--nf-only"]["baeume"], ["nf"])
         self.assertEqual(cat["entries"]["--both"]["baeume"], ["27b", "nf"])
 
+    def test_edge_anchors_are_checked_in_every_tree_and_baeume_marks_the_other_lines_code(self):
+        """Zwei Linien (NF-Katalog 07.10.): der Katalog nennt je Baum, ob alle Kanten-Anker aufloesen (``kanten.beleg_aufloesung_baeume``).  Eine Kante mit
+        ``baeume: [27b]`` ist im NF-Baum ``andere_linie`` (kein Problem, Datei und Anker dort nie gesucht), eine Kante OHNE ``baeume`` mit fehlendem Anker
+        bleibt ein Problem dieses Baums -- ``baeume`` ist der einzige Ausweg, nie ein stilles Ueberspringen."""
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            a = _tree(d, "a", [], [("--x", "hx"), ("--y", "hy"), ("--dualonly", "hd")])
+            b = _tree(d, "b", [], [("--x", "hx"), ("--y", "hy")])
+            mk = lambda i, von, nach, anker, **kw: dict({"id": i, "von": von, "nach": nach, "rel": "braucht", "calc": "text", "wert": None, "satz": "s",
+                                                         "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 2, "anker": anker}}, **kw)
+            edges = {"schema": PC.EDGES_SCHEMA, "kanten": [mk("K1", "--x", "--y", "add_argument('--x'"),
+                                                           mk("K2", "--dualonly", "--x", "add_argument('--dualonly'", baeume=["27b"]),
+                                                           mk("K3", "--y", "--x", "add_argument('--dualonly'")]}
+            ep = os.path.join(d, "edges.json")
+            with open(ep, "w", encoding="utf-8") as fh:
+                json.dump(edges, fh)
+            cat = PC.build_union_catalog([("27b", a), ("nf", b)], {}, {"27b": "r27", "nf": "rnf"}, edges_path=ep)
+        per = cat["kanten"]["beleg_aufloesung_baeume"]
+        self.assertEqual(per["27b"]["problem"], [])
+        self.assertEqual(per["nf"]["problem"], ["K3"])                                   # K3: no baeume, anchor missing in the NF tree
+        self.assertEqual(per["nf"]["status"], {"eindeutig": 1, "andere_linie": 1, "veraltet": 1})
+        dep = {x["kante"]: x for e in cat["entries"].values() for x in e["depends"]}
+        self.assertEqual(dep["K2"]["baeume"], ["27b"])
+        self.assertNotIn("baeume", dep["K1"])
+        self.assertEqual(dep["K1"]["beleg"]["aufloesung"], "eindeutig")                    # the shown line is the FIRST tree's (27b)
+
     def test_output_carries_no_build_path(self):
         """Reproduzierbarer Bau (Wunsch 27B-Sitz 05.10.): derselbe Quellstand ergibt dieselbe Datei, egal in welchem Verzeichnis die Bäume liegen.
         Ein Baum-Pfad in der Ausgabe (``trees.<baum>.python_dir``) machte sie von Maschine zu Maschine verschieden."""

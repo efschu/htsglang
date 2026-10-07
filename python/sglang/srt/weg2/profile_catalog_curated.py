@@ -208,6 +208,12 @@ CURATED: Dict[str, Dict[str, object]] = {
         "text": "JSON-Datei mit der gemessenen Tabelle je Karte/Tag/Gruppe, aus der W71 die VRAM-Spitze des Austauschs preist.",
         "gain": "Macht den Kartenaustausch preisbar.", "cost": "Muss für genau dieses Modell gemessen sein.",
         "depends": [_d("--weg2-weight-source", "braucht", "Nur mit exchange verlangt.", "text")]},
+    "--weg2-xchg-census-map": {
+        "kind": "flag", "group": "Speicher", "level": "experte", "planner_derived": False,
+        "text": "Benennt die Census-Zeile, aus der eine Karte gepreist wird, die nicht per UUID in der Census-Datei steht: Liste <live>=<Census-UUID>, <live> = Karten-UUID, nvml<N> oder Klasse (RTX3080). Ohne Eintrag leiht der Start die schwerste Zeile der gleichen Klasse (sonst der ganzen Census) und verweigert das als HW-BORROWED, bis Force gesetzt ist.",
+        "gain": "Fremde Karten, andere Kartenzahl oder anderes Rig starten mit dem Austausch, ohne dass die Census-Datei neu gemessen wird.",
+        "cost": "Die Bytes sind die einer anderen Karte; der Peak wird weiter gegen die echte VRAM-Summe der Karte geprueft.",
+        "depends": [_d("--weg2-xchg-census", "braucht", "Benennt eine Zeile dieser Census-Datei.", "text")]},
     "--weg2-vision": {
         "kind": "flag", "group": "Speicher", "level": "einfach", "planner_derived": False,
         "text": "'off' (Standard) startet beide Gruppen ohne Vision-Tower; 'resident' hält ihn geladen.",
@@ -1122,19 +1128,26 @@ ERKLAERT: Dict[str, Dict[str, object]] = {
     'SGLANG_WEG2_DEPOSIT_LANE_AHEAD': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
         "text": 'Wie viele Bahnen der Gewichtsablage im Voraus bereitgestellt werden (Standard 1). Wirkt nur mit SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD=1 (Standard aus).', "gain": '', "cost": '', "depends": []},
     'SGLANG_WEG2_DUAL_ANCHOR_AGING_TICKS': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
-        "text": 'Nach so vielen Ticks ohne Treffer (Standard 40) gilt ein Anker im Dual-Modus als veraltet. Wirkt nur mit SGLANG_WEG2_DUAL_ANCHOR_AGING=1 (Standard aus). Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": []},
+        "text": 'Nach so vielen Ticks ohne Treffer (Standard 40) gilt ein Anker im Dual-Modus als veraltet. Wirkt nur mit SGLANG_WEG2_DUAL_ANCHOR_AGING=1 (Standard aus). Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": [],
+        "satz_quelle": 'Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: "7 DUAL-Eintraege als nur-27B-Baum")', "baeume_erwartet": ["27b"]},
     'SGLANG_WEG2_DUAL_BYPASS_HEAD_AGE_S': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
-        "text": 'Wie lange (Sekunden, Standard 60) die älteste Anfrage im Dual-Modus überholt werden darf, bevor sie wieder an der Spitze steht. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": []},
+        "text": 'Wie lange (Sekunden, Standard 60) die älteste Anfrage im Dual-Modus überholt werden darf, bevor sie wieder an der Spitze steht. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": [],
+        "satz_quelle": 'Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: "7 DUAL-Eintraege als nur-27B-Baum")', "baeume_erwartet": ["27b"]},
     'SGLANG_WEG2_DUAL_D_REGROW_HOLD_S': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
-        "text": 'Sperre in Sekunden (Standard 5): so lange nach einem Wachsen des D-KV darf D nicht wieder schrumpfen, sonst käme eine zweite P-Pause; nur im Dual-Modus, Gruppe D. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": []},
+        "text": 'Sperre in Sekunden (Standard 5): so lange nach einem Wachsen des D-KV darf D nicht wieder schrumpfen, sonst käme eine zweite P-Pause; nur im Dual-Modus, Gruppe D. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": [],
+        "satz_quelle": 'Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: "7 DUAL-Eintraege als nur-27B-Baum")', "baeume_erwartet": ["27b"]},
     'SGLANG_WEG2_DUAL_D_UNBACKED_DROP_WAIT_S': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
-        "text": 'Wartezeit in Sekunden (Standard 8): so lange muss P auf seine Karte gewartet haben, bevor D nicht gesicherte Cache-Blätter („unbacked“) verwirft und den Platz abgibt; wirkt nur mit SGLANG_WEG2_DUAL_D_UNBACKED_DROP_ON_WAIT=1 (Standard aus). Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": []},
+        "text": 'Wartezeit in Sekunden (Standard 8): so lange muss P auf seine Karte gewartet haben, bevor D nicht gesicherte Cache-Blätter („unbacked“) verwirft und den Platz abgibt; wirkt nur mit SGLANG_WEG2_DUAL_D_UNBACKED_DROP_ON_WAIT=1 (Standard aus). Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": [],
+        "satz_quelle": 'Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: "7 DUAL-Eintraege als nur-27B-Baum")', "baeume_erwartet": ["27b"]},
     'SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR_MAX': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
-        "text": 'Höchstens so viele jüngere Anfragen (Standard 4) dürfen eine blockierte älteste Anfrage überholen; wirkt nur mit SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR=1 (Standard aus), nur im Dual-Modus. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": []},
+        "text": 'Höchstens so viele jüngere Anfragen (Standard 4) dürfen eine blockierte älteste Anfrage überholen; wirkt nur mit SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR=1 (Standard aus), nur im Dual-Modus. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": [],
+        "satz_quelle": 'Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: "7 DUAL-Eintraege als nur-27B-Baum")', "baeume_erwartet": ["27b"]},
     'SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD_MAX': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
-        "text": 'Höchstens so viele angesagte Anker (Standard 24) werden im Dual-Modus gleichzeitig gehalten. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": []},
+        "text": 'Höchstens so viele angesagte Anker (Standard 24) werden im Dual-Modus gleichzeitig gehalten. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": [],
+        "satz_quelle": 'Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: "7 DUAL-Eintraege als nur-27B-Baum")', "baeume_erwartet": ["27b"]},
     'SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD_RUNS': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
-        "text": 'Ein gehaltener, angesagter Anker bleibt höchstens so viele Cap-Läufe (Standard 256) im Dual-Modus gehalten. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": []},
+        "text": 'Ein gehaltener, angesagter Anker bleibt höchstens so viele Cap-Läufe (Standard 256) im Dual-Modus gehalten. Nur im 27B-Baum vorhanden (nicht im NF-Baum).', "gain": '', "cost": '', "depends": [],
+        "satz_quelle": 'Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: "7 DUAL-Eintraege als nur-27B-Baum")', "baeume_erwartet": ["27b"]},
     'SGLANG_WEG2_D_DECODE_FIRST_ROUNDS': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
         "text": 'Anzahl Runden (Standard 32), in denen D beim Aufwecken zuerst dekodiert (Decode-First). Wirkt nur mit SGLANG_WEG2_ENABLE_D_DECODE_FIRST=1 (Standard aus).', "gain": '', "cost": '', "depends": []},
     'SGLANG_WEG2_D_DECODE_FIRST_TAIL': {"kind": 'env', "group": 'Weitere', "level": "experte", "planner_derived": False,
@@ -1195,8 +1208,8 @@ ERKLAERT: Dict[str, Dict[str, object]] = {
 # ---------------------------------------------------------------------------------------------------------
 # NF-Sitz, Bericht 1504 (05.10.2026): 14 Erklärtexte der NF-Schalter, wortgetreu aus Spalte (1)-(6) übernommen (Umlaute statt Umschrift;
 # Zahlen, "unbelegt"-Marken und Rückfall-Hinweise erhalten, nichts ergänzt). Freigabe als Katalogtext durch den NF-Sitz 19:22Z.
-# ``baeume_erwartet``: Namen, die nur im NF-Baum stehen; der Generator prüft das gegen die Bäume (Warnung bei Abweichung) und führt
-# sie in einem Ein-Baum-Katalog ohne diesen Baum nicht als Eintrag. ``satz_quelle`` sagt, woher der Satz stammt.
+# ``baeume_erwartet``: Namen, die nur in einem Baum stehen (``["nf"]``; die sieben Dual-Namen oben ``["27b"]``); der Generator prüft das gegen die Bäume
+# (Warnung bei Abweichung) und führt sie in einem Ein-Baum-Katalog ohne diesen Baum nicht als Eintrag. ``satz_quelle`` sagt, woher der Satz stammt.
 ERKLAERT.update({
     'SGLANG_WEG2_PARK_END_ANCHOR_FIRST': {"kind": "env", "group": 'Weitere', "level": "experte", "planner_derived": False,
         "text": 'Wenn eine angehaltene (geparkte) Anfrage später weiterlaufen soll und der Platz für Mamba-Anker im Host-RAM voll ist, bekommt ihr Wiedereinstiegspunkt Vorrang: andere Zwischenstände ohne Park-Bezug werden zuerst auf die Platte ausgelagert, damit der Einstiegspunkt der geparkten Anfrage nicht verloren geht. Aus: der alte Weg; geparkte Anfragen können ihren Einstiegspunkt verlieren und neu rechnen. Ohne Park ändert sich nichts. Wirkt nur auf Knoten, die als geparkt markiert sind. Standard an. Unbelegt: Abhängigkeit zu einem anderen Schalter; ob der Nutzer ihn ändern soll (belegt ist nur der Entscheid „bleibt an“ vom 05.10. ~17:47Z); Nutzen am Metall (laut Bericht „active, effect not shown“).', "gain": "", "cost": "", "depends": [],
