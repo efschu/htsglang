@@ -29,7 +29,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import (energy, features, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
+from . import (energy, features, flipzeit, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
                modellprofil, profil, profil_recompute, redact, sampler, sources, vmpush, weg2line)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -282,6 +282,7 @@ class App:
         # Nutzer-Order 01.10. ~07:40Z: rigdash liest die Zeitreihen per PromQL aus VictoriaMetrics
         self.vm = vmpush.VmClient(args.vm_url) if getattr(args, "vm_url", "") else None
         self.vm_boot_cache: dict = {}         # stem -> (fetched_t, vmpush.boot_rates) of finished boots
+        self.flip_boot_cache: dict = {}       # stem -> (fetched_t, flipzeit tile of that boot) of finished boots
         self.live_cache = LiveCache(lambda: self.snapshot(True, None))
 
     def vm_boot(self, b: dict, now: float) -> Optional[dict]:
@@ -299,6 +300,31 @@ class App:
             v = {"prefill": {}, "decode": None, "error": "%s: %s" % (type(e).__name__, e)}
         self.vm_boot_cache[b["stem"]] = (now, v)
         return v
+
+    def flip_zeit(self, boots: list, now: float) -> None:
+        """Nutzer 06.10.: THE Flipzeit figures of the page, one function (history.flip_tile -> flipzeit.tile) over the
+        history marks.  Ueberblick: ``flip_zeit`` = the last flipzeit.OVERVIEW_S of the boot's model (all its boots);
+        ``flip_boot`` = the whole boot (start .. last sign of life, "seit Boot" while it lives): the Boot-Liste row and
+        the Ueberblick switch.  The Verlauf tile is the same function over its own range."""
+        by_model: dict = {}
+        for b in boots:
+            model = history.model_of_ipc(b.get("ipc") or {})
+            if model not in by_model:
+                by_model[model] = history.flip_tile(self.hist, model, now - flipzeit.OVERVIEW_S, now,
+                                                    flipzeit.window_label(flipzeit.OVERVIEW_S))
+            b["flip_zeit"] = by_model[model]
+            if b.get("first_t") is None:
+                continue
+            if b.get("live"):
+                # Nutzer 06.10.: the Ueberblick switch "seit Boot": the same function, this boot's start .. now
+                b["flip_boot"] = history.flip_tile(self.hist, model, b["first_t"], now, "seit Boot")
+                continue
+            hit = self.flip_boot_cache.get(b["stem"])
+            if hit is None or (now - hit[0] >= 60.0 and (b.get("age_s") or 0) <= 1800.0):
+                hi = (b.get("last_log_t") or now) + 5.0
+                hit = (now, history.flip_tile(self.hist, model, b["first_t"], hi, "ganzer Boot"))
+                self.flip_boot_cache[b["stem"]] = hit
+            b["flip_boot"] = hit[1]
 
     def energy_loop(self, stop: threading.Event):
         """Every 5 s: account the closed 5-s intervals of every live boot (energy.py); which class
@@ -368,6 +394,7 @@ class App:
                 finish_series(b, gser, now, live.BUCKET_S, key="series_zoom")
             b["energy"] = self.energy.view(b["stem"], (b.get("totals") or {}).get("boot_wall_s"))
             b["vm_boot"] = self.vm_boot(b, now)
+        self.flip_zeit(boots, now)
         with self.imgchg_lock:
             images, img_err = self.imgchg.load()
         return {
@@ -398,7 +425,7 @@ class App:
 LIVE_TTL_S = 1.0
 #: what the "Letzte Boots" table reads of a boot that is not shown as a card (lean page payload)
 LEAN_KEEP = ("stem", "meta", "age_s", "live", "primary", "first_t", "last_log_t", "flip_count", "totals",
-             "alarm", "container", "end", "stop_count", "error_count", "boot_s", "dur_s", "vm_boot")
+             "alarm", "container", "end", "stop_count", "error_count", "boot_s", "dur_s", "vm_boot", "flip_boot")
 
 
 def lean_boot(b: dict) -> dict:
@@ -410,10 +437,6 @@ def lean_boot(b: dict) -> dict:
                      for g, v in (b.get("decode") or {}).items()}
     ipc = b.get("ipc") or {}
     out["ipc"] = {k: ipc.get(k) for k in ("lifecycle", "terminal", "model", "tag", "boot_id", "cause") if k in ipc}
-    # Nutzer 02.10.: "Letzte Boots" shows the Flipzeit p50/p90/max per direction (and "fehlt (Feld X)")
-    out["flip_last"] = {d: {k: (x or {}).get(k) for k in ("n", "median", "p90", "max")}
-                        | {"newest": {k: ((x or {}).get("newest") or {}).get(k) for k in ("kind", "missing")}}
-                        for d, x in (b.get("flip_last") or {}).items()}
     out["lean"] = True
     return out
 

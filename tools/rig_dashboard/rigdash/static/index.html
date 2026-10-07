@@ -552,7 +552,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
       <div class="vp"><h3><span>Decode-Durchsatz <span class="muted">tok/s &middot; alle Streams und je Stream</span></span><span id="vl-s-dec"></span></h3><div class="u" id="vl-c-dec"></div></div>
       <div class="vp"><h3><span>Input-Tokens: aus Cache / neu gerechnet <span class="muted">tok/s, gestapelt &middot; Übergabe P&rarr;D gestrichelt, nie Cache</span></span><span id="vl-s-cache"></span></h3><div class="u" id="vl-c-cache"></div></div>
       <div class="vp"><h3><span>KV-Cache-Belegung <span class="muted">% der KV-Token je Gruppe</span></span><span id="vl-s-kv"></span></h3><div class="u" id="vl-c-kv"></div></div>
-      <div class="vp w2"><h3><span>Flipzeit je Flip <span class="muted">s &middot; letztes Token &rarr; erstes Token &middot; P&rarr;D: P-Chunk-Ende &rarr; erstes Decode-Token &middot; D&rarr;P: Decode-Ende &rarr; erster Prefill-Forward auf P (PP0) (ab 02.10.)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
+      <div class="vp w2"><h3><span>Flipzeit je Flip <span class="muted">s &middot; P&rarr;D: letzter P-Chunk fertig &rarr; erstes Decode-Token erzeugt &middot; D&rarr;P: letztes Decode-Token erzeugt &rarr; erster Prefill-Chunk beginnt zu rechnen &middot; nur gez&auml;hlte Flips (Nutzer 06.10.)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
     </div>
     <div class="vl-grafana" id="vl-grafana"></div>
   </section>
@@ -853,6 +853,18 @@ function setPhaseSpan(v) {
   try { localStorage.setItem("rigdash.phaseSpan", String(v)); } catch (e) { /* private window */ }
   refresh(true);
 }
+// Nutzer 06.10.: Fenster der Flipzeit-Kachel im Überblick, Schalter "60 min" / "seit Boot" (beide: flipzeit.tile über die
+// Marken, b.flip_zeit bzw. b.flip_boot); der Wert bleibt wie die anderen Schalter der Seite im localStorage
+let flipWinMode = "60";
+try { flipWinMode = localStorage.getItem("rigdash.flipWin") === "boot" ? "boot" : "60"; } catch (e) { flipWinMode = "60"; }
+function setFlipWin(v) {
+  flipWinMode = v === "boot" ? "boot" : "60";
+  try { localStorage.setItem("rigdash.flipWin", flipWinMode); } catch (e) { /* private window */ }
+  refresh(true);
+}
+const flipWinOf = (b) => (flipWinMode === "boot" ? b.flip_boot : b.flip_zeit) || {};
+const flipWinSwitch = () => `<span class="span">${[["60", "60 min"], ["boot", "seit Boot"]].map(([v, t]) =>
+  `<button type="button" class="${flipWinMode === v ? "sel" : ""}" onclick="setFlipWin('${v}')">${t}</button>`).join("")}</span>`;
 const dur = (s) => s < 90 ? fmt(s, s < 10 ? 1 : 0) + " s" : fmt(s / 60, 1) + " min";
 function phaseName(k, single) { return single && k === "P" ? "Prefill" : (PHASE[k] || [k])[0]; }
 /* DEPTH-BEGIN -- Nutzer 02.10. ~12:04Z/~12:15Z: beim Hover nicht nur wie viele Token, sondern
@@ -1311,9 +1323,8 @@ function bootCard(b, now, binders) {
   const topoSrc = ipc && Object.keys(ipc.topology || {}).length ? ipc.topology : m.topology;
   const topo = topoSrc ? Object.entries(topoSrc).map(([g, t]) => `${g}: TP${t.tp || 1}${t.pp > 1 ? "·PP" + t.pp : ""}`).join(", ") : "";
   const q = fr ? fr.queue : (b.queue ? b.queue.queue : null);
-  // Flipzeit (Nutzer 02.10.): letztes Token -> erstes Token je Richtung, Balken = diese Gesamtzeit (flip_views)
-  const ft = b.flip_times || {};
-  const recent = (ft.recent || []).filter((r) => r.ms != null);
+  // Flipzeit (Nutzer 06.10.): EINE Berechnung (flipzeit.py, b.flip_zeit = Fenster der Überblick-Kachel), Balken = die gezählten Flips
+  const recent = (flipWinOf(b).recent || []).filter((r) => r.ms != null);
   let flipHtml = "";
   if (recent.length) {
     const mx = Math.max(...recent.map((r) => r.ms), 1);
@@ -1350,11 +1361,11 @@ function bootCard(b, now, binders) {
         <div class="state">${lastFlip ? `letzter ${esc(lastFlip.slept)}→${esc(lastFlip.woke)} vor ${ago(now - lastFlip.t)}` : "noch kein Flip"}</div>
         ${kv([
           ...["P>D", "D>P"].map((dir) => {
-            const fl = ((b.flip_last || {})[dir]) || {}, x = fl.last, miss = flipMissing(fl);
+            const fz = flipWinOf(b), f = flipWin(fz, dir), miss = flipMissing(b, dir);
             return [`<b>Flipzeit ${dir.replace(">", "&rarr;")}</b> <span class="muted" title="${esc(FLIP_DEF[dir])}">(letzte)</span>`,
-              (miss ? `<b>neuester: ${miss}</b>` + (x ? "<br>" : "") : "")
-              + (x ? `<b>${sec(x.total_ms)} s</b> <span class="muted">&middot; ${flipStats(fl)}${fl.idle_n ? " &middot; Leerlauf-Flips " + fl.idle_n : ""}</span><br><span class="muted">${flipParts(x)}</span>`
-                + (x.p_depth && x.p_depth.x != null ? `<br><span class="muted">${dt("nachprefill")} ${tokRange(x.p_depth.x, x.p_depth.y, x.p_depth.n)}</span>` : "")
+              (miss ? `<b>neuester: ${miss}</b>` + (f.n ? "<br>" : "") : "")
+              + (f.n ? `<b>${sec(f.last_ms)} s</b> <span class="muted">&middot; ${flipStats(f)} &middot; ${esc(flipWinLabel(fz))}${f.idle_n ? " &middot; Leerlauf-Flips " + f.idle_n : ""}</span><br><span class="muted">${flipParts(f, dir)}</span>`
+                + flipDepth(b, dir, f)
                 : miss ? "" : "—"), "keep"];
           }),
           ["Warteschlange Front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : MISSTAG("front.queue")), "keep"],
@@ -1364,7 +1375,7 @@ function bootCard(b, now, binders) {
           ["Rang-Stopps (benannt)", fieldIpc(b, "A14") ? fieldIpc(b, "A14").value.slice(-3).map((x) => `${esc(x.group)}.${esc(x.rank)} ${esc(x.code)}${x.ticket ? " " + esc(x.ticket) : ""}`).join(" &middot; ") + " " + ipcTag(fieldIpc(b, "A14").ipc_src) : fmt(b.stop_count || 0) + " " + srcOf(b, "A14")],
           fieldIpc(b, "C6") ? ["D-Sitze n &middot; geparkt", `${fmt(fieldIpc(b, "C6").value.n)} &middot; ${fmt(fieldIpc(b, "C6").value.parked_n)} ${ipcTag("front.d_seats")}`] : null,
         ])}
-        ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${recent.length} Flips, Höhe = Flipzeit (letztes → erstes Token) &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
+        ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${recent.length} gezählte Flips, Höhe = Flipzeit &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
       </div>
     </div>
     <div class="x">${cacheHtml(b, now, awake)}</div>
@@ -1651,10 +1662,9 @@ function endCell(b) {
 // Nutzer 02.10. (später): a finished boot past the 16-min ring had no tok/s -- its whole-boot figures come from
 // VictoriaMetrics (vm_boot: the sampler's decode sums, the rank counters' prefill), the ring only as fallback.
 function flipCell(b, dir) {
-  const lv = ((b.flip_last || {})[dir]) || null, vv = (((b.vm_boot || {}).flips || {})[dir]) || null;
-  const fl = lv && (lv.n || flipMissing(lv)) ? lv : vv || lv;
-  if (!fl || !fl.n) return flipMissing(fl) || "—";
-  return `<span title="n=${fl.n}${fl.src ? " · " + esc(fl.src) : ""}">${sec(fl.median)} / ${sec(fl.p90)} / ${sec(fl.max)}</span>`;
+  const f = ((b.flip_boot || {})[dir]) || null;      // ganzer Boot, flipzeit.py über die Historie-Marken (eine Berechnung)
+  if (!f || !f.n) return "—";
+  return `<span title="n=${f.n} · ganzer Boot · gezählte Flips · ${esc(FLIP_DEF[dir])}">${sec(f.p50_ms)} / ${sec(f.p90_ms)} / ${sec(f.max_ms)}</span>`;
 }
 function decCell(b) {
   const vd = (b.vm_boot || {}).decode;
@@ -1678,7 +1688,7 @@ function historyHtml(boots, now) {
     const p = (b.prefill || {})[g];
     return p && p.last_burst && p.last_burst.tps != null ? fmt(p.last_burst.tps) : "—";
   };
-  return `<table><tr><th>Modell</th><th>Tag</th><th class="num" title="Boot-Start (boot_id) bis Ende bzw. letztes IPC-Lebenszeichen">Dauer</th><th class="num" title="Boot-Start (boot_id) bis serving (state.json serving_since_ts)">Bootzeit</th><th class="num">letzte IPC-Probe</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Flipzeit = letztes Token → erstes Token, p50 / p90 / max je Richtung (laufender Boot: flip_views; beendeter: VictoriaMetrics weg2_flip_user_view_ms def=t2t)">Flipzeit P&rarr;D<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="wie links, D→P bis zum ersten Prefill-Forward auf P (PP0)">Flipzeit D&rarr;P<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Summe #new-token, Prefill batch, nur PP0">P neu &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Summe #new-token, Prefill batch, nur TP0">D neu &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Summe completion_tokens der Front-Zeilen WEG2-SERVED">dekodiert &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>Ende</th></tr>` +
+  return `<table><tr><th>Modell</th><th>Tag</th><th class="num" title="Boot-Start (boot_id) bis Ende bzw. letztes IPC-Lebenszeichen">Dauer</th><th class="num" title="Boot-Start (boot_id) bis serving (state.json serving_since_ts)">Bootzeit</th><th class="num">letzte IPC-Probe</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Flipzeit P→D = letzter P-Chunk fertig → erstes Decode-Token erzeugt; p50 / p90 / max über alle gezählten Flips des GANZEN Boots (dieselbe Berechnung wie die Kacheln, flipzeit.py)">Flipzeit P&rarr;D<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Flipzeit D→P = letztes Decode-Token erzeugt → erster Prefill-Chunk beginnt zu rechnen; sonst wie links (ganzer Boot, gezählte Flips)">Flipzeit D&rarr;P<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Summe #new-token, Prefill batch, nur PP0">P neu &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Summe #new-token, Prefill batch, nur TP0">D neu &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Summe completion_tokens der Front-Zeilen WEG2-SERVED">dekodiert &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>Ende</th></tr>` +
     rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">${ago(b.dur_s)}</td><td class="num">${b.boot_s == null ? "—" : fmt(b.boot_s, 0) + " s"}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${decCell(b)}</td><td class="num">${fmt(b.flip_count)}</td><td class="num">${flipCell(b, "P>D")}</td><td class="num">${flipCell(b, "D>P")}</td><td class="num">${fmt((b.totals || {}).p_new)}</td><td class="num">${fmt((b.totals || {}).d_new)}</td><td class="num">${fmt((b.totals || {}).decoded)}${(b.totals || {}).read_progress < 1 ? "*" : ""}</td>${endCell(b)}</tr>`).join("") +
     `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill-Spalten: Rechenrate (gpu-ms) des letzten Schubs, langsamster Rang; Decode: Mittel über die ganze Dekodierzeit des Boots (Token / Decode-Sekunden, nur stetige Intervalle), darunter Ø Sitze; der letzte Wert steht im Tooltip.</div>`;
 }
@@ -1689,30 +1699,39 @@ function historyHtml(boots, now) {
 // Fenster. Jede Zahl ist dieselbe wie im Boots-Tab (gleiche Felder), nur ohne die Messdetails.
 const lineOf = (b) => /27b/i.test(`${(b.meta || {}).tag || ""} ${b.stem || ""} ${((b.ipc || {}).dir) || ""}`) ? "27B" : "NF";
 const sec = (ms) => ms == null || !isFinite(ms) ? "—" : fmt(ms / 1000, ms < 10000 ? 2 : 1);
-// Nutzer 02.10.: FLIPZEIT = letztes Token der abgebenden Phase -> erstes Token der annehmenden (beide Richtungen,
-// beide Modelle), die eine Zahl.  Layer/Vorlauf/Nachlauf nur als Teile, die zusammen die Flipzeit ergeben (+ Rest).
-const FLIP_DEF = {"P>D": "Ende des letzten P-Prefill-Chunks → erstes Decode-Token auf D",
-  "D>P": "letztes Decode-Token auf D → Beginn des ersten Prefill-Batches auf P (erster Forward auf PP0; die Pipeline-Füllung PP0 → letzte Stufe ist Prefill)"};
-function flipParts(x) {
-  if (!x || x.total_ms == null) return "";
-  const p = (k, v) => `${k} ${sec(v)}`;
-  // D>P: der Vorlauf benannt (Summe = Vorlauf): leer = D's letztes Token bis zur Ankunft des Requests, der P braucht
-  // (davon D-Prefill im Rang-Takt), halt = Ankunft bis Park/flip_begin, park = Park-RPC, Rest bis flip_begin
+// Nutzer 06.10. (EINZIGE Definition, flipzeit.DEFINITION; tests/test_flipzeit_1006.py prüft die Gleichheit):
+// P>D = letzter P-Chunk fertig -> erstes Decode-Token erzeugt; D>P = letztes Decode-Token erzeugt -> erster Prefill-Chunk
+// beginnt zu rechnen.  Ausnahme: kein Flip zählt, wenn kein Prefill oder Decode ansteht.  Layer/Vorlauf/Nachlauf nur als
+// Zerlegung der einen Zahl (Summe = Flipzeit, + Rest), nie als eigene Flipzeit.
+const FLIP_DEF = {"P>D": "letzter P-Chunk fertig → erstes Decode-Token erzeugt",
+  "D>P": "letztes Decode-Token erzeugt → erster Prefill-Chunk beginnt zu rechnen (erster Forward auf PP0)"};
+const FLIP_EXCEPTION = "Kein Flip zählt, wenn kein Prefill oder Decode ansteht (Leerlauf-Flip).";
+const flipWin = (fz, dir) => ((fz || {})[dir]) || {};
+const flipWinLabel = (fz) => "Fenster: " + (((fz || {}).window || {}).label || "?");
+// die Zerlegung der einen Zahl aus dem Marken-Label (f.parts: Millisekunden, Summe = Flipzeit +- Rundung)
+function flipParts(f, dir) {
+  if (!f || f.last_ms == null || !f.parts) return "";
+  const x = f.parts, p = (k, v) => `${k} ${sec(v)}`;
   const vor = x.leer_ms != null
-    ? ` <span class="muted">(Vorlauf = leer ohne Request ${sec(x.leer_ms)}${x.leer_d_prefill_ms ? `, davon D-Prefill ${sec(x.leer_d_prefill_ms)}` : ""} + Halt ${sec(x.halt_ms)} + Park ${sec(x.park_ms)} + Rest ${sec(x.vor_rest_ms)})</span>`
-    : (x.dir === "D>P" ? ` <span class="muted">(Vorlauf-Zerlegung fehlt: keine Ankunft des Requests)</span>` : "");
-  return `Teile: ${p("Vorlauf", x.vorlauf_ms)} + ${p("Layer-Tausch", x.layer_ms)} + ${p("Wake-KV/DC", x.wake_kv_dc_ms)} + ${p("Nachlauf", x.nachlauf_ms)} + ${p("Rest", x.rest_ms)} = ${sec(x.total_ms)} s`
-    + vor
-    + (x.provisional ? ` <span class="muted">(vorläufig: D's Log hat seine letzten Runden noch nicht geschrieben)</span>` : "")
-    + (x.end_res_ms ? ` <span class="muted">(Rest = Rang-Takt ${fmt(x.end_res_ms)} ms: Ende liegt dort)</span>` : "")
-    + (x.nachlauf_d_extend_ms ? ` <span class="muted">(im Nachlauf D-Extend ${sec(x.nachlauf_d_extend_ms)} s)</span>` : "");
+    // Nutzer 06.10.: Server-Leerlauf (letztes D-Token -> Ankunft des Wartenden) ist keine Flipzeit; der Start ist
+    // max(letztes D-Token, Ankunft), "leer" ist also 0 und erscheint nur noch in alten Marken (> 0)
+    ? ` <span class="muted">(Vorlauf = ${x.leer_ms > 0 ? `leer ohne Request ${sec(x.leer_ms)} + ` : ""}Halt ${sec(x.halt_ms)} + Park ${sec(x.park_ms)} + Rest ${sec(x.vor_rest_ms)})</span>`
+    : (dir === "D>P" ? ` <span class="muted">(Vorlauf-Zerlegung fehlt: keine Ankunft des Requests)</span>` : "");
+  return `Zerlegung: ${p("Vorlauf", x.vorlauf_ms)} + ${p("Layer-Tausch", x.layer_ms)} + ${p("Wake-KV/DC", x.wake_kv_dc_ms)} + ${p("Nachlauf", x.nachlauf_ms)} + ${p("Rest", x.rest_ms)} = ${sec(f.last_ms)} s` + vor;
 }
-function flipStats(fl) {
-  return fl && fl.n ? `p50 ${sec(fl.median)} &middot; p90 ${sec(fl.p90)} &middot; max ${sec(fl.max)} s &middot; n=${fl.n}` : "";
+function flipStats(f) {
+  return f && f.n ? `p50 ${sec(f.p50_ms)} &middot; p90 ${sec(f.p90_ms)} &middot; max ${sec(f.max_ms)} s &middot; n=${f.n}` : "";
 }
-function flipMissing(fl) {
-  const nw = fl && fl.newest;
-  return nw && nw.kind === "fehlt" ? `fehlt (Feld ${esc(nw.missing || "?")})` : "";
+// nicht gezählt, aber benannt: ein Flip ohne Endpunkt (b.flip_diag, 16-min-Ring der IPC-Probe)
+function flipMissing(b, dir) {
+  const dg = ((b.flip_diag || {})[dir]) || {};
+  return dg.missing ? `fehlt (Feld ${esc(dg.missing)})` : "";
+}
+// das Tiefen-Detail der P-Seite gehört nur dann zum letzten Flip, wenn es dessen Beginn trägt
+function flipDepth(b, dir, f) {
+  const dg = ((b.flip_diag || {})[dir]) || {}, pd = dg.p_depth;
+  if (!pd || pd.x == null || f.last_t == null || dg.p_depth_t == null || Math.abs(dg.p_depth_t - f.last_t) > 0.01) return "";
+  return `<br><span class="muted">${dt("nachprefill")} ${tokRange(pd.x, pd.y, pd.n)}</span>`;
 }
 function ttftOf(b, d) {
   const m = lineOf(b), v = d.vm || {};
@@ -1759,16 +1778,17 @@ function actKey(b) {
   return {P: "P", single: "P", D: "D", dec: "dec"}[p.k] || "";
 }
 function flipKpi(b, dir, now) {
-  const fl = ((b.flip_last || {})[dir]) || {};
-  const x = fl.last, miss = flipMissing(fl);
+  const fz = flipWinOf(b), f = flipWin(fz, dir), dg = ((b.flip_diag || {})[dir]) || {};
+  const miss = flipMissing(b, dir);
   const sub = [miss ? `<b>neuester Flip: ${miss}</b>` : null,
-    x ? flipParts(x) : (b.flip_count ? "noch kein gemessener Flip im 16-min-Ring" : "noch kein Flip"),
-    x ? `<span class="muted">${ago(now - x.begin)} her &middot; ${flipStats(fl)}</span>` : null,
-    fl.missing_n ? `<span class="muted">${fl.missing_n} Flips mit fehlendem Endpunkt, nicht gezählt</span>` : null,
-    fl.idle_n ? `<span class="muted">Leerlauf-Flips (ohne wartende Arbeit): ${fl.idle_n}, nicht gezählt</span>` : null].filter(Boolean).join("<br>");
-  return kpi(`Flipzeit ${dir.replace(">", "&rarr;")} &middot; letzte`, miss && !x ? {na: miss} : x ? sec(x.total_ms) : null, "s", sub,
+    f.n ? flipParts(f, dir) : (b.flip_count ? "noch kein gezählter Flip im Fenster" : "noch kein Flip"),
+    f.n ? `<span class="muted">${ago(now - f.last_t)} her &middot; ${flipStats(f)}</span>` : null,
+    `<span class="muted">${esc(flipWinLabel(fz))}${flipWinMode === "60" ? " (alle Boots dieses Modells)" : " (dieser Boot)"}</span> ${flipWinSwitch()}`,
+    dg.missing_n ? `<span class="muted">${dg.missing_n} Flips mit fehlendem Endpunkt im 16-min-Ring, nicht gezählt</span>` : null,
+    f.idle_n ? `<span class="muted">Leerlauf-Flips (kein Prefill/Decode stand an): ${f.idle_n}, nicht gezählt</span>` : null].filter(Boolean).join("<br>");
+  return kpi(`Flipzeit ${dir.replace(">", "&rarr;")} &middot; letzte`, miss && !f.n ? {na: miss} : f.n ? sec(f.last_ms) : null, "s", sub,
     "wide" + (actKey(b) === "flip:" + dir ? " act" : ""), dir === "P>D" ? "var(--s7)" : "var(--s5)",
-    "Flipzeit = " + FLIP_DEF[dir] + (x ? " · Quelle: " + (x.src || "") : ""));
+    "Flipzeit = " + FLIP_DEF[dir] + " · " + FLIP_EXCEPTION + " · " + flipWinLabel(fz));
 }
 function ovCard(b, d, now) {
   const a = b.alarm || {}, st = a.state, ipc = b.ipc || {};

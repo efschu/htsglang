@@ -8,7 +8,7 @@ Zwei Routen im Rig-Dashboard (nur Edition rig, nur im LAN):
   POST /api/hwprofil/cancel   gibt ein noch wartendes Fenster zurück
 
 Die Messung läuft NUR in einem gebuchten gpuq-Fenster (Rig-Regel): die Route bucht selbst über die gpuq-HTTP-API,
-Eigentümer ``profil-editor``, nur die zu messenden Karten, 10 min, ohne not_before.
+Eigentümer ``profil-editor``, nur die zu messenden Karten, 15 min (Auftrag 1006, siehe WINDOW), ohne not_before.
 
   * Ist das Fenster nicht ``running`` (``pending``), gibt die Route den Fensterstatus zurück und misst NICHT.  Die
     Buchung bleibt in der Warteschlange; ein erneuter Knopfdruck derselben Karten nimmt sie wieder auf (kein
@@ -40,14 +40,18 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 OWNER = "profil-editor"
-WINDOW = "10m"
+#: Auftrag 1006: der Messlauf umfasst jetzt je Karte alle Rechenformate (int8, NVFP4 W4A8 über JIT, Marlin) UND die
+#: BAR1-Strecke je Paar (drei Kindprozesse, Erweiterung, Byte-Beweis, sechs gerichtete Paare).  Warm (JIT-Cache da)
+#: etwa 4-5 min, mit kalter JIT-Übersetzung des W4A8-Kernels 8-12 min: 10 min waren dafür zu knapp, 15 min tragen den
+#: kalten Lauf (Kindprozess-Deckel CHILD_CAP_S, BAR1-Schritt darin höchstens 300 s).
+WINDOW = "15m"
 PURPOSE = "Hardwareprofil messen (Profil-Editor S2)"
 #: gpuq: ab so viel belegtem Speicher gilt eine Karte als belegt (CLAUDE.md-Regel: ~500 MiB).
 BUSY_MIB = 500
-#: Obergrenze für den Kindprozess; kürzer, wenn das Fenster früher endet.
-CHILD_CAP_S = 540.0
-#: Weniger Restzeit als das: nicht mehr starten, Fenster zurückgeben.
-MIN_LEFT_S = 90.0
+#: Obergrenze für den Kindprozess (Fenster 15 min minus Sicherheitsabstand); kürzer, wenn das Fenster früher endet.
+CHILD_CAP_S = 840.0
+#: Weniger Restzeit als das: nicht mehr starten, Fenster zurückgeben (ein warmer Lauf braucht ~3 min allein für die Karten).
+MIN_LEFT_S = 180.0
 #: Sicherheitsabstand zwischen Kindprozess-Ende und Fensterende.
 END_MARGIN_S = 25.0
 #: Ein laufendes Fenster, das so lange ungenutzt blieb, wird beim nächsten Seitenaufruf zurückgegeben.

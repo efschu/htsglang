@@ -54,8 +54,11 @@ class VorlaufSplit27B(unittest.TestCase):
         x = ipcboot.flip_views(SEGS, _ipc_27b(), B27 + 60, None, d_rounds=ROUNDS_LATE, arrivals=ARR_27B)[0]
         self.assertEqual(x["kind"], "ok")
         self.assertFalse(x["provisional"])
-        self.assertAlmostEqual(x["start"], 1790964887.603, places=3)
-        self.assertAlmostEqual(x["leer_ms"], 4155, delta=2)
+        # Nutzer 06.10.: Server-Leerlauf zaehlt nicht -- Start = max(D's letztes Token 887.603, Ankunft 891.758)
+        self.assertAlmostEqual(x["start"], 1790964891.758, places=3)
+        self.assertAlmostEqual(x["start_last_d"], 1790964887.603, places=3)
+        self.assertAlmostEqual(x["leer_excl_ms"], 4155, delta=2)        # sichtbar, nicht im total
+        self.assertEqual(x["leer_ms"], 0.0)
         self.assertAlmostEqual(x["halt_ms"], 108, delta=2)
         self.assertEqual(x["park_ms"], 0.0)
         self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["vorlauf_ms"], delta=1e-6)
@@ -64,14 +67,16 @@ class VorlaufSplit27B(unittest.TestCase):
 
     def test_without_the_front_log_the_pricing_verdict_is_the_arrival(self):
         x = ipcboot.flip_views(SEGS, _ipc_27b(), B27 + 60, None, d_rounds=ROUNDS_LATE, arrivals=None)[0]
-        self.assertAlmostEqual(x["leer_ms"], 4262, delta=2)
+        self.assertAlmostEqual(x["leer_excl_ms"], 4262, delta=2)
+        self.assertEqual(x["leer_ms"], 0.0)
         self.assertIn("oldest_waiter_arrival", x["arrival_src"])
         self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["vorlauf_ms"], delta=1e-6)
 
     def test_late_written_rounds_keep_the_start_provisional_and_out_of_vm(self):
         x = ipcboot.flip_views(SEGS, _ipc_27b(), B27 + 5, None, d_rounds=ROUNDS_EARLY, arrivals=ARR_27B)[0]
         self.assertTrue(x["provisional"])
-        self.assertAlmostEqual(x["start"], 1790964886.021, places=3)    # too early by 1,58 s until 331 is written
+        self.assertAlmostEqual(x["start_last_d"], 1790964886.021, places=3)    # too early by 1,58 s until 331 is written
+        self.assertAlmostEqual(x["start"], 1790964891.758, places=3)          # the arrival is the start either way
         self.assertEqual(vmpush.flip_view_points([x], "27B", "b", set()), [])
         y = ipcboot.flip_views(SEGS, _ipc_27b(), B27 + 60, None, d_rounds=ROUNDS_LATE, arrivals=ARR_27B)[0]
         pts = vmpush.flip_view_points([y], "27B", "b", set())
@@ -105,11 +110,12 @@ class VorlaufSplitNF(unittest.TestCase):
         x = ipcboot.flip_views(segs, _ipc_nf(), BNF + 60, None, d_rounds=rounds,
                                arrivals={"weg2-16-52": 1790963329.405})[0]
         self.assertEqual(x["kind"], "ok")
-        self.assertAlmostEqual(x["leer_ms"], 3777, delta=2)
+        self.assertAlmostEqual(x["leer_excl_ms"], 3777, delta=2)        # D's idle before the arrival: not in the total
+        self.assertEqual(x["leer_ms"], 0.0)
         self.assertAlmostEqual(x["halt_ms"], 277, delta=2)
         self.assertAlmostEqual(x["park_ms"], 1681, delta=2)
         self.assertAlmostEqual(x["vor_rest_ms"], 1, delta=2)
-        self.assertAlmostEqual(x["leer_d_prefill_ms"], 3705, delta=2)
+        self.assertEqual(x["leer_d_prefill_ms"], 0.0)       # the D prefill lay inside the excluded idle span
         self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["vorlauf_ms"], delta=1e-6)
         self.assertAlmostEqual(_sum(x, ipcboot.PARTS), x["total_ms"], delta=1e-6)
 
@@ -127,10 +133,11 @@ class VorlaufSplitNF(unittest.TestCase):
         u["flip_user_time"][0]["rid"] = None
         rounds = [(1790963325.600, 1790963325.628), (BNF + 30.0, BNF + 30.03)]
         x = ipcboot.flip_views(SEGS_NF, u, BNF + 60, None, d_rounds=rounds, arrivals={})[0]
-        self.assertEqual(x["kind"], "ok")
+        # Nutzer 06.10.: without the waiter's arrival the idle span cannot be taken out -- missing, no total
+        self.assertEqual((x["kind"], x["total_ms"]), ("fehlt", None))
+        self.assertEqual(x["missing"], ipcboot.F_DP_ARRIVAL_UNKNOWN)
         self.assertIsNone(x["leer_ms"])
         self.assertIsNone(x["halt_ms"])
-        self.assertIsNotNone(x["vorlauf_ms"])
 
 
 class FrontArrivalReader(unittest.TestCase):

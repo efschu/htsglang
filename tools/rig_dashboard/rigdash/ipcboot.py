@@ -11,7 +11,7 @@ Replaces live.LiveLogs as the source of /api/live ``boots``.  Per boot state dir
 
 Every second a sample of every non-terminal boot's rank counters goes into a 16-min ring; the rates,
 windows, bursts, 15-min curves and the phase bar are deltas over that ring.  The view keeps the keys
-the page already reads (prefill/decode/totals/cache/series/timeline/flip_times/...), so the card
+the page already reads (prefill/decode/totals/cache/series/timeline/...), so the card
 renders unchanged; a value without an IPC source is None and the page says "fehlt in IPC" with the
 writer that would have to write it (ipcfields.MISSING_WRITER).  Pure view functions, unit-tested.
 """
@@ -24,7 +24,7 @@ import time
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
-from . import activity, grouplog, ipcfields, ipcstate, stops
+from . import activity, flipzeit, grouplog, ipcfields, ipcstate, stops
 
 SAMPLE_S = 1.0
 RING_S = 16 * 60.0
@@ -600,22 +600,15 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
             "states": list(activity.STATES)}
 
 
-def _q(xs, p):
-    xs = sorted(x for x in xs if x is not None)
-    return xs[max(0, math.ceil(p * len(xs)) - 1)] if xs else None
-
-
 # ----------------------------------------------------------------------------- Flipzeit in Nutzersicht
-# Nutzer 02.10. (ersetzt 29.09./01.10.): FLIPZEIT = vom LETZTEN Token der abgebenden Phase bis zum ERSTEN Token
-# der annehmenden, fuer beide Richtungen und beide Modelle, die eine und einzige Flipzeit (Wortlaut 17:50Z:
-# "letztes decode token wurde erzeugt ->(alles hier ist flipzeit)->erster chunk prefill -> letzer cunk prefill
-# -> (alles hier ist flipzeit)->erstes decode token wurde erzeugt"):
-#   P->D: Ende des letzten P-Prefill-Chunks (P's eigener Chunk-Stempel) -> erstes erzeugtes Decode-Token auf D
-#   D->P: letztes erzeugtes Decode-Token auf D (D's eigene Runde) -> Beginn des ersten Prefill-Forwards auf P (PP0)
-# Nie ein Front-Marker (Park, flip_begin, Ankunft, Leg-1-Ende) als Endpunkt: alles dazwischen -- Halten,
-# MIN-DWELL, Zaehlung, Drain, Park -- ist Flipzeit.
-# Die kleine Zahl (flip_ms, done-begin, Leg-1-Dispatch) ist nirgends mehr eine Flipzeit, nur ein Teil der
-# Zerlegung (flip_partition: Vorlauf + Layer + Wake-KV/DC + Nachlauf + Rest = total).
+# Nutzer 06.10. (EINZIGE Definition, flipzeit.DEFINITION), fuer beide Richtungen und beide Modelle:
+#   P>D = letzter P-Chunk fertig            -> erstes Decode-Token erzeugt
+#   D>P = letztes Decode-Token erzeugt      -> erster Prefill-Chunk beginnt zu rechnen (erster Forward auf PP0)
+# Ausnahme (Nutzer): kein Flip zaehlt, wenn kein Prefill oder Decode ansteht (kind "leerlauf").
+# flip_views misst je Flip diese eine Zahl (total_ms) und zerlegt sie (flip_partition: Vorlauf + Layer + Wake-KV/DC +
+# Nachlauf + Rest = total); gezaehlt, gemittelt und angezeigt wird sie ausschliesslich ueber flipzeit.py.
+# Nie ein Front-Marker (Park, flip_begin, Ankunft, Leg-1-Dispatch/-Ende) als Endpunkt, und keine Teilzahl
+# (flip_ms, done-begin) als Flipzeit: alles dazwischen -- Halten, MIN-DWELL, Zaehlung, Drain, Park -- ist Flipzeit.
 FLIP_IDLE_S = 120.0          # no work this long after flip_done (or before the next flip): Leerlauf-Flip
 
 
@@ -697,9 +690,9 @@ def vorlauf_split(start: float, vorlauf_ms: float, arrival: Optional[float], par
                   park_ms, segs: Optional[List[dict]] = None) -> dict:
     """D>P: [start, start + vorlauf] = leer + halt + park + vor_rest, in time order (running max, every part >= 0):
 
-      leer      start -> arrival: D's last token until the request that needs P arrived at the front -- no request
-                was waiting for P yet (D may still have been busy: ``leer_d_prefill_ms`` = davon D-Prefill-Segmente
-                im Rang-Takt); 0 when the request was already waiting before D's last token
+      leer      start -> arrival.  Since the user's correction of 06.10. (Server-Leerlauf ist keine Flipzeit) the
+                caller passes start = max(D's last token, arrival of the waiter), so leer is 0 here; the idle span
+                D's last token -> arrival is ``leer_excl_ms`` on the row, outside every sum
       halt      arrival -> park RPC sent (or -> flip_begin without a park): holds, MIN-DWELL, pricing, seat verdict
       park      park RPC sent -> acknowledged (flip_user_time parts.park_rpc_ms): D finishing its running pass
       vor_rest  park ack -> flip_begin
@@ -736,6 +729,10 @@ F_DP_START_NOLOG = "D-Log nicht gefunden (Decode rank batch rank 0)"
 
 #: flip_views(..., d_rounds=AUTO) reads D's rounds through grouplog; tests pass the list (or None)
 AUTO = object()
+F_DP_ARRIVAL = "front WEG2 SESSION Ankunft des Wartenden liegt nach dem ersten Prefill-Forward (rid/Uhr)"
+F_DP_ARRIVAL_UNKNOWN = "front WEG2 SESSION Ankunft des Wartenden (rid) bzw. oldest_waiter_arrival fehlt: Server-Leerlauf vor dem Wartenden nicht herausrechenbar"
+#: tolerance between the front's arrival stamp and the rank clock before an arrival "after the first forward" is a defect
+ARRIVAL_SKEW_S = 0.5
 F_DP_END = "rankstats P.tp0pp0.work.forward_ct im Ring / flip_user_time.prefill_start_ts (pp_first_forward)"
 
 
@@ -783,7 +780,10 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
            Rundenende t + gpu-ms) und dem Token am Front (flip_first_work.first_work_ts what=decode_token, wenn
            >= flip_begin + flip_ms - 0,3 s); ohne beide der erste Anstieg der D-Rang-Zaehler.  Gemessen NF y7l
            Flip 2: D dekodierte 1,9 s VOR flip_done (waehrend wake-kv/dc).
-      D>P  start = letztes erzeugtes Decode-Token auf D: Ende der letzten D-Runde (D-Log TP0 ``Decode rank batch``,
+      D>P  start = max(letztes erzeugtes Decode-Token auf D, Ankunft des wartenden Requests) (Nutzer 06.10.: "held";
+           Server-Leerlauf D-Token -> Ankunft zaehlt nicht, bleibt als ``leer_excl_ms`` ausserhalb der Summe sichtbar;
+           ist die Ankunft unbekannt, ist der Flip kind "fehlt" (F_DP_ARRIVAL_UNKNOWN): kein Total, ein Leerlauf
+           davor liesse sich nicht herausrechnen) -- das letzte D-Token: Ende der letzten D-Runde (D-Log TP0 ``Decode rank batch``,
            t + gpu-ms) nach dem vorigen Flip und vor flip_done -- nicht flip_user_time.start_ts (Park-RPC,
            aeltester Wartender): NF y7w/y7x/y7y Erstflip D dekodierte zuletzt 5,5-8,4 s vor dem Park-Stempel.
            end = Beginn des ersten Prefill-Batches auf P
@@ -837,7 +837,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
         row = {"dir": d, "begin": b, "done": t_done, "kind": "offen", "total_ms": None, "start": None, "end": None,
                "vorlauf_ms": None, "layer_ms": None, "wake_kv_dc_ms": None, "nachlauf_ms": None, "rest_ms": None,
                "leer_ms": None, "halt_ms": None, "park_ms": None, "vor_rest_ms": None, "leer_d_prefill_ms": None,
-               "arrival": None, "provisional": False,
+               "leer_excl_ms": None, "arrival": None, "provisional": False,
                "nachlauf_d_extend_ms": None, "end_res_ms": None, "missing": None}
         f = fw.get(key) or {}
         if t_done is None:
@@ -898,15 +898,30 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                     row["kind"], row["missing"] = "fehlt", F_PD_START
             else:
                 row["kind"] = "ok"
+            if bd.get("idle_flip"):
+                # the front's marker (front_state_ipc.pd_idle_flip, Nutzer 06.10.): nothing waited for D at the begin --
+                # the user's exception, the flip is not a Flipzeit (the total, if measured, stays on the row)
+                row["kind"], row["missing"] = "leerlauf", None
         else:
             u = next((x for x in ut if fd.get("epoch") is not None and x.get("epoch") == fd.get("epoch")), None) or \
                 next((x for x in ut if (x.get("prefill_start_ts") or 0) >= b and (nxt is None or (x.get("prefill_start_ts") or 0) < nxt)), None)
             # D's phase began with the previous flip (D can decode during its wake-kv/dc); D is asleep by this done
             pb = float(begins[i - 1][0]) if i > 0 and begins[i - 1][0] is not None else None
             rl = _round_last(d_rounds, pb, float(t_done)) if d_rounds is not None else None
+            if rl is None and d_rounds:
+                # D was woken but wrote no decode round before it slept again (NF 06.10.: 11 of 47 D>P flips -- D's
+                # first work was a prefill forward, the request that triggered the flip was already waiting): the
+                # last decode token D really produced is from an EARLIER D phase -- strict definition, the same
+                # token the 27B derivation takes (int8_matrix_lib.last_d_token: last round with t <= flip begin,
+                # searched back through the whole log).  Never a missing flip because of the phase boundary.
+                rl = _round_last(d_rounds, None, float(t_done))
+                if rl is not None:
+                    row["start_prev_phase"] = True
             if rl is not None:
                 start = rl[1]
                 row["start_src"] = "D-Log letzte Decode-Runde (TP0 t + gpu-ms)"
+                if row.get("start_prev_phase"):
+                    row["start_src"] += ", aus einer frueheren D-Phase (D hat in dieser keine Runde geschrieben)"
             if u is not None and u.get("start_ts") is not None:
                 row["start_front"] = float(u["start_ts"])     # named only: the front's park/arrival stamp
                 row["start_front_src"] = u.get("start_source")
@@ -918,13 +933,17 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
             rid = (u or {}).get("rid")
             if rid:
                 row["rid"] = rid
+            # the waiting request(s): the dispatch rid's arrival at the front and, when the front priced an older
+            # waiter, its arrival -- the EARLIEST is when Prefill became pending (Nutzer 06.10.: Server-Leerlauf vor
+            # diesem Moment ist keine Flipzeit)
+            cands = []
             if rid and arrivals and rid in arrivals:
-                dp_arrival, row["arrival_src"] = float(arrivals[rid]), "front WEG2 SESSION rid=%s" % rid
-            elif (u or {}).get("start_source") == "oldest_waiter_arrival" and u.get("start_ts") is not None:
-                dp_arrival = float(u["start_ts"])
-                row["arrival_src"] = "flip_user_time oldest_waiter_arrival (Preisverdikt)"
-            else:
-                dp_arrival = None
+                cands.append((float(arrivals[rid]), "front WEG2 SESSION rid=%s" % rid))
+            if (u or {}).get("start_source") == "oldest_waiter_arrival" and u.get("start_ts") is not None:
+                cands.append((float(u["start_ts"]), "flip_user_time oldest_waiter_arrival (Preisverdikt)"))
+            dp_arrival, row["arrival_src"] = min(cands) if cands else (None, row.get("arrival_src"))
+            if dp_arrival is None:
+                row["arrival_unknown"] = True      # no front stamp: the idle span before the waiter cannot be taken out
             dp_park = (float(u["start_ts"]), p.get("park_rpc_ms")) \
                 if (u or {}).get("start_source") == "park_rpc_sent" and u.get("start_ts") is not None else (None, None)
             if (u or {}).get("pp_last_start_ts") is not None:
@@ -937,7 +956,15 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                 end, e_lo, row["end_src"] = r
                 if e_lo == end:
                     e_lo = None
-            if u is not None and u.get("idle_flip"):
+            # the front's idle_flip is decided AT the begin (no waiter, no park); a request that reached the front
+            # before this flip was done (NF 06.10.: 9 flips, arrival 0,00-0,07 s BEFORE the begin, the begin raced
+            # the front's waiter list) waited for it -- Prefill was pending, no Leerlauf-Flip.  Only a request
+            # that arrives after the done (or whose arrival is unknown) leaves the flip a Leerlauf-Flip.
+            idle = bool(u is not None and u.get("idle_flip"))
+            if idle and dp_arrival is not None and float(dp_arrival) <= float(t_done):
+                idle = False
+                row["idle_waited"] = True
+            if idle:
                 row["kind"] = "leerlauf"
             elif end is None:
                 if p_first is None or ring_lo is None or ring_lo > b:
@@ -949,7 +976,25 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                 row["missing"] = F_DP_START if d_rounds is not None else F_DP_START_NOLOG
             else:
                 row["kind"] = "ok"
-        if start is not None and end is not None:
+        if d == "D>P" and start is not None and end is not None and dp_arrival is None and row["kind"] == "ok":
+            # no arrival stamp of the waiter: whether D's last token -> arrival was idle cannot be told, and the
+            # total from D's last token could contain Server-Leerlauf (Nutzer 06.10.: never a wrong, too large figure)
+            row["kind"], row["missing"] = "fehlt", F_DP_ARRIVAL_UNKNOWN
+        elif d == "D>P" and start is not None and end is not None and dp_arrival is not None \
+                and float(dp_arrival) > end + ARRIVAL_SKEW_S and row["kind"] == "ok":
+            # the waiter "arrived" after P's first forward started: a stamp of another request / another clock.  Never
+            # a total of ~0 from it, and never the idle span counted instead -- the point is missing, named
+            row["kind"], row["missing"] = "fehlt", F_DP_ARRIVAL
+            row["arrival"] = dp_arrival
+        elif start is not None and end is not None:
+            if d == "D>P" and dp_arrival is not None and dp_arrival > start:
+                # Nutzer 06.10. (Korrektur): Server-Leerlauf ist keine Flipzeit.  D>P beginnt bei max(letztes D-Token,
+                # Ankunft des wartenden Requests); die Spanne D's letztes Token -> Ankunft (D idle, nichts steht an)
+                # steht NICHT im Total, bleibt aber als ``leer_excl_ms`` sichtbar (nicht Teil der Summe).
+                row["start_last_d"] = start
+                start = min(float(dp_arrival), end)
+                row["leer_excl_ms"] = (start - row["start_last_d"]) * 1000.0
+                row["start_src"] = (row.get("start_src") or "") + ", Start = max(letztes D-Token, Ankunft des Wartenden)"
             row.update(flip_partition(start, end, b, flip_ms, t_done, e_lo))
             row["start"], row["end"] = start, end
             if d == "D>P":
@@ -970,45 +1015,21 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
     return out
 
 
-def _stats(vals: List[float]) -> dict:
-    return {"n": len(vals), "median": _q(vals, 0.5), "p90": _q(vals, 0.9), "max": max(vals) if vals else None}
-
-
-def flip_last(views: List[dict]) -> dict:
-    """Per direction: the newest measured flip (bold on the page), p50/p90/max of the measured totals in the
-    ring, the newest flip whose endpoint is missing (the page says "fehlt (Feld X)"), idle and open flips."""
+def flip_diag(views: List[dict]) -> dict:
+    """What the Flipzeit tiles do NOT count, named per direction (Nutzer 06.10.: the numbers themselves are
+    flipzeit.py's, from the history marks, one window): flips whose endpoint is missing (``missing_n``, the
+    newest one's field in ``missing``), a flip still open, and -- for a P>D -- the depth the P side reached
+    after the flip's last counted chunk (``p_depth`` at ``p_depth_t``).  Ring window only; no figure of it
+    is a Flipzeit."""
     out = {}
-    for d in ("P>D", "D>P"):
+    for d in flipzeit.DIRS:
         mine = [x for x in views if x["dir"] == d]
-        ok = [x for x in mine if x["kind"] == "ok" and x.get("total_ms") is not None]
-        idle = [x for x in mine if x["kind"] == "leerlauf"]
-        miss = [x for x in mine if x["kind"] == "fehlt"]
         newest = next((x for x in reversed(mine) if x["kind"] in ("ok", "fehlt")), None)
-        out[d] = dict(_stats([x["total_ms"] for x in ok]), last=ok[-1] if ok else None,
-                      newest=newest, missing_n=len(miss), missing_last=miss[-1] if miss else None,
-                      idle_n=len(idle), idle_last=idle[-1] if idle else None,
-                      open=next((x for x in reversed(mine) if x["kind"] == "offen"), None))
-    return out
-
-
-def flip_times_of(views: List[dict]) -> dict:
-    """flip_times for the card, from flip_views only (Nutzer 02.10.: the layer-only number disappears as a
-    Flipzeit everywhere): per direction n/last/p50/p90/max of total_ms, ``recent`` = total per flip."""
-    fl = flip_last(views)
-    out = {"instruments": {"total": "Flipzeit = letztes Token -> erstes Token (flip_views)"}, "headline": "total"}
-    for d in ("P>D", "D>P"):
-        x = fl[d]
-        last = x["last"]
-        nw = x["newest"] or {}
-        out[d] = {"n": x["n"], "last": last["total_ms"] if last else None, "last_t": last["begin"] if last else None,
-                  "median": x["median"], "p90": x["p90"], "max": x["max"], "open": x["open"] is not None,
-                  "src": last.get("src") if last else None,
-                  "missing": nw.get("missing") if nw.get("kind") == "fehlt" else None,
-                  "missing_n": x["missing_n"], "no_work": x["idle_n"]}
-    out["recent"] = [{"t": x["begin"], "dir": x["dir"], "ms": x["total_ms"], "kind": x["kind"], "missing": x.get("missing"),
-                      "parts": {k: x.get(k) for k in PARTS + VOR_PARTS}, "provisional": x.get("provisional"),
-                      "state": x["kind"], "src": "ipc"}
-                     for x in views if x["kind"] in ("ok", "fehlt")][-24:]
+        last = next((x for x in reversed(mine) if flipzeit.counted(x)), None)
+        out[d] = {"missing_n": sum(1 for x in mine if x["kind"] == "fehlt"),
+                  "missing": newest.get("missing") if newest and newest["kind"] == "fehlt" else None,
+                  "open": any(x["kind"] == "offen" for x in mine),
+                  "p_depth": last.get("p_depth") if last else None, "p_depth_t": last["begin"] if last else None}
     return out
 
 
@@ -1379,7 +1400,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
         "flip_open": bool(b6.get("open")),
         "flips": flip_done[-12:],
         "flip_count": len(flip_done),
-        "flip_times": None,             # below, from flip_views (the one Flipzeit)
+        "flip_diag": None,              # below, from flip_views (what is not counted); the Flipzeit itself: flipzeit.py
         "health": health,
         "errors": [{"t": x.get("t"), "group": x.get("group"), "text": x.get("text") or x.get("exc") or ""}
                    for x in (a13.get("last") or [])],
@@ -1410,8 +1431,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
     # Nutzer 01.10. ~08:20Z: Flipzeit in Nutzersicht mit Vorlauf/Layer-Tausch/Nachlauf, und die Phase jetzt
     fv = flip_views(v["timeline"]["segs"], ipc, now, ring)
     v["flip_views"] = fv[-24:]
-    v["flip_last"] = flip_last(fv)
-    v["flip_times"] = flip_times_of(fv)
+    v["flip_diag"] = flip_diag(fv)
     v["phase_now"] = phase_now(v["timeline"]["segs"], ipc, front, fv, live, now)
     view_ipc = {k: x for k, x in ipc.items() if k not in ("ipc_events", "flip_first_work", "flip_user_time", "request_done")}
     v["ipc"] = view_ipc

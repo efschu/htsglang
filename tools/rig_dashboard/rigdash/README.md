@@ -35,14 +35,17 @@ unter `:3000` mit der Tafel „Rig – Verlauf“. Installiert wird mit `deploy/
 wenn danach gebootet wurde, rot ab 24 h. Darunter stehen die **Commits der Image-Linie (48 h) ohne Baustein**,
 aus git gerechnet (`features.new_commits`). Der Zähler steht im Tab-Titel. Eintragen wie unten mit `features_update.py`.
 
-## Flipzeit (Nutzer-Korrektur 29.09.)
+## Flipzeit (EINE Definition, Nutzer 06.10.2026)
 
-Flipzeit = `WEG2-FLIP begin` → erstes Decode-Token (P→D) bzw. erste PP0-`Prefill batch` (D→P);
-`flip_total` (reconciled) ist nur der Layer-Tausch darin. Jeder Wert nennt sein Instrument.
-Ein 27B-Boot führt mit `flip_total`, bis ein 27B-Boot unter der neuen Definition gemessen ist
-(`FIRST_TOKEN_HEADLINE_FOR_27B` in `live.py`) — sonst sähe die 27B-Historie wie ein Rückschritt aus.
-
-Seit 30.09.: Flipzeiten nur aus `events.jsonl` (`flip_first_work`, `flip_done`), kein Log-Scan mehr (ipcboot.py).
+P→D = letzter P-Chunk fertig → erstes Decode-Token erzeugt; D→P = letztes Decode-Token erzeugt → erster
+Prefill-Chunk beginnt zu rechnen (erster Forward auf PP0, `flip_user_time.prefill_start_source=pp_first_forward`,
+nie der Leg-1-Dispatch). Ausnahme: kein Flip zählt, wenn kein Prefill oder Decode ansteht (Leerlauf-Flip,
+D→P: `flip_user_time.idle_flip`). Layer-Tausch, Vorlauf, Nachlauf sind nur die ZERLEGUNG der einen Zahl, nie eine eigene
+Flipzeit. Es gibt EINE Berechnung, `flipzeit.py`: `ipcboot.flip_views` misst je Flip, die Historie schreibt jeden
+gezählten Flip einmal als Marke `flip_t2t` (offen, vorläufig, ohne Endpunkt, Leerlauf: nie), und jede Zahl der Seite
+(Kachel Überblick, Kachel Verlauf, Diagramm, Boot-Liste) ist `flipzeit.tile` über diese Marken. Nur das FENSTER
+unterscheidet sich und steht in der Beschriftung: Überblick = letzte 60 min des Modells, Verlauf = gewählter
+Bereich/Zoom, Boot-Liste = ganzer Boot. Tests: `tests/test_flipzeit_1006.py`.
 
 **Phasenleiste mit echter Arbeitszeit (WACH-OHNE-ARBEIT-0929):** Die Rang-Zeilen kommen zu spät
 (P nach dem Pipeline-Durchlauf, D einen Pass später). P-Arbeit zeichnet deshalb von
@@ -77,7 +80,7 @@ Anlass: Der Features-Sitz deployte von `desk/dashboard-features-0929`. Ein Deplo
 Flips kommen aus den Ereignissen. Grund: Der kumulative Zähler springt um einen ganzen Chunk; Δ Zähler / Δ Probe gab 16.384 tok/s
 und P/D-Überlappung. Kacheln: „Rate laufender Schub“, „beste Schub-Rate“, „Rate Schübe 60 s“ (je Tokens / Wanduhr des Schubs, P/D), Decode nur über stetige Proben, je Stream
 nur mit Decode davor und danach. Verlauf: 1-s-Modellzeilen unter dem Präfix `mi.`; die alten `m.`-Zeilen aus dem falschen Instrument
-werden nicht mehr gezeigt. Flipzeit: P→D `flip_first_work` (ohne `what="none"`), D→P nur `flip_user_time` (ab Build y4z).
+werden nicht mehr gezeigt. Flipzeit: siehe Abschnitt „Flipzeit“ oben (eine Definition, `flipzeit.py`).
 Audit aller Werte: `/spinning/gpu-arb/docs/DASHBOARD-PLAUSI-AUDIT-0930.md`; Tests `tests/test_activity_0930.py`.
 
 ### D-Prefill: Admit-Extends sind keine Prefill-Rate (Auftrag 880, Nutzer 03.10. „6 token/s prefill in D???“)
@@ -295,7 +298,7 @@ Log-Sammlers, der erst nach einer Runde über alle Logs pollt) jede Boot-Zustand
 | KV-Belegung D / P | `sched.full_token_usage` (Pegel) |
 | Input-Tokens | P: `cached_tokens` = aus Cache, `new_tokens` = neu gerechnet P; D: `new_tokens` = neu gerechnet D, `cached_tokens` = Übergabe P→D |
 | Cache-Stufen | `state.json front.served_tokens.*.cached_tier` |
-| Flipzeit | `events.jsonl flip_first_work` |
+| Flipzeit | `flipzeit.py` über Marken `flip_t2t` (aus `events.jsonl` flip_begin/flip_done/flip_user_time + rankstats) |
 
 Eine lebende, aber ruhende Gruppe liefert 0 (durchgehende Linie), ein Rang mit einer Datei älter als
 20 s liefert nichts (Lücke). `m.<Modell>.ipc` = 1 markiert jedes Intervall, in dem der Sampler einen
@@ -408,12 +411,16 @@ Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `st
   `{v, src, at, probe, note}` mit `src` = `gemessen` | `NVML` | `Datenblatt` | `geschätzt` | `nicht gemessen` (dann `v: null` und `note` = Grund).
   Gebaut wird in `sglang/srt/rigmon/hardware_profile.py` des Planer-Baums (per Dateipfad geladen, kein `import sglang` in diesem Prozess).
 * `POST /api/hwprofil/measure` `{"cards": [<NVML-Index>, ...]}` bucht **selbst** ein gpuq-Fenster (Eigentümer `profil-editor`, nur diese Karten,
-  10 min, ohne `not_before`, exklusiv; `mib` nur wenn der Body es verlangt) und misst darin. Antwort `action`:
+  15 min (Auftrag 1006: alle Rechenformate inkl. nativ W4A4 + BAR1-Strecke je Paar in Kindprozessen), ohne `not_before`, exklusiv; `mib` nur wenn der Body es verlangt) und misst darin. Antwort `action`:
   `messung_gestartet` (Kindprozess läuft, Fenster geht danach SOFORT zurück, auch nach Fehler) · `wartet` (Fenster `pending`: Status, **nichts
   gemessen**, Buchung bleibt; erneuter Druck nimmt sie wieder auf) · `abgelehnt` (unplanbar, Karte belegt trotz Fenster, zu wenig Restzeit, gpuq weg;
   HTTP 409) · `laeuft_bereits`. Das gpuq-Token verlässt den Prozess nie; die Buchung steht zusätzlich in `<state-dir>/hwprofil_window.json`, damit
   ein Neustart ein verwaistes Fenster zurückgibt.
 * `POST /api/hwprofil/cancel` gibt ein wartendes Fenster zurück.
+* Messumfang (Auftrag 1006, `card_probe --run`): je Karte SM-Zahl, L2, membw/GEMV, bf16, fp8, int8 W8A8, NVFP4 W4A8 (nur sm_8x), W4A16 Marlin, W4A4 nativ
+  (nur sm_12x; ältere Karten tragen den Grund), H2D/D2H Bandbreite und Latenz (Median 4 kB, Minimum im Hover); je geordnetem Paar Host-Staging/p2p und die
+  **BAR1-Strecke** (`rigmon/bar1_probe.py`: ein Kindprozess je Karte, Produktions-Transport mit Byte-Beweis, `--no-bar1` schaltet ab). Ein Wert, den ein
+  Mikrobench nicht liefern kann, bleibt „nicht gemessen“ mit Grund. `profile.bar1` = `{measured, complete, pairs_measured, pairs_total, note}`.
 * Kein Hintergrund-Poller: nur wer die Seite bedient fragt. Ein laufendes Fenster, das nach 180 s nicht benutzt wurde, geht beim nächsten Aufruf zurück.
 * Dienst-Parameter (Deploy durch den Lead): `--hw-tree` (gestagter Baum mit `hardware_profile.py` + `weg2/card_identity.py`, `deploy/stage_hwprofil.sh`),
   `--hw-measure-tree` (voller sglang-Baum für den Kindprozess), `--hw-python` (Interpreter mit torch + sgl_kernel; ohne sgl_kernel bleiben die Arme
