@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: rig
+    folder: Rig
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana-rig/dashboards

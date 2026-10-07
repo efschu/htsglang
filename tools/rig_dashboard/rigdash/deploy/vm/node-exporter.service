@@ -1,0 +1,11 @@
+[Unit]
+Description=Prometheus node_exporter (Host CT999, fuer VictoriaMetrics)
+After=network-online.target
+
+[Service]
+ExecStart=/opt/node_exporter/node_exporter --web.listen-address=127.0.0.1:9100 --collector.disable-defaults --collector.cpu --collector.meminfo --collector.loadavg --collector.filesystem --collector.netdev --collector.diskstats --collector.pressure --collector.stat --collector.uname --collector.time
+Restart=always
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

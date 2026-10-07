@@ -1,0 +1,40 @@
+{
+ "checkpoints_real_on_box": {
+  "Qwen3.8-27B-DFlash2-NVFP4-RTNcal": {
+   "files_sha256": {
+    "config.json": "6bf5936c68d432db3c8408d5836dc32e05dc3c4be538eb3e576439186262b186"
+   }
+  },
+  "Qwen3.8-27B-NVFP4-RadixArk": {
+   "files_sha256": {
+    "config.json": "7ff41ec6f96ad50efea3c92751cd261b63839d39936eb6e6ffc9066db8672740",
+    "model.safetensors.index.json": "7aa103a2582b7d26631988de33dea19e8a308ee9c239e8e14feb374af30905e2"
+   }
+  }
+ },
+ "date": "2026-10-07",
+ "golden": "plan_27b_dual_live1521_n3.txt",
+ "note": "AP-J re-snapshot (plan 4c Nachtrag 18:00Z item 4): the live release Dual profile moved after the AP0 snapshot of 14:01Z (sha 1cc8890c): P-KV 266240, cut 31,17,16 / attn 7,5,4, P budgets 6610,5050,5200, no 131072 cap, --env-d SGLANG_WEG2_DUAL_D_WANT_LOCKED=1. Live file sha256 checked identical to the snapshot on 2026-10-07 ~01:30Z (mtime 2026-10-06 15:21:35Z). Generated with `python -m sglang.srt.weg2.propose_oracle golden --profile .../27b-nvfp4-dual-live1521.env --replay .../nvml_devices_1378.json` on the abnahme tree (no --force). On this box the dry run is REFUSED by the launcher's own W64 (Weg2TpOperatingPointInfeasible, no measured dual-D log in the evidence dir), rc=None, 226 lines: the golden pins that named verdict and the plan lines before it; it is not a runnable plan.",
+ "profile": {
+  "file": "profiles/27b-nvfp4-dual-live1521.env",
+  "live": "/spinning/gpu-arb/docker/profiles_release/27b-nvfp4-dual.env (identical sha256 on 2026-10-07, mtime 2026-10-06T15:21:35Z)",
+  "sha256": "ce347c790b8e1aa466ada84c1adfa6765601de982eef0cf8f3b68382fb0e3977"
+ },
+ "profile_inputs": {
+  "base": {
+   "file": "profiles/27b-base.env",
+   "sha256": "7f48188299747a86c76b7eb591b57de07cd4897cd65a058fa9859295ca6026b9"
+  },
+  "census": {
+   "file": "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json",
+   "sha256": "1a8f1c51e93182b83b45e73192f78b69ba921f80beb6098646621fbb6d3ac953"
+  },
+  "pchunk": {
+   "file": "profiles/27b-nvfp4.pchunk.json",
+   "sha256": "a56d1c7a4fb93206e6251540db80dc36656355daed95a3faf1e19de5fc99237c"
+  }
+ },
+ "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
+ "schema": "planer-ap0-golden-provenance/1",
+ "tree": "752537e7b6 + dash-deploy-1006-fz + 11 planer branches (desk/planer-abnahme-1006)"
+}

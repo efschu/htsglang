@@ -1,0 +1,1199 @@
+{
+ "argv_from_log": {
+  "D": [
+   "/opt/venv/bin/python",
+   "-m",
+   "sglang.launch_server",
+   "--model-path",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-FP8",
+   "--trust-remote-code",
+   "--json-model-override-args",
+   "{\"language_model_only\": true}",
+   "--served-model-name",
+   "Qwen3.8-27B-FP8",
+   "--rank-gpu-id",
+   "0,1,2",
+   "--skip-server-warmup",
+   "--kv-cache-dtype",
+   "fp8_e4m3",
+   "--context-length",
+   "262144",
+   "--max-kv-per-request",
+   "262144",
+   "--reasoning-parser",
+   "qwen3",
+   "--tool-call-parser",
+   "qwen3_coder",
+   "--chat-template-default-kwargs",
+   "{\"preserve_thinking\": true}",
+   "--enable-cache-report",
+   "--enable-metrics",
+   "--enable-hierarchical-cache",
+   "--hicache-host-role",
+   "staging",
+   "--hicache-size",
+   "4",
+   "--hicache-mamba-host-mib",
+   "100",
+   "--hicache-write-policy",
+   "write_back",
+   "--hicache-storage-backend",
+   "file",
+   "--hicache-mem-layout",
+   "layer_first",
+   "--hicache-io-backend",
+   "direct",
+   "--hicache-storage-backend-extra-config",
+   "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+   "--hicache-canonical-kv-page",
+   "--host",
+   "127.0.0.1",
+   "--chunked-prefill-size",
+   "4096",
+   "--scheduler-distributed-teardown",
+   "--page-size",
+   "1",
+   "--random-seed",
+   "785500001",
+   "--mamba-slot-reorder",
+   "--kv-backing-relief",
+   "--barlink",
+   "--barlink-transport",
+   "bar1",
+   "--barlink-bar1-cap-cycles",
+   "300000000000",
+   "--collective-census-interval",
+   "50",
+   "--uneven-dcp",
+   "--uneven-dcp-weighted",
+   "--mamba-ssm-dtype",
+   "bfloat16",
+   "--enable-memory-saver",
+   "--max-running-requests",
+   "6",
+   "--tp-prefill-max-tokens",
+   "12288",
+   "--mamba-radix-cache-strategy",
+   "extra_buffer",
+   "--tp-size",
+   "3",
+   "--pp-size",
+   "1",
+   "--num-continuous-decode-steps",
+   "2",
+   "--rank-gpu-memory-mib",
+   "27680,17168,16936",
+   "--rank-tp-ratio",
+   "58,25,25",
+   "--speculative-algorithm",
+   "DFLASH",
+   "--speculative-draft-model-path",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "--speculative-num-draft-tokens",
+   "8",
+   "--speculative-draft-window-size",
+   "2048",
+   "--enable-linear-replayssm-spec",
+   "--linear-replayssm-cache-len",
+   "16",
+   "--barlink-bar1-window-mib",
+   "16,TP_0=32,DCP_0=40",
+   "--barlink-uncovered-class",
+   "refuse",
+   "--port",
+   "30032"
+  ],
+  "P": [
+   "/opt/venv/bin/python",
+   "-m",
+   "sglang.launch_server",
+   "--model-path",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-FP8",
+   "--trust-remote-code",
+   "--json-model-override-args",
+   "{\"language_model_only\": true}",
+   "--served-model-name",
+   "Qwen3.8-27B-FP8",
+   "--rank-gpu-id",
+   "0,1,2",
+   "--skip-server-warmup",
+   "--kv-cache-dtype",
+   "fp8_e4m3",
+   "--context-length",
+   "262144",
+   "--max-kv-per-request",
+   "262144",
+   "--reasoning-parser",
+   "qwen3",
+   "--tool-call-parser",
+   "qwen3_coder",
+   "--chat-template-default-kwargs",
+   "{\"preserve_thinking\": true}",
+   "--enable-cache-report",
+   "--enable-metrics",
+   "--enable-hierarchical-cache",
+   "--hicache-host-role",
+   "staging",
+   "--hicache-size",
+   "1",
+   "--hicache-mamba-host-mib",
+   "100",
+   "--hicache-write-policy",
+   "write_back",
+   "--hicache-storage-backend",
+   "file",
+   "--hicache-mem-layout",
+   "layer_first",
+   "--hicache-io-backend",
+   "direct",
+   "--hicache-storage-backend-extra-config",
+   "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+   "--hicache-canonical-kv-page",
+   "--host",
+   "127.0.0.1",
+   "--chunked-prefill-size",
+   "512",
+   "--scheduler-distributed-teardown",
+   "--page-size",
+   "1",
+   "--random-seed",
+   "785500001",
+   "--mamba-slot-reorder",
+   "--kv-backing-relief",
+   "--barlink",
+   "--barlink-transport",
+   "bar1",
+   "--barlink-bar1-cap-cycles",
+   "300000000000",
+   "--collective-census-interval",
+   "50",
+   "--mamba-ssm-dtype",
+   "bfloat16",
+   "--enable-memory-saver",
+   "--max-running-requests",
+   "1",
+   "--tp-size",
+   "1",
+   "--pp-size",
+   "3",
+   "--pp-async-batch-depth",
+   "0",
+   "--disable-overlap-schedule",
+   "--pp-stage-ratio",
+   "42,11,11",
+   "--pp-attn-stage-ratio",
+   "10,3,3",
+   "--rank-gpu-memory-mib",
+   "26000,15752,15480",
+   "--barlink-bar1-window-mib",
+   "24,PP_0=96",
+   "--speculative-algorithm",
+   "DFLASH",
+   "--speculative-draft-model-path",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "--speculative-num-draft-tokens",
+   "8",
+   "--speculative-draft-kv-only",
+   "--max-total-tokens",
+   "269550",
+   "--port",
+   "30031",
+   "--max-mamba-cache-size",
+   "24",
+   "--cuda-graph-config",
+   "{\"prefill\":{\"backend\":\"full\",\"bs\":[512],\"full_prefill_max_req\":1}}",
+   "--max-running-requests=2"
+  ]
+ },
+ "boot": {
+  "boot_profile": "27b-fp8",
+  "image": null,
+  "ipc_era": false,
+  "rev": "103712cdb2",
+  "state_dir": null,
+  "tag": "dkr27bfp8bar1final09260250"
+ },
+ "boot_json": {
+  "budgets": {
+   "D": [
+    27680,
+    17168,
+    16936
+   ],
+   "P": [
+    26000,
+    15752,
+    15480
+   ]
+  },
+  "cards": [
+   {
+    "name": "NVIDIA GeForce RTX 5090",
+    "nvml_index": 1,
+    "reserved_mib": 518,
+    "total_mib": 32607,
+    "uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
+   },
+   {
+    "name": "NVIDIA GeForce RTX 3080",
+    "nvml_index": 0,
+    "reserved_mib": 425,
+    "total_mib": 20480,
+    "uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7"
+   },
+   {
+    "name": "NVIDIA GeForce RTX 3080",
+    "nvml_index": 2,
+    "reserved_mib": 425,
+    "total_mib": 20480,
+    "uuid": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"
+   }
+  ],
+  "dc_expect_d": {
+   "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 2422,
+   "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 1828,
+   "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 1826
+  },
+  "dc_measured_p": {
+   "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 1466,
+   "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 806,
+   "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 1032
+  },
+  "stamp": "0926_025032",
+  "tag": "dkr27bfp8bar1final09260250",
+  "tip": "103712cdb2"
+ },
+ "budget_lines": [
+  {
+   "budget_mib": 26000,
+   "group": "P",
+   "label": "P",
+   "log_line": 28,
+   "name": "NVIDIA GeForce RTX 5090",
+   "nvml": 1,
+   "ordinal": 0,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 3259,
+    "dormant": 2422,
+    "floor": 2855,
+    "floor_source": "MEASURED-P",
+    "growth": null,
+    "l15": null,
+    "over": 920,
+    "over_prov": "boot weg2ls2b2",
+    "reserve": 1800
+   },
+   "seq": 0,
+   "terms": "total 32607 - corridor 3259 (floor 2855 source=MEASURED-P reserve=1800 + awake_overshoot 404) - dormant_other 2422 - measured_awake_overshoot 920 (boot weg2ls2b2) MiB"
+  },
+  {
+   "budget_mib": 15752,
+   "group": "P",
+   "label": "P",
+   "log_line": 30,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 0,
+   "ordinal": 1,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 2899,
+    "dormant": 1828,
+    "floor": 2495,
+    "floor_source": "MEASURED-P",
+    "growth": null,
+    "l15": null,
+    "over": null,
+    "over_prov": null,
+    "reserve": 1400
+   },
+   "seq": 1,
+   "terms": "total 20480 - corridor 2899 (floor 2495 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1828 MiB"
+  },
+  {
+   "budget_mib": 15480,
+   "group": "P",
+   "label": "P",
+   "log_line": 32,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 2,
+   "ordinal": 2,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 2662,
+    "dormant": 1826,
+    "floor": 2258,
+    "floor_source": "MEASURED-P",
+    "growth": null,
+    "l15": null,
+    "over": 512,
+    "over_prov": "boot weg2ls2b2",
+    "reserve": 1400
+   },
+   "seq": 2,
+   "terms": "total 20480 - corridor 2662 (floor 2258 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1826 - measured_awake_overshoot 512 (boot weg2ls2b2) MiB"
+  },
+  {
+   "budget_mib": 27680,
+   "group": "D",
+   "label": "D",
+   "log_line": 166,
+   "name": "NVIDIA GeForce RTX 5090",
+   "nvml": 1,
+   "ordinal": 0,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 2971,
+    "dormant": 1466,
+    "floor": 2567,
+    "floor_source": "MEASURED-D",
+    "growth": null,
+    "l15": null,
+    "over": 489,
+    "over_prov": "boot weg2ls4b1",
+    "reserve": 1800
+   },
+   "seq": 3,
+   "terms": "total 32607 - corridor 2971 (floor 2567 source=MEASURED-D reserve=1800 + awake_overshoot 404) - dormant_other 1466 - measured_awake_overshoot 489 (boot weg2ls4b1) MiB"
+  },
+  {
+   "budget_mib": 17168,
+   "group": "D",
+   "label": "D",
+   "log_line": 168,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 0,
+   "ordinal": 1,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 2504,
+    "dormant": 806,
+    "floor": 2100,
+    "floor_source": "MEASURED-D",
+    "growth": null,
+    "l15": null,
+    "over": null,
+    "over_prov": null,
+    "reserve": 1400
+   },
+   "seq": 4,
+   "terms": "total 20480 - corridor 2504 (floor 2100 source=MEASURED-D reserve=1400 + awake_overshoot 404) - dormant_other 806 MiB"
+  },
+  {
+   "budget_mib": 16936,
+   "group": "D",
+   "label": "D",
+   "log_line": 170,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 2,
+   "ordinal": 2,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 2505,
+    "dormant": 1032,
+    "floor": 2101,
+    "floor_source": "MEASURED-D",
+    "growth": null,
+    "l15": null,
+    "over": null,
+    "over_prov": null,
+    "reserve": 1400
+   },
+   "seq": 5,
+   "terms": "total 20480 - corridor 2505 (floor 2101 source=MEASURED-D reserve=1400 + awake_overshoot 404) - dormant_other 1032 MiB"
+  }
+ ],
+ "budgets_final": {
+  "D": [
+   27680,
+   17168,
+   16936
+  ],
+  "P": [
+   26000,
+   15752,
+   15480
+  ]
+ },
+ "built_from": {
+  "boot_json": "/spinning/docker-acceptance/27b/evidence/docker_dkr27bfp8bar1final09260250/boot_dkr27bfp8bar1final09260250.json",
+  "evidence": {
+   "D": [
+    "/spinning/docker-acceptance/27b/evidence/boot_weg2_dkr27bfp8bar1final09260250_103712cdb2_0926_025032.D.log"
+   ],
+   "P": [
+    "/spinning/docker-acceptance/27b/evidence/boot_weg2_dkr27bfp8bar1final09260250_103712cdb2_0926_025032.P.log"
+   ],
+   "front": [
+    "/spinning/docker-acceptance/27b/evidence/boot_weg2_dkr27bfp8bar1final09260250_103712cdb2_0926_025032.front.log"
+   ]
+  }
+ },
+ "flag_docs": {
+  "--barlink": {
+   "code_help": "Enable barlink. Promoted from SGLANG_BARLINK (#781)."
+  },
+  "--barlink-bar1-cap-cycles": {
+   "code_help": "Ceiling on barlink's build-time cycle budget, both groups. Default {...} is large BY CONSTRUCTION: it is a ceiling, not a target, and the gate that actually binds on this rig is the BAR1 aperture priced at --barlink-bar1-window-mib (#1234 C1), not this number."
+  },
+  "--barlink-bar1-window-mib": {
+   "code_help": "BAR1 aperture window in MiB. Either a bare integer (applies to every group) or a comma-separated list mixing a bare default with GROUP=VALUE overrides, e.g. '24,PP_0=96,FLIP_TP_0=48,FLIP_DCP_0=32'. Promoted from SGLANG_BARLINK_BAR1_WINDOW_MIB and its per-group suffixed variants (#781). These are TIGHT: the two 3080s expose only 256 MiB of BAR1 each, so a departing tenant holding ~211 MiB of that aperture is the difference between a boot and a refusal."
+  },
+  "--barlink-transport": {
+   "code_help": "Barlink transport ('device', 'bar1', ...). Promoted from SGLANG_BARLINK_TRANSPORT (#781). NOTE: the consumer at device_communicators/barlink.py caches this at MODULE IMPORT, so the value must be settled before that import -- which a flag guarantees and a mid-process env write does not."
+  },
+  "--barlink-uncovered-class": {
+   "code_help": "What happens when the configured barlink transport does not cover a message class at its size. 'warn' (the default, and today's behaviour) logs once per operation and size class and answers on the inline host-staged gloo plane -- correct, but measured 4.7x slower per byte than bar1 on a 96-MiB all_reduce. 'refuse' stops the group instead. Note there is no NCCL rung underneath: a barlink-owned group never constructs a PyNccl communicator (parallel_state.should_build_pynccl), so a declined size has exactly one destination. Use 'refuse' where a silent 4.7x on a hot-path class is worse than a failed boot -- #1234, group D of the Weg-2 launcher."
+  },
+  "--chat-template-default-kwargs": {
+   "code_help": "JSON object of default chat_template_kwargs applied to every chat completion before rendering, e.g. '{\"preserve_thinking\": true}'. Per-request chat_template_kwargs override these key by key. Use this to make a template flag that only exists per request into a serving default; 'preserve_thinking' in particular keeps prior-turn think blocks in the rendered prompt so multi-turn prompts stay a byte-exact prefix of what was generated, which is what lets the KV prefix cache hit instead of re-prefilling the conversation on every turn. --default-chat-template-kwargs (upstream #29579 spelling) is an alias of this flag."
+  },
+  "--chunked-prefill-size": {},
+  "--collective-census-interval": {
+   "code_help": "How often the collective census prints, both groups. Default {...} is a STRIDE and not a measurement: larger is quieter, smaller costs log volume, and nothing about the boot depends on it except how much of it a reader sees."
+  },
+  "--context-length": {
+   "code_help": "The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). {...}"
+  },
+  "--cuda-graph-config": {
+   "code_help": "Per-phase CUDA graph settings as JSON, e.g. '{\"decode\":{\"backend\":\"full\",\"max_bs\":256},\"prefill\":{\"backend\":\"tc_piecewise\",\"tc_compiler\":\"eager\"}}'. Allowed backends per phase: full, breakable, tc_piecewise, disabled (full is decode-only). JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags."
+  },
+  "--disable-overlap-schedule": {
+   "code_help": "Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker."
+  },
+  "--enable-cache-report": {},
+  "--enable-hierarchical-cache": {},
+  "--enable-linear-replayssm-spec": {},
+  "--enable-memory-saver": {},
+  "--enable-metrics": {},
+  "--hicache-canonical-kv-page": {
+   "code_help": "#706: persist HiCache KV pages in the GEOMETRY-NEUTRAL whole-page format, so tokens produced by the same model do not miss between a prefill group and a decode group, or across a reboot. A stored page carries EVERY attention layer of one token (page_size 1, layer-major, global layer order); each PP stage deposits only its own slots at their global offset into one shared page and a completeness marker keeps the page invisible until the last slot arrives. Because the bytes then stop depending on the cut, the KV key drops BOTH geometry suffixes (_{tp_rank}_{tp_size} and _{pp_size}_{pp_rank}) and carries content alone -- the same argument weighted uneven-DCP already used on the token axis, and t"
+  },
+  "--hicache-host-role": {
+   "code_help": "#810: what the PINNED host tier is FOR. 'retention' (the default, today's behaviour) sizes it as an L2 cache from --hicache-ratio, so its pinned footprint scales with the device pool. 'staging' declares it a small write-through staging area in front of the storage tier, per DESIGN_706_BOOT ('the host tier is staging; the disk tier is retention'): retention then belongs to --hicache-storage-backend, and the pinned host budget stops scaling with the device pool. 'staging' REFUSES --hicache-ratio and requires an explicit --hicache-size, because a staging area is sized from write-through bandwidth x latency, which a ratio of the device pool does not express. It also requires a storage backend: s"
+  },
+  "--hicache-io-backend": {
+   "code_help": "The IO backend for KV cache transfer between CPU and GPU"
+  },
+  "--hicache-mamba-host-mib": {},
+  "--hicache-mem-layout": {
+   "code_help": "The layout of host memory pool for hierarchical cache."
+  },
+  "--hicache-size": {},
+  "--hicache-storage-backend": {
+   "code_help": "The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix, eic, simm, mori. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name)."
+  },
+  "--hicache-storage-backend-extra-config": {},
+  "--hicache-write-policy": {
+   "code_help": "The write policy of hierarchical cache."
+  },
+  "--host": {},
+  "--json-model-override-args": {},
+  "--kv-backing-relief": {
+   "code_help": "Enable KV backing relief. Promoted from SGLANG_KV_BACKING_RELIEF (#781). Default is ON."
+  },
+  "--kv-cache-dtype": {
+   "code_help": "Data type for kv cache storage. \"auto\" will use model data type. \"bf16\" or \"bfloat16\" for BF16 KV cache. \"fp8_e5m2\" and \"fp8_e4m3\" are supported for CUDA 11.8+. \"fp4_e2m1\" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
+  },
+  "--linear-replayssm-cache-len": {},
+  "--mamba-radix-cache-strategy": {
+   "code_help": "The strategy to use for mamba radix cache."
+  },
+  "--mamba-slot-reorder": {
+   "code_help": "Reorder mamba pool slots. Promoted from SGLANG_MAMBA_SLOT_REORDER (#781)."
+  },
+  "--mamba-ssm-dtype": {
+   "code_help": "The data type of the SSM states in mamba cache. If not set, will be read from model config (mamba_ssm_dtype)."
+  },
+  "--max-kv-per-request": {
+   "code_help": "K9: per-request KV ceiling for BOTH groups. Unset = the model context ({...}), i.e. the as-built cap."
+  },
+  "--max-mamba-cache-size": {},
+  "--max-running-requests": {},
+  "--max-total-tokens": {
+   "code_help": "The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes. {...}"
+  },
+  "--model-path": {
+   "code_help": "The path of the model weights. This can be a local folder or a Hugging Face repo ID."
+  },
+  "--num-continuous-decode-steps": {
+   "code_help": "Group D only. Decode steps run per scheduler visit (server_args.py:1424). Default {...}: Pass 1 to restore the shipped value."
+  },
+  "--page-size": {
+   "code_help": "The number of tokens in a page."
+  },
+  "--port": {},
+  "--pp-async-batch-depth": {},
+  "--pp-attn-stage-ratio": {
+   "code_help": "OVERRIDE the solved full-attention split for group P (e.g. '8,4,4'). Same PINNED provenance. Unset = the attention axis is resolved for the chosen layer cut by pp_cut.best_attention_split."
+  },
+  "--pp-size": {
+   "code_help": "The pipeline parallelism size."
+  },
+  "--pp-stage-ratio": {
+   "code_help": "OVERRIDE the solved layer cut for group P (e.g. '32,18,14'). Passing it is announced as 'PINNED (user override)' in the PP-CUT provenance line and priced on the same two axes as the solved cut. Unset = the solver decides."
+  },
+  "--random-seed": {
+   "code_help": "Sampling seed for BOTH groups. Default {...} is ARBITRARY AND FIXED, and that is the whole provenance -- it is not measured and not solved, and it is a flag so that no reader has to wonder which it was. What it buys is that two boots of one tip sample identically, so a decode difference between them is a difference in the code."
+  },
+  "--rank-gpu-id": {
+   "code_help": "Comma-separated GPU device indices, one per tensor-parallel rank (CUDA device order as seen by torch.cuda, which is not necessarily the nvidia-smi/NVML order). Duplicates co-locate several ranks on one physical GPU. Length must equal --tp-size. Replaces the --base-gpu-id/--gpu-id-step formula; requires --rank-gpu-memory-mib (or --rank-tp-ratio auto). Only pure single-node tensor parallelism is supported. Example: --rank-gpu-id 0,0,1,2 (TP=4, two ranks share GPU 0)."
+  },
+  "--rank-gpu-memory-mib": {
+   "code_help": "Absolute memory budget in MiB per rank when --rank-gpu-id is set. A single scalar applies uniformly to every rank (even TP: all shards are structurally equal). With --rank-tp-ratio a comma-separated per-rank list may be given instead (e.g. 26000,17000,17000), since shards then differ in size. The value is each rank's ENTIRE budget \u2014 no additional utilization ceiling or safety margin is applied on top; leaving headroom for the CUDA context is the user's responsibility. Required when --rank-gpu-id is set, except with --rank-tp-ratio auto (budgets are then derived from the NVML totals). Each budget is checked against, and converted to a fraction of, the NVML total of the card its rank's CUDA or"
+  },
+  "--rank-tp-ratio": {
+   "code_help": "UNEVEN tensor parallelism: comma-separated positive integer weights, one per rank (length must equal --tp-size), 'auto', or 'auto-performance'. Example: 2,1,1 gives rank 0 half of every sharded dimension and ranks 1/2 a quarter each \u2014 one large GPU plus two smaller ones. sum(weights) must divide every sharded dimension. 'auto' derives the weights from the --rank-gpu-memory-mib list, or, when that is omitted, from the NVML totals of the GPUs named in --rank-gpu-id (minus --rank-auto-reserve-mib). 'auto' is the CAPACITY-FIRST default and does NOT optimize for speed: it maximizes the KV pool and ignores how fast the cards are. It is not the per-task optimum, and it does not probe. 'auto-perform"
+  },
+  "--reasoning-parser": {
+   "code_help": "Specify the parser for reasoning models. Use 'auto' to detect from chat template. Options include: {...}."
+  },
+  "--scheduler-distributed-teardown": {
+   "code_help": "#673: destroy this scheduler's process groups on the graceful shutdown path, instead of leaving them to the interpreter. torch already reports the omission on every boot (\"destroy_process_group() was not called before program exit\"), and the cost is the #673 abort: ProcessGroupNCCL's watchdog and heartbeat are C++ threads joined by the group's destructor, so with the group never destroyed they are still joinable when the process tears down -- and destroying a joinable std::thread calls std::terminate, which is the observed \"terminate called without an active exception\" after a CLEAN drain. Default off because the destroy path also closes barlink (a POSIX shm segment and the device-mapped abo"
+  },
+  "--served-model-name": {},
+  "--skip-server-warmup": {},
+  "--speculative-algorithm": {},
+  "--speculative-draft-kv-only": {
+   "code_help": "#1233 (Weg 2 draft KV across the flip): run the drafter as a draft-KV PRODUCER only (no proposal, no verify): every prefill chunk on the LAST pipeline stage writes the draft layer's KV rows so HiCache can persist them in the canonical draft page that the decode group reads. Requires the full speculative flag set (--speculative-algorithm/--speculative-num-steps/--speculative-eagle-topk/--speculative-num-draft-tokens, carried byte-for-byte from the decode group so both compute the same drafter identity); valid only under pp_size>1, tp_size==1, page_size==1, --hicache-canonical-kv-page, and no dp/ep. Deliberately NOT part of the drafter identity hash: it decides whether the drafter PROPOSES, no"
+  },
+  "--speculative-draft-model-path": {
+   "code_help": "The path of the draft model weights. This can be a local folder or a Hugging Face repo ID. CANONICAL SPELLING (#382): --speculative-draft-model-path. The bare --speculative-draft-model is accepted as a DEPRECATED alias and resolves to the same field; every error and log message names the canonical form, because two names for one flag cost a sweep-2 arm the time it took to notice the message and the parser disagreed."
+  },
+  "--speculative-draft-window-size": {},
+  "--speculative-num-draft-tokens": {},
+  "--tool-call-parser": {
+   "code_help": "Specify the parser for handling tool-call interactions. Use 'auto' to detect from chat template. Options include: {...}."
+  },
+  "--tp-prefill-max-tokens": {
+   "code_help": "K5 (X): uncached tokens D may prefill itself. Default 4096 since 2026-09-15: the derivation below priced r_P from a single in-flip leg's front wall (1346 tok/s) and routed every request SHORT->D (xsn124-126); pass 0 to derive. Derived = 2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip lines, else the recorded PRE-BARLINK pair; floor = --chunked-prefill-size. The derivation and its three inputs are printed at launch."
+  },
+  "--tp-size": {
+   "code_help": "The tensor parallelism size."
+  },
+  "--trust-remote-code": {},
+  "--uneven-dcp": {
+   "code_help": "Enable uneven DCP. Promoted from SGLANG_UNEVEN_DCP (#781). Superseded in most cases by --rank-kv-ratio."
+  },
+  "--uneven-dcp-weighted": {
+   "code_help": "Enable weighted uneven DCP. Promoted from SGLANG_UNEVEN_DCP_WEIGHTED (#781)."
+  }
+ },
+ "flag_docs_sources": {
+  "code": "argparse help am Boot-Rev 103712cdb2",
+  "profile_files": [
+   "27b-fp8.env",
+   "27b-fp8.env"
+  ]
+ },
+ "id": "27b-fp8",
+ "launch": {
+  "argv": {
+   "D": [
+    "/opt/venv/bin/python",
+    "-m",
+    "sglang.launch_server",
+    "--model-path",
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-FP8",
+    "--trust-remote-code",
+    "--json-model-override-args",
+    "{\"language_model_only\": true}",
+    "--served-model-name",
+    "Qwen3.8-27B-FP8",
+    "--rank-gpu-id",
+    "0,1,2",
+    "--skip-server-warmup",
+    "--kv-cache-dtype",
+    "fp8_e4m3",
+    "--context-length",
+    "262144",
+    "--max-kv-per-request",
+    "262144",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
+    "--chat-template-default-kwargs",
+    "{\"preserve_thinking\": true}",
+    "--enable-cache-report",
+    "--enable-metrics",
+    "--enable-hierarchical-cache",
+    "--hicache-host-role",
+    "staging",
+    "--hicache-size",
+    "4",
+    "--hicache-mamba-host-mib",
+    "100",
+    "--hicache-write-policy",
+    "write_back",
+    "--hicache-storage-backend",
+    "file",
+    "--hicache-mem-layout",
+    "layer_first",
+    "--hicache-io-backend",
+    "direct",
+    "--hicache-storage-backend-extra-config",
+    "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+    "--hicache-canonical-kv-page",
+    "--host",
+    "127.0.0.1",
+    "--chunked-prefill-size",
+    "4096",
+    "--scheduler-distributed-teardown",
+    "--page-size",
+    "1",
+    "--random-seed",
+    "785500001",
+    "--mamba-slot-reorder",
+    "--kv-backing-relief",
+    "--barlink",
+    "--barlink-transport",
+    "bar1",
+    "--barlink-bar1-cap-cycles",
+    "300000000000",
+    "--collective-census-interval",
+    "50",
+    "--uneven-dcp",
+    "--uneven-dcp-weighted",
+    "--mamba-ssm-dtype",
+    "bfloat16",
+    "--enable-memory-saver",
+    "--max-running-requests",
+    "6",
+    "--tp-prefill-max-tokens",
+    "12288",
+    "--mamba-radix-cache-strategy",
+    "extra_buffer",
+    "--tp-size",
+    "3",
+    "--pp-size",
+    "1",
+    "--num-continuous-decode-steps",
+    "2",
+    "--rank-gpu-memory-mib",
+    "27680,17168,16936",
+    "--rank-tp-ratio",
+    "58,25,25",
+    "--speculative-algorithm",
+    "DFLASH",
+    "--speculative-draft-model-path",
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+    "--speculative-num-draft-tokens",
+    "8",
+    "--speculative-draft-window-size",
+    "2048",
+    "--enable-linear-replayssm-spec",
+    "--linear-replayssm-cache-len",
+    "16",
+    "--barlink-bar1-window-mib",
+    "16,TP_0=32,DCP_0=40",
+    "--barlink-uncovered-class",
+    "refuse",
+    "--port",
+    "30032"
+   ],
+   "P": [
+    "/opt/venv/bin/python",
+    "-m",
+    "sglang.launch_server",
+    "--model-path",
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-FP8",
+    "--trust-remote-code",
+    "--json-model-override-args",
+    "{\"language_model_only\": true}",
+    "--served-model-name",
+    "Qwen3.8-27B-FP8",
+    "--rank-gpu-id",
+    "0,1,2",
+    "--skip-server-warmup",
+    "--kv-cache-dtype",
+    "fp8_e4m3",
+    "--context-length",
+    "262144",
+    "--max-kv-per-request",
+    "262144",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
+    "--chat-template-default-kwargs",
+    "{\"preserve_thinking\": true}",
+    "--enable-cache-report",
+    "--enable-metrics",
+    "--enable-hierarchical-cache",
+    "--hicache-host-role",
+    "staging",
+    "--hicache-size",
+    "1",
+    "--hicache-mamba-host-mib",
+    "100",
+    "--hicache-write-policy",
+    "write_back",
+    "--hicache-storage-backend",
+    "file",
+    "--hicache-mem-layout",
+    "layer_first",
+    "--hicache-io-backend",
+    "direct",
+    "--hicache-storage-backend-extra-config",
+    "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+    "--hicache-canonical-kv-page",
+    "--host",
+    "127.0.0.1",
+    "--chunked-prefill-size",
+    "512",
+    "--scheduler-distributed-teardown",
+    "--page-size",
+    "1",
+    "--random-seed",
+    "785500001",
+    "--mamba-slot-reorder",
+    "--kv-backing-relief",
+    "--barlink",
+    "--barlink-transport",
+    "bar1",
+    "--barlink-bar1-cap-cycles",
+    "300000000000",
+    "--collective-census-interval",
+    "50",
+    "--mamba-ssm-dtype",
+    "bfloat16",
+    "--enable-memory-saver",
+    "--max-running-requests",
+    "1",
+    "--tp-size",
+    "1",
+    "--pp-size",
+    "3",
+    "--pp-async-batch-depth",
+    "0",
+    "--disable-overlap-schedule",
+    "--pp-stage-ratio",
+    "42,11,11",
+    "--pp-attn-stage-ratio",
+    "10,3,3",
+    "--rank-gpu-memory-mib",
+    "26000,15752,15480",
+    "--barlink-bar1-window-mib",
+    "24,PP_0=96",
+    "--speculative-algorithm",
+    "DFLASH",
+    "--speculative-draft-model-path",
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+    "--speculative-num-draft-tokens",
+    "8",
+    "--speculative-draft-kv-only",
+    "--max-total-tokens",
+    "269550",
+    "--port",
+    "30031",
+    "--max-mamba-cache-size",
+    "24",
+    "--cuda-graph-config",
+    "{\"prefill\":{\"backend\":\"full\",\"bs\":[512],\"full_prefill_max_req\":1}}",
+    "--max-running-requests=2"
+   ]
+  },
+  "env": {
+   "D": {},
+   "P": {}
+  },
+  "front_argv": [],
+  "redacted": "Admin-Schl\u00fcssel und -Schl\u00fcsseldatei (--admin-api-key, --admin-key-file) werden vom Launcher je Boot erzeugt und nie gezeigt."
+ },
+ "line": "27b",
+ "planer_nachrechnung": {
+  "all_match": true,
+  "checked_utc": "2026-10-03T10:09:35Z",
+  "ok": true,
+  "rev": "103712cdb2",
+  "rows": [
+   {
+    "error": null,
+    "expected_mib": [
+     27680,
+     17168,
+     16936
+    ],
+    "got_mib": [
+     27680,
+     17168,
+     16936
+    ],
+    "id": "27b-fp8:D",
+    "label": "D",
+    "lines": [
+     "budget D group=D ordinal=0 nvml_idx=1 NVIDIA GeForce RTX 5090: 27680 MiB = total 32607 - corridor 2971 (floor 2567 source=MEASURED-D reserve=1800 + awake_overshoot 404) - dormant_other 1466 - measured_awake_overshoot 489 () MiB",
+     "budget D group=D ordinal=1 nvml_idx=0 NVIDIA GeForce RTX 3080: 17168 MiB = total 20480 - corridor 2504 (floor 2100 source=MEASURED-D reserve=1400 + awake_overshoot 404) - dormant_other 806 MiB",
+     "budget D group=D ordinal=2 nvml_idx=2 NVIDIA GeForce RTX 3080: 16936 MiB = total 20480 - corridor 2505 (floor 2101 source=MEASURED-D reserve=1400 + awake_overshoot 404) - dormant_other 1032 MiB"
+    ],
+    "match": true
+   },
+   {
+    "error": null,
+    "expected_mib": [
+     26000,
+     15752,
+     15480
+    ],
+    "got_mib": [
+     26000,
+     15752,
+     15480
+    ],
+    "id": "27b-fp8:P",
+    "label": "P",
+    "lines": [
+     "budget P group=P ordinal=0 nvml_idx=1 NVIDIA GeForce RTX 5090: 26000 MiB = total 32607 - corridor 3259 (floor 2855 source=MEASURED-P reserve=1800 + awake_overshoot 404) - dormant_other 2422 - measured_awake_overshoot 920 (boot weg2ls2b2) MiB",
+     "budget P group=P ordinal=1 nvml_idx=0 NVIDIA GeForce RTX 3080: 15752 MiB = total 20480 - corridor 2899 (floor 2495 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1828 MiB",
+     "budget P group=P ordinal=2 nvml_idx=2 NVIDIA GeForce RTX 3080: 15480 MiB = total 20480 - corridor 2662 (floor 2258 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1826 - measured_awake_overshoot 512 (boot weg2ls2b2) MiB"
+    ],
+    "match": true
+   }
+  ]
+ },
+ "profile": "27b-fp8",
+ "rank_posts": {
+  "D": {
+   "tp0": {
+    "avail_after_pool_mib": 3461,
+    "graphs": [
+     {
+      "mib": 358,
+      "what": "target verify"
+     },
+     {
+      "mib": 276,
+      "what": "draft verify"
+     }
+    ],
+    "init_dist_mib": 276,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 4454,
+      "tokens": 285168,
+      "v_mib": 4454
+     },
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 61,
+      "tokens": 24673,
+      "v_mib": 61
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 14012,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool": 1421,
+      "prefill activation reserve": 1024,
+      "speculative intermediate state": 100,
+      "weights + runtime state": 15758
+     },
+     "rest_mib": 9376
+    },
+    "mamba": {
+     "conv_mib": 51,
+     "intermediate_mib": 31,
+     "mib": 1485,
+     "slots": 38,
+     "ssm_mib": 1403
+    },
+    "weights": [
+     {
+      "mib": 14367,
+      "type": "Qwen3_5ForConditionalGeneration"
+     },
+     {
+      "mib": 1198,
+      "type": "DFlash2DraftModel"
+     }
+    ]
+   },
+   "tp1": {
+    "avail_after_pool_mib": 3052,
+    "graphs": [
+     {
+      "mib": 420,
+      "what": "target verify"
+     },
+     {
+      "mib": 297,
+      "what": "draft verify"
+     }
+    ],
+    "init_dist_mib": 154,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 3256,
+      "tokens": 208392,
+      "v_mib": 3256
+     },
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 31,
+      "tokens": 24673,
+      "v_mib": 31
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 10406,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool": 711,
+      "prefill activation reserve": 1024,
+      "speculative intermediate state": 50,
+      "weights + runtime state": 8398
+     },
+     "rest_mib": 6985
+    },
+    "mamba": {
+     "conv_mib": 31,
+     "intermediate_mib": 20,
+     "mib": 758,
+     "slots": 38,
+     "ssm_mib": 707
+    },
+    "weights": [
+     {
+      "mib": 7547,
+      "type": "Qwen3_5ForConditionalGeneration"
+     },
+     {
+      "mib": 655,
+      "type": "DFlash2DraftModel"
+     }
+    ]
+   },
+   "tp2": {
+    "avail_after_pool_mib": 2826,
+    "graphs": [
+     {
+      "mib": 420,
+      "what": "target verify"
+     },
+     {
+      "mib": 297,
+      "what": "draft verify"
+     }
+    ],
+    "init_dist_mib": 154,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 3256,
+      "tokens": 208392,
+      "v_mib": 3256
+     },
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 31,
+      "tokens": 24673,
+      "v_mib": 31
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 10180,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool": 711,
+      "prefill activation reserve": 1024,
+      "speculative intermediate state": 50,
+      "weights + runtime state": 8398
+     },
+     "rest_mib": 6753
+    },
+    "mamba": {
+     "conv_mib": 31,
+     "intermediate_mib": 20,
+     "mib": 758,
+     "slots": 38,
+     "ssm_mib": 707
+    },
+    "weights": [
+     {
+      "mib": 7547,
+      "type": "Qwen3_5ForConditionalGeneration"
+     },
+     {
+      "mib": 655,
+      "type": "DFlash2DraftModel"
+     }
+    ]
+   }
+  },
+  "P": {
+   "pp0": {
+    "avail_after_pool_mib": 7496,
+    "graphs": [
+     {
+      "mib": 184,
+      "what": "target prefill"
+     }
+    ],
+    "init_dist_mib": 307,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 2140,
+      "tokens": 218965,
+      "v_mib": 2140
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 13047,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool + speculative intermediate state + prefill activation reserve": 1197,
+      "prefill graph pool": 160,
+      "weights + runtime state": 18228
+     },
+     "rest_mib": 6415
+    },
+    "mamba": {
+     "conv_mib": 51,
+     "intermediate_mib": 0,
+     "mib": 1249,
+     "slots": 24,
+     "ssm_mib": 1198
+    },
+    "prefill_graph_mib": 188,
+    "weights": [
+     {
+      "mib": 18166,
+      "type": "Qwen3_5ForConditionalGeneration"
+     }
+    ]
+   },
+   "pp1": {
+    "avail_after_pool_mib": 13814,
+    "graphs": [
+     {
+      "mib": 205,
+      "what": "target prefill"
+     }
+    ],
+    "init_dist_mib": 184,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 645,
+      "tokens": 218965,
+      "v_mib": 645
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 15419,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool + speculative intermediate state + prefill activation reserve": 299,
+      "prefill graph pool": 160,
+      "weights + runtime state": 4228
+     },
+     "rest_mib": 11064
+    },
+    "mamba": {
+     "conv_mib": 10,
+     "intermediate_mib": 0,
+     "mib": 307,
+     "slots": 24,
+     "ssm_mib": 297
+    },
+    "prefill_graph_mib": 202,
+    "weights": [
+     {
+      "mib": 4157,
+      "type": "Qwen3_5ForConditionalGeneration"
+     }
+    ]
+   },
+   "pp2": {
+    "avail_after_pool_mib": 9021,
+    "graphs": [
+     {
+      "mib": 215,
+      "what": "target prefill"
+     }
+    ],
+    "init_dist_mib": 184,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 645,
+      "tokens": 218965,
+      "v_mib": 645
+     },
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 82,
+      "tokens": 16384,
+      "v_mib": 82
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 10627,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool + speculative intermediate state + prefill activation reserve": 299,
+      "prefill graph pool": 160,
+      "weights + runtime state": 9020
+     },
+     "rest_mib": 6001
+    },
+    "mamba": {
+     "conv_mib": 10,
+     "intermediate_mib": 0,
+     "mib": 307,
+     "slots": 24,
+     "ssm_mib": 297
+    },
+    "prefill_graph_mib": 218,
+    "weights": [
+     {
+      "mib": 6625,
+      "type": "Qwen3_5ForConditionalGeneration"
+     },
+     {
+      "mib": 2191,
+      "type": "DFlash2DraftModel"
+     }
+    ]
+   }
+  }
+ },
+ "schema": "kartenplan.record/1",
+ "weights": [
+  {
+   "bytes": 30866866928,
+   "flag": "--model-path",
+   "path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-FP8",
+   "src": "stat, gemessen"
+  },
+  {
+   "bytes": null,
+   "flag": "--speculative-draft-model-path",
+   "path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "src": "Pfad nicht lesbar"
+  }
+ ]
+}

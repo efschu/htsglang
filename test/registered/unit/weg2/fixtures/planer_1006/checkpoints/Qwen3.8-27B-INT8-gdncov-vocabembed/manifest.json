@@ -1,0 +1,188 @@
+{
+ "files": [
+  {
+   "kind": "copy",
+   "name": "LICENSE",
+   "size": 11544
+  },
+  {
+   "kind": "copy",
+   "name": "README.md",
+   "size": 495
+  },
+  {
+   "kind": "copy",
+   "name": "chat_template.jinja",
+   "size": 8952
+  },
+  {
+   "kind": "copy",
+   "name": "config.json",
+   "size": 5071
+  },
+  {
+   "kind": "copy",
+   "name": "config.json.yarn-bak",
+   "size": 5037
+  },
+  {
+   "kind": "copy",
+   "name": "crc32.txt",
+   "size": 238
+  },
+  {
+   "kind": "copy",
+   "name": "generation_config.json",
+   "size": 202
+  },
+  {
+   "gz": true,
+   "kind": "copy",
+   "name": "merges.txt",
+   "size": 3353259
+  },
+  {
+   "kind": "header",
+   "name": "model-00001-of-00018.safetensors",
+   "sha256_header": "82fa94cddc209c09ec6f9a0bf2b2bb61ea731b97ffd951df944f143502d91ef3",
+   "size": 2446785080
+  },
+  {
+   "kind": "header",
+   "name": "model-00002-of-00018.safetensors",
+   "sha256_header": "f9343fb697627c3a5ef7363d26e39e55a0904afadc76e5021c41ae8474b71c9f",
+   "size": 1523135576
+  },
+  {
+   "kind": "header",
+   "name": "model-00003-of-00018.safetensors",
+   "sha256_header": "fc9e6d03bb87449d2d1d28c94927dc141d1824aa6b4d510fbd7b4cfd2ccc4828",
+   "size": 1271895312
+  },
+  {
+   "kind": "header",
+   "name": "model-00004-of-00018.safetensors",
+   "sha256_header": "e8d640e4b545c8d65f19815bdf0301751fca9adaeb2a75a438e5f7bd6eda29f1",
+   "size": 1997327784
+  },
+  {
+   "kind": "header",
+   "name": "model-00005-of-00018.safetensors",
+   "sha256_header": "88c4e7d57a584323ff0c6dd42b184e821a33c9e061877eb12e240a205b8c94f5",
+   "size": 1051095744
+  },
+  {
+   "kind": "header",
+   "name": "model-00006-of-00018.safetensors",
+   "sha256_header": "31a4b6bcc4fec3d9437e0559a9742d0b7b351b9191c8a06c8ef0de827f05be3e",
+   "size": 1993149288
+  },
+  {
+   "kind": "header",
+   "name": "model-00007-of-00018.safetensors",
+   "sha256_header": "450903f10adc141e8179e4a79ba2f0772c0b6259671b8ec417e80ce6d0207010",
+   "size": 1055274304
+  },
+  {
+   "kind": "header",
+   "name": "model-00008-of-00018.safetensors",
+   "sha256_header": "4e2f654c4beb40d4156f6fb1b1634d73c602aa5d57a5a44ac6110b5dbbdda75e",
+   "size": 1993149288
+  },
+  {
+   "kind": "header",
+   "name": "model-00009-of-00018.safetensors",
+   "sha256_header": "c0312cc49fd4a3660d265aae9f19fc8d0eca418d42c0e4093f88b1a1fd8ce467",
+   "size": 1055274304
+  },
+  {
+   "kind": "header",
+   "name": "model-00010-of-00018.safetensors",
+   "sha256_header": "907ef2001e7b2f227fcac9ed970db0569792dc76cfaa301c58ab7023b6045c11",
+   "size": 1993149288
+  },
+  {
+   "kind": "header",
+   "name": "model-00011-of-00018.safetensors",
+   "sha256_header": "bcf002b53493b576dc312a7deb47346a49a709b66916552d0873376f21dd51fe",
+   "size": 1055274304
+  },
+  {
+   "kind": "header",
+   "name": "model-00012-of-00018.safetensors",
+   "sha256_header": "f15e1983b35a243d00127da62e21940b8d0955efd9c7d4b719bc6be854b48809",
+   "size": 1993149288
+  },
+  {
+   "kind": "header",
+   "name": "model-00013-of-00018.safetensors",
+   "sha256_header": "733b2604c9252192796cc4b81a45bb7c662fd2b63a63451cbde369a925ae137a",
+   "size": 1055274304
+  },
+  {
+   "kind": "header",
+   "name": "model-00014-of-00018.safetensors",
+   "sha256_header": "f71f56ea14e52efe8cc1cc16f800f4f94a3b79583bb34a7a1e83871838ac3752",
+   "size": 1993149288
+  },
+  {
+   "kind": "header",
+   "name": "model-00015-of-00018.safetensors",
+   "sha256_header": "a072fb8f7b3158fe5112940089e34f513fd85ad37decfd09f21b49ac0074ab11",
+   "size": 1055274304
+  },
+  {
+   "kind": "header",
+   "name": "model-00016-of-00018.safetensors",
+   "sha256_header": "cbdc84997b2cea97619db5c31f70ca513f1a554fc9559f6d75e1ac338ae7e687",
+   "size": 1993159624
+  },
+  {
+   "kind": "header",
+   "name": "model-00017-of-00018.safetensors",
+   "sha256_header": "2b9be8c5f69e2fd8269fc692c9d89cbea40e6f1a01cdbb43d9c51f3c863ea809",
+   "size": 1055274304
+  },
+  {
+   "kind": "header",
+   "name": "model-00018-of-00018.safetensors",
+   "sha256_header": "d9ce50fe97ef7dfa82cabd0d45c96a5302b2fc24decf90e64d96b9a64c4d6c6a",
+   "size": 2967653960
+  },
+  {
+   "gz": true,
+   "kind": "copy",
+   "name": "model.safetensors.index.json",
+   "size": 154559
+  },
+  {
+   "kind": "copy",
+   "name": "preprocessor_config.json",
+   "size": 390
+  },
+  {
+   "kind": "zero",
+   "name": "tokenizer.json",
+   "size": 12809320
+  },
+  {
+   "kind": "copy",
+   "name": "tokenizer_config.json",
+   "size": 17928
+  },
+  {
+   "kind": "copy",
+   "name": "video_preprocessor_config.json",
+   "size": 385
+  },
+  {
+   "kind": "zero",
+   "name": "vocab.json",
+   "size": 6722759
+  }
+ ],
+ "name": "Qwen3.8-27B-INT8-gdncov-vocabembed",
+ "schema": "planer-oracle-checkpoint-snapshot/1",
+ "skipped_dirs": [],
+ "source": "proxmox:/spinning/subvol-999-disk-0/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed (read-only; headers via ssh, 32 files)"
+}

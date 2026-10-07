@@ -1,0 +1,1071 @@
+{
+ "uid": "rig-verlauf",
+ "title": "Rig – Verlauf",
+ "tags": [
+  "rig",
+  "weg2"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "10s",
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "graphTooltip": 1,
+ "editable": true,
+ "templating": {
+  "list": [
+   {
+    "name": "model",
+    "label": "Modell",
+    "type": "custom",
+    "query": "NF,27B",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "includeAll": true,
+    "allValue": ".*",
+    "multi": false,
+    "options": []
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "Nutzer-Latenz",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "TTFT der Nutzer (Punkt je 5-s-Takt)",
+   "description": "Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT), IPC-Zähler state.json front.arrival_seat.ttft_* (NF). Mittel der Anfragen, deren erstes Token im Intervall kam. 27B: fehlt bis zum Image mit weg2_ttft_seconds (TSDB-Delta 01.10.). Über P / direkt D getrennt: fehlt in IPC (front.arrival_seat.ttft_by_via).",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 1,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "points",
+      "lineWidth": 0,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "always",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "sum by (model) (increase(weg2_front_ttft_ms_sum{model=~\"$model\"}[5s])) / (sum by (model) (increase(weg2_front_ttft_count{model=~\"$model\"}[5s])) > 0) / 1000",
+     "legendFormat": "{{model}}"
+    }
+   ],
+   "interval": "5s"
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "TTFT max seit Boot / Anfragen je min",
+   "description": "state.json front.arrival_seat.ttft_ms_max",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 1,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "max by (model) (weg2_front_ttft_ms_max{model=~\"$model\"}) / 1000",
+     "legendFormat": "max {{model}}"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "Anfragen bedient je min (D-Bein)",
+   "description": "state.json front.served.D",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 1,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "sum by (model) (rate(weg2_front_served_total{group=\"D\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "legendFormat": "{{model}}"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "timeseries",
+   "title": "Flipzeit (je Flip)",
+   "description": "Nutzersicht (01.10.): P→D = P-Ende -> erstes Decode auf D (Rang-Segmente), D→P = Decode-Ende -> P-Prefill-Start (flip_user_time); Teile part=vorlauf|layer|nachlauf|d_extend. Ein Punkt je Flip zum flip_begin; Leerlauf-Flips ohne Wert.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 9,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "points",
+      "lineWidth": 0,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "always",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "max by (model, dir) (weg2_flip_user_view_ms{def=\"t2t\",part=\"total\",model=~\"$model\"}) / 1000",
+     "legendFormat": "Flipzeit {{dir}} {{model}}"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "B",
+     "expr": "max by (model, dir) (weg2_flip_user_view_ms{def=\"t2t\",part=\"layer\",model=~\"$model\"}) / 1000",
+     "legendFormat": "Teil Layer-Tausch (in Flipzeit enthalten) {{dir}} {{model}}"
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Upstream-TTFT des D-Beins (nicht Nutzer-TTFT)",
+   "description": "sglang:time_to_first_token_seconds der wachen Gruppe (Front-Durchreiche /metrics): ab Ankunft des Leg 2 bei der Gruppe, ohne Warteschlange und Flip der Front.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 9,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "p50"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "B",
+     "expr": "histogram_quantile(0.9, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "p90"
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "type": "row",
+   "title": "Durchsatz",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 17,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 8,
+   "type": "timeseries",
+   "title": "Decode tok/s (D, TP0)",
+   "description": "rankstats decode.tokens (Wanduhr-Rate, Pausen zählen mit)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 18,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "sum by (model) (rate(weg2_rank_decode_tokens_total{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "{{model}}"
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "Prefill neu gerechnet tok/s (P, D)",
+   "description": "rankstats prefill.new_tokens, erster Rang je Gruppe (Wanduhr-Rate)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 18,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "sum by (model, group) (rate(weg2_rank_prefill_new_tokens_total{rank=\"tp0pp0\",group=~\"P|D\",model=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "{{group}} {{model}}"
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Decode bs (letzte Runde) / laufende Anfragen",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 26,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "max by (model) (weg2_rank_decode_last_bs{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"})",
+     "legendFormat": "bs {{model}}"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "B",
+     "expr": "max by (model) (weg2_front_outstanding_n{model=~\"$model\"})",
+     "legendFormat": "outstanding {{model}}"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "C",
+     "expr": "max by (model) (weg2_front_queue{model=~\"$model\"})",
+     "legendFormat": "Warteschlange {{model}}"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "KV-Belegung",
+   "description": "rankstats sched.full_token_usage",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 26,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "max by (model, group) (weg2_rank_kv_usage_ratio{model=~\"$model\"}) * 100",
+     "legendFormat": "{{group}} {{model}}"
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "type": "row",
+   "title": "Speicherstufen (Zaehler; Dauer/Bytes je Ereignis fehlen in IPC, Feldliste 01.10.)",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 51,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "L2 Host-Arena: Load-back Token/s und Mamba-Resumes/min",
+   "description": "rankstats.cache.loadback_tok / mamba_resume_n, erster Rang je Gruppe",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 52,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "sum by (model, group) (rate(weg2_rank_l2_loadback_tokens_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "Load-back Tok/s {{group}} {{model}}"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "B",
+     "expr": "sum by (model, group) (rate(weg2_rank_mamba_resume_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "legendFormat": "Mamba-Resumes/min {{group}} {{model}}"
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "type": "timeseries",
+   "title": "L3 Store: Prefetch je Ausgang /min",
+   "description": "rankstats.cache.prefetch.*; L1,5: noch keine Daten (Stufe im Bau)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 52,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "sum by (model, group, outcome) (rate(weg2_rank_l3_prefetch_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "legendFormat": "{{outcome}} {{group}} {{model}}"
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "type": "row",
+   "title": "Karten und Host",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 34,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 16,
+   "type": "timeseries",
+   "title": "Leistungsaufnahme",
+   "description": "nvidia_gpu_exporter (NVML)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 35,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "watt",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "sum(nvidia_smi_power_draw_watts)",
+     "legendFormat": "Summe"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "B",
+     "expr": "nvidia_smi_power_draw_watts * on (uuid) group_left (name, index) nvidia_smi_gpu_info",
+     "legendFormat": "nvml {{index}} {{name}}"
+    }
+   ]
+  },
+  {
+   "id": 17,
+   "type": "timeseries",
+   "title": "GPU-Temperatur",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 35,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "celsius",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "nvidia_smi_temperature_gpu * on (uuid) group_left (name, index) nvidia_smi_gpu_info",
+     "legendFormat": "nvml {{index}} {{name}}"
+    }
+   ]
+  },
+  {
+   "id": 18,
+   "type": "timeseries",
+   "title": "GPU-Last / VRAM belegt",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 43,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "nvidia_smi_utilization_gpu_ratio * 100 * on (uuid) group_left (name, index) nvidia_smi_gpu_info",
+     "legendFormat": "Last nvml {{index}}"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "B",
+     "expr": "nvidia_smi_memory_used_bytes / nvidia_smi_memory_total_bytes * 100 * on (uuid) group_left (name, index) nvidia_smi_gpu_info",
+     "legendFormat": "VRAM nvml {{index}}"
+    }
+   ]
+  },
+  {
+   "id": 19,
+   "type": "timeseries",
+   "title": "Proxmox-Host: RAM verfügbar und ZFS-ARC",
+   "description": "node_exporter auf dem Proxmox-Host (192.168.0.11:9100)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 43,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "node_memory_MemAvailable_bytes{host=\"proxmox\"}",
+     "legendFormat": "MemAvailable"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "B",
+     "expr": "node_zfs_arc_size{host=\"proxmox\"}",
+     "legendFormat": "ZFS-ARC"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "C",
+     "expr": "node_memory_SwapTotal_bytes{host=\"proxmox\"} - node_memory_SwapFree_bytes{host=\"proxmox\"}",
+     "legendFormat": "Swap belegt"
+    }
+   ]
+  }
+ ]
+}

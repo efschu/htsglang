@@ -1,0 +1,866 @@
+{
+ "bar1": {
+  "measured": false,
+  "note": "BAR1 stretch per pair: NOT MEASURED. The BAR1 transport (barlink_bar1.build_bar1) needs a torch.distributed CPU group with one process per rank, the dmabuf_holder kernel module and a window the serving boot negotiates; there is no single-process entry that runs it without a server. The pair matrix is the cuda p2p / host staging path and is labelled as such."
+ },
+ "cards": [
+  {
+   "age_s": 3600.0,
+   "bar1_total_mib": {
+    "src": "NVML",
+    "unit": "MiB",
+    "v": 32768
+   },
+   "card_key": "RTX5090/32607MiB/sm120",
+   "cc": [
+    12,
+    0
+   ],
+   "class_key": "RTX5090",
+   "compute": {
+    "bf16": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TFLOPS",
+     "v": 210.0
+    },
+    "fp8_marlin": {
+     "note": "Messarm noch nicht gelaufen (Hardwareprofil messen)",
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "v": null
+    },
+    "fp8_native": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TFLOPS",
+     "v": 400.0
+    },
+    "fp8_w8a16": {
+     "note": "Messarm noch nicht gelaufen (Hardwareprofil messen)",
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "v": null
+    },
+    "int8": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TOPS",
+     "v": 180.0
+    },
+    "nvfp4_marlin": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TFLOPS",
+     "v": 55.0
+    },
+    "nvfp4_w4a8": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TOPS",
+     "v": 62.0
+    }
+   },
+   "d2d_intra_gbs": {
+    "at": 1789996400.0,
+    "note": "Kopier-Kernel innerhalb der Karte (lesen+schreiben), dieselbe Messung wie mem_gbs.copy",
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "unit": "GB/s",
+    "v": 1450.0
+   },
+   "d2h": {
+    "gbs": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 6.5
+    },
+    "lat_us": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "µs",
+     "v": 14.0
+    }
+   },
+   "h2d": {
+    "gbs": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 6.0
+    },
+    "lat_us": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "µs",
+     "v": 12.5
+    }
+   },
+   "l2_mib": {
+    "at": 1789996400.0,
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "unit": "MiB",
+    "v": 5.0
+   },
+   "mem_gbs": {
+    "copy": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 1450.0
+    },
+    "gemv": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 1400.0
+    },
+    "nameplate": {
+     "note": "Busbreite x max. Speichertakt x 2 aus NVML (Spitzenwert, kein Messwert)",
+     "src": "Datenblatt",
+     "unit": "GB/s",
+     "v": 1792.0
+    },
+    "read": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 1500.0
+    }
+   },
+   "name": "NVIDIA GeForce RTX 5090",
+   "nvml_index": 1,
+   "ord": 0,
+   "pci_bus_id": "0000:01:00.0",
+   "pcie": {
+    "cur_gen": {
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)",
+     "src": "NVML",
+     "v": 1
+    },
+    "cur_width": {
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)",
+     "src": "NVML",
+     "v": 8
+    },
+    "max_gen": {
+     "src": "NVML",
+     "v": 5
+    },
+    "max_width": {
+     "src": "NVML",
+     "v": 16
+    }
+   },
+   "power": {
+    "default_w": {
+     "src": "NVML",
+     "unit": "W",
+     "v": 320.0
+    },
+    "limit_w": {
+     "src": "NVML",
+     "unit": "W",
+     "v": 230.0
+    }
+   },
+   "probed_at": 1789996400.0,
+   "sm_count": {
+    "at": 1789996400.0,
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "v": 170.0
+   },
+   "stale": false,
+   "state": {
+    "sm_max_mhz": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "MHz",
+     "v": 2100.0
+    },
+    "sm_mhz": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "MHz",
+     "v": 1900.0
+    },
+    "temp_c": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "°C",
+     "v": 60.0
+    },
+    "throttle": [],
+    "throttled": false
+   },
+   "uuid": "GPU-1111",
+   "vram_total_mib": {
+    "src": "NVML",
+    "unit": "MiB",
+    "v": 32607
+   }
+  },
+  {
+   "age_s": 3600.0,
+   "bar1_total_mib": {
+    "src": "NVML",
+    "unit": "MiB",
+    "v": 256
+   },
+   "card_key": "RTX3080/20480MiB/sm86",
+   "cc": [
+    8,
+    6
+   ],
+   "class_key": "RTX3080",
+   "compute": {
+    "bf16": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TFLOPS",
+     "v": 60.0
+    },
+    "fp8_marlin": {
+     "note": "Messarm noch nicht gelaufen (Hardwareprofil messen)",
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "v": null
+    },
+    "fp8_native": {
+     "note": "compute capability 8.6 has no fp8 tensor path (needs 8.9+)",
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "v": null
+    },
+    "fp8_w8a16": {
+     "note": "Messarm noch nicht gelaufen (Hardwareprofil messen)",
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "v": null
+    },
+    "int8": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TOPS",
+     "v": 180.0
+    },
+    "nvfp4_marlin": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TFLOPS",
+     "v": 55.0
+    },
+    "nvfp4_w4a8": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TOPS",
+     "v": 62.0
+    }
+   },
+   "d2d_intra_gbs": {
+    "at": 1789996400.0,
+    "note": "Kopier-Kernel innerhalb der Karte (lesen+schreiben), dieselbe Messung wie mem_gbs.copy",
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "unit": "GB/s",
+    "v": 690.0
+   },
+   "d2h": {
+    "gbs": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 6.5
+    },
+    "lat_us": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "µs",
+     "v": 14.0
+    }
+   },
+   "h2d": {
+    "gbs": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 6.0
+    },
+    "lat_us": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "µs",
+     "v": 12.5
+    }
+   },
+   "l2_mib": {
+    "at": 1789996400.0,
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "unit": "MiB",
+    "v": 5.0
+   },
+   "mem_gbs": {
+    "copy": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 690.0
+    },
+    "gemv": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 650.0
+    },
+    "nameplate": {
+     "note": "Busbreite x max. Speichertakt x 2 aus NVML (Spitzenwert, kein Messwert)",
+     "src": "Datenblatt",
+     "unit": "GB/s",
+     "v": 760.1
+    },
+    "read": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 700.0
+    }
+   },
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml_index": 0,
+   "ord": 1,
+   "pci_bus_id": "0000:00:00.0",
+   "pcie": {
+    "cur_gen": {
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)",
+     "src": "NVML",
+     "v": 1
+    },
+    "cur_width": {
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)",
+     "src": "NVML",
+     "v": 8
+    },
+    "max_gen": {
+     "src": "NVML",
+     "v": 4
+    },
+    "max_width": {
+     "src": "NVML",
+     "v": 16
+    }
+   },
+   "power": {
+    "default_w": {
+     "src": "NVML",
+     "unit": "W",
+     "v": 320.0
+    },
+    "limit_w": {
+     "src": "NVML",
+     "unit": "W",
+     "v": 230.0
+    }
+   },
+   "probed_at": 1789996400.0,
+   "sm_count": {
+    "at": 1789996400.0,
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "v": 68.0
+   },
+   "stale": false,
+   "state": {
+    "sm_max_mhz": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "MHz",
+     "v": 2100.0
+    },
+    "sm_mhz": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "MHz",
+     "v": 1900.0
+    },
+    "temp_c": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "°C",
+     "v": 60.0
+    },
+    "throttle": [],
+    "throttled": false
+   },
+   "uuid": "GPU-0000",
+   "vram_total_mib": {
+    "src": "NVML",
+    "unit": "MiB",
+    "v": 20480
+   }
+  },
+  {
+   "age_s": 3600.0,
+   "bar1_total_mib": {
+    "src": "NVML",
+    "unit": "MiB",
+    "v": 256
+   },
+   "card_key": "RTX3080/20480MiB/sm86",
+   "cc": [
+    8,
+    6
+   ],
+   "class_key": "RTX3080",
+   "compute": {
+    "bf16": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TFLOPS",
+     "v": 60.0
+    },
+    "fp8_marlin": {
+     "note": "Messarm noch nicht gelaufen (Hardwareprofil messen)",
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "v": null
+    },
+    "fp8_native": {
+     "note": "compute capability 8.6 has no fp8 tensor path (needs 8.9+)",
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "v": null
+    },
+    "fp8_w8a16": {
+     "note": "Messarm noch nicht gelaufen (Hardwareprofil messen)",
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "v": null
+    },
+    "int8": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TOPS",
+     "v": 180.0
+    },
+    "nvfp4_marlin": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TFLOPS",
+     "v": 55.0
+    },
+    "nvfp4_w4a8": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "TOPS",
+     "v": 62.0
+    }
+   },
+   "d2d_intra_gbs": {
+    "at": 1789996400.0,
+    "note": "Kopier-Kernel innerhalb der Karte (lesen+schreiben), dieselbe Messung wie mem_gbs.copy",
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "unit": "GB/s",
+    "v": 690.0
+   },
+   "d2h": {
+    "gbs": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 6.5
+    },
+    "lat_us": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "µs",
+     "v": 14.0
+    }
+   },
+   "h2d": {
+    "gbs": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 6.0
+    },
+    "lat_us": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "µs",
+     "v": 12.5
+    }
+   },
+   "l2_mib": {
+    "at": 1789996400.0,
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "unit": "MiB",
+    "v": 5.0
+   },
+   "mem_gbs": {
+    "copy": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 690.0
+    },
+    "gemv": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 650.0
+    },
+    "nameplate": {
+     "note": "Busbreite x max. Speichertakt x 2 aus NVML (Spitzenwert, kein Messwert)",
+     "src": "Datenblatt",
+     "unit": "GB/s",
+     "v": 760.1
+    },
+    "read": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "GB/s",
+     "v": 700.0
+    }
+   },
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml_index": 2,
+   "ord": 2,
+   "pci_bus_id": "0000:02:00.0",
+   "pcie": {
+    "cur_gen": {
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)",
+     "src": "NVML",
+     "v": 1
+    },
+    "cur_width": {
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)",
+     "src": "NVML",
+     "v": 8
+    },
+    "max_gen": {
+     "src": "NVML",
+     "v": 4
+    },
+    "max_width": {
+     "src": "NVML",
+     "v": 16
+    }
+   },
+   "power": {
+    "default_w": {
+     "src": "NVML",
+     "unit": "W",
+     "v": 320.0
+    },
+    "limit_w": {
+     "src": "NVML",
+     "unit": "W",
+     "v": 230.0
+    }
+   },
+   "probed_at": 1789996400.0,
+   "sm_count": {
+    "at": 1789996400.0,
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "v": 68.0
+   },
+   "stale": false,
+   "state": {
+    "sm_max_mhz": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "MHz",
+     "v": 2100.0
+    },
+    "sm_mhz": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "MHz",
+     "v": 1900.0
+    },
+    "temp_c": {
+     "at": 1789996400.0,
+     "probe": "card_probe-ref.json",
+     "src": "gemessen",
+     "unit": "°C",
+     "v": 60.0
+    },
+    "throttle": [],
+    "throttled": false
+   },
+   "uuid": "GPU-2222",
+   "vram_total_mib": {
+    "src": "NVML",
+    "unit": "MiB",
+    "v": 20480
+   }
+  }
+ ],
+ "cuda": "13.0",
+ "driver": "595.58",
+ "formats": [
+  {
+   "key": "bf16",
+   "label": "bf16",
+   "unit": "TFLOPS"
+  },
+  {
+   "key": "fp8_native",
+   "label": "fp8 (native, _scaled_mm)",
+   "unit": "TFLOPS"
+  },
+  {
+   "key": "fp8_marlin",
+   "label": "fp8 Marlin (nur Gewicht)",
+   "unit": "TFLOPS"
+  },
+  {
+   "key": "fp8_w8a16",
+   "label": "fp8 W8A16 (Dequant)",
+   "unit": "TFLOPS"
+  },
+  {
+   "key": "int8",
+   "label": "int8 W8A8",
+   "unit": "TOPS"
+  },
+  {
+   "key": "nvfp4_w4a8",
+   "label": "NVFP4 W4A8 (int8-Kerne)",
+   "unit": "TOPS"
+  },
+  {
+   "key": "nvfp4_marlin",
+   "label": "NVFP4 W4A16 (Marlin)",
+   "unit": "TFLOPS"
+  }
+ ],
+ "inventory_sig": [
+  "RTX5090",
+  "RTX3080",
+  "RTX3080"
+ ],
+ "links": [
+  {
+   "dst": 0,
+   "gbs": {
+    "at": 1789996400.0,
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "unit": "GB/s",
+    "v": 11.5
+   },
+   "lat_us": {
+    "at": 1789996400.0,
+    "probe": "card_probe-ref.json",
+    "src": "gemessen",
+    "unit": "µs",
+    "v": 9.0
+   },
+   "note": "",
+   "peer_access": true,
+   "src": 1,
+   "transport": "p2p",
+   "transport_label": "cuda p2p"
+  },
+  {
+   "dst": 1,
+   "gbs": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "GB/s",
+    "v": null
+   },
+   "lat_us": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "µs",
+    "v": null
+   },
+   "note": "",
+   "peer_access": null,
+   "src": 0,
+   "transport": "bar1",
+   "transport_label": "BAR1 (barlink)"
+  },
+  {
+   "dst": 2,
+   "gbs": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "GB/s",
+    "v": null
+   },
+   "lat_us": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "µs",
+    "v": null
+   },
+   "note": "",
+   "peer_access": null,
+   "src": 0,
+   "transport": "bar1",
+   "transport_label": "BAR1 (barlink)"
+  },
+  {
+   "dst": 0,
+   "gbs": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "GB/s",
+    "v": null
+   },
+   "lat_us": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "µs",
+    "v": null
+   },
+   "note": "",
+   "peer_access": null,
+   "src": 1,
+   "transport": "bar1",
+   "transport_label": "BAR1 (barlink)"
+  },
+  {
+   "dst": 2,
+   "gbs": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "GB/s",
+    "v": null
+   },
+   "lat_us": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "µs",
+    "v": null
+   },
+   "note": "",
+   "peer_access": null,
+   "src": 1,
+   "transport": "bar1",
+   "transport_label": "BAR1 (barlink)"
+  },
+  {
+   "dst": 0,
+   "gbs": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "GB/s",
+    "v": null
+   },
+   "lat_us": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "µs",
+    "v": null
+   },
+   "note": "",
+   "peer_access": null,
+   "src": 2,
+   "transport": "bar1",
+   "transport_label": "BAR1 (barlink)"
+  },
+  {
+   "dst": 1,
+   "gbs": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "GB/s",
+    "v": null
+   },
+   "lat_us": {
+    "note": "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)",
+    "src": "nicht gemessen",
+    "unit": "µs",
+    "v": null
+   },
+   "note": "",
+   "peer_access": null,
+   "src": 2,
+   "transport": "bar1",
+   "transport_label": "BAR1 (barlink)"
+  }
+ ],
+ "measure_needed": false,
+ "schema": "flliper.hardware/1",
+ "sources": {
+  "card_probe": [
+   {
+    "cards": 3,
+    "created": 1789996400.0,
+    "driver": "595.58",
+    "file": "card_probe-ref.json"
+   }
+  ],
+  "nvml": {
+   "cards": 3,
+   "issues": []
+  },
+  "stage0": []
+ },
+ "src_vocab": [
+  "gemessen",
+  "NVML",
+  "Datenblatt",
+  "geschätzt",
+  "nicht gemessen"
+ ],
+ "torch": "2.9",
+ "unmeasured": {
+  "0": [],
+  "1": [],
+  "2": []
+ }
+}

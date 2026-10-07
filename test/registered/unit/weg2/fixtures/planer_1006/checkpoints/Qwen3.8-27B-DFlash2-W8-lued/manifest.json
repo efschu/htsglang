@@ -1,0 +1,39 @@
+{
+ "files": [
+  {
+   "kind": "copy",
+   "name": ".gitattributes",
+   "size": 1570
+  },
+  {
+   "kind": "copy",
+   "name": "README.md",
+   "size": 3307
+  },
+  {
+   "kind": "copy",
+   "name": "config.json",
+   "size": 2064
+  },
+  {
+   "kind": "header",
+   "name": "model.safetensors",
+   "sha256_header": "6d1f8a447a2102f00403f0558f359021273be329e188ea354bff06b1636586c2",
+   "size": 2172742656
+  },
+  {
+   "kind": "copy",
+   "name": "model.safetensors.index.json",
+   "size": 10011
+  },
+  {
+   "kind": "copy",
+   "name": "recipe.yaml",
+   "size": 199
+  }
+ ],
+ "name": "Qwen3.8-27B-DFlash2-W8-lued",
+ "schema": "planer-oracle-checkpoint-snapshot/1",
+ "skipped_dirs": [],
+ "source": "proxmox:/spinning/subvol-999-disk-0/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued (read-only; headers via ssh, 6 files)"
+}

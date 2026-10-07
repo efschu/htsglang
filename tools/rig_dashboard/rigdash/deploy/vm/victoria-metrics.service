@@ -1,0 +1,14 @@
+[Unit]
+Description=VictoriaMetrics single-node (Zeitreihen-DB des Rigs, LAN :8428)
+After=network-online.target
+
+[Service]
+# -search.latencyOffset=2s: VM blendet sonst die letzten 30 s aus (Live-Kacheln waeren 30 s alt)
+ExecStart=/opt/victoriametrics/victoria-metrics-prod -storageDataPath=/var/lib/victoria-metrics -retentionPeriod=2y -httpListenAddr=:8428 -promscrape.config=/etc/victoria-metrics/scrape.yml -promscrape.config.strictParse=true -selfScrapeInterval=30s -search.latencyOffset=2s -dedup.minScrapeInterval=1ms -memory.allowedBytes=1GiB
+Restart=always
+RestartSec=5
+Nice=5
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,47 @@
+# The htsglang planner (capacity / feasibility / wizard / capability panels /
+# benchmark history) as an always-on, READ-ONLY companion of rig-dashboard:
+# http://192.168.0.88:8780/ .  Live P/D prefill and decode rates are NOT
+# computed here -- they live on rig-dashboard (:8890), from the boot logs.
+#
+# Differences to the older htsglang-planner.service (disabled, left untouched):
+#  * SGLANG_PLANNER_READONLY=1: boots (weg2 launcher in Docker, inside a gpuq
+#    window), GPU measurement runs, downloads, self-updates and publishing are
+#    refused with HTTP 409; planning, wizard and panels stay available.
+#  * CUDA_VISIBLE_DEVICES=-1: no CUDA context, so it never pins the driver and
+#    never takes VRAM on a card someone else holds a window for.  Card
+#    identity comes from NVML (the cuda-ordinal device map reads "unavailable").
+#  * Runs from a deployed copy (/opt/rigdash/planner/current), not a checkout.
+#  * HOME is its own state dir and /root is read-only for it: the planner's
+#    caches (~/.cache/sglang/...) never land in /root/.cache.
+# The interpreter is the htsglang-gpu venv (torch + deps), used read-only.
+
+[Unit]
+Description=htsglang planner, read-only companion of rig-dashboard (LAN :8780)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=exec
+StateDirectory=rig-planner
+WorkingDirectory=/var/lib/rig-planner
+ExecStart=/spinning/htsglang-gpu/.venv/bin/python -m sglang.planner --serve --host 0.0.0.0 --port 8780
+Environment=PYTHONPATH=/opt/rigdash/planner/current/python
+Environment=PYTHONUNBUFFERED=1
+Environment=CUDA_VISIBLE_DEVICES=-1
+Environment=SGLANG_PLANNER_READONLY=1
+Environment=HOME=/var/lib/rig-planner
+Environment=XDG_CACHE_HOME=/var/lib/rig-planner/.cache
+Environment=XDG_CONFIG_HOME=/var/lib/rig-planner/.config
+Environment=SGLANG_PLANNER_MODEL_ROOTS=/spinning/llm_stuff/club-3090/models-cache
+Restart=always
+RestartSec=5
+Nice=5
+MemoryMax=4G
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

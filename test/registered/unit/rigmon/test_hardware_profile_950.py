@@ -62,17 +62,18 @@ def _probe_card(uuid, name, **kw):
         "gemm_int8_tflops": 180.0, "gemm_w4a8_int8_tflops": 62.0, "gemm_w4a16_tflops": 55.0,
         "lane_notes": {}, "arm_seconds": {"membw": 3.0, "bf16": 1.0},
         "sm_clock_mhz": 1900, "sm_clock_max_mhz": 2100, "temp_c": 60.0, "throttle_reasons": [],
+        "pcie_gen_cur": 4, "pcie_width_cur": 8, "pcie_gen_max": 4, "pcie_width_max": 16,
         "seconds": 20.0,
     }
     d.update(kw)
     return d
 
 
-def _write_probe(dirpath, name, created, cards, pairs=(), driver="595.58"):
+def _write_probe(dirpath, name, created, cards, pairs=(), driver="595.58", **extra):
     with open(os.path.join(dirpath, name), "w") as f:
         json.dump(
             {"version": 1, "created": created, "driver": driver, "torch_version": "2.9", "cuda_version": "13.0",
-             "cards": cards, "pairs": list(pairs)},
+             "cards": cards, "pairs": list(pairs), **extra},
             f,
         )
 
@@ -136,14 +137,18 @@ class TestProfileView(CustomTestCase):
 
     def test_a_fully_probed_rig_needs_no_measurement_formats_a_card_cannot_run_do_not_count(self):
         w4a8_gone = {"nvfp4_w4a8": "compute capability 12.0: the W4A8 kernel is the sm_8x one"}
+        w4a4_gone = {"nvfp4_w4a4": "compute capability 8.6: no native FP4 tensor cores (needs 10.0+)"}
         _write_probe(self.d.name, "card_probe-all.json", NOW - 60, [
-            _probe_card(U0, "RTX 3080"), _probe_card(U2, "RTX 3080"),
+            _probe_card(U0, "RTX 3080", lane_notes=w4a4_gone), _probe_card(U2, "RTX 3080", lane_notes=w4a4_gone),
             _probe_card(U1, "RTX 5090", gemm_fp8_tflops=500.0, fp8_note="", gemm_w4a8_int8_tflops=None,
-                        lane_notes=w4a8_gone, compute_capability="12.0")])
+                        gemm_w4a4_tflops=900.0, lane_notes=w4a8_gone, compute_capability="12.0")],
+            # the BAR1 step ran and said why it has no numbers: final, like any card fact (order 1006)
+            bar1_attempted=True, bar1_reason="dmabuf_holder not available", bar1_pairs=[],
+            nccl_attempted=True, nccl_reason="NCCL did not come up", nccl_pairs=[])
         doc = self._build()
         self.assertFalse(doc["measure_needed"], doc["unmeasured"])
         self.assertEqual(doc["unmeasured"], {"0": [], "1": [], "2": []})
-        # ... but BAR1 stays explicitly not measured, and so does fp8 on the 3080s
+        # ... but BAR1 stays explicitly not measured (with the reason), and so does fp8 on the 3080s
         self.assertFalse(doc["bar1"]["measured"])
         c0 = next(c for c in doc["cards"] if c["uuid"] == U0)
         self.assertIsNone(c0["compute"]["fp8_native"]["v"])
@@ -184,9 +189,9 @@ class TestProfileView(CustomTestCase):
 
     def test_pair_matrix_is_ordered_labelled_and_bar1_is_explicitly_not_measured(self):
         pairs = [
-            {"src_uuid": U0, "dst_uuid": U1, "bandwidth_gbs": 5.1, "latency_us": 30.0,
+            {"src_uuid": U0, "dst_uuid": U1, "bandwidth_gbs": 5.1, "bandwidth_serial_gbs": 2.9, "latency_us": 30.0,
              "transport": cp.HOST_STAGING, "peer_access": False, "note": "no peer"},
-            {"src_uuid": U1, "dst_uuid": U0, "bandwidth_gbs": 3.2, "latency_us": 31.0,
+            {"src_uuid": U1, "dst_uuid": U0, "bandwidth_gbs": 3.2, "bandwidth_serial_gbs": 1.8, "latency_us": 31.0,
              "transport": cp.HOST_STAGING, "peer_access": False},
         ]
         _write_probe(self.d.name, "card_probe-aaa.json", NOW - 5, [_probe_card(U0, "RTX 3080")], pairs)
@@ -199,6 +204,7 @@ class TestProfileView(CustomTestCase):
         self.assertEqual(by[(o0, o1)]["gbs"]["v"], 5.1)
         self.assertEqual(by[(o1, o0)]["gbs"]["v"], 3.2)
         self.assertEqual(by[(o0, o1)]["lat_us"]["v"], 30.0)
+        self.assertEqual(by[(o0, o1)]["gbs_serial"]["v"], 2.9)      # order 1006: pipelined headline, serial beside it
         bar1 = [l for l in doc["links"] if l["transport"] == "bar1"]
         self.assertEqual(len(bar1), 3 * 2)  # every ordered pair, both directions
         for l in bar1:
@@ -375,21 +381,26 @@ class TestProbeArms(CustomTestCase):
         self.assertEqual(calls, ["fp8", "int8", "w4a8", "w4a16"])
         for arm in ("membw", "bf16", "fp8_native", "h2d_d2h", "h2d_d2h_lat", "int8_native", "nvfp4_w4a8", "nvfp4_marlin"):
             self.assertIn(arm, m.arm_seconds)
-        self.assertEqual(m.lane_notes, {})
+        # sm_86: the native W4A4 lane is not asked; the card's own reason is stored (order 1006)
+        self.assertEqual(list(m.lane_notes), ["nvfp4_w4a4"])
+        self.assertIn("no native FP4 tensor cores", m.lane_notes["nvfp4_w4a4"])
+        self.assertIsNone(m.gemm_w4a4_tflops)
         self.assertIsNone(m.gemm_fp8_tflops)  # no fp8 on sm_86: absent, with its reason
         self.assertEqual(m.fp8_note, "no fp8 tensor path")
 
     def test_a_lane_that_cannot_run_stores_its_reason_never_a_number(self):
         m, _ = self._measure(w4a8=(None, "kernel did not compile"), int8=(None, "no IMMA arm"))
         self.assertIsNone(m.gemm_w4a8_int8_tflops)
-        self.assertEqual(m.lane_notes, {"nvfp4_w4a8": "kernel did not compile", "int8_native": "no IMMA arm"})
+        self.assertEqual(m.lane_notes["nvfp4_w4a8"], "kernel did not compile")
+        self.assertEqual(m.lane_notes["int8_native"], "no IMMA arm")
         self.assertEqual(m.gemm_w4a16_tflops, 55.0)
 
     def test_an_interpreter_without_sgl_kernel_leaves_the_lanes_empty_and_persists_no_note(self):
         m, calls = self._measure(env_issue="sgl_kernel not importable")
         self.assertEqual(calls, ["fp8"])  # the sgl_kernel lanes were never asked
         self.assertIsNone(m.gemm_int8_tflops)
-        self.assertEqual(m.lane_notes, {})  # an interpreter fact is not a card fact (#310)
+        # an interpreter fact is not a card fact (#310): only the card's own W4A4 verdict (cc 8.6) is stored
+        self.assertEqual(list(m.lane_notes), ["nvfp4_w4a4"])
         self.assertEqual(m.gemm_bf16_tflops, 60.0)
 
     def test_bar1_is_said_not_measured_in_every_multi_card_run(self):
