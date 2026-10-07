@@ -65391,7 +65391,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4062
+      "line": 4025
      }
     }
    },
@@ -73736,6 +73736,26 @@
    "type": "os.environ"
   },
   "SGLANG_WEG2_FORCED_BOOT": {
+   "abweichung": {
+    "27b": {
+     "default": "\"\"",
+     "help": "the ``refusals`` marker variable ``refusals.arm(True)`` writes into ``os.environ``",
+     "source": {
+      "file": "weg2/refusals.py",
+      "kind": "os.environ",
+      "line": 207
+     }
+    },
+    "nf": {
+     "default": "\"\"",
+     "help": "set by the launcher in ITS environment when ``--force`` is on, so the front and the groups (separate processes) inherit it; read by :func:`forced_boot`",
+     "source": {
+      "file": "weg2/refusals.py",
+      "kind": "os.environ",
+      "line": 202
+     }
+    }
+   },
    "baeume": [
     "27b",
     "nf"
@@ -82697,6 +82717,26 @@
    "type": "EnvBool"
   },
   "SGLANG_WEG2_TORCH_CACHE_CAP": {
+   "abweichung": {
+    "27b": {
+     "default": "\"0\"",
+     "help": "Umgebungsschalter der Torch-Cache-Kappe (launcher.py:5487); steht er in ``--env-d``, gilt er, sonst der Standard der Registerzeile",
+     "source": {
+      "file": "planner/profile_couplings.py",
+      "kind": "os.environ",
+      "line": 1155
+     }
+    },
+    "nf": {
+     "default": "\"0\"",
+     "help": "P0 (torch cache cap) must be armed in the SAME D group: the edge leaves ~0 MiB after KV, and without a bounded cache the allocator swing (0.7-3.5 GiB, WEG2-VRAM-PEAK rc12z26) takes that memory back at the next peak.",
+     "source": {
+      "file": "weg2/launcher.py",
+      "kind": "os.environ",
+      "line": 5480
+     }
+    }
+   },
    "baeume": [
     "27b",
     "nf"
@@ -83122,7 +83162,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4177
+      "line": 4140
      }
     }
    },
@@ -85190,7 +85230,7 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "baeume": {
-   "abweichung": 43,
+   "abweichung": 45,
    "beide": 2461,
    "nur_27b": 180,
    "nur_nf": 29
@@ -85203,15 +85243,15 @@
   "kuratiert": 119,
   "unerklaert": 601
  },
- "tree_rev": "27b=65fc0e2076+nf=55e463937f",
+ "tree_rev": "27b=ab8ace2d42+nf=ff2b9ee01d",
  "trees": {
   "27b": {
    "entries": 2641,
-   "rev": "65fc0e2076"
+   "rev": "ab8ace2d42"
   },
   "nf": {
    "entries": 2490,
-   "rev": "55e463937f"
+   "rev": "ff2b9ee01d"
   }
  },
  "warnungen": []
