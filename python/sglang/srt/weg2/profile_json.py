@@ -480,7 +480,7 @@ def roundtrip_check(path: str, specs: Optional[Mapping] = None, runner=None, tmp
 # the editor's view: rows, origins, edits
 
 ORIGIN_PROFIL, ORIGIN_NUTZER, ORIGIN_PLANER, ORIGIN_DEFAULT = "profil", "nutzer", "planer", "default"
-ORIGIN_LABEL = {ORIGIN_PROFIL: "Profil", ORIGIN_NUTZER: "Nutzer", ORIGIN_PLANER: "Planer", ORIGIN_DEFAULT: "Default"}
+ORIGIN_LABEL = {ORIGIN_PROFIL: "Profile", ORIGIN_NUTZER: "User", ORIGIN_PLANER: "Planner", ORIGIN_DEFAULT: "Default"}
 
 _GROUP_SCOPE = {"--env-p": ("env", "P"), "--env-d": ("env", "D"), "--extra-p": ("extra", "P"), "--extra-d": ("extra", "D")}
 

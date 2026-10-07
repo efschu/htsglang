@@ -373,7 +373,7 @@ class TestRegisterShape27B(_Armed):
         self.assertTrue(e["wired"])
         self.assertTrue(e["wired_entrypoint"])
         self.assertEqual(e["wired_at"], "launcher+entrypoint")
-        self.assertEqual(e["force_scope"], "im Docker-Start (Entrypoint) und im Launcher forcebar")
+        self.assertEqual(e["force_scope"], "forceable in the Docker start (entrypoint) and in the launcher")
 
     def test_the_entrypoint_force_codes_are_unchanged(self):
         self.assertEqual(R.ENTRYPOINT_FORCE_CODES,

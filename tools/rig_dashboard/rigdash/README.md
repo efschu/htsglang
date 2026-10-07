@@ -37,7 +37,7 @@ calculated from git (`features.new_commits`). The counter is in the tab title. E
 
 ## Flip time (ONE definition, user 06.10.2026)
 
-P→D = last P chunk finished → first decode token produced; D→P = last decode token produced → first
+P→D = last P chunk done → first decode token produced; D→P = last decode token produced → first
 prefill chunk starts computing (first forward on PP0, `flip_user_time.prefill_start_source=pp_first_forward`,
 never the leg-1 dispatch). Exception: no flip counts if no prefill or decode is pending (idle flip,
 D→P: `flip_user_time.idle_flip`). Layer swap, lead-in and lead-out are only the BREAKDOWN of the one number, never a flip

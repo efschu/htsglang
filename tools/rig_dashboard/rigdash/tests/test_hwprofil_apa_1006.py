@@ -92,7 +92,7 @@ class TestCatalog(unittest.TestCase):
     def test_datasheet_of(self):
         d = CAT.datasheet_of({"name": "NVIDIA GeForce RTX 3080", "total_mib": 20480, "cc": [8, 6]})
         self.assertEqual(d["mem_bw_gbs"], 760)
-        self.assertTrue(d["bw_note"].startswith("GEBORGT, unbelegt"))
+        self.assertTrue(d["bw_note"].startswith("BORROWED, unverified"))
         self.assertTrue(d["catalog"]["preset"])
         d = CAT.datasheet_of({"name": "NVIDIA GeForce RTX 4090", "total_mib": 24564, "cc": [8, 9]})
         self.assertEqual((d["mem_bw_gbs"], d["catalog"]["preset"], d["catalog"]["origin"]), (1008, False, "Datenblatt"))
@@ -196,7 +196,7 @@ class TestPersistedProfile(RealBase):
         self.assertIn("rtx5090-32", c5090["mem_gbs"]["nominal"]["note"])
         self.assertEqual(c3080["catalog"]["id"], "rtx3080-20")
         self.assertEqual(c3080["catalog"]["origin_fields"]["mem_bw"], "borrowed-unbelegt")
-        self.assertTrue(c3080["mem_gbs"]["nominal"]["note"].startswith("GEBORGT, unbelegt"))
+        self.assertTrue(c3080["mem_gbs"]["nominal"]["note"].startswith("BORROWED, unverified"))
         self.assertEqual(out["problems"], [])
 
     def test_without_a_storage_path_nothing_is_written(self):
@@ -220,7 +220,7 @@ class TestPersistedProfile(RealBase):
         self.set_nvml(hw, self.fx.nvml(n=2, driver="600.1"))
         out = hw.get()
         self.assertEqual(out["persist"]["state"], "abweichend")
-        self.assertTrue(any("Treiber" in c for c in out["persist"]["drift"]["changes"]))
+        self.assertTrue(any("Driver" in c for c in out["persist"]["drift"]["changes"]))
         self.assertEqual(open(self.path).read(), raw)
 
     def test_recapture_replaces_the_file_without_gpuq(self):
@@ -243,7 +243,7 @@ class TestPersistedProfile(RealBase):
         self.set_nvml(hw, ([], None, ["pynvml nicht lesbar (Test)"]))
         res = hw.recapture()
         self.assertFalse(res["ok"])
-        self.assertIn("nichts gespeichert", res["error"])
+        self.assertIn("nothing saved", res["error"])
         self.assertEqual(open(self.path).read(), raw)
         out = hw.get()                         # und die Seite zeigt das gespeicherte Profil
         self.assertEqual(out["persist"]["state"], "nur_gespeichert")
@@ -275,24 +275,24 @@ class TestIssueText(RealBase):
         os.environ["SGLANG_IMAGE_TAG"] = "flliper:0.1.0-cu130"
         hw = self.make()
         txt = hw.issue()["text"]
-        for needle in ("## Hardwareprofil (`flliper.hardware/1`)", "| Treiber | 595.58 |", "| CUDA / torch (Messprozess) | 13.0 / 2.9 |",
-                       "| Image | flliper:0.1.0-cu130 |", "| Dashboard | test-1006 |", "| Karten | 3 |",
-                       "### Karten (NVML-Identität)", "### Speicher und Rechenleistung", "### Katalogkarte und Herkunft der Datenblattwerte",
-                       "### Karte-zu-Karte (gemessen)", "### Herkunft der Werte"):
+        for needle in ("## Hardware profile (`flliper.hardware/1`)", "| Driver | 595.58 |", "| CUDA / torch (measuring process) | 13.0 / 2.9 |",
+                       "| Image | flliper:0.1.0-cu130 |", "| Dashboard | test-1006 |", "| Cards | 3 |",
+                       "### Cards (NVML identity)", "### Memory and compute", "### Catalog card and origin of the datasheet values",
+                       "### Card to card (measured)", "### Origin of the values"):
             self.assertIn(needle, txt)
         for c in self.fx.nvml()[0]:                               # NVML-Identität: Index, Name, UUID, PCI-Bus
-            self.assertNotIn(c["uuid"], txt)                      # Nacharbeit 06.10.: die UUID steht nie im Issue-Text (immer "<entfernt>")
+            self.assertNotIn(c["uuid"], txt)                      # Nacharbeit 06.10.: die UUID steht nie im Issue-Text (immer "<redacted>")
             self.assertIn(c["pci_bus_id"], txt)
-        self.assertIn("| <entfernt> |", txt)
+        self.assertIn("| <redacted> |", txt)
         self.assertIn("RTX 5090", txt)
-        self.assertIn("| 170 (gem.) |", txt)                      # SM-Zahl, gemessen
+        self.assertIn("| 170 (meas.) |", txt)                      # SM-Zahl, gemessen
         self.assertIn("32607 MiB (NVML)", txt)                    # Größe
         self.assertIn("2100 MHz (NVML)", txt)                     # Takt
-        self.assertIn("1792 GB/s (Datenbl.)", txt)                # Nennbandbreite aus dem Katalog
-        self.assertIn("210.0 TFLOPS (gem.)", txt)                 # Messrate des 5090
-        self.assertIn("RTX 3080 20 GB (Umbau)", txt)
+        self.assertIn("1792 GB/s (datasheet)", txt)                # Nennbandbreite aus dem Katalog
+        self.assertIn("210.0 TFLOPS (meas.)", txt)                 # Messrate des 5090
+        self.assertIn("RTX 3080 20 GB (modded)", txt)
         self.assertIn("borrowed-unbelegt", txt)
-        self.assertIn("nicht gemessen", txt)                      # fp8 der 3080
+        self.assertIn("not measured", txt)                      # fp8 der 3080
 
     def test_unknown_versions_say_unbelegt_and_state_whether_stored(self):
         # ein Baum ohne git und ohne Revisions-ENV (der echte Baum der Testlaeufe ist ein git-Baum und nennt seine Revision, Review 1006 Befund 2)
@@ -301,16 +301,16 @@ class TestIssueText(RealBase):
             for k in ("HTSGLANG_REVISION", "HTSGLANG_REVISION_27B", "HTSGLANG_REVISION_NF", "SGLANG_BUILD_COMMIT", "SGLANG_IMAGE_TAG", "STAND"):
                 os.environ.pop(k, None)
             txt = hw.issue()["text"]
-        self.assertIn("| Image | unbelegt (SGLANG_IMAGE_TAG nicht gesetzt) |", txt)
-        self.assertIn("| Baum | unbelegt |", txt)
-        self.assertIn("(gespeichert)", txt)
+        self.assertIn("| Image | unverified (SGLANG_IMAGE_TAG not set) |", txt)
+        self.assertIn("| Tree | unverified |", txt)
+        self.assertIn("(saved)", txt)
         txt2 = self.make(persist=False).issue()["text"]
-        self.assertIn("(lebende Sicht, nicht gespeichert)", txt2)
+        self.assertIn("(live view, not saved)", txt2)
 
     def test_the_tree_revision_comes_only_from_a_staged_release_path(self):
         d = hwprofil.issue_text({"cards": []}, versions={"tree": "/opt/rigdash/kartenplan/profil/releases/0123abcd4567/python"})
-        self.assertIn("| Baum | 0123abcd4567 |", d)
-        self.assertIn("| Baum | unbelegt |", hwprofil.issue_text({"cards": []}, versions={"tree": "/opt/rigdash/kartenplan/current/python"}))
+        self.assertIn("| Tree | 0123abcd4567 |", d)
+        self.assertIn("| Tree | unverified |", hwprofil.issue_text({"cards": []}, versions={"tree": "/opt/rigdash/kartenplan/current/python"}))
 
     def test_secrets_and_host_paths_are_removed(self):
         evil = ["/spinning/geheim/pfad broke", "token=abcdefgh12345678 broke", "ADMIN-KEY minted -> /root/x.adminkey"]
@@ -318,7 +318,7 @@ class TestIssueText(RealBase):
         txt = hw.issue()["text"]
         for bad in ("/spinning", "geheim", "abcdefgh12345678", "ADMIN-KEY", ".adminkey", "/root", self.tmp, "hardware.json"):
             self.assertNotIn(bad, txt)
-        self.assertIn("<Pfad entfernt>", txt)
+        self.assertIn("<path redacted>", txt)
 
     def test_a_card_name_cannot_break_the_table(self):
         cards, drv, iss = self.fx.nvml()
@@ -329,8 +329,8 @@ class TestIssueText(RealBase):
 
     def test_no_cards_is_an_honest_empty_profile(self):
         txt = hwprofil.issue_text({"schema": "flliper.hardware/1", "cards": [], "driver": None}, versions={})
-        self.assertIn("| Karten | 0 |", txt)
-        self.assertIn("| Treiber | unbelegt |", txt)
+        self.assertIn("| Cards | 0 |", txt)
+        self.assertIn("| Driver | unverified |", txt)
 
 
 class TestRoutes(RealBase):
@@ -343,7 +343,7 @@ class TestRoutes(RealBase):
             self.assertEqual(st, 200, edition)
             j = json.loads(body)
             self.assertEqual((j["ok"], j["format"]), (True, "markdown"))
-            self.assertIn("## Hardwareprofil", j["text"])
+            self.assertIn("## Hardware profile", j["text"])
             st, body = _req(srv, "POST", "/api/hwprofil/recapture", {})
             self.assertEqual(st, 200, (edition, body))
             self.assertEqual(json.loads(body)["persist"]["state"], "neu_erfasst")
@@ -415,8 +415,8 @@ class TestScripts(unittest.TestCase):
             "links": [], "bar1": {"measured": True, "note": ""}, "sources": {"card_probe": [], "stage0": [], "nvml": {"issues": []}},
             "measure_needed": True},
         "window": None, "job": {"state": "idle"}, "problems": [],
-        "persist": {"enabled": True, "state": "abweichend", "label": "gespeichert, WEICHT ab", "captured_at": 1000.0, "reason": "erster Start",
-                    "id": "sha256:" + "cd" * 32, "drift": {"same": False, "changes": ["Treiber war 1, jetzt 2"]}, "error": None},
+        "persist": {"enabled": True, "state": "abweichend", "label": "saved, DEVIATES", "captured_at": 1000.0, "reason": "first start",
+                    "id": "sha256:" + "cd" * 32, "drift": {"same": False, "changes": ["Driver was 1, now 2"]}, "error": None},
     }
 
     def _render(self, doc):
@@ -430,8 +430,8 @@ class TestScripts(unittest.TestCase):
 
     def test_render_shows_catalog_origin_nominal_bandwidth_clocks_and_the_stored_state(self):
         h = self._render(self.DOC)
-        for needle in ("Katalogkarte", "RTX 5090 32 GB", "measured_on_rig", "Bandbreite borgt", "Nennbandbreite (Katalog)", "SM-Takt max.",
-                       "Speicher-Busbreite", "Gespeichertes Profil", "WEICHT ab", "Treiber war 1, jetzt 2", "Datenbl."):
+        for needle in ("Catalog card", "RTX 5090 32 GB", "measured_on_rig", "bandwidth borrowed", "Nominal bandwidth (catalog)", "SM clock max.",
+                       "Memory bus width", "Stored profile", "DEVIATES", "Driver was 1, now 2", "datash."):
             self.assertIn(needle, h)
         self.assertNotIn("/var/lib", h)
 
@@ -443,18 +443,18 @@ class TestScripts(unittest.TestCase):
         c["mem_gbs"].pop("nominal")
         old.pop("persist")
         h = self._render(old)
-        self.assertNotIn("Katalogkarte", h)
-        self.assertNotIn("Nennbandbreite (Katalog)", h)
-        self.assertIn("nicht gespeichert", h)
+        self.assertNotIn("Catalog card", h)
+        self.assertNotIn("Nominal bandwidth (catalog)", h)
+        self.assertIn("not stored", h)
 
     def test_scripts_wire_the_buttons_and_the_collapsed_catalog(self):
         js = open(os.path.join(STATIC, "hwprofil.js"), encoding="utf-8").read()
-        for needle in ('data-act="recapture"', 'data-act="issue"', 'data-act="copy"', "/recapture", "/issue", "Neu erfassen", "Issue-Text (Hardwareprofil)"):
+        for needle in ('data-act="recapture"', 'data-act="issue"', 'data-act="copy"', "/recapture", "/issue", "Recapture", "Issue text (hardware profile)"):
             self.assertIn(needle, js)
         self.assertNotIn("eval(", js)
         self.assertNotIn("setInterval", js)
         pj = open(os.path.join(STATIC, "profil.js"), encoding="utf-8").read()
-        for needle in ("weitere Karten (Datenblatt, ohne Messraten)", 'data-act="cadd-id"', "c.preset", 'data-fold="cmore"'):
+        for needle in ("more cards (datasheet, without measured rates)", 'data-act="cadd-id"', "c.preset", 'data-fold="cmore"'):
             self.assertIn(needle, pj)
 
 

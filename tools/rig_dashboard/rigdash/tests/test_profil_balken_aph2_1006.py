@@ -173,7 +173,7 @@ class TestRouteDraft(unittest.TestCase):
         def estimate(self, req):
             self.calls.append(dict(req))
             if req.get("draft_path") and self.bad_draft:
-                raise ValueError("%s liegt nicht unter einer Modellwurzel" % req["draft_path"])
+                raise ValueError("%s is not under a model root" % req["draft_path"])
             return {"ok": True, "profile": {"schema": "flliper.model/1", "path": req["path"], "draft": bool(req.get("draft_path"))}}
 
     DOC = dict(ABL_DOC, vars=[{"name": "PROFILE_MODEL", "value": "/m/nf"}, {"name": "PROFILE_DRAFT", "value": "/m/draft-var"}])
@@ -193,8 +193,8 @@ class TestRouteDraft(unittest.TestCase):
         est = self.Est(bad_draft=True)
         st, j = self.call(self.serve(est), {"doc": self.DOC, "what": "phase_bars"})
         self.assertEqual(st, 200)
-        self.assertIn("nicht profiliert", j["draft_error"])
-        self.assertIn("Modellwurzel", j["draft_error"])
+        self.assertIn("not profiled", j["draft_error"])
+        self.assertIn("model root", j["draft_error"])
         self.assertEqual(len(est.calls), 2)
         self.assertNotIn("draft_path", est.calls[1])
         self.assertFalse(j["result"]["echo"]["model"]["draft"])
@@ -215,13 +215,13 @@ class TestJsContract(unittest.TestCase):
         return json.loads(r.stdout)
 
     def bar(self, **kw):
-        b = {"card": 0, "label": "Karte 0 (RTX 5090)", "phase": "P", "total_mib": 1000, "budget_mib": 900, "budget_herkunft": "Profilzeile",
-             "segments": [{"name": "weights", "label": "Gewichte", "mib": 300, "herkunft": "Modellprofil/Hardwareprofil (Index)", "detail": "dichte Gewichte"},
-                          {"name": "kv", "label": "KV", "mib": 200, "herkunft": "Naeherung (nicht der Loeser)", "detail": "Kontext x Layer x Zelle"},
-                          {"name": "fixed", "label": "Festposten", "mib": None, "herkunft": "nicht gerechnet", "detail": "nur am Metall zu messen"},
-                          {"name": "reserve", "label": "Reserve", "mib": 100, "herkunft": "Profilzeile", "detail": "Kartengroesse - Budget"},
-                          {"name": "free", "label": "Frei", "mib": 400, "herkunft": "gerechnet", "detail": "Budget - Posten"}],
-             "posts_mib": 500, "free_mib": 400, "overflow_mib": 0, "beyond_card_mib": 0, "not_computed": ["Festposten"]}
+        b = {"card": 0, "label": "Card 0 (RTX 5090)", "phase": "P", "total_mib": 1000, "budget_mib": 900, "budget_herkunft": "profile row",
+             "segments": [{"name": "weights", "label": "Weights", "mib": 300, "herkunft": "model profile/hardware profile (Index)", "detail": "dense weights"},
+                          {"name": "kv", "label": "KV", "mib": 200, "herkunft": "approximation (not the solver)", "detail": "context x layers x cell"},
+                          {"name": "fixed", "label": "Fixed items", "mib": None, "herkunft": "not computed", "detail": "measurable only on the metal"},
+                          {"name": "reserve", "label": "Reserve", "mib": 100, "herkunft": "profile row", "detail": "card size - budget"},
+                          {"name": "free", "label": "Free", "mib": 400, "herkunft": "computed", "detail": "Budget - Posten"}],
+             "posts_mib": 500, "free_mib": 400, "overflow_mib": 0, "beyond_card_mib": 0, "not_computed": ["Fixed items"]}
         b.update(kw)
         return b
 
@@ -232,30 +232,30 @@ class TestJsContract(unittest.TestCase):
         order = [m["s"]["key"] for m in o["m"]["rows"]]
         self.assertEqual(order, ["weights", "kv", "reserve", "free"])                 # null-Segment wird nicht gezeichnet
         self.assertAlmostEqual(o["m"]["sum"], 1000)
-        self.assertIn("Festposten</b>: nicht gerechnet", html)
-        self.assertIn("nur am Metall zu messen", html)                                 # Grund als Tooltip des Chips
-        self.assertIn("Rest 400 MiB (Obergrenze)", html)                              # nicht gerechnete Posten: "Rest" ist eine Obergrenze
+        self.assertIn("Fixed items</b>: not computed", html)
+        self.assertIn("measurable only on the metal", html)                                 # Grund als Tooltip des Chips
+        self.assertIn("Remainder 400 MiB (upper bound)", html)                              # nicht gerechnete Posten: "Rest" ist eine Obergrenze
         self.assertNotIn("kp-bz", html)
         self.assertIn('class="kp-ph-chip">P<', html)
 
     def test_the_bar_grows_past_the_card_edge_with_a_red_zone_and_a_note(self):
-        b = self.bar(segments=[{"name": "weights", "label": "Gewichte", "mib": 700, "herkunft": "x", "detail": "d"},
+        b = self.bar(segments=[{"name": "weights", "label": "Weights", "mib": 700, "herkunft": "x", "detail": "d"},
                                {"name": "kv", "label": "KV", "mib": 500, "herkunft": "y", "detail": "d"}],
                      posts_mib=1200, free_mib=0, overflow_mib=300, beyond_card_mib=200, not_computed=[])
         o = self.js("const M=require(%r);const b=%s;console.log(JSON.stringify({html:M.render([b],{base:0}),tip:M.tip(b,1)}))" % (JS, json.dumps(b)))
         self.assertIn('class="kp-bz"', o["html"])
-        self.assertIn("Kartenende", o["html"])
-        self.assertIn("200 MiB über der Karte", o["html"])
+        self.assertIn("End of card", o["html"])
+        self.assertIn("200 MiB over the card", o["html"])
         self.assertIn('role="alert"', o["html"])
         # Segment 2 (KV 700..1200) beginnt VOR der Kartenkante (1000): 200 MiB davon liegen dahinter
-        self.assertIn("200 MiB dieses Postens liegen HINTER der Kartengrenze", o["tip"])
-        self.assertIn("Herkunft: <b>y</b>", o["tip"])
+        self.assertIn("200 MiB of this item lie BEYOND the card limit", o["tip"])
+        self.assertIn("Source: <b>y</b>", o["tip"])
 
     def test_server_rounding_of_a_full_bar_is_no_card_edge_overflow(self):
         # Beleg Browser-Gegenprobe 27b-nvfp4-dual-262k, Karte 0, D-Phase: Segmente runden auf 3 Stellen, Summe 32607.001 bei Karte 32607
         b = self.bar(total_mib=1000, budget_mib=1000, segments=[
-            {"name": "weights", "label": "Gewichte", "mib": 300.0004, "herkunft": "x", "detail": "d"},
-            {"name": "free", "label": "Frei", "mib": 699.6006, "herkunft": "gerechnet", "detail": "d"}], posts_mib=300.0004, free_mib=699.6006)
+            {"name": "weights", "label": "Weights", "mib": 300.0004, "herkunft": "x", "detail": "d"},
+            {"name": "free", "label": "Free", "mib": 699.6006, "herkunft": "computed", "detail": "d"}], posts_mib=300.0004, free_mib=699.6006)
         html = self.js("const M=require(%r);console.log(JSON.stringify(M.render([%s],{base:0})))" % (JS, json.dumps(b)))
         self.assertNotIn("kp-edge", html)
         self.assertNotIn("kp-bz", html)
@@ -263,45 +263,45 @@ class TestJsContract(unittest.TestCase):
     def test_over_budget_inside_the_card_is_a_note_without_a_red_zone(self):
         b = self.bar(overflow_mib=50, beyond_card_mib=0)
         html = self.js("const M=require(%r);console.log(JSON.stringify(M.render([%s],{base:0})))" % (JS, json.dumps(b)))
-        self.assertIn("50 MiB über dem Budget", html)
+        self.assertIn("50 MiB over the budget", html)
         self.assertNotIn("kp-bz", html)
 
     def test_the_over_budget_note_claims_no_oom_the_same_words_as_the_planner_text(self):
-        # Fix-Runde 4, Befund 2: Posten ueber dem Budget innerhalb der Karte -> "die Reserve wird aufgezehrt" (wie profile_couplings._over_text), keine OOM-Folgerung
+        # Fix-Runde 4, Befund 2: Posten ueber dem Budget innerhalb der Karte -> "The reserve is consumed" (wie profile_couplings._over_text), keine OOM-Folgerung
         b = self.bar(overflow_mib=50, beyond_card_mib=0,
-                     segments=[{"name": "weights", "label": "Gewichte", "mib": 950, "herkunft": "x", "detail": "d"},
-                               {"name": "free", "label": "Frei", "mib": 50, "herkunft": "gerechnet", "detail": "d"}])
+                     segments=[{"name": "weights", "label": "Weights", "mib": 950, "herkunft": "x", "detail": "d"},
+                               {"name": "free", "label": "Free", "mib": 50, "herkunft": "computed", "detail": "d"}])
         o = self.js("const M=require(%r);console.log(JSON.stringify({html:M.render([%s],{base:0}),tip:M.tip(%s,0)}))" % (JS, json.dumps(b), json.dumps(b)))
-        self.assertIn("Die Reserve wird aufgezehrt", o["html"])
+        self.assertIn("The reserve is consumed", o["html"])
         self.assertNotIn("OOM", o["html"])
         self.assertNotIn("OOM", o["tip"])
         legacy = {"total_mib": 1000, "budget_mib": 900, "segments": [{"key": "weights", "label": "G", "mib": 900}, {"key": "overflow", "label": "Ueberlauf", "mib": 50}]}
         o2 = self.js("const M=require(%r);console.log(JSON.stringify({html:M.render([%s],{base:0}),tip:M.tip(%s,1)}))" % (JS, json.dumps(legacy), json.dumps(legacy)))
         self.assertNotIn("OOM", o2["html"])
-        self.assertIn("die Reserve wird aufgezehrt", o2["tip"])
+        self.assertIn("the reserve is consumed", o2["tip"])
         self.assertNotIn("OOM", o2["tip"])
 
     def test_chips_use_the_floating_tooltip_not_the_native_title(self):
-        b = self.bar(shared_with_d=[{"name": "weights", "label": "Gewichte", "mib": 300, "ref": "shared", "herkunft": "Modellprofil", "detail": "im Union-Image von D"}])
+        b = self.bar(shared_with_d=[{"name": "weights", "label": "Weights", "mib": 300, "ref": "shared", "herkunft": "model profile", "detail": "in the union image of D"}])
         html = self.js("const M=require(%r);console.log(JSON.stringify(M.render([%s],{base:0})))" % (JS, json.dumps(b)))
-        self.assertIn('class="kp-ref" tabindex="0" data-tip="im Union-Image von D | Herkunft: Modellprofil"', html)
-        self.assertIn('class="kp-nc" tabindex="0" data-tip="nur am Metall zu messen"', html)
+        self.assertIn('class="kp-ref" tabindex="0" data-tip="in the union image of D | source: model profile"', html)
+        self.assertIn('class="kp-nc" tabindex="0" data-tip="measurable only on the metal"', html)
         self.assertNotIn('class="kp-ref" tabindex="0" title=', html)
 
     def test_render_phases_lists_each_phase_the_inputs_and_a_failed_phase_as_a_message(self):
-        res = {"phases": {"P": {"ok": True, "label": "P-Phase <x>", "bars": [self.bar(), self.bar(label="Karte 1")], "inputs": [{"was": "stage_layers", "wert": "29,11,8", "herkunft": "Profilzeile --pp-stage-ratio"}]},
+        res = {"phases": {"P": {"ok": True, "label": "P-Phase <x>", "bars": [self.bar(), self.bar(label="Karte 1")], "inputs": [{"was": "stage_layers", "wert": "29,11,8", "herkunft": "profile row --pp-stage-ratio"}]},
                           "D": {"ok": False, "label": "D-Phase", "error": "vector_length: <b>zu kurz</b>", "bars": []}}}
         o = self.js("const M=require(%r);const r=M.renderPhases(%s,{base:0});console.log(JSON.stringify({html:r.html,n:r.bars.length}))" % (JS, json.dumps(res)))
         self.assertEqual(o["n"], 2)
         self.assertEqual(o["html"].count('class="pf-bar"'), 2)
         self.assertIn("P-Phase &lt;x&gt;", o["html"])
-        self.assertIn("Profilzeile --pp-stage-ratio", o["html"])
+        self.assertIn("profile row --pp-stage-ratio", o["html"])
         self.assertIn("vector_length: &lt;b&gt;zu kurz&lt;/b&gt;", o["html"])
         self.assertNotIn("<b>zu kurz</b>", o["html"])
 
     def test_a_phase_without_an_ok_field_counts_as_ok_and_nonmatching_bars_from_the_old_shape_still_draw(self):
         res = {"phases": {"alle": {"bars": [{"label": "K0", "total_mib": 100, "budget_mib": 90, "overflow_mib": 0, "free_mib": 10,
-                                             "segments": [{"key": "weights", "label": "Gewichte", "mib": 80, "origin": "x"}]}]}}}
+                                             "segments": [{"key": "weights", "label": "Weights", "mib": 80, "origin": "x"}]}]}}}
         o = self.js("const M=require(%r);const r=M.renderPhases(%s,{base:0});console.log(JSON.stringify({html:r.html,n:r.bars.length}))" % (JS, json.dumps(res)))
         self.assertEqual(o["n"], 1)
         self.assertIn("K0", o["html"])
@@ -316,7 +316,7 @@ class TestJsContract(unittest.TestCase):
         self.assertEqual((beyond["overflow_mib"], beyond["beyond_card_mib"]), (300, 200))
         self.assertEqual(sum(s["mib"] for s in beyond["segments"]), 1200)
         self.assertEqual(nc["not_computed"], ["KV"])
-        self.assertIn("OBERGRENZE", nc["segments"][-1]["detail"])
+        self.assertIn("UPPER BOUND", nc["segments"][-1]["detail"])
 
     def test_contract_bar_outside_posts_match_the_launcher_semantics(self):
         # Befund 1: Festposten ausserhalb des Budgets (verfuegbar = Karte - fremd - nichttorch), nicht doppelt in der Reserve
@@ -330,26 +330,26 @@ class TestJsContract(unittest.TestCase):
         self.assertEqual((ok["overflow_mib"], ok["outside_budget_mib"], ok["available_mib"], ok["budget_over_available_mib"]), (0, 150, 850, 0))
         self.assertEqual(over["budget_over_available_mib"], 50)                       # 900 gefragt, 850 verfuegbar
         self.assertEqual(sum(s["mib"] for s in over["segments"]), 1000)
-        self.assertIn("größer als das Verfügbare", html)
-        self.assertIn("AUSSERHALB des Budgets", tip)
+        self.assertIn("larger than what is available", html)
+        self.assertIn("lies OUTSIDE the budget", tip)
 
     def test_dual_share_reference_row_is_not_part_of_the_bar_sum(self):
         # Fix-Runde 3, Befund 1: Referenzposten (geteilt mit D) stehen als Geisterstreifen + Chips, nicht in den Segmenten und nicht in der Summe
-        b = self.bar(segments=[{"name": "state", "label": "Mamba/GDN-Zustand", "mib": 100, "herkunft": "x", "detail": "d"},
-                               {"name": "fixed", "label": "Festposten", "mib": 150, "herkunft": "x", "detail": "d", "ausserhalb_budget": True},
+        b = self.bar(segments=[{"name": "state", "label": "Mamba/GDN state", "mib": 100, "herkunft": "x", "detail": "d"},
+                               {"name": "fixed", "label": "Fixed items", "mib": 150, "herkunft": "x", "detail": "d", "ausserhalb_budget": True},
                                {"name": "reserve", "label": "Reserve", "mib": 350, "herkunft": "x", "detail": "d"},
-                               {"name": "free", "label": "Frei", "mib": 400, "herkunft": "gerechnet", "detail": "d"}],
-                     shared_with_d=[{"name": "weights", "label": "Gewichte", "mib": 300, "ref": "shared", "herkunft": "Modellprofil", "detail": "im Union-Image von D"},
-                                    {"name": "activation", "label": "Aktivierung", "mib": 40, "ref": "in_festposten", "herkunft": "x", "detail": "im Festposten"},
-                                    {"name": "diff", "label": "Diff der P-Gewichte", "mib": None, "ref": "shared", "herkunft": "nicht gerechnet", "detail": "nicht belegbar"}])
+                               {"name": "free", "label": "Free", "mib": 400, "herkunft": "computed", "detail": "d"}],
+                     shared_with_d=[{"name": "weights", "label": "Weights", "mib": 300, "ref": "shared", "herkunft": "model profile", "detail": "in the union image of D"},
+                                    {"name": "activation", "label": "Activation", "mib": 40, "ref": "in_festposten", "herkunft": "x", "detail": "in the fixed items"},
+                                    {"name": "diff", "label": "Diff of the P weights", "mib": None, "ref": "shared", "herkunft": "not computed", "detail": "cannot be verified"}])
         o = self.js("const M=require(%r);const b=%s;console.log(JSON.stringify({html:M.render([b],{base:0}),m:M.model(b)}))" % (JS, json.dumps(b)))
         self.assertAlmostEqual(o["m"]["sum"], 1000)                                   # Summe = Karte; die Referenz ist nicht dabei
         html = o["html"]
         self.assertIn('class="kp-ghost"', html)
         self.assertEqual(html.count('class="kp-gs"'), 1)                              # nur "shared" mit Zahl; "in_festposten" und ohne Zahl kein Streifen
-        self.assertIn("Gewichte</b>: 300 MiB geteilt mit D", html)
-        self.assertIn("Aktivierung</b>: 40 MiB steckt im Festposten", html)
-        self.assertIn("Diff der P-Gewichte</b>: nicht gerechnet", html)
+        self.assertIn("Weights</b>: 300 MiB shared with D", html)
+        self.assertIn("Activation</b>: 40 MiB included in the fixed items", html)
+        self.assertIn("Diff of the P weights</b>: not computed", html)
         self.assertNotIn("kp-bz", html)
 
     def test_no_refusal_claim_without_a_source_and_the_user_reserve_enters_the_verdict(self):
@@ -357,9 +357,9 @@ class TestJsContract(unittest.TestCase):
                     "console.log(JSON.stringify({b,html:M.render([b],{base:0}),src:require('fs').readFileSync(%r,'utf8')}))" % (JS, JS))
         self.assertEqual(o["b"]["budget_over_available_mib"], 100)
         self.assertEqual(o["b"]["user_reserve_mib"], 200)
-        self.assertIn("Nutzerreserve 200 MiB (--d-reserve-mib)", o["html"])
-        self.assertIn("Der Launcher meldet DARUEBER und startet trotzdem", o["html"])
-        self.assertNotIn("Der Planer lehnt ab", o["src"])                              # kein unbelegter Ablehnungstext in der Darstellung
+        self.assertIn("user reserve 200 MiB (--d-reserve-mib)", o["html"])
+        self.assertIn("The launcher reports THIS and starts anyway", o["html"])
+        self.assertNotIn("The planner refuses", o["src"])                              # kein unbelegter Ablehnungstext in der Darstellung
 
     def test_contract_bar_dual_extra_counts_the_missing_diff_as_not_computed(self):
         o = self.js("const M=require(%r);console.log(JSON.stringify(M.contractBar('K','P',1000,600,'x',[{name:'state',label:'S',mib:100}],"
@@ -379,7 +379,7 @@ class TestJsContract(unittest.TestCase):
         self.assertEqual(b0["phase"], "P")
         names = [s["name"] for s in b0["segments"]]
         self.assertEqual(names, ["weights", "experts", "kv", "state", "activation", "fixed", "reserve", "free"])
-        self.assertEqual(b0["not_computed"], ["Festposten"])
+        self.assertEqual(b0["not_computed"], ["Fixed items"])
         # Karte 0: 230 + 400 + 1 + 6 + 50 = 687 Posten gegen 1000 Budget
         self.assertAlmostEqual(b0["posts_mib"], 687)
         self.assertAlmostEqual(sum(s["mib"] for s in b0["segments"] if s["mib"] is not None), 1200)

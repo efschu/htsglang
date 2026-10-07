@@ -44,7 +44,7 @@ class Regime(unittest.TestCase):
     def test_27b_tp4_is_not_replicated(self):
         r = KV.compute(tp_size=4, ratios=[1, 1, 1, 1], kv_heads=4)
         self.assertEqual((r["regime"], r["kv"]), ("verteilt", [1, 1, 1, 1]))
-        self.assertTrue(any("nicht repliziert" in n for n in r["notiz"]))
+        self.assertTrue(any("not replicated" in n for n in r["notiz"]))
 
     def test_27b_tp5_replicated(self):
         r = KV.compute(tp_size=5, ratios=[1, 1, 1, 1, 1], kv_heads=4)
@@ -124,15 +124,15 @@ class Ansicht(unittest.TestCase):
             po = [{"key": "extra:D:--rank-tp-ratio", "value": "58,25,25"}, {"key": "extra:P:--pp-stage-ratio", "value": "45,10,9"}]
             out = KV.view([{"name": "--pp-stage-ratio", "scope": "P", "value": "45,10,9"}], d, po)
             self.assertEqual(len(out), 1)
-            self.assertEqual((out[0]["group"], out[0]["quelle"], out[0]["regime"], out[0]["kv"]), ("D", "Planer", "verteilt", [2, 1, 1]))
+            self.assertEqual((out[0]["group"], out[0]["quelle"], out[0]["regime"], out[0]["kv"]), ("D", "Planner", "verteilt", [2, 1, 1]))
             # ein im Profil gesetzter Wert hat Vorrang vor dem Planerwert derselben Gruppe
             both = KV.view([{"name": "--rank-tp-ratio", "scope": "D", "value": "1,1,1"}], d, po)
-            self.assertEqual((len(both), both[0]["quelle"], both[0]["ratios"]), (1, "Profil", "1,1,1"))
+            self.assertEqual((len(both), both[0]["quelle"], both[0]["ratios"]), (1, "Profile", "1,1,1"))
 
     def test_unreadable_model_says_so(self):
         out = KV.view([{"name": "--rank-tp-ratio", "scope": "D", "value": "1,1,1"}], "/nonexistent")
         self.assertEqual((out[0]["status"], out[0]["kv"]), ("unbekannt", None))
-        self.assertIn("nicht lesbar", out[0]["satz"])
+        self.assertIn("not readable", out[0]["satz"])
 
 
 if __name__ == "__main__":

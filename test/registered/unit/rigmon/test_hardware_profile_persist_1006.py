@@ -91,7 +91,7 @@ class TestDataSheetSm(CustomTestCase):
         for n in sm.values():
             self.assertEqual(n["src"], "Datenblatt")
             self.assertIn("hw_sim.py", n["note"])
-            self.assertIn("nicht gemessen", n["note"])
+            self.assertIn("not measured", n["note"])
         self.assertEqual(hp.validate(doc), [])
 
     def test_the_sm_gap_stays_open_until_the_probe_has_read_it(self):
@@ -128,7 +128,7 @@ class TestDataSheetSm(CustomTestCase):
     def test_a_card_without_a_catalog_entry_says_so(self):
         c = self._build()["cards"][0]
         self.assertEqual(c["mem_gbs"]["nominal"]["src"], "nicht gemessen")
-        self.assertIn("Katalog", c["mem_gbs"]["nominal"]["note"])
+        self.assertIn("catalog", c["mem_gbs"]["nominal"]["note"])
         self.assertIsNone(c["catalog"])
 
     def test_a_failing_lookup_is_an_issue_not_an_exception(self):
@@ -136,7 +136,7 @@ class TestDataSheetSm(CustomTestCase):
             raise RuntimeError("kaputt")
 
         doc = self._build(datasheet=boom)
-        self.assertTrue(any("Datenblatt-Suche" in i for i in doc["sources"]["nvml"]["issues"]))
+        self.assertTrue(any("Datasheet lookup" in i for i in doc["sources"]["nvml"]["issues"]))
         self.assertEqual(len(doc["cards"]), 3)
 
 
@@ -187,7 +187,7 @@ class TestPersistence(CustomTestCase):
         self.assertEqual(r["state"], "abweichend")
         ch = " | ".join(r["drift"]["changes"])
         self.assertIn(fx.U2, ch)
-        self.assertIn("Treiber war 595.58, jetzt 600.1", ch)
+        self.assertIn("Driver was 595.58, now 600.1", ch)
         self.assertEqual(open(self.path, encoding="utf-8").read(), raw)
         self.assertEqual(len(r["show"]["cards"]), 2)          # the live view is what is shown
 
@@ -214,7 +214,7 @@ class TestPersistence(CustomTestCase):
         r = hp.capture(self.path, live=empty, force=True, now=fx.NOW + 2)
         self.assertEqual(r["state"], "keine_karten")
         self.assertEqual(len(r["show"]["cards"]), 3)
-        self.assertIn("nichts gespeichert", r["error"])
+        self.assertIn("nothing saved", r["error"])
         self.assertEqual(open(self.path, encoding="utf-8").read(), raw)
 
     def test_no_cards_and_no_file_persists_nothing(self):
@@ -237,7 +237,7 @@ class TestPersistence(CustomTestCase):
             fh.write("{kaputt")
         r = hp.capture(self.path, live=self._live(), now=fx.NOW)
         self.assertEqual(r["state"], "erst_erfasst")
-        self.assertIn("nicht lesbar", r["error"])
+        self.assertIn("not readable", r["error"])
         self.assertIsNone(hp.load_profile(self.path)[1])
 
     def test_another_schema_is_not_taken_for_ours(self):
@@ -246,7 +246,7 @@ class TestPersistence(CustomTestCase):
             json.dump({"schema": "andere/1", "cards": []}, fh)
         doc, problem = hp.load_profile(self.path)
         self.assertIsNone(doc)
-        self.assertIn("kein flliper.hardware/1", problem)
+        self.assertIn("no flliper.hardware/1", problem)
 
     def test_the_path_comes_from_the_environment(self):
         self.assertEqual(hp.persist_path({}), "/var/lib/flliper/hardware.json")

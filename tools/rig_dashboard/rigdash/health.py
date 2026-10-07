@@ -77,7 +77,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     end = b.get("end") or {}
     death = end.get("death")
     if death and end.get("src") == "state.json":
-        add("dead", None, "tot laut IPC: %s" % death.get("text"), death.get("t"))
+        add("dead", None, "dead per IPC: %s" % death.get("text"), death.get("t"))
 
     # 1. WEG2-HEALTH (front log line): a hint, never a death verdict
     for g, h in sorted((b.get("health") or {}).items()):
@@ -85,7 +85,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
             continue
         if not h.get("alive"):
             add("warn", g, "Note (IPC front.groups): group %s alive=False%s -- "
-                "tot ist eine Gruppe nur laut state.json" % (g, " (streak %d)" % h["streak"] if h.get("streak") else ""),
+                "a group counts as dead only per state.json" % (g, " (streak %d)" % h["streak"] if h.get("streak") else ""),
                 h["t"])
         elif not h.get("http_ok") and (h.get("streak") or 0) >= 2:
             add("hang", g, "Group %s does not answer: front.groups http_ok=False, streak %d, process alive" % (
@@ -103,7 +103,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     for g, s in sorted(by_group.items()):
         act = (b.get("last_activity") or {}).get(g)
         recovered = act is not None and act > s["t"] + STOP_RECOVERED_S
-        src = " [Quelle: %s]" % s["src"] if s.get("src") else ""
+        src = " [source: %s]" % s["src"] if s.get("src") else ""
         text = "named stop, group %s: %s%s" % (g, s["text"][:300], src)
         if ended_on is None or s["t"] > ended_on["t"]:
             ended_on = {"group": g, "text": s["text"][:300], "t": s["t"], "recovered": recovered, "src": s.get("src")}
@@ -146,7 +146,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         queued, src = (q_front or 0) + outstanding, "%s (queue %s + outstanding %s)" % (
             fr.get("src") or "Front /weg2/state", q_front, outstanding)
     elif q_log is not None and q_log_age is not None and q_log_age < 600:
-        queued, src = q_log, "Warteschlange"
+        queued, src = q_log, "queue"
     idle = _age(now, b.get("last_activity_any"))
     if judged and queued and idle is not None and idle >= HANG_S and not catching_up and not stopping():
         add("hang", None, "HANGS: %d request(s) waiting (%s), for %d s the rank counters (rankstats) have counted no work" % (

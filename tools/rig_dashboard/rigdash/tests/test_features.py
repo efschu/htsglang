@@ -126,7 +126,7 @@ class GitCase(unittest.TestCase):
             b27 = {r["id"]: r for r in by["27B"]["features"]}
             self.assertEqual(list(b27), ["B"])
             self.assertEqual(b27["B"]["gewinn"], [])
-            self.assertTrue(any("ohne Feld modell" in p for p in v["problems"]))
+            self.assertTrue(any("without field modell" in p for p in v["problems"]))
             t0 = time.time()
             f.view()
             self.assertLess(time.time() - t0, 0.5)   # git ran once per (model, rev, file)
@@ -311,11 +311,11 @@ class ProduktCase(unittest.TestCase):
         features.attach_current(fv, [], None)
         f17, f9, f12 = fv["produkt"]
         self.assertIn("281 s", f17["aktuell"]["NF"]["wert"])
-        self.assertEqual(f17["aktuell"]["NF"]["je_format"], {"INT4": "dieser Boot", "NVFP4": "kein Boot in diesem Format"})
-        self.assertEqual(f17["aktuell"]["27B"], {"leer": "kein Boot dieses Modells gefunden"})
-        self.assertIn("Marker", f9["aktuell"]["NF"]["kein_instrument"])
+        self.assertEqual(f17["aktuell"]["NF"]["je_format"], {"INT4": "dieser Boot", "NVFP4": "no boot in this format"})
+        self.assertEqual(f17["aktuell"]["27B"], {"leer": "no boot of this model found"})
+        self.assertIn("marker", f9["aktuell"]["NF"]["kein_instrument"])
         self.assertEqual([z["aktuell"]["NF"] for z in f12["untertabelle"]["zeilen"]],
-                         ["läuft in diesem Boot", "kein Boot in diesem Format"])
+                         ["runs in this boot", "no boot in this format"])
 
     def test_formats_running_w4a8_rides_on_nvfp4_for_27b(self):
         self.assertEqual(features._formats_running("27B", "nvfp4-modelopt"), {"NVFP4", "W4A8"})
@@ -387,7 +387,7 @@ class ProduktCase(unittest.TestCase):
             self.assertIn("| kurz | code | 131,9 tok/s | ungemessen |", text)
             self.assertIn("| kurz | prosa | ungemessen | ungültig |", text)
             self.assertIn("## F24 Decode-Matrix 27B", text)
-            self.assertIn("alle Zellen ungemessen", text)
+            self.assertIn("all cells unmeasured", text)
 
     def test_soll_erreicht_is_separate_from_status(self):
         with tempfile.TemporaryDirectory() as t:
@@ -412,7 +412,7 @@ class ProduktCase(unittest.TestCase):
             self.assertEqual(v[0]["ist"]["NF"]["erreicht_grund"], "7,06 s gegen Soll <= 3 s")
             out = os.path.join(t, "o.md")
             run("md", "--out", out, "--live-url", "")
-            self.assertIn("Soll erreicht? 27B / NF", open(out).read())
+            self.assertIn("Target reached? 27B / NF", open(out).read())
             self.assertIn("NF: nein (7,06 s gegen Soll <= 3 s)", open(out).read())
 
 

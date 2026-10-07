@@ -65,7 +65,7 @@ MISSING_WRITER = {
     "C5": "RankState kv/seats -- python/sglang/srt/weg2/rank_state.py:note_capacity / rankstats.cap -- %s:RankStats.sync_capacity" % W_RS,
     "C6": "state.json front.d_seats (bzw. d_phase_n) -- %s:publish_front_fields" % W_FI,
     "C7": "rankstats counters (deltas) -- %s:RankStats.record" % W_RS,
-    "D1": "rankstats.work.spans (sonst prefill.last) -- %s:RankStats.record" % W_RS,
+    "D1": "rankstats.work.spans (otherwise prefill.last) -- %s:RankStats.record" % W_RS,
     "D2": "rankstats.work.spans kind=extend (otherwise prefill.last on D) -- %s:RankStats.record" % W_RS,
     "D3": "events flip_first_work + flip_done -- %s" % W_FI,
     "D4": "state.json serving_since_ts / events group_ready -- weg2/state_file.py:transition, add_event",

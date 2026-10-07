@@ -265,7 +265,7 @@ def _spawn_all(cmds: Sequence[List[str]], env: dict, timeout_s: float) -> List[T
                 o, e = procs[i].communicate(timeout=10)
             except Exception:  # noqa: BLE001
                 o, e = "", ""
-            bufs[i].update(rc=124, out=o or "", err=(e or "") + f"\nZeitüberschreitung nach {timeout_s:.0f} s")
+            bufs[i].update(rc=124, out=o or "", err=(e or "") + f"\ntimeout after {timeout_s:.0f} s")
 
     th = [threading.Thread(target=drain, args=(i,), daemon=True) for i in range(len(procs))]
     for t in th:

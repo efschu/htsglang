@@ -85,14 +85,14 @@ def per_card_link(cat_entry: dict, slot: dict) -> dict:
 def choose_transport(links: List[dict], labels: List[str], *, host_patched: bool = True) -> dict:
     """Transport für die weg2-Kollektive und den Flip.  ``links`` = Ausgaben von ``per_card_link``.
 
-    Ergebnis: ``transport`` ('bar1' | 'nccl' | 'keiner'), ``confidence`` ('belegt' | 'ungeprüft' | 'entwicklung'),
+    Ergebnis: ``transport`` ('bar1' | 'nccl' | 'none'), ``confidence`` ('verified' | 'unchecked' | 'development'),
     ``reasons`` (jede Angabe, die in die Wahl einging), ``warnings``, ``card_notes`` (je Karte)."""
     reasons: List[str] = []
     warns: List[str] = []
     notes: List[str] = []
     n = len(links)
     if n < 2:
-        return {"transport": "keiner", "confidence": "belegt",
+        return {"transport": "none", "confidence": "verified",
                 "reasons": ["One card: no card traffic, neither barlink nor NCCL needed. The weg2 flip needs two groups on the same cards and at least 2 cards (topology.MIN_CARDS)."],
                 "warnings": [], "card_notes": ["%s: %s" % (labels[0], "no peer")] if labels else []}
     small = [(labels[i], l["bar1_mib"]) for i, l in enumerate(links) if l["bar1_mib"] < BAR1_WINDOW_NEED_MIB]
@@ -102,25 +102,25 @@ def choose_transport(links: List[dict], labels: List[str], *, host_patched: bool
         e = l["effective"]
         notes.append("%s: PCIe Gen%d x%d = %.1f GB/s gross (%s limited), BAR1 %d MiB%s%s"
                      % (labels[i], e["gen"], e["lanes"], e["gbs"], l["limited_by"], l["bar1_mib"],
-                        " (Resizable BAR %s)" % ("an" if l["slot"]["rebar"] else "aus"),
+                        " (Resizable BAR %s)" % ("on" if l["slot"]["rebar"] else "off"),
                         ", via chipset" if l["chipset"] else ""))
     if not host_patched:
         reasons.append("The host does NOT have the patched nvidia-open 595.58.03 with RMSmallBarP2PPeerBar1=1/PeerMappingOverride=1 and dmabuf_holder: barlink BAR1 refused (source: " + FACTS["host"] + ").")
         reasons.append("NCCL remains (no GPUDirect P2P on GeForce: host staging). " + FACTS["nccl"] + ".")
-        return {"transport": "nccl", "confidence": "entwicklung", "reasons": reasons,
+        return {"transport": "nccl", "confidence": "development", "reasons": reasons,
                 "warnings": ["NCCL operation of the weg2 line is a development switch and never booted for NF."],
                 "card_notes": notes}
     if small:
         reasons.append("BAR1 too small for the weg2 group windows (needed %d MiB, source: %s): %s."
                        % (BAR1_WINDOW_NEED_MIB, FACTS["window_need"], ", ".join("%s %d MiB" % s for s in small)))
         reasons.append("Hence NCCL instead of barlink BAR1.")
-        return {"transport": "nccl", "confidence": "entwicklung", "reasons": reasons,
+        return {"transport": "nccl", "confidence": "development", "reasons": reasons,
                 "warnings": ["NCCL operation is a development switch (never booted, " + FACTS["nccl"] + ")."],
                 "card_notes": notes}
     reasons.append("barlink BAR1: patched host driver assumed (assumption of the page: yes), all cards have BAR1 >= %d MiB (smallest: %d MiB). This is the best form of the rig (%s)."
                    % (BAR1_WINDOW_NEED_MIB, min(l["bar1_mib"] for l in links), FACTS["barlink_default"]))
     reasons.append("PP activations between the P stages run via NCCL (send/recv) regardless of this.")
-    conf = "belegt"
+    conf = "verified"
     if any(not l["slot"]["rebar"] for l in links):
         reasons.append("Resizable BAR off on %s: BAR1 = 256 MiB, enough for the windows (booted like this on the rig); a larger BAR1 brings no verified speedup." % ", ".join(labels[i] for i, l in enumerate(links) if not l["slot"]["rebar"]))
     if chip:

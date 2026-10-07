@@ -133,7 +133,7 @@
     const aus = ausgangOf(ausgang), L = wertVerdikte || [], col = spalteOf(L), q = quelle || "oracle";
     if (col !== "N") {
       const codes = [...new Set(L.map((v) => v.code))];
-      const tip = L.map((v) => v.code + ": " + (v.grund || v.titel || "") + (v.konsequenz ? " Folge: " + v.konsequenz : "")).join("\n");
+      const tip = L.map((v) => v.code + ": " + (v.grund || v.titel || "") + (v.konsequenz ? " Consequence: " + v.konsequenz : "")).join("\n");
       if (col === "OK") return { id: "geht", label: "ok", tip: tip || "The oracle (" + q + ") explicitly names this value as ok." };
       if (col === "B") return { id: "verweigert", label: "refused", code: codes.join(", "), tip };
       if (col === "F") return { id: "force", label: "only with --force", code: codes.join(", "), tip };
@@ -196,7 +196,7 @@
     const pos = ctx.posNames && ctx.posNames.has(r.name);
     const warn = perRank
       ? `<div class="pfx-warn"><span class="pfx-vchip pfx-v-geht">${parts.length} ranks</span> <span class="muted">One entry per rank: the number of the physical card; the same number several times puts several ranks on that card.</span></div>`
-      : n != null && parts.length !== n ? `<div class="pfx-warn"><span class="pfx-vchip pfx-v-hinweis">${parts.length} entries, but ${n} card${n === 1 ? "" : "s"}</span> <span class="muted">${pos ? "The launcher keeps this value as a vector per card (PROFILE-VECTORS refuses a different count); " : ""}Jeder Eintrag gehört zu einem Rang.</span></div>` : "";
+      : n != null && parts.length !== n ? `<div class="pfx-warn"><span class="pfx-vchip pfx-v-hinweis">${parts.length} entries, but ${n} card${n === 1 ? "" : "s"}</span> <span class="muted">${pos ? "The launcher keeps this value as a vector per card (PROFILE-VECTORS refuses a different count); " : ""}Each entry belongs to one rank.</span></div>` : "";
     return `<div class="pfx-vec" data-vrow="${k}" role="group" aria-label="${esc(r.name)} per rank">${cells}${sum != null ? `<span class="pfx-sum" title="Sum of the entries">Σ ${esc(fmtNum(sum))}</span>` : ""}</div>${warn}`;
   }
   /* Felder je Rang NUR für einen ausdrücklich benannten Vektor (ctx.vecNames, vom Server: ui_info "vektoren").  Jede andere Kommaliste
@@ -420,7 +420,7 @@
       `<li><span class="pfx-vchip pfx-v-${x.force_state === "blockiert" ? "verweigert" : "hinweis"}">${x.force_state === "geht" ? "ok" : x.force_state === "blockiert" ? "does not fit" : "note"} <b class="mono">${esc(x.code)}</b></span> ${esc(clip(x.grund || x.titel || "", 260))}</li>`).join("");
     const hints = [].concat(p.notes || [], v.hinweise || [], v.blocker || []).filter(Boolean);
     return `<div class="pfx-prop"><div class="pf-verdict ${a[0] === "ok" ? "ok" : a[0] === "force" ? "" : "bad"}"><b>Proposal for ${esc(p.n)} card${p.n === 1 ? "" : "s"}, form ${esc(p.form)}</b>: ${esc(nCh)} values changed, ${esc(nUnb)} unverified. ${esc(a[1])}${sc ? " " + vChip(sc) : ""}
-        ${fit ? `<div class="muted">Fit (${esc(fit.art || "hw_fit, necessary condition")}): <b>${esc(fit.level)}</b>${fit.margin_mib != null ? ", margin " + esc(Math.round(Number(fit.margin_mib))) + " MiB" : ""}${fit.first ? " · " + esc(fit.first) : ""}</div>` : ""}</div>
+        ${fit ? `<div class="muted">Fit (${esc(fit.art || "hw_fit, necessary condition")}): <b>${esc(({ ja: "yes", knapp: "tight", nein: "no" })[fit.level] || fit.level)}</b>${fit.margin_mib != null ? ", margin " + esc(Math.round(Number(fit.margin_mib))) + " MiB" : ""}${fit.first ? " · " + esc(fit.first) : ""}</div>` : ""}</div>
       ${planerV ? `<div class="pfx-runv"><b>Fit as a planner estimate</b> <span class="muted">(a planner calculation from model sizes, no launcher run and no measurement)</span><ul class="pfx-vd">${planerV}</ul></div>` : ""}
       ${runV ? `<div class="pfx-runv"><b>What the launcher says about the run</b> <span class="muted">(applies to the whole start, not to a single value; never a block in this page)</span><ul class="pfx-vd">${runV}</ul></div>` : ""}
       ${changed ? `<details class="pf-fold" data-fold="propchg" open><summary>What the proposal changed (${nCh})</summary><ul class="pfx-chg">${changed}</ul></details>` : ""}

@@ -272,13 +272,13 @@ class TestProbe(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             r = MP.probe(os.path.join(tmp, "gibt-es-nicht"))
         self.assertEqual((r["state"], r["estimable"]), ("not_mounted", False))
-        self.assertIn("nicht gemountet", r["reason"])
+        self.assertIn("not mounted", r["reason"])
 
     def test_empty_directory_is_an_empty_mountpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             r = MP.probe(tmp)
         self.assertEqual((r["state"], r["estimable"]), ("empty", False))
-        self.assertIn("Mountpunkt", r["reason"])
+        self.assertIn("mount point", r["reason"])
 
     def test_directory_with_only_subdirectories_names_them(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -323,7 +323,7 @@ class TestProbe(unittest.TestCase):
                 fh.write(struct.pack("<Q", 1000) + b"{}")
             r = MP.estimate_or_state(d)
         self.assertEqual((r["ok"], r["state"]), (False, "unreadable"))
-        self.assertIn("abgeschnitten", r["reason"])
+        self.assertIn("truncated", r["reason"])
 
 
 class TestGgufWithoutConfig(unittest.TestCase):
@@ -354,7 +354,7 @@ class TestGgufWithoutConfig(unittest.TestCase):
         # Der Backbone (8) trennt den MTP-Block (Layer 8) ab
         self.assertEqual(est["draft"]["mtp_layers"]["v"], 1)
         self.assertGreater(est["weights"]["mtp_bytes"]["v"], 0)
-        self.assertTrue(any("GGUF-Kopf" in w for w in est["warnings"]))
+        self.assertTrue(any("GGUF header" in w for w in est["warnings"]))
 
     def test_head_facts_are_a_profile_section(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -379,7 +379,7 @@ class TestGgufWithoutConfig(unittest.TestCase):
               "foo.ssm.inner_size": 128, "foo.ssm.time_step_rank": 4}
         cfg, notes = MP.config_from_gguf(kv, MP.TensorDir("gguf", [], {}, 0))
         self.assertNotIn("linear_num_value_heads", cfg["text_config"])
-        self.assertTrue(any("nicht abgebildet" in n for n in notes))
+        self.assertTrue(any("not mapped" in n for n in notes))
 
     def test_missing_architecture_or_depth_is_refused(self):
         td = MP.TensorDir("gguf", [], {}, 0)

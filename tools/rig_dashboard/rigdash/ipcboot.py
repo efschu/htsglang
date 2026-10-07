@@ -381,7 +381,7 @@ def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict
     b_seat = sum(x["seat_s"] for x in allst if x.get("seat_s"))
     b_busy = sum(x["busy"] for x in allst if x.get("seat_s"))
     gms = sum((x.get("gpu_ms") or 0.0) for x in sw)
-    by_bs = {str(bs): {"median_ms": round(v[1] / v[0], 1), "n": int(v[0]), "stat": "Mittel"}
+    by_bs = {str(bs): {"median_ms": round(v[1] / v[0], 1), "n": int(v[0]), "stat": "mean"}
              for bs, v in sorted((last.get("by_bs") or {}).items(), key=lambda x: int(x[0]))
              if isinstance(v, (list, tuple)) and len(v) == 2 and v[0]}
     seats = (front or {}).get("d_seats")
@@ -458,7 +458,7 @@ def fmt_mib(v) -> str:
 
 
 #: the tower-stage phases (activity.VIS_LEGS): label for the phase list and the active frame
-VIS_NAME = {"vis_load": "Vision laden", "vis_enc": "Vision rechnen", "vis_unload": "Vision entladen"}
+VIS_NAME = {"vis_load": "Vision load", "vis_enc": "Vision encode", "vis_unload": "Vision unload"}
 
 
 def vis_annotate(x: dict, spans) -> None:
@@ -723,7 +723,7 @@ PD_END_WHATS = ("decode_token", "d_first_forward_done", "d_first_forward_done_ap
 
 #: the endpoint fields, named where the page says "fehlt (Feld X)"
 F_PD_START = "rankstats P prefill.last.t (last chunk, last P stage) in the ring"
-F_PD_END = "D-Log Decode rank batch rank 0 / flip_first_work.first_work_ts what=decode_token / rankstats D im Ring"
+F_PD_END = "D-Log Decode rank batch rank 0 / flip_first_work.first_work_ts what=decode_token / rankstats D in the ring"
 F_DP_START = "D log Decode rank batch rank 0 (last round of the D phase)"
 F_DP_START_NOLOG = "D log not found (Decode rank batch rank 0)"
 
@@ -733,7 +733,7 @@ F_DP_ARRIVAL = "front WEG2 SESSION arrival of the waiter is after the first pref
 F_DP_ARRIVAL_UNKNOWN = "front WEG2 SESSION arrival of the waiter (rid) or oldest_waiter_arrival is missing: server idle before the waiter cannot be calculated out"
 #: tolerance between the front's arrival stamp and the rank clock before an arrival "after the first forward" is a defect
 ARRIVAL_SKEW_S = 0.5
-F_DP_END = "rankstats P.tp0pp0.work.forward_ct im Ring / flip_user_time.prefill_start_ts (pp_first_forward)"
+F_DP_END = "rankstats P.tp0pp0.work.forward_ct in the ring / flip_user_time.prefill_start_ts (pp_first_forward)"
 
 
 def _p_last_chunk_end(ring, key: Optional[str], t_from: float, t_to: float) -> Optional[float]:
@@ -875,7 +875,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
             r1 = _round_after(d_rounds, float(b), horizon + 0.5)
             if r1 is not None and (end is None or r1[1] < end):
                 end = r1[1]
-                row["end_src"] = "D-Log erste Decode-Runde (TP0 t + gpu-ms)"
+                row["end_src"] = "D log first decode round (TP0 t + gpu-ms)"
             if end is None:
                 r = _rank_first_rise(ring, d_first, ("dtok", "rounds", "pnew"), floor, horizon)
                 if r is not None:
@@ -919,7 +919,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                     row["start_prev_phase"] = True
             if rl is not None:
                 start = rl[1]
-                row["start_src"] = "D-Log letzte Decode-Runde (TP0 t + gpu-ms)"
+                row["start_src"] = "D log last decode round (TP0 t + gpu-ms)"
                 if row.get("start_prev_phase"):
                     row["start_src"] += ", from an earlier D phase (D wrote no round in this one)"
             if u is not None and u.get("start_ts") is not None:
@@ -994,7 +994,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                 row["start_last_d"] = start
                 start = min(float(dp_arrival), end)
                 row["leer_excl_ms"] = (start - row["start_last_d"]) * 1000.0
-                row["start_src"] = (row.get("start_src") or "") + ", Start = max(letztes D-Token, Ankunft des Wartenden)"
+                row["start_src"] = (row.get("start_src") or "") + ", start = max(last D token, arrival of the waiting request)"
             row.update(flip_partition(start, end, b, flip_ms, t_done, e_lo))
             row["start"], row["end"] = start, end
             if d == "D>P":
@@ -1033,7 +1033,7 @@ def flip_diag(views: List[dict]) -> dict:
     return out
 
 
-PHASE_LABEL = {"P": "P aktiv (Prefill)", "single": "Prefill", "D": "D aktiv: Prefill", "dec": "D aktiv: Decode"}
+PHASE_LABEL = {"P": "P active (prefill)", "single": "Prefill", "D": "D active: prefill", "dec": "D active: decode"}
 CO_LABEL = {"dec": "P Prefill + D Decode", "D": "P Prefill + D Prefill"}
 
 
@@ -1047,7 +1047,7 @@ def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live:
     last = views[-1] if views else None
     if last and last.get("done") is None and last.get("kind") == "offen":
         return {"k": "flip", "dir": last["dir"], "label": "FLIP " + last["dir"].replace(">", "→"),
-                "sub": "Layer-Tausch", "since": last["begin"], "flip_since": last["begin"]}
+                "sub": "layer swap", "since": last["begin"], "flip_since": last["begin"]}
     if last and last.get("done") is not None and last.get("kind") == "offen" and now - last["done"] < FLIP_IDLE_S:
         return {"k": "flip", "dir": last["dir"], "label": "FLIP " + last["dir"].replace(">", "→"),
                 "sub": "Lead-out (until the first work)", "since": last["done"], "flip_since": last["begin"]}
@@ -1083,7 +1083,7 @@ def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live:
         return {"k": "idle", "label": "%s inactive" % (aw or "?"), "sub": "awake, no work", "since": since, "awake": aw}
     if k in ("flip_pd", "flip_dp"):
         return {"k": "flip", "dir": "P>D" if k == "flip_pd" else "D>P", "label": "FLIP " + ("P→D" if k == "flip_pd" else "D→P"),
-                "sub": "Layer-Tausch", "since": since, "flip_since": since}
+                "sub": "layer swap", "since": since, "flip_since": since}
     if k == "flip_tail":
         return {"k": "flip", "dir": (last or {}).get("dir"), "label": "FLIP", "sub": "Lead-out (until the first work)", "since": since}
     return {"k": k, "label": k, "sub": cur.get("why") or "", "since": since}

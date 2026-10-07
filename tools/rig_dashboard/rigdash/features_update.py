@@ -420,7 +420,7 @@ def import_27b(d: dict, path: str) -> None:
                         ("status", st or "unbelegt"), ("note", note), ("quelle", QUELLE_27B)) if v}
         elif hdr[:2] == ["format / form", "instrument"]:
             p = prod["F23"]
-            zeilen = p.setdefault("untertabelle", {"spalte": "Prompt-Länge / Form", "zeilen": []}).setdefault("zeilen", [])
+            zeilen = p.setdefault("untertabelle", {"spalte": "Prompt length / form", "zeilen": []}).setdefault("zeilen", [])
             zeilen[:] = [z for z in zeilen if not z.get("name", "").startswith("27B ")]
             for r in rows[1:]:
                 werte = "; ".join("%s: %s" % (h, _plain(v)) for h, v in zip(rows[0][2:-1], r[2:-1]) if _plain(v))

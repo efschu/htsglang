@@ -186,4 +186,18 @@ Numbers use `en-US` (`1,234.5`), clock times `en-GB` (24 h). The decimal comma i
 
 ## Appended by Part 2 / Part 3
 
-(empty; append below, keep alphabetical order of the DE column within a section)
+## Part 4 additions (display words found in the leftover pass)
+
+| DE | EN | Where |
+|---|---|---|
+| Wert-Ablehnung (forcebar) / nicht forcebar | value refusal (forceable) / not forceable | `weg2/refusals.py` `CLASS_LABEL`, `force_scope` (register display texts; codes, `klass` keys, `source`, `enforced_by` unchanged) |
+| blockiert / ungeprueft (force_state in the run report) | blocked / unchecked | `profil.py` `_STATE_DISPLAY` (API values stay German) |
+| keiner / belegt / entwicklung (transport, confidence) | none / verified / development | `kartenplan_transport.py` |
+| gerechnet (bar origin) | computed | `profile_couplings.py` |
+| letzte 60 min / gezoomter Ausschnitt | last 60 min / zoomed section | `flipzeit.window_label` |
+| P aktiv / D aktiv | P active / D active | `ipcboot.PHASE_LABEL` |
+| Vision laden / rechnen / entladen | Vision load / encode / unload | `ipcboot.VIS_NAME` |
+| Layer-Tausch | layer swap | `ipcboot` phase `sub` |
+| ja / knapp / nein (hw_fit level, shown) | yes / tight / no | `profil_planer.js`, `propose_verdict.py` |
+| Planer-Rechnung | planner calculation (Python texts) / planner estimate (chip label); both appear, same meaning | |
+

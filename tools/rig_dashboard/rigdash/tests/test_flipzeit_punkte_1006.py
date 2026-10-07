@@ -76,7 +76,7 @@ class NoRoundInTheDPhase(unittest.TestCase):
         self.assertAlmostEqual(x["start"], T + 39.0, places=3)
         self.assertAlmostEqual(x["start_last_d"], T + 9.8, places=3)
         self.assertTrue(x["start_prev_phase"])
-        self.assertIn("D-Log letzte Decode-Runde", x["start_src"])
+        self.assertIn("D log last decode round", x["start_src"])
         self.assertAlmostEqual(x["total_ms"], (42.45 - 39.0) * 1000, delta=1)
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)             # the partition still sums to the total
         # D's last token -> arrival (D idle, nothing pending) is NOT in the total, but stays visible, outside the sum

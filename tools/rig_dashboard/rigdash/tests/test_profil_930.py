@@ -129,7 +129,7 @@ class Editor(unittest.TestCase):
         d = self.ed.dry_run(r["doc"], RIG)
         self.assertEqual([q["code"] for q in d["rejections"]], ["PROFIL-STATUS"])           # the synthetic profile is experimentell
         self.assertTrue(d["rejections"][0]["forcebar"])
-        self.assertIn("Nicht übergangen werden", d["force_note"])
+        self.assertIn("Not overridden", d["force_note"])
 
     def test_dry_run_names_codes_classes_and_what_force_does(self):
         r = self.ed.load("release", "demo")
@@ -142,7 +142,7 @@ class Editor(unittest.TestCase):
             for q in by[c]:
                 self.assertEqual(q["klass"], "wert")
                 self.assertEqual(q["force_state"], "force")
-                self.assertIn("Force übergeht", q["force"])
+                self.assertIn("force overrides it", q["force"])
                 self.assertTrue(q["why_class"])
         self.assertTrue(any(q["text"].startswith("HW-COUNT:") for q in by["HW-COUNT"]))      # the planner's own text
         self.assertNotIn("HW-TOPOLOGY", by)                         # an unproven N inside the range is HW-COUNT, not "no topology"
@@ -150,8 +150,8 @@ class Editor(unittest.TestCase):
         arch = {q["code"]: q for q in four["rejections"]}["HW-ARCH"]
         self.assertFalse(arch["forcebar"])
         self.assertEqual(arch["klass"], "nicht_forcebar")
-        self.assertIn("nein", arch["force"])
-        self.assertIn("bleiben auch mit Force bestehen", four["verdict"])
+        self.assertIn("no", arch["force"])
+        self.assertIn("remain even with force", four["verdict"])
         one = self.ed.dry_run(r["doc"], RIG[:1])
         topo = {q["code"]: q for q in one["rejections"]}["HW-TOPOLOGY"]                      # no flip topology for one card
         self.assertEqual((topo["klass"], topo["forcebar"], topo["force_state"]), ("nicht_forcebar", False, "blockiert"))
@@ -222,16 +222,16 @@ class Models(unittest.TestCase):
         self.assertEqual(set(by), {"Modell-lesbar", "Modell-leer", "Modell-fehlt"})            # nothing silently left out
         self.assertEqual((by["Modell-lesbar"]["state"], by["Modell-lesbar"]["readable"]), ("lesbar", True))
         self.assertEqual(by["Modell-leer"]["state"], "nicht_gemountet")
-        self.assertIn("Modell im Container nicht gemountet", by["Modell-leer"]["why"])
-        self.assertIn("Verzeichnis leer", by["Modell-leer"]["why"])
-        self.assertIn("Pfad fehlt", by["Modell-fehlt"]["why"])
-        self.assertEqual(sorted(by["Modell-leer"]["roles"]), ["Draft", "Modell"])
+        self.assertIn("Model not mounted in the container", by["Modell-leer"]["why"])
+        self.assertIn("directory empty", by["Modell-leer"]["why"])
+        self.assertIn("path missing", by["Modell-fehlt"]["why"])
+        self.assertEqual(sorted(by["Modell-leer"]["roles"]), ["Draft", "Model"])
         self.assertEqual(sorted(by["Modell-leer"]["used_by"]), ["a", "b"])
 
     def test_the_ui_says_it_and_offers_no_estimate_for_them(self):
         js = open(os.path.join(os.path.dirname(HERE), "static", "profil.js"), encoding="utf-8").read()
-        self.assertIn("Modell im Container nicht gemountet", js)
-        self.assertIn("nicht schätzbar: nichts zu lesen", js)
+        self.assertIn("model not mounted in the container", js)
+        self.assertIn("cannot be estimated: nothing to read", js)
         self.assertIn("window.ModellProfil.schaetzen", js)
 
 

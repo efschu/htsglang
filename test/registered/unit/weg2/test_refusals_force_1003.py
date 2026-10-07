@@ -130,8 +130,8 @@ class EntrypointWiring(Base):
             self.assertTrue(r["wired_entrypoint"], c)
             self.assertEqual(r["wired_at"], "entrypoint", c)
             self.assertEqual(r["force_scope"], R.SCOPE_ENTRYPOINT_ONLY, c)
-        self.assertIn("Docker-Start (Entrypoint)", R.SCOPE_ENTRYPOINT_ONLY)
-        self.assertIn("reinen Launcher-Aufruf nicht", R.SCOPE_ENTRYPOINT_ONLY)
+        self.assertIn("Docker start (entrypoint)", R.SCOPE_ENTRYPOINT_ONLY)
+        self.assertIn("plain launcher call", R.SCOPE_ENTRYPOINT_ONLY)
         self.assertEqual(pub["HW-COUNT"]["wired_at"], "launcher+entrypoint")
         self.assertEqual(pub["HW-UNCALIBRATED"]["wired_at"], "launcher+entrypoint")
         self.assertEqual(pub["HOST-MEM"]["wired_at"], "launcher")
@@ -139,7 +139,7 @@ class EntrypointWiring(Base):
         for c in ("HW-ARCH", "KARTE-BELEGT", "HW-TOPOLOGY"):
             self.assertIsNone(pub[c]["wired_at"], c)
             self.assertIsNone(pub[c]["wired_entrypoint"], c)
-            self.assertEqual(pub[c]["force_scope"], "nicht forcebar")
+            self.assertEqual(pub[c]["force_scope"], "not forceable")
 
     def test_explicit_entrypoint_list_overrides_the_default(self):
         pub = {r["code"]: r for r in R.public_register([], entrypoint_wired=["SHM"])}
