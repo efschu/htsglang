@@ -1,0 +1,32 @@
+{
+ "checkpoints": {
+  "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp": {
+   "files_sha256_on_host": {
+    "config.json": "b058d1b1cde7b76b342b0838ac02e1d1175f5d4aa5a6b0471d6f43a91bcbfaba",
+    "model.safetensors.index.json": "95683eb445fafde8bfaed573783f702c837eb5c008c6f2ffbbeadded057bd576"
+   },
+   "host": "proxmox:/spinning/subvol-999-disk-0/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp",
+   "role": "PROFILE_MODEL (nf-int4-h6-abl.env:150)"
+  },
+  "Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp": {
+   "files_sha256_on_host": {
+    "config.json": "906468d3533c64bc6bf633bf19f7c7cbbfd6ddb61c8a1a0cabd5ac2787f978b0",
+    "model.safetensors.index.json": "a3e600dae46c7f32e2ff42e6c40f46f75fb71ae7d5b73011b666664e5d54f6a2"
+   },
+   "host": "proxmox:/spinning/subvol-999-disk-0/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-MTP-INT4-g32-albucino-abl-wxp",
+   "role": "PROFILE_DRAFT (nf-int4-h6-abl.env:151)"
+  }
+ },
+ "date": "2026-10-07",
+ "golden": "plan_nf_abl_n3.txt",
+ "launcher_line": "nf",
+ "note": "Header snapshots were taken read-only over ssh (safetensors header bytes 8+N per file, small files verbatim, index.json verbatim); no weight byte was read. LINE GOLDEN: made 2026-10-07 with `propose_oracle golden` on the NF launcher line (marker flags --dual-priority/--pp-cut-stage-model unknown); the golden at golden/plan_nf_abl_n3.txt is of the 27B launcher line (d7bce7a1e0). Differences measured: HW-TOPOLOGY N=3 line (NF only), PP-CUT STAGE MODEL off line (27B only), EXTEND-STUECKELUNG/EXTEND-RATE lines of D, GROUP-ENV D.",
+ "profile": {
+  "file": "profiles/nf-int4-h6-abl.env",
+  "live": "/spinning/gpu-arb/docker/profiles/nf-int4-h6-abl.env (identical sha256 on 2026-10-06)",
+  "sha256": "12f9a824b3d9fc66e065ae6856ca91f2c48be43225c55e302ddfab4fd5cb8092"
+ },
+ "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
+ "schema": "planer-ap0-golden-provenance/1",
+ "tree": "2e68b3f94b (desk/nf-nf22-integ-1006, launcher/environ/server_args as there) + desk/planer-nfline-1007"
+}

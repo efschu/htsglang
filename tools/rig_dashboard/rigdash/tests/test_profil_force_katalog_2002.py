@@ -58,6 +58,30 @@ class Verdict(unittest.TestCase):
         self.assertEqual(P.force_verdict({})[1:], ("blockiert", None))                                       # unbekannter Code
 
 
+class WiredFromTheTree(unittest.TestCase):
+    """07.10. (NF line): ``register()`` marks a forcebar code wired by what the launcher.py of the PLANNER TREE consults, not by the
+    shipped catalog (which covers both lines and carries one launcher's list)."""
+
+    def test_wired_comes_from_the_tree_launcher_not_from_the_catalog(self):
+        from .test_profil_930 import FIXTURE_TREE
+        tmp = tempfile.mkdtemp(prefix="pf2002w_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        tree = os.path.join(tmp, "python")
+        wd = os.path.join(tree, "sglang", "srt", "weg2")
+        os.makedirs(wd)
+        shutil.copy(os.path.join(FIXTURE_TREE, "sglang", "srt", "weg2", "refusals.py"), wd)
+        shutil.copy(os.path.join(FIXTURE_TREE, "sglang", "srt", "weg2", "profile_json.py"), wd)
+        with open(os.path.join(wd, "launcher.py"), "w") as fh:
+            fh.write('refuse_value("HW-COUNT", "x")\nrefuse_value("HOST-MEM", "y")\n')
+        ed2, _r, _u = editor(tmp)
+        ed2.tree = tree
+        ed2._mods = None
+        wired = {r["code"] for r in ed2.register() if r.get("wired")}
+        self.assertEqual(wired, {"HW-COUNT", "HOST-MEM"})
+        # the catalog's own list (the other line's) is ignored when the launcher is readable
+        self.assertNotEqual(wired, set(ed2.catalog().get("register_wired") or []))
+
+
 class Dry(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pf2002_")

@@ -13,6 +13,12 @@ GPU-free, NVML-free, Docker-free.  The classes:
                             verdicts equal today's (nothing forced, nothing refused, ``geht``).
 * ``TestN2Vectors``        two cards: the profile as it is carries vectors of three entries (verdict ``PROFILE-VECTORS`` naming them); the proposal carries
                             vectors of N entries and NO verdict names a vector.
+
+LAUNCHER LINES (07.10.): the same test code runs on the 27B line and on the NF line (``propose_oracle.launcher_line``).  The 27B release
+profile (27b-base) is not plannable by the NF launcher (measured 2026-10-07 on tree 2e68b3f94b: SystemExit ``--p-chunk-policy dynamic: need
+0 < min_tokens <= max_tokens, got 4096/2048`` -> verdict ``OPTIONEN``), so on the NF line the loops over the profiles run over NF only and the
+27B-only tests skip.  NF at N=2: the 27B line refuses W167 "Stufenzahl 2 gegen 3" (final refusal), the NF line re-stages the P-card reference
+(AP2 1006, ``launcher._restage_p_card_reference``, probed with ``propose_oracle.launcher_has``) and goes with ``--force``.
 """
 
 from __future__ import annotations
@@ -49,6 +55,17 @@ _NF = ("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp", "Qwen3.8-Fla
 _27B = ("Qwen3.8-27B-INT8-gdncov-vocabembed", "Qwen3.8-27B-DFlash2-W8-lued")
 _CENSUS_27B = "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json"
 _NEEDS_BOX = unittest.skipUnless(os.path.exists(_CENSUS_27B), "27B census not on this box (the dry runs are box-bound, like AP0's goldens)")
+
+#: the launcher line of this tree (argument-parser probe, never a sha or a branch name) and what follows from it
+_LINE = O.launcher_line()
+_UNKNOWN_MARKERS = [f for f in O.LINE_MARKER_FLAGS if not O.launcher_knows(f)]
+_ON_27B_LINE = unittest.skipUnless(
+    _LINE == O.LINE_27B,
+    "27B launcher line only: the launcher of %s does not know %s (line %r); the 27B release profile is not plannable by it "
+    "(measured 2026-10-07 on tree 2e68b3f94b: 27b-base -> SystemExit '--p-chunk-policy dynamic: need 0 < min_tokens <= max_tokens, "
+    "got 4096/2048')" % (TREE, ", ".join(_UNKNOWN_MARKERS) or "-", _LINE))
+_LINE_KEYS = ("27b", "nf") if _LINE == O.LINE_27B else ("nf",)
+_RESTAGES_P_CARD = O.launcher_has("_restage_p_card_reference")      # AP2 1006: NF at N != 3 does not stop at W167
 
 _TMP = None
 _MODELS = {}
@@ -448,13 +465,13 @@ class TestReferenceRigVerdicts(unittest.TestCase):
         self.assertTrue(d["plan"]["pp_cut"], key)                       # the resolved values of the plan are in the verdict
 
     def test_the_release_profiles_as_they_are(self):
-        for key in ("27b", "nf"):
+        for key in _LINE_KEYS:
             d = PV.ask(_profile(key), _ref_rows(), tree=TREE, form="flip", snapshots=_snapshots())
             self._check_clean(d, key)
             self.assertEqual(d["n"], 3)
 
     def test_the_proposal_for_the_reference_rig_and_its_fit_verdict(self):
-        for key in ("27b", "nf"):
+        for key in _LINE_KEYS:
             v = _propose(key, _ref_rows())
             self.assertTrue(v["inventory"]["gleich_wie_profil"])
             li = PV.launch_input_of(v["argv"], v["env"], _profile(key))
@@ -495,7 +512,7 @@ class TestN2Vectors(unittest.TestCase):
         ``PROFILE-VECTORS`` with the vector names; NF carries many more of them than 27B."""
         rows = _catalog_rows(["rtx5090-32", "rtx3090-24"])
         want = {"27b": {"--user-reserve-mib"}, "nf": {"--rank-moe-ratio", "--rank-role", "--rank-tp-ratio", "SGLANG_MOE_SCRATCH_SLOTS", "--user-reserve-mib"}}
-        for key in ("27b", "nf"):
+        for key in _LINE_KEYS:
             d = PV.ask(_profile(key), rows, tree=TREE, form="flip", snapshots=_snapshots())
             pv = [x for x in d["verdikte"] if x["code"] == "PROFILE-VECTORS"]
             self.assertEqual(len(pv), 1, (key, [x["code"] for x in d["verdikte"]]))
@@ -504,13 +521,16 @@ class TestN2Vectors(unittest.TestCase):
             self.assertNotEqual(d["ausgang"], "geht")
             self.assertTrue(any(x["code"] == "RECORDS-NVEC" for x in d["verdikte"]), key)
             # the same profile on the real 5090 + 3080 (every card has a measured twin): the launcher derives the vectors -> no PROFILE-VECTORS for 27B
-        d27 = PV.ask(_profile("27b"), _two_rows(), tree=TREE, form="flip", snapshots=_snapshots())
-        self.assertEqual([x for x in d27["verdikte"] if x["code"] == "PROFILE-VECTORS"], [])
-        self.assertEqual(d27["vektoren"]["nicht_n"].get("--user-reserve-mib"), 3)           # a length != N is data, the launcher derived it
+        if _LINE == O.LINE_27B:
+            d27 = PV.ask(_profile("27b"), _two_rows(), tree=TREE, form="flip", snapshots=_snapshots())
+            self.assertEqual([x for x in d27["verdikte"] if x["code"] == "PROFILE-VECTORS"], [])
+            self.assertEqual(d27["vektoren"]["nicht_n"].get("--user-reserve-mib"), 3)           # a length != N is data, the launcher derived it
 
     def test_the_proposal_for_the_same_foreign_inventory_has_n_vectors_and_no_vector_verdict(self):
         rows = _catalog_rows(["rtx5090-32", "rtx3090-24"])
         for key, z in (("27b", {"kv_tokens": 196608}), ("nf", {})):
+            if key not in _LINE_KEYS:
+                continue
             v = _propose(key, rows, "flip", **z)
             self.assertTrue(v["vektoren_ok"], (key, v["vektoren_falsch"]))
             self.assertTrue(all(c == 2 for c in v["vektorlaengen"].values()), (key, v["vektorlaengen"]))
@@ -528,6 +548,8 @@ class TestN2Vectors(unittest.TestCase):
 
     def test_the_proposal_carries_n_vectors_and_no_verdict_names_one(self):
         for key, z in (("27b", {"kv_tokens": 196608}), ("nf", {})):
+            if key not in _LINE_KEYS:
+                continue
             v = _propose(key, _two_rows(), "flip", **z)
             self.assertTrue(v["vektoren_ok"], v["vektoren_falsch"])
             self.assertTrue(all(c == 2 for c in v["vektorlaengen"].values()), v["vektorlaengen"])
@@ -541,6 +563,7 @@ class TestN2Vectors(unittest.TestCase):
             self.assertIn(d["ausgang"], ("geht_mit_force", "verweigert"), key)       # two cards are unproven (HW-COUNT) -> never a plain "geht"
             self.assertTrue(any(x["code"] == "HW-COUNT" for x in d["verdikte"]), key)
 
+    @_ON_27B_LINE
     def test_27b_n2_goes_with_force_and_says_what_force_passes(self):
         v = _propose("27b", _two_rows(), "flip", kv_tokens=196608)
         li = PV.launch_input_of(v["argv"], v["env"], _profile("27b"))
@@ -553,9 +576,23 @@ class TestN2Vectors(unittest.TestCase):
         self.assertEqual(d["mit_force"]["rc"], 0)
 
     def test_nf_n2_ends_with_the_launchers_own_refusal(self):
+        """27B line: W167 "Stufenzahl 2 gegen 3" is the final refusal of the launcher.  NF line (AP2 1006): the P-card reference is re-staged,
+        nothing refuses after ``--force``: the verdict is ``geht_mit_force`` and no run-level refusal stands."""
         v = _propose("nf", _two_rows(), "flip")
         li = PV.launch_input_of(v["argv"], v["env"], _profile("nf"))
         d = PV.ask(li, _two_rows(), tree=TREE, form="flip", vorschlag=v, snapshots=_snapshots())
+        if _RESTAGES_P_CARD:
+            self.assertEqual(d["ausgang"], "geht_mit_force", [(x["code"], x["grund"][:100]) for x in d["verdikte"]])
+            # every run-level verdict is a value refusal --force passed (nothing blocked, nothing unchecked): no final refusal
+            self.assertEqual({x["code"] for x in d["verdikte"] if x["ebene"] == "lauf"}, {"HW-COUNT", "HW-UNCALIBRATED"})
+            self.assertTrue(all(x["force_state"] == PV.FORCE for x in d["verdikte"] if x["ebene"] == "lauf"))
+            self.assertEqual((d["zaehlung"][PV.BLOCKED], d["zaehlung"][PV.UNCHECKED]), (0, 0))
+            self.assertFalse(any("Stufenzahl" in x["grund"] for x in d["verdikte"]))
+            self.assertEqual(d["mit_force"]["rc"], 0)
+            self.assertTrue({"HW-COUNT"} <= {f["code"] for f in d["forced"]} <= {"HW-COUNT", "HW-UNCALIBRATED"}, d["forced"])
+            # what the launcher still says about the profile's 3-card records stays a named blocker of HW-COUNT
+            self.assertTrue(any(x["code"] == "RECORDS-NVEC" for x in d["verdikte"]))
+            return
         self.assertEqual(d["ausgang"], "verweigert")
         last = [x for x in d["verdikte"] if x["ebene"] == "lauf"][-1]
         self.assertEqual((last["code"], last["launcher_code"], last["force_state"]), ("LAUNCHER-UNKLASSIFIZIERT", "W167", PV.BLOCKED))

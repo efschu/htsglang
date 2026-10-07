@@ -19,8 +19,16 @@ what the launcher makes of a proposal.  GPU-free, NVML-free, Docker-free.
                             (plan section 2: without AP1 the launcher refuses these hard), never worked around.
 * ``TestSeats``             the "Sitze gleichzeitig" regulator edits exactly the seat-bound values.
 
-NF abl at N != 3: the launcher of this tree refuses W167 (``p_card_chunk.recut_check``: the P-card reference is a 3-stage
-measurement); that is the verdict the test pins, not a failure of the proposal.
+NF abl at N != 3: on the 27B launcher line the launcher refuses W167 (``p_card_chunk.recut_check``: the P-card reference is a
+3-stage measurement); that is the verdict the test pins there, not a failure of the proposal.  The NF line has AP2 1006
+(``launcher._restage_p_card_reference``: the reference is re-staged per stage role), so there the same N=2 dry run goes through
+``--force`` (the probe is the launcher's own function, ``propose_oracle.launcher_has``, never a tree sha).
+
+LAUNCHER LINES (07.10.): the same test code runs on the 27B line and on the NF line (``propose_oracle.launcher_line``: the flags
+``--dual-priority``/``--pp-cut-stage-model`` of the launcher's argument parser).  The 27B release profile (27b-base) is not
+plannable by the NF launcher (measured 2026-10-07 on tree 2e68b3f94b: SystemExit ``--p-chunk-policy dynamic: need 0 < min_tokens
+<= max_tokens, got 4096/2048``), so the tests that dry-run it skip there, with the reason; NF tests use the golden of their line
+(``golden/nf/plan_nf_abl_n3.txt``, ``propose_oracle.golden_path``).
 """
 
 from __future__ import annotations
@@ -63,6 +71,28 @@ _NF = ("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp", "Qwen3.8-Fla
 _27B = ("Qwen3.8-27B-INT8-gdncov-vocabembed", "Qwen3.8-27B-DFlash2-W8-lued")
 _CENSUS_27B = "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json"
 _NEEDS_BOX = unittest.skipUnless(os.path.exists(_CENSUS_27B), "27B census not on this box (the goldens are box-bound, like AP0's)")
+#: the launcher line of this tree (argument-parser probe, never a sha or a branch name)
+_LINE = O.launcher_line()
+_UNKNOWN_MARKERS = [f for f in O.LINE_MARKER_FLAGS if not O.launcher_knows(f)]
+_ON_27B_LINE = unittest.skipUnless(
+    _LINE == O.LINE_27B,
+    "27B launcher line only: the launcher of %s does not know %s (line %r); the 27B release profile is not plannable by it "
+    "(measured 2026-10-07 on tree 2e68b3f94b: 27b-base -> SystemExit '--p-chunk-policy dynamic: need 0 < min_tokens <= "
+    "max_tokens, got 4096/2048')" % (TREE, ", ".join(_UNKNOWN_MARKERS) or "-", _LINE))
+#: the model keys whose release profile the launcher of this line plans; the profile a line-neutral test runs
+_LINE_MODELS = ("27b", "nf") if _LINE == O.LINE_27B else ("nf",)
+_REF_KEY = "27b" if _LINE == O.LINE_27B else "nf"
+#: AP2 1006: the launcher re-stages the P-card reference at N != 3 (NF line); else it refuses W167 "Stufenzahl 2 gegen 3"
+_RESTAGES_P_CARD = O.launcher_has("_restage_p_card_reference")
+#: AP4 1526 (NF line): ``--weg2-xchg-census-map`` resolves the UUID-bound exchange census by card class, so the foreign N=4 inventories do
+#: not stop at W71 "is not in the census" any more.  The next refusal behind it was W120 (Platztausch buffer: every owned expert
+#: resident -> no buffer) while the proposal set FR_D 1.000 on every D rank; that was the PLANNER's value (propose_rules.form_a_d), it is
+#: capped now (FIX 6, 07.10.), so the NF-line dry run of the N=4 inventories RUNS THROUGH (rest blockers empty).  On the 27B line W71 is
+#: still the first launcher refusal (the census is UUID-bound there; a launcher matter, not the planner's)
+_CENSUS_MAP = O.launcher_knows("--weg2-xchg-census-map")
+_N4_REFUSAL = None if _CENSUS_MAP else "W71"
+#: the value refusals ``--force`` passes in these dry runs: the NF line also names HW-BORROWED (a census row borrowed from another card)
+_FORCED_OK = {"HW-COUNT", "HW-UNCALIBRATED"} | ({"HW-BORROWED"} if "HW-BORROWED" in {r.code for r in refusals.REGISTER} else set())
 
 _TMP = None
 _MODELS = {}
@@ -477,6 +507,7 @@ class TestReferenceDiff0(unittest.TestCase):
                     self.assertFalse(w["geaendert"], w["key"])
                     self.assertTrue(w["herkunft"].startswith("Profil "), w)
 
+    @_ON_27B_LINE
     @_NEEDS_BOX
     def test_27b_flip_proposal_dry_run_equals_golden(self):
         v = _propose("27b", "ref3")
@@ -495,7 +526,7 @@ class TestReferenceDiff0(unittest.TestCase):
         self.assertIsNone(res.exc_type, "%s: %s" % (res.exc_type, res.exc_msg[:300]))
         self.assertEqual(res.rc, 0)
         self.assertEqual(res.forced, [])
-        with open(os.path.join(GOLDEN, golden), encoding="utf-8") as fh:
+        with open(O.golden_path(GOLDEN, golden, _LINE), encoding="utf-8") as fh:
             want = fh.read()
         d = O.diff_lines(want, res.dump())
         self.assertEqual(d, [], "plan diff vs %s: %d lines\n%s" % (golden, len(d), "\n".join(x[:240] for x in d[:12])))
@@ -503,10 +534,10 @@ class TestReferenceDiff0(unittest.TestCase):
     @_NEEDS_BOX
     def test_tp_form_on_the_reference_rig_is_the_d_only_dry_run(self):
         """``--d-only`` on the profile's own inventory: nothing is forced, the launcher plans P and D and starts D alone."""
-        v = _propose("27b", "ref3", "tp")
-        self.assertEqual(v["argv"][:-1], list(_profile("27b").argv))               # the profile + one flag
+        v = _propose(_REF_KEY, "ref3", "tp")                                       # 27B Flip profile on the 27B line, NF abl on the NF line
+        self.assertEqual(v["argv"][:-1], list(_profile(_REF_KEY).argv))            # the profile + one flag
         self.assertEqual(v["argv"][-1], "--d-only")
-        run = _dry("27b", v, _ref_rows(), force=False)
+        run = _dry(_REF_KEY, v, _ref_rows(), force=False)
         self.assertIsNone(run.result.exc_type, run.result.exc_msg[:300])
         self.assertEqual((run.result.rc, run.result.forced), (0, []))
         self.assertTrue(any("DRY-RUN complete (d-only)" in ln for ln in run.result.text.splitlines()))
@@ -560,7 +591,7 @@ class TestSyntheticDryRun(unittest.TestCase):
         # the rest blockers of the HW gate hold NO vector blocker (PROFILE-VECTORS): that is what the proposal is for
         self.assertNotIn("PROFILE-VECTORS", self._blockers(run), res.forced)
         self.assertNotIn("PROFILE-VECTORS", res.text + (res.exc_msg or ""))
-        self.assertTrue({f["code"] for f in res.forced} <= {"HW-COUNT", "HW-UNCALIBRATED"}, res.forced)
+        self.assertTrue({f["code"] for f in res.forced} <= _FORCED_OK, res.forced)
         # and the launcher's own count of the vectors it parsed: N for each
         ns = _ns(run.argv)
         self.assertEqual({k: c for k, c in launcher.positional_vector_lengths(ns).items() if c != n}, {})
@@ -572,6 +603,7 @@ class TestSyntheticDryRun(unittest.TestCase):
             self.assertIn(refused, res.exc_msg[:200], res.exc_msg[:400])
         return v, run
 
+    @_ON_27B_LINE
     @_NEEDS_BOX
     def test_27b_n2_flip_runs_through(self):
         # 5090 + 3080-20G; KV obligation lowered to what two cards hold (the launcher's own verdict at 262144: next test)
@@ -580,12 +612,14 @@ class TestSyntheticDryRun(unittest.TestCase):
         self.assertTrue(any("PP-CUT SHIPPED" in ln for ln in run.result.text.splitlines()))
         self.assertEqual(v["n"], 2)
 
+    @_ON_27B_LINE
     @_NEEDS_BOX
     def test_27b_n2_tp_runs_through(self):
         v, run = self._check("27b", "n2", "tp", kv_tokens=196608)
         self.assertIn("--d-only", run.argv)
         self.assertTrue(any("DRY-RUN complete (d-only)" in ln for ln in run.result.text.splitlines()))
 
+    @_ON_27B_LINE
     @_NEEDS_BOX
     def test_27b_n2_at_the_262144_obligation_is_the_launchers_own_kv_verdict(self):
         """Two cards do not hold 27B INT8 + 262144 tokens of KV: the launcher's pool-floor refusal W40 says so (the best
@@ -596,13 +630,17 @@ class TestSyntheticDryRun(unittest.TestCase):
 
     @_NEEDS_BOX
     def test_nf_n2_vectors_are_n_and_the_p_card_record_refuses_by_name(self):
-        v, run = self._check("nf", "n2", "flip", refused="W167")
-        self.assertIn("Stufenzahl 2 gegen 3 der Referenz", run.result.exc_msg)
+        v, run = self._check("nf", "n2", "flip", refused=None if _RESTAGES_P_CARD else "W167")
+        if not _RESTAGES_P_CARD:
+            self.assertIn("Stufenzahl 2 gegen 3 der Referenz", run.result.exc_msg)
+        else:       # AP2 1006: the P-card reference is re-staged; only the count is passed
+            self.assertEqual([f["code"] for f in run.result.forced if f["code"] != "HW-UNCALIBRATED"], ["HW-COUNT"])   # the count (+ the class rows of the re-staged reference)
+            self.assertFalse(any("Stufenzahl" in ln for ln in run.result.text.splitlines()))
         self.assertEqual(v["n"], 2)
 
     @_NEEDS_BOX
     def test_nf_n2_tp_the_launcher_still_plans_p(self):
-        v, run = self._check("nf", "n2", "tp", refused="W167")
+        v, run = self._check("nf", "n2", "tp", refused=None if _RESTAGES_P_CARD else "W167")
         self.assertIn("--d-only", run.argv)
 
     @_NEEDS_BOX
@@ -611,13 +649,18 @@ class TestSyntheticDryRun(unittest.TestCase):
         uncalibrated class).  AP-J 07.10.: the integ base 752537e7b6 carries AP1 (HW-GENERISCH), W19 is passed under --force
         (HW-UNCALIBRATED), and the dry run now stops at the next named blocker, W71: the exchange census is UUID-bound and the synthetic
         cards are not in it (the same blocker as ``n4_mixed`` below)."""
-        for model in ("27b", "nf"):
-            v, run = self._check(model, "n4_3090", "flip", refused="W71")
-            self.assertNotIn("W19", run.result.exc_msg[:200])
-            self.assertIn("is not in the census", run.result.exc_msg)
+        for model in _LINE_MODELS:
+            refused = _N4_REFUSAL if model == "nf" or not _CENSUS_MAP else "W71"   # the 27B model's profile reads the census itself: W71
+            v, run = self._check(model, "n4_3090", "flip", refused=refused)
+            self.assertNotIn("W19", (run.result.exc_msg or "")[:200])
+            if refused == "W71":
+                self.assertIn("is not in the census", run.result.exc_msg)
+                self.assertIn("RTX 3090", run.result.exc_msg)
+            else:       # A2: the rest blockers are empty; the dry run runs through, nothing is refused by a value the planner set
+                self.assertNotIn("W120", run.result.text + (run.result.exc_msg or ""))
+                self.assertEqual({f["code"] for f in run.result.forced} - _FORCED_OK, set())
             self.assertEqual(v["n"], 4)
-            self.assertIn("RTX 3090", run.result.exc_msg)
-            self.assertEqual({f["code"] for f in run.result.forced}, {"HW-COUNT", "HW-UNCALIBRATED"})
+            self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= {f["code"] for f in run.result.forced} <= _FORCED_OK)
             # every value the planner derived for these cards is labelled unbelegt
             self.assertTrue(v["unbelegt"])
             self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in v["cards"]))
@@ -625,9 +668,31 @@ class TestSyntheticDryRun(unittest.TestCase):
     @_NEEDS_BOX
     def test_n4_known_classes_stop_at_the_uuid_bound_census(self):
         """2x 5090 + 2x 3080 (known classes, N=4): the exchange census is UUID-bound (W71): synthetic cards are not in it."""
-        for model in ("27b", "nf"):
-            v, run = self._check(model, "n4_mixed", "flip", refused="W71")
-            self.assertIn("is not in the census", run.result.exc_msg)
+        for model in _LINE_MODELS:
+            refused = _N4_REFUSAL if model == "nf" or not _CENSUS_MAP else "W71"
+            v, run = self._check(model, "n4_mixed", "flip", refused=refused)
+            if refused == "W71":
+                self.assertIn("is not in the census", run.result.exc_msg)
+            else:
+                self.assertNotIn("W120", run.result.text + (run.result.exc_msg or ""))
+
+    def test_form_a_fractions_stay_below_the_platztausch_buffer_cap(self):
+        """Review 6 finding 1: the planner's FR_D never exceeds the largest fraction at which the rank still builds its Platztausch
+        buffer (>= 2 scratch rows, the launcher's W120 bound); checked against the launcher's OWN count on the proposal's ownership."""
+        from sglang.srt.layers.moe import expert_map as EM
+        from sglang.srt.planner import expert_residency as ER
+        for inv in ("n4_3090", "n4_mixed"):
+            hw, rows = _inventory(inv)
+            v = P.propose(hw, _MODELS["nf"][0], "flip", {}, basis=_profile("nf"), draft=_MODELS["nf"][1], rates=MEASURED_RATES)
+            la = P.LaunchArgv(v["argv"], v["env"])
+            fr = [float(x) for x in la.extra_get("d", "--rank-moe-resident-fraction").split(",")]
+            owned = [int(x) for x in la.extra_get("d", "--rank-moe-ratio").split(",")]
+            self.assertEqual(len(fr), 4)
+            for r, (f, o) in enumerate(zip(fr, owned)):
+                e = o + 1                                              # the zero-pad expert counts (#82)
+                self.assertLessEqual(ER.resident_rows(e, f), e - 2, (inv, r, f, o))
+                self.assertLessEqual(f, ER.largest_fraction_for_rows(local_experts=e, scratch_rows=0, max_rows=e), (inv, r, f, o))
+            self.assertLess(max(fr), 1.0, (inv, fr))
 
 
 class TestSeats(unittest.TestCase):

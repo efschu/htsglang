@@ -1,6 +1,11 @@
 """Nacharbeit nach der Abnahme AP-J, Befund 6: W71 (UUID-gebundener Census) und W64 (kein gemessenes Dual-D-Log) sind im Verdikt-Register des Planers
 (``propose_verdict.SUPPLEMENT_CODES``) mit Klasse, ``forcebar=False``, Grund und Quelle, nicht mehr ``LAUNCHER-UNKLASSIFIZIERT``.  ``refusals.REGISTER`` (der Launcher)
 bleibt unveraendert (R1).  GPU-frei.
+
+Launcher-Linien (07.10.): derselbe Testcode laeuft auf der 27B-Linie und auf der NF-Linie (``propose_oracle.launcher_line``, aus dem Argumentparser
+des Launchers).  Was an die Zeilennummern und das Modul ``dual_w64`` des 27B-Baums gebunden ist (Dual-Form: auf der NF-Linie nicht implementiert),
+laeuft nur dort; was ein Anker im Quelltext ist, laeuft auf jedem Baum.  Das Launcher-Register hat je Linie seine eigene Groesse (27B: 22 Codes,
+NF: 23, gemessen 2026-10-07): geprueft wird, dass W71/W64 darin fehlen, nicht eine feste Zahl.
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ def _result(exc_type, exc_msg, forced=()):
 
 class TestSupplement(unittest.TestCase):
     def test_the_launcher_register_is_not_changed_and_has_neither_code(self):
-        self.assertEqual(len(refusals.REGISTER), 22)
+        self.assertGreater(len(refusals.REGISTER), 0)
         codes = {r.code for r in refusals.REGISTER}
         for c in ("W71", "W64", "W71-CENSUS", "W64-OPPOINT", "W64-DUAL-D"):
             self.assertNotIn(c, codes)
@@ -114,6 +119,9 @@ class TestSupplement(unittest.TestCase):
         self.assertRegex(kein_vektor["quelle"], r"17235")
         self.assertEqual(len({neutral["titel"], ohne["titel"], gemessen["titel"], kein_vektor["titel"]}), 4)
 
+    @unittest.skipUnless(O.weg2_module_exists("dual_w64"),
+                         "weg2/dual_w64.py does not exist in this tree (NF launcher line: the Dual form is not implemented there); "
+                         "the W64-DUAL marker texts are the 27B line's")
     def test_the_w64_dual_marker_texts_exist_in_the_launcher_sources(self):
         """Die drei Marker, nach denen _supp_view unterscheidet, stehen so im Quelltext (nicht aus dem Gedaechtnis)."""
         import inspect
@@ -130,6 +138,26 @@ class TestSupplement(unittest.TestCase):
         self.assertIn("W71 Weg2XchgResidencyUnarmable", v["grund"])
         self.assertIs(v["forcebar"], False)
 
+    def test_the_cited_anchors_exist_in_the_launcher_sources_of_this_tree(self):
+        """Der zitierte Text steht im Quelltext DIESES Baums (Anker, ohne Zeilennummer: die Nummern sind die der 27B-Linie).  Die Dual-Anker
+        (W64-DUAL, ``dual_layout``) nur dort, wo es die Dual-Form gibt."""
+        xsrc = pathlib.Path(xchg_residency.__file__).read_text(encoding="utf-8")
+        lsrc = pathlib.Path(launcher.__file__).read_text(encoding="utf-8")
+        self.assertIn("W71 Weg2XchgResidencyUnarmable: the exchange's predicted VRAM residency", xsrc)
+        self.assertIn("--weg2-weight-source ring", xsrc)
+        self.assertIn("def load_census", xsrc)
+        self.assertIn("W64 Weg2TpOperatingPointInfeasible: position", lsrc)
+        has_dual = O.weg2_module_exists("dual_w64")
+        # the two probes agree: a launcher with the Dual form knows --dual-priority and has dual_w64.py, one without has neither
+        self.assertEqual(has_dual, O.launcher_knows("--dual-priority"))
+        for anchor in ("W64-DUAL: no measured dual-share D log", "if mine and dual_layout:",
+                       "if not dual_layout or not str(refusal).startswith"):
+            self.assertEqual(anchor in lsrc, has_dual, anchor)
+
+    @unittest.skipUnless(O.launcher_line() == O.LINE_27B,
+                         "the cited line numbers (xchg_residency.py:711-723, launcher.py:16986-17352) are those of the 27B launcher line; "
+                         "this tree's launcher line is %r (the anchors are proved by test_the_cited_anchors_exist_in_the_launcher_sources_of_this_tree)"
+                         % O.launcher_line())
     def test_the_cited_lines_hold_the_launcher_text(self):
         """Die Quellenangaben sind keine Behauptung: der zitierte Text steht an der genannten Stelle des Quelltexts dieses Baums."""
         def lines(mod):

@@ -505,9 +505,29 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
         plan = FA.solve_form_a(cb, posts, geom)
     except FA.FormAInfeasible as exc:
         return {"ok": False, "error": "der Form-A-Loeser findet keine Aufteilung (%s: %s)" % (type(exc).__name__, exc), "unbelegt": unb}
+    # The launcher refuses a D rank without a Platztausch buffer (W120 Weg2PlatztauschBufferUnbuilt, ``launcher.py``
+    # ``_refuse_unbuilt_platztausch_buffers``): a rank holds ``owned + pad`` local rows per layer and builds the buffer only when
+    # at least MIN_SCRATCH_ROWS (2) rows stay free, i.e. ``resident_rows <= E - 2``.  A card that fits its WHOLE share (plan
+    # resident fraction 1.000, e.g. 4 cards) would be proposed a value the launcher refuses, so every rank's fraction is capped at
+    # the largest fraction that still builds the buffer (the same count as ``expert_map.unbuilt_platztausch_buffers``; no reserve:
+    # the two scratch rows are the runtime's own minimum, not a VRAM margin).
+    from sglang.srt.planner.expert_residency import largest_fraction_for_rows
+
+    fr_plan = [round(math.floor(f * 1000.0) / 1000.0, 3) for f in plan.resident_fraction]
+    fr_cap: List[Optional[float]] = []
+    for o in plan.owned:
+        e = int(o) + int(geom.pad_experts_per_rank)
+        fr_cap.append(largest_fraction_for_rows(local_experts=e, scratch_rows=0, max_rows=e) if e > 0 else None)
+    fr = [min(f, c) if c is not None else f for f, c in zip(fr_plan, fr_cap)]
+    capped = [i for i, (f, g) in enumerate(zip(fr_plan, fr)) if g < f]
+    if capped:
+        unb.append("residenter Anteil von Rang %s auf den Platztausch-Puffer begrenzt (Loeser: %s, Grenze: %s): ein Rang mit weniger als "
+                   "2 Scratch-Zeilen baut keinen Puffer, der Launcher verweigert das als W120" % (
+                       ",".join(str(i) for i in capped), ",".join("%.3f" % fr_plan[i] for i in capped),
+                       ",".join("%.3f" % fr[i] for i in capped)))
     return {"ok": True, "error": "", "role": ["host"] + ["worker"] * (n - 1), "tp_ratio": [1] + [0] * (n - 1),
             "moe_ratio": [int(o) for o in plan.owned],
-            "fr": [round(math.floor(f * 1000.0) / 1000.0, 3) for f in plan.resident_fraction],
+            "fr": fr, "fr_solver": fr_plan, "fr_cap": fr_cap,
             "capacity": [int(c) for c in plan.capacity], "owned": [int(o) for o in plan.owned],
             "host_breakdown": dict(plan.host_breakdown), "unbelegt": unb}
 
