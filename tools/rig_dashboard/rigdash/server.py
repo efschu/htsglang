@@ -534,15 +534,16 @@ def edition_page(html: str, edition: str, editor_only: bool = False) -> str:
         i = b + len(DEV_END)
     page = "".join(out)
     # Auftrag 1995: im Docker-Image laeuft die Release-Ausgabe als reiner Profil-Editor (--editor-only): die Seite zeigt nur den Reiter Profil
-    # the language attribute of the shipped page is "de" or "en" (index.html is being translated): match either, keep it as it is
-    for lang in ("de", "en"):
-        tag = '<html lang="%s">' % lang
-        if tag in page:
-            page = page.replace(tag, '<html lang="%s" data-edition="release"%s>' % (lang, ' data-editor-only="1"' if editor_only else ""), 1)
+    # the page text is English since 07.10. (lang="en", "Rig dashboard"); the German markers stay accepted
+    edition_attr = ' data-edition="release"%s>' % (' data-editor-only="1"' if editor_only else "")
+    for lang_tag in ('<html lang="en">', '<html lang="de">'):
+        if lang_tag in page:
+            page = page.replace(lang_tag, lang_tag[:-1] + edition_attr, 1)
             break
-    return (page
-                .replace("<title>Rig-Dashboard</title>", "<title>fLLiper Dashboard</title>", 1)
-                .replace('<h1 id="title">Rig-Dashboard</h1>', '<h1 id="title">fLLiper Dashboard</h1>', 1))
+    for old_t in ("Rig dashboard", "Rig-Dashboard"):
+        page = page.replace("<title>%s</title>" % old_t, "<title>fLLiper Dashboard</title>", 1)
+        page = page.replace('<h1 id="title">%s</h1>' % old_t, '<h1 id="title">fLLiper Dashboard</h1>', 1)
+    return page
 
 
 #: per boot, what names the image, branch, profile or env (NF-Operator 30.09.: Startform, Image-SHAs,

@@ -20,11 +20,11 @@
 
   const p2 = (n) => String(n).padStart(2, "0");
   const hms = (t) => { const d = new Date(t * 1000); return p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds()); };
-  const dur = (s) => s < 90 ? Math.round(s) + " s" : s < 5400 ? (s / 60).toFixed(1).replace(".", ",") + " min" : (s / 3600).toFixed(1).replace(".", ",") + " h";
+  const dur = (s) => s < 90 ? Math.round(s) + " s" : s < 5400 ? (s / 60).toFixed(1) + " min" : (s / 3600).toFixed(1) + " h";
 
   function emit() {
     bar();
-    subs.forEach((f) => { try { f(api.get()); } catch (e) { /* ein Leser darf die anderen nicht stoppen */ } });
+    subs.forEach((f) => { try { f(api.get()); } catch (e) { /* one reader must not stop the others */ } });
   }
   const api = window.RigZoom = {
     get: () => (stack.length ? stack[stack.length - 1].slice() : null),
@@ -58,14 +58,14 @@
       barEl.id = "zoombar";
       barEl.setAttribute("role", "region");
       barEl.setAttribute("aria-label", "Zoom");
-      barEl.innerHTML = '<span class="zb-txt"></span> <button type="button" class="zb-back">Zoom zurück</button> <button type="button" class="zb-reset">ganz heraus</button>';
+      barEl.innerHTML = '<span class="zb-txt"></span> <button type="button" class="zb-back">Zoom back</button> <button type="button" class="zb-reset">zoom out fully</button>';
       barEl.querySelector(".zb-back").addEventListener("click", () => api.back());
       barEl.querySelector(".zb-reset").addEventListener("click", () => api.reset());
       document.body.appendChild(barEl);
     }
     const z = api.get();
     barEl.hidden = !z;
-    if (z) barEl.querySelector(".zb-txt").textContent = `Zoom ${hms(z[0])} – ${hms(z[1])} (${dur(z[1] - z[0])})` + (stack.length > 1 ? ` · Stufe ${stack.length}` : "") + (loadingNow ? " · lädt …" : "");
+    if (z) barEl.querySelector(".zb-txt").textContent = `Zoom ${hms(z[0])} – ${hms(z[1])} (${dur(z[1] - z[0])})` + (stack.length > 1 ? ` · level ${stack.length}` : "") + (loadingNow ? " · loading …" : "");
   }
 
   // ---------------------------------------------------------------- Ziehen (Maus, Stift, Touch)
