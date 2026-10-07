@@ -1,0 +1,5798 @@
+{
+ "needs_translation": {
+  "AKTUELL_FORMATE": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 3
+   },
+   "unmapped_parts": [
+    "aktuell",
+    "formate"
+   ]
+  },
+  "ANKER_FREMD": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "name": 6
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_anker_2013.py": 4,
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "unmapped_parts": [
+    "fremd"
+   ]
+  },
+  "ANKER_PROBLEM": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "name": 6
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 3,
+    "test/registered/unit/weg2/test_kantenkatalog_anker_2013.py": 2,
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "unmapped_parts": [
+    "problem"
+   ]
+  },
+  "Abdeckung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "unmapped_parts": [
+    "abdeckung"
+   ]
+  },
+  "AktivCase": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "aktiv"
+   ]
+  },
+  "Ansicht": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 6,
+   "js_files": 2,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kvheads_1005.py": 1
+   },
+   "unmapped_parts": [
+    "ansicht"
+   ]
+  },
+  "Arbeitspaket": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py": 1
+   },
+   "unmapped_parts": [
+    "arbeitspaket"
+   ]
+  },
+  "AuftragG": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "unmapped_parts": [
+    "auftrag"
+   ]
+  },
+  "BALKEN_FORM": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 2,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   },
+   "unmapped_parts": [
+    "form"
+   ]
+  },
+  "BALKEN_SCHEMA": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/planner/profile_couplings.py": 2
+   },
+   "unmapped_parts": [
+    "schema"
+   ]
+  },
+  "BALKEN_SEGMENTS": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/planner/profile_couplings.py": 3
+   },
+   "unmapped_parts": [
+    "segments"
+   ]
+  },
+  "Chipsatz": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   },
+   "unmapped_parts": [
+    "chipsatz"
+   ]
+  },
+  "Darstellung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 8,
+   "js_files": 2,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   },
+   "unmapped_parts": [
+    "darstellung"
+   ]
+  },
+  "F1ChipNachNeuPruefen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "chip",
+    "nach",
+    "neu"
+   ]
+  },
+  "F1LaufberichtOhneLauf": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "laufbericht"
+   ]
+  },
+  "F6NieGehtWasNichtBeurteiltIst": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "nie",
+    "was",
+    "beurteilt",
+    "ist"
+   ]
+  },
+  "F7ChipForTabelle": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "chip"
+   ]
+  },
+  "GegenLaufzeit": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kvheads_1005.py": 1
+   },
+   "unmapped_parts": [
+    "laufzeit"
+   ]
+  },
+  "HwProfilBlocks": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_issue_laufbericht_1006.py": 1
+   },
+   "unmapped_parts": [
+    "blocks"
+   ]
+  },
+  "KREUZ_ACHSEN": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "name": 6
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 3,
+    "tools/rig_dashboard/rigdash/features_update.py": 3
+   },
+   "unmapped_parts": [
+    "kreuz",
+    "achsen"
+   ]
+  },
+  "KREUZ_STATUS": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 2,
+    "tools/rig_dashboard/rigdash/features_update.py": 2
+   },
+   "unmapped_parts": [
+    "kreuz",
+    "status"
+   ]
+  },
+  "KatalogForm": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "unmapped_parts": [
+    "form"
+   ]
+  },
+  "MATRIX_TIEFE": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 2,
+    "tools/rig_dashboard/rigdash/features_update.py": 2
+   },
+   "unmapped_parts": [
+    "matrix"
+   ]
+  },
+  "NachzugA14C5Tests": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_ipcfields_0929.py": 1
+   },
+   "unmapped_parts": [
+    "nachzug",
+    "tests"
+   ]
+  },
+  "OBERGRENZE": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 12,
+   "js_files": 1,
+   "top_files": {
+    "test/registered/unit/planner/test_profile_couplings_1431.py": 1
+   },
+   "unmapped_parts": [
+    "obergrenze"
+   ]
+  },
+  "OFFEN": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 2
+   },
+   "unmapped_parts": [
+    "offen"
+   ]
+  },
+  "ORIGIN_NUTZER": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "name": 5
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_json.py": 5
+   },
+   "unmapped_parts": [
+    "nutzer"
+   ]
+  },
+  "Offen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "unmapped_parts": [
+    "offen"
+   ]
+  },
+  "PRODUKT_STATUS": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "name": 6
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 4,
+    "tools/rig_dashboard/rigdash/features_update.py": 2
+   },
+   "unmapped_parts": [
+    "produkt",
+    "status"
+   ]
+  },
+  "ProduktCase": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "produkt"
+   ]
+  },
+  "ProfilEditor": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 28,
+   "kinds": {
+    "name": 28
+   },
+   "tree_files": 14,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 6,
+    "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py": 5,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 4
+   },
+   "unmapped_parts": [
+    "editor"
+   ]
+  },
+  "ProfilJsBars": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_ui_fixes_1979.py": 1
+   },
+   "unmapped_parts": [
+    "bars"
+   ]
+  },
+  "RE_POOLEND": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/kartenplan_build/records.py": 2
+   },
+   "unmapped_parts": [
+    "poolend"
+   ]
+  },
+  "RIGDASH_PROFIL_TREE": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/server.py": 1
+   },
+   "unmapped_parts": [
+    "rigdash"
+   ]
+  },
+  "SGLANG_WEG2_DEGEN_DETECT": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "json_key": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "weg2",
+    "degen"
+   ]
+  },
+  "SGLANG_WEG2_DEGEN_DUMP_DIR": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 1,
+    "json_key": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog_curated.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "weg2",
+    "degen",
+    "dump",
+    "dir"
+   ]
+  },
+  "SGLANG_WEG2_DEGEN_DUMP_LONG": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 1,
+    "json_key": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog_curated.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "weg2",
+    "degen",
+    "dump"
+   ]
+  },
+  "SGLANG_WEG2_DEGEN_DUMP_MAX": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "json_key": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "weg2",
+    "degen",
+    "dump"
+   ]
+  },
+  "SGLANG_WEG2_DEGEN_MIN_SPAN": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 1,
+    "json_key": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog_curated.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "weg2",
+    "degen",
+    "min",
+    "span"
+   ]
+  },
+  "SGLANG_WEG2_DEGEN_STOP": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 1,
+    "json_key": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog_curated.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "weg2",
+    "degen"
+   ]
+  },
+  "STUECKELUNG_FLOOR_MIB": {
+   "heads": [
+    "scan_27b"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_weg2_q694_extend_cap_flip_1003.py": 2
+   },
+   "unmapped_parts": [
+    "stueckelung",
+    "floor"
+   ]
+  },
+  "Spekulation": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "spekulation"
+   ]
+  },
+  "TestEingaben": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "test",
+    "eingaben"
+   ]
+  },
+  "TestExternerDraft": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "test",
+    "externer",
+    "draft"
+   ]
+  },
+  "TestFixtureAbgleich": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   },
+   "unmapped_parts": [
+    "test",
+    "abgleich"
+   ]
+  },
+  "TestGateUndAblehnung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   },
+   "unmapped_parts": [
+    "test",
+    "gate"
+   ]
+  },
+  "TestKatalog": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   },
+   "unmapped_parts": [
+    "test"
+   ]
+  },
+  "TestKontextTreiberBudget": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "test",
+    "budget"
+   ]
+  },
+  "TestLaptopSynthetisch": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "test",
+    "laptop",
+    "synthetisch"
+   ]
+  },
+  "TestParseNichtVerfuegbar": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "test",
+    "parse"
+   ]
+  },
+  "TestRegeln": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "test",
+    "regeln"
+   ]
+  },
+  "VorlaufSplit27B": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_vorlauf_split_1002.py": 1
+   },
+   "unmapped_parts": [
+    "split27"
+   ]
+  },
+  "VorlaufSplitNF": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_vorlauf_split_1002.py": 1
+   },
+   "unmapped_parts": [
+    "split"
+   ]
+  },
+  "Vorrang": {
+   "heads": [
+    "scan_27b"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 9,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_weg2_q694_extend_cap_flip_1003.py": 1,
+    "test/registered/unit/weg2/test_weg2_q694b_extend_rate_generic_1003.py": 1,
+    "test/registered/unit/weg2/test_weg2_q710_extend_cap_floor_1003.py": 1
+   },
+   "unmapped_parts": [
+    "vorrang"
+   ]
+  },
+  "WachOhneArbeitTests": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_rigdash.py": 1
+   },
+   "unmapped_parts": [
+    "wach",
+    "arbeit",
+    "tests"
+   ]
+  },
+  "ZIELE_CHOICE": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 2
+   },
+   "unmapped_parts": [
+    "ziele"
+   ]
+  },
+  "ZIELE_CHOICE_EINZEL": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 2
+   },
+   "unmapped_parts": [
+    "ziele"
+   ]
+  },
+  "ZIELE_INT": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 2,
+    "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py": 2
+   },
+   "unmapped_parts": [
+    "ziele"
+   ]
+  },
+  "ZIELE_INT_EINZEL": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 2
+   },
+   "unmapped_parts": [
+    "ziele"
+   ]
+  },
+  "ZIEL_UNBEKANNT": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 2
+   },
+   "unmapped_parts": [
+    "unbekannt"
+   ]
+  },
+  "Z_UNBELEGT": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 4
+   },
+   "unmapped_parts": [
+    "unbelegt"
+   ]
+  },
+  "Zwilling": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1
+   },
+   "unmapped_parts": [
+    "zwilling"
+   ]
+  },
+  "_ANKER_REPO_FILE": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 3
+   },
+   "unmapped_parts": [
+    "",
+    "file"
+   ]
+  },
+  "_AUSGANG_TEXT": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 3
+   },
+   "unmapped_parts": [
+    "",
+    "ausgang",
+    "text"
+   ]
+  },
+  "_KREUZ_KEYS": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 8,
+   "kinds": {
+    "name": 8
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 8
+   },
+   "unmapped_parts": [
+    "",
+    "kreuz"
+   ]
+  },
+  "_OHNE_LAUF": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 2
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_aktuell": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 3
+   },
+   "unmapped_parts": [
+    "",
+    "aktuell"
+   ]
+  },
+  "_beleg": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 3
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_belegt_am": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 3
+   },
+   "unmapped_parts": [
+    "belegt"
+   ],
+   "note": "ambiguous part (occupied vs verified)"
+  },
+  "_dry_ohne_lauf": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 2
+   },
+   "unmapped_parts": [
+    "",
+    "dry"
+   ]
+  },
+  "_find_produkt": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 8,
+   "kinds": {
+    "name": 8
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 8
+   },
+   "unmapped_parts": [
+    "",
+    "find",
+    "produkt"
+   ]
+  },
+  "_form_a_extend_set_riegel": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/managers/test_nf_form_a_chunk_width_follow_h105f.py": 1
+   },
+   "unmapped_parts": [
+    "",
+    "form",
+    "set"
+   ]
+  },
+  "_found_from_verdikt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 2
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_inventar_for": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 3
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_inventar_key": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 3
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_karte": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "name": 5
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_hw_ap2b_1006.py": 5
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_naeherung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/kartenplan.py": 2
+   },
+   "unmapped_parts": [
+    "",
+    "naeherung"
+   ]
+  },
+  "_profil_get": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/server.py": 2
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_profil_guard": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/server.py": 3
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_profil_issue": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/server.py": 2
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_profil_post": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/server.py": 2
+   },
+   "unmapped_parts": [
+    "",
+    "post"
+   ]
+  },
+  "_profil_recompute": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/server.py": 2
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_riegel": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 14,
+   "kinds": {
+    "name": 14
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/managers/test_nf_form_a_chunk_width_follow_h105f.py": 14
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_schalter": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 2
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_single_werte": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 2
+   },
+   "unmapped_parts": [
+    "",
+    "single"
+   ]
+  },
+  "_werte": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 2
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "_ziele": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "name": 5
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 3,
+    "tools/rig_dashboard/rigdash/profil.py": 2
+   },
+   "unmapped_parts": [
+    "",
+    "ziele"
+   ]
+  },
+  "_zweig": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 3
+   },
+   "unmapped_parts": [
+    ""
+   ]
+  },
+  "abgenommen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 9,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "unmapped_parts": [
+    "abgenommen"
+   ]
+  },
+  "abweichend": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 7,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/hwprofil.py": 1
+   },
+   "unmapped_parts": [
+    "abweichend"
+   ]
+  },
+  "achsen": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 8,
+   "kinds": {
+    "name": 8
+   },
+   "tree_files": 2,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 8
+   },
+   "unmapped_parts": [
+    "achsen"
+   ]
+  },
+  "aktiv": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "name": 2,
+    "strkey": 3
+   },
+   "tree_files": 20,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 3,
+    "tools/rig_dashboard/rigdash/features_update.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "aktiv"
+   ]
+  },
+  "aktuell": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 19,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/features_update.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "aktuell"
+   ]
+  },
+  "annahmen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 11,
+   "kinds": {
+    "name": 9,
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 10,
+    "test/registered/unit/weg2/test_planer_ape_dual_1006.py": 1
+   },
+   "unmapped_parts": [
+    "annahmen"
+   ]
+  },
+  "aufloesung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "strkey": 4,
+    "json_key": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1,
+    "test/registered/unit/weg2/test_kantenkatalog_anker_2013.py": 1
+   },
+   "unmapped_parts": [
+    "aufloesung"
+   ]
+  },
+  "auftrag": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "json_key": 1
+   },
+   "tree_files": 8,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/kantenkatalog_1004.json": 1
+   },
+   "unmapped_parts": [
+    "auftrag"
+   ]
+  },
+  "aus_begruendung": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 3,
+    "name": 1
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 2,
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "aus",
+    "begruendung"
+   ]
+  },
+  "ausserhalb_budget": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 4,
+   "js_files": 1,
+   "top_files": {
+    "python/sglang/srt/planner/profile_couplings.py": 1,
+    "test/registered/unit/planner/test_profile_balken_aph2_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_balken_aph2_1006.py": 1
+   },
+   "unmapped_parts": [
+    "budget"
+   ]
+  },
+  "baustein_ids": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 4
+   },
+   "unmapped_parts": [
+    "baustein",
+    "ids"
+   ]
+  },
+  "bausteine": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 7,
+   "kinds": {
+    "name": 4,
+    "strkey": 3
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 3,
+    "tools/rig_dashboard/rigdash/features_update.py": 3,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "bausteine"
+   ]
+  },
+  "bedarf_mib": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1,
+    "test/registered/unit/weg2/test_planer_ape_dual_1006.py": 1
+   },
+   "unmapped_parts": [
+    "bedarf"
+   ]
+  },
+  "begruendung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "name": 2,
+    "strkey": 4
+   },
+   "tree_files": 6,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 3,
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "begruendung"
+   ]
+  },
+  "beleg_aufloesung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 2,
+    "json_key": 1
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kantenkatalog_anker_2013.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "aufloesung"
+   ]
+  },
+  "beleg_aufloesung_baeume": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 3,
+    "json_key": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_profile_catalog_1003.py": 1,
+    "test/registered/unit/weg2/test_profile_catalog_union_1005.py": 1
+   },
+   "unmapped_parts": [
+    "aufloesung"
+   ]
+  },
+  "belegt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "strkey": 5,
+    "json_key": 1
+   },
+   "tree_files": 76,
+   "js_files": 6,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1,
+    "test/registered/unit/weg2/test_kantenkatalog_anker_2013.py": 1
+   },
+   "unmapped_parts": [
+    "belegt"
+   ],
+   "note": "ambiguous part (occupied vs verified)"
+  },
+  "belegt_am": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "strkey": 3,
+    "name": 2
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 3,
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "belegt"
+   ],
+   "note": "ambiguous part (occupied vs verified)"
+  },
+  "belegt_ts": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 8,
+   "kinds": {
+    "name": 8
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 6,
+    "tools/rig_dashboard/rigdash/features_update.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "belegt"
+   ],
+   "note": "ambiguous part (occupied vs verified)"
+  },
+  "beschreibung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "json_key": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/kantenkatalog_1004.json": 1
+   },
+   "unmapped_parts": [
+    "beschreibung"
+   ]
+  },
+  "block_titel": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "unmapped_parts": [
+    "block"
+   ]
+  },
+  "block_zeilen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "unmapped_parts": [
+    "block"
+   ]
+  },
+  "budget_herkunft": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 4,
+   "js_files": 1,
+   "top_files": {
+    "python/sglang/srt/planner/profile_couplings.py": 1,
+    "test/registered/unit/planner/test_profile_balken_aph2_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_balken_aph2_1006.py": 1
+   },
+   "unmapped_parts": [
+    "budget",
+    "herkunft"
+   ]
+  },
+  "calc_vokabular": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "json_key": 1,
+    "strkey": 1
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/kantenkatalog_1004.json": 1,
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "unmapped_parts": [
+    "vokabular"
+   ]
+  },
+  "d_ruhe_mib": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1,
+    "test/registered/unit/weg2/test_planer_ape_dual_1006.py": 1
+   },
+   "unmapped_parts": [
+    "ruhe"
+   ]
+  },
+  "dryAbsturz": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "dry"
+   ]
+  },
+  "dryGeht": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "dry"
+   ]
+  },
+  "dry_from_vorschlag": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 2,
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 2
+   },
+   "unmapped_parts": [
+    "dry"
+   ]
+  },
+  "durchgelassen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "strkey": 3,
+    "name": 2
+   },
+   "tree_files": 11,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 3,
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": 1
+   },
+   "unmapped_parts": [
+    "durchgelassen"
+   ]
+  },
+  "eichung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1
+   },
+   "unmapped_parts": [
+    "eichung"
+   ]
+  },
+  "eindeutig": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 1,
+    "json_key": 1,
+    "json_value": 1
+   },
+   "tree_files": 11,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 2,
+    "test/registered/unit/weg2/test_profile_catalog_union_1005.py": 1
+   },
+   "unmapped_parts": [
+    "eindeutig"
+   ]
+  },
+  "einfach": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "strkey": 4,
+    "json_value": 1
+   },
+   "tree_files": 22,
+   "js_files": 4,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/kartenplan.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1,
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   },
+   "unmapped_parts": [
+    "einfach"
+   ]
+  },
+  "erfuellt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 9,
+   "kinds": {
+    "name": 7,
+    "strkey": 2
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 8,
+    "test/registered/unit/weg2/test_planer_ape_dual_1006.py": 1
+   },
+   "unmapped_parts": [
+    "erfuellt"
+   ]
+  },
+  "ergaenzung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "test/registered/unit/weg2/test_planer_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "ergaenzung"
+   ]
+  },
+  "erst_erfasst": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/hwprofil.py": 1
+   },
+   "unmapped_parts": [
+    "erst",
+    "erfasst"
+   ]
+  },
+  "etikett": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 4
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1,
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_formen_1006.py": 1
+   },
+   "unmapped_parts": [
+    "etikett"
+   ]
+  },
+  "extern_fehlt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "unmapped_parts": [
+    "extern"
+   ]
+  },
+  "fasst": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 11,
+   "js_files": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apc_propose_1006.py": 1
+   },
+   "unmapped_parts": [
+    "fasst"
+   ]
+  },
+  "fehlgriffe": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_oracle.py": 1
+   },
+   "unmapped_parts": [
+    "fehlgriffe"
+   ]
+  },
+  "fit_grund": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 4
+   },
+   "unmapped_parts": [
+    "fit"
+   ]
+  },
+  "flip_zeit": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "name": 3,
+    "strkey": 3
+   },
+   "tree_files": 4,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/server.py": 3,
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_1006.py": 2,
+    "tools/rig_dashboard/rigdash/features.py": 1
+   },
+   "unmapped_parts": [
+    "flip",
+    "zeit"
+   ]
+  },
+  "forceWiderspruch": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "force",
+    "widerspruch"
+   ]
+  },
+  "force_satz": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "unmapped_parts": [
+    "force",
+    "satz"
+   ]
+  },
+  "geladen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 3,
+    "json_key": 1
+   },
+   "tree_files": 34,
+   "js_files": 3,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "geladen"
+   ]
+  },
+  "genannt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 10,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "genannt"
+   ]
+  },
+  "gesetzt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 60,
+   "js_files": 4,
+   "top_files": {
+    "python/sglang/srt/weg2/propose.py": 1
+   },
+   "unmapped_parts": [
+    "gesetzt"
+   ]
+  },
+  "gewinn": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/features_update.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "gewinn"
+   ]
+  },
+  "gleichzeitig": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 36,
+   "js_files": 3,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_dual_ehrlich_1003.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_dual_overlap_1003.py": 1
+   },
+   "unmapped_parts": [
+    "gleichzeitig"
+   ]
+  },
+  "groesse": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_oracle.py": 1
+   },
+   "unmapped_parts": [
+    "groesse"
+   ]
+  },
+  "halbfertig": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "halbfertig"
+   ]
+  },
+  "hand_posten_nvfp4_fp8": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 4
+   },
+   "unmapped_parts": [
+    "hand",
+    "fp8"
+   ]
+  },
+  "ignoriert": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 13,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/planner/test_profile_balken_aph2_1006.py": 1
+   },
+   "unmapped_parts": [
+    "ignoriert"
+   ]
+  },
+  "image_aber_aus": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 3,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "image",
+    "aus"
+   ]
+  },
+  "kanten_belegt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 2,
+    "json_key": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "belegt"
+   ],
+   "note": "ambiguous part (occupied vs verified)"
+  },
+  "kein_dokument": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 2,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "dokument"
+   ]
+  },
+  "kein_instrument": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 4,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/features_update.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "instrument"
+   ]
+  },
+  "klemme": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 2,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_planer.py": 1
+   },
+   "unmapped_parts": [
+    "klemme"
+   ]
+  },
+  "kontext_treiber_herkunft": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 1,
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "herkunft"
+   ]
+  },
+  "kontext_treiber_standard": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 1,
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "standard"
+   ]
+  },
+  "kopplung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1
+   },
+   "unmapped_parts": [
+    "kopplung"
+   ]
+  },
+  "kreuz": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 1
+   },
+   "unmapped_parts": [
+    "kreuz"
+   ]
+  },
+  "kreuz_achsen": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 3,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/features_update.py": 1
+   },
+   "unmapped_parts": [
+    "kreuz",
+    "achsen"
+   ]
+  },
+  "kreuz_key": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "name": 6
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 3,
+    "tools/rig_dashboard/rigdash/features.py": 2,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "kreuz"
+   ]
+  },
+  "laengen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": 1
+   },
+   "unmapped_parts": [
+    "laengen"
+   ]
+  },
+  "leerlauf": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 4
+   },
+   "tree_files": 8,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_1006.py": 1,
+    "tools/rig_dashboard/rigdash/history.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_activity_0930.py": 1
+   },
+   "unmapped_parts": [
+    "leerlauf"
+   ]
+  },
+  "lesbar": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 41,
+   "js_files": 4,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "unmapped_parts": [
+    "lesbar"
+   ]
+  },
+  "maschinell": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_json.py": 1
+   },
+   "unmapped_parts": [
+    "maschinell"
+   ]
+  },
+  "metrik": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "strkey": 3,
+    "name": 2
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 3,
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "metrik"
+   ]
+  },
+  "nachGeht": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "nach"
+   ]
+  },
+  "nachVerweigert": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "nach"
+   ]
+  },
+  "nachlauf_d_extend_ms": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_flipview_1001.py": 1
+   },
+   "unmapped_parts": [
+    "nachlauf"
+   ]
+  },
+  "nachlauf_ms": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 4
+   },
+   "tree_files": 11,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_1006.py": 1,
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_flipview_1001.py": 1
+   },
+   "unmapped_parts": [
+    "nachlauf"
+   ]
+  },
+  "naeherung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 3,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/kartenplan.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   },
+   "unmapped_parts": [
+    "naeherung"
+   ]
+  },
+  "neu_erfasst": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/hwprofil.py": 1
+   },
+   "unmapped_parts": [
+    "neu",
+    "erfasst"
+   ]
+  },
+  "nicht_uebernommen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   },
+   "unmapped_parts": [
+    "uebernommen"
+   ]
+  },
+  "notiz": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 3,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/kvheads.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_kvheads_1005.py": 1
+   },
+   "unmapped_parts": [
+    "notiz"
+   ]
+  },
+  "notizen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 4
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_formen_1006.py": 1,
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "unmapped_parts": [
+    "notizen"
+   ]
+  },
+  "nur_gespeichert": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/hwprofil.py": 1
+   },
+   "unmapped_parts": [
+    "nur",
+    "gespeichert"
+   ]
+  },
+  "nutzer": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 12,
+   "js_files": 2,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "unmapped_parts": [
+    "nutzer"
+   ]
+  },
+  "obergrenze": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/planner/profile_couplings.py": 2
+   },
+   "unmapped_parts": [
+    "obergrenze"
+   ]
+  },
+  "offen": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 26,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1
+   },
+   "unmapped_parts": [
+    "offen"
+   ]
+  },
+  "ohne_force": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": 1
+   },
+   "unmapped_parts": [
+    "force"
+   ]
+  },
+  "okGenannt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "genannt"
+   ]
+  },
+  "plast_conly": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1
+   },
+   "unmapped_parts": [
+    "plast",
+    "conly"
+   ]
+  },
+  "plast_ext": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/activity.py": 1,
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_depth_1002.py": 1
+   },
+   "unmapped_parts": [
+    "plast",
+    "ext"
+   ]
+  },
+  "plast_gpu": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/activity.py": 1,
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_depth_1002.py": 1
+   },
+   "unmapped_parts": [
+    "plast"
+   ]
+  },
+  "plast_new": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_depth_1002.py": 1
+   },
+   "unmapped_parts": [
+    "plast"
+   ]
+  },
+  "plast_own": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/activity.py": 1,
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_depth_1002.py": 1
+   },
+   "unmapped_parts": [
+    "plast",
+    "own"
+   ]
+  },
+  "plast_t": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "strkey": 5
+   },
+   "tree_files": 6,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/activity.py": 1,
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_depth_1002.py": 1
+   },
+   "unmapped_parts": [
+    "plast"
+   ]
+  },
+  "pool_floor_pflicht": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1,
+    "test/registered/unit/weg2/test_planer_ape_dual_1006.py": 1
+   },
+   "unmapped_parts": [
+    "pool",
+    "floor"
+   ]
+  },
+  "pool_geeicht": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1,
+    "test/registered/unit/weg2/test_planer_ape_dual_1006.py": 1
+   },
+   "unmapped_parts": [
+    "pool",
+    "geeicht"
+   ]
+  },
+  "probleme": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   },
+   "unmapped_parts": [
+    "probleme"
+   ]
+  },
+  "produkt": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 12,
+   "kinds": {
+    "name": 9,
+    "strkey": 3
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 9,
+    "tools/rig_dashboard/rigdash/features_update.py": 2,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "produkt"
+   ]
+  },
+  "produkt_view": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 2,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 2
+   },
+   "unmapped_parts": [
+    "produkt"
+   ]
+  },
+  "profil_kommentar": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 7,
+   "js_files": 1,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_json.py": 1
+   },
+   "unmapped_parts": [
+    "kommentar"
+   ]
+  },
+  "profil_panel": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_release_edition_1984.py": 2
+   },
+   "unmapped_parts": [
+    "panel"
+   ]
+  },
+  "profil_planer": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "name": 4
+   },
+   "tree_files": 9,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_dual_linie_1007.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py": 1
+   },
+   "unmapped_parts": [
+    "planer"
+   ]
+  },
+  "profil_text_sha256": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 1
+   },
+   "unmapped_parts": [
+    "text"
+   ]
+  },
+  "propOhneAusgang": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "ausgang"
+   ]
+  },
+  "prozess": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 9,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/server.py": 1
+   },
+   "unmapped_parts": [
+    "prozess"
+   ]
+  },
+  "regeln": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1,
+    "test/registered/unit/weg2/test_planer_ape_dual_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   },
+   "unmapped_parts": [
+    "regeln"
+   ]
+  },
+  "rel_abweichend": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 2,
+    "json_key": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "abweichend"
+   ]
+  },
+  "rel_vokabular": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "json_key": 1,
+    "strkey": 1
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/kantenkatalog_1004.json": 1,
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "unmapped_parts": [
+    "vokabular"
+   ]
+  },
+  "reserve_bedarf_mib": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 4
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_formen_1006.py": 1,
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "reserve",
+    "bedarf"
+   ]
+  },
+  "reserve_gegeben_mib": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 1,
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "reserve",
+    "gegeben"
+   ]
+  },
+  "reserve_herkunft": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 1,
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "reserve",
+    "herkunft"
+   ]
+  },
+  "rolle": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 1,
+    "strkey": 2
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 2,
+    "tools/rig_dashboard/rigdash/profil_planer.py": 1
+   },
+   "unmapped_parts": [
+    "rolle"
+   ]
+  },
+  "run_verdikt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "tools/rig_dashboard/kartenplan_build/oracle_worker.py": 1
+   },
+   "unmapped_parts": [
+    "run"
+   ]
+  },
+  "satz": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 15,
+   "kinds": {
+    "json_key": 2,
+    "strkey": 9,
+    "name": 4
+   },
+   "tree_files": 15,
+   "js_files": 2,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/kvheads.py": 5,
+    "python/sglang/srt/weg2/kantenkatalog_1004.json": 1,
+    "python/sglang/srt/weg2/profile_catalog.py": 1
+   },
+   "unmapped_parts": [
+    "satz"
+   ]
+  },
+  "satz_quelle": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "strkey": 4,
+    "json_key": 1
+   },
+   "tree_files": 8,
+   "js_files": 1,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog_curated.py": 1,
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1,
+    "test/registered/unit/weg2/test_profile_erklaert_1005.py": 1
+   },
+   "unmapped_parts": [
+    "satz"
+   ]
+  },
+  "single_je_wert": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 2
+   },
+   "unmapped_parts": [
+    "single"
+   ]
+  },
+  "single_verdikt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 2
+   },
+   "unmapped_parts": [
+    "single"
+   ]
+  },
+  "spalte": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 1,
+    "strkey": 1
+   },
+   "tree_files": 3,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1,
+    "tools/rig_dashboard/rigdash/features_update.py": 1
+   },
+   "unmapped_parts": [
+    "spalte"
+   ]
+  },
+  "startWiderspruch": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "start",
+    "widerspruch"
+   ]
+  },
+  "statisch_budget_mib": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 4
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_formen_1006.py": 1,
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "statisch",
+    "budget"
+   ]
+  },
+  "statisch_summe_mib": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 1,
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "statisch"
+   ]
+  },
+  "stufe_schichten": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1
+   },
+   "unmapped_parts": [
+    "schichten"
+   ]
+  },
+  "stufen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_planer.py": 1
+   },
+   "unmapped_parts": [
+    "stufen"
+   ]
+  },
+  "synthetische": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 8,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 1
+   },
+   "unmapped_parts": [
+    "synthetische"
+   ]
+  },
+  "table_unbegrenzt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 2,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_planer.py": 1
+   },
+   "unmapped_parts": [
+    "unbegrenzt"
+   ]
+  },
+  "teilweise": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 7,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 1
+   },
+   "unmapped_parts": [
+    "teilweise"
+   ]
+  },
+  "texte": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 2,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_planer.py": 1
+   },
+   "unmapped_parts": [
+    "texte"
+   ]
+  },
+  "ueberblick": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 2,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_1006.py": 2
+   },
+   "unmapped_parts": [
+    "ueberblick"
+   ]
+  },
+  "uebernommen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 15,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1,
+    "test/registered/unit/weg2/test_planer_ape_dual_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   },
+   "unmapped_parts": [
+    "uebernommen"
+   ]
+  },
+  "uebersprungen_ohne_von": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 2,
+    "json_key": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "uebersprungen"
+   ]
+  },
+  "unassigned_bausteine": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 2,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "bausteine"
+   ]
+  },
+  "unbekannt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 4
+   },
+   "tree_files": 46,
+   "js_files": 3,
+   "top_files": {
+    "test/registered/unit/planner/test_profile_couplings_1431.py": 1,
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "unbekannt"
+   ]
+  },
+  "unbekanntes_ziel": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "unmapped_parts": [
+    "unbekanntes"
+   ]
+  },
+  "ungeprueft": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 4
+   },
+   "tree_files": 9,
+   "js_files": 2,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_formen_1006.py": 1,
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "unmapped_parts": [
+    "ungeprueft"
+   ]
+  },
+  "ungueltig": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 1
+   },
+   "unmapped_parts": [
+    "ungueltig"
+   ]
+  },
+  "validate_produkt": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "name": 3
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 3
+   },
+   "unmapped_parts": [
+    "produkt"
+   ]
+  },
+  "veraltet": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 4
+   },
+   "tree_files": 21,
+   "js_files": 3,
+   "top_files": {
+    "test/registered/unit/weg2/test_profile_catalog_union_1005.py": 1,
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/features_update.py": 1
+   },
+   "unmapped_parts": [
+    "veraltet"
+   ]
+  },
+  "verantwortlich": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 1,
+    "name": 1
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/features_update.py": 1
+   },
+   "unmapped_parts": [
+    "verantwortlich"
+   ]
+  },
+  "verdikt_art": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 1
+   },
+   "unmapped_parts": [
+    "art"
+   ]
+  },
+  "verifiziert": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   },
+   "unmapped_parts": [
+    "verifiziert"
+   ]
+  },
+  "verlauf": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 12,
+   "js_files": 3,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_1006.py": 2
+   },
+   "unmapped_parts": [
+    "verlauf"
+   ]
+  },
+  "verschmolzen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 3,
+    "json_key": 1
+   },
+   "tree_files": 5,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "verschmolzen"
+   ]
+  },
+  "vielleicht": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 3,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "vielleicht"
+   ]
+  },
+  "vorlauf_split": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 2,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/ipcboot.py": 2
+   },
+   "unmapped_parts": [
+    "split"
+   ]
+  },
+  "vorschlag_formen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil_planer.py": 2
+   },
+   "unmapped_parts": [
+    "formen"
+   ]
+  },
+  "weicht": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 13,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_weg2line.py": 1
+   },
+   "unmapped_parts": [
+    "weicht"
+   ]
+  },
+  "weicht_vom_vorschlag_ab": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "unmapped_parts": [
+    "weicht",
+    "vom",
+    "ab"
+   ]
+  },
+  "zaehlung": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "strkey": 6
+   },
+   "tree_files": 6,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_formen_1006.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": 1
+   },
+   "unmapped_parts": [
+    "zaehlung"
+   ]
+  },
+  "zeileForce": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 1,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "unmapped_parts": [
+    "force"
+   ]
+  },
+  "zellen": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 4,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/features_update.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "zellen"
+   ]
+  },
+  "ziel_unbekannt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 2,
+    "json_key": 1
+   },
+   "tree_files": 4,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "unmapped_parts": [
+    "unbekannt"
+   ]
+  },
+  "zweige": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 7,
+   "kinds": {
+    "name": 4,
+    "strkey": 3
+   },
+   "tree_files": 5,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 5,
+    "tools/rig_dashboard/rigdash/features_update.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "unmapped_parts": [
+    "zweige"
+   ]
+  }
+ },
+ "too_common": {
+  "Beleg": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 51,
+   "js_files": 3,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   },
+   "proposed": "Evidence"
+  },
+  "Herkunft": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "name": 1
+   },
+   "tree_files": 34,
+   "js_files": 5,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_herkunft_1005.py": 1
+   },
+   "proposed": "Source"
+  },
+  "Treiber": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 36,
+   "js_files": 2,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_hwprofil_apa_1006.py": 1
+   },
+   "proposed": "Driver"
+  },
+  "beide": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 3,
+    "json_key": 1
+   },
+   "tree_files": 103,
+   "js_files": 5,
+   "top_files": {
+    "python/sglang/srt/weg2/profile_catalog.py": 1,
+    "test/registered/unit/weg2/test_profile_catalog_union_1005.py": 1,
+    "tools/rig_dashboard/rigdash/profil_data/catalog.json": 1
+   },
+   "proposed": "both"
+  },
+  "geht": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 7,
+   "kinds": {
+    "strkey": 7
+   },
+   "tree_files": 55,
+   "js_files": 5,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_formen_1006.py": 1,
+    "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": 1
+   },
+   "proposed": "ok"
+  },
+  "gerechnet": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 54,
+   "js_files": 6,
+   "top_files": {
+    "python/sglang/srt/planner/profile_couplings.py": 1,
+    "test/registered/unit/planner/test_profile_balken_aph2_1006.py": 1
+   },
+   "proposed": "computed"
+  },
+  "nennt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 6,
+   "kinds": {
+    "name": 4,
+    "strkey": 2
+   },
+   "tree_files": 80,
+   "js_files": 2,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 5,
+    "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": 1
+   },
+   "proposed": "names"
+  },
+  "passt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 8,
+   "kinds": {
+    "strkey": 6,
+    "name": 2
+   },
+   "tree_files": 60,
+   "js_files": 5,
+   "top_files": {
+    "python/sglang/srt/weg2/hw_progress.py": 2,
+    "python/sglang/srt/weg2/propose_single.py": 1,
+    "python/sglang/srt/weg2/propose_verdict.py": 1
+   },
+   "proposed": "fits"
+  },
+  "posten": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "name": 3,
+    "strkey": 2
+   },
+   "tree_files": 61,
+   "js_files": 0,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_single.py": 4,
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   },
+   "proposed": "items"
+  },
+  "profil": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 55,
+   "kinds": {
+    "strkey": 8,
+    "name": 47
+   },
+   "tree_files": 56,
+   "js_files": 4,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/server.py": 16,
+    "python/sglang/srt/weg2/propose_verdict.py": 6,
+    "tools/rig_dashboard/rigdash/tests/test_profil_staging_1984.py": 4
+   },
+   "proposed": "profile"
+  },
+  "verweigert": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 3,
+   "kinds": {
+    "strkey": 3
+   },
+   "tree_files": 74,
+   "js_files": 3,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 1,
+    "tools/rig_dashboard/rigdash/profil.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   },
+   "proposed": "refused"
+  }
+ },
+ "test_names": {
+  "test_3080_10gb_leiht_keine_20gb_zahlen": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_4090_wird_vom_planer_verweigert": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_a_card_hw_sim_does_not_know_keeps_the_open_gap_as_nicht_gemessen": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/rigmon/test_hardware_profile_persist_1006.py": 1
+   }
+  },
+  "test_a_failed_nccl_way_is_nicht_gemessen_with_its_reason_in_its_own_column_only": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/rigmon/test_hwprofil_messen_1006.py": 1
+   }
+  },
+  "test_a_failure_of_the_harness_is_orakel_fehler": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": 1
+   }
+  },
+  "test_a_manual_ceiling_beside_curve_clamps_x_and_sets_ds_riegel_to_the_lower": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_weg2_x_curves_1006.py": 1
+   }
+  },
+  "test_a_pair_without_number_is_nicht_gemessen_with_its_own_reason_the_rest_stays_measured": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/rigmon/test_hwprofil_messen_1006.py": 1
+   }
+  },
+  "test_a_probe_without_link_fields_shows_the_link_as_nicht_gemessen_with_reason_and_keeps_the_button_lit": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/rigmon/test_hwprofil_messen_1006.py": 1
+   }
+  },
+  "test_a_secret_name_in_the_catalog_stays_entfernt_and_unknown_is_not_entfernt": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_issue_laufbericht_1006.py": 1
+   }
+  },
+  "test_abweichung_only_when_the_trees_disagree": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_profile_catalog_union_1005.py": 1
+   }
+  },
+  "test_alle_records_da_planer_nachgerechnet_gleich": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_alle_speichervarianten_sind_eigene_eintraege": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_an_index_error_in_the_launcher_is_orakel_absturz_with_the_place": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": 1
+   }
+  },
+  "test_apply_parse_traegt_verdikte_ein": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_apu_kontext_verengt_die_decke": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_architekturen": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_argparse_system_exit_is_optionen": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apd_verdikt_1006.py": 1
+   }
+  },
+  "test_books_exactly_the_chosen_cards_for_fifteen_minutes_as_profil_editor": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_hwprofil_950.py": 1
+   }
+  },
+  "test_budget_ist_bruchteil_mal_frei_vor_dem_laden": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_budgets_gleich_vram_plan_und_boot_log": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_capacity_tier_klassen": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_check_verbindet_beides": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_chip_shows_beleg_marker_and_sentence_in_the_title": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_force_katalog_2002.py": 1
+   }
+  },
+  "test_chipsatz_macht_barlink_ungeprueft": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_cli_produkt_ist_kreuz_matrix_override_and_md": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   }
+  },
+  "test_config_fixture_stimmt_mit_dem_index_ueberein": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_context_und_sitze": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_curve_modes_size_ds_riegel_and_hand_the_front_its_flags": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_weg2_x_curves_1006.py": 1
+   }
+  },
+  "test_curve_x_is_capped_by_the_boot_level_riegel_and_says_so": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_weg2_x_curves_1006.py": 1
+   }
+  },
+  "test_deterministisch_und_json": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_docker_run_traegt_profil_image_transport": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_draft_aus_und_sitze": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_drei_3090_unkalibriert": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_dry_from_vorschlag_is_none_for_garbage": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   }
+  },
+  "test_dry_from_vorschlag_shape_for_no_run": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   }
+  },
+  "test_ds_riegel_caps_the_curve_x_and_says_so": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_weg2_x_curves_1006.py": 1
+   }
+  },
+  "test_edge_anchors_are_checked_in_every_tree_and_baeume_marks_the_other_lines_code": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_profile_catalog_union_1005.py": 1
+   }
+  },
+  "test_edit_writes_back_into_the_owning_token_and_marks_nutzer": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_profile_json_1003.py": 1
+   }
+  },
+  "test_editor_only_page_still_carries_the_profil_tab_and_no_dev_part": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_editor_only_1995.py": 1
+   }
+  },
+  "test_eine_5090_passt_rechnerisch_nicht": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_eine_karte_kein_transport": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_empty_directory_is_an_empty_mountpoint": {
+   "count": 2,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apb_modell_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_modellprofil_apb_1006.py": 1
+   }
+  },
+  "test_explizites_kv_dtype_wird_nie_still_geaendert": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_fehlende_kv_zelle_ist_unbelegt_statt_geraten": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_fehler_benannt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_fehler_werden_benannt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_flags_mit_erklaerung_und_bound_by": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_flags_und_verdikt_tragen_die_annahme_als_unbelegt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_form_ziele_basis_and_inventory_are_checked": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 1
+   }
+  },
+  "test_gate_fehlt_wird_benannt": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_gate_laedt_original_planer_module": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_geborgtes_ist_unbelegt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_gemessener_wert_ersetzt_den_standard_und_ist_nicht_unbelegt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_gleiche_form_auf_diskreter_karte_ohne_host_posten": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_grenzfall_kippt_auf_passt_nicht": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_int8_passt_nicht_mit_zahlen": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_karte_aus_hardwareprofil": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_karten_reihenfolge_egal": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_kein_geheimnis_in_den_antworten": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_kein_interpreter_ist_nicht_geprueft_nie_ok": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_kleinerer_kontext_mit_bf16_kv_passt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_kontext_ueber_modellmaximum_wird_vermerkt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_kreuz_key_is_axis_ordered_and_validated": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   }
+  },
+  "test_link_rechnung": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_max_context_fit_gegen_dasselbe_budget": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_missing_profile_prints_profil_fehlt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_hw_ap0_1525.py": 1
+   }
+  },
+  "test_model_path_falls_back_to_the_bodys_and_the_flag": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_balken_1432.py": 1
+   }
+  },
+  "test_nachzug_leaves_come_from_the_record": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_ipcfields_0929.py": 1
+   }
+  },
+  "test_nachzug_surfaces": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_ipcfields_0929.py": 1
+   }
+  },
+  "test_naeherung_ist_gekennzeichnet_und_ohne_plan": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_neu_erfassen_replaces_the_file": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/rigmon/test_hardware_profile_persist_1006.py": 1
+   }
+  },
+  "test_new_edges_are_appended_with_source_katalog": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_kanten_loader_2002.py": 1
+   }
+  },
+  "test_nf_experten_fuellen_freien_vram": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_nvfp4_passt_mit_zahlen": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_offen_lists_unproven_edges_with_existing_names": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   }
+  },
+  "test_orakel_fehler_is_named_and_force_does_not_help_is_not_said": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   }
+  },
+  "test_passt_mit_zahlen": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_passt_nicht_is_a_planer_calculation_block_without_force_claims": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   }
+  },
+  "test_pcie_aenderung_aendert_die_budgets_nicht": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_phasen_schliessen_auf_die_karte": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_phasenaufschluesselung_hat_beide_layouts_und_spitze": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_plan_id_wird_nachgerechnet": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_planer_apb_modell_1006": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_profil_930": {
+   "count": 6,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_force_katalog_2002.py": 2,
+    "tools/rig_dashboard/rigdash/tests/test_editor_only_1995.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_release_edition_1984.py": 1
+   }
+  },
+  "test_profil_balken_1432": {
+   "count": 4,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_balken_aph2_1006.py": 2,
+    "tools/rig_dashboard/rigdash/tests/test_editor_only_1995.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_release_edition_1984.py": 1
+   }
+  },
+  "test_profil_issue_laufbericht_1006": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   }
+  },
+  "test_profil_js_hands_the_page_edition_to_the_module": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_release_edition_1984.py": 1
+   }
+  },
+  "test_profil_orakel_apd_1006": {
+   "count": 3,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_dual_linie_1007.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   }
+  },
+  "test_profil_planer_aph1_1006": {
+   "count": 2,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   }
+  },
+  "test_profil_s3_modell_1003": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apb_modell_1006.py": 1
+   }
+  },
+  "test_profil_status_is_now_forceable_via_the_entrypoint": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_force_katalog_2002.py": 1
+   }
+  },
+  "test_profile_sind_die_beschlossenen": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_provisional_is_never_zuletzt": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_1006.py": 1
+   }
+  },
+  "test_release_page_carries_the_profil_tab": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_release_edition_1984.py": 1
+   }
+  },
+  "test_repo_belege_are_all_verified": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   }
+  },
+  "test_reserve_groesser_als_karte": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_reserve_und_tier_gegen_echte_serverargs": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_reserve_ziel_ersetzt_die_heuristik": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_reviewer_leaks_appear_as_entfernt_in_the_report": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_issue_laufbericht_1006.py": 1
+   }
+  },
+  "test_rig_barlink_belegt": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_rig_karten_haben_nvml_record_fremde_datenblatt": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_run1_laden_rechnen_entladen_in_the_phase_list": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_vision_phase_1002.py": 1
+   }
+  },
+  "test_schaetzen_posts_json_and_surfaces_errors": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_modellprofil_960.py": 1
+   }
+  },
+  "test_scratch_slots_scaled_from_one_measurement_are_unbelegt_with_the_same_inventory": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apc_propose_1006.py": 1
+   }
+  },
+  "test_sechs_karten": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_service_paket_hat_keinen_log_parser": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_slot_begrenzt_die_karte": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_sm75_wird_abgelehnt_mit_grund": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_sm89_status_ehrlich": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_soll_erreicht_is_separate_from_status": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   }
+  },
+  "test_split_sums_to_vorlauf_and_names_the_idle": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_vorlauf_split_1002.py": 1
+   }
+  },
+  "test_status_is_erklaert_and_core_stays_kuratiert": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_profile_erklaert_1005.py": 1
+   }
+  },
+  "test_the_balken_request_is_the_h2_contract": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 1
+   }
+  },
+  "test_the_bar1_column_is_nicht_gemessen_while_the_staging_column_has_numbers_never_filled_from_it": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_hwprofil_messen_1006.py": 1
+   }
+  },
+  "test_the_dual_passung_is_a_planner_calculation_and_says_so": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_ape_dual_1006.py": 1
+   }
+  },
+  "test_the_page_script_stops_polling_and_forces_the_profil_tab_when_editor_only": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_editor_only_1995.py": 1
+   }
+  },
+  "test_the_planer_is_a_section_of_the_profil_page_not_a_second_tab": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_release_edition_1984.py": 1
+   }
+  },
+  "test_the_profil_tab_sits_before_nothing_dev_in_release_and_before_entwicklung_in_rig": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_release_edition_1984.py": 1
+   }
+  },
+  "test_the_review_case_3x3090_nf_scratch_is_unbelegt_with_the_transfer_origin": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apc_propose_1006.py": 1
+   }
+  },
+  "test_the_single_card_proposal_is_labelled_planer_rechnung": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 1
+   }
+  },
+  "test_the_verdict_says_planer_rechnung_and_has_no_launcher_run": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apd_formen_1006.py": 1
+   }
+  },
+  "test_turing_nur_als_deaktivierter_eintrag": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_ueberblick_equals_verlauf_equals_diagram_for_the_same_window": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipzeit_1006.py": 1
+   }
+  },
+  "test_uebersteuerung_rechnet_die_passung_neu": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_unassigned_baustein_is_a_hint_not_a_save_blocker": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   }
+  },
+  "test_unbelegt_and_zero_runs_are_no_dry_run_either": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1
+   }
+  },
+  "test_unbelegte_edge_is_marked_visibly": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_force_katalog_2002.py": 1
+   }
+  },
+  "test_ungueltige_pcie_angaben": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_unknown_versions_say_unbelegt_and_state_whether_stored": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_hwprofil_apa_1006.py": 1
+   }
+  },
+  "test_unmeasured_cards_get_the_data_sheet_sm_labelled_datenblatt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/rigmon/test_hardware_profile_persist_1006.py": 1
+   }
+  },
+  "test_veralteter_alias_wird_erkannt": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_verdikt_without_text_falls_back_to_the_launcher_wording": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_nacharbeit_1006.py": 1
+   }
+  },
+  "test_versions_missing_are_unbelegt_never_guessed": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_issue_laufbericht_1006.py": 1
+   }
+  },
+  "test_vier_karten_count_und_topology": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_view_joins_bausteine_and_marks_stale_ist": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   }
+  },
+  "test_vorlauf_never_reaches_past_the_previous_flip_probe_artifact": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_flipview_1001.py": 1
+   }
+  },
+  "test_vorschlaege_parsen": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_wert_is_within_the_flag_choices": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_kantenkatalog_1433.py": 1
+   }
+  },
+  "test_without_a_bar1_measurement_the_headline_is_nicht_gemessen_even_if_staging_and_nccl_are_measured": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/rigmon/test_hwprofil_messen_1006.py": 1
+   }
+  },
+  "test_xc_1652_kv_only_workers_follow_and_the_riegel_agrees": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/managers/test_nf_form_a_cut_kv_only_follow_h105e.py": 1
+   }
+  },
+  "test_zu_kleine_karte_passt_nicht": {
+   "count": 1,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 1
+   }
+  },
+  "test_zu_kleines_bar1_nccl": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  },
+  "test_zu_viele_oder_keine_karten": {
+   "count": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_kartenplan_510.py": 1
+   }
+  }
+ },
+ "conflicts_with_tables": {
+  "blockiert": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "strkey": 2
+   },
+   "tree_files": 24,
+   "js_files": 2,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apd_formen_1006.py": 1,
+    "tools/rig_dashboard/rigdash/profil.py": 1
+   },
+   "proposed": "blocked",
+   "existing": {
+    "identfix_map.json": "is_blocked"
+   }
+  },
+  "erste": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 1,
+   "kinds": {
+    "strkey": 1
+   },
+   "tree_files": 66,
+   "js_files": 1,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 1
+   },
+   "proposed": "first",
+   "existing": {
+    "merged_0928.json": "first_bad"
+   }
+  },
+  "fehler": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 8,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 2
+   },
+   "proposed": "error",
+   "existing": {
+    "merged_0928.json": "errors"
+   }
+  },
+  "fehlt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 5,
+   "kinds": {
+    "strkey": 5
+   },
+   "tree_files": 104,
+   "js_files": 4,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 1,
+    "tools/rig_dashboard/rigdash/ipcboot.py": 1,
+    "tools/rig_dashboard/rigdash/ipcfields.py": 1
+   },
+   "proposed": "missing",
+   "existing": {
+    "merged_0928.json": "missing_ids"
+   }
+  },
+  "frei": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 2,
+   "kinds": {
+    "name": 2
+   },
+   "tree_files": 79,
+   "js_files": 3,
+   "top_files": {
+    "test/registered/unit/weg2/test_planer_apf_einzelkarte_1006.py": 2
+   },
+   "proposed": "free",
+   "existing": {
+    "merged_0928.json": "free_mib"
+   }
+  },
+  "grund": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 105,
+   "kinds": {
+    "strkey": 16,
+    "name": 88,
+    "json_key": 1
+   },
+   "tree_files": 35,
+   "js_files": 3,
+   "top_files": {
+    "python/sglang/srt/weg2/propose.py": 37,
+    "python/sglang/srt/weg2/propose_verdict.py": 27,
+    "python/sglang/srt/weg2/propose_dual.py": 16
+   },
+   "proposed": "reason",
+   "existing": {
+    "identfix_map.json": "refuse_reason"
+   }
+  },
+  "gruppe": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 12,
+   "kinds": {
+    "name": 9,
+    "strkey": 3
+   },
+   "tree_files": 11,
+   "js_files": 2,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features.py": 6,
+    "tools/rig_dashboard/rigdash/features_update.py": 3,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 3
+   },
+   "proposed": "group",
+   "existing": {
+    "merged_0928.json": "proc_group"
+   }
+  },
+  "karte": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 15,
+   "kinds": {
+    "strkey": 4,
+    "name": 11
+   },
+   "tree_files": 31,
+   "js_files": 0,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/tests/test_profil_propose_formen_apd_1006.py": 7,
+    "tools/rig_dashboard/rigdash/profil.py": 6,
+    "python/sglang/srt/weg2/propose_verdict.py": 1
+   },
+   "proposed": "card",
+   "existing": {
+    "merged_0928.json": "emap"
+   }
+  },
+  "soll": {
+   "heads": [
+    "scan_nf"
+   ],
+   "count": 4,
+   "kinds": {
+    "strkey": 3,
+    "name": 1
+   },
+   "tree_files": 64,
+   "js_files": 3,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 2,
+    "tools/rig_dashboard/rigdash/features.py": 1,
+    "tools/rig_dashboard/rigdash/tests/test_features.py": 1
+   },
+   "proposed": "expected",
+   "existing": {
+    "merged_0928.json": "want"
+   }
+  },
+  "verdikt": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 48,
+   "kinds": {
+    "strkey": 12,
+    "name": 36
+   },
+   "tree_files": 19,
+   "js_files": 2,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_verdict.py": 23,
+    "test/registered/unit/weg2/test_planer_nacharbeit_1006.py": 10,
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 6
+   },
+   "proposed": "verdict",
+   "existing": {
+    "merged_0928.json": "budget_verdict"
+   }
+  },
+  "verdikte": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 18,
+   "kinds": {
+    "name": 8,
+    "strkey": 10
+   },
+   "tree_files": 15,
+   "js_files": 2,
+   "top_files": {
+    "python/sglang/srt/weg2/propose_dual.py": 5,
+    "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": 3,
+    "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": 3
+   },
+   "proposed": "verdicts",
+   "existing": {
+    "merged_0928.json": "rank_verdicts"
+   }
+  },
+  "zeile": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 10,
+   "kinds": {
+    "json_key": 2,
+    "strkey": 6,
+    "name": 2
+   },
+   "tree_files": 18,
+   "js_files": 1,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/features_update.py": 2,
+    "python/sglang/srt/weg2/kantenkatalog_1004.json": 1,
+    "python/sglang/srt/weg2/profile_catalog.py": 1
+   },
+   "proposed": "row",
+   "existing": {
+    "merged_0928.json": "row_idx"
+   }
+  },
+  "zeilen": {
+   "heads": [
+    "scan_27b",
+    "scan_nf"
+   ],
+   "count": 15,
+   "kinds": {
+    "strkey": 4,
+    "name": 11
+   },
+   "tree_files": 20,
+   "js_files": 2,
+   "top_files": {
+    "tools/rig_dashboard/rigdash/profil.py": 7,
+    "tools/rig_dashboard/rigdash/features_update.py": 5,
+    "python/sglang/srt/weg2/propose_verdict.py": 1
+   },
+   "proposed": "rows",
+   "existing": {
+    "merged_0928.json": "row_list"
+   }
+  }
+ },
+ "false_positive": [
+  "durs",
+  "hangt_an",
+  "prange",
+  "refus",
+  "ruhe",
+  "sargs",
+  "soff"
+ ],
+ "dup_target": [],
+ "summary": {
+  "table_entries": 152,
+  "planner_entries": 27,
+  "needs_translation": 235,
+  "test_names": 143,
+  "too_common": 11,
+  "conflicts_with_tables": 13,
+  "dup_target": 0,
+  "words_scanned": 576
+ }
+}

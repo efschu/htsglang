@@ -1,0 +1,228 @@
+{
+ "_comment": "F0-A 07.10.2026: reading notes for the files that collision_proposal.py could NOT clear by its full-token proof (standalone `sglang`/`flliper`/`SGLANG_`/`FLLIPER_` tokens both present) and that were therefore read and added to data/collision_ok_1007_<line>.json by hand. Not read by any tool.",
+ "27b": {
+  "docker/weg2-release/README_RELEASE_DRAFT.md": {
+   "words": [
+    "flliper"
+   ],
+   "note": "prose: 'upstream sglang' would read 'upstream flliper' (wrong statement); the draft README is replaced by the release README (F0-I/F0-G); the pass may run"
+  },
+  "docker/weg2-release/entrypoint.sh": {
+   "words": [
+    "FLLIPER_",
+    "FLLIPER_PDFLIP_",
+    "FLLIPER_P_CHUNK_POLICY",
+    "FLLIPER_TAG",
+    "flliper",
+    "pdflip"
+   ],
+   "note": "comment block (lines 37-44) documents the SGLANG_<X> <-> FLLIPER_<X> pairs; after the pass both sides read FLLIPER_*; F0-B/F0-G rewrite entrypoint.sh for both names, rewrite the comment there"
+  },
+  "python/sglang/srt/environ.py": {
+   "words": [
+    "PDFLIP"
+   ],
+   "note": "prose only ('SGLang CI' next to 'fLLiper release table row 12') + the PDFLIP ticket label class; cosmetic"
+  },
+  "python/sglang/srt/rigmon/hardware_profile.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "path text: '~/.cache/sglang/...' (becomes ~/.cache/flliper, R5 cache rename with read fallback) next to '/var/lib/flliper/hardware.json'; different path prefixes, nothing merges"
+  },
+  "python/sglang/srt/weg2/profile_catalog.py": {
+   "words": [
+    "FLLIPER_",
+    "flliper"
+   ],
+   "note": "_RX_ENV alternation (SGLANG_|FLLIPER_|HTSGLANG_) becomes (FLLIPER_|FLLIPER_|HTSGLANG_) = same matches; _RX_SGL_NAME ^SGLANG_..$ becomes ^FLLIPER_..$ (catalog is rebuilt in F0-F, not hand-edited)"
+  },
+  "python/sglang/srt/weg2/propose_oracle.py": {
+   "words": [
+    "FLLIPER_",
+    "flliper"
+   ],
+   "note": "_SCRUB_PREFIXES tuple gets FLLIPER_ twice (harmless duplicate; scrub semantics unchanged)"
+  },
+  "test/registered/unit/weg2/test_entrypoint_profil_force_930.py": {
+   "words": [
+    "pdflip"
+   ],
+   "note": "directory literal 'weg2' next to the entrypoint MODE value 'pdflip' (already the new word); different contexts"
+  },
+  "test/registered/unit/weg2/test_profile_catalog_union_1005.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "literal '/spinning/flliper/tools' (old kit path) -- gone in this package (KIT default = tools/release); entry can be dropped"
+  },
+  "tools/rig_dashboard/README.md": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/entrypoint_rigdash.sh": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/README.md": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/deploy/install_510.sh": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/deploy/stage_profil_modules.sh": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/hwprofil.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/profil.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/server.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_catalog.py": {
+   "words": [
+    "FLLIPER_",
+    "flliper"
+   ],
+   "note": "_RX_ENV alternation (SGLANG_|FLLIPER_|HTSGLANG_) becomes (FLLIPER_|FLLIPER_|HTSGLANG_) = same matches; _RX_SGL_NAME ^SGLANG_..$ becomes ^FLLIPER_..$ (catalog is rebuilt in F0-F, not hand-edited)"
+  },
+  "tools/rig_dashboard/rigdash/tests/test_hwprofil_apa_1006.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/tests/test_profil_issue_laufbericht_1006.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  }
+ },
+ "nf": {
+  "python/sglang/srt/environ.py": {
+   "words": [
+    "PDFLIP"
+   ],
+   "note": "prose only ('SGLang CI' next to 'fLLiper release table row 12') + the PDFLIP ticket label class; cosmetic"
+  },
+  "python/sglang/srt/rigmon/hardware_profile.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "path text: '~/.cache/sglang/...' (becomes ~/.cache/flliper, R5 cache rename with read fallback) next to '/var/lib/flliper/hardware.json'; different path prefixes, nothing merges"
+  },
+  "python/sglang/srt/weg2/profile_catalog.py": {
+   "words": [
+    "FLLIPER_",
+    "flliper"
+   ],
+   "note": "_RX_ENV alternation (SGLANG_|FLLIPER_|HTSGLANG_) becomes (FLLIPER_|FLLIPER_|HTSGLANG_) = same matches; _RX_SGL_NAME ^SGLANG_..$ becomes ^FLLIPER_..$ (catalog is rebuilt in F0-F, not hand-edited)"
+  },
+  "python/sglang/srt/weg2/propose_oracle.py": {
+   "words": [
+    "FLLIPER_",
+    "flliper"
+   ],
+   "note": "_SCRUB_PREFIXES tuple gets FLLIPER_ twice (harmless duplicate; scrub semantics unchanged)"
+  },
+  "test/registered/unit/weg2/test_entrypoint_profil_force_930.py": {
+   "words": [
+    "pdflip"
+   ],
+   "note": "directory literal 'weg2' next to the entrypoint MODE value 'pdflip' (already the new word); different contexts"
+  },
+  "test/registered/unit/weg2/test_profile_catalog_union_1005.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "literal '/spinning/flliper/tools' (old kit path) -- gone in this package (KIT default = tools/release); entry can be dropped"
+  },
+  "tools/rig_dashboard/entrypoint_rigdash.sh": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/README.md": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/deploy/install_510.sh": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/deploy/stage_profil_modules.sh": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/hwprofil.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/profil.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/server.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_catalog.py": {
+   "words": [
+    "FLLIPER_",
+    "flliper"
+   ],
+   "note": "_RX_ENV alternation (SGLANG_|FLLIPER_|HTSGLANG_) becomes (FLLIPER_|FLLIPER_|HTSGLANG_) = same matches; _RX_SGL_NAME ^SGLANG_..$ becomes ^FLLIPER_..$ (catalog is rebuilt in F0-F, not hand-edited)"
+  },
+  "tools/rig_dashboard/rigdash/tests/test_hwprofil_apa_1006.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  },
+  "tools/rig_dashboard/rigdash/tests/test_profil_issue_laufbericht_1006.py": {
+   "words": [
+    "flliper"
+   ],
+   "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  }
+ }
+}

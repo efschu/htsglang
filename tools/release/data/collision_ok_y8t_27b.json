@@ -1,0 +1,71 @@
+{
+ "python/sglang/srt/environ.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/managers/cache_controller.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/managers/pp_chain_receiver.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/managers/scheduler.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/managers/scheduler_components/weight_updater.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/managers/tp_worker.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/managers/weg2_sleep_drain.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/mem_cache/unified_radix_cache.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/model_executor/model_runner.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/weg2/flush_sub_timing.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/weg2/front.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/weg2/front_state_ipc.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/weg2/handoff_pending.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/weg2/park_l3.py": [
+  "PDFLIP"
+ ],
+ "python/sglang/srt/weg2/phase_policy.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_pdflip_handoff_orphan_1002.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_pdflip_parked_prefetch_1002.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_pdflip_sleep_sub_1002.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_pdflip_x_excursion_1002.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_weg2_flipzeit_dp_user_0930.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_weg2_park_l3_248.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_weg2_scheduling_slice_a_0907.py": [
+  "PDFLIP"
+ ],
+ "test/registered/unit/weg2/test_weg2_x_cost_line_0929.py": [
+  "PDFLIP"
+ ]
+}
