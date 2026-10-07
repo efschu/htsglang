@@ -83,13 +83,16 @@ class Curated(unittest.TestCase):
         cls.envs = PC.environ_fields(os.path.join(SRT, "environ.py"))
         with open(os.path.join(WEG2, "launcher.py"), encoding="utf-8") as fh:
             cls.launcher_src = fh.read()
+        # Envs ohne Envs-Feld, die ein Modul ueber os.environ liest (Konstante AUX_ENV usw.): dieselbe Ernte, die der Katalog-Generator nutzt.
+        cls.env_constants = PC.environ_constants(SRT)
 
     def test_every_curated_name_exists(self):
         miss = []
         for name, c in CU.CURATED.items():
             if c["kind"] == "flag" and name not in self.flags and name not in self.server:
                 miss.append(name)
-            if c["kind"] == "env" and name not in self.envs and name not in self.launcher_src and not self._composed_env_read(name):
+            if c["kind"] == "env" and name not in self.envs and name not in self.launcher_src and not self._composed_env_read(name) \
+                    and name not in self.env_constants:
                 miss.append(name)
         self.assertEqual(miss, [])
 

@@ -4,7 +4,7 @@ Gepinnt (rot -> gruen gegen ``ae25180e67``, wo es weder ``resolve_edge_belege`` 
   * ``resolve_anchor``: genau ein Treffer = eindeutig; mehrere = naechster zur erwarteten Zeile (``nah``); Gleichstand oder
     zu weit weg = ``mehrdeutig``; kein Treffer = ``veraltet`` (nie ein stilles Raten).
   * Verschiebung: der echte Quelltext (launcher.py, environ.py, profile_couplings.py) wird in einem Temp-Verzeichnis um N Zeilen
-    verschoben (Prepend am Dateianfang UND Einschub mitten in launcher.py); JEDE der 116 Kanten loest weiter auf, auf genau
+    verschoben (Prepend am Dateianfang UND Einschub mitten in launcher.py); JEDE der 131 Kanten loest weiter auf, auf genau
     die verschobene Zeile -- auch die mit Mehrfachtreffer-Ankern (``exchange`` 229x, ``DFLASH`` 73x, ``entries`` 30x).
   * Mutant: ein entfernter Anker wird ``veraltet`` und macht die Pruefung rot; ein verdoppelter eindeutiger Anker mit
     Gleichstand wird ``mehrdeutig``.
@@ -93,9 +93,9 @@ class ResolveAnchor(unittest.TestCase):
 
 
 class ResolveEdges(unittest.TestCase):
-    def test_real_tree_resolves_all_116(self):
+    def test_real_tree_resolves_all_131(self):
         res = PC.resolve_edge_belege(KANTEN, REPO_ROOT)
-        self.assertEqual(len(res), 116)
+        self.assertEqual(len(res), 131)
         self.assertEqual(problems(res), {})
         for i, r in res.items():
             self.assertIn(r["status"], PC.ANKER_OK + ("extern_fehlt",), i)
@@ -210,7 +210,7 @@ class CatalogShowsResolvedLine(unittest.TestCase):
                     self.assertEqual(b["zeile_hinweis"], stored)
                     self.assertEqual(b["zeile"] - stored, n, dep["kante"])      # shown line = resolved line
                     self.assertIn(b["aufloesung"], PC.ANKER_OK)
-            self.assertEqual(seen, 116 - sum(1 for k in KANTEN if os.path.isabs(k["beleg"]["datei"])))
+            self.assertEqual(seen, 131 - sum(1 for k in KANTEN if os.path.isabs(k["beleg"]["datei"])))
 
     def test_unresolvable_layout_leaves_the_catalog_as_before(self):
         # ``edges_root`` given but empty tree and a launcher outside the repo layout: no extra fields, no crash

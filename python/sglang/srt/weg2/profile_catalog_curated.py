@@ -512,6 +512,95 @@ CURATED: Dict[str, Dict[str, object]] = {
         "text": "DUAL-TP3PP3: startet vor den Gruppen einen privaten MPS-Control-Daemon (Pipe-Verzeichnis unter dem Run-Verzeichnis des Boots), damit P- und D-Kernels auf einer Karte gleichzeitig laufen statt zeitgeteilt. Nur mit --dual-layout.",
         "gain": "", "cost": "VERWEIGERT, solange SGLANG_WEG2_DUAL_MPS_OPT_IN=1 fehlt: gemessen, beide Gruppen hängen unter Extend-großen Collectives (Repro v2 scjhru S1, Boots kw6pft/ndktv4). Das Dual-Layout läuft ohne MPS; Latenzwächter ist --dual-p-duty.",
         "satz_quelle": "launcher.py --dual-mps (help=)", "depends": []},
+    # ---- Waechter-Schalter 27B (06.10.): Texte NUR aus der Meldeliste des 27B-Sitzes, je Satz die Zeile der Meldeliste in satz_quelle
+    # (WML = /spinning/gpu-arb/deskq/done/waechter-schalter-27b-meldeliste-1006.md; Z. = Zeile dieser Datei). Nichts ergaenzt.
+    "SGLANG_ENABLE_SCHEDULER_WATCHDOG_KILL": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "Hart-Watchdog des Schedulers: Steht der Forward-Zähler still, wird nach dem Dump nach 5 s SIGQUIT an den Eltern-Prozess geschickt (die Gruppe stirbt). Standard 1. Bei 0 bleiben Dump und Logzeile, es wird KEIN Signal geschickt. Die Schwelle bleibt --watchdog-timeout (300 s); der weiche Watchdog bleibt unverändert.",
+        "gain": "", "cost": "Bei 0 beendet nichts einen echten Scheduler-Hänger.",
+        "satz_quelle": "WML Z. 12 (Abschnitt A)", "depends": []},
+    "SGLANG_ENABLE_SUBPROCESS_WATCHDOG_KILL": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "Ein Scheduler- oder Detokenizer-Kindprozess mit exit != 0 lässt den Server per SIGQUIT sterben. Standard 1. Bei 0 wird der Tod gemeldet, es wird aber kein Signal geschickt. Das Abfrage-Intervall bleibt 1 s.",
+        "gain": "", "cost": "Bei 0 bleibt der Server als Hülle um den toten Rang stehen (Zombie-Gefahr).",
+        "satz_quelle": "WML Z. 13 (Abschnitt A)", "depends": []},
+    "SGLANG_WEG2_ENABLE_GROUP_DEAD_STOP": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "W17 Weg2GroupDead: Antwortet eine Gruppe nicht auf /health (und ihr Prozess ist tot) oder ist ein Rang gehalten, stoppt die Front. Standard 1. Bei 0 steht die Zeile „W17 ... suppressed“ im Log und es wird nicht gestoppt; die WEG2-HEALTH-Zeilen und die /health-Fakten bleiben unverändert, die Front-/health meldet weiter 503 (Tatsache). Hängt an SGLANG_WEG2_GROUP_DEAD_STREAK.",
+        "gain": "", "cost": "", "satz_quelle": "WML Z. 14 (Abschnitt A)", "depends": []},
+    "SGLANG_WEG2_GROUP_DEAD_STREAK": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "Wie viele aufeinanderfolgende /health-Fehlschläge (5-s-Takt) W17 braucht (ganze Zahl ≥ 1, Standard 2). Ein gehaltener Rang stoppt weiterhin sofort. Für den Stopp nur wirksam, wenn W17 an ist (SGLANG_WEG2_ENABLE_GROUP_DEAD_STOP). Nur im 27B-Baum gilt die Zahl auch für das 503 der Front-/health (dann immer, damit beide dieselbe Zahl lesen); im NF-Baum nur für das W17-Gate.",
+        "gain": "", "cost": "", "satz_quelle": "WML Z. 15 (Abschnitt A); Baum-Unterschied WML Z. 39 (Abschnitt D, Punkt 2)", "depends": []},
+    "SGLANG_WEG2_ENABLE_DRAIN_STUCK_STOP": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "W2 Weg2DrainStuck: So viele W1 DrainRefused in Folge stoppen die Front. Standard 1. Bei 0 verweigert jedes W1 weiter den Flip und W2 wird nur als ERROR geloggt. Hängt an SGLANG_WEG2_DRAIN_STUCK_REFUSALS.",
+        "gain": "", "cost": "Bei 0 wiederholt ein hängender Drain W1 endlos.",
+        "satz_quelle": "WML Z. 16 (Abschnitt A)", "depends": []},
+    "SGLANG_WEG2_DRAIN_STUCK_REFUSALS": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "Die „in Folge“-Zahl für W2 (ganze Zahl ≥ 1, Standard 3). Nur wirksam, wenn W2 an ist (SGLANG_WEG2_ENABLE_DRAIN_STUCK_STOP).",
+        "gain": "", "cost": "", "satz_quelle": "WML Z. 17 (Abschnitt A)", "depends": []},
+    "SGLANG_WEG2_ENABLE_CONTROLLER_DEAD_STOP": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "CONTROLLER-DEAD (#1264): Eine Ausnahme im offenen Flip stoppt die Front mit Namen. Standard 1. Bei 0 bleiben Zeile und Traceback, es wird nicht gestoppt.",
+        "gain": "", "cost": "Bei 0 bleibt die Front in „flipping“ (der Controller überspringt jede weitere Runde): sie bedient nichts, ist aber „am Leben“. Der gefährlichste der Schalter; Dashboard-Warnung empfohlen.",
+        "satz_quelle": "WML Z. 18 (Abschnitt A)", "depends": []},
+    "SGLANG_WEG2_HOST_GUARD_W22": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "Nur im 27B-Baum. W22 HostWatermarkBreached (Host-RAM-Pegel) stoppt die Front. Text-Wert on/off (on/1/true/yes, off/0/false/no), Standard on. Bei off wird das Verdikt geloggt („HOST GUARD W22 AUS: NOT stopping“, gedrosselt), es wird NICHT gestoppt; beim Front-Start steht eine laute WARNUNG „HOST GUARD W22 AUS: Host-RAM ist nicht mehr geschützt“. Ein Tippfehler gilt als on. Die Schwelle (--host-riegel-gib, host_ledger-Marke) bleibt unverändert.",
+        "gain": "", "cost": "Bei off ist der Host-RAM nicht mehr geschützt (Wortlaut der Start-Warnung).",
+        "satz_quelle": "WML Z. 19 (Abschnitt A); 27B-eigen WML Z. 39 (Abschnitt D, Punkt 1)", "depends": []},
+    "SGLANG_WEG2_HOST_GUARD_W98": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "Nur im 27B-Baum. W98 HostRateLatched (Rate-Latch), getrennt von W22 schaltbar; sonst wie W22 (Text-Wert on/off, Standard on; bei off WARNUNG „HOST GUARD W98 AUS: Host-RAM ist nicht mehr geschützt“). Bei off läuft der W22-Pegeltest im selben Tick weiter.",
+        "gain": "", "cost": "Bei off ist der Host-RAM nicht mehr geschützt (Wortlaut der Start-Warnung).",
+        "satz_quelle": "WML Z. 20 (Abschnitt A); 27B-eigen WML Z. 39 (Abschnitt D, Punkt 1)", "depends": []},
+    "SGLANG_ADMISSION_WEDGE_SECONDS": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "ADMISSION-WEDGE-Alarm: Sekunden ohne erstes Token bei queued>0 und running=0 (speist den Wedge-Status, die Recovery und die Übergabe bei Intake-Stall). Standard 20,0 s; nicht-positiv = 20. Ungesetzt bleibt der Poll 10 s; gesetzt folgt er im 27B-Baum der halben Schwelle (der NF-Baum lässt ihn bei 10 s). Die Recovery-Schwelle ist ein eigener Wert (SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS; Form nextflash/qwen27b 2,0 s, sonst 60 s); nur im 27B-Baum warnt beim Start eine Zeile, wenn Recovery > Alarm (nicht beim Default-Paar 20/60).",
+        "gain": "", "cost": "", "satz_quelle": "WML Z. 26 (Abschnitt B); Baum-Unterschiede WML Z. 39 (Abschnitt D, Punkte 1 und 3)", "depends": []},
+    "SGLANG_ADMISSION_WEDGE_MODE": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "Nur im 27B-Baum. Modus des ADMISSION-WEDGE-Alarms: act (Standard) = Alarm + Status-Datei + Recovery-Treiber (heute). log = Alarm + Status, KEIN Recovery-Versuch. off = der Wedge-Watchdog-Thread startet nicht (kein Alarm, kein Status, keine Recovery; wedge_status liest „keine Messung“). Ein unbekanntes Wort (auch „stop“) gilt als act. SGLANG_WEDGE_STATUS_DISABLE bleibt unabhängig.",
+        "gain": "", "cost": "", "satz_quelle": "WML Z. 27 (Abschnitt B); 27B-eigen WML Z. 39 (Abschnitt D, Punkt 1)", "depends": []},
+    "SGLANG_PREFILL_LIVELOCK_SECONDS": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "PREFILL-LIVELOCK: Sekunden ohne Decode-Runde bei running>0 und queued>0. Standard 20,0 s; nicht-positiv = Standard. Unabhängig von der Wedge-Schwelle.",
+        "gain": "", "cost": "", "satz_quelle": "WML Z. 28 (Abschnitt B); Regel „nicht-positiv = Default“ WML Z. 6", "depends": []},
+    "SGLANG_PREFILL_LIVELOCK_MODE": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "Nur im 27B-Baum. Modus des PREFILL-LIVELOCK-Alarms: log (Standard) = Urteil + ERROR-Zeile, nie Recovery. off = kein Livelock-Urteil. Ein unbekanntes Wort gilt als log. Es gibt keinen stop-Modus für reine Alarme.",
+        "gain": "", "cost": "", "satz_quelle": "WML Z. 29 (Abschnitt B); Überschrift Abschnitt B WML Z. 22; 27B-eigen WML Z. 39 (Abschnitt D, Punkt 1)", "depends": []},
+    "SGLANG_WEG2_FLIP_STALL_SLACK": {
+        "kind": "env", "group": "Wächter", "level": "experte", "planner_derived": False,
+        "text": "WEG2-FLIP STALL (#1262, Tier-3-Signal des Deadman): Faktor auf den zuletzt gemessenen Flip. Standard 4,0; nicht-positiv = 4,0. Vor dem ersten Flip gilt weiter --drain-deadline-s. Der Detektor stoppt selbst nie.",
+        "gain": "", "cost": "", "satz_quelle": "WML Z. 30 (Abschnitt B)", "depends": []},
+    # ---- Dual: D-COMPACT und ARENA-AUX-SPILL (Quellen je Eintrag)
+    "SGLANG_WEG2_DUAL_D_COMPACT": {
+        "kind": "env", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "D-COMPACT: D verschiebt lebende KV-Zeilen laufender Sitze in freie niedrige Zeilen, damit sein KV-Regal schrumpfen kann, wenn P auf eine Karte wartet. Standard an, 0 = aus. Wirkt nur im Dual-Layout (SGLANG_WEG2_DUAL_LAYOUT=1) in Gruppe D mit SGLANG_WEG2_DUAL_D_KV_MAX_TOKENS > 0; Flip, INT8, NF und Gruppe P erreichen das Modul nie. Greift erst, wenn P länger als SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S (Standard 4 s) gewartet hat. Scheitert die Verschiebung, steht eine benannte Zeile „D-COMPACT REFUSED reason=...“ im D-Log. Unbelegt: die Wirkung am Metall (laut Bericht nur CPU-getestet, kein Metall-Boot).",
+        "gain": "", "cost": "", "satz_quelle": "dual-dcompact-vorschlag-1006.md Z. 4 (Meldeliste) und Z. 10 (nicht bewiesen); environ.py-Kommentar zu SGLANG_WEG2_DUAL_D_COMPACT; dual_d_compact.py Modulkopf (Gate: dual_d_kv_stage.armed() AND Schalter)", "depends": []},
+    "SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S": {
+        "kind": "env", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "Q-1190b ARENA-AUX-SPILL (nur Dual-Layout, beide Gruppen): Steht die Wand der gemeinsamen KV-Arena so viele Sekunden, nehmen das Abgeben von D (D-ARENA-YIELD) und das Trimmen von P (ARENA-TRIM) zusätzlich Blätter, deren einzige Verweigerung der nur im Host liegende Zusatzzustand (aux) ist: nach jedem gewöhnlichen Blatt, weiterhin zuerst die L3-Kopie jeder KV-Seite, nie ein gesperrter, laufender, von einem END-Anker (V1) gehaltener oder beanspruchter Knoten. Das Blatt geht ganz, sein Elternknoten wird Blatt und folgt. Standard 30 s; 0 = aus = die alte Verweigerung. Eine nicht lesbare Zahl gilt als 30 s, eine negative als 0. Roher os.environ-Schalter ohne Eintrag in environ.py. Benannte Zeilen: „Q-1190b DUAL ARENA-AUX-SPILL ON/OFF“ und „aux=1 aux_leaves=N“ auf der D-ARENA-YIELD-/ARENA-TRIM-Zeile.",
+        "gain": "", "cost": "", "satz_quelle": "dual_arena_spill.py Kommentar „THE FIX“ (Zeilen 348-359) und aux_after_s (Zeilen 376-383); Commit 6e3060ec02 (Nachricht)", "depends": []},
+    # ---- X-CURVES (AP-K, 06.10.): argparse help= des Launchers; Refusals W190-W197 aus x_curves.py
+    "--x-mode": {
+        "kind": "flag", "group": "Prefill", "level": "experte", "planner_derived": False,
+        "text": "X-CURVES (Nutzer 06.10.: nur fixed und curve): wie die Front X setzt. fixed = --tp-prefill-max-tokens für den ganzen Boot, keine Live-Neuberechnung. curve = X PRO ANFRAGE aus --x-curves (die D-/P-Prefill-Kurven und der Flip-Preis dieses Modells × dieser Form × dieser Hardware); --x-ceiling-tokens daneben begrenzt X von oben, Ds W50-Riegel ist der NIEDRIGERE Wert aus der Hüllkurve der Kurven und dieser Obergrenze. Ungesetzt = die Front genau wie vor dem Flag, argv byte-identisch. Im Dual-Layout verweigert (W197: kein X-Umbau für Dual). Ein unbekanntes Wort verweigert W196; curve ohne --x-curves verweigert W190.",
+        "gain": "", "cost": "Im Dual-Layout verweigert (W197).",
+        "satz_quelle": "launcher.py --x-mode (help=, Zeilen 23013-23020); Refusals W190, W196, W197: x_curves.py (Zeilen 88-104, _check_mode_words)", "depends": []},
+    "--x-curves": {
+        "kind": "flag", "group": "Prefill", "level": "experte", "planner_derived": False,
+        "text": "X-CURVES: die Kurvendatei (weg2-x-curves/1, tools/build_x_curves.py). Nur mit --x-mode curve (sonst W194); fehlt oder ist die Datei nicht lesbar W190, ist sie fehlerhaft W191, stammt sie von einem anderen Modell, einer anderen Form oder anderer Hardware W192: beim Start verweigert. Im Dual-Layout verweigert (W197).",
+        "gain": "", "cost": "",
+        "satz_quelle": "launcher.py --x-curves (help=, Zeilen 23021-23024); W197: x_curves.py refuse_in_dual", "depends": []},
+    "--x-curves-beyond": {
+        "kind": "flag", "group": "Prefill", "level": "experte", "planner_derived": False,
+        "text": "X-CURVES: eine Anfrage, die tiefer liegt, als die Kurven reichen: clamp (Standard, zum Preis der tiefsten Zeile berechnet und benannt) oder refuse (W193 an der Front). Nur mit --x-mode curve (sonst W194); ein unbekannter Wert verweigert W196; im Dual-Layout verweigert (W197).",
+        "gain": "", "cost": "refuse weist solche Anfragen an der Front ab (W193).",
+        "satz_quelle": "launcher.py --x-curves-beyond (help=, Zeilen 23025-23027); W194/W196/W197: x_curves.py (Zeilen 94-104, _check_mode_words, refuse_in_dual)", "depends": []},
 }
 
 
