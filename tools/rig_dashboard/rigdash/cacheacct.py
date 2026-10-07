@@ -1,6 +1,6 @@
-"""Input tokens per class: aus Cache / neu gerechnet (P, D) / Übergabe P->D.
+"""Input tokens per class: from cache / newly computed (P, D) / handoff P->D.
 
-User order 29.09. ~13:40Z: "aus Cache" counts only tokens whose KV existed BEFORE the request --
+User order 29.09. ~13:40Z: "from cache" counts only tokens whose KV existed BEFORE the request --
 the prefix hit at admission.  When D, after the flip, reads from L2/L3 the KV that P has just
 prefilled for the SAME request, that is the hand-over P->D: neither a cache hit nor a
 recomputation.  It is its own class and never counts as cache.  Every prompt token lands in
@@ -32,8 +32,8 @@ from __future__ import annotations
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 CLASSES = ("cache", "comp_p", "comp_d", "handoff")
-LABELS = {"cache": "aus Cache", "comp_p": "neu gerechnet P", "comp_d": "neu gerechnet D",
-          "handoff": "Übergabe P→D"}
+LABELS = {"cache": "from cache", "comp_p": "newly computed P", "comp_d": "newly computed D",
+          "handoff": "Handoff P→D"}
 
 
 def blank() -> Dict[str, int]:

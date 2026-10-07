@@ -37,7 +37,7 @@ def _raw(units: int, weights: Sequence[int]) -> List[int]:
     """Largest-Remainder wie ``_partition_units_raw`` (utils.py:1338-1364): jeder Rang >= 1, Gleichstand zum niedrigeren Rang."""
     n = len(weights)
     if units < n:
-        raise ValueError("%d Einheiten reichen nicht für %d Ränge (jeder Rang braucht mindestens eine)" % (units, n))
+        raise ValueError("%d units are not enough for %d ranks (each rank needs at least one)" % (units, n))
     total = sum(weights)
     quotas = [units * w / total for w in weights]
     sizes = [max(int(q), 1) for q in quotas]
@@ -56,9 +56,9 @@ def _raw(units: int, weights: Sequence[int]) -> List[int]:
 def split_units(units: int, weights: Sequence[int]) -> List[int]:
     """Wie ``partition_units(units, weights, groups=None, allow_zero=any(w == 0))`` (utils.py:1601-1629, 1367-1409)."""
     if any(w < 0 for w in weights):
-        raise ValueError("negatives Gewicht in %s" % list(weights))
+        raise ValueError("negative weight in %s" % list(weights))
     if not any(w > 0 for w in weights):
-        raise ValueError("alle Gewichte sind 0 (%s): kein Rang würde Köpfe tragen" % list(weights))
+        raise ValueError("all weights are 0 (%s): no rank would carry heads" % list(weights))
     if any(w == 0 for w in weights):
         kept = [r for r, w in enumerate(weights) if w > 0]
         sub = _raw(units, [weights[k] for k in kept])
@@ -74,23 +74,23 @@ def compute(*, tp_size: int, ratios, kv_heads: Optional[int], q_heads: Optional[
     ``keins``; ``kv`` / ``q``: Köpfe je Rang oder None (nicht gerechnet); ``belege``: Fundstellen im Planer-Baum."""
     out: Dict[str, object] = {"status": "unbekannt", "regime": "keins", "kv": None, "q": None, "tp": tp_size, "satz": "", "notiz": [], "belege": []}
     if not kv_heads:
-        out["satz"] = "Kopfzahl unbekannt (Modell im Container nicht lesbar): nicht gerechnet."
+        out["satz"] = "Head count unknown (model not readable in the container): not calculated."
         return out
     if isinstance(ratios, str):
-        out["satz"] = "Gewichte stehen auf \"%s\": der Planer löst sie, die Verteilung hängt vom Ergebnis ab: nicht gerechnet." % ratios
+        out["satz"] = "Weights are set to \"%s\": the planner solves them, the distribution depends on the result: not calculated." % ratios
         return out
     plan = bool(ratios) and len(ratios) == tp_size
     if not plan:
         if kv_heads >= tp_size and kv_heads % tp_size == 0:
             out.update(status="ok", regime="gleichmaessig", kv=[kv_heads // tp_size] * tp_size,
-                       satz="Kein Rang-Plan: gleichmäßig, %d KV-Köpfe je Rang." % (kv_heads // tp_size),
-                       belege=["%s:1721-1723 (tp_partition_sizes ohne Plan)" % SRC])
+                       satz="No rank plan: even, %d KV heads per rank." % (kv_heads // tp_size),
+                       belege=["%s:1721-1723 (tp_partition_sizes without plan)" % SRC])
         else:
-            out["satz"] = "Kein Rang-Plan und %d KV-Köpfe auf %d Ränge: Standardpfad der Laufzeit, nicht gerechnet." % (kv_heads, tp_size)
+            out["satz"] = "No rank plan and %d KV heads on %d ranks: standard path of the runtime, not calculated." % (kv_heads, tp_size)
         return out
     if kv_heads < tp_size:
         out.update(status="ok", regime="repliziert", kv=[kv_heads] * tp_size,
-                   satz="%d KV-Köpfe < %d Ränge: REPLIZIERT, jeder Rang hält alle %d KV-Köpfe (die Token-Achse teilt uneven DCP)."
+                   satz="%d KV heads < %d ranks: REPLICATED, each rank holds all %d KV heads (the token axis is split by uneven DCP)."
                         % (kv_heads, tp_size, kv_heads),
                    belege=["%s:1888-1915 (attn_kv_replicated)" % SRC])
         nz = [r for r, w in enumerate(ratios) if w > 0]
@@ -98,24 +98,24 @@ def compute(*, tp_size: int, ratios, kv_heads: Optional[int], q_heads: Optional[
             q = [0] * tp_size
             q[nz[0]] = q_heads
             out["q"] = q
-            out["notiz"].append("Q-Köpfe: nur Rang %d hat Gewicht, er trägt alle %d (belegt für NF im Boot-Log: [24, 0, 0])." % (nz[0], q_heads))
+            out["notiz"].append("Q heads: only rank %d has weight, it carries all %d (verified for NF in the boot log: [24, 0, 0])." % (nz[0], q_heads))
         elif q_heads:
-            out["notiz"].append("Q-Köpfe: nicht gerechnet (kv-aligned Split in Einheiten von %d)." % kv_heads)
+            out["notiz"].append("Q heads: not calculated (kv-aligned split in units of %d)." % kv_heads)
         return out
     try:
         kv = split_units(kv_heads, list(ratios))
     except ValueError as exc:
-        out.update(status="fehler", satz="Verteilung nicht möglich: %s." % exc,
+        out.update(status="fehler", satz="Distribution not possible: %s." % exc,
                    belege=["%s:1338-1364 (_partition_units_raw)" % SRC])
         return out
     out.update(status="ok", regime="verteilt", kv=kv,
-               satz="%d KV-Köpfe auf %d Ränge nach Gewichten %s: %s (Largest-Remainder, jeder Rang mit Gewicht >= 1 Kopf)."
+               satz="%d KV heads on %d ranks by weights %s: %s (largest remainder, each rank with weight >= 1 head)."
                     % (kv_heads, tp_size, ",".join(str(w) for w in ratios), ",".join(str(k) for k in kv)),
                belege=["%s:1338-1364, 1367-1409 (partition_units)" % SRC])
     if kv_heads == tp_size:
-        out["notiz"].append("KV-Köpfe = Ränge: nicht repliziert (ausdrücklich ausgenommen, utils.py:1895-1914).")
+        out["notiz"].append("KV heads = ranks: not replicated (explicitly excepted, utils.py:1895-1914).")
     if q_heads:
-        out["notiz"].append("Q-Köpfe: nicht gerechnet.")
+        out["notiz"].append("Q heads: not calculated.")
     return out
 
 
@@ -158,9 +158,9 @@ def view(rows: Sequence[dict], model_dir: str = "", planner_only: Sequence[dict]
         tp = len(ratios) if isinstance(ratios, list) else 0
         res = compute(tp_size=tp, ratios=ratios, kv_heads=(heads or {}).get("kv"), q_heads=(heads or {}).get("q")) if tp or isinstance(ratios, str) \
             else {"status": "unbekannt", "regime": "keins", "kv": None, "q": None, "tp": 0, "notiz": [], "belege": [],
-                  "satz": "Gewichte \"%s\" nicht lesbar (Shell-Variable?): nicht gerechnet." % raw}
+                  "satz": "Weights \"%s\" not readable (shell variable?): not calculated." % raw}
         # Dict-Literal mit String-Schlüsseln, kein ``update(quelle=...)``: das Rename-Kit macht aus dem Bezeichner ``quelle`` ein ``source``, der
         # JSON-Schlüssel muss aber ``quelle`` bleiben (profil.js liest ``r.quelle``)
-        res.update({"group": r.get("scope"), "ratios": raw, "heads": heads, "quelle": "Profil" if r.get("value") else "Planer"})
+        res.update({"group": r.get("scope"), "ratios": raw, "heads": heads, "quelle": "Profile" if r.get("value") else "Planner"})
         out.append(res)
     return out

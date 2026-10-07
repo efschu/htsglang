@@ -84,11 +84,11 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         if _age(now, h.get("t")) is None or _age(now, h["t"]) > HEALTH_FRESH_S:
             continue
         if not h.get("alive"):
-            add("warn", g, "Hinweis (IPC front.groups): Gruppe %s alive=False%s -- "
+            add("warn", g, "Note (IPC front.groups): group %s alive=False%s -- "
                 "tot ist eine Gruppe nur laut state.json" % (g, " (streak %d)" % h["streak"] if h.get("streak") else ""),
                 h["t"])
         elif not h.get("http_ok") and (h.get("streak") or 0) >= 2:
-            add("hang", g, "Gruppe %s antwortet nicht: front.groups http_ok=False, streak %d, Prozess lebt" % (
+            add("hang", g, "Group %s does not answer: front.groups http_ok=False, streak %d, process alive" % (
                 g, h["streak"]), h["t"])
 
     # 2. named stops in the P/D logs (a traceback, W27, OOM ...), newest per group;
@@ -104,13 +104,13 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         act = (b.get("last_activity") or {}).get(g)
         recovered = act is not None and act > s["t"] + STOP_RECOVERED_S
         src = " [Quelle: %s]" % s["src"] if s.get("src") else ""
-        text = "benannter Stopp, Gruppe %s: %s%s" % (g, s["text"][:300], src)
+        text = "named stop, group %s: %s%s" % (g, s["text"][:300], src)
         if ended_on is None or s["t"] > ended_on["t"]:
             ended_on = {"group": g, "text": s["text"][:300], "t": s["t"], "recovered": recovered, "src": s.get("src")}
         if recovered:
-            add("warn", g, text + " (danach lief die Gruppe weiter)", s["t"])
+            add("warn", g, text + " (the group kept running afterwards)", s["t"])
         elif catching_up:
-            add("warn", g, text + " (ob die Gruppe danach weiterlief, steht noch aus)", s["t"])
+            add("warn", g, text + " (whether the group kept running afterwards is still open)", s["t"])
         else:
             add("warn", g, text + " (lebend/tot entscheidet state.json)", s["t"])
 
@@ -124,14 +124,13 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         idle_now = _age(now, b.get("last_activity_any"))
         hc = (c.get("health_output") or "").strip()
         if catching_up:
-            add("warn", None, "Docker meldet %s unhealthy; Fortschritt noch nicht beurteilbar%s"
+            add("warn", None, "Docker reports %s unhealthy; progress not assessable yet%s"
                 % (c.get("Names"), (" -- Healthcheck: " + hc[:300]) if hc else ""))
         elif idle_now is not None and idle_now < PROGRESS_S:
-            add("warn", None, "Docker-Health widerspricht dem Fortschritt: %s meldet unhealthy, aber vor %d s zählten "
-                "die Rang-Zähler (rankstats) noch Arbeit%s" % (c.get("Names"), idle_now, (" -- Healthcheck: " + hc[:300]) if hc else ""))
+            add("warn", None, "Docker health contradicts the progress: %s reports unhealthy, but %d s ago the rank counters (rankstats) still counted work%s" % (c.get("Names"), idle_now, (" -- Healthcheck: " + hc[:300]) if hc else ""))
         else:
             add("dead" if any(r["level"] == "dead" for r in reasons) else "hang", None,
-                "Docker meldet den Container %s: %s%s" % (c.get("Names"), status, (" -- Healthcheck: " + hc[:300]) if hc else ""))
+                "Docker reports the container %s: %s%s" % (c.get("Names"), status, (" -- Healthcheck: " + hc[:300]) if hc else ""))
 
     # 4. queued work, no progress
     fr = b.get("front") or {}
@@ -150,7 +149,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         queued, src = q_log, "Warteschlange"
     idle = _age(now, b.get("last_activity_any"))
     if judged and queued and idle is not None and idle >= HANG_S and not catching_up and not stopping():
-        add("hang", None, "HÄNGT: %d Anfrage(n) warten (%s), seit %d s zählen die Rang-Zähler (rankstats) keine Arbeit" % (
+        add("hang", None, "HANGS: %d request(s) waiting (%s), for %d s the rank counters (rankstats) have counted no work" % (
             queued, src, idle))
 
     ps = None

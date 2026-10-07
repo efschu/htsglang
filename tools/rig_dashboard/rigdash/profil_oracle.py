@@ -123,7 +123,7 @@ class OracleService(CouplingsService):
         """Antwort des Workers (aus dem Cache, wenn Schluessel und Quellen gleich sind); ``cached`` und ``cache_key`` (16 Zeichen) stehen dabei.
         Ein Fehler des Workers kommt als ``{"ok": False, "error": ...}`` und wird nicht gemerkt."""
         if kind not in ("verdikt", "propose"):
-            return {"ok": False, "error": "unbekannte Orakel-Anfrage %r" % (kind,)}
+            return {"ok": False, "error": "unknown oracle request %r" % (kind,)}
         key = self.key(kind, parts)
         hit = self._get(key)
         if hit is not None:

@@ -12,7 +12,7 @@ Replaces live.LiveLogs as the source of /api/live ``boots``.  Per boot state dir
 Every second a sample of every non-terminal boot's rank counters goes into a 16-min ring; the rates,
 windows, bursts, 15-min curves and the phase bar are deltas over that ring.  The view keeps the keys
 the page already reads (prefill/decode/totals/cache/series/timeline/...), so the card
-renders unchanged; a value without an IPC source is None and the page says "fehlt in IPC" with the
+renders unchanged; a value without an IPC source is None and the page says "missing in IPC" with the
 writer that would have to write it (ipcfields.MISSING_WRITER).  Pure view functions, unit-tested.
 """
 
@@ -318,8 +318,8 @@ def prefill_view(m: "activity.Model", g: str, now: float, done: Optional[List[di
             "last_burst": dict(_burst_dict(m.ring, m.keys, g, last), depth=_depth_round(activity.prefill_depth(last, done, g)))
                           if last else None,
             "last_t": last["e"] if last else None, "queue": lastrec.get("queue"), "pending_tok": lastrec.get("pending"),
-            "instrument": "Chunks zur Rechenzeit (prefill.last t/gpu_ms), Schub = erster Chunk-Start PP0 bis letztes Chunk-Ende letzte Stufe"
-                          + (f"; nur Chunks mit mindestens {activity.WIDE_MIN_TOK} neuen Tokens (kürzere sind Admit/Extend, getrennt gezählt)" if dwide else ""),
+            "instrument": "Chunks at compute time (prefill.last t/gpu_ms), burst = first chunk start PP0 to last chunk end last stage"
+                          + (f"; only chunks with at least {activity.WIDE_MIN_TOK} new tokens (shorter ones are admit/extend, counted separately)" if dwide else ""),
             "min_chunk_tok": activity.WIDE_MIN_TOK if dwide else None,
             "admit": admit_view(m, now) if dwide else None}
 
@@ -336,7 +336,7 @@ def admit_view(m: "activity.Model", now: float) -> dict:
     return {"window_s": WINDOW_S, "now": agg(now - WINDOW_S), "ring": agg(float("-inf")),
             "ring_s": (m.ring[-1]["t"] - m.ring[0]["t"]) if len(m.ring) > 1 else None,
             "max_tok": activity.WIDE_MIN_TOK - 1,
-            "src": "rankstats prefill.new_tokens / prefill.chunks je Probenschritt; Schritte mit Ø < %d neuen Tokens je Chunk" % activity.WIDE_MIN_TOK}
+            "src": "rankstats prefill.new_tokens / prefill.chunks per sample step; steps with avg < %d new tokens per chunk" % activity.WIDE_MIN_TOK}
 
 
 def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict]:
@@ -396,7 +396,7 @@ def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict
             "per_stream": (tok_s / seat_s) if seat_s > 0 else ((sum(streams) / len(streams)) if streams else None),
             "per_stream_n": len(streams),
             "seats_mean": (seat_s / busy_s) if busy_s > 0 else None, "seats_min": bmin, "seats_max": bmax,
-            "seats_src": ("rankstats decode.gpu_ms_by_bs (Δ je Probe, nach Rundenzeit gewichtet)"
+            "seats_src": ("rankstats decode.gpu_ms_by_bs (Δ per sample, weighted by round time)"
                           if any(x.get("bs_src") == "by_bs" for x in sw) else
                           "rankstats decode.running" if any(x.get("bs_src") == "running" for x in sw) else None),
             "running": last.get("running"), "last_bs": last.get("last_bs"), "accept_len": last.get("acc_len"),
@@ -540,7 +540,7 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
     for x in segs:
         x["s"] = max(x["s"], lo)
         if x["s"] > prev + 0.05:
-            out.append({"s": prev, "e": x["s"], "k": "unknown", "why": "keine IPC-Probe (rigdash sah den Boot nicht)"})
+            out.append({"s": prev, "e": x["s"], "k": "unknown", "why": "no IPC sample (rigdash did not see the boot)"})
         if x["k"] in src:
             tok = activity.spread(src[x["k"]], x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
             x["tok"] = tok
@@ -575,7 +575,7 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
         out.append(x)
         prev = max(prev, x["e"])
     if end > prev + 0.05:
-        out.append({"s": prev, "e": end, "k": "unknown", "why": "noch keine zweite IPC-Probe"})
+        out.append({"s": prev, "e": end, "k": "unknown", "why": "no second IPC sample yet"})
     if live and out and (out[-1]["k"] in ("P", "D", "dec") or out[-1].get("vis_live")):
         out[-1]["running"] = True
     if detail:
@@ -594,8 +594,8 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
                                      for r in rd["by_bs"]]
     if live:
         for x in out[-2:]:
-            if x["k"] == "unknown" and x["e"] >= end - 1.5 and (x.get("why") or "").startswith("Rang-Zähler"):
-                x["why"] = "Arbeit läuft gerade, der Chunk ist noch nicht fertig -- die Zuordnung folgt mit seinem Ende"
+            if x["k"] == "unknown" and x["e"] >= end - 1.5 and (x.get("why") or "").startswith("Rank counter"):
+                x["why"] = "Work is running now, the chunk is not finished yet -- the assignment follows with its end"
     return {"segs": out, "span_s": SPAN_S, "t1": now if live else end, "overlap": m.overlap_s(),
             "states": list(activity.STATES)}
 
@@ -722,15 +722,15 @@ def vorlauf_split(start: float, vorlauf_ms: float, arrival: Optional[float], par
 PD_END_WHATS = ("decode_token", "d_first_forward_done", "d_first_forward_done_approx")
 
 #: the endpoint fields, named where the page says "fehlt (Feld X)"
-F_PD_START = "rankstats P prefill.last.t (letzter Chunk, letzte P-Stufe) im Ring"
+F_PD_START = "rankstats P prefill.last.t (last chunk, last P stage) in the ring"
 F_PD_END = "D-Log Decode rank batch rank 0 / flip_first_work.first_work_ts what=decode_token / rankstats D im Ring"
-F_DP_START = "D-Log Decode rank batch rank 0 (letzte Runde der D-Phase)"
-F_DP_START_NOLOG = "D-Log nicht gefunden (Decode rank batch rank 0)"
+F_DP_START = "D log Decode rank batch rank 0 (last round of the D phase)"
+F_DP_START_NOLOG = "D log not found (Decode rank batch rank 0)"
 
 #: flip_views(..., d_rounds=AUTO) reads D's rounds through grouplog; tests pass the list (or None)
 AUTO = object()
-F_DP_ARRIVAL = "front WEG2 SESSION Ankunft des Wartenden liegt nach dem ersten Prefill-Forward (rid/Uhr)"
-F_DP_ARRIVAL_UNKNOWN = "front WEG2 SESSION Ankunft des Wartenden (rid) bzw. oldest_waiter_arrival fehlt: Server-Leerlauf vor dem Wartenden nicht herausrechenbar"
+F_DP_ARRIVAL = "front WEG2 SESSION arrival of the waiter is after the first prefill forward (rid/clock)"
+F_DP_ARRIVAL_UNKNOWN = "front WEG2 SESSION arrival of the waiter (rid) or oldest_waiter_arrival is missing: server idle before the waiter cannot be calculated out"
 #: tolerance between the front's arrival stamp and the rank clock before an arrival "after the first forward" is a defect
 ARRIVAL_SKEW_S = 0.5
 F_DP_END = "rankstats P.tp0pp0.work.forward_ct im Ring / flip_user_time.prefill_start_ts (pp_first_forward)"
@@ -857,7 +857,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
             else:
                 start = _seg_last_end(segs, ("P", "single"), b + 0.3, p_lo)
                 if start is not None:
-                    row["start_src"] = "P-Segment-Ende (Ring-Takt, ohne prefill.last.t)"
+                    row["start_src"] = "P segment end (ring cycle, without prefill.last.t)"
             if f.get("p_end_ts") is not None:
                 row["p_end_front"] = float(f["p_end_ts"])     # named only: the front's leg-1 end, no endpoint
             if start is not None:
@@ -880,7 +880,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                 r = _rank_first_rise(ring, d_first, ("dtok", "rounds", "pnew"), floor, horizon)
                 if r is not None:
                     end, e_lo = r
-                    row["end_src"] = "rankstats %s decode.tokens/rounds (erster Anstieg, Rang-Takt)" % d_first
+                    row["end_src"] = "rankstats %s decode.tokens/rounds (first rise, rank cycle)" % d_first
             if f.get("what") == "none" and end is None:
                 row["kind"] = "leerlauf"
             elif end is None:
@@ -921,7 +921,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                 start = rl[1]
                 row["start_src"] = "D-Log letzte Decode-Runde (TP0 t + gpu-ms)"
                 if row.get("start_prev_phase"):
-                    row["start_src"] += ", aus einer frueheren D-Phase (D hat in dieser keine Runde geschrieben)"
+                    row["start_src"] += ", from an earlier D phase (D wrote no round in this one)"
             if u is not None and u.get("start_ts") is not None:
                 row["start_front"] = float(u["start_ts"])     # named only: the front's park/arrival stamp
                 row["start_front_src"] = u.get("start_source")
@@ -1010,7 +1010,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                 ext = sum(max(0.0, min(x["e"], end) - max(x["s"], t_done)) for x in segs
                           if x["k"] == "D" and x["e"] > t_done and x["s"] < end)
                 row["nachlauf_d_extend_ms"] = ext * 1000.0 if ext > 0 else None
-        row["src"] = "%s -> %s" % (row.get("start_src") or "Start fehlt", row.get("end_src") or "Ende fehlt")
+        row["src"] = "%s -> %s" % (row.get("start_src") or "Start missing", row.get("end_src") or "End missing")
         out.append(row)
     return out
 
@@ -1050,18 +1050,18 @@ def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live:
                 "sub": "Layer-Tausch", "since": last["begin"], "flip_since": last["begin"]}
     if last and last.get("done") is not None and last.get("kind") == "offen" and now - last["done"] < FLIP_IDLE_S:
         return {"k": "flip", "dir": last["dir"], "label": "FLIP " + last["dir"].replace(">", "→"),
-                "sub": "Nachlauf (bis zur ersten Arbeit)", "since": last["done"], "flip_since": last["begin"]}
+                "sub": "Lead-out (until the first work)", "since": last["done"], "flip_since": last["begin"]}
     if (front or {}).get("state") == "flipping":
         # Vorlauf: the still-awake group is the source (Nutzer 02.10.: the active frame follows the phase)
         aw = (front or {}).get("awake")
-        return {"k": "flip", "dir": {"P": "P>D", "D": "D>P"}.get(aw), "label": "FLIP", "sub": "Vorlauf (Drain/Park, vor flip_begin)",
+        return {"k": "flip", "dir": {"P": "P>D", "D": "D>P"}.get(aw), "label": "FLIP", "sub": "Lead-in (drain/park, before flip_begin)",
                 "since": (front or {}).get("ts") or now, "flip_since": None}
     work = [x for x in segs if x["k"] != "unknown"]
     if not work:
-        return {"k": "unknown", "label": "unbekannt", "sub": "noch keine Probe", "since": now}
+        return {"k": "unknown", "label": "unknown", "sub": "no sample yet", "since": now}
     cur = work[-1]
     if segs and segs[-1]["k"] == "unknown" and now - cur["e"] > 3.0:
-        return {"k": "unknown", "label": "unbekannt", "sub": segs[-1].get("why") or "", "since": segs[-1]["s"]}
+        return {"k": "unknown", "label": "unknown", "sub": segs[-1].get("why") or "", "since": segs[-1]["s"]}
     k = cur["k"]
     since = cur["s"]
     for x in reversed(work[:-1]):            # the run of the same state, across sample-sized pieces
@@ -1070,22 +1070,22 @@ def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live:
         since = x["s"]
     if k == "P" and cur.get("co") in CO_LABEL:
         # dual (Nutzer 03.10.): P prefills and D works at the same time -- both named
-        return {"k": k, "co": cur["co"], "label": CO_LABEL[cur["co"]], "sub": "gleichzeitig (Dual, kein Flip)", "since": since}
+        return {"k": k, "co": cur["co"], "label": CO_LABEL[cur["co"]], "sub": "simultaneous (dual, no flip)", "since": since}
     if k in PHASE_LABEL:
         return {"k": k, "label": PHASE_LABEL[k], "sub": "", "since": since}
     if k in VIS_NAME:
         # the tower stage on P's PP0 (rankstats vision): live while ``live`` names a leg, else just done
         rid = ", ".join(cur.get("rids") or [])
-        sub = "Tower %s MiB" % fmt_mib(cur.get("mib")) if cur.get("mib") is not None else "Tower-Stufe auf P/PP0"
+        sub = "Tower %s MiB" % fmt_mib(cur.get("mib")) if cur.get("mib") is not None else "Tower stage on P/PP0"
         return {"k": k, "label": VIS_NAME[k], "sub": sub + (" · " + rid if rid else ""), "since": since}
     if k == "idle":
         aw = cur.get("awake") or (front or {}).get("awake")
-        return {"k": "idle", "label": "%s inaktiv" % (aw or "?"), "sub": "wach, keine Arbeit", "since": since, "awake": aw}
+        return {"k": "idle", "label": "%s inactive" % (aw or "?"), "sub": "awake, no work", "since": since, "awake": aw}
     if k in ("flip_pd", "flip_dp"):
         return {"k": "flip", "dir": "P>D" if k == "flip_pd" else "D>P", "label": "FLIP " + ("P→D" if k == "flip_pd" else "D→P"),
                 "sub": "Layer-Tausch", "since": since, "flip_since": since}
     if k == "flip_tail":
-        return {"k": "flip", "dir": (last or {}).get("dir"), "label": "FLIP", "sub": "Nachlauf (bis zur ersten Arbeit)", "since": since}
+        return {"k": "flip", "dir": (last or {}).get("dir"), "label": "FLIP", "sub": "Lead-out (until the first work)", "since": since}
     return {"k": k, "label": k, "sub": cur.get("why") or "", "since": since}
 
 
@@ -1248,7 +1248,7 @@ def prefill_route(front: dict) -> dict:
     sv = (front or {}).get("served")
     if not isinstance(sv, dict) or sv.get("P") is None or sv.get("D") is None:
         return {"src": None, "exact": False, "missing": "front.routes"}
-    return {"via_p": sv["P"], "d_direct": max(0, sv["D"] - sv["P"]), "src": "front.served (D − P, abgeleitet)",
+    return {"via_p": sv["P"], "d_direct": max(0, sv["D"] - sv["P"]), "src": "front.served (D − P, derived)",
             "exact": False, "missing": "front.routes"}
 
 
@@ -1368,9 +1368,9 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
         # no flip yet in this boot: the flip fields are empty, not missing a writer
         for k in FLIP_KEYS:
             if fields[k]["src"] != "ipc":
-                fields[k]["empty"] = "noch kein Flip in diesem Boot"
+                fields[k]["empty"] = "no flip in this boot yet"
     if fields["C7"]["src"] != "ipc" and (ipc.get("terminal") or len(ring) < 2):
-        fields["C7"]["empty"] = "keine Raten: Boot beendet" if ipc.get("terminal") else "erste Probe, Raten ab der zweiten"
+        fields["C7"]["empty"] = "no rates: boot ended" if ipc.get("terminal") else "first sample, rates from the second"
     last_act = {}
     for g in groups:
         ts = [p[1] for k in keys if _grp(k) == g for p in pairs(ring, k)

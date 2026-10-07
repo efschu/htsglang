@@ -45,14 +45,14 @@ def _load(path: str) -> dict:
     except FileNotFoundError:
         return {"schema": "rigdash.features/1", "features": []}
     if not isinstance(d, dict) or not isinstance(d.get("features"), list):
-        raise SystemExit("%s: kein Objekt mit Array 'features'" % path)
+        raise SystemExit("%s: no object with array 'features'" % path)
     return d
 
 
 def _save(path: str, d: dict):
     probs = features.validate_doc(d)
     if probs:
-        raise SystemExit("nicht geschrieben, Datei waere ungueltig:\n  " + "\n  ".join(probs))
+        raise SystemExit("not written, the file would be invalid:\n  " + "\n  ".join(probs))
     d["updated_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     tmp = "%s.tmp.%d" % (path, os.getpid())
     with open(tmp, "w") as fh:
@@ -66,7 +66,7 @@ def _find(d: dict, fid: str, create: bool = False) -> dict:
         if f.get("id") == fid:
             return f
     if not create:
-        raise SystemExit("kein Feature mit id %s" % fid)
+        raise SystemExit("no feature with id %s" % fid)
     f = {"id": fid}
     d["features"].append(f)
     return f
@@ -75,7 +75,7 @@ def _find(d: dict, fid: str, create: bool = False) -> dict:
 def _zweig(s: str) -> dict:
     b, sep, sha = s.rpartition("=")
     if not sep or not b:
-        raise SystemExit("--zweig braucht branch=sha, nicht %r" % s)
+        raise SystemExit("--zweig needs branch=sha, not %r" % s)
     return {"branch": b, "sha": sha}
 
 
@@ -84,7 +84,7 @@ def _schalter(s: str) -> dict:
     name, sep, rest = s.partition("=")
     parts = rest.split(":") if sep else []
     if len(parts) != 4:
-        raise SystemExit("--schalter braucht NAME=art:gruppe:an_wert:default, nicht %r" % s)
+        raise SystemExit("--schalter needs NAME=art:gruppe:an_wert:default, not %r" % s)
     art, gruppe, an_wert, default = parts
     return {"name": name, "art": art, "gruppe": gruppe, "an_wert": an_wert, "default": default}
 
@@ -94,105 +94,104 @@ def _bool(s: str) -> bool:
         return True
     if s.lower() in ("nein", "n", "0", "false", "no"):
         return False
-    raise SystemExit("ja|nein erwartet, nicht %r" % s)
+    raise SystemExit("ja|nein expected, not %r" % s)
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--file", default=features.DEFAULT_PATH)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("set", help="Feature anlegen oder aendern (upsert nach id)")
+    s = sub.add_parser("set", help="Create or change a feature (upsert by id)")
     s.add_argument("--id", required=True)
     s.add_argument("--modell", choices=features.MODELL_VALUES)
     s.add_argument("--titel")
     s.add_argument("--fertig", type=_bool)
-    s.add_argument("--zweig", action="append", type=_zweig, help="branch=sha (wiederholbar; ersetzt die Liste)")
+    s.add_argument("--zweig", action="append", type=_zweig, help="branch=sha (repeatable; replaces the list)")
     s.add_argument("--schalter", action="append", type=_schalter,
-                   help="NAME=art:gruppe:an_wert:default (wiederholbar; ersetzt die Liste)")
+                   help="NAME=art:gruppe:an_wert:default (repeatable; replaces the list)")
     s.add_argument("--aus-begruendung")
     s.add_argument("--verantwortlich")
-    s.add_argument("--produkt", action="append", help="als Baustein an dieses Produkt-Feature hängen (F1..F24, wiederholbar)")
-    z = sub.add_parser("add-zweig", help="weiteren Zweig/Pick anhaengen (z. B. 27B-Pick unter neuem sha)")
+    s.add_argument("--produkt", action="append", help="attach as a building block to this product feature (F1..F24, repeatable)")
+    z = sub.add_parser("add-zweig", help="append another branch/pick (e.g. 27B pick under a new sha)")
     z.add_argument("--id", required=True)
     z.add_argument("--zweig", required=True, type=_zweig)
-    g = sub.add_parser("gewinn", help="Gewinn anhaengen (gleiche metrik+modell ersetzt den alten)")
+    g = sub.add_parser("gewinn", help="append a gain (same metrik+modell replaces the old one)")
     g.add_argument("--id", required=True)
-    g.add_argument("--metrik", required=True, help="z. B. Decode tok/s, Flipzeit, KV Token, bs parallel")
+    g.add_argument("--metrik", required=True, help="e.g. decode tok/s, flip time, KV tokens, bs parallel")
     g.add_argument("--vorher")
     g.add_argument("--nachher", required=True)
     g.add_argument("--einheit", default="")
     g.add_argument("--art", required=True, choices=features.GAIN_ART)
-    g.add_argument("--modell", choices=("27B", "NF"), help="Pflicht bei modell=beide")
+    g.add_argument("--modell", choices=("27B", "NF"), help="required for modell=beide")
     g.add_argument("--quelle", default="")
     g.add_argument("--boot", default="")
-    b = sub.add_parser("begruendung", help="warum es im Image aus ist")
+    b = sub.add_parser("begruendung", help="why it is off in the image")
     b.add_argument("--id", required=True)
     b.add_argument("--text", required=True)
-    r = sub.add_parser("rm", help="Feature entfernen")
+    r = sub.add_parser("rm", help="Remove a feature")
     r.add_argument("--id", required=True)
     sh = sub.add_parser("show")
     sh.add_argument("--id")
     sub.add_parser("check")
     # Produkt-Features (Nutzer 29.09.): Soll/Ist je Modell, Commits nur als Bausteine
-    ps = sub.add_parser("produkt-set", help="Produkt-Feature anlegen/aendern (Soll, Bausteine)")
+    ps = sub.add_parser("produkt-set", help="Create/change a product feature (target, building blocks)")
     ps.add_argument("--id", required=True)
     ps.add_argument("--nr", type=int)
     ps.add_argument("--titel")
-    ps.add_argument("--soll", help="ein Satz, messbar")
-    ps.add_argument("--bausteine", help="Baustein-ids (features[].id), kommagetrennt; ersetzt die Liste")
-    pi = sub.add_parser("produkt-ist", help="Ist eines Modells setzen -- nur mit Beleg, sonst 'unbelegt'")
+    ps.add_argument("--soll", help="one sentence, measurable")
+    ps.add_argument("--bausteine", help="building block ids (features[].id), comma-separated; replaces the list")
+    pi = sub.add_parser("produkt-ist", help="Set the actual of a model -- only with evidence, otherwise 'unbelegt'")
     pi.add_argument("--id", required=True)
     pi.add_argument("--modell", required=True, choices=features.MODELS)
     pi.add_argument("--status", required=True, choices=features.PRODUKT_STATUS)
     pi.add_argument("--wert", default="")
-    pi.add_argument("--grund", default="", help="warum aus / offen")
-    pi.add_argument("--beleg", default="", help="Boot, Zahl, Datei")
+    pi.add_argument("--grund", default="", help="why off / open")
+    pi.add_argument("--beleg", default="", help="boot, number, file")
     pi.add_argument("--belegt-am", default=None,
-                    help="wann der Beleg entstand (ISO, z. B. 2026-09-29T07:10Z); Default jetzt. Älter als der "
-                         "letzte Boot des Modells = 'Ist veraltet, neu messen'")
-    pi.add_argument("--erreicht", choices=features.SOLL_ERREICHT, help="Soll erreicht? (getrennt vom Status)")
+                    help="when the evidence arose (ISO, e.g. 2026-09-29T07:10Z); default now. Older than the last boot of the model = 'Actual outdated, measure again'")
+    pi.add_argument("--erreicht", choices=features.SOLL_ERREICHT, help="Target reached? (separate from the status)")
     pi.add_argument("--erreicht-grund", default="")
-    er = sub.add_parser("erreicht", help="nur 'Soll erreicht?' eines Modells setzen, der Rest der Zelle bleibt")
+    er = sub.add_parser("erreicht", help="set only 'Target reached?' of a model, the rest of the cell stays")
     er.add_argument("--id", required=True)
     er.add_argument("--modell", required=True, choices=features.MODELS)
     er.add_argument("--wert", required=True, choices=features.SOLL_ERREICHT)
-    er.add_argument("--grund", default="", help="woran gemessen, z. B. '119 s gegen Soll ~21 s'")
-    kz = sub.add_parser("kreuz", help="Zelle der Kreuztabelle (Feature F2) setzen")
+    er.add_argument("--grund", default="", help="what it was measured by, e.g. '119 s against target ~21 s'")
+    kz = sub.add_parser("kreuz", help="Set a cell of the cross table (feature F2)")
     kz.add_argument("--id", default="F2")
     kz.add_argument("--modell", required=True, choices=features.MODELS)
     kz.add_argument("--a", required=True, choices=[k for k, _ in features.KREUZ_ACHSEN])
     kz.add_argument("--b", required=True, choices=[k for k, _ in features.KREUZ_ACHSEN])
     kz.add_argument("--status", required=True, choices=features.KREUZ_STATUS)
     kz.add_argument("--note", default="")
-    fi = sub.add_parser("zeile-ist", help="Ist einer Unterzeile setzen (F12 Format, F23 Prompt-Länge)")
+    fi = sub.add_parser("zeile-ist", help="Set the actual of a sub-row (F12 format, F23 prompt length)")
     fi.add_argument("--id", required=True)
-    fi.add_argument("--zeile", required=True, help="Name der Unterzeile, z. B. NVFP4")
+    fi.add_argument("--zeile", required=True, help="name of the sub-row, e.g. NVFP4")
     fi.add_argument("--modell", required=True, choices=features.MODELS)
     fi.add_argument("--status", choices=features.PRODUKT_STATUS)
     fi.add_argument("--wert", default="")
     fi.add_argument("--beleg", default="")
-    fi.add_argument("--belegt-am", default=None, help="ISO; Default jetzt")
-    mx = sub.add_parser("matrix", help="Zelle der Decode-Matrix (F24): Wert oder 'ungültig'; keine Zelle = ungemessen")
+    fi.add_argument("--belegt-am", default=None, help="ISO; default now")
+    mx = sub.add_parser("matrix", help="Cell of the decode matrix (F24): value or 'ungültig'; no cell = unmeasured")
     mx.add_argument("--id", default="F24")
     mx.add_argument("--modell", required=True, choices=features.MODELS)
     mx.add_argument("--form", required=True)
     mx.add_argument("--bs", required=True, choices=features.MATRIX_BS)
     mx.add_argument("--tiefe", required=True, choices=features.MATRIX_TIEFE)
     mx.add_argument("--text", required=True, choices=features.MATRIX_TEXT)
-    mx.add_argument("--wert", default="", help="mit Einheit, z. B. '24,7 ms' oder '131,9 tok/s'")
-    mx.add_argument("--ungueltig", action="store_true", help="Zelle ungültig (z. B. EOS unter 500 Tokens)")
+    mx.add_argument("--wert", default="", help="with unit, e.g. '24.7 ms' or '131.9 tok/s'")
+    mx.add_argument("--ungueltig", action="store_true", help="cell invalid (e.g. EOS below 500 tokens)")
     mx.add_argument("--boot", default="")
     mx.add_argument("--beleg", required=True)
-    im = sub.add_parser("import-27b", help="27B-Ist, Kreuztabelle, P1/P2 und Marker aus der 27B-Datei übernehmen")
+    im = sub.add_parser("import-27b", help="Take over the 27B actual, cross table, P1/P2 and markers from the 27B file")
     im.add_argument("--md", default="/spinning/gpu-arb/docs/features_27b_ist_0929.md")
-    bo = sub.add_parser("boot-override", help="Lebenszyklus eines Boots korrigiert anzeigen (state.json bleibt)")
-    bo.add_argument("--boot", required=True, help="boot_id aus state.json")
+    bo = sub.add_parser("boot-override", help="Show the lifecycle of a boot corrected (state.json stays)")
+    bo.add_argument("--boot", required=True, help="boot_id from state.json")
     bo.add_argument("--lifecycle", required=True)
     bo.add_argument("--beleg", required=True)
-    md = sub.add_parser("md", help="Produkt-Tabelle als Markdown (mit berechnetem im Image/aktiv der Bausteine)")
-    md.add_argument("--out", help="Datei, sonst stdout")
+    md = sub.add_parser("md", help="Product table as Markdown (with the calculated in image/active of the building blocks)")
+    md.add_argument("--out", help="file, otherwise stdout")
     md.add_argument("--live-url", default="http://127.0.0.1:8890/api/live",
-                    help="laufendes rigdash für 'Wert im aktuellen Boot' ('' = ohne)")
+                    help="running rigdash for 'Value in the current boot' ('' = without)")
     a = ap.parse_args(argv)
 
     if a.cmd == "md":
@@ -204,12 +203,12 @@ def main(argv=None) -> int:
                     lv = json.load(r)
                 boots, gpus = lv.get("boots") or [], lv.get("gpus")
             except (OSError, ValueError) as e:
-                print("Warnung: %s nicht lesbar (%s) -- nur state.json-Werte" % (a.live_url, e), file=sys.stderr)
+                print("Warning: %s not readable (%s) -- state.json values only" % (a.live_url, e), file=sys.stderr)
         text = markdown(features.attach_current(view, boots, gpus))
         if a.out:
             with open(a.out, "w") as fh:
                 fh.write(text)
-            print("geschrieben: %s" % a.out)
+            print("written: %s" % a.out)
         else:
             print(text)
         return 0
@@ -218,7 +217,7 @@ def main(argv=None) -> int:
         d = _load(a.file)
         if a.cmd == "check":
             probs = features.validate_doc(d)
-            print("\n".join(probs) if probs else "ok: %d Features" % len(d["features"]))
+            print("\n".join(probs) if probs else "ok: %d features" % len(d["features"]))
             return 1 if probs else 0
         out = [_find(d, a.id)] if a.id else d["features"]
         print(json.dumps(out, ensure_ascii=False, indent=1))
@@ -308,7 +307,7 @@ def main(argv=None) -> int:
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
-    print("geschrieben: %s (%s %s)" % (a.file, a.cmd, getattr(a, "id", None) or getattr(a, "boot", "")))
+    print("written: %s (%s %s)" % (a.file, a.cmd, getattr(a, "id", None) or getattr(a, "boot", "")))
     return 0
 
 
@@ -316,7 +315,7 @@ def _belegt_am(s) -> str:
     if s is None:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if features.belegt_ts(s) is None:
-        raise SystemExit("--belegt-am braucht ISO (2026-09-29T07:10Z oder 2026-09-29), nicht %r" % s)
+        raise SystemExit("--belegt-am needs ISO (2026-09-29T07:10Z or 2026-09-29), not %r" % s)
     return s
 
 
@@ -325,7 +324,7 @@ def _find_produkt(d: dict, pid: str, create: bool = False) -> dict:
         if p.get("id") == pid:
             return p
     if not create:
-        raise SystemExit("kein Produkt-Feature mit id %s" % pid)
+        raise SystemExit("no product feature with id %s" % pid)
     p = {"id": pid, "ist": {}, "bausteine": []}
     d["produkt"].append(p)
     return p
@@ -471,34 +470,31 @@ def _aktuell(p: dict, m: str) -> str:
     elif a.get("leer"):
         txt = a["leer"]
     elif a.get("kein_instrument"):
-        txt = "kein Instrument: " + a["kein_instrument"]
+        txt = "no instrument: " + a["kein_instrument"]
     else:
         return "—"
     jf = a.get("je_format") or {}
-    run = [f for f, v in jf.items() if v == "dieser Boot"]
+    run = [f for f, v in jf.items() if v == "this boot"]
     rest = [f for f in jf if f not in run]
     if run:
-        txt += " (Format %s%s)" % ("/".join(run), "; %s: kein Boot in diesem Format" % "/".join(rest) if rest else "")
+        txt += " (Format %s%s)" % ("/".join(run), "; %s: no boot in this format" % "/".join(rest) if rest else "")
     elif jf:
-        txt += " (Format des Boots unbekannt)"
+        txt += " (format of the boot unknown)"
     return txt
 
 
 def markdown(view: dict) -> str:
     """The product table for humans (FEATURES-SOLL-IST-*.md), from the same view the dashboard shows."""
     boots = {m["model"]: m.get("boot") or {} for m in view.get("models") or []}
-    out = ["# Features Soll/Ist je Modell", "",
-           "Erzeugt mit `features_update.py md` aus %s am %s UTC. Ist-Werte nur mit Beleg, sonst „unbelegt“; "
-           "27B-Werte vom 27B-Sitz (features_27b_ist_0929.md, per `import-27b`). Bausteine = Commits/Fixes, die das "
-           "Feature tragen; *im Image* / *aktiv* rechnet rigdash gegen den laufenden oder letzten Boot je Modell. "
-           "„Wert im aktuellen Boot“ zieht rigdash aus dem Boot (live.py/state.json), sonst steht der fehlende Marker da."
+    out = ["# Features target/actual per model", "",
+           "Generated with `features_update.py md` from %s on %s UTC. Actual values only with evidence, otherwise “unbelegt”; 27B values from the 27B seat (features_27b_ist_0929.md, via `import-27b`). Building blocks = commits/fixes that carry the feature; *in image* / *active* is calculated by rigdash against the running or last boot per model. “Value in the current boot” is taken by rigdash from the boot (live.py/state.json), otherwise the missing marker is shown."
            % (view.get("path"), time.strftime("%Y-%m-%d %H:%M", time.gmtime())), ""]
     for m in features.MODELS:
         b = boots.get(m) or {}
-        out.append("- %s-Boot: %s, REV %s, %s%s" % (m, b.get("rc") or b.get("boot_id") or "—", b.get("rev") or "—",
+        out.append("- %s boot: %s, REV %s, %s%s" % (m, b.get("rc") or b.get("boot_id") or "—", b.get("rev") or "—",
                                                   b.get("lifecycle") or "—",
-                                                  " (Override: %s)" % b["override_beleg"] if b.get("override_beleg") else ""))
-    out += ["", "| # | Feature | Soll | Ist 27B | Ist NF | Soll erreicht? 27B / NF | Status 27B / NF | Beleg | Wert im aktuellen Boot 27B / NF | Bausteine |",
+                                                  " (override: %s)" % b["override_beleg"] if b.get("override_beleg") else ""))
+    out += ["", "| # | Feature | Target | Actual 27B | Actual NF | Target reached? 27B / NF | Status 27B / NF | Evidence | Value in the current boot 27B / NF | Building blocks |",
             "|---|---|---|---|---|---|---|---|---|---|"]
     for p in view.get("produkt") or []:
         ist = p["ist"]
@@ -507,7 +503,7 @@ def markdown(view: dict) -> str:
             x = ist[m]
             v = x.get("wert") or ("unbelegt" if x["status"] == "unbelegt" else "—")
             if x.get("veraltet"):
-                v += " — **Ist veraltet, neu messen** (belegt %s, älter als der letzte Boot)" % x.get("belegt_am")
+                v += " — **Actual outdated, measure again** (belegt %s, older than the last boot)" % x.get("belegt_am")
             return _cell(v)
 
         def st(m):
@@ -532,8 +528,8 @@ def markdown(view: dict) -> str:
         fmts = []
         for _, _, x in mk:
             fmts += [f for f in x.get("je_format") or {} if f not in fmts]
-        out += ["", "## Instrument-Marker je Feature und Format (Quelle des Werts im aktuellen Boot)", "",
-                "| Feature | Modell | Marker | " + " | ".join(fmts) + " | Quelle |",
+        out += ["", "## Instrument markers per feature and format (source of the value in the current boot)", "",
+                "| Feature | Model | Marker | " + " | ".join(fmts) + " | Source |",
                 "|---|---|---|" + "---|" * len(fmts) + "---|"]
         for p, m, x in mk:
             jf = x.get("je_format") or {}
@@ -546,7 +542,7 @@ def markdown(view: dict) -> str:
             achsen = view.get("kreuz_achsen") or []
             for m in features.MODELS:
                 cells = (kt.get("zellen") or {}).get(m) or {}
-                out += ["", "## %s Kreuztabelle %s" % (p["id"], m), "",
+                out += ["", "## %s Cross table %s" % (p["id"], m), "",
                         "| | " + " | ".join(x["name"] for x in achsen) + " |",
                         "|---|" + "---|" * len(achsen)]
                 for i, a in enumerate(achsen):
@@ -561,7 +557,7 @@ def markdown(view: dict) -> str:
         ut = p.get("untertabelle")
         if ut and ut.get("zeilen"):
             out += ["", "## %s %s" % (p["id"], p["titel"]), "",
-                    "| %s | Soll | Ist 27B | Ist NF | im aktuellen Boot |" % (ut.get("spalte") or "Zeile"),
+                    "| %s | Target | Actual 27B | Actual NF | in the current boot |" % (ut.get("spalte") or "Row"),
                     "|---|---|---|---|---|"]
             for z in ut["zeilen"]:
                 def zc(m):
@@ -577,7 +573,7 @@ def markdown(view: dict) -> str:
         if mx:
             out += matrix_markdown(p, mx)
     if view.get("problems"):
-        out += ["", "## Probleme", ""] + ["- " + _cell(x) for x in view["problems"]]
+        out += ["", "## Problems", ""] + ["- " + _cell(x) for x in view["problems"]]
     return "\n".join(out) + "\n"
 
 
@@ -594,7 +590,7 @@ def matrix_markdown(p: dict, mx: dict) -> list:
                 forms.append(f)
         out += ["", "## %s Decode-Matrix %s" % (p["id"], m)]
         if not forms:
-            out += ["", "alle Zellen ungemessen"]
+            out += ["", "all cells unmeasured"]
             continue
         for f in forms:
             rows = []
@@ -602,8 +598,8 @@ def matrix_markdown(p: dict, mx: dict) -> list:
                 for x in features.MATRIX_TEXT:
                     if any(features.matrix_key(f, bs, t, x) in cells for bs in features.MATRIX_BS):
                         rows.append((t, x))
-            out += ["", "**%s** (übrige Tiefe/Text-Zeilen: ungemessen)" % _cell(f), "",
-                    "| Tiefe | Text | " + " | ".join("bs%s" % b for b in features.MATRIX_BS) + " | Beleg |",
+            out += ["", "**%s** (remaining depth/text rows: unmeasured)" % _cell(f), "",
+                    "| Depth | Text | " + " | ".join("bs%s" % b for b in features.MATRIX_BS) + " | Evidence |",
                     "|---|---|" + "---|" * len(features.MATRIX_BS) + "---|"]
             for t, x in rows:
                 vals, belege = [], []

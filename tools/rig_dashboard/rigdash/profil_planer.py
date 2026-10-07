@@ -21,24 +21,24 @@ FORM_BACKEND = {"einzel": "single", "tp": "tp", "flip": "flip", "dual": "dual"}
 
 #: die vier Formen (Plan R2); ``n_min``/``n_max`` = zulässige Kartenzahl (R2: Einzelkarte N=1, die übrigen N>=2; topology.py MIN_CARDS)
 FORMEN: List[Dict[str, Any]] = [
-    {"id": "einzel", "name": "Einzelkarte", "n_min": 1, "n_max": 1,
-     "satz": "Eine Karte, ein Rang: der normale Server ohne den weg2-Launcher, zum Beispiel ein Laptop. Der Vorschlag ist dort eine Rechnung des Planers, kein Launcher-Lauf.",
-     "quelle": "PLAN-PROFIL-PLANER-1006 R2 und R5b (Nutzer 06.10.)"},
-    {"id": "tp", "name": "Nur TP", "n_min": 2, "n_max": None,
-     "satz": "Nur die Decode-Gruppe D: alle Karten arbeiten als eine Tensor-Parallel-Gruppe, ohne Prefill-Gruppe, ohne Wechsel und ohne Front (Flag --d-only, ab zwei Karten).",
-     "quelle": "Katalogtext von --d-only (Nutzer 25.09.)"},
+    {"id": "einzel", "name": "Single card", "n_min": 1, "n_max": 1,
+     "satz": "One card, one rank: the normal server without the weg2 launcher, for example a laptop. The proposal there is a planner calculation, not a launcher run.",
+     "quelle": "PLAN-PROFIL-PLANER-1006 R2 and R5b (user 06.10.)"},
+    {"id": "tp", "name": "TP only", "n_min": 2, "n_max": None,
+     "satz": "Only the decode group D: all cards work as one tensor-parallel group, without a prefill group, without switching and without a front (flag --d-only, from two cards).",
+     "quelle": "Catalog text of --d-only (user 25.09.)"},
     {"id": "flip", "name": "Flip PP/TP", "n_min": 2, "n_max": None,
-     "satz": "Die Standardform: dieselben Karten arbeiten abwechselnd als Prefill-Gruppe P (Pipeline, liest den langen Eingabetext) und als Decode-Gruppe D (Tensor-parallel, rechnet die Antwort); der Server wechselt zwischen beiden (ab zwei Karten).",
-     "quelle": "PLAN-PROFIL-PLANER-1006 R2; Glossar des Katalogs (P, D, Flip)"},
+     "satz": "The standard form: the same cards work alternately as prefill group P (pipeline, reads the long input text) and as decode group D (tensor-parallel, computes the answer); the server switches between the two (from two cards).",
+     "quelle": "PLAN-PROFIL-PLANER-1006 R2; glossary of the catalog (P, D, flip)"},
     {"id": "dual", "name": "Dual PP/TP", "n_min": 2, "n_max": None,
-     "satz": "P (Pipeline) und D (Tensor-parallel) sind gleichzeitig wach, auf denselben Karten; die Front wechselt nie (Flag --dual-layout, ab zwei Karten, nur im 27B-Baum).",
-     "quelle": "PLAN-PROFIL-PLANER-1006 R2 und R3 (Nutzer 06.10.); Katalogtext von --dual-layout"},
+     "satz": "P (pipeline) and D (tensor-parallel) are awake at the same time, on the same cards; the front never switches (flag --dual-layout, from two cards, only in the 27B tree).",
+     "quelle": "PLAN-PROFIL-PLANER-1006 R2 and R3 (user 06.10.); catalog text of --dual-layout"},
 ]
 
 #: die Abschnitte der Seite und die Namen ihrer Werte (Wireframe Abschnitt 5; jeder Name steht im Katalog, ``test_profil_planer_aph1_1006``)
 ABSCHNITTE: List[Dict[str, Any]] = [
-    {"id": "A", "titel": "A  Aufteilung auf die Karten",
-     "satz": "Wie das Modell auf die Karten verteilt wird: Layer je Karte (Prefill), Gewichte je Karte (Decode), Speicherbudget und Speicherposten (Fremdkontext, Nicht-Torch, Reserven, L15, Extend-Trim) je Karte.",
+    {"id": "A", "titel": "A  Split across the cards",
+     "satz": "How the model is distributed across the cards: layers per card (prefill), weights per card (decode), memory budget and memory items (foreign context, non-torch, reserves, L15, extend trim) per card.",
      "namen": ["--pp-size", "--tp-size", "--pp-stage-ratio", "--pp-attn-stage-ratio", "--pp-layer-ratio", "--pp-layer-set", "--pp-solve-objective",
                "--pp-solve-pool-floor", "--pp-solve-cut", "--pp-cut-expert-device-fraction", "--pp-cut-expert-lru-rows", "--p-layer-split",
                "--p-attn-head-split", "--rank-gpu-id", "--rank-gpu-memory-mib", "--rank-role", "--rank-tp-ratio", "--rank-mlp-ratio",
@@ -47,12 +47,12 @@ ABSCHNITTE: List[Dict[str, Any]] = [
                # Positionale Je-Karte-Vektoren des Launchers (POSITIONAL_VECTOR_FLAGS/-TOKENS, launcher.py): Speicherposten je Karte, Release-Profile nf*/27b* setzen sie
                "--d-foreign-context-mib", "--d-nontorch-mib", "--d-reserve-mib", "--pp-cut-reserve-mib",
                "SGLANG_WEG2_L15_MIB", "SGLANG_WEG2_EXTEND_TRIM_MIB"]},
-    {"id": "B", "titel": "B  KV: Köpfe, Token-Anteile, DCP",
-     "satz": "Wo der KV-Cache liegt: wie viele Token je Karte, ob ungleiches DCP gilt. Die KV-Köpfe je Rang sind abgeleitet und nur eine Anzeige.",
+    {"id": "B", "titel": "B  KV: heads, token shares, DCP",
+     "satz": "Where the KV cache lives: how many tokens per card, whether uneven DCP applies. The KV heads per rank are derived and only a display.",
      "namen": ["--dcp-size", "--uneven-dcp", "--uneven-dcp-weighted", "--rank-kv-ratio", "SGLANG_UNEVEN_TOKEN_VECTOR", "--uneven-token-vector",
                "--d-uneven-token-vector", "--d-kv-token-cut", "--d-token-placement", "--kv-reshard-vectors"]},
-    {"id": "C", "titel": "C  Experten (MoE)",
-     "satz": "Wie viele Experten je Karte im VRAM liegen und wie die Experten verteilt sind (nur bei MoE-Modellen wirksam).",
+    {"id": "C", "titel": "C  Experts (MoE)",
+     "satz": "How many experts per card are in VRAM and how the experts are distributed (effective only for MoE models).",
      "namen": ["--rank-moe-resident-fraction", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "SGLANG_UNEVEN_MOE_EXPERT_SHARD", "SGLANG_UNEVEN_MOE_VECTOR",
                "SGLANG_MOE_SCRATCH_SLOTS", "--expert-placement-override"]},
 ]
@@ -77,19 +77,15 @@ DUAL = {
     "starve_age_default": 60.0,         # dual_share.py:157
     "starve_max_default": 1,            # dual_share.py:158
     "retry_default": 0,                 # environ.py:684 (0 = aus)
-    "quelle": {"table": "dual_green.py:1071 (Standard), :1097 (Format), :1204-1224 (Eintrittsstufe), :1255-1256 (D leer -> Stufe 0)",
-               "starve": "dual_share.py:157-158 (Standard), :414-417 (Klemme); dual_green.py:1319-1322",
-               "retry": "environ.py:679-684; dual_p_kv_stage.py:668-681, :893 (nur Dual-Layout, 0 = aus)"},
+    "quelle": {"table": "dual_green.py:1071 (default), :1097 (format), :1204-1224 (entry rung), :1255-1256 (D empty -> rung 0)",
+               "starve": "dual_share.py:157-158 (default), :414-417 (clamp); dual_green.py:1319-1322",
+               "retry": "environ.py:679-684; dual_p_kv_stage.py:668-681, :893 (dual layout only, 0 = off)"},
     "texte": {
-        "stufen": "Stufe 0, 1, 2, 3 = Ps Anteil an den Recheneinheiten der Karte: 100, 75, 50, 25 Prozent (Standard der Stufen, SGLANG_WEG2_DUAL_SHARE_RUNGS).",
-        "tabelle": "Wenn D nach Leerlauf wieder decodet und keine Mindestrate gesetzt ist, wählt die erste Zeile, deren Schwelle die D-Sitze erreicht oder übersteigt, "
-                   "die Eintrittsstufe von P: die Spalte \"tau niedrig\" oder \"tau hoch\" (tau = wartende P-Arbeit in Sekunden; hoch = über der oberen Kante, Standard 10 s). "
-                   "Ist D leer (0 Sitze), steht P immer bei 100 Prozent. Danach regelt die Front auf die gemessene D-Rundenzeit nach.",
-        "klemme": "Aushungerungs-Klemme: wartet die älteste P-Anfrage länger als die eingestellten Sekunden, wird Ps Stufe auf höchstens die Klemmenstufe begrenzt, "
-                  "egal was die Tabelle sagt. Die tiefste Stufe der Leiter (3) schaltet die Klemme aus.",
-        "retry": "Wartende P-Anfragen fragen sonst bei jeder Scheduler-Runde nach KV-Platz (Code-Standard 0 = Dauerschleife, Ticket #1530). "
-                 "Mit N größer 0 fragen sie höchstens alle N Millisekunden, sofort bei einer Änderung im Karten-Ledger.",
-        "nur_dual": "Alle vier Werte wirken nur im Dual-Layout. Die Tabelle wirkt nur mit --dual-priority dynamic, --dual-share-actuators green und --dual-green-ladder on.",
+        "stufen": "Rung 0, 1, 2, 3 = P's share of the compute units of the card: 100, 75, 50, 25 percent (default of the rungs, SGLANG_WEG2_DUAL_SHARE_RUNGS).",
+        "tabelle": "When D decodes again after idling and no minimum rate is set, the first row whose threshold the D seats reach or exceed selects the entry rung of P: the column \"tau low\" or \"tau high\" (tau = waiting P work in seconds; high = above the upper edge, default 10 s). If D is empty (0 seats), P always stands at 100 percent. Afterwards the front readjusts to the measured D round time.",
+        "klemme": "Starvation clamp: if the oldest P request waits longer than the set seconds, P's rung is limited to at most the clamp rung, whatever the table says. The lowest rung of the ladder (3) switches the clamp off.",
+        "retry": "Waiting P requests otherwise ask for KV space in every scheduler round (code default 0 = busy loop, ticket #1530). With N greater than 0 they ask at most every N milliseconds, immediately on a change in the card ledger.",
+        "nur_dual": "All four values act only in the dual layout. The table acts only with --dual-priority dynamic, --dual-share-actuators green and --dual-green-ladder on.",
     },
 }
 
@@ -148,9 +144,9 @@ def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[s
         d = dict(f, backend=back, vorschlag=bool(oracle and back in can))
         if not d["vorschlag"]:
             if not oracle:
-                d["hinweis"] = "Der Vorschlag braucht das Orakel (Launcher-Trockenlauf), das in diesem Dashboard nicht eingerichtet ist; die Werte lassen sich von Hand setzen."
+                d["hinweis"] = "The proposal needs the oracle (launcher dry run), which is not set up in this dashboard; the values can be set by hand."
             else:
-                d["hinweis"] = "Für diese Form gibt es in diesem Stand keinen Vorschlag; die Werte lassen sich von Hand setzen."
+                d["hinweis"] = "There is no proposal for this form in this version; the values can be set by hand."
         formen.append(d)
     ents = entries or {}
     out = {"schema": SCHEMA, "formen": formen, "abschnitte": [dict(a) for a in ABSCHNITTE], "vektoren": vector_names(),
