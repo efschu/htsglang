@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import re
@@ -857,6 +858,88 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             im_start_id=self.vision_start_token_id,
             im_end_id=self.vision_end_token_id,
             im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )
+
+    def image_cache_fingerprint(self) -> str:
+        """Everything besides an image's own bytes that decides its grid and
+        pixels in this processor: the HF image processor's settings and the
+        ``mm_process_config`` image section (D-MM-ITEM-CACHE-1007)."""
+        image_processor = self._processor.image_processor
+        return json.dumps(
+            {
+                "class": type(image_processor).__name__,
+                "config": image_processor.to_dict(),
+                "image_config": self.image_config,
+                "fast_processor": not self.disable_fast_image_processor,
+            },
+            sort_keys=True,
+            default=str,
+        )
+
+    def build_output_for_known_images(
+        self,
+        *,
+        compact_ids: List[int],
+        hashes: List[int],
+        grids: List[torch.Tensor],
+        token_counts: List[int],
+    ) -> Optional[MultimodalProcessorOutput]:
+        """The output :meth:`process_mm_data_async` gives an image-only prompt,
+        rebuilt from what an earlier run learned of each image -- its content
+        hash, its grid and its token count -- without loading or preprocessing
+        a pixel (D-MM-ITEM-CACHE-1007, a group without a tower).
+
+        ``compact_ids`` is the prompt tokenized with ONE placeholder per image
+        (the chat template's render). The HF processor tokenizes the same text
+        with each placeholder repeated; the placeholder is a special added
+        token, so the text between them tokenizes alike and the expansion
+        below reproduces its ids. The items leave without ``feature``: their
+        ``hash`` is set, so no scheduler rank hashes them, and a group that
+        never encodes an image never reads one. ``None`` when the prompt does
+        not have the shape the known images describe."""
+        image_token_id = self.mm_tokens.image_token_id
+        input_ids_list = self._expand_input_ids(
+            compact_ids, token_counts, image_token_id
+        )
+        input_ids = torch.tensor(input_ids_list, dtype=torch.long)
+        offsets = self.get_mm_items_offset(
+            input_ids=input_ids, mm_token_id=image_token_id
+        )
+        if len(offsets) != len(hashes):
+            return None
+        mm_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=image_hash,
+                offsets=[offset],
+                model_specific_data={"image_grid_thw": grid.clone()},
+            )
+            for image_hash, grid, offset in zip(hashes, grids, offsets)
+        ]
+        mrope_result = self._compute_image_only_mrope_positions_from_offsets(
+            input_len=input_ids.numel(),
+            mm_items=mm_items,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        if mrope_result is None:
+            return None
+        mrope_positions, mrope_position_delta = mrope_result
+        if mrope_positions.ndim == 3:
+            mrope_positions = mrope_positions.squeeze(1)
+        return MultimodalProcessorOutput(
+            input_ids=input_ids_list,
+            padded_input_ids=MultimodalProcessorOutput.build_padded_input_ids(
+                input_ids_list, mm_items
+            ),
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=image_token_id,
             video_token_id=self.mm_tokens.video_token_id,
             audio_token_id=self.mm_tokens.audio_token_id,
             mrope_positions=mrope_positions,

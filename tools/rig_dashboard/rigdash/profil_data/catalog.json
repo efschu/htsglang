@@ -38317,6 +38317,34 @@
    "text": "Glättungsfaktor der dynamischen Chunk-Größe in der Pipeline: bestimmt, wie stark sich die Chunk-Größe dem errechneten Wert pro Schritt annähert (weniger abruptes Schrumpfen).",
    "type": "EnvFloat"
   },
+  "SGLANG_D_MM_ITEM_CACHE_ENTRIES": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "64",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_D_MM_ITEM_CACHE_ENTRIES",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_D_MM_ITEM_CACHE_ENTRIES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4517
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "EnvInt"
+  },
   "SGLANG_EAGER_INPUT_NO_COPY": {
    "baeume": [
     "27b",
@@ -38602,6 +38630,34 @@
     "file": "environ.py",
     "kind": "environ",
     "line": 4357
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_ENABLE_D_MM_ITEM_CACHE": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "D-MM-ITEM-CACHE-1007: group D (multimodal tokenizer, no tower) keeps the hash, grid and token count of every inline image it tokenized and builds a request whose images it has all seen without loading or preprocessing their pixels (weg2/d_mm_item_cache.py). Off: the processor runs as before.",
+   "id": "SGLANG_ENABLE_D_MM_ITEM_CACHE",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_ENABLE_D_MM_ITEM_CACHE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4516
    },
    "status": "geerntet",
    "text": "",
@@ -65391,7 +65447,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4062
+      "line": 4074
      }
     }
    },
@@ -76489,7 +76545,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 1158
+      "line": 1170
      }
     }
    },
@@ -83122,7 +83178,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4177
+      "line": 4189
      }
     }
    },
@@ -85193,25 +85249,25 @@
    "abweichung": 43,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 29
+   "nur_nf": 31
   },
-  "entries": 2688,
-  "envs": 1811,
+  "entries": 2690,
+  "envs": 1813,
   "erklaert": 304,
   "flags": 862,
-  "geerntet": 1664,
+  "geerntet": 1665,
   "kuratiert": 119,
-  "unerklaert": 601
+  "unerklaert": 602
  },
- "tree_rev": "27b=65fc0e2076+nf=55e463937f",
+ "tree_rev": "27b=65fc0e2076+nf=c5da548b7c+hebel1",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "65fc0e2076"
   },
   "nf": {
-   "entries": 2490,
-   "rev": "55e463937f"
+   "entries": 2492,
+   "rev": "c5da548b7c+hebel1"
   }
  },
  "warnungen": []

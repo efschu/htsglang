@@ -315,6 +315,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # that overrides that method cannot turn the admission check into an
     # AttributeError.
     mm_lane_refusal = None
+    # D-MM-ITEM-CACHE-1007: set in maybe_init_d_mm_item_cache; None = the
+    # processor runs for every image request, as before.
+    d_mm_item_cache = None
 
     @property
     def serving_chat_class(self):
@@ -348,6 +351,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
+
+        # Init group D's image item cache (weg2, off by default)
+        self.maybe_init_d_mm_item_cache()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -518,6 +524,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    def maybe_init_d_mm_item_cache(self):
+        from sglang.srt.weg2.d_mm_item_cache import build_d_mm_item_cache
+
+        self.d_mm_item_cache = build_d_mm_item_cache(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            mm_processor=self.mm_processor,
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -951,6 +966,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
+        # D-MM-ITEM-CACHE-1007: the ids tokenized from ``input_text`` here, None
+        # when the prompt's ids came from anywhere else
+        text_ids = None
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
@@ -984,6 +1002,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 input_ids, token_type_ids = await self._tokenize_texts(
                     input_text, is_cross_encoder_request
                 )
+                text_ids = input_ids
 
         contains_mm_input = obj.contains_mm_input()
         is_mossvl = (
@@ -1031,13 +1050,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
-                    )
+                    if self.d_mm_item_cache is not None:
+                        mm_inputs = await self.d_mm_item_cache.process(
+                            obj=obj,
+                            prompt=(input_text or input_ids),
+                            compact_ids=text_ids,
+                            max_req_input_len=self.max_req_input_len,
+                        )
+                    else:
+                        mm_inputs = await self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=(input_text or input_ids),
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
             elif (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend

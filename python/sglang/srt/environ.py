@@ -4509,6 +4509,12 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # D-MM-ITEM-CACHE-1007: group D (multimodal tokenizer, no tower) keeps the
+    # hash, grid and token count of every inline image it tokenized and builds
+    # a request whose images it has all seen without loading or preprocessing
+    # their pixels (weg2/d_mm_item_cache.py). Off: the processor runs as before.
+    SGLANG_ENABLE_D_MM_ITEM_CACHE = EnvBool(False)
+    SGLANG_D_MM_ITEM_CACHE_ENTRIES = EnvInt(64)
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
