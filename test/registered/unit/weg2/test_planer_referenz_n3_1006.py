@@ -71,6 +71,19 @@ sub-command).  Measured 2026-10-06 on tree 173161c595: run-to-run diff 0 lines (
 ``deskq/work/hw1004/plan_dump.py`` on the same profile and the same inputs (PROFILE_ARGS only, no exported env) 0 value
 differences, only the path tokens this harness normalises.
 
+LAUNCHER LINES (07.10., NF seat finding "27 of 234 red on the NF line"): the same test code runs on the 27B launcher line
+(``desk/planer-abnahme-1006``) and on the NF line (``desk/nf-nf22-integ-1006`` + the planer import).  The line is read from the
+launcher's own argument parser (``propose_oracle.launcher_line``: ``--dual-priority`` and ``--pp-cut-stage-model`` known = 27B,
+neither = NF; ``--p-chunk-policy`` is NOT a marker, both lines have it).  The 27B release profiles (27b-base, 27b-nvfp4-dual) are
+profiles of the 27B line: the NF launcher cannot plan them (measured 2026-10-07 on tree 2e68b3f94b: 27b-base -> SystemExit
+``--p-chunk-policy dynamic: need 0 < min_tokens <= max_tokens, got 4096/2048``, 27b-nvfp4-dual -> argparse exit 2 because
+``--dual-*`` is unknown), so the tests that pin a 27B golden SKIP there with that reason; the tests that prove a property of the
+harness (golden independent of the run and of the evidence dir, state left behind, ``--force`` plumbing) run on the REFERENCE
+PROFILE of the line (27b-base on the 27B line, nf-int4-h6-abl on the NF line).  Goldens of another line than the root files
+sit in ``golden/<line>/`` (``golden/nf/plan_nf_abl_n3.txt``: the NF launcher prints a ``HW-TOPOLOGY N=3`` line, no
+``PP-CUT STAGE MODEL`` line and other ``EXTEND-RATE``/``EXTEND-STUECKELUNG`` lines than the 27B launcher; 4 hunks); the root
+files stay the 27B-line goldens (``propose_oracle.golden_path``).
+
 GPU-free, NVML-free, Docker-free.
 """
 
@@ -164,6 +177,31 @@ def _nf_checkpoint_present() -> bool:
     real = (os.path.isfile(os.path.join(MC + _NF_NAMES[0], "config.json")) and os.path.isdir(MC + _NF_NAMES[1])
             and bool(os.listdir(MC + _NF_NAMES[1])))
     return real or all(n in snaps for n in _NF_NAMES)
+
+
+#: the launcher line of this tree (argument-parser probe, never a sha or a branch name)
+_LINE = O.launcher_line()
+_UNKNOWN_MARKERS = [f for f in O.LINE_MARKER_FLAGS if not O.launcher_knows(f)]
+_ON_27B_LINE = unittest.skipUnless(
+    _LINE == O.LINE_27B,
+    "27B launcher line only: the launcher of %s does not know %s (line %r); the 27B release profiles are not plannable by it "
+    "(measured 2026-10-07 on tree 2e68b3f94b: 27b-base -> SystemExit '--p-chunk-policy dynamic: need 0 < min_tokens <= "
+    "max_tokens, got 4096/2048', 27b-nvfp4-dual -> argparse exit 2, --dual-* unknown)" % (TREE, ", ".join(_UNKNOWN_MARKERS) or "-", _LINE))
+#: the reference profile and golden of this line (what the line-neutral harness tests run)
+_REF_PROFILE, _REF_GOLDEN = (("27b-base", "plan_27b_flip_n3.txt") if _LINE == O.LINE_27B
+                             else ("nf-int4-h6-abl", "plan_nf_abl_n3.txt"))
+
+
+def _golden_file(name: str) -> str:
+    return O.golden_path(GOLDEN, name, _LINE)
+
+
+def _ref_run_possible() -> bool:
+    return _have(_CENSUS_27B) if _LINE == O.LINE_27B else _nf_checkpoint_present()
+
+
+_NEEDS_REF_RUN = unittest.skipUnless(
+    _ref_run_possible(), "reference profile %s of the %s line: its census / header snapshots are not on this box" % (_REF_PROFILE, _LINE))
 
 
 def _load_catalog():
@@ -585,7 +623,7 @@ def _assert_zero_diff(tc: unittest.TestCase, golden_name: str, run) -> None:
     res = run.result
     tc.assertIsNone(res.exc_type, "%s: %s" % (res.exc_type, res.exc_msg[:300]))
     tc.assertEqual(res.rc, 0)
-    d = O.diff_lines(_read(os.path.join(GOLDEN, golden_name)), res.dump())
+    d = O.diff_lines(_read(_golden_file(golden_name)), res.dump())
     tc.assertEqual(d, [], "plan diff vs %s: %d lines\n%s" % (golden_name, len(d), "\n".join(x[:240] for x in d[:12])))
 
 
@@ -598,6 +636,7 @@ class TestDryRunGolden(unittest.TestCase):
         self.assertEqual(dict(os.environ), self.env_before)
         self.assertFalse(refusals.forced_boot())
 
+    @_ON_27B_LINE
     @_NEEDS_27B_FLIP
     def test_27b_flip_dump_equals_golden(self):
         self.assertTrue(_flip_snapshots_present(), "27B Flip release-checkpoint header snapshots missing under fixtures/planer_1006/checkpoints")
@@ -610,28 +649,29 @@ class TestDryRunGolden(unittest.TestCase):
         # the plan is priced on the RELEASE model, not the sibling: the launcher recognises it as the reference model
         self.assertTrue(any("WEG2-HOST-REFERENCE-MODEL" in ln and "APPLY to this boot" in ln for ln in run.result.text.splitlines()))
 
-    @_NEEDS_27B_FLIP
+    @_NEEDS_REF_RUN
     def test_27b_flip_golden_does_not_depend_on_the_run(self):
-        """Another scratch dir AND the replay synthesised from a real hardware profile: the same plan."""
+        """Another scratch dir AND the replay synthesised from a real hardware profile: the same plan.  (Reference profile of the
+        launcher line: 27B Flip on the 27B line, NF abl on the NF line.)"""
         rows = O.replay_from_hardware_profile(_hardware_profile_of(O.read_replay(REPLAY_REF)))
         with tempfile.TemporaryDirectory(prefix="ap0-other-scratch-") as td:
-            run = _dump_of("27b-base", rows, scratch=td)
-        _assert_zero_diff(self, "plan_27b_flip_n3.txt", run)
+            run = _dump_of(_REF_PROFILE, rows, scratch=td)
+        _assert_zero_diff(self, _REF_GOLDEN, run)
 
-    @_NEEDS_27B_FLIP
+    @_NEEDS_REF_RUN
     def test_a_forced_two_card_run_leaves_no_state_for_the_next_plan(self):
         """``launcher.main`` fills process caches (``corridor_guard._RIG_FP_CACHE``) and sets the inventory view / exchange
         geometry.  Measured 2026-10-06: after a ``--force`` run on two cards the next THREE-card run of the same process was
         refused (W40) instead of planned.  The oracle restores the module state: the plan after the forced run is the golden."""
         two = [dict(r, index=i) for i, r in enumerate(d for d in O.read_replay(REPLAY_REF) if d["index"] in (1, 2))]
-        forced = _dump_of("27b-base", two, force=True)
+        forced = _dump_of(_REF_PROFILE, two, force=True)
         self.assertIsNotNone(forced.result.exc_type)
         from sglang.srt.managers import corridor_guard
         self.assertEqual(len(corridor_guard._RIG_FP_CACHE), 0)      # the cache the forced run filled is back to its entry state
-        run = _dump_of("27b-base", O.read_replay(REPLAY_REF))
-        _assert_zero_diff(self, "plan_27b_flip_n3.txt", run)
+        run = _dump_of(_REF_PROFILE, O.read_replay(REPLAY_REF))
+        _assert_zero_diff(self, _REF_GOLDEN, run)
 
-    @_NEEDS_27B_FLIP
+    @_NEEDS_REF_RUN
     def test_golden_does_not_move_when_the_evidence_dir_grows(self):
         """The launcher names every ``boot_*.D.log`` of the evidence dir in W65 (``find_dual_d_measurement``): a boot of the
         rig adds one.  An OVERLAY of the live dir (every entry linked) plus one NEWER, unrelated D log: the plan is the
@@ -645,11 +685,13 @@ class TestDryRunGolden(unittest.TestCase):
                 os.symlink(os.path.join(live, n), os.path.join(td, n))
             with open(os.path.join(td, name), "w") as fh:
                 fh.write("not a boot log: the oracle must only list it\n")
-            run = O.run_profile(_p("27b-base"), O.read_replay(REPLAY_REF), tree=TREE, evidence_dir=td)
+            run = _dump_of(_REF_PROFILE, O.read_replay(REPLAY_REF), evidence_dir=td)
+        self.assertIsNone(run.result.exc_type, "%s: %s" % (run.result.exc_type, run.result.exc_msg[:300]))   # a run that stopped early lists no log
         self.assertIn(name, run.result.raw)                       # the overlay really was the evidence dir of the run
         self.assertNotIn(td, run.result.text)                     # ... and the text is normalised back to the live path
-        _assert_zero_diff(self, "plan_27b_flip_n3.txt", run)
+        _assert_zero_diff(self, _REF_GOLDEN, run)
 
+    @_ON_27B_LINE
     @_NEEDS_27B_DUAL
     def test_27b_dual_dump_equals_golden(self):
         run = _dump_of("27b-nvfp4-dual", O.read_replay(REPLAY_REF))
@@ -670,7 +712,7 @@ class TestDryRunGolden(unittest.TestCase):
 
     def test_nf_abl_dump_equals_golden(self):
         self.assertTrue(_nf_checkpoint_present(), "NF abl header snapshots missing under fixtures/planer_1006/checkpoints")
-        self.assertTrue(os.path.isfile(os.path.join(GOLDEN, "plan_nf_abl_n3.txt")))
+        self.assertTrue(os.path.isfile(_golden_file("plan_nf_abl_n3.txt")))
         run = _dump_of("nf-int4-h6-abl", O.read_replay(REPLAY_REF))
         _assert_zero_diff(self, "plan_nf_abl_n3.txt", run)
         self.assertEqual(len(run.notes), 3)           # model stub, draft stub, census-foreign: nothing silent
@@ -690,9 +732,11 @@ class TestDryRunGolden(unittest.TestCase):
 
         snaps = _snapshots()
         for golden, prof in self._GOLDEN_PROVENANCE:
-            side = json.loads(_read(os.path.join(GOLDEN, golden + ".provenance.json")))
+            side = json.loads(_read(_golden_file(golden + ".provenance.json")))
             self.assertEqual(side["golden"], golden + ".txt")
-            self.assertTrue(os.path.isfile(os.path.join(GOLDEN, side["golden"])), golden)
+            self.assertTrue(os.path.isfile(_golden_file(side["golden"])), golden)
+            if golden == "plan_nf_abl_n3" and _LINE == O.LINE_NF:        # the golden of the NF line names the line it was made on
+                self.assertEqual(side.get("launcher_line"), O.LINE_NF, golden)
             self.assertEqual(side["profile"]["sha256"], PROVENANCE[prof + ".env"], golden)
             self.assertEqual(sha(_p(prof)), side["profile"]["sha256"], golden)
             for inp in side.get("profile_inputs", {}).values():
@@ -760,15 +804,15 @@ class TestDryRunGolden(unittest.TestCase):
         self.assertEqual(seen["CUDA_VISIBLE_DEVICES"], "")
         self.assertTrue(seen["SGLANG_NVML_REPLAY_JSON"].endswith("nvml_replay.json"))
 
-    @_NEEDS_27B_FLIP
+    @_NEEDS_REF_RUN
     def test_force_plumbing_on_two_cards(self):
         """N=2 is refused by name (HW-COUNT); --force goes past it and the oracle reports it, the next refusal is the result."""
         two = [dict(r, index=i) for i, r in enumerate(d for d in O.read_replay(REPLAY_REF) if d["index"] in (1, 2))]
-        plain = _dump_of("27b-base", two)
+        plain = _dump_of(_REF_PROFILE, two)
         self.assertEqual(plain.result.exc_type, "Weg2LaunchRefused")
         self.assertIn("HW-COUNT", plain.result.exc_msg)
         self.assertEqual(plain.result.forced, [])
-        forced = _dump_of("27b-base", two, force=True)
+        forced = _dump_of(_REF_PROFILE, two, force=True)
         self.assertIn("HW-COUNT", [f["code"] for f in forced.result.forced])
         self.assertIn("--force", forced.result.argv)
         self.assertNotIn("--force", plain.result.argv)
