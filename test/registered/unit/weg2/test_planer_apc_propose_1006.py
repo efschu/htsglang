@@ -393,7 +393,7 @@ class TestInputs(unittest.TestCase):
     def test_forms_that_are_other_packages_and_bad_input_raise(self):
         hw, _ = _inventory("n2")
         modell, draft = _MODELS["27b"]
-        for form in ("dual", "single", "einzel"):
+        for form in ("single", "einzel"):                             # dual is AP-E now (test_planer_ape_dual_1006)
             with self.assertRaises(P.ProposeError) as cm:
                 P.propose(hw, modell, form, {})
             self.assertIn("AP-", str(cm.exception))

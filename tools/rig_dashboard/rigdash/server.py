@@ -15,6 +15,8 @@ Routes
   POST /api/hwprofil/recapture "Neu erfassen" (AP-A): gespeichertes Hardwareprofil aus NVML ersetzen (kein GPU-Fenster, auch release)
   GET  /api/hwprofil/issue     Issue-Text "Hardwareprofil" (Markdown zum Kopieren, redigiert)
   POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|compute|move|chunk|context, settings?, phases?}
+  POST /api/profil/propose     Startprofil des Planers (AP-D, nur LAN): {basis: {kind, name}, form: flip|tp, inventar: "rig" | [{card, pcie}], ziele?, model_path?, draft_path?}
+                               -> propose() + Orakel (Launcher-Trockenlauf im Kindprozess, Cache) + Verdikte; flliper.server/1 mit Herkunft/Verdikt/Kanten je Wert
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 from . import (energy, features, flipzeit, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
-               modellprofil, profil, profil_recompute, redact, sampler, sources, vmpush, weg2line)
+               modellprofil, profil, profil_oracle, profil_recompute, redact, sampler, sources, vmpush, weg2line)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -249,8 +251,14 @@ class App:
         self.kartenplaner = kartenplan.Kartenplaner()
         # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
         ptree = getattr(args, "profil_tree", None) or None      # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker
+        # AP-D: das Orakel (Launcher-Trockenlauf im Kindprozess + Cache); startet erst bei der ersten Anfrage, nie im Hintergrund
+        # eigener cgroup-Scope (Spitze 1,75 GiB RSS > Rest der Unit-Grenze, Review AP-D); args ohne Feld (Tests) = kein Praefix
+        opf = getattr(args, "oracle_prefix", None)
+        oprefix = profil_oracle.default_prefix() if opf == "auto" else (shlex.split(opf) if opf and opf != "none" else [])
+        self.oracle = profil_oracle.OracleService(profil.find_tree(ptree), python=getattr(args, "couplings_python", None), prefix=oprefix)
         self.profil = profil.ProfilEditor(
             kartenplaner=self.kartenplaner, tree=ptree,
+            oracle=self.oracle, hardware=lambda: self.hwprofil.get(), check_path=lambda p, what: self.modellprofil.check_path(p, what),
             release_dir=getattr(args, "profiles_release_dir", None) or profil.DEFAULT_RELEASE_DIR,
             user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR,
             # Auftrag 1984 (C): die Topologie-Prüfung des Trockenlaufs läuft im Kopplungs-Worker (sglang-Umgebung), nicht in diesem Prozess;
@@ -650,6 +658,8 @@ def make_handler(app: App):
                 return self._json(ed.dry_run(body.get("doc"), body.get("cards") or [], bool(body.get("host_patched", True))))
             if path == "/api/profil/recompute":
                 return self._profil_recompute(body)
+            if path == "/api/profil/propose":
+                return self._json(ed.propose(body))
             return self._send(404, "not found", "text/plain")
 
         def _profil_recompute(self, body):
@@ -900,6 +910,9 @@ def main(argv=None):
                     help="voller sglang-Baum (<baum>/python) für den Messlauf; leer = --hw-tree (dann muss card_probe darin liegen)")
     ap.add_argument("--couplings-python", default=os.environ.get("RIGDASH_COUPLINGS_PYTHON"),
                     help="Profil-Editor S4b: Python der sglang-Umgebung für den Kopplungs-Worker (Standard /spinning/htsglang-gpu/.venv/bin/python)")
+    ap.add_argument("--oracle-prefix", default=os.environ.get("RIGDASH_ORACLE_PREFIX", "auto"),
+                    help="Befehlspräfix des Orakel-Kindprozesses (Launcher-Trockenlauf, Spitze 1,75 GiB RSS gemessen): 'auto' = systemd-run --scope -q -p "
+                         "MemoryMax=4G (eigener cgroup-Rahmen ausserhalb der Unit), 'none' = ohne, sonst der Befehl selbst")
     ap.add_argument("--hw-python", default=os.environ.get("HWPROFIL_PYTHON"),
                     help="Interpreter mit torch + sgl_kernel für den Messlauf (Kindprozess, außerhalb dieses Prozesses)")
     ap.add_argument("--hw-prefix", default=os.environ.get("HWPROFIL_PREFIX", ""),

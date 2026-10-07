@@ -347,6 +347,31 @@ Danach setzt der Lead in der Unit `RIGDASH_PROFIL_TREE` (= `--profil-tree`, EIN 
 gegen `MemoryMax=1G`: auf 2G heben. Der Worker rechnet auch das Topologie-Urteil des Trockenlaufs (Op `topology`); fehlt er, bleibt die Notiz
 "Topologie für N Karte(n) nicht geprüft" (Tests: `tests/test_profil_staging_1984.py`, `tests/test_profil_topology_child_1984.py`).
 
+### Orakel und Vorschlag (AP-D, Plan Profil-Planer 06.10.)
+
+Der Trockenlauf (`POST /api/profil/dry`) fragt seit AP-D den LAUNCHER selbst: `profil_oracle.OracleService` hält einen eigenen Kindprozess
+(`kartenplan_build/oracle_worker.py`, Python der sglang-Umgebung wie `--couplings-python`), der `launcher.main(--dry-run)` auf einem NVML-Replay der
+gewählten Karten fährt (`weg2/propose_oracle`), erst ohne und bei einer Ablehnung noch einmal mit `--force`, und daraus das Dokument
+`flliper.verdikt/1` baut (`weg2/propose_verdict`): je Ding ein Verdikt `{code, forcebar (aus refusals.by_code), force_state, grund, konsequenz}`, dazu
+`PROFILE-VECTORS`, `RECORDS-NVEC`, `METAL-UNPROVEN` (die Blocker im Text von HW-COUNT), `FIT` (hw_fit), `HW-BORROWED`, `HW-UNCALIBRATED` und ein Absturz des
+Launchers als `ORAKEL-ABSTURZ`. Das Rückgabeformat des Trockenlaufs bleibt; neu sind `quelle` (`orakel` | `gate`), `orakel` (Ausgang, Profil-Hash, Cache) und
+`verdikte`. Kann das Orakel nicht fragen (Kindprozess, Python, Modellpfade), gilt die Teilprüfung des Planer-Gates MIT Notiz. Ein Lauf bis zum Ende dauert
+16-18 s (gemessen 06.10.), darum der Cache je (Inventar, Form, Argv-Hash, Stand der Quellen); Live-Profile driften: der Profil-Hash (Datei und Launch-Eingabe)
+steht in jedem Verdikt und im Schlüssel.
+
+`POST /api/profil/propose` ({basis: {kind, name}, form: flip|tp, inventar: "rig" | [{card, pcie}], ziele?}) ruft `propose()` (AP-C) und das Orakel und liefert
+das Startprofil `flliper.server/1` (Basisprofil + die Werte des Vorschlags, Herkunft `planer`) mit Herkunft, Verdikt und Kanten je Wert, die Verdikte des
+Laufs und die Anfrage für die Balken (`what=phase_bars`, `form` flip|d_only, Vertrag `flliper.balken/1` von AP-H2). Dual und Einzelkarte sind AP-E/AP-F.
+Der Orakel-Kindprozess importiert den Launcher: der Planer-Baum der Unit muss `weg2/launcher.py`, `propose*.py`, `hw_fit.py` und `fit_profiles_data`
+tragen (der volle Baum `python/sglang` der Revision, wie bei `stage_profil_modules.sh`).
+
+**Speicher des Orakel-Kindprozesses (GEMESSEN 06.10., Review AP-D):** ein voller NF-Trockenlauf auf dem Referenz-Rig (`nf-int4-h6-abl`, NVML-Replay) braucht
+in der Spitze **1,75 GiB RSS** (`/usr/bin/time -v`: Maximum resident set size 1789432 kB; 47,98 s unter CPUQuota 200%). Gegen `MemoryMax=2G` der Unit
+(MemoryCurrent dort 409 MB) ginge das nicht. Darum startet der Dienst den Kindprozess in einem EIGENEN Scope: `--oracle-prefix auto` (Standard; Env
+`RIGDASH_ORACLE_PREFIX`) = `systemd-run --scope -q -p MemoryMax=4G`, der Scope zählt nicht gegen die Unit. `none` startet ohne Rahmen, jeder andere Wert ist
+der Befehlspräfix selbst. Scheitert der Präfix sofort (kein `systemd-run`, kein D-Bus), läuft der Kindprozess einmal ohne ihn
+(`OracleService.prefix_fallback`); dann gilt wieder die Unit-Grenze. Die Unit-Datei trägt `MemoryMax=2G` (Kopplungs-Worker, 612 MiB RSS, s. o.).
+
 ### Speicher und Stufen
 
 - `history.py`: `history.sqlite` im `--state-dir`. Tiers p0 (1 s NVML, 5 s Host und Modell), p1 (10 s)
