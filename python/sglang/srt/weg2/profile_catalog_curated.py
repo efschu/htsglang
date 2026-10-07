@@ -227,7 +227,11 @@ CURATED: Dict[str, Dict[str, object]] = {
                     _d("--rank-gpu-memory-mib", "tauscht", "Draft-Gewichte gegen KV.", "S4")]},
     "--draft-kv-on-p": {
         "kind": "flag", "group": "Decode", "level": "experte", "planner_derived": False,
-        "text": "Ob Gruppe P auch die Draft-KV erzeugt (on/off).", "gain": "D muss die Draft-KV nicht selbst aufbauen.", "cost": "Mehr Arbeit und Speicher auf P.",
+        # AP-G 06.10.: Text aus dem argparse-help= (#1264) und der Launcher-Zeile draft_on_p_line; die Kanten (Draft-Platzierung, Host-Budget) stehen im Kantenkatalog.
+        "text": "Ob Gruppe P der reine Draft-KV-ERZEUGER ist (#1264). 'on' (Standard; stehender Nutzerauftrag vom 2026-09-07: Draft-KV über den Flip hinweg) legt den mtp.*-Kopf des Checkpoints auf Ps letzte Stufe, damit D nach einem Flip mit warmer Draft-KV wieder aufnimmt. 'off' bootet die rg6-bewiesene Form: P trägt KEIN Speculative-Flag und keinen MTP-Kopf (der Launcher sagt es in einer Zeile; die Serving-Basis / der A-B-Arm, nie still). Gruppe D bleibt bei beiden Werten unverändert: sie behält ihren eigenen NEXTN-Kopf, denn 'off' nimmt den Erzeuger weg, nicht die spekulative Dekodierung.",
+        "gain": "'on': D nimmt nach einem Flip mit warmer Draft-KV wieder auf.",
+        "cost": "'on': der MTP-Kopf liegt auf Ps letzter Stufe. 'off': P bootet ohne Draft; D parkt seine Draft im pinned System-RAM, solange P läuft (WEG2-DRAFT-PARK/UNPARK), und startet jede geflippte Anfrage DRAFT-COLD.",
+        "satz_quelle": "launcher.py --draft-kv-on-p (help=) und launcher.draft_on_p_line",
         "depends": [_d("--spec-form", "braucht", "Nur mit Draft sinnvoll.", "text")]},
     "--d-tp-objective": {
         "kind": "flag", "group": "Aufteilung", "level": "experte", "planner_derived": True,
@@ -357,6 +361,140 @@ CURATED: Dict[str, Dict[str, object]] = {
     "PROFILE_D_ONLY": {"kind": "var", "group": "Start", "level": "einfach", "planner_derived": False,
                        "text": "1 = nur Gruppe D auf allen Karten, keine Front (der Entrypoint hängt --d-only an).", "gain": "", "cost": "Kein Prefill/Decode-Wechsel.",
                        "depends": [_d("PROFILE_SERVE_PORT", "skaliert_mit", "Clients sprechen D direkt an.", "text")]},
+    # ------------------------------------------------------------------ AP-G (Planer-Workflow 06.10.): Form A, ungleiches DCP, Draft, Betriebsform, Dual
+    # Jeder Satz unten ist die Uebersetzung des argparse-``help=`` bzw. des environ.py-Kommentars (Quelle je Eintrag im ``quelle``-Feld);
+    # was die Quelle nicht sagt, steht NICHT hier (gain/cost bleiben leer). Die Kanten dieser Werte stehen NUR im Kantenkatalog
+    # (kantenkatalog_1004.json, K62ff) mit Beleg; ``depends`` bleibt hier leer, damit keine unbelegte kuratierte Kante entsteht.
+    "--rank-role": {
+        "kind": "flag", "group": "Aufteilung", "level": "experte", "planner_derived": False, "scope": "server",
+        "text": "Form A (Attention-Host-Layout): je Rang eine Rolle, 'host' oder 'worker' (z. B. host,worker,worker für eine 5090 und zwei 3080). Genau ein Rang darf Host sein. Der Host rechnet alle dichten Teile des Modells, hält den ganzen KV-Cache für den vollen Kontext, die GDN-Zustände, den spekulativen Draft und die CUDA-Graphen sowie seinen Anteil an den MoE-Experten; ein Worker hält nur seine eigenen Experten und sonst nichts: er rechnet sie für die Zeilen, die der Host verteilt, und schickt die Teilsummen zurück. Erst dieses Flag macht eine Null in --rank-tp-ratio als Layout lesbar: eine Null ist nur für einen Rang erlaubt, den dieses Flag Worker nennt, und jeder Worker braucht eine.",
+        "gain": "", "cost": "Braucht ein ausdrückliches --rank-tp-ratio; nur reine Tensor-Parallelität auf einem Knoten.",
+        "satz_quelle": "server_args.py rank_role (Arg help=)", "depends": []},
+    "--rank-kv-ratio": {
+        "kind": "flag", "group": "Aufteilung", "level": "experte", "planner_derived": False, "scope": "server",
+        "text": "Wem die KV-Token gehören (ungleiches DCP), entkoppelt von der Gewichtsaufteilung: Wo ein Kontext-Token liegt, verschiebt nur, wo seine Attention-Rechnung läuft. 'coupled' (Standard): das bisherige Verhalten. 'capacity' (Alias 'auto'): Besitz proportional zur tatsächlich freien Token-Kapazität jedes Rangs nach dem Laden der Gewichte. 'speed': vom Kapazitätsanteil in Richtung des Speicherbandbreiten-Anteils verschoben, soweit --rank-perf-loose-ctx-percent es erlaubt. 'corridor' (#602): 'capacity' plus eine harte Freiraum-Untergrenze je Karte. Eine Liste positiver ganzer Zahlen (ein Eintrag je Rang) legt den Besitzvektor fest. Werte ungleich 'coupled' schalten den gewichteten-DCP-Weg ein. Die Env SGLANG_UNEVEN_TOKEN_VECTOR (expliziter Vektor) hat Vorrang vor diesem Flag; die Gewichtsaufteilung (--rank-tp-ratio, --rank-mlp-ratio, ...) bleibt unberührt.",
+        "gain": "'capacity' maximiert max_total_num_tokens (Konvergenz in einem Boot). Gemessen (#210, 27B FP8 TP=3, ungleiches DCP, 120k Token im Speicher, bs=1, ohne Spec): Vektor [2,3,3] auf [2,1,1] senkte den kontextabhängigen Teil des Decode-Schritts um 24,5 % (2,296 auf 1,732 ms; Rauschen von Boot zu Boot 1,07 %), das sind -2,5 % Schrittzeit insgesamt, mit dem Kontext linear wachsend.",
+        "cost": "'capacity' verlagert bei tiefem Kontext Attention-Arbeit auf die Karten, die mehr Token halten. 'speed' braucht die Bandbreitenwerte je Rang (--rank-tp-ratio auto-performance), sonst fällt es auf 'capacity' zurück und sagt es. Werte ungleich 'coupled' verlangen --rank-gpu-id mit einem ungleichen --rank-tp-ratio-Plan. 'corridor': eine Karte, die Reserve plus noch nicht angefallenen Bedarf nicht tragen kann, bricht den Boot mit den Zahlen je Karte ab.",
+        "satz_quelle": "server_args.py rank_kv_ratio (Arg help=)", "depends": []},
+    "--dcp-size": {
+        "kind": "flag", "group": "Aufteilung", "level": "experte", "planner_derived": False, "scope": "server",
+        "text": "Die Größe der Decode-Context-Parallelität (Standard 1; Alias --decode-context-parallel-size).",
+        "gain": "", "cost": "", "satz_quelle": "server_args.py dcp_size (Arg help=)", "depends": []},
+    "--uneven-dcp": {
+        "kind": "flag", "group": "Aufteilung", "level": "experte", "planner_derived": False, "scope": "server",
+        "text": "Schaltet ungleiches DCP ein. Aus der Env SGLANG_UNEVEN_DCP (#781) zum Flag befördert; in den meisten Fällen durch --rank-kv-ratio abgelöst.",
+        "gain": "", "cost": "", "satz_quelle": "server_args.py uneven_dcp (Arg help=)", "depends": []},
+    "--uneven-dcp-weighted": {
+        "kind": "flag", "group": "Aufteilung", "level": "experte", "planner_derived": False, "scope": "server",
+        "text": "Schaltet gewichtetes ungleiches DCP ein. Aus der Env SGLANG_UNEVEN_DCP_WEIGHTED (#781) zum Flag befördert.",
+        "gain": "", "cost": "", "satz_quelle": "server_args.py uneven_dcp_weighted (Arg help=)", "depends": []},
+    "SGLANG_UNEVEN_TOKEN_VECTOR": {
+        "kind": "env", "group": "Aufteilung", "level": "experte", "planner_derived": False,
+        "text": "Aufteilungsvektor der Token-Achse bei ungleichem DCP (\"a,b,c\", je DCP-Rang eine positive ganze Zahl). Er überstimmt den aus dem Budget geschätzten Vektor, den resolve_cp_token_ratios sonst ableiten würde. Die KV-Pool-Selbstkalibrierung gibt ihn als Neustart-Hinweis aus (gemessenes Optimum aus der tatsächlich profilierten Token-Kapazität je Rang). Modelltyp-unabhängig: er richtet sich nach der gemessenen Kapazität, die dtype-unabhängig ist.",
+        "gain": "Beim nächsten Boot zurückgespeist, konvergieren die KV-Pools je Rang auf das profilierte Optimum.", "cost": "",
+        "satz_quelle": "environ.py SGLANG_UNEVEN_TOKEN_VECTOR (Kommentar)", "depends": []},
+    "--rank-vocab-ratio": {
+        "kind": "flag", "group": "Aufteilung", "level": "experte", "planner_derived": False, "scope": "server",
+        "text": "Gewichtete Aufteilung der gekoppelten Vokabular-Schichten (VocabParallelEmbedding / ParallelLMHead, auch von NEXTN/EAGLE-Drafts geteilt): 'auto' oder je Rang eine positive ganze Zahl (Länge gleich --tp-size). Der lm_head-Matvec liest bei jedem Decode-Schritt den ganzen Gewichtsanteil; bei ungleichen Karten wird die gleichmäßige Aufteilung (Standard, bleibt auch unter --rank-tp-ratio gleichmäßig) von der langsamsten Karte begrenzt. 'auto' leitet die Gewichte aus den Speicherbandbreiten-Werten des gecachten auto-performance-Hardwareprofils ab, sonst aus dem aufgelösten --rank-tp-ratio-Vektor. Die Env SGLANG_UNEVEN_VOCAB_VECTOR (expliziter Vektor) hat Vorrang vor diesem Flag.",
+        "gain": "Gewichten nach Speicherbandbreite gleicht die Lesezeit des lm_head aus statt der Anteilsbreite.",
+        "cost": "Verlangt einen aktiven --rank-tp-ratio-Plan. Standard AUS: ohne das Flag bleibt die Vokabular-Aufteilung gleichmäßig und das Verhalten unverändert.",
+        "satz_quelle": "server_args.py rank_vocab_ratio (Arg help=)", "depends": []},
+    "--speculative-draft-placement": {
+        "kind": "flag", "group": "Decode", "level": "einfach", "planner_derived": False, "scope": "server",
+        "text": "Wo das spekulative Draft-Modell läuft. 'split' (Standard): der Draft ist wie bisher über alle TP-Ränge tensor-parallel geteilt (byte-identisch, ob das Flag fehlt oder 'split' heißt). 'solo': der Draft läuft UNGETEILT auf EINEM festgelegten Rang (siehe --speculative-draft-gpu) und sendet seine k Draft-Token-IDs einmal je Runde an die übrigen Ränge; diese bauen das Draft-Modell auf dem meta-Gerät (keine Draft-Gewichte, kein Draft-KV-Pool, keine Draft-CUDA-Graphen) und überspringen den Draft-Forward.",
+        "gain": "Auf Rigs ohne P2P ersetzt 'solo' die k host-gestagten Draft-All-Reduces je Runde durch einen kleinen Broadcast.",
+        "cost": "'solo' (v1): nur Familie EAGLE/EAGLE3/NEXTN, topk == 1, kein Rejection Sampling, reine Single-Node-TP.",
+        "satz_quelle": "server_args.py speculative_draft_placement (Arg help=)", "depends": []},
+    "--d-only": {
+        "kind": "flag", "group": "Start", "level": "einfach", "planner_derived": False,
+        "text": "Nur Gruppe D (TP3 auf allen Karten), kein P, kein Flip, keine Front (Nutzer 25.09.). D wird mit derselben Env und demselben argv gebaut wie im Flip-Boot (Budgets aus der Erwartung wie im Dry-Run), nimmt aber jede ungecachte Länge selbst an (--tp-prefill-max-tokens = --max-kv-per-request) und wird direkt auf dem Port angesprochen.",
+        "gain": "Für Hosts, deren RAM den Flip nicht trägt.", "cost": "Kein P, kein Flip, keine Front.",
+        "satz_quelle": "launcher.py --d-only (help=)", "depends": []},
+    "--profile-inventory": {
+        "kind": "flag", "group": "Hardware", "level": "experte", "planner_derived": False,
+        "text": "HW-GENERIC 1002: das Karteninventar (Kalibrierklassen-Labels in Kartenreihenfolge, weg2/card_identity.py, z. B. 'RTX5090,RTX3080,RTX3080'), auf dem die positionalen Vektoren des Profils gemessen wurden. Standard: das Inventar, das die gemessenen Records des Profils angeben (profile_records_data/<Profil>.json, Feld 'inventory'). Ein abweichendes Live-Inventar wird beim Namen verweigert (HW-UNCALIBRATED); positionale Messungen anderer Karten werden nie geliehen.",
+        "gain": "", "cost": "Abweichendes Inventar: HW-UNCALIBRATED.",
+        "satz_quelle": "launcher.py --profile-inventory (help=)", "depends": []},
+    # ---- Dual (launcher.py resolve_dual_layout, argparse :22699-22798)
+    "--dual-layout": {
+        "kind": "flag", "group": "Dual", "level": "einfach", "planner_derived": False,
+        "text": "DUAL-TP3PP3 (F26, Nutzer 29.09.): BEIDE Gruppen bleiben den ganzen Boot wach, die Front flippt nie. Impliziert --flip-weights resident; P wird nach READY nicht schlafen gelegt, statt dessen wird sein WACH-Fußabdruck gemessen und D danach bemessen (dieselbe PID-Messung wie beim Schlafrest). Das Budget von P selbst senkt man mit --extra-p '--rank-gpu-memory-mib ...' (W100 erlaubt das Senken). Verweigert --weg2-d-adopt on und --idle-layout pp (help=; der Code stellt pp ohne Verweigerung auf tp um, launcher.py:14722). Standard aus: der Launcher ist byte-identisch.",
+        "gain": "", "cost": "Kein Flip; verweigert --weg2-d-adopt on; ein gesetztes --idle-layout pp wird auf tp umgestellt (kein Verweigern).",
+        "satz_quelle": "launcher.py --dual-layout (help=)", "depends": []},
+    "--dual-share": {
+        "kind": "flag", "group": "Dual", "level": "einfach", "planner_derived": False,
+        "text": "DUAL-TP3PP3 Stufe 1b (impliziert --dual-layout): Ps Stufe rechnet auf Ds TP-Shards (Hüllen über Ds drei Shards ihrer Layer) und bindet den Shard des D-Rangs auf ihrer Karte über das Union-Image an Ds Bytes. D bootet direkt nach P als Union-OWNER, bemessen aus Ps GEPLANTEM Budget (+ --dual-p-overhead-mib); P wartet auf Ds Image, bevor es etwas lädt.",
+        "gain": "", "cost": "",
+        "satz_quelle": "launcher.py --dual-share (help=)", "depends": []},
+    "--dual-p-overhead-mib": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-TP3PP3 --dual-share (Standard 1500): was P auf einer Karte außerhalb seines --rank-gpu-memory-mib-Budgets hält (CUDA-Kontext, Graphen, Aktivierungen); wird angerechnet, wenn D aus Ps Plan statt aus Ps Messung bemessen wird.",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-p-overhead-mib (help=)", "depends": []},
+    "--dual-d-prefill-tokens": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-TP3PP3 D-Prefill-Zulassung, Standard 0 (Nutzer 01.10.: im Dual-Layout läuft JEDER Prefill auf P, D decodet nur). Ds X (sein W31-Riegel und die Routing-Grenze der Front) wird zu 1 + diesem Wert: die 1 ist die N-1-Anker-Konvention (P hält das letzte Prompt-Token zurück, Ds erster Schritt rechnet es); alles Größere geht an P, und ein größerer Rest an D wird beim Namen verweigert (W31 -> P), nie still neu gerechnet. Ohne --dual-layout ignoriert; ersetzt dort --tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens.",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-d-prefill-tokens (help=)", "depends": []},
+    "--dual-p-duty": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-TP3PP3 Pausenzulassung (Standard 1.0 = keine Pause): P und D laufen gleichzeitig und teilen jede Karte, nur die Physik begrenzt sie (Nutzer 01.10.). Unter 1.0 DARF P pausieren, während D Decodes hält: der Anteil der Wanduhrzeit, in dem Ps erste Stufe rechnen darf (weg2/dual_duty.py). Einfache Form: PP0 wartet nach jedem Forward t_fwd*(1-duty)/duty. Mit der Env SGLANG_WEG2_DUAL_P_GANG_CHUNKS=K (Gang-Fenster): PP0 rechnet K Chunks, wartet, bis die Pipeline leer ist, und hält dann, damit D allein auf allen Karten ist.",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-p-duty (help=)", "depends": []},
+    "--dual-p-sm-pct": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-TP3PP3 mit --dual-mps on (Standard 100): CUDA_MPS_ACTIVE_THREAD_PERCENTAGE für Gruppe P, also der Anteil der SMs, den Ps Kernels belegen dürfen, während D decodet. 100 = keine Grenze.",
+        "gain": "", "cost": "Gemessen am 29.09. (risk-1 bench, 5090): unbegrenztes P nimmt ~90 % der Karte und Ds Schritt läuft ~7x langsamer; 50 teilt ~50/50; die Summe beider Anteile bleibt in beiden Fällen ~1,0.",
+        "satz_quelle": "launcher.py --dual-p-sm-pct (help=)", "depends": []},
+    "--dual-priority": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-SHARE Stufe 2: der P/D-Anteilsregler der Front schreibt eine Stufe (Ps Anteil 1.0/0.75/0.5/0.25, Profil-Env SGLANG_WEG2_DUAL_SHARE_RUNGS) nach <busy>.ctl; P wirkt über --dual-share-actuators. p = P voll (heute), balanced/d = eine feste Stufe, solange D decodet, dynamic = Matrix aus tau (wartende Prefill-Token / Ps volle Rate) x D-bs. Zur Laufzeit umschaltbar: POST /weg2/dual-priority an der Front. Ungesetzt = aus.",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-priority (help=)", "depends": []},
+    "--dual-d-min-rate-tps": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-SHARE: Ds Mindest-Decode-Rate je Anfrage (Token/s, gemessen am Leg-2-Token-Strom); darunter geht die Stufe in Richtung D. 0 = aus.",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-d-min-rate-tps (help=)", "depends": []},
+    "--dual-p-min-share": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-SHARE: Untergrenze von Ps Anteil (Stufen darunter werden nie benutzt; Standard 0.25).",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-p-min-share (help=)", "depends": []},
+    "--dual-share-actuators": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-SHARE: Komma-Liste der P-Stellglieder (Standard 'chunk'): chunk (PP0s Chunk-Obergrenze), duty (P-Duty-Drossel beim Anteil der Stufe), green (Stufe 3, NICHT gebaut: benannter Rückfall auf chunk).",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-share-actuators (help=)", "depends": []},
+    "--dual-green-ladder": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-SHARE Stufe 3 (weg2/dual_green.py): Ps SM-Anteil als Green-Context-LEITER (100/75/50/25 % je Forward, dynamisch, hoch UND runter; PP0 stempelt die Stufe auf den Request-Draht, damit alle drei Stufen dieselbe fahren). 'on' = Leiter + Halte-BEOBACHTER (die P-STUFE-Zeile trägt would_hold), 'hold' = zusätzlich hält PP0 wirklich (0 %), solange die Arena voll ist. Standard off = argv/env/Startpfad byte-identisch.",
+        "gain": "", "cost": "Braucht --dual-priority, 'green' in --dual-share-actuators, --dual-mps on und kein --dual-p-sm-pct.",
+        "satz_quelle": "launcher.py --dual-green-ladder (help=)", "depends": []},
+    "--dual-d-capture-prio": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-SHARE Stufe 1a: D nimmt seine CUDA-Graphen auf dem Stream höchster Priorität des Geräts auf (Graph-Knoten behalten die Priorität des Capture-Streams). Nur Gruppe D des Dual-Layouts.",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-d-capture-prio (help=)", "depends": []},
+    "--dual-p-mps-low-prio": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-SHARE Stufe 1b: P startet mit CUDA_MPS_CLIENT_PRIORITY=1 (unter normal; beim Verbinden gelesen, nur beim Boot).",
+        "gain": "", "cost": "Braucht --dual-mps on, sonst steht eine benannte W-DUAL-SHARE-FALLBACK-Zeile im Log.",
+        "satz_quelle": "launcher.py --dual-p-mps-low-prio (help=)", "depends": []},
+    "--dual-p-sleep": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "Standard: AN mit --dual-share, sonst AUS. Mit --dual-unified-kv on: D-PRIORITÄT Stufe 2 (Nutzer 01.10.): ist D noch knapp, nachdem P gestoppt und sein KV freigegeben hat, schläft P und parkt seine Gewichte im Host-RAM (P bootet mit --enable-weights-cpu-backup und NICHT resident; das Host-Image wird bei der Pause angelegt und nach der Wiederherstellung freigegeben, kein ruhendes Image, KEIN-DAUER-HOSTRAM). off = nur Stufe 1; die Front druckt 'stage=2 unavailable (weights resident)'.",
+        "gain": "", "cost": "Der Hilfetext nennt außerdem die Verweigerung W-DUAL-P-SLEEP-SHARE für 'on' zusammen mit --dual-share, solange der Baum Ps union-gebundenen Teil nicht außerhalb des Pools lädt (launcher.dual_p_sleep_armed prüft das am Baum).",
+        "satz_quelle": "launcher.py --dual-p-sleep (help=; Verlaufsteil des Hilfetexts nicht übernommen)", "depends": []},
+    "--dual-unified-kv": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-TP3PP3: ein KV-Pool je Karte, den P und D zur Laufzeit teilen (Nutzer-Order 30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P bildet KV nur ab, solange es prefillt, und pausiert, wenn D knapp ist. Braucht --dual-share.",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-unified-kv (help=)", "depends": []},
+    "--dual-p-kv-max-tokens": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-TP3PP3 --dual-unified-kv (Standard 196608): Ps KV-Pool-Zeilen (virtuell; Seiten kommen aus dem Karten-Pool). Jeder K/V-Puffer wird in dieser Größe angelegt und sofort gekürzt, die Boot-Spitze ist also ein Puffer (Token x Bytes je Token je Layer).",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-p-kv-max-tokens (help=)", "depends": []},
+    "--dual-d-kv-max-tokens": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-TP3PP3 --dual-unified-kv (Standard 1048576): Ds KV-Pool in GLOBALEN Token (virtuell; D behält seinen Boot-Stand gemappt und wächst aus dem Karten-Pool). Muss Ds Boot-Kontext übersteigen; jeder Puffer wird in seinem Owner-Anteil davon angelegt und sofort gekürzt.",
+        "gain": "", "cost": "", "satz_quelle": "launcher.py --dual-d-kv-max-tokens (help=)", "depends": []},
+    "--dual-mps": {
+        "kind": "flag", "group": "Dual", "level": "experte", "planner_derived": False,
+        "text": "DUAL-TP3PP3: startet vor den Gruppen einen privaten MPS-Control-Daemon (Pipe-Verzeichnis unter dem Run-Verzeichnis des Boots), damit P- und D-Kernels auf einer Karte gleichzeitig laufen statt zeitgeteilt. Nur mit --dual-layout.",
+        "gain": "", "cost": "VERWEIGERT, solange SGLANG_WEG2_DUAL_MPS_OPT_IN=1 fehlt: gemessen, beide Gruppen hängen unter Extend-großen Collectives (Repro v2 scjhru S1, Boots kw6pft/ndktv4). Das Dual-Layout läuft ohne MPS; Latenzwächter ist --dual-p-duty.",
+        "satz_quelle": "launcher.py --dual-mps (help=)", "depends": []},
 }
 
 
