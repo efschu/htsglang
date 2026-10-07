@@ -1029,6 +1029,72 @@ def launch_input_doc(li: LaunchInput) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# launcher-line probes (07.10.: the planer tests run on the 27B line AND on the NF line with ONE test code)
+# ---------------------------------------------------------------------------
+
+#: Flags the 27B launcher line has and the NF launcher line has NOT (``launcher.build_parser()`` flag sets measured
+#: 2026-10-07: NF tree 2e68b3f94b 206 flags, 27B tree d7bce7a1e0 224; the 27B-only ones are the nineteen ``--dual-*``
+#: flags of the Dual form, ``--no-p-host-overlap``, ``--no-p-trim-end-anchor`` and ``--pp-cut-stage-model``).  The line is
+#: read from the launcher's own argument parser, never from a tree sha, a branch name or a text search of the source.
+#: ``--p-chunk-policy`` is NOT a marker: both lines have it (the NF line prices it per model key, H92).
+LINE_MARKER_FLAGS = ("--dual-priority", "--pp-cut-stage-model")
+LINE_27B = "27b"
+LINE_NF = "nf"
+LINE_MIXED = "mixed"
+_FLAG_CACHE: Dict[int, frozenset] = {}
+
+
+def launcher_flags(launcher: Any = None) -> frozenset:
+    """Every option string the launcher's ``build_parser()`` accepts (argparse introspection; cached per module object)."""
+    if launcher is None:
+        from sglang.srt.weg2 import launcher
+    key = id(launcher)
+    if key not in _FLAG_CACHE:
+        _FLAG_CACHE[key] = frozenset(o for a in launcher.build_parser()._actions for o in a.option_strings)
+    return _FLAG_CACHE[key]
+
+
+def launcher_knows(flag: str, launcher: Any = None) -> bool:
+    """Whether the launcher's argument parser knows ``flag`` (``--x``)."""
+    return flag in launcher_flags(launcher)
+
+
+def launcher_line(launcher: Any = None) -> str:
+    """``"27b"`` when the launcher knows every :data:`LINE_MARKER_FLAGS` flag, ``"nf"`` when it knows none, ``"mixed"`` otherwise
+    (a tree between the two lines: the line-bound tests then skip, the goldens of neither line are claimed)."""
+    known = [launcher_knows(f, launcher) for f in LINE_MARKER_FLAGS]
+    return LINE_27B if all(known) else (LINE_NF if not any(known) else LINE_MIXED)
+
+
+def launcher_has(name: str, launcher: Any = None) -> bool:
+    """Whether the launcher module defines ``name`` (a capability probe by attribute, e.g. ``_restage_p_card_reference``: the
+    AP2 1006 re-staging of the P-card reference at N != 3, which the NF line has -- there N=2 goes through ``--force`` -- and
+    the 27B line has not -- there W167 "Stufenzahl 2 gegen 3" stands)."""
+    if launcher is None:
+        from sglang.srt.weg2 import launcher
+    return hasattr(launcher, name)
+
+
+def weg2_module_exists(name: str) -> bool:
+    """Whether ``sglang.srt.weg2.<name>`` exists in the tree on ``sys.path`` (``find_spec``; nothing is imported)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("sglang.srt.weg2." + name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def golden_path(golden_dir: str, name: str, line: Optional[str] = None) -> str:
+    """The golden file ``name`` of the launcher ``line``: ``<golden_dir>/<line>/<name>`` when that exists (a golden of a
+    line other than the one the files at the root were made on), else ``<golden_dir>/<name>`` -- the 27B-line goldens stay
+    at the root, so a tree that has no per-line directory reads exactly what it always read."""
+    line = line or launcher_line()
+    per = os.path.join(golden_dir, line, name)
+    return per if os.path.isfile(per) else os.path.join(golden_dir, name)
+
+
+# ---------------------------------------------------------------------------
 # golden helpers
 # ---------------------------------------------------------------------------
 
