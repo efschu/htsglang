@@ -231,6 +231,9 @@ class RealForms(unittest.TestCase):
         return ed
 
     # ---------------------------------------------------------------- Dual
+    @unittest.skipUnless(os.path.isfile(os.path.join(REPO_PY, "sglang", "srt", "weg2", "dual_layout_plan.py")),
+                         "27B launcher line only: the Dual form (weg2/dual_layout_plan.py, dual_green.py) does not exist in this tree (measured 07.10. on the NF tree "
+                         "2e68b3f94b: ImportError cannot import name 'dual_layout_plan' from 'sglang.srt.weg2')")
     def test_1_reference_dual_is_the_golden_with_zero_diff(self):
         ed = self._ed(self.hw3)
         r = ed.propose({"basis": {"kind": "release", "name": "27b-nvfp4-dual"}, "form": "dual", "inventar": "rig"})

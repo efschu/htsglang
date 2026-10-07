@@ -23,6 +23,22 @@ SRT = os.path.join(PY, "sglang", "srt")
 SHIPPED = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", "tools", "rig_dashboard", "rigdash", "profil_data", "catalog.json"))
 
 
+#: line probe (module exists, never a sha or a branch name): the Dual form (dual_green.py, --dual-*) is a 27B-line feature
+DUAL_LINE = os.path.isfile(os.path.join(os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "python")),
+                                        "sglang", "srt", "weg2", "dual_green.py"))
+#: curated names the code of the NF line does not carry (measured 07.10. on 2e68b3f94b: curated 119 entries, these 26 are neither a flag of the
+#: launcher / server_args nor an env of environ.py nor a literal of the launcher): the Dual form and four guard envs of the 27B line.  The
+#: curated catalog is shared by both lines (the dashboard serves both, the shipped catalog is the union); on the NF line they stay curated
+#: texts without a code behind them, and this test names them instead of passing them silently.
+ABSENT_ON_NF_LINE = frozenset((
+    "--dual-p-overhead-mib", "--dual-d-prefill-tokens", "--dual-p-duty", "--dual-p-sm-pct", "--dual-priority", "--dual-d-min-rate-tps",
+    "--dual-p-min-share", "--dual-share-actuators", "--dual-green-ladder", "--dual-d-capture-prio", "--dual-p-mps-low-prio", "--dual-p-sleep",
+    "--dual-unified-kv", "--dual-p-kv-max-tokens", "--dual-d-kv-max-tokens", "--dual-mps",
+    "SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE", "SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S", "SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG",
+    "SGLANG_WEG2_DUAL_GRANT_RETRY_MS", "SGLANG_WEG2_DUAL_D_COMPACT", "SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S",
+    "SGLANG_WEG2_HOST_GUARD_W22", "SGLANG_WEG2_HOST_GUARD_W98", "SGLANG_ADMISSION_WEDGE_MODE", "SGLANG_PREFILL_LIVELOCK_MODE"))
+
+
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -84,7 +100,8 @@ class Curated(unittest.TestCase):
         with open(os.path.join(WEG2, "launcher.py"), encoding="utf-8") as fh:
             cls.launcher_src = fh.read()
         # Envs ohne Envs-Feld, die ein Modul ueber os.environ liest (Konstante AUX_ENV usw.): dieselbe Ernte, die der Katalog-Generator nutzt.
-        cls.env_constants = PC.environ_constants(SRT)
+        # (the catalog tool of the NF line predates the harvest: no constants there)
+        cls.env_constants = PC.environ_constants(SRT) if hasattr(PC, "environ_constants") else set()
 
     def test_every_curated_name_exists(self):
         miss = []
@@ -94,7 +111,10 @@ class Curated(unittest.TestCase):
             if c["kind"] == "env" and name not in self.envs and name not in self.launcher_src and not self._composed_env_read(name) \
                     and name not in self.env_constants:
                 miss.append(name)
-        self.assertEqual(miss, [])
+        if DUAL_LINE:
+            self.assertEqual(miss, [])
+        else:       # NF line: exactly the named names, no more (a new miss is a defect) and no fewer (a stale entry hides one)
+            self.assertEqual(sorted(miss), sorted(ABSENT_ON_NF_LINE))
 
     #: Envs, die der Code aus ``ENV_PREFIX + "<NAME>"`` zusammensetzt (der volle Name steht nirgends als Literal): Name -> (Datei im weg2-Verzeichnis,
     #: Quelltext der Stelle, die das Suffix liest).  AP-H1 (Dual-ENV-Tabelle): dual_green.py / dual_share.py lesen sie ueber ``g("TABLE")`` bzw. die Namensliste.
@@ -110,6 +130,8 @@ class Curated(unittest.TestCase):
         if hit is None:
             return False
         prefix, suffix_src = "SGLANG_WEG2_DUAL_SHARE_", hit[1]
+        if not os.path.isfile(os.path.join(WEG2, "dual_share.py")) or not os.path.isfile(os.path.join(WEG2, hit[0])):
+            return False                                   # the Dual form is not on this line
         with open(os.path.join(WEG2, "dual_share.py"), encoding="utf-8") as fh:
             if 'ENV_PREFIX = "%s"' % prefix not in fh.read():
                 return False
@@ -163,16 +185,26 @@ class Build(unittest.TestCase):
             with open(SHIPPED, encoding="utf-8") as fh:
                 shipped = json.load(fh)
             self.assertEqual(shipped["schema"], PC.SCHEMA)
-            self.assertEqual(shipped["register_wired"], wired)             # regenerate: python -m sglang.srt.weg2.profile_catalog
-            self.assertEqual(shipped["stats"]["kuratiert"], st["kuratiert"])
-            # Die ausgelieferte Datei ist der Katalog über BEIDE Code-Bäume (--tree-27b/--tree-nf, siehe test_profile_catalog_union_1005): sie
-            # hat mehr Einträge als dieser Baum allein. Was als "27b" markiert ist, muss aber genau dem Baum dieses Branchs entsprechen:
-            # bewegt sich der Baum (Flag, Env, os.environ-Lesestelle), wird diese Prüfung rot = catalog.json neu bauen
-            # (Kommando und Baum-Stände stehen in der Commit-Nachricht der Datei).
-            self.assertEqual(sorted(shipped["trees"]), ["27b", "nf"])
-            here = PC._harvest(os.path.join(WEG2, "launcher.py"), os.path.join(SRT, "environ.py"), os.path.join(SRT, "server_args.py"), SRT)
-            tagged = {n for n, e in shipped["entries"].items() if "27b" in e.get("baeume", [])}
-            self.assertEqual(tagged, set(here))
+            if DUAL_LINE:
+                self.assertEqual(shipped["register_wired"], wired)             # regenerate: python -m sglang.srt.weg2.profile_catalog
+                self.assertEqual(shipped["stats"]["kuratiert"], st["kuratiert"])
+                # Die ausgelieferte Datei ist der Katalog über BEIDE Code-Bäume (--tree-27b/--tree-nf, siehe test_profile_catalog_union_1005): sie
+                # hat mehr Einträge als dieser Baum allein. Was als "27b" markiert ist, muss aber genau dem Baum dieses Branchs entsprechen:
+                # bewegt sich der Baum (Flag, Env, os.environ-Lesestelle), wird diese Prüfung rot = catalog.json neu bauen
+                # (Kommando und Baum-Stände stehen in der Commit-Nachricht der Datei).
+                self.assertEqual(sorted(shipped["trees"]), ["27b", "nf"])
+                here = PC._harvest(os.path.join(WEG2, "launcher.py"), os.path.join(SRT, "environ.py"), os.path.join(SRT, "server_args.py"), SRT)
+                tagged = {n for n, e in shipped["entries"].items() if "27b" in e.get("baeume", [])}
+                self.assertEqual(tagged, set(here))
+            else:
+                # NF line (07.10.): the shipped file is the catalog over BOTH code trees, built by the 27B line's tool (the catalog tool of this
+                # line is the older single-tree one).  Its ``register_wired`` is the 27B launcher's, so it is NOT compared with this tree's
+                # (the dashboard reads the wired codes from the planner tree's own launcher: test_profil_force_katalog_2002); what must hold:
+                # both trees are in, and every name this tree's tool harvests (curated-only names aside) is tagged "nf" in the file.
+                self.assertEqual(sorted(shipped["trees"]), ["27b", "nf"])
+                nf_names = {n for n, e in shipped["entries"].items() if "nf" in e.get("baeume", [])}
+                self.assertEqual(sorted(n for n in cat["entries"] if n not in CU.CURATED and n not in nf_names), [])
+                self.assertLessEqual(shipped["stats"]["kuratiert"], st["kuratiert"])
 
 
 if __name__ == "__main__":
