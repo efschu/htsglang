@@ -16,8 +16,9 @@ Routes
   GET  /api/hwprofil/issue     Issue-Text "Hardwareprofil" (Markdown zum Kopieren, redigiert)
   POST /api/profil/issue       Issue-Text "Laufbericht" (AP-I, Markdown zum Kopieren, redigiert): {doc, dry?, cards?, model?}
   POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|phase_bars|compute|move|chunk|context, settings?, phases?, form?}
-  POST /api/profil/propose     Startprofil des Planers (AP-D, nur LAN): {basis: {kind, name}, form: flip|tp, inventar: "rig" | [{card, pcie}], ziele?, model_path?, draft_path?}
-                               -> propose() + Orakel (Launcher-Trockenlauf im Kindprozess, Cache) + Verdikte; flliper.server/1 mit Herkunft/Verdikt/Kanten je Wert
+  POST /api/profil/propose     Startprofil des Planers (AP-D, nur LAN): {basis: {kind, name}, form: flip|tp|dual|single, inventar: "rig" | [{card, pcie}], karte?, ziele?, model_path?, draft_path?}
+                               -> propose() + Orakel (Launcher-Trockenlauf im Kindprozess, Cache) + Verdikte; flip/tp/dual: Orakel, single (Einzelkarte, genau eine Karte): Planer-Rechnung
+                               ohne Launcher (AP-F); flliper.server/1 mit Herkunft/Verdikt/Kanten je Wert
 """
 
 from __future__ import annotations

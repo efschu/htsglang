@@ -359,9 +359,14 @@ Launchers als `ORAKEL-ABSTURZ`. Das Rückgabeformat des Trockenlaufs bleibt; neu
 16-18 s (gemessen 06.10.), darum der Cache je (Inventar, Form, Argv-Hash, Stand der Quellen); Live-Profile driften: der Profil-Hash (Datei und Launch-Eingabe)
 steht in jedem Verdikt und im Schlüssel.
 
-`POST /api/profil/propose` ({basis: {kind, name}, form: flip|tp, inventar: "rig" | [{card, pcie}], ziele?}) ruft `propose()` (AP-C) und das Orakel und liefert
-das Startprofil `flliper.server/1` (Basisprofil + die Werte des Vorschlags, Herkunft `planer`) mit Herkunft, Verdikt und Kanten je Wert, die Verdikte des
-Laufs und die Anfrage für die Balken (`what=phase_bars`, `form` flip|d_only, Vertrag `flliper.balken/1` von AP-H2). Dual und Einzelkarte sind AP-E/AP-F.
+`POST /api/profil/propose` ({basis: {kind, name}, form: flip|tp|dual|single, inventar: "rig" | [{card, pcie}], karte?, ziele?, model_path?, draft_path?}) ruft
+`propose()` (AP-C) und liefert das Startprofil `flliper.server/1` (Basisprofil + die Werte des Vorschlags, Herkunft `planer`) mit Herkunft, Verdikt und Kanten je
+Wert, die Verdikte und die Anfrage für die Balken (`what=phase_bars`, `form` flip|d_only|dual|single, Vertrag `flliper.balken/1` von AP-H2). Alle vier Formen:
+`flip`, `tp` und `dual` fragen den Launcher-Trockenlauf (Orakel); Dual (AP-E) trägt zusätzlich die Dual-Passung als Verdikt "Planer-Rechnung, nicht hw_fit"
+(`DUAL-PASSUNG`, `DUAL-PFLICHT`). `single` (Einzelkarte, AP-F; `einzel` ist ein Name dafür) hat keinen Launcher: genau EINE Karte (`karte` = Ordinal im
+Hardwareprofil, Standard 0), ein Modellpfad (`model_path` oder das `PROFILE_MODEL` des Basisprofils; ohne Basisprofil geht es auch), das Verdikt ist eine
+Planer-Rechnung (`ausgang` passt | passt_nicht | unbelegt, `art` Planer-Rechnung, kein Force) plus ServerArgs-Parse, das Startprofil ein neues Profil aus den
+Argumenten des normalen Servers (`launch.argv` für `python -m sglang.launch_server`).
 Der Orakel-Kindprozess importiert den Launcher: der Planer-Baum der Unit muss `weg2/launcher.py`, `propose*.py`, `hw_fit.py` und `fit_profiles_data`
 tragen (der volle Baum `python/sglang` der Revision, wie bei `stage_profil_modules.sh`).
 

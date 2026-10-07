@@ -374,7 +374,7 @@ class ProposeRequests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_form_ziele_basis_and_inventory_are_checked(self):
-        for body, needle in (({"basis": {"kind": "release", "name": "demo"}, "form": "dual"}, "form muss flip oder tp"),
+        for body, needle in (({"basis": {"kind": "release", "name": "demo"}, "form": "quad"}, "form muss flip, tp, dual oder single"),
                              ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"x": 1}}, "unbekannte Ziele"),
                              ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"seats": 0}}, "seats muss zwischen"),
                              ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"p_cut": "x"}}, "p_cut muss eines"),
@@ -579,9 +579,9 @@ class ProposeRoute(unittest.TestCase):
         self.assertEqual(st, 200, txt[:300])
         js = json.loads(txt)
         self.assertEqual((js["ok"], js["schema"], js["startprofil"]["schema"]), (True, "flliper.propose-d/1", "flliper.server/1"))
-        st, txt = self.call(port, "/api/profil/propose", base._body(form="dual"))
+        st, txt = self.call(port, "/api/profil/propose", base._body(form="quad"))
         self.assertEqual(st, 400)
-        self.assertIn("form muss flip oder tp", json.loads(txt)["error"])
+        self.assertIn("form muss flip, tp, dual oder single", json.loads(txt)["error"])
         st, txt = self.call(port, "/api/profil/propose", base._body(basis={"kind": "release", "name": "../x"}))
         self.assertEqual(st, 400)
 

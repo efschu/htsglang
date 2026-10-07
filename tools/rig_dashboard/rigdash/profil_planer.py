@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 SCHEMA = "flliper.planer-ui/1"
 
-#: Betriebsform der Seite -> Name der Form in ``ProfilEditor.propose`` / ``propose_oracle`` (``single`` und ``dual`` sind AP-F und AP-E)
+#: Betriebsform der Seite -> Name der Form in ``ProfilEditor.propose`` (AP-D: ``flip``/``tp`` Orakel, ``dual`` AP-E Orakel + Dual-Passung, ``single`` AP-F Planer-Rechnung)
 FORM_BACKEND = {"einzel": "single", "tp": "tp", "flip": "flip", "dual": "dual"}
 
 #: die vier Formen (Plan R2); ``n_min``/``n_max`` = zulässige Kartenzahl (R2: Einzelkarte N=1, die übrigen N>=2; topology.py MIN_CARDS)
@@ -134,8 +134,8 @@ def vector_names() -> List[str]:
 def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[str, Any]]] = None, oracle: bool = False) -> Dict[str, Any]:
     """Das ``planer``-Objekt der ``list``-Antwort.
 
-    ``vorschlag_formen``: die Formen, die ``ProfilEditor.propose`` kann (``flip``, ``tp``); eine Seitenform mit anderem Namen bekommt
-    ``vorschlag: False`` und den Hinweis, dass ihr Vorschlag ein späteres Arbeitspaket ist.  ``entries``: der Katalog (für Text und Kanten der
+    ``vorschlag_formen``: die Formen, die ``ProfilEditor.propose`` kann (``ProfilEditor.FORMS``); eine Seitenform mit anderem Namen bekommt
+    ``vorschlag: False`` und einen Hinweis (heute bedient ``propose`` alle vier Formen: ``flip``, ``tp``, ``dual``, ``single``).  ``entries``: der Katalog (für Text und Kanten der
     Dual-ENV-Werte, auch wenn das Profil sie nicht setzt).  ``oracle``: ob das Orakel konfiguriert ist (ohne es gibt es keinen Vorschlag)."""
     can = set(vorschlag_formen or ())
     formen = []
@@ -145,10 +145,8 @@ def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[s
         if not d["vorschlag"]:
             if not oracle:
                 d["hinweis"] = "Der Vorschlag braucht das Orakel (Launcher-Trockenlauf), das in diesem Dashboard nicht eingerichtet ist; die Werte lassen sich von Hand setzen."
-            elif back == "single":
-                d["hinweis"] = "Der Vorschlag für die Einzelkarte ist ein eigenes Arbeitspaket (AP-F) und in diesem Stand nicht enthalten; die Werte lassen sich von Hand setzen."
             else:
-                d["hinweis"] = "Der Vorschlag für Dual ist ein eigenes Arbeitspaket (AP-E) und in diesem Stand nicht enthalten; die Werte lassen sich von Hand setzen."
+                d["hinweis"] = "Für diese Form gibt es in diesem Stand keinen Vorschlag; die Werte lassen sich von Hand setzen."
         formen.append(d)
     ents = entries or {}
     dual = dict(DUAL)

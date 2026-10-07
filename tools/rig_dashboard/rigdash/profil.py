@@ -1102,24 +1102,35 @@ class ProfilEditor:
 
     # ------------------------------------------------------------------ Vorschlag (Stufe A + Orakel + Verdikte, AP-D)
     PROPOSE_SCHEMA = "flliper.propose-d/1"
-    FORMS = ("flip", "tp")
-    #: Betriebsform des Vorschlags -> Form des Balkenvertrags ``flliper.balken/1`` (AP-H2: ``what=phase_bars``, ``form``)
-    BALKEN_FORM = {"flip": "flip", "tp": "d_only"}
+    #: die Formen des Vorschlags: flip, tp und dual = Planer + Launcher-Trockenlauf (Orakel); single = die Einzelkarte, Planer-Rechnung ohne Launcher
+    #: (``weg2/propose_single``, kein weg2-Launcher bei N=1: ``topology.py`` MIN_CARDS=2)
+    FORMS = ("flip", "tp", "dual", "single")
+    #: Namen der Einzelkarte in einer Anfrage (der Plan sagt ``einzel``, die Seite schickt ``single``)
+    FORM_ALIAS = {"einzel": "single", "einzelkarte": "single"}
+    #: Betriebsform des Vorschlags -> Form des Balkenvertrags ``flliper.balken/1`` (AP-H2: ``what=phase_bars``, ``form``; ``profile_couplings.FORMS``)
+    BALKEN_FORM = {"flip": "flip", "tp": "d_only", "dual": "dual", "single": "single"}
     ZIELE_INT = {"seats": (1, 256), "kv_tokens": (1024, 8 << 20)}
     ZIELE_CHOICE = {"kv_dtype": ("auto", "fp8_e4m3"), "p_cut": ("auto", "pin", "seed"), "draft_kv_on_p": ("on", "off")}
+    #: Ziele, die nur die Einzelkarte kennt (``propose_single``: Host-RAM-Budget fuer HiCache, gemessenes ``pre_model_load_memory``, gemessene Reserve, Draft-Wahl)
+    ZIELE_INT_EINZEL = {"host_ram_mib": (1, 8 << 20), "pre_load_free_mib": (1, 1 << 20), "reserve_mib": (0, 1 << 20)}
+    ZIELE_CHOICE_EINZEL = {"draft": ("auto", "on", "off", "nextn", "external")}
 
-    def _ziele(self, z) -> dict:
+    def _ziele(self, z, form: str = "flip") -> dict:
         """Die Ziele des Vorschlags (``propose(ziele)``), geprüft: nur bekannte Schlüssel, Zahlen im Bereich, Auswahl aus der Liste."""
         if z in (None, {}):
             return {}
         if not isinstance(z, dict):
             raise ProfilError("ziele muss ein JSON-Objekt sein")
-        known = set(self.ZIELE_INT) | set(self.ZIELE_CHOICE) | {"d_objective", "force_rules"}
+        ints, choices = dict(self.ZIELE_INT), dict(self.ZIELE_CHOICE)
+        if form == "single":
+            ints.update(self.ZIELE_INT_EINZEL)
+            choices.update(self.ZIELE_CHOICE_EINZEL)
+        known = set(ints) | set(choices) | {"d_objective", "force_rules"}
         bad = sorted(set(z) - known)
         if bad:
             raise ProfilError("unbekannte Ziele: %s (erlaubt: %s)" % (", ".join(bad), ", ".join(sorted(known))))
         out: dict = {}
-        for k, (lo, hi) in self.ZIELE_INT.items():
+        for k, (lo, hi) in ints.items():
             if z.get(k) not in (None, ""):
                 try:
                     v = int(z[k])
@@ -1128,10 +1139,10 @@ class ProfilEditor:
                 if not lo <= v <= hi:
                     raise ProfilError("Ziel %s muss zwischen %d und %d liegen" % (k, lo, hi))
                 out[k] = v
-        for k, choices in self.ZIELE_CHOICE.items():
+        for k, opts in choices.items():
             if z.get(k) not in (None, ""):
-                if z[k] not in choices:
-                    raise ProfilError("Ziel %s muss eines von %s sein" % (k, ", ".join(choices)))
+                if z[k] not in opts:
+                    raise ProfilError("Ziel %s muss eines von %s sein" % (k, ", ".join(opts)))
                 out[k] = z[k]
         if z.get("d_objective") not in (None, ""):
             v = str(z["d_objective"])
@@ -1191,14 +1202,29 @@ class ProfilEditor:
         new["name"] = ("%s-vorschlag" % basis_name)[:64]
         return new, keys, skipped
 
+    def _single_base(self, name: str, model_path: str) -> dict:
+        """Das leere Profil der Einzelkarte (``flliper.server/1`` ohne weg2-Zeilen): nur Name, Linie und Modellpfad; die Argumente des normalen Servers setzt
+        der Vorschlag hinein.  Kein Release-Profil als Grundlage: dessen Zeilen (``--pp-size``, ``--d-bs`` ...) gehören zum weg2-Launcher, den die Einzelkarte nicht hat."""
+        pj, _ref = self.mods()
+        doc = {"schema": pj.SCHEMA, "name": ("%s" % name)[:64], "line": "einzel", "source": {"kind": "planer", "file": "", "sha256": "", "rc": 0},
+               "vars": [{"name": "PROFILE_LINE", "value": "einzel"}, {"name": "PROFILE_MODEL", "value": model_path}, {"name": "PROFILE_NAME", "value": name}],
+               "exports": [], "args": [], "form": [], "instr": [], "meta": {"origins": {}, "planner": {}, "notes": [], "caller_switches": []}}
+        doc["id"] = pj.doc_id(doc)
+        return doc
+
     def propose(self, body: dict) -> dict:
         """``POST /api/profil/propose``: Vorschlag (``weg2/propose.propose``) + Orakel (Launcher-Trockenlauf) + Verdikte je Wert, als Startprofil
         ``flliper.server/1`` mit Herkunft, Verdikt und Kanten je Wert.
 
-        Körper: ``basis`` {kind: release|user, name}, ``form`` flip|tp, ``inventar`` ``"rig"`` (das Hardwareprofil dieses Rigs) oder eine Kartenliste
-        ``[{card, pcie}]`` (Katalog, wie der Trockenlauf), ``ziele`` {seats, kv_tokens, kv_dtype, p_cut, d_objective, draft_kv_on_p, force_rules},
-        ``model_path`` / ``draft_path`` (sonst die des Basisprofils).  Läuft im Kindprozess (``self.oracle``), Cache je (Inventar, Form, Ziele,
-        Profil-Hash, Modell); ein Fehler des Kindprozesses kommt als ``ok: false`` mit Grund, nie als Absturz."""
+        Körper: ``basis`` {kind: release|user, name}, ``form`` flip|tp|dual|single (``einzel`` ist ein Name für ``single``), ``inventar`` ``"rig"`` (das
+        Hardwareprofil dieses Rigs) oder eine Kartenliste ``[{card, pcie}]`` (Katalog, wie der Trockenlauf), ``ziele`` {seats, kv_tokens, kv_dtype, p_cut,
+        d_objective, draft_kv_on_p, force_rules; nur single: host_ram_mib, pre_load_free_mib, reserve_mib, draft}, ``model_path`` / ``draft_path`` (sonst die
+        des Basisprofils).  Läuft im Kindprozess (``self.oracle``), Cache je (Inventar, Form, Ziele, Profil-Hash, Modell); ein Fehler des Kindprozesses kommt
+        als ``ok: false`` mit Grund, nie als Absturz.
+
+        Die Form ``single`` (Einzelkarte, genau EINE Karte; ``karte`` = Ordinal im Hardwareprofil, Standard 0) hat keinen Launcher-Lauf: ihr Verdikt ist
+        eine Planer-Rechnung (``ausgang`` passt | passt_nicht | unbelegt, ``art`` Planer-Rechnung) und ihr Startprofil ein neues Profil aus den Argumenten des
+        normalen Servers (kein Basisprofil nötig; ``model_path`` oder das ``PROFILE_MODEL`` des Basisprofils)."""
         pj, _ref = self.mods()
         if self.oracle is None:
             raise ProfilError("Das Orakel ist nicht konfiguriert (Kindprozess mit dem Python der sglang-Umgebung: --couplings-python / RIGDASH_COUPLINGS_PYTHON)")
@@ -1209,11 +1235,17 @@ class ProfilEditor:
             raise ProfilError("basis muss {kind, name} sein")
         kind, name = str(basis.get("kind") or "release"), str(basis.get("name") or "")
         form = str(body.get("form") or "flip")
+        form = self.FORM_ALIAS.get(form, form)
         if form not in self.FORMS:
-            raise ProfilError("form muss flip oder tp sein (Dual und Einzelkarte sind andere Pakete: AP-E, AP-F)")
-        ziele = self._ziele(body.get("ziele"))
+            raise ProfilError("form muss flip, tp, dual oder single (Einzelkarte) sein")
+        single = form == "single"
+        ziele = self._ziele(body.get("ziele"), form)
         notes: List[str] = []
-        if kind == "release":
+        if single and not name:
+            doc, bas, bsha, comments = None, None, "", {}                 # die Einzelkarte braucht kein Profil: Modellpfad + Karte genügen
+            name = "einzelkarte"
+            kind = "keines"
+        elif kind == "release":
             doc = self._import_release(name)
             path = self._release_path(name)
             bas = {"env_path": path}
@@ -1227,7 +1259,7 @@ class ProfilEditor:
             comments = {}
         else:
             raise ProfilError("basis.kind muss release oder user sein")
-        vars_ = {v["name"]: str(v.get("value", "")) for v in doc.get("vars") or [] if "name" in v}
+        vars_ = {v["name"]: str(v.get("value", "")) for v in (doc or {}).get("vars") or [] if "name" in v}
         paths = {}
         for fld, var_name in (("model_path", "PROFILE_MODEL"), ("draft_path", "PROFILE_DRAFT")):
             p = body.get(fld)
@@ -1239,9 +1271,12 @@ class ProfilEditor:
                 except ValueError as exc:
                     raise ProfilError(str(exc))
             else:
-                p = vars_.get(var_name) or ""
+                # das Draft-Verzeichnis eines weg2-Profils ist ein weg2-Draft: die Einzelkarte nimmt nur einen ausdrücklich genannten
+                p = "" if (single and fld == "draft_path") else (vars_.get(var_name) or "")
             if p:
                 paths[fld] = str(p)
+        if single and not paths.get("model_path"):
+            raise ProfilError("Einzelkarte: model_path angeben (oder ein Basisprofil mit PROFILE_MODEL wählen)")
         inv_req = body.get("inventar", "rig")
         if inv_req == "rig":
             hw = self._hardware_profile()
@@ -1249,23 +1284,40 @@ class ProfilEditor:
                 raise ProfilError("Hardwareprofil dieses Rigs nicht verfügbar: für ein synthetisches Inventar die Kartenliste [{card, pcie}] angeben")
             inventar = {"hardware": hw}
             notes.append("Inventar: die NVML-Karten dieses Rigs (Hardwareprofil), echte UUIDs.")
+            if single:
+                try:
+                    karte = int(body.get("karte") or 0)
+                except (TypeError, ValueError):
+                    raise ProfilError("karte muss das Ordinal einer Karte des Hardwareprofils sein")
+                if not 0 <= karte < len(hw["cards"]):
+                    raise ProfilError("karte %d: das Hardwareprofil hat %d Karten" % (karte, len(hw["cards"])))
+                inventar["karte"] = karte
+                notes.append("Einzelkarte: Karte %d des Hardwareprofils (andere Karte: karte=<Ordinal>); die übrigen Karten des Rigs bleiben unberücksichtigt." % karte)
         elif isinstance(inv_req, list):
+            if single and len(inv_req) != 1:
+                raise ProfilError("Einzelkarte: genau eine Karte wählen (nicht %d)" % len(inv_req))
             cards = self._build_cards(inv_req)
             inventar = self._inventar_for(cards, notes)
         else:
             raise ProfilError('inventar muss "rig" oder eine Kartenliste [{card, pcie}] sein')
-        parts = {"inventar": self._inventar_key(inventar), "form": form, "ziele": ziele, "basis_sha256": bsha, "basis": [kind, name], "paths": paths,
+        parts = {"inventar": self._inventar_key(inventar) + ([["karte", inventar.get("karte")]] if single and "karte" in inventar else []), "form": form, "ziele": ziele, "basis_sha256": bsha, "basis": [kind, name], "paths": paths,
                  "modell": [self._path_stamp(p) for p in paths.values()]}
         req = {"basis": bas, "inventar": inventar, "form": form, "ziele": ziele, "model_path": paths.get("model_path"), "draft_path": paths.get("draft_path")}
         res = self.oracle.ask("propose", req, parts)
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error") or "unbekannter Fehler", "schema": self.PROPOSE_SCHEMA, "notes": notes + list(res.get("notizen") or [])}
         v = res["vorschlag"]
+        if single:
+            doc = self._single_base(name, paths["model_path"])
         new, keys, skipped = self._startprofil(doc, v, name)
         problems = self.verify_render(new, pj.render_env(new))
         new["meta"]["vorschlag"] = {"schema": self.PROPOSE_SCHEMA, "form": form, "n": v["n"], "ziele": v["ziele"], "basis": [kind, name], "basis_sha256": bsha,
                                     "ausgang": res["verdikt"].get("ausgang"), "argv_sha256": res["verdikt"].get("argv_sha256")}
-        new["meta"].setdefault("notes", []).append("Startprofil des Planers aus %s (%s) für %d Karten, Form %s" % (name, bsha[:12], v["n"], form))
+        if single:
+            new["meta"].setdefault("notes", []).append("Startprofil der Einzelkarte (Planer-Rechnung, kein weg2-Launcher): die Argumente des normalen Servers "
+                                                       "(python -m sglang.launch_server) für Modell %s" % paths["model_path"])
+        else:
+            new["meta"].setdefault("notes", []).append("Startprofil des Planers aus %s (%s) für %d Karten, Form %s" % (name, bsha[:12], v["n"], form))
         new["id"] = pj.doc_id(new)
         view = self.render_view(new, comments)
         by_key = {r["key"]: r for r in view["view"]["rows"]}
@@ -1283,7 +1335,8 @@ class ProfilEditor:
             werte.append(wv)
             if row is not None:
                 row["vorschlag"] = {k: wv[k] for k in ("zustand", "herkunft", "grund", "verdikte", "kanten", "geaendert")}
-        keep = ("schema", "form", "n", "cards", "inventory", "seeds", "fit", "ziele", "unbelegt", "hinweise", "blocker", "vektorlaengen", "vektoren_ok", "vektoren_falsch", "basis")
+        keep = ("schema", "form", "n", "cards", "inventory", "seeds", "fit", "ziele", "unbelegt", "hinweise", "blocker", "vektorlaengen", "vektoren_ok", "vektoren_falsch", "basis",
+                "dual", "einzelkarte")
         vd = res["verdikt"]
         return {"ok": True, "schema": self.PROPOSE_SCHEMA, "form": form, "n": v["n"],
                 "basis": {"kind": kind, "name": name, "sha256": bsha, "profil": vd.get("profil")},
