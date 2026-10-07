@@ -143,7 +143,10 @@ def _plan(fundable, **kw):
 class ChunkWidthFollowTest(unittest.TestCase):
     def setUp(self):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        m._STATS.clear()
+        stats_before = dict(m._STATS)
+        self.addCleanup(lambda: (m._STATS.clear(), m._STATS.update(stats_before)))
+        for key in m._STATS:
+            m._STATS[key] = 0
 
     def _riegel(self, sched, adder, tp_rank):
         with patch.object(m, "form_a_follow_active", return_value=True), patch.object(
