@@ -81,6 +81,8 @@ class Daten(unittest.TestCase):
         self.assertEqual(PL.ZIELE["seats"], list(P.ProfilEditor.ZIELE_INT["seats"]))
         self.assertEqual(PL.ZIELE["kv_tokens"], list(P.ProfilEditor.ZIELE_INT["kv_tokens"]))
 
+    @unittest.skipUnless(os.path.isfile(os.path.join(WEG2, "dual_green.py")),
+                         "27B launcher line only: the Dual form (weg2/dual_green.py, dual_share.py) does not exist in this tree (measured 07.10. on the NF tree 2e68b3f94b)")
     def test_dual_defaults_are_in_the_source(self):
         g, s, e, dsh = _src("dual_green.py"), _src("dual_share.py"), None, _src("dual_share.py")
         self.assertIn("((2, 1, 0), (4, 2, 1), (10 ** 9, 3, 2))", g)

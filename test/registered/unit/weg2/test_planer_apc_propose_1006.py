@@ -85,10 +85,12 @@ _REF_KEY = "27b" if _LINE == O.LINE_27B else "nf"
 #: AP2 1006: the launcher re-stages the P-card reference at N != 3 (NF line); else it refuses W167 "Stufenzahl 2 gegen 3"
 _RESTAGES_P_CARD = O.launcher_has("_restage_p_card_reference")
 #: AP4 1526 (NF line): ``--weg2-xchg-census-map`` resolves the UUID-bound exchange census by card class, so the foreign N=4 inventories do
-#: not stop at W71 "is not in the census" any more; the next named refusal behind it is W120 (Platztausch buffer: every owned expert
-#: resident -> no buffer; measured 2026-10-07, both lines have W120, on the 27B line W71 comes first)
+#: not stop at W71 "is not in the census" any more.  The next refusal behind it was W120 (Platztausch buffer: every owned expert
+#: resident -> no buffer) while the proposal set FR_D 1.000 on every D rank; that was the PLANNER's value (propose_rules.form_a_d), it is
+#: capped now (FIX 6, 07.10.), so the NF-line dry run of the N=4 inventories RUNS THROUGH (rest blockers empty).  On the 27B line W71 is
+#: still the first launcher refusal (the census is UUID-bound there; a launcher matter, not the planner's)
 _CENSUS_MAP = O.launcher_knows("--weg2-xchg-census-map")
-_N4_REFUSAL = "W120" if _CENSUS_MAP else "W71"
+_N4_REFUSAL = None if _CENSUS_MAP else "W71"
 #: the value refusals ``--force`` passes in these dry runs: the NF line also names HW-BORROWED (a census row borrowed from another card)
 _FORCED_OK = {"HW-COUNT", "HW-UNCALIBRATED"} | ({"HW-BORROWED"} if "HW-BORROWED" in {r.code for r in refusals.REGISTER} else set())
 
@@ -650,12 +652,13 @@ class TestSyntheticDryRun(unittest.TestCase):
         for model in _LINE_MODELS:
             refused = _N4_REFUSAL if model == "nf" or not _CENSUS_MAP else "W71"   # the 27B model's profile reads the census itself: W71
             v, run = self._check(model, "n4_3090", "flip", refused=refused)
-            self.assertNotIn("W19", run.result.exc_msg[:200])
+            self.assertNotIn("W19", (run.result.exc_msg or "")[:200])
             if refused == "W71":
                 self.assertIn("is not in the census", run.result.exc_msg)
                 self.assertIn("RTX 3090", run.result.exc_msg)
-            else:
-                self.assertIn("kein Puffer", run.result.exc_msg)
+            else:       # A2: the rest blockers are empty; the dry run runs through, nothing is refused by a value the planner set
+                self.assertNotIn("W120", run.result.text + (run.result.exc_msg or ""))
+                self.assertEqual({f["code"] for f in run.result.forced} - _FORCED_OK, set())
             self.assertEqual(v["n"], 4)
             self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= {f["code"] for f in run.result.forced} <= _FORCED_OK)
             # every value the planner derived for these cards is labelled unbelegt
@@ -668,7 +671,28 @@ class TestSyntheticDryRun(unittest.TestCase):
         for model in _LINE_MODELS:
             refused = _N4_REFUSAL if model == "nf" or not _CENSUS_MAP else "W71"
             v, run = self._check(model, "n4_mixed", "flip", refused=refused)
-            self.assertIn("is not in the census" if refused == "W71" else "kein Puffer", run.result.exc_msg)
+            if refused == "W71":
+                self.assertIn("is not in the census", run.result.exc_msg)
+            else:
+                self.assertNotIn("W120", run.result.text + (run.result.exc_msg or ""))
+
+    def test_form_a_fractions_stay_below_the_platztausch_buffer_cap(self):
+        """Review 6 finding 1: the planner's FR_D never exceeds the largest fraction at which the rank still builds its Platztausch
+        buffer (>= 2 scratch rows, the launcher's W120 bound); checked against the launcher's OWN count on the proposal's ownership."""
+        from sglang.srt.layers.moe import expert_map as EM
+        from sglang.srt.planner import expert_residency as ER
+        for inv in ("n4_3090", "n4_mixed"):
+            hw, rows = _inventory(inv)
+            v = P.propose(hw, _MODELS["nf"][0], "flip", {}, basis=_profile("nf"), draft=_MODELS["nf"][1], rates=MEASURED_RATES)
+            la = P.LaunchArgv(v["argv"], v["env"])
+            fr = [float(x) for x in la.extra_get("d", "--rank-moe-resident-fraction").split(",")]
+            owned = [int(x) for x in la.extra_get("d", "--rank-moe-ratio").split(",")]
+            self.assertEqual(len(fr), 4)
+            for r, (f, o) in enumerate(zip(fr, owned)):
+                e = o + 1                                              # the zero-pad expert counts (#82)
+                self.assertLessEqual(ER.resident_rows(e, f), e - 2, (inv, r, f, o))
+                self.assertLessEqual(f, ER.largest_fraction_for_rows(local_experts=e, scratch_rows=0, max_rows=e), (inv, r, f, o))
+            self.assertLess(max(fr), 1.0, (inv, fr))
 
 
 class TestSeats(unittest.TestCase):

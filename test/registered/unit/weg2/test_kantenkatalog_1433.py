@@ -34,6 +34,13 @@ RELS = {"tauscht", "braucht", "schliesst_aus", "abgeleitet_von", "skaliert_mit"}
 CALCS = {"text", "S4"}
 
 
+#: line probe (module exists, never a sha or a branch name): the Dual form (dual_green.py, dual_d_kv_stage.py ...) is a 27B-line feature
+DUAL_LINE = os.path.isfile(os.path.join(WEG2, "dual_green.py"))
+#: edge endpoints the code of the NF line does not carry (measured 07.10. on 2e68b3f94b: K123 names the Dual ENV, the NF tree has no
+#: ``dual_d_kv_stage``): the edge catalog is shared by both lines, so these edges are catalog text without a code behind them on the NF line
+ABSENT_ON_NF_LINE = frozenset(("SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S",))
+
+
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -85,7 +92,10 @@ class KatalogForm(Basis, unittest.TestCase):
     def test_every_name_exists_in_the_catalog(self):
         """Namen existieren: kuratiert, Parser, ServerArgs, environ.py oder Registercode."""
         bad = [(k["id"], n) for k in self.kanten for n in (k["von"], k["nach"]) if n not in self.names]
-        self.assertEqual(bad, [])
+        if DUAL_LINE:
+            self.assertEqual(bad, [])
+        else:       # NF line: exactly the named endpoints (a new miss is a defect, a stale entry would hide one)
+            self.assertEqual(sorted({n for _i, n in bad}), sorted(ABSENT_ON_NF_LINE))
 
     def test_wert_is_within_the_flag_choices(self):
         """Wertebereich: ein 'wert' muss zu den choices des Flags gehoeren (wenn bekannt)."""
@@ -114,6 +124,10 @@ class Beleg(Basis, unittest.TestCase):
                 self.files[path] = fh.readlines()
         return self.files[path]
 
+    @unittest.skipUnless(hasattr(PC, "resolve_edge_belege"),
+                         "the catalog tool of the NF line (profile_catalog.py) has no anchor resolution (resolve_edge_belege, 27B line); the anchors "
+                         "of kantenkatalog_1004.json are written against the 27B launcher: measured 07.10. with the 27B tool on the NF tree 2e68b3f94b, "
+                         "56 of 120 edges do not resolve (31 veraltet, 13 mehrdeutig, 12 datei_fehlt: dual_*.py, x_curves.py, invariant_checker.py)")
     def test_every_edge_has_a_readable_anchor(self):
         """Der ANKER-TEXT ist der Beleg (Auftrag 2013): er muss in der Datei stehen und sich eindeutig aufloesen lassen.
 

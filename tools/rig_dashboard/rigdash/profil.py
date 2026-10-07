@@ -590,8 +590,18 @@ class ProfilEditor:
         return "lesbar", "%d Einträge" % len(entries)
 
     def register(self) -> List[dict]:
+        """The refusal register of the planner tree.  ``wired`` (which forcebar codes the launcher consults) is read from the launcher.py
+        of THAT tree, not from the shipped catalog: the catalog covers both code lines and carries the wired list of one launcher, which on
+        the other line marks codes the launcher does not have (NF line 07.10.: P-CARD/D-BUDGET/WAKE-CREDIT shown wired, HW-BORROWED not).
+        Without a readable launcher the catalog's list is the fallback."""
         _pj, ref = self.mods()
-        return ref.public_register(self.catalog().get("register_wired") or [])
+        wired = None
+        try:
+            with open(os.path.join(self.tree, "sglang", "srt", "weg2", "launcher.py"), encoding="utf-8") as fh:
+                wired = ref.wired_codes(fh.read())
+        except (OSError, AttributeError):
+            wired = None
+        return ref.public_register(wired if wired is not None else (self.catalog().get("register_wired") or []))
 
     # ------------------------------------------------------------------ Laden
     def _import_release(self, name: str) -> dict:

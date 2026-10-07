@@ -35,6 +35,16 @@ REPO_CATALOG = os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json"
 PLANER_FIX = os.path.join(REPO_ROOT, "test", "registered", "unit", "weg2", "fixtures", "planer_1006")
 REPLAY_REF = os.path.join(REPO_ROOT, "test", "registered", "unit", "weg2", "fixtures", "xchg_launch_replay_0911", "nvml_devices_1378.json")
 CENSUS_27B = "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json"
+#: line probes (module / function exists in the tree under test, never a sha or a branch name): the Dual form (dual_green.py) marks the 27B launcher
+#: line; the NF line re-stages the P-card reference at N != 3 (AP2 1006, ``launcher._restage_p_card_reference``), the 27B line refuses W167
+DUAL_LINE = os.path.isfile(os.path.join(REPO_ROOT, "python", "sglang", "srt", "weg2", "dual_green.py"))
+def _launcher_defines(name):
+    try:
+        with open(os.path.join(REPO_ROOT, "python", "sglang", "srt", "weg2", "launcher.py"), encoding="utf-8") as fh:
+            return ("\ndef %s(" % name) in fh.read()
+    except OSError:
+        return False
+RESTAGES_P_CARD = _launcher_defines("_restage_p_card_reference")
 
 ENV = """\
 # shellcheck shell=bash
@@ -669,7 +679,10 @@ class RealOracle(unittest.TestCase):
 
     def test_3_propose_for_two_cards_is_a_startprofil_with_origin_verdict_and_edges(self):
         ed = self._ed(self.hw2)
-        body = {"basis": {"kind": "release", "name": "27b-base"}, "form": "flip", "inventar": "rig", "ziele": {"kv_tokens": 196608}}
+        # the release profile of the line: the NF launcher cannot plan 27b-base (measured 07.10. on 2e68b3f94b: SystemExit '--p-chunk-policy dynamic:
+        # need 0 < min_tokens <= max_tokens, got 4096/2048'); the 27B model holds 196608 tokens on two cards, the NF default is its own
+        body = {"basis": {"kind": "release", "name": "27b-base" if DUAL_LINE else "nf-int4-h6-abl"}, "form": "flip", "inventar": "rig",
+                "ziele": {"kv_tokens": 196608} if DUAL_LINE else {}}
         r = ed.propose(body)
         self.assertTrue(r["ok"], r)
         self.assertEqual(r["schema"], "flliper.propose-d/1")
@@ -681,7 +694,9 @@ class RealOracle(unittest.TestCase):
         # vectors of N entries; no verdict names a vector
         self.assertTrue(r["vorschlag"]["vektoren_ok"], r["vorschlag"]["vektoren_falsch"])
         self.assertEqual([x for x in r["verdikt"]["verdikte"] if x["code"] == "PROFILE-VECTORS"], [])
-        self.assertEqual(r["verdikt"]["ausgang"], "geht_mit_force")
+        # 27B line: the planner's dry run goes with --force; NF line: the same once the launcher re-stages the P-card reference, else it ends with W167
+        self.assertEqual(r["verdikt"]["ausgang"], "geht_mit_force" if (DUAL_LINE or RESTAGES_P_CARD) else "verweigert",
+                         [(x["code"], x["grund"][:100]) for x in r["verdikt"]["verdikte"]])
         self.assertEqual(r["verdikt"]["n"], 2)
         self.assertEqual(len(r["verdikt"]["profil"]["datei_sha256"]), 64)
         self.assertEqual(r["basis"]["sha256"], r["verdikt"]["profil"]["datei_sha256"])
