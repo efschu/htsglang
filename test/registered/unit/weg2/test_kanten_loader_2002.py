@@ -39,7 +39,19 @@ PJ = _load("t2002_profile_json", os.path.join(WEG2, "profile_json.py"))
 EDGES_JSON = os.path.join(WEG2, "kantenkatalog_1004.json")
 
 
+#: line probe (module exists, never a sha or a branch name): the Dual form (dual_green.py ...) is a 27B-line feature
+DUAL_LINE = os.path.isfile(os.path.join(WEG2, "dual_green.py"))
+BAUM = "27b" if DUAL_LINE else "nf"
+#: curated edges without a catalog edge (``belegt: False``): 24 on the 27B line; the NF line's own curated entry --weg2-xchg-census-map carries one more
+#: (its ``braucht`` --weg2-xchg-census, no edge K.. for it)
+OHNE_BELEG = 24 if DUAL_LINE else 25
+#: edge targets that are no row of THIS tree's catalog (``to_kind`` unbekannt): none on the 27B line; on the NF line K123 names the 27B-only
+#: Dual env SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S (the edge says ``baeume: [27b]``)
+ZIEL_UNBEKANNT = 0 if DUAL_LINE else 1
+
+
 def build(**kw):
+    kw.setdefault("baum", BAUM)
     return PC.build_catalog(os.path.join(WEG2, "launcher.py"), os.path.join(SRT, "environ.py"), CU.CURATED, "t", os.path.join(SRT, "server_args.py"), **kw)
 
 
@@ -60,10 +72,10 @@ class RealCatalog(unittest.TestCase):
         k = self.cat["kanten"]
         self.assertTrue(k["geladen"])
         self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"]), (131, 51, 80))
-        self.assertEqual(k["kanten_ohne_beleg"], 24)
+        self.assertEqual(k["kanten_ohne_beleg"], OHNE_BELEG)
         self.assertEqual(k["kanten_belegt"], 131)
         self.assertEqual(k["uebersprungen_ohne_von"], [])
-        self.assertEqual(k["ziel_unbekannt"], 0)
+        self.assertEqual(k["ziel_unbekannt"], ZIEL_UNBEKANNT)
         self.assertEqual(k["wertbedingt"], 22)
 
     def test_every_catalog_edge_is_a_dependency_with_evidence_and_sentence(self):
@@ -75,13 +87,18 @@ class RealCatalog(unittest.TestCase):
             self.assertEqual(d["beleg"]["datei"], e["beleg"]["datei"])
             # Auftrag 2013: the displayed line is the one resolved by the anchor text; the stored line stays as hint
             self.assertEqual(d["beleg"]["zeile_hinweis"], e["beleg"]["zeile"])
-            self.assertIn(d["beleg"]["aufloesung"], PC.ANKER_OK + ("extern_fehlt",), e["id"])
+            if BAUM not in e.get("baeume", [BAUM]):          # the other line's code: not looked up here, marked, the stored line stays
+                self.assertEqual(d["beleg"]["aufloesung"], "andere_linie", e["id"])
+                self.assertEqual(d["baeume"], e["baeume"], e["id"])
+            else:
+                self.assertIn(d["beleg"]["aufloesung"], PC.ANKER_OK + ("extern_fehlt",), e["id"])
+                self.assertEqual(d.get("baeume"), e.get("baeume"), e["id"])
             self.assertIsInstance(d["beleg"]["zeile"], int, e["id"])
             self.assertEqual(d["beleg"]["anker"], e["beleg"]["anker"])
 
     def test_the_24_curated_edges_without_evidence_stay_and_are_marked(self):
         marked = [(n, d["to"]) for n, e in self.ent.items() for d in e["depends"] if not d["belegt"]]
-        self.assertEqual(len(marked), 24)
+        self.assertEqual(len(marked), OHNE_BELEG)
         self.assertIn(("--chunked-prefill-size", "--tp-prefill-max-tokens"), marked)
         d = self.dep("--chunked-prefill-size", "--tp-prefill-max-tokens")
         self.assertIsNone(d["beleg"])
@@ -111,6 +128,9 @@ class RealCatalog(unittest.TestCase):
         self.assertEqual(self.dep("--pp-stage-ratio", "--pp-attn-stage-ratio")["to_kind"], "flag")
         for e in self.ent.values():
             for d in e["depends"]:
+                if d["to_kind"] == "unbekannt" and not DUAL_LINE:      # only an edge of the other line may point at a name this tree lacks
+                    self.assertEqual(d.get("baeume"), ["27b"], (e["name"], d["to"]))
+                    continue
                 self.assertIn(d["to_kind"], ("flag", "env", "var", "ablehnung"), (e["name"], d["to"]))
 
     def test_conditional_edges_carry_the_value_as_data_and_nothing_is_evaluated(self):

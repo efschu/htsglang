@@ -91,6 +91,21 @@ def find_tree(explicit: Optional[str] = None) -> Optional[str]:
     return None
 
 
+#: Module der Dual-Form im Planer-Baum (``propose_dual`` importiert ``dual_layout_plan``, die Dual-ENV-Tabelle liest ``dual_green``): nur die 27B-Linie
+#: traegt sie.  Auf der NF-Linie fehlen sie (Nutzerentscheid 07.10. "2 nein": der NF-Editor bietet Dual nicht an; vorher endete der Dual-Vorschlag dort mit
+#: ImportError).
+DUAL_MODULES = ("dual_layout_plan.py", "dual_green.py")
+DUAL_FEHLT = "Dual auf dieser Linie nicht verfuegbar"
+
+
+def dual_line_probe(tree: Optional[str]) -> bool:
+    """Traegt der Planer-Baum die Dual-Module?  Sonde auf Dateiebene (die Module existieren), nie ein Baum-SHA oder ein Branchname."""
+    if not tree:
+        return False
+    base = os.path.join(tree, "sglang", "srt", "weg2")
+    return all(os.path.isfile(os.path.join(base, n)) for n in DUAL_MODULES)
+
+
 FORCE_ENV = "FLLIPER_FORCE=1"
 MAX_CODE_TEXT = 400
 
@@ -479,6 +494,14 @@ class ProfilEditor:
         self._rel_cache: Dict[str, tuple] = {}
         self._lock = threading.Lock()
 
+    def dual_available(self) -> bool:
+        """Bietet dieser Editor die Betriebsform Dual an?  Nur wenn der Planer-Baum die Dual-Module traegt (``dual_line_probe``)."""
+        return dual_line_probe(self.tree)
+
+    def forms(self) -> tuple:
+        """Die Formen, die ``propose`` auf diesem Baum bedient: ``FORMS`` ohne ``dual``, wenn der Baum die Dual-Module nicht traegt (NF-Linie)."""
+        return tuple(self.FORMS) if self.dual_available() else tuple(f for f in self.FORMS if f != "dual")
+
     # ------------------------------------------------------------------ Planer-Module und Katalog
     def mods(self):
         if self._mods is None:
@@ -543,7 +566,7 @@ class ProfilEditor:
                 "register": self.register(), "coverage": cat.get("stats"), "tree_rev": cat.get("tree_rev"),
                 "planner_tree": self.tree,
                 # AP-H1: die Daten der einen Seite (Betriebsformen, Abschnitte, Dual-ENV-Tabelle, Reglergrenzen); fehlt der Schlüssel, zeichnet die Seite wie bisher
-                "planer": PLANER.ui_info(self.FORMS, cat.get("entries"), self.oracle is not None)}
+                "planer": PLANER.ui_info(self.forms(), cat.get("entries"), self.oracle is not None, dual=self.dual_available())}
 
     def known_models(self) -> dict:
         """Every model / draft path the release profiles name, with what THIS container can read of it.  A path that is not readable here
@@ -1351,6 +1374,8 @@ class ProfilEditor:
         eine Planer-Rechnung (``ausgang`` passt | passt_nicht | unbelegt, ``art`` Planer-Rechnung) und ihr Startprofil ein neues Profil aus den Argumenten des
         normalen Servers (kein Basisprofil nötig; ``model_path`` oder das ``PROFILE_MODEL`` des Basisprofils)."""
         pj, _ref = self.mods()
+        if isinstance(body, dict) and self.FORM_ALIAS.get(str(body.get("form") or ""), str(body.get("form") or "")) == "dual" and not self.dual_available():
+            raise ProfilError(DUAL_FEHLT)              # NF-Linie: kein Dual-Vorschlag, kein ImportError im Kindprozess (HTTP 400)
         if self.oracle is None:
             raise ProfilError("Das Orakel ist nicht konfiguriert (Kindprozess mit dem Python der sglang-Umgebung: --couplings-python / RIGDASH_COUPLINGS_PYTHON)")
         if not isinstance(body, dict):

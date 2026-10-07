@@ -26,6 +26,7 @@ SHIPPED = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", "tools", "r
 #: line probe (module exists, never a sha or a branch name): the Dual form (dual_green.py, --dual-*) is a 27B-line feature
 DUAL_LINE = os.path.isfile(os.path.join(os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "python")),
                                         "sglang", "srt", "weg2", "dual_green.py"))
+TREE = "27b" if DUAL_LINE else "nf"
 #: curated names the code of the NF line does not carry (measured 07.10. on 2e68b3f94b: curated 119 entries, these 26 are neither a flag of the
 #: launcher / server_args nor an env of environ.py nor a literal of the launcher): the Dual form and four guard envs of the 27B line.  The
 #: curated catalog is shared by both lines (the dashboard serves both, the shipped catalog is the union); on the NF line they stay curated
@@ -100,8 +101,7 @@ class Curated(unittest.TestCase):
         with open(os.path.join(WEG2, "launcher.py"), encoding="utf-8") as fh:
             cls.launcher_src = fh.read()
         # Envs ohne Envs-Feld, die ein Modul ueber os.environ liest (Konstante AUX_ENV usw.): dieselbe Ernte, die der Katalog-Generator nutzt.
-        # (the catalog tool of the NF line predates the harvest: no constants there)
-        cls.env_constants = PC.environ_constants(SRT) if hasattr(PC, "environ_constants") else set()
+        cls.env_constants = PC.environ_constants(SRT)
 
     def test_every_curated_name_exists(self):
         miss = []
@@ -185,26 +185,20 @@ class Build(unittest.TestCase):
             with open(SHIPPED, encoding="utf-8") as fh:
                 shipped = json.load(fh)
             self.assertEqual(shipped["schema"], PC.SCHEMA)
+            # The shipped file is the catalog over BOTH code trees (--tree-27b/--tree-nf, see test_profile_catalog_union_1005): it has more entries than
+            # this tree alone.  What is tagged with THIS tree's label must be exactly this tree's harvest: when the tree moves (flag, env, os.environ
+            # read site), this check goes red = rebuild catalog.json (command and tree revisions are in the commit message of the file).
+            self.assertEqual(sorted(shipped["trees"]), ["27b", "nf"])
+            self.assertEqual(shipped["stats"]["kuratiert"], st["kuratiert"])
+            here = PC._harvest(os.path.join(WEG2, "launcher.py"), os.path.join(SRT, "environ.py"), os.path.join(SRT, "server_args.py"), SRT)
+            tagged = {n for n, e in shipped["entries"].items() if TREE in e.get("baeume", [])}
+            self.assertEqual(tagged, set(here))
             if DUAL_LINE:
+                # the file's ``register_wired`` is the FIRST tree's (27B launcher): comparable only on the 27B line (the NF dashboard reads the wired
+                # codes from the planner tree's own launcher: test_profil_force_katalog_2002)
                 self.assertEqual(shipped["register_wired"], wired)             # regenerate: python -m sglang.srt.weg2.profile_catalog
-                self.assertEqual(shipped["stats"]["kuratiert"], st["kuratiert"])
-                # Die ausgelieferte Datei ist der Katalog über BEIDE Code-Bäume (--tree-27b/--tree-nf, siehe test_profile_catalog_union_1005): sie
-                # hat mehr Einträge als dieser Baum allein. Was als "27b" markiert ist, muss aber genau dem Baum dieses Branchs entsprechen:
-                # bewegt sich der Baum (Flag, Env, os.environ-Lesestelle), wird diese Prüfung rot = catalog.json neu bauen
-                # (Kommando und Baum-Stände stehen in der Commit-Nachricht der Datei).
-                self.assertEqual(sorted(shipped["trees"]), ["27b", "nf"])
-                here = PC._harvest(os.path.join(WEG2, "launcher.py"), os.path.join(SRT, "environ.py"), os.path.join(SRT, "server_args.py"), SRT)
-                tagged = {n for n, e in shipped["entries"].items() if "27b" in e.get("baeume", [])}
-                self.assertEqual(tagged, set(here))
-            else:
-                # NF line (07.10.): the shipped file is the catalog over BOTH code trees, built by the 27B line's tool (the catalog tool of this
-                # line is the older single-tree one).  Its ``register_wired`` is the 27B launcher's, so it is NOT compared with this tree's
-                # (the dashboard reads the wired codes from the planner tree's own launcher: test_profil_force_katalog_2002); what must hold:
-                # both trees are in, and every name this tree's tool harvests (curated-only names aside) is tagged "nf" in the file.
-                self.assertEqual(sorted(shipped["trees"]), ["27b", "nf"])
-                nf_names = {n for n, e in shipped["entries"].items() if "nf" in e.get("baeume", [])}
-                self.assertEqual(sorted(n for n in cat["entries"] if n not in CU.CURATED and n not in nf_names), [])
-                self.assertLessEqual(shipped["stats"]["kuratiert"], st["kuratiert"])
+            # the edge anchors are checked in BOTH trees at build time and the file says so: no stale anchor in either tree
+            self.assertEqual({lb: v["problem"] for lb, v in shipped["kanten"]["beleg_aufloesung_baeume"].items()}, {"27b": [], "nf": []})
 
 
 if __name__ == "__main__":

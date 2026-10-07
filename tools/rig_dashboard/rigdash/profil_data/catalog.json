@@ -2649,8 +2649,8 @@
    "depends": [
     {
      "beleg": {
-      "anker": "refuse_short_drain_above_x",
-      "aufloesung": "nah",
+      "anker": "refuse_short_drain_above_x(int(ns.d_short_drain_tokens",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 25461,
       "zeile_hinweis": 25461
@@ -2686,6 +2686,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
       "aufloesung": "eindeutig",
@@ -2826,11 +2829,11 @@
    "depends": [
     {
      "beleg": {
-      "anker": "d_tp_ratio_decision",
-      "aufloesung": "nah",
+      "anker": "p_split=p_split, chunk_layers=chunk_layers)\n        d_ratio = d_tp_ratio_decision(",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 27341,
-      "zeile_hinweis": 27341
+      "zeile": 27340,
+      "zeile_hinweis": 27340
      },
      "belegt": true,
      "calc": "text",
@@ -5311,6 +5314,9 @@
    "default": "off",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout",
       "aufloesung": "eindeutig",
@@ -5360,6 +5366,9 @@
    "default": 1048576,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "DUAL-TP3PP3 --dual-unified-kv: D's KV pool in GLOBAL tokens",
       "aufloesung": "eindeutig",
@@ -5471,6 +5480,9 @@
    "default": "off",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--dual-green-ladder needs --dual-priority",
       "aufloesung": "eindeutig",
@@ -5490,6 +5502,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "needs 'green' in --dual-share-actuators",
       "aufloesung": "eindeutig",
@@ -5509,6 +5524,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--dual-green-ladder needs --dual-mps on",
       "aufloesung": "eindeutig",
@@ -5528,6 +5546,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "needs --dual-p-kv-max-tokens > 0",
       "aufloesung": "eindeutig",
@@ -5547,6 +5568,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--dual-green-ladder and --dual-p-sm-pct below 100 exclude each other",
       "aufloesung": "eindeutig",
@@ -6487,6 +6511,9 @@
    "default": false,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "WEG2-DUAL --dual-share implies --dual-layout",
       "aufloesung": "eindeutig",
@@ -6506,6 +6533,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "with --weg2-d-adopt on -- D would hold placeholder",
       "aufloesung": "eindeutig",
@@ -6558,6 +6588,9 @@
    "default": "off",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--dual-mps on needs --dual-layout",
       "aufloesung": "eindeutig",
@@ -6636,6 +6669,9 @@
    "default": 196608,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "DUAL-TP3PP3 --dual-unified-kv: P's KV pool rows",
       "aufloesung": "eindeutig",
@@ -6717,6 +6753,9 @@
    "default": "off",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "Needs --dual-mps on, else a named W-DUAL-SHARE-FALLBACK line",
       "aufloesung": "eindeutig",
@@ -6736,6 +6775,9 @@
      "wert": "on"
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout",
       "aufloesung": "eindeutig",
@@ -6785,6 +6827,9 @@
    "default": 1500,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "DUAL-TP3PP3 --dual-share: what P holds on a card outside its",
       "aufloesung": "eindeutig",
@@ -6804,6 +6849,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "DUAL-TP3PP3 --dual-share: what P holds on a card outside its",
       "aufloesung": "eindeutig",
@@ -6856,6 +6904,9 @@
    "default": null,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "DEFAULT: ON with --dual-share, OFF otherwise",
       "aufloesung": "eindeutig",
@@ -6875,6 +6926,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "D PRIORITY stage 2 is armed: dual layout + unified KV",
       "aufloesung": "eindeutig",
@@ -6953,6 +7007,9 @@
    "default": null,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout",
       "aufloesung": "eindeutig",
@@ -7023,6 +7080,9 @@
    "default": false,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "WEG2-DUAL --dual-share implies --dual-layout",
       "aufloesung": "eindeutig",
@@ -7072,6 +7132,9 @@
    "default": "chunk",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--dual-share-actuators duty with --dual-p-duty below 1",
       "aufloesung": "eindeutig",
@@ -7124,6 +7187,9 @@
    "default": "off",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--dual-unified-kv on needs --dual-share",
       "aufloesung": "eindeutig",
@@ -11152,6 +11218,9 @@
      "wert": "resident"
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "(both groups stay awake, no weight ever sleeps)",
       "aufloesung": "eindeutig",
@@ -12501,6 +12570,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "flip rule",
       "aufloesung": "nah",
@@ -17613,8 +17685,8 @@
    "depends": [
     {
      "beleg": {
-      "anker": "p_chunk_max",
-      "aufloesung": "nah",
+      "anker": "cap = int(getattr(ns, \"p_chunk_max\", P_CHUNK_MAX_DEFAULT) or P_CHUNK_MAX_DEFAULT)\n    low = int(getattr(ns, \"p_chunk_min\"",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 1911,
       "zeile_hinweis": 1911
@@ -17828,8 +17900,8 @@
    "depends": [
     {
      "beleg": {
-      "anker": "the plan's CEILING",
-      "aufloesung": "nah",
+      "anker": "it is the plan's CEILING (--p-chunk-max)",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 1391,
       "zeile_hinweis": 1391
@@ -17847,8 +17919,8 @@
     },
     {
      "beleg": {
-      "anker": "p_chunk_stage_model",
-      "aufloesung": "nah",
+      "anker": "models, source = p_chunk_stage_model(",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 1916,
       "zeile_hinweis": 1916
@@ -17866,8 +17938,8 @@
     },
     {
      "beleg": {
-      "anker": "the plan's CEILING",
-      "aufloesung": "nah",
+      "anker": "it is the plan's CEILING (--p-chunk-max)",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 1391,
       "zeile_hinweis": 1391
@@ -19642,8 +19714,8 @@
    "depends": [
     {
      "beleg": {
-      "anker": "--pp-cut-expert-lru-rows",
-      "aufloesung": "nah",
+      "anker": "and --pp-cut-expert-lru-rows.\"",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 21653,
       "zeile_hinweis": 21653
@@ -19662,8 +19734,8 @@
     },
     {
      "beleg": {
-      "anker": "device pool",
-      "aufloesung": "nah",
+      "anker": "MiB per layer) that live in a device pool",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 21650,
       "zeile_hinweis": 21650
@@ -19711,8 +19783,8 @@
    "depends": [
     {
      "beleg": {
-      "anker": "entries",
-      "aufloesung": "nah",
+      "anker": "has {len(fracs)} entries and",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 21659,
       "zeile_hinweis": 21659
@@ -21540,8 +21612,8 @@
     },
     {
      "beleg": {
-      "anker": "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
-      "aufloesung": "nah",
+      "anker": "SGLANG_MOE_RESIDENT_EXPERT_FRACTION\",\n                                          plan.solved_fractions)",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 20242,
       "zeile_hinweis": 20242
@@ -21759,8 +21831,8 @@
    "depends": [
     {
      "beleg": {
-      "anker": "CAPACITY-FIRST",
-      "aufloesung": "nah",
+      "anker": "is the CAPACITY-FIRST split",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 5024,
       "zeile_hinweis": 5024
@@ -23195,9 +23267,12 @@
    "default": null,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
-      "anker": "DFLASH",
-      "aufloesung": "nah",
+      "anker": "From the draft's OWN geometry: DFLASH",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 2526,
       "zeile_hinweis": 2526
@@ -25416,6 +25491,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
       "aufloesung": "eindeutig",
@@ -26789,8 +26867,8 @@
    "depends": [
     {
      "beleg": {
-      "anker": "load_census",
-      "aufloesung": "nah",
+      "anker": "census = xchg_residency.load_census(census_path)   # raises W71 by name",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 10654,
       "zeile_hinweis": 10654
@@ -26867,8 +26945,8 @@
    "depends": [
     {
      "beleg": {
-      "anker": "exchange",
-      "aufloesung": "nah",
+      "anker": "if weight_source != \"exchange\":",
+      "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
       "zeile": 10652,
       "zeile_hinweis": 10652
@@ -26939,11 +27017,25 @@
    ],
    "bare": false,
    "choices": null,
-   "cost": "",
+   "cost": "Die Bytes sind die einer anderen Karte; der Peak wird weiter gegen die echte VRAM-Summe der Karte geprueft.",
    "default": "",
-   "depends": [],
-   "gain": "",
-   "group": "",
+   "depends": [
+    {
+     "beleg": null,
+     "belegt": false,
+     "calc": "text",
+     "effect": "Benennt eine Zeile dieser Census-Datei.",
+     "kante": "",
+     "quelle": "kuratiert",
+     "rel": "braucht",
+     "satz": "",
+     "to": "--weg2-xchg-census",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
+   "gain": "Fremde Karten, andere Kartenzahl oder anderes Rig starten mit dem Austausch, ohne dass die Census-Datei neu gemessen wird.",
+   "group": "Speicher",
    "help": "AP4 1526: name the census row that prices a live card the census does not carry by UUID: comma list of <live>=<census uuid>, <live> = a live card UUID, nvml<N> or a card class label (RTX3080). Accepted as the operator's assertion (one WEG2-XCHG-CENSUS-MAP line, no refusal). A live card with neither a census row nor a mapping is BORROWED from the heaviest row of its class (else of the census) and refused as HW-BORROWED unless --force. Ignored when every live card is in the census",
    "id": "--weg2-xchg-census-map",
    "kind": "flag",
@@ -26957,8 +27049,8 @@
     "kind": "argparse",
     "line": 23395
    },
-   "status": "geerntet",
-   "text": "",
+   "status": "kuratiert",
+   "text": "Benennt die Census-Zeile, aus der eine Karte gepreist wird, die nicht per UUID in der Census-Datei steht: Liste <live>=<Census-UUID>, <live> = Karten-UUID, nvml<N> oder Klasse (RTX3080). Ohne Eintrag leiht der Start die schwerste Zeile der gleichen Klasse (sonst der ganzen Census) und verweigert das als HW-BORROWED, bis Force gesetzt ist.",
    "type": "str"
   },
   "--weg2-xchg-inject": {
@@ -27891,6 +27983,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
       "aufloesung": "eindeutig",
@@ -27959,6 +28054,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "raise XCurvesRefused(W_X_MODE_IN_DUAL, (",
       "aufloesung": "eindeutig",
@@ -28028,6 +28126,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "raise XCurvesRefused(W_X_MODE_IN_DUAL, (",
       "aufloesung": "eindeutig",
@@ -28117,6 +28218,9 @@
      "wert": "curve"
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "raise XCurvesRefused(W_X_MODE_IN_DUAL, (",
       "aufloesung": "eindeutig",
@@ -29530,6 +29634,9 @@
    "default": "20.0",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "watchdog NOT started (SGLANG_ADMISSION_WEDGE_MODE=off)",
       "aufloesung": "eindeutig",
@@ -56737,6 +56844,9 @@
    "default": "20.0",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "and _prefill_livelock_mode() != guard_switches.MODE_OFF",
       "aufloesung": "eindeutig",
@@ -65281,7 +65391,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4025
+      "line": 4062
      }
     }
    },
@@ -66441,6 +66551,7 @@
    "name": "SGLANG_WEG2_DUAL_ANCHOR_AGING_TICKS",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: \"7 DUAL-Eintraege als nur-27B-Baum\")",
    "source": {
     "baum": "27b",
     "file": "environ.py",
@@ -66461,6 +66572,9 @@
    "default": "\"\"",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "THE FIX (dual layout only, both groups, switch SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S",
       "aufloesung": "eindeutig",
@@ -66833,6 +66947,7 @@
    "name": "SGLANG_WEG2_DUAL_BYPASS_HEAD_AGE_S",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: \"7 DUAL-Eintraege als nur-27B-Baum\")",
    "source": {
     "baum": "27b",
     "file": "environ.py",
@@ -66977,6 +67092,9 @@
    "default": "True",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "Gate: ``dual_d_kv_stage.armed()``",
       "aufloesung": "eindeutig",
@@ -66996,6 +67114,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "Gate: ``dual_d_kv_stage.armed()``",
       "aufloesung": "eindeutig",
@@ -67015,6 +67136,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "# D-COMPACT (switch SGLANG_WEG2_DUAL_D_COMPACT, default on in the dual D): when P has waited past",
       "aufloesung": "eindeutig",
@@ -67316,6 +67440,7 @@
    "name": "SGLANG_WEG2_DUAL_D_REGROW_HOLD_S",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: \"7 DUAL-Eintraege als nur-27B-Baum\")",
    "source": {
     "baum": "27b",
     "file": "environ.py",
@@ -67517,6 +67642,7 @@
    "name": "SGLANG_WEG2_DUAL_D_UNBACKED_DROP_WAIT_S",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: \"7 DUAL-Eintraege als nur-27B-Baum\")",
    "source": {
     "baum": "27b",
     "file": "environ.py",
@@ -67653,6 +67779,9 @@
    "default": "0",
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "_ms = _retry_ms() if _dual_layout_env() else 0",
       "aufloesung": "eindeutig",
@@ -68076,6 +68205,7 @@
    "name": "SGLANG_WEG2_DUAL_HEAD_BYPASS_FLOOR_MAX",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: \"7 DUAL-Eintraege als nur-27B-Baum\")",
    "source": {
     "baum": "27b",
     "file": "environ.py",
@@ -68953,6 +69083,9 @@
    "default": null,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "``--dual-priority dynamic`` with the ladder armed",
       "aufloesung": "eindeutig",
@@ -68972,6 +69105,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "return \"green\" in acts and bool(str(e.get(_ds.CTL_ENV",
       "aufloesung": "eindeutig",
@@ -68991,6 +69127,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "if not ladder_switch(e):",
       "aufloesung": "eindeutig",
@@ -69010,6 +69149,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "return k, f\"model(rmin={rmin:g},tsolo={ts:.0f}{src[0]})\"",
       "aufloesung": "eindeutig",
@@ -69055,6 +69197,9 @@
    "default": null,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "if self.mode != \"p\" and oldest_age_s > cfg.starve_age_s and target > cfg.starve_max_rung:",
       "aufloesung": "eindeutig",
@@ -69074,6 +69219,9 @@
      "wert": null
     },
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "if self.mode != \"p\" and oldest_age_s > cfg.starve_age_s and target > cfg.starve_max_rung:",
       "aufloesung": "eindeutig",
@@ -69119,6 +69267,9 @@
    "default": null,
    "depends": [
     {
+     "baeume": [
+      "27b"
+     ],
      "beleg": {
       "anker": "if self.mode != \"p\" and oldest_age_s > cfg.starve_age_s and target > cfg.starve_max_rung:",
       "aufloesung": "eindeutig",
@@ -69262,6 +69413,7 @@
    "name": "SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD_MAX",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: \"7 DUAL-Eintraege als nur-27B-Baum\")",
    "source": {
     "baum": "27b",
     "file": "environ.py",
@@ -69290,6 +69442,7 @@
    "name": "SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD_RUNS",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "Dashboard-Agent 2026-10-05 (Kopf von ERKLAERT: je ein Satz aus Verwendungsstelle/Kommentar im Code); Dual-Form, nur im 27B-Baum (Commit 9f8150ca60: \"7 DUAL-Eintraege als nur-27B-Baum\")",
    "source": {
     "baum": "27b",
     "file": "environ.py",
@@ -73583,26 +73736,6 @@
    "type": "os.environ"
   },
   "SGLANG_WEG2_FORCED_BOOT": {
-   "abweichung": {
-    "27b": {
-     "default": "\"\"",
-     "help": "the ``refusals`` marker variable ``refusals.arm(True)`` writes into ``os.environ``",
-     "source": {
-      "file": "weg2/refusals.py",
-      "kind": "os.environ",
-      "line": 207
-     }
-    },
-    "nf": {
-     "default": "\"\"",
-     "help": "set by the launcher in ITS environment when ``--force`` is on, so the front and the groups (separate processes) inherit it; read by :func:`forced_boot`",
-     "source": {
-      "file": "weg2/refusals.py",
-      "kind": "os.environ",
-      "line": 202
-     }
-    }
-   },
    "baeume": [
     "27b",
     "nf"
@@ -82564,26 +82697,6 @@
    "type": "EnvBool"
   },
   "SGLANG_WEG2_TORCH_CACHE_CAP": {
-   "abweichung": {
-    "27b": {
-     "default": "\"0\"",
-     "help": "Umgebungsschalter der Torch-Cache-Kappe (launcher.py:5487); steht er in ``--env-d``, gilt er, sonst der Standard der Registerzeile",
-     "source": {
-      "file": "planner/profile_couplings.py",
-      "kind": "os.environ",
-      "line": 1155
-     }
-    },
-    "nf": {
-     "default": "\"0\"",
-     "help": "P0 (torch cache cap) must be armed in the SAME D group: the edge leaves ~0 MiB after KV, and without a bounded cache the allocator swing (0.7-3.5 GiB, WEG2-VRAM-PEAK rc12z26) takes that memory back at the next peak.",
-     "source": {
-      "file": "weg2/launcher.py",
-      "kind": "os.environ",
-      "line": 5480
-     }
-    }
-   },
    "baeume": [
     "27b",
     "nf"
@@ -83009,7 +83122,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4140
+      "line": 4177
      }
     }
    },
@@ -85024,8 +85137,25 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
-    "eindeutig": 105,
-    "nah": 26
+    "eindeutig": 119,
+    "nah": 12
+   }
+  },
+  "beleg_aufloesung_baeume": {
+   "27b": {
+    "problem": [],
+    "status": {
+     "eindeutig": 119,
+     "nah": 12
+    }
+   },
+   "nf": {
+    "problem": [],
+    "status": {
+     "andere_linie": 44,
+     "eindeutig": 77,
+     "nah": 10
+    }
    }
   },
   "datei": "kantenkatalog_1004.json",
@@ -85033,7 +85163,7 @@
   "grund": "",
   "kanten_belegt": 131,
   "kanten_gesamt": 131,
-  "kanten_ohne_beleg": 24,
+  "kanten_ohne_beleg": 25,
   "neu": 80,
   "rel_abweichend": [
    "K12",
@@ -85060,7 +85190,7 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "baeume": {
-   "abweichung": 45,
+   "abweichung": 43,
    "beide": 2461,
    "nur_27b": 180,
    "nur_nf": 29
@@ -85069,19 +85199,19 @@
   "envs": 1811,
   "erklaert": 304,
   "flags": 862,
-  "geerntet": 1665,
-  "kuratiert": 118,
+  "geerntet": 1664,
+  "kuratiert": 119,
   "unerklaert": 601
  },
- "tree_rev": "27b=271a7632cd+nf=ff2b9ee01d",
+ "tree_rev": "27b=65fc0e2076+nf=55e463937f",
  "trees": {
   "27b": {
    "entries": 2641,
-   "rev": "271a7632cd"
+   "rev": "65fc0e2076"
   },
   "nf": {
    "entries": 2490,
-   "rev": "ff2b9ee01d"
+   "rev": "55e463937f"
   }
  },
  "warnungen": []

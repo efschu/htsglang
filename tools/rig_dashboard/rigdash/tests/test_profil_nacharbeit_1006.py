@@ -15,6 +15,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
@@ -216,7 +217,10 @@ class F2Endpoint(unittest.TestCase):
                                 "fit": {"level": "ja"}, "unbelegt": [], "hinweise": [], "blocker": [], "vektorlaengen": {}, "vektoren_ok": True, "vektoren_falsch": {}, "basis": "demo.env"},
                   "verdikt": _doc([], n=3, ausgang="geht"), "je_wert": {}, "launch": {"argv": argv, "env": {}}}
         ed = editor(tmp, oracle=FakeOracle(propose=answer), hardware=lambda: {"ok": True, "profile": _hw_profile(_rows(3))})
-        return ed.propose({"basis": {"kind": "release", "name": "demo"}, "form": "dual", "inventar": "rig"})
+        # the fixture planner tree carries no Dual module: this test is about the 27B line's Dual proposal, so the line probe is set (NF line 07.10.: no Dual
+        # without the modules, see test_profil_dual_linie_1007)
+        with mock.patch.object(P, "dual_line_probe", return_value=True):
+            return ed.propose({"basis": {"kind": "release", "name": "demo"}, "form": "dual", "inventar": "rig"})
 
     def test_seed_that_the_launcher_does_not_get_is_not_in_argv_and_names_the_profile_value(self):
         # demo.env setzt --pp-stage-ratio 29,11,8; der argv des Vorschlags traegt weiter diesen Wert, nicht den Seed (Profil-Modus des Dual)
