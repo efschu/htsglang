@@ -403,9 +403,6 @@
      "beleg": {"datei": "python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py", "zeile": 953, "anker": "require_w4a8_moe_scheme()"}, "baeume": ["nf"]},
     {"id": "K133", "von": "SGLANG_MOE_ACT_INT8", "nach": "--quantization", "rel": "braucht", "calc": "text", "wert": null,
      "satz": "Dieselbe Voraussetzung wie beim Flag --moe-act-int8: gelesen wird der Schalter nur im WNA16-MoE-Zweig eines compressed-tensors-Checkpoints (Wahl des MoE-Schemas); die Dual-Form ist nicht betroffen (Plan H88 D2, R2).",
-     "beleg": {"datei": "python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py", "zeile": 953, "anker": "require_w4a8_moe_scheme()"}, "baeume": ["nf"]},
-    {"id": "K134", "von": "--moe-act-int8", "nach": "--hicache-storage-backend", "rel": "skaliert_mit", "calc": "text", "wert": null,
-     "satz": "Mit dem Schalter an rechnen die Experten anders; der Plan (H88 D4) gibt der L3-Identität (die Modell-Identität der HiCache-Ablage, compute_model_identity_hash, und die des Launchers, l3_persist_identity) dafür ein eigenes Feld, so dass das erste Boot dieser Form einmal alle L3-Seiten neu berechnet. Dieses Feld ist in diesem Baum noch nicht verdrahtet (H88-D, unbelegt bis zu dessen Merge): belegt ist hier nur die Stelle, an der die Identität gebaut wird.",
-     "beleg": {"datei": "python/sglang/srt/mem_cache/hicache_storage.py", "zeile": 309, "anker": "def compute_model_identity_hash("}, "baeume": ["nf"]}
+     "beleg": {"datei": "python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py", "zeile": 953, "anker": "require_w4a8_moe_scheme()"}, "baeume": ["nf"]}
   ]
 }

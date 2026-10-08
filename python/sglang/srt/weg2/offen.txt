@@ -81,3 +81,15 @@ is set/checked/derived (not: where the values occur together).
     Partly verified: the vector carries one value per P stage
     (launcher.py:20827-20831, included as K59/K19/K21). The pure
     cut coupling (a stage change changes the share) is missing at one place.
+
+17. --moe-act-int8 -> --hicache-storage-backend (skaliert_mit)
+    H88-E (07.10.): der Plan (PLAN-H88-W4A8-1007 D4) gibt der L3-Identitaet
+    (compute_model_identity_hash, hicache_storage.py:309; l3_persist_identity
+    im Launcher) ein eigenes Feld fuer den Schalter, damit das erste Boot
+    dieser Form alle L3-Seiten einmal neu rechnet. In diesem Baum liest
+    keine Stelle den Schalter fuer die Identitaet: der Anker waere nur der
+    Ort, an dem die Identitaet gebaut wird, nicht an dem die Abhaengigkeit
+    gesetzt wird. Frage: welche Zeile setzt/prueft das Feld? Erwartet mit
+    H88-D (origin/desk/planer-h88d-1007: launcher.py l3_moe_act_active,
+    hicache_storage.py); nach dessen Merge die Kante mit diesem Anker
+    aufnehmen (neue ID, Pins 133 -> 134 / neu 82 -> 83).

@@ -944,7 +944,7 @@
       "anker": "def c3_chunk",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 573,
+      "zeile": 571,
       "zeile_hinweis": 573
      },
      "belegt": true,
@@ -15605,7 +15605,7 @@
       "anker": "def c4_context_target",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 603,
+      "zeile": 600,
       "zeile_hinweis": 603
      },
      "belegt": true,
@@ -16625,28 +16625,6 @@
      "rel": "braucht",
      "satz": "Der Schalter wirkt nur im Zweig der int4-Experten eines compressed-tensors-Checkpoints (WNA16-MoE, Quantisierung compressed-tensors, die --quantization nennt oder aus dem Checkpoint kommt): dort wird er beim Wählen des MoE-Schemas gelesen, bei jedem anderen Checkpoint bewirkt er nichts. Die Dual-Form (R2 des Planer-Plans: nur 27B-Linie) ist nicht betroffen (Plan H88 D2: Umfang sind die MoE-Experten des NF-Modells).",
      "to": "--quantization",
-     "to_kind": "flag",
-     "wert": null
-    },
-    {
-     "baeume": [
-      "nf"
-     ],
-     "beleg": {
-      "anker": "def compute_model_identity_hash(",
-      "aufloesung": "andere_linie",
-      "datei": "python/sglang/srt/mem_cache/hicache_storage.py",
-      "zeile": 309,
-      "zeile_hinweis": 309
-     },
-     "belegt": true,
-     "calc": "text",
-     "effect": "Mit dem Schalter an rechnen die Experten anders; der Plan (H88 D4) gibt der L3-Identität (die Modell-Identität der HiCache-Ablage, compute_model_identity_hash, und die des Launchers, l3_persist_identity) dafür ein eigenes Feld, so dass das erste Boot dieser Form einmal alle L3-Seiten neu berechnet. Dieses Feld ist in diesem Baum noch nicht verdrahtet (H88-D, unbelegt bis zu dessen Merge): belegt ist hier nur die Stelle, an der die Identität gebaut wird.",
-     "kante": "K134",
-     "quelle": "katalog",
-     "rel": "skaliert_mit",
-     "satz": "Mit dem Schalter an rechnen die Experten anders; der Plan (H88 D4) gibt der L3-Identität (die Modell-Identität der HiCache-Ablage, compute_model_identity_hash, und die des Launchers, l3_persist_identity) dafür ein eigenes Feld, so dass das erste Boot dieser Form einmal alle L3-Seiten neu berechnet. Dieses Feld ist in diesem Baum noch nicht verdrahtet (H88-D, unbelegt bis zu dessen Merge): belegt ist hier nur die Stelle, an der die Identität gebaut wird.",
-     "to": "--hicache-storage-backend",
      "to_kind": "flag",
      "wert": null
     }
@@ -19456,7 +19434,7 @@
       "anker": "def c1_layer_split",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 441,
+      "zeile": 439,
       "zeile_hinweis": 441
      },
      "belegt": true,
@@ -20466,7 +20444,7 @@
       "anker": "def c1_layer_split",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 441,
+      "zeile": 439,
       "zeile_hinweis": 441
      },
      "belegt": true,
@@ -20485,7 +20463,7 @@
       "anker": "def c4_context_target",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 603,
+      "zeile": 600,
       "zeile_hinweis": 603
      },
      "belegt": true,
@@ -21358,7 +21336,7 @@
       "anker": "def c1_layer_split",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 441,
+      "zeile": 439,
       "zeile_hinweis": 441
      },
      "belegt": true,
@@ -21377,7 +21355,7 @@
       "anker": "def c2_expert_residency",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 517,
+      "zeile": 515,
       "zeile_hinweis": 517
      },
      "belegt": true,
@@ -21605,7 +21583,7 @@
       "anker": "def c2_expert_residency",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 517,
+      "zeile": 515,
       "zeile_hinweis": 517
      },
      "belegt": true,
@@ -21674,7 +21652,7 @@
       "anker": "def c2_expert_residency",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/planner/profile_couplings.py",
-      "zeile": 517,
+      "zeile": 515,
       "zeile_hinweis": 517
      },
      "belegt": true,
@@ -83038,7 +83016,7 @@
    "id": "SGLANG_WEG2_TORCH_CACHE_CAP",
    "kind": "env",
    "lesestellen": [
-    "planner/profile_couplings.py:1155",
+    "planner/profile_couplings.py:1149",
     "weg2/launcher.py:5605",
     "weg2/launcher.py:5641",
     "weg2/launcher.py:14321",
@@ -83055,7 +83033,7 @@
     "baum": "27b",
     "file": "planner/profile_couplings.py",
     "kind": "os.environ",
-    "line": 1155
+    "line": 1149
    },
    "status": "geerntet",
    "text": "",
@@ -85463,7 +85441,7 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
-    "andere_linie": 3,
+    "andere_linie": 2,
     "eindeutig": 119,
     "nah": 12
    }
@@ -85472,7 +85450,7 @@
    "27b": {
     "problem": [],
     "status": {
-     "andere_linie": 3,
+     "andere_linie": 2,
      "eindeutig": 119,
      "nah": 12
     }
@@ -85481,7 +85459,7 @@
     "problem": [],
     "status": {
      "andere_linie": 44,
-     "eindeutig": 80,
+     "eindeutig": 79,
      "nah": 10
     }
    }
@@ -85489,10 +85467,10 @@
   "datei": "kantenkatalog_1004.json",
   "geladen": true,
   "grund": "",
-  "kanten_belegt": 134,
-  "kanten_gesamt": 134,
+  "kanten_belegt": 133,
+  "kanten_gesamt": 133,
   "kanten_ohne_beleg": 25,
-  "neu": 83,
+  "neu": 82,
   "rel_abweichend": [
    "K12",
    "K19",
@@ -85531,11 +85509,11 @@
   "kuratiert": 121,
   "unerklaert": 602
  },
- "tree_rev": "27b=07c20a35e5+nf=6cb6580482+h88e",
+ "tree_rev": "27b=84d04adae1+nf=6cb6580482+h88e",
  "trees": {
   "27b": {
    "entries": 2641,
-   "rev": "07c20a35e5"
+   "rev": "84d04adae1"
   },
   "nf": {
    "entries": 2499,
