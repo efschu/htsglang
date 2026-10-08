@@ -11,6 +11,13 @@
 // the default namespace (marlin -> marlin_a8, marlin_moe_wna16 ->
 // marlin_a8_moe), shared-header paths, header-guard names. The A16 Marlin in
 // ../marlin/ and ../marlin_moe/ is a different, untouched code base.
+// ONE semantic edit (H88 scalefix, 2026-10-08): the int8-activation group
+// scales (int16 x4096, marlin_w4a8_utils.marlin_act_int8_process_scales) are
+// read as int16_t, not uint16_t (4 casts in matmul_a8). Upstream assumes
+// positive scales; AutoRound/compressed-tensors checkpoints carry SIGNED group
+// scales, and a negative int16 read as uint16_t is 65536-|v| (NF layer 23:
+// output norm 5e6 instead of 1.3). |v| <= 4096, so the int32 product with the
+// group dot has the same bound as before.
 // H88-A-PROVENANCE-END
 /*
  * Modified by Neural Magic
@@ -1347,11 +1354,11 @@ __global__ void Marlin(
           if constexpr (a_type == host::kS8) {
             int2 s_vals[2];
             s_vals[0] = {
-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[1]};
+                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2][0])[0],
+                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2][0])[1]};
             s_vals[1] = {
-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
+                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
+                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
 
   #pragma unroll
             for (int i = 0; i < thread_m_blocks; i++) {

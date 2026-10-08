@@ -92,11 +92,29 @@ def gptq_pack(q_w: torch.Tensor, num_bits: int, size_k: int, size_n: int) -> tor
     return torch.from_numpy(res.astype(np.int32))
 
 
-def build_weight(size_k, size_n, group_size, asym, dtype, seed=0):
-    """Quantise a random weight and produce everything a W4A8 GEMM consumes."""
+def signed_scales(s: torch.Tensor, mode: str, seed: int = 0) -> torch.Tensor:
+    """Give positive reference scales the sign structure of an AutoRound checkpoint (H88 scalefix 1008).
+
+    mixed: ~60 % of the group scales negative (the NF experts' median scale is negative) and the largest
+           magnitude negative too (|min| > max: the signed max of the old code is then NOT the abs max);
+    neg:   every scale negative (signed max < 0)."""
+    if mode == "neg":
+        return -s
+    assert mode == "mixed", mode
+    g = torch.Generator().manual_seed(1000 + seed)
+    sign = torch.where(torch.rand(s.shape, generator=g) < 0.6, -1.0, 1.0)
+    sign.view(-1)[int(s.abs().argmax())] = -1.0
+    return s * sign
+
+
+def build_weight(size_k, size_n, group_size, asym, dtype, seed=0, signs=None):
+    """Quantise a random weight and produce everything a W4A8 GEMM consumes. ``signs`` (None, "mixed", "neg")
+    makes the group scales signed as in the NF checkpoint; the reference weight follows the signed scales."""
     g = torch.Generator().manual_seed(seed)
     w = (torch.randn(size_k, size_n, generator=g) * 0.05).float()
     w_ref, q_stored, s, zp = U.quantize_weights_ref(w, group_size, asym)
+    if signs is not None:
+        s = signed_scales(s, signs, seed)
     # the kernel only ever sees scales in the output dtype: the reference weight
     # is built from those (as vLLM's test does by quantising in the working dtype)
     s = s.to(dtype).float()
@@ -312,6 +330,122 @@ class TestW4A8CpuNumerics(unittest.TestCase):
         self.assertEqual(sorted(valid[valid < 8].tolist()), list(range(8)))
 
 
+#: the C type each a8 template reads an int16 x4096 group scale with, mapped to the numpy type of that read
+_CTYPE_TO_NP = {"int16_t": np.int16, "uint16_t": np.uint16}
+_SCALE_READ_RE = re.compile(r"\(int\)reinterpret_cast<(\w+)\*>\(&frag_s\[k2\]\[j \* 2")
+
+
+def template_scale_read_ctypes(rel: str) -> list:
+    """The C types of the group-scale casts in matmul_a8 (int8 activations, group_blocks != -1) of one template."""
+    return _SCALE_READ_RE.findall(_read(_CSRC / rel))
+
+
+def kernel_read_of_scales(s_int_view: torch.Tensor, ctype: str) -> np.ndarray:
+    """What the kernel sees for the processed scales when it reads the 16-bit pattern as ``ctype``."""
+    raw = s_int_view.contiguous().view(torch.int16).numpy()
+    return raw.view(_CTYPE_TO_NP[ctype]).astype(np.int64)
+
+
+def checkpoint_like_scales(shape, seed=0) -> torch.Tensor:
+    """Signed group scales shaped like the NF experts' (AutoRound, layer 23: min -0.0699, median -0.0032,
+    max +0.0731): heavy-tailed magnitudes, mostly small, median negative."""
+    g = torch.Generator().manual_seed(seed)
+    mag = torch.exp(torch.randn(shape, generator=g) * 1.0) * 0.003
+    sign = torch.where(torch.rand(shape, generator=g) < 0.6, -1.0, 1.0)
+    return (mag * sign).clamp(-0.07, 0.073)
+
+
+class TestW4A8SignedScalesCpu(unittest.TestCase):
+    """H88 scalefix 1008: the group scales of the NF checkpoint are SIGNED. marlin_act_int8_process_scales keeps
+    the sign in the int16 (factor = max|s| / 4096) and BOTH a8 templates must read the int16 as int16_t -- a
+    uint16_t read turns -v into 65536 - v (layer 23: output norm 5e6 instead of 1.3). The roundtrip below goes
+    through the read type parsed from the template sources, so it fails if a template reads uint16_t again."""
+
+    TEMPLATES = ("marlin_a8/marlin_template.h", "marlin_a8_moe/marlin_template.h")
+
+    def _patterns(self):
+        g = torch.Generator().manual_seed(17)
+        pos = torch.rand(6, 128, generator=g) * 0.02 + 1e-4
+        mixed = signed_scales(pos, "mixed", 1)
+        return {
+            "positive": pos,
+            "all_negative": -pos,
+            "mixed_abs_max_negative": mixed,
+            "mixed_abs_max_positive": -mixed,
+            # |min| = 2.5 * max: the signed max is NOT the abs max (the NF w2 tensor has |min| > max too)
+            "negative_dominant": torch.where(mixed > 0, mixed * 0.4, mixed),
+            "checkpoint_like": checkpoint_like_scales((6, 128), 2),
+            "single_nonzero_negative": torch.zeros(6, 128).index_put_((torch.tensor([2]), torch.tensor([5])), torch.tensor([-0.01])),
+            "with_zeros_and_tiny": torch.cat([mixed[:3], torch.zeros(1, 128), mixed[4:] * 1e-4]),
+        }
+
+    def test_both_templates_read_group_scales_as_int16(self):
+        for rel in self.TEMPLATES:
+            ctypes = template_scale_read_ctypes(rel)
+            self.assertEqual(len(ctypes), 4, f"{rel}: expected the 4 group-scale casts of matmul_a8")
+            self.assertEqual(set(ctypes), {"int16_t"}, f"{rel}: signed int16 x4096 scales read as {set(ctypes)}")
+
+    def test_roundtrip_through_the_template_read_for_every_sign_pattern(self):
+        for rel in self.TEMPLATES:
+            (ctype,) = set(template_scale_read_ctypes(rel))
+            for dtype in (torch.float16, torch.bfloat16):
+                for name, s in self._patterns().items():
+                    s = s.to(dtype)
+                    amax = float(s.float().abs().max())
+                    s_int, factor = U.marlin_act_int8_process_scales(s)
+                    self.assertEqual(s_int.dtype, dtype)
+                    self.assertEqual(factor.dtype, torch.float32)
+                    self.assertGreater(float(factor), 0.0, name)
+                    self.assertAlmostEqual(float(factor), amax / U.W4A8_SCALE_INT_RANGE, places=12, msg=name)
+                    ints = s_int.view(torch.int16)
+                    self.assertEqual(int(ints.abs().max()), U.W4A8_SCALE_INT_RANGE, name)  # +-4096, never beyond
+                    # the sign survives in the int16: same sign pattern as the scales (zeros and tiny ones -> 0)
+                    nz = ints != 0
+                    self.assertTrue(bool((torch.sign(ints[nz].float()) == torch.sign(s.float()[nz])).all()), name)
+                    seen = torch.from_numpy(kernel_read_of_scales(s_int, ctype)).double() * float(factor)
+                    err = float((seen - s.double()).abs().max())
+                    # round to nearest on a grid of one factor = amax/4096: |err| <= amax/8192 < amax/4096
+                    self.assertLessEqual(err, 0.5 * float(factor) * (1 + 1e-6), f"{rel} {dtype} {name}: err {err}")
+                    self.assertLess(err / amax, 1.0 / 4096, f"{rel} {dtype} {name}")
+                    # decode helper agrees with the kernel read
+                    dec = U.marlin_act_int8_decode_scales(s_int, factor, torch.float64)
+                    self.assertTrue(torch.equal(dec, seen), name)
+
+    def test_a_uint16_read_would_fail_the_roundtrip(self):
+        # the pin above is only a pin if the other read type is caught: show it on the checkpoint-like scales
+        s = checkpoint_like_scales((4, 128), 3).to(torch.bfloat16)
+        s_int, factor = U.marlin_act_int8_process_scales(s)
+        wrong = torch.from_numpy(kernel_read_of_scales(s_int, "uint16_t")).double() * float(factor)
+        # a negative int16 v (|v| <= 4096) read as uint16_t is 65536 - |v| >= 61440 = 15 * 4096: the decoded
+        # scale is >= 15 * max|s|, positive, where it should be negative
+        self.assertGreater(float((wrong - s.double()).abs().max()), 15 * float(s.float().abs().max()))
+
+    def test_zero_empty_and_non_finite_scales(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            s_int, factor = U.marlin_act_int8_process_scales(torch.zeros(3, 64, dtype=dtype))
+            self.assertEqual(int(s_int.view(torch.int16).abs().max()), 0)
+            self.assertEqual(float(factor), 1.0)  # finite, > 0: no 0/0 in the int16 nor in the a_scales
+            s_int, factor = U.marlin_act_int8_process_scales(torch.empty(0, 64, dtype=dtype))
+            self.assertEqual(tuple(s_int.shape), (0, 64))
+            self.assertEqual(float(factor), 1.0)
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                s = torch.full((2, 64), 0.01, dtype=dtype)
+                s[1, 3] = bad
+                with self.assertRaises(ValueError):
+                    U.marlin_act_int8_process_scales(s)
+
+    def test_emulated_kernel_with_signed_scales_matches_reference(self):
+        for dtype, gs, asym, signs in itertools.product(
+            (torch.float16, torch.bfloat16), (32, 128), (False, True), ("mixed", "neg")
+        ):
+            c = build_weight(256, 128, gs, asym, dtype, seed=gs + 3, signs=signs)
+            self.assertLess(float(c["s"].min()), 0.0)
+            a, a_q, a_scales, _ = build_activation(37, 256, dtype, None)
+            ref = U.reference_w4a8_gemm(a_q, a_scales, c["w_ref"])
+            emu = U.emulate_w4a8_kernel(a_q, a_scales, c["q_stored"], c["s"], c["zp"], gs, True)
+            self.assertLess(max_diff(emu, ref), 1e-3, f"{dtype} g={gs} asym={asym} signs={signs}")
+
+
 # ---------------------------------------------------------------------------
 # DESK: Python wrapper contract
 # ---------------------------------------------------------------------------
@@ -469,6 +603,12 @@ class TestW4A8CudaSources(unittest.TestCase):
 
         for mine, theirs in pairs.items():
             a = norm(_read(vllm / theirs))
+            if mine.endswith("marlin_template.h"):
+                # the ONE semantic edit (H88 scalefix 1008, named in the provenance block): signed int16 group
+                # scales are read as int16_t. Exactly the four casts of matmul_a8 change, nothing else.
+                old_cast = "(int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2"
+                self.assertEqual(a.count(old_cast), 4, f"{theirs}: expected the 4 uint16_t scale casts upstream")
+                a = a.replace(old_cast, "(int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2")
             b = _read(_CSRC / mine)
             # the H88-A provenance block at the file head is the one addition
             b = re.sub(r"// H88-A-PROVENANCE-BEGIN.*?// H88-A-PROVENANCE-END\n", "", b, count=1, flags=re.S)
@@ -716,8 +856,8 @@ class TestW4A8GpuDenseGemm(unittest.TestCase):
         self.gemm, self.types = gptq_marlin_gemm_w4a8, scalar_types
         self.ws = U.make_workspace(torch.device("cuda"))
 
-    def _run(self, dtype, gs, asym, m, k, n, bias=False, fp32_reduce=True, atomic=False):
-        c = build_weight(k, n, gs, asym, dtype, seed=m + k + n + gs)
+    def _run(self, dtype, gs, asym, m, k, n, bias=False, fp32_reduce=True, atomic=False, signs=None):
+        c = build_weight(k, n, gs, asym, dtype, seed=m + k + n + gs, signs=signs)
         a, a_q, a_scales, a_sk = build_activation(m, k, dtype, c["factor"], seed=m)
         b = None
         if bias:
@@ -735,7 +875,8 @@ class TestW4A8GpuDenseGemm(unittest.TestCase):
             ref = ref + b.double().reshape(1, -1)
         self.assertEqual(out.dtype, dtype)
         d = max_diff(out.cpu(), ref)
-        self.assertLess(d, U.W4A8_GPU_MAX_DIFF, f"{dtype} gs={gs} asym={asym} m={m} k={k} n={n} diff={d}")
+        self.assertLess(d, U.W4A8_GPU_MAX_DIFF, f"{dtype} gs={gs} asym={asym} m={m} k={k} n={n} signs={signs} diff={d}")
+        return d
 
     def test_g32_g128_channelwise_sym_asym_fp16_bf16(self):
         for dtype, gs, asym in itertools.product((torch.float16, torch.bfloat16), (-1, 32, 128), (False, True)):
@@ -758,6 +899,20 @@ class TestW4A8GpuDenseGemm(unittest.TestCase):
         self._run(torch.float16, 128, False, 64, 512, 256)
         self.assertEqual(int(self.ws.abs().sum()), 0)
 
+    def test_signed_group_scales(self):
+        # H88 scalefix 1008: NF (AutoRound) group scales are signed; same criterion as the positive-scale runs.
+        # Red before the fix: a negative int16 read as uint16_t is 65536 - |v| (diff >> 1).
+        diffs = []
+        for dtype, gs, asym, signs in itertools.product(
+            (torch.float16, torch.bfloat16), (32, 128), (False, True), ("mixed", "neg")
+        ):
+            for m in (1, 16, 200):
+                diffs.append(self._run(dtype, gs, asym, m, 512, 256, signs=signs))
+        for dtype, gs in itertools.product((torch.float16, torch.bfloat16), (32, 128)):
+            diffs.append(self._run(dtype, gs, False, 8, 2560, 1280, signs="mixed"))
+            diffs.append(self._run(dtype, gs, False, 130, 640, 2560, signs="mixed"))
+        print(f"[H88 scalefix gpu dense] signed scales: {len(diffs)} runs, max diff {max(diffs):.4f}")
+
 
 @unittest.skipUnless(GPU_TESTS, GPU_SKIP_REASON)
 class TestW4A8GpuMoe(unittest.TestCase):
@@ -770,8 +925,8 @@ class TestW4A8GpuMoe(unittest.TestCase):
         self.gemm, self.types = moe_wna16_marlin_gemm_w4a8, scalar_types
         self.ws = U.make_workspace(torch.device("cuda"))
 
-    def _run(self, dtype, gs, asym, e_n, m, k, n, top_k, block, mul_w, second_gemm=False):
-        ws = [build_weight(k, n, gs, asym, dtype, seed=40 + e) for e in range(e_n)]
+    def _run(self, dtype, gs, asym, e_n, m, k, n, top_k, block, mul_w, second_gemm=False, signs=None):
+        ws = [build_weight(k, n, gs, asym, dtype, seed=40 + e, signs=signs) for e in range(e_n)]
         q_all = torch.stack([w["marlin_q"] for w in ws])
         s_all = torch.stack([w["s_m"] for w in ws])
         factor = None
@@ -800,7 +955,8 @@ class TestW4A8GpuMoe(unittest.TestCase):
         torch.cuda.synchronize()
         ref = moe_reference(a_q, a_scales, [w["w_ref"] for w in ws], ids_eff, w_eff, eff_top_k, mul_w)
         d = max_diff(out.cpu(), ref)
-        self.assertLess(d, U.W4A8_GPU_MAX_DIFF, f"{dtype} gs={gs} asym={asym} e={e_n} m={m} block={block} diff={d}")
+        self.assertLess(d, U.W4A8_GPU_MAX_DIFF, f"{dtype} gs={gs} asym={asym} e={e_n} m={m} block={block} signs={signs} diff={d}")
+        return d
 
     def test_moe_g32_g128_sym_asym(self):
         for dtype, gs, asym in itertools.product((torch.float16, torch.bfloat16), (32, 128), (False, True)):
@@ -810,6 +966,17 @@ class TestW4A8GpuMoe(unittest.TestCase):
     def test_moe_mul_topk_weights_and_second_gemm(self):
         self._run(torch.float16, 128, False, 8, 32, 512, 256, 2, 16, True)
         self._run(torch.bfloat16, 32, False, 8, 32, 256, 256, 2, 16, True, second_gemm=True)
+
+    def test_moe_signed_group_scales(self):
+        # H88 scalefix 1008: signed scales, ONE factor = max|s|/4096 over all experts; same criterion as above
+        diffs = []
+        for dtype, gs, asym, signs in itertools.product(
+            (torch.float16, torch.bfloat16), (32, 128), (False, True), ("mixed", "neg")
+        ):
+            for m, block in ((4, 16), (64, 32), (256, 64)):
+                diffs.append(self._run(dtype, gs, asym, 8, m, 512, 256, 2, block, False, signs=signs))
+        diffs.append(self._run(torch.bfloat16, 128, False, 8, 32, 640, 2560, 2, 16, True, second_gemm=True, signs="mixed"))
+        print(f"[H88 scalefix gpu moe] signed scales: {len(diffs)} runs, max diff {max(diffs):.4f}")
 
 
 if __name__ == "__main__":

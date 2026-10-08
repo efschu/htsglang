@@ -7,7 +7,7 @@ Differences to ``fused_marlin_moe``:
   int8 (``int8_kernel.per_token_quant_int8``): the hidden states before GEMM 1
   and the SwiGLU output before GEMM 2;
 * the per-token scales are multiplied by the per-layer-tensor factor
-  ``max(group_scale) / 4096`` that belongs to the int16 x4096 group scales
+  ``max|group_scale| / 4096`` that belongs to the int16 x4096 group scales
   (``marlin_w4a8_utils.marlin_act_int8_process_scales``); ``None`` for channelwise
   scales, exactly as vLLM does it (oracle/int_wna16.py);
 * the kernel is ``moe_wna16_marlin_gemm_w4a8`` (H88-A). It has no ``is_ep``

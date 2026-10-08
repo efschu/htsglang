@@ -42,7 +42,7 @@ MARLIN_TILE = 16
 MARLIN_MIN_THREAD_N = 64
 #: group sizes with an int8-activation kernel: -1 = channelwise
 W4A8_GROUP_SIZES = (-1, 32, 64, 128)
-#: group scales are stored as round(s / s.max() * 4096) in an int16
+#: group scales are stored as round(s / s.abs().max() * 4096) in an int16 (signed, read as int16_t)
 W4A8_SCALE_INT_RANGE = 4096
 #: moe_block_size values with an int8 kernel (moe_block_size 8 has none)
 W4A8_MOE_BLOCK_SIZES = (16, 32, 48, 64)
@@ -255,18 +255,29 @@ def marlin_permute_bias(b: torch.Tensor) -> torch.Tensor:
 def marlin_act_int8_process_scales(s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """int16 x4096 trick for GROUP scales (not for channelwise scales).
 
-    Returns (s_int16_in_fp16_container, factor): s_int = round(s / s.max() *
-    4096) as int16, its bit pattern viewed as s.dtype; factor = s.max() / 4096
-    (float32 scalar) which the caller multiplies into the per-token a_scales.
-    One factor per scale TENSOR (for MoE: per layer tensor over all experts,
-    exactly as vLLM does)."""
+    Returns (s_int16_in_fp16_container, factor): s_int = round(s / amax *
+    4096) as int16 with amax = s.abs().max(), its bit pattern viewed as
+    s.dtype; factor = amax / 4096 (float32 scalar, > 0) which the caller
+    multiplies into the per-token a_scales. One factor per scale TENSOR (for
+    MoE: per layer tensor over all experts, as vLLM does).
+
+    The scales may be SIGNED (AutoRound / compressed-tensors checkpoints: NF
+    experts carry negative group scales). The sign stays in the int16, so
+    s_int is in [-4096, 4096], and the kernels read it as int16_t (H88
+    scalefix 1008; vLLM divides by the SIGNED max and reads uint16_t, which is
+    only correct for positive scales). All-zero scales give zeros and factor
+    1.0 (any factor scales zeros); non-finite scales are refused."""
     # Computed in float32 (vLLM divides in s.dtype: for bf16 that costs ~0.4 %
     # of scale precision before the int16 rounding even starts; the kernel only
     # sees the resulting integers, so the better quotient is free).
     sf = s.float()
-    smax = sf.max()
-    factor = smax / W4A8_SCALE_INT_RANGE
-    s_int = (sf / smax * W4A8_SCALE_INT_RANGE).round().to(torch.int16).view(s.dtype)
+    amax = sf.abs().max() if sf.numel() else sf.new_zeros(())
+    if not bool(torch.isfinite(amax)):
+        raise ValueError("marlin_act_int8_process_scales: non-finite group scale (inf/nan) in the scale tensor")
+    if float(amax) == 0.0:
+        return torch.zeros_like(sf, dtype=torch.int16).view(s.dtype), torch.ones((), dtype=torch.float32, device=s.device)
+    factor = amax / W4A8_SCALE_INT_RANGE
+    s_int = (sf / amax * W4A8_SCALE_INT_RANGE).round().to(torch.int16).view(s.dtype)
     return s_int, factor
 
 
@@ -484,7 +495,7 @@ def emulate_w4a8_kernel(
     """What the kernel computes, in fp64: per group an exact integer dot
     sum_k a_q * (q - zp_or_bias), multiplied by the group scale. With
     use_int16_scales the scale is the int16 x4096 approximation and the
-    per-token scale carries the s.max()/4096 factor (the GPU path); without it
+    per-token scale carries the max|s|/4096 factor (the GPU path); without it
     the original scale is used (channelwise path). Matches reference_w4a8_gemm
     up to the int16 rounding of the scales."""
     size_k, size_n = q_stored.shape

@@ -13,8 +13,9 @@ What it does differently from ``CompressedTensorsWNA16MoE`` (whose
 * the expert weights are repacked to the Marlin W4A8 layout (32x32 tiles, nibble
   order of the int8 dequant) with ``gptq_marlin_moe_repack_w4a8`` (H88-A);
 * the group scales are permuted with the "single" permutation and converted to
-  ``int16 = round(s / s.max() * 4096)`` (bit pattern viewed as the model dtype);
-  ``s.max() / 4096`` is kept as a float32 0-d tensor per layer tensor
+  ``int16 = round(s / s.abs().max() * 4096)`` (bit pattern viewed as the model dtype; the scales of
+  AutoRound checkpoints are SIGNED, the sign stays in the int16 and the kernels read int16_t -- H88 scalefix 1008);
+  ``s.abs().max() / 4096`` is kept as a float32 0-d tensor per layer tensor
   (``layer.w13_act_scale_factor`` / ``layer.w2_act_scale_factor``) and is
   multiplied into the per-token activation scale at run time. Channelwise scales
   (one group) stay plain and have no factor;
@@ -97,10 +98,10 @@ W4A8_DIM_MULTIPLE = 64
 MARKER = "MOE-ACT-INT8"
 
 #: the int16 scale of a group is ``round(s / factor)``. The reference factor (H88-B, vLLM semantics) is
-#: ``max(s) / 4096`` over the WHOLE tensor: the largest scale maps to 4096 (``W4A8_SCALE_INT_RANGE``). A factor
+#: ``max|s| / 4096`` over the WHOLE tensor: the largest scale magnitude maps to +-4096 (``W4A8_SCALE_INT_RANGE``). A factor
 #: adopted from another rank (H88-C: published through the store sidecar) maps THIS rank's largest scale to
 #: ``max(s) / factor``, and the kernel accumulates in int32: ``frag_c(int32) += frag_c_tmp(int32 group dot) *
-#: scale(int)`` summed over every group of K (jit_kernel/csrc/gemm/marlin_a8_moe/marlin_template.h:1480-1503).
+#: scale(int)`` summed over every group of K (jit_kernel/csrc/gemm/marlin_a8_moe/marlin_template.h:1488-1511).
 #: A scale above 4096 multiplies every group dot beyond the reference and can overflow that accumulator --
 #: a wrap is silent (wrong output, no error). Hence the band's upper end is the x4096 REFERENCE range, not the
 #: int16 storage limit 32767: with only full-view ranks publishing (:meth:`CompressedTensorsWNA16A8MoE._resolve_factor`)
@@ -178,7 +179,7 @@ def validate_w4a8_moe_dims(
 
 
 def w4a8_scale_proposal(s: torch.Tensor, rows=None) -> Optional[float]:
-    """The factor a rank that sees ``rows`` of the group scales ``s`` [E, G, N] would choose: ``max / 4096`` (exactly
+    """The factor a rank that sees ``rows`` of the group scales ``s`` [E, G, N] would choose: ``max|s| / 4096`` (exactly
     representable in float32 -- a power-of-two quotient). None for channelwise scales (G == 1: no factor) and when the
     viewed rows are all zero (nothing to scale)."""
     from sglang.jit_kernel import marlin_w4a8_utils as U
@@ -209,7 +210,8 @@ def w4a8_process_moe_scales(
     tensor, all experts, as vLLM). Returns (scales [E, G, N] in s.dtype -- for
     G > 1 the int16 bit pattern --, factor float32 0-d or None for G == 1).
 
-    ``factor=None`` (H88-B, one process sees the whole tensor): the factor is ``max / 4096`` of ``s`` itself.
+    ``factor=None`` (H88-B, one process sees the whole tensor): the factor is ``max|s| / 4096`` of ``s`` itself (the same value
+    :func:`w4a8_scale_proposal` publishes).
     ``factor=<float>`` (H88-C, a factor agreed with other processes through the store): the int16 is
     ``round(s / factor)``; the rows in ``rows`` (None = all) are the ones this rank actually holds -- the others are
     never read and are ignored by the range check; the largest viewed scale must map into
