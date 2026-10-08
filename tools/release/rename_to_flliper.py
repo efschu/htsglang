@@ -117,6 +117,17 @@ EXCLUDE_CONTENT = [
     # collisions), so its content is locked here; F0-B writes it for both names, F0-G finishes it by hand on the renamed tree. The file
     # still moves with its directory (weg2-release -> pdflip-release).
     "docker/weg2-release/entrypoint.sh", "docker/pdflip-release/entrypoint.sh",
+    # F0-D (08.10.2026, Planer-Sitz decision after the 27B probe 06:16Z, `ABORT: apply rc`, collision_auto REFUSED 8 files): since F0-B/F0-C these
+    # files spell the OLD and the NEW name on purpose (executable double-read code: the reader accepts WEG2_*/PDFLIP_*, `weg2`/`pdflip`, `sglang`/
+    # `flliper`). The mechanical pass would turn both spellings into one word (name-rule collisions: `sglang`|`flliper` -> `flliper`,
+    # `weg2`|`pdflip` -> `pdflip`) and the renamed tree would lose the compat with the old name -- COLLISION_OK would only silence the report.
+    # So their content is locked like the entrypoint above (precedent F0-A fix round 2); a file that is moved with its directory is listed under
+    # BOTH paths (the second pass over the renamed tree must be a no-op). Paths NOT moved: rigdash/*.py, GLOSSARY_EN.md, docker/htsglang-entrypoint.sh.
+    "docker/htsglang-entrypoint.sh",
+    "scripts/weg2/devtools/boot_deadman.sh", "scripts/pdflip/devtools/boot_deadman.sh",
+    "test/registered/unit/weg2/test_f0b_tool_names_1007.py", "test/registered/unit/pdflip/test_f0b_tool_names_1007.py",
+    "tools/rig_dashboard/rigdash/GLOSSARY_EN.md", "tools/rig_dashboard/rigdash/features.py", "tools/rig_dashboard/rigdash/redact.py",
+    "tools/rig_dashboard/rigdash/sources.py", "tools/rig_dashboard/rigdash/weg2line.py",
 ]
 # Files that spell BOTH names on purpose: the tests of the NF compat layer (name_compat 1a/1b, 00925f46bd) write the
 # new package/subsystem word as a plain literal next to imports of the old one (`["sg" "lang", "flliper"]`,
