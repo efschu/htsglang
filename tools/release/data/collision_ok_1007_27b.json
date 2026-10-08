@@ -103,6 +103,9 @@
  "test/registered/unit/weg2/test_entrypoint_profil_force_930.py": [
   "pdflip"
  ],
+ "test/registered/unit/weg2/test_f0b_tool_names_1007.py": [
+  "flliper"
+ ],
  "test/registered/unit/weg2/test_kantenkatalog_1433.py": [
   "flliper"
  ],
@@ -166,6 +169,9 @@
  "tools/rig_dashboard/kartenplan_build/oracle_worker.py": [
   "flliper"
  ],
+ "tools/rig_dashboard/rigdash/GLOSSARY_EN.md": [
+  "flliper"
+ ],
  "tools/rig_dashboard/rigdash/README.md": [
   "flliper"
  ],
@@ -174,6 +180,9 @@
  ],
  "tools/rig_dashboard/rigdash/deploy/stage_profil_modules.sh": [
   "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/features.py": [
+  "pdflip"
  ],
  "tools/rig_dashboard/rigdash/hwprofil.py": [
   "flliper"
@@ -194,8 +203,15 @@
  "tools/rig_dashboard/rigdash/profil_recompute.py": [
   "flliper"
  ],
+ "tools/rig_dashboard/rigdash/redact.py": [
+  "PDFLIP",
+  "PdFlip"
+ ],
  "tools/rig_dashboard/rigdash/server.py": [
   "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/sources.py": [
+  "pdflip"
  ],
  "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/sglang/srt/weg2/profile_catalog.py": [
   "FLLIPER_",
@@ -235,6 +251,9 @@
   "flliper"
  ],
  "tools/rig_dashboard/rigdash/tests/test_profil_release_edition_1984.py": [
+  "flliper"
+ ],
+ "tools/rig_dashboard/rigdash/weg2line.py": [
   "flliper"
  ]
 }

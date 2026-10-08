@@ -406,3 +406,4 @@ weg2_measured_record.json
 memts_weg2_
 preflight_weg2_
 boot_weg2_
+Modellwurzel
