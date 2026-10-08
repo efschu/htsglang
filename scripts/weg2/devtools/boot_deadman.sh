@@ -1169,16 +1169,32 @@ last_probe=0
 # deadman other than the front's, or with PROGRESS_STALL_S=0.
 PROGRESS_STALL_S="${PROGRESS_STALL_S:-60}"
 PROGRESS_MEMO="${PROGRESS_MEMO:-/tmp/deadman_progress_$$.json}"
+# F0-B (rename R5): the rename tool turns the launcher's bare WEG2_* env names into PDFLIP_* (DEADMAN_GROUP, STATE_DIR,
+# STATE_FILE_PY, PY, WRITER_PID), and the launcher hands this script exactly its own spelling. A deadman that read only the
+# old names would have tier 4 silently OFF behind a renamed launcher (and the other way round) -- both are read here, the
+# renamed name wins when both are set. The old token is written split (WE""G2) and read by indirection, so the mechanical
+# rename of the tree leaves this reader alone.
+dm_env() {   # dm_env <SUFFIX> [default]: ${PDFLIP_<SUFFIX>} else ${WEG2_<SUFFIX>} else default
+  local new=PDFLIP_$1 old=WE""G2_$1
+  printf '%s' "${!new:-${!old:-${2:-}}}"
+}
+dm_group() { dm_env DEADMAN_GROUP; }
+dm_state_dir() { dm_env STATE_DIR; }
+dm_state_py() { dm_env STATE_FILE_PY; }
+dm_py() { dm_env PY python3; }
 progress_on() {
-  [ "${WEG2_DEADMAN_GROUP:-}" = "front" ] && [ "$PROGRESS_STALL_S" != "0" ] \
-    && [ -n "${WEG2_STATE_DIR:-}" ] && [ -f "$WEG2_STATE_DIR/state.json" ] \
-    && [ -n "${WEG2_STATE_FILE_PY:-}" ] && [ -f "$WEG2_STATE_FILE_PY" ]
+  local sd sp
+  sd=$(dm_state_dir); sp=$(dm_state_py)
+  [ "$(dm_group)" = "front" ] && [ "$PROGRESS_STALL_S" != "0" ] \
+    && [ -n "$sd" ] && [ -f "$sd/state.json" ] \
+    && [ -n "$sp" ] && [ -f "$sp" ]
 }
 progress_check() {
-  local line
+  local line sd sp
   progress_on || return 0
-  line=$(WEG2_WRITER_PID=$$ "${WEG2_PY:-python3}" "$WEG2_STATE_FILE_PY" progress-check \
-         --dir "$WEG2_STATE_DIR" --memo "$PROGRESS_MEMO" --stall-s "$PROGRESS_STALL_S" 2>&1) || {
+  sd=$(dm_state_dir); sp=$(dm_state_py)
+  line=$(WEG2_WRITER_PID=$$ PDFLIP_WRITER_PID=$$ "$(dm_py)" "$sp" progress-check \
+         --dir "$sd" --memo "$PROGRESS_MEMO" --stall-s "$PROGRESS_STALL_S" 2>&1) || {
     echo "DEADMAN[PROGRESS-STALL] $(date -Is) check failed (no verdict): $(printf '%s' "$line" | tail -1 | cut -c1-200)"
     return 0; }
   [ -n "$line" ] || return 0

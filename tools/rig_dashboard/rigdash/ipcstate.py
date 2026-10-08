@@ -22,7 +22,10 @@ import json
 import os
 import threading
 import time
+
 from typing import Dict, List, Optional
+
+from . import names as N
 
 STATE_ROOTS = ("/spinning/docker-acceptance/nf/state", "/spinning/docker-acceptance/27b/state")
 SCHEMA = "weg2.state/1"
@@ -94,7 +97,7 @@ def served_model(groups: dict) -> Optional[str]:
 def transport(groups: dict) -> Optional[str]:
     for v in (groups or {}).values():
         env = ((v or {}).get("launch") or {}).get("env") or {}
-        t = env.get("HTSGLANG_TRANSPORT") if isinstance(env, dict) else None
+        t = N.env_get(env, "HTSGLANG_TRANSPORT") if isinstance(env, dict) else None
         if t:
             return str(t)
     return None
@@ -131,7 +134,7 @@ class _Events:
                 e = json.loads(raw)
             except ValueError:
                 continue
-            if not isinstance(e, dict) or e.get("schema") != EVENT_SCHEMA:
+            if not isinstance(e, dict) or not N.schema_ok(e.get("schema"), EVENT_SCHEMA):
                 continue
             t = e.get("type")
             self.counts[t] = self.counts.get(t, 0) + 1
@@ -232,7 +235,7 @@ class IpcStates:
                 seen.add(d)
                 if self._mt.get(d) != mt:
                     st = _read_json(p)
-                    if st and st.get("schema") == SCHEMA:
+                    if st and N.schema_ok(st.get("schema"), SCHEMA):
                         with self.lock:
                             self._st[d] = st
                             self._mt[d] = mt

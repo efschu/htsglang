@@ -25,6 +25,8 @@ import re
 import time
 from typing import Optional
 
+from . import names as N
+
 # "[2026-09-27 09:20:28 PP1] ..." / "[2026-09-27 09:20:42,596] INFO weg2.front: ..."
 RE_PREFIX = re.compile(
     r"^\[(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:[,.](\d{1,6}))?Z?"
@@ -33,7 +35,8 @@ RE_PREFIX = re.compile(
 
 
 def _f(p):
-    return re.compile(p)
+    # a subsystem marker/logger in the pattern matches the old AND the renamed spelling (F0-B, names.py)
+    return N.tolerant_compile(p)
 
 
 F_NEW_SEQ = _f(r"#new-seq: (\d+)")
@@ -86,7 +89,7 @@ F_HEALTH = _f(r"WEG2-HEALTH group=(\w+) http_ok=(\w+) process_alive=(\w+)(?: str
 # named refusal ("...Refused: #1233 W27 PP WIDTH DIVERGENCE REFUSED") under a
 # scheduler traceback, which the patterns below still catch.
 STOP_RE = _f(r"\b\w+Refused: #\d+|#791b|SPLIT refused|ADMISSION SPLIT|Traceback \(most recent|CUDA out of memory|DEBUG-HOLD rank=")
-STOP_EXCLUDE = ("FI-GRAPH-SPLIT off", "WEG2-LAUNCH")
+STOP_EXCLUDE = ("FI-GRAPH-SPLIT off",) + N.marker_variants("WEG2-LAUNCH")
 
 
 def stop_match(line: str) -> bool:
@@ -196,7 +199,7 @@ def parse_line(line: str) -> Optional[dict]:
         if m2:
             ev.update(kind="anon_extend", wall_ms=float(m2.group(1)))
             return ev
-    if rest.startswith("WEG2-POST-WAKE-PASS n=0"):
+    if N.starts_with(rest, "WEG2-POST-WAKE-PASS n=0"):
         m2 = F_POST_WAKE0.search(rest)
         if m2:
             ev.update(kind="post_wake0", mode=m2.group(1), schedule_ms=int(m2.group(2)),
@@ -216,7 +219,7 @@ def parse_line(line: str) -> Optional[dict]:
         return ev
 
     # front-log families
-    if "WEG2 D-PHASE-SEATS" in rest:
+    if N.has_marker(rest, "WEG2 D-PHASE-SEATS"):
         d = F_DSEATS.search(rest)
         if d:
             ev.update(kind="d_seats", handoff_n=int(d.group(1)), parked_n=int(d.group(2)), n=int(d.group(3)),
@@ -227,7 +230,7 @@ def parse_line(line: str) -> Optional[dict]:
         if c:
             ev.update(kind="sched_cap", max_total_tokens=int(c.group(1)), max_running=int(c.group(2)))
             return ev
-    if "WEG2-FLIP " in rest:
+    if N.has_marker(rest, "WEG2-FLIP "):
         b = F_FLIP_BEGIN.search(rest)
         if b:
             ev.update(kind="flip_begin", epoch=int(b.group(1)), sleep=b.group(2), wake=b.group(3))
@@ -241,7 +244,7 @@ def parse_line(line: str) -> Optional[dict]:
             ev["wake_ms"] = _num(F_FLIP_WAKE, rest)
             return ev
     c = F_CORRIDOR_PHASE.search(rest)
-    if c and "WEG2-CORRIDOR" in rest:
+    if c and N.has_marker(rest, "WEG2-CORRIDOR"):
         ev.update(kind="phase", awake=c.group(1), state=c.group(2))
         return ev
     r = F_ROUTE.search(rest)
