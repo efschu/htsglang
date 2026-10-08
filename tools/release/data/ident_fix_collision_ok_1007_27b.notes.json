@@ -48,5 +48,12 @@
    "profil_planer.js"
   ],
   "why": "IDENT_FIX_WEB=1: the dashboard pages read the keys the planner modules write; line reading of every old-word line plus a regex check for the target as declared identifier/key in the same file. Targets (`value`, `source`, `title`, `note`, `state`) occur as DOM properties (`el.value`), other data objects (`f.value` in the IPC table, `c.title`), or prose. No object literal and no function carries both words as properties/variables of the same object."
+ },
+ "markdown_prose_added_with_kit_data_5": {
+  "files": [
+   "rigdash/GLOSSARY_EN.md herkunft/source, zustand/state",
+   "rigdash/features.py wert/value"
+  ],
+  "why": "GLOSSARY_EN.md: words inside backticks name the old JSON keys in prose (glossary table); no machine reader. features.py: hazard check SAFE (cell record keys vs the unrelated `value` of _flag_value/_env_lookup)."
  }
 }
