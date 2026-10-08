@@ -32,7 +32,7 @@ from typing import Dict, List, Optional
 HARNESS_LOG = "abnahme_cu130.log"
 MATCH_AFTER_S = 600.0     # a marker up to this long after the boot's last log line still belongs to it
 
-RE_DAUER_STOP = re.compile(r"^\[nf-dauer (\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z\] Stop-Datei -> Hold-Ende")
+RE_DURATION_STOP = re.compile(r"^\[nf-dauer (\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z\] Stop-Datei -> Hold-Ende")
 RE_HOLD_END = re.compile(r"^\[host-acc (\d\d):(\d\d):(\d\d)Z\] AGENT-HOLD \(([^)\s]+)\) Ende: (Stop-Datei|Zeit|Container-tot)")
 RE_DEADMAN = re.compile(r"DEADMAN-VERDICT deadman_(\S+?)_(P|D|front): DEADMAN\[([A-Z_-]+)\]"
                         r"(?: (\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d))?")
@@ -42,7 +42,7 @@ def parse_marker(line: str) -> Optional[dict]:
     """One harness line -> marker dict, or None.  ``t`` is epoch UTC when the
     line carries a date, else ``sod`` (seconds of the UTC day) is set and the
     date is resolved against the boot (resolve_t)."""
-    m = RE_DAUER_STOP.match(line)
+    m = RE_DURATION_STOP.match(line)
     if m:
         y, mo, d, hh, mi, ss = (int(x) for x in m.groups())
         return {"kind": "planned", "src": "nf-dauer", "t": float(calendar.timegm((y, mo, d, hh, mi, ss))),

@@ -76,7 +76,7 @@ class _Env:
 def _front(**env):
     with _Env(**env):
         f = front_mod.Front(
-            prefill="http://p", decode="http://d", awake="D", tag="vorlauf",
+            prefill="http://p", decode="http://d", awake="D", tag="warmup",
             store_dir="/tmp", prefill_sid=0, decode_sid=0, dc_reserve={}, w_s=45.0,
             weight_chunks=2, flip_min_work_tokens=1,
         )

@@ -226,7 +226,7 @@ def test_survey_covers_the_ident_fix_guard_of_release_rename():
     g("init", "-q")
     os.makedirs(os.path.join(d, "python"))
     with open(os.path.join(d, "python", "a.py"), "w") as fh:
-        german = "vor" "lauf"      # split: the kit pass over this very file must not turn the German test word into its English target
+        german = "vor" "run"      # split: the kit pass over this very file must not turn the German test word into its English target
         fh.write("def f():\n    %s = 1\n    warmup = 2\n    return %s + warmup\n" % (german, german))
     with open(os.path.join(d, "python", "b.json"), "w") as fh:
         fh.write('{"note": "the %s phase is the warmup"}\n' % german)

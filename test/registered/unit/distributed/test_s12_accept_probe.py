@@ -17,7 +17,7 @@ no `meta_info` whatsoever -- `accept_probe_fatal` must be True so
 with a void measurement.
 
 Every string this file asserts against is IMPORTED from
-scripts/gpu_battery/s12_prefill_kurve.py, never retyped -- the #315 lesson:
+scripts/gpu_battery/s12_prefill_curve.py, never retyped -- the #315 lesson:
 a hand-typed copy of an emitted literal is exactly what let the s11 BAR1
 regexes drift onto dead German wording without any test noticing.
 
@@ -39,7 +39,7 @@ REPO_ROOT = os.path.abspath(
 BATTERY = os.path.join(REPO_ROOT, "scripts", "gpu_battery")
 sys.path.insert(0, BATTERY)
 
-import s12_prefill_kurve as s12  # noqa: E402
+import s12_prefill_curve as s12  # noqa: E402
 
 
 class _Resp:
@@ -173,7 +173,7 @@ class TestModeMeasureFailsLoudlyOnFatalAcceptProbe:
             out_dir=out_dir,
             arm="bar1",
             sessions=1,
-            folge=0,
+            step_sequence=0,
             point_seconds=1.0,
             warmup_seconds=0.0,
             prompt_tokens=64,

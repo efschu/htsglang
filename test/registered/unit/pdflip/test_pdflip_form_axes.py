@@ -1,7 +1,7 @@
 """PDFLIP-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env,
 ONE accessor -- and the calibration identity it keys.
 
-User order (verbatim): "da muessen schalter rein, in den code, dense, moe,
+User order (verbatim): "da muessen switch rein, in den code, dense, moe,
 vollstaendig im vram, mit offload - oder sowas aehnliches oder mehr oder
 weniger (ergruende/begruende). sonst knallts doch an jeder stelle".
 Inventory: FORM_AXES_INVENTORY.md (H1 #114 transient, H2 #1444 D residue,

@@ -1274,7 +1274,7 @@ phase_mix() {
   note "# NCCL/SHM-Referenz ist hier NICHT dabei: der comm_suite-Worker faehrt"
   note "# feste Groessen je Lauf, ein gemischter Fahrplan waere neuer Messcode"
   note "# und damit genau die neue Batterie, die ausgeschlossen war."
-  note "# pair	ort	modus	klasse	size_bytes	n	burst_every|last	p10_us	p50_us	p99_us"
+  note "# pair	ort	modus	class	size_bytes	n	burst_every|last	p10_us	p50_us	p99_us"
   faults_begin
 
   local o5090="${ORD1[0a:00.0]:-}" o3080="${ORD1[05:00.0]:-}"

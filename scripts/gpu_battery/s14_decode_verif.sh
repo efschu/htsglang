@@ -58,7 +58,7 @@ ARM_TABLE=(
 )
 S14_NUR="${S14_NUR:-}"
 
-mkdir -p "$DIR/belege" "$DIR/logs"
+mkdir -p "$DIR/evidence_items" "$DIR/logs"
 DIR_HOST="$(host_path "$DIR")" || exit 2
 DRIVER_HOST="$(host_path "$BATTERY_DIR/s14_decode_punkt.py")" || exit 2
 
@@ -111,7 +111,7 @@ set -uo pipefail
   --port $PORT --out-dir $DIR_HOST \\
   --context-tokens $CONTEXT_TOKENS --model-context-tokens $MODEL_CONTEXT \\
   --ramp-seconds $RAMP_S --window-seconds $WINDOW_S --drain-seconds $DRAIN_S \\
-  --arm "\$1" --bs "\$2" --folge "\$3" --server-log "\$4"
+  --arm "\$1" --bs "\$2" --step_sequence "\$3" --server-log "\$4"
 EOF
 chmod +x "$DIR/remote_decode.sh"
 
@@ -174,7 +174,7 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
         # second communicator group quietly fell back is a mixed point, and a
         # decode graph that silently did not get captured would otherwise be
         # reported as a graph measurement.
-        host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
+        host_grep_into "$HOSTLOG" "$DIR/evidence_items/${ARM}.txt" \
             "barlink enabled for group" \
             "ACHIEVED=" \
             "barlink-BAR1: setup in" \
@@ -217,7 +217,7 @@ cleanup
 trap - EXIT INT TERM
 
 if [ -n "$ABORT" ]; then
-    echo "aborted: $ABORT" | tee "$DIR/abbruch.txt"
+    echo "aborted: $ABORT" | tee "$DIR/abort_reason.txt"
     exit 1
 fi
 exit 0

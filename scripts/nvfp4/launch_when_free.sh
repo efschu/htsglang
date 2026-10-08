@@ -28,7 +28,7 @@ cards_free() {
 
 holder_clear() {
   [ -f "$ARB/holder" ] || return 0
-  grep -q 'session=agent-332-fam-beleg' "$ARB/holder" && return 0
+  grep -q 'session=agent-332-fam-evidence' "$ARB/holder" && return 0
   return 1
 }
 

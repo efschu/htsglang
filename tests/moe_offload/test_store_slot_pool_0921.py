@@ -6,7 +6,7 @@ Zweitkopie des Modells.
      systemram liegen."
 
 Es kommt auf die ANZAHL an, nicht auf die Identitaet: liegen zu jedem
-Zeitpunkt R von N Experten auf den Karten, braucht der Store nie mehr als
+Zeitpunkt R von N Experten auf den Karten, requires der Store nie mehr als
 N-R Plaetze -- auch wenn dauernd andere Experten darin stehen.
 
 GEMESSEN heute (fnFL2w5, fnFL2w7): der Store haelt alle 512 Experten, 59 GiB
@@ -78,7 +78,7 @@ def test_the_missing_half_is_named():
 
     src = inspect.getsource(es.write_rows)
     assert "global_rows" in src, (
-        "write_rows indiziert noch ueber global_rows -- der Slot-Pool braucht "
+        "write_rows indiziert noch ueber global_rows -- der Slot-Pool requires "
         "hier die Indirektion, sonst ist die kleinere Datei ein Fehler")
 
 
@@ -185,6 +185,6 @@ def test_a_missing_fraction_reserves_the_whole_span():
 
 
 def test_full_residency_needs_no_slots_at_all():
-    """Liegt alles auf den Karten, braucht der Store keinen Platz -- die
+    """Liegt alles auf den Karten, requires der Store keinen Platz -- die
     Nutzer-Order in ihrem Grenzfall."""
     assert es.slot_base_for_rank([60, 226, 226], [1.0, 1.0, 1.0], 2) == 0

@@ -2,7 +2,7 @@
 Referenzen, Schnitt aus gemessenen Stufenraten.
 
 Nutzer 24.09. 18:53Z: "die geschwindigkeiten der karten ist noch im powerlimit
-bei 400 und 230 deswegen muss der schnitt aufjedenfall anpassbar sein, da ich
+bei 400 und 230 deswegen muss der cut aufjedenfall anpassbar sein, da ich
 spaeter das powerlimit ggf. erhoehen werde".
 
 Hermetisch: ein Fake-NVML (dieselben Abfragen wie ``nvidia-smi

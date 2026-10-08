@@ -3,7 +3,7 @@
 
 Every expectation this checks is stated in scripts/nvfp4/v4_boot_proof.sh or in
 the families slice report, and every anchor number comes from the 06:40 NVFP4
-beleg's own JSONL -- read out of that file here rather than retyped, so an
+evidence's own JSONL -- read out of that file here rather than retyped, so an
 anchor cannot drift by transcription.
 """
 
@@ -41,9 +41,9 @@ def by_arm(rows: list[dict], arm: str, **kw) -> dict | None:
 
 
 def main() -> None:
-    anchors_p = load_jsonl(ANCHOR / "punkte.jsonl")
+    anchors_p = load_jsonl(ANCHOR / "data_points.jsonl")
     anchors_d = load_jsonl(ANCHOR / "decode_punkte.jsonl")
-    mine_p = load_jsonl(OUT / "punkte.jsonl")
+    mine_p = load_jsonl(OUT / "data_points.jsonl")
     mine_d = load_jsonl(OUT / "decode_punkte.jsonl")
 
     print("=" * 72)

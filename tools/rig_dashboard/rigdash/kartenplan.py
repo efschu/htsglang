@@ -252,7 +252,7 @@ class Kartenplaner:
                        "note": "Numbers = recording of the planner at the real boot on the reference rig; PCIe settings do not change them (flip prices are measured only for the rig, HW-GENERISCH K4)."},
             "einfach": {"docker_run": dr, "bars": bars, "context": ctx,
                         "legend": ["Weights", "Experts", "KV", "Mamba/State", "Draft", "Activation/graphs", "Sleep residue", "Driver", "Rest"]},
-            "experte": {"flags": flags, "phases": phases, "peak": peak, "warnings": _warnings(rec, phases, transport),
+            "expert": {"flags": flags, "phases": phases, "peak": peak, "warnings": _warnings(rec, phases, transport),
                         "flip_note": ("The flip transition itself (exchange buffer, lane window, arena) is not booked as an item in the plan (flip_legs empty): unmeasured.  The peak below is the maximum of the two phases per card."),
                         "closure": (rec.get("vram_plan") or {}).get("closure", []),
                         "open": (rec.get("vram_plan") or {}).get("open", []),

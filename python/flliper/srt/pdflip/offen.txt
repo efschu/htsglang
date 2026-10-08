@@ -5,13 +5,13 @@ Rule: an edge without a citation is not taken into kantenkatalog_1004.json,
 but is listed here with a question. Citation = file:line at which the dependency
 is set/checked/derived (not: where the values occur together).
 
-1. --rank-moe-resident-fraction -> FLLIPER_MOE_RESIDENT_EXPERT_FRACTION (schliesst_aus)
+1. --rank-moe-resident-fraction -> FLLIPER_MOE_RESIDENT_EXPERT_FRACTION (excludes)
    Checked: the planner publishes both together at the same size
    (launcher.py:19552-19557), P reads the env at :4556, D at :15878. Where is a
    CONTRADICTION (flag != env) turned away by name? Not found; the edge
-   'braucht/abgeleitet' is included (K12), the refusal is not.
+   'requires/abgeleitet' is included (K12), the refusal is not.
 
-2. --pp-cut-expert-lru-rows -> FLLIPER_MOE_SCRATCH_SLOTS (abgeleitet_von)
+2. --pp-cut-expert-lru-rows -> FLLIPER_MOE_SCRATCH_SLOTS (derived_from)
    The launcher rewrites FLLIPER_MOE_SCRATCH_SLOTS to KV stage rows
    (launcher.py:3282-3292). At which point does the value of the flag
    --pp-cut-expert-lru-rows derive the scratch value?
@@ -19,65 +19,65 @@ is set/checked/derived (not: where the values occur together).
 3. FLLIPER_MOE_SCRATCH_SLOTS -> --pp-cut-expert-lru-rows (reverse direction,
    same question as 2).
 
-4. --rank-moe-ratio -> --rank-moe-resident-fraction (skaliert_mit)
+4. --rank-moe-ratio -> --rank-moe-resident-fraction (scales_with)
    Both values sit in the expert area; which function couples them?
    (c2_expert_residency computes resident-fraction against KV, not against ratio.)
 
-5. --rank-mlp-ratio -> --rank-tp-ratio (braucht, reverse direction)
+5. --rank-mlp-ratio -> --rank-tp-ratio (requires, reverse direction)
    Verified only: the performance arm writes rank_mlp_ratio
    (launcher.py:16766-16770, uneven_perf.py:6571). Is there a reverse
    derivation?
 
-6. --spec-form -> --rank-gpu-memory-mib (tauscht)
+6. --spec-form -> --rank-gpu-memory-mib (trades)
    The draft pool on P is computed from the draft geometry
    (launcher.py:2441-2448). Through which function does the draft KV pay into
    P's KV budget? (C5 in planner/profile_couplings.py EDGES: computed=false.)
 
-7. --d-reshard -> --rank-mlp-ratio (abgeleitet_von)
+7. --d-reshard -> --rank-mlp-ratio (derived_from)
    apply_d_reshard only chooses policy/target (launcher.py:2160-2172). Where does
    the reshard act on the MLP vector?
 
-8. --idle-layout -> --d-hold-s (skaliert_mit)
+8. --idle-layout -> --d-hold-s (scales_with)
    Verified only: pp is forced to tp under dual-layout
    (launcher.py:14406-14411, included as K44) and d-hold-s is checked together
    with d-short-drain-tokens (launcher.py:24552-24554, K29). Is there a
    direct idle-layout/d-hold-s coupling?
 
-9. --max-kv-per-request -> --pp-stage-ratio (skaliert_mit)
+9. --max-kv-per-request -> --pp-stage-ratio (scales_with)
    C4 computes the KV target (profile_couplings.py:545); is the target in the
    cut solve coupled to the stage cut?
 
-10. --chunked-prefill-size -> --tp-prefill-max-tokens (skaliert_mit)
+10. --chunked-prefill-size -> --tp-prefill-max-tokens (scales_with)
     Both are chunk widths (P vs D prefill). Where is a coupling
     set? Not found.
 
-11. --p-bs -> --rank-gpu-memory-mib (tauscht)
+11. --p-bs -> --rank-gpu-memory-mib (trades)
     Batch and budget are connected (max-running-requests comes from the
     batch, K36). Which function computes batch -> budget?
 
-11b. --d-bs -> --rank-gpu-memory-mib (tauscht)
+11b. --d-bs -> --rank-gpu-memory-mib (trades)
     As 11, D side (K37).
 
-12. --store-max-gb -> --pp-stage-ratio (skaliert_mit)
+12. --store-max-gb -> --pp-stage-ratio (scales_with)
     W57 checks store-max-gb against the disk reserve (launcher.py:7044, 7067).
     Is the store size derived from the stage cut/expert share (0 =
     'from the P pool')? Not found.
 
-13. --pin-ledger-arm-m -> PROFILE_MEMAVAIL_MIN_GIB (skaliert_mit)
+13. --pin-ledger-arm-m -> PROFILE_MEMAVAIL_MIN_GIB (scales_with)
     pin_m_mib is passed to the ledger (launcher.py:25684-25685); the
     entrypoint checks MemAvailable against the profile minimum (entrypoint.sh:525).
     Is the pinned GiB explicitly computed against the threshold?
 
-14. PROFILE_DRAFT -> --spec-form (braucht)
+14. PROFILE_DRAFT -> --spec-form (requires)
     The entrypoint checks the presence of the draft path (entrypoint.sh:571)
     independently of the spec form. Where is the coupling to the spec form set
     (C5: touches --spec-form/--draft-model-path, computed=false)?
 
-15. PROFILE_CARD_COUNT -> --pp-stage-ratio (skaliert_mit)
+15. PROFILE_CARD_COUNT -> --pp-stage-ratio (scales_with)
     The gate checks the card count (entrypoint.sh:437-439, K51). How does it
     shape the stage cut? Not found in the repo.
 
-16. --pp-cut-expert-device-fraction -> --pp-stage-ratio (skaliert_mit)
+16. --pp-cut-expert-device-fraction -> --pp-stage-ratio (scales_with)
     Partly verified: the vector carries one value per P stage
     (launcher.py:20827-20831, included as K59/K19/K21). The pure
     cut coupling (a stage change changes the share) is missing at one place.

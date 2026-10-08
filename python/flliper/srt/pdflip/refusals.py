@@ -1,8 +1,8 @@
 """PROFIL-EDITOR S1: the refusal register and the ONE Force switch.
 
 Nutzer-Entscheid 03.10. ~20:15Z (verbatim): "das dashboard soll ein profil erstellen, beim serverstart soll der
-user ein profil angeben das geladen wird und es soll einen force flag beim serverstart geben dass die ablehnung
-der werte aufhebt und trotzdem startet".
+user ein profil angeben das geladen wird und es soll einen force flag beim serverstart geben dass die refusal
+der values aufhebt und trotzdem startet".
 
 * ONE switch, no list of codes: ``--force`` on the launcher (the container entrypoint maps ``FLLIPER_FORCE=1``
   / ``HTSGLANG_FORCE=1`` to it).  It lifts every VALUE refusal that is wired through :func:`refuse_value`;
@@ -10,13 +10,13 @@ der werte aufhebt und trotzdem startet".
   (``host_ledger.append_measured_record`` returns without writing): what it measures lies outside the
   promise the planner made, and must never calibrate a later boot.
 * Two classes, each with its reason (see :data:`REGISTER`):
-    - ``wert``            a VALUE refusal: the planner or the launcher judges numbers (capacity, VRAM, host
+    - ``value``            a VALUE refusal: the planner or the launcher judges numbers (capacity, VRAM, host
                           memory, calibration of the inventory, card count).  Force starts with these numbers.
     - ``nicht_forcebar``  NOT a value judgement: someone else's occupation of a card or of /dev/shm, a missing or
                           broken file, an impossible build.  Force does not touch these.
 * ``wired`` says whether the launcher of THIS tree consults the switch for that code today
   (:func:`wired_codes` greps ``refuse_value("CODE"`` in ``launcher.py``; a test pins the register to it, so the
-  register cannot claim more than the launcher does).  A ``wert`` code that is not wired yet is listed as such
+  register cannot claim more than the launcher does).  A ``value`` code that is not wired yet is listed as such
   and keeps refusing.
 
 PURE: stdlib only.  The dashboard loads this file by path to show, per profile, which refusals the planner would
@@ -37,7 +37,7 @@ ENV_FORCED_BOOT = "FLLIPER_PDFLIP_FORCED_BOOT"
 ENV_FORCE_REQUEST = "HTSGLANG_FORCE"
 MARKER = "FORCED-PAST"
 
-CLASS_VALUE = "wert"
+CLASS_VALUE = "value"
 CLASS_HARD = "nicht_forcebar"
 CLASS_LABEL = {CLASS_VALUE: "value refusal (forceable)", CLASS_HARD: "not forceable"}
 
@@ -154,7 +154,7 @@ REGISTER: Tuple[Refusal, ...] = (
     _h("FORMAT", "Format of the checkpoint does not match the profile",
        "A real fault: the checkpoint is in another format than the profile assumes (entrypoint detect_format, launcher W160).",
        "docker/entrypoint.sh (MODEL); launcher (PdFlipFp8LayoutRefused)", "entrypoint"),
-    _h("BAUM", "Code state unclean or not the image",
+    _h("TREE", "Code state unclean or not the image",
        "Provenance check: a boot from another or modified tree would not be reproducible and nothing about it could be verified.",
        "launcher (tree is not clean); docker/entrypoint.sh (TREE)", "launcher"),
     _h("OPTIONEN", "Contradictory or unknown options",

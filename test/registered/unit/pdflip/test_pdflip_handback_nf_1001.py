@@ -1,4 +1,4 @@
-"""HANDBACK on NF (01.10., user via 27B: "den anker fix koennen alle brauchen").
+"""HANDBACK on NF (01.10., user via 27B: "den anchor fix koennen alle brauchen").
 
 NF's P->D contract is E2 (P's END state after N + its token, D computes 0);
 measured on 12 NF boots, 492 of 565 hand-offs ran it. What this pins:

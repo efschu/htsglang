@@ -1,13 +1,13 @@
 """AP-D Fix-Runde 2: ``POST /api/profil/propose`` bedient ALLE VIER Formen (Plan PLAN-PROFIL-PLANER-1006 Abschnitt 1.3 A3, Abschnitt 3 Zeilen AP-D/AP-E/AP-F).
 
 Gepinnt:
-  * Der Editor nimmt ``flip``, ``tp``, ``dual`` und ``single`` (``einzel`` ist ein Name dafuer); die Seite zeigt fuer keine Form mehr den Platzhalter "Vorschlag ist
+  * Der Editor nimmt ``flip``, ``tp``, ``dual`` und ``single`` (``single`` ist ein Name dafuer); die Seite zeigt fuer keine Form mehr den Platzhalter "Vorschlag ist
     spaeteres Arbeitspaket".
-  * ``single`` (Einzelkarte): genau EINE Karte, ein Modellpfad, kein Basisprofil noetig; Startprofil = neues ``flliper.server/1`` aus den Argumenten des normalen
+  * ``single`` (SingleCard): genau EINE Karte, ein Modellpfad, kein Basisprofil noetig; Startprofil = neues ``flliper.server/1`` aus den Argumenten des normalen
     Servers (Herkunft ``planer``, nie die pdflip-Zeilen eines Release-Profils); das Verdikt ist eine Planer-Rechnung, es gibt keinen Launcher-Lauf.
   * Mit dem ECHTEN Kindprozess: Referenz-Dual (``27b-nvfp4-dual``, Referenz-Rig, 3 Karten): Argv und Env des Vorschlags = der Golden des Dual (Diff 0), kein Wert
-    geaendert, Verdikt traegt ``DUAL-PASSUNG`` als "planner calculation, not hw_fit", der Launcher-Trockenlauf des Vorschlags geht ohne Force durch.
-    Einzelkarte 5090 + 27B NVFP4: Verdikt "passt" mit den Zahlen von AP-F (Bruchteil 0.874, KV fp8, Reserve 4050 MiB); 27B INT8: "passt nicht".
+    changed, Verdikt traegt ``DUAL-PASSUNG`` als "planner calculation, not hw_fit", der Launcher-Trockenlauf des Vorschlags geht ohne Force durch.
+    SingleCard 5090 + 27B NVFP4: Verdikt "passt" mit den Zahlen von AP-F (Bruchteil 0.874, KV fp8, Reserve 4050 MiB); 27B INT8: "passt nicht".
 """
 
 import copy
@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, HERE)
 
 from rigdash import profil as P  # noqa: E402
-from rigdash import profil_oracle as ORA  # noqa: E402
+from rigdash import profile_oracle as ORA  # noqa: E402
 from rigdash import profil_planer as PL  # noqa: E402
 from test_profil_orakel_apd_1006 import (  # noqa: E402
     CENSUS_27B, ENV, FakeOracle, PLANER_FIX, REPO_CATALOG, REPO_PY, REPLAY_REF, _doc, _hw_profile, _rows, editor)
@@ -43,20 +43,20 @@ def _ed_single(tmp, oracle):
 
 
 def _canned_single():
-    werte = [{"key": "--model-path", "group": "-", "policy": "single", "alt": None, "wert": "/m", "eintraege": 1, "zustand": "vorgeschlagen",
-              "herkunft": "Modellprofil (Pfad)", "grund": "Modellordner", "in_argv": True, "geaendert": True},
-             {"key": "--mem-fraction-static", "group": "-", "policy": "single", "alt": None, "wert": "0.874", "eintraege": 1, "zustand": "unbelegt",
-              "herkunft": "Planner calculation", "grund": "Bruchteil", "in_argv": True, "geaendert": True},
-             {"key": "--max-running-requests", "group": "-", "policy": "single", "alt": None, "wert": "1", "eintraege": 1, "zustand": "vorgeschlagen",
-              "herkunft": "Ziel", "grund": "Sitze", "in_argv": True, "geaendert": True},
-             {"key": "--no-enable-multimodal", "group": "-", "policy": "single", "alt": None, "wert": "", "eintraege": 1, "zustand": "vorgeschlagen",
-              "herkunft": "Ziel", "grund": "Sichtturm aus", "in_argv": True, "geaendert": True},
-             {"key": "--speculative-algorithm", "group": "-", "policy": "single", "alt": None, "wert": None, "eintraege": 1, "zustand": "vorgeschlagen",
-              "herkunft": "Planner calculation", "grund": "kein Draft", "in_argv": False, "geaendert": False}]
-    return {"vorschlag": {"schema": "flliper.propose-a/1", "form": "einzel", "n": 1, "werte": werte, "ziele": {"seats": 1}, "cards": [{"name": "RTX 5090", "total_mib": 32607}],
-                          "inventory": {}, "seeds": {}, "fit": {"level": "ja", "art": "Planner calculation"}, "unbelegt": [], "hinweise": [], "blocker": [],
-                          "vektorlaengen": {}, "vektoren_ok": True, "vektoren_falsch": {}, "basis": "(kein Profil)"},
-            "verdikt": _doc([], n=1, ausgang="passt", form="einzel", art="Planner calculation"), "je_wert": {},
+    values = [{"key": "--model-path", "group": "-", "policy": "single", "alt": None, "value": "/m", "entries": 1, "state": "vorgeschlagen",
+              "source": "Modellprofil (Pfad)", "reason": "Modellordner", "in_argv": True, "changed": True},
+             {"key": "--mem-fraction-static", "group": "-", "policy": "single", "alt": None, "value": "0.874", "entries": 1, "state": "unverified",
+              "source": "Planner calculation", "reason": "Bruchteil", "in_argv": True, "changed": True},
+             {"key": "--max-running-requests", "group": "-", "policy": "single", "alt": None, "value": "1", "entries": 1, "state": "vorgeschlagen",
+              "source": "Ziel", "reason": "Sitze", "in_argv": True, "changed": True},
+             {"key": "--no-enable-multimodal", "group": "-", "policy": "single", "alt": None, "value": "", "entries": 1, "state": "vorgeschlagen",
+              "source": "Ziel", "reason": "Sichtturm aus", "in_argv": True, "changed": True},
+             {"key": "--speculative-algorithm", "group": "-", "policy": "single", "alt": None, "value": None, "entries": 1, "state": "vorgeschlagen",
+              "source": "Planner calculation", "reason": "kein Draft", "in_argv": False, "changed": False}]
+    return {"proposal": {"schema": "flliper.propose-a/1", "form": "single", "n": 1, "values": values, "goals": {"seats": 1}, "cards": [{"name": "RTX 5090", "total_mib": 32607}],
+                          "inventory": {}, "seeds": {}, "fit": {"level": "ja", "art": "Planner calculation"}, "unverified": [], "notes": [], "blocker": [],
+                          "vector_lengths": {}, "vectors_ok": True, "vectors_wrong": {}, "basis": "(kein Profil)"},
+            "verdict": _doc([], n=1, outcome="passt", form="single", art="Planner calculation"), "per_value": {},
             "launch": {"argv": ["--model-path", "/m"], "env": {}}}
 
 
@@ -72,13 +72,13 @@ class SingleRequests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _body(self, **kw):
-        return dict({"form": "single", "basis": {"kind": "release", "name": "demo"}, "inventar": "rig", "model_path": "/m"}, **kw)
+        return dict({"form": "single", "basis": {"kind": "release", "name": "demo"}, "inventory": "rig", "model_path": "/m"}, **kw)
 
     def test_the_editor_serves_all_four_forms_and_the_page_has_no_placeholder(self):
         self.assertEqual(set(P.ProfilEditor.FORMS), {"flip", "tp", "dual", "single"})
         ui = PL.ui_info(P.ProfilEditor.FORMS, self.ed.catalog()["entries"], True)
-        self.assertEqual([f["vorschlag"] for f in ui["formen"]], [True] * 4)
-        self.assertFalse(any("hinweis" in f for f in ui["formen"]))
+        self.assertEqual([f["proposal"] for f in ui["forms"]], [True] * 4)
+        self.assertFalse(any("note" in f for f in ui["forms"]))
         for name in ("profil_planer.py", os.path.join("static", "profil_planer.js")):
             with open(os.path.join(os.path.dirname(HERE), name), encoding="utf-8") as fh:
                 txt = fh.read()
@@ -88,14 +88,14 @@ class SingleRequests(unittest.TestCase):
         self.assertEqual(P.ProfilEditor.BALKEN_FORM, {"flip": "flip", "tp": "d_only", "dual": "dual", "single": "single"})        # profile_couplings.FORMS
 
     def test_the_request_to_the_child_names_card_model_and_no_pdflip_draft(self):
-        r = self.ed.propose(self._body(form="einzel"))                               # "einzel" is a name of single
+        r = self.ed.propose(self._body(form="single"))                               # "einzel" is a name of single
         self.assertTrue(r["ok"], r)
         kind, req, parts = self.orc.calls[0]
         self.assertEqual((kind, req["form"]), ("propose", "single"))
         self.assertEqual(req["model_path"], "/m")
         self.assertIsNone(req.get("draft_path"))                                       # the profile's PROFILE_DRAFT is a pdflip draft: not the single card's
-        self.assertEqual(req["inventar"]["karte"], 0)
-        self.assertIn(["karte", 0], parts["inventar"])                                 # another card is another question (cache)
+        self.assertEqual(req["inventory"]["karte"], 0)
+        self.assertIn(["karte", 0], parts["inventory"])                                 # another card is another question (cache)
         self.assertEqual(parts["form"], "single")
 
     def test_the_startprofil_is_a_new_profile_of_the_servers_arguments(self):
@@ -111,42 +111,42 @@ class SingleRequests(unittest.TestCase):
         self.assertNotIn("flag:--speculative-algorithm", rows)                          # not set: the server's default applies
         for k in rows:                                                                  # no row of a pdflip release profile (demo.env has --p-bs, --pp-stage-ratio ...)
             self.assertNotIn(k, ("flag:--p-bs", "flag:--pp-stage-ratio", "flag:--p-hostgap"))
-        self.assertEqual(sp["doc"]["line"], "einzel")
-        self.assertEqual(sp["doc"]["meta"]["vorschlag"]["form"], "single")
-        self.assertEqual(r["balken"]["form"], "single")
+        self.assertEqual(sp["doc"]["line"], "single")
+        self.assertEqual(sp["doc"]["meta"]["proposal"]["form"], "single")
+        self.assertEqual(r["bar"]["form"], "single")
         self.assertEqual(r["nicht_uebernommen"], [])
-        by = {w["label"]: w for w in r["werte"]}
+        by = {w["label"]: w for w in r["values"]}
         self.assertEqual(by["--mem-fraction-static"]["key"], "flag:--mem-fraction-static")
         self.assertTrue(by["--max-running-requests"]["kanten"], "the catalog gives --max-running-requests its edges")
         self.assertTrue(any("single card" in n and "no pdflip launcher" in n for n in sp["doc"]["meta"]["notes"]))
 
     def test_without_a_profile_the_model_path_is_needed(self):
-        with self.assertRaises(P.ProfilError) as cm:
-            self.ed.propose({"form": "single", "inventar": "rig"})
+        with self.assertRaises(P.ProfileError) as cm:
+            self.ed.propose({"form": "single", "inventory": "rig"})
         self.assertIn("give model_path", str(cm.exception))
-        r = self.ed.propose({"form": "single", "inventar": "rig", "model_path": "/m"})              # no basis at all is fine for one card
+        r = self.ed.propose({"form": "single", "inventory": "rig", "model_path": "/m"})              # no basis at all is fine for one card
         self.assertTrue(r["ok"], r)
         self.assertEqual(r["basis"]["kind"], "keines")
-        self.assertEqual(r["startprofil"]["name"], "einzelkarte-vorschlag")
+        self.assertEqual(r["startprofil"]["name"], "single_card-proposal")
 
     def test_exactly_one_card_and_a_card_of_the_profile(self):
         two = [{"card": "rtx3080-20", "pcie": {"gen": 4, "lanes": 8}}] * 2
-        with self.assertRaises(P.ProfilError) as cm:
-            self.ed.propose(self._body(inventar=two))
+        with self.assertRaises(P.ProfileError) as cm:
+            self.ed.propose(self._body(inventory=two))
         self.assertIn("select exactly one card", str(cm.exception))
-        with self.assertRaises(P.ProfilError) as cm:
+        with self.assertRaises(P.ProfileError) as cm:
             self.ed.propose(self._body(emap=3))
         self.assertIn("the hardware profile has 1 cards", str(cm.exception))
-        r = self.ed.propose(self._body(inventar=two[:1]))                                         # one catalog card that is not the rig's: a datasheet inventory
+        r = self.ed.propose(self._body(inventory=two[:1]))                                         # one catalog card that is not the rig's: a datasheet inventory
         self.assertTrue(r["ok"], r)
-        self.assertIn("cards", self.orc.calls[-1][1]["inventar"])
+        self.assertIn("cards", self.orc.calls[-1][1]["inventory"])
 
     def test_the_goals_of_a_single_card(self):
         ok = self.ed._ziele({"host_ram_mib": 16384, "draft": "off", "pre_load_free_mib": 32000, "seats": 2}, "single")
         self.assertEqual(ok, {"host_ram_mib": 16384, "draft": "off", "pre_load_free_mib": 32000, "seats": 2})
-        with self.assertRaises(P.ProfilError):
+        with self.assertRaises(P.ProfileError):
             self.ed._ziele({"host_ram_mib": 16384}, "flip")                                       # a goal only the single card knows
-        with self.assertRaises(P.ProfilError):
+        with self.assertRaises(P.ProfileError):
             self.ed._ziele({"draft": "wild"}, "single")
 
     def test_dual_is_a_form_of_the_editor(self):
@@ -154,15 +154,15 @@ class SingleRequests(unittest.TestCase):
         ed = editor(self.tmp + "_d", oracle=orc, hardware=lambda: {"ok": True, "profile": _hw_profile(_rows(3))}) if os.makedirs(self.tmp + "_d") is None else None
         try:
             ans = copy.deepcopy(_canned_single())
-            ans["vorschlag"].update(form="dual", n=3)
+            ans["proposal"].update(form="dual", n=3)
             orc.propose = ans
             with mock.patch.object(P, "dual_line_probe", return_value=True):         # the fixture tree has no Dual module: this is the 27B line's Dual proposal
-                r = ed.propose({"basis": {"kind": "release", "name": "demo"}, "form": "dual", "inventar": "rig"})
+                r = ed.propose({"basis": {"kind": "release", "name": "demo"}, "form": "dual", "inventory": "rig"})
         finally:
             shutil.rmtree(self.tmp + "_d", ignore_errors=True)
         self.assertTrue(r["ok"], r)
         self.assertEqual(orc.calls[0][1]["form"], "dual")
-        self.assertEqual(r["balken"]["form"], "dual")
+        self.assertEqual(r["bar"]["form"], "dual")
 
 
 try:
@@ -177,14 +177,14 @@ class Darstellung(unittest.TestCase):
 
     def test_the_single_card_proposal_is_labelled_planer_rechnung(self):
         o = run_node("""
-out.single = PX.renderProposal({ n: 1, form: "single", werte: [{ label: "--mem-fraction-static", alt: null, wert: "0.874", zustand: "vorgeschlagen", geaendert: true, verdikte: [] }],
-  verdikt: { ausgang: "passt", verdikte: [{ ebene: "fit", code: "EINZEL-PASSUNG", grund: "passt: statisch 28000 MiB", force_state: "geht", forcebar: null },
-                                          { ebene: "fit", code: "FIT-STATIC", grund: "es fehlen 100 MiB", force_state: "blockiert", forcebar: null }] },
-  vorschlag: { cards: [{ name: "NVIDIA GeForce RTX 5090", total_mib: 32607 }], fit: { level: "ja", margin_mib: 12.4, first: "x", art: "Planner calculation" } }, notes: [] });
-out.dual = PX.renderProposal({ n: 3, form: "dual", werte: [], verdikt: { ausgang: "geht", verdikte: [{ ebene: "fit", code: "DUAL-PASSUNG", grund: "Dual fit: planner calculation, not hw_fit", force_state: "geht" },
-                                                                                                { ebene: "fit", code: "FIT", grund: "hw_fit", force_state: "hinweis" }] },
-  vorschlag: { cards: [], fit: { level: "ja", margin_mib: 1, first: "" } }, notes: [] });
-out.flip = PX.renderProposal({ n: 3, form: "flip", werte: [], verdikt: { ausgang: "geht", verdikte: [] }, vorschlag: { cards: [], fit: { level: "ja", margin_mib: 1, first: "" } }, notes: [] });
+out.single = PX.renderProposal({ n: 1, form: "single", values: [{ label: "--mem-fraction-static", alt: null, value: "0.874", state: "vorgeschlagen", changed: true, verdikte: [] }],
+  verdict: { outcome: "passt", verdikte: [{ level: "fit", code: "EINZEL-PASSUNG", reason: "passt: statisch 28000 MiB", force_state: "geht", forcebar: null },
+                                          { level: "fit", code: "FIT-STATIC", reason: "es fehlen 100 MiB", force_state: "is_blocked", forcebar: null }] },
+  proposal: { cards: [{ name: "NVIDIA GeForce RTX 5090", total_mib: 32607 }], fit: { level: "ja", margin_mib: 12.4, first: "x", art: "Planner calculation" } }, notes: [] });
+out.dual = PX.renderProposal({ n: 3, form: "dual", values: [], verdict: { outcome: "geht", verdikte: [{ level: "fit", code: "DUAL-PASSUNG", reason: "Dual fit: planner calculation, not hw_fit", force_state: "geht" },
+                                                                                                { level: "fit", code: "FIT", reason: "hw_fit", force_state: "note" }] },
+  proposal: { cards: [], fit: { level: "ja", margin_mib: 1, first: "" } }, notes: [] });
+out.flip = PX.renderProposal({ n: 3, form: "flip", values: [], verdict: { outcome: "geht", verdikte: [] }, proposal: { cards: [], fit: { level: "ja", margin_mib: 1, first: "" } }, notes: [] });
 """)
         s = o["single"]
         self.assertIn("Planner estimate: fits (no launcher run", s)
@@ -238,7 +238,7 @@ class RealForms(unittest.TestCase):
                          "2e68b3f94b: ImportError cannot import name 'dual_layout_plan' from 'flliper.srt.pdflip')")
     def test_1_reference_dual_is_the_golden_with_zero_diff(self):
         ed = self._ed(self.hw3)
-        r = ed.propose({"basis": {"kind": "release", "name": "27b-nvfp4-dual"}, "form": "dual", "inventar": "rig"})
+        r = ed.propose({"basis": {"kind": "release", "name": "27b-nvfp4-dual"}, "form": "dual", "inventory": "rig"})
         self.assertTrue(r["ok"], r)
         self.assertEqual((r["schema"], r["form"], r["n"]), ("flliper.propose-d/1", "dual", 3))
         # A1 (Plan 1.3): the proposal for the profile's own inventory IS the profile: argv and env equal the Dual golden of AP0, no value changed
@@ -252,33 +252,33 @@ class RealForms(unittest.TestCase):
         self.assertEqual(r["launch"]["argv"], [norm(t) for t in self.golden["argv"]])
         self.assertEqual(r["launch"]["env"], {k: norm(v) for k, v in self.golden["env"].items()})
         # (the only "changed" row is the P-cut seed: a planner-only value, written to meta.planner and never to a row of the profile)
-        self.assertEqual([w["label"] for w in r["werte"] if w["geaendert"]], ["--pp-stage-ratio (Seed)"])
+        self.assertEqual([w["label"] for w in r["values"] if w["changed"]], ["--pp-stage-ratio (Seed)"])
         self.assertIsNone(ed.doc_key("--pp-stage-ratio (Seed)"))
         base_rows = {x["key"]: x["value"] for x in ed.render_view(ed.load("release", "27b-nvfp4-dual")["doc"])["view"]["rows"]}
         new_rows = {x["key"]: x["value"] for x in r["startprofil"]["view"]["rows"]}
         self.assertEqual(new_rows, base_rows)                                                         # the Startprofil equals the profile, row for row
-        self.assertEqual(r["vorschlag"]["dual"]["modus"], "profil", r["vorschlag"]["dual"].get("regeln"))
-        self.assertTrue(r["vorschlag"]["dual"]["regeln"]["uebernommen"], r["vorschlag"]["dual"]["regeln"])
+        self.assertEqual(r["proposal"]["dual"]["modus"], "profil", r["proposal"]["dual"].get("regeln"))
+        self.assertTrue(r["proposal"]["dual"]["regeln"]["uebernommen"], r["proposal"]["dual"]["regeln"])
         self.assertTrue(r["startprofil"]["verifiziert"], r["startprofil"]["probleme"])
-        self.assertEqual(r["balken"]["form"], "dual")
+        self.assertEqual(r["bar"]["form"], "dual")
         # the verdicts: the launcher dry run of the proposal (as for the Flip) and the Dual coupling as a Planer-Rechnung, never as hw_fit
-        vd = r["verdikt"]
-        self.assertEqual(vd["ausgang"], "geht", [(x["code"], x["grund"][:120]) for x in vd["verdikte"]])
-        self.assertEqual((vd["orakel"]["laeufe"], vd["forced"]), (1, []))
+        vd = r["verdict"]
+        self.assertEqual(vd["outcome"], "geht", [(x["code"], x["reason"][:120]) for x in vd["verdikte"]])
+        self.assertEqual((vd["oracle"]["runs"], vd["forced"]), (1, []))
         codes = {x["code"]: x for x in vd["verdikte"]}
         self.assertIn("DUAL-PASSUNG", codes)
         self.assertIn("DUAL-PFLICHT", codes)
-        self.assertEqual(codes["DUAL-PASSUNG"]["titel"], "Dual fit: planner calculation, not hw_fit")
+        self.assertEqual(codes["DUAL-PASSUNG"]["title"], "Dual fit: planner calculation, not hw_fit")
         self.assertIn("planner calculation, not hw_fit", codes["DUAL-PASSUNG"]["text"])
-        self.assertEqual(codes["DUAL-PASSUNG"]["ebene"], "fit")
+        self.assertEqual(codes["DUAL-PASSUNG"]["level"], "fit")
         self.assertIn("dual not modelled", codes["FIT"]["text"])
-        self.assertEqual(codes["FIT"]["force_state"], "hinweis")                         # hw_fit does not clear or block the Dual
-        for w in r["werte"]:
-            for f in ("key", "label", "wert", "zustand", "herkunft", "grund", "verdikte", "kanten"):
+        self.assertEqual(codes["FIT"]["force_state"], "note")                         # hw_fit does not clear or block the Dual
+        for w in r["values"]:
+            for f in ("key", "label", "value", "state", "source", "reason", "verdikte", "kanten"):
                 self.assertIn(f, w)
         # the second equal question is a cache hit
-        r2 = ed.propose({"basis": {"kind": "release", "name": "27b-nvfp4-dual"}, "form": "dual", "inventar": "rig"})
-        self.assertTrue(r2["orakel"]["cached"])
+        r2 = ed.propose({"basis": {"kind": "release", "name": "27b-nvfp4-dual"}, "form": "dual", "inventory": "rig"})
+        self.assertTrue(r2["oracle"]["cached"])
 
     # ---------------------------------------------------------------- Einzelkarte
     def _single(self, model="q27_nvfp4", hw=None, **kw):
@@ -286,31 +286,31 @@ class RealForms(unittest.TestCase):
         names = [c["name"] for c in hw["cards"]]
         emap = next(i for i, n in enumerate(names) if "5090" in n)                        # resolved by name, never a fixed index (project rule)
         ed = self._ed(hw)
-        return ed, ed.propose(dict({"form": "single", "inventar": "rig", "karte": emap, "model_path": os.path.join(APF_FIX, model)}, **kw)), emap
+        return ed, ed.propose(dict({"form": "single", "inventory": "rig", "karte": emap, "model_path": os.path.join(APF_FIX, model)}, **kw)), emap
 
     def test_2_single_5090_with_27b_nvfp4_fits_with_the_apf_numbers(self):
         ed, r, emap = self._single()
         self.assertTrue(r["ok"], r)
         self.assertEqual((r["form"], r["n"]), ("single", 1))
-        vd = r["verdikt"]
-        self.assertEqual((vd["ausgang"], vd["orakel"]["laeufe"]), ("passt", 0))
+        vd = r["verdict"]
+        self.assertEqual((vd["outcome"], vd["oracle"]["runs"]), ("passt", 0))
         self.assertTrue(vd["art"].startswith("Planner calculation"), vd["art"])                    # "+ ServerArgs-Parse" when the parse ran
-        self.assertIsNone(vd["lauf"])
-        by = {w["label"]: w for w in r["werte"]}
+        self.assertIsNone(vd["run"])
+        by = {w["label"]: w for w in r["values"]}
         # AP-F (test_nvfp4_passt_mit_zahlen, Handrechnung dort): fraction = floor3((32607-400-4050)/(32607-400)) = 0.874, KV fp8, MTP-Draft NEXTN
-        self.assertEqual(by["--mem-fraction-static"]["wert"], "0.874")
-        self.assertEqual(by["--kv-cache-dtype"]["wert"], "fp8_e4m3")
-        self.assertEqual(by["--speculative-algorithm"]["wert"], "NEXTN")
-        self.assertEqual(by["--context-length"]["wert"], "131072")
-        fit = r["vorschlag"]["einzelkarte"]["fit"]
+        self.assertEqual(by["--mem-fraction-static"]["value"], "0.874")
+        self.assertEqual(by["--kv-cache-dtype"]["value"], "fp8_e4m3")
+        self.assertEqual(by["--speculative-algorithm"]["value"], "NEXTN")
+        self.assertEqual(by["--context-length"]["value"], "131072")
+        fit = r["proposal"]["single_card"]["fit"]
         self.assertEqual(fit["reserve_bedarf_mib"], 4050.0)
         self.assertAlmostEqual(fit["statisch_budget_mib"], 0.874 * 32207, delta=0.1)
         self.assertTrue(fit["passt"])
         codes = {x["code"]: x for x in vd["verdikte"]}
         self.assertEqual(codes["EINZEL-PASSUNG"]["force_state"], "geht")
         self.assertIn("EINZEL-PARSE", codes)
-        self.assertIn(codes["EINZEL-PARSE"]["force_state"], ("geht", "hinweis"))              # parse ran, or says it could not: never a silent ok
-        self.assertNotIn("blockiert", {x["force_state"] for x in vd["verdikte"]})
+        self.assertIn(codes["EINZEL-PARSE"]["force_state"], ("geht", "note"))              # parse ran, or says it could not: never a silent ok
+        self.assertNotIn("is_blocked", {x["force_state"] for x in vd["verdikte"]})
         # the Startprofil: a new profile of the server's arguments, origin planer, verified by bash
         sp = r["startprofil"]
         self.assertTrue(sp["verifiziert"], sp["probleme"])
@@ -321,35 +321,35 @@ class RealForms(unittest.TestCase):
         self.assertEqual(r["launch"]["argv"][:2], ["--model-path", os.path.join(APF_FIX, "q27_nvfp4")])
         self.assertEqual(r["launch"]["env"], {})
         # Herkunft, Verdikt und Kanten je Wert
-        for w in r["werte"]:
-            for f in ("key", "label", "wert", "zustand", "herkunft", "grund", "verdikte", "kanten"):
+        for w in r["values"]:
+            for f in ("key", "label", "value", "state", "source", "reason", "verdikte", "kanten"):
                 self.assertIn(f, w)
-        self.assertTrue(by["--mem-fraction-static"]["herkunft"] and by["--mem-fraction-static"]["grund"])
+        self.assertTrue(by["--mem-fraction-static"]["source"] and by["--mem-fraction-static"]["reason"])
         self.assertTrue(by["--max-running-requests"]["kanten"], "the catalog gives --max-running-requests its edges")
         # cached: the second equal question
-        r2 = ed.propose({"form": "single", "inventar": "rig", "karte": emap, "model_path": os.path.join(APF_FIX, "q27_nvfp4")})
-        self.assertTrue(r2["orakel"]["cached"])
+        r2 = ed.propose({"form": "single", "inventory": "rig", "karte": emap, "model_path": os.path.join(APF_FIX, "q27_nvfp4")})
+        self.assertTrue(r2["oracle"]["cached"])
         self.assertEqual(r2["launch"]["argv"], r["launch"]["argv"])
 
     def test_3_single_27b_int8_does_not_fit_on_the_5090(self):
         _ed, r, _k = self._single("q27_int8")
         self.assertTrue(r["ok"], r)
-        vd = r["verdikt"]
-        self.assertEqual((vd["ausgang"], vd["geht"]), ("passt_nicht", False))
+        vd = r["verdict"]
+        self.assertEqual((vd["outcome"], vd["geht"]), ("does_not_fit", False))
         codes = {x["code"]: x["force_state"] for x in vd["verdikte"]}
-        self.assertEqual(codes["EINZEL-PASSUNG"], "blockiert")
-        self.assertEqual(codes["FIT-STATIC"], "blockiert")
-        by = {w["label"]: w for w in r["werte"]}
+        self.assertEqual(codes["EINZEL-PASSUNG"], "is_blocked")
+        self.assertEqual(codes["FIT-STATIC"], "is_blocked")
+        by = {w["label"]: w for w in r["values"]}
         self.assertIn("FIT-STATIC", [x["code"] for x in by["--mem-fraction-static"]["verdikte"]])
 
     def test_4_single_card_ordinal_is_another_question_and_another_card(self):
         names = [c["name"] for c in self.hw3["cards"]]
         k3080 = next(i for i, n in enumerate(names) if "3080" in n)
         ed = self._ed(self.hw3)
-        r = ed.propose({"form": "single", "inventar": "rig", "karte": k3080, "model_path": os.path.join(APF_FIX, "q27_nvfp4")})
+        r = ed.propose({"form": "single", "inventory": "rig", "karte": k3080, "model_path": os.path.join(APF_FIX, "q27_nvfp4")})
         self.assertTrue(r["ok"], r)
-        self.assertEqual(r["vorschlag"]["cards"][0]["name"], names[k3080])
-        self.assertEqual(r["vorschlag"]["cards"][0]["total_mib"], self.hw3["cards"][k3080]["vram_total_mib"]["v"])
+        self.assertEqual(r["proposal"]["cards"][0]["name"], names[k3080])
+        self.assertEqual(r["proposal"]["cards"][0]["total_mib"], self.hw3["cards"][k3080]["vram_total_mib"]["v"])
 
 
 if __name__ == "__main__":

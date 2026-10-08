@@ -82,7 +82,7 @@ class Served(unittest.TestCase):
         os.makedirs(d)
         with open(os.path.join(d, "hardware_profile.py"), "w") as fh:
             fh.write(H.STUB_MODULE)
-        self.hw = H.hwprofil.HwProfil(http=self.gq, tree=hw_tree, synchronous=True, edition=self.edition)
+        self.hw = H.hwprofil.HwProfile(http=self.gq, tree=hw_tree, synchronous=True, edition=self.edition)
         self.svc = B.fake_service(self.tmp)
         self.addCleanup(self.svc.close)
         app = SimpleNamespace(edition=self.edition, profil=self.ed, hwprofil=self.hw, modellprofil=Est(), couplings=self.svc,

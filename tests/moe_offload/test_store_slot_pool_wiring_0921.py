@@ -113,7 +113,7 @@ def test_without_the_env_nothing_changes(monkeypatch, tmp_path):
 
 
 def test_a_scalar_resident_fraction_broadcasts(monkeypatch, tmp_path):
-    """Ein Skalar gilt fuer JEDEN Rang -- und genau das braucht die Basis.
+    """Ein Skalar gilt fuer JEDEN Rang -- und genau das requires die Basis.
 
     Der Test hiess erst "ist nicht genug" und war damit falsch: ein Skalar
     sagt sehr wohl etwas ueber die anderen Raenge, naemlich dieselbe Zahl.

@@ -6,7 +6,7 @@ Jetzt: der Kopplungs-Worker (Kindprozess mit der flliper-Umgebung) beantwortet `
 Gepinnt:
 
 * Worker: ``refused`` traegt den Text einer TopologyRefused, ``None`` heisst "durchgelassen"; ein Import-Fehler im Kind ist ``ok: false``
-  mit Grund; der Worker bleibt oben, auch wenn ``profile_couplings`` im Baum fehlt (die Topologie braucht es nicht);
+  mit Grund; der Worker bleibt oben, auch wenn ``profile_couplings`` im Baum fehlt (die Topologie requires es nicht);
 * Editor.dry_run: Kind-Urteil wird zu HW-COUNT bzw. HW-TOPOLOGY mit Quelle; ohne Kind (nicht ok) greift die alte Rechnung im Prozess, und
   scheitert auch die am Import, bleibt es die benannte Notiz "nicht geprueft" (nie 500);
 * App verdrahtet den Editor mit ``couplings.topology``.
@@ -24,7 +24,7 @@ from types import SimpleNamespace
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
-from rigdash import profil_recompute as R  # noqa: E402
+from rigdash import profile_recompute as R  # noqa: E402
 from rigdash import server as S  # noqa: E402
 from rigdash.tests import test_profil_930 as P9  # noqa: E402
 

@@ -3,7 +3,7 @@ weight exchange may hold, and the refusals when it cannot be covered.
 
 USER LAW, 2026-09-11, verbatim: *"notfalls wird das layer auf einem
 (vertretbar kleinen) hostpuffer vollstaendig zusammengesetzt und jede karte
-nimmt sich von dem was er braucht (oder ihn komplett). die 27gb (oder so
+nimmt sich von dem was er requires (oder ihn komplett). die 27gb (oder so
 aehnlich) an layerbytes muessen nicht mehr dauerhaft im systemram gehalten
 werden. das ist das ziel."*  Design note: WEG2_REUSE_SPEC_0908.md section 10.
 

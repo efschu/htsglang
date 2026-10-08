@@ -81,7 +81,7 @@ while [ $# -gt 0 ]; do
     --dry-run) mode=dry ;;
     --apply) mode=apply ;;
     --unit-flags) mode=flags ;;
-    --root) shift; root=${1:?--root braucht ein Verzeichnis} ;;
+    --root) shift; root=${1:?--root requires ein Verzeichnis} ;;
     -h|--help) usage ;;
     -*) echo "unbekannte Option $1" >&2; usage ;;
     *) rev=$1 ;;

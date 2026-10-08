@@ -42,7 +42,7 @@ def test_pd_early_front_event_is_never_a_small_flipzeit():
     assert "decode_token" in pd["missing"]
     ok = ipcboot.flip_views(SEGS, _ipc(102.5), 450.0)[0]
     assert ok["kind"] == "ok" and round(ok["total_ms"]) == 3000            # P end 99,5 (segments) -> 102,5
-    assert (round(ok["vorlauf_ms"]), round(ok["layer_ms"]), round(ok["wake_kv_dc_ms"]), round(ok["nachlauf_ms"]),
+    assert (round(ok["warmup_ms"]), round(ok["layer_ms"]), round(ok["wake_kv_dc_ms"]), round(ok["nachlauf_ms"]),
             round(ok["rest_ms"])) == (500, 2000, 0, 500, 0)
     assert round(ok["nachlauf_d_extend_ms"]) == 500
 
@@ -53,7 +53,7 @@ def test_dp_ends_at_the_last_stage_forward_and_idle_pd_flip():
     dp = v[1]
     assert dp["dir"] == "D>P" and dp["kind"] == "ok"
     assert round(dp["total_ms"]) == 4400              # 199,6 -> 204,0 (first forward on PP0), not the front's 2300
-    assert (round(dp["vorlauf_ms"]), round(dp["layer_ms"]), round(dp["wake_kv_dc_ms"]), round(dp["nachlauf_ms"]),
+    assert (round(dp["warmup_ms"]), round(dp["layer_ms"]), round(dp["wake_kv_dc_ms"]), round(dp["nachlauf_ms"]),
             round(dp["rest_ms"])) == (400, 1500, 0, 1500, 1000)
     idle = v[2]
     assert idle["dir"] == "P>D" and idle["kind"] == "leerlauf" and idle["total_ms"] is None
@@ -94,8 +94,8 @@ def test_phase_now_flip_has_a_direction_for_the_active_frame():
 
 def test_vorlauf_never_reaches_past_the_previous_flip_probe_artifact():
     """N3u 07:33:29/:39 (11,3/21,0 s) and N4p 09:58:14 (17,2 s): the acceptance probe's manual D->P,
-    P does no work and flips back at once -- the P>D vorlauf was measured from the P chunk of the
-    phase before the probe. Bounded by the previous flip's done: no P chunk in this P phase = no vorlauf."""
+    P does no work and flips back at once -- the P>D warmup was measured from the P chunk of the
+    phase before the probe. Bounded by the previous flip's done: no P chunk in this P phase = no warmup."""
     ev = [{"type": "flip_begin", "ts": 100.0, "data": {"flip_begin_ts": 100.0, "sleep": "P", "wake": "D"}},
           {"type": "flip_done", "ts": 102.0, "data": {"flip_begin_ts": 100.0, "t": 102.0, "flip_ms": 2000, "epoch": 2, "sleep": "P", "wake": "D"}},
           {"type": "flip_begin", "ts": 110.0, "data": {"flip_begin_ts": 110.0, "sleep": "D", "wake": "P"}},
@@ -108,7 +108,7 @@ def test_vorlauf_never_reaches_past_the_previous_flip_probe_artifact():
           {"dir": "P>D", "flip_begin_ts": 112.003, "first_work_ts": 115.0, "what": "decode_token"}]
     v = ipcboot.flip_views(segs, {"ipc_events": ev, "flip_first_work": fw}, 140.0, _ring(t0=80.0, t1=135.0))
     first, probe_back = v[0], v[2]
-    assert round(first["vorlauf_ms"]) == 500                       # a real P phase keeps its vorlauf
+    assert round(first["warmup_ms"]) == 500                       # a real P phase keeps its vorlauf
     # Nutzer 02.10.: P computed no forward in its phase -- no last token to measure from: a Leerlauf-Flip,
     # never "flip_begin -> first decode" as a Flipzeit
     assert probe_back["dir"] == "P>D" and probe_back["kind"] == "leerlauf" and probe_back["total_ms"] is None

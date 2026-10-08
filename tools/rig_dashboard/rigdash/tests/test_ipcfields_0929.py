@@ -1,5 +1,5 @@
 """DASHBOARD-AUS-IPC, the 25 "Übergang" rows (user 29.09. ~12:00Z via 27B: "warum sind die
-ganzen werte im dashboard noch aus log"): one reader per field, switched by presence.
+ganzen values im dashboard noch aus log"): one reader per field, switched by presence.
 
 For every field: the IPC source present -> the IPC value (src=ipc); absent -> the log value
 with the label "missing in IPC".  The fixtures follow the producers' schemas:

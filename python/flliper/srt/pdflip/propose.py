@@ -3,7 +3,7 @@ goals -> a candidate launch (argv + environment) with the ORIGIN of every value.
 
 ::
 
-    propose(hardware, modell, form, ziele, *, basis=None, draft=None, rates=None, library=None) -> Vorschlag (dict)
+    propose(hardware, modell, form, goals, *, basis=None, draft=None, rates=None, library=None) -> Vorschlag (dict)
 
 * ``hardware``  a ``flliper.hardware/1`` document (``rigmon.hardware_profile.build``), or a list of card dicts: NVML replay
   rows (``index, uuid, name, total_bytes, cc_major, ...``) or ``rigdash.kartenplan_catalog`` rows (``usable_mib, nvml_name``).
@@ -12,7 +12,7 @@ goals -> a candidate launch (argv + environment) with the ORIGIN of every value.
 * ``form``      ``"flip"`` (P = PP<N>, D = TP<N>, the standard form), ``"tp"`` (``--d-only``: pure tensor parallel) or ``"dual"``
   (AP-E, ``propose_dual``: P and D awake together on the SAME cards; the 27B tree).  A single card (AP-F) is another package:
   it raises :class:`ProposeError`, it is not guessed.
-* ``ziele``     the goals (all optional): ``seats`` (the "Sitze gleichzeitig" regulator = decode-bs target), ``kv_tokens``
+* ``goals``     the goals (all optional): ``seats`` (the "Sitze gleichzeitig" regulator = decode-bs target), ``kv_tokens``
   (K1 obligation, default 262144), ``kv_dtype``, ``p_cut`` (``auto`` | ``pin`` | ``seed``), ``d_objective``,
   ``draft_kv_on_p``, ``force_rules`` (derive everything by rule even where the profile's own inventory is the live one).
 * ``basis``     the release profile of the model line as its launcher input (``propose_oracle.LaunchInput`` or a dict with
@@ -26,14 +26,14 @@ What it decides, by the criteria K1-K5 (rules in ``propose_rules.py``):
   "Profil, gleiches Inventar").  Otherwise each is re-derived: per-card measured values by class maximum with the arch twin as
   BORROWED (``class_rekey``), the P cut by the GEMM rates, the resident expert fractions from what a stage has left, the D side by
   the Form A solve (MoE) or VRAM-proportional TP shares (dense).  A value no rule and no record can give is DROPPED and named
-  in ``unbelegt`` -- the launcher then says what it needs (HW-UNCALIBRATED), the planner invents nothing.
+  in ``unverified`` -- the launcher then says what it needs (HW-UNCALIBRATED), the planner invents nothing.
 * **EVERY per-card flag/token the launcher's topology probe counts (``launcher.POSITIONAL_VECTOR_FLAGS/TOKENS`` minus the BAR1
   window spec, the d_reshard presets and ``FLLIPER_PDFLIP_L15_MIB``: ``launcher._TOPOLOGY_VECTOR_FLAGS/-TOKENS``) the proposal
   carries has exactly N entries** (:func:`vector_lengths`, checked into ``vector_ok``); those three are kept as the profile has them.
 * **The scalars of the profile are kept** (``--d-tp-objective decode-bs1`` of the 27B profile stays) unless a goal names them;
   the rule defaults (``maxkv``, ``--max-kv-per-request`` = KV obligation) fill only what the profile does not say.
 
-A P cut seed is a PIN for the launcher; it goes into the argv only where the profile pins a cut itself (NF) or ``ziele["p_cut"]
+A P cut seed is a PIN for the launcher; it goes into the argv only where the profile pins a cut itself (NF) or ``goals["p_cut"]
 == "pin"``; otherwise the launcher's own cut solver stays in charge (27B) and the seed is shown as ``in_argv: false``.
 
 The result is HOCHRECHNUNG, not MESSUNG: stage B (``propose_oracle``) runs the launcher dry run on it and says what the
@@ -50,7 +50,7 @@ from flliper.srt.pdflip import propose_rules as R
 SCHEMA = "flliper.propose-a/1"
 FORMS = ("flip", "tp", "dual")
 #: the forms of the plan that are other packages (AP-F single card)
-OTHER_FORMS = {"single": "AP-F (single card)", "einzel": "AP-F (single card)"}
+OTHER_FORMS = {"single": "AP-F (single card)", "single": "AP-F (single card)"}
 
 KV_TOKENS_DEFAULT = 262144
 KV_DTYPE_DEFAULT = "fp8_e4m3"
@@ -402,22 +402,22 @@ class _Rec:
 
     def __init__(self) -> None:
         self.values: List[Dict[str, Any]] = []
-        self.unbelegt: List[str] = []
-        self.hinweise: List[str] = []
+        self.unverified: List[str] = []
+        self.notes: List[str] = []
         self.blocker: List[str] = []
 
-    def add(self, label: str, *, group: str, old: Optional[str], new: Optional[str], state: str, herkunft: str, grund: str,
+    def add(self, label: str, *, group: str, old: Optional[str], new: Optional[str], state: str, source: str, reason: str,
             in_argv: bool = True, policy: str = "") -> None:
         n = len(R.parse_csv(new) or []) if new else 0
-        self.values.append({"key": label, "group": group, "policy": policy, "alt": old, "wert": new,
-                            "eintraege": n if n else (1 if new not in (None, "") else 0), "zustand": state,
-                            "herkunft": herkunft, "grund": grund, "in_argv": in_argv,
-                            "geaendert": (old != new)})
-        if state == R.UNBELEGT:
-            self.unbelegt.append("%s: %s" % (label, herkunft))
+        self.values.append({"key": label, "group": group, "policy": policy, "alt": old, "value": new,
+                            "entries": n if n else (1 if new not in (None, "") else 0), "state": state,
+                            "source": source, "reason": reason, "in_argv": in_argv,
+                            "changed": (old != new)})
+        if state == R.UNVERIFIED:
+            self.unverified.append("%s: %s" % (label, source))
 
 
-def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: Optional[Mapping[str, Any]] = None, *,
+def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: Optional[Mapping[str, Any]] = None, *,
             basis: Any = None, draft: Optional[Mapping[str, Any]] = None, rates: Optional[Mapping[str, float]] = None,
             library: Any = None) -> Dict[str, Any]:
     """The stage A proposal (see the module docstring).  Pure: reads nothing from disk or the box; every input is an argument."""
@@ -428,7 +428,7 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
         raise ProposeError("form %r is %s, not stage A of AP-C (flip | tp | dual)" % (form, OTHER_FORMS[form]))
     if form not in FORMS:
         raise ProposeError("unknown form %r (flip | tp | dual)" % form)
-    z = dict(ziele or {})
+    z = dict(goals or {})
     cards = R.order_cards(cards_from_hardware(hardware))
     n = len(cards)
     if n < 2:
@@ -478,14 +478,14 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
     rate, rate_src, rate_basis = R.rate_table(cards, measured=rates, library=library)
     layers, cut_notes = R.split_layers(fp.n_layers, rate, sb["caps"])
     attn = R.attn_counts(fp.layer_families, layers)
-    rec.hinweise += ["P cut: " + x for x in cut_notes]
-    if rate_basis.startswith(("Datenblatt", "unbelegt", "datasheet", "unverified")):
-        rec.unbelegt.append("GEMM rates: " + rate_basis)
+    rec.notes += ["P cut: " + x for x in cut_notes]
+    if rate_basis.startswith(("Datasheet", "unverified", "datasheet", "unverified")):
+        rec.unverified.append("GEMM rates: " + rate_basis)
     pin_in_basis = la.get_flag("--pp-stage-ratio") is not None or la.extra_get("p", "--pp-stage-ratio") is not None
     pin_mode = str(z.get("p_cut") or "auto")
     apply_cut = (pin_mode == "pin" or (pin_mode == "auto" and pin_in_basis))
     frp, frp_notes = R.fr_p(fp, layers, sb["avail"], sb["cost"])
-    rec.hinweise += ["Resident expert share of the P stages: " + x for x in frp_notes]
+    rec.notes += ["Resident expert share of the P stages: " + x for x in frp_notes]
 
     carry_h = "Profile %s, same inventory [%s]" % (bname, ",".join(live_cls))
     carry_g = "Value of the profile (measured or set by the operator) unchanged: the profile applies to exactly these cards"
@@ -497,7 +497,7 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
 
     def carried() -> Tuple[str, str, str]:
         """``(state, origin, reason)`` of a profile value kept as it is."""
-        return (R.VORGESCHLAGEN, carry_h, carry_g) if same_inv else (R.UNBELEGT, carry_x, carry_gx)
+        return (R.PROPOSED, carry_h, carry_g) if same_inv else (R.UNVERIFIED, carry_x, carry_gx)
 
     def rule_origin(pol: str) -> str:
         return "%s for the cards [%s]" % (RULE_ORIGIN.get(pol, "Planner rule"), ",".join(live_cls))
@@ -515,21 +515,21 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
             return
         if same_inv or (len(vec) == n and binv is None):
             st, hk, gr = carried()
-            rec.add(lab, group=group, old=old, new=old, state=st, herkunft=hk, grund=gr, policy="class")
+            rec.add(lab, group=group, old=old, new=old, state=st, source=hk, reason=gr, policy="class")
             return
         if binv is not None and len(vec) == len(binv):
             new, srcs = R.class_rekey(vec, binv, cards)
             newt = R.csv(new)
             _set(la, kind, group, name, newt)
-            borrowed = [s for s in srcs if s.startswith(("geborgt", "unbelegt", "borrowed", "unverified"))]
-            rec.add(lab, group=group, old=old, new=newt, state=R.UNBELEGT if borrowed else R.VORGESCHLAGEN,
-                    herkunft="Class maximum of the profile measurement %s [%s] -> [%s]: %s" % (bname, ",".join(binv), ",".join(live_cls),
+            borrowed = [s for s in srcs if s.startswith(("borrowed", "unverified", "borrowed", "unverified"))]
+            rec.add(lab, group=group, old=old, new=newt, state=R.UNVERIFIED if borrowed else R.PROPOSED,
+                    source="Class maximum of the profile measurement %s [%s] -> [%s]: %s" % (bname, ",".join(binv), ",".join(live_cls),
                                                                                        "; ".join(srcs)),
-                    grund="per card the maximum of the measured entries of its OWN class (conservative); a card without a twin in the measurement borrows the value of its arch class and is unverified", policy="class")
+                    reason="per card the maximum of the measured entries of its OWN class (conservative); a card without a twin in the measurement borrows the value of its arch class and is unverified", policy="class")
             return
         _del(la, kind, group, name)
-        rec.add(lab, group=group, old=old, new=None, state=R.UNBELEGT, herkunft="not derivable: profile measurement %s has %d entries for [%s], the cards are [%s]" % (bname, len(vec), ",".join(binv or ()), ",".join(live_cls)),
-                grund="removed (no value invented); the launcher names what it needs instead", in_argv=False,
+        rec.add(lab, group=group, old=old, new=None, state=R.UNVERIFIED, source="not derivable: profile measurement %s has %d entries for [%s], the cards are [%s]" % (bname, len(vec), ",".join(binv or ()), ",".join(live_cls)),
+                reason="removed (no value invented); the launcher names what it needs instead", in_argv=False,
                 policy="class")
 
     def keep_as_is(kind: str, group: str, name: str) -> None:
@@ -537,8 +537,8 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
         if old is None:
             return
         st, hk, gr = carried()
-        rec.add(slot_label(kind, group, name), group=group, old=old, new=old, state=st, herkunft=hk,
-                grund=gr + " (no card vector of the topology check of the launcher: unchanged from the profile)", policy="carry")
+        rec.add(slot_label(kind, group, name), group=group, old=old, new=old, state=st, source=hk,
+                reason=gr + " (no card vector of the topology check of the launcher: unchanged from the profile)", policy="carry")
 
     for kind, group, name, pol in SLOTS:
         if pol == "class":
@@ -556,7 +556,7 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
     else:
         ctx = [float(c["total_mib"] - sb["avail"][i]) for i, c in enumerate(cards)]       # total - (total - residue - posts)
         ctx_src = "P residue + stage items (fallback, unverified)"
-        rec.unbelegt.append("D context per card: no --d-foreign-context-mib/--d-nontorch-mib in the profile for this inventory")
+        rec.unverified.append("D context per card: no --d-foreign-context-mib/--d-nontorch-mib in the profile for this inventory")
     d_budget = [int(c["total_mib"] - ctx[i]) for i, c in enumerate(cards)]
     kv_cell = fp.kv_bytes_per_token_per_attn_layer[kv_dtype]
     kv_mib = fp.attn_layers * kv_cell * kv_tokens / R.MIB
@@ -571,7 +571,7 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
         fa = R.form_a_d(fp, cards, d_budget, res_mib, kv_tokens=kv_tokens, kv_cell_bytes=kv_cell, draft_mib=fp.draft_mib,
                         d_mamba_slots=asm.d_mamba_slots, mamba_slot_mib=mamba_slot)
         results["form_a"] = fa
-        rec.unbelegt += fa["unbelegt"]
+        rec.unverified += fa["unverified"]
         if not fa["ok"]:
             rec.blocker.append("Form A does not fit: " + fa["error"])
     else:
@@ -674,53 +674,53 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
                     parts.append("re-keyed to %d cards by rank role (first/middle/last entry of the profile with %d entries)" % (n, len(vec)))
                 if by_seats:
                     parts.append("scaled linearly in the seats (%d -> %d), extrapolation from one measuring point" % (ref_s, tgt_s))
-                st, hk = R.UNBELEGT, "Profile %s: %s" % (bname, "; ".join(parts))
+                st, hk = R.UNVERIFIED, "Profile %s: %s" % (bname, "; ".join(parts))
                 if not same_inv:
                     hk += "; inventory of the profile [%s], here [%s]" % (inv_txt, ",".join(live_cls))
                 gr = ("Scratch rows belong to rank role and seat count; the profile holds only ONE measuring point, the conversion is unverified")
-            rec.add(lab, group=group, old=old, new=nt, state=st, herkunft=hk, grund=gr, policy=pol)
+            rec.add(lab, group=group, old=old, new=nt, state=st, source=hk, reason=gr, policy=pol)
             return
         if pol == "advisory":
             if vec is None or same_inv or len(vec) == n or name in WINDOW_SPEC_FLAGS:
                 st, hk, gr = carried()
-                rec.add(lab, group=group, old=old, new=old, state=st, herkunft=hk, grund=gr, policy=pol)
+                rec.add(lab, group=group, old=old, new=old, state=st, source=hk, reason=gr, policy=pol)
             else:
                 _del(la, kind, group, name)
-                rec.add(lab, group=group, old=old, new=None, state=R.UNBELEGT,
-                        herkunft="not derivable (%d entries, %d cards)" % (len(vec), n),
-                        grund="removed (no value invented)", in_argv=False, policy=pol)
+                rec.add(lab, group=group, old=old, new=None, state=R.UNVERIFIED,
+                        source="not derivable (%d entries, %d cards)" % (len(vec), n),
+                        reason="removed (no value invented)", in_argv=False, policy=pol)
             return
         if vec is None:
             return
         if pol == "lru":
             if same_inv:
-                rec.add(lab, group=group, old=old, new=old, state=R.VORGESCHLAGEN, herkunft=carry_h, grund=carry_g, policy=pol)
+                rec.add(lab, group=group, old=old, new=old, state=R.PROPOSED, source=carry_h, reason=carry_g, policy=pol)
                 return
             new = R.csv(R.role_rekey(vec, n))
             _set(la, kind, group, name, new)
-            rec.add(lab, group=group, old=old, new=new, state=R.UNBELEGT,
-                    herkunft="Profile %s: re-keyed by rank role (first/middle/last entry) to %d cards; inventory of the profile [%s], here [%s]" % (bname, n, inv_txt, ",".join(live_cls)),
-                    grund="LRU rows per stage are a pool size, not a card measurement; unverified for these cards", policy=pol)
+            rec.add(lab, group=group, old=old, new=new, state=R.UNVERIFIED,
+                    source="Profile %s: re-keyed by rank role (first/middle/last entry) to %d cards; inventory of the profile [%s], here [%s]" % (bname, n, inv_txt, ",".join(live_cls)),
+                    reason="LRU rows per stage are a pool size, not a card measurement; unverified for these cards", policy=pol)
             return
         # cut / cut_attn / fr_p / fr_d / moe_ratio / role / tp_ratio
         if same_inv and seats_changed and pol in ("fr_p", "fr_d") and is_moe and (pol == "fr_d" or p_coupled):
             sf = seat_fr(pol, vec)
             if sf is not None:
                 _set(la, kind, group, name, sf[0])
-                rec.add(lab, group=group, old=old, new=sf[0], state=R.UNBELEGT, herkunft="Profile %s + rule for the control seats at the same time (%d)" % (
-                    bname, seats), grund=sf[1] + "; unverified on the hardware (planner calculation)", policy=pol)
+                rec.add(lab, group=group, old=old, new=sf[0], state=R.UNVERIFIED, source="Profile %s + rule for the control seats at the same time (%d)" % (
+                    bname, seats), reason=sf[1] + "; unverified on the hardware (planner calculation)", policy=pol)
                 return
-            rec.hinweise.append("%s: cannot be converted to %d seats (vector length/form A); profile value stays" % (lab, seats))
+            rec.notes.append("%s: cannot be converted to %d seats (vector length/form A); profile value stays" % (lab, seats))
         if same_inv:
-            rec.add(lab, group=group, old=old, new=old, state=R.VORGESCHLAGEN, herkunft=carry_h, grund=carry_g, policy=pol)
+            rec.add(lab, group=group, old=old, new=old, state=R.PROPOSED, source=carry_h, reason=carry_g, policy=pol)
             return
         new: Optional[str] = None
         why = ""
-        stt = R.VORGESCHLAGEN
+        stt = R.PROPOSED
         if pol == "cut":
             if apply_cut:
                 new, why = R.csv(layers), ("Layer cut proportional to the GEMM rate (%s), limited per stage to the memory capacity (hw_fit: %s layers)" % (rate_basis, R.csv(sb["caps"])))
-                stt = R.UNBELEGT if rate_basis.startswith(("Datenblatt", "unbelegt", "datasheet", "unverified")) else R.VORGESCHLAGEN
+                stt = R.UNVERIFIED if rate_basis.startswith(("Datasheet", "unverified", "datasheet", "unverified")) else R.PROPOSED
         elif pol == "cut_attn":
             if apply_cut:
                 new, why = R.csv(attn), "the full-attention layers of each stage of the layer cut, exactly from the layer families"
@@ -740,16 +740,16 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
             if pol in ("cut", "cut_attn") and not apply_cut:
                 return
             _del(la, kind, group, name)
-            rec.add(lab, group=group, old=old, new=None, state=R.UNBELEGT,
-                    herkunft="not derivable for the cards [%s]%s" % (",".join(live_cls), " (form A does not fit)" if pol in (
+            rec.add(lab, group=group, old=old, new=None, state=R.UNVERIFIED,
+                    source="not derivable for the cards [%s]%s" % (",".join(live_cls), " (form A does not fit)" if pol in (
                         "fr_d", "moe_ratio", "role", "tp_ratio") and fa is not None and not fa["ok"] else ""),
-                    grund="removed (no value invented)", in_argv=False, policy=pol)
+                    reason="removed (no value invented)", in_argv=False, policy=pol)
             return
         _set(la, kind, group, name, new)
         if pol in ("fr_p", "fr_d", "moe_ratio", "role", "tp_ratio"):
-            stt = R.UNBELEGT if pol != "role" and pol != "tp_ratio" else R.VORGESCHLAGEN
-        rec.add(lab, group=group, old=old, new=new, state=stt, herkunft=rule_origin(pol),
-                grund=why + ("; unverified on the hardware (planner calculation)" if stt == R.UNBELEGT else ""), policy=pol)
+            stt = R.UNVERIFIED if pol != "role" and pol != "tp_ratio" else R.PROPOSED
+        rec.add(lab, group=group, old=old, new=new, state=stt, source=rule_origin(pol),
+                reason=why + ("; unverified on the hardware (planner calculation)" if stt == R.UNVERIFIED else ""), policy=pol)
 
     for kind, group, name, pol in SLOTS:
         if pol not in ("class", "carry"):
@@ -761,15 +761,15 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
         old = la.get_flag(rflag)
         if old is not None and not same_inv:
             la.del_flag(rflag)
-            rec.add(rflag, group="-", old=old, new=None, state=R.UNBELEGT,
-                    herkunft="Measurement of profile %s on [%s]" % (bname, ",".join(binv or ())),
-                    grund="removed: the reference logs apply only to these cards and stage count; for [%s] a run of THIS form must measure them" % ",".join(live_cls), in_argv=False, policy="reference")
+            rec.add(rflag, group="-", old=old, new=None, state=R.UNVERIFIED,
+                    source="Measurement of profile %s on [%s]" % (bname, ",".join(binv or ())),
+                    reason="removed: the reference logs apply only to these cards and stage count; for [%s] a run of THIS form must measure them" % ",".join(live_cls), in_argv=False, policy="reference")
 
     # the P cut seed, shown when it is not applied (the launcher plans group P in BOTH forms: ``--d-only`` keeps "P's resting
     # residue planned, exactly the D form of the flip boot", ``launcher.py:27160``)
-    rec.add("--pp-stage-ratio (Seed)", group="-", old=None, new=R.csv(layers), state=R.UNBELEGT if rate_basis.startswith((
-        "Datenblatt", "unbelegt", "datasheet", "unverified")) else R.VORGESCHLAGEN, herkunft="Rule: P cut by GEMM rate; rate: " + rate_basis,
-            grund="Layer cut proportional to the GEMM rate, limited per stage to the memory capacity; attention layers per stage %s" % R.csv(attn) + ("" if apply_cut else "; NOT set: the launcher solves the cut itself (p_cut=pin sets it)"),
+    rec.add("--pp-stage-ratio (Seed)", group="-", old=None, new=R.csv(layers), state=R.UNVERIFIED if rate_basis.startswith((
+        "Datasheet", "unverified", "datasheet", "unverified")) else R.PROPOSED, source="Rule: P cut by GEMM rate; rate: " + rate_basis,
+            reason="Layer cut proportional to the GEMM rate, limited per stage to the memory capacity; attention layers per stage %s" % R.csv(attn) + ("" if apply_cut else "; NOT set: the launcher solves the cut itself (p_cut=pin sets it)"),
             in_argv=apply_cut, policy="cut_seed")
 
     # a MoE flip needs the resident fraction and the LRU rows of every P stage (the launcher refuses without them, W40: "Pass
@@ -781,8 +781,8 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
                                 "LRU rows per stage: the hw_fit default (%d), a pool size" % asm.lru_rows)):
             if la.get_flag(flag) is None:
                 la.set_flag(flag, val)
-                rec.add(flag, group="p", old=None, new=val, state=R.UNBELEGT if "fraction" in flag else R.VORGESCHLAGEN,
-                        herkunft="Rule: the rest of the P stage buys resident experts (MoE)", grund=why + ("; unverified on the hardware (planner calculation)" if "fraction" in flag else ""),
+                rec.add(flag, group="p", old=None, new=val, state=R.UNVERIFIED if "fraction" in flag else R.PROPOSED,
+                        source="Rule: the rest of the P stage buys resident experts (MoE)", reason=why + ("; unverified on the hardware (planner calculation)" if "fraction" in flag else ""),
                         policy="fr_p" if "fraction" in flag else "lru")
 
     # --- Form A skeleton when no profile names it (no basis) ---------------------------------------------------------------
@@ -793,8 +793,8 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
                                     ("fr_d", "--rank-moe-resident-fraction", ",".join("%.3f" % f for f in fa["fr"]),
                                      "Form A solution: resident share")):
             la.extra_set("d", flag, val)
-            rec.add("--extra-d " + flag, group="d", old=None, new=val, state=R.UNBELEGT if pol in ("moe_ratio", "fr_d") else R.VORGESCHLAGEN,
-                    herkunft="Rule form A: split of the D ranks (MoE)", grund=why, policy=pol)
+            rec.add("--extra-d " + flag, group="d", old=None, new=val, state=R.UNVERIFIED if pol in ("moe_ratio", "fr_d") else R.PROPOSED,
+                    source="Rule form A: split of the D ranks (MoE)", reason=why, policy=pol)
 
     # --- K3: the draft ------------------------------------------------------------------------------------------------------
     plc_old = la.extra_get("d", "--speculative-draft-placement") or la.get_flag("--speculative-draft-placement")
@@ -802,48 +802,48 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
         want = dp["placement"]
         if plc_old is None and not b["argv"]:
             la.extra_set("d", "--speculative-draft-placement", want)
-            rec.add("--extra-d --speculative-draft-placement", group="d", old=None, new=want, state=R.VORGESCHLAGEN,
-                    herkunft="Rule: draft solo on rank 0 if it fits with the dense weights and the KV obligation", grund=dp["why"], policy="draft")
+            rec.add("--extra-d --speculative-draft-placement", group="d", old=None, new=want, state=R.PROPOSED,
+                    source="Rule: draft solo on rank 0 if it fits with the dense weights and the KV obligation", reason=dp["why"], policy="draft")
         elif plc_old is not None:
-            rec.add("--extra-d --speculative-draft-placement", group="d", old=plc_old, new=plc_old, state=R.VORGESCHLAGEN,
-                    herkunft="Profile %s (unchanged)" % bname, grund="the draft rule says for these cards %s: %s" % (want, dp["why"]), policy="draft")
+            rec.add("--extra-d --speculative-draft-placement", group="d", old=plc_old, new=plc_old, state=R.PROPOSED,
+                    source="Profile %s (unchanged)" % bname, reason="the draft rule says for these cards %s: %s" % (want, dp["why"]), policy="draft")
             if want != plc_old and plc_old == "solo":
-                rec.hinweise.append("Draft: the profile sets solo, but it does not fit for these cards (%s). Form A refuses the split across all ranks." % dp["why"])
+                rec.notes.append("Draft: the profile sets solo, but it does not fit for these cards (%s). Form A refuses the split across all ranks." % dp["why"])
         if dp["placement"] == "split":
-            rec.hinweise.append("Draft solo does not fit on rank 0 (%s). Without it on rank 0 only the split across all ranks would remain, which form A refuses." % dp["why"])
+            rec.notes.append("Draft solo does not fit on rank 0 (%s). Without it on rank 0 only the split across all ranks would remain, which form A refuses." % dp["why"])
             rec.blocker.append("Draft solo on rank 0 does not fit (form A demands solo)")
     elif form != "dual":                      # the Dual form states its own draft rule (propose_dual: D shards the draft, P holds none)
-        rec.hinweise.append("Draft: %s (the draft rule applies to the form A MoE line; for a dense model the draft runs per profile)" % dp["why"])
+        rec.notes.append("Draft: %s (the draft rule applies to the form A MoE line; for a dense model the draft runs per profile)" % dp["why"])
     d_kv_old = la.get_flag("--draft-kv-on-p")
     if z.get("draft_kv_on_p") in ("on", "off"):
         la.set_flag("--draft-kv-on-p", z["draft_kv_on_p"])
-        rec.add("--draft-kv-on-p", group="-", old=d_kv_old, new=z["draft_kv_on_p"], state=R.VORGESCHLAGEN, herkunft="Goal draft_kv_on_p",
-                grund="Draft KV on P (user order 07.09.: draft KV across the flip)", policy="draft")
+        rec.add("--draft-kv-on-p", group="-", old=d_kv_old, new=z["draft_kv_on_p"], state=R.PROPOSED, source="Goal draft_kv_on_p",
+                reason="Draft KV on P (user order 07.09.: draft KV across the flip)", policy="draft")
     elif d_kv_old is not None:
-        rec.add("--draft-kv-on-p", group="-", old=d_kv_old, new=d_kv_old, state=R.VORGESCHLAGEN, herkunft="Profile %s (unchanged)" % bname,
-                grund="set by the profile; without a value the launcher default on applies", policy="draft")
+        rec.add("--draft-kv-on-p", group="-", old=d_kv_old, new=d_kv_old, state=R.PROPOSED, source="Profile %s (unchanged)" % bname,
+                reason="set by the profile; without a value the launcher default on applies", policy="draft")
 
     # --- the scalar knobs: D objective, seats, KV obligation ----------------------------------------------------------------
     obj = z.get("d_objective")
     if obj:
         la.set_flag("--d-tp-objective", str(obj))
-        rec.add("--d-tp-objective", group="-", old=d_obj_old, new=str(obj), state=R.VORGESCHLAGEN, herkunft="Goal d_objective",
-                grund="chosen by the user", policy="knob")
+        rec.add("--d-tp-objective", group="-", old=d_obj_old, new=str(obj), state=R.PROPOSED, source="Goal d_objective",
+                reason="chosen by the user", policy="knob")
     elif d_obj_old is not None:
-        rec.add("--d-tp-objective", group="-", old=d_obj_old, new=d_obj_old, state=R.VORGESCHLAGEN, herkunft="Profile %s (unchanged)" % bname,
-                grund="the goal value of the profile stays (a scalar of the form, no card measurement)", policy="knob")
+        rec.add("--d-tp-objective", group="-", old=d_obj_old, new=d_obj_old, state=R.PROPOSED, source="Profile %s (unchanged)" % bname,
+                reason="the goal value of the profile stays (a scalar of the form, no card measurement)", policy="knob")
     else:
         la.set_flag("--d-tp-objective", "maxkv")
-        rec.add("--d-tp-objective", group="-", old=None, new="maxkv", state=R.VORGESCHLAGEN, herkunft="Rule: standard goal of the form (no value in the profile)",
-                grund=("Dense: TP-symmetric, VRAM-proportional" if not is_moe else "MoE: rest to KV/experts by VRAM")
+        rec.add("--d-tp-objective", group="-", old=None, new="maxkv", state=R.PROPOSED, source="Rule: standard goal of the form (no value in the profile)",
+                reason=("Dense: TP-symmetric, VRAM-proportional" if not is_moe else "MoE: rest to KV/experts by VRAM")
                 + " (maxkv = the largest KV slot count; the launcher solves the ranks itself)", policy="knob")
     if form == "tp":
         if "--d-only" not in la.t:
             la.t.append("--d-only")
-        rec.add("--d-only", group="-", old=None, new="", state=R.VORGESCHLAGEN, herkunft="Form TP only",
-                grund="only group D, TP across all %d cards, no flip" % n, policy="form")
+        rec.add("--d-only", group="-", old=None, new="", state=R.PROPOSED, source="Form TP only",
+                reason="only group D, TP across all %d cards, no flip" % n, policy="form")
     if seats_changed and seats_ref is not None and not p_coupled:
-        rec.hinweise.append("Seats at the same time %d: the profile runs P with %d seats (--p-bs / --max-running-requests) and D with %d (%s); the goal is the decode bs goal, the P side of the profile stays" % (seats, seats_ref, d_seats_base, d_seats_src))
+        rec.notes.append("Seats at the same time %d: the profile runs P with %d seats (--p-bs / --max-running-requests) and D with %d (%s); the goal is the decode bs goal, the P side of the profile stays" % (seats, seats_ref, d_seats_base, d_seats_src))
     dbs_added = False
     if seats_changed:
         # the regulator reaches D: an absent --d-bs leaves the launcher default (``apply_profile_d_bs_default``: 6 seats for
@@ -851,8 +851,8 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
         if la.get_flag("--d-bs") is None:
             dbs_added = True
             la.set_flag("--d-bs", str(seats))
-            rec.add("--d-bs", group="-", old=None, new=str(seats), state=R.VORGESCHLAGEN, herkunft="Goal seats at the same time = %d" % seats,
-                    grund="Decode bs goal of the user; without it D would stay at %d seats (%s)" % (seats_base, d_seats_src),
+            rec.add("--d-bs", group="-", old=None, new=str(seats), state=R.PROPOSED, source="Goal seats at the same time = %d" % seats,
+                    reason="Decode bs goal of the user; without it D would stay at %d seats (%s)" % (seats_base, d_seats_src),
                     policy="seats")
         # the decode CUDA graph ladder follows the seats when it is the contiguous 1..k ladder of the profile
         dtext = la.gtext("extra", "d") or ""
@@ -864,10 +864,10 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
                     newl = " ".join(str(i) for i in range(1, seats + 1))
                     la.set_gtext("extra", "d", dtext[:m.start(1)] + " " + newl + dtext[m.end(1):])
                     rec.add("--extra-d --cuda-graph-bs-decode", group="d", old=" ".join(map(str, ladder)), new=newl,
-                            state=R.UNBELEGT, herkunft="Goal seats at the same time = %d" % seats,
-                            grund="the decode graph ladder 1..%d of the profile follows the bs goal; graph memory per bs unverified on the hardware" % ladder[-1], policy="seats")
+                            state=R.UNVERIFIED, source="Goal seats at the same time = %d" % seats,
+                            reason="the decode graph ladder 1..%d of the profile follows the bs goal; graph memory per bs unverified on the hardware" % ladder[-1], policy="seats")
             else:
-                rec.hinweise.append("--cuda-graph-bs-decode is no 1..k ladder (%s): stays, bs above the ladder runs without a graph"
+                rec.notes.append("--cuda-graph-bs-decode is no 1..k ladder (%s): stays, bs above the ladder runs without a graph"
                                     % " ".join(map(str, ladder)))
     if seats_changed:
         for kind, group, name, setter in (("flag", "-", "--p-bs", lambda v: la.set_flag("--p-bs", v)),
@@ -883,15 +883,15 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
                     continue            # the profile runs P at another seat count than D: the decode goal does not move P
             new = str(R.mamba_slots_p(seats)) if name == "--max-mamba-cache-size" else str(seats)
             setter(new)
-            rec.add(slot_label(kind, group, name), group=group, old=old, new=new, state=R.VORGESCHLAGEN, herkunft="Goal seats at the same time = %d" % seats,
-                    grund=("Mamba slots = %d per seat + %d retention (launcher line PP-CUT budget posts)" % (R.P_MAMBA_SLOTS_PER_SEAT,
+            rec.add(slot_label(kind, group, name), group=group, old=old, new=new, state=R.PROPOSED, source="Goal seats at the same time = %d" % seats,
+                    reason=("Mamba slots = %d per seat + %d retention (launcher line PP-CUT budget posts)" % (R.P_MAMBA_SLOTS_PER_SEAT,
                            R.P_MAMBA_RETENTION)) if name == "--max-mamba-cache-size" else "Decode bs goal of the user", policy="seats")
     if z.get("kv_tokens") and int(z["kv_tokens"]) != KV_TOKENS_DEFAULT or la.get_flag("--max-kv-per-request") is None:
         old = la.get_flag("--max-kv-per-request")
         la.set_flag("--max-kv-per-request", str(kv_tokens))
-        rec.add("--max-kv-per-request", group="-", old=old, new=str(kv_tokens), state=R.VORGESCHLAGEN,
-                herkunft="Goal kv_tokens" if z.get("kv_tokens") else "Rule: KV obligation 262144 tokens (user 05.10.)",
-                grund="one request carries this context (P must carry 262144 tokens of prefill context)", policy="knob")
+        rec.add("--max-kv-per-request", group="-", old=old, new=str(kv_tokens), state=R.PROPOSED,
+                source="Goal kv_tokens" if z.get("kv_tokens") else "Rule: KV obligation 262144 tokens (user 05.10.)",
+                reason="one request carries this context (P must carry 262144 tokens of prefill context)", policy="knob")
 
     # --- K4 regulators that are scalars of the profile: the pool floor and the X ceiling ---------------------------------------
     # ``--pp-solve-pool-floor`` is a hard lower bound, in WORLD KV tokens, on the priced pool the P cut solve ranks over
@@ -903,23 +903,23 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
     if pf_old is not None:
         if z.get("kv_tokens") and str(pf_old).lstrip("-").isdigit() and int(pf_old) > 0 and int(pf_old) != kv_tokens:
             la.set_flag("--pp-solve-pool-floor", str(kv_tokens))
-            rec.add("--pp-solve-pool-floor", group="-", old=pf_old, new=str(kv_tokens), state=R.VORGESCHLAGEN,
-                    herkunft="Goal kv_tokens: the pool floor follows the KV obligation (profile %s had %s)" % (bname, pf_old),
-                    grund=pf_expl + "; whether this cut lies on the frontier is decided by the solver at boot (W67 otherwise)", policy="knob")
+            rec.add("--pp-solve-pool-floor", group="-", old=pf_old, new=str(kv_tokens), state=R.PROPOSED,
+                    source="Goal kv_tokens: the pool floor follows the KV obligation (profile %s had %s)" % (bname, pf_old),
+                    reason=pf_expl + "; whether this cut lies on the frontier is decided by the solver at boot (W67 otherwise)", policy="knob")
         else:
-            rec.add("--pp-solve-pool-floor", group="-", old=pf_old, new=pf_old, state=R.VORGESCHLAGEN,
-                    herkunft="Profile %s (unchanged)" % bname, grund=pf_expl, policy="knob")
+            rec.add("--pp-solve-pool-floor", group="-", old=pf_old, new=pf_old, state=R.PROPOSED,
+                    source="Profile %s (unchanged)" % bname, reason=pf_expl, policy="knob")
     else:
-        rec.add("--pp-solve-pool-floor", group="-", old=None, new=None, state=R.VORGESCHLAGEN,
-                herkunft="not in profile %s: launcher default" % bname, grund=pf_expl, in_argv=False, policy="knob")
+        rec.add("--pp-solve-pool-floor", group="-", old=None, new=None, state=R.PROPOSED,
+                source="not in profile %s: launcher default" % bname, reason=pf_expl, in_argv=False, policy="knob")
     xc_old = la.get_flag("--x-ceiling-tokens")
     xc_expl = ("upper bound up to which the front may raise X (tokens from which a request goes to D instead of P) at runtime, and at the same time the bar --tp-prefill-max-tokens of D; 0 = off (D and front keep the start X)")
     if xc_old is not None:
-        rec.add("--x-ceiling-tokens", group="-", old=xc_old, new=xc_old, state=R.VORGESCHLAGEN,
-                herkunft="from profile %s (unchanged; a scalar of the form, no card measurement)" % bname, grund=xc_expl, policy="knob")
+        rec.add("--x-ceiling-tokens", group="-", old=xc_old, new=xc_old, state=R.PROPOSED,
+                source="from profile %s (unchanged; a scalar of the form, no card measurement)" % bname, reason=xc_expl, policy="knob")
     else:
-        rec.add("--x-ceiling-tokens", group="-", old=None, new=None, state=R.VORGESCHLAGEN,
-                herkunft="not in profile %s: launcher default 0 (off)" % bname, grund=xc_expl, in_argv=False, policy="knob")
+        rec.add("--x-ceiling-tokens", group="-", old=None, new=None, state=R.PROPOSED,
+                source="not in profile %s: launcher default 0 (off)" % bname, reason=xc_expl, in_argv=False, policy="knob")
 
     # --- the Dual form (AP-E): what is specific to P and D awake together on the same cards -------------------------------------
     dual = None
@@ -939,14 +939,14 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", ziele: 
         "cards": [{"ordinal": c["ordinal"], "nvml_index": c.get("nvml_index"), "uuid": c.get("uuid"), "name": c.get("name"),
                    "class": c["class"], "arch": c["arch"], "total_mib": c["total_mib"], "tflops": rate[i], "tflops_src": rate_src[i]}
                   for i, c in enumerate(cards)],
-        "inventory": {"live": list(live_cls), "profil": list(binv) if binv else None, "gleich_wie_profil": bool(same_inv)},
+        "inventory": {"live": list(live_cls), "profil": list(binv) if binv else None, "same_as_profile": bool(same_inv)},
         "argv": list(la.t), "env": dict(la.env), "basis": b["name"],
-        "werte": rec.values,
+        "values": rec.values,
         "seeds": {"p_cut": {"layers": layers, "attn": attn, "basis": rate_basis, "gesetzt": bool(apply_cut), "caps": sb["caps"]},
                   "fr_p": frp, "draft": dp, "form_a": fa, "dense_d_shares": results.get("dense_d_shares")},
         "fit": {"level": fv.level, "first": fv.first, "margin_mib": fv.margin_mib, "lines": list(fv.lines),
                 "marks": sorted(set(fv.marks + verdict.marks))},
-        "ziele": {"seats": seats, "kv_tokens": kv_tokens, "kv_dtype": kv_dtype, "p_cut": pin_mode}, "dual": dual,
-        "unbelegt": rec.unbelegt, "hinweise": rec.hinweise, "blocker": rec.blocker,
-        "vektorlaengen": lens, "vektoren_ok": not bad, "vektoren_falsch": bad,
+        "goals": {"seats": seats, "kv_tokens": kv_tokens, "kv_dtype": kv_dtype, "p_cut": pin_mode}, "dual": dual,
+        "unverified": rec.unverified, "notes": rec.notes, "blocker": rec.blocker,
+        "vector_lengths": lens, "vectors_ok": not bad, "vectors_wrong": bad,
     }

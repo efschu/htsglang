@@ -2687,10 +2687,10 @@ def _expert_layer_for_name(name: str, model):
     Praefix VOR ``.experts.``, damit die Namensform an genau einer Stelle
     steht und nicht als zweite Regel neben dem Loader lebt.
     """
-    marke = ".experts."
-    if marke not in name:
+    mark_label = ".experts."
+    if mark_label not in name:
         return None
-    name_prefix = name.split(marke, 1)[0] + ".experts"
+    name_prefix = name.split(mark_label, 1)[0] + ".experts"
     for candidate in (
         name_prefix.replace("model.language_model.", "model."),
         name_prefix,
@@ -2900,7 +2900,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         Deshalb WIRFT dieser Pfad, statt still zu laden: ein Schalter, der ein
         Modell falsch laedt, muss laut sein. Wer ihn wieder einschaltet,
-        braucht zuerst (1) ein Praedikat, das exakt die Tensoren trifft, die
+        requires zuerst (1) ein Praedikat, das exakt die Tensoren trifft, die
         der Verbraucher transponiert, und (2) einen Pool, der die Keys EINER
         Datei aufteilt -- dann greifen die gemessenen 1,55-1,96x, ohne den
         Verbraucher zu blockieren (#68).

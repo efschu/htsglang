@@ -4,7 +4,7 @@ What this file pins (all CPU, no GPU, no NVML):
 
 1. the CATALOG / SEED_CARDS know the cards of the release example configurations
    (RTX 3070 8 GiB, RTX 5070 12 GiB, RTX 5070 Ti 16 GiB) and say which figures no
-   card ever backed ("HW-BORROWED/unbelegt"); the sm89 cards say "am Metall nie
+   card ever backed ("HW-BORROWED/unverified"); the sm89 cards say "am Metall nie
    gemessen";
 2. the model profiles of ``fit_profiles_data/`` are DERIVED from the
    ``config.json`` fixtures by ``hw_fit.derive_profile`` (not typed in) and
@@ -83,7 +83,7 @@ class CatalogEvidence(unittest.TestCase):
             c = HS.CATALOG[key]
             self.assertEqual((c.total_mib, c.sm), (total, sm), key)
             self.assertTrue(c.borrowed, key)
-            self.assertTrue(c.evidence.startswith("HW-BORROWED/unbelegt"), c.evidence)
+            self.assertTrue(c.evidence.startswith("HW-BORROWED/unverified"), c.evidence)
 
     def test_rig_cards_are_metal_and_sm89_says_never_measured(self):
         self.assertEqual(HS.CATALOG["5090"].evidence, HS.EV_METAL)
@@ -97,7 +97,7 @@ class CatalogEvidence(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             self.assertEqual(HS.main(["--catalog"]), 0)
         out = buf.getvalue()
-        self.assertIn("[HW-BORROWED/unbelegt", out)
+        self.assertIn("[HW-BORROWED/unverified", out)
         self.assertRegex(out, r"4090 .*\[NVML-RECORDING; sm89 am Metall nie gemessen\]")
 
     def test_seed_cards_carry_the_three_cards_as_borrowed(self):
@@ -179,7 +179,7 @@ class FitBound(unittest.TestCase):
         self.assertEqual(floor.level, HF.NEIN)
         self.assertIn("D host", floor.first)
         self.assertIn("17671", floor.first)
-        self.assertEqual(level(17700).level, HF.KNAPP)        # floor holds, 19805 with mamba does not
+        self.assertEqual(level(17700).level, HF.TIGHT)        # floor holds, 19805 with mamba does not
         self.assertEqual(level(19900).level, HF.JA)
 
     def test_27b_int8_fits_5090_plus_3080_but_not_3080_plus_3080(self):
@@ -202,7 +202,7 @@ class FitBound(unittest.TestCase):
         cards = [HF.FitCard(total_mib=12000, arch="sm86", cls="", label="a"),
                  HF.FitCard(total_mib=12000, arch="sm120", cls="", label="b")]
         v = HF.evaluate(p, cards, asm=HF.Assumptions(kv_tokens=1024))
-        self.assertIn(v.level, (HF.JA, HF.KNAPP))
+        self.assertIn(v.level, (HF.JA, HF.TIGHT))
         self.assertTrue(any("no record" in m for m in v.marks), v.marks)
         self.assertTrue(any("HW-BORROWED" in m for m in v.marks), v.marks)      # residue borrowed by arch
         tiny = HF.evaluate(p, [HF.FitCard(total_mib=4000, arch="sm86", cls="", label="a")] * 2,

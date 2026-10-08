@@ -85,7 +85,7 @@ PERSIST_LABELS = {
     "vorhanden": "saved, matches the cards",
     "abweichend": "saved, DEVIATES from the cards (file unchanged; Capture again replaces it)",
     "nur_gespeichert": "NVML reports nothing: the saved profile applies",
-    "keine_karten": "no card reported, nothing saved",
+    "no_cards": "no card reported, nothing saved",
     "nicht_schreibbar": "Saving failed",
 }
 
@@ -102,8 +102,8 @@ def default_persist_path(env: Optional[dict] = None) -> str:
 
 
 def datasheet_provider(mod) -> Callable[[dict], dict]:
-    """Datenblatt-Suche für ``hardware_profile.build``: SM-Zahl aus ``pdflip/hw_sim.py`` (über das Profilmodul), Nennbandbreite und
-    Katalogkarte aus ``kartenplan_catalog``.  Beide gelten als "Datenblatt"; ein Gemessenes steht im Profil davor."""
+    """Datasheet-Suche für ``hardware_profile.build``: SM-Zahl aus ``pdflip/hw_sim.py`` (über das Profilmodul), Nennbandbreite und
+    Katalogkarte aus ``kartenplan_catalog``.  Beide gelten als "Datasheet"; ein Gemessenes steht im Profil davor."""
     sm = getattr(mod, "hw_sim_datasheet", None)
 
     def provider(row: dict) -> dict:
@@ -117,7 +117,7 @@ def datasheet_provider(mod) -> Callable[[dict], dict]:
 
 
 # ---------------------------------------------------------------------------------------------------------- Issue-Text
-_SRC_SHORT = {"gemessen": "meas.", "NVML": "NVML", "Datenblatt": "datasheet", "geschätzt": "est.", "nicht gemessen": "not measured"}
+_SRC_SHORT = {"gemessen": "meas.", "NVML": "NVML", "Datasheet": "datasheet", "geschätzt": "est.", "nicht gemessen": "not measured"}
 
 
 def _md(x) -> str:
@@ -186,7 +186,7 @@ def version_facts(doc: dict, versions: Optional[dict] = None, environ: Optional[
     ``tree_rev``; einem gestagten Baumpfad ``.../releases/<sha>/python``; ``git rev-parse HEAD`` des Baums (Release-Image: ``/opt/htsglang/src``);
     der Image-ENV ``HTSGLANG_REVISION`` (bzw. ``_27B`` / ``_NF`` je ``STAND``, Soll-Revision des Entrypoints); ``FLLIPER_BUILD_COMMIT``.  Die Herkunft
     steht in ``tree_rev_src``.  Die Build-Defaults ``FLLIPER_BUILD_COMMIT=unknown`` und ``FLLIPER_IMAGE_TAG=local/flliper:dev`` (Dockerfile) sind
-    KEIN Beleg: Revision ``None`` bzw. ``image_default`` = True.  Was nicht belegt ist, ist ``None`` (die Texte schreiben dann "unbelegt"); nie geraten."""
+    KEIN Beleg: Revision ``None`` bzw. ``image_default`` = True.  Was nicht belegt ist, ist ``None`` (die Texte schreiben dann "unverified"); nie geraten."""
     versions = versions or {}
     env = os.environ if environ is None else environ
     rev, src = None, None
@@ -215,14 +215,14 @@ def version_facts(doc: dict, versions: Optional[dict] = None, environ: Optional[
 
 
 def version_image_text(vf: dict) -> str:
-    """Die Image-Zelle: der Tag mit Herkunft, der Dockerfile-Default als "unbelegt (Default)", ohne Angabe wie bisher."""
+    """Die Image-Zelle: der Tag mit Herkunft, der Dockerfile-Default als "unverified (Default)", ohne Angabe wie bisher."""
     if vf.get("image_default"):
         return "unverified (default %s, not set at build)" % vf["image"]
     return vf.get("image") or "unverified (FLLIPER_IMAGE_TAG not set)"
 
 
 def version_tree_text(vf: dict) -> str:
-    """Die Baum-Zelle: Revision mit Herkunft, sonst "unbelegt"."""
+    """Die Baum-Zelle: Revision mit Herkunft, sonst "unverified"."""
     if vf.get("tree_rev"):
         src = vf.get("tree_rev_src") or ""
         return "%s (%s)" % (vf["tree_rev"], src) if src.startswith(("git", "Image-ENV")) else vf["tree_rev"]     # Pfad/übergeben: der Wert spricht für sich
@@ -268,7 +268,7 @@ UUID_REDACTED = "<redacted>"
 def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[dict] = None, now: Optional[float] = None) -> str:
     """Der Issue-Text "Hardwareprofil" (GitHub-Markdown): NVML-Identität, Größen, cc, SM, Takt, Messraten (soweit vorhanden),
     Treiber/Image/Baum.  Geheimnisse und Hostpfade sind entfernt (``redact.text_for_issue``).  Ein Wert ohne Messung steht als
-    "not measured", ein Wert ohne bekannte Version als "unbelegt"."""
+    "not measured", ein Wert ohne bekannte Version als "unverified"."""
     versions = versions or {}
     cards = doc.get("cards") or []
     now = time.time() if now is None else now
@@ -419,7 +419,7 @@ def _window_view(b: Optional[dict]) -> Optional[dict]:
     }
 
 
-class HwProfil:
+class HwProfile:
     def __init__(self, *, gpuq: str = "http://127.0.0.1:8770", tree: Optional[str] = None, measure_tree: Optional[str] = None,
                  python: Optional[str] = None, prefix: Sequence[str] = (), cache_dir: Optional[str] = None,
                  state_dir: Optional[str] = None, http: Optional[Callable] = None, runner: Optional[Callable] = None,
@@ -549,7 +549,7 @@ class HwProfil:
 
     # ------------------------------------------------------------------ Speichern (AP-A)
     def _build(self, mod) -> dict:
-        """Das lebende Profil; die Datenblatt-Suche nur an ein Modul, dessen ``build`` sie kennt (ein älterer Baum nicht)."""
+        """Das lebende Profil; die Datasheet-Suche nur an ein Modul, dessen ``build`` sie kennt (ein älterer Baum nicht)."""
         kw: Dict[str, Any] = {"cache_dir": self.cache_dir}
         try:
             if "datasheet" in inspect.signature(mod.build).parameters:

@@ -176,10 +176,10 @@ def _measured_library(only=("RTX 5090", "RTX 3080 20GB")):
     return lib
 
 
-def _propose(model: str, inv: str, form: str = "flip", **ziele):
+def _propose(model: str, inv: str, form: str = "flip", **goals):
     hw, _ = _inventory(inv)
     model_spec, draft = _MODELS[model]
-    return P.propose(hw, model_spec, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES, library=_seed_library())
+    return P.propose(hw, model_spec, form, goals, basis=_profile(model), draft=draft, rates=MEASURED_RATES, library=_seed_library())
 
 
 def _dry(model: str, v: dict, rows, *, force: bool = True):
@@ -353,7 +353,7 @@ class TestInputs(unittest.TestCase):
         self.assertEqual(v["seeds"]["p_cut"]["basis"], "measured: GEMM rate per card")
         w = _propose("27b", "n4_3090")
         self.assertTrue(all(c["tflops_src"].startswith("datasheet/unverified") for c in w["cards"]), w["cards"])
-        self.assertTrue(any("GEMM rates: datasheet/unverified" in u for u in w["unbelegt"]), w["unbelegt"])
+        self.assertTrue(any("GEMM rates: datasheet/unverified" in u for u in w["unverified"]), w["unverified"])
         # one measured card among datasheet cards: the measured achieved rate and a datasheet PEAK are not comparable ->
         # ALL cards on the datasheet basis
         m = _propose("27b", "n2_5090_3090")
@@ -367,7 +367,7 @@ class TestInputs(unittest.TestCase):
         self.assertEqual([c["tflops"] for c in v["cards"]], [203.42, 50.97, 50.97])
         self.assertTrue(all(c["tflops_src"] == "measured (card_library)" for c in v["cards"]), v["cards"])
         self.assertEqual(v["seeds"]["p_cut"]["basis"], "measured: GEMM rate per card")
-        self.assertFalse(any("GEMM rates" in u for u in v["unbelegt"]), v["unbelegt"])
+        self.assertFalse(any("GEMM rates" in u for u in v["unverified"]), v["unverified"])
         # the measured ratio is not the datasheet ratio (419/119): the cut seed follows the measurement
         d = P.propose(hw, model_spec, "flip", {}, basis=_profile("27b"), draft=draft, library=_seed_library())
         self.assertEqual([c["tflops"] for c in d["cards"]], [419.0, 119.0, 119.0])
@@ -416,14 +416,14 @@ class TestInputs(unittest.TestCase):
         back = json.loads(json.dumps(v))
         self.assertEqual(back["argv"], v["argv"])
         self.assertEqual(back["schema"], P.SCHEMA)
-        for w in v["werte"]:                                             # every value says where it comes from
-            self.assertIn(w["zustand"], (R.VORGESCHLAGEN, R.UNBELEGT), w)
-            self.assertTrue(w["herkunft"] and w["grund"], w)
+        for w in v["values"]:                                             # every value says where it comes from
+            self.assertIn(w["state"], (R.PROPOSED, R.UNVERIFIED), w)
+            self.assertTrue(w["source"] and w["reason"], w)
 
     def test_forms_that_are_other_packages_and_bad_input_raise(self):
         hw, _ = _inventory("n2")
         model_spec, draft = _MODELS["27b"]
-        for form in ("single", "einzel"):                             # dual is AP-E now (test_planer_ape_dual_1006)
+        for form in ("single", "single"):                             # dual is AP-E now (test_planer_ape_dual_1006)
             with self.assertRaises(P.ProposeError) as cm:
                 P.propose(hw, model_spec, form, {})
             self.assertIn("AP-", str(cm.exception))
@@ -447,8 +447,8 @@ class TestVectorLengths(unittest.TestCase):
                     v = _propose(model, inv, form, **({"force_rules": True} if inv == "ref3" else {}))
                     n = v["n"]
                     self.assertEqual(n, len(_inventory(inv)[0]))
-                    self.assertTrue(v["vektoren_ok"], (model, form, inv, v["vektoren_falsch"]))
-                    self.assertEqual({k: c for k, c in v["vektorlaengen"].items() if c != n}, {}, (model, form, inv))
+                    self.assertTrue(v["vectors_ok"], (model, form, inv, v["vectors_wrong"]))
+                    self.assertEqual({k: c for k, c in v["vector_lengths"].items() if c != n}, {}, (model, form, inv))
                     # the launcher's own reading of the parsed argv agrees
                     ns = _ns(v["argv"])
                     bad = {k: c for k, c in launcher.positional_vector_lengths(ns).items() if c != n}
@@ -458,28 +458,28 @@ class TestVectorLengths(unittest.TestCase):
     def test_a_vector_that_cannot_be_derived_is_dropped_and_named_not_invented(self):
         v = _propose("27b", "n4_3090")
         # the 27B user reserve of 3 cards: for the 4 foreign cards the maximum of the arch twin (3080), BORROWED -> unbelegt
-        w = {x["key"]: x for x in v["werte"]}
+        w = {x["key"]: x for x in v["values"]}
         ur = w["--user-reserve-mib"]
-        self.assertEqual(ur["wert"], "1400,1400,1400,1400")
-        self.assertEqual(ur["zustand"], "unbelegt")
-        self.assertIn("borrowed: RTX3080 (unverified)", ur["herkunft"])
+        self.assertEqual(ur["value"], "1400,1400,1400,1400")
+        self.assertEqual(ur["state"], "unverified")
+        self.assertIn("borrowed: RTX3080 (unverified)", ur["source"])
         n = _propose("nf", "n4_3090")
         for k in ("--d-foreign-context-mib", "--d-nontorch-mib"):
-            self.assertEqual(len(R.parse_csv({x["key"]: x for x in n["werte"]}[k]["wert"])), 4)
+            self.assertEqual(len(R.parse_csv({x["key"]: x for x in n["values"]}[k]["value"])), 4)
 
     def test_the_wake_credit_reference_logs_of_another_inventory_are_dropped(self):
         ref = _propose("nf", "ref3")
         self.assertIn("--wake-credit-reference-logs", ref["argv"])          # the profile's own inventory: kept
         n2 = _propose("nf", "n2")
         self.assertNotIn("--wake-credit-reference-logs", n2["argv"])
-        w = {x["key"]: x for x in n2["werte"]}["--wake-credit-reference-logs"]
-        self.assertEqual((w["zustand"], w["in_argv"]), ("unbelegt", False))
+        w = {x["key"]: x for x in n2["values"]}["--wake-credit-reference-logs"]
+        self.assertEqual((w["state"], w["in_argv"]), ("unverified", False))
 
     def test_a_moe_without_a_profile_gets_the_form_a_tokens_and_the_p_fractions(self):
         hw, _ = _inventory("n4_mixed")
         model_spec, draft = _MODELS["nf"]
         v = P.propose(hw, model_spec, "flip", {}, draft=draft, rates=MEASURED_RATES)           # no basis profile
-        self.assertTrue(v["vektoren_ok"], v["vektoren_falsch"])
+        self.assertTrue(v["vectors_ok"], v["vectors_wrong"])
         la = P.LaunchArgv(v["argv"], v["env"])
         self.assertEqual(la.extra_get("d", "--rank-role"), "host,worker,worker,worker")
         self.assertEqual(la.extra_get("d", "--rank-tp-ratio"), "1,0,0,0")
@@ -497,15 +497,15 @@ class TestReferenceDiff0(unittest.TestCase):
         for key in ("27b", "nf"):
             li = _profile(key)
             v = _propose(key, "ref3")
-            self.assertTrue(v["inventory"]["gleich_wie_profil"], key)
+            self.assertTrue(v["inventory"]["same_as_profile"], key)
             self.assertEqual(v["argv"], list(li.argv), key)                # byte-equal argv (nothing re-serialised)
             self.assertEqual(v["env"], dict(li.env), key)
-            self.assertTrue(v["vektoren_ok"])
+            self.assertTrue(v["vectors_ok"])
             self.assertEqual(v["blocker"], [])
-            for w in v["werte"]:
+            for w in v["values"]:
                 if w["policy"] in ("class", "cut", "cut_attn", "fr_p", "fr_d", "moe_ratio", "role", "tp_ratio", "lru", "scratch"):
-                    self.assertFalse(w["geaendert"], w["key"])
-                    self.assertTrue(w["herkunft"].startswith("Profile "), w)
+                    self.assertFalse(w["changed"], w["key"])
+                    self.assertTrue(w["source"].startswith("Profile "), w)
 
     @_ON_27B_LINE
     @_NEEDS_BOX
@@ -547,16 +547,16 @@ class TestReferenceDiff0(unittest.TestCase):
         profile agree the value is the profile's; where they do not, THAT is the finding (the profile value is measured or an
         operator pin, the rule value a Planer-Rechnung): the test pins the known differences so a rule change shows."""
         v = _propose("27b", "ref3", force_rules=True)
-        w = {x["key"]: x for x in v["werte"]}
-        self.assertEqual(w["--user-reserve-mib"]["wert"], "1800,1400,1400")          # class max of the 3080 pair == the profile
-        self.assertFalse(v["inventory"]["gleich_wie_profil"])
+        w = {x["key"]: x for x in v["values"]}
+        self.assertEqual(w["--user-reserve-mib"]["value"], "1800,1400,1400")          # class max of the 3080 pair == the profile
+        self.assertFalse(v["inventory"]["same_as_profile"])
         n = _propose("nf", "ref3", force_rules=True)
-        w = {x["key"]: x for x in n["werte"]}
-        self.assertEqual(w["--d-foreign-context-mib"]["wert"], "1446,896,896")       # profile: 1446,896,894 (class MAX: 2 MiB more)
-        self.assertEqual(w["--d-nontorch-mib"]["wert"], "1981,528,528")              # profile: 1981,528,524
+        w = {x["key"]: x for x in n["values"]}
+        self.assertEqual(w["--d-foreign-context-mib"]["value"], "1446,896,896")       # profile: 1446,896,894 (class MAX: 2 MiB more)
+        self.assertEqual(w["--d-nontorch-mib"]["value"], "1981,528,528")              # profile: 1981,528,524
         # the P cut: the rule is the compute-proportional seed, the profile pins the maxkv cut 29,11,8 (the operator's choice)
-        self.assertEqual(w["--pp-stage-ratio"]["wert"], "32,8,8")
-        self.assertEqual(w["--pp-attn-stage-ratio"]["wert"], "8,2,2")
+        self.assertEqual(w["--pp-stage-ratio"]["value"], "32,8,8")
+        self.assertEqual(w["--pp-attn-stage-ratio"]["value"], "8,2,2")
         self.assertEqual(R.attn_counts((["gdn"] * 3 + ["attn"]) * 12, [32, 8, 8]), [8, 2, 2])
         # the Form A rule is NOT the profile's hand-tuned D layout: both are 3-vectors that sum to the same experts
         fa = n["seeds"]["form_a"]
@@ -567,7 +567,7 @@ class TestReferenceDiff0(unittest.TestCase):
         self.assertEqual(n["seeds"]["draft"]["placement"], "solo")                  # K3: the profile says solo, the rule agrees
         # every value the rules made is labelled: a Planer-Rechnung is "unbelegt", never a measurement
         for key in ("--extra-d --rank-moe-ratio", "--extra-d --rank-moe-resident-fraction", "--pp-cut-expert-device-fraction"):
-            self.assertEqual(w[key]["zustand"], "unbelegt", key)
+            self.assertEqual(w[key]["state"], "unverified", key)
 
 
 class TestSyntheticDryRun(unittest.TestCase):
@@ -580,12 +580,12 @@ class TestSyntheticDryRun(unittest.TestCase):
             out.update(re.findall(r"\[([A-Z][A-Z0-9-]+)\]", f["text"]))
         return out
 
-    def _check(self, model, inv, form="flip", *, refused=None, **ziele):
+    def _check(self, model, inv, form="flip", *, refused=None, **goals):
         hw, rows = _inventory(inv)
         model_spec, draft = _MODELS[model]
-        v = P.propose(hw, model_spec, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES)
+        v = P.propose(hw, model_spec, form, goals, basis=_profile(model), draft=draft, rates=MEASURED_RATES)
         n = len(rows)
-        self.assertTrue(v["vektoren_ok"], v["vektoren_falsch"])
+        self.assertTrue(v["vectors_ok"], v["vectors_wrong"])
         run = _dry(model, v, rows)
         res = run.result
         # the rest blockers of the HW gate hold NO vector blocker (PROFILE-VECTORS): that is what the proposal is for
@@ -662,7 +662,7 @@ class TestSyntheticDryRun(unittest.TestCase):
             self.assertEqual(v["n"], 4)
             self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= {f["code"] for f in run.result.forced} <= _FORCED_OK)
             # every value the planner derived for these cards is labelled unbelegt
-            self.assertTrue(v["unbelegt"])
+            self.assertTrue(v["unverified"])
             self.assertTrue(all(c["tflops_src"].startswith("datasheet/unverified") for c in v["cards"]))
 
     @_NEEDS_BOX
@@ -712,8 +712,8 @@ class TestSeats(unittest.TestCase):
         # the cut and the expert ownership stay the profile's
         self.assertEqual(la.get_flag("--pp-stage-ratio"), lb.get_flag("--pp-stage-ratio"))
         self.assertEqual(la.extra_get("d", "--rank-moe-ratio"), lb.extra_get("d", "--rank-moe-ratio"))
-        self.assertTrue(v["vektoren_ok"])
-        self.assertEqual(v["ziele"]["seats"], 12)
+        self.assertTrue(v["vectors_ok"])
+        self.assertEqual(v["goals"]["seats"], 12)
 
     def test_seats_derive_fr_p_and_fr_d_from_the_mamba_slots(self):
         """K4 MoE: more seats = more Mamba slots = less VRAM for resident experts: FR_P / FR_D fall, monotonically, and the
@@ -736,11 +736,11 @@ class TestSeats(unittest.TestCase):
                 self.assertTrue(all(a <= b for a, b in zip(fp_, prev_p)), (fp_, prev_p))
                 self.assertTrue(all(a <= b for a, b in zip(fd_, prev_d)), (fd_, prev_d))
             prev_p, prev_d = fp_, fd_
-            w = {x["key"]: x for x in v["werte"]}
+            w = {x["key"]: x for x in v["values"]}
             for key in ("--pp-cut-expert-device-fraction", "--extra-d --rank-moe-resident-fraction"):
-                self.assertEqual(w[key]["zustand"], R.UNBELEGT, key)
-                self.assertIn("Seats at the same time %d" % seats, w[key]["herkunft"] + w[key]["grund"])
-            self.assertTrue(v["vektoren_ok"])
+                self.assertEqual(w[key]["state"], R.UNVERIFIED, key)
+                self.assertIn("Seats at the same time %d" % seats, w[key]["source"] + w[key]["reason"])
+            self.assertTrue(v["vectors_ok"])
 
     def test_seats_goal_graph_ladder_follows_the_goal(self):
         v = _propose("nf", "ref3", seats=12)
@@ -768,34 +768,34 @@ class TestSeats(unittest.TestCase):
             la = P.LaunchArgv(v["argv"], v["env"])
             self.assertEqual(la.get_flag("--d-bs"), str(seats), seats)
             self.assertEqual(la.get_flag("--p-bs"), "1")                  # P keeps its own seat count
-            self.assertEqual(v["ziele"]["seats"], seats)
-            w = {x["key"]: x for x in v["werte"]}
-            self.assertIn("%d seats (Launcher-Default" % DEFAULT_D_BS, w["--d-bs"]["grund"])
-            self.assertNotIn("(1 seats)", w["--d-bs"]["grund"])
-            self.assertTrue(v["vektoren_ok"])
+            self.assertEqual(v["goals"]["seats"], seats)
+            w = {x["key"]: x for x in v["values"]}
+            self.assertIn("%d seats (Launcher-Default" % DEFAULT_D_BS, w["--d-bs"]["reason"])
+            self.assertNotIn("(1 seats)", w["--d-bs"]["reason"])
+            self.assertTrue(v["vectors_ok"])
         v6 = _propose("27b", "ref3", seats=DEFAULT_D_BS)
         self.assertEqual(v6["argv"], list(_profile("27b").argv))          # goal == what D runs: nothing moves
         v0 = _propose("27b", "ref3")
-        self.assertEqual(v0["ziele"]["seats"], DEFAULT_D_BS)
+        self.assertEqual(v0["goals"]["seats"], DEFAULT_D_BS)
 
     def test_scratch_slots_scaled_from_one_measurement_are_unbelegt_with_the_same_inventory(self):
-        """A seat goal moves FLLIPER_MOE_SCRATCH_SLOTS by extrapolation from ONE measured point: unbelegt (also on the profile's own
-        inventory), listed in the unbelegt list; the unchanged value stays the profile's."""
+        """A seat goal moves FLLIPER_MOE_SCRATCH_SLOTS by extrapolation from ONE measured point: unverified (also on the profile's own
+        inventory), listed in the unverified list; the unchanged value stays the profile's."""
         v = _propose("nf", "ref3", seats=12)
-        w = {x["key"]: x for x in v["werte"]}
+        w = {x["key"]: x for x in v["values"]}
         for key in ("--env-d FLLIPER_MOE_SCRATCH_SLOTS", "--env-p FLLIPER_MOE_SCRATCH_SLOTS"):
             self.assertIn(key, w)
-            self.assertEqual(w[key]["zustand"], R.UNBELEGT, key)
-            self.assertTrue(any(u.startswith(key + ":") for u in v["unbelegt"]), (key, v["unbelegt"]))
-            self.assertIn("extrapolation", w[key]["herkunft"])
+            self.assertEqual(w[key]["state"], R.UNVERIFIED, key)
+            self.assertTrue(any(u.startswith(key + ":") for u in v["unverified"]), (key, v["unverified"]))
+            self.assertIn("extrapolation", w[key]["source"])
         b = _propose("nf", "ref3")
-        wb = {x["key"]: x for x in b["werte"]}
+        wb = {x["key"]: x for x in b["values"]}
         for key in ("--env-d FLLIPER_MOE_SCRATCH_SLOTS", "--env-p FLLIPER_MOE_SCRATCH_SLOTS"):
-            self.assertEqual(wb[key]["zustand"], R.VORGESCHLAGEN, key)
+            self.assertEqual(wb[key]["state"], R.PROPOSED, key)
 
     def test_without_a_seats_goal_nothing_seat_bound_moves(self):
         v = _propose("nf", "ref3")
-        self.assertEqual(v["ziele"]["seats"], 6)
+        self.assertEqual(v["goals"]["seats"], 6)
         self.assertEqual(v["argv"], list(_profile("nf").argv))
 
 
@@ -807,16 +807,16 @@ class TestOriginOfTransferredValues(unittest.TestCase):
     _GERMAN = ("ueberschreiten das Host-Budget", "fasst nicht", "passt nicht", "Laufzeitposten von Form A")      # a leak of the old German texts
 
     def _check(self, v):
-        for w in v["werte"]:
-            if not v["inventory"]["gleich_wie_profil"]:
-                if w["zustand"] == R.VORGESCHLAGEN:
-                    self.assertNotIn("same inventory", w["herkunft"], w)
-                    self.assertNotIn("applies to exactly these cards", w["grund"], w)
-                if w["herkunft"].startswith("taken from profile"):
-                    self.assertEqual(w["zustand"], R.UNBELEGT, w)
-                    self.assertIn("inventory here [", w["herkunft"], w)
-            self.assertIsNone(self._INTERNAL.search(w["herkunft"]), w["herkunft"])
-        for text in v["hinweise"] + v["blocker"] + v["unbelegt"]:
+        for w in v["values"]:
+            if not v["inventory"]["same_as_profile"]:
+                if w["state"] == R.PROPOSED:
+                    self.assertNotIn("same inventory", w["source"], w)
+                    self.assertNotIn("applies to exactly these cards", w["reason"], w)
+                if w["source"].startswith("taken from profile"):
+                    self.assertEqual(w["state"], R.UNVERIFIED, w)
+                    self.assertIn("inventory here [", w["source"], w)
+            self.assertIsNone(self._INTERNAL.search(w["source"]), w["source"])
+        for text in v["notes"] + v["blocker"] + v["unverified"]:
             self.assertIsNone(self._INTERNAL.search(text), text)
             for en in self._GERMAN:
                 self.assertNotIn(en, text)
@@ -827,38 +827,38 @@ class TestOriginOfTransferredValues(unittest.TestCase):
                 for form in ("flip", "tp"):
                     with self.subTest(model=model, inv=inv, form=form):
                         v = _propose(model, inv, form)
-                        self.assertFalse(v["inventory"]["gleich_wie_profil"])
+                        self.assertFalse(v["inventory"]["same_as_profile"])
                         self._check(v)
 
     def test_the_review_case_3x3090_nf_scratch_is_unbelegt_with_the_transfer_origin(self):
         v = _propose("nf", "n4_3090")
         v3 = P.propose([dict(r) for r in _inventory("n4_3090")[0][:3]], _MODELS["nf"][0], "flip", {}, basis=_profile("nf"),
                        draft=_MODELS["nf"][1], rates=MEASURED_RATES, library=_seed_library())
-        w = {x["key"]: x for x in v3["werte"]}["--env-d FLLIPER_MOE_SCRATCH_SLOTS"]
-        self.assertEqual(w["zustand"], R.UNBELEGT)
-        self.assertTrue(w["herkunft"].startswith("taken from profile nf-int4-h6-abl.env for ["), w["herkunft"])
-        self.assertIn("inventory here [RTX3090", w["herkunft"])
+        w = {x["key"]: x for x in v3["values"]}["--env-d FLLIPER_MOE_SCRATCH_SLOTS"]
+        self.assertEqual(w["state"], R.UNVERIFIED)
+        self.assertTrue(w["source"].startswith("taken from profile nf-int4-h6-abl.env for ["), w["source"])
+        self.assertIn("inventory here [RTX3090", w["source"])
         self._check(v3)
         self._check(v)
 
     def test_a_role_rekey_with_an_unchanged_seat_goal_is_not_called_a_seat_extrapolation(self):
         v = _propose("nf", "n2")
-        w = {x["key"]: x for x in v["werte"]}
+        w = {x["key"]: x for x in v["values"]}
         for key in ("--env-d FLLIPER_MOE_SCRATCH_SLOTS", "--env-p FLLIPER_MOE_SCRATCH_SLOTS"):
-            if w[key]["alt"] != w[key]["wert"]:
-                self.assertIn("re-keyed", w[key]["herkunft"], key)
-                self.assertNotIn("scaled linearly in the seats", w[key]["herkunft"], key)
-                self.assertNotIn("6 -> 6", w[key]["herkunft"], key)
+            if w[key]["alt"] != w[key]["value"]:
+                self.assertIn("re-keyed", w[key]["source"], key)
+                self.assertNotIn("scaled linearly in the seats", w[key]["source"], key)
+                self.assertNotIn("6 -> 6", w[key]["source"], key)
         v12 = _propose("nf", "n2", seats=12)
-        w12 = {x["key"]: x for x in v12["werte"]}["--env-d FLLIPER_MOE_SCRATCH_SLOTS"]
-        self.assertIn("scaled linearly in the seats (6 -> 12)", w12["herkunft"])
+        w12 = {x["key"]: x for x in v12["values"]}["--env-d FLLIPER_MOE_SCRATCH_SLOTS"]
+        self.assertIn("scaled linearly in the seats (6 -> 12)", w12["source"])
 
     def test_the_reference_inventory_keeps_the_profile_origin(self):
         v = _propose("nf", "ref3")
-        self.assertTrue(v["inventory"]["gleich_wie_profil"])
-        w = {x["key"]: x for x in v["werte"]}["--env-d FLLIPER_MOE_SCRATCH_SLOTS"]
-        self.assertEqual(w["zustand"], R.VORGESCHLAGEN)
-        self.assertIn("same inventory", w["herkunft"])
+        self.assertTrue(v["inventory"]["same_as_profile"])
+        w = {x["key"]: x for x in v["values"]}["--env-d FLLIPER_MOE_SCRATCH_SLOTS"]
+        self.assertEqual(w["state"], R.PROPOSED)
+        self.assertIn("same inventory", w["source"])
 
 
 class TestNonTopologyValuesStayAsTheProfileHasThem(unittest.TestCase):
@@ -893,28 +893,28 @@ class TestNonTopologyValuesStayAsTheProfileHasThem(unittest.TestCase):
                     for k in lens:
                         for bad in ("bar1", "reshard", "L15"):
                             self.assertNotIn(bad, k)
-                    self.assertTrue(v["vektoren_ok"], (lens, v.get("vektoren_falsch")))
+                    self.assertTrue(v["vectors_ok"], (lens, v.get("vectors_wrong")))
 
 
 class TestK4ScalarRegulators(unittest.TestCase):
     """Plan 1.2 K4: --pp-solve-pool-floor and --x-ceiling-tokens are carried with an origin line; the floor follows a moved KV goal."""
 
     def _vals(self, v):
-        return {x["key"]: x for x in v["werte"]}
+        return {x["key"]: x for x in v["values"]}
 
     def test_profile_scalars_are_listed_with_origin_and_explanation(self):
         v = _propose("nf", "ref3")
         w = self._vals(v)
-        self.assertEqual((w["--pp-solve-pool-floor"]["wert"], w["--x-ceiling-tokens"]["wert"]), ("0", "12288"))
+        self.assertEqual((w["--pp-solve-pool-floor"]["value"], w["--x-ceiling-tokens"]["value"]), ("0", "12288"))
         for key in ("--pp-solve-pool-floor", "--x-ceiling-tokens"):
-            self.assertTrue(w[key]["herkunft"].startswith("Profile") or w[key]["herkunft"].startswith("from profile"), w[key])
-            self.assertTrue(w[key]["grund"], key)
+            self.assertTrue(w[key]["source"].startswith("Profile") or w[key]["source"].startswith("from profile"), w[key])
+            self.assertTrue(w[key]["reason"], key)
         self.assertEqual(v["argv"], list(_profile("nf").argv))
         v27 = _propose("27b", "ref3")
         w27 = self._vals(v27)
-        self.assertIsNone(w27["--pp-solve-pool-floor"]["wert"])                 # 27B profile: no flag, launcher default
-        self.assertIn("launcher default", w27["--pp-solve-pool-floor"]["herkunft"])
-        self.assertEqual(w27["--x-ceiling-tokens"]["wert"], "12288")
+        self.assertIsNone(w27["--pp-solve-pool-floor"]["value"])                 # 27B profile: no flag, launcher default
+        self.assertIn("launcher default", w27["--pp-solve-pool-floor"]["source"])
+        self.assertEqual(w27["--x-ceiling-tokens"]["value"], "12288")
         self.assertEqual(v27["argv"], list(_profile("27b").argv))
 
     def test_a_positive_pool_floor_follows_the_kv_goal(self):
@@ -926,13 +926,13 @@ class TestK4ScalarRegulators(unittest.TestCase):
         hw, _ = _inventory("ref3")
         model_spec, draft = _MODELS["nf"]
         v0 = P.propose(hw, model_spec, "flip", {}, basis=basis, draft=draft, rates=MEASURED_RATES, library=_seed_library())
-        self.assertEqual(self._vals(v0)["--pp-solve-pool-floor"]["wert"], "262144")        # no goal: stays
+        self.assertEqual(self._vals(v0)["--pp-solve-pool-floor"]["value"], "262144")        # no goal: stays
         v1 = P.propose(hw, model_spec, "flip", {"kv_tokens": 131072}, basis=basis, draft=draft, rates=MEASURED_RATES,
                        library=_seed_library())
         w = self._vals(v1)["--pp-solve-pool-floor"]
-        self.assertEqual((w["alt"], w["wert"]), ("262144", "131072"))
+        self.assertEqual((w["alt"], w["value"]), ("262144", "131072"))
         self.assertEqual(P.LaunchArgv(v1["argv"], v1["env"]).get_flag("--pp-solve-pool-floor"), "131072")
-        self.assertIn("KV obligation", w["herkunft"])
+        self.assertIn("KV obligation", w["source"])
         v_off = _propose("nf", "ref3", kv_tokens=131072)                                   # floor 0 = OFF: never pulled
         self.assertEqual(P.LaunchArgv(v_off["argv"], v_off["env"]).get_flag("--pp-solve-pool-floor"), "0")
 
@@ -941,15 +941,15 @@ class TestKvObligation(unittest.TestCase):
     def test_the_kv_goal_sets_the_per_request_cap(self):
         v = _propose("27b", "n2", kv_tokens=131072)
         self.assertEqual(P.LaunchArgv(v["argv"], v["env"]).get_flag("--max-kv-per-request"), "131072")
-        w = {x["key"]: x for x in v["werte"]}["--max-kv-per-request"]
-        self.assertEqual((w["alt"], w["wert"], w["herkunft"]), ("262144", "131072", "Goal kv_tokens"))
+        w = {x["key"]: x for x in v["values"]}["--max-kv-per-request"]
+        self.assertEqual((w["alt"], w["value"], w["source"]), ("262144", "131072", "Goal kv_tokens"))
 
     def test_a_draft_that_does_not_fit_rank_0_is_a_blocker_for_form_a(self):
         v = _propose("nf", "n2_3070")                      # 2x RTX 3070 8 GB: neither dense + KV nor the draft fit one host card
         self.assertTrue(v["blocker"], v["fit"])
         self.assertEqual(v["seeds"]["draft"]["placement"], "split")
         self.assertTrue(any("solo" in b or "Form A" in b for b in v["blocker"]), v["blocker"])
-        self.assertTrue(v["vektoren_ok"])                  # a vector that cannot be derived is dropped, not mis-sized
+        self.assertTrue(v["vectors_ok"])                  # a vector that cannot be derived is dropped, not mis-sized
 
 
 if __name__ == "__main__":

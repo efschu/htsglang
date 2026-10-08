@@ -32,7 +32,7 @@ NODE = shutil.which("node") or ("/opt/node-v22.14.0-linux-x64/bin/node" if os.pa
 
 
 def reg_row(code, **kw):
-    r = {"code": code, "klass": "wert", "forcebar": True, "wired": False, "wired_entrypoint": False, "enforced_by": "launcher", "title": code + "-Titel"}
+    r = {"code": code, "klass": "value", "forcebar": True, "wired": False, "wired_entrypoint": False, "enforced_by": "launcher", "title": code + "-Titel"}
     r.update(kw)
     return r
 
@@ -50,12 +50,12 @@ class Verdict(unittest.TestCase):
         self.assertEqual(P.force_verdict(old)[1:], ("force", "entrypoint"))
 
     def test_hard_unwired_and_unchecked(self):
-        self.assertEqual(P.force_verdict(reg_row("HW-ARCH", klass="nicht_forcebar", forcebar=False))[1:], ("blockiert", None))
+        self.assertEqual(P.force_verdict(reg_row("HW-ARCH", klass="nicht_forcebar", forcebar=False))[1:], ("is_blocked", None))
         t, s, v = P.force_verdict(reg_row("PP-CUT"))
-        self.assertEqual((s, v), ("blockiert", None))
+        self.assertEqual((s, v), ("is_blocked", None))
         self.assertIn("wired neither in the launcher nor in the entrypoint", t)
         self.assertEqual(P.force_verdict(reg_row("X", enforced_by="planner-gate"))[1:], ("ungeprueft", None))
-        self.assertEqual(P.force_verdict({})[1:], ("blockiert", None))                                       # unbekannter Code
+        self.assertEqual(P.force_verdict({})[1:], ("is_blocked", None))                                       # unbekannter Code
 
 
 class WiredFromTheTree(unittest.TestCase):
@@ -220,7 +220,7 @@ class Route(Routes):
         self.assertEqual(json.loads(txt)["use"]["force"]["fall"], "kein_trockenlauf")
 
 
-class Katalog(unittest.TestCase):
+class Catalog(unittest.TestCase):
     def test_shipped_catalog_carries_the_edge_status_and_fields(self):
         cat = json.load(open(os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json"), encoding="utf-8"))
         k = cat["kanten"]
@@ -229,11 +229,11 @@ class Katalog(unittest.TestCase):
         # (neu 8 -> 10, alle 61 belegt); die 24 "ohne Beleg" sind kuratierte Kantenwünsche, unverändert
         # "ohne Beleg" = kuratierte Kanten ohne Katalogkante: 24 im Kern der 27B-Linie; der NF-eigene kuratierte Eintrag --pdflip-xchg-census-map (nur NF-Baum) traegt
         # eine weitere (braucht --pdflip-xchg-census), ist der Katalog aus dem NF-Kern gebaut (Neubau NF-Linie 07.10.), sind es 25
-        nf_census_map = cat["entries"].get("--pdflip-xchg-census-map", {}).get("status") == "kuratiert"
-        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"], k["kanten_ohne_beleg"]), (131, 51, 80, 25 if nf_census_map else 24))
+        nf_census_map = cat["entries"].get("--pdflip-xchg-census-map", {}).get("status") == "curated"
+        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"], k["edges_without_evidence"]), (131, 51, 80, 25 if nf_census_map else 24))
         deps = [d for e in cat["entries"].values() for d in e["depends"]]
         self.assertTrue(all("belegt" in d and "to_kind" in d for d in deps))
-        self.assertTrue(any(d["to_kind"] == "ablehnung" for d in deps))
+        self.assertTrue(any(d["to_kind"] == "refusal" for d in deps))
 
 
 # ---------------------------------------------------------------------------------------------------------- node: Chips und Export-Anzeige
@@ -252,9 +252,9 @@ global.localStorage = { getItem() { return null; }, setItem() {} };
 global.CSS = { escape: (s) => s };
 const posted = {};
 const row = (name, deps) => ({ key: "flag:" + name, name, scope: "launcher", value: "1", bare: false, origin: "profil", origin_label: "Profile", changed: false,
-  profile_value: "1", planner_value: null, explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Erklaerung " + name, source: "c.py" }], depends: deps,
+  profile_value: "1", planner_value: null, explain: { status: "curated", parts: [{ kind: "curated", text: "Erklaerung " + name, source: "c.py" }], depends: deps,
   gain: "", cost: "", group: "", level: "einfach", planner_derived: false, source: null, default: null, choices: null } });
-const VIEW = { rows: [row("--a", CASE.deps)], planner_only: [], removed: [], coverage: { rows: 1, erklaert: 1, kuratiert: 1, geerntet: 0, profil_kommentar: 0, unerklaert: 0, geaendert: 0 } };
+const VIEW = { rows: [row("--a", CASE.deps)], planner_only: [], removed: [], coverage: { rows: 1, explained: 1, curated: 1, harvested: 0, profil_kommentar: 0, unexplained: 0, changed: 0 } };
 const DOC = { name: "p", line: "27b", args: [], meta: {}, vars: [] };
 global.fetch = async (url, opt) => {
   const p = String(url).replace(/^api\/profil\//, "");
@@ -301,15 +301,15 @@ def run_js(case):
 
 
 DEPS = [
-    {"to": "--b", "rel": "braucht", "effect": "kuratierter Satz", "calc": "S4", "present": True, "belegt": True, "quelle": "katalog+kuratiert", "kante": "K01",
-     "beleg": {"datei": "python/flliper/srt/pdflip/launcher.py", "zeile": 8617, "anker": "must be given together"}, "satz": "Tradeoff-Satz K01", "wert": None, "to_kind": "flag"},
-    {"to": "--c", "rel": "tauscht", "effect": "nur kuratiert", "calc": "text", "present": False, "belegt": False, "quelle": "kuratiert", "beleg": None, "satz": "", "kante": "",
-     "wert": None, "to_kind": "flag"},
-    {"to": "HW-COUNT", "rel": "braucht", "effect": "Satz zur Ablehnung", "calc": "text", "present": None, "belegt": True, "kante": "K51", "satz": "Satz zur Ablehnung",
-     "beleg": {"datei": "entrypoint.sh", "zeile": 475, "anker": "HW-COUNT"}, "wert": None, "to_kind": "ablehnung"},
-    {"to": "--d", "rel": "abgeleitet_von", "effect": "bedingt", "calc": "text", "present": True, "belegt": True, "kante": "K08", "satz": "bedingter Satz",
-     "beleg": {"datei": "launcher.py", "zeile": 1, "anker": "a"}, "wert": "auto", "to_kind": "flag", "rel_katalog": "skaliert_mit"},
-    {"to": "PROFILE_NIX", "rel": "braucht", "effect": "x", "calc": "text", "present": False, "belegt": True, "kante": "K99", "satz": "x", "beleg": None, "wert": None, "to_kind": "unbekannt"},
+    {"to": "--b", "rel": "requires", "effect": "kuratierter Satz", "calc": "S4", "present": True, "belegt": True, "quelle": "catalog+curated", "edge": "K01",
+     "evidence": {"file": "python/flliper/srt/pdflip/launcher.py", "zeile": 8617, "anchor": "must be given together"}, "satz": "Tradeoff-Satz K01", "value": None, "to_kind": "flag"},
+    {"to": "--c", "rel": "trades", "effect": "nur curated", "calc": "text", "present": False, "belegt": False, "quelle": "curated", "evidence": None, "satz": "", "edge": "",
+     "value": None, "to_kind": "flag"},
+    {"to": "HW-COUNT", "rel": "requires", "effect": "Satz zur Ablehnung", "calc": "text", "present": None, "belegt": True, "edge": "K51", "satz": "Satz zur Ablehnung",
+     "evidence": {"file": "entrypoint.sh", "zeile": 475, "anchor": "HW-COUNT"}, "value": None, "to_kind": "refusal"},
+    {"to": "--d", "rel": "derived_from", "effect": "bedingt", "calc": "text", "present": True, "belegt": True, "edge": "K08", "satz": "bedingter Satz",
+     "evidence": {"file": "launcher.py", "zeile": 1, "anchor": "a"}, "value": "auto", "to_kind": "flag", "rel_catalog": "scales_with"},
+    {"to": "PROFILE_NIX", "rel": "requires", "effect": "x", "calc": "text", "present": False, "belegt": True, "edge": "K99", "satz": "x", "evidence": None, "value": None, "to_kind": "unbekannt"},
 ]
 REGISTER = [{"code": "HW-COUNT", "title": "Kartenzahl ist nicht die bewiesene", "force_scope": "im Docker-Start (Entrypoint) und im Launcher forcebar"}]
 
@@ -368,7 +368,7 @@ class ChipsJs(unittest.TestCase):
         self.assertIn("edge K01", h)
 
     def test_old_catalog_without_edge_fields_still_draws(self):
-        old = [{"to": "--b", "rel": "braucht", "effect": "alt", "calc": "text", "present": True}]
+        old = [{"to": "--b", "rel": "requires", "effect": "alt", "calc": "text", "present": True}]
         o = run_js({"deps": old, "register": []})
         self.assertEqual(o["unhandled"], [])
         self.assertIn("alt", o["chips"])

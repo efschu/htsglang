@@ -21,9 +21,9 @@
  "nextflash": {
   "budget_charges_driver_carve": true,
   "budget_lines": [
-   "budget D group=D ordinal=0 nvml_idx=1 NVIDIA GeForce RTX 5090: 28368 MiB = total 32607 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 1320 - served_dormant_growth 482 (WEG2-DORMANT-SERVED record) - driver_carve 518 (NVML reserved) - measured_awake_overshoot 489 (boot weg2ls4b1) MiB",
-   "budget D group=D ordinal=1 nvml_idx=0 NVIDIA GeForce RTX 3080: 17336 MiB = total 20480 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 712 - served_dormant_growth 572 (WEG2-DORMANT-SERVED record) - driver_carve 425 (NVML reserved) MiB",
-   "budget D group=D ordinal=2 nvml_idx=2 NVIDIA GeForce RTX 3080: 17544 MiB = total 20480 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 696 - served_dormant_growth 384 (WEG2-DORMANT-SERVED record) - driver_carve 425 (NVML reserved) MiB"
+   "budget D group=D ordinal=0 nvml_idx=1 NVIDIA GeForce RTX 5090: 28368 MiB = total 32607 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 1320 - served_dormant_growth 482 (PDFLIP-DORMANT-SERVED record) - driver_carve 518 (NVML reserved) - measured_awake_overshoot 489 (boot weg2ls4b1) MiB",
+   "budget D group=D ordinal=1 nvml_idx=0 NVIDIA GeForce RTX 3080: 17336 MiB = total 20480 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 712 - served_dormant_growth 572 (PDFLIP-DORMANT-SERVED record) - driver_carve 425 (NVML reserved) MiB",
+   "budget D group=D ordinal=2 nvml_idx=2 NVIDIA GeForce RTX 3080: 17544 MiB = total 20480 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 696 - served_dormant_growth 384 (PDFLIP-DORMANT-SERVED record) - driver_carve 425 (NVML reserved) MiB"
   ],
   "budgets_d": [
    28368,
@@ -39,7 +39,7 @@
    "boot dkrnfh91bar1dauer09262249,dkrnfh91bar1dauer09262302,dkrnfh91bar1dauer09270007,dkrnfh91bar1dauer09270103,dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2arrwretadhmlefrwfpfopwhctsesrwtswbar1dauer09301740"
   ],
   "driver_carve_min_total_mib": 0,
-  "l15_posts": "ImportError: weg2.l15_plan not in this tree",
+  "l15_posts": "ImportError: pdflip.l15_plan not in this tree",
   "pp_cut_stage_model_auto": "absent"
  },
  "order_nvml": [
@@ -58,7 +58,7 @@
    230.0,
    230.0
   ],
-  "builtin rig limits (nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924))"
+  "builtin rig limits (nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (pdflip/power_limit.RIG_POWER_LIMIT_W_0924))"
  ],
  "p_stage_card_classes": [
   "RTX5090",
@@ -104,21 +104,21 @@
    ""
   ],
   "driver_carve_min_total_mib": 32000,
-  "l15_posts": "ImportError: weg2.l15_plan not in this tree",
+  "l15_posts": "ImportError: pdflip.l15_plan not in this tree",
   "pp_cut_stage_model_auto": "absent"
  },
  "xchg_dormant_for_card": [
   [
    2228,
-   "CONSTANT launcher.DC_MEASURED_D_5090_MIB = 2228 MiB, MEASURED on boot weg2ls1b2 (NVML per-process at group D's first sleep, NEXTN draft + TP decode graphs resident); boot stem logged no uuid-keyed WEG2-DC reading"
+   "CONSTANT launcher.DC_MEASURED_D_5090_MIB = 2228 MiB, MEASURED on boot weg2ls1b2 (NVML per-process at group D's first sleep, NEXTN draft + TP decode graphs resident); boot stem logged no uuid-keyed PDFLIP-DC reading"
   ],
   [
    1922,
-   "CONSTANT launcher.DC_MEASURED_D_3080_MIB = 1922 MiB, MEASURED on boot weg2ls1b2 (NVML per-process at group D's first sleep, NEXTN draft + TP decode graphs resident); boot stem logged no uuid-keyed WEG2-DC reading"
+   "CONSTANT launcher.DC_MEASURED_D_3080_MIB = 1922 MiB, MEASURED on boot weg2ls1b2 (NVML per-process at group D's first sleep, NEXTN draft + TP decode graphs resident); boot stem logged no uuid-keyed PDFLIP-DC reading"
   ],
   [
    1922,
-   "CONSTANT launcher.DC_MEASURED_D_3080_MIB = 1922 MiB, MEASURED on boot weg2ls1b2 (NVML per-process at group D's first sleep, NEXTN draft + TP decode graphs resident); boot stem logged no uuid-keyed WEG2-DC reading"
+   "CONSTANT launcher.DC_MEASURED_D_3080_MIB = 1922 MiB, MEASURED on boot weg2ls1b2 (NVML per-process at group D's first sleep, NEXTN draft + TP decode graphs resident); boot stem logged no uuid-keyed PDFLIP-DC reading"
   ]
  ]
 }

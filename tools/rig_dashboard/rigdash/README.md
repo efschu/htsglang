@@ -227,24 +227,24 @@ python3 $U check
 ```
 
 Rules: gains strictly per model — with `modell=beide` every gain carries `--modell`
-(otherwise the CLI refuses). Switch: `NAME=art:gruppe:an_wert:default`, `art` env|flag,
+(otherwise the CLI refuses). Switch: `NAME=art:gruppe:an_value:default`, `art` env|flag,
 `gruppe` P|D|beide|front|launcher (front/launcher: not in the group snapshot, rigdash
 reads the profile), `default` an|aus. 27B enters its rows itself.
 
 ## Features target/actual (user reprimand 29.09.: "bug fixes are not features")
 
 At the top the **product features** F1–F24 (`features.json` → `produkt`), below them the commits/fixes
-as **building blocks** (`features`, card at the top). Per product feature: `id, nr, titel, soll`
-(one measurable sentence), `ist.{27B,NF}` = `{status, wert, grund, beleg, belegt_am, quelle}`,
+as **building blocks** (`features`, card at the top). Per product feature: `id, nr, title, soll`
+(one measurable sentence), `ist.{27B,NF}` = `{status, value, reason, evidence, belegt_am, quelle}`,
 `bausteine` (ids from `features`), optional `kreuztabelle` (F2), `untertabelle` (F12 formats,
 F23 prompt lengths), `matrix` (F24 form × bs × depth × text), `marker` (instrument per format).
 
-* **Actual only with evidence**, otherwise `unbelegt`. Each seat writes only its column: NF the NF cells,
+* **Actual only with evidence**, otherwise `unverified`. Each seat writes only its column: NF the NF cells,
   the 27B seat the 27B cells (`import-27b` reads `features_27b_ist_0929.md`, source per row).
 * **last verified** (`belegt_am`, ISO): if the evidence is older than the start of the last boot
   of this model, the dashboard shows the cell yellow "Actual outdated, measure again" (27B/user
   29.09.: new findings do not fall behind). `produkt-ist` without `--belegt-am` = now.
-* **Matrix cells** are only measurements (`wert` or `ungültig` = EOS below 500 tokens);
+* **Matrix cells** are only measurements (`value` or `ungültig` = EOS below 500 tokens);
   a missing cell is "unmeasured", never interpolated. Values without depth (agent load)
   are shown as the edge value `gemischt`.
 * **Value in the current boot** is calculated by rigdash itself (live.py/state.json/profile) and shows
@@ -349,23 +349,23 @@ against `MemoryMax=1G`: raise to 2G. The worker also calculates the topology ver
 
 ### Oracle and proposal (AP-D, plan profile planner 06.10.)
 
-Since AP-D the dry run (`POST /api/profil/dry`) asks the LAUNCHER itself: `profil_oracle.OracleService` holds a child process of its own
+Since AP-D the dry run (`POST /api/profil/dry`) asks the LAUNCHER itself: `profile_oracle.OracleService` holds a child process of its own
 (`kartenplan_build/oracle_worker.py`, Python of the flliper environment like `--couplings-python`) that runs `launcher.main(--dry-run)` on an NVML replay of the
 selected cards (`pdflip/propose_oracle`), first without and, on a refusal, once more with `--force`, and builds from it the document
-`flliper.verdikt/1` (`pdflip/propose_verdict`): per item a verdict `{code, forcebar (from refusals.by_code), force_state, grund, konsequenz}`, plus
+`flliper.verdict/1` (`pdflip/propose_verdict`): per item a verdict `{code, forcebar (from refusals.by_code), force_state, reason, consequence}`, plus
 `PROFILE-VECTORS`, `RECORDS-NVEC`, `METAL-UNPROVEN` (the blockers in the text of HW-COUNT), `FIT` (hw_fit), `HW-BORROWED`, `HW-UNCALIBRATED` and a crash of the
-launcher as `ORAKEL-ABSTURZ`. The return format of the dry run stays; new are `quelle` (`orakel` | `gate`), `orakel` (outcome, profile hash, cache) and
+launcher as `ORAKEL-ABSTURZ`. The return format of the dry run stays; new are `quelle` (`oracle` | `gate`), `oracle` (outcome, profile hash, cache) and
 `verdikte`. If the oracle cannot be asked (child process, Python, model paths), the partial check of the planner gate applies WITH a note. A run to the end takes
 16-18 s (measured 06.10.), hence the cache per (inventory, form, argv hash, state of the sources); live profiles drift: the profile hash (file and launch input)
 is in every verdict and in the key.
 
 `POST /api/profil/propose` ({basis: {kind, name}, form: flip|tp|dual|single, inventar: "rig" | [{card, pcie}], karte?, ziele?, model_path?, draft_path?}) calls
 `propose()` (AP-C) and returns the server profile `flliper.server/1` (base profile + the values of the proposal, origin `planer`) with origin, verdict and edges per
-value, the verdicts and the request for the bars (`what=phase_bars`, `form` flip|d_only|dual|single, contract `flliper.balken/1` of AP-H2). All four forms:
+value, the verdicts and the request for the bars (`what=phase_bars`, `form` flip|d_only|dual|single, contract `flliper.bar/1` of AP-H2). All four forms:
 `flip`, `tp` and `dual` ask the launcher dry run (oracle); dual (AP-E) additionally carries the dual fit as the verdict "Planner calculation, not hw_fit"
-(`DUAL-PASSUNG`, `DUAL-PFLICHT`). `single` (single card, AP-F; `einzel` is a name for it) has no launcher: exactly ONE card (`karte` = ordinal in the
+(`DUAL-PASSUNG`, `DUAL-PFLICHT`). `single` (single card, AP-F; `single` is a name for it) has no launcher: exactly ONE card (`karte` = ordinal in the
 hardware profile, default 0), a model path (`model_path` or the `PROFILE_MODEL` of the base profile; without a base profile it works too), the verdict is a
-planner calculation (`ausgang` passt | passt_nicht | unbelegt, `art` planner calculation, no force) plus ServerArgs parse, the server profile a new profile from the
+planner calculation (`outcome` passt | passt_nicht | unbelegt, `art` planner calculation, no force) plus ServerArgs parse, the server profile a new profile from the
 arguments of the normal server (`launch.argv` for `python -m flliper.launch_server`).
 The oracle child process imports the launcher: the planner tree of the unit must carry `pdflip/launcher.py`, `propose*.py`, `hw_fit.py` and `fit_profiles_data`
 (the full tree `python/flliper` of the revision, as with `stage_profil_modules.sh`).
@@ -429,7 +429,7 @@ derived from the estimated profile.  `GET /api/modellprofil/modelle` lists the m
   model root (`--model-root`, repeatable, or `RIGDASH_MODEL_ROOTS`; default `/spinning/llm_stuff/club-3090/models-cache`); relative
   paths, `..`, NUL and symlinks out of the root are rejected with 400.  Answers are remembered per path and file state (size, mtime).
 * **LAN only** (also in the edition `release`, since 05.10.): 403 via the proxy (the route reads files under the model roots).  Body at most 64 KiB.
-* `static/modellprofil.js` (`window.ModellProfil`): `liste()`, `schaetzen(path, opts)`, `zeilen(profil)` (rows `{gruppe, label, wert, roh, src, hinweis}`),
+* `static/modellprofil.js` (`window.ModellProfil`): `liste()`, `schaetzen(path, opts)`, `zeilen(profil)` (rows `{gruppe, label, value, roh, src, note}`),
   `tabelle(profil)` (HTML building block, escaped), `bytes(n)`.  The UI is built by order 930; this module draws nothing itself.
 
 ## Measure and display the hardware profile (order 950, profile editor S2; rig edition only, LAN only)
@@ -438,7 +438,7 @@ Routes and JSON, no UI (that is built by the profile editor, order 930; `static/
 
 * `GET /api/hwprofil` → `{profile, problems, window, job, gpuq, owner, window_len}`. `profile` is `flliper.hardware/1`: a **view** (not a fourth
   measurement file) over the card probe cache (`card_probe-*.json`), the stage-0 profile (`hw_profile-*.json`) and NVML. Every numeric value is
-  `{v, src, at, probe, note}` with `src` = `gemessen` | `NVML` | `Datenblatt` | `geschätzt` | `nicht gemessen` (then `v: null` and `note` = reason).
+  `{v, src, at, probe, note}` with `src` = `gemessen` | `NVML` | `Datasheet` | `geschätzt` | `nicht gemessen` (then `v: null` and `note` = reason).
   It is built in `flliper/srt/rigmon/hardware_profile.py` of the planner tree (loaded by file path, no `import flliper` in this process).
 * `POST /api/hwprofil/measure` `{"cards": [<NVML index>, ...]}` books a gpuq window **itself** (owner `profil-editor`, only these cards,
   15 min (order 1006: all compute formats incl. native W4A4 + BAR1 link per pair in child processes), without `not_before`, exclusive; `mib` only if the body asks for it) and measures in it. Answer `action`:
@@ -454,11 +454,11 @@ Routes and JSON, no UI (that is built by the profile editor, order 930; `static/
 * **Saved (AP-A, profile planner 06.10.).** On the first call the service writes the profile to `--hw-profile-file` (env `FLLIPER_HARDWARE_PROFILE`,
   default `/var/lib/flliper/hardware.json`; rig and release alike; a write error is only a state, not a crash). `GET /api/hwprofil`
   also carries `persist` = `{enabled, state, label, captured_at, reason, id, drift, error, from_persisted, file}`; `state` = `erst_erfasst` | `neu_erfasst` |
-  `vorhanden` | `abweichend` (file stays, `drift.changes` names the difference) | `nur_gespeichert` (NVML is silent: the file applies) | `keine_karten` |
+  `vorhanden` | `abweichend` (file stays, `drift.changes` names the difference) | `nur_gespeichert` (NVML is silent: the file applies) | `no_cards` |
   `nicht_schreibbar`. `POST /api/hwprofil/recapture` ("Capture again") reads NVML again and replaces the file: no gpuq window, also in release; a
   successful measurement also captures again. SM count (`pdflip/hw_sim.py`) and nominal bandwidth (`kartenplan_catalog.py`, field `mem_gbs.nominal`) enter the profile as
-  `Datenblatt`, a measured SM count wins; `cards[].catalog` names the catalog card, `preset` and origin (`measured_on_rig` | `Datenblatt` |
-  `borrowed-unbelegt`, per field in `origin_fields`). `GET /api/hwprofil/issue` returns the issue text "Hardware profile" as Markdown (`{ok, format, text}`);
+  `Datasheet`, a measured SM count wins; `cards[].catalog` names the catalog card, `preset` and origin (`measured_on_rig` | `Datasheet` |
+  `borrowed-unverified`, per field in `origin_fields`). `GET /api/hwprofil/issue` returns the issue text "Hardware profile" as Markdown (`{ok, format, text}`);
   secrets and host paths are removed (`redact.text_for_issue`).
 * **Issue text "Run report" (AP-I, profile planner 06.10.).** `POST /api/profil/issue` with `{doc, dry?, cards?, model?}` (profile, answer of the last
   dry run, the selected cards `[{card, pcie}]`, a model profile `flliper.model/1`) returns `{ok, format: "markdown", text, blocks, filename}`: a
@@ -479,8 +479,8 @@ Routes and JSON, no UI (that is built by the profile editor, order 930; `static/
   `--hw-measure-tree` (full flliper tree for the child process), `--hw-python` (interpreter with torch + sgl_kernel; without sgl_kernel the int8/W4A16 arms stay
   empty and the run reports that as a warning), `--hw-prefix` (e.g. `systemd-run --scope -q -p MemoryMax=6G`: the service has
   `MemoryMax=1G`, torch/CUDA belongs in a cgroup frame of its own). Env: `HWPROFIL_TREE`, `HWPROFIL_MEASURE_TREE`, `HWPROFIL_PYTHON`, `HWPROFIL_PREFIX`.
-* Mounting into a page: `<div id="x"></div><script src="hwprofil.js"></script><script>HwProfil.mount(document.getElementById("x"))</script>`;
-  `HwProfil.render(answer)` returns only the HTML text.
+* Mounting into a page: `<div id="x"></div><script src="hwprofil.js"></script><script>HwProfile.mount(document.getElementById("x"))</script>`;
+  `HwProfile.render(answer)` returns only the HTML text.
 
 ## Profile planner: one page in six steps (AP-H1, plan profile planner 06.10.)
 

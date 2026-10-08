@@ -70,10 +70,10 @@ def _n(v, src="NVML", unit=None):
 
 HW = {"schema": "flliper.hardware/1", "id": "sha256:abcdef0123456789abcdef", "driver": "575.57.08", "cuda": "13.0", "torch": "2.9.1",
       "cards": [
-          {"ord": 0, "nvml_index": 1, "name": "NVIDIA GeForce RTX 5090", "cc": [12, 0], "sm_count": _n(170, "Datenblatt"), "vram_total_mib": _n(32607, unit="MiB"),
-           "pcie": {"max_gen": _n(5), "max_width": _n(16)}, "mem_gbs": {"read": _n(1650, "gemessen", "GB/s"), "nominal": _n(1792, "Datenblatt", "GB/s")}},
-          {"ord": 1, "nvml_index": 0, "name": "NVIDIA GeForce RTX 3080", "cc": [8, 6], "sm_count": _n(68, "Datenblatt"), "vram_total_mib": _n(20480, unit="MiB"),
-           "pcie": {"max_gen": _n(4), "max_width": _n(16)}, "mem_gbs": {"nominal": _n(760, "Datenblatt", "GB/s")}},
+          {"ord": 0, "nvml_index": 1, "name": "NVIDIA GeForce RTX 5090", "cc": [12, 0], "sm_count": _n(170, "Datasheet"), "vram_total_mib": _n(32607, unit="MiB"),
+           "pcie": {"max_gen": _n(5), "max_width": _n(16)}, "mem_gbs": {"read": _n(1650, "gemessen", "GB/s"), "nominal": _n(1792, "Datasheet", "GB/s")}},
+          {"ord": 1, "nvml_index": 0, "name": "NVIDIA GeForce RTX 3080", "cc": [8, 6], "sm_count": _n(68, "Datasheet"), "vram_total_mib": _n(20480, unit="MiB"),
+           "pcie": {"max_gen": _n(4), "max_width": _n(16)}, "mem_gbs": {"nominal": _n(760, "Datasheet", "GB/s")}},
       ]}
 VERSIONS = {"tree_rev": "173161c595de23e0", "image": "ghcr.io/efschu/htsglang:0.1.0-cu130", "driver": "575.57.08", "cuda": "13.0", "torch": "2.9.1", "rigdash": "r1006"}
 MODEL = {"schema": "flliper.model/1", "path": "/spinning/llm_stuff/models-cache/Qwen3.8-27B", "config_sha": "0123456789abcdef",
@@ -623,14 +623,14 @@ class Redaction(Base):
         self.assertEqual(row.count("|"), 6)                                # 5 Spalten
 
     def test_rejects_a_foreign_document(self):
-        with self.assertRaises(P.ProfilError):
+        with self.assertRaises(P.ProfileError):
             self.ed.issue_report({"schema": "x"})
 
 
 
 class StructuralAllowRule(Base):
-    """Fix-Runde 5: Werte nur fuer Katalog-Schluessel (und nicht per Name Geheimnis); jeder andere Schluessel des Nutzers zeigt nur seinen Namen.
-    Die Wertmuster bleiben die zweite Schicht (auch fuer Katalog-Schluessel); Pfade werden normalisiert."""
+    """Fix-Runde 5: Werte nur fuer Catalog-Schluessel (und nicht per Name Geheimnis); jeder andere Schluessel des Nutzers zeigt nur seinen Namen.
+    Die Wertmuster bleiben die zweite Schicht (auch fuer Catalog-Schluessel); Pfade werden normalisiert."""
     AWS = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     AZURE = "PV2c7Y2ccEFykpwliZwJBl1tQ57j/XHICdb03E6gK109O3L0aonSzrcIKLpVrfCeYUAywgtSDET5eXC4+gYlIQ=="
     DISCORD = ".".join(("MTk4NjIyNDgz" + "NDcxOTI1MjQ4", "Cl2" + "FMQ", "ZnCjm1XVW7vRze" + "4b7Cq4se7kKWs"))      # zusammengesetzt: kein Wortlaut im Quelltext (Push-Schutz)
@@ -698,7 +698,7 @@ class StructuralAllowRule(Base):
         self.assertEqual(redact.value_for_issue("flag:--p-bs", "4", KNOWN), "4")                   # Profilschluessel mit Praefix
         self.assertEqual(redact.value_for_issue("env:P:FLLIPER_CACHE_DIR", "/app/x", KNOWN), "/app/x")
         self.assertEqual(redact.value_for_issue("env:P:MY_THING", "4", KNOWN), HIDDEN)
-        self.assertEqual(redact.value_for_issue("extra:P:--nicht-im-katalog", "4", KNOWN), HIDDEN)
+        self.assertEqual(redact.value_for_issue("extra:P:--nicht-im-catalog", "4", KNOWN), HIDDEN)
         self.assertEqual(redact.value_for_issue("--p-bs", "4"), HIDDEN)                            # ohne Katalog nichts zeigen
         self.assertEqual(redact.value_for_issue("--p-bs", "4", frozenset()), HIDDEN)
         self.assertEqual(redact.value_for_issue("MY_THING", "", KNOWN), "")                        # leer ist kein Geheimnis
@@ -835,7 +835,7 @@ global.CSS = { escape: (s) => s };
 let copied = null;
 Object.defineProperty(global, "navigator", { value: { clipboard: { writeText: async (t) => { copied = t; } } }, configurable: true });
 const calls = [];
-const VIEW = { rows: [], planner_only: [], removed: [], coverage: { rows: 0, erklaert: 0, kuratiert: 0, geerntet: 0, profil_kommentar: 0, unerklaert: 0, geaendert: 0 } };
+const VIEW = { rows: [], planner_only: [], removed: [], coverage: { rows: 0, explained: 0, curated: 0, harvested: 0, profil_kommentar: 0, unexplained: 0, changed: 0 } };
 const DOC = { name: "p", id: "sha256:one", line: "nf", args: [], meta: {}, vars: [] };
 global.fetch = async (url, opt) => {
   const p = String(url).replace(/^api\/profil\//, "");
@@ -899,7 +899,7 @@ class UiJs(unittest.TestCase):
         self.assertTrue(o["button"])
         self.assertTrue(o["noTextYet"])
         self.assertEqual(o["issueCalls"], 1)
-        self.assertEqual(set(o["body"]), {"doc", "dry", "cards", "model", "vorschlag"})
+        self.assertEqual(set(o["body"]), {"doc", "dry", "cards", "model", "proposal"})
         self.assertEqual(o["body"]["doc"]["name"], "p")
         self.assertIsNone(o["body"]["dry"])                                  # noch kein Trockenlauf
         self.assertEqual(o["body"]["cards"], [{"card": "a", "pcie": {"gen": 4, "lanes": 8}}])

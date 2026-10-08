@@ -3,7 +3,7 @@
 Referenzen, Schnitt aus gemessenen Stufenraten.
 
 DIE ORDER (Nutzer 24.09. 18:53Z, woertlich): "die geschwindigkeiten der karten
-ist noch im powerlimit bei 400 und 230 deswegen muss der schnitt aufjedenfall
+ist noch im powerlimit bei 400 und 230 deswegen muss der cut aufjedenfall
 anpassbar sein, da ich spaeter das powerlimit ggf. erhoehen werde". Am Metall
 (nvidia-smi 18:55Z): nvml0 3080 230 W (max 320), nvml1 5090 400 W (max 600),
 nvml2 3080 230 W (max 320).

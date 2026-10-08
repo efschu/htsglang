@@ -14,8 +14,8 @@
                // AP-H1 (eine Seite): Betriebsform, Inventar, Regler, Vorschlag
                basis: null, form: "flip", formUser: false, inv: "rig", seats: 6, seatsOn: false, ctx: 262144, ctxOn: false, prop: null, vsrc: "prop", rigHw: null, vecTimer: null };
   const isOpen = (id, dflt) => (id in st.fold ? st.fold[id] : dflt);
-  try { const v = localStorage.getItem("rigdash.pf.view"); if (v === "einfach" || v === "experte") st.mode = v; } catch (e) { /* private window */ }
-  const REL = { tauscht: "swaps with", braucht: "needs", schliesst_aus: "excludes", abgeleitet_von: "derived from", skaliert_mit: "scales with" };
+  try { const v = localStorage.getItem("rigdash.pf.view"); if (v === "einfach" || v === "expert") st.mode = v; } catch (e) { /* private window */ }
+  const REL = { trades: "swaps with", requires: "needs", excludes: "excludes", derived_from: "derived from", scales_with: "scales with" };
   const SCOPE = { P: "P", D: "D", launcher: "Launcher", profile: "Profile", form: "Form", instr: "Instrument", all: "all" };
 
   async function api(path, body) {
@@ -67,14 +67,14 @@
   // wozu er gehört (doc.id, Trockenlauf, Modellprofil), damit die Seite einen veralteten Text kennzeichnet statt ihn still stehen zu lassen
   // Orakel-Lauf des Vorschlags (Verdikt der letzten propose-Antwort): ohne "Neu prüfen" sagt der Bericht damit, was der Launcher zum Vorschlag gesagt hat
   const propVerdikt = () => {
-    const v = st.prop && st.prop.verdikt;
+    const v = st.prop && st.prop.verdict;
     if (!v) return null;
-    return { schema: v.schema, ausgang: v.ausgang, orakel: { laeufe: (v.orakel || {}).laeufe },
-             verdikte: (v.verdikte || []).map((x) => ({ code: x.code, ebene: x.ebene, parent: x.parent, text: x.text, grund: x.grund, klasse: x.klasse, konsequenz: x.konsequenz })) };
+    return { schema: v.schema, outcome: v.outcome, oracle: { runs: (v.oracle || {}).runs },
+             verdikte: (v.verdikte || []).map((x) => ({ code: x.code, level: x.level, parent: x.parent, text: x.text, reason: x.reason, class: x.class, consequence: x.consequence })) };
   };
-  const issueKey = () => JSON.stringify([st.doc ? st.doc.id : null, st.dry, st.cards, st.mprof ? st.mprof.path : null, propVerdikt() ? propVerdikt().ausgang : null]);
+  const issueKey = () => JSON.stringify([st.doc ? st.doc.id : null, st.dry, st.cards, st.mprof ? st.mprof.path : null, propVerdikt() ? propVerdikt().outcome : null]);
   const doIssue = () => run(async () => {
-    const j = await api("issue", { doc: st.doc, dry: st.dry, vorschlag: propVerdikt(), cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })), model: st.mprof ? st.mprof.profile : null });
+    const j = await api("issue", { doc: st.doc, dry: st.dry, proposal: propVerdikt(), cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })), model: st.mprof ? st.mprof.profile : null });
     st.issue = { text: j.text, blocks: j.blocks || [], filename: j.filename || "laufbericht.md", key: issueKey() };
   });
   const doDry = () => run(async () => { st.dry = await api("dry", { doc: st.doc, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })) }); st.vsrc = "dry"; });
@@ -87,14 +87,14 @@
     return st.rigHw ? st.rigHw.cards.length : null;
   };
   function inferForm() { const PX = planer(); if (PX && !st.formUser && st.doc) st.form = PX.formOf(st.doc, nCards()); }
-  const backendForm = () => { const f = ((st.list.planer || {}).formen || []).find((x) => x.id === st.form); return f ? f.backend : null; };
+  const backendForm = () => { const f = ((st.list.planer || {}).forms || []).find((x) => x.id === st.form); return f ? f.backend : null; };
   const doPropose = () => run(async () => {
     if (!st.basis) throw new Error("Load a profile first (step 2): the proposal starts from this profile.");
-    const ziele = {};
-    if (st.seatsOn) ziele.seats = st.seats;
-    if (st.ctxOn) ziele.kv_tokens = st.ctx;
-    const inventar = st.inv === "rig" ? "rig" : st.cards.map((c) => ({ card: c.card, pcie: c.pcie }));
-    const j = await api("propose", { basis: st.basis, form: backendForm(), inventar, ziele });
+    const goals = {};
+    if (st.seatsOn) goals.seats = st.seats;
+    if (st.ctxOn) goals.kv_tokens = st.ctx;
+    const inventory = st.inv === "rig" ? "rig" : st.cards.map((c) => ({ card: c.card, pcie: c.pcie }));
+    const j = await api("propose", { basis: st.basis, form: backendForm(), inventory, goals });
     st.prop = j; st.vsrc = "prop"; st.dry = null; st.exp = null; st.dirty = true; st.cmsg = null;
     setView({ doc: j.startprofil.doc, view: j.startprofil.view });
     st.msg = "Proposal applied as " + j.startprofil.name + " (not saved yet).";
@@ -115,7 +115,7 @@
   // Katalog (AP-A): vorbelegt sind RTX 5090, RTX 3080 20 GB, RTX 3090; die übrigen Karten stehen eingeklappt unter "weitere Karten" mit sichtbarer Herkunft.
   // Ein Dienst ohne ``preset`` (älterer Stand) zeigt alle Karten wie bisher.
   const hasPreset = () => st.list.cards.some((c) => "preset" in c);
-  const ORIGIN_TIP = { "measured_on_rig": "measured on the rig", "Datenblatt": "datasheet (manufacturer figure, not measured)", "datasheet": "datasheet (manufacturer figure, not measured)", "borrowed-unbelegt": "borrowed from another variant, unverified" };
+  const ORIGIN_TIP = { "measured_on_rig": "measured on the rig", "Datasheet": "datasheet (manufacturer figure, not measured)", "datasheet": "datasheet (manufacturer figure, not measured)", "borrowed-unverified": "borrowed from another variant, unverified" };
   function cardOpts(sel) {
     // eine bereits gewählte Karte außerhalb der Vorbelegung bleibt in der Auswahl, sonst verlöre die Zeile ihren Wert
     const vis = st.list.cards.filter((c) => !hasPreset() || c.preset || c.id === sel);
@@ -127,7 +127,7 @@
     if (!more.length) return "";
     const rows = more.map((c) => {
       const of = c.origin_fields || {};
-      const borrowed = of.mem_bw === "borrowed-unbelegt" ? ' <span class="pf-chip" title="Nominal bandwidth borrowed from another variant, unverified">bandwidth borrowed</span>' : "";
+      const borrowed = of.mem_bw === "borrowed-unverified" ? ' <span class="pf-chip" title="Nominal bandwidth borrowed from another variant, unverified">bandwidth borrowed</span>' : "";
       return `<tr data-id="${esc(c.id)}"><td>${esc(c.label)}</td><td>${esc(c.arch)}</td><td>${Math.round((c.usable_mib || 0) / 1024)} GB</td><td>${esc(String(c.mem_bw_gbs))} GB/s</td>
         <td><span class="pf-chip" title="${esc(c.origin_label || ORIGIN_TIP[c.origin] || "")}">${esc(c.origin || "")}</span>${borrowed}</td>
         <td><button type="button" data-act="cadd-id" data-id="${esc(c.id)}"${st.cards.length >= 6 ? " disabled" : ""}>+ add</button></td></tr>`;
@@ -157,7 +157,7 @@
       <div class="pf-force">At server start: ${esc(r.force)}</div>
       <details><summary>Why this classification · consequence · source</summary><div class="muted">${esc(r.why_class || "")}</div>
         ${r.consequence ? `<div class="muted">Consequence with force: ${esc(r.consequence)}</div>` : ""}<div class="muted">Source: ${esc(r.source || "")}</div></details></li>`).join("");
-    const PX = window.ProfilPlaner, sc = PX && PX.startChip((d.orakel || {}).ausgang, d.verdikte);      // dry run: "with --force" is shown at the start, not at a value
+    const PX = window.ProfilPlaner, sc = PX && PX.startChip((d.oracle || {}).outcome, d.verdikte);      // dry run: "with --force" is shown at the start, not at a value
     return `<div class="pf-verdict ${d.goes ? "ok" : "bad"}"><b>${esc(d.verdict)}</b>${sc ? " " + PX.vChip(sc) : ""}</div>
       ${rj ? `<ul class="pf-rejs">${rj}</ul>` : ""}
       <div class="muted pf-note">${esc(d.force_note)}</div>
@@ -165,16 +165,16 @@
   }
   // ------------------------------------------------------------------ Kanten (Abhängigkeiten): Beleg und Satz aus dem Kantenkatalog (2002 C)
   const regByCode = () => { const m = {}; ((st.list && st.list.register) || []).forEach((r) => { m[r.code] = r; }); return m; };
-  const belegText = (d) => (d.beleg ? String(d.beleg.datei) + ":" + String(d.beleg.zeile) + (d.beleg.anker ? ` (“${d.beleg.anker}”)` : "") : "");
+  const belegText = (d) => (d.evidence ? String(d.evidence.file) + ":" + String(d.evidence.zeile) + (d.evidence.anchor ? ` (“${d.evidence.anchor}”)` : "") : "");
   function depNotes(d) {
     // alle Aussagen über eine Kante als Zeilen (Tooltip des Chips UND ausgeklappte Erklärung): kein Hover-Zwang, nichts wird ausgewertet
     const n = [d.satz || d.effect || ""];
     if (d.calc === "S4") n.push("The planner computes the consequence in MiB/tokens/ms in the card bars (couplings, section below); the chip does not show it yet.");
-    if (d.wert != null && d.wert !== "") n.push(`Applies only for value: ${d.wert} (the condition is not evaluated here).`);
-    if (d.rel_katalog) n.push(`The edge catalog lists this relation as “${REL[d.rel_katalog] || d.rel_katalog}”, curated says “${REL[d.rel] || d.rel}”.`);
+    if (d.value != null && d.value !== "") n.push(`Applies only for value: ${d.value} (the condition is not evaluated here).`);
+    if (d.rel_catalog) n.push(`The edge catalog lists this relation as “${REL[d.rel_catalog] || d.rel_catalog}”, curated says “${REL[d.rel] || d.rel}”.`);
     if (d.belegt === false) n.push("Unverified: curated only, not evidenced in the edge catalog (not refuted).");
-    else if (d.beleg) n.push("Evidence: " + belegText(d) + (d.kante ? " (edge " + d.kante + ")" : ""));
-    if (d.to_kind === "ablehnung") {
+    else if (d.evidence) n.push("Evidence: " + belegText(d) + (d.edge ? " (edge " + d.edge + ")" : ""));
+    if (d.to_kind === "refusal") {
       const r = regByCode()[d.to];
       n.push("Refusal code of the planner, not a value in the profile" + (r ? ": " + r.title + ". " + (r.force_scope || "") : "."));
     } else if (d.to_kind === "unbekannt") n.push("Target without a catalog entry and without a refusal code.");
@@ -182,22 +182,22 @@
     return n.filter(Boolean);
   }
   function depChip(d) {
-    const rej = d.to_kind === "ablehnung";
+    const rej = d.to_kind === "refusal";
     const cls = "pf-dep" + (rej ? " pf-dep-rej" : d.present ? "" : " pf-dep-off");
     const badge = d.belegt === false ? '<i class="pf-dep-nb">unverified</i>' : d.belegt ? '<i class="pf-dep-b">evidence</i>' : "";
-    const wert = d.wert != null && d.wert !== "" ? `<i class="pf-dep-w">only for ${esc(d.wert)}</i>` : "";
+    const value = d.value != null && d.value !== "" ? `<i class="pf-dep-w">only for ${esc(d.value)}</i>` : "";
     return `<span class="${cls}" data-goto="${esc(d.to)}" title="${esc(depNotes(d).join(" — "))}">
-      ${esc(REL[d.rel] || d.rel)} <b>${esc(d.to)}</b> ${wert} ${badge}</span>`;
+      ${esc(REL[d.rel] || d.rel)} <b>${esc(d.to)}</b> ${value} ${badge}</span>`;
   }
   function drawDeps(r) {
     const ds = r.explain.depends;
     if (!ds.length) return "";
-    return `<div class="pf-depl"><b>Dependencies</b><ul>${ds.map((d) => `<li><span class="pf-chip">${esc(REL[d.rel] || d.rel)}</span> <b class="mono">${esc(d.to)}</b>${d.to_kind === "ablehnung" ? ' <span class="pf-chip pf-dep-rej">refusal code</span>' : ""}
+    return `<div class="pf-depl"><b>Dependencies</b><ul>${ds.map((d) => `<li><span class="pf-chip">${esc(REL[d.rel] || d.rel)}</span> <b class="mono">${esc(d.to)}</b>${d.to_kind === "refusal" ? ' <span class="pf-chip pf-dep-rej">refusal code</span>' : ""}
       <div class="muted">${depNotes(d).map(esc).join("<br>")}</div></li>`).join("")}</ul></div>`;
   }
   function gotoMessage(to, row) {
     const dep = st.view.rows.reduce((f, r) => f || r.explain.depends.find((d) => d.to === to), null);
-    if (dep && dep.to_kind === "ablehnung") {
+    if (dep && dep.to_kind === "refusal") {
       const r = regByCode()[to];
       return `${to} is a refusal code of the planner, not a value in the profile${r ? ": " + r.title + " (" + (r.force_scope || "") + ")" : ""}. The dry run shows whether it applies here.`;
     }
@@ -206,18 +206,18 @@
     return `${to} is not set in this profile (explained in the catalog, but not part of this profile).`;
   }
   // In welchem Code-Baum steht der Wert? Das Release-Image trägt zwei Stände (27B- und NF-Linie): ein Wert nur in einem Baum ist ein Hinweis, kein Fehler.
-  const BAUM = { "27b": "27B tree", nf: "NF tree" };
+  const TREE = { "27b": "27B tree", nf: "NF tree" };
   function drawOrigin(ex) {
-    const b = ex.baeume || [];
+    const b = ex.trees || [];
     let out = "";
-    if (b.length === 1) out += `<div class="pf-orig"><span class="pf-chip">only in the ${esc(BAUM[b[0]] || b[0])}</span> <span class="muted">The other code tree does not know this value.</span></div>`;
+    if (b.length === 1) out += `<div class="pf-orig"><span class="pf-chip">only in the ${esc(TREE[b[0]] || b[0])}</span> <span class="muted">The other code tree does not know this value.</span></div>`;
     const ab = ex.abweichung;
     if (ab) {
       const ks = Object.keys(ab);
       const helpDiffers = new Set(ks.map((k) => String(ab[k].help || ""))).size > 1;
-      out += `<div class="pf-orig"><span class="pf-chip pf-dep-off">differs</span> ${ks.map((k) => `<span>${esc(BAUM[k] || k)}: default <span class="mono">${esc(ab[k].default == null ? "–" : ab[k].default)}</span></span>`).join(" · ")}${helpDiffers ? ' <b>· same name, different description per tree: the effect may differ</b>' : ""}</div>`;
+      out += `<div class="pf-orig"><span class="pf-chip pf-dep-off">differs</span> ${ks.map((k) => `<span>${esc(TREE[k] || k)}: default <span class="mono">${esc(ab[k].default == null ? "–" : ab[k].default)}</span></span>`).join(" · ")}${helpDiffers ? ' <b>· same name, different description per tree: the effect may differ</b>' : ""}</div>`;
       // beide Beschreibungen aus dem Code nebeneinander: der Unterschied soll nicht erraten werden müssen (z. B. FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK: 27B nur im Dual-Layout, NF ohne Gate)
-      if (helpDiffers) out += `<details class="pf-fold pf-orig-d"><summary>Description per tree (from the code)</summary>${ks.map((k) => `<div class="pf-part"><span class="pf-chip">${esc(BAUM[k] || k)}</span> <span class="muted">${esc(ab[k].help || "(no description)")}</span></div>`).join("")}</details>`;
+      if (helpDiffers) out += `<details class="pf-fold pf-orig-d"><summary>Description per tree (from the code)</summary>${ks.map((k) => `<div class="pf-part"><span class="pf-chip">${esc(TREE[k] || k)}</span> <span class="muted">${esc(ab[k].help || "(no description)")}</span></div>`).join("")}</details>`;
     }
     if (ex.satz_quelle) out += `<div class="muted pf-note">Source of the sentence: ${esc(ex.satz_quelle)}</div>`;
     return out;
@@ -225,7 +225,7 @@
   function drawExplain(r) {
     const ex = r.explain;
     if (!ex.parts.length) return `<div class="pf-unex">Unexplained: this value has neither catalog text nor code help nor a comment in the profile. ${ex.source ? "Source: " + esc(ex.source.file) + ":" + esc(ex.source.line) : "Look it up in the code (search " + esc(r.name) + ")."}</div>`;
-    const parts = ex.parts.map((p) => `<div class="pf-part"><span class="pf-chip">${esc({ kuratiert: "Explanation", erklaert: "Explanation (from the code)", code: "Code help", profil: "Justified in the profile" }[p.kind] || p.kind)}</span> ${esc(p.text)} <span class="muted">${esc(p.source)}</span></div>`).join("");
+    const parts = ex.parts.map((p) => `<div class="pf-part"><span class="pf-chip">${esc({ curated: "Explanation", explained: "Explanation (from the code)", code: "Code help", profil: "Justified in the profile" }[p.kind] || p.kind)}</span> ${esc(p.text)} <span class="muted">${esc(p.source)}</span></div>`).join("");
     const gc = (ex.gain || ex.cost) ? `<div class="pf-gc">${ex.gain ? `<div><b>Gains:</b> ${esc(ex.gain)}</div>` : ""}${ex.cost ? `<div><b>Costs:</b> ${esc(ex.cost)}</div>` : ""}</div>` : "";
     return parts + drawOrigin(ex) + gc + drawDeps(r);
   }
@@ -260,10 +260,10 @@
     const q = st.search.trim().toLowerCase();
     return st.view.rows.filter((r) => {
       if (exclude && exclude.has(r.key)) return false;      // AP-H1: was ein Abschnitt A-D schon zeigt, steht nicht noch einmal in der Liste
-      if (st.mode === "einfach") return r.explain.level === "einfach" && r.explain.status !== "unerklaert";
-      if (st.filt === "geaendert" && !r.changed) return false;
+      if (st.mode === "einfach") return r.explain.level === "einfach" && r.explain.status !== "unexplained";
+      if (st.filt === "changed" && !r.changed) return false;
       if (st.filt === "planer" && r.planner_value == null) return false;
-      if (st.filt === "unerklaert" && r.explain.status !== "unerklaert") return false;
+      if (st.filt === "unexplained" && r.explain.status !== "unexplained") return false;
       if (q && !(r.name.toLowerCase().includes(q) || r.explain.parts.some((p) => p.text.toLowerCase().includes(q)))) return false;
       return true;
     });
@@ -299,7 +299,7 @@
       const heads = r.heads ? `Model: ${r.heads.q} Q heads, ${r.heads.kv} KV heads` : "Model: head count not readable";
       const per = r.kv ? r.kv.map((n, i) => `<span class="mono">Rank ${i}: KV ${n}${r.q ? " · Q " + r.q[i] : ""}</span>`).join(" · ") : "";
       const notes = (r.notiz || []).map((n) => `<div class="muted pf-note">${esc(n)}</div>`).join("");
-      const src = (r.belege || []).length ? `<div class="muted pf-note">Evidence in the planner tree: ${esc(r.belege.join("; "))}</div>` : "";
+      const src = (r.evidence_items || []).length ? `<div class="muted pf-note">Evidence in the planner tree: ${esc(r.evidence_items.join("; "))}</div>` : "";
       return `<div class="pf-kvh"><b>Group ${esc(r.group)}</b> · weights <span class="mono">${esc(r.ratios)}</span> (${esc(r.quelle)}) · ${esc(REG[r.regime] || r.regime)}
         <div class="muted pf-note">${esc(heads)}</div><div>${per}</div><div>${esc(r.satz)}</div>${notes}${src}</div>`;
     };
@@ -308,7 +308,7 @@
   }
   // Lesehilfe der Erklärsätze (D, P, Flip, Park, Mamba-Anker): die Sätze erklären diese Wörter nicht noch einmal
   function drawGlossar() {
-    const g = (st.view && st.view.glossar) || {};
+    const g = (st.view && st.view.glossary) || {};
     const ks = Object.keys(g);
     if (!ks.length) return "";
     return `<details class="pf-fold" data-fold="gloss" ${isOpen("gloss", false) ? "open" : ""}><summary>Words in the explanations <span class="muted">${esc(ks.join(", "))}</span></summary>
@@ -341,8 +341,8 @@
   // (root.innerHTML wird ersetzt; HwProfil.mount hängt seine Ereignisse an den Knoten, nicht an root)
   let hwEl = null;
   function drawHardware() {
-    if (!window.HwProfil) return "";
-    if (!hwEl) { hwEl = document.createElement("div"); window.HwProfil.mount(hwEl, { edition: document.documentElement.getAttribute("data-edition") || "rig" }); }
+    if (!window.HwProfile) return "";
+    if (!hwEl) { hwEl = document.createElement("div"); window.HwProfile.mount(hwEl, { edition: document.documentElement.getAttribute("data-edition") || "rig" }); }
     return `<details class="pf-fold" data-fold="hw" ${isOpen("hw", false) ? "open" : ""}><summary><b>Hardware</b> · cards and measured values (read the hardware profile, measure in the booked gpuq window)</summary><div id="pf-hwroot"></div></details>`;
   }
   // ------------------------------------------------------------------ Balken (Auftrag 1432, S4b; AP-H2 Auftrag 880)
@@ -462,9 +462,9 @@
   // ------------------------------------------------------------------ Seite: Hardware -> Modell -> Form -> Vorschlag -> Anpassen -> Export (AP-H1, R12)
   function planCtx() {
     const PX = window.ProfilPlaner;
-    const cards = st.prop && st.prop.vorschlag && st.prop.vorschlag.cards ? st.prop.vorschlag.cards.map((c) => ({ name: c.name, mib: c.total_mib })) : [];
+    const cards = st.prop && st.prop.proposal && st.prop.proposal.cards ? st.prop.proposal.cards.map((c) => ({ name: c.name, mib: c.total_mib })) : [];
     const pl = (st.list && st.list.planer) || {};
-    return { vecNames: new Set(pl.vektoren || []), posNames: new Set(pl.positional || []), rankNames: new Set(pl.je_rang || []), n: nCards(), ranks: cards, mode: st.mode, prop: st.prop, vsrc: st.vsrc, dry: st.dry, open: st.open, cmsg: st.cmsg, isOpen,
+    return { vecNames: new Set(pl.vectors || []), posNames: new Set(pl.positional || []), rankNames: new Set(pl.per_rank || []), n: nCards(), ranks: cards, mode: st.mode, prop: st.prop, vsrc: st.vsrc, dry: st.dry, open: st.open, cmsg: st.cmsg, isOpen,
              hasProfileValues: !!(st.doc && Object.keys((st.doc.meta || {}).profile_values || {}).length),
              input: inputFor, short: (r) => { const f = r.explain.parts.length ? r.explain.parts[0].text : ""; return f.length > 170 ? f.slice(0, 168) + "…" : f; },
              explain: drawExplain, depChip, PX };
@@ -479,7 +479,7 @@
     const relOpts = L.release.map((p) => `<option value="release:${esc(p.name)}"${st.loaded === "release:" + p.name ? " selected" : ""}>${esc(p.name)}${p.status ? " · " + esc(p.status) : ""}${p.format ? " · " + esc(p.format) : ""}</option>`).join("");
     const usrOpts = L.user.map((p) => `<option value="user:${esc(p.name)}"${st.loaded === "user:" + p.name ? " selected" : ""}>${esc(p.name)}</option>`).join("");
     const isUser = st.loaded.startsWith("user:"), cov = st.view ? st.view.coverage : null;
-    const form = (info.formen || []).find((f) => f.id === st.form) || {};
+    const form = (info.forms || []).find((f) => f.id === st.form) || {};
     const canCards = st.inv === "rig" || st.cards.length > 0;
     const whyNot = !st.basis ? "Load a profile first (step 2): the proposal starts from this profile." : !canCards ? "Choose cards first (step 1)." : "";
     // Schritt 1: Hardware
@@ -495,7 +495,7 @@
         <button type="button" data-act="save" class="pf-main"${st.doc && !st.busy ? "" : " disabled"}>Save</button>
         <button type="button" data-act="del"${isUser && !st.busy ? "" : " disabled"}>Delete</button></div>
       <div class="muted pf-note">The profile defines model, draft and initial values. The dashboard only <b>creates</b> the profile and starts nothing; at server start you specify it (<span class="mono">FLLIPER_PROFILE=&lt;name&gt;</span>).</div>
-      ${st.doc ? `<div class="pf-stat"><b>${esc(st.doc.name)}</b> · line ${esc(st.doc.line || "?")} · ${cov.rows} values, <b>${cov.erklaert}</b> explained, <span class="${cov.unerklaert ? "pf-warn" : ""}">${cov.unerklaert} unexplained</span> · <b>${cov.geaendert}</b> changed${st.dirty ? ' · <span class="pf-warn">not saved</span>' : ""}</div>` : ""}
+      ${st.doc ? `<div class="pf-stat"><b>${esc(st.doc.name)}</b> · line ${esc(st.doc.line || "?")} · ${cov.rows} values, <b>${cov.explained}</b> explained, <span class="${cov.unexplained ? "pf-warn" : ""}">${cov.unexplained} unexplained</span> · <b>${cov.changed}</b> changed${st.dirty ? ' · <span class="pf-warn">not saved</span>' : ""}</div>` : ""}
       ${drawModels()}</section>`;
     // Schritt 3: Betriebsform
     const s3 = `<section class="pfx-step" aria-labelledby="pfx-h3"><h3 id="pfx-h3"><span class="pfx-no">3</span> Operating form</h3>${PX.renderFormPick(info, st.form, n)}</section>`;
@@ -507,7 +507,7 @@
     let s5body = `<div class="muted pf-note">Load a profile first (step 2).</div>`;
     if (st.doc) {
       const rows = st.view.rows, used = new Set(), po = st.view.planner_only || [];
-      const secs = (info.abschnitte || []).map((sec) => {
+      const secs = (info.sections || []).map((sec) => {
         const r = PX.renderSection(sec, rows, ctx, sec.id === "B" ? drawKvHeads() : "", po);
         r.keys.forEach((k) => used.add(k));
         return r.html;
@@ -516,17 +516,17 @@
       const hasDual = st.form === "dual" || rows.some((r) => dualNames.has(r.name));
       let dual = "";
       if (hasDual) { dual = PX.renderDual(rows, info, ctx); rows.forEach((r) => { if (dualNames.has(r.name)) used.add(r.key); }); }
-      const filt = st.mode === "experte" ? `<div class="pf-filter"><input type="search" id="pf-search" placeholder="Search value or explanation" value="${esc(st.search)}">
-        ${["alle", "geaendert", "planer", "unerklaert"].map((f) => `<button type="button" data-filt="${f}" class="${st.filt === f ? "sel" : ""}">${{ alle: "all", geaendert: "changed", planer: "with planner value", unerklaert: "unexplained" }[f]}</button>`).join("")}</div>` : "";
+      const filt = st.mode === "expert" ? `<div class="pf-filter"><input type="search" id="pf-search" placeholder="Search value or explanation" value="${esc(st.search)}">
+        ${["alle", "changed", "planer", "unexplained"].map((f) => `<button type="button" data-filt="${f}" class="${st.filt === f ? "sel" : ""}">${{ alle: "all", changed: "changed", planer: "with planner value", unexplained: "unexplained" }[f]}</button>`).join("")}</div>` : "";
       s5body = `${secs.join("")}${dual}
-        <details class="pf-fold pfx-rest" data-fold="rest" ${isOpen("rest", st.mode === "experte") ? "open" : ""}><summary><b>E  Remaining values</b> <span class="muted">everything that is not in A to D</span></summary>
+        <details class="pf-fold pfx-rest" data-fold="rest" ${isOpen("rest", st.mode === "expert") ? "open" : ""}><summary><b>E  Remaining values</b> <span class="muted">everything that is not in A to D</span></summary>
           ${st.mode === "einfach" ? `<div class="muted pf-note">Simple view: the most important values. All ${cov.rows} values, instruments and environment are in the expert view.</div>` : ""}
-          ${filt}${drawRows(used)}${st.mode === "experte" ? drawPlannerOnly() : ""}${drawRemoved()}</details>
+          ${filt}${drawRows(used)}${st.mode === "expert" ? drawPlannerOnly() : ""}${drawRemoved()}</details>
         <details class="pf-fold" data-fold="dry" ${isOpen("dry", false) ? "open" : ""}><summary><b>Dry run</b> · which refusals would the planner raise? <span class="muted">(button “Re-check” in step 4)</span></summary>${drawDry()}</details>
         ${drawBars()}${drawGlossar()}`;
     }
     const s5 = `<section class="pfx-step" aria-labelledby="pfx-h5"><h3 id="pfx-h5"><span class="pfx-no">5</span> Adjust
-        <span class="pf-seg pfx-view"><button type="button" data-mode="einfach" class="${st.mode === "einfach" ? "sel" : ""}">Simple</button><button type="button" data-mode="experte" class="${st.mode === "experte" ? "sel" : ""}">Expert</button></span></h3>
+        <span class="pf-seg pfx-view"><button type="button" data-mode="einfach" class="${st.mode === "einfach" ? "sel" : ""}">Simple</button><button type="button" data-mode="expert" class="${st.mode === "expert" ? "sel" : ""}">Expert</button></span></h3>
       <div class="muted pf-note">Every field is editable. The “state” chip says where the value comes from; the “judgement” chip what the launcher says about it (ok, only with --force, refused). A judgement is a note, not a block.</div>
       ${s5body}</section>`;
     // Schritt 6: Export
@@ -557,15 +557,15 @@
       <button type="button" data-act="save" class="pf-main"${st.doc && !st.busy ? "" : " disabled"}>Save</button>
       <button type="button" data-act="del"${isUser && !st.busy ? "" : " disabled"}>Delete</button>
       <button type="button" data-act="export"${st.doc && !st.busy ? "" : " disabled"}>Export as .env</button>
-      <span class="pf-seg"><button type="button" data-mode="einfach" class="${st.mode === "einfach" ? "sel" : ""}">Simple</button><button type="button" data-mode="experte" class="${st.mode === "experte" ? "sel" : ""}">Expert</button></span></div>`;
+      <span class="pf-seg"><button type="button" data-mode="einfach" class="${st.mode === "einfach" ? "sel" : ""}">Simple</button><button type="button" data-mode="expert" class="${st.mode === "expert" ? "sel" : ""}">Expert</button></span></div>`;
     const tip = `<div class="muted pf-note">The dashboard only <b>creates</b> the profile and starts nothing. At server start you specify the profile (<span class="mono">FLLIPER_PROFILE=&lt;name&gt;</span>); if the planner refuses values, <span class="mono">FLLIPER_FORCE=1</span> (launcher: <span class="mono">--force</span>) starts anyway — not overridden are occupied cards, a missing model, an unsupported architecture.</div>`;
     let body = "";
     if (st.doc) {
-      const filt = st.mode === "experte" ? `<div class="pf-filter"><input type="search" id="pf-search" placeholder="Search value or explanation" value="${esc(st.search)}">
-        ${["alle", "geaendert", "planer", "unerklaert"].map((f) => `<button type="button" data-filt="${f}" class="${st.filt === f ? "sel" : ""}">${{ alle: "all", geaendert: "changed", planer: "with planner value", unerklaert: "unexplained" }[f]}</button>`).join("")}</div>` : "";
-      body = `<div class="pf-stat"><b>${esc(st.doc.name)}</b> · line ${esc(st.doc.line || "?")} · ${cov.rows} values, <b>${cov.erklaert}</b> explained (${cov.kuratiert} curated, ${cov.geerntet} from the code, ${cov.profil_kommentar} only in the profile), <span class="${cov.unerklaert ? "pf-warn" : ""}">${cov.unerklaert} unexplained</span> · <b>${cov.geaendert}</b> changed${st.dirty ? ' · <span class="pf-warn">not saved</span>' : ""}</div>
+      const filt = st.mode === "expert" ? `<div class="pf-filter"><input type="search" id="pf-search" placeholder="Search value or explanation" value="${esc(st.search)}">
+        ${["alle", "changed", "planer", "unexplained"].map((f) => `<button type="button" data-filt="${f}" class="${st.filt === f ? "sel" : ""}">${{ alle: "all", changed: "changed", planer: "with planner value", unexplained: "unexplained" }[f]}</button>`).join("")}</div>` : "";
+      body = `<div class="pf-stat"><b>${esc(st.doc.name)}</b> · line ${esc(st.doc.line || "?")} · ${cov.rows} values, <b>${cov.explained}</b> explained (${cov.curated} curated, ${cov.harvested} from the code, ${cov.profil_kommentar} only in the profile), <span class="${cov.unexplained ? "pf-warn" : ""}">${cov.unexplained} unexplained</span> · <b>${cov.changed}</b> changed${st.dirty ? ' · <span class="pf-warn">not saved</span>' : ""}</div>
         ${st.mode === "einfach" ? `<div class="muted pf-note">Simple view: the most important values. All ${cov.rows} values, instruments and environment are in the expert view.</div>` : ""}
-        ${filt}${drawRows()}${st.mode === "experte" ? drawPlannerOnly() : ""}${drawRemoved()}`;
+        ${filt}${drawRows()}${st.mode === "expert" ? drawPlannerOnly() : ""}${drawRemoved()}`;
     }
     root.innerHTML = `${top}${tip}${st.err ? `<div class="kp-verdict bad">${esc(st.err)}</div>` : ""}${st.msg ? `<div class="muted pf-note">${esc(st.msg)}</div>` : ""}
       ${body}
@@ -649,7 +649,7 @@
         if (tr && tr.id) st.cmsg = { key: tr.id.replace(/^pfr-/, ""), text }; else st.msg = text;
         return draw();
       }
-      if (st.mode === "einfach" && row.explain.level !== "einfach") { st.mode = "experte"; draw(); }
+      if (st.mode === "einfach" && row.explain.level !== "einfach") { st.mode = "expert"; draw(); }
       const el = document.getElementById("pfr-" + row.key); if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("pf-flash"); setTimeout(() => el.classList.remove("pf-flash"), 1600); }
       return;
     }

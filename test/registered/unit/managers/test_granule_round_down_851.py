@@ -33,7 +33,7 @@ the refusal line, not the actuator (FEATURE_CATALOG: "not yet for the refusal
 itself"). It becomes an ACTUATOR defect the moment F4 lands.
 
 PRIOR-ART DISTINCTION, mandatory. This is NOT the retracted "granule axis"
-(Strang 12, 2026-08-22, kapazitaets-hebel-inventar): that claim was
+(Strang 12, 2026-08-22, kapazitaets-hebel-inventory): that claim was
 *granule > pool*, built on a test-fixture number (229376 rows), and was
 correctly retracted. This is a different mechanism -- a round-UP refusal
 inside ``Post.creditable`` with the real 256 MiB granule -- verified against

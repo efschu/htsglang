@@ -2,14 +2,14 @@
 
 Every value in the editor is explained from a SOURCE, never from a guess.  The sources, in order:
 
-1. **kuratiert** (``profile_catalog_curated.py``): the core values a person is meant to touch, with a plain
+1. **curated** (``profile_catalog_curated.py``): the core values a person is meant to touch, with a plain
    sentence, the price (gain/cost) and the dependencies on other values (``depends``).
 2. **argparse** -- the ``help=`` text, default, choices and arity of every ``add_argument`` of the launcher,
    harvested by AST from ``launcher.py`` (no import: the launcher pulls torch).
 3. **environ** -- the comment lines above a field of ``environ.py``'s ``Envs`` plus its type and default.
 4. **profil-kommentar** -- the comment above (or after) the line that sets the value in the profile itself
    (``harvest_profile_comments``; per profile, at load time).
-5. Nothing found -> ``status: "unerklaert"``, shown as such with the place in the code to read.
+5. Nothing found -> ``status: "unexplained"``, shown as such with the place in the code to read.
 
 ``build_catalog`` merges 1-3 and the EDGE CATALOG (``kantenkatalog_1004.json``, see :func:`merge_edges`); ``coverage`` states how much is explained.  A curated dependency edge is checked
 against the launcher by the test (``test_profile_catalog_1003``): the flags it names must exist.
@@ -226,9 +226,9 @@ EDGES_SCHEMA = "flliper.kanten/1"
 #: Display wording (English) for the vocabulary that stays a KEY in the data: the edge ``rel`` values and the entry ``status`` values.
 #: The keys (``tauscht`` ... / ``kuratiert`` ...) are what code, tests and ``catalog.json`` entries carry; only the text a person reads is English.
 #: ``main`` ships both tables in ``catalog.json`` under ``anzeige`` so the page does not need its own copy.
-REL_ANZEIGE: Dict[str, str] = {"tauscht": "trades", "braucht": "requires", "schliesst_aus": "excludes", "abgeleitet_von": "derived_from",
-                               "skaliert_mit": "scales_with"}
-STATUS_ANZEIGE: Dict[str, str] = {"kuratiert": "curated", "erklaert": "explained", "geerntet": "harvested", "unerklaert": "unexplained"}
+REL_ANZEIGE: Dict[str, str] = {"trades": "trades", "requires": "requires", "excludes": "excludes", "derived_from": "derived_from",
+                               "scales_with": "scales_with"}
+STATUS_ANZEIGE: Dict[str, str] = {"curated": "curated", "explained": "explained", "harvested": "harvested", "unexplained": "unexplained"}
 EDGES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kantenkatalog_1004.json")
 _RX_CODE = re.compile(r"^[A-Z]+(?:-[A-Z]+)+$")
 
@@ -237,44 +237,44 @@ def load_edges(path: str = "") -> Tuple[List[Dict[str, object]], Dict[str, objec
     """The edges of the edge catalog and a status dict.  A missing or unreadable file is NOT an error of the catalog: the
     dependencies stay as curated, the status says ``geladen: False`` and why (never a silent empty list)."""
     path = path or EDGES_FILE
-    info: Dict[str, object] = {"datei": os.path.basename(path), "geladen": False, "grund": "", "schema": ""}
+    info: Dict[str, object] = {"file": os.path.basename(path), "geladen": False, "reason": "", "schema": ""}
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
     except (OSError, ValueError) as exc:
-        info["grund"] = "not readable: %s" % exc
+        info["reason"] = "not readable: %s" % exc
         return [], info
     info["schema"] = str(doc.get("schema", ""))
     edges = doc.get("kanten")
     if info["schema"] != EDGES_SCHEMA or not isinstance(edges, list):
-        info["grund"] = "schema %r (expected %s) or no edge list" % (info["schema"], EDGES_SCHEMA)
+        info["reason"] = "schema %r (expected %s) or no edge list" % (info["schema"], EDGES_SCHEMA)
         return [], info
     ok = [e for e in edges if isinstance(e, dict) and e.get("von") and e.get("nach") and e.get("rel")]
-    info.update({"geladen": True, "kanten_gesamt": len(ok), "verworfen": len(edges) - len(ok)})
+    info.update({"geladen": True, "edges_total": len(ok), "rejected": len(edges) - len(ok)})
     return ok, info
 
 
 # Evidence resolution (Auftrag 2013): the ANCHOR TEXT is the evidence, the stored line number is only a hint.  A line number in
 # ``launcher.py``/``environ.py`` drifts with every edit above it; the anchor does not.  ``resolve_edge_belege`` finds each anchor in
 # its file, so a pure line shift never breaks an edge -- only a missing or ambiguous anchor does.
-ANKER_TOL = 10          # a multi-hit anchor must have a hit within this many lines of where the edge is expected
-ANKER_OK = ("eindeutig", "nah")                      # resolved
+ANCHOR_TOL = 10          # a multi-hit anchor must have a hit within this many lines of where the edge is expected
+ANCHOR_OK = ("eindeutig", "nah")                      # resolved
 ANKER_PROBLEM = ("veraltet", "mehrdeutig", "datei_fehlt")   # the evidence cannot be trusted: say so, never guess
-ANKER_FREMD = ("andere_linie",)         # the edge's ``baeume`` does not name the tree being resolved (code of the other line): not checked here, no problem
+ANKER_FREMD = ("other_line",)         # the edge's ``baeume`` does not name the tree being resolved (code of the other line): not checked here, no problem
 _ANKER_REPO_FILE = "python/flliper/srt/pdflip/launcher.py"
 
 
-def anchor_lines(text: str, anker: str) -> List[int]:
-    """1-based START lines of every occurrence of ``anker`` in ``text`` (an anchor may span lines; one entry per line)."""
+def anchor_lines(text: str, anchor: str) -> List[int]:
+    """1-based START lines of every occurrence of ``anchor`` in ``text`` (an anchor may span lines; one entry per line)."""
     out: List[int] = []
-    if not anker:
+    if not anchor:
         return out
-    pos = text.find(anker)
+    pos = text.find(anchor)
     while pos >= 0:
         ln = text.count("\n", 0, pos) + 1
         if not out or out[-1] != ln:
             out.append(ln)
-        pos = text.find(anker, pos + 1)
+        pos = text.find(anchor, pos + 1)
     return out
 
 
@@ -284,7 +284,7 @@ def resolve_anchor(hits: Sequence[int], hint: object, drift: int = 0) -> Tuple[O
     * no hit            -> ``(None, "veraltet")``: the anchor text is gone from the file (the evidence is stale);
     * exactly one hit   -> ``(hit, "eindeutig")`` wherever it is;
     * several hits      -> the one nearest to ``hint + drift`` (``drift`` = how far this region of the file moved, see
-      :func:`resolve_edge_belege`) is ``"nah"``; when two hits are equally near, or the nearest is farther than ``ANKER_TOL`` from
+      :func:`resolve_edge_evidence_items`) is ``"nah"``; when two hits are equally near, or the nearest is farther than ``ANCHOR_TOL`` from
       the expectation, the anchor is ``(None, "mehrdeutig")`` -- no silent pick."""
     if not hits:
         return None, "veraltet"
@@ -294,7 +294,7 @@ def resolve_anchor(hits: Sequence[int], hint: object, drift: int = 0) -> Tuple[O
     want = h + drift
     ranked = sorted(hits, key=lambda x: (abs(x - want), x))
     d0 = abs(ranked[0] - want)
-    if d0 > ANKER_TOL or abs(ranked[1] - want) == d0:
+    if d0 > ANCHOR_TOL or abs(ranked[1] - want) == d0:
         return None, "mehrdeutig"
     return ranked[0], "nah"
 
@@ -305,30 +305,30 @@ def _repo_root_of(launcher_path: str) -> str:
     return p[:-len(_ANKER_REPO_FILE) - 1] if p.endswith("/" + _ANKER_REPO_FILE) else ""
 
 
-def resolve_edge_belege(edges: Sequence[Mapping], root: str, baum: str = "") -> Dict[str, Dict[str, object]]:
-    """Resolve the evidence of every edge by its ANCHOR TEXT.  Returns ``{edge id: {zeile, hinweis, status, treffer, datei}}``.
+def resolve_edge_evidence_items(edges: Sequence[Mapping], root: str, tree: str = "") -> Dict[str, Dict[str, object]]:
+    """Resolve the evidence of every edge by its ANCHOR TEXT.  Returns ``{edge id: {zeile, note, status, treffer, file}}``.
 
-    ``zeile`` is the resolved line (the stored line stays visible as ``hinweis`` when nothing resolves).  Relative files are
+    ``zeile`` is the resolved line (the stored line stays visible as ``note`` when nothing resolves).  Relative files are
     read under ``root``, absolute ones as they are (``extern_fehlt`` when such a file is not on this machine: not a problem, not
     verifiable).  Drift: edges whose anchor is unique show how far their region moved (hit - stored); a multi-hit anchor expects
     its hit at ``stored + median drift of the nearest unique edges of the same file`` -- so a prepend of N lines moves every hint by N
     and an ambiguous anchor still lands on its own line instead of a stray namesake.
 
-    ``baum`` (the label of the code tree under ``root``, ``"27b"`` or ``"nf"``; ``""`` = no filter, every edge is checked): an edge may
-    carry ``baeume`` (the labels of the trees whose code it documents; absent = both lines).  An edge that does not name ``baum`` is
-    ``andere_linie`` -- its evidence lives in the other line's code (the Dual form is a 27B-line feature), so it is NOT looked up in
+    ``tree`` (the label of the code tree under ``root``, ``"27b"`` or ``"nf"``; ``""`` = no filter, every edge is checked): an edge may
+    carry ``trees`` (the labels of the trees whose code it documents; absent = both lines).  An edge that does not name ``tree`` is
+    ``other_line`` -- its evidence lives in the other line's code (the Dual form is a 27B-line feature), so it is NOT looked up in
     this tree (no ``veraltet`` for code that was never here), and it is not a problem either."""
     texts: Dict[str, Optional[str]] = {}
     rows: List[Dict[str, object]] = []
     for e in edges:
-        b = e.get("beleg") if isinstance(e, Mapping) else None
-        if not isinstance(b, Mapping) or not b.get("datei"):
+        b = e.get("evidence") if isinstance(e, Mapping) else None
+        if not isinstance(b, Mapping) or not b.get("file"):
             continue
-        datei = str(b["datei"])
-        path = datei if os.path.isabs(datei) else (os.path.join(root, datei) if root else "")
-        if baum and isinstance(e.get("baeume"), list) and baum not in e["baeume"]:
-            rows.append({"id": str(e.get("id", "")), "datei": datei, "hinweis": b.get("zeile"), "treffer": 0, "zeile": b.get("zeile"),
-                         "status": "andere_linie", "_path": path})
+        file = str(b["file"])
+        path = file if os.path.isabs(file) else (os.path.join(root, file) if root else "")
+        if tree and isinstance(e.get("trees"), list) and tree not in e["trees"]:
+            rows.append({"id": str(e.get("id", "")), "file": file, "note": b.get("zeile"), "treffer": 0, "zeile": b.get("zeile"),
+                         "status": "other_line", "_path": path})
             continue
         if path not in texts:
             try:
@@ -337,26 +337,26 @@ def resolve_edge_belege(edges: Sequence[Mapping], root: str, baum: str = "") -> 
             except OSError:
                 texts[path] = None
         text = texts[path]
-        row: Dict[str, object] = {"id": str(e.get("id", "")), "datei": datei, "hinweis": b.get("zeile"), "treffer": 0,
+        row: Dict[str, object] = {"id": str(e.get("id", "")), "file": file, "note": b.get("zeile"), "treffer": 0,
                                   "zeile": b.get("zeile"), "status": "", "_path": path}
         if text is None:
-            row["status"] = "extern_fehlt" if os.path.isabs(datei) else "datei_fehlt"
+            row["status"] = "extern_fehlt" if os.path.isabs(file) else "datei_fehlt"
         else:
-            row["_hits"] = anchor_lines(text, str(b.get("anker") or ""))
+            row["_hits"] = anchor_lines(text, str(b.get("anchor") or ""))
             row["treffer"] = len(row["_hits"])
         rows.append(row)
     unique: Dict[str, List[Tuple[int, int]]] = {}
     for r in rows:
         h = r.get("_hits")
-        if h is not None and len(h) == 1 and isinstance(r["hinweis"], int):
-            unique.setdefault(str(r["_path"]), []).append((r["hinweis"], h[0] - r["hinweis"]))
+        if h is not None and len(h) == 1 and isinstance(r["note"], int):
+            unique.setdefault(str(r["_path"]), []).append((r["note"], h[0] - r["note"]))
     out: Dict[str, Dict[str, object]] = {}
     for r in rows:
         if not r["status"]:
-            near = sorted(unique.get(str(r["_path"]), []), key=lambda t: abs(t[0] - (r["hinweis"] if isinstance(r["hinweis"], int) else 0)))[:3]
+            near = sorted(unique.get(str(r["_path"]), []), key=lambda t: abs(t[0] - (r["note"] if isinstance(r["note"], int) else 0)))[:3]
             drifts = sorted(d for _s, d in near)
             drift = drifts[len(drifts) // 2] if drifts else 0
-            line, r["status"] = resolve_anchor(r["_hits"], r["hinweis"], drift)
+            line, r["status"] = resolve_anchor(r["_hits"], r["note"], drift)
             if line is not None:
                 r["zeile"] = line
         out[str(r["id"])] = {k: v for k, v in r.items() if not k.startswith("_")}
@@ -364,35 +364,35 @@ def resolve_edge_belege(edges: Sequence[Mapping], root: str, baum: str = "") -> 
 
 
 def _beleg(e: Mapping, res: Optional[Mapping] = None) -> Optional[Dict[str, object]]:
-    b = e.get("beleg")
-    if not isinstance(b, dict) or not b.get("datei"):
+    b = e.get("evidence")
+    if not isinstance(b, dict) or not b.get("file"):
         return None
-    out = {"datei": str(b.get("datei")), "zeile": b.get("zeile"), "anker": str(b.get("anker") or "")}
+    out = {"file": str(b.get("file")), "zeile": b.get("zeile"), "anchor": str(b.get("anchor") or "")}
     if res is not None:
         # displayed line = the resolved one; the stored line is kept as a hint, the status says how it was found
-        out.update({"zeile": res["zeile"], "zeile_hinweis": b.get("zeile"), "aufloesung": res["status"]})
+        out.update({"zeile": res["zeile"], "row_note": b.get("zeile"), "aufloesung": res["status"]})
     return out
 
 
 def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping], info: Dict[str, object],
                 refusal_codes: Optional[Sequence[str]] = None,
-                belege: Optional[Mapping[str, Mapping]] = None) -> Dict[str, object]:
+                evidence_items: Optional[Mapping[str, Mapping]] = None) -> Dict[str, object]:
     """Merge the edge catalog into ``entries[von]["depends"]`` (key ``(von, nach)``), IN PLACE, and say what happened.
 
-    * a curated edge with a catalog edge of the same pair gets ``kante`` (id), ``beleg`` (``datei``/``zeile``/``anker``), ``satz``
-      (the tradeoff sentence), ``wert`` (the condition, shown as text only -- the editor does NOT evaluate it) and ``belegt: True``;
-      when the catalog names another ``rel``, the curated one stays and ``rel_katalog`` carries the catalog's (no silent overwrite);
-    * a catalog edge with no curated twin is appended (``quelle: "katalog"``);
+    * a curated edge with a catalog edge of the same pair gets ``edge`` (id), ``evidence`` (``file``/``zeile``/``anchor``), ``satz``
+      (the tradeoff sentence), ``value`` (the condition, shown as text only -- the editor does NOT evaluate it) and ``belegt: True``;
+      when the catalog names another ``rel``, the curated one stays and ``rel_catalog`` carries the catalog's (no silent overwrite);
+    * a catalog edge with no curated twin is appended (``quelle: "catalog"``);
     * a curated edge without catalog edge stays and is marked ``belegt: False`` -- "ohne Beleg", not refuted;
-    * every edge gets ``to_kind``: ``flag`` / ``env`` / ``var`` (a row of the editor), ``ablehnung`` (a code of the refusal register,
+    * every edge gets ``to_kind``: ``flag`` / ``env`` / ``var`` (a row of the editor), ``refusal`` (a code of the refusal register,
       no row) or ``unbekannt`` -- so a chip never points silently at nothing.
 
-    ``belege`` (from :func:`resolve_edge_belege`): the evidence line shown is the one resolved by its anchor text, the stored line
-    becomes ``zeile_hinweis`` and ``aufloesung`` says how it was found (``eindeutig``/``nah``/``veraltet``/``mehrdeutig``/...).
+    ``evidence_items`` (from :func:`resolve_edge_evidence_items`): the evidence line shown is the one resolved by its anchor text, the stored line
+    becomes ``row_note`` and ``aufloesung`` says how it was found (``eindeutig``/``nah``/``veraltet``/``mehrdeutig``/...).
 
     No rule is evaluated here (Nutzerentscheid 05.10.): the launcher and the dry run judge, the edges only explain."""
     codes = set(refusal_codes or ())
-    belege = belege or {}
+    evidence_items = evidence_items or {}
     by_pair: Dict[Tuple[str, str], Mapping] = {(str(e["von"]), str(e["nach"])): e for e in edges}
     used = set()
     skipped: List[str] = []
@@ -401,15 +401,15 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
         for d in ent.get("depends", []):
             e = by_pair.get((name, str(d.get("to"))))
             if e is None:
-                d.update({"belegt": False, "quelle": "kuratiert", "beleg": None, "satz": "", "kante": "", "wert": None})
+                d.update({"belegt": False, "quelle": "curated", "evidence": None, "satz": "", "edge": "", "value": None})
                 continue
             used.add((name, str(d["to"])))
-            d.update({"belegt": True, "quelle": "katalog+kuratiert", "kante": str(e.get("id", "")), "beleg": _beleg(e, belege.get(str(e.get("id", "")))),
-                      "satz": str(e.get("satz") or ""), "wert": e.get("wert")})
-            if isinstance(e.get("baeume"), list):
-                d["baeume"] = list(e["baeume"])      # the edge documents the code of these trees only (absent = both lines)
+            d.update({"belegt": True, "quelle": "catalog+curated", "edge": str(e.get("id", "")), "evidence": _beleg(e, evidence_items.get(str(e.get("id", "")))),
+                      "satz": str(e.get("satz") or ""), "value": e.get("value")})
+            if isinstance(e.get("trees"), list):
+                d["trees"] = list(e["trees"])      # the edge documents the code of these trees only (absent = both lines)
             if e["rel"] != d.get("rel"):
-                d["rel_katalog"] = e["rel"]
+                d["rel_catalog"] = e["rel"]
                 rel_diff.append(str(e.get("id", "")))
     new = 0
     for key, e in by_pair.items():
@@ -421,10 +421,10 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
             continue
         ent.setdefault("depends", []).append({
             "to": key[1], "rel": e["rel"], "effect": str(e.get("satz") or ""), "calc": e.get("calc") or "text", "belegt": True,
-            "quelle": "katalog", "kante": str(e.get("id", "")), "beleg": _beleg(e, belege.get(str(e.get("id", "")))), "satz": str(e.get("satz") or ""),
-            "wert": e.get("wert")})
-        if isinstance(e.get("baeume"), list):
-            ent["depends"][-1]["baeume"] = list(e["baeume"])
+            "quelle": "catalog", "edge": str(e.get("id", "")), "evidence": _beleg(e, evidence_items.get(str(e.get("id", "")))), "satz": str(e.get("satz") or ""),
+            "value": e.get("value")})
+        if isinstance(e.get("trees"), list):
+            ent["depends"][-1]["trees"] = list(e["trees"])
         new += 1
     n_with = n_without = n_kind_unknown = 0
     for ent in entries.values():
@@ -433,7 +433,7 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
             if to in entries:
                 d["to_kind"] = str(entries[to].get("kind") or "unbekannt")
             elif to in codes or (not codes and _RX_CODE.match(to)):
-                d["to_kind"] = "ablehnung"
+                d["to_kind"] = "refusal"
             else:
                 d["to_kind"] = "unbekannt"
                 n_kind_unknown += 1
@@ -442,13 +442,13 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
             else:
                 n_without += 1
     info.update({"verschmolzen": len(used), "neu": new, "uebersprungen_ohne_von": skipped, "rel_abweichend": rel_diff,
-                 "kanten_belegt": n_with, "kanten_ohne_beleg": n_without, "ziel_unbekannt": n_kind_unknown,
-                 "wertbedingt": sum(1 for e in edges if e.get("wert"))})
-    if belege:
+                 "kanten_belegt": n_with, "edges_without_evidence": n_without, "ziel_unbekannt": n_kind_unknown,
+                 "wertbedingt": sum(1 for e in edges if e.get("value"))})
+    if evidence_items:
         stat: Dict[str, int] = {}
-        for r in belege.values():
+        for r in evidence_items.values():
             stat[str(r["status"])] = stat.get(str(r["status"]), 0) + 1
-        info["beleg_aufloesung"] = {"status": stat, "problem": sorted(i for i, r in belege.items() if r["status"] in ANKER_PROBLEM)}
+        info["beleg_aufloesung"] = {"status": stat, "problem": sorted(i for i, r in evidence_items.items() if r["status"] in ANKER_PROBLEM)}
     return info
 
 
@@ -594,47 +594,47 @@ def _harvest(launcher_path: str, environ_path: str, server_args_path: str = "", 
                 continue
             entries[name] = {"id": name, "kind": "flag", "name": name, "type": "bool" if r["bare"] else "str",
                              "default": r["default"], "choices": r["choices"], "bare": r["bare"], "nargs": r["nargs"],
-                             "text": "", "gain": "", "cost": "", "depends": [], "level": "experte", "group": "",
+                             "text": "", "gain": "", "cost": "", "depends": [], "level": "expert", "group": "",
                              "planner_derived": False, "scope": "server",
                              "source": {"file": "server_args.py", "line": r["line"], "kind": "argparse"},
-                             "help": r["help"], "status": "geerntet" if r["help"] else "unerklaert"}
+                             "help": r["help"], "status": "harvested" if r["help"] else "unexplained"}
     for name, r in flags.items():
         e: Dict[str, object] = {"id": name, "kind": "flag", "name": name, "type": r["type"] or ("bool" if r["bare"] else "str"),
                                 "default": r["default"], "choices": r["choices"], "bare": r["bare"], "nargs": r["nargs"],
-                                "text": "", "gain": "", "cost": "", "depends": [], "level": "experte", "group": "",
+                                "text": "", "gain": "", "cost": "", "depends": [], "level": "expert", "group": "",
                                 "planner_derived": False, "source": {"file": "pdflip/launcher.py", "line": r["line"], "kind": "argparse"},
-                                "help": r["help"], "status": "geerntet" if r["help"] else "unerklaert"}
+                                "help": r["help"], "status": "harvested" if r["help"] else "unexplained"}
         entries[name] = e
     for name, r in envs.items():
         txt = r["comment"] or r["trailing"]
         entries[name] = {"id": name, "kind": "env", "name": name, "type": r["kind"], "default": r["default"], "choices": None,
-                         "bare": False, "nargs": None, "text": "", "gain": "", "cost": "", "depends": [], "level": "experte",
+                         "bare": False, "nargs": None, "text": "", "gain": "", "cost": "", "depends": [], "level": "expert",
                          "group": "", "planner_derived": False,
                          "source": {"file": "environ.py", "line": r["line"], "kind": "environ"}, "help": txt,
-                         "status": "geerntet" if txt else "unerklaert"}
+                         "status": "harvested" if txt else "unexplained"}
     if srt_dir and os.path.isdir(srt_dir):
         for name, r in environ_constants(srt_dir).items():
             if name in entries:
                 continue        # declared in environ.py: that record stays
             entries[name] = {"id": name, "kind": "env", "name": name, "type": "os.environ", "default": r["default"], "choices": None,
-                             "bare": False, "nargs": None, "text": "", "gain": "", "cost": "", "depends": [], "level": "experte",
+                             "bare": False, "nargs": None, "text": "", "gain": "", "cost": "", "depends": [], "level": "expert",
                              "group": "", "planner_derived": False,
                              "source": {"file": r["file"], "line": r["line"], "kind": "os.environ"}, "lesestellen": r["reads"],
-                             "help": r["comment"], "status": "geerntet" if r["comment"] else "unerklaert"}
+                             "help": r["comment"], "status": "harvested" if r["comment"] else "unexplained"}
     return entries
 
 
-def _finish(entries: Dict[str, Dict[str, object]], curated: Mapping[str, Mapping], erklaert: Optional[Mapping[str, Mapping]],
-            tree_rev: str, launcher_path: str, edges_path: str, edges_root: str, baum: str = "") -> Dict[str, object]:
+def _finish(entries: Dict[str, Dict[str, object]], curated: Mapping[str, Mapping], explained: Optional[Mapping[str, Mapping]],
+            tree_rev: str, launcher_path: str, edges_path: str, edges_root: str, tree: str = "") -> Dict[str, object]:
     """Curated and explained texts, the edge catalog, statistics and the wiring statement on top of harvested ``entries`` (in place)."""
     # ``erklaert`` = one-sentence texts written from the code's consumers (``profile_catalog_curated.ERKLAERT``), status
     # "erklaert"; ``curated`` (the hand-curated core) is applied after it and wins on a name clash, status "kuratiert".
-    for name, c, stat in [(n, c, "erklaert") for n, c in (erklaert or {}).items()] + [(n, c, "kuratiert") for n, c in curated.items()]:
-        if "baeume_erwartet" in c and name not in entries:
+    for name, c, stat in [(n, c, "explained") for n, c in (explained or {}).items()] + [(n, c, "curated") for n, c in curated.items()]:
+        if "trees_expected" in c and name not in entries:
             continue        # the name lives in another tree only: no entry in a catalog that does not cover that tree
         e = entries.setdefault(name, {"id": name, "kind": c.get("kind", "env"), "name": name, "type": "str", "default": None,
                                       "choices": None, "bare": False, "nargs": None, "help": "",
-                                      "source": {"file": "profile", "line": 0, "kind": "kuratiert"}})
+                                      "source": {"file": "profile", "line": 0, "kind": "curated"}})
         for k in ("text", "gain", "cost", "group", "level", "planner_derived", "satz_quelle"):
             if k in c:
                 e[k] = c[k]
@@ -643,8 +643,8 @@ def _finish(entries: Dict[str, Dict[str, object]], curated: Mapping[str, Mapping
     ref = _refusals_module()
     edges, einfo = load_edges(edges_path)
     root = edges_root or _repo_root_of(launcher_path)
-    belege = resolve_edge_belege(edges, root, baum) if root else None
-    merge_edges(entries, edges, einfo, [r.code for r in ref.REGISTER] if ref is not None else None, belege)
+    evidence_items = resolve_edge_evidence_items(edges, root, tree) if root else None
+    merge_edges(entries, edges, einfo, [r.code for r in ref.REGISTER] if ref is not None else None, evidence_items)
     cat = {"schema": SCHEMA, "tree_rev": tree_rev, "entries": entries, "stats": coverage(entries), "kanten": einfo}
     try:
         with open(launcher_path, encoding="utf-8") as fh:
@@ -660,11 +660,11 @@ def _finish(entries: Dict[str, Dict[str, object]], curated: Mapping[str, Mapping
 
 def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, Mapping], tree_rev: str = "",
                   server_args_path: str = "", edges_path: str = "", edges_root: str = "",
-                  erklaert: Optional[Mapping[str, Mapping]] = None, srt_dir: str = "", baum: str = "") -> Dict[str, object]:
-    """The catalog of ONE tree.  ``srt_dir`` (optional) also harvests the names the code reads through ``os.environ``.  ``baum`` = the
-    label of this tree (``"27b"`` / ``"nf"``, see :func:`resolve_edge_belege`); ``""`` checks every edge's evidence in this tree."""
+                  explained: Optional[Mapping[str, Mapping]] = None, srt_dir: str = "", tree: str = "") -> Dict[str, object]:
+    """The catalog of ONE tree.  ``srt_dir`` (optional) also harvests the names the code reads through ``os.environ``.  ``tree`` = the
+    label of this tree (``"27b"`` / ``"nf"``, see :func:`resolve_edge_evidence_items`); ``""`` checks every edge's evidence in this tree."""
     entries = _harvest(launcher_path, environ_path, server_args_path, srt_dir)
-    return _finish(entries, curated, erklaert, tree_rev, launcher_path, edges_path, edges_root, baum)
+    return _finish(entries, curated, explained, tree_rev, launcher_path, edges_path, edges_root, tree)
 
 
 def _differs(a: Mapping, b: Mapping) -> bool:
@@ -672,9 +672,9 @@ def _differs(a: Mapping, b: Mapping) -> bool:
 
 
 def build_union_catalog(trees: Sequence[Tuple[str, str]], curated: Mapping[str, Mapping], tree_revs: Optional[Mapping[str, str]] = None,
-                        edges_path: str = "", edges_root: str = "", erklaert: Optional[Mapping[str, Mapping]] = None) -> Dict[str, object]:
+                        edges_path: str = "", edges_root: str = "", explained: Optional[Mapping[str, Mapping]] = None) -> Dict[str, object]:
     """ONE catalog over several code trees (the release image carries two: the 27B and the NF line).  ``trees`` = ``[(label, python_dir)]`` in
-    priority order: the first tree that has a name gives its record.  Every entry gets ``baeume`` (the labels of the trees that have it); when
+    priority order: the first tree that has a name gives its record.  Every entry gets ``trees`` (the labels of the trees that have it); when
     the trees disagree on default or help text, ``abweichung`` carries each tree's own values.  Edges, refusal wiring and the curated texts
     come once, from the FIRST tree's launcher (``edges_root`` resolves the edges' evidence lines)."""
     if not trees:
@@ -690,16 +690,16 @@ def build_union_catalog(trees: Sequence[Tuple[str, str]], curated: Mapping[str, 
         for name, e in ents.items():
             if name not in union:
                 # ``source.baum``: which tree the file:line belongs to (a name in both trees shows the first tree's place)
-                union[name] = dict(e, baeume=[label], source=dict(e["source"], baum=label))
+                union[name] = dict(e, trees=[label], source=dict(e["source"], tree=label))
             else:
-                union[name]["baeume"].append(label)
+                union[name]["trees"].append(label)
     for name, e in union.items():
-        have = [(lb, per_tree[lb][name]) for lb in e["baeume"]]
+        have = [(lb, per_tree[lb][name]) for lb in e["trees"]]
         if len(have) > 1 and any(_differs(have[0][1], o) for _lb, o in have[1:]):
             e["abweichung"] = {lb: {"default": o.get("default"), "help": o.get("help"), "source": o.get("source")} for lb, o in have}
     revs = dict(tree_revs or {})
-    cat = _finish(union, curated, erklaert, "+".join("%s=%s" % (lb, revs.get(lb, "")) for lb, _p in trees), first_launcher, edges_path,
-                  edges_root, baum=trees[0][0])
+    cat = _finish(union, curated, explained, "+".join("%s=%s" % (lb, revs.get(lb, "")) for lb, _p in trees), first_launcher, edges_path,
+                  edges_root, tree=trees[0][0])
     labels = [lb for lb, _p in trees]
     # The edges' evidence lines shown above are the FIRST tree's.  Every tree's own anchors are checked here (an edge that names only the
     # other line's tree in ``baeume`` is ``andere_linie``, not a problem), so a stale anchor in EITHER tree shows in the file.
@@ -708,7 +708,7 @@ def build_union_catalog(trees: Sequence[Tuple[str, str]], curated: Mapping[str, 
     for i, (lb, py) in enumerate(trees):
         root = (edges_root if i == 0 and edges_root else "") or _repo_root_of(find_tree_files(py)[0])
         if root:
-            res = resolve_edge_belege(edges, root, lb)
+            res = resolve_edge_evidence_items(edges, root, lb)
             stat: Dict[str, int] = {}
             for r in res.values():
                 stat[str(r["status"])] = stat.get(str(r["status"]), 0) + 1
@@ -717,24 +717,24 @@ def build_union_catalog(trees: Sequence[Tuple[str, str]], curated: Mapping[str, 
         cat["kanten"]["beleg_aufloesung_baeume"] = per
     # no ``python_dir``: a build path in the output would make the file differ from machine to machine (reproducible build)
     cat["trees"] = {lb: {"rev": revs.get(lb, ""), "entries": len(per_tree[lb])} for lb, _py in trees}
-    cat["stats"]["baeume"] = {"nur_" + lb: sum(1 for e in union.values() if e.get("baeume") == [lb]) for lb in labels}
-    cat["stats"]["baeume"]["beide"] = sum(1 for e in union.values() if len(e.get("baeume", [])) == len(labels) > 1)
-    cat["stats"]["baeume"]["abweichung"] = sum(1 for e in union.values() if "abweichung" in e)
+    cat["stats"]["trees"] = {"nur_" + lb: sum(1 for e in union.values() if e.get("trees") == [lb]) for lb in labels}
+    cat["stats"]["trees"]["beide"] = sum(1 for e in union.values() if len(e.get("trees", [])) == len(labels) > 1)
+    cat["stats"]["trees"]["abweichung"] = sum(1 for e in union.values() if "abweichung" in e)
     cat["warnungen"] = [
-        "%s: the text expects the trees %s, the entry is in %s" % (n, c["baeume_erwartet"], union[n].get("baeume"))
-        for n, c in sorted((erklaert or {}).items())
-        if "baeume_erwartet" in c and n in union and union[n].get("baeume") != c["baeume_erwartet"]]
-    cat["warnungen"] += ["%s: the text expects the trees %s, the name is in no tree" % (n, c["baeume_erwartet"])
-                         for n, c in sorted((erklaert or {}).items()) if "baeume_erwartet" in c and n not in union]
+        "%s: the text expects the trees %s, the entry is in %s" % (n, c["trees_expected"], union[n].get("trees"))
+        for n, c in sorted((explained or {}).items())
+        if "trees_expected" in c and n in union and union[n].get("trees") != c["trees_expected"]]
+    cat["warnungen"] += ["%s: the text expects the trees %s, the name is in no tree" % (n, c["trees_expected"])
+                         for n, c in sorted((explained or {}).items()) if "trees_expected" in c and n not in union]
     return cat
 
 
 def coverage(entries: Mapping[str, Mapping]) -> Dict[str, int]:
     n = len(entries)
-    return {"entries": n, "kuratiert": sum(1 for e in entries.values() if e["status"] == "kuratiert"),
-            "erklaert": sum(1 for e in entries.values() if e["status"] == "erklaert"),
-            "geerntet": sum(1 for e in entries.values() if e["status"] == "geerntet"),
-            "unerklaert": sum(1 for e in entries.values() if e["status"] == "unerklaert"),
+    return {"entries": n, "curated": sum(1 for e in entries.values() if e["status"] == "curated"),
+            "explained": sum(1 for e in entries.values() if e["status"] == "explained"),
+            "harvested": sum(1 for e in entries.values() if e["status"] == "harvested"),
+            "unexplained": sum(1 for e in entries.values() if e["status"] == "unexplained"),
             "flags": sum(1 for e in entries.values() if e["kind"] == "flag"),
             "envs": sum(1 for e in entries.values() if e["kind"] == "env")}
 
@@ -752,7 +752,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--python-dir", default="", help="<tree>/python (launcher.py and environ.py are read from it); ONE tree")
     ap.add_argument("--rev", default="")
-    ap.add_argument("--baum", default="", help="with --python-dir: the label of this tree (27b|nf); edges that name only the other tree are not checked")
+    ap.add_argument("--tree", default="", help="with --python-dir: the label of this tree (27b|nf); edges that name only the other tree are not checked")
     ap.add_argument("--tree-27b", default="", help="<tree>/python of the 27B line; with --tree-nf the catalog covers BOTH trees")
     ap.add_argument("--tree-nf", default="", help="<tree>/python of the NF line")
     ap.add_argument("--rev-27b", default="")
@@ -771,12 +771,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     spec.loader.exec_module(mod)
     if ns.tree_27b:
         cat = build_union_catalog([("27b", ns.tree_27b), ("nf", ns.tree_nf)], mod.CURATED, {"27b": ns.rev_27b, "nf": ns.rev_nf},
-                                  erklaert=mod.ERKLAERT)
+                                  explained=mod.EXPLAINED)
     else:
         launcher, environ, sargs = find_tree_files(py)
-        cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs, erklaert=mod.ERKLAERT, srt_dir=os.path.join(py, "flliper", "srt"),
-                            baum=ns.baum)
-    cat["glossar"] = dict(mod.GLOSSAR)
+        cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs, explained=mod.EXPLAINED, srt_dir=os.path.join(py, "flliper", "srt"),
+                            tree=ns.tree)
+    cat["glossary"] = dict(mod.GLOSSARY)
     cat["anzeige"] = {"rel": dict(REL_ANZEIGE), "status": dict(STATUS_ANZEIGE)}
     text = json.dumps(cat, indent=1, sort_keys=True, ensure_ascii=False, default=str) + "\n"
     if ns.out:
@@ -785,9 +785,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         sys.stdout.write(text)
     st = cat["stats"]
-    print("catalog: %(entries)d entries (%(flags)d flags, %(envs)d envs): %(kuratiert)d kuratiert, %(erklaert)d erklaert, %(geerntet)d geerntet, %(unerklaert)d unerklaert" % st, file=sys.stderr)
-    if "baeume" in st:
-        print("trees: %s" % ", ".join("%s=%s" % kv for kv in sorted(st["baeume"].items())), file=sys.stderr)
+    print("catalog: %(entries)d entries (%(flags)d flags, %(envs)d envs): %(curated)d curated, %(explained)d explained, %(harvested)d harvested, %(unexplained)d unexplained" % st, file=sys.stderr)
+    if "trees" in st:
+        print("trees: %s" % ", ".join("%s=%s" % kv for kv in sorted(st["trees"].items())), file=sys.stderr)
     for w in cat.get("warnungen", []):
         print("WARNUNG: %s" % w, file=sys.stderr)
     return 0

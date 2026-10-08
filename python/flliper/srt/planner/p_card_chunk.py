@@ -1078,8 +1078,8 @@ def p_card_reference_from_logs(
 
     #242b ``windows=True`` (Logs mit H55-Fenstern und ``#969N ADMIT``, die
     Mehr-Sequenz-Form H91): der Chunk-0-Punkt nur aus einem EIN-Sequenz-Chunk,
-    normiert mit SEINER gemessenen Transiente (Spitze minus allocated danach,
-    das H55-Fenster derselben Spitze) statt dem Stuetzpunkt; das Wachstum nur
+    normiert mit SEINER gemessenen Transiente (Peak minus allocated danach,
+    das H55-Fenster derselben Peak) statt dem Stuetzpunkt; das Wachstum nur
     aus Ein-Sequenz-Chunks derselben Anfrage (:func:`window_growth`). Die
     Hochwassermarken mischen sonst die Last (2-5 Sequenzen im 16k-Chunk: PP0
     +2500 MiB Transiente) in das Wachstum mit der Tiefe (28.09.: 1942 statt
@@ -1824,7 +1824,7 @@ def p_card_refusal_text(
         "%s (P, chunk %d, prompt %d): die Experten-Residenz passt ins Budget, aber nicht "
         "auf die KARTE am letzten Chunk -- %s. Gemessen: Kopfraum am Chunk 0 von %s, "
         "verschoben um Puffer (je Zeile ueber der Referenz zum gemessenen Preis), KV, "
-        "Chunk-Transiente, Draft, Chunk-Wachstum der Spitze, den Run-Write-LMEM und den "
+        "Chunk-Transiente, Draft, Chunk-Wachstum der Peak, den Run-Write-LMEM und den "
         "Mitbewohner-Hochstand (schlafender D-Rang derselben Karte); "
         "fnFL2x121 (FR_P[0] 0.45) und x122 (0.40) starben im ersten 16k-Chunk, "
         "fnFL2x149 (0.351) im zweiten am Run-Write-LMEM (H47), fnFL2x164 (0.410, "

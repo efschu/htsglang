@@ -13,7 +13,7 @@ davon NICHTS. Manifest, Cross-Group-Join und Plan erbten die Luecke.
 WARUM EIN PUFFER UND NICHT JE BAND (w67 hat das widerlegt): `_nbytes` misst
 den STORAGE, weil `covered_storage` per Storage-Key deckt -- ein View meldet
 damit den ganzen Puffer (mib=800.000 fuer 25 MiB) und die Coverage refuest
-(W84). Ein Band kann auch kein eigener Tensor sein, der MoE-Kernel braucht
+(W84). Ein Band kann auch kein eigener Tensor sein, der MoE-Kernel requires
 den Stapel zusammenhaengend. Der Schnitt ueber die Experten gehoert deshalb
 in die SHARD-ACHSE, die der Join aus den Manifesten abliest.
 """

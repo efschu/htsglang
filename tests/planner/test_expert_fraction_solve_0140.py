@@ -1,7 +1,7 @@
 """#140: der Planner spuckt die Experten-Fraction aus, statt sie zu nehmen.
 
 Nutzer-Order 22.09., woertlich: *"diese falschen sizing zahlen tauchen jetzt
-immer und immer wieder auf, werden dann endlos analysiert und verworfen und
+immer und immer wieder auf, werden dann endlos analysiert und rejected und
 halluziniert und neu berechnet. der planner muss sie ausspucken"*.
 
 Der Anlass mit Zahl, fnFL2w73: PP2 haelt bei FR_P 0.95 487 von 512 Experten,
@@ -52,7 +52,7 @@ def test_lru_rows_are_charged():
 
 def test_stage_that_cannot_carry_dense_gives_zero():
     """Geklemmt, aber der Aufrufer soll es benennen: 0.0 heisst hier NICHT
-    'passt knapp', sondern 'diese Stufe traegt ihre Dense-Gewichte nicht'."""
+    'passt tight', sondern 'diese Stufe traegt ihre Dense-Gewichte nicht'."""
     f = solve_expert_fraction_per_stage(
         budgets_mib=[500], stage_layers=[10], mean_layer_mib=100.0,
         expert_layer_mib=1000.0, num_experts=512, lru_rows=[0],

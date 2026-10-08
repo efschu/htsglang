@@ -1,6 +1,6 @@
 """DIE EXPERTEN-KARTE -- wer haelt welchen Experten, und wo liegt der Rest.
 
-Nutzer-Gesetz 22.09.: *"alles was geshardet wird braucht ne karte"*. Die
+Nutzer-Gesetz 22.09.: *"alles was geshardet wird requires ne karte"*. Die
 Dense-Gewichte haben eine (``tp_widths``/``src_widths``), der Draft hat
 eine (``region_tag=weights_draft``); die Experten hatten keine. Ihre
 Aufteilung wurde an VIER Stellen unabhaengig aus denselben zwei Vektoren
@@ -15,7 +15,7 @@ abgeleitet -- ``slot_base_for_rank``, ``global_rows``,
 DIE KARTE IST DER TAUSCH, NICHT DIE VEREINIGUNG (Nutzer 22.09. 07:08Z):
 
     "falls das andere layout einen/mehrere andere experten im vram
-     braucht wie das zum schluss geladene, muessen die vram layer zurueck
+     requires wie das zum schluss geladene, muessen die vram layer zurueck
      in den moe cache und die benoetigten experten in den vram. kein
      zusaetzlicher systemram dafuer notwendig"
 
@@ -24,7 +24,7 @@ die Vereinigung aller je kalten Ids. Beide Phasen halten hier 188 von 512
 resident, also hat der Store 324 Plaetze -- exakt die am Metall gemessene
 Zahl aus fnFL2w24 und w30 (506,25 MiB je Tensor, 36,71 statt 58,01 GiB).
 Beim Flip wandern nur die Ids, die die Phasen NICHT teilen: die
-Schnittmenge bleibt auf den Karten liegen, der Rest tauscht Platz gegen
+Schnittmenge bleibt auf den Karten liegen, der Rest trades Platz gegen
 Platz. Die Belegung bleibt dabei konstant.
 
 SKALIERTE GRENZEN, NICHT DIE ROHEN RATIOS. ``--rank-moe-ratio
@@ -149,7 +149,7 @@ def resident_count_like_the_rank(n: int, fraction: float) -> int:
     Vorher rechnete sie ``round(n * f)`` und der Rang ``max(1, ceil(f*n))``.
     An den acht Fraktionen, die am 22.09. wirklich gefahren wurden,
     divergierten SIEBEN -- jedes Mal um genau eine Id, und jedes Mal so,
-    dass die Karte einen Experten fuer kalt erklaert, den der Rang resident
+    dass die Karte einen Experten fuer kalt explained, den der Rang resident
     haelt:
 
         P  512 x 0.459  ->  Rang 236, Karte 235   (fnFL2w133)
@@ -278,7 +278,7 @@ def build(total: int,
     """Die Karte beider Phasen, mit EINER Platzzahl fuer beide.
 
     ``slots`` ist das Maximum der beiden kalten Mengen, nicht ihre
-    Vereinigung: mehr Plaetze braucht der Tausch nie, weniger wuerde ihn
+    Vereinigung: mehr Plaetze requires der Tausch nie, weniger wuerde ihn
     unmoeglich machen. ``moves`` sagt, wieviele Zeilen ein Flip bewegt --
     die Schnittmenge bleibt liegen, und genau das ist die Ersparnis, die
     kein zusaetzliches Systemram kostet.
@@ -579,7 +579,7 @@ def nested_join_verdict(emap: dict) -> List[str]:
 def _refuse_if_inconsistent_nested(emap: dict, total: int) -> Optional[str]:
     """Version 2: der Store haelt dauerhaft alles AUSSER der Schnittmenge aller
     Praefixe; jede Id, die eine Phase fuer einen Layer NICHT auf der Karte hat,
-    braucht einen Platz, und keine Id der Schnittmenge darf einen haben."""
+    requires einen Platz, und keine Id der Schnittmenge darf einen haben."""
     try:
         commons = emap["phases"][PHASE_PP]["common"]
         res_p = emap["phases"][PHASE_PP]["resident"]
@@ -609,8 +609,8 @@ def _refuse_if_inconsistent_nested(emap: dict, total: int) -> Optional[str]:
         return f"D: {len(missing_d)} kalte Ids ohne Store-Platz (erste {missing_d[:4]})"
     if cold_ids and max(int(v) for v in slot_of_.values()) >= int(emap["slots"]):
         return f"ein Platz liegt hinter dem Ende der Datei ({emap['slots']})"
-    grund = nested_join_verdict(emap)
-    return grund[0] if grund else None
+    reason = nested_join_verdict(emap)
+    return reason[0] if reason else None
 
 
 def phase_of(group: str) -> str:
@@ -680,7 +680,7 @@ def join_verdict(emap: dict) -> List[str]:
             f"Stufe {i}: P haelt {len(p_ids)} Experten, D haelt {len(d_ids)}, "
             f"gemeinsam {len(p_ids & d_ids)} -- P-only {len(p_ids - d_ids)}, "
             f"D-only {len(d_ids - p_ids)}. Der Austausch vergleicht je Layer "
-            f"und braucht DIESELBEN Ids auf beiden Seiten."
+            f"und requires DIESELBEN Ids auf beiden Seiten."
         )
     return out
 

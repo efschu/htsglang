@@ -27,7 +27,7 @@ same run measured Marlin at 3231.18 + 1694.36 us = 55.6 TFLOPS, i.e. it reproduc
 
   RTX 3080  W4A8    2749.29 + 1619.81 us ->  62.7 TOPS   (power limit 230 W)
 
-The power limit is part of the record (p-schnitt-anpassbar-powerlimit): another
+The power limit is part of the record (p-cut-anpassbar-powerlimit): another
 limit is another record -- re-measure, never scale.
 """
 

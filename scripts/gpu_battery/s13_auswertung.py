@@ -3,11 +3,11 @@
 
 Reads three kinds of artifact out of one step directory and prints markdown:
 
-  punkte.jsonl        one line per measured point, arm name carrying the round
+  data_points.jsonl        one line per measured point, arm name carrying the round
                       as a suffix ("bar1pipe_r2")
   wait/<arm>.json     the compute/wait split of that boot's primary point,
                       produced on the host by s12_log_analyse
-  belege/<arm>.txt    the ACHIEVED lines and the prefill-graph lines of that
+  evidence_items/<arm>.txt    the ACHIEVED lines and the prefill-graph lines of that
                       boot -- evidence, not numbers
 
 THE NOISE FLOOR IS COMPUTED, NOT ASSUMED. Every arm ran in every round, so the
@@ -42,7 +42,7 @@ def arm_and_round(name: str) -> tuple:
 
 
 def load_points(step_dir: str) -> list:
-    path = os.path.join(step_dir, "punkte.jsonl")
+    path = os.path.join(step_dir, "data_points.jsonl")
     out = []
     if not os.path.exists(path):
         return out
@@ -85,7 +85,7 @@ def load_evidence(step_dir: str) -> dict:
     substrings counted below are log lines the server writes, matched verbatim.
     """
     out: dict = {}
-    d = os.path.join(step_dir, "belege")
+    d = os.path.join(step_dir, "evidence_items")
     if not os.path.isdir(d):
         return out
     for name in sorted(os.listdir(d)):
@@ -104,7 +104,7 @@ def load_evidence(step_dir: str) -> dict:
             pg = "off (auto-disable)"
         out[(arm, rnd)] = {
             "bar1_gruppen": text.count("barlink-BAR1: setup in"),
-            "erreicht": len(re.findall(r"ACHIEVED=", text)),
+            "reached": len(re.findall(r"ACHIEVED=", text)),
             "pipe_zeilen": text.count("barlink-BAR1-PIPE:"),
             "vorrat_leer": (
                 "the graph pool of the result ring is exhausted" in text
@@ -316,7 +316,7 @@ def report(step_dir: str) -> str:
             if not b:
                 continue
             lines.append(
-                f"| {arm} | {rnd} | {b['erreicht']} | {b['bar1_gruppen']} | "
+                f"| {arm} | {rnd} | {b['reached']} | {b['bar1_gruppen']} | "
                 f"{b['pipe_zeilen']} | {'yes' if b['vorrat_leer'] else 'no'} | "
                 f"{b['prefill_graph']} |"
             )

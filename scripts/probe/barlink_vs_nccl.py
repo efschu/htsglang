@@ -13,7 +13,7 @@ WARUM KOLLEKTIVE UND KEIN send/recv
 ===================================
 barlink implementiert ausschliesslich Kollektive (all_reduce, broadcast,
 all_gather, reduce_scatter) und KEIN send/recv. Ein Vergleich mit dem
-Punkt-zu-Punkt-Ping-Pong waere deshalb schief. Gemessen wird daher
+Punkt-zu-Punkt-Ping-Pong waere deshalb skewed. Gemessen wird daher
 all_reduce gegen all_reduce und broadcast gegen broadcast.
 
     Alle Zeiten sind die VOLLE Operationsdauer.
@@ -54,7 +54,7 @@ viele Kollektive absetzten. Hier gilt:
     je Zelle) und verteilt ihn per broadcast_object_list. Kein Rang leitet
     eine Rundenzahl selbst ab.
   * Kommt ein Backend auf einem Rang nicht hoch, wird das per all_gather_object
-    bekannt gemacht und das Backend auf ALLEN Raengen verworfen.
+    bekannt gemacht und das Backend auf ALLEN Raengen rejected.
   * Kein unbegrenztes Warten: gloo-Timeout, harter Watchdog je Rang, Timeout
     im Elternprozess.
 """

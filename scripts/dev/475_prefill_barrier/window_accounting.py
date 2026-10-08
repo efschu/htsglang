@@ -6,7 +6,7 @@ collectives. Ranks run lockstep, so T is common. Therefore
     max_r compute_r = T - min_r wait_r   (the critical rank's own work)
     min_r wait_r                          (the part no weight re-split removes)
 Batches are grouped into probe CLUSTERS by a >20 s idle gap and matched to the
-punkte.jsonl records in order.
+data_points.jsonl records in order.
 """
 import json
 import re
@@ -85,7 +85,7 @@ if __name__ == "__main__":
            "435": "/spinning/gpu-battery-results/2026-08-02_435_coupling_fp8bar1"}
     for bat, d in BAT.items():
         d = Path(d)
-        recs = [json.loads(x) for x in open(d / "raw/punkte.jsonl")]
+        recs = [json.loads(x) for x in open(d / "raw/data_points.jsonl")]
         print(f"########## battery {bat}")
         for p in sorted((d / "raw").glob("server_*.log")):
             base = p.name[7:-4]

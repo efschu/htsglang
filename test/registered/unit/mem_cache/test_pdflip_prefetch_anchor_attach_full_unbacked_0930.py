@@ -18,7 +18,7 @@ Jetzt: ATTACH haengt den Anker nur an einen Knoten mit Full-Host-Kopie. Hat
 der Endknoten keine, uebernimmt er die KV-Zeilen, die derselbe Read fuer genau
 seinen Span geliefert hat (sie wurden bisher als "schon im Baum" freigegeben);
 der Aufrufer gibt diese Zeilen dann nicht frei. Geht das nicht (write_through
-und der Elternknoten ohne Host-Kopie, keine Zeilen), wird der Anker verworfen
+und der Elternknoten ohne Host-Kopie, keine Zeilen), wird der Anker rejected
 und an den Pool zurueckgegeben, mit ``PDFLIP PREFETCH-ANCHOR-ATTACH dropped``.
 Dazu das Netz im Verdraengungs-Trichter: verlaesst die Full-Host-Kopie einen
 Knoten, gehen seine Aux-Host-Zustaende zuerst.
@@ -116,7 +116,7 @@ def test_deeper_end_node_adopts_only_its_own_span_and_the_head_is_released():
 
 def test_write_through_with_unbacked_parent_drops_and_releases_the_anchor(caplog):
     """write_through: der Elternknoten ohne Host-Kopie verbietet die Uebernahme
-    (#841-Gesetz) -> Anker verworfen, Slot an den Pool (append_host_mem_release),
+    (#841-Gesetz) -> Anker rejected, Slot an den Pool (append_host_mem_release),
     benannte Zeile, der Baum bleibt gesetzestreu."""
     cache, pool, toks = _two_node_path(_CtlWT)
     res = A._read_span(cache, toks, 96)
@@ -146,7 +146,7 @@ def test_write_through_under_the_root_adopts():
 
 def test_no_read_rows_for_the_node_drops(caplog):
     """Ohne Zeilen des Reads fuer den Endknoten gibt es keine Full-Host-Kopie:
-    verworfen, nicht angehaengt."""
+    rejected, nicht angehaengt."""
     cache, pool, toks = A._device_path(128, anchor=None)
     res = A._read_span(cache, toks, 96)
     res.matched_end_host_kv = None

@@ -29,7 +29,7 @@ NOW = 1790990000.0
 def _row(d, begin, total_ms, kind="ok", provisional=False, **kw):
     """One ipcboot.flip_views row (the keys the counting rule and the mark writer read)."""
     x = {"dir": d, "begin": begin, "kind": kind, "total_ms": total_ms, "provisional": provisional,
-         "vorlauf_ms": 100.0, "layer_ms": 2000.0, "wake_kv_dc_ms": 10.0, "nachlauf_ms": 40.0,
+         "warmup_ms": 100.0, "layer_ms": 2000.0, "wake_kv_dc_ms": 10.0, "nachlauf_ms": 40.0,
          "rest_ms": (total_ms - 2150.0) if total_ms is not None else None,
          "leer_ms": None, "halt_ms": None, "park_ms": None, "vor_rest_ms": None}
     x.update(kw)

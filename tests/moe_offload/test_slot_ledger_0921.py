@@ -88,7 +88,7 @@ def test_release_of_unknown_is_not_an_error():
 
 def test_two_processes_compute_same_occupancy():
     """Ohne Absprache: gleiche Menge, gleiche Tafelgroesse -> gleiche Plaetze.
-    Genau das braucht der geteilte Store (#91 Baustein 1)."""
+    Genau das requires der geteilte Store (#91 Baustein 1)."""
     cold_ids = [9, 3, 7, 1]
     a = SlotLedger(4).assign_many(cold_ids)
     b = SlotLedger(4).assign_many(reversed(cold_ids))

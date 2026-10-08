@@ -405,7 +405,7 @@ whether it boots.
   throughput.
 * **Artifacts** `s11_bar1_e2e/{bar1_e2e.json,graph_check.txt,barlink_lines.txt,smoke.json,server_info.json,server.log,remote_*.sh}`
 
-### S12 — `s12_prefill_kurve` · sonnet · ~70 min · NOT repeatable
+### S12 — `s12_prefill_curve` · sonnet · ~70 min · NOT repeatable
 
 **The** measurement. Over the host path the prefill curve is flat
 (1190/1097/1144/1105/1122 tok/s over 1/2/4/8/16 sessions) at 65-90% collective
@@ -452,7 +452,7 @@ it.
   (EXECUTOR_PROTOCOL 6b/6c).
 * **Not covered** compute versus wait time per rank. That needs the profiler
   and is an exercise of its own.
-* **Artifacts** `s12_prefill_kurve/{prefill_kurve.json,zwischentabelle.md,punkte.jsonl,roh_*.jsonl,belege/*,logs/*,remote_*.sh}`
+* **Artifacts** `s12_prefill_curve/{prefill_kurve.json,zwischentabelle.md,data_points.jsonl,roh_*.jsonl,evidence_items/*,logs/*,remote_*.sh}`
 
 ---
 

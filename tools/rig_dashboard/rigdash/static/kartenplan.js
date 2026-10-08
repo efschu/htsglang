@@ -1,5 +1,5 @@
 /* Kartenplaner (Item 510): Startkonfiguration für ein gewähltes Modell auf 1..6 gewählten Karten.
-   Rechnet NICHTS selbst: Katalog und Plan kommen von /api/kartenplan/* (Planer-Funktionen und Planer-Aufzeichnungen).
+   Rechnet NICHTS selbst: Catalog und Plan kommen von /api/kartenplan/* (Planer-Funktionen und Planer-Aufzeichnungen).
    Diese Datei zeichnet nur: Auswahl, Einfach-Seite, Experten-Seite. Nur im Rig-Dashboard (Edition rig).
    Seit 05.10. kein eigener Reiter mehr: der Plan ist der aufklappbare Abschnitt "Plan für andere Karten" im Profil-Planer (#kp-fold). */
 (function () {
@@ -8,10 +8,10 @@
   if (!root) return;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const fmt = (n) => (n == null ? "–" : Math.round(n).toLocaleString("en-US"));
-  const srcDisp = (t) => ({ "Datenblatt": "datasheet", "NVML-Record": "NVML record" })[t] || t;   // display words of the catalog source tags (the tags stay German keys)
+  const srcDisp = (t) => ({ "Datasheet": "datasheet", "NVML-Record": "NVML record" })[t] || t;   // display words of the catalog source tags (the tags stay German keys)
   const gib = (n) => (n == null ? "–" : (n / 1024).toLocaleString("en-US", { maximumFractionDigits: 1 }));
   const state = { cat: null, profile: null, cards: [], hostPatched: true, view: "einfach", res: null, busy: false, err: null, envFilter: "" };
-  try { const v = localStorage.getItem("rigdash.kp.view"); if (v === "einfach" || v === "experte") state.view = v; } catch (e) { /* private window */ }
+  try { const v = localStorage.getItem("rigdash.kp.view"); if (v === "einfach" || v === "expert") state.view = v; } catch (e) { /* private window */ }
 
   async function getJson(url) {
     // relative URL: the page is also served under a path prefix (nginx /rigdash/)
@@ -208,7 +208,7 @@
       `<tr><td class="mono">${esc(f.name)}</td><td class="mono kp-val">${esc(f.value)}</td><td>${esc(f.bound_by)}</td><td>${whyHtml(f)}</td></tr>`).join("") + `</table></div><div class="muted">${l.length} of ${list.length}</div>`;
   }
   function phaseTable(res, g) {
-    const p = res.plan, ph = p.experte.phases[g];
+    const p = res.plan, ph = p.expert.phases[g];
     const keys = []; ph.forEach((c) => c.segments.forEach((s) => { if (!keys.includes(s.label.replace(/ \(.*/, ""))) keys.push(s.label.replace(/ \(.*/, "")); }));
     const head = p.einfach.bars.map((b) => `<th class="num">${esc(b.card_label)}<br><span class="muted">ordinal ${b.ordinal}</span></th>`).join("");
     const rows = keys.map((k) => `<tr><td>${esc(k)}</td>${ph.map((c) => {
@@ -222,7 +222,7 @@
     const notes = ph.map((c, i) => c.notes.length ? `<li>Card ordinal ${i}: ${c.notes.map(esc).join(" · ")}</li>` : "").join("");
     return `<div class="tablewrap"><table><tr><th>Item (MiB)</th>${head}</tr>${rows}${foot}</table></div>${notes ? `<ul class="kp-notes">${notes}</ul>` : ""}`;
   }
-  function experte(res) {
+  function expert(res) {
     const v = res.verdict;
     let h = `<div class="kp-verdict ${v.goes ? "ok" : "bad"}"><b>${esc(v.headline)}</b></div>${cardsStatus(res)}`;
     if (!v.goes) h += `<ul class="kp-reasons">${reasonsHtml(v)}</ul>`;
@@ -235,7 +235,7 @@
     }
     const p = res.plan;
     if (p) {
-      const x = p.experte, s = p.source;
+      const x = p.expert, s = p.source;
       h += `<h3>Plan</h3><div class="kp-src">Plan-ID <span class="mono">${esc((s.plan_id || "(no vram_plan, boot before IPC)").slice(0, 31))}</span> · pass ${esc(s.plan_pass || "–")} · Boot <span class="mono">${esc(s.boot_tag)}</span> · Rev <span class="mono">${esc(s.rev)}</span> · Image <span class="mono">${esc(s.image)}</span> · Profile <span class="mono">${esc(s.boot_profile)}</span> · plan_id ${s.plan_id_ok === false ? "DOES NOT MATCH" : (s.plan_id_ok ? "checked" : "–")}</div>`;
       if (s.nachrechnung) {
         h += `<h3>Planner recomputed <span class="muted">launcher.budgets_from_dc, ${esc(s.nachrechnung.checked_utc)}, rev ${esc(s.nachrechnung.rev)}: ${s.nachrechnung.all_match ? "all budgets equal" : "DEVIATION"}</span></h3>
@@ -262,8 +262,8 @@
   function renderResult() {
     if (state.err) return `<div class="kp-verdict bad">${esc(state.err)}</div>`;
     if (!state.res) return `<div class="muted">${state.busy ? "computing …" : "Choose a profile and cards."}</div>`;
-    const tabs = `<div class="seg" role="tablist"><button type="button" data-view="einfach" class="${state.view === "einfach" ? "sel" : ""}">Simple</button><button type="button" data-view="experte" class="${state.view === "experte" ? "sel" : ""}">Expert</button></div>`;
-    return tabs + (state.view === "einfach" ? einfach(state.res) : experte(state.res));
+    const tabs = `<div class="seg" role="tablist"><button type="button" data-view="einfach" class="${state.view === "einfach" ? "sel" : ""}">Simple</button><button type="button" data-view="expert" class="${state.view === "expert" ? "sel" : ""}">Expert</button></div>`;
+    return tabs + (state.view === "einfach" ? einfach(state.res) : expert(state.res));
   }
 
   function draw() {

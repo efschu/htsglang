@@ -16,7 +16,7 @@ def test_checker_accepts_the_measured_form():
 
     `build` bildet kalt_p als "was MINDESTENS EINE Stufe nicht haelt"
     (#132), der Pruefer las die VEREINIGUNG -- zwei Seiten einer Naht, die
-    verschieden fragen. Die Karte wurde verworfen und der Lauf fiel auf die
+    verschieden fragen. Die Karte wurde rejected und der Lauf fiel auf die
     globale Menge zurueck.
     """
     assert em.refuse_if_inconsistent(em.build(**W128)) is None

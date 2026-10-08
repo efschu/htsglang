@@ -322,7 +322,7 @@ class TestSwitchesAndFlags(unittest.TestCase):
         return {"groups": {"D": {"launch": {"env": env, "argv": argv}}, "P": {"launch": {"env": env, "argv": argv}}}}
 
     def test_env_switch_of_both_generations(self):
-        sw = {"name": "SG" "LANG_WE" "G2_FORM_X", "art": "env", "gruppe": "D", "default": "aus", "an_wert": "1"}
+        sw = {"name": "SG" "LANG_WE" "G2_FORM_X", "art": "env", "gruppe": "D", "default": "aus", "an_value": "1"}
         for env in ({"SG" "LANG_WE" "G2_FORM_X": "1"}, {"FLLIPER_PDFLIP_FORM_X": "1"}):
             r = features.switch_state(sw, self._launch(env, []), None)
             self.assertEqual((r["state"], r["value"]), ("an", "D=1"), env)
@@ -336,7 +336,7 @@ class TestSwitchesAndFlags(unittest.TestCase):
             self.assertEqual(r["state"], "an", argv)
 
     def test_profile_text_lookup_of_both_generations(self):
-        sw = {"name": "SG" "LANG_WE" "G2_FORM_X", "art": "env", "gruppe": "front", "default": "aus", "an_wert": "1"}
+        sw = {"name": "SG" "LANG_WE" "G2_FORM_X", "art": "env", "gruppe": "front", "default": "aus", "an_value": "1"}
         for text in ('export SG' 'LANG_WE' 'G2_FORM_X=1', 'export FLLIPER_PDFLIP_FORM_X=1'):
             r = features.switch_state(sw, None, text)
             self.assertEqual((r["state"], r["value"]), ("an", "1"), text)

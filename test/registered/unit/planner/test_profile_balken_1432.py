@@ -10,7 +10,7 @@ Gepinnt (GPU-frei, Modellprofile aus den Config-Fixtures von Auftrag 960):
   UEBERLAUF, den der Boot nicht hatte: das ist die benannte Grenze der Naeherung, kein Messwert (Test pinnt, dass der Ueberlauf gezeigt wird);
 * Summenregel des Balkens: Summe der Segmente == Kartengroesse (ohne Ueberlauf) bzw. Kartengroesse + Ueberlauf (mit);
 * Ueberlauf ist ein eigenes Segment ``overflow`` mit den betroffenen Posten, nie still beschnitten;
-* Phasen P/D und Spitze; Browser-Naeherung (``approx_terms``) gegen die Server-Antwort innerhalb 0,5 MiB bei Verschiebung des Layer-Schnitts.
+* Phasen P/D und Peak; Browser-Naeherung (``approx_terms``) gegen die Server-Antwort innerhalb 0,5 MiB bei Verschiebung des Layer-Schnitts.
 """
 
 import json
@@ -133,14 +133,14 @@ class TestPhases(unittest.TestCase):
         base = {"stage_layers": [32, 16, 16], "kv_dtype": "fp8_e4m3", "context_tokens": 50000}
         r = PC.bars_for(hw3(), m, base, phases={"P": {"chunk_tokens": 8192}, "D": {"chunk_tokens": 512}})
         self.assertEqual(set(r["phases"]), {"P", "D"})
-        for i, pk in enumerate(r["Spitze"]["bars"]):
+        for i, pk in enumerate(r["Peak"]["bars"]):
             self.assertEqual(pk["from_phase"], "P")        # grosser Chunk = hoehere Spitze
             self.assertEqual(pk["needs_mib"], max(r["phases"][p]["bars"][i]["needs_mib"] for p in ("P", "D")))
         self.assertLess(r["phases"]["D"]["bars"][0]["needs_mib"], r["phases"]["P"]["bars"][0]["needs_mib"])
 
     def test_single_phase_has_no_peak(self):
         r = PC.bars_for(hw3(), model("qwen27b_int8_vocabembed"), {"stage_layers": [32, 16, 16]})
-        self.assertNotIn("Spitze", r)
+        self.assertNotIn("Peak", r)
 
 
 class TestBrowserApproximation(unittest.TestCase):
@@ -183,7 +183,7 @@ class TestRunBars(unittest.TestCase):
         json.dumps(res)
         r = res["result"]
         self.assertEqual(set(r["phases"]), {"P", "D"})
-        self.assertIn("Spitze", r)
+        self.assertIn("Peak", r)
         self.assertEqual(r["approx"]["n_stages"], 3)
 
     def test_run_bars_bad_input_is_ok_false(self):

@@ -1,4 +1,4 @@
-"""Die Experten-Karte (Nutzer-Gesetz: "alles was geshardet wird braucht ne karte").
+"""Die Experten-Karte (Nutzer-Gesetz: "alles was geshardet wird requires ne karte").
 
 Die Tests halten die zwei Fallen fest, die am 22.09. Boots gekostet haben,
 und die eine Zahl, die am Metall gemessen ist (fnFL2w24/w30: 324 Plaetze).
@@ -41,7 +41,7 @@ def test_store_holds_the_swap_not_the_union():
 
     Die Vereinigung aller je kalten Ids waere 420 (512 minus die 92, die
     beide Phasen teilen) -- 96 Plaetze mehr, also ~11 GiB Host-RAM, die
-    der Tausch nicht braucht. Beide Phasen halten 188 resident, also
+    der Tausch nicht requires. Beide Phasen halten 188 resident, also
     haelt der Store zu JEDEM Zeitpunkt 324.
     """
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
@@ -85,8 +85,8 @@ def test_broken_map_is_named_not_swallowed():
     dann muss sie es sagen, mit Zahl."""
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     k["phases"]["P"]["slot_of"]["0"] = 0        # Id 0 ist resident UND im Store
-    grund = em.refuse_if_inconsistent(k)
-    assert grund and "resident UND im Store" in grund
+    reason = em.refuse_if_inconsistent(k)
+    assert reason and "resident UND im Store" in reason
 
 
 def test_slot_of_gives_none_for_residents():

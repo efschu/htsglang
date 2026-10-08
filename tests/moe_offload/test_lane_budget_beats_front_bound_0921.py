@@ -29,7 +29,7 @@ def test_the_lane_gives_up_before_the_front_calls_a_stall():
 
 
 def test_the_lead_is_big_enough_to_be_read():
-    """Nicht knapp: die Meldung muss ankommen, bevor die Front abraeumt."""
+    """Nicht tight: die Meldung muss ankommen, bevor die Front abraeumt."""
     from flliper.srt.pdflip import front
     from flliper.srt.pdflip import weight_exchange_bounce as wxb
 

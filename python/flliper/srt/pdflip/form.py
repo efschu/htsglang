@@ -1,6 +1,6 @@
 """PDFLIP-FORM: the boot's FORM AXES -- one resolver, one line, one env, one accessor.
 
-User order 2026-09-24 (verbatim): "da muessen schalter rein, in den code, dense,
+User order 2026-09-24 (verbatim): "da muessen switch rein, in den code, dense,
 moe, vollstaendig im vram, mit offload - oder sowas aehnliches oder mehr oder
 weniger (ergruende/begruende). sonst knallts doch an jeder stelle".
 

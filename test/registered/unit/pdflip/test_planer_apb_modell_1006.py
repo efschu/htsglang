@@ -1,4 +1,4 @@
-"""AP-B Modellprofil-Lücken (Planer-Workflow 06.10.2026): was ``propose()`` (Plan §1.2 K1-K4) vom Modellprofil ``flliper.model/1`` braucht
+"""AP-B Modellprofil-Lücken (Planer-Workflow 06.10.2026): was ``propose()`` (Plan §1.2 K1-K4) vom Modellprofil ``flliper.model/1`` requires
 und vorher fehlte.  Je Lücke ein Test (Lücken-Tabelle: ``deskq/done/planer-apB-luecken-1006.md``):
 
 * L6  KV-Gleitfenster (``kv.sliding``): der DFlash2-Draft (2048 / 5 Layer) wird nicht mit vollem Kontext gerechnet;

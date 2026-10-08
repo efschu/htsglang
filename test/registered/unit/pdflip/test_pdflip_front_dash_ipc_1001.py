@@ -1,6 +1,6 @@
 """DASHBOARD-IPC 01.10. (dashboard redesign, user 01.10. ~07:20Z / ~07:40Z: phase
 live, flip time in the user's sense, TTFT per route with its parts, a session
-view -- "Daten in die Zeitreihen-DB statt grep"): the front's IPC fields.
+view -- "Data in die Zeitreihen-DB statt grep"): the front's IPC fields.
 
 A. ``front.flip`` (Vorlauf / Layer / Nachlauf) and ``front.d_activity``, live.
    BUG (NF + 27B, 3-12 per boot): a P->D ``flip_first_work`` (decode_token)
@@ -181,9 +181,9 @@ class TestFlipPhase(CustomTestCase):
         from flliper.srt.pdflip.front_requests import FlipPhase
 
         fp = FlipPhase()
-        self.assertTrue(fp.vorlauf("D>P", "park:wait_bound", 100.0))
-        self.assertFalse(fp.vorlauf("D>P", "backlog", 100.4))          # the park's decision stands
-        self.assertEqual((fp.snap["phase"], fp.snap["reason"]), ("vorlauf", "park:wait_bound"))
+        self.assertTrue(fp.warmup("D>P", "park:wait_bound", 100.0))
+        self.assertFalse(fp.warmup("D>P", "backlog", 100.4))          # the park's decision stands
+        self.assertEqual((fp.snap["phase"], fp.snap["reason"]), ("warmup", "park:wait_bound"))
         fp.layer("D>P", 100.66, "backlog")
         self.assertEqual((fp.snap["phase"], fp.snap["begin_ts"], fp.snap["decision_ts"], fp.snap["reason"]),
                          ("layer", 100.66, 100.0, "park:wait_bound"))
@@ -192,7 +192,7 @@ class TestFlipPhase(CustomTestCase):
         fp.first_work(103.5, "p_leg1_dispatch")
         s = fp.snap
         self.assertIsNone(s["phase"])
-        self.assertEqual((s["last"]["vorlauf_ms"], s["last"]["layer_ms"], s["last"]["nachlauf_ms"],
+        self.assertEqual((s["last"]["warmup_ms"], s["last"]["layer_ms"], s["last"]["nachlauf_ms"],
                           s["last"]["decision_to_first_work_ms"]), (660, 2540, 300, 3500))
 
     def test_first_work_before_done_closes_at_done(self):
@@ -204,13 +204,13 @@ class TestFlipPhase(CustomTestCase):
         self.assertEqual(fp.snap["phase"], "layer")
         fp.done(12.0)
         self.assertIsNone(fp.snap["phase"])
-        self.assertEqual((fp.snap["last"]["vorlauf_ms"], fp.snap["last"]["nachlauf_ms"]), (0, 0))
+        self.assertEqual((fp.snap["last"]["warmup_ms"], fp.snap["last"]["nachlauf_ms"]), (0, 0))
 
     def test_abort_names_why(self):
         from flliper.srt.pdflip.front_requests import FlipPhase
 
         fp = FlipPhase()
-        fp.vorlauf("D>P", "park:x", 1.0)
+        fp.warmup("D>P", "park:x", 1.0)
         fp.abort(2.0, "front_stop")
         self.assertIsNone(fp.snap["phase"])
         self.assertEqual(fp.snap["last"]["aborted"], "front_stop")
@@ -366,10 +366,10 @@ class TestFrontWiring(CustomTestCase):
         f._req_book().arrive("x", time.time() - 1, 0)
         f._req_book().leg2_dispatch("x", time.time() - 0.5)
         f._req_book().first_token("x", time.time(), "d_single")
-        f._flip_phase().vorlauf("D>P", "park:x", time.time())
+        f._flip_phase().warmup("D>P", "park:x", time.time())
         fields = f._ipc_front_fields()
         self.assertFalse(set(fields) & set(fsi.HOST_FRONT_KEYS))
-        self.assertEqual(fields["flip"]["phase"], "vorlauf")
+        self.assertEqual(fields["flip"]["phase"], "warmup")
         self.assertEqual(fields["d_activity"]["value"], "decode")
         self.assertEqual(fields["ttft_by_via"]["d_single"]["n"], 1)
         self.assertEqual(set(fields["ttft_by_via"]), {"after_p", "d_direct", "d_single"})

@@ -206,7 +206,7 @@ def test_the_timed_order_takes_the_tail_off_the_x141_leg():
 
 
 def test_a_mutant_order_search_does_not_shorten_the_leg():
-    """Der Mutant, der nur die Plaetze der geteilten Baender tauscht (die Suche
+    """Der Mutant, der nur die Plaetze der geteilten Baender trades (die Suche
     ohne die eigenen Baender der knappen Stufe), findet keinen Gewinn."""
     main = _planned("x141", 1, BASE)
     stage = 2

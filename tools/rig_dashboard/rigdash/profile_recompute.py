@@ -48,7 +48,7 @@ def args_of(doc: Mapping[str, Any]) -> Dict[str, str]:
 
 
 def _entry_text(e: Mapping[str, Any]) -> str:
-    """Der Text eines Argumenteintrags wie er im Profil stand (``flag=wert`` bei ``eq``, sonst ``flag wert...``)."""
+    """Der Text eines Argumenteintrags wie er im Profil stand (``flag=value`` bei ``eq``, sonst ``flag value...``)."""
     vals = [str(v) for v in (e.get("values") or [])]
     if e.get("eq") and vals:
         return str(e["flag"]) + "=" + vals[0]
@@ -76,7 +76,7 @@ def group_texts(doc: Mapping[str, Any]) -> Dict[str, str]:
 
 
 def scoped_args(text: str) -> Dict[str, str]:
-    """Flags eines ``--extra-p/-d``-Textes: Flag -> Wert (mehrere Werte mit Leerzeichen, ``--flag=wert`` und ``--flag wert`` beide)."""
+    """Flags eines ``--extra-p/-d``-Textes: Flag -> Wert (mehrere Werte mit Leerzeichen, ``--flag=value`` und ``--flag value`` beide)."""
     try:
         toks = shlex.split(text)
     except ValueError:

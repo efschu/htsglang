@@ -66,7 +66,7 @@ class WakeCard:
     (``PDFLIP-CREDIT-FLOOR group=<Waker>``), gegen den ``wait_for`` gradet.
     ``release_mib``: je Tag, was die Pause des Schlaefers freigibt
     (``tms_tag_bytes``, dieselbe Zahl, die ``credit.publish`` publiziert).
-    ``demand_mib``: je Tag, was ``resume`` des Wakers braucht (0/fehlt =
+    ``demand_mib``: je Tag, was ``resume`` des Wakers requires (0/fehlt =
     No-op fuer diesen Waker). ``oncard_mib``: je Tag, was der Schlaefer fuer
     den co-lokierten Waker auf DIESER Karte staged (``PDFLIP-SEQ lane=cN
     phase=deposit ... slot_bytes``; der Ring bleibt im Leg allokiert).
@@ -162,7 +162,7 @@ def simulate(order: Sequence[str], cards: Sequence[WakeCard], *,
 
     ``collect_runahead`` (n): der Waker holt den Kredit fuer Position k erst,
     wenn die Collects seiner Tags bis Position k-1-n fertig sind; ein Collect
-    ist fertig, wenn jeder Schlaefer mit Bytes dieses Tags ihn erreicht hat.
+    ist fertig, wenn jeder Schlaefer mit Bytes dieses Tags ihn reached hat.
     ``None`` = unbeschraenkt.
 
     ``double_staging``: der Weg (b) zieht das Staging ein ZWEITES Mal von der
@@ -351,8 +351,8 @@ def search_order(order: Sequence[str], cards: Sequence[WakeCard], *,
     (ein Tag an eine andere Stelle; der Basis-Tag bleibt hinten) nach
     :func:`_progress`. Deterministisch, ab der gegebenen Ordnung, also so
     nah an ihr, wie der Anstieg es zulaesst; die erste tragende Ordnung wird
-    genommen. Rueckgabe ``(ordnung, lauf, zuege)`` (``zuege`` = angewandte
-    Einzelzuege); laeuft der beste Lauf nicht durch, ist ``lauf.complete``
+    genommen. Rueckgabe ``(ordnung, run, zuege)`` (``zuege`` = angewandte
+    Einzelzuege); laeuft der beste Lauf nicht durch, ist ``run.complete``
     False."""
     tail = [t for t in order if t in set(pinned_tail)]
     cur = [t for t in order if t not in set(pinned_tail)]
@@ -387,7 +387,7 @@ def search_order(order: Sequence[str], cards: Sequence[WakeCard], *,
 def _greedy_order(order: Sequence[str], cards: Sequence[WakeCard], *,
                   pinned_tail: Sequence[str] = PINNED_TAIL,
                   **sim) -> Tuple[Optional[List[str]], Optional[WakeRun], str]:
-    """Der gierige Praefix-Bau von :func:`credit_order`: ``(ordnung, lauf, "")``
+    """Der gierige Praefix-Bau von :func:`credit_order`: ``(ordnung, run, "")``
     wenn die fertige Ordnung VOLL durchlaeuft, sonst ``(None, None, warum)``."""
     order = list(order)
     tail = [t for t in order if t in set(pinned_tail)]
@@ -455,7 +455,7 @@ LEG_ORDER_MARKER = "PDFLIP-LEG-ORDER"
 
 
 def first_claim(order: Sequence[str], wc: WakeCard) -> Optional[int]:
-    """Position des ersten Tags, den der Waker dieser Karte braucht (None = keiner)."""
+    """Position des ersten Tags, den der Waker dieser Karte requires (None = keiner)."""
     for k, t in enumerate(order):
         if float(wc.demand_mib.get(t, 0.0) or 0.0) > 0.0:
             return k
@@ -648,7 +648,7 @@ def credit_order(order: Sequence[str], cards: Sequence[WakeCard], *,
     Seite: Vorlauf gibt nur Pausen dazu). Die fertige Ordnung wird noch
     einmal VOLL simuliert (mit Vorlauf und Staging); nur wenn DIE durchlaeuft,
     wird sie genommen, sonst bleibt die gegebene stehen und der Verdikt nennt
-    den Zyklus. Rueckgabe ``(ordnung, lauf, warum)``.
+    den Zyklus. Rueckgabe ``(ordnung, run, warum)``.
 
     ``search`` (H54, FLLIPER_PDFLIP_ENABLE_FLIP_ORDER_CREDIT_SEARCH): findet
     der gierige Bau keine Ordnung, sucht :func:`search_order` ueber VOLLE
@@ -895,7 +895,7 @@ def reference_from_logs(p_text: str, d_text: str, front_text: str, *, source: st
 def wake_cards(ref: WakeReference) -> List[WakeCard]:
     """Die Karten des Referenz-Wakes (D schlaeft, P wacht), wie gemessen.
 
-    Tags, deren On-card-Staging der Referenz-Boot nicht mehr erreicht hat (er
+    Tags, deren On-card-Staging der Referenz-Boot nicht mehr reached hat (er
     starb vorher), bekommen den Median-Anteil ``staged/tag`` DIESES Rangs aus
     seinen gemessenen Einzel-Eigentuemer-Tags, anteilig am Bedarf der
     co-lokierten Stufe (geteilte Tags wie ``weights_9`` gehen an zwei Stufen)."""

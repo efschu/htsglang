@@ -4,7 +4,7 @@ nominal bandwidth with their source, and the reference-rig document stays what i
 No GPU, no NVML: NVML is injected.  What is under test: (1) the document of the three-card reference inventory equals the
 document 173161c595 assembled, apart from the new fields; (2) the file is written once, kept when the cards differ, replaced
 only on request, never overwritten by an empty view, and a failed write is a state, not an exception; (3) the SM count of an
-unmeasured card is the data sheet's, labelled "Datenblatt", a measurement still wins, and the open measurement gap stays open.
+unmeasured card is the data sheet's, labelled "Datasheet", a measurement still wins, and the open measurement gap stays open.
 """
 
 import copy
@@ -89,7 +89,7 @@ class TestDataSheetSm(CustomTestCase):
         self.assertEqual(sm[1]["v"], 170)                       # hw_sim CATALOG["5090"]
         self.assertEqual(sm[0]["v"], 68)                        # 3080-10G and 3080-20G agree
         for n in sm.values():
-            self.assertEqual(n["src"], "Datenblatt")
+            self.assertEqual(n["src"], "Datasheet")
             self.assertIn("hw_sim.py", n["note"])
             self.assertIn("not measured", n["note"])
         self.assertEqual(hp.validate(doc), [])
@@ -117,11 +117,11 @@ class TestDataSheetSm(CustomTestCase):
 
     def test_an_injected_lookup_fills_nominal_bandwidth_and_catalog(self):
         def lookup(row):
-            return {"mem_bw_gbs": 1792, "bw_note": "Katalog X", "catalog": {"id": "x", "preset": True, "origin": "Datenblatt"}}
+            return {"mem_bw_gbs": 1792, "bw_note": "Catalog X", "catalog": {"id": "x", "preset": True, "origin": "Datasheet"}}
 
         doc = self._build(datasheet=lookup)
         c = doc["cards"][1]
-        self.assertEqual(c["mem_gbs"]["nominal"], {"v": 1792, "src": "Datenblatt", "unit": "GB/s", "note": "Katalog X"})
+        self.assertEqual(c["mem_gbs"]["nominal"], {"v": 1792, "src": "Datasheet", "unit": "GB/s", "note": "Catalog X"})
         self.assertEqual(c["catalog"]["id"], "x")
         self.assertEqual(hp.validate(doc), [])
 
@@ -212,7 +212,7 @@ class TestPersistence(CustomTestCase):
         self.assertEqual(r["state"], "nur_gespeichert")
         self.assertEqual(len(r["show"]["cards"]), 3)
         r = hp.capture(self.path, live=empty, force=True, now=fx.NOW + 2)
-        self.assertEqual(r["state"], "keine_karten")
+        self.assertEqual(r["state"], "no_cards")
         self.assertEqual(len(r["show"]["cards"]), 3)
         self.assertIn("nothing saved", r["error"])
         self.assertEqual(open(self.path, encoding="utf-8").read(), raw)
@@ -220,11 +220,11 @@ class TestPersistence(CustomTestCase):
     def test_no_cards_and_no_file_persists_nothing(self):
         empty = hp.build(cache_dir=self.cache, nvml=([], None, []), now=fx.NOW)
         r = hp.capture(self.path, live=empty, now=fx.NOW)
-        self.assertEqual(r["state"], "keine_karten")
+        self.assertEqual(r["state"], "no_cards")
         self.assertFalse(os.path.exists(self.path))
 
     def test_a_failed_write_is_a_state_not_an_exception(self):
-        blocker = os.path.join(self.d.name, "datei")
+        blocker = os.path.join(self.d.name, "file")
         open(blocker, "w").close()
         r = hp.capture(os.path.join(blocker, "hardware.json"), live=self._live(), now=fx.NOW)     # the "directory" is a file
         self.assertEqual(r["state"], "nicht_schreibbar")

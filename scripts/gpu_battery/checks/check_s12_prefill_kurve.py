@@ -45,7 +45,7 @@ from check_common import (  # noqa: E402
     run_check,
 )
 
-STEP = "s12_prefill_kurve"
+STEP = "s12_prefill_curve"
 KIND = "bar1_prefill_kurve"
 # Arm names as the producer writes them into the artifact -- "grundlinie" is a
 # value in prefill_kurve.json, not prose, so it stays as it is.
@@ -91,22 +91,22 @@ def check(step_dir: str) -> None:
     payload = load_json(path, "prefill_kurve.json")
     require_envelope(payload, KIND, "prefill_kurve.json", 3)
 
-    if not payload.get("host_erreichbar"):
+    if not payload.get("host_reachable"):
         raise CheckStop("host unreachable -- nothing was measured")
     if not payload.get("integration_vorhanden"):
         raise CheckStop(
             "the BAR1 integration is not in the worktree under test -- set "
             "BAR1_HOST_WT"
         )
-    if payload.get("blockiert"):
-        raise CheckStop(f"step blocked, blockiert={payload['blockiert']}")
+    if payload.get("is_blocked"):
+        raise CheckStop(f"step blocked, is_blocked={payload['is_blocked']}")
 
     plan = payload.get("sessions_geplant") or []
     if not plan:
         raise CheckStop("no session plan in the result -- nothing to check")
 
     # --- completeness --------------------------------------------------------
-    aborted = payload.get("abbruch")
+    aborted = payload.get("abort_reason")
     for sessions in plan:
         for arm in ARMS:
             rate = _rate(payload, arm, sessions)

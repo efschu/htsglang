@@ -706,7 +706,7 @@ class PhaseTimelineTests(unittest.TestCase):
 
 
 # verbatim, /spinning/docker-acceptance/nf/abnahme_cu130.log and 27b/abnahme_cu130.log, 2026-09-27
-H_DAUER_STOP = "[nf-dauer 2026-09-27T17:39:28Z] Stop-Datei -> Hold-Ende, Schleife endet"
+H_DURATION_STOP = "[nf-dauer 2026-09-27T17:39:28Z] Stop-Datei -> Hold-Ende, Schleife endet"
 H_HOLD_STOP = "[host-acc 17:39:36Z] AGENT-HOLD (h91dprbar1dauer) Ende: Stop-Datei"
 H_HOLD_DEAD = "[host-acc 15:39:54Z] AGENT-HOLD (releasedraftbar1w1) Ende: Container-tot"
 H_HOLD_TIME = "[host-acc 11:02:10Z] AGENT-HOLD (h91dprbar1dauer) Ende: Zeit"
@@ -732,8 +732,8 @@ class PlannedStopTests(unittest.TestCase):
         return [m for m in (stops.parse_marker(x) for x in lines) if m]
 
     def test_parse_all_marker_kinds(self):
-        self.assertEqual(stops.parse_marker(H_DAUER_STOP)["kind"], "planned")
-        self.assertEqual(stops.parse_marker(H_DAUER_STOP)["t"], _utc(17, 39, 28))
+        self.assertEqual(stops.parse_marker(H_DURATION_STOP)["kind"], "planned")
+        self.assertEqual(stops.parse_marker(H_DURATION_STOP)["t"], _utc(17, 39, 28))
         m = stops.parse_marker(H_HOLD_STOP)
         self.assertEqual((m["kind"], m["tag"], m["sod"]), ("planned", "h91dprbar1dauer", 17 * 3600 + 39 * 60 + 36))
         self.assertEqual(stops.parse_marker(H_HOLD_TIME)["kind"], "planned")
@@ -743,7 +743,7 @@ class PlannedStopTests(unittest.TestCase):
         self.assertIsNone(stops.parse_marker(H_ARMED))          # armed is not a verdict
 
     def test_planned_stop_of_rc12s(self):
-        mk = self._markers(H_DAUER_STOP, H_HOLD_STOP)
+        mk = self._markers(H_DURATION_STOP, H_HOLD_STOP)
         e = stops.classify(STEM_S, _utc(17, 19, 31), _utc(17, 40, 5), mk)
         self.assertIsNone(e["death"])
         self.assertEqual(e["planned"]["t"], _utc(17, 39, 28))
@@ -756,8 +756,8 @@ class PlannedStopTests(unittest.TestCase):
         self.assertEqual(e["death"]["t"], _utc(16, 28, 41))
 
     def test_markers_of_other_boots_do_not_match(self):
-        mk = self._markers(H_DAUER_STOP, H_HOLD_STOP, H_DEADMAN)
-        e = stops.classify(STEM_603, _utc(16, 3, 35), _utc(16, 28, 45), self._markers(H_DAUER_STOP, H_HOLD_STOP))
+        mk = self._markers(H_DURATION_STOP, H_HOLD_STOP, H_DEADMAN)
+        e = stops.classify(STEM_603, _utc(16, 3, 35), _utc(16, 28, 45), self._markers(H_DURATION_STOP, H_HOLD_STOP))
         self.assertIsNone(e["planned"])                         # 17:39 is > 10 min after that boot's end
         e = stops.classify(STEM_S, _utc(17, 19, 31), _utc(17, 40, 5), mk)
         self.assertIsNone(e["death"])                           # the 16:28 deadman names another boot
@@ -776,7 +776,7 @@ class PlannedStopTests(unittest.TestCase):
         return b
 
     def test_teardown_after_planned_stop_is_grey_not_tot(self):
-        end = {"planned": {"t": _utc(17, 39, 28), "text": H_DAUER_STOP, "src": "nf-dauer"}, "death": None}
+        end = {"planned": {"t": _utc(17, 39, 28), "text": H_DURATION_STOP, "src": "nf-dauer"}, "death": None}
         a = health.assess(self._boot(end), self.NOW)
         self.assertEqual(a["state"], "GESTOPPT")
         self.assertEqual(a["reasons"], [])
@@ -786,13 +786,13 @@ class PlannedStopTests(unittest.TestCase):
 
     def test_death_before_the_planned_stop_stays_red(self):
         # the death comes from IPC (state.json), not from the PDFLIP-HEALTH line
-        end = {"planned": {"t": _utc(17, 40, 30), "text": H_DAUER_STOP, "src": "nf-dauer"},
+        end = {"planned": {"t": _utc(17, 40, 30), "text": H_DURATION_STOP, "src": "nf-dauer"},
                "death": {"t": _utc(17, 40, 2), "text": "state.json dead: DEADMAN_CRASH", "src": "state.json"},
                "src": "state.json"}
         self.assertEqual(health.assess(self._boot(end), self.NOW)["state"], "TOT")
 
     def test_named_stop_before_planned_stop_is_a_hint_not_tot(self):
-        end = {"planned": {"t": _utc(17, 40, 50), "text": H_DAUER_STOP, "src": "nf-dauer"}, "death": None}
+        end = {"planned": {"t": _utc(17, 40, 50), "text": H_DURATION_STOP, "src": "nf-dauer"}, "death": None}
         b = self._boot(end, health={}, stops=[{"t": _utc(17, 38, 0), "group": "P", "text": W27_UNPREFIXED, "bare": False}],
                        last_activity={"P": _utc(17, 37, 0)})
         a = health.assess(b, self.NOW)
@@ -800,14 +800,14 @@ class PlannedStopTests(unittest.TestCase):
         self.assertTrue(any("named stop, group P" in r["text"] for r in a["reasons"]))
 
     def test_stop_requested_while_serving_changes_nothing(self):
-        end = {"planned": {"t": self.NOW - 200, "text": H_DAUER_STOP, "src": "nf-dauer"}, "death": None}
+        end = {"planned": {"t": self.NOW - 200, "text": H_DURATION_STOP, "src": "nf-dauer"}, "death": None}
         b = self._boot(end, health={}, last_activity_any=self.NOW - 2, queue=None)
         a = health.assess(b, self.NOW)
         self.assertIsNone(a["state"])
         self.assertFalse(a["planned_stop"]["stopping"])
 
     def test_finish_series_grey_cut_for_planned_stop(self):
-        end = {"planned": {"t": _utc(17, 39, 28), "text": H_DAUER_STOP, "src": "nf-dauer"}, "death": None}
+        end = {"planned": {"t": _utc(17, 39, 28), "text": H_DURATION_STOP, "src": "nf-dauer"}, "death": None}
         b = self._boot(end)
         b["alarm"] = health.assess(b, self.NOW)
         b["last_log_t"] = self.NOW - 5
@@ -964,7 +964,7 @@ ART_FRONT = [
 
 
 class GenArtefactTests(unittest.TestCase):
-    """User 28.09.: 'messartefakte entfernen. unsinnige werte im dashboard nicht anzeigen'."""
+    """User 28.09.: 'messartefakte entfernen. unsinnige values im dashboard nicht anzeigen'."""
 
     def _boot(self, with_front=True):
         b = live.Boot("x", "/tmp")

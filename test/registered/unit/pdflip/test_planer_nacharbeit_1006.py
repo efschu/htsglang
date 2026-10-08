@@ -46,8 +46,8 @@ class TestSupplement(unittest.TestCase):
     def test_w71_and_w64_are_classified_by_their_own_code(self):
         a = PV.classify_exception("PdFlipXchgResidencyUnarmable", W71_MSG)
         b = PV.classify_exception("PdFlipTpOperatingPointInfeasible", W64_MSG)
-        self.assertEqual((a["kind"], a["code"], a["launcher_code"]), ("ablehnung", "W71-CENSUS", "W71"))
-        self.assertEqual((b["kind"], b["code"], b["launcher_code"]), ("ablehnung", "W64-OPPOINT", "W64"))
+        self.assertEqual((a["kind"], a["code"], a["launcher_code"]), ("refusal", "W71-CENSUS", "W71"))
+        self.assertEqual((b["kind"], b["code"], b["launcher_code"]), ("refusal", "W64-OPPOINT", "W64"))
 
     def test_other_launcher_codes_stay_unclassified(self):
         c = PV.classify_exception("PdFlipPCutRecutRefused", "W167 PdFlipPCutRecutRefused: x")
@@ -55,69 +55,69 @@ class TestSupplement(unittest.TestCase):
 
     def test_the_verdict_carries_class_not_forceable_reason_and_source(self):
         for exc, msg, code in (("PdFlipXchgResidencyUnarmable", W71_MSG, "W71-CENSUS"), ("PdFlipTpOperatingPointInfeasible", W64_MSG, "W64-OPPOINT")):
-            d = PV.build_verdikt(3, _result("PdFlipLaunchRefused", "HW-COUNT: x"), _result(exc, msg, forced=[{"code": "HW-COUNT", "text": "HW-COUNT: x"}]))
-            last = [v for v in d["verdikte"] if v["ebene"] == "lauf"][-1]
+            d = PV.build_verdict(3, _result("PdFlipLaunchRefused", "HW-COUNT: x"), _result(exc, msg, forced=[{"code": "HW-COUNT", "text": "HW-COUNT: x"}]))
+            last = [v for v in d["verdikte"] if v["level"] == "run"][-1]
             self.assertEqual(last["code"], code)
             self.assertIs(last["forcebar"], False)
             self.assertEqual(last["force_state"], PV.BLOCKED)
-            self.assertEqual(last["klasse"], "nicht_forcebar")
-            self.assertTrue(last["klasse_grund"] and last["konsequenz"] and last["titel"])
-            self.assertIn(msg[:40], last["grund"])                      # der Text der Launcher-Meldung, nicht ein Platzhalter
+            self.assertEqual(last["class"], "nicht_forcebar")
+            self.assertTrue(last["class_reason"] and last["consequence"] and last["title"])
+            self.assertIn(msg[:40], last["reason"])                      # der Text der Launcher-Meldung, nicht ein Platzhalter
             self.assertRegex(last["quelle"], r"\.py:\d+")
             self.assertTrue(last["ergaenzung"])
-            self.assertEqual(d["ausgang"], "verweigert")
+            self.assertEqual(d["outcome"], "verweigert")
             self.assertEqual(d["zaehlung"][PV.BLOCKED], 1)
 
     def test_w64_is_form_neutral_without_the_dual_marker_and_dual_worded_with_it(self):
         """Der Launcher wirft W64 auch ohne dual_layout (Flip/nur TP); den Dual-Wortlaut gibt es nur, wenn die Meldung 'W64-DUAL:' traegt."""
-        flip = PV.budget_verdict("W64-OPPOINT", ebene="lauf", text=W64_MSG, force_state=PV.BLOCKED)
-        self.assertNotIn("Dual", flip["titel"])
-        self.assertNotIn("dual D log", flip["konsequenz"] + flip["klasse_grund"])
-        self.assertNotIn("W64-DUAL", flip["grund"])
-        self.assertEqual((flip["forcebar"], flip["klasse"]), (False, "nicht_forcebar"))
+        flip = PV.budget_verdict("W64-OPPOINT", level="run", text=W64_MSG, force_state=PV.BLOCKED)
+        self.assertNotIn("Dual", flip["title"])
+        self.assertNotIn("dual D log", flip["consequence"] + flip["class_reason"])
+        self.assertNotIn("W64-DUAL", flip["reason"])
+        self.assertEqual((flip["forcebar"], flip["class"]), (False, "nicht_forcebar"))
         dual_msg = W64_MSG + " W64-DUAL: no measured dual-share D log of m with weights [20, 12, 8] under /x; the model verdict stands"
-        dual = PV.budget_verdict("W64-OPPOINT", ebene="lauf", text=dual_msg, force_state=PV.BLOCKED)
-        self.assertIn("dual D", dual["titel"])
-        self.assertIn("dual D log", dual["konsequenz"])
+        dual = PV.budget_verdict("W64-OPPOINT", level="run", text=dual_msg, force_state=PV.BLOCKED)
+        self.assertIn("dual D", dual["title"])
+        self.assertIn("dual D log", dual["consequence"])
         self.assertEqual((dual["code"], flip["code"]), ("W64-OPPOINT", "W64-OPPOINT"))
         # ohne Text (Fallback auf den Launcher-Wortlaut) bleibt es neutral
-        self.assertNotIn("dual", PV.budget_verdict("W64-OPPOINT", ebene="lauf")["titel"])
+        self.assertNotIn("dual", PV.budget_verdict("W64-OPPOINT", level="run")["title"])
         # durch classify/build_verdikt: Flip-W64 und Dual-W64 tragen denselben Code
         for msg in (W64_MSG, dual_msg):
-            d = PV.build_verdikt(3, _result("PdFlipLaunchRefused", "HW-COUNT: x"), _result("PdFlipTpOperatingPointInfeasible", msg, forced=[{"code": "HW-COUNT", "text": "HW-COUNT: x"}]))
-            last = [v for v in d["verdikte"] if v["ebene"] == "lauf"][-1]
+            d = PV.build_verdict(3, _result("PdFlipLaunchRefused", "HW-COUNT: x"), _result("PdFlipTpOperatingPointInfeasible", msg, forced=[{"code": "HW-COUNT", "text": "HW-COUNT: x"}]))
+            last = [v for v in d["verdikte"] if v["level"] == "run"][-1]
             self.assertEqual(last["code"], "W64-OPPOINT")
-            self.assertEqual("dual D" in last["titel"], "W64-DUAL:" in msg)
+            self.assertEqual("dual D" in last["title"], "W64-DUAL:" in msg)
 
     def test_w64_three_dual_cases_each_get_their_own_wording(self):
         """Nacharbeit 1006 Runde 6, Befund 3: kein Dual / Dual ohne Messung / Dual mit Messung INFEASIBLE / Meldung ohne Gewichtsvektor sind vier Woerter,
         nicht zwei (launcher.py:17235, :17242-17243, :17343-17347, dual_w64.py:117)."""
-        neutral = PV.budget_verdict("W64-OPPOINT", ebene="lauf", text=W64_MSG, force_state=PV.BLOCKED)
-        without = PV.budget_verdict("W64-OPPOINT", ebene="lauf", force_state=PV.BLOCKED,
+        neutral = PV.budget_verdict("W64-OPPOINT", level="run", text=W64_MSG, force_state=PV.BLOCKED)
+        without = PV.budget_verdict("W64-OPPOINT", level="run", force_state=PV.BLOCKED,
                           text=W64_MSG + " | W64-DUAL: no measured dual-share D log of m with weights [20, 12, 8] under /x; the model verdict stands")
         measured_line = ("W64-DUAL MEASURED (/ev/boot_x.D.log, D weights [20, 12, 8], cell 18432 B): r0 budget=15000 - measured posts=14853 => 9000 tokens; "
                          "r1 budget=15000 - measured posts=15100 => -5000 tokens  <-- BELOW 1024 -> INFEASIBLE")
-        measured = PV.budget_verdict("W64-OPPOINT", ebene="lauf", force_state=PV.BLOCKED, text=W64_MSG + " | " + measured_line)
-        kein_vektor = PV.budget_verdict("W64-OPPOINT", ebene="lauf", force_state=PV.BLOCKED,
+        measured = PV.budget_verdict("W64-OPPOINT", level="run", force_state=PV.BLOCKED, text=W64_MSG + " | " + measured_line)
+        no_vector = PV.budget_verdict("W64-OPPOINT", level="run", force_state=PV.BLOCKED,
                                  text="W64 PdFlipTpOperatingPointInfeasible: x | W64-DUAL: the refusal names no weight vector; the model verdict stands")
-        for v in (neutral, without, measured, kein_vektor):
-            self.assertEqual((v["code"], v["forcebar"], v["klasse"]), ("W64-OPPOINT", False, "nicht_forcebar"))
+        for v in (neutral, without, measured, no_vector):
+            self.assertEqual((v["code"], v["forcebar"], v["class"]), ("W64-OPPOINT", False, "nicht_forcebar"))
         # kein Dual: formneutral, ohne Dual-Wort
-        self.assertNotIn("Dual", neutral["titel"])
-        self.assertNotIn("dual D log", neutral["konsequenz"])
+        self.assertNotIn("Dual", neutral["title"])
+        self.assertNotIn("dual D log", neutral["consequence"])
         # Dual ohne Messung: der Wortlaut "without a measured dual D log"
-        self.assertIn("without a measured dual D log", without["titel"])
-        self.assertIn("dual D log", without["konsequenz"])
+        self.assertIn("without a measured dual D log", without["title"])
+        self.assertIn("dual D log", without["consequence"])
         # Dual mit Messung INFEASIBLE: sagt, dass gemessen wurde, nie "without a measured dual D log"
-        self.assertIn("measured dual D log confirms", measured["titel"])
-        self.assertNotIn("without a measured", measured["titel"] + measured["konsequenz"] + measured["klasse_grund"])
-        self.assertIn("confirms", measured["konsequenz"])
+        self.assertIn("measured dual D log confirms", measured["title"])
+        self.assertNotIn("without a measured", measured["title"] + measured["consequence"] + measured["class_reason"])
+        self.assertIn("confirms", measured["consequence"])
         self.assertRegex(measured["quelle"], r"17343-17347.*dual_w64\.py:117")
         # Meldung ohne Gewichtsvektor: keine Suche, also nicht "without a measured dual D log"
-        self.assertNotIn("without a measured", kein_vektor["titel"] + kein_vektor["konsequenz"])
-        self.assertIn("without weight vector", kein_vektor["titel"])
-        self.assertRegex(kein_vektor["quelle"], r"17235")
-        self.assertEqual(len({neutral["titel"], without["titel"], measured["titel"], kein_vektor["titel"]}), 4)
+        self.assertNotIn("without a measured", no_vector["title"] + no_vector["consequence"])
+        self.assertIn("without weight vector", no_vector["title"])
+        self.assertRegex(no_vector["quelle"], r"17235")
+        self.assertEqual(len({neutral["title"], without["title"], measured["title"], no_vector["title"]}), 4)
 
     @unittest.skipUnless(O.pdflip_module_exists("dual_w64"),
                          "pdflip/dual_w64.py does not exist in this tree (NF launcher line: the Dual form is not implemented there); "
@@ -134,8 +134,8 @@ class TestSupplement(unittest.TestCase):
         self.assertIn('"INFEASIBLE"', dsrc)
 
     def test_verdikt_without_text_falls_back_to_the_launcher_wording(self):
-        v = PV.budget_verdict("W71-CENSUS", ebene="lauf")
-        self.assertIn("W71 PdFlipXchgResidencyUnarmable", v["grund"])
+        v = PV.budget_verdict("W71-CENSUS", level="run")
+        self.assertIn("W71 PdFlipXchgResidencyUnarmable", v["reason"])
         self.assertIs(v["forcebar"], False)
 
     def test_the_cited_anchors_exist_in_the_launcher_sources_of_this_tree(self):
@@ -189,8 +189,8 @@ class TestSupplement(unittest.TestCase):
             sys.path.insert(0, tools)
         from rigdash import profil as P
 
-        v = PV.budget_verdict("W71-CENSUS", ebene="lauf", text=W71_MSG, force_state=PV.BLOCKED, extra={"launcher_code": "W71"})
-        row = P.ProfilEditor._register_row({"code": "W71-CENSUS", "verdikt": v}, {})
+        v = PV.budget_verdict("W71-CENSUS", level="run", text=W71_MSG, force_state=PV.BLOCKED, extra={"launcher_code": "W71"})
+        row = P.ProfilEditor._register_row({"code": "W71-CENSUS", "verdict": v}, {})
         self.assertEqual((row["klass"], row["forcebar"]), ("nicht_forcebar", False))
         self.assertIn("W71", row["why_class"])
         self.assertTrue(row["consequence"])

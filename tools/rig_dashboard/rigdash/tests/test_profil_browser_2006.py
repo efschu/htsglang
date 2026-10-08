@@ -59,7 +59,7 @@ class Css(unittest.TestCase):
         self.assertIn("pf-cmsg", self.js)
 
     def test_chip_parts_are_separated_by_spaces(self):
-        self.assertIn("<b>${esc(d.to)}</b> ${wert} ${badge}</span>", self.js)
+        self.assertIn("<b>${esc(d.to)}</b> ${value} ${badge}</span>", self.js)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
-"""AP-A (Profil-Planer 06.10.): Hardwareprofil gespeichert, Katalog vorbelegt, Issue-Text.  Kein Rig, keine GPU, kein gpuq.
+"""AP-A (Profil-Planer 06.10.): Hardwareprofil gespeichert, Catalog vorbelegt, Issue-Text.  Kein Rig, keine GPU, kein gpuq.
 
-Geprüft wird: (1) der Katalog hat genau drei vorbelegte Karten (RTX 5090, RTX 3080 20 GB, RTX 3090), behält alle übrigen und
+Geprüft wird: (1) der Catalog hat genau drei vorbelegte Karten (RTX 5090, RTX 3080 20 GB, RTX 3090), behält alle übrigen und
 nennt die Herkunft je Eintrag und Feld; (2) das Profil wird beim ersten Aufruf gespeichert, danach nur verglichen, "Neu
 erfassen" ersetzt es, in Rig UND Release, ohne gpuq; (3) der Issue-Text hat alle Blöcke und lässt weder Geheimnisse noch
 Hostpfade durch.  Der echte Profilbaum (HWPROFIL_TREE) liefert das Modul; NVML wird eingespielt.
@@ -72,14 +72,14 @@ class TestCatalog(unittest.TestCase):
             if e["measured_on_rig"]:
                 self.assertEqual(e["origin"], "measured_on_rig")
             else:
-                self.assertEqual(e["origin"], "Datenblatt", e["id"])
+                self.assertEqual(e["origin"], "Datasheet", e["id"])
 
     def test_rig_cards_are_measured_but_the_3080_20g_bandwidth_is_borrowed(self):
         by = {e["id"]: e for e in CAT.CATALOG}
         self.assertEqual(by["rtx5090-32"]["origin"], "measured_on_rig")
-        self.assertEqual(by["rtx5090-32"]["origin_fields"]["mem_bw"], "Datenblatt")
-        self.assertEqual(by["rtx3080-20"]["origin_fields"], {"vram": "measured_on_rig", "mem_bw": "borrowed-unbelegt", "pcie": "Datenblatt"})
-        self.assertEqual(by["rtx3090-24"]["origin"], "Datenblatt")           # preset, aber am Rig nicht gemessen
+        self.assertEqual(by["rtx5090-32"]["origin_fields"]["mem_bw"], "Datasheet")
+        self.assertEqual(by["rtx3080-20"]["origin_fields"], {"vram": "measured_on_rig", "mem_bw": "borrowed-unverified", "pcie": "Datasheet"})
+        self.assertEqual(by["rtx3090-24"]["origin"], "Datasheet")           # preset, aber am Rig nicht gemessen
 
     def test_match_nvml(self):
         self.assertEqual(CAT.match_nvml("NVIDIA GeForce RTX 5090", 32607, (12, 0))["id"], "rtx5090-32")
@@ -95,7 +95,7 @@ class TestCatalog(unittest.TestCase):
         self.assertTrue(d["bw_note"].startswith("BORROWED, unverified"))
         self.assertTrue(d["catalog"]["preset"])
         d = CAT.datasheet_of({"name": "NVIDIA GeForce RTX 4090", "total_mib": 24564, "cc": [8, 9]})
-        self.assertEqual((d["mem_bw_gbs"], d["catalog"]["preset"], d["catalog"]["origin"]), (1008, False, "Datenblatt"))
+        self.assertEqual((d["mem_bw_gbs"], d["catalog"]["preset"], d["catalog"]["origin"]), (1008, False, "Datasheet"))
         self.assertNotIn("GEBORGT", d["bw_note"])
         self.assertEqual(CAT.datasheet_of({"name": "unbekannt", "total_mib": 1, "cc": [1, 1]}), {})
 
@@ -161,7 +161,7 @@ class RealBase(unittest.TestCase):
             os.environ.pop(k, None)
 
     def make(self, nvml=None, persist=True, edition="rig", **kw):
-        hw = hwprofil.HwProfil(http=_gq_down, tree=os.environ["HWPROFIL_TREE"], cache_dir=self.cache,
+        hw = hwprofil.HwProfile(http=_gq_down, tree=os.environ["HWPROFIL_TREE"], cache_dir=self.cache,
                                persist_path=self.path if persist else None, clock=lambda: self.now[0], synchronous=True,
                                edition=edition, versions=lambda: {"rigdash": "test-1006", "edition": edition}, **kw)
         self.set_nvml(hw, nvml or self.fx.nvml())
@@ -192,10 +192,10 @@ class TestPersistedProfile(RealBase):
         by = {c["uuid"]: c for c in out["profile"]["cards"]}
         c5090, c3080 = by[self.fx.U1], by[self.fx.U0]
         self.assertEqual(c5090["catalog"]["id"], "rtx5090-32")
-        self.assertEqual(c5090["mem_gbs"]["nominal"], {"v": 1792, "src": "Datenblatt", "unit": "GB/s", "note": mock.ANY})
+        self.assertEqual(c5090["mem_gbs"]["nominal"], {"v": 1792, "src": "Datasheet", "unit": "GB/s", "note": mock.ANY})
         self.assertIn("rtx5090-32", c5090["mem_gbs"]["nominal"]["note"])
         self.assertEqual(c3080["catalog"]["id"], "rtx3080-20")
-        self.assertEqual(c3080["catalog"]["origin_fields"]["mem_bw"], "borrowed-unbelegt")
+        self.assertEqual(c3080["catalog"]["origin_fields"]["mem_bw"], "borrowed-unverified")
         self.assertTrue(c3080["mem_gbs"]["nominal"]["note"].startswith("BORROWED, unverified"))
         self.assertEqual(out["problems"], [])
 
@@ -208,7 +208,7 @@ class TestPersistedProfile(RealBase):
 
     def test_the_environment_names_the_file(self):
         os.environ[hwprofil.PERSIST_ENV] = self.path
-        hw = hwprofil.HwProfil(http=_gq_down, tree=os.environ["HWPROFIL_TREE"], cache_dir=self.cache, clock=lambda: self.now[0])
+        hw = hwprofil.HwProfile(http=_gq_down, tree=os.environ["HWPROFIL_TREE"], cache_dir=self.cache, clock=lambda: self.now[0])
         self.assertEqual(hw.persist_path, self.path)
         self.assertEqual(hwprofil.default_persist_path({}), "/var/lib/flliper/hardware.json")
         self.assertEqual(hwprofil.default_persist_path({hwprofil.PERSIST_ENV: "/x/y.json"}), "/x/y.json")
@@ -261,7 +261,7 @@ class TestPersistedProfile(RealBase):
         self.assertEqual(json.load(open(self.path))["capture"], {"at": self.fx.NOW + 500, "reason": "Neu erfassen"})
 
     def test_a_failed_write_is_shown_not_raised(self):
-        blocker = os.path.join(self.tmp, "datei")
+        blocker = os.path.join(self.tmp, "file")
         open(blocker, "w").close()
         self.path = os.path.join(blocker, "hardware.json")
         out = self.make().get()
@@ -291,7 +291,7 @@ class TestIssueText(RealBase):
         self.assertIn("1792 GB/s (datasheet)", txt)                # Nennbandbreite aus dem Katalog
         self.assertIn("210.0 TFLOPS (meas.)", txt)                 # Messrate des 5090
         self.assertIn("RTX 3080 20 GB (modded)", txt)
-        self.assertIn("borrowed-unbelegt", txt)
+        self.assertIn("borrowed-unverified", txt)
         self.assertIn("not measured", txt)                      # fp8 der 3080
 
     def test_unknown_versions_say_unbelegt_and_state_whether_stored(self):
@@ -379,7 +379,7 @@ class TestOldModuleWithoutPersistence(unittest.TestCase):
             d = os.path.join(t, "python", "flliper", "srt", "rigmon")
             os.makedirs(d)
             open(os.path.join(d, "hardware_profile.py"), "w").write(self.STUB)
-            hw = hwprofil.HwProfil(http=_gq_down, tree=os.path.join(t, "python"), persist_path=os.path.join(t, "hw.json"))
+            hw = hwprofil.HwProfile(http=_gq_down, tree=os.path.join(t, "python"), persist_path=os.path.join(t, "hw.json"))
             out = hw.get()
             self.assertTrue(out["ok"])
             self.assertEqual(out["persist"], {"enabled": False})
@@ -395,13 +395,13 @@ class TestScripts(unittest.TestCase):
             "formats": [{"key": "bf16", "unit": "TFLOPS", "label": "bf16"}],
             "cards": [
                 {"ord": 0, "nvml_index": 1, "name": "NVIDIA GeForce RTX 5090", "class_key": "RTX5090", "cc": [12, 0],
-                 "sm_count": {"v": 170, "src": "Datenblatt", "note": "Datenblatt-Katalog pdflip/hw_sim.py"},
+                 "sm_count": {"v": 170, "src": "Datasheet", "note": "Datasheet-Catalog pdflip/hw_sim.py"},
                  "l2_mib": {"v": None, "src": "nicht gemessen", "note": "x"},
                  "vram_total_mib": {"v": 32607, "src": "NVML", "unit": "MiB"}, "bar1_total_mib": {"v": 32768, "src": "NVML"},
                  "mem_gbs": {"read": {"v": None, "src": "nicht gemessen", "note": "n"}, "copy": {"v": None, "src": "nicht gemessen", "note": "n"},
                              "gemv": {"v": None, "src": "nicht gemessen", "note": "n"},
-                             "nameplate": {"v": 1792.0, "src": "Datenblatt", "unit": "GB/s"},
-                             "nominal": {"v": 1792, "src": "Datenblatt", "unit": "GB/s", "note": "Katalog"}},
+                             "nameplate": {"v": 1792.0, "src": "Datasheet", "unit": "GB/s"},
+                             "nominal": {"v": 1792, "src": "Datasheet", "unit": "GB/s", "note": "Catalog"}},
                  "compute": {"bf16": {"v": None, "src": "nicht gemessen", "note": "n"}},
                  "h2d": {"gbs": {"v": None, "src": "nicht gemessen", "note": "n"}, "lat_us": {"v": None, "src": "nicht gemessen", "note": "n"}},
                  "d2h": {"gbs": {"v": None, "src": "nicht gemessen", "note": "n"}, "lat_us": {"v": None, "src": "nicht gemessen", "note": "n"}},
@@ -410,7 +410,7 @@ class TestScripts(unittest.TestCase):
                  "clocks": {"sm_max_mhz": {"v": 3090, "src": "NVML", "unit": "MHz"}, "mem_max_mhz": {"v": 14001, "src": "NVML", "unit": "MHz"}},
                  "mem_bus_bits": {"v": 512, "src": "NVML", "unit": "bit"},
                  "catalog": {"id": "rtx5090-32", "label": "RTX 5090 32 GB", "preset": True, "origin": "measured_on_rig",
-                             "origin_label": "am Rig gemessen", "origin_fields": {"vram": "measured_on_rig", "mem_bw": "borrowed-unbelegt", "pcie": "Datenblatt"}},
+                             "origin_label": "am Rig gemessen", "origin_fields": {"vram": "measured_on_rig", "mem_bw": "borrowed-unverified", "pcie": "Datasheet"}},
                  "state": None, "probed_at": None}],
             "links": [], "bar1": {"measured": True, "note": ""}, "sources": {"card_probe": [], "stage0": [], "nvml": {"issues": []}},
             "measure_needed": True},

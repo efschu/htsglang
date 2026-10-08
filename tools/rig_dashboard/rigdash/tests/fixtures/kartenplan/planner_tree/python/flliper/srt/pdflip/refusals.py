@@ -1,8 +1,8 @@
 """PROFIL-EDITOR S1: the refusal register and the ONE Force switch.
 
 Nutzer-Entscheid 03.10. ~20:15Z (verbatim): "das dashboard soll ein profil erstellen, beim serverstart soll der
-user ein profil angeben das geladen wird und es soll einen force flag beim serverstart geben dass die ablehnung
-der werte aufhebt und trotzdem startet".
+user ein profil angeben das geladen wird und es soll einen force flag beim serverstart geben dass die refusal
+der values aufhebt und trotzdem startet".
 
 * ONE switch, no list of codes: ``--force`` on the launcher (the container entrypoint maps ``FLLIPER_FORCE=1``
   / ``HTSGLANG_FORCE=1`` to it).  It lifts every VALUE refusal that is wired through :func:`refuse_value`;
@@ -10,13 +10,13 @@ der werte aufhebt und trotzdem startet".
   (``host_ledger.append_measured_record`` returns without writing): what it measures lies outside the
   promise the planner made, and must never calibrate a later boot.
 * Two classes, each with its reason (see :data:`REGISTER`):
-    - ``wert``            a VALUE refusal: the planner or the launcher judges numbers (capacity, VRAM, host
+    - ``value``            a VALUE refusal: the planner or the launcher judges numbers (capacity, VRAM, host
                           memory, calibration of the inventory, card count).  Force starts with these numbers.
     - ``nicht_forcebar``  NOT a value judgement: someone else's occupation of a card or of /dev/shm, a missing or
                           broken file, an impossible build.  Force does not touch these.
 * ``wired`` says whether the launcher of THIS tree consults the switch for that code today
   (:func:`wired_codes` greps ``refuse_value("CODE"`` in ``launcher.py``; a test pins the register to it, so the
-  register cannot claim more than the launcher does).  A ``wert`` code that is not wired yet is listed as such
+  register cannot claim more than the launcher does).  A ``value`` code that is not wired yet is listed as such
   and keeps refusing.
 * The container ENTRYPOINT is a second place that consults the switch (``FLLIPER_FORCE=1`` -> ``refuse_value TAG CODE text``
   in ``entrypoint.sh``, before the launcher exists): PROFIL-STATUS, SHM, STORE, MEMAVAIL and the GPU gate's HW-COUNT /
@@ -43,7 +43,7 @@ ENV_FORCED_BOOT = "FLLIPER_PDFLIP_FORCED_BOOT"
 ENV_FORCE_REQUEST = "HTSGLANG_FORCE"
 MARKER = "FORCED-PAST"
 
-CLASS_VALUE = "wert"
+CLASS_VALUE = "value"
 CLASS_HARD = "nicht_forcebar"
 CLASS_LABEL = {CLASS_VALUE: "Wert-Ablehnung (forcebar)", CLASS_HARD: "nicht forcebar"}
 
@@ -136,7 +136,7 @@ REGISTER: Tuple[Refusal, ...] = (
        "pdflip/card_identity.py arch_gate; launcher.resolve_cards", "launcher"),
     _h("KARTE-BELEGT", "Fremder Prozess oder fremdes Fenster auf der Karte",
        "Keine Wert-Ablehnung, sondern Schutz anderer Nutzer: die Belegungsprüfung (NVML-Fremdnutzung, gpuq-Fenster) darf nie "
-       "übergangen werden, sonst trifft der Start die Daten eines anderen.",
+       "übergangen werden, sonst trifft der Start die Data eines anderen.",
        "launcher.cards_free_check; gpuq-Fenster", "launcher"),
     _h("SHM-BELEGT", "Lebender Halter auf eigenen /dev/shm-Einträgen",
        "Fremder lebender Prozess hält Einträge des Launchers: Belegung, nicht Wert. Wegräumen würde ihn zerstören.",
@@ -150,7 +150,7 @@ REGISTER: Tuple[Refusal, ...] = (
     _h("FORMAT", "Format des Checkpoints passt nicht zum Profil",
        "Echter Fehler: der Checkpoint ist in einem anderen Format als das Profil annimmt (Entrypoint detect_format, Launcher W160).",
        "docker/entrypoint.sh (MODEL); launcher (PdFlipFp8LayoutRefused)", "entrypoint"),
-    _h("BAUM", "Code-Stand unsauber oder nicht das Image",
+    _h("TREE", "Code-Stand unsauber oder nicht das Image",
        "Herkunftsprüfung: ein Boot aus einem anderen oder geänderten Baum wäre nicht reproduzierbar und nichts darüber belegbar.",
        "launcher (tree is not clean); docker/entrypoint.sh (TREE)", "launcher"),
     _h("OPTIONEN", "Widersprüchliche oder unbekannte Optionen",

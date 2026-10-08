@@ -5588,7 +5588,7 @@ class MoEExpertOffloadCache:
     def _deferred_layout(self, extra, entries):
         """``(hot_slot_of, host_row)`` mit den Extra-Zeilen als KALT, oder None
         (dann laedt der Rearm seriell): jede Extra-Zeile muss genau einen
-        residenten Experten tragen, und jedes Attribut braucht seinen Store."""
+        residenten Experten tragen, und jedes Attribut requires seinen Store."""
         if any(spill is None for _a, _b, spill in entries):
             return None
         hot_slot_of, host_row = self._pool_layout()
@@ -8082,7 +8082,7 @@ class ExpertRearmPrefetch:
     Zeilenliste steht seit dem Load fest (Karte -> ``_moe_offload_refill_runs``),
     der Zielpuffer existiert, sobald der Chunk-Tag seines Layers wieder gemappt
     ist (``resume(tag)`` im Leg-Loop, hinter dessen Kredit), und der Store ist
-    gepinnter Host (``cudaHostRegister`` auf tmpfs): die Kopie braucht also
+    gepinnter Host (``cudaHostRegister`` auf tmpfs): die Kopie requires also
     weder einen fruehen Kredit noch einen Host-Zwischenpuffer, nur einen
     anderen Zeitpunkt.
 
@@ -8302,7 +8302,7 @@ def _hotset_local_ids(layer, num_local):
 
     #92. Die Datei ist je Rang lokal geschrieben, `plan_load_time_staging`
     rechnet ebenfalls lokal: hier ist also keine Umrechnung noetig (anders
-    als bei `_hotset_global_ids`, das der Store braucht).
+    als bei `_hotset_global_ids`, das der Store requires).
 
     Leer heisst "kein Hotset" und damit das bisherige Verhalten -- die
     ersten R Ids bleiben resident. Kein Raten: ohne Datei, ohne Abdeckung
@@ -8654,14 +8654,14 @@ def _rank_resident_fraction_vector(layer, tp_size=None):
     UEBER `resident_fraction_vector`, NICHT ueber `envs`: der EnvFloatVector
     VERWEIGERT `.get()`, sobald er je Rang gesetzt ist -- "is set per rank
     (0.59,0.59,0.59), so there is no single value to return" (environ.py:206).
-    Das ist genau der Fall, den #72 braucht, also war der direkte Weg der
+    Das ist genau der Fall, den #72 requires, also war der direkte Weg der
     einzige, der nie funktionieren konnte: meine erste Fassung fing die
     Verweigerung ab und lieferte still `None`, der Slot-Pool blieb aus und
     der Store wieder 512 Plaetze gross. Der vorgesehene Leser kreuzt Flag und
     Env gegeneinander und broadcastet einen Skalar auf alle Raenge.
 
     Ein BROADCASTETER Skalar taugt hier trotzdem: er sagt fuer jeden Rang
-    dasselbe, und genau das braucht die Basisrechnung -- nur die Laenge muss
+    dasselbe, und genau das requires die Basisrechnung -- nur die Laenge muss
     zu den Ratios passen, sonst faellt ein Rang aus der Rechnung.
     """
     from flliper.srt.layers.moe import resident_fraction as _rf
@@ -8689,7 +8689,7 @@ def _fill_experts_from_store(store, dst, s_dir, s_key, attr, s_lo, E, s_pad):
     MESSUNG, die den Schnitt bemisst (Karte #107 mit den Arm-Parametern
     183,137,168 / FR_P 0.367 / FR_D 0.479,0.319,0.284, Slotgroesse aus
     fnFL2w51): von 512 Experten je Layer liegen 324 im Store (63 %) und
-    188 nur auf P's Karten (37 %) -- und D-Rang 0 braucht 92 residente,
+    188 nur auf P's Karten (37 %) -- und D-Rang 0 requires 92 residente,
     von denen KEIN einziger im Store liegt: es sind genau die
     ``shared_resident=92``, die beide Gruppen auf DERSELBEN 5090 heiss
     halten.
@@ -8778,7 +8778,7 @@ def publish_expert_bands(layer, attr: str, buf, resident_ids) -> int:
     Attention und NULL Experten-Bytes.
 
     Ein Band wird als VIEW auf den Slot-Buffer veroeffentlicht, nicht als
-    Kopie: es sind dieselben Bytes, der Austausch braucht Zeiger und Laenge,
+    Kopie: es sind dieselben Bytes, der Austausch requires Zeiger und Laenge,
     und eine Kopie waere ein zweites Mal Karte fuer nichts.  Der Name traegt
     den Band-Index (``expert_band_attr_name``), aus dem
     ``tag_of_parameter_name`` denselben Tag ableitet, den der Allokationspfad

@@ -369,7 +369,7 @@ def test_d_only_stream_gets_the_zero_object():
 def _flip_between(front):
     fp = F.Front._flip_phase(front)
     t = time.time()
-    fp.vorlauf("P>D", "test", t)
+    fp.warmup("P>D", "test", t)
     fp.layer("P>D", t, "test")
     fp.done(t + 0.001)
 

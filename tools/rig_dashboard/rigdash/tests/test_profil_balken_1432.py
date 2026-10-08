@@ -25,7 +25,7 @@ from types import SimpleNamespace
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
-from rigdash import profil_recompute as R  # noqa: E402
+from rigdash import profile_recompute as R  # noqa: E402
 from rigdash import server as S  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(HERE), "static")
@@ -357,7 +357,7 @@ class TestRealTree(unittest.TestCase):
     def test_phases_and_peak(self):
         r = self.ask(phases={"P": {}, "D": {"activation_mib": [900, 900, 900]}})["result"]
         self.assertEqual(set(r["phases"]), {"P", "D"})
-        self.assertEqual({b["from_phase"] for b in r["Spitze"]["bars"]}, {"P"})
+        self.assertEqual({b["from_phase"] for b in r["Peak"]["bars"]}, {"P"})
 
     def test_bad_cut_is_a_named_error(self):
         r = self.ask(settings=dict(self.settings, stage_layers=[29, 11]))

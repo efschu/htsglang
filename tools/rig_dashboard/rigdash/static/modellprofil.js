@@ -1,7 +1,7 @@
 /* Modellprofil schätzen (PROFIL-EDITOR S3, Auftrag 960): das kleine Modul hinter dem Knopf "Modellprofil erstellen".
    Rechnet NICHTS selbst: POST /api/modellprofil/schaetzen liefert das Modellprofil flliper.model/1 (der Schätzer liest nur
    config.json und die Kopfzeilen der Shards, nie ein Gewicht).  Dieses Modul holt es ab und macht daraus Zeilen
-   {gruppe, label, wert, src, hinweis} -- die Oberfläche (Auftrag 930) zeichnet sie; tabelle() ist ein fertiger HTML-Baustein.
+   {gruppe, label, value, src, note} -- die Oberfläche (Auftrag 930) zeichnet sie; tabelle() ist ein fertiger HTML-Baustein.
    Jeder Wert trägt seine Quelle: config | Index | geschätzt | stat.  Nur im Rig-Dashboard (Edition rig). */
 (function (root) {
   "use strict";
@@ -48,22 +48,22 @@
   const zahl = (n) => (n == null ? "–" : n.toLocaleString("en-US"));
   const leaf = (o) => (o && typeof o === "object" && "v" in o ? o : { v: null, src: "" });
 
-  /* Das Schätzprofil als flache Zeilenliste, gruppiert wie der Editor sie braucht. */
+  /* Das Schätzprofil als flache Zeilenliste, gruppiert wie der Editor sie requires. */
   function zeilen(p) {
     const out = [];
-    const add = (gruppe, label, o, fmt, hinweis) => {
+    const add = (gruppe, label, o, fmt, note) => {
       const l = leaf(o);
       if (l.v == null || (fmt === bytes && l.v === 0)) return;          // Posten, den es im Modell nicht gibt
-      const wert = fmt ? fmt(l.v) : String(l.v);
-      if (wert == null) return;
-      out.push({ gruppe: gruppe, label: label, wert: wert, roh: l.v, src: l.src, hinweis: hinweis || l.note || "" });
+      const value = fmt ? fmt(l.v) : String(l.v);
+      if (value == null) return;
+      out.push({ gruppe: gruppe, label: label, value: value, roh: l.v, src: l.src, note: note || l.note || "" });
     };
     const a = p.arch || {}, w = p.weights || {}, kv = p.kv || {}, st = p.state || {}, ex = p.experts || {}, dr = p.draft || {}, cx = p.context || {};
     add("Model", "Format", p.format, null, "registry name; " + (leaf(p.format).src === "Index" ? "from the tensors" : "from the config"));
     add("Model", "Type", a.family, (v) => (v === "moe" ? "MoE" : "dense"));
     add("Model", "Layers", a.n_layers, zahl);
     const lc = leaf(a.layer_counts).v;
-    if (lc) out.push({ gruppe: "Model", label: "Layer types", wert: "Attention " + lc.attn + " · GDN " + lc.gdn + (lc.mamba ? " · Mamba " + lc.mamba : ""), roh: lc, src: leaf(a.layer_counts).src, hinweis: "" });
+    if (lc) out.push({ gruppe: "Model", label: "Layer types", value: "Attention " + lc.attn + " · GDN " + lc.gdn + (lc.mamba ? " · Mamba " + lc.mamba : ""), roh: lc, src: leaf(a.layer_counts).src, note: "" });
     add("Model", "Attention", a.attention, (v) => (v === "qsa" ? "QSA (indexer)" : "full"));
     add("Model", "Hidden size", a.hidden, zahl);
     add("Weights", "Weights total", w.total_bytes, bytes, leaf(w.total_bytes).note);
@@ -105,7 +105,7 @@
     let g = null, h = "<table class=\"mp-tab\"><thead><tr><th>Value</th><th>Size</th><th>Source</th></tr></thead><tbody>";
     rows.forEach((r) => {
       if (r.gruppe !== g) { g = r.gruppe; h += "<tr class=\"mp-grp\"><th colspan=\"3\">" + esc(g) + "</th></tr>"; }
-      h += "<tr><td title=\"" + esc(r.hinweis) + "\">" + esc(r.label) + "</td><td>" + esc(r.wert) + "</td><td title=\"" + esc(QUELLE[r.src] || "") + "\">" + esc(QUELLE_LABEL[r.src] || r.src) + "</td></tr>";
+      h += "<tr><td title=\"" + esc(r.note) + "\">" + esc(r.label) + "</td><td>" + esc(r.value) + "</td><td title=\"" + esc(QUELLE[r.src] || "") + "\">" + esc(QUELLE_LABEL[r.src] || r.src) + "</td></tr>";
     });
     return h + "</tbody></table>";
   }

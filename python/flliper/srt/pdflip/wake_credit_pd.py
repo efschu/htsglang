@@ -3,7 +3,7 @@
 
 H14 (``wake_credit.py``) rechnet den ersten Wake D->P als Fixpunkt: laeuft die
 Ordnung durch oder endet sie im Kreditzyklus (W109)? Den Wake P->D rechnete
-niemand -- und genau dort ist nvml2 knapp: im P->D-Wake von fnFL2x141 wartet
+niemand -- und genau dort ist nvml2 tight: im P->D-Wake von fnFL2x141 wartet
 D TP2 (3080, nvml2) 73/83/94 ms an ``weights_4`` und 472/427/455 ms an
 ``weights_6`` auf VRAM-Kredit (die drei kurzen P->D-Flips), im 97k-Flip 125 ms
 an ``weights_6``.
@@ -227,7 +227,7 @@ def simulate_pd(ref: PDReference, order: Optional[Sequence[str]] = None, *,
                 unbounded_cards: Sequence[int] = ()) -> PDRun:
     """Der Wake P->D im Millisekundentakt.
 
-    ``unbounded_cards``: Karten, deren Kredit NIE knapp ist (``floor = -inf``)
+    ``unbounded_cards``: Karten, deren Kredit NIE tight ist (``floor = -inf``)
     -- der Vergleichslauf, der zeigt, was das Kreditwarten auf dieser Karte
     das Leg kostet."""
     order = list(ref.order if order is None else order)
@@ -710,7 +710,7 @@ def verdict_lines_pd(ref: PDReference, *, label: str, apply: bool,
     if run.complete:
         return lines, None, list(chosen)
     detail = (" | ".join("D TP%d steht bei %s, FEHLT %.0f MiB" % x for x in run.stuck)
-              or "kein Rang knapp -- die Legs warten im Kreis aufeinander")
+              or "kein Rang tight -- die Legs warten im Kreis aufeinander")
     refusal = (
         "%s: %s %s -- der Wake P->D endet deterministisch im Kreditmangel: %s. Die "
         "Karte haelt nach allen Pausen ihrer P-Stufe (minus Staging-Ring und "
@@ -1427,7 +1427,7 @@ def resolve_free0(form_key: str, d_seats: Optional[int], flip: int, *,
                   records: Sequence[Mapping[str, object]] = (),
                   model: Optional[str] = None,
                   form_model: object = None) -> Tuple[Optional[Mapping[str, object]], str, str]:
-    """``(eintrag, herkunft, zeile)``: die juengste Messung von free0 fuer die
+    """``(eintrag, source, zeile)``: die juengste Messung von free0 fuer die
     Form ``form_key`` (FORM_KEYS-Name der Zeitreferenz), die D-Sitze ``d_seats``
     und die Flip-Position ``flip``. ``eintrag`` None = keine Messung dieser
     Form, die Zeile sagt es. ``d_seats`` None: der Aufrufer nennt keine Sitze

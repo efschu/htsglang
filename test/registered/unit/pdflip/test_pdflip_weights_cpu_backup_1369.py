@@ -6,7 +6,7 @@ weight_exchange.py only; weight_updater.py/pdflip_memory_saver.py/model_runner.p
 User order 2026-09-14, verbatim: "DIE 48GB MUESSEN WEG. UND ZWAR PRONTO" and,
 against the "the ring is a fallback net" argument: "auf der Festplatte liegt
 ein Snapshot. Das ist auch ein Rueckfall. Aber wenn es korrekt implementiert
-ist braucht es NIEMALS einen Rueckfall....!"
+ist requires es NIEMALS einen Rueckfall....!"
 
 THE 46.40 GiB HOST RING (#1369) backed the WEIGHTS region unconditionally,
 both groups, under all three weight-source arms -- including under an ARMED,

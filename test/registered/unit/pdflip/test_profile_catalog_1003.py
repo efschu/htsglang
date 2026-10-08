@@ -55,7 +55,7 @@ def _load(name, path):
 PC = _load("t_profile_catalog", os.path.join(PDFLIP, "profile_catalog.py"))
 CU = _load("t_profile_catalog_curated", os.path.join(PDFLIP, "profile_catalog_curated.py"))
 RF = _load("t_refusals_cat", os.path.join(PDFLIP, "refusals.py"))
-RELS = {"tauscht", "braucht", "schliesst_aus", "abgeleitet_von", "skaliert_mit"}
+RELS = {"trades", "requires", "excludes", "derived_from", "scales_with"}
 
 
 class Harvest(unittest.TestCase):
@@ -159,7 +159,7 @@ class Curated(unittest.TestCase):
     def test_every_curated_entry_is_explained_and_core_values_have_a_price(self):
         for name, c in CU.CURATED.items():
             self.assertGreater(len(c["text"]), 15, name)
-            self.assertIn(c["level"], ("einfach", "experte"))
+            self.assertIn(c["level"], ("einfach", "expert"))
         for name in ("--pp-stage-ratio", "--rank-gpu-memory-mib", "--rank-moe-resident-fraction", "--p-chunk-policy"):
             self.assertTrue(CU.CURATED[name]["gain"] and CU.CURATED[name]["cost"], name)
 
@@ -167,10 +167,10 @@ class Curated(unittest.TestCase):
         """Layer-Schnitt <-> KV/Kontext, Experten <-> KV, Chunk <-> Aktivierung (Nutzer-Order 03.10.)."""
         def edge(a, b, rel):
             return any(d["to"] == b and d["rel"] == rel for d in CU.CURATED[a]["depends"])
-        self.assertTrue(edge("--pp-stage-ratio", "--rank-gpu-memory-mib", "tauscht"))
-        self.assertTrue(edge("--rank-moe-resident-fraction", "--rank-gpu-memory-mib", "tauscht"))
-        self.assertTrue(edge("--p-chunk-max", "--rank-gpu-memory-mib", "tauscht"))
-        self.assertTrue(edge("--pp-stage-ratio", "--pp-attn-stage-ratio", "braucht"))
+        self.assertTrue(edge("--pp-stage-ratio", "--rank-gpu-memory-mib", "trades"))
+        self.assertTrue(edge("--rank-moe-resident-fraction", "--rank-gpu-memory-mib", "trades"))
+        self.assertTrue(edge("--p-chunk-max", "--rank-gpu-memory-mib", "trades"))
+        self.assertTrue(edge("--pp-stage-ratio", "--pp-attn-stage-ratio", "requires"))
 
 
 class Build(unittest.TestCase):
@@ -178,10 +178,10 @@ class Build(unittest.TestCase):
         cat = PC.build_catalog(os.path.join(PDFLIP, "launcher.py"), os.path.join(SRT, "environ.py"), CU.CURATED, "t",
                                os.path.join(SRT, "server_args.py"))
         st = cat["stats"]
-        self.assertEqual(st["kuratiert"], len(CU.CURATED))
-        self.assertGreater(st["geerntet"], 1000)
-        self.assertEqual(cat["entries"]["--pp-stage-ratio"]["status"], "kuratiert")
-        self.assertEqual(cat["entries"]["--p-hostgap"]["status"], "kuratiert")
+        self.assertEqual(st["curated"], len(CU.CURATED))
+        self.assertGreater(st["harvested"], 1000)
+        self.assertEqual(cat["entries"]["--pp-stage-ratio"]["status"], "curated")
+        self.assertEqual(cat["entries"]["--p-hostgap"]["status"], "curated")
         with open(os.path.join(PDFLIP, "launcher.py"), encoding="utf-8") as fh:
             wired = RF.wired_codes(fh.read())
         self.assertEqual(cat["register_wired"], wired)
@@ -193,9 +193,9 @@ class Build(unittest.TestCase):
             # this tree alone.  What is tagged with THIS tree's label must be exactly this tree's harvest: when the tree moves (flag, env, os.environ
             # read site), this check goes red = rebuild catalog.json (command and tree revisions are in the commit message of the file).
             self.assertEqual(sorted(shipped["trees"]), ["27b", "nf"])
-            self.assertEqual(shipped["stats"]["kuratiert"], st["kuratiert"])
+            self.assertEqual(shipped["stats"]["curated"], st["curated"])
             here = PC._harvest(os.path.join(PDFLIP, "launcher.py"), os.path.join(SRT, "environ.py"), os.path.join(SRT, "server_args.py"), SRT)
-            tagged = {n for n, e in shipped["entries"].items() if TREE in e.get("baeume", [])}
+            tagged = {n for n, e in shipped["entries"].items() if TREE in e.get("trees", [])}
             self.assertEqual(tagged, set(here))
             if DUAL_LINE:
                 # the file's ``register_wired`` is the FIRST tree's (27B launcher): comparable only on the 27B line (the NF dashboard reads the wired

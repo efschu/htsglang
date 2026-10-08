@@ -1,14 +1,14 @@
 /* Profil-Editor S4b (Auftrag 1432) + AP-H2 (Auftrag 880): VRAM-Balken je Karte und Phase.
 
-   ============================ DATENVERTRAG flliper.balken/1 ============================
+   ============================ DATENVERTRAG flliper.bar/1 ============================
    Die Darstellung kennt NUR diese Form.  Der heutige Weg (POST /api/profil/recompute what=phase_bars ->
-   planner/profile_couplings.phase_bars) und ein späteres Orakel (propose()/Dry-Run, AP-C/AP-D) liefern DIESELBE Form; wer Werte
+   planner/profile_couplings.phase_bars) und ein späteres Oracle (propose()/Dry-Run, AP-C/AP-D) liefern DIESELBE Form; wer Werte
    einspeist, ändert die Darstellung nicht.
 
-     { "schema": "flliper.balken/1",
-       "form":   "single" | "d_only" | "flip" | "dual",          // Einzelkarte | nur TP | Flip PP/TP | Dual PP/TP
+     { "schema": "flliper.bar/1",
+       "form":   "single" | "d_only" | "flip" | "dual",          // SingleCard | nur TP | Flip PP/TP | Dual PP/TP
        "phases": {                                               // P und D (Dual: beide zugleich); d_only: nur D; single: nur "alle"
-         "P": { "ok": true (fehlt = ok), "label": "P-Phase (...)", "bars": [ CardBar, ... ], "inputs": [ {was, wert, herkunft} ], "error"?: "..." },
+         "P": { "ok": true (fehlt = ok), "label": "P-Phase (...)", "bars": [ CardBar, ... ], "inputs": [ {was, value, source} ], "error"?: "..." },
          "D": { ... } },
        "hints": [ "..." ] }
 
@@ -28,7 +28,7 @@
                  "shared_with_d": [ RefSegment, ... ],  // optional (Dual-Form --dual-share, P-Phase): REFERENZ ohne Budgetverbrauch, NICHT in segments und nicht in der Summe
                  "not_computed": [ "Festposten" ], "over_text": "" }
 
-     RefSegment = { "name", "label", "mib": number | null, "ref": "shared" | "in_festposten", "herkunft", "detail", "gerechnet" }
+     RefSegment = { "name", "label", "mib": number | null, "ref": "shared" | "in_festposten", "source", "detail", "gerechnet" }
                  // "shared" = die Bytes liegen in D's Union-Image bzw. im Karten-KV-Pool; "in_festposten" = der Betrag steckt schon im Festposten;
                  // mib = null = nicht gerechnet (z. B. das Diff, das sich nicht an D's Bytes binden lässt)
 
@@ -39,13 +39,13 @@
      Segment = { "name":  "weights"|"experts"|"draft"|"kv"|"state"|"activation"|"fixed"|"reserve"|"free",
                  "label": "Gewichte",
                  "mib":   number | null,             // null = NICHT GERECHNET: nicht gezeichnet, nicht in der Summe, steht als Chip unter dem Balken
-                 "herkunft": "Modellprofil/Hardwareprofil (config)" | "Profilzeile" | "Naeherung (nicht der Loeser)" | "gerechnet" |
+                 "source": "Modellprofil/Hardwareprofil (config)" | "Profilzeile" | "Naeherung (nicht der Loeser)" | "gerechnet" |
                              "Eingabe (Nutzer/Profil)" | "Annahme dieser Rechnung" | "nicht gerechnet",
                  "detail": "Formel/Grund für den Tooltip", "gerechnet": true|false,
                  "ausserhalb_budget": true }          // optional: Posten liegt AUSSERHALB des Budgets (verkleinert das Verfügbare der Karte)
 
    Summenregel: Σ mib aller Segmente = max(total_mib, posts_mib).  Mit in = Posten im Budget, out = Posten ausserhalb (ohne Flag: out = 0).  Reserve = max(0, (total − out) − max(budget, in)); Frei = max(0, min(budget, total − out) − in).
-   Ein Orakel darf zusätzliche Felder mitgeben; fehlende optionale Felder (detail, gerechnet, inputs) sind erlaubt.
+   Ein Oracle darf zusätzliche Felder mitgeben; fehlende optionale Felder (detail, gerechnet, inputs) sind erlaubt.
    Nicht gerechnete Terme: mib = null mit Grund in detail -- NIE geraten.
    ======================================================================================
 
@@ -130,7 +130,7 @@
   // Ein Segment des Vertrags (name/herkunft/detail) und eines der Näherung (key/origin/what) werden zu EINER inneren Form.
   const NC = "not computed";
   function normSeg(s) {
-    return { key: s.key || s.name, label: s.label || s.key || s.name, mib: s.mib == null ? null : s.mib, origin: s.origin || s.herkunft || "",
+    return { key: s.key || s.name, label: s.label || s.key || s.name, mib: s.mib == null ? null : s.mib, origin: s.origin || s.source || "",
       what: s.what || s.detail || s.label || "", src: s.src, cut: s.cut, outside: !!(s.ausserhalb_budget || s.outside) };
   }
   function normBar(b) {
@@ -144,10 +144,10 @@
     const segs = [], missing = [];
     let inside = 0, outside = 0;
     posts.forEach((p) => {
-      if (p.mib == null) { segs.push({ name: p.name, label: p.label, mib: null, herkunft: NC, detail: p.detail || "", gerechnet: false }); missing.push(p.label); }
+      if (p.mib == null) { segs.push({ name: p.name, label: p.label, mib: null, source: NC, detail: p.detail || "", gerechnet: false }); missing.push(p.label); }
       else if (p.mib > 0) {
         if (p.outside) outside += p.mib; else inside += p.mib;
-        const sg = { name: p.name, label: p.label, mib: p.mib, herkunft: p.herkunft || "", detail: p.detail || "", gerechnet: true };
+        const sg = { name: p.name, label: p.label, mib: p.mib, source: p.source || "", detail: p.detail || "", gerechnet: true };
         if (p.outside) sg.ausserhalb_budget = true;
         segs.push(sg);
       }
@@ -156,9 +156,9 @@
     const userReserve = extra.userReserve || 0;
     const overflow = Math.max(0, inside - budget), beyond = Math.max(0, known - total), overAvail = Math.max(0, budget - (available - userReserve));
     const reserve = Math.max(0, available - Math.max(budget, inside)), free = Math.max(0, Math.min(budget, available) - inside);
-    if (reserve > 0) segs.push({ name: "reserve", label: "Reserve", mib: reserve, herkunft: budgetOrigin || "", gerechnet: true,
+    if (reserve > 0) segs.push({ name: "reserve", label: "Reserve", mib: reserve, source: budgetOrigin || "", gerechnet: true,
       detail: LEG_TAIL[0][2] + (overflow > 0 ? " -- requested " + fmt(available - budget) + " MiB, of which " + fmt(overflow) + " MiB consumed" : "") });
-    if (free > 0) segs.push({ name: "free", label: "Free", mib: free, herkunft: "computed", gerechnet: true,
+    if (free > 0) segs.push({ name: "free", label: "Free", mib: free, source: "computed", gerechnet: true,
       detail: LEG_TAIL[1][2] + (missing.length ? " -- UPPER BOUND: not computed are " + missing.join(", ") : "") });
     return { label, phase, total_mib: total, budget_mib: budget, budget_herkunft: budgetOrigin || "", segments: segs, posts_mib: known, free_mib: free,
       overflow_mib: overflow, beyond_card_mib: beyond, outside_budget_mib: outside, available_mib: available, budget_over_available_mib: overAvail,
@@ -177,7 +177,7 @@
     const posts = SEGS.map(([key, lab, what]) => {
       if (key === "fixed" && !(kept.fixed > 0)) return { name: key, label: lab, mib: null, detail: what };
       const m = meta[key] || {};
-      return { name: key, label: lab, mib: kept[key] || 0, herkunft: m.origin || "approximation (browser)", detail: m.what || what };
+      return { name: key, label: lab, mib: kept[key] || 0, source: m.origin || "approximation (browser)", detail: m.what || what };
     });
     const out = contractBar(b.label, phase, b.total_mib, b.budget_mib, "input/computed", posts);
     out.card = b.ord;
@@ -241,7 +241,7 @@
     return (strip ? '<div class="kp-ghost" aria-hidden="true">' + strip + "</div>" : "") + '<div class="kp-refs"><span class="muted">Not in the budget:</span> ' + chips + "</div>";
   }
   function normRef(s) {
-    return { label: s.label || s.name, mib: s.mib == null ? null : s.mib, ref: s.ref || "shared", origin: s.origin || s.herkunft || "", what: s.what || s.detail || "" };
+    return { label: s.label || s.name, mib: s.mib == null ? null : s.mib, ref: s.ref || "shared", origin: s.origin || s.source || "", what: s.what || s.detail || "" };
   }
   function overNote(b) {
     if (b.beyond_card_mib > 0) return '<div class="kp-over bad" role="alert"><b>' + esc(b.label) + ": " + fmt(b.beyond_card_mib) + " MiB over the card.</b> The bar grows beyond the card limit; expect OOM during loading or graph capture.</div>";
@@ -275,7 +275,7 @@
       all = all.concat(ph.bars);
       if (ph.inputs && ph.inputs.length) {
         html += '<details class="pf-fold kp-in"><summary>Inputs of this phase (' + ph.inputs.length + ")</summary><ul class=\"pf-notes\">" +
-          ph.inputs.map((x) => "<li><b>" + esc(x.was) + "</b> = <span class=\"mono\">" + esc(x.wert) + "</span> <span class=\"muted\">· " + esc(x.herkunft) + "</span></li>").join("") + "</ul></details>";
+          ph.inputs.map((x) => "<li><b>" + esc(x.was) + "</b> = <span class=\"mono\">" + esc(x.value) + "</span> <span class=\"muted\">· " + esc(x.source) + "</span></li>").join("") + "</ul></details>";
       }
     });
     return { html, bars: all };
@@ -308,7 +308,7 @@
     el.addEventListener("click", (ev) => { const t = at(ev); if (t) show(t, ev.clientX, ev.clientY); else hide(); });
   }
 
-  const api = { approx, approxBars, barFromTerms, render, renderPhases, tip, attach, model, SEGS, contractBar, toContract, approxContractBars, normBar, SCHEMA: "flliper.balken/1" };
+  const api = { approx, approxBars, barFromTerms, render, renderPhases, tip, attach, model, SEGS, contractBar, toContract, approxContractBars, normBar, SCHEMA: "flliper.bar/1" };
   root.ProfilBalken = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof window !== "undefined" ? window : globalThis);

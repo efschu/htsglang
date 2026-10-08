@@ -1,9 +1,9 @@
-"""AP-H2 (Auftrag 880): Balken je Karte und Phase im Vertrag ``flliper.balken/1`` -- Dashboard-Seite.
+"""AP-H2 (Auftrag 880): Balken je Karte und Phase im Vertrag ``flliper.bar/1`` -- Dashboard-Seite.
 
 Gepinnt:
 
 * Gruppenzeilen des Profils (``--extra-p/-d``, ``--env-p/-d``) werden je Phase gelesen, in BEIDEN Darstellungen, die der Importer liefert (Wert in
-  ``values`` oder -- ohne Specs importiert -- als eigener Eintrag danach, auch in der ``flag=wert``-Form); Draft-Pfad aus Koerper, Flag, Gruppenzeile,
+  ``values`` oder -- ohne Specs importiert -- als eigener Eintrag danach, auch in der ``flag=value``-Form); Draft-Pfad aus Koerper, Flag, Gruppenzeile,
   ``PROFILE_DRAFT``;
 * Route ``what=phase_bars``: Draft-Verzeichnis wird mitprofiliert, ein nicht lesbares Draft-Verzeichnis ist ``draft_error`` und rechnet ohne es;
   ``what=bars`` bleibt unveraendert (kein Draft, keine Gruppenzeilen);
@@ -25,7 +25,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
-from rigdash import profil_recompute as R  # noqa: E402
+from rigdash import profile_recompute as R  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(HERE), "static")
 JS = os.path.join(STATIC, "profil_balken.js")
@@ -216,11 +216,11 @@ class TestJsContract(unittest.TestCase):
 
     def bar(self, **kw):
         b = {"card": 0, "label": "Card 0 (RTX 5090)", "phase": "P", "total_mib": 1000, "budget_mib": 900, "budget_herkunft": "profile row",
-             "segments": [{"name": "weights", "label": "Weights", "mib": 300, "herkunft": "model profile/hardware profile (Index)", "detail": "dense weights"},
-                          {"name": "kv", "label": "KV", "mib": 200, "herkunft": "approximation (not the solver)", "detail": "context x layers x cell"},
-                          {"name": "fixed", "label": "Fixed items", "mib": None, "herkunft": "not computed", "detail": "measurable only on the metal"},
-                          {"name": "reserve", "label": "Reserve", "mib": 100, "herkunft": "profile row", "detail": "card size - budget"},
-                          {"name": "free", "label": "Free", "mib": 400, "herkunft": "computed", "detail": "Budget - Posten"}],
+             "segments": [{"name": "weights", "label": "Weights", "mib": 300, "source": "model profile/hardware profile (Index)", "detail": "dense weights"},
+                          {"name": "kv", "label": "KV", "mib": 200, "source": "approximation (not the solver)", "detail": "context x layers x cell"},
+                          {"name": "fixed", "label": "Fixed items", "mib": None, "source": "not computed", "detail": "measurable only on the metal"},
+                          {"name": "reserve", "label": "Reserve", "mib": 100, "source": "profile row", "detail": "card size - budget"},
+                          {"name": "free", "label": "Free", "mib": 400, "source": "computed", "detail": "Budget - Posten"}],
              "posts_mib": 500, "free_mib": 400, "overflow_mib": 0, "beyond_card_mib": 0, "not_computed": ["Fixed items"]}
         b.update(kw)
         return b
@@ -239,8 +239,8 @@ class TestJsContract(unittest.TestCase):
         self.assertIn('class="kp-ph-chip">P<', html)
 
     def test_the_bar_grows_past_the_card_edge_with_a_red_zone_and_a_note(self):
-        b = self.bar(segments=[{"name": "weights", "label": "Weights", "mib": 700, "herkunft": "x", "detail": "d"},
-                               {"name": "kv", "label": "KV", "mib": 500, "herkunft": "y", "detail": "d"}],
+        b = self.bar(segments=[{"name": "weights", "label": "Weights", "mib": 700, "source": "x", "detail": "d"},
+                               {"name": "kv", "label": "KV", "mib": 500, "source": "y", "detail": "d"}],
                      posts_mib=1200, free_mib=0, overflow_mib=300, beyond_card_mib=200, not_computed=[])
         o = self.js("const M=require(%r);const b=%s;console.log(JSON.stringify({html:M.render([b],{base:0}),tip:M.tip(b,1)}))" % (JS, json.dumps(b)))
         self.assertIn('class="kp-bz"', o["html"])
@@ -254,8 +254,8 @@ class TestJsContract(unittest.TestCase):
     def test_server_rounding_of_a_full_bar_is_no_card_edge_overflow(self):
         # Beleg Browser-Gegenprobe 27b-nvfp4-dual-262k, Karte 0, D-Phase: Segmente runden auf 3 Stellen, Summe 32607.001 bei Karte 32607
         b = self.bar(total_mib=1000, budget_mib=1000, segments=[
-            {"name": "weights", "label": "Weights", "mib": 300.0004, "herkunft": "x", "detail": "d"},
-            {"name": "free", "label": "Free", "mib": 699.6006, "herkunft": "computed", "detail": "d"}], posts_mib=300.0004, free_mib=699.6006)
+            {"name": "weights", "label": "Weights", "mib": 300.0004, "source": "x", "detail": "d"},
+            {"name": "free", "label": "Free", "mib": 699.6006, "source": "computed", "detail": "d"}], posts_mib=300.0004, free_mib=699.6006)
         html = self.js("const M=require(%r);console.log(JSON.stringify(M.render([%s],{base:0})))" % (JS, json.dumps(b)))
         self.assertNotIn("kp-edge", html)
         self.assertNotIn("kp-bz", html)
@@ -269,8 +269,8 @@ class TestJsContract(unittest.TestCase):
     def test_the_over_budget_note_claims_no_oom_the_same_words_as_the_planner_text(self):
         # Fix-Runde 4, Befund 2: Posten ueber dem Budget innerhalb der Karte -> "The reserve is consumed" (wie profile_couplings._over_text), keine OOM-Folgerung
         b = self.bar(overflow_mib=50, beyond_card_mib=0,
-                     segments=[{"name": "weights", "label": "Weights", "mib": 950, "herkunft": "x", "detail": "d"},
-                               {"name": "free", "label": "Free", "mib": 50, "herkunft": "computed", "detail": "d"}])
+                     segments=[{"name": "weights", "label": "Weights", "mib": 950, "source": "x", "detail": "d"},
+                               {"name": "free", "label": "Free", "mib": 50, "source": "computed", "detail": "d"}])
         o = self.js("const M=require(%r);console.log(JSON.stringify({html:M.render([%s],{base:0}),tip:M.tip(%s,0)}))" % (JS, json.dumps(b), json.dumps(b)))
         self.assertIn("The reserve is consumed", o["html"])
         self.assertNotIn("OOM", o["html"])
@@ -282,14 +282,14 @@ class TestJsContract(unittest.TestCase):
         self.assertNotIn("OOM", o2["tip"])
 
     def test_chips_use_the_floating_tooltip_not_the_native_title(self):
-        b = self.bar(shared_with_d=[{"name": "weights", "label": "Weights", "mib": 300, "ref": "shared", "herkunft": "model profile", "detail": "in the union image of D"}])
+        b = self.bar(shared_with_d=[{"name": "weights", "label": "Weights", "mib": 300, "ref": "shared", "source": "model profile", "detail": "in the union image of D"}])
         html = self.js("const M=require(%r);console.log(JSON.stringify(M.render([%s],{base:0})))" % (JS, json.dumps(b)))
         self.assertIn('class="kp-ref" tabindex="0" data-tip="in the union image of D | source: model profile"', html)
         self.assertIn('class="kp-nc" tabindex="0" data-tip="measurable only on the metal"', html)
         self.assertNotIn('class="kp-ref" tabindex="0" title=', html)
 
     def test_render_phases_lists_each_phase_the_inputs_and_a_failed_phase_as_a_message(self):
-        res = {"phases": {"P": {"ok": True, "label": "P-Phase <x>", "bars": [self.bar(), self.bar(label="Karte 1")], "inputs": [{"was": "stage_layers", "wert": "29,11,8", "herkunft": "profile row --pp-stage-ratio"}]},
+        res = {"phases": {"P": {"ok": True, "label": "P-Phase <x>", "bars": [self.bar(), self.bar(label="Karte 1")], "inputs": [{"was": "stage_layers", "value": "29,11,8", "source": "profile row --pp-stage-ratio"}]},
                           "D": {"ok": False, "label": "D-Phase", "error": "vector_length: <b>zu kurz</b>", "bars": []}}}
         o = self.js("const M=require(%r);const r=M.renderPhases(%s,{base:0});console.log(JSON.stringify({html:r.html,n:r.bars.length}))" % (JS, json.dumps(res)))
         self.assertEqual(o["n"], 2)
@@ -335,13 +335,13 @@ class TestJsContract(unittest.TestCase):
 
     def test_dual_share_reference_row_is_not_part_of_the_bar_sum(self):
         # Fix-Runde 3, Befund 1: Referenzposten (geteilt mit D) stehen als Geisterstreifen + Chips, nicht in den Segmenten und nicht in der Summe
-        b = self.bar(segments=[{"name": "state", "label": "Mamba/GDN state", "mib": 100, "herkunft": "x", "detail": "d"},
-                               {"name": "fixed", "label": "Fixed items", "mib": 150, "herkunft": "x", "detail": "d", "ausserhalb_budget": True},
-                               {"name": "reserve", "label": "Reserve", "mib": 350, "herkunft": "x", "detail": "d"},
-                               {"name": "free", "label": "Free", "mib": 400, "herkunft": "computed", "detail": "d"}],
-                     shared_with_d=[{"name": "weights", "label": "Weights", "mib": 300, "ref": "shared", "herkunft": "model profile", "detail": "in the union image of D"},
-                                    {"name": "activation", "label": "Activation", "mib": 40, "ref": "in_festposten", "herkunft": "x", "detail": "in the fixed items"},
-                                    {"name": "diff", "label": "Diff of the P weights", "mib": None, "ref": "shared", "herkunft": "not computed", "detail": "cannot be verified"}])
+        b = self.bar(segments=[{"name": "state", "label": "Mamba/GDN state", "mib": 100, "source": "x", "detail": "d"},
+                               {"name": "fixed", "label": "Fixed items", "mib": 150, "source": "x", "detail": "d", "ausserhalb_budget": True},
+                               {"name": "reserve", "label": "Reserve", "mib": 350, "source": "x", "detail": "d"},
+                               {"name": "free", "label": "Free", "mib": 400, "source": "computed", "detail": "d"}],
+                     shared_with_d=[{"name": "weights", "label": "Weights", "mib": 300, "ref": "shared", "source": "model profile", "detail": "in the union image of D"},
+                                    {"name": "activation", "label": "Activation", "mib": 40, "ref": "in_festposten", "source": "x", "detail": "in the fixed items"},
+                                    {"name": "diff", "label": "Diff of the P weights", "mib": None, "ref": "shared", "source": "not computed", "detail": "cannot be verified"}])
         o = self.js("const M=require(%r);const b=%s;console.log(JSON.stringify({html:M.render([b],{base:0}),m:M.model(b)}))" % (JS, json.dumps(b)))
         self.assertAlmostEqual(o["m"]["sum"], 1000)                                   # Summe = Karte; die Referenz ist nicht dabei
         html = o["html"]
@@ -398,7 +398,7 @@ class TestJsContract(unittest.TestCase):
             self.assertIn(needle, pj)
         self.assertIn('res.form === "dual"', pj)                                      # Dual: keine lineare Browser-Naeherung (kennt die Referenzposten nicht)
         head = open(JS, encoding="utf-8").read().split("(function (root)")[0]
-        for needle in ("flliper.balken/1", '"herkunft"', '"mib":', "NICHT GERECHNET", "Summenregel", "shared_with_d", "user_reserve_mib"):
+        for needle in ("flliper.bar/1", '"source"', '"mib":', "NICHT GERECHNET", "Summenregel", "shared_with_d", "user_reserve_mib"):
             self.assertIn(needle, head)
 
 
@@ -444,7 +444,7 @@ print(json.dumps({"hw": hw, "model": model, "bar": PC.contract_bar(st, "P")}))
         r = self.ask()
         self.assertTrue(r["ok"], r)
         res = r["result"]
-        self.assertEqual((res["schema"], res["form"], list(res["phases"])), ("flliper.balken/1", "flip", ["P", "D"]))
+        self.assertEqual((res["schema"], res["form"], list(res["phases"])), ("flliper.bar/1", "flip", ["P", "D"]))
         self.assertEqual(len(res["phases"]["P"]["bars"]), 3)
         self.assertEqual(len(res["phases"]["D"]["bars"]), 3)
         self.assertEqual(self.svc.starts, 1)

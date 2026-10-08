@@ -2,14 +2,14 @@
 
 Every value in the editor is explained from a SOURCE, never from a guess.  The sources, in order:
 
-1. **kuratiert** (``profile_catalog_curated.py``): the core values a person is meant to touch, with a plain
+1. **curated** (``profile_catalog_curated.py``): the core values a person is meant to touch, with a plain
    sentence, the price (gain/cost) and the dependencies on other values (``depends``).
 2. **argparse** -- the ``help=`` text, default, choices and arity of every ``add_argument`` of the launcher,
    harvested by AST from ``launcher.py`` (no import: the launcher pulls torch).
 3. **environ** -- the comment lines above a field of ``environ.py``'s ``Envs`` plus its type and default.
 4. **profil-kommentar** -- the comment above (or after) the line that sets the value in the profile itself
    (``harvest_profile_comments``; per profile, at load time).
-5. Nothing found -> ``status: "unerklaert"``, shown as such with the place in the code to read.
+5. Nothing found -> ``status: "unexplained"``, shown as such with the place in the code to read.
 
 ``build_catalog`` merges 1-3 and the EDGE CATALOG (``kantenkatalog_1004.json``, see :func:`merge_edges`); ``coverage`` states how much is explained.  A curated dependency edge is checked
 against the launcher by the test (``test_profile_catalog_1003``): the flags it names must exist.
@@ -231,40 +231,40 @@ def load_edges(path: str = "") -> Tuple[List[Dict[str, object]], Dict[str, objec
     """The edges of the edge catalog and a status dict.  A missing or unreadable file is NOT an error of the catalog: the
     dependencies stay as curated, the status says ``geladen: False`` and why (never a silent empty list)."""
     path = path or EDGES_FILE
-    info: Dict[str, object] = {"datei": os.path.basename(path), "geladen": False, "grund": "", "schema": ""}
+    info: Dict[str, object] = {"file": os.path.basename(path), "geladen": False, "reason": "", "schema": ""}
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
     except (OSError, ValueError) as exc:
-        info["grund"] = "nicht lesbar: %s" % exc
+        info["reason"] = "nicht lesbar: %s" % exc
         return [], info
     info["schema"] = str(doc.get("schema", ""))
     edges = doc.get("kanten")
     if info["schema"] != EDGES_SCHEMA or not isinstance(edges, list):
-        info["grund"] = "Schema %r (erwartet %s) oder keine Kantenliste" % (info["schema"], EDGES_SCHEMA)
+        info["reason"] = "Schema %r (erwartet %s) oder keine Kantenliste" % (info["schema"], EDGES_SCHEMA)
         return [], info
     ok = [e for e in edges if isinstance(e, dict) and e.get("von") and e.get("nach") and e.get("rel")]
-    info.update({"geladen": True, "kanten_gesamt": len(ok), "verworfen": len(edges) - len(ok)})
+    info.update({"geladen": True, "edges_total": len(ok), "rejected": len(edges) - len(ok)})
     return ok, info
 
 
 def _beleg(e: Mapping) -> Optional[Dict[str, object]]:
-    b = e.get("beleg")
-    if not isinstance(b, dict) or not b.get("datei"):
+    b = e.get("evidence")
+    if not isinstance(b, dict) or not b.get("file"):
         return None
-    return {"datei": str(b.get("datei")), "zeile": b.get("zeile"), "anker": str(b.get("anker") or "")}
+    return {"file": str(b.get("file")), "zeile": b.get("zeile"), "anchor": str(b.get("anchor") or "")}
 
 
 def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping], info: Dict[str, object],
                 refusal_codes: Optional[Sequence[str]] = None) -> Dict[str, object]:
     """Merge the edge catalog into ``entries[von]["depends"]`` (key ``(von, nach)``), IN PLACE, and say what happened.
 
-    * a curated edge with a catalog edge of the same pair gets ``kante`` (id), ``beleg`` (``datei``/``zeile``/``anker``), ``satz``
-      (the tradeoff sentence), ``wert`` (the condition, shown as text only -- the editor does NOT evaluate it) and ``belegt: True``;
-      when the catalog names another ``rel``, the curated one stays and ``rel_katalog`` carries the catalog's (no silent overwrite);
-    * a catalog edge with no curated twin is appended (``quelle: "katalog"``);
+    * a curated edge with a catalog edge of the same pair gets ``edge`` (id), ``evidence`` (``file``/``zeile``/``anchor``), ``satz``
+      (the tradeoff sentence), ``value`` (the condition, shown as text only -- the editor does NOT evaluate it) and ``belegt: True``;
+      when the catalog names another ``rel``, the curated one stays and ``rel_catalog`` carries the catalog's (no silent overwrite);
+    * a catalog edge with no curated twin is appended (``quelle: "catalog"``);
     * a curated edge without catalog edge stays and is marked ``belegt: False`` -- "ohne Beleg", not refuted;
-    * every edge gets ``to_kind``: ``flag`` / ``env`` / ``var`` (a row of the editor), ``ablehnung`` (a code of the refusal register,
+    * every edge gets ``to_kind``: ``flag`` / ``env`` / ``var`` (a row of the editor), ``refusal`` (a code of the refusal register,
       no row) or ``unbekannt`` -- so a chip never points silently at nothing.
 
     No rule is evaluated here (Nutzerentscheid 05.10.): the launcher and the dry run judge, the edges only explain."""
@@ -277,13 +277,13 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
         for d in ent.get("depends", []):
             e = by_pair.get((name, str(d.get("to"))))
             if e is None:
-                d.update({"belegt": False, "quelle": "kuratiert", "beleg": None, "satz": "", "kante": "", "wert": None})
+                d.update({"belegt": False, "quelle": "curated", "evidence": None, "satz": "", "edge": "", "value": None})
                 continue
             used.add((name, str(d["to"])))
-            d.update({"belegt": True, "quelle": "katalog+kuratiert", "kante": str(e.get("id", "")), "beleg": _beleg(e),
-                      "satz": str(e.get("satz") or ""), "wert": e.get("wert")})
+            d.update({"belegt": True, "quelle": "catalog+curated", "edge": str(e.get("id", "")), "evidence": _beleg(e),
+                      "satz": str(e.get("satz") or ""), "value": e.get("value")})
             if e["rel"] != d.get("rel"):
-                d["rel_katalog"] = e["rel"]
+                d["rel_catalog"] = e["rel"]
                 rel_diff.append(str(e.get("id", "")))
     new = 0
     for key, e in by_pair.items():
@@ -295,8 +295,8 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
             continue
         ent.setdefault("depends", []).append({
             "to": key[1], "rel": e["rel"], "effect": str(e.get("satz") or ""), "calc": e.get("calc") or "text", "belegt": True,
-            "quelle": "katalog", "kante": str(e.get("id", "")), "beleg": _beleg(e), "satz": str(e.get("satz") or ""),
-            "wert": e.get("wert")})
+            "quelle": "catalog", "edge": str(e.get("id", "")), "evidence": _beleg(e), "satz": str(e.get("satz") or ""),
+            "value": e.get("value")})
         new += 1
     n_with = n_without = n_kind_unknown = 0
     for ent in entries.values():
@@ -305,7 +305,7 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
             if to in entries:
                 d["to_kind"] = str(entries[to].get("kind") or "unbekannt")
             elif to in codes or (not codes and _RX_CODE.match(to)):
-                d["to_kind"] = "ablehnung"
+                d["to_kind"] = "refusal"
             else:
                 d["to_kind"] = "unbekannt"
                 n_kind_unknown += 1
@@ -314,8 +314,8 @@ def merge_edges(entries: Dict[str, Dict[str, object]], edges: Sequence[Mapping],
             else:
                 n_without += 1
     info.update({"verschmolzen": len(used), "neu": new, "uebersprungen_ohne_von": skipped, "rel_abweichend": rel_diff,
-                 "kanten_belegt": n_with, "kanten_ohne_beleg": n_without, "ziel_unbekannt": n_kind_unknown,
-                 "wertbedingt": sum(1 for e in edges if e.get("wert"))})
+                 "kanten_belegt": n_with, "edges_without_evidence": n_without, "ziel_unbekannt": n_kind_unknown,
+                 "wertbedingt": sum(1 for e in edges if e.get("value"))})
     return info
 
 
@@ -346,33 +346,33 @@ def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, M
                 continue
             entries[name] = {"id": name, "kind": "flag", "name": name, "type": "bool" if r["bare"] else "str",
                              "default": r["default"], "choices": r["choices"], "bare": r["bare"], "nargs": r["nargs"],
-                             "text": "", "gain": "", "cost": "", "depends": [], "level": "experte", "group": "",
+                             "text": "", "gain": "", "cost": "", "depends": [], "level": "expert", "group": "",
                              "planner_derived": False, "scope": "server",
                              "source": {"file": "server_args.py", "line": r["line"], "kind": "argparse"},
-                             "help": r["help"], "status": "geerntet" if r["help"] else "unerklaert"}
+                             "help": r["help"], "status": "harvested" if r["help"] else "unexplained"}
     for name, r in flags.items():
         e: Dict[str, object] = {"id": name, "kind": "flag", "name": name, "type": r["type"] or ("bool" if r["bare"] else "str"),
                                 "default": r["default"], "choices": r["choices"], "bare": r["bare"], "nargs": r["nargs"],
-                                "text": "", "gain": "", "cost": "", "depends": [], "level": "experte", "group": "",
+                                "text": "", "gain": "", "cost": "", "depends": [], "level": "expert", "group": "",
                                 "planner_derived": False, "source": {"file": "pdflip/launcher.py", "line": r["line"], "kind": "argparse"},
-                                "help": r["help"], "status": "geerntet" if r["help"] else "unerklaert"}
+                                "help": r["help"], "status": "harvested" if r["help"] else "unexplained"}
         entries[name] = e
     for name, r in envs.items():
         txt = r["comment"] or r["trailing"]
         entries[name] = {"id": name, "kind": "env", "name": name, "type": r["kind"], "default": r["default"], "choices": None,
-                         "bare": False, "nargs": None, "text": "", "gain": "", "cost": "", "depends": [], "level": "experte",
+                         "bare": False, "nargs": None, "text": "", "gain": "", "cost": "", "depends": [], "level": "expert",
                          "group": "", "planner_derived": False,
                          "source": {"file": "environ.py", "line": r["line"], "kind": "environ"}, "help": txt,
-                         "status": "geerntet" if txt else "unerklaert"}
+                         "status": "harvested" if txt else "unexplained"}
     for name, c in curated.items():
         e = entries.setdefault(name, {"id": name, "kind": c.get("kind", "env"), "name": name, "type": "str", "default": None,
                                       "choices": None, "bare": False, "nargs": None, "help": "",
-                                      "source": {"file": "profile", "line": 0, "kind": "kuratiert"}})
+                                      "source": {"file": "profile", "line": 0, "kind": "curated"}})
         for k in ("text", "gain", "cost", "group", "level", "planner_derived"):
             if k in c:
                 e[k] = c[k]
         e["depends"] = [dict(d) for d in c.get("depends", [])]
-        e["status"] = "kuratiert"
+        e["status"] = "curated"
     ref = _refusals_module()
     edges, einfo = load_edges(edges_path)
     merge_edges(entries, edges, einfo, [r.code for r in ref.REGISTER] if ref is not None else None)
@@ -391,9 +391,9 @@ def build_catalog(launcher_path: str, environ_path: str, curated: Mapping[str, M
 
 def coverage(entries: Mapping[str, Mapping]) -> Dict[str, int]:
     n = len(entries)
-    return {"entries": n, "kuratiert": sum(1 for e in entries.values() if e["status"] == "kuratiert"),
-            "geerntet": sum(1 for e in entries.values() if e["status"] == "geerntet"),
-            "unerklaert": sum(1 for e in entries.values() if e["status"] == "unerklaert"),
+    return {"entries": n, "curated": sum(1 for e in entries.values() if e["status"] == "curated"),
+            "harvested": sum(1 for e in entries.values() if e["status"] == "harvested"),
+            "unexplained": sum(1 for e in entries.values() if e["status"] == "unexplained"),
             "flags": sum(1 for e in entries.values() if e["kind"] == "flag"),
             "envs": sum(1 for e in entries.values() if e["kind"] == "env")}
 
@@ -428,7 +428,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         sys.stdout.write(text)
     st = cat["stats"]
-    print("catalog: %(entries)d entries (%(flags)d flags, %(envs)d envs): %(kuratiert)d kuratiert, %(geerntet)d geerntet, %(unerklaert)d unerklaert" % st, file=sys.stderr)
+    print("catalog: %(entries)d entries (%(flags)d flags, %(envs)d envs): %(curated)d curated, %(harvested)d harvested, %(unexplained)d unexplained" % st, file=sys.stderr)
     return 0
 
 

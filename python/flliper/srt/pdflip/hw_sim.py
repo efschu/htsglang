@@ -104,7 +104,7 @@ class SimCard:
 EV_METAL = "METAL"
 EV_NVML = "NVML-RECORDING"
 EV_DATASHEET = "DATASHEET"
-EV_BORROWED = "HW-BORROWED/unbelegt"
+EV_BORROWED = "HW-BORROWED/unverified"
 _SM89 = "; sm89 am Metall nie gemessen"
 
 #: The catalog (nameplate figures; totals as NVML reports them where the rig

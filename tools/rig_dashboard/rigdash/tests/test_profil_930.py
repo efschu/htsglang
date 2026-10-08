@@ -86,24 +86,24 @@ class Editor(unittest.TestCase):
         for k in rows:
             self.assertEqual(rows[k]["origin"], "profil", k)
         ex = rows["flag:--pp-stage-ratio"]["explain"]
-        self.assertEqual(ex["status"], "kuratiert")
-        self.assertTrue(any(d["to"] == "--rank-gpu-memory-mib" and d["rel"] == "tauscht" for d in ex["depends"]))
+        self.assertEqual(ex["status"], "curated")
+        self.assertTrue(any(d["to"] == "--rank-gpu-memory-mib" and d["rel"] == "trades" for d in ex["depends"]))
         self.assertTrue(any(d["to"] == "--pp-attn-stage-ratio" and d["present"] for d in ex["depends"]))   # set in this profile
-        self.assertEqual(rows["flag:--model"]["explain"]["status"] in ("geerntet", "kuratiert", "profil-kommentar", "unerklaert"), True)
-        self.assertEqual(r["view"]["coverage"]["geaendert"], 0)
+        self.assertEqual(rows["flag:--model"]["explain"]["status"] in ("harvested", "curated", "profil-kommentar", "unexplained"), True)
+        self.assertEqual(r["view"]["coverage"]["changed"], 0)
 
     def test_the_profile_comment_is_shown_as_its_own_source(self):
         r = self.ed.load("release", "demo")
         parts = self.rows(r)["var:PROFILE_NAME"]["explain"]["parts"]
         self.assertTrue(any(p["kind"] == "profil" and "why the batch size" in p["text"] for p in parts))      # the comment sits right above PROFILE_NAME
-        self.assertTrue(any(p["kind"] == "kuratiert" for p in parts))
+        self.assertTrue(any(p["kind"] == "curated" for p in parts))
 
     def test_edit_origin_and_reset(self):
         r = self.ed.load("release", "demo")
         e = self.ed.edit(r["doc"], [{"key": "flag:--p-bs", "op": "set", "value": "4"}])
         row = self.rows(e)["flag:--p-bs"]
         self.assertEqual((row["value"], row["origin"], row["profile_value"], row["changed"]), ("4", "nutzer", "2", True))
-        self.assertEqual(e["view"]["coverage"]["geaendert"], 1)
+        self.assertEqual(e["view"]["coverage"]["changed"], 1)
         back = self.ed.edit(e["doc"], [{"key": "flag:--p-bs", "op": "reset", "to": "profil"}])
         row = self.rows(back)["flag:--p-bs"]
         self.assertEqual((row["value"], row["origin"], row["changed"]), ("2", "profil", False))
@@ -140,7 +140,7 @@ class Editor(unittest.TestCase):
         self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= set(by))
         for c in ("HW-COUNT", "HW-UNCALIBRATED"):
             for q in by[c]:
-                self.assertEqual(q["klass"], "wert")
+                self.assertEqual(q["klass"], "value")
                 self.assertEqual(q["force_state"], "force")
                 self.assertIn("force overrides it", q["force"])
                 self.assertTrue(q["why_class"])
@@ -154,7 +154,7 @@ class Editor(unittest.TestCase):
         self.assertIn("remain even with force", four["verdict"])
         one = self.ed.dry_run(r["doc"], RIG[:1])
         topo = {q["code"]: q for q in one["rejections"]}["HW-TOPOLOGY"]                      # no flip topology for one card
-        self.assertEqual((topo["klass"], topo["forcebar"], topo["force_state"]), ("nicht_forcebar", False, "blockiert"))
+        self.assertEqual((topo["klass"], topo["forcebar"], topo["force_state"]), ("nicht_forcebar", False, "is_blocked"))
 
     def test_no_force_switch_and_no_start_route_in_the_dashboard(self):
         src = open(S.__file__, encoding="utf-8").read()
@@ -185,19 +185,19 @@ class Editor(unittest.TestCase):
     def test_names_cannot_escape(self):
         r = self.ed.load("release", "demo")
         for bad in ("../x", "a/b", "", "A", ".hidden", "x" * 70):
-            with self.assertRaises(P.ProfilError):
+            with self.assertRaises(P.ProfileError):
                 self.ed.save(r["doc"], bad)
-        with self.assertRaises(P.ProfilError):
+        with self.assertRaises(P.ProfileError):
             self.ed.load("release", "../demo")
-        with self.assertRaises(P.ProfilError):
+        with self.assertRaises(P.ProfileError):
             self.ed.load("user", "nope")
 
     def test_bad_input_is_a_named_error(self):
-        with self.assertRaises(P.ProfilError):
+        with self.assertRaises(P.ProfileError):
             self.ed.edit({"schema": "x"}, [])
-        with self.assertRaises(P.ProfilError):
+        with self.assertRaises(P.ProfileError):
             self.ed.dry_run(self.ed.load("release", "demo")["doc"], [])
-        with self.assertRaises(P.ProfilError):
+        with self.assertRaises(P.ProfileError):
             self.ed.dry_run(self.ed.load("release", "demo")["doc"], [{"card": "no-such-card"}])
 
 

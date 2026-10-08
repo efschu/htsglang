@@ -1,7 +1,7 @@
 """#1369 -- USER ORDER 2026-09-14 ("DIE 48GB MUESSEN WEG. UND ZWAR PRONTO"), and
 on the counter-argument that the ring is a fallback: "auf der festplatte liegt
 ein snapshot. das ist auch ein rueckfall. aber wenn es korrekt implementiert
-ist braucht es NIEMALS einen rueckfall....!"
+ist requires es NIEMALS einen rueckfall....!"
 
 DESK12 / Paket C of a four-package coordinated fix: bind the WEIGHTS region's
 ``enable_cpu_backup`` to ``weight_exchange.weights_cpu_backup_armed()``
@@ -307,7 +307,7 @@ class TestWeightsCpuBackupArmedPredicate(unittest.TestCase):
     def test_only_exchange_with_authoritative_inject_drops_the_ring(self):
         """The ONE combination the user's order actually names: the exchange
         truly owns the bytes at the wake seam (nothing compares against the
-        ring any more), which is the "korrekt implementiert, braucht NIEMALS
+        ring any more), which is the "korrekt implementiert, requires NIEMALS
         einen Rueckfall" case."""
         from flliper.srt.pdflip import weight_exchange as wx
 

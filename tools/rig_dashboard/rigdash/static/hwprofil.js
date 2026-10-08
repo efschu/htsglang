@@ -5,20 +5,20 @@
 
      <div id="hwprofil-root"></div>
      <script src="hwprofil.js"></script>
-     <script>HwProfil.mount(document.getElementById("hwprofil-root"));</script>
+     <script>HwProfile.mount(document.getElementById("hwprofil-root"));</script>
 
-   HwProfil.render(antwort, {now}) liefert dasselbe als HTML-Text (ohne DOM, ohne Netz) für Tests und Einbettung.
+   HwProfile.render(antwort, {now}) liefert dasselbe als HTML-Text (ohne DOM, ohne Netz) für Tests und Einbettung.
    Gespeichert (AP-A): der Dienst legt das Profil beim ersten Start ab (antwort.persist); die Seite zeigt den Zustand, "Neu erfassen"
    ersetzt die Datei (auch in der Release-Ausgabe: kein GPU-Fenster), "Issue-Text" holt den Markdown-Block zum Kopieren.
-   Jeder Wert trägt seine Quelle als Marke: gemessen / NVML / Datenblatt / geschätzt; ein Wert ohne Messung steht als
+   Jeder Wert trägt seine Quelle als Marke: gemessen / NVML / Datasheet / geschätzt; ein Wert ohne Messung steht als
    "nicht gemessen" mit dem Grund im Hover, nie als Zahl.  Nur im Rig-Dashboard (Edition rig, nur LAN). */
 (function (root) {
   "use strict";
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   // source tags of the values (API: flliper.hardware/1); the English tags and the German ones are both accepted
   const BADGE = { "measured": ["hwp-m", "meas."], "NVML": ["hwp-n", "NVML"], "datasheet": ["hwp-d", "datash."], "estimated": ["hwp-e", "est."], "not measured": ["hwp-x", ""],
-    "gemessen": ["hwp-m", "meas."], "Datenblatt": ["hwp-d", "datash."], "geschätzt": ["hwp-e", "est."], "nicht gemessen": ["hwp-x", ""] };
-  const SRC_EN = { "gemessen": "measured", "Datenblatt": "datasheet", "geschätzt": "estimated", "nicht gemessen": "not measured" };
+    "gemessen": ["hwp-m", "meas."], "Datasheet": ["hwp-d", "datash."], "geschätzt": ["hwp-e", "est."], "nicht gemessen": ["hwp-x", ""] };
+  const SRC_EN = { "gemessen": "measured", "Datasheet": "datasheet", "geschätzt": "estimated", "nicht gemessen": "not measured" };
   const CSS = ".hwp{font:13px/1.45 system-ui,sans-serif;max-width:100%;overflow-x:auto}.hwp table{border-collapse:collapse;margin:.4em 0 1em}"
     + ".hwp th,.hwp td{border:1px solid var(--hwp-line,#8884);padding:2px 8px;text-align:right;white-space:nowrap}"
     + ".hwp th:first-child,.hwp td:first-child{text-align:left}.hwp h4{margin:1em 0 .2em}"
@@ -128,20 +128,20 @@
     return h;
   }
 
-  /* Katalogkarte einer NVML-Karte mit der Herkunft ihrer Datenblattwerte (measured_on_rig / Datenblatt / borrowed-unbelegt). */
+  /* Katalogkarte einer NVML-Karte mit der Herkunft ihrer Datenblattwerte (measured_on_rig / Datasheet / borrowed-unverified). */
   function catalogCell(k) {
     if (!k) return '<span class="hwp-x" title="no catalog entry with this NVML name and this size">no entry</span>';
     const of = k.origin_fields || {};
     const tip = "Source: " + (k.origin_label || k.origin || "") + (of.mem_bw && of.mem_bw !== k.origin ? " · nominal bandwidth: " + of.mem_bw : "");
     return esc(k.label || k.id) + '<span class="hwp-chip" title="' + esc(tip) + '">' + esc(SRC_EN[k.origin] || k.origin || "?") + "</span>"
-      + (of.mem_bw === "borrowed-unbelegt" ? '<span class="hwp-chip hwp-warn" title="Nominal bandwidth borrowed from another variant, unverified">bandwidth borrowed</span>' : "");
+      + (of.mem_bw === "borrowed-unverified" ? '<span class="hwp-chip hwp-warn" title="Nominal bandwidth borrowed from another variant, unverified">bandwidth borrowed</span>' : "");
   }
 
   /* Zustand der gespeicherten Datei (antwort.persist).  Kein Pfad: der Ort ist Sache des Betreibers. */
   function persistLine(r, o) {
     const p = r && r.persist;
     if (!p || !p.enabled) return '<p class="hwp-msg hwp-x">The profile is not stored in this edition (no storage location configured).</p>';
-    const bad = p.state === "abweichend" || p.state === "nicht_schreibbar" || p.state === "keine_karten";
+    const bad = p.state === "abweichend" || p.state === "nicht_schreibbar" || p.state === "no_cards";
     let h = '<p class="hwp-msg' + (bad ? " hwp-warn" : "") + '">Stored profile: <b>' + esc(p.label || p.state) + "</b>"
       + (p.captured_at != null ? " · captured " + esc(age(p.captured_at, o && o.now)) : "") + (p.reason ? " (" + esc(p.reason) + ")" : "")
       + (p.id ? ' · <span title="' + esc(p.id) + '">ID ' + esc(String(p.id).slice(7, 19)) + "</span>" : "") + "</p>";
@@ -308,6 +308,6 @@
   }
 
   const api = { render, mount, cell, age };
-  root.HwProfil = api;
+  root.HwProfile = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof window !== "undefined" ? window : globalThis);

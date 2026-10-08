@@ -51,7 +51,7 @@ class DPStartIsDsLastToken(unittest.TestCase):
         self.assertAlmostEqual(x["total_ms"], (37.776 - 26.417) * 1000, delta=1)   # 11,36 s, not 5,31 s
         self.assertIn("D log last decode round", x["start_src"])
         self.assertAlmostEqual(x["start_front"], T + 32.463, places=3)              # named, no endpoint
-        self.assertAlmostEqual(x["vorlauf_ms"], (33.891 - 26.417) * 1000, delta=1)
+        self.assertAlmostEqual(x["warmup_ms"], (33.891 - 26.417) * 1000, delta=1)
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)
 
     def test_round_after_flip_begin_still_counts_until_d_sleeps(self):
@@ -59,7 +59,7 @@ class DPStartIsDsLastToken(unittest.TestCase):
         x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 120.0, None,
                                d_rounds=D_ROUNDS + [(T + 33.89, T + 33.911)], arrivals=ARR)[0]
         self.assertAlmostEqual(x["start"], T + 33.911, places=3)
-        self.assertEqual(x["vorlauf_ms"], 0.0)
+        self.assertEqual(x["warmup_ms"], 0.0)
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)
 
     def test_no_d_log_is_missing_never_the_front_stamp(self):
@@ -88,7 +88,7 @@ class PDEndpointsAreTheGroupsOwn(unittest.TestCase):
         self.assertEqual(x["kind"], "ok")
         self.assertAlmostEqual(x["start"], T + 19.949, places=3)
         self.assertAlmostEqual(x["p_end_front"], T + 20.0, places=3)
-        self.assertAlmostEqual(x["vorlauf_ms"], 53, delta=1)                    # chunk end -> flip_begin
+        self.assertAlmostEqual(x["warmup_ms"], 53, delta=1)                    # chunk end -> flip_begin
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)
 
     def test_pd_start_reads_the_last_stages_own_chunk_stamp_not_the_sample_clock(self):

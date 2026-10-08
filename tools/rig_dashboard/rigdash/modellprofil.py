@@ -147,10 +147,10 @@ class ModelEstimator:
 
     # ------------------------------------------------------------------ Zustand (AP-B 06.10.2026)
     def status(self, req: dict) -> dict:
-        """Der Zustand eines Modellpfads als Daten (``model_profile.probe``): ``not_mounted`` | ``empty`` | ``no_model_files`` |
+        """Der Zustand eines Modellpfads als Data (``model_profile.probe``): ``not_mounted`` | ``empty`` | ``no_model_files`` |
         ``no_config`` | ``config_only`` | ``index_only`` | ``complete`` | ``gguf_incomplete`` | ``ambiguous`` | ``unreadable`` mit ``estimable``
         und Grund.  Nur Dateinamen werden gelesen.  Der Pfad muss unter einer Modellwurzel liegen, darf aber FEHLEN -- das ist der
-        Fall "nicht gemountet", den der Planer als ``unbelegt`` liest, nicht als Fehler."""
+        Fall "nicht gemountet", den der Planer als ``unverified`` liest, nicht als Fehler."""
         if not isinstance(req, dict):
             raise ValueError("Request must be a JSON object: {path, gguf_file?}")
         path = self.check_path(req.get("path"), "path", must_exist=False)

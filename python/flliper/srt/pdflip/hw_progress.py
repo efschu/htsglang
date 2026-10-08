@@ -9,7 +9,7 @@ Per cell:
 
 * ``passt``  -- the :mod:`hw_fit` verdict computed from the model PROFILE
   (layers, KV heads x head dim, quant bytes, MoE/dense, draft) + the profile's
-  records + the launch argv: ``ja`` / ``knapp`` (only the mamba slots push it
+  records + the launch argv: ``ja`` / ``tight`` (only the mamba slots push it
   over) / ``nein``. ``Profil fehlt`` when the model has no fit profile.
 * ``erste Sperre`` -- the first refusal of the launcher's own pre-spawn
   hardware path (:func:`hw_sim.simulate`: arch gate, topology/count,
@@ -96,7 +96,7 @@ def _card_flags(keys: Sequence[str], selection: Optional[Sequence[int]]) -> List
     for k in dict.fromkeys(live):
         c = HS.CATALOG[k]
         if c.borrowed:
-            out.append(f"{k}: HW-BORROWED/unbelegt")
+            out.append(f"{k}: HW-BORROWED/unverified")
         if "sm89" in c.evidence:
             out.append(f"{k}: sm89 am Metall nie gemessen")
     return out
@@ -115,10 +115,10 @@ def rows_for(models: Sequence[str] = PROGRESS_MODELS, configs: Sequence[Config] 
             borrowed = _card_flags(keys, sel)
             unmodelled: List[str] = []
             if fit is not None:
-                borrowed += [m.replace("HW-BORROWED/unbelegt: ", "") for m in fit["marks"]
+                borrowed += [m.replace("HW-BORROWED/unverified: ", "") for m in fit["marks"]
                              if "BORROWED" in m and "layer geometry" not in m]
                 unmodelled = [m for m in fit["marks"] if "no record" in m or "NOT modelled" in m or "unreadable" in m
-                              or "UNBELEGT" in m]
+                              or "UNVERIFIED" in m]
             out.append(Row(
                 model=mk, config=label, n=c.n_cards, reference=ref,
                 fit="Profil fehlt" if fit is None else str(fit["level"]),
@@ -153,7 +153,7 @@ def profile_line(model_key: str, table: Optional[Mapping[str, object]] = None) -
     kv = p.kv_bytes_per_token_per_attn_layer[HF.KV_DTYPE_DEFAULT]
     return (f"{title}: {p.n_layers} Layer ({p.attn_layers} Attention, KV {kv:.0f} B/Token/Layer fp8), {moe}, "
             f"Draft {p.draft_mib:.0f} MiB, Platte-only {p.disk_mib:.0f} MiB, Format {m.weight_format}"
-            + (f" [HW-BORROWED/unbelegt: Geometrie des {p.weight_format}-Profils, Bytes auf ckpt {m.ckpt_mib} MiB skaliert]"
+            + (f" [HW-BORROWED/unverified: Geometrie des {p.weight_format}-Profils, Bytes auf ckpt {m.ckpt_mib} MiB skaliert]"
                if scaled else f" [Profil aus {p.derived_from.split(' ')[0]}]")
             + (", Dual" if "--dual-share" in m.argv else ", Flip"))
 
@@ -166,7 +166,7 @@ def render(rows: Sequence[Row], table: Optional[Mapping[str, object]] = None) ->
         unmod = list(dict.fromkeys(m for r in sub for m in r.unmodelled))
         if unmod:
             out.append("Nicht modelliert / ohne Posten: " + "; ".join(unmod))
-        out.append("| Konfiguration | N | passt rechnerisch | erste Sperre | weitere Sperren | HW-BORROWED / unbelegt |")
+        out.append("| Konfiguration | N | passt rechnerisch | erste Sperre | weitere Sperren | HW-BORROWED / unverified |")
         out.append("|---|---|---|---|---|---|")
         for r in sub:
             rest = [b for b in r.blockers if b != r.first_block]
@@ -182,14 +182,14 @@ def render(rows: Sequence[Row], table: Optional[Mapping[str, object]] = None) ->
 
 def model_summary(sub: Sequence[Row]) -> str:
     n = len(sub)
-    fits = sum(1 for r in sub if r.fit in ("ja", "knapp"))
+    fits = sum(1 for r in sub if r.fit in ("ja", "tight"))
     free = sum(1 for r in sub if r.result == "läuft")
     return f"FORTSCHRITT {sub[0].model}: passt rechnerisch {fits}/{n}, ohne Sperre (laeuft) {free}/{n}"
 
 
 def total_summary(rows: Sequence[Row]) -> str:
     n = len(rows)
-    fits = sum(1 for r in rows if r.fit in ("ja", "knapp"))
+    fits = sum(1 for r in rows if r.fit in ("ja", "tight"))
     free = sum(1 for r in rows if r.result == "läuft")
     return f"HW-PROGRESS cells={n} passt={fits} laeuft={free} refused={n - free}"
 

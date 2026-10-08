@@ -2,7 +2,7 @@
 
 Merge note (part 4): Part 1 (static JS/HTML) and Part 2 (Python texts) each created this file. Both term lists are kept
 below unchanged, Part 2 table first as "Python-text terms", then the Part 1 sections. Where both define the same German
-term the English wording agrees except: `unbelegt` (Part 2: unverified / Part 1: unverified), `Vorschlag` (proposal in both),
+term the English wording agrees except: `unverified` (Part 2: unverified / Part 1: unverified), `Vorschlag` (proposal in both),
 `Verdikt` (verdict in both; Part 1 lists "judgement / verdict" for Urteil). The catalog glossary lives separately in
 `python/flliper/srt/pdflip/GLOSSARY_EN.md`.
 
@@ -10,7 +10,7 @@ term the English wording agrees except: `unbelegt` (Part 2: unverified / Part 1:
 
 One English term per German term, used by the UI (static/*.js, index.html), the Python texts (rigdash/*.py,
 pdflip/propose*.py, planner/profile_couplings.py) and the catalog texts. Machine-readable names (JSON keys, flags,
-env names, refusal codes, enum values such as `zustand`/`force_state`) are NOT translated.
+env names, refusal codes, enum values such as `state`/`force_state`) are NOT translated.
 
 | German | English |
 |---|---|
@@ -78,9 +78,9 @@ env names, refusal codes, enum values such as `zustand`/`force_state`) are NOT t
 Single word list for the English UI. Part 1 (static JS/HTML) created it; Part 2 (Python texts, `pdflip/propose*.py`,
 `profile_couplings.py`) and Part 3 (catalog files) append to it and use the same terms. Style: terse developer English.
 
-Not translated (API contract `flliper.*/1`, logic keys, CSS): JSON keys and field names (`werte`, `herkunft`, `verdikt`,
-`zustand`, `formen`, `ausgang`, ...), enum values that the JS compares (`geht`, `geht_mit_force`, `verweigert`,
-`unbelegt`, `vorgeschlagen`, `einfach`, `experte`, `GESTOPPT`, `TOT`, `HAENGT`, ...), env/flag names, CSS classes, element IDs,
+Not translated (API contract `flliper.*/1`, logic keys, CSS): JSON keys and field names (`values`, `source`, `verdict`,
+`state`, `forms`, `outcome`, ...), enum values that the JS compares (`geht`, `ok_with_force`, `verweigert`,
+`unverified`, `vorgeschlagen`, `einfach`, `expert`, `GESTOPPT`, `TOT`, `HAENGT`, ...), env/flag names, CSS classes, element IDs,
 file names. The JS shows an English display label for such a value and keeps the German value as the key.
 
 ## General terms
