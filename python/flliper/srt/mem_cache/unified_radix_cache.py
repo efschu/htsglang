@@ -5294,6 +5294,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         cands = [a for a in cands if a.node is not node]
         victim = _mad.pick_park_victim(cands, chain_ids=self._pdflip_park_chain(),
                                        claimer_is_end=bool(node.pdflip_park_end))
+        if victim is None or not victim.slots:
+            victim = self._pdflip_last_resort_victim(node, mp)
         depth = _mad.ancestor_path(target=node, root=self.root_node)[1]
         if victim is None or not victim.slots:
             logger.warning("PDFLIP PARK-END-ANCHOR-FIRST SPILL node=%s depth=%s end=%s victim=none (no releasable "
@@ -5348,6 +5350,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tree = [a for a in tree if a.node is not node]
         victim = _mad.pick_foreign_victim(tree, rid="")
         if victim is None or not victim.slots:
+            victim = self._pdflip_last_resort_victim(node, mp)
+        if victim is None or not victim.slots:
             logger.warning("PDFLIP MAMBA-ARENA FLUSH-SPILL node=%s depth=%s victim=none (no releasable "
                            "intermediate anchor in the tree -- the node stays un-backed, named)",
                            getattr(node, "id", "?"), _mad.ancestor_path(target=node, root=self.root_node)[1])
@@ -5373,17 +5377,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     int(sec.get("written", 0) or 0))
         return True
 
-    def _pdflip_anchor_of(self, n, mp):
+    def _pdflip_anchor_of(self, n, mp, allow_end=False):
         """(held, slots): an arena anchor sits on `n`; its slots when this rank
-        may release it (settled write, no host lock, not the end anchor)."""
+        may release it (settled write, no host lock, not the end anchor --
+        ``allow_end``: the end anchor too, MAMBA-LAST-RESORT)."""
         cd = n.component_data[ComponentType.MAMBA]
         hv = cd.host_value
         if hv is None or hv.numel() == 0 or not mp.is_arena_id(int(hv.min())):
             return False, None
-        if (n._pdflip_end_anchor or n.write_through_pending_id is not None
+        if ((n._pdflip_end_anchor and not allow_end) or n.write_through_pending_id is not None
                 or cd.host_lock_ref > 0 or n.id in self._pdflip_direct_mamba_rows):
             return True, None
         return True, mp.settled_anchor_slots(hv)
+
+    def _pdflip_last_resort_victim(self, node, mp):
+        """MAMBA-LAST-RESORT (``FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT``, default
+        off): the anchor a full arena's claim may spill when the H19 /
+        PARK-END-ANCHOR-FIRST rules found none (NF int22, D TP0 boot
+        1008_171755 17:51:57: 26 usable slots, all END or deepest anchors,
+        ``FLUSH-SPILL victim=none`` x4, ``ARENA-DROP slot_bytes=58834944
+        freed=0`` x59, ``PDFLIP-ANCHOR-LOST at=flush n=15`` incl. the END anchor
+        of the parked pdflip-24-128 -- D recomputed what the L3 could have
+        served). The shallowest settled anchor (END too) off the claimer's
+        park chain; the caller secures its L3 copy before it releases it, so
+        no anchor is lost -- the next reader takes it from the store. None
+        with the switch off: the old answer, byte for byte."""
+        if not envs.FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT.get():
+            return None
+        cands = _mad.tree_anchors(
+            root=self.root_node,
+            anchor_of=lambda n: self._pdflip_anchor_of(n, mp, allow_end=True),
+            include_untagged=True)
+        cands = [a for a in cands if a.node is not node]
+        return _mad.pick_last_resort_victim(cands, chain_ids=self._pdflip_park_chain())
 
     def _pdflip_full_victim(self, node, rid, owned, mp):
         """FULL: the request's own shallowest anchor; a request with none to
