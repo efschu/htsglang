@@ -588,7 +588,10 @@ def load_measured_library(path: Optional[str] = None):
     ``CardLibrary()``: that is precisely the substitution that made the gate
     refuse every card on every rig while looking like it had a catalog.
     """
-    target = card_library_path(path)
+    from sglang.srt.compat_shims import read_fallback
+
+    # rename transition: a library measured under the other name is read (the writer keeps the primary path)
+    target = read_fallback(card_library_path(path))
     if not os.path.isfile(target):
         return None
     from sglang.srt.planner.card_library import CardLibrary

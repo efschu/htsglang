@@ -14,7 +14,11 @@ Six things keep working across the ONE mechanical rename commit, in both directi
 * /dev/shm residue of boots under the other name: the launcher's sweep also lists the other
   spelling of its own name families (:func:`name_counterparts`).
 * launcher flags: ``--<old token>-x`` and ``--<new token>-x`` both reach the running parser
-  (:func:`canonical_flags`), so profiles and arms need not switch in the same step.
+  (:func:`canonical_flags` on an argv, :func:`register_flag_aliases` as real argparse aliases with
+  the same ``dest`` -- ``--help`` lists both), so profiles and arms need not switch in the same step.
+* rig state READ across the rename (F0-C): a state file missing under ``~/.cache/<running>`` is read
+  from ``~/.cache/<other>`` (:func:`read_fallback`, :func:`cache_dirs`: ``card_library.json``, its
+  ``.by-uuid.json`` side file, ``hw_profile-*.json``). WRITES keep the running name's path.
 * processes of the other generation: the launcher's live-server census accepts both module
   names in argv (:func:`name_variants`) and both spellings of the boot token in another
   process's environment (:func:`env_name_variants`).
@@ -150,6 +154,45 @@ def cache_file(*parts: str, home: Optional[str] = None, name: Optional[str] = No
     return legacy if os.path.exists(legacy) else primary
 
 
+def _other_equivalent(path: str, home: Optional[str] = None, name: Optional[str] = None) -> Optional[str]:
+    """The path under ``~/.cache/<other>`` that corresponds to ``path`` under ``~/.cache/<running>``;
+    ``None`` for any path that is not inside the running cache root (a tmp dir, an explicit
+    override): such a path is the caller's own and is never redirected."""
+    root = os.path.abspath(_cache_root(running_package(name), home))
+    p = os.path.abspath(path)
+    if p != root and not p.startswith(root + os.sep):
+        return None
+    return os.path.join(_cache_root(other_package(name), home), os.path.relpath(p, root)) if p != root \
+        else _cache_root(other_package(name), home)
+
+
+def read_fallback(path: str, home: Optional[str] = None, name: Optional[str] = None) -> str:
+    """``path`` itself when it exists (or is not under the rig cache root); else the same file under the
+    other name's cache directory when THAT exists. For READERS of ``card_library.json``,
+    ``card_library.json.by-uuid.json``, ``hw_profile-*.json``: a rig that calibrated under one name is
+    read by a tree of the other. Writers never call this -- they keep the running name's path."""
+    if os.path.exists(path):
+        return path
+    alt = _other_equivalent(path, home, name)
+    return alt if alt is not None and os.path.exists(alt) else path
+
+
+def cache_dirs(directory: str, home: Optional[str] = None, name: Optional[str] = None) -> Tuple[str, ...]:
+    """``directory`` first, then the equivalent directory of the other name when it exists and is another
+    directory (a symlink made by :func:`link_legacy_cache_dir` is the same directory, listed once). For
+    readers that SCAN a cache directory (``hw_profile-*.json``): list every entry of every returned dir,
+    the first one wins on a name present in both."""
+    alt = _other_equivalent(directory, home, name)
+    if alt is None or not os.path.isdir(alt):
+        return (directory,)
+    try:
+        if os.path.isdir(directory) and os.path.samefile(alt, directory):
+            return (directory,)
+    except OSError:
+        pass
+    return (directory, alt)
+
+
 # ---------------------------------------------------------------------------
 # launcher flags --<flip token>-x
 # ---------------------------------------------------------------------------
@@ -175,6 +218,33 @@ def canonical_flags(argv: Iterable[str], name: Optional[str] = None) -> List[str
         logger.warning("compat: %d launcher flag(s) in the other spelling mapped %s* -> %s*: %s",
                        len(seen), src, dst, " ".join(sorted(set(seen))))
     return out
+
+
+def register_flag_aliases(parser) -> int:
+    """Give every ``--<running token>-x`` option of ``parser`` the other spelling ``--<other token>-x`` as an
+    alias of the SAME action (same ``dest``, default, choices, help; ``--help`` prints both). Registration
+    only, no logic: the launcher parser and ``ServerArgs`` call it once after their last ``add_argument``.
+    An alias that already exists is left alone. Returns the number of aliases added. :func:`canonical_flags`
+    does the same on an argv before parsing; this makes the parser itself accept both (``build_parser()``
+    callers that never see ``main``: the profile oracle, the help renderer, tests)."""
+    old, new = FLAG_TOKENS
+    run, other = (old, new) if running_package() == _PKG_OLD else (new, old)
+    src, dst = "--%s-" % run, "--%s-" % other
+    registry = getattr(parser, "_option_string_actions", None)
+    if registry is None:    # not an argparse parser or group: nothing to register on
+        return 0
+    n = 0
+    for action in list(getattr(parser, "_actions", ())):
+        for opt in list(action.option_strings):
+            if not opt.startswith(src):
+                continue
+            alias = dst + opt[len(src):]
+            if alias in registry:
+                continue
+            action.option_strings.append(alias)
+            registry[alias] = action
+            n += 1
+    return n
 
 
 # ---------------------------------------------------------------------------

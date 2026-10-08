@@ -48,19 +48,31 @@ NONRANK_ROLES = (
 )
 
 
+def _variants(name: str) -> Tuple[str, ...]:
+    """``name`` and its other-generation spelling (package / subsystem token), this tree's first."""
+    from sglang.srt.compat_shims import name_variants
+
+    return name_variants(name)
+
+
+def _in(cmd: str, name: str) -> bool:
+    return any(v in cmd for v in _variants(name))
+
+
 def classify_process(comm: str, cmd: str) -> str:
     """The role of one process from its ``comm`` and command line."""
     comm = str(comm or "")
     cmd = str(cmd or "")
-    if comm.startswith("sglang::schedul") or "sglang::scheduler" in cmd:
+    # rename transition (compat_shims): the census counts the processes of either package generation
+    if comm.startswith(_variants("sglang::schedul")) or _in(cmd, "sglang::scheduler"):
         return RANK_ROLE
-    if comm.startswith("sglang::detoken") or "sglang::detokenizer" in cmd:
+    if comm.startswith(_variants("sglang::detoken")) or _in(cmd, "sglang::detokenizer"):
         return "detokenizer"
-    if "sglang.srt.weg2.front" in cmd:
+    if _in(cmd, "sglang.srt.weg2.front"):
         return "front"
-    if "sglang.srt.weg2.launcher" in cmd:
+    if _in(cmd, "sglang.srt.weg2.launcher"):
         return "launcher"
-    if "sglang.launch_server" in cmd:
+    if _in(cmd, "sglang.launch_server"):
         return "server_main"
     if "compile_worker" in cmd:
         return "inductor_compile_worker"

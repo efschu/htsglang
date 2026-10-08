@@ -91,13 +91,14 @@ def test_every_spelling_folds_onto_one_name(mod_pkg):
 
 
 @pytest.mark.parametrize("mod_pkg", ["sg" "lang", "flliper"])
-def test_canonical_value_wins_and_no_name_is_doubled(mod_pkg):
+def test_renamed_value_wins_and_no_name_is_doubled(mod_pkg):
     m = _load_as(mod_pkg)
     s, g = m.ENV_PREFIX_PAIRS[0], m.ENV_PREFIX_PAIRS[-1]
     c = m.CANONICAL_SIDE
     env = {s[0] + "FORM": "legacy", s[1] + "FORM": "renamed", g[0] + "X": "l", g[1] + "X": "r"}
     m.canonical_env(env)
-    assert env == {s[c] + "FORM": ("legacy", "renamed")[c], g[c] + "X": ("l", "r")[c]}
+    # F0-C: the RENAMED spelling wins on either side of the rename (RENAME_PLAN 4.1), not the one the tree reads
+    assert env == {s[c] + "FORM": "renamed", g[c] + "X": "r"}
     fams = {}
     for k in env:
         fams.setdefault(m.canonical_env_name(k), []).append(k)

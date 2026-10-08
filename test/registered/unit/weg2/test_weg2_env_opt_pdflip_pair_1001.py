@@ -61,13 +61,14 @@ def test_renamed_spelling_reaches_the_legacy_tree(name):
 
 
 @pytest.mark.parametrize("mod_pkg", ["sg" "lang", "fl" "liper"])
-def test_canonical_value_wins_when_both_spellings_are_set(mod_pkg):
+def test_renamed_value_wins_when_both_spellings_are_set(mod_pkg):
     m = _load_as(mod_pkg)
     c = m.CANONICAL_SIDE
     for name in NAMES:
         env = {LEG_OPT + name: "legacy", NEW_OPT + name: "renamed"}
         m.canonical_env(env)
-        assert env == {(LEG_OPT, NEW_OPT)[c] + name: ("legacy", "renamed")[c]}
+        # F0-C: the renamed spelling wins on either side of the rename; the name left is the one the tree reads
+        assert env == {(LEG_OPT, NEW_OPT)[c] + name: "renamed"}
 
 
 def test_other_process_reader_accepts_both_spellings():

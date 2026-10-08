@@ -130,9 +130,15 @@ def test_name_compat_survives_rename():
     tool = _rename_tool()
     if tool is None:
         pytest.skip("rename tool not on this box")
-    src = open(nc.__file__).read()
-    out, rep, _skip = tool.rewrite_all(src, True, True, {})
-    assert out == src, rep
+    from sglang import _compat_boot
+    from sglang.srt import compat_shims
+
+    # F0-C: the whole compatibility layer, not only the log-marker helper: the env mirror and its announcement
+    # (name_compat.canonical_env, _compat_boot), the flag aliases / cache fallback / census shims (compat_shims)
+    for path in (nc.__file__, compat_shims.__file__, _compat_boot.__file__):
+        src = open(path).read()
+        out, rep, _skip = tool.rewrite_all(src, True, True, {})
+        assert out == src, (path, rep)
 
 
 # --------------------------------------------------------------------------

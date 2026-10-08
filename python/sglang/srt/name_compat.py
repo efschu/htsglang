@@ -203,21 +203,32 @@ def canonical_env_name(name: str) -> str:
     return fam[2] if fam else name
 
 
-def canonical_env(env: MutableMapping, *, foreign_keep=FOREIGN_READERS) -> MutableMapping:
+def canonical_env(env: MutableMapping, *, foreign_keep=FOREIGN_READERS,
+                  report: Optional[Dict[str, List]] = None) -> MutableMapping:
     """Fold every legacy/renamed env spelling onto the one this tree reads.
 
-    In place; returns ``env``. When several spellings of one name are
-    present, the canonical spelling's value wins (it is what the tree has
-    always read, and after the rename it is the explicit new name); when the
-    canonical spelling is absent, the other one's value moves onto it. Then
-    every non-canonical spelling is REMOVED, so a later ``env.pop(canonical)``
-    removes the variable -- no other spelling survives to be mirrored back by a
-    child's own import. The exception is ``foreign_keep`` (legacy spellings
-    read by code outside the rename): for those the legacy spelling is always
-    set, and both spellings, where present, carry the resolved value.
+    In place; returns ``env``. When both spellings of one name are present
+    the RENAMED spelling's value wins, on either side of the rename (a profile
+    that moved to the new name must not be overridden by a stale old one;
+    RENAME_PLAN 4.1); when only one is present its value moves onto the
+    canonical spelling. Then every non-canonical spelling is REMOVED, so a
+    later ``env.pop(canonical)`` removes the variable -- no other spelling
+    survives to be mirrored back by a child's own import. The exception is
+    ``foreign_keep`` (legacy spellings read by code outside the rename): for
+    those the legacy spelling is always set, and both spellings, where
+    present, carry the resolved value.
 
     An env that holds only canonical spellings of non-foreign names comes back
     unchanged, key order included.
+
+    ``report`` (optional, filled in place) names what a caller may announce:
+    ``report["conflicts"]`` = ``[(legacy, renamed), ...]`` both set with
+    different values (the renamed one won); ``report["legacy"]`` = the legacy
+    spellings that were read through the mirror although this tree reads the
+    renamed ones (empty before the rename: there the legacy names ARE the
+    canonical ones). A foreign reader's legacy spelling that sits beside an
+    equal renamed one is this function's own output of a parent process, not a
+    use, and is not listed.
     """
     groups: Dict[Tuple[str, str, str], List[str]] = {}
     for k in list(env.keys()):
@@ -226,14 +237,15 @@ def canonical_env(env: MutableMapping, *, foreign_keep=FOREIGN_READERS) -> Mutab
             groups.setdefault(fam, []).append(k)
     for (leg, new, canon), present in groups.items():
         foreign = leg in foreign_keep
+        if report is not None:
+            if leg in env and new in env and env[leg] != env[new]:
+                report.setdefault("conflicts", []).append((leg, new))
+            if leg in env and canon != leg and not (foreign and new in env and env[leg] == env[new]):
+                report.setdefault("legacy", []).append(leg)
         if present == [canon] and (not foreign or leg == canon):
             continue
-        if canon in env:
-            value = env[canon]
-        else:
-            other = new if canon == leg else leg
-            value = env[other] if other in env else env[present[0]]
-            env[canon] = value
+        value = env[new] if new in env else env[leg]
+        env[canon] = value
         for k in present:
             if k != canon and not (foreign and k in (leg, new)):
                 del env[k]
