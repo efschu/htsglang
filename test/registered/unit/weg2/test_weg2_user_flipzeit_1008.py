@@ -53,11 +53,12 @@ def test_epoch5_the_user_flip_time_starts_at_ds_last_token_not_at_the_park_rpc()
     """Red on 49873f9af8: no ``user_flipzeit_ms`` (and no ``note_d_token``):
     the only "user" field said 30974 ms from the park RPC's send while D was
     still producing tokens for 28.6 s."""
-    ev = _epoch5_clock().first_prefill("weg2-2-39", FLIP_BEGIN, {"ts": PP0, "pid": 775, "ct": 32, "pp_rank": 0})
+    ev = _epoch5_clock().first_prefill("weg2-2-39", FLIP_BEGIN, {"ts": PP0, "pid": 775, "ct": 32, "pp_rank": 0},
+                                       rid_arrival_ts=WAITER)
     assert ev["user_flipzeit_ms"] == round((PP0 - LAST_D) * 1000.0) == 2382
-    assert ev["user_flipzeit_start_source"] == "last_d_token"
+    assert ev["user_flipzeit_start_source"] == "d_leg2_served"
     assert (ev["last_d_token_ts"], ev["last_d_token_source"]) == (round(LAST_D, 3), "d_leg2_served")
-    assert (ev["waiter_arrival_ts"], ev["waiter_arrival_source"]) == (round(WAITER, 3), "oldest_queued_at_flip_begin")
+    assert (ev["waiter_arrival_ts"], ev["waiter_arrival_source"]) == (round(WAITER, 3), "first_leg1_rid_arrival")
     assert ev["first_p_chunk_ts"] == round(PP0, 3) and ev["user_flipzeit_missing"] is None
     # the instrument keeps its value, labelled; the old fields stay (dashboard)
     assert ev["flip_total_ms"] == ev["parts"]["legs_ms"] == round((DONE - FLIP_BEGIN) * 1000.0)
@@ -71,7 +72,7 @@ def test_a_waiter_that_arrives_after_ds_last_token_starts_the_span():
     c.note_d_token(50.0)
     c.begin(3, 60.0, oldest_waiter_ts=58.0)
     c.done(62.0)
-    ev = c.first_prefill("r", 62.0, {"ts": 62.5})
+    ev = c.first_prefill("r", 62.0, {"ts": 62.5}, rid_arrival_ts=58.0)
     assert (ev["user_flipzeit_start_source"], ev["user_flipzeit_ms"]) == ("waiter_arrival", 4500)
     # a flip with no waiter at its begin: the first leg 1's own arrival is the waiter
     c.begin(5, 100.0, oldest_waiter_ts=None)
@@ -94,12 +95,12 @@ def test_dp_without_a_proven_waiter_arrival_has_no_start_and_pre_wait_is_only_di
     c.note_d_token(70.0)
     c.begin(5, 80.0, oldest_waiter_ts=75.0)                              # arrived 5 s after the last token
     c.done(82.0)
-    ev = c.first_prefill("r2", 82.0, {"ts": 82.5})
+    ev = c.first_prefill("r2", 82.0, {"ts": 82.5}, rid_arrival_ts=75.0)
     assert (ev["user_flipzeit_ms"], ev["pre_wait_ms"]) == (7500, 5000)
     c.note_d_token(90.0)
     c.begin(7, 100.0, oldest_waiter_ts=85.0)                             # waiter held since before the last token
     c.done(102.0)
-    ev = c.first_prefill("r3", 102.0, {"ts": 102.5})
+    ev = c.first_prefill("r3", 102.0, {"ts": 102.5}, rid_arrival_ts=85.0)
     assert (ev["user_flipzeit_ms"], ev["pre_wait_ms"]) == (12500, 0)
 
 

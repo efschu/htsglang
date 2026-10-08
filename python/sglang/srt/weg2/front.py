@@ -8244,7 +8244,8 @@ class Front:
             from sglang.srt.weg2 import front_state_ipc as _fsi
 
             first = ev.get("first_work_ts")
-            p_done = _fsi.p_last_forward_done(Front._group_beacons(self, "P"), not_after=first)
+            _ps = self.__dict__.get("_p_phase_start")   # this P phase began at the D->P flip's done
+            p_done = _fsi.p_last_forward_done(Front._group_beacons(self, "P"), not_after=first, not_before=_ps)
             reason = self.__dict__.get("_user_flip_reason", {}).get(ev.get("epoch"))
             w = wsrc = None
             if reason == "idle":
@@ -8256,7 +8257,7 @@ class Front:
                     wsrc = "unknown:idle_flip_first_work_without_rid"
             elif reason is not None:
                 wsrc = "d_work_waiting_at_flip_begin:" + str(reason)
-            out = _fsi.FirstWorkClock.pd_user(ev, p_done, w, wsrc)
+            out = _fsi.FirstWorkClock.pd_user(ev, p_done, w, wsrc, p_phase_start=_ps)
             if wsrc is not None and wsrc.startswith("unknown:"):
                 out["user_flipzeit_ms"] = None
                 out["user_flipzeit_missing"] = "idle_flip_waiter_unknown"
@@ -8273,7 +8274,8 @@ class Front:
                 "user_flipzeit_start_source", "user_flipzeit_end_ts", "waiter_arrival_ts",
                 "waiter_arrival_source", "last_d_token_ts", "last_d_token_source", "first_p_chunk_ts",
                 "last_p_chunk_end_ts", "last_p_chunk_end_source", "first_d_token_ts", "flip_total_ms",
-                "flip_total_note", "user_flipzeit_definition")
+                "flip_total_note", "user_flipzeit_definition", "pre_wait_ms", "queue_age_max_ms", "queue_skip_ms",
+                "queue_skip", "idle_ms")
         last = self.__dict__.setdefault("_flip_user_last", {})
         last[d] = {k: ev.get(k) for k in keys if k in ev}
         if d == "D>P":
@@ -8285,8 +8287,10 @@ class Front:
                 ev.get("last_p_chunk_end_ts"), ev.get("last_p_chunk_end_source"), ev.get("waiter_arrival_ts"),
                 ev.get("waiter_arrival_source"), ev.get("first_d_token_ts"))
         logger.info("WEG2-FLIP-USERZEIT dir=%s epoch=%s user_flipzeit_ms=%s missing=%s start=%s %s | "
+                    "diagnosis(not flip time): pre_wait_ms=%s queue_age_max_ms=%s queue_skip_ms=%s idle_ms=%s | "
                     "flip_total_ms=%s (%s)", d, ev.get("epoch"), ev.get("user_flipzeit_ms"),
                     ev.get("user_flipzeit_missing"), ev.get("user_flipzeit_start_source"), sup,
+                    ev.get("pre_wait_ms"), ev.get("queue_age_max_ms"), ev.get("queue_skip_ms"), ev.get("idle_ms"),
                     ev.get("flip_total_ms"), FLIP_TOTAL_NOTE_SHORT)
 
     # ---------------- FLIPZEIT D>P END (user order 02.10.) ----------------
@@ -14709,7 +14713,10 @@ class Front:
         self._ipc_publish("flip_done", _fsi.flip_done_payload(rec, t_flip0))
         self._ipc_first_work_clock().done(time.time())  # FEHLT 3: pairs with one flip_first_work
         self._ipc_dp_clock().done(time.time())
+        if src == "D" and dst == "P":
+            self.__dict__["_p_phase_start"] = time.time()   # USER-FLIPZEIT: a new P phase begins
         if src == "P" and dst == "D":
+            self._ipc_dp_clock().note_d_phase_start(t_flip0, time.time())  # USER-FLIPZEIT: a new D phase begins
             # PDFLIP-E3 (N5f first P->D 13:30:17: non-stream requests, no D chunk the
             # front could time): D's first forward after done from D's beacons
             _dsnap, _dt0 = self.__dict__.pop("_pd_dsnap", None) or (None, 0.0)
