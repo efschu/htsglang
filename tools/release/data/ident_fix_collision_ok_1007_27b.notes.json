@@ -1,0 +1,52 @@
+{
+ "_comment": "Why each class of ident_fix collision is harmless (F0-D, 27B). Pairs are (old German word -> English target); the target already exists in the file.",
+ "python_no_scope_meets": {
+  "files": [
+   "launcher.py grund/reason",
+   "profile_catalog.py baum/tree, datei/file, baeume/trees, kuratiert/curated",
+   "propose.py geborgt/borrowed",
+   "propose_dual.py schnitt/cut",
+   "propose_verdict.py herkunft/source, klasse/class, werte/values, zustand/state",
+   "_bar1_marker_source.py grund/reason",
+   "test_planer_ape_dual_1006.py passung/fit, schnitt/cut",
+   "features_update.py werte/values",
+   "rigdash/profil.py (10 pairs)",
+   "fixtures .../profile_catalog.py datei/file",
+   "rigdash tests (3 files)"
+  ],
+  "why": "hazard check (AST): in no scope both words are bound/used as binding; no call passes both as keywords; no dict literal and no access on the same base carries both as key. Typical: the old word is a dict key / keyword of one record, the target is a local, a parameter, an attribute (`.values()`) or a key of another record. propose.py: the duplicate lies in one startswith() tuple (`(\"geborgt\", \"unbelegt\", \"borrowed\", ...)`): a tuple with the same prefix twice is harmless."
+ },
+ "python_disambiguated_in_source": {
+  "files": [
+   "propose_single.py zustand/state",
+   "propose_verdict.py hinweise/notes"
+  ],
+  "why": "both words DID meet (parameter `state` of _entry next to `zustand`, two `state=` keywords in one call after renaming; local `notes` next to local `hinweise`). Source disambiguated before the run (commit F0-D pre-rename): _entry(state=...) -> verdict_state, local hinweise -> hint_list. Keys of the records (`\"zustand\"` entry key, `\"state\"` inside the nested `verdikt` dict; `fit[\"hinweise\"]`) stay and are renamed by the table."
+ },
+ "shell_and_markdown": {
+  "files": [
+   "test_rigdash_ctx_1995.sh baum/tree",
+   "launch_when_free.sh beleg/evidence",
+   "crossrig_ladder_run.sh klasse/class",
+   "wait_for_cards.sh zustand/state",
+   "rigdash/README.md (6 pairs)"
+  ],
+  "why": "the target word occurs only in comments/prose/paths (`/sys/class/...`, `evidence` in a header comment); no shell variable or function of the target name. Side effect named, not a collision: launch_when_free.sh line 31 `session=agent-332-fam-beleg` (a historic holder session id compared with the holder file) becomes `...fam-evidence` -- the whole-word rule of ident_fix; the script is a one-off of ticket 332."
+ },
+ "catalog_json": {
+  "files": [
+   "rigdash/profil_data/catalog.json"
+  ],
+  "why": "key/value walk: the English target is a value or a key of ANOTHER object than the old word (`anzeige.rel.braucht: \"requires\"` is a display map whose key is renamed to the same word as its value; `datei` is a key of the `beleg` records, `file` of the `source` records; root `trees` vs `entries.*.baeume`). The file is rebuilt in F0-F anyway."
+ },
+ "web_js_html": {
+  "files": [
+   "static/index.html",
+   "modellprofil.js",
+   "profil.js",
+   "profil_balken.js",
+   "profil_planer.js"
+  ],
+  "why": "IDENT_FIX_WEB=1: the dashboard pages read the keys the planner modules write; line reading of every old-word line plus a regex check for the target as declared identifier/key in the same file. Targets (`value`, `source`, `title`, `note`, `state`) occur as DOM properties (`el.value`), other data objects (`f.value` in the IPC table, `c.title`), or prose. No object literal and no function carries both words as properties/variables of the same object."
+ }
+}

@@ -94,6 +94,17 @@ def fix_text(path, src):
     return "".join(out), n
 
 
+# F0-D (08.10.2026): reviewed collisions. IDENT_FIX_COLLISION_OK_FILE = JSON {path: [old word, ...]} exempts exactly those (path, old word)
+# pairs from the collision refusal below: pairs where the English target exists in the file but can never meet the old word in one binding
+# (a parameter vs an attribute `.values`, a key of one dict vs a key of another, a word in a path string). The file is read by a person per
+# pair (scope check: no function binds/uses both, no call passes both keywords, no dict literal and no same-base access carries both keys);
+# a pair where both DO meet is not listed: the source is disambiguated first. Every use is counted in the final line (`collisions_allowed`).
+# `_comment` / keys starting with `_` are metadata. Unset = unchanged behaviour (every collision refuses).
+COLLISION_OK = {}
+if os.environ.get("IDENT_FIX_COLLISION_OK_FILE"):
+    COLLISION_OK = {p: frozenset(ws) for p, ws in json.load(open(os.environ["IDENT_FIX_COLLISION_OK_FILE"])).items() if not p.startswith("_")}
+allowed = []
+
 touched = sorted({f for k in M for f in files_with(k) if in_scope(f)})
 # collisions: a target that already exists in a file we touch
 coll = []
@@ -116,11 +127,14 @@ for f in touched:
         if W[k].search(src) and v in have:
             if REFINED and not ((k in names_r and v in names_r) or (k in exact_r and v in exact_r)):
                 continue
+            if k in COLLISION_OK.get(f, frozenset()):
+                allowed.append((f, k, v))
+                continue
             coll.append((f, k, v))
 if coll:
-    print(json.dumps({"REFUSED_collisions": coll[:40]}, indent=1)); sys.exit(3)
+    print(json.dumps({"REFUSED_collisions": coll}, indent=1)); sys.exit(3)
 
-stats = {"files": 0, "edits": 0, "moves": []}
+stats = {"files": 0, "edits": 0, "moves": [], "collisions_allowed": len(allowed)}
 for f in touched:
     p = os.path.join(ROOT, f)
     try:
