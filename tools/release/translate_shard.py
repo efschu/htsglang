@@ -108,7 +108,10 @@ if TM_FILE:
             if r.get("translation"):
                 tm[r["text"]] = r["translation"]
     except FileNotFoundError:
-        pass
+        # F0-A fix round 1: an explicitly named TM that is missing used to mean "empty memory" and re-translated every unit
+        # (non-deterministic run, 28.09. translations lost). A first run with no memory yet says so with KIT_TM_ALLOW_EMPTY=1.
+        if os.environ.get("KIT_TM_ALLOW_EMPTY") != "1":
+            sys.exit("translate_shard: translation memory %s not found (KIT_TM_ALLOW_EMPTY=1 starts with an empty one)" % TM_FILE)
 done, reasons = {}, collections.Counter()
 todo = []
 for u in units:

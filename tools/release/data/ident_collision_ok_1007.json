@@ -1,0 +1,9 @@
+{
+ "_comment": "F0-A 07.10.2026 (fix round 1): reviewed ident-map collisions of data/merged_0928.json that are NOT real: the old word and its target are names of DIFFERENT functions of the file and never meet in one scope (AST scope check: no function body contains both as a bare name / argument; module level has neither). IDENT_COLLISION_OK_FILE=this file. Only (path, old word) pairs. Real clashes are NOT listed: test_planer_apc_propose_1006.py and test_planer_apd_verdikt_1006.py (`def _propose(model, ...)` next to a local `modell`) need a source rename first (escalated to the planner seat).",
+ "python/sglang/srt/weg2/launcher.py": [
+  "gefunden"
+ ],
+ "python/sglang/srt/weg2/propose_verdict.py": [
+  "modell"
+ ]
+}
