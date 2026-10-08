@@ -51,7 +51,7 @@
    "id": 2,
    "type": "timeseries",
    "title": "TTFT der Nutzer (Punkt je 5-s-Takt)",
-   "description": "Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT), IPC-Zähler state.json front.arrival_seat.ttft_* (NF). Mittel der Anfragen, deren erstes Token im Intervall kam. 27B: fehlt bis zum Image mit pdflip_ttft_seconds (TSDB-Delta 01.10.). Über P / direkt D getrennt: fehlt in IPC (front.arrival_seat.ttft_by_via).",
+   "description": "Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT), IPC-Zähler state.json front.arrival_seat.ttft_* (NF). Mittel der Anfragen, deren erstes Token im Intervall kam. 27B: fehlt bis zum Image mit weg2_ttft_seconds (TSDB-Delta 01.10.). Über P / direkt D getrennt: fehlt in IPC (front.arrival_seat.ttft_by_via).",
    "datasource": {
     "type": "prometheus",
     "uid": "vm"
@@ -102,7 +102,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model) (increase(pdflip_front_ttft_ms_sum{model=~\"$model\"}[5s])) / (sum by (model) (increase(pdflip_front_ttft_count{model=~\"$model\"}[5s])) > 0) / 1000",
+     "expr": "sum by (model) (increase(weg2_front_ttft_ms_sum{model=~\"$model\"}[5s])) / (sum by (model) (increase(weg2_front_ttft_count{model=~\"$model\"}[5s])) > 0) / 1000",
      "legendFormat": "{{model}}"
     }
    ],
@@ -163,7 +163,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model) (pdflip_front_ttft_ms_max{model=~\"$model\"}) / 1000",
+     "expr": "max by (model) (weg2_front_ttft_ms_max{model=~\"$model\"}) / 1000",
      "legendFormat": "max {{model}}"
     }
    ]
@@ -223,7 +223,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model) (rate(pdflip_front_served_total{group=\"D\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "expr": "sum by (model) (rate(weg2_front_served_total{group=\"D\",model=~\"$model\"}[$__rate_interval])) * 60",
      "legendFormat": "{{model}}"
     }
    ]
@@ -283,7 +283,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model, dir) (pdflip_flip_user_view_ms{def=\"t2t\",part=\"total\",model=~\"$model\"}) / 1000",
+     "expr": "max by (model, dir) (weg2_flip_user_view_ms{def=\"t2t\",part=\"total\",model=~\"$model\"}) / 1000",
      "legendFormat": "Flipzeit {{dir}} {{model}}"
     },
     {
@@ -292,7 +292,7 @@
       "uid": "vm"
      },
      "refId": "B",
-     "expr": "max by (model, dir) (pdflip_flip_user_view_ms{def=\"t2t\",part=\"layer\",model=~\"$model\"}) / 1000",
+     "expr": "max by (model, dir) (weg2_flip_user_view_ms{def=\"t2t\",part=\"layer\",model=~\"$model\"}) / 1000",
      "legendFormat": "Teil Layer-Tausch (in Flipzeit enthalten) {{dir}} {{model}}"
     }
    ]
@@ -301,7 +301,7 @@
    "id": 6,
    "type": "timeseries",
    "title": "Upstream-TTFT des D-Beins (nicht Nutzer-TTFT)",
-   "description": "flliper:time_to_first_token_seconds der wachen Gruppe (Front-Durchreiche /metrics): ab Ankunft des Leg 2 bei der Gruppe, ohne Warteschlange und Flip der Front.",
+   "description": "sglang:time_to_first_token_seconds der wachen Gruppe (Front-Durchreiche /metrics): ab Ankunft des Leg 2 bei der Gruppe, ohne Warteschlange und Flip der Front.",
    "datasource": {
     "type": "prometheus",
     "uid": "vm"
@@ -352,7 +352,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "histogram_quantile(0.5, sum by (le) (rate(flliper:time_to_first_token_seconds_bucket[$__rate_interval])))",
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))",
      "legendFormat": "p50"
     },
     {
@@ -361,7 +361,7 @@
       "uid": "vm"
      },
      "refId": "B",
-     "expr": "histogram_quantile(0.9, sum by (le) (rate(flliper:time_to_first_token_seconds_bucket[$__rate_interval])))",
+     "expr": "histogram_quantile(0.9, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))",
      "legendFormat": "p90"
     }
    ]
@@ -434,7 +434,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model) (rate(pdflip_rank_decode_tokens_total{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
+     "expr": "sum by (model) (rate(weg2_rank_decode_tokens_total{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
      "legendFormat": "{{model}}"
     }
    ]
@@ -494,7 +494,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model, group) (rate(pdflip_rank_prefill_new_tokens_total{rank=\"tp0pp0\",group=~\"P|D\",model=~\"$model\"}[$__rate_interval]))",
+     "expr": "sum by (model, group) (rate(weg2_rank_prefill_new_tokens_total{rank=\"tp0pp0\",group=~\"P|D\",model=~\"$model\"}[$__rate_interval]))",
      "legendFormat": "{{group}} {{model}}"
     }
    ]
@@ -554,7 +554,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model) (pdflip_rank_decode_last_bs{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"})",
+     "expr": "max by (model) (weg2_rank_decode_last_bs{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"})",
      "legendFormat": "bs {{model}}"
     },
     {
@@ -563,7 +563,7 @@
       "uid": "vm"
      },
      "refId": "B",
-     "expr": "max by (model) (pdflip_front_outstanding_n{model=~\"$model\"})",
+     "expr": "max by (model) (weg2_front_outstanding_n{model=~\"$model\"})",
      "legendFormat": "outstanding {{model}}"
     },
     {
@@ -572,7 +572,7 @@
       "uid": "vm"
      },
      "refId": "C",
-     "expr": "max by (model) (pdflip_front_queue{model=~\"$model\"})",
+     "expr": "max by (model) (weg2_front_queue{model=~\"$model\"})",
      "legendFormat": "Warteschlange {{model}}"
     }
    ]
@@ -632,7 +632,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model, group) (pdflip_rank_kv_usage_ratio{model=~\"$model\"}) * 100",
+     "expr": "max by (model, group) (weg2_rank_kv_usage_ratio{model=~\"$model\"}) * 100",
      "legendFormat": "{{group}} {{model}}"
     }
    ]
@@ -705,7 +705,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model, group) (rate(pdflip_rank_l2_loadback_tokens_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
+     "expr": "sum by (model, group) (rate(weg2_rank_l2_loadback_tokens_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
      "legendFormat": "Load-back Tok/s {{group}} {{model}}"
     },
     {
@@ -714,7 +714,7 @@
       "uid": "vm"
      },
      "refId": "B",
-     "expr": "sum by (model, group) (rate(pdflip_rank_mamba_resume_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "expr": "sum by (model, group) (rate(weg2_rank_mamba_resume_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
      "legendFormat": "Mamba-Resumes/min {{group}} {{model}}"
     }
    ]
@@ -774,7 +774,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model, group, outcome) (rate(pdflip_rank_l3_prefetch_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "expr": "sum by (model, group, outcome) (rate(weg2_rank_l3_prefetch_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
      "legendFormat": "{{outcome}} {{group}} {{model}}"
     }
    ]

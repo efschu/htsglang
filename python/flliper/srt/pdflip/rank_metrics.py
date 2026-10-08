@@ -3,12 +3,12 @@ gauges and the decode-round histogram on the group servers' existing
 ``/metrics`` (``--enable-metrics``, prometheus multiprocess). No new env, no
 new port.
 
-* ``pdflip_rank_vram_used_bytes`` / ``pdflip_rank_kv_usage_ratio`` /
-  ``pdflip_rank_running`` {tp_rank, pp_rank}, ``multiprocess_mode="livemax"`` --
+* ``weg2_rank_vram_used_bytes`` / ``weg2_rank_kv_usage_ratio`` /
+  ``weg2_rank_running`` {tp_rank, pp_rank}, ``multiprocess_mode="livemax"`` --
   set from the rankstats timer thread (pdflip/rankstats.py), never the round path;
-* ``pdflip_decode_round_seconds{bs}`` -- one observation per decode round, at the
+* ``weg2_decode_round_seconds{bs}`` -- one observation per decode round, at the
   round's flush (DecodeRoundLog._emit, a boundary, never between two forwards);
-* ``pdflip_decode_tokens_total`` -- the generated-token delta per rankstats tick.
+* ``weg2_decode_tokens_total`` -- the generated-token delta per rankstats tick.
 
 Armed only where the server has metrics on (``PROMETHEUS_MULTIPROC_DIR`` set,
 which ``--enable-metrics`` does before the schedulers start). Every failure is
@@ -52,15 +52,15 @@ def _metrics() -> Optional[Dict[str, Any]]:
 
             lbl = ["tp_rank", "pp_rank"]
             _M = {
-                "vram": Gauge("pdflip_rank_vram_used_bytes", "CUDA memory reserved by this rank",
+                "vram": Gauge("weg2_rank_vram_used_bytes", "CUDA memory reserved by this rank",
                               lbl, multiprocess_mode="livemax"),
-                "kv": Gauge("pdflip_rank_kv_usage_ratio", "Full-token KV usage of this rank",
+                "kv": Gauge("weg2_rank_kv_usage_ratio", "Full-token KV usage of this rank",
                             lbl, multiprocess_mode="livemax"),
-                "running": Gauge("pdflip_rank_running", "Running requests on this rank",
+                "running": Gauge("weg2_rank_running", "Running requests on this rank",
                                  lbl, multiprocess_mode="livemax"),
-                "round": Histogram("pdflip_decode_round_seconds", "Decode round wall (GPU) time",
+                "round": Histogram("weg2_decode_round_seconds", "Decode round wall (GPU) time",
                                    ["bs"], buckets=_ROUND_BUCKETS),
-                "tokens": Counter("pdflip_decode_tokens", "Generated tokens (rankstats delta)"),
+                "tokens": Counter("weg2_decode_tokens", "Generated tokens (rankstats delta)"),
             }
         except Exception:  # noqa: BLE001 - no client / a registry clash: off, counted
             _err("init")

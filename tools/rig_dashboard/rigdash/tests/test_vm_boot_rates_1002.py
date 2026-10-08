@@ -25,16 +25,16 @@ def test_decode_sums_seeded_from_vm_continue_after_restart():
 
 
 def test_boot_rates_from_prefill_slowest_rank_and_decode_sums():
-    ser = {("pdflip_rank_prefill_new_tokens_total", "P", "tp0pp0"): [(1, 1000.0), (2, 216156.0)],
-           ("pdflip_rank_prefill_compute_ms_total", "P", "tp0pp0"): [(2, 58395.4)],
-           ("pdflip_rank_prefill_new_tokens_total", "P", "tp0pp1"): [(2, 216156.0)],
-           ("pdflip_rank_prefill_compute_ms_total", "P", "tp0pp1"): [(2, 38442.0)],
-           ("pdflip_rank_prefill_new_tokens_total", "D", "tp0pp0"): [(2, 500.0)],       # below the noise floor
-           ("pdflip_rank_prefill_compute_ms_total", "D", "tp0pp0"): [(2, 900.0)],
-           ("pdflip_boot_decode_tokens_total", "", ""): [(1, 30000.0), (2, 65000.0)],
-           ("pdflip_boot_decode_seconds_total", "", ""): [(2, 544.0)],
-           ("pdflip_boot_decode_seat_seconds_total", "", ""): [(2, 1500.0)],
-           ("pdflip_boot_decode_busy_seconds_total", "", ""): [(2, 500.0)]}
+    ser = {("weg2_rank_prefill_new_tokens_total", "P", "tp0pp0"): [(1, 1000.0), (2, 216156.0)],
+           ("weg2_rank_prefill_compute_ms_total", "P", "tp0pp0"): [(2, 58395.4)],
+           ("weg2_rank_prefill_new_tokens_total", "P", "tp0pp1"): [(2, 216156.0)],
+           ("weg2_rank_prefill_compute_ms_total", "P", "tp0pp1"): [(2, 38442.0)],
+           ("weg2_rank_prefill_new_tokens_total", "D", "tp0pp0"): [(2, 500.0)],       # below the noise floor
+           ("weg2_rank_prefill_compute_ms_total", "D", "tp0pp0"): [(2, 900.0)],
+           ("weg2_boot_decode_tokens_total", "", ""): [(1, 30000.0), (2, 65000.0)],
+           ("weg2_boot_decode_seconds_total", "", ""): [(2, 544.0)],
+           ("weg2_boot_decode_seat_seconds_total", "", ""): [(2, 1500.0)],
+           ("weg2_boot_decode_busy_seconds_total", "", ""): [(2, 500.0)]}
     r = vmpush.boot_rates_from(ser)
     assert r["prefill"]["P"]["rank"] == "tp0pp0" and round(r["prefill"]["P"]["tps"]) == 3702
     assert "D" not in r["prefill"]
@@ -47,4 +47,4 @@ def test_boot_rates_from_without_decode_sums_says_none():
 
 def test_decode_sum_lines_carry_model_and_boot():
     lines = vmpush.decode_sum_lines(dict(vmpush.decode_sums_empty(), tok=5.0), "NF", "boot-x", 1000)
-    assert lines[0] == 'pdflip_boot_decode_tokens_total{boot="boot-x",model="NF"} 5.0 1000'
+    assert lines[0] == 'weg2_boot_decode_tokens_total{boot="boot-x",model="NF"} 5.0 1000'

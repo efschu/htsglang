@@ -1,5 +1,5 @@
 """TSDB (user order 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md) for the 27B
-line: the front's /metrics (own pdflip_* + P/D relabelled), the optional Influx
+line: the front's /metrics (own weg2_* + P/D relabelled), the optional Influx
 push in the IPC writer thread, the NF arrival stamp, the rank gauges and the
 decode-round histogram.
 
@@ -8,7 +8,7 @@ Danger directions pinned:
   * a metric/push failure raised into the front -- counted instead;
   * the push running in the caller (event loop / flip) -- it is handed to the
     writer's ``submit``; with no env it does not exist at all;
-  * a failed group scrape breaking /metrics -- it reads pdflip_group_scrape_ok 0;
+  * a failed group scrape breaking /metrics -- it reads weg2_group_scrape_ok 0;
   * duplicate HELP/TYPE families in the joint exposition."""
 
 import asyncio
@@ -35,10 +35,10 @@ def _metrics(**env):
 
 
 def test_influx_line_escapes_and_types():
-    line = fm.influx_line("pdflip_req", {"model": "27B", "via": "after p", "x": None},
+    line = fm.influx_line("weg2_req", {"model": "27B", "via": "after p", "x": None},
                           {"rid": 'pdflip-1-2"', "ttft_ms": 12.5, "prompt": 7, "ok": True, "none": None},
                           ts_ns=1)
-    assert line == ('pdflip_req,model=27B,via=after\\ p '
+    assert line == ('weg2_req,model=27B,via=after\\ p '
                     'rid="pdflip-1-2\\"",ttft_ms=12.5,prompt=7i,ok=true 1')
     assert fm.influx_line("m", {}, {"a": None}) is None
 
@@ -78,7 +78,7 @@ def test_no_env_no_push():
 
 
 def test_push_rides_the_writer_with_rid_as_field():
-    """The pdflip_req point comes from request_done (DASHBOARD-IPC) through the
+    """The weg2_req point comes from request_done (DASHBOARD-IPC) through the
     ONE pusher of the TSDB front metrics; rid is a field, never a tag."""
     from flliper.srt.pdflip import front as F
 
@@ -93,7 +93,7 @@ def test_push_rides_the_writer_with_rid_as_field():
                                  "ttft_ms": 1250.0, "end_ts": 1.0})
     assert calls, "the write is handed to the writer"
     fn, (lines,) = calls[-1]
-    assert lines[-1].startswith("pdflip_req,")
+    assert lines[-1].startswith("weg2_req,")
     assert 'rid="pdflip-3-9"' in lines[-1] and "ttft_ms=1250.0" in lines[-1]
     head = lines[-1].split(" ")[0]
     assert "rid" not in head and "via=after_p" in head
@@ -108,12 +108,12 @@ def test_request_metrics_and_no_rid_label():
     m.served_leg("D", "pdflip-1-7", 3.0, 500, 400, 20)
     m.served_leg("P", "pdflip-1-8", 4.0, 800, 0, 0)
     out = m.render()
-    assert 'pdflip_ttft_seconds_count{via="d_direct"} 1.0' in out
-    assert 'pdflip_leg2_first_content_seconds_count{via="d_direct"} 1.0' in out
-    assert 'pdflip_served_total{group="D"} 1.0' in out and 'pdflip_served_total{group="P"} 1.0' in out
-    assert 'pdflip_tokens_total{group="D",kind="cached"} 400.0' in out
-    assert 'pdflip_request_seconds_count{group="P"} 1.0' in out
-    assert "rid" not in out.replace("pdflip_", "")  # never a rid label
+    assert 'weg2_ttft_seconds_count{via="d_direct"} 1.0' in out
+    assert 'weg2_leg2_first_content_seconds_count{via="d_direct"} 1.0' in out
+    assert 'weg2_served_total{group="D"} 1.0' in out and 'weg2_served_total{group="P"} 1.0' in out
+    assert 'weg2_tokens_total{group="D",kind="cached"} 400.0' in out
+    assert 'weg2_request_seconds_count{group="P"} 1.0' in out
+    assert "rid" not in out.replace("weg2_", "")  # never a rid label
 
 
 def test_flip_events_and_park_rpc():
@@ -124,10 +124,10 @@ def test_flip_events_and_park_rpc():
                                   "parts": {"park_rpc_ms": 400}})
     m.park_rpc_done(0.4)
     out = m.render()
-    assert 'pdflip_flips_total{dir="D>P"} 1.0' in out
+    assert 'weg2_flips_total{dir="D>P"} 1.0' in out
     for kind in ("layer", "first_work", "user"):
-        assert f'pdflip_flip_seconds_count{{dir="D>P",kind="{kind}"}} 1.0' in out
-    assert "pdflip_park_rpc_seconds_count 1.0" in out
+        assert f'weg2_flip_seconds_count{{dir="D>P",kind="{kind}"}} 1.0' in out
+    assert "weg2_park_rpc_seconds_count 1.0" in out
 
 
 def test_a_metric_failure_is_counted_never_raised():
@@ -135,7 +135,7 @@ def test_a_metric_failure_is_counted_never_raised():
     m.on_event("flip_done", {"sleep": "D", "wake": "P", "flip_ms": "not-a-number"})
     m.leg2_first_content("r", "d_direct", "x", arrival_ts=None)
     assert m.errors["on_event"] == 1 and m.errors["leg2_first_content"] == 1
-    assert 'pdflip_metrics_errors_total{where="on_event"} 1.0' in m.render()
+    assert 'weg2_metrics_errors_total{where="on_event"} 1.0' in m.render()
 
 
 def test_relabel_adds_the_group_and_names_each_family_once():
@@ -144,17 +144,17 @@ def test_relabel_adds_the_group_and_names_each_family_once():
     p = fm.relabel_group(own + 'flliper_y{a="b"} 2.0\n', "P", seen)
     d = fm.relabel_group("# TYPE flliper_y gauge\nflliper_y 3.0\n", "D", seen)
     assert "# TYPE flliper_x" not in p           # already named by the front's text
-    assert 'flliper_x{pdflip_group="P"} 1.0' in p
-    assert 'flliper_y{pdflip_group="P",a="b"} 2.0' in p
-    assert 'flliper_y{pdflip_group="D"} 3.0' in d and "# TYPE flliper_y gauge" in d
+    assert 'flliper_x{weg2_group="P"} 1.0' in p
+    assert 'flliper_y{weg2_group="P",a="b"} 2.0' in p
+    assert 'flliper_y{weg2_group="D"} 3.0' in d and "# TYPE flliper_y gauge" in d
 
 
 def test_aggregate_names_a_failed_group():
     m, _ = _metrics()
     out = m.aggregate([("P", "flliper_up 1.0\n"), ("D", None)])
-    assert 'flliper_up{pdflip_group="P"} 1.0' in out
-    assert 'pdflip_group_scrape_ok{pdflip_group="D"} 0.0' in out
-    assert 'pdflip_group_scrape_ok{pdflip_group="P"} 1.0' in out
+    assert 'flliper_up{weg2_group="P"} 1.0' in out
+    assert 'weg2_group_scrape_ok{weg2_group="D"} 0.0' in out
+    assert 'weg2_group_scrape_ok{weg2_group="P"} 1.0' in out
 
 
 # --- the front's route, arrival stamp and rid end ----------------------------------------
@@ -197,10 +197,10 @@ def test_handle_metrics_aggregates_p_and_d_and_survives_a_dead_group():
 
     status, body = asyncio.run(_run())
     assert status == 200
-    assert 'flliper_num_running_reqs{pdflip_group="P"} 2.0' in body
-    assert 'pdflip_group_scrape_ok{pdflip_group="D"} 0.0' in body
-    assert "pdflip_queue_len 2.0" in body and "pdflip_outstanding 1.0" in body
-    assert 'pdflip_awake{group="D"} 1.0' in body and "pdflip_d_seats 6.0" in body
+    assert 'flliper_num_running_reqs{weg2_group="P"} 2.0' in body
+    assert 'weg2_group_scrape_ok{weg2_group="D"} 0.0' in body
+    assert "weg2_queue_len 2.0" in body and "weg2_outstanding 1.0" in body
+    assert 'weg2_awake{group="D"} 1.0' in body and "weg2_d_seats 6.0" in body
 
 
 def test_metrics_is_the_fronts_route_not_a_passthrough():
@@ -265,11 +265,11 @@ def test_rank_gauges_round_histogram_and_token_delta(monkeypatch, tmp_path):
         rm.on_rankstats(rec, 0, 2, vram_bytes=123)
         rm.on_rankstats(dict(rec, tokens={"decode_total": 160}), 0, 2, vram_bytes=124)
         out = pc.generate_latest(pc.REGISTRY).decode()
-        assert 'pdflip_decode_round_seconds_count{bs="2"} 1.0' in out
-        assert 'pdflip_rank_running{pp_rank="2",tp_rank="0"} 3.0' in out
-        assert 'pdflip_rank_kv_usage_ratio{pp_rank="2",tp_rank="0"} 0.42' in out
-        assert 'pdflip_rank_vram_used_bytes{pp_rank="2",tp_rank="0"} 124.0' in out
-        assert "pdflip_decode_tokens_total 60.0" in out
+        assert 'weg2_decode_round_seconds_count{bs="2"} 1.0' in out
+        assert 'weg2_rank_running{pp_rank="2",tp_rank="0"} 3.0' in out
+        assert 'weg2_rank_kv_usage_ratio{pp_rank="2",tp_rank="0"} 0.42' in out
+        assert 'weg2_rank_vram_used_bytes{pp_rank="2",tp_rank="0"} 124.0' in out
+        assert "weg2_decode_tokens_total 60.0" in out
         assert rm.ERRORS == {}
     finally:
         for c in list((rm._M or {}).values()):

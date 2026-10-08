@@ -2889,7 +2889,7 @@ class DPDispatcher:
             from prometheus_client import Gauge
 
             self.pending_gauge = Gauge(
-                name="flliper:encoder_dp_pending_requests",
+                name="sglang:encoder_dp_pending_requests",
                 documentation="Number of pending requests per encoder DP rank.",
                 labelnames=list(self.labels.keys()) + ["dp_rank"],
                 multiprocess_mode="mostrecent",

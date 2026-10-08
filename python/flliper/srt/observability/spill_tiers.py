@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Live occupancy of the spill / offload tiers, read off the bookkeeping that
-already exists -- for the ``flliper:spill_tier_*_bytes`` gauges.
+already exists -- for the ``sglang:spill_tier_*_bytes`` gauges.
 
 The rule this module is written to: **read the consumer's own ledger, never a
 proxy.** Each tier below names the object it reads and the unit that object

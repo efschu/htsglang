@@ -29,25 +29,25 @@ Design contract (from design_dashboard_v2.md "Module: live_metrics.py"):
         snap, state = snapshot(endpoint, state)     # deltas vs the previous call
 
   * REAL rates from Prometheus COUNTER DELTAS, not the coarse
-    ``flliper:gen_throughput`` gauge:
-      - decode tok/s  = delta(flliper:generation_tokens_total) / dt
+    ``sglang:gen_throughput`` gauge:
+      - decode tok/s  = delta(sglang:generation_tokens_total) / dt
       - prefill tok/s = TRUE non-cached prefill work only, i.e.
-            delta(flliper:prompt_tokens_total) MINUS delta(cached tokens)
+            delta(sglang:prompt_tokens_total) MINUS delta(cached tokens)
         Tokens served from any cache tier (device radix / host RAM / storage
         disk) are NOT prefill compute and must not be counted as prefill work.
         The coarse ``gen_throughput`` gauge is echoed for reference only.
 
   * Per-TIER cache-hit rate from the multi-label counter
-        flliper:cached_tokens_total{cache_source="device"|"host"|"storage_*"}
+        sglang:cached_tokens_total{cache_source="device"|"host"|"storage_*"}
     one hit rate per tier = delta(cached_tokens of that tier) / delta(prompt
     tokens) over the same window (delta-based; NOT lifetime cumulative).
 
-  * MTP acceptance + adaptive-k from the gauges flliper:spec_accept_rate /
-    flliper:spec_num_steps / flliper:spec_ema_accept_len. Absent (spec off) ->
+  * MTP acceptance + adaptive-k from the gauges sglang:spec_accept_rate /
+    sglang:spec_num_steps / sglang:spec_ema_accept_len. Absent (spec off) ->
     the whole ``spec`` block degrades to None rather than reporting fake zeros.
 
-  * HiCache system-RAM usage from flliper:hicache_host_used_tokens /
-    flliper:hicache_host_total_tokens (only exported when the server was booted
+  * HiCache system-RAM usage from sglang:hicache_host_used_tokens /
+    sglang:hicache_host_total_tokens (only exported when the server was booted
     with a hierarchical cache; absent -> ``hicache`` is None). These are the
     only HiCache-RAM gauges metrics_collector.py exports; the figure is in
     KV-cache TOKENS of host memory, not raw bytes (see the note in the module's
@@ -108,18 +108,18 @@ __all__ = [
 ]
 
 # --- exact Prometheus metric names (pinned against metrics_collector.py) -----
-PROMPT_TOKENS_METRIC = "flliper:prompt_tokens_total"
-GENERATION_TOKENS_METRIC = "flliper:generation_tokens_total"
-CACHED_TOKENS_METRIC = "flliper:cached_tokens_total"  # labelled by cache_source
+PROMPT_TOKENS_METRIC = "sglang:prompt_tokens_total"
+GENERATION_TOKENS_METRIC = "sglang:generation_tokens_total"
+CACHED_TOKENS_METRIC = "sglang:cached_tokens_total"  # labelled by cache_source
 #: The pdflip front (and newer schedulers) export no prompt/generation counters,
-#: only ``flliper:realtime_tokens_total{mode="prefill_compute"|"prefill_cache"|
+#: only ``sglang:realtime_tokens_total{mode="prefill_compute"|"prefill_cache"|
 #: "decode"}``.  Without this fallback every rate on the Monitor tab read 0.0
 #: against a server decoding at 200 tok/s (measured 2026-09-27, 27B pdflip boot).
-REALTIME_TOKENS_METRIC = "flliper:realtime_tokens_total"
+REALTIME_TOKENS_METRIC = "sglang:realtime_tokens_total"
 
 
 def realtime_tokens_by_mode(metrics_text: str) -> Dict[str, float]:
-    """``{mode: summed value}`` for ``flliper:realtime_tokens_total``."""
+    """``{mode: summed value}`` for ``sglang:realtime_tokens_total``."""
     out: Dict[str, float] = {}
     for line in metrics_text.splitlines():
         if not line.startswith(REALTIME_TOKENS_METRIC + "{"):
@@ -132,18 +132,18 @@ def realtime_tokens_by_mode(metrics_text: str) -> Dict[str, float]:
         if m:
             out[m.group(1)] = out.get(m.group(1), 0.0) + val
     return out
-SPEC_ACCEPT_RATE_METRIC = "flliper:spec_accept_rate"
-SPEC_NUM_STEPS_METRIC = "flliper:spec_num_steps"        # current adaptive-k
-SPEC_EMA_ACCEPT_LEN_METRIC = "flliper:spec_ema_accept_len"
-GEN_THROUGHPUT_METRIC = "flliper:gen_throughput"        # coarse gauge (reference)
+SPEC_ACCEPT_RATE_METRIC = "sglang:spec_accept_rate"
+SPEC_NUM_STEPS_METRIC = "sglang:spec_num_steps"        # current adaptive-k
+SPEC_EMA_ACCEPT_LEN_METRIC = "sglang:spec_ema_accept_len"
+GEN_THROUGHPUT_METRIC = "sglang:gen_throughput"        # coarse gauge (reference)
 #: Concurrency gauges. Needed to turn a server-wide token rate into a PER
 #: SESSION one -- 40 tok/s across 4 concurrent requests is not the same
 #: experience as 40 tok/s for one, and only the per-session figure is what a
 #: reader actually feels.
-NUM_RUNNING_REQS_METRIC = "flliper:num_running_reqs"
-NUM_QUEUE_REQS_METRIC = "flliper:num_queue_reqs"
-HICACHE_HOST_USED_METRIC = "flliper:hicache_host_used_tokens"
-HICACHE_HOST_TOTAL_METRIC = "flliper:hicache_host_total_tokens"
+NUM_RUNNING_REQS_METRIC = "sglang:num_running_reqs"
+NUM_QUEUE_REQS_METRIC = "sglang:num_queue_reqs"
+HICACHE_HOST_USED_METRIC = "sglang:hicache_host_used_tokens"
+HICACHE_HOST_TOTAL_METRIC = "sglang:hicache_host_total_tokens"
 
 
 # ===========================================================================
@@ -597,7 +597,7 @@ def _parse_counters(metrics_text: str) -> Dict[str, Any]:
 def _parse_hicache(flat: Dict[str, float]) -> Optional[Dict[str, float]]:
     """HiCache host (system-RAM) usage, or None when the server was not booted
     with a hierarchical cache. metrics_collector.py exports host usage as a KV
-    TOKEN count (``flliper:hicache_host_used_tokens`` /
+    TOKEN count (``sglang:hicache_host_used_tokens`` /
     ``..._total_tokens``), not as a byte figure -- so ``host_used_frac`` is the
     fraction of the host KV pool in use, and the token counts are the honest
     unit. (There is no host-BYTES gauge in metrics_collector.py; a byte figure

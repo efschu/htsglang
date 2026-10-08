@@ -160,7 +160,7 @@ FORWARD_PATHS = ("/generate", "/v1/completions", "/v1/chat/completions", "/v1/me
 PASSTHROUGH_POST = ("/v1/messages/count_tokens",)
 PASSTHROUGH_GET = ("/v1/models", "/get_model_info", "/get_server_info", "/model_info")
 #: TSDB (01.10.): /metrics is the front's own route (front_metrics): its pdflip_* families
-#: plus P's and D's /metrics relabelled with pdflip_group="P"|"D".
+#: plus P's and D's /metrics relabelled with weg2_group="P"|"D".
 METRICS_PATH = "/metrics"
 CHARS_PER_TOKEN = 3.0  # conservative: over-estimates tokens, never under-prices
 # #1233 zero-remainder: the CARRIER-EXCEEDS route must not UNDER-estimate --
@@ -8229,7 +8229,7 @@ class Front:
 
     def _ipc_out_book(self):
         """Every open request's arrival and last token (front_state_ipc.OutstandingBook,
-        NF port): the 27B front reads its arrival for pdflip_ttft_seconds."""
+        NF port): the 27B front reads its arrival for weg2_ttft_seconds."""
         b = self.__dict__.get("_ipc_out_book_obj")
         if b is None:
             from flliper.srt.pdflip.front_state_ipc import OutstandingBook
@@ -8281,8 +8281,8 @@ class Front:
 
     async def handle_metrics(self, request: web.Request) -> web.Response:
         """TSDB: the front's own pdflip_* families + P's and D's /metrics, each
-        relabelled pdflip_group="P"|"D" (2 s per group; a failed group reads
-        pdflip_group_scrape_ok 0). Never raises: a failure here is counted."""
+        relabelled weg2_group="P"|"D" (2 s per group; a failed group reads
+        weg2_group_scrape_ok 0). Never raises: a failure here is counted."""
         GROUP_SCRAPE_TIMEOUT_S = _front_metrics.GROUP_SCRAPE_TIMEOUT_S
         m = self._metrics()
         try:
@@ -8525,7 +8525,7 @@ class Front:
 
     def _rb_done(self, rid: str, status: Any) -> None:
         """The handler's end: ``request_done`` (+ the ``park`` of a park still
-        open) into events.jsonl, and the optional ``pdflip_req`` push."""
+        open) into events.jsonl, and the optional ``weg2_req`` push."""
         b = self.__dict__.get("_req_book_obj")
         if b is None:
             return
@@ -8545,14 +8545,14 @@ class Front:
         return Front._metrics(self).pusher
 
     def _ipc_req_push(self, rec: dict) -> None:
-        """Runs in the IPC thread: one ``pdflip_req`` line, bundled ~2 s."""
+        """Runs in the IPC thread: one ``weg2_req`` line, bundled ~2 s."""
         p = Front._ipc_pusher(self)
         if p is None:
             return
         tags, fields = _frq.influx_req_fields(rec)
         tags["model"] = envs.FLLIPER_PDFLIP_METRICS_MODEL.get() or None
         ts = rec.get("end_ts")
-        p.add(_front_metrics.influx_line("pdflip_req", tags, fields,
+        p.add(_front_metrics.influx_line("weg2_req", tags, fields,
                           ts_ns=int(float(ts) * 1e9) if ts is not None else None))
         p.maybe_flush()
 
@@ -9305,7 +9305,7 @@ class Front:
         if _asr.enabled():
             self._asr_arrival_note(rid)  # NF-STAU: the TTFT clocks start here
         self._sess_note(rid, request, payload)  # SESSION-TRACE (after the book's row: session/turn)
-        self._ipc_out_book().arrive(rid, time.time())  # state.json front.oldest_outstanding_* + pdflip_ttft_seconds
+        self._ipc_out_book().arrive(rid, time.time())  # state.json front.oldest_outstanding_* + weg2_ttft_seconds
         # UNIFY S7 (27B RC7-X): the arrival time the idle re-grant's quiet
         # window reads ("did anything arrive in the last window").
         self._x_last_arrival = time.time()

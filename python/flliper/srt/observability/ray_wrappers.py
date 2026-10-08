@@ -136,7 +136,7 @@ class RayPrometheusMetric:
         """Replace characters Ray's OTel-backed metric name validator rejects.
 
         Ray is migrating from OpenCensus to OpenTelemetry, whose instrument names
-        only allow ``a-zA-Z0-9_``. flliper's existing names use a ``flliper:foo``
+        only allow ``a-zA-Z0-9_``. flliper's existing names use a ``sglang:foo``
         prefix; converting ``:`` (and any other punctuation) to ``_`` keeps the
         names valid without churn on the prometheus_client side.
         """

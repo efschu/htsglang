@@ -59,7 +59,7 @@ from flliper.srt.utils.network import NetworkAddress
 logger = logging.getLogger(__name__)
 
 FAILED_SESSION_RECOVERIES = Counter(
-    "flliper:failed_session_recoveries_total",
+    "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
 

@@ -59,19 +59,19 @@ class TestEnableMetrics(CustomTestCase):
         def _verify_metrics_extra(metrics):
             metrics_to_check = [
                 (
-                    "flliper:dp_cooperation_realtime_tokens_total",
+                    "sglang:dp_cooperation_realtime_tokens_total",
                     {"mode": "prefill_compute"},
                 ),
                 (
-                    "flliper:dp_cooperation_realtime_tokens_total",
+                    "sglang:dp_cooperation_realtime_tokens_total",
                     {"mode": "decode"},
                 ),
                 (
-                    "flliper:dp_cooperation_forward_execution_seconds_total",
+                    "sglang:dp_cooperation_forward_execution_seconds_total",
                     {"category": "extend"},
                 ),
                 (
-                    "flliper:dp_cooperation_forward_execution_seconds_total",
+                    "sglang:dp_cooperation_forward_execution_seconds_total",
                     {"category": "decode"},
                 ),
             ]
@@ -79,7 +79,7 @@ class TestEnableMetrics(CustomTestCase):
 
             num_prefill_ranks_values = {
                 s.labels["num_prefill_ranks"]
-                for s in metrics["flliper:dp_cooperation_realtime_tokens_total"]
+                for s in metrics["sglang:dp_cooperation_realtime_tokens_total"]
             }
             self.assertIn("0", num_prefill_ranks_values)
             self.assertIn("1", num_prefill_ranks_values)
@@ -167,31 +167,31 @@ class TestEnableMetrics(CustomTestCase):
 
     def _verify_metrics_common(self, metrics_text, metrics, expect_mfu_metrics: bool):
         essential_metrics = [
-            "flliper:num_running_reqs",
-            "flliper:num_used_tokens",
-            "flliper:token_usage",
-            "flliper:gen_throughput",
-            "flliper:num_queue_reqs",
-            "flliper:num_grammar_queue_reqs",
-            "flliper:cache_hit_rate",
-            "flliper:spec_accept_length",
-            "flliper:prompt_tokens_total",
-            "flliper:generation_tokens_total",
-            "flliper:cached_tokens_total",
-            "flliper:num_requests_total",
-            "flliper:time_to_first_token_seconds",
-            "flliper:inter_token_latency_seconds",
-            "flliper:e2e_request_latency_seconds",
-            "flliper:http_requests_active",
-            "flliper:routing_keys_active",
-            "flliper:num_unique_running_routing_keys",
-            "flliper:routing_key_running_req_count",
-            "flliper:routing_key_all_req_count",
+            "sglang:num_running_reqs",
+            "sglang:num_used_tokens",
+            "sglang:token_usage",
+            "sglang:gen_throughput",
+            "sglang:num_queue_reqs",
+            "sglang:num_grammar_queue_reqs",
+            "sglang:cache_hit_rate",
+            "sglang:spec_accept_length",
+            "sglang:prompt_tokens_total",
+            "sglang:generation_tokens_total",
+            "sglang:cached_tokens_total",
+            "sglang:num_requests_total",
+            "sglang:time_to_first_token_seconds",
+            "sglang:inter_token_latency_seconds",
+            "sglang:e2e_request_latency_seconds",
+            "sglang:http_requests_active",
+            "sglang:routing_keys_active",
+            "sglang:num_unique_running_routing_keys",
+            "sglang:routing_key_running_req_count",
+            "sglang:routing_key_all_req_count",
         ]
         mfu_metrics = [
-            "flliper:estimated_flops_per_gpu_total",
-            "flliper:estimated_read_bytes_per_gpu_total",
-            "flliper:estimated_write_bytes_per_gpu_total",
+            "sglang:estimated_flops_per_gpu_total",
+            "sglang:estimated_read_bytes_per_gpu_total",
+            "sglang:estimated_write_bytes_per_gpu_total",
         ]
         if expect_mfu_metrics:
             essential_metrics.extend(mfu_metrics)
@@ -201,8 +201,8 @@ class TestEnableMetrics(CustomTestCase):
         # Verify routing key GaugeHistogram buckets
         expected_buckets = len(ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS) + 1
         for metric_name in [
-            "flliper:routing_key_running_req_count",
-            "flliper:routing_key_all_req_count",
+            "sglang:routing_key_running_req_count",
+            "sglang:routing_key_all_req_count",
         ]:
             gt_le_pairs = set()
             for sample in metrics.get(metric_name, []):
@@ -219,11 +219,11 @@ class TestEnableMetrics(CustomTestCase):
         self.assertIn("_bucket{", metrics_text)
 
         metrics_to_check = [
-            ("flliper:realtime_tokens_total", {"mode": "prefill_compute"}),
-            ("flliper:realtime_tokens_total", {"mode": "decode"}),
-            ("flliper:forward_execution_seconds_total", {"category": "extend"}),
-            ("flliper:forward_execution_seconds_total", {"category": "decode"}),
-            ("flliper:process_cpu_seconds_total", {"component": "tokenizer"}),
+            ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
+            ("sglang:realtime_tokens_total", {"mode": "decode"}),
+            ("sglang:forward_execution_seconds_total", {"category": "extend"}),
+            ("sglang:forward_execution_seconds_total", {"category": "decode"}),
+            ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 
@@ -546,22 +546,22 @@ class TestStatLoggersDIRecording(CustomTestCase):
         #    stats tick. After one generation it should have at least one
         #    emission.
         self.assertIn(
-            "flliper:num_running_reqs",
+            "sglang:num_running_reqs",
             by_name,
             f"Expected num_running_reqs emissions, saw: {sorted(by_name)[:10]}",
         )
-        running_ops = {e["op"] for e in by_name["flliper:num_running_reqs"]}
+        running_ops = {e["op"] for e in by_name["sglang:num_running_reqs"]}
         self.assertIn("set", running_ops)
 
         # 2) num_queue_reqs: same shape, different metric. Two metrics from
         #    the same collector firing confirm the DI hook applied uniformly.
-        self.assertIn("flliper:num_queue_reqs", by_name)
-        queue_ops = {e["op"] for e in by_name["flliper:num_queue_reqs"]}
+        self.assertIn("sglang:num_queue_reqs", by_name)
+        queue_ops = {e["op"] for e in by_name["sglang:num_queue_reqs"]}
         self.assertIn("set", queue_ops)
 
         # 3) Tag propagation: every recorded emission must carry the labels
         #    keys the scheduler installed (model_name, engine_type, ...).
-        any_running = by_name["flliper:num_running_reqs"][0]
+        any_running = by_name["sglang:num_running_reqs"][0]
         self.assertIn("model_name", any_running["tags"])
         self.assertEqual(any_running["tags"]["model_name"], _MODEL_NAME)
 

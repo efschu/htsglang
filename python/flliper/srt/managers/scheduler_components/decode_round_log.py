@@ -616,7 +616,7 @@ class DecodeRoundLog:
         else:
             slot_bs[0] += 1
             slot_bs[1] += round_ms
-        # TSDB (01.10.): pdflip_decode_round_seconds{bs} on the group's /metrics --
+        # TSDB (01.10.): weg2_decode_round_seconds{bs} on the group's /metrics --
         # at this flush (a round boundary), a no-op without server metrics
         _rank_metrics.observe_decode_round(acc.bs, round_ms / 1000.0)
         if split_known and family_acc:

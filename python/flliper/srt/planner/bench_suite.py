@@ -55,8 +55,8 @@ Result schema per test (design "Result-Schema pro Test"):
 
 MTP acceptance length (test 7) is read from Prometheus ``/metrics`` using the
 metric names PINNED in ``live_metrics.py`` (imported, not re-guessed):
-``flliper:spec_accept_rate`` / ``flliper:spec_num_steps`` /
-``flliper:spec_ema_accept_len``.
+``sglang:spec_accept_rate`` / ``sglang:spec_num_steps`` /
+``sglang:spec_ema_accept_len``.
 
 HONEST NOTES (need a live server to close):
   * The AL gauge names are pinned against this fork's metrics_collector.py via

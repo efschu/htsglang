@@ -1116,7 +1116,7 @@ def hicache_saved_record(payload: dict) -> dict:
 
     Two input modes (both accumulate, neither resets):
       * ``target``: scrape the running server's ``/metrics`` and record the
-        ABSOLUTE ``flliper:cached_tokens_total`` (HiCache RAM/disk tiers only) as a
+        ABSOLUTE ``sglang:cached_tokens_total`` (HiCache RAM/disk tiers only) as a
         counter snapshot — the store adds only the DELTA since the last snapshot.
       * ``recovered_tokens``: a manual delta to add directly (no server).
 

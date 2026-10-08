@@ -287,11 +287,11 @@ import sys
 path, tag = sys.argv[1], sys.argv[2]
 text = open(path).read()
 wanted = (
-    "flliper:e2e_request_latency_seconds_sum",
-    "flliper:time_per_output_token_seconds_sum",
-    "flliper:time_to_first_token_seconds_sum",
-    "flliper:num_generation_tokens_total",
-    "flliper:prompt_tokens_total",
+    "sglang:e2e_request_latency_seconds_sum",
+    "sglang:time_per_output_token_seconds_sum",
+    "sglang:time_to_first_token_seconds_sum",
+    "sglang:num_generation_tokens_total",
+    "sglang:prompt_tokens_total",
 )
 print(f"--- {tag}")
 for key in wanted:

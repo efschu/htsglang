@@ -33,7 +33,7 @@ def enable_func_timer():
     enable_metrics = True
 
     FUNC_LATENCY = Histogram(
-        "flliper:func_latency_seconds",
+        "sglang:func_latency_seconds",
         "Function latency in seconds",
         # captures latency in range [50ms - ~50s]
         buckets=exponential_buckets(start=0.05, width=1.5, length=18),

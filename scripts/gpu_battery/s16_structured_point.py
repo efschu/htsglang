@@ -174,12 +174,12 @@ def _flush_cache(port: int) -> str:
 
 def _metrics_snapshot(port: int) -> dict:
     keep = (
-        "flliper:num_running_reqs",
-        "flliper:num_queue_reqs",
-        "flliper:gen_throughput",
-        "flliper:spec_accept_length",
-        "flliper:token_usage",
-        "flliper:cache_hit_rate",
+        "sglang:num_running_reqs",
+        "sglang:num_queue_reqs",
+        "sglang:gen_throughput",
+        "sglang:spec_accept_length",
+        "sglang:token_usage",
+        "sglang:cache_hit_rate",
     )
     out: dict = {}
     try:
