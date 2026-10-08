@@ -348,6 +348,16 @@ class TestSwitchesAndFlags(unittest.TestCase):
 
 
 class TestRedactKnownNames(unittest.TestCase):
+    def test_builtin_names_both_spellings_derived_without_tree(self):
+        """Fix-Runde 1, Befund 1: the built-in set holds old AND new spelling of every refusal class, derived through names (no contiguous old literal)."""
+        old, new = N.CAMEL_TOKENS
+        for suffix in ("TpOperatingPointInfeasible", "XchgResidencyUnarmable", "XchgSemaphoreNotRearmed", "DualCompactBreach"):
+            self.assertIn(old + suffix, redact._KNOWN_IDENT_BUILTIN)
+            self.assertIn(new + suffix, redact._KNOWN_IDENT_BUILTIN)
+        self.assertIn(old + "FlipPeerLegAborted", redact._KNOWN_IDENT_BUILTIN)
+        self.assertIn(new + "PeerLegAborted", redact._KNOWN_IDENT_BUILTIN)
+        self.assertEqual(len(redact._KNOWN_IDENT_BUILTIN), 10)
+
     def test_renamed_tree_class_names_stay_readable(self):
         with tempfile.TemporaryDirectory() as tree:
             sub = os.path.join(tree, "flliper", "srt", NEW_L)

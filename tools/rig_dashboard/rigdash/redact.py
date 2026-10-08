@@ -158,11 +158,12 @@ _FULLRUN = re.compile(r"[A-Za-z0-9_\-]{32,}\Z")
 # ``srt/weg2/*.py`` and ``srt/flip_*.py`` (the launcher prints some as text, ``Weg2TpOperatingPointInfeasible`` is no class) plus every ``class X``
 # of those files.  No tree found -> only the built-in names below (the ones the run report is known to quote), everything else is cut: the safe side.
 # F0-B: a renamed tree spells these ``PdFlip<Word>`` (``Weg2Flip<X>`` -> ``PdFlip<X>``, ``Weg2<X>`` -> ``PdFlip<X>``, rename tool rule), so the
-# built-in list carries both spellings and the tree scan reads either layout.
-_KNOWN_IDENT_BUILTIN = frozenset(("Weg2TpOperatingPointInfeasible", "Weg2XchgResidencyUnarmable", "Weg2XchgSemaphoreNotRearmed", "Weg2FlipPeerLegAborted",
-                                  "Weg2DualCompactBreach",
-                                  "PdFlipTpOperatingPointInfeasible", "PdFlipXchgResidencyUnarmable", "PdFlipXchgSemaphoreNotRearmed",
-                                  "PdFlipPeerLegAborted", "PdFlipDualCompactBreach"))
+# built-in list carries both spellings (derived, see below) and the tree scan reads either layout.
+# The set is DERIVED from one spelling through ``names`` (``marker_variants``), never written out twice: a literal old spelling would be rewritten by the
+# rename tool (F0-F) and the old-evidence names would drop out of a renamed dashboard.
+_BUILTIN_BASES = tuple(N.CAMEL_TOKENS[0] + _w for _w in ("TpOperatingPointInfeasible", "XchgResidencyUnarmable", "XchgSemaphoreNotRearmed",
+                                                       "FlipPeerLegAborted", "DualCompactBreach"))
+_KNOWN_IDENT_BUILTIN = frozenset(v for _b in _BUILTIN_BASES for v in N.marker_variants(_b))
 _IDENT_IN_SOURCE = re.compile(r"\b(?:%s|%s)[A-Z][A-Za-z0-9]+\b|^class ([A-Z][A-Za-z0-9]+)" % N.CAMEL_TOKENS, re.M)
 _known_cache: Optional[frozenset] = None
 
