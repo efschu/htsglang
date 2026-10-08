@@ -122,8 +122,11 @@ def _sweep(cache, pool, *, on=True):
 
 
 def _backed_ids(cache):
-    return sorted(n.id for n in cache._collect_all_nodes()
-                  if n is not cache.root_node and n.backuped)
+    """Backed nodes by POSITION in the tree: node ids come from a process-wide
+    counter, so two trees built one after the other never share ids."""
+    nodes = [n for n in cache._collect_all_nodes() if n is not cache.root_node]
+    base = min(n.id for n in nodes)
+    return sorted(n.id - base for n in nodes if n.backuped)
 
 
 class TestAFullArenaIsClaimedOncePerSweep(CustomTestCase):
@@ -184,11 +187,17 @@ class TestAFullArenaIsClaimedOncePerSweep(CustomTestCase):
         self.assertEqual(len(pool2.claims), 2 * CHAIN, "R12 mirrors every refusal TP0 records")
 
     def test_a_w3_spill_that_releases_room_gets_the_claim(self):
-        cache = _tree()
-        pool = _DirectPool(room=())
-        with mock.patch.object(UnifiedRadixCache, "_w3_arena_spill", lambda self, p, n, claimer=None: 1):
-            _sweep(cache, pool, on=True)
-        self.assertEqual(len(pool.claims), 2 * CHAIN)
+        """A spill that frees room keeps every node's claim, exactly as with the
+        switch off (a claim and its retry after the spill, per node)."""
+        claims = {}
+        for on in (False, True):
+            cache = _tree()
+            pool = _DirectPool(room=())
+            with mock.patch.object(UnifiedRadixCache, "_w3_arena_spill", lambda self, p, n, claimer=None: 1):
+                _sweep(cache, pool, on=on)
+            claims[on] = len(pool.claims)
+        self.assertEqual(claims[True], claims[False])
+        self.assertGreaterEqual(claims[True], 2 * CHAIN)
 
 
 class _Arena:
