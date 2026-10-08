@@ -195,8 +195,8 @@ This file describes only what agents and operators have to **maintain**.
 ## Feature map (user order 29.09.: "this must always be kept current")
 
 Source: `/spinning/gpu-arb/docs/features.json`. One row per feature with
-`id, modell (27B|NF|beide), titel, fertig, zweige[{branch, sha}], schalter[…], gewinn[…],
-aus_begruendung, verantwortlich`.
+`id, model (27B|NF|both), title, done, branches[{branch, sha}], switches[…], gain[…],
+aus_begruendung, responsible`.
 
 **Do not enter, rigdash calculates it itself:**
 
@@ -214,13 +214,13 @@ aus_begruendung, verantwortlich`.
 ```bash
 U=/opt/rigdash/current/rigdash/features_update.py
 # feature done/built (upsert by id; --zweig/--schalter replace the lists)
-python3 $U set --id H106 --modell NF --titel "…" --fertig ja \
-    --zweig desk/nf-…=<sha> --schalter FLLIPER_X=env:D:1:aus --verantwortlich NF-Implementierer
+python3 $U set --id H106 --modell NF --titel "…" --fertig yes \
+    --zweig desk/nf-…=<sha> --schalter FLLIPER_X=env:D:1:off --verantwortlich NF-Implementer
 # 27B has picked it (new sha, old ones stay)
 python3 $U add-zweig --id H106 --zweig desk/27b-unified-0926=<sha>
 # gain -- measured (boot + source), calculated (planner/model) or unverified
-python3 $U gewinn --id H106 --modell NF --metrik Flipzeit --vorher 3.1 --nachher 2.4 --einheit s \
-    --art gemessen --quelle "fliptimes" --boot <boot_id>
+python3 $U gewinn --id H106 --modell NF --metrik FlipTime --vorher 3.1 --nachher 2.4 --einheit s \
+    --art measured --quelle "fliptimes" --boot <boot_id>
 # in the image, but off: why
 python3 $U begruendung --id H63 --text "…"
 python3 $U check
@@ -255,12 +255,12 @@ F23 prompt lengths), `matrix` (F24 form × bs × depth × text), `marker` (instr
   `set --produkt F8` attaches it in the same step.
 
 ```bash
-python3 $U produkt-ist --id F1 --modell NF --status fertig+aktiv --wert "…" --beleg "Boot …" [--belegt-am 2026-09-29T06:00Z]
-python3 $U kreuz --modell NF --a kvonly --b dcp --status "nur Desk" --note "F15"
+python3 $U produkt-ist --id F1 --modell NF --status done+active --wert "…" --beleg "Boot …" [--belegt-am 2026-09-29T06:00Z]
+python3 $U kreuz --modell NF --a kvonly --b dcp --status "only Desk" --note "F15"
 python3 $U matrix --id F24 --modell NF --form "Form A" --bs 1 --tiefe kurz --text code --wert "131,9 tok/s" --boot x177 --beleg "…" [--ungueltig]
 python3 $U zeile-ist --id F23 --zeile 97k --modell NF --status fertig+aktiv --wert "24,18 s" --beleg x175
 python3 $U import-27b [--md /spinning/gpu-arb/docs/features_27b_ist_0929.md]
-python3 $U boot-override --boot <boot_id> --lifecycle "stopped (geplant)" --beleg "…"   # state.json stays untouched
+python3 $U boot-override --boot <boot_id> --lifecycle "stopped (planned)" --beleg "…"   # state.json stays untouched
 python3 $U md --out /spinning/gpu-arb/docs/FEATURES-SOLL-IST-0929.md   # table as Markdown, values from the running rigdash
 ```
 
@@ -359,7 +359,7 @@ launcher as `ORAKEL-ABSTURZ`. The return format of the dry run stays; new are `q
 16-18 s (measured 06.10.), hence the cache per (inventory, form, argv hash, state of the sources); live profiles drift: the profile hash (file and launch input)
 is in every verdict and in the key.
 
-`POST /api/profil/propose` ({basis: {kind, name}, form: flip|tp|dual|single, inventar: "rig" | [{card, pcie}], karte?, ziele?, model_path?, draft_path?}) calls
+`POST /api/profil/propose` ({basis: {kind, name}, form: flip|tp|dual|single, inventory: "rig" | [{card, pcie}], card?, targets?, model_path?, draft_path?}) calls
 `propose()` (AP-C) and returns the server profile `flliper.server/1` (base profile + the values of the proposal, origin `planer`) with origin, verdict and edges per
 value, the verdicts and the request for the bars (`what=phase_bars`, `form` flip|d_only|dual|single, contract `flliper.bar/1` of AP-H2). All four forms:
 `flip`, `tp` and `dual` ask the launcher dry run (oracle); dual (AP-E) additionally carries the dual fit as the verdict "Planner calculation, not hw_fit"

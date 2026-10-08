@@ -44,7 +44,7 @@ def test_ranges_are_consecutive_and_complete(band_env):
     # 512 Experten, jeder vierte resident -> 128 Slots, 32 Baender a 16 Ids
     ids = list(range(0, 512, 4))
     ranges = expert_band_slot_ranges(ids)
-    assert len(ranges) == 32, "jedes Band haelt hier 4 der 16 Ids"
+    assert len(ranges) == 32, "each band holds 4 of the 16 Ids here"
     for band, s0, s1 in ranges:
         assert s1 > s0
         for slot in range(s0, s1):
@@ -74,7 +74,7 @@ def test_bands_are_views_on_same_memory(band_env):
     n = publish_expert_bands(layer, "w13_weight_packed", buf, list(range(0, 512, 4)))
     assert n == 32
     t0 = getattr(layer, m.expert_band_attr_name(0, "w13_weight_packed"))
-    assert t0.data_ptr() == buf.data_ptr(), "ein Band ist ein VIEW, keine Kopie"
+    assert t0.data_ptr() == buf.data_ptr(), "a band is a VIEW, no copy"
     assert t0.shape == (4, 4)
     buf[0, 0] = -1.0
     assert t0[0, 0] == -1.0
@@ -101,7 +101,7 @@ def test_walk_sees_bands_with_their_tag(band_env):
     hit = {
         t.name: t.tag for t in walk_live_tensors(root) if "eband" in t.name
     }
-    assert len(hit) == 32, f"der Walk fand {len(hit)} Baender"
+    assert len(hit) == 32, f"the walk found {len(hit)} bands"
     name = "model.layers.7.mlp.experts.pdflip_eband3_w13_weight_packed"
     assert name in hit, sorted(hit)[:3]
     # Layer 7 -> Chunk 7//3 = 2; Band 3
@@ -119,7 +119,7 @@ def test_without_band_env_same_name_has_chunk_tag(monkeypatch):
     monkeypatch.delenv(m.EXPERT_BAND_ENV_COUNT, raising=False)
     n = "model.layers.7.mlp.experts.pdflip_eband3_w13_weight_packed"
     assert tag_of_parameter_name(n) == "weights_2", (
-        "ohne Bandteilung muss ein Name mit Marker den Chunk-Tag liefern -- "
+        "without band splitting a name with marker must deliver the chunk tag -- "
         "sonst traegt er einen Tag, den die Familie nicht aufzaehlt"
     )
 
@@ -139,10 +139,10 @@ def test_plan_yields_ranges_that_hold(band_env):
     # Die Refusal wuerde hier feuern, waere der Plan unsortiert.
     ranges = expert_band_slot_ranges(plan.resident_ids)
     ids = list(plan.resident_ids)
-    assert ranges, "kein einziges Band -- die Residenz ist leer?"
+    assert ranges, "not a single band -- is the residency empty?"
     for band, s0, s1 in ranges:
         for slot in range(s0, s1):
             assert band * 16 <= ids[slot] < (band + 1) * 16, (band, ids[slot])
     occupied_rows = [s for _, s0, s1 in ranges for s in range(s0, s1)]
-    assert occupied_rows == list(range(len(ids))), "jeder residente Slot gehoert genau einem Band"
-    assert E - 1 in ids and 300 in ids, "die gepinnten bleiben resident"
+    assert occupied_rows == list(range(len(ids))), "each resident slot belongs to exactly one band"
+    assert E - 1 in ids and 300 in ids, "the pinned ones stay resident"

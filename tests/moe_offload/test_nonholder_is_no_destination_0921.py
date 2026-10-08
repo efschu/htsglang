@@ -68,7 +68,7 @@ def test_mixed_fused_stays_exempt():
     i_mixed = src.index("self.shard_axis != wx.MIXED_FUSED")
     i_zero = src.index("any(int(w) == 0 for w in self.tp_widths)")
     assert i_mixed < i_zero, (
-        "die MIXED_FUSED-Ausnahme muss VOR der Null-Breiten-Klausel stehen "
+        "the MIXED_FUSED exception must come BEFORE the zero-width clause "
         "und sie per `and` binden")
 
 

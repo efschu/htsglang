@@ -34,7 +34,7 @@ def test_ple_is_excluded_by_segment_not_by_prefix():
     geladene Tensoren nebeneinander, anders als beim MTP-Baum."""
     assert cc.PLE_SEGMENTS == (".ple.",)
     nm = "model.language_model.layers.1.ple.key_proj.weight_packed"
-    assert not nm.startswith(cc.MTP_TREE_PREFIXES), "kein Praefix-Fall"
+    assert not nm.startswith(cc.MTP_TREE_PREFIXES), "no prefix case"
     assert any(s in nm for s in cc.PLE_SEGMENTS)
 
 
@@ -54,7 +54,7 @@ def test_the_exclusion_is_wired_into_the_widest_layer_reader():
 
     src = inspect.getsource(cc)
     assert "exclude_segments=PLE_SEGMENTS" in src, (
-        "widest_layer_terms muss PLE_SEGMENTS durchreichen")
+        "widest_layer_terms must pass through PLE_SEGMENTS")
 
 
 def test_the_census_honours_both_exclusions_independently():
@@ -66,4 +66,4 @@ def test_the_census_honours_both_exclusions_independently():
     assert "exclude_prefixes" in src and "exclude_segments" in src
     i_pre = src.index("exclude_prefixes and str(name).startswith")
     i_seg = src.index("exclude_segments and any(")
-    assert i_pre < i_seg, "beide Klauseln stehen nacheinander, keine ersetzt die andere"
+    assert i_pre < i_seg, "both clauses stand in sequence, neither replaces the other"

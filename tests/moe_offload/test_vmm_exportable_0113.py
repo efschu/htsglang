@@ -52,7 +52,7 @@ def test_default_aus():
     # Ohne die Env muss die Funktion byte-identisch zu vorher sein.
     i = _UTILS.index(ENV)
     block = _UTILS[i : i + 400]
-    assert "[0] == '1'" in block, "die Env wird nicht auf '1' geprueft"
+    assert "[0] == '1'" in block, "the Env is not checked against '1'"
 
 
 def test_refused_export_does_not_kill_the_boot():

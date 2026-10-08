@@ -30,7 +30,7 @@ def test_row_without_evidence_is_not_read():
     dst = torch.zeros(2, 3)
     g = es.fill_rows(store, dst, {0: 3, 1: 1}, valid=[1])
     assert g == {1: 1}
-    assert torch.equal(dst[0], torch.zeros(3)), "Zeile 3 hatte keinen Beleg"
+    assert torch.equal(dst[0], torch.zeros(3)), "row 3 had no evidence"
     assert torch.equal(dst[1], torch.ones(3))
 
 
@@ -54,7 +54,7 @@ def test_fill_rows_is_counterpart_of_write_rows():
 def test_presplit_calls_adoption_branch():
     src = inspect.getsource(eo.presplit_expert_offload_after_repack)
     assert "_fill_experts_from_store" in src, (
-        "der Presplit holt nichts aus dem Store -- dann liest D die Shards "
+        "the presplit fetches nothing from the store -- then D reads the shards "
         "weiter von Platte, wie in w52 gemessen"
     )
     # UND VOR write_rows / vor dem Kopieren in den GPU-Puffer: `t` muss
@@ -63,8 +63,8 @@ def test_presplit_calls_adoption_branch():
     i_fill = src.index("_fill_experts_from_store")
     i_write = src.index("_es.write_rows(")
     i_buf = src.rindex("buf[:R].copy_")
-    assert i_fill < i_write, "gefuellt wird erst nach dem Schreiben"
-    assert i_fill < i_buf, "gefuellt wird erst nach dem Kopieren auf die Karte"
+    assert i_fill < i_write, "filled only after writing"
+    assert i_fill < i_buf, "filled only after copying to the card"
 
 
 def test_adoption_branch_runs_only_under_placeholders():
@@ -72,7 +72,7 @@ def test_adoption_branch_runs_only_under_placeholders():
     i = src.index("_fill_experts_from_store")
     before_text = src[max(0, i - 400):i]
     assert "weights_are_placeholder" in before_text, (
-        "ohne diesen Riegel wuerde auch ein normal geladener Rang seine "
+        "without this guard, even a normally loaded rank would its "
         "echten Bytes mit Store-Zeilen ueberschreiben"
     )
 
@@ -82,7 +82,7 @@ def test_without_map_all_reported_missing(monkeypatch):
     g, f = eo._fill_experts_from_store(
         torch.zeros(2, 3), torch.zeros(4, 3), "/nx", "L0", "w", 0, 4, True
     )
-    assert (g, f) == (0, 4), "ohne Karte darf nichts als gefuellt gelten"
+    assert (g, f) == (0, 4), "without a card, nothing may count as filled"
 
 
 # --- DIE REIHENFOLGE, die #108 falsch hatte ------------------------------
@@ -102,7 +102,7 @@ def test_placeholder_guard_is_before_the_loader():
     i_arm = src.index("arm_placeholder")
     i_load = src.index("self.loader.load_model(")
     assert i_arm < i_load, (
-        "arm_placeholder steht hinter dem Loader -- der Presplit sieht den "
+        "arm_placeholder is behind the loader -- the presplit sees the "
         "Platzhalter-Zustand dann nicht"
     )
     # und die Bedingung muss das load_format pruefen, nicht nur das Flag

@@ -1027,7 +1027,7 @@ def row_card_cost_from_boots(
         h = headroom_by_chunk_index(text)
         if obs["chunk"].get(0) != reference.chunk or bool(obs["draft_on_p"][0]) != reference.draft_on_p:
             raise ValueError(
-                "Ueber-Boot %s: Chunk %s / Draft %s, die Referenz %s hat %d / %s"
+                "Over-Boot %s: Chunk %s / Draft %s, the reference %s has %d / %s"
                 % (name, obs["chunk"].get(0), obs["draft_on_p"][0], reference.source,
                    reference.chunk, reference.draft_on_p)
             )
@@ -1141,9 +1141,9 @@ def p_card_reference_from_logs(
             co = co_tenant_at(dl[name], s, p0.t) if with_co else None
             if with_co and co is None:
                 raise ValueError(
-                    "P-Karten-Referenz: %s Stufe %d -- kein weights-Release des D-Rangs %d "
+                    "P-cards-reference: %s stage %d -- no weights-release of D-rank %d "
                     "vor dem Chunk-0-Punkt (%s) im D-Log; der Mitbewohner ist ungemessen"
-                    % (name, s, s, p0.t or "ohne Zeitstempel")
+                    % (name, s, s, p0.t or "without timestamp")
                 )
             key = h0 + (co or 0.0)
             if s not in best or key < best[s][0] + (best[s][4] or 0.0):
@@ -1162,7 +1162,7 @@ def p_card_reference_from_logs(
     missing = [s for s in range(n) if s not in best or s not in growth]
     if missing:
         raise ValueError(
-            "P-Karten-Referenz unvollstaendig in %s: Stufe %s ohne Chunk-0-Punkt, ohne "
+            "P-cards-reference incomplete in %s: stage %s without Chunk-0 point, without "
             "spaeteren Punkt (Wachstum), Pufferzeile, KV-Zelle oder Chunk"
             % ([b[0] for b in boots], missing)
         )
@@ -1469,7 +1469,7 @@ def solve_p_card(
         )
     if len(fractions) != n or len(lru_rows) != n or len(kv_mib) != n:
         raise ValueError(
-            "P-Karte: %d Stufen, aber %d Fractions / %d LRU / %d KV"
+            "P-card: %d stages, but %d Fractions / %d LRU / %d KV"
             % (n, len(fractions), len(lru_rows), len(kv_mib))
         )
     prompt = int(prompt_tokens) if int(prompt_tokens) > 0 else int(reference.longest_prompt_tokens)

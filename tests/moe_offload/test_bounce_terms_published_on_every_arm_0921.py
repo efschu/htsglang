@@ -47,9 +47,9 @@ def test_the_terms_now_hang_on_the_exchange_arm_not_on_the_host_pin():
     i_armed = src.index("_xchg_armed = ")
     i_pub = src.index("bounce_terms_for_ranks, _widest_line")
     i_pin = src.find("xchg_bounce_arm_pins_host(ns.pdflip_weight_source", i_armed)
-    assert i_armed < i_pub, "die Terme muessen hinter dem Austausch-Arm stehen"
+    assert i_armed < i_pub, "the terms must stand behind the exchange arm"
     assert i_pin == -1 or i_pin > i_pub, (
-        "der Host-Pin darf die Publikation nicht mehr torwaechtern")
+        "the Host-Pin must no longer watchdog the publication")
 
 
 def test_a_ring_boot_still_publishes_nothing():
@@ -73,6 +73,6 @@ def test_the_lane_budget_is_not_the_front_bound():
     sig = inspect.signature(wxb.run_sequential_units)
     budget = sig.parameters["budget_s"].default
     assert budget == 120.0, (
-        f"Lane-Budget {budget}s -- fnFL2w3 mass 120,0 s gegen einen "
+        f"Lane-Budget {budget}s -- fnFL2w3 mass 120,0 s against a "
         f"Front-Bound von ebenfalls 120,0 s (STALL bei elapsed=129,2 s). "
         f"Aendert sich eine der beiden Zahlen, gehoert die andere geprueft.")

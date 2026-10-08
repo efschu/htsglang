@@ -76,7 +76,7 @@ class FakeGpuq:
 
     def __call__(self, method, url, body=None, headers=None, timeout=10.0):
         if self.down:
-            raise hwprofil.GpuqUnavailable("gpuq nicht erreichbar (stub)")
+            raise hwprofil.GpuqUnavailable("gpuq not reachable (stub)")
         path = url.split("8770", 1)[1]
         self.log.append((method, path, body, dict(headers or {})))
         if method == "GET" and path == "/api/v1/cards":

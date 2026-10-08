@@ -73,13 +73,13 @@ def main(argv=None):
     ap.add_argument("--root", default=MC)
     a = ap.parse_args(argv)
     est = {}
-    print("## A. Gewichtsbytes aus den Köpfen gegen die Dateien auf der Platte\n")
-    print("| Modell | Format | Tensorsumme (Index) | + Köpfe | Shards auf Platte | Abweichung | stat (Kartenplaner-Record) |")
+    print("## A. Weight bytes from the heads against the files on the disk\n")
+    print("| Model | Format | Tensor sum (Index) | + Heads | Shards on disk | Deviation | stat (card planner record) |")
     print("|---|---|---:|---:|---:|---:|---|")
     for label, d, _ in MODELS:
         p = load(a.root, d)
         if not p:
-            print("| %s | nicht gefunden | | | | | |" % label)
+            print("| %s | not found | | | | | |" % label)
             continue
         e = MP.estimate(p)
         est[d] = e
@@ -92,10 +92,10 @@ def main(argv=None):
         st = STAT_RECORDED.get(d)
         print("| %s | %s | %d | %d | %s | %s | %s |" % (label, e["format"]["v"], tot, hdr, disk, pct(tot + hdr, disk) if disk else "n/a",
                                                        ("%d (%s)" % (st, pct(tot + hdr, st)) if st else "-")))
-    print("\nGGUF: der Kopf trägt Metadaten (Tokenizer) vor den Tensordaten; die Abweichung dort ist dieser Kopf (kein Gewicht).\n")
+    print("\nGGUF: the head carries metadata (Tokenizer) before the tensor data; the deviation there is this head (no weight).\n")
 
-    print("## B. Nur Config + Quantisierung (kein Tensorverzeichnis) gegen die Köpfe\n")
-    print("| Modell | Format (Config) | Formel | Köpfe | Abweichung | Formel: Layer ohne Experten / Experten / Einbettung+lm_head / Sicht / MTP |")
+    print("## B. Config + Quantization only (no tensor directory) against the heads\n")
+    print("| Model | Format (Config) | Formula | Heads | Deviation | Formula: Layers without experts / experts / Embedding+lm_head / View / MTP |")
     print("|---|---|---:|---:|---:|---|")
     for label, d, _ in MODELS:
         if d not in est:
@@ -106,10 +106,10 @@ def main(argv=None):
         print("| %s | %s | %d | %d | %s | %.2f / %.2f / %.2f / %.2f / %.2f GiB |" % (
             label, cw["format"], cw["total_bytes"], real, pct(cw["total_bytes"], real), sum(cw["layer_bytes"]) / GIB,
             sum(cw["layer_expert_bytes"]) / GIB, (cw["embed_bytes"] + cw["lm_head_bytes"]) / GIB, cw["visual_bytes"] / GIB, cw["mtp_bytes"] / GIB))
-    print("\nGGUF hat keine Quantisierungsangabe in der Config (UD-Mix je Tensor): nur der Kopf bepreist es.\n")
+    print("\nGGUF has no quantization spec in the Config (UD-Mix per tensor): only the head prices it.\n")
 
     print("## C. Stufensummen gegen `Load weight end ... mem usage` (GiB)\n")
-    print("| Lauf | Stufe | Schätzung | Boot-Log | Abweichung |")
+    print("| Run | Stage | Estimate | Boot-Log | Deviation |")
     print("|---|---|---:|---:|---:|")
     for label, d, cut, rows, meas, src in BOOT_STAGES:
         if d not in est:
@@ -129,8 +129,8 @@ def main(argv=None):
             print("| %s | Draft | %.2f | 2.14 | %s |" % (label, dr["total_bytes"]["v"] / GIB, pct(dr["total_bytes"]["v"] / GIB, 2.14)))
     print()
 
-    print("## D. Geometrieterme gegen Records und Metall\n")
-    print("| Größe | Schätzung | Referenz | Abweichung | Quelle der Referenz |")
+    print("## D. Geometry terms against records and metal\n")
+    print("| Size | Estimate | Reference | Deviation | Source of the reference |")
     print("|---|---:|---:|---:|---|")
     e27 = est.get("Qwen3.8-27B-INT8-gdncov-vocabembed")
     enf = est.get("Qwen3.8-Flash-Next-NVFP4-nvidia")
@@ -140,21 +140,21 @@ def main(argv=None):
         v = e27["kv"]["variants"]["fp8_e4m3"]["payload_per_token_all_attn_layers"]["v"]
         print("| 27B KV-Seitenbytes je Token (16 Attn-Layer, fp8) | %d B | %d B | %s | STORE_CENSUS_KV_PAGE_BYTES (weg2sb5g) |" % (v, rec27["STORE_CENSUS_KV_PAGE_BYTES"], pct(v, rec27["STORE_CENSUS_KV_PAGE_BYTES"])))
         m = e27["state"]["variants_mib"]["bfloat16"]
-        print("| 27B Mamba-Zustand je Linear-Layer und Slot (ssm bf16) | %.4f MiB | %.4f MiB | %s | P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT (weg2sb5f+weg2rg6) |" % (m, rec27["P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"], pct(m, rec27["P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"])))
+        print("| 27B Mamba state per Linear-Layer and Slot (ssm bf16) | %.4f MiB | %.4f MiB | %s | P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT (weg2sb5f+weg2rg6) |" % (m, rec27["P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"], pct(m, rec27["P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"])))
         r = e27["activation"]["extend_rate_mib_per_row"]["v"]
-        print("| 27B Extend-Rate je Zeile (Startwert) | %.4f MiB | %.4f MiB (gemessenes Maximum 0,2690) | %s | D_EXTEND_CAP_PER_ROW_MIB; der Start ist absichtlich konservativ (Q-694b) |" % (r, rec27["D_EXTEND_CAP_PER_ROW_MIB"][0], pct(r, rec27["D_EXTEND_CAP_PER_ROW_MIB"][0])))
+        print("| 27B Extend-Rate per row (start value) | %.4f MiB | %.4f MiB (measured maximum 0,2690) | %s | D_EXTEND_CAP_PER_ROW_MIB; the start is intentionally conservative (Q-694b) |" % (r, rec27["D_EXTEND_CAP_PER_ROW_MIB"][0], pct(r, rec27["D_EXTEND_CAP_PER_ROW_MIB"][0])))
     if enf:
         c = enf["kv"]["variants"]["fp8_e4m3"]["cell_bytes_per_attn_layer_token"]["v"]
-        print("| NF KV-Zelle je Attn-Layer und Token (fp8) | %d B | 1088 B | %s | fnFL2w123, drei emittierte Zellen 8704/4352/3264 |" % (c, pct(c, 1088)))
+        print("| NF KV cell per Attn-Layer and Token (fp8) | %d B | 1088 B | %s | fnFL2w123, three emitted cells 8704/4352/3264 |" % (c, pct(c, 1088)))
         m = enf["state"]["variants_mib"]["bfloat16"]
-        print("| NF Mamba-Zustand je Linear-Layer und Slot (ssm bf16) | %.4f MiB | %.4f MiB | %s | P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT (dkrnfh91...) |" % (m, recnf["P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"], pct(m, recnf["P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"])))
+        print("| NF Mamba state per Linear-Layer and Slot (ssm bf16) | %.4f MiB | %.4f MiB | %s | P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT (dkrnfh91...) |" % (m, recnf["P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"], pct(m, recnf["P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"])))
         r = enf["activation"]["extend_rate_mib_per_row"]["v"]
-        print("| NF Extend-Rate je Zeile (Startwert) | %.4f MiB | %.4f MiB (reservierter Zuwachs, nicht gleiche Größe) | %s | D_EXTEND_GROWTH_PER_ROW_MIB rc12g |" % (r, recnf["D_EXTEND_GROWTH_PER_ROW_MIB"][0], pct(r, recnf["D_EXTEND_GROWTH_PER_ROW_MIB"][0])))
+        print("| NF Extend-Rate per row (start value) | %.4f MiB | %.4f MiB (reserved growth, not same size) | %s | D_EXTEND_GROWTH_PER_ROW_MIB rc12g |" % (r, recnf["D_EXTEND_GROWTH_PER_ROW_MIB"][0], pct(r, recnf["D_EXTEND_GROWTH_PER_ROW_MIB"][0])))
         n = enf["experts"]
         print("| NF Experten (n, top_k) | %d, %d | 512, 10 | exakt | Boot-Log `512 Experten`, ServerArgs |" % (n["n"]["v"], n["top_k"]["v"]))
     print()
 
-    print("## E. Registry-Zeile aus dem Schätzprofil gegen die Handzeile\n")
+    print("## E. Registry row from the estimate profile against the hand row\n")
     for label, d, rid in MODELS:
         if not rid or d not in est:
             continue
@@ -164,23 +164,23 @@ def main(argv=None):
         for r in rows:
             by.setdefault(r["class"], []).append(r)
         print("### %s -> `%s` (%d Felder)\n" % (label, rid, len(rows)))
-        print("| Klasse | gleich | gleich im Modellteil, Rest weicht ab | abweichend |")
+        print("| Class | equal | equal in the model part, rest deviates | deviating |")
         print("|---|---:|---:|---:|")
         for cls in ("fact", "name", "experts", "format", "policy"):
             rs = by.get(cls, [])
             print("| %s | %d | %d | %d |" % (cls, sum(r["equal"] and not r["partial"] for r in rs), sum(r["equal"] and r["partial"] for r in rs),
                                           sum(not r["equal"] for r in rs)))
         print()
-        print("| Feld | Klasse | erzeugt | Handzeile | Grund |")
+        print("| Field | Class | generated | Hand row | Reason |")
         print("|---|---|---|---|---|")
         for r in rows:
             if r["class"] in ("fact", "name"):
                 print("| %s | %s | %s | %s | gleich |" % (r["field"], r["class"], json.dumps(r["derived"]), json.dumps(r["hand"])))
             elif r["class"] in ("experts", "format"):
-                print("| %s | %s | store/swap bzw. Name+Pfad gleich | %s | %s |" % (
+                print("| %s | %s | store/swap or Name+Path equal | %s | %s |" % (
                     r["field"], r["class"], "Rest weicht ab" if r["partial"] else "gleich", r["reason"] or "gleich"))
         pol = [r for r in rows if r["class"] == "policy" and not r["equal"]]
-        print("\nPolicy-Felder, in denen die Handzeile vom konservativen Standard abweicht (%d):\n" % len(pol))
+        print("\nPolicy fields in which the hand row deviates from the conservative default (%d):\n" % len(pol))
         for r in pol:
             print("* `%s`: erzeugt %s, Hand %s -- %s" % (r["field"], json.dumps(r["derived"])[:50], json.dumps(r["hand"])[:60], r["reason"]))
         print()

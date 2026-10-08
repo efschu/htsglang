@@ -49,8 +49,8 @@ def test_a_descriptor_without_a_holder_is_refused(capsys):
     msg = str(ei.value)
     assert "W82" in msg
     assert "dst_rank" in msg
-    assert "model.layers.29.x.weight" in msg, "die Verweigerung nennt den Tensor"
-    assert "c1/c2/p3" in msg, "und den gemessenen Fall, der sie erzwungen hat"
+    assert "model.layers.29.x.weight" in msg, "the rejection names the tensor"
+    assert "c1/c2/p3" in msg, "and the measured case that forced it"
 
 
 def test_the_refusal_names_the_card_it_would_have_taken():

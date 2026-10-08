@@ -461,14 +461,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--min-tokens", type=int, default=3000)
     ap.add_argument("--max-tokens-prompt", type=int, default=8000)
     ap.add_argument("--answer-tokens", type=int, default=48,
-                    help="max_tokens je Antwort; der Code steht vorn, D dekodiert bs1 nacheinander")
+                    help="max_tokens per response; the code stands first, D decodes bs1 one by one")
     ap.add_argument("--seed", type=int, default=37)
-    ap.add_argument("--nonce", default="", help="Zusatz in der Kopfzeile gegen Store-Treffer aus Vorlaeufen")
+    ap.add_argument("--nonce", default="", help="Addition in the header against store hits from previous runs")
     ap.add_argument("--mode", choices=("burst", "serial"), default="burst")
     ap.add_argument("--p-log", required=True, help="Log von group P (boot_weg2_<tag>_..P.log)")
-    ap.add_argument("--front-log", default=None, help="Default: aus --p-log abgeleitet")
+    ap.add_argument("--front-log", default=None, help="Default: derived from --p-log")
     ap.add_argument("--timeout", type=float, default=1800.0)
-    ap.add_argument("--settle-s", type=float, default=2.0, help="Wartezeit fuer die letzten Logzeilen")
+    ap.add_argument("--settle-s", type=float, default=2.0, help="Wait time for the last log rows")
     ap.add_argument("--json-out", default=None)
     a = ap.parse_args(argv)
 

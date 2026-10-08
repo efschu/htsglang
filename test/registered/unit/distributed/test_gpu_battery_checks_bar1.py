@@ -119,7 +119,7 @@ def run_check(check: str, step_dir) -> tuple:
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
     assert (
         len(lines) == 1
-    ), f"{check} gab {len(lines)} Zeilen aus, der Executor liest genau eine: {lines}"
+    ), f"{check} emitted {len(lines)} rows, the Executor reads exactly one: {lines}"
     return proc.returncode, lines[0]
 
 
@@ -1303,7 +1303,7 @@ class TestSmokeContractWithTheStepScript:
 
         text = self._commands()
         assert f'\\"text\\": \\"{SMOKE_PROMPT}\\"' in text, (
-            "der Fortsetzungs-Prompt in s11_bar1_e2e.sh und SMOKE_PROMPT "
+            "the continuation prompt in s11_bar1_e2e.sh and SMOKE_PROMPT "
             "sind auseinandergelaufen"
         )
         # Und die Zaehlung setzt genau dahinter an.
@@ -1321,7 +1321,7 @@ class TestSmokeContractWithTheStepScript:
 
         text = self._commands()
         hits = re.search(r'max_new_tokens\\":\s*(\d+)', text)
-        assert hits, "kein max_new_tokens im Smoke-Request"
+        assert hits, "no max_new_tokens in the smoke request"
         assert int(hits.group(1)) >= 512
 
 

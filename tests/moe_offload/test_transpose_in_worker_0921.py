@@ -190,7 +190,7 @@ def test_the_loader_applies_it_in_the_worker():
     # Schleife oben auch fuer ihn, waere es zweimal.
     ps = inspect.getsource(wu.pread_safetensors_file)
     assert ps.count("post_load") >= 2, (
-        "ein Zweig von pread_safetensors_file wendet post_load nicht an -- "
+        "a branch of pread_safetensors_file does not apply post_load -- "
         "genau daran starb fnFL2w59"
     )
 

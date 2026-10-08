@@ -33,7 +33,7 @@ def test_112_repack_skips_placeholders():
     i_gate = src.index("weights_are_placeholder")
     i_repack = src.index("gptq_marlin_moe_repack(")
     assert i_gate < i_repack, (
-        "der Repack steht vor seinem Riegel -- dann indiziert er wieder mit "
+        "the repack comes before its guard -- then it indexes again with "
         "Zufallswerten und nimmt den CUDA-Kontext mit"
     )
 
@@ -59,7 +59,7 @@ def test_111_no_staging_buffer_no_per_expert_lookup():
     # BOOTZEIT 3 (29.09.): die Schleife laeuft ueber `rows` oder alle
     # Experten (FLLIPER_MOE_REPACK_SKIP_VETOED) -- dieselbe Schleife.
     i_loop = code.index("for e in (range(num_experts) if rows is None else rows)")
-    assert i_mod < i_loop, "der Modul-Lookup steht noch in der Schleife"
+    assert i_mod < i_loop, "the module lookup is still in the loop"
     assert code.count("_jit_gptq_marlin_repack_module()") == 1
     # Der Kernel schreibt DIREKT in output[e] -- keine Zuweisung aus einem
     # Rueckgabewert, also keine Allokation und keine Kopie je Experte.

@@ -103,7 +103,7 @@ class TestMeasuredValuesReachTheRows(unittest.TestCase):
     @staticmethod
     def _row(html, label):
         m = re.search(r"<tr><td>" + re.escape(label) + r"</td>(.*?)</tr>", html, re.S)
-        assert m, "Zeile fehlt: " + label
+        assert m, "Row missing: " + label
         return m.group(1).split("</td>")[:-1]
 
     def test_every_asked_row_is_filled_with_a_number_and_the_gem_mark(self):

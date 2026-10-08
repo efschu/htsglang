@@ -20,7 +20,7 @@ def test_109_path_finds_it():
     import inspect
 
     src = inspect.getsource(eo.presplit_expert_offload_after_repack)
-    assert "logger." in src, "der Pfad loggt nicht mehr -- Test veraltet?"
+    assert "logger." in src, "the path no longer logs -- test outdated?"
     # keine lokale Bindung in dieser Funktion: dann MUSS das Modul sie haben
     if "logger = " not in src:
         assert isinstance(eo.logger, logging.Logger)

@@ -245,7 +245,7 @@ _moe_offload_fetch_step` — enabled on exactly that one module via
 
 **Verdict rule**: `43 × (break + rendezvous + planning + publish)` against the
 launch-overhead saving the graph buys. Report both numbers and the ratio.
-**No kill threshold** — Aufwand/Ertrag decides, and a small win that is cheap
+**No kill threshold** — effort/yield decides, and a small win that is cheap
 to keep is still a win. Do not quote F1's 5.3–8.4× (a *ceiling* measured on
 Qwen3.6-35B-A3B). The 43 rendezvous/step are irreducible on this route
 (DESIGN_462 §4); their removal is not an achievable optimisation.
