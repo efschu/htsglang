@@ -739,3 +739,25 @@ Dockerfile lines behave exactly as before (dash -n ok, simulation above); its ma
 4. Quiet-box dry-run that reaches `build_env`; editable install + Rust `_core` (§7); pyproject/postpare.
 5. Profile/arm conversion (2b), NF monitor list (8.14), the "left on purpose" rows above if wanted; kernel lists may stay
    in the old spelling (mapped). First real image of a renamed tree: all three prebuild stages run (expected, paths moved).
+
+## 8.16 F0-D, 27B line: what the pass leaves wrong, and how it was closed (08.10.2026, fix round 1)
+
+Two classes were found by review after the kit run; neither is a naming slip of the engine, both are consequences of its rules.
+
+1. **Persisted documents keep their spelling, the code reads both.** `ident_fix` translated the German keys and enumerated values that
+   `rigdash/features.py` / `features_update.py` read from `/spinning/gpu-arb/docs/features.json` (`titel schalter an_wert wert grund beleg
+   erreicht erreicht_grund einheit`, values `unbelegt`, `wert` under `status`/`art`) and the vocabulary `rigmon/hardware_profile.py` checks in
+   `/var/lib/flliper/hardware.json` (`Datenblatt`, `borrowed-unbelegt`).  The files on the rig carry the old words (features.json: 118 `an_wert`,
+   125 `titel`, 222 `beleg`; hardware.json: 6 `Datenblatt` sources) and are read by tools outside the tree (`devtools/l15_speed_monitor.py`
+   reads `status == "wert"` and `"wert"`).  Rule: **the file on disk is a frozen contract**.  features.json: `features.normalize_doc`
+   (disk -> memory, either spelling, idempotent) on every read, `features.persisted_doc` (memory -> disk, the exact inverse) on the one
+   write path (`features_update._save`); the live file validates with 0 problems and `persisted_doc(normalize_doc(live)) == live`.
+   hardware.json: `hardware_profile.normalize_profile` in `load_profile` and `validate` (exact string values only); a profile captured
+   later is written with the new words.  Two earlier cases of the same class stayed as kept ids (`weg2-footprint/1`, `weg2-x-curves/1`,
+   `weg2.form_measures/N`: kit data 3).  Not audited, no file on the box: measured records under `<evidence>/records/weg2/`.
+2. **Launcher dump goldens (`fixtures/planer_1006/golden/plan_*.txt`) are rewritten by what the kit did to the CODE, not by the name rule.**
+   The name rule (`planer_fixture_sync.py`) is right for the profile snapshots and launch-input json (they are input), wrong for the dump
+   goldens: the launcher prints text whose wording `ident_fix` and the translation changed, and copies other text out of evidence files that
+   must keep its old spelling.  `planer_golden_regen.py` takes the stable lines (equal in the old golden and the old dump at the reference
+   state S0 = empty `$HOME`) from the renamed dump and rewrites the live-box lines with the kit's fragment table (string constants of the old
+   modules paired with the renamed ones by AST position); the method is graded on the stable lines (see the tool's docstring).

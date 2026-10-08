@@ -273,3 +273,21 @@ def test_ident_collision_ok_file_is_well_formed_and_scope_separate():
                 if isinstance(s, fn):
                     n = names(s)
                     assert not (w in n and tgt in n), (path, w, tgt, s.name)
+
+
+def test_dump_goldens_carry_what_the_renamed_launcher_prints():
+    """F0-D fix round 1: the launcher dump goldens (fixtures/planer_1006/golden/plan_*.txt) are made by planer_golden_regen.py from the
+    renamed launcher's own dump (stable lines) and the kit's rewrite of the code (live-box lines), not by the name rule alone.  A name
+    rule leaves the old marker out of the picture only partly: the translated wording and the recomputed plan_id of the pass would be
+    missing.  The words of the old name and the German wording are built from pieces (this file passes the mechanical rename unchanged)."""
+    gdir = os.path.join(HERE, "fixtures", "planer_1006", "golden")
+    texts = {n: open(os.path.join(gdir, n), encoding="utf-8").read() for n in os.listdir(gdir) if n.startswith("plan_") and n.endswith(".txt")}
+    assert len(texts) == 4, sorted(texts)
+    old_marker = "WE" + "G2-LAUNCH"
+    for name, t in texts.items():
+        assert old_marker not in t, name
+        assert "PDFLIP-LAUNCH" in t, name
+    nf = texts["plan_nf_abl_n3.txt"]
+    assert "Wellenboden " + _rev("thcuarb") + " Scratch" not in nf          # the translated wording of the pass ...
+    assert "Wellenboden requires Scratch" in nf
+    assert "plan_id=sha256:" + "13383ae12642" not in nf                       # ... and the plan_id the renamed launcher computes

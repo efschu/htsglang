@@ -253,5 +253,65 @@ class TestPersistence(CustomTestCase):
         self.assertEqual(hp.persist_path({hp.PERSIST_ENV: "/data/hw.json"}), "/data/hw.json")
 
 
+class TestLegacyVocabulary(CustomTestCase):
+    """F0-D fix round 1: a profile persisted BEFORE the rename spells the source "Datenblatt" (and "borrowed-unbelegt"); the renamed
+    module checks "Datasheet".  The file is read in either spelling and is never rewritten by the reader."""
+
+    LIVE = "/var/lib/flliper/hardware.json"
+
+    def _legacy(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        doc = hp.build(cache_dir=d.name, nvml=fx.nvml(), now=fx.NOW)        # no probe file: the SM counts are the data sheet's
+        text = json.dumps(doc)
+        assert hp.SRC_DATASHEET in text
+        return json.loads(text.replace(hp.SRC_DATASHEET, "Datenblatt")), d
+
+    def test_validate_names_the_legacy_source_not_as_unknown(self):
+        doc = {"cards": [{"sm_count": {"v": 68, "src": "Datenblatt", "unit": "SM"}}], "links": []}
+        self.assertEqual(hp.validate(doc), [])
+        doc["cards"][0]["sm_count"]["src"] = "Datenblat"
+        self.assertTrue(any("unknown source" in x for x in hp.validate(doc)))
+
+    def test_load_profile_returns_the_translated_vocabulary_and_leaves_the_file_alone(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = os.path.join(t, "hw.json")
+            doc = {"schema": hp.SCHEMA, "cards": [{"mem_gbs": {"nominal": {"v": 760, "src": "Datenblatt"}},
+                                                    "catalog": {"origin_fields": {"pcie": "Datenblatt", "mem_bw": "borrowed-unbelegt"}}}],
+                   "src_vocab": ["gemessen", "NVML", "Datenblatt", "geschätzt", "nicht gemessen"]}
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            before = open(p, "rb").read()
+            got, problem = hp.load_profile(p)
+            self.assertIsNone(problem)
+            self.assertEqual(got["cards"][0]["mem_gbs"]["nominal"]["src"], hp.SRC_DATASHEET)
+            self.assertEqual(got["cards"][0]["catalog"]["origin_fields"], {"pcie": "Datasheet", "mem_bw": "borrowed-unverified"})
+            self.assertEqual(got["src_vocab"][2], hp.SRC_DATASHEET)
+            self.assertEqual(open(p, "rb").read(), before)
+            self.assertEqual(hp.validate(got), [])
+
+    def test_prose_is_never_translated(self):
+        got = hp.normalize_profile({"note": "Datenblatt value of the catalog", "x": ["Datenblatt"]})
+        self.assertEqual(got, {"note": "Datenblatt value of the catalog", "x": ["Datasheet"]})
+
+    def test_capture_of_a_legacy_file_is_vorhanden_and_valid(self):
+        legacy, d = self._legacy()
+        with tempfile.TemporaryDirectory() as t:
+            p = os.path.join(t, "hw.json")
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(legacy, fh)
+            r = hp.capture(p, live=hp.build(cache_dir=d.name, nvml=fx.nvml(), now=fx.NOW), now=fx.NOW)
+            self.assertEqual(r["state"], "vorhanden")
+            self.assertEqual(hp.validate(r["persisted"]), [])
+
+    @unittest.skipUnless(os.path.exists(LIVE), "the rig's persisted hardware.json is not on this box")
+    def test_the_rigs_persisted_file_validates(self):
+        got, problem = hp.load_profile(self.LIVE)
+        self.assertIsNone(problem)
+        self.assertEqual(hp.validate(got), [])
+        with open(self.LIVE, encoding="utf-8") as fh:
+            self.assertEqual(hp.validate(json.load(fh)), [])        # the raw document too
+
+
 if __name__ == "__main__":
     unittest.main()

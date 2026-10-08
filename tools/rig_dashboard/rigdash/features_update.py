@@ -46,7 +46,7 @@ def _load(path: str) -> dict:
         return {"schema": "rigdash.features/1", "features": []}
     if not isinstance(d, dict) or not isinstance(d.get("features"), list):
         raise SystemExit("%s: no object with array 'features'" % path)
-    return d
+    return features.normalize_doc(d)       # the file keeps its legacy spelling on disk; in memory the translated one
 
 
 def _save(path: str, d: dict):
@@ -56,7 +56,7 @@ def _save(path: str, d: dict):
     d["updated_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     tmp = "%s.tmp.%d" % (path, os.getpid())
     with open(tmp, "w") as fh:
-        json.dump(d, fh, ensure_ascii=False, indent=1)
+        json.dump(features.persisted_doc(d), fh, ensure_ascii=False, indent=1)
         fh.write("\n")
     os.replace(tmp, path)
 

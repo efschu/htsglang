@@ -51,6 +51,45 @@ OFF_VALUES = ("", "0", "false", "off", "no", "none", "aus")
 GIT_TIMEOUT_S = 60
 
 
+# --------------------------------------------------------------------------- persisted spelling (F0-D fix round 1)
+# features.json is a PERSISTED document, kept by the operators, written by features_update.py and read by tools outside this
+# tree (devtools/l15_speed_monitor.py reads status == "wert" and the cell key "wert").  The rename pass (ident_fix) translated
+# the German keys and enumerated values this module reads; the file on disk was not and must not be rewritten by the pass.  So the
+# file keeps its spelling (schema rigdash.features/1, the legacy words below) and this module works on the translated spelling in
+# memory: ``normalize_doc`` (disk -> memory, reads either spelling, idempotent) on every read, ``persisted_doc`` (memory -> disk)
+# on the one write path (features_update._save).  The two maps are the exact string literals the renamed code reads instead of the
+# old ones (diff of this file and of features_update.py between the 86ff356d0d base and the renamed tree).
+LEGACY_KEYS = {"titel": "title", "schalter": "switch", "an_wert": "an_value", "wert": "value", "grund": "reason",
+               "beleg": "evidence", "erreicht": "reached", "erreicht_grund": "reached_reason", "einheit": "unit"}
+#: enumerated VALUES, only under the keys "status" (product / cross-table / matrix cells) and "art" (gains)
+LEGACY_VALUES = {"unbelegt": "unverified", "wert": "value"}
+_VALUE_KEYS = ("status", "art")
+
+
+def _convert_doc(o, keys: dict, values: dict):
+    if isinstance(o, dict):
+        out = {}
+        for k, v in o.items():
+            nk = keys.get(k, k)
+            if nk != k and nk in o:             # both spellings in one object: the one already in the target spelling wins
+                continue
+            out[nk] = values.get(v, v) if (nk in _VALUE_KEYS and isinstance(v, str)) else _convert_doc(v, keys, values)
+        return out
+    if isinstance(o, list):
+        return [_convert_doc(x, keys, values) for x in o]
+    return o
+
+
+def normalize_doc(doc):
+    """features.json as read from disk (legacy or already translated spelling) -> the spelling this module works on."""
+    return _convert_doc(doc, LEGACY_KEYS, LEGACY_VALUES)
+
+
+def persisted_doc(doc):
+    """The in-memory document -> the spelling of the file on disk (the inverse of ``normalize_doc``)."""
+    return _convert_doc(doc, {v: k for k, v in LEGACY_KEYS.items()}, {v: k for k, v in LEGACY_VALUES.items()})
+
+
 # --------------------------------------------------------------------------- file
 
 class FeatureFile:
@@ -76,7 +115,7 @@ class FeatureFile:
         if sig != self._sig:
             try:
                 with open(self.path) as fh:
-                    d = json.load(fh)
+                    d = normalize_doc(json.load(fh))
                 feats = d.get("features") if isinstance(d, dict) else None
                 if not isinstance(feats, list):
                     raise ValueError("no array 'features'")
@@ -779,6 +818,7 @@ def attach_current(fv: dict, live_boots: list, gpus: Optional[dict]) -> dict:
 
 
 def validate_doc(doc: dict) -> list:
+    doc = normalize_doc(doc)
     feats = doc.get("features") or []
     return validate(feats) + validate_produkt(doc.get("produkt") or [],
                                               {f.get("id") for f in feats if isinstance(f, dict)})
