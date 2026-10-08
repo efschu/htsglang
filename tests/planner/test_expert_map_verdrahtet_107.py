@@ -29,10 +29,10 @@ def test_other_ranks_count_too():
     # haelt bei FR_D 0.006 ueber 192 Experten ZWEI, nicht einen -- die alte
     # Kartenformel schrieb 1 auf und erklaerte damit eine residente Id fuer
     # kalt. Das ist die Zahl aus Aufgabe #79, hier an der Quelle.
-    assert [len(x) for x in res_d] == [2, 79, 80], "die 3080er halten 79+80"
+    assert [len(x) for x in res_d] == [2, 79, 80], "the 3080s hold 79+80"
     # Ohne Karte bleibt im Schnitt aller Stufen/Raenge genau EINE Id -> 511
     # Store-Slots. Mit Karte sind es weniger, weil 79+80 mitzaehlen.
-    assert k["slots"] < 511, f"slots={k['slots']} -- die Karte spart nichts"
+    assert k["slots"] < 511, f"slots={k['slots']} -- the card saves nothing"
     # 3 Plaetze weniger als vor #160: mehr resident heisst weniger kalt.
     assert k["slots"] == 351
 
@@ -85,9 +85,9 @@ def test_publish_writes_file_and_reader_finds_it(tmp_path, monkeypatch):
     es._EXPERT_MAP_CACHE.clear()
     monkeypatch.setenv("FLLIPER_MOE_EXPERT_MAP", file_path)
     emap = es.expert_map()
-    assert emap is not None, "der Leser findet die Datei nicht"
-    assert em.slot_of(emap, "D", 200) is None, "Id 200 ist auf D-Rang 1 resident"
-    assert em.slot_of(emap, "D", 500) is not None, "Id 500 haelt niemand"
+    assert emap is not None, "the reader does not find the file"
+    assert em.slot_of(emap, "D", 200) is None, "Id 200 is resident on D-rank 1"
+    assert em.slot_of(emap, "D", 500) is not None, "no one holds Id 500"
 
 
 def test_publish_writes_nothing_without_vectors(tmp_path):
@@ -107,7 +107,7 @@ def test_join_verdict_catches_w132_form():
     """#159: der Grund, aus dem w130/w131/w132 beim Wake starben."""
     k = em.build(**W128)
     row_list = em.join_verdict(k)
-    assert len(row_list) == 3, "alle drei PP-Stufen passen nicht zu D"
+    assert len(row_list) == 3, "all three PP stages do not fit D"
     assert "P haelt 194 Experten, D haelt 161, gemeinsam 4" in row_list[0]
 
 
@@ -135,7 +135,7 @@ def test_mirror_makes_form_joinable():
     k = em.build(**W128, mirror=True)
     assert em.join_verdict(k) == []
     assert em.refuse_if_inconsistent(k) is None
-    assert k["moves"] == 0, "identische Mengen -> der Flip bewegt NICHTS"
+    assert k["moves"] == 0, "identical sets -> the Flip moves NICHTS"
 
 
 def test_mirror_caps_on_too_small_fr_p():
@@ -144,7 +144,7 @@ def test_mirror_caps_on_too_small_fr_p():
                  fr_pp=[0.377, 0.700, 0.442],
                  fr_tp=[0.688, 0.545, 0.449], mirror=True)
     row_list = em.join_verdict(k)
-    assert row_list, "FR_P 0.377 -> 194 < D-Menge 292, das muss auffallen"
+    assert row_list, "FR_P 0.377 -> 194 < D set 292, that must stand out"
     assert "P haelt 194" in row_list[0] and "D haelt 292" in row_list[0]
 
 

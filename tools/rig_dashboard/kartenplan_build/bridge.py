@@ -171,7 +171,7 @@ def main(argv=None) -> int:
     from . import records as R
 
     ap = argparse.ArgumentParser(description=main.__doc__)
-    ap.add_argument("--trees-root", required=True, help="Ordner mit <rev>/python/flliper (git archive der Boot-Revisionen)")
+    ap.add_argument("--trees-root", required=True, help="Folder with <rev>/python/flliper (git archive of the boot revisions)")
     ap.add_argument("--python", default=DEFAULT_PYTHON)
     ap.add_argument("ids", nargs="*")
     ns = ap.parse_args(argv)
@@ -187,7 +187,7 @@ def main(argv=None) -> int:
         res.pop("tree_python", None)
         rec["planer_nachrechnung"] = res
         R.save(rec)
-        print(spec["id"], "rev", spec["rev"], "->", "ALLE GLEICH" if res.get("all_match") else "ABWEICHUNG/FEHLER: %s" % (res.get("error") or res.get("why") or res.get("rows")))
+        print(spec["id"], "rev", spec["rev"], "->", "ALL EQUAL" if res.get("all_match") else "DEVIATION/ERROR: %s" % (res.get("error") or res.get("why") or res.get("rows")))
         for r in res.get("rows", []):
             print("   ", r["id"], "Planer", r["got_mib"], "Boot", r["expected_mib"], "OK" if r["match"] else "ABWEICHUNG", r["error"] or "")
         bad += 0 if res.get("all_match") else 1

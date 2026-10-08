@@ -782,7 +782,7 @@ def stage_rates_from_logs(
     empty = [s for s in range(n) if not per.get(s)]
     if empty:
         raise ValueError(
-            "%s: kein voller %d-Token-Chunk auf Stufe(n) %s"
+            "%s: no full %d-token chunk on stage(s) %s"
             % (name, chunk_tokens, empty)
         )
     return StageRates(
@@ -895,7 +895,7 @@ def balanced_cut(
             best = (key, cut, attn, stage_ms)
     if best is None:
         raise ValueError(
-            "kein Schnitt von %d Schichten auf %d Stufen gibt jeder Stufe "
+            "no split of %d layers on %d stages gives each stage "
             "eine Attention-Schicht" % (n_layers, n_stages)
         )
     return best[1], best[2], best[3]
@@ -1121,21 +1121,21 @@ def stage_rates_from_boot(
     cards = ordinal_cards_from_launch_log(launch_log_text)
     if not limits or not cards:
         raise ValueError(
-            "%s: Launcher-Log ohne POWER-LIMIT- oder NVML-Ordinal-Zeile -- der Boot ist "
+            "%s: Launcher log without POWER-LIMIT or NVML-ordinal line -- the boot is "
             "aelter als H57, sein Limit ist nicht belegt" % name
         )
     if stage_layers is None:
         m = re.search(r"REALIZED layer split \[([0-9, ]+)\]", launch_log_text)
         if m is None:
             raise ValueError(
-                "%s: kein 'REALIZED layer split' im Launcher-Log; --layers angeben"
+                "%s: no 'REALIZED layer split' in the Launcher log; specify --layers"
                 % name
             )
         stage_layers = [int(x) for x in m.group(1).split(",")]
     missing = [n for _u, n, _name in cards if n not in limits]
     if missing:
         raise ValueError(
-            "%s: POWER-LIMIT-Zeile ohne Limit fuer nvml%s" % (name, missing)
+            "%s: POWER-LIMIT line without limit for nvml%s" % (name, missing)
         )
     stamps = [LimitStamp(u, n, nm, limits[n]) for u, n, nm in cards]
     return stage_rates_from_logs(
@@ -1167,7 +1167,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--source", default="")
     ap.add_argument("--chunk", type=int, default=16384)
     ap.add_argument(
-        "--layers", default="", help="Schnitt, sonst aus 'REALIZED layer split'"
+        "--layers", default="", help="Split, otherwise from 'REALIZED layer split'"
     )
     ap.add_argument("--fr-p", default="?")
     ap.add_argument("--trees", default="?")

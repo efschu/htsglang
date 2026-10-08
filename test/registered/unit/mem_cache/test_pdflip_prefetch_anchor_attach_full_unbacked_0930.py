@@ -78,7 +78,7 @@ def test_y5h_attach_on_a_node_without_full_host_keeps_the_tree_law():
     A._commit(cache, res)
     cache.sanity_check()   # die Idle-Pruefung, die TP1/TP2 getoetet hat
     node = A._node_at(cache, 96)
-    assert node.component_data[MC].host_value is not None, "der Anker bleibt (y5a)"
+    assert node.component_data[MC].host_value is not None, "the anchor stays (y5a)"
     assert node.component_data[FULL].host_value is not None, "Aux-Host verlangt Full-Host"
 
 
@@ -94,7 +94,7 @@ def test_the_node_takes_exactly_its_own_rows_of_the_read():
     assert res.anchor_adopted_tokens == 96
     assert cache._prefetch_head_free_to(res) == 0
     assert node.hash_value == ["h%d" % i for i in range(96)]
-    assert node.l3_present, "die Zeilen kamen aus dem Store"
+    assert node.l3_present, "the rows came from the Store"
     assert node in cache.evictable_host_leaves or not cache._is_host_leaf(node)
 
 
@@ -125,7 +125,7 @@ def test_write_through_with_unbacked_parent_drops_and_releases_the_anchor(caplog
     node = A._node_at(cache, 96)
     assert node.component_data[MC].host_value is None
     assert node.component_data[FULL].host_value is None
-    assert len(cache.cache_controller.released) == 1, "der Mamba-Slot geht an den Pool"
+    assert len(cache.cache_controller.released) == 1, "the Mamba-slot goes to the Pool"
     assert int(getattr(res, "anchor_adopted_tokens", 0) or 0) == 0
     assert cache._prefetch_head_free_to(res) == 96
     assert "PDFLIP PREFETCH-ANCHOR-ATTACH dropped" in caplog.text

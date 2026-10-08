@@ -112,7 +112,7 @@ class TestRedact(unittest.TestCase):
 
 
 def _gq_down(method, url, body=None, headers=None, timeout=10.0):
-    raise hwprofil.GpuqUnavailable("gpuq nicht erreichbar (Test)")
+    raise hwprofil.GpuqUnavailable("gpuq not reachable (Test)")
 
 
 class _App:

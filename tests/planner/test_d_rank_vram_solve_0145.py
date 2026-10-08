@@ -133,7 +133,7 @@ def test_w83_without_foreign_context_rank_zero_undetected():
     )
     for i, (a, b) in enumerate(zip(without_b, mit)):
         assert a.available_mib - b.available_mib == pytest.approx(FREMD_MIB[i]), (
-            f"Rang {i}: der fehlende Term --d-foreign-context-mib verschiebt "
+            f"rank {i}: the missing term --d-foreign-context-mib shifts "
             f"die Bilanz um genau {FREMD_MIB[i]} MiB"
         )
     assert without_b[0].over_mib == pytest.approx(701.0)
@@ -151,7 +151,7 @@ def test_w83_without_non_torch_term_verdict_is_wrong():
         foreign_context_mib=FREMD_MIB, nontorch_mib=[0.0, 0.0, 0.0],
     )
     assert [x.rank for x in without_c if not x.fits] == [], (
-        "ohne --d-nontorch-mib sieht w83 wie ein passender Boot aus -- "
+        "without --d-nontorch-mib w83 looks like a fitting boot -- "
         "genau das war der Defekt"
     )
     assert without_c[0].fits and without_c[0].over_mib == pytest.approx(-1585.0)
@@ -358,7 +358,7 @@ def test_die_w83_form_je_rang():
     assert all(a > b for a, b in zip(without_c, f)), (without_c, f)
     growth = [a - b for a, b in zip(without_c, f)]
     assert growth[0] == max(growth), (
-        "ohne --d-nontorch-mib gewinnt Rang 0 (5090) die groesste Schein-Luft "
+        "without --d-nontorch-mib rank 0 (5090) gets the largest phantom headroom "
         f"({growth[0]:.3f} gegen {growth[1]:.3f} / {growth[2]:.3f}) -- das "
         "ist die Falschaussage, an der w83 gestorben ist"
     )

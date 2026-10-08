@@ -1391,7 +1391,7 @@ def d_rank_available_mib(
     rs = list(reserve_mib_by_rank) if reserve_mib_by_rank is not None else [0.0] * n
     if len(fk) != n or len(nt) != n or len(rs) != n:
         raise ValueError(
-            f"d_rank_available_mib: {n} Karten, aber {len(fk)} Fremd-Kontexte / "
+            f"d_rank_available_mib: {n} cards, but {len(fk)} foreign contexts / "
             f"{len(nt)} Nicht-Torch-Werte / {len(rs)} Reserven -- eine halbe "
             f"Bilanz entscheidet nichts"
         )

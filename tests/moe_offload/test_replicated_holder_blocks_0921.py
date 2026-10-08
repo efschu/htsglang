@@ -52,9 +52,9 @@ def test_a_non_holder_gets_no_block():
     """Der Kern: Breite 0 = kein Block = kein d_rank = keine Lane."""
     out = _blocks(_Geom(dst_widths=(384, 0, 0)))
     assert len(out) == 3
-    assert len(out[0]) == 1, "der Attention-Host haelt ihn"
+    assert len(out[0]) == 1, "the attention host holds it"
     assert out[1] == [] and out[2] == [], \
-        "die Worker-Karten halten ihn NICHT -- sonst entstehen c1 und c2"
+        "the worker cards do NICHT hold it -- otherwise c1 and c2 arise"
 
 
 def test_a_holder_carries_the_FULL_form_not_its_width():

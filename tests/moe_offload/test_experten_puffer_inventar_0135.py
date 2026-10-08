@@ -95,7 +95,7 @@ def test_buffer_travels_with_its_tensor(chunks):
     assert len(paar) == 1
     _g, t = paar[0]
     assert t.data_ptr() == buf.data_ptr(), (
-        "Geometrie und Tensor muessen aus DEMSELBEN Walk-Schritt kommen -- "
+        "geometry and tensor must come from the SAME walk step -- "
         "sie nachtraeglich per Name zu paaren waere die zweite Buchhaltung"
     )
 
@@ -117,7 +117,7 @@ def test_empty_buffer_is_not_inventoried(chunks):
     inv, skipped, _w, _r = sh.card_inventory(rank=0, model=_model(buf))
     assert not [g for g, _t in (inv or []) if "pdflip_experts" in g.name]
     assert not [n for n, _why in skipped if "pdflip_experts" in n], (
-        "der leere Puffer landete in der Skip-Liste statt frueh auszusteigen "
+        "the empty buffer landed in the skip list instead of bailing out early "
         "-- dann zaehlt jeder Boot 48x4 erwartete Formen als Defekt"
     )
 
@@ -159,7 +159,7 @@ def test_plan_and_manifest_see_same_buffer(chunks):
     inv, _s, _w, _r = sh.card_inventory(rank=0, model=model)
     in_inventory = {g.name for g, _t in inv}
     assert name in in_inventory, (
-        "das Manifest-Inventar sieht den Puffer nicht"
+        "the manifest inventory does not see the buffer"
     )
 
 
@@ -181,7 +181,7 @@ def test_helper_is_the_only_site(chunks):
         # das ist kein zweites Inventar, sondern eine Eigenschaftsfrage an
         # einen Eintrag, den der Helfer geliefert hat.)
         assert "vars(module)" not in src, (
-            f"{fn.__name__} walkt die Modul-Dicts selbst statt den Helfer zu "
+            f"{fn.__name__} walks the module dicts itself instead of calling the helper "
             f"rufen -- das ist die zweite Buchhaltung, die w68 gekostet hat"
         )
 
@@ -206,11 +206,11 @@ def test_expert_buffers_survive_pair_narrowing():
     i = src.index("kept = [g for g in inventory")
     block = src[i:i + 320]
     assert "is_expert_buffer_attr(g.name)" in block, (
-        "die Verengung nimmt die Experten-Puffer nicht aus -- sie fallen "
+        "the narrowing does not exclude the expert buffers -- they fall "
         "wieder heraus, und der Flip transportiert erneut null Experten"
     )
     assert "manifest_entry(" in block, (
-        "die Geometrie-Pruefung ist ganz entfallen -- sie MUSS fuer jeden "
+        "the geometry check is gone entirely -- it MUST be for every "
         "anderen Tensor stehen bleiben, sonst faengt nichts mehr echte "
         "Divergenz (W80)"
     )
@@ -234,10 +234,10 @@ def test_plan_param_line_finds_expert_buffer(chunks):
         model, rank=0, tag="weights_2",
         planned_bytes_by_tag={"weights_2": {name: buf.numel() * 4}},
     )
-    assert row_list, "keine Zeile gedruckt"
+    assert row_list, "no line printed"
     z = row_list[0]
     assert "verdict=absent" not in z, (
-        f"der Puffer gilt als abwesend, obwohl der Walk ihn liefert: {z}"
+        f"the buffer is treated as absent, even though the walk delivers it: {z}"
     )
     assert "verdict=here" in z and "live_tag=weights_2" in z, z
 
@@ -254,7 +254,7 @@ def test_ordinary_attribute_stays_out(chunks):
     z = plan_param_lines(model, rank=0, tag="weights_2",
                          planned_bytes_by_tag={"weights_2": {name: 64}})[0]
     assert "verdict=absent" in z, (
-        f"ein gewoehnliches Attribut zaehlt jetzt als Parameter: {z}"
+        f"a plain attribute now counts as a parameter: {z}"
     )
 
 

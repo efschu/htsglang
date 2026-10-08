@@ -28,7 +28,7 @@ def test_schema_wins_over_quant_method():
         scheme=CompressedTensorsWNA16MarlinMoE(),
     )
     assert not fml.ct_method_transposes(layer.quant_method), (
-        "die quant_method steht nicht in _CT_TRANSPOSING_METHODS -- genau "
+        "the quant_method is not in _CT_TRANSPOSING_METHODS -- exactly "
         "deshalb war `layer.quant_method` die falsche Frage"
     )
     assert fml.ct_method_transposes(fml.ct_effective_method(layer))
@@ -54,7 +54,7 @@ def test_consumer_asks_the_same_function():
     code = "\n".join(z for z in src.split("\n") if not z.lstrip().startswith("#"))
     assert "ct_effective_method(self)" in code
     assert "self.scheme" not in code, (
-        "der Verbraucher loest die Methode wieder selbst auf"
+        "the consumer resolves the method itself again"
     )
 
 
@@ -65,7 +65,7 @@ def test_worker_asks_the_same_function():
     code = "\n".join(z for z in src.split("\n") if not z.lstrip().startswith("#"))
     assert "ct_effective_method(layer)" in code
     assert 'getattr(layer, "quant_method"' not in code, (
-        "der Worker fragt wieder nur die quant_method -- das war die w59-Wurzel"
+        "the worker only asks the quant_method again -- that was the w59 root"
     )
 
 
@@ -136,8 +136,8 @@ def test_68f_counter_counts_transposed_and_offered(monkeypatch):
         _M(), "model.layers.0.self_attn.q_proj.weight", t
     )
     nach = qx.worker_transpose_counts()
-    assert nach[0] - vor[0] == 1, "gedreht falsch gezaehlt"
-    assert nach[1] - vor[1] == 2, "angeboten falsch gezaehlt"
+    assert nach[0] - vor[0] == 1, "rotated counted wrong"
+    assert nach[1] - vor[1] == 2, "offered counted wrong"
 
 
 def test_68f_counter_holds_no_references():

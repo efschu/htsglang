@@ -15,20 +15,20 @@ refusal/register codes (W40, HW-COUNT ...), log line wordings quoted from the so
 | Fehlersuche (group) | Debugging |
 | Weitere (group) | Other |
 | Diagnose (group, text prefix) | Diagnostics |
-| Wächter (group) | Watchdogs |
+| Watchers (group) | Watchdogs |
 | Profil (group) | Profile |
-| Schnitt (P-Schnitt, Layer-Schnitt) | cut (layer cut) |
+| Cut (P-cut, layer cut) | cut (layer cut) |
 | Stufe | stage (pipeline) / rung (ladder, share controller) |
 | Gruppe P / D | group P / D |
-| Sitz, Sitze | seat, seats |
+| Seat, seats | seat, seats |
 | Schlafrest | sleep remainder |
-| Riegel | latch (the `--host-riegel-gib` flag name is unchanged) |
-| Anker (Mamba-Anker) | anchor (Mamba anchor; glossary key "Mamba anchor") |
-| abgenommen / vorbereitet / geplant | accepted / prepared / planned |
-| Klemme (Aushungerungs-Klemme) | clamp (starvation clamp) |
-| Hülle | envelope |
-| Beleg / belegt / unbelegt | citation / verified / unverified |
-| Weg (Pfad, Code-Pfad) | path |
+| Guard | latch (the `--host-riegel-gib` flag name is unchanged) |
+| Anchor (Mamba anchor) | anchor (Mamba anchor; glossary key "Mamba anchor") |
+| Accepted / prepared / planned | accepted / prepared / planned |
+| Clamp (starvation clamp) | clamp (starvation clamp) |
+| Envelope | envelope |
+| Evidence / occupied / unoccupied | citation / verified / unverified |
+| Path (path, code path) | path |
 | Zustand | state |
 | Bahn (Gewichtsbahn) | lane (weight lane) |
 

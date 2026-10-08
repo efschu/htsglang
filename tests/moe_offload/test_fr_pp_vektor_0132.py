@@ -45,4 +45,4 @@ def test_launcher_passes_vector_through():
     i = src.index("_pp_frac = ")
     code = "\n".join(z for z in src[i:i + 200].split("\n")
                      if not z.lstrip().startswith("#"))
-    assert "list(_fr_p)" in code, "der Launcher mittelt wieder"
+    assert "list(_fr_p)" in code, "the launcher averages again"

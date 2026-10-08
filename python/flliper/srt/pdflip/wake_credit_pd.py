@@ -807,7 +807,7 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
                                 "kv_mib_per_attn_layer") if geo.get(k) is None]
             if miss:
                 raise ValueError(
-                    "%s: %s %s %s -- Schnitt %s: die Geometrie fuer den Umschnitt fehlt (%s)"
+                    "%s: %s %s %s -- Cut %s: the geometry for the recut is missing (%s)"
                     % (_pc.RECUT_REFUSAL_CODE, MARKER, DIRECTION, label, _pc.split_text(p_split),
                        ", ".join(miss)))
             _pc.recut_check(key["p_split"], p_split, geo["layer_kinds"],  # type: ignore[arg-type]
@@ -1106,7 +1106,7 @@ def pd_reference_from_logs(p_text: str, d_text: str, front_text: str, *, source:
     Fehlt eine Zeile, ``ValueError`` -- nie eine halbe Referenz."""
     orders = list(_RX_ORDER.finditer(front_text))
     if len(orders) <= flip:
-        raise ValueError("%s: nur %d PDFLIP-FLIP-ORDER src=P-Zeilen, Flip %d fehlt"
+        raise ValueError("%s: only %d PDFLIP-FLIP-ORDER src=P rows, Flip %d missing"
                          % (source, len(orders), flip))
     m = orders[flip]
     t_order = _epoch_s(m.group(1))
@@ -1210,7 +1210,7 @@ def pd_reference_from_logs(p_text: str, d_text: str, front_text: str, *, source:
         by_lane.setdefault(lane, []).append((tag, mib, tot, wt))
     for lane, items in sorted(by_lane.items()):
         if lane not in lane_src or lane not in lane_dst:
-            raise ValueError("%s: Lane p%d ohne Quelle/Ziel im Flip seq %d" % (source, lane, seq))
+            raise ValueError("%s: Lane p%d without source/target in Flip seq %d" % (source, lane, seq))
         rates = [tot / mib for _t, mib, tot, wt in items
                  if wt <= LANE_UNBLOCKED_WAIT_MS and mib > 0]
         rate = statistics.median(rates) if rates else None
@@ -1250,7 +1250,7 @@ def pd_reference_from_logs(p_text: str, d_text: str, front_text: str, *, source:
     for s in range(n):
         t0s = [v[0] for (st, _t), v in stt.items() if st == s]
         if not t0s:
-            raise ValueError("%s: Stufe %d ohne PDFLIP-SLEEP-TAG-TIME im Flip" % (source, s))
+            raise ValueError("%s: stage %d without PDFLIP-SLEEP-TAG-TIME in the Flip" % (source, s))
         p_start.append(round((min(t0s) - t_order) * 1000.0, 3))
     d_start = []
     for r in range(n):
@@ -1344,7 +1344,7 @@ def pd_free0_from_logs(p_text: str, d_text: str, front_text: str, *, source: str
     Fehlt eine Zeile: ``ValueError`` -- nie ein halber Eintrag."""
     orders = list(_RX_ORDER.finditer(front_text))
     if len(orders) <= int(flip):
-        raise ValueError("%s: nur %d PDFLIP-FLIP-ORDER src=P-Zeilen, Flip %d fehlt"
+        raise ValueError("%s: only %d PDFLIP-FLIP-ORDER src=P rows, Flip %d missing"
                          % (source, len(orders), flip))
     m = orders[int(flip)]
     rows: Dict[int, int] = {}
@@ -1353,7 +1353,7 @@ def pd_free0_from_logs(p_text: str, d_text: str, front_text: str, *, source: str
             rows.setdefault(int(mm.group(2)), int(mm.group(4)))
     mv = _RX_VERIFY_BS.search(d_text)
     if not rows or sorted(rows) != list(range(len(rows))) or mv is None:
-        raise ValueError("%s: P-Zeilen %s oder D-Verify-Graph %s fehlen"
+        raise ValueError("%s: P rows %s or D-Verify-Graph %s missing"
                          % (source, sorted(rows), "da" if mv else "fehlt"))
     return {
         "kind": FREE0_KIND, "group": FREE0_GROUP, "source": source, "flip": int(flip),

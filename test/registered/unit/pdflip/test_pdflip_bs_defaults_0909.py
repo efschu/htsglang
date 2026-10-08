@@ -78,7 +78,7 @@ def test_the_parsed_defaults_are_the_ordered_pair():
 
     ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
     assert ns.p_bs == 2, "user order 2026-09-09: 'bs2 fuer prefill'"
-    assert ns.d_bs == 6, ("user order 2026-09-09: 'der decode bs6 soll mit bs6 "
+    assert ns.d_bs == 6, ("user order 2026-09-09: 'the decode bs6 shall use bs6 (user order, translated) "
                           "(nicht mehr bs4) der standard werden'")
     # ...and the constants are those same two numbers, so no site can be
     # "correct" against a constant that has itself drifted from the order.

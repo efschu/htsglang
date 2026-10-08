@@ -117,7 +117,7 @@ def _first_free(plan):
 
 @pytest.mark.parametrize("i", range(max(1, len(RECS))))
 def test_the_builtin_free0_records_are_the_logs_own_measurement(i):
-    assert RECS, "keine eingebauten free0-Messungen"
+    assert RECS, "no built-in free0 measurements"
     rec = RECS[i]
     boot, flip = rec["source"][len("fnFL2"):].split("/")
     got = pd.pd_free0_from_logs(_txt(boot, "P"), _txt(boot, "D"), _txt(boot, "front"),

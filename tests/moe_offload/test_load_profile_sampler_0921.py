@@ -80,7 +80,7 @@ def test_the_sampler_holds_no_frame_across_its_wait():
     # die Referenzen sind VOR dem Warten geloescht
     i_del = src.index("del _f, _frames")
     i_wait = src.index("self._stop.wait(")
-    assert i_del < i_wait, "Frame-Referenz ueberlebt das wait"
+    assert i_del < i_wait, "Frame reference survives the wait"
     # und es wird nichts anderes gebunden, was eine Frame haelt
     assert "frame = sys._current_frames()" not in src
     # der Ort ist zu diesem Zeitpunkt schon eine Zeichenkette

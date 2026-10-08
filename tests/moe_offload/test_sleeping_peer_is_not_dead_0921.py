@@ -32,7 +32,7 @@ def test_an_empty_nvml_list_is_no_longer_a_death_certificate():
                             else wu)
     assert "if others:" in src and "return True" in src
     assert "_any_scheduler_process_alive()" in src, (
-        "eine leere NVML-Liste muss beim Prozess nachfragen, nicht toeten")
+        "an empty NVML list must ask the process, not kill it")
 
 
 def test_the_fallback_fails_open():
@@ -40,9 +40,9 @@ def test_the_fallback_fails_open():
     Budget, nie einen lebenden Peer erschiessen."""
     src = inspect.getsource(wu._any_scheduler_process_alive)
     assert "except OSError:" in src
-    assert src.rstrip().endswith("return False"), "nur ein LEERES /proc heisst tot"
+    assert src.rstrip().endswith("return False"), "only an EMPTY /proc means dead"
     i_open = src.index("except OSError:\n        return True")
-    assert i_open > 0, "der Lesefehler-Pfad muss True antworten"
+    assert i_open > 0, "the read-error path must answer True"
 
 
 def test_it_finds_a_living_scheduler_by_comm():

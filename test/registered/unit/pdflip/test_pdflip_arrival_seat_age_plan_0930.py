@@ -97,7 +97,7 @@ def test_the_bound_parks_nobody_when_elders_hold_every_seat(monkeypatch):
     f.t_awake = now - 200.0
     f.queue = [_pending("big", 16448, now - 120.0)]
     res = asyncio.run(f._arrival_seat_step(f.groups["D"], now))
-    assert not f.rpc_calls, "nicht pauschal: nobody is displaced for a head its elders block"
+    assert not f.rpc_calls, "not blanket: nobody is displaced for a head its elders block"
     assert f.counters["arrival_seat_youngest_park"] == 0
     assert res == (False, False, None)
 

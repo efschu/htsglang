@@ -265,7 +265,7 @@ class _Buf:
     def read(self, n: int) -> bytes:
         b = self.fh.read(n)
         if len(b) < n:
-            raise ModelProfileError("GGUF-Kopf endet vorzeitig")
+            raise ModelProfileError("GGUF head ends prematurely")
         return b
 
     def u32(self) -> int:
@@ -842,7 +842,7 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
         elif len(sets) == 1 and no_safetensors:
             gguf_path = os.path.join(model_path, next(iter(sets.values()))[0])
         elif len(sets) > 1 and no_safetensors:
-            raise ModelProfileError("%s: mehrere .gguf (%s) -- die Datei nennen" % (
+            raise ModelProfileError("%s: multiple .gguf (%s) -- name the file" % (
                 model_path, ", ".join(sorted(os.path.basename(g) for g in glob.glob(os.path.join(model_path, "*.gguf"))))))
     gguf_files: List[str] = []
     if gguf_path:
@@ -1515,7 +1515,7 @@ def stage_weight_bytes(profile: Mapping[str, Any], counts: Sequence[int], *, emb
     lb = w["layer_bytes"]["v"]
     le = w["layer_expert_bytes"]["v"]
     if sum(counts) != len(lb):
-        raise ValueError("counts summiert zu %d, das Modell hat %d Layer" % (sum(counts), len(lb)))
+        raise ValueError("counts sum to %d, the model has %d layers" % (sum(counts), len(lb)))
     out: List[float] = []
     start = 0
     for s, c in enumerate(counts):

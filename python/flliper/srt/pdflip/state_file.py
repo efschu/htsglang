@@ -141,7 +141,7 @@ def read(d: str) -> dict:
     except FileNotFoundError:
         return {}
     if st.get("schema") != STATE_SCHEMA:
-        raise StateFileError(f"state_file: {_path(d)} hat schema {st.get('schema')!r}, erwartet {STATE_SCHEMA}")
+        raise StateFileError(f"state_file: {_path(d)} has schema {st.get('schema')!r}, expected {STATE_SCHEMA}")
     return st
 
 
@@ -279,17 +279,17 @@ def owns(writer: str, key: str) -> bool:
 
 def _check_owner(writer: str, state, cause, fields) -> None:
     if writer not in WRITERS:
-        raise StateFileError(f"state_file: Schreiber {writer!r} (erlaubt: {', '.join(WRITERS)})")
+        raise StateFileError(f"state_file: writer {writer!r} (allowed: {', '.join(WRITERS)})")
     if state is not None and state not in OWNED_STATES[writer]:
-        raise StateFileError(f"state_file: Zustand {state!r} gehoert nicht dem Schreiber {writer!r}")
+        raise StateFileError(f"state_file: state {state!r} does not belong to writer {writer!r}")
     for k in (fields or {}):
         if not owns(writer, k):
-            raise StateFileError(f"state_file: Feld {k!r} gehoert nicht zu {STATE_SCHEMA}/{writer} "
+            raise StateFileError(f"state_file: field {k!r} does not belong to {STATE_SCHEMA}/{writer} "
                                  f"(erlaubt: {', '.join(OWNED_FIELDS[writer])})")
     if writer == "launcher" and state == "dead" and (cause or {}).get("origin") not in LAUNCHER_DEAD_ORIGINS:
         raise StateFileError(f"state_file: dead des Launchers requires origin in {LAUNCHER_DEAD_ORIGINS}")
     if writer == "rank" and state == "dead" and (cause or {}).get("origin") != "rank":
-        raise StateFileError("state_file: dead eines Rangs requires origin rank")
+        raise StateFileError("state_file: dead of a rank requires origin rank")
 
 
 def transition(d: str, state=None, *, if_state=None, cause=None, fields=None, heartbeat_only=False,
@@ -299,12 +299,12 @@ def transition(d: str, state=None, *, if_state=None, cause=None, fields=None, he
     ``lifecycle``-Event geschrieben. Ein Übergang, den die Ordnung verbietet (ein
     zweiter Schreiber war schon weiter), ist KEIN Fehler, sondern ein No-op."""
     if state is not None and state not in STATES:
-        raise StateFileError(f"state_file: unbekannter Zustand {state!r} (erlaubt: {', '.join(STATES)})")
+        raise StateFileError(f"state_file: unknown state {state!r} (allowed: {', '.join(STATES)})")
     _check_owner(writer, state, cause, fields)
     with _locked(d):
         st = read(d)
         if not st:
-            raise StateFileError(f"state_file: {_path(d)} fehlt (erst init)")
+            raise StateFileError(f"state_file: {_path(d)} missing (init first)")
         cur = st["lifecycle"]["state"]
         change = (state is not None and may_transition(cur, state)
                   and (if_state is None or cur in if_state))
@@ -364,7 +364,7 @@ def init(root: str, boot_id: str, kind: str, fields: dict) -> str:
         raise StateFileError(f"state_file: kind {kind!r} (erlaubt: {', '.join(KINDS)})")
     for k in fields:
         if "." in k or not owns("host", k):
-            raise StateFileError(f"state_file: Feld {k!r} gehoert nicht zu {STATE_SCHEMA}")
+            raise StateFileError(f"state_file: field {k!r} does not belong to {STATE_SCHEMA}")
     d = os.path.join(root, boot_id)
     with _locked(d):
         if os.path.exists(_path(d)):

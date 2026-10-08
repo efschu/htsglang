@@ -1,78 +1,78 @@
 
-## Stufe 4 (#1427, 16.09. abends): die Schreibseite ist gemappt
+## Stage 4 (#1427, 16.09. evening): the write side is mapped
 
-Stufe 3 hatte nur die Leseseite in place gebracht; Schreiben lief weiter
-Karte -> 1-GB-Staging-Ring -> Store-Thread -> Arena -> Umbindung, und die
-Mamba-Zustaende durch einen 13-Slot-Host-Anker-Pool. Der Park-Test (6 x 100k)
-starb an genau diesem Transit (xsn184-187).
+Stage 3 had only brought the read side in place; Writing continued
+Card -> 1-GB-Staging-Ring -> Store-Thread -> Arena -> Rebinding, and the
+Mamba states through a 13-slot host anchor pool. The park test (6 x 100k)
+died at exactly this transit (xsn184-187).
 
-* KV/Draft (`pool_host/arena_pool.py`): `write_backup` beansprucht je Seiten-
-  Hash einen Arena-Slot (`arena_claim`: frisch / einem frueheren Shard
-  beitreten / schon COMPLETE), der Backup-Thread DMA't die K- und V-Extents
-  dieses Rangs mit dem All-Layer-Kernel direkt in den Slot (Arena-Datenregion
-  als Host-Puffer, Seitenschritt), der Ack merged die Extents in die
-  Abdeckung (`arena_complete`, COMPLETE sobald jeder Layer-Shard drin ist),
-  nimmt die Leser-Referenz und markiert den Knoten store-praesent. Kein
-  Staging, kein Ring, kein Store-Write, keine Umbindung.
-* Mamba (`pool_host/arena_mamba_pool.py`): Ansichten je lokalem Layer
-  (temporal) und je Conv-Segment (q|k|v) auf die Mamba-Arena, exakt der Schnitt
-  aus `temporal_extents`/`conv_extents`; Backup = Index-Kopie Karte -> Ansicht,
-  Load = Rueckweg, Prefetch loest COMPLETE-Blobs in place auf
-  (`arena_resolve_reads`, Haken in `_batch_io_v2`). Fensterteile kommen aus
+* KV/Draft (`pool_host/arena_pool.py`): `write_backup` claims per page-
+  hash one arena slot (`arena_claim`: fresh / join a previous shard
+  join / already COMPLETE), the backup thread DMAs the K and V extents
+  of this rank with the All-Layer-Kernel directly into the slot (arena data region
+  as host buffer, page stride), the ack merges the extents into the
+  coverage (`arena_complete`, COMPLETE as soon as each layer shard is inside),
+  takes the reader reference and marks the node store-present. No
+  staging, no ring, no store-write, no rebinding.
+* Mamba (`pool_host/arena_mamba_pool.py`): views per local layer
+  (temporal) and per Conv segment (q|k|v) onto the Mamba arena, exactly the slice
+  from `temporal_extents`/`conv_extents`; Backup = index copy card -> view,
+  Load = return path, Prefetch resolves COMPLETE blobs in place
+  (`arena_resolve_reads`, hook in `_batch_io_v2`). Window parts come from
   `_canonical_mamba_window`.
-* Refs auf CLAIMED-Slots sind erlaubt (der Knoten des Schreibers haelt eine ab
-  dem Claim); `free_slots` bumpt die Generation, eine spaete Vervollstaendigung
-  wird abgewiesen.
-* Noch Transit: nichts fuer KV/Draft/Mamba; Sidecar-Pools (SWA/Indexer) gibt es
-  auf diesem Modell nicht.
+* Refs to CLAIMED slots are allowed (the writer's node holds one from
+  the claim); `free_slots` bumps the generation, a late completion
+  is rejected.
+* Still in transit: nothing for KV/Draft/Mamba; Sidecar pools (SWA/Indexer) do not exist
+  on this model.
 
-### Stufe 4, Metall-Lehren (xsn188-192, 16.09. abends)
+### Stage 4, metal lessons (xsn188-192, 16.09. evening)
 
-* Bindung VOR der Pruefung (#1427e): `pool.arena` ist erst nach `ensure_bound`
-  gesetzt; wer erst schaut und dann bindet, laesst jeden Rang ohne Prefetch
-  (PP1/PP2 lesen den Store nie) auf dem Staging-Ring. Gleiches fuer den
-  Draft-Pool (#1427g, bindet sonst erst beim ersten Draft-Lesen, das P nie tut)
-  und den Mamba-Pool der neu gebauten D-Gruppe (#1427c, Fensterteile nach dem
-  Rebind an den AKTUELLEN Pool).
-* Ein ungebundener Pool gibt keine Platzhalter aus und schreibt keine fremden
-  Arena-Ids in seinen Staging-Puffer (#1427c/#1427g).
-* Nicht in der Arena = Miss, nie Platten-Lesen in einen Platzhalter (#1427d);
-  ein Raise im Storage-Thread liess die Anfrage ewig auf
-  `pool_transfers_done` warten (#1033e: Flag bei jedem Ausgang).
-* `op_fn is self._read_page` vergleicht zwei frische Bound-Method-Objekte und
-  ist immer False (#1427e) -- per Name vergleichen.
-* KV-Legs des Front brauchen denselben Epoch-Retry wie die Gewichts-Legs
-  (#1428); ein abgerissener Keep-alive hat sonst den Boot beim ersten Wake
-  gekillt, obwohl P 200 antwortete.
+* Binding BEFORE the check (#1427e): `pool.arena` is only set after `ensure_bound`
+  set; whoever checks first and then binds lets every rank without Prefetch
+  (PP1/PP2 never read the store) on the staging ring. Same for the
+  Draft pool (#1427g, otherwise only binds at the first draft read, which P never does)
+  and the Mamba pool of the newly built D group (#1427c, window parts after the
+  Rebind to the CURRENT Pool).
+* An unbound pool emits no placeholders and writes no foreign
+  Arena-Ids into its staging buffer (#1427c/#1427g).
+* Not in the Arena = Miss, never disk-read into a placeholder (#1427d);
+  a Raise in the Storage-Thread left the request waiting forever on
+  `pool_transfers_done` (#1033e: Flag on every exit).
+* `op_fn is self._read_page` compares two fresh Bound-Method-Objects and
+  is always False (#1427e) -- compare by name.
+* KV-Legs of the Front need the same Epoch-Retry as the Weight-Legs
+  (#1428); a dropped Keep-alive would otherwise kill the Boot on the first Wake
+  even though P answered 200.
 
-## Nachtrag 16.09. spät: Layout-Leiter je Größenklasse, YaRN je Klasse (Design, Nutzer-Order)
+## Addendum 16.09. late: Layout-Ladder per size class, YaRN per class (Design, user order)
 
-**Ist (nach #1447):** Der P-Cut-Solver preist jeden Frontier-Kandidaten mit seinem
-Host-Bounce (`PP-CUT HOST-PRICE`), der Cap-Floor (262144 + Chunk) ist auf dem
-Austausch-Arm Standard, und es schifft der schnellste fundierbare Schnitt. Fundierbar
-ist heute nur 39,13,12, weil nur dessen Lane-Satz vermessen ist (5 Lanes, 15,75 GiB);
-jeder unvermessene Schnitt wird mit dem Worst-Case (9 Lanes, 27,75 GiB) bepreist und
-fällt am Ledger (Excess −1,3 GiB). Das `PDFLIP-XCHG-HOST-SLOT`-Instrument, aus dem die
-Lanes gelernt werden, liefert seit Ring-off keine Zeilen mehr (0 in xsn203–208) —
-das ist die eine Wand vor der Leiter: **erst Lane-Messung wieder verdrahten, dann
-kann ein zweiter Schnitt überhaupt vermessen werden** (Boot mit
-`FLLIPER_PDFLIP_PCUT_BOUNCE_SLACK_GIB` und Ledger-Spielraum, danach ist er in
+**Is (after #1447):** The P-Cut-Solver prices every Frontier-Candidate with its
+Host-Bounce (`PP-CUT HOST-PRICE`), the Cap-Floor (262144 + Chunk) is on the
+Exchange-Arm standard, and it ships the fastest fundable cut. Fundable
+is today only 39,13,12, because only its lane set is surveyed (5 Lanes, 15,75 GiB);
+each unsurveyed cut is priced at the worst-case (9 Lanes, 27,75 GiB) and
+falls on the ledger (Excess −1,3 GiB). The `PDFLIP-XCHG-HOST-SLOT` instrument, from which the
+Lanes are learned, has delivered no rows since Ring-off (0 in xsn203–208) —
+that is the single wall before the Ladder: **first re-wire Lane-Measurement, then
+can a second cut be measured at all** (Boot with
+`FLLIPER_PDFLIP_PCUT_BOUNCE_SLACK_GIB` and Ledger-headroom, after that it is in
 `XCHG_LANES_BY_CUT` bzw. dem Record).
 
-**Leiter (Design):** Größenklassen nach geschätzter Prompt-Länge des Frontends
-(`est_prompt`, schon vorhanden): ≤32k, ≤64k, ≤128k, ≤262k. Je Klasse der schnellste
-Schnitt der Frontier, dessen Pool `Klasse + Chunk` hält (bs1: der Pool muss nur den
-einen Prefill halten). Der Solver liefert die ganze Frontier bereits je Boot; die
-Leiter ist eine Tabelle `Klasse → (Schnitt, Pool, ms/Chunk)` aus derselben Rechnung.
+**Ladder (Design):** Size classes by estimated Prompt-Length of the Frontend
+(`est_prompt`, already present): ≤32k, ≤64k, ≤128k, ≤262k. Per class the fastest
+cut of the frontier, whose pool holds `Klasse + Chunk` (bs1: the pool only needs the
+single Prefill). The Solver already delivers the whole Frontier per Boot; the
+Ladder is a table `Klasse → (Schnitt, Pool, ms/Chunk)` from the same computation.
 
-**Re-Cut zur Laufzeit:** ein P-interner Layout-Flip (PP-Stufen tauschen Layer über
-dieselben Host-Bounce-Lanes wie der P↔D-Austausch, kein D-Beteiligter), ausgelöst vom
-Frontend, wenn die nächste Batch-Klasse einen anderen Schnitt verlangt als der
-installierte; Kosten ~1 Flip (1,6–2,0 s). Nur wenn der Backlog der Klasse den Flip
-amortisiert (dieselbe Break-even-Regel wie `FLIP-ECONOMICS`).
+**Re-Cut at runtime:** a P-internal Layout-Flip (PP-Stages swap Layers over
+the same Host-Bounce-Lanes as the P↔D-Exchange, no D-party involved), triggered by the
+Frontend, if the next Batch-class demands a different cut than the
+installed; cost ~1 Flip (1,6–2,0 s). Only if the class backlog the Flip
+(same Break-even-Rule as `FLIP-ECONOMICS`).
 
-**YaRN je Klasse:** RoPE-Skalierung ist Ladezeit-Konfiguration des Modells; ein
-Faktorwechsel zur Laufzeit hieße Neu-Laden. Deshalb: Faktor pro Boot fest
-(`--json-model-override-args rope_scaling`), Klassen >262k (Faktor 2/3/4 → 524k/786k/
-1M) nur mit einem Boot dieses Faktors; D-Pool 697856 hält ~2,6×262k, P braucht dafür
-die Pool-lastigen Schnitte (33,18,13 ff.). Automatik = Boot-Wahl, nicht Laufzeit-Wechsel.
+**YaRN per class:** RoPE-Scaling is load-time configuration of the Model; a
+factor change at runtime would mean re-loading. Therefore: factor fixed per Boot
+(`--json-model-override-args rope_scaling`), classes >262k (factor 2/3/4 → 524k/786k/
+1M) only with one boot of this factor; D-Pool 697856 holds ~2,6×262k, P needs for that
+the Pool-heavy cuts (33,18,13 ff.). Automation = Boot-Choice, not runtime-Switch.
