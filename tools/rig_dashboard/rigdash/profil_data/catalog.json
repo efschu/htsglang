@@ -29557,7 +29557,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2463
+      "line": 2473
      }
     }
    },
@@ -29612,7 +29612,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2453
+    "line": 2463
    },
    "status": "geerntet",
    "text": "",
@@ -29635,7 +29635,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2499
+      "line": 2509
      }
     }
    },
@@ -38354,7 +38354,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4564
+    "line": 4574
    },
    "status": "unerklaert",
    "text": "",
@@ -38672,7 +38672,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4563
+    "line": 4573
    },
    "status": "geerntet",
    "text": "",
@@ -39225,7 +39225,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2134
+    "line": 2144
    },
    "status": "geerntet",
    "text": "",
@@ -39248,7 +39248,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2474
+      "line": 2484
      }
     }
    },
@@ -39417,7 +39417,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2478
+      "line": 2488
      }
     }
    },
@@ -39617,7 +39617,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1911
+    "line": 1921
    },
    "status": "geerntet",
    "text": "",
@@ -47576,7 +47576,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2143
+    "line": 2153
    },
    "status": "geerntet",
    "text": "",
@@ -47604,7 +47604,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2148
+    "line": 2158
    },
    "status": "geerntet",
    "text": "",
@@ -53703,7 +53703,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1642
+    "line": 1652
    },
    "status": "geerntet",
    "text": "",
@@ -65251,7 +65251,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1581
+    "line": 1591
    },
    "status": "erklaert",
    "text": "Protection against a mutual blockade when waking D to P: two groups wait in a circle for memory room. On: the waiting part counts its own waiting from the start of the wait; the resolution (swapping the rest out to host RAM) begins after about 0.1 s instead of about 0.6 s. Off: only after the wait flag has gone up after 0.5 s. Default off (preparation/experiment, \"Default off until metal A/B\"). According to the code necessary before SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED (is off) goes on again. Related: SGLANG_WEG2_BAR1_SPILL_GRACE_S (0.1 s). Acts only for the sending side. Not verified individually on the metal. No user value recognizable.",
@@ -65431,7 +65431,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 889
+      "line": 899
      }
     }
    },
@@ -65623,7 +65623,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 881
+      "line": 891
      }
     }
    },
@@ -65765,7 +65765,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 884
+      "line": 894
      }
     }
    },
@@ -65876,7 +65876,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1890
+      "line": 1900
      }
     }
    },
@@ -66215,7 +66215,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 919
+      "line": 929
      }
     }
    },
@@ -69937,7 +69937,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 976
+    "line": 986
    },
    "status": "erklaert",
    "text": "Threshold in milliseconds for SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH: how much estimated reload wait time must at least be incurred for the short request to yield to P. The estimate is fixed at 624 ms (one wave) or 1248 ms (two waves, from 190 uncached tokens). Value up to 624: every request from 8 tokens yields; 625 to 1248: only those from 190 tokens; above 1248: never. Default 600. Without effect without SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH=1 and without SGLANG_WEG2_ENABLE_D_DIRECT_YIELD. Note: the comment in environ.py (\"raising it past 1248 exposes only the two-wave SHORTs\") contradicts the logic in the code (if the estimate lies below the threshold, the request stays on D); this explanation follows the logic. Setting number for an experiment. Unverified: whether and how the user should change it.",
@@ -70968,7 +70968,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3599
+      "line": 3609
      }
     }
    },
@@ -71249,7 +71249,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1994
+      "line": 2004
      }
     }
    },
@@ -71327,7 +71327,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4271
+      "line": 4281
      }
     }
    },
@@ -71406,7 +71406,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2492
+      "line": 2502
      }
     }
    },
@@ -71606,7 +71606,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 966
+    "line": 976
    },
    "status": "geerntet",
    "text": "",
@@ -71635,7 +71635,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 972
+    "line": 982
    },
    "status": "erklaert",
    "text": "A short request that would be prefilled directly on D, but there mainly waits for the reloading of expert weights from RAM (about 0.6 s per pass), is computed together with P instead, even if no flip is foreseeable at the moment. Off: it stays on D. Default off (experimental switch). Needs SGLANG_WEG2_ENABLE_D_DIRECT_YIELD (default on); acts only if no P request is waiting in the queue and the request has at least 8 uncached tokens. Threshold: SGLANG_WEG2_D_DIRECT_YIELD_FETCH_MS. On the metal: fires (yield=d_direct_fetch 59/132/60 lines), effect on latency/throughput according to the report \"not evidenced\". Unverified: whether it brings the user anything.",
@@ -71720,7 +71720,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2014
+    "line": 2024
    },
    "status": "geerntet",
    "text": "",
@@ -71871,6 +71871,34 @@
    "text": "",
    "type": "EnvBool"
   },
+  "SGLANG_WEG2_ENABLE_FORM_A_ADMIT_ROOM_FIRST": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "ENABLE_FORM_A_ADMIT_ROOM_FIRST (H98e, the cause behind H98d, NF xc D 21:37:29Z 07.10., weg2-130-2093 -> weg2-130-2092): a Form A load-back whose group ADMIT is already taken (worker off the token cut, every rank on it) decides its room from the LIVE pool with a shortfall-only eviction on its FIRST attempt (H105c's follow-room). Off = the first attempt goes through the pass-published floor, whose refusal runs the xsn285 full drain (every evictable leaf, the voted-but-not-admitted prefixes of the same pass included) before H105c retries from the live pool. The host-first path (H105b/H106) is not touched.",
+   "id": "SGLANG_WEG2_ENABLE_FORM_A_ADMIT_ROOM_FIRST",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_ENABLE_FORM_A_ADMIT_ROOM_FIRST",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 766
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
   "SGLANG_WEG2_ENABLE_FORM_A_STALE_VOTE_DEFER": {
    "baeume": [
     "nf"
@@ -71950,7 +71978,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1918
+    "line": 1928
    },
    "status": "geerntet",
    "text": "",
@@ -71973,7 +72001,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2483
+      "line": 2493
      }
     }
    },
@@ -72085,7 +72113,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 988
+    "line": 998
    },
    "status": "geerntet",
    "text": "",
@@ -72195,7 +72223,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4251
+      "line": 4261
      }
     }
    },
@@ -72653,7 +72681,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 981
+    "line": 991
    },
    "status": "geerntet",
    "text": "",
@@ -72768,7 +72796,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1051
+    "line": 1061
    },
    "status": "geerntet",
    "text": "",
@@ -72912,7 +72940,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1929
+    "line": 1939
    },
    "status": "geerntet",
    "text": "",
@@ -72940,7 +72968,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1924
+    "line": 1934
    },
    "status": "geerntet",
    "text": "",
@@ -73439,7 +73467,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1160
+      "line": 1170
      }
     }
    },
@@ -73493,7 +73521,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1163
+    "line": 1173
    },
    "status": "geerntet",
    "text": "",
@@ -73643,7 +73671,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 994
+    "line": 1004
    },
    "status": "geerntet",
    "text": "",
@@ -73885,7 +73913,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1039
+    "line": 1049
    },
    "status": "erklaert",
    "text": "Before sleep the system tidies up the intermediate store (\"publish round\", about 1.2 s per poll). On: a round that could not move anything is not made again at the next poll as long as nothing has changed (saves the about 1.2 s). Off: every poll makes the round anew. Default off (optional accelerator, \"until metal\"). Effective only if the hierarchical cache is on, SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP is not 0 (default 1), nothing is running and no chunk is open. On the metal it fires (MEMO-SKIP 106/97 lines); that the 1177 ms stall disappears as a result is not shown. Unverified: whether the user should switch it on.",
@@ -75248,7 +75276,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 934
+    "line": 944
    },
    "status": "geerntet",
    "text": "",
@@ -75361,7 +75389,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4371
+      "line": 4381
      }
     }
    },
@@ -77481,7 +77509,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4180
+      "line": 4190
      }
     }
    },
@@ -78042,7 +78070,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2359
+    "line": 2369
    },
    "status": "erklaert",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -78191,7 +78219,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1836
+    "line": 1846
    },
    "status": "geerntet",
    "text": "",
@@ -78248,7 +78276,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1859
+    "line": 1869
    },
    "status": "geerntet",
    "text": "",
@@ -78735,7 +78763,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 763
+    "line": 773
    },
    "status": "erklaert",
    "text": "Pure observation log: after every park D writes additional log lines about the memory row bookkeeping; on a memory leak alarm the orphaned row numbers are appended. Changes no behavior. Default off. Pure diagnostics. Unverified: dependency on another switch.",
@@ -80083,7 +80111,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 870
+      "line": 880
      }
     }
    },
@@ -81210,7 +81238,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1619
+      "line": 1629
      }
     }
    },
@@ -84679,7 +84707,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4358
+      "line": 4368
      }
     }
    },
@@ -85460,25 +85488,25 @@
    "abweichung": 43,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 38
+   "nur_nf": 39
   },
-  "entries": 2697,
-  "envs": 1820,
+  "entries": 2698,
+  "envs": 1821,
   "erklaert": 304,
   "flags": 862,
-  "geerntet": 1672,
+  "geerntet": 1673,
   "kuratiert": 119,
   "unerklaert": 602
  },
- "tree_rev": "27b=84d04adae1+nf=02c7720524",
+ "tree_rev": "27b=84d04adae1+nf=ee0683f429",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "84d04adae1"
   },
   "nf": {
-   "entries": 2499,
-   "rev": "02c7720524"
+   "entries": 2500,
+   "rev": "ee0683f429"
   }
  },
  "warnungen": []
