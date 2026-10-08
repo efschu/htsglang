@@ -191,10 +191,15 @@ class GlooAckChannel:
     """One process's end of the ack stream. Follower: ``send_nowait`` /
     ``pump``. PP0: ``harvest``. Nothing here ever blocks the caller."""
 
-    def __init__(self, group: Any, pp_rank: int, world_ranks: List[int]):
+    def __init__(self, group: Any, pp_rank: int, world_ranks: List[int],
+                 tag: int = PDFLIP_TOLD_ACK_TAG, label: str = "told-ack"):
         self.group = group
         self.pp_rank = int(pp_rank)
         self.world_ranks = list(world_ranks)
+        #: PR (pdflip/pp_room_vote.py) runs a second stream of the same shape on
+        #: its own tag; the told-ack defaults are unchanged.
+        self.tag = int(tag)
+        self.label = str(label)
         self._inflight: Optional[List[Tuple[Any, Any]]] = None  # (ParkedWait, tensor)
         self._frames: Dict[int, Any] = {}
         self.errors = 0
@@ -228,9 +233,9 @@ class GlooAckChannel:
         self.errors += 1
         if _say(self.errors):
             logger.warning(
-                "PF TOLD-ACK %s failed rank pp=%d (%d so far): %r -- PP0 sends "
+                "PF %s %s failed rank pp=%d (%d so far): %r -- PP0 sends "
                 "told=0 at its Frist for every rid an ack could not carry",
-                what, self.pp_rank, self.errors, exc,
+                self.label, what, self.pp_rank, self.errors, exc,
             )
 
     def send_nowait(self, ack: PdFlipToldReadAck) -> bool:
@@ -253,8 +258,8 @@ class GlooAckChannel:
         works = []
         try:
             for label, t in (("size", size_t), ("payload", data_t)):
-                w = dist.isend(t, dst, group=self.group, tag=PDFLIP_TOLD_ACK_TAG)
-                works.append((ParkedWait(w, f"pdflip/told-ack/{label}"), t))
+                w = dist.isend(t, dst, group=self.group, tag=self.tag)
+                works.append((ParkedWait(w, f"pdflip/{self.label}/{label}"), t))
         except Exception as exc:  # noqa: BLE001 - never into the follower's pass
             self._error("send-post", exc)
             if works:
@@ -281,8 +286,8 @@ class GlooAckChannel:
             frame = self._frames[pp_rank] = ObjectRecvFrame(
                 group=self.group,
                 src_global=src,
-                tag=PDFLIP_TOLD_ACK_TAG,
-                site=f"pdflip/told-ack[pp{pp_rank}]",
+                tag=self.tag,
+                site=f"pdflip/{self.label}[pp{pp_rank}]",
                 rank_desc="pp_rank=0",
             )
         return frame

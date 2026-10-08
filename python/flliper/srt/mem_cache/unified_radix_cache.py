@@ -6813,9 +6813,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # refuse-and-retry-next-pass below skews this stage a pass behind its
         # peers. There the shortfall is evicted and the load runs in THIS pass;
         # None = not that form, False = the residual: the path below unchanged.
-        if kv_tokens > floor:
-            from flliper.srt.pdflip import pp_slot_fidelity as _sf
+        from flliper.srt.pdflip import pp_slot_fidelity as _sf
 
+        # PR (pdflip/pp_room_vote.py): under the stages' agreed R_m, at most R_m
+        floor = _sf.agreed_floor(self, floor)
+        if kv_tokens > floor:
             if _sf.local_pp_room(self, kv_tokens, floor, getattr(req, "rid", None)):
                 # A group of one's floor IS this rank's available_size():
                 # re-read after the eviction, it clears the load-back.
