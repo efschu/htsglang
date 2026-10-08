@@ -343,18 +343,21 @@ class TestCatalog(unittest.TestCase):
         self.assertIn("compressed-tensors", edges["K132"]["satz"])
         self.assertIn("Dual", edges["K132"]["satz"])                    # 'Dual not affected' is in the words, with its plan source
         self.assertIn("nicht betroffen", edges["K132"]["satz"])
-        # the L3-identity edge (--moe-act-int8 -> --hicache-storage-backend) has NO evidence in this tree (the field is H88-D):
-        # it is not in the proven catalog (offen.txt rule), it stands in offen.txt with the question for the H88-D anchor
-        self.assertNotIn("K134", edges)
-        self.assertFalse([k for k in edges.values() if k["von"] == "--moe-act-int8" and k["nach"] == "--hicache-storage-backend"])
+        # H88-F (08.10.): the L3-identity edge is proven now that H88-D is merged: K134 anchors at the line that
+        # appends the field to the storage identity; offen.txt Nr. 17 (the question for that anchor) is gone
+        k134 = edges["K134"]
+        self.assertEqual((k134["von"], k134["nach"], k134["rel"]), ("--moe-act-int8", "--hicache-storage-backend", "skaliert_mit"))
+        self.assertEqual(k134["baeume"], ["nf"])
+        self.assertEqual(k134["beleg"]["datei"], "python/sglang/srt/mem_cache/hicache_storage.py")
+        self.assertEqual(k134["beleg"]["anker"], 'identity_parts.append("moe_act=int8")')
+        self.assertIn("launcher.py:7709", k134["satz"])
         with open(os.path.join(WEG2, "offen.txt"), encoding="utf-8") as fh:
             offen = fh.read()
-        self.assertRegex(offen, r"(?m)^17\. --moe-act-int8 -> --hicache-storage-backend \(skaliert_mit\)")
-        self.assertIn("H88-D", offen)
+        self.assertNotRegex(offen, r"(?m)^17\. --moe-act-int8")
 
     def test_the_edge_anchors_resolve_in_this_tree(self):
         with open(os.path.join(WEG2, "kantenkatalog_1004.json"), encoding="utf-8") as fh:
-            edges = [k for k in json.load(fh)["kanten"] if k["id"] in ("K132", "K133")]
+            edges = [k for k in json.load(fh)["kanten"] if k["id"] in ("K132", "K133", "K134")]
         res = PC.resolve_edge_belege(edges, TREE, "nf")
         for i, r in res.items():
             self.assertIn(r["status"], PC.ANKER_OK, (i, r))
@@ -374,10 +377,10 @@ class TestCatalog(unittest.TestCase):
         deps = {d["to"]: d for d in cat["entries"]["--moe-act-int8"]["depends"]}
         self.assertEqual(deps["--quantization"]["rel"], "braucht")
         self.assertEqual(deps["--quantization"]["kante"], "K132")
-        self.assertNotIn("--hicache-storage-backend", deps)             # unproven in this tree: offen.txt Nr. 17, not an edge
+        self.assertEqual((deps["--hicache-storage-backend"]["rel"], deps["--hicache-storage-backend"]["kante"]), ("skaliert_mit", "K134"))
         self.assertEqual({d["to"]: d["kante"] for d in cat["entries"]["SGLANG_MOE_ACT_INT8"]["depends"]}, {"--quantization": "K133"})
         self.assertTrue(all(d["belegt"] for n in self.NAMES for d in cat["entries"][n]["depends"]))
-        self.assertEqual((cat["kanten"]["kanten_gesamt"], cat["kanten"]["kanten_belegt"]), (133, 133))
+        self.assertEqual((cat["kanten"]["kanten_gesamt"], cat["kanten"]["kanten_belegt"]), (134, 134))
 
 
 # ---------------------------------------------------------------------------
@@ -538,19 +541,40 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(d, [], "\n".join(x[:200] for x in d[:8]))
         self.assertNotIn("SGLANG_MOE_ACT_INT8", self.abl.result.dump())
 
-    def test_the_switch_form_differs_from_the_golden_only_by_the_switch(self):
+    def test_the_switch_form_differs_from_the_golden_only_by_the_switch_and_what_follows_from_it(self):
+        """H88-F (08.10.): with H88-B/C/D merged the switch has consequences in the dump, all named and nothing else:
+        (1) the switch itself in WEG2-GROUP-ENV P/D (H88-E), (2) the L3 store directory/identity carries ``moe_act=int8``
+        (H88-D: dir suffix and the front's --store-dir), (3) the expert-store identity carries the layout (H88-C: H2c
+        STORE-IDENTITY id + ' layout=marlin_w4a8') and (4) ONE new line 'H88C MOE-LAYOUT layout=marlin_w4a8 P=.. D=..'.
+        Take those four out of the new lines and they ARE the golden lines."""
         want = _read(O.golden_path(GOLDEN, "plan_nf_abl_n3.txt", _LINE))
         d = [x for x in O.diff_lines(want, self.w4a8.result.dump()) if x[:1] in "+-" and x[:3] not in ("+++", "---")]
         plus = [x[1:] for x in d if x[0] == "+"]
         minus = [x[1:] for x in d if x[0] == "-"]
         self.assertTrue(plus)
-        self.assertEqual(len(plus), len(minus))
-        for x in plus:
-            self.assertIn("SGLANG_MOE_ACT_INT8=1", x, x[:200])
+        layout_lines = [x for x in plus if "WEG2-LAUNCH H88C MOE-LAYOUT layout=marlin_w4a8 P=marlin_w4a8 D=marlin_w4a8" in x]
+        self.assertEqual(len(layout_lines), 1, plus)
+        rest = [x for x in plus if x not in layout_lines]
+        self.assertEqual(len(rest), len(minus))
         for x in minus:
             self.assertNotIn("SGLANG_MOE_ACT_INT8", x)
-        # no other line moved: take the switch out of the new lines and they ARE the golden lines
-        self.assertEqual([x.replace(";SGLANG_MOE_ACT_INT8=1", "").replace("SGLANG_MOE_ACT_INT8=1;", "") for x in plus], minus)
+            self.assertNotIn("moe_act", x)
+            self.assertNotIn("marlin_w4a8", x)
+        # the L3 dir suffix: the golden's suffix (03a5fb6b55) is replaced by the identity hash that carries moe_act
+        m_old = re.search(r"-abl-wxp-([0-9a-f]{10})\b", "\n".join(minus))
+        m_new = re.search(r"-abl-wxp-([0-9a-f]{10})\b", "\n".join(rest))
+        self.assertTrue(m_old and m_new)
+        self.assertNotEqual(m_old.group(1), m_new.group(1))
+        self.assertTrue(any('"moe_act": "int8"' in x for x in rest))
+        self.assertTrue(any("SGLANG_MOE_ACT_INT8=1" in x for x in rest))
+        norm = []
+        for x in rest:
+            x = x.replace(";SGLANG_MOE_ACT_INT8=1", "").replace("SGLANG_MOE_ACT_INT8=1;", "")
+            x = x.replace(m_new.group(1), m_old.group(1)).replace(' "moe_act": "int8",', "")
+            x = re.sub(r"(STORE[-_]IDENTITY[=_ ](?:id=)?)[0-9a-f]{24}", r"\1<ID>", x).replace(" layout=marlin_w4a8", "")
+            norm.append(x)
+        want_minus = [re.sub(r"(STORE[-_]IDENTITY[=_ ](?:id=)?)[0-9a-f]{24}", r"\1<ID>", x) for x in minus]
+        self.assertEqual(norm, want_minus)
 
     def test_the_plan_dump_shows_the_switch_in_both_group_environments(self):
         dump = self.w4a8.result.dump()
