@@ -236,3 +236,19 @@ def pick_park_victim(candidates: Iterable[OwnedAnchor], *, chain_ids: set, claim
     if not off:
         return None
     return min(off, key=lambda a: (a.depth, getattr(a.node, "id", 0)))
+
+
+def pick_last_resort_victim(candidates: Iterable[OwnedAnchor], *, chain_ids: set):
+    """MAMBA-LAST-RESORT (``SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT``): the anchor a
+    claim may spill when ``pick_foreign_victim`` / ``pick_park_victim`` found
+    none -- every other slot of the arena holds a request's END or deepest
+    anchor (NF int22, D TP0 17:51:57). The shallowest settled anchor OFF the
+    claimer's park chain, node id breaking the tie (the ranks' trees are
+    replicas); the caller secures its L3 copy first and releases it only when
+    that worked. ``candidates`` come from ``tree_anchors`` with the END anchors
+    offered (``slots`` None = still pinned: pending write, host lock, direct
+    rows). None = nothing may be spilled."""
+    pool = [a for a in candidates if a.slots is not None and id(a.node) not in chain_ids]
+    if not pool:
+        return None
+    return min(pool, key=lambda a: (a.depth, getattr(a.node, "id", 0)))
