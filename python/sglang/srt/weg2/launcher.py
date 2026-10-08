@@ -20037,7 +20037,7 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
     return pplan.refusal
 
 
-def publish_store_identity(model: str, map_path: str, log) -> str:
+def publish_store_identity(model: str, map_path: str, log, layout: str = "") -> str:
     """H2c: die Identitaet des geteilten Expertenstores fuer diesen Boot.
 
     Ein Sentinel ``*.written.json`` sagte bis hier nur "diese Plaetze sind
@@ -20057,14 +20057,34 @@ def publish_store_identity(model: str, map_path: str, log) -> str:
     from sglang.srt.layers.moe import expert_store as _es
 
     try:
-        ident = _es.compute_identity(model, map_path)
+        # H88-C: the weight layout of the expert rows is part of the identity; "" = the default layout (marlin_w4a16),
+        # whose identity is byte-identical to the one before H88-C
+        ident = _es.compute_identity(model, map_path, **({"layout": layout} if layout else {}))
     except OSError as exc:
         log("H2c STORE-IDENTITY ENTFAELLT: %s: %s -> D-Store-Adopt inaktiv"
             % (type(exc).__name__, exc))
         return ""
     log("H2c STORE-IDENTITY id=%s model=%s map=%s (beide Gruppen; ein Sentinel "
-        "ohne diese Identitaet belegt nichts)" % (ident or "-", model, map_path))
+        "ohne diese Identitaet belegt nichts)%s" % (
+            ident or "-", model, map_path,
+            (" layout=%s" % layout) if layout else ""))
     return ident
+
+
+def moe_expert_layout_of_launch(ns, log) -> str:
+    """H88-C: the weight layout of the int4 MoE experts this launch runs in BOTH groups, "" for the default
+    (marlin_w4a16: nothing is logged, nothing changes). P != D is a named refusal before any rank loads a byte."""
+    from sglang.srt.layers.moe import moe_w4a8_layout as _mwl
+
+    try:
+        layout, lp, ld = _mwl.launch_layout(ns)
+    except _mwl.MoeLayoutMismatch as exc:
+        raise Weg2LaunchRefused(str(exc))
+    if layout == _mwl.LAYOUT_W4A16:
+        return ""
+    log("H88C MOE-LAYOUT layout=%s P=%s D=%s (the expert store identity carries the layout; the per-tensor int16 "
+        "scale factors are agreed through the store directory)" % (layout, lp, ld))
+    return layout
 
 
 EXPERT_MAP_DIR_ENV = "SGLANG_WEG2_EXPERT_MAP_DIR"
@@ -26177,7 +26197,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns._host_census = {"record": _census_record, "key": _census_key,
                        "store_dir": expert_store_dir_of(ns),
                        "widths": list(_ARENA_BOOKED_WIDTHS.get(str(ns.model), []))}
-    _estore_id = publish_store_identity(ns.model, _emap, log)
+    _estore_id = publish_store_identity(ns.model, _emap, log, layout=moe_expert_layout_of_launch(ns, log))
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     # H125: the host-RAM price of `--weg2-vision-source ram`, named where the
     # P env is built (the line is empty, and nothing is logged, for `disk`).

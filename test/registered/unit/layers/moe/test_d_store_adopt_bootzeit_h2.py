@@ -225,5 +225,36 @@ class TestLoaderVeto(_Env):
         self.assertFalse(m.weight_name_needed(name.format(2)))
 
 
+
+class TestW4A8LayoutH88C(_Env):
+    """H88-C: the store is shared by BOTH expert layouts (marlin_w4a16, marlin_w4a8).
+
+    Rows are only ever vouched for by sentinels of the SAME boot identity, and H88-C hashes the layout
+    into that identity (expert_store.compute_identity): the A16 boot's sentinels ("h2-toy" here) mean
+    NOTHING to a W4A8 boot -- it must read from the checkpoint instead of adopting foreign-layout rows.
+    The veto that DOES belong to the boot drives repack_rows: the Marlin repack skips exactly the
+    vetoed rows (the pad row stays -- it is not a checkpoint expert).
+    """
+
+    def test_foreign_layout_identity_vetoes_nothing(self):
+        with mock.patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STORE_IDENTITY": "h2-toy-w4a8"}):
+            self.assertEqual(sa.vetoed_global_ids(_layer()), frozenset())
+
+    def test_matching_identity_still_vetoes(self):
+        self.assertEqual(sa.vetoed_global_ids(_layer()), frozenset({8, 10, 11}))
+
+    def test_repack_rows_skips_vetoed_keeps_pad(self):
+        layer = _layer()
+        layer._moe_store_adopt_vetoed_global = frozenset({8, 10, 11})
+        # local ids: 0 = pad (kept), 1..6 -> globals 6..11; vetoed 8,10,11 -> local 3,5,6 out
+        self.assertEqual(sa.repack_rows(layer, 7), [0, 1, 2, 4])
+
+    def test_repack_rows_inert_without_vetoes_or_with_switch_off(self):
+        self.assertIsNone(sa.repack_rows(_layer(), 7))
+        layer = _layer()
+        layer._moe_store_adopt_vetoed_global = frozenset({8, 10, 11})
+        with mock.patch.dict(os.environ, {"SGLANG_MOE_REPACK_SKIP_VETOED": "0"}):
+            self.assertIsNone(sa.repack_rows(layer, 7))
+
 if __name__ == "__main__":
     unittest.main()

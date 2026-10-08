@@ -2610,11 +2610,24 @@ _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES = {
     # cutlass / trtllm / cutedsl: swizzled block scales, alphas) never sets
     # the marker and is refused exactly as before.
     "ModelOptNvFp4FusedMoEMethod": "_moe_offload_nvfp4_marlin_staged",
+    # H88-C: the compressed-tensors int4 x int8-activation MoE scheme (CompressedTensorsWNA16A8MoE, --moe-act-int8).
+    # Its expert-major tensors carry the A16 names, but a scheme that is new to the guard is exactly the #323b
+    # class: the layer is admitted only after the scheme verified every expert-major tensor against
+    # EXPERT_TENSOR_ATTRS (moe_w4a8_layout.assert_offload_covers_w4a8) and set the mark.
+    "CompressedTensorsWNA16A8MoE": "_moe_offload_w4a8_covered",
 }
 
 #: Why a conditional method's half did not stage a layer, per method -- the
 #: reason names the layer's OWN state, so it cannot go stale (#479).
 _OFFLOAD_CONDITIONAL_REASONS = {
+    "CompressedTensorsWNA16A8MoE": (
+        "'CompressedTensorsWNA16A8MoE' (--moe-act-int8, the W4A8 expert layout) is admitted only on a layer whose "
+        "scheme verified that EXPERT_TENSOR_ATTRS names every expert-major tensor the Marlin W4A8 kernel reads "
+        "(packed weights, int16 group scales, zero points) and set the mark {marker!r}; it is absent on this layer. "
+        "The mark is set at the end of process_weights_after_loading -- a layer that reaches the offload install "
+        "without it was never converted by this scheme (a #323b-class gap: the cache would stage a subset of the "
+        "tensors the kernel reads)."
+    ),
     "ModelOptNvFp4FusedMoEMethod": (
         "'ModelOptNvFp4FusedMoEMethod' has a load-time offload half on the "
         "Marlin path only (H68b), and it did not stage this layer: the marker "
