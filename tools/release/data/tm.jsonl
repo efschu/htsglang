@@ -635,3 +635,5 @@
 {"text": "| P aktiv / D aktiv | P active / D active | `ipcboot.PHASE_LABEL` |", "translation": "| P active / D active | P active / D active | `ipcboot.PHASE_LABEL` |"}
 {"text": "| Vision laden / rechnen / entladen | Vision load / encode / unload | `ipcboot.VIS_NAME` |", "translation": "| Vision load / compute / unload | Vision load / encode / unload | `ipcboot.VIS_NAME` |"}
 {"text": "| ja / knapp / nein (hw_fit level, shown) | yes / tight / no | `profil_planer.js`, `propose_verdict.py` |", "translation": "| yes / tight / no (hw_fit level, shown) | yes / tight / no | `profil_planer.js`, `propose_verdict.py` |"}
+{"text": "f\" -- Rang {','.join(str(i) for i in _unarmed)}: weder Wachstums-Record noch Geometrie, \"", "translation": "f\" -- rank {','.join(str(i) for i in _unarmed)}: neither growth record nor geometry, \""}
+{"text": "\"%s: %s -- Schnitt %s ist aus der Referenz (Schnitt %s) nicht auf %d Stufen \"", "translation": "\"%s: %s -- cut %s is from the reference (cut %s) not on %d stages \""}
