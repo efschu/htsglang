@@ -1,7 +1,7 @@
 """Auftrag 2002 C: der Kantenkatalog (kantenkatalog_1004.json) wird gelesen und mit ``CURATED[...]["depends"]`` verschmolzen.
 
 Gepinnt (Nutzerentscheid 05.10., Variante A: Loader + Verschmelzung, KEINE Regelauswertung im Editor):
-  * Jede der 133 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``kante``-ID, ``beleg``, ``satz``); 51 verschmolzen, 82 neu (AP-G 06.10.: K62-K108 neu, alle ohne kuratierte Zwillingskante; AP-H1: K109-K116 Dual-ENV-Tabelle, neu; Katalog-Neubau 07.10.: K117-K131 neu; Prio-Lanes L1 08.10.: K132-K133 neu).
+  * Jede der 133 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``kante``-ID, ``beleg``, ``satz``); 51 verschmolzen, 82 neu (AP-G 06.10.: K62-K108 neu, alle ohne kuratierte Zwillingskante; AP-H1: K109-K116 Dual-ENV-Tabelle, neu; Katalog-Neubau 07.10.: K117-K131 neu; Prio-Lanes L1 08.10.: K135-K136 neu (K132-K134 gehoeren H88)).
   * Die 24 kuratierten Kanten ohne Katalogkante bleiben und sind ``belegt: False`` ("ohne Beleg"), nicht geloescht.
   * Weicht die Beziehungsart ab, bleibt die kuratierte und ``rel_katalog`` traegt die andere (kein stilles Ueberschreiben).
   * ``to_kind`` kennzeichnet das Ziel (flag/env/var/ablehnung/unbekannt): ein Chip zeigt nie stumm ins Leere.
@@ -107,7 +107,7 @@ class RealCatalog(unittest.TestCase):
         self.assertTrue(d["effect"])                    # the curated sentence is untouched
         n_curated = sum(len(c.get("depends", [])) for c in CU.CURATED.values())
         n_all = sum(len(e["depends"]) for e in self.ent.values())
-        self.assertEqual(n_all, n_curated + 82)         # nothing deleted, 82 appended (57 + 8 AP-H1 + 15 Katalog-Neubau 07.10. + 2 Prio-Lanes L1 08.10.)
+        self.assertEqual(n_all, n_curated + 82)         # nothing deleted, 82 appended (57 + 8 AP-H1 + 15 Katalog-Neubau 07.10. + 2 Prio-Lanes L1 08.10., K135-K136)
 
     def test_new_edges_are_appended_with_source_katalog(self):
         d = self.dep("--idle-layout", "--dual-layout")  # K44, not curated

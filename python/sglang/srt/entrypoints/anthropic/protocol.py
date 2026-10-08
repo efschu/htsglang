@@ -511,6 +511,26 @@ class AnthropicMessagesRequest(BaseModel):
     cache_salt: Optional[str] = None
     extra_key: Optional[str] = None
 
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _priority_never_refuses(cls, v: Any) -> Optional[int]:
+        """PRIORITY LANES 1008 (L1): a malformed ``priority`` (text, fraction, bool, NaN, list) is dropped
+        (None), never refused: before the field was declared ``extra="ignore"`` swallowed it and the
+        request ran, and that must stay true with SGLANG_WEG2_LANES=0. Whole numbers pass (an integral
+        float or a digit string too); the lane arithmetic (negative -> 0) is the front's and the adapter's."""
+        if v is None or isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        try:
+            if isinstance(v, float):
+                return int(v) if v == v and v not in (float("inf"), float("-inf")) and v == int(v) else None
+            if isinstance(v, str):
+                return int(v.strip())
+        except (ValueError, OverflowError):
+            return None
+        return None
+
     @field_validator("model")
     @classmethod
     def _validate_model(cls, v):

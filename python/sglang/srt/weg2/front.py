@@ -7169,7 +7169,8 @@ class Front:
     def _lane_note(self, rid: str, payload) -> None:
         """PRIORITY LANES 1008 (L1): read ``payload["priority"]`` into the lane of ``rid`` (negative or
         malformed -> lane 0 with a ``WEG2 LANE-FIELD`` warning), note it in LaneState and the request
-        book. SGLANG_WEG2_LANES off: returns before it looks at the payload."""
+        book, and write the normalised lane back into ``payload["priority"]`` (what P and D receive).
+        SGLANG_WEG2_LANES off: returns before it looks at the payload."""
         if not _lanes.enabled():
             return
         try:
@@ -7179,6 +7180,12 @@ class Front:
                 logger.warning("%s rid=%s priority=%r -> lane %d (%s)", _lanes.MARK_FIELD, rid, raw, lane, why)
             Front._lane_state(self).note(rid, lane)
             Front._req_book(self).lane(rid, lane)
+            # the forwarded payload carries the NORMALISED lane (negative -> 0, text/fraction/bool -> 0,
+            # above LANE_MAX -> LANE_MAX): front, P/D scheduler (`Req.priority`) and the Anthropic adapter
+            # then agree on one number, and a malformed value never reaches a server that would refuse it.
+            # Only when the caller sent the field: absent stays absent.
+            if isinstance(payload, dict) and payload.get(_lanes.FIELD) is not None:
+                payload[_lanes.FIELD] = lane
         except Exception:  # noqa: BLE001 -- an instrument, never the route
             pass
 
