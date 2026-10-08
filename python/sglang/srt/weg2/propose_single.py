@@ -647,10 +647,10 @@ def max_context_fit(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[st
 # ===========================================================================
 
 
-def _entry(flag: str, wert: Any, herkunft: str, begruendung: str, *, state: str = V_OK, code: Optional[str] = None, grund: str = "",
+def _entry(flag: str, wert: Any, herkunft: str, begruendung: str, *, verdict_state: str = V_OK, code: Optional[str] = None, grund: str = "",
            zustand: str = Z_PROPOSED) -> Dict[str, Any]:
     return {"flag": flag, "wert": wert, "herkunft": herkunft, "zustand": zustand, "begruendung": begruendung,
-            "verdikt": {"state": state, "code": code, "grund": grund, "art": VERDICT_ART, "parse": "nicht geprüft"}}
+            "verdikt": {"state": verdict_state, "code": code, "grund": grund, "art": VERDICT_ART, "parse": "nicht geprüft"}}
 
 
 def _fmt(x: float) -> str:
@@ -681,11 +681,11 @@ def build_entries(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str,
                                      "%s; KV cell %s B per attention layer and token (%s)" % (dreason, _fmt(_cell_for(F, dtype)[0] or 0), F["src"]["cell"]))
     out["--context-length"] = _entry("--context-length", v["context"], H_GOAL if g["context_tokens"] else H_RULE,
                                      ("Goal context" if g["context_tokens"] else "Standard goal min(max_position_embeddings %d, %d) (MiniCPM-V-4_6.mdx:63)" % (F["maxpos"], DEFAULT_CONTEXT_TOKENS)),
-                                     state=V_NO if "FIT-CTX" in failing else V_OK, code="FIT-CTX" if "FIT-CTX" in failing else None, grund=failing.get("FIT-CTX", ""))
+                                     verdict_state=V_NO if "FIT-CTX" in failing else V_OK, code="FIT-CTX" if "FIT-CTX" in failing else None, grund=failing.get("FIT-CTX", ""))
     out["--max-total-tokens"] = _entry("--max-total-tokens", v["kv_tokens"], H_RULE,
                                        "KV pool: obligation %d tokens (goal) + rest in the ratio %.1f to Mamba (server_args.py:4405); page size %d; %s MiB" % (
                                            aux["kv_goal"], MAMBA_FULL_MEMORY_RATIO, aux["page"], _fmt(n["kv_main"] + n["kv_draft"])),
-                                       state=fit_state if v["kv_tokens"] else V_UNK, code=fit_code, grund=fit_grund)
+                                       verdict_state=fit_state if v["kv_tokens"] else V_UNK, code=fit_code, grund=fit_grund)
     out["--max-running-requests"] = _entry("--max-running-requests", v["seats"], H_GOAL, "Goal 'seats at the same time' (default 1)")
     fr = v.get("fraction")
     out["--mem-fraction-static"] = _entry(
@@ -694,13 +694,13 @@ def build_entries(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str,
             _fmt(card["usable_mib"] - aux["host_unified"]), _fmt(aux["overhead"]), _fmt(aux["reserve"]), _fmt(aux["pre"]), acc["reserve_herkunft"],
             "; host pool %s MiB deducted (APU)" % _fmt(aux["host_unified"]) if aux["host_unified"] else ""))
         if fr is not None else "Reserve %s MiB (+ context/driver %s MiB) exceeds the card: no fraction possible" % (_fmt(aux["reserve"]), _fmt(aux["overhead"])),
-        state=fit_state if fr is not None else V_NO, code=fit_code if fr is not None else "FIT-RESERVE", grund=fit_grund if fr is not None else "Reserve larger than the card")
+        verdict_state=fit_state if fr is not None else V_NO, code=fit_code if fr is not None else "FIT-RESERVE", grund=fit_grund if fr is not None else "Reserve larger than the card")
     if F["n_lin"] and v.get("slots") is not None:
         out["--max-mamba-cache-size"] = _entry(
             "--max-mamba-cache-size", v["slots"], H_RULE,
             "Lower bound %d (= %d requests x %d slots, mamba_pool_floor.py:264) + rest; per slot %s MiB (%s)" % (
                 acc["mamba_floor_slots"], v["seats"], acc["mamba_floor_slots"] // max(v["seats"], 1), _fmt((F["per_req"] or 0) / MIB), F["src"]["state"]),
-            state=fit_state, code=fit_code, grund=fit_grund)
+            verdict_state=fit_state, code=fit_code, grund=fit_grund)
     out["--chunked-prefill-size"] = _entry("--chunked-prefill-size", v["cps"], H_GOAL if g["chunked_prefill_size"] else H_DEFAULT,
                                            "Card class %s MiB (server_args.py:12767-12837); determines the activation reserve" % _fmt(card["total_mib"]))
     out["--cuda-graph-max-bs-decode"] = _entry("--cuda-graph-max-bs-decode", v["max_bs"], H_RULE,
@@ -745,7 +745,7 @@ def _apply_overrides(entries: List[Dict[str, Any]], overrides: Mapping[str, Any]
             e["wert"], e["herkunft"], e["zustand"] = val, H_OVERRIDE, Z_OVERRIDDEN
         else:
             entries.append(_entry(flag, val, H_OVERRIDE, "overridden: the single card calculation does not know this flag; only the ServerArgs parse checks it",
-                                  state=V_UNK, grund="not in the fit calculation", zustand=Z_OVERRIDDEN))
+                                  verdict_state=V_UNK, grund="not in the fit calculation", zustand=Z_OVERRIDDEN))
     return entries
 
 

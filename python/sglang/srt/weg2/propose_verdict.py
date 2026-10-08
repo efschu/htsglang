@@ -839,14 +839,14 @@ def run_propose_single(req: Mapping[str, Any]) -> Dict[str, Any]:
         fit = p["fit"]
         lvl = {"passt": "ja", "passt nicht": "nein"}.get(p["verdikt"]["state"], "unbelegt")
         flag_of = {w["key"]: w["wert"] for w in werte}.get          # what the proposal settled on (the goals may be defaults)
-        hinweise = [str(r.get("grund") or r.get("schritt")) for r in p.get("relaxations") or []] + list(fit.get("hinweise") or [])
+        hint_list = [str(r.get("grund") or r.get("schritt")) for r in p.get("relaxations") or []] + list(fit.get("hinweise") or [])
         vorschlag = {"schema": "flliper.propose-a/1", "form": "einzel", "n": 1, "werte": werte,
                      "cards": [{"name": p["card"]["name"], "total_mib": int(p["card"]["total_mib"]), "tflops_src": None}],
                      "inventory": {"gleich_wie_profil": False, "n": 1}, "seeds": {},
                      "fit": {"level": lvl, "first": p["verdikt"]["text"], "margin_mib": fit.get("frei_mib"), "lines": [], "marks": [],
                              "art": p["verdikt"].get("art") or PS.VERDICT_ART},
                      "ziele": {"seats": _num(flag_of("--max-running-requests")), "kv_tokens": _num(flag_of("--context-length")), "kv_dtype": flag_of("--kv-cache-dtype")},
-                     "unbelegt": list(p.get("unbelegt") or []), "hinweise": hinweise, "blocker": [], "vektorlaengen": {}, "vektoren_ok": True,
+                     "unbelegt": list(p.get("unbelegt") or []), "hinweise": hint_list, "blocker": [], "vektorlaengen": {}, "vektoren_ok": True,
                      "vektoren_falsch": {}, "basis": os.path.basename(str(getattr(li, "source", "") or "")) or "(no profile)",
                      "argv": list(p["argv"]), "env": {}, "einzelkarte": p}
         profil = dict(profile_identity(li), rolle="basis") if li is not None else {"rolle": "keines", "quelle": "", "datei_sha256": None, "eingabe_sha256": None}
