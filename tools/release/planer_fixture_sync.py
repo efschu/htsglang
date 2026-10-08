@@ -44,6 +44,9 @@ def conv(path):
 
 
 files = sorted(glob.glob(FIX + "/profiles/*.env") + glob.glob(FIX + "/golden/**/*.json", recursive=True) + glob.glob(FIX + "/golden/**/*.txt", recursive=True))
+# F0-E (08.10.2026, NF line): the NF reference golden of test_nf_n3_unchanged_1005 (vector_lengths keys are env names the code spells:
+# SGLANG_MOE_RESIDENT_EXPERT_FRACTION, SGLANG_MOE_SCRATCH_SLOTS) -- the same name rule, no snapshot sha behind it.
+files += sorted(glob.glob(os.path.join(root, "test/registered/unit/pdflip/fixtures/nf_n3_unchanged_1005/*.json")))
 sha_map = {}
 n = 0
 OLD_REF = sys.argv[sys.argv.index("--old-ref") + 1] if "--old-ref" in sys.argv else None     # profiles converted by an earlier run: old bytes from git
