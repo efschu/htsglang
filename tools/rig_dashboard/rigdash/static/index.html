@@ -1379,6 +1379,13 @@ function relHead(b, ipc, topo) {
   if (!ipc) return topo ? esc(topo) : "";
   return `lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json")}`;
 }
+// PRIORITY LANES 1008 (L1): one display row, only when the front reports lane_floor (SGLANG_WEG2_LANES=1);
+// lanes = {lane: {pending, running_p, running_d, parked}} as state.json front.lanes
+function laneRow(b) {
+  const f = ((b.ipc || {}).front || {}).lane_floor != null ? b.ipc.front : (b.front && b.front.lane_floor != null ? b.front : null);
+  if (!f) return null;
+  return ["Lanes", `floor ${fmt(f.lane_floor)}, lanes ${esc(JSON.stringify(f.lanes || {}))} ${ipcTag("front.lane_floor")}`];
+}
 function bootCard(b, now, binders) {
   const m = b.meta || {};
   const c = b.container;
@@ -1445,6 +1452,7 @@ function bootCard(b, now, binders) {
           ["Error lines (ERROR)", fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count) + " " + srcOf(b, "A13")],
           ["Rank stops (named)", fieldIpc(b, "A14") ? fieldIpc(b, "A14").value.slice(-3).map((x) => `${esc(x.group)}.${esc(x.rank)} ${esc(x.code)}${x.ticket ? " " + esc(x.ticket) : ""}`).join(" &middot; ") + " " + ipcTag(fieldIpc(b, "A14").ipc_src) : fmt(b.stop_count || 0) + " " + srcOf(b, "A14")],
           fieldIpc(b, "C6") ? ["D seats n &middot; parked", `${fmt(fieldIpc(b, "C6").value.n)} &middot; ${fmt(fieldIpc(b, "C6").value.parked_n)} ${ipcTag("front.d_seats")}`] : null,
+          laneRow(b),
         ])}
         ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">last ${recent.length} counted flips, height = flip time &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
       </div>

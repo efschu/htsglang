@@ -202,8 +202,8 @@ APG_REL = {
 
 class AuftragG(Basis, unittest.TestCase):
     def test_edge_count_is_pinned(self):
-        self.assertEqual(len(self.kanten), 131)                         # 61 + 47 (K62-K108, AP-G; fix round 1 dropped 2 wrongly typed edges) + 8 (K109-K116, AP-H1: Dual-ENV-Tabelle) + 15 (K117-K131, Katalog-Neubau 07.10.: Waechter-Envs, D-COMPACT, AUX-SPILL, --x-mode/--x-curves)
-        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in range(1, 132)])
+        self.assertEqual(len(self.kanten), 133)                         # 61 + 47 (K62-K108, AP-G; fix round 1 dropped 2 wrongly typed edges) + 8 (K109-K116, AP-H1: Dual-ENV-Tabelle) + 15 (K117-K131, Katalog-Neubau 07.10.: Waechter-Envs, D-COMPACT, AUX-SPILL, --x-mode/--x-curves) + 2 (K135-K136, Prio-Lanes L1; K132-K134 belong to H88 on origin/desk/nf-h88-int22-1008 and stay free here: SGLANG_WEG2_LANE_KEEPALIVE_S / _PREEMPT_CHUNK_TOKENS braucht SGLANG_WEG2_LANES)
+        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in list(range(1, 132)) + [135, 136]])
 
     def test_apg_values_are_curated_and_explained_from_the_source(self):
         for n in APG_NAMES:

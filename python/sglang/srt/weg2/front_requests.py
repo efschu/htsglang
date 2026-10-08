@@ -241,6 +241,13 @@ class RequestBook:
         if row is not None and ip:
             row["client_ip"] = str(ip)
 
+    def lane(self, rid: Any, lane: int) -> None:
+        """PRIORITY LANES 1008 (L1): the request's lane (weg2/lanes.py). Called only with
+        SGLANG_WEG2_LANES=1, so a row (and its ``request_done`` record) carries no ``lane`` key otherwise."""
+        row = self._row(rid)
+        if row is not None:
+            row["lane"] = int(lane)
+
     def est_prompt(self, rid: Any, n: Optional[int]) -> None:
         row = self._row(rid)
         if row is not None and n:
@@ -506,6 +513,8 @@ class RequestBook:
             "legs": {"p": row["leg1_n"], "d": row["leg2_n"]},
             "wall_s": round(end - float(row["arrival_ts"]), 3),
         }
+        if "lane" in row:  # PRIORITY LANES 1008 (L1): only rows the switch-on front noted
+            rec["lane"] = row["lane"]
         return rec
 
 
