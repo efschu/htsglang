@@ -109,9 +109,11 @@ class TestFlipBootUnchanged(unittest.TestCase):
     (e5a274ddb4) produced -- hashes taken from that release, EXCEPT the D segments of Auftrag 880 (Nutzer 03.10. "6 token/s
     prefill in D???"): a D segment whose chunks are all narrower than activity.WIDE_MIN_TOK (admit extends of 25..92 tokens)
     now has tps None and carries admit_n/admit_tok.  Verified by diff against the base release: 10 of 125 segments changed (all D: 8x tps 1..181 tok/s -> None, e.g. a "1.0 tok/s" one),
-    admit keys added, tps of a segment with a wide chunk 80,9 -> 80,5 (no Dual/co key, no P/dec/flip segment touched).  Hashes below are the 880 state."""
-    SEGS = "9a04f69aa116537ccb709ec35b8f77bf01d919e433a63c9a91240b62b29e9823"      # 07.10. English texts: only the strings why/src/reqs_src changed (verified by structured diff against 07c20a35e5, no key/number changed)
-    TIMELINE = "1502f91e5bc7d65d4594211de32879354a60f436b8fc5a38520809e3e7d64710"
+    admit keys added, tps of a segment with a wide chunk 80,9 -> 80,5 (no Dual/co key, no P/dec/flip segment touched).  Hashes below are the 880 state; F0-D 08.10.: re-pinned for the renamed tree (the segments and the timeline are identical to the old tree after the name mapping, verified by a structured diff of the replayed JSON).  Old: segs 9a04f69aa116, timeline 1502f91e5bc7."""
+    # F0-D 08.10. (fLLiper rename): both hashes re-pinned for the renamed tree. The replayed segments/timeline are identical to the old tree after the name
+    # mapping (structured diff of the two JSON dumps: empty); old pins: segs 9a04f69aa116, timeline 1502f91e5bc7.
+    SEGS = "f08946c212612fcea17ea7ea2c9f6470b4695511e269ba23a80b4176b7ac2b88"      # 07.10. English texts: only the strings why/src/reqs_src changed (verified by structured diff against 07c20a35e5, no key/number changed)
+    TIMELINE = "bd2199ac4b215fb0bf77cc8dd3870cab4380e03cd2c60fa63a0525af2a1f8696"
 
     def test_flip_boot_bytes(self):
         r = replay_boot("y8c_0cf3")

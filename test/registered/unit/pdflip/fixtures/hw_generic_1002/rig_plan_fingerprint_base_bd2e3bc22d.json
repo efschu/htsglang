@@ -61,7 +61,7 @@
    230.0,
    230.0
   ],
-  "builtin rig limits (nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924))"
+  "builtin rig limits (nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (pdflip/power_limit.RIG_POWER_LIMIT_W_0924))"
  ],
  "p_stage_card_classes": [
   "RTX5090",

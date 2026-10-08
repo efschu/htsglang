@@ -184,6 +184,8 @@ KIT = os.environ.get("RELEASE_KIT_TOOLS") or os.path.join(REPO, "tools", "releas
 
 
 @unittest.skipUnless(os.path.isfile(RENAME) and os.path.isdir(KIT), "rename_rigdash.py oder das Release-Kit fehlt")
+@unittest.skipUnless(os.path.isdir(os.path.join(PY, "sg" "lang")),
+                     "scenario of the pre-rename tree: the synthetic trees spell the old names and this file is renamed (F0-D)")
 class RenameRoundtrip(unittest.TestCase):
     """Die Generator-Ausgabe muss durch die Editor-Umbenennung (rename_rigdash.py) laufen: kein Rest ``FLLIPER_PDFLIP_``/``flliper/srt`` (Exit 3 sonst),
     gleiche Eintragszahl, ``trees``/``abweichung`` bleiben."""

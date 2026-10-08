@@ -144,6 +144,12 @@ def _run_selfcheck(root: pathlib.Path, pkg: str, sub: str, other_sub: str):
     return json.loads(cp.stdout.strip().splitlines()[-1]), cp.stderr
 
 
+# F0-D (08.10.2026): TestRenamedCopy builds a mini repo from the REAL compat files of this tree and runs them before and after the rename tool: a
+# scenario of the pre-rename tree. On the renamed tree the copied files already spell the new names and the "before" run cannot exist.
+_OLD_PACKAGE_PRESENT = os.path.isdir(os.path.join(os.path.dirname(PKG_DIR), PKG_OLD))
+
+
+@unittest.skipUnless(_OLD_PACKAGE_PRESENT, "scenario of the pre-rename tree: the old package is gone (F0-D)")
 class TestRenamedCopy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -292,7 +298,8 @@ class TestDryRunOldNamesEqualNewNames(unittest.TestCase):
         a, b = _spelled_input(self.li, 0), _spelled_input(self.li, 1)
         self.assertNotEqual(sorted(a.env), sorted(b.env))
         self.assertNotEqual(a.argv, b.argv)
-        self.assertGreater(len([k for k in b.env if nc.canonical_env_name(k) != k]), 5)
+        # the spelling that is NOT canonical must fold: the new one before the rename (canonical side 0), the old one after it (canonical side 1; F0-D)
+        self.assertGreater(len([k for k in (b if nc.CANONICAL_SIDE == 0 else a).env if nc.canonical_env_name(k) != k]), 5)
         self.assertTrue(any(isinstance(t, str) and t.startswith("--%s-" % TOK_NEW) for t in b.argv) or nc.CANONICAL_SIDE == 1)
 
     def test_the_bridge_folds_the_new_spelling_onto_the_old_profile_environment(self):

@@ -13,7 +13,7 @@ converted profile snapshots where the tree records them (`PROVENANCE` in the ref
 
 Prints `PLANER-FIXTURE-SYNC files=<n> repinned=<m>`; exit 3 on any problem (a converted JSON that does not parse, a recorded sha that is
 not found).  Idempotent: a second run changes nothing."""
-import glob, hashlib, json, os, re, sys
+import glob, hashlib, json, os, re, subprocess, sys
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, KIT)
@@ -46,13 +46,22 @@ def conv(path):
 files = sorted(glob.glob(FIX + "/profiles/*.env") + glob.glob(FIX + "/golden/**/*.json", recursive=True) + glob.glob(FIX + "/golden/**/*.txt", recursive=True))
 sha_map = {}
 n = 0
+OLD_REF = sys.argv[sys.argv.index("--old-ref") + 1] if "--old-ref" in sys.argv else None     # profiles converted by an earlier run: old bytes from git
 for f in files:
     old, new = conv(f)
     n += old != new
-    if f.endswith(".env") and old != new:
-        sha_map[hashlib.sha256(old.encode()).hexdigest()] = hashlib.sha256(new.encode()).hexdigest()
+    if f.endswith(".env"):
+        if old == new and OLD_REF:
+            rel = os.path.relpath(f, root)
+            r = subprocess.run(["git", "-C", root, "show", "%s:%s" % (OLD_REF, rel)], capture_output=True)
+            if r.returncode == 0:
+                old = r.stdout.decode("utf-8")
+        if old != new:
+            sha_map[hashlib.sha256(old.encode()).hexdigest()] = hashlib.sha256(new.encode()).hexdigest()
 repinned = 0
-for f in [TEST] + sorted(glob.glob(FIX + "/golden/**/*.provenance.json", recursive=True)):
+# every file of the tree that records the sha of a snapshot: the reference test, the other planner tests that tie to the same
+# snapshots (abnahme, ape_dual: their own PROVENANCE tables) and the provenance json of the goldens
+for f in [TEST] + sorted(glob.glob(os.path.join(root, "test/registered/unit/pdflip/test_planer_*.py"))) + sorted(glob.glob(FIX + "/golden/**/*.provenance.json", recursive=True)):
     t = open(f, encoding="utf-8").read()
     t2 = t
     for a, b in sha_map.items():
