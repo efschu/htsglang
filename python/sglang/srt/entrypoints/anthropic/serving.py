@@ -842,6 +842,10 @@ class AnthropicServing:
         # on every rank. Absent stays absent: the server then mints its own.
         if anthropic_request.rid is not None:
             request_data["rid"] = anthropic_request.rid
+        # PRIORITY LANES 1008 (L1): the lane rides the request to the chat layer (and on to the scheduler's
+        # ``Req.priority``) only with SGLANG_WEG2_LANES=1; off, the field is dropped as it always was.
+        if anthropic_request.priority is not None and envs.SGLANG_WEG2_LANES.get():
+            request_data["priority"] = min(max(0, anthropic_request.priority), 2**31 - 1)  # negative -> lane 0
         if anthropic_request.return_cached_tokens_details:
             request_data["return_cached_tokens_details"] = True
         # Q-460 SALT-ISOLATION: the namespace reaches the chat layer, which
