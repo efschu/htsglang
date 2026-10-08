@@ -61,6 +61,7 @@ main { padding: 12px 16px 40px; max-width: 1500px; margin: 0 auto; }
    selbst (holdAnchor); die Browser-Verankerung ist aus, sonst korrigieren zwei Stellen. */
 html, body { overflow-anchor: none; }
 header .livebox { font-size: 13px; color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
+header .langsw { align-self: center; } header .langsw button { cursor: pointer; }
 header .livebox .note { display: inline-block; min-width: 17em; color: var(--warn); }
 /* <!--DEV:BEGIN--> */
 /* Startflags (Nutzer 29.09.): eingeklappt, Tabellen umbrechen statt seitlich zu scrollen */
@@ -577,6 +578,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
   <span class="sub" id="sub">connecting&hellip;</span>
   <label class="livebox" title="Expert view (user 01.10.): all measurement details, sources and instruments; remembered in this browser"><input type="checkbox" id="expert"> Expert view</label>
   <label class="livebox"><input type="checkbox" id="live-pause"> Pause live update <span class="note" id="pausenote"></span></label>
+  <span class="seg langsw" id="langsw" role="group" aria-label="Language"><button type="button" data-lang="en" class="sel" aria-pressed="true" title="English">EN</button><button type="button" data-lang="de" aria-pressed="false" title="Deutsch">DE</button></span>
   <nav>
     <!--DEV:BEGIN-->
     <a id="gpuqlink" class="lan" href="#" target="_blank" rel="noopener">GPU window plan</a>
@@ -730,6 +732,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
   </details>
 </main>
 <div class="tip" id="tip"></div>
+<script src="i18n.js"></script>
 <script src="zoom.js"></script>
 <script src="tooltip.js"></script>
 <!--DEV:BEGIN-->
@@ -776,9 +779,9 @@ const ENUM_EN = {"ja": "yes", "nein": "no", "teilweise": "partial", "unbekannt":
   "wirkungslos": "ineffective", "erwartet": "expected", "fertig": "done", "fertig+aktiv": "done+active", "im Image aber aus": "in image but off", "Desk": "desk", "offen": "open",
   "entfällt": "dropped", "am Metall belegt": "verified on hardware", "unterstützt": "supported", "nur Desk": "desk only", "ungültig": "invalid", "ungemessen": "unmeasured"};
 const en = (s) => (s != null && Object.prototype.hasOwnProperty.call(ENUM_EN, s)) ? ENUM_EN[s] : s;
-const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("en-US", {maximumFractionDigits: d, minimumFractionDigits: d});
+const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString(RigI18n.loc(), {maximumFractionDigits: d, minimumFractionDigits: d});
 const ago = (s) => s == null ? "—" : s < 90 ? Math.round(s) + " s" : s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h";
-const hhmm = (t) => new Date(t * 1000).toLocaleTimeString("en-GB", {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+const hhmm = (t) => new Date(t * 1000).toLocaleTimeString(RigI18n.lang() === "de" ? "de-DE" : "en-GB", {hour: "2-digit", minute: "2-digit", second: "2-digit"});
 const tip = $("tip");
 
 function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
@@ -876,13 +879,13 @@ function rateCharts(b, key, color, digits, now, binders) {
   const g = key.split("_")[0];
   const zo = z ? {t0: z[0], t1: z[1]} : {};
   const o = Object.assign({gapFrom: ser.gap_from, gapReason: ser.gap_reason, gapKind: ser.gap_kind}, zo);
-  const stepTxt = `${fmt(ser.step || 5)}-s-Eimer`;
+  const stepTxt = `${fmt(ser.step || 5)} s bucket`;
   const dec = /_decode_tps$/.test(key);
   const seats = ser[g + "_decode_seats"], stream = ser[g + "_decode_stream"];
   const extra = dec ? (i) => (seats && seats[i] != null
     ? ` &middot; per stream <b>${fmt(stream[i], 1)}</b> tok/s at avg <b>${fmt(seats[i], 1)}</b> seats` : "") +
-      (ser[key][i] != null ? ` <span class="muted">&middot; Wanduhr inkl. Pausen ${fmt(ser[key][i], 1)}</span>` : "")
-    : (i) => (ser[key][i] != null ? ` <span class="muted">&middot; Wanduhr inkl. Pausen ${fmt(ser[key][i], 0)}</span>` : "");
+      (ser[key][i] != null ? ` <span class="muted">&middot; wall clock incl. pauses ${fmt(ser[key][i], 1)}</span>` : "")
+    : (i) => (ser[key][i] != null ? ` <span class="muted">&middot; wall clock incl. pauses ${fmt(ser[key][i], 0)}</span>` : "");
   const a = spark(`sp-${b.stem}-${key}`, ser.t, ser[rk] || ser[key], color, "tok/s", digits, now,
     Object.assign({}, o, {tipExtra: extra, caption: ser[rk] ? `tok/s during ${dec ? "decode" : "prefill"} (tokens / compute time in ${stepTxt}; gap = phase idle)` : ""}));
   binders.push(a.bind);
@@ -1110,7 +1113,7 @@ function bindPhaseBars() {
       if (!x) { tip.style.display = "none"; return; }
       showTip(phaseTip(x, data.single), e.clientX, e.clientY);
     };
-    bar.onmouseleave = () => { if (!tapPinned) { tip.style.display = "none"; tip.style.whiteSpace = ""; } };
+    bar.onmouseleave = () => { if (!tapPinned) tip.style.display = "none"; };
     bar.onclick = (e) => {        // a tap on the phone
       const [el, x] = segAt(e);
       if (!x) return;
@@ -1823,7 +1826,7 @@ function ttftOf(b, d) {
   const fr = (b.ipc || {}).front || (b.front || {});
   const a = fr.arrival_seat && fr.arrival_seat.ttft_n != null ? fr.arrival_seat : null, tv = fr.ttft_by_via || null, vs = viaSum(tv);
   const r = {m5: (v.ttft_mean_5m_ms || {})[m], n5: (v.ttft_n_5m || {})[m], mb: (v.ttft_mean_boot_ms || {})[m],
-    mx: (v.ttft_max_boot_ms || {})[m], src: v.error ? null : "VictoriaMetrics", n: a ? a.ttft_n : null};
+    mx: (v.ttft_max_boot_ms || {})[m], src: v.error ? null : "VictoriaMetrics", n: a ? a.ttft_n : (tv ? vs.n : null)};
   if (r.mb == null && a && a.ttft_n) { r.mb = a.ttft_ms_sum / a.ttft_n; r.mx = a.ttft_ms_max; r.src = "state.json"; }
   else if (r.mb == null && !a && vs.n) { r.mb = vs.sum / vs.n; r.mx = vs.max; r.src = "state.json front.ttft_by_via"; }
   if (!a && !tv) r.missing = "front delivers neither arrival_seat.ttft_* nor ttft_by_via";
@@ -2057,6 +2060,7 @@ const tplEl = document.createElement("template");
 function morph(el, html) {
   if (!el) return;              // release: the dev part is not in the page
   tplEl.innerHTML = html;
+  RigI18n.translateTree(tplEl.content);       // German mode: the merge compares German with German (i18n.js)
   morphChildren(el, tplEl.content);
 }
 function sameNode(a, b) {
@@ -2078,10 +2082,12 @@ function morphChildren(cur, next) {
   while (c) { const cn = c.nextSibling; cur.removeChild(c); c = cn; }
 }
 function morphNode(c, n) {
-  if (c.nodeType !== 1) { if (c.nodeValue !== n.nodeValue) c.nodeValue = n.nodeValue; return; }
+  if (c.nodeType !== 1) { if (c.nodeValue !== n.nodeValue) { c.nodeValue = n.nodeValue; RigI18n.carry(n, c); } return; }
   const keepOpen = c.nodeName === "DETAILS";
   for (const a of [...c.attributes]) if (!n.hasAttribute(a.name) && !(keepOpen && a.name === "open")) c.removeAttribute(a.name);
-  for (const a of n.attributes) if (!(keepOpen && a.name === "open") && c.getAttribute(a.name) !== a.value) c.setAttribute(a.name, a.value);
+  let carried = false;
+  for (const a of n.attributes) if (!(keepOpen && a.name === "open") && c.getAttribute(a.name) !== a.value) { c.setAttribute(a.name, a.value); carried = true; }
+  if (carried) RigI18n.carry(n, c);
   morphChildren(c, n);
 }
 let selfScrollUntil = 0;

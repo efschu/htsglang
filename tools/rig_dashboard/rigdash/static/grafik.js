@@ -51,7 +51,8 @@
     const a = Math.abs(v);
     if (a >= 1e6) return (v / 1e6).toFixed(1) + " M";
     if (a >= 1e4) return (v / 1e3).toFixed(1) + " k";
-    return v.toFixed(d == null ? (a >= 100 ? 0 : 1) : d);
+    const dd = d == null ? (a >= 100 ? 0 : 1) : d;
+    return LANG() === "de" ? v.toLocaleString("de-DE", { minimumFractionDigits: dd, maximumFractionDigits: dd }) : v.toFixed(dd);
   }
   const srcBadge = (s0) => { const s = SRC_EN[s0] || s0; return !s ? "" : (s !== NO_DATA && (s === LOG || /transition|Übergang|missing|fehlt|–/.test(s)))
     ? `<span class="logsrc" title="Source: ${esc(s)}">${esc(s)}</span>`
@@ -244,7 +245,7 @@
         ctx.fillStyle = C.grid; ctx.fillRect(a, top, Math.max(1, b - a), height);
         if (b - a > 150 * dpr) {
           ctx.fillStyle = C.muted; ctx.font = `${10.5 * dpr}px system-ui, sans-serif`; ctx.textAlign = "center";
-          ctx.fillText(NO_DATA, (a + b) / 2, top + height / 2); ctx.textAlign = "start";
+          ctx.fillText(T(NO_DATA), (a + b) / 2, top + height / 2); ctx.textAlign = "start";
         }
         i = j;
       }
@@ -266,7 +267,7 @@
       if (m.kind === "boot" && x - lastLbl > 40 * dpr) {
         ctx.fillStyle = C.text2;
         ctx.font = `${10 * dpr}px system-ui, sans-serif`;
-        ctx.fillText("Boot", x + 3 * dpr, top + 11 * dpr);
+        ctx.fillText(T("Boot"), x + 3 * dpr, top + 11 * dpr);
         lastLbl = x;
       }
     });
@@ -385,7 +386,7 @@
     charts.ttft = mk("vl-c-ttft", {
       scales: { y: { range: zeroUp(1000) }, n: { range: (u, a, b) => [0, Math.max(4, Math.ceil((b || 0) * 1.2))] } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " s"),
-        Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "n", side: 1, grid: { show: false }, size: 40, label: "Requests", labelSize: 14, labelFont: FONT })],
+        Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "n", side: 1, grid: { show: false }, size: 40, label: T("Requests"), labelSize: 14, labelFont: FONT })],
       series: [{}, line("TTFT per tick (dot = requests with first token in the bucket, mean)", C.s7, "s", { value: valFmt("s", 2, null, 0.001),
           width: 0, fill: undefined, noDot: true, paths: () => null, points: { show: true, size: 7, fill: C.s7 } }),
         line("Requests with first token in the bucket (helper line, click to show)", C.s4, "", { width: 1, fill: undefined, scale: "n", noDot: true, show: false,
@@ -479,7 +480,7 @@
     const isPd = (m) => (m.label || "").startsWith("P>D");
     return [fl.map((m) => m.t), fl.map((m) => (isPd(m) ? m.v : null)), fl.map((m) => (isPd(m) ? null : m.v))];
   }
-  const sigOf = (d) => [d.model, d.range, d.zoom ? "z" : "", (d.cards || []).map((c) => cardLabel(c)).join("|")].join("/");
+  const sigOf = (d) => [d.model, d.range, d.zoom ? "z" : "", LANG(), (d.cards || []).map((c) => cardLabel(c)).join("|")].join("/");
 
   function update(d) {
     if (sigOf(d) !== sig || !charts.pre) { build(d); return; }
@@ -538,6 +539,8 @@
   let rt = null;
   const rebuild = () => { clearTimeout(rt); rt = setTimeout(() => { if (data) { sig = ""; update(data); tiles(data); } }, 200); };
   window.addEventListener("resize", rebuild);
+  // language switch: the canvas texts (axis labels, "no data") and the number format are drawn, not translated in the DOM
+  window.addEventListener("rigdash-lang", () => { if (data) { sig = ""; update(data); tiles(data); heads(data); } });
   try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", rebuild); } catch (e) { /* old browser */ }
   // Legende der Phasen-Bänder: dieselben Klassen wie die Phasenleiste der Boot-Karte
   const PH_NAME = { P: "P prefill", D: "D prefill/extend", dec: "D decode", flip_pd: "Flip P→D", flip_dp: "Flip D→P",

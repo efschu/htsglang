@@ -125,6 +125,47 @@ The history reloads `api/history?from=&to=` in the matching grid (from ≤ 24 mi
 with 1/2/5-s buckets (`series_zoom`); the 60-s tiles stay on "now". The card bars at the top are instantaneous values without a time axis.
 Tests: `tests/test_rates_glatt_0930.py`.
 
+## History 08.10.: decode per batch size, input tokens as levels, sessions, TTFT causes
+
+* **Decode** (user: "decode per stream ersetzt durch decode tok/s gesamt und aufgeteilt ... bs1 ... bs6"): the tiles "Decode tok/s (all streams)" and
+  "Decode tok/s by bs" and the lines bs 1 ... 6 in the decode chart replace per stream p50/p90. A decode interval counts for class k only if ALL its rounds
+  ran at exactly bs = k (`activity.BS_CLASSES`, `Model.buckets` -> `dec_bs<k>_tps` / `dec_bs<k>_busy`, stored as shares like `dec_busy`); the class mean over
+  the shown range is tokens / busy seconds (`history.seat_tiles` -> `dec_by_bs`); a class without such time is "–", never 0.
+* **Input tokens** (user: "springt auf die tokenzahl aus dem cache ... darueber steigt die gruene kurve"): the old chart stacked the RATES tok/s per bucket, but
+  rankstats count a request's cached prefix once at its first chunk, so the stack started at the smeared rate and fell to 0 after every burst. Now the levels
+  of the prefill in progress (`activity.prefill_requests` / `prefill_levels` -> `pf_cache`, `pf_hand`, `pf_new`): the cached prefix is level from the first
+  second of the request (blue), the P->D hand-over share of a D request amber (the boot's measured ratio), the tokens newly prefilled so far (green) rise
+  on top; no prefill = gap. A record with `cached > 0` starts a request (without `prefill.last.ext` that is the finest honest split). `tok_*` rates stay for
+  the cache hit share and the tiers.
+* **Sessions**: from the front's `request_done` events (`sessions.py`): per session the context now (`context_tokens` of its newest request) and the origin
+  IP. The front does not write a client IP (see the note on the page); the column shows "–" until `request_done.client_ip` exists, and the public view
+  (behind the proxy) never carries IPs (`server.without_client_ips`).
+* **TTFT**: `front.arrival_seat.ttft_*` exists only while the arrival-seat rule is armed; `front.ttft_by_via` (request book, both lines) is the second source
+  (dashboard tile, route split, and `vmpush.ttft_from_via` for VictoriaMetrics). An empty TTFT tile names its cause (no boot / no request yet / no block).
+* Source badges `.ipcsrc` / `.logsrc` are cut at 36 characters; the full text is in the floating box of `static/tooltip.js` (`RigTip.place`: the one placement
+  for every floating box, inside the viewport).
+
+## Language switch EN / DE (user 08.10.: "es soll einen umschalter geben deutsch englisch, englisch ist default")
+
+English is the source text of every file; German is a translation memory, `static/i18n_de.json` (`"de"`: whole texts and
+phrases, `"words"`: single words that may be replaced inside a longer text). `static/i18n.js` (`RigI18n`) applies it to what the
+page shows: text nodes and the attributes title / placeholder / aria-label / alt / data-tip. A whole text that is in the memory is replaced
+as a whole, otherwise every phrase of it (two words or more, longest first), so a sentence with figures in it is translated around the
+figures; "2 min ago", "last 15 min", "5 of 6" are word-order rules in `i18n.js`. Not translated: `.mono`, code, pre, identifiers.
+
+* The switch is in the header (EN | DE), default English, remembered in `localStorage` (`rigdash-lang`); `?lang=de|en` overrides it for one visit.
+  It works in both directions without reload: the English of every changed node is kept.
+* `morph()` translates its template before merging, other render paths are caught by a MutationObserver. Canvas texts and number formats
+  (`fmt`, `fmtN`, `toLocaleString(RigI18n.loc())`) follow the language; the charts rebuild on the event `rigdash-lang`.
+* Texts delivered by the Python side (`/api/live`, `/api/history`, the profile catalog) are English and translated on the page, so there is
+  one mechanism and one memory. A text without an entry stays English, never blank.
+* **New English text = add its German to `i18n_de.json`.** `tests/test_i18n_0810.py` fails for a static label without German. For the
+  texts that JS builds: in German mode run `RigI18n.leftovers()` in the console on every tab (Expert view on, `<details>` open) -- it lists
+  what still carries English, as the English original (the key to add) and what is shown.
+* The memory was built from the two revisions of every UI file (1980e8b746 German, 84d04adae1 English; the translation kept the structure) and
+  completed by hand. Known limit: help texts that the profile catalog harvests from the launcher code (argparse `help=`, comments) and the
+  technical tooltips of a measured hardware profile are English in the code and stay English.
+
 ## Depth on hover: "token x–y (n new)" (user 02.10. ~12:04Z / ~12:15Z)
 
 Prefill throughput falls with context depth, so every prefill segment of the phase bar (and the last burst

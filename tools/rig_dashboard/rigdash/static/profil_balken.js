@@ -54,10 +54,11 @@
    ein Test vergleicht beide.  Reine Funktionen (Node/Bun-tauglich) plus `attach` für den Tooltip.  Nur Rig-Ausgabe. */
 (function (root) {
   "use strict";
+  const LOC = () => (typeof RigI18n === "undefined" ? "en-US" : RigI18n.loc());      // the number format follows the page language (i18n.js); node tests have none
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const fmt = (n) => (n == null ? "–" : Math.round(n).toLocaleString("en-US"));
-  const gib = (n) => (n == null ? "–" : (n / 1024).toLocaleString("en-US", { maximumFractionDigits: 1 }));
-  const pct = (a, t) => (t ? (100 * a / t).toLocaleString("en-US", { maximumFractionDigits: 1 }) : "–") + " %";
+  const fmt = (n) => (n == null ? "–" : Math.round(n).toLocaleString(LOC()));
+  const gib = (n) => (n == null ? "–" : (n / 1024).toLocaleString(LOC(), { maximumFractionDigits: 1 }));
+  const pct = (a, t) => (t ? (100 * a / t).toLocaleString(LOC(), { maximumFractionDigits: 1 }) : "–") + " %";
 
   // Reihenfolge, Beschriftung, Erklärung: wie profile_couplings.BAR_SEGMENTS
   const SEGS = [
