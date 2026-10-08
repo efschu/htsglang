@@ -263,8 +263,14 @@ class TokenCutLoadBackRoomTest(unittest.TestCase):
             self.assertEqual(adders[r].can_run_list, [])
             # nobody loaded back: the vote came first and was NO_TOKEN
             self.assertEqual(adders[r].tree_cache.load_backs, [])
-            # the room attempt ran before the vote: shortfall asked, 7616 paid
-            self.assertEqual(adders[r].tree_cache.evicts, [(KV_ROWS - AVAILABLE, DELIVERED)])
+            # the room attempt ran before the vote: shortfall asked, 7616 paid.
+            # H110: the shortfall is the pass's rows -- the load-back plus the
+            # 12647-token rest behind it (one chunk at width 16384) plus the
+            # allocator's page (page_size=1 here)
+            self.assertEqual(
+                adders[r].tree_cache.evicts,
+                [(KV_ROWS + (EXTENT[0] + UNCACHED - KV_ROWS) + 1 - AVAILABLE, DELIVERED)],
+            )
         self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})
         self.assertEqual(_refused(), 3)
 
