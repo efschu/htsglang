@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The presence probe asks the WHOLE key chain when it asks about the mamba anchor.
 
-Metal gmps14 (boot ...dual1mpsleepbar1fs10020256_4d088c5af7, D TP0, weg2-0-19):
+Metal gmps14 (boot ...dual1mpsleepbar1fs10020256_4d088c5af7, D TP0, pdflip-0-19):
 P's leg 1 (N=19941, 17450 cached, tail 2491) had written the tail to the store
 before D's first probe -- ``#1028B FETCH CAP n=1: kv=1024 claimed=0 lost=1024
 keys=1024 anchors_in_range mamba (0, -1)`` -- yet ``H108 PRESENCE-PROBE ...
@@ -22,15 +22,15 @@ import tempfile
 
 import pytest
 
-from sglang.srt.managers import cache_controller as CC
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig, PoolName
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import cache_controller as CC
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig, PoolName
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
-TAIL = 2491          # weg2-0-19's tail, pages at page_size 1
-BATCH = 1024         # SGLANG_HICACHE_STORAGE_BATCH on the dual boots
+TAIL = 2491          # pdflip-0-19's tail, pages at page_size 1
+BATCH = 1024         # FLLIPER_HICACHE_STORAGE_BATCH on the dual boots
 
 
 def _backend(tmpdir):

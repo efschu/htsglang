@@ -11,7 +11,7 @@ import pytest
 import torch
 from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
 
-from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+from flliper.srt.layers.quantization.compressed_tensors.ct_embedding import (
     CompressedTensorsPackedEmbeddingMethod,
 )
 
@@ -66,7 +66,7 @@ def test_vocab_loader_attrs_shard_rows_not_the_packed_axis():
 
 
 def test_logits_gate_accepts_a_packed_head():
-    from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+    from flliper.srt.layers.logits_processor import should_apply_lm_head_quant_method
 
     head = SimpleNamespace(weight_packed=torch.zeros(2, 2, dtype=torch.int32))
     method = SimpleNamespace(apply=lambda *a, **k: None)
@@ -79,10 +79,10 @@ def test_logits_gate_accepts_a_packed_head():
 def test_scheme_selection_by_explicit_target_names():
     """AutoRound lists module NAMES as targets; a 6-bit symmetric group must
     resolve to the widened WNA16 scheme, an INT8 g128 target to the 8-bit one."""
-    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
-    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    from flliper.srt.layers.quantization.compressed_tensors.schemes import (
         CompressedTensorsWNA16,
     )
 
@@ -121,10 +121,10 @@ def test_explicit_target_wins_over_a_parent_entry_in_the_ignore_list(monkeypatch
     came up unquantized with ``weight_packed`` tensors to load. An explicit
     target name must resolve to its scheme; a name only covered by the
     ignore list stays unquantized."""
-    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
-    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    from flliper.srt.layers.quantization.compressed_tensors.schemes import (
         CompressedTensorsWNA16,
     )
 
@@ -158,10 +158,10 @@ def test_fused_module_resolves_through_its_explicitly_targeted_shards(monkeypatc
     while their parent ``linear_attn`` sits in the ignore list; the sibling
     ``in_proj_ba`` (shards in_proj_b/in_proj_a) is bf16 in the checkpoint
     and listed in ignore. Shards with different schemes are refused."""
-    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
-    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    from flliper.srt.layers.quantization.compressed_tensors.schemes import (
         CompressedTensorsWNA16,
     )
 
@@ -201,7 +201,7 @@ def test_fused_module_resolves_through_its_explicitly_targeted_shards(monkeypatc
 
 
 def test_dequantize_pack_quantized_weight_roundtrips_int8_g64():
-    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+    from flliper.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
         dequantize_pack_quantized_weight,
     )
 
@@ -221,7 +221,7 @@ def test_dequantize_pack_quantized_weight_roundtrips_int8_g64():
 def test_load_packed_hc_linear_widens_into_the_dense_parameter():
     """Packed and scale arrive as two separate tensors (any order); the
     weight_shape tensor is absorbed; a foreign name is not claimed."""
-    from sglang.srt.models.qwen4_exp import load_packed_hc_linear
+    from flliper.srt.models.qwen4_exp import load_packed_hc_linear
 
     out, inp, group = 6, 256, 64
     g = torch.Generator().manual_seed(5)
@@ -247,7 +247,7 @@ def test_vocab_gets_a_quant_config_only_when_a_group_names_it():
     """cyankiwi: targets [Linear], embedding dense and not in ignore -> no
     quant_config for the vocab (the ignore-only rule would say quantized).
     Minachist: `re:.*embed_tokens` names it -> quantized. Explicit names too."""
-    from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+    from flliper.srt.layers.quantization.compressed_tensors.ct_embedding import (
         vocab_named_in_targets,
     )
 

@@ -8,7 +8,7 @@ measured number."""
 
 import unittest
 
-from sglang.srt.planner.kv_ladder_table import (
+from flliper.srt.planner.kv_ladder_table import (
     CardSpec,
     GeometryRungSpec,
     RankScoreProfile,

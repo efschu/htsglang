@@ -37,16 +37,16 @@ deliberately NOT claimed here -- see the module note at the bottom.
 
 import pytest
 
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     FENCE_BLIND_STREAK,
     advance_fence_blind_streak,
 )
-from sglang.srt.mem_cache.hicache_phase_binding import (
+from flliper.srt.mem_cache.hicache_phase_binding import (
     PhasePools,
     RebindRefused,
     check_pool_coverage,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.hicache_storage import PoolName
 
 
 class _Tier:

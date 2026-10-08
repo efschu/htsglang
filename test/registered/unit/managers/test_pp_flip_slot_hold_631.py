@@ -42,7 +42,7 @@ CPU-only, no CUDA, no distributed.
 
 import pytest
 
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
 # #1233 (WEG 2, S0): RETIRED, not deleted.  Every property below rests on an
 # ARMED WINDOW -- a rank that has been told a layout change is coming and must
@@ -425,7 +425,7 @@ def test_does_not_hold_while_a_launched_passs_frame_is_stashed(monkeypatch):
     starvation shape. So the hold releases and the loop walks the ring to the
     slot the frame names.
     """
-    import sglang.srt.managers.scheduler_pp_mixin as ppm
+    import flliper.srt.managers.scheduler_pp_mixin as ppm
 
     r = _predicate_rank()
     r.pp_group = object()

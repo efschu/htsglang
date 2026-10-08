@@ -21,15 +21,15 @@ THE TESTS ASSERT ON THE STORE'S CONTENT, not on the counter. A counter can be
 incremented by a fix that still persists.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import inspect
 import unittest
 
-from sglang.srt.managers.cache_controller import operation_is_stale
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import operation_is_stale
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Op:
@@ -44,7 +44,7 @@ class _Ctl:
 
 def _gen_at(n):
     """Drive the ONE stamp authority to generation n."""
-    from sglang.srt.mem_cache import hicache_phase_binding as b
+    from flliper.srt.mem_cache import hicache_phase_binding as b
 
     b._STATE.reset()
     for _ in range(n):
@@ -91,7 +91,7 @@ class TestNothingIsPersisted(CustomTestCase):
     def _controller_with_store(self):
         import types
 
-        from sglang.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.managers.cache_controller import HiCacheController
 
         ctl = HiCacheController.__new__(HiCacheController)
         ctl.written = []
@@ -125,7 +125,7 @@ class TestNothingIsPersisted(CustomTestCase):
 
 class TestTheConsumerLoopUsesIt(CustomTestCase):
     def test_the_backup_thread_gates_before_persisting(self):
-        from sglang.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.managers.cache_controller import HiCacheController
 
         src = inspect.getsource(HiCacheController.backup_thread_func)
         self.assertIn("operation_is_stale", src)
@@ -137,7 +137,7 @@ class TestTheConsumerLoopUsesIt(CustomTestCase):
     def test_a_refused_operation_is_still_acked(self):
         # An unacked operation stalls the queue; a declined backup is a
         # correct non-persist, exactly as `backup_skip` already is.
-        from sglang.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.managers.cache_controller import HiCacheController
 
         src = inspect.getsource(HiCacheController.backup_thread_func)
         head = src[: src.find("if not self.backup_skip")]
@@ -147,8 +147,8 @@ class TestTheConsumerLoopUsesIt(CustomTestCase):
         # THE STANDING WARNING: an override that shadows the loop would make
         # this fix inert on the live lane, which is exactly what happened to
         # `append_host_mem_release`. Assert the hybrid does NOT override it.
-        from sglang.srt.managers.cache_controller import HiCacheController
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        from flliper.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
         )
 
@@ -161,7 +161,7 @@ class TestTheConsumerLoopUsesIt(CustomTestCase):
 
 class TestTheStampReachesRealOperations(CustomTestCase):
     def test_storage_operations_stamp_themselves(self):
-        from sglang.srt.managers.cache_controller import StorageOperation
+        from flliper.srt.managers.cache_controller import StorageOperation
 
         src = inspect.getsource(StorageOperation.__init__)
         self.assertIn("binding_generation", src)

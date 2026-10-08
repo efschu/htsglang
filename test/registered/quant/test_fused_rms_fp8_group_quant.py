@@ -4,8 +4,8 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=10, suite="stage-a-test-1-gpu-small-amd")
 

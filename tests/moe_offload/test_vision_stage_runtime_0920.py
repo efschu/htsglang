@@ -34,12 +34,12 @@ WHAT THIS PINS, danger direction by danger direction:
 
 import pytest
 
-from sglang.srt.planner import vision_stage as vs
-from sglang.srt.planner.vision_stage_load import (
+from flliper.srt.planner import vision_stage as vs
+from flliper.srt.planner.vision_stage_load import (
     VisionEmbeddingRefused,
     VisionStageLoadRefused,
 )
-from sglang.srt.weg2 import vision_stage_runtime as vsr
+from flliper.srt.pdflip import vision_stage_runtime as vsr
 
 GIB = vs.GIB
 
@@ -209,7 +209,7 @@ def test_the_measured_legs_sit_next_to_the_modelled_ones():
 def test_the_log_line_carries_the_numbers_a_boot_reader_needs():
     rig = Rig([card(2, 0.10, evictable=[band("weights_1", 1.0)])])
     line = run(rig).log_line()
-    assert "W102 Weg2VisionStage" in line
+    assert "W102 PdFlipVisionStage" in line
     assert "card=2" in line and "rows=1024" in line
     assert "weights_1" in line
     assert "free_idle_before=" in line and "slack=" in line

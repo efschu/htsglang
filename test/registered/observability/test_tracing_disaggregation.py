@@ -3,9 +3,9 @@
 import os
 
 # Configure OTLP exporter for faster test execution
-# Must be set before importing sglang trace module
-os.environ.setdefault("SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", "50")
-os.environ.setdefault("SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", "4")
+# Must be set before importing flliper trace module
+os.environ.setdefault("FLLIPER_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", "50")
+os.environ.setdefault("FLLIPER_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", "4")
 
 import logging
 import shlex
@@ -15,13 +15,13 @@ from urllib.parse import urlparse
 
 import requests
 
-from sglang.srt.observability.mooncake_trace import MooncakeRequestStage
-from sglang.srt.observability.req_time_stats import RequestStage
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.otel_collector import LightweightOtlpCollector
-from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
-from sglang.test.test_utils import (
+from flliper.srt.observability.mooncake_trace import MooncakeRequestStage
+from flliper.srt.observability.req_time_stats import RequestStage
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.otel_collector import LightweightOtlpCollector
+from flliper.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
     popen_with_error_check,
 )
-from sglang.utils import wait_for_http_ready
+from flliper.utils import wait_for_http_ready
 
 logger = logging.getLogger(__name__)
 

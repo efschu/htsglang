@@ -13,7 +13,7 @@
 #   - runs_on: GHA runner label for the stage's `runs-on:`. The literal
 #     `$b200_runner` is substituted at workflow-load time with the dynamic
 #     b200 runner tag from check-changes (see runner_configs.py --map).
-#   - rdma_devices (optional): exported as SGLANG_CI_RDMA_ALL_DEVICES env
+#   - rdma_devices (optional): exported as FLLIPER_CI_RDMA_ALL_DEVICES env
 #     to the stage job; absent means unset.
 
 _anchors:

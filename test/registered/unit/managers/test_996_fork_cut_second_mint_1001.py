@@ -3,17 +3,17 @@
 WHAT DIED. NF y6s (50fa5c42d1), P log ...dauer10012224_50fa5c42d1_1001_222413,
 22:27:29, all three P ranks, on the first agent wave:
 
-  P-FORK-CUT CUT  rid=weg2-0-1 site=add_one_req prefix=8704 extend=16384
+  P-FORK-CUT CUT  rid=pdflip-0-1 site=add_one_req prefix=8704 extend=16384
                   prompt=28725 fork=16640 src=told cut=16640 chunk=16384
-  P-FORK-CUT SKIP rid=weg2-0-3 site=add_one_req prefix=8640 extend=8448
+  P-FORK-CUT SKIP rid=pdflip-0-3 site=add_one_req prefix=8640 extend=8448
                   prompt=63216 fork=8704 ... paid
   AssertionError: #996 SECOND CHUNKED MINT IN ONE PASS at add_one_req: this
-                  adder already minted rid=weg2-0-1 and is now being asked to
-                  mint rid=weg2-0-3
+                  adder already minted rid=pdflip-0-1 and is now being asked to
+                  mint rid=pdflip-0-3
 
-THE GAP. The told fork cut weg2-0-1's chunk to 7936 of the 16384 chunk
+THE GAP. The told fork cut pdflip-0-1's chunk to 7936 of the 16384 chunk
 budget; 8448 stayed in ``rem_chunk_tokens`` and the admission loop went on.
-weg2-0-3 entered the same truncating branch of ``add_one_req``, whose #959
+pdflip-0-3 entered the same truncating branch of ``add_one_req``, whose #959
 guard asked only for the RESIDENT continuation (``chunked_req_outstanding``),
 not for this pass's own mint (``new_chunked_req``) -- the end-anchor branch
 asks for both. Pre-existing since P-FORK-CUT (28./29.09.); the PLE hint fix
@@ -30,15 +30,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from sglang.srt import runtime_context as rc
-from sglang.srt.managers import schedule_policy as sp
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils.common import Range
-from sglang.srt.weg2 import p_fork_cut as pfc
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt import runtime_context as rc
+from flliper.srt.managers import schedule_policy as sp
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from flliper.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.utils.common import Range
+from flliper.srt.pdflip import p_fork_cut as pfc
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15)
 
@@ -83,7 +83,7 @@ def _fresh_req(rid, n_tokens, fork=0):
     r.born_spilled_deep = False
     r.last_node = None
     r.mamba_pool_idx = None
-    r._weg2_fork_told = int(fork)  # PP0's verdict off the told (#1400/#1416)
+    r._pdflip_fork_told = int(fork)  # PP0's verdict off the told (#1400/#1416)
     r.finished.return_value = False
     r.needs_host_load_back.return_value = False
     r.set_extend_range = MagicMock(
@@ -110,9 +110,9 @@ def adder(monkeypatch):
     sa = ServerArgs(model_path="dummy")
     set_global_server_args_for_scheduler(sa)
     monkeypatch.setattr(rc, "get_server_args", lambda: _GroupP(sa))
-    monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
-    monkeypatch.delenv("SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL", raising=False)
-    monkeypatch.delenv("SGLANG_WEG2_FORM", raising=False)
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "P")
+    monkeypatch.delenv("FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL", raising=False)
+    monkeypatch.delenv("FLLIPER_PDFLIP_FORM", raising=False)
     sp._SECOND_CONTINUATION_REFUSALS.clear()
     running = MagicMock()
     running.reqs = []
@@ -136,9 +136,9 @@ def _admit(adder, req):
 
 
 def _cut_first(adder):
-    """weg2-0-1's shape: a free told-fork cut that leaves chunk budget behind."""
+    """pdflip-0-1's shape: a free told-fork cut that leaves chunk budget behind."""
     assert pfc.armed(), "the P-FORK-CUT must be armed, or nothing below is reached"
-    first = _fresh_req("weg2-0-1", 20000, fork=7990)
+    first = _fresh_req("pdflip-0-1", 20000, fork=7990)
     _admit(adder, first)
     assert adder.new_chunked_req is first
     assert first.extend_range.end - first.extend_range.start == 7936, (
@@ -152,7 +152,7 @@ def _cut_first(adder):
 def test_second_truncating_request_after_a_fork_cut_is_refused_not_minted(adder):
     """RED on 50fa5c42d1: the #996 assert fires at add_one_req."""
     first = _cut_first(adder)
-    second = _fresh_req("weg2-0-3", 63216)
+    second = _fresh_req("pdflip-0-3", 63216)
     res = _admit(adder, second)
     assert res == AddReqResult.OTHER
     assert adder.new_chunked_req is first, "the first mint keeps the single field"
@@ -188,7 +188,7 @@ def test_whole_fit_request_still_rides_the_left_budget(adder):
 
 def test_without_a_mint_the_truncating_request_is_still_chunked(adder):
     """No first mint in this pass -> the ordinary chunked admission happens."""
-    second = _fresh_req("weg2-0-3", 63216)
+    second = _fresh_req("pdflip-0-3", 63216)
     _admit(adder, second)
     assert adder.new_chunked_req is second
     assert second.extend_range.end - second.extend_range.start == CHUNK

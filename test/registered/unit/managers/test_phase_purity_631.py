@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PHASE_PP,
     PHASE_TP,
     PP_TO_TP,
@@ -31,7 +31,7 @@ from sglang.srt.managers.phase_policy import (
     decide,
     observe_idle,
 )
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.managers.phase_purity import (
     MODE_OFF,
     MODE_PREFILL_IN_TP,
     MODE_STRICT,

@@ -11,7 +11,7 @@ REPO_ROOT = os.environ.get("REPO_ROOT") or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))
 )
 sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
-from sglang.srt.uneven_perf import PlanInputs, PerfCostModel  # noqa: E402
+from flliper.srt.uneven_perf import PlanInputs, PerfCostModel  # noqa: E402
 
 D = os.path.join(REPO_ROOT, "bench216", "logs")
 MODEL = os.path.join(os.environ.get("MODEL_ROOT", "<MODEL_ROOT>"), "Qwen3.6-27B-FP8")

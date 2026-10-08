@@ -2,9 +2,9 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 

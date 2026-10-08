@@ -84,7 +84,7 @@ ARMS = (
 
 
 def build(model_path):
-    from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+    from flliper.srt.uneven_perf import PerfCostModel, PlanInputs
 
     pi = PlanInputs(
         tp_size=3, model_path=model_path, kv_cache_dtype="fp8_e4m3",
@@ -139,7 +139,7 @@ def best_pair(m, gemm, mlp_grid, attn_grid):
 
 
 def main():
-    from sglang.srt.uneven_perf import _attn_candidates, _mlp_candidates
+    from flliper.srt.uneven_perf import _attn_candidates, _mlp_candidates
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--models-cache", default=CACHE_DEFAULT)
@@ -232,7 +232,7 @@ def main():
           "the GDN family is BF16-resident in both checkpoints (2.0 B/param "
           "in\nthe family table), so its real lane is the dense bf16 probe, "
           "not the\ncheckpoint-wide quantized one #324 assigns it.\n")
-    from sglang.srt.uneven_perf import _attn_lane_bracket
+    from flliper.srt.uneven_perf import _attn_lane_bracket
 
     for key, m in models.items():
         gemm = GEMM[key]
@@ -287,7 +287,7 @@ def section5(models):
        between the two bracket endpoints.
     3. the bracket itself, at both endpoints, with the argmax verdict.
     """
-    from sglang.srt.uneven_perf import (
+    from flliper.srt.uneven_perf import (
         _attn_candidates,
         _attn_token_candidates,
         _mlp_candidates,

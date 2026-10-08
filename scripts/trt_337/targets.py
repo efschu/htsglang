@@ -67,7 +67,7 @@ SHAPES
 Derived from the deployed checkpoint's own ``config.json`` and the deployed
 shard plan, never hardcoded. The shard arithmetic is taken from the #368
 harness (``scripts/int8_368/microbench.py``), which cross-checks itself against
-``sglang.srt.distributed.utils._partition_units_raw`` and refuses to emit a
+``flliper.srt.distributed.utils._partition_units_raw`` and refuses to emit a
 table that disagrees with what the ranks would actually build.
 
 Decode runs on the auto vector ``[30,17,17]`` over TP=3. Rank 0 is the 5090

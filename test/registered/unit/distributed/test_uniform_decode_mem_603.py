@@ -30,7 +30,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.scheduler import Scheduler
+from flliper.srt.managers.scheduler import Scheduler
 
 MiB = 1024 * 1024
 

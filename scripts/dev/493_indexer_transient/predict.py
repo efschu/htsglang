@@ -13,7 +13,7 @@ No GPU, no CUDA call, no server. Run it with CUDA_VISIBLE_DEVICES=99.
 
 Defaults are the window-3 geometry (2026-08-03, DeepSeek-V4-Flash TP=3 on the
 club-3090 rig): --chunked-prefill-size 256, C4 span 8196 (the compress_ratio-4
-image of a 32768-token prompt), SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK=2048.
+image of a 32768-token prompt), FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK=2048.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ sys.path.insert(
     ),
 )
 
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.layers.attention.dsv4.indexer import (  # noqa: E402
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.srt.layers.attention.dsv4.indexer import (  # noqa: E402
     _indexer_logits_chunk_rows,
     _indexer_logits_output_bytes,
     _indexer_logits_step_bytes,
@@ -77,9 +77,9 @@ def main() -> int:
         f"{'free@peak':>10} {'corridor':>9}"
     )
     arms = {}
-    for budget in (0, 2048, envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.get()):
-        with envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.override(budget):
-            with envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(args.seq_chunk):
+    for budget in (0, 2048, envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.get()):
+        with envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.override(budget):
+            with envs.FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(args.seq_chunk):
                 rows = _indexer_logits_chunk_rows(
                     chunk_seq=args.seq_chunk,
                     num_heads=args.heads,
@@ -106,7 +106,7 @@ def main() -> int:
         )
 
     off = arms[0]
-    on = arms[envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.get()]
+    on = arms[envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.get()]
     print()
     print(
         f"PREDICTED A/B DELTA (budget off -> shipped default): {off - on:.1f} MiB "

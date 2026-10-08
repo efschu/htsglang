@@ -58,9 +58,9 @@ assertion here while destroying the detector.
 import logging
 import unittest
 
-from sglang.srt.managers import layout_conformance as lc
-from sglang.srt.managers.phase_policy import PHASE_PP, PHASE_TP
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import layout_conformance as lc
+from flliper.srt.managers.phase_policy import PHASE_PP, PHASE_TP
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

@@ -20,11 +20,11 @@ blind for the same reason. The signal has to be QUEUE AGE VERSUS PROGRESS.
 
 import unittest
 
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     ADMISSION_WEDGE_SECONDS,
     admission_wedge_verdict,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestAdmissionWedgeDetector699(CustomTestCase):

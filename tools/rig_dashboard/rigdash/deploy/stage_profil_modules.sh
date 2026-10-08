@@ -1,16 +1,16 @@
 #!/bin/bash
 # Deploy-VORSCHLAG Auftrag 1984 (B): die Planer-Module des Profil-Editors stagen.  GESTAGED: der Lead fuehrt --apply aus, nicht der Schreibtisch.
 #
-# WARUM: install.sh deployt python/sglang der DASHBOARD-Revision nach /opt/rigdash/planner.  Diese Revision (Dashboard-Linie) traegt die
+# WARUM: install.sh deployt python/flliper der DASHBOARD-Revision nach /opt/rigdash/planner.  Diese Revision (Dashboard-Linie) traegt die
 # Rechenmodule des Editors NICHT (profile_json, refusals, profile_catalog(+_curated), model_profile, hardware_profile, profile_couplings,
 # expert_residency, pp_cut): sie liegen auf den PYTHON-Release-Zweigen (desk/profil-editor-release-27b-1005 bzw. -nf-1005).  Ohne sie
 # antwortet der Editor mit "kein Planer-Baum ..." (Route /api/profil/*), das Hardwareprofil mit "kein Planer-Baum mit hardware_profile.py"
 # und die Balken/Topologie mit "kein Planer-Baum mit planner/profile_couplings.py".
 #
-# WAS: legt den VOLLEN Baum python/sglang der Revision <rev> (git archive, ~80 MiB, wie install.sh es fuer den Planer tut) unter
-#   <root>/profil/releases/<sha>/python/sglang
+# WAS: legt den VOLLEN Baum python/flliper der Revision <rev> (git archive, ~80 MiB, wie install.sh es fuer den Planer tut) unter
+#   <root>/profil/releases/<sha>/python/flliper
 # ab und schaltet <root>/profil/current atomar darauf.  Voll, weil der Kindprozess (Kopplungs-Worker, couplings_worker.py) mit der Python der
-# sglang-Umgebung ein echtes `import sglang.srt.planner.profile_couplings` / `sglang.srt.weg2.topology` macht (PYTHONPATH = dieser Baum geht
+# flliper-Umgebung ein echtes `import flliper.srt.planner.profile_couplings` / `flliper.srt.pdflip.topology` macht (PYTHONPATH = dieser Baum geht
 # dem editierbaren Install der Umgebung vor); die Dateipfad-Lader des Dashboards (profil.py, hwprofil.py, modellprofil.py) finden ihre
 # Dateien im selben Baum.  Der bestehende Kartenplaner-Baum (<root>/current, GATE_REV) bleibt UNBERUEHRT.
 #
@@ -31,16 +31,16 @@ root=${RIGDASH_STAGE_ROOT:-/opt/rigdash/kartenplan}
 mode=check
 rev=""
 
-#: relativ zu python/sglang/srt/ -- alles, was Dashboard-Prozess (per Dateipfad) und Kindprozess (per import) fuer den Editor brauchen
+#: relativ zu python/flliper/srt/ -- alles, was Dashboard-Prozess (per Dateipfad) und Kindprozess (per import) fuer den Editor brauchen
 REQUIRED=(
-  weg2/profile_json.py weg2/refusals.py weg2/profile_catalog.py weg2/profile_catalog_curated.py
-  weg2/model_profile.py weg2/card_identity.py weg2/topology.py
+  pdflip/profile_json.py pdflip/refusals.py pdflip/profile_catalog.py pdflip/profile_catalog_curated.py
+  pdflip/model_profile.py pdflip/card_identity.py pdflip/topology.py
   rigmon/hardware_profile.py
   planner/profile_couplings.py planner/expert_residency.py planner/pp_cut.py
 )
 #: die Paket-Wurzeln, ohne die der Kindprozess nicht importieren kann
-#: (sglang/srt hat im Repo bewusst KEIN __init__.py: Namensraum-Paket, gemessen an fa9e7d5c4c)
-REQUIRED_ROOT=(__init__.py srt/planner/__init__.py srt/weg2/__init__.py srt/rigmon/__init__.py)
+#: (flliper/srt hat im Repo bewusst KEIN __init__.py: Namensraum-Paket, gemessen an fa9e7d5c4c)
+REQUIRED_ROOT=(__init__.py srt/planner/__init__.py srt/pdflip/__init__.py srt/rigmon/__init__.py)
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//' | head -40 >&2; exit 2; }
 
@@ -53,9 +53,9 @@ unit_flags() {
 # EIN Baum fuer Editor, Modellprofil, Hardwareprofil UND den Kopplungs-Worker (--profil-tree, Env RIGDASH_PROFIL_TREE).
 # Der Kartenplaner-Baum (KARTENPLAN_TREE bzw. $root/current) bleibt, wie er ist.
 Environment=RIGDASH_PROFIL_TREE=$tree
-# Python der sglang-Umgebung fuer den Kopplungs-Worker (Balken, Topologie-Urteil des Trockenlaufs).  Rig-Standard, im Container die Image-Python:
+# Python der flliper-Umgebung fuer den Kopplungs-Worker (Balken, Topologie-Urteil des Trockenlaufs).  Rig-Standard, im Container die Image-Python:
 Environment=RIGDASH_COUPLINGS_PYTHON=/spinning/htsglang-gpu/.venv/bin/python
-# Der Worker (import sglang, torch) liegt im cgroup der Unit: gemessen RSS 612 MiB nach dem ersten Topologie-Aufruf, die Unit lag bei
+# Der Worker (import flliper, torch) liegt im cgroup der Unit: gemessen RSS 612 MiB nach dem ersten Topologie-Aufruf, die Unit lag bei
 # MemoryCurrent 487 MiB / MemoryPeak 715 MiB gegen MemoryMax=1G.  Ohne mehr Raum killt der OOM-Killer den Worker oder das Dashboard:
 MemoryMax=2G
 # ExecStart um die Flags (jedes hat eine Env-Entsprechung; Flag gewinnt):
@@ -66,7 +66,7 @@ MemoryMax=2G
 #   --model-root             /spinning/llm_stuff/club-3090/models-cache    (wiederholbar, Env RIGDASH_MODEL_ROOTS; Modellprofil schaetzen liest NUR darunter)
 #   --edition release                                                       (Env RIGDASH_EDITION; die veroeffentlichte Ausgabe)
 # NUR Rig-Ausgabe (--edition rig), in release gesperrt (bucht gpuq):
-#   --hw-measure-tree <voller sglang-Baum>/python   (muss rigmon/card_probe.py tragen)
+#   --hw-measure-tree <voller flliper-Baum>/python   (muss rigmon/card_probe.py tragen)
 #   --hw-python       <Interpreter mit torch + sgl_kernel>
 #   --hw-prefix       'systemd-run --scope -q -p MemoryMax=6G'
 #   --hw-tree         nur noetig, wenn die Hardware aus einem anderen Baum als --profil-tree kommen soll (Env HWPROFIL_TREE)
@@ -97,10 +97,10 @@ sha=$(git -C "$repo" rev-parse --verify -q --short=10 "$rev^{commit}") || { echo
 
 missing=()
 for f in "${REQUIRED[@]}"; do
-  git -C "$repo" cat-file -e "$sha:python/sglang/srt/$f" 2>/dev/null || missing+=("python/sglang/srt/$f")
+  git -C "$repo" cat-file -e "$sha:python/flliper/srt/$f" 2>/dev/null || missing+=("python/flliper/srt/$f")
 done
 for f in "${REQUIRED_ROOT[@]}"; do
-  git -C "$repo" cat-file -e "$sha:python/sglang/$f" 2>/dev/null || missing+=("python/sglang/$f")
+  git -C "$repo" cat-file -e "$sha:python/flliper/$f" 2>/dev/null || missing+=("python/flliper/$f")
 done
 if [ ${#missing[@]} -gt 0 ]; then
   echo "REFUSED: $sha traegt die Editor-Module nicht (das ist keine Python-Release-Revision des Profil-Editors, z. B. eine Dashboard-Revision):" >&2
@@ -133,7 +133,7 @@ case "$mode" in
     if [ "$want_extract" = 1 ]; then
       echo "  mkdir -p $root/profil/releases"
       echo "  tmp=\$(mktemp -d $root/profil/.stage.XXXXXX)"
-      echo "  git -C $repo archive $sha python/sglang | tar -x -C \$tmp     # ~80 MiB"
+      echo "  git -C $repo archive $sha python/flliper | tar -x -C \$tmp     # ~80 MiB"
       echo "  echo $sha > \$tmp/REV ; touch \$tmp/STAGED_OK ; mv \$tmp $dst"
     fi
     [ "$want_switch" = 1 ] && echo "  ln -sfn releases/$sha $root/profil/current.new && mv -T $root/profil/current.new $root/profil/current"
@@ -145,7 +145,7 @@ case "$mode" in
       rm -rf "$dst"
       tmp=$(mktemp -d "$root/profil/.stage.XXXXXX")
       trap 'rm -rf "$tmp"' EXIT
-      git -C "$repo" archive "$sha" python/sglang | tar -x -C "$tmp"
+      git -C "$repo" archive "$sha" python/flliper | tar -x -C "$tmp"
       echo "$sha" > "$tmp/REV"
       touch "$tmp/STAGED_OK"
       mv "$tmp" "$dst"

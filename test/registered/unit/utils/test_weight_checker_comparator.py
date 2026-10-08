@@ -11,25 +11,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Unit tests for sglang/srt/utils/weight_checker_comparator.py."""
+"""Unit tests for flliper/srt/utils/weight_checker_comparator.py."""
 
 import unittest
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_utils import (
+from flliper.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
-from sglang.srt.utils.weight_checker_comparator import (
+from flliper.srt.utils.weight_checker_comparator import (
     ComparableWeight,
     Fp8BlockComparable,
     compare_weights,
     select_comparable_weight,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
@@ -131,7 +131,7 @@ class TestCompareQuantPair(CustomTestCase):
 
     def test_chunked_result_matches_unchunked(self):
         reference = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
-        with patch("sglang.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 128 * 128):
+        with patch("flliper.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 128 * 128):
             chunked = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
         eq_c, max_c, mean_c, ex_c = chunked
         eq_r, max_r, mean_r, ex_r = reference
@@ -188,14 +188,14 @@ class TestSelectComparableWeight(CustomTestCase):
         self.assertIsNone(select_comparable_weight(None))
 
     def test_returns_none_for_raw_safe_method(self):
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from flliper.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         # unquantized / int4 / mxfp8 all route to raw (None).
         fake = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
         self.assertIsNone(select_comparable_weight(fake))
 
     def test_raises_on_nvfp4(self):
-        from sglang.srt.layers.quantization.modelopt_quant import (
+        from flliper.srt.layers.quantization.modelopt_quant import (
             ModelOptFp4LinearMethod,
         )
 

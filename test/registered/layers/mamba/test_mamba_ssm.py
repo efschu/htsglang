@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
@@ -13,9 +13,9 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
-from sglang.srt.layers.attention.mamba.ops.mamba_ssm import selective_state_update
-from sglang.srt.utils import get_device, is_sm100_supported
+from flliper.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from flliper.srt.layers.attention.mamba.ops.mamba_ssm import selective_state_update
+from flliper.srt.utils import get_device, is_sm100_supported
 
 
 def selective_state_update_ref(

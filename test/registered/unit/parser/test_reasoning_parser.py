@@ -2,7 +2,7 @@
 
 import unittest
 
-from sglang.srt.parser.reasoning_parser import (
+from flliper.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     CohereCommand4Detector,
     DeepSeekR1Detector,
@@ -15,8 +15,8 @@ from sglang.srt.parser.reasoning_parser import (
     Qwen3Detector,
     ReasoningParser,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -796,7 +796,7 @@ class TestGptOssDetector(CustomTestCase):
     """Test cases for GptOssDetector which delegates to HarmonyParser."""
 
     def setUp(self):
-        from sglang.srt.parser.reasoning_parser import GptOssDetector
+        from flliper.srt.parser.reasoning_parser import GptOssDetector
 
         self.detector = GptOssDetector()
 
@@ -823,7 +823,7 @@ class TestMiniMaxAppendThinkDetector(CustomTestCase):
     """Test cases for MiniMaxAppendThinkDetector."""
 
     def setUp(self):
-        from sglang.srt.parser.reasoning_parser import MiniMaxAppendThinkDetector
+        from flliper.srt.parser.reasoning_parser import MiniMaxAppendThinkDetector
 
         self.detector = MiniMaxAppendThinkDetector()
 
@@ -848,7 +848,7 @@ class TestMiniMaxM3Detector(CustomTestCase):
     """Test cases for MiniMaxM3Detector multi-turn stray-closer handling."""
 
     def _detector(self, force_reasoning=False):
-        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+        from flliper.srt.parser.reasoning_parser import MiniMaxM3Detector
 
         return MiniMaxM3Detector(force_reasoning=force_reasoning)
 
@@ -905,14 +905,14 @@ class TestMiniMaxM3Detector(CustomTestCase):
         self.assertEqual(out.normal_text, "Hello")
 
     def test_minimax_m3_model_type(self):
-        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+        from flliper.srt.parser.reasoning_parser import MiniMaxM3Detector
 
         parser = ReasoningParser("minimax-m3")
         self.assertIsInstance(parser.detector, MiniMaxM3Detector)
 
     def test_force_nonempty_content_via_chat_template_kwargs(self):
         """force_nonempty_content must reach the M3 detector without a TypeError."""
-        from sglang.srt.entrypoints.openai.protocol import (
+        from flliper.srt.entrypoints.openai.protocol import (
             ChatCompletionMessageUserParam,
             ChatCompletionRequest,
         )
@@ -926,7 +926,7 @@ class TestMiniMaxM3Detector(CustomTestCase):
         self.assertTrue(parser.detector._force_nonempty_content)
 
     def test_force_nonempty_content_swaps_when_no_content(self):
-        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+        from flliper.srt.parser.reasoning_parser import MiniMaxM3Detector
 
         detector = MiniMaxM3Detector(force_reasoning=True, force_nonempty_content=True)
         result = detector.detect_and_parse("only reasoning, no closer")
@@ -939,14 +939,14 @@ class TestReasoningParserAdvanced(CustomTestCase):
 
     def test_gpt_oss_model_type(self):
         """Test that gpt-oss model type creates GptOssDetector."""
-        from sglang.srt.parser.reasoning_parser import GptOssDetector
+        from flliper.srt.parser.reasoning_parser import GptOssDetector
 
         parser = ReasoningParser("gpt-oss")
         self.assertIsInstance(parser.detector, GptOssDetector)
 
     def test_minimax_append_think_model_type(self):
         """Test that minimax-append-think creates MiniMaxAppendThinkDetector."""
-        from sglang.srt.parser.reasoning_parser import MiniMaxAppendThinkDetector
+        from flliper.srt.parser.reasoning_parser import MiniMaxAppendThinkDetector
 
         parser = ReasoningParser("minimax-append-think")
         self.assertIsInstance(parser.detector, MiniMaxAppendThinkDetector)
@@ -985,7 +985,7 @@ class TestReasoningParserAdvanced(CustomTestCase):
 
     def test_continue_final_message_with_request(self):
         """Test continue_final_message passes previous content to detector."""
-        from sglang.srt.entrypoints.openai.protocol import (
+        from flliper.srt.entrypoints.openai.protocol import (
             ChatCompletionMessageGenericParam,
             ChatCompletionMessageUserParam,
             ChatCompletionRequest,
@@ -1006,7 +1006,7 @@ class TestReasoningParserAdvanced(CustomTestCase):
 
     def test_force_nonempty_content_via_chat_template_kwargs(self):
         """Test that force_nonempty_content is passed via chat_template_kwargs."""
-        from sglang.srt.entrypoints.openai.protocol import (
+        from flliper.srt.entrypoints.openai.protocol import (
             ChatCompletionMessageUserParam,
             ChatCompletionRequest,
         )
@@ -1112,7 +1112,7 @@ class TestGptOssDetectorToolCall(CustomTestCase):
 
     def test_detect_and_parse_tool_call_raw_text(self):
         """Test that tool_call events use raw_text when available."""
-        from sglang.srt.parser.reasoning_parser import GptOssDetector
+        from flliper.srt.parser.reasoning_parser import GptOssDetector
 
         detector = GptOssDetector()
         # Sequence with CALL...RETURN that produces tool_call events with raw_text
@@ -1128,7 +1128,7 @@ class TestGptOssDetectorToolCall(CustomTestCase):
 
     def test_streaming_tool_call_raw_text(self):
         """Test streaming parse with tool_call events preserving raw_text."""
-        from sglang.srt.parser.reasoning_parser import GptOssDetector
+        from flliper.srt.parser.reasoning_parser import GptOssDetector
 
         detector = GptOssDetector()
         chunks = [

@@ -26,7 +26,7 @@ Hermetic: pure decision logic, no CUDA.
 
 import pytest
 
-from sglang.srt.planner.replayssm_identity import (
+from flliper.srt.planner.replayssm_identity import (
     ProbePlan,
     classify_identity,
     gate_verdict,

@@ -1,4 +1,4 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Generation model tests (CUDA only)
 register_cuda_ci(est_time=150, stage="extra-a", runner_config="1-gpu-large")
@@ -34,15 +34,15 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
-from sglang.test.runners import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import is_hip
+from flliper.test.runners import (
     DEFAULT_PROMPTS,
     HFRunner,
     SRTRunner,
     check_close_model_outputs,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from flliper.test.test_utils import CustomTestCase, is_in_ci
 
 
 @dataclasses.dataclass
@@ -63,7 +63,7 @@ CI_MODELS = [
     ModelCase("google/gemma-2-2b", attention_backend="triton" if is_hip() else None),
 ]
 
-# the complete set of models to test sglang's generation model
+# the complete set of models to test flliper's generation model
 ALL_MODELS = [
     *CI_MODELS,
     ModelCase("Qwen/Qwen2-1.5B", decode_tolerance=7e-2),
@@ -149,7 +149,7 @@ class TestGenerationModels(CustomTestCase):
         )
 
         if model_case.model_path in MAMBA_MODEL_PATHS:
-            env_ctx = envs.SGLANG_MAMBA_CONV_DTYPE.override(dtype_str)
+            env_ctx = envs.FLLIPER_MAMBA_CONV_DTYPE.override(dtype_str)
         else:
             env_ctx = nullcontext()
 

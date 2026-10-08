@@ -41,14 +41,14 @@ predicate to cover them would be a second crying-wolf gate, which the same law
 that motivates this one forbids.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.mem_cache.hicache_flip_writeback import FlipWritebackReport
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_flip_writeback import FlipWritebackReport
+from flliper.test.test_utils import CustomTestCase
 
 
 def _w37g_empty_fence() -> FlipWritebackReport:
@@ -161,7 +161,7 @@ class TestTheSeamActuallyWarns(CustomTestCase):
         import types
         from unittest import mock
 
-        from sglang.srt.managers import phase_flip_runtime as pfr
+        from flliper.srt.managers import phase_flip_runtime as pfr
 
         runtime = pfr.PhaseFlipRuntime.__new__(pfr.PhaseFlipRuntime)
         runtime._last_writeback_report = report

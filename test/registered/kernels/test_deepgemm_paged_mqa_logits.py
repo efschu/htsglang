@@ -6,16 +6,16 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.dsa import (
+from flliper.jit_kernel.dsa import (
     deepgemm_paged_mqa_logits_native,
     deepgemm_paged_mqa_logits_split,
 )
-from sglang.srt.layers.attention.dsa.utils import (
+from flliper.srt.layers.attention.dsa.utils import (
     fp8_mqa_logits_ceil_to_ue8m0,
     fp8_mqa_logits_make_fused_kv,
 )
-from sglang.srt.utils import is_sm90_supported, is_sm100_supported
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.utils import is_sm90_supported, is_sm100_supported
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, suite="nightly-4-gpu-b200", nightly=True)
 
@@ -148,7 +148,7 @@ def _assert_matches_ref(logits, ref_logits, context_lens, B, next_n, max_model_l
 
 def _run_deepgemm_paged_mqa_logits(data, batch_size, next_n, num_heads, max_model_len):
     """Mirrors the DEEPGEMM dispatch in
-    sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._get_topk_paged:
+    flliper.srt.layers.attention.dsa.dsa_indexer.Indexer._get_topk_paged:
     next_n>=2 (target-verify) goes through the native wrapper, everything
     else goes through the split wrapper."""
     import deep_gemm

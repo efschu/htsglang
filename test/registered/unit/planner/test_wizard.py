@@ -4,7 +4,7 @@ Three properties are pinned here, and they are the ones that make the page
 trustworthy rather than merely present.
 
 **A rejected combination is never proposed.** The register
-(:mod:`sglang.srt.planner.rejected`) is the blocklist, and every ``blocked``
+(:mod:`flliper.srt.planner.rejected`) is the blocklist, and every ``blocked``
 row it holds is a combination this project measured and settled. If the
 matrix ever offers one, the wizard is inviting a repeat of work that was
 already done and thrown away.
@@ -29,12 +29,12 @@ import json
 import os
 import tempfile
 
-from sglang.srt.planner import rejected as rejmod
-from sglang.srt.planner import webui
-from sglang.srt.planner import wizard as wz
-from sglang.srt.planner.bench_factors import ABSENT, ESTIMATE, MEASURED
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import rejected as rejmod
+from flliper.srt.planner import webui
+from flliper.srt.planner import wizard as wz
+from flliper.srt.planner.bench_factors import ABSENT, ESTIMATE, MEASURED
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -574,7 +574,7 @@ class TestCommandGeneration(WizardFixture):
         misspelled name and a value of the wrong type all fail here."""
         import argparse
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         cases = [
             ("solo_tp", "off"),
@@ -682,7 +682,7 @@ class TestWizardInIndex(CustomTestCase):
             self.assertNotIn(leaked, h.split("<script>")[1], leaked)
 
     def test_every_new_control_has_a_trade_off_written(self):
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
 
         for key in ("wizard.target", "wizard.usage", "wizard.families",
                     "wizard.command", "wizard.expert"):

@@ -21,8 +21,8 @@ P lief in sein volles Lane-Budget, dann W29 auf resume_memory_occupation,
 0/6 Raenge.
 """
 
-from sglang.srt.weg2 import weight_exchange as wx
-from sglang.srt.weg2 import xchg_manifest as xm
+from flliper.srt.pdflip import weight_exchange as wx
+from flliper.srt.pdflip import xchg_manifest as xm
 
 
 def _joined(widths, axis, name="model.layers.0.attn_hyper_connection.w"):

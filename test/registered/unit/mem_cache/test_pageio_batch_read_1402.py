@@ -11,7 +11,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache.storage.file import pageio
+from flliper.srt.mem_cache.storage.file import pageio
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -64,13 +64,13 @@ def test_read_pages_statuses(tmp_path, pio):
 
 
 def test_env_switch_disables_the_helper(monkeypatch):
-    monkeypatch.setenv("SGLANG_HICACHE_PAGEIO", "0")
+    monkeypatch.setenv("FLLIPER_HICACHE_PAGEIO", "0")
     monkeypatch.setattr(pageio, "_loaded", None)
     monkeypatch.setattr(pageio, "_failed", False)
     assert pageio.load() is None
     monkeypatch.setattr(pageio, "_loaded", None)
     monkeypatch.setattr(pageio, "_failed", False)
-    monkeypatch.delenv("SGLANG_HICACHE_PAGEIO")
+    monkeypatch.delenv("FLLIPER_HICACHE_PAGEIO")
     assert pageio.load() is not None
 
 

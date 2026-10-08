@@ -7,10 +7,10 @@
 Benchmark online serving with dynamic requests.
 
 Usage:
-python3 -m sglang.bench_serving --backend sglang --num-prompt 10
+python3 -m flliper.bench_serving --backend flliper --num-prompt 10
 
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate-range 1,2,4,8,16,32 --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --multi
+python3 -m flliper.bench_serving --backend flliper --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
+python3 -m flliper.bench_serving --backend flliper --dataset-name random --request-rate-range 1,2,4,8,16,32 --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --multi
 """
 
 import argparse
@@ -34,7 +34,7 @@ from data_processing import MsgContent, SampleOutput, get_dataset
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
+from flliper.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
@@ -220,7 +220,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
 
 ASYNC_REQUEST_FUNCS = {
-    "sglang": async_request_openai_completions,
+    "flliper": async_request_openai_completions,
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
 }
@@ -443,7 +443,7 @@ async def benchmark(
     assert inputs_requests_queue.empty()
 
     # Flush cache
-    if "sglang" in backend:
+    if "flliper" in backend:
         requests.post(base_url + "/flush_cache")
 
     time.sleep(1.0)
@@ -704,7 +704,7 @@ def run_benchmark(args_: argparse.Namespace):
     # Set url
     if args.port is None:
         args.port = {
-            "sglang": 30000,
+            "flliper": 30000,
             "lmdeploy": 23333,
             "vllm": 8000,
         }.get(args.backend, 30000)
@@ -715,7 +715,7 @@ def run_benchmark(args_: argparse.Namespace):
         else f"http://{args.host}:{args.port}/v1/models"
     )
 
-    if args.backend in ["sglang", "vllm", "lmdeploy"]:
+    if args.backend in ["flliper", "vllm", "lmdeploy"]:
         api_url = (
             f"{args.base_url}/v1/chat/completions"
             if args.base_url
@@ -797,7 +797,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
-        default="sglang",
+        default="flliper",
         help="Must specify a backend, depending on the LLM Inference Engine.",
     )
     parser.add_argument(
@@ -973,7 +973,7 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        "FLLIPER_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
         "--lora-name",

@@ -24,14 +24,14 @@ import math
 import os
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     attn_kv_replicated,
     partition_units,
     uneven_dcp_kv_replicated,
     set_tp_partition_ratios,
 )
-from sglang.srt.planner import rejected
-from sglang.srt.uneven_perf import (
+from flliper.srt.planner import rejected
+from flliper.srt.uneven_perf import (
     AttnCorePlan,
     PerfCostModel,
     PlanInputs,
@@ -44,8 +44,8 @@ from sglang.srt.uneven_perf import (
     _mlp_candidates,
     _replication_axis_lines,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -124,7 +124,7 @@ class TestWhatTheRuntimeCanActuallyDoToday(CustomTestCase):
         set_tp_partition_ratios(None)
         self.assertFalse(uneven_dcp_kv_replicated(3))
 
-    def test_projection_replication_stays_an_unbuilt_posten(self):
+    def test_projection_replication_stays_an_unbuilt_item(self):
         """The mechanism that is NOT available, named rather than assumed.
 
         ``attn_kv_replicated`` is strictly ``kv < tp``; the ``<=`` flip is
@@ -211,7 +211,7 @@ class TestTheHeadOnlyCandidateSpaceIsEmpty(CustomTestCase):
         "is the head axis empty" on that pair reports five distinct
         candidates for a space in which the attention partition never moves.
         """
-        from sglang.srt.uneven_perf import _attn_partition_key
+        from flliper.srt.uneven_perf import _attn_partition_key
 
         m = _model(_INT8)
         cands = _attn_candidates(m, _GEMM_INT8, _BUDGETS)
@@ -438,7 +438,7 @@ class TestTheAxisIsGatedOnThePredicateThatInstallsIt(CustomTestCase):
     axis only exists where the KV pool runs replicated-heads + token-shard,
     i.e. where ``uneven_dcp_kv_replicated`` holds -- ``dcp_size > 1 and
     get_tp_partition_ratios() is not None``. A boot on the default
-    ``--rank-kv-ratio coupled`` with no ``SGLANG_UNEVEN_DCP`` never reaches
+    ``--rank-kv-ratio coupled`` with no ``FLLIPER_UNEVEN_DCP`` never reaches
     ``dcp_size > 1`` (``server_args.py:9845-9853``), head-shards the KV cache,
     and has no token vector to solve for. Reporting a priced lever with a
     ``funds ctx`` number to that operator is an offer the boot cannot honour.

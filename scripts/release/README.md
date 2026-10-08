@@ -1,15 +1,15 @@
 # Release Scripts
 
-This directory contains scripts to automate version bumping for SGLang releases.
+This directory contains scripts to automate version bumping for fLLiper releases.
 
 ## Scripts
 
-### `bump_sglang_version.py`
-Updates SGLang version across all relevant files following the pattern from [PR #10468](https://github.com/sgl-project/sglang/pull/10468).
+### `bump_flliper_version.py`
+Updates fLLiper version across all relevant files following the pattern from [PR #10468](https://github.com/sgl-project/sglang/pull/10468).
 
 **Usage:**
 ```bash
-python scripts/release/bump_sglang_version.py 0.5.3rc0
+python scripts/release/bump_flliper_version.py 0.5.3rc0
 ```
 
 **Files updated:**
@@ -22,10 +22,10 @@ python scripts/release/bump_sglang_version.py 0.5.3rc0
 - `python/pyproject.toml`
 - `python/pyproject_other.toml`
 - `python/pyproject_npu.toml`
-- `python/sglang/version.py`
+- `python/flliper/version.py`
 
 ### `bump_docs_install_version.py`
-Bumps the release version pinned in the Mintlify install docs — both the `git clone -b v<version> ...sglang.git` "install from source" line and the version-pinned `lmsysorg/sglang:v<version>` Docker example. Mutable tags (`latest`, `dev`) are intentionally left untouched. Driven automatically on release-tag push by [`.github/workflows/bot-bump-docs-version.yml`](../../.github/workflows/bot-bump-docs-version.yml), which opens a PR with the change.
+Bumps the release version pinned in the Mintlify install docs — both the `git clone -b v<version> ...flliper.git` "install from source" line and the version-pinned `lmsysorg/sglang:v<version>` Docker example. Mutable tags (`latest`, `dev`) are intentionally left untouched. Driven automatically on release-tag push by [`.github/workflows/bot-bump-docs-version.yml`](../../.github/workflows/bot-bump-docs-version.yml), which opens a PR with the change.
 
 **Usage:**
 ```bash
@@ -53,11 +53,11 @@ python scripts/release/bump_kernel_version.py 0.4.0
 
 ## Manual Testing Instructions
 
-### Test SGLang Version Bump
+### Test fLLiper Version Bump
 
 1. **Run the script:**
    ```bash
-   python scripts/release/bump_sglang_version.py 0.5.4rc0
+   python scripts/release/bump_flliper_version.py 0.5.4rc0
    ```
 
 2. **Verify changes with git diff:**
@@ -67,7 +67,7 @@ python scripts/release/bump_kernel_version.py 0.4.0
 
 3. **Check specific files contain the new version:**
    ```bash
-   grep -r "0.5.4rc0" python/sglang/version.py
+   grep -r "0.5.4rc0" python/flliper/version.py
    grep -r "0.5.4rc0" python/pyproject.toml
    grep -r "0.5.4rc0" docs/get_started/install.md
    ```
@@ -102,7 +102,7 @@ python scripts/release/bump_kernel_version.py 0.4.0
 
 ## Version Format Validation
 
-- **SGLang versions:** `X.Y.Z` or `X.Y.ZrcN` (e.g., `0.5.3` or `0.5.3rc0`)
+- **fLLiper versions:** `X.Y.Z` or `X.Y.ZrcN` (e.g., `0.5.3` or `0.5.3rc0`)
 - **Kernel versions:** `X.Y.Z` (e.g., `0.4.0`)
 
 The scripts will validate the version format and exit with an error if invalid.

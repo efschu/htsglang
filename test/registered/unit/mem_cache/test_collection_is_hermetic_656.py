@@ -25,7 +25,7 @@ Kept cheap on purpose: importing the modules is what collection does anyway,
 so this adds no new machinery and cannot drift from the thing it protects.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 

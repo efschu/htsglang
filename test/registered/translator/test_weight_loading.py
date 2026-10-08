@@ -37,7 +37,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-from sglang.srt.translator.qwen3_tts_compat import (
+from flliper.srt.translator.qwen3_tts_compat import (
     CompatError,
     retarget_wrapper_device,
     verify_and_load_weights,

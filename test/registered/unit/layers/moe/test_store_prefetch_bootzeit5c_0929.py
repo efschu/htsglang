@@ -24,15 +24,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe import expert_store as es
-from sglang.srt.layers.moe import store_prefetch as sp
-from sglang.srt.layers.moe.fused_moe_triton import layer as fl
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import store_prefetch as sp
+from flliper.srt.layers.moe.fused_moe_triton import layer as fl
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_wNa16_moe as ctm,
 )
-from sglang.srt.models import qwen4_exp
+from flliper.srt.models import qwen4_exp
 
 GEOM = [
     ("w13_weight_packed", (4, 8), torch.int32),
@@ -60,7 +60,7 @@ class _Case(unittest.TestCase):
 
 class TestPrefetchRoundTrip(_Case):
     def test_next_layer_gets_the_prefetched_file_same_bytes_same_size(self):
-        with envs.SGLANG_OPT_LOAD_STORE_PREFETCH.override(True):
+        with envs.FLLIPER_OPT_LOAD_STORE_PREFETCH.override(True):
             sp.note_armed(3)
             sp.note_armed(4)
             for attr, row, dt in GEOM:
@@ -85,7 +85,7 @@ class TestPrefetchRoundTrip(_Case):
 
     def test_only_layers_this_process_presplits_are_touched(self):
         # PP0 owns 0..28: its last layer must not create PP1's layer-29 file.
-        with envs.SGLANG_OPT_LOAD_STORE_PREFETCH.override(True):
+        with envs.FLLIPER_OPT_LOAD_STORE_PREFETCH.override(True):
             sp.note_armed(28)
             n = sp.prefetch_next(28, directory=self.dir, slots=SLOTS,
                                  geometry=GEOM, device_index=None)
@@ -93,7 +93,7 @@ class TestPrefetchRoundTrip(_Case):
         self.assertFalse(os.path.exists(es.store_path(self.dir, "L29", "w13_weight_packed")))
 
     def test_switch_off_prefetches_nothing(self):
-        self.assertFalse(envs.SGLANG_OPT_LOAD_STORE_PREFETCH.get())
+        self.assertFalse(envs.FLLIPER_OPT_LOAD_STORE_PREFETCH.get())
         sp.note_armed(1)
         self.assertEqual(sp.prefetch_next(0, directory=self.dir, slots=SLOTS,
                                           geometry=GEOM, device_index=None), 0)
@@ -104,7 +104,7 @@ class TestWrongGeometryNeverSurvives(_Case):
         # Derived: the prefetch guessed SLOTS, the layer wants SLOTS + 2. The
         # file the prefetch created must go, or the real open refuses it
         # ("shared store ... has N bytes, this layout wants M").
-        with envs.SGLANG_OPT_LOAD_STORE_PREFETCH.override(True):
+        with envs.FLLIPER_OPT_LOAD_STORE_PREFETCH.override(True):
             sp.note_armed(5)
             sp.prefetch_next(4, directory=self.dir, slots=SLOTS,
                              geometry=GEOM[:1], device_index=None)
@@ -122,7 +122,7 @@ class TestWrongGeometryNeverSurvives(_Case):
         # real open behaves exactly as without the prefetch (it refuses).
         es.open_store_uncached(self.dir, "L7", "w13_weight_packed", SLOTS + 2,
                                (4, 8), torch.int32, num_slots=SLOTS + 2)
-        with envs.SGLANG_OPT_LOAD_STORE_PREFETCH.override(True):
+        with envs.FLLIPER_OPT_LOAD_STORE_PREFETCH.override(True):
             sp.note_armed(7)
             sp.prefetch_next(6, directory=self.dir, slots=SLOTS,
                              geometry=GEOM[:1], device_index=None)

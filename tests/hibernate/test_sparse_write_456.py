@@ -27,7 +27,7 @@ Falsifiers (each fails without the mechanism it guards):
 6. ``test_unaligned_writes_are_byte_exact`` -- writes that straddle page
    boundaries, which is every ``torch.save`` record (they are 64-byte aligned,
    not 4096-byte aligned).
-7. ``test_dense_escape_is_bit_identical`` -- ``SGLANG_HIBERNATE_DENSE_WRITE=1``
+7. ``test_dense_escape_is_bit_identical`` -- ``FLLIPER_HIBERNATE_DENSE_WRITE=1``
    produces the same bytes, not merely a loadable file.
 8. ``test_park_uses_the_sparse_writer`` -- ``hibernate.park_weights_to_disk``
    reaches the shipped writer, so reverting the wiring cannot leave this file
@@ -48,7 +48,7 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.srt.model_loader.sparse_write import (
+from flliper.srt.model_loader.sparse_write import (
     DENSE_WRITE_ENV,
     PAGE_SIZE,
     SparseFileWriter,
@@ -417,7 +417,7 @@ def test_park_uses_the_sparse_writer():
     Source-level so it needs no GPU and no distributed group: reverting the
     single line in ``hibernate.py`` must turn this file red.
     """
-    import sglang.srt.model_loader.hibernate as hib
+    import flliper.srt.model_loader.hibernate as hib
 
     src = pathlib.Path(hib.__file__).read_text()
     tree = ast.parse(src)
@@ -437,7 +437,7 @@ def test_restore_path_is_untouched():
     """No version gate, no manifest field, no reader change: the image format
     did not move, so ``HIBERNATE_VERSION`` must not have been bumped for this
     and the restore must still be a plain ``torch.load``."""
-    import sglang.srt.model_loader.hibernate as hib
+    import flliper.srt.model_loader.hibernate as hib
 
     assert hib.HIBERNATE_VERSION == 2
     src = pathlib.Path(hib.__file__).read_text()

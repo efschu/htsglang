@@ -23,8 +23,8 @@ import torch
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.distributed.device_communicators import barlink as B  # noqa: E402
-from sglang.srt.layers.dcp import comm  # noqa: E402
+from flliper.srt.distributed.device_communicators import barlink as B  # noqa: E402
+from flliper.srt.layers.dcp import comm  # noqa: E402
 
 
 class _T:
@@ -107,7 +107,7 @@ def test_helper_passes_the_hint_only_to_classes_that_take_it(monkeypatch):
 
 
 def test_wiring():
-    from sglang.srt.distributed import parallel_state as ps
+    from flliper.srt.distributed import parallel_state as ps
 
     src = inspect.getsource(ps.GroupCoordinator.all_to_all_single_v)
     assert "largest_block_rows=largest_block_rows" in src

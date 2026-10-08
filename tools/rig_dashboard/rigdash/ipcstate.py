@@ -3,13 +3,13 @@
 User order 2026-09-29 (via 27B): "das dashboard soll auch aus der inter prozess
 kommunikation gespeist werden, nicht aus logs".  Per boot, the writers keep
 
-  /spinning/docker-acceptance/<line>/state/<boot_id>/state.json    (weg2.state/1, atomic)
-  /spinning/docker-acceptance/<line>/state/<boot_id>/events.jsonl  (weg2.event/1, append-only)
+  /spinning/docker-acceptance/<line>/state/<boot_id>/state.json    (pdflip.state/1, atomic)
+  /spinning/docker-acceptance/<line>/state/<boot_id>/events.jsonl  (pdflip.event/1, append-only)
   /spinning/docker-acceptance/<line>/state/<boot_id>/stop_request.json
 
-and ``state.json.tag`` is the launcher tag the boot's logs carry (``WEG2 BOOT
+and ``state.json.tag`` is the launcher tag the boot's logs carry (``PDFLIP BOOT
 tag=``), which is how a log-discovered boot finds its state.  Read-only: this
-module never writes there (the one writer is weg2/state_file.py).
+module never writes there (the one writer is pdflip/state_file.py).
 
 What is read from here and what still comes from a log line is listed in
 /spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md; a display fed by a
@@ -28,8 +28,8 @@ from typing import Dict, List, Optional
 from . import names as N
 
 STATE_ROOTS = ("/spinning/docker-acceptance/nf/state", "/spinning/docker-acceptance/27b/state")
-SCHEMA = "weg2.state/1"
-EVENT_SCHEMA = "weg2.event/1"
+SCHEMA = "pdflip.state/1"
+EVENT_SCHEMA = "pdflip.event/1"
 TERMINAL = ("refused_preflight", "stopped_clean", "dead")
 SHOW_S = 6 * 3600.0           # same horizon as the log-discovered boots (live.SHOW_S)
 #: the events the field readers use (ipcfields.py, DASHBOARD-AUS-IPC-INVENTAR rows A12/A14/B1-B7/D4)

@@ -22,9 +22,9 @@ from unittest.mock import patch
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sglang.srt.entrypoints.engine import Engine
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+from flliper.srt.entrypoints.engine import Engine
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=85, stage="base-b", runner_config="1-gpu-small")
 
@@ -86,7 +86,7 @@ class TestCausalLMScoring(CustomTestCase):
         for hf_row, sgl_row in zip(hf, sgl):
             self.assertEqual(len(hf_row), len(sgl_row))
             for h, s in zip(hf_row, sgl_row):
-                self.assertLessEqual(abs(h - s), tol, f"HF={h:.6f} SGLang={s:.6f}")
+                self.assertLessEqual(abs(h - s), tol, f"HF={h:.6f} fLLiper={s:.6f}")
             self.assertAlmostEqual(sum(sgl_row), 1.0, places=6)
 
     # ------------------------------------------------------------------
@@ -94,7 +94,7 @@ class TestCausalLMScoring(CustomTestCase):
     # ------------------------------------------------------------------
 
     def test_scores_match_hf_reference(self):
-        """SGLang scores agree with HuggingFace within 1% tolerance."""
+        """fLLiper scores agree with HuggingFace within 1% tolerance."""
         label_token_ids = []
         tokenizer = AutoTokenizer.from_pretrained(
             _CAUSAL_LM_MODEL, trust_remote_code=True

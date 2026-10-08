@@ -1,6 +1,6 @@
 """H86: Leerlauf ist kein Stillstand -- der Scheduler-Watchdog darf eine Schlafphase nicht als Haenger zaehlen.
 
-fnNV4f4 (25.09.2026): P schlief (WEG2-DORMANT) von 09:36:06 bis 09:40:59, 293 s. Beim Wake setzten PP1/PP2 ihren
+fnNV4f4 (25.09.2026): P schlief (PDFLIP-DORMANT) von 09:36:06 bis 09:40:59, 293 s. Beim Wake setzten PP1/PP2 ihren
 cur_batch und warteten Sekunden auf die Proxy-Tensoren von PP0, bevor forward_ct (erst in _run_batch_forward) weiterzog.
 Die naechste Pruefung sah den Zaehler unveraendert und die Uhr der letzten Bewegung von VOR dem Schlaf: "Scheduler
 watchdog timeout (self.watchdog_timeout=300, self.soft=False) tripped_by=forward-counter-frozen(cur_batch set)" um
@@ -17,7 +17,7 @@ import time
 import unittest
 from unittest import mock
 
-from sglang.srt.utils import watchdog as W
+from flliper.srt.utils import watchdog as W
 
 TIMEOUT = 0.4   # Pruefung alle TIMEOUT/2 = 0,2 s
 
@@ -30,7 +30,7 @@ class _Scenario:
     """Zeitplan aus Abschnitten (Dauer, aktiv, Zaehler 'fest'|'laeuft'); nach dem letzten beendet _Stop den Wachhund.
 
     Der erste Abschnitt ist aktiv mit festem Zaehler: so kennt der Wachhund den Zaehlerstand VOR dem Schlaf, wie der
-    echte Scheduler, dessen letzter Forward vor WEG2-DORMANT lag."""
+    echte Scheduler, dessen letzter Forward vor PDFLIP-DORMANT lag."""
 
     def __init__(self, segments):
         self.t0 = time.perf_counter()

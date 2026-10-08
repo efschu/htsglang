@@ -1,16 +1,16 @@
 """Unit tests for QuarkConfig — CPU-only, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.quark.quark import QuarkConfig
+from flliper.test.test_utils import CustomTestCase
 
-_GET_CAP = "sglang.srt.layers.quantization.quark.quark.get_device_capability"
+_GET_CAP = "flliper.srt.layers.quantization.quark.quark.get_device_capability"
 
 
 def _bare_config() -> QuarkConfig:

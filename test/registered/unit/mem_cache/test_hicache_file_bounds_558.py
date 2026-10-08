@@ -26,7 +26,7 @@ Run with:
     python3 -m pytest test/registered/unit/mem_cache/test_hicache_file_bounds_558.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -40,8 +40,8 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from flliper.test.test_utils import CustomTestCase
 
 _HEX = "0123456789abcdef"
 
@@ -165,7 +165,7 @@ class TestAllocatedAccounting(_TmpDirCase):
         length undercounted the incident's 5.8 million ``.draft`` pages 17-fold,
         so the byte cap bounded a quantity the disk does not care about.
         """
-        from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+        from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
         draft_page = SimpleNamespace(st_size=512, st_blocks=17)
         self.assertEqual(LRUFileEvictor._allocated_size(draft_page), 8704)
@@ -233,7 +233,7 @@ class TestFreeSpaceWatchdog(_TmpDirCase):
         b = _make_backend(d, max_size="8Mi", min_free="1Gi")
         self.assertTrue(b.set(_key(1), _t(4096)))
 
-        logger = logging.getLogger("sglang.srt.mem_cache.storage.file.lru_file_evictor")
+        logger = logging.getLogger("flliper.srt.mem_cache.storage.file.lru_file_evictor")
         with mock.patch("os.statvfs", self._statvfs_with_free(64 * 1024 * 1024)):
             with self.assertLogs(logger, level="ERROR") as captured:
                 b.check_disk_space(force=True)

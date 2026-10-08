@@ -10,7 +10,7 @@ The tests mock ``TokenizerManager.generate_request`` to yield synthetic
 ``text`` chunks for each of the happy, abort, and boundary cases.
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -19,14 +19,14 @@ import unittest
 from typing import List
 from unittest.mock import Mock
 
-from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
-from sglang.srt.entrypoints.openai.serving_transcription import (
+from flliper.srt.entrypoints.openai.protocol import TranscriptionRequest
+from flliper.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.utils import get_or_create_event_loop
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.io_struct import GenerateReqInput
+from flliper.srt.utils import get_or_create_event_loop
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -280,7 +280,7 @@ class TestStreamingIncrementalOutputMode(CustomTestCase):
         return request, get_or_create_event_loop().run_until_complete(drive())
 
     def test_incremental_non_fused_emits_each_delta_verbatim(self):
-        # sglang.private default: each content["text"] IS the new delta, so
+        # flliper.private default: each content["text"] IS the new delta, so
         # the handler should NOT slice it. Client should see exactly what
         # the detokenizer emitted.
         deltas_in = [" The", " President", ":", " Thank", " you"]

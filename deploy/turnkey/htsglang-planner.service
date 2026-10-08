@@ -3,7 +3,7 @@
 # scripts/turnkey_539_render_units.py when the installer writes this
 # unit. They were literal /spinning/htsglang-gpu paths until
 # 2026-08-12, when every unit died with 'No module named
-# sglang.srt.turnkey' because that checkout was not the one
+# flliper.srt.turnkey' because that checkout was not the one
 # [stack].repo named. Change stack.toml, or this template -- never
 # the rendered copy under /etc, which the next install overwrites.
 
@@ -28,7 +28,7 @@ PartOf=htsglang.target
 Type=simple
 WorkingDirectory=@@REPO@@
 Environment=PYTHONPATH=@@REPO@@/python
-ExecStart=@@VENV@@/bin/python -m sglang.planner --serve --port 8780
+ExecStart=@@VENV@@/bin/python -m flliper.planner --serve --port 8780
 
 # DELIBERATELY NOT CUDA_VISIBLE_DEVICES=-1, unlike the router's no-cuda
 # drop-in. That was the first draft here and it is wrong: the planner loads

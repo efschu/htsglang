@@ -1,4 +1,4 @@
-"""L3FILL-JOINED (30.09., NF y4a ep36, weg2-36-74): the read stopped 146 pages
+"""L3FILL-JOINED (30.09., NF y4a ep36, pdflip-36-74): the read stopped 146 pages
 into a 1070-page prefix on every D rank and on P for 5 cycles because 29
 stems were CLAIMED by a writer that never finished ('L3-FILL JOINED stems=29:
 a live writer holds the claim'), and nothing named the holder. Now the JOINED
@@ -14,10 +14,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest
 
-from sglang.srt.mem_cache import hicache_storage as hs
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile
-from sglang.srt.mem_cache.storage.file import hicache_arena as ha
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.mem_cache import hicache_storage as hs
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+from flliper.srt.mem_cache.storage.file import hicache_arena as ha
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 

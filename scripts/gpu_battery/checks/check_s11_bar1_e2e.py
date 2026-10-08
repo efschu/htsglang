@@ -7,7 +7,7 @@ reporting:
   1. host reachable, BAR1 code in the worktree under test (STOP -- nothing was
      measured),
   2. the graph gate. bar1_graph_check.py must have run and every GATE case must
-     have passed. SGLANG_BARLINK_GRAPH_ENABLE=1 without that evidence produces
+     have passed. FLLIPER_BARLINK_GRAPH_ENABLE=1 without that evidence produces
      numbers from an operating point nobody can defend,
   3. was a log harvested at ALL. An empty evidence list means one of two very
      different things -- nobody looked, or nothing was there -- and only the
@@ -60,7 +60,7 @@ from check_common import (  # noqa: E402
 STEP = "s11_bar1_e2e"
 KIND = "bar1_e2e"
 
-# With SGLANG_UNEVEN_DCP=1 the standard run builds two communicator groups. The
+# With FLLIPER_UNEVEN_DCP=1 the standard run builds two communicator groups. The
 # names are prefixes because the counter suffix (tp:0, dcp:0) is an
 # implementation detail of _get_unique_name.
 REQUIRED_GROUP_PREFIXES = ("tp", "dcp")
@@ -96,7 +96,7 @@ def check(step_dir: str) -> None:
         raise CheckStop(
             "bar1_graph_check reported no gate case at all (rc="
             f"{gate.get('rc')!r}) -- the gate never ran, so "
-            "SGLANG_BARLINK_GRAPH_ENABLE=1 is unsupported"
+            "FLLIPER_BARLINK_GRAPH_ENABLE=1 is unsupported"
         )
     if not gate.get("alle_bestanden"):
         raise CheckFail(
@@ -153,7 +153,7 @@ def check(step_dir: str) -> None:
             raise CheckFail(
                 f"no group {prefix!r} in the log (reported: "
                 f"{[g.get('group') for g in groups]}) -- with "
-                "SGLANG_UNEVEN_DCP=1 both tp and dcp have to show up"
+                "FLLIPER_UNEVEN_DCP=1 both tp and dcp have to show up"
             )
         not_bar1 = [g for g in found if g.get("achieved") != "bar1"]
         if not_bar1:

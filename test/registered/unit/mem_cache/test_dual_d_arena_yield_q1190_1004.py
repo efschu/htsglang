@@ -9,14 +9,14 @@ rank 'ARENA-REF-HOLDERS pool=FULL tree=675527 tree_in_use=0 arena_pinned=694560'
 request. A slot frees only when no rank of either group references it: P's claims were
 refused ('#1427 ARENA-DROP freed=0' 2893x, PASS-STALL 871x), P's hand-off pages and
 Mamba anchors did not reach the store, D refused them (W50) and P prefilled them twice
-(W53 Weg2StoreHandbackFailed).
+(W53 PdFlipStoreHandbackFailed).
 
 The fix (dual layout only): a refused claim posts its page need next to the shared arena;
 D's TP0 takes it in the tick, the need rides the tick's group collective, every D rank
 spills host-only H-leaves of its tree (L3 copy first) -- P's next claim finds its room.
 
 Hermetic: the real C arena on a temp file (two pools = two processes on the same file),
-the real ArenaMHAHostPool, the real ``_weg2_direct_claim`` / ``_w3_arena_spill`` /
+the real ArenaMHAHostPool, the real ``_pdflip_direct_claim`` / ``_w3_arena_spill`` /
 ``_evict_for_claim``; pages of 64 B, page_size 1. The new module functions are looked up
 with getattr so that on the base the tests fail by BEHAVIOUR (P's claim stays refused),
 not by an import error."""
@@ -33,28 +33,28 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "weg2"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "pdflip"))
 import test_w3_arena_spill_0929 as W  # noqa: E402
 import test_w3_dual_host_only_spill_q697c_1004 as Q  # noqa: E402
 
-from sglang.srt.weg2 import dual_arena_spill as DS  # noqa: E402
-from sglang.srt.weg2 import dual_d_kv_stage as DK  # noqa: E402
-from sglang.srt.weg2 import dual_p_kv_stage as PK  # noqa: E402
+from flliper.srt.pdflip import dual_arena_spill as DS  # noqa: E402
+from flliper.srt.pdflip import dual_d_kv_stage as DK  # noqa: E402
+from flliper.srt.pdflip import dual_p_kv_stage as PK  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
 FULL = W.FULL
-DUAL_P = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P", PK.MAX_TOKENS_ENV: "131072"}
-DUAL_D = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D", DK.MAX_TOKENS_ENV: "131072"}
-GATE_KEYS = ("SGLANG_WEG2_DUAL_LAYOUT", "SGLANG_WEG2_GROUP", PK.MAX_TOKENS_ENV, DK.MAX_TOKENS_ENV)
+DUAL_P = {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P", PK.MAX_TOKENS_ENV: "131072"}
+DUAL_D = {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D", DK.MAX_TOKENS_ENV: "131072"}
+GATE_KEYS = ("FLLIPER_PDFLIP_DUAL_LAYOUT", "FLLIPER_PDFLIP_GROUP", PK.MAX_TOKENS_ENV, DK.MAX_TOKENS_ENV)
 NOT_DUAL = [
     {},
-    {"SGLANG_WEG2_GROUP": "P"},
-    {"SGLANG_WEG2_GROUP": "D"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"},   # no P KV cap: not armed
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D"},   # no D KV cap: not armed
-    {"SGLANG_WEG2_GROUP": "D", DK.MAX_TOKENS_ENV: "131072"},      # no dual layout (flip)
+    {"FLLIPER_PDFLIP_GROUP": "P"},
+    {"FLLIPER_PDFLIP_GROUP": "D"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P"},   # no P KV cap: not armed
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D"},   # no D KV cap: not armed
+    {"FLLIPER_PDFLIP_GROUP": "D", DK.MAX_TOKENS_ENV: "131072"},      # no dual layout (flip)
 ]
 
 
@@ -83,7 +83,7 @@ def _y9d1(tmp_path):
     tp.tree_components = (FULL,)
     g = Q._Group(pp)                                                     # the 27B's HostPoolGroup
     tp.cache_controller.mem_pool_host = g
-    tp._weg2_direct_pool = lambda: g
+    tp._pdflip_direct_pool = lambda: g
     return tp, td, d_nodes, root, arena
 
 
@@ -106,14 +106,14 @@ def test_y9d1_d_tree_holds_the_shared_arena_p_claim_gets_room_after_d_yield(tmp_
     tp, td, d_nodes, root, arena = _y9d1(tmp_path)
     _env(monkeypatch, DUAL_P)
     m = W._claimer(tp)
-    assert tp._weg2_direct_claim(m) is False                             # the metal line, reproduced
+    assert tp._pdflip_direct_claim(m) is False                             # the metal line, reproduced
     assert tp.refused == ["arena_claim"]
     _env(monkeypatch, DUAL_D)
     need, got = _d_side(td)
     assert need == 2, "P's refused claim did not reach group D"
     assert got is not None and got["released"] >= 2
     _env(monkeypatch, DUAL_P)
-    pre = tp._weg2_direct_claim(m)
+    pre = tp._pdflip_direct_claim(m)
     assert pre is not False, f"P's claim still refused after D's yield: {tp.refused}"
     assert pre is not None and int(pre.numel()) == 2
     for n in d_nodes:                                                    # #257: no page left L2 without L3
@@ -128,7 +128,7 @@ def test_y9d1_d_tree_holds_the_shared_arena_p_claim_gets_room_after_d_yield(tmp_
 def test_the_need_is_taken_once_and_only_by_tp0(tmp_path, monkeypatch):
     tp, td, d_nodes, root, arena = _y9d1(tmp_path)
     _env(monkeypatch, DUAL_P)
-    tp._weg2_direct_claim(W._claimer(tp))
+    tp._pdflip_direct_claim(W._claimer(tp))
     _env(monkeypatch, DUAL_D)
     assert DS.d_take_need(types.SimpleNamespace(tree_cache=td)) == 2
     assert DS.d_take_need(types.SimpleNamespace(tree_cache=td)) == 0     # cleared
@@ -143,7 +143,7 @@ def test_a_d_leaf_without_an_l3_copy_stays(tmp_path, monkeypatch):
     assert Q._in_tree(td, d_nodes[7]) and d_nodes[7].component_data[FULL].host_value is not None
     assert not (root / "a7_sfx.bin").exists()
     assert got["unsecured"] >= 1 and got["released"] == 0               # the chain's tail blocks the rest
-    assert DS.post_need(td._weg2_direct_pool(), 5) is True
+    assert DS.post_need(td._pdflip_direct_pool(), 5) is True
     assert DS.d_take_need(types.SimpleNamespace(tree_cache=td)) == 0     # backoff after an empty yield
     DS._Y["quiet_until"] = 0.0
     assert DS.d_take_need(types.SimpleNamespace(tree_cache=td)) == 5     # the need waited, not lost
@@ -152,7 +152,7 @@ def test_a_d_leaf_without_an_l3_copy_stays(tmp_path, monkeypatch):
 def test_no_spill_pool_is_a_named_stop(monkeypatch, caplog):
     _env(monkeypatch, DUAL_D)
     caplog.set_level(logging.INFO)
-    t = types.SimpleNamespace(_weg2_direct_pool=lambda: types.SimpleNamespace(), page_size=1)
+    t = types.SimpleNamespace(_pdflip_direct_pool=lambda: types.SimpleNamespace(), page_size=1)
     got = DS.d_yield_arena(types.SimpleNamespace(tree_cache=t), 64)
     assert got["released"] == 0
     assert any("Q-1190 DUAL D-ARENA-YIELD" in r.getMessage() and "STOP no_spill_pool" in r.getMessage()
@@ -167,14 +167,14 @@ def test_flip_unchanged_a_refused_claim_off_the_gate_posts_nothing(tmp_path, mon
         sub = tmp_path / ("e%d" % len(os.listdir(tmp_path)))
         sub.mkdir()
         tp, td, d_nodes, root, arena = _y9d1(sub)
-        assert tp._weg2_direct_claim(W._claimer(tp)) is False, env
+        assert tp._pdflip_direct_claim(W._claimer(tp)) is False, env
         assert tp.refused == ["arena_claim"], env
         assert not os.path.exists(arena.path + ".dualneed"), env
         assert all(Q._in_tree(td, n) for n in d_nodes), env
 
 
 # ---------------------------------------------------------------- the tick wiring
-import test_weg2_dual_d_kv_stage_0930 as T  # noqa: E402
+import test_pdflip_dual_d_kv_stage_0930 as T  # noqa: E402
 
 
 def _tick(monkeypatch, tp_rank, group, take=0):

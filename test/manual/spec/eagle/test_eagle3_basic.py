@@ -3,10 +3,10 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import is_hip
-from sglang.test.run_eval import run_eval
-from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
-from sglang.test.test_utils import (
+from flliper.srt.utils import is_hip
+from flliper.test.run_eval import run_eval
+from flliper.test.server_fixtures.eagle_fixture import EagleServerBase
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
 )

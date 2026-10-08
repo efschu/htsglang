@@ -6,7 +6,7 @@ Run inside the image / venv on a card whose window you hold, as an MPS client wi
 
     CUDA_VISIBLE_DEVICES=<one card> python3 scripts/dual_group/green_ladder_metal_1330.py --out /spinning/gpu-arb/probe_out/green_ladder_1330/<card>.json
 
-It drives the REAL ``weg2/dual_green.py`` (CtypesBackend, GreenLadder with its probe, GreenActuator.pick with the
+It drives the REAL ``pdflip/dual_green.py`` (CtypesBackend, GreenLadder with its probe, GreenActuator.pick with the
 hook's wait_stream pattern of ``_pp_launch_batch``) with a stand-in load (a P-like chunk of bf16 GEMMs, a D-like
 graph of dependent small GEMMs). What it answers (each is one line ``G1330 <key> ...`` and a JSON field):
 
@@ -23,7 +23,7 @@ graph of dependent small GEMMs). What it answers (each is one line ``G1330 <key>
       stage's stream: the single number the ladder exists for (compare with the 100 % row).
   W6  VRAM: the context cost of the ladder (``mem_get_info`` before the build / after the build / after the walk).
   W0  (S1) MPS state before anything: ``is_mps_client`` (get_server_list), the env; after a hang the server list again.
-  W2c (S2) CORRECTNESS per stage: the same seeded inputs through a GEMM chain, a Triton add+norm kernel, sglang's
+  W2c (S2) CORRECTNESS per stage: the same seeded inputs through a GEMM chain, a Triton add+norm kernel, flliper's
       Triton l2norm, FlashInfer single prefill and the fla gated-delta-rule chunk kernel (each only if importable,
       a missing one is a printed SKIP) on every green stream, compared with stage 100 % (bitwise flag + max abs diff
       against a bf16 tolerance); a kernel that hangs ends the process with exit 3 under the same watchdog.
@@ -121,8 +121,8 @@ def main() -> int:
 
     import torch
 
-    from sglang.srt.weg2 import dual_green as G
-    from sglang.srt.weg2 import dual_share as S
+    from flliper.srt.pdflip import dual_green as G
+    from flliper.srt.pdflip import dual_share as S
 
     dev = torch.device("cuda:0")
     torch.cuda.set_device(0)
@@ -191,7 +191,7 @@ def main() -> int:
 
     def run_stage(rung: int, seq: int, watchdog: bool = True):
         """The hook of _pp_launch_batch, verbatim in its stream calls; returns (chunk ms, host pick us, stream)."""
-        act.apply(G.Weg2DualGreenRung(seq, rung, int(round(fractions[rung] * 1e6))))
+        act.apply(G.PdFlipDualGreenRung(seq, rung, int(round(fractions[rung] * 1e6))))
         t0 = time.perf_counter()
         ctx, gc = act.pick(sched)
         pick_us = (time.perf_counter() - t0) * 1e6
@@ -263,7 +263,7 @@ def main() -> int:
 
     def on_stage(rung, fn, what="kernel"):
         """The hook of _pp_launch_batch around ``fn`` (inputs made beforehand on the default stream)."""
-        act.apply(G.Weg2DualGreenRung(next_seq(), rung, int(round(fractions[rung] * 1e6))))
+        act.apply(G.PdFlipDualGreenRung(next_seq(), rung, int(round(fractions[rung] * 1e6))))
         ctx, gc = act.pick(sched)
         with ctx:
             sched.forward_stream.wait_stream(sched.schedule_stream)
@@ -299,12 +299,12 @@ def main() -> int:
     else:
         print("G1330 W2c SKIP triton_add_norm: triton not importable")
     try:
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+        from flliper.srt.layers.attention.fla.l2norm import l2norm_fwd
 
         xl = rnd(2048, 128)
-        cases["sglang_triton_l2norm"] = lambda: l2norm_fwd(xl).clone()
+        cases["flliper_triton_l2norm"] = lambda: l2norm_fwd(xl).clone()
     except Exception as e:  # noqa: BLE001
-        print(f"G1330 W2c SKIP sglang_triton_l2norm: {type(e).__name__}: {e}")
+        print(f"G1330 W2c SKIP flliper_triton_l2norm: {type(e).__name__}: {e}")
     try:
         import flashinfer
 
@@ -315,7 +315,7 @@ def main() -> int:
     try:
         import torch.nn.functional as F
 
-        from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+        from flliper.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 
         T_g, Hg_g, H_g, K_g = 1024, 4, 8, 128      # q/k heads Hg, v heads H = 2 Hg (the GQA branch i_h // (H // Hg))
         gq = rnd(1, T_g, Hg_g, K_g)
@@ -437,7 +437,7 @@ def main() -> int:
         rounds = []
         for _ in range(12):
             seq += 1
-            act.apply(G.Weg2DualGreenRung(seq, i, int(round(fractions[i] * 1e6))))
+            act.apply(G.PdFlipDualGreenRung(seq, i, int(round(fractions[i] * 1e6))))
             ctx, gc = act.pick(sched)
             with ctx:
                 sched.forward_stream.wait_stream(sched.schedule_stream)
@@ -466,7 +466,7 @@ def main() -> int:
             st0 = torch.cuda.memory_stats()
             r0 = int(st0.get("num_alloc_retries", 0))
             t0 = time.perf_counter()
-            act.apply(G.Weg2DualGreenRung(next_seq(), i, int(round(fractions[i] * 1e6))))
+            act.apply(G.PdFlipDualGreenRung(next_seq(), i, int(round(fractions[i] * 1e6))))
             ctx, gc = act.pick(sched)
             t_switch_us = (time.perf_counter() - t0) * 1e6
             oom = None
@@ -514,7 +514,7 @@ def main() -> int:
                 with torch.cuda.stream(sch):                   # the producer: the schedule stream's allocation + fill
                     t = torch.empty(n_el, dtype=torch.int32, device=dev)
                     t.fill_(i + 1)
-                act.apply(G.Weg2DualGreenRung(next_seq(), rung, int(round(fractions[rung] * 1e6))))
+                act.apply(G.PdFlipDualGreenRung(next_seq(), rung, int(round(fractions[rung] * 1e6))))
                 ctx, gc = act.pick(sched)
                 with ctx:
                     sched.forward_stream.wait_stream(sched.schedule_stream)

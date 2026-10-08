@@ -22,7 +22,7 @@ The test file imports the V2 names through ``getattr`` so that on the base it fa
 given back), not by an import error.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -40,17 +40,17 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
-from sglang.srt.weg2 import dual_arena_spill as D  # noqa: E402
-from sglang.srt.weg2 import dual_p_kv_stage as PK  # noqa: E402
+from flliper.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
+from flliper.srt.pdflip import dual_arena_spill as D  # noqa: E402
+from flliper.srt.pdflip import dual_p_kv_stage as PK  # noqa: E402
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture  # noqa: E402
 
 FULL, MAMBA = ComponentType.FULL, ComponentType.MAMBA
 SLOTS = 100
 # the V2 names through getattr: on the base this file loads and fails by BEHAVIOUR (nothing is given back)
-TRIM_ENV = getattr(D, "TRIM_ENV", "SGLANG_WEG2_DUAL_ARENA_TRIM")
+TRIM_ENV = getattr(D, "TRIM_ENV", "FLLIPER_PDFLIP_DUAL_ARENA_TRIM")
 TRIM_HI_ENV = getattr(D, "TRIM_HI_ENV", TRIM_ENV + "_HI")
 TRIM_LO_ENV = getattr(D, "TRIM_LO_ENV", TRIM_ENV + "_LO")
 TRIM_MIN_S_ENV = getattr(D, "TRIM_MIN_S_ENV", TRIM_ENV + "_MIN_S")
@@ -58,16 +58,16 @@ TRIM_MAX_PAGES_ENV = getattr(D, "TRIM_MAX_PAGES_ENV", TRIM_ENV + "_MAX_PAGES")
 TRIM_BUDGET_S_ENV = getattr(D, "TRIM_BUDGET_S_ENV", TRIM_ENV + "_BUDGET_S")
 TRIM_EMPTY_BACKOFF_S_ENV = getattr(D, "TRIM_EMPTY_BACKOFF_S_ENV", TRIM_ENV + "_EMPTY_BACKOFF_S")
 TRIM_MARK = getattr(D, "TRIM_MARK", "Q-1500 UD-V2 DUAL ARENA-TRIM")
-DUAL_P = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P", PK.MAX_TOKENS_ENV: "131072"}
+DUAL_P = {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P", PK.MAX_TOKENS_ENV: "131072"}
 NOT_DUAL_P = [
     {},                                                                    # flip / NF / INT8
-    {"SGLANG_WEG2_GROUP": "P"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D", PK.MAX_TOKENS_ENV: "131072"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"},           # no P KV cap: not armed
+    {"FLLIPER_PDFLIP_GROUP": "P"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D", PK.MAX_TOKENS_ENV: "131072"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P"},           # no P KV cap: not armed
     dict(DUAL_P, **{TRIM_ENV: "0"}),                                     # the switch
 ]
-_KEYS = ("SGLANG_WEG2_DUAL_LAYOUT", "SGLANG_WEG2_GROUP", PK.MAX_TOKENS_ENV, TRIM_ENV, TRIM_HI_ENV,
+_KEYS = ("FLLIPER_PDFLIP_DUAL_LAYOUT", "FLLIPER_PDFLIP_GROUP", PK.MAX_TOKENS_ENV, TRIM_ENV, TRIM_HI_ENV,
          TRIM_LO_ENV, TRIM_MIN_S_ENV, TRIM_MAX_PAGES_ENV, TRIM_BUDGET_S_ENV,
          TRIM_EMPTY_BACKOFF_S_ENV)
 
@@ -179,7 +179,7 @@ def _stage(n_leaves, *, pp_rank=0, refuse=()):
     cache.cache_controller = _WriteBackController()
     nodes = [_host_leaf(cache, 10 + i, 7000 + i) for i in range(n_leaves)]
     pool = _FakePool(cache, refuse=[7000 + i for i in refuse])
-    cache._weg2_direct_pool = lambda: pool
+    cache._pdflip_direct_pool = lambda: pool
     sched = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=pp_rank, pp_size=3), tree_cache=cache)
     return sched, cache, pool, nodes
 
@@ -363,7 +363,7 @@ def test_gates_flip_nf_int8_dual_d_uncapped_and_the_switch_do_nothing(monkeypatc
         assert pool.arena.stats_calls == 0 and pool.arena.census_calls == 0, env
         assert D.follower_absorb(sched, wire) is wire, env
         assert len(_live(cache)) == 97 and not pool.secured, env
-        forced = D.execute(sched, D.Weg2DualArenaTrim(1, 50, 970000), env=None)
+        forced = D.execute(sched, D.PdFlipDualArenaTrim(1, 50, 970000), env=None)
         assert forced["released"] == 0 and len(_live(cache)) == 97, env
 
 
@@ -411,7 +411,7 @@ def test_locked_pending_aux_child_and_l3_refused_nodes_stay_and_the_tree_is_sane
 def test_post_d_switch_zero_posts_nothing(tmp_path, monkeypatch):
     import test_w3_dual_host_only_spill_q697c_1004 as Q
 
-    _env(monkeypatch, dict(DUAL_P, **{"SGLANG_WEG2_DUAL_ARENA_TRIM_POST_D": "0"}))
+    _env(monkeypatch, dict(DUAL_P, **{"FLLIPER_PDFLIP_DUAL_ARENA_TRIM_POST_D": "0"}))
     p, arena, root, t, nodes = Q._host_only_tree(tmp_path, slots=40, chain=False)
     sched = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=0, pp_size=3), tree_cache=t)
     assert _tick(sched, 0.0) is not None
@@ -434,9 +434,9 @@ def test_a_stage_without_a_spill_pool_logs_a_rate_limited_stop(monkeypatch, capl
     _env(monkeypatch, DUAL_P)
     caplog.set_level(logging.WARNING)
     sched, cache, pool, nodes = _stage(97, pp_rank=1)
-    cache._weg2_direct_pool = lambda: None
+    cache._pdflip_direct_pool = lambda: None
     for i in range(20):
-        got = D.execute(sched, D.Weg2DualArenaTrim(i + 1, 5, 970000))
+        got = D.execute(sched, D.PdFlipDualArenaTrim(i + 1, 5, 970000))
         assert got["released"] == 0
     stops = [r for r in caplog.records if "STOP rank=1" in r.getMessage()]
     assert 1 <= len(stops) <= 8 and len(_live(cache)) == 97
@@ -453,7 +453,7 @@ def test_a_failing_order_or_decision_never_takes_the_pass_down(monkeypatch, capl
         raise OSError("L3 disk gone")
 
     monkeypatch.setattr(pool, "secure_rows_to_l3", boom)
-    got = D.execute(sched, D.Weg2DualArenaTrim(1, 17, 970000))           # a raise in the spill: caught, named
+    got = D.execute(sched, D.PdFlipDualArenaTrim(1, 17, 970000))           # a raise in the spill: caught, named
     assert got["released"] == 0 and len(_live(cache)) == 97
     assert any("STOP execute_failed" in r.getMessage() for r in caplog.records)
     pool.arena.stats = boom                                                # a raise in PP0's header read
@@ -485,24 +485,24 @@ def test_a1_a_split_nodes_pending_write_id_keeps_the_node(monkeypatch):
 
 
 def test_a1_a_direct_writes_mamba_rows_in_flight_keep_the_node(monkeypatch):
-    """#1427: ``_weg2_direct_mamba_rows`` names the node -- nothing may take it."""
+    """#1427: ``_pdflip_direct_mamba_rows`` names the node -- nothing may take it."""
     _env(monkeypatch, DUAL_P)
     sched, cache, pool, nodes = _stage(20)
-    cache._weg2_direct_mamba_rows = {nodes[6].id: torch.tensor([1])}
+    cache._pdflip_direct_mamba_rows = {nodes[6].id: torch.tensor([1])}
     _stays(cache, pool, nodes, 6, "mamba rows in flight")
 
 
 def test_a1_a_host_backed_end_anchor_keeps_the_node(monkeypatch):
-    """The hand-back anchor of a request D may not have read yet (``_weg2_end_anchor`` + a mamba host value);
+    """The hand-back anchor of a request D may not have read yet (``_pdflip_end_anchor`` + a mamba host value);
     a mamba DEVICE value too, so the aux-host-only guard alone would not catch it."""
     _env(monkeypatch, DUAL_P)
     sched, cache, pool, nodes = _stage(20)
-    nodes[7]._weg2_end_anchor = True
+    nodes[7]._pdflip_end_anchor = True
     nodes[7].component_data[MAMBA].host_value = torch.tensor([42])
     nodes[7].component_data[MAMBA].value = torch.tensor([43])
     _stays(cache, pool, nodes, 7, "end anchor")
     # an END-flagged node WITHOUT a mamba host value carries nothing to hold: it goes
-    nodes[8]._weg2_end_anchor = True
+    nodes[8]._pdflip_end_anchor = True
     D.spill_host_only(cache, pool, 1000, 1, set())
     assert nodes[8].id not in _live(cache)
 
@@ -539,7 +539,7 @@ def test_a6_execute_passes_the_budget_to_the_spill(monkeypatch):
 
     pool.secure_rows_to_l3 = slow_secure
     monkeypatch.setattr(D.time, "monotonic", lambda: clock[0])
-    got = D.execute(sched, D.Weg2DualArenaTrim(1, 17, 970000))
+    got = D.execute(sched, D.PdFlipDualArenaTrim(1, 17, 970000))
     assert got["braked"] == 1 and got["leaves"] == 2 and len(_live(cache)) == 95
 
 
@@ -558,7 +558,7 @@ def test_a3_orders_that_do_not_lower_the_pin_pause_the_episode_and_the_tree_is_n
     pause the episode (30 s, a named warning); the host tree is NOT cleared order by order."""
     import logging
 
-    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5", "SGLANG_WEG2_DUAL_ARENA_TRIM_PAUSE_S": "30"}))
+    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5", "FLLIPER_PDFLIP_DUAL_ARENA_TRIM_PAUSE_S": "30"}))
     caplog.set_level(logging.INFO)
     sched, cache, pool, nodes = _stage(60)
     pool.arena.d_rows = {7000 + i for i in range(60)}            # D references every page P holds
@@ -611,7 +611,7 @@ def test_neu1_during_the_pause_d_still_hears_the_need_and_the_default_pause_is_s
 
 def test_neu1_the_pause_ends_when_the_header_shows_the_fill_at_or_below_hi(monkeypatch):
     """D gave the pages after all: the next header read ends the pause, a new rise starts a new episode at once."""
-    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5", "SGLANG_WEG2_DUAL_ARENA_TRIM_PAUSE_S": "600"}))
+    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5", "FLLIPER_PDFLIP_DUAL_ARENA_TRIM_PAUSE_S": "600"}))
     sched, cache, pool, nodes = _stage(60)
     pool.arena.d_rows = {7000 + i for i in range(60)}
     pool.arena.extra_pinned = 35
@@ -640,14 +640,14 @@ def test_neu2_the_pool_lookup_the_role_and_the_config_are_inside_the_never_raise
 
     for name in ("_tree_pool", "trim_cfg"):
         monkeypatch.setattr(D, name, boom)
-        got = D.execute(sched, D.Weg2DualArenaTrim(1, 5, 970000))
+        got = D.execute(sched, D.PdFlipDualArenaTrim(1, 5, 970000))
         assert got["released"] == 0 and len(_live(cache)) == 97
         monkeypatch.undo()
         _env(monkeypatch, DUAL_P)
-    from sglang.srt.mem_cache import form_a_host_shadow as r12
+    from flliper.srt.mem_cache import form_a_host_shadow as r12
 
     monkeypatch.setattr(r12, "role", boom)
-    assert D.execute(sched, D.Weg2DualArenaTrim(1, 5, 970000))["released"] == 0
+    assert D.execute(sched, D.PdFlipDualArenaTrim(1, 5, 970000))["released"] == 0
     assert len([r for r in caplog.records if "STOP execute_failed" in r.getMessage()]) == 3
 
 
@@ -655,9 +655,9 @@ def test_neu2_the_pool_lookup_the_role_and_the_config_are_inside_the_never_raise
 def test_a5_the_request_trace_does_not_see_the_order(monkeypatch):
     import inspect
 
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
-    cmd = D.Weg2DualArenaTrim(1, 5, 970000)
+    cmd = D.PdFlipDualArenaTrim(1, 5, 970000)
     assert D.without_trim_order(["req", cmd]) == ["req"] and D.without_trim_order([]) == []
     src = inspect.getsource(SchedulerPPMixin._pp_forward_and_process_input_requests)
     assert "_traced = _das_trim.without_trim_order(_traced)" in src
@@ -691,9 +691,9 @@ def _pp_stage(rank, n_leaves=97):
     h.pp_group = types.SimpleNamespace(is_first_rank=rank == 0, is_last_rank=rank == 2)
     h.send_req_work = None
     h.flush_wrapper = types.SimpleNamespace(apply_pp0_verdict=lambda *a, **k: None)
-    h._weg2_store_told_armed = False
-    h._weg2_vote_pass_hook = lambda reqs: None
-    h._weg2_vote_after_forward = lambda reqs: reqs
+    h._pdflip_store_told_armed = False
+    h._pdflip_vote_pass_hook = lambda reqs: None
+    h._pdflip_vote_after_forward = lambda reqs: reqs
     h._pp_commit_comm_work = lambda work: None
     h.sent, h.dispatched = [], []
     h._pp_send_pyobj_to_next_stage = lambda reqs, async_send=True: h.sent.append(
@@ -705,11 +705,11 @@ def _pp_stage(rank, n_leaves=97):
 
 def _nc(lst):
     """The list without PP0's burst clock (another test of the process may leave that window armed)."""
-    return [r for r in lst if type(r).__name__ != "Weg2BurstClock"]
+    return [r for r in lst if type(r).__name__ != "PdFlipBurstClock"]
 
 
 def _intake(h, reqs):
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     SchedulerPPMixin._pp_forward_and_process_input_requests(h, reqs)
 
@@ -719,13 +719,13 @@ def test_rank_congruence_one_order_on_the_wire_every_stage_executes_the_same(mon
     stages = [_pp_stage(r) for r in range(3)]
     h0, h1, h2 = (s[0] for s in stages)
     _intake(h0, ["req"])                                         # PP0 decides and serves its own order
-    assert [type(r).__name__ for r in _nc(h0.sent[-1])] == ["str", "Weg2DualArenaTrim"]
+    assert [type(r).__name__ for r in _nc(h0.sent[-1])] == ["str", "PdFlipDualArenaTrim"]
     assert h0.dispatched[-1] == ["req"]                          # the dispatched list stays clean
     _intake(h1, h0.sent[-1])                                     # PP1: relay verbatim, dispatch without it
     assert h1.sent[-1] == h0.sent[-1] and _nc(h1.dispatched[-1]) == ["req"]
     _intake(h2, h1.sent[-1])                                     # PP2 (last: no send)
     assert h2.sent == [] and h2.dispatched[-1] == ["req"]
-    cmd = [r for r in h0.sent[-1] if type(r).__name__ == "Weg2DualArenaTrim"][0]
+    cmd = [r for r in h0.sent[-1] if type(r).__name__ == "PdFlipDualArenaTrim"][0]
     assert cmd.want == 17 and cmd.seq == 1
     lives = [_live_tokens(s[1]) for s in stages]
     assert lives[0] == lives[1] == lives[2]                      # the SAME tree on every stage
@@ -773,7 +773,7 @@ def test_a_lagging_follower_with_a_node_less_executes_the_same_order_and_keeps_w
 def test_wiring_order_in_the_pass(monkeypatch):
     import inspect
 
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     src = inspect.getsource(SchedulerPPMixin._pp_forward_and_process_input_requests)
     stamp = src.index("_das_trim.pp0_stamp(")

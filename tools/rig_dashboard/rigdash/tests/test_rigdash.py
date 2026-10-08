@@ -1,6 +1,6 @@
 """Unit tests for rigdash (stdlib unittest; run: python3 -m unittest discover -s tests).
 
-The fixture lines are verbatim from the weg2 boot logs of 2026-09-27
+The fixture lines are verbatim from the pdflip boot logs of 2026-09-27
 (NF dkrnfh91bar1dauer09270859, 27B dkr27breleasedraftbar1w109270737).
 """
 
@@ -33,20 +33,20 @@ DEC = ("[2026-09-27 09:19:23 TP0] Decode batch, #running-req: 4, #full token: 21
 DEC_RANK = ("[2026-09-27 09:21:17 TP0] Decode rank batch, rank: 0, #round: 7453, t: 1790500877.238, bs: 5, #rows: 20, "
             "#fwd: 1, gpu-ms: 117.7 (split unavailable: graph-replay-reader-off, graphed-fwd 1/1)")
 CLOCK_PROSE = ("[2026-09-27 09:03:29 TP1] collective clock: graph reader OFF (...): Graphed 'Decode rank batch' lin")
-FLIP_BEGIN = "[2026-09-27 09:20:42,596] INFO weg2.front: WEG2-FLIP begin epoch=17 sleep=P wake=D outstanding=0 queue=2"
-FLIP_DONE = ("[2026-09-27 09:20:44,544] INFO weg2.front: WEG2-FLIP done epoch=18 slept=P woke=D drain+quiesce=177 ms "
+FLIP_BEGIN = "[2026-09-27 09:20:42,596] INFO pdflip.front: PDFLIP-FLIP begin epoch=17 sleep=P wake=D outstanding=0 queue=2"
+FLIP_DONE = ("[2026-09-27 09:20:44,544] INFO pdflip.front: PDFLIP-FLIP done epoch=18 slept=P woke=D drain+quiesce=177 ms "
              "sleep=1563 ms (kv RPC + the P leg of the gathered pair) wake=1744 ms (the D leg + kv RPC) interleave=1642 "
              "ms overlap=1540 ms critical_path=wake/D rank=0 card=GPU-31d7 ms=1520 flip_total=1948 ms weights_tags=17")
-CORRIDOR = ("[2026-09-27 09:20:35,254] INFO weg2.front: WEG2-CORRIDOR phase=P(awake) epoch=17 "
+CORRIDOR = ("[2026-09-27 09:20:35,254] INFO pdflip.front: PDFLIP-CORRIDOR phase=P(awake) epoch=17 "
             "instrument=nvml_v2_free,allocatable band=858-1314MiB")
-HEALTH = "[2026-09-27 09:24:07,713] WARNING weg2.front: WEG2-HEALTH group=P http_ok=False process_alive=False streak=4"
-WARN_TIMEOUT = ("[2026-09-27 07:41:36,865] WARNING weg2.front: WEG2 D-POOL UNREADABLE (cause=TimeoutError: ): group D "
+HEALTH = "[2026-09-27 09:24:07,713] WARNING pdflip.front: PDFLIP-HEALTH group=P http_ok=False process_alive=False streak=4"
+WARN_TIMEOUT = ("[2026-09-27 07:41:36,865] WARNING pdflip.front: PDFLIP D-POOL UNREADABLE (cause=TimeoutError: ): group D "
                 "published no reading")
-ERR = ("[2026-09-27 09:07:08,831] ERROR weg2.front: WEG2 leg2 rid=weg2-0-9 failed: ClientConnectionResetError: Cannot "
+ERR = ("[2026-09-27 09:07:08,831] ERROR pdflip.front: PDFLIP leg2 rid=pdflip-0-9 failed: ClientConnectionResetError: Cannot "
        "write to closing transport")
-BOOT = ("[2026-09-27T08:59:39Z] WEG2-LAUNCH === WEG2 BOOT tag=dkrnfh91bar1dauer09270859 tree=/opt/htsglang/src-nf "
+BOOT = ("[2026-09-27T08:59:39Z] PDFLIP-LAUNCH === PDFLIP BOOT tag=dkrnfh91bar1dauer09270859 tree=/opt/htsglang/src-nf "
         "@ 8f0bf40c2f (clean) stamp=0927_085939 dry=False")
-FORM = ("[2026-09-27T08:59:39Z] WEG2-LAUNCH WEG2-FORM arch=moe experts=offload draft=mtp model=Qwen3.8-Flash-Next "
+FORM = ("[2026-09-27T08:59:39Z] PDFLIP-LAUNCH PDFLIP-FORM arch=moe experts=offload draft=mtp model=Qwen3.8-Flash-Next "
         "(sources: arch <- checkpoint)")
 ARGS = ("[2026-09-27 08:59:56] server_args=ServerArgs(model_path='/m/Qwen3.8-Flash-Next', "
         "served_model_name='Qwen3.8-Flash-Next', tp_size=1, pp_size=3, x=1)")
@@ -293,19 +293,19 @@ class LaunchLineTests(unittest.TestCase):
         lines = [
             BOOT,
             FORM,
-            "[2026-09-27T09:32:20Z] WEG2-LAUNCH #1217/#1233 shm residue: none of ours in /dev/shm",
-            "[2026-09-27T09:32:20Z] WEG2-LAUNCH X PROVENANCE: X=4096 source=flag",
-            "[2026-09-27T09:32:21Z] WEG2-LAUNCH X PROVENANCE: X=4096 source=flag",
+            "[2026-09-27T09:32:20Z] PDFLIP-LAUNCH #1217/#1233 shm residue: none of ours in /dev/shm",
+            "[2026-09-27T09:32:20Z] PDFLIP-LAUNCH X PROVENANCE: X=4096 source=flag",
+            "[2026-09-27T09:32:21Z] PDFLIP-LAUNCH X PROVENANCE: X=4096 source=flag",
         ]
         out = live.launch_lines(lines)
         self.assertEqual(len(out), 3)
-        self.assertTrue(out[0].startswith("=== WEG2 BOOT tag="))
+        self.assertTrue(out[0].startswith("=== PDFLIP BOOT tag="))
         self.assertEqual(out[2], "X PROVENANCE: X=4096 source=flag")
 
 
 # verbatim, 27B-b1 dkr27breleasedraftbar1w109270932 P log, 2026-09-27
 TB_PREFIXED = "[2026-09-27 09:45:58 PP1] Scheduler hit an exception: Traceback (most recent call last):"
-W27_UNPREFIXED = ("sglang.srt.managers.pp_admission_congruence.PPWidthDivergenceRefused: #1233 W27 PP WIDTH "
+W27_UNPREFIXED = ("flliper.srt.managers.pp_admission_congruence.PPWidthDivergenceRefused: #1233 W27 PP WIDTH "
                   "DIVERGENCE REFUSED: received hidden_states with 1024 row(s) for a batch of 512 token(s)")
 FI_SPLIT_OFF = ("[2026-09-27 09:33:06 PP0] FI-GRAPH-SPLIT off for this capture: flashinfer '0.7.0', this module "
                 "mirrors 0.6.14")
@@ -324,8 +324,8 @@ class HealthTests(unittest.TestCase):
     def test_healthy_boot_has_no_state(self):
         self.assertIsNone(health.assess(self._boot(), self.NOW)["state"])
 
-    def test_weg2_health_dead_line_is_only_a_hint(self):
-        # operator 29.09.: dead only from IPC; a WEG2-HEALTH log line is a hint
+    def test_pdflip_health_dead_line_is_only_a_hint(self):
+        # operator 29.09.: dead only from IPC; a PDFLIP-HEALTH log line is a hint
         b = self._boot(health={"P": {"t": self.NOW - 10, "alive": False, "http_ok": False, "streak": 4}})
         a = health.assess(b, self.NOW)
         self.assertEqual(a["state"], "WARNUNG")
@@ -404,7 +404,7 @@ class StopScanTests(unittest.TestCase):
     def test_stop_lines_from_a_p_log(self):
         self.assertTrue(parse.stop_match(TB_PREFIXED))
         # launcher prose that merely NAMES the W27 guard is no stop (27.09. false alarm)
-        self.assertFalse(parse.stop_match("[2026-09-27T14:22:10Z] WEG2-LAUNCH W27 PP WIDTH guard armed: a divergence "
+        self.assertFalse(parse.stop_match("[2026-09-27T14:22:10Z] PDFLIP-LAUNCH W27 PP WIDTH guard armed: a divergence "
                                           "raises PPWidthDivergenceRefused: #1233 at the receiver"))
         self.assertFalse(parse.stop_match("[2026-09-27 14:22:10 PP0] width census W27 ok rows=512"))
         self.assertTrue(parse.stop_match(W27_UNPREFIXED))
@@ -425,21 +425,21 @@ class StopScanTests(unittest.TestCase):
 
 
 # verbatim, NF dkrnfh91bar1dauer09270859 (D log / front log), 2026-09-27
-LB0 = ("[2026-09-27 09:05:29 TP0] #988 LOADBACK rid=weg2-0-1 prefix moved to 27456, extend_range re-derived to the "
+LB0 = ("[2026-09-27 09:05:29 TP0] #988 LOADBACK rid=pdflip-0-1 prefix moved to 27456, extend_range re-derived to the "
        "parked shape at the mutation (seen=1) kv_applied=1 mamba_restored=1 kv_only=0 anchor_depth=27456 extent=27456")
 MB1 = ("[2026-09-27 09:04:40 TP1] MAMBA-HOST-RESUME n=1: anchor accepted at depth=16384 on a HOST-backed state (device "
        "copy evicted); this match triggers load_back. interval=None")
-SR0 = ("[2026-09-27 09:04:40 TP0] #1324 STORE READ INCOMPLETE rid=weg2-0-1 delivered=16384 deliverable=27456 "
+SR0 = ("[2026-09-27 09:04:40 TP0] #1324 STORE READ INCOMPLETE rid=pdflip-0-1 delivered=16384 deliverable=27456 "
        "shortfall=11072 site=drain occurrence=1 -- the read TERMINATED holding less than the prefix it asked for")
-SV_D = ("[2026-09-27 09:05:39,208] INFO weg2.front: WEG2-SERVED group=D leg=2 rid=weg2-0-6 stream=1 status=200 "
+SV_D = ("[2026-09-27 09:05:39,208] INFO pdflip.front: PDFLIP-SERVED group=D leg=2 rid=pdflip-0-6 stream=1 status=200 "
         "prompt_tokens=26012 cached_tokens=25984 completion_tokens=28 uncached=28 verdict=serve priced=True")
-SV_P = ("[2026-09-27 09:04:38,917] INFO weg2.front: WEG2-SERVED group=P leg=1 rid=weg2-0-1 prompt_tokens=27512 "
+SV_P = ("[2026-09-27 09:04:38,917] INFO pdflip.front: PDFLIP-SERVED group=P leg=1 rid=pdflip-0-1 prompt_tokens=27512 "
         "cached_tokens=0 wall=39.25s epoch=1")
 D_BATCH = ("[2026-09-27 09:18:53 TP0] Prefill batch, #new-seq: 1, #new-token: 4, #cached-token: 52172, full token usage: "
            "0.89, mamba usage: 0.63, #running-req: 5, #queue-req: 0, #pending-token: 0, cuda graph: False, input "
            "throughput (token/s): 0.39")
 P_BATCH_PP1 = P_BATCH.replace(" PP0]", " PP1]")
-ADMIN = ("[2026-09-27T09:57:55Z] WEG2-LAUNCH WEG2 ADMIN-KEY minted for this boot -> /var/lib/htsglang/arb/weg2/"
+ADMIN = ("[2026-09-27T09:57:55Z] PDFLIP-LAUNCH PDFLIP ADMIN-KEY minted for this boot -> /var/lib/htsglang/arb/pdflip/"
          "boot_x.adminkey (mode 0600); both groups get --admin-api-key")
 
 
@@ -543,11 +543,11 @@ class EnergyTests(unittest.TestCase):
 class RedactTests(unittest.TestCase):
     def test_key_lines_dropped_values_cut_door_closed(self):
         from rigdash import redact
-        self.assertIsNone(redact.clean("WEG2 ADMIN-KEY minted for this boot -> /x/boot.adminkey (mode 0600)"))
+        self.assertIsNone(redact.clean("PDFLIP ADMIN-KEY minted for this boot -> /x/boot.adminkey (mode 0600)"))
         self.assertIsNone(redact.clean("RPC auth=bearer abcdefghijklmnop"))
         self.assertEqual(redact.clean("failed: api_key=sk-or-v1-abcdef0123456789 x"), "failed: api_key=<redacted> x")
         self.assertEqual(redact.clean("#new-token: 16384, tokens: 5"), "#new-token: 16384, tokens: 5")
-        self.assertNotIn("ADMIN-KEY", redact.guard('{"t": "WEG2 ADMIN-KEY x"}'))
+        self.assertNotIn("ADMIN-KEY", redact.guard('{"t": "PDFLIP ADMIN-KEY x"}'))
 
 
 class SourceTests(unittest.TestCase):
@@ -785,7 +785,7 @@ class PlannedStopTests(unittest.TestCase):
         self.assertEqual(health.assess(self._boot({"planned": None, "death": None}), self.NOW)["state"], "HAENGT")
 
     def test_death_before_the_planned_stop_stays_red(self):
-        # the death comes from IPC (state.json), not from the WEG2-HEALTH line
+        # the death comes from IPC (state.json), not from the PDFLIP-HEALTH line
         end = {"planned": {"t": _utc(17, 40, 30), "text": H_DAUER_STOP, "src": "nf-dauer"},
                "death": {"t": _utc(17, 40, 2), "text": "state.json dead: DEADMAN_CRASH", "src": "state.json"},
                "src": "state.json"}
@@ -905,7 +905,7 @@ class OneSecondRateTests(unittest.TestCase):
 
 
 # verbatim, NF D log boot_weg2_dkrnfh91dprbar1dauer09271756, 2026-09-27
-DSEATS = ("[2026-09-27 18:06:42 TP0] WEG2 D-PHASE-SEATS (H95) epoch=1790532154.3 handoff_n=6 parked_n=4 -> n=6 of cap 6 "
+DSEATS = ("[2026-09-27 18:06:42 TP0] PDFLIP D-PHASE-SEATS (H95) epoch=1790532154.3 handoff_n=6 parked_n=4 -> n=6 of cap 6 "
           "(CLAMPED: the front handed more than --d-bs): decode batch bs6, GDN slots in use <= 38 of 38 (boot)")
 SCHEDCAP = ("[2026-09-27 18:02:25 TP0] max_total_num_tokens=262144, chunked_prefill_size=4096, max_prefill_tokens=16384, "
             "max_running_requests=6, context_len=262144, available_gpu_mem=3.65 GB")
@@ -959,7 +959,7 @@ ART_D = [
     "mamba usage: 0.42, accept len: 2.58, accept rate: 0.53, cuda graph: True, gen throughput (token/s): 133.47, #queue-req: 0",
 ]
 ART_FRONT = [
-    "[2026-09-28 12:34:44,088] INFO weg2.front: WEG2-FLIP begin epoch=11 sleep=P wake=D outstanding=0 queue=0",
+    "[2026-09-28 12:34:44,088] INFO pdflip.front: PDFLIP-FLIP begin epoch=11 sleep=P wake=D outstanding=0 queue=0",
 ]
 
 
@@ -1054,10 +1054,10 @@ class WachOhneArbeitTests(unittest.TestCase):
     def test_flip_tail_replaces_awake_idle_between_flip_done_and_first_decode(self):
         base = 1790667000.0
         b = live.Boot("x", "/tmp")
-        FlipTimeTests()._front(b, base, "WEG2-FLIP begin epoch=2 sleep=P wake=D outstanding=0 queue=1")
-        FlipTimeTests()._front(b, base + 2.0, "WEG2-FLIP done epoch=3 slept=P woke=D drain+quiesce=100 ms "
+        FlipTimeTests()._front(b, base, "PDFLIP-FLIP begin epoch=2 sleep=P wake=D outstanding=0 queue=1")
+        FlipTimeTests()._front(b, base + 2.0, "PDFLIP-FLIP done epoch=3 slept=P woke=D drain+quiesce=100 ms "
                                "sleep=1000 ms wake=1000 ms flip_total=2000 ms weights_tags=17")
-        self._line(b, "D", base + 4, "TP0", "WEG2-POST-WAKE-PASS n=0 mode=EXTEND bs=5 gap_ms=-1 schedule_ms=1400 "
+        self._line(b, "D", base + 4, "TP0", "PDFLIP-POST-WAKE-PASS n=0 mode=EXTEND bs=5 gap_ms=-1 schedule_ms=1400 "
                    "run_ms=2500 prefetch_ms=7 prepare_ms=1300 ready_ms=1 (x)")
         for k in range(5):
             FlipTimeTests()._decode(b, base + 7.2 + k * 0.05)
@@ -1115,7 +1115,7 @@ class FlipTimeTests(unittest.TestCase):
         return s + (",%03d" % int(round((t % 1) * 1000)) if frac else "")
 
     def _front(self, b, t, line):
-        b._ingest("front", parse.parse_line("[%s] INFO weg2.front: %s" % (self._stamp(t, True), line)))
+        b._ingest("front", parse.parse_line("[%s] INFO pdflip.front: %s" % (self._stamp(t, True), line)))
 
     def _decode(self, b, t):
         b._ingest("D", parse.parse_line(
@@ -1230,7 +1230,7 @@ class IpcDeathAndWallRateTests(unittest.TestCase):
         b = self._boot(stops=[{"t": t, "group": "D", "text": "Traceback (most recent call last):", "bare": True,
                                "src": "boot_weg2_x_110211.D.log"},
                               {"t": t, "group": "D", "bare": True, "src": "boot_weg2_x_110211.D.log",
-                               "text": "sglang.srt.entrypoints.http_server.ConsumerGone: stream released after 122 s"}],
+                               "text": "flliper.srt.entrypoints.http_server.ConsumerGone: stream released after 122 s"}],
                        last_activity={"D": self.NOW - 2})
         a = health.assess(b, self.NOW)
         self.assertNotEqual(a["state"], "TOT")

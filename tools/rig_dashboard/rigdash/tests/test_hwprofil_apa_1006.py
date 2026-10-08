@@ -157,7 +157,7 @@ class RealBase(unittest.TestCase):
         env = mock.patch.dict(os.environ, {}, clear=False)
         env.start()
         self.addCleanup(env.stop)
-        for k in (hwprofil.PERSIST_ENV, "SGLANG_IMAGE_TAG"):
+        for k in (hwprofil.PERSIST_ENV, "FLLIPER_IMAGE_TAG"):
             os.environ.pop(k, None)
 
     def make(self, nvml=None, persist=True, edition="rig", **kw):
@@ -272,7 +272,7 @@ class TestPersistedProfile(RealBase):
 
 class TestIssueText(RealBase):
     def test_all_blocks_and_values(self):
-        os.environ["SGLANG_IMAGE_TAG"] = "flliper:0.1.0-cu130"
+        os.environ["FLLIPER_IMAGE_TAG"] = "flliper:0.1.0-cu130"
         hw = self.make()
         txt = hw.issue()["text"]
         for needle in ("## Hardware profile (`flliper.hardware/1`)", "| Driver | 595.58 |", "| CUDA / torch (measuring process) | 13.0 / 2.9 |",
@@ -298,10 +298,10 @@ class TestIssueText(RealBase):
         # ein Baum ohne git und ohne Revisions-ENV (der echte Baum der Testlaeufe ist ein git-Baum und nennt seine Revision, Review 1006 Befund 2)
         hw = self.make()
         with mock.patch.dict(os.environ), mock.patch.object(hwprofil, "_git_head", return_value=None):
-            for k in ("HTSGLANG_REVISION", "HTSGLANG_REVISION_27B", "HTSGLANG_REVISION_NF", "SGLANG_BUILD_COMMIT", "SGLANG_IMAGE_TAG", "STAND"):
+            for k in ("HTSGLANG_REVISION", "HTSGLANG_REVISION_27B", "HTSGLANG_REVISION_NF", "FLLIPER_BUILD_COMMIT", "FLLIPER_IMAGE_TAG", "STAND"):
                 os.environ.pop(k, None)
             txt = hw.issue()["text"]
-        self.assertIn("| Image | unverified (SGLANG_IMAGE_TAG not set) |", txt)
+        self.assertIn("| Image | unverified (FLLIPER_IMAGE_TAG not set) |", txt)
         self.assertIn("| Tree | unverified |", txt)
         self.assertIn("(saved)", txt)
         txt2 = self.make(persist=False).issue()["text"]
@@ -376,7 +376,7 @@ class TestOldModuleWithoutPersistence(unittest.TestCase):
 
     def test_get_works_and_persist_is_off(self):
         with tempfile.TemporaryDirectory() as t:
-            d = os.path.join(t, "python", "sglang", "srt", "rigmon")
+            d = os.path.join(t, "python", "flliper", "srt", "rigmon")
             os.makedirs(d)
             open(os.path.join(d, "hardware_profile.py"), "w").write(self.STUB)
             hw = hwprofil.HwProfil(http=_gq_down, tree=os.path.join(t, "python"), persist_path=os.path.join(t, "hw.json"))
@@ -395,7 +395,7 @@ class TestScripts(unittest.TestCase):
             "formats": [{"key": "bf16", "unit": "TFLOPS", "label": "bf16"}],
             "cards": [
                 {"ord": 0, "nvml_index": 1, "name": "NVIDIA GeForce RTX 5090", "class_key": "RTX5090", "cc": [12, 0],
-                 "sm_count": {"v": 170, "src": "Datenblatt", "note": "Datenblatt-Katalog weg2/hw_sim.py"},
+                 "sm_count": {"v": 170, "src": "Datenblatt", "note": "Datenblatt-Katalog pdflip/hw_sim.py"},
                  "l2_mib": {"v": None, "src": "nicht gemessen", "note": "x"},
                  "vram_total_mib": {"v": 32607, "src": "NVML", "unit": "MiB"}, "bar1_total_mib": {"v": 32768, "src": "NVML"},
                  "mem_gbs": {"read": {"v": None, "src": "nicht gemessen", "note": "n"}, "copy": {"v": None, "src": "nicht gemessen", "note": "n"},

@@ -6,7 +6,7 @@
 #
 # Delta against the live boot (PID 1236):
 #   + --enable-hierarchical-cache --hicache-storage-backend file
-#   + SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/spinning/hicache
+#   + FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR=/spinning/hicache
 #   + --hicache-ratio 2 (host L2; NOT --hicache-size, see the note below)
 #   + preserve_thinking server default        <- flag name from feat/hicache-runtime-544
 #   + #540 thinking budget (merged into this tree)
@@ -28,11 +28,11 @@ mkdir -p "$HICACHE_DIR"
 
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_BARLINK=1
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$HICACHE_DIR"
+export FLLIPER_BARLINK=1
+export FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR="$HICACHE_DIR"
 
 cd "$WT"
-setsid "$VENV/bin/python" -m sglang.launch_server \
+setsid "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$MODEL" \
   --served-model-name Qwen3.6-27B \
   --tp-size 3 --rank-gpu-id 0,1,2 \

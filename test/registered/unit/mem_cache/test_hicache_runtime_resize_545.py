@@ -21,7 +21,7 @@ Run with:
       test/registered/unit/mem_cache/test_hicache_runtime_resize_545.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -32,13 +32,13 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorage,
     HiCacheStorageConfig,
 )
-from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+from flliper.test.test_utils import CustomTestCase
 
 KIB = 1024
 
@@ -237,8 +237,8 @@ class TestSchedulerRequestValidation(CustomTestCase):
     """Drives Scheduler.resize_hicache_storage_wrapped as an unbound method."""
 
     def _call(self, sched, **kwargs):
-        from sglang.srt.managers.io_struct import ResizeHiCacheStorageReqInput
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.io_struct import ResizeHiCacheStorageReqInput
+        from flliper.srt.managers.scheduler import Scheduler
 
         return Scheduler.resize_hicache_storage_wrapped(
             sched, ResizeHiCacheStorageReqInput(**kwargs)
@@ -313,19 +313,19 @@ class TestBothCacheClassesExposeResize(CustomTestCase):
     """A hybrid-SSM (GDN) model gets UnifiedRadixCache, not HiRadixCache."""
 
     def test_hiradix_cache_has_resize(self):
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
         self.assertTrue(hasattr(HiRadixCache, "resize_storage_backend"))
         self.assertTrue(hasattr(HiRadixCache, "storage_capacity_stats"))
 
     def test_unified_radix_cache_has_resize(self):
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         self.assertTrue(hasattr(UnifiedRadixCache, "resize_storage_backend"))
         self.assertTrue(hasattr(UnifiedRadixCache, "storage_capacity_stats"))
 
     def test_unified_radix_cache_resize_guards_on_disabled_storage(self):
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         class _C:
             enable_storage = False

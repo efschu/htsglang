@@ -8,24 +8,24 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner import explorer as explorer_mod
-from sglang.srt.planner import webui
-from sglang.srt.planner.explorer import (
+from flliper.srt.planner import explorer as explorer_mod
+from flliper.srt.planner import webui
+from flliper.srt.planner.explorer import (
     COMPOSED_ESTIMATE_NOTE,
     plan_matrix,
     provenance_of,
     render_matrix_text,
 )
-from sglang.srt.planner.hardware import HardwareSpec, hardware_from_manual
-from sglang.srt.planner.issue_text import HardwareFingerprint
-from sglang.srt.planner.card_library import (
+from flliper.srt.planner.hardware import HardwareSpec, hardware_from_manual
+from flliper.srt.planner.issue_text import HardwareFingerprint
+from flliper.srt.planner.card_library import (
     SEED_CARDS,
     CardSpec,
     CardLibrary,
     compose_rig,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 

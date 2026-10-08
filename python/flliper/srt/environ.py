@@ -1,0 +1,5412 @@
+import functools
+import os
+import subprocess
+import warnings
+from contextlib import ExitStack, contextmanager
+from enum import IntEnum
+from typing import Any, Optional
+
+
+def _profile_default(name: str, fallback):
+    """UNIFY S2/S3: a callable default for the switch ``name`` -- the value the
+    published pdflip form's MODEL PROFILE gives it (pdflip/form.py
+    PROFILE_SWITCH_DEFAULTS, derived from the registry rows), read at get()
+    time (not cached: the form env is per group); ``fallback`` (the NF line's
+    code default) without a form. An explicitly set env var never reaches this.
+    pdflip.form is stdlib-only, so this stays light."""
+
+    def _default():
+        from flliper.srt.pdflip.form import profile_switch_default
+
+        return profile_switch_default(name, fallback)
+
+    _default.__name__ = f"_profile_default_{name}"
+    return _default
+
+
+_dense_repack_outside_pool_default = _profile_default(
+    "FLLIPER_PDFLIP_DENSE_REPACK_OUTSIDE_POOL", True)
+
+
+#: The 27B line's switch that armed its END-anchor hold (together with its
+#: inner-anchor release, 479f6eccb0/c255e10ddb; the release half is the 27B
+#: mamba-anchor policy and comes with the profile field ``mamba_anchor``).
+_MAMBA_CARRIER_HOLD_27B_ALIAS = "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE"
+
+
+def _mamba_carrier_hold_default() -> bool:
+    """UNIFY S2: FLLIPER_PDFLIP_ENABLE_MAMBA_CARRIER_HOLD's default when unset --
+    the 27B alias if set (``1/true/yes/on`` = hold, as on the 27B line), else
+    the profile's default (pdflip/form.py), else True (the NF line's default)."""
+    raw = os.environ.get(_MAMBA_CARRIER_HOLD_27B_ALIAS)
+    if raw is not None and raw.strip():
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return _profile_default("FLLIPER_PDFLIP_ENABLE_MAMBA_CARRIER_HOLD", True)()
+
+
+@functools.lru_cache(maxsize=1)
+def _default_hip() -> bool:
+    """Lazy ROCm/HIP detection for platform-conditional env defaults.
+
+    Avoids importing torch at environ import time (this module is intentionally
+    stdlib-only and loaded very early). Resolved on first EnvField.get() that uses
+    it as a default, by which point torch is already imported in any real run;
+    falls back to False if torch is unavailable.
+    """
+    try:
+        import torch
+
+        return torch.version.hip is not None
+    except Exception:
+        return False
+
+
+class EnvField:
+    _allow_set_name = True
+
+    def __init__(self, default: Any):
+        self.default = default
+        # NOTE: environ can only accept str values, so we need a flag to indicate
+        # whether the env var is explicitly set to None.
+        self._set_to_none = False
+
+    def __set_name__(self, owner, name):
+        assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
+        self.name = name
+
+    def parse(self, value: str) -> Any:
+        raise NotImplementedError()
+
+    def _resolve_default(self) -> Any:
+        # Support a callable default for lazily/platform-computed defaults
+        # (e.g. EnvBool(_default_hip)); evaluated only when the env is unset.
+        return self.default() if callable(self.default) else self.default
+
+    def get(self) -> Any:
+        value = os.getenv(self.name)
+
+        # Explicitly set to None
+        if self._set_to_none:
+            assert value == str(None)
+            return None
+
+        # Not set, return default
+        if value is None:
+            return self._resolve_default()
+
+        try:
+            return self.parse(value)
+        except ValueError as e:
+            default = self._resolve_default()
+            warnings.warn(
+                f'Invalid value for {self.name}: {e}, using default "{default}"'
+            )
+            return default
+
+    def is_set(self):
+        return self.name in os.environ
+
+    def set(self, value: Any):
+        self._set_to_none = value is None
+        os.environ[self.name] = str(value)
+
+    @contextmanager
+    def override(self, value: Any):
+        backup_present = self.name in os.environ
+        backup_value = os.environ.get(self.name)
+        backup_set_to_none = self._set_to_none
+        self.set(value)
+        yield
+        if backup_present:
+            os.environ[self.name] = backup_value
+        else:
+            os.environ.pop(self.name, None)
+        self._set_to_none = backup_set_to_none
+
+    def clear(self):
+        os.environ.pop(self.name, None)
+        self._set_to_none = False
+
+    def __bool__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
+    def __len__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
+
+class EnvTuple(EnvField):
+    def parse(self, value: str) -> tuple[str, ...]:
+        return tuple(s.strip() for s in value.split(",") if s.strip())
+
+
+class EnvStr(EnvField):
+    def parse(self, value: str) -> str:
+        return value
+
+
+class EnvBool(EnvField):
+    def parse(self, value: str) -> bool:
+        value = value.lower()
+        if value in ["true", "1", "yes", "y"]:
+            return True
+        if value in ["false", "0", "no", "n"]:
+            return False
+        raise ValueError(f'"{value}" is not a valid boolean value')
+
+
+class EnvInt(EnvField):
+    def parse(self, value: str) -> int:
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f'"{value}" is not a valid integer value')
+
+
+class _DeprecatedEnvFallback:
+    """Mixin for EnvField subclasses: if the canonical env var is not set,
+    check *deprecated_name* and emit DeprecationWarning before reading it.
+
+    Usage:
+        FLLIPER_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="FLLIPER_NSA_FUSE_TOPK")
+    """
+
+    def __init__(self, default: Any, deprecated_name: str):
+        super().__init__(default)
+        self.deprecated_name = deprecated_name
+
+    def get(self) -> Any:
+        if os.getenv(self.name) is None:
+            fallback = os.getenv(self.deprecated_name)
+            if fallback is not None:
+                warnings.warn(
+                    f"Environment variable '{self.deprecated_name}' is deprecated; "
+                    f"use '{self.name}' instead. "
+                    "The alias will be removed in a future release.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                os.environ[self.name] = fallback
+        return super().get()
+
+
+class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
+    pass
+
+
+class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
+    pass
+
+
+class EnvFloat(EnvField):
+    def parse(self, value: str) -> float:
+        try:
+            return float(value)
+        except ValueError:
+            raise ValueError(f'"{value}" is not a valid float value')
+
+
+class EnvFloatVector(EnvField):
+    """A float that may also be given per rank as a comma-list.
+
+    ``"0.45"`` parses to the float ``0.45`` -- indistinguishable from
+    :class:`EnvFloat`, so every existing reader and the default path are
+    byte-identical. ``"0.485,0.42,0.42"`` parses to a tuple, one entry per
+    tensor-parallel rank.
+
+    ``get()`` deliberately REFUSES to answer once a vector is set. The value
+    has a dozen readers, and a reader that has not been taught about ranks
+    would otherwise compare a tuple against a float and either raise something
+    obscure or, worse, silently size a buffer from the wrong number. Failing
+    here names the sanctioned accessor instead. Use :meth:`get_vector` (or the
+    helpers in ``flliper.srt.layers.moe.resident_fraction``) to read it.
+    """
+
+    def parse(self, value: str):
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+        if not parts:
+            raise ValueError(f"{self.name} is empty")
+        out = []
+        for p in parts:
+            try:
+                out.append(float(p))
+            except ValueError:
+                raise ValueError(f'"{p}" is not a valid float value in {self.name}')
+        return out[0] if len(out) == 1 else tuple(out)
+
+    def get(self):
+        value = super().get()
+        if isinstance(value, tuple):
+            raise RuntimeError(
+                f"{self.name} is set per rank ({','.join(str(v) for v in value)}), "
+                f"so there is no single value to return. Read it through "
+                f"flliper.srt.layers.moe.resident_fraction: "
+                f"resident_fraction_for_rank(rank) for anything that sizes or "
+                f"books memory, offload_active() for a plain is-offload-on check."
+            )
+        return value
+
+    def get_vector(self) -> tuple:
+        """The sanctioned reader: always a tuple, length 1 when scalar."""
+        value = super().get()
+        return value if isinstance(value, tuple) else (value,)
+
+
+class ToolStrictLevel(IntEnum):
+    """
+    Defines the strictness levels for tool call parsing and validation.
+
+    OFF: No strict validation
+    FUNCTION: Enables structural tag constraints for all tools
+    PARAMETER: Enforces strict parameter validation for all tools
+    """
+
+    OFF = 0
+    FUNCTION = 1
+    PARAMETER = 2
+
+
+class PdFlipHeapCensus(IntEnum):
+    """Where the sleep's gc census of the host heap runs (pdflip/heap_census.py).
+
+    OFF: no census (the trim and its line stay)
+    DEFER: on a daemon timer after the sleep answered -- off the flip's path
+    INLINE: inside the sleep RPC, the form before fnFL2 H16
+    """
+
+    OFF = 0
+    DEFER = 1
+    INLINE = 2
+
+
+class PresplitGcMode(IntEnum):
+    """The per-layer host reclaim at the end of the expert presplit
+    (layers.moe.expert_offload.presplit_host_reclaim).
+
+    FULL: gc.collect() + malloc_trim(0), the form since 19.07.
+    TRIM: malloc_trim(0) only
+    """
+
+    FULL = 0
+    TRIM = 1
+
+
+class Envs:
+    # Raise on bare server_args field assignments after resolution; mutation
+    # must go through ServerArgs.override() (enabled by the test harness).
+    FLLIPER_STRICT_CONFIG_MUTATION = EnvBool(False)
+    # Which speculative decisions rank 0 broadcasts to its TP group (upstream
+    # #33614, spec_tp_sync.py); narrowing it under live traffic isolates where
+    # ranks diverge. Comma separated presets ("all", "rng", "init", "off"), or
+    # SpecTpSyncSite slugs and numbers, each negatable with a leading "-".
+    FLLIPER_SPEC_TP_SYNC = EnvStr("all")
+    # #1485 divergence instrument in SpecTpSync.sync: how many broadcasts per
+    # rank compare the rank-local value against rank 0's (each compare is a
+    # blocking device read). -1 = never retire (the pre-#31468 behaviour on the
+    # receiving ranks), 0 = off. The broadcast source never compares.
+    FLLIPER_SPEC_TP_DIVERGE_CHECKS = EnvInt(64)
+    # A/B: keep the DFLASH draft sampler (greedy head or DFlash2 selector) eager,
+    # not folded into the draft cuda graph.
+    FLLIPER_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # DFLASH window pool (FLLIPER_DFLASH_WINDOW_POOL=1): run the draft-slot
+    # mapper and the per-round window rebuild without host reads, so the host
+    # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
+    # the legacy mapper, byte-identical. Default: the HG base of the published
+    # form's profile (pdflip/form.py ModelProfile.d_hostgap_base, qwen27b on
+    # since 30.09., nextflash off); off without a form; explicit value wins.
+    FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE = EnvBool(
+        _profile_default("FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE", False))
+    # DFLASH window pool, radix-dedup draft-row carry (27b-draftholes 26.09.):
+    # when an insert frees a request's fresh KV slots in favour of the tree's
+    # own (same tokens), move the draft rows the fresh slots hold to the kept
+    # slots instead of dropping them. Off = no alias listener, byte-identical.
+    # Default: the 27B release fixes of the published form's profile
+    # (pdflip/form.py ModelProfile.d_release_fixes, qwen27b on since 30.09.,
+    # nextflash off); off without a form; an explicit value wins.
+    FLLIPER_DFLASH_WINDOW_POOL_DEDUP_CARRY = EnvBool(
+        _profile_default("FLLIPER_DFLASH_WINDOW_POOL_DEDUP_CARRY", False))
+    # Producer-phase census ledger: O(1) FIFO eviction at its cap (KR
+    # e54ac95c65, mem_cache/producer_phase_census.py, read once per process;
+    # the reader keeps its parse of an explicit value, only "1" arms). Default
+    # as DEDUP_CARRY above (ModelProfile.d_release_fixes).
+    FLLIPER_PDFLIP_CENSUS_O1_EVICT = EnvBool(
+        _profile_default("FLLIPER_PDFLIP_CENSUS_O1_EVICT", False))
+    # DFLASH window pool, hole rows out of the draft softmax (27b-draftwin
+    # 26.09.): window rows without draft KV (prefix from P / HiCache after a
+    # flip or loadback) read the hole slot 0 and dilute the draft attention.
+    # With the switch the draft attention removes their share exactly
+    # (speculative/dflash_window_holes.py); needs the sync-free window pool.
+    # Off = no buffer, no LSE path, byte-identical.
+    FLLIPER_DFLASH_WINDOW_HOLE_MASK = EnvBool(False)
+    # DFLASH decode round, stage 2 of the host-sync removal: plan the draft
+    # and the uneven-DCP target verify with HOST-known FlashInfer metadata so
+    # the host never waits for the draft forward (owner.py compact[owned] /
+    # repeat_interleave, prefill.py plan .to("cpu"), flashinfer_backend
+    # _host_sum_or_device). The verify's owned-slot index is built BEFORE the
+    # draft in stream order and read back through an event that fires ahead
+    # of the draft. Off = the old planning path, byte-identical. Default: the
+    # HG base (ModelProfile.d_hostgap_base, as WINDOW_POOL_SYNC_FREE above).
+    FLLIPER_DFLASH_PLAN_SYNC_FREE = EnvBool(
+        _profile_default("FLLIPER_DFLASH_PLAN_SYNC_FREE", False))
+    # 27B row 24h, the HG BASE (30.09.): the deferred host-length read and its
+    # stage 2 (managers/pdflip_d_hostgap.py). The HG levers below act only on a
+    # deferred round (EARLY_DRAFT is stage 3 of this read), and the dhg
+    # measurement ran with all four base switches on in both arms. The reader
+    # (pdflip_d_hostgap.defer_seq_lens_cpu_on / defer_rebuild_on) keeps its
+    # parse of an explicit value (only "1" arms) and takes this default when
+    # the env is unset or blank.
+    FLLIPER_PDFLIP_D_DEFER_SEQ_LENS_CPU = EnvBool(
+        _profile_default("FLLIPER_PDFLIP_D_DEFER_SEQ_LENS_CPU", False))
+    FLLIPER_PDFLIP_D_DEFER_REBUILD = EnvBool(
+        _profile_default("FLLIPER_PDFLIP_D_DEFER_REBUILD", False))
+    # 27B row 24h (HG): the three D host-gap levers, ONE registry field
+    # (pdflip/form.py ModelProfile.d_hostgap_levers: qwen27b on since 29.09.,
+    # nextflash off); off without a form; an explicitly set value wins. The
+    # readers keep their own parse of an explicit value (pdflip_d_hostgap
+    # early_draft_on, dflash_worker_v2 accept_sync_fused_on, barlink_bar1
+    # canon_order_on) and take this default when the env is unset or blank.
+    FLLIPER_PDFLIP_D_EARLY_DRAFT = EnvBool(_profile_default("FLLIPER_PDFLIP_D_EARLY_DRAFT", False))
+    FLLIPER_DFLASH_ACCEPT_SYNC_FUSED = EnvBool(
+        _profile_default("FLLIPER_DFLASH_ACCEPT_SYNC_FUSED", False))
+    FLLIPER_BARLINK_BAR1_CANON_ORDER = EnvBool(
+        _profile_default("FLLIPER_BARLINK_BAR1_CANON_ORDER", False))
+    # [vram-peak] high-water check (model_runner, every forward): read the
+    # allocator peak straight from torch's nested stats dict instead of the
+    # flattened memory_stats() -- the same number without the Python flatten
+    # (~0.7 ms per DFLASH round on D). Off = torch.cuda.max_memory_allocated().
+    # LS12 rest (30.09.): default = the published form's row (ModelProfile.vram_peak_fast_read,
+    # qwen27b on); off without a form; an explicit value wins.
+    FLLIPER_VRAM_PEAK_FAST_READ = EnvBool(_profile_default("FLLIPER_VRAM_PEAK_FAST_READ", False))
+    # LS12 rest (30.09.): the profile-default contract entries (UNIFY S2) of the switches whose
+    # readers parse the environment themselves and ask the same registry when unset/blank:
+    # logits_processor.verify_local_vocab_requested, arena_pool.load_index_async,
+    # unified_radix_cache._hicache_drain_agree_every, front._env_switch_on_or_profile (kicks).
+    FLLIPER_DFLASH_VERIFY_VOCAB_ARGMAX = EnvBool(_profile_default("FLLIPER_DFLASH_VERIFY_VOCAB_ARGMAX", False))
+    FLLIPER_HICACHE_LOAD_ASYNC_INDEX = EnvBool(_profile_default("FLLIPER_HICACHE_LOAD_ASYNC_INDEX", False))
+    FLLIPER_HICACHE_DRAIN_AGREE_EVERY = EnvInt(_profile_default("FLLIPER_HICACHE_DRAIN_AGREE_EVERY", 1))
+    FLLIPER_PDFLIP_CTL_KICK_ARRIVAL = EnvBool(_profile_default("FLLIPER_PDFLIP_CTL_KICK_ARRIVAL", False))
+    FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP = EnvBool(_profile_default("FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP", False))
+    # INT8 W8A8 small-M GEMM on sm_120 (27b-int8tri 26.09.): route
+    # CompressedTensorsW8A8Int8.apply_weights through the Triton kernel with
+    # exact int32 split-K (layers/quantization/int8_sm120_triton.py) when the
+    # device is sm_120, M <= 16, bias-free bf16, and (N, K) is in the table
+    # measured on the 5090 (int8_mm_sweep 20260926T171511Z). Every other
+    # call, and every other device, stays on sgl_kernel.int8_scaled_mm.
+    # Off = the sgl call only, byte-identical.
+    FLLIPER_INT8_SM120_TRITON = EnvBool(False)
+
+    # Downgrade the draft-model unloaded-parameter check (#290/#318) from a
+    # hard error to a log line. An unloaded drafter proposes noise, so this is
+    # a debugging escape hatch, not a supported configuration.
+    FLLIPER_ALLOW_UNLOADED_DRAFT_PARAMS = EnvBool(False)
+
+    # fnFL2 H36: per-request acceptance profile. When a speculative request
+    # finishes, TP rank 0 logs one SPEC-ACCEPT-PROFILE line: the correct-drafts
+    # histogram of the whole request, split into its first N verify rounds and
+    # the rest, plus the phase flip's draft-cold mark. It reads counters the
+    # batch-result processor already holds on the CPU (no device sync), so a
+    # flipped request's warm-up can be told from its steady state in the D log
+    # without SPEC-TRACE. 0 turns the line off.
+    FLLIPER_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS = EnvInt(64)
+
+    # H25 (Nutzer-Order 24.09. 08:25Z, "Draft auf P streichen"): does the
+    # Weg-2 prefill group P carry the MTP draft head? False = P boots with no
+    # draft (no weights_draft tag, no draft-KV producer; P's draft KV has had
+    # no reader since fnFL2x63), the freed VRAM on P's draft card goes to that
+    # stage's expert residency (launcher PP-CUT draft post), and D's own draft
+    # is parked in pinned system RAM while P runs (pdflip/draft_park.py). The
+    # pdflip launcher resolves it once, together with --draft-kv-on-p, and
+    # publishes the resolved value to the front and both groups' ranks.
+    FLLIPER_PDFLIP_DRAFT_ON_P = EnvBool(False)
+
+    # #695: allocate the permanent phase-flip host weight images at their exact
+    # size (MAP_ANONYMOUS + cudaHostRegister) instead of through torch's pinned
+    # caching allocator, which rounds every request up to a power of two and
+    # held 13.65 GiB of pure rounding for the life of the process.
+    # Set to 0 to restore the pre-#695 allocation. That is the comparand arm of
+    # the flip-latency A/B (MERGE-R5 §6) and the opt-out if the exact-size path
+    # ever has to be taken off by default without reverting the commit. It does
+    # NOT disable the host-post registration or the shmem pricing from the same
+    # commit -- those are correct under either allocator.
+    FLLIPER_PHASE_FLIP_EXACT_PIN = EnvBool(True)
+    # Flip host images as FILE-BACKED shared mappings instead of page-locked
+    # RAM: the pages become reclaimable page cache (written back to disk under
+    # pressure, refaulted at the next flip) and the ~tens-of-GiB image post
+    # leaves the pinned-host ledger. Opt-in: the flip's H2D refill then runs
+    # pageable instead of DMA, plus a disk refault when the box was actually
+    # under pressure (#89's hibernate restore, 8-14 s for a full weight set on
+    # the same pool, is the cold-read anchor; #690 measured the pinned DMA
+    # refill at 9,614.9 MiB/rank). Requires FLLIPER_PHASE_FLIP_IMAGE_DIR on a
+    # persistent filesystem; refuses (never silently pins) otherwise.
+    # #830 F4: the seam's DRAIN BUDGET, in milliseconds -- the longest #760
+    # device-tier quiesce the flip will enter the no-return window carrying.
+    # Above it the arm is REFUSED BY NAME (bounded defer, then escalate and
+    # proceed, exactly as #721's host-RAM guard does) instead of the seam
+    # silently holding the ring for as long as the drain happens to take.
+    #
+    # THE DEFAULT IS DERIVED, NOT PINNED, and 1094 is odd on purpose so it
+    # stays traceable. It is the largest cutover step observed anywhere in the
+    # pre-integration corpus ANALYSE_830 section 2.1 measures: 1014 flips with
+    # HiCache off, across boot_knowngood_r15 (503 flips), the 303-flip
+    # 2026-08-17 bundle, boot_735_nohc and boot_735_w2 -- max cutover 1094 ms,
+    # max total 4155 ms, zero faults. So the claim behind the number is
+    # narrow and checkable: the seam has demonstrably held the ring this long,
+    # a thousand times, without producing a single fault. A projected drain
+    # that would push past a duration with that much clean evidence behind it
+    # is worth refusing an arm over.
+    #
+    # 0 disables the guard (no refusal, projection still logged). Raise it if
+    # a boot shows the refusal firing on drains that complete harmlessly --
+    # that is data, and this number should move on data.
+    FLLIPER_FLIP_SEAM_DRAIN_BUDGET_MS = EnvInt(1094)
+    # #834: THE SEAM SHRINK. Off by default, and "off" means the shipped path
+    # runs unchanged -- every new branch in phase_flip_runtime.py and
+    # phase_flip_spill.py is entered only through this gate.
+    #
+    # WHAT IT CHANGES, in one sentence per half:
+    #
+    #   A  the #760 device-tier quiesce moves to ARM TIME. The device tier is
+    #      disarmed and its in-flight copies drained while the pipeline is
+    #      still serving, instead of the flip arming first and then waiting
+    #      for those copies inside the no-return window with the requests
+    #      parked. The seam's own quiesce is NOT removed -- it stays exactly
+    #      where it is and becomes the confirmation that the drain already
+    #      happened (#830 M11: removing it re-opens two SIGSEGVs that no
+    #      Python-side shape check can catch).
+    #   B  the rank-local half of ``recover_kv_backing`` -- the
+    #      cuMemCreate/cuMemMap grow that #830 F2 measured as ~99% of the
+    #      cutover term -- moves OUT of the no-return window and runs after
+    #      the cutover. The COLLECTIVE levelling stays in the seam, because
+    #      that is the half that cannot move: it is what stops one rank
+    #      exposing an id a peer has not backed, and running it at a
+    #      rank-local cadence is the 2026-08-08 boots 9/10 PP wedge shape.
+    #
+    # THE HAZARD THIS GATE EXISTS FOR is that both halves change WHEN work
+    # happens relative to a collective, and both of B's failure modes -- a
+    # three-rank abort inside store_kvcache's bounds assert, and #814's
+    # permanent pool shrink -- are invisible to a hermetic suite. So the
+    # default is the measured, booted path, and the shrink is what a GPU
+    # window turns on deliberately.
+    FLLIPER_SEAM_SHRINK = EnvBool(False)
+    # Per-half overrides, for attributing a window's result to one half rather
+    # than to "the shrink". -1 = follow FLLIPER_SEAM_SHRINK, 0 = force off,
+    # 1 = force on. A window that moves both at once cannot say which moved
+    # the number, and this family has already paid twice for reading adjacency
+    # as attribution.
+    FLLIPER_SEAM_SHRINK_PREARM_QUIESCE = EnvInt(-1)
+    FLLIPER_SEAM_SHRINK_DEFER_GROW = EnvInt(-1)
+    # #834 B step 4: the RATCHET GUARD's patience, in flip-runtime rounds.
+    #
+    # A deferred grow that no levelling has consumed is #814's trap wearing a
+    # new shape: the rows are backed but not exposed, so the pool stays small
+    # while the memory is already spent. After this many rounds with a grow
+    # still outstanding the runtime says so LOUDLY and names #814, the way the
+    # abort window's "drain missed" check does. It never self-heals by
+    # exposing unlevelled rows -- that is the abort this design refuses.
+    #
+    # 32 is a patience, not a measurement: the levelling runs at the seam's
+    # funding-verdict cadence, which is asked at least once per arm, and an
+    # instance that has not armed in 32 rounds has a different problem. It
+    # should move on data from the first window that turns the shrink on.
+    FLLIPER_SEAM_SHRINK_GROW_DEBT_ROUNDS = EnvInt(32)
+    FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED = EnvBool(False)
+    FLLIPER_PHASE_FLIP_IMAGE_DIR = EnvStr("")
+    # #1078: keep BOTH layout images as their own files, so a flip leg reads
+    # the incoming layout from its own file and DISCARDS the outgoing arena
+    # content instead of copying it back. The copy-back is 94.7-95.2 % of the
+    # leg under the file-backed arm (measured PP0 pp_to_tp 63.911 s, of which
+    # d2h-issue 60.692 s) because its destination is an unregistered ZFS
+    # MAP_SHARED mapping: the copy cannot be async and goes out through the
+    # mmap write path at 153-226 MiB/s, while the SAME file reads at 2 595
+    # MiB/s buffered / 8 304 O_DIRECT.
+    #
+    # VALID ONLY WITH FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED, and that is a
+    # refusal in `require_two_file_preconditions`, not a note. Two PINNED
+    # lifetime images are 55.99 GiB across this rig's three ranks -- the dual
+    # pin W26 OOM-killed, merely renamed (phase_flip_boot.py:1861-1865).
+    # File-backed they are reclaimable page cache: +27.15 GiB of DISK against
+    # 501 GiB free, and no locked RAM.
+    FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE = EnvBool(False)
+    # #809: hold ONE page-locked host buffer per rank, sized to the LARGER of
+    # this rank's two layout images, and fill it with the INCOMING layout's
+    # image file while the flip drains. At the cutover the refill takes the
+    # leading `[0, bytes_valid)` bytes from that buffer as a real DMA and
+    # falls through to the file for the rest, so the content is identical by
+    # construction and only the TIMING moves (weights_arena.py, FlipImagePin).
+    #
+    # WHAT THIS SUPERSEDES, and only in part. The 2026-08-18 rationale above
+    # (:255-263) moved the images off pinned RAM because PINNED LIFETIME
+    # IMAGES FOR BOTH LAYOUTS were 55.99 GiB and W26 OOM-killed under them
+    # (#721). That verdict stands: the images stay file-backed and the file
+    # stays the carrier. What this adds is ONE buffer per rank -- the larger
+    # image, not both, ~28 GiB summed over this rig's three ranks against the
+    # #810 host ledger's 60.10 GB of posts in 115.97 GB minus a 10.74 GB
+    # reserve -- and it is a READ-AHEAD, not a second copy of the truth.
+    #
+    # GATED BY THE #721 LEDGER, not by this flag: the buffer is declared to
+    # `pinned_host_budget` before it is allocated and the boot REFUSES BY NAME
+    # if it does not fit, because a pin that silently did not happen is the
+    # #742 silently-inert-flag class. Measured Boot 10/11: refill legs 11.0-
+    # 12.7 s at 1.3-1.4 GB/s (STORAGE-BOUND) against ~1.5 s for 7 GiB on the
+    # x4 link alone (#690: 4.93 GB/s H2D on rank 1), which is the whole gap
+    # this buys.
+    #
+    # VALID ONLY WITH FILE_BACKED + TWO_FILE, and that is a refusal in
+    # `require_pin_preconditions` (weights_arena.py), not a note: the pin
+    # reads the incoming layout's OWN image file, and under one rotating
+    # image there is no such file to read ahead of.
+    FLLIPER_PHASE_FLIP_IMAGE_PIN_INCOMING = EnvBool(False)
+    # FLLIPER_PINNED_HOST_RESERVE_GIB (the pinned-host OS reserve, GiB) is NOT declared
+    # here: its one reader is pinned_host_budget.pinned_host_reserve(), which reads it
+    # at call time, validates it and names its source (unify step 1, 27B form a9fc5e52ef).
+    # #1159: how long the #1033c post-cutover forward warmup may stay OPEN
+    # before the scheduler says so in ONE named line. It is a REPORTING bound,
+    # not a stop: the group stop for a one-sided cutover belongs to #1158
+    # (RAENGE-NIE-UNEINS) and is deliberately not built here.
+    #
+    # Measured weg1b3: the window opened at 23:59:54 on PP0 and PP2, PP1 never
+    # entered it, and no 'CUTOVER FORWARD WARMUP done' or 'build window CLOSE'
+    # ever followed. The only evidence the boot produced for that state was
+    # 82,350 '#1073 ... RESUMING' lines -- 41 % of the log -- which is the
+    # symptom, not the event. 120 s is chosen against the honest population:
+    # every completed warmup in that boot took 28-629 ms (tp layout 2/8..8/8 at
+    # 23:53:00, pp layout 1/8..8/8 across 23:54:18-23:58:01), so 120 s is ~190x
+    # the longest honest one and cannot fire on a healthy group.
+    FLLIPER_CUTOVER_WARMUP_OPEN_WARN_S = EnvFloat(120.0)
+    # #802: refill a FILE-BACKED image by READING the file into a pinned
+    # staging ring, instead of copying straight off the mapping and taking one
+    # synchronous major fault per 4 KiB page. Measured on this rig 2026-08-22
+    # for the 16 699 408 904-byte PP0 image: the mapping path costs 4 077 045
+    # faults and 12 572 ms (1266 MiB/s) on a pool that writes at ~3500 MiB/s.
+    # Advisory hints do NOT fix it here and this arm deliberately does not use
+    # them -- on this OpenZFS pool MADV_WILLNEED populates nothing (12 564 ms,
+    # 4 077 052 faults, mincore residency 0.0 after the call) and per-chunk
+    # MADV_SEQUENTIAL is a 15.6x regression (196 200 ms).
+    # Only affects the file-backed arm; the default pinned image path never
+    # reaches it. Set to 0 for the comparand arm of the A/B on one binary.
+    FLLIPER_PHASE_FLIP_REFILL_STAGED = EnvBool(True)
+    # Staging chunk and ring depth. The ring is allocated ONCE and charged to
+    # the pinned-host registry (#720's ReadBufferPool), so the whole new host
+    # post is CHUNK_MIB x DEPTH per rank -- bounded, unlike the image itself.
+    # 32 MiB x 2 measured fastest of the sweep at 1 918 ms / 8 304 MiB/s, a
+    # 7.50x improvement on the 14 377 ms mapping baseline. Buffered reads of
+    # the same shape reach only 2 242 MiB/s because they pay a second pass
+    # into the ARC, so the read path prefers O_DIRECT and falls back to
+    # buffered only when the filesystem refuses it.
+    FLLIPER_PHASE_FLIP_REFILL_CHUNK_MIB = EnvInt(32)
+    FLLIPER_PHASE_FLIP_REFILL_DEPTH = EnvInt(2)
+    FLLIPER_PHASE_FLIP_REFILL_SAVE_SLICES = EnvInt(4)
+
+    # Weg-2 flip legs (H11, fnFL2x83-x105): the non-physics time of the legs.
+    # TAG_PLAN_PREWARM: the per-tag plan key the deposit (hook=source) and the
+    # collect (hook=authoritative) read is derived at boot with the hook plans,
+    # not by the first tag of the first flip (PP0 106-517 ms, D 200-330 ms).
+    FLLIPER_PDFLIP_TAG_PLAN_PREWARM = EnvBool(True)
+    # WAKE_LANE_TURNS: the tag-order gate of a host/IPC lane waits only for the
+    # earlier tags that USE that lane (a turn per lane, as the BAR1 lanes do),
+    # not for every earlier tag of every source card.
+    FLLIPER_PDFLIP_WAKE_LANE_TURNS = EnvBool(True)
+    # WAKE_COLLECT_SPARE: collect workers beyond the run-ahead bound
+    # (FLLIPER_PDFLIP_WAKE_COLLECT_WORKERS, default 2). The bound keeps bound+1
+    # collects submitted; a pool of exactly `bound` queued the just-resumed
+    # tag behind two tags of other source cards (x105 PP0 weights_1/2: lane
+    # p0 waited 115/139 ms). 0 = the pool of the 2026-09-18 form. Resumes and
+    # VRAM are unchanged by it.
+    FLLIPER_PDFLIP_WAKE_COLLECT_SPARE = EnvInt(1)
+    # ARENA_OWNER_LANE_DMA (01.10., NF y6o P->D): a Form-A worker's owner
+    # loadback after the wake ("dma" mode, registered arena) copies only the
+    # lanes the rank owns -- one cudaMemcpy2DAsync per run of consecutive
+    # slots (src pitch = owner split x cell, width = owned run x cell) into a
+    # compact device stage -- instead of whole pages (y6o: 3601 pages = 2.83
+    # GB per worker, TP1 owns 40/64 lanes, TP2 24/64). Same stage bytes, same
+    # loaded KV bytes; =0 restores the whole-page load for an A/B.
+    FLLIPER_PDFLIP_ARENA_OWNER_LANE_DMA = EnvBool(True)
+    # WAKE_RUNAHEAD_ANY (30.09., NF y4k/y4l P->D, pdflip/wake_runahead.py): the
+    # run-ahead bound waits for ANY collect in flight to finish instead of the
+    # OLDEST (a slow 3080 source's band held D TP1/TP2's resume of PP0's next
+    # band -- the flip's critical chain -- while newer collects were done;
+    # main-loop gaps 654/659 ms per flip, PP0 p0/p1 credit waits 313/138 ms).
+    # Same collects in flight, same resumes and credit waits, no VRAM. Per
+    # group (the waking group reads it); off until metal.
+    FLLIPER_PDFLIP_WAKE_RUNAHEAD_ANY = EnvBool(False)
+    # CREDIT_LIVE_STAGING: the waker's credit check subtracts only the peer's
+    # stagings that are booked but not yet allocated; an allocated staging is
+    # already missing from the free reading (x105 TP2: 943 MiB counted twice,
+    # 311 + 293 ms credit waits).
+    FLLIPER_PDFLIP_CREDIT_LIVE_STAGING = EnvBool(True)
+    # HANDOFF_PENDING_EXPIRE_S (#243): a P hand-off still marked pending after
+    # this many seconds leaves the eviction order by name (EXPIRED) and reads
+    # LOST (reason=expired, first_lost_page=0), never none -- so a rid still
+    # waiting for its seat is re-routed fresh, never priced on unprotected
+    # pages. It clears the mark of a rid that ended where nobody reported it
+    # (the front's drop missing). A garbage bound, not a capacity: the order
+    # itself never holds a slot. Seat waits up to 658 s were measured (rc12r).
+    FLLIPER_PDFLIP_HANDOFF_PENDING_EXPIRE_S = EnvFloat(900.0)
+    # ENABLE_DUAL_ANCHOR_RELEASE (Q-610, dual y8t 11:24:25: P's tree held a
+    # reader reference on every mamba anchor it ever wrote -- 92 of the 112
+    # arena slots on each PP rank -- because the dual layout never resets P,
+    # the only point that gave them back): on a group-P rank of the dual
+    # layout an END anchor's tree reference goes once the front ended its rid,
+    # and a refused mamba claim gives back the settled prefix-cache anchors.
+    # The pages stay COMPLETE in the arena until a claim needs their slot.
+    # Inert outside FLLIPER_PDFLIP_DUAL_LAYOUT=1 + FLLIPER_PDFLIP_GROUP=P.
+    FLLIPER_PDFLIP_ENABLE_DUAL_ANCHOR_RELEASE = EnvBool(True)
+    # #1500a ANCHOR-AGING (pdflip/dual_anchor_release.py, dual layout group D only, needs the switch
+    # above): D gives anchors no match touched for more than ..._TICKS D ticks (256 HICACHE rounds
+    # each, ~9-60 s; counted, never wall time) back softly. Default OFF; TICKS default 40 (>= 6 min
+    # at the fastest measured D round rate).
+    FLLIPER_PDFLIP_DUAL_ANCHOR_AGING = EnvBool(False)
+    FLLIPER_PDFLIP_DUAL_ANCHOR_AGING_TICKS = EnvInt(40)
+    # #1500a ANCHOR-AGING-P: the same rule on dual group P's radix tree (P pins ~30 of the 112 mamba
+    # slots for ever after D's aging: deskq/done/1530). Age counted in RETAINS (finished requests), the
+    # same ..._TICKS value; END anchors only when their rid is done; counted L3 copy, not gated. Default OFF.
+    FLLIPER_PDFLIP_DUAL_ANCHOR_AGING_P = EnvBool(False)
+    # told-anchor hold (y9d4, pdflip/dual_told_anchor_hold.py): dual group P keeps the anchor a
+    # standing told names from told to admission (cap / Q-610 / inner release skip it). 0 = off.
+    FLLIPER_PDFLIP_DUAL_TOLD_ANCHOR_HOLD = EnvBool(True)
+    FLLIPER_PDFLIP_DUAL_TOLD_ANCHOR_HOLD_MAX = EnvInt(24)  # = dual_told_anchor_hold.DEFAULT_MAX (the module reads os.environ itself)
+    FLLIPER_PDFLIP_DUAL_TOLD_ANCHOR_HOLD_RUNS = EnvInt(256)
+    # Q-670 DUAL-PARALLEL (pdflip.dual_parallel; dual layout only): a request
+    # counts as short at or below DUAL_SHORT_BYPASS_TOKENS uncached tokens and
+    # may pass a paused or long head; a head is overtaken for at most
+    # DUAL_BYPASS_HEAD_AGE_S seconds (front SHORT-FIRST and PP0 GRANT-BYPASS),
+    # then newcomers wait behind it again.
+    FLLIPER_PDFLIP_DUAL_SHORT_BYPASS_TOKENS = EnvInt(8192)
+    FLLIPER_PDFLIP_DUAL_BYPASS_HEAD_AGE_S = EnvFloat(60.0)
+    # #1530 GRANT-RETRY throttle (dual layout, PP0 only; 0 = OFF = every pass retries as before).
+    # B9g boot 5 (04.10. 20:10-20:22Z): PP0 retried 9 held legs on EVERY scheduler pass (~2000
+    # grants/s: stage JSON + ledger reads each), CPU 101 % under the GIL, forward/publish starved
+    # (stop-and-go, Deadman HAENGT 2x ~90 s). With N > 0 a held rid retries at most every N ms
+    # unless a card ledger record changed since its last attempt; stage tables are cached by mtime.
+    FLLIPER_PDFLIP_DUAL_GRANT_RETRY_MS = EnvInt(0)
+    # #1640 GRANT-INFEASIBLE (deskq/done/1640, E2): a request whose group grant is short on a card even if
+    # D gave back EVERYTHING it holds there (need > ledger free + D committed; card 0 of the 27B dual:
+    # ~3.1 GB pool vs 4.08 GB for level 196608) can only be released by a falling level, never by D.
+    # With the switch on, PP0's ``_older_waits`` does not count such a head, so it no longer blocks the
+    # younger grants after FLLIPER_PDFLIP_DUAL_BYPASS_HEAD_AGE_S (hold=older-head, '0 running' wedge). PP0-local
+    # (no collective, no wall clock in the decision); the head keeps retrying itself. The marker
+    # '#1640 GRANT-INFEASIBLE' is a pure log line and is written with or without the switch. 0 = off (default).
+    FLLIPER_PDFLIP_DUAL_GRANT_INFEASIBLE_SKIP = EnvBool(False)
+    # #1920 HEAD-BYPASS-FLOOR (deskq/done/1890 lever B, 1910): dual b9p/top112 still showed P-KV waits of 63-127 s
+    # and ADMISSION-WEDGEs of 65 s because a RUNNING D request on a high row (``D-LIVE-FLOOR ... live_row=198899``)
+    # blocks the D shrink; the oldest P waiter then holds (``hold=older-head``, ``_older_waits``) every younger
+    # request that would be grantable NOW once it is older than FLLIPER_PDFLIP_DUAL_BYPASS_HEAD_AGE_S. With the
+    # switch on (set it for BOTH groups: D publishes the flag, PP0 reads it) a head whose grant is short while D's
+    # tick reports SHRINK-BLOCKED reason=live_floor does not hold a younger request whose own group grant
+    # succeeds right now (order violation on purpose). Starvation guard: the head keeps priority whenever its
+    # grant is satisfiable from the ledger's free bytes, and at most FLLIPER_PDFLIP_DUAL_HEAD_BYPASS_FLOOR_MAX
+    # overtakers pass one head (then hold=older-head as before). Dual P, PP0-local decision (the told carries the
+    # grant; no collective, no clock beyond the existing head age). Marker '#1920 HEAD-BYPASS-FLOOR'. 0 = off.
+    FLLIPER_PDFLIP_DUAL_HEAD_BYPASS_FLOOR = EnvBool(False)
+    FLLIPER_PDFLIP_DUAL_HEAD_BYPASS_FLOOR_MAX = EnvInt(4)
+    # #1720 SEATS-STALL-OFF (deskq/done/1720, F1): on dual group P (--max-running-requests 1) the seat gate
+    # declines with 'running=empty' whenever the ONE request slot is held by a mini request flying in the PP
+    # ring (self.mbs, not running_batch); IntakeStallWatch never resets on a slot change, so after 1.0 s the
+    # next observation fires a false-positive 503 (gate=seats) that aborts a healthy head (30-36 s cost).
+    # With the switch on AND dual P (FLLIPER_PDFLIP_DUAL_LAYOUT=1, FLLIPER_PDFLIP_GROUP=P) the gate=seats
+    # observation is skipped; a real wedge stays covered by wedge_recovery (gate=admission-wedge, >=20 s,
+    # immediate). Pure env, identical on every rank, no clock in the decision. 0 = off (default).
+    FLLIPER_PDFLIP_DUAL_SEATS_STALL_OFF = EnvBool(False)
+    # #1730 FRONT-REJECT-OVERLONG (deskq/done/1740; b9o: 27 of 28 claude-cli 503 = P's 400 'Input length (134k-150k) exceeds the
+    # maximum allowed length (131072 tokens)', each one a 1-token stub that held a full ring slot on P and fed the
+    # gate=seats stall): in the DUAL layout the front answers a request whose EXACT front token count (X-EXACT) is over
+    # the group's --max-kv-per-request with HTTP 400 invalid_request_error (Anthropic or OpenAI body by route) BEFORE any
+    # route/seat/leg 1, P untouched. Inert in the flip form (no dual layout), without an exact count, and without a
+    # known cap. #1958 FRONT-CAP-LEVEL-TOP: the cap is min(--max-kv-per-request, P's max_req_input_len), the latter
+    # read once from P's /get_server_info (top112: --dual-p-kv-max-tokens 114688 -> 114682), so prompts between P's
+    # ceiling and max-kv no longer reach P. 0 = off (default).
+    FLLIPER_PDFLIP_FRONT_REJECT_OVERLONG = EnvBool(False)
+    # Q-680 DUAL RESUME-STALE-LEDGER (dual y8w fs10031623 16:45:42: two P
+    # followers kept 201/302 MB committed for 905 s, the front's RESUME-WAIT
+    # held the whole queue): when P is idle (no leg in flight) and the only
+    # thing a paused head waits for is "P committed" -- no pressure, no D
+    # demand -- for this many seconds, the front resumes it.
+    FLLIPER_PDFLIP_DUAL_RESUME_STALE_S = EnvFloat(10.0)
+    # Q-696 DUAL D-CACHE-HOLDS-CARD (dual y8z fs10031909 19:24:40-19:25:54: P's
+    # 94720-token grant waited 73.9 s on PP0's card while D held 225280 mapped
+    # rows for ONE running request, 163929 of them evictable cache): once P has
+    # waited for a card this many seconds (group MAX), a RUNNING D yields its
+    # unlocked cache too and shrinks to its live floor; <= 0 = only an idle D
+    # yields (the pre-Q-696 rule). DUAL_D_REGROW_HOLD_S: no D shrink this many
+    # seconds after a D grow (19:26:04 GROW 110592->196608, SHRINK back and a
+    # GROUP-WAIT for the same level within one second -> a second P pause).
+    # Inert outside FLLIPER_PDFLIP_DUAL_LAYOUT=1 + FLLIPER_PDFLIP_GROUP=D.
+    FLLIPER_PDFLIP_DUAL_D_LIVE_YIELD_WAIT_S = EnvFloat(4.0)
+    FLLIPER_PDFLIP_DUAL_D_REGROW_HOLD_S = EnvFloat(5.0)
+    # #1540 D-LOW-FIRST (deskq/done/1540, 1590): D's KV allocator hands out ids in free-list order
+    # (token allocator: freed ids go to the TAIL; paged: to the head, unsorted), so ONE running request
+    # can sit on a page near the top of the mapped span and the D-KV shrink (live_floor) cannot give P's
+    # card the rest back (b9i pdflip-0-50 page 229371 for 62 s, 1.4 GB). N > 0: every N-th allocation
+    # call merges the released ids and sorts the free list ascending, so new work lands low and
+    # max_live_id falls. A pure function of the replicated call count (never wall time), so every D
+    # rank holds the same list. Inert outside the dual layout + group D. 0 = off (default).
+    FLLIPER_PDFLIP_DUAL_D_LOW_FIRST = EnvInt(0)
+    # D-COMPACT (dual262kbar1fs10061152: P's KV grant waited 473 s because two running seats held D rows
+    # 198716/198717 and the D-KV span shrinks only from the top): when P has waited past
+    # FLLIPER_PDFLIP_DUAL_D_LIVE_YIELD_WAIT_S and live rows above the shrink target hold the span, every D rank
+    # moves them (KV bytes of all layers, owner-class preserving under uneven DCP; req_to_token, tree values,
+    # prefix_indices, DFlash draft rows via the alias carry) to free ids below the target and shrinks in the
+    # same tick. Three group collectives (plan fingerprint / copy ok / new floor), rollback before any
+    # reference changes, named REFUSED otherwise (pdflip/dual_d_compact.py). DEFAULT ON, but inert outside
+    # FLLIPER_PDFLIP_DUAL_LAYOUT=1 + group D + FLLIPER_PDFLIP_DUAL_D_KV_MAX_TOKENS > 0; 0 = off. The module reads
+    # os.environ itself.
+    FLLIPER_PDFLIP_DUAL_D_COMPACT = EnvBool(True)
+    # #1420r DEFER-REARM (desk 1420 point 5): D-HANDBACK-DEFER is single-shot -- the one re-read lands
+    # empty while P's write-through of the tail anchor is still in flight, the second W31 spends the
+    # mark and the request goes back over P (second prefill, ~58 s). N > 0 = a mark whose read has
+    # been issued is RE-ARMED up to N times (PASS-counted, so every D rank decides alike; the wall
+    # bound stays the existing length-priced vote in ``pending``). 0 = off = the old behaviour,
+    # byte-identical. Dual D only (dual_handback_defer.armed()). The module reads os.environ itself.
+    FLLIPER_PDFLIP_DUAL_HANDBACK_DEFER_REARM = EnvInt(0)
+    # #1500i PKVWAIT-INSTR (y9d4d, desk analysis 1390 Fix 1): LOG-ONLY census lines that name why a
+    # full-arena D hands no VRAM to a waiting P -- the refusal reasons of ``spill_host_only``, the
+    # evictable size after the D cache yield, the owner of D's topmost live row. At most one line per
+    # 5 s per rank and marker, no collective, no behaviour. Inert outside FLLIPER_PDFLIP_DUAL_LAYOUT=1
+    # (either group with its KV cap); 0 = no line, no cost.
+    FLLIPER_PDFLIP_DUAL_PKVWAIT_INSTR = EnvBool(True)
+    # #2004 D-WANT-LOCKED (deskq/done/2000 B1, Karte-0-Wand 262k): dual D only. DEFAULT OFF = the old
+    # code, byte for byte. On: D's level (``want``) is built from the rows it really holds (mapped - free -
+    # evictable = ``locked``, a prefix the seats share counts ONCE) plus the not yet allocated need of the
+    # queue and the chunked request, instead of the SUM of every request's full token count (pt4: mapped
+    # 308634 for ~149246 occupied rows). Never above the old want; floor_want, the live floor and the
+    # immediate grow stay. The module reads os.environ itself (dual_d_kv_stage.want_locked_armed).
+    FLLIPER_PDFLIP_DUAL_D_WANT_LOCKED = EnvBool(False)
+    # #1390f UNBACKED-DROP (y9d4d/B9, desk analysis 1390 Fix 2): dual D only. DEFAULT OFF = the old code
+    # path byte for byte. On: while P waits for its card >= DROP_WAIT_S, the D group has no demand and no
+    # hold and the shared arena refused a claim recently, D's cache yield drops un-backed childless leaves
+    # (group-uniform order on the tick collective; a parked/held request blocks it).
+    FLLIPER_PDFLIP_DUAL_D_UNBACKED_DROP_ON_WAIT = EnvBool(False)
+    FLLIPER_PDFLIP_DUAL_D_UNBACKED_DROP_WAIT_S = EnvFloat(8.0)
+    # #1430q LATER-TOLD DROPS HELD ZOMBIE (B9 14:49:55Z, pdflip-0-103): dual P followers only. DEFAULT OFF = the old
+    # code path byte for byte. On: a told verdict of a later PP0 list than a held (#1180-W) waiting-queue abort takes
+    # that abort's unadmitted instance (a zombie; the told belongs to the rid's NEW instance) out of the queue, object-exact.
+    FLLIPER_PDFLIP_DUAL_LATER_TOLD_DROP = EnvBool(False)
+    # #1470 POP KEEPS TWIN (B9b 15:45:30Z, pdflip-0-89): dual P followers only. DEFAULT OFF = the old code path byte for byte.
+    # On: the #1180-W 'pop' verdict (PP0 popped the aborted request at receipt) takes out only the objects the hold was
+    # made for when a newer instance of the same rid is queued, instead of AbortReq(rid) (prefix: both instances + the
+    # new instance's told).
+    FLLIPER_PDFLIP_DUAL_POP_KEEPS_TWIN = EnvBool(False)
+    # #1480 LEND-RESUME-GATE (B9c 17:02:28Z): dual FRONT only (the P-stage ladder). DEFAULT OFF = the old code path byte for
+    # byte. On: the front's resume 'from=lend' needs every P stage file at lent==0. The front read the stage files under
+    # the tag 'pdflip' (its own env carries neither FLLIPER_PDFLIP_DUAL_KV_TAG nor FLLIPER_PDFLIP_TAG, the P ranks' env does), so
+    # p_lent was always 0 and P resumed 200 ms after PP0's REFUSED reclaim (1.85 GiB lent, 302 MiB free) -> OOM. On: p_lent is
+    # read under the front's own --tag too (max with the old reading); a refused/open reclaim holds the resume.
+    FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE = EnvBool(False)
+    # #1495 FRONT-KV-TAG (desk 1495): the front's reads of the dual P stage files
+    # (_dual_p_stage_reading: grant/air/weights/card_room/p_lent; d_signal_file;
+    # the ANCHOR-OWED read_room) key the file names by FLLIPER_PDFLIP_DUAL_KV_TAG or
+    # FLLIPER_PDFLIP_TAG, which only the RANK env carries (launcher dual_share_env);
+    # the front env (fenv = dict(os.environ)) has neither, so the front reads
+    # wkvs-sha1("pdflip")-ppN.json and finds nothing: the pressure ladder is BLIND in
+    # every dual boot (p_lent always 0, the resume after stage 1 goes at once).
+    # On: the launcher exports the boot's --tag as FLLIPER_PDFLIP_DUAL_KV_TAG into the
+    # FRONT env (dual layout only). The ladder then SEES the cards: new stalls are
+    # possible (P held while a lend is open), so this is its own observed boot.
+    # Default off = front env byte for byte as before.
+    FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX = EnvBool(False)
+    # #1956 WAKE-SEES-LOAN (f9 rc12z30y9f9, 05.10. 05:18:02Z, PP1 W-DUAL-P-WAKE-SHORT): dual FRONT only (the P-stage
+    # ladder). DEFAULT OFF = the old code path byte for byte. The front's wake from sleep is guarded per card by
+    # card_room (free >= that card's loan + one P step + D's look-ahead); without the env tag (#1495) the front read no
+    # stage file, card_room was None and the fallback 'free_min >= weights+grant+air' compared against 0+0+0 -> P woke
+    # the instant a D seat ended, while D's waiting group grant had taken 178782208 B of PP1's 3235905536 B sleep loan.
+    # On: card_room is built from the stage files under the front's own --tag as well (like #1480), a wake from sleep
+    # needs card_room (blind = P stays asleep, one named line) and the sleep leg's RPC answered (the loan is published
+    # at its end). No reserve, no D brake: D may grow into the loan; P returns only once the card has it free again.
+    FLLIPER_PDFLIP_DUAL_WAKE_SEES_LOAN = EnvBool(False)
+    # #1962 P-LAYER-STREAM (dual P, PP0 only; pdflip/p_layer_stream.py). DEFAULT OFF = the old code path byte for
+    # byte (nothing is built, no hook installed, the grant path never calls in). Goal: Dual-P prefills 262144 tokens
+    # (1959/1960: the K0 pool is 3.3 GB against 6.0 GB for level 266240; no static cut carries it under D load).
+    # On: when PP0's atomic group grant is short ONLY on PP0's own card, PP0 pauses whole weight-chunk tags of its
+    # P-PRIVATE layer bytes (TMS pause, VA kept), lends the freed bytes to the card pool and streams those layers'
+    # tensors from pinned host images per forward (side stream, FLLIPER_PDFLIP_DUAL_P_LAYER_STREAM_PREFETCH layers
+    # ahead) -- the 27B analogue of NF's "experts out, KV in", staged by the prompt's level. Regain at idle when the
+    # ledger has the bytes back (P never presses D; D may grow into the loan, then P keeps streaming). PP0 runs
+    # eager while a unit is paused (graphs read the paused VA). Same math, same outputs, no collective, no rank
+    # but PP0 changes behaviour.
+    FLLIPER_PDFLIP_DUAL_P_LAYER_STREAM = EnvBool(False)
+    # #1962: layers whose streamed tensors are copied ahead of the forward (staging = this many layers' bytes).
+    FLLIPER_PDFLIP_DUAL_P_LAYER_STREAM_PREFETCH = EnvInt(2)
+    # #1540 D-SIGNAL-SEATS (dual front, default off): d_signal (D's id-space / Mamba-arena reading,
+    # dual_d_priority.d_signal_short) counts as pressure only while D really has work that needs the
+    # rows -- a live seat (front._d_seats_live) or a leg-1-done request waiting for one
+    # (front._ready_for_d). B9e (deskq/done/1520): with the tag fix the ladder SAW id_space 0.93-0.99
+    # (D holds cache rows, running-req 0) as pressure in every tick, P slept after the lend (stage 2)
+    # and never woke (pressure<=0 is a wake condition); only a workaround (D_ID_PRESSURE=1.0) existed.
+    # On: no live seat and nothing waiting for one -> d_signal contributes 0 (ledger bytes unchanged).
+    # Default off = byte for byte as before.
+    FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS = EnvBool(False)
+    # #1986 D-SEAT-LONG-FIRST (dual front, default 0 = off): N > 0 -> a request whose finished P leg 1 COMPUTED
+    # >= N tokens (leg1 prompt_tokens - cached_tokens) takes the next free D seat before the waiting requests
+    # that did not (pdflip/dual_seat_long_first.py). Only the ORDER OF THE WAITING for a free seat changes: no
+    # running decode is touched or parked, seats/KV gates/backfill unchanged, front-side only (no collective,
+    # no wall clock). pt2 (fs10051150): a 174 s P leg (249962 tok) waited 43 s without a D seat and was dropped
+    # by the client's 300 s timeout. Suggested 32768 for the metal check.
+    FLLIPER_PDFLIP_DUAL_D_SEAT_LONG_P_TOKENS = EnvInt(0)
+    # #1998 (dual front, default off): with FLLIPER_PDFLIP_DUAL_D_SEAT_LONG_P_TOKENS > 0 the 'long' measure becomes the
+    # RAW prompt length of the request (leg1 prompt_tokens, est_prompt as fallback) instead of the tokens the LAST
+    # P leg computed (prompt - cached). pt4: the 250k needle, paused 3x and resumed from L2, computed only 8257 in
+    # its last leg and did not count as long. Threshold unchanged (metal: 131072). Off = old measure, byte for byte.
+    FLLIPER_PDFLIP_DUAL_D_SEAT_LONG_USE_RAW_PROMPT = EnvBool(False)
+    # #1976 D-SIGNAL-LOCKED (dual front, default off): d_signal reads D's LOCKED rows (mapped - available -
+    # evictable, over the 1M-row id space) and the Mamba arena's PINNED slots instead of the table fill
+    # (id_space = size - available - evictable, which counts the rows D never mapped; arena = COMPLETE
+    # slots, a full cache). f11 (fs10050941) 10:00-10:14Z: id_space 0.91-1.00 and arena 111-112/112 in every
+    # tick, so each D seat (56 of 67 stage-1 events within 1 s of a D-ADMIT) stopped P with d_need = one P
+    # grant step (92274688 B = 4096 tok x 22528 B) while no card was short; 10 P-PAUSE of the 262k leg, 69 %
+    # of the wall clock P asleep (stage 2). On: the front takes locked_frac / arena_pinned from D's published
+    # reading (an older D without them: the old fields). Off = byte for byte as before.
+    FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED = EnvBool(False)
+    # #1989 D-PARK OLDER-LIVE-FREE (dual D, default off): a SEAT-AGE victim (pressure park) that waits only
+    # because an OLDER request is RUNNING (``d_seats.admission_gate`` older_live; no older one still waiting
+    # for it, no decode-first deferral, nothing parked outside the queue) cannot resume this pass -- so it
+    # no longer holds every younger newcomer behind the barrier while free seats exist. Newcomers take at
+    # most ``seat_cap - running - parked`` seats this pass (the parked one's seat stays held); KV, X gate,
+    # HOL and the adder decide as always. pt2 (fs10051150 11:56:02-12:00:05): pdflip-0-7 displaced for
+    # pdflip-0-5, 0-5 decoded 12648 tokens for 243 s, D ran bs=1 with 5 of 6 seats waiting (0 X-GATE,
+    # 0 Prefill batch in 209 s), pdflip-0-18 (1132 tok) got its first token after 233 s. Off = as before.
+    FLLIPER_PDFLIP_DUAL_D_PARK_OLDER_LIVE_FREE = EnvBool(False)
+    # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
+    # by reference while it slept -- 2 parked + 3 held requests -- and P's
+    # claims found "no free slot"): a request that does not run on D (parked,
+    # in the dormant hold) holds NO arena reference over a flip. Its span is
+    # kept by ORDER (pdflip.handoff_pending role "park"), copied to the L3 disk
+    # store in the background (PARK_DEMOTE_S), and read -- reference, pin,
+    # device load -- at the wake. False = the pre-#248 hold read (reference
+    # and pin during the sleep), byte for byte.
+    FLLIPER_PDFLIP_ENABLE_PARK_L3 = EnvBool(True)
+    # ENABLE_PARK_HOLD_YIELD (HY, NF y3w 01:39:13 / y3u 00:36:46): a D park
+    # whose forced host write-through the full arena refuses takes the pages
+    # of a HELD (not running) request whose whole span has an L3 copy -- one
+    # MIN vote over the TP group, the same give-back on every rank, the
+    # refused backups again; the wake reads the held request from L3. Before:
+    # the park's KV died with the sleep and P recomputed ~125k tokens (30 s).
+    # False = the refusal stands (the marker line still counts need/held).
+    FLLIPER_PDFLIP_ENABLE_PARK_HOLD_YIELD = EnvBool(True)
+    # ENABLE_SHORT_READ_ANCHOR (SA, NF y3v 5327bdfa17, pdflip-46-98): a store
+    # read whose KV ended short still reads the recurrent state (and the QSA
+    # index pages) at the deepest anchor inside the landed pages; that anchor
+    # is the rank's #257 cut. Before: the extra pools were skipped for every
+    # short read, the #257 cut inserted 45824 KV tokens without a state, PP0's
+    # walk refused them (#TF told=0) and P re-prefilled 54226 tokens. Only
+    # where the rank decides its own cut (no attention-TP reduce). False = the
+    # pre-SA skip, byte for byte.
+    FLLIPER_PDFLIP_ENABLE_SHORT_READ_ANCHOR = EnvBool(True)
+    # ENABLE_WAKE_READ_EARLY (F22, 29.09.): the #248 hold read is issued at the
+    # START of D's weight legs instead of after the kv resume, so the store
+    # reads (aux threads, host only) run beside the ~1.5 s of legs. Measured
+    # posten without it (#1471 SETTLE held_after_wake_s): z30w-park median
+    # 0.60 s, z30x2-kvdemand 0.35 s; x178 (read during the flip) 0. The
+    # reference exists from the wake's first RPC on -- P has drained by then
+    # (the front drains before the sleep/wake pair), so #248's measured fault
+    # (a reference over P's whole phase) stays closed. Model-neutral.
+    # DEFAULT ON (02.10., 27B P->D seat): NF ran it since 09300726 (60+ boots,
+    # nf-int4.env:340, #248 WAKE-READ-EARLY issued= 99x, PDFLIP-WAKE-COHORT
+    # wake_to_last_decode_ms 476-579 ms); the 27B left it unset and paid for it
+    # on every P->D flip -- N3u 1002_072908: read_early=0 on 19/19 wakes, the
+    # release issued the reads 160-550 ms after the resume reply, the reads
+    # queued 0.6-2.1 s, SETTLE held_after_wake_s p50 1.4 s, wake_to_last_decode
+    # p50 2.49 s = the bulk of the 2.8 s P->D nachlauf. =0 restores the
+    # release-time read byte for byte.
+    FLLIPER_PDFLIP_ENABLE_WAKE_READ_EARLY = EnvBool(True)
+    # TAIL-STAGE-EARLY (30.09., NF y4k/y4l P->D, pdflip/tail_adopt.stage_early):
+    # the E2 tail staging of the dormant hold starts at the START of D's weight
+    # legs (beside them, host-only) instead of at the first prefetch check
+    # after the wake. Measured: PDFLIP-TAIL-READY waited_ms (the H45 hold on a
+    # finished store read) median 291 ms (y4l, n=12) / 286 (y4k, n=14), up to
+    # 757 at a wake cohort of 6 -- inside flip_first_work. Off until metal.
+    FLLIPER_PDFLIP_ENABLE_TAIL_STAGE_EARLY = EnvBool(False)
+    # TAIL-STAGE-AFTER-LEGS (30.09., NF y4s/y4s-tse P->D): with TAIL-STAGE-EARLY
+    # on, start that staging after the LAST weight collect (legs end, before
+    # the expert rearm) instead of at the legs' start. Measured y4s-tse vs y4l
+    # at 5-6 seats: the staging threads (part read, digest, pin_memory per
+    # layer) ran beside the collectors -- D collector issue_ms 202-286 ->
+    # 359-1127 ms on TP0, P deposit credit waits 451-584 -> 951-2094 ms, legs
+    # 1522 -> ~2030 ms median; the post-wake gain (TAIL-READY 291 -> 0 ms) is
+    # kept in part, since the staging still starts before the first pass.
+    # Off = the leg-start site of TAIL-STAGE-EARLY, unchanged.
+    FLLIPER_PDFLIP_TAIL_STAGE_AFTER_LEGS = EnvBool(False)
+    # TAIL-STAGE-WORKER (30.09., NF y4x/y4w P->D, pdflip/tail_adopt): the E2 tail
+    # staging runs on ONE long-lived worker thread per rank (a queue, not a
+    # thread per rid) and copies into ONE host arena pinned once (sized from
+    # the form: D's seat cap x the held tail of one rid), never pin_memory()
+    # per tensor. Measured: staged at the legs' start (y4w, 6 seats) the
+    # per-rid threads slowed the D collectors (TP0 issue_ms 452 vs 247 in y4l,
+    # P credit waits 1069 vs 457); staged behind the legs (y4x, TSAL) they
+    # slowed the expert rearm (TP0 375 vs 90 ms) and TAIL-READY came back
+    # (338 ms). Off = one thread and pin_memory() per rid, unchanged.
+    FLLIPER_PDFLIP_TAIL_STAGE_WORKER = EnvBool(False)
+    # WAKE_READ_ARENA_GATE (#248f, 30.09., NF y4b ep18): the #248 hold reads of
+    # a wake are issued in hold (arrival) order only while their pages fit in
+    # the KV arena together (its slot count -- no reserve); a younger read
+    # whose pages would overrun it waits parked in the #1471 settle, by name,
+    # and is issued as soon as the older reads leave the settle. y4b: three
+    # hold reads of 1412 + 1728 + 3841 = 6981 pages against 6485 slots, and
+    # pdflip-16-29's L3 fills evicted 449 of its OWN kept pages (#248e
+    # ORDERED-EVICT) -- 4 re-reads, 4.5 s held after the wake.
+    FLLIPER_PDFLIP_ENABLE_WAKE_READ_ARENA_GATE = EnvBool(True)
+    # X_FLOOR_CREDIT (H98x, 30.09., NF y4b D 03:50:21 pdflip-14-27): on a Form A
+    # group the X gate credits the group's USABLE floor -- the depth every
+    # rank admits (host: its admission match, workers: their KV reach) --
+    # when it lies above the head/store terms. A Form A expert worker's head
+    # walk is refused by its own absent mamba bytes (#904 MambaComponent:
+    # absent) and votes 0, so the head MIN was 0 and W31 priced the whole
+    # prompt (110438) of a request whose 109440-token prefix sat on TP0's
+    # device: W50, P re-prefilled it. Off = the pre-H98x pricing.
+    FLLIPER_PDFLIP_ENABLE_X_FLOOR_CREDIT = EnvBool(True)
+    # RVP_CAPACITY_PARK (#248h, 30.09., NF y4b D 03:58:57-03:59:24 pdflip-32-72):
+    # a streamed request the X gate refuses right after a store read that ended
+    # short although the store holds its context (P wrote it: delivered 39168
+    # of deliverable 95104, total 95137) is kept parked on D and re-read when
+    # the arena has room -- no P leg (P already has it), no attempt spent, no
+    # W50 to the client. Bounded by this many seconds from its first capacity
+    # park; past it the RESUME-VIA-P legs / the named end apply as before.
+    # 0 = off. y4b: two needless P legs (p_ms 7712 / 7460, flips included),
+    # then the third refusal ended the client's stream with W50.
+    FLLIPER_PDFLIP_RVP_CAPACITY_PARK_S = EnvFloat(120.0)
+    # WAKE_READ_EARLY_SPREAD (PDFLIP-S, 02.10.): the early hold reads are not
+    # registered all at once before the first resume (PDFLIP-WAKE-TAIL read_early
+    # p50 89 ms / max 319 in N4p, p50 301 / max 789 in N4f -- P's depositors
+    # wait for D's first collect meanwhile), but one per weight tag, right after
+    # that tag's collect went to the worker, the rest after the last tag:
+    # beside the collects, still early. Same hold order on every rank, no other
+    # collective in the loop. 0 = all at the legs' start (d1e5da09dc).
+    FLLIPER_PDFLIP_WAKE_READ_EARLY_SPREAD = EnvBool(True)
+    # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
+    # rank 0, never the scheduler thread) that copies the kept pages of
+    # parked and waiting rids from the arena to HiCacheFile without freeing
+    # them -- a claim may then free such a page without I/O (stage ii).
+    # 0 = no demotion (every kept page stays copy-less: stage iii).
+    FLLIPER_PDFLIP_PARK_DEMOTE_S = EnvFloat(1.0)
+    # PARK_DEMOTE_BATCH (#248): pages copied per write batch of the demoter.
+    FLLIPER_PDFLIP_PARK_DEMOTE_BATCH = EnvInt(256)
+    # FORM_A_DEADLOCK_STOP_S (H106, rc12z23 D 15:28:54-15:36:12): on a Form A
+    # D group the attention host's admission verdict for the queue head has
+    # refused with NOTHING running and an unchanged budget for this many
+    # seconds -> every rank stops by name (FormAAdmissionDeadlock) instead of
+    # standing still until the deadman. Decided on the host, carried by the
+    # H105 verdict broadcast. 0 = never stop.
+    FLLIPER_PDFLIP_FORM_A_DEADLOCK_STOP_S = EnvFloat(120.0)
+    # L3_WRITE_BEHIND_S (L3-REUSE 0928, NF rc12z13: the first request after a
+    # boot read 399 of 512 KV pages from L3 -- the rest had been in the
+    # boot's /dev/shm arena only -- and the QSA index for 47): the tick of the
+    # background thread (the persistent store's index owner, P PP0 and D TP0,
+    # never a scheduler thread) that copies every COMPLETE L2 arena page
+    # without an L3 copy to the persistent disk store, without freeing it. A
+    # restart then resumes from L3 instead of re-prefilling. 0 = L3 is written
+    # only when a page leaves L2 (the pre-0928 form).
+    FLLIPER_PDFLIP_L3_WRITE_BEHIND_S = EnvFloat(2.0)
+    # L3_WRITE_BEHIND_MIB: bytes copied per arena and pass (KV 786 KiB pages:
+    # 325 per pass; mamba blobs 56 MiB: 4 per pass).
+    FLLIPER_PDFLIP_L3_WRITE_BEHIND_MIB = EnvInt(256)
+    # L3WB-SLICE (27B z30y10, dcdb9ab8f9, D TP0 20:03:52-20:04:10): ONE pass
+    # after the P->D gate opened ran 17.6 s (cpu_ms=17574.6) over new=4092
+    # stems for 8 pages written, and TP0 answered nothing in that window
+    # (front W3). SLICE_MS bounds one uninterrupted burst of the pass (census,
+    # stem read, stat, pair gate, write): when it is used up the pass stops at
+    # a slice edge, remembers where (per-arena cursor) and the thread
+    # continues after YIELD_MS instead of the full tick -- the work is
+    # stretched, never dropped. 0 = the pre-slice form (one pass does
+    # everything it finds).
+    FLLIPER_PDFLIP_L3_WRITE_BEHIND_SLICE_MS = EnvFloat(25.0)
+    FLLIPER_PDFLIP_L3_WRITE_BEHIND_YIELD_MS = EnvFloat(25.0)
+    # 540 L3WB-ANCHOR-FIRST (27B y8r 55c95a89c7, D>P flush 2.9 s): the write-
+    # behind visited the arenas in open order and the KV arena (720896 slots,
+    # 50-150k new stems) never ended its cycle (cont=1 for minutes), so the
+    # mamba anchor arena behind it (112 x 78 MiB) was NEVER reached. Every
+    # anchor claim of the flip's FLUSH-PUBLISH then evicted a slot without an
+    # L3 copy and wrote it synchronously (#257 d, CRC + fsync of 78 MiB,
+    # ~140-400 ms each; y8r 09:14:00 TP1: 5 such writes, sweep 1039 ms; the
+    # same passes with only on_disk drops: 89 ms). Arenas whose slot is at
+    # least this many MiB (the anchor arenas; KV/QSA/draft pages are KiB) go
+    # first (before QSA) and are revisited from slot 0 with a fresh byte
+    # budget on EVERY pass, continuation or not. 0 = the open order.
+    FLLIPER_PDFLIP_L3_WRITE_BEHIND_ANCHOR_MIN_MIB = EnvInt(1)
+    # 540 PLAN-WARM-DEFER (pdflip/l15_restore.warm_plan_async): the L1.5 wake
+    # plan's warm thread is started in D's sleep flush; it now waits until D
+    # is dormant (kv paused) before its pure-Python walk over every held token
+    # (~0.6-0.9 s at 150k rows), at most this many seconds, so it never
+    # competes for the GIL with the rest of the D>P sleep leg. 0 = build at
+    # once (the pre-540 form).
+    FLLIPER_PDFLIP_L15_PLAN_WARM_DEFER_S = EnvFloat(5.0)
+    # L15-POOL S1 (docs/L15-POOL-ENTWURF-1004.md sec 7): LOG-ONLY shadow of the
+    # pooled L1.5 admission (pdflip/l15_pool.py) at the D sleep flush -- what a
+    # hold against the SUM of all cards' segments (KV + end anchors, guests in
+    # foreign segments) would keep vs what the per-rank path keeps today.
+    # Emits L15-POOL-SHADOW and the launcher's L15-POOL line; changes nothing.
+    # Only in the L15 path (FLLIPER_PDFLIP_L15=1, never --dual-layout: W-L15-DUAL).
+    # The ranks read it through l15_pool.pool_shadow_on(os.environ) (1/true/on/yes),
+    # like every FLLIPER_PDFLIP_L15* switch. Default off = today byte for byte.
+    FLLIPER_PDFLIP_L15_POOL_SHADOW = EnvBool(False)
+    # L15-POOL S2 (docs/L15-POOL-ENTWURF-1004.md sec 7, KV only, no anchor): the
+    # pooled hold takes effect. A rank with no home segment (cap 0) is no longer
+    # refused/refilled from L2 alone: the hold is admitted against the SUM of the
+    # segments (its KV shards need guest room in the capped ranks' free hold
+    # rows), the plan checks that room BEFORE the retain moves anything (a
+    # request without room is dropped, never held half), the cap-0 rank's rows
+    # park card to card in the capped ranks' segments (pdflip/l15_park.py, group
+    # all_to_all) and come back at the wake; any pool failure = the group falls
+    # back to today's L2 refill. Marks: L15-POOL-OUT / L15-POOL-BACK /
+    # L15-POOL-CHECK. Only in the L15 path (FLLIPER_PDFLIP_L15=1, 27B, never
+    # --dual-layout: refused by name). Read by the ranks through
+    # l15_pool.pool_on(os.environ) (1/true/on/yes). Default off = today's
+    # per-card path byte for byte.
+    FLLIPER_PDFLIP_L15_POOL = EnvBool(False)
+    # L15-POOL S3 (docs/L15-POOL-ENTWURF-1004.md sec 3.2-3.3/4.1/7, KV only, no
+    # anchor): part switch ON TOP of FLLIPER_PDFLIP_L15_POOL (S3 without POOL is
+    # refused by name, W-L15-POOL-S3-NEEDS-POOL). EVERY rank may overflow, not
+    # only the rank without a home segment: what does not fit a rank's own hold
+    # region lies as guest rows in the free rows of the other segments (Q3 rule:
+    # home first; guests by free area x measured link rate of the barlink matrix,
+    # the slowest card only as the last overflow), admission runs against the SUM
+    # of the segments, the hold manifest becomes v2 (guest placement + caps in
+    # the group fingerprint, so ranks that disagree on the placement fall back
+    # together), the guest rows are sampled at the wake (L15-POOL-CHECK, L15-CHECK
+    # with guest rows) and a failed park of a capped rank's overflow is a group
+    # fallback. Q2: the cap-0 rank's L2 duty (post_vote) stays. Default off = the
+    # S2 path (or today's per-card path when POOL is off) byte for byte.
+    FLLIPER_PDFLIP_L15_POOL_S3 = EnvBool(False)
+    # L15-POOL S4 (docs/L15-POOL-ENTWURF-1004.md sec 1.2/3.3/4.5/5.2 N4/7, KV AND
+    # END anchor = a WHOLE request): part switch ON TOP of FLLIPER_PDFLIP_L15_POOL and
+    # FLLIPER_PDFLIP_L15_POOL_S3 (S4 without them is refused by name,
+    # W-L15-POOL-S4-NEEDS-S3). The anchor share (GDN head share, priced in bytes
+    # from the MambaBlobSpec) of a rank WITHOUT a home segment lies as a byte guest
+    # in the free KV hold rows of a host rank (same free rows as the KV guests; the
+    # Mamba hold region is too small, zeroed by every flush and ledgered); admission
+    # counts KV rows AND anchor bytes against the sum of the segments, a request
+    # whose anchor finds no room is not held at all (no half hold), the manifest v2
+    # carries the anchor guests, the pricing and the row bytes in the group
+    # fingerprint, the source checksum covers the anchor bytes, and a wake whose
+    # anchors came back from the pool loads none from L2 (no 'Mamba-Anker fehlt'
+    # re-prefill from a stale L2 generation). Q2: the L2 duty (post_vote, anchor L2
+    # identity) is unchanged. Default off = the S3 path byte for byte.
+    FLLIPER_PDFLIP_L15_POOL_S4 = EnvBool(False)
+    # L15-POOL S4b (docs/L15-POOL-ENTWURF-1004.md sec 5.2 N4, user idea 04.10.
+    # ~17:50Z "dynamische Anker-Anzahl"): part switch ON TOP of FLLIPER_PDFLIP_L15_POOL,
+    # _S3 and _S4 (S4b without S4 is refused by name, W-L15-POOL-S4B-NEEDS-S4; dual /
+    # non-27B refuse it too). The anchor count is no longer capped at
+    # FLLIPER_PDFLIP_L15_ANCHOR_CAP for the ranks WITH a home segment: the anchors
+    # beyond the cap (their Mamba hold region is anchor_cap+1 slots) lie as bytes
+    # in free KV hold rows -- first the rank's own home segment, then as a guest in
+    # the foreign segments (Q3: home first, then free area x rate, never a card
+    # name). Admission plans KV rows AND all anchor bytes of ALL ranks together
+    # against the SUM of the free rows (whole requests, all or nothing, in the
+    # candidate order): the anchor consumes rows, KV gets the rest (max KV shrinks
+    # only as far as an anchor really displaces free rows). The anchor count, the
+    # cap and the pricing ride the plan digest and the manifest v2 fingerprint; the
+    # wake reads the overflow anchors back from the hold rows (source checksum),
+    # nothing from L2. Default off = the S4 path byte for byte.
+    FLLIPER_PDFLIP_L15_POOL_S4B = EnvBool(False)
+    # L15-POOL S1b (pdflip/l15_pool_peak.py): the planner input P_AWAKE_PEAK_MIB
+    # per card, built from measured PDFLIP-VRAM-PEAK windows (scripts/
+    # l15_pool_peak_record.py): per card the MAXIMUM over boots/lines with its
+    # origin, never a mean, never an estimate. On: with FLLIPER_PDFLIP_L15=1 the
+    # pool record is the only source of the peaks (no record for a card = no
+    # pool share there) and one ``L15-POOL-PEAK card=.. peak_mib=.. source=..
+    # n=..`` line per card is printed. 0 = the planner byte for byte as before.
+    # _FILE overrides pdflip/profile_records_data/l15_pool_peak_<profile>.json.
+    FLLIPER_PDFLIP_L15_POOL_PEAK_RECORD = EnvBool(False)
+    FLLIPER_PDFLIP_L15_POOL_PEAK_RECORD_FILE = EnvStr("")
+    # L3FILL_JOIN_WAIT_MS (L3FILL-JOINED 30.09., NF y4a ep36 pdflip-36-74): how
+    # long an L3 -> L2 fill waits for a stem another writer has CLAIMED to
+    # become COMPLETE before it counts as a miss. A prefix read ends at its
+    # first miss, so one JOINED page cut a 1070-page prefix at 146 (the rest
+    # re-prefilled). Only on the prefetch io threads (hicache-prefetch-io-<k>);
+    # the scheduler, flip and decode threads never wait. 0 = the pre-0930 form.
+    FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS = EnvInt(300)
+    # L3FILL_STALE_CLAIM_S (L3FILL-JOINED (3), 30.09.): a claim whose writer is
+    # alive but delivered no byte for this long is taken from its key
+    # (arena_quarantine_stale, generation-safe: a late completion of the old
+    # writer is refused by name, status 6) and the fill claims the stem fresh.
+    # y4a: 29 stems JOINED for >= 6 s blocked D and P. 0 = never.
+    FLLIPER_PDFLIP_L3FILL_STALE_CLAIM_S = EnvFloat(5.0)
+    # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
+    # real boot whose store directory lives on one of these filesystems
+    # (/proc/mounts) is refused by name -- the container layer (overlay) or
+    # the ZFS pool instead of the told store disk. A dry run only warns.
+    # Empty = no filesystem is refused.
+    FLLIPER_PDFLIP_STORE_REFUSE_FS = EnvTuple(("overlay", "zfs"))
+    # STORE_MLOCK (30.09., NF y3z/y4a D load 99 s: 6-8 store files per rank
+    # whose registration stalled 4-17 s behind the host's direct compaction,
+    # which isolates the pinned 4K shmem store pages and fails to migrate
+    # them): mlock every expert-store mapping (layers/moe/shared_pinned.py)
+    # BEFORE its cudaHostRegister, so the pages sit on the unevictable LRU.
+    # Only effective together with the HOST sysctl
+    # vm.compact_unevictable_allowed=0; OFF until that is set and the metal
+    # shows it. A failed mlock is refused by name (PdFlipStoreMlockRefused).
+    FLLIPER_PDFLIP_STORE_MLOCK = EnvBool(False)
+    # RANK_STATE_DIR (IPC Phase 1, user 28.09. "über logfiles?"): the
+    # directory each rank writes its versioned RankState record into
+    # (pdflip/rank_state.py). Set by the pdflip launcher per group, next to the
+    # group log; unset = no record is written (a boot outside the launcher).
+    FLLIPER_PDFLIP_RANK_STATE_DIR = EnvStr(None)
+    # VRAM_ACTUAL (VRAM-Vertrag M2, 29.09.): each rank writes its VRAM actual
+    # per PID and category as the block ``vram`` of its RankState
+    # (pdflip/vram_actual.py): at the boot posts (flight_recorder.mark), each
+    # flip leg and each PDFLIP-VRAM-PEAK window end, the window max per state key
+    # in memory and a write only on a change (never per decode round).
+    # Display and records only; nothing decides on it. Off = RankState as before.
+    FLLIPER_PDFLIP_VRAM_ACTUAL = EnvBool(False)
+    # RANKSTATS (DASHBOARD-AUS-IPC, 29.09.): each rank writes its cumulative
+    # counters (forward_ct, prefill/decode tokens, spec, queue, errors, last
+    # post-wake census) as <G>.tp<t>pp<p>.rankstats next to its RankState, from
+    # one timer thread every PERIOD_S (pdflip/rankstats.py); the forward path
+    # writes nothing. Off = no thread, no file. Display only.
+    # 30.09. (progress_watch, 27B false alarm: a 62k P prefill 80 s without a
+    # front.served step): an INSTRUMENT, on by default; its `progress` block
+    # (fwd_ct, tokens_done) moves per forward / prefill chunk. 1 s cadence.
+    FLLIPER_PDFLIP_ENABLE_RANKSTATS = EnvBool(True)
+    FLLIPER_PDFLIP_RANKSTATS_PERIOD_S = EnvFloat(1.0)
+    # PDFLIP_STATE_DIR (IPC §2.2, 27B B1/H5): the boot's own state directory
+    # state/<boot_id>/ (state.json + events.jsonl), mounted into the container
+    # by the arm, the host writer creates it. The launcher writes its fields
+    # through pdflip/state_file.py; unset = the launcher writes no state. The
+    # unprefixed name is the cross-component contract with the host scripts.
+    PDFLIP_STATE_DIR = EnvStr(None)
+    # IDLE_VOTE_FRESHNESS (fnFL2 H77, #1268): PP0 reads a landed idle lap as
+    # the PP group's /flush_cache verdict only while the state it witnessed
+    # holds -- the lap of PP0's latest stamp, PP0 neither asleep nor busy
+    # since that stamp, younger than IDLE_VOTE_TTL_S seconds, and PP0 idle
+    # itself at the read; any other lap is dropped ("#1268 IDLE-ROUND stale
+    # ... dropped") and a new one is wanted. fnFL2x166/x169: the sleep leg's
+    # own flush left a lap that the NEXT quiesce's first poll read minutes
+    # later (x169: 22:00:34 -> 22:04:26, PP1/PP2 at hicache_backup(5)).
+    # False = any landed lap answers, the 2026-09-24 form.
+    FLLIPER_PDFLIP_ENABLE_IDLE_VOTE_FRESHNESS = EnvBool(True)
+    FLLIPER_PDFLIP_IDLE_VOTE_TTL_S = EnvFloat(2.0)
+    # QUIESCE_FAST (fnFL2 H111, Tail-Buchhaltung): the front's quiesce polls
+    # /flush_cache every QUIESCE_FAST_POLL_MS instead of 50 ms, and PP0 no
+    # longer WANTS a new idle lap from a poll that finds its lap still on the
+    # ring. Measured x177/x178/h91v1, all 15 P->D flips: the last
+    # write-through lands +19..+189 ms after P-end, /flush_cache answers 200
+    # 95..189 ms later -- two polls at 50 ms per lap, and in 8 of 15 flips a
+    # poll during the lap wanted a second one, so the first lap came home
+    # "#1268 IDLE-ROUND stale ... round id mismatch" and cost one more poll.
+    # Without the guard a poll faster than a lap would drop EVERY lap (a new
+    # one is stamped at the harvest pass), so ONE switch arms both halves;
+    # the launcher hands its own environment to the front and to every rank
+    # (build_env / fenv = dict(os.environ)), so export it in the arm.
+    # False = the 50 ms poll and the unconditional want, byte-identical.
+    # LS6 (30.09.): default = the published form's row (pdflip/form.py
+    # ModelProfile.front_quiesce_fast, qwen27b on -- z30y5m 13 PDFLIP-QUIESCE-FAST
+    # lines, until then only the 27B arm set it; nextflash off, NF H111 decides);
+    # off without a form; an explicit value wins.
+    FLLIPER_PDFLIP_QUIESCE_FAST = EnvBool(_profile_default("FLLIPER_PDFLIP_QUIESCE_FAST", False))
+    # LS6 (30.09.): the profile-default contract entries of the two other env
+    # switches of the six (UNIFY S2: one environ entry per registry switch).
+    # Their rank-side readers keep their own parse of an explicit value and
+    # ask the same registry when unset/blank: front._env_switch_on_or_profile
+    # (DC_OFF_PATH, ModelProfile.front_dc_off_path) and layers/dcp/comm.
+    # lse_merge_mode (DCP_LSE_MERGE, ModelProfile.d_dcp_lse_merge).
+    FLLIPER_PDFLIP_DC_OFF_PATH = EnvBool(_profile_default("FLLIPER_PDFLIP_DC_OFF_PATH", False))
+    FLLIPER_DCP_LSE_MERGE = EnvStr(_profile_default("FLLIPER_DCP_LSE_MERGE", "ar"))
+    FLLIPER_PDFLIP_QUIESCE_FAST_POLL_MS = EnvInt(10)
+    # QUIESCE-PENDING (02.10., N5t epoch 11 ..._012d1a161a_1002_153611: PP2's last
+    # PASS-TAIL 51.319, the idle lap home ~51.327, the next poll only at 51.335 --
+    # the 10 ms interval after a 'GROUP VERDICT PENDING' answer): while PP0 says
+    # the idle vote is ON THE RING the front re-polls after this many ms instead
+    # of the poll interval (never longer than it). Safe only with PP0's no-re-want
+    # guard (H111 / FLLIPER_PDFLIP_IDLE_VOTE_NO_REWANT): a poll during the lap never
+    # stamps a second one. Marker 'PDFLIP-QUIESCE-PENDING'. 0 = the interval, as before.
+    FLLIPER_PDFLIP_QUIESCE_PENDING_POLL_MS = EnvInt(1)
+    # IDLE_VOTE_NO_REWANT (27B rc12z21 park boot dkr27bparkdraftbar1w109281421,
+    # flip epoch=5 14:28:08-14:29:38): the H111 guard ALONE, without the fast
+    # poll. 27B profiles never set QUIESCE_FAST, so every poll (50 ms) that
+    # found PP0's lap on the ring wanted a new one; the harvest pass stamped
+    # it, and every landed lap read "#1268 IDLE-ROUND stale ... round id
+    # mismatch" -- 293 laps dropped, the lap (~300 ms, the followers flushing
+    # on every forwarded poll) never faster than the poll, W3 at the quiesce
+    # deadline. A poll that finds its lap still on the ring does not want
+    # another; the landed lap answers the next poll. ON by default (it only
+    # removes a want that can never be read fresh); False = the pre-fix want.
+    FLLIPER_PDFLIP_IDLE_VOTE_NO_REWANT = EnvBool(True)
+    # DEPOSIT_LANE_LOOKAHEAD (fnFL2 H111b, Legs): the sleeper's pair lanes
+    # (cross-card, BAR1 or host) leave the per-tag lockstep -- each runs in
+    # its own worker over the tag order, at most DEPOSIT_LANE_AHEAD tag(s)
+    # beyond the tag the loop pauses; the on-card lane, the pause and the
+    # credit stay on the loop thread in their old order (pdflip/deposit_lookahead.py).
+    # Measured x177/x178/h91v1: lockstep idle 42-156 ms and pause+credit
+    # 5-7 ms x 10 tags per flip sit on PP0's chain above the 1.25 s copy-engine
+    # floor. False = the lockstep, byte for byte.
+    FLLIPER_PDFLIP_DEPOSIT_LANE_LOOKAHEAD = EnvBool(False)
+    FLLIPER_PDFLIP_DEPOSIT_LANE_AHEAD = EnvInt(1)
+    # TAG-STALL-SENTINEL (30.09., NF y3z ep52: PP0 still 5.4 s process-wide at
+    # the first tag of P's sleep): per sleep tag, faulthandler's C watchdog
+    # dumps every thread's stack into <evidence>/pdflip_tagstall_*.txt when the
+    # tag outlives this many seconds (pdflip/tag_stall_sentinel.py). 0 = off.
+    FLLIPER_PDFLIP_TAG_STALL_SENTINEL_S = EnvFloat(1.5)
+    # PDFLIP-GC warn (30.09.): > 0 arms the gen-2 GC warning in the scheduler
+    # (pdflip/gc_instrument.arm_after_boot) when --gc-warning-threshold-secs is
+    # 0; the launcher sets 0.5 for group P by default (--env-p states another).
+    FLLIPER_PDFLIP_GC_WARN_SECS = EnvFloat(0.0)
+    # the sleeping group(s) that take the lookahead (comma list, default the
+    # P->D direction only: P sleeps, PP0's chain is the Flipzeit's legs).
+    FLLIPER_PDFLIP_DEPOSIT_LANE_LOOKAHEAD_GROUPS = EnvStr("P")
+    # SLEEP_PAUSE_OVERLAP (30.09., NF y4h/y4i, pdflip/pause_overlap.py): the
+    # sleeper's pause(t)+credit(t) run on a worker beside deposit(t+1); at
+    # most one pause in flight, joined before every on-card-lane deposit and
+    # at the leg end. Measured: D's leg binds the D->P flip (TP1 37/39, TP2
+    # 23/31) and pause_ms is 26-28 ms per tag on the 3080 D ranks (5090: 6)
+    # with sync_ms=0 -- 465-517 ms per leg. Inert while H111b runs the leg.
+    # False = the per-tag chain, byte for byte. METAL (y4k 09301110, y4l
+    # rc12z30y4l 11e5db4370, profile -clk-po-pm-b1): 0 deaths, D->P
+    # flip_first_work median 1757 (y4k) / 1588 ms (y4l) against 2002 (y4i) --
+    # on by default since (user law: a proven switch is on); off via env.
+    FLLIPER_PDFLIP_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(True)
+    # L3-CSUM (N2, 01.10., hicache_storage.l3_csum_on): a blob's (arena slot
+    # >= 1 MiB, the mamba anchor) disk copy carries a CRC32 sidecar, the L3
+    # fill verifies it; a mismatch is a named MISS. False = no sidecar, no check.
+    FLLIPER_PDFLIP_L3_BLOB_CSUM = EnvBool(True)
+    # MAMBA-SNAPSHOT-FENCE (N2, 01.10., hybrid_cache_controller.start_writing):
+    # a write op carrying a recurrent-state (mamba) transfer makes the compute
+    # stream wait for the op's finish event, so no later forward can mutate the
+    # state rows before the async D2H snapshot has read them. KV rows are
+    # append-only and are not fenced. False = the old unordered tail.
+    FLLIPER_PDFLIP_MAMBA_SNAPSHOT_FENCE = EnvBool(True)
+    # the sleeping group(s) that take it (comma list; default the D->P leg).
+    FLLIPER_PDFLIP_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
+    # FLIPCYCLE H6 (02.10., pdflip/front.flip): the waker's kv_cache resume rides
+    # its weights leg (late site, after the legs, with the z30y7 bounded fit wait)
+    # instead of a second RPC the waker's scheduler picks up only after its
+    # post-wake pass (y6z P->D wake-kv p50 158 ms on the front against 41 ms of
+    # D-side work). Off = the separate kv RPC issued when the weights leg returns.
+    FLLIPER_PDFLIP_ENABLE_WAKE_KV_FUSED = EnvBool(True)
+    # FLIPCYCLE H1 (02.10., pdflip/front.drain): a flip whose ledger is already
+    # empty (D->P after the park) skips the drain's blocking progress read.
+    FLLIPER_PDFLIP_ENABLE_DRAIN_EMPTY_SKIP = EnvBool(True)
+    # FLIPCYCLE H5 (02.10., pdflip/front._p_drain_pool cap_exempt): past the P
+    # phase cap (H91 part C rule 1) a queued SHORT still rides P's batch; off =
+    # the cap strands it and D prefills it after the P->D flip (y6z ep 2,
+    # pdflip-1-7: 2.03 s with every seat stalled). Design law E2: on.
+    FLLIPER_PDFLIP_ENABLE_P_PHASE_SHORT_RIDES = EnvBool(True)
+    # PAUSE-MAPS (30.09., tms_csrc patch 5, pdflip/pause_overlap.arm_pause_maps):
+    # the saver's pause releases a span-mapped (H95c) allocation with ONE
+    # cuMemUnmap per contiguous run of extents instead of one per extent.
+    # Measured y4i (PDFLIP-PAUSE-SUB): 3080 D tag = 10 allocations, 31-64
+    # cuMemUnmap calls, 21-25 ms; the same tag before the first D phase (no
+    # extents, 10 calls) 10.6 ms. False = the per-extent walk, call for call.
+    # The driver may refuse a multi-mapping range: that run then falls back to
+    # the per-extent walk and the line counts it. METAL (y4l): unmaps = allocs
+    # 8172/8172, fallbacks 0, unmap time per tag line 14.9 ms against 17.9 in
+    # y4k, calls per line 44.9 -> 13.4 -- on by default; off via env.
+    FLLIPER_PDFLIP_ENABLE_PAUSE_COALESCE_UNMAP = EnvBool(True)
+    # B1 (30.09., NF y4i, managers/pdflip_flush_nonblock.py): the HiCache
+    # publish leaves the D->P flip's quiesce. Measured: the first quiesce
+    # /flush_cache refused in 11/12 flips (hicache_backup), FLUSH-PUBLISH
+    # waited 32-166 ms, begin -> quiesce done median 98 ms; D was idle
+    # 137-333 ms before each flip. (1) D-IDLE-PUBLISH: the bubble publisher's
+    # sweep from Scheduler.on_idle (nothing running/waiting, not dormant).
+    # METAL (y4l): PDFLIP-D-IDLE-PUBLISH 117x, D quiesce median 10 ms (max 23)
+    # against 98 ms; no "Cache not flushed", no STORE READ INCOMPLETE, no
+    # W120 -- on by default; off via env.
+    FLLIPER_PDFLIP_ENABLE_D_IDLE_PUBLISH = EnvBool(True)
+    # nodes per idle pass (the sweep's max_issue). 1: a request that lands
+    # during a pass waits at most one node's issue (y4i: ~23-48 ms per node
+    # incl. arena claim + mamba write); the idle loop takes the next node
+    # on its next iteration.
+    FLLIPER_PDFLIP_D_IDLE_PUBLISH_MAX_ISSUE = EnvInt(1)
+    # (2) FLUSH-QUIESCE-NONBLOCK: the quiesce answers "quiesced" when the only
+    # blockers on every rank are the group's own write-throughs / store
+    # writes; the sleep leg's group drain + #1470 flush reset before the pause.
+    # On by default with (1) (y4l: never needed to act, the idle publish left
+    # nothing in flight at the quiesce); off via env.
+    FLLIPER_PDFLIP_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(True)
+    # the groups both parts apply to (comma list; default the D->P sleeper)
+    FLLIPER_PDFLIP_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
+    # PUBLISH-SWEEP-BG (04.10., INT8 boot 4cf740ad50, D->P flip layer 2.1 s ->
+    # 3.4-5.6 s): after a long D wake phase 110-121 finished-request nodes sat
+    # un-backed (D-IDLE-PUBLISH only runs when D is idle, one node per pass) and
+    # the flip's flush paid 1.9-2.8 s of write_backup issue for them. True = the
+    # same publish_unbacked_sweep also runs BETWEEN D decode rounds, every
+    # _EVERY-th forward, at most _MAX_ISSUE node(s), only nodes no running
+    # request references (device lock 0) whose parent is already backed, so the
+    # flip finds the backlog small. False = the flush alone, as in 4cf740ad50.
+    FLLIPER_PDFLIP_PUBLISH_SWEEP_BG = EnvBool(True)
+    # EVERY 64 (review 1270 #5: a BG issue is synchronous in the TP lockstep, p90 54 ms,
+    # 4.6 % of the issues > 100 ms): about one node per 2-4 s of D decode.
+    FLLIPER_PDFLIP_PUBLISH_SWEEP_BG_EVERY = EnvInt(64)
+    # BG only publishes nodes with len(key) <= this many tokens (replicated, so every rank
+    # decides alike); a longer node (a P hand-over chain) is left to the flip's flush as
+    # before. 0 = no size limit.
+    FLLIPER_PDFLIP_PUBLISH_SWEEP_BG_MAX_TOKENS = EnvInt(8192)
+    FLLIPER_PDFLIP_PUBLISH_SWEEP_BG_MAX_ISSUE = EnvInt(1)
+    # #287 NEED0 (c, 30.09., NF y4k pdflip-0-4): the front's state.json field
+    # front.d_park_stuck lists the rids parked in at least this many
+    # consecutive D phases with no output in between (pdflip/park_stuck.py).
+    FLLIPER_PDFLIP_PARK_STUCK_PHASES = EnvInt(3)
+    # TSDB (user 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md 1c): the front's
+    # optional Influx-line push of one `pdflip_req` point per finished request
+    # to VictoriaMetrics (e.g. http://192.168.0.88:8428/write), bundled ~2 s in
+    # the front's IPC writer thread. Unset = no push (default). The model tag
+    # of every point (e.g. NF / 27B).
+    FLLIPER_PDFLIP_METRICS_PUSH_URL = EnvStr(None)
+    FLLIPER_PDFLIP_METRICS_MODEL = EnvStr(None)
+    # RW-FINISH (#287, 30.09., NF y4k): the resume warm runs to the end instead
+    # of being cancelled at the first decode (14/14 wakes: warm_layers=8
+    # skipped_cancel=40; window-1 decode wall 38.4 ms vs 27-28.5 steady). The
+    # rest goes on a side stream in layer order, each layer committed before a
+    # forward once its event completed -- no host wait in the decode path.
+    # Off until its own metal proof (layers/moe/expert_offload.ResumeWarm).
+    FLLIPER_PDFLIP_RESUME_WARM_FINISH = EnvBool(False)
+    # RW-AT-ARM (30.09., NF y4k/y4l P->D): the resume warm is planned,
+    # reserved and copied on the side stream AT THE ARM (the weight legs are
+    # over) instead of 8 layers per idle settle pass -- the settle ends first
+    # (y4l 12/12 wakes: warm_layers=8, skipped_cancel=40). The copies land
+    # during the kv leg and the first pass; deferred_rows_tick commits each
+    # layer before a forward once its event completed (no host wait). Measured
+    # target: the first decode round after every P->D wake, pool.fetch 104 ms
+    # (y4l median, n=12; y4k 108, n=14) against the steady round. Rows per
+    # layer: _ROWS (no new VRAM: free LRU rows only, below the seat block).
+    # Off until metal.
+    FLLIPER_PDFLIP_RESUME_WARM_AT_ARM = EnvBool(False)
+    FLLIPER_PDFLIP_RESUME_WARM_AT_ARM_ROWS = EnvInt(16)
+    # PFO (#287 Hebel A, 30.09., layers/moe/expert_offload.PrefillFetchOverlap):
+    # the expert-major multi-wave prefill copies wave k+1 on the rank's
+    # prefetch stream while wave k computes; the scratch is split in two
+    # halves (wave count ~doubles), events only, no host sync, no new VRAM.
+    # Measured today: PP0 16k fetch 1.13-1.48 s fully serial (moe_fetch
+    # segment == copy events). Byte-identical under the table partials; the
+    # single-wave (decode) path is untouched. Off until metal.
+    FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP = EnvBool(False)
+    # P-PREWARM (30.09., NF y4k/y4l first P forward vs warm median): at boot,
+    # beside H101/H103/P-COLD, (a) the PLE admission armed -- vocab range,
+    # hash constants on the host, pread workers up (models/qwen4_exp_ple_admit
+    # run_boot_prewarm; ple 334 vs 39 ms, 'admit ... skipped: no prefill
+    # gather in this process yet') -- and (c) the MoE router's first call
+    # (layers/moe/router_prewarm; gate +80-105 ms per stage). No forward, no
+    # new RAM or VRAM. Off until metal.
+    FLLIPER_PDFLIP_ENABLE_TARGETED_PREWARM = EnvBool(False)
+    # P-HC-DYNROWS (30.09., NF y4k/y4l PP2 other_ms 1266 first / 329 second
+    # forward): the GatedResidual torch.compile fallbacks (layers/
+    # hyperconnection.py) mark the row count dynamic, so the first call
+    # compiles once and a new prefill length never recompiles. Bytes equal to
+    # the static compile. Off until metal.
+    FLLIPER_ENABLE_HC_COMPILE_DYNAMIC_ROWS = EnvBool(False)
+    # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
+    # not carry (pad + D-extra rows, loaded from the host store) are issued on
+    # a side stream right behind the resume of their layer's chunk tag, i.e.
+    # DURING the legs; the expert-rearm after the legs only joins the stream
+    # (PDFLIP-RESUME expert-rearm ... prefetched=N rows wait_ms=... overlap=...).
+    # Same bytes from the same pinned store into the same buffers: no new host
+    # RAM, no VRAM reserve. 0 = the serial rearm of the 2026-09-24 form.
+    # DEFAULT OFF since x147 (H31b): the worker cards' input link is the pacer
+    # of the legs (TP1 x4), the copies made them 286 ms longer and left the
+    # arena's KV read short at the drain (+0.9 s to the first token).
+    FLLIPER_PDFLIP_REARM_PREFETCH = EnvBool(False)
+    # REARM_DEFER (H31b): on the waking DECODE group the extra rows of every
+    # POOL layer are not loaded before the first token at all. The rearm puts
+    # those experts into the tables as cold (a decode miss fetches them from
+    # the same store slot), the first decode forward starts the load on a side
+    # stream, later forwards promote the finished layers to the full layout;
+    # an eager forward (extend) lands its layer first (PDFLIP-REARM-DEFER
+    # fill-start / landed, expert-rearm ... deferred=N). 0 = serial as before.
+    FLLIPER_PDFLIP_REARM_DEFER = EnvBool(True)
+    # REARM_DEFER_HOST_GROUPS (#284, D->P wake): waking groups whose MoE layers
+    # plan on the HOST (P's prefill) take the same deferral in its early form:
+    # the rearm does not wait for the extra rows, they load on a side stream
+    # right behind it and the rank's NEXT forward (any mode) waits their events.
+    # Measured x178/z30w-park/z30x2 (63/63 D->P wakes): PP1 ends the wake RPC
+    # last with a serial rearm of ~7000 store rows (894-1068 ms, reload=895),
+    # PP0 waits 474-538 ms in the fence; PP1's first forward comes after PP0's
+    # first chunk. Comma list; empty = the serial rearm on P, byte for byte.
+    FLLIPER_PDFLIP_REARM_DEFER_HOST_GROUPS = EnvStr("")
+    # VRAM_PEAK (H55): one PDFLIP-VRAM-PEAK line per P chunk, per D round window
+    # (VRAM_PEAK_ROUNDS decode/verify forwards or 5 s) and per flip leg: the
+    # allocator peak of that window (memory_stats + reset_peak_memory_stats,
+    # no device sync) and the card's free bytes at both ends, with ms wall
+    # stamps for the NVML probe pdflip/tools/vram_hires.py. The since-pools peak
+    # of [vram-peak]/PDFLIP-GRAPH-POOL is kept through a folded shadow. 0 = no
+    # line and no re-base, the 2026-09-24 form.
+    FLLIPER_PDFLIP_VRAM_PEAK = EnvBool(True)
+    FLLIPER_PDFLIP_VRAM_PEAK_ROUNDS = EnvInt(64)
+    # EXTEND_TRIM_MIB (rc12e): per-rank threshold "a,b,c" in MiB = the card
+    # floor + the booked activation of the D form. Before an extend batch of
+    # the target worker, a card with less free than that empties the caching
+    # allocator (PDFLIP-EXTEND-CACHE-TRIM): rc12d's extends found 983 MiB cached
+    # but not reusable and took +1174 MiB of new segments for a 621 MiB
+    # transient. The launcher writes it into the D group env from the #145
+    # card ledger (NF only); unset = no read, no trim, the 227ae1becd form.
+    FLLIPER_PDFLIP_EXTEND_TRIM_MIB = EnvStr(None)
+    # rc12g: per-rank measured reserved growth of a D extend per row (MiB/row,
+    # CSV, "0" = no rate). Set by the pdflip launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
+    # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
+    FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
+    # Q-694b EXTEND-RATE: the rank MEASURES its own extend transient per row
+    # (allocator peak / reserved growth of every target extend of >= 2048 rows)
+    # and votes with max(start rate, measured x 1.15), a per-rank ratchet up
+    # only; the rate above is then only the start value (record or derived from
+    # the model geometry). Written by the pdflip launcher on the flip line's D
+    # group; off = the rate above alone, byte-identical.
+    FLLIPER_PDFLIP_EXTEND_RATE_MEASURE = EnvBool(False)
+    # Q-710 EXTEND-CAP-FLOOR (INT8 y8vb 03.10. 19:34-19:51Z, 3905 one-token D
+    # extends, ~150 ms each, 11x 'GROUP-NARROWED 4096 to 1'): the rc12g vote
+    # floor((card_free_post - 300) / rate) is page-clamped to ONE row once a
+    # card (the 3080, 72-290 MiB free in the D phase) sits under the 300 MiB
+    # line, and an eager extend costs the same ~150 ms at 1 row as at 100. With
+    # this on the vote never drops below a floor chunk (1/16 of the configured
+    # width, bounded by what the free card physically funds at the priced
+    # rate), and a fresh D-direct request longer than the group's width while
+    # that width is under the floor is refused at the X gate so the front
+    # routes it through P. Written by the pdflip launcher only where it wrote
+    # the flip arm's rate (Q-694); off = byte-identical, P0 arm and dual never
+    # set it.
+    FLLIPER_PDFLIP_EXTEND_CAP_FLOOR = EnvBool(False)
+    # CORRIDOR BOUND WAKE RESET (y3r Klasse E/A2, D TP1 3080, 23:45:29-34): the
+    # '#794 GROUP-NARROWED ... from 4096 to 64' right after every wake is the
+    # #1028c bounded-min window (5 s) of the #656 gate still holding the
+    # driver_free samples of the DORMANT phase -- 81.8 MiB while P owned the
+    # card -- against 2444/2188/2100 MiB measured after the resume. The vote
+    # priced the budget at -97..-188 MiB (81.8 + takeable cache - delta 256),
+    # so every real extend of the next ~5 s ran in 64-token pieces (ep36 220
+    # tokens: 64 + 156 = 2490 + 1922 ms). The window now starts at the wake
+    # (scheduler._pdflip_last_wake_t): samples of the other group's phase are
+    # dropped, every value still returned is a MIN over this phase's own
+    # device readings. 0 = the window spans the flip (the old form).
+    FLLIPER_PDFLIP_CORRIDOR_BOUND_WAKE_RESET = EnvBool(True)
+    # DEGEN-SUSPECT (27B pdflip-1-13, 28.09. 13:44-13:51: an endless generation
+    # held the D->P drain): the detokenizer watches each request's decode tail
+    # for an exact repetition (smallest period <= 256 tokens covering >= 8
+    # repetitions and >= MIN_SPAN tokens of the last 2048) and logs it once per
+    # rid and period (managers/degen_detect.py). Off the scheduler's decode
+    # round by construction (separate process). STOP is the prepared stage 2
+    # (abort the request): OFF -- stage 1 only logs.
+    FLLIPER_PDFLIP_DEGEN_DETECT = EnvBool(True)
+    FLLIPER_PDFLIP_DEGEN_STOP = EnvBool(False)
+    FLLIPER_PDFLIP_DEGEN_MIN_SPAN = EnvInt(512)
+    # TAIL DUMP (EG 28.09.: the text of pdflip-0-8 / pdflip-1-13 was never kept):
+    # at a DEGEN-SUSPECT, and at the end of any request whose output reached
+    # DUMP_LONG ids (0 = off), the detokenizer hands the part's last <= 2048
+    # output ids to one background thread that writes ids + decoded text as
+    # <DUMP_DIR or $FLLIPER_PDFLIP_EVIDENCE_DIR/degen>/degen_<pid>_<rid>_<reason>_<n>.json,
+    # at most DUMP_MAX files per process (0 = off).
+    FLLIPER_PDFLIP_DEGEN_DUMP_MAX = EnvInt(16)
+    FLLIPER_PDFLIP_DEGEN_DUMP_LONG = EnvInt(16384)
+    FLLIPER_PDFLIP_DEGEN_DUMP_DIR = EnvStr(None)
+    # TAIL_HANDOFF (H18, E1 of H17, fnFL2x132): P ends the prompt's last-but-one
+    # chunk at c = floor_r(N-1) (r = QSA compress ratio) instead of the page,
+    # and hands the GDN state after c plus the KV/QSA rows of the partial page
+    # [floor_page(c), c) to D through the arena dir (pdflip/tail_handoff.py);
+    # D probes them at its load-back (PDFLIP-TAIL-READY). 0 = the 64-token cut
+    # and no tail files, byte for byte the 2026-09-24 form.
+    # UNIFY S3 (BLOCKER S2): the four TAIL switches are the profile field
+    # ``end_anchor`` (pdflip/form.py END_ANCHOR_SWITCHES): nextflash tail_handoff
+    # = on, qwen27b trim = off; no published form = on (the NF code default).
+    # Set explicitly, the env always wins.
+    FLLIPER_PDFLIP_TAIL_HANDOFF = EnvBool(_profile_default("FLLIPER_PDFLIP_TAIL_HANDOFF", True))
+    # TAIL_ADOPT (H21, second half of E1): D takes the hand-off over -- the
+    # TP group MIN-votes it in the prefetch-progress collective, every rank
+    # grows the prefix by the partial page's rows [floor_page(c), c), the
+    # rank(s) holding attention/GDN layers write the rows and the state at c
+    # at the first GDN layer of the extend forward, and the extend is [c, N)
+    # (1-4 tokens). Effective only under TAIL_HANDOFF; 0 = the H18 form
+    # (extend from floor_page(c)).
+    FLLIPER_PDFLIP_TAIL_ADOPT = EnvBool(_profile_default("FLLIPER_PDFLIP_TAIL_ADOPT", True))
+    # TAIL_VERIFY (H21): D checks the part payloads against the publish
+    # digests before its vote (a mismatch votes the group back to the page
+    # resume) and reads the written rows/state back once per request for the
+    # PDFLIP-TAIL-ADOPT line (digest=match|MISMATCH).
+    FLLIPER_PDFLIP_TAIL_VERIFY = EnvBool(_profile_default("FLLIPER_PDFLIP_TAIL_VERIFY", True))
+    # TAIL_SKIP_EXTEND (H24, E2): P also publishes its END state -- the KV
+    # rows [floor_page(c), N), the QSA pending-ring rows of the open group,
+    # the GDN state after all N tokens and the token it sampled -- and D,
+    # when every rank of the group can serve it (vote 2 in the same MIN
+    # slot), runs NO extend forward: the request enters the decode queue
+    # with prefix N and P's token as its first output. Effective only under
+    # TAIL_ADOPT; any refusal falls back to E1 (extend [c, N)), then to the
+    # page resume. 0 = the H21 form.
+    FLLIPER_PDFLIP_TAIL_SKIP_EXTEND = EnvBool(_profile_default("FLLIPER_PDFLIP_TAIL_SKIP_EXTEND", True))
+    # SKIP_RESULT_NOW (nf-pd-post 01.10., y6o): the overlap loop processes a
+    # skip-extend batch's result (P's token) in the iteration that launched
+    # it, instead of after the NEXT batch's launch. The skip runs no target
+    # forward, so there is nothing to overlap; deferred, the first token
+    # waited for the next pass's TP recv broadcast (~175 ms behind the slowest
+    # worker's load-back issue) and that pass's launch (531 ms on a boot's
+    # first wake). Rank-uniform: the skip verdict is the group's vote. 0 =
+    # the deferred order.
+    FLLIPER_PDFLIP_ENABLE_SKIP_RESULT_NOW = EnvBool(True)
+    # DCP_PREFIX_LENS_DEFER_SKIP (nf-pd-post 01.10., y6o): the #639 prefix-lens
+    # ballot of a skip-extend batch (no target forward) is issued in
+    # prepare_for_extend as before but DECIDED after the batch's result, at the
+    # latest before the next forward (layers/dcp/prefix_lens_check.py). TP0
+    # waited there for TP1's load-back issue (prepare_ms 240-295) before it could
+    # stream P's token. Read once at import. 0 = decide in prepare.
+    FLLIPER_DCP_PREFIX_LENS_DEFER_SKIP = EnvBool(True)
+    # TAIL_WAIT_MS (H45, metal fnFL2x150/x151): P's PP ranks write their tail
+    # parts from background threads; D's vote used to read the part list ONCE
+    # at the first prefetch check and fell on a partial manifest (parts=1-2 of
+    # 3 -> 'fa_layer_missing' on TP0 -> extend instead of adoption, flip 3.6-3.9
+    # s instead of ~2 s). D now stages only a COMPLETE manifest (the header
+    # names P's part count) and the group holds the prefetch termination -- the
+    # vote's collective -- until every rank has staged, at most this many ms
+    # after its first check (300 ms while no part exists at all). The hold is a
+    # slot of the existing MAX, never a new collective. 0 = no hold (vote at
+    # the termination on whatever is staged then).
+    FLLIPER_PDFLIP_TAIL_WAIT_MS = EnvInt(1500)
+    # TAIL_FIT_ON_COMPUTE (cold-round1, metal y3p ...dauer09292250, D TP0): right
+    # after a wake the corridor narrows the prefill chunk to 64 tokens ('#794
+    # GROUP-NARROWED ... from 4096 to 64'); a parked resume with an agreed END
+    # tail but 112-211 uncached tokens then took the CHUNKED branch, where no
+    # tail is taken -- a real extend of 64 + the rest, each an expert-major pass
+    # of 1.9-2.4 s (ep44 5.97 s, ep54 5.16 s, 23:11:55 5.77 s, 23:13:24 5.66 s,
+    # 23:15:34 5.97 s from wake to the cohort's first decode). The whole-fit test
+    # and the chunk charge now take what the forward COMPUTES with the tail (0
+    # under the E2 skip, N - c under E1) instead of N - prefix; the KV charge is
+    # unchanged. 0 = the old test on N - prefix.
+    FLLIPER_PDFLIP_TAIL_FIT_ON_COMPUTE = EnvBool(True)
+    # TAIL_FOLD_SHORT (metal y3r ...dauer09292330, P/D): under the H63 fold P
+    # published NO part when c = floor_grain(N-1) sat on a page boundary
+    # (N % page in 1..grain; 23 of 53 prompts, all N % 64 in {1, 2, 4}) and D
+    # re-ran 1-65 tokens as a real extend (2 tokens 0.6-0.7 s, 65 tokens
+    # 1.5-2.4 s, cold expert pass). On: the END-only part is published anyway
+    # (tail_handoff.fold_spec, page_prefix = the reader's claim, E1 rows may be
+    # 0) and D takes it as the E2 skip. 0 = spec_for (no part, D extends).
+    FLLIPER_PDFLIP_TAIL_FOLD_SHORT = EnvBool(True)
+    # TAIL_FOLD_PAGE_END (P-MINIFWD 0930, metal y3r ...dauer09292330 / y3t,
+    # group P under the H63 fold): a page-multiple prompt (N % 64 == 0) still
+    # took the END-ANCHOR split -- the last 4 tokens a PP0 forward of their
+    # own (1.37-1.57 s), the body [.., N-4) truncated, so no waiting request
+    # joined it and its 60/124-token remainder ran alone as well (pdflip-74:
+    # 6 x 124 tokens at 1.1 s each). On: the fold applies wherever the CLAIM
+    # ANCHOR track puts the anchor on the reader's claim N - page inside the
+    # last chunk (tail_handoff.page_end_fold_applies); END-only part as for
+    # every other fold. False = the split at N % page == 0, byte for byte.
+    FLLIPER_PDFLIP_TAIL_FOLD_PAGE_END = EnvBool(True)
+    # P_MINIFWD_TOLD_WAIT (P-MINIFWD 0930, group P PP0 under the #1400 told):
+    # a carried request's final rest below 1000 tokens waits at the top of its
+    # pass for the store read of a request already queued (held, read open),
+    # so the told goes on this pass's wire and the rest runs in that request's
+    # chunk 0 instead of alone (y3r pdflip-62-92: 66 tokens 1144.7 gpu-ms alone,
+    # 93's told one pass later). Bound = the measured price of a lone rest on
+    # this rank (pdflip/p_minifwd_hold.py), no waiter / a control request / a
+    # co-admissible request / unmeasured -> no wait. False = no wait, ever.
+    FLLIPER_PDFLIP_P_MINIFWD_TOLD_WAIT = EnvBool(True)
+    # TAIL FOLD (fnFL2 H63, group P, only with TAIL_HANDOFF + TAIL_ADOPT +
+    # TAIL_SKIP_EXTEND): the END-ANCHOR no longer splits the last chunk at
+    # c = floor_r(N-1) when N is not a page multiple -- the tail [c, N) runs
+    # inside the last chunk's forward instead of a forward of its own (x163:
+    # 1-4 tokens, 125-903 ms on PP0, plus one more pipeline round per
+    # request). The page anchor the tree keeps is the same (the extra_buffer
+    # track lands on floor_page(N) == floor_page(N-1)); what is dropped is the
+    # E1 state AT c, which only D's E1 fallback reads (TP0 logs x153b-x166:
+    # 52 skips, 0 skip refusals, i.e. never read). P publishes END-only parts (header e1=False:
+    # rows [floor_page(c), N), ring, GDN state after N, P's token); D votes 2
+    # or 0 for them, a refused skip is the page resume. N % page == 0 keeps
+    # the cut (the fold would track the anchor at N, one token too deep).
+    # False = the H24 form, byte for byte.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_ENABLE_P_TAIL_FOLD = EnvBool(False)
+    # TAIL KEEP (fnFL2 H63b, set on BOTH groups): the tail-part store
+    # (<arena dir>/handoff, tmpfs = host RAM) as a bounded buffer between P
+    # and D instead of an age window. 0 = the H42 count rule: P keeps the
+    # parts of its capture_keep() (= its --max-running-requests) newest rids,
+    # so a burst deeper than that loses its older parts before D reads them
+    # (x163/x166: 4 of 8 burst requests no_parts/parts_partial on D, each
+    # 0.6-0.9 s more serial D time, the first after the flip also up to the
+    # 1.5 s H45 hold). >0 = P keeps, besides those, every older rid while all
+    # parts together fit this many MiB (oldest out first), and D removes a
+    # rid's parts once its group agreed on it (every rank has staged: the
+    # consumption receipt), so the store holds only what D has not read yet.
+    # Bound: max(KEEP_MIB, capture_keep() x one rid's parts) plus the parts
+    # being written; one 97k rid (PP0+PP1+PP2) is 56.9 MiB folded (H63),
+    # 113.8 MiB not (x166).
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_TAIL_KEEP_MIB = EnvInt(0)
+    # TAIL READ MMAP (Kriech-Sitz 29.09., z30w-park): a D rank reads a tail
+    # part with torch.load(mmap=True) -- the tensors are views of the part
+    # file's tmpfs pages (already charged as shmem, <arena dir>/handoff)
+    # instead of an anonymous copy of the WHOLE bundle, and the digest hashes
+    # the buffers without a bytes copy. Measured on z30w: each tail stage put
+    # +250-390 MiB of glibc heap on a D rank (HOST-ANON-DELTA, pdflip-tail-stage
+    # thread, malloc_inuse), returned only by the sleep's malloc_trim -- the
+    # 1.5-2 GiB anon sawtooth under memory.max. Same bytes, same digests.
+    # False = the torch.load copy, byte for byte.
+    FLLIPER_OPT_PDFLIP_TAIL_READ_MMAP = EnvBool(False)
+    # PLE STATE HAND-OFF (fnFL2 H63c, set on BOTH groups): the Qwen4-Exp PLE
+    # side states of a request slot -- the n-gram history (NGramPool, the
+    # last ngram_size-1 tokens) and the short-conv window (ShortConvPool, the
+    # last (kernel-1)*ngram_size conv inputs, 9 on Qwen3.8-Flash-Next) --
+    # travel with the GDN state on every P->D path: the E1 part (state at c),
+    # the END part (state after N) and the arena anchors (a side table beside
+    # the mamba arena, one row per arena slot, tagged with the slot's stem).
+    # D installs them into the request's slot instead of the EOS history and
+    # zero window a cleared slot starts from (the mamba host pool and the tail
+    # parts carried the GDN state only: every P->D resume re-started the PLE
+    # n-gram hash and short conv at the resume point). Rows are only written
+    # and installed on the rank that runs the PLE layer. False = the H24/H63b
+    # form, byte for byte.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_PLE_STATE_HANDOFF = EnvBool(False)
+    # DECODE WARM FROM P (fnFL2 H29). P publishes what it saw at the END of
+    # the prompt into the hand-off dir (<FLLIPER_HICACHE_ARENA_DIR>/handoff):
+    # the routed experts of the last LRU_WARM_TOKENS tokens per MoE layer and
+    # the PLE rows of its last prefill gather. D reads them after the wake.
+    # Both groups need the switch (the launcher env is not the rank env).
+    # PLE_DECODE_PREFETCH (H29a): D faults the published PLE rows' pages into
+    # ITS OWN mapping of the checkpoint shards on a background thread (the
+    # decode gather is an in-graph HMM kernel; P's pread gather does not fill
+    # the mmap page cache on ZFS, so D's first reads of prompt n-grams are
+    # cold). At most PLE_DECODE_PREFETCH_PAGES pages per wake.
+    FLLIPER_PDFLIP_PLE_DECODE_PREFETCH = EnvBool(False)
+    FLLIPER_PDFLIP_PLE_DECODE_PREFETCH_PAGES = EnvInt(16384)
+    # DECODE PLE WAIT (fnFL2 H35, layers/ple_wait_span.py): time the PLE
+    # layer's join on its n-gram gather as the clock family ``ple.wait``
+    # (``spec_verify:ple.wait`` on ``Decode rank batch``, ``ple_ms`` on
+    # DECODE-ROUND-COST). The gather reads the on-disk table through HMM
+    # inside the verify graph; its cold-page faults otherwise sit in TP0's
+    # ``compute``. Debug instrumentation, per rank env (set it in group D).
+    FLLIPER_DEBUG_DECODE_PLE_WAIT = EnvBool(False)
+    # DECODE/PP HOST PERIOD (fnFL2 H49, scheduler_components/host_round_cost.py):
+    # every N decode rounds a DECODE-HOST-PERIOD line (host share of the
+    # round: HiCache poll, its CPU all_reduce, result sync, the rest), every N
+    # synced PP chunks a PP-HOST-PERIOD line (d2h sync wait vs host work).
+    # perf_counter around existing calls only; 0 = no line.
+    FLLIPER_DEBUG_DECODE_HOST_PERIOD = EnvInt(64)
+    FLLIPER_DEBUG_PP_HOST_PERIOD = EnvInt(8)
+    # DECODE HOST SPLIT (fnFL2 H58, scheduler_components/decode_host_split.py):
+    # every N decode rounds a DECODE-HOST-SPLIT line -- H49's host_other split
+    # into the device waits inside run_batch (seq_lens resolve, PLE sync, BAR1
+    # abort-check waits) and the named host spans, plus six stream events per
+    # round read late by query (GPU idle the host caused). perf_counter around
+    # existing calls, no sync; 0 = no line and no events.
+    FLLIPER_DEBUG_DECODE_HOST_SPLIT = EnvInt(64)
+    # COLLECTIVE-CLOCK GRAPH READER (Register #52, utils/collective_clock.py):
+    # lay the clock's event-record NODES into every captured decode graph
+    # (#1241b), bind K event sets per graph (Task #52) and, before every
+    # replay, swap the set (2 cudaGraphExecEventRecordNodeSetEvent per pair)
+    # and record a launch fence (#1302). That is what makes a graphed
+    # 'Decode rank batch' line carry a compute/wait split (and feeds
+    # BARLINK-ROUND-CENSUS, H28). Measuring form only: x176 bound 192 pairs x
+    # 8 sets per graph; 20.09. Runden/s 26,0 -> 24,4..27,1. Off: no node, no
+    # set, no swap, no fence; graphed rounds print 'split unavailable:
+    # graph-replay-reader-off'. Per rank env (set it in group D).
+    FLLIPER_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES = EnvBool(False)
+    # DECODE ROUND DEPTH (#239 S3f A/B, 29.09.): the 'Decode rank batch' line
+    # carries ', depth: min/median/max' -- the KV length of every running
+    # request (prompt + output tokens, host-side lists only) -- so rounds
+    # can be compared at equal bs AND depth ('#full token' of 'Decode batch'
+    # is pool occupancy incl. the radix cache, not a request's depth). No
+    # device work, no graph change; off: one attribute test per round.
+    FLLIPER_DEBUG_DECODE_ROUND_DEPTH = EnvBool(False)
+    # LRU_WARM_FROM_HANDOFF (H29b): after rearm_after_wake the free LRU rows
+    # of every pool layer are filled with P's most-routed experts of the last
+    # LRU_WARM_TOKENS prompt tokens (no new VRAM: only rows the reinit left
+    # free, at most LRU_WARM_ROWS per layer, 0 = every free row). The copy is
+    # synchronous in the wake: it moves bytes the first decode rounds would
+    # fetch anyway from the rounds into the flip (measured by LRU-WARM ms=).
+    FLLIPER_PDFLIP_LRU_WARM_FROM_HANDOFF = EnvBool(False)
+    FLLIPER_PDFLIP_LRU_WARM_TOKENS = EnvInt(64)
+    FLLIPER_PDFLIP_LRU_WARM_ROWS = EnvInt(8)
+    # a published file older than this is another prompt's and is ignored
+    FLLIPER_PDFLIP_DECODE_WARM_MAX_AGE_S = EnvFloat(600.0)
+    # FLIP_ORDER_CREDIT (H14, fnFL2x114c/x114d): the front simulates the
+    # D->P wake per card (pdflip/wake_credit.py) before it hands out the pause
+    # order; an order that ends in the W109 credit cycle is replaced by one in
+    # which a co-located sleeper always frees its waker's tag before its first
+    # deposit without a collector. A cycle-free order is kept UNCHANGED (proven
+    # on x104/x113/x115/x116), so the proven form flips byte-identically. The
+    # planner refuses (W126) a form no order can fund. 0 = the round-robin as
+    # before, and the planner then refuses every form whose given order cycles.
+    FLLIPER_PDFLIP_FLIP_ORDER_CREDIT = EnvBool(True)
+    # FLIP_ORDER_CREDIT_SEARCH (H54, dry fnFL2x162 at FR_P 0.410/0.712): the
+    # credit order builds greedily over PREFIXES, and a prefix simulation
+    # knows no sleeper run-ahead -- it reported "NO order funds the wake" for a
+    # form whose full simulation finds a funded order (min headroom 263/8/5
+    # MiB). On: when the greedy build finds none, credit_order searches over
+    # FULL simulations (single-tag moves from the given order, steepest
+    # ascent). The planner riegel (W126) and the front both ask credit_order,
+    # and the planner marks its front table when its pass rests on the
+    # search, so the front runs the same search. A cycle-free order stays
+    # unchanged either way. Off by default: never run on metal.
+    FLLIPER_PDFLIP_ENABLE_FLIP_ORDER_CREDIT_SEARCH = EnvBool(False)
+    # FLIP_ORDER_LEAST_DEFICIT (02.10., NF y6u D->P 2->3 / 4->5): when no order
+    # is funded at the measured free (greedy and, if on, H54 found none), the
+    # front no longer keeps the given order -- at y6u's driver_free {0: 1281,
+    # 1: 2212, 2: 1269} that order ran into its credit cycle (sleeper1
+    # weights_15 -> waker2, sleeper2 weights_11 -> waker1) and stalled 1.6-1.9 s
+    # until the W109b spill. It takes the order the model funds at the smallest
+    # uniform free uplift per card (pdflip/wake_credit.least_deficit_order; the
+    # given order needs +2048..3072 MiB, the reorder +512), the given one when
+    # it is funded at the same step. Only the order changes: no reservation,
+    # the planner's W126 riegel asks without it. 0 = the given order is kept.
+    FLLIPER_PDFLIP_FLIP_ORDER_LEAST_DEFICIT = EnvBool(True)
+    # FLIP_ORDER_LOCKSTEP (02.10., NF y7o D->P ep3/9/11/13): after the credit
+    # order, the FIRST claim of every waker stands behind the co-located
+    # sleeper pauses that fund it (pdflip/wake_credit.lockstep_claims). y7o's
+    # PP2 weights_14 (4014 MiB) stood at position 3: D TP2 had published
+    # 4292, 406 staged -> balance 3885, and the next TP2 pause (weights_10,
+    # deposit to PP1) waited on PP1, PP1 on TP1, TP1 on PP2 -- a three-rank
+    # convoy, 0.9-1.3 s on each P rank's first big tag. Only the order moves:
+    # no reserve, no expert cap, no floor change; an order whose first claims
+    # are funded stays byte-identical. D->P only. 0 = order as before.
+    FLLIPER_PDFLIP_ENABLE_FLIP_ORDER_LOCKSTEP = EnvBool(True)
+    # PD_TIMED_ORDER (H34, fnFL2x141): the planner times the P->D wake per card
+    # in ms (pdflip/wake_credit_pd.py) and recommends a rearrangement of the
+    # tightest card's own P bands when the credit wait there lengthens the leg
+    # (x141, draft on P: D TP2 waited 466 ms at weights_6, PP0's chain paid
+    # ~90 ms). With this on, the front replaces the pause order by that
+    # recommendation -- only when its live order is exactly the one the
+    # planner timed and the H14 fixpoint finds no credit cycle in it. Off by
+    # default: modelled -90 ms (x141 form) / -52..-71 ms (H25 form with FR_D
+    # 0.06,0.51,0.48, checked on x145's own flips) on the short P->D flips and
+    # 0 on the 97k flip, never measured on metal; the proven H25 form
+    # (FR_D 0.06,0.44,0.365) gets no recommendation.
+    FLLIPER_PDFLIP_ENABLE_PD_TIMED_ORDER = EnvBool(False)
+    # PD_CREDIT_REFUSAL (H34): the dry run refuses (W126) a form whose P->D
+    # wake cannot finish on some card (after every pause of its P stage the
+    # card still lacks free - floor - staging for the next D tag: W35 after
+    # the 120 s credit budget). 0 = the lines are printed, the boot goes on.
+    FLLIPER_PDFLIP_ENABLE_PD_CREDIT_REFUSAL = EnvBool(True)
+    # WARM_MIN_DWELL (H34b, fnFL2x148): the front's min-dwell (K7) prices a
+    # round trip with a measured flip. The boot's FIRST flip is not one: it
+    # registers the on-card lanes' host staging buffers for the first time
+    # (x148: cudaHostRegister 7.3/7.8/7.9/5.9 s, flip 24.6 s against 1.6-2.2 s
+    # afterwards) and held the next D->P flip 24.6 s (TTFT 34 s instead of
+    # 17). On: the dwell is the median of the last MIN_DWELL_WINDOW flips in
+    # the same direction WITHOUT the boot's first flip, else the median of the
+    # later flips of either direction, else 0. 0 = the last same-direction
+    # flip, first flip included (the pre-H34b rule).
+    # UNIFY S7: default per profile (ModelProfile.warm_min_dwell): nextflash on
+    # (H34b, its metal), qwen27b off -- the 27B metal priced K7 with the last
+    # same-direction flip (+ 27B DPWAIT FLLIPER_PDFLIP_MIN_DWELL_EXCLUDE_DRAIN);
+    # on without a form (the NF code default). An explicit value always wins.
+    FLLIPER_PDFLIP_ENABLE_WARM_MIN_DWELL = EnvBool(_profile_default("FLLIPER_PDFLIP_ENABLE_WARM_MIN_DWELL", True))
+    FLLIPER_PDFLIP_MIN_DWELL_WINDOW = EnvInt(5)
+    # SLEEP_RELEASE_LMEM (H15, fnFL2x120): a complete sleep lowers the context's
+    # per-thread stack limit (cuCtxSetLimit), which frees the driver's
+    # local-memory reservation (derived 255 MiB per process on the 5090,
+    # 102 MiB on a 3080); the wake puts the saved limit back before its
+    # kv_cache fit check (pdflip/sleep_lmem.py). 0 = the context keeps it.
+    FLLIPER_PDFLIP_SLEEP_RELEASE_LMEM = EnvBool(True)
+    # GRAPH_UPLOAD_AT_CAPTURE (27B b1 death 27.09., D TP0 OOM in the FIRST bs=3
+    # replay at card_free 5 MiB): upload each full-graph exec right after its
+    # capture (cuGraphUpload), not at its first replay under load; one
+    # PDFLIP-GRAPH-UPLOAD line per shape (pdflip/graph_upload.py). Code default off;
+    # the pdflip launcher sets it for group D (build_env), an explicit value wins.
+    FLLIPER_PDFLIP_GRAPH_UPLOAD_AT_CAPTURE = EnvBool(False)
+    # SLEEP_HEAP_CENSUS (H16, fnFL2x127): the gc walk of PDFLIP-SLEEP-HOST-HEAP
+    # (sleeps 1, 2, 4, 8, ...) cost 505-639 ms INSIDE the sleep RPC, which the
+    # front waits for before the wake -- on the flip's critical path (P PP0
+    # tail 538/505 ms with the walk, 18/23 ms without). 1 = DEFER: the walk
+    # runs 2 s after the sleep answered and logs PDFLIP-SLEEP-HOST-HEAP-CENSUS
+    # with its own census_ms; 2 = INLINE (the old form); 0 = OFF.
+    # DEFAULT OFF since fnFL2x131/x132: DEFER's walk (613 ms, 2 s after the
+    # sleep) lands in D's post-wake extend and made the census flips 0.2-0.3 s
+    # SLOWER (3.38/3.30 vs 3.18/3.01 s), OFF equals the pre-H16 flips; and once
+    # the extend shrinks, an INLINE walk of 500 ms is back on the critical
+    # path. The census is a leak instrument: switch it on by name when hunting.
+    FLLIPER_PDFLIP_SLEEP_HEAP_CENSUS = EnvInt(PdFlipHeapCensus.OFF)
+    # MAMBA_ARENA_RID_ANCHORS (H19, fnFL2x130): arena mamba anchors one
+    # request may hold per rank; its next, deeper anchor displaces its
+    # shallowest one, and a node the full arena refuses releases one more
+    # (pdflip/mamba_arena_displace.py) -- the hand-over reads the DEEPEST anchor
+    # only, x130 kept the first 30 of 191 and lost the end anchor. -1 = auto
+    # max(2, arena_slots // 4) (32 -> 8; chunk 16384 stays untouched),
+    # N >= 2 = N, 0 = off (first-come as before).
+    # UNIFY S3 (BLOCKER S2): default = the profile field ``mamba_anchor``
+    # (pdflip/form.py MAMBA_ANCHOR_SWITCHES): nextflash deepest = -1 (auto),
+    # qwen27b grid4096 = 0 (no displacement, first-come -- the displacement and
+    # arena.c arena_drop_unreferenced are not reached); no form = -1. Set
+    # explicitly, the env always wins.
+    FLLIPER_PDFLIP_MAMBA_ARENA_RID_ANCHORS = EnvInt(
+        _profile_default("FLLIPER_PDFLIP_MAMBA_ARENA_RID_ANCHORS", -1))
+    # MAMBA_CARRIER_HOLD (H81, fnNV4f2): the flip's tree reset gives the
+    # tree's arena references back (27B 479f6eccb0 on the NF line) -- except,
+    # on group P, the END anchors (#1481 mark) of the phase: those stay
+    # referenced across D's phase and are released at P's next wake, so no
+    # claim D makes can drop a hand-over anchor D has not read yet. False =
+    # the end anchors are released with the rest at the reset (the 27B A form).
+    # UNIFY S2: default per profile (pdflip/form.py PROFILE_SWITCH_DEFAULTS:
+    # qwen27b True since 29.09. -- the form every 27B boot ran --, nextflash
+    # True), and the 27B line's switch FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE
+    # (which armed its hold, 27B arms =1) is read as its alias -- see
+    # _mamba_carrier_hold_default.
+    FLLIPER_PDFLIP_ENABLE_MAMBA_CARRIER_HOLD = EnvBool(_mamba_carrier_hold_default)
+    # The 27B line's INNER-anchor release on group P (c255e10ddb,
+    # mem_cache/unified_radix_cache._pdflip_inner_anchor_release_on): default per
+    # profile since 29.09. (pdflip/form.py MAMBA_ANCHOR_SWITCHES: grid4096 = the
+    # qwen27b row on, deepest/none off), off without a form; an explicitly set
+    # value wins -- and, set, is also the carrier-hold alias above.
+    FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE = EnvBool(
+        _profile_default("FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE", False))
+    # LANE_PARALLEL_COPY (H22, fnFL2x127/x132): a BAR1 deposit lane writes into
+    # the peer's window as REGISTERED HOST memory, so cudaMemcpyAsync makes
+    # every deposit copy a D2H on the card's ONE D2H copy engine
+    # (asyncEngineCount 2 = one per direction): the 5090's two lanes run
+    # time-multiplexed (x132: p0 alone 7.0, p1 alone 13.7 GB/s, together
+    # 104-110 ms = 4.3-4.4 GB/s each). 1 = the depositor copies with an SM
+    # kernel (pdflip/lane_sm_copy.py, NVRTC at the lane setup) on the lane's own
+    # streams; slots, sync-before-full and credits unchanged. A refused build
+    # stays on the copy engine with `mode=serial mode_why=` in the lane line.
+    # 0 = the copy engine, byte for byte the 2026-09-24 form.
+    FLLIPER_PDFLIP_LANE_PARALLEL_COPY = EnvBool(False)
+    # LANE_SM_COPY_BLOCKS: blocks per SM-copy launch (x 256 threads), the cap
+    # one lane takes of the card's SMs; the metal probe
+    # (probe_lanes_parallel.py) sweeps it.
+    FLLIPER_PDFLIP_LANE_SM_COPY_BLOCKS = EnvInt(64)
+    # BAR1_SPILL_GRACE_S (W109b, NF y6u 01.10. epochs 2->3 and 4->5): the age
+    # a blocked BAR1 depositor demands of every edge of a waker credit cycle
+    # through its own deposit before it spills the rest of the tag to host
+    # memory. Until 02.10. it was a third of the waker's W109 grace (1.0 s)
+    # plus a 0.5 s poll on top of the 0.5 s `blocked` flag delay: y6u's two
+    # cycled D->P wakes (sleeper1 weights_15 -> waker2, sleeper2 weights_11 ->
+    # waker1) sat 1.6-1.9 s in deposit before the spill, 3.40/3.46 s gathered
+    # legs against 1.31-1.45 s in the four uncycled ones. The chain is a
+    # deadlock by construction (each waker's credit can only come from the
+    # sleeper that is blocked on the other waker), so the grace only covers
+    # flag-read skew. The waker's W109 refusal keeps its own grace
+    # (FLLIPER_PDFLIP_BAR1_CYCLE_GRACE_S, 3 s).
+    FLLIPER_PDFLIP_BAR1_SPILL_GRACE_S = EnvFloat(0.1)
+    # Weg-2 load (H39, fnFL2x141-x145): the dense Marlin linears
+    # (compressed_tensors_wNa16: GDN/attention/shared-expert 6->8 bit, HC
+    # mixer, PLE, lm_head) keep their checkpoint-format tensors and the whole
+    # repack working set OUTSIDE the private tag pools; only the survivors
+    # (repacked weight, permuted scales, g_idx, workspace) are born in the tag
+    # pool. On D-TP0 those dead blocks were 4.6 of the 4.9 GiB private-free
+    # (weights pool 1.22 GiB = lm_head, bands 3.45 GiB). False = the
+    # 2026-09-24 form, byte for byte (everything born in the tag pool).
+    # UNIFY S2: ONE entry for both profiles, the DEFAULT per profile
+    # (pdflip/form.py PROFILE_SWITCH_DEFAULTS): qwen27b True since the operator
+    # decision of 26.09. (the 27B port 3c9bfeff95 shipped it off, but every 27B
+    # profile and arm set 1 and the RC9 metal ran with it), nextflash True;
+    # no published form -> True (the NF line's default). Set explicitly, the
+    # env always wins.
+    FLLIPER_PDFLIP_DENSE_REPACK_OUTSIDE_POOL = EnvBool(_dense_repack_outside_pool_default)
+    # SEQ_LANE_RING (H44, Task #17): the on-card HOST lanes (c0/c1/c2,
+    # /dev/shm/pdflip-seq-<boot>/c<card>[_s1]_unit_buffer.bin) were sized to
+    # the lane's biggest TAG, persisted and pinned per buffer slot -- 3.2 GiB
+    # of tmpfs at depth 2 (x148: 646+346, 563+563, 647+647 MB), while 151 of
+    # 152 tag transfers per boot rode the on-card IPC staging and never
+    # touched them. 1 = a tag maps a host lane only when it really takes the
+    # host path (IPC staging refused), and then as a RING of
+    # RING_SLOTS x sync-batch slots (FLLIPER_PDFLIP_SEQ_SYNC_BATCH_MIB) with a
+    # free handshake per batch -- IF the collector has announced it is
+    # already inside its collect (resumed, draining unconditionally). A
+    # collector that is not ready within RING_READY_MS gets the whole-tag
+    # buffer as before (#1374 Option 1: on the diagonal the collector's
+    # resume may wait for this depositor's pause, a blocking ring would be
+    # the xsn30 deadlock). 0 = the eager whole-tag form byte for byte.
+    FLLIPER_PDFLIP_SEQ_LANE_RING = EnvBool(True)
+    FLLIPER_PDFLIP_SEQ_LANE_RING_SLOTS = EnvInt(4)
+    FLLIPER_PDFLIP_SEQ_LANE_RING_READY_MS = EnvInt(50)
+    # H46: the ring files (cards x depth x (4 KiB + RING_SLOTS x sync batch),
+    # 3.0 GiB at 3 x 1 x 4 x 256 MiB, the 27B depth 1; NF depth 2 6.0 GiB) are created, populated and cudaHostRegister'ed
+    # at boot on a daemon thread, not at the first host-path tag of a flip --
+    # x148/x149/x151 paid 5.9-9.7 s per register in the first flip (same
+    # bytes: 293-342 ms in x147/x150). False = mapped at first use (H44 form).
+    FLLIPER_PDFLIP_SEQ_LANE_RING_PREREGISTER = EnvBool(True)
+    # H46b: D's draft host image (pdflip/draft_park.DraftHostPark, 1.5 GB pinned,
+    # ledger post d_draft_host) is allocated at scheduler init, not at the first
+    # sleep's park -- x148/x151: cudaHostAlloc 7989/10442 ms inside TP0's first
+    # sleep, TP0's first deposit 8.1 s behind TP1/TP2. False = first-park form.
+    FLLIPER_PDFLIP_DRAFT_PARK_PREALLOC = EnvBool(True)
+    # Kriech-Sitz 29.09. (z30w-park): that image is pinned at its EXACT size
+    # (expert_offload.pinned_exact_empty) instead of torch.empty(pin_memory),
+    # whose CachingHostAllocator rounds to the next power of two: 1522.8 MiB
+    # image -> 2048 MiB block on D-TP0, 525 MiB of host RAM no ledger post
+    # books. False = the torch.empty form, byte for byte.
+    FLLIPER_OPT_PDFLIP_DRAFT_PARK_EXACT_PIN = EnvBool(False)
+
+    # Model & File Download
+    FLLIPER_USE_MODELSCOPE = EnvBool(False)
+    # Controls weight-file ordering for load-time I/O optimization.
+    #   -1 : no sorting, no staggering; preserves original file order.
+    #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.
+    #   k>0: sort files and stagger per-rank order with factor k.
+    #        Files are processed in groups of (tp_size * k), and rank r starts each
+    #        group at offset (r * k), improving multi-rank I/O concurrency while
+    #        keeping access relatively ordered.
+    FLLIPER_SORT_WEIGHT_FILES = EnvInt(0)
+    FLLIPER_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
+    # instead of gathering DP tokens for a global-TP lookup.
+    FLLIPER_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
+    # and phases fall back to the original implementation.
+    FLLIPER_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # H125d (NF vision, transient): with images tokenized, Qwen4-Exp runs the
+    # 3D mrope path only for an extend whose extent holds image positions;
+    # decode and text extends take row 0 of the mrope positions (the 1D
+    # positions plus the request's mrope delta) through today's 1D rotary.
+    # Off = mrope on every batch of an image-tokenizing group (H125 8/n).
+    FLLIPER_PDFLIP_ENABLE_MROPE_IMAGE_EXTENT_ONLY = EnvBool(False)
+    # --ple-offload-backend file: where the sparse, file-backed PLE table lives
+    # (deterministic name, reused across restarts), whether prefill-sized
+    # gathers hint the page cache first, and an escape hatch for the device
+    # attribute check (pageable host memory reachable through host page tables).
+    FLLIPER_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
+    FLLIPER_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
+    FLLIPER_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
+    # Faulting rows in maps whole page-cache folios, so the mapping creeps
+    # towards full residency (~45 KB/token) and eats the free memory that
+    # sizes the KV pool. Cap its resident set; 0 disables the trim.
+    FLLIPER_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
+    FLLIPER_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # fnFL2 H32 (checkpoint backend with FLLIPER_QWEN4_PLE_CKPT_GATHER=pread):
+    # the prefill pread gather runs in worker PROCESSES, and the chunked
+    # request's NEXT chunk is gathered while the current chunk's forward runs
+    # (ring of two shared host slots). Off = the in-process serial gather.
+    FLLIPER_QWEN4_PLE_PREFETCH = EnvBool(True)
+    FLLIPER_QWEN4_PLE_PREFETCH_PROCS = EnvInt(4)
+    FLLIPER_QWEN4_PLE_PREFETCH_THREADS = EnvInt(4)
+    # fnFL2 H40 (checkpoint backend, qwen4_exp_ple_decode_pread.py): the
+    # decode/verify-sized PLE gather takes its rows from a page-locked host
+    # stage that pread worker PROCESSES fill between the draft and the verify
+    # replay (the round's tokens are known then); a row whose staged id is not
+    # its real id is read through HMM as before (bytes never depend on the
+    # stage). BUDGET_MS bounds the host wait per round; rows not read by then
+    # stay on the HMM path. LOG_EVERY rounds per PLE-DECODE-PREAD line. Off =
+    # the captured kernel reads every row through HMM (the pre-H40 graph).
+    FLLIPER_QWEN4_PLE_DECODE_PREAD = EnvBool(True)
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_QWEN4_PLE_DECODE_PREAD_PROCS = EnvInt(4)
+    FLLIPER_QWEN4_PLE_DECODE_PREAD_THREADS = EnvInt(4)
+    FLLIPER_QWEN4_PLE_DECODE_PREAD_BUDGET_MS = EnvFloat(8.0)
+    FLLIPER_QWEN4_PLE_DECODE_PREAD_LOG_EVERY = EnvInt(32)
+    # fnFL2 H69 (D, graphed verify rounds): the H40 stage is filled AFTER the
+    # verify graph was launched instead of before it. The graph starts right
+    # behind the draft; a one-warp gate kernel on the PLE prefetch stream
+    # waits (bounded) for the host's "round staged" word while decoder layer
+    # 0 runs on the forward stream, and the staged gather then reads the
+    # stage (gate timed out: every row through HMM, bytes unchanged). Takes
+    # the host's event wait + hash + pread (x168: gpu_gap_ple 1.7 ms per
+    # round, all three cards idle) off the device's critical path. Off = the
+    # H40 order and the H40 kernel, byte-identical.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_PLE_STAGE_BEHIND_REPLAY = EnvBool(False)
+    # fnFL2 H73 (D, verify rounds): the pread WORKERS stage the round on their
+    # own. The verify's windows are posted by the device into a mailbox of the
+    # stage right behind the draft (D2H copy, then the round number into a
+    # flag word, stream-ordered); the workers poll the flag, hash, pread their
+    # share of the rows into the stage and publish one done word each; the
+    # gate (H69, gated kernel) waits for every word. The scheduler thread
+    # neither waits for the draft nor hashes nor preads (x172: ple_stage
+    # 2.8-3.0 ms host, ple.wait 3.2-3.8 ms device per round), and the reads
+    # start at the draft's end instead of after the verify replay returned.
+    # Implies the gated kernel; supersedes BEHIND_REPLAY (no hook). Off = the
+    # H40/H69 paths, byte-identical.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_PLE_STAGE_AUTONOMOUS = EnvBool(False)
+    # fnFL2 H73 (with AUTONOMOUS): the NEXT round's first verify token is this
+    # round's bonus -- after the accept its window [committed history | bonus]
+    # is posted as well, and the workers read those rows (16 per request)
+    # while the draft extend and the next draft run; the verify round then
+    # keeps every row whose id is already staged. Off = only the verify post.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_PLE_STAGE_BONUS_EARLY = EnvBool(False)
+    # fnFL2 H69b (Form A only, D's host): build the PLE n-gram table with the
+    # full vocabulary (enable_tp=False), as F13 does for embed_tokens. Without
+    # it the host holds the even TP=3 shard [0, V/3) of the n-gram ids and --
+    # with the F12 reduce skipped and no worker holding the rest -- reads the
+    # other two thirds (bigram heads 5-7, every trigram head) as zero rows
+    # (x168: kernel_rows/rows 33.4 %). A correctness fix: it changes D's
+    # numerics back to P's model and triples D's staged PLE rows per round
+    # (21 -> 64 at bs 1). Off = the pre-H69b layout, byte-identical.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB = EnvBool(False)
+    # H68d (models/qwen4_exp_ple_fp8.py): how the PLE gathers read an fp8
+    # (float8_e4m3fn) table -- the nvidia NVFP4 export's PLE is fp8, and Triton
+    # refuses the fp8e4nv pointer below sm89 (NVFP4 slice smoke on a 3080:
+    # "type fp8e4nv not supported in this architecture" at the first forward).
+    # Grammar [smXX:]MODE[;...] with MODE native | exp2 | bits | ptx (the QSA
+    # decoders of H65, bytes loaded as uint8); an arch group wins over a
+    # generic one. Empty = native from sm90 on (the pre-H68d kernels; sm89
+    # types fp8e4nv but cannot convert it to bf16), bits below. native below
+    # sm90 and ptx below sm80 are refused by name. A bf16 table never reads it.
+    FLLIPER_PDFLIP_PLE_FP8_DECODE = EnvStr("")
+    # fnFL2 H43: the FIRST chunk's gather starts at the request's admission
+    # (scheduler intake, or the front's hint while P still sleeps) into a third
+    # shared slot, whenever the H32 ring is idle. Off = H32 alone. Never on
+    # group D.
+    FLLIPER_QWEN4_PLE_PREFETCH_ADMIT = EnvBool(True)
+    # fnFL2 H43 (Weg-2 front): a BATCH arrival queued while P is not awake is
+    # hinted to P (/pdflip/ple_prefetch_hint) so P's first-chunk PLE read runs
+    # while P wakes. Off = P learns of the request at its leg 1 only.
+    FLLIPER_PDFLIP_PLE_ADMIT_HINT = EnvBool(True)
+    # H84 (Weg-2 front, live X): an r_D sample is D's own prefill time
+    # (meta_info pdflip_prefill_s) over the uncached extent, and only from an
+    # extent of at least this many tokens -- below it the fixed per-request
+    # cost dominates (x177: 48-64 tokens took 0.87-1.23 s on D).
+    FLLIPER_PDFLIP_X_RD_MIN_UNCACHED = EnvInt(2048)
+    # H84 (Weg-2 front, X-SOLO): a request between the start X and the live X
+    # goes to D only when nothing else arrives within this window and nothing
+    # is in flight; otherwise it is routed with the start X (to P). NF D is
+    # bs1, so a burst served serially on D would be slower than P's batch.
+    FLLIPER_PDFLIP_X_SOLO_WINDOW_MS = EnvInt(250)
+    # X_ROUTED_NEEDS_P (#246b, 30.09., NF y4c ...dauer09300427 front 04:39:57):
+    # a queued request needs P above the X it was ROUTED on, not only above the
+    # live X. pdflip-22-37 / 22-38 (4447 / 4191 tokens) were routed LONG on the
+    # X-SOLO band floor X_busy=4096 (D busy), but the ARRIVAL-SEAT step, the
+    # park collect window and the immediate park asked needs_p() against the
+    # live X 4964 -> no candidate, no verdict, no flip: D decoded one stream
+    # with 5 free seats for 128 s (DP-WAIT hold_by=d-work) until it ended.
+    # Off = needs_p() against the live X only, as before.
+    FLLIPER_PDFLIP_ENABLE_X_ROUTED_NEEDS_P = EnvBool(True)
+    # #49 rest (FS 26.09., desk/27b-frontspan2-0926 a561991382, inflight half
+    # only: #49 itself runs unswitched in the unified tree since S7c): a D leg
+    # 2 whose stream has delivered its first content event has PREFILLED its
+    # whole prompt into D's radix -- the front credits that text for the rest
+    # of the epoch at once, not only when the leg finishes. Closes the twin
+    # gap (a Claude-Code turn's second request, +~155 tokens on the first,
+    # arriving while the first decodes). Off = presence only at leg-2 finish.
+    # RG 26.09.: a registry field (pdflip/form.py PREFIX_SWITCHES,
+    # front_span_inflight): qwen27b on (dkr27brc10bar1agent09261821), nextflash
+    # and no form off.
+    FLLIPER_PDFLIP_FRONT_SPAN_INFLIGHT = EnvBool(_profile_default("FLLIPER_PDFLIP_FRONT_SPAN_INFLIGHT", False))
+    # X-EXACT (user 26.09. ~19:00Z, memory d2p-sofort-flippen-und-x-exakt-0926):
+    # X holds EXACTLY for the pending tokens -- no 1.3*X band. On = the front
+    # renders and tokenizes every /v1/messages, /v1/chat/completions and
+    # /generate request with the group's own serving code, tokenizer and
+    # template settings (read from its /get_server_info; pdflip/front_tokens.py)
+    # and prices pending = tokens - the MEASURED cached-on-D token prefix; the
+    # tokenizer runs in one worker thread, incremental per conversation
+    # prefix. Every D leg 2 logs PDFLIP X-EXACT-ERR (priced vs realised). Off
+    # = the chars/3 pricing byte for byte. Default per profile
+    # (ModelProfile.front_exact_tokens: qwen27b on since the agent-load boot
+    # w109290020 29.09., nextflash on since V1 27.09.); off without a form;
+    # explicit wins (=0 turns the NF row off).
+    FLLIPER_PDFLIP_FRONT_EXACT_TOKENS = EnvBool(_profile_default("FLLIPER_PDFLIP_FRONT_EXACT_TOKENS", False))
+    # X-EXACT: longest wait for the count before the request is priced by the
+    # chars/3 estimate instead (named: PDFLIP X-EXACT-FALLBACK reason=timeout).
+    FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS = EnvInt(3000)
+    # PRICE-BARRIER (02.10., N5x ..._5ddc067a81_1002_162100 16:23:41: the SHORT
+    # pdflip-0-1 was admitted to D 12 ms before its LONG sibling pdflip-0-2's verdict --
+    # both released by the same BOOT-START HOLD -- and was parked after its first
+    # extend for the whole P phase, wall 19.1 s; agent load 01./02.10.: ~1 per 1000
+    # arrivals). A SHORT that D would admit now waits for the verdicts of the
+    # arrivals still being priced beside it whose chars/3 estimate is a LONG
+    # candidate (> X/2); one goes LONG -> the SHORT joins P's batch with it (no D
+    # extend, no park); none does -> D as before, having lost at most their count
+    # time (bounded by FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS). Marker 'PDFLIP
+    # PRICE-BARRIER'. 0 = the SHORT takes its D seat at once, as before.
+    FLLIPER_PDFLIP_PRICE_BARRIER = EnvBool(True)
+    # PARK-NO-DWELL (user 02.10.: an arriving request is prefilled AT ONCE, no
+    # grace for running decodes; N6d ..._ec4d492f58 epoch 4: 'PDFLIP
+    # PARK-IMMEDIATE-DWELL awake_ms=310 min_dwell_ms=1974 floor_ms=2000' held the
+    # LONG pdflip-4-6 142 ms until D's 2-token SHORT had finished): the immediate
+    # park of D's running decodes for a queued request over X fires at once --
+    # no K7 min-dwell, no park-cycle/decode dwell, no collect window, no fairness
+    # floor -- and the D->P MIN-DWELL after that park does not hold either.
+    # Marker 'PDFLIP PARK-NO-DWELL'. 0 = the dwell rules as before.
+    FLLIPER_PDFLIP_PARK_NO_DWELL = EnvBool(True)
+    # EARLY-FLIP (02.10., binding flip time = last D token -> first P chunk; N6d:
+    # arrival -> verdict 194-224 ms = X-EXACT count 100-130 + PROBE-FAST ~100, all
+    # of it before the flip could begin): with D IDLE (nothing running, no
+    # hand-off, nothing prefilled waiting, empty queue) an arrival whose chars/3
+    # uncached price is >= FLLIPER_PDFLIP_EARLY_FLIP_X_FACTOR x X begins the D->P flip
+    # at once -- drain and D quiesce run beside the count and the store probe --
+    # and the flip awaits the verdict before its first sleep RPC (sleep-kv): LONG
+    # (and economics + MIN-DWELL say flip) -> it goes on; anything else -> ABORT,
+    # D stays awake and serves (its quiesce flushed the radix; the prefix comes
+    # back from L2). Measured 01./02.10.: 2x catches 597 of 1063 LONGs, 7 of 604
+    # early begins end SHORT (1.2 %). Markers 'PDFLIP-EARLY-FLIP begin|go|abort'.
+    # 0 = the flip waits for the verdict, as before.
+    FLLIPER_PDFLIP_EARLY_FLIP = EnvBool(True)
+    FLLIPER_PDFLIP_EARLY_FLIP_X_FACTOR = EnvFloat(2.0)
+    # DECODE-COLLECT (user rule 02.10. ~19:07Z, both models: "wenn prefill
+    # requests reinkommen und noch decoded wird, dann wird erstmal noch 15
+    # sekunden weiterdecoded und prefill requests gesammelt, erst dann ...
+    # je nach anzahl in P oder D"; ~19:09Z: "auf den alten weg ... indem man
+    # die zeit auf 0 stellt"): while D decodes, every arriving prefill (SHORT
+    # and P-bound alike) is held for this many seconds from the first one; D
+    # decodes on. At the end the collected set goes as a whole: summed
+    # uncached <= X and nothing P-only -> D, else the D->P flip and P takes
+    # all of it. D not decoding (or it stops decoding inside the window) ->
+    # at once, as before. While a window holds it wins over PARK-NO-DWELL,
+    # PBOUND-FLIP-NOW, the ARRIVAL-SEAT flip_now and the SHORT seat on D.
+    # Marker 'PDFLIP DECODE-COLLECT hold|dcheck|release'. 0 = the old path, byte
+    # for byte (whatever D_CHECK_S says).
+    FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S = EnvFloat(15.0)
+    # DECODE-COLLECT D-CHECK (user ~19:12Z: "es wird 7,5 gesammelt, wenn dann
+    # gesammelt nicht mehr token anstehen, als X in D prefillen wuerde, dann
+    # prefillt er in D die kleine menge ... auch diese zeit muss einstellbar
+    # sein"): at this many seconds into the window a set whose summed uncached
+    # is <= X (and nothing P-only) goes to D at once; else it collects on to
+    # WINDOW_S and then flips (user: "ansonsten wartet er auf die 15er grenze
+    # und flippt"), P takes all of it. 0 or >= WINDOW_S = no intermediate
+    # check (the window routes the set by its amount).
+    FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S = EnvFloat(7.5)
+    # DECODE-COLLECT SEAT GATE (user 02.10. ~20:25Z: no prefill on P while D has
+    # no room for it; filling prefills for free seats stay allowed): in the
+    # ARRIVAL-SEAT branch the collect window's route P flips only while D has a
+    # free seat after the flip back, and the P phase then dispatches at most
+    # that many requests (oldest first). No free seat: the set keeps waiting;
+    # AGE PLAN's displacement plan, else the ARRIVAL-SEAT wait bound (parks the
+    # youngest running decode), frees one. Without ARRIVAL_SEAT (the 27B
+    # classic path) the switch is never read. Marker 'PDFLIP DECODE-COLLECT
+    # seat-gate'. 0 = route P flips at once, as before.
+    FLLIPER_PDFLIP_DECODE_COLLECT_SEAT_GATE = EnvBool(True)
+    # X-EXACT: tokenizer path override (tests, or a front without a group
+    # reachable); empty = the group's own server_args.tokenizer_path.
+    FLLIPER_PDFLIP_FRONT_TOKENIZER_PATH = EnvStr("")
+    # FRONT-PREWARM (NF y7y 17:41:47, pdflip-0-1 'X-EXACT-HOLD waited_ms=4594';
+    # every NF boot of 02.10. held its first arrivals 3.7-7.6 s, 27B N6i 8.5 s:
+    # the front was up 3 s after group D, its tokenizer stack ~8 s later):
+    # /pdflip/state reports ``state=warming`` until the X-EXACT load ended (the
+    # tokenizer stack ready AND the L3 presence probe opened) or
+    # X_EXACT_HOLD_MAX_S since the front's start passed, so a host that waits
+    # for ``serving`` sends its first request into a warm front. The load also
+    # ends with one dummy render + encode per chat path (the first count took
+    # 142 ms for 25 tokens, a warm one 10 ms for 2711). The front's own state,
+    # its /health and every route decision are unchanged; a client that does
+    # not wait is held exactly as before. 0 = serving at once, no warm render.
+    FLLIPER_PDFLIP_FRONT_TOKENIZER_PREWARM = EnvBool(True)
+    # RG 26.09.: the told/twin prefix switches as registry fields (pdflip/form.py
+    # PREFIX_SWITCHES; their readers in managers/pdflip_store_told.py,
+    # pdflip/p_twin_defer.py and managers/pdflip_told_fallback.py take the same
+    # default through form.prefix_switch_armed). qwen27b on (TK, PX2, TW;
+    # metal dkr27brc10bar1agent09261821), PF off everywhere (unproven);
+    # nextflash and no form off. FLLIPER_PDFLIP_TOLD_ABSOLUTE follows TREE_KEY.
+    FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY = EnvBool(_profile_default("FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY", False))
+    FLLIPER_PDFLIP_TOLD_PACED = EnvBool(_profile_default("FLLIPER_PDFLIP_TOLD_PACED", False))
+    # #1416f: PP0 admits a paced told without waiting out its window when
+    # nothing is in pipeline flight (managers/pdflip_store_told.pipeline_idle).
+    # 1 = the window always runs, as before.
+    FLLIPER_PDFLIP_DISABLE_TOLD_PACE_IDLE_SKIP = EnvBool(False)
+    FLLIPER_PDFLIP_P_TWIN_DEFER = EnvBool(_profile_default("FLLIPER_PDFLIP_P_TWIN_DEFER", False))
+    FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK = EnvBool(_profile_default("FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK", False))
+    # Prefix trace (IN 26.09., pdflip/prefix_trace.py): every prefix miss of an
+    # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
+    # (rid, stop depth) whose unmatched rest is >= the minimum below, full
+    # rids and no 8/256 sampling in #1400/#1416*, #1442 REG and #1040 EXTENT
+    # unsampled, #1469 EVICT / #1427 ARENA-DROP uncapped with parent node and
+    # page/slot keys. Never a line on the decode round path. Off = the
+    # sampled instruments exactly as before.
+    FLLIPER_PDFLIP_PREFIX_TRACE = EnvBool(False)
+    FLLIPER_PDFLIP_PREFIX_TRACE_MIN_TOKENS = EnvInt(1024)
+    # UNIFY S7 (27B RC7-X, 7f81f09daf/e28c450a0d/0e8faa7178): the front half of
+    # the 27B busy/idle split beyond the shared X-SOLO band -- a band request
+    # the singleton rule sent to P is marked deferred and served on D by the
+    # idle re-grant once D is idle and quiet (no flip for it meanwhile); the
+    # SHORT drain (--d-short-drain-tokens) is capped at X_busy while D decodes;
+    # an X_busy overrun is counted. Default per profile (pdflip/form.py
+    # ModelProfile.x_split): qwen27b on (the 27B line's form), nextflash off
+    # (9e36e2185a: D bs1, min-work 4096); off without a form.
+    FLLIPER_PDFLIP_X_IDLE_REGRANT = EnvBool(_profile_default("FLLIPER_PDFLIP_X_IDLE_REGRANT", False))
+    # UNIFY S7 (27B xsn437 3453cc7766 / RC2-final B e34b90ffe8): the store-short
+    # tail -- a short store read re-reads its tail below the prefetch threshold,
+    # a standstill within X recomputes instead of W88 503, a remainder within X
+    # settles at the wake. Default per profile (ModelProfile.store_short_tail):
+    # qwen27b on (the 27B line's code default), nextflash off; on without a
+    # form. The scheduler keeps the 27B parse of an explicit value
+    # (0/false/no/off = off, anything else on); this entry carries the default.
+    FLLIPER_PDFLIP_STORE_SHORT_TAIL = EnvBool(_profile_default("FLLIPER_PDFLIP_STORE_SHORT_TAIL", True))
+    # UNIFY S7/S8 (27B 34965fc3fa, mamba_anchor=grid4096): group P's anchor
+    # spacing and per-path cap. The readers are mem_cache/mamba_ckpt_utils
+    # (pdflip_anchor_interval / pdflip_max_states_per_path, per-node path, cached per
+    # form); these entries carry the profile default (qwen27b 4096 / 4, the 27B
+    # arm's values; nextflash 0 = off). An explicit value always wins.
+    FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL = EnvInt(_profile_default("FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL", 0))
+    FLLIPER_PDFLIP_MAMBA_MAX_STATES_PER_PATH = EnvInt(_profile_default("FLLIPER_PDFLIP_MAMBA_MAX_STATES_PER_PATH", 0))
+    # UNIFY S7/S8 (NF fnFL2x76 c8e26de17d): exact bigram anchor keying -- the
+    # retention key takes one more token so node units == tokens the recurrent
+    # state consumed. Default per profile (ModelProfile.bigram_anchor_exact):
+    # nextflash on (its metal), qwen27b off (upstream keying, the 27B metal);
+    # on without a form (the NF code default).
+    FLLIPER_PDFLIP_BIGRAM_ANCHOR_EXACT = EnvBool(_profile_default("FLLIPER_PDFLIP_BIGRAM_ANCHOR_EXACT", True))
+    # HANDBACK N-1 claim (27B fe5c55041b, gated RELEASE-HEAD 1002): D claims N
+    # raw tokens on an exact bigram tree. Profile row ``handback_claim_n``
+    # (qwen27b on, nextflash off); on without a form (the 27B line's claim --
+    # NF always runs with its form, whose row turns it off).
+    FLLIPER_PDFLIP_HANDBACK_CLAIM_N = EnvBool(_profile_default("FLLIPER_PDFLIP_HANDBACK_CLAIM_N", True))
+    # #49 (27B 196f6a8f57, S7c) behind a switch -- NF P49 c1988ff84f: agent
+    # turns priced so that a short tail on a prefix D already holds stays on D.
+    # On = (A) request_text renders tools FIRST (the Qwen3.8/Flash-Next template
+    # order), (B) a 200 D serve records prompt_tokens as held for that epoch
+    # while D is awake and serving, (C) a credited prefix is priced by its
+    # measured prompt_tokens, only the unmatched tail by chars/3. The law is
+    # unchanged: an uncached rest above X still routes LONG. Off = the pre-#49
+    # pricing (NF rc2.1l + H100). Default per profile (pdflip/form.py
+    # ModelProfile.agent_span, operator 26.09.): qwen27b on (its line ran #49
+    # unswitched since RC9), nextflash off until the NF seat releases it with a
+    # boot tag; off without a form (the NF code default).
+    FLLIPER_PDFLIP_ENABLE_AGENT_SPAN = EnvBool(_profile_default("FLLIPER_PDFLIP_ENABLE_AGENT_SPAN", False))
+    # PREFILL-EINBRUCH-0929 K1 (Weg-2 front, X-EXACT): at the first content of
+    # an after_p leg 2 -- P's publish is complete, D resumed from it -- the
+    # prompt's END-ANCHOR (page floor of P's prompt_tokens) is recorded as a
+    # store presence, so a follow-up turn on that prefix prices its real rest
+    # and stays on D. Line 'PDFLIP P-ANCHOR-PRESENCE'. Off = no record (#1324:
+    # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
+    FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE = EnvBool(True)
+    # Q-711 SHORT-KEPT-BOUND (INT8 y8vb 03.10.): a SHORT kept for D waits in the
+    # front's _ready_for_d, which no flip trigger reads (they read only the batch
+    # queue) -- it had no upper bound (137 s and 152 s, p90 137 s against 1 s on
+    # y8va). Past this many seconds in D's admission line WITHOUT a free seat it
+    # moves to P's queue (_to_p_batch, arrival order) and the existing flip path
+    # takes it. Profile row ``short_kept_max_wait_s`` (qwen27b 30 s, nextflash
+    # 0); 0 = off, byte-identical (also the value without a form). Not read in
+    # the dual layout.
+    FLLIPER_PDFLIP_SHORT_KEPT_MAX_WAIT_S = EnvFloat(_profile_default("FLLIPER_PDFLIP_SHORT_KEPT_MAX_WAIT_S", 0.0))
+    # RPC-STALL-WATCHDOG (30.09., hauenh P->D epoch 6: D TP0 silent 6 s inside the wake RPC):
+    # faulthandler's C watchdog writes every thread's stack into its own file per rank when a sleep
+    # (release) or wake (resume) RPC outlives this many seconds (pdflip/rpc_stall_watchdog.py). A normal
+    # leg is 1.5-2.3 s; 0 = off. Costs nothing while nothing hangs.
+    FLLIPER_PDFLIP_RPC_STALL_WATCHDOG_S = EnvFloat(3.0)
+    # HOLD-RELEASE-AFTER-REPLY (30.09., z30y8 epoch 26: the #1443 hold release inside the kv resume RPC
+    # took 15 s on TP0 -- TP1/TP2 waited in its hicache collective -- and the whole P->D flip with it).
+    # On: the resume only marks the release due; it runs right after the resume's reply is sent, at
+    # the same point of the same intake list on every rank. 0 = the old in-RPC release (A/B arm).
+    FLLIPER_PDFLIP_HOLD_RELEASE_AFTER_REPLY = EnvBool(True)
+    # #49 L2 (30.09., desk/27b-front-span-49-0930): at a D->P flip done (D's sleep leg published its tree
+    # and joined the store queue) the texts D served in the ending epochs become store presences at D's own
+    # #59 pdflip_resumable_depth, never the prompt (front_tokens.TokenSpans.promote_published). Front only;
+    # default off until the first 27B flip boot proves it.
+    FLLIPER_PDFLIP_ENABLE_D_EPOCH_PUBLISH_PRESENCE = EnvBool(False)
+    # #49 L3 (30.09.): with the P-anchor presence witness, also credit the INNER mamba anchors P's
+    # prefill donated (P's leg-1 sglext/meta_info pdflip_anchor_depths) -- the deepest one on a later
+    # text's shared path. Front only, and only under --dual-layout: the flip form RELEASES inner anchors
+    # at P's reset (FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE, grid4096), so crediting them there would
+    # over-credit. Default off.
+    FLLIPER_PDFLIP_ENABLE_INNER_ANCHOR_PRESENCE = EnvBool(False)
+    # The page grain of that end anchor (the store page, ArenaMHAHostPool #107).
+    FLLIPER_PDFLIP_FRONT_ANCHOR_PAGE = EnvInt(64)
+    # H102 (Weg-2 front): a per-request watcher sees the client's connection
+    # close and cancels the work behind it -- dequeued while queued, aborted
+    # on P (/abort_request, the intake-stall path) during leg 1, dropped
+    # before D, a D-parked request aborted on D. One line PDFLIP-CLIENT-GONE
+    # per request. Off = a dead client's leg 1 runs to its end (pre-H102).
+    FLLIPER_PDFLIP_ENABLE_CLIENT_GONE_ABORT = EnvBool(True)
+    FLLIPER_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    # Weight loader: read safetensors tensors with pread() instead of mmap
+    # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through
+    # read(); fn1v/fn1w 2026-09-16), and let the model veto tensors before
+    # they are read (weight_name_needed: PLE shards the checkpoint backend
+    # only maps, experts and layers other ranks own).
+    FLLIPER_WEIGHT_LOADER_PREAD = EnvBool(False)
+    # NF-Bootzeit H2 (28.09.): group D does not read the expert rows group P
+    # already published in the shared expert store (sentinel), and does not
+    # rewrite them -- only its residents and the rows P did not write come from
+    # the checkpoint (layers/moe/store_adopt.py). Active only on FLLIPER_PDFLIP_GROUP=D
+    # with the store and a nested expert map; False = read everything (pre-H2).
+    FLLIPER_PDFLIP_ENABLE_D_STORE_ADOPT = EnvBool(True)
+    # Weight loader: how many threads consume the EXPERT shards a model's
+    # load_weights hands to FusedMoE.weight_loader (Ladezeit 2, 23.09.).
+    # Measured fnFL2x26 with FLLIPER_LOAD_PROFILE: 50 % of a 107 s rank load
+    # was the per-shard `expert_data.copy_` (222720 strided host copies,
+    # serial on the loader thread while the eight file workers waited).
+    # The copy releases the GIL, the destinations are disjoint rows of a
+    # stacked [E, ...] parameter, and the per-layer presplit trigger counts
+    # under its own lock -- so the shards can land in parallel. 0 = the
+    # serial form (A/B); the pool is bounded (2 x threads in flight) so the
+    # sliding-window file buffer stays the only thing that holds mmaps.
+    FLLIPER_LOAD_CONSUMER_THREADS = EnvInt(4)
+    # BOOTZEIT 3 Stufe 2b (29.09.): the NON-expert tensors (dense, embed,
+    # lm_head, norms, draft) read ONCE per boot. With the coalesced O_DIRECT
+    # stream every group reads them from disk; here they go through the page
+    # cache instead: "keep" (group P, the first reader) leaves them there,
+    # "drop" (group D, the last reader) takes them from there and drops each
+    # range after reading it. The expert rows are H2's (store adopt). Empty =
+    # off (every run as before). The cache is clean and reclaimable; "keep"
+    # stops keeping past FLLIPER_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB.
+    FLLIPER_WEIGHT_LOADER_SHARED_CACHE = EnvStr("")
+    FLLIPER_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB = EnvInt(6144)
+    # W98 (z30u): the directory "keep" writes its kept ranges to, so the
+    # launcher drops exactly those ranges once group D is ready
+    # (pdflip/shared_cache_release.py). Set per group by the pdflip launcher;
+    # empty = no manifest (the ranges stay until the kernel reclaims them).
+    FLLIPER_WEIGHT_LOADER_SHARED_CACHE_MANIFEST = EnvStr("")
+    # BOOTZEIT 3 (29.09., z30r3): the device -> store write of the presplit
+    # in RUNS of consecutive rows, async into the registered store and one
+    # stream sync per call, instead of one synchronous copy per expert row.
+    # z30r3 PP0: store_write 16.7 s of a 51.1 s presplit (29 layers, ~1200
+    # tiny sync D2H copies each, every one fighting 8 consumer threads for
+    # the GIL). Same bytes, same rows. False = the per-row copy.
+    FLLIPER_EXPERT_STORE_WRITE_RUNS = EnvBool(False)
+    # BOOTZEIT 3 (29.09., z30r3): D's Marlin repack runs over the rank's whole
+    # [E] window although H2 vetoed most of it (never read -- the store holds
+    # P's bytes for those rows, and the presplit neither copies nor writes
+    # them). Measured: TP0 reads 3171 of 9040 owned rows on 40 layers, TP1
+    # 3320/6096, TP2 3120/7632; repack ~30 s per D rank. On: repack only the
+    # rows that were read (+ the pad row). Same bytes for every row anyone
+    # reads; the vetoed rows stay what they were -- unread garbage.
+    # Default on (30.09.): every NF metal boot since z30r3 ran it, but only via
+    # the instrument profile -- a release with HTSGLANG_INSTRUMENTS=0 lost it.
+    FLLIPER_MOE_REPACK_SKIP_VETOED = EnvBool(True)
+    # BOOTZEIT 4 (29.09., z30w-park): the per-layer host reclaim at the end of
+    # the presplit (PresplitGcMode). FULL: gc.collect() + malloc_trim(0) --
+    # the collect was 7.8-9.6 % of the D loader thread, under the GIL, 48x
+    # per D rank; TRIM: malloc_trim(0) only. The [ct-stream-presplit] line
+    # prints gc= found= trim= either way, so one FULL boot says whether the
+    # collect ever finds anything.
+    FLLIPER_OPT_LOAD_PRESPLIT_GC = EnvInt(PresplitGcMode.FULL)
+    # BOOTZEIT 5 (29.09., z30w-park): the expert-params mapping of a model's
+    # load_weights as a dict index (model_loader/expert_mapping_index.py)
+    # instead of a linear substring scan over all 3 x num_experts entries per
+    # expert tensor. Same entries, same order -- the loop body is unchanged.
+    # Measured on the rig's CPU with the identical loop: 10.8 s of loader-
+    # thread GIL time for PP0's 133632 expert tensors (81 us each). False =
+    # the scan (A/B only).
+    FLLIPER_OPT_LOAD_EXPERT_MAPPING_INDEX = EnvBool(True)
+    # BOOTZEIT 5 (29.09., z30w-park): DefaultModelLoader.load_model builds and
+    # loads the model with the pre-load objects frozen (gc.freeze(), undone at
+    # the end; model_loader/load_gc.py). The presplit's per-layer full
+    # gc.collect() then walks only what the load created -- 1.5 ms instead of
+    # 0.26-0.29 s measured on the import graph alone (801522 objects); on the
+    # metal the fixed per-layer "repack" residual was 0.43 s (PP0, 29 layers)
+    # and 0.49 s (D TP0, 48). Everything the load allocates stays collectible.
+    # Only under expert offload (offload_active: the presplit and its collect
+    # exist); a dense load (27B) freezes nothing. One collect before the
+    # freeze, one after the unfreeze; the "BOOTZEIT5 LOAD-GC-FREEZE end" line
+    # names reclaim gc s/layer, the cgroup anon+shmem peak of the load and
+    # what the load-end collect freed. False = collect over the whole process.
+    FLLIPER_OPT_LOAD_GC_FREEZE = EnvBool(True)
+    # BOOTZEIT 5c (29.09., z30w-park): open the NEXT layer's expert-store
+    # files (tmpfs ftruncate + mmap + cudaHostRegister) on one background
+    # thread while this layer's shards are consumed, instead of inside the
+    # presplit on the loader thread (layers/moe/store_prefetch.py). store_open
+    # was 5.17 s on PP0 (29 x 4 files, 23.78 GiB), 2.90 s on D TP0 (48 x 4).
+    # Same files, same bytes; a prefetch whose geometry is not the one asked
+    # for is dropped. Off until the first metal series (then default on).
+    FLLIPER_OPT_LOAD_STORE_PREFETCH = EnvBool(False)
+    # BOOTZEIT 5d (29.09., z30w-park): the presplit's copy of a layer's [E]
+    # host stack to the card moves only the rows this rank READ
+    # (store_adopt.repack_rows -- all but the H2-vetoed; acts only where
+    # FLLIPER_MOE_REPACK_SKIP_VETOED is on and something was vetoed, i.e. group
+    # D). D TP0 read 29 of 201 rows per layer and copied all 201 (h2d 3.76 s).
+    # The unread rows arrive as zeros, and nobody on the card reads them
+    # (repack skips them, presplit neither keeps nor stores them). Every read
+    # row is byte-identical. False = the full copy.
+    FLLIPER_OPT_LOAD_H2D_READ_ROWS = EnvBool(True)
+    FLLIPER_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+
+    # HTTP server
+    # Decompress request bodies tagged with `x-body-compressed`.
+    FLLIPER_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
+    # Override parsed request fields from headers.
+    FLLIPER_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+
+    # Logging Options
+    FLLIPER_LOG_GC = EnvBool(False)
+    FLLIPER_LOG_FORWARD_ITERS = EnvBool(False)
+    FLLIPER_LOG_DECODE_GRAPH_KEY = EnvBool(False)
+    FLLIPER_LOG_MS = EnvBool(False)
+    # #540: what the Anthropic front sends downstream for output_config.effort
+    # == "xhigh". Default "xhigh" = pass the client's value through unchanged,
+    # which is what the Qwen3.8 family's chat template accepts ('xhigh',
+    # 'medium', 'low' -- anything else raises). Set to "max" to restore the
+    # pre-fix collapse for a deployment whose template names its top tier
+    # "max" instead; the collapse is then logged by name.
+    FLLIPER_ANTHROPIC_XHIGH_EFFORT = EnvStr("xhigh")
+    # Befund M (26.09., boots dkr27bnvfp4bar1agent09252328 / dkr27bbar1final09260145):
+    # Claude Code sends mid-conversation ``role: "system"`` messages
+    # (api_system: tool additions/removals, output_config). For a template
+    # without inline-system support the front HOISTS them into the head system
+    # turn, so the turn that first carries one re-renders every token behind
+    # the system text: D's radix walk and the arena key chain both stop at the
+    # end of the system turn (3.7-4.7k tokens), the match census reads
+    # ``MambaComponent:absent`` there, and the turn goes W31 -> P. On: render
+    # each NON-LEADING inline system message IN PLACE as a user turn wrapped in
+    # <system-reminder>, so a turn stays a token-prefix of the next one. Leading
+    # inline system messages (before any user/assistant turn) are still merged
+    # into the head -- that position is prefix-stable. Set it identically on
+    # P and D: the P->D handoff keys are P's tokenization of the same body.
+    # RG 26.09.: a registry field (pdflip/form.py PREFIX_SWITCHES,
+    # inline_system_in_place): qwen27b on, nextflash and no form off; the
+    # launcher refuses an --env-p/--env-d split.
+    FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE = EnvBool(
+        _profile_default("FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE", False))
+    FLLIPER_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
+    FLLIPER_LOG_REQUEST_HEADERS = EnvTuple(tuple())
+    FLLIPER_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
+    FLLIPER_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+
+    # IPC
+    FLLIPER_USE_PICKLE_IPC = EnvBool(True)
+    FLLIPER_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
+
+    # fLLiper CI
+    FLLIPER_IS_IN_CI = EnvBool(False)
+    FLLIPER_IS_IN_CI_AMD = EnvBool(False)
+    FLLIPER_CUDA_COREDUMP = EnvBool(False)
+    # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
+    # else /tmp); see debug_utils/cuda_coredump.py.
+    FLLIPER_CUDA_COREDUMP_DIR = EnvStr(None)
+    FLLIPER_TEST_MAX_RETRY = EnvInt(None)
+
+    # Constrained Decoding (Grammar)
+    FLLIPER_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
+    FLLIPER_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    FLLIPER_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
+
+    # Test & Debug
+    FLLIPER_DETECT_SLOW_RANK = EnvBool(False)
+    FLLIPER_TEST_STUCK_DETOKENIZER = EnvFloat(0)
+    FLLIPER_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
+    FLLIPER_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
+    FLLIPER_TEST_STUCK_TOKENIZER = EnvFloat(0)
+    FLLIPER_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
+    IS_H200 = EnvBool(False)
+    FLLIPER_SET_CPU_AFFINITY = EnvBool(False)
+    FLLIPER_ENABLE_CP_V2 = EnvBool(False)
+    FLLIPER_PROFILE_WITH_STACK = EnvBool(True)
+    FLLIPER_PROFILE_RECORD_SHAPES = EnvBool(True)
+    FLLIPER_PROFILE_V2 = EnvBool(False)
+    FLLIPER_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
+        False, deprecated_name="FLLIPER_ENABLE_NVTX"
+    )
+    FLLIPER_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
+        False, deprecated_name="FLLIPER_OPERATIONS_ENABLE_PROFILE"
+    )
+    FLLIPER_RECORD_STEP_TIME = EnvBool(False)
+    FLLIPER_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
+    FLLIPER_FORCE_SHUTDOWN = EnvBool(False)
+    FLLIPER_DEBUG_MEMORY_POOL = EnvBool(False)
+    # H13 (fnFL2x109, D-TP0 cgroup-OOM mid D-prefill, anon +7.4 GiB in 1 s):
+    # debug_utils/host_anon_probe.py. RssAnon of the rank at every decoder
+    # layer / MoE wave (fetch, apply) / Form A worker layer, and a sampler
+    # thread; a move of >= DELTA_MIB logs HOST-ANON-DELTA with the site (and,
+    # from the sampler, HOST-ANON-STACK per Python thread + HOST-ANON-VMAS),
+    # one HOST-ANON-PASS line per extend pass. SAMPLE_MS=0: no sampler thread.
+    FLLIPER_DEBUG_HOST_ANON_PROBE = EnvBool(False)
+    FLLIPER_DEBUG_HOST_ANON_PROBE_DELTA_MIB = EnvInt(256)
+    FLLIPER_DEBUG_HOST_ANON_PROBE_SAMPLE_MS = EnvInt(50)
+    # #790: the #767 mamba carry-without-copy instrument. Its log line sits on
+    # the prefill admission path (alloc <- alloc_for_extend <- prepare_for_
+    # extend <- get_new_batch_prefill), where a WARNING that fires on ordinary
+    # traffic is a cost every admission pays for a diagnosis nobody asked for.
+    # Off in production; the counters behind it keep incrementing either way.
+    FLLIPER_DEBUG_MAMBA_CARRY = EnvBool(False)
+    FLLIPER_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
+    FLLIPER_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
+    FLLIPER_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
+    FLLIPER_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
+    FLLIPER_DSPARK_STS_COLLECT_PATH = EnvStr("")
+    FLLIPER_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
+    FLLIPER_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
+    FLLIPER_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
+    FLLIPER_DSPARK_FAST_KERNEL = EnvBool(True)
+    FLLIPER_DSPARK_FP32_LM_HEAD = EnvBool(False)
+    FLLIPER_DSPARK_FAST_SAMPLING = EnvBool(True)
+    FLLIPER_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
+    FLLIPER_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
+    FLLIPER_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    FLLIPER_DEBUG_REVERT_PR = EnvInt(0)
+    FLLIPER_PHASE_CHECKER_DEBUG = EnvBool(False)
+    FLLIPER_TEST_REQUEST_TIME_STATS = EnvBool(False)
+    FLLIPER_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
+    FLLIPER_SIMULATE_ACC_LEN = EnvFloat(-1)
+    FLLIPER_SIMULATE_ACC_METHOD = EnvStr("match-expected")
+    FLLIPER_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
+    FLLIPER_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
+    FLLIPER_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
+    FLLIPER_TORCH_PROFILER_DIR = EnvStr("/tmp")
+    FLLIPER_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
+    FLLIPER_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
+    FLLIPER_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+    # Disable lazy compaction in the unified memory pool allocator and
+    # fall back to the per-free eager compaction. Used for production
+    # A/B and quick rollback. Default False (lazy compaction on).
+    FLLIPER_DISABLE_LAZY_COMPACTION = EnvBool(False)
+    # Sort the multi-ended allocator's free list after a merge (perf A/B knob).
+    FLLIPER_SORT_FREE_LIST_AFTER_MERGE = EnvBool(False)
+    # Periodically log lazy-compaction stats per sub-pool (observability only).
+    FLLIPER_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
+    FLLIPER_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
+    FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
+    FLLIPER_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
+
+    # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
+    # page tables (DP attn); paged backends like trtllm_mha consume it directly.
+    FLLIPER_USE_HND_KVCACHE = EnvBool(False)
+
+    # size the KV pool after CUDA-graph capture
+    FLLIPER_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+
+    # #552 env twin of --kv-session-offload-resume-under-spec: let a spilled
+    # session under speculative decoding wave back and rejoin the LIVE spec
+    # decode batch instead of finishing on host. Either source turning it on
+    # is enough (the flag ORs them), so a boot-matrix arm can arm it without
+    # rewriting its command line. The bare `KVSO_RESUME` spelling predates the
+    # flag and stays as a deprecated alias so existing arms and tickets keep
+    # working. Default OFF is a named decision -- see the flag's help text.
+    FLLIPER_KVSO_RESUME = EnvBoolWithAlias(False, deprecated_name="KVSO_RESUME")
+
+    # #330 --enable-vram-dial: physical commit chunk of the VMM-backed KV
+    # pool in MiB. Smaller chunks = finer dial-down release granularity but
+    # more driver handles (boot maps pool_bytes / chunk handles per rank).
+    FLLIPER_VRAM_DIAL_CHUNK_MIB = EnvInt(16)
+
+    # Measured KV-budget correction (two-boot convergence): after load +
+    # capture each rank measures its ACTUAL leftover GPU memory and persists
+    # `leftover - safety` per rank (config-fingerprinted cache); the next
+    # boot adds that correction to the heuristic KV budget, replacing the
+    # blind mem-fraction slack with a measured remainder. Fixed-point: once
+    # leftover ~= safety the correction stops moving.
+    FLLIPER_MEASURED_KV_BUDGET = EnvBool(False)
+    # Scalar MiB or a comma list with one value per TP rank (roles differ:
+    # the draft-solo host carries prompt-length-scaled serving transients).
+    FLLIPER_MEASURED_KV_BUDGET_SAFETY_MIB = EnvStr("400")
+    # #188: how many MiB of this rank's device share may be used by things
+    # outside its own allocator reservation (CUDA context, NCCL buffers)
+    # before the leftover measurement is reported as contaminated by a
+    # FOREIGN consumer -- e.g. a server from the previous boot that never
+    # exited, which silently shrinks the persisted correction. Raise this on
+    # a device that legitimately hosts a co-resident non-flliper consumer.
+    FLLIPER_MEASURED_KV_BUDGET_CTX_ALLOWANCE_MIB = EnvInt(1024)
+
+    # Scheduler: memory leak test
+    FLLIPER_TEST_RETRACT = EnvBool(False)
+    FLLIPER_TEST_RETRACT_INTERVAL = EnvInt(3)
+    FLLIPER_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
+    # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
+    FLLIPER_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
+    # --mamba-checkpoint-interval: how many of the deepest on-grid mamba
+    # checkpoints per radix path evict_mamba keeps live (best effort; a
+    # second eviction pass ignores the window when the pool must yield).
+    FLLIPER_MAMBA_CKPT_WINDOW = EnvInt(2)
+    # #904 (g)/(h): split `#cached-token: 0` into its three worlds --
+    # NOT_PRESENT (nothing stored: the write-side null #869b measured), DEAD
+    # (evicted, no host backup) and REFUSED (bytes reachable, a component
+    # validator declined them). Only the last two mean a row was loaded and
+    # then invalidated before it could be read. 0 = off, and the walk builds
+    # no census object at all; N = emit every Nth match, plus EVERY refusal.
+    FLLIPER_MATCH_REFUSAL_CENSUS_EVERY = EnvInt(0)
+    # --mamba-checkpoint-interval: resume only at the DEEPEST interval
+    # boundary of the full-KV match (else recompute from 0) instead of the
+    # deepest surviving on-grid checkpoint.
+    FLLIPER_MAMBA_CKPT_STRICT_RESUME = EnvBool(False)
+    # Upstream #31648 (opt-in here): on a unified-radix prefix hit refresh only
+    # the CONSUMED node's mamba state in the mamba LRU (not the whole matched
+    # chain), and leave the insert walk out of it. Changes which mamba states
+    # the tree tombstones first under pool pressure, so it stays off until an
+    # A/B boot has priced it against the fork's anchor/retention policy.
+    FLLIPER_MAMBA_LRU_REFRESH_USED_ONLY = EnvBool(False)
+    # PREFETCH ANCHOR ATTACH (NF y5a 30.09., pdflip-19-28): a store read whose
+    # span is already in the tree (a sibling's load put the KV on the device
+    # first) keeps the Mamba anchor it read -- attached to the existing node at
+    # the read's end when that node carries no state -- instead of releasing it
+    # (the node then matched KV to 43200 with no state: "#928 REFUSING").
+    FLLIPER_PDFLIP_PREFETCH_ANCHOR_ATTACH = EnvBool(True)
+    # ANCHOR-ONLY BACKUP (NF y5a 30.09., 16x PDFLIP-ANCHOR-LOST at=flush): a node
+    # whose KV is already backed (backuped / l3_present) but whose Mamba anchor
+    # lives on the device only gets the anchor alone copied D->H into the Mamba
+    # arena (no KV copy); the publish sweep skipped such nodes and the flush
+    # reset dropped the anchor.
+    FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP = EnvBool(True)
+    # Per-request mamba checkpoint diagnostics: log match length, resume
+    # length, checkpoint node/slot and cache-insert positions so a
+    # nondeterministic resume (or a checkpoint at a wrong position) can be
+    # attributed from server logs.
+    FLLIPER_MAMBA_CKPT_DEBUG = EnvBool(False)
+    # #581 mamba pin trace: emit one line per rank every N scheduler ticks
+    # with the transfer-queue depths, the outstanding write-through and
+    # load-back pin counts, the protected/evictable sizes, and the
+    # inc/dec_lock_ref traffic per call site since the previous line. 0 = off
+    # (default; the traced path is not entered at all).
+    FLLIPER_MAMBA_PIN_TRACE = EnvInt(0)
+    # #743 slot instrument: SUSTAINED lines per second for MAMBA-SLOT EVICT /
+    # TRUNCATED. Successful mamba slot eviction and mamba-caused prefix
+    # truncation were both silent, so slot pressure destroying reusable prefix
+    # could not be read from a boot log. Per-event while pressure is
+    # occasional; a SUPPRESSED rollup carrying the totals takes over above
+    # this rate. The bucket's CAPACITY is decoupled (8) so a burst inside one
+    # scheduler step is still reported in full. 0 turns the instrument off.
+    FLLIPER_MAMBA_SLOT_LOG_RATE = EnvFloat(2.0)
+    # Zero the attention KV data buffers on /flush_cache (default ON, set 0
+    # to opt out): a flushed server must match a fresh boot bit-for-bit even
+    # if some kernel folds residual bytes beyond the valid region into its
+    # result. Idle-time only, cost irrelevant.
+    FLLIPER_FLUSH_ZERO_KV = EnvBool(True)
+    # Debug lever: after /flush_cache's empty_cache, claim + zero + release
+    # the free device memory so allocator-recycled pages read as zeros like
+    # the first-touch pages of a fresh boot. Discriminates kernels that are
+    # sensitive to residual bytes in uninitialized activation scratch.
+    FLLIPER_FLUSH_SCRUB_FREE_MEMORY = EnvBool(False)
+    # Debug lever: fill pool DATA buffers (mamba states/intermediates/rings,
+    # MHA KV) with NaN at boot instead of zeros. Any kernel that reads pool
+    # bytes never written for the current request then surfaces as NaN
+    # output immediately, instead of a silent traffic-dependent divergence.
+    FLLIPER_POISON_POOL_DATA = EnvBool(False)
+    # Debug lever (#50 campaign): after every finished request, walk the
+    # process-persistent objects of the target/draft workers (model runners,
+    # attn backends, cuda-graph runners, spec workers) and log a sha256 per
+    # reachable tensor plus every plain int/float/bool attribute. Diffing the
+    # dumps of two identical requests pinpoints exactly which persistent
+    # state a request mutates (deterministic cross-request state evolution).
+    FLLIPER_SPEC_STATE_HASH = EnvBool(False)
+    # 0 = hash every tensor fully. >0 = tensors above this many MiB are
+    # fingerprinted from a strided sample instead (faster, still detects
+    # virtually any realistic mutation).
+    FLLIPER_SPEC_STATE_HASH_MAX_MB = EnvInt(0)
+    # Falsifier for stale-tail reads of persistent input buffers, eager AND
+    # graph replay: (a) the draft-extend graph runner fills the padded tail
+    # rows of its replayed input buffers with loud junk (token id 100 /
+    # hidden 1024.0) instead of the neutral zero reset; (b) the
+    # CudaGraphBufferRegistry poisons every slot-buffer element beyond the
+    # current iteration's raw region (floats NaN, uint8 0xFF, ints 100)
+    # before the semantic pad reset and head copy. If outputs differ from a
+    # clean boot, some kernel reads beyond the active region (a KEEP_PAD /
+    # FOREACH_COPY "tail is never read" claim is violated and the junk
+    # localizes it); bit-identical output exonerates the stale-tail class
+    # for the whole registry. Diagnostic boots only.
+    FLLIPER_POISON_GRAPH_PAD = EnvBool(False)
+    # Reset probe (#50 campaign, round 9): comma-separated families of
+    # process-persistent state to hard-reset after every finished request.
+    #   "flashinfer" — zero every tensor held by flashinfer/sgl_kernel
+    #                  wrapper objects (plan/workspace/kv_lens buffers);
+    #                  the next plan() must rebuild everything it consumes
+    #                  from the current batch alone.
+    #   "registry"   — zero every CudaGraphBufferRegistry slot buffer.
+    # If the request-ordinal-dependent output sequence flattens under a
+    # family, that family carries the cross-request state; if the sequence
+    # continues unchanged, the family is exonerated wholesale. Diagnostic
+    # boots only.
+    FLLIPER_SPEC_RESET_PROBE = EnvStr("")
+    # Bisection filter for the "flashinfer" reset-probe family: comma-
+    # separated fnmatch globs on wrapper ATTRIBUTE names; only matching
+    # tensors are zeroed (empty = all). Needed because in non-graph mode the
+    # wrappers' _qo_indptr_buf / _paged_kv_*_buf are REFERENCES to
+    # flliper-owned buffer slices (zeroing them perturbs more than wrapper
+    # state — kv_last_page_len is init-ones and never refilled). The
+    # wrapper-OWNED persistents are: _float_workspace_buffer,
+    # _int_workspace_buffer, _pin_memory_int_workspace_buffer,
+    # _kv_lens_buffer.
+    FLLIPER_SPEC_RESET_PROBE_FILTER = EnvStr("")
+    # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
+    FLLIPER_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
+    FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    # Physical KV-page checks: committed<=allocated + no page alias.
+    FLLIPER_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
+
+    # #788: seconds a confirmed ADMISSION-WEDGE (invariant_checker.py) must
+    # persist, on top of the report threshold, before the watchdog fires ONE
+    # forced-admission recovery attempt for that episode. See
+    # ADMISSION_WEDGE_RECOVERY_SECONDS in invariant_checker.py for the
+    # default's derivation and rationale.
+    # LS12 rest (30.09.): default = the published form's row (ModelProfile.admission_wedge_recovery_s,
+    # qwen27b 2.0 s); -1 (the 60 s default) without a form; an explicit value wins.
+    FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(
+        _profile_default("FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS", -1.0))
+
+    # deskq 1981 (f11 false alarms): the ADMISSION-WEDGE 'queue age' is the time since D's LAST FIRST TOKEN, not the
+    # age of the waiting request -- a long decode or an idle D makes the clock old before the request arrives, and
+    # the first poll that sees it alarms. 1 = (dual layout only, FLLIPER_PDFLIP_DUAL_LAYOUT=1) the age is
+    # min(that clock, time the waiting_queue has been non-empty as seen by the poll), and a new alarm window
+    # clears the recovery channel's stale last_outcome. 0 = off (default): the pre-fix verdict, byte for byte.
+    FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK = EnvBool(False)
+
+    # ---- WAECHTER-SCHALTER 06.10. (Nutzerentscheid): Schalter und Schwellen NUR fuer die Waechter, die die Gruppe oder den
+    # Prozess hart stoppen (plus die Alarme ADMISSION-WEDGE / PREFILL-LIVELOCK, die der Nutzer ausdruecklich nannte).
+    # Jeder Default ist das bisherige Verhalten byte-gleich: ungesetzt aendert sich nichts, kein Boot-Argv/Env ist betroffen.
+    # Ein Schalter auf 0 behaelt Erkennung, Logzeilen und Dumps und nimmt NUR den Stopp. NICHT Teil dieses Blocks, mit
+    # Absicht: WAIT_CAP_S (pdflip_store_told.py, Store-Read > 60 s, bleibt ein Fehler), der Deadman, die Request-Abbruch-Waechter
+    # (H102, W88, Client-Liveness, Intake-Stall) und der Scheduler-Exception-Pfad. Es gibt KEINEN 'stop'-Modus fuer reine Alarme.
+    # Gelesen ueber flliper.srt.guard_switches (nicht-positive Zahl = Default, unbekanntes Modus-Wort = Default, nie ein Raise).
+    # Die Namen (ENABLE_*_KILL/_STOP, *_STREAK, *_REFUSALS, FLIP_STALL_SLACK, ADMISSION_WEDGE_SECONDS, PREFILL_LIVELOCK_SECONDS)
+    # sind dieselben wie im NF-Baum (deskq 52, desk/nf-nf22-integ-1006 @ 220e3f8b70).
+    #
+    # Scheduler watchdog (WatchdogRaw, soft=False; --watchdog-timeout is its threshold): 1 = after the dump and 5 s,
+    # SIGQUIT to the parent process as before; 0 = the timeout is dumped and logged (as the soft watchdog does) and the
+    # process lives on.
+    FLLIPER_ENABLE_SCHEDULER_WATCHDOG_KILL = EnvBool(True)
+    # SubprocessWatchdog (engine.py): 1 = a scheduler/detokenizer child that exited non-zero makes the watchdog send
+    # SIGQUIT to its own process (whole server down) as before; 0 = every death is still reported, nothing is signalled.
+    FLLIPER_ENABLE_SUBPROCESS_WATCHDOG_KILL = EnvBool(True)
+    # Front W17 PdFlipGroupDead: 1 = a group whose /health failed for >= FLLIPER_PDFLIP_GROUP_DEAD_STREAK polls with a dead
+    # process (or a held rank) stops the front as before; 0 = the PDFLIP-HEALTH lines and the /health facts stay, the stop
+    # does not happen. Streak: consecutive failed polls before W17 may fire (minimum 1); it also drives the 503 of the
+    # front's own /health, so a raised streak does not make /health report a group dead that W17 still tolerates.
+    FLLIPER_PDFLIP_ENABLE_GROUP_DEAD_STOP = EnvBool(True)
+    FLLIPER_PDFLIP_GROUP_DEAD_STREAK = EnvInt(2)
+    # Front W2 PdFlipDrainStuck: 1 = this many W1 DrainRefused in a row stop the front as before; 0 = every W1 still refuses
+    # its flip and is logged, the stop never follows. Refusals: the "in a row" count (minimum 1).
+    FLLIPER_PDFLIP_ENABLE_DRAIN_STUCK_STOP = EnvBool(True)
+    FLLIPER_PDFLIP_DRAIN_STUCK_REFUSALS = EnvInt(3)
+    # Front CONTROLLER-DEAD (#1264): 1 = an exception that escapes an OPEN flip stops the front by name as before; 0 = the
+    # CONTROLLER-DEAD line and the traceback are written, the stop is not (the front then stays in 'flipping').
+    FLLIPER_PDFLIP_ENABLE_CONTROLLER_DEAD_STOP = EnvBool(True)
+    # Flip-stall detector (#1262 tier 3, feeds the deadman): a flip is named stalled after this many times the boot's last
+    # measured flip. Non-positive reads as the default 4.0.
+    FLLIPER_PDFLIP_FLIP_STALL_SLACK = EnvFloat(4.0)
+    # Seconds without a first token (ADMISSION-WEDGE alarm, #699; it feeds the wedge status file, the recovery and the
+    # intake-stall handover) and seconds without a decode round (PREFILL-LIVELOCK, Q-698b). Non-positive reads as the
+    # default 20.0. The ADMISSION-WEDGE poll follows the threshold (threshold / 2) once the threshold is set; unset it
+    # stays the 10 s it always was. The recovery threshold (FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS) stays its own value.
+    FLLIPER_ADMISSION_WEDGE_SECONDS = EnvFloat(20.0)
+    FLLIPER_PREFILL_LIVELOCK_SECONDS = EnvFloat(20.0)
+    # ADMISSION-WEDGE: act (default) = alarm line + status file + recovery driver (as before); log = alarm line + status,
+    # NO recovery attempt; off = the wedge watchdog thread does not start (no alarm, no status, no recovery; wedge_status
+    # reads 'no measurement'). Unknown word = act.
+    FLLIPER_ADMISSION_WEDGE_MODE = EnvStr("act")
+    # PREFILL-LIVELOCK (report only, never recovery): log (default) | off (no livelock verdict). Unknown word = log.
+    FLLIPER_PREFILL_LIVELOCK_MODE = EnvStr("log")
+    # Host-RAM guards of the front (user decision 06.10.): ON/OFF per guard, separately. on (default; on/1/true/yes) = the
+    # existing do_stop. off (off/0/false/no) = the guard no longer stops (the line stays, "NOT stopping") and the front
+    # start writes a loud WARNING "HOST GUARD W22/W98 AUS: Host-RAM ist nicht mehr geschuetzt". The thresholds
+    # (--host-riegel-gib, host_ledger mark) are untouched. A typo reads as on. W22 = HostWatermarkBreached (level),
+    # W98 = HostRateLatched (rate).
+    FLLIPER_PDFLIP_HOST_GUARD_W22 = EnvStr("on")
+    FLLIPER_PDFLIP_HOST_GUARD_W98 = EnvStr("on")
+
+    # #788: per-rank admission-verdict trace. OFF by default -- it exists to
+    # convert a MECHANISM proof into a captured value on one instrumented
+    # boot, not to run permanently. Under PP every rank re-derives the
+    # admission verdict locally, and a rank that declines forwards the request
+    # but can never send the proxy its downstream blocks on. This trace prints
+    # each rank's verdict and the host-side inputs behind it so a divergence
+    # is visible in one grep instead of a py-spy hunt. It logs ONLY host-side
+    # integers: no device tensor may reach a log argument here (see #790,
+    # where exactly that stringification synced inside logging.emit and wedged
+    # the scheduler for 25 minutes).
+    FLLIPER_PP_ADMISSION_TRACE = EnvBool(False)
+
+    # Load snapshot backend
+    FLLIPER_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
+
+    # Scheduler: new token ratio hyperparameters
+    FLLIPER_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
+    FLLIPER_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
+    FLLIPER_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
+    FLLIPER_RETRACT_DECODE_STEPS = EnvInt(20)
+    FLLIPER_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
+    # #273: how many times in a row a request may be the sole survivor of
+    # retract_decode and still not fit before it is failed instead of
+    # re-queued again. Ordinary extreme pressure (e.g. the #236/#242
+    # kv-session-offload spill budget running out) resolves within a couple
+    # of scheduler iterations; a request still solo-OOMing past this many
+    # retries is structurally too large for the pool, not merely contended.
+    FLLIPER_RETRACT_SOLO_OOM_MAX_RETRIES = EnvInt(8)
+
+    # Scheduler: recv interval
+    FLLIPER_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
+    FLLIPER_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE = EnvInt(1)
+    FLLIPER_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY = EnvInt(1)
+    FLLIPER_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
+
+    # PD Disaggregation (runtime)
+    # NOTE: For FLLIPER_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
+    # computed dynamically at runtime based on cpu_count; see disaggregation backends.
+    FLLIPER_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
+    FLLIPER_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    FLLIPER_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    FLLIPER_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
+    FLLIPER_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
+    FLLIPER_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    FLLIPER_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+    FLLIPER_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
+    FLLIPER_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    FLLIPER_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
+    FLLIPER_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    # #631a. Restores the pre-#631a behaviour: PD arms launched with a
+    # speculative algorithm auto-DISABLE it and warn, instead of refusing.
+    # The default is now the refusal, because the auto-disable is silent in
+    # the only way that matters -- a decode arm asked for NEXTN comes up
+    # without it and merely serves slower, which no smoke test catches. This
+    # escape hatch exists for shared launch configs that pass one flagset to
+    # both a PD and a non-PD server (the original design ruling's reason).
+    FLLIPER_PD_AUTO_DISABLE_SPEC = EnvBool(False)
+
+    # Scheduler: others:
+    # #547 idle blocking poll. Turns the scheduler's (and the DP controller's)
+    # true-idle busy spin into a blocking zmq poll with a stepped-up timeout,
+    # without requiring the `--sleep-on-idle` server arg. Off by default: the
+    # CPU win is proven hermetically, but the loaded-path A/B and the idle
+    # wattage still need a card window (see IdleSleeper for the ladder and the
+    # exact "loaded => unchanged" condition).
+    FLLIPER_IDLE_BLOCKING_POLL = EnvBool(False)
+    # in seconds. Set if you observe high memory accumulation over a long serving period.
+    FLLIPER_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
+    FLLIPER_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
+    # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
+    # already enabled regardless of this flag (see start_event_loop).
+    FLLIPER_ENABLE_WAR_BARRIER = EnvBool(False)
+    # #616 index-race guard (srt/debug_utils/index_race_guard.py). Sync-free,
+    # non-fatal bounds + stability instrumentation for the index tensors of the
+    # overlap / speculative-decode path. Default off; when off the guard costs a
+    # single module-level bool test per call site.
+    FLLIPER_INDEX_RACE_GUARD = EnvBool(False)
+    # Clamp offending values back into range instead of letting the kernel
+    # assert, so a run SURVIVES the first bad batch and keeps reporting.
+    # Diagnostic only -- output is not trustworthy on a round that reports a hit.
+    FLLIPER_INDEX_RACE_GUARD_CLAMP = EnvBool(False)
+    # Poll the guard counters every N scheduler iterations.
+    FLLIPER_INDEX_RACE_GUARD_POLL = EnvInt(1)
+    # Directory for the guard's durable per-rank counter dump. A rank that HANGS
+    # never reaches an exception handler and never logs again, so a log line is
+    # not a record for that failure mode -- a file is.
+    FLLIPER_INDEX_RACE_GUARD_DIR = EnvStr("")
+    # Force the overlap scheduler's WAR barrier onto its CONSERVATIVE form
+    # (full wait_stream on the forward stream) instead of the fast-path
+    # read-done event. #616 bisection arm: if the crash disappears with this
+    # set, the fast-path event is published before the forward's last read of
+    # the shared pool.
+    FLLIPER_WAR_BARRIER_FASTPATH = EnvBool(True)
+    # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
+    # since process_batch_result_prefill discards next_token_ids for those anyway.
+    FLLIPER_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # PP: log the stage-boundary traffic every N crossings (0 = off). Counts
+    # bytes and wall time at the two chokepoints every crossing passes through,
+    # which is the only way to put a number on a boundary that spans two hosts.
+    FLLIPER_PP_BOUNDARY_STATS = EnvInt(0)
+
+    # PP: how many CONSECUTIVE passes a non-first rank may void because its
+    # upstream launched nothing, while still deriving a batch of its own, before
+    # the loop is refused by name (#801-spin; 0 or less disables the refusal).
+    # A voided pass runs no forward, so a streak is time in which this rank
+    # cannot have served anybody: specimen boot_802f_staged1_0822_1716 spun
+    # 2353 of them in five seconds. 512 is roughly one second of that spin and
+    # two orders of magnitude above any burst this corpus has measured.
+    FLLIPER_PP_IDLE_VOID_STREAK_BOUND = EnvInt(512)
+    #: #926: cadence gate for the at-arm pool census. The census walks the pool
+    #: and the KV row-ownership map, which was affordable when an arm was rare;
+    #: the 0827 window measured 69 cutovers in five minutes and one boot died
+    #: in a CPU spin on this frame. Either admission opens the gate; setting
+    #: BOTH to 0 restores the unconditional pre-#926 behaviour.
+    FLLIPER_PP_ARM_CENSUS_EVERY_N = EnvInt(16)
+    FLLIPER_PP_ARM_CENSUS_MIN_INTERVAL_S = EnvFloat(30.0)
+
+    # PP: how long an UNDECLARED tensor-dict kind may hold the phase flip's
+    # presence gate before it is retired loudly (#800). Deliberately shorter
+    # than the flip's 60 s presence deadline: an escape that expires after the
+    # abandonment it exists to prevent is decoration, not an actuator. Kinds
+    # with a declared disposition are unaffected -- see pp_stash_disposition.
+    FLLIPER_PP_STASH_ESCAPE_S = EnvFloat(20.0)
+    # #1059: apply PP0's uniform pass geometry instead of each rank's own
+    # HiCache-derived width. Ships OFF, per #947's precedent -- an unset env is
+    # byte-identical to the pre-#1059 tree, and the boot that turns it on is
+    # the one that proves it. The producer, the pin and the MIN run either way,
+    # so the reports are measurable before the apply is trusted.
+    # PP: how long the presence gate may keep waiting once EVERY clause of its
+    # withhold reason is one no armed service turn can clear (#850). The gate
+    # holds four actuators; a reason outside all four cannot change while the
+    # rank is in the gate, so the outcome after the full 60 s presence deadline
+    # is identical to the outcome available in the first round -- the wait just
+    # costs the whole group 60 s of serving. Shortened, not removed: a small
+    # bound keeps the existing withdrawal protocol (may_withdraw, the race
+    # re-check, _abandon_no_quorum) doing the abandoning, unchanged. Set to 0
+    # to disable and fall back to the full presence deadline -- the off-switch
+    # a guard needs to be provable in both directions.
+    FLLIPER_PP_PRESENCE_FUTILE_S = EnvFloat(2.0)
+    # #201 slice 3: cache the pickled tensor-dict METADATA at the pipeline
+    # stage boundary. At bs=1 the gloo-pickled metadata costs MORE than the
+    # hidden-state payload itself (measured slice 2: 249 us vs 142 us
+    # one-way), and the shapes are static per batch geometry -- so a repeat
+    # crossing sends a 16-byte reference instead of size+pickle. Mirrored
+    # sender/receiver caches stay in lockstep over the FIFO p2p channel.
+    # Off by default (byte-identical wire protocol unless set).
+    FLLIPER_PP_SHAPE_CACHE = EnvBool(False)
+    FLLIPER_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
+    FLLIPER_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    FLLIPER_RADIX_FORCE_MISS = EnvBool(False)
+    FLLIPER_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    FLLIPER_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+    FLLIPER_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
+    FLLIPER_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
+    FLLIPER_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
+    FLLIPER_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
+    FLLIPER_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
+    FLLIPER_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
+    FLLIPER_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    FLLIPER_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    FLLIPER_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
+    # Decode batches between SWA out-of-window evictions.
+    FLLIPER_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # For non-streaming requests, the scheduler still flushes intermediate
+    # output batches to the tokenizer manager every N decoded tokens so that
+    # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
+    # an accurate TTFT for benchmarking; the upstream default of 50 trades
+    # off some TTFT-metric accuracy for less IPC overhead.
+    FLLIPER_FORCE_STREAM_INTERVAL = EnvInt(50)
+
+    # Test: pd-disaggregation
+    FLLIPER_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
+    FLLIPER_TEST_PD_DISAGG_DEVICES = EnvStr(None)
+    FLLIPER_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
+
+    FLLIPER_TEST_SCRIPTED_RUNTIME = EnvBool(False)
+    FLLIPER_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
+    FLLIPER_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH = EnvStr(None)
+    FLLIPER_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY = EnvStr(None)
+
+    # Model Parallel
+    FLLIPER_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    FLLIPER_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
+    # Uneven TP: per-family weight vectors ("a,b,c", one positive integer
+    # per TP rank). Take precedence over --rank-mlp-ratio /
+    # --rank-moe-ratio when both are set. Emitted by the KV-pool
+    # self-calibration as a restart hint. MLP = dense-MLP/shared-expert
+    # family, MOE = fused expert-weight family.
+    FLLIPER_UNEVEN_MLP_VECTOR = EnvStr(None)
+    FLLIPER_UNEVEN_MOE_VECTOR = EnvStr(None)
+    # WP3a: shard MoE experts by INDEX (whole experts per rank, pad expert at
+    # local 0) under an uneven plan for non-GGUF quant paths too.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_UNEVEN_MOE_EXPERT_SHARD = EnvBool(False)
+    # WP8 expert lookahead (slotstream +11 % decode): a MoE block runs the
+    # router of the block N steps AHEAD on its own stream and that block's
+    # offload cache prefetches the predicted spill experts while the current
+    # block computes. 0 = off (default, byte-identical path); 1 or 2 = distance.
+    FLLIPER_MOE_EXPERT_LOOKAHEAD = EnvInt(0)
+    # Ratio-weighted vocab sharding vector ("a,b,c", one positive integer
+    # per rank) for VocabParallelEmbedding/ParallelLMHead; overrides
+    # --rank-vocab-ratio when both are set. Unlike MLP/MOE this family
+    # NEVER falls back to the base --rank-tp-ratio plan -- without a
+    # vector, vocab sharding stays even (the classic layout).
+    FLLIPER_UNEVEN_VOCAB_VECTOR = EnvStr(None)
+    # Uneven DCP token-axis split vector ("a,b,c", one positive integer per
+    # DCP rank). Overrides the budget-estimate vector resolve_cp_token_ratios
+    # would otherwise derive. Emitted by the KV-pool self-calibration as a
+    # restart hint (measured optimal from the actual per-rank profiled token
+    # capacity); feeding it back on the next boot converges the per-rank KV
+    # pools to the profiled optimum. Model-type-agnostic (keys off measured
+    # capacity, which is dtype-independent).
+    FLLIPER_UNEVEN_TOKEN_VECTOR = EnvStr(None)
+    # #797: "pin" (the vector is an assertion) or "seed" (an estimate the
+    # measured optimum may supersede in-process). Unset reads as "pin", so a
+    # process that never sets it behaves exactly as before.
+    FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE = EnvStr(None)
+    # #797: where the token vector came from -- the investigation, task id or
+    # tool that produced it ("#602", "planner", "measured"). An ACTIVE vector
+    # whose provenance names a RETRACTED investigation is refused at boot
+    # (planner/retracted.py). Unset falls back to matching the vector's VALUE
+    # against the values each retraction recorded, which is what catches a
+    # retracted vector nobody declared a lineage for.
+    FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE = EnvStr(None)
+    # Log one per-rank residency census line once everything permanent is
+    # resident (planner/residency_census.py). Read-only instrument for
+    # calibrating the #485 cut gate against exclusively-owned, measured bytes
+    # instead of a fit; unset, the boot is byte-identical.
+    FLLIPER_RESIDENCY_CENSUS = EnvBool(False)
+    # Directory the census also writes itself to as JSON, one file per rank.
+    # A later boot points --pp-solve-cut at it to solve the layer cut against
+    # these measured bytes. Requires FLLIPER_RESIDENCY_CENSUS.
+    FLLIPER_RESIDENCY_CENSUS_DIR = EnvStr(None)
+    # Override the location of the MEASURED card-rate library (#584) that
+    # --pp-solve-cut prices its stages from. Unset, the pass and the solver
+    # agree on ~/.cache/flliper/card_library.json, beside the #213 card probe
+    # the rates are projected from. Set it to point a boot at an artifact
+    # measured elsewhere -- the rates are keyed by card UUID, so an artifact
+    # from another rig is visibly not this rig's.
+    FLLIPER_CARD_LIBRARY = EnvStr(None)
+    # Override the location of the PER-STAGE measurement canon (#584 second
+    # half) that the #363 stage table promotes solved candidates from: the
+    # measured gain over the reference stage, the band that gain was taken
+    # against, and the instrumented flip cost. Unset, the store sits beside
+    # the card library above, and its EXISTENCE is the gate -- no file means
+    # the pre-#584 path, where an unmeasured candidate refuses the table by
+    # name. Records are keyed by the sorted card-UUID set plus the checkpoint,
+    # so a record from another rig or another model is refused rather than
+    # borrowed. Written by planner/stage_measure_pass.py.
+    FLLIPER_STAGE_MEASUREMENTS = EnvStr(None)
+    # Record, per rank, the driver-visible free-memory MINIMUM reached in each
+    # load state the rank actually serves (planner/transient_census.py), and
+    # write it beside the residency census. The #485 cut gate funds the WORST
+    # measured state, because a transient measured under one load state does
+    # not transfer to another -- a scalar measured at a prefill trigger
+    # admitted cuts that broke the corridor under a mixed soak, twice. Uses
+    # FLLIPER_RESIDENCY_CENSUS_DIR for its output. Unset: byte-identical.
+    FLLIPER_TRANSIENT_CENSUS = EnvBool(False)
+    # Sample one batch in this many for the transient census above.
+    FLLIPER_TRANSIENT_CENSUS_STRIDE = EnvInt(8)
+    # Force a fresh stage-0 hardware micro-probe for --rank-tp-ratio
+    # auto-performance, ignoring the cached profile under ~/.cache/flliper.
+    FLLIPER_PERF_REPROBE = EnvBool(False)
+    # Wall-clock cap (seconds) on the WHOLE stage-0 probe subprocess.
+    FLLIPER_PERF_PROBE_TIMEOUT_S = EnvFloat(600.0)
+    # Wall-clock cap (seconds) on the NETWORK phase of the stage-0 probe (the
+    # pairwise NCCL link matrix). The phase joins a process group, so it is
+    # the one part of the probe that can wait on something other than this
+    # rig's own hardware; without a cap it inherits torch's 600 s default
+    # process-group timeout and charges it to every boot. On expiry the probe
+    # keeps the per-card measurements, stores the reason next to the empty
+    # link table, and returns.
+    FLLIPER_PERF_PROBE_LINK_TIMEOUT_S = EnvFloat(45.0)
+    # Skip the link matrix entirely (per-card measurements only).
+    FLLIPER_PERF_PROBE_SKIP_LINKS = EnvBool(False)
+    # Refit seam for the parse-time cost model (uneven_perf.PerfCalibration).
+    # The stage-0 probe MEASURES per-card GEMM/membw/GEMV rates on every
+    # machine; the four scalars below are the model's FITTED/ASSUMED
+    # constants, fitted on the reference rig only. On other hardware they are
+    # a hypothesis — refit them there (recipe in the PerfCalibration
+    # docstring) and set the result here instead of editing code. Unset
+    # (None) keeps the shipped reference-rig values.
+    FLLIPER_PERF_DECODE_GEMV_RESIDUAL_EXP = EnvFloat(None)
+    FLLIPER_PERF_DECODE_PEAK_COMPRESSION_EXP = EnvFloat(None)
+    FLLIPER_PERF_DECODE_NONWEIGHT_FRACTION = EnvFloat(None)
+    FLLIPER_PERF_PREFILL_INVARIANT_FRACTION = EnvFloat(None)
+    # Override seam for #330's absolutely-free VRAM corridor (MiB per card)
+    # as the PLANNER prices it in the fundability gate. Not a measurement and
+    # not rig-fitted: it is the policy "a boot must leave this much
+    # unallocated on every card". The single definition is
+    # registry.ledger.DEFAULT_CORRIDOR_BYTES (400 MiB, #330), which the ledger
+    # daemon exposes as --corridor-mib; unset (None) reads that one.
+    FLLIPER_PLANNER_CORRIDOR_MIB = EnvInt(None)
+
+    # --- barlink: vendor-neutral host-staged collectives (task #117) ---------
+    # Route this group's TP collectives over barlink instead of NCCL. Needed
+    # when a TP group spans GPUs with no common device collective library
+    # (mixed NVIDIA + AMD); also forceable on a homogeneous group, where it
+    # exercises the identical code path (on P2P-less consumer cards NCCL
+    # already stages through the host, so the data movement is the same).
+    # OFF by default -- with this unset the dispatch is byte-identical to
+    # stock flliper.
+    #
+    # RANK-UNIFORMITY: every FLLIPER_BARLINK* variable below MUST be set to the
+    # same value on every rank of the group. Divergence does not produce a
+    # wrong answer, it deadlocks -- the transports agree on a per-chunk flag
+    # protocol, and a rank that took a different branch never publishes the
+    # flag its peers spin on.
+    FLLIPER_BARLINK = EnvBool(False)
+    # Data plane: "device" (GPU-driven DMA + spin kernels, CUDA-graph
+    # capturable), "host" (GPU-driven zero-copy over ONE pinned, portable
+    # host segment -- two kernels per op, no host sync, also capturable),
+    # "shm" (CPU-orchestrated pinned staging), "gloo" (TCP, also multi-node)
+    # or "ucx" (RDMA, multi-node; same host-staged semantics as gloo). The
+    # CPU transports synchronize with the host and therefore require
+    # --disable-cuda-graph.
+    FLLIPER_BARLINK_TRANSPORT = EnvStr("device")
+    # #732 per-peer transport override, for A/B against the default per-link
+    # policy (NCCL on fast edges where BAR1 is measured to lose, BAR1 on x4
+    # edges where it wins). Comma separated, keys are RANKS -- never CUDA
+    # ordinals: "all=nccl_sendrecv", "0>1=bar1_p2p", or both, with an explicit
+    # pair beating "all". Unset -> the default policy, which on a tree without
+    # a BAR1 p2p kernel degrades every BAR1 edge to NCCL and says so loudly.
+    # Forcing bar1_p2p while that kernel is absent REFUSES rather than
+    # degrading: a silent fallback would answer a different A/B than the one
+    # asked. See barlink_peer_transport.py.
+    FLLIPER_BARLINK_PEER_MAP = EnvStr(None)
+    # #279 path dispatcher (skeleton): size/load-aware path choice with
+    # saturation overflow. Default off; even when on, decisions fall back to
+    # the status-quo #240 class choice until measured rate tables are loaded
+    # (placeholder neutrality), so enabling it is byte-identical today.
+    FLLIPER_BARLINK_PATH_DISPATCHER = EnvBool(False)
+    # Per-rank shared-memory slot size (MiB) for payload staging.
+    FLLIPER_BARLINK_SLOT_MIB = EnvInt(64)
+    # Chunk size (MiB) of the gloo data-plane pipeline.
+    FLLIPER_BARLINK_CHUNK_MIB = EnvInt(8)
+    # #1234 -- what happens when the configured transport does not cover a
+    # message class at its size: "warn" (log once per operation and size
+    # class, answer on the inline host-staged gloo plane) or "refuse" (stop
+    # the group). Published by --barlink-uncovered-class and read ONCE per
+    # communicator at build time, so it is rank-uniform by construction.
+    # "warn" stays the library default: a default that aborts on a new
+    # operating point can brick a boot, and with the derived round bound a
+    # fallback now only happens where bar1 genuinely would be slower.
+    FLLIPER_BARLINK_UNCOVERED_CLASS = EnvStr("warn")
+    # Chunk size (MiB) of the device transport's dual-stream pipeline.
+    # Unset -> calibrated at startup (a collective sweep; see the
+    # rank-uniformity note above -- set it on all ranks or on none).
+    FLLIPER_BARLINK_PIPE_CHUNK_MIB = EnvStr(None)
+    # Upcast half dtypes to fp32 for the gloo-plane reduction, to match
+    # NCCL numerics.
+    FLLIPER_BARLINK_FP32_REDUCE = EnvBool(True)
+    # RS+AG chunk-ownership weights for world >= 3 ("a,b,c", one positive
+    # integer per rank). Unset -> measured from per-rank slot DMA bandwidth
+    # at startup, so a slow PCIe link owns fewer reduce-scatter chunks.
+    FLLIPER_BARLINK_RSAG_SHARES = EnvStr(None)
+    # --- host transport (pinned portable host memory, GPU-driven) ----------
+    # Per-rank staging slot (MiB). Unset -> inherit FLLIPER_BARLINK_SLOT_MIB, so
+    # there is one knob for the common case and a second only when the host
+    # transport should differ. The segment holds TWO slots per rank (the
+    # double buffering that removes a third kernel from every collective),
+    # so it costs 2 x world x this.
+    FLLIPER_BARLINK_HOST_SLOT_MIB = EnvStr(None)
+    # Per-ordered-pair send/recv buffer (MiB), also double-buffered. 0
+    # disables point-to-point, and the transport then DECLINES send/recv in
+    # handles() rather than discovering the missing buffer later.
+    FLLIPER_BARLINK_HOST_P2P_MIB = EnvInt(4)
+    # Grid width of the host transport's two data kernels. Its payloads are
+    # latency-bound; more blocks buy nothing below ~1 MiB and cost tail
+    # latency. Rank-uniform like every knob in this block.
+    FLLIPER_BARLINK_HOST_BLOCKS = EnvInt(32)
+    # --- ucx transport (RDMA data plane) -----------------------------------
+    # Which libucp to load. Unset -> the system "libucp.so.0". Point this at a
+    # side-by-side install to satisfy the transport's version-parity check
+    # when the hosts ship different UCX releases, e.g.
+    # "/opt/ucx116/lib/libucp.so.0"; libucs/libuct are pre-loaded from the
+    # same directory, so LD_LIBRARY_PATH is not additionally needed.
+    # Mixed releases are REJECTED at rendezvous -- UCX's UCP wire address
+    # format is not compatible across them and fails as "invalid bandwidth
+    # 0.00".
+    FLLIPER_BARLINK_UCX_LIB = EnvStr(None)
+    # Largest single UCX transfer (MiB). Chunks of one collective step are
+    # posted and progressed together, so this caps per-request footprint
+    # without costing extra round trips.
+    FLLIPER_BARLINK_UCX_CHUNK_MIB = EnvInt(4)
+    # all_reduce payload (KiB) at or above which the one-step flat exchange
+    # gives way to a ring. Below it latency beats bandwidth; above it the
+    # flat exchange's (W-1) payloads per direction dominate. Measured
+    # crossover on a cross-rig world-4 group is ~22 KiB (task #244), so a
+    # speculative verify all-reduce sits on the ring side and a bs=1 decode
+    # all-reduce on the flat side.
+    FLLIPER_BARLINK_UCX_RING_KIB = EnvInt(24)
+    # Deprecated MiB spelling of the same threshold; still honoured, and it
+    # wins when both are set.
+    FLLIPER_BARLINK_UCX_RING_MIB = EnvInt(None)
+    # Same switch for all_gather (KiB); 0 disables the ring entirely. This
+    # ring saves no bytes -- the flat exchange already moves the (W-1) * n
+    # every rank must receive, in one round trip -- but it saves the single
+    # UCX worker per rank from progressing 2(W-1) simultaneous requests.
+    # Measured crossover cross-rig at world 4 is ~32 KiB (task #263), so a
+    # bs=1 decode gather stays flat and a 4-token verify gather rings.
+    FLLIPER_BARLINK_UCX_AG_RING_KIB = EnvInt(32)
+    # Largest host-side pass in elements that stays on the calling thread;
+    # above it torch dispatches a CPU->CPU copy_/add_ through at::parallel_for.
+    # Co-located TP ranks enter their host passes together, so the OpenMP
+    # region's join lands on a descheduled thread and the 128 -> 256 KiB step
+    # cost milliseconds (task #263). 0 restores the unchunked passes.
+    FLLIPER_BARLINK_UCX_GRAIN_ELEMS = EnvInt(32768)
+    # Seconds before a pending UCX request is declared stuck. Guards against
+    # a silent hang when a peer dies or the ranks disagree about the
+    # collective sequence.
+    FLLIPER_BARLINK_UCX_TIMEOUT_S = EnvInt(300)
+    # Overlap the MLP all-reduce with the layer boundary: issue it
+    # asynchronously at down_proj, complete it in the next layer's
+    # prepare_attn (rides the fuse_mlp_allreduce seam). Requires the ucx
+    # transport; rank-uniform like every other flag in this block.
+    FLLIPER_BARLINK_UCX_OVERLAP = EnvBool(False)
+    # Token-slice pipelining of the TP all-reduce (task #588). Splits a
+    # row-parallel layer's token axis so slice i's transfer occupies the wire
+    # during slice i+1's GEMM. Eager prefill only; the saving is bounded by
+    # the layer's own GEMM time, never by the transfer term. Off by default:
+    # when unset, RowParallelLinear.forward reads this bool and nothing else
+    # changes. RANK-UNIFORM, like every flag in this block -- the slice count
+    # is part of the collective sequence, so ranks that disagree deadlock.
+    FLLIPER_TP_AR_PIPELINE = EnvBool(False)
+    # Upper bound on the slice count. Caps the K*latency term that grows with
+    # K and bounds the extra launch traffic per layer.
+    FLLIPER_TP_AR_PIPELINE_MAX_SLICES = EnvInt(8)
+    # Below this token count a forward stays unsliced. Keeps decode (and any
+    # short extend) on the untouched path, where there is no transfer to hide
+    # anything behind.
+    FLLIPER_TP_AR_PIPELINE_MIN_TOKENS = EnvInt(256)
+    # Force a fixed slice count instead of deriving it from the measured cost
+    # model. 0 = derive. For A/B arms that need K held constant, not for
+    # production tuning.
+    FLLIPER_TP_AR_PIPELINE_SLICES = EnvInt(0)
+    # Deferred join (task #597). Issues a layer's all-reduce on the comm
+    # stream at the site that already owned it and joins at the first
+    # consumer, so the transfer runs under everything in between. Independent
+    # of FLLIPER_TP_AR_PIPELINE: that one hides a collective under the
+    # producing GEMM, this one under the issue-to-join window. Window 8
+    # showed the production model's dominant all-reduce is the MoE layer's
+    # own reduce, which the in-call hook never sees. RANK-UNIFORM.
+    FLLIPER_TP_AR_PIPELINE_DEFERRED = EnvBool(False)
+    # Minimum token count for the deferred issue. Below it the collective is
+    # too small for the handle bookkeeping to pay for itself.
+    FLLIPER_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS = EnvInt(256)
+    # Number of independent UCX contexts/workers per rank for the collective
+    # plane (task #266). 2 splits the flat exchange's peers over the two
+    # workers by the symmetric (rank + peer) % ways rule, so no rank has all
+    # 2(W-1) requests of a decode collective on one progress engine. Measured
+    # cross-rig at world 4: -7.6 % all_reduce and -8.1 % all_gather at the
+    # 20 KiB bs=1 decode size, neutral (within noise) at every ring size.
+    # Default 1 -- the transport also runs single-host over loopback/shm,
+    # where a second context has no peers to spread. RANK-UNIFORM and more
+    # strictly so than most: a rank that disagrees posts where nobody is
+    # listening, which hangs rather than returning a wrong answer. Checked at
+    # rendezvous before any endpoint exists.
+    FLLIPER_BARLINK_UCX_WORKERS = EnvInt(1)
+    # Additionally run the RING half each way round, one direction per worker
+    # (needs ..._WORKERS >= 2). Measured negative on this link -- a ring step
+    # is two requests in lock step, so there is no concurrency for a second
+    # worker to expose, and halving the bytes per hop buys nothing where the
+    # bytes were never the cost (task #244). +17 % on an 80 KiB all_reduce.
+    # Kept as the A/B control and for links where the bytes DO dominate.
+    FLLIPER_BARLINK_UCX_RING_BIDIR = EnvBool(False)
+    # --- peer liveness for the collective family (task #312) ---------------
+    # A rank that dies leaves its peers spinning: the gloo cpu_group every
+    # barlink handshake runs on is built with a hardcoded 7200 s timeout, and
+    # the BAR1 spin kernels carry only a rank-local cycle deadline whose
+    # expiry writes a status word nothing reads. These four knobs bound both
+    # sides. 0 restores the previous, unbounded behaviour exactly.
+    #
+    # Rank-uniform like the rest of this block, and more strictly so than
+    # most: the deadline decides WHEN a rank gives up, and ranks that give up
+    # minutes apart turn one clean group failure into a cascade.
+    FLLIPER_BARLINK_PEER_LIVENESS = EnvBool(True)
+    # Seconds a host-side wait may make no progress before it gives up. Scaled
+    # by FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT while the cold-build window is
+    # open, so a first boot on an empty kernel cache does not trip it.
+    FLLIPER_BARLINK_PEER_TIMEOUT_S = EnvFloat(120.0)
+    # How often a stalled wait, and the watchdog thread, may ask whether the
+    # peer processes still exist. One kill(pid, 0) per peer, ~1 us.
+    FLLIPER_BARLINK_PEER_PROBE_S = EnvFloat(1.0)
+    # Whether the watchdog thread runs. It is what ends a DEVICE-side spin:
+    # no host code runs inside a captured graph replay, so somebody outside
+    # the collective has to write the abort word the kernels poll.
+    FLLIPER_BARLINK_PEER_WATCHDOG = EnvBool(True)
+
+    # --- per-message-class link selection (task #240) ----------------------
+    # Env spelling of --collective-net-small / --collective-net-bulk. Set
+    # either directly or let server-args resolution export it; the flag and
+    # the variable carry the same value, and a value already present in the
+    # environment is never overwritten.
+    #
+    # NOT rank-uniform, unlike the FLLIPER_BARLINK* block above: the value is a
+    # local device NAME, and the two ends of a link are normally called
+    # different things (rocep4s0f1 on one host, rocep1s0f1 on the other).
+    # What must match is the wire, not the string.
+    #
+    # SMALL pins the barlink UCX collective context (small AND large TP
+    # collectives -- they share one context, see barlink_ucx.py), BULK reaches
+    # the transfers that have a transport of their own: PD-KV / HiCache, by
+    # seeding --disaggregation-ib-device when that is unset. On a host with
+    # one line both are pointless; the payoff is a host with two, where a
+    # FEC-free link wins on small-message latency while a wider one wins on
+    # bulk bandwidth.
+    FLLIPER_COLLECTIVE_NET_SMALL = EnvStr(None)
+    FLLIPER_COLLECTIVE_NET_BULK = EnvStr(None)
+    # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
+    FLLIPER_RAY_BUNDLE_INDICES = EnvStr("")
+    # Override the distributed init method used by torch.distributed.init_process_group.
+    # Set to "env://" to use an externally-created TCPStore via MASTER_ADDR/MASTER_PORT.
+    FLLIPER_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
+    FLLIPER_TCP_STORE_PORT = EnvInt(29600)
+
+    # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
+    # When set, get_open_port() and shm_broadcast search upwards from this
+    # value instead of asking the OS for a random port.  Useful to keep all
+    # fLLiper ports in a predictable range behind a firewall.
+    FLLIPER_PORT = EnvInt(None)
+
+    # Tool Calling
+    FLLIPER_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+
+    # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
+    # (kept as-is, not renamed to FLLIPER_*); the FLLIPER_EXA_* knobs tune the
+    # request defaults for the built-in GPT-OSS web_search tool.
+    EXA_API_KEY = EnvStr(None)
+    FLLIPER_EXA_NUM_RESULTS = EnvInt(10)
+    FLLIPER_EXA_SEARCH_TYPE = EnvStr("auto")
+    FLLIPER_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
+
+    # Hi-Cache
+    # Deadline (seconds) for the per-step HiCache control collectives. The gloo
+    # cpu_group they run on defaults to a two-hour timeout, so a rank whose peer
+    # died of OOM would otherwise sit in all_reduce for hours; on expiry the
+    # surviving rank raises HiCacheCollectiveTimeoutError instead. <= 0 restores
+    # the unbounded blocking wait.
+    FLLIPER_HICACHE_COLLECTIVE_TIMEOUT_S = EnvFloat(600.0)
+    # H62 (NF D rounds): cadence of the #939 retired-prefetch agreement
+    # (UnifiedRadixCache.drain_retired_prefetch, one gloo MIN all_reduce per
+    # scheduler iteration on a multi-rank attention group, outside
+    # check_hicache_events). 1 = every round (unchanged); N > 1 = every round
+    # while any rank names a retired record, every N-th round while none does.
+    FLLIPER_HICACHE_RETIRED_AGREE_EVERY = EnvInt(1)
+    # #410: the pin budget, 0 = unbounded. Read once when the store builds
+    # its PinLedger; a checkpoint that would cross it is refused by name.
+    FLLIPER_HICACHE_PIN_BUDGET_BYTES = EnvInt(0)
+    FLLIPER_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
+    FLLIPER_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
+    FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
+    # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
+    FLLIPER_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
+    FLLIPER_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
+    # 29.09. (27B S1 dkr27browauthoritynopinbar1fs09291638, flip 13->14 7,05 s): the L3 cap eviction ran INSIDE
+    # reserve() on the backup thread -- one run from the cap down to cap x ratio (6.3 GB, ~170k unlinks, 4.8 s) --
+    # and the sleep flush's #1068 RESET JOIN waited for it. On: reserve() evicts only what ITS write needs, and a
+    # background thread "l3_evictor" (never in the RESET JOIN set) brings the directory down to cap x ratio in
+    # short lock-held batches, woken once the directory passes the midpoint between ratio and the cap.
+    # Default ON since the metal proof (29.09. 27B dkr27browauthorityl3cap10bar1fs09292016, cap 10 GB: 22 background
+    # runs ~1 s each off the reset-joined threads, 23 flips interleave max 2.34 s, needle MATCH; user order: a
+    # proven performance switch is default on). Off: byte-identical old path, the whole run stays in reserve().
+    FLLIPER_HICACHE_FILE_BACKEND_EVICT_OFFPATH = EnvBool(True)
+    # 30.09. (NF y3u 5bedac26f1, pdflip-0-5): the L3 LRU evicted the QSA index page of a KV page alone -- D's owner
+    # unlinked 8 `{h}.qsa_indexer` files at 00:35:43 whose KV pages stayed on disk (index order: QSA 21:41:25, KV
+    # 00:10:24), so D's resume and P's reroute both capped at 47 of 1996 pages and P re-prefilled 127813 tokens.
+    # On: the QSA index page of a KV page that is on disk is never the victim; it leaves together with its KV page.
+    # Off: byte-identical old path (every file its own LRU entry).
+    FLLIPER_HICACHE_L3_SIDECAR_PAIR_EVICT = EnvBool(True)
+    FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
+    # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
+    FLLIPER_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
+    # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
+    FLLIPER_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
+    # #706: age at which an orphaned canonical partial page/blob (.part706 and
+    # its .slots706 marker) is reaped at attach. Must stay comfortably longer
+    # than the time all writers of one page need, or a live partial is reaped
+    # from under a stage that is still filling it.
+    FLLIPER_HICACHE_CANONICAL_PARTIAL_TTL_S = EnvFloat(3600.0)
+    # #720: size of the reusable, budget-REGISTERED read-buffer ring per pool.
+    # 0 (default) keeps today's per-read fresh pinned allocation, which the
+    # joint budget cannot see. A positive value declares capacity x page bytes
+    # to the registry at first use, so the read path's pinned footprint becomes
+    # a number the budget can refuse.
+    FLLIPER_HICACHE_READ_BUFFERS = EnvInt(0)
+    # #1062: cap on the #969G key-trace, in LINES. 0 -> the built-in 20000.
+    # Not a rate limit: past the cap the suppressed count is printed, so an
+    # absence in the trace is always readable against a named denominator.
+    FLLIPER_HICACHE_KEY_TRACE_CAP = EnvInt(0)
+    # #558: free-space floor, in bytes, below which the #706 canonical write
+    # protocol refuses rather than risking ENOSPC in the middle of a
+    # multi-writer page assembly. 0 (default) keeps today's behaviour, where
+    # the only protection is the LRU evictor's watermark -- which is disabled
+    # unless --hicache-storage-backend-extra-config sets a cap or a min-free.
+    FLLIPER_HICACHE_CANONICAL_MIN_FREE_BYTES = EnvInt(0)
+    # #410 slice 2: ceiling on bytes pinned by conversation checkpoints. Pinned
+    # bytes are bytes eviction can never reclaim, so a checkpoint whose pins
+    # would cross this is REFUSED with the numbers rather than quietly turning
+    # the cache into a pin museum. 0 = no ceiling.
+    FLLIPER_HICACHE_PIN_BUDGET_BYTES = EnvInt(0)
+    # #703: cap on OUTSTANDING eviction-time demotions to the disk tier, and
+    # the on/off switch (0 = off, today's behaviour). Eviction runs under
+    # memory pressure, so demotion enqueues onto the existing backup queue and
+    # DROPS beyond this cap rather than queueing without limit -- a dropped
+    # demotion is a later miss, never corruption.
+    FLLIPER_HICACHE_DEMOTE_ON_EVICT = EnvInt(0)
+    # H2 (23.09.): issue a write op with its device indices left on the card
+    # when every pool of the op can take them (arena KV/mamba, QSA page rows)
+    # instead of the io_backend=direct normalisation, whose device_indices.cpu()
+    # blocks the scheduler thread until the card's queued forward finished.
+    # False restores the old normalisation for every op (the fallback form).
+    FLLIPER_OPT_HICACHE_DEVICE_INDEX_WRITE = EnvBool(True)
+    # H2: run the first N chunk publishes under torch's sync-debug "warn" mode
+    # and log each implicit synchronising call site once (H2-SYNC-SITE). 0 = off.
+    FLLIPER_DEBUG_HICACHE_SYNC_TRACE = EnvInt(0)
+    # fnFL2 H74 (x172): each rank drains its OWN storage-write acks, the full
+    # ready count -- no MIN over the TP group. The MIN presumed that every TP
+    # rank issues the same store writes; Form A does not (TP0's arena staging
+    # pool vs the workers' plain host pool, TP0's mamba pin budget), so a rank
+    # with one write more than its peers kept that ack forever: ongoing_backup
+    # never emptied, hicache_backup(1) refused every /flush_cache and the front
+    # stopped with W3. The revoke and host-release drains keep the MIN. False
+    # restores the MIN for the backup acks too.
+    FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN = EnvBool(True)
+    # fnFL2 H74 (x172): on a TP group the publish split window (#1407) is the
+    # chunk (4096, page-aligned) on every rank instead of a quarter of the
+    # rank's OWN host pool -- x172 split a 6080-token node into 4096 + 1984 on
+    # TP0 (arena staging pool, 4096 rows) and not on TP1/TP2 (353,600-row host
+    # pool, window 86,016): one node and one store write more on TP0, a tree
+    # that no longer has the same nodes on every rank. Single-rank groups (P,
+    # PP stages) keep the quarter-of-the-pool window. False restores the
+    # per-rank window.
+    FLLIPER_PDFLIP_ENABLE_TP_UNIFORM_PUBLISH_WINDOW = EnvBool(True)
+    # H98 (rc2.1k, rc9l/rc9m): on a Form A group (--rank-role) the attention
+    # host is the ONLY authority for prefix match, anchor verdict and resume
+    # depth. The expert workers hold no KV, mamba or host bytes (0.00 GB pools,
+    # null storage tier), so their radix tree is bookkeeping: in the RU/H97
+    # usable-match reduce they vote their KV reach (MIN-neutral wherever they
+    # can follow) and abstain in the MAX arm, and at admission they adopt the
+    # group depth on the KV path without their own anchor rule
+    # (tp_match_floor.follow_rematch, line 'RU FORM-A FOLLOW'). Only read when
+    # a Form A role plan is installed; False restores the H97 votes, byte-
+    # identical to 138d9df01c.
+    FLLIPER_PDFLIP_ENABLE_FORM_A_TP0_FOLLOW = EnvBool(True)
+    # #31468 metal check: run the first N DFLASH decode rounds under torch's
+    # sync-debug "warn" mode; logs DFLASH-SYNC-ROUND (count per round) and each
+    # implicit host-sync call site once (DFLASH-SYNC-SITE). 0 = off.
+    FLLIPER_DEBUG_DFLASH_SYNC_TRACE = EnvInt(0)
+    # R12 (fLLiper release table row 12, mem_cache/form_a_host_shadow.py): on
+    # a Form A D group every rank keeps the same host and anchor entries. A
+    # worker keeps its byteless host rows as long as TP0 holds them (no transit
+    # release at the store ack or after a load-back, no host eviction of its
+    # own); TP0's own host drops (failed arena rebind, H19 displacement, its
+    # evict_host, a refused backup) ride the tp<-reqs request broadcast and
+    # every rank applies them before the pass's requests; a worker's 0-byte
+    # anchor pool gets 2 x FLLIPER_HICACHE_ARENA_MAMBA_SLOTS rows. Only read
+    # with an installed Form A role plan whose host is TP rank 0; False =
+    # byte-identical to d1c7094ba6.
+    # UNIFY: default per profile (qsa_forma D = nextflash on, qwen27b off); on
+    # without a form (the NF code default).
+    FLLIPER_PDFLIP_ENABLE_FORM_A_HOST_SHADOW = EnvBool(
+        _profile_default("FLLIPER_PDFLIP_ENABLE_FORM_A_HOST_SHADOW", True))
+    FLLIPER_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
+    # Disable with FLLIPER_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
+    # "use_direct_io": false key in --hicache-storage-backend-extra-config.
+    FLLIPER_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    FLLIPER_HUGEPAGE_SIZE = EnvStr("")
+    # Staging buffer for heterogeneous TP KV transfer
+    FLLIPER_DISAGG_STAGING_BUFFER = EnvBool(False)
+    FLLIPER_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
+    FLLIPER_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # TODO(yangminl): remove FLLIPER_STAGING_USE_TORCH and the torch fallback in
+    # staging_buffer.py once Triton kernels are fully validated in production.
+    FLLIPER_STAGING_USE_TORCH = EnvBool(False)
+    # Mooncake KV Transfer
+    FLLIPER_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
+    ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
+    ASCEND_NPU_PHY_ID = EnvInt(-1)
+    FLLIPER_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
+    FLLIPER_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
+    FLLIPER_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+
+    # Mooncake Store
+    FLLIPER_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
+    FLLIPER_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    MOONCAKE_MASTER = EnvStr(None)
+    MOONCAKE_CLIENT = EnvStr(None)
+    MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
+    MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
+    MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
+    MOONCAKE_PROTOCOL = EnvStr("rdma")
+    MOONCAKE_DEVICE = EnvStr("")
+    MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
+    MOONCAKE_CHECK_SERVER = EnvBool(False)
+    MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
+    MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
+    MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
+
+    # MoRI KV Transfer
+    # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
+    FLLIPER_MORI_SEND_AUX_RDMA = EnvBool(False)
+    # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
+    # values can increase parallelism and bandwidth utilization.
+    FLLIPER_MORI_QP_PER_TRANSFER = EnvInt(4)
+    # Number of RDMA work requests posted in a single batch to each QP. Larger
+    # batch sizes reduce per-operation overhead and improve throughput at the
+    # cost of higher latency. -1 selects automatic sizing based on the number
+    # of merged work requests and available endpoints.
+    FLLIPER_MORI_POST_BATCH_SIZE = EnvInt(-1)
+    # Number of worker threads in the RDMA executor thread pool. More workers
+    # can improve parallelism for large batch transfers across multiple QPs,
+    # but excessive threads may cause contention.
+    FLLIPER_MORI_NUM_WORKERS = EnvInt(4)
+    # Number of sharded synchronous worker threads that drain KV transfers.
+    # Also the bound on outstanding (posted-but-not-completed) transfers, so it
+    # is the primary throttle keeping the RDMA send queue from overflowing.
+    FLLIPER_MORI_TRANSFER_SHARDS = EnvInt(8)
+    # Poll cadence (ms) at which a transfer worker wakes to check the SLA while
+    # waiting for completion; real completion still wakes it immediately.
+    FLLIPER_MORI_WAIT_POLL_MS = EnvInt(1000)
+    # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
+    # and relies on the RDMA retry-exceeded timeout only.
+    FLLIPER_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+
+    # AMD & ROCm
+    FLLIPER_USE_AITER = EnvBool(False)
+    FLLIPER_USE_AITER_AG = EnvBool(True)
+    # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
+    # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
+    # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
+    # explicitly to force on/off on any platform.
+    FLLIPER_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    FLLIPER_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Select the gate/up tile layout for AITER MoE: True -> interleave
+    # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
+    # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
+    # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
+    FLLIPER_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
+    # before the MoE block for models whose MoE input hidden_size must be
+    # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
+    # 256). When False (default) the pad runs as a separate
+    # torch.nn.functional.pad call inside the MoE method. When True, the
+    # aiter Triton kernel `fused_add_rmsnorm_pad` produces a padded
+    # post-attention layernorm output in one launch and the MoE method
+    # skips the explicit pad. Currently only takes effect on the
+    # post_attention_layernorm path with aiter backend and TP=1.
+    FLLIPER_AITER_FUSE_RMSNORM_PAD = EnvBool(False)
+    # Physical layout for MHA KV cache. "nhd" (default) keeps the existing
+    # (size, head_num, head_dim) per-token storage that
+    # `aiter.mha.mha_batch_prefill_func`/`unified_attention` consume directly.
+    # "vectorized_5d" allocates K as (num_blocks, H_kv, head_dim/x, page_size, x)
+    # and V as (num_blocks, H_kv, page_size/x, head_dim, x) (x = 16 / dtype_size),
+    # matching the SHUFFLE layout that aiter's CK FmhaBatchPrefill kernel and
+    # `aiter.ops.triton.gluon.pa_decode_gluon` both consume natively. This is
+    # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
+    # decode without runtime permutes.
+    FLLIPER_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    FLLIPER_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    FLLIPER_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
+    FLLIPER_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Enable dual-stream MoE (shared experts vs routed experts) on the
+    # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
+    FLLIPER_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    FLLIPER_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+
+    # MPS (Apple Silicon)
+    FLLIPER_USE_MLX = EnvBool(False)
+    FLLIPER_MLX_USE_CUSTOM_ROPE = EnvBool(False)
+    FLLIPER_MLX_FUSE_SWIGLU = EnvBool(False)
+    # Number of decode steps between periodic mx.clear_cache() calls.
+    # Set to 0 to disable cache clearing entirely.
+    FLLIPER_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
+
+    # NPU
+    FLLIPER_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+    FLLIPER_NPU_USE_MULTI_STREAM = EnvBool(False)
+    FLLIPER_NPU_USE_MLAPO = EnvBool(False)
+    # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
+    FLLIPER_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
+    # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
+    FLLIPER_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
+    # Delay all-gather after qlora for better performance for Deepseek v3.2
+    FLLIPER_USE_AG_AFTER_QLORA = EnvBool(False)
+    # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
+    # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
+    FLLIPER_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
+    # Quantize x to int8 in the dispatch operator
+    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
+    FLLIPER_NPU_FUSED_MOE_MODE = EnvInt(1)
+
+    # MTHREADS & MUSA
+    FLLIPER_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+
+    # Quantization
+    FLLIPER_INT4_WEIGHT = EnvBool(False)
+    FLLIPER_CPU_QUANTIZATION = EnvBool(False)
+    FLLIPER_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
+    FLLIPER_FORCE_FP8_MARLIN = EnvBool(False)
+    # --fp4-gemm-backend native-mixed (Backlog #38): the kernel of an sm_8x rank.
+    # "w4a8" (default, user order 25.09.): the registered W4A8 INT8 kernel on the
+    # native bytes (N4D decode GEMV M<=48, N4A GEMM above; main model and draft).
+    # "marlin" (opt-in): Marlin W4A16 on the SHARED native layout, content
+    # permuted in place at every flip (nvfp4_marlin_inplace.py). BARRED since
+    # 26.09. (wrong output), see FLLIPER_FP4_ALLOW_BROKEN_SM8X_MARLIN below.
+    FLLIPER_FP4_NATIVE_MIXED_SM8X = EnvStr("w4a8")
+    FLLIPER_FP4_NATIVE_MIXED_SM12X = EnvStr("flashinfer_cutlass")
+    # NVFP4-SM8X-MARLIN-GUARD (26.09.): SM8X=marlin serves wrong output on the
+    # current line and is refused; "1" runs it anyway, for DIAGNOSIS ONLY.
+    FLLIPER_FP4_ALLOW_BROKEN_SM8X_MARLIN = EnvBool(False)
+    # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
+    #
+    # WHAT IS BROKEN. On sm80..88 an fp8 checkpoint has exactly one GEMM
+    # available -- Marlin (can_auto_enable_marlin_fp8: 80 <= sm < 89) -- and
+    # gptq_marlin_gemm is NOT run-to-run reproducible there. Measured on an RTX
+    # 3080 at the real 27B shape (N=8704, K=5120), repeating one
+    # apply_fp8_marlin_linear call on bit-identical inputs: 0/1200 mismatching
+    # iterations for M <= 109, then 1/1200 at M=128, 4/1200 at M=256, 12/1200 at
+    # M=512, worst per-element |delta| ~1e-1. The cause is the accumulation order
+    # across K-slices inside the kernel (falsified: not the atomic-add path, not
+    # use_fp32_reduce, not a stale workspace) -- a CUDA-kernel defect, not a
+    # config flip. The same shape on sm120 is 0/2000; sm89+ is unaffected.
+    #
+    # WHAT THIS FLAG DOES. On sm80..88 ONLY, it forces the fp8 Marlin path off
+    # for the dense linears that have a paired fallback, which routes them to the
+    # dequant W8A16 lane (fused dequant-GEMV for small-batch decode,
+    # materialise + F.linear for prefill). sm89+/sm90/sm120 are untouched -- the
+    # native / flashinfer fp8 paths there are already clean, and this flag is not
+    # a global "no fp8".
+    #
+    # WHAT IT COSTS. A large decode penalty, and how large depends on how much
+    # of the model sits on sm8x ranks:
+    #   * #179/#189 anchor, Qwen3.6-27B block-fp8, TP=3 (5090 + 2x 3080), the
+    #     5090 carrying its share on the native path: 91.5 tok/s Marlin against
+    #     27.6 (uncached dequant) to 37.3 (fused GEMV) on the fallback -- roughly
+    #     a factor 2.5, and that is the OPTIMISTIC end;
+    #   * this flag's own A/B, same checkpoint but TP=2 across the two 3080s so
+    #     every layer is on sm8x: 36.4 -> 5.8 tok/s on a short single request.
+    # Prefill is only mildly affected (-8% at the #179 anchor) -- the fallback
+    # expands the weight once per FORWARD, so batch-1 decode pays the whole
+    # thing for one token while prefill amortises it over the prompt.
+    # This is deliberately opt-in: pay it when byte-reproducibility is the
+    # product (CI byte gates, bisecting a numerical regression, debugging), not
+    # in normal serving.
+    #
+    # COVERAGE GAPS, on purpose. fp8 MoE experts, FBGEMM fp8 and the
+    # multimodal_gen runtime keep Marlin on sm8x because they have no fallback
+    # there -- switching them off would leave no fp8 GEMM at all. Each logs a
+    # warning when this flag is set. Under mixed-arch TP (5090 + 3080s) the flag
+    # is rank-local by construction: only the sm8x ranks change lane, so ranks
+    # stop agreeing numerically -- that is the #50 broadcast family's problem,
+    # not this flag's.
+    FLLIPER_DETERMINISTIC_FP8_GEMM = EnvBool(False)
+    FLLIPER_MOE_NVFP4_DISPATCH = EnvBool(False)
+    # MoE expert-offload (M-B/M-C, feat/moe-expert-offload). Fraction of each
+    # layer's local routed experts kept resident on GPU (1.0 = no offload =
+    # default, byte-identical). <1.0 activates the pinned-host pool + LRU
+    # H2D-fetch cache so the resident-fraction-vs-tok/s curve can be swept on a
+    # model that otherwise fully fits (A3B-FP8). Cold experts are FETCHED to
+    # GPU and computed on GPU (NOT CPU-computed — this AMD box has no AMX).
+    # May be a single float (uniform, the original behaviour) or a comma-list
+    # with one entry per TP rank. A vector exists because the fraction is the
+    # GPU-resident / host-pinned split WITHIN a rank's own expert shard, and on
+    # a heterogeneous group the right split differs per card: on this rig a
+    # 5090 rank had ~4.0 GiB of VRAM idle while both 3080 ranks were 32 MiB
+    # short of fitting their scratch region. Lowering the fraction only on the
+    # small cards frees exactly the VRAM that binds, and raising it on the big
+    # card pays the resulting host-pinned-pool growth back. See
+    # --rank-moe-resident-fraction and docs/dev/PLAN_MOE_RESIDENT_FRACTION_PER_RANK.md.
+    FLLIPER_MOE_RESIDENT_EXPERT_FRACTION = EnvFloatVector(1.0)
+    # When set to a path, log per-layer routed expert IDs (topk_ids) to that
+    # file for offline routing-locality / cache-hit-rate simulation (M-C).
+    FLLIPER_MOE_OFFLOAD_TRACE = EnvStr("")
+    # Stage-1 hot-expert residency (offload-speed bundle). When True (and offload
+    # is active, fraction<1.0), the resident GPU set is FROZEN to the R most-
+    # frequently-routed experts per layer -- observed over the first
+    # FLLIPER_MOE_HOT_CALIB_STEPS forwards (a deterministic calibration pass), then
+    # never changed. Cuts H2D spill traffic (real MoE routing is heavily skewed;
+    # the default static [0,R) set captures only ~uniform R/E). BYTE-IDENTICAL to
+    # the static-residency path at the same fraction: residency only changes WHICH
+    # experts are physically resident vs fetched, not the per-token math (same
+    # GEMM, same buffer size R+C, per-expert token sets unchanged). Frozen-after-
+    # calibration => self-deterministic. Default False = static [0,R) (unchanged).
+    FLLIPER_MOE_HOT_RESIDENCY = EnvBool(False)
+    # #302a Stage-2 heat migration: keep re-ranking the resident set against a
+    # DECAYED window of live router traffic instead of freezing it once. Stage-1
+    # above improves the choice but keeps the one-shot shape; this reacts to a
+    # workload that drifts after calibration. Swaps are EQUAL-COUNT pairs, so
+    # residency size -- and every VRAM figure derived from it -- is unchanged.
+    # Eager offload path only (refused under FLLIPER_MOE_OFFLOAD_CUDA_GRAPH: a
+    # captured gather's LUTs pin the layout). Default False = unchanged.
+    FLLIPER_MOE_HEAT_MIGRATION = EnvBool(False)
+    # Forwards between two re-rank decisions, per layer. Small = re-ranks on
+    # noise and pays PCIe for it; large = tracks a drifting workload slowly.
+    FLLIPER_MOE_HEAT_PERIOD = EnvInt(512)
+    # #516 longer-horizon miss budget for the heat re-rank. 0.0 = OFF and the
+    # OFF path is byte-identical. When > 0, a window whose miss rate is at or
+    # below this is left alone instead of re-ranked, so a swap is spent only
+    # where the miss rate says it is needed. Simulation on the recorded #302a
+    # series favours 0.04; nothing here has run on metal.
+    FLLIPER_MOE_HEAT_MISS_BUDGET = EnvFloat(0.0)
+    # Decay multiplied into every expert's count at each round boundary.
+    # 1.0 = whole-run heat, 0.0 = only the last period counts.
+    FLLIPER_MOE_HEAT_DECAY = EnvFloat(0.5)
+    # A candidate must be (1+x) times hotter than the victim it would displace.
+    # This is the anti-thrash term: without it a one-activation difference
+    # swaps back and forth every round.
+    FLLIPER_MOE_HEAT_HYSTERESIS = EnvFloat(0.25)
+    # Absolute companion to the margin above, in observed activations. A purely
+    # relative margin is scale-free and churns on sampling noise down in the
+    # tail of the routing distribution, where "40 % hotter" is three
+    # activations. A swap costs two expert-row transfers; both conditions must
+    # hold before it is taken.
+    FLLIPER_MOE_HEAT_MIN_GAIN = EnvFloat(8.0)
+    # Upper bound on swaps per layer per round; the burst is swaps x expert
+    # bytes and lands between two forwards.
+    FLLIPER_MOE_HEAT_MAX_SWAPS = EnvInt(4)
+    # Minimum activations observed in a window before it is allowed to re-rank.
+    FLLIPER_MOE_HEAT_MIN_OBS = EnvInt(32)
+    # #286 offload register (DESIGN_201 Nachtrag-13 Erg. 7/7b/7c): enable the
+    # generic VRAM item register's ADAPTERS (registration + size/access
+    # bookkeeping at the item creation sites: capture rungs, drafter heads,
+    # lane workspaces, input-buffer pools). Default False = the adapters are
+    # no-ops and the default path stays byte-identical. CPU phase: bookkeeping
+    # only, no movement.
+    FLLIPER_OFFLOAD_REGISTER = EnvBool(False)
+    # Number of offload forwards to observe (accumulating per-expert routing
+    # counts) before the hot-set is computed, physically installed, and FROZEN.
+    # Default 1: freeze right after the first forward (a prefill sees ~all prompt
+    # tokens => rich frequency signal in one shot). The freeze happens at the TOP
+    # of the triggering forward, so that forward's own output already uses the
+    # frozen hot-set (no intra-run residency drift => self-det holds).
+    FLLIPER_MOE_HOT_CALIB_STEPS = EnvInt(1)
+    # Stage-3 CUDA-graph-compatible offload. When True (opt-in), the decode MoE
+    # offload uses the on-device index math (prepare_capturable) + a captured
+    # gather instead of the per-layer topk_ids.tolist()+Python-planning path, so
+    # decode can be CUDA-graph captured (removing the launch-overhead that
+    # dominates single-token decode). Requires a residency layout frozen BEFORE
+    # capture (static [0,R) or FLLIPER_MOE_HOTSET_FILE); live hot-calibration is
+    # rejected on this path. Default False = eager run_waves (unchanged).
+    #
+    # #452: REFUTED on hardware and refused by name at boot
+    # (moe/offload_capture_gate.refuse_capturable_offload_decode). Setting this
+    # to True aborts the launch unless the override below is also set.
+    FLLIPER_MOE_OFFLOAD_CUDA_GRAPH = EnvBool(False)
+    # Development override past the #452 refusal, for a card window that wants
+    # to localise B2 or measure a candidate fix. Not a performance option: the
+    # measured operating point is 6.60x slower than the eager offload path and
+    # decodes different text.
+    FLLIPER_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE = EnvBool(False)
+    # Path to a per-layer frozen hot-set file (produced offline from the M-C
+    # routing trace). Enables hot-residency under CUDA-graph capture by freezing
+    # the resident set from the file before capture, instead of live calibration.
+    FLLIPER_MOE_HOTSET_FILE = EnvStr("")
+    # Max decode batch size eligible for the captured offload path. Buckets with
+    # bs*top_k > scratch (would need >1 wave) fall back to eager. 0 = no cap.
+    FLLIPER_MOE_OFFLOAD_MAX_GRAPH_BS = EnvInt(0)
+    # H12: the wave order of an EAGER forward under the device-planned pool
+    # (FLLIPER_MOE_OFFLOAD_GRAPH_MODE=pool: D's extend after the flip, an eager
+    # verify). True (default): expert-major -- each spill expert crosses PCIe
+    # ONCE per forward and lands in exactly one pool row. fnFL2x104 (90k
+    # needle): D ran the 49-token extend token-major because the arm sets
+    # FLLIPER_MOE_OFFLOAD_WAVE_ORDER=expert only for P; TP0 (12 residents, 181
+    # spill rows) re-fetched the hot experts in every wave, 3 waves / 0.27 GiB
+    # H2D per layer, and the extend's gpu-ms (1069) was that stream. False:
+    # the pool's eager forwards follow FLLIPER_MOE_OFFLOAD_WAVE_ORDER again.
+    # Rank-uniform: every rank reads the same launcher env.
+    FLLIPER_OPT_MOE_POOL_EAGER_EXPERT_MAJOR = EnvBool(True)
+    # H107: the expert-major eager forward under the pool (D's extend) reads a
+    # routed spill expert from the LRU row that already OWNS it instead of
+    # fetching it again into the scratch rows, and fetches only the misses into
+    # rows that hold no hit. The pool's hot_phys map crosses in the SAME D2H as
+    # the routed ids (no extra sync per layer); the decode step and its graph
+    # are untouched. Output bit-identical (a row choice never changes what the
+    # apply computes). rc12z26 D TP0: 110 of 193 experts on the card, every
+    # extend still moved 0.20 GiB/layer in 3 waves (~1.6 s gpu-ms) and wiped
+    # the decode LRU. False: the plan before H107. Rank-uniform: every rank
+    # reads the same launcher env; the waves are rank-local (no collective).
+    FLLIPER_OPT_MOE_POOL_EAGER_LRU_HITS = EnvBool(True)
+    # D-Mini-Extend (30.09., y3u): an eager forward under the pool whose routed
+    # ids fit the widest CAPTURED decode step (graph form: max graph bs x MTP
+    # verify rows x top-k, and the step's wave bound min(ids, E - R) <=
+    # waves x (LRU + staging) with waves <= FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES)
+    # runs the decode graph's device-planned step instead of the host plan:
+    # prepare_pool / run_pool_waves, eager. No per-layer D2H of the routing,
+    # no host plan, no sync_pool_from_host (its 4-5 device reads per layer);
+    # the misses are those of the decode step, promoted into the LRU by its
+    # own rule. y3u D TP0: extends of 2-6 new tokens cost 403-739 gpu-ms,
+    # every MoE layer serialized CPU launch and H2D behind its syncs. Single
+    # wave: bit-identical to the host plan (one apply over the same lanes on
+    # rows holding the same bytes). False: every eager forward plans on the
+    # host as before. Rank-local choice, no collective inside the MoE.
+    FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP = EnvBool(True)
+    # y6o (01.10.): the host-planned eager forward (D's extend of more ids
+    # than the device step takes) republishes each layer's pool tables
+    # (check_pool_error + sync_tables, device reads) right after that layer's
+    # waves -- a drain of the stream at EVERY MoE layer, so the next layer's
+    # attention is launched only after this layer's experts finished
+    # (y6m slot 2 py-spy: check_pool_error 18.8 % of D TP0). True: inside a
+    # model forward the per-layer republish is queued and run once at the end
+    # of the layer loop (eager_pool_sync_scope), in layer order, before the
+    # forward returns -- a sticky pool error still stops the forward by layer
+    # name before its output is used. Outside such a scope (any other caller)
+    # the republish runs at once as before. False: per layer as before.
+    # Rank-local, no collective.
+    FLLIPER_OPT_MOE_POOL_DEFER_EAGER_SYNC = EnvBool(True)
+    # Metal instrument for FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP: the first N
+    # device-planned eager forwards PER LAYER also run the plain host plan
+    # (history-free, H107 off: every spill expert fetched fresh from the host
+    # store) as the reference and compare the MoE outputs. One line
+    # 'EAGER-DEVICE-STEP CHECK ... verdict=MATCH' per check; a deviation
+    # beyond fp rounding stops the rank by name ('EAGER-DEVICE-STEP
+    # MISMATCH'). 1 (default) = the first mini extend of the process proves
+    # all 48 layers once (one extra MoE pass); 0 = off.
+    FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK = EnvInt(1)
+    # H95: the captured decode step of the device-planned pool
+    # (FLLIPER_MOE_OFFLOAD_GRAPH_MODE=pool) in up to N OVERFLOW WAVES. 0 or 1
+    # (default) = off, the Task #40 worst case: a captured batch needs
+    # min(bs x verify x top_k, E - R) <= LRU + staging rows, so the scratch
+    # grows with the seats (Form A D bs2: 80 rows, residency 0.29 on the 3080
+    # workers; bs6: 240 ids). N >= 2: the bound is min(ids, E - R) <= N x
+    # (LRU + staging) -- wave 1 is the ordinary step, the experts it cannot
+    # hold are served by the next wave over exactly their lanes (weight 0 in
+    # every other wave), so the scratch stays that of bs1 and a step that fits
+    # computes exactly as without waves. A graph whose batch fits one wave
+    # captures no second one. Rank-uniform: every rank reads the launcher env;
+    # the wave count itself is rank-local (no collective inside the MoE).
+    FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES = EnvInt(0)
+    # H95 probe: every N decode graph replays, one line per rank
+    # 'MOE-POOL-DEMAND (H95)' with, per MoE layer since the last line, the
+    # MAXIMUM number of distinct non-resident expert ids one step routed and
+    # how many steps exceeded LRU + staging -- the measured demand the pool
+    # bound is about, instead of its worst case. 0 (default) = off; the pool
+    # tables then carry no demand counters and the step kernel is unchanged.
+    FLLIPER_DEBUG_MOE_POOL_DEMAND = EnvInt(0)
+    # #276 heat record: a directory turns it on. Every pool layer keeps a
+    # device histogram of the routed LOCAL expert ids of its captured decode
+    # steps (one index_add_ in the step, no host read); D writes one JSON
+    # record per rank at its sleep ('MOE-HEAT (#276) wrote ...') and zeroes
+    # the counters at the wake. Unset (default) = off: no tensor, no op, the
+    # captured graph is unchanged. Input of the planner's hot-set stage.
+    FLLIPER_DEBUG_MOE_HEAT = EnvStr(None)
+    # #239 S3f miss record (layers/moe/pool_miss_cost.py): the records root
+    # of the line (``.../records/<line>``, IPC plan section 2.2 req. 7 / VRAM
+    # contract M3) turns it on. PR2 (30.09.): each D rank pairs, per timed
+    # prefill forward, the device ms of its host-plan expert fetches
+    # (``pool.host_fetch`` spans) with the rows THE SAME fetches loaded (a
+    # window at the prefill timer's bracket; only a #691-paired, split-known
+    # duration whose span count equals its fetch count counts), and writes
+    # one JSON record per rank at its
+    # sleep into ``<root>/<model_id>/owned_miss/`` (next to the #276 heat
+    # record). The launcher sets it for group D by default (evidence
+    # ``records/pdflip``; --env-d names another root, empty = off); its owned
+    # solve reads RECORD from K paired forwards per rank, else the seed.
+    # Unset = off: one None test per fetch.
+    FLLIPER_PDFLIP_OWNED_MISS_RECORD = EnvStr(None)
+    # Owned cut from the profiles (user 01.10. ~19:05Z: the expert split on D
+    # comes from the planner, not from a hand vector in the profile). The
+    # owned solve weights its round over the decode batch-size mix the line
+    # runs, "<bs>:<weight>,..." (unset = the measured default bs1 0.107 / bs2
+    # 0.446 / bs3 0.447 of y6k -dres 01.10.; "bs1" = the old bs1-only solve).
+    FLLIPER_PDFLIP_OWNED_BS_WEIGHTS = EnvStr(None)
+    # Form-A base of the owned solve: "derive" (default) = the planner derives
+    # the ownership that minimises the weighted round, the profile's
+    # --rank-moe-ratio only seeds the search; "stated" = the stated vector is
+    # the base (the old hand base, explicit override).
+    FLLIPER_PDFLIP_OWNED_BASE = EnvStr("derive")
+    # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
+    # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats
+    # the phase occupies (n = d_seats.phase_seats of the wake's handoff_n); the
+    # rest of the same VRAM backs extra expert-LRU rows on the attention host
+    # (Form A TP0). Mechanism (pdflip/d_seat_vram.py): the Mamba/GDN temporal
+    # state and the expert buffers keep their FULL virtual range (CUDA graphs
+    # keep their addresses), the saver's span map (tms_csrc patch 3) maps only
+    # slots(n) per layer resp. rows(cap) + k(n) per expert tensor, the slot
+    # allocator hands out slots(n), the pool tables enable k(n) rows as device
+    # values, D admits at most n. False (default) = byte-identical to H95 B;
+    # the Next-Flash launcher profile writes it True into --env-d.
+    # Rank-uniform: every rank of D reads the same launcher env.
+    FLLIPER_OPT_PDFLIP_D_SEAT_VRAM = EnvBool(False)
+    # D-SEAT-REWAKE (Nutzer 30.09.: "D sleeped (ohne wirklich runterzufahren)
+    # und waket sofort wieder mit mehr sitzen ... selbe funktion nur auch
+    # wieder in die andere richtung"): D's phase seat count n moves LIVE at a
+    # round boundary, rank-uniform, no weight legs, no P -- grow n -> n+k when
+    # waiting requests find every seat taken (the expert rows the new seats'
+    # GDN pages need go off, coldest first); shrink n -> n-k when seats stand
+    # free and nobody waits, once the free time exceeds the MEASURED price of a
+    # re-plan round trip (ski rental, the flip policy's shape) -- the freed
+    # pages go back to expert rows. Needs FLLIPER_OPT_PDFLIP_D_SEAT_VRAM; read by
+    # D's ranks AND by the front (which then counts D's seats at --d-bs).
+    FLLIPER_PDFLIP_D_SEAT_REWAKE = EnvBool(False)
+    # H95c: the extra expert rows' VIRTUAL reservation per MoE TP rank
+    # ("16,0,0"), written by the launcher from the seat table (rows at n=1
+    # minus rows at the --d-bs cap, GERECHNET). Only the rows the runtime's
+    # exact granule arithmetic funds in a phase are ever mapped; unset/empty or
+    # 0 on a rank = no extra rows there.
+    FLLIPER_PDFLIP_D_SEAT_EXPERT_ROWS = EnvStr("")
+    # #251c (Nutzer 27./28.09.): D's KV STAGES on the Form A attention host,
+    # traded against the expert bank's tail rows at every wake (the third post
+    # of the H95c span map, pdflip/d_seat_vram.py). Form values the launcher
+    # writes into --env-d, never operator knobs; they act only with
+    # FLLIPER_OPT_PDFLIP_D_SEAT_VRAM on group D.
+    #   _TOKENS: the stages' KV tokens ascending, "262144,393216,524288"; the
+    #     pool is VIRTUALLY the last one, physically the first at boot. Fewer
+    #     than two stages = no stages (byte-identical to H95c).
+    #   _ROWS: the expert rows ON in the boot form (S0 at the --d-bs cap) that
+    #     the higher stages take back -- part of FLLIPER_PDFLIP_D_SEAT_EXPERT_ROWS.
+    #   _MAX_BY_SEATS: the highest stage a phase of n = 1..--d-bs seats may
+    #     take ("2,2,2,2,2,2"; empty = every stage). The launcher derives it
+    #     from the same geometry TP0 checks at its first wake, and from the
+    #     captured overflow waves when the stage must not add one. Replicated:
+    #     every rank picks the stage from these and the wake request alone.
+    FLLIPER_PDFLIP_D_KV_STAGE_TOKENS = EnvStr("")
+    FLLIPER_PDFLIP_D_KV_STAGE_ROWS = EnvInt(0)
+    #   _ROWS_BY_RANK (#239 S3g): the stage rows ON per D rank ("6,21,8") when
+    #     the KV lies on more than the attention host (the token cut: every
+    #     rank holding FA KV trims it to S0 and funds its higher stages from
+    #     its own expert rows). Empty = _ROWS on every rank, byte-identical.
+    FLLIPER_PDFLIP_D_KV_STAGE_ROWS_BY_RANK = EnvStr("")
+    FLLIPER_PDFLIP_D_KV_STAGE_MAX_BY_SEATS = EnvStr("")
+    # #251d: the stage follows the next wake's demand alone -- every stage is
+    #   open to every seat count (MAX_BY_SEATS is not read), the smallest one
+    #   holding the phase's KV tokens is taken. The captured waves are priced
+    #   for the lowest stage row count (the launcher raises the wave cap it
+    #   derived, or refuses a told one by name). Off = the table, byte-identical.
+    #   Default ON since 29.09. (metal: z30x2 kvdemand 09291210, D.log _121057 --
+    #   '#251 WAKE-RESHARD n=2 stage=S1 tokens=393216 demand=262276 over=no' at
+    #   bs2 x 128k, every other wake S0, needle MATCH, no death). Inert without a
+    #   stage form (< 2 stage tokens): the 27B never gets one.
+    FLLIPER_PDFLIP_D_KV_STAGE_BY_DEMAND = EnvBool(True)
+    # D-MEM-SCHED (29.09., user law "free VRAM is always experts"): one budget
+    #   per D rank -- a seat-row shrink moves the dropped rows' experts into the
+    #   coldest kept rows first (pdflip/d_mem_sched.py). ON by default; this is
+    #   the diagnosis-only emergency stop, not a feature switch.
+    FLLIPER_PDFLIP_DISABLE_D_ELASTIC_ROWS = EnvBool(False)
+    # D-MEM-SCHED floor/room re-check (01.10., NF y6k: 32 % of the D-TP0
+    #   scheduler in max_live_page, a device sync + a group collective every
+    #   decode round under a pending shrink; host gap 9 ms/round vs 2.9 in
+    #   x176). While a shrink stays pending and nothing replicated changed,
+    #   the floor and the room below the cap are re-read after 1, 2, 4, ...
+    #   up to this many rounds (an end event, a lift or a demand change
+    #   re-reads at once; the room re-reads before decode can use up its
+    #   slack). 1 = every round (the old behaviour).
+    FLLIPER_PDFLIP_D_MEM_RECHECK_ROUNDS = EnvInt(64)
+    # KV-STAGE warm refill (01.10., y6h: 179 shrinks, 178 on an end event, 72
+    #   of 109 grows within 5 s after one): a seat-row shrink remembers the
+    #   experts it sent to the store, hottest first; the next grow refills its
+    #   freed rows with them at once (the miss path's copy, no new VRAM)
+    #   instead of letting each one miss cold. False = byte-identical lazy fill.
+    FLLIPER_PDFLIP_D_SEAT_WARM_REFILL = EnvBool(True)
+    # D-TRANSIENT-LEND (01.10., user law "free VRAM is always experts"): between
+    #   two extends D's statically booked transient (corridor floor above the
+    #   near-OOM edge, awake overshoot, extend activation, the KV share the
+    #   stage does not map) sits free on the card -- fqnsdm 01.10.: 1.7-2.0 GiB
+    #   NVML-free per rank for ~95 % of D's time. It is lent as extra LRU
+    #   expert rows after SETTLE decode rounds and returned (rows OFF coldest
+    #   first, sync, unmap) before the next extend / stage move / wake
+    #   (pdflip/d_transient_lend.py). ON by default; off = byte-identical.
+    FLLIPER_PDFLIP_D_TRANSIENT_LEND = EnvBool(True)
+    #   The near-OOM edge per D rank (MiB, "767,700,701"): the launcher writes
+    #   the card ledger's floor beside FLLIPER_PDFLIP_EXTEND_TRIM_MIB. Unset = no
+    #   lend (nothing is guessed).
+    FLLIPER_PDFLIP_D_LEND_FLOOR_MIB = EnvStr(None)
+    #   Virtual seat rows a lend may take above the rank's own seat rows (VA
+    #   only: unmapped rows cost no byte), per rank or one value; only ranks
+    #   that already have seat rows get them.
+    FLLIPER_PDFLIP_D_LEND_HEAD_ROWS = EnvStr("16")
+    #   The lend lattice: the bank's plans are cut every STEP rows so a lend
+    #   and its return release whole cells only (S1-Wisch).
+    FLLIPER_PDFLIP_D_LEND_STEP_ROWS = EnvInt(4)
+    #   Decode rounds in a row before a lend (a burst of extends lends nothing).
+    FLLIPER_PDFLIP_D_LEND_SETTLE_ROUNDS = EnvInt(8)
+    # 29.09. (Nutzer 12:35Z, Grundgesetz): KV stages BELOW the booked S0 at this
+    #   granularity (floor, 2 x floor, ... < S0, e.g. 32768). The plan still
+    #   books S0; the KV between the floor and S0 is born unmapped and funds
+    #   expert rows that the wake / the D-MEM-SCHED tick turn off as the known
+    #   tokens grow. 0 = no stage below S0, byte-identical.
+    FLLIPER_PDFLIP_D_KV_STAGE_FLOOR_TOKENS = EnvInt(0)
+    # #254: how a prefill forward that overflows the scratch region is split.
+    #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
+    #     re-fetches the spill experts its tokens need, so a spill expert is
+    #     streamed once PER WAVE (~62x per 2048-token chunk at C=16).
+    #   "expert" -- waves are disjoint SPILL-EXPERT groups; each spill expert is
+    #     streamed EXACTLY ONCE per chunk (H2D volume drops by the wave count).
+    #     Byte-identical to "token": each wave computes the per-(token, k-slot)
+    #     contributions into a fixed [T, top_k, H] buffer indexed by the k-slot
+    #     (which the routing fixes, independent of the wave split), and the top-k
+    #     reduction runs once at the end over the full buffer in k order -- the
+    #     same reduction, over the same values, as the unsplit path. Costs one
+    #     transient T*top_k*H buffer per layer (freed at the end of the forward).
+    # Decode (single-wave) is unaffected by this flag.
+    FLLIPER_MOE_OFFLOAD_WAVE_ORDER = EnvStr("token")
+    # fnFL2 H20b: plan an expert-major prefill forward on a numpy array (one
+    # D2H copy + np.unique) instead of topk_ids.tolist() + per-element Python.
+    # Desk bench at T=16384 K=10: ~26 ms host Python per MoE layer after the
+    # rendezvous, the GPU idle through it (~0.75 s of PP0's 5.5-s chunk).
+    # Same waves, same pair array -> byte-identical forward. Falls back to the
+    # list path whenever a list consumer is on (router stats, hot calibration,
+    # heat window, NaN guard) and below 4096 routed pairs (decode).
+    FLLIPER_MOE_OFFLOAD_PLAN_VECTOR = EnvBool(False)
+    # Per-forward CUDA-event split of a prefill chunk: MOE-OFFLOAD-TIMING-PREFILL
+    # (expert stream vs grouped GEMM), ATTN-TIMING-PREFILL (full vs linear
+    # attention) and PLE-GATHER-PREFILL (the stage-0 CPU gather). One host sync
+    # per forward per rank. The older call sites still read the raw key.
+    FLLIPER_MOE_OFFLOAD_TIMING = EnvBool(False)
+    # fnFL2 H20: FWD-TIMING-PREFILL -- one CUDA-event TIMELINE per plain
+    # prefill forward (layers/fwd_timeline.py): every component boundary
+    # (embed, ple, hc, dense, qsa_idx, attn, linear, shared, gate, moe_plan,
+    # moe_fetch, moe_apply, other) records one event, the segments telescope,
+    # so their sum is the forward's span and the line is comparable with the
+    # rank's gpu-ms. No host sync in the forward; read at the next forward.
+    FLLIPER_PDFLIP_PREFILL_TIMING = EnvBool(False)
+    # fnFL2 H67: the flush of ATTN-TIMING-PREFILL / MOE-OFFLOAD-TIMING(-PREFILL)
+    # (layers/prefill_timing.flush_wait) waits on the recorded events of the
+    # forward it reads instead of torch.cuda.synchronize(). The device-wide
+    # wait at the stage's head layer also joins the async PP proxy send of the
+    # previous chunk, which completes only when the next stage posts its
+    # receive: on a stage faster than its successor the instrument parked the
+    # forward for the successor's remaining compute (x167 PP0 chunk 4/5:
+    # 548/639 ms inside 'linear', burst forward 16: 1196 ms) and gpu-ms counted
+    # it as compute. Same events, same sums. Off: the device-wide wait.
+    FLLIPER_PDFLIP_ENABLE_TIMING_EVENT_FLUSH = EnvBool(False)
+    # fnFL2 H28 (Task #53): the decode round's all-reduce census by class.
+    # On: the Form A MoE-input carrier records under its own collective-clock
+    # family 'tp.moe_carrier' (the combine keeps 'tp.all_reduce'), and every
+    # _EVERY decode rounds each rank prints BARLINK-ROUND-CENSUS (count,
+    # bytes and kernel mode as captured, mean/min span, transport floor vs
+    # skew). Names only -- no collective changes. Off: byte-identical.
+    FLLIPER_PDFLIP_AR_ROUND_CENSUS = EnvBool(False)
+    FLLIPER_PDFLIP_AR_ROUND_CENSUS_EVERY = EnvInt(50)
+    # PdFlip launcher: group P's --chunked-prefill-size (tokens). The launcher
+    # names the chunk ONCE (CHUNKED_PREFILL_TOKENS) because the PP-cut solver,
+    # the depth funding and P's argv must all price the same chunk; an argv
+    # override alone (EXTRA_P_ADD) would ship a cut solved for another chunk.
+    # 4096 is the flip form; 8192 is the fn7t best form (L2 lever, 24.09.).
+    # D keeps 4096 (X's floor, K5).
+    FLLIPER_PDFLIP_P_CHUNKED_PREFILL_TOKENS = EnvInt(4096)
+    # H92 (--p-chunk-policy dynamic, NF line): the forward budget of group P
+    # plans the token STREAM of every waiting request ('stream', set by the NF
+    # launcher) instead of the head request alone (unset/'request', the 27B
+    # budget). Read as a mapping by pdflip/p_chunk_nf.budget_is_stream, like the
+    # shared FLLIPER_P_CHUNK_POLICY/SPEC; inert without a dynamic planner.
+    FLLIPER_P_CHUNK_BUDGET = EnvStr("")
+    # fnFL2 H37 (Task #118, agent load = many small prefills): group P's
+    # --pp-max-micro-batch-size. Unset/False = stock: the scheduler derives it
+    # as max_running_requests // pp_size (scheduler.default_pp_micro_batch_size),
+    # i.e. ONE request per forward for --p-bs 1..5 on PP3. True: the launcher
+    # emits P's effective --max-running-requests UNDIVIDED, so one forward may
+    # carry several requests up to the chunk budget (the requests' total stays
+    # bounded by req_to_token_pool = --max-running-requests). Admission cap
+    # only, no allocation: kept out of the ring form key.
+    FLLIPER_PDFLIP_ENABLE_P_UNDIVIDED_MICRO_BATCH = EnvBool(False)
+    # fnFL2 H42 (Task #118): several END-ANCHOR tails per P forward. Unset/
+    # False = stock: a whole-fit prompt's body [0, N-1') mints THE chunked
+    # continuation (`scheduler.chunked_req`, one per pass, #959/#996), so at
+    # most ONE request reaches its end per forward and the second whole-fit
+    # prompt of a pass is refused (#967). True (and FLLIPER_PDFLIP_END_ANCHOR
+    # armed, i.e. group P only): each anchor body becomes an ANCHOR TAIL of
+    # its own (`Scheduler.anchor_tails`); the tails [N-1', N) are re-added
+    # together in the next pass. Inert without the END-ANCHOR (group D).
+    FLLIPER_PDFLIP_ENABLE_P_MULTI_ANCHOR_TAILS = EnvBool(False)
+    # TURN ANCHOR (pdflip/turn_anchor.py, 29.09.): the chat template's turn-start
+    # token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Set on group P,
+    # a prefill step whose extend holds the start of the prompt's LAST message
+    # snapshots the recurrent state there too (a second extend track in the
+    # same forward) and inserts it as its own anchor -- where the next turn
+    # and a client's side request fork. Unset/None = every path byte-identical.
+    FLLIPER_PDFLIP_TURN_ANCHOR_TOKEN = EnvInt(None)
+    # TWIN ANCHOR (pdflip/twin_anchor.py, 30.09., NF y4a pdflip-16-28): where the
+    # turn anchor and the twin deferral are armed, a prefill step also tracks
+    # the state at floor_page(shared - 1) of every fork twin still queued
+    # behind the request (one more gather row, one mamba slot), and a twin
+    # waits only for a source that promised an anchor <= shared. 0 = off.
+    FLLIPER_PDFLIP_TWIN_ANCHOR = EnvBool(True)
+    # fnFL2 H42b: burst assembly on the DECIDING P rank (PP0), only while
+    # multi anchor tails are armed. A pass that would carry nothing but new
+    # bodies is held back up to this many ms while more of a burst is still
+    # arriving (a new rid seen within the last window/4 ms) or still waiting
+    # for its #1400 store verdict -- so the burst runs as ONE body forward
+    # instead of the first arrival alone (x153b: fwd13 carried one 7.8k body
+    # for 2.4 s while three more requests were already on P). Released at
+    # once when the chunk budget or the seats are full. 0 = off.
+    FLLIPER_PDFLIP_P_BURST_ASSEMBLY_MS = EnvInt(0)
+    # Device-planned expert pool (FLLIPER_MOE_OFFLOAD_GRAPH_MODE=pool): what an
+    # EAGER forward (extend, eager first verify) leaves of the decode LRU.
+    # True (default): only the LRU rows the eager pass actually WROTE take its
+    # experts; every row it did not write keeps its expert and its recency --
+    # the bytes in it did not change, so the device mapping stays true. False:
+    # the old behaviour, every unwritten LRU row is freed, so each request's
+    # decode starts from an empty LRU (fnFL2x100 MID-2, a radix-hit repeat of
+    # the same prompt: TP0 pool.fetch 53-68 ms in the first graph rounds, 8-13
+    # ms once re-warmed). Rank-uniform: every rank reads the same launcher env.
+    FLLIPER_OPT_MOE_POOL_KEEP_LRU = EnvBool(True)
+    # #119: hand the weight VRAM freed by the expert offload to the KV pool.
+    # Default ON, but STRICTLY scoped to the offload lane -- every effect is
+    # additionally gated on FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1.0, so with
+    # offload off (the default) this flag changes nothing and the sizing path
+    # stays byte-identical. On the offload lane it (a) enforces that the offload
+    # is installed BEFORE the KV pool is profiled -- otherwise the profiler
+    # measures the pre-offload footprint and the reclaim is lost, which was the
+    # #77 "known limitation"; (b) synchronizes the release across the TP group
+    # so every rank's freed blocks are back with the driver before ANY rank
+    # takes its free-memory reading; and (c) logs the reclaimed bytes. Set to
+    # False to fall back to the unsynchronized, unaccounted behaviour.
+    FLLIPER_MOE_OFFLOAD_KV_REGAIN = EnvBool(True)
+    # #390: router-distribution and VRAM residency hit-rate counters in the
+    # expert-offload path. Opt-in; off by default and the counters are then not
+    # even constructed, so the offload path costs one `is not None` test. When
+    # on, every eager offload forward folds its already-materialized routing
+    # decision (topk_ids.tolist(), the sync run_waves pays anyway) into a
+    # per-layer expert-activation histogram plus hit/miss against the resident
+    # set. No extra device sync and nothing in the kernel. Captured decode steps
+    # (FLLIPER_MOE_OFFLOAD_CUDA_GRAPH) are not counted -- counting them would
+    # require the host sync that path exists to avoid; the dump flags this.
+    FLLIPER_EXPERT_STATS = EnvBool(False)
+    # #391c: fill the GGUF MoE offload's two tiers FROM THE WEIGHT STREAM.
+    # Without this the interception point is process_weights_after_loading,
+    # which the loader runs only after the complete load_weights pass -- so
+    # every owned expert first accumulates in host anon memory and the residency
+    # plan arrives too late to prevent the peak it exists to prevent (boot
+    # attempt 5 of #391: rank 0 OOM-killed at 90.7 GiB of anon on a swapless
+    # 98.5 GiB box). With it on, each expert is routed into its tier as it
+    # leaves the stream and the peak is pinned tier + one layer's expert set.
+    # Only ever consulted on a layer the offload already covers
+    # (FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1.0 and a ggml type with a MoE
+    # kernel), so a default GGUF boot is byte-identical either way. Set to 0 to
+    # fall back to the accumulate-then-materialize path -- a debugging switch,
+    # not an operating mode.
+    FLLIPER_MOE_GGUF_STREAM_STAGING = EnvBool(True)
+    # #391c: log the streaming stager's own byte accounting at every layer
+    # boundary (cumulative pinned/resident/streamed bytes plus the in-flight
+    # peak), so a boot's external RAM monitor can be cross-checked against what
+    # the code thinks it is holding. Off by default; pure logging.
+    FLLIPER_MOE_STAGING_TRACE = EnvBool(False)
+    # #396(a): materialize COLD experts on FIRST TOUCH instead of reading every
+    # one of them into the pinned host tier at load time. The tier is still
+    # allocated at load (so every byte figure and capacity check is unchanged);
+    # only the reads move to the first router hit for that expert, behind the
+    # same ``pool[row]`` accessor the #125 prefetch and the #394 cold shard
+    # already use -- neither consumer gains a branch. Requires a door that can
+    # hand ``stage_experts_into_tiers`` a per-expert ``ExpertFileRef``; a door
+    # that cannot stages eagerly regardless of this flag, so turning it on can
+    # never make a boot read LESS than it can prove it is able to re-read.
+    # Off by default: a lazy tier trades a shorter boot for a first-token stall
+    # per cold expert and for a hard dependency on the checkpoint staying in
+    # place, and neither is a default anybody should get without asking.
+    FLLIPER_EXPERT_LAZY_STAGING = EnvBool(False)
+    # Dump prefix; each rank writes "<prefix>.<rank_tag>.json". Default /tmp.
+    FLLIPER_EXPERT_STATS_PATH = EnvStr("")
+    # Additionally dump every N seconds (0 = only on exit / SIGUSR2).
+    FLLIPER_EXPERT_STATS_INTERVAL_SEC = EnvFloat(0.0)
+    # #407 cut 2: rank -> physical card UUID vector, one per WORLD rank in
+    # world_rank order, published by the launcher so no worker needs a
+    # collective to learn the group's placement (#394's link-proportional
+    # cold-expert shards are the first consumer). Normally written by
+    # _launch_subprocesses; set it by hand for a launch that does not go
+    # through it, and a hand-set value is never overwritten.
+    FLLIPER_RANK_CARD_UUIDS = EnvStr("")
+    # Licence for the LAUNCHER to create a CUDA context purely to resolve that
+    # vector. Off by default: the context costs a few hundred MiB on every
+    # visible card, in the process that is about to spawn workers onto them.
+    # Unnecessary with --rank-gpu-id, whose validation resolves the cards
+    # already.
+    FLLIPER_RANK_CARD_PROBE_CUDA = EnvBool(False)
+    # #394: weakest provenance the cold-expert host split may be weighted by --
+    # "measured" (the rigmon card probe's timed H2D, or an operator-supplied
+    # FLLIPER_MOE_HOST_SHARD_RATIO vector) or "estimate" (the NVML PCIe
+    # width x generation nameplate derivation). "absent" is not selectable in
+    # either setting; an unknown link yields an equal split, which is exactly
+    # today's assignment.
+    FLLIPER_MOE_HOST_SHARD_MIN_PROVENANCE = EnvStr("estimate")
+    # #394: allow cold-expert delegation on a layer whose ranks hold DISJOINT
+    # expert ranges (the #82 GGUF expert-dim shard). Off, because there it is
+    # unsound: a delegated expert is not relocated to a peer, it is absent, and
+    # the first token routed to it fails. Measured 2026-08-02 on V4-Flash TP=3 --
+    # all 43 layers staged, then every rank died on the first forward. The flag
+    # exists to develop the missing reachability mechanism (a shared-memory host
+    # pool, or replicated experts with an EP dispatch) against a real boot. It
+    # is not a performance option.
+    FLLIPER_MOE_HOST_SHARD_UNSAFE_DELEGATE = EnvBool(False)
+    # #394 slice 2: put this rank's cold expert pool in a NAMED SHARED segment
+    # (/dev/shm) instead of a private pinned allocation, and publish a manifest
+    # so peers can DMA a delegated expert's row out of it. This is the
+    # reachability mechanism the refusal above names as missing: with it on, a
+    # delegated cold expert is relocated rather than absent. Off by default --
+    # the tier costs a tmpfs-visible allocation and the shm size cap is not
+    # restart-persistent, so it is an explicit operator decision.
+    FLLIPER_MOE_COLD_TIER_SHM = EnvBool(False)
+    # Bounded wait for a peer's cold-tier manifest at the FIRST fetch, which is
+    # long after every rank has loaded. Not a barrier: it expires with a named
+    # error rather than hanging the group.
+    FLLIPER_MOE_COLD_TIER_MANIFEST_TIMEOUT_S = EnvFloat(30.0)
+    # #394 slice 2, graph seam: capture a decode graph over a layer whose cold
+    # rows live in a peer's segment. BOOT-PENDING -- the UVA device pointer for
+    # a peer mapping needs cudaHostGetDevicePointer on the registered range and
+    # has not been exercised on hardware, so the capturable installer refuses
+    # by default rather than capturing a graph over an address it has not
+    # verified. Graphs pin ADDRESSES, not contents, so the seam is sound in
+    # principle; this flag exists to prove it in a card window.
+    FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE = EnvBool(False)
+    # #394 slice 3: which policy produced the installed --rank-moe-ratio, so a
+    # #390 dump can tell a SOLVED vector from one an operator typed. Written by
+    # the launcher when it resolves "--rank-moe-ratio link"; read only by the
+    # expert-stats dump. An A/B arm that cannot identify itself is an A/B whose
+    # null result was never tested.
+    FLLIPER_MOE_COMPUTE_POLICY = EnvStr("")
+    # #394 slice 3 / #439: the "moe" family vector the solve held the RESIDENT
+    # expert mass against, i.e. the plan the boot would have run without
+    # "--rank-moe-ratio link". Written by the launcher next to the policy label
+    # above; read by the residency sizing in every worker so a rank that GAINS
+    # experts does not also gain resident VRAM. Absent = today's sizing.
+    FLLIPER_MOE_COMPUTE_BASE_PLAN = EnvStr("")
+    # #394 slice 3: per-rank cold-traffic coefficients ("a,b,c", mean 1),
+    # measured from a PRIOR boot's #390 dump with
+    # cold_traffic_coefficients_from_measurement. Without them the solve uses
+    # the first-order model (a cold expert is fetched, a resident one is not),
+    # which the reference-rig battery shows has a per-rank residual. There is
+    # deliberately no automatic dump -> launch path: a coefficient measured on
+    # one recipe is not a property of the rig.
+    FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS = EnvStr("")
+    # Weightless-KV streaming block-decode graphs (#136a): max decode capture
+    # bucket. Each bucket carries a full ladder block-wrapper pool (~8 MB int
+    # workspace per block), and the host-spill graph path only supports bs=1;
+    # larger decode batches fall back to the eager block loop.
+    FLLIPER_WL_GRAPH_MAX_BS = EnvInt(1)
+    # Weightless-KV streaming H2D prefetch / double-buffer (#136b): carve TWO
+    # block-sized staging regions and, inside the captured block-decode graph,
+    # issue each block's host-spill H2D copy on a side stream so it overlaps
+    # the previous block's attention (PCIe transfer hidden behind compute).
+    # Rank-local only -- no collective is added or reordered. Set 0 to restore
+    # the single-buffer serial-copy #136a behavior (A/B knob).
+    FLLIPER_WL_H2D_PREFETCH = EnvBool(True)
+    FLLIPER_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
+    FLLIPER_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    FLLIPER_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    FLLIPER_FP8_IGNORED_LAYERS = EnvStr("")
+    FLLIPER_FP4_IGNORED_LAYERS = EnvStr("")
+
+    # Flashinfer
+    FLLIPER_IS_FLASHINFER_AVAILABLE = EnvBool(True)
+    FLLIPER_FLASHINFER_USE_PAGED = EnvBool(False)
+    # Default to the pick from flashinfer
+    FLLIPER_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # #50 root fix: zero every flashinfer float workspace when a request
+    # finishes. The fa2 split-KV kernels read workspace regions the current
+    # forward did not write; on a fresh boot those read as first-touch zeros
+    # (the contract the kernels were validated against), afterwards as the
+    # previous request's partials — making outputs a function of the request
+    # ordinal (greedy near-tie flips; degenerate fixed point under cuda
+    # graphs). One ~384 MiB memset per finished request (~0.5 ms). Set 0 to
+    # restore the old (nondeterministic-across-requests) behavior.
+    FLLIPER_FLASHINFER_ZERO_WORKSPACE_PER_REQUEST = EnvBool(True)
+    # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
+    FLLIPER_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # fLLiper needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
+    FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
+    FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
+    # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
+    # None = standard attention. See https://arxiv.org/abs/2512.12087
+    FLLIPER_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    FLLIPER_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
+    FLLIPER_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+
+    # Triton
+    FLLIPER_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
+    FLLIPER_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    # QSA rows kernel launch (fnFL2 H58, layers/attention/qsa/sparse_attn.py):
+    # overrides the device-name-keyed (H20 / else L20) BLOCK_N / num_warps /
+    # num_stages table of sparse_attn_rows_triton, optionally per arch, e.g.
+    # "sm86:512=32/4/2,inf=64/4/2" (only sm86 changes) or "inf=32/8/2" (all).
+    # Empty = the table (default). Launch parameters only, same math.
+    FLLIPER_FORCE_QSA_ROWS_CONFIG = EnvStr("")
+    # QSA rows kernel fp8 decode (fnFL2 H65, same file): the kernel decodes
+    # every selected fp8 K/V byte once per (query, kv head) program; the
+    # default exp2 decode costs ~23 SASS instructions per element, ~95 % of
+    # the loop of every spill-free launch config (offline compiled, sm86 and
+    # sm120). "bits" = fp32 bit construction (~12), "ptx" = packed inline PTX,
+    # four bytes per instance (sm80+, ~3.5); both give the same value for all
+    # 256 codes. Grammar [smXX:]MODE[;...] (MODE exp2|bits|ptx), an arch group
+    # wins over a generic one, e.g. "sm86:ptx" moves only the 3080 stages.
+    # Empty = exp2 (default; the kernel compiles to the same SASS as before).
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_QSA_FP8_DECODE = EnvStr("")
+    # QSA prefix-free prefill launch (fnFL2 H65, F2 of H58, same file): the
+    # first chunk of a prompt and every short prefill run _sparse_gqa_prefill
+    # with the same table row, (16, 1, 2) above 512 rows = 3 warps per SM on
+    # sm86 and sm120 (offline compiled, latency-bound). The
+    # FLLIPER_FORCE_QSA_ROWS_CONFIG grammar, for this launch only, e.g.
+    # "inf=32/8/2". Empty = the table (default). Launch parameters only.
+    FLLIPER_PDFLIP_QSA_PREFILL_CONFIG = EnvStr("")
+    # QSA rows resolve on EAGER forwards (fnFL2 H65, qwen_sparse_attn_backend
+    # _qsa_rows_fused_route): True routes the P prefix chunks through the
+    # fused Triton resolve the graph path already uses (qsa/rows_resolve.py)
+    # instead of the torch chain, whose int64 top-k copy, gather, full_like and
+    # where hold ~0.57 GB per full-attention layer of a 16k chunk above the
+    # 134-MB rows. Same rows, bit-identical attention. False = torch chain.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_QSA_ROWS_FUSED_EAGER = EnvBool(False)
+
+    # Torch Compile
+    FLLIPER_ENABLE_TORCH_COMPILE = EnvBool(False)
+
+    # EPLB
+    FLLIPER_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
+    FLLIPER_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
+    FLLIPER_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
+    FLLIPER_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
+    FLLIPER_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
+    FLLIPER_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
+    FLLIPER_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
+    # Chunk size for the rebalance expert-weight P2P exchange; set
+    # >= num_physical_experts to submit a single batch_isend_irecv.
+    FLLIPER_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
+        32, deprecated_name="FLLIPER_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
+    )
+
+    # TBO
+    FLLIPER_TBO_DEBUG = EnvBool(False)
+
+    # DeepGemm
+    FLLIPER_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    FLLIPER_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
+    FLLIPER_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
+    FLLIPER_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
+    FLLIPER_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
+    FLLIPER_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
+    FLLIPER_DG_USE_NVRTC = EnvBool(False)
+    FLLIPER_USE_DEEPGEMM_BMM = EnvBool(False)
+    FLLIPER_DEEPGEMM_SANITY_CHECK = EnvBool(False)
+    FLLIPER_DEEPGEMM_PDL = EnvBool(True)
+    FLLIPER_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
+
+    # DeepSeek MHA Optimization
+    # Deprecated (#395): a flat token count does not scale with per-rank head
+    # count/head dim under (uneven) TP. Use --attn-scratch-budget-mib
+    # (ServerArgs), which is a MiB scratch budget converted to a per-rank
+    # token threshold at attention-layer init
+    # (attention_forward_methods/forward_mha.py). Still honored verbatim,
+    # with a deprecation warning, when explicitly set; mutually exclusive
+    # with --attn-scratch-budget-mib.
+    FLLIPER_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
+    FLLIPER_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
+
+    # DeepEP
+    FLLIPER_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated
+    FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    FLLIPER_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    FLLIPER_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+    # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
+    # default static local-batch path.
+    FLLIPER_DISABLE_STATIC_WATERFILL = EnvBool(False)
+
+    # NIXL-EP
+    FLLIPER_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    FLLIPER_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+
+    # DSA Backend (canonical names; fall back to FLLIPER_NSA_* with deprecation warning)
+    FLLIPER_DSA_FUSE_TOPK = EnvBoolWithAlias(
+        True, deprecated_name="FLLIPER_NSA_FUSE_TOPK"
+    )
+    FLLIPER_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
+    FLLIPER_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    FLLIPER_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
+        2048, deprecated_name="FLLIPER_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
+    )
+    FLLIPER_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
+        False, deprecated_name="FLLIPER_NSA_HIP_DISABLE_PRESHUFFLE"
+    )
+    FLLIPER_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    FLLIPER_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
+    FLLIPER_DSA_TOPK_BROADCAST = EnvBool(False)
+    FLLIPER_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+
+    # sgl-kernel
+    FLLIPER_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
+
+    # Flash Attention
+    FLLIPER_USE_SGL_FA3_KERNEL = EnvBool(True)
+
+    # Kernels
+    # Force every flliper.kernels BaseFusedOp onto one backend (a KernelBackend
+    # value, e.g. "torch" / "torch_compile" / "triton" / "cuda_aot"); unset =
+    # auto-select by priority. "torch" flips all fused ops to their pure-torch
+    # reference implementations for numerical-bug bisection.
+    FLLIPER_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
+    FLLIPER_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
+    FLLIPER_MOE_PADDING = EnvBool(False)
+    FLLIPER_CUTLASS_MOE = EnvBool(False)
+    HF_HUB_DISABLE_XET = EnvBool(False)
+    DISABLE_OPENAPI_DOC = EnvBool(False)
+    FLLIPER_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
+    FLLIPER_IS_FIRST_RANK_ON_NODE = EnvBool(True)
+    FLLIPER_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
+    FLLIPER_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
+
+    # Deterministic inference
+    FLLIPER_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
+    # If not set: auto (enabled when --enable-deterministic-inference is on)
+    # Set to 1: force enable (even without --enable-deterministic-inference)
+    # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
+    FLLIPER_USE_1STAGE_ALLREDUCE = EnvBool(False)
+    FLLIPER_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    FLLIPER_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
+    FLLIPER_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
+    FLLIPER_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
+    FLLIPER_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
+
+    # RoPE cache configuration
+    FLLIPER_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
+    FLLIPER_ROPE_CACHE_FP32 = EnvBool(False)
+    FLLIPER_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
+    FLLIPER_ROPE_CACHE_ALIGN = EnvInt(128)
+    # #656 T1: reserve the context ceiling's cos/sin rows instead of
+    # materializing them. Default OFF -- the eager cache is the shipped
+    # behaviour and this changes when memory is spent, which the KV sizer
+    # reads. See layers/rotary_embedding/lazy_cos_sin_cache.py.
+    FLLIPER_ROPE_LAZY_CACHE = EnvBool(False)
+    FLLIPER_ROPE_LAZY_CHUNK_ROWS = EnvInt(65536)
+    FLLIPER_ROPE_LAZY_MIN_ROWS = EnvInt(262144)
+    # Costs a device sync per batch. For proving the fill actually precedes
+    # every position that is read, never for serving.
+    FLLIPER_ROPE_LAZY_VERIFY = EnvBool(False)
+
+    # Overlap Spec V2
+    FLLIPER_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+
+    # Spec Config
+    FLLIPER_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # DFLASH-PRODUCE-ON-P (27B user decision 2026-09-24: "P ohne draft
+    # rechnen"; UNIFY S6: the p_draft axis cold = 0 / compute = 1): 0 = group P
+    # still BUILDS its DFlash draft-KV producer on the last PP stage (the draft
+    # bytes stay cold-resident: same VRAM, same planner cut, same exchange
+    # census and flip) but COMPUTES nothing with it -- no aux hidden capture on
+    # any PP stage, no DFlashDraftKvProducer.produce(), no
+    # publish_draft_rows_direct. Group D is unchanged and finds no draft pages
+    # (its existing cold path). The pdflip launcher always sets it on group P
+    # under --spec-form DFLASH (--dflash-produce-on-p, default off -> 0).
+    # Unset = 1 = the producer form as before (non-launcher boots).
+    FLLIPER_PDFLIP_DFLASH_PRODUCE = EnvBool(True)
+    # fnFL2 H1b: a NEXTN/MTP draft that shares the target's embed_tokens /
+    # lm_head MODULES builds no vocab table of its own (placeholders, replaced
+    # by init_lm_head). 0 restores the old form: both tables built in the
+    # weights_draft tag, then replaced (Next Flash: 2 x 1212.5 MiB dead reserve).
+    # UNIFY S3: default = the profile field ``draft.share_embed`` (nextflash
+    # on, qwen27b off -- the 27B line never had H1b); no form = on.
+    FLLIPER_PDFLIP_DRAFT_SHARE_EMBED = EnvBool(_profile_default("FLLIPER_PDFLIP_DRAFT_SHARE_EMBED", True))
+    # HICACHE-DRAFT-TIER (user order 2026-09-24 14:15Z: "und schreiben wir in D
+    # auch draft context in den hicache? das muesste raus, weil draft ja keinen
+    # hicacheplatz mehr bekommt"). off = the draft gets NO HiCache space on
+    # this rank: no draft host pool is registered (has_draft stays False), so
+    # there is no draft arena, no draft write-back, no draft lookup/read at a
+    # prefix restore or at admission; D builds its draft context cold (#993
+    # zeros + one bootstrap round). The pdflip launcher resolves its default
+    # `auto` (off when group P carries no draft producer, launcher
+    # p_group_has_draft_producer) and writes `off` into BOTH groups; on a rank
+    # anything but `off` (unset, auto, on) is the draft tier as before.
+    FLLIPER_PDFLIP_HICACHE_DRAFT_TIER = EnvStr("auto")
+    # 27B DPWAIT (release table row 28, 26.09.): the front's min-dwell (K7) prices a
+    # round trip with the last same-direction flip's flip_ms, and flip_ms INCLUDES the
+    # drain wait for running decodes (drain_quiesce_ms). Measured dkr27bnvfp4bar1agent
+    # 09252328: a D->P flip that drained 29.7 s recorded flip_ms=31115, and the next
+    # D->P was held 39.2 s by min-dwell (need 31115 ms, awake 8758 ms) while a batch
+    # waiter queued. On: the price is flip_ms - drain_quiesce_ms (the flip itself).
+    # DEFAULT ON since 03.10. (110: 27B w109290020 129x ':drain-<n>ms-excluded',
+    # NF 197 boots); =0 restores the flip_ms-with-drain price.
+    FLLIPER_PDFLIP_MIN_DWELL_EXCLUDE_DRAIN = EnvBool(True)
+    # H91d D-PARK DRAFT KV (user decision 2026-09-25: "Ausnahme nur fuers
+    # Parken"): the one exception to the tier being off. A PARKED group-D
+    # request (flip park before D's sleep, pressure park of the youngest)
+    # keeps its MTP draft rows -- the non-zero rows of its committed context,
+    # copied off the draft pool before the retraction into one pageable host
+    # buffer per request (L2, in-process, it survives the sleep) and written
+    # back at its new slots on the resume (pdflip/d_park_draft.py). Effective
+    # only on group D with FLLIPER_PDFLIP_D_PARK active and the draft tier off;
+    # nothing is pinned, nothing un-parked is touched. False = H91b byte for
+    # byte (the resumed request drafts over whatever its new slots held).
+    # UNIFY (operator 26.09.): default per profile (ModelProfile.standard_form):
+    # nextflash on, qwen27b off; on without a form (the NF code default).
+    FLLIPER_PDFLIP_ENABLE_D_PARK_DRAFT_KV = EnvBool(
+        _profile_default("FLLIPER_PDFLIP_ENABLE_D_PARK_DRAFT_KV", True))
+    # NF H91 STANDARD FORM on the front (pdflip/front.py): the phase policy's
+    # defaults (P phase cap 6, P pool 262144, D wait bound 60 s, leg-1 stall
+    # 180 s; an explicit front flag wins), rule 2 (D is done only when nothing
+    # is handed over or ready for it) and handoff_n/parked_n on D's wake (D's
+    # seats per phase). Default per profile (ModelProfile.standard_form):
+    # nextflash on, qwen27b off (the 27B front byte-identical); on without a
+    # form (the NF code default).
+    FLLIPER_PDFLIP_STANDARD_FORM = EnvBool(_profile_default("FLLIPER_PDFLIP_STANDARD_FORM", True))
+    # NF H91b D park (pdflip/d_seats.d_park_active; group D only): default per
+    # profile (ModelProfile.standard_form: nextflash on, qwen27b off); on
+    # without a form. d_seats reads the raw value with the same default (it
+    # also judges hand-built env mappings); an explicit value always wins.
+    FLLIPER_PDFLIP_D_PARK = EnvBool(_profile_default("FLLIPER_PDFLIP_D_PARK", True))
+    # 27B PARK (user decision 26.09. ~19:00Z): D->P waits for nothing -- a
+    # queued request whose pending tokens exceed X while D decodes parks D's
+    # running decodes at once (the H91b FLIP park only: no pressure park, no
+    # seats, no MTP draft carry) and the front flips to P (pdflip/front.py,
+    # pdflip/d_seats.d_flip_park_active). Default per profile
+    # (ModelProfile.d_park_immediate: ON on qwen27b and nextflash since
+    # 28.09.); off without a form. d_seats/front read it through
+    # pdflip.form.d_park_immediate_state (same default); explicit value wins.
+    FLLIPER_PDFLIP_D_PARK_IMMEDIATE = EnvBool(_profile_default("FLLIPER_PDFLIP_D_PARK_IMMEDIATE", False))
+    # F3 (29.09., FLIPZEIT-VERLAUF-0929.md): after D's wake the hand-offs of the
+    # wake decode FIRST -- a flip-parked resume whose tail extend exceeds
+    # FLLIPER_PDFLIP_D_DECODE_FIRST_TAIL tokens (~2 s expert pass on NF-D) waits
+    # in the D park gate (pdflip/d_seats.admission_gate) until the wake's
+    # members had their first decode round, at most
+    # FLLIPER_PDFLIP_D_DECODE_FIRST_ROUNDS decode rounds. Off = the gate byte for
+    # byte (parked first, newcomers wait).
+    FLLIPER_PDFLIP_ENABLE_D_DECODE_FIRST = EnvBool(False)
+    FLLIPER_PDFLIP_D_DECODE_FIRST_TAIL = EnvInt(8)
+    FLLIPER_PDFLIP_D_DECODE_FIRST_ROUNDS = EnvInt(32)
+    # F4 (#259 4c, 29.09.): D's flip park (pdflip/d_park_runtime.park_running)
+    # writes the END state of every running request -- KV rows up to the last
+    # consumed token, the open QSA group's ring, the GDN/PLE slot -- as an
+    # END-only tail part (P's hand-off format, pdflip/tail_handoff
+    # publish_park_end); the resume is then E2's skip (no tail extend, ~2 s
+    # expert pass on NF-D). Needs FLLIPER_PDFLIP_TAIL_SKIP_EXTEND; refused by
+    # name under uneven DCP / the token cut. Off = the park byte for byte.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_ENABLE_D_PARK_END = EnvBool(False)
+    # PARK-COLLECT-WINDOW (29.09., NF z30w-park 08:31-08:46: 21 immediate parks
+    # in 15 min, 37 parked streams, park->resume median 8.4 s / p90 17.8 s --
+    # the user's stream stuttered). User decision 29.09. ~09:15Z, for qwen27b
+    # AND nextflash: D keeps decoding; once the queued P work passes
+    # THRESHOLD_TOKENS (0 = X) it collects -- SKI RENTAL: until the queued
+    # requests' summed wait reaches what the park costs, one measured flip
+    # round trip per running stream (K7's D->P + P->D + wake -> first decoded
+    # chunk: this boot's, else the newest record of this model x form, else 0
+    # = the immediate park). D running nothing or a hard cap
+    # (p_phase_max_requests, P's pool, d_wait_bound_s) fires at once. Off =
+    # the immediate park byte for byte.
+    # WINDOW_S: a fixed timer x instead of the measured price (override only).
+    FLLIPER_PDFLIP_ENABLE_PARK_COLLECT_WINDOW = EnvBool(False)
+    # PARK-SEAT-FREE (27B flip layout, 02.10.; N3o ...10020544: the collect
+    # window held P-bound arrivals 20-46 s while D ran 1-4 of its 6 seats --
+    # DP-WAIT hold_by=d-work, p90 60 s; NF prefills after ~2 s). The NF
+    # ARRIVAL-SEAT rule's case (a), user 29.09. ~19:40Z, ported minimal: with
+    # the collect window on, a P-bound queue head while a D seat is FREE
+    # (running + hand-offs + ready_for_d < --d-bs) parks at once -- no collect
+    # window -- behind the immediate park's own dwell and NF's MIN-DWELL (a
+    # decode D resumed this phase first decodes one measured round trip). No
+    # seat free: the collect window decides as before. Not ported: NF's KV
+    # ladder test, the youngest/KV displacement, the AGE plan. Off = the
+    # collect window byte for byte.
+    FLLIPER_PDFLIP_ENABLE_PARK_SEAT_FREE = EnvBool(False)
+    FLLIPER_PDFLIP_PARK_COLLECT_WINDOW_S = EnvFloat(None)
+    FLLIPER_PDFLIP_PARK_COLLECT_THRESHOLD_TOKENS = EnvInt(0)
+    # PARK-WINDOW-GATE (27B decision 29.09. ~13:55Z, F22 audit: the park RPC
+    # waits for D's running pass -- NF z30w median 0.40 s / p90 2.32 s, 27B
+    # z30j 0.66 / 1.15 s, max 3.31 s): while the collect window HOLDs, the
+    # front sends D its deadline and D's X-COST-LINE; D admits no extend whose
+    # forward would end after it (pdflip/park_window_gate). The window stays the
+    # one decision site. Front-side switch, model-neutral; off = nothing sent,
+    # D's admission byte for byte. Off until the first boot series, then on.
+    FLLIPER_PDFLIP_ENABLE_PARK_WINDOW_GATE = EnvBool(False)
+    # ARRIVAL-SEAT (user 29.09. ~19:40Z, pdflip/arrival_seat_rule.py): while D
+    # decodes, an arrival that finds a free D seat and fits D's free KV is
+    # prefilled at once -- on D (uncached <= X) or by an immediate flip to P
+    # (no collect window); without a seat nothing flips and it waits for the
+    # next seat in arrival order; the wait bound parks the youngest decode.
+    # With it on, PARK-COLLECT-WINDOW and PARK-WINDOW-GATE are inert. Front-
+    # side, model-neutral. Off until the first series, then on.
+    FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE = EnvBool(False)
+    # ARRIVAL-SEAT: the decode part of an arrival's KV need when the client
+    # set no max_tokens (prompt + this = the need checked against D's free KV).
+    FLLIPER_PDFLIP_ARRIVAL_DECODE_RESERVE_TOKENS = EnvInt(2048)
+    # ARRIVAL-SEAT AGE PLAN (Nutzer 30.09. ~14:40Z/14:45Z, the seat policy):
+    # age has the right of way; a younger request that fits beside older
+    # running ones is backfilled (no time limit); the oldest waiter displaces
+    # younger running decodes ONLY when it does not fit otherwise -- the
+    # fewest youngest that make it fit (seat and KV), and only when they do.
+    # ONE displacement logic, on D (d_park_runtime.displace_for_age, SEAT-AGE
+    # seat/KV trigger + victims_needed on D's real KV); the front only orders
+    # by age across the P and D waiters, admits a head D can make fit, and
+    # backfills past heads their elders block -- no front park, no wait-bound
+    # blanket park, no clock on the backfill. Needs
+    # FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE; 0 = the ARRIVAL-SEAT/#246 front.
+    FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_AGE_PLAN = EnvBool(True)
+    # ARRIVAL-SEAT MIN-DWELL (NF-Operator 30.09., y5c: pdflip-0-2 parked 6x by
+    # flip_now, park 4 came 1.1 s after its resume): a flip_now to P waits
+    # until the decodes this D phase RESUMED have decoded since their resume
+    # at least one measured flip round trip -- the price X-COST-LINE / K_FLIP
+    # use (live warm legs > record of this checkpoint x form; unmeasured =
+    # no hold, named). The arrival waits in arrival order meanwhile (its seat
+    # stays its own under the AGE PLAN), is never rerouted. Name ordered by
+    # the operator (no ENABLE verb). DEFAULT OFF since 02.10. (user rule: an
+    # arriving request is prefilled at once, no grace for running decodes; NF:
+    # DP-WAIT hold_s=1.6-1.9 hold_by=d-work+min-dwell). 1 = the hold again.
+    FLLIPER_PDFLIP_ARRIVAL_MIN_DWELL = EnvBool(False)
+    # ARRIVAL-SEAT KV reading budget (NF D->P flip, 01.10. bfpgwv): how long
+    # the controller tick waits for a FRESH /server_info from D before it
+    # decides on the last reading it has. D answers /server_info only at its
+    # scheduler pass boundary, and so does the park RPC that follows a
+    # flip_now -- a blocking read put the park one whole D pass later (6 of
+    # the 6 bfpgwv D->P flips over 4 s: `kv=unread` after the 2.0 s timeout,
+    # park RPC 1.0-5.1 s). The refresh keeps running in the background and
+    # lands for the next tick; no reading at all (boot, after a KV park)
+    # still waits for D as before. Seconds; 0 = never wait for a refresh.
+    FLLIPER_PDFLIP_ARRIVAL_KV_READ_BUDGET_S = EnvFloat(0.05)
+    # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
+    # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
+    # solo r_D probe never fired under load). X is re-solved from D's measured
+    # cost line a + b*n + c*n*prefix over D's own prefill forwards (the
+    # `Prefill rank batch` gpu-ms, published as a ring -- valid while D
+    # decodes, mixed chunk is off), priced by the ski instrument's warm round
+    # trip and amortised over the mean requests per P phase; P's side is its
+    # own cost line from the same ring on PP0 (the bottleneck stage), read
+    # after each P drain -- the drain r_P only while P has neither a fit nor a
+    # record (it counts P's waits: 27B 09290020 drain 1437 tok/s, PP0 9180):
+    #     X* = (price/k + a_P - a_D) / (b_D + c_D*prefix - b_P - c_P*prefix)
+    # The seed is the newest record of this model x form (kind x_cost_line),
+    # never a constant; the hard 4096 floor gives way to the fitted range's
+    # lower edge, the ceiling (--x-ceiling-tokens) stays. Off = the solo-r_D
+    # re-solve byte for byte.
+    # FIT_MIN_TOKENS: forwards below it are D's cheap tail extends, not the
+    # expert-streaming prefill the line describes (z30w TP0: 1-31 new tokens
+    # 46-106 ms mean, 32-511 tokens 1583-2199 ms). FIT_MIN_SAMPLES: forwards
+    # the live fit needs before it replaces the record.
+    # DEFAULT ON (29.09., Leistungsschalter rule): metal proof 27B z30y
+    # 09291331 (895559fed2) -- "X COST-LINE RE-SOLVE X=5120 <- 4096 X*=5878
+    # (ok)", RECORD side=D a=190 b=0.575 n=9, side=P b=0.138 n=62. The
+    # mechanism is model-neutral; NF confirms it in the first z30y2 series
+    # (back to off if it fails there). =0 is the solo-r_D re-solve.
+    FLLIPER_PDFLIP_ENABLE_X_COST_LINE = EnvBool(True)
+    FLLIPER_PDFLIP_X_COST_FIT_MIN_TOKENS = EnvInt(64)
+    FLLIPER_PDFLIP_X_COST_FIT_MIN_SAMPLES = EnvInt(8)
+    # 27B review of 800bb82ac6: a fit only from a window with n_hi/n_lo >=
+    # MIN_SPREAD and >= MIN_BIG forwards of >= 1024 tokens (else the whole
+    # boot's line, else the record, named); one re-solve moves X by at most
+    # MAX_STEP of the previous X (hysteresis against D/P route flapping).
+    FLLIPER_PDFLIP_X_COST_FIT_MIN_SPREAD = EnvFloat(4.0)
+    FLLIPER_PDFLIP_X_COST_FIT_MIN_BIG = EnvInt(8)
+    FLLIPER_PDFLIP_X_COST_MAX_STEP = EnvFloat(0.25)
+    # X-K-FLIP (30.09., NF y5a front): the X COST-LINE re-solve amortised the
+    # flip's round trip over k = the MEAN requests per P phase of the boot
+    # (mean-of-19 = 2.4-2.6, inflated by the dmatrix 6-request bursts), so the
+    # live X fell 4096 -> 1440-1900 and 8 flips were fired by ONE agent request
+    # of 2087-2940 new tokens (k real 1-2). On: X in force = the lone request's
+    # (k=1, ~4200 on y5a's lines); an arrival is routed on the X of the flip it
+    # would take (1 + requests queued for P now). The mean stays display-only.
+    # Default on for the NF freeze (y5c): the routing rule itself, not a tuning.
+    FLLIPER_PDFLIP_X_K_FLIP = EnvBool(True)
+    # PDFLIP-X (02.10.): X-COST-LINE's price = the measured LONG excursion the
+    # request waits (R28 DP-WAIT wait_s of LONG arrivals + LEG2-FIRST-CONTENT
+    # via=after_p, warm, the acceptance probe's manual flips excluded), NOT
+    # divided by k; k samples skip manual-flip phases. Model-neutral (NF shares
+    # the solver). 0 = the ski price (warm legs + resume) / k, byte for byte.
+    FLLIPER_PDFLIP_X_EXCURSION_PRICE = EnvBool(True)
+    # PDFLIP-B (02.10., N5d ping-pong): with the excursion price the X-SOLO band
+    # floor (X_busy / start X) and FLIP-ECONOMICS' threshold follow the live X;
+    # a park-closed admission is labelled "park", not "fairness", in MIN-DWELL.
+    # 0 = the band floor and the threshold as before.
+    FLLIPER_PDFLIP_X_BAND_FOLLOWS_PRICE = EnvBool(True)
+    # K7-DWELL idle skip (02.10., N5j 13:50:12-15: D just woke, nothing to decode,
+    # a LONG waiting; MIN-DWELL held the idle D 2.2 s until awake >= the derived
+    # 2586 ms). The D->P min-dwell only holds while D has work (running decodes,
+    # a hand-off in flight or ready_for_d); an idle D flips at once (NF cd12370e30
+    # names: "PDFLIP ARRIVAL-SEAT K7-DWELL skip ... d_running=0",
+    # arrival_seat_k7_dwell_skip_idle). 0 = the dwell holds an idle D as before.
+    FLLIPER_PDFLIP_K7_DWELL_IDLE_SKIP = EnvBool(True)
+    # MANUAL-FLIP RETURN-SKIP (02.10., L15 boot dac8b62b8c 14:43:03): POST /pdflip/flip
+    # from D skips its return half P->D while P-bound work waits (P outstanding or
+    # a queued request that needs P); P stays awake ("PDFLIP MANUAL-FLIP RETURN-SKIP
+    # reason=..."). 0 = the round trip always returns to D, as before.
+    FLLIPER_PDFLIP_MANUAL_FLIP_RETURN_SKIP = EnvBool(True)
+    # GC-GUARD (02.10., N5q epoch 4: 'PDFLIP-FRONT GC-PAUSE generation=2 ms=92
+    # collected=0' between the P>D done and the D>P begin): the front never lets
+    # CPython start a generation-2 pass on its own; the due pass runs when no flip
+    # is open and no verdict waits (pdflip/front_gc_guard.py), the warm-up end
+    # freezes the heap again, a slow pass refreezes its survivors. Markers
+    # 'PDFLIP-FRONT GC-GUARD armed=|full reason=|warm-freeze|refreeze'.
+    # 0 = CPython's own schedule, as before.
+    FLLIPER_PDFLIP_FRONT_GC_GUARD = EnvBool(True)
+    # GC-GUARD: a due full pass waits at most this long for a moment without
+    # queued work; then it runs at the next moment no flip is open.
+    FLLIPER_PDFLIP_FRONT_GC_MAX_DEFER_S = EnvFloat(30.0)
+    # DONE-KICK (02.10., N5q epoch 4: the LONG pdflip-3-5 queued at 13.541 during a
+    # P>D flip; done 13.854, the controller's next 0.2 s tick decided at 14.038):
+    # a P>D flip that closes with P-bound work queued wakes the controller at
+    # once -- the same D-branch decision (economics, MIN-DWELL, fairness), only
+    # not one tick later. Marker 'PDFLIP-FLIP DONE-KICK'. 0 = the tick, as before.
+    FLLIPER_PDFLIP_CTL_KICK_DONE_QUEUED = EnvBool(True)
+    # PROBE-FAST (02.10., N5q epoch 4: 'L3-INDEX-PRESENCE ... kv_pages=74064
+    # probe_ms=413.3' before the ROUTE-VERDICT): the front's store presence
+    # probe encodes each page stem once and asks the L3 index and every arena
+    # over the same char ** in C (pdflip/front_store.py) -- the same Depth.
+    # Marker: 'probe=fast' on the L3-INDEX-PRESENCE line. 0 = the per-stem form.
+    FLLIPER_PDFLIP_FRONT_PROBE_FAST = EnvBool(True)
+    # PARK-READ-DETACH (02.10., L15 boot dac8b62b8c D 14:43:49: '#1068 RESET JOIN
+    # terminated_ops=1 joined_s=1.29', 'PDFLIP-SLEEP-SUB alloc_clear=1414'): the sleep
+    # flush's reset terminates the open store reads of D's park list and joins their
+    # thread in a background reaper (which restarts the pipeline) instead of
+    # synchronously -- only while no store->host page transfer is in flight. Marker
+    # '#1068 RESET JOIN ... detached=prefetch' / '#1068 PARK-READ-DETACH reaped'.
+    # 0 = the reset joins as before.
+    FLLIPER_PDFLIP_PARK_READ_DETACH = EnvBool(True)
+    # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
+    # 0 PDFLIP-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
+    # worker takes the E2 END state of a hand-off -- its owned K/V rows at
+    # their compact slots and the QSA pending ring -- instead of refusing it,
+    # so the group votes 2 and the extend is skipped again. Off = the refusal.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, pdflip/form.py); this global default stays (27B).
+    FLLIPER_PDFLIP_ENABLE_CUT_WORKER_END = EnvBool(False)
+    # Fix B (pdflip/p_row_authority.py): the #631 row form on group P
+    # (ModelProfile.p_row_authority: qwen27b on since the agent-load proof
+    # w109290020 29.09., nextflash off); explicit wins, no form off.
+    FLLIPER_PDFLIP_P_ROW_AUTHORITY = EnvBool(_profile_default("FLLIPER_PDFLIP_P_ROW_AUTHORITY", False))
+    # H91d: the L2 bound of those buffers per rank (MiB). A FLIP park whose
+    # buffer would pass it goes to L3 (a file under
+    # FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR/pdflip_d_park_draft, written in the
+    # background, the RAM freed once written); a PRESSURE park (no sleep) is
+    # then not carried. 256 = one full 262k context of NF's draft (~1 KiB/token).
+    FLLIPER_PDFLIP_D_PARK_DRAFT_KV_HOST_MIB = EnvInt(256)
+    FLLIPER_RAGGED_VERIFY_MODE = EnvStr("static")
+    FLLIPER_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    FLLIPER_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
+    # Saves the per-step draft forward, but the draft KV goes stale: an upshift
+    # back to steps>0 starts from a cold draft state (low accept until it recovers).
+    FLLIPER_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Debug/stress: on every swap of an adaptive graph-memory state, all-gather
+    # (swap ordinal, target steps) over the TP CPU group and assert equality.
+    # Turns a rank-divergent swap (a #50-class bug) into an immediate failure
+    # instead of silent corruption. Costs one gloo collective per swap (~0.1/s).
+    FLLIPER_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC = EnvBool(False)
+    # TEST-ONLY: force an adaptive runtime-state swap every N verify
+    # completions, cycling through the candidate steps (rank-deterministic:
+    # driven by the verify-call counter, identical on all ranks). Overrides the
+    # EMA decision; use to stress the offload swap path, never in production.
+    FLLIPER_ADAPTIVE_FORCE_SWAP_INTERVAL = EnvInt(0)
+    # Adaptive graph-memory offload: minimum free VRAM (MiB) that must remain
+    # AFTER mapping the largest candidate state, enforced at boot
+    # (finalize_boot). Covers eager-forward transient allocations (mamba
+    # chunked-prefill recompute etc.) that run while a state is mapped.
+    # Measured on the T102 rig: 148 MiB post-map free OOM'd at KV-full deep
+    # prefill, 1367 MiB survived; 512 is the enforced floor between them.
+    FLLIPER_ADAPTIVE_SERVING_MARGIN_MIB = EnvInt(512)
+    # Stage-2 graph-memory offload fallback: back the per-state CUDA-graph
+    # capture pools up to host RAM on pause and restore the exact bytes on
+    # resume, instead of relying on replay's rewrite-before-read property
+    # over undefined resume content. Costs ~capture-pool-size of host RAM per
+    # state and a PCIe round-trip per swap.
+    FLLIPER_ADAPTIVE_CAPTURE_CPU_BACKUP = EnvBool(False)
+    # Cap on the number of TAGGED adaptive states mapped at once (offload
+    # modes). 0 = the finalize_boot residency budget alone decides (fn8s4
+    # behaviour: every state that fits stays mapped). 1 = #93/#102's rule
+    # "reserve max(one state), not sum". fnFA25/26/27 (Form A, 2026-09-20)
+    # OOM'd on the 5090 in round 17 with k1+k2 both mapped under the budget
+    # rule; under a Weg-2 flip the boot-time budget is stale by construction.
+    FLLIPER_ADAPTIVE_GRAPH_MEMORY_MAX_RESIDENT = EnvInt(0)
+    # Per-round adaptive draft chain length (topk=1 chains only), on top of
+    # --speculative-adaptive. Where --speculative-adaptive picks the chain
+    # length from the EMA of *observed* accept lengths every update_interval
+    # batches, this picks it every round from the draft model's own top-1
+    # confidence: survival = cumprod of the per-step top-1 probability, and
+    # k* = argmax (1 + sum survival) / cost(k). Deliberately NOT named
+    # FLLIPER_SPEC_ADAPTIVE: that word is already taken by the server arg for
+    # the EMA policy, and two different mechanisms under one name is how a
+    # later reader picks the wrong one. Requires --speculative-adaptive, which
+    # owns the per-candidate runtime states (CUDA graphs) this switches between.
+    FLLIPER_SPEC_ADAPTIVE_CHAIN = EnvBool(False)
+    # Never draft fewer than this many steps, even at zero confidence.
+    FLLIPER_SPEC_ADAPTIVE_CHAIN_MIN_STEPS = EnvInt(1)
+    # Cost prior, "draft:<ms>,verify:<ms>" (e.g. "draft:2.5,verify:26"). Seeds
+    # cost(k) = verify + k * draft until enough rounds at that k have been
+    # measured; a malformed entry falls back to the built-in default.
+    FLLIPER_SPEC_ADAPTIVE_CHAIN_COST_MS = EnvStr("")
+    # Log a "[spec-adaptive]" histogram of chosen k every N rounds. 0 = never.
+    FLLIPER_SPEC_ADAPTIVE_CHAIN_LOG_EVERY = EnvInt(0)
+    # Rounds a chain length is held before the policy may reconsider it. Two
+    # jobs: it amortises the graph-memory swap a switch can cost (measured
+    # fn8s4 2026-09-20: mean 33.5 ms against a ~38 ms round, break-even ~5
+    # rounds), and it confines the decision -- and the one broadcast that makes
+    # it rank-identical -- to every Nth round. 0 disables both (decide every
+    # round); the default is set from the measured break-even with headroom.
+    FLLIPER_SPEC_ADAPTIVE_CHAIN_MIN_DWELL = EnvInt(8)
+    # Hysteresis: relative throughput improvement a candidate chain length must
+    # show before the incumbent is given up, in percent. The break-even gate
+    # alone stops paying for swaps; it does NOT stop two near-equal lengths
+    # trading places on estimate noise, and with every candidate state resident
+    # (plan_residency) the swap term is honestly 0.0 so the gate degenerates
+    # into a bare ">". 0 disables the margin (pre-2026-09-20 behaviour).
+    #
+    # MUST STAY WELL UNDER THE EFFECT SIZE, and 2 % is not a round number
+    # picked for looking modest. Measured on the 27B A/B of 2026-09-20: the
+    # whole spread between the best and the worst chain length was 4.5 %
+    # (k=3 at 0.0673 vs k=5 at 0.0644 tok/ms). A 5 % margin -- which reads as
+    # conservative -- is larger than that spread, so it suppresses the k=5 ->
+    # k=3 correction this regulator exists to make and silently reproduces the
+    # bug it was added next to. Caught by the closed-loop test in
+    # test_adaptive_chain_throughput.py, not by review. Raising this is
+    # therefore a decision about which real gains to give up, not a safety
+    # tightening; re-measure the spread before touching it.
+    FLLIPER_SPEC_ADAPTIVE_CHAIN_SWITCH_MARGIN_PCT = EnvFloat(2.0)
+    # fnFL2 H27: one "SPEC-ADAPT-CENSUS" line every N chain-policy rounds
+    # (histogram, measured accept/cost/tok-s per k, switches, fallback). 0 =
+    # never. The per-switch "SPEC-ADAPT k=a->b reason=..." line is always on.
+    FLLIPER_SPEC_ADAPTIVE_CHAIN_CENSUS_EVERY = EnvInt(50)
+    # fnFL2 H27 regret guard, in percent; 0 = off. After warm-up, when a whole
+    # census period delivered fewer tok/s than the fixed length's own measured
+    # rate minus this margin, for two periods in a row, the deciding rank
+    # broadcasts the fallback and EVERY rank holds --speculative-num-steps for
+    # the rest of the process (sticky, collective-free from then on).
+    FLLIPER_SPEC_ADAPTIVE_CHAIN_REGRET_PCT = EnvFloat(0.0)
+    # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
+    # eager. Escape hatch for setups where the capture's memory pool costs more
+    # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
+    # capacity).
+    FLLIPER_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
+    # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
+    # extend_attention_fwd for unsupported cases or when set false (e.g. for
+    # debugging). Correctness is unaffected; this only changes performance.
+    FLLIPER_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
+    # page alignment). Off in prod; tests turn it on to fail-fast on
+    # numerical / index violations instead of getting silent NaN cascades.
+    FLLIPER_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # In-kernel slot-id bound check for the masked KV writers (#355). Unlike
+    # FLLIPER_ENABLE_ASYNC_ASSERT above this is DEFAULT ON and costs no extra
+    # kernel launch: the compare runs in-register against a by-value bound the
+    # writer already knows, the same mechanism store_cache uses since #352. Set
+    # to 1 only to prove the check is what a slowdown is caused by -- with it
+    # off, an out-of-range slot id corrupts KV silently again.
+    FLLIPER_DISABLE_KV_MASKED_BOUND_CHECK = EnvBool(False)
+    # Sanitize NaN logits before sampling kernels and log a throttled warning
+    # (see sanitize_nan_logits).
+    FLLIPER_SANITIZE_NAN_LOGITS = EnvBool(False)
+
+    # VLM
+    FLLIPER_VLM_CACHE_SIZE_MB = EnvInt(100)
+    FLLIPER_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    FLLIPER_RESIZE_RESAMPLE = EnvStr("")
+    FLLIPER_MM_BUFFER_SIZE_MB = EnvInt(0)
+    FLLIPER_MM_PRECOMPUTE_HASH = EnvBool(False)
+    FLLIPER_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    # Use the fully-vectorized ViT position-embedding interpolation (no per-image
+    # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
+    # set False to fall back to the per-image loop.
+    FLLIPER_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
+    FLLIPER_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Let the GPU-passive tokenizer process preprocess multimodal data on a
+    # worker's card again (nvJPEG decode, fast-image-processor resize/normalize,
+    # pinned video frames). Off by default since #403: the context it opens is
+    # invisible to every per-rank memory budget and the tensors are copied back
+    # to the host before they leave the process anyway. See
+    # multimodal/processors/base_processor.mm_frontend_gpu_enabled.
+    FLLIPER_MM_FRONTEND_GPU_PREPROCESS = EnvBool(False)
+    # For pre-tokenized (list[int]) multimodal prompts,
+    # preserve the user's original tokens to avoid retokenization drift.
+    FLLIPER_MM_AVOID_RETOKENIZE = EnvBool(True)
+
+    # VLM Item CUDA IPC Transport
+    FLLIPER_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
+    FLLIPER_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
+    FLLIPER_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
+    FLLIPER_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
+
+    # Mamba
+    FLLIPER_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
+    FLLIPER_MAMBA_SSM_DTYPE = EnvStr(None)
+
+    # Unified Radix Tree
+    FLLIPER_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+
+    # CUDA Graph
+    FLLIPER_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
+    FLLIPER_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
+
+    # Release & Resume Memory
+    FLLIPER_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+
+    # Sparse Embeddings
+    FLLIPER_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+
+    # Logits processor
+    FLLIPER_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
+    FLLIPER_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+
+    # Tool-Call behavior
+    FLLIPER_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+
+    # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
+    FLLIPER_MAX_THINK_TOKENS = EnvInt(-1)
+
+    # Ngram
+    FLLIPER_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+
+    # Warmup
+    # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.
+    # Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
+    FLLIPER_WARMUP_TIMEOUT = EnvFloat(-1)
+
+    # HTTP Server
+    FLLIPER_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
+    # too short when many workers cold-start and load tokenizers in parallel.
+    FLLIPER_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
+
+    # Health Check
+    FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+
+    # Crash diagnostics
+    FLLIPER_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
+    FLLIPER_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
+    FLLIPER_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
+
+    # Encoder gRPC
+    FLLIPER_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
+    # Encoder receiver selection: http|grpc (used by EPD paths).
+    FLLIPER_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
+
+    # Native gRPC server. FLLIPER_GRPC_PORT is the env fallback for the
+    # --grpc-port CLI flag; setting either enables the native server alongside
+    # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI
+    # surface).
+    FLLIPER_GRPC_PORT = EnvInt(None)
+    FLLIPER_GRPC_WORKER_THREADS = EnvInt(4)
+
+    # External models
+    FLLIPER_EXTERNAL_MODEL_PACKAGE = EnvStr("")
+    FLLIPER_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
+    FLLIPER_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
+
+    # Numa
+    FLLIPER_NUMA_BIND_V2 = EnvBool(True)
+    FLLIPER_AUTO_NUMA_BIND = EnvBool(False)
+    FLLIPER_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
+
+    # Metrics
+    FLLIPER_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
+    FLLIPER_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+
+    # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
+    FLLIPER_PATCH_TOKENIZER = EnvBool(True)
+
+    # TokenizerManager
+    FLLIPER_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
+
+    # ZBAL, zero buffer accelerate library, currently worked only in npu
+    FLLIPER_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
+    FLLIPER_ZBAL_BOOTSTRAP_URL = EnvStr("")
+
+    FLLIPER_DEFAULT_THINKING = EnvBool(False)
+
+    # ====================================================================
+    # DeepSeek V4
+    FLLIPER_OPT_DPSK_V4_RADIX = EnvBool(True)
+    FLLIPER_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
+    FLLIPER_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
+    FLLIPER_OPT_USE_AITER_MHC_PRE = EnvBool(True)
+    FLLIPER_OPT_USE_AITER_MHC_POST = EnvBool(True)
+    FLLIPER_OPT_USE_AITER_SILU_MUL = EnvBool(False)
+    FLLIPER_OPT_USE_FUSED_COMPRESS = EnvBool(False)
+    FLLIPER_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
+    FLLIPER_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
+    FLLIPER_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
+    FLLIPER_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
+    FLLIPER_FIX_MTP_HC_HIDDEN = EnvBool(False)
+    # ====================================================================
+
+    # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
+    FLLIPER_DSV4_FP4_EXPERTS = EnvBool(True)
+    FLLIPER_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
+    # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
+    FLLIPER_DSV4_REASONING_EFFORT = EnvStr("")
+
+    # CUDA kernels
+    FLLIPER_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    FLLIPER_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
+    FLLIPER_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    FLLIPER_DSV4_MHC_PREWARM = EnvBool(True)
+    FLLIPER_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
+    FLLIPER_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
+    FLLIPER_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    FLLIPER_OPT_USE_AITER_INDEXER = EnvBool(False)
+    FLLIPER_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
+    # Per-rank local query rows (after DP-attention sharding when enabled),
+    # not request ISL.
+    FLLIPER_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+    FLLIPER_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
+    FLLIPER_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    FLLIPER_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
+    FLLIPER_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Deprecated: DSV4 compressor V2 is always used.
+    FLLIPER_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
+    FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # Sequence-axis chunk (in KV positions) of the torch paged-MQA-logits
+    # implementation. Bounds its peak intermediate at O(batch x chunk x heads)
+    # instead of O(batch x context x heads); see #426 / upstream #33246. Must
+    # be a multiple of the 64-position page; 0 disables chunking (one pass over
+    # the whole sequence, the pre-#426 shape).
+    FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK = EnvInt(8192)
+    # Query-axis chunk of the same implementation, expressed as a per-rank MiB
+    # budget for the transient working set of ONE (query chunk x KV chunk)
+    # step -- not a row count, because the bytes a query row costs scale with
+    # the head count and with the KV chunk width, so a flat row count is not
+    # comparable across geometries (same reasoning as --attn-scratch-budget-mib,
+    # #395). Bounds the per-query-token duplication of the KV gather described
+    # in ANALYSE_447 section 2.3 L1. 0 disables it (one pass over the whole
+    # query axis, the pre-#449 shape). See #449.
+    #
+    # THE DEFAULT MUST BIND (#493). #449 shipped 2048 MiB and NOTE_449 section 5
+    # names it for what it was: "a ceiling picked at desk, not a tuned value".
+    # It is above the peak it was meant to bound on the geometry this fork
+    # actually serves, so the cap was inert. On the DeepSeek-V4-Flash C4 indexer
+    # (index_n_heads=64, index_head_dim=128, heads replicated) one query row
+    # costs `chunk_seq * 1160` bytes, so at --chunked-prefill-size 256:
+    #   SEQ_CHUNK 2048 -> 2.27 MiB/row -> 580 MiB for 256 rows; 2048 MiB permits
+    #                     903 rows, i.e. it never binds;
+    #   SEQ_CHUNK 8192 (this file's default) -> 9.06 MiB/row -> 2320 MiB for 256
+    #                     rows; 2048 MiB permits 225 rows, i.e. it trims 12 %.
+    # Window 3 of 2026-08-03 measured what that costs: both 3080 ranks fell from
+    # 873 MiB free to 271 MiB during the deep DSV4F prefill, a 602 MiB excursion
+    # (a LOWER bound -- the sampler ran at 1 Hz against a sub-second transient),
+    # breaching the 400 MiB corridor floor on 214 samples. The model for that
+    # run is 588 MiB: 580 MiB of loop step (256 rows at SEQ_CHUNK 2048) plus
+    # 8 MiB of returned logits at the C4 indexer span of 8196 -- the indexer
+    # runs on the compress_ratio-4 span, not on the 32768-token prompt. Raising
+    # --rank-auto-reserve-mib by 500 MiB did not move that floor: the reserve
+    # forms the rank BUDGET and cannot cap a runtime allocation. Only this knob
+    # caps it.
+    # 256 MiB is chosen as the largest power-of-two budget that still binds on
+    # the reference geometry above at both SEQ_CHUNK settings, and it leaves the
+    # corridor intact on the same run: 112 rows x 2.27 MiB = 254 MiB of step
+    # plus 8 MiB of logits, i.e. 873 - 262 = 611 MiB free at peak. The
+    # regrouping it forces is exact -- no reduction crosses a chunk boundary --
+    # so this buys corridor without giving up any KV capacity.
+    FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB = EnvInt(256)
+    FLLIPER_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    # Validate the non-negative-seq_len precondition of the DSV4 top-k
+    # wrappers (v1 and v2) before the launch. The check costs a device-to-host
+    # sync per call, so it is off on the serving path and meant for bring-up of
+    # a new producer of `seq_lens` (DP-idle companion rows, padded MTP rows).
+    # See #427 F2 and the docstrings in `flliper.jit_kernel.dsv4.topk`.
+    FLLIPER_DSV4_CHECK_TOPK_SEQ_LENS = EnvBool(False)
+    FLLIPER_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+
+    # SWA radix cache
+    # TODO(DSV4): @ispobock this has bug on main branch when retract
+    FLLIPER_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
+    FLLIPER_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
+    FLLIPER_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+
+    # Unified radix cache
+    FLLIPER_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
+
+    # DeepGemm Mega MoE
+    FLLIPER_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
+    FLLIPER_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+
+    # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
+    # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
+    # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer
+    # sizing + fp8_fp4_mega_moe pick up the FP4 layout.
+    FLLIPER_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
+    # Switches the L1+L2 mainloops from kind::mxf8f6f4 (K=32 with-padding) to
+    # kind::mxf4 (K=64 dense) inside fp8_fp4_mega_moe. No effect unless
+    # FLLIPER_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
+    # this combination on the host side.
+    FLLIPER_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
+    FLLIPER_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
+
+    # TopK
+    FLLIPER_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
+    FLLIPER_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
+    # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
+    # instead of the flashinfer/AOT grouped kernels. Off by default (flashinfer is
+    # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
+    # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
+    FLLIPER_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
+    FLLIPER_OPT_USE_TOPK_V2 = EnvBool(True)
+
+    # Reroutes the generic fp8 per-token-group quant (every model, not just MiniMax)
+    # to the V1 JIT kernel. Off by default; V1 is byte-identical to V2.
+    FLLIPER_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(False)
+    FLLIPER_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
+    FLLIPER_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
+    FLLIPER_DISABLE_MSA = EnvBool(False)
+    FLLIPER_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
+
+    # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
+    FLLIPER_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
+
+    # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
+    # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
+    FLLIPER_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+
+    # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
+    FLLIPER_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
+    FLLIPER_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+
+    # GEMM / kernel fusion
+    FLLIPER_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    FLLIPER_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
+    FLLIPER_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    FLLIPER_OPT_FUSE_WQA_WKV = EnvBool(True)
+    FLLIPER_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+
+    # Cache / overlap
+    FLLIPER_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    FLLIPER_OPT_USE_JIT_NORM = EnvBool(True)
+    FLLIPER_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+
+    # CUDA graph
+    FLLIPER_PREP_IN_CUDA_GRAPH = EnvBool(True)
+
+    # Eager forward wraps the ForwardBatch's own tensors instead of copying them
+    # into the CUDA graph buffer registry (no per-iter device-to-device copy).
+    FLLIPER_EAGER_INPUT_NO_COPY = EnvBool(False)
+
+    # Distributed
+    FLLIPER_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
+    FLLIPER_SHARED_EXPERT_TP1 = EnvBool(False)
+    # Replicate the input embedding across TP ranks instead of sharding it
+    # along the vocab dimension (saves an all-reduce/all-gather in the embed
+    # lookup at the cost of replicated embedding weights). Drives both the
+    # target and every draft that shares its embedding (see
+    # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
+    # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
+    FLLIPER_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # Symmetric Memory
+    FLLIPER_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
+    FLLIPER_DEBUG_SYMM_MEM = EnvBool(False)
+
+    # Aiter
+    FLLIPER_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+
+    # EPD
+    FLLIPER_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
+    FLLIPER_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    FLLIPER_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
+    FLLIPER_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
+    FLLIPER_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
+    FLLIPER_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
+    FLLIPER_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
+    FLLIPER_ENCODER_PREPROC_WORKERS = EnvInt(8)
+    # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
+    FLLIPER_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
+    FLLIPER_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
+    # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
+    # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
+    FLLIPER_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
+    FLLIPER_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
+
+    # Elastic EP Backup Port
+    FLLIPER_BACKUP_PORT_BASE = EnvInt(10000)
+
+    # Flliper Cache Dir
+    FLLIPER_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/flliper"))
+    FLLIPER_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    FLLIPER_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
+
+    # Plugin system
+    FLLIPER_PLATFORM = EnvStr("")
+    FLLIPER_PLUGINS = EnvStr("")
+
+    # GGUF loader
+    # #391: repack GGUF MXFP4 (ggml type 39) tensors to Q5_0 while reading the
+    # weight stream. The MXFP4 lattice is a subset of Q5_0's, so the conversion
+    # is value-exact (every element dequantizes to the same fp32 number) and it
+    # turns a type no GGUF kernel dispatches on into one every GGUF kernel
+    # dispatches on. It costs 22/17 = 1.294x the bytes of the repacked tensors,
+    # in host RAM and in VRAM, and that inflation is logged once at load time.
+    # Set to False to refuse MXFP4 loudly instead, which is what this build did
+    # before the repack existed. There is no silent middle ground.
+    FLLIPER_GGUF_MXFP4_REPACK = EnvBool(True)
+
+    # #391: release the page cache behind the GGUF weight stream. gguf-py's
+    # reader maps every part with np.memmap, so reading the stream faults the
+    # whole checkpoint into the page cache and never gives it back -- ~48+ GiB
+    # of clean file pages competing with the loader's own anonymous memory on a
+    # swapless box (boot attempt 8 died exactly there: memory.current pinned at
+    # 98.3 of 98.5 GiB while the kernel traded file pages for anon one for one).
+    # With this on, each consumed region is madvise(MADV_DONTNEED)'d and then
+    # posix_fadvise(POSIX_FADV_DONTNEED)'d as the stream advances. Read-only
+    # shared mapping of an unmodified file: an advised range re-faults the same
+    # bytes, so the streamed bytes are identical either way. Set to False to
+    # restore the pre-#391 accumulation.
+    FLLIPER_GGUF_STREAM_DROP_CACHE = EnvBool(True)
+    # numpy madvise(MADV_HUGEPAGE)s every array >= 4 MiB. Under the host's THP
+    # defrag=madvise each first-touch fault of such an array compacts memory
+    # synchronously; behind group P's pinned arena that cost group D's GGUF
+    # load 670 s of kernel time per rank (weg2rc7gg, 2026-09-25). False
+    # (default): the hint is off for the GGUF weight stream and numpy's own
+    # setting is restored afterwards (model_loader/gguf_numpy_hugepage.py).
+    # True: numpy keeps its setting during the load (pre-fix behaviour).
+    FLLIPER_GGUF_NUMPY_HUGEPAGE = EnvBool(False)
+    # NUMPY-THP-SERVE (27B z30y11, b4946aa966, 30.09.): the same numpy hint
+    # during SERVING. The scheduler's host-side numpy arrays of 4 MiB or more
+    # (L3 write-behind census buffers, park-demote) faulted 2 MiB pages with
+    # direct compaction; the compaction migrates the shared arena's shmem
+    # pages (rmap walk + TLB shootdown into every rank). perf on P PP0's and
+    # D TP0's write-behind thread: 31.4 s / 18.8 s of sys in 152 s, top frame
+    # arena_complete_census -> do_huge_pmd_anonymous_page ->
+    # __alloc_pages_direct_compact. False (default): run_scheduler_process
+    # switches the hint off for the whole rank process. True: numpy keeps its
+    # own setting (pre-fix behaviour, A/B arm).
+    FLLIPER_PDFLIP_NUMPY_HUGEPAGE = EnvBool(False)
+    # Synchronous cgroup reclaim during the GGUF stream, in GiB of
+    # memory.current. 0 (default) = off, behaviour byte-identical to before.
+    # The dropper only releases page cache BEHIND the consumer while the
+    # kernel reads AHEAD of it, and on a swapless box that gap is the whole
+    # budget (#391). An external sampler chasing it on a wall-clock interval
+    # can be outrun -- window 3 saw memory.current move 88 -> 102 GiB inside
+    # one 15 s window. Reclaiming here instead ties the trim RATE to consumer
+    # PROGRESS, which is what generates the pressure in the first place.
+    FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB = EnvFloat(0.0)
+    #: Reclaim down to about here once the soft watermark is crossed.
+    FLLIPER_GGUF_STREAM_TRIM_TARGET_GIB = EnvFloat(0.0)
+    # Slack above the UNRECLAIMABLE floor (#537). The trim's target is raised
+    # to `anon + pinned host pool + this` whenever that sits above the
+    # configured target, because cgroup reclaim cannot take either term --
+    # CUDA pinned host memory is filed under `file`, not `anon`, so
+    # memory.current hides it (49.66 GiB of pool against anon 14.6 GiB,
+    # measured 2026-08-04). This term buys the loader's own read-ahead room
+    # inside that budget. 0.0 (default) = no slack, i.e. the trim is allowed to
+    # drive page cache down to the floor exactly as it did before #537;
+    # calibrating it needs a load-time page-cache measurement, not a desk
+    # number, so it ships INERT and pinned as such in
+    # test_bounding_default_value_pins.py.
+    FLLIPER_GGUF_STREAM_TRIM_HEADROOM_GIB = EnvFloat(0.0)
+
+    # ===================================================================
+    # KV-Canary / Token-Oracle (testing-only)
+    # ===================================================================
+    FLLIPER_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    FLLIPER_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
+    FLLIPER_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
+    FLLIPER_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
+    FLLIPER_KV_CANARY_PERTURB_WARMUP_STEPS = EnvInt(50)
+    FLLIPER_KV_CANARY_PERTURB_REAL_KV_USED_PROB = EnvFloat(0.0)
+    FLLIPER_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB = EnvFloat(0.0)
+    FLLIPER_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
+    FLLIPER_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
+    FLLIPER_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
+    FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
+    FLLIPER_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
+    FLLIPER_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
+    FLLIPER_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
+
+
+envs = Envs()
+EnvField._allow_set_name = False
+
+
+def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
+    if old_name in os.environ:
+        if new_name is None:
+            warnings.warn(f"Environment variable {old_name} has been deprecated.")
+        else:
+            warnings.warn(
+                f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
+            )
+            os.environ[new_name] = os.environ[old_name]
+
+
+def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
+    """Warn when a deprecated environment variable is used.
+
+    This is for env vars that are deprecated in favor of CLI flags.
+    """
+    if env_name in os.environ:
+        warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}")
+
+
+def _convert_SGL_to_FLLIPER():
+    _print_deprecated_env("FLLIPER_GC_LOG", "FLLIPER_LOG_GC")
+    _print_deprecated_env(
+        "FLLIPER_CUTEDSL_MOE_NVFP4_DISPATCH", "FLLIPER_MOE_NVFP4_DISPATCH"
+    )
+    _print_deprecated_env(
+        "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+        "FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK",
+    )
+    _print_deprecated_env("FLLIPER_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+    _print_deprecated_env("FLLIPER_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
+    _print_deprecated_env("FLLIPER_ENABLE_THINKING", "FLLIPER_DEFAULT_THINKING")
+    _print_deprecated_env("FLLIPER_REASONING_EFFORT", "FLLIPER_DSV4_REASONING_EFFORT")
+    _print_deprecated_env(
+        "FLLIPER_USE_JIT_ALL_REDUCE", "FLLIPER_OPT_USE_CUSTOM_ALL_REDUCE_V2"
+    )
+    _deprecated_ms_to_s = {
+        "FLLIPER_QUEUED_TIMEOUT_MS": "FLLIPER_REQ_WAITING_TIMEOUT",
+        "FLLIPER_FORWARD_TIMEOUT_MS": "FLLIPER_REQ_RUNNING_TIMEOUT",
+    }
+    for old_name, new_name in _deprecated_ms_to_s.items():
+        if old_name in os.environ:
+            ms_val = os.environ[old_name]
+            warnings.warn(
+                f"Environment variable {old_name} (in ms) is deprecated, "
+                f"please use {new_name} (in seconds) instead"
+            )
+            os.environ[new_name] = str(float(ms_val) / 1000.0)
+
+    for key, value in os.environ.items():
+        if key.startswith("SGL_"):
+            new_key = key.replace("SGL_", "FLLIPER_", 1)
+            warnings.warn(
+                f"Environment variable {key} is deprecated, please use {new_key}"
+            )
+            os.environ[new_key] = value
+
+
+_convert_SGL_to_FLLIPER()
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_ENABLE_GRPC",
+    "Please use '--grpc-port' to enable the native gRPC server.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_SCHEDULER_DECREASE_PREFILL_IDLE",
+    "Please use '--enable-prefill-delayer' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_PREFILL_DELAYER_MAX_DELAY_PASSES",
+    "Please use '--prefill-delayer-max-delay-passes' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
+    "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_DFLASH_PREFILL_REFILL_TARGET",
+    "DFlash now auto-enables the min-free-slots delay; unset this env. To "
+    "override the threshold, use '--min-free-slots-delay'.",
+)
+# #837: the round-4 seam knobs. These notices are load-bearing in a way the
+# ones above are not, and the mechanism is worth stating because it looks
+# self-inflicted otherwise. This module is imported long before ServerArgs
+# runs __post_init__, so a key found HERE was written by a human or a boot
+# script -- the value a flag publishes arrives later and is never warned
+# about. That is the intended asymmetry: the flag is the surface, the env is
+# an internal propagation detail this process writes from its own argv.
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_SEAM_SHRINK",
+    "Please use '--seam-shrink' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_SEAM_SHRINK_PREARM_QUIESCE",
+    "Please use '--seam-shrink-prearm-quiesce' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_SEAM_SHRINK_DEFER_GROW",
+    "Please use '--seam-shrink-defer-grow' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_SEAM_SHRINK_GROW_DEBT_ROUNDS",
+    "Please use '--seam-shrink-grow-debt-rounds' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_FLIP_SEAM_DRAIN_BUDGET_MS",
+    "Please use '--flip-seam-drain-budget-ms' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "FLLIPER_HICACHE_READ_BUFFERS",
+    "Please use '--hicache-read-buffers' instead.",
+)
+
+# Import cuda_coredump to trigger auto-injection of CUDA env vars
+# when FLLIPER_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
+# set CUDA_* env vars in the shell before launching Python.
+import flliper.srt.debug_utils.cuda_coredump  # noqa: F401, E402  # isort: skip
+
+
+def example_with_exit_stack():
+    # Use this style of context manager in unit test
+    exit_stack = ExitStack()
+    exit_stack.enter_context(envs.FLLIPER_TEST_RETRACT.override(False))
+    assert envs.FLLIPER_TEST_RETRACT.get() is False
+    exit_stack.close()
+    assert envs.FLLIPER_TEST_RETRACT.get() is None
+
+
+def example_with_subprocess():
+    command = ["python", "-c", "import os; print(os.getenv('FLLIPER_TEST_RETRACT'))"]
+    with envs.FLLIPER_TEST_RETRACT.override(True):
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        process.wait()
+        output = process.stdout.read().decode("utf-8").strip()
+        assert output == "True"
+
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = process.stdout.read().decode("utf-8").strip()
+    assert output == "None"
+
+
+def example_with_implicit_bool_avoidance():
+    @contextmanager
+    def assert_throws(message_matcher: str):
+        try:
+            yield
+        except Exception as e:
+            assert message_matcher in str(e), f"{e=}"
+            print(f"assert_throws find expected error: {e}")
+            return
+        raise AssertionError("assert_throws do not see exceptions")
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.FLLIPER_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if (1 != 1) or envs.FLLIPER_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.FLLIPER_TEST_RETRACT or (1 == 1):
+            pass
+
+
+def examples():
+    # Example usage for envs
+    envs.FLLIPER_TEST_RETRACT.clear()
+    assert envs.FLLIPER_TEST_RETRACT.get() is False
+
+    envs.FLLIPER_TEST_RETRACT.set(None)
+    assert envs.FLLIPER_TEST_RETRACT.is_set() and envs.FLLIPER_TEST_RETRACT.get() is None
+
+    envs.FLLIPER_TEST_RETRACT.clear()
+    assert not envs.FLLIPER_TEST_RETRACT.is_set()
+
+    envs.FLLIPER_TEST_RETRACT.set(True)
+    assert envs.FLLIPER_TEST_RETRACT.get() is True
+
+    with envs.FLLIPER_TEST_RETRACT.override(None):
+        assert (
+            envs.FLLIPER_TEST_RETRACT.is_set() and envs.FLLIPER_TEST_RETRACT.get() is None
+        )
+
+    assert envs.FLLIPER_TEST_RETRACT.get() is True
+
+    envs.FLLIPER_TEST_RETRACT.set(None)
+    with envs.FLLIPER_TEST_RETRACT.override(True):
+        assert envs.FLLIPER_TEST_RETRACT.get() is True
+
+    assert envs.FLLIPER_TEST_RETRACT.is_set() and envs.FLLIPER_TEST_RETRACT.get() is None
+
+    example_with_exit_stack()
+    example_with_subprocess()
+    example_with_implicit_bool_avoidance()
+
+
+if __name__ == "__main__":
+    examples()

@@ -105,11 +105,11 @@ echo "--rank-auto-reserve-mib $RESERVE"
 claim_cards "274-r7c-boot-c-dflash-solo-q8"
 trap 'stop_vram_sampler; release_cards "boot C abgebrochen"; exit 1' INT TERM
 start_vram_sampler "$OUT/vram.csv"
-export SGLANG_ACCEPT_POSITION_PROBE=1
+export FLLIPER_ACCEPT_POSITION_PROBE=1
 
 cd "$WT" || exit 1
 launch_server "$LOG" /tmp/r7c-boot-c.pid \
-  "$VENV/bin/python" -m sglang.launch_server \
+  "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$TARGET" \
   --tokenizer-path "$TARGET_DIR" \
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \

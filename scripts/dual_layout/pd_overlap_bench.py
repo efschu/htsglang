@@ -15,7 +15,7 @@ Arrangements (who shares the card):
 * solo      -- one role alone (the floor for its share)
 * inproc    -- one process, two threads, two streams (decode on the
                HIGH-priority stream) -- the DESIGN_121 (a) arrangement
-* 2proc     -- two processes (P and D as separate processes, as weg2 runs them
+* 2proc     -- two processes (P and D as separate processes, as pdflip runs them
                today); without MPS the driver time-slices them
 * 2proc-mps -- the same two processes as clients of a private MPS daemon
 

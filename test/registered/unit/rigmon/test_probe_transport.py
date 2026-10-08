@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 
-from sglang.srt.rigmon.probe import (
+from flliper.srt.rigmon.probe import (
     BUDGET_SECONDS,
     MEASURED,
     CardState,
@@ -16,20 +16,20 @@ from sglang.srt.rigmon.probe import (
     from_hardware_profile,
     measure_host_link,
 )
-from sglang.srt.rigmon.transport import (
+from flliper.srt.rigmon.transport import (
     VERDICT_RECOMMENDED,
     VERDICT_UNAVAILABLE,
     VERDICT_UNKNOWN,
     choose_all_pairs,
     choose_transport,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
-#: Shaped exactly like a real ~/.cache/sglang/hw_profile-*.json on this rig.
+#: Shaped exactly like a real ~/.cache/flliper/hw_profile-*.json on this rig.
 HW_PROFILE = {
     "version": 1,
     "driver": "580.95.05",
@@ -303,7 +303,7 @@ class TestTransportChoice(CustomTestCase):
         self.assertAlmostEqual(c.chosen.evidence["bandwidth_gbs"], 2.41)
 
     def test_an_unavailable_transport_is_shown_with_what_is_missing(self):
-        from sglang.srt.rigmon.probe import LinkRate
+        from flliper.srt.rigmon.probe import LinkRate
 
         link = LinkRate(src="rig1/a", dst="rig2/b", bandwidth_gbs=1.1,
                         same_node=False, transport="tcp (host-to-host)")
@@ -314,7 +314,7 @@ class TestTransportChoice(CustomTestCase):
         self.assertIn("installed rather than", rdma.reason)
 
     def test_rdma_wins_across_the_boundary_once_it_is_available(self):
-        from sglang.srt.rigmon.probe import LinkRate
+        from flliper.srt.rigmon.probe import LinkRate
 
         link = LinkRate(src="rig1/a", dst="rig2/b", bandwidth_gbs=1.1,
                         same_node=False, transport="tcp (host-to-host)")
@@ -324,7 +324,7 @@ class TestTransportChoice(CustomTestCase):
         self.assertEqual(choose_transport(link).chosen.key, "barlink-ucx")
 
     def test_intra_and_inter_candidates_do_not_mix(self):
-        from sglang.srt.rigmon.probe import LinkRate
+        from flliper.srt.rigmon.probe import LinkRate
 
         inter = choose_transport(
             LinkRate(src="a", dst="b", bandwidth_gbs=1.0, same_node=False)

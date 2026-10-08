@@ -2,7 +2,7 @@
 """#700: ReplaySSM byte-identity probe. WINDOW-GATED.
 
 Measures whether ``--enable-linear-replayssm`` changes output at all. The
-decision rules live in ``sglang.srt.planner.replayssm_identity`` and are unit
+decision rules live in ``flliper.srt.planner.replayssm_identity`` and are unit
 tested without a GPU; this script only collects the samples and hands them over,
 so the verdict cannot drift when the probe is edited.
 
@@ -29,7 +29,7 @@ import urllib.request
 
 sys.path.insert(0, "python")
 
-from sglang.srt.planner.replayssm_identity import (  # noqa: E402
+from flliper.srt.planner.replayssm_identity import (  # noqa: E402
     ProbePlan,
     classify_identity,
     gate_verdict,

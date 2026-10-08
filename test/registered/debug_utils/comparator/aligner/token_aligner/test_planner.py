@@ -2,33 +2,33 @@ import sys
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.planner import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.planner import (
     _match_sequences,
     compute_token_aligner_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.seq_info_builder import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.seq_info_builder import (
     build_seqs_info,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     PositionalSeqId,
     SeqId,
-    SGLangSeqId,
+    FlliperSeqId,
     TokenAlignerGlobalAux,
     TokenAlignerSeqInfo,
     TokenAlignerSeqsInfo,
     TokenAlignerStepAux,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.dims_spec import TokenLayout
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
-class TestBuildTokenIndexSGLangThd:
-    """Tests for SGLang thd token index building."""
+class TestBuildTokenIndexFlliperThd:
+    """Tests for fLLiper thd token index building."""
 
     def test_single_step_prefill(self):
         """Single prefill step with two sequences."""
@@ -38,23 +38,23 @@ class TestBuildTokenIndexSGLangThd:
                     input_ids=[10, 20, 30, 40, 50],
                     positions=[0, 1, 2, 0, 1],
                     seq_lens=[3, 2],
-                    seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+                    seq_ids=[FlliperSeqId(rid="A"), FlliperSeqId(rid="B")],
                 ),
             },
-            framework="sglang",
+            framework="flliper",
             layout=TokenLayout.T,
         )
 
         index = build_seqs_info(side_aux)
         assert len(index.sequences) == 2
 
-        seq_a = index.sequences[SGLangSeqId(rid="A")]
+        seq_a = index.sequences[FlliperSeqId(rid="A")]
         assert seq_a.input_ids == [10, 20, 30]
         assert seq_a.positions == [0, 1, 2]
         assert seq_a.locator.steps == [0, 0, 0]
         assert seq_a.locator.token_index_in_step == [0, 1, 2]
 
-        seq_b = index.sequences[SGLangSeqId(rid="B")]
+        seq_b = index.sequences[FlliperSeqId(rid="B")]
         assert seq_b.input_ids == [40, 50]
         assert seq_b.positions == [0, 1]
         assert seq_b.locator.token_index_in_step == [3, 4]
@@ -67,28 +67,28 @@ class TestBuildTokenIndexSGLangThd:
                     input_ids=[10, 20, 30, 40, 50],
                     positions=[0, 1, 2, 0, 1],
                     seq_lens=[3, 2],
-                    seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+                    seq_ids=[FlliperSeqId(rid="A"), FlliperSeqId(rid="B")],
                 ),
                 1: TokenAlignerStepAux(
                     input_ids=[31, 51],
                     positions=[3, 2],
                     seq_lens=[1, 1],
-                    seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+                    seq_ids=[FlliperSeqId(rid="A"), FlliperSeqId(rid="B")],
                 ),
             },
-            framework="sglang",
+            framework="flliper",
             layout=TokenLayout.T,
         )
 
         index = build_seqs_info(side_aux)
         assert len(index.sequences) == 2
 
-        seq_a = index.sequences[SGLangSeqId(rid="A")]
+        seq_a = index.sequences[FlliperSeqId(rid="A")]
         assert seq_a.input_ids == [10, 20, 30, 31]
         assert seq_a.positions == [0, 1, 2, 3]
         assert seq_a.locator.steps == [0, 0, 0, 1]
 
-        seq_b = index.sequences[SGLangSeqId(rid="B")]
+        seq_b = index.sequences[FlliperSeqId(rid="B")]
         assert seq_b.input_ids == [40, 50, 51]
         assert seq_b.positions == [0, 1, 2]
 
@@ -100,16 +100,16 @@ class TestBuildTokenIndexSGLangThd:
                     input_ids=[10, 20, 30],
                     positions=[0, 1, 2],
                     seq_lens=[3],
-                    seq_ids=[SGLangSeqId(rid="A")],
+                    seq_ids=[FlliperSeqId(rid="A")],
                 ),
                 1: TokenAlignerStepAux(
                     input_ids=[100, 200],
                     positions=[0, 1],
                     seq_lens=[2],
-                    seq_ids=[SGLangSeqId(rid="D")],
+                    seq_ids=[FlliperSeqId(rid="D")],
                 ),
             },
-            framework="sglang",
+            framework="flliper",
             layout=TokenLayout.T,
         )
 
@@ -124,16 +124,16 @@ class TestBuildTokenIndexSGLangThd:
                     input_ids=[10, 20],
                     positions=[0, 1],
                     seq_lens=[2],
-                    seq_ids=[SGLangSeqId(rid="A")],
+                    seq_ids=[FlliperSeqId(rid="A")],
                 ),
                 1: TokenAlignerStepAux(
                     input_ids=[100, 200, 300],
                     positions=[0, 1, 2],
                     seq_lens=[3],
-                    seq_ids=[SGLangSeqId(rid="D")],
+                    seq_ids=[FlliperSeqId(rid="D")],
                 ),
             },
-            framework="sglang",
+            framework="flliper",
             layout=TokenLayout.T,
         )
 
@@ -381,16 +381,16 @@ class TestComputeAlignmentPlanCrossFramework:
                     input_ids=[10, 20],
                     positions=[0, 1],
                     seq_lens=[2],
-                    seq_ids=[SGLangSeqId(rid="X")],
+                    seq_ids=[FlliperSeqId(rid="X")],
                 ),
                 1: TokenAlignerStepAux(
                     input_ids=[30],
                     positions=[2],
                     seq_lens=[1],
-                    seq_ids=[SGLangSeqId(rid="X")],
+                    seq_ids=[FlliperSeqId(rid="X")],
                 ),
             },
-            framework="sglang",
+            framework="flliper",
             layout=TokenLayout.T,
         )
         side_aux_b = TokenAlignerGlobalAux(
@@ -399,10 +399,10 @@ class TestComputeAlignmentPlanCrossFramework:
                     input_ids=[10, 20, 30],
                     positions=[0, 1, 2],
                     seq_lens=[3],
-                    seq_ids=[SGLangSeqId(rid="X")],
+                    seq_ids=[FlliperSeqId(rid="X")],
                 ),
             },
-            framework="sglang",
+            framework="flliper",
             layout=TokenLayout.T,
         )
 
@@ -412,24 +412,24 @@ class TestComputeAlignmentPlanCrossFramework:
         plan = compute_token_aligner_plan(seqs_info_pair=Pair(x=index_a, y=index_b))
         assert len(plan.locators.x.steps) == 3
 
-    def test_sglang_vs_megatron_thd(self):
-        """SGLang multi-step thd aligned with Megatron single-step thd."""
+    def test_flliper_vs_megatron_thd(self):
+        """fLLiper multi-step thd aligned with Megatron single-step thd."""
         side_aux_a = TokenAlignerGlobalAux(
             step_auxs={
                 0: TokenAlignerStepAux(
                     input_ids=[10, 20, 30, 40, 50],
                     positions=[0, 1, 2, 0, 1],
                     seq_lens=[3, 2],
-                    seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+                    seq_ids=[FlliperSeqId(rid="A"), FlliperSeqId(rid="B")],
                 ),
                 1: TokenAlignerStepAux(
                     input_ids=[31, 51],
                     positions=[3, 2],
                     seq_lens=[1, 1],
-                    seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+                    seq_ids=[FlliperSeqId(rid="A"), FlliperSeqId(rid="B")],
                 ),
             },
-            framework="sglang",
+            framework="flliper",
             layout=TokenLayout.T,
         )
         side_aux_b = TokenAlignerGlobalAux(
@@ -455,24 +455,24 @@ class TestComputeAlignmentPlanCrossFramework:
 
         assert len(plan.locators.x.steps) == 7
 
-    def test_cross_layout_sglang_thd_vs_megatron_bshd(self):
-        """SGLang THD vs Megatron BSHD end-to-end alignment via planner.
+    def test_cross_layout_flliper_thd_vs_megatron_bshd(self):
+        """fLLiper THD vs Megatron BSHD end-to-end alignment via planner.
 
-        SGLang side: two sequences [10,20,30] and [40,50] across 2 steps.
+        fLLiper side: two sequences [10,20,30] and [40,50] across 2 steps.
         Megatron BSHD side: same tokens as 2 batch slots [10,20,30,PAD] and [40,50,PAD,PAD],
         where PAD tokens (99) are included because BSHD treats whole padded row as one seq.
         Planner should match by prefix and align the common 5 tokens.
         """
-        side_sglang = TokenAlignerGlobalAux(
+        side_flliper = TokenAlignerGlobalAux(
             step_auxs={
                 0: TokenAlignerStepAux(
                     input_ids=[10, 20, 30, 40, 50],
                     positions=[0, 1, 2, 0, 1],
                     seq_lens=[3, 2],
-                    seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+                    seq_ids=[FlliperSeqId(rid="A"), FlliperSeqId(rid="B")],
                 ),
             },
-            framework="sglang",
+            framework="flliper",
             layout=TokenLayout.T,
         )
 
@@ -493,11 +493,11 @@ class TestComputeAlignmentPlanCrossFramework:
             layout=TokenLayout.BS,
         )
 
-        index_sglang = build_seqs_info(side_sglang)
+        index_flliper = build_seqs_info(side_flliper)
         index_megatron = build_seqs_info(side_megatron_bshd)
 
         plan = compute_token_aligner_plan(
-            seqs_info_pair=Pair(x=index_sglang, y=index_megatron)
+            seqs_info_pair=Pair(x=index_flliper, y=index_megatron)
         )
 
         # Seq A: [10,20,30] matches prefix of [10,20,30,99] → 3 tokens
@@ -514,7 +514,7 @@ class TestComputeAlignmentPlanCrossFramework:
 
 def _int_to_seq_id(k: int) -> SeqId:
     """Convert an int key to a SeqId for test convenience."""
-    return SGLangSeqId(rid=str(k))
+    return FlliperSeqId(rid=str(k))
 
 
 def _make_index(

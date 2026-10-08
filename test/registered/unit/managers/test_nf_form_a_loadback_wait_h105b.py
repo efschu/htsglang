@@ -3,28 +3,28 @@ group's admission verdict too.
 
 THE DEATH (rc12z20 3a86888ba5, boot
 dkrnfh91dprsavisnoadoptstbar1dauer09281220, D log ~252090-252147, 12:55:34).
-weg2-36-144 (host depth 84480) was admitted on every rank; in the same pass
-weg2-36-145 came to the gate with a host-backed hit (TP0 depth 62016, device
+pdflip-36-144 (host depth 84480) was admitted on every rank; in the same pass
+pdflip-36-145 came to the gate with a host-backed hit (TP0 depth 62016, device
 prefix 3712):
 
 * every rank passed the H105 gate and the host's verdict (ADMIT) went out --
   BEFORE the load-back;
-* TP0: ``WEG2-LOADBACK-WAIT rid=weg2-36-145 extent=62016 applied=0: no device
+* TP0: ``PDFLIP-LOADBACK-WAIT rid=pdflip-36-145 extent=62016 applied=0: no device
   room for the host hit yet ... the anchor is given back and the request
   waits`` -> NO_TOKEN;
 * TP1/TP2 (expert workers, no recurrent state, never adopt an anchor):
   ``#1048 EXTENT STALE ... asked for 58304 ... served 0; taking the served
-  amount`` and ``#988 LOADBACK rid=weg2-36-145 prefix moved to 3712`` -> the
+  amount`` and ``#988 LOADBACK rid=pdflip-36-145 prefix moved to 3712`` -> the
   rid admitted at its device prefix;
 * the post-loop riegel: ``FormAAdmissionSplit: H105 RU FORM-A EXTEND-SET SPLIT
-  host=[('weg2-36-144', 84480, 84656)] local=[..., ('weg2-36-145', 3712,
+  host=[('pdflip-36-144', 84480, 84656)] local=[..., ('pdflip-36-145', 3712,
   7552)]`` -- D dead.
 
 Driven through the REAL ``PrefillAdder.add_one_req`` and the REAL
 ``Scheduler._form_a_admission_follow_fn`` / ``_form_a_extend_set_riegel`` (a
 stand-in scheduler; the TP broadcast is an ordered stream the host fills
 first, as ``broadcast_pyobj`` does). RED on cb7f2cdc35: the workers admit
-weg2-36-145, the riegel stops. GREEN with H105b.
+pdflip-36-145, the riegel stops. GREEN with H105b.
 """
 
 from __future__ import annotations
@@ -36,19 +36,19 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers import schedule_policy as sp
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.managers import schedule_policy as sp
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
-#: weg2-36-145 geometry (D log 12:55:34).
-RID = "weg2-36-145"
+#: pdflip-36-145 geometry (D log 12:55:34).
+RID = "pdflip-36-145"
 DEVICE_PREFIX = 3712
 HOST_EXTENT = 62016 - DEVICE_PREFIX  # TP0's own extent above its device rows
 WORKER_EXTENT = 58304  # the workers' (stale) stamp
@@ -99,7 +99,7 @@ def _tree_cache(*, adopts: bool, served: int):
     tc.swa_evictable_size.return_value = 0
     tc.disable = False
     tc.uniform_avail_floor = None
-    tc._weg2_loadback_no_room = 0
+    tc._pdflip_loadback_no_room = 0
     tc.inc_lock_ref.return_value = IncLockRefResult()
     tc.dec_lock_ref.return_value = DecLockRefResult()
 
@@ -175,7 +175,7 @@ class LoadBackWaitIsTheGroupsTest(unittest.TestCase):
         _install(adder, sched, tp_rank)
         req = _req()
         with patch.object(sp, "_pp_load_back_extent", return_value=extent), patch(
-            "sglang.srt.mem_cache.common.release_admission_acquired_mamba_slot"
+            "flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"
         ):
             res = adder.add_one_req(req, truncation_align_size=None)
         return res, adder, sched, req
@@ -267,7 +267,7 @@ class OffFormAIsUnchangedTest(unittest.TestCase):
         self.assertIsNone(adder.form_a_admission_follow)
         req = _req()
         with patch.object(sp, "_pp_load_back_extent", return_value=extent), patch(
-            "sglang.srt.mem_cache.common.release_admission_acquired_mamba_slot"
+            "flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"
         ):
             res = adder.add_one_req(req, truncation_align_size=None)
         self.assertEqual(ch.posts, [])

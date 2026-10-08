@@ -1,6 +1,6 @@
 """A real UnifiedRadixCache over a real HybridReqToTokenPool on CPU -- the builder of NF's
-test_weg2_d_seat_compact_0930.py (``_build``), without that test's D-seat modules, for the lines that do not
-carry them (27B). test_weg2_prefetch_anchor_attach_0930.py loads it when the NF file is absent."""
+test_pdflip_d_seat_compact_0930.py (``_build``), without that test's D-seat modules, for the lines that do not
+carry them (27B). test_pdflip_prefetch_anchor_attach_0930.py loads it when the NF file is absent."""
 from __future__ import annotations
 
 import os
@@ -9,15 +9,15 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape  # noqa: E402
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE  # noqa: E402
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator  # noqa: E402
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler  # noqa: E402
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape  # noqa: E402
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE  # noqa: E402
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator  # noqa: E402
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
+from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler  # noqa: E402
 
 NUM_LAYERS = 8
 FULL = (3, 7)
@@ -33,7 +33,7 @@ def _build():
     sa.disable_radix_cache = False
     sa.disable_overlap_schedule = True
     set_global_server_args_for_scheduler(sa)
-    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+    with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
         shape = Mamba2StateShape.create(tp_world_size=1, intermediate_size=256, n_groups=1, num_heads=2,
                                         head_dim=16, state_size=16, conv_kernel=4)
         cp = Mamba2CacheParams(shape=shape, layers=LIN)

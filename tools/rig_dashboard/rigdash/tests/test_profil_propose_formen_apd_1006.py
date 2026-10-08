@@ -4,7 +4,7 @@ Gepinnt:
   * Der Editor nimmt ``flip``, ``tp``, ``dual`` und ``single`` (``einzel`` ist ein Name dafuer); die Seite zeigt fuer keine Form mehr den Platzhalter "Vorschlag ist
     spaeteres Arbeitspaket".
   * ``single`` (Einzelkarte): genau EINE Karte, ein Modellpfad, kein Basisprofil noetig; Startprofil = neues ``flliper.server/1`` aus den Argumenten des normalen
-    Servers (Herkunft ``planer``, nie die weg2-Zeilen eines Release-Profils); das Verdikt ist eine Planer-Rechnung, es gibt keinen Launcher-Lauf.
+    Servers (Herkunft ``planer``, nie die pdflip-Zeilen eines Release-Profils); das Verdikt ist eine Planer-Rechnung, es gibt keinen Launcher-Lauf.
   * Mit dem ECHTEN Kindprozess: Referenz-Dual (``27b-nvfp4-dual``, Referenz-Rig, 3 Karten): Argv und Env des Vorschlags = der Golden des Dual (Diff 0), kein Wert
     geaendert, Verdikt traegt ``DUAL-PASSUNG`` als "planner calculation, not hw_fit", der Launcher-Trockenlauf des Vorschlags geht ohne Force durch.
     Einzelkarte 5090 + 27B NVFP4: Verdikt "passt" mit den Zahlen von AP-F (Bruchteil 0.874, KV fp8, Reserve 4050 MiB); 27B INT8: "passt nicht".
@@ -30,7 +30,7 @@ from test_profil_orakel_apd_1006 import (  # noqa: E402
     CENSUS_27B, ENV, FakeOracle, PLANER_FIX, REPO_CATALOG, REPO_PY, REPLAY_REF, _doc, _hw_profile, _rows, editor)
 
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
-APF_FIX = os.path.join(REPO_ROOT, "test", "registered", "unit", "weg2", "fixtures", "planer_apf_1006")
+APF_FIX = os.path.join(REPO_ROOT, "test", "registered", "unit", "pdflip", "fixtures", "planer_apf_1006")
 GOLDEN_DUAL = os.path.join(PLANER_FIX, "golden", "launch_27b-nvfp4-dual.json")
 MC = "/spinning/llm_stuff/club-3090/models-cache/"
 HW1 = {"schema": "flliper.hardware/1", "cards": [{"ord": 0, "name": "NVIDIA GeForce RTX 5090", "vram_total_mib": {"v": 32607, "src": "NVML"}}]}
@@ -87,13 +87,13 @@ class SingleRequests(unittest.TestCase):
             self.assertNotIn("eigenes Arbeitspaket (AP-E)", txt, name)
         self.assertEqual(P.ProfilEditor.BALKEN_FORM, {"flip": "flip", "tp": "d_only", "dual": "dual", "single": "single"})        # profile_couplings.FORMS
 
-    def test_the_request_to_the_child_names_card_model_and_no_weg2_draft(self):
+    def test_the_request_to_the_child_names_card_model_and_no_pdflip_draft(self):
         r = self.ed.propose(self._body(form="einzel"))                               # "einzel" is a name of single
         self.assertTrue(r["ok"], r)
         kind, req, parts = self.orc.calls[0]
         self.assertEqual((kind, req["form"]), ("propose", "single"))
         self.assertEqual(req["model_path"], "/m")
-        self.assertIsNone(req.get("draft_path"))                                       # the profile's PROFILE_DRAFT is a weg2 draft: not the single card's
+        self.assertIsNone(req.get("draft_path"))                                       # the profile's PROFILE_DRAFT is a pdflip draft: not the single card's
         self.assertEqual(req["inventar"]["karte"], 0)
         self.assertIn(["karte", 0], parts["inventar"])                                 # another card is another question (cache)
         self.assertEqual(parts["form"], "single")
@@ -109,7 +109,7 @@ class SingleRequests(unittest.TestCase):
         self.assertEqual(rows["flag:--mem-fraction-static"]["origin"], "planer")
         self.assertIn("flag:--no-enable-multimodal", rows)                             # a switch
         self.assertNotIn("flag:--speculative-algorithm", rows)                          # not set: the server's default applies
-        for k in rows:                                                                  # no row of a weg2 release profile (demo.env has --p-bs, --pp-stage-ratio ...)
+        for k in rows:                                                                  # no row of a pdflip release profile (demo.env has --p-bs, --pp-stage-ratio ...)
             self.assertNotIn(k, ("flag:--p-bs", "flag:--pp-stage-ratio", "flag:--p-hostgap"))
         self.assertEqual(sp["doc"]["line"], "einzel")
         self.assertEqual(sp["doc"]["meta"]["vorschlag"]["form"], "single")
@@ -118,7 +118,7 @@ class SingleRequests(unittest.TestCase):
         by = {w["label"]: w for w in r["werte"]}
         self.assertEqual(by["--mem-fraction-static"]["key"], "flag:--mem-fraction-static")
         self.assertTrue(by["--max-running-requests"]["kanten"], "the catalog gives --max-running-requests its edges")
-        self.assertTrue(any("single card" in n and "no weg2 launcher" in n for n in sp["doc"]["meta"]["notes"]))
+        self.assertTrue(any("single card" in n and "no pdflip launcher" in n for n in sp["doc"]["meta"]["notes"]))
 
     def test_without_a_profile_the_model_path_is_needed(self):
         with self.assertRaises(P.ProfilError) as cm:
@@ -135,7 +135,7 @@ class SingleRequests(unittest.TestCase):
             self.ed.propose(self._body(inventar=two))
         self.assertIn("select exactly one card", str(cm.exception))
         with self.assertRaises(P.ProfilError) as cm:
-            self.ed.propose(self._body(karte=3))
+            self.ed.propose(self._body(emap=3))
         self.assertIn("the hardware profile has 1 cards", str(cm.exception))
         r = self.ed.propose(self._body(inventar=two[:1]))                                         # one catalog card that is not the rig's: a datasheet inventory
         self.assertTrue(r["ok"], r)
@@ -205,7 +205,7 @@ out.flip = PX.renderProposal({ n: 3, form: "flip", werte: [], verdikt: { ausgang
                      and os.path.exists(MC + "Qwen3.8-27B-NVFP4-RadixArk/config.json") and os.path.exists(MC + "Qwen3.8-27B-DFlash2-NVFP4-RTNcal/config.json"),
                      "the real oracle needs the rig box (census, the 27B NVFP4 checkpoints) and the planner tree")
 class RealForms(unittest.TestCase):
-    """The REAL child process (this checkout's sglang) behind ``ProfilEditor.propose`` for the Dual and the single card."""
+    """The REAL child process (this checkout's flliper) behind ``ProfilEditor.propose`` for the Dual and the single card."""
 
     @classmethod
     def setUpClass(cls):
@@ -233,9 +233,9 @@ class RealForms(unittest.TestCase):
         return ed
 
     # ---------------------------------------------------------------- Dual
-    @unittest.skipUnless(os.path.isfile(os.path.join(REPO_PY, "sglang", "srt", "weg2", "dual_layout_plan.py")),
-                         "27B launcher line only: the Dual form (weg2/dual_layout_plan.py, dual_green.py) does not exist in this tree (measured 07.10. on the NF tree "
-                         "2e68b3f94b: ImportError cannot import name 'dual_layout_plan' from 'sglang.srt.weg2')")
+    @unittest.skipUnless(os.path.isfile(os.path.join(REPO_PY, "flliper", "srt", "pdflip", "dual_layout_plan.py")),
+                         "27B launcher line only: the Dual form (pdflip/dual_layout_plan.py, dual_green.py) does not exist in this tree (measured 07.10. on the NF tree "
+                         "2e68b3f94b: ImportError cannot import name 'dual_layout_plan' from 'flliper.srt.pdflip')")
     def test_1_reference_dual_is_the_golden_with_zero_diff(self):
         ed = self._ed(self.hw3)
         r = ed.propose({"basis": {"kind": "release", "name": "27b-nvfp4-dual"}, "form": "dual", "inventar": "rig"})
@@ -284,12 +284,12 @@ class RealForms(unittest.TestCase):
     def _single(self, model="q27_nvfp4", hw=None, **kw):
         hw = hw or self.hw3
         names = [c["name"] for c in hw["cards"]]
-        karte = next(i for i, n in enumerate(names) if "5090" in n)                        # resolved by name, never a fixed index (project rule)
+        emap = next(i for i, n in enumerate(names) if "5090" in n)                        # resolved by name, never a fixed index (project rule)
         ed = self._ed(hw)
-        return ed, ed.propose(dict({"form": "single", "inventar": "rig", "karte": karte, "model_path": os.path.join(APF_FIX, model)}, **kw)), karte
+        return ed, ed.propose(dict({"form": "single", "inventar": "rig", "karte": emap, "model_path": os.path.join(APF_FIX, model)}, **kw)), emap
 
     def test_2_single_5090_with_27b_nvfp4_fits_with_the_apf_numbers(self):
-        ed, r, karte = self._single()
+        ed, r, emap = self._single()
         self.assertTrue(r["ok"], r)
         self.assertEqual((r["form"], r["n"]), ("single", 1))
         vd = r["verdikt"]
@@ -327,7 +327,7 @@ class RealForms(unittest.TestCase):
         self.assertTrue(by["--mem-fraction-static"]["herkunft"] and by["--mem-fraction-static"]["grund"])
         self.assertTrue(by["--max-running-requests"]["kanten"], "the catalog gives --max-running-requests its edges")
         # cached: the second equal question
-        r2 = ed.propose({"form": "single", "inventar": "rig", "karte": karte, "model_path": os.path.join(APF_FIX, "q27_nvfp4")})
+        r2 = ed.propose({"form": "single", "inventar": "rig", "karte": emap, "model_path": os.path.join(APF_FIX, "q27_nvfp4")})
         self.assertTrue(r2["orakel"]["cached"])
         self.assertEqual(r2["launch"]["argv"], r["launch"]["argv"])
 

@@ -25,15 +25,15 @@ import re
 import unittest
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 _COMM = (
     Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/distributed/device_communicators"
+    / "python/flliper/srt/distributed/device_communicators"
 )
 _EXT = _COMM / "barlink_bar1_ext.py"
 _PIPE = _COMM / "barlink_bar1_pipe_ext.py"
@@ -224,7 +224,7 @@ class TestHostAbortProbeInEverySpinLoop(CustomTestCase):
                 f"{path.name}: the spin loop(s) whose deadline check is on "
                 f"line(s) {without} do not probe the host abort word. Such a "
                 f"loop keeps spinning for the full "
-                f"SGLANG_BARLINK_BAR1_CAP_CYCLES budget after a peer has "
+                f"FLLIPER_BARLINK_BAR1_CAP_CYCLES budget after a peer has "
                 f"died, and the watchdog has no way to end it."
             ),
         )

@@ -1,14 +1,14 @@
-"""sglang build hooks.
+"""flliper build hooks.
 
-SGLANG_BUILD_RUST_EXTS controls which Rust extensions are built:
+FLLIPER_BUILD_RUST_EXTS controls which Rust extensions are built:
   - unset or "all": build every declared Rust extension (the default).
   - "none": build no Rust extensions.
   - comma-separated names: build only extensions whose target matches one of the
     given (case-insensitive) substrings, e.g. "grpc" matches
-    "sglang.srt.grpc._core".
+    "flliper.srt.grpc._core".
 
 This is a build-time environment variable, so it is read directly from
-os.environ instead of sglang.srt.environ, which is not available until after the
+os.environ instead of flliper.srt.environ, which is not available until after the
 package has been built.
 """
 
@@ -24,13 +24,13 @@ except ModuleNotFoundError as exc:
     # Alternate platform pyprojects do not declare Rust extensions.
     build_rust = None
 
-_BUILD_RUST_EXTS_ENV = "SGLANG_BUILD_RUST_EXTS"
+_BUILD_RUST_EXTS_ENV = "FLLIPER_BUILD_RUST_EXTS"
 
 
 def _selected_rust_extensions(declared):
-    """Return the Rust extensions selected by SGLANG_BUILD_RUST_EXTS.
+    """Return the Rust extensions selected by FLLIPER_BUILD_RUST_EXTS.
 
-    `ext.name` is the fully-qualified target (e.g. "sglang.srt.grpc._core") for
+    `ext.name` is the fully-qualified target (e.g. "flliper.srt.grpc._core") for
     the string-target declarations in pyproject.toml, so comma-separated names
     are matched as case-insensitive substrings of it.
     """
@@ -74,7 +74,7 @@ def _selected_rust_extensions(declared):
 if build_rust is not None:
 
     class BuildRust(build_rust):
-        """Build only the Rust extensions selected by SGLANG_BUILD_RUST_EXTS."""
+        """Build only the Rust extensions selected by FLLIPER_BUILD_RUST_EXTS."""
 
         def run(self) -> None:
             rust_extensions = _selected_rust_extensions(self.extensions or [])

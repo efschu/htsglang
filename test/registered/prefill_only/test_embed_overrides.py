@@ -13,16 +13,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import torch
 
-from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
-from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
+from flliper.srt.entrypoints.openai.utils import convert_embeds_to_tensors
+from flliper.srt.managers.embed_types import PositionalEmbeds
+from flliper.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from flliper.srt.managers.tokenizer_manager import TokenizerManager
+from flliper.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
-from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import MIS_DELIMITER_TOKEN_ID
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")

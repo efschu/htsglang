@@ -28,8 +28,8 @@ import os
 import re
 import unittest
 
-from sglang.srt.planner import pp_cut
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.planner import pp_cut
+from flliper.srt.server_args import ServerArgs
 
 _SELF_CALL = re.compile(r"self\.(_pp_cut_[A-Za-z0-9_]+)\s*\(")
 
@@ -55,15 +55,15 @@ class ThePPSolveCutPathIsReachableTest(unittest.TestCase):
         sa = ServerArgs.__new__(ServerArgs)
         sa.pp_size = 3
         sa.phase_flip_tp_vector = "32,16,16"
-        prev = os.environ.get("SGLANG_UNEVEN_TOKEN_VECTOR")
-        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "10,3,3"
+        prev = os.environ.get("FLLIPER_UNEVEN_TOKEN_VECTOR")
+        os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"] = "10,3,3"
         try:
             shares = sa._pp_cut_token_shares()
         finally:
             if prev is None:
-                os.environ.pop("SGLANG_UNEVEN_TOKEN_VECTOR", None)
+                os.environ.pop("FLLIPER_UNEVEN_TOKEN_VECTOR", None)
             else:
-                os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = prev
+                os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"] = prev
         self.assertEqual(len(shares), 3)
         self.assertAlmostEqual(sum(shares), 1.0, places=9)
         self.assertEqual(shares, pp_cut.token_shares_from_vector((10, 3, 3)))

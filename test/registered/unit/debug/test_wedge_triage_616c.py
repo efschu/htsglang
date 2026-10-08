@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 # Resolve the module under test.
 # PYTHONPATH must include the project's python/ dir.
-_wedge = importlib.import_module("sglang.srt.debug_utils.wedge_triage")
+_wedge = importlib.import_module("flliper.srt.debug_utils.wedge_triage")
 
 
 class TestCollectCreatesOutDirAndKeys:

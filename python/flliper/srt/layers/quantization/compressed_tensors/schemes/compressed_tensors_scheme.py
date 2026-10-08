@@ -1,0 +1,129 @@
+# Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
+# SPDX-License-Identifier: Apache-2.0
+
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from abc import abstractmethod
+from typing import TYPE_CHECKING, Optional
+
+import torch
+
+from flliper.srt.layers.moe import MoeRunnerConfig
+from flliper.srt.layers.quantization.base_scheme import BaseLinearScheme, BaseMoEScheme
+
+if TYPE_CHECKING:
+    from flliper.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+
+__all__ = ["CompressedTensorsLinearScheme", "CompressedTensorsMoEScheme"]
+
+
+class CompressedTensorsLinearScheme(BaseLinearScheme):
+    """
+    Abstract class used to describe the weight creation and forward pass
+    of different quantization schemes supported by CompressedTensors.
+    """
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        """
+        Get minimum device capability.
+        """
+        raise NotImplementedError
+
+    def needs_device_kernel(self) -> bool:
+        """Whether this scheme depends on a device kernel with a capability floor.
+
+        A scheme that runs on plain torch ops (dequantise + ``F.linear``) has
+        no floor -- it works wherever the storage dtype itself works. Such a
+        scheme returns False so the capability gate is not consulted at all,
+        rather than being handed a threshold that does not describe it.
+
+        Instance-level, not a classmethod, because a scheme may only discover
+        which path it is taking once it can see the device.
+        """
+        return True
+
+    @abstractmethod
+    def create_weights(self, *args, **kwargs):
+        """
+        Weight creation for the particular scheme. Inputs to this function
+
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply_weights(
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+    ):
+        """
+        Run the forward pass for the particular scheme. This is where
+        scheme-specific dequant/quant steps/kernels should be applied.
+
+        :param layer: torch.nn.Module with the registered weights and
+            other parameters relevant to the particular scheme.
+        :param x: input to the layer
+        :param bias: bias parameter
+
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        """
+        Called after weight loading is complete for any cleanup that
+        needs to occur.
+        """
+        raise NotImplementedError
+
+
+class CompressedTensorsMoEScheme(BaseMoEScheme):
+    """
+    Abstract class used to describe the weight creation and forward pass
+    of different quantization schemes supported by CompressedTensors.
+    """
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        """
+        Get minimum device capability.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def create_weights(self, *args, **kwargs):
+        """
+        Weight creation for the particular scheme. Inputs to this function
+
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        raise NotImplementedError
+
+    @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        """
+        Called after weight loading is complete for any cleanup that
+        needs to occur.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ):
+        """
+        Run the forward pass for the particular scheme. This is where
+        scheme-specific dequant/quant steps/kernels should be applied.
+
+        :param layer: torch.nn.Module with the registered weights and
+            other parameters relevant to the particular scheme.
+        :param x: input to the layer
+        :param bias: bias parameter
+
+        """
+        raise NotImplementedError

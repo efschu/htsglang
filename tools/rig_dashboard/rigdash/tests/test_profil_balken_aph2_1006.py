@@ -38,8 +38,8 @@ ABL_DOC = {
     "vars": [{"name": "PROFILE_DRAFT", "value": "/m/draft-var"}],
     "args": [
         {"flag": "--pp-stage-ratio", "values": ["29,11,8"]},
-        {"flag": "--env-p", "values": ["SGLANG_MOE_SCRATCH_SLOTS=32;SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.330,0.701,0.652"]},
-        {"flag": "--env-d", "values": ["SGLANG_MOE_SCRATCH_SLOTS=104,48,48;SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.06,0.51,0.48"]},
+        {"flag": "--env-p", "values": ["FLLIPER_MOE_SCRATCH_SLOTS=32;FLLIPER_MOE_RESIDENT_EXPERT_FRACTION=0.330,0.701,0.652"]},
+        {"flag": "--env-d", "values": ["FLLIPER_MOE_SCRATCH_SLOTS=104,48,48;FLLIPER_MOE_RESIDENT_EXPERT_FRACTION=0.06,0.51,0.48"]},
         {"flag": "--extra-p", "values": []},
         {"flag": "--max-total-tokens 262144 --kv-cache-dtype fp8_e4m3 --max-mamba-cache-size 32 --hicache-size 2", "values": []},
         {"flag": "--extra-d", "values": []},
@@ -86,8 +86,8 @@ class TestGroupLines(unittest.TestCase):
         pi = R.phase_inputs(ABL_DOC)
         self.assertEqual(pi["phase_args"]["P"]["--max-mamba-cache-size"], "32")
         self.assertEqual(pi["phase_args"]["D"]["--rank-role"], "host,worker,worker")
-        self.assertEqual(pi["phase_env"]["P"]["SGLANG_MOE_SCRATCH_SLOTS"], "32")
-        self.assertEqual(pi["phase_env"]["D"]["SGLANG_MOE_RESIDENT_EXPERT_FRACTION"], "0.06,0.51,0.48")
+        self.assertEqual(pi["phase_env"]["P"]["FLLIPER_MOE_SCRATCH_SLOTS"], "32")
+        self.assertEqual(pi["phase_env"]["D"]["FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"], "0.06,0.51,0.48")
         self.assertEqual(pi["tokens"], ["--d-only"])
         empty = R.phase_inputs({"args": []})
         self.assertEqual((empty["phase_args"], empty["phase_env"], empty["tokens"]), ({"P": {}, "D": {}}, {"P": {}, "D": {}}, []))
@@ -105,15 +105,15 @@ class TestGroupLines(unittest.TestCase):
 
     @unittest.skipUnless(os.path.exists(ABL_ENV) and REAL_TREE, "echtes abl-Profil und COUPLINGS_TREE fehlen")
     def test_the_real_abl_profile_yields_the_reference_group_lines(self):
-        out = subprocess.run([sys.executable, "-c", "import json,sys;sys.path.insert(0,sys.argv[1]);from sglang.srt.weg2 import profile_json as P;"
+        out = subprocess.run([sys.executable, "-c", "import json,sys;sys.path.insert(0,sys.argv[1]);from flliper.srt.pdflip import profile_json as P;"
                               "print(json.dumps(P.import_env(sys.argv[2])))", REAL_TREE, ABL_ENV], capture_output=True, text=True, timeout=120,
                              env=dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONWARNINGS="ignore"))
         self.assertEqual(out.returncode, 0, out.stderr[-500:])
         pi = R.phase_inputs(json.loads(out.stdout))
         self.assertEqual(pi["phase_args"]["D"]["--rank-tp-ratio"], "1,0,0")
         self.assertEqual(pi["phase_args"]["D"]["--rank-moe-ratio"], "183,137,168")
-        self.assertEqual(pi["phase_env"]["D"]["SGLANG_MOE_RESIDENT_EXPERT_FRACTION"], "0.06,0.51,0.48")
-        self.assertEqual(pi["phase_env"]["P"]["SGLANG_MOE_SCRATCH_SLOTS"], "32")
+        self.assertEqual(pi["phase_env"]["D"]["FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"], "0.06,0.51,0.48")
+        self.assertEqual(pi["phase_env"]["P"]["FLLIPER_MOE_SCRATCH_SLOTS"], "32")
         self.assertEqual(pi["phase_args"]["P"]["--max-mamba-cache-size"], "32")
 
 
@@ -122,7 +122,7 @@ class TestRequest(unittest.TestCase):
         req = R.build_request({"doc": ABL_DOC, "what": "phase_bars", "form": "flip"}, hardware={"cards": []}, model={"arch": {}})
         self.assertEqual(req["what"], "phase_bars")
         self.assertEqual(req["phase_args"]["D"]["--rank-tp-ratio"], "1,0,0")
-        self.assertEqual(req["phase_env"]["P"]["SGLANG_MOE_SCRATCH_SLOTS"], "32")
+        self.assertEqual(req["phase_env"]["P"]["FLLIPER_MOE_SCRATCH_SLOTS"], "32")
         self.assertEqual((req["tokens"], req["form"]), (["--d-only"], "flip"))
         self.assertEqual(req["server_args"]["--pp-stage-ratio"], "29,11,8")
 
@@ -407,9 +407,9 @@ class TestRealTree(unittest.TestCase):
     SCRIPT = r"""
 import json, os, sys
 sys.path.insert(0, sys.argv[1])
-from sglang.srt.planner import profile_couplings as PC
-from sglang.srt.weg2 import model_profile as MP
-fx = os.path.join(sys.argv[1], "..", "test", "registered", "unit", "weg2", "fixtures", "profil_s3_1003", "nextflash_int4mixed")
+from flliper.srt.planner import profile_couplings as PC
+from flliper.srt.pdflip import model_profile as MP
+fx = os.path.join(sys.argv[1], "..", "test", "registered", "unit", "pdflip", "fixtures", "profil_s3_1003", "nextflash_int4mixed")
 hw = PC.synthetic_hardware([("NVIDIA GeForce RTX 5090", 32607, 1400.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0)])
 model = MP.estimate(os.path.abspath(fx))
 st = {"ord": 0, "label": "Karte 0", "total_mib": 1000.0, "budget_mib": {"v": 900.0, "src": "Profilzeile", "note": ""},
@@ -436,7 +436,7 @@ print(json.dumps({"hw": hw, "model": model, "bar": PC.contract_bar(st, "P")}))
                "phase_args": {"P": {"--kv-cache-dtype": "fp8_e4m3", "--max-mamba-cache-size": "32", "--mamba-ssm-dtype": "bfloat16",
                                     "--chunked-prefill-size": "16384"},
                               "D": {"--rank-tp-ratio": "1,0,0", "--rank-moe-ratio": "183,137,168", "--rank-moe-resident-fraction": "0.06,0.51,0.48"}},
-               "phase_env": {"P": {}, "D": {"SGLANG_MOE_SCRATCH_SLOTS": "104,48,48"}}}
+               "phase_env": {"P": {}, "D": {"FLLIPER_MOE_SCRATCH_SLOTS": "104,48,48"}}}
         req.update(kw)
         return self.svc.request(req)
 

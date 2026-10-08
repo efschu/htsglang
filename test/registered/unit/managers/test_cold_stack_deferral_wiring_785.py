@@ -18,8 +18,8 @@ import sys
 
 import pytest
 
-from sglang.srt.managers import phase_flip_spill as sp
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import phase_flip_spill as sp
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 
@@ -129,7 +129,7 @@ class _Runner:
 
 
 def _charge(depth):
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
         ModelRunnerKVCacheMixin,
     )
 
@@ -139,7 +139,7 @@ def _charge(depth):
 def test_the_sizer_takes_the_credit_at_the_rung_that_defers(monkeypatch):
     _clear_env(monkeypatch)
     monkeypatch.setenv(sp.DEPTH_UNIMPLEMENTED_ENV, "1")
-    from sglang.srt.managers.arena_tail_probe import STACK_RESIDUAL_MIB
+    from flliper.srt.managers.arena_tail_probe import STACK_RESIDUAL_MIB
 
     assert _charge("arena") - _charge("draft+graphs") == STACK_RESIDUAL_MIB[0] * MIB
 
@@ -169,7 +169,7 @@ def test_without_a_derivation_the_charge_is_zero_regardless_of_depth(monkeypatch
     not turn that 0 into a negative or into a credit."""
     _clear_env(monkeypatch)
     monkeypatch.setenv(sp.DEPTH_UNIMPLEMENTED_ENV, "1")
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
         ModelRunnerKVCacheMixin,
     )
 

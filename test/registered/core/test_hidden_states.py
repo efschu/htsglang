@@ -3,10 +3,10 @@ import unittest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import sglang as sgl
-from sglang.srt.utils import get_device, is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+import flliper as sgl
+from flliper.srt.utils import get_device, is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=55, suite="stage-b-test-1-gpu-small-amd")
@@ -15,7 +15,7 @@ _is_hip = is_hip()
 if _is_hip:
     import os
 
-    os.environ["SGLANG_USE_AITER"] = "0"
+    os.environ["FLLIPER_USE_AITER"] = "0"
 
 
 class TestHiddenState(CustomTestCase):

@@ -46,16 +46,16 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.device_communicators import (
+from flliper.srt.distributed.device_communicators import (
     barlink_abort_gate,
     barlink_liveness,
 )
-from sglang.srt.distributed.device_communicators.barlink_device import (
+from flliper.srt.distributed.device_communicators.barlink_device import (
     BarlinkDeviceTransport,
     DeviceCollectiveAborted,
 )
 
-LIVENESS_MOD = "sglang.srt.distributed.device_communicators.barlink_liveness"
+LIVENESS_MOD = "flliper.srt.distributed.device_communicators.barlink_liveness"
 
 
 def _device_transport(code: int = 0, *, launches: int = 8, armed: bool = True):
@@ -227,7 +227,7 @@ class TestTheReadIsGivenBack(_Base):
         be re-verified for that family."""
         import inspect
 
-        from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+        from flliper.srt.distributed.device_communicators.barlink_bar1 import (
             BarlinkBar1Transport,
         )
 
@@ -312,7 +312,7 @@ class TestStopJoinsBeforeClearing(_Base):
 
 class TestTheTeardownWiring(_Base):
     def test_graceful_stops_it_and_re_arms(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         t = _device_transport()
         barlink_abort_gate.register(t)
@@ -324,7 +324,7 @@ class TestTheTeardownWiring(_Base):
         self.assertFalse(t._abort_poll_active)
 
     def test_the_exception_path_leaves_it_alone(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         w = _watchdog()
         try:
@@ -339,7 +339,7 @@ class TestTheTeardownWiring(_Base):
     def test_it_is_ALWAYS_STOP_with_no_gate(self):
         """A stop caller has no reason to be opt-in; always-stop is the safe
         direction, and the destroy's flag must not leak into it."""
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         w = _watchdog()
         sched = SimpleNamespace(
@@ -349,7 +349,7 @@ class TestTheTeardownWiring(_Base):
             self.assertEqual(td.release_barlink_watchdog(sched, graceful=True), "joined")
 
     def test_no_watchdog_installed_is_a_quiet_no_op(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         with mock.patch.object(barlink_liveness, "_watchdog", None):
             self.assertIsNone(
@@ -357,7 +357,7 @@ class TestTheTeardownWiring(_Base):
             )
 
     def test_it_NEVER_RAISES(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         class Boom:
             def stop(self, timeout_s=None):
@@ -374,18 +374,18 @@ class TestTheOrderingIsByConstruction(_Base):
         """CAN-FAIL by reordering. Patches the FUNCTIONS, not sys.modules --
         `from X import Y` resolves the package attribute, so a sys.modules
         patch is silently bypassed."""
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         order = []
         with mock.patch(
-            "sglang.srt.distributed.device_communicators.barlink_liveness"
+            "flliper.srt.distributed.device_communicators.barlink_liveness"
             ".stop_watchdog",
             side_effect=lambda *a, **k: (order.append("stop_watchdog"), "joined")[1],
         ), mock.patch(
-            "sglang.srt.distributed.parallel_state.destroy_model_parallel",
+            "flliper.srt.distributed.parallel_state.destroy_model_parallel",
             side_effect=lambda: order.append("destroy_model_parallel"),
         ), mock.patch(
-            "sglang.srt.distributed.parallel_state.destroy_distributed_environment",
+            "flliper.srt.distributed.parallel_state.destroy_distributed_environment",
             side_effect=lambda: order.append("destroy_world"),
         ):
             td.release_distributed(
@@ -405,7 +405,7 @@ class TestTheOrderingIsByConstruction(_Base):
     def test_the_scheduler_calls_it_before_release_distributed(self):
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         src = inspect.getsource(sched_mod)
         self.assertLess(
@@ -417,7 +417,7 @@ class TestTheOrderingIsByConstruction(_Base):
         import ast
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         called = {
             n.func.id

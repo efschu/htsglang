@@ -5,13 +5,13 @@ size of tensor b (80)". Grund: `_is_ct_wna16_expert_shard` fragte
 `layer.quant_method`, der Verbraucher in `_weight_loader_impl` fragte
 `self.scheme`. Die Namen in `_CT_TRANSPOSING_METHODS` sind SCHEMA-Namen --
 `quant_method` traf nie einen, der Worker transponierte also nie, und der
-Verbraucher sprang wegen `SGLANG_LOAD_TRANSPOSE_IN_WORKER=1` trotzdem ueber
+Verbraucher sprang wegen `FLLIPER_LOAD_TRANSPOSE_IN_WORKER=1` trotzdem ueber
 seine eigene Transposition. Niemand transponierte.
 """
 import inspect
 import types
 
-from sglang.srt.layers.moe.fused_moe_triton import layer as fml
+from flliper.srt.layers.moe.fused_moe_triton import layer as fml
 
 
 class CompressedTensorsWNA16MarlinMoE:
@@ -22,7 +22,7 @@ class CompressedTensorsMoEMethod:
     """Die `quant_method`, unter der das Schema haengt. Transponiert NICHT."""
 
 
-def test_schema_gewinnt_gegen_quant_method():
+def test_schema_wins_over_quant_method():
     layer = types.SimpleNamespace(
         quant_method=CompressedTensorsMoEMethod(),
         scheme=CompressedTensorsWNA16MarlinMoE(),
@@ -34,12 +34,12 @@ def test_schema_gewinnt_gegen_quant_method():
     assert fml.ct_method_transposes(fml.ct_effective_method(layer))
 
 
-def test_ohne_schema_zaehlt_die_quant_method():
+def test_without_schema_quant_method_counts():
     layer = types.SimpleNamespace(quant_method=CompressedTensorsWNA16MarlinMoE())
     assert fml.ct_method_transposes(fml.ct_effective_method(layer))
 
 
-def test_ktep_wrapper_wird_ausgepackt():
+def test_ktep_wrapper_is_unwrapped():
     class KTEPWrapperMethod:
         gpu_method = CompressedTensorsWNA16MarlinMoE()
 
@@ -47,7 +47,7 @@ def test_ktep_wrapper_wird_ausgepackt():
     assert fml.ct_method_transposes(fml.ct_effective_method(layer))
 
 
-def test_verbraucher_fragt_dieselbe_funktion():
+def test_consumer_asks_the_same_function():
     """Der Verbraucher darf die Kette nicht ein zweites Mal ausschreiben --
     sonst laufen die beiden Seiten wieder auseinander."""
     src = inspect.getsource(fml.FusedMoE._weight_loader_impl)
@@ -58,8 +58,8 @@ def test_verbraucher_fragt_dieselbe_funktion():
     )
 
 
-def test_worker_fragt_dieselbe_funktion():
-    from sglang.srt.models import qwen4_exp
+def test_worker_asks_the_same_function():
+    from flliper.srt.models import qwen4_exp
 
     src = inspect.getsource(qwen4_exp._is_ct_wna16_expert_shard)
     code = "\n".join(z for z in src.split("\n") if not z.lstrip().startswith("#"))
@@ -69,32 +69,32 @@ def test_worker_fragt_dieselbe_funktion():
     )
 
 
-def test_worker_praedikat_am_echten_namen(monkeypatch):
+def test_worker_predicate_on_real_name(monkeypatch):
     """Die Gegenprobe am Prädikat selbst, nicht am Quelltext: ein Layer,
     dessen SCHEMA transponiert und dessen quant_method nicht -- genau die
     Form des Checkpoints, an dem w59 starb."""
-    from sglang.srt.models import qwen4_exp
+    from flliper.srt.models import qwen4_exp
 
     experts = types.SimpleNamespace(
         quant_method=CompressedTensorsMoEMethod(),
         scheme=CompressedTensorsWNA16MarlinMoE(),
     )
 
-    class _Modell:
-        def get_submodule(self, pfad):
-            if pfad.endswith("layers.7.mlp.experts"):
+    class _Model:
+        def get_submodule(self, file_path):
+            if file_path.endswith("layers.7.mlp.experts"):
                 return experts
-            raise AttributeError(pfad)
+            raise AttributeError(file_path)
 
     name = "model.language_model.layers.7.mlp.experts.3.down_proj.weight_packed"
-    assert qwen4_exp._is_ct_wna16_expert_shard(name, _Modell()) is True
+    assert qwen4_exp._is_ct_wna16_expert_shard(name, _Model()) is True
     # kein Experten-Tensor -> nie
     assert not qwen4_exp._is_ct_wna16_expert_shard(
-        "model.layers.7.mlp.gate.weight", _Modell()
+        "model.layers.7.mlp.gate.weight", _Model()
     )
 
 
-def test_auch_der_fused_einstieg_kennt_die_quittung():
+def test_fused_entry_also_knows_the_ack():
     """devindex `where scheme kinds=read path~layers/moe` fand einen ZWEITEN
     Leser der Methodenkette: `weight_loader_fused`. Er transponiert mit
     einer eigenen, engeren Namensliste -- ohne die Quittung waere das eine
@@ -107,25 +107,25 @@ def test_auch_der_fused_einstieg_kennt_die_quittung():
     assert "self.scheme" not in code
 
 
-def test_68f_zaehler_zaehlt_gedreht_und_angeboten(monkeypatch):
+def test_68f_counter_counts_transposed_and_offered(monkeypatch):
     """Ohne diese Zahl sind am Ende eines Boots 'der Schalter brachte
     nichts' und 'der Schalter griff nie' nicht unterscheidbar -- w58 (Env
     kam nicht an) und w59 (Praedikat sagte immer nein) haben je einen Boot
     gekostet."""
     import torch
-    from sglang.srt.models import qwen4_exp as qx
+    from flliper.srt.models import qwen4_exp as qx
 
-    monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", "1")
+    monkeypatch.setenv("FLLIPER_LOAD_TRANSPOSE_IN_WORKER", "1")
     experts = types.SimpleNamespace(
         quant_method=CompressedTensorsMoEMethod(),
         scheme=CompressedTensorsWNA16MarlinMoE(),
     )
 
     class _M:
-        def get_submodule(self, pfad):
-            if pfad.endswith(".experts"):
+        def get_submodule(self, file_path):
+            if file_path.endswith(".experts"):
                 return experts
-            raise AttributeError(pfad)
+            raise AttributeError(file_path)
 
     vor = qx.worker_transpose_counts()
     t = torch.arange(6, dtype=torch.int32).reshape(2, 3)
@@ -140,11 +140,11 @@ def test_68f_zaehler_zaehlt_gedreht_und_angeboten(monkeypatch):
     assert nach[1] - vor[1] == 2, "angeboten falsch gezaehlt"
 
 
-def test_68f_der_zaehler_haelt_nichts_fest():
+def test_68f_counter_holds_no_references():
     """Ein Instrument darf das Gemessene nicht festhalten (21.09.: der
     Sampler hielt Frames ueber sein wait = +450 MiB reserved, zwei Boots
     tot). Hier stehen zwei ints, keine Tensoren."""
-    from sglang.srt.models import qwen4_exp as qx
+    from flliper.srt.models import qwen4_exp as qx
 
     assert all(isinstance(x, int) for x in qx._WORKER_TRANSPOSED)
     assert len(qx._WORKER_TRANSPOSED) == 2

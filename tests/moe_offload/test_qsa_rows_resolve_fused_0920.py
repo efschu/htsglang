@@ -23,11 +23,11 @@ CHECK = r'''
 import os, sys, types, torch
 os.environ["TRITON_INTERPRET"] = "1"
 sys.path.insert(0, %r)
-from sglang.srt.layers.attention.qsa.rows_resolve import (
+from flliper.srt.layers.attention.qsa.rows_resolve import (
     MODE_EVEN, MODE_NONE, MODE_WEIGHTED, qsa_rows_resolve,
 )
-from sglang.srt.layers.attention.qsa.sparse_attn import compact_owned_rows
-from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+from flliper.srt.layers.attention.qsa.sparse_attn import compact_owned_rows
+from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
 
 torch.manual_seed(7)
 R, C, B, K = 6, 300, 4, 40
@@ -92,14 +92,14 @@ def test_fused_rows_match_the_torch_chain_under_the_interpreter():
 
 
 def test_backend_switch_and_wiring(monkeypatch):
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
 
     for raw, want in (("", True), ("0", False), ("1", True)):
         qb._QSA_ROWS_FUSED["on"] = None
         if raw == "":
-            monkeypatch.delenv("SGLANG_QSA_ROWS_FUSED", raising=False)
+            monkeypatch.delenv("FLLIPER_QSA_ROWS_FUSED", raising=False)
         else:
-            monkeypatch.setenv("SGLANG_QSA_ROWS_FUSED", raw)
+            monkeypatch.setenv("FLLIPER_QSA_ROWS_FUSED", raw)
         assert qb._qsa_rows_fused_on() is want, raw
     qb._QSA_ROWS_FUSED["on"] = None
     import inspect
@@ -120,7 +120,7 @@ def test_backend_switch_and_wiring(monkeypatch):
 def test_fused_kernel_is_bounded_by_lane_and_writes_every_lane_once():
     import inspect
 
-    from sglang.srt.layers.attention.qsa import rows_resolve as rr
+    from flliper.srt.layers.attention.qsa import rows_resolve as rr
 
     src = inspect.getsource(rr)
     assert "dest = tl.where(keep, incl - 1, count + (offs - incl))" in src

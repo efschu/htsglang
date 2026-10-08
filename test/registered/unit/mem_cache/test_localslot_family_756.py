@@ -30,13 +30,13 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-SET_ENV = "SGLANG_PP_LAYER_SET"
-WIRE_ENV = "SGLANG_PP_CROSSING_WIRE"
+SET_ENV = "FLLIPER_PP_LAYER_SET"
+WIRE_ENV = "FLLIPER_PP_CROSSING_WIRE"
 
 
 class _CounterSpy:
@@ -59,7 +59,7 @@ class _SubPoolStub:
 
 
 def _hybrid(counter, start_layer=24):
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     pool = object.__new__(HybridLinearKVPool)
     pool.layer_transfer_counter = counter
@@ -70,7 +70,7 @@ def _hybrid(counter, start_layer=24):
 
 
 def _minimax(counter):
-    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+    from flliper.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
     pool = object.__new__(MiniMaxSparseKVPool)
     pool.layer_transfer_counter = counter
@@ -123,7 +123,7 @@ class TestTheBaseCoverReachesEverySubclass(CustomTestCase):
         """The one-line cover, proven over the LIVE class tree rather than a
         hand-list: every subclass -- including future ones -- resolves
         ``_local_slot_of`` without its __init__ having run."""
-        from sglang.srt.mem_cache import memory_pool as mp
+        from flliper.srt.mem_cache import memory_pool as mp
 
         def walk(cls):
             yield cls
@@ -137,7 +137,7 @@ class TestTheBaseCoverReachesEverySubclass(CustomTestCase):
                 self.assertIsNone(getattr(cls, "_local_slot_of"))
 
     def test_a_bypassing_instance_degenerates_to_the_subtraction(self):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         pool = object.__new__(HybridLinearKVPool)
         pool.start_layer = 24
@@ -164,7 +164,7 @@ class TestLayerSetsStillMapForReal(CustomTestCase):
     def test_both_wrappers_build_the_ownership_map_in_init(self):
         import inspect
 
-        from sglang.srt.mem_cache.memory_pool import (
+        from flliper.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
             MiniMaxSparseKVPool,
         )
@@ -182,8 +182,8 @@ class TestLayerSetsStillMapForReal(CustomTestCase):
         from types import SimpleNamespace
         from unittest import mock
 
-        import sglang.srt.distributed as dist
-        from sglang.srt.mem_cache.memory_pool import _owned_layers_for_pool
+        import flliper.srt.distributed as dist
+        from flliper.srt.mem_cache.memory_pool import _owned_layers_for_pool
 
         # #815: THE CROSSING WIRE IS NOW PART OF THE PREMISE, not decoration.
         # This test's whole point is a GAPPED ownership set, and 4b2e43465d
@@ -221,8 +221,8 @@ class TestLayerSetsStillMapForReal(CustomTestCase):
         from types import SimpleNamespace
         from unittest import mock
 
-        import sglang.srt.distributed as dist
-        from sglang.srt.mem_cache.memory_pool import _owned_layers_for_pool
+        import flliper.srt.distributed as dist
+        from flliper.srt.mem_cache.memory_pool import _owned_layers_for_pool
 
         os.environ[SET_ENV] = "0-15,32-39;16-31;40-47"
         os.environ.pop(WIRE_ENV, None)
@@ -236,7 +236,7 @@ class TestLayerSetsStillMapForReal(CustomTestCase):
 
 class TestStandardPoolUnchanged(CustomTestCase):
     def test_mha_pool_wait_still_runs_through_local_slot(self):
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         spy = _CounterSpy()
         pool = object.__new__(MHATokenToKVPool)

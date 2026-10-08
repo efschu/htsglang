@@ -26,7 +26,7 @@ import ast
 import pathlib
 import unittest
 
-from sglang.srt.distributed.device_communicators.barlink_path_dispatcher import (
+from flliper.srt.distributed.device_communicators.barlink_path_dispatcher import (
     HINT_GLOO,
     HINT_TRANSPORT,
     PROVENANCE_MEASURED,
@@ -36,13 +36,13 @@ from sglang.srt.distributed.device_communicators.barlink_path_dispatcher import 
     RatePoint,
     refine_transport_choice,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
-_RATES = "python/sglang/srt/distributed/device_communicators/barlink_path_rates.py"
+_RATES = "python/flliper/srt/distributed/device_communicators/barlink_path_rates.py"
 
 
 def _measured(name, base_ms, per_byte_ms, **kw):
@@ -128,7 +128,7 @@ class TestTransportHintIsStillUnwired(CustomTestCase):
         self.assertIsNone(d.transport_hint(decision.path))
         sentinel = object()
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink_path_dispatcher",
+            "flliper.srt.distributed.device_communicators.barlink_path_dispatcher",
             level="WARNING",
         ):
             self.assertIs(

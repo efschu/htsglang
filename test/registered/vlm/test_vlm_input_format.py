@@ -18,7 +18,7 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 if not hasattr(_hf_activations, "PytorchGELUTanh"):
 
@@ -32,11 +32,11 @@ if not hasattr(_hf_activations, "PytorchGELUTanh"):
         lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
     )
 
-from sglang import Engine
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.srt.utils.common import is_cuda, is_xpu
-from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
+from flliper import Engine
+from flliper.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from flliper.srt.parser.conversation import generate_chat_conv
+from flliper.srt.utils.common import is_cuda, is_xpu
+from flliper.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
 
 register_cuda_ci(est_time=747, stage="base-b", runner_config="1-gpu-large")
 
@@ -540,8 +540,8 @@ class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         ``</img>`` — mirroring the logic in
         ``InternVLProcessor.process_internlm2_mm_data_async``.
         """
-        from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
-        from sglang.srt.multimodal.processors.internvl import InternVLProcessor
+        from flliper.srt.multimodal.internvl_utils import image_to_pixel_values
+        from flliper.srt.multimodal.processors.internvl import InternVLProcessor
 
         if req is None:
             req = self.get_completion_request()
@@ -611,9 +611,9 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         )
         # In transformers v5.5.3, AutoTokenizer may return TokenizersBackend
         # which lacks model-specific attributes (e.g. im_start_id for MiniCPM-V).
-        # Replace with sglang's tokenizer which handles this via declared-class
+        # Replace with flliper's tokenizer which handles this via declared-class
         # fallback, then fix added tokens encoding.
-        from sglang.srt.utils.hf_transformers import get_tokenizer
+        from flliper.srt.utils.hf_transformers import get_tokenizer
 
         cls.processor.tokenizer = get_tokenizer(cls.model_path, trust_remote_code=True)
         _fix_added_tokens_encoding(cls.processor.tokenizer)

@@ -1,13 +1,13 @@
 """X-COST-LINE (29.09.): the rank fills the D prefill cost ring.
 
 ``RankPrefillLog.flush`` hands its measured (new, cached, gpu-ms) to
-``weg2.prefill_clock.note_batch_cost`` before it formats the log line; the
+``pdflip.prefill_clock.note_batch_cost`` before it formats the log line; the
 front reads the ring over ``/get_server_info`` (IPC, not the log). The front
 side (fit, solve, records) is in
-``test/registered/unit/weg2/test_weg2_x_cost_line_0929.py``.
+``test/registered/unit/pdflip/test_pdflip_x_cost_line_0929.py``.
 
 Imported the way the reporter's own tests are (CPU default device at module
-top): importing it inside a test, after a weg2 sibling module had hidden the
+top): importing it inside a test, after a pdflip sibling module had hidden the
 devices, died in dynamo's device table (IndexError, order-dependent).
 """
 
@@ -20,10 +20,10 @@ import torch
 
 torch.set_default_device("cpu")
 
-from sglang.srt.managers.scheduler_components.metrics_reporter import (  # noqa: E402
+from flliper.srt.managers.scheduler_components.metrics_reporter import (  # noqa: E402
     RankPrefillLog,
 )
-from sglang.srt.weg2 import prefill_clock as pc  # noqa: E402
+from flliper.srt.pdflip import prefill_clock as pc  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +48,7 @@ def test_rank_fills_the_ring_from_its_own_measurement_with_the_logger_muted():
 
     log = RankPrefillLog()
     log.timer = _Timer(log)
-    mr = logging.getLogger("sglang.srt.managers.scheduler_components.metrics_reporter")
+    mr = logging.getLogger("flliper.srt.managers.scheduler_components.metrics_reporter")
     was = mr.disabled
     mr.disabled = True
     try:

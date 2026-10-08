@@ -15,7 +15,7 @@ import torch
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
+from flliper.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
 
 
 class _Pool:
@@ -48,7 +48,7 @@ def test_a_slot_outside_the_arena_is_refused_by_name():
     p = _p(A=3)                                        # slot 4 (row 2) is outside
     with pytest.raises(RuntimeError) as exc:
         ap.ArenaMHAHostPool._load_arena(p, _Pool(1000), torch.tensor([1, 2]), torch.tensor([10, 11]), 0)
-    assert "WEG2-ARENA-LOAD REFUSED" in str(exc.value) and "outside the arena of 3 slots" in str(exc.value)
+    assert "PDFLIP-ARENA-LOAD REFUSED" in str(exc.value) and "outside the arena of 3 slots" in str(exc.value)
     assert p.calls == []
 
 

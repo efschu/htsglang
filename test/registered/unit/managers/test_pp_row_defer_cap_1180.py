@@ -28,7 +28,7 @@ pins carry that:
   * `test_a_repeat_defer_does_not_rearm_the_chain_hedge` -- the reachability
     pin. Every defer used to set `_pp_row_chain_owed`, and the next loop
     iteration turns that flag into a BLOCKING chain receive with no bound
-    (`SGLANG_PP_CHAIN_RECV_STALL_S` defaults to "0"). Arming it only on the
+    (`FLLIPER_PP_CHAIN_RECV_STALL_S` defaults to "0"). Arming it only on the
     FIRST sighting is what lets this rank come back to the probe on its own.
   * `test_the_defer_is_not_unbounded` -- the behavioural pin, and it imports
     NOTHING new on purpose, so its red is a statement about behaviour rather
@@ -56,7 +56,7 @@ from __future__ import annotations
 import types
 import unittest
 
-from sglang.srt.managers import scheduler_pp_mixin as ppm
+from flliper.srt.managers import scheduler_pp_mixin as ppm
 
 
 def _wire_row(rid: str, *, admitted: bool = True, retracted: bool = False):
@@ -196,7 +196,7 @@ class RowDeferCapProbeTest(unittest.TestCase):
         )
 
     def test_an_unchanging_missing_set_past_the_cap_stops_by_name(self):
-        from sglang.srt.managers.pp_row_defer_cap import (
+        from flliper.srt.managers.pp_row_defer_cap import (
             ROW_DEFER_LAP_CAP,
             PpRowDeferCapExceeded,
         )
@@ -214,7 +214,7 @@ class RowDeferCapProbeTest(unittest.TestCase):
         self.assertIn("#1180", msg)
         self.assertIn("slot 2", msg)
         self.assertIn("c25108f3", msg)
-        self.assertIn("SGLANG_PP_ROW_AUTHORITY=0", msg)
+        self.assertIn("FLLIPER_PP_ROW_AUTHORITY=0", msg)
         self.assertIn("UNRESOLVED_DEFER_CAP", msg)
 
     def test_the_frame_is_still_queued_when_the_cap_lapses(self):
@@ -224,7 +224,7 @@ class RowDeferCapProbeTest(unittest.TestCase):
         finds nothing and the ring dies upstream-waiting. The stop's only
         product is a verdict and a message.
         """
-        from sglang.srt.managers.pp_row_defer_cap import (
+        from flliper.srt.managers.pp_row_defer_cap import (
             ROW_DEFER_LAP_CAP,
             PpRowDeferCapExceeded,
         )
@@ -246,7 +246,7 @@ class RowDeferCapProbeTest(unittest.TestCase):
         same identity must raise again at once -- never degrade into a
         periodic raise-and-retry that keeps the ring closed between raises.
         """
-        from sglang.srt.managers.pp_row_defer_cap import (
+        from flliper.srt.managers.pp_row_defer_cap import (
             ROW_DEFER_LAP_CAP,
             PpRowDeferCapExceeded,
         )
@@ -261,7 +261,7 @@ class RowDeferCapProbeTest(unittest.TestCase):
             self._probe(sched)
 
     def test_a_changing_missing_set_never_reaches_the_cap(self):
-        from sglang.srt.managers.pp_row_defer_cap import PpRowDeferCapExceeded
+        from flliper.srt.managers.pp_row_defer_cap import PpRowDeferCapExceeded
 
         queue = [_frame(self.SLOT, self.EPOCH, ["c25108f3"])]
         sched = self._sched(queue)
@@ -274,7 +274,7 @@ class RowDeferCapProbeTest(unittest.TestCase):
             self.fail(f"a moving missing set must never lapse: {exc}")
 
     def test_a_new_frame_does_not_inherit_its_predecessors_count(self):
-        from sglang.srt.managers.pp_row_defer_cap import (
+        from flliper.srt.managers.pp_row_defer_cap import (
             ROW_DEFER_LAP_CAP,
             PpRowDeferCapExceeded,
         )
@@ -350,8 +350,8 @@ class RowDeferCapUnitTest(unittest.TestCase):
         import ast
         import inspect
 
-        from sglang.srt.managers import pp_row_defer_cap as mod
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers import pp_row_defer_cap as mod
+        from flliper.srt.managers.pp_admission_congruence import (
             UNRESOLVED_DEFER_CAP,
         )
 
@@ -379,13 +379,13 @@ class RowDeferCapUnitTest(unittest.TestCase):
             alias.name
             for node in tree.body
             if isinstance(node, ast.ImportFrom)
-            and node.module == "sglang.srt.managers.pp_admission_congruence"
+            and node.module == "flliper.srt.managers.pp_admission_congruence"
             for alias in node.names
         }
         self.assertIn("UNRESOLVED_DEFER_CAP", imported)
 
     def test_the_first_sighting_always_defers(self):
-        from sglang.srt.managers.pp_row_defer_cap import RowDeferCap
+        from flliper.srt.managers.pp_row_defer_cap import RowDeferCap
 
         c = RowDeferCap()
         v = c.observe(0, ["a"], token=("t",))
@@ -395,7 +395,7 @@ class RowDeferCapUnitTest(unittest.TestCase):
 
     def test_the_cap_is_inclusive_at_its_own_value(self):
         """`cap` consecutive observations still defer; `cap`+1 stops."""
-        from sglang.srt.managers.pp_row_defer_cap import RowDeferCap
+        from flliper.srt.managers.pp_row_defer_cap import RowDeferCap
 
         c = RowDeferCap()
         for i in range(3):
@@ -403,14 +403,14 @@ class RowDeferCapUnitTest(unittest.TestCase):
         self.assertFalse(c.observe(0, ["a"], token=("t",), cap=3).defer)
 
     def test_zero_disables_the_bound_and_restores_todays_behaviour(self):
-        from sglang.srt.managers.pp_row_defer_cap import RowDeferCap
+        from flliper.srt.managers.pp_row_defer_cap import RowDeferCap
 
         c = RowDeferCap()
         for _ in range(1000):
             self.assertTrue(c.observe(0, ["a"], token=("t",), cap=0).defer)
 
     def test_clear_forgets_one_slot_only(self):
-        from sglang.srt.managers.pp_row_defer_cap import RowDeferCap
+        from flliper.srt.managers.pp_row_defer_cap import RowDeferCap
 
         c = RowDeferCap()
         c.observe(0, ["a"], token=("t",))
@@ -420,7 +420,7 @@ class RowDeferCapUnitTest(unittest.TestCase):
         self.assertEqual(c.observe(1, ["a"], token=("t",)).occurrence, 2)
 
     def test_a_different_token_restarts_the_count(self):
-        from sglang.srt.managers.pp_row_defer_cap import RowDeferCap
+        from flliper.srt.managers.pp_row_defer_cap import RowDeferCap
 
         c = RowDeferCap()
         c.observe(0, ["a"], token=("t1",))
@@ -428,7 +428,7 @@ class RowDeferCapUnitTest(unittest.TestCase):
         self.assertEqual(c.observe(0, ["a"], token=("t2",)).occurrence, 1)
 
     def test_an_unhashable_token_degrades_instead_of_raising(self):
-        from sglang.srt.managers.pp_row_defer_cap import RowDeferCap
+        from flliper.srt.managers.pp_row_defer_cap import RowDeferCap
 
         c = RowDeferCap()
         v = c.observe(0, ["a"], token=["unhashable"])
@@ -436,7 +436,7 @@ class RowDeferCapUnitTest(unittest.TestCase):
         self.assertEqual(c.observe(0, ["a"], token=["other"]).occurrence, 2)
 
     def test_slots_do_not_share_a_count(self):
-        from sglang.srt.managers.pp_row_defer_cap import RowDeferCap
+        from flliper.srt.managers.pp_row_defer_cap import RowDeferCap
 
         c = RowDeferCap()
         for _ in range(8):
@@ -444,7 +444,7 @@ class RowDeferCapUnitTest(unittest.TestCase):
         self.assertEqual(c.observe(1, ["a"], token=("t",)).occurrence, 1)
 
     def test_the_message_names_every_term(self):
-        from sglang.srt.managers.pp_row_defer_cap import RowDeferCap
+        from flliper.srt.managers.pp_row_defer_cap import RowDeferCap
 
         c = RowDeferCap()
         v = None
@@ -457,7 +457,7 @@ class RowDeferCapUnitTest(unittest.TestCase):
             "deadbeef",
             "LAPS, NOT SECONDS",
             "UNRESOLVED_DEFER_CAP",
-            "SGLANG_PP_ROW_AUTHORITY=0",
+            "FLLIPER_PP_ROW_AUTHORITY=0",
         ):
             self.assertIn(term, v.message)
 

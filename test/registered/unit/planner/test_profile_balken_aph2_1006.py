@@ -22,12 +22,12 @@ from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.planner import expert_residency as ER  # noqa: E402
-from sglang.srt.planner import profile_couplings as PC  # noqa: E402
-from sglang.srt.weg2 import model_profile as MP  # noqa: E402
+from flliper.srt.planner import expert_residency as ER  # noqa: E402
+from flliper.srt.planner import profile_couplings as PC  # noqa: E402
+from flliper.srt.pdflip import model_profile as MP  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FX = os.path.join(HERE, "..", "weg2", "fixtures", "profil_s3_1003")
+FX = os.path.join(HERE, "..", "pdflip", "fixtures", "profil_s3_1003")
 MIB = 1024.0 * 1024.0
 RIG3 = [("NVIDIA GeForce RTX 5090", 32607, 1400.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0)]
 ORDER = ["weights", "experts", "draft", "kv", "state", "activation", "fixed", "reserve", "free"]
@@ -53,7 +53,7 @@ NF_PA = {"P": {"--kv-cache-dtype": "fp8_e4m3", "--max-mamba-cache-size": "32", "
          "D": {"--rank-role": "host,worker,worker", "--rank-tp-ratio": "1,0,0", "--rank-moe-ratio": "183,137,168",
                "--rank-moe-resident-fraction": "0.06,0.51,0.48", "--speculative-draft-placement": "solo", "--speculative-algorithm": "NEXTN",
                "--kv-cache-dtype": "fp8_e4m3", "--max-mamba-cache-size": "32", "--mamba-ssm-dtype": "bfloat16"}}
-NF_PE = {"P": {"SGLANG_MOE_SCRATCH_SLOTS": "32"}, "D": {"SGLANG_MOE_SCRATCH_SLOTS": "104,48,48", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION": "0.06,0.51,0.48"}}
+NF_PE = {"P": {"FLLIPER_MOE_SCRATCH_SLOTS": "32"}, "D": {"FLLIPER_MOE_SCRATCH_SLOTS": "104,48,48", "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION": "0.06,0.51,0.48"}}
 
 
 def nf(**kw):
@@ -648,15 +648,15 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
     Rest mit der Launcher-Formel ueberein.  Die D-Phase wird gegen ``launcher.budgets_from_dc`` gehalten, aufgerufen mit ALLEN Argumenten, die der
     Launcher in ``_d_spec_from`` uebergibt (launcher.py:27207-27214: overshoot, corridor_sample_path, corridor_constrain=True, user_reserve_by_card,
     dormant_growth, charge_driver_carve, driver_carve_min_total_mib, awake_rest, terms_out, booked_rest_kwargs) -- fuer Release-Flip (27b-base),
-    Release-Dual, NF abl und d_only.  Der Korridor-Boden kommt aus SGLANG_CORRIDOR_LAW_FLOOR_MIB=1024 (host-unabhaengig)."""
+    Release-Dual, NF abl und d_only.  Der Korridor-Boden kommt aus FLLIPER_CORRIDOR_LAW_FLOOR_MIB=1024 (host-unabhaengig)."""
 
     TOTALS = (32607, 20480, 20480)
 
     @classmethod
     def setUpClass(cls):
         try:
-            from sglang.srt.weg2 import launcher as L
-            from sglang.srt.planner import pp_cut as PP
+            from flliper.srt.pdflip import launcher as L
+            from flliper.srt.planner import pp_cut as PP
         except Exception as exc:                                  # pragma: no cover - ohne Launcher-Import nicht pruefbar
             raise unittest.SkipTest("launcher import: %r" % (exc,))
         cls.L, cls.PP = L, PP
@@ -674,8 +674,8 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
         _grow, _grow_prov = L.served_dormant_growth(cards, ns.profile)
         _rest, _rest_prov = L.d_awake_rest(cards, ns.profile)
         _over, _over_prov = L.d_overshoot_record(ns.profile)
-        env = {k: v for k, v in os.environ.items() if k != "SGLANG_WEG2_BUDGET_REST_RECORD"}
-        env["SGLANG_CORRIDOR_LAW_FLOOR_MIB"] = "1024"
+        env = {k: v for k, v in os.environ.items() if k != "FLLIPER_PDFLIP_BUDGET_REST_RECORD"}
+        env["FLLIPER_CORRIDOR_LAW_FLOOR_MIB"] = "1024"
         terms = []
         with mock.patch.dict(os.environ, env, clear=True):
             out = L.budgets_from_dc(
@@ -757,8 +757,8 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
         dc = [a + b for a, b in zip(fo, nt)]
         av = self.PP.d_rank_available_mib(card_total_mib=self.TOTALS, foreign_context_mib=fo, nontorch_mib=nt)
         # Torch-Cache-Kappe: --env-d nennt den Schalter (0 = ungekappter Rest), sonst gilt die Registerzeile
-        for env in ("SGLANG_WEG2_TORCH_CACHE_CAP=0", "SGLANG_WEG2_TORCH_CACHE_CAP=1"):
-            pe = {"D": {"SGLANG_WEG2_TORCH_CACHE_CAP": env.split("=")[1]}}
+        for env in ("FLLIPER_PDFLIP_TORCH_CACHE_CAP=0", "FLLIPER_PDFLIP_TORCH_CACHE_CAP=1"):
+            pe = {"D": {"FLLIPER_PDFLIP_TORCH_CACHE_CAP": env.split("=")[1]}}
             r = PC.phase_bars(hw(), model("qwen27b_int8_vocabembed"), dict(FLIP27_ARGS), {}, pe)
             self.check_d_bar(r["phases"]["D"]["bars"], dc, av, profile="qwen27b", reserve="1800,1400,1400", env_d=env)
         # skalare Reserve gilt fuer jede Karte (launcher.py:14152-14158)

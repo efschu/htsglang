@@ -1,10 +1,10 @@
 """
 Usage:
-# Run a Pixtral model with SGLang:
+# Run a Pixtral model with fLLiper:
 # HuggingFace:
-python -m sglang.launch_server --model-path mistral-community/pixtral-12b --port=30000
+python -m flliper.launch_server --model-path mistral-community/pixtral-12b --port=30000
 # ModelScope:
-python -m sglang.launch_server --model-path AI-ModelScope/pixtral-12b --port=30000
+python -m flliper.launch_server --model-path AI-ModelScope/pixtral-12b --port=30000
 
 # Then test it with:
 python pixtral_server.py
@@ -19,7 +19,7 @@ import json
 import aiohttp
 import requests
 
-from sglang.utils import normalize_base_url
+from flliper.utils import normalize_base_url
 
 IMAGE_TOKEN_SEP = "\n[IMG]"
 ROUTE = "/generate"

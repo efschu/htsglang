@@ -17,7 +17,7 @@ i.e. the second process's view of the same weights costs ZERO card bytes.
 import os, sys, time
 import torch
 
-from sglang.srt.weg2.union_arena_vmm import (
+from flliper.srt.pdflip.union_arena_vmm import (
     UnionRendezvousServer, UnionVmmArena, fetch_union, socket_path,
 )
 

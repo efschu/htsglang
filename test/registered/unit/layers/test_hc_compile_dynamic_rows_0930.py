@@ -10,7 +10,7 @@ static compile), 328.9 / 332.2 on forward 2 (65 rows, the automatic-dynamic
 recompile), 5-8 ms from then on.
 
 Hermetic on CPU inductor: the stock wrapper builds two graphs over changing
-row counts; with SGLANG_ENABLE_HC_COMPILE_DYNAMIC_ROWS one. The served bytes
+row counts; with FLLIPER_ENABLE_HC_COMPILE_DYNAMIC_ROWS one. The served bytes
 are the compiled ones: equal, row count by row count (16, 17, 65, 16384), to
 a static compile of the same function; the eager composition differs from
 BOTH by bf16 rounding of the fused intermediates (asserted close, not equal
@@ -26,15 +26,15 @@ import torch
 import torch._dynamo as dyn
 from torch._dynamo.utils import counters
 
-from sglang.srt.environ import envs
-from sglang.srt.layers import hyperconnection as hcm
+from flliper.srt.environ import envs
+from flliper.srt.layers import hyperconnection as hcm
 
 HC, HS, LR = 4, 64, 16
 ROWS = (16384, 65, 8258, 16, 17)
 
 
 def _switch(on):
-    return envs.SGLANG_ENABLE_HC_COMPILE_DYNAMIC_ROWS.override(on)
+    return envs.FLLIPER_ENABLE_HC_COMPILE_DYNAMIC_ROWS.override(on)
 
 
 @pytest.fixture(autouse=True)
@@ -85,7 +85,7 @@ def test_switch_on_compiles_the_mixer_once_over_every_row_count():
 
 def test_every_layer_shares_the_one_graph():
     """PP0/PP1 and D carry the same class per layer (bf16 unless
-    SGLANG_HC_MIXER_INT8): one code object, one graph for all instances."""
+    FLLIPER_HC_MIXER_INT8): one code object, one graph for all instances."""
     with _switch(True):
         mixers = [_mixer(seed=s) for s in range(3)]
     for i, m in enumerate(ROWS):
@@ -132,6 +132,6 @@ def test_combine_compiles_once_and_bytes_equal_the_static_compile(m):
 
 
 def test_switch_default_off():
-    assert envs.SGLANG_ENABLE_HC_COMPILE_DYNAMIC_ROWS.get() is False
+    assert envs.FLLIPER_ENABLE_HC_COMPILE_DYNAMIC_ROWS.get() is False
     g = _mixer()
     assert g._compile_dynamic_rows is False

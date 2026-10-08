@@ -30,9 +30,9 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from sglang.srt.turnkey import config as C            # noqa: E402
-from sglang.srt.turnkey import orchestrator as O      # noqa: E402
-from sglang.srt.turnkey import preflight as PF        # noqa: E402
+from flliper.srt.turnkey import config as C            # noqa: E402
+from flliper.srt.turnkey import orchestrator as O      # noqa: E402
+from flliper.srt.turnkey import preflight as PF        # noqa: E402
 from turnkey_539_export_env import PER_BOOT_KEYS      # noqa: E402
 
 #: Env keys the turnkey path is EXPECTED to diverge on, each for a stated
@@ -111,7 +111,7 @@ def main(argv=None) -> int:
 
     print("\n== env parity (turnkey-controlled keys) ==")
     interesting = [k for k in want_env
-                   if k.startswith(("SGLANG_", "HTSGLANG_", "PYTORCH_"))
+                   if k.startswith(("FLLIPER_", "HTSGLANG_", "PYTORCH_"))
                    or k in ("LD_LIBRARY_PATH", "PYTHONPATH",
                             "CUDA_VISIBLE_DEVICES")]
     bad = []
@@ -135,7 +135,7 @@ def main(argv=None) -> int:
         ok = False
 
     extra = [k for k in bp.env
-             if k not in want_env and k.startswith(("SGLANG_", "HTSGLANG_"))]
+             if k not in want_env and k.startswith(("FLLIPER_", "HTSGLANG_"))]
     for k in sorted(extra):
         if k in EXPECTED_DIVERGENCE:
             continue

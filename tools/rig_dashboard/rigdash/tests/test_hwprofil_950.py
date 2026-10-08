@@ -111,7 +111,7 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.tree = os.path.join(self.tmp, "python")
-        d = os.path.join(self.tree, "sglang", "srt", "rigmon")
+        d = os.path.join(self.tree, "flliper", "srt", "rigmon")
         os.makedirs(d)
         with open(os.path.join(d, "hardware_profile.py"), "w") as fh:
             fh.write(STUB_MODULE)

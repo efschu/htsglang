@@ -1,7 +1,7 @@
 """
 Usage:
 1) Launch the server in one terminal:
-   python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --port 30000
+   python -m flliper.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --port 30000
 
 2) Run this script in another terminal:
    python openai_chat_with_response_prefill.py

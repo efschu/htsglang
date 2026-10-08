@@ -20,15 +20,15 @@ Hermetic: no GPU, no torch import beyond what the module already does.
 
 import unittest
 
-from sglang.srt.layers.moe.expert_offload import (
+from flliper.srt.layers.moe.expert_offload import (
     ColdShardContext,
     HostShardRatio,
     presplit_expert_offload_after_repack,
     refuse_cold_shard_at_repack_door,
     repack_door_shards_experts_on_dim0,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -70,12 +70,12 @@ class TestTheDoorRefusesByName(CustomTestCase):
             refuse_cold_shard_at_repack_door(_Layer(moe_ep_size=2))
         msg = str(ctx.exception)
         self.assertIn("UNREACHABLE", msg)
-        self.assertIn("SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE", msg)
+        self.assertIn("FLLIPER_MOE_HOST_SHARD_UNSAFE_DELEGATE", msg)
 
     def test_the_unsafe_escape_hatch_opens_only_for_an_eligible_layer(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE.override(True):
+        with envs.FLLIPER_MOE_HOST_SHARD_UNSAFE_DELEGATE.override(True):
             # Eligible: the developer escape hatch lets it through.
             refuse_cold_shard_at_repack_door(_Layer(moe_ep_size=2))
             # Ineligible: still structurally impossible, hatch or not.

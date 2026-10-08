@@ -77,13 +77,13 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 _ROOT = Path(__file__).resolve().parents[4]
-_MIXIN = _ROOT / "python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py"
-_SERVER_ARGS = _ROOT / "python/sglang/srt/server_args.py"
+_MIXIN = _ROOT / "python/flliper/srt/model_executor/model_runner_kv_cache_mixin.py"
+_SERVER_ARGS = _ROOT / "python/flliper/srt/server_args.py"
 
 
 class _Args:
@@ -102,17 +102,17 @@ class TestTheReplicatedDraftPredicate(unittest.TestCase):
     """``draft_pool_is_replicated`` is the single source of the geometry."""
 
     def test_a_default_draft_worker_is_replicated(self):
-        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+        from flliper.srt.layers.dcp.owner import draft_pool_is_replicated
 
         self.assertTrue(draft_pool_is_replicated(True, _Args()))
 
     def test_opting_into_dcp_turns_it_off(self):
-        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+        from flliper.srt.layers.dcp.owner import draft_pool_is_replicated
 
         self.assertFalse(draft_pool_is_replicated(True, _Args("dcp")))
 
     def test_the_target_worker_is_never_replicated_by_this_predicate(self):
-        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+        from flliper.srt.layers.dcp.owner import draft_pool_is_replicated
 
         self.assertFalse(draft_pool_is_replicated(False, _Args()))
         self.assertFalse(draft_pool_is_replicated(False, _Args("dcp")))
@@ -120,7 +120,7 @@ class TestTheReplicatedDraftPredicate(unittest.TestCase):
     def test_a_partial_server_args_stand_in_means_the_default(self):
         """The docstring at owner.py:92-99 claims getattr-defensiveness for
         test doubles and the CUDA-graph runners. That is a testable claim."""
-        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+        from flliper.srt.layers.dcp.owner import draft_pool_is_replicated
 
         class _Bare:
             pass
@@ -283,7 +283,7 @@ class TestTheAnalysisInputsAreStillTrue(unittest.TestCase):
         leg: that draft worker is built from the SAME server_args, so its
         ``dcp_size`` is the target's, not 1."""
         worker = (
-            _ROOT / "python/sglang/srt/speculative/eagle_worker_v2.py"
+            _ROOT / "python/flliper/srt/speculative/eagle_worker_v2.py"
         ).read_text()
         self.assertRegex(worker, r"TpModelWorker\(\s*\n\s*server_args=server_args,")
         self.assertIn("is_draft_worker=True,", worker)
@@ -300,18 +300,18 @@ class TestTheAnalysisInputsAreStillTrue(unittest.TestCase):
         """
         producers = sorted(
             str(p.relative_to(_ROOT))
-            for p in (_ROOT / "python/sglang/srt").rglob("*.py")
+            for p in (_ROOT / "python/flliper/srt").rglob("*.py")
             if "is_draft_worker=True," in p.read_text()
         )
         self.assertEqual(
             producers,
             [
-                "python/sglang/srt/model_executor/dual_group_lane.py",
-                "python/sglang/srt/speculative/draft_worker_common.py",
-                "python/sglang/srt/speculative/eagle_worker_v2.py",
-                "python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py",
-                "python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py",
-                "python/sglang/srt/speculative/standalone_worker_v2.py",
+                "python/flliper/srt/model_executor/dual_group_lane.py",
+                "python/flliper/srt/speculative/draft_worker_common.py",
+                "python/flliper/srt/speculative/eagle_worker_v2.py",
+                "python/flliper/srt/speculative/frozen_kv_mtp_worker_v2.py",
+                "python/flliper/srt/speculative/multi_layer_eagle_worker_v2.py",
+                "python/flliper/srt/speculative/standalone_worker_v2.py",
             ],
             "a new is_draft_worker producer appeared; re-derive the #487 "
             "reachability case split before trusting this file",
@@ -327,7 +327,7 @@ class TestTheAnalysisInputsAreStillTrue(unittest.TestCase):
         stock branch's two multipliers are identities regardless.
         """
         src = (
-            _ROOT / "python/sglang/srt/model_executor/dual_group_lane.py"
+            _ROOT / "python/flliper/srt/model_executor/dual_group_lane.py"
         ).read_text()
         view = src[src.index("def _lane_server_args_view") :][:3000]
         self.assertIn("view.dcp_size = 1", view)
@@ -338,7 +338,7 @@ class TestTheAnalysisInputsAreStillTrue(unittest.TestCase):
         """What makes the lane leg work: the runner takes dcp_size from the
         (overridden) server args, not from the ambient parallel view."""
         runner = (
-            _ROOT / "python/sglang/srt/model_executor/model_runner.py"
+            _ROOT / "python/flliper/srt/model_executor/model_runner.py"
         ).read_text()
         self.assertIn("self.dcp_size = server_args.dcp_size", runner)
         self.assertEqual(runner.count("self.dcp_size = "), 1)

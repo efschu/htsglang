@@ -10,7 +10,7 @@ computes them from git and the boot's state.json.
   python3 /opt/rigdash/current/rigdash/features_update.py set --id H106 --modell NF \\
       --titel "Form-A-Worker folgt dem ADMIT des Hosts" --fertig ja \\
       --zweig desk/nf-h106-0928=49a2a04af3 \\
-      --schalter SGLANG_WEG2_H106=env:D:1:an --verantwortlich NF-Implementierer
+      --schalter FLLIPER_PDFLIP_H106=env:D:1:an --verantwortlich NF-Implementierer
   # 27B picked it: add its sha as a further branch (keeps the others)
   ... add-zweig --id H106 --zweig desk/27b-unified-0926=0293076975
   # a gain -- modell is mandatory when the feature is for both models
@@ -80,13 +80,13 @@ def _zweig(s: str) -> dict:
 
 
 def _schalter(s: str) -> dict:
-    """NAME=art:gruppe:an_wert:default -- e.g. SGLANG_X=env:D:1:aus, --d-foo=flag:D::aus."""
+    """NAME=art:gruppe:an_wert:default -- e.g. FLLIPER_X=env:D:1:aus, --d-foo=flag:D::aus."""
     name, sep, rest = s.partition("=")
     parts = rest.split(":") if sep else []
     if len(parts) != 4:
         raise SystemExit("--schalter needs NAME=art:gruppe:an_wert:default, not %r" % s)
-    art, gruppe, an_wert, default = parts
-    return {"name": name, "art": art, "gruppe": gruppe, "an_wert": an_wert, "default": default}
+    art, proc_group, an_wert, default = parts
+    return {"name": name, "art": art, "gruppe": proc_group, "an_wert": an_wert, "default": default}
 
 
 def _bool(s: str) -> bool:
@@ -229,8 +229,8 @@ def main(argv=None) -> int:
         d = _load(a.file)
         if a.cmd == "set":
             f = _find(d, a.id, create=True)
-            for key, val in (("modell", a.modell), ("titel", a.titel), ("fertig", a.fertig),
-                             ("zweige", a.zweig), ("schalter", a.schalter),
+            for key, val in (("modell", a.model), ("titel", a.titel), ("fertig", a.done),
+                             ("zweige", a.branch), ("schalter", a.schalter),
                              ("aus_begruendung", a.aus_begruendung), ("verantwortlich", a.verantwortlich)):
                 if val is not None:
                     f[key] = val
@@ -244,15 +244,15 @@ def main(argv=None) -> int:
                     bs.append(a.id)
         elif a.cmd == "add-zweig":
             f = _find(d, a.id)
-            zs = [x for x in f.get("zweige") or [] if x.get("sha") != a.zweig["sha"]]
-            f["zweige"] = zs + [a.zweig]
+            zs = [x for x in f.get("zweige") or [] if x.get("sha") != a.branch["sha"]]
+            f["zweige"] = zs + [a.branch]
         elif a.cmd == "gewinn":
             f = _find(d, a.id)
-            new = {k: v for k, v in (("metrik", a.metrik), ("vorher", a.vorher), ("nachher", a.nachher),
-                                    ("einheit", a.einheit), ("art", a.art), ("modell", a.modell),
-                                    ("quelle", a.quelle), ("boot", a.boot)) if v not in (None, "")}
+            new = {k: v for k, v in (("metrik", a.metrik), ("vorher", a.before), ("nachher", a.after),
+                                    ("einheit", a.einheit), ("art", a.art), ("modell", a.model),
+                                    ("quelle", a.source), ("boot", a.boot)) if v not in (None, "")}
             keep = [x for x in f.get("gewinn") or []
-                    if not (x.get("metrik") == a.metrik and x.get("modell") == a.modell)]
+                    if not (x.get("metrik") == a.metrik and x.get("modell") == a.model)]
             f["gewinn"] = keep + [new]
         elif a.cmd == "begruendung":
             _find(d, a.id)["aus_begruendung"] = a.text
@@ -261,43 +261,43 @@ def main(argv=None) -> int:
             d["features"].remove(f)
         elif a.cmd == "produkt-set":
             p = _find_produkt(d, a.id, create=True)
-            for key, val in (("nr", a.nr), ("titel", a.titel), ("soll", a.soll)):
+            for key, val in (("nr", a.nr), ("titel", a.titel), ("soll", a.want)):
                 if val is not None:
                     p[key] = val
             if a.bausteine is not None:
                 p["bausteine"] = [x.strip() for x in a.bausteine.split(",") if x.strip()]
         elif a.cmd == "produkt-ist":
             p = _find_produkt(d, a.id)
-            p.setdefault("ist", {})[a.modell] = {k: v for k, v in (
-                ("status", a.status), ("wert", a.wert), ("grund", a.grund), ("beleg", a.beleg),
+            p.setdefault("ist", {})[a.model] = {k: v for k, v in (
+                ("status", a.status), ("wert", a.value), ("grund", a.grund), ("beleg", a.beleg),
                 ("belegt_am", _belegt_am(a.belegt_am)), ("erreicht", a.erreicht),
                 ("erreicht_grund", a.erreicht_grund)) if v}
         elif a.cmd == "erreicht":
-            x = _find_produkt(d, a.id).setdefault("ist", {}).setdefault(a.modell, {"status": "unbelegt"})
-            x["erreicht"] = a.wert
+            x = _find_produkt(d, a.id).setdefault("ist", {}).setdefault(a.model, {"status": "unbelegt"})
+            x["erreicht"] = a.value
             if a.grund:
                 x["erreicht_grund"] = a.grund
             else:
                 x.pop("erreicht_grund", None)
         elif a.cmd == "kreuz":
             p = _find_produkt(d, a.id)
-            cells = p.setdefault("kreuztabelle", {}).setdefault("zellen", {}).setdefault(a.modell, {})
+            cells = p.setdefault("kreuztabelle", {}).setdefault("zellen", {}).setdefault(a.model, {})
             cells[features.kreuz_key(a.a, a.b)] = {k: v for k, v in (("status", a.status), ("note", a.note)) if v}
         elif a.cmd == "zeile-ist":
             p = _find_produkt(d, a.id)
             rows = p.setdefault("untertabelle", {}).setdefault("zeilen", [])
-            row = next((r for r in rows if r.get("name") == a.zeile), None)
+            row = next((r for r in rows if r.get("name") == a.row_idx), None)
             if row is None:
-                row = {"name": a.zeile, "ist": {}}
+                row = {"name": a.row_idx, "ist": {}}
                 rows.append(row)
-            row.setdefault("ist", {})[a.modell] = {k: v for k, v in (
-                ("status", a.status), ("wert", a.wert), ("beleg", a.beleg),
+            row.setdefault("ist", {})[a.model] = {k: v for k, v in (
+                ("status", a.status), ("wert", a.value), ("beleg", a.beleg),
                 ("belegt_am", _belegt_am(a.belegt_am))) if v}
         elif a.cmd == "matrix":
             p = _find_produkt(d, a.id)
-            cells = p.setdefault("matrix", {}).setdefault("zellen", {}).setdefault(a.modell, {})
-            cells[features.matrix_key(a.form, a.bs, a.tiefe, a.text)] = {k: v for k, v in (
-                ("status", "ungültig" if a.ungueltig else "wert"), ("wert", a.wert), ("boot", a.boot),
+            cells = p.setdefault("matrix", {}).setdefault("zellen", {}).setdefault(a.model, {})
+            cells[features.matrix_key(a.form, a.bs, a.depth, a.text)] = {k: v for k, v in (
+                ("status", "ungültig" if a.ungueltig else "wert"), ("wert", a.value), ("boot", a.boot),
                 ("beleg", a.beleg)) if v}
         elif a.cmd == "import-27b":
             import_27b(d, a.md)
@@ -420,11 +420,11 @@ def import_27b(d: dict, path: str) -> None:
                         ("status", st or "unbelegt"), ("note", note), ("quelle", QUELLE_27B)) if v}
         elif hdr[:2] == ["format / form", "instrument"]:
             p = prod["F23"]
-            zeilen = p.setdefault("untertabelle", {"spalte": "Prompt length / form", "zeilen": []}).setdefault("zeilen", [])
-            zeilen[:] = [z for z in zeilen if not z.get("name", "").startswith("27B ")]
+            row_list = p.setdefault("untertabelle", {"spalte": "Prompt length / form", "zeilen": []}).setdefault("zeilen", [])
+            row_list[:] = [z for z in row_list if not z.get("name", "").startswith("27B ")]
             for r in rows[1:]:
                 werte = "; ".join("%s: %s" % (h, _plain(v)) for h, v in zip(rows[0][2:-1], r[2:-1]) if _plain(v))
-                zeilen.append({"name": "27B " + _plain(r[0]), "ist": {"27B": {
+                row_list.append({"name": "27B " + _plain(r[0]), "ist": {"27B": {
                     "wert": "%s [Instrument %s]" % (werte, _plain(r[1])), "beleg": _plain(r[-1]), "quelle": QUELLE_27B,
                     "belegt_am": stand}}})
         elif hdr[:3] == ["form", "tiefe", "text"]:
@@ -433,12 +433,12 @@ def import_27b(d: dict, path: str) -> None:
             cells = prod["F24"].setdefault("matrix", {}).setdefault("zellen", {}).setdefault("27B", {})
             for r in rows[1:]:
                 form = ("%s %s" % (fmt, _plain(r[0]))).strip()
-                tiefe, txt = _plain(r[1]).lower(), _plain(r[2]).lower()
+                depth, txt = _plain(r[1]).lower(), _plain(r[2]).lower()
                 for bs, c in zip(features.MATRIX_BS, r[3:9]):
                     c = _plain(c)
                     if not c or c == "ungemessen":
                         continue
-                    k = features.matrix_key(form, bs, tiefe, txt)
+                    k = features.matrix_key(form, bs, depth, txt)
                     cells[k] = {"status": "ungültig", "beleg": beleg, "quelle": QUELLE_27B} if c == "ungültig" else \
                         {"status": "wert", "wert": c + " ms", "beleg": beleg, "quelle": QUELLE_27B}
         elif hdr[:2] == ["f", "marker (quelle des werts)"]:

@@ -4,7 +4,7 @@ by a zero per-slot cost -> ZeroDivisionError killed TP1/TP2."""
 
 import types
 
-from sglang.srt.model_executor import model_runner_kv_cache_mixin as m
+from flliper.srt.model_executor import model_runner_kv_cache_mixin as m
 
 
 def _runner():

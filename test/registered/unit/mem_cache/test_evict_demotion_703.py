@@ -31,11 +31,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache import hicache_demotion as demotion
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import window_for_layers
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache import hicache_demotion as demotion
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import window_for_layers
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from flliper.test.test_utils import CustomTestCase
 
 ATTN_LAYER_IDS = list(range(3, 64, 4))
 CELL = 64
@@ -129,8 +129,8 @@ class TestDemotionRoundTrip(CustomTestCase):
     def _enable(self, cap="4"):
         import os
 
-        os.environ["SGLANG_HICACHE_DEMOTE_ON_EVICT"] = cap
-        self.addCleanup(os.environ.pop, "SGLANG_HICACHE_DEMOTE_ON_EVICT", None)
+        os.environ["FLLIPER_HICACHE_DEMOTE_ON_EVICT"] = cap
+        self.addCleanup(os.environ.pop, "FLLIPER_HICACHE_DEMOTE_ON_EVICT", None)
 
     def _evict_the_prefix(self, tree, stage_rank):
         """The moment the prefix leaves memory. Its host bytes are still valid
@@ -217,7 +217,7 @@ class TestDemotionRoundTrip(CustomTestCase):
         import pathlib
         import re
 
-        import sglang.srt.mem_cache.hiradix_cache as hr
+        import flliper.srt.mem_cache.hiradix_cache as hr
 
         text = pathlib.Path(hr.__file__).read_text()
         body = text[text.index("    def evict_host(") :]

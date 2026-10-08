@@ -8,7 +8,7 @@ line reads:
 
 3.2 s is ``DEFAULT_FLIP_COST_S``, derived from 997/1246/1720 ms in
 PROD_BRINGUP_BENCH -- the PINNED-image era. The current arm is file-backed and
-costs ~7x that. ``SGLANG_PHASE_POLICY_FLIP_COST_S`` is not set on this boot, so
+costs ~7x that. ``FLLIPER_PHASE_POLICY_FLIP_COST_S`` is not set on this boot, so
 the stale default is live.
 
 The consequence is arithmetic, not opinion: at the measured cost the break-even
@@ -30,13 +30,13 @@ THE FIX IS SELF-CALIBRATION, with four properties this file pins:
 
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     DEFAULT_FLIP_COST_S,
     FlipCostEstimator,
     break_even_tokens,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -149,24 +149,24 @@ class TestTheHookFeedsThePolicy(CustomTestCase):
     """
 
     def setUp(self):
-        from sglang.srt.managers import phase_policy as pp
+        from flliper.srt.managers import phase_policy as pp
 
         self._saved = pp._FLIP_COST_ESTIMATOR
         pp._FLIP_COST_ESTIMATOR = None
 
     def tearDown(self):
-        from sglang.srt.managers import phase_policy as pp
+        from flliper.srt.managers import phase_policy as pp
 
         pp._FLIP_COST_ESTIMATOR = self._saved
 
     def test_the_hook_is_inert_before_the_policy_is_built(self):
         """It may be called from anywhere, at any time, safely."""
-        from sglang.srt.managers.phase_policy import observe_flip_cost
+        from flliper.srt.managers.phase_policy import observe_flip_cost
 
         observe_flip_cost(22.5)  # must not raise
 
     def test_observations_move_the_break_even(self):
-        from sglang.srt.managers import phase_policy as pp
+        from flliper.srt.managers import phase_policy as pp
 
         pp._FLIP_COST_ESTIMATOR = pp.RoundTripFlipCost(seed_s=STALE_COST_S)
         n_before = break_even_tokens(

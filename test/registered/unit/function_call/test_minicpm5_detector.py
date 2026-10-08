@@ -2,11 +2,11 @@ import json
 
 import pytest
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.minicpm5_detector import (
+from flliper.srt.entrypoints.openai.protocol import Function, Tool
+from flliper.srt.function_call.minicpm5_detector import (
     MiniCPM5Detector,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 

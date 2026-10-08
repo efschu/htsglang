@@ -5,13 +5,13 @@
     python3 scripts/l15_pool_peak_record.py /spinning/docker-acceptance/27b/evidence \
         --contains dkr27browauthority --newest 8 [--write FILE] [--with-d-pool]
 
-Reads ``WEG2-VRAM-PEAK`` lines (phase chunk/round/idle by default) of every
+Reads ``PDFLIP-VRAM-PEAK`` lines (phase chunk/round/idle by default) of every
 ``*.P.log`` it is given (files, or a directory), keeps per card (P rank) the
 MAXIMUM of ``peak_reserved_mib`` over all boots and lines (never a mean) and
 prints it with the boot / time / line it came from.  Read-only on the logs.
 ``--write FILE`` stores the JSON the planner reads behind
-SGLANG_WEG2_L15_POOL_PEAK_RECORD (default file: weg2/profile_records_data/
-l15_pool_peak_<profile>.json, or point SGLANG_WEG2_L15_POOL_PEAK_RECORD_FILE at it).
+FLLIPER_PDFLIP_L15_POOL_PEAK_RECORD (default file: pdflip/profile_records_data/
+l15_pool_peak_<profile>.json, or point FLLIPER_PDFLIP_L15_POOL_PEAK_RECORD_FILE at it).
 """
 
 import argparse
@@ -25,7 +25,7 @@ import sys
 
 def _load_module():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
-                        "python", "sglang", "srt", "weg2", "l15_pool_peak.py")
+                        "python", "flliper", "srt", "pdflip", "l15_pool_peak.py")
     spec = importlib.util.spec_from_file_location("l15_pool_peak", os.path.normpath(path))
     mod = importlib.util.module_from_spec(spec)
     sys.modules["l15_pool_peak"] = mod
@@ -96,7 +96,7 @@ def main(argv=None):
     rec = mod.build_record(sources(), profile=a.profile,
                            phases=tuple(x for x in a.phases.split(",") if x), basis=a.basis)
     if not rec["cards"]:
-        print(f"no WEG2-VRAM-PEAK record line in {len(files)} file(s): no record", file=sys.stderr)
+        print(f"no PDFLIP-VRAM-PEAK record line in {len(files)} file(s): no record", file=sys.stderr)
         return 3
     print(json.dumps(rec, indent=1, sort_keys=True) if a.json else mod.format_record(rec))
     if a.with_d_pool:

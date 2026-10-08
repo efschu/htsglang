@@ -1,4 +1,4 @@
-"""Importing sglang.test.test_utils must survive any CUDA_VISIBLE_DEVICES.
+"""Importing flliper.test.test_utils must survive any CUDA_VISIBLE_DEVICES.
 
 The test port carries an offset derived from the first visible device, so
 two concurrent runs on different cards do not grab the same port. It was
@@ -27,8 +27,8 @@ import subprocess
 import sys
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import (
     _MAX_DEVICE_ORDINAL_OFFSET,
     CustomTestCase,
     _first_visible_device_ordinal,
@@ -90,7 +90,7 @@ class TestPortOffsetHelper(CustomTestCase):
             [
                 sys.executable,
                 "-c",
-                "import sglang.test.test_utils as t; "
+                "import flliper.test.test_utils as t; "
                 "print(t.DEFAULT_PORT_FOR_SRT_TEST_RUNNER)",
             ],
             capture_output=True,
@@ -102,7 +102,7 @@ class TestPortOffsetHelper(CustomTestCase):
             proc.returncode,
             0,
             msg=(
-                "importing sglang.test.test_utils with CUDA_VISIBLE_DEVICES='' "
+                "importing flliper.test.test_utils with CUDA_VISIBLE_DEVICES='' "
                 f"failed:\n{proc.stderr[-3000:]}"
             ),
         )
@@ -110,7 +110,7 @@ class TestPortOffsetHelper(CustomTestCase):
         self.assertTrue(1024 < port < 65536, msg=f"port out of range: {port}")
 
     def test_reimport_is_consistent(self):
-        module = importlib.import_module("sglang.test.test_utils")
+        module = importlib.import_module("flliper.test.test_utils")
         self.assertTrue(1024 < module.DEFAULT_PORT_FOR_SRT_TEST_RUNNER < 65536)
 
 

@@ -1,12 +1,12 @@
-"""Unit tests for sglang.srt.distributed.parallel_state — no server, no model loading."""
+"""Unit tests for flliper.srt.distributed.parallel_state — no server, no model loading."""
 
 import unittest
 
-import sglang.srt.platforms as platforms_mod
-from sglang.srt.distributed.parallel_state import get_default_distributed_backend
-from sglang.srt.platforms.interface import SRTPlatform
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.platforms as platforms_mod
+from flliper.srt.distributed.parallel_state import get_default_distributed_backend
+from flliper.srt.platforms.interface import SRTPlatform
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

@@ -33,7 +33,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from sglang.srt.speculative.draft_worker_common import (
+from flliper.srt.speculative.draft_worker_common import (
     _refuse_unsupported_speculative_moe_backend,
 )
 
@@ -61,14 +61,14 @@ class _Args:
 
 def _run_guard(*, placement, solo_rank, tp_rank, sm_ok):
     """Call the guard as an SM86 card with the marlin backend selected."""
-    mod = "sglang.srt.speculative.draft_worker_common"
+    mod = "flliper.srt.speculative.draft_worker_common"
     with mock.patch(f"{mod}.torch") as t, mock.patch(
-        "sglang.srt.layers.moe.utils.get_speculative_moe_runner_backend",
+        "flliper.srt.layers.moe.utils.get_speculative_moe_runner_backend",
         return_value=_Backend(True),
     ), mock.patch(
-        "sglang.srt.utils.common.is_sm90_supported", return_value=sm_ok
+        "flliper.srt.utils.common.is_sm90_supported", return_value=sm_ok
     ), mock.patch(
-        "sglang.srt.utils.common.is_sm120_supported", return_value=sm_ok
+        "flliper.srt.utils.common.is_sm120_supported", return_value=sm_ok
     ):
         t.cuda.is_available.return_value = True
         t.cuda.get_device_capability.return_value = (8, 6)

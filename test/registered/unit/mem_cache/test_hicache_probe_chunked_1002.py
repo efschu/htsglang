@@ -1,7 +1,7 @@
 """DP-NACHLAUF 02.10.: the store probe answers L3 presence / readability per
 chunk of pages on first ask, not for every KV page up front.
 
-N5m (5576ce0f16, D->P, weg2-8-9, 72786 tokens): PP0's prefetch queued 1270 ms
+N5m (5576ce0f16, D->P, pdflip-8-9, 72786 tokens): PP0's prefetch queued 1270 ms
 before a 92-ms read; #969G counted 100k -> 200k key derivations inside the
 probe -- the trailing-pages rule (mamba anchors) asks a few dozen pages, the
 bulk derived ~61k keys per pool. Pinned (red before): chunked and bulk give
@@ -19,8 +19,8 @@ import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache import hicache_storage as hs  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache import hicache_storage as hs  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolTransfer  # noqa: E402
 
 
 def _fake(seed, n=3000, kv_fast=2500):
@@ -81,7 +81,7 @@ def test_trace_past_the_cap_reads_no_env(monkeypatch):
     def boom():
         raise AssertionError("env read past the cap")
 
-    monkeypatch.setattr(hs.envs.SGLANG_HICACHE_KEY_TRACE_CAP, "get", boom, raising=False)
+    monkeypatch.setattr(hs.envs.FLLIPER_HICACHE_KEY_TRACE_CAP, "get", boom, raising=False)
     before = getattr(hs.HiCacheFile, "_969g_suppressed", 0)
     hs._969g_trace("lookup", "x", "s1")
     assert getattr(hs.HiCacheFile, "_969g_suppressed", 0) == before + 1
@@ -122,7 +122,7 @@ def test_anchor_probe_still_answers_claimed_zero(monkeypatch, caplog):
 
 def test_hybrid_prefetch_operation_carries_stage_times():
     import inspect
-    from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
+    from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
 
     init = inspect.getsource(hcc.PrefetchOperation.__init__)
     assert "self.stage_times" in init

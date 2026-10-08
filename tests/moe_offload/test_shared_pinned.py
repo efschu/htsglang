@@ -9,7 +9,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.layers.moe import shared_pinned as sp
+from flliper.srt.layers.moe import shared_pinned as sp
 
 
 def test_two_processes_share_the_same_bytes(tmp_path):
@@ -21,7 +21,7 @@ def test_two_processes_share_the_same_bytes(tmp_path):
     code = f"""
 import torch, sys
 sys.path.insert(0, {repr(os.path.join(os.path.dirname(sp.__file__), '..', '..', '..', '..'))})
-from sglang.srt.layers.moe import shared_pinned as sp
+from flliper.srt.layers.moe import shared_pinned as sp
 t, created = sp.shared_pinned_empty({path!r}, (4, 8), torch.bfloat16, register=False)
 assert not created
 print(int(t.float().sum().item()), t[3, 7].item())

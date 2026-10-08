@@ -1,7 +1,7 @@
 """TOLD-PIN + ACK-RESUMABLE (N1 dkr27browauthoritybar1fs10010740, image
 32fc2683b1 = 341d089831 + L1,5 shadow, PP1 death 07:46:29Z).
 
-MEASURED (P log, rid weg2-10-16):
+MEASURED (P log, rid pdflip-10-16):
 
     PP0  PF TOLD-ACKED told=17406 acks={1: 17406, 2: 17406}
     PP0  #988 LOADBACK prefix moved to 17406 ... mamba_restored=5
@@ -33,13 +33,13 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.managers import weg2_store_told as st  # noqa: E402
-from sglang.srt.managers import weg2_told_fallback as fb  # noqa: E402
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
-from sglang.srt.weg2 import p_intake  # noqa: E402
+from flliper.srt.managers import pdflip_store_told as st  # noqa: E402
+from flliper.srt.managers import pdflip_told_fallback as fb  # noqa: E402
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
+from flliper.srt.pdflip import p_intake  # noqa: E402
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture  # noqa: E402
 
@@ -80,7 +80,7 @@ def _completed(monkeypatch, with_anchor: bool):
 
 
 def _follower(cache):
-    return SimpleNamespace(tree_cache=cache, _weg2_store_told={REQ: TOLD},
+    return SimpleNamespace(tree_cache=cache, _pdflip_store_told={REQ: TOLD},
                            ps=SimpleNamespace(pp_rank=1, pp_size=3, tp_size=1))
 
 

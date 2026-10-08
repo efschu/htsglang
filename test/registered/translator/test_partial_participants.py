@@ -24,12 +24,12 @@ behaviour rather than a matrix that was servable all along.
 
 import unittest
 
-from sglang.srt.translator.languages import (
+from flliper.srt.translator.languages import (
     ConversationLanguages,
     LanguageError,
     LanguageMatrix,
 )
-from sglang.srt.translator.session import EventKind, run_conversation
+from flliper.srt.translator.session import EventKind, run_conversation
 from test_session import (  # noqa: E402  - sibling helper module
     LANG_A,
     LANG_B,

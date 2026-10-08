@@ -39,12 +39,12 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators import barlink_abort_gate
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     Bar1CollectiveAborted,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -272,20 +272,20 @@ class TestTheReplaySitesAreWired(_TagTestCase):
 
     _SITES = (
         (
-            "sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py",
+            "flliper/srt/model_executor/runner_backend/full_cuda_graph_backend.py",
             'note_replay("full"',
         ),
         (
-            "sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py",
+            "flliper/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py",
             'note_replay("breakable"',
         ),
         (
-            "sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph"
+            "flliper/srt/model_executor/runner_backend_utils/breakable_cuda_graph"
             "/breakable_cuda_graph.py",
             'note_replay("breakable/seg"',
         ),
         (
-            "sglang/srt/speculative"
+            "flliper/srt/speculative"
             "/multi_layer_eagle_draft_extend_cuda_graph_runner.py",
             'note_replay("draft/rung"',
         ),
@@ -294,9 +294,9 @@ class TestTheReplaySitesAreWired(_TagTestCase):
     def _root(self):
         import os
 
-        import sglang
+        import flliper
 
-        return os.path.dirname(os.path.dirname(os.path.abspath(sglang.__file__)))
+        return os.path.dirname(os.path.dirname(os.path.abspath(flliper.__file__)))
 
     def test_every_replay_site_records_its_window(self):
         root = self._root()
@@ -314,7 +314,7 @@ class TestTheReplaySitesAreWired(_TagTestCase):
         import os
 
         root = self._root()
-        rel = "sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py"
+        rel = "flliper/srt/model_executor/runner_backend/full_cuda_graph_backend.py"
         src = open(os.path.join(root, rel)).read()
         tag_at = src.index('note_replay("full"')
         launch_at = src.index("self._graphs[shape_key].replay()")
@@ -335,7 +335,7 @@ class TestTheCaptureCensusReachesTheAbortPath(_TagTestCase):
     """
 
     def test_the_abort_path_dumps_the_capture_census(self):
-        from sglang.srt.distributed.device_communicators import barlink_capture_census
+        from flliper.srt.distributed.device_communicators import barlink_capture_census
 
         seen = []
         with (
@@ -359,7 +359,7 @@ class TestTheCaptureCensusReachesTheAbortPath(_TagTestCase):
         )
 
     def test_a_failing_capture_census_does_not_mask_the_abort(self):
-        from sglang.srt.distributed.device_communicators import barlink_capture_census
+        from flliper.srt.distributed.device_communicators import barlink_capture_census
 
         with (
             mock.patch.object(

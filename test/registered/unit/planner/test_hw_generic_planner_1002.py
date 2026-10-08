@@ -1,7 +1,7 @@
 """HW-GENERIC 1002, planner side: the planner decides arch, calibration
 membership and catalogue misses from card PROPERTIES, never a name substring.
 
-User order 02.10.: the weg2 release must run on any sm_86 / sm_120 card set,
+User order 02.10.: the pdflip release must run on any sm_86 / sm_120 card set,
 not only the reference rig (1x RTX 5090 + 2x RTX 3080 20 GB).
 
 FALSIFIERS (each fails on 262abf7f75):
@@ -25,12 +25,12 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.planner import card_library as cl
-from sglang.srt.planner import flags
-from sglang.srt.planner import hardware as hw
-from sglang.srt.planner import power_limit as P
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import card_library as cl
+from flliper.srt.planner import flags
+from flliper.srt.planner import hardware as hw
+from flliper.srt.planner import power_limit as P
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -175,7 +175,7 @@ class TestHardwareSourcesCarryTheCc(CustomTestCase):
                                return_value=lambda: (cards, "pynvml")), \
                 mock.patch.object(hw, "_annotate_cuda_indices",
                                   side_effect=lambda g: (g, None)), \
-                mock.patch("sglang.srt.registry.nvml.list_devices", return_value=devs):
+                mock.patch("flliper.srt.registry.nvml.list_devices", return_value=devs):
             spec = hw.hardware_from_nvml()
         # GPU-a has no NVML answer: None, never borrowed from its twin
         self.assertEqual([g.cc for g in spec.gpus], [None, SM86])
@@ -218,7 +218,7 @@ class TestUncalibratedCatalogueMiss(CustomTestCase):
         self.assertIsInstance(cm.exception, KeyError)
         self.assertIn("UNCALIBRATED", msg)
         self.assertIn("RTXPRO6000Blackwell/?MiB/sm?", msg)
-        self.assertIn("python -m sglang.srt.planner.card_rate_pass --run", msg)
+        self.assertIn("python -m flliper.srt.planner.card_rate_pass --run", msg)
         self.assertEqual(cm.exception.card_key, "RTXPRO6000Blackwell/?MiB/sm?")
 
     def test_resolve_names_the_measured_total(self):

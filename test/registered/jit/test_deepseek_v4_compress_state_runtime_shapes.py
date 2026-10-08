@@ -37,12 +37,12 @@
 # - Prefer TP-only or DP=1 first; DP attention may reduce chunked prefill from
 #   4096 to 512, which makes fixed kernel overhead dominate.
 # - Use long random prompts and short outputs to make prefill dominate:
-#   SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 \
-#   SGLANG_SHARED_EXPERT_TP1=1 \
-#   SGLANG_ENABLE_THINKING=1 \
-#   SGLANG_DSV4_FP4_EXPERTS=1 \
-#   SGLANG_JIT_DEEPGEMM_PRECOMPILE=1 \
-#   sglang serve \
+#   FLLIPER_DSV4_COMPRESS_STATE_DTYPE=bf16 \
+#   FLLIPER_SHARED_EXPERT_TP1=1 \
+#   FLLIPER_ENABLE_THINKING=1 \
+#   FLLIPER_DSV4_FP4_EXPERTS=1 \
+#   FLLIPER_JIT_DEEPGEMM_PRECOMPILE=1 \
+#   flliper serve \
 #     --trust-remote-code \
 #     --model-path /data00/models/DeepSeek-V4-Flash \
 #     --tp 8 \
@@ -59,7 +59,7 @@
 #
 # Workload for the service-level scenario:
 #   HF_ENDPOINT=https://hf-mirror.com \
-#   python3 -m sglang.benchmark.serving \
+#   python3 -m flliper.benchmark.serving \
 #     --host localhost \
 #     --port 8080 \
 #     --model /data00/models/DeepSeek-V4-Flash \
@@ -72,7 +72,7 @@
 #     --request-rate 16
 #
 # Compare with the same service command without
-# SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16. A visible service-level gain requires
+# FLLIPER_DSV4_COMPRESS_STATE_DTYPE=bf16. A visible service-level gain requires
 # large prefill shapes and a non-trivial compress-kernel share in the profile.
 
 from __future__ import annotations
@@ -89,17 +89,17 @@ from typing import Callable, Iterable, Literal, Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv4 import (
+from flliper.jit_kernel.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
 )
-from sglang.jit_kernel.tests.deepseek_v4.common import (
+from flliper.jit_kernel.tests.deepseek_v4.common import (
     make_legacy_context,
     to_seq_extend,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=25, suite="nightly-amd-kernel-1-gpu", nightly=True)

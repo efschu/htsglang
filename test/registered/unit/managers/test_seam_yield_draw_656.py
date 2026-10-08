@@ -64,9 +64,9 @@ from __future__ import annotations
 import os
 import unittest
 
-from sglang.srt.managers import phase_flip_spill
-from sglang.srt.managers.corridor_guard import GuardResult
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers import phase_flip_spill
+from flliper.srt.managers.corridor_guard import GuardResult
+from flliper.srt.managers.phase_flip_runtime import (
     SEAM_MARGIN_DELAY_TAG,
     PhaseFlipRuntime,
 )
@@ -159,7 +159,7 @@ class TheYieldIsWithheldWhenTheDrawPredictsABreachTest(unittest.TestCase):
     def _gate(self, **kw):
         # Budget spent: the next decision is the YIELD.
         r = _runtime(direction="tp_to_pp", abandons=8, **kw)
-        with _Env(SGLANG_SEAM_ENTRY_MARGIN_MIB=512, SGLANG_SEAM_ENTRY_DELAY_BUDGET=2):
+        with _Env(FLLIPER_SEAM_ENTRY_MARGIN_MIB=512, FLLIPER_SEAM_ENTRY_DELAY_BUDGET=2):
             with _Patched(_Guard(ENTRY_FREE)):
                 return r, r._corridor_gate(STAGED, "tp_to_pp")
 
@@ -212,7 +212,7 @@ class TheYieldIsWithheldWhenTheDrawPredictsABreachTest(unittest.TestCase):
         it as an abort rather than a margin delay.
         """
         r = _runtime(direction="tp_to_pp", abandons=8, measured_draw_mib=0)
-        with _Env(SGLANG_SEAM_ENTRY_MARGIN_MIB=512, SGLANG_SEAM_ENTRY_DELAY_BUDGET=2):
+        with _Env(FLLIPER_SEAM_ENTRY_MARGIN_MIB=512, FLLIPER_SEAM_ENTRY_DELAY_BUDGET=2):
             with _Patched(_Guard(1100 * MIB)):
                 detail = r._corridor_gate(600 * MIB, "tp_to_pp")
         self.assertNotEqual(detail, "")
@@ -223,7 +223,7 @@ class TheYieldIsWithheldWhenTheDrawPredictsABreachTest(unittest.TestCase):
 class TheLawWarningIsCountedApartTest(unittest.TestCase):
     def test_it_has_its_own_counter(self):
         r = _runtime(direction="tp_to_pp", abandons=8, measured_draw_mib=1452)
-        with _Env(SGLANG_SEAM_ENTRY_MARGIN_MIB=512, SGLANG_SEAM_ENTRY_DELAY_BUDGET=2):
+        with _Env(FLLIPER_SEAM_ENTRY_MARGIN_MIB=512, FLLIPER_SEAM_ENTRY_DELAY_BUDGET=2):
             with _Patched(_Guard(ENTRY_FREE)):
                 r._corridor_gate(STAGED, "tp_to_pp")
         self.assertEqual(r.seam_law_warned, 1)

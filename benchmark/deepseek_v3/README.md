@@ -1,10 +1,10 @@
 # DeepSeek V3.1/V3/R1 Support
 
-The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVIDIA and AMD GPUs **from day one**. SGLang also supports [MLA optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [DP attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models), making SGLang one of the best open-source LLM engines for running DeepSeek models. SGLang is the inference engine recommended by the official [DeepSeek team](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended).
+The fLLiper and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVIDIA and AMD GPUs **from day one**. fLLiper also supports [MLA optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [DP attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models), making fLLiper one of the best open-source LLM engines for running DeepSeek models. fLLiper is the inference engine recommended by the official [DeepSeek team](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended).
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
-For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek V3/V3.1/R1 Model Optimizations in SGLang](https://docs.sglang.io/basic_usage/deepseek_v3.html#optimizations).
+For optimizations made on the DeepSeek series models regarding fLLiper, please refer to [DeepSeek V3/V3.1/R1 Model Optimizations in fLLiper](https://docs.sglang.io/basic_usage/deepseek_v3.html#optimizations).
 
 ## Installation & Launch
 
@@ -19,7 +19,7 @@ docker pull lmsysorg/sglang:latest
 
 # Launch
 docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/root/.cache/huggingface --ipc=host --network=host --privileged lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code --port 30000
+    python3 -m flliper.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code --port 30000
 ```
 
 If you are using RDMA, please note that:
@@ -33,10 +33,10 @@ Add [performance optimization options](#performance-optimization-options) as nee
 
 ```bash
 # Installation
-pip install sglang
+pip install flliper
 
 # Launch
-python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
+python3 -m flliper.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
 ```
 
 Add [performance optimization options](#performance-optimization-options) as needed.
@@ -158,10 +158,10 @@ If the multi nodes support NVIDIA InfiniBand and encounter hanging issues during
 
 ```bash
 # node 1
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
+python3 -m flliper.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
 
 # node 2
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
+python3 -m flliper.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
 ```
 
 If you have two H100 nodes, the usage is similar to the aforementioned H20.
@@ -177,19 +177,19 @@ There is one B200 node with 4 (for FP4) GPUs or 8 (for FP4 or FP8) GPUs.  Both F
 If using 4 GPUs:
 
 ```bash
-python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=4 --cuda-graph-max-bs-decode 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 4 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
+python3 -m flliper.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=4 --cuda-graph-max-bs-decode 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 4 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
 ```
 
 If using 8 GPUs:
 
 ```bash
-python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=8 --cuda-graph-max-bs-decode 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 8 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
+python3 -m flliper.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=8 --cuda-graph-max-bs-decode 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 8 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
 ```
 
 #### FP8
 
 ```bash
-SGLANG_ENABLE_JIT_DEEPGEMM=false python3 -m sglang.launch_server --model-path=deepseek-ai/DeepSeek-R1-0528 --host=0.0.0.0 --port=8000 --tensor-parallel-size=8 --cuda-graph-max-bs-decode 128 --max-running-requests 128 --mem-fraction-static 0.82 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 32768 --max-prefill-tokens 32768 --scheduler-recv-interval 30 --stream-interval 30 --fp8-gemm-backend flashinfer_trtllm
+FLLIPER_ENABLE_JIT_DEEPGEMM=false python3 -m flliper.launch_server --model-path=deepseek-ai/DeepSeek-R1-0528 --host=0.0.0.0 --port=8000 --tensor-parallel-size=8 --cuda-graph-max-bs-decode 128 --max-running-requests 128 --mem-fraction-static 0.82 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 32768 --max-prefill-tokens 32768 --scheduler-recv-interval 30 --stream-interval 30 --fp8-gemm-backend flashinfer_trtllm
 ```
 
 ### Example: Serving with two H200\*8 nodes and docker
@@ -203,13 +203,13 @@ docker run --gpus all \
     --shm-size 32g \
     --network=host \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --name sglang_multinode1 \
+    --name flliper_multinode1 \
     -it \
     --rm \
     --env "HF_TOKEN=$HF_TOKEN" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 192.168.114.10:20000 --nnodes 2 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 40000
+    python3 -m flliper.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 192.168.114.10:20000 --nnodes 2 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 40000
 ```
 
 ```bash
@@ -218,13 +218,13 @@ docker run --gpus all \
     --shm-size 32g \
     --network=host \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --name sglang_multinode2 \
+    --name flliper_multinode2 \
     -it \
     --rm \
     --env "HF_TOKEN=$HF_TOKEN" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 192.168.114.10:20000 --nnodes 2 --node-rank 1 --trust-remote-code --host 0.0.0.0 --port 40000
+    python3 -m flliper.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 192.168.114.10:20000 --nnodes 2 --node-rank 1 --trust-remote-code --host 0.0.0.0 --port 40000
 ```
 
 To ensure functionality, we include a test from a client Docker container.
@@ -234,13 +234,13 @@ docker run --gpus all \
     --shm-size 32g \
     --network=host \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --name sglang_multinode_client \
+    --name flliper_multinode_client \
     -it \
     --rm \
     --env "HF_TOKEN=$HF_TOKEN" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1 --random-output 512 --random-range-ratio 1 --num-prompts 1 --host 0.0.0.0 --port 40000 --output-file "deepseekv3_multinode.jsonl"
+    python3 -m flliper.bench_serving --backend flliper --dataset-name random --random-input 1 --random-output 512 --random-range-ratio 1 --num-prompts 1 --host 0.0.0.0 --port 40000 --output-file "deepseekv3_multinode.jsonl"
 ```
 
 > **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
@@ -253,16 +253,16 @@ Since the BF16 model is over 1.3 TB, we need to prepare four A100 nodes, each wi
 
 ```bash
 # node 1
-python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 30000
+python3 -m flliper.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 30000
 
 # node 2
-python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 1 --trust-remote-code
+python3 -m flliper.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 1 --trust-remote-code
 
 # node 3
-python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 2 --trust-remote-code
+python3 -m flliper.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 2 --trust-remote-code
 
 # node 4
-python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 3 --trust-remote-code
+python3 -m flliper.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 3 --trust-remote-code
 ```
 
 > **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
@@ -271,10 +271,10 @@ Then we can benchmark the accuracy and latency by accessing the first node's exp
 
 ```bash
 # bench accuracy
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host 10.0.0.1 --port 30000
+python3 benchmark/gsm8k/bench_flliper.py --num-questions 1319 --host 10.0.0.1 --port 30000
 
 # bench latency
-python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
+python3 -m flliper.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
 ```
 
 
@@ -286,13 +286,13 @@ Add `--quantization moe_wna16` flag to enable moe wna16 kernel for better perfor
 One example is as follows:
 
 ```bash
-python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization moe_wna16
+python3 -m flliper.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization moe_wna16
 ```
 
 Alternatively, you can use `--quantization awq_marlin` as follows:
 
 ```bash
-python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization awq_marlin --dtype float16
+python3 -m flliper.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization awq_marlin --dtype float16
 ```
 
 Note that `awq_marlin` only supports `float16` now, which may lead to some precision loss.
@@ -307,11 +307,11 @@ There are block-wise and per-channel quantization methods, and the quantization 
 Assuming that master node IP is `MASTER_IP`, checkpoint path is `/path/to/DeepSeek-R1-INT8` and port=5000, we can have following commands to launch the server:
 ```bash
 #master
-python3 -m sglang.launch_server \
+python3 -m flliper.launch_server \
 	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
 	MASTER_IP:5000 --nnodes 2 --node-rank 0 --trust-remote-code --enable-torch-compile --torch-compile-max-bs 8
 #cluster
-python3 -m sglang.launch_server \
+python3 -m flliper.launch_server \
 	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
 	MASTER_IP:5000 --nnodes 2 --node-rank 1 --trust-remote-code --enable-torch-compile --torch-compile-max-bs 8
 ```
@@ -322,10 +322,10 @@ Then on the **master node**, supposing the ShareGPT data is located at `/path/to
 
 ```bash
 # bench accuracy
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319
+python3 benchmark/gsm8k/bench_flliper.py --num-questions 1319
 
 # bench serving
-python3 -m sglang.bench_serving --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random  --random-input 128 --random-output 128 --num-prompts 1000 --request-rate 128 --random-range-ratio 1.0
+python3 -m flliper.bench_serving --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random  --random-input 128 --random-output 128 --num-prompts 1000 --request-rate 128 --random-range-ratio 1.0
 ```
 
 > **Note: using `--parallel 200` can accelerate accuracy benchmarking**.
@@ -340,17 +340,17 @@ Assuming that master node IP is `MASTER_IP`, checkpoint path is `/path/to/DeepSe
 
 ```bash
 #master
-python3 -m sglang.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
+python3 -m flliper.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
 	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 0 --trust-remote \
 	--enable-torch-compile --torch-compile-max-bs 32
 #cluster
-python3 -m sglang.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
+python3 -m flliper.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
 	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 1 --trust-remote \
 	--enable-torch-compile --torch-compile-max-bs 32
-python3 -m sglang.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
+python3 -m flliper.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
 	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 2 --trust-remote \
 	--enable-torch-compile --torch-compile-max-bs 32
-python3 -m sglang.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
+python3 -m flliper.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
 	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 3 --trust-remote \
 	--enable-torch-compile --torch-compile-max-bs 32
 ```
@@ -396,7 +396,7 @@ Removing this block typically resolves the error. For more details, see the disc
 There are mixed-precision quantization methods where MoE layers are computed using W4(int)A(FP)8 quantization while the dense layers remain in FP8 precision. Users can run these models efficiently on 4xH200 GPUs (or potentially 8xH100 GPUs), as the pre-quantized weights are already available on Hugging Face. Here's an example:
 
 ```bash
-python -m sglang.launch_server --model novita/Deepseek-V3-0324-W4AFP8 --mem-fraction-static 0.85 --disable-shared-experts-fusion --tp-size 4
+python -m flliper.launch_server --model novita/Deepseek-V3-0324-W4AFP8 --mem-fraction-static 0.85 --disable-shared-experts-fusion --tp-size 4
 ```
 
 Other variants of pre-quantized DeepSeek models are also available:

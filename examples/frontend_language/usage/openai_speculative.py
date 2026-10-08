@@ -3,7 +3,7 @@ Usage:
 python3 openai_speculative.py
 """
 
-from sglang import OpenAI, function, gen, set_default_backend
+from flliper import OpenAI, function, gen, set_default_backend
 
 
 @function(num_api_spec_tokens=64)

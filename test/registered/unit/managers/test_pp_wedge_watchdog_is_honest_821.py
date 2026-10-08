@@ -48,7 +48,7 @@ import time
 import types
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -97,7 +97,7 @@ def _watchdog_for(scheduler):
     runner's parent on expiry, so the constructor is stubbed out and only the
     two callables under test are captured.
     """
-    from sglang.srt.managers.scheduler_components import invariant_checker as ic
+    from flliper.srt.managers.scheduler_components import invariant_checker as ic
 
     captured = {}
 
@@ -227,7 +227,7 @@ class TheMarkerIsActuallySetByTheReceive(unittest.TestCase):
     drives the shipped `_pp_recv_typed_dict` and watches the marker."""
 
     def _holder(self, wire):
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         h = types.SimpleNamespace(pp_group=wire)
         h._pp_boundary_stats = lambda: None

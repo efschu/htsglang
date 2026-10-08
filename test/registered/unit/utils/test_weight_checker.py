@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Unit tests for sglang/srt/utils/weight_checker.py."""
+"""Unit tests for flliper/srt/utils/weight_checker.py."""
 
 import unittest
 from typing import Iterable, List
@@ -20,11 +20,11 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.layers.quantization.fp8_utils import (
+from flliper.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
-from sglang.srt.utils.weight_checker import (
+from flliper.srt.utils.weight_checker import (
     CheckEntry,
     ChecksumInfo,
     ParallelismInfo,
@@ -37,12 +37,12 @@ from sglang.srt.utils.weight_checker import (
     _is_non_persistent_buffer_name,
     _random_like,
 )
-from sglang.srt.utils.weight_checker_comparator import (
+from flliper.srt.utils.weight_checker_comparator import (
     Fp8BlockComparable,
     RawComparable,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
@@ -105,7 +105,7 @@ class _TinyModel(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # requires_grad=False matches sglang's inference-time params, so _reset_tensors
+        # requires_grad=False matches flliper's inference-time params, so _reset_tensors
         # can do in-place copy_ on them (autograd would otherwise reject it).
         self.w = nn.Parameter(torch.randn(4, 4), requires_grad=False)
         self.b = nn.Parameter(torch.zeros(4), requires_grad=False)
@@ -188,7 +188,7 @@ class TestRandomLike(CustomTestCase):
         torch.testing.assert_close(t, before)
 
     def test_floating_point_chunked_generation(self):
-        with patch("sglang.srt.utils.weight_checker.CHUNK_NUMEL", 8):
+        with patch("flliper.srt.utils.weight_checker.CHUNK_NUMEL", 8):
             out = _random_like(torch.zeros(64, dtype=torch.bfloat16))
         self.assertEqual(out.dtype, torch.bfloat16)
         self.assertEqual(out.shape, (64,))
@@ -357,7 +357,7 @@ class TestCheckTensors(CustomTestCase):
     def test_chunked_raw_stats_match_unchunked(self):
         expect = [("a", True, RawComparable(torch.zeros(10)))]
         actual = [("a", True, RawComparable(torch.arange(10.0)))]
-        with patch("sglang.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 3):
+        with patch("flliper.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 3):
             with self.assertRaises(Exception) as ctx:
                 _check_tensors(expect_tensors=expect, actual_tensors=actual)
         self.assertIn("max_abs_err=9.0", str(ctx.exception))
@@ -446,7 +446,7 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
 class TestBuildQuantizedSet(CustomTestCase):
 
     def test_fp8_block_module_pairs_weight_and_scale(self):
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        from flliper.srt.layers.quantization.fp8 import Fp8LinearMethod
 
         method = Fp8LinearMethod.__new__(Fp8LinearMethod)
         method.block_quant = True

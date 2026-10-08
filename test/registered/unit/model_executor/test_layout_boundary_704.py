@@ -33,7 +33,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.model_executor.layout_boundary import (
+from flliper.srt.model_executor.layout_boundary import (
     LayoutBoundaryActuator,
     LayoutBoundaryError,
     validate_world_tiling,
@@ -292,7 +292,7 @@ def test_the_two_halves_of_slice_1a_compose():
     together they deliver a rung change in which every parameter keeps its
     storage and the executed set changes.
     """
-    from sglang.srt.model_executor.weights_arena_union import (
+    from flliper.srt.model_executor.weights_arena_union import (
         flip_delta,
         plan_union_arena,
     )
@@ -368,7 +368,7 @@ def test_a_stale_graph_would_replay_the_old_layer_set():
     Without this the guard below could pass vacuously -- it must be true that a
     graph captured at rung A really does keep running rung A's layers.
     """
-    from sglang.srt.model_executor.layout_boundary import cuda_graph_observer
+    from flliper.srt.model_executor.layout_boundary import cuda_graph_observer
 
     _, act, _ = _rank0()
     graphs = _FakeGraphRegistry(captured_range=(0, 28))
@@ -393,7 +393,7 @@ def test_a_stale_graph_would_replay_the_old_layer_set():
 
 def test_graphs_without_a_recapture_hook_refuse_the_flip():
     """No recapture available means the flip must not happen at all."""
-    from sglang.srt.model_executor.layout_boundary import cuda_graph_observer
+    from flliper.srt.model_executor.layout_boundary import cuda_graph_observer
 
     model, act, _ = _rank0()
 
@@ -415,7 +415,7 @@ def test_a_range_escaping_the_pools_built_span_is_refused():
     span the pools were BUILT for has layers with no rows at all -- so the
     pools must be built over the UNION, exactly like the weights.
     """
-    from sglang.srt.model_executor.layout_boundary import pool_coverage_observer
+    from flliper.srt.model_executor.layout_boundary import pool_coverage_observer
 
     model, act, _ = _rank0()
     # Pools built for the narrow rung only -- the boot-time mistake this catches.
@@ -426,7 +426,7 @@ def test_a_range_escaping_the_pools_built_span_is_refused():
 
 
 def test_pools_built_over_the_union_accept_every_rung():
-    from sglang.srt.model_executor.layout_boundary import pool_coverage_observer
+    from flliper.srt.model_executor.layout_boundary import pool_coverage_observer
 
     model, act, _ = _rank0()
     act.add_observer(pool_coverage_observer(0, 29, name="kv"))

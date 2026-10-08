@@ -7,7 +7,7 @@ storage location but differing in e.g. --kv-cache-dtype must not hit each
 other's pages. compute_model_identity_hash() closes that gap.
 """
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-only key computation, runs in milliseconds on any runner.
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
@@ -16,7 +16,7 @@ register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
 import tempfile
 import unittest
 
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     compute_model_identity_hash,

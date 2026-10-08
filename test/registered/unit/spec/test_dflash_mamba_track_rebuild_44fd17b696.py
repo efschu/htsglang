@@ -32,9 +32,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.runtime_context as rc
-from sglang.srt.speculative import dflash_worker_v2 as dfw
-from sglang.srt.speculative import spec_utils
+import flliper.srt.runtime_context as rc
+from flliper.srt.speculative import dflash_worker_v2 as dfw
+from flliper.srt.speculative import spec_utils
 
 HELPER = "prepare_mamba_track_for_verify"
 

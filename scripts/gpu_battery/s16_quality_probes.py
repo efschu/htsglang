@@ -65,7 +65,7 @@ REPO_PYTHON = os.path.join(
 if REPO_PYTHON not in sys.path:
     sys.path.insert(0, REPO_PYTHON)
 
-from sglang.srt.planner import bench_suite as bs  # noqa: E402
+from flliper.srt.planner import bench_suite as bs  # noqa: E402
 
 #: Seed for every stochastic choice a probe or the suite makes, so that two
 #: arms are asked literally the same questions.

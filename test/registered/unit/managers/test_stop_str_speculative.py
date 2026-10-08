@@ -8,9 +8,9 @@ a fake tokenizer; pure CPU. Each test guards a distinct branch of
 import unittest
 from array import array
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

@@ -30,7 +30,7 @@ So: aliasing comes from the caller, and the inference path refuses meta input.
 import pytest
 import torch
 
-from sglang.srt.model_executor.weights_arena import (
+from flliper.srt.model_executor.weights_arena import (
     WeightsArenaError,
     plan_arena_layout,
 )

@@ -1,4 +1,4 @@
-"""Line parsers for the weg2 boot logs (P, D and front).
+"""Line parsers for the pdflip boot logs (P, D and front).
 
 One small regex per FIELD, not one per line: the instruments grow fields over
 time, and a monolithic pattern turns every added field into a silent total
@@ -27,7 +27,7 @@ from typing import Optional
 
 from . import names as N
 
-# "[2026-09-27 09:20:28 PP1] ..." / "[2026-09-27 09:20:42,596] INFO weg2.front: ..."
+# "[2026-09-27 09:20:28 PP1] ..." / "[2026-09-27 09:20:42,596] INFO pdflip.front: ..."
 RE_PREFIX = re.compile(
     r"^\[(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:[,.](\d{1,6}))?Z?"
     r"(?: (PP|TP|DP)(\d+))?\] ?"
@@ -46,8 +46,8 @@ F_GPUMS = _f(r"gpu-ms: ([\d.]+) \(compute ([\d.]+), wait ([\d.]+)\)")
 F_GPUMS_BARE = _f(r"gpu-ms: ([\d.]+)")
 F_RUNREQ = _f(r"#running-req: (\d+)")
 F_QUEUEREQ = _f(r"#queue-req: (\d+)")
-# D phase seats (H95, D log): "WEG2 D-PHASE-SEATS (H95) epoch=.. handoff_n=6 parked_n=4 -> n=6 of cap 6 (CLAMPED ...)"
-F_DSEATS = _f(r"WEG2 D-PHASE-SEATS \(H95\) epoch=\S+ handoff_n=(\d+) parked_n=(\d+) -> n=(\d+) of cap (\d+)")
+# D phase seats (H95, D log): "PDFLIP D-PHASE-SEATS (H95) epoch=.. handoff_n=6 parked_n=4 -> n=6 of cap 6 (CLAMPED ...)"
+F_DSEATS = _f(r"PDFLIP D-PHASE-SEATS \(H95\) epoch=\S+ handoff_n=(\d+) parked_n=(\d+) -> n=(\d+) of cap (\d+)")
 # scheduler caps at start: "max_total_num_tokens=262144, ..., max_running_requests=6, ..."
 F_SCHEDCAP = _f(r"^max_total_num_tokens=(\d+),.*\bmax_running_requests=(\d+)")
 F_PENDTOK = _f(r"#pending-token: (\d+)")
@@ -64,32 +64,32 @@ F_RANK_T = _f(r", t: (\d+\.\d+),")
 F_FWD_PREFILL = _f(r"FWD-TIMING-PREFILL forward=(\d+) tokens=(\d+) .*?\btotal_ms=([\d.]+)")
 F_FLUSH_WAIT = _f(r"TIMING-FLUSH-WAIT .*?\bforward=(\d+) .*?\bt_unix_ms=(\d+)")
 F_ANON_EXTEND = _f(r"HOST-ANON-PASS pass=\d+ phase=EXTEND .*?\bwall_ms=(\d+)")
-F_POST_WAKE0 = _f(r"WEG2-POST-WAKE-PASS n=0 mode=(\w+) .*?\bschedule_ms=(-?\d+) run_ms=(-?\d+)"
+F_POST_WAKE0 = _f(r"PDFLIP-POST-WAKE-PASS n=0 mode=(\w+) .*?\bschedule_ms=(-?\d+) run_ms=(-?\d+)"
                   r".*?\bprepare_ms=(-?\d+)")
 F_BUBBLE = _f(r"bubble_ms=([\d.]+)")
 F_CUDAG = _f(r"cuda graph: (\w+)")
 
-F_FLIP_BEGIN = _f(r"WEG2-FLIP begin epoch=(\d+) sleep=(\w+) wake=(\w+)")
-F_FLIP_DONE = _f(r"WEG2-FLIP done epoch=(\d+) slept=(\w+) woke=(\w+)")
+F_FLIP_BEGIN = _f(r"PDFLIP-FLIP begin epoch=(\d+) sleep=(\w+) wake=(\w+)")
+F_FLIP_DONE = _f(r"PDFLIP-FLIP done epoch=(\d+) slept=(\w+) woke=(\w+)")
 F_FLIP_TOTAL = _f(r"flip_total=(\d+(?:\.\d+)?) ms")
 F_FLIP_DRAIN = _f(r"drain\+quiesce=(\d+(?:\.\d+)?) ms")
 F_FLIP_SLEEP = _f(r"\bsleep=(\d+(?:\.\d+)?) ms")
 F_FLIP_WAKE = _f(r"\bwake=(\d+(?:\.\d+)?) ms")
-F_CORRIDOR_PHASE = _f(r"WEG2-CORRIDOR phase=(\w)\((\w+)\)")
-F_ROUTE = _f(r"WEG2-ROUTE .*?\(awake=(\w+)\b.*?queue=(\d+)")
-F_HEALTH = _f(r"WEG2-HEALTH group=(\w+) http_ok=(\w+) process_alive=(\w+)(?: streak=(\d+))?")
+F_CORRIDOR_PHASE = _f(r"PDFLIP-CORRIDOR phase=(\w)\((\w+)\)")
+F_ROUTE = _f(r"PDFLIP-ROUTE .*?\(awake=(\w+)\b.*?queue=(\d+)")
+F_HEALTH = _f(r"PDFLIP-HEALTH group=(\w+) http_ok=(\w+) process_alive=(\w+)(?: streak=(\d+))?")
 
 # Named stops in the P/D scheduler logs (operator list 2026-09-27): a refusal
 # the runtime raises on purpose, a scheduler exception, or an OOM.  The
 # harmless "FI-GRAPH-SPLIT off" status line also contains "SPLIT" and must not
 # count.  DEBUG-HOLD is the #1223 hold a rank enters after such a stop -- the
 # process is alive and deliberately parked, which from outside is a hang.
-# 27.09. ~14:40Z: the bare "W27 " also matched PROSE in a WEG2-LAUNCH line (the
+# 27.09. ~14:40Z: the bare "W27 " also matched PROSE in a PDFLIP-LAUNCH line (the
 # launcher explains its guards) and raised a false alarm; a real W27 stop is a
 # named refusal ("...Refused: #1233 W27 PP WIDTH DIVERGENCE REFUSED") under a
 # scheduler traceback, which the patterns below still catch.
 STOP_RE = _f(r"\b\w+Refused: #\d+|#791b|SPLIT refused|ADMISSION SPLIT|Traceback \(most recent|CUDA out of memory|DEBUG-HOLD rank=")
-STOP_EXCLUDE = ("FI-GRAPH-SPLIT off",) + N.marker_variants("WEG2-LAUNCH")
+STOP_EXCLUDE = ("FI-GRAPH-SPLIT off",) + N.marker_variants("PDFLIP-LAUNCH")
 
 
 def stop_match(line: str) -> bool:
@@ -98,7 +98,7 @@ F_MODEL_PATH = _f(r"model_path='([^']*)'")
 F_SERVED_NAME = _f(r"served_model_name='([^']*)'")
 F_TP = _f(r"\btp_size=(\d+)")
 F_PP = _f(r"\bpp_size=(\d+)")
-F_SERVED = _f(r"WEG2-SERVED group=(\w+) leg=(\d+) rid=(\S+)")
+F_SERVED = _f(r"PDFLIP-SERVED group=(\w+) leg=(\d+) rid=(\S+)")
 F_PROMPT_T = _f(r"\bprompt_tokens=(\d+)")
 F_CACHED_T = _f(r"\bcached_tokens=(\d+)")
 F_COMPL_T = _f(r"\bcompletion_tokens=(\d+)")
@@ -108,9 +108,9 @@ F_KV_APPLIED = _f(r"\bkv_applied=(\d+)")
 F_MAMBA_RESUME = _f(r"^MAMBA-HOST-RESUME n=\d+: anchor accepted at depth=(\d+)")
 F_STORE_INC = _f(r"^#\d+ STORE READ INCOMPLETE rid=(\S+) delivered=(\d+) deliverable=(\d+)")
 F_PREFETCH = _f(r"^#\d+ PREFETCH (LANDED|REFUSED|DEFERRED|TIMEOUT)\b")
-F_BOOT = _f(r"WEG2 BOOT tag=(\S+) tree=(\S+) @ (\w+)")
-F_FORM_MODEL = _f(r"WEG2-FORM .*?\bmodel=(\S+)")
-F_FORM = _f(r"WEG2-FORM (.*?) \(sources:")
+F_BOOT = _f(r"PDFLIP BOOT tag=(\S+) tree=(\S+) @ (\w+)")
+F_FORM_MODEL = _f(r"PDFLIP-FORM .*?\bmodel=(\S+)")
+F_FORM = _f(r"PDFLIP-FORM (.*?) \(sources:")
 F_EXC = _f(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)): ")
 F_LEVEL = _f(r"^\s*(ERROR|CRITICAL)\b")
 
@@ -199,7 +199,7 @@ def parse_line(line: str) -> Optional[dict]:
         if m2:
             ev.update(kind="anon_extend", wall_ms=float(m2.group(1)))
             return ev
-    if N.starts_with(rest, "WEG2-POST-WAKE-PASS n=0"):
+    if N.starts_with(rest, "PDFLIP-POST-WAKE-PASS n=0"):
         m2 = F_POST_WAKE0.search(rest)
         if m2:
             ev.update(kind="post_wake0", mode=m2.group(1), schedule_ms=int(m2.group(2)),
@@ -219,7 +219,7 @@ def parse_line(line: str) -> Optional[dict]:
         return ev
 
     # front-log families
-    if N.has_marker(rest, "WEG2 D-PHASE-SEATS"):
+    if N.has_marker(rest, "PDFLIP D-PHASE-SEATS"):
         d = F_DSEATS.search(rest)
         if d:
             ev.update(kind="d_seats", handoff_n=int(d.group(1)), parked_n=int(d.group(2)), n=int(d.group(3)),
@@ -230,7 +230,7 @@ def parse_line(line: str) -> Optional[dict]:
         if c:
             ev.update(kind="sched_cap", max_total_tokens=int(c.group(1)), max_running=int(c.group(2)))
             return ev
-    if N.has_marker(rest, "WEG2-FLIP "):
+    if N.has_marker(rest, "PDFLIP-FLIP "):
         b = F_FLIP_BEGIN.search(rest)
         if b:
             ev.update(kind="flip_begin", epoch=int(b.group(1)), sleep=b.group(2), wake=b.group(3))
@@ -244,7 +244,7 @@ def parse_line(line: str) -> Optional[dict]:
             ev["wake_ms"] = _num(F_FLIP_WAKE, rest)
             return ev
     c = F_CORRIDOR_PHASE.search(rest)
-    if c and N.has_marker(rest, "WEG2-CORRIDOR"):
+    if c and N.has_marker(rest, "PDFLIP-CORRIDOR"):
         ev.update(kind="phase", awake=c.group(1), state=c.group(2))
         return ev
     r = F_ROUTE.search(rest)

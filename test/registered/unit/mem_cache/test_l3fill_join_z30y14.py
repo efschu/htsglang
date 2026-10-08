@@ -39,10 +39,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest  # noqa: E402
 
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.mem_cache import hicache_storage as hs  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.srt.mem_cache import hicache_storage as hs  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -120,7 +120,7 @@ def test_a_page_another_rank_is_filling_does_not_end_this_ranks_prefix(tmp_path)
 
     joins0 = hs._FILL_JOIN_N[1]
     box = {}
-    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(3000):
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(3000):
         th_o = threading.Thread(target=_other_reads)
         th_o.start()
         _on_prefetch_thread(0, lambda: HiCacheFile.arena_fill_from_disk(be, arena, stems, TOTAL, prefix=True),
@@ -151,7 +151,7 @@ def test_both_followers_reach_the_same_depth(tmp_path):
     view_a = _InterleavedClaims(arena, lambda i: i % 2 == 0, ev)
     view_b = _InterleavedClaims(arena, lambda i: i % 2 == 1, ev)
     box = {}
-    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(1500):
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(1500):
         ths = [_on_prefetch_thread(k, (lambda v=v: HiCacheFile.arena_fill_from_disk(
             be, v, stems, TOTAL, prefix=True)), box, k) for k, v in enumerate((view_a, view_b))]
         for th in ths:
@@ -177,7 +177,7 @@ def test_a_join_given_back_leaves_the_slot_to_its_first_writer(tmp_path):
     ((s7, st7, g7),) = arena.claim_slots([stems[7]], [TOTAL])
     assert st7 == 0
     box = {}
-    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(100):
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(100):
         _on_prefetch_thread(1, lambda: HiCacheFile.arena_fill_from_disk(be, arena, stems, TOTAL, prefix=True),
                             box, "out").join(15)
     out = box["out"]

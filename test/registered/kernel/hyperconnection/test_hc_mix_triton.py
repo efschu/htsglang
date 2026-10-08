@@ -4,12 +4,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.hc_mix_triton import (
+from flliper.srt.layers.hc_mix_triton import (
     _FUSED_MIX_MAX_ROWS,
     fused_hc_mix,
     fused_hc_mix_supported,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 

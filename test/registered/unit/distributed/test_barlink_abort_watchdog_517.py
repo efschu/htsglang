@@ -25,8 +25,8 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate as gate
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.distributed.device_communicators import barlink_abort_gate as gate
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -55,7 +55,7 @@ class _Word:
 
 def _transport(**over):
     """A BarlinkDeviceTransport-shaped stub carrying the REAL methods."""
-    from sglang.srt.distributed.device_communicators.barlink_device import (
+    from flliper.srt.distributed.device_communicators.barlink_device import (
         BarlinkDeviceTransport,
     )
 
@@ -100,7 +100,7 @@ class TestTheHotPathIsCheckFree(unittest.TestCase):
     def test_it_does_not_ask_whether_a_capture_is_running(self):
         """``graph_capture_running`` is a CUDA API call. The clean hot path
         must not reach it -- there is no device read to protect."""
-        import sglang.srt.distributed.device_communicators.barlink as bl
+        import flliper.srt.distributed.device_communicators.barlink as bl
 
         t = _transport()
         with mock.patch.object(
@@ -114,7 +114,7 @@ class TestTheHotPathIsCheckFree(unittest.TestCase):
         pre-#517 in-line read, so the counter above is measuring the new
         path and not a broken stub."""
         t = _transport(_abort_poll_active=False)
-        import sglang.srt.distributed.device_communicators.barlink as bl
+        import flliper.srt.distributed.device_communicators.barlink as bl
 
         with mock.patch.object(bl, "graph_capture_running", return_value=False):
             t.check_aborted("host-path collective")
@@ -123,7 +123,7 @@ class TestTheHotPathIsCheckFree(unittest.TestCase):
 
 class TestTheGuardStillGuards(unittest.TestCase):
     def test_a_tripped_word_raises_on_the_next_check(self):
-        from sglang.srt.distributed.device_communicators.barlink_device import (
+        from flliper.srt.distributed.device_communicators.barlink_device import (
             DeviceCollectiveAborted,
         )
 
@@ -138,7 +138,7 @@ class TestTheGuardStillGuards(unittest.TestCase):
         diagnostic would drift on the first edit."""
         import inspect
 
-        from sglang.srt.distributed.device_communicators.barlink_device import (
+        from flliper.srt.distributed.device_communicators.barlink_device import (
             BarlinkDeviceTransport,
         )
 
@@ -152,7 +152,7 @@ class TestTheGuardStillGuards(unittest.TestCase):
             t.check_aborted("host-path collective")
 
     def test_the_poll_is_one_way_and_sticky(self):
-        from sglang.srt.distributed.device_communicators.barlink_device import (
+        from flliper.srt.distributed.device_communicators.barlink_device import (
             BarlinkDeviceTransport,
         )
 
@@ -215,7 +215,7 @@ class TestTheCaptureExclusion(unittest.TestCase):
         ``graph_capture``. A per-backend guess is what drifts."""
         import inspect
 
-        from sglang.srt.distributed import parallel_state
+        from flliper.srt.distributed import parallel_state
 
         src = inspect.getsource(parallel_state.graph_capture)
         self.assertIn("pause_polling()", src)
@@ -239,7 +239,7 @@ class TestTheWatchdogRunsBothDuties(unittest.TestCase):
     def test_the_thread_polls_the_abort_words(self):
         import inspect
 
-        from sglang.srt.distributed.device_communicators import barlink_liveness
+        from flliper.srt.distributed.device_communicators import barlink_liveness
 
         src = inspect.getsource(barlink_liveness.PeerWatchdog._run)
         self.assertIn("poll_abort_words()", src)
@@ -250,7 +250,7 @@ class TestTheWatchdogRunsBothDuties(unittest.TestCase):
         natural interval -- /proc at 100 Hz, or an abort report at 1 Hz."""
         import inspect
 
-        from sglang.srt.distributed.device_communicators import barlink_liveness
+        from flliper.srt.distributed.device_communicators import barlink_liveness
 
         src = inspect.getsource(barlink_liveness.PeerWatchdog._run)
         self.assertIn("next_probe", src)

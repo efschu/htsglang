@@ -42,7 +42,7 @@ def _ring(pp2_rise_at=53.910, d_rise_at=None):
 def _ipc_dp(prefill_source="leg1_dispatch", prefill_ts=46.608):
     ev = [_ev("flip_begin", T + 44.319, flip_begin_ts=T + 44.317, sleep="D", wake="P", epoch_before=2),
           _ev("flip_done", T + 46.608, flip_begin_ts=T + 44.317, t=T + 46.605589, flip_ms=2288, epoch=3, sleep="D", wake="P")]
-    ut = [{"dir": "D>P", "epoch": 3, "flip_user_ms": 2513, "idle_flip": False, "rid": "weg2-1-1", "start_ts": T + 44.096,
+    ut = [{"dir": "D>P", "epoch": 3, "flip_user_ms": 2513, "idle_flip": False, "rid": "pdflip-1-1", "start_ts": T + 44.096,
            "start_source": "park_rpc_sent", "prefill_start_ts": T + prefill_ts, "prefill_start_source": prefill_source,
            "parts": {"first_chunk_ms": 3, "legs_ms": 2289, "park_rpc_ms": 219, "pre_begin_ms": 221}}]
     fw = [{"dir": "D>P", "flip_begin_ts": T + 44.317, "first_work_ts": T + 46.608, "flip_time_ms": 2291,
@@ -52,7 +52,7 @@ def _ipc_dp(prefill_source="leg1_dispatch", prefill_ts=46.608):
 
 SEGS = [{"s": T + 0.0, "e": T + 60.0, "k": "unknown"}]
 #: the waiter arrived before D's last token (Nutzer 06.10.: start = max(last D token, arrival))
-ARR = {"weg2-1-1": T + 44.0}
+ARR = {"pdflip-1-1": T + 44.0}
 #: D's TP0 rounds (open, open + gpu-ms): the last one before the D>P flip ends at 44,096
 D_ROUNDS = [(T + 43.9, T + 43.93), (T + 44.07, T + 44.096)]
 
@@ -173,7 +173,7 @@ class FlipzeitPush(unittest.TestCase):
         self.assertEqual(parts, ["halt", "layer", "leer", "leer_d_prefill", "nachlauf", "park", "rest", "total",
                                  "vor_rest", "vorlauf", "wake_kv_dc"])
         self.assertTrue(all('def="t2t"' in l for l in lines))
-        # the front's own small numbers are no longer pushed as weg2_flip_time_ms / weg2_flip_user_ms
+        # the front's own small numbers are no longer pushed as pdflip_flip_time_ms / pdflip_flip_user_ms
         pts, newest = vmpush.flip_points(_ipc_dp(), "NF", 0.0)
         self.assertEqual(pts, [])
         self.assertGreater(newest, 0.0)

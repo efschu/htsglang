@@ -1,17 +1,17 @@
 ## Run synthetic multi-turn benchmark
 
 ```
-# SGLang server with radix cache disabled
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-14B-Instruct --port 30000 --disable-radix-cache
+# fLLiper server with radix cache disabled
+python -m flliper.launch_server --model-path Qwen/Qwen2.5-14B-Instruct --port 30000 --disable-radix-cache
 
-# SGLang server with radix cache on and first-come-first-serve policy
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-14B-Instruct --port 30000 --schedule-policy fcfs
+# fLLiper server with radix cache on and first-come-first-serve policy
+python -m flliper.launch_server --model-path Qwen/Qwen2.5-14B-Instruct --port 30000 --schedule-policy fcfs
 
-# The default SGLang server with radix cache on and long-prefix-match policy
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-14B-Instruct --port 30000
+# The default fLLiper server with radix cache on and long-prefix-match policy
+python -m flliper.launch_server --model-path Qwen/Qwen2.5-14B-Instruct --port 30000
 
-# SGLang server with hierarchical radix cache enabled
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-14B-Instruct --port 30000 --enable-hierarchical-cache
+# fLLiper server with hierarchical radix cache enabled
+python -m flliper.launch_server --model-path Qwen/Qwen2.5-14B-Instruct --port 30000 --enable-hierarchical-cache
 
 ```
 
@@ -36,11 +36,11 @@ This script will automatically download the required dataset to the current work
 - loogle
 ### Example Usage:
 ```bash
-python3 bench_serving.py --model mistralai/Mistral-7B-Instruct-v0.3 --backend sglang \
+python3 bench_serving.py --model mistralai/Mistral-7B-Instruct-v0.3 --backend flliper \
 --dataset-path longdep_qa.json --dataset-name loogle --request-rate 10 --num-prompts 10  \
 --port 8001 --enable-multiturn --disable-shuffle
 ```
-This uses `mistralai/Mistral-7B-Instruct-v0.3` model with `sglang` as backend. The dataset
+This uses `mistralai/Mistral-7B-Instruct-v0.3` model with `flliper` as backend. The dataset
 is `longdep_qa.json`. We send `10 conversations` with `10 req/s` to port 8001. We enable
 multiturn chat without shuffling the order of conversations (i.e. following the original
 order in the dataset file).
@@ -58,7 +58,7 @@ yield the most benefit compared to a FIFO scheduler)
 - loogle
 ### Example Usage:
 ```bash
-python3 bench_serving.py --model mistralai/Mistral-7B-Instruct-v0.3 --backend sglang \
+python3 bench_serving.py --model mistralai/Mistral-7B-Instruct-v0.3 --backend flliper \
 --dataset-path longdep_qa.json --dataset-name loogle --request-rate 10 --num-prompts 10  \
 --port 8001 --enable-shared-prefix --disable-shuffle
 ```
@@ -75,17 +75,17 @@ backend in the following order: `[A+Q1, A+Q2, B+Q1, B+Q2, B+Q3, C+Q1, C+Q2, C+Q3
 ### Example Usage:
 ```bash
 Server:
-python3 -m sglang.launch_server --model-path lmms-lab/LLaVA-NeXT-Video-7B  --tp 2 --dp 1 --port 8001 \
+python3 -m flliper.launch_server --model-path lmms-lab/LLaVA-NeXT-Video-7B  --tp 2 --dp 1 --port 8001 \
 --host 0.0.0.0 --mem-fraction-static 0.9 --tokenizer-path llava-hf/llava-1.5-7b-hf \
 --json-model-override-args "{\"architectures\": [\"LlavaVidForCausalLM\"], \"model_type\":\"llava\", \"mm_spatial_pool_stride\":2}"
 
 Client:
-python3 bench_serving.py --model lmms-lab/LLaVA-NeXT-Video-7B --backend sglang  --dataset-path \
+python3 bench_serving.py --model lmms-lab/LLaVA-NeXT-Video-7B --backend flliper  --dataset-path \
 NExTVideo  --dataset-name nextqa --request-rate 10 --num-prompts 1 --disable-shuffle --port 8001 \ --enable-multiturn --max-frames 16 --tokenizer llava-hf/llava-1.5-7b-hf --fixed-output-len 2048
 ```
 Note: for the server args, `tokenizer-path`, overriding architecture are necessary.
 
 ## Supported Backend
-- sglang (oai)
+- flliper (oai)
 - vllm (oai)
 - lmdeploy (oai)

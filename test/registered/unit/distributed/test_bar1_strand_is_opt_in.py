@@ -1,4 +1,4 @@
-"""Without SGLANG_BARLINK* nothing of the BAR1 strand happens.
+"""Without FLLIPER_BARLINK* nothing of the BAR1 strand happens.
 
 The strand added a transport, a MoE dispatcher, three JIT extensions and a
 handful of new branches in shared files. Every one of them is behind a flag,
@@ -16,8 +16,8 @@ it:
 3. **Dispatch.** With no transport built, ``_select`` answers ``None`` for
    every op -- the inline gloo plane, exactly as before the strand.
 4. **Flags.** Every new environment variable defaults to the previous
-   behaviour, and their names all carry the ``SGLANG_BARLINK`` prefix, so
-   "unset every SGLANG_BARLINK*" really is the whole off switch.
+   behaviour, and their names all carry the ``FLLIPER_BARLINK`` prefix, so
+   "unset every FLLIPER_BARLINK*" really is the whole off switch.
 
 CPU only.
 """
@@ -29,15 +29,15 @@ import sys
 import unittest
 from pathlib import Path
 
-from sglang.srt.layers.moe.utils import MoeA2ABackend
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe.utils import MoeA2ABackend
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 
 _REPO = Path(__file__).resolve().parents[4]
-_COMM = _REPO / "python" / "sglang" / "srt" / "distributed" / "device_communicators"
+_COMM = _REPO / "python" / "flliper" / "srt" / "distributed" / "device_communicators"
 
 #: The probe prints one module per line under this prefix, and the parser
 #: accepts NOTHING else (#736).
@@ -57,7 +57,7 @@ _COMM = _REPO / "python" / "sglang" / "srt" / "distributed" / "device_communicat
 #: indistinguishable from the noise.
 #:
 #: The precise origin, which the parallel fix on the train pinned down: the
-#: import chain under test reaches ``sglang.srt.layers.quantization.
+#: import chain under test reaches ``flliper.srt.layers.quantization.
 #: marlin_utils``, whose module-level ``from vllm import _custom_ops as ops``
 #: (marlin_utils.py:41) initialises vllm's platform layer, and on a rig with
 #: cards of different names that logs to STDOUT.
@@ -98,11 +98,11 @@ def _probe_code(setup: str, needle: str) -> str:
 
 
 def _clean_env():
-    """The environment without any SGLANG_BARLINK* / bar1 knob."""
+    """The environment without any FLLIPER_BARLINK* / bar1 knob."""
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith("SGLANG_BARLINK") and "BAR1" not in k
+        if not k.startswith("FLLIPER_BARLINK") and "BAR1" not in k
     }
     env["CUDA_VISIBLE_DEVICES"] = "99"
     return env
@@ -135,8 +135,8 @@ class TestNothingIsImported(CustomTestCase):
 
     def test_distributed_import_does_not_pull_the_bar1_modules(self):
         code = _probe_code(
-            "import sglang.srt.distributed.parallel_state\n"
-            "import sglang.srt.distributed.device_communicators.barlink\n",
+            "import flliper.srt.distributed.parallel_state\n"
+            "import flliper.srt.distributed.device_communicators.barlink\n",
             "bar1",
         )
         self.assertEqual(self._imports(code, _clean_env()), set())
@@ -153,8 +153,8 @@ class TestNothingIsImported(CustomTestCase):
         i.e. only once someone has chosen ``--moe-a2a-backend bar1ep``.
         """
         code = _probe_code(
-            "import sglang.srt.layers.moe.utils\n"
-            "import sglang.srt.layers.moe.token_dispatcher as td\n",
+            "import flliper.srt.layers.moe.utils\n"
+            "import flliper.srt.layers.moe.token_dispatcher as td\n",
             "barlink_bar1",
         )
         self.assertEqual(self._imports(code, _clean_env()), set())
@@ -163,8 +163,8 @@ class TestNothingIsImported(CustomTestCase):
         """Otherwise the two tests above would pass for the wrong reason."""
         code = _probe_code(
             "import importlib\n"
-            "for _t in ('sglang.srt.distributed.device_communicators.barlink_bar1',"
-            "'sglang.srt.layers.moe.token_dispatcher.bar1ep'):\n"
+            "for _t in ('flliper.srt.distributed.device_communicators.barlink_bar1',"
+            "'flliper.srt.layers.moe.token_dispatcher.bar1ep'):\n"
             "    importlib.import_module(_t)\n",
             "bar1",
         )
@@ -210,12 +210,12 @@ class TestImportParserIsAnchored(CustomTestCase):
     def test_noise_around_a_real_module_line_is_stripped(self):
         stdout = (
             f"{self.RIG_WARNING}\n"
-            "MODULE:sglang.srt.distributed.device_communicators.barlink_bar1\n"
+            "MODULE:flliper.srt.distributed.device_communicators.barlink_bar1\n"
             "some trailing banner text\n"
         )
         self.assertEqual(
             _MODULE_LINE.findall(stdout),
-            ["sglang.srt.distributed.device_communicators.barlink_bar1"],
+            ["flliper.srt.distributed.device_communicators.barlink_bar1"],
         )
 
     def test_a_module_name_embedded_in_prose_is_not_counted(self):
@@ -247,7 +247,7 @@ class TestImportParserIsAnchored(CustomTestCase):
         ``== set()`` assertions above are load-bearing, not vacuous.
         """
         code = _probe_code(
-            "import sglang.srt.distributed.device_communicators.barlink_bar1\n",
+            "import flliper.srt.distributed.device_communicators.barlink_bar1\n",
             "barlink_bar1",
         )
         got = TestNothingIsImported._imports(self, code, _clean_env())
@@ -287,7 +287,7 @@ class TestMoeBackendDefaultUnchanged(CustomTestCase):
 
 class TestSelectWithoutATransport(CustomTestCase):
     def test_every_op_falls_to_the_gloo_plane(self):
-        from sglang.srt.distributed.device_communicators.barlink import (
+        from flliper.srt.distributed.device_communicators.barlink import (
             BarlinkCommunicator,
         )
 
@@ -307,7 +307,7 @@ class TestSelectWithoutATransport(CustomTestCase):
 
 class TestFlagNamesAndDefaults(CustomTestCase):
     def test_every_new_bar1_knob_is_under_the_barlink_prefix(self):
-        """ "Unset every SGLANG_BARLINK*" has to be the complete off switch.
+        """ "Unset every FLLIPER_BARLINK*" has to be the complete off switch.
 
         A knob named anything else would be a second, undocumented way to
         change behaviour -- and the operating recipe only tells people about
@@ -315,13 +315,13 @@ class TestFlagNamesAndDefaults(CustomTestCase):
         """
         offenders = []
         for path in sorted(_COMM.glob("barlink_bar1*.py")) + [
-            _REPO / "python/sglang/srt/layers/moe/token_dispatcher/bar1ep.py"
+            _REPO / "python/flliper/srt/layers/moe/token_dispatcher/bar1ep.py"
         ]:
             for name in re.findall(
                 r"""os\.environ\.get\(\s*["']([A-Z0-9_]+)["']""",
                 path.read_text(encoding="utf-8"),
             ):
-                if not name.startswith("SGLANG_BARLINK"):
+                if not name.startswith("FLLIPER_BARLINK"):
                     offenders.append(f"{path.name}: {name}")
         # TORCH_* / CUDA_* are read by torch's own JIT machinery, not by us;
         # anything else is ours and belongs under the prefix.
@@ -340,13 +340,13 @@ class TestFlagNamesAndDefaults(CustomTestCase):
         measurement can be taken both ways without a rebuild -- it is a
         knob inside an opt-in path, not a second opt-in.
         """
-        from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+        from flliper.srt.distributed.device_communicators.barlink_bar1 import (
             BarlinkBar1Transport,
         )
 
         self.assertIn("all_gather", BarlinkBar1Transport.BARLINK_OPS)
         src = (_COMM / "barlink_bar1.py").read_text(encoding="utf-8")
-        self.assertIn('os.environ.get("SGLANG_BARLINK_BAR1_AG", "1")', src)
+        self.assertIn('os.environ.get("FLLIPER_BARLINK_BAR1_AG", "1")', src)
 
 
 if __name__ == "__main__":

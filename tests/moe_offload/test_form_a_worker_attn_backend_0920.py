@@ -6,7 +6,7 @@ import types
 
 import pytest
 
-from sglang.srt.form_a_construction import (
+from flliper.srt.form_a_construction import (
     FormAWorkerAttentionUsed,
     FormAWorkerAttnBackend,
 )
@@ -46,7 +46,7 @@ def test_bookkeeping_is_a_no_op_and_attention_refuses():
 
 
 def test_runner_picks_the_worker_backend_only_on_a_worker(monkeypatch):
-    from sglang.srt.model_executor import model_runner as mr
+    from flliper.srt.model_executor import model_runner as mr
 
     picked = []
     r = _runner(True)

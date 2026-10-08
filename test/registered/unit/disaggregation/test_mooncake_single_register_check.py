@@ -15,11 +15,11 @@ import re
 import unittest
 from pathlib import Path
 
-from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+from flliper.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -118,7 +118,7 @@ class TestEncodePathsUseCheckedRegistration(CustomTestCase):
         import importlib.util
 
         spec = importlib.util.find_spec(
-            f"sglang.srt.disaggregation.{module_name}"
+            f"flliper.srt.disaggregation.{module_name}"
         )
         return Path(spec.origin).read_text()
 

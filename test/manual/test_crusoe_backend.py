@@ -12,14 +12,14 @@ Run a single test:
 
 import unittest
 
-from sglang import Crusoe, set_default_backend
-from sglang.test.test_programs import (
+from flliper import Crusoe, set_default_backend
+from flliper.test.test_programs import (
     test_mt_bench,
     test_parallel_decoding,
     test_parallel_encoding,
     test_stream,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # Default model available on Crusoe managed inference.
 DEFAULT_CRUSOE_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"

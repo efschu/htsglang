@@ -54,11 +54,11 @@ class TestKatalog(unittest.TestCase):
         self.assertFalse(c["measured_on_rig"])
 
     def test_max_cards_follows_the_planner(self):
-        """Die Seite bietet höchstens so viele Karten an wie der Planer beurteilen kann (weg2/topology.py MAX_CARDS_BAR1); sonst nennt sie 6 Karten, wo
+        """Die Seite bietet höchstens so viele Karten an wie der Planer beurteilen kann (pdflip/topology.py MAX_CARDS_BAR1); sonst nennt sie 6 Karten, wo
         der Planer 8 kennt (gefunden bei der HW-generisch-Meldung 05.10.)."""
         import re
         from rigdash import kartenplan as KP
-        topo = os.path.join(os.path.dirname(HERE), "..", "..", "..", "python", "sglang", "srt", "weg2", "topology.py")
+        topo = os.path.join(os.path.dirname(HERE), "..", "..", "..", "python", "flliper", "srt", "pdflip", "topology.py")
         with open(os.path.normpath(topo), encoding="utf-8") as fh:
             planner_max = int(re.search(r"^MAX_CARDS_BAR1 = (\d+)", fh.read(), re.M).group(1))
         self.assertEqual(KP.MAX_CARDS, planner_max)
@@ -333,7 +333,7 @@ class TestRecords(unittest.TestCase):
         for prof in ("27b-int8", "nf-int4-abl"):
             kp, r = rig(prof)
             body = json.dumps(r)
-            # redact.guard darf höchstens eine Kommentarstelle schwärzen (Profil-Kommentar nennt WEG2-GROUP-ENV), nie einen Wert
+            # redact.guard darf höchstens eine Kommentarstelle schwärzen (Profil-Kommentar nennt PDFLIP-GROUP-ENV), nie einen Wert
             self.assertEqual(len(redact.guard(body)) - len(body) <= 0, True)
             self.assertNotIn("adminkey", body.lower())
             self.assertNotIn("admin-api-key", body.lower())

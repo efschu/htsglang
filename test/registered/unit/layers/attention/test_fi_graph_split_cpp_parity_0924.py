@@ -10,7 +10,7 @@ under ~/.cache) and compares with the Python port array by array.
 
 HEADER SETS (one concrete test class each, ``TestCppPlannerParity_<label>``):
 the installed flashinfer-python when fi_graph_split mirrors its version, plus
-every ``<root>/{include,cccl,VERSION}`` under ``$SGLANG_FI_PLANNER_HEADERS``
+every ``<root>/{include,cccl,VERSION}`` under ``$FLLIPER_FI_PLANNER_HEADERS``
 (os.pathsep list) or ``/spinning/fi-planner-headers/*`` -- on this rig
 ``0.7.0-2f3bc5ac`` (the 27B image's tree, git 2f3bc5ac: post-#5176/#5177) and
 ``0.7.0-pypi`` (the PyPI 0.7.0 wheel, v0.7.0: the 0.6.14 reservation, the new
@@ -46,8 +46,8 @@ import subprocess
 import tempfile
 import unittest
 
-from sglang.srt.layers.attention import fi_graph_split as G
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.attention import fi_graph_split as G
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -235,7 +235,7 @@ def _header_sets():
     if data is not None:
         add("installed_" + _installed_version().replace(".", "_"), _installed_version(), os.path.join(data, "include"),
             os.path.join(data, "cccl"))
-    roots = [r for r in os.environ.get("SGLANG_FI_PLANNER_HEADERS", "").split(os.pathsep) if r]
+    roots = [r for r in os.environ.get("FLLIPER_FI_PLANNER_HEADERS", "").split(os.pathsep) if r]
     roots += sorted(glob.glob("/spinning/fi-planner-headers/*"))
     for root in roots:
         vfile = os.path.join(root, "VERSION")
@@ -489,7 +489,7 @@ def _concrete_classes():
         class TestCppPlannerParity(unittest.TestCase):
             @unittest.skip(
                 "no planner header set whose version fi_graph_split mirrors (%s): installed flashinfer %r, "
-                "$SGLANG_FI_PLANNER_HEADERS and /spinning/fi-planner-headers/* hold none"
+                "$FLLIPER_FI_PLANNER_HEADERS and /spinning/fi-planner-headers/* hold none"
                 % (", ".join(G.PLAN_FIELDS_BY_VERSION), _installed_version())
             )
             def test_needs_a_header_set(self):

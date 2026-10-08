@@ -5,9 +5,9 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.runners import HFRunner, SRTRunner
+from flliper.test.test_utils import CustomTestCase
 
 logger = logging.getLogger(__name__)
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
@@ -83,6 +83,6 @@ class TestRewardModels(CustomTestCase):
 
 
 if __name__ == "__main__":
-    os.environ["SGLANG_NPU_FORWARD_NATIVE_GELUTANH"] = "1"
-    os.environ["SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM"] = "1"
+    os.environ["FLLIPER_NPU_FORWARD_NATIVE_GELUTANH"] = "1"
+    os.environ["FLLIPER_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM"] = "1"
     unittest.main()

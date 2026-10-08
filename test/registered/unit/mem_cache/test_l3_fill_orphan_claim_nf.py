@@ -8,7 +8,7 @@ Metal (NF y3w e033a931db):
   ARENA-CLAIM REFUSED statuses=[1, 2, 4]`` (their joins unclaimed). The slots
   stayed CLAIMED with no open writer; the KV arena never reaps (#231's reap ran
   for the mamba arena only).
-* P PP0 01:43:12, weg2-26-39: the probe held 1066 COMPLETE pages and counted
+* P PP0 01:43:12, pdflip-26-39: the probe held 1066 COMPLETE pages and counted
   page 612 from its L3 copy (``PROBE-HOLD pages=1067 held=1066``); the read's
   L3 -> L2 fill claimed page 612, JOINED the orphan (status 1), skipped it as
   "another writer is filling it" and ended there: ``READ-STAGES pages=612
@@ -31,8 +31,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -87,14 +87,14 @@ def _orphan(arena, stem):
 
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_PARTIAL_REAP_S", "0.05")
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PARTIAL_REAP_S", "0.05")
     root = tmp_path / "store"
     root.mkdir()
     arena = ShmArena(str(tmp_path / "kv.bin"), PAGE, 8)
     return str(root), arena, _backend(str(root))
 
 
-def test_weg2_26_39_a_page_behind_an_orphan_claim_is_read_from_l3(setup):
+def test_pdflip_26_39_a_page_behind_an_orphan_claim_is_read_from_l3(setup):
     """RED on a332187f28: [None] -- the fill joins the orphan and skips it,
     the read ends there. GREEN: the orphan is reaped, the page filled from
     disk and COMPLETE with its bytes."""

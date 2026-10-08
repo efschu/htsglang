@@ -3,9 +3,9 @@
 Two layers: text taken from a log is cleaned when it is ingested (``clean``;
 a line that names a key is dropped whole), and every JSON answer passes
 ``guard`` before it leaves, so a secret that slipped past the first layer is
-cut out at the door instead of published.  Measured 2026-09-27: the weg2
-front log carries ``WEG2 ADMIN-KEY minted for this boot -> <path>.adminkey``
-and ``RPC auth=bearer ...`` lines, and ``WEG2-GROUP-ENV`` lines with the
+cut out at the door instead of published.  Measured 2026-09-27: the pdflip
+front log carries ``PDFLIP ADMIN-KEY minted for this boot -> <path>.adminkey``
+and ``RPC auth=bearer ...`` lines, and ``PDFLIP-GROUP-ENV`` lines with the
 whole group environment.
 """
 
@@ -20,9 +20,9 @@ from typing import List, Optional
 from . import names as N
 
 # a line matching this is dropped whole
-# F0-B: ``WEG2-GROUP-ENV`` (the whole group environment) is stamped as ``PDFLIP-GROUP-ENV`` by a renamed launcher; a reader that
+# F0-B: ``PDFLIP-GROUP-ENV`` (the whole group environment) is stamped as ``PDFLIP-GROUP-ENV`` by a renamed launcher; a reader that
 # only knew the old spelling would PUBLISH that line.  Both spellings, so the drop is the same in both generations.
-DROP_LINE = N.tolerant_compile(r"ADMIN-KEY|admin-api-key|\.adminkey\b|auth=bearer|Authorization:|WEG2-GROUP-ENV|GITHUB_PAT|openrouter\.key",
+DROP_LINE = N.tolerant_compile(r"ADMIN-KEY|admin-api-key|\.adminkey\b|auth=bearer|Authorization:|PDFLIP-GROUP-ENV|GITHUB_PAT|openrouter\.key",
                                re.IGNORECASE)
 # inline values that are cut out of a kept line
 _VALUE = re.compile(
@@ -42,7 +42,7 @@ def clean(text: str):
 
 
 # the door: a serialized answer must not contain any of these
-_DOOR = N.tolerant_compile(r"ADMIN-KEY|admin-api-key|\.adminkey|auth=bearer|GITHUB_PAT|openrouter\.key|WEG2-GROUP-ENV", re.IGNORECASE)
+_DOOR = N.tolerant_compile(r"ADMIN-KEY|admin-api-key|\.adminkey|auth=bearer|GITHUB_PAT|openrouter\.key|PDFLIP-GROUP-ENV", re.IGNORECASE)
 
 
 def guard(body: str) -> str:
@@ -151,13 +151,13 @@ _DOTTED = re.compile(r"(?<![A-Za-z0-9_\-.])[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+
 _FULLRUN = re.compile(r"[A-Za-z0-9_\-]{32,}\Z")
 
 
-# a CamelCase identifier the LAUNCHER / weg2 source really contains (the exception class of a refusal, ``Weg2TpOperatingPointInfeasible``, or any ``class X``
-# of ``srt/weg2``): such a name is a word of the refusal text, not a secret, and stays readable in the run report.  The exemption is a LIST, never a shape:
+# a CamelCase identifier the LAUNCHER / pdflip source really contains (the exception class of a refusal, ``PdFlipTpOperatingPointInfeasible``, or any ``class X``
+# of ``srt/pdflip``): such a name is a word of the refusal text, not a secret, and stays readable in the run report.  The exemption is a LIST, never a shape:
 # a token-like run of capital+lower-case groups (``AbcdEfghIjklMnopQrstUvwxYz12Ab``) is no source name and is cut like any other base64-looking run.
-# Read once from the source tree (``HWPROFIL_TREE`` / ``KARTENPLAN_TREE`` / the tree candidates of ``hwprofil``): every ``Weg2<Word>...`` identifier of
-# ``srt/weg2/*.py`` and ``srt/flip_*.py`` (the launcher prints some as text, ``Weg2TpOperatingPointInfeasible`` is no class) plus every ``class X``
+# Read once from the source tree (``HWPROFIL_TREE`` / ``KARTENPLAN_TREE`` / the tree candidates of ``hwprofil``): every ``PdFlip<Word>...`` identifier of
+# ``srt/pdflip/*.py`` and ``srt/flip_*.py`` (the launcher prints some as text, ``PdFlipTpOperatingPointInfeasible`` is no class) plus every ``class X``
 # of those files.  No tree found -> only the built-in names below (the ones the run report is known to quote), everything else is cut: the safe side.
-# F0-B: a renamed tree spells these ``PdFlip<Word>`` (``Weg2Flip<X>`` -> ``PdFlip<X>``, ``Weg2<X>`` -> ``PdFlip<X>``, rename tool rule), so the
+# F0-B: a renamed tree spells these ``PdFlip<Word>`` (``PdFlip<X>`` -> ``PdFlip<X>``, ``PdFlip<X>`` -> ``PdFlip<X>``, rename tool rule), so the
 # built-in list carries both spellings (derived, see below) and the tree scan reads either layout.
 # The set is DERIVED from one spelling through ``names`` (``marker_variants``), never written out twice: a literal old spelling would be rewritten by the
 # rename tool (F0-F) and the old-evidence names would drop out of a renamed dashboard.
@@ -208,7 +208,7 @@ def known_idents() -> frozenset:
 
 def _b64_secret(run: str) -> bool:
     body = run.rstrip("=")
-    if run == body and body in known_idents():      # ``Weg2TpOperatingPointInfeasible``: a name of the launcher source, not a key
+    if run == body and body in known_idents():      # ``PdFlipTpOperatingPointInfeasible``: a name of the launcher source, not a key
         return False
     return (not body.startswith("/") and len(body) >= 30 and _looks_like_secret(body)
             and any(c.isupper() for c in body) and any(c.islower() for c in body) and any(c.isdigit() for c in body))
@@ -259,20 +259,20 @@ def text_for_issue(text: str) -> str:
 # its letter runs (``HF_TOKEN`` -> hf, token; ``--max-total-tokens`` -> max, total, tokens), so ``tokens`` / ``tokenizer`` are NOT secrets.
 # ``token`` alone is a secret only where it is the NAME's last word (``HF_TOKEN``, ``--auth-token``, ``--token``) or it pairs with an
 # access word (``hf-token-file``, ``--token-key``): the catalog is full of flags that merely MENTION a token (``--d-token-placement``,
-# ``--uneven-token-vector``, ``SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION``) and their values are exactly what the Laufbericht shows.
+# ``--uneven-token-vector``, ``FLLIPER_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION``) and their values are exactly what the Laufbericht shows.
 # A name that ENDS in ``token`` but carries a token id or a boot marker is on the allow list ``_TOKEN_IS_NOT_SECRET`` (catalog:
-# ``--fork-anchor-token``, ``--turn-anchor-token``, ``SGLANG_WEG2_LANE_COVERAGE_TOKEN``) or counts tokens (``..._PER_KI_TOKEN``, a ``per`` word anywhere,
+# ``--fork-anchor-token``, ``--turn-anchor-token``, ``FLLIPER_PDFLIP_LANE_COVERAGE_TOKEN``) or counts tokens (``..._PER_KI_TOKEN``, a ``per`` word anywhere,
 # ``--bucket-time-to-first-token``).
 _SECRET_WORDS = frozenset(("secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "credential", "credentials", "bearer",
                            "authorization", "pat", "apikey", "apikeys", "adminkey", "accesskey", "privatekey"))
 # words that make a secret only as the LAST word of a name (``HF_AUTH``, ``DB_PASS``); mid-name they are ordinary (``--auth-backend``, ``--pass-through``)
 _LAST_WORD_SECRET = frozenset(("auth", "pass", "pat"))
-# ... except where the word before ``pass`` says it is a forward pass (catalog: ``SGLANG_WEG2_D_TWIN_PASS``)
+# ... except where the word before ``pass`` says it is a forward pass (catalog: ``FLLIPER_PDFLIP_D_TWIN_PASS``)
 _PASS_IS_NOT_SECRET = frozenset(("twin", "forward", "prefill", "decode", "warmup", "draft"))
 _KEY_PREFIX = frozenset(("api", "admin", "access", "private", "auth", "ssh"))
 # ``key`` as the LAST word of a name is a credential whatever precedes it (``OPENROUTER_KEY``, ``WANDB_KEY``, ``ANTHROPIC_KEY``): a user can set any
 # env name, so a closed prefix list lets vendor keys through.  Allow list = catalog names whose ``key`` is a lookup key, not a credential
-# (``SGLANG_LOG_DECODE_GRAPH_KEY``, ``SGLANG_WEG2_TOLD_PROBE_TREE_KEY``, ``SGLANG_HICACHE_BIGRAM_KEYS``, ``SGLANG_WEG2_MAMBA_STATE_KEYS``): the word
+# (``FLLIPER_LOG_DECODE_GRAPH_KEY``, ``FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY``, ``FLLIPER_HICACHE_BIGRAM_KEYS``, ``FLLIPER_PDFLIP_MAMBA_STATE_KEYS``): the word
 # before ``key`` / ``keys`` is ``graph`` / ``tree`` / ``bigram`` / ``state``.
 _KEY_IS_NOT_SECRET = frozenset(("graph", "tree", "bigram", "state"))
 _TOKEN_PREFIX = frozenset(("hf", "hub", "huggingface", "github", "gh", "gitlab", "auth", "access", "bearer", "api", "admin", "boot", "refresh",

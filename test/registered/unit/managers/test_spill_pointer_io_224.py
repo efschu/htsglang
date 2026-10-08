@@ -27,8 +27,8 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.kv_session_spill_destination import DestinationTier
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.kv_session_spill_destination import DestinationTier
+from flliper.test.test_utils import CustomTestCase
 
 
 class _PointerStore:

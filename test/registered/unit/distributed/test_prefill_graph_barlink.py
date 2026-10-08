@@ -4,9 +4,9 @@ Hermetic tests — no GPU access. Verifies that:
 1. The default prefill backend on CUDA resolves to BREAKABLE.
 2. The breakable auto-disable rules do NOT fire for a standard
    non-MLA, non-multimodal, non-MoE, non-LoRA config with hierarchical cache.
-3. SGLANG_BARLINK_GRAPH_ENABLE defaults to ON, making bar1 capturable.
-4. graph_grid_default() chains to SGLANG_BARLINK_GRAPH_ENABLE when
-   SGLANG_BARLINK_BAR1_GRAPH_GRID is unset.
+3. FLLIPER_BARLINK_GRAPH_ENABLE defaults to ON, making bar1 capturable.
+4. graph_grid_default() chains to FLLIPER_BARLINK_GRAPH_ENABLE when
+   FLLIPER_BARLINK_BAR1_GRAPH_GRID is unset.
 """
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "99"
 # still carrying a MODULE-LEVEL prepend of that tree. Collection imports
 # every test module, so the prepend poisoned the sys.path every LATER
 # multiprocess test's spawn children inherited -- measured: the gloo wire
-# children resolved sglang from the foreign tree and died on
+# children resolved flliper from the foreign tree and died on
 # ModuleNotFoundError for modules that exist only here. This repo's copy
-# tests THIS repo's sglang, which PYTHONPATH already provides; a test that
+# tests THIS repo's flliper, which PYTHONPATH already provides; a test that
 # needs another worktree must scope the insert inside itself, never at
 # import time.
 
@@ -30,7 +30,7 @@ def test_default_prefill_backend_is_breakable():
     """On CUDA, the default prefill backend should be BREAKABLE.
 
     Since we run hermetic (no GPU), we mock is_cuda() to True."""
-    from sglang.srt.model_executor.cuda_graph_config import (
+    from flliper.srt.model_executor.cuda_graph_config import (
         Backend,
         default_cuda_graph_config,
     )
@@ -38,7 +38,7 @@ def test_default_prefill_backend_is_breakable():
 
     # is_cuda() is lazily imported from sglang.srt.utils inside
     # default_prefill_backend(). Patch the source module.
-    with patch("sglang.srt.utils.is_cuda", return_value=True):
+    with patch("flliper.srt.utils.is_cuda", return_value=True):
         cfg = default_cuda_graph_config()
         assert cfg.prefill.backend == Backend.BREAKABLE, (
             f"Expected default prefill backend BREAKABLE on CUDA, "
@@ -46,7 +46,7 @@ def test_default_prefill_backend_is_breakable():
         )
 
     # Also verify the non-CUDA default is TC_PIECEWISE
-    with patch("sglang.srt.utils.is_cuda", return_value=False):
+    with patch("flliper.srt.utils.is_cuda", return_value=False):
         cfg2 = default_cuda_graph_config()
         assert cfg2.prefill.backend == Backend.TC_PIECEWISE, (
             f"Expected TC_PIECEWISE on non-CUDA, got {cfg2.prefill.backend}."
@@ -54,26 +54,26 @@ def test_default_prefill_backend_is_breakable():
 
 
 def test_graph_enable_default():
-    """SGLANG_BARLINK_GRAPH_ENABLE should default to ON (truthy '1')."""
+    """FLLIPER_BARLINK_GRAPH_ENABLE should default to ON (truthy '1')."""
     # Clean slate: remove any prior setting
-    env_backup = os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+    env_backup = os.environ.pop("FLLIPER_BARLINK_GRAPH_ENABLE", None)
     try:
-        from sglang.srt.distributed.parallel_state import graph_enable_set
+        from flliper.srt.distributed.parallel_state import graph_enable_set
 
         assert graph_enable_set() is True, (
-            "SGLANG_BARLINK_GRAPH_ENABLE should default to ON (1) "
+            "FLLIPER_BARLINK_GRAPH_ENABLE should default to ON (1) "
             "when unset. This is the #369 release default."
         )
     finally:
         if env_backup is not None:
-            os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = env_backup
+            os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = env_backup
 
 
 def test_bar1_capturable_when_graph_enable_on():
-    """When SGLANG_BARLINK_GRAPH_ENABLE is on, bar1 must be capturable."""
-    env_backup = os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+    """When FLLIPER_BARLINK_GRAPH_ENABLE is on, bar1 must be capturable."""
+    env_backup = os.environ.pop("FLLIPER_BARLINK_GRAPH_ENABLE", None)
     try:
-        from sglang.srt.distributed.parallel_state import (
+        from flliper.srt.distributed.parallel_state import (
             CAPTURABLE_BARLINK_TRANSPORTS,
             GRAPH_ENABLE_TRANSPORTS,
             capturable_transports,
@@ -91,22 +91,22 @@ def test_bar1_capturable_when_graph_enable_on():
         # With release ON (default), bar1 IS capturable
         cap = capturable_transports()
         assert "bar1" in cap, (
-            f"bar1 should be capturable when SGLANG_BARLINK_GRAPH_ENABLE "
+            f"bar1 should be capturable when FLLIPER_BARLINK_GRAPH_ENABLE "
             f"is on (default). Got capturable set: {cap}"
         )
     finally:
         if env_backup is not None:
-            os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = env_backup
+            os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = env_backup
 
 
 def test_graph_grid_default_chains():
-    """When SGLANG_BARLINK_BAR1_GRAPH_GRID is unset,
-    graph_grid_default() should chain to SGLANG_BARLINK_GRAPH_ENABLE."""
+    """When FLLIPER_BARLINK_BAR1_GRAPH_GRID is unset,
+    graph_grid_default() should chain to FLLIPER_BARLINK_GRAPH_ENABLE."""
     # Remove the explicit grid override
-    grid_backup = os.environ.pop("SGLANG_BARLINK_BAR1_GRAPH_GRID", None)
-    graph_backup = os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+    grid_backup = os.environ.pop("FLLIPER_BARLINK_BAR1_GRAPH_GRID", None)
+    graph_backup = os.environ.pop("FLLIPER_BARLINK_GRAPH_ENABLE", None)
     try:
-        from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+        from flliper.srt.distributed.device_communicators.barlink_bar1 import (
             graph_grid_default,
         )
 
@@ -118,30 +118,30 @@ def test_graph_grid_default_chains():
         )
 
         # Explicit GRAPH_GRID=0 should force off regardless
-        os.environ["SGLANG_BARLINK_BAR1_GRAPH_GRID"] = "0"
+        os.environ["FLLIPER_BARLINK_BAR1_GRAPH_GRID"] = "0"
         result_forced_off = graph_grid_default()
         assert result_forced_off is False, (
             f"Expected graph_grid_default()=False with "
-            f"SGLANG_BARLINK_BAR1_GRAPH_GRID=0. Got {result_forced_off}."
+            f"FLLIPER_BARLINK_BAR1_GRAPH_GRID=0. Got {result_forced_off}."
         )
 
         # GRAPH_ENABLE=0 with GRID unset should also be off
-        del os.environ["SGLANG_BARLINK_BAR1_GRAPH_GRID"]
-        os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = "0"
+        del os.environ["FLLIPER_BARLINK_BAR1_GRAPH_GRID"]
+        os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = "0"
         result_off = graph_grid_default()
         assert result_off is False, (
             f"Expected graph_grid_default()=False with "
-            f"SGLANG_BARLINK_GRAPH_ENABLE=0. Got {result_off}."
+            f"FLLIPER_BARLINK_GRAPH_ENABLE=0. Got {result_off}."
         )
     finally:
         if grid_backup is not None:
-            os.environ["SGLANG_BARLINK_BAR1_GRAPH_GRID"] = grid_backup
-        elif "SGLANG_BARLINK_BAR1_GRAPH_GRID" in os.environ:
-            del os.environ["SGLANG_BARLINK_BAR1_GRAPH_GRID"]
+            os.environ["FLLIPER_BARLINK_BAR1_GRAPH_GRID"] = grid_backup
+        elif "FLLIPER_BARLINK_BAR1_GRAPH_GRID" in os.environ:
+            del os.environ["FLLIPER_BARLINK_BAR1_GRAPH_GRID"]
         if graph_backup is not None:
-            os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = graph_backup
-        elif "SGLANG_BARLINK_GRAPH_ENABLE" in os.environ:
-            del os.environ["SGLANG_BARLINK_GRAPH_ENABLE"]
+            os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = graph_backup
+        elif "FLLIPER_BARLINK_GRAPH_ENABLE" in os.environ:
+            del os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"]
 
 
 def test_enforce_cpu_transport_error_when_graph_enable_off():
@@ -151,17 +151,17 @@ def test_enforce_cpu_transport_error_when_graph_enable_off():
     This verifies the error path that blocks bar1 under capture when
     the release switch is off. The function needs ServerArgs published
     to detect 'graphs enabled', so we test the capturable path directly."""
-    graph_backup = os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+    graph_backup = os.environ.pop("FLLIPER_BARLINK_GRAPH_ENABLE", None)
     try:
         # Force GRAPH_ENABLE off
-        os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = "0"
+        os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = "0"
 
         # Force reimport to pick up new env
         import importlib
-        import sglang.srt.distributed.parallel_state as ps_mod
+        import flliper.srt.distributed.parallel_state as ps_mod
         importlib.reload(ps_mod)
 
-        from sglang.srt.distributed.parallel_state import (
+        from flliper.srt.distributed.parallel_state import (
             CAPTURABLE_BARLINK_TRANSPORTS,
             GRAPH_ENABLE_TRANSPORTS,
             capturable_transports,
@@ -170,7 +170,7 @@ def test_enforce_cpu_transport_error_when_graph_enable_off():
         # bar1 should NOT be capturable when GRAPH_ENABLE is off
         cap = capturable_transports()
         assert "bar1" not in cap, (
-            f"bar1 should NOT be capturable when SGLANG_BARLINK_GRAPH_ENABLE=0. "
+            f"bar1 should NOT be capturable when FLLIPER_BARLINK_GRAPH_ENABLE=0. "
             f"Got: {cap}"
         )
         # But it should still be in GRAPH_ENABLE_TRANSPORTS (the set that
@@ -178,9 +178,9 @@ def test_enforce_cpu_transport_error_when_graph_enable_off():
         assert "bar1" in GRAPH_ENABLE_TRANSPORTS
     finally:
         if graph_backup is not None:
-            os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = graph_backup
-        elif "SGLANG_BARLINK_GRAPH_ENABLE" in os.environ:
-            del os.environ["SGLANG_BARLINK_GRAPH_ENABLE"]
+            os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = graph_backup
+        elif "FLLIPER_BARLINK_GRAPH_ENABLE" in os.environ:
+            del os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"]
 
 
 def test_prefill_capture_enters_model_capture_mode():
@@ -192,13 +192,13 @@ def test_prefill_capture_enters_model_capture_mode():
     # The method checks isinstance(backend, BreakableCudaGraphBackend | Full)
     # and returns True for those backends. We can verify the logic by
     # checking the source structure.
-    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    from flliper.srt.model_executor.runner.prefill_cuda_graph_runner import (
         PrefillCudaGraphRunner,
     )
-    from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    from flliper.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
         BreakableCudaGraphBackend,
     )
-    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    from flliper.srt.model_executor.runner_backend.full_cuda_graph_backend import (
         FullCudaGraphBackend,
     )
 
@@ -226,7 +226,7 @@ def test_solo_draft_barrier_fix():
     tp_group.barrier()), so solo-draft ranks skip the barrier.
     """
     import inspect
-    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    from flliper.srt.model_executor.runner.prefill_cuda_graph_runner import (
         PrefillCudaGraphRunner,
     )
 
@@ -251,7 +251,7 @@ def test_breakable_rules_no_hierarchical_cache():
 
     Verify by reading the rule list directly."""
     import inspect
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     source = inspect.getsource(
         ServerArgs._disable_breakable_cudagraph_if_incompatible

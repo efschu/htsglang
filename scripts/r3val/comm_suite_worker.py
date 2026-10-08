@@ -51,7 +51,7 @@ DEFAULT_SIZES_KIB = (20, 80, 256)
 
 
 def _load_shm_transport(comm_dir):
-    """Import ``barlink_shm`` from a checkout without importing sglang.
+    """Import ``barlink_shm`` from a checkout without importing flliper.
 
     Same trick as ``link_lat.load_transport``, kept separate because the shm
     module has no bindings sibling to load first.
@@ -59,13 +59,13 @@ def _load_shm_transport(comm_dir):
     import importlib.util
     import types
 
-    for name in ("sglang", "sglang.srt", "sglang.srt.distributed",
-                 "sglang.srt.distributed.device_communicators"):
+    for name in ("flliper", "flliper.srt", "flliper.srt.distributed",
+                 "flliper.srt.distributed.device_communicators"):
         if name not in sys.modules or not hasattr(sys.modules[name], "__path__"):
             stub = types.ModuleType(name)
             stub.__path__ = []
             sys.modules[name] = stub
-    mod_name = "sglang.srt.distributed.device_communicators.barlink_shm"
+    mod_name = "flliper.srt.distributed.device_communicators.barlink_shm"
     spec = importlib.util.spec_from_file_location(
         mod_name, os.path.join(comm_dir, "barlink_shm.py"))
     mod = importlib.util.module_from_spec(spec)

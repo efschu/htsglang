@@ -6,13 +6,13 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.dsa import cutedsl_paged_mqa_logits, pick_dsl_expand
-from sglang.srt.layers.attention.dsa.utils import (
+from flliper.jit_kernel.dsa import cutedsl_paged_mqa_logits, pick_dsl_expand
+from flliper.srt.layers.attention.dsa.utils import (
     fp8_mqa_logits_ceil_to_ue8m0,
     fp8_mqa_logits_make_fused_kv,
 )
-from sglang.srt.utils import is_sm100_supported
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.utils import is_sm100_supported
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, suite="nightly-4-gpu-b200", nightly=True)
 
@@ -147,7 +147,7 @@ def _run_cutedsl_paged_mqa_logits(
     data, batch_size, next_n, num_heads, max_model_len, is_target_verify
 ):
     """Mirrors the CUTEDSL dispatch in
-    sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._get_topk_paged."""
+    flliper.srt.layers.attention.dsa.dsa_indexer.Indexer._get_topk_paged."""
     import deep_gemm
 
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count

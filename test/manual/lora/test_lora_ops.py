@@ -3,22 +3,22 @@ import unittest
 
 import torch
 
-from sglang.srt.lora.torch_ops.graph_lora_ops import (
+from flliper.srt.lora.torch_ops.graph_lora_ops import (
     sgemm_lora_a_embedding_graph_fwd,
     sgemm_lora_a_graph_fwd,
     sgemm_lora_b_graph_fwd,
 )
-from sglang.srt.lora.torch_ops.lora_ops import (
+from flliper.srt.lora.torch_ops.lora_ops import (
     sgemm_lora_a_embedding_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
-from sglang.test.lora_utils import (
+from flliper.test.lora_utils import (
     reference_embedding_lora_a_shrink,
     reference_sgmv_expand,
     reference_sgmv_shrink,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestLoraOps(CustomTestCase):

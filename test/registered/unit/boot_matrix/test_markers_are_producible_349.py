@@ -30,8 +30,8 @@ from __future__ import annotations
 import os
 import unittest
 
-from sglang.srt.boot_matrix import arms as arms_mod
-from sglang.srt.boot_matrix.arms import (
+from flliper.srt.boot_matrix import arms as arms_mod
+from flliper.srt.boot_matrix.arms import (
     ARMS,
     SPILL_MARKER_DECODE,
     SPILL_MARKER_PREFILL,

@@ -4,9 +4,9 @@
 Design and the derivation of every number:
 /spinning/gpu-arb/weg2/DESIGN_LEFTOVER_27B_0920.md
 
-The bands below are boot weg2xsn408's own `WEG2-BAR1 lane-time phase=collect`
+The bands below are boot weg2xsn408's own `PDFLIP-BAR1 lane-time phase=collect`
 lines at seq=9 (the last P->D flip) with the tag sizes from that rank's
-`WEG2-DC-BREAKDOWN`. TP1 is the flip's pacemaker: leg_collects 1645 ms against
+`PDFLIP-DC-BREAKDOWN`. TP1 is the flip's pacemaker: leg_collects 1645 ms against
 TP0's 1539 and TP2's 1462.
 
 ONE SIMPLIFICATION, stated because it changes a number below: TP1's log
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.weg2.leftover_register import (
+from flliper.srt.pdflip.leftover_register import (
     KV_TAG,
     Band,
     Card,
@@ -156,7 +156,7 @@ def test_a_leftover_that_would_starve_the_needle_is_refused_by_name():
     )
     assert plan.refusals, "the needle floor must bite"
     why = plan.refusals[0]
-    assert "W116 Weg2LeftoverRefused" in why
+    assert "W116 PdFlipLeftoverRefused" in why
     assert "under the 8500 MiB the needle needs" in why
     assert "PLANNER TERM, not a reserve" in why
     assert plan.p_budget_after_mib >= 8500
@@ -222,6 +222,6 @@ def test_a_card_with_no_bands_gets_an_empty_plan():
 
 def test_the_line_names_its_instrument_and_never_sums_lanes():
     line = format_plan(plan_card(Card("GPU-5c648f96", 8775), TP1))
-    assert "WEG2-LEFTOVER card=GPU-5c648f96" in line
+    assert "PDFLIP-LEFTOVER card=GPU-5c648f96" in line
     assert "never summed across lanes" in line
     assert "P planned with that much less" in line

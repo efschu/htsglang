@@ -85,7 +85,7 @@ def _partial_attention(q, k_shard, v_shard, scale):
 def _owned_token_slots(rank):
     """This rank's owned context slots under the weighted prefix-range owner
     rule (the #99 rule): slot t owned iff (t % S) in [prefix[r], prefix[r+1])."""
-    from sglang.srt.distributed.utils import cp_token_prefix
+    from flliper.srt.distributed.utils import cp_token_prefix
 
     prefix = cp_token_prefix(WORLD)
     S = prefix[-1]
@@ -98,11 +98,11 @@ def _owned_token_slots(rank):
 # ---------------------------------------------------------------------------
 def _init_rank(rank, port):
     torch.cuda.set_device(rank)
-    from sglang.srt.distributed.parallel_state import (
+    from flliper.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from sglang.srt.distributed.utils import (
+    from flliper.srt.distributed.utils import (
         set_cp_token_ratios,
         set_weightless_kv_head_rank,
     )
@@ -126,7 +126,7 @@ def _init_rank(rank, port):
 
 
 def _dcp_group():
-    from sglang.srt.runtime_context import get_parallel
+    from flliper.srt.runtime_context import get_parallel
 
     return get_parallel().dcp_group
 
@@ -142,11 +142,11 @@ def _weightless_attention_step(dcp_group, q_local, k_full, v_full, scale, *,
 
     reorder/skip_merge inject a deliberate collective-sequence divergence to
     exercise the anti-hang guard."""
-    from sglang.srt.layers.dcp.comm import (
+    from flliper.srt.layers.dcp.comm import (
         cp_all_gather_heads_uneven,
         cp_lse_ag_out_ar_mha_uneven,
     )
-    from sglang.srt.distributed.utils import weightless_head_counts
+    from flliper.srt.distributed.utils import weightless_head_counts
 
     q_counts = weightless_head_counts(H, WORLD)  # [H,0,0]
 
@@ -210,7 +210,7 @@ def _worker(rank, port, scenario, result_q):
         faulthandler.dump_traceback_later(60, exit=False)
     try:
         _init_rank(rank, port)
-        from sglang.srt.layers.dcp.collective_guard import dcp_forward_guard
+        from flliper.srt.layers.dcp.collective_guard import dcp_forward_guard
 
         dev = torch.device(f"cuda:{rank}")
         scale = 1.0 / math.sqrt(D)

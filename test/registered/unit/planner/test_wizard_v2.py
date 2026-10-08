@@ -34,16 +34,16 @@ import json
 import os
 import tempfile
 
-from sglang.srt.planner import webui
-from sglang.srt.planner import wizard as wz
-from sglang.srt.planner import wizard_islands as isl
-from sglang.srt.planner import wizard_lanes as lanes
-from sglang.srt.planner import wizard_links as links
-from sglang.srt.planner import wizard_offload as off
-from sglang.srt.planner import wizard_tipping as tip
-from sglang.srt.planner.bench_factors import ABSENT, ESTIMATE, MEASURED
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import webui
+from flliper.srt.planner import wizard as wz
+from flliper.srt.planner import wizard_islands as isl
+from flliper.srt.planner import wizard_lanes as lanes
+from flliper.srt.planner import wizard_links as links
+from flliper.srt.planner import wizard_offload as off
+from flliper.srt.planner import wizard_tipping as tip
+from flliper.srt.planner.bench_factors import ABSENT, ESTIMATE, MEASURED
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -437,7 +437,7 @@ class IslandFamilies(CustomTestCase):
         self.assertEqual(local["collective_advantage"]["provenance"], ESTIMATE)
 
     def test_the_ladder_is_read_from_roofline_not_copied(self):
-        from sglang.srt.planner import roofline
+        from flliper.srt.planner import roofline
 
         self.assertEqual(
             isl.collective_discount("nvlink", 2), roofline._NVLINK_DISCOUNT
@@ -472,7 +472,7 @@ class RejectedRegister(CustomTestCase):
     """The register has to teach, or it is a wall of settled opinions."""
 
     def test_every_row_answers_gain_cost_and_why(self):
-        from sglang.srt.planner import rejected as rej
+        from flliper.srt.planner import rejected as rej
 
         for e in rej.REGISTER:
             self.assertTrue(e.gain, e.key)
@@ -482,7 +482,7 @@ class RejectedRegister(CustomTestCase):
     def test_the_three_lines_stay_short(self):
         """Short and precise was the requirement. A paragraph in the gain
         field is how this becomes the wall it replaced."""
-        from sglang.srt.planner import rejected as rej
+        from flliper.srt.planner import rejected as rej
 
         for e in rej.REGISTER:
             self.assertLessEqual(len(e.gain), 120, e.key)
@@ -490,7 +490,7 @@ class RejectedRegister(CustomTestCase):
             self.assertLessEqual(len(e.why), 400, e.key)
 
     def test_only_a_not_default_row_can_be_unlocked(self):
-        from sglang.srt.planner import rejected as rej
+        from flliper.srt.planner import rejected as rej
 
         for e in rej.REGISTER:
             row = e.to_json()
@@ -502,7 +502,7 @@ class RejectedRegister(CustomTestCase):
 
     def test_at_least_one_row_is_genuinely_offerable(self):
         """"Available on request" is only true if the request exists."""
-        from sglang.srt.planner import rejected as rej
+        from flliper.srt.planner import rejected as rej
 
         offerable = [e for e in rej.REGISTER if e.to_json()["unlockable"]]
         self.assertTrue(offerable)

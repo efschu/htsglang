@@ -32,9 +32,9 @@ where the derived vector belongs in the live path and what it needs first.
 
 import unittest
 
-from sglang.srt.managers import phase_flip_seam_reserve as sr
-from sglang.srt.managers.seam_slope import derive_seam_slope_bytes_per_token
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import phase_flip_seam_reserve as sr
+from flliper.srt.managers.seam_slope import derive_seam_slope_bytes_per_token
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

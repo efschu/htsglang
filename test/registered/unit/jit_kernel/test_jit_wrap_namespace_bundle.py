@@ -1,25 +1,25 @@
 """The #37500 bundle's JIT kernels (grouped_gemma_rmsnorm, hc_combine,
 fast_topk, qsa_indexer) build against upstream's newer sgl_kernel headers,
-shipped here as ``sgl_kernel_next``, through the ``sglang.kernels.jit``
+shipped here as ``sgl_kernel_next``, through the ``flliper.kernels.jit``
 alias: it adds that include root and asks load_jit to wrap the exports in
-``namespace sglang`` (upstream's form). This line's own kernels keep the
+``namespace flliper`` (upstream's form). This line's own kernels keep the
 bare wrapper and therefore their build hashes (fn1r boot 2026-09-16: the
 first forward's nvcc build failed on CHECK_HOST / bf16_t / DTypeTrait)."""
 
 import inspect
 import os
 
-from sglang.jit_kernel import utils as ours
-from sglang.kernels.jit import utils as alias
+from flliper.jit_kernel import utils as ours
+from flliper.kernels.jit import utils as alias
 
 
 def test_default_wrapper_is_the_bare_export_line():
     line = ours._make_wrapper(("f", "Kernel<1>::run"))
     assert line == "TVM_FFI_DLL_EXPORT_TYPED_FUNC(f, (Kernel<1>::run));"
     assert ours._wrap_in_namespace([line], None) == [line]
-    assert ours._wrap_in_namespace([], "sglang") == []
-    wrapped = ours._wrap_in_namespace([line], "sglang")
-    assert wrapped[0] == "namespace sglang {" and wrapped[-1].startswith("}")
+    assert ours._wrap_in_namespace([], "flliper") == []
+    wrapped = ours._wrap_in_namespace([line], "flliper")
+    assert wrapped[0] == "namespace flliper {" and wrapped[-1].startswith("}")
     assert "wrap_namespace" in inspect.signature(ours.load_jit).parameters
 
 
@@ -32,7 +32,7 @@ def test_alias_adds_the_next_include_root_and_the_namespace(monkeypatch):
 
     monkeypatch.setattr(ours, "load_jit", fake_load_jit)
     assert alias.load_jit("k", cuda_files=["x.cuh"]) == "module"
-    assert seen["wrap_namespace"] == "sglang"
+    assert seen["wrap_namespace"] == "flliper"
     assert os.path.isdir(os.path.join(seen["extra_include_paths"][0], "sgl_kernel_next"))
     assert alias.cache_once is ours.cache_once and alias.make_cpp_args is ours.make_cpp_args
 

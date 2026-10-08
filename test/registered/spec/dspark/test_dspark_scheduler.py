@@ -4,23 +4,23 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_planner import (
+from flliper.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
     graph_tier_fill_budget,
 )
-from sglang.srt.speculative.dspark_components.dspark_sps import (
+from flliper.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
 )
-from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
+from flliper.srt.speculative.dspark_components.kernels.dspark_schedule import (
     schedule_verify_lens_topk_from_survival,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.speculative.ragged_verify import RaggedVerifyLayout
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -486,10 +486,10 @@ def _fake_model_runner(capture_num_tokens, max_bs):
 
 class TestBudgetTierSelection(CustomTestCase):
     def test_floor_uses_tier_hint_capped_at_uniform_window(self):
-        from sglang.srt.speculative.dspark_components.dspark_planner import (
+        from flliper.srt.speculative.dspark_components.dspark_planner import (
             verify_layout_graph_num_tokens_floor,
         )
-        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+        from flliper.srt.speculative.ragged_verify import RaggedVerifyMode
 
         model_runner = _fake_model_runner([8, 16, 1024], max_bs=128)
         floor = verify_layout_graph_num_tokens_floor(
@@ -517,7 +517,7 @@ class TestBudgetTierSelection(CustomTestCase):
         self.assertEqual(pinned, 800)
 
     def test_exceeds_gate_checks_slots_and_tier(self):
-        from sglang.srt.speculative.dspark_components.dspark_planner import (
+        from flliper.srt.speculative.dspark_components.dspark_planner import (
             ragged_layout_exceeds_captured_grid,
         )
 

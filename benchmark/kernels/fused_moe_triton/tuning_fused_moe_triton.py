@@ -22,21 +22,21 @@ from common_utils import (
 )
 from ray.experimental.tqdm_ray import tqdm
 
-from sglang.srt.layers.moe.fused_moe_triton import override_config
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+from flliper.srt.layers.moe.fused_moe_triton import override_config
+from flliper.srt.layers.moe.moe_runner import MoeRunnerConfig
+from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_dtype_str,
     get_default_config,
     get_moe_configs,
 )
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.server_args import (
+from flliper.srt.layers.moe.topk import TopKConfig, select_experts
+from flliper.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_device, is_hip, is_xpu
-from sglang.srt.utils.hf_transformers_utils import get_config
+from flliper.srt.utils import get_device, is_hip, is_xpu
+from flliper.srt.utils.hf_transformers_utils import get_config
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()

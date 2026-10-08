@@ -227,12 +227,12 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.kv_row_ownership import (
+from flliper.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from flliper.srt.mem_cache.kv_row_ownership import (
     EXCLUSIVITY_DOUBLED,
     EXCLUSIVITY_UNOWNED,
     Law,
@@ -240,8 +240,8 @@ from sglang.srt.mem_cache.kv_row_ownership import (
     RowSpace,
     read_free_rows,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

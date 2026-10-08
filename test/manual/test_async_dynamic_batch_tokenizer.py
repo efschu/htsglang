@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 from transformers import AutoTokenizer
 
-from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from flliper.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 
 
 class TestAsyncDynamicbatchTokenizer:

@@ -3,18 +3,18 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import (
+from flliper.srt.disaggregation.utils import DisaggregationMode
+from flliper.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=9, suite="base-c-test-cpu")

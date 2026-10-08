@@ -1,11 +1,11 @@
-"""Live state of every weg2 boot whose logs are still being written.
+"""Live state of every pdflip boot whose logs are still being written.
 
 Read-only by construction: the only thing this module does to a running
 model is read the files its launcher already writes.  No request reaches the
 server from here.
 
 A boot is the triple ``<stem>.P.log``, ``<stem>.D.log``, ``<stem>.front.log``
-(the weg2 launcher's naming); a lone ``<stem>.log`` is accepted as a
+(the pdflip launcher's naming); a lone ``<stem>.log`` is accepted as a
 single-group boot.  Each file is tailed by byte offset (never slurped): on
 first sight the tail starts ``BACKFILL_BYTES`` before EOF so the charts have
 recent history, and the first ``HEAD_BYTES`` are read once for the identity
@@ -49,11 +49,11 @@ FLIP_TAIL_MAX_S = 60.0        # a 'first decode' later than this after FLIP done
 # headline, no per-model headline switch, no IPC override of its figures.
 
 # Launcher summary lines worth showing as the boot's "start form" (read-only
-# view of what the weg2 launcher actually emitted; the full list is ~250 lines).
+# view of what the pdflip launcher actually emitted; the full list is ~250 lines).
 LAUNCH_KEYS = tuple(v for k in (
-    "WEG2 BOOT tag=", "WEG2-FORM ", "NVML -> CUDA ordinal map", "POWER-LIMIT nvml",
+    "PDFLIP BOOT tag=", "PDFLIP-FORM ", "NVML -> CUDA ordinal map", "POWER-LIMIT nvml",
     "SCHEDULING FLAGS AS EMITTED", "SCHEDULING KNOBS", "X PROVENANCE", "X CEILING",
-    "IDLE POLICY", "budget P group=", "budget D group=", "host preflight", "WEG2-L2 D hicache_size",
+    "IDLE POLICY", "budget P group=", "budget D group=", "host preflight", "PDFLIP-L2 D hicache_size",
 ) for v in N.marker_variants(k))     # F0-B: a renamed launcher stamps the renamed marker; both spellings are listed
 MAX_LAUNCH_LINES = 40
 
@@ -124,7 +124,7 @@ def launch_lines(lines: List[str]) -> List[str]:
     """The launcher's key summary lines, de-duplicated, in order, prefix stripped."""
     out, seen = [], set()
     for ln in lines:
-        i, spelled = N.find_marker(ln, "WEG2-LAUNCH ")
+        i, spelled = N.find_marker(ln, "PDFLIP-LAUNCH ")
         if i < 0:
             continue
         body = redact.clean(ln[i + len(spelled):].strip())
@@ -231,7 +231,7 @@ def mark_gen_artefacts(batches, pauses, gap_s=PHASE_GAP_S, factor=GEN_GAP_FACTOR
     """Drop the 'gen throughput' of Decode batch lines whose interval was not
     continuous decode.  Pure, unit-tested.
 
-    sglang's figure is tokens since the PREVIOUS Decode batch line / the wall
+    flliper's figure is tokens since the PREVIOUS Decode batch line / the wall
     time since it.  When decode paused in between (a flip, an extend of the
     same group, idle), the pause sits in the denominator: measured rc12z20
     12:34:57 bs6 13.65 tok/s, 4 s later bs5 133.  Such a line keeps its raw
@@ -383,7 +383,7 @@ def max_rate(per_rank, t_lo, t_hi, w=3.0, rate=None):
 
 
 def _flip_intervals(begins, dones, open_begin, t1):
-    """Pair ``WEG2-FLIP begin`` with its ``done`` (the done carries the NEW
+    """Pair ``PDFLIP-FLIP begin`` with its ``done`` (the done carries the NEW
     epoch = begin epoch + 1, and slept/woke = sleep/wake).  Without a begin
     in memory the start is done - flip_total.  An open flip runs to ``t1``."""
     out = []
@@ -455,7 +455,7 @@ def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHA
         in between; it starts at its first line's start, or at the end of the
         piece before it when that is at most ``gap_s`` earlier (the work
         between two lines is still that work), else 1 s before its first line;
-      * a flip is grey from ``WEG2-FLIP begin`` to ``done``; while the old
+      * a flip is grey from ``PDFLIP-FLIP begin`` to ``done``; while the old
         group still logs work inside it (drain), that work is shown as work
         and the grey starts after its last line;
       * whatever is left is ``idle`` (awake group from the flips: no work);
@@ -835,9 +835,9 @@ class Boot:
             return
 
     def flip_tails(self, lo: float, now: float) -> list:
-        """'Flip-Nachlauf D' (WACH-OHNE-ARBEIT-0929): from WEG2-FLIP done woke=D to the first TP0
+        """'Flip-Nachlauf D' (WACH-OHNE-ARBEIT-0929): from PDFLIP-FLIP done woke=D to the first TP0
         'Decode rank batch' t: after it -- flip time by the user's definition, not 'awake, no work'.
-        Split by the TP0 WEG2-POST-WAKE-PASS n=0 inside it: reads before pass 0, prepare (park
+        Split by the TP0 PDFLIP-POST-WAKE-PASS n=0 inside it: reads before pass 0, prepare (park
         resume), re-extend (the rest up to the first decode round).
         TODO (27B-Review 29.09.): display only, read from log lines -- move to events.jsonl once the
         front writes flip / pass / forward events there (see README, Phasenleiste)."""

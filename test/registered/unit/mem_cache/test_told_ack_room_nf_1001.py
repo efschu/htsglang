@@ -1,6 +1,6 @@
 """ACK-ROOM for the NF line (port of the ACK-ROOM half of 27B 1cd3c5ac00,
 NVFP4 dual1k dkr27bnvfp4dual1kbar1fs10010950, PP1 death 09:55:20Z, rid
-weg2-0-10).
+pdflip-0-10).
 
 MEASURED on 27B (P log):
 
@@ -9,14 +9,14 @@ MEASURED on 27B (P log):
     PP1  SF LOADBACK-ROOM PP-RESIDUAL kv_tokens=12288 avail=1717 evictable=0
     PP1  #968 PREFIX MATERIALISATION SHORTFALL prefix_len=16383, holds 0 after 0.00 s
 
-The PF-told ack path (weg2_told_fallback.own_prefix -> _resumable_own) is the
+The PF-told ack path (pdflip_told_fallback.own_prefix -> _resumable_own) is the
 general one, not dual-only: NF runs it since the TOLD-PIN pick (2fd7585584).
 A follower whose told span is HOST-only and does not fit its pool even with
 every evictable row freed now acks 0 ("PF TOLD-ACK NO-ROOM") -> PP0 sends
 told=0 to every rank instead of the #968 group death after admission.
 
 GRANT-SUM (the other half of 1cd3c5ac00) is NOT ported: it lives in
-weg2/dual_p_kv_stage.py (dual TP3PP3 P-KV grant), which the NF line does not
+pdflip/dual_p_kv_stage.py (dual TP3PP3 P-KV grant), which the NF line does not
 carry and does not execute.
 
 NF geometry (NF_PROFILE argv): --tp-size 1 --pp-size 3 --page-size 1, a
@@ -34,11 +34,11 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.managers import weg2_told_fallback as fb  # noqa: E402
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
+from flliper.srt.managers import pdflip_told_fallback as fb  # noqa: E402
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture  # noqa: E402
 
@@ -79,7 +79,7 @@ def _host_only_span_with_anchor(monkeypatch):
 
 
 def _follower(cache, pp_rank):
-    return SimpleNamespace(tree_cache=cache, _weg2_store_told={REQ: TOLD},
+    return SimpleNamespace(tree_cache=cache, _pdflip_store_told={REQ: TOLD},
                            ps=SimpleNamespace(pp_rank=pp_rank, pp_size=NF_PP, tp_size=NF_TP))
 
 

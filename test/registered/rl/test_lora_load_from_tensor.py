@@ -6,9 +6,9 @@ import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
-import sglang as sgl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper as sgl
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=102, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
@@ -202,21 +202,21 @@ class TestLoRALoadFromTensor(CustomTestCase):
 
     def test_lora_logp_diff_with_huggingface(self):
         """
-        Test comparing SGLang and HuggingFace LoRA logprobs when loading LoRA from tensors.
+        Test comparing fLLiper and HuggingFace LoRA logprobs when loading LoRA from tensors.
         This verifies that loading LoRA adapters from tensors produces consistent logprobs
         with HuggingFace.
         """
 
-        from sglang.test.runners import HFRunner, SRTRunner
-        from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
+        from flliper.test.runners import HFRunner, SRTRunner
+        from flliper.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 
         print("[Test]Testing LoRA logprob difference with HuggingFace...")
 
         lora_name = "self_cognition_Alice_logprob_test"
         prompts = [TEST_PROMPT]
 
-        # Step 1: Run SGLang with LoRA loaded from tensors
-        print("[Test]Running SGLang with LoRA from tensors...")
+        # Step 1: Run fLLiper with LoRA loaded from tensors
+        print("[Test]Running fLLiper with LoRA from tensors...")
         with SRTRunner(
             MODEL_PATH,
             torch_dtype=torch.float16,
@@ -274,36 +274,36 @@ class TestLoRALoadFromTensor(CustomTestCase):
             )
 
         # Step 3: Compare results
-        sglang_text = srt_outputs.output_strs[0]
+        flliper_text = srt_outputs.output_strs[0]
         hf_text = hf_outputs.output_strs[0]
 
         print(f"[Text Output]")
-        print(f"  SGLang:      {sglang_text}")
+        print(f"  fLLiper:      {flliper_text}")
         print(f"  HuggingFace: {hf_text}")
 
         # Compare prefill (input) logprobs
-        sglang_prefill = torch.tensor(srt_outputs.top_input_logprobs[0])
+        flliper_prefill = torch.tensor(srt_outputs.top_input_logprobs[0])
         hf_prefill = torch.tensor(hf_outputs.top_input_logprobs[0])
 
-        prefill_diff = torch.abs(sglang_prefill - hf_prefill)
+        prefill_diff = torch.abs(flliper_prefill - hf_prefill)
         prefill_max_diff = torch.max(prefill_diff).item()
         prefill_mean_diff = torch.mean(prefill_diff).item()
 
         print(f"\n[Prefill Logprob Comparison]")
-        print(f"  Shape:           {list(sglang_prefill.shape)}")
+        print(f"  Shape:           {list(flliper_prefill.shape)}")
         print(f"  Max difference:  {prefill_max_diff:.6e}")
         print(f"  Mean difference: {prefill_mean_diff:.6e}")
 
         # Compare decode (output) logprobs
-        sglang_decode = torch.tensor(srt_outputs.top_output_logprobs[0])
+        flliper_decode = torch.tensor(srt_outputs.top_output_logprobs[0])
         hf_decode = torch.tensor(hf_outputs.top_output_logprobs[0])
 
-        decode_diff = torch.abs(sglang_decode - hf_decode)
+        decode_diff = torch.abs(flliper_decode - hf_decode)
         decode_max_diff = torch.max(decode_diff).item()
         decode_mean_diff = torch.mean(decode_diff).item()
 
         print(f"\n[Decode Logprob Comparison]")
-        print(f"  Shape:           {list(sglang_decode.shape)}")
+        print(f"  Shape:           {list(flliper_decode.shape)}")
         print(f"  Max difference:  {decode_max_diff:.6e}")
         print(f"  Mean difference: {decode_mean_diff:.6e}")
 
@@ -322,17 +322,17 @@ class TestLoRALoadFromTensor(CustomTestCase):
 
         # Verify text outputs match expected
         self.assertEqual(
-            sglang_text[: len(EXPECTED_OUTPUT)],
+            flliper_text[: len(EXPECTED_OUTPUT)],
             EXPECTED_OUTPUT,
-            "SGLang output does not match expected result",
+            "fLLiper output does not match expected result",
         )
 
         print("\n[Test]LoRA logprob comparison test passed!")
 
     def test_lora_e2e_load_from_flattened_bucket(self):
         """Test loading LoRA via FlattenedTensorBucket format (RL weight sync path)."""
-        from sglang.srt.utils import MultiprocessingSerializer
-        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+        from flliper.srt.utils import MultiprocessingSerializer
+        from flliper.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
         named_tensors = list(self.lora_tensors.items())
         bucket = FlattenedTensorBucket(named_tensors=[(n, t) for n, t in named_tensors])

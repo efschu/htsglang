@@ -21,12 +21,12 @@ from unittest import mock
 
 import pytest
 
-from sglang.srt.planner import jtok_counter as jc
-from sglang.srt.planner import self_update as su
-from sglang.srt.planner import webui
-from sglang.srt.planner.hardware import hardware_from_manual  # noqa: F401
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import jtok_counter as jc
+from flliper.srt.planner import self_update as su
+from flliper.srt.planner import webui
+from flliper.srt.planner.hardware import hardware_from_manual  # noqa: F401
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -103,7 +103,7 @@ class TestKnobDiscovery(CustomTestCase):
     def test_absent_server_args_knob_is_not_offered(self):
         # rank_kv_ratio / weightless-KV live on other branches; the catalog
         # must not surface a knob whose ServerArgs field is missing.
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
         import dataclasses
 
         fields = {f.name for f in dataclasses.fields(ServerArgs)}
@@ -294,7 +294,7 @@ class TestEnergyRoutePayloads(CustomTestCase):
 
 
 class _FakeSupervisor:
-    """A GPU-less stand-in for SglangSupervisor (no real sglang boot)."""
+    """A GPU-less stand-in for FlliperSupervisor (no real flliper boot)."""
 
     def __init__(self):
         self.started = None
@@ -318,7 +318,7 @@ class _FakeSupervisor:
 
     def restart(self, settings, wait_ready=False):
         if self.busy:
-            from sglang.srt.planner.server_manager import SupervisorBusyError
+            from flliper.srt.planner.server_manager import SupervisorBusyError
 
             raise SupervisorBusyError("refusing restart: a live job is in-flight")
         self.restarted = settings
@@ -344,7 +344,7 @@ class TestModelManagerRoutes(CustomTestCase):
         webui._set_supervisor(None)
 
     def test_list_models_serializes(self):
-        from sglang.srt.planner.server_manager import DiscoveredModel, GgufVariant
+        from flliper.srt.planner.server_manager import DiscoveredModel, GgufVariant
 
         fake_models = [
             DiscoveredModel(
@@ -362,7 +362,7 @@ class TestModelManagerRoutes(CustomTestCase):
             ),
         ]
         with mock.patch(
-            "sglang.srt.planner.server_manager.discover_models",
+            "flliper.srt.planner.server_manager.discover_models",
             return_value=fake_models,
         ):
             d = webui.list_models_payload()
@@ -428,7 +428,7 @@ class TestModelManagerRoutes(CustomTestCase):
 
 class TestPowerRoute(CustomTestCase):
     def test_measure_power_serializes_result(self):
-        from sglang.srt.planner.power_calibration import (
+        from flliper.srt.planner.power_calibration import (
             CardPowerMeasurement,
             PowerCalibrationResult,
         )
@@ -446,7 +446,7 @@ class TestPowerRoute(CustomTestCase):
             driver="580.00", created="2026-07-21 10:00:00",
         )
         with mock.patch(
-            "sglang.srt.planner.power_calibration.measure_all_cards",
+            "flliper.srt.planner.power_calibration.measure_all_cards",
             return_value=result,
         ) as m:
             d = webui.measure_power_payload({})
@@ -458,7 +458,7 @@ class TestPowerRoute(CustomTestCase):
 
     def test_power_profile_read(self):
         with mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             return_value={},
         ):
             d = webui.power_profile_payload({})
@@ -495,7 +495,7 @@ class TestQualityRoutes(CustomTestCase):
 
         with mock.patch.object(webui, "_chat_completion", side_effect=fake_chat), \
             mock.patch(
-                "sglang.srt.planner.quality_chess.validate"
+                "flliper.srt.planner.quality_chess.validate"
             ) as v:
             v.return_value.as_dict.return_value = {
                 "verdict": "wrong-position", "report": "R", "piece_diff": [],
@@ -860,7 +860,7 @@ class TestPlacementRoute(CustomTestCase):
 
     def test_placement_route_wires_module(self):
         with mock.patch(
-            "sglang.srt.planner.placement.compute_placement",
+            "flliper.srt.planner.placement.compute_placement",
             return_value={"cards": [], "sentinel": True},
         ) as m:
             d = webui.placement_payload({"model_cfg": _V2_CONFIG, "flags": {}})
@@ -973,7 +973,7 @@ class TestLandingSnapshotRoute(CustomTestCase):
         webui._set_supervisor(_RunningFakeSupervisor())
         fake_snap = ({"ok": True, "gpus": [], "rates": None}, {"t": 1.0})
         with mock.patch(
-            "sglang.srt.planner.live_metrics.snapshot", return_value=fake_snap
+            "flliper.srt.planner.live_metrics.snapshot", return_value=fake_snap
         ) as m:
             d = webui.landing_snapshot_payload()
         self.assertTrue(d["ok"])
@@ -1020,7 +1020,7 @@ class TestLandingSnapshotRoute(CustomTestCase):
             results.append(webui.landing_snapshot_payload())
 
         with mock.patch(
-            "sglang.srt.planner.live_metrics.snapshot", side_effect=fake_snapshot
+            "flliper.srt.planner.live_metrics.snapshot", side_effect=fake_snapshot
         ):
             t1 = threading.Thread(target=run)
             t1.start()
@@ -1057,12 +1057,12 @@ class TestJtokCounterRoutes(CustomTestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self._prev_env = os.environ.get("SGLANG_PLANNER_DATA_DIR")
-        os.environ["SGLANG_PLANNER_DATA_DIR"] = self._tmp.name
+        self._prev_env = os.environ.get("FLLIPER_PLANNER_DATA_DIR")
+        os.environ["FLLIPER_PLANNER_DATA_DIR"] = self._tmp.name
         # DEFAULT_JTOK_STORE (like hicache's DEFAULT_HICACHE_STORE / energy's
         # DEFAULT_RESULTS_STORE) is a module-level constant resolved ONCE at
         # jtok_counter import time -- by the time this test class runs,
-        # jtok_counter is already imported, so the SGLANG_PLANNER_DATA_DIR
+        # jtok_counter is already imported, so the FLLIPER_PLANNER_DATA_DIR
         # override above only affects the schema-stamp GUARD lookup (which is
         # re-resolved dynamically on every call), not the store file path.
         # Patch the constant directly so each test's store lives in its own
@@ -1079,9 +1079,9 @@ class TestJtokCounterRoutes(CustomTestCase):
         _reset_jtok_state()
         self._store_patch.stop()
         if self._prev_env is None:
-            os.environ.pop("SGLANG_PLANNER_DATA_DIR", None)
+            os.environ.pop("FLLIPER_PLANNER_DATA_DIR", None)
         else:
-            os.environ["SGLANG_PLANNER_DATA_DIR"] = self._prev_env
+            os.environ["FLLIPER_PLANNER_DATA_DIR"] = self._prev_env
         self._tmp.cleanup()
 
     def _snap(self, dt, prefill_tok_s, decode_tok_s, watts=(150.0, 160.0)):
@@ -1174,7 +1174,7 @@ class TestJtokCounterRoutes(CustomTestCase):
         _reset_landing_state()
         fake_snap = (self._snap(2.0, 0.0, 40.0), {"t": 1.0})
         try:
-            with mock.patch("sglang.srt.planner.live_metrics.snapshot",
+            with mock.patch("flliper.srt.planner.live_metrics.snapshot",
                             return_value=fake_snap):
                 d = webui.landing_snapshot_payload()
             self.assertTrue(d["ok"])
@@ -1243,14 +1243,14 @@ class TestConfigProfilesRoutes(CustomTestCase):
     def setUp(self):
         self._tf = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
         self._tf.close()
-        self._prev = os.environ.get("SGLANG_PLANNER_PROFILES")
-        os.environ["SGLANG_PLANNER_PROFILES"] = self._tf.name
+        self._prev = os.environ.get("FLLIPER_PLANNER_PROFILES")
+        os.environ["FLLIPER_PLANNER_PROFILES"] = self._tf.name
 
     def tearDown(self):
         if self._prev is None:
-            os.environ.pop("SGLANG_PLANNER_PROFILES", None)
+            os.environ.pop("FLLIPER_PLANNER_PROFILES", None)
         else:
-            os.environ["SGLANG_PLANNER_PROFILES"] = self._prev
+            os.environ["FLLIPER_PLANNER_PROFILES"] = self._prev
         os.unlink(self._tf.name)
 
     def test_generated_profiles_listed(self):
@@ -1288,7 +1288,7 @@ class TestConfigProfilesRoutes(CustomTestCase):
         drafts = [SimpleNamespace(
             name="Gemma-4-31B-Eagle3", path="/m/ge3", error=None)]
         with mock.patch(
-            "sglang.srt.planner.server_manager.discover_models",
+            "flliper.srt.planner.server_manager.discover_models",
             return_value=drafts,
         ):
             d = webui.config_profiles_get(
@@ -1321,7 +1321,7 @@ class TestConfigProfilesRoutes(CustomTestCase):
         drafts = [SimpleNamespace(
             name="Gemma-4-31B-Eagle3", path="/m/ge3", error=None)]
         with mock.patch(
-            "sglang.srt.planner.server_manager.discover_models",
+            "flliper.srt.planner.server_manager.discover_models",
             return_value=drafts,
         ):
             d = webui.config_profiles_get(
@@ -1354,7 +1354,7 @@ class TestDashboardV2HttpRoutes(WebUIFixture):
         webui._set_supervisor(self.fake)
         self._tf = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
         self._tf.close()
-        os.environ["SGLANG_PLANNER_PROFILES"] = self._tf.name
+        os.environ["FLLIPER_PLANNER_PROFILES"] = self._tf.name
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
         self.port = self.srv.server_address[1]
         self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
@@ -1362,7 +1362,7 @@ class TestDashboardV2HttpRoutes(WebUIFixture):
 
     def tearDown(self):
         webui._set_supervisor(None)
-        os.environ.pop("SGLANG_PLANNER_PROFILES", None)
+        os.environ.pop("FLLIPER_PLANNER_PROFILES", None)
         os.unlink(self._tf.name)
         self.srv.shutdown()
         self.srv.server_close()
@@ -1459,7 +1459,7 @@ class TestMonitorTargetResolution(CustomTestCase):
             webui, "_detect_external_endpoint",
             return_value="http://127.0.0.1:30000",
         ), mock.patch(
-            "sglang.srt.planner.live_metrics.snapshot",
+            "flliper.srt.planner.live_metrics.snapshot",
             return_value=self._snap(rates),
         ) as m:
             d = webui.landing_snapshot_payload()
@@ -1475,7 +1475,7 @@ class TestMonitorTargetResolution(CustomTestCase):
     def test_explicit_endpoint_beats_managed(self):
         webui._set_supervisor(_RunningFakeSupervisor())
         with mock.patch(
-            "sglang.srt.planner.live_metrics.snapshot",
+            "flliper.srt.planner.live_metrics.snapshot",
             return_value=self._snap(),
         ) as m:
             d = webui.landing_snapshot_payload({"endpoint": "127.0.0.1:30100"})
@@ -1488,7 +1488,7 @@ class TestMonitorTargetResolution(CustomTestCase):
         with mock.patch.object(
             webui, "_detect_external_endpoint"
         ) as det, mock.patch(
-            "sglang.srt.planner.live_metrics.snapshot",
+            "flliper.srt.planner.live_metrics.snapshot",
             return_value=self._snap(),
         ) as m:
             d = webui.landing_snapshot_payload()
@@ -1516,7 +1516,7 @@ class TestMonitorTargetResolution(CustomTestCase):
         # must also SURVIVE the second poll.
         k0 = ("explicit", "http://127.0.0.1:30000")
         with mock.patch(
-            "sglang.srt.planner.live_metrics.snapshot",
+            "flliper.srt.planner.live_metrics.snapshot",
             return_value=self._snap(),
         ) as m:
             webui.landing_snapshot_payload({"endpoint": "127.0.0.1:30000"})
@@ -1529,7 +1529,7 @@ class TestMonitorTargetResolution(CustomTestCase):
         with mock.patch.object(
             webui, "_tcp_open", side_effect=lambda h, p, timeout=0.15: p == 30100
         ), mock.patch.object(
-            webui, "_probe_sglang",
+            webui, "_probe_flliper",
             side_effect=lambda u, timeout=0.8: u.endswith(":30100"),
         ):
             d = webui.detect_endpoint_payload()
@@ -1537,7 +1537,7 @@ class TestMonitorTargetResolution(CustomTestCase):
         self.assertEqual(d["endpoint"], "http://127.0.0.1:30100")
         self.assertIn(30100, d["probed"])
 
-    def test_detect_endpoint_sweeps_the_whole_sglang_range(self):
+    def test_detect_endpoint_sweeps_the_whole_flliper_range(self):
         # The 'detect' button must cover the documented 30000-30100 range, not
         # just a three-port sample.
         with mock.patch.object(webui, "_tcp_open", return_value=False):
@@ -1550,13 +1550,13 @@ class TestMonitorTargetResolution(CustomTestCase):
     def test_detect_endpoint_tcp_prescan_gates_the_http_probe(self):
         # A closed port must never reach the (expensive) HTTP probe.
         with mock.patch.object(webui, "_tcp_open", return_value=False), \
-                mock.patch.object(webui, "_probe_sglang") as probe:
+                mock.patch.object(webui, "_probe_flliper") as probe:
             webui.detect_endpoint_payload()
         probe.assert_not_called()
 
     def test_detect_endpoint_explicit_target_skips_the_sweep(self):
         with mock.patch.object(webui, "_tcp_open") as scan, \
-                mock.patch.object(webui, "_probe_sglang", return_value=True):
+                mock.patch.object(webui, "_probe_flliper", return_value=True):
             d = webui.detect_endpoint_payload({"endpoint": "1.2.3.4:31000"})
         scan.assert_not_called()
         self.assertTrue(d["explicit"])
@@ -1564,7 +1564,7 @@ class TestMonitorTargetResolution(CustomTestCase):
         self.assertEqual(d["probed"], [31000])
 
     def test_detect_endpoint_explicit_target_unreachable_reports_why(self):
-        with mock.patch.object(webui, "_probe_sglang", return_value=False):
+        with mock.patch.object(webui, "_probe_flliper", return_value=False):
             d = webui.detect_endpoint_payload({"endpoint": "host-x:31000"})
         self.assertIsNone(d["endpoint"])
         self.assertIn("host-x:31000", d["error"])
@@ -1591,19 +1591,19 @@ class TestProfileLaunchWiring(CustomTestCase):
     def test_env_and_profile_argv_reach_the_supervisor(self):
         d = webui.server_start_payload({
             "model_path": "/m", "tp_size": 1, "port": 31000,
-            "env": {"SGLANG_UNEVEN_DCP": "1", "HF_TOKEN": "supersecret"},
+            "env": {"FLLIPER_UNEVEN_DCP": "1", "HF_TOKEN": "supersecret"},
             "profile_argv": ["--model-path", "/m", "--tp-size", "1"],
         })
         self.assertTrue(d["ok"], d.get("error"))
         st = self.fake.started
-        self.assertEqual(st.extra_env["SGLANG_UNEVEN_DCP"], "1")
+        self.assertEqual(st.extra_env["FLLIPER_UNEVEN_DCP"], "1")
         self.assertEqual(st.extra_env["HF_TOKEN"], "supersecret")
-        # exact profile argv: interpreter -m sglang.launch_server + flag list.
-        self.assertEqual(d["launch_command"][1:3], ["-m", "sglang.launch_server"])
+        # exact profile argv: interpreter -m flliper.launch_server + flag list.
+        self.assertEqual(d["launch_command"][1:3], ["-m", "flliper.launch_server"])
         self.assertIn("--model-path", d["launch_command"])
         # the echoed env redacts credential-suffixed names, keeps knobs exact.
         self.assertEqual(d["env_applied"]["HF_TOKEN"], "<redacted>")
-        self.assertEqual(d["env_applied"]["SGLANG_UNEVEN_DCP"], "1")
+        self.assertEqual(d["env_applied"]["FLLIPER_UNEVEN_DCP"], "1")
         self.assertNotIn("supersecret", json.dumps(d))
 
     def test_launch_without_env_stays_default(self):
@@ -1629,14 +1629,14 @@ class TestProfileLaunchWiring(CustomTestCase):
         uneven = [p for p in d["generated"] if "uneven" in p["kind"]]
         self.assertTrue(uneven, [p["kind"] for p in d["generated"]])
         # spec+DCP is only supported with the env pair -- it must be carried.
-        self.assertEqual(uneven[0]["launch_env"].get("SGLANG_UNEVEN_DCP"), "1")
+        self.assertEqual(uneven[0]["launch_env"].get("FLLIPER_UNEVEN_DCP"), "1")
 
 
 class TestBenchRoutes(CustomTestCase):
     """#151 -- probe/gating + the streaming run route (bench_suite mocked)."""
 
     def _caps(self, **kw):
-        from sglang.srt.planner import bench_suite
+        from flliper.srt.planner import bench_suite
 
         d = dict(chat_template_basic=True, tool_parser=None,
                  reasoning_parser="qwen3", streaming=True, spec_decode=False,
@@ -1646,7 +1646,7 @@ class TestBenchRoutes(CustomTestCase):
 
     def test_probe_reports_capabilities_and_gates(self):
         with mock.patch(
-            "sglang.srt.planner.bench_suite.probe_capabilities",
+            "flliper.srt.planner.bench_suite.probe_capabilities",
             return_value=self._caps(),
         ) as m:
             d = webui.bench_probe_payload({"endpoint": "127.0.0.1:30000"})
@@ -1662,7 +1662,7 @@ class TestBenchRoutes(CustomTestCase):
 
     def test_probe_without_endpoint_returns_catalog_only(self):
         with mock.patch(
-            "sglang.srt.planner.bench_suite.probe_capabilities"
+            "flliper.srt.planner.bench_suite.probe_capabilities"
         ) as m:
             d = webui.bench_probe_payload({})
         m.assert_not_called()
@@ -1685,7 +1685,7 @@ class TestBenchRoutes(CustomTestCase):
             yield from results
 
         with mock.patch(
-            "sglang.srt.planner.bench_suite.run_suite", side_effect=fake_run
+            "flliper.srt.planner.bench_suite.run_suite", side_effect=fake_run
         ):
             evs = list(webui.bench_run_events(
                 {"endpoint": "127.0.0.1:30000", "model": "m",
@@ -1712,7 +1712,7 @@ class TestBenchRoutes(CustomTestCase):
             return iter(())
 
         with mock.patch(
-            "sglang.srt.planner.bench_suite.run_suite", side_effect=fake_run
+            "flliper.srt.planner.bench_suite.run_suite", side_effect=fake_run
         ):
             list(webui.bench_run_events({
                 "endpoint": "e", "model": "m", "selected": [1],
@@ -1738,21 +1738,21 @@ class TestShareRoutes(CustomTestCase):
         d = webui.share_preview_payload({"payload": {
             "model": "Qwen3.6-27B",
             "command": {
-                "argv": ["python", "-m", "sglang.launch_server", "--tp", "3"],
-                "env": {"SGLANG_UNEVEN_DCP": "1", "HF_TOKEN": "hfsecret"},
+                "argv": ["python", "-m", "flliper.launch_server", "--tp", "3"],
+                "env": {"FLLIPER_UNEVEN_DCP": "1", "HF_TOKEN": "hfsecret"},
             },
             "metrics": {"decode_tok_s": 51.0},
         }})
         self.assertTrue(d["ok"])
         self.assertIn("Start command (exact)", d["report"])
-        self.assertIn("SGLANG_UNEVEN_DCP=1", d["report"])   # knob stays exact
+        self.assertIn("FLLIPER_UNEVEN_DCP=1", d["report"])   # knob stays exact
         self.assertNotIn("hfsecret", d["report"])           # credential redacted
         self.assertTrue(d["default_repo"])
 
     def test_submit_refused_without_confirmation_no_network(self):
         api = mock.Mock()
         with mock.patch(
-            "sglang.srt.planner.github_share._default_api", api
+            "flliper.srt.planner.github_share._default_api", api
         ):
             d = webui.share_submit_payload(
                 {"report": "r", "token": self.TOKEN, "confirmed": False})
@@ -1763,7 +1763,7 @@ class TestShareRoutes(CustomTestCase):
 
     def test_submit_confirmed_calls_github_never_echoes_pat(self):
         with mock.patch(
-            "sglang.srt.planner.github_share.submit",
+            "flliper.srt.planner.github_share.submit",
             return_value={"action": "created", "number": 7,
                           "url": "https://github.com/x/y/issues/7"},
         ) as m:
@@ -1779,10 +1779,10 @@ class TestShareRoutes(CustomTestCase):
         self.assertNotIn(self.TOKEN, json.dumps(d))
 
     def test_submit_error_stays_redacted(self):
-        from sglang.srt.planner.github_share import GitHubShareError
+        from flliper.srt.planner.github_share import GitHubShareError
 
         with mock.patch(
-            "sglang.srt.planner.github_share.submit",
+            "flliper.srt.planner.github_share.submit",
             side_effect=GitHubShareError("HTTP 401 <redacted-token>"),
         ):
             d = webui.share_submit_payload(
@@ -1840,7 +1840,7 @@ class TestV3HttpRoutes(WebUIFixture):
             yield from results
 
         with mock.patch(
-            "sglang.srt.planner.bench_suite.run_suite", side_effect=fake_run
+            "flliper.srt.planner.bench_suite.run_suite", side_effect=fake_run
         ):
             with self._post_raw(
                 "/api/bench_run",
@@ -1886,7 +1886,7 @@ class TestV3HttpRoutes(WebUIFixture):
     def test_detect_routes_answer_post_too(self):
         # The page's detect button POSTs a body (explicit host:port / port
         # list); a GET-only route answered {"error": "not found"}.
-        with mock.patch.object(webui, "_probe_sglang", return_value=True):
+        with mock.patch.object(webui, "_probe_flliper", return_value=True):
             with self._post_raw(
                 "/api/detect_endpoint", {"endpoint": "1.2.3.4:31000"}
             ) as r:
@@ -1899,7 +1899,7 @@ class TestV3HttpRoutes(WebUIFixture):
         self.assertNotIn("error", d)
 
     def test_detect_endpoint_route_accepts_query_params(self):
-        with mock.patch.object(webui, "_probe_sglang", return_value=True):
+        with mock.patch.object(webui, "_probe_flliper", return_value=True):
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}"
                 "/api/detect_endpoint?endpoint=1.2.3.4:31000",
@@ -1914,7 +1914,7 @@ class TestV3HttpRoutes(WebUIFixture):
             {"t": 1.0},
         )
         with mock.patch(
-            "sglang.srt.planner.live_metrics.snapshot", return_value=fake_snap
+            "flliper.srt.planner.live_metrics.snapshot", return_value=fake_snap
         ) as m:
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}/api/live_snapshot"
@@ -2080,7 +2080,7 @@ class TestRunnerLmStudioLayout(CustomTestCase):
         renamed/removed flag would silently fall through to advanced)."""
         import re
 
-        from sglang.srt.planner import flags as flagsmod
+        from flliper.srt.planner import flags as flagsmod
 
         cat = flagsmod.catalog()
         html = webui.INDEX_HTML
@@ -2104,12 +2104,12 @@ if __name__ == "__main__":
 class TestProfileArgvMerge(unittest.TestCase):
     """A profile's argv is a FLAG SET; the serving identity lives in the launch
     form. Live boots exposed both halves of this: using the profile argv alone
-    produced a command sglang rejects ("--model-path required"), and letting the
+    produced a command flliper rejects ("--model-path required"), and letting the
     profile's placeholder --max-running-requests win OOM'd CUDA-graph capture.
     """
 
     def _settings(self, **kw):
-        from sglang.srt.planner.server_manager import LaunchSettings
+        from flliper.srt.planner.server_manager import LaunchSettings
 
         base = dict(
             model_path="/models/M", served_model_name="M", tp_size=3,
@@ -2120,7 +2120,7 @@ class TestProfileArgvMerge(unittest.TestCase):
         return LaunchSettings(**base).validate()
 
     def test_merge_keeps_serving_identity_and_profile_flags(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         prof = [
             "--tp-size", "3", "--rank-tp-ratio", "auto-performance",
@@ -2147,7 +2147,7 @@ class TestProfileArgvMerge(unittest.TestCase):
             self.assertEqual(argv.count(flag), 1, flag)
 
     def test_drop_flags_removes_flag_and_value(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         out = webui._drop_flags(
             ["--a", "1", "--keep", "2", "--flagonly", "--b", "3"],
@@ -2162,7 +2162,7 @@ class TestDeviceIndexSpaces(CustomTestCase):
     rank_gpu_id / base_gpu_id live in), never in NVML order."""
 
     def _spec(self):
-        from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
+        from flliper.srt.planner.hardware import GpuDescriptor, HardwareSpec
 
         # THE reference box: NVML order [3080, 5090, 3080]; the bridge puts
         # the 5090 at cuda:0.
@@ -2185,7 +2185,7 @@ class TestDeviceIndexSpaces(CustomTestCase):
 
     def test_detect_payload_carries_both_indices(self):
         with mock.patch(
-            "sglang.srt.planner.hardware.hardware_from_nvml",
+            "flliper.srt.planner.hardware.hardware_from_nvml",
             return_value=self._spec(),
         ):
             d = webui.detect_hardware()
@@ -2205,7 +2205,7 @@ class TestDeviceIndexSpaces(CustomTestCase):
         # actually trains to -- only the capacity-matrix's "assumes
         # pcie/nvlink topology, not measured" disclaimer existed, never the
         # measured fact for THIS rig's asymmetric wiring.
-        from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
+        from flliper.srt.planner.hardware import GpuDescriptor, HardwareSpec
 
         spec = HardwareSpec(
             gpus=(
@@ -2219,7 +2219,7 @@ class TestDeviceIndexSpaces(CustomTestCase):
             source="nvml",
         )
         with mock.patch(
-            "sglang.srt.planner.hardware.hardware_from_nvml",
+            "flliper.srt.planner.hardware.hardware_from_nvml",
             return_value=spec,
         ):
             d = webui.detect_hardware()
@@ -2236,8 +2236,8 @@ class TestDeviceIndexSpaces(CustomTestCase):
         self.assertIn("PCIe ' + c.pcie_gen", html)
 
     def test_gpu_state_rows_annotated_with_cuda_index(self):
-        from sglang.srt.planner import device_map as dmod
-        from sglang.srt.planner.energy import GpuPowerState
+        from flliper.srt.planner import device_map as dmod
+        from flliper.srt.planner.energy import GpuPowerState
 
         def _st(i, name):
             return GpuPowerState(
@@ -2261,7 +2261,7 @@ class TestDeviceIndexSpaces(CustomTestCase):
             source=dmod.IDENTITY_MAP_SOURCE,
         )
         with mock.patch(
-            "sglang.srt.planner.energy.read_gpu_power_states",
+            "flliper.srt.planner.energy.read_gpu_power_states",
             return_value=[_st(0, "RTX 3080"), _st(1, "RTX 5090")],
         ), mock.patch.object(dmod, "device_map", return_value=dm):
             d = webui.gpu_state_payload()
@@ -2408,7 +2408,7 @@ class TestLiveGraphCapture(CustomTestCase):
 
     def test_managed_boot_log_parse(self):
         tmp = tempfile.mkdtemp()
-        log = os.path.join(tmp, "sglang_boot_30000.log")
+        log = os.path.join(tmp, "flliper_boot_30000.log")
         with open(log, "w") as f:
             f.write(self._LINES)
 
@@ -2943,7 +2943,7 @@ class TestTemplatesAreStartingPoints(CustomTestCase):
         # enum -- including the phase-optimal arms (#357), so a value the
         # server accepts never renders as a bare identifier in the objective
         # note.
-        from sglang.srt.planner import flags as flagsmod
+        from flliper.srt.planner import flags as flagsmod
         allowed = set(flagsmod.catalog()["rank_perf_tune"].allowed)
         self.assertEqual(
             allowed,
@@ -2975,7 +2975,7 @@ class TestTradeoffTooltips(CustomTestCase):
     """Every control says what it gives and what it costs, from ONE source."""
 
     def test_registry_entries_have_both_halves(self):
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
         for key, t in tipsmod.TRADEOFFS.items():
             self.assertTrue(t.gain.strip(), key)
             self.assertTrue(t.cost.strip(), key)
@@ -2984,14 +2984,14 @@ class TestTradeoffTooltips(CustomTestCase):
             self.assertLess(len(t.cost), 200, key)
 
     def test_rendered_line_states_the_cost(self):
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
         txt = tipsmod.describe("rank_kv_ratio=speed")
         self.assertIn("Costs:", txt)
 
     def test_numbers_are_never_invented(self):
         # A trade-off that points at a study must say the study has not been
         # run rather than quoting a figure from nowhere.
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
         txt = tipsmod.describe("rank_kv_ratio=speed", measurements={})
         self.assertIn("Not measured on this rig", txt)
         txt2 = tipsmod.describe(
@@ -3001,15 +3001,15 @@ class TestTradeoffTooltips(CustomTestCase):
         self.assertNotIn("Not measured", txt2)
 
     def test_unknown_key_falls_back(self):
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
         self.assertEqual(tipsmod.describe("nope", fallback="old text"), "old text")
 
     def test_fork_flags_are_covered(self):
         # A knob this fork invented has no documentation anywhere else, so it
         # is the one that most needs to state its cost. Env-only vectors are
         # excluded: they mirror a --rank-*-ratio flag that is covered.
-        from sglang.srt.planner import flags as flagsmod
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import flags as flagsmod
+        from flliper.srt.planner import tooltips as tipsmod
         fork = [
             k for k, v in flagsmod.catalog().items()
             if v.source == "fork" and not v.is_env
@@ -3032,7 +3032,7 @@ class TestTradeoffTooltips(CustomTestCase):
         # The browser renders what the server sends. If a sentence were
         # inlined in the JS it would drift from the registry silently.
         js = _index_script()
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
         for key, t in tipsmod.TRADEOFFS.items():
             self.assertNotIn(t.gain, js, key)
             self.assertNotIn(t.cost, js, key)
@@ -3060,7 +3060,7 @@ class TestTooltipsRoute(TestHttpRoundTrip):
 class TestRigPairRoutes(TestHttpRoundTrip):
     def setUp(self):
         super().setUp()
-        from sglang.srt.rigmon import pairing
+        from flliper.srt.rigmon import pairing
         self.pairing = pairing
         self._real_opener = pairing.STORE._opener
         self._real_sync = pairing.STORE.synchronous
@@ -3192,7 +3192,7 @@ class TestBenchLeadMetrics(CustomTestCase):
             per_rank_phase = {}
 
         with mock.patch(
-            "sglang.srt.rigmon.sources.EngineScraper.scrape",
+            "flliper.srt.rigmon.sources.EngineScraper.scrape",
             return_value=_Sample(),
         ):
             d = webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:30000"})
@@ -3210,7 +3210,7 @@ class TestBenchLeadMetrics(CustomTestCase):
             per_rank_phase = {}
 
         with mock.patch(
-            "sglang.srt.rigmon.sources.EngineScraper.scrape",
+            "flliper.srt.rigmon.sources.EngineScraper.scrape",
             return_value=_Sample(),
         ):
             webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:30000"})
@@ -3219,7 +3219,7 @@ class TestBenchLeadMetrics(CustomTestCase):
         self.assertEqual(d["metrics"], {})
         joined = " ".join(d["notes"])
         self.assertIn("absent, not zero", joined)
-        self.assertIn("SGLANG_ENABLE_METRICS_DEVICE_TIMER", joined)
+        self.assertIn("FLLIPER_ENABLE_METRICS_DEVICE_TIMER", joined)
 
     def test_unreachable_engine_reports_rather_than_raises(self):
         d = webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:1"})
@@ -3309,7 +3309,7 @@ class TestChessWindow(CustomTestCase):
 
 class TestDiscussionExport(CustomTestCase):
     def setUp(self):
-        from sglang.srt.planner import discussion_export as dx
+        from flliper.srt.planner import discussion_export as dx
         self.dx = dx
         self._env = {k: os.environ.get(k) for k in (dx.TARGET_ENV, dx.PAT_FILE_ENV)}
         for k in self._env:
@@ -3554,7 +3554,7 @@ class TestObservabilityIsNotOptional(CustomTestCase):
     def test_argv_override_still_gets_enable_metrics(self):
         # The full-argv path is the one place a caller could otherwise decide
         # to boot a blind server.
-        out = webui._force_enable_metrics(["python", "-m", "sglang.launch_server"])
+        out = webui._force_enable_metrics(["python", "-m", "flliper.launch_server"])
         self.assertIn("--enable-metrics", out)
 
     def test_not_added_twice(self):
@@ -3567,7 +3567,7 @@ class TestObservabilityIsNotOptional(CustomTestCase):
         self.assertIsNone(webui._force_enable_metrics(None))
 
     def test_launch_settings_command_has_it(self):
-        from sglang.srt.planner.server_manager import LaunchSettings
+        from flliper.srt.planner.server_manager import LaunchSettings
 
         self.assertIn("--enable-metrics",
                       LaunchSettings(model_path="/m").launch_command())
@@ -3580,7 +3580,7 @@ class TestObservabilityIsNotOptional(CustomTestCase):
         # failed scrape.
         self.assertIn("serverStateBanner", html)
         self.assertIn("running_no_metrics", html)
-        from sglang.srt.planner import server_state as _ss
+        from flliper.srt.planner import server_state as _ss
 
         st = _ss.build(_ss.Probe(ok=True, path="/get_model_info", status=200),
                        _ss.Probe(ok=False, path="/metrics", status=404))
@@ -3588,7 +3588,7 @@ class TestObservabilityIsNotOptional(CustomTestCase):
         self.assertIn("--enable-metrics", st.headline)
 
     def test_detect_reports_whether_metrics_are_served(self):
-        with mock.patch.object(webui, "_probe_sglang", return_value=True), \
+        with mock.patch.object(webui, "_probe_flliper", return_value=True), \
                 mock.patch.object(webui, "_serves_metrics", return_value=False):
             d = webui.detect_endpoint_payload({"endpoint": "1.2.3.4:30000"})
         self.assertEqual(d["endpoint"], "http://1.2.3.4:30000")
@@ -3682,7 +3682,7 @@ class TestBenchHistoryRoutes(CustomTestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="bhroute_")
         self._env = mock.patch.dict(
-            os.environ, {"SGLANG_PLANNER_BENCH_HISTORY": self.tmp})
+            os.environ, {"FLLIPER_PLANNER_BENCH_HISTORY": self.tmp})
         self._env.start()
 
     def tearDown(self):
@@ -3692,7 +3692,7 @@ class TestBenchHistoryRoutes(CustomTestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_run_is_saved_with_its_transcript_and_listed(self):
-        from sglang.srt.planner import bench_history
+        from flliper.srt.planner import bench_history
 
         class _Ctx:
             transcript = [{"test_id": 1, "request": {"messages": []},
@@ -3706,7 +3706,7 @@ class TestBenchHistoryRoutes(CustomTestCase):
                    "metric": {"name": "none", "value": None}, "detail": {},
                    "deps": {}}
 
-        with mock.patch("sglang.srt.planner.bench_suite.run_suite",
+        with mock.patch("flliper.srt.planner.bench_suite.run_suite",
                         side_effect=fake_run):
             evs = list(webui.bench_run_events(
                 {"endpoint": "127.0.0.1:30000", "model": "/m/Model-A"}))
@@ -3731,7 +3731,7 @@ class TestBenchHistoryRoutes(CustomTestCase):
                    "deps": {}}
             raise RuntimeError("engine died")
 
-        with mock.patch("sglang.srt.planner.bench_suite.run_suite",
+        with mock.patch("flliper.srt.planner.bench_suite.run_suite",
                         side_effect=boom):
             evs = list(webui.bench_run_events(
                 {"endpoint": "127.0.0.1:30000", "model": "/m/Model-B"}))
@@ -3749,7 +3749,7 @@ class TestBenchHistoryRoutes(CustomTestCase):
     # from the start but had no HTTP route and no button, so the store could
     # only ever grow. These pin the route that finally reaches it.
     def _save(self, model="/m/Model-A"):
-        from sglang.srt.planner import bench_history
+        from flliper.srt.planner import bench_history
 
         return bench_history.save_run(
             {"model": model, "endpoint": "e", "started_at": 1.0,
@@ -4031,21 +4031,21 @@ class TestFrontendIAv2RegistryHub(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        os.environ.pop("SGLANG_REGISTRY_URL", None)
-        os.environ.pop("SGLANG_VIDEO_URL", None)
+        os.environ.pop("FLLIPER_REGISTRY_URL", None)
+        os.environ.pop("FLLIPER_VIDEO_URL", None)
 
     def test_registry_base_resolution_order(self):
         # query override > env > documented default (§ same convention as
         # the landing tab's editable endpoint).
         self.assertEqual(webui._registry_base({}), "http://127.0.0.1:8500")
-        os.environ["SGLANG_REGISTRY_URL"] = "10.0.0.5:9000"
+        os.environ["FLLIPER_REGISTRY_URL"] = "10.0.0.5:9000"
         try:
             self.assertEqual(webui._registry_base({}), "http://10.0.0.5:9000")
             self.assertEqual(
                 webui._registry_base({"registry": "other:1234"}), "http://other:1234"
             )
         finally:
-            os.environ.pop("SGLANG_REGISTRY_URL", None)
+            os.environ.pop("FLLIPER_REGISTRY_URL", None)
 
     def test_snapshot_reachable_relays_body_verbatim(self):
         # Real shape of GET /registry (arbiter.EngineRegistry.snapshot() /
@@ -4224,7 +4224,7 @@ class TestFrontendIAv2VideoTab(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        os.environ.pop("SGLANG_VIDEO_URL", None)
+        os.environ.pop("FLLIPER_VIDEO_URL", None)
 
     def test_no_base_configured_is_offline_without_a_network_attempt(self):
         with mock.patch.object(webui, "_proxy_json") as proxy:
@@ -4536,7 +4536,7 @@ class TestReferencePngIsDerived(CustomTestCase):
         self.assertGreater(len(data), 1000)
 
     def test_it_is_derived_from_the_same_movetext_the_validator_grades(self):
-        from sglang.srt.planner import quality_chess
+        from flliper.srt.planner import quality_chess
 
         captured = {}
         real = quality_chess.ground_truth
@@ -4616,7 +4616,7 @@ class TestLinkThroughput(CustomTestCase):
     """#15: live PCIe / NVLink per card, each against its own ceiling."""
 
     def setUp(self):
-        from sglang.srt.planner import live_metrics
+        from flliper.srt.planner import live_metrics
 
         live_metrics._LINK_PEAKS.clear()
         live_metrics._LINK_STATE_PEAKS.clear()
@@ -4625,7 +4625,7 @@ class TestLinkThroughput(CustomTestCase):
     tearDown = setUp
 
     def test_pcie_is_sampled_and_nvlink_absence_is_not_zero(self):
-        from sglang.srt.planner import live_metrics
+        from flliper.srt.planner import live_metrics
 
         class _Nvml:
             NVML_PCIE_UTIL_TX_BYTES = 0
@@ -4658,7 +4658,7 @@ class TestLinkThroughput(CustomTestCase):
         self.assertEqual(d["nvlink_links"], 0)
 
     def test_without_calibration_the_ceiling_is_the_highest_seen_so_far(self):
-        from sglang.srt.planner import live_metrics
+        from flliper.srt.planner import live_metrics
 
         rate = {"v": 3_000_000}
 
@@ -4690,7 +4690,7 @@ class TestLinkThroughput(CustomTestCase):
         self.assertAlmostEqual(d["pcie_max_gbs"], 9.0, places=6)
 
     def test_a_measured_peak_outranks_a_lower_capability_figure(self):
-        from sglang.srt.planner import live_metrics
+        from flliper.srt.planner import live_metrics
 
         class _Nvml:
             NVML_PCIE_UTIL_TX_BYTES = 0
@@ -4754,7 +4754,7 @@ class TestLiveBannerStates(CustomTestCase):
         self.assertLess(i_render, i_hide + 1)
 
     def test_the_four_states_are_named(self):
-        from sglang.srt.planner import server_state as _ss
+        from flliper.srt.planner import server_state as _ss
 
         html = webui.INDEX_HTML
         self.assertIn("No inference server running", html)
@@ -4802,14 +4802,14 @@ class TestCardProbeEndpoint(CustomTestCase):
 
     def _isolated_store(self):
         """A fresh job store, so a test never starts a real probe."""
-        from sglang.srt.rigmon import card_probe
+        from flliper.srt.rigmon import card_probe
 
         store = card_probe.ProbeJobStore()
         store.synchronous = True
         return card_probe, store
 
     def test_status_without_a_probe_names_the_nameplate_basis(self):
-        from sglang.srt.rigmon import card_probe
+        from flliper.srt.rigmon import card_probe
 
         real = card_probe.load_card_probe
         card_probe.load_card_probe = lambda *a, **k: None
@@ -4823,7 +4823,7 @@ class TestCardProbeEndpoint(CustomTestCase):
         self.assertEqual(d["basis"], "nameplate-ranked, no probe cached")
 
     def test_status_with_a_probe_reports_measured(self):
-        from sglang.srt.rigmon import card_probe
+        from flliper.srt.rigmon import card_probe
 
         prof = card_probe.CardProbeProfile(
             created=1000.0,
@@ -4901,7 +4901,7 @@ class TestCardProbeEndpoint(CustomTestCase):
 class TestSplitProbeEndpoint(CustomTestCase):
     def _isolated(self):
         """A fresh job store, so a test never boots a server."""
-        from sglang.srt.planner import split_probe as sp
+        from flliper.srt.planner import split_probe as sp
 
         store = sp.SplitProbeJobStore()
         store.synchronous = True
@@ -4951,7 +4951,7 @@ class TestSplitProbeEndpoint(CustomTestCase):
         self.assertTrue(set(sp.LADDER).issubset(keys))
 
     def test_an_unmeasured_candidate_is_a_row_with_a_reason_not_a_number(self):
-        from sglang.srt.planner import split_probe as sp
+        from flliper.srt.planner import split_probe as sp
 
         with tempfile.TemporaryDirectory() as d:
             table = sp.tipping_point_table(os.path.join(d, "empty.jsonl"))
@@ -4986,7 +4986,7 @@ class TestSplitProbeEndpoint(CustomTestCase):
         self.assertIn("clearInterval(window._splitProbeTimer)", seg)
 
     def test_the_measure_button_says_what_it_costs(self):
-        from sglang.srt.planner import split_probe as sp
+        from flliper.srt.planner import split_probe as sp
 
         with tempfile.TemporaryDirectory() as d:
             table = sp.tipping_point_table(os.path.join(d, "empty.jsonl"))
@@ -5013,7 +5013,7 @@ class TestBenchFactors(WebUIFixture):
         return {f["key"]: f for f in d["factors"]}, d
 
     def test_every_factor_answers_with_a_provenance_and_an_action(self):
-        from sglang.srt.planner import bench_factors as bfm
+        from flliper.srt.planner import bench_factors as bfm
 
         by_key, d = self._factors()
         self.assertEqual(set(by_key), set(bfm.FACTOR_KEYS))
@@ -5030,7 +5030,7 @@ class TestBenchFactors(WebUIFixture):
 
     def test_a_missing_study_carries_no_number_at_all(self):
         # The whole point: absent must be distinguishable from measured-zero.
-        from sglang.srt.planner import bench_factors as bfm
+        from flliper.srt.planner import bench_factors as bfm
 
         by_key, _ = self._factors()
         for key, f in by_key.items():
@@ -5050,7 +5050,7 @@ class TestBenchFactors(WebUIFixture):
 
     def test_a_cached_probe_is_read_without_touching_a_gpu(self):
         # Written here, read back through the endpoint: no NVML, no CUDA.
-        from sglang.srt.rigmon import card_probe as cp
+        from flliper.srt.rigmon import card_probe as cp
 
         prof = cp.CardProbeProfile(
             created=time.time() - 3600,
@@ -5156,7 +5156,7 @@ class TestScenarioSuggest(WebUIFixture):
         )
 
     def test_every_step_names_the_provenance_it_rests_on(self):
-        from sglang.srt.planner import bench_factors as bfm
+        from flliper.srt.planner import bench_factors as bfm
 
         sug = webui.scenario_suggest_payload(self._payload())
         self.assertTrue(sug["reasoning"])
@@ -5189,7 +5189,7 @@ class TestScenarioSuggest(WebUIFixture):
     def test_an_unmeasured_rig_never_proposes_a_directed_split(self):
         # The conservative gate: with no probe of these cards, the answer is
         # the reference configuration, and the reason says why.
-        from sglang.srt.planner import bench_factors as bfm
+        from flliper.srt.planner import bench_factors as bfm
 
         profiles = {
             "ok": True,
@@ -5219,7 +5219,7 @@ class TestScenarioSuggest(WebUIFixture):
         )
 
     def test_a_measured_rig_takes_the_prefill_point_on_a_prompt_workload(self):
-        from sglang.srt.planner import bench_factors as bfm
+        from flliper.srt.planner import bench_factors as bfm
 
         profiles = {
             "ok": True,
@@ -5246,7 +5246,7 @@ class TestScenarioSuggest(WebUIFixture):
         self.assertEqual(sug["apply"]["settings"]["rank_perf_tune"], "enc")
 
     def test_a_stop_that_resolves_back_to_the_baseline_is_not_proposed(self):
-        from sglang.srt.planner import bench_factors as bfm
+        from flliper.srt.planner import bench_factors as bfm
 
         profiles = {
             "ok": True, "baseline": "balanced", "distinct_working_points": 2,
@@ -5289,8 +5289,8 @@ class TestFactorTooltipCoverage(CustomTestCase):
     """Every tile and the suggestion say what they give and what they cost."""
 
     def test_every_factor_has_a_tradeoff(self):
-        from sglang.srt.planner import bench_factors as bfm
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import bench_factors as bfm
+        from flliper.srt.planner import tooltips as tipsmod
 
         missing = [
             f.key for f in bfm.FACTORS if f.tooltip_key not in tipsmod.TRADEOFFS
@@ -5298,7 +5298,7 @@ class TestFactorTooltipCoverage(CustomTestCase):
         self.assertEqual(missing, [], f"factors without a trade-off: {missing}")
 
     def test_the_suggestion_controls_have_one_too(self):
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
 
         for key in ("scenario.suggest", "scenario.apply"):
             self.assertIn(key, tipsmod.TRADEOFFS)
@@ -5383,10 +5383,10 @@ class TestSpillTierPanel(CustomTestCase):
         self.assertIn("absent?'<span class=\"muted\">no data</span>'", seg)
 
     def test_token_valued_rows_are_excluded_from_the_byte_sum(self):
-        from sglang.srt.planner import tier_occupancy
+        from flliper.srt.planner import tier_occupancy
 
         view = tier_occupancy.tier_view(
-            'sglang:spill_tier_used_bytes{spill_tier="expert_host_ram"} 1024\n',
+            'flliper:spill_tier_used_bytes{spill_tier="expert_host_ram"} 1024\n',
             hicache={"host_used_tokens": 5, "host_total_tokens": 10},
             meminfo_text="MemTotal: 1024 kB\n")
         self.assertEqual(view["host_ram_counted"], ["expert_host_ram"])
@@ -5424,7 +5424,7 @@ class TestRateMedianBadges(CustomTestCase):
         self.assertIn("idle polls excluded", seg)
 
     def test_the_window_constant_is_server_side(self):
-        from sglang.srt.planner import rate_medians
+        from flliper.srt.planner import rate_medians
 
         # The page must not carry its own client-side history for this: the
         # median is part of the snapshot so a shell client sees the same one.

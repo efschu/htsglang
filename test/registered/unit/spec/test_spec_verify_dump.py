@@ -16,7 +16,7 @@ projection, the near-tie margin, the accept-length floor) is indexed by it.
 import pytest
 import torch
 
-from sglang.srt.speculative.spec_verify_dump import (
+from flliper.srt.speculative.spec_verify_dump import (
     accepted_row_indices,
     build_verify_record,
 )
@@ -157,7 +157,7 @@ def test_build_verify_record_preserves_dtype():
 
 
 def test_build_verify_record_writes_atomically(tmp_path):
-    from sglang.srt.speculative.spec_verify_dump import write_verify_record
+    from flliper.srt.speculative.spec_verify_dump import write_verify_record
 
     logits, predict, candidates, accept_index, accept_lens = _fake_step()
     rec = build_verify_record(

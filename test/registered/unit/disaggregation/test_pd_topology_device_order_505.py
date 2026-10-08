@@ -33,16 +33,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.topology import (
+from flliper.srt.disaggregation.topology import (
     TOPOLOGY_COLOCATED_CONGRUENT,
     apply_pd_topology,
     nvml_card_totals_mib,
     reindex_totals_cuda_order,
 )
-from sglang.srt.registry import nvml as registry_nvml
-from sglang.srt.registry.nvml import DeviceInfo
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.registry import nvml as registry_nvml
+from flliper.srt.registry.nvml import DeviceInfo
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -240,7 +240,7 @@ class NoCudaBridgeTest(_RigCase):
         the boot-time check passed the plan without a word.
         """
         args = _congruent_args(1)
-        with self.assertLogs("sglang.srt.disaggregation.topology", "WARNING") as logs:
+        with self.assertLogs("flliper.srt.disaggregation.topology", "WARNING") as logs:
             plan = apply_pd_topology(args, setenv={})
         self.assertIsNotNone(plan)
         self.assertIsNone(plan.card(1).total_mib)
@@ -267,7 +267,7 @@ class PartialCudaBridgeTest(_RigCase):
         self.assertNotIn(2, totals)
 
     def test_a_plan_on_an_unplaced_card_is_unverified(self):
-        with self.assertLogs("sglang.srt.disaggregation.topology", "WARNING") as logs:
+        with self.assertLogs("flliper.srt.disaggregation.topology", "WARNING") as logs:
             plan = apply_pd_topology(_congruent_args(1), setenv={})
         self.assertIsNone(plan.card(1).total_mib)
         self.assertIn("UNVERIFIED", "\n".join(logs.output))

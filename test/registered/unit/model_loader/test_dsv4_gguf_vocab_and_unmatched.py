@@ -52,13 +52,13 @@ from unittest import mock
 import numpy as np
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.model_loader.gguf_deepseek4 import Deepseek4GGUFAdapter
-from sglang.srt.model_loader.weight_utils import gguf_quantized_name
-from sglang.srt.models import deepseek_v4
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.model_loader.gguf_deepseek4 import Deepseek4GGUFAdapter
+from flliper.srt.model_loader.weight_utils import gguf_quantized_name
+from flliper.srt.models import deepseek_v4
+from flliper.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -152,8 +152,8 @@ def _run_load(
         name: _CapturingParam(name, sink, dtype) for name, dtype in param_specs.items()
     }
     stub = _make_stub(quant_name, params, **stub_kwargs)
-    with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
-        with envs.SGLANG_OPT_FUSE_WQA_WKV.override(fuse_wqa_wkv):
+    with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
+        with envs.FLLIPER_OPT_FUSE_WQA_WKV.override(fuse_wqa_wkv):
             DeepseekV4ForCausalLM.load_weights(stub, iter(stream))
     sink.pop("__lock__", None)
     return sink
@@ -476,7 +476,7 @@ class TestWoAIsUnpackedIntoItsDenseParameter(CustomTestCase):
         sink: Dict[str, torch.Tensor] = {}
         params = {_WO_A_PARAM: _CapturingParam(_WO_A_PARAM, sink, torch.bfloat16)}
         stub = _make_stub("gguf", params)
-        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+        with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
             with self.assertRaises(AssertionError):
                 DeepseekV4ForCausalLM.load_weights(
                     stub, iter(self._stream(packed, qtype)[:1])

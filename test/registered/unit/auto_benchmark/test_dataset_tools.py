@@ -11,9 +11,9 @@ if str(PARENT_DIR) not in sys.path:
 
 from auto_benchmark import AutoBenchmarkTestCase
 
-from sglang.auto_benchmark_lib import infer_backend, prepare_dataset
-from sglang.benchmark.datasets.autobench import sample_autobench_requests
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.auto_benchmark_lib import infer_backend, prepare_dataset
+from flliper.benchmark.datasets.autobench import sample_autobench_requests
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd")
@@ -95,9 +95,9 @@ class TestAutoBenchmarkDatasetTools(AutoBenchmarkTestCase):
         chat_rows = [SimpleNamespace(prompt=[{"role": "user", "content": "tok_1"}])]
         token_id_rows = [SimpleNamespace(prompt=[1, 2, 3])]
 
-        self.assertEqual(infer_backend("auto", prompt_rows), "sglang-oai")
-        self.assertEqual(infer_backend("auto", chat_rows), "sglang-oai-chat")
-        self.assertEqual(infer_backend("auto", token_id_rows), "sglang")
+        self.assertEqual(infer_backend("auto", prompt_rows), "flliper-oai")
+        self.assertEqual(infer_backend("auto", chat_rows), "flliper-oai-chat")
+        self.assertEqual(infer_backend("auto", token_id_rows), "flliper")
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ Not registered in any CI suite -- runnable manually only.
 
 import unittest
 
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.server_fixtures.ngram_fixture import NgramServerBase
 
 
 class TestNgramSpeculativeDecodingBase(NgramServerBase, GSM8KMixin):

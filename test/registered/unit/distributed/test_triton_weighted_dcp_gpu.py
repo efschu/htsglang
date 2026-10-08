@@ -35,14 +35,14 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
+from flliper.srt.layers.dcp.owner import (
     build_dcp_weighted_kv_indices,
     dcp_weighted_owner_bounds,
     dcp_weighted_write_slots,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
@@ -159,7 +159,7 @@ class TestTritonWeightedDcpGpu(CustomTestCase):
         capture. Returning a fresh tensor instead would leave every replay
         decoding against the capture-time context -- fluent nonsense, no error.
         """
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+        from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
         lens_np = np.array([20, 0, 33, 7, 64], dtype=np.int32)
         lens = torch.from_numpy(lens_np).to(self.dev)
@@ -198,7 +198,7 @@ class TestTritonWeightedDcpGpu(CustomTestCase):
         np.testing.assert_array_equal(owned.cpu().numpy(), owned2.cpu().numpy())
 
     def test_an_undersized_buffer_raises_instead_of_truncating(self):
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+        from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
         lens = torch.full((self.n_req,), self.width, dtype=torch.int32, device=self.dev)
         S, lo, hi, ratio = self._bounds([13, 30, 21], 1)
@@ -231,7 +231,7 @@ class TestTritonWeightedDcpGpu(CustomTestCase):
         image of a COMMITTED slot, and none of the draft slots' images may
         appear.
         """
-        from sglang.srt.layers.dcp.owner import dcp_verify_paged_lens
+        from flliper.srt.layers.dcp.owner import dcp_verify_paged_lens
 
         d = 4
         seq_np = np.array([1, 9, 40, 0, self.width - d], dtype=np.int32)
@@ -283,7 +283,7 @@ class TestTritonWeightedDcpGpu(CustomTestCase):
         degraded accept rate rather than as an error, which is why this is
         asserted on the device build and not only on the arithmetic.
         """
-        from sglang.srt.layers.dcp.owner import dcp_verify_paged_lens
+        from flliper.srt.layers.dcp.owner import dcp_verify_paged_lens
 
         seq_np = np.array([1, 9, 40, 0, 63], dtype=np.int32)
         seq_lens = torch.from_numpy(seq_np).to(self.dev)
@@ -313,7 +313,7 @@ class TestTritonWeightedDcpGpu(CustomTestCase):
         """Short prefix + low token ratio -> zero owned rows. The kernels are
         then driven by an all-zero indptr and never dereference the index
         tensor, but a 0-element tensor has no storage to take a pointer from."""
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+        from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
         table = torch.arange(64, dtype=torch.int32, device=self.dev).reshape(1, 64)
         S, lo, hi, ratio = self._bounds([13, 30, 21], 2)

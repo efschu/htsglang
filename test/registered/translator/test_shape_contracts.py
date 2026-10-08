@@ -28,7 +28,7 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.translator.talker_config import (
+from flliper.srt.translator.talker_config import (
     ShapeContractError,
     assert_position_contract,
     assert_prompt_block,
@@ -217,7 +217,7 @@ class TestCachePositionRestoration(unittest.TestCase):
     """
 
     def setUp(self):
-        from sglang.srt.translator.qwen3_tts_compat import restore_cache_position
+        from flliper.srt.translator.qwen3_tts_compat import restore_cache_position
 
         self.restore = restore_cache_position
 
@@ -304,7 +304,7 @@ class TestResampleShim(unittest.TestCase):
     """
 
     def setUp(self):
-        from sglang.srt.translator.qwen3_tts_compat import librosa_resample
+        from flliper.srt.translator.qwen3_tts_compat import librosa_resample
 
         self.resample = librosa_resample
 

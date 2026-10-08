@@ -10,7 +10,7 @@ import types
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache import hicache_storage as hs  # noqa: E402
+from flliper.srt.mem_cache import hicache_storage as hs  # noqa: E402
 
 
 def _store(tmp_path, persistent=True):
@@ -32,7 +32,7 @@ def test_a_persistent_store_refuses_a_clear_without_force(tmp_path, caplog):
     with caplog.at_level(logging.ERROR):
         assert f.clear() is False
     assert (d / "ab" / "abcd.bin").exists(), "not a page removed"
-    assert "W166 Weg2L3ClearRefused" in caplog.text
+    assert "W166 PdFlipL3ClearRefused" in caplog.text
 
 
 def test_force_clears_it(tmp_path):
@@ -66,8 +66,8 @@ def test_clear_storage_passes_force_and_reads_the_refusal():
 
 
 def test_the_request_carries_force_and_the_planner_flushes_the_tree_only():
-    from sglang.srt.managers.io_struct import ClearHiCacheReqInput
-    from sglang.srt.planner.energy import CACHE_FLUSH_ENDPOINTS
+    from flliper.srt.managers.io_struct import ClearHiCacheReqInput
+    from flliper.srt.planner.energy import CACHE_FLUSH_ENDPOINTS
 
     assert ClearHiCacheReqInput().force is False
     assert ClearHiCacheReqInput(force=True).force is True
@@ -75,8 +75,8 @@ def test_the_request_carries_force_and_the_planner_flushes_the_tree_only():
 
 
 def test_the_scheduler_reports_the_refusal():
-    from sglang.srt.managers.io_struct import ClearHiCacheReqInput
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.io_struct import ClearHiCacheReqInput
+    from flliper.srt.managers.scheduler import Scheduler
 
     seen = []
     tree = types.SimpleNamespace(clear_storage_backend=lambda force=False: seen.append(force) or force)

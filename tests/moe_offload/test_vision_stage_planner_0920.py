@@ -50,7 +50,7 @@ import math
 
 import pytest
 
-from sglang.srt.planner import vision_stage as vs
+from flliper.srt.planner import vision_stage as vs
 
 GIB = vs.GIB
 MIB = vs.MIB
@@ -72,7 +72,7 @@ H2D_GBPS = {0: 14.4, 1: 6.5, 2: 13.3}
 #: fn8aj ``[vram-peak] decode`` -- the quietest state that boot sampled, the
 #: closest stand-in it carries for "idle, pools built, no prefill in flight".
 #: The real number for a stage placement is ``free_idle_mib``
-#: (weg2/corridor_budget.py:143); until a boot prints it for the P group,
+#: (pdflip/corridor_budget.py:143); until a boot prints it for the P group,
 #: these are what exist, and the tests say so rather than inventing better.
 FN8AJ_FREE_IDLE = {0: 0.65 * GIB, 1: 1.63 * GIB, 2: 2.09 * GIB}
 FN8AJ_FREE_LOAD = {0: 0.55 * GIB, 1: 0.85 * GIB, 2: 0.96 * GIB}

@@ -25,7 +25,7 @@ arithmetic can be re-run at a desk.
 
 import unittest
 
-from sglang.srt.managers.funding_authority import (
+from flliper.srt.managers.funding_authority import (
     CAUSE_FUNDED,
     CAUSE_GRANULARITY,
     CAUSE_PEER_VETO,
@@ -395,8 +395,8 @@ class TestUnsatisfiableFloor(unittest.TestCase):
     SHIPPED constants rather than quoted."""
 
     def test_shipped_defaults_make_the_arming_floor_unreachable(self):
-        from sglang.srt.managers import corridor_guard as cg
-        from sglang.srt.managers import phase_flip_seam_reserve as sr
+        from flliper.srt.managers import corridor_guard as cg
+        from flliper.srt.managers import phase_flip_seam_reserve as sr
 
         d = diagnose_floor_band(
             cg.arming_floor_mib(),
@@ -459,7 +459,7 @@ class TestRungAccessorContract(unittest.TestCase):
     """
 
     def test_rung_exposes_the_accessors_the_census_uses(self):
-        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+        from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
         self.assertTrue(callable(getattr(KvBackingRelief, "_min_release_rows", None)))
         import inspect
@@ -471,7 +471,7 @@ class TestRungAccessorContract(unittest.TestCase):
     def test_proposal_terms_carry_the_two_keys_the_census_reads(self):
         import inspect
 
-        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+        from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
         src = inspect.getsource(KvBackingRelief)
         # The census computes slack as current - floor_rows.
@@ -546,8 +546,8 @@ class TestSolveArmingFloor(unittest.TestCase):
     """B: the arming floor is the free variable; the corridor band is not."""
 
     def test_shipped_defaults_are_unsatisfiable_and_name_the_max_reserve(self):
-        from sglang.srt.managers import corridor_guard as cg
-        from sglang.srt.managers import phase_flip_seam_reserve as sr
+        from flliper.srt.managers import corridor_guard as cg
+        from flliper.srt.managers import phase_flip_seam_reserve as sr
 
         sol = solve_arming_floor(
             cg.corridor_band_floor_mib(),
@@ -603,6 +603,6 @@ class TestBreakEvenProvenance(unittest.TestCase):
 
     def test_7004_is_reproduced_by_the_shipped_inputs(self):
         """The number the ticket calls a seed, derived from its three inputs."""
-        from sglang.srt.managers.phase_policy import break_even_tokens
+        from flliper.srt.managers.phase_policy import break_even_tokens
 
         self.assertEqual(break_even_tokens(3.2, 1681.0, 7245.5), 7004)

@@ -9,93 +9,93 @@ der gleichzeitig Kalten -- egal wie oft getauscht wird.
 
 import pytest
 
-from sglang.srt.layers.moe.slot_ledger import (
+from flliper.srt.layers.moe.slot_ledger import (
     SlotExhausted,
     SlotLedger,
     ledger_for_cold_set,
 )
 
 
-def test_plaetze_nur_fuer_die_kalten():
+def test_slots_only_for_cold_ones():
     """Die Nutzer-Order: Plaetze fuer das, was NICHT auf einer Karte liegt."""
-    tafel = ledger_for_cold_set(range(154, 512))  # P bei fraction 0.30
-    assert tafel.capacity == 358
-    assert tafel.free_count == 0
-    assert tafel.slot_of(154) == 0 and tafel.slot_of(511) == 357
+    board = ledger_for_cold_set(range(154, 512))  # P bei fraction 0.30
+    assert board.capacity == 358
+    assert board.free_count == 0
+    assert board.slot_of(154) == 0 and board.slot_of(511) == 357
 
 
-def test_tausch_haelt_die_platzzahl_konstant():
+def test_swap_keeps_slot_count_constant():
     """DAS ist der Kern: 1000 Wechsel, und kein Platz kommt dazu."""
-    tafel = ledger_for_cold_set(range(100, 200))  # 100 Kalte
-    heiss, kalt = 100, 50
+    board = ledger_for_cold_set(range(100, 200))  # 100 Kalte
+    hot, cold_ids = 100, 50
     for i in range(1000):
-        slot = tafel.swap(heiss, kalt)
-        assert tafel.slot_of(kalt) == slot
-        assert tafel.slot_of(heiss) is None, "der Heisse liegt jetzt auf der Karte"
-        heiss, kalt = kalt, heiss
-    assert tafel.capacity == 100
-    assert len(tafel.as_map()) == 100
+        slot = board.swap(hot, cold_ids)
+        assert board.slot_of(cold_ids) == slot
+        assert board.slot_of(hot) is None, "der Heisse liegt jetzt auf der Karte"
+        hot, cold_ids = cold_ids, hot
+    assert board.capacity == 100
+    assert len(board.as_map()) == 100
 
 
-def test_tausch_gibt_genau_den_platz_des_heissen():
-    tafel = ledger_for_cold_set([7, 8, 9])
-    alt = tafel.slot_of(8)
-    assert tafel.swap(8, 42) == alt
-    assert tafel.slot_of(42) == alt
-    assert tafel.expert_at(alt) == 42
-    assert tafel.slot_of(8) is None
+def test_swap_gives_exactly_the_hot_ones_slot():
+    board = ledger_for_cold_set([7, 8, 9])
+    alt = board.slot_of(8)
+    assert board.swap(8, 42) == alt
+    assert board.slot_of(42) == alt
+    assert board.expert_at(alt) == 42
+    assert board.slot_of(8) is None
 
 
-def test_tausch_wenn_der_heisse_keinen_platz_hatte():
+def test_swap_when_hot_one_had_no_slot():
     """Lag er schon auf der Karte, ist es kein Tausch, sondern eine Vergabe."""
-    tafel = SlotLedger(4)
-    slot = tafel.swap(99, 5)  # 99 war nie im Store
-    assert tafel.slot_of(5) == slot
-    assert tafel.free_count == 3
+    board = SlotLedger(4)
+    slot = board.swap(99, 5)  # 99 war nie im Store
+    assert board.slot_of(5) == slot
+    assert board.free_count == 3
 
 
-def test_kalter_mit_eigenem_platz_gibt_ihn_zurueck():
-    tafel = ledger_for_cold_set([1, 2, 3])
-    assert tafel.free_count == 0
-    tafel.swap(1, 2)  # 2 hatte schon einen -- der wird frei
-    assert tafel.free_count == 1
-    assert len(tafel.as_map()) == 2
+def test_cold_with_own_slot_returns_it():
+    board = ledger_for_cold_set([1, 2, 3])
+    assert board.free_count == 0
+    board.swap(1, 2)  # 2 hatte schon einen -- der wird frei
+    assert board.free_count == 1
+    assert len(board.as_map()) == 2
 
 
-def test_volle_tafel_verweigert_statt_still_zu_verlieren():
+def test_full_table_refuses_instead_of_losing_silently():
     """Ein Experte ohne Platz waere der stille Verlust seiner Zeile."""
-    tafel = ledger_for_cold_set([1, 2])
+    board = ledger_for_cold_set([1, 2])
     with pytest.raises(SlotExhausted):
-        tafel.assign(3)
+        board.assign(3)
 
 
 def test_assign_ist_idempotent():
-    tafel = SlotLedger(8)
-    assert tafel.assign(5) == tafel.assign(5)
-    assert tafel.free_count == 7
+    board = SlotLedger(8)
+    assert board.assign(5) == board.assign(5)
+    assert board.free_count == 7
 
 
-def test_release_gibt_den_platz_wirklich_frei():
-    tafel = ledger_for_cold_set([4, 5])
-    slot = tafel.release(4)
-    assert slot is not None and tafel.free_count == 1
-    assert tafel.assign(6) == slot, "der freie Platz wird wiederverwendet"
+def test_release_really_frees_the_slot():
+    board = ledger_for_cold_set([4, 5])
+    slot = board.release(4)
+    assert slot is not None and board.free_count == 1
+    assert board.assign(6) == slot, "der freie Platz wird wiederverwendet"
 
 
-def test_release_eines_unbekannten_ist_kein_fehler():
+def test_release_of_unknown_is_not_an_error():
     assert SlotLedger(2).release(77) is None
 
 
-def test_zwei_prozesse_rechnen_dieselbe_belegung():
+def test_two_processes_compute_same_occupancy():
     """Ohne Absprache: gleiche Menge, gleiche Tafelgroesse -> gleiche Plaetze.
     Genau das braucht der geteilte Store (#91 Baustein 1)."""
-    kalt = [9, 3, 7, 1]
-    a = SlotLedger(4).assign_many(kalt)
-    b = SlotLedger(4).assign_many(reversed(kalt))
+    cold_ids = [9, 3, 7, 1]
+    a = SlotLedger(4).assign_many(cold_ids)
+    b = SlotLedger(4).assign_many(reversed(cold_ids))
     assert a == b
 
 
-def test_uebergabe_ueber_den_flip():
+def test_handover_across_the_flip():
     """Die Belegung muss den Wechsel der Gruppe ueberleben (Baustein 3)."""
     p = ledger_for_cold_set([10, 20, 30])
     d = SlotLedger(p.capacity, occupied=p.as_map())
@@ -105,42 +105,42 @@ def test_uebergabe_ueber_den_flip():
     assert d.slot_of(40) == p.slot_of(20)
 
 
-def test_kapazitaet_muss_positiv_sein():
+def test_capacity_must_be_positive():
     with pytest.raises(ValueError):
         SlotLedger(0)
 
 
-def test_doppelbelegung_wird_verweigert():
+def test_double_assignment_is_refused():
     with pytest.raises(ValueError):
         SlotLedger(4, occupied={1: 0, 2: 0})
 
 
-def test_platz_ausserhalb_der_tafel_wird_verweigert():
+def test_slot_outside_the_table_is_refused():
     with pytest.raises(ValueError):
         SlotLedger(4, occupied={1: 9})
 
 
-def test_tausch_mit_sich_selbst_ist_keiner():
+def test_swap_with_itself_is_none():
     with pytest.raises(ValueError):
         ledger_for_cold_set([1, 2]).swap(1, 1)
 
 
-def test_tausch_geht_nicht_ueber_die_freiliste():
+def test_swap_does_not_use_the_free_list():
     """Der Platz wandert DIREKT weiter. Ginge er ueber die Freiliste, bekaeme
     der Kalte den kleinsten freien statt genau des Platzes des Heissen -- und
     ein dritter Aufrufer koennte ihn dazwischen wegnehmen."""
-    tafel = SlotLedger(6, occupied={7: 3, 8: 4, 9: 5})
-    assert tafel.free_count == 3          # 0, 1, 2 sind frei und KLEINER
-    alt = tafel.slot_of(8)
-    assert tafel.swap(8, 42) == alt == 4
-    assert tafel.slot_of(42) == 4, "ueber die Freiliste waere es Platz 0 geworden"
+    board = SlotLedger(6, occupied={7: 3, 8: 4, 9: 5})
+    assert board.free_count == 3          # 0, 1, 2 sind frei und KLEINER
+    alt = board.slot_of(8)
+    assert board.swap(8, 42) == alt == 4
+    assert board.slot_of(42) == 4, "ueber die Freiliste waere es Platz 0 geworden"
 
 
-def test_vergabe_nimmt_den_kleinsten_freien_platz():
+def test_assign_takes_smallest_free_slot():
     """Eine frisch angelegte Datei wird von vorne gefuellt; die hinteren
     Seiten bleiben unberuehrt und kosten auf tmpfs nichts."""
-    tafel = SlotLedger(4)
-    tafel.assign(100)
-    tafel.assign(200)
-    tafel.release(100)
-    assert tafel.assign(300) == 0, "Platz 0 wurde frei und ist der kleinste"
+    board = SlotLedger(4)
+    board.assign(100)
+    board.assign(200)
+    board.release(100)
+    assert board.assign(300) == 0, "Platz 0 wurde frei und ist der kleinste"

@@ -16,9 +16,9 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.flashinfer_backend import fast_prefill_plan
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.attention.flashinfer_backend import fast_prefill_plan
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 try:
     from flashinfer import BatchPrefillWithPagedKVCacheWrapper

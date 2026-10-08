@@ -14,7 +14,7 @@ Two causes, both in ``UnifiedRadixCache._w3_arena_spill``:
 The fix (dual P layout only): the spill resolves the group's anchor pool and, when the
 device-resident round is not enough, spills host-only H-LEAVES (L3 copy first, then the
 leaf goes). Hermetic: the real C arena on a temp file, the real ArenaMHAHostPool, the
-real ``_weg2_direct_claim`` / ``_w3_arena_spill``; pages of 64 B, page_size 1.
+real ``_pdflip_direct_claim`` / ``_w3_arena_spill``; pages of 64 B, page_size 1.
 
 This file is deliberately written without importing the new module at the top: on the
 base the tests fail by BEHAVIOUR (the claim is refused), not by an import error."""
@@ -33,22 +33,22 @@ import torch  # noqa: E402
 sys.path.insert(0, os.path.dirname(__file__))
 import test_w3_arena_spill_0929 as W  # noqa: E402
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode  # noqa: E402
-from sglang.srt.weg2 import dual_p_kv_stage as PK  # noqa: E402
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedTreeNode  # noqa: E402
+from flliper.srt.pdflip import dual_p_kv_stage as PK  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
 FULL = W.FULL
 SLOTS = 8
-DUAL_P = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P", PK.MAX_TOKENS_ENV: "131072"}
+DUAL_P = {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P", PK.MAX_TOKENS_ENV: "131072"}
 NOT_DUAL_P = [
     {},
-    {"SGLANG_WEG2_GROUP": "P"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D", PK.MAX_TOKENS_ENV: "131072"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"},   # no P KV cap: not armed
+    {"FLLIPER_PDFLIP_GROUP": "P"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D", PK.MAX_TOKENS_ENV: "131072"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P"},   # no P KV cap: not armed
 ]
-GATE_KEYS = ("SGLANG_WEG2_DUAL_LAYOUT", "SGLANG_WEG2_GROUP", PK.MAX_TOKENS_ENV)
+GATE_KEYS = ("FLLIPER_PDFLIP_DUAL_LAYOUT", "FLLIPER_PDFLIP_GROUP", PK.MAX_TOKENS_ENV)
 
 
 def _env(monkeypatch, env):
@@ -102,7 +102,7 @@ def _host_only_tree(tmp_path, slots=SLOTS, refuse=(), group=True, chain=True):
     if group:
         g = _Group(p)
         t.cache_controller.mem_pool_host = g
-        t._weg2_direct_pool = lambda: g
+        t._pdflip_direct_pool = lambda: g
     nodes, parent = [], t.root_node
     for i in range(slots):
         rows = W._finished(p, arena, [f"a{i}"], 0x40 + i)
@@ -134,7 +134,7 @@ def test_group_pool_without_the_gate_stops_as_before_flip_unchanged(tmp_path, mo
         sub.mkdir()
         p, arena, root, t, nodes = _host_only_tree(sub)
         m = W._claimer(t)
-        assert t._weg2_direct_claim(m) is False, env
+        assert t._pdflip_direct_claim(m) is False, env
         assert t.refused == ["arena_claim"], env
         assert not list(root.iterdir()), env
         assert all(_in_tree(t, n) and n.component_data[FULL].host_value is not None for n in nodes), env
@@ -145,7 +145,7 @@ def test_plain_pool_host_only_nodes_stay_without_the_gate(tmp_path, monkeypatch)
     nodes stay -- their host copy is their only copy (the W3 rule, unchanged)."""
     _env(monkeypatch, {})
     p, arena, root, t, nodes = _host_only_tree(tmp_path, group=False)
-    assert t._weg2_direct_claim(W._claimer(t)) is False
+    assert t._pdflip_direct_claim(W._claimer(t)) is False
     assert all(_in_tree(t, n) for n in nodes)
     assert not list(root.iterdir())
 
@@ -158,7 +158,7 @@ def test_c_wedge_a_full_arena_of_host_only_nodes_spills_to_l3_and_the_claim_gets
     p, arena, root, t, nodes = _host_only_tree(tmp_path)
     caplog.set_level(logging.INFO)
     m = W._claimer(t)
-    pre = t._weg2_direct_claim(m)
+    pre = t._pdflip_direct_claim(m)
     assert pre is not False, f"claim refused: {t.refused}"
     assert pre is not None and int(pre.numel()) == 2
     gone = _spilled(nodes)
@@ -173,7 +173,7 @@ def test_c_wedge_a_full_arena_of_host_only_nodes_spills_to_l3_and_the_claim_gets
 def test_a_chain_is_spilled_leaf_first_and_the_parent_follows(tmp_path, monkeypatch):
     """Only an H-leaf may go; once it did, its parent is one and goes next."""
     _env(monkeypatch, DUAL_P)
-    from sglang.srt.weg2 import dual_arena_spill as D
+    from flliper.srt.pdflip import dual_arena_spill as D
 
     p, arena, root, t, nodes = _host_only_tree(tmp_path)
     got = D.spill_host_only(t, t.cache_controller.mem_pool_host.anchor_entry.host_pool, 3, 1, set())
@@ -186,7 +186,7 @@ def test_a_chain_is_spilled_leaf_first_and_the_parent_follows(tmp_path, monkeypa
 def test_siblings_go_in_node_id_order(tmp_path, monkeypatch):
     """The PP ranks' trees are replicas: every rank releases the same nodes."""
     _env(monkeypatch, DUAL_P)
-    from sglang.srt.weg2 import dual_arena_spill as D
+    from flliper.srt.pdflip import dual_arena_spill as D
 
     p, arena, root, t, nodes = _host_only_tree(tmp_path, chain=False)
     ids = sorted(n.id for n in nodes)
@@ -199,7 +199,7 @@ def test_siblings_go_in_node_id_order(tmp_path, monkeypatch):
 def test_a_page_without_an_l3_copy_is_never_released(tmp_path, monkeypatch):
     _env(monkeypatch, DUAL_P)
     p, arena, root, t, nodes = _host_only_tree(tmp_path, refuse=("a0_sfx",), chain=False)
-    t._weg2_direct_claim(W._claimer(t))
+    t._pdflip_direct_claim(W._claimer(t))
     assert _in_tree(t, nodes[0]) and nodes[0].component_data[FULL].host_value is not None
     assert not (root / "a0_sfx.bin").exists()
     assert any(not _in_tree(t, n) for n in nodes[1:])
@@ -207,7 +207,7 @@ def test_a_page_without_an_l3_copy_is_never_released(tmp_path, monkeypatch):
 
 def test_pending_write_host_lock_aux_state_and_children_keep_their_node(tmp_path, monkeypatch):
     _env(monkeypatch, DUAL_P)
-    from sglang.srt.weg2 import dual_arena_spill as D
+    from flliper.srt.pdflip import dual_arena_spill as D
 
     p, arena, root, t, nodes = _host_only_tree(tmp_path, chain=False)
     t.ongoing_write_through[nodes[1].id] = object()          # slots not COMPLETE yet
@@ -231,7 +231,7 @@ def test_device_resident_nodes_are_spilled_first_and_the_claimers_chain_stays(tm
     for n in nodes[:4]:                                      # four nodes still on the device
         n.component_data[FULL].value = torch.arange(1, dtype=torch.int64)
     m = W._claimer(t)
-    pre = t._weg2_direct_claim(m)
+    pre = t._pdflip_direct_claim(m)
     assert pre is not False, t.refused
     # the host-only ones: not needed for two slots once W3 gave the device ones back
     assert all(_in_tree(t, n) for n in nodes[4:])

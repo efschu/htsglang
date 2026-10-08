@@ -10,7 +10,7 @@ overclaim ("offload == MACHINE_ZERO vs no-offload") can never re-enter.
 
 SEED-PINNING DISCIPLINE (memory ``hetero-spec-determinismus``): every gate
 run -- reference, test, and rerun -- boots with the SAME pinned
-``--random-seed`` (:data:`PINNED_SEED`). sglang otherwise randomizes the
+``--random-seed`` (:data:`PINNED_SEED`). flliper otherwise randomizes the
 seed per boot (server_args: ``random.randint`` when unset), which silently
 degrades every comparison. Cross-boot near-tie sensitivity is pre-existing
 and expected; the pinned seed removes the avoidable part. Reruns for
@@ -35,7 +35,7 @@ __all__ = ["PINNED_SEED", "CaseSpec", "TEST_MATRIX", "EXCLUDED_CASES", "get_case
 
 #: The single pinned seed for ALL gate runs (ref, test, rerun). The value is
 #: arbitrary; what matters is that it is fixed, shared by every boot in a
-#: comparison, and never silently defaulted (sglang randomizes when unset).
+#: comparison, and never silently defaulted (flliper randomizes when unset).
 PINNED_SEED = 1234
 
 
@@ -50,14 +50,14 @@ class CaseSpec:
     #: lane vehicle (dense/GQA; on this box TP=3: 5090 head + 2 weightless
     #: 3080 workers), "moe_fp8" / "moe_marlin" = the offload vehicles.
     model_role: str
-    #: sglang server args (server_args field names) for the run under test.
+    #: flliper server args (server_args field names) for the run under test.
     test_config: Mapping[str, Any]
     #: env vars for the run under test. MUST be baked into the MAIN process
-    #: (pickled server args path) -- sglang scrubs custom env for scheduler
+    #: (pickled server args path) -- flliper scrubs custom env for scheduler
     #: TP workers, a worker-side env toggle is a silent no-op (memory
     #: ``full-perf-testen``).
     test_env: Mapping[str, str]
-    #: sglang server args for the reference run.
+    #: flliper server args for the reference run.
     reference_config: Mapping[str, Any]
     reference_env: Mapping[str, str]
     expected_class: ByteIdentityClass
@@ -272,13 +272,13 @@ TEST_MATRIX: List[CaseSpec] = [
         model_role="moe_fp8",
         # The offload machinery is eager-only BY DESIGN (data-dependent
         # per-forward residency plan; hard-gated in fused_moe_triton/layer.py
-        # against SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1 with graphs on), so
+        # against FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1 with graphs on), so
         # the valid comparison is eager-offload vs eager-no-offload
         # (common execution mode on both arms). The offload-x-graph question
         # is covered by the isolation gate tests/moe_offload/
         # test_capturable_gpu.py, see EXCLUDED_CASES.
         test_config=dict(_SOLO_EAGER_REF),
-        test_env={"SGLANG_MOE_RESIDENT_EXPERT_FRACTION": "0.25"},
+        test_env={"FLLIPER_MOE_RESIDENT_EXPERT_FRACTION": "0.25"},
         reference_config=dict(_SOLO_EAGER_REF),
         reference_env={},  # fraction unset = no offload
         expected_class=ByteIdentityClass.SELF_DET_NEAR_TIE,
@@ -311,7 +311,7 @@ TEST_MATRIX: List[CaseSpec] = [
         # Eager on both arms: offload is eager-only by design (see the
         # fp8_offload row comment).
         test_config=dict(_SOLO_EAGER_REF),
-        test_env={"SGLANG_MOE_RESIDENT_EXPERT_FRACTION": "0.25"},
+        test_env={"FLLIPER_MOE_RESIDENT_EXPERT_FRACTION": "0.25"},
         reference_config=dict(_SOLO_EAGER_REF),
         reference_env={},
         expected_class=ByteIdentityClass.SELF_DET_NEAR_TIE,
@@ -526,7 +526,7 @@ def validate_matrix() -> None:
         for cfg in (c.test_config, c.reference_config):
             assert cfg.get("random_seed") == PINNED_SEED, (
                 f"{c.case_id}: boot config missing pinned random_seed "
-                "(sglang randomizes when unset)"
+                "(flliper randomizes when unset)"
             )
         if c.expected_class is ByteIdentityClass.MACHINE_ZERO:
             assert c.band is None and c.near_tie_margin is None, (
@@ -559,7 +559,7 @@ def validate_matrix() -> None:
             )
         # The overclaim guard: no offload case may claim bit-exactness or
         # even argmax-clean identity vs. the no-offload reference.
-        if "offload" in c.case_id or "SGLANG_MOE_RESIDENT_EXPERT_FRACTION" in c.test_env:
+        if "offload" in c.case_id or "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION" in c.test_env:
             assert c.expected_class is ByteIdentityClass.SELF_DET_NEAR_TIE, (
                 f"{c.case_id}: offload vs no-offload is SELF_DET_NEAR_TIE, "
                 "never MACHINE_ZERO/DECODE_CLASS -- see EXCLUDED_CASES"

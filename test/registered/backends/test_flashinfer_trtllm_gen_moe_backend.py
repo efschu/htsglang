@@ -2,10 +2,10 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -26,7 +26,7 @@ class FlashinferTrtllmGenMoeBackendFP8Base:
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={**os.environ, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
+            env={**os.environ, "FLLIPER_ENABLE_JIT_DEEPGEMM": "False"},
             other_args=[
                 "--attention-backend",
                 "triton",
@@ -121,7 +121,7 @@ class FlashinferTrtllmGenMoeBackendMXFP8Base:
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={**os.environ, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
+            env={**os.environ, "FLLIPER_ENABLE_JIT_DEEPGEMM": "False"},
             other_args=[
                 "--fp8-gemm-backend",
                 "flashinfer_cutlass",
@@ -166,7 +166,7 @@ class FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base:
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={**os.environ, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
+            env={**os.environ, "FLLIPER_ENABLE_JIT_DEEPGEMM": "False"},
             other_args=[
                 "--kv-cache-dtype",
                 "bf16",
@@ -211,7 +211,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={**os.environ, **cls.extra_env, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
+            env={**os.environ, **cls.extra_env, "FLLIPER_ENABLE_JIT_DEEPGEMM": "False"},
             other_args=[
                 "--moe-runner-backend",
                 cls.backend,
@@ -255,7 +255,7 @@ class FlashinferTrtllmGenMoeBackendNvFp4OnlineBase:
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={**os.environ, **cls.extra_env, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
+            env={**os.environ, **cls.extra_env, "FLLIPER_ENABLE_JIT_DEEPGEMM": "False"},
             other_args=[
                 "--attention-backend",
                 "triton",
@@ -328,7 +328,7 @@ class TestFlashinferTrtllmGenMoeBackendBF16Routed(
 class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRouted(
     FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):
-    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
+    extra_env = {"FLLIPER_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm_routed"
 
 
@@ -340,7 +340,7 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4Online(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
         "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
-        "SGLANG_FP4_IGNORED_LAYERS": ",".join(
+        "FLLIPER_FP4_IGNORED_LAYERS": ",".join(
             ["shared_expert"]
             + [f"model.layers.{layer_id}" for layer_id in range(40, 48)]
         ),

@@ -24,13 +24,13 @@ and the help says the cache will be released. Whether it would have helped is a
 different question from whether we lied about doing it.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.server_args import ServerArgs
 
 
 def _handle(**over):
@@ -96,7 +96,7 @@ class TestTheHelpNoLongerPromisesUnconditionally(unittest.TestCase):
         annotation, which is what the first version of this test got wrong."""
         import argparse
 
-        parser = argparse.ArgumentParser(prog="sglang.launch_server")
+        parser = argparse.ArgumentParser(prog="flliper.launch_server")
         ServerArgs.add_cli_args(parser)
         help_text = ""
         for action in parser._actions:

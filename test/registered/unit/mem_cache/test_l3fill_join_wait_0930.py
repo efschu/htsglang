@@ -1,7 +1,7 @@
 """L3FILL-JOINED (2) (30.09., NF y4a ep36): a prefix read ended at its first
 JOINED stem -- another writer's open claim was a miss at once, and one such
 page cut a 1070-page prefix at 146. Now the fill waits (bounded by
-SGLANG_WEG2_L3FILL_JOIN_WAIT_MS, default 300) for the claim to complete, but
+FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS, default 300) for the claim to complete, but
 ONLY on a prefetch io thread (hicache-prefetch-io-<k>); the scheduler thread
 never waits."""
 
@@ -14,10 +14,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache import hicache_storage as hs
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache import hicache_storage as hs
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -63,7 +63,7 @@ def test_the_prefetch_io_thread_waits_for_a_claim_that_completes(tmp_path):
         assert arena.complete_slots([slot], [gen], [(0, TOTAL)]) == [1]
 
     threading.Thread(target=finish_later).start()
-    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(300):
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(300):
         out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
             be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
     assert out[1] == slot                 # base: None -- the prefix ended at p1
@@ -72,20 +72,20 @@ def test_the_prefetch_io_thread_waits_for_a_claim_that_completes(tmp_path):
 
 def test_the_scheduler_thread_never_waits(tmp_path):
     be, arena, slot, gen = _setup(tmp_path)
-    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(300):
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(300):
         assert hs.fill_join_wait_ms() == 0            # MainThread: no wait
         t0 = time.perf_counter()
         out = HiCacheFile.arena_fill_from_disk(be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True)
         took = time.perf_counter() - t0
     assert out[1] is None and out[2] is None and took < 0.25
-    assert _run_on("weg2-flip-lane", hs.fill_join_wait_ms) == 0
-    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(300):
+    assert _run_on("pdflip-flip-lane", hs.fill_join_wait_ms) == 0
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(300):
         assert _run_on("hicache-prefetch-io-3", hs.fill_join_wait_ms) == 300
 
 
 def test_a_claim_that_never_completes_is_a_miss_after_the_bound(tmp_path):
     be, arena, slot, gen = _setup(tmp_path)
-    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(80):
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(80):
         t0 = time.perf_counter()
         out = _run_on("hicache-prefetch-io-1", lambda: HiCacheFile.arena_fill_from_disk(
             be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))

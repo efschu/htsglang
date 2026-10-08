@@ -22,10 +22,10 @@ from unittest.mock import patch
 
 import torch
 
-import sglang.srt.speculative.eagle_worker_v2 as eagle_worker_v2
-from sglang.srt.speculative.eagle_worker_v2 import _broadcast_draft_picks
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.speculative.eagle_worker_v2 as eagle_worker_v2
+from flliper.srt.speculative.eagle_worker_v2 import _broadcast_draft_picks
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -44,11 +44,11 @@ class TestBroadcastDraftPicks(CustomTestCase):
         )
         return (
             patch(
-                "sglang.srt.distributed.get_tp_group",
+                "flliper.srt.distributed.get_tp_group",
                 return_value=fake_group,
             ),
             patch(
-                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                "flliper.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
         )
@@ -187,7 +187,7 @@ class TestAdaptiveAcceptFeedRatchet(CustomTestCase):
     """
 
     def test_eagle_sample_broadcasts_num_correct_drafts(self):
-        import sglang.srt.speculative.eagle_utils as eagle_utils
+        import flliper.srt.speculative.eagle_utils as eagle_utils
 
         tree = ast.parse(inspect.getsource(eagle_utils))
 
@@ -237,7 +237,7 @@ class TestAdaptiveAcceptFeedRatchet(CustomTestCase):
         )
 
     def test_adaptive_feed_derives_from_broadcast_accept_lens(self):
-        import sglang.srt.managers.scheduler_components.batch_result_processor as brp
+        import flliper.srt.managers.scheduler_components.batch_result_processor as brp
 
         tree = ast.parse(inspect.getsource(brp))
 
@@ -315,7 +315,7 @@ class TestAdaptiveAcceptFeedRatchet(CustomTestCase):
         # broadcast-derived accept counts checked above).
         import os
 
-        import sglang.srt.speculative as spec_pkg
+        import flliper.srt.speculative as spec_pkg
 
         offenders = []
         found_any = False
@@ -436,7 +436,7 @@ class TestMultiLayerPickSiteRatchet(CustomTestCase):
     """
 
     def _sites(self):
-        import sglang.srt.speculative.multi_layer_eagle_worker_v2 as ml
+        import flliper.srt.speculative.multi_layer_eagle_worker_v2 as ml
 
         tree = _annotate_parents(ast.parse(inspect.getsource(ml)))
         picks, broadcasts, rotations = [], [], []
@@ -528,9 +528,9 @@ class TestBroadcastAdoptsRank0Picks(CustomTestCase):
             broadcast=lambda t, src: t.copy_(next(payloads)),
         )
         with (
-            patch("sglang.srt.distributed.get_tp_group", return_value=fake_group),
+            patch("flliper.srt.distributed.get_tp_group", return_value=fake_group),
             patch(
-                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                "flliper.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
         ):
@@ -547,9 +547,9 @@ class TestBroadcastAdoptsRank0Picks(CustomTestCase):
             broadcast=lambda t, src: t.fill_(-1),
         )
         with (
-            patch("sglang.srt.distributed.get_tp_group", return_value=fake_group),
+            patch("flliper.srt.distributed.get_tp_group", return_value=fake_group),
             patch(
-                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                "flliper.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
         ):

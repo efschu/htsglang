@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -17,7 +17,7 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from flliper.srt.constants import HEALTH_CHECK_RID_PREFIX
 
 # ── Test helper classes (local only, never injected into sys.modules) ──
 
@@ -69,28 +69,28 @@ def setUpModule():
 
     stub_modules = {}
     for name in (
-        "sglang.srt.managers",
-        "sglang.srt.managers.io_struct",
-        "sglang.srt.server_args",
+        "flliper.srt.managers",
+        "flliper.srt.managers.io_struct",
+        "flliper.srt.server_args",
     ):
         if name not in __import__("sys").modules:
             stub_modules[name] = types.ModuleType(name)
 
     if stub_modules:
-        if "sglang.srt.managers.io_struct" in stub_modules:
-            stub_modules["sglang.srt.managers.io_struct"].GenerateReqInput = (
+        if "flliper.srt.managers.io_struct" in stub_modules:
+            stub_modules["flliper.srt.managers.io_struct"].GenerateReqInput = (
                 _GenerateReqInput
             )
-            stub_modules["sglang.srt.managers.io_struct"].EmbeddingReqInput = (
+            stub_modules["flliper.srt.managers.io_struct"].EmbeddingReqInput = (
                 _EmbeddingReqInput
             )
-        if "sglang.srt.server_args" in stub_modules:
-            stub_modules["sglang.srt.server_args"].ServerArgs = _ServerArgs
+        if "flliper.srt.server_args" in stub_modules:
+            stub_modules["flliper.srt.server_args"].ServerArgs = _ServerArgs
 
         _patcher = patch.dict("sys.modules", stub_modules)
         _patcher.start()
 
-    import sglang.srt.observability.request_metrics_exporter as _mod
+    import flliper.srt.observability.request_metrics_exporter as _mod
 
     FileRequestMetricsExporter = _mod.FileRequestMetricsExporter
     RequestMetricsExporter = _mod.RequestMetricsExporter

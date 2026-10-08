@@ -1,6 +1,6 @@
 """AC: a store claim ends on a trailing (mamba) anchor BELOW the all-pages caps.
 
-Metal (NF y3v 5327bdfa17, P log PP0, weg2-23-56, prompt 86598):
+Metal (NF y3v 5327bdfa17, P log PP0, pdflip-23-56, prompt 86598):
 
 * 01:08:59 ``#1028B FETCH CAP n=5: kv=1350 claimed=716 caps={mamba: 1350,
   qsa_indexer: 716} ... anchors_in_range {mamba: (26, 1349), qsa_indexer:
@@ -12,7 +12,7 @@ Metal (NF y3v 5327bdfa17, P log PP0, weg2-23-56, prompt 86598):
   mamba: (0, -1)``, identical KV presence = identical key form) and cut told
   to 0 -- correctly: there was no anchor below the hole. The read had loaded
   716 KV pages (45824 tokens, ~328 MB on PP0) for nothing.
-* Same shape on y3u 5bedac26f1 PP0 00:36:06, weg2-0-5: ``claimed=47 caps=
+* Same shape on y3u 5bedac26f1 PP0 00:36:06, pdflip-0-5: ``claimed=47 caps=
   {mamba: 1996, qsa_indexer: 47}`` -> clamp ``completed=3008 anchored=0``.
 
 The trailing-pages contract is "the last pages OF THE FINAL PREFIX": the
@@ -33,7 +33,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import (  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import (  # noqa: E402
     HiCacheFile,
     HiCacheStorageConfig,
     PoolHitPolicy,
@@ -83,7 +83,7 @@ def test_the_claim_ends_on_the_deepest_anchor_below_the_qsa_hole(order):
 
 
 def test_no_anchor_below_the_hole_claims_nothing():
-    """weg2-23-56 / weg2-0-5: every anchor sits beyond the hole. RED: 10
+    """pdflip-23-56 / pdflip-0-5: every anchor sits beyond the hole. RED: 10
     stateless pages claimed and read. GREEN: 0, nothing read."""
     with tempfile.TemporaryDirectory() as d:
         res = _store(d, mamba_at={15, 19}, qsa_upto=10).batch_exists_v2(KEYS, [_mamba(), _qsa()])

@@ -8,10 +8,10 @@ from typing import List
 import torch
 from tqdm import tqdm
 
-from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
+from flliper.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
     Hf3fsLocalMetadataClient,
 )
-from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
+from flliper.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 
 
 def print_stats(x: List[int]):

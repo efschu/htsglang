@@ -1,0 +1,561 @@
+"""L15-12 wake side of the L1.5 hold: pure decision and check logic.
+
+At D's wake every rank reads the manifest its sleep wrote
+(``load_for_wake``). The caller collects the group's min/max fingerprint
+(the collective is the caller's job) and every rank reaches the same
+verdict via ``verdict``: "hold" keeps the hold, "fallback" drops it
+group-wide (today's empty tree), "none" means nobody holds anything.
+
+On "hold" the 3080 ranks kept their rows mapped (TMS keep spans); TP0
+(cap 0, the 5090) kept nothing and refills its owned rows from L2 via
+``refill_plan``. Ownership follows the l15_compact.owner_of rule: rank r
+owns global slot L iff prefix[r] <= L % S < prefix[r+1], S = prefix[-1];
+compact row = (L // S) * (prefix[r+1] - prefix[r]) + (L % S - prefix[r]).
+Before the first admission, ``sample_rows`` picks a deterministic subset
+to compare against L2; ``check_line`` and ``restore_line`` format it.
+"""
+
+import dataclasses
+from typing import Callable, List, Optional, Sequence, Tuple
+
+from flliper.srt.pdflip.l15_manifest import Manifest, decide, read_and_clear
+
+
+def load_for_wake(
+    path: str, pid_alive: Optional[Callable[[int], bool]] = None
+) -> Optional[Manifest]:
+    """Manifest written by this rank's sleep, or None when nothing is
+    held (absent file, or owning pid dead -> reaped by the read).
+
+    READ-AND-CLEAR: the manifest's lifetime is one sleep-wake pair, so the
+    file is unlinked as soon as it is read -- a stale record from an earlier
+    sleep cannot re-vote at this wake or any later one, and that
+    consumption is what makes the absent wake-epoch comparison moot (only
+    this sleep's record can ever be what the wake reads)."""
+    if pid_alive is None:
+        return read_and_clear(path)
+    return read_and_clear(path, pid_alive=pid_alive)
+
+
+def verdict(
+    local_fp: Optional[int], min_fp: Optional[int], max_fp: Optional[int]
+) -> str:
+    """"none" when nobody holds; "fallback" when the group is mixed (None
+    mixed with ints) or decide() says so; else "hold"."""
+    vals = (local_fp, min_fp, max_fp)
+    if all(v is None for v in vals):
+        return "none"
+    if any(v is None for v in vals):
+        return "fallback"
+    return decide(min_fp, max_fp)
+
+
+class L15RefillError(RuntimeError):
+    """Refill could not be performed as one whole operation.
+
+    The caller folds this into the wake's gather as a bad vote; a partial
+    copy is never reported as success. Defined here (not in l15_refill)
+    because the plan builders below raise it for a plan that cannot be
+    built at all; l15_refill re-exports it, so every existing
+    ``l15_refill.L15RefillError`` site keeps working -- no cycle:
+    l15_refill imports this module, never the reverse."""
+
+
+def _owns(prefix: Sequence[int], rank: int, slot: int) -> bool:
+    lo = slot % prefix[-1]
+    return prefix[rank] <= lo < prefix[rank + 1]
+
+
+def _compact_row(prefix: Sequence[int], rank: int, slot: int) -> int:
+    width = prefix[rank + 1] - prefix[rank]
+    return (slot // prefix[-1]) * width + (slot % prefix[-1] - prefix[rank])
+
+
+def _owned_tokens(m: Manifest, rank: int, prefix: Sequence[int]):
+    for span in m.spans:
+        for i, slot in enumerate(span.slots):
+            if _owns(prefix, rank, slot):
+                yield span, i, slot
+
+
+def _l2_source(span, i: int) -> Optional[Tuple[int, int]]:
+    """(l2_slot, l2_gen) for token i, or None when it has no L2 entry."""
+    if i < len(span.l2_slots) and i < len(span.l2_gens):
+        slot = span.l2_slots[i]
+        if slot is not None and slot >= 0:
+            return slot, span.l2_gens[i]
+    return None
+
+
+#: L15-PLAN-CACHE (N6k: the wake's refill plan + sample rebuilt owned_l2_rows
+#: from the manifest on the resume RPC -- ~80 ms per 47k / ~230 ms per 133k
+#: held tokens per call, on TP0's path that every peer's fence waits for).
+#: One entry: (fingerprint, rank, prefix) -> rows; warmed at the sleep.
+_PLAN_CACHE: dict = {}
+
+
+def _plan_key(m: Manifest, rank: int, prefix: Sequence[int]):
+    """Cache key of the plan: the manifest CONTENT, not its epoch stamp.
+
+    L15-PLAN-KEY-NO-EPOCH (item 470, 27B y8r 09:14:13 / 09:17:44): the plan
+    (row, l2_slot, l2_gen, lane, rids) is a function of the spans only, but
+    ``fingerprint`` (the group agreement) also hashes ``m.epoch``. A D sleep
+    is two flushes; the second REUSES the first round and ``restamp`` writes
+    the release's flip epoch into the published manifest (L15-SLEEP1X). The
+    plan warmed at the first flush was keyed with the old epoch, the wake
+    read the restamped manifest, missed, and rebuilt the plan on the resume
+    RPC: ``L15-REFILL ... steps=plan:972`` / ``plan:844`` (54k rows, 198k
+    held tokens of 7 TREE-CAND tips) against ``plan:21..58`` on the unstamped
+    holds -- every peer's fence waited for it (P>D layer +1 s, once even a
+    fallback after the wait). The epoch is therefore zeroed in the key."""
+    from flliper.srt.pdflip.l15_manifest import fingerprint
+
+    return (
+        int(fingerprint(dataclasses.replace(m, epoch=0))),
+        int(rank),
+        tuple(int(x) for x in prefix),
+    )
+
+
+def owned_l2_rows(
+    m: Manifest, rank: int, prefix: Sequence[int],
+) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
+    """Cached :func:`owned_l2_rows_uncached` (same manifest content, rank and
+    prefix -> the same rows; the rows are immutable tuples)."""
+    try:
+        key = _plan_key(m, rank, prefix)
+    except Exception:  # noqa: BLE001 -- an odd manifest: compute directly
+        return owned_l2_rows_uncached(m, rank, prefix)
+    hit = _PLAN_CACHE.get(key)
+    if hit is not None:
+        return list(hit)
+    rows = owned_l2_rows_uncached(m, rank, prefix)
+    _PLAN_CACHE.clear()
+    _PLAN_CACHE[key] = tuple(rows)
+    return rows
+
+
+#: 540 PLAN-WARM-DEFER: poll step of the deferred warm thread (s)
+_WARM_POLL_S = 0.02
+
+
+def warm_defer_s() -> float:
+    """540: how long the warm thread waits for ``ready`` at most (s); 0 = start
+    at once (the pre-540 form)."""
+    try:
+        from flliper.srt.environ import envs
+
+        return max(0.0, float(envs.FLLIPER_PDFLIP_L15_PLAN_WARM_DEFER_S.get()))
+    except Exception:  # noqa: BLE001
+        return 5.0
+
+
+def warm_plan_async(m: Manifest, rank: int, prefix: Sequence[int],
+                    ready: Optional[Callable[[], bool]] = None,
+                    defer_s: Optional[float] = None) -> None:
+    """Build the wake's plan in a daemon thread after the sleep (P's phase
+    lasts seconds; the wake then finds it cached). Never raises.
+
+    540 PLAN-WARM-DEFER (27B y8r 55c95a89c7): the plan is a pure-Python walk
+    over every held token (~0.6-0.9 s at 150k held rows). Started inside the
+    sleep flush it competes for the GIL with the rest of the D>P sleep leg
+    on the same process (release flush, kv pause) -- the flip's critical
+    path. With ``ready`` (the scheduler passes "D is dormant") the thread
+    first waits until it holds, at most ``defer_s`` (``warm_defer_s``), and
+    only then builds: the work lands in P's phase, where D's scheduler
+    thread is idle."""
+    import threading
+    import time as _time
+
+    wait_s = warm_defer_s() if defer_s is None else max(0.0, float(defer_s))
+
+    def _run():
+        if ready is not None and wait_s > 0:
+            t_end = _time.monotonic() + wait_s
+            while _time.monotonic() < t_end:
+                try:
+                    if ready():
+                        break
+                except Exception:  # noqa: BLE001 -- an unreadable flag: build now
+                    break
+                _time.sleep(_WARM_POLL_S)
+        try:
+            owned_l2_rows(m, rank, prefix)
+        except Exception:  # noqa: BLE001 -- the wake computes it then
+            pass
+
+    try:
+        threading.Thread(target=_run, name="l15-plan-warm", daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def owned_l2_rows_reference(
+    m: Manifest, rank: int, prefix: Sequence[int],
+) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
+    """Every L2-backed row this rank must refill, ONCE per compact row.
+
+    This is the ONE dedupe all plan builders share (refill_plan,
+    refill_plan_laned, the wake's refill ACT and sample check): held spans
+    that share a radix path share the prefix's device slot (compact_plan
+    F7 planned it once), so the spans x tokens walk visits the same
+    compact row once per sharing span, each time with the IDENTICAL
+    recorded (l2_slot, l2_gen, lane). Returning the row once is what lets
+    the refill load it once -- refusing the second, identical occurrence
+    (the old l15_refill "duplicate page slot") made every multi-rid hold
+    with a shared system prompt vote None and fall back.
+
+    Entries come in first-appearance order as ``(compact_row, l2_slot,
+    l2_gen, lane, rids)``; ``rids`` names EVERY span rid that landed on
+    the row (first-appearance order, the leading tag is the first rid),
+    because a generation mismatch must drop each referencing request
+    WHOLE -- the whole rid set therefore travels with the row into
+    gen_check. A row whose two visits recorded DIFFERENT identities is a
+    real conflict -- the one destination row cannot come from two sources
+    -- and raises L15RefillError naming row and both sources, never a
+    silent first-wins. Tokens whose span carries no L2 source are skipped
+    (count_missing counts them per token still)."""
+    entries: List[List] = []
+    by_row: dict = {}
+    for span, i, slot in _owned_tokens(m, rank, prefix):
+        src = _l2_source(span, i)
+        if src is None:
+            continue
+        lanes = getattr(span, "l2_lanes", ())  # pre-P1 records/records
+        lane = lanes[i] if i < len(lanes) else -1  # without lanes at all
+        row = _compact_row(prefix, rank, slot)
+        ident = (int(src[0]), int(src[1]), int(lane))
+        ent = by_row.get(row)
+        if ent is None:
+            ent = [row, ident[0], ident[1], ident[2], [str(span.rid)]]
+            by_row[row] = ent
+            entries.append(ent)
+        elif tuple(ent[1:4]) != ident:
+            raise L15RefillError(
+                "refill plan: row %d claimed by two L2 sources: "
+                "(slot %d, gen %d, lane %d) via rid %s vs "
+                "(slot %d, gen %d, lane %d) via rid %s"
+                % (row, ent[1], ent[2], ent[3], ",".join(ent[4]),
+                   ident[0], ident[1], ident[2], str(span.rid)))
+        elif str(span.rid) not in ent[4]:
+            ent[4].append(str(span.rid))
+    return [(e[0], e[1], e[2], e[3], tuple(e[4])) for e in entries]
+
+
+def _owned_l2_rows_np(
+    m: Manifest, rank: int, prefix: Sequence[int],
+):
+    """L15-PLAN-NP (item 470): :func:`owned_l2_rows_reference` as numpy.
+
+    27B y8r 09:14:13: ``plan:972`` ms for 198k held tokens (7 TREE-CAND tips
+    sharing their prefix) -- a per-token Python walk with a generator, two
+    helper calls and a dict probe each, ~5 us/token, slower still beside the
+    scheduler threads. The same answer as arrays: owned mask, compact row,
+    first-appearance order (``np.unique`` first index), identity check against
+    the first occurrence, and the rid tuple from a per-row span bitmask.
+    Returns None when a case needs the reference (a conflicting identity -- it
+    raises there with the exact message -- more than 62 spans, or odd data)."""
+    import numpy as np
+
+    spans = m.spans
+    if not spans or len(spans) > 62:
+        return None
+    s_tot = int(prefix[-1])
+    lo = int(prefix[rank])
+    width = int(prefix[rank + 1]) - lo
+    rows_p, l2s_p, l2g_p, lane_p, spi_p = [], [], [], [], []
+    for k, span in enumerate(spans):
+        slots = np.asarray(span.slots, dtype=np.int64)
+        n = int(slots.shape[0])
+        if n == 0:
+            continue
+        m_src = min(len(span.l2_slots), len(span.l2_gens), n)
+        if m_src == 0:
+            continue
+        l2s = np.asarray(span.l2_slots[:m_src], dtype=np.int64)
+        l2g = np.asarray(span.l2_gens[:m_src], dtype=np.int64)
+        lanes = np.full(m_src, -1, dtype=np.int64)
+        lv = getattr(span, "l2_lanes", ())
+        if len(lv):
+            lk = min(len(lv), m_src)
+            lanes[:lk] = np.asarray(lv[:lk], dtype=np.int64)
+        sl = slots[:m_src]
+        lo_s = sl % s_tot
+        sel = (lo_s >= lo) & (lo_s < lo + width) & (l2s >= 0)
+        if not bool(sel.any()):
+            continue
+        sl, lo_s = sl[sel], lo_s[sel]
+        rows_p.append((sl // s_tot) * width + (lo_s - lo))
+        l2s_p.append(l2s[sel])
+        l2g_p.append(l2g[sel])
+        lane_p.append(lanes[sel])
+        spi_p.append(np.full(sl.shape[0], k, dtype=np.int64))
+    if not rows_p:
+        return []
+    rows = np.concatenate(rows_p)
+    l2s = np.concatenate(l2s_p)
+    l2g = np.concatenate(l2g_p)
+    lane = np.concatenate(lane_p)
+    spi = np.concatenate(spi_p)
+    uniq, first, inv = np.unique(rows, return_index=True, return_inverse=True)
+    # a row visited again with ANOTHER identity is a real conflict: the
+    # reference raises it with row, both sources and rids
+    if (np.any(l2s != l2s[first][inv]) or np.any(l2g != l2g[first][inv])
+            or np.any(lane != lane[first][inv])):
+        return None
+    mask = np.zeros(uniq.shape[0], dtype=np.int64)
+    np.bitwise_or.at(mask, inv, np.left_shift(np.int64(1), spi))
+    order = np.argsort(first, kind="stable")  # first-appearance order
+    rids_of: dict = {}
+
+    def _rids(mk: int) -> Tuple[str, ...]:
+        hit = rids_of.get(mk)
+        if hit is None:
+            out: List[str] = []
+            for k in range(len(spans)):
+                if (mk >> k) & 1:
+                    r = str(spans[k].rid)
+                    if r not in out:
+                        out.append(r)
+            hit = tuple(out)
+            rids_of[mk] = hit
+        return hit
+
+    f_idx = first[order]
+    return [
+        (int(r), int(a), int(b), int(c), _rids(int(mk)))
+        for r, a, b, c, mk in zip(
+            uniq[order].tolist(), l2s[f_idx].tolist(), l2g[f_idx].tolist(),
+            lane[f_idx].tolist(), mask[order].tolist())
+    ]
+
+
+def owned_l2_rows_uncached(
+    m: Manifest, rank: int, prefix: Sequence[int],
+) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
+    """:func:`owned_l2_rows_reference` through the numpy plan; any case the
+    arrays do not cover (conflict, odd data) runs the reference."""
+    try:
+        got = _owned_l2_rows_np(m, rank, prefix)
+    except Exception:  # noqa: BLE001 -- odd manifest: the reference decides
+        got = None
+    if got is not None:
+        return got
+    return owned_l2_rows_reference(m, rank, prefix)
+
+
+def rid_tagged_plan(
+    m: Manifest, rank: int, prefix: Sequence[int],
+) -> List[Tuple[Tuple[str, ...], int, int, int]]:
+    """The refill ACT's plan: owned_l2_rows' rows as
+    ``(rids, compact_row, l2_slot, l2_gen)`` -- the full rid tuple travels
+    with a shared row so gen_check drops EVERY sharing rid on a generation
+    mismatch, never just the first tag."""
+    return [(rids, row, slot, gen)
+            for row, slot, gen, _lane, rids in owned_l2_rows(m, rank, prefix)]
+
+
+def refill_plan(
+    m: Manifest, rank: int, prefix: Sequence[int],
+    cap_rows_by_rank: Sequence[int],
+) -> List[Tuple[int, int, int]]:
+    """Rows rank must refill from L2 as (compact_row, l2_slot, l2_gen),
+    each row ONCE (shared-prefix rows deduped by owned_l2_rows).
+
+    Invariant (cap > 0 = resident): ``cap_rows_by_rank[rank] > 0`` means
+    this rank KEPT its rows mapped on the TMS keep spans through the hold,
+    so it owns no gap to refill and the plan is ``[]`` -- even a rank that
+    owns slots. Only a cap-0 rank (TP0, the 5090: held nowhere, refilled
+    from L2) gets a non-empty plan, naming exactly its L2-backed rows. A
+    future PARTIAL-hold variant (a rank that keeps only some of its rows)
+    must change this function: the ``cap > 0 -> []`` shortcut assumes
+    "kept everything", not "kept some".
+
+    Tokens without an L2 entry are skipped here and counted by
+    count_missing()."""
+    if cap_rows_by_rank[rank] > 0:
+        return []
+    return [(row, slot, gen)
+            for row, slot, gen, _lane, _rids in owned_l2_rows(m, rank, prefix)]
+
+
+def count_missing(m: Manifest, rank: int, prefix: Sequence[int]) -> int:
+    return sum(
+        1 for span, i, _ in _owned_tokens(m, rank, prefix)
+        if _l2_source(span, i) is None
+    )
+
+
+def sample_rows(plan_or_rows, k: int = 64) -> List[int]:
+    """Deterministic, evenly spaced subset of row ids (stable across
+    runs): accepts (compact_row, ...) tuples or plain row ids."""
+    rows = sorted({x[0] if isinstance(x, tuple) else x for x in plan_or_rows})
+    n = len(rows)
+    if n <= k:
+        return rows
+    return [rows[(j * n) // k] for j in range(k)]
+
+
+def check_line(rank: int, ok: int, bad: int, missing: int) -> str:
+    return "L15-CHECK rank=%d ok=%d bad=%d missing=%d" % (
+        rank, ok, bad, missing,
+    )
+
+
+def restore_line(
+    epoch: int, verdict: str, rows_by_rank: Sequence[int],
+    refill_rows: int, missing: int,
+) -> str:
+    # rows_by_rank is the manifest's per-rank KEEP capacity (not the
+    # admitted rows of a HoldSet); printed as keep_rows_by_rank so the
+    # two never clash under the same log key.
+    rows = ",".join(str(x) for x in rows_by_rank)
+    return (
+        "L15-RESTORE epoch=%d verdict=%s keep_rows_by_rank=%s "
+        "refill_rows=%d missing=%d"
+        % (epoch, verdict, rows, refill_rows, missing)
+    )
+
+
+def l15_fp_reduce(
+    votes: Sequence[Optional[int]],
+) -> Tuple[Optional[Tuple[int, int]], bool]:
+    """Reduce the group's per-rank manifest fingerprints (L15-12 part 2).
+
+    ``votes`` is one entry per rank of the group: an int fingerprint when that
+    rank read its sleep manifest, ``None`` when it held nothing (master off,
+    or the manifest was absent / its owning process died).
+
+    Returns ``(minmax, mixed)`` where:
+      * ``minmax`` is ``(min, max)`` over the int votes, or ``None`` when no
+        rank had a fingerprint (the group holds nothing).
+      * ``mixed`` is True when some ranks had an int and at least one had
+        ``None``: the group disagrees on whether a hold exists at all, which
+        the wake site maps to "fallback" (a split hold cannot be kept whole).
+
+    Pure over the vote list (no I/O, no process group) so it is unit-testable
+    and its result is group-uniform: every rank passes the same ``gathered``
+    list and therefore computes the same ``(minmax, mixed)``.
+    """
+    ints = [v for v in votes if isinstance(v, int) and not isinstance(v, bool)]
+    if not ints:
+        return None, False
+    return (min(ints), max(ints)), (len(ints) != len(votes))
+
+
+@dataclasses.dataclass(frozen=True)
+class GroupCheck:
+    """ONE group decision from the wake's sample-check votes (L15-12c-E1).
+
+    Field values are order-independent aggregates of the gathered vote
+    list, so every rank that passes the same list computes an equal
+    GroupCheck (group-uniformity, same discipline as l15_fp_reduce)."""
+
+    refuse: bool
+    drop_rids: Tuple[str, ...]
+    fp_mixed: bool
+    verdict: str
+    bad_ranks: Tuple[int, ...]
+
+
+def check_vote(
+    fp: Optional[int], ok: int, bad: int, missing: int,
+    drop_rids: Sequence[str],
+) -> Tuple[Optional[int], int, int, int, Tuple[str, ...]]:
+    """Per-rank payload for the wake's check gather (plan section 4):
+    plain ints plus a sorted tuple of str rids -- picklable and
+    deterministic, so the gathered list replays identically everywhere."""
+    return (
+        None if fp is None else int(fp),
+        int(ok), int(bad), int(missing),
+        tuple(sorted({str(r) for r in drop_rids})),
+    )
+
+
+def group_check(votes: Sequence[Optional[tuple]]) -> GroupCheck:
+    """Reduce one vote per rank (None = that rank had no hold; else a
+    check_vote tuple) into the single group decision (plan section 4):
+
+      * bad > 0 on ANY rank -> the whole group refuses (F11 "mismatch =
+        stop"), the group stays DORMANT together;
+      * drop_rids is the sorted UNION over all ranks -- dropped on all
+        ranks together, never rank-local;
+      * fp_mixed: the fingerprints disagree, or some ranks hold and others
+        do not (l15_fp_reduce's split-hold rule) -> "fallback";
+      * verdict order: refuse > fallback > hold (any rank held) > none.
+
+    Pure over the vote list; sorting every aggregate makes the result
+    identical for any order of the same votes."""
+    bad_ranks = tuple(
+        i for i, v in enumerate(votes) if v is not None and int(v[2]) > 0
+    )
+    drops = set()
+    fps = []
+    for v in votes:
+        if v is None:
+            fps.append(None)
+        else:
+            fps.append(v[0])
+            drops.update(v[4])
+    present = {f for f in fps if f is not None}
+    fp_mixed = len(present) > 1 or (bool(present) and any(f is None for f in fps))
+    held = any(f is not None for f in fps)
+    if bad_ranks:
+        verdict = "refuse"
+    elif fp_mixed:
+        verdict = "fallback"
+    elif held:
+        verdict = "hold"
+    else:
+        verdict = "none"
+    return GroupCheck(
+        refuse=bool(bad_ranks), drop_rids=tuple(sorted(drops)),
+        fp_mixed=fp_mixed, verdict=verdict, bad_ranks=bad_ranks,
+    )
+
+
+def refusal_message(gc: GroupCheck, epoch: int) -> str:
+    """The named refusal -- one string every rank raises identically after
+    the gather (F11): identical inputs give identical text by construction."""
+    return "L15-CHECK REFUSED epoch=%d bad_ranks=%s" % (
+        epoch, ",".join(str(i) for i in gc.bad_ranks),
+    )
+
+
+def owned_held_rows(m: Manifest, rank: int, prefix: Sequence[int]) -> int:
+    """Distinct held slots of ``m`` this rank owns (shared prefixes once)."""
+    s = int(prefix[-1])
+    lo, hi = int(prefix[rank]), int(prefix[rank + 1])
+    seen = set()
+    for sp in m.spans:
+        for slot in sp.slots:
+            if lo <= int(slot) % s < hi:
+                seen.add(int(slot))
+    return len(seen)
+
+
+def hostbytes_line(m: Optional[Manifest], rank: int, prefix: Sequence[int],
+                   cap_rows: int, cell_bytes: int, anchor_bytes: int,
+                   verdict: str, epoch: int, parked: bool = False) -> str:
+    """L15-HOSTBYTES (user law 02.10.: with L15 the flip must move FEWER host
+    bytes): per rank and wake, the bytes that did NOT cross the host because
+    they stayed on the card (h2d_saved: KV rows + anchor shares of a capped
+    rank on verdict hold), the bytes still loaded from L2 (h2d_refill: the
+    cap-0 rank's owned held rows), and d2h_saved (the sleep's write-through
+    of held rows -- still issued today, so 0)."""
+    rows = owned_held_rows(m, rank, prefix) if m is not None else 0
+    anchors = len({int(sp.anchor_slot) for sp in m.spans}) if m is not None else 0
+    kv = rows * int(cell_bytes)
+    an = anchors * int(anchor_bytes)
+    keep = verdict == "hold"
+    if int(cap_rows) > 0:
+        saved, refill = (kv + an if keep else 0), 0
+    elif parked:
+        # L15-16: the cap-0 rank's KV came back card to card, anchors from L2
+        saved, refill = (kv if keep else 0), (an if keep else 0)
+    else:
+        saved, refill = 0, (kv + an if keep else 0)
+    return ("L15-HOSTBYTES flip=%d rank=%d verdict=%s rows=%d anchors=%d "
+            "h2d_saved=%d h2d_refill=%d d2h_saved=0 parked=%d"
+            % (int(epoch), int(rank), verdict, rows, anchors, saved, refill,
+               int(bool(parked))))

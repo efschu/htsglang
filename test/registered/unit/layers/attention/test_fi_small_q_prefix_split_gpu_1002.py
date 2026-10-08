@@ -27,7 +27,7 @@ import torch
 if not torch.cuda.is_available():  # pragma: no cover - desk
     pytest.skip("needs CUDA", allow_module_level=True)
 
-from sglang.srt.layers.attention import fi_jit_cache_check as _jit  # noqa: E402
+from flliper.srt.layers.attention import fi_jit_cache_check as _jit  # noqa: E402
 
 _JIT_OK, _JIT_LINES = _jit.check_prefill_modules(("bf16", "e4m3"))
 if not _JIT_OK:  # pragma: no cover
@@ -35,7 +35,7 @@ if not _JIT_OK:  # pragma: no cover
 
 flashinfer = pytest.importorskip("flashinfer")
 
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 QO, HQ, HKV, HD = 5, 24, 4, 256
 WS_BYTES = 384 * 1024 * 1024

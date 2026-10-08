@@ -5,21 +5,21 @@ from __future__ import annotations
 import unittest
 from typing import ClassVar
 
-from sglang.srt.kv_canary.config import CanaryMode
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+from flliper.srt.kv_canary.config import CanaryMode
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.e2e_base import CanaryE2EBase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=101, stage="extra-a", runner_config="1-gpu-small-amd")
 
 _SPEC_EAGLE_TOKEN_ORACLE_ENV = {
-    "SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT": "0",
-    "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",
-    "SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT": "0",
+    "FLLIPER_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT": "0",
+    "FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",
+    "FLLIPER_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT": "0",
 }
 _SPEC_EAGLE_REVERT_PR_ENV = {
     **_SPEC_EAGLE_TOKEN_ORACLE_ENV,
-    "SGLANG_DEBUG_REVERT_PR": "25015",
+    "FLLIPER_DEBUG_REVERT_PR": "25015",
 }
 _CUDA_GRAPH_MAX_BS = 1
 _EAGER_DRAFT_REQUEST_COUNT = 20

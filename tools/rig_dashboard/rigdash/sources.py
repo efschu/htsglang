@@ -1,4 +1,4 @@
-"""Non-log sources: NVML (the cards; nvidia-smi until 30.09.), the Docker host, the weg2 front, gpuq.
+"""Non-log sources: NVML (the cards; nvidia-smi until 30.09.), the Docker host, the pdflip front, gpuq.
 
 Since 30.09. ~22Z they run in the sampler process (sampler.py); the web server reads what they
 published through ``SourcesReader`` and measures nothing itself.
@@ -12,7 +12,7 @@ Nothing here writes to or requests work from a model server:
 * nvidia-smi is a query of the driver (no CUDA context is created, so the
   dashboard never pins the driver the way the old planner did).
 * the Docker host is asked ``docker ps`` / ``docker inspect`` over ssh.
-* the weg2 front is asked ``GET /weg2/state`` -- a dict it already keeps.
+* the pdflip front is asked ``GET /pdflip/state`` -- a dict it already keeps.
 * gpuq is asked ``GET /api/v1/cards`` and ``GET /api/v1/bookings``.
 """
 
@@ -161,11 +161,11 @@ _FRONT_ROUTE: Dict[str, str] = {}     # endpoint -> the route spelling that answ
 
 
 def front_state(endpoint: str, timeout: float = 3.0):
-    """``GET <endpoint>/weg2/state`` for a front of either generation (F0-B): the renamed front serves ``/pdflip/state`` and
-    keeps the old prefix as an alias (shims.patch); an old front only knows ``/weg2/state``.  The spelling that answered is
+    """``GET <endpoint>/pdflip/state`` for a front of either generation (F0-B): the renamed front serves ``/pdflip/state`` and
+    keeps the old prefix as an alias (shims.patch); an old front only knows ``/pdflip/state``.  The spelling that answered is
     remembered per endpoint, so the second poll is one request again; when it stops answering, the other one is tried."""
     base = endpoint.rstrip("/")
-    routes = list(N.marker_variants("/weg2/state"))
+    routes = list(N.marker_variants("/pdflip/state"))
     known = _FRONT_ROUTE.get(base)
     if known in routes:
         routes.remove(known)
@@ -219,7 +219,7 @@ class Sources:
         }
         if ssh:
             self.samplers["docker"] = Sampler("docker", cfg.get("docker_period", 20.0), self.sample_docker)
-        for ep in cfg.get("weg2_fronts") or []:
+        for ep in cfg.get("pdflip_fronts") or []:
             self.samplers["front:" + ep] = Sampler(
                 "front:" + ep, cfg.get("front_period", 10.0),
                 (lambda ep=ep: front_state(ep)))
@@ -417,7 +417,7 @@ class Sources:
 
 
 def front_for_boot(fronts: Dict[str, dict], tag: Optional[str]) -> Optional[dict]:
-    """The /weg2/state sample whose ``tag`` is this boot's launcher tag."""
+    """The /pdflip/state sample whose ``tag`` is this boot's launcher tag."""
     if not tag:
         return None
     for ep, v in fronts.items():

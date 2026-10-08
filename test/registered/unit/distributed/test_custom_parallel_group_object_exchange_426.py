@@ -28,9 +28,9 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-import sglang.srt.distributed.parallel_state as parallel_state
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.distributed.parallel_state as parallel_state
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

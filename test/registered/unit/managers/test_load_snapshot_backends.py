@@ -6,7 +6,7 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.load_snapshot import (
+from flliper.srt.managers.load_snapshot import (
     LoadSnapshot,
     ShmLoadSnapshotReader,
     ShmLoadSnapshotWriter,
@@ -18,8 +18,8 @@ from sglang.srt.managers.load_snapshot import (
     should_use_zmq,
     zmq_reader_owner,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -35,7 +35,7 @@ def _temp_path() -> str:
 
 
 def _ipc_addr() -> str:
-    fd, path = tempfile.mkstemp(prefix="sglang_test_zmq_", suffix=".sock")
+    fd, path = tempfile.mkstemp(prefix="flliper_test_zmq_", suffix=".sock")
     os.close(fd)
     os.unlink(path)
     return f"ipc://{path}"
@@ -231,7 +231,7 @@ class TestFactoryFunctions(CustomTestCase):
         self.assertIsInstance(reader, ShmLoadSnapshotReader)
         reader.close()
         writer.close()
-        from sglang.srt.managers.load_snapshot import shm_path_for
+        from flliper.srt.managers.load_snapshot import shm_path_for
 
         path = shm_path_for("test_shm_factory")
         if os.path.exists(path):
@@ -247,7 +247,7 @@ class TestFactoryFunctions(CustomTestCase):
             tokenizer_worker_num=1,
         )
         port_args = SimpleNamespace(instance_id="test_zmq_factory")
-        os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"] = "1"
+        os.environ["FLLIPER_LOAD_SNAPSHOT_USE_ZMQ"] = "1"
         try:
             writer = create_load_snapshot_writer(
                 server_args, port_args, dp_size=1, dp_rank=0
@@ -260,7 +260,7 @@ class TestFactoryFunctions(CustomTestCase):
             reader.close()
             writer.close()
         finally:
-            del os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"]
+            del os.environ["FLLIPER_LOAD_SNAPSHOT_USE_ZMQ"]
 
     def test_should_use_zmq_multinode_dp_attention(self):
         args = SimpleNamespace(enable_dp_attention=True, nnodes=2)
@@ -340,7 +340,7 @@ class TestZmqAddr(CustomTestCase):
         self.assertIn("myinstance", addr)
 
     def test_tcp_from_port_args(self):
-        from sglang.srt.utils.network import NetworkAddress
+        from flliper.srt.utils.network import NetworkAddress
 
         port_args = SimpleNamespace(
             instance_id="myinstance",

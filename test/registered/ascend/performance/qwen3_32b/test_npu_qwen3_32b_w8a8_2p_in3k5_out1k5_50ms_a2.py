@@ -1,16 +1,16 @@
 import unittest
 
-from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
+from flliper.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_performance_utils import (
+from flliper.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     DEFAULT_URL_FOR_TEST,
     QWEN3_32B_EAGLE_MODEL_PATH,
     QWEN3_32B_W8A8_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+from flliper.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
@@ -20,16 +20,16 @@ register_npu_ci(
 )
 
 QWEN3_32B_ENVS = {
-    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
+    "FLLIPER_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
-    "SGLANG_NPU_USE_DEEPGEMM": "1",
+    "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "FLLIPER_ENABLE_SPEC_V2": "1",
+    "FLLIPER_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
+    "FLLIPER_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
+    "FLLIPER_NPU_USE_DEEPGEMM": "1",
 }
 
 QWEN3_32B_OTHER_ARGS = [

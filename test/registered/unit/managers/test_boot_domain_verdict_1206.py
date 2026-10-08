@@ -37,16 +37,16 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers import phase_domain_verdict as pdv
-from sglang.srt.managers import phase_flip_boot as pfb
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import phase_domain_verdict as pdv
+from flliper.srt.managers import phase_flip_boot as pfb
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
-_LOGGER = logging.getLogger("sglang.srt.managers.phase_flip_boot")
+_LOGGER = logging.getLogger("flliper.srt.managers.phase_flip_boot")
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +269,8 @@ class _BootFabric:
             self.lines.append(record.getMessage())
 
         _NAMES = (
-            "sglang.srt.managers.phase_flip_boot",
-            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler",
+            "flliper.srt.managers.phase_flip_boot",
+            "flliper.srt.mem_cache.hybrid_cache.hybrid_pool_assembler",
         )
 
         def __enter__(self):
@@ -1111,13 +1111,13 @@ class TestTheRankLabelIsReadWhereTheSchedulerKeepsIt(CustomTestCase):
     def test_the_scheduler_has_no_rank_of_its_own(self):
         """THE FALSIFIER, in the #583 form: if this ever becomes false the
         reader below is over-built; while it is true, a bare read is a bug."""
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         self.assertFalse(hasattr(Scheduler, "pp_rank"))
         self.assertFalse(hasattr(Scheduler, "tp_rank"))
 
     def test_the_parallel_state_is_where_the_identity_lives(self):
-        from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+        from flliper.srt.distributed.parallel_state_wrapper import ParallelState
 
         for field in ("pp_rank", "tp_rank"):
             with self.subTest(field=field):

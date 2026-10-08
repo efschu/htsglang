@@ -20,22 +20,22 @@ from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.environ import envs
-from sglang.srt.managers.scheduler_components import host_round_cost as hrc
-from sglang.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
-from sglang.srt.managers.scheduler_components.host_round_cost import (
+from flliper.srt.environ import envs
+from flliper.srt.managers.scheduler_components import host_round_cost as hrc
+from flliper.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
+from flliper.srt.managers.scheduler_components.host_round_cost import (
     DecodeHostCost,
     HostCostCounters,
     PPHostPeriod,
     med_max,
 )
-from sglang.srt.utils.collective_clock import ClockBackend, CollectiveClock
-from sglang.srt.weg2.publish_cost import PublishCostLedger, format_parts
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils.collective_clock import ClockBackend, CollectiveClock
+from flliper.srt.pdflip.publish_cost import PublishCostLedger, format_parts
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-MOD_HRC = "sglang.srt.managers.scheduler_components.host_round_cost"
+MOD_HRC = "flliper.srt.managers.scheduler_components.host_round_cost"
 
 
 class _State:
@@ -173,11 +173,11 @@ class DecodeHostCostTest(unittest.TestCase):
         self.assertEqual([l for l in cap.lines if "DECODE-HOST-PERIOD" in l], [])
 
     def test_env_drives_the_period(self):
-        self.assertEqual(envs.SGLANG_DEBUG_DECODE_HOST_PERIOD.get(), 64)
-        self.assertEqual(envs.SGLANG_DEBUG_PP_HOST_PERIOD.get(), 8)
-        with envs.SGLANG_DEBUG_DECODE_HOST_PERIOD.override(0):
+        self.assertEqual(envs.FLLIPER_DEBUG_DECODE_HOST_PERIOD.get(), 64)
+        self.assertEqual(envs.FLLIPER_DEBUG_PP_HOST_PERIOD.get(), 8)
+        with envs.FLLIPER_DEBUG_DECODE_HOST_PERIOD.override(0):
             self.assertEqual(DecodeHostCost.from_env(rank=0)._period, 0)
-        with envs.SGLANG_DEBUG_PP_HOST_PERIOD.override(0):
+        with envs.FLLIPER_DEBUG_PP_HOST_PERIOD.override(0):
             self.assertFalse(PPHostPeriod.from_env().on)
 
     def test_keep_bounds_memory(self):
@@ -211,8 +211,8 @@ class DecodeRoundCostCarriesHostTest(unittest.TestCase):
         self.log.host_cost = DecodeHostCost(rank=0, period=0, counters=self.counters)
         self.cap = _capture(
             self,
-            "sglang.srt.managers.scheduler_components.decode_round_log",
-            "sglang.srt.managers.scheduler_components.wake_round_census",
+            "flliper.srt.managers.scheduler_components.decode_round_log",
+            "flliper.srt.managers.scheduler_components.wake_round_census",
         )
         self.next_round = 100
 
@@ -260,7 +260,7 @@ class DecodeRoundCostCarriesHostTest(unittest.TestCase):
         self.assertEqual(self.state.syncs, 0)
 
     def test_unknown_host_interval_prints_dash_never_zero(self):
-        from sglang.srt.managers.scheduler_components.wake_round_census import (
+        from flliper.srt.managers.scheduler_components.wake_round_census import (
             WakeRoundCensus,
         )
 
@@ -303,7 +303,7 @@ class HicachePollCountsItsPartsTest(unittest.TestCase):
         )
 
     def test_check_hicache_events_adds_total_and_named_parts(self):
-        from sglang.srt.mem_cache import unified_radix_cache as urc
+        from flliper.srt.mem_cache import unified_radix_cache as urc
 
         counters = _Counters()
         calls = []
@@ -320,7 +320,7 @@ class HicachePollCountsItsPartsTest(unittest.TestCase):
         self.assertAlmostEqual(counters.hc_ms, 3.0, places=6)
 
     def test_all_reduce_counted_only_when_a_collective_ran(self):
-        from sglang.srt.mem_cache import unified_radix_cache as urc
+        from flliper.srt.mem_cache import unified_radix_cache as urc
 
         counters = _Counters()
         waited = []
@@ -386,7 +386,7 @@ class PPHostPeriodTest(unittest.TestCase):
         """Structural: in event_loop_pp the slot's d2h_event.synchronize() is
         bracketed by perf_counter and handed to PP-HOST-PERIOD -- and no new
         synchronize() call was added (the instrument only times)."""
-        from sglang.srt.managers import scheduler_pp_mixin as m
+        from flliper.srt.managers import scheduler_pp_mixin as m
 
         text = open(m.__file__).read()
         a = text.index("    def event_loop_pp(self: Scheduler):")
@@ -401,29 +401,29 @@ class PPHostPeriodTest(unittest.TestCase):
 
 class PublishLedgerTest(unittest.TestCase):
     def test_chunk_lines_budget_over_and_request_sum(self):
-        """x153b P-PP0 rid weg2-0-4: chunk publishes 113, 225 (stopped at the
+        """x153b P-PP0 rid pdflip-0-4: chunk publishes 113, 225 (stopped at the
         150 ms budget), 38, 17, 17, 15 ms -> sum 425, one over budget."""
         led = PublishCostLedger()
         lines = []
         for ms, stopped in ((113, None), (225, "budget"), (38, None), (17, None),
                             (17, None), (15, None)):
-            lines.append(led.note_chunk(rid="weg2-0-4", ms=float(ms), budget_ms=150.0,
+            lines.append(led.note_chunk(rid="pdflip-0-4", ms=float(ms), budget_ms=150.0,
                                         stopped=stopped, issued=2, parts="-"))
         self.assertRegex(
             lines[1],
-            r"^WEG2-PUBLISH-CHUNK rid=weg2-0-4 chunk=2 ms=225\.0 budget_ms=150 "
+            r"^PDFLIP-PUBLISH-CHUNK rid=pdflip-0-4 chunk=2 ms=225\.0 budget_ms=150 "
             r"over=yes stopped=budget issued=2 sum_ms=338\.0 parts=-$",
         )
         self.assertIn("chunk=1 ms=113.0 budget_ms=150 over=no stopped=-", lines[0])
-        req = led.close("weg2-0-4", retain_ms=2.0)
+        req = led.close("pdflip-0-4", retain_ms=2.0)
         self.assertRegex(
             req,
-            r"^WEG2-PUBLISH-REQ rid=weg2-0-4 chunks=6 chunk_sum_ms=425\.0 "
+            r"^PDFLIP-PUBLISH-REQ rid=pdflip-0-4 chunks=6 chunk_sum_ms=425\.0 "
             r"chunk_max_ms=225\.0 over_budget=1 stopped_budget=1 budget_ms=150 "
             r"retain_ms=2\.0 total_ms=427\.0 \(",
         )
         # closed: a second close has nothing (no chunk, no retain)
-        self.assertIsNone(led.close("weg2-0-4", retain_ms=None))
+        self.assertIsNone(led.close("pdflip-0-4", retain_ms=None))
 
     def test_budget_zero_is_unbounded_never_over(self):
         led = PublishCostLedger()
@@ -440,7 +440,7 @@ class PublishLedgerTest(unittest.TestCase):
         self.assertEqual(len(led._open), PublishCostLedger.MAX_OPEN)
 
     def test_parts_from_a_finished_publish_clock(self):
-        from sglang.srt.mem_cache import hicache_write_path as hwp
+        from flliper.srt.mem_cache import hicache_write_path as hwp
 
         clk = hwp.PublishClock()
         clk.finish(1)

@@ -1,10 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.srt.runtime_context import get_context, reset_context
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from flliper.srt.runtime_context import get_context, reset_context
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 

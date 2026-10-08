@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.srt.speculative.spec_utils import (
+from flliper.srt.speculative.spec_utils import (
     _sample_simulated_acc_len,
     _select_top_k_tokens_first,
     fast_sample,

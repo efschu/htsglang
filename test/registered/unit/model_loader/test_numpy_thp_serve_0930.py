@@ -30,9 +30,9 @@ from unittest import mock
 
 import numpy as np
 
-from sglang.srt.model_loader import gguf_numpy_hugepage as H
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_loader import gguf_numpy_hugepage as H
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -56,7 +56,7 @@ class _HintCase(CustomTestCase):
         env = mock.patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("SGLANG_WEG2_NUMPY_HUGEPAGE", None)
+        os.environ.pop("FLLIPER_PDFLIP_NUMPY_HUGEPAGE", None)
 
     def tearDown(self):
         _SWITCH(self._orig)
@@ -72,7 +72,7 @@ class TheServingSwitch(_HintCase):
         self.assertIn("OFF for the whole rank process (was on;", line)
 
     def test_opt_out_env_keeps_numpys_setting(self):
-        os.environ["SGLANG_WEG2_NUMPY_HUGEPAGE"] = "1"
+        os.environ["FLLIPER_PDFLIP_NUMPY_HUGEPAGE"] = "1"
         self.assertFalse(H.numpy_hugepage_off_for_serving("x"))
         self.assertTrue(_get_hint())
 
@@ -116,7 +116,7 @@ class TheKernelSeesNoHugepageAdviceWhileServing(_HintCase):
 
 class TheRankProcessCallsIt(CustomTestCase):
     def test_run_scheduler_process_switches_after_configuring_logging(self):
-        from sglang.srt.managers import scheduler as S
+        from flliper.srt.managers import scheduler as S
 
         tree = ast.parse(inspect.getsource(S.run_scheduler_process))
         order = []

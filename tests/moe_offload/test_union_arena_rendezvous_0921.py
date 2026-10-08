@@ -12,8 +12,8 @@ import threading
 
 import pytest
 
-from sglang.srt.weg2.union_arena import UnionShareError
-from sglang.srt.weg2.union_arena_vmm import (
+from flliper.srt.pdflip.union_arena import UnionShareError
+from flliper.srt.pdflip.union_arena_vmm import (
     UnionRendezvousServer,
     fetch_union,
     socket_path,
@@ -51,7 +51,7 @@ def test_manifest_and_fds_survive_the_handoff(tmp_path):
 def test_the_socket_path_stays_inside_the_unix_limit():
     """The boot's own directory fits; an over-long one is a NAMED refusal,
     not a bare OSError out of bind()."""
-    path = socket_path("/dev/shm/weg2-union-fnFL2", "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d")
+    path = socket_path("/dev/shm/pdflip-union-fnFL2", "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d")
     assert len(path.encode()) <= 107, path
     assert path.endswith("u-e773fd938f6d.sock")
     with pytest.raises(UnionShareError, match="at most 107"):

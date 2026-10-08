@@ -734,7 +734,7 @@ def main() -> int:
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python")
     )
     sys.path.insert(0, repo_python)
-    from sglang.srt.distributed.device_communicators.barlink_path_rates import (  # noqa: E402
+    from flliper.srt.distributed.device_communicators.barlink_path_rates import (  # noqa: E402
         new_nccl_reference_envelope,
     )
     from p2p_common import parse_nccl_transports, summarize_transport_classes  # noqa: E402

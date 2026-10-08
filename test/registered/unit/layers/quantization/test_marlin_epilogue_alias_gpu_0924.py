@@ -48,9 +48,9 @@ M >= 128, ~1 %, measured 2026-07-26, 4de61b5c6f), which is accumulation order,
 not garbage. A red here is corruption on the running draft path, whatever its
 mechanism -- escalate, do not re-run until green.
 
-Env knobs (defaults are the 27B draft): SGLANG_MARLIN_ALIAS_TEST_SHAPES="N:K,..."
-SGLANG_MARLIN_ALIAS_TEST_MS="1,8,..." SGLANG_MARLIN_ALIAS_TEST_GROUP=128
-SGLANG_MARLIN_ALIAS_TEST_REPS=20. The NF line runs the same dense template
+Env knobs (defaults are the 27B draft): FLLIPER_MARLIN_ALIAS_TEST_SHAPES="N:K,..."
+FLLIPER_MARLIN_ALIAS_TEST_MS="1,8,..." FLLIPER_MARLIN_ALIAS_TEST_GROUP=128
+FLLIPER_MARLIN_ALIAS_TEST_REPS=20. The NF line runs the same dense template
 byte for byte (its dense layers: group 64, pass its own N:K).
 """
 
@@ -71,9 +71,9 @@ if torch.cuda.device_count() != 1:  # pragma: no cover - window hygiene
         allow_module_level=True,
     )
 
-import sglang.jit_kernel.utils as JU  # noqa: E402
-from sglang.jit_kernel import gptq_marlin as GM  # noqa: E402
-from sglang.jit_kernel import gptq_marlin_repack as GR  # noqa: E402
+import flliper.jit_kernel.utils as JU  # noqa: E402
+from flliper.jit_kernel import gptq_marlin as GM  # noqa: E402
+from flliper.jit_kernel import gptq_marlin_repack as GR  # noqa: E402
 
 
 class _Refused(BaseException):
@@ -135,8 +135,8 @@ if not (_OK_GEMM and _OK_REPACK):  # pragma: no cover - window hygiene
 
 from sgl_kernel.scalar_type import scalar_types  # noqa: E402
 
-from sglang.srt.layers.quantization import marlin_utils as MU  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
+from flliper.srt.layers.quantization import marlin_utils as MU  # noqa: E402
+from flliper.test.ci.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=90, suite="nightly-1-gpu")
 
@@ -166,13 +166,13 @@ def _env_list(name, default, conv):
 
 
 SHAPES = (
-    [("env", int(nk.split(":")[0]), int(nk.split(":")[1])) for nk in os.environ["SGLANG_MARLIN_ALIAS_TEST_SHAPES"].split(",")]
-    if os.environ.get("SGLANG_MARLIN_ALIAS_TEST_SHAPES", "").strip()
+    [("env", int(nk.split(":")[0]), int(nk.split(":")[1])) for nk in os.environ["FLLIPER_MARLIN_ALIAS_TEST_SHAPES"].split(",")]
+    if os.environ.get("FLLIPER_MARLIN_ALIAS_TEST_SHAPES", "").strip()
     else DRAFT_SHAPES + EXTRA_SHAPES
 )
-MS = _env_list("SGLANG_MARLIN_ALIAS_TEST_MS", (1, 8, 16, 256, 2048), int)
-GROUP = int(os.environ.get("SGLANG_MARLIN_ALIAS_TEST_GROUP", "128"))
-REPS = int(os.environ.get("SGLANG_MARLIN_ALIAS_TEST_REPS", "20"))
+MS = _env_list("FLLIPER_MARLIN_ALIAS_TEST_MS", (1, 8, 16, 256, 2048), int)
+GROUP = int(os.environ.get("FLLIPER_MARLIN_ALIAS_TEST_GROUP", "128"))
+REPS = int(os.environ.get("FLLIPER_MARLIN_ALIAS_TEST_REPS", "20"))
 
 # Bounds, element-wise: rel * |ref| + absf * rms(ref).
 # TIGHT: fp32 reduce -- the output is ONE bf16 rounding of an fp32 sum of exact

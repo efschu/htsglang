@@ -27,8 +27,8 @@ that is the whole surface under test; a real pool needs CUDA.
 import unittest
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -59,15 +59,15 @@ def _attrs_assigned_by(init_func) -> set:
 
 class HybridDecodePoolAttributeContractTest(CustomTestCase):
     def test_subclass_establishes_every_base_attribute(self):
-        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
-        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from flliper.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
+        from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
         base = _attrs_assigned_by(HybridReqToTokenPool.__init__)
         sub = _attrs_assigned_by(HybridMambaDecodeReqToTokenPool.__init__)
 
         # Attributes the subclass legitimately leaves to DecodeReqToTokenPool
         # (it calls that base's __init__ explicitly, so those ARE established).
-        from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+        from flliper.srt.disaggregation.decode import DecodeReqToTokenPool
 
         via_decode_base = _attrs_assigned_by(DecodeReqToTokenPool.__init__)
 
@@ -91,13 +91,13 @@ class HybridDecodePoolAttributeContractTest(CustomTestCase):
         launched without --disaggregation-decode-enable-radix-cache never binds
         one, which the allocator's None branch is written to handle.
         """
-        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
+        from flliper.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
 
         pool = HybridMambaDecodeReqToTokenPool.__new__(HybridMambaDecodeReqToTokenPool)
         with mock.patch.object(
             HybridMambaDecodeReqToTokenPool, "_init_mamba_pool", return_value=None
         ), mock.patch(
-            "sglang.srt.disaggregation.decode.DecodeReqToTokenPool.__init__",
+            "flliper.srt.disaggregation.decode.DecodeReqToTokenPool.__init__",
             return_value=None,
         ):
             HybridMambaDecodeReqToTokenPool.__init__(

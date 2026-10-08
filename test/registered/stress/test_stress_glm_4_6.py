@@ -3,9 +3,9 @@
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.ci.ci_stress_utils import StressTestRunner
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_stress_utils import StressTestRunner
+from flliper.test.test_utils import DEFAULT_URL_FOR_TEST
 
 MODEL_PATH = "zai-org/GLM-4.6"
 RANDOM_INPUT_LEN = 4096

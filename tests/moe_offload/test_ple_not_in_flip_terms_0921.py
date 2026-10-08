@@ -6,9 +6,9 @@ gemessen. Sie erreichen weder VRAM noch den Host-Store, also traegt sie
 auch kein Flip. Der Checkpoint-Zensus zaehlte sie trotzdem mit, und daraus
 sizet der Bounce:
 
-    WEG2-XCHG-BOUNCE PUBLISHED ... widest_layer_bytes=103797370776,
+    PDFLIP-XCHG-BOUNCE PUBLISHED ... widest_layer_bytes=103797370776,
     max_tag_bytes=106524281944      (fnFL2w4, 21.09. 17:53Z)
-    WEG2-XCHG-TAGMAX lane=0 max_tag_mib=101589
+    PDFLIP-XCHG-TAGMAX lane=0 max_tag_mib=101589
 
 GEMESSEN am Shipped-Checkpoint (163,20 GiB, 48 safetensors):
 
@@ -26,7 +26,7 @@ damit niemand die falsche Lehre zieht: am laufenden Boot gemessen ist
 Datei-Cache nur ~4,4 GiB.
 """
 
-from sglang.srt.weg2 import checkpoint_census as cc
+from flliper.srt.pdflip import checkpoint_census as cc
 
 
 def test_ple_is_excluded_by_segment_not_by_prefix():

@@ -32,7 +32,7 @@ try/finally, named as such rather than papered over.
 import threading
 import unittest
 
-from sglang.srt.distributed import utils as u
+from flliper.srt.distributed import utils as u
 
 # A three-rank flip vector against a two-rank installed plan. The lengths differ
 # on purpose: length is the only thing that decides whether a plan applies, so a

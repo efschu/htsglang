@@ -17,7 +17,7 @@ supplies the number. That refusal is the point: it is the difference between
 import types
 import unittest
 
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     TERM_ATTN_WORKSPACE,
     TERM_NCCL_BUFFERS,
     TRTLLM_MHA_WORKSPACE_MIB,
@@ -27,7 +27,7 @@ from sglang.srt.mem_ledger.engine import (
     build_card_ledgers,
     demand_outside_budget_mib,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -164,7 +164,7 @@ class TestTheIntendedInteraction(unittest.TestCase):
     fallback the refusal lands on."""
 
     def setUp(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         ServerArgs._full_demand_refusal_named = False
         self.SA = ServerArgs
@@ -177,7 +177,7 @@ class TestTheIntendedInteraction(unittest.TestCase):
         stub.cuda_graph_config = types.SimpleNamespace(
             decode=types.SimpleNamespace(max_bs=24, bs=None)
         )
-        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.server_args", level="WARNING") as cm:
             got = self.SA.ledger_full_demand_per_gpu(stub, 20480)
         self.assertIsNone(got)
         self.assertIn("NCCL", "\n".join(cm.output))

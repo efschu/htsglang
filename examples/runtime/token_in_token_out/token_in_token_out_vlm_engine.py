@@ -4,11 +4,11 @@ from typing import Tuple
 
 from transformers import AutoProcessor
 
-from sglang import Engine
-from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import DEFAULT_IMAGE_URL
+from flliper import Engine
+from flliper.lang.chat_template import get_chat_template_by_model_path
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.server_args import ServerArgs
+from flliper.test.test_utils import DEFAULT_IMAGE_URL
 
 
 def get_input_ids(

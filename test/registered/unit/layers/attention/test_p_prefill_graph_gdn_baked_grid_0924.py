@@ -38,8 +38,8 @@ import sys
 import textwrap
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -55,15 +55,15 @@ _WORKER = textwrap.dedent(
     import triton.language as tl
     import triton.runtime.autotuner as _at
 
-    from sglang.srt.layers.attention.fla import index as fidx
-    from sglang.srt.layers.attention.fla.chunk import ChunkGatedDeltaRuleFunction
-    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+    from flliper.srt.layers.attention.fla import index as fidx
+    from flliper.srt.layers.attention.fla.chunk import ChunkGatedDeltaRuleFunction
+    from flliper.srt.layers.attention.fla.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64 as KERNEL,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from flliper.srt.layers.attention.mamba.causal_conv1d_triton import (
         causal_conv1d_fn,
     )
-    import sglang.srt.layers.attention.fla.utils as fu
+    import flliper.srt.layers.attention.fla.utils as fu
 
     # --- interpreter shims (compute-neutral) ---------------------------
     _at.Autotuner._bench = lambda self, *a, config=None, **m: [0.0, 0.0, 0.0]
@@ -88,7 +88,7 @@ _WORKER = textwrap.dedent(
     _repl = {"exp": _exp, "exp2": _exp2, "log": _log, "log2": _log2}
     _orig = {tl.exp, tl.math.exp2, tl.log, tl.log2}
     for _name, _mod in list(sys.modules.items()):
-        if _mod is None or not _name.startswith("sglang.srt.layers.attention.fla"):
+        if _mod is None or not _name.startswith("flliper.srt.layers.attention.fla"):
             continue
         for _alias, _fn in _repl.items():
             if getattr(_mod, _alias, None) in _orig:

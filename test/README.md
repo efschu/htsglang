@@ -1,8 +1,8 @@
-# Test and Continuous Integration (CI) System in SGLang
+# Test and Continuous Integration (CI) System in fLLiper
 
 This page covers principles and essentials: folder layout, how to run tests, registration, and suite selection. For complete references, see the skill guides:
 
-- **Writing tests** — templates, fixtures, model selection, complete suite tables, checklist: [`.claude/skills/write-sglang-test/SKILL.md`](../.claude/skills/write-sglang-test/SKILL.md)
+- **Writing tests** — templates, fixtures, model selection, complete suite tables, checklist: [`.claude/skills/write-flliper-test/SKILL.md`](../.claude/skills/write-flliper-test/SKILL.md)
 - **CI pipeline internals** — stage flow diagrams, fast-fail layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
 
 ## CI Pipeline Overview
@@ -63,7 +63,7 @@ python3 test/run_suite.py --hw cuda --suite base-b-test-1-gpu-small \
 Every CI-discovered test file must call a registration function at module level:
 
 ```python
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
 ```
@@ -72,13 +72,13 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-JIT kernel correctness tests and benchmarks live under `test/registered/jit/`, same as other registered tests (their helpers stay alongside the kernel source under `python/sglang/jit_kernel/` and are imported by absolute path):
+JIT kernel correctness tests and benchmarks live under `test/registered/jit/`, same as other registered tests (their helpers stay alongside the kernel source under `python/flliper/jit_kernel/` and are imported by absolute path):
 - Correctness tests: `test/registered/jit/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
 - Benchmarks: `test/registered/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
 
 ## Choosing a Suite
 
-Use the lightest suite that meets your test's needs. Full suite tables are in the [write-sglang-test skill](../.claude/skills/write-sglang-test/SKILL.md#all-ci-suites).
+Use the lightest suite that meets your test's needs. Full suite tables are in the [write-flliper-test skill](../.claude/skills/write-flliper-test/SKILL.md#all-ci-suites).
 
 | Need | Suite |
 |------|-------|
@@ -92,7 +92,7 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 
 ## Steps for Adding a Test
 
-See the [write-sglang-test skill](../.claude/skills/write-sglang-test/SKILL.md) for templates, fixtures, model selection, and a complete checklist.
+See the [write-flliper-test skill](../.claude/skills/write-flliper-test/SKILL.md) for templates, fixtures, model selection, and a complete checklist.
 
 ## Multi-Hardware Backends
 

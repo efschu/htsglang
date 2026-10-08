@@ -552,7 +552,7 @@ def print_results_table(all_results: Dict[str, dict]) -> None:
     """Print a formatted results summary table to stdout."""
     sep = "=" * 70
     print(f"\n{sep}")
-    print("  olmOCR-bench Results Summary  (DeepSeek-OCR-2 via sglang)")
+    print("  olmOCR-bench Results Summary  (DeepSeek-OCR-2 via flliper)")
     print(sep)
     print(f"{'Split':<22} {'Tests':>8} {'Passed':>8} {'Score':>8}")
     print("-" * 50)

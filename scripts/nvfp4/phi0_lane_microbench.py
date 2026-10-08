@@ -190,7 +190,7 @@ def lane_bf16(device, m, k, n) -> Tuple[Optional[float], str]:
 
 def lane_fp8(device, m, k, n) -> Dict[str, Tuple[Optional[float], str]]:
     """Reuse the exact probes that produced the cached lane table."""
-    from sglang.srt import uneven_perf
+    from flliper.srt import uneven_perf
 
     out = {}
     saved = (
@@ -224,7 +224,7 @@ def lane_nvfp4_native(device, m, k, n) -> Tuple[Optional[float], str]:
     """
     a = b = a_sf = b_sf = alpha = None
     try:
-        from sglang.jit_kernel.nvfp4 import (
+        from flliper.jit_kernel.nvfp4 import (
             cutlass_scaled_fp4_mm,
             scaled_fp4_quant,
             suggest_nvfp4_global_scale,
@@ -265,7 +265,7 @@ def lane_nvfp4_marlin(device, m, k, n) -> Tuple[Optional[float], str]:
     """
     layer = x = None
     try:
-        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        from flliper.srt.layers.quantization.marlin_utils_fp4 import (
             apply_fp4_marlin_linear,
             prepare_nvfp4_layer_for_marlin,
         )
@@ -320,7 +320,7 @@ def resolved_auto_backend() -> str:
     chose the fork's own kernel. Print the answer next to the numbers so the
     routing claim is checked by the same run that measures the lanes.
     """
-    from sglang.srt.layers.quantization import fp4_utils
+    from flliper.srt.layers.quantization import fp4_utils
 
     saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
     fp4_utils.FP4_GEMM_RUNNER_BACKEND = None

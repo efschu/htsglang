@@ -13,7 +13,7 @@ Hermetic: CPU tensors only, no CUDA.
 import pytest
 import torch
 
-from sglang.srt.weg2 import union_arena as ua
+from flliper.srt.pdflip import union_arena as ua
 
 
 def _phase_sets():

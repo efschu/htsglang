@@ -44,15 +44,15 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache import pinned_host_budget
-from sglang.srt.model_executor import weights_arena
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache import pinned_host_budget
+from flliper.srt.model_executor import weights_arena
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-_LOGGER = "sglang.srt.model_executor.weights_arena"
+_LOGGER = "flliper.srt.model_executor.weights_arena"
 
 #: One reader chunk under the env override below (the accessor's floor).
 _CHUNK = 1 << 20
@@ -73,7 +73,7 @@ class _PinStopBase(CustomTestCase):
         self._pins = []
         # 32 MiB (the default) swallows a test image in one read, and a
         # reader that cannot be caught INSIDE a chunk cannot be held there.
-        self._chunk = envs.SGLANG_PHASE_FLIP_REFILL_CHUNK_MIB.override(1)
+        self._chunk = envs.FLLIPER_PHASE_FLIP_REFILL_CHUNK_MIB.override(1)
         self._chunk.__enter__()
         weights_arena.release_flip_image_pin()
         weights_arena._FILE_BACKED_IMAGES.clear()

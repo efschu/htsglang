@@ -30,16 +30,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.mem_cache.mamba_pool_floor import (
+from flliper.srt.mem_cache.mamba_pool_floor import (
     MAMBA_SLOT_REORDER_ENV,
     describe_mamba_floor,
     mamba_hard_floor,
     mamba_slot_reorder_active,
     mamba_slots_per_running_req,
 )
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -77,7 +77,7 @@ def _with_lineage():
     that basis alone. The mechanism itself is unchanged -- these tests state
     what it is worth WHERE IT EXISTS, which is what they always meant.
     """
-    import sglang.srt.mem_cache.mamba_pool_floor as floor_mod
+    import flliper.srt.mem_cache.mamba_pool_floor as floor_mod
 
     return patch.object(floor_mod, "mamba_reorder_lineage_supported", lambda _sa: True)
 

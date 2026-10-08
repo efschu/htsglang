@@ -1,13 +1,13 @@
 """Kartenplaner (Item 510): Planer-Funktionen als reine Funktionsaufrufe, OHNE GPU, OHNE Launcher-Prozess.
 
-Läuft als KINDPROZESS des Dashboards mit dem Python der sglang-Umgebung
+Läuft als KINDPROZESS des Dashboards mit dem Python der flliper-Umgebung
 (``PYTHONPATH=<Baum>/python``, ``CUDA_VISIBLE_DEVICES=``), liest eine JSON-Anfrage von stdin und schreibt
 eine JSON-Antwort nach stdout.  Warum ein Kindprozess und nicht im Dashboard-Prozess: der Dashboard-Dienst
-läuft mit dem System-Python ohne torch (MemoryMax=1G); der sglang-Import zieht torch.  Der Aufruf selbst ist
-derselbe wie in test/registered/unit/weg2/hw_generic_rig_plan_fingerprint_1002.py: Module importieren,
+läuft mit dem System-Python ohne torch (MemoryMax=1G); der flliper-Import zieht torch.  Der Aufruf selbst ist
+derselbe wie in test/registered/unit/pdflip/hw_generic_rig_plan_fingerprint_1002.py: Module importieren,
 Funktionen mit einem synthetischen Karteninventar rufen.
 
-Dieses Skript startet NIE den Launcher (``python -m sglang.srt.weg2.launcher``) und ruft nie ``launcher.main``.
+Dieses Skript startet NIE den Launcher (``python -m flliper.srt.pdflip.launcher``) und ruft nie ``launcher.main``.
 Es berührt keinen Shared-Memory-Ordner, keinen Docker, keinen Port.
 
 Operationen
@@ -15,7 +15,7 @@ Operationen
   gate       Karteninventar gegen das Gate des Planers (card_identity, topology): Arch, Zahl, Reihenfolge,
              Kalibrierklasse, Topologie.  Antwort: die ORIGINAL-Meldungen der Planer-Funktionen.
   rederive   D-/P-Budgets mit ``launcher.budgets_from_dc`` aus den aufgezeichneten Eingaben neu rechnen.
-  couplings  Profil-Editor S4a (Auftrag 1431): Kopplungen C1-C4 (``sglang.srt.planner.profile_couplings.run``);
+  couplings  Profil-Editor S4a (Auftrag 1431): Kopplungen C1-C4 (``flliper.srt.planner.profile_couplings.run``);
              Anfrage {what, hardware, model, settings | server_args, ...}.  Fehlt das Modul im Baum, sagt die Antwort es.
 """
 
@@ -44,16 +44,16 @@ def _cards(L, rows):
 
 
 def op_version(req):
-    from sglang.srt.weg2 import launcher as L
+    from flliper.srt.pdflip import launcher as L
     info = {"launcher": os.path.relpath(L.__file__, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(L.__file__)))))
             if False else L.__file__, "has_budgets_from_dc": hasattr(L, "budgets_from_dc")}
     try:
-        from sglang.srt.weg2 import card_identity  # noqa: F401
+        from flliper.srt.pdflip import card_identity  # noqa: F401
         info["card_identity"] = True
     except ImportError:
         info["card_identity"] = False
     try:
-        from sglang.srt.weg2 import topology  # noqa: F401
+        from flliper.srt.pdflip import topology  # noqa: F401
         info["topology"] = True
     except ImportError:
         info["topology"] = False
@@ -64,15 +64,15 @@ def op_gate(req):
     """Gate des Planers (gleiche Funktion wie im Dashboard-Prozess, hier mit dem echten Paketimport)."""
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rigdash"))
     import kartenplan_gate as G
-    from sglang.srt.weg2 import card_identity as CI
-    from sglang.srt.weg2 import topology as TP
+    from flliper.srt.pdflip import card_identity as CI
+    from flliper.srt.pdflip import topology as TP
 
     return G.gate(CI, TP, req["cards"])
 
 
 def op_rederive(req):
     """``rows``: je Budgetzeile {label, ordinal, card, inputs{...}, expected_mib}.  Gleiche Funktion wie der Launcher."""
-    from sglang.srt.weg2 import launcher as L
+    from flliper.srt.pdflip import launcher as L
 
     out = []
     for row in req["rows"]:
@@ -110,7 +110,7 @@ def op_rederive(req):
 def op_couplings(req):
     """Profil-Editor S4a: reine Funktionen aus ``planner/profile_couplings.py`` des Baums (kein Launcher, keine GPU)."""
     try:
-        from sglang.srt.planner import profile_couplings as PC
+        from flliper.srt.planner import profile_couplings as PC
     except ImportError as exc:
         return {"ok": False, "error": "profile_couplings.py fehlt im Planer-Baum (%s)" % exc}
     return PC.run(req)

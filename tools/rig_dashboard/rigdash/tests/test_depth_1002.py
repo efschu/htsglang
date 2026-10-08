@@ -69,13 +69,13 @@ def test_prefill_depth_from_request_done_names_the_request():
     ring = _p_ring(N5A)
     b = _burst(ring)
     end = b["e"] + 0.4
-    done = [{"rid": "weg2-22-59", "arrival_ts": end - 70.0, "queue_ms": 3153, "p_prefill_ms": int((70.0 - 3.153) * 1000),
+    done = [{"rid": "pdflip-22-59", "arrival_ts": end - 70.0, "queue_ms": 3153, "p_prefill_ms": int((70.0 - 3.153) * 1000),
              "prefill": {"P": {"cached": 77824, "prompt": 77824 + N5A_N, "tokens": N5A_N, "ms": 60618}}},
             {"rid": "other", "arrival_ts": end - 900.0, "queue_ms": 10, "p_prefill_ms": 1000,
              "prefill": {"P": {"cached": 0, "prompt": 500, "tokens": 500}}}]
     d = activity.prefill_depth(b, done, "P")
     assert d["exact"] is True and d["src"].startswith("events request_done")
-    assert [r["rid"] for r in d["reqs"]] == ["weg2-22-59"]
+    assert [r["rid"] for r in d["reqs"]] == ["pdflip-22-59"]
     assert (d["x"], d["y"], d["n"]) == (77824, 77824 + N5A_N, N5A_N)
     # the port seat's explicit leg-1 end wins over arrival + queue + p_prefill
     done[0]["p_leg1_end_ts"] = b["s"] - 50.0
@@ -86,13 +86,13 @@ def test_prefill_depth_from_the_chunk_extent_reaches_back_to_the_start():
     # a sample only shows the NEWEST chunk's extent; the burst's token count gives the true start
     ext, pos = [], 77824
     for n, _c, _ms in N5A:
-        ext.append([["weg2-22-59", pos, pos + n]])
+        ext.append([["pdflip-22-59", pos, pos + n]])
         pos += n
     ext[0] = None                       # the first chunk's sample was missed
     d = activity.prefill_depth(_burst(_p_ring(N5A, ext)), None, "P")
     assert d["exact"] is True and "ext" in d["src"]
     assert (d["x"], d["y"], d["n"]) == (77824, 77824 + N5A_N, N5A_N)
-    assert d["reqs"] == [{"rid": "weg2-22-59", "x": 77824, "y": 77824 + N5A_N, "n": N5A_N}]
+    assert d["reqs"] == [{"rid": "pdflip-22-59", "x": 77824, "y": 77824 + N5A_N, "n": N5A_N}]
 
 
 def test_timeline_prefill_segment_and_last_burst_carry_the_depth():
@@ -156,7 +156,7 @@ def test_events_keep_request_done_and_the_view_does_not_ship_it():
     try:
         p = os.path.join(d, "events.jsonl")
         with open(p, "w") as fh:
-            fh.write('{"schema": "weg2.event/1", "type": "request_done", "ts": 5.0, "data": {"rid": "x", "end_ts": 5.0}}\n')
+            fh.write('{"schema": "pdflip.event/1", "type": "request_done", "ts": 5.0, "data": {"rid": "x", "end_ts": 5.0}}\n')
         ev = ipcstate._Events(p)
         ev.poll()
         bv = ipcstate.boot_view(d, {"boot_id": "b"}, ev, 10.0)
@@ -202,10 +202,10 @@ def _run_js(expr, lang="de"):
 @pytest.mark.skipif(NODE is None, reason="kein node")
 def test_hover_text_prefill_and_decode_de_and_en():
     d = ('{x: 77824, y: 214537, n: 136713, tps_start: 4312.4, tps_end: 2391.0, exact: true, '
-         'src: "events request_done (prefill.P cached/prompt/tokens)", reqs: [{rid: "weg2-22-59", x: 77824, y: 214537, n: 136713}]}')
+         'src: "events request_done (prefill.P cached/prompt/tokens)", reqs: [{rid: "pdflip-22-59", x: 77824, y: 214537, n: 136713}]}')
     de = _run_js("depthTip(%s)" % d)
     assert "Token 77,824&ndash;214,537 (136,713 neu)" in de
-    assert "4,312 &rarr; 2,391</b> tok/s" in de and "weg2-22-59" in de
+    assert "4,312 &rarr; 2,391</b> tok/s" in de and "pdflip-22-59" in de
     en = _run_js("depthTip(%s)" % d, "en")
     assert "Tokens 77,824&ndash;214,537 (136,713 new)" in en and "(start &rarr; end)" in en
     approx = _run_js('depthTip({x: 4096, y: 77349, n: 73253, exact: false, src: "rankstats prefill.cached_tokens (x)", reqs: []})')

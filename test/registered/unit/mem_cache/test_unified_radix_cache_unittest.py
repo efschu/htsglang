@@ -12,18 +12,18 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.disaggregation.kv_events import (
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from flliper.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
 )
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     IncLockRefResult,
@@ -32,38 +32,38 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.memory_pool import (
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.common import available_and_evictable_str
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
     TreeComponent,
 )
-from sglang.srt.mem_cache.unified_radix_cache import (
+from flliper.srt.mem_cache.unified_radix_cache import (
     COMPONENT_REGISTRY,
     UnifiedLRUList,
     UnifiedRadixCache,
     UnifiedTreeNode,
 )
-from sglang.srt.runtime_context import get_server_args
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import (
+from flliper.srt.runtime_context import get_server_args
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
@@ -229,7 +229,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
 
     mamba2_cache_params = None
     if cfg.has_mamba:
-        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+        with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
             shape = Mamba2StateShape.create(
                 tp_world_size=1,
                 intermediate_size=cfg.mamba_intermediate_size,
@@ -349,7 +349,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
     )
 
     def test_l3_prefetch_uses_bigram_radix_key(self):
-        from sglang.srt.mem_cache.utils import get_hash_str
+        from flliper.srt.mem_cache.utils import get_hash_str
 
         cache, allocator, _ = build_fixture(self.cfg)
         cache.enable_storage = True
@@ -426,7 +426,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
 
 
 class TestUnifiedRadixDedupDraftCarry(CustomTestCase):
-    """SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY: an insert that finds its tokens
+    """FLLIPER_DFLASH_WINDOW_POOL_DEDUP_CARRY: an insert that finds its tokens
     already in the tree frees the request's fresh KV slots and keeps the
     tree's. The alias listener sees (fresh, kept) element-wise BEFORE the free,
     so the DFlash window pool can move the fresh draft rows to the kept slots
@@ -453,7 +453,7 @@ class TestUnifiedRadixDedupDraftCarry(CustomTestCase):
         cache.sanity_check()
 
     def test_no_listener_no_call_and_mapper_carry_end_to_end(self):
-        from sglang.srt.speculative.dflash_solo_pool import DraftKVSlotMapper
+        from flliper.srt.speculative.dflash_solo_pool import DraftKVSlotMapper
 
         for carry in (False, True):
             cache, allocator, _ = build_fixture(CacheConfig())
@@ -506,7 +506,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         return match.last_device_node
 
     def _init_hicache(self, cache, *, write_policy: str = "write_through"):
-        import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
+        import flliper.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         # Wrap the host-pool factory (not MHATokenToKVPoolHost directly)
         # because the assembler picks between MHATokenToKVPoolHost and
@@ -1817,7 +1817,7 @@ class UnifiedRadixCacheSuite:
 
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
-        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+        with envs.FLLIPER_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.cache_unfinished_req(req)
 
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
@@ -1867,7 +1867,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.swa_evicted_seqlen = 0
 
-        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+        with envs.FLLIPER_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.cache_unfinished_req(req)
 
         self.assertEqual(
@@ -2599,7 +2599,7 @@ class UnifiedRadixCacheSuite:
         prefetch_threshold: Optional[int] = None,
         prefetch_policy: str = "wait_complete",
     ):
-        import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
+        import flliper.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         # See _init_hicache: wrap the factory rather than MHATokenToKVPoolHost
         # directly so the pin_memory=False override applies to both
@@ -2638,7 +2638,7 @@ class UnifiedRadixCacheSuite:
 
         storage_extra_config = None
         if storage_backend == "file":
-            from sglang.srt.runtime_context import get_parallel
+            from flliper.srt.runtime_context import get_parallel
 
             # The file-backend storage config records TP/PP rank/size. These unit
             # fixtures run without initializing distributed parallel state, so
@@ -2651,7 +2651,7 @@ class UnifiedRadixCacheSuite:
 
             assert storage_dir is not None, "file backend needs a storage_dir"
             # HiCacheFile reads the directory from this env var.
-            cm = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(storage_dir)
+            cm = envs.FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR.override(storage_dir)
             cm.__enter__()
             self.addCleanup(cm.__exit__, None, None, None)
             extra = {}
@@ -4115,7 +4115,7 @@ class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
 
 
 class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
-    """Upstream #31648, opt-in here (SGLANG_MAMBA_LRU_REFRESH_USED_ONLY).
+    """Upstream #31648, opt-in here (FLLIPER_MAMBA_LRU_REFRESH_USED_ONLY).
 
     ON: a prefix-cache hit refreshes only best_match_node's mamba state in the
     mamba LRU, not its ancestors (upstream test). OFF (default): the base
@@ -4181,14 +4181,14 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
         return self._mamba_lru_mru_to_lru(cache), a1, b1, a2
 
     def test_match_refreshes_only_used_node_when_opted_in(self):
-        with envs.SGLANG_MAMBA_LRU_REFRESH_USED_ONLY.override(True):
+        with envs.FLLIPER_MAMBA_LRU_REFRESH_USED_ONLY.override(True):
             order, a1, b1, a2 = self._two_sessions_then_rematch_first()
         # Only the consumed leaf b1 moves to MRU; ancestor a1 stays put.
         self.assertIs(order[0], b1)
         self.assertGreater(order.index(a1), order.index(a2))
 
     def test_default_keeps_whole_chain_refresh(self):
-        with envs.SGLANG_MAMBA_LRU_REFRESH_USED_ONLY.override(False):
+        with envs.FLLIPER_MAMBA_LRU_REFRESH_USED_ONLY.override(False):
             order, a1, b1, a2 = self._two_sessions_then_rematch_first()
         # Byte-identical to the pre-port order: the whole matched chain is MRU.
         self.assertIs(order[0], b1)

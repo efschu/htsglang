@@ -56,9 +56,9 @@ WHAT MUST STILL BE TRUE AFTERWARDS:
 from __future__ import annotations
 
 import pytest
-from sglang.srt.managers import layout_conformance
-from sglang.srt.managers.phase_policy import PHASE_PP, PHASE_TP, TP_TO_PP
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.managers import layout_conformance
+from flliper.srt.managers.phase_policy import PHASE_PP, PHASE_TP, TP_TO_PP
+from flliper.srt.managers.phase_purity import (
     MODE_OFF,
     MODE_PREFILL_IN_TP,
     MODE_STRICT,
@@ -229,7 +229,7 @@ def test_a_restore_never_spends_the_compute_budget():
     ABOVE the budget in `prefill_blocked_here`, so a verified restore passes
     unbounded and leaves the one computed chunk still available.
     """
-    from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
+    from flliper.srt.managers.phase_purity import SEAM_READMIT_ATTR
 
     purity = PhasePurity(mode=MODE_STRICT, tp_compute_chunk_budget=1)
     sched = _Sched(PHASE_TP, purity)
@@ -319,7 +319,7 @@ def test_the_858b_runnability_term_sees_a_remaining_budget():
     progress in the layout we are in NOW". With a chunk still owed it CAN, and
     a hold that ignores that is the #858b wedge with a valve installed and
     unreachable -- the W31 shape, exactly."""
-    from sglang.srt.managers.phase_flip_runtime import (
+    from flliper.srt.managers.phase_flip_runtime import (
         prefill_runnable_in_current_layout,
     )
 

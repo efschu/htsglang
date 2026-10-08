@@ -51,7 +51,7 @@ import pytest
 
 
 def test_trigger_line_names_the_arm_when_one_is_known():
-    from sglang.srt.utils.watchdog import compose_timeout_line
+    from flliper.srt.utils.watchdog import compose_timeout_line
 
     line = compose_timeout_line(
         "Scheduler", 300, False, "blocked-recv[chain-recv/size<-0] waited=31.4s"
@@ -68,7 +68,7 @@ def test_trigger_line_names_the_arm_when_one_is_known():
 def test_trigger_line_is_worded_exactly_as_before_without_a_describer():
     """No arm known -> no new noise. The old wording is load-bearing for
     every log grep and dashboard that already matches on it."""
-    from sglang.srt.utils.watchdog import compose_timeout_line
+    from flliper.srt.utils.watchdog import compose_timeout_line
 
     line = compose_timeout_line("Scheduler", 300, False, "")
     assert line == (
@@ -106,7 +106,7 @@ class _SilentDist:
 
 def test_chain_receive_stamps_the_arm_it_is_blocked_in(monkeypatch):
     """THE W5(b) GAP. pp_chain_receiver had no marker at all."""
-    from sglang.srt.managers import pp_chain_receiver as mod
+    from flliper.srt.managers import pp_chain_receiver as mod
 
     monkeypatch.setattr(mod, "dist", _SilentDist())
 
@@ -142,7 +142,7 @@ def test_marker_clears_when_the_message_finally_lands(monkeypatch):
 
     import torch
 
-    from sglang.srt.managers import pp_chain_receiver as mod
+    from flliper.srt.managers import pp_chain_receiver as mod
 
     payload = pickle.dumps([{"rid": "r0"}])
 
@@ -193,7 +193,7 @@ def test_marker_clears_when_the_message_finally_lands(monkeypatch):
 
 
 def test_describer_reports_the_chain_arm_the_watchdog_used_to_miss():
-    from sglang.srt.managers.scheduler_components.invariant_checker import (
+    from flliper.srt.managers.scheduler_components.invariant_checker import (
         create_scheduler_watchdog,
     )
 

@@ -1,12 +1,12 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.kv_canary.e2e_base import (
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.kv_canary.e2e_base import (
     _LONG_PROMPT_BODY,
     _UNIQUE_PROMPT_FIRST_CHARS,
     _make_unique_prompts,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 

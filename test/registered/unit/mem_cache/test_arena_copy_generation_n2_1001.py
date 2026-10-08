@@ -36,10 +36,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
-from sglang.srt.mem_cache.storage.file import pageio as _pageio  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from flliper.srt.mem_cache.storage.file import pageio as _pageio  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -52,7 +52,7 @@ class _KVPage:
 
 
 def _backend(tmp_path, monkeypatch, slots=1):
-    from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+    from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
     root = tmp_path / "store"
     root.mkdir(parents=True, exist_ok=True)
@@ -81,7 +81,7 @@ def _backend(tmp_path, monkeypatch, slots=1):
     )
     arena_dir = tmp_path / "shm"
     arena_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_DIR", str(arena_dir))
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_DIR", str(arena_dir))
     arena = ShmArena(str(arena_dir / f"arena-{TOTAL}.bin"), TOTAL, slots)
     be._arenas = {TOTAL: arena}
     return be, arena
@@ -153,7 +153,7 @@ def test_reap_stale_leaves_a_live_evictors_candidates_alone(tmp_path, monkeypatc
 def test_reap_stale_still_reaps_a_dead_evictors_slots(tmp_path, monkeypatch):
     """The reaper keeps its job: an EVICTING slot nobody freed for longer
     than the stale age goes back to FREE."""
-    from sglang.srt.mem_cache.storage.file import hicache_arena as _ha
+    from flliper.srt.mem_cache.storage.file import hicache_arena as _ha
 
     be, arena = _backend(tmp_path, monkeypatch)
     assert _put(arena, _stem(be, "aa"), 0x11) == [1]
@@ -258,7 +258,7 @@ def _put_blob(arena, stem, seed):
 
 
 def test_blob_copy_writes_a_crc_sidecar_and_the_fill_verifies_it(tmp_path, monkeypatch):
-    from sglang.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.mem_cache import hicache_storage as hs
 
     be, arena = _blob_backend(tmp_path, monkeypatch)
     sa = be._get_suffixed_key("cc" + "ab" * 30 + ".mamba")
@@ -277,7 +277,7 @@ def test_blob_copy_writes_a_crc_sidecar_and_the_fill_verifies_it(tmp_path, monke
 
 
 def test_a_blob_whose_bytes_changed_on_disk_is_a_named_miss_and_moved_aside(tmp_path, monkeypatch):
-    from sglang.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.mem_cache import hicache_storage as hs
 
     be, arena = _blob_backend(tmp_path, monkeypatch)
     sa = be._get_suffixed_key("dd" + "ab" * 30 + ".mamba")
@@ -299,7 +299,7 @@ def test_a_blob_whose_bytes_changed_on_disk_is_a_named_miss_and_moved_aside(tmp_
 
 
 def test_a_blob_without_a_sidecar_is_read_as_before(tmp_path, monkeypatch):
-    from sglang.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.mem_cache import hicache_storage as hs
 
     be, arena = _blob_backend(tmp_path, monkeypatch)
     sa = be._get_suffixed_key("ee" + "ab" * 30 + ".mamba")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SGLang CI Auto Bisect
+fLLiper CI Auto Bisect
 
 Fetches recent Nvidia scheduled PR Test runs, identifies consistently failing
 tests, and calls Claude to classify each as regression/flaky/hardware/environment.
@@ -37,7 +37,7 @@ GITHUB_API = "https://api.github.com"
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Path to the bisect skill definition (relative to repo root)
-BISECT_SKILL_PATH = ".claude/skills/sglang-bisect-ci-regression/SKILL.md"
+BISECT_SKILL_PATH = ".claude/skills/flliper-bisect-ci-regression/SKILL.md"
 
 # Jobs to exclude from analysis (administrative/setup, not actual tests)
 EXCLUDED_JOBS = [
@@ -557,28 +557,28 @@ def _infer_related_paths(test_file: str) -> List[str]:
         core = core[:-3]
 
     path_hints = {
-        "lora": ["python/sglang/srt/lora/"],
-        "moe": ["python/sglang/srt/layers/moe/"],
-        "tp": ["python/sglang/srt/distributed/"],
-        "dp": ["python/sglang/srt/distributed/"],
-        "endpoint": ["python/sglang/srt/entrypoints/"],
-        "openai": ["python/sglang/srt/entrypoints/openai/"],
-        "anthropic": ["python/sglang/srt/entrypoints/anthropic/"],
-        "server": ["python/sglang/srt/entrypoints/"],
-        "engine": ["python/sglang/srt/"],
-        "sampling": ["python/sglang/srt/sampling/"],
-        "tokenizer": ["python/sglang/srt/managers/tokenizer_manager.py"],
-        "schedule": ["python/sglang/srt/managers/schedule_batch.py"],
-        "radix": ["python/sglang/srt/mem_cache/"],
-        "cuda_graph": ["python/sglang/srt/layers/cuda_graph_runner.py"],
-        "attention": ["python/sglang/srt/layers/attention/"],
-        "quantiz": ["python/sglang/srt/layers/quantization/"],
-        "specul": ["python/sglang/srt/speculative/"],
-        "vision": ["python/sglang/srt/models/"],
-        "embed": ["python/sglang/srt/layers/"],
-        "kernel": ["sgl-kernel/", "python/sglang/srt/layers/"],
+        "lora": ["python/flliper/srt/lora/"],
+        "moe": ["python/flliper/srt/layers/moe/"],
+        "tp": ["python/flliper/srt/distributed/"],
+        "dp": ["python/flliper/srt/distributed/"],
+        "endpoint": ["python/flliper/srt/entrypoints/"],
+        "openai": ["python/flliper/srt/entrypoints/openai/"],
+        "anthropic": ["python/flliper/srt/entrypoints/anthropic/"],
+        "server": ["python/flliper/srt/entrypoints/"],
+        "engine": ["python/flliper/srt/"],
+        "sampling": ["python/flliper/srt/sampling/"],
+        "tokenizer": ["python/flliper/srt/managers/tokenizer_manager.py"],
+        "schedule": ["python/flliper/srt/managers/schedule_batch.py"],
+        "radix": ["python/flliper/srt/mem_cache/"],
+        "cuda_graph": ["python/flliper/srt/layers/cuda_graph_runner.py"],
+        "attention": ["python/flliper/srt/layers/attention/"],
+        "quantiz": ["python/flliper/srt/layers/quantization/"],
+        "specul": ["python/flliper/srt/speculative/"],
+        "vision": ["python/flliper/srt/models/"],
+        "embed": ["python/flliper/srt/layers/"],
+        "kernel": ["sgl-kernel/", "python/flliper/srt/layers/"],
         "bench": ["benchmark/"],
-        "constrained": ["python/sglang/srt/constrained/"],
+        "constrained": ["python/flliper/srt/constrained/"],
     }
 
     for hint, hint_paths in path_hints.items():
@@ -586,7 +586,7 @@ def _infer_related_paths(test_file: str) -> List[str]:
             paths.extend(hint_paths)
 
     if len(paths) == 1:
-        paths.append("python/sglang/srt/")
+        paths.append("python/flliper/srt/")
 
     return paths
 
@@ -852,7 +852,7 @@ Classify as exactly ONE of: code_regression, flaky_test, hardware_issue, environ
 - If commit range is empty (same SHA) -> the failure predates this range, check if flaky
 - If candidate commits are empty but failures are consistent -> environment change or hardware"""
 
-    return f"""You are an expert CI regression analyst for the SGLang project (a high-performance LLM serving framework).
+    return f"""You are an expert CI regression analyst for the fLLiper project (a high-performance LLM serving framework).
 
 ## Task
 Analyze this CI test failure and classify its root cause. Be precise and evidence-based.
@@ -1078,7 +1078,7 @@ def run_bisection_analysis(
 ) -> dict:
     """Main orchestration: fetch failures, gather context, call Claude, report."""
     print("=" * 80)
-    print("SGLang CI Auto Bisect")
+    print("fLLiper CI Auto Bisect")
     print("=" * 80)
 
     # Load bisect skill methodology for prompt construction
@@ -1230,7 +1230,7 @@ def run_bisection_analysis(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SGLang CI Auto Bisect")
+    parser = argparse.ArgumentParser(description="fLLiper CI Auto Bisect")
     parser.add_argument(
         "--github-token",
         required=True,

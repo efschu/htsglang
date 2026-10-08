@@ -32,12 +32,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.srt.planner import cost_model as cm
-from sglang.srt.planner import key_solver as ks
-from sglang.srt.planner import lever_profiles as lp
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.srt.planner import cost_model as cm
+from flliper.srt.planner import key_solver as ks
+from flliper.srt.planner import lever_profiles as lp
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -230,7 +230,7 @@ class _Checkpoints(CustomTestCase):
             os.makedirs(path, exist_ok=True)
             setattr(cls, name, _write_checkpoint(path, quant))
         cls._env = mock.patch.dict(
-            os.environ, {"SGLANG_MAMBA_SSM_DTYPE": "bfloat16"}, clear=False
+            os.environ, {"FLLIPER_MAMBA_SSM_DTYPE": "bfloat16"}, clear=False
         )
         cls._env.start()
 
@@ -242,7 +242,7 @@ class _Checkpoints(CustomTestCase):
 
     @staticmethod
     def _inputs(model_path):
-        from sglang.srt.uneven_perf import PlanInputs
+        from flliper.srt.uneven_perf import PlanInputs
 
         return PlanInputs(
             tp_size=3,
@@ -330,7 +330,7 @@ class TestAbsentLinkNeverRanks(CustomTestCase):
 
 
 def _tiny_cost_model():
-    from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+    from flliper.srt.uneven_perf import PerfCostModel, PlanInputs
 
     tmp = tempfile.mkdtemp()
     path = _write_checkpoint(tmp, None)
@@ -342,13 +342,13 @@ def _tiny_cost_model():
         rank_gpu_id=[0, 1, 2],
         effective_vram_mib=[29607, 17780, 17780],
     )
-    with mock.patch.dict(os.environ, {"SGLANG_MAMBA_SSM_DTYPE": "bfloat16"}):
+    with mock.patch.dict(os.environ, {"FLLIPER_MAMBA_SSM_DTYPE": "bfloat16"}):
         return PerfCostModel(inputs, [1, 1, 1], [29607, 17780, 17780])
 
 
 def _lever_report_without_a_link():
     """The lever surface on a rig whose link matrix was never measured."""
-    from sglang.srt.planner import webui
+    from flliper.srt.planner import webui
 
     tmp = tempfile.mkdtemp()
     model = _write_checkpoint(tmp, _FP8_QUANT)
@@ -363,7 +363,7 @@ def _lever_report_without_a_link():
         "max_running_requests": 16,
     }
     with mock.patch.object(lp, "_load_pair_matrix", return_value=(None, [])):
-        with mock.patch.dict(os.environ, {"SGLANG_MAMBA_SSM_DTYPE": "bfloat16"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_MAMBA_SSM_DTYPE": "bfloat16"}):
             report = webui.lever_profiles_payload(payload)
     assert report.get("ok"), report.get("reasons")
     return report

@@ -38,8 +38,8 @@ network.
 
 import pytest
 
-from sglang.srt.managers import phase_policy as pp
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers import phase_policy as pp
+from flliper.srt.managers.phase_policy import (
     MIN_DECODE_STEPS_PER_PHASE,
     PP_TO_TP,
     PhasePolicyInputs,

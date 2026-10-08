@@ -16,7 +16,7 @@ Shapes and scale magnitudes follow real NVFP4 MoE checkpoints rather than toy
 sizes, so a failure looks like one a real checkpoint would hit.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -29,11 +29,11 @@ import torch
 # schemes package; the quantization-package-first order masks it. The isort
 # guards keep that order.
 # isort: off
-from sglang.srt.layers.quantization.modelopt_quant import _compute_gemm1_alphas
-from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import _compute_g1_scale_c
+from flliper.srt.layers.quantization.modelopt_quant import _compute_gemm1_alphas
+from flliper.srt.layers.moe.moe_runner.flashinfer_trtllm import _compute_g1_scale_c
 
 # isort: on
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # Representative NVFP4 MoE shapes (name, num_experts, hidden, intermediate,
 # is_gated). Only num_experts and is_gated matter to the scale helpers; hidden

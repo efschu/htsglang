@@ -29,20 +29,20 @@ The size asymmetry is W26's measured one, per rank, in MiB:
 PP0 15925.8 / 16362.7, PP1 8573.8 / 8961.3, PP2 8573.8 / 9481.6.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.model_executor.rotation_plan import (
+from flliper.srt.model_executor.rotation_plan import (
     RotationPlanError,
     peak_ram_bytes,
     plan_rotation,
     rotation_overshoot_bytes,
     rotation_totals,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 MIB = 1024 * 1024
 CHUNK = 32 * MIB
@@ -240,7 +240,7 @@ class TestTheImageTrailerIsTheOnlyNewBYTES(CustomTestCase):
     def test_the_image_is_arena_bytes_plus_an_int64_trailer(self):
         import inspect
 
-        from sglang.srt.model_executor import weights_arena
+        from flliper.srt.model_executor import weights_arena
 
         src = inspect.getsource(weights_arena.arena_refill)
         self.assertIn("payload = image[: layout.total_bytes]", src)
@@ -253,7 +253,7 @@ class TestTheImageTrailerIsTheOnlyNewBYTES(CustomTestCase):
         # way bytes that came from disk do.
         import inspect
 
-        from sglang.srt.model_executor import weights_arena
+        from flliper.srt.model_executor import weights_arena
 
         src = inspect.getsource(weights_arena.arena_refill)
         self.assertIn("uint8_checksum(dst)", src)

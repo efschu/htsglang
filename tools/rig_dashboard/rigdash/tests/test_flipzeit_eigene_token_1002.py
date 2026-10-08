@@ -33,13 +33,13 @@ def _ipc_dp():
     """y7y Erstflip D>P: park_rpc_sent 32,463, begin 33,891, done 37,571, PP0 first forward 37,776."""
     ev = [_ev("flip_begin", T + 33.891, flip_begin_ts=T + 33.891, sleep="D", wake="P", epoch_before=0),
           _ev("flip_done", T + 37.571, flip_begin_ts=T + 33.891, t=T + 37.571, flip_ms=1703, epoch=1, sleep="D", wake="P")]
-    ut = [{"dir": "D>P", "epoch": 1, "flip_user_ms": 5313, "idle_flip": False, "rid": "weg2-1-1", "start_ts": T + 32.463,
+    ut = [{"dir": "D>P", "epoch": 1, "flip_user_ms": 5313, "idle_flip": False, "rid": "pdflip-1-1", "start_ts": T + 32.463,
            "start_source": "park_rpc_sent", "prefill_start_ts": T + 37.776, "prefill_start_source": "pp_first_forward"}]
     return {"ipc_events": ev, "flip_user_time": ut, "flip_first_work": []}
 
 
 SEGS = [{"s": T + 0.0, "e": T + 120.0, "k": "unknown"}]
-ARR = {"weg2-1-1": T + 26.0}       # the waiter arrived before D's last token: start = that token
+ARR = {"pdflip-1-1": T + 26.0}       # the waiter arrived before D's last token: start = that token
 D_ROUNDS = [(T + 26.39, T + 26.405), (T + 26.40, T + 26.417)]
 
 

@@ -37,15 +37,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate
-from sglang.srt.distributed.device_communicators.barlink import BarlinkCommunicator
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators import barlink_abort_gate
+from flliper.srt.distributed.device_communicators.barlink import BarlinkCommunicator
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     Bar1CollectiveAborted,
     BarlinkBar1Transport,
 )
-from sglang.srt.utils import jit_cold_build
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import jit_cold_build
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -147,7 +147,7 @@ class TestDeadlineReachesTheKernel(CustomTestCase):
     def test_the_multiplier_is_honoured_from_the_environment(self):
         t = _transport()
         with mock.patch.dict(
-            os.environ, {"SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT": "7"}, clear=False
+            os.environ, {"FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT": "7"}, clear=False
         ):
             with jit_cold_build.cold_build_window("test"):
                 self.assertEqual(t._deadline_cycles(), CAP * 7)
@@ -188,7 +188,7 @@ class TestDeadlineReachesTheKernel(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.distributed.device_communicators import barlink_bar1
+        from flliper.srt.distributed.device_communicators import barlink_bar1
 
         src = inspect.getsource(barlink_bar1)
         self.assertNotIn("int(self.cap_cycles), int(self.threads)", src)
@@ -283,7 +283,7 @@ class TestCaptureSafety(CustomTestCase):
 
     def _capturing(self, value):
         return mock.patch(
-            "sglang.srt.distributed.device_communicators.barlink."
+            "flliper.srt.distributed.device_communicators.barlink."
             "graph_capture_running",
             return_value=value,
         )
@@ -345,7 +345,7 @@ class TestCaptureSafety(CustomTestCase):
 
         root = (
             pathlib.Path(__file__).resolve().parents[4]
-            / "python/sglang/srt/model_executor/runner_backend"
+            / "python/flliper/srt/model_executor/runner_backend"
         )
         for name in ("full_cuda_graph_backend.py", "breakable_cuda_graph_backend.py"):
             src = (root / name).read_text()
@@ -434,7 +434,7 @@ class TestColdBuildWindowLogsItsClose(CustomTestCase):
     falsify a leak.
     """
 
-    LOGGER = "sglang.srt.utils.jit_cold_build"
+    LOGGER = "flliper.srt.utils.jit_cold_build"
 
     def test_open_and_close_are_both_logged(self):
         with self.assertLogs(self.LOGGER, level="INFO") as cm:

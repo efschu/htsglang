@@ -1,11 +1,11 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.streaming_session_kit import StreamingSessionKitMixin
-from sglang.test.server_fixtures.streaming_session_fixture import (
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.streaming_session_kit import StreamingSessionKitMixin
+from flliper.test.server_fixtures.streaming_session_fixture import (
     StreamingSessionServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
@@ -20,7 +20,7 @@ class TestStreamingSessionRetractMixedChunk(
     """Retract + --enable-mixed-chunk."""
 
     extra_args = ["--chunked-prefill-size", "128", "--enable-mixed-chunk"]
-    env_overrides = [("SGLANG_TEST_RETRACT", True)]
+    env_overrides = [("FLLIPER_TEST_RETRACT", True)]
 
 
 class TestStreamingSessionRetractLargePage(
@@ -30,7 +30,7 @@ class TestStreamingSessionRetractLargePage(
     free would corrupt pages still holding committed tokens."""
 
     extra_args = ["--chunked-prefill-size", "4096", "--page-size", "256"]
-    env_overrides = [("SGLANG_TEST_RETRACT", True)]
+    env_overrides = [("FLLIPER_TEST_RETRACT", True)]
 
 
 # Common EAGLE3 spec args; reused by Eagle/EagleV2/EagleRetractLargePage variants.
@@ -62,7 +62,7 @@ class TestStreamingSessionEagle(StreamingSessionServerBase, StreamingSessionKitM
         "512",
         *_EAGLE3_SPEC_ARGS,
     ]
-    env_overrides = [("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True)]
+    env_overrides = [("FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True)]
 
 
 class TestStreamingSessionEagleV2(StreamingSessionServerBase, StreamingSessionKitMixin):
@@ -75,7 +75,7 @@ class TestStreamingSessionEagleV2(StreamingSessionServerBase, StreamingSessionKi
         *_EAGLE3_SPEC_ARGS,
     ]
     env_overrides = [
-        ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
+        ("FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
     ]
 
 
@@ -97,8 +97,8 @@ class TestStreamingSessionEagleRetractLargePage(
         "256",
     ]
     env_overrides = [
-        ("SGLANG_TEST_RETRACT", True),
-        ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
+        ("FLLIPER_TEST_RETRACT", True),
+        ("FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
     ]
 
 

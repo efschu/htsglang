@@ -15,10 +15,10 @@ import re
 
 import pytest
 
-from sglang.srt.weg2 import launcher as lx
+from flliper.srt.pdflip import launcher as lx
 
 
-def test_heben_wird_benannt_verweigert():
+def test_raise_is_refused_by_name():
     with pytest.raises(RuntimeError) as ei:
         lx._refuse_if_extra_raises_budget(
             [28240, 16672, 16672],
@@ -30,37 +30,37 @@ def test_heben_wird_benannt_verweigert():
     assert "28240" in t and "29900" in t and "+1660" in t
 
 
-def test_senken_ist_erlaubt():
+def test_lowering_is_allowed():
     lx._refuse_if_extra_raises_budget(
         [28240, 16672, 16672], ["--rank-gpu-memory-mib", "27000,16000,16000"], "D"
     )
 
 
-def test_gleich_ist_erlaubt():
+def test_equal_is_allowed():
     lx._refuse_if_extra_raises_budget(
         [28240, 16672], ["--rank-gpu-memory-mib", "28240,16672"], "D"
     )
 
 
-def test_gleichheitszeichen_form_wird_auch_gesehen():
+def test_equals_sign_form_is_seen_too():
     with pytest.raises(RuntimeError, match="W100"):
         lx._refuse_if_extra_raises_budget(
             [100, 100], ["--rank-gpu-memory-mib=200,100"], "P"
         )
 
 
-def test_ohne_die_flag_passiert_nichts():
+def test_without_flag_nothing_happens():
     lx._refuse_if_extra_raises_budget([1, 2], ["--irgendwas", "5"], "D")
     lx._refuse_if_extra_raises_budget([1, 2], [], "D")
 
 
-def test_unlesbarer_wert_ist_kein_freibrief():
+def test_unreadable_value_is_no_free_pass():
     # Er ueberschreibt trotzdem -- Schweigen waere hier das Gefaehrlichste.
     with pytest.raises(RuntimeError, match="W100"):
         lx._refuse_if_extra_raises_budget([1, 2], ["--rank-gpu-memory-mib", "auto"], "D")
 
 
-def test_andere_laenge_wird_verweigert():
+def test_other_length_is_refused():
     with pytest.raises(RuntimeError, match="W100"):
         lx._refuse_if_extra_raises_budget(
             [1, 2, 3], ["--rank-gpu-memory-mib", "1,2"], "D"
@@ -68,13 +68,13 @@ def test_andere_laenge_wird_verweigert():
 
 
 @pytest.mark.parametrize("fn", ["argv_d", "argv_p"])
-def test_die_argv_bauer_rufen_den_riegel(fn):
+def test_argv_builders_call_the_guard(fn):
     src = inspect.getsource(getattr(lx, fn))
     assert "_refuse_if_extra_raises_budget(budgets" in src, (
         f"{fn} baut argv, ohne den Riegel zu rufen -- dann gewinnt die "
         f"extra-Flag wieder still."
     )
     # Und zwar VOR dem return, sonst ist er unerreichbar.
-    i_riegel = src.index("_refuse_if_extra_raises_budget")
+    i_guard = src.index("_refuse_if_extra_raises_budget")
     i_return = src.index("return ", src.index("List[str]:"))
-    assert i_riegel < i_return
+    assert i_guard < i_return

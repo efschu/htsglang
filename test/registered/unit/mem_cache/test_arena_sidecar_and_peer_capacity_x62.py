@@ -28,15 +28,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     StorageOperation,
 )
-from sglang.srt.mem_cache.pool_host import arena_pool as ap
-from sglang.srt.mem_cache.pool_host.base import NO_KV_RANK_TOKENS
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.mem_cache.pool_host import arena_pool as ap
+from flliper.srt.mem_cache.pool_host.base import NO_KV_RANK_TOKENS
+from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 # ---- 1. sidecar filter and sidecar-only backup -----------------------------
@@ -128,8 +128,8 @@ def test_the_arena_pool_bids_its_id_space_not_its_ring():
     p = object.__new__(ap.ArenaMHAHostPool)
     p.page_size = 64
     p.size_per_token = 12288  # 12 attention layers x 1024 B (Next Flash fp8)
-    with mock.patch.dict(os.environ, {"SGLANG_HICACHE_ARENA_GIB": "2"}, clear=False):
-        os.environ.pop("SGLANG_HICACHE_ARENA_KV_PAGE_BYTES", None)
+    with mock.patch.dict(os.environ, {"FLLIPER_HICACHE_ARENA_GIB": "2"}, clear=False):
+        os.environ.pop("FLLIPER_HICACHE_ARENA_KV_PAGE_BYTES", None)
         slots = ap.planned_arena_slots(12288 * 64)
         assert slots == max(1024, (2 << 30) // 786432) == 2730
         assert p._carrier_capacity_bid(4096) == 4096 + 2730 * 64
@@ -172,15 +172,15 @@ def test_a_paged_pool_loads_without_a_jit_build_by_default():
     > 150 s while the workers died at the BAR1 cycle deadline. H12: the paged
     default is the DMA from the registered arena (no JIT, no CPU gather)."""
     with mock.patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", None)
+        os.environ.pop("FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE", None)
         assert ap._arena_page_load_mode(32768) == "kernel"   # 27B: a warm build
         assert ap._arena_page_load_mode(0) == "kernel"
         assert ap._arena_page_load_mode(786432) == "dma"
 
 
 def test_an_explicit_page_load_mode_wins_for_both_page_sizes():
-    with mock.patch.dict(os.environ, {"SGLANG_WEG2_ARENA_PAGE_LOAD_MODE": "kernel"}, clear=False):
+    with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE": "kernel"}, clear=False):
         assert ap._arena_page_load_mode(786432) == "kernel"
-    with mock.patch.dict(os.environ, {"SGLANG_WEG2_ARENA_PAGE_LOAD_MODE": "cpu"}, clear=False):
+    with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE": "cpu"}, clear=False):
         assert ap._arena_page_load_mode(32768) == "cpu"
         assert ap._arena_page_load_mode(786432) == "cpu"   # H12 A/B: the old paged form

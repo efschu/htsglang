@@ -24,7 +24,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     ExpertResidencyPlanner,
     MoEExpertOffloadCache,
     plan_token_waves,

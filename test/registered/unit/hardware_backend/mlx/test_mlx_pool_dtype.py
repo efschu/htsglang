@@ -19,8 +19,8 @@ from __future__ import annotations
 import importlib.util
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 register_mlx_ci(est_time=4, suite="stage-a-unit-test-mlx")
@@ -36,11 +36,11 @@ if _HAS_MLX:
     import mlx.nn as nn
     from mlx_lm.models import qwen2
 
-    from sglang.srt.hardware_backend.mlx.kv_cache import (
+    from flliper.srt.hardware_backend.mlx.kv_cache import (
         MlxModelCacheLayout,
         find_attention_layers,
     )
-    from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
+    from flliper.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
 
 def _tiny_qwen2_model():

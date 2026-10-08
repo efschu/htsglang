@@ -33,9 +33,9 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
-from sglang.srt.model_executor import weights_arena as wa
-from sglang.srt.managers.phase_flip_boot import PhaseFlipStacks
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from flliper.srt.model_executor import weights_arena as wa
+from flliper.srt.managers.phase_flip_boot import PhaseFlipStacks
 
 PAYLOAD = 4096
 
@@ -189,7 +189,7 @@ class TestTheRealMoverOnlyRestores(unittest.TestCase):
         rotation declares the arena undefined and refuses. What must NOT
         happen either way is a rebuild, which is what this file is about.
         """
-        from sglang.srt.model_executor.rotation_executor import RotationHazard
+        from flliper.srt.model_executor.rotation_executor import RotationHazard
 
         corrupt = _image(0xCD)
         corrupt[0] = 0x01  # payload no longer matches its trailer

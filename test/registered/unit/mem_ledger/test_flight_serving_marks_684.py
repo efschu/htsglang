@@ -18,7 +18,7 @@ sampler already runs during serving at 100 ms and already calls
     process that crashes, so the evidence goes with it;
   * ``Sample`` retains free/self/reserved/allocated and DISCARDS the per-pid
     map it just read, so it cannot name a foreign holder even while running;
-  * it is off unless ``SGLANG_CORRIDOR_TRACE_MS`` is set, and it was not set on
+  * it is off unless ``FLLIPER_CORRIDOR_TRACE_MS`` is set, and it was not set on
     the boot that died.
 
 Marks are appended to a file and therefore SURVIVE the crash. That is not a
@@ -47,9 +47,9 @@ import unittest
 from typing import Any, Dict
 from unittest import mock
 
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_ledger import flight_recorder as fr
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_ledger import flight_recorder as fr
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

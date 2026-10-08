@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
+from flliper.srt.managers.schedule_batch import Modality
+from flliper.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
     EmbeddingCacheController,
     EmbeddingCacheEntry,
     EmbeddingPool,
@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller impo
     RangePageAllocator,
     build_transfer_buffers,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -391,7 +391,7 @@ class TestTransferBuffers(unittest.TestCase):
 
 class TestMooncakeEmbeddingStoreWrappers(unittest.TestCase):
     def test_batch_put_multi_buffers_deduplicates_existing_keys(self):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
+        from flliper.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
             MooncakeEmbeddingStore,
         )
 
@@ -412,7 +412,7 @@ class TestMooncakeEmbeddingStoreWrappers(unittest.TestCase):
         )
 
     def test_batch_get_multi_buffers_maps_positive_result_to_true(self):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
+        from flliper.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
             MooncakeEmbeddingStore,
         )
 

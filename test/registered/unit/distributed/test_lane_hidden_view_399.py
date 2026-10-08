@@ -38,9 +38,9 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.dual_group_lane import DualGroupLane
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.dual_group_lane import DualGroupLane
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -264,11 +264,11 @@ class TestHiddenIsNotAViewIntoTheForwardOutput(CustomTestCase):
 
     def setUp(self):
         for var in (
-            "SGLANG_LANE_MARGIN_PROBE",
-            "SGLANG_LANE_SPEC_DEBUG",
-            "SGLANG_LANE_SPEC_ROW_ORACLE",
-            "SGLANG_LANE_SPEC_TV_MAX_ACCEPT",
-            "SGLANG_LANE_SPEC_VERIFY",
+            "FLLIPER_LANE_MARGIN_PROBE",
+            "FLLIPER_LANE_SPEC_DEBUG",
+            "FLLIPER_LANE_SPEC_ROW_ORACLE",
+            "FLLIPER_LANE_SPEC_TV_MAX_ACCEPT",
+            "FLLIPER_LANE_SPEC_VERIFY",
         ):
             os.environ.pop(var, None)
 
@@ -344,7 +344,7 @@ class TestWhatAWrittenThroughHiddenCosts(CustomTestCase):
     """
 
     def setUp(self):
-        for var in ("SGLANG_LANE_MARGIN_PROBE", "SGLANG_LANE_SPEC_DEBUG"):
+        for var in ("FLLIPER_LANE_MARGIN_PROBE", "FLLIPER_LANE_SPEC_DEBUG"):
             os.environ.pop(var, None)
 
     def _run(self, rounds, intervening_replay):

@@ -1,4 +1,4 @@
-"""H68d: the fp8 PLE table on sm86 (SGLANG_WEG2_PLE_FP8_DECODE, qwen4_exp_ple_fp8.py).
+"""H68d: the fp8 PLE table on sm86 (FLLIPER_PDFLIP_PLE_FP8_DECODE, qwen4_exp_ple_fp8.py).
 
 The nvidia NVFP4 export keeps the PLE n-gram table in float8_e4m3fn. Every PLE
 gather typed it as ``tl.float8e4nv``, which Triton refuses below sm89 -- the
@@ -42,13 +42,13 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 from triton.runtime.interpreter import InterpretedFunction
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.qsa import sparse_attn as sa
-from sglang.srt.models import qwen4_exp as qe
-from sglang.srt.models import qwen4_exp_ple_decode_pread as dp
-from sglang.srt.models import qwen4_exp_ple_fp8 as pf8
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.qsa import sparse_attn as sa
+from flliper.srt.models import qwen4_exp as qe
+from flliper.srt.models import qwen4_exp_ple_decode_pread as dp
+from flliper.srt.models import qwen4_exp_ple_fp8 as pf8
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
@@ -57,7 +57,7 @@ BLOCK_D = 256
 ROWS_PER_SHARD = 4
 SHARDS = 2
 TOTAL = ROWS_PER_SHARD * SHARDS
-LOGGER = "sglang.srt.models.qwen4_exp_ple_fp8"
+LOGGER = "flliper.srt.models.qwen4_exp_ple_fp8"
 
 
 # --------------------------------------------------------------------------
@@ -115,7 +115,7 @@ class TestSelection(CustomTestCase):
                     mock.patch.dict(pf8._MODE_CACHE, {}, clear=True), \
                     mock.patch.object(pf8, "_NOTED", set()), \
                     mock.patch.object(pf8.torch.cuda, "get_device_capability", return_value=cap), \
-                    envs.SGLANG_WEG2_PLE_FP8_DECODE.override(raw), \
+                    envs.FLLIPER_PDFLIP_PLE_FP8_DECODE.override(raw), \
                     self.assertLogs(LOGGER, level=logging.INFO) as logs:
                 dev = torch.device("cuda", 0)
                 self.assertEqual(pf8.ple_fp8_decode_arg(torch.float8_e4m3fn, dev), want)

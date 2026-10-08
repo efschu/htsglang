@@ -1,6 +1,6 @@
 """Unit tests for the measured KV-budget path (#188) -- CPU only, no GPU.
 
-SGLANG_MEASURED_KV_BUDGET=1 sizes this boot's KV pool from the PREVIOUS
+FLLIPER_MEASURED_KV_BUDGET=1 sizes this boot's KV pool from the PREVIOUS
 boot's measured leftover. Two identical commands therefore produced
 max_total_num_tokens 380289 and 447173 (measured, R3 validation window),
 and nothing in the boot log said so. Three separable defects:
@@ -20,12 +20,12 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.environ import envs
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -174,7 +174,7 @@ class TestCrossBootProvenanceIsAnnounced(CustomTestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self._tmp.name, "budget.json")
-        self._env = envs.SGLANG_MEASURED_KV_BUDGET.override(True)
+        self._env = envs.FLLIPER_MEASURED_KV_BUDGET.override(True)
         self._env.__enter__()
 
     def tearDown(self):

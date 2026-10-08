@@ -2,7 +2,7 @@
 depth_page=484: the stored key 37d19e9e2e7a409b is not this page's key (P's -,
 own 4d1f1b4bf648aed6) and no admissible key has a COMPLETE slot" -- D dead in
 load_back, TP1/TP2 (Form A workers, 0-byte KV) had already taken #988 LOADBACK
-33024. weg2-2-15: first piece to 30976 (INCOMPLETE, shortfall 2048), second
+33024. pdflip-2-15: first piece to 30976 (INCOMPLETE, shortfall 2048), second
 piece 2048 tokens (success), P's hand-off chain ends at page 483.
 
 ROOT (the proof's own blind spot): the tree keys an EAGLE (bigram) RadixKey,
@@ -30,9 +30,9 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
-from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
-from sglang.srt.mem_cache.utils import get_hash_str  # noqa: E402
+from flliper.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
+from flliper.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
+from flliper.srt.mem_cache.utils import get_hash_str  # noqa: E402
 
 P = 4
 S = 5
@@ -102,7 +102,7 @@ def _tree(arena, *, own_keys):
     """A parented tree: root -> n11 (page 0, on device) -> n12 (pages 1-2,
     host; page 1's rows point at page 2's slot -- a twin, so the chain is
     proven page by page) -> n13 (pages 3-4, the second piece, host, read-convention keys)."""
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
     pool = _pool(arena)
     backend = types.SimpleNamespace(_suffix_for_key=lambda k: ("", False))
@@ -125,14 +125,14 @@ def _tree(arena, *, own_keys):
     n11 = node(11, 0, 1, [PK[0]], _rows([9]), root, False)
     n12 = node(12, 1, 3, [PK[1], PK[2]], _rows([6, 6]), n11, True)      # page 1 on page 2's slot: a twin
     n13 = node(13, 3, 5, own_keys, _rows([SLOT_OF.get(k, 13) for k in own_keys]), n12, True)
-    req = types.SimpleNamespace(rid="weg2-2-15")
-    from sglang.srt.weg2.handoff_keys import CHAIN_ATTR
+    req = types.SimpleNamespace(rid="pdflip-2-15")
+    from flliper.srt.pdflip.handoff_keys import CHAIN_ATTR
     setattr(req, CHAIN_ATTR, list(PK))
     return tree, pool, (n12, n13), req
 
 
 def _xfer(nodes):
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
     return types.SimpleNamespace(
         nodes_to_load=list(nodes),
         host_indices=torch.cat([n.component_data[urc.BASE_COMPONENT_TYPE].host_value for n in nodes]))
@@ -150,7 +150,7 @@ def test_metal_shape_a_read_convention_second_piece_is_proven_and_loads_its_own_
     only the tree's bigram key -> 'CHAIN MISMATCH ... cannot be proven', the
     13:36:10 death. With the read convention admissible, the chain is proven,
     page 1 re-pointed, and the load returns each page's own slot."""
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
     arena = _Arena(SLOT_OF)
     tree, pool, nodes, req = _tree(arena, own_keys=[K3, K4])
@@ -178,12 +178,12 @@ def test_an_unprovable_page_cuts_the_proof_depth_instead_of_the_rank():
     12 -- and the load still refuses by name (the last latch)."""
     arena = _Arena({k: v for k, v in SLOT_OF.items() if k != K3})
     tree, _pool_, nodes, req = _tree(arena, own_keys=["ab" * 32, K4])
-    assert tree.weg2_chain_proof_depth(nodes[1], req) == 3 * P
+    assert tree.pdflip_chain_proof_depth(nodes[1], req) == 3 * P
     with pytest.raises(ap.ArenaChainMismatch, match="depth_page=3"):
         tree._1424_verify_load_chain(_xfer(nodes), req=req)
     # a fully proven chain has nothing to cut
     tree2, _p2, nodes2, req2 = _tree(_Arena(SLOT_OF), own_keys=[K3, K4])
-    assert tree2.weg2_chain_proof_depth(nodes2[1], req2) is None
+    assert tree2.pdflip_chain_proof_depth(nodes2[1], req2) is None
 
 
 class _ProbeTree:
@@ -203,12 +203,12 @@ class _ProbeTree:
         return types.SimpleNamespace(device_indices=torch.empty(0), host_hit_length=n,
                                      best_match_node=object())
 
-    def weg2_chain_proof_depth(self, node, req):
+    def pdflip_chain_proof_depth(self, node, req):
         return self.cut
 
 
 def _req(total):
-    return types.SimpleNamespace(rid="weg2-2-15", origin_input_ids=list(range(total)), output_ids=[],
+    return types.SimpleNamespace(rid="pdflip-2-15", origin_input_ids=list(range(total)), output_ids=[],
                                  _compute_max_prefix_len=lambda n: n - 1)
 
 
@@ -218,7 +218,7 @@ def test_the_form_a_host_votes_the_last_proven_page_group_uniform():
     admission on the key cut at the proven depth (anchor rule included): 13
     proven tokens -> the anchor at 8. The group MIN then takes every rank
     there; the workers adopt it."""
-    from sglang.srt.managers import tp_match_floor as tmf
+    from flliper.srt.managers import tp_match_floor as tmf
 
     t = _ProbeTree(total=40 + P, cut=13)
     assert tmf.admission_probe(t, _req(45), follow=False) == 8
@@ -232,9 +232,9 @@ def test_the_form_a_host_votes_the_last_proven_page_group_uniform():
 
 
 def _x_gate(monkeypatch, *, total, head, floor, x):
-    from sglang.srt.managers import scheduler as sched
-    from sglang.srt.managers import tp_head_congruence as thc
-    from sglang.srt.managers import tp_match_floor as tmf
+    from flliper.srt.managers import scheduler as sched
+    from flliper.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_match_floor as tmf
 
     monkeypatch.setattr(thc, "group_match_for", lambda inputs, rid: head)
     monkeypatch.setattr(thc, "group_store_match_for", lambda inputs, rid: None)
@@ -242,8 +242,8 @@ def _x_gate(monkeypatch, *, total, head, floor, x):
     s.server_args = types.SimpleNamespace(tp_prefill_max_tokens=x)
     s.ps = types.SimpleNamespace(tp_size=3)
     s.tree_cache = types.SimpleNamespace()
-    tmf.plant(s.tree_cache, {"weg2-2-15": floor} if floor is not None else None)
-    req = types.SimpleNamespace(rid="weg2-2-15", full_untruncated_fill_ids=list(range(total)),
+    tmf.plant(s.tree_cache, {"pdflip-2-15": floor} if floor is not None else None)
+    req = types.SimpleNamespace(rid="pdflip-2-15", full_untruncated_fill_ids=list(range(total)),
                                 prefix_indices=[], host_hit_length=head)
     return s, req
 
@@ -252,8 +252,8 @@ def test_rest_within_x_is_prefilled_on_d(monkeypatch):
     """Cut at 30976 of 33175 (rc12n2 shape): rest 2199 <= X=12288 -> the X
     gate admits, D re-prefills the rest from the last proven page."""
     s, req = _x_gate(monkeypatch, total=33175, head=33024, floor=30976, x=12288)
-    assert s.weg2_uncached_extent(req, head_inputs=object()) == 33175 - 30976
-    assert s._weg2_x_refuses(req, head_inputs=object()) is False
+    assert s.pdflip_uncached_extent(req, head_inputs=object()) == 33175 - 30976
+    assert s._pdflip_x_refuses(req, head_inputs=object()) is False
 
 
 def test_rest_beyond_x_goes_via_p(monkeypatch):
@@ -261,12 +261,12 @@ def test_rest_beyond_x_goes_via_p(monkeypatch):
     -> admit, and D would prefill 20k+ itself): a cut at 12288 leaves 20887 >
     X -> W50 by name, the request goes via P (X-REQUEUE / RESUME-VIA-P)."""
     s, req = _x_gate(monkeypatch, total=33175, head=33024, floor=12288, x=12288)
-    assert s.weg2_uncached_extent(req, head_inputs=object()) == 33175 - 12288
-    assert s._weg2_x_refuses(req, head_inputs=object()) is True
+    assert s.pdflip_uncached_extent(req, head_inputs=object()) == 33175 - 12288
+    assert s._pdflip_x_refuses(req, head_inputs=object()) is True
 
 
 def test_no_floor_prices_exactly_as_before(monkeypatch):
     s, req = _x_gate(monkeypatch, total=33175, head=33024, floor=None, x=12288)
-    assert s.weg2_uncached_extent(req, head_inputs=object()) == 151
+    assert s.pdflip_uncached_extent(req, head_inputs=object()) == 151
     s, req = _x_gate(monkeypatch, total=33175, head=33024, floor=33024, x=12288)
-    assert s.weg2_uncached_extent(req, head_inputs=object()) == 151
+    assert s.pdflip_uncached_extent(req, head_inputs=object()) == 151

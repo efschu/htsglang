@@ -12,7 +12,7 @@
    measured optimal vector is INSTALLED (one-boot convergence) instead of
    logged as a restart hint -- but only in capacity mode, only when it
    strictly raises the context budget, never for the draft worker, and
-   never over an explicit SGLANG_UNEVEN_TOKEN_VECTOR pin.
+   never over an explicit FLLIPER_UNEVEN_TOKEN_VECTOR pin.
 """
 
 import os
@@ -20,15 +20,15 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_cp_token_ratios,
     set_cp_token_ratios,
 )
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -171,15 +171,15 @@ def _run_ranks(
             world_group = mock.Mock(world_size=dcp_size, cpu_group=None)
             parallel = mock.Mock(attn_dcp_rank=rank)
             with mock.patch(
-                "sglang.srt.model_executor.model_runner_kv_cache_mixin"
+                "flliper.srt.model_executor.model_runner_kv_cache_mixin"
                 ".get_world_group",
                 return_value=world_group,
             ), mock.patch(
-                "sglang.srt.model_executor.model_runner_kv_cache_mixin"
+                "flliper.srt.model_executor.model_runner_kv_cache_mixin"
                 ".get_parallel",
                 return_value=parallel,
             ), mock.patch(
-                "sglang.srt.model_executor.pool_configurator"
+                "flliper.srt.model_executor.pool_configurator"
                 ".create_memory_pool_configurator",
                 side_effect=lambda mr: _configurator_for(mr.tp_rank),
             ), mock.patch(
@@ -280,7 +280,7 @@ class TestCapacityInstall(CustomTestCase):
         safe: an operator's declared vector is still never overridden, in
         coupled mode or any other."""
         with mock.patch.dict(
-            os.environ, {"SGLANG_UNEVEN_TOKEN_VECTOR": ",".join(map(str, ESTIMATE))}
+            os.environ, {"FLLIPER_UNEVEN_TOKEN_VECTOR": ",".join(map(str, ESTIMATE))}
         ):
             _, installed = _run_ranks(
                 MEASURED_P, active=ESTIMATE, capacity_mode=False, allow_install=True
@@ -297,7 +297,7 @@ class TestCapacityInstall(CustomTestCase):
 
     def test_env_pin_suppresses_install(self):
         with mock.patch.dict(
-            os.environ, {"SGLANG_UNEVEN_TOKEN_VECTOR": "30,17,17"}
+            os.environ, {"FLLIPER_UNEVEN_TOKEN_VECTOR": "30,17,17"}
         ):
             _, installed = _run_ranks(
                 MEASURED_P,
@@ -323,7 +323,7 @@ class TestCapacityInstall(CustomTestCase):
 # (108341 tokens under the seeded vector [16,23,25]) is a FUNCTION of its
 # ownership share, while the shadows' is not. Pre-fix the boot stalled at
 # max_total_num_tokens=433344 and only logged the un-actioned
-# "restart with SGLANG_UNEVEN_TOKEN_VECTOR=5,13,14" hint.
+# "restart with FLLIPER_UNEVEN_TOKEN_VECTOR=5,13,14" hint.
 SOLO_ACTIVE = [16, 23, 25]
 SOLO_SHADOWS = [0, 290465, 312551]
 SOLO_T_TARGET, SOLO_T_DRAFT = 1000, 200
@@ -431,7 +431,7 @@ class TestDraftSoloCapacityInstall(CustomTestCase):
     def test_solo_coupled_mode_still_honours_a_DECLARED_pin(self):
         with mock.patch.dict(
             os.environ,
-            {"SGLANG_UNEVEN_TOKEN_VECTOR": ",".join(map(str, SOLO_ACTIVE))},
+            {"FLLIPER_UNEVEN_TOKEN_VECTOR": ",".join(map(str, SOLO_ACTIVE))},
         ):
             _, installed = _run_ranks(
                 list(SOLO_SHADOWS),

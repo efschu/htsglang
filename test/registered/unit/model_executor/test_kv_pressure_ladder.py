@@ -13,7 +13,7 @@ conflict freedom with the Erg.-8 admission planner.
 import unittest
 from typing import List
 
-from sglang.srt.model_executor.kv_pressure_ladder import (
+from flliper.srt.model_executor.kv_pressure_ladder import (
     DEFAULT_EXTERNAL_HYSTERESIS_ROUNDS,
     HANDOVER_ANTICIPATORY_SHADOW,
     HANDOVER_BACKGROUND_MIGRATE,
@@ -57,13 +57,13 @@ from sglang.srt.model_executor.kv_pressure_ladder import (
     plan_conflicts,
     resolve_plan_priority,
 )
-from sglang.srt.model_executor.offload_register import (
+from flliper.srt.model_executor.offload_register import (
     OFFLOAD_CLASSES,
     CpuFakeMovementBackend,
     OffloadRegister,
     resolve_class_policies,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -974,7 +974,7 @@ class TestServerArgsValidation(unittest.TestCase):
     """
 
     def _args(self, **kwargs):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         return ServerArgs(model_path="dummy", **kwargs)
 

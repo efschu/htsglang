@@ -81,14 +81,14 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers.pp_admission_congruence import (
     PPAdmissionDecision,
     PPAdmissionEntry,
     PPScheduleRefused,
     forwarded_schedule,
     schedule_refusal_reason,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=90)
 
@@ -170,7 +170,7 @@ def _pp0_builds_its_own_decision(reqs):
     a decision, so the whole file was green while the producer forwarded a
     geometry no rank had run.
     """
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         PPAdmissionCongruenceGuard,
         build_pp_admission_decision,
     )
@@ -212,7 +212,7 @@ def _sentinel():
 def _holder(wire, pp_rank):
     """The SHIPPED mixin methods bound to a holder (the #630/#757/#795/#797
     pattern)."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=wire,
@@ -298,7 +298,7 @@ class _Req:
         return self._host_resident > len(self.prefix_indices)
 
     def set_extend_range(self, start: int, end: int) -> None:
-        from sglang.srt.utils.common import Range
+        from flliper.srt.utils.common import Range
 
         self.extend_range = Range(start, end)
 
@@ -314,12 +314,12 @@ class _Req:
 def _adder(scheduled_extents):
     """A real `PrefillAdder`, with instr20's chunk width and a cache that
     performs the load-back the victim's own state now permits."""
-    from sglang.srt.managers.schedule_policy import PrefillAdder
-    from sglang.srt.mem_cache.base_prefix_cache import (
+    from flliper.srt.managers.schedule_policy import PrefillAdder
+    from flliper.srt.mem_cache.base_prefix_cache import (
         DecLockRefResult,
         IncLockRefResult,
     )
-    from sglang.srt.server_args import (
+    from flliper.srt.server_args import (
         ServerArgs,
         set_global_server_args_for_scheduler,
     )
@@ -365,10 +365,10 @@ def _adder(scheduled_extents):
 
 def _victim_pass(h, decision, res):
     """The victim's pass, on shipped functions throughout."""
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         reconcile_pp_admission_decision,
     )
-    from sglang.srt.managers.schedule_policy import AddReqResult
+    from flliper.srt.managers.schedule_policy import AddReqResult
 
     # This rank's own radix match for the rid, AFTER the prefetch landed.
     # `local >= told` is the SAFE branch, so nothing is retracted and nothing
@@ -471,7 +471,7 @@ def _order_pass(h, decision, res):
     the decision follows the first rank's, and the two are fed by independent
     chain-forward arrivals.
     """
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         reconcile_pp_admission_decision,
     )
 
@@ -528,7 +528,7 @@ def _producer_pass(h, decision, res):
     difference between this arm and the seventeen that were green while
     instr21 died.
     """
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         reconcile_pp_admission_decision,
     )
 
@@ -559,7 +559,7 @@ def _worker(rank, init_file, out_dir, case):
             "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD
         )
         if rank == UPSTREAM:
-            from sglang.srt.managers.scheduler_pp_mixin import (
+            from flliper.srt.managers.scheduler_pp_mixin import (
                 pp_admission_decision_to_wire,
             )
 
@@ -650,7 +650,7 @@ def _blind_forwarded_schedule(rank, init_file, out_dir, case):
     AttributeError is impossible and a green result here would mean the
     harness never depended on the fix.
     """
-    from sglang.srt.managers import scheduler_pp_mixin as m
+    from flliper.srt.managers import scheduler_pp_mixin as m
 
     m.forwarded_schedule = lambda decision: {}
     return _worker(rank, init_file, out_dir, case)
@@ -670,7 +670,7 @@ def _blind_executed_extent(rank, init_file, out_dir, case):
     Rebound in `pp_admission_congruence`'s own globals because that is where
     `build_pp_admission_decision` resolves it.
     """
-    from sglang.srt.managers import pp_admission_congruence as c
+    from flliper.srt.managers import pp_admission_congruence as c
 
     c._executed_extent = lambda req: None
     return _worker(rank, init_file, out_dir, case)
@@ -684,7 +684,7 @@ def _blind_order(rank, init_file, out_dir, case):
     signature, and `_pp_order_batch_by_schedule` still runs its own body and
     still calls it.
     """
-    from sglang.srt.managers import scheduler_pp_mixin as m
+    from flliper.srt.managers import scheduler_pp_mixin as m
 
     m.order_batch_by_schedule = lambda reqs, schedule: list(reqs)
     return _worker(rank, init_file, out_dir, case)
@@ -938,7 +938,7 @@ class PPProducerNoGeometry791(unittest.TestCase):
     scheduler.py:5572 -- so the producer owes it a defined answer."""
 
     def test_the_production_call_site_refuses_a_torn_down_request(self):
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             build_pp_admission_decision,
         )
 
@@ -954,7 +954,7 @@ class PPProducerNoGeometry791(unittest.TestCase):
     def test_the_refusal_fires_before_any_geometry_is_emitted(self):
         """A torn-down request among healthy ones must not let a partial
         decision out: the whole build refuses."""
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             build_pp_admission_decision,
         )
 
@@ -971,7 +971,7 @@ class PPProducerNoGeometry791(unittest.TestCase):
     def test_a_stand_in_without_the_flag_keeps_the_legacy_arithmetic(self):
         """The default keeps the #630 / #796 stand-ins working; they carry no
         adder output and never reach a real batch."""
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             build_pp_admission_decision,
         )
 
@@ -981,7 +981,7 @@ class PPProducerNoGeometry791(unittest.TestCase):
         self.assertEqual(decision.entries[0].extend_len, PROMPT_TOKENS)
 
     def test_a_zero_length_executed_range_is_reported_not_suppressed(self):
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             build_pp_admission_decision,
         )
 
@@ -996,7 +996,7 @@ class PPProducerNoGeometry791(unittest.TestCase):
 
 class PPOrderBatchBySchedule791(unittest.TestCase):
     def test_an_empty_schedule_is_the_untouched_default_path(self):
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             order_batch_by_schedule,
         )
 
@@ -1007,7 +1007,7 @@ class PPOrderBatchBySchedule791(unittest.TestCase):
         )
 
     def test_the_forwarded_order_is_applied(self):
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             order_batch_by_schedule,
         )
 
@@ -1016,7 +1016,7 @@ class PPOrderBatchBySchedule791(unittest.TestCase):
         self.assertEqual([r.rid for r in ordered], [RID, RID_B])
 
     def test_an_already_congruent_order_is_unchanged(self):
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             order_batch_by_schedule,
         )
 
@@ -1088,8 +1088,8 @@ class PPOrderBatchBySchedule791(unittest.TestCase):
         stop (RAENGE-NIE-UNEINS) -- never PPScheduleRefused, whose void
         disposal left PP0 starving in its ring recv (trainA/B/B2,
         2026-09-01), and never a narrowed batch."""
-        import sglang.srt.managers.pp_admission_congruence as congruence
-        from sglang.srt.managers.schedule_policy import AddReqResult
+        import flliper.srt.managers.pp_admission_congruence as congruence
+        from flliper.srt.managers.schedule_policy import AddReqResult
 
         # Surplus direction: executes, at the scheduled geometry.
         adder = _adder({RID: (TOLD_PREFIX, TOLD_EXTEND)})

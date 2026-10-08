@@ -4,9 +4,9 @@
 SPECIMEN, 2026-08-21 on this rig (boot_735_bal785.log, first real agent load,
 inside the first tp_to_pp flip):
 
-    File "sglang/srt/models/qwen3_5.py", line 625, in forward
+    File "flliper/srt/models/qwen3_5.py", line 625, in forward
       projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-    File "sglang/srt/layers/linear.py", line 835, in forward
+    File "flliper/srt/layers/linear.py", line 835, in forward
       return F.linear(x, layer.weight, bias)
     torch.OutOfMemoryError: Tried to allocate 256.00 MiB.
     GPU 0 has a total capacity of 31.34 GiB of which 131.69 MiB is free.
@@ -29,9 +29,9 @@ where the honest threshold is ~1280 MiB.
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.server_args import ServerArgs
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 

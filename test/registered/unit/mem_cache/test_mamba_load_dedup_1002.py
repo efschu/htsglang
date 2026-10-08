@@ -1,6 +1,6 @@
 """DP-NACHLAUF 02.10. (N5p b6a6a5c08d): the host load-back's two mamba
 transfers (the node anchor and the request's CoW slot) read the SAME host
-slot -- two WEG2-ARENA-STATE-LOAD of 54 MB per load on PP0. Loaded once, the
+slot -- two PDFLIP-ARENA-STATE-LOAD of 54 MB per load on PP0. Loaded once, the
 second device row is copied on the card per layer before the layer's event.
 
 Pinned (red before): the split keeps the first of each (name, host slots) and
@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.hybrid_cache import mamba_load_dedup as d  # noqa: E402
+from flliper.srt.mem_cache.hybrid_cache import mamba_load_dedup as d  # noqa: E402
 
 
 def _t(name, host, dev):
@@ -52,7 +52,7 @@ def test_what_stays_two_loads(monkeypatch):
 
 def test_one_arena_load_plus_card_copy_equals_two_loads(tmp_path, monkeypatch):
     import test_arena_mamba_direct_1427 as H
-    from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+    from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
     if H.shutil.which("gcc") is None:
         import pytest
@@ -75,7 +75,7 @@ def test_one_arena_load_plus_card_copy_equals_two_loads(tmp_path, monkeypatch):
 
 
 def test_start_loading_loads_the_kept_and_copies_before_the_layer_event():
-    from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
+    from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
 
     src = inspect.getsource(hcc.HybridCacheController.start_loading)
     assert "pool_transfers=load_transfers," in src

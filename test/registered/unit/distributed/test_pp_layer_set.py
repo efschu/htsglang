@@ -2,13 +2,13 @@
 
 A pipeline stage has always been an INTERVAL here: `get_pp_indices` returns
 `(start, end)` with `start = sum(partitions[:pp_rank])`, and
-`SGLANG_PP_LAYER_PARTITION` takes per-stage COUNTS. So a family placement — all
+`FLLIPER_PP_LAYER_PARTITION` takes per-stage COUNTS. So a family placement — all
 48 linear-attention layers on one card, the 16 interleaved full-attention
 layers on others — was not expressible at all. That is an ADDRESSING limit and
 it is independent of any transport: a wire that can carry the activations does
 not help if no one can say which card owns layer 7.
 
-`SGLANG_PP_LAYER_SET` is the set form. The count form is untouched, and the
+`FLLIPER_PP_LAYER_SET` is the set form. The count form is untouched, and the
 first class below is the pin that says so.
 
 WHY THE VALIDATION IS THE POINT. Both ways of getting a partition wrong are
@@ -18,7 +18,7 @@ answers with that layer quietly skipped and nothing anywhere reports it. Every
 refusal below therefore names the exact layers.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -27,15 +27,15 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     PP_LAYER_SET_ENV,
     PPLayerSetError,
     get_pp_indices,
     get_pp_layer_set,
     parse_pp_layer_sets,
 )
-from sglang.srt.utils.common import make_layers
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils.common import make_layers
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Layer(torch.nn.Identity):
@@ -56,8 +56,8 @@ class _Env:
         # crossing wire. Without that declaration parse_pp_layer_sets refuses a
         # gapped set -- correctly, because the forward loop would skip the peer
         # layers in silence.
-        self.saved_wire = os.environ.get("SGLANG_PP_CROSSING_WIRE")
-        os.environ["SGLANG_PP_CROSSING_WIRE"] = "1"
+        self.saved_wire = os.environ.get("FLLIPER_PP_CROSSING_WIRE")
+        os.environ["FLLIPER_PP_CROSSING_WIRE"] = "1"
         if self.value is None:
             os.environ.pop(PP_LAYER_SET_ENV, None)
         else:
@@ -70,9 +70,9 @@ class _Env:
         else:
             os.environ[PP_LAYER_SET_ENV] = self.saved
         if self.saved_wire is None:
-            os.environ.pop("SGLANG_PP_CROSSING_WIRE", None)
+            os.environ.pop("FLLIPER_PP_CROSSING_WIRE", None)
         else:
-            os.environ["SGLANG_PP_CROSSING_WIRE"] = self.saved_wire
+            os.environ["FLLIPER_PP_CROSSING_WIRE"] = self.saved_wire
         return False
 
 
@@ -242,7 +242,7 @@ class TestTheSpanIsNotTheCount(CustomTestCase):
         fallback."""
         import inspect
 
-        from sglang.srt.model_executor import model_runner as mr
+        from flliper.srt.model_executor import model_runner as mr
 
         src = inspect.getsource(mr)
         self.assertIn("owned = get_pp_layer_set(", src)
@@ -257,7 +257,7 @@ class TestTheSpanIsNotTheCount(CustomTestCase):
         would each have to propagate -- two derivations is how they disagree."""
         import inspect
 
-        from sglang.srt.model_executor import model_runner as mr
+        from flliper.srt.model_executor import model_runner as mr
 
         src = inspect.getsource(mr)
         self.assertNotIn('getattr(self.model, "owned_layers"', src)

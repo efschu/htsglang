@@ -3,8 +3,8 @@
 
 Run ONCE per boot against the front (default http://127.0.0.1:30030), sequentially (bs1,
 so batch composition cannot move the numerics), temperature 0:
-  boot A: dual1m image with the join code, SGLANG_WEG2_DUAL_DECODE_JOIN unset (extend path)
-  boot B: same image + EXTRA_CENV="SGLANG_WEG2_DUAL_DECODE_JOIN=1" (join path)
+  boot A: dual1m image with the join code, FLLIPER_PDFLIP_DUAL_DECODE_JOIN unset (extend path)
+  boot B: same image + EXTRA_CENV="FLLIPER_PDFLIP_DUAL_DECODE_JOIN=1" (join path)
   join_bitcheck.py run --out A.json      (on boot A)
   join_bitcheck.py run --out B.json      (on boot B)
   join_bitcheck.py compare A.json B.json [--k 64]
@@ -103,7 +103,7 @@ def main():
     r.add_argument("--url", default="http://127.0.0.1:30030")
     r.add_argument("--model", default="")
     r.add_argument("--root", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
-                                                    "python", "sglang", "srt", "weg2"))
+                                                    "python", "flliper", "srt", "pdflip"))
     r.add_argument("--n", type=int, default=4)
     r.add_argument("--k", type=int, default=64)
     r.add_argument("--timeout", type=float, default=300)

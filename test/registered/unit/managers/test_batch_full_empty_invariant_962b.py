@@ -56,7 +56,7 @@ That hole is closed here.
 import types
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20)
 
@@ -116,7 +116,7 @@ class _StubAllocator:
 
 def _void_holder(mb_id=1, size=3):
     """The #797d own-void holder (the 630/757/795 pattern, as in the 797 file)."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         mbs=[None] * size,
@@ -141,7 +141,7 @@ def _gate_holder(waiting_queue, allocatable, relief_calls=None):
     relief is bound as the REAL method, not stubbed: whether it fires at
     running=0 is itself an assertion of this module.
     """
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     h = types.SimpleNamespace(
         _admission_decline_note=None,

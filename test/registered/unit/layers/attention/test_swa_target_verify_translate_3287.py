@@ -64,8 +64,8 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention import triton_backend as tb
-from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from flliper.srt.layers.attention import triton_backend as tb
+from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
 # ---------------------------------------------------------------------------
 # Corpus. Two requests, a window smaller than both sequences, so every request

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# PF mutation check for the group told=0 fallback (weg2_told_fallback +
-# its seams in weg2_store_told / pp_object_recv). Every mutation is a
+# PF mutation check for the group told=0 fallback (pdflip_told_fallback +
+# its seams in pdflip_store_told / pp_object_recv). Every mutation is a
 # plausible WRONG implementation in a named danger direction, and each one
-# MUST make test_weg2_told_group_fallback_pf.py fail. A survivor means that
+# MUST make test_pdflip_told_group_fallback_pf.py fail. A survivor means that
 # direction is asserted nowhere.
 #
 #   M1  PP0 admits the full told at the Frist (the group death returns)
@@ -25,10 +25,10 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=${ROOT:-$(cd "$HERE/../../../.." && pwd)}
-FB=$ROOT/python/sglang/srt/managers/weg2_told_fallback.py
-ST=$ROOT/python/sglang/srt/managers/weg2_store_told.py
+FB=$ROOT/python/flliper/srt/managers/pdflip_told_fallback.py
+ST=$ROOT/python/flliper/srt/managers/pdflip_store_told.py
 PY=${PY:-/spinning/htsglang-gpu/.venv/bin/python}
-TESTS=$ROOT/test/registered/unit/managers/test_weg2_told_group_fallback_pf.py
+TESTS=$ROOT/test/registered/unit/managers/test_pdflip_told_group_fallback_pf.py
 
 BAK_DIR=$(mktemp -d)
 cp "$FB" "$BAK_DIR/fb.py"

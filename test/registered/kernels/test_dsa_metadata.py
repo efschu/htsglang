@@ -2,13 +2,13 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsa_metadata import (
+from flliper.kernels.ops.attention.dsa_metadata import (
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
     fused_dsa_target_verify_metadata,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-large-amd")

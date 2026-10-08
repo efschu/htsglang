@@ -14,8 +14,8 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.backends import AudioChunk
-from sglang.srt.translator.segmenter import (
+from flliper.srt.translator.backends import AudioChunk
+from flliper.srt.translator.segmenter import (
     EnergyVad,
     SegmentReason,
     SegmenterConfig,

@@ -19,10 +19,10 @@ import requests
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -76,16 +76,16 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
 
     Both tests require --disable-radix-cache (for input_embeds). The chunked
     prefill test needs a small --chunked-prefill-size. The retraction test
-    uses SGLANG_TEST_RETRACT to deterministically force retraction every few
+    uses FLLIPER_TEST_RETRACT to deterministically force retraction every few
     scheduler iterations regardless of KV pressure.
     """
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        # SGLANG_TEST_RETRACT forces retraction periodically; this is
+        # FLLIPER_TEST_RETRACT forces retraction periodically; this is
         # deterministic and doesn't require guessing KV budgets.
-        with envs.SGLANG_TEST_RETRACT.override(True):
+        with envs.FLLIPER_TEST_RETRACT.override(True):
             cls.process = popen_launch_server(
                 _MODEL,
                 cls.base_url,
@@ -159,7 +159,7 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
     def test_retraction_with_output_ids(self):
         """Regression test for #14110.
 
-        SGLANG_TEST_RETRACT forces retraction every few scheduler iterations.
+        FLLIPER_TEST_RETRACT forces retraction every few scheduler iterations.
         Combined with ignore_eos and a reasonable max_new_tokens, at least one
         request is retracted mid-decode with non-empty output_ids, then
         re-prefilled. Pre-#14110 this crashes (cache_k < loc) because the
@@ -168,7 +168,7 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
         text = "The quick brown fox jumps over the lazy dog. " * 4
         embeds = _embeds_for(text)
 
-        # Batch of requests with enough decode steps that SGLANG_TEST_RETRACT
+        # Batch of requests with enough decode steps that FLLIPER_TEST_RETRACT
         # (interval=3 by default) fires mid-decode.
         n = 4
         resp = _generate(

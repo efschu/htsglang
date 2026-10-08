@@ -1,0 +1,634 @@
+"""SF SLOT FIDELITY (27B rc12k27 b23, 27.09. 10:27:56Z, rid pdflip-68-235): on the
+carrierless PP form every stage admits a request in the SAME pass and at the SAME
+width, or none does.
+
+THE DEATH. P log boot_weg2_dkr27bparkodirectdraftbar1w2309270957 (9417507cd2):
+PP1 ``#1004 SLOT DISAGREEMENT: PP1 is launching slot 0 (fwd_ct=1582,
+rids=[pdflip-68-235], extend=512) but the upstream's proxy names slot 1 (rows=1024,
+extent=('pdflip-68-235', 40958, 41982))``. The told was 40958 on every rank, every
+rank planned the head at 40958 (``P-CHUNK-POLICY ... start=40958 widths=[512x39,469]``),
+the host read was complete on all three (``#905 ... completed=40958``). Then:
+
+  PP0   PDFLIP-LOADBACK-EVICT kv_tokens=27095 floor=13035: the uniform floor is short by
+        14060 ... this pass refuses (n=4)
+  PP0   PDFLIP-LOADBACK-WAIT extent=40958 applied=0 ... the request waits
+  PP1/2 #988 LOADBACK prefix moved to 40958 -> #969N ADMIT slot=0 extend=512
+  PP0   (next pass) P-CHUNK-POLICY start=0 widths=[1024x59,979] pick=mid=1024
+  PP0   H91 STORE-TOLD KEPT told=40958 -> #988 LOADBACK prefix moved to 40958
+        -> #969N ADMIT slot=1 extend=1024
+
+TERM (a) -- THE ROOM VERDICT WAS RANK-LOCAL. The "uniform floor" the load-back
+decides from is the MIN over ``tp_cpu_group`` -- and on TP=1/PP=3 that group has one
+member (boot line 1810: ``#788 UNIFORM-FLOOR SCOPE: tp_cpu_group world=1 -> floors
+OFF ... the ranks that must agree are NOT in this reduce group``). The single-rank
+path publishes THIS rank's ``available_size()`` (#1045), so the refuse-this-pass /
+retry-next-pass rule built for a TP group's published MIN (xsn285) turns a local
+shortfall into a PASS SKEW: PP0 was short, its peers were not, PP0 admitted one
+pass later.
+
+THE RULE (a). On a floor that is this rank's own value under pp > 1, the load-back
+does what upstream's ``load_back`` does: evict what is short and load in the SAME
+pass. The retry-next-pass exists so that a TP group re-reads a new MIN; a group of
+one has nothing to re-read, so waiting a pass only buys the skew. Every rank then
+admits in the same pass whenever free + evictable covers the host hit -- 218004
+evictable against a 14060 shortfall on the specimen. Only when this rank cannot
+hold the load-back even with every evictable row freed does it still refuse (the
+residual, named ``SF LOADBACK-ROOM PP-RESIDUAL``; on this form a peer with room
+admits in this pass, so that line is the cause of the ``#1004`` that follows).
+
+TERM (b) -- THE CHUNK PLAN SURVIVED THE PREFIX MOVE. #1400's ``admission`` pops
+``_pdflip_store_told[rid]`` on the first visit; H91 keeps the verdict in
+``_pdflip_told_kept``. Fix A's ``budget_head`` read only the told map, so PP0's second
+visit sized the pass from position 0 (``pos_src=zero``) -- a plan for start=0 whose
+width (1024) then ran on an extent that #988 moved to 40958, where the plan says 512.
+
+THE RULE (b). (b1) ``budget_head`` reads the KEPT told when the told map no longer
+has the rid (same request object): every rank keeps the same verdict the same way,
+so the position stays rank-identical. (b2) Whenever #988 moves the prefix of the
+request the pass budget was planned for to a position OTHER than the planned one,
+the plan is replanned at the moved prefix and the pass budget NARROWED to it (never
+widened: the corridor granted the old width, not a wider one). Deterministic in the
+planner's call sequence, which is the same on every rank when the move is.
+
+NOT BUILT: followers taking PP0's width from PP0's row. On this form
+(``pp_row_carrier_present`` False: no ``pp_flip_counters`` side channel, followers
+log ``#1460 FOLLOWER-GATE gate=None``) PP0's row reaches a follower only with the
+proxy of the pass it already admitted (Fix B, unbuilt). The rule here is the other
+half of the same law: every input of the width and of the pass is rank-identical,
+and ``#1004`` / ``#1233 W27`` stay the named stops if they ever are not.
+
+Switch ``FLLIPER_PDFLIP_PP_SLOT_FIDELITY``, default on; ``0`` = the old behaviour byte
+for byte (no flag is written, no hook installed, no extra lookup).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import NamedTuple, Optional
+
+logger = logging.getLogger(__name__)
+
+ENV = "FLLIPER_PDFLIP_PP_SLOT_FIDELITY"
+#: tree attribute: True while this iteration's evict floor is THIS rank's own
+#: ``available_size()`` on a multi-stage PP form (tp group of one).
+FLOOR_LOCAL_PP_ATTR = "pdflip_sf_floor_local_pp"
+#: scheduler attribute: the plan this pass's budget was sized from (cleared at
+#: the top of every budget sizing, consumed by the adder's move hook).
+PLAN_ATTR = "_pdflip_sf_budget_plan"
+#: adder attribute: the chunk budget the adder was built with.
+ADDER_INITIAL_ATTR = "sf_rem_chunk_initial"
+
+_LOG_FIRST = 8
+#: Q-640: eviction rounds the room verdict may run before it decides. A round
+#: can free more than it was asked for (an evict drains the in-flight write-
+#: backs, #1465, which makes their nodes evictable), so the set is re-read and
+#: evicted again -- bounded, never a spin. DUAL LAYOUT ONLY (Q-640b, user order
+#: 03.10.): outside FLLIPER_PDFLIP_DUAL_LAYOUT=1 -- the flip form, NF (TP=1/PP>1 as
+#: well) -- the verdict keeps its single eviction round, as before Q-640.
+_ROOM_MAX_ROUNDS = 4
+
+
+def _room_max_rounds(env=None) -> int:
+    """Q-640b: the re-read rounds exist only in the dual layout; one round
+    (the pre-Q-640 behaviour, byte for byte) everywhere else."""
+    e = os.environ if env is None else env
+    if (e.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+        return _ROOM_MAX_ROUNDS
+    return 1
+
+
+def enabled(env=None) -> bool:
+    e = os.environ if env is None else env
+    raw = (e.get(ENV, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _sampled(holder, attr: str) -> Optional[int]:
+    """Counter on ``holder``; returns n when this occurrence prints (first 8,
+    then powers of two), else None. Never raises."""
+    try:
+        n = int(getattr(holder, attr, 0) or 0) + 1
+        setattr(holder, attr, n)
+    except Exception:  # noqa: BLE001 -- a slotted double
+        return None
+    return n if (n <= _LOG_FIRST or (n & (n - 1)) == 0) else None
+
+
+# ---------------------------------------------------------------------------
+# (a) the floor's scope, published by the scheduler
+# ---------------------------------------------------------------------------
+
+
+def mark_floor_scope(tree, local_pp: bool) -> None:
+    """Record on the tree whether this iteration's evict floor is this rank's own
+    value on a multi-stage PP form. Switch off: nothing is written."""
+    if tree is None or not enabled():
+        return
+    try:
+        setattr(tree, FLOOR_LOCAL_PP_ATTR, bool(local_pp))
+    except Exception:  # noqa: BLE001 -- a slotted double
+        pass
+
+
+def pp_size_of(holder) -> int:
+    args = getattr(holder, "server_args", None)
+    try:
+        return int(getattr(args, "pp_size", 1) or 1) if args is not None else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
+    """The load-back room verdict on a local floor under pp > 1.
+
+    None  -- not this form (switch off, a group floor, pp == 1): the caller keeps
+             its path unchanged.
+    True  -- room is there now (after evicting the shortfall): load in THIS pass.
+    False -- the residual: even every evictable row does not make room; the
+             caller refuses as before.
+
+    Q-640 (27B dual y8u 10031206 12:33:47, rid pdflip-0-51): PP2 read evictable=2081
+    while an in-flight write-back held node 79; the eviction of node 80 drained it
+    (#1465 WRITE-BACK DRAIN), node 79 became evictable (82788) -- and the verdict,
+    taken from the ONE read before the eviction, was PP-RESIDUAL while PP0/PP1
+    (evictable=84869) admitted: #968 PREFIX MATERIALISATION SHORTFALL on PP2. The
+    evictable set is re-read after every round and evicted again until the room is
+    there or a round frees nothing (at most ``_ROOM_MAX_ROUNDS``)."""
+    if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
+        return None
+    alloc = getattr(tree, "token_to_kv_pool_allocator", None)
+    if alloc is None:
+        return None
+    kv_tokens = int(kv_tokens)
+    avail0 = int(alloc.available_size())
+    evictable0 = evictable = int(tree.evictable_size())
+    evicted = 0
+    rounds = 0
+    avail1 = avail0
+    max_rounds = _room_max_rounds()
+    while avail1 < kv_tokens and evictable > 0 and rounds < max_rounds:
+        from flliper.srt.mem_cache.base_prefix_cache import EvictParams
+
+        res = tree.evict(EvictParams(num_tokens=min(kv_tokens - avail1, evictable)))
+        got = int(getattr(res, "num_tokens_evicted", 0) or 0)
+        rounds += 1
+        evicted += got
+        avail_prev, avail1 = avail1, int(alloc.available_size())
+        evictable = int(tree.evictable_size())
+        if got <= 0 and avail1 <= avail_prev:
+            break
+    ok = avail1 >= kv_tokens
+    if ok:
+        n = _sampled(tree, "_pdflip_sf_room_same_pass")
+        if n is not None:
+            logger.info(
+                "SF LOADBACK-ROOM SAME-PASS rid=%s kv_tokens=%d floor=%d avail=%d "
+                "evictable=%d evicted=%d avail_after=%d evictable_after=%d rounds=%d (n=%d): "
+                "the floor is this "
+                "rank's own value (tp group of one, pp>1), so the shortfall is "
+                "evicted and the host hit loads in THIS pass -- a next-pass retry "
+                "would only skew this stage one pass behind its peers (#1004, b23)",
+                rid, kv_tokens, int(floor), avail0, evictable0, evicted, avail1, evictable,
+                rounds, n,
+            )
+    else:
+        n = _sampled(tree, "_pdflip_sf_room_residual")
+        if n is not None:
+            logger.warning(
+                "SF LOADBACK-ROOM PP-RESIDUAL rid=%s kv_tokens=%d floor=%d avail=%d "
+                "evictable=%d evicted=%d avail_after=%d evictable_after=%d rounds=%d (n=%d): "
+                "this rank cannot hold "
+                "the load-back even with every evictable row freed and refuses this "
+                "pass. The verdict is RANK-LOCAL on a carrierless PP form: a peer "
+                "with room admits in this pass, and if one does the #1004 SLOT "
+                "DISAGREEMENT that follows has THIS line as its cause",
+                rid, kv_tokens, int(floor), avail0, evictable0, evicted, avail1, evictable,
+                rounds, n,
+            )
+    return ok
+
+
+def note_loaded(tree, rows: int) -> None:
+    """SF-X (rc12q PP2 15:38:49Z, pdflip-4-37): charge a load-back's device rows
+    against this iteration's floor when the floor is this rank's own value.
+
+    The floor (5336) was published at the top of the iteration; the same-pass
+    room evicted 810 and the load took 5932 rows, so the live pool held 214 --
+    while the extend's own eviction trigger (``uniform_avail_for_evict`` =
+    floor - admitted ledger) still read 5336 >= 775 and SKIPPED, and the
+    775-token extend raised with 245003 evictable. Charged here, the trigger
+    reads 5336 - 5932 < 775 and evicts what the extend needs. Only on the
+    local-PP form: on a TP group the floor is a group MIN and its ledger is
+    charged by replicated allocations only (unchanged)."""
+    if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False) or rows <= 0:
+        return
+    try:
+        from flliper.srt.mem_cache.common import note_uniform_admitted
+
+        note_uniform_admitted(tree, int(rows))
+    except Exception:  # noqa: BLE001 -- a ledger note never breaks a load
+        pass
+
+
+def unbacked_drop_allowed(tree, node) -> bool:
+    """UD (NF rc12q PP2 16:28:19Z): may an eviction DROP a write_back leaf whose
+    backup was refused? Only on the local-PP floor (the tree is this rank's own;
+    on a TP group a rank-local drop would split the replicas), only a node with
+    no children (#841: an un-backed node with children would orphan them) and
+    no write-through in flight."""
+    if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
+        return False
+    if getattr(node, "children", None):
+        return False
+    ongoing = getattr(tree, "ongoing_write_through", None) or {}
+    if getattr(node, "id", None) in ongoing:
+        return False
+    return True
+
+
+#: Q-1500 (V1, desk analysis 1290): the dual-P extension of UD below. Default ON, and
+#: only ever read behind ``dual_p_kv_stage.armed()``; ``0`` = UD exactly as before.
+UD_HOST_CHILDREN_ENV = "FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN"
+
+
+def ud_host_children_enabled(env=None, tree=None) -> bool:
+    """Dual P layout only (``dual_p_kv_stage.armed``: FLLIPER_PDFLIP_DUAL_LAYOUT=1, group P and
+    a P-KV cap); False in the flip form, NF, 27B INT8 and on dual D whatever the switch says.
+    Switch values: ``1`` (default, every P rank), ``pp0`` (only the tree of pipeline rank 0 -- the
+    authority whose told the followers cap to; ``tree.pp_rank``, a plain attribute of the
+    UnifiedRadixCache; without a tree the answer is the armed one), ``0`` / false / no / off."""
+    e = os.environ if env is None else env
+    from flliper.srt.pdflip import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed(e):
+        return False
+    raw = (e.get(UD_HOST_CHILDREN_ENV, "") or "1").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw == "pp0" and tree is not None:
+        return int(getattr(tree, "pp_rank", 0) or 0) == 0
+    return True
+
+
+def _end_anchor_told_held(tree, n) -> bool:
+    """Q-1500 V3: the END anchor a standing told names (y9d4 told-anchor hold, END depth == told) stays:
+    between that told and the admission the follower's admission reads it (PdFlipStoreToldMismatch
+    otherwise). Without a hold (not dual P, switch off, nothing standing) False."""
+    held = getattr(tree, "_pdflip_told_held", None)
+    if not callable(held):
+        return False
+    try:
+        return bool(held(n))
+    except Exception:  # noqa: BLE001 -- cannot tell: keep it (the V1 behaviour for this node)
+        return True
+
+
+def _subtree_blocked(tree, n, ongoing, end_anchor_yield: bool = False) -> bool:
+    """A node the drop must not release (True = keep everything, the old behaviour). Asked of the
+    leaf AND every descendant.
+
+    ``end_anchor_yield`` (Q-1500 V3, only ``unbacked_drop_subtree`` passes True; the V2 trim census
+    in ``dual_arena_spill._reason`` keeps the default): a host-backed END anchor below the refused,
+    un-backed leaf no longer keeps the subtree, unless a standing told names it
+    (``_end_anchor_told_held``). See ``unbacked_drop_subtree``, section V3.
+
+    * in flight: ``ongoing_write_through`` by id, AND ``write_through_pending_id`` (after
+      ``_replace_pending_write_through_node`` a split node's key stays the OLD node id, so the id
+      lookup misses it), AND ``_pdflip_direct_mamba_rows`` (#1427: a direct write's mamba rows in
+      flight -- nothing may take them).
+    * a host-backed END anchor (``_pdflip_end_anchor`` with a mamba host value): the hand-back anchor
+      of a request D may not have read yet, which the reset path holds across one D phase on
+      purpose (``_pdflip_carrier_rotate``, mamba HOLD-END-ANCHOR). Released here it would be taken
+      from under that hold, so the drop leaves such a subtree alone (the eviction then ends as it
+      did before this fix). An END-flagged node WITHOUT a mamba host value carries nothing to
+      hold and is released; the log's ``end_anchors`` counts those."""
+    nid = getattr(n, "id", None)
+    if nid in ongoing or getattr(n, "write_through_pending_id", None) is not None:
+        return True
+    if nid in (getattr(tree, "_pdflip_direct_mamba_rows", None) or {}):
+        return True
+    if getattr(n, "_pdflip_end_anchor", False):
+        try:
+            from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+            if n.component_data[ComponentType.MAMBA].host_value is not None:
+                return (not end_anchor_yield) or _end_anchor_told_held(tree, n)
+        except Exception:  # noqa: BLE001 -- no mamba component on this tree: no END anchor to hold
+            pass
+    return False
+
+
+def unbacked_drop_subtree(tree, node):
+    """Q-1500 UD-V1 (y9d3 P PP0 07:18:49Z, desk analysis 1290): may a refused write_back leaf be
+    dropped TOGETHER WITH its host-only subtree? Returns the descendants children-first, or None.
+
+    METAL. The last device leaf (node 266, parent 265 also un-backed) had host-only CHILDREN -- the
+    hand-off tail the arena kept. ``_is_device_leaf`` calls such a node a D-leaf (it asks only for "no
+    child with a DEVICE value"), the arena refused its backup (#1421 arena_claim, 14x), UD refused it
+    for its children, the eviction delivered 22 of 1024 and ``alloc_token_slots`` raised: rank death,
+    W17. Under write_back the host-only insert is legal below an un-backed parent
+    (``_insert_helper_host``: the #841 gate is armed only for the other policies), so the state is
+    reachable by the tree's own writers (test_dual_p_ud_host_children_1004).
+
+    #841 (law: an un-backed node with children is never DELETED, its edge would orphan the backed
+    subtree) is kept, not relaxed: the children are released FIRST, bottom-up, each through the
+    host-leaf eviction (its references go back to the arena), and only then is the childless leaf
+    dropped by the existing UD path -- no edge is popped above a surviving subtree, the guard in the
+    write_through branch is untouched.
+
+    Every descendant must be a plain host-only node: evicted, host copy present, no device value in
+    any component, no device or host lock (a load-back or a prefetch pin in flight), no write in
+    flight. Anything else -- and the whole call off the dual P layout, off the local-PP floor, with
+    the switch at 0 -- returns None and the eviction ends as it did before this fix.
+
+    RANK CONGRUENCE (corrected after review 08:31Z -- an earlier text called the follower case "a named
+    stop on one request"; it is not). The verdict is rank-local, like UD itself (the floor is this
+    rank's own value) and like the Q-697c spill. No collective runs inside the eviction, so the drop
+    itself cannot hang. What matters is who drops:
+      * PP0 (the y9d3 case: the rank with the smallest pool rest). PP0 is the authority -- its Admit
+        names what PP0's OWN tree can admit (pdflip_told_fidelity) and the followers cap their radix
+        match to that told (#1419), so a shorter PP0 tree shortens the told on every rank.
+      * a follower (PP1/PP2), only under its own pool wall: it can end with LESS than PP0's told.
+        What follows is NOT a refusal of one request: ``PdFlipStoreToldMismatch`` / ``STORE-TOLD WAIT
+        EXCEEDED`` (managers/pdflip_store_told.py) and ``#1004 SLOT DISAGREEMENT``
+        (scheduler_pp_mixin.py) are raises without a catch = a NAMED GROUP DEATH. The OOM death this
+        replaces is certain; the disagreement is only possible. That is the decision, and it is
+        switchable: ``FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN`` = ``1`` (all P ranks, default) / ``pp0``
+        (PP0's tree only: the safe half) / ``0`` (off).
+      * the critical case ``_pdflip_store_told_satisfied`` (pdflip_store_told.py, "registered nothing
+        because it already held the span"): a follower that held the told span locally registers no
+        read and its admission settles at told. Between that registration and the admission the
+        request pins nothing in the tree (the lock is taken at admission, the prefix is re-matched
+        on every pass), so a rank-local drop of exactly that span by THIS fix is possible, and the
+        admission would then raise the mismatch. It is the same exposure the tree already has to
+        every host-leaf eviction (W3 spill, host LRU) and is NOT closed here: the tree does not
+        know which request ids the scheduler holds as satisfied. Named residual; ``pp0`` removes it
+        for the followers.
+    The cache content below the leaf is lost (hand-off pages without an L3 copy).
+
+    V3 -- A HOST-BACKED END ANCHOR NO LONGER KEEPS THE SUBTREE (27B NVFP4 dual P/D stages, boot
+    ...dualstufenbar1fs10060932 @173161c595, P PP1 09:48:38Z, rid pdflip-0-50; desk dual-evict-oom-1006).
+    METAL. pdflip-0-50 (129552 tokens) was prefilled by P, D read 32768 of it (handoff_kept=32768/129551,
+    STORE READ INCOMPLETE) and handed it back (W50-REROUTE); P's re-run was paused (DUAL P-PAUSE) and
+    re-admitted at told=0. PP1's tree still held the old copy: 126976 un-backed device tokens, the
+    un-backed leaf 221 (2573 tokens, depth 129549, #1421 parent_unbacked: the arena was full) and below
+    it node 220, the END anchor (#1481) at 129551 -- KV and mamba backed, evicted to the host by the
+    peel (#1469 EVICT node=220 backuped=True host=True parent=221). V1 refused the subtree for that
+    END anchor, UD refused 221 for its child, EVICT-FRONTIER-CENSUS on_frontier=2573
+    behind_device_child=126976 delivered 0 of 1024, alloc_token_slots raised: W17 group death. On PP0
+    the same END anchor was NOT host-backed (its claim was refused), so plain UD dropped node 220 and
+    then 221 (EVICT-UNBACKED-DROP node=220 tokens=2, node=221 tokens=2573) and PP0 lived on -- the
+    same END anchor, dropped on one rank, fatal on the other.
+    WHY THE V1 GUARD IS NOT NEEDED HERE. (1) The carrier hold it cites (``_pdflip_carrier_rotate``) holds
+    the rows the RESET collected from a tree it then drops; a node of the live tree carries only its own
+    reference. (2) The hand-off to D is kept by ARENA EVICTION ORDER, not by P's tree reference
+    (``handoff_pending``, #243: "THE HOLDER IS AN EVICTION ORDER, NOT A REFERENCE"): giving the tree's
+    reference back leaves the slot COMPLETE, and for a marked rid kept (KV chain pages + END anchor keys,
+    ``keep_for``) until D takes it. (3) Every END anchor this
+    verdict reaches sits AT or BELOW the refused leaf, whose device rows have no host copy -- the KV chain
+    up to the anchor's depth was never published by P, so the anchor cannot complete a hand-back through P's
+    tree anyway. (4) Plain UD (``unbacked_drop_allowed``) has always dropped a childless un-backed END
+    anchor; V1 was stricter for the host-backed one than for the device one.
+    KEPT: the END anchor a standing told names (y9d4 told-anchor hold, ``_end_anchor_told_held``) --
+    its follower admission reads it; every other V1 guard (in flight, direct mamba rows, host/device
+    locks, a descendant that is not plain host-only) is unchanged. Gate and switch are V1's
+    (``ud_host_children_enabled``: dual P only, ``FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN`` 1/pp0/0). The V2
+    trim census (``dual_arena_spill._reason``) keeps the V1 guard as it was."""
+    if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
+        return None
+    if not ud_host_children_enabled(tree=tree):
+        return None
+    children = getattr(node, "children", None)
+    if not children:
+        return None  # a childless leaf is the plain UD case
+    ongoing = getattr(tree, "ongoing_write_through", None) or {}
+    if _subtree_blocked(tree, node, ongoing, end_anchor_yield=True):
+        return None
+    pre = []
+    stack = list(children.values())
+    while stack:
+        d = stack.pop()
+        pre.append(d)
+        if (
+            not getattr(d, "evicted", False)
+            or not getattr(d, "backuped", False)
+            or _subtree_blocked(tree, d, ongoing, end_anchor_yield=True)
+        ):
+            return None
+        for cd in d.component_data:
+            if cd.value is not None or cd.lock_ref > 0 or cd.host_lock_ref > 0:
+                return None
+        stack.extend(d.children.values())
+    pre.reverse()  # reversed pre-order: every node after all of its descendants
+    return pre
+
+
+def note_unbacked_drop(tree, node, tokens: int, subtree_nodes: int = 0, host_tokens: int = 0,
+                       end_anchors: int = 0, end_anchors_yielded: int = 0) -> None:
+    if subtree_nodes:
+        n = _sampled(tree, "_pdflip_sf_unbacked_drop_subtree")
+        if n is not None:
+            logger.warning(
+                "EVICT-UNBACKED-DROP SUBTREE node=%s tokens=%d freed=%d subtree_nodes=%d "
+                "subtree_host_tokens=%d end_anchors=%d end_anchors_yielded=%d rank=pp%s (n=%d): Q-1500 dual P -- a write_back leaf whose backup the "
+                "arena refused carried host-only children; they were released bottom-up (their arena "
+                "references went back) and the leaf dropped, instead of the eviction delivering "
+                "nothing and alloc_token_slots raising (y9d3 P PP0: rank death, W17). The cache "
+                "content below it is lost (recomputable / re-routed); end_anchors_yielded = host-backed "
+                "END anchors given up (V3, 1006 PP1 W17: D's copy stays kept by the hand-off order)",
+                getattr(node, "id", "?"), len(getattr(node, "key", []) or []), int(tokens),
+                int(subtree_nodes), int(host_tokens), int(end_anchors), int(end_anchors_yielded),
+                getattr(tree, "pp_rank", "?"), n)
+        return
+    n = _sampled(tree, "_pdflip_sf_unbacked_drop")
+    if n is not None:
+        logger.warning(
+            "EVICT-UNBACKED-DROP node=%s tokens=%d freed=%d (n=%d): a write_back leaf whose "
+            "backup was refused (arena full / parent un-backed) is dropped on the local-PP "
+            "floor instead of blocking the whole chain behind it (NF rc12q: 249856 tokens behind "
+            "one un-backable leaf)",
+            getattr(node, "id", "?"), len(getattr(node, "key", []) or []), int(tokens), n)
+
+
+def ensure_relief_provider(scheduler) -> None:
+    """SF-X: register ONE rank-local extend relief provider for this process
+    (``common.register_extend_relief_provider``). It acts only while the tree's
+    floor is marked local-PP (tp group of one, pp>1: the floor is rank-local
+    anyway, so a rank-local eviction cannot split a replica group); on a TP
+    group it returns 0 without touching the tree. Evicts exactly the tokens
+    asked, applies staged frees, logs ``EXTEND-RELIEF``."""
+    if not enabled() or getattr(scheduler, "_sf_relief_registered", False):
+        return
+    tree = getattr(scheduler, "tree_cache", None)
+    if tree is None:
+        return
+
+    def _relief(num_tokens: int) -> int:
+        if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
+            return 0
+        from flliper.srt.mem_cache.base_prefix_cache import EvictParams
+        from flliper.srt.mem_cache import common as _c
+
+        alloc = tree.token_to_kv_pool_allocator
+        before = int(alloc.available_size())
+        need = max(0, int(num_tokens) - before)
+        res = tree.evict(EvictParams(num_tokens=need)) if need > 0 else None
+        try:
+            _c._flush_deferred_frees(alloc)
+        except Exception:  # noqa: BLE001
+            pass
+        after = int(alloc.available_size())
+        n = _sampled(tree, "_pdflip_sf_extend_relief")
+        if n is not None:
+            logger.warning(
+                "EXTEND-RELIEF evicted=%d asked=%d avail %d->%d evictable_left=%d (n=%d): "
+                "rank-local relief on the local-PP floor (tp group of one) -- the extend's "
+                "own trigger read a floor the pass had already spent",
+                int(getattr(res, "num_tokens_evicted", 0) or 0), int(num_tokens), before, after,
+                int(tree.evictable_size()), n)
+        return max(0, after - before)
+
+    from flliper.srt.mem_cache.common import register_extend_relief_provider
+
+    register_extend_relief_provider(_relief)
+    scheduler._sf_relief_registered = True
+
+
+# ---------------------------------------------------------------------------
+# (b1) the budget head's position from the KEPT told
+# ---------------------------------------------------------------------------
+
+
+def kept_told(scheduler, req) -> Optional[int]:
+    """The H91 kept told of ``req`` (same request object), or None. Switch off:
+    None, the lookup is not made."""
+    if not enabled():
+        return None
+    kept = getattr(scheduler, "_pdflip_told_kept", None)
+    if not kept:
+        return None
+    entry = kept.get(str(getattr(req, "rid", "")))
+    if entry is None or getattr(entry, "req", None) is not req:
+        return None
+    try:
+        return int(entry.told)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# (b2) replan at the prefix move
+# ---------------------------------------------------------------------------
+
+
+class BudgetPlan(NamedTuple):
+    rid: str
+    pos: int
+    end: int
+    src: str
+    width: int
+
+
+def note_budget(scheduler, head, width: int) -> None:
+    """Remember the position/width this pass's budget was sized from."""
+    if not enabled():
+        return
+    try:
+        setattr(scheduler, PLAN_ATTR, BudgetPlan(
+            str(getattr(head.req, "rid", "")), int(head.pos), int(head.end),
+            str(head.src), int(width)))
+    except Exception:  # noqa: BLE001 -- an instrument never stops a pass
+        pass
+
+
+def clear_budget(scheduler) -> None:
+    """Start of a pass's budget sizing: no plan is carried over from an earlier
+    pass (a static / layer-split pass notes none). Switch off: nothing."""
+    if not enabled():
+        return
+    try:
+        setattr(scheduler, PLAN_ATTR, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def replan_hook(scheduler, adder):
+    """The #988 move hook for this pass's adder, or None (switch off, no plan
+    policy, no plan noted this pass): ``hook(req, new_prefix_len)``. The plan is
+    CONSUMED here -- bound into this adder's hook, gone from the scheduler -- so
+    it never serves a second adder."""
+    if not enabled() or getattr(scheduler, "_p_chunk_planner", None) is None:
+        return None
+    plan = getattr(scheduler, PLAN_ATTR, None)
+    if plan is None:
+        return None
+    try:
+        setattr(scheduler, PLAN_ATTR, None)
+        setattr(adder, ADDER_INITIAL_ATTR, adder.rem_chunk_tokens)
+    except Exception:  # noqa: BLE001
+        return None
+    box = [plan]
+
+    def _hook(req, new_pos):
+        return replan_after_move(scheduler, adder, req, new_pos, box)
+
+    return _hook
+
+
+def replan_after_move(scheduler, adder, req, new_pos: int, box) -> Optional[int]:
+    """#988 moved ``req``'s prefix to ``new_pos``. If the pass budget was planned
+    for this request at a different position, replan at ``new_pos`` and narrow
+    the adder's chunk budget to the new plan's width. ``box`` holds this pass's
+    plan. Returns the new budget, or None when nothing changed. Never raises."""
+    try:
+        plan = box[0]
+        rid = str(getattr(req, "rid", ""))
+        if plan is None or plan.rid != rid or plan.src == "chunked":
+            return None
+        new_pos = int(new_pos)
+        if new_pos == plan.pos:
+            return None
+        rem = getattr(adder, "rem_chunk_tokens", None)
+        initial = getattr(adder, ADDER_INITIAL_ATTR, None)
+        if rem is None or initial is None:
+            return None
+        if getattr(adder, "can_run_list", None) or int(rem) != int(initial):
+            n = _sampled(scheduler, "_pdflip_sf_replan_skipped")
+            if n is not None:
+                logger.warning(
+                    "SF P-CHUNK REPLAN-AT-MOVE SKIPPED rid=%s planned_start=%d moved_to=%d "
+                    "rem_chunk=%s initial=%s can_run=%d (n=%d): the pass budget was "
+                    "already spent on another request; the next pass replans at the "
+                    "executed position",
+                    rid[:16], plan.pos, new_pos, rem, initial,
+                    len(getattr(adder, "can_run_list", None) or ()), n,
+                )
+            return None
+        from flliper.srt.pdflip.p_chunk_policy import forward_budget
+
+        planner = getattr(scheduler, "_p_chunk_planner", None)
+        if planner is None:
+            return None
+        width = int(forward_budget(planner, req.rid, new_pos, plan.end, queued=True))
+        cap = int(getattr(scheduler, "chunked_prefill_size", 0) or 0)
+        if cap > 0:
+            width = min(width, cap)
+        new_budget = min(width, int(initial)) if width > 0 else int(initial)
+        adder.rem_chunk_tokens = new_budget
+        box[0] = plan._replace(pos=new_pos, width=new_budget)
+        n = _sampled(scheduler, "_pdflip_sf_replan_n")
+        if n is not None:
+            logger.info(
+                "SF P-CHUNK REPLAN-AT-MOVE rid=%s planned_start=%d (src=%s) moved_to=%d "
+                "width %d -> %d (plan %d, never widened) (n=%d): the pass budget was "
+                "planned for another start; #988 moved the prefix, so the plan is "
+                "redone at the moved prefix on every rank alike",
+                rid[:16], plan.pos, plan.src, new_pos, int(initial), new_budget, width, n,
+            )
+        return new_budget
+    except Exception as exc:  # noqa: BLE001 -- a plan must never stop a pass
+        n = _sampled(scheduler, "_pdflip_sf_replan_err")
+        if n is not None:
+            logger.warning("SF P-CHUNK REPLAN-AT-MOVE failed (n=%d): %r", n, exc)
+        return None

@@ -25,13 +25,13 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.distributed.dual_group import (  # noqa: E402
+from flliper.srt.distributed.dual_group import (  # noqa: E402
     NestedGroupPlan,
     derive_nested_plan,
     nesting_failures,
     transformer_nesting_probes,
 )
-from sglang.srt.distributed.utils import ACTIVATION_VEC_ELEMS  # noqa: E402
+from flliper.srt.distributed.utils import ACTIVATION_VEC_ELEMS  # noqa: E402
 
 
 def read_cfg(path: str) -> dict:

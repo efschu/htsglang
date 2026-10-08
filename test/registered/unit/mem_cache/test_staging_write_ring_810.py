@@ -29,18 +29,18 @@ import unittest
 import torch
 
 try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.test.ci.ci_register import register_cpu_ci
 except ImportError:  # pragma: no cover - registration is a CI-time marker
 
     def register_cpu_ci(*args, **kwargs):
         return None
 
 
-from sglang.srt.mem_cache.staging_write_ring import (
+from flliper.srt.mem_cache.staging_write_ring import (
     StagingWriteRing,
     build_staging_write_ring,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -295,7 +295,7 @@ class _HiRadixFixture:
 
 
 def _run_hiradix_backup(fixture, node_id=7, kv_tokens=CHUNK):
-    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+    from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
     node = _HiRadixNode(node_id, kv_tokens, fixture.root_node)
     return HiRadixCache.write_backup(fixture, node)
@@ -322,7 +322,7 @@ class _UnifiedFixture:
         self.staging_write_ring = ring
         self.evictions = 0
         self._components_tuple = ()
-        from sglang.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
+        from flliper.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
 
         self.components = {
             BASE_COMPONENT_TYPE: types.SimpleNamespace(
@@ -351,8 +351,8 @@ class _UnifiedFixture:
 
 
 def _run_unified_backup(fixture, node_id=7, kv_tokens=CHUNK):
-    from sglang.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     node = _UnifiedNode(node_id, kv_tokens, fixture.root_node)
     node.component_data[BASE_COMPONENT_TYPE] = types.SimpleNamespace(
@@ -498,7 +498,7 @@ class _StorageFixture(_HiRadixFixture):
 
     def write_backup_storage(self, node, backup_len=None):
         """The REAL hand-off, so the phase hand-over is exercised end to end."""
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
         return HiRadixCache.write_backup_storage(self, node, backup_len)
 
@@ -528,7 +528,7 @@ class DrainPhaseIsChargedTest(CustomTestCase):
     """
 
     def test_the_storage_handoff_charges_the_ring(self):
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
         ring = StagingWriteRing(capacity_tokens=4 * CHUNK)
         fixture = _StorageFixture(ring)
@@ -545,7 +545,7 @@ class DrainPhaseIsChargedTest(CustomTestCase):
         self.assertEqual(node.protected, 1)
 
     def test_the_backup_ack_gives_the_room_back(self):
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
         ring = StagingWriteRing(capacity_tokens=4 * CHUNK)
         fixture = _StorageFixture(ring)
@@ -570,7 +570,7 @@ class DrainPhaseIsChargedTest(CustomTestCase):
     def test_the_two_phases_do_not_double_count_one_page(self):
         """The admitted charge is retired at the device->host ack, BEFORE the
         storage hand-off takes its own. Overlapping them would halve the ring."""
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
         ring = StagingWriteRing(capacity_tokens=4 * CHUNK)
         fixture = _StorageFixture(ring)
@@ -589,7 +589,7 @@ class DrainPhaseIsChargedTest(CustomTestCase):
         """The other exit from ``ongoing_backup``. A charge skipped here would
         shrink the ring for the rest of the process's life -- the failure mode
         that is strictly worse than the overshoot it protects against."""
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
         ring = StagingWriteRing(capacity_tokens=4 * CHUNK)
         fixture = _StorageFixture(ring)
@@ -620,7 +620,7 @@ class UnifiedDrainPhaseTest(CustomTestCase):
     """The same two drain edges on the other production class."""
 
     def _fixture(self, ring):
-        from sglang.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
+        from flliper.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
 
         fixture = _UnifiedFixture(ring)
         fixture.ongoing_backup = {}
@@ -646,7 +646,7 @@ class UnifiedDrainPhaseTest(CustomTestCase):
         fixture.dec_lock_ref = lambda node, params: None
 
         def _write_backup_storage(node):
-            from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+            from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
             return UnifiedRadixCache.write_backup_storage(fixture, node)
 
@@ -662,7 +662,7 @@ class UnifiedDrainPhaseTest(CustomTestCase):
         return fixture, node
 
     def test_the_storage_handoff_charges_the_ring(self):
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         ring = StagingWriteRing(capacity_tokens=4 * CHUNK)
         fixture, node = self._fixture(ring)
@@ -671,7 +671,7 @@ class UnifiedDrainPhaseTest(CustomTestCase):
         self.assertEqual(ring.occupied, 1)
 
     def test_the_backup_ack_gives_the_room_back(self):
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         ring = StagingWriteRing(capacity_tokens=4 * CHUNK)
         fixture, node = self._fixture(ring)
@@ -699,7 +699,7 @@ class UnifiedDrainPhaseTest(CustomTestCase):
         and leaving the admitted one standing would leak it: after a node
         split the storage backups are keyed by OPERATION, so nothing downstream
         ever retires a node-keyed charge."""
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         ring = StagingWriteRing(capacity_tokens=4 * CHUNK)
         fixture, node = self._fixture(ring)

@@ -2,10 +2,10 @@ import unittest
 
 import torch
 
-from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import (
+from flliper.test.accuracy_test_runner import AccuracyTestParams
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_combined_tests import run_combined_tests
+from flliper.test.test_utils import (
     CustomTestCase,
     ModelLaunchSettings,
 )

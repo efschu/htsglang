@@ -9,7 +9,7 @@ automatic dump could not find py-spy:
 py-spy was installed the whole time, in the venv bin directory next to the
 interpreter. The handler shelled out to a bare ``py-spy`` with ``shell=True``,
 so the name was resolved against ``/bin/sh``'s PATH, and a server started as
-``/path/to/venv/bin/python -m sglang.launch_server`` never puts that directory
+``/path/to/venv/bin/python -m flliper.launch_server`` never puts that directory
 on PATH. The failure is silent in the sense that matters: it costs you the
 specimen, and you only find out afterwards.
 
@@ -26,12 +26,12 @@ from unittest import mock
 
 import pytest
 
-from sglang.srt.utils.cudacore_pyspy_dump_utils import (
+from flliper.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     resolve_pyspy_binary,
 )
 
-MODULE = "sglang.srt.utils.cudacore_pyspy_dump_utils"
+MODULE = "flliper.srt.utils.cudacore_pyspy_dump_utils"
 
 
 def _make_executable(path: Path) -> Path:
@@ -50,7 +50,7 @@ def fake_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(f"{MODULE}.sys.executable", str(bindir / "python"))
     monkeypatch.setenv("PATH", str(elsewhere))
-    monkeypatch.delenv("SGLANG_PYSPY_BIN", raising=False)
+    monkeypatch.delenv("FLLIPER_PYSPY_BIN", raising=False)
     return bindir, elsewhere
 
 
@@ -89,7 +89,7 @@ def test_interpreter_bin_dir_wins_over_path(fake_env):
 def test_env_override_wins_over_everything(fake_env, monkeypatch):
     bindir, _ = fake_env
     _make_executable(bindir / "py-spy")
-    monkeypatch.setenv("SGLANG_PYSPY_BIN", "/opt/custom/py-spy")
+    monkeypatch.setenv("FLLIPER_PYSPY_BIN", "/opt/custom/py-spy")
 
     assert resolve_pyspy_binary() == "/opt/custom/py-spy"
 
@@ -263,7 +263,7 @@ def test_a_symlinked_venv_interpreter_still_finds_its_own_console_script(
     empty.mkdir()
     monkeypatch.setattr(f"{MODULE}.sys.executable", str(venv_bin / "python"))
     monkeypatch.setenv("PATH", str(empty))
-    monkeypatch.delenv("SGLANG_PYSPY_BIN", raising=False)
+    monkeypatch.delenv("FLLIPER_PYSPY_BIN", raising=False)
 
     assert resolve_pyspy_binary() == str(expected)
 
@@ -285,6 +285,6 @@ def test_resolved_interpreter_dir_is_still_searched_as_a_fallback(
     empty.mkdir()
     monkeypatch.setattr(f"{MODULE}.sys.executable", str(venv_bin / "python"))
     monkeypatch.setenv("PATH", str(empty))
-    monkeypatch.delenv("SGLANG_PYSPY_BIN", raising=False)
+    monkeypatch.delenv("FLLIPER_PYSPY_BIN", raising=False)
 
     assert resolve_pyspy_binary() == str(expected)

@@ -15,19 +15,19 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
+from flliper.jit_kernel.diffusion.triton.varlen_pack_pad import (
     fused_pack_qkv,
     fused_scatter_to_padded,
 )
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.multimodal_gen.runtime.layers.attention.backends import (
+from flliper.jit_kernel.flash_attention import flash_attn_varlen_func
+from flliper.jit_kernel.utils import get_ci_test_range
+from flliper.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )
-from sglang.multimodal_gen.runtime.layers.attention.layer import (
+from flliper.multimodal_gen.runtime.layers.attention.layer import (
     build_varlen_mask_meta,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, suite="nightly-kernel-1-gpu", nightly=True)

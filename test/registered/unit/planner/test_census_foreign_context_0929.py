@@ -20,10 +20,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.planner import pp_cut_calibration as cal
-from sglang.srt.planner import residency_census as rc
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import pp_cut_calibration as cal
+from flliper.srt.planner import residency_census as rc
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -109,7 +109,7 @@ class CensusSplit(CustomTestCase):
             def __exit__(self_inner, *a):
                 return False
 
-        with mock.patch("sglang.srt.registry.nvml.nvml_session", lambda: _Sess()):
+        with mock.patch("flliper.srt.registry.nvml.nvml_session", lambda: _Sess()):
             out = rc.card_process_split_mib(uuid, pid=pid)
         return out, fake
 

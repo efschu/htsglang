@@ -18,12 +18,12 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+from flliper.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.attention_unittest.attention_methods.mla_attention import (
     DEFAULT_KV_LORA_RANK,
     DEFAULT_MAX_CONTEXT_LEN,
     MLAAttentionCase,
@@ -31,7 +31,7 @@ from sglang.test.kits.attention_unittest.attention_methods.mla_attention import 
     TinyMLAModelConfig,
     _make_forward_batch,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
@@ -88,7 +88,7 @@ def _build_hybrid_backend(testcase, case: MLAAttentionCase):
         fp8_kv_cache=False,
     )
     try:
-        from sglang.srt.layers.attention.flashinfer_mla_backend import (
+        from flliper.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
         )
 

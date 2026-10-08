@@ -14,11 +14,11 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
-from sglang.jit_kernel.fused_qknorm_rope import (
+from flliper.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from flliper.jit_kernel.fused_qknorm_rope import (
     fused_qk_norm_rope as fused_qk_norm_rope_jit,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

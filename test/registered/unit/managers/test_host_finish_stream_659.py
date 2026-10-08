@@ -88,8 +88,8 @@ def _make_batch(reqs, *, return_logprob=False):
     fields a forward pass would need are irrelevant and constructing them
     would need a GPU.
     """
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from flliper.srt.managers.schedule_batch import ScheduleBatch
+    from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
     batch = ScheduleBatch.__new__(ScheduleBatch)
     batch.reqs = list(reqs)
@@ -113,7 +113,7 @@ class _RebindingBatch:
     """
 
     def __init__(self, reqs, return_logprob):
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.reqs = list(reqs)
         self.return_logprob = return_logprob
@@ -130,7 +130,7 @@ def _make_manager(batch):
     release path touches, and its slot aliased to ``batch`` -- which is the
     spill-tick shape: ``maybe_take_tick`` hands the scheduler the persistent
     batch, so ``slot.batch is batch``."""
-    from sglang.srt.managers.kv_session_offload import (
+    from flliper.srt.managers.kv_session_offload import (
         KVSessionOffloadManager,
         RestoreHysteresis,
         SpillSlot,
@@ -163,7 +163,7 @@ def _make_manager(batch):
 
 
 def _install_slot(mgr, req, batch, region=0):
-    from sglang.srt.managers.kv_session_offload import (
+    from flliper.srt.managers.kv_session_offload import (
         RestoreHysteresis,
         SpillSlot,
         WaveBackController,
@@ -186,7 +186,7 @@ def _make_processor(mgr, streamer):
     are orthogonal to the alias (logprobs, mamba, reasoning tokens, weightless
     lane). It is a frozen, SLOTTED dataclass, so per-instance method stubs are
     impossible -- the subclass is the only seam."""
-    from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    from flliper.srt.managers.scheduler_components.batch_result_processor import (
         DisaggregationMode,
         SchedulerBatchResultProcessor,
     )
@@ -273,7 +273,7 @@ def test_filter_batch_rebinds_are_still_what_this_file_assumes():
     this test says so before that test can pass on a false model."""
     import inspect
 
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from flliper.srt.managers.schedule_batch import ScheduleBatch
 
     src = inspect.getsource(ScheduleBatch.filter_batch)
     assert "not self.reqs[i].finished()" in src, "keep-criterion changed"

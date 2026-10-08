@@ -28,8 +28,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5)
 
@@ -41,27 +41,27 @@ PRE_251_LAUNCH_DUMP_DIR = "/spinning/wedge-catch-603b"
 
 class TestTranslatorModelRoot(CustomTestCase):
     def test_default_is_the_pre_251_literal(self):
-        from sglang.srt.translator.config import default_model_root
+        from flliper.srt.translator.config import default_model_root
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_TRANSLATOR_MODEL_ROOT", None)
+            os.environ.pop("FLLIPER_TRANSLATOR_MODEL_ROOT", None)
             self.assertEqual(default_model_root(), Path(PRE_251_TRANSLATOR_ROOT))
 
     def test_config_dataclass_default_is_the_pre_251_literal(self):
-        from sglang.srt.translator.config import TranslatorConfig
+        from flliper.srt.translator.config import TranslatorConfig
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_TRANSLATOR_MODEL_ROOT", None)
+            os.environ.pop("FLLIPER_TRANSLATOR_MODEL_ROOT", None)
             self.assertEqual(
                 TranslatorConfig().model_root, Path(PRE_251_TRANSLATOR_ROOT)
             )
 
     def test_override_reaches_the_config_and_the_launcher_flags(self):
-        from sglang.srt.translator.config import TranslatorConfig
-        from sglang.srt.translator.launch import build_parser
+        from flliper.srt.translator.config import TranslatorConfig
+        from flliper.srt.translator.launch import build_parser
 
         with mock.patch.dict(
-            os.environ, {"SGLANG_TRANSLATOR_MODEL_ROOT": "/models/tr"}
+            os.environ, {"FLLIPER_TRANSLATOR_MODEL_ROOT": "/models/tr"}
         ):
             self.assertEqual(TranslatorConfig().model_root, Path("/models/tr"))
             args = build_parser().parse_args([])
@@ -74,10 +74,10 @@ class TestTranslatorModelRoot(CustomTestCase):
             )
 
     def test_launcher_defaults_unset_are_the_pre_251_literals(self):
-        from sglang.srt.translator.launch import build_parser
+        from flliper.srt.translator.launch import build_parser
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_TRANSLATOR_MODEL_ROOT", None)
+            os.environ.pop("FLLIPER_TRANSLATOR_MODEL_ROOT", None)
             args = build_parser().parse_args([])
             self.assertEqual(
                 args.asr_cache, Path(PRE_251_TRANSLATOR_ROOT) / "asr-models"
@@ -91,14 +91,14 @@ class TestTranslatorModelRoot(CustomTestCase):
 
 class TestVideoEnhanceModelRoot(CustomTestCase):
     def test_defaults_are_the_pre_251_literals(self):
-        from sglang.srt.video_enhance.asset_root import (
+        from flliper.srt.video_enhance.asset_root import (
             default_engine_cache_dir,
             default_model_root,
             default_sr_model_dir,
         )
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_VIDEO_MODEL_ROOT", None)
+            os.environ.pop("FLLIPER_VIDEO_MODEL_ROOT", None)
             self.assertEqual(default_model_root(), Path(PRE_251_VIDEO_ROOT))
             self.assertEqual(default_sr_model_dir(), Path(PRE_251_VIDEO_ROOT) / "sr")
             self.assertEqual(
@@ -106,13 +106,13 @@ class TestVideoEnhanceModelRoot(CustomTestCase):
             )
 
     def test_override_reaches_every_derived_path(self):
-        from sglang.srt.video_enhance.asset_root import (
+        from flliper.srt.video_enhance.asset_root import (
             default_engine_cache_dir,
             default_model_root,
             default_sr_model_dir,
         )
 
-        with mock.patch.dict(os.environ, {"SGLANG_VIDEO_MODEL_ROOT": "/models/k3"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_VIDEO_MODEL_ROOT": "/models/k3"}):
             self.assertEqual(default_model_root(), Path("/models/k3"))
             self.assertEqual(default_sr_model_dir(), Path("/models/k3/sr"))
             self.assertEqual(default_engine_cache_dir(), Path("/models/k3/engines"))
@@ -121,41 +121,41 @@ class TestVideoEnhanceModelRoot(CustomTestCase):
         # An empty value is what a half-written unit file or an unset shell
         # variable expands to. Path("") is the CURRENT DIRECTORY, which would
         # scatter engine caches wherever the server happened to start.
-        from sglang.srt.video_enhance.asset_root import default_model_root
+        from flliper.srt.video_enhance.asset_root import default_model_root
 
-        with mock.patch.dict(os.environ, {"SGLANG_VIDEO_MODEL_ROOT": ""}):
+        with mock.patch.dict(os.environ, {"FLLIPER_VIDEO_MODEL_ROOT": ""}):
             self.assertEqual(default_model_root(), Path(PRE_251_VIDEO_ROOT))
 
 
 class TestLaunchDumpDestination(CustomTestCase):
     def test_default_directory_is_the_pre_251_literal(self):
-        from sglang.srt.distributed.device_communicators import barlink_launch_dump
+        from flliper.srt.distributed.device_communicators import barlink_launch_dump
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_BARLINK_LAUNCH_DUMP_DIR", None)
+            os.environ.pop("FLLIPER_BARLINK_LAUNCH_DUMP_DIR", None)
             self.assertEqual(
                 barlink_launch_dump.sample_dir(), PRE_251_LAUNCH_DUMP_DIR
             )
 
     def test_directory_override_is_honoured(self):
-        from sglang.srt.distributed.device_communicators import barlink_launch_dump
+        from flliper.srt.distributed.device_communicators import barlink_launch_dump
 
         with mock.patch.dict(
-            os.environ, {"SGLANG_BARLINK_LAUNCH_DUMP_DIR": "/var/log/hts"}
+            os.environ, {"FLLIPER_BARLINK_LAUNCH_DUMP_DIR": "/var/log/hts"}
         ):
             self.assertEqual(barlink_launch_dump.sample_dir(), "/var/log/hts")
 
     def test_sampler_is_on_by_default(self):
-        from sglang.srt.distributed.device_communicators import barlink_launch_dump
+        from flliper.srt.distributed.device_communicators import barlink_launch_dump
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_BARLINK_LAUNCH_DUMP", None)
+            os.environ.pop("FLLIPER_BARLINK_LAUNCH_DUMP", None)
             self.assertTrue(barlink_launch_dump.sampler_enabled())
 
     def test_sampler_can_be_switched_off(self):
-        from sglang.srt.distributed.device_communicators import barlink_launch_dump
+        from flliper.srt.distributed.device_communicators import barlink_launch_dump
 
-        with mock.patch.dict(os.environ, {"SGLANG_BARLINK_LAUNCH_DUMP": "0"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_BARLINK_LAUNCH_DUMP": "0"}):
             self.assertFalse(barlink_launch_dump.sampler_enabled())
 
     def test_switched_off_sampler_creates_no_directory_and_no_thread(self):
@@ -164,14 +164,14 @@ class TestLaunchDumpDestination(CustomTestCase):
         # filesystem, and must not carry a thread appending to it forever.
         import threading
 
-        from sglang.srt.distributed.device_communicators import barlink_launch_dump
+        from flliper.srt.distributed.device_communicators import barlink_launch_dump
 
         before = {t.name for t in threading.enumerate()}
         with mock.patch.dict(
             os.environ,
             {
-                "SGLANG_BARLINK_LAUNCH_DUMP": "0",
-                "SGLANG_BARLINK_LAUNCH_DUMP_DIR": "/nonexistent-251/should-not-appear",
+                "FLLIPER_BARLINK_LAUNCH_DUMP": "0",
+                "FLLIPER_BARLINK_LAUNCH_DUMP_DIR": "/nonexistent-251/should-not-appear",
             },
         ):
             with mock.patch("os.makedirs") as made:

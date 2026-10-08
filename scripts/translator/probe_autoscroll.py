@@ -20,7 +20,7 @@ gate's job and this does not replace it.
 
 Can-fail proof (run it before believing a green):
 
-    git -C <worktree> show 8011c6fb05:python/sglang/srt/translator/client/index.html \\
+    git -C <worktree> show 8011c6fb05:python/flliper/srt/translator/client/index.html \\
         > /tmp/client_before.html
     ... probe_autoscroll.py --client /tmp/client_before.html   # must be RED
 
@@ -44,7 +44,7 @@ from pathlib import Path
 
 DEFAULT_CLIENT = (
     Path(__file__).resolve().parents[2]
-    / "python/sglang/srt/translator/client/index.html"
+    / "python/flliper/srt/translator/client/index.html"
 )
 
 #: A phone, roughly. The defect only exists once the content overflows, so the

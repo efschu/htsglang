@@ -3,14 +3,14 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.kv_canary import endpoint as endpoint_module
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.fixtures import (
+from flliper.srt.kv_canary import endpoint as endpoint_module
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.fixtures import (
     make_forward_batch,
     make_radix_cache,
     make_req_to_token_pool,
 )
-from sglang.test.kv_canary.runner_test_base import (
+from flliper.test.kv_canary.runner_test_base import (
     CanaryManagerTestCase,
     make_config,
     make_manager,

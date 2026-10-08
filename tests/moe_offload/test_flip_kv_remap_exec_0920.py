@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.flip_kv_remap import DISPOSITION_REMAP, plan_kv_remap
-from sglang.srt.flip_kv_remap_exec import (
+from flliper.srt.flip_kv_remap import DISPOSITION_REMAP, plan_kv_remap
+from flliper.srt.flip_kv_remap_exec import (
     CudaVmmOps,
     FakeVmmOps,
     LayerHandle,
     execute_kv_remap,
 )
-from sglang.srt.flip_nextflash_plan import Weg2FlipKvRelayInfeasible
+from flliper.srt.flip_nextflash_plan import PdFlipKvRelayInfeasible
 
 
 def _handles(plan, only_remap=True, nbytes=1 << 20):
@@ -113,7 +113,7 @@ def test_a_missing_handle_is_a_hole_not_a_smaller_remap():
     hs = _handles(plan)[:-1]
     ops = FakeVmmOps()
     _mapped_src(ops, hs)
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         execute_kv_remap(plan, hs, ops)
     msg = str(exc.value)
     assert "no physical handle" in msg
@@ -124,7 +124,7 @@ def test_a_handle_for_an_unscheduled_layer_is_refused():
     plan = plan_kv_remap()
     hs = _handles(plan) + [LayerHandle(99, object(), 0x1, 0x2, 4096)]
     ops = FakeVmmOps()
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         execute_kv_remap(plan, hs, ops)
     assert "does not move" in str(exc.value)
 
@@ -134,7 +134,7 @@ def test_src_equal_dst_is_a_noop_wearing_a_remaps_name():
     hs = _handles(plan)
     hs[0] = LayerHandle(hs[0].layer_index, hs[0].handle, 0x500, 0x500, 4096)
     ops = FakeVmmOps()
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         execute_kv_remap(plan, hs, ops)
     assert "no-op wearing a remap" in str(exc.value)
 
@@ -146,7 +146,7 @@ def test_a_failure_names_the_layers_in_the_window():
     hs = _handles(plan)
     ops = FakeVmmOps(fail_on_map=[hs[2].dst_va])
     _mapped_src(ops, hs)
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         execute_kv_remap(plan, hs, ops)
     msg = str(exc.value)
     assert f"[{hs[2].layer_index}] are IN THE WINDOW" in msg
@@ -162,7 +162,7 @@ def test_an_unavailable_device_layer_refuses_instead_of_copying():
             return False
 
     plan = plan_kv_remap()
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         execute_kv_remap(plan, _handles(plan), Dead())
     assert "S6-REMAP-STATT-ALLOKATION" in str(exc.value)
 
@@ -174,7 +174,7 @@ def test_the_cuda_ops_refuse_by_name_without_bindings():
     ops = CudaVmmOps()
     if ops.available():
         pytest.skip("driver bindings present in this process")
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         ops.unmap(0x1000, 4096)
     msg = str(exc.value)
     assert "no CUDA driver bindings" in msg
@@ -186,7 +186,7 @@ def test_the_cuda_ops_never_degrade_to_a_copy():
     exists to avoid, and would surface as an OOM with no line saying why."""
     import inspect
 
-    from sglang.srt import flip_kv_remap_exec as mod
+    from flliper.srt import flip_kv_remap_exec as mod
 
     src = inspect.getsource(mod.CudaVmmOps)
     assert "copy" in src  # it TALKS about the copy...

@@ -1,10 +1,10 @@
 """Nutzer 02.10. ~11:00Z: "dann muss der visiontower laden rechnen entladen auch mit in die phasenliste ins
-dashboard".  Source: rankstats ``vision`` of P's PP0 (writer weg2/rank_timing.note_vision_*, desk/nf-vision-ipc-1002)
+dashboard".  Source: rankstats ``vision`` of P's PP0 (writer pdflip/rank_timing.note_vision_*, desk/nf-vision-ipc-1002)
 -- IPC, never the log line (test_no_new_log_parsers).
 
 Metal shape (y7h-noH4, P PP0, 02.10.):
-  run=1 10:54:28Z legs_ms=(build 69, load 488, encode 838, attach 0, teardown 439)   fresh image, weg2-0-1
-  run=2 10:55:03Z legs_ms=(build 55, load 478, encode 20, attach 0, teardown 413)    cached image, weg2-1-5
+  run=1 10:54:28Z legs_ms=(build 69, load 488, encode 838, attach 0, teardown 439)   fresh image, pdflip-0-1
+  run=2 10:55:03Z legs_ms=(build 55, load 478, encode 20, attach 0, teardown 413)    cached image, pdflip-1-5
 The stage runs in P's admission after the D>P flip -- inside the flip tail, before the first P chunk.
 """
 import unittest
@@ -28,8 +28,8 @@ def run(no, end, legs_ms, rid, reserve_ms=3.0):
             "tower_mib": 856.3, "place": "kvtail", "card": 1, "legs": legs}
 
 
-RUN1 = run(1, T1, {"build": 69, "load": 488, "encode": 838, "attach": 0, "teardown": 439}, "weg2-0-1")
-RUN2 = run(2, T2, {"build": 55, "load": 478, "encode": 20, "attach": 0, "teardown": 413}, "weg2-1-5")
+RUN1 = run(1, T1, {"build": 69, "load": 488, "encode": 838, "attach": 0, "teardown": 439}, "pdflip-0-1")
+RUN2 = run(2, T2, {"build": 55, "load": 478, "encode": 20, "attach": 0, "teardown": 413}, "pdflip-1-5")
 
 
 def pp0(ts, runs, live=None, fwd=0):
@@ -43,10 +43,10 @@ def ring_of(*samples):
 
 class VisionCompact(unittest.TestCase):
     def test_compact_keeps_runs_and_live(self):
-        c = pp0(T1 + 1, [RUN1], live={"run": 2, "leg": "load", "since": T2 - 0.5, "rids": ["weg2-1-5"]})
+        c = pp0(T1 + 1, [RUN1], live={"run": 2, "leg": "load", "since": T2 - 0.5, "rids": ["pdflip-1-5"]})
         v = c["vis"]
         self.assertEqual(v["live"]["leg"], "load")
-        self.assertEqual(v["recent"][0]["rids"], ["weg2-0-1"])
+        self.assertEqual(v["recent"][0]["rids"], ["pdflip-0-1"])
         self.assertEqual(v["recent"][0]["mib"], 856.3)
         self.assertEqual(set(v["recent"][0]["legs"]), {"build", "reserve", "load", "encode", "attach", "teardown"})
 
@@ -88,7 +88,7 @@ class VisionPhases(unittest.TestCase):
         self.assertTrue(all(x["e"] <= RUN1["t0"] + 1e-3 or x["s"] >= T1 - 1e-3 for x in tl))
 
     def test_live_leg_shows_now_and_in_the_active_frame(self):
-        live = {"run": 2, "leg": "load", "since": T2 - 0.6, "rids": ["weg2-1-5"]}
+        live = {"run": 2, "leg": "load", "since": T2 - 0.6, "rids": ["pdflip-1-5"]}
         ring = ring_of((T2 - 2.0, pp0(T2 - 2.0, [RUN1])), (T2 - 0.1, pp0(T2 - 0.1, [RUN1], live=live)))
         m = activity.Model(ring, [], [])
         tl = ipcboot.timeline_view(m, True, "P", T2, T1 - 10.0)
@@ -98,7 +98,7 @@ class VisionPhases(unittest.TestCase):
         self.assertEqual(last.get("vis_live"), "load")
         pn = ipcboot.phase_now(tl["segs"], {}, {"state": "serving", "awake": "P"}, [], True, T2)
         self.assertEqual(pn["label"], "Vision load")
-        self.assertIn("weg2-1-5", pn["sub"])
+        self.assertIn("pdflip-1-5", pn["sub"])
 
     def test_states_and_history_fractions_carry_the_vision_phases(self):
         for k in ("vis_load", "vis_enc", "vis_unload"):
@@ -113,7 +113,7 @@ class VisionPhases(unittest.TestCase):
         m = activity.Model(ring, [], [])
         tl = ipcboot.timeline_view(m, False, "P", T1 + 0.5, T1 - 10.0)
         enc = next(x for x in tl["segs"] if x["k"] == "vis_enc")
-        self.assertEqual((enc["run"], enc["rids"], enc["mib"]), (1, ["weg2-0-1"], 856.3))
+        self.assertEqual((enc["run"], enc["rids"], enc["mib"]), (1, ["pdflip-0-1"], 856.3))
         self.assertEqual(enc["legs_ms"], {"encode": 838, "attach": 0})
 
 

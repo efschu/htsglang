@@ -59,7 +59,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30)
 
@@ -97,7 +97,7 @@ class _Wire:
 
 
 def _counters(directory, rank):
-    from sglang.srt.managers.phase_flip_counters import PhaseFlipCounters
+    from flliper.srt.managers.phase_flip_counters import PhaseFlipCounters
 
     return PhaseFlipCounters(
         n_ranks=WORLD, rank=rank, directory=directory, instance=INSTANCE
@@ -112,7 +112,7 @@ def _upstream_holder(directory):
     posts, so a test that bumped the counters itself would be asserting its
     own arithmetic.
     """
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=_Wire(UPSTREAM),
@@ -138,7 +138,7 @@ def _upstream_holder(directory):
 
 
 def _victim_holder(directory):
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=_Wire(VICTIM),
@@ -197,7 +197,7 @@ def _drive(victim, kind, join_s=JOIN_S):
 
 class PPReadinessPerKind974(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.managers.scheduler_pp_mixin import ENV_PROXY_READINESS_BUDGET
+        from flliper.srt.managers.scheduler_pp_mixin import ENV_PROXY_READINESS_BUDGET
 
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = self._tmp.name
@@ -226,7 +226,7 @@ class PPReadinessPerKind974(unittest.TestCase):
         After it, the gate sees zero posted and zero entered on
         `dict|output` and refuses -- bounded, named, loud.
         """
-        from sglang.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
+        from flliper.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
 
         _post(self.upstream, ADMISSION_DECISION_KIND, n=12)
 
@@ -251,8 +251,8 @@ class PPReadinessPerKind974(unittest.TestCase):
         upstream is provably ahead, and it is only ON THIS KIND that it is
         not.
         """
-        from sglang.srt.managers.phase_flip_counters import CHAN_DICT
-        from sglang.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
+        from flliper.srt.managers.phase_flip_counters import CHAN_DICT
+        from flliper.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
 
         _post(self.upstream, ADMISSION_DECISION_KIND, n=12)
         c = self.victim.pp_flip_counters
@@ -293,7 +293,7 @@ class PPReadinessPerKind974(unittest.TestCase):
         Boots instr7/instr8 died of getting this wrong; it must not regress
         because the counters gained an axis.
         """
-        from sglang.srt.managers.phase_flip_counters import CHAN_DICT, kind_channel
+        from flliper.srt.managers.phase_flip_counters import CHAN_DICT, kind_channel
 
         # Entered, not yet posted: exactly what `bump_attempted` publishes on
         # the line before the send call.
@@ -333,7 +333,7 @@ class PPReadinessPerKind974(unittest.TestCase):
         shortfall and the gate uses the wire counters, which is what those
         tests have always measured.
         """
-        from sglang.srt.managers.phase_flip_counters import (
+        from flliper.srt.managers.phase_flip_counters import (
             CHAN_DICT,
             kind_axis_covers,
         )
@@ -354,7 +354,7 @@ class PPReadinessPerKind974(unittest.TestCase):
     def test_a_counters_object_without_the_kind_api_is_tolerated(self):
         """The stub-counters holder of test_pp_proxy_readiness_contract_789,
         in one line: presence-tested, not assumed."""
-        from sglang.srt.managers.phase_flip_counters import (
+        from flliper.srt.managers.phase_flip_counters import (
             CHAN_DICT,
             kind_axis_covers,
         )
@@ -376,8 +376,8 @@ class PPReadinessPerKind974(unittest.TestCase):
         `output`, or a rank that consumed somebody else's message would look
         like a rank that had caught up on its own.
         """
-        from sglang.srt.managers.phase_flip_counters import CHAN_DICT
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.phase_flip_counters import CHAN_DICT
+        from flliper.srt.managers.scheduler_pp_mixin import (
             ADMISSION_DECISION_KIND,
             _pp_flip_bump_kind,
         )
@@ -416,8 +416,8 @@ class PPReadinessPerKind974(unittest.TestCase):
         helper list at all, so the assertion cannot be satisfied by this
         module's own holders happening to bind more than production requires.
         """
-        from sglang.srt.managers.phase_flip_counters import CHAN_DICT
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.phase_flip_counters import CHAN_DICT
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         bare = types.SimpleNamespace(
             pp_group=_Wire(UPSTREAM),
@@ -453,8 +453,8 @@ class PPReadinessPerKind974(unittest.TestCase):
         approximate the defect, it reinstates it. Arm 1's constellation must
         go back to returning, which is the silent wedge.
         """
-        import sglang.srt.managers.scheduler_pp_mixin as mod
-        from sglang.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
+        import flliper.srt.managers.scheduler_pp_mixin as mod
+        from flliper.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
 
         _post(self.upstream, ADMISSION_DECISION_KIND, n=12)
 
@@ -477,7 +477,7 @@ class PPReadinessPerKind974(unittest.TestCase):
         sweep that already existed. Asserted because a counter file that
         outlived its boot would be read as a phantom message next boot.
         """
-        from sglang.srt.managers.phase_flip_counters import CHAN_DICT
+        from flliper.srt.managers.phase_flip_counters import CHAN_DICT
 
         _post(self.upstream, "output", n=2)
         files = os.listdir(self.dir)

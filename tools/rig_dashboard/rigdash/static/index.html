@@ -571,7 +571,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
   <nav>
     <!--DEV:BEGIN-->
     <a id="gpuqlink" class="lan" href="#" target="_blank" rel="noopener">GPU window plan</a>
-    <a id="weg2link" class="lan" href="weg2" target="_blank" rel="noopener">Launch line</a>
+    <a id="weg2link" class="lan" href="pdflip" target="_blank" rel="noopener">Launch line</a>
     <a id="plannerlink" class="lan" href="#" target="_blank" rel="noopener">Planner (boards, wizard)</a>
     <span id="lannote" class="muted" style="display:none">Planner, GPU window plan, launch line: LAN only</span>
     <!--DEV:END-->
@@ -711,12 +711,12 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
     with work (idle samples do not count); <b>now</b> = the last sample.</p>
     <p><b>Decode tok/s</b> = &Delta;<span class="mono">decode.tokens</span> (TP0) / &Delta;ts over the samples with work;
     <b>per stream</b> = that divided by <span class="mono">decode.running</span>; compute rate = &Delta;decode.tokens / &Delta;<span class="mono">decode.gpu_ms</span>.</p>
-    <p>The dashboard sends no request to any model except <span class="mono">GET /weg2/state</span> every 10 s.
+    <p>The dashboard sends no request to any model except <span class="mono">GET /pdflip/state</span> every 10 s.
     VictoriaMetrics (:8428) fetches <span class="mono">/metrics</span> of the front every 15 s (user order 01.10.: time-series DB).</p>
     <p><b>TTFT</b> = arrival at the front &rarr; first content from D (<span class="mono">LEG2-FIRST-CONTENT</span>), as IPC counter
     <span class="mono">state.json front.arrival_seat.ttft_*</span> (NF front); the sampler writes it to VictoriaMetrics
-    (<span class="mono">weg2_front_ttft_*</span>), the tile reads it via PromQL. The 27B front does not have it until the image with
-    <span class="mono">weg2_ttft_seconds</span>.</p>
+    (<span class="mono">pdflip_front_ttft_*</span>), the tile reads it via PromQL. The 27B front does not have it until the image with
+    <span class="mono">pdflip_ttft_seconds</span>.</p>
   </details>
 </main>
 <div class="tip" id="tip"></div>
@@ -893,7 +893,7 @@ function kv(rows) {
 // (only one phase runs at a time): the running one is coloured, the others dimmed
 
 // decode: how many seats REALLY compute (bs of the newest round) against the
-// seats of this D phase (WEG2 D-PHASE-SEATS n of cap), and what waits in D's queue
+// seats of this D phase (PDFLIP D-PHASE-SEATS n of cap), and what waits in D's queue
 function bsBadge(d, on) {
   const rb = d.round_bs, se = d.seats || {};
   const cap = se.n != null ? se.n : d.max_running;
@@ -1439,8 +1439,8 @@ function bootCard(b, now, binders) {
                 + flipDepth(b, dir, f)
                 : miss ? "" : "—"), "keep"];
           }),
-          ["Queue front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : MISSTAG("front.queue")), "keep"],
-          fr && fr.served ? ["served P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)} ${ipcTag(fr.src || "/weg2/state")}`] : null,
+          ["Queue front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/pdflip/state") : MISSTAG("front.queue")), "keep"],
+          fr && fr.served ? ["served P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)} ${ipcTag(fr.src || "/pdflip/state")}`] : null,
           prefillOrt(b),
           ["Error lines (ERROR)", fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count) + " " + srcOf(b, "A13")],
           ["Rank stops (named)", fieldIpc(b, "A14") ? fieldIpc(b, "A14").value.slice(-3).map((x) => `${esc(x.group)}.${esc(x.rank)} ${esc(x.code)}${x.ticket ? " " + esc(x.ticket) : ""}`).join(" &middot; ") + " " + ipcTag(fieldIpc(b, "A14").ipc_src) : fmt(b.stop_count || 0) + " " + srcOf(b, "A14")],
@@ -1760,7 +1760,7 @@ function historyHtml(boots, now) {
     const p = (b.prefill || {})[g];
     return p && p.last_burst && p.last_burst.tps != null ? fmt(p.last_burst.tps) : "—";
   };
-  return `<table><tr><th>Model</th><th>Tag</th><th class="num" title="boot start (boot_id) to end or last IPC sign of life">Duration</th><th class="num" title="boot start (boot_id) to serving (state.json serving_since_ts)">Boot time</th><th class="num">last IPC sample</th><th class="num">P prefill</th><th class="num">D prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Flip time P→D = last P chunk done → first decode token produced; p50 / p90 / max over all counted flips of the WHOLE boot (same calculation as the tiles, flipzeit.py)">Flip time P&rarr;D<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Flip time D→P = last decode token produced → first prefill chunk starts computing; otherwise as on the left (whole boot, counted flips)">Flip time D&rarr;P<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Sum #new-token, prefill batch, PP0 only">P new &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Sum #new-token, prefill batch, TP0 only">D new &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Sum of completion_tokens of the front lines WEG2-SERVED">decoded &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>End</th></tr>` +
+  return `<table><tr><th>Model</th><th>Tag</th><th class="num" title="boot start (boot_id) to end or last IPC sign of life">Duration</th><th class="num" title="boot start (boot_id) to serving (state.json serving_since_ts)">Boot time</th><th class="num">last IPC sample</th><th class="num">P prefill</th><th class="num">D prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Flip time P→D = last P chunk done → first decode token produced; p50 / p90 / max over all counted flips of the WHOLE boot (same calculation as the tiles, flipzeit.py)">Flip time P&rarr;D<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Flip time D→P = last decode token produced → first prefill chunk starts computing; otherwise as on the left (whole boot, counted flips)">Flip time D&rarr;P<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Sum #new-token, prefill batch, PP0 only">P new &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Sum #new-token, prefill batch, TP0 only">D new &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Sum of completion_tokens of the front lines PDFLIP-SERVED">decoded &Sigma;<br><span class="muted">PDFLIP-SERVED</span></th><th>End</th></tr>` +
     rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">${ago(b.dur_s)}</td><td class="num">${b.boot_s == null ? "—" : fmt(b.boot_s, 0) + " s"}</td><td class="num">${ago(b.age_s)} ago</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${decCell(b)}</td><td class="num">${fmt(b.flip_count)}</td><td class="num">${flipCell(b, "P>D")}</td><td class="num">${flipCell(b, "D>P")}</td><td class="num">${fmt((b.totals || {}).p_new)}</td><td class="num">${fmt((b.totals || {}).d_new)}</td><td class="num">${fmt((b.totals || {}).decoded)}${(b.totals || {}).read_progress < 1 ? "*" : ""}</td>${endCell(b)}</tr>`).join("") +
     `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill columns: compute rate (gpu-ms) of the last burst, slowest rank; decode: mean over the whole decode time of the boot (tokens / decode seconds, continuous intervals only), below it avg seats; the last value is in the tooltip.</div>`;
 }
@@ -1812,7 +1812,7 @@ function ttftOf(b, d) {
     mx: (v.ttft_max_boot_ms || {})[m], src: v.error ? null : "VictoriaMetrics", n: a ? a.ttft_n : null};
   if (r.mb == null && a && a.ttft_n) { r.mb = a.ttft_ms_sum / a.ttft_n; r.mx = a.ttft_ms_max; r.src = "state.json"; }
   if (!a || a.ttft_n == null)
-    r.missing = m === "27B" ? "27B front delivers no TTFT (until the image with weg2_ttft_seconds, TSDB delta 01.10.)"
+    r.missing = m === "27B" ? "27B front delivers no TTFT (until the image with pdflip_ttft_seconds, TSDB delta 01.10.)"
       : "front.arrival_seat.ttft_* missing in IPC";
   return r;
 }
@@ -1960,7 +1960,7 @@ function sessionsHtml(d, shown, now) {
     : `<div class="muted">no open request</div>`;
   return `<div class="stand warn"><b>Session overview is missing in IPC.</b> The front knows the session per request (SESSION-TRACE, header X-Claude-Code-Session-Id
     or metadata.user_id, as a 10-hex hash), but writes it only to its log. Needed per request is an event or VM point
-    <span class="mono">weg2_req</span> (session as label, rid as field) with: ${SESS_FIELDS.map(esc).join(" &middot; ")}.</div>
+    <span class="mono">pdflip_req</span> (session as label, rid as field) with: ${SESS_FIELDS.map(esc).join(" &middot; ")}.</div>
     <h3 style="font-size:13px;margin:10px 0 6px">Open requests now <span class="muted">state.json front.outstanding_stalest (IPC)</span></h3>${tbl}`;
 }
 function overviewHtml(d, shown, now) {

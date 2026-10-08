@@ -1,5 +1,5 @@
 """Nacharbeit nach der Abnahme AP-J (done/planer-abnahme-1006.md, Abschnitt "Neu aus AP-J"): fuenf der sechs Befunde im Dashboard (der sechste, W71/W64 im
-Verdikt-Register, steht in test/registered/unit/weg2/test_planer_nacharbeit_1006.py).
+Verdikt-Register, steht in test/registered/unit/pdflip/test_planer_nacharbeit_1006.py).
 
   F1  Verdikt-Chip: nach "Neu pruefen" steht der Chip eines uebersteuerten Werts auf dem Urteil des Trockenlaufs; "ungeprueft seit Ihrer Aenderung" nur bis zum naechsten Lauf.
   F2  Seed-Zeile ``--pp-stage-ratio (Seed)``: nie "not set", wo das Profil den Wert setzt; als Aenderung zaehlt nur, was im argv steht.
@@ -241,7 +241,7 @@ class F3Laufbericht(Base):
     VD = {"schema": "flliper.verdikt/1", "ausgang": "geht_mit_force", "orakel": {"laeufe": 2},
           "verdikte": [{"code": "HW-COUNT", "ebene": "lauf", "text": "HW-COUNT: 2 cards would be P = TP1 x PP2 ...", "grund": "g"},
                        {"code": "METAL-UNPROVEN", "ebene": "blocker", "parent": "HW-COUNT", "text": "no release boot", "grund": "g"},
-                       {"code": "W64", "ebene": "lauf", "text": "W64 Weg2TpOperatingPointInfeasible: x", "grund": "g"},
+                       {"code": "W64", "ebene": "lauf", "text": "W64 PdFlipTpOperatingPointInfeasible: x", "grund": "g"},
                        {"code": "FIT", "ebene": "fit", "text": "hw_fit: ja", "grund": "g"}]}
 
     def test_without_a_dry_run_the_report_takes_the_oracle_run_of_the_proposal(self):
@@ -256,7 +256,7 @@ class F3Laufbericht(Base):
 
     def test_a_code_without_register_row_shows_its_class_and_consequence_but_stays_blocked(self):
         vd = {"schema": "flliper.verdikt/1", "ausgang": "verweigert", "orakel": {"laeufe": 2},
-              "verdikte": [{"code": "W64-OPPOINT", "ebene": "lauf", "text": "W64 Weg2TpOperatingPointInfeasible: x", "klasse": "nicht_forcebar",
+              "verdikte": [{"code": "W64-OPPOINT", "ebene": "lauf", "text": "W64 PdFlipTpOperatingPointInfeasible: x", "klasse": "nicht_forcebar",
                             "konsequenz": "Remains even with force.", "forcebar": True, "force_state": "force"}]}       # der Browser behauptet forcebar: nicht geglaubt
         t = self.report(dry=None, vorschlag=vd)["text"]
         row = [x for x in t.split("\n") if x.startswith("| `W64-OPPOINT`")][0]
@@ -333,8 +333,8 @@ class F1LaufberichtOhneLauf(Base):
     ``Der Planer lehnt nichts ab``."""
 
     @staticmethod
-    def VD(ausgang, verdikte, laeufe=0):
-        return {"schema": "flliper.verdikt/1", "ausgang": ausgang, "orakel": {"laeufe": laeufe}, "verdikte": verdikte}
+    def VD(ausgang, rank_verdicts, laeufe=0):
+        return {"schema": "flliper.verdikt/1", "ausgang": ausgang, "orakel": {"laeufe": laeufe}, "verdikte": rank_verdicts}
 
     def _v(self, vd):
         t = self.report(dry=None, vorschlag=vd)["text"]

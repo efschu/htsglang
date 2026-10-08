@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`sglang.srt.observability.ray_wrappers`.
+"""Unit tests for :mod:`flliper.srt.observability.ray_wrappers`.
 
 The wrapper module is designed to import cleanly even without Ray installed; we
 inject a fake ``ray``/``ray.util.metrics``/``ray.serve`` triple into
@@ -12,8 +12,8 @@ from __future__ import annotations
 import sys
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.observability.fake_ray import (
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.observability.fake_ray import (
     clear_fake_ray_modules,
     load_ray_wrappers_with_fake_ray,
     load_ray_wrappers_without_ray,
@@ -38,33 +38,33 @@ class TestRayWrapperBase(unittest.TestCase):
 class TestNameSanitization(TestRayWrapperBase):
     def test_replaces_colons_with_underscores(self):
         sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
-            "sglang:num_running_reqs"
+            "flliper:num_running_reqs"
         )
-        self.assertEqual(sanitized, "sglang_num_running_reqs")
+        self.assertEqual(sanitized, "flliper_num_running_reqs")
 
     def test_replaces_all_punctuation(self):
         sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
-            "sglang:foo.bar-baz/qux"
+            "flliper:foo.bar-baz/qux"
         )
-        self.assertEqual(sanitized, "sglang_foo_bar_baz_qux")
+        self.assertEqual(sanitized, "flliper_foo_bar_baz_qux")
 
     def test_keeps_already_valid_names(self):
         sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
-            "sglang_foo_bar"
+            "flliper_foo_bar"
         )
-        self.assertEqual(sanitized, "sglang_foo_bar")
+        self.assertEqual(sanitized, "flliper_foo_bar")
 
 
 class TestReplicaIdInjection(TestRayWrapperBase):
     def test_tag_keys_include_replica_id(self):
         counter = self.rw.RayCounterWrapper(
-            "sglang:requests", "doc", labelnames=["model_name"]
+            "flliper:requests", "doc", labelnames=["model_name"]
         )
         self.assertEqual(counter.metric._tag_keys, ("model_name", "ReplicaId"))
 
     def test_emit_uses_replica_id_tag(self):
         counter = self.rw.RayCounterWrapper(
-            "sglang:requests", "doc", labelnames=["model_name"]
+            "flliper:requests", "doc", labelnames=["model_name"]
         )
         counter.labels(model_name="m1").inc(1)
         op, value, tags = counter.metric.calls[-1]
@@ -75,7 +75,7 @@ class TestReplicaIdInjection(TestRayWrapperBase):
 
 class TestCounterWrapper(TestRayWrapperBase):
     def test_inc_forwards_value_and_tags(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
+        counter = self.rw.RayCounterWrapper("flliper:requests", "doc", labelnames=["m"])
         counter.labels(m="x").inc(5)
         self.assertEqual(
             counter.metric.calls[-1],
@@ -83,7 +83,7 @@ class TestCounterWrapper(TestRayWrapperBase):
         )
 
     def test_inc_zero_is_noop(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
+        counter = self.rw.RayCounterWrapper("flliper:requests", "doc", labelnames=["m"])
         counter.labels(m="x").inc(0)
         # No call recorded — inc(0) should short-circuit.
         self.assertEqual(counter.metric.calls, [])
@@ -91,7 +91,7 @@ class TestCounterWrapper(TestRayWrapperBase):
 
 class TestGaugeWrapper(TestRayWrapperBase):
     def test_set_forwards_value_and_tags(self):
-        gauge = self.rw.RayGaugeWrapper("sglang:running", "doc", labelnames=["m"])
+        gauge = self.rw.RayGaugeWrapper("flliper:running", "doc", labelnames=["m"])
         gauge.labels(m="x").set(12)
         self.assertEqual(
             gauge.metric.calls[-1],
@@ -99,7 +99,7 @@ class TestGaugeWrapper(TestRayWrapperBase):
         )
 
     def test_set_to_current_time_uses_set(self):
-        gauge = self.rw.RayGaugeWrapper("sglang:start_time", "doc")
+        gauge = self.rw.RayGaugeWrapper("flliper:start_time", "doc")
         gauge.set_to_current_time()
         op, value, _ = gauge.metric.calls[-1]
         self.assertEqual(op, "set")
@@ -110,7 +110,7 @@ class TestGaugeWrapper(TestRayWrapperBase):
         # multiprocess_mode is irrelevant under Ray; the wrapper must still
         # accept the kwarg so existing call sites in metrics_collector.py work.
         gauge = self.rw.RayGaugeWrapper(
-            "sglang:running", "doc", labelnames=["m"], multiprocess_mode="livesum"
+            "flliper:running", "doc", labelnames=["m"], multiprocess_mode="livesum"
         )
         gauge.labels(m="x").set(7)
         self.assertEqual(gauge.metric.calls[-1][0], "set")
@@ -119,7 +119,7 @@ class TestGaugeWrapper(TestRayWrapperBase):
 class TestHistogramWrapper(TestRayWrapperBase):
     def test_observe_forwards_value_and_tags(self):
         hist = self.rw.RayHistogramWrapper(
-            "sglang:ttft_seconds", "doc", labelnames=["m"], buckets=[0.1, 1.0]
+            "flliper:ttft_seconds", "doc", labelnames=["m"], buckets=[0.1, 1.0]
         )
         hist.labels(m="x").observe(0.3)
         self.assertEqual(
@@ -129,34 +129,34 @@ class TestHistogramWrapper(TestRayWrapperBase):
 
     def test_buckets_translate_to_boundaries(self):
         hist = self.rw.RayHistogramWrapper(
-            "sglang:ttft_seconds", "doc", buckets=[0.1, 0.5, 1.0, 2.0]
+            "flliper:ttft_seconds", "doc", buckets=[0.1, 0.5, 1.0, 2.0]
         )
         self.assertEqual(hist.metric.boundaries, [0.1, 0.5, 1.0, 2.0])
 
     def test_no_buckets_defaults_to_empty_list(self):
-        hist = self.rw.RayHistogramWrapper("sglang:ttft_seconds", "doc")
+        hist = self.rw.RayHistogramWrapper("flliper:ttft_seconds", "doc")
         self.assertEqual(hist.metric.boundaries, [])
 
     def test_non_positive_boundaries_dropped(self):
-        # Ray.util.metrics rejects boundaries <= 0; sglang's queue_time and a
+        # Ray.util.metrics rejects boundaries <= 0; flliper's queue_time and a
         # few other histograms include 0.0 as their lowest bucket. The wrapper
         # silently filters non-positive entries so engine startup never breaks
         # when the Ray backend is in use.
         hist = self.rw.RayHistogramWrapper(
-            "sglang:queue_time_seconds", "doc", buckets=[0.0, 0.001, 1.0]
+            "flliper:queue_time_seconds", "doc", buckets=[0.0, 0.001, 1.0]
         )
         self.assertEqual(hist.metric.boundaries, [0.001, 1.0])
 
     def test_negative_boundaries_dropped(self):
         hist = self.rw.RayHistogramWrapper(
-            "sglang:demo", "doc", buckets=[-1.0, 0.0, 0.5]
+            "flliper:demo", "doc", buckets=[-1.0, 0.0, 0.5]
         )
         self.assertEqual(hist.metric.boundaries, [0.5])
 
 
 class TestSummaryWrapperFallback(TestRayWrapperBase):
     def test_observe_uses_default_boundaries(self):
-        summary = self.rw.RaySummaryWrapper("sglang:request_latency", "doc")
+        summary = self.rw.RaySummaryWrapper("flliper:request_latency", "doc")
         self.assertEqual(
             summary.metric.boundaries,
             self.rw.RaySummaryWrapper.DEFAULT_BOUNDARIES,
@@ -164,7 +164,7 @@ class TestSummaryWrapperFallback(TestRayWrapperBase):
 
     def test_observe_forwards_value_and_tags(self):
         summary = self.rw.RaySummaryWrapper(
-            "sglang:request_latency", "doc", labelnames=["m"]
+            "flliper:request_latency", "doc", labelnames=["m"]
         )
         summary.labels(m="x").observe(0.42)
         self.assertEqual(
@@ -175,23 +175,23 @@ class TestSummaryWrapperFallback(TestRayWrapperBase):
 
 class TestLabelsCopyAndGuard(TestRayWrapperBase):
     def test_labels_returns_copy_not_self(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
+        counter = self.rw.RayCounterWrapper("flliper:requests", "doc", labelnames=["m"])
         labeled = counter.labels(m="x")
         self.assertIsNot(labeled, counter)
 
     def test_original_remains_unlabeled_after_labels_call(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
+        counter = self.rw.RayCounterWrapper("flliper:requests", "doc", labelnames=["m"])
         counter.labels(m="x")
         self.assertFalse(counter._is_labeled)
 
     def test_double_labels_raises(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
+        counter = self.rw.RayCounterWrapper("flliper:requests", "doc", labelnames=["m"])
         labeled = counter.labels(m="x")
         with self.assertRaises(ValueError):
             labeled.labels(m="y")
 
     def test_concurrent_labels_have_isolated_tags(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
+        counter = self.rw.RayCounterWrapper("flliper:requests", "doc", labelnames=["m"])
         a = counter.labels(m="alpha")
         b = counter.labels(m="beta")
         self.assertEqual(a._tags["m"], "alpha")
@@ -199,7 +199,7 @@ class TestLabelsCopyAndGuard(TestRayWrapperBase):
 
     def test_positional_label_args_supported(self):
         counter = self.rw.RayCounterWrapper(
-            "sglang:requests", "doc", labelnames=["model", "engine"]
+            "flliper:requests", "doc", labelnames=["model", "engine"]
         )
         counter.labels("m1", "e1").inc(1)
         _, _, tags = counter.metric.calls[-1]
@@ -208,7 +208,7 @@ class TestLabelsCopyAndGuard(TestRayWrapperBase):
 
     def test_wrong_positional_arity_raises(self):
         counter = self.rw.RayCounterWrapper(
-            "sglang:requests", "doc", labelnames=["model", "engine"]
+            "flliper:requests", "doc", labelnames=["model", "engine"]
         )
         with self.assertRaises(ValueError):
             counter.labels("only_one_arg")
@@ -270,7 +270,7 @@ class TestRayMissingImportError(unittest.TestCase):
 
     def test_instantiating_wrapper_without_ray_raises(self):
         with self.assertRaises(ImportError) as ctx:
-            self.rw.RayCounterWrapper("sglang:foo", "doc")
+            self.rw.RayCounterWrapper("flliper:foo", "doc")
         self.assertIn("Ray", str(ctx.exception))
 
     def test_get_replica_id_returns_none_without_ray(self):

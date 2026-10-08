@@ -6,7 +6,7 @@ the legacy hardcoded ids (151667/151668) is reproduced exactly as reported in
 sgl-project/sglang#25536.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -16,12 +16,12 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.sampling.custom_logit_processor import (
+from flliper.srt.sampling.custom_logit_processor import (
     Qwen3ThinkingBudgetLogitProcessor,
     ThinkingBudgetLogitProcessor,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.thinking_budget import (
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.sampling.thinking_budget import (
     THINKING_BUDGET_INTERNAL_KEY,
     THINKING_BUDGET_KEY,
     THINKING_BUDGET_TOKEN_IDS_KEY,
@@ -31,7 +31,7 @@ from sglang.srt.sampling.thinking_budget import (
     resolve_thinking_budget_token_ids,
     validate_thinking_budget,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # Minimal tokenizer fixture. The ids are the ones the real Qwen3.6-27B
 # tokenizer produces (verified against
@@ -294,7 +294,7 @@ class TestSpecDecodeRowAlignment(CustomTestCase):
     DRAFT_TOKEN_NUM = 3
 
     def test_every_row_of_an_over_budget_request_is_forced(self):
-        from sglang.srt.layers.sampler import apply_custom_logit_processor
+        from flliper.srt.layers.sampler import apply_custom_logit_processor
 
         over = _make_req(origin_input_ids=[QWEN36_THINK_START_ID], output_ids=[7] * 5)
         under = _make_req(origin_input_ids=[QWEN36_THINK_START_ID], output_ids=[7])

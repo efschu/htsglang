@@ -6,7 +6,7 @@ AFTER the last read of them."""
 
 import inspect
 
-from sglang.jit_kernel import moe_fused_gate as mfg
+from flliper.jit_kernel import moe_fused_gate as mfg
 
 
 def test_pdl_wait_precedes_the_scores_load_and_launch_dependents_follows():

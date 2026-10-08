@@ -8,13 +8,13 @@ on the Hopper runner in test_spec_eagle_fa3.py.)
 
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.spec_server_kits import (
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecFeatureKit,
 )
-from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
+from flliper.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
 register_cuda_ci(est_time=720, stage="base-b", runner_config="1-gpu-small")
 
@@ -27,14 +27,14 @@ class TestEagle3Page64Topk8(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
     spec_tokens = 32
     disable_overlap = False
     cuda_graph_max_bs_decode = 5
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    env_overrides = ((envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagleLlama2Page4Topk8(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
     """Llama-2 topk>1 tree + page_size=4 (spec v1)."""
 
     page_size = 4
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    env_overrides = ((envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 if __name__ == "__main__":

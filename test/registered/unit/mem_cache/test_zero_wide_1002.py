@@ -1,6 +1,6 @@
 """DP-NACHLAUF 02.10.: the wake restore's re-zero through a wide view.
 
-Every D wake of N5m/N5p/N5q: 'WEG2-WAKE-INVARIANT ... re-zeroed ... in
+Every D wake of N5m/N5p/N5q: 'PDFLIP-WAKE-INVARIANT ... re-zeroed ... in
 85-95 ms' on TP0 (5090) and 169-189 ms on TP1/TP2 (3080) for ~8-10 GB per
 rank -- the fill ran element-wise over fp8 KV buffers and the uint8 mamba
 envelope, one byte per element. Pinned (red before): a contiguous buffer is
@@ -18,7 +18,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache import memory_pool as mp  # noqa: E402
+from flliper.srt.mem_cache import memory_pool as mp  # noqa: E402
 
 
 def _dirty(shape, dtype=torch.uint8):
@@ -71,7 +71,7 @@ def test_zero_kv_data_buffers_keeps_safe_zero_rows(monkeypatch):
 
 
 def test_flush_line_and_envelope_use_the_wide_zero():
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     src = inspect.getsource(Scheduler._flush_zero_kv_buffers)
     assert "wide=%d narrow=%d bytes=%d ms=%.1f" in src

@@ -1,7 +1,7 @@
 {
   "_comment": [
     "Targeted logging config for the #462 F2 arm. Consumed via",
-    "SGLANG_LOGGING_CONFIG_PATH (srt/utils/common.py:2685-2693, a plain",
+    "FLLIPER_LOGGING_CONFIG_PATH (srt/utils/common.py:2685-2693, a plain",
     "logging.config.dictConfig). Root stays at INFO so the boot log keeps its",
     "normal shape; ONLY the breakable-graph module drops to DEBUG, which is",
     "what emits 'Break graph due to function: _moe_offload_fetch_step'",
@@ -32,7 +32,7 @@
     "handlers": ["console"]
   },
   "loggers": {
-    "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph": {
+    "flliper.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph": {
       "level": "DEBUG",
       "handlers": ["console"],
       "propagate": false

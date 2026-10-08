@@ -1,7 +1,7 @@
 """Profil-Editor S4b (Auftrag 1432): ``POST /api/profil/recompute`` — der Dienst hinter dem Balken.
 
-Der Dashboard-Prozess rechnet nichts selbst (kein sglang-Import, MemoryMax=1G).  ``CouplingsService`` hält EINEN langlebigen Kindprozess
-(``kartenplan_build/couplings_worker.py``, JSON-Zeilen über stdin/stdout) mit dem Python der sglang-Umgebung, startet ihn bei der ersten Anfrage
+Der Dashboard-Prozess rechnet nichts selbst (kein flliper-Import, MemoryMax=1G).  ``CouplingsService`` hält EINEN langlebigen Kindprozess
+(``kartenplan_build/couplings_worker.py``, JSON-Zeilen über stdin/stdout) mit dem Python der flliper-Umgebung, startet ihn bei der ersten Anfrage
 (nie im Hintergrund), startet ihn nach Tod oder Zeitüberschreitung neu und antwortet bei jedem Fehler mit ``{"ok": False, "error": ...}``.
 
 ``build_request`` baut aus dem Serverprofil (``flliper.server/1``), dem Hardwareprofil und dem Modellprofil die Anfrage an
@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(os.path.dirname(HERE), "kartenplan_build", "couplings_worker.py")
 DEFAULT_PYTHON = os.environ.get("RIGDASH_COUPLINGS_PYTHON") or "/spinning/htsglang-gpu/.venv/bin/python"
-#: höchstens so lange wartet eine Anfrage auf den Worker (der Start importiert sglang.srt.planner)
+#: höchstens so lange wartet eine Anfrage auf den Worker (der Start importiert flliper.srt.planner)
 TIMEOUT_S = 60.0
 START_TIMEOUT_S = 120.0
 #: Operationen, die der Editor verlangen darf
@@ -226,7 +226,7 @@ class CouplingsService:
         if not self.tree_python or not os.path.isdir(self.tree_python):
             return "no planner tree with planner/profile_couplings.py (KARTENPLAN_TREE or install_510.sh)"
         if not os.path.isfile(self.python):
-            return "Python of the sglang environment is missing: %s (RIGDASH_COUPLINGS_PYTHON)" % self.python
+            return "Python of the flliper environment is missing: %s (RIGDASH_COUPLINGS_PYTHON)" % self.python
 
         def spawn(cmd: List[str]) -> Optional[str]:
             try:

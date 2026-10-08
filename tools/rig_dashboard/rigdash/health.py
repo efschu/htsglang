@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-HEALTH_FRESH_S = 120.0   # a WEG2-HEALTH line older than this no longer describes now
+HEALTH_FRESH_S = 120.0   # a PDFLIP-HEALTH line older than this no longer describes now
 STOP_RECOVERED_S = 30.0  # activity this long after a stop means it ran on
 HANG_S = 60.0            # queued work and no prefill/decode line for this long
 STOP_SLACK_S = 5.0       # a sign this close before the planned-stop marker is already its teardown
@@ -79,7 +79,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     if death and end.get("src") == "state.json":
         add("dead", None, "dead per IPC: %s" % death.get("text"), death.get("t"))
 
-    # 1. WEG2-HEALTH (front log line): a hint, never a death verdict
+    # 1. PDFLIP-HEALTH (front log line): a hint, never a death verdict
     for g, h in sorted((b.get("health") or {}).items()):
         if _age(now, h.get("t")) is None or _age(now, h["t"]) > HEALTH_FRESH_S:
             continue
@@ -136,7 +136,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     fr = b.get("front") or {}
     q_front = fr.get("queue")
     o = fr.get("outstanding")
-    # /weg2/state keeps it per group, the state.json mirror as one number (IPC §2.2 H4)
+    # /pdflip/state keeps it per group, the state.json mirror as one number (IPC §2.2 H4)
     outstanding = (sum(o.values()) if isinstance(o, dict) else int(o or 0)) if o else 0
     q_log = (b.get("queue") or {}).get("queue") if b.get("queue") else None
     q_log_age = _age(now, (b.get("queue") or {}).get("t")) if b.get("queue") else None
@@ -144,7 +144,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     src = None
     if q_front is not None:
         queued, src = (q_front or 0) + outstanding, "%s (queue %s + outstanding %s)" % (
-            fr.get("src") or "Front /weg2/state", q_front, outstanding)
+            fr.get("src") or "Front /pdflip/state", q_front, outstanding)
     elif q_log is not None and q_log_age is not None and q_log_age < 600:
         queued, src = q_log, "queue"
     idle = _age(now, b.get("last_activity_any"))

@@ -27,7 +27,7 @@ from test_activity_0930 import CH, p_chunks, rec_p  # noqa: E402
 def rec_d_dual(ts):
     """D decodes 5 -> 40 s at 200 tok/s (2 streams) while P prefills 10 -> 25.5 s; no flip, no extend."""
     dec = max(0.0, min(ts, 40.0) - 5.0)
-    return {"schema": "weg2.rankstats/1", "ts": ts,
+    return {"schema": "pdflip.rankstats/1", "ts": ts,
             "prefill": {"chunks": 0, "new_tokens": 0, "cached_tokens": 0, "compute_ms": 0.0, "last": None},
             "decode": {"tokens": int(200 * dec), "rounds": int(50 * dec), "gpu_ms": 1000.0 * dec * 0.9,
                        "running": 2 if 5.0 <= ts <= 40.0 else 0},

@@ -12,24 +12,24 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner import landscape as landscape_mod
-from sglang.srt.planner.landscape import (
+from flliper.srt.planner import landscape as landscape_mod
+from flliper.srt.planner.landscape import (
     LandscapeCell,
     build_mode_a,
     build_mode_b,
     render_mode_a_text,
 )
-from sglang.srt.planner.card_library import compose_rig
-from sglang.srt.planner.hardware import hardware_from_manual
-from sglang.srt.planner.results_store import (
+from flliper.srt.planner.card_library import compose_rig
+from flliper.srt.planner.hardware import hardware_from_manual
+from flliper.srt.planner.results_store import (
     Band,
     IngestRejected,
     QuantDescriptor,
     ResultEntry,
     ResultsStore,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -67,7 +67,7 @@ def _measured_entry(**kw):
         model="Qwen3.6-27B",
         quant=QuantDescriptor.parse("4b/AWQ/g128"),
         hardware_cards=[(1, "RTX 5090", 32607), (2, "RTX 3080 20GB", 20480)],
-        reproduce_flags=["--tp-size 3", "--rank-gpu-id 0,1,2", "SGLANG_UNEVEN_DCP=1"],
+        reproduce_flags=["--tp-size 3", "--rank-gpu-id 0,1,2", "FLLIPER_UNEVEN_DCP=1"],
         provenance="measured",
         fits=True,
         max_context_tokens=200000,

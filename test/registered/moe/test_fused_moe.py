@@ -3,16 +3,16 @@ import unittest
 import torch
 from tqdm import tqdm
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import get_device, get_device_capability, is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
+from flliper.srt.layers.activation import SiluAndMul
+from flliper.srt.layers.moe.moe_runner import MoeRunnerConfig
+from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from flliper.srt.layers.moe.topk import TopKConfig, select_experts
+from flliper.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from flliper.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.utils import get_device, get_device_capability, is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase, empty_gpu_cache
 
 register_cuda_ci(est_time=87, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
@@ -164,7 +164,7 @@ class TestFusedMOE(CustomTestCase):
                 a2_scale,
             )
 
-            sglang_output = fused_moe(
+            flliper_output = fused_moe(
                 a,
                 w1,
                 w2,
@@ -176,7 +176,7 @@ class TestFusedMOE(CustomTestCase):
                 a2_scale=a2_scale,
             )
             torch.testing.assert_close(
-                sglang_output, torch_output, rtol=rtol, atol=atol
+                flliper_output, torch_output, rtol=rtol, atol=atol
             )
         else:
             a = self.create_random_gpu_tensor((m, k), dtype)

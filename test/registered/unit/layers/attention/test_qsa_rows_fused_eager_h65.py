@@ -1,4 +1,4 @@
-"""fnFL2 H65: SGLANG_WEG2_QSA_ROWS_FUSED_EAGER -- the P prefix chunks resolve
+"""fnFL2 H65: FLLIPER_PDFLIP_QSA_ROWS_FUSED_EAGER -- the P prefix chunks resolve
 their top-k rows through the fused Triton launch (qsa/rows_resolve.py) the
 graph path already uses, instead of the eager torch chain
 (_logical_to_physical -> _local_rows), whose int64 top-k copy, gather,
@@ -21,9 +21,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -53,12 +53,12 @@ class RouteTest(unittest.TestCase):
         self.assertFalse(qb._qsa_rows_fused_route(eager, _Cuda(), None, eager=True))
         none_rows = types.SimpleNamespace(is_cuda_graph=False, row_req_pool_indices=None)
         self.assertFalse(qb._qsa_rows_fused_route(none_rows, _Cuda(), r2t, eager=True))
-        # SGLANG_QSA_ROWS_FUSED=0 still turns every fused resolve off
+        # FLLIPER_QSA_ROWS_FUSED=0 still turns every fused resolve off
         qb._QSA_ROWS_FUSED["on"] = False
         self.assertFalse(qb._qsa_rows_fused_route(graph, _Cuda(), r2t, eager=True))
 
     def test_default_is_off(self):
-        self.assertIs(envs.SGLANG_WEG2_QSA_ROWS_FUSED_EAGER.get(), False)
+        self.assertIs(envs.FLLIPER_PDFLIP_QSA_ROWS_FUSED_EAGER.get(), False)
 
 
 class WiringTest(unittest.TestCase):
@@ -77,7 +77,7 @@ class WiringTest(unittest.TestCase):
         )
 
     def test_switch_on_calls_the_fused_resolve_with_the_eager_tables(self):
-        from sglang.srt.layers.attention.qsa import rows_resolve
+        from flliper.srt.layers.attention.qsa import rows_resolve
 
         stub, meta = self._stub(), self._meta()
         topk = torch.zeros(3, 5, dtype=torch.int32)
@@ -88,7 +88,7 @@ class WiringTest(unittest.TestCase):
                         r2t=r2t, mode=mode, kw=kw)
             return "rows", "counts"
 
-        with envs.SGLANG_WEG2_QSA_ROWS_FUSED_EAGER.override(True), \
+        with envs.FLLIPER_PDFLIP_QSA_ROWS_FUSED_EAGER.override(True), \
                 mock.patch.object(qb, "_qsa_rows_fused_route", lambda m, t, r, eager: eager), \
                 mock.patch.object(rows_resolve, "qsa_rows_resolve", fake), \
                 self.assertLogs(qb.logger, level="INFO") as logs:
@@ -109,7 +109,7 @@ class WiringTest(unittest.TestCase):
         stub._logical_to_physical = qb.QwenSparseAttnBackend._logical_to_physical
         stub._topk_rows = lambda t, m: qb.QwenSparseAttnBackend._topk_rows(stub, t, m)
         topk = torch.tensor([[0, 1, -1], [2, -1, -1], [7, 3, -1]], dtype=torch.int32)
-        with envs.SGLANG_WEG2_QSA_ROWS_FUSED_EAGER.override(False), \
+        with envs.FLLIPER_PDFLIP_QSA_ROWS_FUSED_EAGER.override(False), \
                 mock.patch.object(qb, "_qsa_rows_fused_route", lambda m, t, r, eager: eager):
             rows, counts = qb.QwenSparseAttnBackend._rows_and_counts(stub, topk, meta)
         self.assertIsNone(counts)
@@ -120,9 +120,9 @@ CHECK = r'''
 import os, sys, types, torch
 os.environ["TRITON_INTERPRET"] = "1"
 sys.path.insert(0, %r)
-from sglang.srt.layers.attention.qsa.rows_resolve import MODE_NONE, qsa_rows_resolve
-from sglang.srt.layers.attention.qsa.kernel import torch_expand_qsa_block_indices
-from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+from flliper.srt.layers.attention.qsa.rows_resolve import MODE_NONE, qsa_rows_resolve
+from flliper.srt.layers.attention.qsa.kernel import torch_expand_qsa_block_indices
+from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
 
 torch.manual_seed(65)
 R, C, ratio, token_topk = 5, 640, 4, 48
@@ -166,7 +166,7 @@ class InterpretedEquivalenceTest(unittest.TestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "metal: run in a GPU window")
 class MetalTest(unittest.TestCase):
     def test_counts_bounded_loop_is_bit_identical(self):
-        from sglang.srt.layers.attention.qsa.sparse_attn import sparse_attn_rows_triton
+        from flliper.srt.layers.attention.qsa.sparse_attn import sparse_attn_rows_triton
 
         g = torch.Generator(device="cuda").manual_seed(66)
         tq, n, topk = 900, 8192, 2051

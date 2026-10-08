@@ -18,7 +18,7 @@
 #
 # FIRST-BOOT MEASUREMENT OBLIGATIONS (DESIGN_631 3.4b/4 -- a first boot
 # that does not produce these numbers is incomplete):
-#   * SGLANG_NCCL_BUFFER_DUMP armed below -> per-group NCCL buffer cost
+#   * FLLIPER_NCCL_BUFFER_DUMP armed below -> per-group NCCL buffer cost
 #     incl. the flip_tp/flip_dcp/flip_pp secondary set (read the dump,
 #     update the 3.4a ledger's ~500 MiB guess).
 #   * activation term: read the post-capture leftover log lines (the 4016
@@ -65,16 +65,16 @@ mkdir -p "$LOGDIR"
 
 export PYTHONPATH="$WT/python"
 export LD_LIBRARY_PATH=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 # The flip's TP phase token-shards KV under the WEIGHTED owner rule; the
 # boot builder REFUSES without this pair (phase_flip_boot).
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
 # Mixed 5090+3080 group is the CONFIGURATION, not a symptom.
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 # First-boot ledger measurement: per-group NCCL buffer costs, incl. the
 # flip secondary set (mem_ledger/nccl_probe brackets every pynccl ctor).
-export SGLANG_NCCL_BUFFER_DUMP="${SGLANG_NCCL_BUFFER_DUMP:-$LOGDIR/nccl_buffers.json}"
+export FLLIPER_NCCL_BUFFER_DUMP="${FLLIPER_NCCL_BUFFER_DUMP:-$LOGDIR/nccl_buffers.json}"
 
 # --- resolve cards by NAME -> UUID, 5090 FIRST -------------------------------
 BIG_UUID=""; SMALL_UUID=()
@@ -89,7 +89,7 @@ echo "cuda:1=3080a=${SMALL_UUID[0]}"
 echo "cuda:2=3080b=${SMALL_UUID[1]}"
 
 CUDA_VISIBLE_DEVICES="$BIG_UUID,${SMALL_UUID[0]},${SMALL_UUID[1]}" \
-exec "$PY" -m sglang.launch_server \
+exec "$PY" -m flliper.launch_server \
     --model-path "$MODEL" --trust-remote-code \
     --tp-size 1 --pp-size 3 \
     --pp-stage-ratio 2,1,1 \

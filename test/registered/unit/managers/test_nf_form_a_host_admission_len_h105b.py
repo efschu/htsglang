@@ -2,7 +2,7 @@
 load-back charges the iteration's availability floor.
 
 H105 (rc12w dkrnfh91dprsabar1dauer09272038_3a10543309, D log 10939-10993,
-rid weg2-0-1 after a #248 park/wake-read): TP0's match was device 0 + host
+rid pdflip-0-1 after a #248 park/wake-read): TP0's match was device 0 + host
 hit 23040 -- the leading 2560-token node counts no host hit -- with key and
 mamba anchor at 25600. TP0 VOTED 23040 (``_local_match_len``), the workers
 FOLLOWED 23040 (``RU FORM-A FOLLOW tp0_depth=23040 worker_local=25600``), and
@@ -10,10 +10,10 @@ TP0's own load-back raised its extent to the anchor
 (``#1040 EXTENT STATE-ALIGN kv=23040 extent=25600``, ``#988 LOADBACK prefix
 moved to 25600``). TP0 took the tail skip (extend 0) and closed its admission
 loop, the workers extended 2571 tokens and went on to the next gate:
-``H105 RU FORM-A ADMISSION MALFORMED rid=weg2-0-5``.
+``H105 RU FORM-A ADMISSION MALFORMED rid=pdflip-0-5``.
 
 D-OOM (rc12v dkrnfh91dprsabar1dauer09272047_4c866d534a, D log ~281870-281925,
-rid weg2-28-124): TP1/TP2 loaded 23424 rows back, then the 163-token extend's
+rid pdflip-28-124): TP1/TP2 loaded 23424 rows back, then the 163-token extend's
 eviction trigger read the uncharged floor, skipped the eviction and failed on
 a pool with 0 free rows ('EVICTION UNDER-DELIVERED asked 227 received 0').
 
@@ -30,13 +30,13 @@ from array import array
 
 import torch
 
-from sglang.srt import rank_role
-from sglang.srt.managers import pp_admission_congruence as pac
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.mem_cache import common
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from flliper.srt import rank_role
+from flliper.srt.managers import pp_admission_congruence as pac
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.mem_cache import common
+from flliper.srt.mem_cache.base_prefix_cache import MatchResult
 
-SWITCH = "SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW"
+SWITCH = "FLLIPER_PDFLIP_ENABLE_FORM_A_TP0_FOLLOW"
 FOLLOW_ATTR = "_tp_match_floor_follow_walk"
 FLOOR_ATTR = "_tp_match_floor_group"
 ROLES = ("host", "worker", "worker")
@@ -58,7 +58,7 @@ def _as_rank(rank, roles=ROLES):
 
 @contextlib.contextmanager
 def _switch(value=True):
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     with getattr(envs, SWITCH).override(value):
         yield
@@ -105,7 +105,7 @@ class _WorkerTree(_HostTree):
         super().__init__(depth=reach, lead=0)
 
 
-def _req(rid="weg2-0-1", n=PROMPT):
+def _req(rid="pdflip-0-1", n=PROMPT):
     return types.SimpleNamespace(
         rid=rid,
         origin_input_ids=array("q", range(n)),
@@ -117,7 +117,7 @@ def _req(rid="weg2-0-1", n=PROMPT):
     )
 
 
-def _vote(tree, rank, rid="weg2-0-1"):
+def _vote(tree, rank, rid="pdflip-0-1"):
     with _as_rank(rank):
         req = _req(rid)
         return m.local_usable_matches(tree, {rid: req}, {rid: PROMPT - 1})[rid]
@@ -159,7 +159,7 @@ class TestHostVotesAdmittedDepth(unittest.TestCase):
             vote = _vote(tree, 0)
         res = tree.match_prefix(types.SimpleNamespace(key=list(range(PROMPT - 1))))
         req = types.SimpleNamespace(
-            rid="weg2-0-1",
+            rid="pdflip-0-1",
             host_hit_length=res.host_hit_length,
             state_anchor_depth=res.state_anchor_depth,
             key_match_depth=res.key_match_depth,
@@ -170,7 +170,7 @@ class TestHostVotesAdmittedDepth(unittest.TestCase):
     def test_host_admission_does_not_stop_at_its_own_depth(self):
         tree = _HostTree()
         res = tree.match_prefix(types.SimpleNamespace(key=list(range(PROMPT - 1))))
-        setattr(tree, FLOOR_ATTR, {"weg2-0-1": DEPTH})
+        setattr(tree, FLOOR_ATTR, {"pdflip-0-1": DEPTH})
         with _switch(), _as_rank(0):
             # the raw match (23040) is below the planted depth; what the host
             # admits (25600) is not -- no HOST-BELOW-GROUP stop
@@ -182,15 +182,15 @@ class TestHostVotesAdmittedDepth(unittest.TestCase):
         sets the group lower; the host must cap, not load back beyond it."""
         tree = _HostTree()
         res = tree.match_prefix(types.SimpleNamespace(key=list(range(PROMPT - 1))))
-        setattr(tree, FLOOR_ATTR, {"weg2-0-1": 24000})
+        setattr(tree, FLOOR_ATTR, {"pdflip-0-1": 24000})
         with _switch(), _as_rank(0):
             # RED on 3a10543309: None (raw 23040 <= 24000 reads 'agree') while
             # the load-back takes the host to 25600
             self.assertEqual(m.group_floor_cap(tree, _req(), res), 24000)
             # the re-match at the group depth REALIZES it on the host (anchor
             # there, admitted depth == 24000) -- no CAP-MISS
-            from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
-            from sglang.srt.mem_cache.radix_cache import RadixKey
+            from flliper.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+            from flliper.srt.mem_cache.radix_cache import RadixKey
 
             params = MatchPrefixParams(
                 key=RadixKey(array("q", range(PROMPT - 1)), None), cow_mamba=False, req=_req()
@@ -201,16 +201,16 @@ class TestHostVotesAdmittedDepth(unittest.TestCase):
     def test_worker_follows_the_group_depth(self):
         tree = _WorkerTree()
         res = tree.match_prefix(types.SimpleNamespace(key=list(range(PROMPT - 1))))
-        setattr(tree, FLOOR_ATTR, {"weg2-0-1": DEPTH})
+        setattr(tree, FLOOR_ATTR, {"pdflip-0-1": DEPTH})
         with _switch(), _as_rank(1):
             self.assertEqual(m.form_a_follow_admission(tree, _req(), res), DEPTH)
 
     def test_classic_boot_untouched(self):
         tree = _HostTree()
         with _switch(False), _as_rank(0, roles=None):
-            vote = m.local_usable_matches(tree, {"weg2-0-1": _req()}, {"weg2-0-1": 23040})
+            vote = m.local_usable_matches(tree, {"pdflip-0-1": _req()}, {"pdflip-0-1": 23040})
         # classic path: the head walk's number, as before
-        self.assertEqual(vote["weg2-0-1"], 23040)
+        self.assertEqual(vote["pdflip-0-1"], 23040)
 
 
 class _Alloc:
@@ -240,7 +240,7 @@ class _EvictTree:
 
 
 def _charge(tree, rows):
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
     fn = getattr(urc, "_form_a_note_loaded", None)
     if fn is None:

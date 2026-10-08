@@ -1,26 +1,26 @@
 """1210b HOSTLOCK-EVICT-TO-HOST (NF y9nf4 e23f7dff30 boot 1004_031945, 04:06:42Z): D TP1 and TP2 died at the
 idle sanity walk right after the epoch-82 park ("Sanity check FAILED (1 violations across 28 nodes): mamba
 host-locked node(s) on the host LRU: {1272}", D.log 263217-263265; TP0, already in its sleep leg, died on the
-broken gloo pair, 263845) -> WEG2-FLIP STALL epoch=82.
+broken gloo pair, 263845) -> PDFLIP-FLIP STALL epoch=82.
 
 Y8P-HOSTLOCK-LRU (a3f574c24e) closed two writers that filed a host-locked mamba node into the host LRU (the
 mamba component's device eviction and the reclaim disown). The third one stayed: the FULL demotion
 ``_evict_to_host`` files every aux component that has a host copy with ``_for_each_component_lru(insert_mru,
 target=HOST)`` -- without the host lock. A node whose anchor is on BOTH sides and host-locked (#1417 prefetch
-pin / anchor lock, the park retracts such requests) demoted by a backed-leaf eviction (WEG2-LOADBACK-EVICT,
+pin / anchor lock, the park retracts such requests) demoted by a backed-leaf eviction (PDFLIP-LOADBACK-EVICT,
 D-MEM-SCHED stage down, D-KV-EVICT) lands on the host LRU while locked.
 
 Hermetic: the real UnifiedRadixCache (FULL + MAMBA) of the #1417b / Y8P tests, CPU only.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
 import unittest
 
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.test.test_utils import CustomTestCase
 
 from test_hostlock_node_stays_off_host_lru_y8p import _give_device_value
 from test_prefetch_pin_host_lru_sanity_1417b import HEAD, _metal_form, _tree
@@ -59,8 +59,8 @@ class HostLockSurvivesEvictToHost(CustomTestCase):
         n249, _ = _metal_form(cache)
         _both_sides(cache, n249)
         cache._evict_to_host(n249, {ct: 0 for ct in cache.tree_components})
-        cache.pop_prefetch_loaded_tokens("weg2-16-31")
-        cache.pop_prefetch_loaded_tokens("weg2-16-38")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-31")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-38")
         self.assertEqual(n249.component_data[MAMBA].host_lock_ref, 0)
         self.assertTrue(cache.host_lru_lists[MAMBA].in_list(n249))
         cache.sanity_check()
@@ -68,8 +68,8 @@ class HostLockSurvivesEvictToHost(CustomTestCase):
     def test_an_unlocked_anchor_still_joins_the_host_lru_on_demotion(self):
         cache = _tree()
         n249, _ = _metal_form(cache)
-        cache.pop_prefetch_loaded_tokens("weg2-16-31")
-        cache.pop_prefetch_loaded_tokens("weg2-16-38")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-31")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-38")
         cache.host_lru_lists[MAMBA].remove_node(n249)
         _both_sides(cache, n249)
         self.assertEqual(n249.component_data[MAMBA].host_lock_ref, 0)

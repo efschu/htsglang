@@ -3,7 +3,7 @@
 # Release; ein Release, das nur der Nutzer bedienen kann, ist keins."  Zweiter Dienst im Image neben der Front (und neben userdash).
 #
 # Zwei Verwendungen, EINE Datei:
-#   a) GESOURCED vom Image-Entrypoint, direkt nach dem userdash-Start (MODE=weg2, Server laeuft):
+#   a) GESOURCED vom Image-Entrypoint, direkt nach dem userdash-Start (MODE=pdflip, Server laeuft):
 #        . /opt/htsglang/rigdash/entrypoint_rigdash.sh && rigdash_start
 #      Erwartet say/refuse, PY, LOGCOPY (und optional HOME_DIR, TREE, STAND, PROFILE_DIR, USER_PROFILE_DIR, FRONT_PORT) aus dem Entrypoint.
 #   b) AUSGEFUEHRT (MODE=editor des Entrypoints, `docker run -e MODE=editor ...`): nur der Editor im Vordergrund, kein Server, keine GPU.
@@ -56,8 +56,8 @@ rigdash_cmd() {
   tree=$home/src-$line
   [ -d "$tree/python" ] || tree=${TREE:-$home/src}      # Image ohne zwei Staende (aelterer Bau): der eine Baum
   RIGDASH_TREE_PY=$tree/python
-  if [ ! -f "$RIGDASH_TREE_PY/sglang/srt/weg2/profile_json.py" ]; then
-    say "WARN: Planer-Baum $RIGDASH_TREE_PY traegt sglang/srt/weg2/profile_json.py nicht (Code-Stand ohne Profil-Editor-Module, oder umbenannter Baum python/flliper) -- kein Editor"
+  if [ ! -f "$RIGDASH_TREE_PY/flliper/srt/pdflip/profile_json.py" ]; then
+    say "WARN: Planer-Baum $RIGDASH_TREE_PY traegt flliper/srt/pdflip/profile_json.py nicht (Code-Stand ohne Profil-Editor-Module, oder umbenannter Baum python/flliper) -- kein Editor"
     return 1
   fi
   RIGDASH_ARGV=(-m rigdash --edition release --editor-only --host "$HTSGLANG_RIGDASH_BIND" --port "$HTSGLANG_RIGDASH_PORT"

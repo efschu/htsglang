@@ -20,7 +20,7 @@
 # them byte for byte, so five units carried a literal /spinning/htsglang-gpu
 # for PYTHONPATH and for the interpreter no matter what [stack].repo said. On
 # this rig that checkout predated the turnkey merge and every unit died with
-# "No module named sglang.srt.turnkey". [stack].repo now decides, which is
+# "No module named flliper.srt.turnkey". [stack].repo now decides, which is
 # what it always claimed to do.
 #
 # Usage:
@@ -90,11 +90,11 @@ fi
 # one the rendered units write into.
 LOG_DIR="${LOG_DIR:-$(PYTHONPATH="$CHECKOUT/python:${PYTHONPATH:-}" "$PY" -c '
 import sys
-from sglang.srt.turnkey import config as C
+from flliper.srt.turnkey import config as C
 print(C.load(sys.argv[1]).log_dir)' "$RENDER_FROM")}"
 REPO="${REPO:-$(PYTHONPATH="$CHECKOUT/python:${PYTHONPATH:-}" "$PY" -c '
 import sys
-from sglang.srt.turnkey import config as C
+from flliper.srt.turnkey import config as C
 print(C.load(sys.argv[1]).repo)' "$RENDER_FROM")}"
 
 say "source:  $SRC (rendered)"
@@ -198,7 +198,7 @@ done
 say ""
 say "Next steps are the OPERATOR's, deliberately not automated:"
 say "  1. review $dstconf against the running ship config"
-say "  2. $REPO/.venv/bin/python -m sglang.srt.turnkey --config $dstconf preflight"
+say "  2. $REPO/.venv/bin/python -m flliper.srt.turnkey --config $dstconf preflight"
 say "  3. ... boot ship --dry-run     # prove argv/env parity before cutover"
 say "  4. systemctl enable --now htsglang.target   # REVERSES the standing"
 say "     'do not restore production' order in /spinning/GPU_WINDOWS.md:71"

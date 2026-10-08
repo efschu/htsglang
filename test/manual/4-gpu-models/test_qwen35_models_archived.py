@@ -10,15 +10,15 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.kits.reasoning_kit import ReasoningTokenUsageMixin
+from flliper.srt.utils import kill_process_tree
+from flliper.test.accuracy_test_runner import AccuracyTestParams
+from flliper.test.kits.reasoning_kit import ReasoningTokenUsageMixin
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.test.run_combined_tests import run_combined_tests
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

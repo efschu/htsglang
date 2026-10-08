@@ -26,21 +26,21 @@ import unittest
 from fractions import Fraction
 from pathlib import Path
 
-from sglang.srt.video_enhance.chain import StageKind
-from sglang.srt.video_enhance.chain_policy import ChainPolicyError
-from sglang.srt.video_enhance.frame_math import MIB, PixelFormat, Resolution
-from sglang.srt.video_enhance.frames import Frame
-from sglang.srt.video_enhance.mux import MediaInfo, TrackInfo
-from sglang.srt.video_enhance.ring import OverloadPolicy
-from sglang.srt.video_enhance.server import (
+from flliper.srt.video_enhance.chain import StageKind
+from flliper.srt.video_enhance.chain_policy import ChainPolicyError
+from flliper.srt.video_enhance.frame_math import MIB, PixelFormat, Resolution
+from flliper.srt.video_enhance.frames import Frame
+from flliper.srt.video_enhance.mux import MediaInfo, TrackInfo
+from flliper.srt.video_enhance.ring import OverloadPolicy
+from flliper.srt.video_enhance.server import (
     RESPONSE_BRIDGE_DEPTH,
     EnhanceRequestBody,
     VideoEnhanceService,
 )
-from sglang.srt.video_enhance.streaming import StreamingAdmissionError
-from sglang.srt.video_enhance.tenant import TenantConfig
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.video_enhance.streaming import StreamingAdmissionError
+from flliper.srt.video_enhance.tenant import TenantConfig
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

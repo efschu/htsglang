@@ -33,10 +33,10 @@ records the call and frees a seat models exactly that contract.
 
 import unittest
 
-from sglang.srt.managers.log_cycle_collapse import CycleCollapse
-from sglang.srt.managers.parked_carrier_relief import ENV_PARKED_CARRIER_RELIEF
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.log_cycle_collapse import CycleCollapse
+from flliper.srt.managers.parked_carrier_relief import ENV_PARKED_CARRIER_RELIEF
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 
@@ -332,7 +332,7 @@ class TheBootRefusalIsNotLiftedByThisFix(unittest.TestCase):
     """
 
     def test_the_unbounded_strict_config_is_still_refused(self):
-        from sglang.srt.managers.phase_purity import (
+        from flliper.srt.managers.phase_purity import (
             PhasePurityError,
             validate_purity_policy_pair,
         )
@@ -353,7 +353,7 @@ class TheBootRefusalIsNotLiftedByThisFix(unittest.TestCase):
             validate_purity_policy_pair(_Purity(), _Cfg())
 
     def test_a_declared_slo_is_still_the_accepted_bound(self):
-        from sglang.srt.managers.phase_purity import validate_purity_policy_pair
+        from flliper.srt.managers.phase_purity import validate_purity_policy_pair
 
         class _Purity:
             enforced = True

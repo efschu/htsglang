@@ -22,7 +22,7 @@ import pytest  # noqa: E402
 
 
 def _fake(root, fmt):
-    from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 
     fake = mock.MagicMock()
     fake.file_path = root
@@ -47,10 +47,10 @@ def _store(root):
 
 
 def test_format_recorded_then_matched_then_a_layout_bump_refused(monkeypatch):
-    from sglang.srt.mem_cache import hicache_storage as hs
-    from sglang.srt.mem_cache.weg2_store_gates import Weg2L3IdentityMismatch
+    from flliper.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.mem_cache.pdflip_store_gates import PdFlipL3IdentityMismatch
 
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "1")
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as m:
         _store(root)
         fmt = hs.l3_rank_format(_sa(m))
@@ -61,29 +61,29 @@ def test_format_recorded_then_matched_then_a_layout_bump_refused(monkeypatch):
         fn(fake, cfg)                                   # match
         monkeypatch.setattr(hs, "L3_FORMAT_GENERATION", hs.L3_FORMAT_GENERATION + 1)
         fn2, fake2, cfg2 = _fake(root, hs.l3_rank_format(_sa(m)))
-        with pytest.raises(Weg2L3IdentityMismatch) as ei:
+        with pytest.raises(PdFlipL3IdentityMismatch) as ei:
             fn2(fake2, cfg2)
         assert "W165" in str(ei.value) and "format" in str(ei.value)
 
 
 def test_a_state_dtype_change_is_refused(monkeypatch):
-    from sglang.srt.mem_cache import hicache_storage as hs
-    from sglang.srt.mem_cache.weg2_store_gates import Weg2L3IdentityMismatch
+    from flliper.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.mem_cache.pdflip_store_gates import PdFlipL3IdentityMismatch
 
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "1")
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as m:
         _store(root)
         fn, fake, cfg = _fake(root, hs.l3_rank_format(_sa(m)))
         fn(fake, cfg)
         fn2, fake2, cfg2 = _fake(root, hs.l3_rank_format(_sa(m, mamba_ssm_dtype="float32")))
-        with pytest.raises(Weg2L3IdentityMismatch):
+        with pytest.raises(PdFlipL3IdentityMismatch):
             fn2(fake2, cfg2)
 
 
 def test_p_and_d_of_the_27b_form_share_one_record(monkeypatch):
     """The 27B boot's own args (P: no ReplaySSM, D: ReplaySSM-spec; ratios
     differ): one record, no refusal between the groups."""
-    from sglang.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.mem_cache import hicache_storage as hs
 
     with tempfile.TemporaryDirectory() as m:
         p = hs.l3_rank_format(_sa(m, rank_tp_ratio=None))
@@ -93,7 +93,7 @@ def test_p_and_d_of_the_27b_form_share_one_record(monkeypatch):
 
 
 def test_unset_state_dtype_resolves_from_the_model_config(monkeypatch):
-    from sglang.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.mem_cache import hicache_storage as hs
 
     with tempfile.TemporaryDirectory() as m:
         with open(os.path.join(m, "config.json"), "w") as f:
@@ -102,9 +102,9 @@ def test_unset_state_dtype_resolves_from_the_model_config(monkeypatch):
 
 
 def test_not_a_persistent_dir_records_nothing(monkeypatch):
-    from sglang.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.mem_cache import hicache_storage as hs
 
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "1")
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as m:
         fn, fake, cfg = _fake(root, hs.l3_rank_format(_sa(m)))
         fn(fake, cfg)
@@ -114,8 +114,8 @@ def test_not_a_persistent_dir_records_nothing(monkeypatch):
 def test_wired_after_the_rank_identity_and_through_the_controller():
     import inspect
 
-    from sglang.srt.managers import cache_controller as cc
-    from sglang.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.managers import cache_controller as cc
+    from flliper.srt.mem_cache import hicache_storage as hs
 
     src = inspect.getsource(hs)
     i = src.index("self._l3p_check_rank_identity(storage_config)")

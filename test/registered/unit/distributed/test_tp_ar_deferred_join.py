@@ -38,8 +38,8 @@ import types
 import pytest
 import torch
 
-from sglang.srt.distributed import tp_ar_pipeline as tap
-from sglang.srt.environ import envs
+from flliper.srt.distributed import tp_ar_pipeline as tap
+from flliper.srt.environ import envs
 
 WORLD = 3
 TOKENS = 512
@@ -314,7 +314,7 @@ def test_issue_to_join_window_is_sampled_without_synchronizing(backend):
 
 
 def test_disabled_by_default():
-    envs.SGLANG_TP_AR_PIPELINE_DEFERRED.clear()
+    envs.FLLIPER_TP_AR_PIPELINE_DEFERRED.clear()
     tap.reset_tp_ar_pipeline_state()
     assert tap.tp_ar_deferred_enabled() is False
 
@@ -324,11 +324,11 @@ def test_moe_forward_impl_is_inert_when_the_flag_is_off(monkeypatch):
 
     Drives the real ``FusedMoE.forward_impl`` with a duck-typed self.
     """
-    from sglang.srt.layers.moe.fused_moe_triton import layer as moe_layer
+    from flliper.srt.layers.moe.fused_moe_triton import layer as moe_layer
 
     group = CountingGroup()
     monkeypatch.setattr(moe_layer, "tensor_model_parallel_all_reduce", group.all_reduce)
-    envs.SGLANG_TP_AR_PIPELINE_DEFERRED.clear()
+    envs.FLLIPER_TP_AR_PIPELINE_DEFERRED.clear()
     tap.reset_tp_ar_pipeline_state()
 
     fake = types.SimpleNamespace(
@@ -348,13 +348,13 @@ def test_moe_forward_impl_is_inert_when_the_flag_is_off(monkeypatch):
 
 
 def test_moe_forward_impl_declines_below_the_token_gate(backend, monkeypatch):
-    from sglang.srt.layers.moe.fused_moe_triton import layer as moe_layer
+    from flliper.srt.layers.moe.fused_moe_triton import layer as moe_layer
 
     group = CountingGroup(tokens=8)
     monkeypatch.setattr(moe_layer, "tensor_model_parallel_all_reduce", group.all_reduce)
     with (
-        envs.SGLANG_TP_AR_PIPELINE_DEFERRED.override(True),
-        envs.SGLANG_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS.override(256),
+        envs.FLLIPER_TP_AR_PIPELINE_DEFERRED.override(True),
+        envs.FLLIPER_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS.override(256),
     ):
         tap.reset_tp_ar_pipeline_state()
         tap.set_deferred_backend_for_test(backend)
@@ -384,13 +384,13 @@ def test_coverage_moe_issue_fires_on_a_qwen3_5_shaped_config(backend, monkeypatc
     this drives the real ``FusedMoE.forward_impl`` with the production shape
     (reduce_results=True, moe_tp_size>1) and requires an issue.
     """
-    from sglang.srt.layers.moe.fused_moe_triton import layer as moe_layer
+    from flliper.srt.layers.moe.fused_moe_triton import layer as moe_layer
 
     group = CountingGroup()
     monkeypatch.setattr(moe_layer, "tensor_model_parallel_all_reduce", group.all_reduce)
     with (
-        envs.SGLANG_TP_AR_PIPELINE_DEFERRED.override(True),
-        envs.SGLANG_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS.override(256),
+        envs.FLLIPER_TP_AR_PIPELINE_DEFERRED.override(True),
+        envs.FLLIPER_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS.override(256),
     ):
         tap.reset_tp_ar_pipeline_state()
         tap.set_deferred_backend_for_test(backend)
@@ -409,7 +409,7 @@ def test_coverage_moe_issue_fires_on_a_qwen3_5_shaped_config(backend, monkeypatc
         assert tap.tp_ar_pipeline_stats()["deferred_issued"] == 1
 
         # ... and the communicator's entry point completes it.
-        from sglang.srt.layers import communicator as comm_mod
+        from flliper.srt.layers import communicator as comm_mod
 
         joined = comm_mod.join_deferred(out)
 
@@ -426,11 +426,11 @@ def test_coverage_check_can_fail(backend, monkeypatch):
     If the issue fired there too, the coverage assertion above would pass for
     the wrong reason and the double-reduce risk would be real.
     """
-    from sglang.srt.layers.moe.fused_moe_triton import layer as moe_layer
+    from flliper.srt.layers.moe.fused_moe_triton import layer as moe_layer
 
     group = CountingGroup()
     monkeypatch.setattr(moe_layer, "tensor_model_parallel_all_reduce", group.all_reduce)
-    with envs.SGLANG_TP_AR_PIPELINE_DEFERRED.override(True):
+    with envs.FLLIPER_TP_AR_PIPELINE_DEFERRED.override(True):
         tap.reset_tp_ar_pipeline_state()
         tap.set_deferred_backend_for_test(backend)
         fake = types.SimpleNamespace(
@@ -459,7 +459,7 @@ def test_every_communicator_all_reduce_site_is_guarded():
     """
     import inspect
 
-    from sglang.srt.layers import communicator as comm_mod
+    from flliper.srt.layers import communicator as comm_mod
 
     source = inspect.getsource(comm_mod)
     reduce_calls = (
@@ -479,7 +479,7 @@ def test_every_communicator_all_reduce_site_is_guarded():
 def test_communicator_entry_points_join_first():
     import inspect
 
-    from sglang.srt.layers import communicator as comm_mod
+    from flliper.srt.layers import communicator as comm_mod
 
     for method in (
         comm_mod.LayerCommunicator.prepare_attn,

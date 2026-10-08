@@ -3,31 +3,31 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins import (
     _infer_positions,
     _MegatronPlugin,
-    _SGLangPlugin,
+    _FlliperPlugin,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     PositionalSeqId,
-    SGLangSeqId,
+    FlliperSeqId,
     TokenAlignerStepAux,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.dims_spec import TokenLayout
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
-_sglang_plugin = _SGLangPlugin()
+_flliper_plugin = _FlliperPlugin()
 _megatron_plugin = _MegatronPlugin()
 
 
-class TestNormalizeSGLang:
-    """Tests for SGLang aux tensor normalization."""
+class TestNormalizeFlliper:
+    """Tests for fLLiper aux tensor normalization."""
 
     def test_with_rids(self):
-        """SGLang tensors with rids produce string seq_ids."""
+        """fLLiper tensors with rids produce string seq_ids."""
         step_data: dict = {
             "input_ids": torch.tensor([10, 20, 30]),
             "positions": torch.tensor([0, 1, 2]),
@@ -35,14 +35,14 @@ class TestNormalizeSGLang:
             "rids": ["A"],
         }
 
-        result: TokenAlignerStepAux = _sglang_plugin.compute_step_aux(
+        result: TokenAlignerStepAux = _flliper_plugin.compute_step_aux(
             step_data, layout=TokenLayout.T, step=0
         )
 
         assert result.input_ids == [10, 20, 30]
         assert result.positions == [0, 1, 2]
         assert result.seq_lens == [3]
-        assert result.seq_ids == [SGLangSeqId(rid="A")]
+        assert result.seq_ids == [FlliperSeqId(rid="A")]
 
     def test_rids_none_fallback(self):
         """Missing rids results in (step, index) fallback seq_ids."""
@@ -52,7 +52,7 @@ class TestNormalizeSGLang:
             "seq_lens": torch.tensor([2]),
         }
 
-        result: TokenAlignerStepAux = _sglang_plugin.compute_step_aux(
+        result: TokenAlignerStepAux = _flliper_plugin.compute_step_aux(
             step_data, layout=TokenLayout.T, step=3
         )
         assert result.seq_ids == [PositionalSeqId(step=3, seq_index=0)]
@@ -66,10 +66,10 @@ class TestNormalizeSGLang:
             "rids": ["A", "B"],
         }
 
-        result: TokenAlignerStepAux = _sglang_plugin.compute_step_aux(
+        result: TokenAlignerStepAux = _flliper_plugin.compute_step_aux(
             step_data, layout=TokenLayout.T, step=0
         )
-        assert result.seq_ids == [SGLangSeqId(rid="A"), SGLangSeqId(rid="B")]
+        assert result.seq_ids == [FlliperSeqId(rid="A"), FlliperSeqId(rid="B")]
 
 
 class TestNormalizeMegatron:
@@ -228,9 +228,9 @@ class TestInferCpShardedDims:
         result: str = _megatron_plugin.infer_cp_sharded_dims(name="input_ids", ndim=2)
         assert result == "b s[cp:zigzag]"
 
-    def test_sglang_infer_1d(self) -> None:
-        """SGLang 1D → 't[cp:zigzag]'."""
-        result: str = _sglang_plugin.infer_cp_sharded_dims(name="input_ids", ndim=1)
+    def test_flliper_infer_1d(self) -> None:
+        """fLLiper 1D → 't[cp:zigzag]'."""
+        result: str = _flliper_plugin.infer_cp_sharded_dims(name="input_ids", ndim=1)
         assert result == "t[cp:zigzag]"
 
     def test_megatron_infer_3d_raises(self) -> None:
@@ -238,10 +238,10 @@ class TestInferCpShardedDims:
         with pytest.raises(ValueError, match="cannot infer dims"):
             _megatron_plugin.infer_cp_sharded_dims(name="input_ids", ndim=3)
 
-    def test_sglang_infer_2d_raises(self) -> None:
-        """SGLang 2D raises ValueError."""
+    def test_flliper_infer_2d_raises(self) -> None:
+        """fLLiper 2D raises ValueError."""
         with pytest.raises(ValueError, match="cannot infer dims"):
-            _sglang_plugin.infer_cp_sharded_dims(name="input_ids", ndim=2)
+            _flliper_plugin.infer_cp_sharded_dims(name="input_ids", ndim=2)
 
 
 if __name__ == "__main__":

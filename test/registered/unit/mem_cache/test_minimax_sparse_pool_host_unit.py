@@ -3,25 +3,25 @@ import unittest
 import psutil
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
+from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
-from sglang.srt.mem_cache.memory_pool_host import (
+from flliper.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from flliper.srt.mem_cache.memory_pool_host import (
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
 )
-from sglang.srt.mem_cache.pool_host.common import (
+from flliper.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
-from sglang.srt.mem_cache.pool_host.mha import (
+from flliper.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, stage="stage-b", runner_config="1-gpu-small-amd")

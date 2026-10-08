@@ -1,6 +1,6 @@
 """W65-REGROUP (27B INT8 decode matrix, boot 113226 on 173161c595, D 11:47:15,
-rid weg2-22-115): the intake prefetch of one warm stream died with W65
-Weg2PrefetchSpanSplit (min=2958 max=3448) because the ranks had matched
+rid pdflip-22-115): the intake prefetch of one warm stream died with W65
+PdFlipPrefetchSpanSplit (min=2958 max=3448) because the ranks had matched
 DIFFERENT prefix depths of the same prompt -- TP0/TP2 at the 99776 anchor, TP1
 one 490-token node deeper at 100266 (``FA PREFETCH-FROM-ANCHOR`` x3, ``#1042
 EXTENT 2898/3388/2898``); match end 103225 on every rank.
@@ -10,7 +10,7 @@ Driven through the REAL ``Scheduler._prefetch_kvcache`` and the REAL
 a mock gloo group (the H99 harness). Only the radix match is simulated: each
 rank's request carries the anchors its tree holds and answers
 ``init_next_round_input`` with the deepest anchor at or below the
-``_weg2_prefix_cap`` the scheduler sets (the real #1419 hook).
+``_pdflip_prefix_cap`` the scheduler sets (the real #1419 hook).
 
 RED on 173161c595: W65 on every rank. GREEN with the regroup: nothing is
 registered on the split pass, every rank re-matches capped at the group's
@@ -31,11 +31,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_nf_form_a_prefetch_span_h99 as h99  # noqa: E402  (the 3-rank gloo harness)
 
-from sglang.srt.managers import tp_match_floor as tmf  # noqa: E402
-from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.mem_cache import match_refusal_census as mrc  # noqa: E402
-from sglang.srt.mem_cache import unified_radix_cache as urc  # noqa: E402
-from sglang.srt.mem_cache.unified_radix_cache import (  # noqa: E402
+from flliper.srt.managers import tp_match_floor as tmf  # noqa: E402
+from flliper.srt.managers.scheduler import Scheduler  # noqa: E402
+from flliper.srt.mem_cache import match_refusal_census as mrc  # noqa: E402
+from flliper.srt.mem_cache import unified_radix_cache as urc  # noqa: E402
+from flliper.srt.mem_cache.unified_radix_cache import (  # noqa: E402
     HiCacheCollectiveDesyncError,
     UnifiedRadixCache,
 )
@@ -71,7 +71,7 @@ class _Req:
         self.init_next_round_input(None)
 
     def init_next_round_input(self, tree_cache, cow_mamba=False):
-        cap = getattr(self, "_weg2_prefix_cap", None)
+        cap = getattr(self, "_pdflip_prefix_cap", None)
         ok = [a for a in self.anchors if cap is None or a <= int(cap)]
         m = max(ok) if ok else DEVICE
         self.matches.append((cap, m))
@@ -90,7 +90,7 @@ class _Sched:
 
     _prefetch_kvcache = Scheduler._prefetch_kvcache
     # absent on 173161c595: the tests then fail on W65 (red), not at import
-    _weg2_prefetch_span_regroup = getattr(Scheduler, "_weg2_prefetch_span_regroup", None)
+    _pdflip_prefetch_span_regroup = getattr(Scheduler, "_pdflip_prefetch_span_regroup", None)
     _note_prefetch_unregistered = Scheduler._note_prefetch_unregistered
 
     def __init__(self, tree):
@@ -99,8 +99,8 @@ class _Sched:
         self.tree_cache = tree
 
 
-_REGROUP_ATTR = getattr(tmf, "SPAN_REGROUP_ATTR", "_weg2_span_regroup")
-_ARMED_ATTR = getattr(tmf, "SPAN_REGROUP_ARMED_ATTR", "_weg2_span_regroup_armed")
+_REGROUP_ATTR = getattr(tmf, "SPAN_REGROUP_ATTR", "_pdflip_span_regroup")
+_ARMED_ATTR = getattr(tmf, "SPAN_REGROUP_ARMED_ATTR", "_pdflip_span_regroup_armed")
 
 
 def _tree(rank, group):
@@ -121,7 +121,7 @@ class _Env:
 
     def __enter__(self):
         for p in (
-            mock.patch("sglang.srt.runtime_context.get_server_args", return_value=types.SimpleNamespace(rank_tp_ratio=None)),
+            mock.patch("flliper.srt.runtime_context.get_server_args", return_value=types.SimpleNamespace(rank_tp_ratio=None)),
             mock.patch.object(urc, "uneven_dcp_active", return_value=True),
             mock.patch.object(tmf, "form_a_follow_active", return_value=self.follow),
         ):
@@ -195,7 +195,7 @@ class TestRc12z30SplitIsRegrouped(unittest.TestCase):
         self.assertEqual(reqs[1].state_anchor_depth, 100266)
         self.assertEqual(reqs[0].state_anchor_depth, 99776)
         for r in reqs.values():
-            self.assertFalse(hasattr(r, "_weg2_prefix_cap"), "the cap is the retry's, never kept")
+            self.assertFalse(hasattr(r, "_pdflip_prefix_cap"), "the cap is the retry's, never kept")
 
     def test_registered_prefix_stamp_is_the_group_start_on_every_rank(self):
         _t, reqs, _res, errors, _g = _intake(RC12Z30)
@@ -240,7 +240,7 @@ class TestTheStopSurvivesWhereTheRegroupCannot(unittest.TestCase):
                             for e in errors.values()), errors)
         # the cap never outlives the retry, even on the stop
         for r in reqs.values():
-            self.assertFalse(hasattr(r, "_weg2_prefix_cap"))
+            self.assertFalse(hasattr(r, "_pdflip_prefix_cap"))
 
     def test_unarmed_rematch_false_keeps_w65(self):
         _t, _r, _res, errors, _g = _intake(
@@ -295,8 +295,8 @@ class TestPieces(unittest.TestCase):
             self.assertFalse(tmf.span_regroup_allowed(rematch=True, limit_tokens=None, group_decides=True))
 
     def test_chain_tail_instrument_prints_the_tail_and_never_raises(self):
-        from sglang.srt.managers.scheduler import _weg2_regroup_chain_tail as tail
-        from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+        from flliper.srt.managers.scheduler import _pdflip_regroup_chain_tail as tail
+        from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 
         root = types.SimpleNamespace(parent=None, key=None)
         a = types.SimpleNamespace(parent=root, key=list(range(490)), backuped=True,

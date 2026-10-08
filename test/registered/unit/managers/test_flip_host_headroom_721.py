@@ -18,13 +18,13 @@ default-on ahead of full attribution.
 
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 GB = 1024**3
 
 
 def _v(avail, transient=20 * GB, defers=0, **kw):
-    from sglang.srt.managers.phase_flip_runtime import flip_host_headroom_verdict
+    from flliper.srt.managers.phase_flip_runtime import flip_host_headroom_verdict
 
     return flip_host_headroom_verdict(avail, transient, defers, **kw)
 
@@ -48,7 +48,7 @@ class TestFlipHostHeadroomGuard721(CustomTestCase):
     def test_the_boundary_is_transient_plus_floor(self):
         """Exactly enough passes; one byte short defers. The floor is not
         decoration -- it is the whole margin."""
-        from sglang.srt.managers.phase_flip_runtime import FLIP_HOST_RAM_FLOOR_BYTES
+        from flliper.srt.managers.phase_flip_runtime import FLIP_HOST_RAM_FLOOR_BYTES
 
         need = 20 * GB + FLIP_HOST_RAM_FLOOR_BYTES
         self.assertTrue(_v(need)[0])
@@ -65,7 +65,7 @@ class TestFlipHostHeadroomGuard721(CustomTestCase):
     def test_defer_is_bounded_then_escalates_and_proceeds(self):
         """A permanent hold is worse than the hazard: it converts a POSSIBLE
         kill into a CERTAIN half-service outage, and the kill is recoverable."""
-        from sglang.srt.managers.phase_flip_runtime import FLIP_HOST_RAM_MAX_DEFERS
+        from flliper.srt.managers.phase_flip_runtime import FLIP_HOST_RAM_MAX_DEFERS
 
         for n in range(FLIP_HOST_RAM_MAX_DEFERS):
             with self.subTest(defers=n):
@@ -91,7 +91,7 @@ class TestFlipHostHeadroomGuard721(CustomTestCase):
         flip that did not arm because the HOST was tight is a different fact
         from one that could not fund its VRAM seam, and merging them hides the
         signal #721 exists to collect."""
-        from sglang.srt.managers.phase_flip_runtime import DEFERRED_HOST_RAM
+        from flliper.srt.managers.phase_flip_runtime import DEFERRED_HOST_RAM
 
         self.assertEqual(DEFERRED_HOST_RAM, "DEFERRED-HOST-RAM")
         self.assertIn(DEFERRED_HOST_RAM, _v(1 * GB)[2])

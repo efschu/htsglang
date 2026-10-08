@@ -5,7 +5,7 @@ failed srtslurm job, determine the root cause, and **take action** by filing
 GitHub issues when the cause is clear.
 
 srtslurm is a Python-first orchestration framework for running distributed LLM
-inference benchmarks on SLURM clusters using SGLang and TRTLLM backends.
+inference benchmarks on SLURM clusters using fLLiper and TRTLLM backends.
 
 ## Architecture
 
@@ -13,14 +13,14 @@ There are two repos involved:
 
 - **`NVIDIA/srt-slurm`**: The orchestration layer. It owns recipes (YAML configs)
   that define which flags, environment variables, and topology to use when
-  launching SGLang workers. It controls `srtctl`, worker lifecycle, health
+  launching fLLiper workers. It controls `srtctl`, worker lifecycle, health
   checks, and benchmark execution.
 - **`sgl-project/sglang`**: The inference engine. It owns the server, model
   loading, CUDA kernels, MoE routing, attention backends, and all runtime code.
 
-When a recipe passes flags that SGLang doesn't support together, **that is a
-recipe bug in srt-slurm**, not an sglang bug — even though the error appears in
-SGLang code. The recipe is responsible for only requesting valid combinations.
+When a recipe passes flags that fLLiper doesn't support together, **that is a
+recipe bug in srt-slurm**, not an flliper bug — even though the error appears in
+fLLiper code. The recipe is responsible for only requesting valid combinations.
 
 ## Step 1: Read Logs
 
@@ -82,20 +82,20 @@ Determine which category the failure falls into:
 
 ### Category A: Recipe/Config Bug → file against `NVIDIA/srt-slurm`
 
-The recipe or config is passing invalid or incompatible flags to SGLang. Examples:
+The recipe or config is passing invalid or incompatible flags to fLLiper. Examples:
 - Incompatible flag combinations (e.g., `--moe-a2a-backend deepep` with
   `--fp4-gemm-backend flashinfer_cutedsl` when no fused func exists for that pair)
 - Wrong environment variables for the topology
 - Incorrect worker counts, GPU assignments, or port configs
 - srtctl bugs, health check misconfigurations, orchestration logic errors
 
-**Key signal**: The error is in SGLang code but the `config.yaml` shows the
-recipe chose a flag combination that SGLang doesn't support. The fix belongs in
-the recipe, not in SGLang.
+**Key signal**: The error is in fLLiper code but the `config.yaml` shows the
+recipe chose a flag combination that fLLiper doesn't support. The fix belongs in
+the recipe, not in fLLiper.
 
-### Category B: SGLang Bug → list suspect PRs (do NOT auto-file)
+### Category B: fLLiper Bug → list suspect PRs (do NOT auto-file)
 
-A genuine bug in SGLang's runtime code. Examples:
+A genuine bug in fLLiper's runtime code. Examples:
 - CUDA OOM, NCCL timeout, or kernel crash with valid flags
 - Model loading failure for a supported model
 - Regression introduced by a recent commit
@@ -108,7 +108,7 @@ Then check which files each suspect commit touched:
 ```
 gh api repos/sgl-project/sglang/commits/<sha> --jq '.files[].filename'
 ```
-List suspect PRs in the report. Do NOT auto-file issues against sglang.
+List suspect PRs in the report. Do NOT auto-file issues against flliper.
 
 ### Category C: Infra/Transient → do NOT file any issue
 
@@ -140,7 +140,7 @@ One clear sentence. State the category (A/B/C) and which repo owns the fix.
 ### Noise
 - Warnings that were NOT causal (and why)
 
-### Suspect PRs (sglang)
+### Suspect PRs (flliper)
 (Only for Category B failures)
 - PR #NNNN: "title" — why this commit could be related based on files changed
 
@@ -178,7 +178,7 @@ The issue body MUST include:
   when `moe-a2a-backend` is `deepep`", or "add validation to reject this
   combination")
 
-### For Category B (sglang bugs) → file against `sgl-project/sglang`
+### For Category B (flliper bugs) → file against `sgl-project/sglang`
 
 1. First, check for duplicates:
    ```
@@ -197,8 +197,8 @@ The issue body MUST include:
 - **Repro context**: Model, precision, topology, relevant flags from `config.yaml`
 - **Suspect commits**: List any recent commits that may have caused this, with
   links (e.g., `https://github.com/sgl-project/sglang/commit/<sha>`)
-- **Suggested Fix**: If you can identify the fix from reading the sglang source
-  in `/workspace/repos/sglang/`, include it. Otherwise, describe what needs to
+- **Suggested Fix**: If you can identify the fix from reading the flliper source
+  in `/workspace/repos/flliper/`, include it. Otherwise, describe what needs to
   change conceptually.
 
 ### For Category C (infra/transient) → do NOT file any issue

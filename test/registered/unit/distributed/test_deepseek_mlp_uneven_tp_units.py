@@ -41,17 +41,17 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     ACTIVATION_VEC_ELEMS,
     get_tp_partition_ratios,
     partition_sizes,
     set_tp_partition_ratios,
 )
-from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
-from sglang.srt.models.deepseek_v2 import DeepseekV2MLP
-from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
+from flliper.srt.models.deepseek_v2 import DeepseekV2MLP
+from flliper.srt.runtime_context import get_context, get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -75,7 +75,7 @@ GGUF_BLOCK = 256
 
 
 def _gguf_config():
-    from sglang.srt.layers.quantization.gguf import GGUFConfig
+    from flliper.srt.layers.quantization.gguf import GGUFConfig
 
     return GGUFConfig()
 
@@ -310,7 +310,7 @@ class TestEvenPathUnchanged(_MLPCase):
 
 
 class TestReplicatedSharedExpert(_MLPCase):
-    """tp_size=1 (SGLANG_SHARED_EXPERT_TP1, DeepEP/FP4 allgather, moe-dense-dp):
+    """tp_size=1 (FLLIPER_SHARED_EXPERT_TP1, DeepEP/FP4 allgather, moe-dense-dp):
     the module is replicated and must not join the "mlp" family."""
 
     def test_replicated_declares_no_units_and_keeps_the_full_dimension(self):
@@ -351,7 +351,7 @@ class TestNonDeepseekPathUntouched(_MLPCase):
     nothing outside deepseek_v2 changed to make that true."""
 
     def test_llama_and_deepseek_partition_identically(self):
-        from sglang.srt.models.llama import LlamaMLP
+        from flliper.srt.models.llama import LlamaMLP
 
         for weights in (AUTO_WEIGHTS, EXPLICIT_WEIGHTS, [5, 3, 3]):
             for intermediate in (DENSE_INTERMEDIATE, 11008, SHARED_INTERMEDIATE):

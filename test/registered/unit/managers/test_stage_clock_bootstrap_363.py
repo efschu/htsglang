@@ -66,7 +66,7 @@ class _Runtime:
     """The two attributes `_intra_phase_decide` actually reads, plus a clock."""
 
     def __init__(self, table=None, current_stage=None):
-        from sglang.srt.managers.regime_runtime import RegimeObserver
+        from flliper.srt.managers.regime_runtime import RegimeObserver
 
         self._intra_phase_decide = RegimeObserver._intra_phase_decide.__get__(self)
         self._table = table
@@ -122,7 +122,7 @@ class TestThePassAcceptsSuchARow(unittest.TestCase):
     """The other end of the loop: the pass must read the record we now write."""
 
     def test_the_pass_reads_mean_total_ms_from_the_record(self):
-        from sglang.srt.managers.regime_ms_clock import MsDecision
+        from flliper.srt.managers.regime_ms_clock import MsDecision
 
         d = MsDecision(
             target=None,
@@ -138,7 +138,7 @@ class TestThePassAcceptsSuchARow(unittest.TestCase):
     def test_the_pass_no_longer_claims_an_empty_split_means_no_clock(self):
         import inspect
 
-        from sglang.srt.planner import stage_measure_pass
+        from flliper.srt.planner import stage_measure_pass
 
         src = inspect.getsource(stage_measure_pass)
         self.assertIn("stage table was absent", src)

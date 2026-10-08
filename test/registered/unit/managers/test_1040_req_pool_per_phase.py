@@ -28,11 +28,11 @@ import pathlib
 import types
 import unittest
 
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
+from flliper.test.test_utils import CustomTestCase
 
 _REPO = pathlib.Path(__file__).resolve().parents[4]
-_BOOT = _REPO / "python" / "sglang" / "srt" / "managers" / "phase_flip_boot.py"
+_BOOT = _REPO / "python" / "flliper" / "srt" / "managers" / "phase_flip_boot.py"
 
 
 def _fake_req(idx=None, binding=None, chunked=0, committed=0):
@@ -111,7 +111,7 @@ class TestTheCutoverRebindsTheSchedulerRequestPool(CustomTestCase):
     """T1 / C1.2: the scheduler follows the incoming phase's own pool."""
 
     def test_pp_to_tp_rebinds_to_the_tp_pool(self):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             rebind_req_pool_for_cutover,
         )
 
@@ -124,7 +124,7 @@ class TestTheCutoverRebindsTheSchedulerRequestPool(CustomTestCase):
         self.assertIsNot(sched.req_to_token_pool.req_to_token, pp.req_to_token)
 
     def test_tp_to_pp_rebinds_back(self):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             rebind_req_pool_for_cutover,
         )
 
@@ -139,7 +139,7 @@ class TestTheCutoverRebindsTheSchedulerRequestPool(CustomTestCase):
         # req-pool rebind inside that gate would leave the aliases deleted and
         # the pools never swapped -- the TP phase reading a tensor nobody
         # writes.  Both flag states must rebind identically.
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             rebind_req_pool_for_cutover,
         )
 
@@ -150,7 +150,7 @@ class TestTheCutoverRebindsTheSchedulerRequestPool(CustomTestCase):
             self.assertIs(sched.req_to_token_pool, tp, f"flag={flag}")
 
     def test_a_missing_incoming_pool_raises_rather_than_returning_none(self):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             ReqPoolRebindRefused,
             rebind_req_pool_for_cutover,
         )
@@ -161,7 +161,7 @@ class TestTheCutoverRebindsTheSchedulerRequestPool(CustomTestCase):
             rebind_req_pool_for_cutover(sched, "tp")
 
     def test_the_incoming_pool_is_cleared_to_a_fresh_boot_state(self):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             rebind_req_pool_for_cutover,
         )
 
@@ -222,7 +222,7 @@ class TestTheRequestAxisCensus(CustomTestCase):
     """T3 / C1.4: #919 on the request axis. Emitted always, raises non-zero."""
 
     def test_a_fully_free_outgoing_pool_reports_zero_escapees(self):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             census_outgoing_req_pool,
         )
 
@@ -233,7 +233,7 @@ class TestTheRequestAxisCensus(CustomTestCase):
         self.assertEqual(census.size, pool.size)
 
     def test_an_unfreed_row_is_counted_and_its_rid_named(self):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             census_outgoing_req_pool,
         )
 
@@ -247,7 +247,7 @@ class TestTheRequestAxisCensus(CustomTestCase):
         self.assertIn(req.req_pool_idx, census.rows)
 
     def test_the_cutover_raises_when_the_outgoing_pool_is_not_empty(self):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             ReqPoolRebindRefused,
             rebind_req_pool_for_cutover,
         )
@@ -261,7 +261,7 @@ class TestTheRequestAxisCensus(CustomTestCase):
     def test_the_census_line_carries_every_named_term(self):
         # Indicator law: an unmeasured zero is not a zero, so the line is
         # emitted on EVERY cutover and carries its own denominator.
-        from sglang.srt.managers import phase_req_pool_binding as mod
+        from flliper.srt.managers import phase_req_pool_binding as mod
 
         self.assertIn("#1040 REQ-POOL REBOUND", mod.REBIND_LOG_FORMAT)
         for term in ("binding=", "rows=", "outgoing free=", "escapees=", "rids="):
@@ -287,14 +287,14 @@ class TestTheDefaultPathIsUnchanged(CustomTestCase):
         self.assertIsNone(pool.alloc([_fake_req()]))
 
 
-class TestTheOnlyPoolObjectCacherFollowsTheRebind(CustomTestCase):
+class TestTheOnlyPoolObjectCacheFollowsTheRebind(CustomTestCase):
     """C1.5: kv_session_offload cached the pool OBJECT off the scheduler."""
 
     def test_kv_session_offload_reads_the_scheduler_at_use(self):
         src = (
             _REPO
             / "python"
-            / "sglang"
+            / "flliper"
             / "srt"
             / "managers"
             / "kv_session_offload.py"

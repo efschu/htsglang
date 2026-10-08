@@ -28,19 +28,19 @@ from pathlib import Path
 import requests
 from openai_sdk_harness import TOKENIZER_NAME, live_server
 
-from sglang.srt.training.feasibility import GIB, CardResources, MachineResources
-from sglang.srt.training.tenant import DemandSample, IdleMonitor
-from sglang.srt.workbench.scheduler import WorkbenchConfig
-from sglang.srt.workbench.service import WorkbenchService
-from sglang.srt.workbench.tenant import (
+from flliper.srt.training.feasibility import GIB, CardResources, MachineResources
+from flliper.srt.training.tenant import DemandSample, IdleMonitor
+from flliper.srt.workbench.scheduler import WorkbenchConfig
+from flliper.srt.workbench.service import WorkbenchService
+from flliper.srt.workbench.tenant import (
     IdleWorkTenant,
     SegmentOutcome,
     SegmentStatus,
     WorkEstimate,
     WorkSegment,
 )
-from sglang.srt.workbench.tenants.fp8_tuner import Fp8BlockTunerTenant
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.workbench.tenants.fp8_tuner import Fp8BlockTunerTenant
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -110,7 +110,7 @@ class SleeperTenant(IdleWorkTenant):
     async def start_segment(self, grant, sink) -> WorkSegment:
         self.started += 1
         sink_message = f"sleeper started on {list(grant.card_indices)}"
-        from sglang.srt.workbench.tenant import WorkEvent
+        from flliper.srt.workbench.tenant import WorkEvent
 
         sink(WorkEvent("info", sink_message))
         return SleeperSegment(self)

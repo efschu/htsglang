@@ -163,7 +163,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60)
 
@@ -260,7 +260,7 @@ class _GlooWire:
 
 def _victim(rank, wire):
     """The shipped mixin methods, bound to a holder (the 630 pattern)."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=wire,
@@ -428,7 +428,7 @@ def _worker(rank, init_file, out_dir, case):
                 # with the sent-counter bumped synchronously right after
                 # each post, mirroring `bump_sent`'s real synchronicity
                 # with the send call in `_pp_send_dict_to_next_stage`.
-                from sglang.srt.managers.scheduler_pp_mixin import (
+                from flliper.srt.managers.scheduler_pp_mixin import (
                     DRAIN_SETTLE_BUDGET_S,
                 )
 

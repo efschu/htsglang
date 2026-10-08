@@ -11,7 +11,7 @@
 #   systemd[1]: Caught <QUIT>, dumped core as pid 273622.
 #   systemd[1]: Exiting PID 1...
 #
-# sglang signals its PARENT when a scheduler dies
+# flliper signals its PARENT when a scheduler dies
 # (managers/scheduler.py: parent_process.send_signal(signal.SIGQUIT), parent
 # resolved via os.getppid()), and kill_process_tree sends SIGQUIT too
 # (utils/common.py, whose own comment names PID 1 as a case it expects to hit).
@@ -26,7 +26,7 @@
 # ---------------------------------------------------------------------------
 # Tagged process identification.
 #
-# NEVER pattern-kill on this box: it is shared, and `pkill -f sglang` has twice
+# NEVER pattern-kill on this box: it is shared, and `pkill -f flliper` has twice
 # taken down someone else's server (and once the killer's own session). Every
 # rank this tooling starts carries L0_RUN_TAG in its ENVIRONMENT, and every
 # lookup and every kill is restricted to processes carrying THIS run's tag.

@@ -15,7 +15,7 @@ rest: is the INT8 linear path itself slow in the decode regime?
 so there is no #255 analog. What is left is to price the two kernels that DO
 run, separately, at the shapes and batch sizes the serving path uses:
 
-    python/sglang/srt/layers/quantization/compressed_tensors/schemes/
+    python/flliper/srt/layers/quantization/compressed_tensors/schemes/
         compressed_tensors_w8a8_int8.py:213   x_q, x_scale = per_token_quant_int8(x)
         compressed_tensors_w8a8_int8.py:215   int8_scaled_mm(x_q, layer.weight,
                                                 x_scale, layer.weight_scale,
@@ -46,7 +46,7 @@ rather than inferred:
     int8_quant          per_token_quant_int8(x)          -- activation quant only
     int8_gemm           int8_scaled_mm(pre-quantized)    -- GEMM only
     int8_fused          quant + GEMM                     -- the serving path verbatim
-    fp8_quant           sglang_per_token_quant_fp8(x)    -- FP8 act quant only
+    fp8_quant           flliper_per_token_quant_fp8(x)    -- FP8 act quant only
     fp8_gemm            fp8_scaled_mm(pre-quantized)     -- FP8 GEMM only
     fp8_ct_fused        apply_fp8_linear, compressed-tensors branch
     fp8_block_fused     w8a8_block_fp8_linear, the branch Fp8LinearMethod takes
@@ -74,8 +74,8 @@ Derived from the checkpoint's own config.json and the shard plan, not
 hardcoded. Under uneven TP the per-rank N differs per rank, so the shape set
 is a function of (tp_size, --rank-tp-ratio, --rank-mlp-ratio, rank). The
 partition arithmetic is the largest-remainder split the serving path uses;
-when sglang is importable the derivation is cross-checked against
-``sglang.srt.distributed.utils.partition_units`` and disagreement is fatal.
+when flliper is importable the derivation is cross-checked against
+``flliper.srt.distributed.utils.partition_units`` and disagreement is fatal.
 
 Only layers that are actually INT8 are included. The checkpoint's ignore
 list keeps ``in_proj_b`` / ``in_proj_a`` (the GDN ba projection), ``lm_head``
@@ -147,9 +147,9 @@ def partition_units_local(units: int, weights: Sequence[int]) -> list:
     `weights`, every rank >= 1 unit, ties toward the lower rank index.
 
     A deliberate second implementation of
-    ``sglang.srt.distributed.utils._partition_units_raw`` so this script
+    ``flliper.srt.distributed.utils._partition_units_raw`` so this script
     derives shapes without importing the serving stack (a desk machine
-    without sgl_kernel can still print the table). When sglang IS
+    without sgl_kernel can still print the table). When flliper IS
     importable, ``cross_check_partition`` compares the two and refuses to
     continue on disagreement -- a shape table that silently drifts from the
     serving split would be worse than no table.
@@ -179,11 +179,11 @@ def partition_units_local(units: int, weights: Sequence[int]) -> list:
 
 
 def cross_check_partition(cases: Sequence[tuple]) -> str:
-    """Compare the local split against sglang's for every (units, weights)
+    """Compare the local split against flliper's for every (units, weights)
     the shape derivation used. Returns a provenance string for the JSON."""
     try:
-        from sglang.srt.distributed.utils import _partition_units_raw  # noqa: PLC0415
-    except Exception as ex:  # sglang not importable on a bare desk machine
+        from flliper.srt.distributed.utils import _partition_units_raw  # noqa: PLC0415
+    except Exception as ex:  # flliper not importable on a bare desk machine
         return f"local-only ({type(ex).__name__}: {ex})"
     for units, weights in cases:
         mine = partition_units_local(units, weights)
@@ -192,10 +192,10 @@ def cross_check_partition(cases: Sequence[tuple]) -> str:
             raise SystemExit(
                 f"Shard arithmetic disagrees with the serving stack for "
                 f"units={units} weights={list(weights)}: local {mine} vs "
-                f"sglang {theirs}. Refusing to emit a shape table that does "
+                f"flliper {theirs}. Refusing to emit a shape table that does "
                 f"not match what the ranks would actually build."
             )
-    return "cross-checked against sglang.srt.distributed.utils._partition_units_raw"
+    return "cross-checked against flliper.srt.distributed.utils._partition_units_raw"
 
 
 @dataclass
@@ -541,25 +541,25 @@ def load_kernels(dry_run: bool, block_backend: str = "auto") -> Kernels:
         )
 
     missing = []
-    from sglang.srt.layers.quantization.int8_kernel import (  # noqa: PLC0415
+    from flliper.srt.layers.quantization.int8_kernel import (  # noqa: PLC0415
         per_token_quant_int8,
     )
     from sgl_kernel import int8_scaled_mm  # noqa: PLC0415
 
     try:
-        from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: PLC0415
-            sglang_per_token_quant_fp8,
+        from flliper.srt.layers.quantization.fp8_kernel import (  # noqa: PLC0415
+            flliper_per_token_quant_fp8,
         )
     except Exception as ex:
-        sglang_per_token_quant_fp8 = None
-        missing.append(f"sglang_per_token_quant_fp8: {type(ex).__name__}: {ex}")
+        flliper_per_token_quant_fp8 = None
+        missing.append(f"flliper_per_token_quant_fp8: {type(ex).__name__}: {ex}")
     try:
         from sgl_kernel import fp8_scaled_mm  # noqa: PLC0415
     except Exception as ex:
         fp8_scaled_mm = None
         missing.append(f"fp8_scaled_mm: {type(ex).__name__}: {ex}")
     try:
-        from sglang.srt.layers.quantization.fp8_utils import (  # noqa: PLC0415
+        from flliper.srt.layers.quantization.fp8_utils import (  # noqa: PLC0415
             apply_fp8_linear,
         )
     except Exception as ex:
@@ -570,7 +570,7 @@ def load_kernels(dry_run: bool, block_backend: str = "auto") -> Kernels:
         # checkpoint (fp8.py:1132 `if self.block_quant:` ->
         # self.w8a8_block_fp8_linear). Resolved for the current device, so it
         # must be called after the device is selected.
-        from sglang.srt.layers.quantization import fp8_utils  # noqa: PLC0415
+        from flliper.srt.layers.quantization import fp8_utils  # noqa: PLC0415
 
         if block_backend == "auto":
             block_fp8_linear = fp8_utils.dispatch_w8a8_block_fp8_linear()
@@ -583,7 +583,7 @@ def load_kernels(dry_run: bool, block_backend: str = "auto") -> Kernels:
     return Kernels(
         per_token_quant_int8=per_token_quant_int8,
         int8_scaled_mm=int8_scaled_mm,
-        per_token_quant_fp8=sglang_per_token_quant_fp8,
+        per_token_quant_fp8=flliper_per_token_quant_fp8,
         fp8_scaled_mm=fp8_scaled_mm,
         apply_fp8_linear=apply_fp8_linear,
         block_fp8_linear=block_fp8_linear,
@@ -1175,7 +1175,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for label, obj in (
             ("per_token_quant_int8", kn.per_token_quant_int8),
             ("int8_scaled_mm", kn.int8_scaled_mm),
-            ("sglang_per_token_quant_fp8", kn.per_token_quant_fp8),
+            ("flliper_per_token_quant_fp8", kn.per_token_quant_fp8),
             ("fp8_scaled_mm", kn.fp8_scaled_mm),
             ("apply_fp8_linear", kn.apply_fp8_linear),
             ("w8a8_block_fp8_linear (dispatched)", kn.block_fp8_linear),

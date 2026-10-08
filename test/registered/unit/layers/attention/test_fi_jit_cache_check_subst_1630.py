@@ -5,7 +5,7 @@ substitution kept the first flag of the FILE and deleted every later one."""
 
 import unittest
 
-from sglang.srt.layers.attention import fi_jit_cache_check as J
+from flliper.srt.layers.attention import fi_jit_cache_check as J
 
 G120A = "-gencode=arch=compute_120a,code=sm_120a"
 G120F = "-gencode=arch=compute_120f,code=sm_120f"

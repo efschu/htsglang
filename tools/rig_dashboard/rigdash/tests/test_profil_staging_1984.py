@@ -27,10 +27,10 @@ from rigdash import server as S  # noqa: E402
 
 SCRIPT = os.path.join(os.path.dirname(HERE), "deploy", "stage_profil_modules.sh")
 REQUIRED = [
-    "weg2/profile_json.py", "weg2/refusals.py", "weg2/profile_catalog.py", "weg2/profile_catalog_curated.py", "weg2/model_profile.py",
-    "weg2/card_identity.py", "weg2/topology.py", "rigmon/hardware_profile.py", "planner/profile_couplings.py", "planner/expert_residency.py",
+    "pdflip/profile_json.py", "pdflip/refusals.py", "pdflip/profile_catalog.py", "pdflip/profile_catalog_curated.py", "pdflip/model_profile.py",
+    "pdflip/card_identity.py", "pdflip/topology.py", "rigmon/hardware_profile.py", "planner/profile_couplings.py", "planner/expert_residency.py",
     "planner/pp_cut.py"]
-ROOTS = ["python/sglang/__init__.py", "python/sglang/srt/planner/__init__.py", "python/sglang/srt/weg2/__init__.py", "python/sglang/srt/rigmon/__init__.py"]   # srt/ ohne __init__ wie im echten Repo
+ROOTS = ["python/flliper/__init__.py", "python/flliper/srt/planner/__init__.py", "python/flliper/srt/pdflip/__init__.py", "python/flliper/srt/rigmon/__init__.py"]   # srt/ ohne __init__ wie im echten Repo
 
 
 def git(repo, *args):
@@ -53,18 +53,18 @@ class Staging(unittest.TestCase):
         self.root = os.path.join(self.tmp, "stage")
         os.makedirs(self.repo)
         git(self.repo, "init", "-q")
-        write(self.repo, "python/sglang/srt/other.py")           # Dashboard-Linie: kein Editor-Modul
+        write(self.repo, "python/flliper/srt/other.py")           # Dashboard-Linie: kein Editor-Modul
         for r in ROOTS:
             write(self.repo, r, "")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "dash")
         self.dash = git(self.repo, "rev-parse", "--short=10", "HEAD")
         for f in REQUIRED:
-            write(self.repo, "python/sglang/srt/" + f, "# %s\n" % f)
+            write(self.repo, "python/flliper/srt/" + f, "# %s\n" % f)
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "py")
         self.py1 = git(self.repo, "rev-parse", "--short=10", "HEAD")
-        write(self.repo, "python/sglang/srt/weg2/model_profile.py", "# neu\n")
+        write(self.repo, "python/flliper/srt/pdflip/model_profile.py", "# neu\n")
         git(self.repo, "commit", "-q", "-am", "py2")
         self.py2 = git(self.repo, "rev-parse", "--short=10", "HEAD")
 
@@ -89,7 +89,7 @@ class Staging(unittest.TestCase):
     def test_dry_run_names_the_actions(self):
         r = self.run_script("--dry-run", self.py1)
         self.assertIn("DRY-RUN", r.stdout)
-        self.assertIn("git -C %s archive %s python/sglang" % (self.repo, self.py1), r.stdout)
+        self.assertIn("git -C %s archive %s python/flliper" % (self.repo, self.py1), r.stdout)
         self.assertIn("ln -sfn releases/%s" % self.py1, r.stdout)
         self.assertFalse(os.path.exists(self.root))
 
@@ -98,7 +98,7 @@ class Staging(unittest.TestCase):
             r = self.run_script(mode, self.dash)
             self.assertEqual(r.returncode, 3, (mode, r.stdout, r.stderr))
             for f in REQUIRED:
-                self.assertIn("python/sglang/srt/" + f, r.stderr, f)
+                self.assertIn("python/flliper/srt/" + f, r.stderr, f)
             self.assertIn("keine Python-Release-Revision", r.stderr)
             self.assertFalse(os.path.exists(self.root), "auch die Verweigerung schreibt nichts (%s)" % mode)
 
@@ -114,8 +114,8 @@ class Staging(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         base = os.path.join(self.root, "profil", "releases", self.py1)
         for f in REQUIRED:
-            self.assertTrue(os.path.isfile(os.path.join(base, "python", "sglang", "srt", f)), f)
-        self.assertTrue(os.path.isfile(os.path.join(base, "python", "sglang", "srt", "other.py")))   # der VOLLE Baum
+            self.assertTrue(os.path.isfile(os.path.join(base, "python", "flliper", "srt", f)), f)
+        self.assertTrue(os.path.isfile(os.path.join(base, "python", "flliper", "srt", "other.py")))   # der VOLLE Baum
         self.assertEqual(open(os.path.join(base, "REV")).read().strip(), self.py1)
         self.assertEqual(os.readlink(os.path.join(self.root, "profil", "current")), "releases/%s" % self.py1)
         self.assertFalse([n for n in os.listdir(os.path.join(self.root, "profil")) if n.startswith(".stage")])
@@ -139,8 +139,8 @@ class Staging(unittest.TestCase):
         rel = os.path.join(self.root, "profil", "releases")
         self.assertEqual(sorted(os.listdir(rel)), sorted([self.py1, self.py2]))
         self.assertEqual(os.readlink(os.path.join(self.root, "profil", "current")), "releases/%s" % self.py2)
-        self.assertEqual(open(os.path.join(rel, self.py2, "python/sglang/srt/weg2/model_profile.py")).read(), "# neu\n")
-        self.assertEqual(open(os.path.join(rel, self.py1, "python/sglang/srt/weg2/model_profile.py")).read(), "# weg2/model_profile.py\n")
+        self.assertEqual(open(os.path.join(rel, self.py2, "python/flliper/srt/pdflip/model_profile.py")).read(), "# neu\n")
+        self.assertEqual(open(os.path.join(rel, self.py1, "python/flliper/srt/pdflip/model_profile.py")).read(), "# pdflip/model_profile.py\n")
         back = self.run_script("--apply", self.py1)               # zurueck: nur der Zeiger, nichts neu ausgepackt
         self.assertNotIn("gestagt:", back.stdout)
         self.assertEqual(os.readlink(os.path.join(self.root, "profil", "current")), "releases/%s" % self.py1)
@@ -177,8 +177,8 @@ class ProfilTreeFlag(unittest.TestCase):
     def test_the_app_hands_one_tree_to_editor_model_hardware_and_worker(self):
         with tempfile.TemporaryDirectory() as d:
             tree = os.path.join(d, "python")
-            for rel in ("sglang/srt/weg2/profile_json.py", "sglang/srt/weg2/refusals.py", "sglang/srt/weg2/model_profile.py",
-                        "sglang/srt/rigmon/hardware_profile.py"):
+            for rel in ("flliper/srt/pdflip/profile_json.py", "flliper/srt/pdflip/refusals.py", "flliper/srt/pdflip/model_profile.py",
+                        "flliper/srt/rigmon/hardware_profile.py"):
                 write(tree, rel)
             ns = argparse.Namespace(log_glob=[], docker_ssh="", docker_host_prefix="", front=[], gpuq="", state_dir="", release_profile=[],
                                     image_changes=os.path.join(d, "ic.json"), features=os.path.join(d, "f.json"), features_repo=d,
@@ -192,9 +192,9 @@ class ProfilTreeFlag(unittest.TestCase):
     def test_hw_tree_overrides_only_the_hardware_profile(self):
         with tempfile.TemporaryDirectory() as d:
             tree, hw = os.path.join(d, "python"), os.path.join(d, "hw")
-            for rel in ("sglang/srt/weg2/profile_json.py", "sglang/srt/weg2/refusals.py"):
+            for rel in ("flliper/srt/pdflip/profile_json.py", "flliper/srt/pdflip/refusals.py"):
                 write(tree, rel)
-            write(hw, "sglang/srt/rigmon/hardware_profile.py")
+            write(hw, "flliper/srt/rigmon/hardware_profile.py")
             ns = argparse.Namespace(log_glob=[], docker_ssh="", docker_host_prefix="", front=[], gpuq="", state_dir="", release_profile=[],
                                     image_changes=os.path.join(d, "ic.json"), features=os.path.join(d, "f.json"), features_repo=d,
                                     edition="rig", profil_tree=tree, hw_tree=hw)

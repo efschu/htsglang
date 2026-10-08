@@ -5,7 +5,7 @@ rc12z15 D log: ``#249 BYTELESS-GROW pool=MHATokenToKVPoolHost rows 353600 ->
 373504`` at the wake that read six held prompts (63360 + 17536 + 105664 +
 17664 + 63488 + 105792 = 373504), the QSA host pool stayed at its assembly
 size (``V4 paged pool 'qsa_indexer' (layers=12, pages=5525)`` = 353600 ids),
-and the load of weg2-0-4's tail died in ``transfer_kv_direct``:
+and the load of pdflip-0-4's tail died in ``transfer_kv_direct``:
 ``output with shape [1, 4096] doesn't match the broadcast shape [0, 4096]``
 -- the host slice of page >= 5525 is empty.
 
@@ -17,12 +17,12 @@ over contiguous runs), which reproduces the metal message on CPU."""
 import pytest
 import torch
 
-import sglang.srt.mem_cache.memory_pool_host as mph
-import sglang.srt.rank_role as rank_role
-from sglang.srt.mem_cache.qsa_pool_host import QSAPagedHostPool
-from sglang.test.ci.ci_register import register_cpu_ci
+import flliper.srt.mem_cache.memory_pool_host as mph
+import flliper.srt.rank_role as rank_role
+from flliper.srt.mem_cache.qsa_pool_host import QSAPagedHostPool
+from flliper.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="stage-a-weg2-unit")
+register_cpu_ci(est_time=3, suite="stage-a-pdflip-unit")
 
 RATIO, PAGE, HEADS, DIM = 4, 64, 1, 128
 HOST_PAGES = 4  # the assembly size of the sidecar (rc12z15: 5525)
@@ -133,7 +133,7 @@ def test_h106b_one_line_per_transfer_and_direction(pool, monkeypatch, caplog):
     dev, host = pool
     monkeypatch.setattr(rank_role, "this_rank_is_form_a_worker", lambda: True)
     monkeypatch.setattr(QSAPagedHostPool, "_h106_open", None)
-    caplog.set_level(logging.WARNING, logger="sglang.srt.mem_cache.qsa_pool_host")
+    caplog.set_level(logging.WARNING, logger="flliper.srt.mem_cache.qsa_pool_host")
     _load(host, dev, [HOST_PAGES, HOST_PAGES + 1], [5, 6])  # one transfer, layer_num calls
     lines = _skip_lines(caplog)
     assert len(lines) == 1, lines
@@ -155,7 +155,7 @@ def test_h106b_periodic_counter_line(pool, monkeypatch, caplog):
     monkeypatch.setattr(QSAPagedHostPool, "_h106_open", None)
     monkeypatch.setattr(QSAPagedHostPool, "_h106_suppressed", 0)
     monkeypatch.setattr(QSAPagedHostPool, "H106_PERIODIC", 3)
-    caplog.set_level(logging.WARNING, logger="sglang.srt.mem_cache.qsa_pool_host")
+    caplog.set_level(logging.WARNING, logger="flliper.srt.mem_cache.qsa_pool_host")
     for _ in range(4):
         host.load_to_device_per_layer(dev, _ids([HOST_PAGES]), _ids([5]), 0, "direct")
     lines = _skip_lines(caplog)
@@ -177,7 +177,7 @@ def test_h106b_two_pools_with_the_same_ids_are_two_transfers(pool, monkeypatch, 
     other.pool_name = "qsa_other"
     monkeypatch.setattr(rank_role, "this_rank_is_form_a_worker", lambda: True)
     monkeypatch.setattr(QSAPagedHostPool, "_h106_open", None)
-    caplog.set_level(logging.WARNING, logger="sglang.srt.mem_cache.qsa_pool_host")
+    caplog.set_level(logging.WARNING, logger="flliper.srt.mem_cache.qsa_pool_host")
     host.load_to_device_per_layer(dev, _ids([HOST_PAGES]), _ids([5]), 0, "direct")
     other.load_to_device_per_layer(dev, _ids([HOST_PAGES]), _ids([5]), 0, "direct")
     lines = _skip_lines(caplog)
@@ -206,7 +206,7 @@ def test_h106b_a_backup_in_another_thread_does_not_rename_a_load(pool, monkeypat
 
     monkeypatch.setattr(rank_role, "this_rank_is_form_a_worker", _worker)
     monkeypatch.setattr(QSAPagedHostPool, "_h106_open", None)
-    caplog.set_level(logging.WARNING, logger="sglang.srt.mem_cache.qsa_pool_host")
+    caplog.set_level(logging.WARNING, logger="flliper.srt.mem_cache.qsa_pool_host")
     host.load_to_device_per_layer(dev, _ids([HOST_PAGES]), _ids([5]), 0, "direct")
     lines = _skip_lines(caplog)
     import re

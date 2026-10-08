@@ -39,8 +39,8 @@ import types
 import pytest
 import torch
 
-from sglang.srt.distributed import tp_ar_pipeline as tap
-from sglang.srt.environ import envs
+from flliper.srt.distributed import tp_ar_pipeline as tap
+from flliper.srt.environ import envs
 
 WORLD = 3
 TOKENS = 40
@@ -433,13 +433,13 @@ def test_degenerate_fit_is_reported_unusable_rather_than_guessed():
 
 
 def test_disabled_by_default():
-    envs.SGLANG_TP_AR_PIPELINE.clear()
+    envs.FLLIPER_TP_AR_PIPELINE.clear()
     tap.reset_tp_ar_pipeline_state()
     assert tap.tp_ar_pipeline_enabled() is False
 
 
 def test_flag_turns_it_on_and_is_cached():
-    with envs.SGLANG_TP_AR_PIPELINE.override(True):
+    with envs.FLLIPER_TP_AR_PIPELINE.override(True):
         tap.reset_tp_ar_pipeline_state()
         assert tap.tp_ar_pipeline_enabled() is True
     # Cached for the process lifetime on purpose: the flag is part of the
@@ -450,15 +450,15 @@ def test_flag_turns_it_on_and_is_cached():
 
 
 def test_min_token_gate_keeps_short_forwards_unsliced():
-    with envs.SGLANG_TP_AR_PIPELINE_MIN_TOKENS.override(256):
+    with envs.FLLIPER_TP_AR_PIPELINE_MIN_TOKENS.override(256):
         assert tap.plan_num_slices(num_tokens=8, payload_bytes=1 << 20) == 1
 
 
 def test_plan_uses_the_calibration_when_the_gate_opens():
     tap._STATE.calibration = _calibration()
     with (
-        envs.SGLANG_TP_AR_PIPELINE_MIN_TOKENS.override(256),
-        envs.SGLANG_TP_AR_PIPELINE_MAX_SLICES.override(8),
+        envs.FLLIPER_TP_AR_PIPELINE_MIN_TOKENS.override(256),
+        envs.FLLIPER_TP_AR_PIPELINE_MAX_SLICES.override(8),
     ):
         assert tap.plan_num_slices(num_tokens=1916, payload_bytes=16 * 1024 * 1024) > 1
 
@@ -486,8 +486,8 @@ def test_entry_point_calibrates_once_then_slices():
     tap._STATE.calibration = _calibration(latency_us=1.0, compute_ns_per_byte=5.0)
     group2 = _make_group(tokens=1024)
     with (
-        envs.SGLANG_TP_AR_PIPELINE_MIN_TOKENS.override(256),
-        envs.SGLANG_TP_AR_PIPELINE_MAX_SLICES.override(8),
+        envs.FLLIPER_TP_AR_PIPELINE_MIN_TOKENS.override(256),
+        envs.FLLIPER_TP_AR_PIPELINE_MAX_SLICES.override(8),
     ):
         second = tap.pipelined_row_all_reduce(
             group2.inputs[0], group2.apply, group2.all_reduce, out_features=OUT_FEATURES
@@ -531,7 +531,7 @@ def _fake_row_linear(group: FakeTpGroup, reduce_results: bool = True):
 
 @pytest.fixture
 def patched_linear(monkeypatch):
-    from sglang.srt.layers import linear as linear_mod
+    from flliper.srt.layers import linear as linear_mod
 
     monkeypatch.setattr(linear_mod, "get_tp_group", lambda: object())
     monkeypatch.setattr(
@@ -552,7 +552,7 @@ def test_hook_is_inert_when_the_flag_is_off(patched_linear, monkeypatch):
     monkeypatch.setattr(
         patched_linear, "tensor_model_parallel_all_reduce", group.all_reduce
     )
-    envs.SGLANG_TP_AR_PIPELINE.clear()
+    envs.FLLIPER_TP_AR_PIPELINE.clear()
     tap.reset_tp_ar_pipeline_state()
 
     layer = _fake_row_linear(group)
@@ -572,9 +572,9 @@ def test_hook_pipelines_and_stays_bitwise_identical_when_on(
     patched_linear, monkeypatch
 ):
     with (
-        envs.SGLANG_TP_AR_PIPELINE.override(True),
-        envs.SGLANG_TP_AR_PIPELINE_MIN_TOKENS.override(256),
-        envs.SGLANG_TP_AR_PIPELINE_MAX_SLICES.override(8),
+        envs.FLLIPER_TP_AR_PIPELINE.override(True),
+        envs.FLLIPER_TP_AR_PIPELINE_MIN_TOKENS.override(256),
+        envs.FLLIPER_TP_AR_PIPELINE_MAX_SLICES.override(8),
     ):
         tap.reset_tp_ar_pipeline_state()
 
@@ -620,7 +620,7 @@ def test_hook_declines_when_the_layer_does_not_reduce(patched_linear, monkeypatc
         "get_forward",
         lambda: types.SimpleNamespace(fuse_mlp_allreduce=False),
     )
-    with envs.SGLANG_TP_AR_PIPELINE.override(True):
+    with envs.FLLIPER_TP_AR_PIPELINE.override(True):
         tap.reset_tp_ar_pipeline_state()
         layer = _fake_row_linear(group, reduce_results=False)
         output, _ = patched_linear.RowParallelLinear.forward(layer, group.inputs[0])

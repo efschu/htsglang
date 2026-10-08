@@ -2,7 +2,7 @@
 """X-CURVES 1006: build one curve file (model x form x hardware) from a
 ``calib_x_<Boot>.jsonl`` harvest (CPU only).
 
-Thin wrapper of ``python -m sglang.srt.weg2.x_curves_build``:
+Thin wrapper of ``python -m flliper.srt.pdflip.x_curves_build``:
 
     tools/build_x_curves.py calib_x_s9wwu9.jsonl --out nf-int4-h6-abl.xcurves.json \\
         --model <checkpoint dir name> --form arch=moe,experts=...,draft=...,kv=...,flip=... \\
@@ -18,7 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "python"))
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.weg2.x_curves_build import main  # noqa: E402
+from flliper.srt.pdflip.x_curves_build import main  # noqa: E402
 
 if __name__ == "__main__":
     sys.exit(main())

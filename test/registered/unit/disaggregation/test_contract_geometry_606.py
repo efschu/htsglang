@@ -8,8 +8,8 @@ producing a zero that breaks the destination's head layout reconstruction.
 import types
 import unittest
 
-from sglang.srt.disaggregation.nccl.contract import identity_from_args
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.disaggregation.nccl.contract import identity_from_args
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

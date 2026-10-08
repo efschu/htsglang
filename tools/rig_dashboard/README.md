@@ -2,7 +2,7 @@
 
 A lightweight, self-contained live view of the heterogeneous 3-GPU rig
 (2× RTX 3080 20 GB + 1× RTX 5090 32 GB) and the uneven-TP shard plan that
-sglang materializes at boot.
+flliper materializes at boot.
 
 One small Python process + one HTML page. **No CDN, no npm, no build step.**
 Only stdlib + optional `pynvml` (falls back to parsing `nvidia-smi`).
@@ -11,15 +11,15 @@ Only stdlib + optional `pynvml` (falls back to parsing `nvidia-smi`).
 
 ```bash
 python3 tools/rig_dashboard/server.py \
-    --sglang   http://127.0.0.1:30010 \
-    --boot-log /path/to/your/sglang_server.log
+    --flliper   http://127.0.0.1:30010 \
+    --boot-log /path/to/your/flliper_server.log
 ```
 
 Then open <http://127.0.0.1:8770/> . The page auto-refreshes ~1 Hz.
 
 Everything is optional and degrades gracefully:
 
-* no `--sglang` reachable  → dashboard shows NVML + boot-log plan only.
+* no `--flliper` reachable  → dashboard shows NVML + boot-log plan only.
 * no `--boot-log`          → dashboard shows live NVML (+ live server) only.
 * neither                 → dashboard shows live NVML alone (idle cards render
   a near-empty bar, which is correct).
@@ -29,16 +29,16 @@ Everything is optional and degrades gracefully:
 | flag | default | meaning |
 |------|---------|---------|
 | `--host` / `--port` | `127.0.0.1` / `8770` | where to serve the page |
-| `--sglang` | `http://127.0.0.1:30010` | sglang base URL (blank disables scraping) |
-| `--boot-log` | `$RIG_BOOT_LOG` | sglang boot log to parse for the uneven-TP plan |
+| `--flliper` | `http://127.0.0.1:30010` | flliper base URL (blank disables scraping) |
+| `--boot-log` | `$RIG_BOOT_LOG` | flliper boot log to parse for the uneven-TP plan |
 | `--q-heads` / `--kv-heads` / `--gdn-v-heads` / `--gdn-k-heads` / `--vocab-units` | Qwen3.6-27B defaults | model geometry used to *draw* the head/unit split |
 
 ## Data sources
 
 1. **NVML live** (`pynvml`, ~1 s poll): per card VRAM used/total, temperature
    (80 °C mark drawn), utilization, power, PCIe gen/width, name, UUID.
-2. **sglang live** (`/get_server_info` + `/metrics`, robust to server-down):
-   model name, TP/DCP, `max_total_num_tokens`, tok/s (`sglang:gen_throughput`),
+2. **flliper live** (`/get_server_info` + `/metrics`, robust to server-down):
+   model name, TP/DCP, `max_total_num_tokens`, tok/s (`flliper:gen_throughput`),
    running/queued requests, KV used tokens + token usage, spec accept length,
    cache-hit rate.
 3. **Uneven-TP plan** — parsed from the **boot log** (`plan_parser.py`),
@@ -85,7 +85,7 @@ Dark and light themes (follows OS; toggle button in the header).
 ## Note on physical-index correlation
 
 The server's boot-time GPU enumeration and the live NVML order can diverge
-(observed live: sglang's GPU 0 was the RTX 5090, while system NVML had it at
+(observed live: flliper's GPU 0 was the RTX 5090, while system NVML had it at
 index 1). The dashboard therefore maps boot-log GPU indices onto live NVML
 cards (`map_plan_gpus_to_nvml`): first by unique card name from the
 auto-performance block, then by per-rank memory-budget best-fit (a 29607 MiB
@@ -117,7 +117,7 @@ python3 tools/rig_dashboard/test_plan_parser.py     # 10 tests vs real boot logs
 The parser is validated against real M38 boot logs (AWQ / FP8 full plans,
 GGUF pinned-partial, and an early minimal boot) including the subtle case where
 the DCP log line contains both a restart *recommendation*
-(`SGLANG_UNEVEN_TOKEN_VECTOR=…`) and the *active* materialized vector — the
+(`FLLIPER_UNEVEN_TOKEN_VECTOR=…`) and the *active* materialized vector — the
 parser must take the active one.
 
 ## Profile editor (order 930, S1)
@@ -130,9 +130,9 @@ reset button and dependency chips, see the dry run against selected cards (refus
 
 * The dashboard only **creates** a profile and starts nothing; it has no force switch. On the server: `FLLIPER_PROFILE=<name>` and if needed
   `FLLIPER_FORCE=1` (launcher `--force`). Entrypoint patch staged: `/spinning/gpu-arb/docker/entrypoint.sh.profil-force-staged` (+ `.diff`).
-* The calculation lives in the planner tree (stdlib, loaded by file path): `weg2/profile_json.py`, `weg2/refusals.py`; explanations from
-  `rigdash/profil_data/catalog.json` (regenerate: `python -m sglang.srt.weg2.profile_catalog --rev <sha> -o rigdash/profil_data/catalog.json`).
+* The calculation lives in the planner tree (stdlib, loaded by file path): `pdflip/profile_json.py`, `pdflip/refusals.py`; explanations from
+  `rigdash/profil_data/catalog.json` (regenerate: `python -m flliper.srt.pdflip.profile_catalog --rev <sha> -o rigdash/profil_data/catalog.json`).
 * View simple (the most important values) / expert (all, search, filter changed / with planner value / unexplained).
 * `.env` stays the authoritative source until the round-trip golden over all release profiles is permanently green
-  (`python -m sglang.srt.weg2.profile_json check /spinning/gpu-arb/docker/profiles_release`).
+  (`python -m flliper.srt.pdflip.profile_json check /spinning/gpu-arb/docker/profiles_release`).
 * Deploy (lead): `deploy/install_510.sh --check <sha>`, then `deploy/install_510.sh <sha>` (also stages the planner modules of the editor).

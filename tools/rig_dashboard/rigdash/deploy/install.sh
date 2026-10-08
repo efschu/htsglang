@@ -4,7 +4,7 @@
 #
 # Neither service runs from a checkout: `git archive` writes the code into
 # /opt/rigdash/releases/<sha> (rigdash) and /opt/rigdash/planner/releases/<tree>
-# (python/sglang, keyed by its tree hash so an unchanged planner is not
+# (python/flliper, keyed by its tree hash so an unchanged planner is not
 # re-extracted), `current` is switched atomically, the units are restarted.
 # Rolling back = RIGDASH_DEPLOY_ROLLBACK=1 install.sh <older-sha>.
 #
@@ -55,13 +55,13 @@ if [ ! -d "$dst/rigdash" ]; then
 fi
 ln -sfn "releases/$sha" /opt/rigdash/current.new && mv -T /opt/rigdash/current.new /opt/rigdash/current
 
-# --- planner (python/sglang) ----------------------------------------------
-tree=$(git -C "$repo" rev-parse --short=10 "$sha:python/sglang")
+# --- planner (python/flliper) ----------------------------------------------
+tree=$(git -C "$repo" rev-parse --short=10 "$sha:python/flliper")
 pdst=/opt/rigdash/planner/releases/$tree
-if [ ! -d "$pdst/python/sglang" ]; then
+if [ ! -d "$pdst/python/flliper" ]; then
   tmp=$(mktemp -d /opt/rigdash/planner/.stage.XXXXXX)
-  git -C "$repo" archive "$sha" python/sglang | tar -x -C "$tmp"
-  echo "$sha" > "$tmp/python/sglang/srt/planner/DEPLOYED_FROM"
+  git -C "$repo" archive "$sha" python/flliper | tar -x -C "$tmp"
+  echo "$sha" > "$tmp/python/flliper/srt/planner/DEPLOYED_FROM"
   mv "$tmp" "$pdst"
 fi
 ln -sfn "releases/$tree" /opt/rigdash/planner/current.new && mv -T /opt/rigdash/planner/current.new /opt/rigdash/planner/current
@@ -69,10 +69,10 @@ ln -sfn "releases/$tree" /opt/rigdash/planner/current.new && mv -T /opt/rigdash/
 # Seed the planner's own state dir ONCE with the rig's existing profiles
 # (copied, read from /root/.cache; nothing is ever written back there).
 state=/var/lib/rig-planner
-mkdir -p "$state/.cache/sglang" "$state/.cache/htsglang-planner"
-for src in /root/.cache/sglang/{power_profile.json,split_probe.jsonl,card_library.json,card_library.json.by-uuid.json,barlink_matrix.json,graph_mem_anchors.json,mlp_crossover.json} \
-           /root/.cache/sglang/card_probe-*.json /root/.cache/sglang/hw_profile-*.json; do
-  dstf=$state/.cache/sglang/$(basename "$src")
+mkdir -p "$state/.cache/flliper" "$state/.cache/htsglang-planner"
+for src in /root/.cache/flliper/{power_profile.json,split_probe.jsonl,card_library.json,card_library.json.by-uuid.json,barlink_matrix.json,graph_mem_anchors.json,mlp_crossover.json} \
+           /root/.cache/flliper/card_probe-*.json /root/.cache/flliper/hw_profile-*.json; do
+  dstf=$state/.cache/flliper/$(basename "$src")
   if [ -f "$src" ] && [ ! -e "$dstf" ]; then cp -p "$src" "$dstf"; fi
 done
 if [ -d /root/.cache/htsglang-planner/bench_runs ] && [ ! -e "$state/.cache/htsglang-planner/bench_runs" ]; then

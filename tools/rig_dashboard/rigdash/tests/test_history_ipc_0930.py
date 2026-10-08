@@ -16,7 +16,7 @@ from rigdash import history  # noqa: E402
 
 
 def rs(g, t, ts, pnew=0, pcached=0, dtok=0, rounds=0, dgpu=0.0, running=None, kv=None):
-    return {"schema": "weg2.rankstats/1", "group": g, "ts": ts,
+    return {"schema": "pdflip.rankstats/1", "group": g, "ts": ts,
             "prefill": {"new_tokens": pnew, "cached_tokens": pcached},
             "decode": {"tokens": dtok, "rounds": rounds, "gpu_ms": dgpu, "running": running},
             "tokens": {"prefill_total": pnew, "decode_total": dtok},
@@ -68,14 +68,14 @@ class TestRecorderIpc(unittest.TestCase):
             d = os.path.join(root, "nfx-boot-20260930T153426Z-051f")
             os.makedirs(d)
             with open(os.path.join(d, "state.json"), "w") as fh:
-                json.dump({"schema": "weg2.state/1", "boot_id": os.path.basename(d), "kind": "boot", "tag": "nfx",
+                json.dump({"schema": "pdflip.state/1", "boot_id": os.path.basename(d), "kind": "boot", "tag": "nfx",
                            "lifecycle": {"state": "serving"}, "front": {"awake": "D"}}, fh)
             with open(os.path.join(d, "events.jsonl"), "w") as fh:
                 for typ, data in (("flip_done", dict(sim.FLIP_DONE[0], flip_begin_ts=T0 + 26.0, t=T0 + 28.0)),
                                   ("flip_first_work", dict(sim.FIRST_WORK[0], flip_begin_ts=T0 + 26.0)),
                                   ("flip_first_work", {"dir": "D>P", "flip_begin_ts": T0 + 50.0, "what": "none",
                                                        "flip_time_ms": 900, "flip_total_ms": 900})):
-                    fh.write(json.dumps({"schema": "weg2.event/1", "type": typ, "ts": T0 + 28.0, "data": data}) + "\n")
+                    fh.write(json.dumps({"schema": "pdflip.event/1", "type": typ, "ts": T0 + 28.0, "data": data}) + "\n")
             ib = ipcboot.IpcBoots(roots=(root,))
             ib.poll(T0 + 0.5)
             ring = sim.ring_until(60.0)
@@ -138,7 +138,7 @@ class TestNoLogInHistory(unittest.TestCase):
             d = os.path.join(root, "nfx-boot-20260930T153426Z-051f")
             os.makedirs(os.path.join(d, "rankstate", "P"))
             with real(os.path.join(d, "state.json"), "w") as fh:
-                json.dump({"schema": "weg2.state/1", "boot_id": os.path.basename(d), "kind": "boot",
+                json.dump({"schema": "pdflip.state/1", "boot_id": os.path.basename(d), "kind": "boot",
                            "lifecycle": {"state": "serving"}}, fh)
             for g in ("P", "D", "front"):          # logs lying next to it must stay unopened
                 real(os.path.join(tmp, "x.%s.log" % g), "w").close()

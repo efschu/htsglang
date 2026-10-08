@@ -32,8 +32,8 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -97,16 +97,16 @@ def _run(stub):
         return types.SimpleNamespace()
 
     with mock.patch(
-        "sglang.srt.server_args.get_device_memory_capacity", return_value=GPU_MEM
+        "flliper.srt.server_args.get_device_memory_capacity", return_value=GPU_MEM
     ), mock.patch(
-        "sglang.srt.server_args._resolve_rank_gpu_cards", return_value={0: card}
+        "flliper.srt.server_args._resolve_rank_gpu_cards", return_value={0: card}
     ), mock.patch(
-        "sglang.srt.mem_ledger.engine.DemandInputs.from_server_args",
+        "flliper.srt.mem_ledger.engine.DemandInputs.from_server_args",
         side_effect=fake_from_server_args,
     ), mock.patch(
-        "sglang.srt.mem_ledger.engine.build_card_ledgers", return_value=[]
+        "flliper.srt.mem_ledger.engine.build_card_ledgers", return_value=[]
     ), mock.patch(
-        "sglang.srt.mem_ledger.calibration.load_calibration", return_value=None
+        "flliper.srt.mem_ledger.calibration.load_calibration", return_value=None
     ):
         return stub._build_card_ledgers()
 

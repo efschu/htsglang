@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from sgl_kernel import concat_mla_k as concat_mla_k_cuda
 
-from sglang.benchmark.bench_utils import run_bench
+from flliper.benchmark.bench_utils import run_bench
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 

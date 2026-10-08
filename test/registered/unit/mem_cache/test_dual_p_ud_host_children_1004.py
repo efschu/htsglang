@@ -16,7 +16,7 @@ what the V1 extension does (dual P only): the leaf and its host-only subtree go,
 books stay sane.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -26,24 +26,24 @@ from array import array
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.weg2 import pp_slot_fidelity as SF
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.pdflip import pp_slot_fidelity as SF
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
 FULL, MAMBA = ComponentType.FULL, ComponentType.MAMBA
 PAGE = 1
 DUAL_ENV = {
-    "SGLANG_WEG2_DUAL_LAYOUT": "1",
-    "SGLANG_WEG2_GROUP": "P",
-    "SGLANG_WEG2_DUAL_P_KV_MAX_TOKENS": "32768",
+    "FLLIPER_PDFLIP_DUAL_LAYOUT": "1",
+    "FLLIPER_PDFLIP_GROUP": "P",
+    "FLLIPER_PDFLIP_DUAL_P_KV_MAX_TOKENS": "32768",
 }
-_KEYS = tuple(DUAL_ENV) + (SF.ENV, "SGLANG_WEG2_DUAL_UD_HOST_CHILDREN", "SGLANG_EVICT_FRONTIER_REPAIR")
+_KEYS = tuple(DUAL_ENV) + (SF.ENV, "FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN", "FLLIPER_EVICT_FRONTIER_REPAIR")
 
 
 class _WriteBackController:
@@ -172,7 +172,7 @@ class DualPUdHostChildren(CustomTestCase):
 
     def test_switch_zero_is_the_old_behaviour(self):
         def edit():
-            os.environ["SGLANG_WEG2_DUAL_UD_HOST_CHILDREN"] = "0"
+            os.environ["FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN"] = "0"
         self._assert_old_behaviour(*self._evicted_with_env(edit))
 
     def test_flip_nf_int8_form_is_unchanged(self):
@@ -184,12 +184,12 @@ class DualPUdHostChildren(CustomTestCase):
 
     def test_dual_d_and_uncapped_p_are_unchanged(self):
         def edit_d():
-            os.environ["SGLANG_WEG2_GROUP"] = "D"
+            os.environ["FLLIPER_PDFLIP_GROUP"] = "D"
         self._assert_old_behaviour(*self._evicted_with_env(edit_d))
 
         def edit_nocap():
-            os.environ["SGLANG_WEG2_GROUP"] = "P"
-            os.environ.pop("SGLANG_WEG2_DUAL_P_KV_MAX_TOKENS", None)
+            os.environ["FLLIPER_PDFLIP_GROUP"] = "P"
+            os.environ.pop("FLLIPER_PDFLIP_DUAL_P_KV_MAX_TOKENS", None)
         self._assert_old_behaviour(*self._evicted_with_env(edit_nocap))
 
     def test_not_the_local_pp_floor_is_unchanged(self):
@@ -278,7 +278,7 @@ class DualPUdHostChildren(CustomTestCase):
         """#1427: a direct write's mamba rows in flight (leaf or descendant) are never taken."""
         for key in (13, 5):
             cache, alloc, n = _tree()
-            cache._weg2_direct_mamba_rows = {n[key].id: object()}
+            cache._pdflip_direct_mamba_rows = {n[key].id: object()}
             self.assertIsNone(SF.unbacked_drop_subtree(cache, n[5]), key)
 
     def test_a_host_backed_end_anchor_yields_unless_a_told_names_it(self):
@@ -296,25 +296,25 @@ class DualPUdHostChildren(CustomTestCase):
 
         for key, depth in ((13, 16), (5, 8)):
             cache, alloc, n = _tree()
-            n[key]._weg2_end_anchor = True
+            n[key]._pdflip_end_anchor = True
             n[key].component_data[MAMBA].host_value = torch.tensor([555], dtype=torch.int64)
             self.assertIsNotNone(SF.unbacked_drop_subtree(cache, n[5]), key)
-            cache._weg2_told_hold = _Told(depth)                         # a standing told at its END depth
+            cache._pdflip_told_hold = _Told(depth)                         # a standing told at its END depth
             self.assertIsNone(SF.unbacked_drop_subtree(cache, n[5]), key)
         cache, alloc, n = _tree()
-        n[13]._weg2_end_anchor = True                                    # no mamba host value
+        n[13]._pdflip_end_anchor = True                                    # no mamba host value
         self.assertIsNotNone(SF.unbacked_drop_subtree(cache, n[5]))
 
     # ---- review A2: PP0-only mode ----
 
     def test_pp0_mode_drops_on_pp0_only(self):
         cache, alloc, n = _tree()
-        os.environ["SGLANG_WEG2_DUAL_UD_HOST_CHILDREN"] = "pp0"
+        os.environ["FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN"] = "pp0"
         cache.pp_rank = 1
         self.assertIsNone(SF.unbacked_drop_subtree(cache, n[5]))
         self._assert_old_behaviour(cache, n, cache.evict(EvictParams(num_tokens=8)))
         cache, alloc, n = _tree()
-        os.environ["SGLANG_WEG2_DUAL_UD_HOST_CHILDREN"] = "pp0"
+        os.environ["FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN"] = "pp0"
         cache.pp_rank = 0
         self.assertIsNotNone(SF.unbacked_drop_subtree(cache, n[5]))
         self.assertEqual(cache.evict(EvictParams(num_tokens=8)).num_tokens_evicted, 8)
@@ -323,9 +323,9 @@ class DualPUdHostChildren(CustomTestCase):
 
     def test_the_log_names_rank_and_end_anchors(self):
         cache, alloc, n = _tree()
-        n[13]._weg2_end_anchor = True                                    # flagged, nothing to hold
+        n[13]._pdflip_end_anchor = True                                    # flagged, nothing to hold
         cache.pp_rank = 2
-        with self.assertLogs("sglang.srt.weg2.pp_slot_fidelity", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.pdflip.pp_slot_fidelity", level="WARNING") as cm:
             cache.evict(EvictParams(num_tokens=4))
         line = next(m for m in cm.output if "EVICT-UNBACKED-DROP SUBTREE" in m)
         self.assertIn("end_anchors=1", line)
@@ -364,7 +364,7 @@ class DualPUdHostChildren(CustomTestCase):
         """M15: with the EF retry (FullComponent.drive_eviction) off, the plain eviction still pays
         the leaf -- the hook is what delivers, not the retry that would rescue a missing one."""
         cache, alloc, n = _tree()
-        os.environ["SGLANG_EVICT_FRONTIER_REPAIR"] = "0"
+        os.environ["FLLIPER_EVICT_FRONTIER_REPAIR"] = "0"
         res = cache.evict(EvictParams(num_tokens=8))
         self.assertEqual(res.num_tokens_evicted, 8)
         self.assertEqual(len(cache.root_node.children), 0)

@@ -1,7 +1,7 @@
 import unittest
 
-from sglang import OpenAI, set_default_backend
-from sglang.test.test_programs import (
+from flliper import OpenAI, set_default_backend
+from flliper.test.test_programs import (
     test_chat_completion_speculative,
     test_completion_speculative,
     test_decode_int,
@@ -17,7 +17,7 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestOpenAIBackend(CustomTestCase):

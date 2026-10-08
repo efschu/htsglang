@@ -54,7 +54,7 @@ import importlib
 import pytest
 
 
-RETIRED_MODULE = "sglang.srt.managers.phase_flip_resident_carry"
+RETIRED_MODULE = "flliper.srt.managers.phase_flip_resident_carry"
 
 
 def test_the_resident_carry_module_stays_deleted():
@@ -93,7 +93,7 @@ def test_the_kind_blind_drain_stays_gone_from_the_mixin():
     The live contract is the successor's, and it is asserted here too so this
     test cannot pass by the whole family having disappeared.
     """
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     assert not hasattr(SchedulerPPMixin, "pp_flip_drain_tensor_dicts"), (
         "the kind-blind drain is back; see HANDOFF_656.md:1348 before using it"
@@ -121,7 +121,7 @@ def test_the_arming_ceiling_stays_retired():
     arming module.
     """
     bootstrap = importlib.import_module(
-        "sglang.srt.managers.phase_flip_draft_bootstrap"
+        "flliper.srt.managers.phase_flip_draft_bootstrap"
     )
     assert not hasattr(bootstrap, "IN_FLIGHT_CHUNKED_ALLOWANCE"), (
         "the in-flight-chunked allowance is back on the arming leg; "

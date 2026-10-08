@@ -36,8 +36,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -51,10 +51,10 @@ _WORKER = textwrap.dedent(
 
     import torch
 
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    from flliper.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update as recurrent,
     )
-    from sglang.srt.layers.attention.fla.gdn_replayssm_spec_decode import (
+    from flliper.srt.layers.attention.fla.gdn_replayssm_spec_decode import (
         commit_gdn_replayssm_circular,
         commit_gdn_replayssm_spec,
         gdn_replayssm_spec_decode,
@@ -272,7 +272,7 @@ class TestReplaySSMMatchesRecurrentVerify(CustomTestCase):
 
 class TestRingBytesPerReq(CustomTestCase):
     def test_27b_rank_row_price(self):
-        from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+        from flliper.srt.configs.mamba_utils import BaseLinearStateParams
 
         # 27B D rank with HV_local 18 / H_local 6, head dims 128, 48 GDN layers
         fake = SimpleNamespace(

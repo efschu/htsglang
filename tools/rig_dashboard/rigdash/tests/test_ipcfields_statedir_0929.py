@@ -2,7 +2,7 @@
 
 Host 29.09. ~20:00Z: /spinning/docker-acceptance/{27b,nf}/state/current/rankstate/{P,D}/ held the
 RankState files of both lines (host_acceptance_v2.sh mounts the state dir, the launcher names
-SGLANG_WEG2_RANK_STATE_DIR=/var/lib/htsglang/state/rankstate/<G>), while live.py looked only for
+FLLIPER_PDFLIP_RANK_STATE_DIR=/var/lib/htsglang/state/rankstate/<G>), while live.py looked only for
 ``<log>.rankstate`` next to the group logs -- so KV/seats stayed "aus Log (Übergang)".
 """
 

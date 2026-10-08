@@ -21,7 +21,7 @@
 #
 # Site-specific paths and addresses come from the environment (MASTER_ADDR,
 # MODEL_ROOT, VENV, REPO_ROOT on the main side; RIG2_MODEL_DIR, RIG2_VENV,
-# RIG2_SGLANG_SRC, RIG2_ROCM_VENV, RIG2_TRITON_PATH on the second side).
+# RIG2_FLLIPER_SRC, RIG2_ROCM_VENV, RIG2_TRITON_PATH on the second side).
 # Source your local rig env file first; unset variables fall back to
 # placeholders so the rank fails on a visibly bogus path instead of picking up
 # somebody else's tree.
@@ -52,10 +52,10 @@ MAXTOK=${MAXTOK:-$CTX}
 MAXTOK_FLAG=""
 [ "$MAXTOK" != "0" ] && MAXTOK_FLAG="--max-total-tokens $MAXTOK"
 
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export TORCHDYNAMO_DISABLE=1
-export SGLANG_BARLINK=1
-export SGLANG_BARLINK_TRANSPORT=${TRANSPORT:-gloo}
+export FLLIPER_BARLINK=1
+export FLLIPER_BARLINK_TRANSPORT=${TRANSPORT:-gloo}
 export MAX_JOBS=4
 # The shm message-queue broadcaster is a NODE-LOCAL shared-memory optimisation.
 # Across two hosts its handle is broadcast with dist.broadcast_object_list and
@@ -63,7 +63,7 @@ export MAX_JOBS=4
 # builds), so create_from_handle dies with
 #   AttributeError: 'str' object has no attribute 'local_reader_ranks'
 # Measured on the second L0 attempt. Shared memory cannot span hosts anyway.
-export SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0
+export FLLIPER_USE_MESSAGE_QUEUE_BROADCASTER=0
 # Cross-host gloo MUST be told which interface to use. Without this, gloo
 # resolves the local hostname for its advertised endpoint, and on Debian that
 # is 127.0.1.1 (/etc/hosts maps the hostname to loopback). Rank 0 then
@@ -105,15 +105,15 @@ else
        R2_VENV=${RIG2_VENV:-<RIG2_VENV>}
        export CPATH=$R2_VENV/lib/python3.12/site-packages/nvidia/cu13/include:${CPATH:-}
        PY=$R2_VENV/bin/python
-       export PYTHONPATH=${RIG2_SGLANG_SRC:-<RIG2_SGLANG_SRC>} ;;
+       export PYTHONPATH=${RIG2_FLLIPER_SRC:-<RIG2_FLLIPER_SRC>} ;;
     4) export HIP_VISIBLE_DEVICES=0
        export PYTORCH_ROCM_ARCH=gfx900
        R2_ROCM=${RIG2_ROCM_VENV:-<RIG2_ROCM_VENV>}
        export TRITON_HIP_LLD_PATH=$R2_ROCM/lib/python3.12/site-packages/triton/backends/amd/llvm/bin/ld.lld
        PY=$R2_ROCM/bin/python
        # RIG2_TRITON_PATH: the gfx900 triton shim tree, ':'-separated, ahead of
-       # the sglang source on PYTHONPATH.
-       export PYTHONPATH=${RIG2_TRITON_PATH:-<RIG2_TRITON_PATH>}:${RIG2_SGLANG_SRC:-<RIG2_SGLANG_SRC>} ;;
+       # the flliper source on PYTHONPATH.
+       export PYTHONPATH=${RIG2_TRITON_PATH:-<RIG2_TRITON_PATH>}:${RIG2_FLLIPER_SRC:-<RIG2_FLLIPER_SRC>} ;;
     *) echo "rank $RANK is not a second-host rank" >&2; exit 2 ;;
   esac
 fi
@@ -141,7 +141,7 @@ fi
 # --------------------------------------------------------------------------
 # SUPERVISED LAUNCH -- do NOT exec, and do NOT detach the server.
 #
-# This is the guardrail for the container kill of 2026-07-25 20:48:34. sglang
+# This is the guardrail for the container kill of 2026-07-25 20:48:34. flliper
 # signals its PARENT when a scheduler dies (scheduler.py:
 # parent_process.send_signal(SIGQUIT) via os.getppid()). If the server has been
 # orphaned, that parent is PID 1: systemd caught the QUIT, dumped core, and the
@@ -154,18 +154,18 @@ fi
 # reparented to init that is harmless: a bash script's default SIGQUIT action
 # is to die, not to take the container with it.
 #
-# Note SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION does NOT remove the hazard on its
+# Note FLLIPER_KILLPG_ON_SCHEDULER_EXCEPTION does NOT remove the hazard on its
 # own: in scheduler.py the SIGQUIT to the parent is sent BEFORE the optional
 # killpg. It is set below because it stops sibling ranks spewing tracebacks,
 # not because it fixes this.
-export SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION=1
+export FLLIPER_KILLPG_ON_SCHEDULER_EXCEPTION=1
 
 # Tag: every process this run starts carries it in its ENVIRONMENT, so the
 # launcher can find and kill exactly its own ranks. Never pattern-kill on this
 # shared box.
 export L0_RUN_TAG=${L0_RUN_TAG:-l0-standalone-$$}
 
-"$PY" -u -m sglang.launch_server \
+"$PY" -u -m flliper.launch_server \
   --model-path "$MODEL" --dtype float16 \
   --tp-size 5 --nnodes 5 --node-rank "$RANK" --dist-init-addr "$MASTER:$PORT" \
   --rank-tp-ratio "$RATIO" $DCPFLAGS $SPECFLAGS \

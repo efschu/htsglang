@@ -47,7 +47,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from sglang.srt.debug_utils.rank_phase_summary import (
+from flliper.srt.debug_utils.rank_phase_summary import (
     parse_rank_batch_line,
     parse_unsplit_line,
 )
@@ -64,7 +64,7 @@ class ReplayLagTest(unittest.TestCase):
         self.h = Harness()
         self.cap = _Capture()
         self.logger = logging.getLogger(
-            "sglang.srt.managers.scheduler_components.decode_round_log"
+            "flliper.srt.managers.scheduler_components.decode_round_log"
         )
         self.logger.addHandler(self.cap)
         self.logger.setLevel(logging.INFO)

@@ -24,7 +24,7 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators import (
+from flliper.srt.distributed.device_communicators import (
     barlink_matrix_transport as mt,
 )
 
@@ -50,8 +50,8 @@ class WindowClipTest(unittest.TestCase):
 
     def test_default_request_is_reduced_and_recorded(self):
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("SGLANG_BARLINK_BAR1_WINDOW_MIB")
-               and k != "SGLANG_BARLINK_BAR1_RESERVE_MIB"}
+               if not k.startswith("FLLIPER_BARLINK_BAR1_WINDOW_MIB")
+               and k != "FLLIPER_BARLINK_BAR1_RESERVE_MIB"}
         with mock.patch.dict(os.environ, env, clear=True), \
                 self._with_free(56), self._no_ledger():
             got = mt.window_for("dcp:0", device=None)
@@ -68,8 +68,8 @@ class WindowClipTest(unittest.TestCase):
         when nothing was reduced, otherwise the test above would pass on a
         table that simply records everything."""
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("SGLANG_BARLINK_BAR1_WINDOW_MIB")
-               and k != "SGLANG_BARLINK_BAR1_RESERVE_MIB"}
+               if not k.startswith("FLLIPER_BARLINK_BAR1_WINDOW_MIB")
+               and k != "FLLIPER_BARLINK_BAR1_RESERVE_MIB"}
         with mock.patch.dict(os.environ, env, clear=True), \
                 self._with_free(400), self._no_ledger():
             got = mt.window_for("tp:0", device=None)
@@ -81,13 +81,13 @@ class WindowClipTest(unittest.TestCase):
     def test_explicit_per_group_window_refuses_instead_of_shrinking(self):
         with mock.patch.dict(
             os.environ,
-            {"SGLANG_BARLINK_BAR1_WINDOW_MIB_DCP_0": "96"},
+            {"FLLIPER_BARLINK_BAR1_WINDOW_MIB_DCP_0": "96"},
         ), self._with_free(56), self._no_ledger():
             with self.assertRaises(mt.Bar1WindowRefused) as caught:
                 mt.window_for("dcp:0", device=None)
         message = str(caught.exception)
         # The refusal has to carry the arithmetic, or it cannot be acted on.
-        self.assertIn("SGLANG_BARLINK_BAR1_WINDOW_MIB_DCP_0", message)
+        self.assertIn("FLLIPER_BARLINK_BAR1_WINDOW_MIB_DCP_0", message)
         self.assertIn("96 MiB", message)
         self.assertIn("24 MiB", message)
         # And nothing is recorded as "reduced": it did not come up at all.
@@ -95,7 +95,7 @@ class WindowClipTest(unittest.TestCase):
 
     def test_explicit_global_window_also_refuses(self):
         with mock.patch.dict(
-            os.environ, {"SGLANG_BARLINK_BAR1_WINDOW_MIB": "96"},
+            os.environ, {"FLLIPER_BARLINK_BAR1_WINDOW_MIB": "96"},
         ), self._with_free(56), self._no_ledger():
             with self.assertRaises(mt.Bar1WindowRefused):
                 mt.window_for("dcp:0", device=None)
@@ -104,7 +104,7 @@ class WindowClipTest(unittest.TestCase):
         """The gate must be able to NOT fire -- otherwise the two refusal
         tests above would pass against a function that always raises."""
         with mock.patch.dict(
-            os.environ, {"SGLANG_BARLINK_BAR1_WINDOW_MIB_TP_0": "64"},
+            os.environ, {"FLLIPER_BARLINK_BAR1_WINDOW_MIB_TP_0": "64"},
         ), self._with_free(400), self._no_ledger():
             got = mt.window_for("tp:0", device=None)
         self.assertEqual(got, 64 * MiB)
@@ -112,7 +112,7 @@ class WindowClipTest(unittest.TestCase):
     # -- the reduction reaches the place people read -----------------------
 
     def test_state_summary_names_the_reduced_window(self):
-        from sglang.srt.distributed.device_communicators import barlink
+        from flliper.srt.distributed.device_communicators import barlink
 
         barlink._STATE.clear()
         self.addCleanup(barlink._STATE.clear)
@@ -120,7 +120,7 @@ class WindowClipTest(unittest.TestCase):
         # Without a recorded reduction the summary must not mention one.
         self.assertNotIn("REDUCED", barlink.state_summary())
         mt.record_clip("dcp:0", 96 * MiB, 24 * MiB,
-                       "SGLANG_BARLINK_BAR1_WINDOW_MIB", "arithmetic here")
+                       "FLLIPER_BARLINK_BAR1_WINDOW_MIB", "arithmetic here")
         summary = barlink.state_summary()
         self.assertIn("REDUCED", summary)
         self.assertIn("24 MiB granted of 96 MiB requested", summary)
@@ -137,7 +137,7 @@ class WindowClipTest(unittest.TestCase):
         because the two live far apart: the raise is in
         barlink_matrix_transport, the swallow would be in barlink.
         """
-        from sglang.srt.distributed.device_communicators import barlink
+        from flliper.srt.distributed.device_communicators import barlink
 
         self.assertTrue(barlink._no_fallback("bar1"))
         self.assertTrue(barlink._no_fallback("matrix"))
@@ -156,7 +156,7 @@ class WindowClipTest(unittest.TestCase):
     # -- the row names its own denominator ---------------------------------
 
     def test_a_second_clip_for_one_group_is_counted_not_overwritten(self):
-        """weg2 S2 makes the build repeatable, so one row is no longer one
+        """pdflip S2 makes the build repeatable, so one row is no longer one
         clip.
 
         Until ``GroupCoordinator.barlink_reopen()`` a group's window was
@@ -166,8 +166,8 @@ class WindowClipTest(unittest.TestCase):
         whether one build came up short or twelve.
         """
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("SGLANG_BARLINK_BAR1_WINDOW_MIB")
-               and k != "SGLANG_BARLINK_BAR1_RESERVE_MIB"}
+               if not k.startswith("FLLIPER_BARLINK_BAR1_WINDOW_MIB")
+               and k != "FLLIPER_BARLINK_BAR1_RESERVE_MIB"}
         with mock.patch.dict(os.environ, env, clear=True), \
                 self._with_free(56), self._no_ledger():
             mt.window_for("dcp:0", device=None)
@@ -185,24 +185,24 @@ class WindowClipTest(unittest.TestCase):
         self.assertEqual(clips["dcp:0"]["granted_bytes"], 16 * MiB)
 
     def test_state_summary_prints_how_many_builds_were_clipped(self):
-        from sglang.srt.distributed.device_communicators import barlink
+        from flliper.srt.distributed.device_communicators import barlink
 
         barlink._STATE.clear()
         self.addCleanup(barlink._STATE.clear)
         barlink.report_state("dcp:0", "bar1", "bar1")
         mt.record_clip("dcp:0", 96 * MiB, 24 * MiB,
-                       "SGLANG_BARLINK_BAR1_WINDOW_MIB", "arithmetic here")
+                       "FLLIPER_BARLINK_BAR1_WINDOW_MIB", "arithmetic here")
         self.assertIn("1 clipped build", barlink.state_summary())
         mt.record_clip("dcp:0", 96 * MiB, 16 * MiB,
-                       "SGLANG_BARLINK_BAR1_WINDOW_MIB", "arithmetic here")
+                       "FLLIPER_BARLINK_BAR1_WINDOW_MIB", "arithmetic here")
         self.assertIn("2 clipped builds", barlink.state_summary())
 
     # -- the wording that misdirected the incident -------------------------
 
     def test_reduction_warning_does_not_claim_a_silent_gloo_fallback(self):
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("SGLANG_BARLINK_BAR1_WINDOW_MIB")
-               and k != "SGLANG_BARLINK_BAR1_RESERVE_MIB"}
+               if not k.startswith("FLLIPER_BARLINK_BAR1_WINDOW_MIB")
+               and k != "FLLIPER_BARLINK_BAR1_RESERVE_MIB"}
         with mock.patch.dict(os.environ, env, clear=True), \
                 self._with_free(56), self._no_ledger(), \
                 self.assertLogs(mt.logger, level="WARNING") as logs:

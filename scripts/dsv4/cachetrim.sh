@@ -3,7 +3,7 @@
 #
 # WHY THIS EXISTS -- THE DROPPER ALONE IS NOT ENOUGH
 # ---------------------------------------------------------------------------
-# The loader's ConsumedPageDropper (SGLANG_GGUF_STREAM_DROP_CACHE, runbook
+# The loader's ConsumedPageDropper (FLLIPER_GGUF_STREAM_DROP_CACHE, runbook
 # 4.5.5) releases the checkpoint's page cache BEHIND the weight stream. Boot 10
 # attempt B (2026-08-01, .../2026-08-01_391_dsv4flash10/ram10b.log) showed what
 # that leaves on the table: the dropper was working -- 40.68 GiB released in 76

@@ -4,7 +4,7 @@ no longer keeps the dual-P eviction from paying the pool. REAL UnifiedRadixCache
 
 THE DEATH (27B NVFP4 dual P/D stages, boot ...dualstufenbar1fs10060932 @173161c595, P PP1 09:48:38Z):
   PP1 tree: [126976 un-backed device tokens] -> node 221 (2573, un-backed, depth 129549)
-            -> node 220 (2 tokens, END anchor of weg2-0-50 at 129551, KV + mamba on the host:
+            -> node 220 (2 tokens, END anchor of pdflip-0-50 at 129551, KV + mamba on the host:
                '#1469 EVICT node=220 backuped=True host=True parent=221')
   '#1421 BACKUP-REFUSED why=parent_unbacked node=221' (arena fill 0.998), UD refuses 221 (children),
   Q-1500 V1 refuses the subtree for the host-backed END anchor, 'EVICT-FRONTIER-CENSUS request=1024
@@ -19,7 +19,7 @@ flight keep everything; an allowed backup is a demotion, never a drop; the flip 
 dual D and the switch at 0 are unchanged; the V2 trim census keeps the V1 guard.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -29,25 +29,25 @@ from array import array
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache import common as C
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.weg2 import dual_arena_spill as DAS
-from sglang.srt.weg2 import pp_slot_fidelity as SF
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.mem_cache import common as C
+from flliper.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.pdflip import dual_arena_spill as DAS
+from flliper.srt.pdflip import pp_slot_fidelity as SF
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
 FULL, MAMBA = ComponentType.FULL, ComponentType.MAMBA
 DUAL_ENV = {
-    "SGLANG_WEG2_DUAL_LAYOUT": "1",
-    "SGLANG_WEG2_GROUP": "P",
-    "SGLANG_WEG2_DUAL_P_KV_MAX_TOKENS": "32768",
+    "FLLIPER_PDFLIP_DUAL_LAYOUT": "1",
+    "FLLIPER_PDFLIP_GROUP": "P",
+    "FLLIPER_PDFLIP_DUAL_P_KV_MAX_TOKENS": "32768",
 }
-_KEYS = tuple(DUAL_ENV) + (SF.ENV, "SGLANG_WEG2_DUAL_UD_HOST_CHILDREN", "SGLANG_EVICT_FRONTIER_REPAIR")
+_KEYS = tuple(DUAL_ENV) + (SF.ENV, "FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN", "FLLIPER_EVICT_FRONTIER_REPAIR")
 E_MAMBA_ROW = 4242
 
 
@@ -70,7 +70,7 @@ class _MambaHostPool:
 
 
 class _ToldHold:
-    """The y9d4 hold's interface as ``UnifiedRadixCache._weg2_told_held`` reads it."""
+    """The y9d4 hold's interface as ``UnifiedRadixCache._pdflip_told_held`` reads it."""
 
     def __init__(self, depths):
         self._d = depths
@@ -103,14 +103,14 @@ def _metal_tree(dual=True):
     cache, alloc, r2t = build_fixture(cfg)
     cache.cache_controller = _WriteBackController()
     _insert(cache, alloc, r2t, list(range(1, 9)), "r-a")
-    _insert(cache, alloc, r2t, list(range(1, 13)), "weg2-0-50")
+    _insert(cache, alloc, r2t, list(range(1, 13)), "pdflip-0-50")
     res = _host_insert(cache, list(range(1, 15)))
     e = res.inserted_host_node
     assert e is not None
     pool = _MambaHostPool()
     cache.components[MAMBA]._mamba_pool_host = pool
-    e._weg2_end_anchor = True                                         # #1481 mark (END-ANCHOR ok=True)
-    e.weg2_anchor_rid = "weg2-0-50"
+    e._pdflip_end_anchor = True                                         # #1481 mark (END-ANCHOR ok=True)
+    e.pdflip_anchor_rid = "pdflip-0-50"
     e.component_data[MAMBA].host_value = torch.tensor([E_MAMBA_ROW], dtype=torch.int64)
     cache.host_lru_lists[MAMBA].insert_mru(e)
     cache.write_backup = lambda node, write_back=False, kv_only_if_mamba_refused=False: 0  # arena full
@@ -187,7 +187,7 @@ class DualPEvictEndAnchor1006(CustomTestCase):
     def test_the_log_names_the_yielded_end_anchor(self):
         cache, *_ = _metal_tree()
         cache.pp_rank = 1
-        with self.assertLogs("sglang.srt.weg2.pp_slot_fidelity", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.pdflip.pp_slot_fidelity", level="WARNING") as cm:
             cache.evict(EvictParams(num_tokens=4))
         line = next(m for m in cm.output if "EVICT-UNBACKED-DROP SUBTREE" in m)
         self.assertIn("end_anchors=1", line)
@@ -229,12 +229,12 @@ class DualPEvictEndAnchor1006(CustomTestCase):
 
     def test_a_told_named_end_anchor_keeps_the_subtree(self):
         cache, alloc, pool, a, l, e = _metal_tree()
-        cache._weg2_told_hold = _ToldHold({14: ["weg2-0-50"]})       # END depth of E == a standing told
+        cache._pdflip_told_hold = _ToldHold({14: ["pdflip-0-50"]})       # END depth of E == a standing told
         self._assert_kept(cache, alloc, pool, a, l, e)
 
     def test_a_told_at_another_depth_does_not_keep_it(self):
         cache, alloc, pool, a, l, e = _metal_tree()
-        cache._weg2_told_hold = _ToldHold({8: ["weg2-0-50"]})        # 1006: told=32768, END at 129551
+        cache._pdflip_told_hold = _ToldHold({8: ["pdflip-0-50"]})        # 1006: told=32768, END at 129551
         self.assertIsNotNone(SF.unbacked_drop_subtree(cache, l))
         self.assertEqual(cache.evict(EvictParams(num_tokens=4)).num_tokens_evicted, 4)
 
@@ -251,7 +251,7 @@ class DualPEvictEndAnchor1006(CustomTestCase):
         cache.ongoing_write_through[e.id] = object()
         self.assertIsNone(SF.unbacked_drop_subtree(cache, l))
         cache.ongoing_write_through.pop(e.id)
-        cache._weg2_direct_mamba_rows = {e.id: object()}              # #1427 direct mamba rows in flight
+        cache._pdflip_direct_mamba_rows = {e.id: object()}              # #1427 direct mamba rows in flight
         self.assertIsNone(SF.unbacked_drop_subtree(cache, l))
 
     def test_a_device_locked_leaf_is_never_a_candidate(self):
@@ -266,10 +266,10 @@ class DualPEvictEndAnchor1006(CustomTestCase):
     def test_a_host_backed_end_anchor_leaf_itself_yields_unless_told(self):
         """The refused leaf is itself an END anchor with a mamba host row (KV un-backed): same rule."""
         cache, alloc, pool, a, l, e = _metal_tree()
-        l._weg2_end_anchor = True
+        l._pdflip_end_anchor = True
         l.component_data[MAMBA].host_value = torch.tensor([777], dtype=torch.int64)
         self.assertIsNotNone(SF.unbacked_drop_subtree(cache, l))
-        cache._weg2_told_hold = _ToldHold({12: ["weg2-0-50"]})       # END depth of L
+        cache._pdflip_told_hold = _ToldHold({12: ["pdflip-0-50"]})       # END depth of L
         self.assertIsNone(SF.unbacked_drop_subtree(cache, l))
 
     # ---- danger direction 4: every other form is the base behaviour ----
@@ -280,17 +280,17 @@ class DualPEvictEndAnchor1006(CustomTestCase):
 
     def test_dual_d_is_unchanged(self):
         cache, alloc, pool, a, l, e = _metal_tree()
-        os.environ["SGLANG_WEG2_GROUP"] = "D"
+        os.environ["FLLIPER_PDFLIP_GROUP"] = "D"
         self._assert_kept(cache, alloc, pool, a, l, e)
 
     def test_switch_zero_is_unchanged(self):
         cache, alloc, pool, a, l, e = _metal_tree()
-        os.environ["SGLANG_WEG2_DUAL_UD_HOST_CHILDREN"] = "0"
+        os.environ["FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN"] = "0"
         self._assert_kept(cache, alloc, pool, a, l, e)
 
     def test_pp0_mode_keeps_it_on_a_follower(self):
         cache, alloc, pool, a, l, e = _metal_tree()
-        os.environ["SGLANG_WEG2_DUAL_UD_HOST_CHILDREN"] = "pp0"
+        os.environ["FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN"] = "pp0"
         cache.pp_rank = 1
         self._assert_kept(cache, alloc, pool, a, l, e)
 

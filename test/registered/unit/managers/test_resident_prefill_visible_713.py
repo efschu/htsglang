@@ -25,7 +25,7 @@ resident request whose prefill is DONE were counted, pending would never reach
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Range:
@@ -43,7 +43,7 @@ def _req(total, filled, rid="r"):
 
 
 def _sched(resident=(), waiting=(), chunked=None):
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     s = Scheduler.__new__(Scheduler)
     s.waiting_queue = list(waiting)
@@ -94,7 +94,7 @@ class TestResidentPrefillIsVisible713(CustomTestCase):
         self.assertEqual(s._pending_prefill_tokens(), 122)
 
     def test_no_resident_batch_is_harmless(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         s = Scheduler.__new__(Scheduler)
         s.waiting_queue = []

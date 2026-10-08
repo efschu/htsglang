@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 # CuteDSL prefill kernel only exists on Blackwell. Single-GPU kernel-unit suite,
 # same slot as the GDN prefill test.
@@ -25,12 +25,12 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 1
         allow_module_level=True,
     )
 
-from sglang.srt.layers.attention.fla.index import (  # noqa: E402
+from flliper.srt.layers.attention.fla.index import (  # noqa: E402
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from sglang.srt.layers.attention.fla.kda import fused_recurrent_kda  # noqa: E402
-from sglang.srt.layers.attention.linear.kernels.kda_blackwell import (  # noqa: E402
+from flliper.srt.layers.attention.fla.kda import fused_recurrent_kda  # noqa: E402
+from flliper.srt.layers.attention.linear.kernels.kda_blackwell import (  # noqa: E402
     chunk_kda_cutedsl,
     prepare_metadata,
 )

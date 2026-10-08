@@ -7,7 +7,7 @@ Replaces live.LiveLogs as the source of /api/live ``boots``.  Per boot state dir
   state.json          lifecycle, cause, front mirror (awake, queue, served, served_tokens, d_phase_n,
                       groups, errors), groups.<G>.launch/form, tag, rev, profile, image, container
   events.jsonl        flip_begin / flip_done / flip_first_work / group_health / rank_stop / group_ready ...
-  rankstate/<G>/*.rankstats   weg2.rankstats/1 per rank, timer-written: cumulative counters
+  rankstate/<G>/*.rankstats   pdflip.rankstats/1 per rank, timer-written: cumulative counters
 
 Every second a sample of every non-terminal boot's rank counters goes into a 16-min ring; the rates,
 windows, bursts, 15-min curves and the phase bar are deltas over that ring.  The view keeps the keys
@@ -143,7 +143,7 @@ VIS_KEEP = 6
 
 def vision_compact(v) -> Optional[dict]:
     """rankstats ``vision`` (Nutzer 02.10.: Vision-Tower laden/rechnen/entladen in die Phasenliste;
-    writer weg2/rank_timing.note_vision_*): {runs, live{run, leg, since, rids}, recent[{run, ok, t0, t1,
+    writer pdflip/rank_timing.note_vision_*): {runs, live{run, leg, since, rids}, recent[{run, ok, t0, t1,
     rids, mib, legs{leg: [t0, t1]}}]}; None on a rank that never ran a tower stage."""
     if not isinstance(v, dict):
         return None
@@ -729,8 +729,8 @@ F_DP_START_NOLOG = "D log not found (Decode rank batch rank 0)"
 
 #: flip_views(..., d_rounds=AUTO) reads D's rounds through grouplog; tests pass the list (or None)
 AUTO = object()
-F_DP_ARRIVAL = "front WEG2 SESSION arrival of the waiter is after the first prefill forward (rid/clock)"
-F_DP_ARRIVAL_UNKNOWN = "front WEG2 SESSION arrival of the waiter (rid) or oldest_waiter_arrival is missing: server idle before the waiter cannot be calculated out"
+F_DP_ARRIVAL = "front PDFLIP SESSION arrival of the waiter is after the first prefill forward (rid/clock)"
+F_DP_ARRIVAL_UNKNOWN = "front PDFLIP SESSION arrival of the waiter (rid) or oldest_waiter_arrival is missing: server idle before the waiter cannot be calculated out"
 #: tolerance between the front's arrival stamp and the rank clock before an arrival "after the first forward" is a defect
 ARRIVAL_SKEW_S = 0.5
 F_DP_END = "rankstats P.tp0pp0.work.forward_ct in the ring / flip_user_time.prefill_start_ts (pp_first_forward)"
@@ -928,7 +928,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
             p = (u or {}).get("parts") or {}
             if p.get("park_rpc_ms") is not None:
                 row["park_rpc_ms"] = p.get("park_rpc_ms")
-            # the Vorlauf split: arrival of the request that triggered the flip (front WEG2 SESSION of its rid; else
+            # the Vorlauf split: arrival of the request that triggered the flip (front PDFLIP SESSION of its rid; else
             # the pricing verdict the front stamps as oldest_waiter_arrival), the park RPC from flip_user_time
             rid = (u or {}).get("rid")
             if rid:
@@ -938,7 +938,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
             # diesem Moment ist keine Flipzeit)
             cands = []
             if rid and arrivals and rid in arrivals:
-                cands.append((float(arrivals[rid]), "front WEG2 SESSION rid=%s" % rid))
+                cands.append((float(arrivals[rid]), "front PDFLIP SESSION rid=%s" % rid))
             if (u or {}).get("start_source") == "oldest_waiter_arrival" and u.get("start_ts") is not None:
                 cands.append((float(u["start_ts"]), "flip_user_time oldest_waiter_arrival (Preisverdikt)"))
             dp_arrival, row["arrival_src"] = min(cands) if cands else (None, row.get("arrival_src"))
@@ -1239,7 +1239,7 @@ def cache_view(ring, keys, now) -> dict:
 def prefill_route(front: dict) -> dict:
     """Where the prefills ran (Nutzer 30.09.: "wird jeder Prefill zu P geflippt?").  Exact only with
     the front field ``front.routes`` {d_direct, via_p, d_drain, reroute_midstream} (proposed, writer
-    weg2/front.py at the X-EXACT-ERR via classification); until then derived from ``front.served``:
+    pdflip/front.py at the X-EXACT-ERR via classification); until then derived from ``front.served``:
     every request through P has one P leg and one D leg, a D-direct request only a D leg, so
     d_direct = D legs - P legs (mirror every 5 s, reroutes invisible) -- labelled as derived."""
     r = (front or {}).get("routes")

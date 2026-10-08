@@ -24,15 +24,15 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.cache_controller import StorageOperation
-from sglang.srt.mem_cache.hicache_phase_binding import (
+from flliper.srt.managers.cache_controller import StorageOperation
+from flliper.srt.mem_cache.hicache_phase_binding import (
     binding_state,
     current_generation,
     write_back_stamp_is_current,
 )
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # ~1s: plain objects and one single-rank vote. No pool, no accelerator, no boot.
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -80,7 +80,7 @@ class TestACutoverIsWhatMakesAStampStale(CustomTestCase):
         """THE UNRECOVERABLE HALF. If this ever becomes possible, the prefix
         'survives' by republishing bytes from a replaced pool, which is the 2j
         garbage wearing the fix's clothes."""
-        from sglang.srt.managers import cache_controller
+        from flliper.srt.managers import cache_controller
 
         err = getattr(cache_controller, "StaleStampRewrite", None)
         self.assertIsNotNone(

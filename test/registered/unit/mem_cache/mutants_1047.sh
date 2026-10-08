@@ -12,8 +12,8 @@ set -u
 
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 PY="${GATE_PY:-python3}"
-SB="$WT/python/sglang/srt/managers/schedule_batch.py"
-PPC="$WT/python/sglang/srt/mem_cache/producer_phase_census.py"
+SB="$WT/python/flliper/srt/managers/schedule_batch.py"
+PPC="$WT/python/flliper/srt/mem_cache/producer_phase_census.py"
 T="$WT/test/registered/unit/mem_cache/test_double_prefill_census_wiring_1047.py"
 
 cp "$SB" /tmp/1047_sb.orig

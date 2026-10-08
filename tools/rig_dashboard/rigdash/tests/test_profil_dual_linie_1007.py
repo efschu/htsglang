@@ -1,6 +1,6 @@
 """NF-Linie 07.10. (Nutzerentscheid "2 nein"): der Editor bietet die Betriebsform Dual nur an, wenn der Planer-Baum die Dual-Module traegt.
 
-Gepinnt (die Sonde ``profil.dual_line_probe`` ist eine Dateisonde -- ``weg2/dual_layout_plan.py`` und ``weg2/dual_green.py`` --, nie ein Baum-SHA; sie wird in diesen
+Gepinnt (die Sonde ``profil.dual_line_probe`` ist eine Dateisonde -- ``pdflip/dual_layout_plan.py`` und ``pdflip/dual_green.py`` --, nie ein Baum-SHA; sie wird in diesen
 Faellen gemockt, so dass derselbe Test auf beiden Linien beide Zweige prueft):
 
   * ohne Dual-Module (NF-Linie): ``formen`` der Seite hat weder ``dual`` noch eine Dual-ENV-Tabelle (kein Schluessel ``dual``), ``dual_verfuegbar`` ist False,
@@ -33,8 +33,8 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 
 
 def _tree_with(tmp, modules):
-    """A planner tree skeleton (``sglang/srt/weg2`` with the given module files)."""
-    base = os.path.join(tmp, "sglang", "srt", "weg2")
+    """A planner tree skeleton (``flliper/srt/pdflip`` with the given module files)."""
+    base = os.path.join(tmp, "flliper", "srt", "pdflip")
     os.makedirs(base)
     for m in modules:
         with open(os.path.join(base, m), "w", encoding="utf-8") as fh:
@@ -60,7 +60,7 @@ class Probe(unittest.TestCase):
 
     def test_the_probe_reads_the_tree_of_this_checkout_by_files(self):
         py = os.path.join(REPO_ROOT, "python")
-        has = all(os.path.isfile(os.path.join(py, "sglang", "srt", "weg2", n)) for n in ("dual_layout_plan.py", "dual_green.py"))
+        has = all(os.path.isfile(os.path.join(py, "flliper", "srt", "pdflip", n)) for n in ("dual_layout_plan.py", "dual_green.py"))
         self.assertIs(P.dual_line_probe(py), has)
 
 
@@ -76,7 +76,7 @@ class PageData(unittest.TestCase):
         self.assertNotIn("dual", ui)
         self.assertIs(ui["dual_verfuegbar"], False)
         self.assertNotIn("dual", {f["backend"] for f in ui["formen"]})
-        self.assertNotIn("SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE", json.dumps(ui))             # the Dual-ENV table is not in the page data at all
+        self.assertNotIn("FLLIPER_PDFLIP_DUAL_SHARE_GREEN_TABLE", json.dumps(ui))             # the Dual-ENV table is not in the page data at all
 
     def test_with_dual_the_answer_is_the_old_one(self):
         ui = PL.ui_info(("flip", "tp", "dual", "single"), self.entries, True)               # dual defaults to True: callers of the 27B line are unchanged

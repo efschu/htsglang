@@ -27,7 +27,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     TERM_NCCL_BUFFERS,
     CardFacts,
     DemandInputs,
@@ -35,12 +35,12 @@ from sglang.srt.mem_ledger.engine import (
     communicator_groups_from_server_args,
     demand_outside_budget_mib,
 )
-from sglang.srt.mem_ledger.nccl_transport import (
+from flliper.srt.mem_ledger.nccl_transport import (
     CommunicatorGroup,
     classify_communicator_groups,
 )
-from sglang.srt.mem_ledger.terms import LedgerError, LedgerTerm, Provenance
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_ledger.terms import LedgerError, LedgerTerm, Provenance
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -51,7 +51,7 @@ CARD = CardFacts(
     total_mib=20480,
 )
 
-#: A launch whose groups are all multi-rank. With SGLANG_BARLINK set, barlink
+#: A launch whose groups are all multi-rank. With FLLIPER_BARLINK set, barlink
 #: owns every one of them; with it unset, they all build NCCL.
 TP_GROUPS = (
     CommunicatorGroup(name="world", world_size=2),
@@ -60,11 +60,11 @@ TP_GROUPS = (
 
 
 def barlink_on():
-    return mock.patch.dict(os.environ, {"SGLANG_BARLINK": "1"})
+    return mock.patch.dict(os.environ, {"FLLIPER_BARLINK": "1"})
 
 
 def barlink_off():
-    return mock.patch.dict(os.environ, {"SGLANG_BARLINK": "0"})
+    return mock.patch.dict(os.environ, {"FLLIPER_BARLINK": "0"})
 
 
 def inputs(**over):
@@ -318,7 +318,7 @@ class TestPerGroupNotPerBoot(unittest.TestCase):
     def test_an_unresolvable_group_is_unbounded_and_named(self):
         """'Could not tell' must not read like 'there is none'."""
         with mock.patch.dict(
-            sys.modules, {"sglang.srt.distributed.parallel_state": None}
+            sys.modules, {"flliper.srt.distributed.parallel_state": None}
         ):
             lg = ledger(communicator_groups=TP_GROUPS)
         msgs = nccl_refusals(lg)
@@ -338,7 +338,7 @@ class TestTheVerdictComesFromTheConstructionPredicate(unittest.TestCase):
         with (
             barlink_on(),
             mock.patch(
-                "sglang.srt.distributed.parallel_state.should_build_pynccl",
+                "flliper.srt.distributed.parallel_state.should_build_pynccl",
                 return_value=True,
             ) as spy,
         ):
@@ -352,7 +352,7 @@ class TestTheVerdictComesFromTheConstructionPredicate(unittest.TestCase):
         with (
             barlink_off(),
             mock.patch(
-                "sglang.srt.distributed.parallel_state.should_build_barlink",
+                "flliper.srt.distributed.parallel_state.should_build_barlink",
                 return_value=True,
             ) as spy,
         ):
@@ -365,7 +365,7 @@ class TestTheVerdictComesFromTheConstructionPredicate(unittest.TestCase):
         should_build_barlink too, not on an inline copy of its body.
 
         The construction site moved out of `__init__` into `_build_barlink`
-        (weg2 S2 / BI-1), so that a wake can reach it a second time. What this
+        (pdflip S2 / BI-1), so that a wake can reach it a second time. What this
         test is about is the PREDICATE, so it follows the block to where the
         block now lives -- and it pins the call from `__init__` too, because a
         construction block that is present but unreached would satisfy the
@@ -373,30 +373,30 @@ class TestTheVerdictComesFromTheConstructionPredicate(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.distributed.parallel_state import GroupCoordinator
+        from flliper.srt.distributed.parallel_state import GroupCoordinator
 
         src = inspect.getsource(GroupCoordinator._build_barlink)
         self.assertIn("should_build_barlink(self.world_size)", src)
-        self.assertNotIn("envs.SGLANG_BARLINK.get() and self.world_size", src)
+        self.assertNotIn("envs.FLLIPER_BARLINK.get() and self.world_size", src)
         init_src = inspect.getsource(GroupCoordinator.__init__)
         self.assertIn("self._build_barlink()", init_src)
         self.assertNotIn("should_build_barlink(self.world_size)", init_src)
 
     def test_the_ledger_does_not_read_the_barlink_switch_itself(self):
-        """Reading the switch here -- through sglang.environ or through
+        """Reading the switch here -- through flliper.environ or through
         os.environ -- would be the parallel check the import exists to
         prevent."""
         import inspect
 
-        from sglang.srt.mem_ledger import engine, nccl_transport
+        from flliper.srt.mem_ledger import engine, nccl_transport
 
         src = inspect.getsource(nccl_transport)
         for forbidden in ("os.environ", "getenv", "envs."):
             self.assertNotIn(forbidden, src, forbidden)
-        self.assertNotIn("envs.SGLANG_BARLINK", inspect.getsource(engine))
+        self.assertNotIn("envs.FLLIPER_BARLINK", inspect.getsource(engine))
 
     def test_the_predicates_are_the_ones_the_skip_log_line_belongs_to(self):
-        from sglang.srt.distributed.parallel_state import (
+        from flliper.srt.distributed.parallel_state import (
             should_build_barlink,
             should_build_pynccl,
         )
@@ -436,7 +436,7 @@ class TestTheWindowNineOutcomeIsInverted(unittest.TestCase):
     boot that allocates no NCCL buffers at all."""
 
     def setUp(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         ServerArgs._full_demand_refusal_named = False
         self.SA = ServerArgs
@@ -466,7 +466,7 @@ class TestTheWindowNineOutcomeIsInverted(unittest.TestCase):
         with barlink_off():
             lg = ledger(communicator_groups=TP_GROUPS, calibration=calibration_stub())
             self.assertTrue(nccl_refusals(lg), lg.unbounded)
-            with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+            with self.assertLogs("flliper.srt.server_args", level="WARNING") as cm:
                 got = self.SA.ledger_full_demand_per_gpu(self._stub(lg), 20480)
         self.assertIsNone(got)
         self.assertIn("NCCL", "\n".join(cm.output))

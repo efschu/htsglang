@@ -11,13 +11,13 @@
 #   F2 MPS, D 8 MiB AR, P 8 MiB AR + GEMM, no SM cap         (both groups above the old grid threshold)
 #   F3 MPS, D 40 MiB AR (extend 4096 x 5120 x 2 B), P 10 MiB AR (a 1024 chunk frame) + GEMM
 #   N3 no MPS, F3 load                                       (latency baseline without MPS)
-#   C1 MPS, F1 load, SGLANG_BARLINK_BAR1_GRID_THRESHOLD=4194304 (old) + cap 6e9   (control: expected aborts/wedge)
+#   C1 MPS, F1 load, FLLIPER_BARLINK_BAR1_GRID_THRESHOLD=4194304 (old) + cap 6e9   (control: expected aborts/wedge)
 # Usage (CT999, cards 0,1,2 free, no boot): run_dualmps.sh <outdir>   ~12 min
 set -u
 PY=${PY:-/spinning/htsglang-gpu/.venv/bin/python}
 HERE=$(cd "$(dirname "$0")" && pwd)
 export PYTHONPATH=$(cd "$HERE/../.." && pwd)/python
-unset CUDA_VISIBLE_DEVICES SGLANG_BARLINK_BAR1_GRID_THRESHOLD
+unset CUDA_VISIBLE_DEVICES FLLIPER_BARLINK_BAR1_GRID_THRESHOLD
 B="$PY $HERE/bar1_two_groups.py"
 OUT=$1; mkdir -p "$OUT"
 DUR=${DUR:-30}; TO=${TO:-150}
@@ -43,7 +43,7 @@ echo "== F1 MPS fix, D 8 MiB, P 1 MiB + GEMM, P 50 %"; start_mps; PENV=$P50 DENV
 echo "== F2 MPS fix, D 8 MiB, P 8 MiB + GEMM";       start_mps; PENV= DENV= pair F2 "--size 8388608" "--size 8388608 --gemm-m 2048"; stop_mps
 echo "== F3 MPS fix, D 40 MiB, P 10 MiB + GEMM";     start_mps; PENV= DENV= pair F3 "--size 41943040" "--size 10485760 --gemm-m 2048"; stop_mps
 echo "== N3 no MPS, D 40 MiB, P 10 MiB + GEMM";                  PENV= DENV= pair N3 "--size 41943040" "--size 10485760 --gemm-m 2048"
-OLD="SGLANG_BARLINK_BAR1_GRID_THRESHOLD=4194304 SGLANG_BARLINK_BAR1_CAP_CYCLES=6000000000"
+OLD="FLLIPER_BARLINK_BAR1_GRID_THRESHOLD=4194304 FLLIPER_BARLINK_BAR1_CAP_CYCLES=6000000000"
 echo "== C1 MPS OLD grid (control), D 8 MiB, P 1 MiB + GEMM, P 50 %, cap 6e9"; start_mps
 PENV="$P50 $OLD" DENV="$OLD" pair C1 "--size 8388608" "--size 1048576 --gemm-m 2048"; stop_mps
 $PY - "$OUT" <<'PYEOF'

@@ -18,12 +18,12 @@ import torch
 from fastapi.testclient import TestClient
 from torch import nn
 
-from sglang.srt.translator import metrics
-from sglang.srt.translator.backends import FakeAsr, FakeEmbedder, FakeMt, FakeTts
-from sglang.srt.translator.config import TranslatorConfig
-from sglang.srt.translator.idle_park import IdleParkConfig, IdleParkController
-from sglang.srt.translator.ledger import AudioAssetLedger
-from sglang.srt.translator.server import Stack, TranslatorService, build_app
+from flliper.srt.translator import metrics
+from flliper.srt.translator.backends import FakeAsr, FakeEmbedder, FakeMt, FakeTts
+from flliper.srt.translator.config import TranslatorConfig
+from flliper.srt.translator.idle_park import IdleParkConfig, IdleParkController
+from flliper.srt.translator.ledger import AudioAssetLedger
+from flliper.srt.translator.server import Stack, TranslatorService, build_app
 
 LANG_A, LANG_B = "de", "es"
 
@@ -179,8 +179,8 @@ class TestRequestPathsWake(unittest.TestCase):
 
         import numpy as np
 
-        from sglang.srt.translator.audio import PIPELINE_SAMPLE_RATE, Pcm16Codec
-        from sglang.srt.translator.backends import AudioChunk
+        from flliper.srt.translator.audio import PIPELINE_SAMPLE_RATE, Pcm16Codec
+        from flliper.srt.translator.backends import AudioChunk
 
         service, controller, clock = build()
         client = TestClient(build_app(service))

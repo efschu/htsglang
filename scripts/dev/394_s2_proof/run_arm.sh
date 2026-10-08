@@ -68,7 +68,7 @@ echo "ready=$ok after $((i * 15))s"
   # baseline arms by construction; absent on a compute arm means the arm is
   # NOT VRAM-neutral and its corridor numbers are not arm 1's.
   grep -hE "resident fraction held at the base plan" "$RUN/boot_$ARM.log" | tail -3
-  grep -ohiE "WARNING.*SGLANG_MOE_HOST_SHARD_RATIO.*" "$RUN/boot_$ARM.log" | tail -2
+  grep -ohiE "WARNING.*FLLIPER_MOE_HOST_SHARD_RATIO.*" "$RUN/boot_$ARM.log" | tail -2
   echo "--- VRAM after boot ---"
   nvidia-smi --query-gpu=index,name,memory.used,memory.free --format=csv,noheader
 } > "$RUN/facts_$ARM.txt" 2>&1

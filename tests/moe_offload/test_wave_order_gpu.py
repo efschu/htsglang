@@ -35,14 +35,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 if torch.cuda.is_available():
-    from sglang.srt.runtime_context import get_context
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.runtime_context import get_context
+    from flliper.srt.server_args import ServerArgs
 
     if get_context()._server_args is None:
         get_context().set_server_args(ServerArgs(model_path="dummy"))
 
-    from sglang.srt.layers.moe.expert_offload import combine_topk_partials
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    from flliper.srt.layers.moe.expert_offload import combine_topk_partials
+    from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         fused_experts_impl,
     )
 
@@ -190,7 +190,7 @@ def test_kernel_config_is_m_invariant_only_for_blockwise_fp8():
     pair, not per token), so they land on the same side as the reference more
     often, but the guarantee comes from the quantization format, not the split.
     """
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+    from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
         get_default_config,
     )
 

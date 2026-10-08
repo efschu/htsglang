@@ -27,7 +27,7 @@ import ast
 import inspect
 import unittest
 
-from sglang.srt.managers.pp_presence_disposition import (
+from flliper.srt.managers.pp_presence_disposition import (
     CONSUMER_EXCLUDED,
     SELF_CLEARING,
     UNCLASSIFIED,
@@ -35,7 +35,7 @@ from sglang.srt.managers.pp_presence_disposition import (
     classify_withhold_clause,
     withhold_markers,
 )
-from sglang.srt.managers.pp_stash_disposition import census_stash
+from flliper.srt.managers.pp_stash_disposition import census_stash
 
 
 class TestWithholdClassification(unittest.TestCase):
@@ -159,7 +159,7 @@ class TestMarkerTableExhaustiveness(unittest.TestCase):
         this pin cannot drift away from the function it guards. f-strings are
         reduced to their constant segments, which is where every marker lives.
         """
-        from sglang.srt.managers import scheduler_pp_mixin
+        from flliper.srt.managers import scheduler_pp_mixin
 
         tree = ast.parse(inspect.getsource(scheduler_pp_mixin))
         target = None

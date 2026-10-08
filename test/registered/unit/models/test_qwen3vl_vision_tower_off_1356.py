@@ -24,7 +24,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.models import qwen3_5, qwen3_vl  # noqa: E402
+from flliper.srt.models import qwen3_5, qwen3_vl  # noqa: E402
 
 
 class _Args:

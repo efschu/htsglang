@@ -16,16 +16,16 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
+from flliper.utils import download_and_cache_file, read_jsonl
 
 # DISABLED: Split into individual files for each model variant
 # See: test_grok1_fp8_eval_amd.py, test_grok1_int4_eval_amd.py, test_grok2_eval_amd.py
@@ -78,8 +78,8 @@ GROK_MODELS = [
         ],
         env_vars={
             "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "0",
+            "FLLIPER_USE_AITER": "1",
+            "FLLIPER_INT4_WEIGHT": "0",
         },
     ),
     # GROK1-INT4
@@ -100,8 +100,8 @@ GROK_MODELS = [
         ],
         env_vars={
             "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "1",
+            "FLLIPER_USE_AITER": "1",
+            "FLLIPER_INT4_WEIGHT": "1",
         },
     ),
     # GROK2
@@ -122,8 +122,8 @@ GROK_MODELS = [
         ],
         env_vars={
             "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "0",
+            "FLLIPER_USE_AITER": "1",
+            "FLLIPER_INT4_WEIGHT": "0",
         },
     ),
 ]
@@ -164,8 +164,8 @@ def run_gsm8k_benchmark(
     parallel: int = 64,
 ) -> Tuple[float, float, float]:
     """Run GSM8K few-shot completion benchmark."""
-    import sglang as sgl
-    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+    import flliper as sgl
+    from flliper.lang.backend.runtime_endpoint import RuntimeEndpoint
 
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     data_path = download_and_cache_file(url)

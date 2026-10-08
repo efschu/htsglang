@@ -14,7 +14,7 @@ Hermetic: pure arithmetic, no CUDA.
 """
 
 import pytest
-from sglang.srt.planner.seam_holdback import (
+from flliper.srt.planner.seam_holdback import (
     SeamHoldbackError,
     SeamRecord,
     WeightTerms,

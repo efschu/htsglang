@@ -3,10 +3,10 @@ from __future__ import annotations
 import unittest
 from typing import ClassVar
 
-from sglang.srt.kv_canary.config import CanaryMode
-from sglang.srt.kv_canary.perturb.config import TargetGroupKind
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.pp_fixture import CanaryPPFixture
+from flliper.srt.kv_canary.config import CanaryMode
+from flliper.srt.kv_canary.perturb.config import TargetGroupKind
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.pp_fixture import CanaryPPFixture
 
 register_cuda_ci(est_time=220, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=298, stage="extra-a", runner_config="2-gpu-large-amd")
@@ -21,9 +21,9 @@ class TestPPPerturbSwaSwa(CanaryPPFixture):
     @classmethod
     def setUpClass(cls) -> None:
         cls.extra_env = {
-            "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
-            "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
-            "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+            "FLLIPER_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
+            "FLLIPER_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
+            "FLLIPER_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
         }
         super().setUpClass()
 

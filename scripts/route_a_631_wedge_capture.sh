@@ -36,8 +36,8 @@ LIVENESS_STRIKES="${LIVENESS_STRIKES:-3}"
 mkdir -p "$EVIDENCE_ROOT"
 
 scheduler_pids() {
-    # The scheduler processes retitle themselves sglang::scheduler_PPn.
-    pgrep -f 'sglang::scheduler_PP' 2>/dev/null | sort -n
+    # The scheduler processes retitle themselves flliper::scheduler_PPn.
+    pgrep -f 'flliper::scheduler_PP' 2>/dev/null | sort -n
 }
 
 capture() {
@@ -88,15 +88,15 @@ capture() {
 
     # -- the rendezvous state ---------------------------------------------
     # Which ranks had announced, for which epoch. The gate's own evidence.
-    ls -la /dev/shm/sglang-phase-flip-presence/ > "$dir/presence_markers.txt" 2>&1
-    for f in /dev/shm/sglang-phase-flip-presence/*; do
+    ls -la /dev/shm/flliper-phase-flip-presence/ > "$dir/presence_markers.txt" 2>&1
+    for f in /dev/shm/flliper-phase-flip-presence/*; do
         [ -f "$f" ] && printf '== %s ==\n%s\n' "$f" "$(cat "$f")" \
             >> "$dir/presence_marker_bodies.txt"
     done 2>/dev/null
 
     # -- surroundings ------------------------------------------------------
     nvidia-smi > "$dir/nvidia-smi.txt" 2>&1
-    ps -eo pid,pgid,stat,etimes,cmd | grep -E 'sglang|launch_server' \
+    ps -eo pid,pgid,stat,etimes,cmd | grep -E 'flliper|launch_server' \
         | grep -v grep > "$dir/processes.txt" 2>&1
     # Bounded slice of the log: enough for the flip timeline, small enough
     # to read. The full log is rotated by the boot script, not copied here.

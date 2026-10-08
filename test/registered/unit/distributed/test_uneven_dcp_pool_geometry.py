@@ -34,7 +34,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     cp_token_split_factor,
     get_cp_token_ratios,
     get_tp_partition_ratios,
@@ -42,16 +42,16 @@ from sglang.srt.distributed.utils import (
     set_tp_partition_ratios,
     uneven_dcp_kv_replicated,
 )
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.layers.dcp.owner import (
     dcp_accounting_total_slots,
     dcp_compact_pool_rows,
 )
-from sglang.srt.model_executor import model_runner_kv_cache_mixin as mixin_mod
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.model_executor import model_runner_kv_cache_mixin as mixin_mod
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -220,7 +220,7 @@ class TestUnevenDcpPoolRows(_DcpPlanFixture):
             ),
             self.global_context,
         )
-        # Even-modulo owner rule (SGLANG_UNEVEN_DCP_WEIGHTED=0): no token
+        # Even-modulo owner rule (FLLIPER_UNEVEN_DCP_WEIGHTED=0): no token
         # vector, so max_total_num_tokens IS the per-rank pool already and
         # the allocator carries the inflated index space instead.
         set_cp_token_ratios(None)
@@ -347,7 +347,7 @@ class TestUnevenDcpWriteAddressing(_DcpPlanFixture):
 
 
 class TestDcpAccountingTotalSlots(unittest.TestCase):
-    """The second #345 defect: ``SGLANG_UNEVEN_DCP=1`` with ``_WEIGHTED=0``
+    """The second #345 defect: ``FLLIPER_UNEVEN_DCP=1`` with ``_WEIGHTED=0``
     died at the first idle check with ``available`` exactly ``dcp_size`` x
     ``total``, because the two scalars counted different spaces."""
 

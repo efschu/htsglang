@@ -4,8 +4,8 @@ import subprocess
 import unittest
 from unittest import mock
 
-from sglang.srt.utils import prepare_model_and_tokenizer
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import prepare_model_and_tokenizer
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestDownloadFromModelScope(CustomTestCase):
@@ -16,7 +16,7 @@ class TestDownloadFromModelScope(CustomTestCase):
         stat, output = subprocess.getstatusoutput("pip install modelscope")
 
         cls.with_modelscope_environ = {k: v for k, v in os.environ.items()}
-        cls.with_modelscope_environ["SGLANG_USE_MODELSCOPE"] = "True"
+        cls.with_modelscope_environ["FLLIPER_USE_MODELSCOPE"] = "True"
 
     @classmethod
     def tearDownClass(cls):

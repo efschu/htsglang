@@ -18,7 +18,7 @@ import inspect
 import pytest
 import torch
 
-from sglang.srt.layers.moe.fused_moe_triton import layer as L
+from flliper.srt.layers.moe.fused_moe_triton import layer as L
 
 
 # Die vier Shard-Formen des Checkpoints (int32 packed), Checkpoint-Layout

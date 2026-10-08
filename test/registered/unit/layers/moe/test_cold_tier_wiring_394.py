@@ -18,7 +18,7 @@ Three sites carry the chain, and each is asserted here by name:
     (``expert_offload.py``).
 
 Can-fail proof: delete any one of the three calls and the matching test goes
-red; set ``SGLANG_MOE_COLD_TIER_SHM`` back to a hard ``False`` default and
+red; set ``FLLIPER_MOE_COLD_TIER_SHM`` back to a hard ``False`` default and
 ``test_the_default_path_takes_no_cold_tier_branch`` still passes while
 ``test_enabling_the_tier_is_a_single_documented_flag`` goes red, which is the
 distinction between "off by default" and "not there".
@@ -36,9 +36,9 @@ import pathlib
 import unittest
 import warnings
 
-from sglang.srt.layers.moe import cold_tier_fetch as ctf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe import cold_tier_fetch as ctf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -67,9 +67,9 @@ def _call_lines(rel_path, func_name):
     return out
 
 
-_ENGINE = "python/sglang/srt/entrypoints/engine.py"
-_LAYER = "python/sglang/srt/layers/moe/fused_moe_triton/layer.py"
-_OFFLOAD = "python/sglang/srt/layers/moe/expert_offload.py"
+_ENGINE = "python/flliper/srt/entrypoints/engine.py"
+_LAYER = "python/flliper/srt/layers/moe/fused_moe_triton/layer.py"
+_OFFLOAD = "python/flliper/srt/layers/moe/expert_offload.py"
 
 
 class TestColdTierIsWiredFromProduction(CustomTestCase):
@@ -121,12 +121,12 @@ class TestColdTierIsWiredFromProduction(CustomTestCase):
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.ImportFrom)
-                    and node.module == "sglang.srt.layers.moe.cold_tier_shm"
+                    and node.module == "flliper.srt.layers.moe.cold_tier_shm"
                 ):
                     importers.append(f"{rel}:{node.lineno}")
         self.assertTrue(
             importers,
-            "sglang.srt.layers.moe.cold_tier_shm has no production importer "
+            "flliper.srt.layers.moe.cold_tier_shm has no production importer "
             "again -- #421 finding F4 has regressed",
         )
 
@@ -136,20 +136,20 @@ class TestTheDefaultPathIsUnchanged(CustomTestCase):
         """Off unless asked for. Every entry point must answer ``None``."""
         import os
 
-        previous = os.environ.pop("SGLANG_MOE_COLD_TIER_SHM", None)
+        previous = os.environ.pop("FLLIPER_MOE_COLD_TIER_SHM", None)
         try:
             self.assertFalse(ctf.cold_tier_enabled())
             self.assertIsNone(ctf.owner_for_layer("L0", 0, 2, ("A", "B")))
             self.assertIsNone(ctf.resolver_for_layer(object()))
         finally:
             if previous is not None:
-                os.environ["SGLANG_MOE_COLD_TIER_SHM"] = previous
+                os.environ["FLLIPER_MOE_COLD_TIER_SHM"] = previous
 
     def test_enabling_the_tier_is_a_single_documented_flag(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        self.assertIn("SGLANG_MOE_COLD_TIER_SHM", dir(envs))
-        self.assertFalse(envs.SGLANG_MOE_COLD_TIER_SHM.get())
+        self.assertIn("FLLIPER_MOE_COLD_TIER_SHM", dir(envs))
+        self.assertFalse(envs.FLLIPER_MOE_COLD_TIER_SHM.get())
 
 
 if __name__ == "__main__":

@@ -18,20 +18,20 @@ hidden.
 Hermetic: no server, no model, no GPU, no process group.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 import unittest  # noqa: E402
 
-from sglang.srt.disaggregation.nccl.link import (  # noqa: E402
+from flliper.srt.disaggregation.nccl.link import (  # noqa: E402
     LinkError,
     MemoryRegion,
     NcclLink,
     TransferBlock,
     order_blocks,
 )
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 
 class _RecordingOps:
@@ -217,12 +217,12 @@ class TestBackendRegistrationRefusesByName(CustomTestCase):
     can be used. What is missing is named rather than implied."""
 
     def test_the_member_exists(self):
-        from sglang.srt.disaggregation.utils import TransferBackend
+        from flliper.srt.disaggregation.utils import TransferBackend
 
         self.assertEqual(TransferBackend("nccl"), TransferBackend.NCCL)
 
     def test_selecting_it_names_what_is_missing_and_what_to_use_instead(self):
-        from sglang.srt.disaggregation.utils import (
+        from flliper.srt.disaggregation.utils import (
             KVClassType,
             TransferBackend,
             get_kv_class,
@@ -236,7 +236,7 @@ class TestBackendRegistrationRefusesByName(CustomTestCase):
         self.assertIn("TASK_111_PD_KV_NCCL.md", message)
 
     def test_the_working_backends_are_untouched(self):
-        from sglang.srt.disaggregation.utils import (
+        from flliper.srt.disaggregation.utils import (
             KVClassType,
             TransferBackend,
             get_kv_class,

@@ -6,8 +6,8 @@ python3 -m unittest test_qwen3_next_deterministic.TestFlashInferDeterministic
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_deterministic_utils import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )

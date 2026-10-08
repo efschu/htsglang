@@ -3,7 +3,7 @@
 These knobs used to come from the environment only, and the boot env was
 assembled by concatenating a captured shell environment, a heredoc and
 EXTRA_ENV. A key written twice resolved silently as "last one wins":
-SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S was 10 in one half and 8 in the other, and
+FLLIPER_PHASE_POLICY_TP_DECODE_FLOOR_S was 10 in one half and 8 in the other, and
 the 10 had been dead the whole time with nobody aware of it.
 
 What has to hold now:
@@ -22,7 +22,7 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.managers.phase_policy import config_from_env
+from flliper.srt.managers.phase_policy import config_from_env
 
 
 class _Args:
@@ -38,15 +38,15 @@ class _Args:
 
 # (ServerArgs field, env var, flag value, conflicting env value, config attr)
 CASES = [
-    ("phase_policy_min_dwell_s", "SGLANG_PHASE_POLICY_MIN_DWELL_S",
+    ("phase_policy_min_dwell_s", "FLLIPER_PHASE_POLICY_MIN_DWELL_S",
      7.0, "99.0", "min_dwell_s"),
-    ("phase_policy_tp_decode_floor_s", "SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S",
+    ("phase_policy_tp_decode_floor_s", "FLLIPER_PHASE_POLICY_TP_DECODE_FLOOR_S",
      10.0, "8", "tp_decode_floor_s"),
-    ("phase_policy_pp_window_s", "SGLANG_PHASE_POLICY_PP_WINDOW_S",
+    ("phase_policy_pp_window_s", "FLLIPER_PHASE_POLICY_PP_WINDOW_S",
      4.0, "15", "pp_window_s"),
-    ("phase_policy_decode_stall_slo_s", "SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S",
+    ("phase_policy_decode_stall_slo_s", "FLLIPER_PHASE_POLICY_DECODE_STALL_SLO_S",
      180.0, "12", "decode_stall_slo_s"),
-    ("phase_policy_decode_contention", "SGLANG_PHASE_POLICY_DECODE_CONTENTION",
+    ("phase_policy_decode_contention", "FLLIPER_PHASE_POLICY_DECODE_CONTENTION",
      1.0, "0.25", "decode_contention"),
 ]
 
@@ -97,7 +97,7 @@ class TestPhasePolicyFlagPromotion781(unittest.TestCase):
         # feature OFF is the inverted-polarity trap that bit
         # SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK.
         with mock.patch.dict(
-            os.environ, {"SGLANG_PHASE_POLICY_DRAIN_MODE": "1"}, clear=False
+            os.environ, {"FLLIPER_PHASE_POLICY_DRAIN_MODE": "1"}, clear=False
         ):
             cfg = self._cfg(_Args(phase_policy_drain_mode=False))
             self.assertFalse(
@@ -111,7 +111,7 @@ class TestPhasePolicyFlagPromotion781(unittest.TestCase):
     def test_no_server_args_is_unchanged_behaviour(self):
         """Every existing caller passes no ServerArgs; none of them may move."""
         with mock.patch.dict(
-            os.environ, {"SGLANG_PHASE_POLICY_PP_WINDOW_S": "6"}, clear=False
+            os.environ, {"FLLIPER_PHASE_POLICY_PP_WINDOW_S": "6"}, clear=False
         ):
             self.assertEqual(config_from_env(enabled=False).pp_window_s, 6.0)
 
@@ -119,7 +119,7 @@ class TestPhasePolicyFlagPromotion781(unittest.TestCase):
         """The flags must be real ServerArgs fields, not just accepted kwargs."""
         import dataclasses
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         names = {f.name for f in dataclasses.fields(ServerArgs)}
         for field, _env, _v, _b, _a in CASES:

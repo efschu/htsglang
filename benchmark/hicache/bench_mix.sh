@@ -2,7 +2,7 @@
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/dist-packages:/usr/local/lib/python3.12/dist-packages/torch/lib
 rm -rf nohup.out && \
-nohup python3 -m sglang.launch_server \
+nohup python3 -m flliper.launch_server \
     --attention-backend triton \
     --model-path /code/models/Qwen3-32B/ \
     --log-level info \

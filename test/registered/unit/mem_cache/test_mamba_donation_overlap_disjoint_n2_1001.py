@@ -30,7 +30,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool  # noqa: E402
+from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool  # noqa: E402
 
 
 class _Req:

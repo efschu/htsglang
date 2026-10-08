@@ -6,7 +6,7 @@ Abschnitt 5), die Dual-ENV-Tabelle (Plan 4c Nachträge 12:20Z und 13:20Z) mit St
 liefert das als ``planer``; ``static/profil_planer.js`` zeichnet es.
 
 Jeder Satz der Betriebsformen und der Dual-Tabelle steht in einer Quelle (Plan R2/R3, Katalogtext von ``--d-only`` und ``--dual-layout``,
-``weg2/dual_green.py``, ``weg2/dual_share.py``); die Standardwerte der Dual-Tabelle prüft ``test_profil_planer_aph1_1006`` gegen den Quelltext.
+``pdflip/dual_green.py``, ``pdflip/dual_share.py``); die Standardwerte der Dual-Tabelle prüft ``test_profil_planer_aph1_1006`` gegen den Quelltext.
 Was nicht belegt ist, steht nicht hier.
 """
 
@@ -22,7 +22,7 @@ FORM_BACKEND = {"einzel": "single", "tp": "tp", "flip": "flip", "dual": "dual"}
 #: die vier Formen (Plan R2); ``n_min``/``n_max`` = zulässige Kartenzahl (R2: Einzelkarte N=1, die übrigen N>=2; topology.py MIN_CARDS)
 FORMEN: List[Dict[str, Any]] = [
     {"id": "einzel", "name": "Single card", "n_min": 1, "n_max": 1,
-     "satz": "One card, one rank: the normal server without the weg2 launcher, for example a laptop. The proposal there is a planner calculation, not a launcher run.",
+     "satz": "One card, one rank: the normal server without the pdflip launcher, for example a laptop. The proposal there is a planner calculation, not a launcher run.",
      "quelle": "PLAN-PROFIL-PLANER-1006 R2 and R5b (user 06.10.)"},
     {"id": "tp", "name": "TP only", "n_min": 2, "n_max": None,
      "satz": "Only the decode group D: all cards work as one tensor-parallel group, without a prefill group, without switching and without a front (flag --d-only, from two cards).",
@@ -46,25 +46,25 @@ ABSCHNITTE: List[Dict[str, Any]] = [
                "--d-tp-objective",
                # Positionale Je-Karte-Vektoren des Launchers (POSITIONAL_VECTOR_FLAGS/-TOKENS, launcher.py): Speicherposten je Karte, Release-Profile nf*/27b* setzen sie
                "--d-foreign-context-mib", "--d-nontorch-mib", "--d-reserve-mib", "--pp-cut-reserve-mib",
-               "SGLANG_WEG2_L15_MIB", "SGLANG_WEG2_EXTEND_TRIM_MIB"]},
+               "FLLIPER_PDFLIP_L15_MIB", "FLLIPER_PDFLIP_EXTEND_TRIM_MIB"]},
     {"id": "B", "titel": "B  KV: heads, token shares, DCP",
      "satz": "Where the KV cache lives: how many tokens per card, whether uneven DCP applies. The KV heads per rank are derived and only a display.",
-     "namen": ["--dcp-size", "--uneven-dcp", "--uneven-dcp-weighted", "--rank-kv-ratio", "SGLANG_UNEVEN_TOKEN_VECTOR", "--uneven-token-vector",
+     "namen": ["--dcp-size", "--uneven-dcp", "--uneven-dcp-weighted", "--rank-kv-ratio", "FLLIPER_UNEVEN_TOKEN_VECTOR", "--uneven-token-vector",
                "--d-uneven-token-vector", "--d-kv-token-cut", "--d-token-placement", "--kv-reshard-vectors"]},
     {"id": "C", "titel": "C  Experts (MoE)",
      "satz": "How many experts per card are in VRAM and how the experts are distributed (effective only for MoE models).",
-     "namen": ["--rank-moe-resident-fraction", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "SGLANG_UNEVEN_MOE_EXPERT_SHARD", "SGLANG_UNEVEN_MOE_VECTOR",
-               "SGLANG_MOE_SCRATCH_SLOTS", "--expert-placement-override"]},
+     "namen": ["--rank-moe-resident-fraction", "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", "FLLIPER_UNEVEN_MOE_EXPERT_SHARD", "FLLIPER_UNEVEN_MOE_VECTOR",
+               "FLLIPER_MOE_SCRATCH_SLOTS", "--expert-placement-override"]},
 ]
 
-#: die Dual-ENV-Tabelle (Plan 4c).  Namen aus ``weg2/dual_green.py`` (``GreenConfig.from_env``: ``ENV_PREFIX + "GREEN_" + "TABLE"``), ``weg2/dual_share.py``
-#: (``STARVE_AGE_S``, ``STARVE_MAX_RUNG``) und ``environ.py`` (``SGLANG_WEG2_DUAL_GRANT_RETRY_MS``).  Standardwerte aus dem Quelltext, Beleg je Zeile.
+#: die Dual-ENV-Tabelle (Plan 4c).  Namen aus ``pdflip/dual_green.py`` (``GreenConfig.from_env``: ``ENV_PREFIX + "GREEN_" + "TABLE"``), ``pdflip/dual_share.py``
+#: (``STARVE_AGE_S``, ``STARVE_MAX_RUNG``) und ``environ.py`` (``FLLIPER_PDFLIP_DUAL_GRANT_RETRY_MS``).  Standardwerte aus dem Quelltext, Beleg je Zeile.
 DUAL_ENV = {
-    "table": "SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE",
-    "starve_age": "SGLANG_WEG2_DUAL_SHARE_STARVE_AGE_S",
-    "starve_max": "SGLANG_WEG2_DUAL_SHARE_STARVE_MAX_RUNG",
-    "retry": "SGLANG_WEG2_DUAL_GRANT_RETRY_MS",
-    "rungs": "SGLANG_WEG2_DUAL_SHARE_RUNGS",
+    "table": "FLLIPER_PDFLIP_DUAL_SHARE_GREEN_TABLE",
+    "starve_age": "FLLIPER_PDFLIP_DUAL_SHARE_STARVE_AGE_S",
+    "starve_max": "FLLIPER_PDFLIP_DUAL_SHARE_STARVE_MAX_RUNG",
+    "retry": "FLLIPER_PDFLIP_DUAL_GRANT_RETRY_MS",
+    "rungs": "FLLIPER_PDFLIP_DUAL_SHARE_RUNGS",
 }
 DUAL = {
     "env": DUAL_ENV,
@@ -81,7 +81,7 @@ DUAL = {
                "starve": "dual_share.py:157-158 (default), :414-417 (clamp); dual_green.py:1319-1322",
                "retry": "environ.py:679-684; dual_p_kv_stage.py:668-681, :893 (dual layout only, 0 = off)"},
     "texte": {
-        "stufen": "Rung 0, 1, 2, 3 = P's share of the compute units of the card: 100, 75, 50, 25 percent (default of the rungs, SGLANG_WEG2_DUAL_SHARE_RUNGS).",
+        "stufen": "Rung 0, 1, 2, 3 = P's share of the compute units of the card: 100, 75, 50, 25 percent (default of the rungs, FLLIPER_PDFLIP_DUAL_SHARE_RUNGS).",
         "tabelle": "When D decodes again after idling and no minimum rate is set, the first row whose threshold the D seats reach or exceed selects the entry rung of P: the column \"tau low\" or \"tau high\" (tau = waiting P work in seconds; high = above the upper edge, default 10 s). If D is empty (0 seats), P always stands at 100 percent. Afterwards the front readjusts to the measured D round time.",
         "klemme": "Starvation clamp: if the oldest P request waits longer than the set seconds, P's rung is limited to at most the clamp rung, whatever the table says. The lowest rung of the ladder (3) switches the clamp off.",
         "retry": "Waiting P requests otherwise ask for KV space in every scheduler round (code default 0 = busy loop, ticket #1530). With N greater than 0 they ask at most every N milliseconds, immediately on a change in the card ledger.",
@@ -98,19 +98,19 @@ ZIELE = {"seats": [1, 256], "kv_tokens": [1024, 8 << 20], "kontext_presets": [32
 POSITIONAL_FLAGS_ALL = ["--d-foreign-context-mib", "--d-nontorch-mib", "--pp-stage-ratio", "--pp-attn-stage-ratio", "--pp-cut-expert-device-fraction",
                         "--pp-cut-expert-lru-rows", "--user-reserve-mib", "--d-reserve-mib", "--pp-cut-reserve-mib", "--d-reshard-presets", "--p-barlink-bar1-window-mib"]
 POSITIONAL_TOKENS_ALL = ["--rank-role", "--rank-tp-ratio", "--rank-moe-ratio", "--rank-moe-resident-fraction", "--rank-user-reserve-mib", "--rank-gpu-memory-mib",
-                         "--pp-stage-ratio", "--pp-attn-stage-ratio", "SGLANG_MOE_SCRATCH_SLOTS", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "SGLANG_WEG2_L15_MIB",
-                         "SGLANG_WEG2_EXTEND_TRIM_MIB"]
+                         "--pp-stage-ratio", "--pp-attn-stage-ratio", "FLLIPER_MOE_SCRATCH_SLOTS", "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", "FLLIPER_PDFLIP_L15_MIB",
+                         "FLLIPER_PDFLIP_EXTEND_TRIM_MIB"]
 #: Aus der POSITIONAL-Liste des Launchers, die seine Topologie-Probe NICHT als Vektor je Karte zaehlt (launcher.py:6319-6328 _TOPOLOGY_VECTOR_FLAGS/-TOKENS):
 #: das BAR1-Fenster ("24,PP_0=96", Code BAR1-WINDOW), die d_reshard-Presets (nicht je Karte) und L1.5 (eigene Probe).  Sie bleiben Textfelder mit Katalogtext.
 #: Ein Test bildet _TOPOLOGY_VECTOR_FLAGS/-TOKENS aus dem Launcher-Quelltext nach und pinnt vector_names()/POSITIONAL_* dagegen.
-LAUNCHER_NICHT_JE_KARTE = ["--p-barlink-bar1-window-mib", "--d-reshard-presets", "SGLANG_WEG2_L15_MIB"]
+LAUNCHER_NICHT_JE_KARTE = ["--p-barlink-bar1-window-mib", "--d-reshard-presets", "FLLIPER_PDFLIP_L15_MIB"]
 POSITIONAL_FLAGS = [f for f in POSITIONAL_FLAGS_ALL if f not in LAUNCHER_NICHT_JE_KARTE]
 POSITIONAL_TOKENS = [t for t in POSITIONAL_TOKENS_ALL if t not in LAUNCHER_NICHT_JE_KARTE]
 #: Je-Karte-Vektoren aus den Abschnitten A-C, die der Launcher nicht positional fuehrt (je Eintrag ein Rang bzw. eine Stufe laut Katalogtext).
 #: Bewusst NICHT dabei: Kommalisten, die keine Rang-Vektoren sind (--pp-layer-set, --p-layer-split, --p-attn-head-split, --kv-reshard-vectors,
 #: --expert-placement-override, --d-kv-token-cut, --d-token-placement) und die Dual-/Planer-Listen (--dual-share-actuators, --cuda-graph-bs ...): die bleiben ein Textfeld.
 SECTION_VECTORS = ["--pp-layer-ratio", "--rank-gpu-id", "--rank-mlp-ratio", "--rank-vocab-ratio", "--rank-auto-reserve-mib", "--rank-kv-ratio",
-                   "SGLANG_UNEVEN_TOKEN_VECTOR", "--uneven-token-vector", "--d-uneven-token-vector", "SGLANG_UNEVEN_MOE_VECTOR"]
+                   "FLLIPER_UNEVEN_TOKEN_VECTOR", "--uneven-token-vector", "--d-uneven-token-vector", "FLLIPER_UNEVEN_MOE_VECTOR"]
 
 
 #: Je RANG (nicht je Karte): ``--rank-gpu-id`` nennt je Tensor-Parallel-Rang die physische Karte; Duplikate legen mehrere Raenge auf eine Karte

@@ -5,7 +5,7 @@ set -e
 # Usage: commit_and_pr.sh <version_type> <new_version> <branch_name>
 #
 # Arguments:
-#   version_type: "SGLang" or "sgl-kernel"
+#   version_type: "fLLiper" or "sgl-kernel"
 #   new_version: The new version number
 #   branch_name: The git branch name to push to
 

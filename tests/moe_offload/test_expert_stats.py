@@ -30,7 +30,7 @@ sys.path.insert(
     os.path.join(os.path.dirname(__file__), "..", "..", "python"),
 )
 
-from sglang.srt.layers.moe.expert_stats import (  # noqa: E402
+from flliper.srt.layers.moe.expert_stats import (  # noqa: E402
     DEFAULT_STATS_PATH,
     ExpertStatsCollector,
     LayerExpertStats,
@@ -45,17 +45,17 @@ from sglang.srt.layers.moe.expert_stats import (  # noqa: E402
 def _clean_collector():
     reset_for_tests()
     for name in (
-        "SGLANG_EXPERT_STATS",
-        "SGLANG_EXPERT_STATS_PATH",
-        "SGLANG_EXPERT_STATS_INTERVAL_SEC",
+        "FLLIPER_EXPERT_STATS",
+        "FLLIPER_EXPERT_STATS_PATH",
+        "FLLIPER_EXPERT_STATS_INTERVAL_SEC",
     ):
         os.environ.pop(name, None)
     yield
     reset_for_tests()
     for name in (
-        "SGLANG_EXPERT_STATS",
-        "SGLANG_EXPERT_STATS_PATH",
-        "SGLANG_EXPERT_STATS_INTERVAL_SEC",
+        "FLLIPER_EXPERT_STATS",
+        "FLLIPER_EXPERT_STATS_PATH",
+        "FLLIPER_EXPERT_STATS_INTERVAL_SEC",
     ):
         os.environ.pop(name, None)
 
@@ -153,7 +153,7 @@ def test_disabled_by_default():
 
 
 def test_enabled_returns_shared_per_layer_counter():
-    os.environ["SGLANG_EXPERT_STATS"] = "1"
+    os.environ["FLLIPER_EXPERT_STATS"] = "1"
     first = maybe_layer_stats(layer_id=5, num_experts=8, resident_count=2)
     second = maybe_layer_stats(layer_id=5, num_experts=8, resident_count=2)
     assert first is not None and first is second
@@ -163,8 +163,8 @@ def test_enabled_returns_shared_per_layer_counter():
 
 
 def test_path_override():
-    os.environ["SGLANG_EXPERT_STATS"] = "1"
-    os.environ["SGLANG_EXPERT_STATS_PATH"] = "/tmp/somewhere/else"
+    os.environ["FLLIPER_EXPERT_STATS"] = "1"
+    os.environ["FLLIPER_EXPERT_STATS_PATH"] = "/tmp/somewhere/else"
     collector = get_collector(rank_tag="tp1ep0")
     assert collector is not None
     assert collector.output_path() == "/tmp/somewhere/else.tp1ep0.json"
@@ -265,9 +265,9 @@ def test_periodic_dump_fires_when_interval_elapsed(tmp_path):
 _SIGNAL_CHILD = """
 import json, os, signal, sys
 sys.path.insert(0, {python_dir!r})
-os.environ["SGLANG_EXPERT_STATS"] = "1"
-os.environ["SGLANG_EXPERT_STATS_PATH"] = {prefix!r}
-from sglang.srt.layers.moe.expert_stats import get_collector, maybe_layer_stats
+os.environ["FLLIPER_EXPERT_STATS"] = "1"
+os.environ["FLLIPER_EXPERT_STATS_PATH"] = {prefix!r}
+from flliper.srt.layers.moe.expert_stats import get_collector, maybe_layer_stats
 
 stats = maybe_layer_stats(layer_id=0, num_experts=8, resident_count=4)
 stats.record([[0, 4], [1, 5]])
@@ -314,9 +314,9 @@ class _FakeMoELayer:
 
 
 def test_offload_cache_wires_the_counter_when_enabled():
-    from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+    from flliper.srt.layers.moe.expert_offload import MoEExpertOffloadCache
 
-    os.environ["SGLANG_EXPERT_STATS"] = "1"
+    os.environ["FLLIPER_EXPERT_STATS"] = "1"
     cache = MoEExpertOffloadCache(_FakeMoELayer(), fraction=0.25)
     assert cache._router_stats is not None
     assert cache._stats_collector is not None
@@ -334,7 +334,7 @@ def test_offload_cache_wires_the_counter_when_enabled():
 
 
 def test_offload_cache_has_no_counter_when_disabled():
-    from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+    from flliper.srt.layers.moe.expert_offload import MoEExpertOffloadCache
 
     cache = MoEExpertOffloadCache(_FakeMoELayer(), fraction=0.25)
     assert cache._router_stats is None
@@ -347,8 +347,8 @@ def test_offload_cache_has_no_counter_when_disabled():
 # --------------------------------------------------------------------------- #
 def _synthetic_smoke(out_dir: str) -> dict:
     """The whole instrument driven the way the offload path drives it."""
-    os.environ["SGLANG_EXPERT_STATS"] = "1"
-    os.environ["SGLANG_EXPERT_STATS_PATH"] = os.path.join(out_dir, "expert_stats")
+    os.environ["FLLIPER_EXPERT_STATS"] = "1"
+    os.environ["FLLIPER_EXPERT_STATS_PATH"] = os.path.join(out_dir, "expert_stats")
     reset_for_tests()
 
     num_experts, top_k, resident = 16, 4, 6

@@ -4,8 +4,8 @@ An instrument that cannot go RED when the thing did not happen, and GREEN when
 it did, is not an instrument. Both directions are proven here, plus the third
 state (NO_OBSERVATION) that this strand has already lost a reading to.
 
-Hermetic: no GPU, no boot, no sglang runtime. The module's two runtime lookups
-(`current_generation`, `bound_phase`) fail closed to "-" without sglang, and
+Hermetic: no GPU, no boot, no flliper runtime. The module's two runtime lookups
+(`current_generation`, `bound_phase`) fail closed to "-" without flliper, and
 the arming knob returns 0, so every path below is exercised with explicit
 state instead of ambient state.
 """
@@ -13,7 +13,7 @@ state instead of ambient state.
 import logging
 
 import pytest
-from sglang.srt.mem_cache.producer_phase_census import (
+from flliper.srt.mem_cache.producer_phase_census import (
     AdoptionSource,
     ObservationState,
     ProducerPhase,
@@ -302,7 +302,7 @@ def test_the_partition_reproduces_the_measured_eighteen():
 
 
 def test_dropped_ledger_entries_are_counted():
-    from sglang.srt.mem_cache import producer_phase_census as m
+    from flliper.srt.mem_cache import producer_phase_census as m
 
     original = m._LEDGER_MAX
     m._LEDGER_MAX = 2
@@ -320,7 +320,7 @@ def test_dropped_ledger_entries_are_counted():
 
 
 def test_cross_phase_window_is_never_sampled_away(monkeypatch, caplog):
-    from sglang.srt.mem_cache import producer_phase_census as m
+    from flliper.srt.mem_cache import producer_phase_census as m
 
     monkeypatch.setattr(m, "census_armed", lambda: 1000)
     c = ProducerPhaseCensus()
@@ -334,7 +334,7 @@ def test_cross_phase_window_is_never_sampled_away(monkeypatch, caplog):
 
 
 def test_disarmed_emits_nothing(caplog):
-    from sglang.srt.mem_cache import producer_phase_census as m
+    from flliper.srt.mem_cache import producer_phase_census as m
 
     c = ProducerPhaseCensus()
     c.note_walk(hit=True)
@@ -348,7 +348,7 @@ def test_disarmed_emits_nothing(caplog):
 # #939: the second half -- no double prefill
 # ========================================================================
 
-from sglang.srt.mem_cache.producer_phase_census import (  # noqa: E402
+from flliper.srt.mem_cache.producer_phase_census import (  # noqa: E402
     DoublePrefillCensus,
 )
 

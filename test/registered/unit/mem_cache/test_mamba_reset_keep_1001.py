@@ -2,7 +2,7 @@
 
 The D-rank sleep flush (``HybridReqToTokenPool.clear`` ->
 ``mamba_pool.reset_state``) zeroed EVERY mamba slot, which would wipe the
-compacted GDN anchors that ``weg2/l15_retain.py`` keeps in slots
+compacted GDN anchors that ``pdflip/l15_retain.py`` keeps in slots
 ``[1, A_H)``. ``reset_state(keep_rows=N)`` and ``clear(keep_mamba_rows=N)``
 must spare rows ``[0, N)`` of every slot-axis buffer (conv, temporal, the
 per-slot ReplaySSM rings and the per-slot write cursors); request/spec-row
@@ -15,12 +15,12 @@ CPU-only: the pool is built exactly like ``test_mamba_pool_floor.py``
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 
@@ -45,7 +45,7 @@ def _build_pool() -> HybridReqToTokenPool:
         i for i in range(GLOBAL_INTERVAL - 1, NUM_LAYERS, GLOBAL_INTERVAL)
     ]
     mamba_layers = [i for i in range(NUM_LAYERS) if i not in full_attention_layer_ids]
-    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+    with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
         shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=512,

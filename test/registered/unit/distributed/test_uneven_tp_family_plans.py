@@ -1,7 +1,7 @@
 """CPU unit tests for the NAMED family shard plans of uneven TP
-(--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR).
+(--rank-mlp-ratio / FLLIPER_UNEVEN_MLP_VECTOR).
 
-Covers the registry semantics in sglang.srt.distributed.utils (family
+Covers the registry semantics in flliper.srt.distributed.utils (family
 fallback to the base vector, isolation between the base plan and family
 plans, validation) and the loader consistency: layers constructed with
 tp_family="mlp" must partition their shapes AND their checkpoint offsets
@@ -10,7 +10,7 @@ by a full roundtrip (concatenation of all rank shards reconstructs the
 full tensor) with a family vector that DIFFERS from the base vector.
 
 No GPU, no distributed init: layer classes accept explicit
-tp_rank/tp_size; `sgl_kernel` is stubbed out before the sglang imports.
+tp_rank/tp_size; `sgl_kernel` is stubbed out before the flliper imports.
 """
 
 import importlib.util
@@ -46,7 +46,7 @@ _install_sgl_kernel_stub()
 
 import torch  # noqa: E402
 
-from sglang.srt.distributed.utils import (  # noqa: E402
+from flliper.srt.distributed.utils import (  # noqa: E402
     get_tp_partition_ratios,
     set_tp_partition_ratios,
     tp_loaded_shard_start,
@@ -54,13 +54,13 @@ from sglang.srt.distributed.utils import (  # noqa: E402
     tp_partition_sizes,
     tp_plan_active,
 )
-from sglang.srt.layers.linear import (  # noqa: E402
+from flliper.srt.layers.linear import (  # noqa: E402
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -306,7 +306,7 @@ class TestFamilyWeightLoading(FamilyPlanTestCase):
         # classic rank * shard_size.
         from types import SimpleNamespace
 
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         fake = SimpleNamespace(
             moe_tp_size=TP, moe_tp_units=self.INTERMEDIATE, moe_tp_family="moe"

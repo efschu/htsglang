@@ -9,7 +9,7 @@ main module and reads on.
 
 The behaviour test reproduces exactly that: the payload's first element makes
 the child import a module that sleeps 3 s (the stand-in for
-``sglang.launch_server``), followed by 2 MB (a ServerArgs above the pipe
+``flliper.launch_server``), followed by 2 MB (a ServerArgs above the pipe
 size). RED on fa548e7c46: ``proc.start()`` takes >= 3 s. GREEN with the fix:
 the payload travels by file reference, ``start()`` returns at once, and the
 child still receives the identical object.
@@ -27,9 +27,9 @@ import time
 import unittest
 
 try:  # the fix; absent on the base -> the old inline path (the RED case)
-    from sglang.srt.utils.spawn_payload import FILE_PREFIX, by_reference
+    from flliper.srt.utils.spawn_payload import FILE_PREFIX, by_reference
 except ImportError:  # pragma: no cover - base
-    FILE_PREFIX = "sglang-spawn-payload-"
+    FILE_PREFIX = "flliper-spawn-payload-"
 
     def by_reference(obj, **_kw):
         return obj
@@ -118,7 +118,7 @@ class TestSpawnPayloadByReference(unittest.TestCase):
     def test_stale_file_of_dead_writer_is_swept(self):
         """A parent SIGKILLed before its atexit leaves its unread payload
         behind; the next writer removes files of DEAD writers only."""
-        from sglang.srt.utils import spawn_payload as sp
+        from flliper.srt.utils import spawn_payload as sp
 
         d = tempfile.mkdtemp(prefix="bootzeit_h1_sweep_")
         dead = subprocess_dead_pid()
@@ -135,7 +135,7 @@ class TestSpawnPayloadByReference(unittest.TestCase):
         self.assertTrue(os.path.basename(ref.path).startswith(f"{FILE_PREFIX}{os.getpid()}-"))
 
     def test_scheduler_launch_passes_server_args_by_reference(self):
-        from sglang.srt.entrypoints import engine
+        from flliper.srt.entrypoints import engine
 
         src = inspect.getsource(engine.Engine._launch_scheduler_processes)
         self.assertIn("spawn_payload.by_reference(server_args)", src)

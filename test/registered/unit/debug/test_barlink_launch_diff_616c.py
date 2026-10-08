@@ -1,6 +1,6 @@
-"""Hermetic tests for sglang.srt.debug_utils.barlink_launch_diff."""
+"""Hermetic tests for flliper.srt.debug_utils.barlink_launch_diff."""
 
-from sglang.srt.debug_utils.barlink_launch_diff import (
+from flliper.srt.debug_utils.barlink_launch_diff import (
     diff_ranks,
     main,
     parse_file,

@@ -38,7 +38,7 @@ def eval_mmmu(args):
             if "InternVL" in args.model_path:
                 from transformers import AutoTokenizer
 
-                from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
+                from flliper.srt.multimodal.internvl_utils import image_to_pixel_values
 
                 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
                 model = AutoModel.from_pretrained(

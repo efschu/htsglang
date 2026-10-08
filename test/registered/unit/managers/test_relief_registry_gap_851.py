@@ -49,8 +49,8 @@ import ast
 import inspect
 import unittest
 
-from sglang.srt.managers import phase_flip_spill
-from sglang.srt.managers.funding_authority import MIB, authority_from_seam_snapshot
+from flliper.srt.managers import phase_flip_spill
+from flliper.srt.managers.funding_authority import MIB, authority_from_seam_snapshot
 
 
 def _declared_post_names():
@@ -147,7 +147,7 @@ class TestTheRegistryAsymmetry(unittest.TestCase):
         delivered nothing, but which can see a declared post holding credit,
         must not describe its sources as "nothing".
         """
-        from sglang.srt.managers import corridor_guard as cg
+        from flliper.srt.managers import corridor_guard as cg
 
         # W22's numbers: the gate wanted 3248 MiB against 2420 MiB free, with
         # an empty ladder (no provider registered), while kv-slack held credit.

@@ -1,19 +1,19 @@
 """GRANT-SUM + ACK-ROOM (NVFP4 dual1k dkr27bnvfp4dual1kbar1fs10010950, image
-y6e = freeze-final 90945aeba9, PP1 death 09:55:20Z, rid weg2-0-10).
+y6e = freeze-final 90945aeba9, PP1 death 09:55:20Z, rid pdflip-0-10).
 
 MEASURED (P log):
 
-    PP0  DUAL-TP3PP3 P-KV PP0 GRANT rid=weg2-0-9  tokens=61440 on all 3 cards
-    PP0  DUAL-TP3PP3 P-KV PP0 GRANT rid=weg2-0-10 tokens=20480 on all 3 cards
+    PP0  DUAL-TP3PP3 P-KV PP0 GRANT rid=pdflip-0-9  tokens=61440 on all 3 cards
+    PP0  DUAL-TP3PP3 P-KV PP0 GRANT rid=pdflip-0-10 tokens=20480 on all 3 cards
     PP1  MAPPED-BY-GRANT tokens=20480 ... returned=83886080 B   (level stays 61440)
-    PP0  #TW TWIN-TOLD rid=weg2-0-10 head=16383 told=16383; PF TOLD-ACKED acks={1: 16383, 2: 16383}
+    PP0  #TW TWIN-TOLD rid=pdflip-0-10 head=16383 told=16383; PF TOLD-ACKED acks={1: 16383, 2: 16383}
     PP0/PP2  resident=16383 (the twin head on the device);  PP1 resident=0 host_hit=16383
     PP1  SF LOADBACK-ROOM PP-RESIDUAL kv_tokens=12288 avail=1717 evictable=0
     PP1  #968 PREFIX MATERIALISATION SHORTFALL prefix_len=16383, holds 0 after 0.00 s
 
 Root: the dual P KV mapping is ONE high-water level shared by every request
-P holds, and each grant was sized for its own prompt only -- weg2-0-10's 20480
-fit "under" weg2-0-9's 61440 level although weg2-0-9's prefill was filling it.
+P holds, and each grant was sized for its own prompt only -- pdflip-0-10's 20480
+fit "under" pdflip-0-9's 61440 level although pdflip-0-9's prefill was filling it.
 PP1, the one stage that held the twin head on its host only, had to load it
 back and found no room. Not an anchor depth off-by-one (16383 on every rank).
 
@@ -35,12 +35,12 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.managers import weg2_told_fallback as fb  # noqa: E402
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
-from sglang.srt.weg2 import dual_p_kv_stage as S  # noqa: E402
+from flliper.srt.managers import pdflip_told_fallback as fb  # noqa: E402
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
+from flliper.srt.pdflip import dual_p_kv_stage as S  # noqa: E402
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture  # noqa: E402
 
@@ -65,17 +65,17 @@ def _req(rid, n, granted=0):
 
 
 def test_live_grant_tokens_counts_every_other_granted_request_once():
-    r9 = _req("weg2-0-9", 61440, granted=61440)
-    r10 = _req("weg2-0-10", 19681)
-    plain = _req("weg2-0-8", 500)                      # no grant: not counted
+    r9 = _req("pdflip-0-9", 61440, granted=61440)
+    r10 = _req("pdflip-0-10", 19681)
+    plain = _req("pdflip-0-8", 500)                      # no grant: not counted
     sched = SimpleNamespace(running_batch=SimpleNamespace(reqs=[r9]), running_mbs=[SimpleNamespace(reqs=[r9])],
-                            chunked_req=None, waiting_queue=[plain, r10], _weg2_store_held={"weg2-0-10": r10})
+                            chunked_req=None, waiting_queue=[plain, r10], _pdflip_store_held={"pdflip-0-10": r10})
     assert S.live_grant_tokens(sched, r10, 64) == 61440 + 64
 
 
 def test_pp0_grant_sizes_the_level_for_all_held_requests(monkeypatch):
-    """RED on 90945aeba9: the grant asked 19681+64 tokens for weg2-0-10 while
-    weg2-0-9 (61440) held the same high-water mapping."""
+    """RED on 90945aeba9: the grant asked 19681+64 tokens for pdflip-0-10 while
+    pdflip-0-9 (61440) held the same high-water mapping."""
     d = tempfile.mkdtemp(prefix="wkvs")
     stages = [{"ledger": os.path.join(d, f"c{i}"), "step": 4096, "top": 196608, "bytes": [0] * 64}
               for i in range(3)]
@@ -93,8 +93,8 @@ def test_pp0_grant_sizes_the_level_for_all_held_requests(monkeypatch):
         return S.round_up(tokens, 4096)
 
     monkeypatch.setattr(S, "group_grant", _grant)
-    r9 = _req("weg2-0-9", 61440, granted=61440)
-    r10 = _req("weg2-0-10", 19681)
+    r9 = _req("pdflip-0-9", 61440, granted=61440)
+    r10 = _req("pdflip-0-10", 19681)
     sched = SimpleNamespace(ps=SimpleNamespace(pp_rank=0, pp_size=3),
                             running_batch=SimpleNamespace(reqs=[r9]), waiting_queue=[r10])
     lvl = S.pp0_grant(sched, r10)
@@ -126,7 +126,7 @@ def _host_only_span_with_anchor(monkeypatch):
 
 
 def _follower(cache):
-    return SimpleNamespace(tree_cache=cache, _weg2_store_told={REQ: TOLD},
+    return SimpleNamespace(tree_cache=cache, _pdflip_store_told={REQ: TOLD},
                            ps=SimpleNamespace(pp_rank=1, pp_size=3, tp_size=1))
 
 

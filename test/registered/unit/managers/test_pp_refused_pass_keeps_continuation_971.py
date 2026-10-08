@@ -105,18 +105,18 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers.pp_admission_congruence import (
     PPAdmissionDecision,
     PPAdmissionEntry,
 )
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.utils.common import Range
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.utils.common import Range
 
 try:
-    from sglang.srt.managers.schedule_policy import PPScheduleRefused
+    from flliper.srt.managers.schedule_policy import PPScheduleRefused
 except ImportError:  # the exception lives beside the guard, not the policy
-    from sglang.srt.managers.pp_admission_congruence import PPScheduleRefused
+    from flliper.srt.managers.pp_admission_congruence import PPScheduleRefused
 
 
 #: The specimen's geometry, verbatim from the boot log.
@@ -188,12 +188,12 @@ def _real_adder(scheduled_extents):
     `add_chunked_req`'s arithmetic, its budget update and its return value are
     the product's own. Mirrors `test_pp_forwarded_schedule_791._adder`.
     """
-    from sglang.srt.managers.schedule_policy import PrefillAdder
-    from sglang.srt.mem_cache.base_prefix_cache import (
+    from flliper.srt.managers.schedule_policy import PrefillAdder
+    from flliper.srt.mem_cache.base_prefix_cache import (
         DecLockRefResult,
         IncLockRefResult,
     )
-    from sglang.srt.server_args import (
+    from flliper.srt.server_args import (
         ServerArgs,
         set_global_server_args_for_scheduler,
     )
@@ -366,7 +366,7 @@ def _refused_pass(h):
 
 
 def _locations(h):
-    from sglang.srt.managers.scheduler_pp_mixin import pp_request_locations
+    from flliper.srt.managers.scheduler_pp_mixin import pp_request_locations
 
     return pp_request_locations(h)
 
@@ -405,7 +405,7 @@ class TheSiblingVoidSitesAreUnchanged(unittest.TestCase):
     default is pinned here rather than assumed."""
 
     def _park(self, req, **kw):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             _park_chunked_prefill_chunk,
         )
 

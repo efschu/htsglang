@@ -49,20 +49,20 @@ import os
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.layers.dcp.owner import (
     draft_kv_layout_is_dcp,
     draft_pool_is_replicated,
     reject_multi_layer_draft_kv_dcp,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 WEIGHTED_ENV = {
-    "SGLANG_UNEVEN_DCP": "1",
-    "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+    "FLLIPER_UNEVEN_DCP": "1",
+    "FLLIPER_UNEVEN_DCP_WEIGHTED": "1",
 }
 
 
@@ -182,9 +182,9 @@ class TestDraftKvLayoutDcpRefusals(unittest.TestCase):
     def test_off_the_weighted_lane_is_rejected(self):
         # no env pair at all
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_UNEVEN_DCP", None)
-            os.environ.pop("SGLANG_UNEVEN_DCP_WEIGHTED", None)
-            self._assert_rejects(admitted_args(), "SGLANG_UNEVEN_DCP")
+            os.environ.pop("FLLIPER_UNEVEN_DCP", None)
+            os.environ.pop("FLLIPER_UNEVEN_DCP_WEIGHTED", None)
+            self._assert_rejects(admitted_args(), "FLLIPER_UNEVEN_DCP")
 
     def test_uniform_ratio_is_rejected(self):
         """A uniform vector is not a weighted plan: there is no non-trivial
@@ -274,7 +274,7 @@ class TestGateRunsAfterArgResolution(unittest.TestCase):
       --speculative-algorithm  NEXTN -> EAGLE (handle_speculative_decoding)
       --speculative-eagle-topk defaulted, not necessarily user-supplied
       --rank-tp-ratio          'auto-performance' -> a concrete vector
-      dcp_size                 auto-set to tp_size under SGLANG_UNEVEN_DCP
+      dcp_size                 auto-set to tp_size under FLLIPER_UNEVEN_DCP
 
     Placed in ``_handle_dcp_validation`` (where the sibling DCP gates live) it
     reads every one of them RAW. Measured on the rig: a correct TP=3
@@ -338,7 +338,7 @@ class TestDraftKvLayoutDcpAcceptsTheFlagRoute(unittest.TestCase):
 
     (``managers/scheduler.py:5952-5958``), and
     ``uneven_weighted_dcp_enabled`` (``server_args.py:8457``) is
-    ``SGLANG_UNEVEN_DCP_WEIGHTED=1 OR uneven_kv_flag_active()``. So a boot
+    ``FLLIPER_UNEVEN_DCP_WEIGHTED=1 OR uneven_kv_flag_active()``. So a boot
     that reaches the weighted rule through ``--rank-kv-ratio`` is on the same
     machinery as one that reaches it through the env pair. The sibling
     speculation x DCP gate already accepts both spellings
@@ -350,7 +350,7 @@ class TestDraftKvLayoutDcpAcceptsTheFlagRoute(unittest.TestCase):
     def _no_env(self):
         return patch.dict(
             os.environ,
-            {"SGLANG_UNEVEN_DCP": "0", "SGLANG_UNEVEN_DCP_WEIGHTED": "0"},
+            {"FLLIPER_UNEVEN_DCP": "0", "FLLIPER_UNEVEN_DCP_WEIGHTED": "0"},
         )
 
     def test_rank_kv_ratio_modes_reach_the_weighted_lane(self):
@@ -384,8 +384,8 @@ class TestDraftKvLayoutDcpAcceptsTheFlagRoute(unittest.TestCase):
                     with patch.dict(
                         os.environ,
                         {
-                            "SGLANG_UNEVEN_DCP": "0",
-                            "SGLANG_UNEVEN_DCP_WEIGHTED": weighted_env,
+                            "FLLIPER_UNEVEN_DCP": "0",
+                            "FLLIPER_UNEVEN_DCP_WEIGHTED": weighted_env,
                         },
                     ):
                         args = admitted_args(rank_kv_ratio=kv_ratio)
@@ -396,14 +396,14 @@ class TestDraftKvLayoutDcpAcceptsTheFlagRoute(unittest.TestCase):
                             with self.assertRaises(ValueError):
                                 args._reject_unsupported_draft_kv_dcp()
 
-    def test_sglang_uneven_dcp_alone_is_not_the_weighted_rule(self):
-        """``SGLANG_UNEVEN_DCP=1`` only auto-sets ``dcp_size`` -- it installs
+    def test_flliper_uneven_dcp_alone_is_not_the_weighted_rule(self):
+        """``FLLIPER_UNEVEN_DCP=1`` only auto-sets ``dcp_size`` -- it installs
         no token vector (``server_args.py:9845``). The gate used to demand it
         as a separate condition even though ``dcp_size == tp_size`` is checked
         directly, so it read as a second, redundant lock."""
         with patch.dict(
             os.environ,
-            {"SGLANG_UNEVEN_DCP": "1", "SGLANG_UNEVEN_DCP_WEIGHTED": "0"},
+            {"FLLIPER_UNEVEN_DCP": "1", "FLLIPER_UNEVEN_DCP_WEIGHTED": "0"},
         ):
             with self.assertRaises(ValueError):
                 admitted_args()._reject_unsupported_draft_kv_dcp()

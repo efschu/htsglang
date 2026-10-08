@@ -58,7 +58,7 @@ def build_argv(census_dir, pool, budget):
 
 
 def solve_inproc(census_dir, pool, budget):
-    from sglang.srt.server_args import prepare_server_args
+    from flliper.srt.server_args import prepare_server_args
     buf = io.StringIO()
     try:
         with __import__("contextlib").redirect_stdout(buf), \

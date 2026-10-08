@@ -15,7 +15,7 @@
 """Measure the prefill activation peak and the graph-capture cost, per rank.
 
     # 1. boot the target recipe with the instrumentation env var set
-    SGLANG_PHASE_FOOTPRINT_DUMP=/spinning/footprints /root/bin/start-serving-30030.sh
+    FLLIPER_PHASE_FOOTPRINT_DUMP=/spinning/footprints /root/bin/start-serving-30030.sh
     # 2. drive a representative deep prefill
     # 3. fold the per-rank dumps into a fingerprinted calibration
     python scripts/vram_ledger/probe_activation.py ingest \\
@@ -48,7 +48,7 @@ peak). Each rank writes one JSON file; ``ingest`` folds them into the
 fingerprinted store the ledger reads.
 
 The in-process hook lives in
-:func:`sglang.srt.mem_ledger.activation_probe.record_phase_footprint` so that the
+:func:`flliper.srt.mem_ledger.activation_probe.record_phase_footprint` so that the
 serving process needs no import of this script. This file is the CLI and the
 ingest half.
 """
@@ -92,7 +92,7 @@ def load_dumps(dump_dir: str, boot_token: Optional[str] = None) -> List[dict]:
     # FIX #1292: the pattern used to be "phase_footprint_rank*.json". It now
     # also matches the group-qualified shape "phase_footprint_P_rank0.json"
     # / "phase_footprint_D_rank0.json" that
-    # sglang.srt.mem_ledger.activation_probe.dump_filename() writes, so a
+    # flliper.srt.mem_ledger.activation_probe.dump_filename() writes, so a
     # directory holding both Weg-2 groups' dumps is read whole rather than
     # half-ignored.
     #
@@ -106,7 +106,7 @@ def load_dumps(dump_dir: str, boot_token: Optional[str] = None) -> List[dict]:
     # keeps the pre-#1395 flat-root read, byte-identical, for old dumps and
     # for callers who deliberately do not care which boot -- but is told, by
     # name, when boot-tagged subdirectories exist and were NOT read.
-    from sglang.srt.mem_ledger.activation_probe import _boot_subdir
+    from flliper.srt.mem_ledger.activation_probe import _boot_subdir
 
     out = []
     if boot_token is not None:
@@ -159,7 +159,7 @@ def _ingest_one_group(
     groups' otherwise-valid measurements just because they disagree, which
     two independently-launched Weg-2 process groups always will).
     """
-    from sglang.srt.mem_ledger.activation import (
+    from flliper.srt.mem_ledger.activation import (
         ActivationProfile,
         FootprintProvenance,
         PhaseFootprint,
@@ -248,7 +248,7 @@ def ingest(
     dump_dir: str, cache_dir: Optional[str] = None,
     boot_token: Optional[str] = None,
 ) -> int:
-    from sglang.srt.mem_ledger.activation import profile_digest_from_canonical
+    from flliper.srt.mem_ledger.activation import profile_digest_from_canonical
 
     dumps = load_dumps(dump_dir, boot_token=boot_token)
     if not dumps:
@@ -262,7 +262,7 @@ def ingest(
         else:
             print(
                 f"No rank dumps in {dump_dir}. Boot the recipe with "
-                "SGLANG_PHASE_FOOTPRINT_DUMP set to that directory, drive a "
+                "FLLIPER_PHASE_FOOTPRINT_DUMP set to that directory, drive a "
                 "representative prefill, then re-run ingest."
             )
         return 1
@@ -270,7 +270,7 @@ def ingest(
     # FIX #1292: group by profile digest instead of refusing the whole
     # ingest on >1 profile. Two Weg-2 groups (P, D) legitimately share one
     # dump directory today (the existing recipe arms both with the same
-    # SGLANG_PHASE_FOOTPRINT_DUMP) and always carry two different profiles
+    # FLLIPER_PHASE_FOOTPRINT_DUMP) and always carry two different profiles
     # (different tp_size/pp_size) -- that is not a bad measurement, it is
     # two good ones. Each group gets its own cache write and its own
     # printed verdict block; they are never folded into one.
@@ -294,7 +294,7 @@ def ingest(
 
 
 def show(cache_dir: Optional[str] = None) -> int:
-    from sglang.srt.mem_ledger.activation import (
+    from flliper.srt.mem_ledger.activation import (
         REFERENCE_WINDOW_FINGERPRINT,
         reference_window_footprints,
     )

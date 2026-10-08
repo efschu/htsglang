@@ -1,36 +1,36 @@
 import json
 import unittest
 
-from sglang.srt.entrypoints.openai.protocol import (
+from flliper.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult
-from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
-from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
-from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
-from sglang.srt.function_call.gemma4_detector import (
+from flliper.srt.function_call.base_format_detector import BaseFormatDetector
+from flliper.srt.function_call.core_types import StreamingParseResult
+from flliper.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from flliper.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from flliper.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from flliper.srt.function_call.gemma4_detector import (
     Gemma4Detector,
     _parse_gemma4_args,
     _parse_gemma4_array,
     _parse_gemma4_value,
 )
-from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
-from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
-from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
-from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
-from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.kimik2_detector import KimiK2Detector
-from sglang.srt.function_call.lfm2_detector import Lfm2Detector
-from sglang.srt.function_call.llama32_detector import Llama32Detector
-from sglang.srt.function_call.mistral_detector import MistralDetector
-from sglang.srt.function_call.pythonic_detector import PythonicDetector
-from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
-from sglang.srt.function_call.utils import get_schema_properties
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.function_call.gigachat3_detector import GigaChat3Detector
+from flliper.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from flliper.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from flliper.srt.function_call.gpt_oss_detector import GptOssDetector
+from flliper.srt.function_call.json_array_parser import JsonArrayParser
+from flliper.srt.function_call.kimik2_detector import KimiK2Detector
+from flliper.srt.function_call.lfm2_detector import Lfm2Detector
+from flliper.srt.function_call.llama32_detector import Llama32Detector
+from flliper.srt.function_call.mistral_detector import MistralDetector
+from flliper.srt.function_call.pythonic_detector import PythonicDetector
+from flliper.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from flliper.srt.function_call.utils import get_schema_properties
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=61, suite="base-c-test-cpu")
@@ -1164,7 +1164,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from flliper.srt.utils.hf_transformers_utils import get_tokenizer
 
         self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
@@ -1614,7 +1614,7 @@ class TestDeepSeekV4Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV4Detector()
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from flliper.srt.utils.hf_transformers_utils import get_tokenizer
 
         self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
@@ -3235,13 +3235,13 @@ class TestGlm47MoeDetector(unittest.TestCase):
     def test_required_tool_choice_falls_back_when_native_tag_is_unavailable(self):
         from unittest.mock import patch
 
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
-        from sglang.srt.function_call.glm47_moe_detector import (
+        from flliper.srt.function_call.function_call_parser import FunctionCallParser
+        from flliper.srt.function_call.glm47_moe_detector import (
             _glm47_native_structural_tag_available,
         )
 
         with patch(
-            "sglang.srt.function_call.glm47_moe_detector.get_model_structural_tag",
+            "flliper.srt.function_call.glm47_moe_detector.get_model_structural_tag",
             None,
         ):
             _glm47_native_structural_tag_available.cache_clear()
@@ -3605,7 +3605,7 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(result.calls, [])
 
     def test_detect_and_parse_unknown_function(self):
-        """Test parsing with unknown function name - skipped by default (SGLANG_FORWARD_UNKNOWN_TOOLS=false)."""
+        """Test parsing with unknown function name - skipped by default (FLLIPER_FORWARD_UNKNOWN_TOOLS=false)."""
         text = '<|tool_call_start|>[unknown_function(arg="value")]<|tool_call_end|>'
         result = self.detector.detect_and_parse(text, self.tools)
 
@@ -4255,7 +4255,7 @@ class TestGetStructureConstraint(unittest.TestCase):
         ]
 
     def _make_parser(self, parser_name, strict=False):
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from flliper.srt.function_call.function_call_parser import FunctionCallParser
 
         return FunctionCallParser(self._make_tools(strict=strict), parser_name)
 
@@ -4304,7 +4304,7 @@ class TestGetStructureConstraint(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_kimi_named_tool_choice_returns_structural_tag(self):
-        from sglang.srt.entrypoints.openai.protocol import (
+        from flliper.srt.entrypoints.openai.protocol import (
             ToolChoice,
             ToolChoiceFuncName,
         )
@@ -4365,7 +4365,7 @@ class TestGetStructureConstraint(unittest.TestCase):
         through the xgrammar builtin)."""
         import inspect
 
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from flliper.srt.function_call.function_call_parser import FunctionCallParser
 
         sig = inspect.signature(FunctionCallParser.get_structure_constraint)
         self.assertIs(sig.parameters["thinking_mode"].default, False)
@@ -4375,7 +4375,7 @@ class TestQwen25Detector(unittest.TestCase):
     """Test Qwen25Detector streaming and non-streaming multi-tool-call parsing."""
 
     def setUp(self):
-        from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+        from flliper.srt.function_call.qwen25_detector import Qwen25Detector
 
         self.detector = Qwen25Detector()
         self.tools = [

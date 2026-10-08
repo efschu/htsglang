@@ -1,16 +1,16 @@
 """Q-1930 #968 ANCESTOR-RETARGET (27B NVFP4 dual hb 0ceb3699f8, boot
 dkr27bnvfp4dual1mpsleepsharegreentop112bar1fs10050428, P PP1 W17 04:33:13Z,
-rid weg2-0-4).
+rid pdflip-0-4).
 
 The race replayed on the follower's tree shape (debug-hold rank1_pid787):
 PP0 lost its 53248 anchor (node 51788..53248 evicted host=False, a tree edge
-only PP0 had after its PP0-only L3 read of weg2-0-3 fell back to told=0), so
+only PP0 had after its PP0-only L3 read of pdflip-0-3 fell back to told=0), so
 PP0 decided prefix_len=49152 from its host anchor at 49152. PP1 still held the
 node 49152..53248 with a host-backed state, its best_match_node was that node,
 the load-back served 53248 with the anchor adopted at 53248 -> #968 SHORTFALL.
 PP1 ALSO held the 49152 node with a host-backed state.
 
-Pinned: with SGLANG_WEG2_968_ANCESTOR_RETARGET=1 the follower loads back from
+Pinned: with FLLIPER_PDFLIP_968_ANCESTOR_RETARGET=1 the follower loads back from
 the ancestor ending at the decision (exactly 49152, state at 49152); without
 the gate, or without a host state at the decision, the #968 stop stands.
 """
@@ -25,12 +25,12 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-import sglang.srt.managers.pp_admission_congruence as congruence  # noqa: E402
-from sglang.srt.managers.pp_admission_congruence import (  # noqa: E402
+import flliper.srt.managers.pp_admission_congruence as congruence  # noqa: E402
+from flliper.srt.managers.pp_admission_congruence import (  # noqa: E402
     ENV_ANCESTOR_RETARGET,
     execute_scheduled_prefix,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (  # noqa: E402
     ComponentType,
 )
 
@@ -83,7 +83,7 @@ def _follower(state_at_decision=True):
     b = _Node(a, DECISION - 45056, host_state=state_at_decision)  # ..49152
     c = _Node(b, DEEP - DECISION)                            # ..53248, host state
     req = SimpleNamespace(
-        rid="weg2-0-4",
+        rid="pdflip-0-4",
         prefix_indices=torch.arange(0),
         cache_protected_len=0,
         host_hit_length=DECISION,

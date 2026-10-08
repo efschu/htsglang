@@ -11,10 +11,10 @@ import flashinfer
 import sgl_kernel
 import torch
 
-from sglang.jit_kernel.benchmark.utils import DEFAULT_DTYPE
-from sglang.jit_kernel.utils import KERNEL_PATH
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.jit_kernel.benchmark.utils import DEFAULT_DTYPE
+from flliper.jit_kernel.utils import KERNEL_PATH
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=120,
@@ -25,9 +25,9 @@ register_cuda_ci(
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = (
-    Path(os.environ["SGLANG_NVFP4_REPO_ROOT"])
-    if os.environ.get("SGLANG_NVFP4_REPO_ROOT")
-    # Anchor on the installed jit_kernel package (python/sglang/jit_kernel) so
+    Path(os.environ["FLLIPER_NVFP4_REPO_ROOT"])
+    if os.environ.get("FLLIPER_NVFP4_REPO_ROOT")
+    # Anchor on the installed jit_kernel package (python/flliper/jit_kernel) so
     # this stays correct regardless of where the benchmark file lives.
     else KERNEL_PATH.parents[2]
 )

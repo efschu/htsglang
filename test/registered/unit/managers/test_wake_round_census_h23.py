@@ -15,13 +15,13 @@ import logging
 import types
 import unittest
 
-from sglang.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
-from sglang.srt.managers.scheduler_components.wake_round_census import (
+from flliper.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
+from flliper.srt.managers.scheduler_components.wake_round_census import (
     WakeRoundCensus,
     cold_term,
     fold_families,
 )
-from sglang.srt.utils.collective_clock import ClockBackend, CollectiveClock
+from flliper.srt.utils.collective_clock import ClockBackend, CollectiveClock
 
 
 class _State:
@@ -84,8 +84,8 @@ class WakeRoundCensusTest(unittest.TestCase):
         self.log = DecodeRoundLog(clock=self.clock, rank=0)
         self.cap = _Capture()
         for name in (
-            "sglang.srt.managers.scheduler_components.decode_round_log",
-            "sglang.srt.managers.scheduler_components.wake_round_census",
+            "flliper.srt.managers.scheduler_components.decode_round_log",
+            "flliper.srt.managers.scheduler_components.wake_round_census",
         ):
             lg = logging.getLogger(name)
             lg.addHandler(self.cap)
@@ -204,25 +204,25 @@ class WakeRoundCensusTest(unittest.TestCase):
 class SchedulerArmsOnTheFirstPassTest(unittest.TestCase):
     def test_pass_zero_arms_with_the_wake_time_and_later_passes_do_not(self):
         """The wake arms the post-wake pass counter (weight_updater); the
-        scheduler's pass 0 arms the census with ``_weg2_last_wake_t``. Passes
+        scheduler's pass 0 arms the census with ``_pdflip_last_wake_t``. Passes
         1..7 must not re-arm (that would restart n=1 in mid-burst)."""
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         arms = []
         drl = types.SimpleNamespace(arm_wake_census=lambda *, wake_mono: arms.append(wake_mono))
         stub = types.SimpleNamespace(
-            _weg2_post_wake_pass_n=0,
-            _weg2_last_wake_t=123.25,
+            _pdflip_post_wake_pass_n=0,
+            _pdflip_last_wake_t=123.25,
             metrics_reporter=types.SimpleNamespace(decode_round_log=drl),
         )
-        stub._weg2_arm_wake_round_census = (
-            lambda: Scheduler._weg2_arm_wake_round_census(stub)
+        stub._pdflip_arm_wake_round_census = (
+            lambda: Scheduler._pdflip_arm_wake_round_census(stub)
         )
         batch = types.SimpleNamespace(forward_mode=None, reqs=[])
         for _ in range(3):
-            Scheduler._weg2_post_wake_pass_log(stub, batch)
+            Scheduler._pdflip_post_wake_pass_log(stub, batch)
         self.assertEqual(arms, [123.25])
-        self.assertEqual(stub._weg2_post_wake_pass_n, 3)
+        self.assertEqual(stub._pdflip_post_wake_pass_n, 3)
 
 
 if __name__ == "__main__":

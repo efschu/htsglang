@@ -12,17 +12,17 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest  # noqa: E402
 
-from sglang.srt.weg2 import dual_d_kv_stage as DK  # noqa: E402
-from sglang.srt.weg2 import dual_d_unbacked_drop as UD  # noqa: E402
+from flliper.srt.pdflip import dual_d_kv_stage as DK  # noqa: E402
+from flliper.srt.pdflip import dual_d_unbacked_drop as UD  # noqa: E402
 
-DUAL_D = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D", DK.MAX_TOKENS_ENV: "131072"}
+DUAL_D = {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D", DK.MAX_TOKENS_ENV: "131072"}
 ON = dict(DUAL_D, **{UD.ENV_NAME: "1"})
 
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     for k in list(os.environ):
-        if k.startswith("SGLANG_WEG2_"):
+        if k.startswith("FLLIPER_PDFLIP_"):
             monkeypatch.delenv(k, raising=False)
 
 
@@ -38,9 +38,9 @@ def test_default_off_and_gate(monkeypatch):
     assert UD.switch_on() is False                      # dual D armed, switch unset = OFF
     monkeypatch.setenv(UD.ENV_NAME, "1")
     assert UD.switch_on() is True
-    for bad in ({}, {"SGLANG_WEG2_GROUP": "P"}, {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"},
-                {"SGLANG_WEG2_GROUP": "D", DK.MAX_TOKENS_ENV: "131072"},      # flip form (no dual layout)
-                {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D"}):  # no D cap: not armed
+    for bad in ({}, {"FLLIPER_PDFLIP_GROUP": "P"}, {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P"},
+                {"FLLIPER_PDFLIP_GROUP": "D", DK.MAX_TOKENS_ENV: "131072"},      # flip form (no dual layout)
+                {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D"}):  # no D cap: not armed
         assert UD.switch_on(dict(bad, **{UD.ENV_NAME: "1"})) is False
 
 
@@ -74,7 +74,7 @@ class FakeNode:
 
 
 def make_tree(order, ongoing=None):
-    from sglang.srt.mem_cache import unified_radix_cache as U
+    from flliper.srt.mem_cache import unified_radix_cache as U
 
     t = types.SimpleNamespace(
         cache_controller=types.SimpleNamespace(write_policy="write_back"),
@@ -180,8 +180,8 @@ def test_proposal_needs_arena_refusal_then_expires(monkeypatch):
 def run_tick(monkeypatch, env, *, holds, demand, p_wait_ms, order_elem, arena_need=0):
     setenv(monkeypatch, env)
     calls = []
-    from sglang.srt.weg2 import d_seat_vram as SV, dual_arena_spill as DAS
-    from sglang.srt.weg2 import card_kv_ledger as CL
+    from flliper.srt.pdflip import d_seat_vram as SV, dual_arena_spill as DAS
+    from flliper.srt.pdflip import card_kv_ledger as CL
 
     monkeypatch.setattr(SV, "_air", lambda s: 0)
     monkeypatch.setattr(CL, "peek", lambda path: types.SimpleNamespace(demand={"P": 1}, pressure={}, pid={"P": 1}))
@@ -210,7 +210,7 @@ def run_tick(monkeypatch, env, *, holds, demand, p_wait_ms, order_elem, arena_ne
         group_grow=lambda *a: None, _p_wait_since=1.0)
     monkeypatch.setattr(DK._pk, "_now", lambda: 1.0 + p_wait_ms / 1000.0)
     sched = types.SimpleNamespace(
-        tp_rank=0, weg2_d_parked=[object()] if holds else [], tree_cache=None,
+        tp_rank=0, pdflip_d_parked=[object()] if holds else [], tree_cache=None,
         tp_worker=types.SimpleNamespace(model_runner=types.SimpleNamespace(**{DK.ACTOR_ATTR: actor})))
     DK.tick(sched)
     return calls, seen

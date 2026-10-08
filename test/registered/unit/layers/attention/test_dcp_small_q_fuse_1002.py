@@ -26,7 +26,7 @@ import torch
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.layers.dcp import comm  # noqa: E402
+from flliper.srt.layers.dcp import comm  # noqa: E402
 
 _H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_dcp_collective_fusion_0926.py")
 _spec = importlib.util.spec_from_file_location("_dcp_fusion_0926", _H)
@@ -68,8 +68,8 @@ def test_forced_merge_is_bit_identical_and_one_collective():
             return comm.cp_lse_ag_out_a2a_mha_uneven(w.o[r], w.lse[r], grp, w.counts, return_lse=True,
                                                      force_fused=True)
 
-        with mock.patch.dict(os.environ, {"SGLANG_DCP_LSE_MERGE": "a2a"}):
-            os.environ.pop("SGLANG_DCP_LSE_MERGE_FUSED", None)        # the global switch stays OFF
+        with mock.patch.dict(os.environ, {"FLLIPER_DCP_LSE_MERGE": "a2a"}):
+            os.environ.pop("FLLIPER_DCP_LSE_MERGE_FUSED", None)        # the global switch stays OFF
             _reset_all()
             base, log_b = F._run_world(3, base_call)
             _reset_all()
@@ -83,9 +83,9 @@ def test_forced_merge_is_bit_identical_and_one_collective():
 
 
 def test_kvq_fusable_honours_the_force(monkeypatch):
-    from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend as B
+    from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend as B
 
-    monkeypatch.delenv("SGLANG_DCP_FUSE_KVQ_GATHER", raising=False)
+    monkeypatch.delenv("FLLIPER_DCP_FUSE_KVQ_GATHER", raising=False)
     _reset_all()
     self_ = SimpleNamespace(uneven_dcp=True, dcp_kv_replicated_heads=False, weightless_kv=False)
     layer = SimpleNamespace(tp_k_head_num=2, tp_v_head_num=2, head_dim=8)
@@ -99,7 +99,7 @@ def test_kvq_fusable_honours_the_force(monkeypatch):
 
 
 def test_wiring():
-    from sglang.srt.layers.attention import flashinfer_backend as fb
+    from flliper.srt.layers.attention import flashinfer_backend as fb
 
     src = inspect.getsource(fb.FlashInferAttnBackend._forward_extend_dcp)
     assert "_dcp_comm.small_q_fuse_applies(" in src

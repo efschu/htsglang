@@ -4,9 +4,9 @@ import io
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
-from sglang.srt.planner.cli import main
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner.cli import main
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -77,7 +77,7 @@ class TestScenariosThroughThePlannerCli(CustomTestCase):
 
     def test_it_prints_the_command_that_drives_the_existing_harness(self):
         rc, out, _ = run(["--scenario", "noise_floor"])
-        self.assertIn("python -m sglang.benchmark.serving", out)
+        self.assertIn("python -m flliper.benchmark.serving", out)
 
     def test_an_unknown_key_fails_loudly(self):
         rc, _, err = run(["--scenario", "not_a_scenario"])
@@ -99,7 +99,7 @@ class TestScenariosThroughThePlannerCli(CustomTestCase):
 class TestTheOtherDoorIsClosed(CustomTestCase):
     def test_the_rigmon_cli_no_longer_offers_levers_or_scenarios(self):
         """One concept, one front door: the rigmon CLI is host telemetry."""
-        from sglang.srt.rigmon.__main__ import build_parser
+        from flliper.srt.rigmon.__main__ import build_parser
 
         actions = build_parser()._subparsers._group_actions[0].choices
         self.assertNotIn("levers", actions)

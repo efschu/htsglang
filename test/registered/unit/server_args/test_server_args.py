@@ -7,20 +7,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.environ import envs
-from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
-from sglang.srt.model_executor.cuda_graph_config import (
+import flliper.srt.server_args as server_args_module
+from flliper.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from flliper.srt.environ import envs
+from flliper.srt.layers.cp.base import is_cp_enabled, is_interleave
+from flliper.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
     Phase,
     PhaseConfig,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
-from sglang.srt.server_args_config_parser import ConfigArgumentMerger
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import (
+from flliper.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from flliper.srt.server_args_config_parser import ConfigArgumentMerger
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
 )
@@ -29,7 +29,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=12, suite="base-c-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners
-_mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
+_mock_device = patch("flliper.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
 
 
@@ -70,7 +70,7 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype float16"):
             server_args._handle_mamba_backend()
 
-    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    @patch("flliper.srt.server_args.is_cuda", return_value=False)
     def test_rejects_non_cuda(self, _mock_is_cuda):
         server_args = ServerArgs(
             model_path="dummy",
@@ -81,8 +81,8 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "NVIDIA CUDA"):
             server_args._handle_mamba_backend()
 
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    @patch("flliper.srt.server_args.is_cuda", return_value=True)
+    @patch("flliper.srt.server_args.is_sm100_supported", return_value=False)
     def test_rejects_triton_without_sm100(self, _mock_sm100, _mock_is_cuda):
         server_args = ServerArgs(
             model_path="dummy",
@@ -165,7 +165,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     def _resolve(kv_cache_dtype, **kw):
         from types import SimpleNamespace
 
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _dsa_split_backend_resolution,
         )
@@ -184,9 +184,9 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             )
         )
         with (
-            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            patch("sglang.srt.arg_groups.overrides.is_npu", return_value=False),
-            patch("sglang.srt.arg_groups.overrides.is_xpu", return_value=False),
+            patch("flliper.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("flliper.srt.arg_groups.overrides.is_npu", return_value=False),
+            patch("flliper.srt.arg_groups.overrides.is_xpu", return_value=False),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
         ):
             declared = _dsa_split_backend_resolution(view)
@@ -199,28 +199,28 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             ),
         }
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("flliper.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("flliper.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
         resolved = self._resolve("fp8_e4m3")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("flliper.srt.server_args.is_hip", return_value=True)
     def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("flliper.srt.server_args.is_hip", return_value=True)
     def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
         self, _mock_is_hip
     ):
@@ -229,7 +229,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("flliper.srt.server_args.is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
@@ -242,7 +242,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
         server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("flliper.srt.server_args.is_hip", return_value=True)
     def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
@@ -254,7 +254,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tilelang"):
             server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("flliper.srt.server_args.is_hip", return_value=False)
     def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
@@ -314,8 +314,8 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         args.model_config.hf_config.dual_chunk_attention_config = None
         return args
 
-    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
-    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    @patch("flliper.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
+    @patch("flliper.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_combined_attention_backend_fa4_forces_page_size_128(
         self, _mock_mla, _mock_sm100
     ):
@@ -324,20 +324,20 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         args._handle_attention_backend_compatibility()
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from flliper.srt.arg_groups.overrides import resolved_view
 
         self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
         self.assertEqual(resolved_view(args).page_size, 128)
 
-    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
-    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    @patch("flliper.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
+    @patch("flliper.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
         # `--prefill-attention-backend fa4`: the previously-covered path.
         args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)
 
         args._handle_attention_backend_compatibility()
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from flliper.srt.arg_groups.overrides import resolved_view
 
         self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
         self.assertEqual(resolved_view(args).page_size, 128)
@@ -518,7 +518,7 @@ class TestContextParallelServerArgs(CustomTestCase):
 
 
 class TestPortArgs(unittest.TestCase):
-    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    @patch("flliper.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"
 
@@ -534,7 +534,7 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("ipc://"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    @patch("flliper.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_builds_decoupled_spec_ipc_config(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"
 
@@ -557,7 +557,7 @@ class TestPortArgs(unittest.TestCase):
             port_args.decoupled_spec_ipc_config.connect_endpoints, ("ipc:///tmp/d",)
         )
 
-    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    @patch("flliper.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_no_decoupled_config_when_role_null(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"
 
@@ -984,7 +984,7 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from flliper.srt.arg_groups.overrides import resolved_view
 
         # dual-apply retired: the fields stay pristine, the declarations win
         self.assertTrue(server_args.disable_shared_experts_fusion)
@@ -1000,7 +1000,7 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from flliper.srt.arg_groups.overrides import resolved_view
 
         self.assertEqual(server_args.moe_a2a_backend, "none")  # pristine
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
@@ -1097,13 +1097,13 @@ class TestSessionRadixCacheServerArgs(unittest.TestCase):
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
-        "sglang.srt.model_executor.runner_backend."
+        "flliper.srt.model_executor.runner_backend."
         "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
     )
     def test_tc_piecewise_build_config_reads_phase_config_dataclass(
         self, mock_get_moe_a2a_backend
     ):
-        from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+        from flliper.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
             TcPiecewiseCudaGraphBackend,
         )
 
@@ -1137,7 +1137,7 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
             is_multimodal_piecewise_cuda_graph_supported=False,
         )
         with (
-            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch("flliper.srt.utils.is_cuda", return_value=True),
             patch.object(ServerArgs, "use_mla_backend", return_value=False),
         ):
             args._handle_cuda_graph_config()
@@ -1243,7 +1243,7 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
 
 
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
-    """The 'token_oracle' choice is gated on SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.
+    """The 'token_oracle' choice is gated on FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE.
 
     The choice set is built once at server_args.py import time, so each subtest
     reloads the module with the env var set to the desired value.
@@ -1266,33 +1266,33 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         # does). What IS restorable is the env-derived module state this test
         # changes, so restore it here rather than leaving the process holding
         # whichever choice list the last subtest happened to build.
-        previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
+        previous = os.environ.get("FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE")
         self.addCleanup(self._restore_server_args_module, previous)
-        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
+        os.environ["FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
         try:
             return importlib.reload(server_args_module)
         finally:
             if previous is None:
-                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
+                os.environ.pop("FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
             else:
-                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
+                os.environ["FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
 
     @staticmethod
     def _restore_server_args_module(previous):
         """Rebuild the module under the ambient env, so later tests see the
         default choice lists rather than this test's."""
-        saved = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
+        saved = os.environ.get("FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE")
         if previous is None:
-            os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
+            os.environ.pop("FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
         else:
-            os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
+            os.environ["FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
         try:
             importlib.reload(server_args_module)
         finally:
             if saved is None:
-                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
+                os.environ.pop("FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
             else:
-                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = saved
+                os.environ["FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE"] = saved
 
     def test_token_oracle_rejected_when_env_disabled(self):
         reloaded = self._reload_server_args_with_env(enabled=False)
@@ -1372,7 +1372,7 @@ class TestHandleCrashDumpEnv(CustomTestCase):
 
 
 class TestGrpcServerArgs(CustomTestCase):
-    """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
+    """Native gRPC is enabled by --grpc-port (or FLLIPER_GRPC_PORT) and runs
     alongside HTTP; --smg-grpc-mode (and the deprecated --grpc-mode) select the
     legacy SMG server. Worker-threads / max-prefill-tokens are env-only knobs.
 
@@ -1393,14 +1393,14 @@ class TestGrpcServerArgs(CustomTestCase):
 
     def test_grpc_port_enables_native_and_env_knobs(self):
         sa = self._args(grpc_port=50051)
-        with envs.SGLANG_GRPC_WORKER_THREADS.override(8):
+        with envs.FLLIPER_GRPC_WORKER_THREADS.override(8):
             sa._handle_deprecated_args()
         self.assertEqual(sa.grpc_port, 50051)
         self.assertEqual(sa.grpc_worker_threads, 8)
 
     def test_env_grpc_port_enables_native(self):
         sa = self._args(port=30000)
-        with envs.SGLANG_GRPC_PORT.override(45000):
+        with envs.FLLIPER_GRPC_PORT.override(45000):
             sa._handle_deprecated_args()
         self.assertEqual(sa.grpc_port, 45000)
 
@@ -1434,7 +1434,7 @@ class TestGrpcServerArgs(CustomTestCase):
 
     def test_invalid_grpc_worker_threads_rejected(self):
         sa = self._args(grpc_port=40000)
-        with envs.SGLANG_GRPC_WORKER_THREADS.override(0):
+        with envs.FLLIPER_GRPC_WORKER_THREADS.override(0):
             with self.assertRaises(ValueError):
                 sa._handle_deprecated_args()
 
@@ -1446,7 +1446,7 @@ class TestGrpcServerArgs(CustomTestCase):
         launch. This mocks the native extension and locks the kwarg set."""
         import sys
 
-        from sglang.srt.entrypoints import http_server
+        from flliper.srt.entrypoints import http_server
 
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
         fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
@@ -1456,9 +1456,9 @@ class TestGrpcServerArgs(CustomTestCase):
         with patch.dict(
             sys.modules,
             {
-                "sglang.srt.grpc": SimpleNamespace(_core=fake_core),
-                "sglang.srt.grpc._core": fake_core,
-                "sglang.srt.entrypoints.grpc_bridge": fake_bridge,
+                "flliper.srt.grpc": SimpleNamespace(_core=fake_core),
+                "flliper.srt.grpc._core": fake_core,
+                "flliper.srt.entrypoints.grpc_bridge": fake_bridge,
             },
         ):
             handle = http_server._start_native_grpc_server_for_runtime(
@@ -1483,7 +1483,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     is only valid on the DeepSeek-V4 non-EP DP TP-MoE path (overlapping the DP
     all_gatherv / reduce_scatterv with the other ubatch's compute), which
     requires --enable-dp-attention. This replaced the removed opt-in
-    SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
+    FLLIPER_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
 
     dummy-model short-circuits __post_init__, so the guard handler is invoked
     directly (same pattern as TestDeepEPWaterfillArgs)."""
@@ -1504,7 +1504,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
 
     def test_no_a2a_with_dp_attention_ok(self):
         # DP TBO path is valid: --enable-dp-attention + --enable-two-batch-overlap
-        # with a2a backend 'none' must NOT raise (no SGLANG_ENABLE_DP_TBO needed).
+        # with a2a backend 'none' must NOT raise (no FLLIPER_ENABLE_DP_TBO needed).
         args = self._args(enable_dp_attention=True)
         args._check_two_batch_overlap()
 

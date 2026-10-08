@@ -23,7 +23,7 @@ Hermetic: the real UnifiedRadixCache (FULL + MAMBA) with the real CPU pools of
 test_unified_radix_cache_unittest. Nothing here touches a GPU.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -32,17 +32,17 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler_components.weight_updater import (
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager as WU,
 )
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.base_prefix_cache import InsertParams
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
@@ -76,7 +76,7 @@ def _metal_tree():
     retained flag, an L15 held chain as reset_keep leaves it)."""
     cfg = CacheConfig(page_size=1, components=(FULL, MAMBA))
     cache, allocator, r2t = build_fixture(cfg)
-    value, mslot = _insert(cache, allocator, r2t, "weg2-36-194", 1, SPAN)
+    value, mslot = _insert(cache, allocator, r2t, "pdflip-36-194", 1, SPAN)
     cache._q590_value, cache._q590_mslot = value, mslot
     return cache, allocator, r2t
 
@@ -119,7 +119,7 @@ def _updater(cache, allocator, r2t, *, master_on=False, manifest=None, retained=
 
 
 def _guard():
-    from sglang.srt.managers.weg2_sleep_drain import sleep_flush_until_reset
+    from flliper.srt.managers.pdflip_sleep_drain import sleep_flush_until_reset
 
     return sleep_flush_until_reset
 
@@ -137,19 +137,19 @@ class WakeRestoreOnAKeptDeviceTree(CustomTestCase):
         cache, allocator, r2t = _metal_tree()
         upd, calls = _updater(cache, allocator, r2t, master_on=True)
         try:
-            WU._weg2_wake_restore_pools(upd)
+            WU._pdflip_wake_restore_pools(upd)
         except RuntimeError as exc:
             self.assertIn("W26b", str(exc))
         self.assertEqual(_aliased(cache, allocator, r2t), (0, 0))
         self.assertEqual(calls, [])  # W26b is not swallowed into the fallback flush
 
     def test_w26b_propagates_by_name(self):
-        from sglang.srt.managers.weg2_sleep_drain import Weg2WakeTreeHeld
+        from flliper.srt.managers.pdflip_sleep_drain import PdFlipWakeTreeHeld
 
         cache, allocator, r2t = _metal_tree()
         upd, calls = _updater(cache, allocator, r2t, master_on=False)
-        with self.assertRaises(Weg2WakeTreeHeld) as ctx:
-            WU._weg2_wake_restore_pools(upd)
+        with self.assertRaises(PdFlipWakeTreeHeld) as ctx:
+            WU._pdflip_wake_restore_pools(upd)
         self.assertIn("full=%d mamba=1" % SPAN, str(ctx.exception))
         self.assertEqual(calls, [])
 
@@ -157,7 +157,7 @@ class WakeRestoreOnAKeptDeviceTree(CustomTestCase):
         cache, allocator, r2t = _metal_tree()
         cache.reset()
         upd, calls = _updater(cache, allocator, r2t, master_on=True)
-        self.assertTrue(WU._weg2_wake_restore_pools(upd))
+        self.assertTrue(WU._pdflip_wake_restore_pools(upd))
         self.assertEqual(calls, [])  # no fallback flush on the #1455 path
         self.assertEqual(_aliased(cache, allocator, r2t), (0, 0))
 
@@ -166,7 +166,7 @@ class WakeRestoreOnAKeptDeviceTree(CustomTestCase):
         here -- the drop runs BEFORE the tripwire, so no W26b and no aliasing."""
         cache, allocator, r2t = _metal_tree()
         upd, calls = _updater(cache, allocator, r2t, master_on=True, retained=True)
-        self.assertTrue(WU._weg2_wake_restore_pools(upd))
+        self.assertTrue(WU._pdflip_wake_restore_pools(upd))
         self.assertFalse(upd.scheduler._l15_tree_retained)
         self.assertEqual(cache.full_evictable_size() + cache.mamba_evictable_size(), 0)
         self.assertEqual(_aliased(cache, allocator, r2t), (0, 0))
@@ -183,7 +183,7 @@ class WakeRestoreOnAKeptDeviceTree(CustomTestCase):
         upd, calls = _updater(
             cache, allocator, r2t, master_on=True, manifest=manifest, retained=True
         )
-        self.assertTrue(WU._weg2_wake_restore_pools(upd))
+        self.assertTrue(WU._pdflip_wake_restore_pools(upd))
         self.assertEqual(calls, [])
         self.assertEqual(cache.full_evictable_size(), SPAN)  # the hold stays
         self.assertEqual(cache.mamba_evictable_size(), 1)
@@ -233,20 +233,20 @@ class SleepFlushLeavesNoDeviceTree(CustomTestCase):
         self.assertEqual(flushes, [1, 1])  # the sleep leg's flush + the uniform re-flush
         self.assertEqual(drains, [1])  # the collective drain every rank posts
         self.assertEqual([v for v, _ in votes], [[0], [0]])
-        self.assertTrue(all(lbl == "weg2_sleep_flush/held" for _, lbl in votes))
+        self.assertTrue(all(lbl == "pdflip_sleep_flush/held" for _, lbl in votes))
 
     def test_a_tree_that_stays_held_refuses_by_name_before_the_pause(self):
         guard = _guard()
-        from sglang.srt.managers.weg2_sleep_drain import (
-            Weg2SleepDrainRefused,
-            Weg2SleepFlushRefused,
+        from flliper.srt.managers.pdflip_sleep_drain import (
+            PdFlipSleepDrainRefused,
+            PdFlipSleepFlushRefused,
         )
 
         cache, allocator, r2t = _metal_tree()
         drains = []
-        with self.assertRaises(Weg2SleepFlushRefused) as ctx:
+        with self.assertRaises(PdFlipSleepFlushRefused) as ctx:
             guard(flush=lambda: False, tree=cache, drain=lambda: drains.append(1), attempts=2)
-        self.assertIsInstance(ctx.exception, Weg2SleepDrainRefused)  # the W120 family
+        self.assertIsInstance(ctx.exception, PdFlipSleepDrainRefused)  # the W120 family
         self.assertIn("W120b", str(ctx.exception))
         self.assertIn("full=%d" % SPAN, str(ctx.exception))
         self.assertEqual(len(drains), 2)
@@ -254,8 +254,8 @@ class SleepFlushLeavesNoDeviceTree(CustomTestCase):
     def test_the_release_leg_uses_the_guard_not_a_bare_flush(self):
         src = inspect.getsource(WU.release_memory_occupation)
         self.assertNotIn("self.flush_cache(zero_kv=False)", src)
-        self.assertIn("self._weg2_sleep_flush()", src)
-        i_flush = src.index("self._weg2_sleep_flush()")
+        self.assertIn("self._pdflip_sleep_flush()", src)
+        i_flush = src.index("self._pdflip_sleep_flush()")
         i_pause = src.index("self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)")
         self.assertLess(i_flush, i_pause)
 
@@ -265,7 +265,7 @@ class L15HoldChainIsNotHeld(CustomTestCase):
     must neither trip W120b at the sleep nor be flushed away by the guard."""
 
     def _retained_sched(self, cache):
-        from sglang.srt.managers.weg2_sleep_drain import tree_device_held
+        from flliper.srt.managers.pdflip_sleep_drain import tree_device_held
 
         # what Scheduler.flush_cache records where it sets _l15_tree_retained
         return SimpleNamespace(
@@ -275,7 +275,7 @@ class L15HoldChainIsNotHeld(CustomTestCase):
         )
 
     def test_an_l15_hold_chain_passes_without_a_drain_and_stays(self):
-        from sglang.srt.managers.weg2_sleep_drain import l15_retained_books
+        from flliper.srt.managers.pdflip_sleep_drain import l15_retained_books
 
         guard = _guard()
         cache, allocator, r2t = _metal_tree()
@@ -289,24 +289,24 @@ class L15HoldChainIsNotHeld(CustomTestCase):
             retained=lambda: l15_retained_books(sched),
             attempts=1,
         )
-        self.assertEqual(retries, 0)  # no W120b, no WEG2-SLEEP-FLUSH-HELD round
+        self.assertEqual(retries, 0)  # no W120b, no PDFLIP-SLEEP-FLUSH-HELD round
         self.assertEqual((flushes, drains), ([1], []))
         self.assertEqual(cache.full_evictable_size(), SPAN)  # the hold is kept
         self.assertEqual(cache.mamba_evictable_size(), 1)
         self.assertEqual(_aliased(cache, allocator, r2t), (0, 0))
 
     def test_a_device_value_beyond_the_hold_still_counts(self):
-        from sglang.srt.managers.weg2_sleep_drain import (
-            Weg2SleepFlushRefused,
+        from flliper.srt.managers.pdflip_sleep_drain import (
+            PdFlipSleepFlushRefused,
             l15_retained_books,
         )
 
         guard = _guard()
         cache, allocator, r2t = _metal_tree()
         sched = self._retained_sched(cache)
-        _insert(cache, allocator, r2t, "weg2-36-198", 1000, 8)  # not part of the hold
+        _insert(cache, allocator, r2t, "pdflip-36-198", 1000, 8)  # not part of the hold
         drains = []
-        with self.assertRaises(Weg2SleepFlushRefused) as ctx:
+        with self.assertRaises(PdFlipSleepFlushRefused) as ctx:
             guard(
                 flush=lambda: False,
                 tree=cache,
@@ -319,7 +319,7 @@ class L15HoldChainIsNotHeld(CustomTestCase):
         self.assertEqual(drains, [1])
 
     def test_no_hold_books_without_the_flag_or_the_record(self):
-        from sglang.srt.managers.weg2_sleep_drain import l15_retained_books
+        from flliper.srt.managers.pdflip_sleep_drain import l15_retained_books
 
         self.assertEqual(l15_retained_books(None), (0, 0))
         self.assertEqual(
@@ -332,7 +332,7 @@ class L15HoldChainIsNotHeld(CustomTestCase):
         self.assertEqual(l15_retained_books(SimpleNamespace(_l15_tree_retained=True)), (0, 0))
 
     def test_the_retaining_flush_records_the_hold_books(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         body = inspect.getsource(Scheduler.flush_cache)
         i_flag = body.index("self._l15_tree_retained = _l15_res is not None")
@@ -341,7 +341,7 @@ class L15HoldChainIsNotHeld(CustomTestCase):
         self.assertIn("_q590_held(self.tree_cache) if _l15_res is not None else (0, 0)", body)
 
     def test_the_sleep_flush_verdict_is_group_reduced_without_b1(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         sig = inspect.signature(Scheduler.flush_cache)
         self.assertIn("sleep_group_verdict", sig.parameters)
@@ -351,7 +351,7 @@ class L15HoldChainIsNotHeld(CustomTestCase):
         # B1's quiesce answer and non-blocking sweep stay on the front's quiesce only
         self.assertIn("self, group_idle, tp_group_verdict\n", body)
         self.assertIn("self, {}, tp_group_verdict)", body)
-        src = inspect.getsource(WU._weg2_sleep_flush)
+        src = inspect.getsource(WU._pdflip_sleep_flush)
         self.assertIn("self.flush_cache(zero_kv=False, sleep_group_verdict=True)", src)
         self.assertIn("retained=lambda: l15_retained_books(sch)", src)
 

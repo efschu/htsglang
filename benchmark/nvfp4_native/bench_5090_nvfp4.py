@@ -6,7 +6,7 @@ Qwen3.8-27B-NVFP4, modelopt MIXED_PRECISION: NVFP4 only on mlp gate/up/down and
 lm_head) and M in {1, 8, 16, 48, 512, 4096}:
 
   q_fi       flashinfer fp4_quantize (the call ModelOptFp4LinearMethod.apply makes)
-  q_sgl      fork JIT scaled_fp4_quant (sglang.jit_kernel.nvfp4)
+  q_sgl      fork JIT scaled_fp4_quant (flliper.jit_kernel.nvfp4)
   mm_sgl     fork CUTLASS cutlass_scaled_fp4_mm (what `auto` resolves on sm_120)
   mm_fi_*    flashinfer mm_fp4 backends cutlass / cudnn / b12x (whichever load)
   apply_nat  ModelOptFp4LinearMethod.apply end to end, backend=cutlass (quant+pad+gemm)
@@ -131,7 +131,7 @@ class Rot:
 
 
 def make_nvfp4_layer(method, N, K, backend_name, fused=False):
-    from sglang.srt.layers.quantization import fp4_utils
+    from flliper.srt.layers.quantization import fp4_utils
 
     fp4_utils.FP4_GEMM_RUNNER_BACKEND = fp4_utils.Fp4GemmRunnerBackend(backend_name)
     layer = torch.nn.Module()
@@ -175,13 +175,13 @@ def main():
         meta["flashinfer"] = None
     print(json.dumps(meta), flush=True)
 
-    from sglang.srt.layers.quantization.modelopt_quant import (
+    from flliper.srt.layers.quantization.modelopt_quant import (
         ModelOptFp4Config,
         ModelOptFp4LinearMethod,
     )
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-    from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
-    from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+    from flliper.srt.layers.quantization.fp4_utils import fp4_quantize
+    from flliper.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
+    from flliper.srt.layers.quantization.int8_kernel import per_token_quant_int8
     try:
         from sgl_kernel import int8_scaled_mm
     except Exception:  # noqa: BLE001
@@ -282,7 +282,7 @@ def main():
                             rec_err(shape, M, f"mm_fi_{be}", e)
                 # end to end native apply
                 try:
-                    from sglang.srt.layers.quantization import fp4_utils
+                    from flliper.srt.layers.quantization import fp4_utils
                     fp4_utils.FP4_GEMM_RUNNER_BACKEND = fp4_utils.Fp4GemmRunnerBackend("cutlass")
                     rot = Rot(nat)
                     us, mode = timed(lambda: method.apply(rot.next(), x), args.reps)
@@ -295,7 +295,7 @@ def main():
         # --- marlin layers ---
         try:
             mar = [make_nvfp4_layer(method, N, K, "marlin", fused=shape.endswith("gate_up")) for _ in range(C)]
-            from sglang.srt.layers.quantization import fp4_utils
+            from flliper.srt.layers.quantization import fp4_utils
             for M in ms:
                 x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
                 fp4_utils.FP4_GEMM_RUNNER_BACKEND = fp4_utils.Fp4GemmRunnerBackend("marlin")
@@ -353,7 +353,7 @@ def main():
             torch.cuda.empty_cache()
 
     # ---------------- FP8 per-tensor (ModelOptFp8LinearMethod) ----------------
-    from sglang.srt.layers.quantization.modelopt_quant import (
+    from flliper.srt.layers.quantization.modelopt_quant import (
         ModelOptFp8Config,
         ModelOptFp8LinearMethod,
     )

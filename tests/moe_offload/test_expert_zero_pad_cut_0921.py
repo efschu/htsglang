@@ -3,7 +3,7 @@
 fnFL2w1 erreichte P READY 159,0 s, D READY 237,0 s, Front 9,1 s und den
 ERSTEN FLIP -- und starb am Wake:
 
-    W68 Weg2XchgPlanDisagree: model.layers.0.mlp.experts.w13_weight_shape:
+    W68 PdFlipXchgPlanDisagree: model.layers.0.mlp.experts.w13_weight_shape:
     the PP side holds (512, 2) and the TP rows hold
     [(61, 2), (227, 2), (227, 2)]      61+227+227 = 515 gegen 512
 
@@ -21,8 +21,8 @@ Nullzeile an local 0 -- 515 = 512 + 3 Raenge.
 
 import pytest
 
-from sglang.srt.weg2 import xchg_manifest as xm
-from sglang.srt.weg2 import weight_exchange as wx
+from flliper.srt.pdflip import xchg_manifest as xm
+from flliper.srt.pdflip import weight_exchange as wx
 
 
 def _piece(name, rows, cols=2, itemsize=8):
@@ -53,7 +53,7 @@ def test_a_genuine_skew_still_refuses():
     tolerance band here would read a genuine disagreement as padding')."""
     whole = _piece(EXPERT, 512)
     cut = [_piece(EXPERT, 62), _piece(EXPERT, 227), _piece(EXPERT, 227)]  # 516-3=513
-    with pytest.raises(wx.Weg2XchgPlanDisagree):
+    with pytest.raises(wx.PdFlipXchgPlanDisagree):
         xm._axis_of(EXPERT, whole, cut)
 
 
@@ -65,7 +65,7 @@ def test_only_expert_tensors_may_carry_the_pad():
     nm = "model.layers.0.self_attn.qkv_proj.weight"
     whole = _piece(nm, 512)
     cut = [_piece(nm, 61), _piece(nm, 227), _piece(nm, 227)]
-    with pytest.raises(wx.Weg2XchgPlanDisagree):
+    with pytest.raises(wx.PdFlipXchgPlanDisagree):
         xm._axis_of(nm, whole, cut)
 
 
@@ -74,7 +74,7 @@ def test_a_rank_of_width_one_is_all_pad_and_refuses():
     dieser Zweig nicht buergen."""
     whole = _piece(EXPERT, 2)
     cut = [_piece(EXPERT, 1), _piece(EXPERT, 2), _piece(EXPERT, 2)]  # 5-3=2
-    with pytest.raises(wx.Weg2XchgPlanDisagree):
+    with pytest.raises(wx.PdFlipXchgPlanDisagree):
         xm._axis_of(EXPERT, whole, cut)
 
 
@@ -101,7 +101,7 @@ def test_the_convention_this_leans_on_still_exists():
     Verschwindet sie, faellt dieser Test -- und die Klausel oben mit ihr."""
     import inspect
 
-    from sglang.srt.layers.moe import expert_store as es
+    from flliper.srt.layers.moe import expert_store as es
 
     src = inspect.getsource(es.global_rows)
     assert "local 0 is the zero pad expert" in src

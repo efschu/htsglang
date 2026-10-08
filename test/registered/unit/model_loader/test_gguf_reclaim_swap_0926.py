@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt.model_loader import gguf_shards as gs
+from flliper.srt.model_loader import gguf_shards as gs
 
 
 def _setup(tmp, swap_max=None, swap_total_kb=0):

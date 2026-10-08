@@ -8,12 +8,12 @@ und welche davon der Force-Schalter übergeht.
 
 Die Rechnung liegt im Planer-Baum, stdlib-rein und per Dateipfad geladen (wie ``kartenplan_gate``):
 
-* ``weg2/profile_json.py``  Profil als JSON (``flliper.server/1``), ``.env`` <-> JSON, Zeilen, Herkunft, Bearbeitung;
-* ``weg2/refusals.py``      das Ablehnungsregister (Wert-Ablehnung forcebar / nicht forcebar, je mit Begründung);
-* ``weg2/card_identity.py`` und ``topology.py`` für das Trockenlauf-Gate (über ``kartenplan``).
+* ``pdflip/profile_json.py``  Profil als JSON (``flliper.server/1``), ``.env`` <-> JSON, Zeilen, Herkunft, Bearbeitung;
+* ``pdflip/refusals.py``      das Ablehnungsregister (Wert-Ablehnung forcebar / nicht forcebar, je mit Begründung);
+* ``pdflip/card_identity.py`` und ``topology.py`` für das Trockenlauf-Gate (über ``kartenplan``).
 
 Erklärungen und Abhängigkeiten kommen aus ``profil_data/catalog.json`` (erzeugt von
-``python -m sglang.srt.weg2.profile_catalog``): kuratiert, aus argparse/environ geerntet, sonst "unerklärt".
+``python -m flliper.srt.pdflip.profile_catalog``): kuratiert, aus argparse/environ geerntet, sonst "unerklärt".
 Release-Profile (``.env``) werden mit bash ausgewertet (vertrauenswürdiges Verzeichnis, nur Lesen); Nutzerprofile
 sind JSON-Dateien im State-Volume.
 """
@@ -85,7 +85,7 @@ def find_tree(explicit: Optional[str] = None) -> Optional[str]:
     for t in (explicit, os.environ.get("KARTENPLAN_TREE"), *TREE_CANDIDATES):
         if not t:
             continue
-        base = os.path.join(t, "sglang", "srt", "weg2")
+        base = os.path.join(t, "flliper", "srt", "pdflip")
         if all(os.path.isfile(os.path.join(base, n)) for n in NEEDED):
             return t
     return None
@@ -102,7 +102,7 @@ def dual_line_probe(tree: Optional[str]) -> bool:
     """Traegt der Planer-Baum die Dual-Module?  Sonde auf Dateiebene (die Module existieren), nie ein Baum-SHA oder ein Branchname."""
     if not tree:
         return False
-    base = os.path.join(tree, "sglang", "srt", "weg2")
+    base = os.path.join(tree, "flliper", "srt", "pdflip")
     return all(os.path.isfile(os.path.join(base, n)) for n in DUAL_MODULES)
 
 
@@ -198,7 +198,7 @@ def docker_run_example(name: str, force: dict) -> List[str]:
     lines += ["docker run -d --name htsglang-mine \\",
               "  <the flags from section 3.3 of the README: --gpus, --shm-size, --memory, -p, model mounts> \\",
               "  -v flliper-state:/var/lib/flliper \\",
-              "  -e MODE=weg2 -e FLLIPER_PROFILE=%s \\" % name]
+              "  -e MODE=pdflip -e FLLIPER_PROFILE=%s \\" % name]
     if force.get("show_line"):
         lines.append("  -e %s \\" % FORCE_ENV)
     lines.append("  ghcr.io/efschu/htsglang:<tag> serve")
@@ -246,7 +246,7 @@ def issue_betriebsform(names, n_cards) -> dict:
     if "--d-only" in names:
         return {"form": "TP only", "why": "Flag --d-only in the profile"}
     if n_cards == 1:
-        return {"form": "Single card", "why": "one card in the dry run (the weg2 launcher needs at least two)"}
+        return {"form": "Single card", "why": "one card in the dry run (the pdflip launcher needs at least two)"}
     return {"form": "Flip PP/TP", "why": "neither --d-only nor --dual-* in the profile, so the launcher's standard form"}
 
 
@@ -275,23 +275,23 @@ def _dry_ohne_lauf(vd: dict, ausgang: str) -> dict:
     """Der Vorschlag ohne Launcher-Lauf in der Form eines Trockenlaufs: ``kein_lauf`` True, KEINE Ablehnungen (``rejections`` leer) und ein eigener Block statt
     ``Trockenlauf:``: ``Planer-Rechnung: <Ausgang>`` mit den Prüfungen der Ebene ``fit`` oder ``Orakel-Fehler: <Text>``.  ``force_satz`` sagt ehrlich, dass daraus
     kein Force-Urteil folgt (nicht ``Der Planer lehnt nichts ab``)."""
-    zeilen = []
+    row_list = []
     for x in vd["verdikte"][:128]:
         if not isinstance(x, dict):
             continue
         if ausgang == "orakel_fehler":
-            if x.get("ebene") == "orakel" and not zeilen:
-                zeilen.append(str(x.get("text") or x.get("grund") or x.get("code") or "")[:600])
+            if x.get("ebene") == "orakel" and not row_list:
+                row_list.append(str(x.get("text") or x.get("grund") or x.get("code") or "")[:600])
         elif x.get("ebene") == "fit" and isinstance(x.get("code"), str) and x["code"] != "EINZEL-PASSUNG":
-            zeilen.append("`%s`: %s" % (x["code"][:40], str(x.get("text") or x.get("grund") or "")[:300]))
+            row_list.append("`%s`: %s" % (x["code"][:40], str(x.get("text") or x.get("grund") or "")[:300]))
     if ausgang == "orakel_fehler":
-        t = zeilen[0] if zeilen else "no text"
+        t = row_list[0] if row_list else "no text"
         return {"rejections": [], "kein_lauf": True, "quelle": "vorschlag", "block_titel": "Oracle error: %s" % t, "block_zeilen": [],
                 "verdict": "Oracle error: %s" % t,
                 "force_satz": "The oracle could not be asked: there is no verdict, none on force either; Check again asks once more.",
                 "notes": ["No launcher run: the proposal is not checked."]}
     titel = "Planner calculation: %s" % _AUSGANG_TEXT.get(ausgang, ausgang or "no outcome").replace("Planner calculation: ", "")
-    return {"rejections": [], "kein_lauf": True, "quelle": "vorschlag", "block_titel": titel, "block_zeilen": zeilen[:40], "verdict": titel,
+    return {"rejections": [], "kein_lauf": True, "quelle": "vorschlag", "block_titel": titel, "block_zeilen": row_list[:40], "verdict": titel,
             "force_satz": "No launcher run: the planner calculation names no register code that force could override; whether the start brings a refusal is shown only "
                           "by a dry run (Check again).",
             "notes": ["This is a planner calculation, not a verdict of the launcher."]}
@@ -486,7 +486,7 @@ class ProfilEditor:
         #: ``check_path(path, what) -> path`` (der Modellwurzel-Wachposten ``modellprofil.check_path``) fuer Modellpfade im Vorschlags-Aufruf
         self.check_path = check_path
         #: Auftrag 1984 (C): ``topology(n) -> {"ok": True, "refused": None | text} | {"ok": False, "error": ..}``, gerechnet im Kindprozess mit der
-        #: sglang-Umgebung (``CouplingsService.topology``); ohne sie rechnet der Trockenlauf wie bisher im Prozess
+        #: flliper-Umgebung (``CouplingsService.topology``); ohne sie rechnet der Trockenlauf wie bisher im Prozess
         self.topology = topology
         self.release_dir = release_dir
         self.user_dir = user_dir
@@ -509,8 +509,8 @@ class ProfilEditor:
     def mods(self):
         if self._mods is None:
             if not self.tree:
-                raise ProfilError("no planner tree with weg2/profile_json.py and refusals.py found (KARTENPLAN_TREE or install_510.sh)")
-            base = os.path.join(self.tree, "sglang", "srt", "weg2")
+                raise ProfilError("no planner tree with pdflip/profile_json.py and refusals.py found (KARTENPLAN_TREE or install_510.sh)")
+            base = os.path.join(self.tree, "flliper", "srt", "pdflip")
             self._mods = (_load("kp_profile_json", os.path.join(base, "profile_json.py")),
                           _load("kp_refusals", os.path.join(base, "refusals.py")))
         return self._mods
@@ -521,7 +521,7 @@ class ProfilEditor:
                 with open(self.catalog_file, encoding="utf-8") as fh:
                     self._cat = json.load(fh)
             except (OSError, ValueError) as exc:
-                raise ProfilError("Catalog %s not readable: %s (python -m sglang.srt.weg2.profile_catalog -o ...)" % (self.catalog_file, exc))
+                raise ProfilError("Catalog %s not readable: %s (python -m flliper.srt.pdflip.profile_catalog -o ...)" % (self.catalog_file, exc))
         return self._cat
 
     def specs(self) -> dict:
@@ -623,7 +623,7 @@ class ProfilEditor:
         _pj, ref = self.mods()
         wired = None
         try:
-            with open(os.path.join(self.tree, "sglang", "srt", "weg2", "launcher.py"), encoding="utf-8") as fh:
+            with open(os.path.join(self.tree, "flliper", "srt", "pdflip", "launcher.py"), encoding="utf-8") as fh:
                 wired = ref.wired_codes(fh.read())
         except (OSError, AttributeError):
             wired = None
@@ -704,7 +704,7 @@ class ProfilEditor:
 
     def _profile_comments(self, path: str) -> dict:
         """Kommentare über den Zeilen des Profils (profile_catalog.harvest_profile_comments), aus dem Planer-Baum."""
-        cmod = os.path.join(self.tree, "sglang", "srt", "weg2", "profile_catalog.py") if self.tree else ""
+        cmod = os.path.join(self.tree, "flliper", "srt", "pdflip", "profile_catalog.py") if self.tree else ""
         if not cmod or not os.path.isfile(cmod):
             return {}
         mod = getattr(self, "_catmod", None)
@@ -906,9 +906,9 @@ class ProfilEditor:
     def _topology_verdict(self, n: int, tp, notes: List[str]) -> Optional[str]:
         """Der Text einer Topologie-Ablehnung für ``n`` Karten, oder ``None`` (durchgelassen / nicht prüfbar, dann steht eine Notiz in ``notes``).
 
-        ``topology.plan_topology`` importiert für N != 3 ``weg2/weight_exchange_region`` (import sglang): das geht nur in der sglang-Umgebung, also
+        ``topology.plan_topology`` importiert für N != 3 ``pdflip/weight_exchange_region`` (import flliper): das geht nur in der flliper-Umgebung, also
         fragt der Editor zuerst den Kopplungs-Worker (Kindprozess).  Ist keiner da oder antwortet er mit einem Fehler, rechnet die Funktion wie
-        bisher im Prozess (N=3 braucht sglang nicht); scheitert auch das am Import, ist es KEINE Ablehnung und nie ein HTTP 500 (Browsertest 1979 F2),
+        bisher im Prozess (N=3 braucht flliper nicht); scheitert auch das am Import, ist es KEINE Ablehnung und nie ein HTTP 500 (Browsertest 1979 F2),
         sondern die benannte Notiz "nicht geprüft"."""
         child_err = ""
         if self.topology is not None:
@@ -922,7 +922,7 @@ class ProfilEditor:
         try:
             tp.plan_topology(n)
         except ImportError as exc:
-            notes.append("Topology for %d card(s) not checked: the planner gate needs the sglang environment for it (%s: %s)%s."
+            notes.append("Topology for %d card(s) not checked: the planner gate needs the flliper environment for it (%s: %s)%s."
                          % (n, type(exc).__name__, exc,
                             "; couplings Python / child process not available: " + child_err if child_err else
                             " (no child process with --couplings-python / RIGDASH_COUPLINGS_PYTHON configured)"))
@@ -979,7 +979,7 @@ class ProfilEditor:
                     bad.append(str(exc))
             if bad:
                 found.append({"code": "HW-ARCH", "text": bad[0] + ("  [same message for %d more card(s)]" % (len(bad) - 1) if len(bad) > 1 else ""),
-                              "source": "weg2/card_identity.arch_gate"})
+                              "source": "pdflip/card_identity.arch_gate"})
             try:
                 want_n = int(var("PROFILE_CARD_COUNT") or 0) or None
             except ValueError:
@@ -987,20 +987,20 @@ class ProfilEditor:
             try:
                 ordered = ci.order_cards(card_objs, want_n, gate=False)
             except ci.CardInventoryRefused as exc:
-                found.append({"code": "HW-COUNT", "text": str(exc), "source": "weg2/card_identity.order_cards (PROFILE_CARD_COUNT=%s)" % want_n})
+                found.append({"code": "HW-COUNT", "text": str(exc), "source": "pdflip/card_identity.order_cards (PROFILE_CARD_COUNT=%s)" % want_n})
                 ordered = ci.order_cards(card_objs, None, gate=False)
             inv = ci.parse_inventory(var("PROFILE_INVENTORY")) or tuple(ci.REFERENCE_INVENTORY)
             positional = sorted({r["name"] for r in pj.rows(doc, self.specs())
                                  if _is_vector(r["value"], len(inv)) and r["kind"] != "var"})
             msg = ci.uncalibrated_message(ordered, list(inv), positional, "profile %r" % (doc.get("name") or var("PROFILE_NAME")))
             if msg:
-                found.append({"code": "HW-UNCALIBRATED", "text": msg, "source": "weg2/card_identity.uncalibrated_message"})
+                found.append({"code": "HW-UNCALIBRATED", "text": msg, "source": "pdflip/card_identity.uncalibrated_message"})
             refused = self._topology_verdict(len(cards), tp, notes)
             if refused:
                 # N inside the range that is only not proven ("N cards would be P = ..., proven on metal only for N in [3]") is the value
                 # refusal HW-COUNT (the 27B line names it so); N with no topology at all is HW-TOPOLOGY (not forceable)
                 code = "HW-COUNT" if (refused.startswith("HW-COUNT") or " would be " in refused) else "HW-TOPOLOGY"
-                found.append({"code": code, "text": refused, "source": "weg2/topology.plan_topology"})
+                found.append({"code": code, "text": refused, "source": "pdflip/topology.plan_topology"})
         return found
 
     def _count_found(self, cards: List[dict], var) -> List[dict]:
@@ -1021,7 +1021,7 @@ class ProfilEditor:
         try:
             ci.order_cards([GATE._row(r) for r in self._gate_rows(cards)], want_n, gate=False)
         except ci.CardInventoryRefused as exc:
-            return [{"code": "HW-COUNT", "text": str(exc), "source": "weg2/card_identity.order_cards (PROFILE_CARD_COUNT=%s)" % want_n}]
+            return [{"code": "HW-COUNT", "text": str(exc), "source": "pdflip/card_identity.order_cards (PROFILE_CARD_COUNT=%s)" % want_n}]
         return []
 
     @staticmethod
@@ -1097,7 +1097,7 @@ class ProfilEditor:
         out = []
         for x in v.get("verdikte") or []:
             if x.get("ebene") in ("lauf", "absturz", "orakel") and not x.get("parent"):
-                src = "Launcher dry run (oracle, weg2/propose_verdict)"
+                src = "Launcher dry run (oracle, pdflip/propose_verdict)"
                 if x.get("launcher_code"):
                     src += ", %s" % x["launcher_code"]
                 if x.get("wo"):
@@ -1135,10 +1135,10 @@ class ProfilEditor:
         orakel = self._dry_oracle(doc, cards, var, notes) if self.oracle is not None else None
         if orakel is not None:
             found = list(orakel["found"])
-            quelle = "orakel"
+            source = "orakel"
         else:
             found = self._gate_found(pj, doc, cards, var, notes)
-            quelle = "gate"
+            source = "gate"
         st = var("PROFILE_STATUS") or ("platzhalter" if var("PROFILE_PLACEHOLDER") == "1" else "abgenommen")
         if st != "abgenommen":
             found.append({"code": "PROFIL-STATUS", "text": "Profile %r has the status %s (%s)" % (doc.get("name"), st.upper(), var("PROFILE_OWNER") or "owner open"),
@@ -1181,7 +1181,7 @@ class ProfilEditor:
                "cards": [{"index": c["index"], "label": c["label"], "arch": c["entry"]["arch"]} for c in cards],
                "force_note": "Force exists only at the server start (FLLIPER_FORCE=1 / --force), not in the dashboard. It lifts all value refusals that the launcher has wired and, in the Docker start, additionally those the entrypoint checks itself (PROFIL-STATUS, SHM, STORE, MEMAVAIL: forceable in the Docker start (entrypoint), not in a plain launcher call), lists each one in the boot log as FORCED-PAST <CODE> <reason> and writes no records. Not overridden: the occupancy check (foreign process/window on the card), a missing or broken model, an unsupported architecture.",
                "reference": {"inventory": list(ci.REFERENCE_INVENTORY) if (ci := self._ci()) is not None else None},
-               "quelle": quelle}
+               "quelle": source}
         if orakel is not None:
             v = orakel["verdikt"]
             res["verdikte"] = v.get("verdikte") or []
@@ -1204,7 +1204,7 @@ class ProfilEditor:
     # ------------------------------------------------------------------ Vorschlag (Stufe A + Orakel + Verdikte, AP-D)
     PROPOSE_SCHEMA = "flliper.propose-d/1"
     #: die Formen des Vorschlags: flip, tp und dual = Planer + Launcher-Trockenlauf (Orakel); single = die Einzelkarte, Planer-Rechnung ohne Launcher
-    #: (``weg2/propose_single``, kein weg2-Launcher bei N=1: ``topology.py`` MIN_CARDS=2)
+    #: (``pdflip/propose_single``, kein pdflip-Launcher bei N=1: ``topology.py`` MIN_CARDS=2)
     FORMS = ("flip", "tp", "dual", "single")
     #: Namen der Einzelkarte in einer Anfrage (der Plan sagt ``einzel``, die Seite schickt ``single``)
     FORM_ALIAS = {"einzel": "single", "einzelkarte": "single"}
@@ -1340,8 +1340,8 @@ class ProfilEditor:
         return new, keys, skipped
 
     def _single_base(self, name: str, model_path: str) -> dict:
-        """Das leere Profil der Einzelkarte (``flliper.server/1`` ohne weg2-Zeilen): nur Name, Linie und Modellpfad; die Argumente des normalen Servers setzt
-        der Vorschlag hinein.  Kein Release-Profil als Grundlage: dessen Zeilen (``--pp-size``, ``--d-bs`` ...) gehören zum weg2-Launcher, den die Einzelkarte nicht hat."""
+        """Das leere Profil der Einzelkarte (``flliper.server/1`` ohne pdflip-Zeilen): nur Name, Linie und Modellpfad; die Argumente des normalen Servers setzt
+        der Vorschlag hinein.  Kein Release-Profil als Grundlage: dessen Zeilen (``--pp-size``, ``--d-bs`` ...) gehören zum pdflip-Launcher, den die Einzelkarte nicht hat."""
         pj, _ref = self.mods()
         doc = {"schema": pj.SCHEMA, "name": ("%s" % name)[:64], "line": "einzel", "source": {"kind": "planer", "file": "", "sha256": "", "rc": 0},
                "vars": [{"name": "PROFILE_LINE", "value": "einzel"}, {"name": "PROFILE_MODEL", "value": model_path}, {"name": "PROFILE_NAME", "value": name}],
@@ -1350,7 +1350,7 @@ class ProfilEditor:
         return doc
 
     def propose(self, body: dict) -> dict:
-        """``POST /api/profil/propose``: Vorschlag (``weg2/propose.propose``) + Orakel (Launcher-Trockenlauf) + Verdikte je Wert, als Startprofil
+        """``POST /api/profil/propose``: Vorschlag (``pdflip/propose.propose``) + Orakel (Launcher-Trockenlauf) + Verdikte je Wert, als Startprofil
         ``flliper.server/1`` mit Herkunft, Verdikt und Kanten je Wert.
 
         Körper: ``basis`` {kind: release|user, name}, ``form`` flip|tp|dual|single (``einzel`` ist ein Name für ``single``), ``inventar`` ``"rig"`` (das
@@ -1366,7 +1366,7 @@ class ProfilEditor:
         if isinstance(body, dict) and self.FORM_ALIAS.get(str(body.get("form") or ""), str(body.get("form") or "")) == "dual" and not self.dual_available():
             raise ProfilError(DUAL_FEHLT)              # NF-Linie: kein Dual-Vorschlag, kein ImportError im Kindprozess (HTTP 400)
         if self.oracle is None:
-            raise ProfilError("The oracle is not configured (child process with the Python of the sglang environment: --couplings-python / RIGDASH_COUPLINGS_PYTHON)")
+            raise ProfilError("The oracle is not configured (child process with the Python of the flliper environment: --couplings-python / RIGDASH_COUPLINGS_PYTHON)")
         if not isinstance(body, dict):
             raise ProfilError("Body must be a JSON object")
         basis = body.get("basis") or {}
@@ -1410,7 +1410,7 @@ class ProfilEditor:
                 except ValueError as exc:
                     raise ProfilError(str(exc))
             else:
-                # das Draft-Verzeichnis eines weg2-Profils ist ein weg2-Draft: die Einzelkarte nimmt nur einen ausdrücklich genannten
+                # das Draft-Verzeichnis eines pdflip-Profils ist ein pdflip-Draft: die Einzelkarte nimmt nur einen ausdrücklich genannten
                 p = "" if (single and fld == "draft_path") else (vars_.get(var_name) or "")
             if p:
                 paths[fld] = str(p)
@@ -1425,13 +1425,13 @@ class ProfilEditor:
             notes.append("Inventory: the NVML cards of this rig (hardware profile), real UUIDs.")
             if single:
                 try:
-                    karte = int(body.get("karte") or 0)
+                    emap = int(body.get("karte") or 0)
                 except (TypeError, ValueError):
                     raise ProfilError("karte must be the ordinal of a card of the hardware profile")
-                if not 0 <= karte < len(hw["cards"]):
-                    raise ProfilError("karte %d: the hardware profile has %d cards" % (karte, len(hw["cards"])))
-                inventar["karte"] = karte
-                notes.append("Single card: card %d of the hardware profile (other card: karte=<ordinal>); the remaining cards of the rig are not taken into account." % karte)
+                if not 0 <= emap < len(hw["cards"]):
+                    raise ProfilError("karte %d: the hardware profile has %d cards" % (emap, len(hw["cards"])))
+                inventar["karte"] = emap
+                notes.append("Single card: card %d of the hardware profile (other card: karte=<ordinal>); the remaining cards of the rig are not taken into account." % emap)
         elif isinstance(inv_req, list):
             if single and len(inv_req) != 1:
                 raise ProfilError("Single card: select exactly one card (not %d)" % len(inv_req))
@@ -1453,7 +1453,7 @@ class ProfilEditor:
         new["meta"]["vorschlag"] = {"schema": self.PROPOSE_SCHEMA, "form": form, "n": v["n"], "ziele": v["ziele"], "basis": [kind, name], "basis_sha256": bsha,
                                     "ausgang": res["verdikt"].get("ausgang"), "argv_sha256": res["verdikt"].get("argv_sha256")}
         if single:
-            new["meta"].setdefault("notes", []).append("Server profile of the single card (planner calculation, no weg2 launcher): the arguments of the normal server (python -m sglang.launch_server) for model %s" % paths["model_path"])
+            new["meta"].setdefault("notes", []).append("Server profile of the single card (planner calculation, no pdflip launcher): the arguments of the normal server (python -m flliper.launch_server) for model %s" % paths["model_path"])
         else:
             new["meta"].setdefault("notes", []).append("Planner server profile from %s (%s) for %d cards, form %s" % (name, bsha[:12], v["n"], form))
         new["id"] = pj.doc_id(new)

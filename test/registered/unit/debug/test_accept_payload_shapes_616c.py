@@ -1,8 +1,8 @@
 """Round-trip, ordering, and error tests for accept-broadcast pack/unpack.
 
 Hermetic CPU-only unit tests for
-:func:`sglang.srt.speculative.eagle_utils.pack_accept_payload`, and
-:func:`sglang.srt.speculative.eagle_utils.unpack_accept_payload`.
+:func:`flliper.srt.speculative.eagle_utils.pack_accept_payload`, and
+:func:`flliper.srt.speculative.eagle_utils.unpack_accept_payload`.
 
 No CUDA, no imports beyond torch and the three functions.
 """
@@ -10,7 +10,7 @@ No CUDA, no imports beyond torch and the three functions.
 import pytest
 import torch
 
-from sglang.srt.speculative.eagle_utils import (
+from flliper.srt.speculative.eagle_utils import (
     pack_accept_payload,
     unpack_accept_payload,
 )

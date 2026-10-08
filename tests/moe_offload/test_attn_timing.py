@@ -1,11 +1,11 @@
-"""SGLANG_MOE_OFFLOAD_TIMING=1: the hybrid backend times full vs linear
+"""FLLIPER_MOE_OFFLOAD_TIMING=1: the hybrid backend times full vs linear
 attention per prefill forward and logs the split when the next forward starts."""
 
 import logging
 
 import torch
 
-from sglang.srt.layers.attention import hybrid_linear_attn_backend as hb
+from flliper.srt.layers.attention import hybrid_linear_attn_backend as hb
 
 
 class _Ev:
@@ -36,9 +36,9 @@ def test_the_switch_is_the_moe_timing_switch(monkeypatch):
     for raw, want in (("", False), ("0", False), ("1", True)):
         hb._ATTN_T["on"] = None
         if raw == "":
-            monkeypatch.delenv("SGLANG_MOE_OFFLOAD_TIMING", raising=False)
+            monkeypatch.delenv("FLLIPER_MOE_OFFLOAD_TIMING", raising=False)
         else:
-            monkeypatch.setenv("SGLANG_MOE_OFFLOAD_TIMING", raw)
+            monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_TIMING", raw)
         assert hb._attn_timing_on() is want, raw
     hb._ATTN_T["on"] = None
 

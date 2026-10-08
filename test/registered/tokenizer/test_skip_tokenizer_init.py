@@ -9,10 +9,10 @@ import unittest
 import requests
 from transformers import AutoProcessor, AutoTokenizer
 
-from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.lang.chat_template import get_chat_template_by_model_path
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,

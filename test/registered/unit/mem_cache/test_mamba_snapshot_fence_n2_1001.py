@@ -27,8 +27,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc  # noqa: E402
 
 
 class _Log(list):
@@ -149,7 +149,7 @@ def test_a_kv_only_write_stays_unordered(monkeypatch):
 
 
 def test_the_switch_turns_the_fence_off(monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_MAMBA_SNAPSHOT_FENCE", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_MAMBA_SNAPSHOT_FENCE", "0")
     log, _ = _run(monkeypatch, _mamba())
     assert ("wait", "compute", "finish") not in log
 
@@ -217,7 +217,7 @@ def test_an_unstageable_op_keeps_the_fence(monkeypatch):
 
 
 def _arena_mamba_host(pending_rows=(0,), staging_rows=3):
-    from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
+    from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
 
     hp = object.__new__(ArenaMambaPoolHost)
     hp.arena = object()
@@ -261,7 +261,7 @@ def test_snapshot_rows_refuses_what_the_fence_must_keep():
 
 
 def test_pool_group_stages_only_mamba_transfers():
-    from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+    from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup
 
     hp = _arena_mamba_host()
     dev = _Dev2()

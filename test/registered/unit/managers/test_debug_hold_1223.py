@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from sglang.srt.managers import debug_hold
+from flliper.srt.managers import debug_hold
 
 
 class FakeTensor:
@@ -395,7 +395,7 @@ def test_hold_mode_suppresses_the_sigquit_in_the_scheduler_except():
     assert "_1223_hold_on" in window, "the SIGQUIT is not guarded by the hold flag"
     assert "if _1223_hold_on:" in window
     assert "else:\n            parent_process.send_signal(signal.SIGQUIT)" in window
-    assert "if not _1223_hold_on and envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION" in text
+    assert "if not _1223_hold_on and envs.FLLIPER_KILLPG_ON_SCHEDULER_EXCEPTION" in text
 
 
 # --- (3) the dump filename must not collide --------------------------------
@@ -492,7 +492,7 @@ def test_scripted_one_shot_attach_pattern_works_repeatedly(monkeypatch):
 
 
 def test_off_path_calls_nothing_at_all(monkeypatch):
-    """Without SGLANG_DEBUG_HOLD=1, maybe_hold touches nothing: no dump, no
+    """Without FLLIPER_DEBUG_HOLD=1, maybe_hold touches nothing: no dump, no
     socket, no port resolution, no log line. This is the byte-identical-off
     contract, pinned rather than inspected."""
     called = []

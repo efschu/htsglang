@@ -26,7 +26,7 @@ import unittest
 
 
 def _clear_gates():
-    from sglang.srt.utils.common import clear_per_device_gate_caches
+    from flliper.srt.utils.common import clear_per_device_gate_caches
 
     clear_per_device_gate_caches()
 
@@ -43,7 +43,7 @@ def cuinfo_note(sm: int) -> bytes:
 
 class TestWheelSassScan(unittest.TestCase):
     def test_scan_reads_note_archs_from_file_bytes(self):
-        from sglang.srt.utils import wheel_sass
+        from flliper.srt.utils import wheel_sass
 
         blob = b"\x00JUNK\x00" + cuinfo_note(86) + cuinfo_note(120)
         self.assertEqual({86, 120}, set(wheel_sass.scan_sass_archs(blob)))
@@ -51,7 +51,7 @@ class TestWheelSassScan(unittest.TestCase):
         self.assertEqual({86, 89, 120}, set(wheel_sass.scan_sass_archs(blob89)))
 
     def test_scan_of_bytes_without_notes_is_empty_not_a_crash(self):
-        from sglang.srt.utils import wheel_sass
+        from flliper.srt.utils import wheel_sass
 
         self.assertEqual(set(), set(wheel_sass.scan_sass_archs(b"no cubins here")))
 
@@ -75,7 +75,7 @@ class TestWheelSassScan(unittest.TestCase):
         else:
             frame = subprocess.run([zstd, "-c"], input=inner, capture_output=True,
                                    check=True).stdout
-        from sglang.srt.utils import wheel_sass
+        from flliper.srt.utils import wheel_sass
 
         blob = b"\x7fELF\x02\x01\x01" + b"\x00" * 100 + frame + b"tail"
         self.assertEqual({86, 120}, set(wheel_sass.scan_sass_archs(blob)))
@@ -90,7 +90,7 @@ class TestSm89FallbackDecision(unittest.TestCase):
         self.addCleanup(_clear_gates)
 
     def _arm(self, sm: int, carries):
-        import sglang.srt.layers.quantization.fp8_utils as fu
+        import flliper.srt.layers.quantization.fp8_utils as fu
 
         self.saved = {}
         for name, value in (
@@ -105,7 +105,7 @@ class TestSm89FallbackDecision(unittest.TestCase):
         return fu
 
     def tearDown(self):
-        import sglang.srt.layers.quantization.fp8_utils as fu
+        import flliper.srt.layers.quantization.fp8_utils as fu
 
         for name, value in self.saved.items():
             setattr(fu, name, value)

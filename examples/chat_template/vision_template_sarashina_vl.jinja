@@ -1,5 +1,5 @@
 {#
- In sglang, the default chat templates often assume message['content'] is a plain string.
+ In flliper, the default chat templates often assume message['content'] is a plain string.
  That works fine for simple text conversations, but it ignores multimodal inputs (e.g. image_url, tool_call).
  To align with the original model behavior and support richer content,
  we iterate over message['content'] as a list of typed items and extract their values directly.

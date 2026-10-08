@@ -1,4 +1,4 @@
-"""L3-PAIR (30.09., NF y3u 5bedac26f1, weg2-0-5): the L3 LRU must never evict the
+"""L3-PAIR (30.09., NF y3u 5bedac26f1, pdflip-0-5): the L3 LRU must never evict the
 QSA index page of a KV page that stays on disk.
 
 Metal: D's L3 owner unlinked 8 ``{h}.qsa_indexer{sfx}`` files at 00:35:43
@@ -13,7 +13,7 @@ Red on the base (the index page is the oldest entry and goes first), green with
 the pair rule. CPU only.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -23,10 +23,10 @@ import time
 import unittest
 from unittest import mock
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.storage.file import lru_file_evictor as LFE
-from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.storage.file import lru_file_evictor as LFE
+from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
 SFX = "_Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist_898fe1bf454ff7c1"
 KV_BYTES = 8192
@@ -58,7 +58,7 @@ def _ev(d: str) -> LRUFileEvictor:
             if name.endswith(".bin"):
                 yield name[:-4], os.stat(os.path.join(d, name))
 
-    with mock.patch.dict(os.environ, {"SGLANG_WEG2_GROUP": "D", "SGLANG_WEG2_STORE_JOURNAL": "0"}):
+    with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_PDFLIP_STORE_JOURNAL": "0"}):
         return LRUFileEvictor(d, SFX, tp_rank=0, pp_rank=0, attn_cp_rank=0,
                               writes_shared_keys=True, scan_suffixes=(SFX,),
                               extra_config={"max_size": str(10 ** 9), "max_size_scope": "shared"},
@@ -157,7 +157,7 @@ class TestL3SidecarPairEvict(unittest.TestCase):
 
     def test_switch_off_is_the_old_path(self):
         self._y3u_store()
-        with envs.SGLANG_HICACHE_L3_SIDECAR_PAIR_EVICT.override(False):
+        with envs.FLLIPER_HICACHE_L3_SIDECAR_PAIR_EVICT.override(False):
             ev = _ev(self.d)
         _evict_bytes(ev, 1)
         self.assertFalse(_exists(self.d, _qsa(47)))
@@ -165,7 +165,7 @@ class TestL3SidecarPairEvict(unittest.TestCase):
         self.assertTrue(_exists(self.d, _qsa(1)))
 
     def test_switch_default_on(self):
-        self.assertTrue(envs.SGLANG_HICACHE_L3_SIDECAR_PAIR_EVICT.get())
+        self.assertTrue(envs.FLLIPER_HICACHE_L3_SIDECAR_PAIR_EVICT.get())
 
 
 if __name__ == "__main__":

@@ -5,9 +5,9 @@ whether the double layout RUNS.
   eval_dual_boot.py <evidence-dir-or-prefix>   (the boot_weg2_<tag>_... files)
 
 Answers, each with the lines it counted:
-1. Did the dual path engage? (launcher WEG2-DUAL*, front WEG2 DUAL-LAYOUT on,
+1. Did the dual path engage? (launcher PDFLIP-DUAL*, front PDFLIP DUAL-LAYOUT on,
    P stage assembled, union OWNER/PEER + bound bytes, D ratios published)
-2. Were there flips? (WEG2-FLIP begin) -- must be 0.
+2. Were there flips? (PDFLIP-FLIP begin) -- must be 0.
 3. Did P prefill WHILE D decoded? Overlap of PP0 prefill seconds with TP0
    decode seconds (1-s buckets), and D's per-round gpu-ms in buckets with and
    without P activity (the price D pays; risk-1 predicted ~2x at P 50 %).
@@ -63,16 +63,16 @@ def _grep(path, pats, limit=6):
 # ...10010932: 6453 rounds over 457 s of t landed in 109 log seconds, lag p50
 # 1.4 s / p99 19 s), which made the old 1-s buckets report "5 s with BOTH" for
 # ~55 s of real overlap. P activity: per rank, the chunk window
-# [WEG2-VRAM-PEAK t_unix_ms - 'Prefill rank batch' gpu-ms, t_unix_ms] (paired by
+# [PDFLIP-VRAM-PEAK t_unix_ms - 'Prefill rank batch' gpu-ms, t_unix_ms] (paired by
 # TIME, see pair_peaks_with_batches: a peak without a batch line is dropped and
 # counted, never shifts the later pairs as zip() did); without those lines, the old PP0 'Prefill batch' log seconds.
-_VP = re.compile(r"PP(\d)\] WEG2-VRAM-PEAK rank=\d+ phase=chunk rows=(\d+) .*?t_unix_ms=(\d+)")
+_VP = re.compile(r"PP(\d)\] PDFLIP-VRAM-PEAK rank=\d+ phase=chunk rows=(\d+) .*?t_unix_ms=(\d+)")
 _RB = re.compile(r"PP(\d)\] Prefill rank batch, #new-token: (\d+), .*gpu-ms: ([\d.]+)")
 _DR = re.compile(r"TP0\] Decode rank batch, rank: 0, #round: \d+, t: ([\d.]+), .*gpu-ms: ([\d.]+)")
 
 
 #: A 'Prefill rank batch' line is stamped to the whole second and follows its
-#: chunk's WEG2-VRAM-PEAK line by milliseconds; further back than this it is a
+#: chunk's PDFLIP-VRAM-PEAK line by milliseconds; further back than this it is a
 #: different chunk's line (ITEM 200, 03.10.).
 MAX_PAIR_GAP_S = 10.0
 
@@ -186,15 +186,15 @@ def main():
     fs = _files(sys.argv[1])
     print("files:", fs)
     pats = {
-        "dual_launch": re.compile(r"WEG2-DUAL"),
-        "front_dual": re.compile(r"WEG2 DUAL-LAYOUT on"),
+        "dual_launch": re.compile(r"PDFLIP-DUAL"),
+        "front_dual": re.compile(r"PDFLIP DUAL-LAYOUT on"),
         "p_stage": re.compile(r"DUAL-TP3PP3 P stage \d+/\d+ assembled"),
         "p_bound": re.compile(r"DUAL-TP3PP3 P: shared part bound"),
-        "union_owner": re.compile(r"WEG2-UNION OWNER"),
-        "union_peer": re.compile(r"WEG2-UNION PEER"),
-        "d_ratios": re.compile(r"WEG2-UNION D ratios published"),
-        "flip": re.compile(r"WEG2-FLIP begin"),
-        "error": re.compile(r"Traceback|REFUSED:|CUDA error|out of memory|OutOfMemory|Weg2Stop|DualShareError|UnionShareError|STOP "),
+        "union_owner": re.compile(r"PDFLIP-UNION OWNER"),
+        "union_peer": re.compile(r"PDFLIP-UNION PEER"),
+        "d_ratios": re.compile(r"PDFLIP-UNION D ratios published"),
+        "flip": re.compile(r"PDFLIP-FLIP begin"),
+        "error": re.compile(r"Traceback|REFUSED:|CUDA error|out of memory|OutOfMemory|PdFlipStop|DualShareError|UnionShareError|STOP "),
         "mps": re.compile(r"MPS"),
         "duty": re.compile(r"duty throttle armed"),
         # unified KV per card (dual1g)
@@ -207,8 +207,8 @@ def main():
         "d_kv_grow": re.compile(r"DUAL-TP3PP3 D-KV GROW"),
         "d_kv_shrink": re.compile(r"DUAL-TP3PP3 D-KV SHRINK"),
         "d_kv_wait": re.compile(r"DUAL-TP3PP3 D-KV GROUP-WAIT"),
-        "p_pause": re.compile(r"WEG2 DUAL P-PAUSE rid"),
-        "p_paused": re.compile(r"WEG2 DUAL P-PAUSED rid"),
+        "p_pause": re.compile(r"PDFLIP DUAL P-PAUSE rid"),
+        "p_paused": re.compile(r"PDFLIP DUAL P-PAUSED rid"),
         "terminate": re.compile(r"terminate called"),
     }
     for k, p in fs.items():

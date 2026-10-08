@@ -28,31 +28,31 @@ runs. The numbers below are that constellation.
 Pure functions, no GPU, no server.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import math
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     ACTIVATION_VEC_ELEMS,
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.srt.layers.linear import _quant_block_aligned_units
-from sglang.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+from flliper.srt.layers.linear import _quant_block_aligned_units
+from flliper.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
+from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.layers.quantization.w8a8_int8 import (
+from flliper.srt.layers.quantization.w8a8_int8 import (
     INT8_SCALED_MM_ALIGN_K,
     INT8_SCALED_MM_ALIGN_N,
     W8A8Int8Config,
     int8_w8a8_uneven_tp_block,
     verify_int8_scaled_mm_supports_shape,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # Qwen3.6-27B-INT8-W8A8 (Avesed), the #327 A/B vehicle.
 HIDDEN = 5120
@@ -142,7 +142,7 @@ def _int4_group_ct():
 
 
 def _mlp_units(intermediate, quant_config):
-    """Mirrors the derivation in sglang.srt.models.qwen2_moe.Qwen2MoeMLP."""
+    """Mirrors the derivation in flliper.srt.models.qwen2_moe.Qwen2MoeMLP."""
     units = intermediate // math.gcd(intermediate, 16)
     return _quant_block_aligned_units(intermediate, units, quant_config, 1)
 

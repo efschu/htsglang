@@ -3,15 +3,15 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.batch_overlap.two_batch_overlap import (
+from flliper.srt.batch_overlap.two_batch_overlap import (
     compute_split_seq_index,
     compute_split_token_index,
 )
-from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.utils import kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -25,7 +25,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False):
+        with envs.FLLIPER_ENABLE_JIT_DEEPGEMM.override(False):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -126,7 +126,7 @@ class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):
         cls.model = DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
-        with envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False):
+        with envs.FLLIPER_ENABLE_JIT_DEEPGEMM.override(False):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

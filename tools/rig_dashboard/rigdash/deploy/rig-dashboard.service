@@ -1,10 +1,10 @@
 # Rig-Dashboard (rigdash): live P-Prefill / D-Prefill / Decode tok/s, flips,
 # cards, containers and the gpuq plan, on http://192.168.0.101:8890/ .
 #
-# Read-only towards every model: it tails the weg2 boot logs by byte offset,
+# Read-only towards every model: it tails the pdflip boot logs by byte offset,
 # asks nvidia-smi (no CUDA context -- unlike the old planner it never pins the
 # driver, so a driver reload does not have to stop it), `docker ps` on the
-# Proxmox host over ssh, gpuq's GET API, and GET /weg2/state every 10 s.
+# Proxmox host over ssh, gpuq's GET API, and GET /pdflip/state every 10 s.
 #
 # Runs from a DEPLOYED copy (/opt/rigdash/current -> releases/<sha>), never
 # from a git worktree an unrelated agent can delete (the defect recorded in

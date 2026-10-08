@@ -20,7 +20,7 @@ Eigentümer ``profil-editor``, nur die zu messenden Karten, 15 min (Auftrag 1006
     Buchung bleibt in der Warteschlange; ein erneuter Knopfdruck derselben Karten nimmt sie wieder auf (kein
     Hintergrund-Poller, nur die offene Seite fragt; Memory KEINE-CRONS).
   * Läuft das Fenster, prüft die Route zuerst die Karten (gpuq ``used_mib`` stammt aus nvidia-smi: der Dienst sperrt
-    nichts) und startet dann den Messlauf: ein Kindprozess ``python -m sglang.srt.rigmon.card_probe --run`` mit genau
+    nichts) und startet dann den Messlauf: ein Kindprozess ``python -m flliper.srt.rigmon.card_probe --run`` mit genau
     den gewählten Karten (derselbe Weg wie ``ProbeJobStore``: der Dashboard-Prozess bekommt nie einen CUDA-Kontext).
   * Nach der Messung (auch nach Fehler oder Zeitüberschreitung) gibt die Route das Fenster SOFORT zurück.
 
@@ -28,7 +28,7 @@ Das Fenster ist exklusiv (kein ``mib``): eine Ratenmessung neben fremder Last mi
 bewusst einen Anteil buchen will, gibt ``mib`` im Body an.
 
 Dieser Prozess bleibt stdlib-only und ohne CUDA: ``hardware_profile.py`` des Planer-Baums wird per Dateipfad geladen
-(wie ``kartenplan_gate``), NICHT per ``import sglang``.  Token der gpuq-Buchung verlassen den Prozess nie (nicht in
+(wie ``kartenplan_gate``), NICHT per ``import flliper``.  Token der gpuq-Buchung verlassen den Prozess nie (nicht in
 der JSON-Antwort); die Buchung steht zusätzlich in ``<state-dir>/hwprofil_window.json``, damit ein Neustart ein
 verwaistes Fenster zurückgeben kann.
 """
@@ -89,7 +89,7 @@ PERSIST_LABELS = {
     "nicht_schreibbar": "Saving failed",
 }
 
-MODULE_REL = os.path.join("sglang", "srt", "rigmon", "hardware_profile.py")
+MODULE_REL = os.path.join("flliper", "srt", "rigmon", "hardware_profile.py")
 #: Planer-Bäume, in denen ``hardware_profile.py`` gesucht wird (KARTENPLAN_TREE wie beim Kartenplaner)
 TREE_CANDIDATES = (
     "/opt/rigdash/kartenplan/current/python",
@@ -102,7 +102,7 @@ def default_persist_path(env: Optional[dict] = None) -> str:
 
 
 def datasheet_provider(mod) -> Callable[[dict], dict]:
-    """Datenblatt-Suche für ``hardware_profile.build``: SM-Zahl aus ``weg2/hw_sim.py`` (über das Profilmodul), Nennbandbreite und
+    """Datenblatt-Suche für ``hardware_profile.build``: SM-Zahl aus ``pdflip/hw_sim.py`` (über das Profilmodul), Nennbandbreite und
     Katalogkarte aus ``kartenplan_catalog``.  Beide gelten als "Datenblatt"; ein Gemessenes steht im Profil davor."""
     sm = getattr(mod, "hw_sim_datasheet", None)
 
@@ -181,11 +181,11 @@ def _git_head(tree: Optional[str]) -> Optional[str]:
 
 
 def version_facts(doc: dict, versions: Optional[dict] = None, environ: Optional[dict] = None) -> dict:
-    """Die Versionsangaben, die ein Issue-Text nennt (Hardwareprofil UND Laufbericht lesen dieselben): Image (``SGLANG_IMAGE_TAG``),
+    """Die Versionsangaben, die ein Issue-Text nennt (Hardwareprofil UND Laufbericht lesen dieselben): Image (``FLLIPER_IMAGE_TAG``),
     Baum-Revision, Treiber, CUDA/torch des Messprozesses und Dashboard-Version.  Die Revision kommt der Reihe nach aus: einer übergebenen
     ``tree_rev``; einem gestagten Baumpfad ``.../releases/<sha>/python``; ``git rev-parse HEAD`` des Baums (Release-Image: ``/opt/htsglang/src``);
-    der Image-ENV ``HTSGLANG_REVISION`` (bzw. ``_27B`` / ``_NF`` je ``STAND``, Soll-Revision des Entrypoints); ``SGLANG_BUILD_COMMIT``.  Die Herkunft
-    steht in ``tree_rev_src``.  Die Build-Defaults ``SGLANG_BUILD_COMMIT=unknown`` und ``SGLANG_IMAGE_TAG=local/sglang:dev`` (Dockerfile) sind
+    der Image-ENV ``HTSGLANG_REVISION`` (bzw. ``_27B`` / ``_NF`` je ``STAND``, Soll-Revision des Entrypoints); ``FLLIPER_BUILD_COMMIT``.  Die Herkunft
+    steht in ``tree_rev_src``.  Die Build-Defaults ``FLLIPER_BUILD_COMMIT=unknown`` und ``FLLIPER_IMAGE_TAG=local/flliper:dev`` (Dockerfile) sind
     KEIN Beleg: Revision ``None`` bzw. ``image_default`` = True.  Was nicht belegt ist, ist ``None`` (die Texte schreiben dann "unbelegt"); nie geraten."""
     versions = versions or {}
     env = os.environ if environ is None else environ
@@ -205,10 +205,10 @@ def version_facts(doc: dict, versions: Optional[dict] = None, environ: Optional[
                     rev, src = str(env[k]).strip().lower(), "Image-ENV %s" % k
                     break
             else:
-                if _is_sha(env.get("SGLANG_BUILD_COMMIT")):
-                    rev, src = str(env["SGLANG_BUILD_COMMIT"]).strip().lower(), "Image-ENV SGLANG_BUILD_COMMIT"
-    image = env.get("SGLANG_IMAGE_TAG") or versions.get("image") or None
-    image_default = image == "local/sglang:dev"
+                if _is_sha(env.get("FLLIPER_BUILD_COMMIT")):
+                    rev, src = str(env["FLLIPER_BUILD_COMMIT"]).strip().lower(), "Image-ENV FLLIPER_BUILD_COMMIT"
+    image = env.get("FLLIPER_IMAGE_TAG") or versions.get("image") or None
+    image_default = image == "local/flliper:dev"
     return {"image": image, "image_default": image_default, "tree_rev": rev or None, "tree_rev_src": src,
             "driver": doc.get("driver") or None, "cuda": doc.get("cuda") or None, "torch": doc.get("torch") or None,
             "rigdash": versions.get("rigdash") or None}
@@ -218,7 +218,7 @@ def version_image_text(vf: dict) -> str:
     """Die Image-Zelle: der Tag mit Herkunft, der Dockerfile-Default als "unbelegt (Default)", ohne Angabe wie bisher."""
     if vf.get("image_default"):
         return "unverified (default %s, not set at build)" % vf["image"]
-    return vf.get("image") or "unverified (SGLANG_IMAGE_TAG not set)"
+    return vf.get("image") or "unverified (FLLIPER_IMAGE_TAG not set)"
 
 
 def version_tree_text(vf: dict) -> str:
@@ -452,7 +452,7 @@ class HwProfil:
         if self._mod is None:
             if not self.tree:
                 raise RuntimeError(
-                    "no planner tree with sglang/srt/rigmon/hardware_profile.py found (--hw-tree, HWPROFIL_TREE or KARTENPLAN_TREE; to stage: deploy/stage_hwprofil.sh)")
+                    "no planner tree with flliper/srt/rigmon/hardware_profile.py found (--hw-tree, HWPROFIL_TREE or KARTENPLAN_TREE; to stage: deploy/stage_hwprofil.sh)")
             self._mod = _load_module(self.tree)
         return self._mod
 

@@ -23,7 +23,7 @@ LANE_GBS = {3: 0.985, 4: 1.969, 5: 3.938}
 GENS = (3, 4, 5)
 LANES = (1, 4, 8, 16)
 
-#: Mindest-BAR1 für die weg2-Gruppenfenster (MiB): 96 (P PP_0) + 16 + 32 + 24 (D) = 168
+#: Mindest-BAR1 für die pdflip-Gruppenfenster (MiB): 96 (P PP_0) + 16 + 32 + 24 (D) = 168
 BAR1_WINDOW_NEED_MIB = 168
 #: BAR1 bei ausgeschaltetem Resizable BAR: das Rig misst 256 MiB auf den 3080
 BAR1_NO_REBAR_MIB = 256
@@ -83,7 +83,7 @@ def per_card_link(cat_entry: dict, slot: dict) -> dict:
 
 
 def choose_transport(links: List[dict], labels: List[str], *, host_patched: bool = True) -> dict:
-    """Transport für die weg2-Kollektive und den Flip.  ``links`` = Ausgaben von ``per_card_link``.
+    """Transport für die pdflip-Kollektive und den Flip.  ``links`` = Ausgaben von ``per_card_link``.
 
     Ergebnis: ``transport`` ('bar1' | 'nccl' | 'none'), ``confidence`` ('verified' | 'unchecked' | 'development'),
     ``reasons`` (jede Angabe, die in die Wahl einging), ``warnings``, ``card_notes`` (je Karte)."""
@@ -93,7 +93,7 @@ def choose_transport(links: List[dict], labels: List[str], *, host_patched: bool
     n = len(links)
     if n < 2:
         return {"transport": "none", "confidence": "verified",
-                "reasons": ["One card: no card traffic, neither barlink nor NCCL needed. The weg2 flip needs two groups on the same cards and at least 2 cards (topology.MIN_CARDS)."],
+                "reasons": ["One card: no card traffic, neither barlink nor NCCL needed. The pdflip flip needs two groups on the same cards and at least 2 cards (topology.MIN_CARDS)."],
                 "warnings": [], "card_notes": ["%s: %s" % (labels[0], "no peer")] if labels else []}
     small = [(labels[i], l["bar1_mib"]) for i, l in enumerate(links) if l["bar1_mib"] < BAR1_WINDOW_NEED_MIB]
     chip = [labels[i] for i, l in enumerate(links) if l["chipset"]]
@@ -108,10 +108,10 @@ def choose_transport(links: List[dict], labels: List[str], *, host_patched: bool
         reasons.append("The host does NOT have the patched nvidia-open 595.58.03 with RMSmallBarP2PPeerBar1=1/PeerMappingOverride=1 and dmabuf_holder: barlink BAR1 refused (source: " + FACTS["host"] + ").")
         reasons.append("NCCL remains (no GPUDirect P2P on GeForce: host staging). " + FACTS["nccl"] + ".")
         return {"transport": "nccl", "confidence": "development", "reasons": reasons,
-                "warnings": ["NCCL operation of the weg2 line is a development switch and never booted for NF."],
+                "warnings": ["NCCL operation of the pdflip line is a development switch and never booted for NF."],
                 "card_notes": notes}
     if small:
-        reasons.append("BAR1 too small for the weg2 group windows (needed %d MiB, source: %s): %s."
+        reasons.append("BAR1 too small for the pdflip group windows (needed %d MiB, source: %s): %s."
                        % (BAR1_WINDOW_NEED_MIB, FACTS["window_need"], ", ".join("%s %d MiB" % s for s in small)))
         reasons.append("Hence NCCL instead of barlink BAR1.")
         return {"transport": "nccl", "confidence": "development", "reasons": reasons,

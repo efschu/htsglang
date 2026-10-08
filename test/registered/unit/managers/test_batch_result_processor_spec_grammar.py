@@ -9,13 +9,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

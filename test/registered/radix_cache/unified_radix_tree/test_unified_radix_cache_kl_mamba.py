@@ -5,15 +5,15 @@ import unittest
 
 from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
-from sglang.test.kl_multiturn_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from flliper.test.kl_multiturn_utils import (
     get_input_ids,
     make_mamba_decode_assert,
     make_mamba_prefill_assert,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -60,7 +60,7 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={"FLLIPER_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -119,7 +119,7 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "4",
                 "--weight-loader-prefetch-checkpoints",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={"FLLIPER_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -179,8 +179,8 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--weight-loader-prefetch-checkpoints",
             ],
             env={
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
+                "FLLIPER_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )
 

@@ -4,7 +4,7 @@ read, mtp / visual (language_model_only) dropped."""
 
 from types import SimpleNamespace
 
-from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration as M
+from flliper.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration as M
 
 
 class _Stub:

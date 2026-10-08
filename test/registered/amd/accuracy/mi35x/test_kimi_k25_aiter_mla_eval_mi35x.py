@@ -22,9 +22,9 @@ import unittest
 from dataclasses import dataclass
 from typing import List, Optional
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
@@ -85,7 +85,7 @@ def get_kimi_k25_models() -> List[ModelConfig]:
         "--watchdog-timeout",
         "1200",
     ]
-    common_env = {"SGLANG_AITER_MLA_PERSIST": "1"}
+    common_env = {"FLLIPER_AITER_MLA_PERSIST": "1"}
 
     return [
         ModelConfig(
@@ -122,7 +122,7 @@ class TestKimiK25AiterMlaEvalMI35x(unittest.TestCase):
         """Test Kimi-K2.5 with GSM8K completion benchmark (default & fp8kv)."""
         from types import SimpleNamespace
 
-        from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+        from flliper.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 
         all_results = []
         summary = "### Kimi-K2.5 aiter MLA (MI35x)\n\n"

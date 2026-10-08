@@ -39,8 +39,8 @@ narrower window.
 
 import unittest
 
-from sglang.srt.managers.corridor_guard import CorridorGuard
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.corridor_guard import CorridorGuard
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

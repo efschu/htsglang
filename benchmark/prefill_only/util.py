@@ -1,7 +1,7 @@
 """
-Common utilities for SGLang benchmark scripts.
+Common utilities for fLLiper benchmark scripts.
 
-This module contains shared code for benchmarking different SGLang APIs
+This module contains shared code for benchmarking different fLLiper APIs
 including scoring, embeddings, and other endpoints.
 """
 
@@ -97,7 +97,7 @@ def setup_profiler(config: BenchmarkConfig, benchmark_name: str) -> None:
         profiler_path = os.path.join(
             config.profiler_dir, benchmark_name.lower().replace("_", "-")
         )
-        os.environ["SGLANG_TORCH_PROFILER_DIR"] = profiler_path
+        os.environ["FLLIPER_TORCH_PROFILER_DIR"] = profiler_path
         print(f"Profiler enabled. Output directory: {profiler_path}")
     else:
         print("Profiler disabled")

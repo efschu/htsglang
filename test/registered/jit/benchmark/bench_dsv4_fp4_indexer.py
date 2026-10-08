@@ -5,10 +5,10 @@ import sys
 import torch
 import triton
 
-from sglang.benchmark.bench_utils import run_bench
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range
-from sglang.srt.utils import is_sm100_supported
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.benchmark.bench_utils import run_bench
+from flliper.jit_kernel.benchmark.utils import get_benchmark_range
+from flliper.srt.utils import is_sm100_supported
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

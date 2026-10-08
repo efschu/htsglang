@@ -9,13 +9,13 @@ intermediate buffers; the baseline is two launches with split-K partials.
 import torch
 import triton
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.minimax_decode_topk import minimax_decode_topk
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.minimax_decode_topk import minimax_decode_topk
+from flliper.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
     _topk_index_merge_kernel,
     _topk_index_partial_kernel,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

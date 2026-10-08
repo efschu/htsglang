@@ -5,9 +5,9 @@ from typing import Optional
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, get_similarities
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.runners import HFRunner, SRTRunner
+from flliper.test.test_utils import CustomTestCase, get_similarities
 
 register_npu_ci(
     est_time=400,

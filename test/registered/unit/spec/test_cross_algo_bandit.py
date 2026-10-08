@@ -13,20 +13,20 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.speculative.adaptive_spec_params import RungMetrics
-from sglang.srt.speculative.cross_algo_bandit import (
+from flliper.srt.speculative.adaptive_spec_params import RungMetrics
+from flliper.srt.speculative.cross_algo_bandit import (
     ENV_PREFIX,
     CrossAlgoBandit,
     CrossBanditConfig,
     NextnAcceptModel,
 )
-from sglang.srt.speculative.cross_algo_utils import (
+from flliper.srt.speculative.cross_algo_utils import (
     ctx_gate_eligible,
     derive_ctx_gate_threshold,
     parse_ctx_gate_value,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -337,7 +337,7 @@ class TestCtxGateDecide(CustomTestCase):
         b = _bandit(rungs=[NEXTN3, DFLASH])
         _feed(b, NEXTN3, accept=3, rounds=10, dt=0.040)
         with self.assertLogs(
-            "sglang.srt.speculative.cross_algo_bandit", level="INFO"
+            "flliper.srt.speculative.cross_algo_bandit", level="INFO"
         ) as cm:
             b.decide(64, eligible=frozenset([NEXTN3]))
             b.decide(80, eligible=frozenset([NEXTN3]))
@@ -351,7 +351,7 @@ class TestCtxGateDecide(CustomTestCase):
         b._probe_until = None
         b._pre_probe_rung = None
         with self.assertLogs(
-            "sglang.srt.speculative.cross_algo_bandit", level="INFO"
+            "flliper.srt.speculative.cross_algo_bandit", level="INFO"
         ) as cm:
             b.decide(1000, eligible=frozenset([NEXTN3]))
         self.assertTrue(any("skipped: ctx gate" in m for m in cm.output))
@@ -422,11 +422,11 @@ class TestCtxGateDerivation(CustomTestCase):
     def test_factor_env_override(self):
         with tempfile.TemporaryDirectory() as d:
             self._write_cfg(d, {"sliding_window": 2048})
-            os.environ["SGLANG_CROSS_CTX_GATE_FACTOR"] = "8"
+            os.environ["FLLIPER_CROSS_CTX_GATE_FACTOR"] = "8"
             try:
                 thr, _ = derive_ctx_gate_threshold(d)
             finally:
-                del os.environ["SGLANG_CROSS_CTX_GATE_FACTOR"]
+                del os.environ["FLLIPER_CROSS_CTX_GATE_FACTOR"]
         self.assertEqual(thr, 16384)
 
     def test_swa_threshold_capped_at_mpe(self):

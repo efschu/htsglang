@@ -11,17 +11,17 @@ n.has_children=8 candidates=0' -- every leaf of D's tree is a finished request's
 mamba anchor host-only, ``dual_arena_spill._reason`` refuses 'aux_host_only' unconditionally, and the
 inner nodes never become leaves. P's V2 trim looped START -> 3 empty orders -> PAUSED -> RESUME 21x.
 
-The fix (dual layout only, switch SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S, default 30 s, 0 = off): once the
+The fix (dual layout only, switch FLLIPER_PDFLIP_DUAL_ARENA_AUX_SPILL_S, default 30 s, 0 = off): once the
 wall has stood that long, the D yield (TP0's clock, a bit on the tick's collective) and the P trim
 (PP0's clock, ``aux=1`` on the wire order) also take END-anchor leaves -- after every plain leaf, L3
 copy of every KV page first, never a locked / in-flight / V1-held node.
 
 Hermetic: the real C arena on a temp file, the real ArenaMHAHostPool, the real
-``_weg2_direct_claim`` / ``_evict_host_leaf``; the mamba component is a recording fake (its host
+``_pdflip_direct_claim`` / ``_evict_host_leaf``; the mamba component is a recording fake (its host
 free is the reference going back to its own arena). New names are looked up with getattr so the
 tests fail on the base by BEHAVIOUR (the claim stays refused), not by an import error."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -39,22 +39,22 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "weg2"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "pdflip"))
 import test_dual_d_arena_yield_q1190_1004 as Y  # noqa: E402
 import test_w3_arena_spill_0929 as W  # noqa: E402
 import test_w3_dual_host_only_spill_q697c_1004 as Q  # noqa: E402
 
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (  # noqa: E402
     ComponentType,
     EvictLayer,
 )
-from sglang.srt.weg2 import dual_arena_spill as DS  # noqa: E402
-from sglang.srt.weg2 import dual_d_kv_stage as DK  # noqa: E402
+from flliper.srt.pdflip import dual_arena_spill as DS  # noqa: E402
+from flliper.srt.pdflip import dual_d_kv_stage as DK  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
 FULL, MAMBA = ComponentType.FULL, ComponentType.MAMBA
-AUX_ENV = getattr(DS, "AUX_ENV", "SGLANG_WEG2_DUAL_ARENA_AUX_SPILL_S")
+AUX_ENV = getattr(DS, "AUX_ENV", "FLLIPER_PDFLIP_DUAL_ARENA_AUX_SPILL_S")
 AUX_FLAG = getattr(DS, "AUX_FLAG", 1 << 40)
 AUX_MARK = getattr(DS, "AUX_MARK", "Q-1190b DUAL ARENA-AUX-SPILL")
 DUAL_P, DUAL_D = Y.DUAL_P, Y.DUAL_D
@@ -126,7 +126,7 @@ def _wedge(tmp_path):
 
 def _p_claim(monkeypatch, tp, m, aux_s):
     _env(monkeypatch, DUAL_P, aux_s)
-    return tp._weg2_direct_claim(m)
+    return tp._pdflip_direct_claim(m)
 
 
 def _d_round(monkeypatch, td, aux_s, tp_rank=0):
@@ -242,8 +242,8 @@ def test_aux_never_takes_a_page_without_l3_a_locked_an_in_flight_or_a_v1_held_en
     _with_mamba(td, nodes, anchors=range(8))                      # every leaf an END-anchor leaf
     nodes[1].component_data[MAMBA].host_lock_ref = 1             # a load reads the anchor
     td.ongoing_write_through[nodes[2].id] = object()              # pages not COMPLETE yet
-    nodes[3]._weg2_end_anchor = True                              # V1: D may not have read it yet
-    td._weg2_direct_mamba_rows = {nodes[4].id: object()}          # #1427 direct write in flight
+    nodes[3]._pdflip_end_anchor = True                              # V1: D may not have read it yet
+    td._pdflip_direct_mamba_rows = {nodes[4].id: object()}          # #1427 direct write in flight
     got = DS.d_yield_arena(types.SimpleNamespace(tree_cache=td), 100 | AUX_FLAG)
     for k in (0, 1, 2, 3, 4):
         assert Q._in_tree(td, nodes[k]), k
@@ -355,6 +355,6 @@ def test_off_the_gate_no_clock_runs_and_no_bit_is_set(tmp_path, monkeypatch):
         sub = tmp_path / ("e%d" % len(os.listdir(tmp_path)))
         sub.mkdir()
         tp, td, d_nodes, root, arena, mc = _wedge(sub)
-        assert DS.post_need(td._weg2_direct_pool(), 5) is False, env      # nothing written off the gate
+        assert DS.post_need(td._pdflip_direct_pool(), 5) is False, env      # nothing written off the gate
         assert DS.d_take_need(types.SimpleNamespace(tree_cache=td)) == 0, env
         assert getattr(DS, "_A", {}).get("d_since") is None, env

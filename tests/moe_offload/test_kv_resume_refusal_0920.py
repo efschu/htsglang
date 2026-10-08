@@ -6,14 +6,14 @@ THE SPECIMEN (boot weg2xsn408, 2026-09-20 17:57:21Z; boot weg2xsn406 68
 minutes earlier is the same failure). The wake's own arithmetic printed the
 shortfall and then ignored it:
 
-    TP0  WEG2-WAKE-KV-FIRST LATE free=13355 MiB floor=767 MiB need=13024 MiB
-    TP1  WEG2-WAKE-KV-FIRST LATE free=5974  MiB floor=700 MiB need=6904  MiB
+    TP0  PDFLIP-WAKE-KV-FIRST LATE free=13355 MiB floor=767 MiB need=13024 MiB
+    TP1  PDFLIP-WAKE-KV-FIRST LATE free=5974  MiB floor=700 MiB need=6904  MiB
                              (... free - floor - margin < kv)
 
-`_weg2_wake_kv_first_ok` uses that answer ONLY to pick EARLY vs LATE, then
+`_pdflip_wake_kv_first_ok` uses that answer ONLY to pick EARLY vs LATE, then
 resumes LATE anyway. The hook rolled the tag back and could not say so:
 
-    [core.cpp] WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
+    [core.cpp] PDFLIP-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
                failed_alloc=30/41 rolled_back_bytes=5442109440
                tag_bytes=7239368704 -- every allocation of the tag is PAUSED again
     [torch_memory_saver.cpp] tms_resume failed rc=2 tag=kv_cache (void ABI: exiting)
@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.weg2.wake_kv import (
+from flliper.srt.pdflip.wake_kv import (
     RESUME_LANDED_MIN_BYTES,
     kv_resume_fit_refusal,
     resume_landed,
@@ -127,7 +127,7 @@ class _StubSaver:
 
 
 def _adapter(monkeypatch, free_before, free_after, tag_bytes):
-    from sglang.srt.utils import torch_memory_saver_adapter as tms
+    from flliper.srt.utils import torch_memory_saver_adapter as tms
 
     saver = _StubSaver()
     monkeypatch.setattr(tms, "_memory_saver", saver, raising=False)
@@ -140,10 +140,10 @@ def _adapter(monkeypatch, free_before, free_after, tag_bytes):
 
 def test_adapter_raises_by_name_when_the_resume_did_not_land(monkeypatch):
     tms, a, saver = _adapter(monkeypatch, 5974 * MiB, 5974 * MiB, 6904 * MiB)
-    with pytest.raises(tms.Weg2TmsResumeRefused) as e:
+    with pytest.raises(tms.PdFlipTmsResumeRefused) as e:
         a.resume("kv_cache")
     msg = str(e.value)
-    assert "W119 Weg2TmsResumeRefused" in msg  # renumbered on this line: W114 is Weg2FlipHostPoolDoubled here
+    assert "W119 PdFlipTmsResumeRefused" in msg  # renumbered on this line: W114 is PdFlipHostPoolDoubled here
     assert "tag=kv_cache" in msg
     assert "tag_bytes=6904 MiB" in msg
     assert "delta=0 MiB" in msg
@@ -174,7 +174,7 @@ def test_a_sequence_that_did_not_record_this_tag_proves_nothing(monkeypatch, aft
     measurement, which here says the bytes never left free memory."""
     tms, a, saver = _adapter(monkeypatch, 5974 * MiB, 5974 * MiB, 6904 * MiB)
     _records(monkeypatch, tms, a, (41, "weights_draft", 0, 0.0, 0.0), after)
-    with pytest.raises(tms.Weg2TmsResumeRefused):
+    with pytest.raises(tms.PdFlipTmsResumeRefused):
         a.resume("weights")
 
 
@@ -196,7 +196,7 @@ def test_adapter_stays_silent_when_the_tag_size_is_unknown(monkeypatch):
 
 
 def test_adapter_survives_a_tag_bytes_probe_that_raises(monkeypatch):
-    from sglang.srt.utils import torch_memory_saver_adapter as tms
+    from flliper.srt.utils import torch_memory_saver_adapter as tms
 
     saver = _StubSaver()
     monkeypatch.setattr(tms, "_memory_saver", saver, raising=False)
@@ -213,13 +213,13 @@ def test_adapter_survives_a_tag_bytes_probe_that_raises(monkeypatch):
 def test_the_refusal_is_a_runtime_error_subclass(monkeypatch):
     """Callers that only catch the base class still stop; callers that name it
     can keep the rank alive and dormant."""
-    from sglang.srt.utils import torch_memory_saver_adapter as tms
+    from flliper.srt.utils import torch_memory_saver_adapter as tms
 
-    assert issubclass(tms.Weg2TmsResumeRefused, RuntimeError)
+    assert issubclass(tms.PdFlipTmsResumeRefused, RuntimeError)
 
 
 def test_device_free_bytes_never_raises(monkeypatch):
-    from sglang.srt.utils import torch_memory_saver_adapter as tms
+    from flliper.srt.utils import torch_memory_saver_adapter as tms
 
     import torch
 

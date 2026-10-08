@@ -500,7 +500,7 @@ def run(root, path_prefixes, only_feature=True, fork_only=True):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
-    ap.add_argument("--paths", default="python/sglang/srt")
+    ap.add_argument("--paths", default="python/flliper/srt")
     ap.add_argument("--all", action="store_true")
     ap.add_argument(
         "--any-file",

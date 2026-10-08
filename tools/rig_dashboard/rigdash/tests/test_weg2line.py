@@ -1,4 +1,4 @@
-"""weg2 start-line wizard: the host line and its boot-free dry run."""
+"""pdflip start-line wizard: the host line and its boot-free dry run."""
 
 import json
 import os
@@ -76,7 +76,7 @@ class BuildTests(unittest.TestCase):
             fh.write("PROFILE_NAME=27b-release-draft\nPROFILE_STATUS=experimentell\n# newer\n")
         with open(os.path.join(d, "profiles", "nf-h91.env"), "w") as fh:
             fh.write("PROFILE_NAME=nf-h91\nPROFILE_LINE=nf\nPROFILE_STATUS=experimentell\nPROFILE_NCCL_STATUS=unproven\n")
-        self.w = weg2line.Weg2Lines(["false"], ["27b-release-draft", "nf-h91"], docker_dir=d,
+        self.w = weg2line.PdFlipLines(["false"], ["27b-release-draft", "nf-h91"], docker_dir=d,
                                     ctx_glob=os.path.join(d, "ctx", "*", "BUILD_INFO.json"))
         self.w._images = (1e18, weg2line.parse_images(IMAGES), None)   # no ssh in tests
         self.ctx = ctx

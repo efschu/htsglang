@@ -3,25 +3,25 @@ from array import array
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     EvictResult,
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.common import available_and_evictable_str
+from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
+from flliper.srt.mem_cache.swa_radix_cache import SWARadixCache
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
@@ -631,7 +631,7 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(freed_lens, [4, 1])
 
 
-# Optimization: SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.
+# Optimization: FLLIPER_OPT_SWA_SPLIT_LEAF_ON_INSERT.
 # Splits a freshly-inserted leaf at the (page-aligned) sliding-window
 # boundary so a future inc_lock_ref protects only ~sliding_window_size SWA
 # tokens instead of the whole chunked-prefill chain.
@@ -645,7 +645,7 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
             page_size=page_size,
         )
         token_ids = list(range(leaf_len))
-        with envs.SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.override(flag_on):
+        with envs.FLLIPER_OPT_SWA_SPLIT_LEAF_ON_INSERT.override(flag_on):
             leaf = _insert_chain(tree, allocator, token_ids)
         result = tree.inc_lock_ref(leaf)
         return tree, leaf, result
@@ -714,7 +714,7 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
             page_size=1,
         )
         token_ids = list(range(12))
-        with envs.SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.override(True):
+        with envs.FLLIPER_OPT_SWA_SPLIT_LEAF_ON_INSERT.override(True):
             inserted_leaf = _insert_chain(tree, allocator, token_ids)
         self.assertEqual(len(inserted_leaf.value), 4)
         match = tree.match_prefix(

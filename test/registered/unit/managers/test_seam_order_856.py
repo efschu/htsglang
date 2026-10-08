@@ -31,17 +31,17 @@ it reaches the CURRENT root. That is the whole mechanism of the crash; every
 other detail of the radix cache is irrelevant to it.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     SeamOrderError,
     release_residents_for_cutover,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Node:
@@ -180,7 +180,7 @@ class TestTheSchedulerBindingRefusesRatherThanDegrades(CustomTestCase):
     def test_no_tree_cache_is_refused(self):
         import types
 
-        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+        from flliper.srt.managers.phase_flip_runtime import build_cutover_release
 
         self.assertIsNone(build_cutover_release(types.SimpleNamespace()))
 
@@ -189,7 +189,7 @@ class TestTheSchedulerBindingRefusesRatherThanDegrades(CustomTestCase):
         # enter the next phase naming rows that hold no KV.
         import types
 
-        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+        from flliper.srt.managers.phase_flip_runtime import build_cutover_release
 
         sched = types.SimpleNamespace(tree_cache=types.SimpleNamespace())
         self.assertIsNone(build_cutover_release(sched))
@@ -197,7 +197,7 @@ class TestTheSchedulerBindingRefusesRatherThanDegrades(CustomTestCase):
     def test_a_resettable_tree_yields_both_halves(self):
         import types
 
-        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+        from flliper.srt.managers.phase_flip_runtime import build_cutover_release
 
         tree = types.SimpleNamespace(reset=lambda: None)
         built = build_cutover_release(types.SimpleNamespace(tree_cache=tree))
@@ -216,7 +216,7 @@ class TestTheSchedulerBindingRefusesRatherThanDegrades(CustomTestCase):
         # not have wired -- an idle flip still has to drop its tree.
         import types
 
-        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+        from flliper.srt.managers.phase_flip_runtime import build_cutover_release
 
         tree = types.SimpleNamespace(reset=lambda: None)
         retract, _ = build_cutover_release(types.SimpleNamespace(tree_cache=tree))
@@ -229,7 +229,7 @@ class TestTheSchedulerBindingRefusesRatherThanDegrades(CustomTestCase):
         # twice at the one instant the instance is blocked.
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+        from flliper.srt.managers.phase_flip_runtime import build_cutover_release
 
         src = inspect.getsource(build_cutover_release)
         self.assertIn("offload_kv=False", src)

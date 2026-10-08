@@ -3,8 +3,8 @@ den Host-Pin.
 
 fnFL2w3 starb daran. Die Kette, jede Stufe gemessen:
 
-    WEG2-XCHG-DEPOSIT-SKIPPED group=D rank=1: the arm published no bounce
-    terms (SGLANG_WEG2_XCHG_BOUNCE_TERMS), so this rank cannot size a deposit
+    PDFLIP-XCHG-DEPOSIT-SKIPPED group=D rank=1: the arm published no bounce
+    terms (FLLIPER_PDFLIP_XCHG_BOUNCE_TERMS), so this rank cannot size a deposit
 
   -> von 16 Chunk-Tags deponierte D GENAU EINEN (weights_0, 643/682/693 ms je
      Rang); fuer die anderen 15 steht `deposit_ms=0` neben `pause_ms=1`.
@@ -13,7 +13,7 @@ fnFL2w3 starb daran. Die Kette, jede Stufe gemessen:
      unit 0". Das Budget ist 120,0 s (weight_exchange_bounce.py) und der
      Front-Bound ebenfalls 120,0 s -- der Lane-Wait kann strukturell nie vor
      dem Front-STALL aufgeben.
-  -> WEG2-FLIP STALL epoch=0 elapsed=129,2 s, dann W29 Weg2FlipRankDisagree
+  -> PDFLIP-FLIP STALL epoch=0 elapsed=129,2 s, dann W29 PdFlipRankDisagree
      auf resume_memory_occupation, 0/6 Raenge.
 
 Die Wurzel ist EIN Praedikat fuer ZWEI Fragen. `xchg_bounce_arm_pins_host`
@@ -24,8 +24,8 @@ Austausch-Arm braucht.
 
 import inspect
 
-from sglang.srt.weg2 import launcher
-from sglang.srt.weg2 import weight_exchange_transport as wxt
+from flliper.srt.pdflip import launcher
+from flliper.srt.pdflip import weight_exchange_transport as wxt
 
 
 def test_the_host_pin_predicate_still_answers_only_its_own_question():
@@ -43,10 +43,10 @@ def test_the_terms_now_hang_on_the_exchange_arm_not_on_the_host_pin():
     """Der Fix selbst: die Publikation steht hinter `_xchg_armed`, und das
     ist wahr fuer JEDEN Arm ausser `ring`."""
     src = inspect.getsource(launcher.main)
-    assert "_xchg_armed = str(ns.weg2_weight_source) != WEIGHT_SOURCE_DEFAULT" in src
+    assert "_xchg_armed = str(ns.pdflip_weight_source) != WEIGHT_SOURCE_DEFAULT" in src
     i_armed = src.index("_xchg_armed = ")
     i_pub = src.index("bounce_terms_for_ranks, _widest_line")
-    i_pin = src.find("xchg_bounce_arm_pins_host(ns.weg2_weight_source", i_armed)
+    i_pin = src.find("xchg_bounce_arm_pins_host(ns.pdflip_weight_source", i_armed)
     assert i_armed < i_pub, "die Terme muessen hinter dem Austausch-Arm stehen"
     assert i_pin == -1 or i_pin > i_pub, (
         "der Host-Pin darf die Publikation nicht mehr torwaechtern")
@@ -56,7 +56,7 @@ def test_a_ring_boot_still_publishes_nothing():
     """Die Gegenrichtung, die bleiben muss: ohne Austausch gibt es nichts zu
     deponieren, also auch keinen Term -- `read_published_terms` antwortet
     None und die Naht verweigert BENANNT statt zu defaulten."""
-    from sglang.srt.weg2 import xchg_bounce
+    from flliper.srt.pdflip import xchg_bounce
 
     assert xchg_bounce.read_published_terms("") is None
     assert launcher.xchg_bounce_arm_pins_host(launcher.WEIGHT_SOURCE_DEFAULT,
@@ -68,7 +68,7 @@ def test_the_lane_budget_is_not_the_front_bound():
     wie der Front-Bound, kann nie zuerst aufgeben -- der Boot stirbt am Stall
     statt an einer benannten Lane-Verweigerung. Dieser Test haelt die Zahl
     fest, die fnFL2w3 gemessen hat, damit der Gleichstand auffaellt."""
-    from sglang.srt.weg2 import weight_exchange_bounce as wxb
+    from flliper.srt.pdflip import weight_exchange_bounce as wxb
 
     sig = inspect.signature(wxb.run_sequential_units)
     budget = sig.parameters["budget_s"].default

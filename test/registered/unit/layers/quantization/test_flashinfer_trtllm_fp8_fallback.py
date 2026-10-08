@@ -18,7 +18,7 @@ So the fallback must key on output dtype and K (>= 256), independent of any
 backend selector and the two GEMM implementations so they run on CPU CI.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -27,8 +27,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-import sglang.srt.layers.quantization.fp8_utils as fp8_utils
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.layers.quantization.fp8_utils as fp8_utils
+from flliper.test.test_utils import CustomTestCase
 
 BLOCK_SIZE = [128, 128]
 M = 16
@@ -64,7 +64,7 @@ class TestFlashinferTrtllmFp8Fallback(CustomTestCase):
         ), patch.object(
             fp8_utils, "triton_w8a8_block_fp8_linear", triton_spy
         ), patch.object(
-            fp8_utils, "sglang_per_token_group_quant_fp8", quant_spy
+            fp8_utils, "flliper_per_token_group_quant_fp8", quant_spy
         ):
             fp8_utils.flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
                 input_2d, weight, BLOCK_SIZE, weight_scale

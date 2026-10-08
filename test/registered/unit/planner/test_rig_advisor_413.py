@@ -49,19 +49,19 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner import roofline as rfmod
-from sglang.srt.planner.bench_factors import ABSENT, ESTIMATE, MEASURED
-from sglang.srt.planner.card_library import CardLibrary, CardSpec
-from sglang.srt.planner.explorer import provenance_of
-from sglang.srt.planner.hardware import hardware_from_manual
-from sglang.srt.planner.rig_advisor import (
+from flliper.srt.planner import roofline as rfmod
+from flliper.srt.planner.bench_factors import ABSENT, ESTIMATE, MEASURED
+from flliper.srt.planner.card_library import CardLibrary, CardSpec
+from flliper.srt.planner.explorer import provenance_of
+from flliper.srt.planner.hardware import hardware_from_manual
+from flliper.srt.planner.rig_advisor import (
     ADVISOR_RIG_SOURCE,
     FreeSlot,
     advise,
     rig_with_candidate,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -458,7 +458,7 @@ class TestEndpoint(AdvisorFixture):
     def test_an_empty_request_returns_the_card_library(self):
         """The picker and the plan come from ONE endpoint (#342: the UI
         composes the same API a script would call)."""
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         d = webui.rig_advisor_payload({})
         self.assertTrue(d["ok"])
@@ -467,7 +467,7 @@ class TestEndpoint(AdvisorFixture):
         self.assertEqual(d["rows"], [])
 
     def test_a_plan_request_returns_the_before_after_table(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         d = webui.rig_advisor_payload(self._body())
         self.assertTrue(d.get("ok"), d.get("error"))
@@ -477,7 +477,7 @@ class TestEndpoint(AdvisorFixture):
         json.dumps(d)  # must survive the wire
 
     def test_a_missing_model_is_an_explained_refusal_not_a_crash(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         d = webui.rig_advisor_payload(self._body(model=""))
         self.assertFalse(d["ok"])
@@ -491,7 +491,7 @@ class TestEndpoint(AdvisorFixture):
         #413 it never forwarded one, so a card outside ``SEED_CARDS`` silently
         produced no roofline at all. A hand-typed card must get real numbers.
         """
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         d = webui.rig_advisor_payload(
             self._body(
@@ -524,7 +524,7 @@ class TestDashboardWiring(unittest.TestCase):
     """
 
     def test_the_advisor_tab_is_wired_into_the_page(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         html = webui.INDEX_HTML
         for needle in (

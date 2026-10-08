@@ -34,18 +34,18 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 # THE REAL MODULES, imported -- not re-implementations.
-import sglang.srt.distributed.device_communicators.custom_all_reduce as car_mod  # noqa: E402
-import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as car_ops  # noqa: E402
-from sglang.srt.distributed.device_communicators.custom_all_reduce import (  # noqa: E402
+import flliper.srt.distributed.device_communicators.custom_all_reduce as car_mod  # noqa: E402
+import flliper.srt.distributed.device_communicators.custom_all_reduce_ops as car_ops  # noqa: E402
+from flliper.srt.distributed.device_communicators.custom_all_reduce import (  # noqa: E402
     CustomAllreduce,
 )
-from sglang.srt.distributed.parallel_state import GroupCoordinator  # noqa: E402
+from flliper.srt.distributed.parallel_state import GroupCoordinator  # noqa: E402
 
 RENDEZVOUS_TIMEOUT_S = 5.0
 
@@ -307,7 +307,7 @@ class TestV2CaptureExitBalance(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            import sglang.srt.distributed.device_communicators.custom_all_reduce_v2 as v2_mod
+            import flliper.srt.distributed.device_communicators.custom_all_reduce_v2 as v2_mod
         except ImportError as e:  # jit_kernel unavailable in this build
             raise unittest.SkipTest(f"custom_all_reduce_v2 not importable: {e}")
         cls.v2_mod = v2_mod

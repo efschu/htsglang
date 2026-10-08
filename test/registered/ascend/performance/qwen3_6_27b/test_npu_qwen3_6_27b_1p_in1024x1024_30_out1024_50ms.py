@@ -1,12 +1,12 @@
 import unittest
 
-from sglang.test.ascend.e2e.test_npu_performance_utils import (
+from flliper.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_MM_CUSTOM_GEN,
     BENCHMARK_TOOL_DEFAULT,
     QWEN3_6_27B_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+from flliper.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
@@ -21,14 +21,14 @@ QWEN3_6_27B_1024_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_NPU_PROFILING": "1",
-    "SGLANG_NPU_PROFILING_STAGE": "prefill",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "150",
+    "FLLIPER_SET_CPU_AFFINITY": "1",
+    "FLLIPER_VIT_ENABLE_CUDA_GRAPH": "1",
+    "FLLIPER_ENABLE_SPEC_V2": "1",
+    "FLLIPER_NPU_PROFILING": "1",
+    "FLLIPER_NPU_PROFILING_STAGE": "prefill",
+    "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "FLLIPER_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
+    "FLLIPER_PREFILL_DELAYER_MAX_DELAY_PASSES": "150",
     "ASCEND_USE_FIA": "1",
 }
 
@@ -96,7 +96,7 @@ class TestNPUQwen3_6_27B_1P_In1024x1024_30_Out1024_50ms(TestNpuPerformanceTestCa
     model = QWEN3_6_27B_MODEL_PATH
     other_args = QWEN3_6_27B_1024_OTHER_ARGS
     envs = QWEN3_6_27B_1024_ENVS
-    backend = "sglang-oai-chat"
+    backend = "flliper-oai-chat"
     dataset_name = "image"
     max_concurrency = 60
     num_prompts = 240

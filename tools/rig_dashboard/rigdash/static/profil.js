@@ -216,7 +216,7 @@
       const ks = Object.keys(ab);
       const helpDiffers = new Set(ks.map((k) => String(ab[k].help || ""))).size > 1;
       out += `<div class="pf-orig"><span class="pf-chip pf-dep-off">differs</span> ${ks.map((k) => `<span>${esc(BAUM[k] || k)}: default <span class="mono">${esc(ab[k].default == null ? "–" : ab[k].default)}</span></span>`).join(" · ")}${helpDiffers ? ' <b>· same name, different description per tree: the effect may differ</b>' : ""}</div>`;
-      // beide Beschreibungen aus dem Code nebeneinander: der Unterschied soll nicht erraten werden müssen (z. B. SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK: 27B nur im Dual-Layout, NF ohne Gate)
+      // beide Beschreibungen aus dem Code nebeneinander: der Unterschied soll nicht erraten werden müssen (z. B. FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK: 27B nur im Dual-Layout, NF ohne Gate)
       if (helpDiffers) out += `<details class="pf-fold pf-orig-d"><summary>Description per tree (from the code)</summary>${ks.map((k) => `<div class="pf-part"><span class="pf-chip">${esc(BAUM[k] || k)}</span> <span class="muted">${esc(ab[k].help || "(no description)")}</span></div>`).join("")}</details>`;
     }
     if (ex.satz_quelle) out += `<div class="muted pf-note">Source of the sentence: ${esc(ex.satz_quelle)}</div>`;

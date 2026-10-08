@@ -20,7 +20,7 @@ that it now binds, and pins the arithmetic that says by how much.
 The reference geometry throughout is that run's: the DeepSeek-V4-Flash C4
 indexer (`index_n_heads=64`, `index_head_dim=128`, heads replicated, so the
 per-row cost is rank-invariant), `--chunked-prefill-size 256`, and
-`SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK=2048` at a C4 span of 8196 (the
+`FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK=2048` at a C4 span of 8196 (the
 compress_ratio-4 image of the 32768-token prompt).
 
 GPU-free: everything here is CPU float32, `CUDA_VISIBLE_DEVICES=99`.
@@ -33,16 +33,16 @@ import pathlib
 import types
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4.indexer import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.dsv4.indexer import (
     _indexer_logits_chunk_rows,
     _indexer_logits_output_bytes,
     _indexer_logits_step_bytes,
     indexer_prefill_scratch_bytes,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 
 def _load_sibling(name: str):
@@ -74,7 +74,7 @@ MIB = 1024 * 1024
 REF_HEADS = 64
 REF_HEAD_DIM = 128
 REF_ROWS = 256  # --chunked-prefill-size
-REF_SEQ_CHUNK = 2048  # SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK
+REF_SEQ_CHUNK = 2048  # FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK
 REF_C4_SPAN = 8196  # compress_ratio-4 image of a 32768-token prompt
 
 # --- what the driver measured in that run (corridor.csv) ------------------
@@ -90,7 +90,7 @@ PRE_449_SHAPE = 0  # budget disabled: one pass over the query axis
 
 
 def _ref_rows(budget_mib: int, *, seq_chunk: int = REF_SEQ_CHUNK) -> int:
-    with envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.override(budget_mib):
+    with envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.override(budget_mib):
         return _indexer_logits_chunk_rows(
             chunk_seq=seq_chunk,
             num_heads=REF_HEADS,
@@ -101,11 +101,11 @@ def _ref_rows(budget_mib: int, *, seq_chunk: int = REF_SEQ_CHUNK) -> int:
 
 def _ref_peak_mib(budget_mib, *, span: int = REF_C4_SPAN) -> float:
     ctx = (
-        envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.override(budget_mib)
+        envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.override(budget_mib)
         if budget_mib is not None
         else _nullcontext()
     )
-    with ctx, envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(REF_SEQ_CHUNK):
+    with ctx, envs.FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(REF_SEQ_CHUNK):
         return (
             indexer_prefill_scratch_bytes(
                 num_rows=REF_ROWS,
@@ -139,7 +139,7 @@ class TestTheShippedDefaultBinds(CustomTestCase):
     def test_the_shipped_default_binds_on_the_reference_geometry(self):
         """Fixed: the default now costs strictly fewer rows than the query axis
         has, which is what 'the cap binds' means."""
-        rows = _ref_rows(envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.get())
+        rows = _ref_rows(envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.get())
         self.assertLess(rows, REF_ROWS)
         step_mib = (
             rows
@@ -148,14 +148,14 @@ class TestTheShippedDefaultBinds(CustomTestCase):
             )
             / MIB
         )
-        self.assertLessEqual(step_mib, envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.get())
+        self.assertLessEqual(step_mib, envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.get())
 
     def test_the_default_binds_at_the_seq_chunk_default_too(self):
         """The recipe narrowed the KV chunk to 2048; the shipped SEQ_CHUNK
         default is 8192, where one query row costs 9.06 MiB and 256 rows cost
         2320 MiB. A budget that only binds at the narrow setting would leave the
         stock path exactly as exposed."""
-        rows = _ref_rows(envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.get(), seq_chunk=8192)
+        rows = _ref_rows(envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.get(), seq_chunk=8192)
         self.assertLess(rows, REF_ROWS)
         # And the pre-#493 default barely moved it there: 225 rows of 256.
         self.assertGreater(
@@ -165,8 +165,8 @@ class TestTheShippedDefaultBinds(CustomTestCase):
     def test_the_default_still_leaves_small_shapes_single_pass(self):
         """Lowering a default must not start chunking the golden pins. The
         #425/#426 shapes are a handful of rows at <= 4096 positions."""
-        with envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.override(
-            envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.get()
+        with envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.override(
+            envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.get()
         ):
             self.assertEqual(
                 _indexer_logits_chunk_rows(
@@ -209,7 +209,7 @@ class TestTheModelMatchesTheMeasuredBreach(CustomTestCase):
         )
         capped = _ref_peak_mib(None)
         step_only = (
-            _ref_rows(envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.get())
+            _ref_rows(envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.get())
             * _indexer_logits_step_bytes(
                 chunk_seq=REF_SEQ_CHUNK, num_heads=REF_HEADS, head_dim=REF_HEAD_DIM
             )
@@ -238,10 +238,10 @@ class TestTheModelAndTheAllocationShareOneFormula(CustomTestCase):
 
     def _observed_step_bytes(self, budget_mib, num_heads, seq_lens, seq_chunk):
         inputs = _build_inputs(seq_lens, num_heads=num_heads, uniform_page_table=True)
-        with envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.override(budget_mib):
-            with envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(seq_chunk):
+        with envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.override(budget_mib):
+            with envs.FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(seq_chunk):
                 with _GatherProbe() as gather, _BmmProbe() as bmm:
-                    from sglang.srt.layers.attention.dsv4.indexer import (
+                    from flliper.srt.layers.attention.dsv4.indexer import (
                         fp8_paged_mqa_logits_torch_sm120,
                     )
 
@@ -298,7 +298,7 @@ class TestTheReserveDiagnosticNamesIt(CustomTestCase):
             self._stub((REF_HEADS, REF_HEAD_DIM))
         )
         self.assertIsNotNone(got)
-        with envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(REF_SEQ_CHUNK):
+        with envs.FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(REF_SEQ_CHUNK):
             expected = _ref_peak_mib(None)
         # Same formula, so the launcher's number and the loop's bound agree.
         self.assertAlmostEqual(got, expected, delta=1.0)
@@ -319,10 +319,10 @@ class TestTheReserveDiagnosticNamesIt(CustomTestCase):
         """The estimate must move when the cap moves -- otherwise the launcher
         would keep reporting a number the runtime no longer allocates."""
         stub = self._stub((REF_HEADS, REF_HEAD_DIM))
-        with envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(REF_SEQ_CHUNK):
-            with envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.override(PRE_449_SHAPE):
+        with envs.FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK.override(REF_SEQ_CHUNK):
+            with envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.override(PRE_449_SHAPE):
                 wide = ServerArgs.dsv4_indexer_prefill_scratch_mib(stub)
-            with envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.override(64):
+            with envs.FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB.override(64):
                 narrow = ServerArgs.dsv4_indexer_prefill_scratch_mib(stub)
         self.assertGreater(wide, narrow)
 

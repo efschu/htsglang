@@ -2,16 +2,16 @@ import unittest
 
 import requests
 
-from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
-from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
-from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
-from sglang.test.test_utils import (
+from flliper.lang.chat_template import get_chat_template_by_model_path
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.json_constrained_kit import JSONConstrainedMixin
+from flliper.test.kits.radix_cache_server_kit import run_radix_attention_test
+from flliper.test.kits.regex_constrained_kit import RegexConstrainedMixin
+from flliper.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -41,7 +41,7 @@ class TestDPAttentionDP2TP2(
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
+        cls._env_override = envs.FLLIPER_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
             True
         )
         cls._env_override.__enter__()
@@ -70,7 +70,7 @@ class TestDPAttentionGatherv(
     GSM8KMixin,
 ):
     """Exercise the variable-length all_gatherv + reduce_scatterv DP-MoE path
-    (SGLANG_DP_USE_GATHERV=1). The path only activates for the
+    (FLLIPER_DP_USE_GATHERV=1). The path only activates for the
     attn_tp_size == 1, tp_size == dp_size layout, which tp2 + dp2 satisfies.
     Without this test the gatherv/reduce_scatterv code is never exercised by CI
     (it is gated behind the env var, default off). gsm8k must stay correct since
@@ -86,7 +86,7 @@ class TestDPAttentionGatherv(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={"SGLANG_DP_USE_GATHERV": "1"},
+            env={"FLLIPER_DP_USE_GATHERV": "1"},
             other_args=[
                 "--trust-remote-code",
                 "--tp",
@@ -173,7 +173,7 @@ class TestDPRetract(
         kill_process_tree(cls.process.pid)
 
     def test_radix_attention(self):
-        with envs.SGLANG_TEST_RETRACT.override(True):
+        with envs.FLLIPER_TEST_RETRACT.override(True):
             run_radix_attention_test(self.base_url)
             self.assertIsNone(self.process.poll())
 

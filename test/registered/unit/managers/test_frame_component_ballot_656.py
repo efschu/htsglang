@@ -46,7 +46,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
 
 def _runtime(*, vec=(30, 16, 18), n_layers=64):

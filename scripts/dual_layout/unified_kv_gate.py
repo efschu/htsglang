@@ -2,9 +2,9 @@
 """DUAL-TP3PP3 unified KV gate (D) -- the GPU half the CPU tests cannot see.
 
 Run under the patched torch_memory_saver preload (the release image's
-SGLANG_WEG2_TMS_PRELOAD_SO on LD_PRELOAD), one card, ~1.5 GiB:
+FLLIPER_PDFLIP_TMS_PRELOAD_SO on LD_PRELOAD), one card, ~1.5 GiB:
 
-  LD_PRELOAD=$SGLANG_WEG2_TMS_PRELOAD_SO python unified_kv_gate.py --device 0
+  LD_PRELOAD=$FLLIPER_PDFLIP_TMS_PRELOAD_SO python unified_kv_gate.py --device 0
 
 Checks, each printed PASS/FAIL:
  G1 born: a KV-shaped buffer allocated in a saver region at the TOP size and
@@ -38,9 +38,9 @@ def main() -> int:
     a = ap.parse_args()
     dev = torch.device("cuda", a.device)
     torch.cuda.set_device(dev)
-    from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-    from sglang.srt.weg2 import d_seat_vram as sv
-    from sglang.srt.weg2 import dual_p_kv_stage as pk
+    from flliper.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+    from flliper.srt.pdflip import d_seat_vram as sv
+    from flliper.srt.pdflip import dual_p_kv_stage as pk
 
     spans = sv.tms()
     if not spans.available:

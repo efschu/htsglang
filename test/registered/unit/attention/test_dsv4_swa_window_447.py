@@ -17,11 +17,11 @@ compress against the wrong span rather than honour it.
 import inspect
 import unittest
 
-from sglang.srt.layers.attention.deepseek_v4_backend import (
+from flliper.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     verify_swa_window,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Config:
@@ -62,7 +62,7 @@ class TestTheCheckIsActuallyWired(CustomTestCase):
     fails if the call is deleted."""
 
     def test_the_backend_init_calls_the_check(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from flliper.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
 
@@ -75,7 +75,7 @@ class TestTheCheckIsActuallyWired(CustomTestCase):
         )
 
     def test_the_backend_no_longer_hardcodes_the_page_size(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from flliper.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
 

@@ -18,15 +18,15 @@ import unittest
 def _install_fake_corridor(band_floor, arming, phase):
     """Stand in for corridor_guard/phase_flip_presence without importing the
     runtime: this test must not need CUDA, NVML or a live boot."""
-    cg = types.ModuleType("sglang.srt.managers.corridor_guard")
+    cg = types.ModuleType("flliper.srt.managers.corridor_guard")
     cg.corridor_band_floor_mib = lambda: band_floor
     cg.arming_floor_mib = lambda *a, **k: arming
     cg.committed_arming_mib = lambda a: max(0, int(a) - band_floor)
     cg.net_free_mib = lambda free, a: int(free) - cg.committed_arming_mib(a)
-    pf = types.ModuleType("sglang.srt.managers.phase_flip_presence")
+    pf = types.ModuleType("flliper.srt.managers.phase_flip_presence")
     pf.read_active_phase = lambda *a, **k: phase
-    sys.modules["sglang.srt.managers.corridor_guard"] = cg
-    sys.modules["sglang.srt.managers.phase_flip_presence"] = pf
+    sys.modules["flliper.srt.managers.corridor_guard"] = cg
+    sys.modules["flliper.srt.managers.phase_flip_presence"] = pf
 
 
 #: ``sys.modules`` value meaning "this key was not loaded before the test".
@@ -35,8 +35,8 @@ _ABSENT = object()
 #: The keys every test here rebinds: the two stand-ins and the module under
 #: test, which is re-imported bound to them.
 _REBOUND = (
-    "sglang.srt.managers.corridor_guard",
-    "sglang.srt.managers.phase_flip_presence",
+    "flliper.srt.managers.corridor_guard",
+    "flliper.srt.managers.phase_flip_presence",
 )
 
 
@@ -55,7 +55,7 @@ class CeilingMarginLevel(unittest.TestCase):
     # ``types.ModuleType`` objects with no spec, and the fallback test below
     # stores ``None``; left in ``sys.modules`` they outlive this file on the
     # xdist worker that ran it, and every later test on that worker that does
-    # ``from sglang.srt.managers.corridor_guard import corridor_law_bytes``
+    # ``from flliper.srt.managers.corridor_guard import corridor_law_bytes``
     # (or ``PhaseFlipPresence``, ``draft_carrier_provider``) fails with
     # ``ImportError: cannot import name ... (unknown location)``. Measured on
     # the serve-next5 train gate (cachyllama, 2026-09-09, -n 8): 23 such
@@ -81,7 +81,7 @@ class CeilingMarginLevel(unittest.TestCase):
         _install_fake_corridor(self.BAND_FLOOR, arming or self.ARMING, phase)
         for m in [k for k in sys.modules if k.endswith("planner.bench_suite")]:
             del sys.modules[m]
-        from sglang.srt.planner.bench_suite import _ceiling_margin_level
+        from flliper.srt.planner.bench_suite import _ceiling_margin_level
 
         return _ceiling_margin_level(free)
 
@@ -133,13 +133,13 @@ class CeilingMarginLevel(unittest.TestCase):
     def test_fallback_says_so_instead_of_reinstating_1024(self):
         """corridor_guard unavailable: grade on the band and NAME the fallback."""
         for k in (
-            "sglang.srt.managers.corridor_guard",
-            "sglang.srt.managers.phase_flip_presence",
+            "flliper.srt.managers.corridor_guard",
+            "flliper.srt.managers.phase_flip_presence",
         ):
             sys.modules[k] = None
         for m in [k for k in sys.modules if k.endswith("planner.bench_suite")]:
             del sys.modules[m]
-        from sglang.srt.planner.bench_suite import _ceiling_margin_level
+        from flliper.srt.planner.bench_suite import _ceiling_margin_level
 
         _, name, level, net, floor = _ceiling_margin_level(1000)
         self.assertIn("fallback", name)

@@ -15,11 +15,11 @@ import sys
 
 PY = "/spinning/htsglang-gpu/.venv/bin/python"
 ROOT = "/spinning/wt-799-wedge-watchdog"
-IC = "python/sglang/srt/managers/scheduler_components/invariant_checker.py"
-RN = "python/sglang/srt/turnkey/runner.py"
-WD = "python/sglang/srt/turnkey/watchdog.py"
-WS = "python/sglang/srt/managers/wedge_status.py"
-MN = "python/sglang/srt/turnkey/__main__.py"
+IC = "python/flliper/srt/managers/scheduler_components/invariant_checker.py"
+RN = "python/flliper/srt/turnkey/runner.py"
+WD = "python/flliper/srt/turnkey/watchdog.py"
+WS = "python/flliper/srt/managers/wedge_status.py"
+MN = "python/flliper/srt/turnkey/__main__.py"
 
 T_WD = "test/registered/unit/turnkey/test_wedge_signal_799.py"
 T_WS = "test/registered/unit/managers/test_wedge_status_799.py"

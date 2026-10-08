@@ -20,9 +20,9 @@ import types
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
-from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost  # noqa: E402
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost  # noqa: E402
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
 
 
 class _Backend:
@@ -51,7 +51,7 @@ def _pool(cls, **fields):
 
 def test_mamba_pool_registers_its_arena_at_bind():
     be = _Backend()
-    pool = _pool(ArenaMambaPoolHost, _weg2_parts=("spec", (1,), 0, 0, 1))
+    pool = _pool(ArenaMambaPoolHost, _pdflip_parts=("spec", (1,), 0, 0, 1))
     assert ArenaMambaPoolHost.ensure_bound(pool, be) is True
     assert be.registered == [(be.arena, pool)]
     assert pool.bound == [be.arena] and pool._backend is be
@@ -66,14 +66,14 @@ def test_kv_pool_registers_its_arena_at_bind():
 
 def test_a_bound_pool_does_not_register_twice():
     be = _Backend()
-    pool = _pool(ArenaMambaPoolHost, _weg2_parts=("spec", (1,), 0, 0, 1))
+    pool = _pool(ArenaMambaPoolHost, _pdflip_parts=("spec", (1,), 0, 0, 1))
     ArenaMambaPoolHost.ensure_bound(pool, be)
     ArenaMambaPoolHost.ensure_bound(pool, be)
     assert len(be.registered) == 1
 
 
 def test_a_backend_without_the_hook_still_binds():
-    for cls, fields in ((ArenaMambaPoolHost, {"_weg2_parts": ("spec", (1,), 0, 0, 1)}), (ArenaMHAHostPool, {})):
+    for cls, fields in ((ArenaMambaPoolHost, {"_pdflip_parts": ("spec", (1,), 0, 0, 1)}), (ArenaMHAHostPool, {})):
         be = _Backend(register=False)
         pool = _pool(cls, **fields)
         assert cls.ensure_bound(pool, be) is True
@@ -98,7 +98,7 @@ class _Pool:
 def test_the_bound_pool_is_what_the_clock_evict_reads(monkeypatch):
     """bind_arena(pool, arena) -> the clock evict's stage (i) passes that
     pool's keep as keep_lo; an arena no pool is bound to keeps only the pins."""
-    from sglang.srt.weg2 import handoff_pending as hp
+    from flliper.srt.pdflip import handoff_pending as hp
 
     arena, other, pool = _Arena(), _Arena(), _Pool()
     hp.bind_arena(pool, arena)
@@ -127,8 +127,8 @@ def test_the_real_kv_bind_makes_its_arena_findable(tmp_path):
     import pytest
     import torch
 
-    from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
-    from sglang.srt.weg2 import handoff_pending as hp
+    from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
+    from flliper.srt.pdflip import handoff_pending as hp
 
     if shutil.which("gcc") is None:
         pytest.skip("needs gcc (arena.c)")

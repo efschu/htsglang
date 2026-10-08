@@ -11,12 +11,12 @@ import os
 import re
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "python", "sglang", "jit_kernel", "csrc", "gemm")
+CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "python", "flliper", "jit_kernel", "csrc", "gemm")
 FILES = ("nvfp4_w4a8_sm86.cuh", "nvfp4_w4a8_decode_sm86.cuh")
 
 

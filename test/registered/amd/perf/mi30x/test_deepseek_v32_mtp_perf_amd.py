@@ -15,10 +15,10 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.nightly_bench_utils import BenchmarkResult
-from sglang.test.nightly_utils import NightlyBenchmarkRunner
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.nightly_bench_utils import BenchmarkResult
+from flliper.test.nightly_utils import NightlyBenchmarkRunner
+from flliper.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - DeepSeek-V3.2 MTP benchmark (~120 min)
 register_amd_ci(
@@ -105,7 +105,7 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
                 "--watchdog-timeout",
                 "1200",
             ],
-            "env_vars": {"SGLANG_USE_AITER": "1"},
+            "env_vars": {"FLLIPER_USE_AITER": "1"},
         }
 
         cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)

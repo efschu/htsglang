@@ -58,7 +58,7 @@ def canonical(obj) -> str:
 
 
 def plan_id_ok(plan: dict) -> bool:
-    """Wie weg2/vram_plan.compute_plan_id: sha256 über den Plan ohne plan_id."""
+    """Wie pdflip/vram_plan.compute_plan_id: sha256 über den Plan ohne plan_id."""
     body = {k: v for k, v in plan.items() if k != "plan_id"}
     return plan.get("plan_id") == "sha256:" + hashlib.sha256(canonical(body).encode()).hexdigest()
 
@@ -407,7 +407,7 @@ def build_record(spec: dict) -> dict:
             pass
     # Erklärungen aus Code (Revision des Boots) und Profil
     code_help: Dict[str, str] = {}
-    for rel in ("python/sglang/srt/weg2/launcher.py", "python/sglang/srt/server_args.py", "python/sglang/srt/weg2/front.py"):
+    for rel in ("python/flliper/srt/pdflip/launcher.py", "python/flliper/srt/server_args.py", "python/flliper/srt/pdflip/front.py"):
         code_help.update({k: v for k, v in argparse_help(git_show(spec["rev"], rel)).items() if k not in code_help})
     all_flags = sorted({f for g in argv.values() for f in flags_of(g)} | set(flags_of(front_cmd)))
     all_envs = sorted({k for g in env.values() for k in g})

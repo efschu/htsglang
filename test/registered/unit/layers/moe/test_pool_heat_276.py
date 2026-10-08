@@ -1,7 +1,7 @@
 """#276 heat record of the device-planned expert pool.
 
 WHAT MUST HOLD.
-(1) Off (SGLANG_DEBUG_MOE_HEAT unset, the default): nothing is allocated and
+(1) Off (FLLIPER_DEBUG_MOE_HEAT unset, the default): nothing is allocated and
     the captured step is the step before #276 -- the op sequence of
     ``prepare_pool`` is identical to that of a cache that has no heat
     attribute at all, and no op touches a heat tensor.
@@ -15,7 +15,7 @@ WHAT MUST HOLD.
 (5) The D sleep flushes before any pause, the D wake resets after the rearm.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -34,10 +34,10 @@ from typing import NamedTuple
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe import expert_pool_device as ep
-from sglang.srt.layers.moe import pool_heat
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe import expert_pool_device as ep
+from flliper.srt.layers.moe import pool_heat
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Topk(NamedTuple):
@@ -57,7 +57,7 @@ class _Comb(NamedTuple):
 def _cache(E=20, R=4, C=16, S=3, width=64, heat=False, attr=True, pad=None, lo=None):
     """A CPU pool layer: residents 0..R-1 (plus ``pad`` in row R-1), the rest
     in host row ``e``; the reference step and row copy run on the CPU."""
-    from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+    from flliper.srt.layers.moe.expert_offload import MoEExpertOffloadCache
 
     hot = {e: e for e in range(R)}
     if pad is not None:
@@ -90,7 +90,7 @@ def _cache(E=20, R=4, C=16, S=3, width=64, heat=False, attr=True, pad=None, lo=N
     if attr:
         cache._pool_heat, cache._pool_heat_ones = None, None
     if heat:
-        with envs.SGLANG_DEBUG_MOE_HEAT.override("/nonexistent-but-on"):
+        with envs.FLLIPER_DEBUG_MOE_HEAT.override("/nonexistent-but-on"):
             cache._pool_heat, cache._pool_heat_ones = pool_heat.allocate("cpu", E, width)
     return cache
 
@@ -121,10 +121,10 @@ def _ids(rows, k=10, E=20, seed=0, holes=True):
 
 class TestOff(CustomTestCase):
     def test_default_is_off_and_allocates_nothing(self):
-        self.assertIsNone(envs.SGLANG_DEBUG_MOE_HEAT.get())
+        self.assertIsNone(envs.FLLIPER_DEBUG_MOE_HEAT.get())
         self.assertIsNone(pool_heat.heat_dir())
         self.assertEqual(pool_heat.allocate("cpu", 20, 64), (None, None))
-        with envs.SGLANG_DEBUG_MOE_HEAT.override(""):
+        with envs.FLLIPER_DEBUG_MOE_HEAT.override(""):
             self.assertIsNone(pool_heat.heat_dir())
 
     def test_off_step_is_the_step_before_276(self):
@@ -215,7 +215,7 @@ class TestRecord(CustomTestCase):
         for s in range(5):
             cache.prepare_pool(_ids(2, E=E, seed=s))
         before = cache._pool_heat.tolist()
-        with tempfile.TemporaryDirectory() as d, envs.SGLANG_DEBUG_MOE_HEAT.override(d):
+        with tempfile.TemporaryDirectory() as d, envs.FLLIPER_DEBUG_MOE_HEAT.override(d):
             path = pool_heat.flush([self._model([cache])], rank=1, group="D",
                                    reason="sleep", phase_index=12)
             self.assertIsNotNone(path)
@@ -235,7 +235,7 @@ class TestRecord(CustomTestCase):
     def test_nothing_written_when_off_or_without_a_step(self):
         cache = _cache(heat=True)
         with tempfile.TemporaryDirectory() as d:
-            with envs.SGLANG_DEBUG_MOE_HEAT.override(d):
+            with envs.FLLIPER_DEBUG_MOE_HEAT.override(d):
                 self.assertIsNone(pool_heat.flush([self._model([cache])], rank=0,
                                                   group="D", reason="sleep"))
             cache.prepare_pool(_ids(1))
@@ -252,7 +252,7 @@ class TestRecord(CustomTestCase):
 
 class TestPhaseBoundaryWiring(CustomTestCase):
     def test_d_sleep_flushes_before_the_pause_and_the_wake_resets(self):
-        from sglang.srt.managers.scheduler_components import weight_updater as wu
+        from flliper.srt.managers.scheduler_components import weight_updater as wu
 
         src = inspect.getsource(wu)
         rel = src[src.index("def release_memory_occupation"):]

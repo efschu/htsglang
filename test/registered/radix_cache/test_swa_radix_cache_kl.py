@@ -1,8 +1,8 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.kl_divergence_kit import KLDivergenceMixin
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
 
 MODEL = "openai/gpt-oss-20b"
 

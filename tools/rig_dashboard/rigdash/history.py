@@ -25,7 +25,7 @@ Sources -- IPC and hardware only; no series and no mark is read from a boot log 
   host         Proxmox host /proc/stat, /proc/meminfo, memory.current of the htsglang containers'
                cgroups (the host currency) over the existing ssh alias; without ssh: this LXC's /proc
   model        IPC (Nutzer 30.09.: "keine IPC über Logs"): every 5 s the first rank of each group's
-               rankstats (<state>/rankstate/<G>/*.rankstats, weg2.rankstats/1, timer-written) --
+               rankstats (<state>/rankstate/<G>/*.rankstats, pdflip.rankstats/1, timer-written) --
                P-/D-Prefill tok/s = Δprefill.new_tokens / Δts, Decode tok/s = Δdecode.tokens / Δts,
                Decode je Stream = that / decode.running (only while D decoded continuously),
                KV = sched.full_token_usage (level), input-token classes per CHUNK from

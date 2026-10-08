@@ -61,15 +61,15 @@ DEFECT 5 -- THE BOOTED WEIGHT VECTOR MUST COME FROM RESOLVED STATE.
 import types
 import unittest
 
-from sglang.srt.managers.regime_runtime import (
+from flliper.srt.managers.regime_runtime import (
     MODE_OBSERVE,
     RegimeObserver,
     _booted_stage,
     build_regime_observer,
     rank_split_ms_from,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -127,7 +127,7 @@ def _scheduler(server_args):
 
 def _observer(**kw):
     """An observer with the ms axis wired, driven by plain floats."""
-    from sglang.srt.managers.regime_ms_clock import MsStageDecider
+    from flliper.srt.managers.regime_ms_clock import MsStageDecider
 
     params = dict(
         consensus_interval=1,
@@ -272,7 +272,7 @@ class TestSplitFreshness(CustomTestCase):
 
 class TestBootedWeightsComeFromResolvedState(CustomTestCase):
     def setUp(self):
-        from sglang.srt.distributed.utils import set_tp_partition_ratios
+        from flliper.srt.distributed.utils import set_tp_partition_ratios
 
         self.addCleanup(set_tp_partition_ratios, None, None)
 
@@ -302,7 +302,7 @@ class TestBootedWeightsComeFromResolvedState(CustomTestCase):
         is running [27107, 16680, 16680]. Reading the flag reports
         weights=None and makes every candidate NO_WEIGHT_MOVER.
         """
-        from sglang.srt.distributed.utils import set_tp_partition_ratios
+        from flliper.srt.distributed.utils import set_tp_partition_ratios
 
         set_tp_partition_ratios([27107, 16680, 16680], None)
         stage = _booted_stage(self._sched(rank_mlp_ratio=None))
@@ -318,7 +318,7 @@ class TestBootedWeightsComeFromResolvedState(CustomTestCase):
         A resolved plan of [60, 34, 42] and a candidate ratio of [30, 17, 21]
         describe ONE partition. Comparing them raw is a false mismatch.
         """
-        from sglang.srt.distributed.utils import set_tp_partition_ratios
+        from flliper.srt.distributed.utils import set_tp_partition_ratios
 
         set_tp_partition_ratios([60, 34, 42], None)
         stage = _booted_stage(self._sched(rank_mlp_ratio=None))
@@ -326,7 +326,7 @@ class TestBootedWeightsComeFromResolvedState(CustomTestCase):
 
     def test_an_explicit_flag_still_wins_and_is_reduced(self):
         """The pinned-ratio boot keeps working, in the same space."""
-        from sglang.srt.distributed.utils import set_tp_partition_ratios
+        from flliper.srt.distributed.utils import set_tp_partition_ratios
 
         set_tp_partition_ratios([27107, 16680, 16680], {"mlp": [94, 13, 29]})
         stage = _booted_stage(self._sched(rank_mlp_ratio=[94, 13, 29]))
@@ -334,9 +334,9 @@ class TestBootedWeightsComeFromResolvedState(CustomTestCase):
 
     def test_a_reachable_candidate_stops_being_no_weight_mover(self):
         """The consequence the defect actually had, end to end."""
-        from sglang.srt.distributed.utils import set_tp_partition_ratios
-        from sglang.srt.managers.regime_classifier import REGIME_MIXED, Stage
-        from sglang.srt.managers.regime_stages import REACH_RESHARD, reachability
+        from flliper.srt.distributed.utils import set_tp_partition_ratios
+        from flliper.srt.managers.regime_classifier import REGIME_MIXED, Stage
+        from flliper.srt.managers.regime_stages import REACH_RESHARD, reachability
 
         set_tp_partition_ratios([188, 26, 58], None)
         booted = _booted_stage(self._sched(rank_mlp_ratio=None))

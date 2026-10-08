@@ -27,13 +27,13 @@ which is also why this uses ``unittest.TestCase`` rather than
 
 import unittest
 
-from sglang.srt.memtier.registry import (
+from flliper.srt.memtier.registry import (
     RefusalRule,
     TierQuery,
     TierRegistry,
     UnknownTier,
 )
-from sglang.srt.memtier.tiers import (
+from flliper.srt.memtier.tiers import (
     ADMITTED_PAYLOADS,
     HEALTH_VERDICTS,
     PayloadClass,
@@ -52,9 +52,9 @@ from sglang.srt.memtier.tiers import (
     host_tier_id,
     parse_tier_id,
 )
-from sglang.srt.planner import rig_coupling
-from sglang.srt.planner.cost_model import Rate
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.planner import rig_coupling
+from flliper.srt.planner.cost_model import Rate
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

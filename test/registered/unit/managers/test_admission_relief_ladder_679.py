@@ -43,7 +43,7 @@ THREE PROPERTIES ARE LOAD-BEARING AND EACH HAS ITS OWN CLASS BELOW.
    BOUND (ranks entered together and popped DIFFERENT numbers of victims), and
    rung 3 needs both.
 
-OFF BY DEFAULT. Without SGLANG_ADMISSION_RELIEF_LADDER the ladder returns 0
+OFF BY DEFAULT. Without FLLIPER_ADMISSION_RELIEF_LADDER the ladder returns 0
 before touching anything, and admission behaves exactly as c4b88e1923 -- the
 boot currently serving.
 """
@@ -54,7 +54,7 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.scheduler import Scheduler
+from flliper.srt.managers.scheduler import Scheduler
 
 CHUNK = 512
 
@@ -164,7 +164,7 @@ class TheLadderIsOffByDefaultTest(unittest.TestCase):
         kvso = _Kvso()
         s = _sched(avail=0, kvso=kvso)
         with _Env(
-            SGLANG_ADMISSION_RELIEF_LADDER=None, SGLANG_ADMISSION_RELIEF_RETRACT=None
+            FLLIPER_ADMISSION_RELIEF_LADDER=None, FLLIPER_ADMISSION_RELIEF_RETRACT=None
         ):
             freed = s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(freed, 0)
@@ -176,7 +176,7 @@ class TheLadderIsOffByDefaultTest(unittest.TestCase):
         rungs that only cost bandwidth and latency."""
         s = _sched(avail=0, kvso=_Kvso(regions=0))
         with _Env(
-            SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=None
+            FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=None
         ):
             s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(
@@ -185,7 +185,7 @@ class TheLadderIsOffByDefaultTest(unittest.TestCase):
 
     def test_rung_3_cannot_run_while_the_ladder_is_off(self):
         s = _sched(avail=0, kvso=None)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=0, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=0, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(s.retract_calls, [])
 
@@ -196,7 +196,7 @@ class TheTriggerSpendsNothingWhenComfortableTest(unittest.TestCase):
         comparison, nothing spent."""
         kvso = _Kvso()
         s = _sched(avail=CHUNK, kvso=kvso)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             self.assertEqual(s._maybe_spend_admission_relief(_Batch()), 0)
         self.assertEqual(kvso.calls, [])
         self.assertEqual(s.retract_calls, [])
@@ -206,14 +206,14 @@ class TheTriggerSpendsNothingWhenComfortableTest(unittest.TestCase):
         same number of tokens. Sizing it locally is #583 one layer up."""
         kvso = _Kvso()
         s = _sched(avail=100, kvso=kvso)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1):
             s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(kvso.calls, [CHUNK - 100])
 
     def test_no_chunked_request_means_nothing_to_relieve_for(self):
         kvso = _Kvso()
         s = _sched(avail=0, kvso=kvso, chunked=False)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1):
             self.assertEqual(s._maybe_spend_admission_relief(_Batch()), 0)
         self.assertEqual(kvso.calls, [])
 
@@ -238,7 +238,7 @@ class TheDecisionsAreGroupUniformTest(unittest.TestCase):
             CHUNK,
             "fixture precondition: this rank must look comfortable locally",
         )
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(
             kvso.calls,
@@ -252,7 +252,7 @@ class TheDecisionsAreGroupUniformTest(unittest.TestCase):
         different numbers of victims."""
         kvso = _Kvso(regions=1)
         s = _sched(avail=200, kvso=kvso)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1):
             s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(kvso.calls, [CHUNK - 200])
 
@@ -268,7 +268,7 @@ class TheRungsRunInOrderTest(unittest.TestCase):
             kvso=kvso,
             avail_after=[0, 0, CHUNK, CHUNK, CHUNK],
         )
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(len(kvso.calls), 1, "rung 1 ran")
         self.assertEqual(s.retract_calls, [], "rung 3 must not run after a spill")
@@ -278,7 +278,7 @@ class TheRungsRunInOrderTest(unittest.TestCase):
         unmeasured on this rig -- the ladder continues to the next rung."""
         kvso = _Kvso(regions=0)
         s = _sched(avail=0, kvso=kvso, retract_gain=900)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             freed = s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(len(kvso.calls), 1, "rung 1 was asked and declined")
         self.assertEqual(len(s.retract_calls), 1, "rung 3 must pick it up")
@@ -286,7 +286,7 @@ class TheRungsRunInOrderTest(unittest.TestCase):
 
     def test_no_kvso_at_all_still_reaches_retraction(self):
         s = _sched(avail=0, kvso=None)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(len(s.retract_calls), 1)
 
@@ -295,7 +295,7 @@ class TheRungsRunInOrderTest(unittest.TestCase):
         not coming from resident work."""
         kvso = _Kvso()
         s = _sched(avail=0, kvso=kvso)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             self.assertEqual(s._maybe_spend_admission_relief(_Batch(empty=True)), 0)
         self.assertEqual(kvso.calls, [])
         self.assertEqual(s.retract_calls, [])
@@ -309,7 +309,7 @@ class Rung3CarriesItsPreconditionTest(unittest.TestCase):
     def test_uniform_avail_floor_is_set_before_retracting(self):
         s = _sched(avail=0, kvso=None, retract_gain=10)
         batch = _Batch()
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             s._maybe_spend_admission_relief(batch)
         self.assertIsNotNone(
             batch.uniform_avail_floor,
@@ -319,7 +319,7 @@ class Rung3CarriesItsPreconditionTest(unittest.TestCase):
 
     def test_the_retraction_is_flagged_as_a_real_pool_shortage(self):
         s = _sched(avail=0, kvso=None)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             s._maybe_spend_admission_relief(_Batch())
         self.assertEqual(s.retract_calls[0][1], True)
 
@@ -334,7 +334,7 @@ class NoRungMayRaiseTest(unittest.TestCase):
                 raise RuntimeError("spill exploded")
 
         s = _sched(avail=0, kvso=_Boom(), retract_gain=5)
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             freed = s._maybe_spend_admission_relief(_Batch())
         self.assertIsInstance(freed, int)
         self.assertEqual(len(s.retract_calls), 1, "the next rung still ran")
@@ -346,7 +346,7 @@ class NoRungMayRaiseTest(unittest.TestCase):
             raise RuntimeError("retract exploded")
 
         s._retract_decode_and_requeue = _boom
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1, FLLIPER_ADMISSION_RELIEF_RETRACT=1):
             self.assertIsInstance(s._maybe_spend_admission_relief(_Batch()), int)
 
     def test_a_broken_trigger_lets_admission_proceed_unaided(self):
@@ -356,7 +356,7 @@ class NoRungMayRaiseTest(unittest.TestCase):
             raise RuntimeError("reduce unavailable")
 
         s.uniform_min_avail = _boom
-        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1):
+        with _Env(FLLIPER_ADMISSION_RELIEF_LADDER=1):
             self.assertEqual(s._maybe_spend_admission_relief(_Batch()), 0)
 
 

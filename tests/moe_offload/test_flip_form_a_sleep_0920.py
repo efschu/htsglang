@@ -9,18 +9,18 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.constants import (
+from flliper.srt.constants import (
     GPU_MEMORY_ALL_TYPES,
     GPU_MEMORY_TYPE_CUDA_GRAPH,
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
     GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
 )
-from sglang.srt.flip_form_a_sleep import (
+from flliper.srt.flip_form_a_sleep import (
     FORM_A_ALLOCATIONS,
     ROLE_HOST,
     ROLE_WORKER,
-    Weg2FlipFormAUntagged,
+    PdFlipFormAUntagged,
     plan_form_a_sleep,
     sleep_tag_order,
     tags_for_role,
@@ -47,7 +47,7 @@ def test_form_a_still_has_no_runtime_sleep_hook():
     import inspect
     import pathlib
 
-    import sglang.srt.form_a_plan as fa
+    import flliper.srt.form_a_plan as fa
 
     root = pathlib.Path(inspect.getfile(fa)).parent
     hits = []
@@ -92,7 +92,7 @@ def test_the_draft_tag_is_in_neither_role_because_it_stays_resident():
 
 
 def test_an_unknown_role_is_refused():
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         tags_for_role("stage")
     assert "not a Form-A role" in str(exc.value)
 
@@ -159,10 +159,10 @@ def test_the_measured_worker_inventory_plans_cleanly():
 
 
 def test_an_untagged_allocation_is_refused_with_the_tight_card_named():
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         plan_form_a_sleep(ROLE_HOST, _HOST_ALLOCS + ["hc_mixer_int8_buffer"])
     msg = str(exc.value)
-    assert "W118 Weg2FlipFormAUntagged" in msg
+    assert "W118 PdFlipFormAUntagged" in msg
     assert "hc_mixer_int8_buffer" in msg
     assert "0.08 GiB" in msg
     assert "WAKING group" in msg
@@ -171,7 +171,7 @@ def test_an_untagged_allocation_is_refused_with_the_tight_card_named():
 def test_the_refusal_names_the_one_legitimate_untagged_case():
     """The shared host expert pool wears no device tag on purpose --
     torch_memory_saver manages DEVICE memory only."""
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         plan_form_a_sleep(ROLE_WORKER, ["spilled_expert_host_pool"])
     msg = str(exc.value)
     assert "DEVICE memory only" in msg
@@ -179,7 +179,7 @@ def test_the_refusal_names_the_one_legitimate_untagged_case():
 
 
 def test_a_host_allocation_on_a_worker_is_a_layout_bug_not_a_tagging_one():
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         plan_form_a_sleep(ROLE_WORKER, ["host_kv_pool", "role_graphs"])
     assert "layout bug" in str(exc.value)
 
@@ -205,6 +205,6 @@ def test_the_plan_declares_that_it_runs_under_pause_polling():
 
 
 def test_pause_polling_exists_and_is_the_thing_being_referred_to():
-    from sglang.srt.distributed.device_communicators import barlink_abort_gate
+    from flliper.srt.distributed.device_communicators import barlink_abort_gate
 
     assert callable(barlink_abort_gate.pause_polling)

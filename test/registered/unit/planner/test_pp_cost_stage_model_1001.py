@@ -28,10 +28,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest
 
-from sglang.srt.planner import pp_cut as P
-from sglang.srt.planner.pp_cut_launch import solve_launch_cut
-from sglang.srt.weg2 import p_stage_model as M
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.planner import pp_cut as P
+from flliper.srt.planner.pp_cut_launch import solve_launch_cut
+from flliper.srt.pdflip import p_stage_model as M
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -169,7 +169,7 @@ def test_the_chunk_mix_bins_one_ranks_chunks_and_the_makespan_is_the_mean_bottle
 
 def _pool_model():
     """N3b's P budgets (PP-CUT inputs: free=[26344, 15928, 15656] MiB) with the 27B posts."""
-    from sglang.srt.weg2 import form as F
+    from flliper.srt.pdflip import form as F
 
     fixed = tuple(float(x) for x in str(F.profile_constant("P_PP_STAGE_FIXED_MIB", "qwen27b")).split(","))
     return P.PhasePoolModel(
@@ -222,10 +222,10 @@ def test_the_old_family_card_rate_mutant_turns_the_ranking_test_red():
 
 
 def test_auto_resolves_only_for_the_27b_int8_checkpoint():
-    from sglang.srt.weg2 import form as F
-    from sglang.srt.weg2 import launcher as L
+    from flliper.srt.pdflip import form as F
+    from flliper.srt.pdflip import launcher as L
 
-    from sglang.srt.weg2 import card_identity as CI
+    from flliper.srt.pdflip import card_identity as CI
 
     ref = CI.REFERENCE_INVENTORY  # HW-GENERIC 1002: the cards are part of the key
     ckpt = F.profile_row("qwen27b").formats["int8"].checkpoint
@@ -243,7 +243,7 @@ def test_auto_resolves_only_for_the_27b_int8_checkpoint():
 
 
 def test_without_a_predecessor_log_the_mix_is_one_named_cell():
-    from sglang.srt.weg2 import launcher as L
+    from flliper.srt.pdflip import launcher as L
 
     mix, prov = L.pp_cut_chunk_mix(None, 2048, 21615, 512)
     assert mix == ((2048, 21615, M.MODE_EAGER, 1.0),) and prov.startswith("FALLBACK")

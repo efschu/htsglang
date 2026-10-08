@@ -13,7 +13,7 @@ import time
 
 import requests
 
-import sglang as sgl
+import flliper as sgl
 
 
 @sgl.function

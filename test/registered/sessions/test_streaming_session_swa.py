@@ -1,11 +1,11 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.streaming_session_kit import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.streaming_session_kit import (
     AbortLeakReproKitMixin,
     StreamingSessionKitMixin,
 )
-from sglang.test.server_fixtures.streaming_session_fixture import (
+from flliper.test.server_fixtures.streaming_session_fixture import (
     ABORT_REPRO_CHUNKED_PREFILL_SIZE,
     ABORT_REPRO_CONTEXT_LEN,
     ABORT_REPRO_PAGE_SIZE,
@@ -45,7 +45,7 @@ class TestStreamingSessionSWARetractLargePage(
         "256",
         *SWA_COMMON_ARGS,
     ]
-    env_overrides = [("SGLANG_TEST_RETRACT", True)]
+    env_overrides = [("FLLIPER_TEST_RETRACT", True)]
 
 
 class TestStreamingSessionSWARetractMixedChunk(
@@ -60,7 +60,7 @@ class TestStreamingSessionSWARetractMixedChunk(
         "--enable-mixed-chunk",
         *SWA_COMMON_ARGS,
     ]
-    env_overrides = [("SGLANG_TEST_RETRACT", True)]
+    env_overrides = [("FLLIPER_TEST_RETRACT", True)]
 
 
 class TestStreamingSessionSWAAbortLeakRepro(

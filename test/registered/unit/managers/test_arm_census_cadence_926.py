@@ -24,16 +24,16 @@ fire would have traded a spin for a blind spot, which is the trade #829 exists
 to refuse.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
 import types
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.test.test_utils import CustomTestCase
 
 
 def _holder():
@@ -46,16 +46,16 @@ class TestTheGateThrottles(CustomTestCase):
     def test_a_fast_arming_instance_is_sampled_not_censused_every_arm(self):
         """The spin, as arithmetic: 69 arms must not be 69 pool walks."""
         h = _holder()
-        with envs.SGLANG_PP_ARM_CENSUS_EVERY_N.override(16), (
-            envs.SGLANG_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0)
+        with envs.FLLIPER_PP_ARM_CENSUS_EVERY_N.override(16), (
+            envs.FLLIPER_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0)
         ):
             fired = sum(1 for _ in range(69) if h._at_arm_census_due())
         self.assertEqual(fired, 4, "expected every-16th sampling over 69 arms")
 
     def test_the_nth_arm_is_the_one_that_fires(self):
         h = _holder()
-        with envs.SGLANG_PP_ARM_CENSUS_EVERY_N.override(4), (
-            envs.SGLANG_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0)
+        with envs.FLLIPER_PP_ARM_CENSUS_EVERY_N.override(4), (
+            envs.FLLIPER_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0)
         ):
             fired = [i for i in range(1, 13) if h._at_arm_census_due()]
         self.assertEqual(fired, [4, 8, 12])
@@ -68,8 +68,8 @@ class TestTheInstrumentCanStillFire(CustomTestCase):
         """A slow-arming instance censuses every arm exactly as before, because
         each one is the first past the interval."""
         h = _holder()
-        with envs.SGLANG_PP_ARM_CENSUS_EVERY_N.override(0), (
-            envs.SGLANG_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0.0001)
+        with envs.FLLIPER_PP_ARM_CENSUS_EVERY_N.override(0), (
+            envs.FLLIPER_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0.0001)
         ):
             import time
 
@@ -84,8 +84,8 @@ class TestTheInstrumentCanStillFire(CustomTestCase):
         """The operator escape hatch: chasing the #631 J page loss needs the
         continuous record back."""
         h = _holder()
-        with envs.SGLANG_PP_ARM_CENSUS_EVERY_N.override(0), (
-            envs.SGLANG_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0)
+        with envs.FLLIPER_PP_ARM_CENSUS_EVERY_N.override(0), (
+            envs.FLLIPER_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0)
         ):
             fired = sum(1 for _ in range(20) if h._at_arm_census_due())
         self.assertEqual(fired, 20)
@@ -94,8 +94,8 @@ class TestTheInstrumentCanStillFire(CustomTestCase):
         """NEVER SILENTLY FALSE. The skip count must survive to the next
         census, or a sampled window reads exactly like a clean one."""
         h = _holder()
-        with envs.SGLANG_PP_ARM_CENSUS_EVERY_N.override(4), (
-            envs.SGLANG_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0)
+        with envs.FLLIPER_PP_ARM_CENSUS_EVERY_N.override(4), (
+            envs.FLLIPER_PP_ARM_CENSUS_MIN_INTERVAL_S.override(0)
         ):
             for _ in range(3):
                 self.assertFalse(h._at_arm_census_due())

@@ -4,9 +4,9 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
-from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from flliper.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -21,7 +21,7 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 try:
-    from sglang.srt.utils import is_hip
+    from flliper.srt.utils import is_hip
 
     _is_hip = is_hip()
 except ImportError:
@@ -35,11 +35,11 @@ def vllm_scaled_fp8_quant(
     scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if not VLLM_AVAILABLE:
-        return sglang_scaled_fp8_quant(input, scale)
+        return flliper_scaled_fp8_quant(input, scale)
     return ops.scaled_fp8_quant(input, scale)
 
 
-def sglang_scaled_fp8_quant(
+def flliper_scaled_fp8_quant(
     input: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -63,13 +63,13 @@ def calculate_diff(batch_size: int, seq_len: int):
         return
 
     vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
+    flliper_out, flliper_scale = flliper_scaled_fp8_quant(x)
 
     vllm_out = vllm_out.to(torch.float32)
-    sglang_out = sglang_out.to(torch.float32)
+    flliper_out = flliper_out.to(torch.float32)
 
-    triton.testing.assert_close(vllm_out, sglang_out, rtol=1e-3, atol=1e-3)
-    triton.testing.assert_close(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-3)
+    triton.testing.assert_close(vllm_out, flliper_out, rtol=1e-3, atol=1e-3)
+    triton.testing.assert_close(vllm_scale, flliper_scale, rtol=1e-3, atol=1e-3)
 
 
 # Benchmark configuration
@@ -79,11 +79,11 @@ element_range = get_benchmark_range(
 )
 
 if VLLM_AVAILABLE:
-    line_vals = ["vllm", "sglang"]
+    line_vals = ["vllm", "flliper"]
     line_names = ["VLLM", "SGL Kernel"]
     styles = [("blue", "-"), ("green", "-")]
 else:
-    line_vals = ["sglang"]
+    line_vals = ["flliper"]
     line_names = ["SGL Kernel"]
     styles = [("green", "-")]
 
@@ -109,8 +109,8 @@ def benchmark(element_count, provider):
 
     if provider == "vllm":
         fn = lambda: vllm_scaled_fp8_quant(x.clone())
-    elif provider == "sglang":
-        fn = lambda: sglang_scaled_fp8_quant(x.clone())
+    elif provider == "flliper":
+        fn = lambda: flliper_scaled_fp8_quant(x.clone())
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

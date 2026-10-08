@@ -13,7 +13,7 @@ import types
 
 import pytest
 
-from sglang.srt.weg2.launcher import d_moe_residency
+from flliper.srt.pdflip.launcher import d_moe_residency
 
 
 class _Fam:
@@ -25,7 +25,7 @@ class _Fam:
 def _model(tp=3, experts=512, offloadable=(90.0, 40.0, 40.0)):
     """Ein PerfCostModel-Stellvertreter mit genau den Naehten, die der neue
     Term anfasst -- kein Checkpoint noetig."""
-    from sglang.srt.uneven_perf import PerfCostModel
+    from flliper.srt.uneven_perf import PerfCostModel
 
     m = PerfCostModel.__new__(PerfCostModel)
     m.tp_size = tp
@@ -75,7 +75,7 @@ def test_a_dense_checkpoint_offloads_nothing():
 def test_predict_capacity_reads_the_same_term():
     import inspect
 
-    from sglang.srt.uneven_perf import PerfCostModel
+    from flliper.srt.uneven_perf import PerfCostModel
 
     src = inspect.getsource(PerfCostModel.predict_capacity)
     assert "offloaded = self.per_rank_offloaded_weight_bytes(mlp_vector)" in src
@@ -85,8 +85,8 @@ def test_predict_capacity_reads_the_same_term():
 
 def test_the_residency_is_read_from_the_arms_env_d_string():
     frac, scratch = d_moe_residency(
-        "SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.006,0.12,0.12;"
-        "SGLANG_MOE_SCRATCH_SLOTS=60,48,48;SGLANG_UNEVEN_MOE_EXPERT_SHARD=1",
+        "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION=0.006,0.12,0.12;"
+        "FLLIPER_MOE_SCRATCH_SLOTS=60,48,48;FLLIPER_UNEVEN_MOE_EXPERT_SHARD=1",
         3,
     )
     assert frac == [0.006, 0.12, 0.12]
@@ -94,23 +94,23 @@ def test_the_residency_is_read_from_the_arms_env_d_string():
 
 
 def test_one_entry_is_broadcast_and_a_missing_key_is_none():
-    frac, scratch = d_moe_residency("SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.25", 3)
+    frac, scratch = d_moe_residency("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION=0.25", 3)
     assert frac == [0.25, 0.25, 0.25]
     assert scratch is None
     assert d_moe_residency("", 3) == (None, None)
 
 
 def test_a_mis_sized_vector_is_ignored_not_guessed():
-    frac, _ = d_moe_residency("SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.1,0.2", 3)
+    frac, _ = d_moe_residency("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION=0.1,0.2", 3)
     assert frac is None
-    frac, _ = d_moe_residency("SGLANG_MOE_RESIDENT_EXPERT_FRACTION=nonsense", 3)
+    frac, _ = d_moe_residency("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION=nonsense", 3)
     assert frac is None
 
 
 def test_the_decision_hands_env_d_to_the_rows():
     import inspect
 
-    from sglang.srt.weg2 import launcher
+    from flliper.srt.pdflip import launcher
 
     src = inspect.getsource(launcher.d_tp_ratio_decision)
     assert "_moe_frac, _moe_scratch = d_moe_residency(env_d, len(budgets))" in src
@@ -131,7 +131,7 @@ def test_the_offload_opens_the_gate_but_leaves_p_and_the_vector_alone():
     verweigern lassen, aber nicht waehlen."""
     import inspect
 
-    from sglang.srt.uneven_perf import PerfCostModel
+    from flliper.srt.uneven_perf import PerfCostModel
 
     src = inspect.getsource(PerfCostModel.predict_capacity)
     # p wird NICHT gekuerzt
@@ -150,7 +150,7 @@ def test_the_shipped_vector_is_only_read_back_from_an_anchored_model():
     262144 auf 195008 Token, Karte voll beim Graph-Capture."""
     import inspect
 
-    from sglang.srt.weg2 import launcher
+    from flliper.srt.pdflip import launcher
 
     src = inspect.getsource(launcher.d_operating_point_rows)
     assert 'getattr(pcm, "measured", None) is not None' in src

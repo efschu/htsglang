@@ -9,7 +9,7 @@ Metal (NF y3w e033a931db):
   TP0/TP2 had joined), TP0/TP2 unclaimed their joins. Every rank resolved only
   ITS claim: 753 slots stayed CLAIMED with no open writer and no byte
   (``#1439 ... claimed=753`` on P), then 512 more at 01:40:20.
-* P PP0 read weg2-1-4 at 01:39:45 (300 of 1952 pages) and 01:40:52 (764 of
+* P PP0 read pdflip-1-4 at 01:39:45 (300 of 1952 pages) and 01:40:52 (764 of
   1955): each read stopped at such a slot.
 * ``_evict_for_claim`` of the KV arena never reaped (#231 ran for the mamba
   arena only): claims evicted kept pages while orphans sat beside them.
@@ -31,8 +31,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest  # noqa: E402
 
-from sglang.srt.mem_cache.pool_host import arena_pool  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.pool_host import arena_pool  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -96,7 +96,7 @@ def test_the_claim_room_takes_orphans_before_any_complete_page(arena, monkeypatc
     """RED on a332187f28: the KV claim room evicts a COMPLETE page and leaves
     the orphan (partial rows, no writer) where it is. GREEN: the orphan goes,
     the COMPLETE pages stay."""
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_PARTIAL_REAP_S", "0.05")
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PARTIAL_REAP_S", "0.05")
     import ctypes
 
     for i in range(7):

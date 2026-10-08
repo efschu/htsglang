@@ -7,7 +7,7 @@ import deep_ep
 import torch
 import torch.distributed as dist
 
-from sglang.test.test_deepep_utils import (
+from flliper.test.test_deepep_utils import (
     bench,
     bench_kineto,
     calc_diff,

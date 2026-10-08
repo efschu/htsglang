@@ -7,7 +7,7 @@ INT8-W8A8 Qwen3.6-27B on port 30030) was live throughout and was not disturbed.
 Everything hermetic ran under `CUDA_VISIBLE_DEVICES=99`.
 
 Interpreter: `/spinning/htsglang-gpu/.venv/bin/python`
-`PYTHONPATH=/spinning/wt-dsv4f-window/python` where an `sglang` import was needed.
+`PYTHONPATH=/spinning/wt-dsv4f-window/python` where an `flliper` import was needed.
 
 ---
 
@@ -94,7 +94,7 @@ A first draft of the renderer used a hand-rolled `jinja2.Environment` with
 `StrictUndefined` and **failed** on `message['tool_calls']` — a message the
 server renders fine. It now borrows
 `transformers.utils.chat_template_utils._compile_jinja_template`
-(`chat_template_utils.py:480-494`), the exact environment sglang's chat path
+(`chat_template_utils.py:480-494`), the exact environment flliper's chat path
 compiles with, so the selftest predicts server behaviour instead of
 approximating it.
 
@@ -231,7 +231,7 @@ returned 0 as required
 
 ## EXECUTED — 8. `logging_break_debug.json` is a valid `dictConfig`
 
-Loaded exactly as sglang loads it (`orjson` → `logging.config.dictConfig`,
+Loaded exactly as flliper loads it (`orjson` → `logging.config.dictConfig`,
 `srt/utils/common.py:2685-2693`), including the `_comment` key:
 
 ```
@@ -254,7 +254,7 @@ Read from source in this worktree, not from memory:
 | per-rank vectors zip positionally against it | `server_args.py:9111` |
 | solo-draft rank resolution | `server_args.py:7086-7117` |
 | `validate_breakable_boot` preconditions | `offload_capture_gate.py:311-420` |
-| `SGLANG_BREAK_COST_PATH` used verbatim, no rank tag | `break_cost_clock.py:513` |
+| `FLLIPER_BREAK_COST_PATH` used verbatim, no rank tag | `break_cost_clock.py:513` |
 | rank tag comes from `torch.distributed` | `break_cost_clock.py:478-494` |
 | `summarise.py` exists and groups by `rank_tag` | `scripts/dev/494_break_cost/summarise.py` |
 | `Preparing MXFP4 experts for Marlin backend` | `mxfp4_marlin_moe.py:133` |
@@ -263,7 +263,7 @@ Read from source in this worktree, not from memory:
 | `deepseekv4` tool-call parser registered | `function_call/function_call_parser.py:66` |
 | `/health_generate` exists | `entrypoints/http_server.py:861-862` |
 | jinja file load mangles `\n` | `parser/template_manager.py:269-270` |
-| `SGLANG_LOGGING_CONFIG_PATH` honoured | `srt/utils/common.py:2685-2693` |
+| `FLLIPER_LOGGING_CONFIG_PATH` honoured | `srt/utils/common.py:2685-2693` |
 | `compressor_v2.forward_unified` write sites | `layers/attention/dsv4/compressor_v2.py:516-596` |
 | no runtime resident-fraction endpoint exists | searched `http_server.py`, `srt/managers/` — no match |
 | `--cuda-graph-bs-decode` is the live flag | `server_args.py:3095-3097` |
@@ -302,7 +302,7 @@ of it has executed against hardware.
 8. **`probes.py` server-facing modes** — `prefill`, `decode`, `avsa`,
    `determined`, `accept`, `chatprobe`, `idem-record`, `idem-compare`. Only
    their pure helpers were selftested. `stream_bounded`'s SSE loop has still
-   never seen a real sglang stream.
+   never seen a real flliper stream.
 
    **RESOLVED at desk (was the biggest unverified assumption).** The counters
    do NOT appear on intermediate streamed chunks:
@@ -324,7 +324,7 @@ of it has executed against hardware.
     to discriminate; whether DSV4F answers "Thursday" or spells `kcats` is
     unknown. Expect to re-tune the set on first contact, and record the
     baseline arm's score before treating it as a quality gate.
-11. **`SGLANG_LOGGING_CONFIG_PATH` inside a real launch.** The dict is valid and
+11. **`FLLIPER_LOGGING_CONFIG_PATH` inside a real launch.** The dict is valid and
     the logger name is right, but whether `configure_logger` runs early enough
     in every worker to catch the break-graph DEBUG lines is unverified. If the
     independent count comes back 0, that is the first thing to suspect — the
@@ -359,7 +359,7 @@ metadata KV block does — 13698 bytes, identical across both quants. Extracting
 the authoritative template is strictly better than desk-writing a plausible
 one, and the cross-quant identity is itself a precondition for arm 1.
 
-### C3 — `SGLANG_BREAK_COST_PATH` is **not** expanded per rank
+### C3 — `FLLIPER_BREAK_COST_PATH` is **not** expanded per rank
 
 The briefing sets it to `"$RUN/break_cost"`; TICKET_462 §3 sets it to
 `"$RUN/break_cost.jsonl"` and comments `# becomes one file per rank`. Neither is
@@ -391,7 +391,7 @@ Named explicitly so they can be checked first in the window.
 | guess | why it is a guess | how to settle it |
 |---|---|---|
 | `RESIDENT_FRACTION_CUT=0.383,0.42,0.42` | 0.485 × 0.79, from TICKET_470 §0's "~21 %". §7.6 says the ~11 GiB ask is arithmetic, not a measurement | override from the GGUF footprint analysis before the window |
-| `MEM_AVAIL_FLOOR_GIB=96` | `SGLANG_GGUF_STREAM_TRIM_SOFT_GIB` (88) + 8 GiB headroom. The headroom term is mine | lower it deliberately if a q3kxl boot refuses |
+| `MEM_AVAIL_FLOOR_GIB=96` | `FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB` (88) + 8 GiB headroom. The headroom term is mine | lower it deliberately if a q3kxl boot refuses |
 | `READY_ITERS` 90 / 132 / 108 | IQ3 measured ~5.5-6 min; Q3_K_XL scaled by the 120/98 GiB size ratio and rounded up; the DSpark arm +3 min for the head | first boot's `ready_<arm>.txt` settles all three |
 | the determined-answer set | chosen for determinacy, not from a prior DSV4F run | score the baseline arm first |
 | prefill prompt lengths | `build_prompt` targets 240/480/940/1850 at ~4 chars/token; actual `prompt_tokens` is recorded next to the target | the recorded actuals |

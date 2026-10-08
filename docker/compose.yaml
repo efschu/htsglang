@@ -1,7 +1,7 @@
 services:
-  sglang:
+  flliper:
     image: lmsysorg/sglang:latest
-    container_name: sglang
+    container_name: flliper
     volumes:
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
       # If you use modelscope, you need mount this directory
@@ -15,8 +15,8 @@ services:
     environment:
       - HF_TOKEN=<secret>
       # if you use modelscope to download model, you need set this environment
-      # - SGLANG_USE_MODELSCOPE=true
-    entrypoint: python3 -m sglang.launch_server
+      # - FLLIPER_USE_MODELSCOPE=true
+    entrypoint: python3 -m flliper.launch_server
     command: --model-path meta-llama/Llama-3.1-8B-Instruct
       --host 0.0.0.0
       --port 30000

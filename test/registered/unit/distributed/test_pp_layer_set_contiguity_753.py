@@ -18,9 +18,9 @@ the safe reading.
 
 import unittest
 
-from sglang.srt.distributed.utils import PPLayerSetError, parse_pp_layer_sets
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.utils import PPLayerSetError, parse_pp_layer_sets
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -99,7 +99,7 @@ if __name__ == "__main__":
 class TestPpSizeOneIsNotAnError754(CustomTestCase):
     """#754, folded into #753: it is the same resolution seam.
 
-    ``SGLANG_PP_LAYER_SET`` is process-wide, but ``get_pp_layer_set`` is called
+    ``FLLIPER_PP_LAYER_SET`` is process-wide, but ``get_pp_layer_set`` is called
     again by the TP stack during a phase flip -- with ``pp_size=1``. A 3-stage
     string is then not merely inapplicable but INVALID, and the parser refused
     it by stage count ("3 stage(s) given but pp_size is 1"), taking down a flip
@@ -116,9 +116,9 @@ class TestPpSizeOneIsNotAnError754(CustomTestCase):
         import os
         from unittest.mock import patch
 
-        from sglang.srt.distributed.utils import get_pp_layer_set
+        from flliper.srt.distributed.utils import get_pp_layer_set
 
-        with patch.dict(os.environ, {"SGLANG_PP_LAYER_SET": self.RAW}):
+        with patch.dict(os.environ, {"FLLIPER_PP_LAYER_SET": self.RAW}):
             return get_pp_layer_set(N, pp_rank, pp_size)
 
     def test_pp_size_one_answers_none_instead_of_raising(self):
@@ -135,8 +135,8 @@ class TestPpSizeOneIsNotAnError754(CustomTestCase):
         import os
         from unittest.mock import patch
 
-        from sglang.srt.distributed.utils import get_pp_layer_set
+        from flliper.srt.distributed.utils import get_pp_layer_set
 
-        with patch.dict(os.environ, {"SGLANG_PP_LAYER_SET": self.RAW}):
+        with patch.dict(os.environ, {"FLLIPER_PP_LAYER_SET": self.RAW}):
             with self.assertRaises(PPLayerSetError):
                 get_pp_layer_set(N, 0, 2)

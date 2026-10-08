@@ -2,10 +2,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.schedule_batch import FINISH_ABORT
+from flliper.srt.mem_cache.base_prefix_cache import MatchResult
+from flliper.srt.session.streaming_session import SessionSlot, StreamingSession
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 

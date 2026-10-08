@@ -1,10 +1,10 @@
 import pytest
 
-from sglang.srt.layers.attention.mamba.ops import ssu_dispatch
-from sglang.srt.layers.attention.mamba.ops.ssu_dispatch import (
+from flliper.srt.layers.attention.mamba.ops import ssu_dispatch
+from flliper.srt.layers.attention.mamba.ops.ssu_dispatch import (
     initialize_mamba_selective_state_update_backend,
 )
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.server_args import ServerArgs
 
 
 @pytest.fixture(scope="session", autouse=True)

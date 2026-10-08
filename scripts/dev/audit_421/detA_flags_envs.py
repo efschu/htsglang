@@ -34,7 +34,7 @@ def is_doc(p):
 
 def is_decl(p):
     r = os.path.relpath(p, ROOT)
-    return r in ("python/sglang/srt/server_args.py", "python/sglang/srt/environ.py")
+    return r in ("python/flliper/srt/server_args.py", "python/flliper/srt/environ.py")
 
 
 CACHE = {}

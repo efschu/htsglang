@@ -26,15 +26,15 @@ The two facts that construction would have established -- the dense mapping and
 the absent `start_layer` -- are pinned against the source instead.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import inspect
 import unittest
 
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
+from flliper.test.test_utils import CustomTestCase
 
 #: The family plan: full attention every 4th layer, 64 layers, this stage
 #: owning the second half of them.
@@ -88,7 +88,7 @@ class _Backend:
 
 
 def _make_backend():
-    from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+    from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
     class _B:
         _wl_full_layer_idx = FlashInferAttnBackend._wl_full_layer_idx
@@ -200,7 +200,7 @@ class TestTheFallbackBranchIsAGlobalTranslation(CustomTestCase):
 
 class TestNoRawSubtractionSurvives(CustomTestCase):
     def test_both_helpers_route_through_the_accessor(self):
-        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
         for name in ("_wl_full_layer_idx", "_sess_full_layer_idx"):
             with self.subTest(helper=name):

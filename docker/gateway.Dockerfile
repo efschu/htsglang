@@ -47,10 +47,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version && protoc --version
 
 # copy source code
-COPY --from=local_src /src /opt/sglang
+COPY --from=local_src /src /opt/flliper
 
 # working directory
-WORKDIR /opt/sglang/sgl-model-gateway
+WORKDIR /opt/flliper/sgl-model-gateway
 
 # install maturin and build the wheel with vendored OpenSSL
 RUN uv pip install maturin \
@@ -64,7 +64,7 @@ RUN uv pip install maturin \
 FROM base AS router-image
 
 # Copy the built package from the build image
-COPY --from=build-image /opt/sglang/sgl-model-gateway/bindings/python/dist/*.whl dist/
+COPY --from=build-image /opt/flliper/sgl-model-gateway/bindings/python/dist/*.whl dist/
 
 # Build the package and install
 RUN uv pip install --force-reinstall dist/*.whl

@@ -2,7 +2,7 @@
 on D and on P -- a claim whose writer is alive but delivered no byte is never
 reaped by #231 (only claims with NO open writer are), and every fill of the
 stem is a miss for good. Now such a claim is QUARANTINED from its key after
-SGLANG_WEG2_L3FILL_STALE_CLAIM_S (default 5 s) without byte progress and the
+FLLIPER_PDFLIP_L3FILL_STALE_CLAIM_S (default 5 s) without byte progress and the
 fill reads the stem from disk into a fresh slot. Generation-safe: the old
 writer's late completion is refused by name (status 6) and can never land in
 the stem's new slot nor in the old slot's next owner."""
@@ -16,10 +16,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache import hicache_storage as hs
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache import hicache_storage as hs
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -52,7 +52,7 @@ def _setup(tmp_path):
 def test_a_stale_live_claim_is_quarantined_and_the_stem_read_from_disk(tmp_path, caplog):
     be, arena, old, gen = _setup(tmp_path)
     time.sleep(0.08)
-    with envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.05), \
+    with envs.FLLIPER_PDFLIP_L3FILL_STALE_CLAIM_S.override(0.05), \
             caplog.at_level(logging.WARNING, logger=hs.__name__):
         out = HiCacheFile.arena_fill_from_disk(be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True)
     new = out[1]
@@ -68,7 +68,7 @@ def test_a_stale_live_claim_is_quarantined_and_the_stem_read_from_disk(tmp_path,
 def test_the_old_writers_late_completion_is_refused_by_generation(tmp_path):
     be, arena, old, gen = _setup(tmp_path)
     time.sleep(0.08)
-    with envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.05):
+    with envs.FLLIPER_PDFLIP_L3FILL_STALE_CLAIM_S.override(0.05):
         out = HiCacheFile.arena_fill_from_disk(be, arena, ["p1"], TOTAL, prefix=True)
     new = out[0]
     # the old writer comes back and writes its (other) bytes, then completes
@@ -89,7 +89,7 @@ def test_the_old_writers_late_completion_is_refused_by_generation(tmp_path):
 
 def test_a_young_claim_is_not_reaped(tmp_path):
     be, arena, old, gen = _setup(tmp_path)
-    with envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(30.0):
+    with envs.FLLIPER_PDFLIP_L3FILL_STALE_CLAIM_S.override(30.0):
         out = HiCacheFile.arena_fill_from_disk(be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True)
     assert out[1] is None and out[2] is None
     assert arena.claim_info([old])[0][6] == 1                   # still CLAIMED by its writer

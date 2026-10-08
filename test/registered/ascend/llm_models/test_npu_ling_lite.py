@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import LING_LITE_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from flliper.test.ascend.test_ascend_utils import LING_LITE_WEIGHTS_PATH
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=400, suite="full-2-npu-a3", nightly=True)
 

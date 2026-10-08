@@ -33,13 +33,13 @@ import sys
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.planner import device_map as device_map_module
-from sglang.srt.planner import flags as flags_module
-from sglang.srt.registry import nvml as registry_nvml
-from sglang.srt.registry.nvml import DeviceInfo, DeviceOrderUnresolvedError
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.server_args as server_args_module
+from flliper.srt.planner import device_map as device_map_module
+from flliper.srt.planner import flags as flags_module
+from flliper.srt.registry import nvml as registry_nvml
+from flliper.srt.registry.nvml import DeviceInfo, DeviceOrderUnresolvedError
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -230,7 +230,7 @@ class MigratedCallersAgreeTest(_RigCase):
     def test_uneven_perf_inventory_matches(self):
         """The hardware micro-probe keys the profile CACHE by these uuids, so
         a misattributed card persists a profile of another machine."""
-        from sglang.srt import uneven_perf
+        from flliper.srt import uneven_perf
 
         with patch("torch.cuda.device_count", return_value=3):
             gpus, driver = uneven_perf._nvml_gpu_inventory()
@@ -280,14 +280,14 @@ class MigratedCallersAgreeTest(_RigCase):
     def test_energy_compute_share_bridge_matches(self):
         """The fourth local copy of the bridge, found by the straggler audit
         and migrated with the rest."""
-        from sglang.srt.planner import energy
+        from flliper.srt.planner import energy
 
         self.assertEqual(energy._torch_to_nvml_index(), EXPECTED_CUDA_TO_NVML)
 
     def test_pd_topology_totals_match(self):
         """``disaggregation.topology`` still reaches the map through the
         deprecated shell; the answer has to be the same one."""
-        from sglang.srt.disaggregation import topology
+        from flliper.srt.disaggregation import topology
 
         self.assertEqual(topology.nvml_card_totals_mib(), EXPECTED_CUDA_TO_TOTAL)
 
@@ -314,7 +314,7 @@ class NoCudaBridgeTest(_RigCase):
         self.assertIn("Refusing to guess", str(ctx.exception))
 
     def test_uneven_perf_inventory_refuses(self):
-        from sglang.srt import uneven_perf
+        from flliper.srt import uneven_perf
 
         with patch("torch.cuda.device_count", return_value=3):
             with self.assertRaises(DeviceOrderUnresolvedError) as ctx:
@@ -353,7 +353,7 @@ class NoCudaBridgeTest(_RigCase):
     def test_energy_leaves_an_unresolvable_rank_unattributed(self):
         """It used to add the rank's share to the NVML card of the same
         number, i.e. to a different physical card."""
-        from sglang.srt.planner import energy
+        from flliper.srt.planner import energy
 
         notes = []
         cfg = type("_Cfg", (), {"rank_tp_ratio": [2, 1, 1], "rank_gpu_id": [0, 1, 2]})()
@@ -443,8 +443,8 @@ class AgreeingOrdersTest(_RigCase):
     IDENTITY = {0: 0, 1: 1, 2: 2}
 
     def test_every_migrated_caller_is_unchanged(self):
-        from sglang.srt import uneven_perf
-        from sglang.srt.disaggregation import topology
+        from flliper.srt import uneven_perf
+        from flliper.srt.disaggregation import topology
 
         self.assertEqual(
             server_args_module._torch_to_nvml_gpu_index_mapping(), self.IDENTITY

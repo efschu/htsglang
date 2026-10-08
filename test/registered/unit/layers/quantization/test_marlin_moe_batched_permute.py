@@ -5,7 +5,7 @@ on the 5090 rank). Pinned row-identical against the per-expert loop."""
 
 import torch
 
-from sglang.srt.layers.quantization.marlin_utils import (
+from flliper.srt.layers.quantization.marlin_utils import (
     awq_to_marlin_zero_points,
     marlin_moe_permute_scales,
     marlin_permute_scales,
@@ -35,7 +35,7 @@ def test_batched_scales_equal_the_per_expert_loop():
 
 
 def test_torch_zero_point_path_is_bit_identical_to_numpy():
-    from sglang.srt.layers.quantization.marlin_utils import awq_to_marlin_zero_points_torch
+    from flliper.srt.layers.quantization.marlin_utils import awq_to_marlin_zero_points_torch
 
     g = torch.Generator().manual_seed(2)
     for num_bits, size_n, size_k in ((4, 256, 12), (8, 128, 7)):
@@ -52,8 +52,8 @@ def test_batched_moe_zero_point_path_never_enters_numpy_unpack(monkeypatch):
     scatter over a 128 MB array) against 0.23 s for the per-expert loop and
     0.32 s for the torch path -- 13..65 s per layer on the 5090 rank instead
     of 1.3 s. The MoE path must stay off the numpy helpers."""
-    import sglang.srt.layers.quantization.marlin_utils as mu
-    import sglang.srt.layers.quantization.utils as qu
+    import flliper.srt.layers.quantization.marlin_utils as mu
+    import flliper.srt.layers.quantization.utils as qu
 
     def boom(*a, **k):
         raise AssertionError("numpy unpack_cols/pack_cols entered on the batched MoE path")

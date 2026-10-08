@@ -3,7 +3,7 @@
 #889 fixed ONE instance (``--phase-policy-pp-window-s`` made unreachable by a
 declared decode-stall SLO). The sweep that found it found three more of the
 same class. This suite pins the two that live under ``srt/managers``; the third
-(``SGLANG_GGUF_MMQ_DECODE_THRESHOLD`` beating ``--gguf-mmq-decode-threshold``)
+(``FLLIPER_GGUF_MMQ_DECODE_THRESHOLD`` beating ``--gguf-mmq-decode-threshold``)
 is pinned in ``test/registered/unit/quantization/
 test_gguf_mmq_env_supersession_894.py``.
 
@@ -54,7 +54,7 @@ disables the branch that mentions it, forever and silently. It is RED at the
 base commit on ``tp_window_s``.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -64,7 +64,7 @@ import pathlib
 import types
 import unittest
 
-from sglang.srt.managers.min_free_slots_delayer import (
+from flliper.srt.managers.min_free_slots_delayer import (
     MIN_FREE_SLOTS_CAPPED,
     MIN_FREE_SLOTS_DISABLED_SMALL_POOL,
     MIN_FREE_SLOTS_HONOURED,
@@ -73,16 +73,16 @@ from sglang.srt.managers.min_free_slots_delayer import (
     narrowed_min_free_slots_warning,
     resolve_min_free_slots,
 )
-from sglang.srt.managers.phase_policy import PhasePolicyConfig
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.managers.phase_policy import PhasePolicyConfig
+from flliper.srt.managers.phase_purity import (
     PhasePurityError,
     parse_purity,
     validate_tp_exit_pair,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 #  .../<root>/test/registered/unit/managers/<this file>
-_SRT = pathlib.Path(__file__).resolve().parents[4] / "python" / "sglang" / "srt"
+_SRT = pathlib.Path(__file__).resolve().parents[4] / "python" / "flliper" / "srt"
 _PHASE_MODULES = (
     _SRT / "managers" / "phase_purity.py",
     _SRT / "managers" / "phase_policy.py",
@@ -466,7 +466,7 @@ _CLASSIFIED = {
         "distributed/utils.py:announce_superseded_rank_kv_ratio, called once "
         "per process from scheduler.configure_scheduler_process (#897). "
         "#894 left this KNOWN_SILENT for a stated reason: "
-        "`resolve_cp_token_ratios` still lets SGLANG_UNEVEN_TOKEN_VECTOR win "
+        "`resolve_cp_token_ratios` still lets FLLIPER_UNEVEN_TOKEN_VECTOR win "
         "on presence over an explicit --rank-kv-ratio, and it is documented "
         "as a DETERMINISTIC PURE FUNCTION with several call sites, so the "
         "announcement could not go inside it. #897 put the warner beside the "
@@ -575,7 +575,7 @@ class TestEverySupersessionInHelpTextIsClassified(CustomTestCase):
         source = (
             "class ServerArgs:\n"
             "    already_fine: A[int, Arg(help='a plain flag')] = 1\n"
-            "    brand_new_894: A[int, Arg(help='SGLANG_X wins over this "
+            "    brand_new_894: A[int, Arg(help='FLLIPER_X wins over this "
             "flag')] = 2\n"
         )
         probe = pathlib.Path(__file__).with_name("_probe_prose_894.py")

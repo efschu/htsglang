@@ -7,11 +7,11 @@ injected, and the aggregator is exercised through its object API.
 import json
 import unittest
 
-from sglang.srt.rigmon.aggregator import Aggregator
-from sglang.srt.rigmon.collector import Collector, PushClient, flatten_sample
-from sglang.srt.rigmon.config import AggregatorConfig, CollectorConfig
-from sglang.srt.rigmon.series import TierSpec
-from sglang.srt.rigmon.sources import (
+from flliper.srt.rigmon.aggregator import Aggregator
+from flliper.srt.rigmon.collector import Collector, PushClient, flatten_sample
+from flliper.srt.rigmon.config import AggregatorConfig, CollectorConfig
+from flliper.srt.rigmon.series import TierSpec
+from flliper.srt.rigmon.sources import (
     CardSample,
     DeviceBackend,
     EngineSample,
@@ -19,8 +19,8 @@ from sglang.srt.rigmon.sources import (
     GpuSampler,
     NullBackend,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

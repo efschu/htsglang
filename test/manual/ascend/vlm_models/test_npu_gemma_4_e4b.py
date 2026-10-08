@@ -1,7 +1,7 @@
 import unittest
 
-from sglang.test.ascend.test_ascend_utils import GEMMA_4_E4B_WEIGHTS_PATH
-from sglang.test.ascend.vlm_utils import TestVLMModels
+from flliper.test.ascend.test_ascend_utils import GEMMA_4_E4B_WEIGHTS_PATH
+from flliper.test.ascend.vlm_utils import TestVLMModels
 
 
 class TestGemma4E4B(TestVLMModels):

@@ -10,7 +10,7 @@ import pandas as pd
 import tiktoken
 from tqdm import tqdm
 
-from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from flliper.test.test_utils import add_common_other_args_and_parse, get_call_generate
 
 choices = ["A", "B", "C", "D"]
 

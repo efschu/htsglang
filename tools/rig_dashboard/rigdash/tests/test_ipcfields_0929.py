@@ -3,7 +3,7 @@ ganzen werte im dashboard noch aus log"): one reader per field, switched by pres
 
 For every field: the IPC source present -> the IPC value (src=ipc); absent -> the log value
 with the label "missing in IPC".  The fixtures follow the producers' schemas:
-weg2/rankstats.py (weg2.rankstats/1, 2188e1bd98), weg2/front.py _ipc_front_fields and the
+pdflip/rankstats.py (pdflip.rankstats/1, 2188e1bd98), pdflip/front.py _ipc_front_fields and the
 events flip_begin / flip_done / flip_first_work / group_health (front_state_ipc.py), and the
 §3 blocks the inventory names for rankstats (prefill / decode / cache / work.spans).
 """
@@ -23,7 +23,7 @@ STATIC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 
 
 def _ev(typ, data, **kw):
-    return dict({"schema": "weg2.event/1", "ts": data.get("ts", 1790680000.0), "type": typ, "data": data}, **kw)
+    return dict({"schema": "pdflip.event/1", "ts": data.get("ts", 1790680000.0), "type": typ, "data": data}, **kw)
 
 
 def _ipc():
@@ -33,7 +33,7 @@ def _ipc():
         "forms": {"D": "OWNED_CUT_X1=workers kv=S0"},
         "front": {"groups": {"P": {"http_ok": True, "alive": True, "streak": 0, "ts": 1.0},
                              "D": {"http_ok": True, "alive": True, "streak": 0, "ts": 1.0}},
-                  "errors": {"n": 1, "last": [{"t": 5.0, "logger": "sglang", "level": "ERROR", "exc": None,
+                  "errors": {"n": 1, "last": [{"t": 5.0, "logger": "flliper", "level": "ERROR", "exc": None,
                                                "text": "front err"}]},
                   "served_tokens": {"P": {"n": 3, "prompt": 30000, "cached": 1000, "completion": 0}},
                   "d_phase_n": 2, "d_parked_n": 1},
@@ -66,7 +66,7 @@ def _stats(ts=1000.0, prefill_total=1000, decode_total=500, new_tokens=16384, co
             "tokens": {"prefill_total": prefill_total, "decode_total": decode_total},
             "spec": {"accept_tokens_total": 300, "forward_ct_total": 100},
             "sched": {"waiting": 2, "running": 1},
-            "errors": {"n": 2, "last": [{"t": 4.0, "logger": "sglang", "level": "ERROR", "exc": "OSError",
+            "errors": {"n": 2, "last": [{"t": 4.0, "logger": "flliper", "level": "ERROR", "exc": "OSError",
                                          "text": "rank err"}]},
             "last_post_wake": {"n": 0, "run_ms": 31},
             "prefill": {"chunks": 3, "new_tokens": new_tokens, "cached_tokens": 4096, "compute_ms": compute_ms,
@@ -196,7 +196,7 @@ class FieldSwitchTests(unittest.TestCase):
 #: desk/rankstats-s3-0929 @ ff643c9010, "Nachzug A14 / C5": full_token_usage, mamba_tok,
 #: prefetch.deferred/defer_refused/timeout, cap, stops)
 S3_FIXTURE = json.loads("""
-{"schema":"weg2.rankstats/1","pid":1,"ts":1790680000.0,"seq":12,"group":"P","tp_rank":0,"pp_rank":0,
+{"schema":"pdflip.rankstats/1","pid":1,"ts":1790680000.0,"seq":12,"group":"P","tp_rank":0,"pp_rank":0,
  "rank_state_seq":null,"work":{"forward_ct":40},"tokens":{"prefill_total":65536,"decode_total":0},
  "spec":{"accept_tokens_total":0,"forward_ct_total":0},
  "sched":{"waiting":1,"running":0,"queue_req":1,"running_req":0,"pending_tokens":16384,"full_token_usage":0.4271},
@@ -369,7 +369,7 @@ class RankFilesTests(unittest.TestCase):
             with open(os.path.join(rs, "D.tp0pp0.rankstats"), "w") as fh:
                 json.dump(_stats()["D.tp0pp0"], fh)
             with open(os.path.join(rs, "D.tp1pp0.rankstats"), "w") as fh:
-                json.dump({"schema": "weg2.rankstats/9"}, fh)            # another schema: refused
+                json.dump({"schema": "pdflip.rankstats/9"}, fh)            # another schema: refused
             with open(os.path.join(rs, "D.tp0pp0.json"), "w") as fh:
                 json.dump({"schema": 2, "kv": {"kv_tokens": 1}}, fh)
             dirs = ipcfields.rankstate_dirs({"D": {"path": log}, "front": {"path": log}})
@@ -383,7 +383,7 @@ class BootViewEventsTests(unittest.TestCase):
     def test_boot_view_keeps_the_field_events_and_forms(self):
         ev = ipcstate._Events("/nonexistent")
         ev.rows = [_ev("flip_first_work", {"dir": "P>D", "flip_time_ms": 1}), _ev("lifecycle", {"state": "serving"})]
-        st = {"schema": "weg2.state/1", "groups": {"D": {"form": "F", "state": "ready"}}, "lifecycle": {}}
+        st = {"schema": "pdflip.state/1", "groups": {"D": {"form": "F", "state": "ready"}}, "lifecycle": {}}
         v = ipcstate.boot_view("/d", st, ev, 0.0)
         self.assertEqual([e["type"] for e in v["ipc_events"]], ["flip_first_work"])
         self.assertEqual(v["forms"], {"D": "F"})

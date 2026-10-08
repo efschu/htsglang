@@ -1,10 +1,10 @@
 import os, sys, json, torch
-os.environ["SGLANG_FP4_SM12X_W4A16_MAX_M"] = "16"
+os.environ["FLLIPER_FP4_SM12X_W4A16_MAX_M"] = "16"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bench_fi_next_sm12x as B
-from sglang.srt.layers.quantization import fp4_utils
-from sglang.srt.layers.quantization import nvfp4_sm12x_w4a16 as S
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config, ModelOptFp4LinearMethod
+from flliper.srt.layers.quantization import fp4_utils
+from flliper.srt.layers.quantization import nvfp4_sm12x_w4a16 as S
+from flliper.srt.layers.quantization.modelopt_quant import ModelOptFp4Config, ModelOptFp4LinearMethod
 from flashinfer.autotuner import autotune
 m = ModelOptFp4LinearMethod(ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16))
 res = []

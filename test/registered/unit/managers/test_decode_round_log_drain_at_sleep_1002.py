@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.managers.scheduler_components import decode_round_log as D  # noqa: E402
+from flliper.srt.managers.scheduler_components import decode_round_log as D  # noqa: E402
 
 
 class _Clock:
@@ -67,9 +67,9 @@ def test_nothing_pending_no_sync_and_switch_off(monkeypatch):
 
 
 def test_sleep_leg_drains_after_the_replay_check():
-    from sglang.srt.managers.scheduler_components import weight_updater as wu
+    from flliper.srt.managers.scheduler_components import weight_updater as wu
 
     src = inspect.getsource(wu.WeightUpdater.release_memory_occupation) if hasattr(wu, "WeightUpdater") else inspect.getsource(wu)
-    i_seam = src.index("self._weg2_raise_pending_seam_refusal()")
+    i_seam = src.index("self._pdflip_raise_pending_seam_refusal()")
     i_drain = src.index("_drl.drain_blocking()")
-    assert i_seam < i_drain < src.index('replay = self._weg2_leg_replay("release", recv_req)')
+    assert i_seam < i_drain < src.index('replay = self._pdflip_leg_replay("release", recv_req)')

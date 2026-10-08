@@ -28,7 +28,7 @@ It follows the two existing siblings:
 A high-precision ``F.silu(gate) * up`` check additionally grounds the unfused path so a
 bug shared by both kernels cannot produce a false (vacuous) pass.
 
-    pytest python/sglang/jit_kernel/tests/test_silu_and_mul_scaled_fp4_experts_quant_packed.py -v
+    pytest python/flliper/jit_kernel/tests/test_silu_and_mul_scaled_fp4_experts_quant_packed.py -v
 """
 
 import sys
@@ -38,12 +38,12 @@ import torch
 import triton
 from torch.nn import functional as F
 
-from sglang.jit_kernel.activation import silu_and_mul
-from sglang.jit_kernel.nvfp4 import (
+from flliper.jit_kernel.activation import silu_and_mul
+from flliper.jit_kernel.nvfp4 import (
     scaled_fp4_experts_quant,
     silu_and_mul_scaled_fp4_experts_quant_packed,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 # The NVFP4 expert-quant kernels are Blackwell-only (sm100a), so this runs on
 # the B200 unit suite.
@@ -256,7 +256,7 @@ def test_fused_matches_unfused_uneven_offsets(m_per_expert, n, dtype):
 # Performance. The fusion removes, on the MoE down-projection input, one
 # intermediate buffer allocation, one extra kernel launch, and a full HBM
 # round-trip of the SiLU(gate)*up result. The speedup is measured under CUDA
-# graphs -- the steady-state GPU memory-traffic saving, matching how SGLang
+# graphs -- the steady-state GPU memory-traffic saving, matching how fLLiper
 # executes graphed decode (the credible, low-noise number; eager wall-clock is
 # dominated by launch/dispatch overhead and is too noisy to assert on). The
 # assert is only a conservative regression floor; the printed speedup is the real

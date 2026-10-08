@@ -1,7 +1,7 @@
 """#1158b -- a health probe that rides the SAME intake as a ReleaseMemoryOccupation,
 ahead of it, is disposed at the origin (boot race, W120 at the first idle flip).
 
-THE SPECIMEN (boot weg2_dkr27browauthoritybar1fs10060558_09757b0a44_1006_055847,
+THE SPECIMEN (boot pdflip_dkr27browauthoritybar1fs10060558_09757b0a44_1006_055847,
 D.log 06:02:01). Flush 01.208, front's Release RPC 01.322, the Release reaches the
 scheduler at 01.647 -- in the SAME intake pass as a /health_generate probe
 (HEALTH_CHECK_6ed9e716...). The origin gate read "idle" (the sleep does not exist
@@ -34,11 +34,11 @@ from unittest import mock
 
 import zmq
 
-from sglang.srt.managers import scheduler as scheduler_mod
-from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
-from sglang.srt.managers.scheduler_components import request_receiver as rr
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import scheduler as scheduler_mod
+from flliper.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
+from flliper.srt.managers.scheduler_components import request_receiver as rr
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -228,7 +228,7 @@ class NothingElseChanges(CustomTestCase):
     def test_flush_in_the_list_does_not_drop_a_probe(self):
         """Deliberate scope: only the release kills the boot (a probe queued
         behind a flush makes that flush answer 400, the front re-polls)."""
-        from sglang.srt.managers.io_struct import FlushCacheReqInput
+        from flliper.srt.managers.io_struct import FlushCacheReqInput
 
         got0, _g1, _s, deq, now, _c = _recv(
             [_req(HEALTH_RID)], [FlushCacheReqInput()], idle=True

@@ -80,7 +80,7 @@ def test_pynccl_broadcast_used_when_available() -> None:
     comm = FakePyncclComm(available=True)
     tp_group = FakeTpGroup(pynccl_comm=comm)
 
-    from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+    from flliper.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
     tensors = (_make_sentinel("t0"), _make_sentinel("t1"), _make_sentinel("t2"))
     capture_safe_tp_broadcast(tp_group, tensors, src=3)
@@ -110,7 +110,7 @@ def test_c10d_fallback_when_pynccl_none() -> None:
     non-None tensor."""
     tp_group = FakeTpGroup(pynccl_comm=None)
 
-    from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+    from flliper.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
     tensors = (_make_sentinel("a"), _make_sentinel("b"))
     capture_safe_tp_broadcast(tp_group, tensors, src=7)
@@ -135,7 +135,7 @@ def test_c10d_fallback_when_pynccl_unavailable() -> None:
     comm = FakePyncclComm(available=False)
     tp_group = FakeTpGroup(pynccl_comm=comm)
 
-    from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+    from flliper.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
     tensors = (_make_sentinel("x"),)
     capture_safe_tp_broadcast(tp_group, tensors, src=0)
@@ -158,7 +158,7 @@ def test_none_entries_skipped_pynccl_path() -> None:
     comm = FakePyncclComm(available=True)
     tp_group = FakeTpGroup(pynccl_comm=comm)
 
-    from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+    from flliper.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
     # 3 tensors, 2 are None
     tensors = (_make_sentinel("real"), None, None)
@@ -172,7 +172,7 @@ def test_none_entries_skipped_c10d_path() -> None:
     """None entries in the tensor tuple are skipped on the c10d fallback path."""
     tp_group = FakeTpGroup(pynccl_comm=None)
 
-    from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+    from flliper.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
     tensors = (None, _make_sentinel("real"), None)
     capture_safe_tp_broadcast(tp_group, tensors, src=0)
@@ -191,7 +191,7 @@ def test_src_forwarded_pynccl_path() -> None:
     comm = FakePyncclComm(available=True)
     tp_group = FakeTpGroup(pynccl_comm=comm)
 
-    from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+    from flliper.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
     capture_safe_tp_broadcast(tp_group, (_make_sentinel("t"),), src=42)
     assert comm.broadcast_calls[0][1] == 42
@@ -201,7 +201,7 @@ def test_src_forwarded_c10d_path() -> None:
     """The src argument is forwarded unchanged on the c10d fallback path."""
     tp_group = FakeTpGroup(pynccl_comm=None)
 
-    from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+    from flliper.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
     capture_safe_tp_broadcast(tp_group, (_make_sentinel("t"),), src=99)
     assert tp_group.broadcast_calls[0][1] == 99
@@ -229,7 +229,7 @@ def test_pynccl_change_state_enter_exit() -> None:
 
     comm.change_state = tracking_change_state
 
-    from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+    from flliper.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
     capture_safe_tp_broadcast(tp_group, (_make_sentinel("t"),), src=0)
 
@@ -246,19 +246,19 @@ def test_spec_accept_broadcast_src_defaults_to_zero() -> None:
     """Returns 0 when the weightless-KV fast lane is off.
 
     spec_accept_broadcast_src imports get_server_args from
-    sglang.srt.runtime_context *inside* the function body, so we patch it
+    flliper.srt.runtime_context *inside* the function body, so we patch it
     on the runtime_context module (the import target), not on eagle_utils.
     """
     from unittest.mock import patch
 
-    from sglang.srt.speculative.eagle_utils import spec_accept_broadcast_src
+    from flliper.srt.speculative.eagle_utils import spec_accept_broadcast_src
 
     class FakeServerArgs:
         weightless_kv_fastlane = False
         weightless_kv_head_rank = 5  # should be ignored
 
     with patch(
-        "sglang.srt.runtime_context.get_server_args",
+        "flliper.srt.runtime_context.get_server_args",
         return_value=FakeServerArgs(),
     ):
         result = spec_accept_broadcast_src()
@@ -276,14 +276,14 @@ def test_spec_accept_broadcast_src_returns_head_rank() -> None:
     is on."""
     from unittest.mock import patch
 
-    from sglang.srt.speculative.eagle_utils import spec_accept_broadcast_src
+    from flliper.srt.speculative.eagle_utils import spec_accept_broadcast_src
 
     class FakeServerArgs:
         weightless_kv_fastlane = True
         weightless_kv_head_rank = 3
 
     with patch(
-        "sglang.srt.runtime_context.get_server_args",
+        "flliper.srt.runtime_context.get_server_args",
         return_value=FakeServerArgs(),
     ):
         result = spec_accept_broadcast_src()

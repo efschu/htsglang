@@ -44,9 +44,9 @@ PROFILE_OWNER="the owner"
 PROFILE_CARD_COUNT=3
 PROFILE_INVENTORY=RTX5090,RTX3080,RTX3080
 PROFILE_ARGS=(--model /m --p-bs 2 --pp-stage-ratio 29,11,8 --pp-attn-stage-ratio 8,4,4 --p-hostgap
-              "--extra-p=--rank-moe-ratio 183,137,168" --env-p "SGLANG_MOE_SCRATCH_SLOTS=74,48,48")
+              "--extra-p=--rank-moe-ratio 183,137,168" --env-p "FLLIPER_MOE_SCRATCH_SLOTS=74,48,48")
 profile_form_env() {
-  _form SGLANG_WEG2_OWNED_BASE stated
+  _form FLLIPER_PDFLIP_OWNED_BASE stated
 }
 """
 
@@ -82,7 +82,7 @@ class Editor(unittest.TestCase):
         rows = self.rows(r)
         self.assertEqual(rows["flag:--p-bs"]["value"], "2")
         self.assertEqual(rows["extra:P:--rank-moe-ratio"]["value"], "183,137,168")
-        self.assertEqual(rows["env:P:SGLANG_MOE_SCRATCH_SLOTS"]["value"], "74,48,48")
+        self.assertEqual(rows["env:P:FLLIPER_MOE_SCRATCH_SLOTS"]["value"], "74,48,48")
         for k in rows:
             self.assertEqual(rows[k]["origin"], "profil", k)
         ex = rows["flag:--pp-stage-ratio"]["explain"]
@@ -117,11 +117,11 @@ class Editor(unittest.TestCase):
         self.assertEqual(x["filename"], "demo.env")
         self.assertIsNone(x["use"]["force_env"])            # 2002 B: die Force-Zeile gibt es nur nach einem Trockenlauf mit forcebaren Ablehnungen
         self.assertEqual(x["use"]["force"]["fall"], "kein_trockenlauf")
-        e = self.ed.edit(r["doc"], [{"key": "env:P:SGLANG_MOE_SCRATCH_SLOTS", "op": "set", "value": "80,50,50"},
+        e = self.ed.edit(r["doc"], [{"key": "env:P:FLLIPER_MOE_SCRATCH_SLOTS", "op": "set", "value": "80,50,50"},
                                     {"key": "extra:D:--rank-gpu-memory-mib", "op": "set", "value": "26000,17000,17000"}])
         x2 = self.ed.export_env(e["doc"])
         self.assertTrue(x2["verified"], x2["problems"])
-        self.assertIn("SGLANG_MOE_SCRATCH_SLOTS=80,50,50", x2["env"])
+        self.assertIn("FLLIPER_MOE_SCRATCH_SLOTS=80,50,50", x2["env"])
         self.assertIn("--rank-gpu-memory-mib 26000,17000,17000", x2["env"])
 
     def test_dry_run_reference_rig_needs_no_force_except_status(self):

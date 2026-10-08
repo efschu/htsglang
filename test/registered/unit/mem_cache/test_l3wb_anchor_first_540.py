@@ -24,11 +24,11 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache import hicache_storage as HS  # noqa: E402
-from sglang.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.mem_cache import hicache_storage as HS  # noqa: E402
+from flliper.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
@@ -47,7 +47,7 @@ class _KVPage:
 
 @pytest.fixture(autouse=True)
 def _awake_gate():
-    from sglang.srt.mem_cache import l3_write_behind as gate
+    from flliper.srt.mem_cache import l3_write_behind as gate
 
     gate._reset_for_tests()
     yield
@@ -69,10 +69,10 @@ class _Clock:
 
 
 def _backend(tmp_path, monkeypatch):
-    from sglang.srt.mem_cache.storage.file.l3_index import L3Index
-    from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+    from flliper.srt.mem_cache.storage.file.l3_index import L3Index
+    from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "1")
     root = tmp_path / "store"
     root.mkdir(parents=True, exist_ok=True)
     (root / "L3_IDENTITY.json").write_text("{}")
@@ -102,7 +102,7 @@ def _backend(tmp_path, monkeypatch):
     be._evictor.l3_index = idx
     adir = tmp_path / "shm"
     adir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_DIR", str(adir))
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_DIR", str(adir))
     kv = ShmArena(str(adir / f"arena-{TOTAL}.bin"), TOTAL, 2048)
     an = ShmArena(str(adir / f"arena-{A_TOTAL}.bin"), A_TOTAL, 4)
     # the y8r open order: the KV arena first, the anchor arena behind it
@@ -158,7 +158,7 @@ def _run(tmp_path, monkeypatch):
 
 
 def test_the_anchor_page_reaches_l3_on_the_next_pass_while_the_kv_cycle_runs(tmp_path, monkeypatch):
-    monkeypatch.delenv("SGLANG_WEG2_L3_WRITE_BEHIND_ANCHOR_MIN_MIB", raising=False)
+    monkeypatch.delenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_ANCHOR_MIN_MIB", raising=False)
     be, a_stem, passes = _run(tmp_path, monkeypatch)
     assert be._stem_exists(a_stem)                       # RED before 540: never reached
     assert passes[3]["anchor_written"] == 1              # the first pass after it arrived
@@ -168,14 +168,14 @@ def test_the_anchor_page_reaches_l3_on_the_next_pass_while_the_kv_cycle_runs(tmp
 
 
 def test_switch_zero_is_the_open_order_and_starves_the_anchor_arena(tmp_path, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_L3_WRITE_BEHIND_ANCHOR_MIN_MIB", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_ANCHOR_MIN_MIB", "0")
     be, a_stem, passes = _run(tmp_path, monkeypatch)
     assert not be._stem_exists(a_stem)                   # the y8r defect, reproduced
     assert sum(p["anchor_written"] for p in passes) == 0
 
 
 def test_an_already_secured_anchor_page_costs_no_write_on_later_passes(tmp_path, monkeypatch):
-    monkeypatch.delenv("SGLANG_WEG2_L3_WRITE_BEHIND_ANCHOR_MIN_MIB", raising=False)
+    monkeypatch.delenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_ANCHOR_MIN_MIB", raising=False)
     be, kv, an = _backend(tmp_path, monkeypatch)
     a_stem = be._get_suffixed_key("e" * 64 + ".mamba")
     _put(an, a_stem, A_TOTAL, 3)
@@ -187,9 +187,9 @@ def test_an_already_secured_anchor_page_costs_no_write_on_later_passes(tmp_path,
 
 
 def test_the_default_threshold_separates_anchor_from_kv_pages():
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
-    assert envs.SGLANG_WEG2_L3_WRITE_BEHIND_ANCHOR_MIN_MIB.get() == 1
+    assert envs.FLLIPER_PDFLIP_L3_WRITE_BEHIND_ANCHOR_MIN_MIB.get() == 1
     assert HiCacheFile._l3wb_anchor_min_bytes() == 1 << 20
     # 27B: KV page 32 KiB, mamba blob 78446592 B; NF: KV 786 KiB, mamba 56 MiB
     assert 32768 < HiCacheFile._l3wb_anchor_min_bytes() <= 78446592
@@ -199,7 +199,7 @@ def test_the_default_threshold_separates_anchor_from_kv_pages():
 def test_nf_the_anchor_arena_goes_before_a_qsa_backlog(tmp_path, monkeypatch):
     """NF: the QSA index arena goes before KV (pair rule) and its backlog follows KV 1:1, so an
     anchor arena behind QSA would starve the same way. Anchors go first, even before QSA."""
-    monkeypatch.delenv("SGLANG_WEG2_L3_WRITE_BEHIND_ANCHOR_MIN_MIB", raising=False)
+    monkeypatch.delenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_ANCHOR_MIN_MIB", raising=False)
     q_total = 32
     be, kv, an = _backend(tmp_path, monkeypatch)
     be.canonical_qsa_page = CanonicalExtentWindow(q_total, ((0, q_total),), label="qsa")

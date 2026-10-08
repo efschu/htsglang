@@ -10,8 +10,8 @@ from utils import compare_versions, get_repo_root, normalize_version, validate_v
 FILES_TO_UPDATE = [
     Path("python/pyproject.toml"),
     Path("docker/Dockerfile"),
-    Path("python/sglang/srt/entrypoints/engine.py"),
-    Path("python/sglang/srt/utils/common.py"),
+    Path("python/flliper/srt/entrypoints/engine.py"),
+    Path("python/flliper/srt/utils/common.py"),
 ]
 
 

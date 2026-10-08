@@ -1,5 +1,5 @@
 """
-Tests for the execution of separate_reasoning functionality in sglang.
+Tests for the execution of separate_reasoning functionality in flliper.
 
 Usage:
 python3 -m unittest test/lang/test_separate_reasoning_execution.py
@@ -9,9 +9,9 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.lang.interpreter import StreamExecutor
-from sglang.lang.ir import SglGen, SglSeparateReasoning
-from sglang.test.test_utils import CustomTestCase
+from flliper.lang.interpreter import StreamExecutor
+from flliper.lang.ir import SglGen, SglSeparateReasoning
+from flliper.test.test_utils import CustomTestCase
 
 
 # Helper function to create events that won't block program exit
@@ -62,7 +62,7 @@ class TestSeparateReasoningExecution(CustomTestCase):
         for ev in self.events:
             ev.set()
 
-    @patch("sglang.srt.parser.reasoning_parser.ReasoningParser")
+    @patch("flliper.srt.parser.reasoning_parser.ReasoningParser")
     def test_execute_separate_reasoning(self, mock_parser_class):
         """Test that _execute_separate_reasoning correctly calls the ReasoningParser."""
         # Setup mock parser
@@ -134,7 +134,7 @@ class TestSeparateReasoningExecution(CustomTestCase):
         # Verify that the text was updated
         self.assertEqual(executor.text_, f"[NORMAL from deepseek-r1]: {var_value}")
 
-    @patch("sglang.srt.parser.reasoning_parser.ReasoningParser")
+    @patch("flliper.srt.parser.reasoning_parser.ReasoningParser")
     def test_reasoning_parser_integration(self, mock_parser_class):
         """Test the integration between separate_reasoning and ReasoningParser."""
         # Setup mock parsers for different model types
@@ -165,7 +165,7 @@ class TestSeparateReasoningExecution(CustomTestCase):
         self.assertEqual(reasoning, f"[REASONING from qwen3]: {test_text}")
         self.assertEqual(normal_text, f"[NORMAL from qwen3]: {test_text}")
 
-    @patch("sglang.srt.parser.reasoning_parser.ReasoningParser")
+    @patch("flliper.srt.parser.reasoning_parser.ReasoningParser")
     def test_reasoning_parser_invalid_model(self, mock_parser_class):
         """Test that ReasoningParser raises an error for invalid model types."""
 

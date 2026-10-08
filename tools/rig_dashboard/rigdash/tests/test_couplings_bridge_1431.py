@@ -1,7 +1,7 @@
 """PROFIL-EDITOR S4a (Auftrag 1431): die Verdrahtung der Kopplungs-Engine im Dashboard-Brückenprozess.
 
-Das Dashboard rechnet nichts selbst (kein sglang-Import, MemoryMax=1G): ``kartenplan_build.bridge.couplings`` startet den Kindprozess
-``runner.py`` (op ``couplings``) mit dem Python der sglang-Umgebung; der ruft ``sglang.srt.planner.profile_couplings.run``.
+Das Dashboard rechnet nichts selbst (kein flliper-Import, MemoryMax=1G): ``kartenplan_build.bridge.couplings`` startet den Kindprozess
+``runner.py`` (op ``couplings``) mit dem Python der flliper-Umgebung; der ruft ``flliper.srt.planner.profile_couplings.run``.
 
 Gepinnt:
 * gegen einen Planer-Baum OHNE das Modul (der vendorte Fixture-Baum) antwortet die Brücke benannt ``fehlt im Planer-Baum``, kein Absturz,
@@ -28,16 +28,16 @@ REAL_TREE = os.environ.get("COUPLINGS_TREE")
 SETUP_SCRIPT = r"""
 import json, os, sys
 sys.path.insert(0, sys.argv[1])
-from sglang.srt.planner import profile_couplings as PC
-from sglang.srt.weg2 import model_profile as MP
-fx = os.path.join(sys.argv[1], "..", "test", "registered", "unit", "weg2", "fixtures", "profil_s3_1003", sys.argv[2])
+from flliper.srt.planner import profile_couplings as PC
+from flliper.srt.pdflip import model_profile as MP
+fx = os.path.join(sys.argv[1], "..", "test", "registered", "unit", "pdflip", "fixtures", "profil_s3_1003", sys.argv[2])
 hw = PC.synthetic_hardware([("NVIDIA GeForce RTX 5090", 32607, 1400.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0)])
 print(json.dumps({"hw": hw, "model": MP.estimate(os.path.abspath(fx))}))
 """
 
 
 def profiles_via_subprocess(tree, fixture):
-    """Hardware- und Modellprofil im KINDPROZESS bauen: der Dashboard-Testprozess darf sglang nicht importieren
+    """Hardware- und Modellprofil im KINDPROZESS bauen: der Dashboard-Testprozess darf flliper nicht importieren
     (test_modellprofil_960::test_tree_is_found_by_file_path_not_by_import)."""
     p = subprocess.run([sys.executable, "-c", SETUP_SCRIPT, tree, fixture], capture_output=True, text=True, timeout=120,
                        env=dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONWARNINGS="ignore"))

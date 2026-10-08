@@ -4,14 +4,14 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.utils import get_ci_test_range
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
-def sglang_jit_fused_add_rmsnorm(
+def flliper_jit_fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -19,7 +19,7 @@ def sglang_jit_fused_add_rmsnorm(
     *,
     cast_x_before_out_mul: bool = False,
 ) -> None:
-    from sglang.jit_kernel.norm import fused_add_rmsnorm
+    from flliper.jit_kernel.norm import fused_add_rmsnorm
 
     fused_add_rmsnorm(
         input, residual, weight, eps, cast_x_before_out_mul=cast_x_before_out_mul
@@ -77,11 +77,11 @@ def test_fused_add_rmsnorm(
     residual = torch.randn(batch_size, hidden_size, device=DEVICE, dtype=DTYPE)
     weight = torch.randn(hidden_size, device=DEVICE, dtype=DTYPE)
 
-    input_sglang = input.clone()
-    residual_sglang = residual.clone()
-    sglang_jit_fused_add_rmsnorm(
-        input_sglang,
-        residual_sglang,
+    input_flliper = input.clone()
+    residual_flliper = residual.clone()
+    flliper_jit_fused_add_rmsnorm(
+        input_flliper,
+        residual_flliper,
         weight,
         EPS,
         cast_x_before_out_mul=cast_x_before_out_mul,
@@ -97,8 +97,8 @@ def test_fused_add_rmsnorm(
         flashinfer_fused_add_rmsnorm(input_ref, residual_ref_buf, weight, EPS)
         out_ref, residual_ref = input_ref, residual_ref_buf
 
-    torch.testing.assert_close(input_sglang, out_ref, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(residual_sglang, residual_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(input_flliper, out_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(residual_flliper, residual_ref, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

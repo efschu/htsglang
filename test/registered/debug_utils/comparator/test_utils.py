@@ -4,8 +4,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.output_types import SummaryRecord
-from sglang.srt.debug_utils.comparator.utils import (
+from flliper.srt.debug_utils.comparator.output_types import SummaryRecord
+from flliper.srt.debug_utils.comparator.utils import (
     Pair,
     argmax_coord,
     auto_descend_dir,
@@ -15,7 +15,7 @@ from sglang.srt.debug_utils.comparator.utils import (
     compute_smaller_dtype,
     try_unify_shape,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")

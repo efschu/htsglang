@@ -52,13 +52,13 @@ import tokenize
 import unittest
 from typing import Dict, List, Tuple
 
-import sglang
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-SRT_ROOT = os.path.join(os.path.dirname(os.path.abspath(sglang.__file__)), "srt")
+SRT_ROOT = os.path.join(os.path.dirname(os.path.abspath(flliper.__file__)), "srt")
 
 #: Words that are German and are not also English. Deliberately not a
 #: dictionary: a broad list would fire on "gross size" (English, and correct

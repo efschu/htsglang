@@ -25,16 +25,16 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
-from sglang.srt.planner.card_library import CardSpec, CardLibrary
-from sglang.srt.planner.roofline import (
+from flliper.srt.planner.hardware import GpuDescriptor, HardwareSpec
+from flliper.srt.planner.card_library import CardSpec, CardLibrary
+from flliper.srt.planner.roofline import (
     IDLE_FRACTION_OF_TDP,
     ROOFLINE_PROVENANCE,
     RooflineEnergyEstimate,
     estimate_roofline,
     roofline_energy,
 )
-from sglang.srt.uneven_perf import PlanInputs
+from flliper.srt.uneven_perf import PlanInputs
 
 
 def _tiny_model_dir() -> str:
@@ -252,7 +252,7 @@ class TestEnergyNeverMeasured(unittest.TestCase):
     or masquerade as a measurement."""
 
     def test_rejected_by_results_store(self):
-        from sglang.srt.planner.results_store import (
+        from flliper.srt.planner.results_store import (
             IngestRejected,
             QuantDescriptor,
             ResultEntry,

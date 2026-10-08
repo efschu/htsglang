@@ -25,16 +25,16 @@ CPU only: this is pure integer partition arithmetic, no device involved.
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     set_tp_partition_ratios,
 )
-from sglang.srt.layers.attention.triton_backend import (
+from flliper.srt.layers.attention.triton_backend import (
     _plan_aware_dcp_gathered_q_heads,
     _plan_aware_num_q_heads,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -63,7 +63,7 @@ class _Parallel:
 
 def _gathered_for_rank(cfg, tp_size, rank, dcp_size):
     with mock.patch(
-        "sglang.srt.layers.attention.triton_backend.get_parallel",
+        "flliper.srt.layers.attention.triton_backend.get_parallel",
         return_value=_Parallel(tp_size, rank),
     ):
         return _plan_aware_dcp_gathered_q_heads(cfg, dcp_size)
@@ -71,7 +71,7 @@ def _gathered_for_rank(cfg, tp_size, rank, dcp_size):
 
 def _local_for_rank(cfg, tp_size, rank):
     with mock.patch(
-        "sglang.srt.layers.attention.triton_backend.get_parallel",
+        "flliper.srt.layers.attention.triton_backend.get_parallel",
         return_value=_Parallel(tp_size, rank),
     ):
         return _plan_aware_num_q_heads(cfg)

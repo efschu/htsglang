@@ -14,7 +14,7 @@
 """#824 W4a: the chain wait aborts on STATE, never on a clock.
 
 W4a made the chain receive bounded, named and resumable, but left its
-automatic abort off: SGLANG_PP_CHAIN_RECV_STALL_S defaults to 0, and that
+automatic abort off: FLLIPER_PP_CHAIN_RECV_STALL_S defaults to 0, and that
 default stays. It has to. An idle PP rank legitimately blocks in this
 receive until a request arrives, so there is NO duration that separates
 "idle" from "wedged" -- a wall-clock default would SIGQUIT a healthy idle
@@ -63,7 +63,7 @@ class _Counters:
 
 
 def _holder(attempted=0, consumed=0, counters=True, upstream=0):
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     s = SimpleNamespace()
     s.pp_flip_counters = _Counters(attempted, consumed) if counters else None
@@ -91,7 +91,7 @@ class _StallingChain:
         self.recv_calls = 0
 
     def recv(self):
-        from sglang.srt.managers.pp_chain_receiver import PpChainRecvStalled
+        from flliper.srt.managers.pp_chain_receiver import PpChainRecvStalled
 
         self.recv_calls += 1
         if self.remaining > 0:
@@ -101,7 +101,7 @@ class _StallingChain:
 
 
 def _receiver(chain, service=None):
-    from sglang.srt.managers.scheduler_components.request_receiver import (
+    from flliper.srt.managers.scheduler_components.request_receiver import (
         SchedulerRequestReceiver,
     )
 
@@ -125,7 +125,7 @@ def test_a_stall_is_serviced_once_and_the_receive_resumes():
 
 def test_a_stall_that_servicing_cannot_clear_is_re_raised():
     """Spinning here would replace a loud wedge with a silent one."""
-    from sglang.srt.managers.pp_chain_receiver import PpChainRecvStalled
+    from flliper.srt.managers.pp_chain_receiver import PpChainRecvStalled
 
     chain = _StallingChain(stalls=99)
     turns = []
@@ -140,7 +140,7 @@ def test_a_stall_that_servicing_cannot_clear_is_re_raised():
 def test_without_a_service_hook_the_stall_propagates_unchanged():
     """A boot without the flip installs no hook and must keep the pre-#824
     behaviour exactly."""
-    from sglang.srt.managers.pp_chain_receiver import PpChainRecvStalled
+    from flliper.srt.managers.pp_chain_receiver import PpChainRecvStalled
 
     chain = _StallingChain(stalls=1)
     rr = _receiver(chain, service=None)

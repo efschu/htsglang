@@ -29,7 +29,7 @@ class EvalArgs:
     seed: int = 42
     split: str = "validation"
     image_pixels_limit: int = -1
-    result_filename: str = f"./val_sglang.json"
+    result_filename: str = f"./val_flliper.json"
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
     extra_request_body: Optional[str] = None

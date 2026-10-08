@@ -22,7 +22,7 @@ path, which is why the corridor verdict has been reporting ``net == raw``.
 
 ROOT CAUSE, an ORDERING defect introduced by #781. The predicate
 ``parallel_state.should_build_barlink`` (parallel_state.py:489) is
-``bool(envs.SGLANG_BARLINK.get()) and world_size > 1``. Before #781 the boot
+``bool(envs.FLLIPER_BARLINK.get()) and world_size > 1``. Before #781 the boot
 script set that variable, so it was true by the time the ledger ran. #781 made
 ``--barlink`` the source of truth and the environment an internal detail this
 process publishes from its own argv -- but it published in
@@ -39,8 +39,8 @@ import inspect
 import os
 import re
 
-from sglang.srt import server_args as sa_mod
-from sglang.srt.mem_ledger import engine as ledger_engine
+from flliper.srt import server_args as sa_mod
+from flliper.srt.mem_ledger import engine as ledger_engine
 
 REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
@@ -66,7 +66,7 @@ def test_the_781_flags_are_published_before_the_ledger_prices_them():
     assert ledger != -1, "the ledger-bearing call vanished from __post_init__"
     assert publish < ledger, (
         "the #781 flags must be published BEFORE the VRAM ledger prices the "
-        "NCCL term, or should_build_barlink() reads an unset SGLANG_BARLINK "
+        "NCCL term, or should_build_barlink() reads an unset FLLIPER_BARLINK "
         "and the ledger refuses over communicator buffers that barlink means "
         "are never allocated (#786)"
     )
@@ -120,13 +120,13 @@ def test_the_early_publish_is_narrow_and_idempotent():
 def test_the_full_publisher_delegates_rather_than_duplicating():
     """One definition: the late publisher must call the same helper.
 
-    Two copies of ``os.environ["SGLANG_BARLINK"] = ...`` would let the early
+    Two copies of ``os.environ["FLLIPER_BARLINK"] = ...`` would let the early
     and late values diverge, which is the failure this whole ticket is about.
     """
     src = inspect.getsource(sa_mod.ServerArgs._publish_promoted_781_flags)
     assert "_publish_barlink_ownership_env()" in src
     assert (
-        'os.environ["SGLANG_BARLINK"]' not in src
+        'os.environ["FLLIPER_BARLINK"]' not in src
     ), "the barlink publish is duplicated instead of delegated"
 
 

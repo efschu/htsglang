@@ -13,27 +13,27 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.video_enhance.chain import ChainRequest
-from sglang.srt.video_enhance.engine_cache import (
+from flliper.srt.video_enhance.chain import ChainRequest
+from flliper.srt.video_enhance.engine_cache import (
     EngineCache,
     EngineKey,
     ShapeTriplet,
     sha256_file,
 )
-from sglang.srt.video_enhance.frame_math import (
+from flliper.srt.video_enhance.frame_math import (
     R4K,
     R1080P,
     MIB,
     PixelFormat,
     Resolution,
 )
-from sglang.srt.video_enhance.frames import Frame
-from sglang.srt.video_enhance.parity import DEFAULT_PSNR_DB, grade, psnr, ssim
-from sglang.srt.video_enhance.resize import ResizeStage, lanczos3_resize
-from sglang.srt.video_enhance.server import EnhanceRequestBody
-from sglang.srt.video_enhance.tenant import TenantConfig, TenantConfigError, plan_job
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.video_enhance.frames import Frame
+from flliper.srt.video_enhance.parity import DEFAULT_PSNR_DB, grade, psnr, ssim
+from flliper.srt.video_enhance.resize import ResizeStage, lanczos3_resize
+from flliper.srt.video_enhance.server import EnhanceRequestBody
+from flliper.srt.video_enhance.tenant import TenantConfig, TenantConfigError, plan_job
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 

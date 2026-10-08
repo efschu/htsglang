@@ -4,8 +4,8 @@ as the local gate.
 Metal gmps7 (dkr27bnvfp4dual1mbar1fs10011748, group D TP=3, 17:52:27-17:52:56):
 every P hand-back whose span beyond D's match was below the prefetch threshold
 (256) was refused ``#915 PREFETCH REFUSED reason=vote_negative`` although all
-three ranks probed it present (H108 PRESENCE-PROBE present=True): weg2-0-6
-need=24, weg2-0-10 need=40. The scheduler passes ``min_tokens=1`` for a
+three ranks probed it present (H108 PRESENCE-PROBE present=True): pdflip-0-6
+need=24, pdflip-0-10 need=40. The scheduler passes ``min_tokens=1`` for a
 hand-back (handback_claim.handback_min_tokens) and the LOCAL gate honoured it
 (``_min_len``), but the group vote compared ``group_len`` with the bare
 ``prefetch_threshold`` -> W31 -> W50 -> P ran leg 1 twice -> W53/503. Same code on
@@ -25,8 +25,8 @@ import types
 
 import pytest
 
-from sglang.srt.mem_cache import unified_radix_cache as urc
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache import unified_radix_cache as urc
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -63,7 +63,7 @@ def _read(cache, rid, need, min_tokens):
     return rid in cache.ongoing_prefetch
 
 
-@pytest.mark.parametrize("rid,need", [("weg2-0-6", 24), ("weg2-0-10", 40)])
+@pytest.mark.parametrize("rid,need", [("pdflip-0-6", 24), ("pdflip-0-10", 40)])
 def test_a_short_handback_span_registers_through_the_group_vote(rid, need, prefetch=None):
     cache, reduces = _group(prefetch)
     assert _read(cache, rid, need, min_tokens=1), (
@@ -74,13 +74,13 @@ def test_a_short_handback_span_registers_through_the_group_vote(rid, need, prefe
 
 def test_without_min_tokens_the_group_still_refuses_below_the_threshold():
     cache, reduces = _group()
-    assert not _read(cache, "weg2-0-6", 24, min_tokens=None)
+    assert not _read(cache, "pdflip-0-6", 24, min_tokens=None)
     assert "prefetch_participation_vote" in reduces
 
 
 def test_at_the_threshold_the_default_read_registers():
     cache, _ = _group()
-    assert _read(cache, "weg2-0-1", THRESHOLD, min_tokens=None)
+    assert _read(cache, "pdflip-0-1", THRESHOLD, min_tokens=None)
 
 
 def _mutant_threshold_vote():
@@ -100,4 +100,4 @@ def _mutant_threshold_vote():
 def test_the_threshold_mutant_turns_the_short_handback_test_red():
     mutant = _mutant_threshold_vote()
     with pytest.raises(AssertionError):
-        test_a_short_handback_span_registers_through_the_group_vote("weg2-0-10", 40, prefetch=mutant)
+        test_a_short_handback_span_registers_through_the_group_vote("pdflip-0-10", 40, prefetch=mutant)

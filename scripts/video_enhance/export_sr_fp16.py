@@ -48,8 +48,8 @@ import sys
 import time
 from pathlib import Path
 
-from sglang.srt.video_enhance.engine_cache import sha256_file
-from sglang.srt.video_enhance.frame_math import Resolution
+from flliper.srt.video_enhance.engine_cache import sha256_file
+from flliper.srt.video_enhance.frame_math import Resolution
 
 FP16_SUFFIX = "_fp16.onnx"
 #: Sidecar next to the derived artifact. A derived file has no upstream hash
@@ -292,9 +292,9 @@ def grade(
     """
     import torch
 
-    from sglang.srt.video_enhance.backends import OnnxRuntimeBackend
-    from sglang.srt.video_enhance.engine_cache import ShapeTriplet
-    from sglang.srt.video_enhance.parity import grade as grade_pair
+    from flliper.srt.video_enhance.backends import OnnxRuntimeBackend
+    from flliper.srt.video_enhance.engine_cache import ShapeTriplet
+    from flliper.srt.video_enhance.parity import grade as grade_pair
 
     results: list[dict] = []
     for resolution in resolutions:
@@ -351,7 +351,7 @@ def grade(
 
 
 def main(argv: list[str] | None = None) -> int:
-    from sglang.srt.video_enhance.sr import REALESR_GENERAL_WDN_X4V3, fetch_model
+    from flliper.srt.video_enhance.sr import REALESR_GENERAL_WDN_X4V3, fetch_model
 
     parser = argparse.ArgumentParser(description="#339 fp16 SR artifact + parity")
     parser.add_argument("--model-dir", default="/spinning/llm_stuff/k3-models/sr")

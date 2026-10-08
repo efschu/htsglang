@@ -3,10 +3,10 @@ import argparse
 import torch
 import triton
 
-from sglang.kernels.ops.attention.decode_attention import (
+from flliper.kernels.ops.attention.decode_attention import (
     decode_attention_fwd_grouped,
 )
-from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
+from flliper.kernels.ops.attention.extend_attention import extend_attention_fwd
 
 # gpt oss
 head_num = 64

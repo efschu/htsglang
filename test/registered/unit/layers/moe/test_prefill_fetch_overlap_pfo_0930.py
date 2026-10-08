@@ -20,7 +20,7 @@ Gewichte AUS DEN SLOTS liest -- ein falscher Slot gibt ein falsches Ergebnis):
 * ``_fetch`` ohne ``stream`` bleibt der alte Aufruf (gibt None, gleiche Kopien).
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -32,9 +32,9 @@ from unittest import mock
 import numpy as np
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.test.test_utils import CustomTestCase
 
 E, R, S, K, H = 48, 8, 6, 4, 3
 
@@ -124,7 +124,7 @@ class TestBitIdentical(CustomTestCase):
     def test_overlap_equals_serial_and_the_true_moe(self):
         for T, seed in ((40, 1), (64, 2), (9, 3)):
             ids, disp, want = _case(T, seed)
-            with envs.SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP.override(False):
+            with envs.FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP.override(False):
                 serial, sw = _run(_cache(), ids, disp)
             fetched = []
             c = _cache()
@@ -135,7 +135,7 @@ class TestBitIdentical(CustomTestCase):
                 return _f(plan, join=join, stream=stream, after=after)
 
             c._fetch = spy
-            with envs.SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP.override(True):
+            with envs.FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP.override(True):
                 over, _ = _run(c, ids, disp)
             self.assertTrue(torch.equal(over.hidden_states, serial.hidden_states), (T, seed))
             torch.testing.assert_close(serial.hidden_states, want, rtol=0, atol=1e-12)
@@ -149,9 +149,9 @@ class TestBitIdentical(CustomTestCase):
 
     def test_not_taken_outside_its_case(self):
         c = _cache()
-        with envs.SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP.override(False):
+        with envs.FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP.override(False):
             self.assertIsNone(eo.prefill_fetch_overlap_form(c, None, 5))
-        with envs.SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP.override(True):
+        with envs.FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP.override(True):
             self.assertIsNotNone(eo.prefill_fetch_overlap_form(c, None, 5))
             self.assertIsNone(eo.prefill_fetch_overlap_form(c, {0: None}, 5))   # H107 slot plans
             self.assertIsNone(eo.prefill_fetch_overlap_form(_cache(scratch=1), None, 5))
@@ -160,7 +160,7 @@ class TestBitIdentical(CustomTestCase):
                 self.assertIsNone(eo.prefill_fetch_overlap_form(c, None, 5))
 
     def test_switch_default_off(self):
-        self.assertFalse(envs.SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP.get())
+        self.assertFalse(envs.FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP.get())
 
 
 class TestStreamOrder(CustomTestCase):
@@ -239,7 +239,7 @@ class TestDecodeUntouched(CustomTestCase):
         seen = {}
         c._run_single_wave = lambda d, f, ids_list, prefetch: seen.update(n=len(ids_list))
         ids, disp, _ = _case(16, 5)
-        with envs.SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP.override(True), \
+        with envs.FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP.override(True), \
                 mock.patch.object(eo, "prefill_fetch_overlap_form",
                                   side_effect=AssertionError("PFO asked on a single wave")):
             c._run_waves_vector(disp, apply_fn=None, lookahead=None)

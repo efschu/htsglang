@@ -8,7 +8,7 @@ import pathlib
 
 
 def test_eagle_worker_v2_has_no_undefined_module_names():
-    path = pathlib.Path(__file__).resolve().parents[2] / "python/sglang/srt/speculative/eagle_worker_v2.py"
+    path = pathlib.Path(__file__).resolve().parents[2] / "python/flliper/srt/speculative/eagle_worker_v2.py"
     tree = ast.parse(path.read_text())
     defined = set(dir(builtins))
     for node in ast.walk(tree):

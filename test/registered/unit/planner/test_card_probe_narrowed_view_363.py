@@ -74,7 +74,7 @@ class _ProbeCache(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
 
     def write(self, uuids, driver=DRIVER, *, mtime=1000, tag="probe"):
-        from sglang.srt.rigmon.card_probe import (  # noqa: PLC0415
+        from flliper.srt.rigmon.card_probe import (  # noqa: PLC0415
             CARD_PROBE_VERSION,
             card_probe_cache_path,
         )
@@ -101,7 +101,7 @@ class _ProbeCache(unittest.TestCase):
 
     def look(self, visible, driver=DRIVER):
         """The lookup as a rank performs it: only the cards IT can see."""
-        from sglang.srt.rigmon.card_probe import (  # noqa: PLC0415
+        from flliper.srt.rigmon.card_probe import (  # noqa: PLC0415
             matching_cached_probe_json,
         )
 
@@ -150,10 +150,10 @@ class TestNarrowedRankCanFindTheProbe(_ProbeCache):
 
     def test_the_readers_both_carry_the_fix(self):
         """The two audit sites of #513, exercised as themselves."""
-        from sglang.srt.planner.rig_profile_source import (  # noqa: PLC0415
+        from flliper.srt.planner.rig_profile_source import (  # noqa: PLC0415
             _latest_card_probe,
         )
-        from sglang.srt.planner.solver_api import cached_card_probe  # noqa: PLC0415
+        from flliper.srt.planner.solver_api import cached_card_probe  # noqa: PLC0415
 
         self.write([A, B, C], tag="rig")
         inv = ([B], DRIVER)
@@ -190,7 +190,7 @@ class TestContainmentDoesNotUndo513(_ProbeCache):
     def test_an_unresolvable_inventory_is_still_a_miss(self):
         """No NVML means no attribution. Containment must not degrade into
         'anything contains nothing, so take the newest file'."""
-        from sglang.srt.rigmon.card_probe import (  # noqa: PLC0415
+        from flliper.srt.rigmon.card_probe import (  # noqa: PLC0415
             matching_cached_probe_json,
         )
 

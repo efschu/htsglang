@@ -14,8 +14,8 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.quantization import nvfp4_sm12x_w4a16 as S
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.quantization import nvfp4_sm12x_w4a16 as S
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -45,7 +45,7 @@ class _Env:
         env = {} if self.value is None else {S.MAX_M_ENV: str(self.value)}
         self._p = [
             mock.patch.dict("os.environ", env, clear=False),
-            mock.patch("sglang.srt.utils.common.get_device_capability", return_value=(self.major, 0)),
+            mock.patch("flliper.srt.utils.common.get_device_capability", return_value=(self.major, 0)),
             mock.patch.object(S, "native_w4a16_kernel_present", return_value=self.present),
         ]
         if self.value is None:
@@ -92,7 +92,7 @@ class TestSeam(unittest.TestCase):
 
     def test_default_off_is_none_and_never_touches_the_device(self):
         with _Env(None, major=12), mock.patch(
-            "sglang.srt.utils.common.get_device_capability", side_effect=AssertionError("no device query when off")
+            "flliper.srt.utils.common.get_device_capability", side_effect=AssertionError("no device query when off")
         ):
             self.assertIsNone(S.maybe_apply_sm12x_w4a16(_layer(), torch.zeros(1, 128, dtype=torch.bfloat16), None, "cutlass"))
 
@@ -164,7 +164,7 @@ class TestModelOptHook(unittest.TestCase):
     def test_apply_calls_the_seam_before_w4a4(self):
         import inspect
 
-        from sglang.srt.layers.quantization import modelopt_quant as MQ
+        from flliper.srt.layers.quantization import modelopt_quant as MQ
 
         src = inspect.getsource(MQ.ModelOptFp4LinearMethod.apply)
         self.assertIn("maybe_apply_sm12x_w4a16", src)

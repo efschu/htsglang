@@ -32,12 +32,12 @@ boot's.
 
 import unittest
 
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     TERM_HARDWARE_RESIDUAL,
     TERM_NCCL_BUFFERS,
     TERM_NVML_CARVE_OUT,
 )
-from sglang.srt.mem_ledger.reconcile import (
+from flliper.srt.mem_ledger.reconcile import (
     ReconcileRefusal,
     marks_by_rank_from_pids,
     reconcile,

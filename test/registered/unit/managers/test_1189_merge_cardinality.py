@@ -67,9 +67,9 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.schedule_batch import ScheduleBatch
+from flliper.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -83,7 +83,7 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 SCHEDULE_BATCH = (
     pathlib.Path(__file__).resolve().parents[4]
     / "python"
-    / "sglang"
+    / "flliper"
     / "srt"
     / "managers"
     / "schedule_batch.py"
@@ -190,7 +190,7 @@ def _batch(
     b.mamba_track_indices = None
     b.mamba_track_mask = None
     b.mamba_track_seqlens = None
-    b.weg2_turn_tracks = None
+    b.pdflip_turn_tracks = None
     b.return_logprob = return_logprob
     b.top_logprobs_nums = [f"{tag}top{i}" for i in range(n)]
     b.token_ids_logprobs = [f"{tag}tid{i}" for i in range(n)]

@@ -34,8 +34,8 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 P = 4
 SLOTS = 16
@@ -48,9 +48,9 @@ CHAIN = ["a0", "a1", "a2", "a3", "a4", "a5"]
 
 @pytest.fixture(params=["ledger", "header"])
 def arena(tmp_path, monkeypatch, request):
-    """``ledger``: SGLANG_HICACHE_ARENA_QUEUE_REFS on (the rig's form, the
+    """``ledger``: FLLIPER_HICACHE_ARENA_QUEUE_REFS on (the rig's form, the
     per-process reference ledger); ``header``: off (the C count alone)."""
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_QUEUE_REFS", "1" if request.param == "ledger" else "0")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_QUEUE_REFS", "1" if request.param == "ledger" else "0")
     a = ShmArena(str(tmp_path / f"arena-kv-{request.param}.bin"), SLOT_BYTES, SLOTS)
     yield a
     a.close()
@@ -71,8 +71,8 @@ def _refs(arena):
     """Every slot's reader references, read from the headers (all ranks)."""
     out = (ctypes.c_int64 * 6)()
     arena._lib.arena_layout(arena.slots, arena.slot_bytes, out)
-    hb, hoff = int(out[0]), int(out[3])
-    u32 = np.frombuffer(arena._mm, dtype=np.uint32, count=arena.slots * hb // 4, offset=hoff)
+    hb, hope = int(out[0]), int(out[3])
+    u32 = np.frombuffer(arena._mm, dtype=np.uint32, count=arena.slots * hb // 4, offset=hope)
     return u32.reshape(arena.slots, hb // 4)[:, 1].astype(np.int64).tolist()
 
 
@@ -212,7 +212,7 @@ def test_a_slot_this_process_holds_no_reference_on_is_never_released(tmp_path, m
     process references (another rank's reader), this process holds none there
     -- the re-point gives nothing back, the other holder keeps its
     reference, the ledger refuses nothing."""
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_QUEUE_REFS", "1")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_QUEUE_REFS", "1")
     arena = ShmArena(str(tmp_path / "arena-kv-foreign.bin"), SLOT_BYTES, SLOTS)
     try:
         slot_of = _publish(arena, CHAIN + ["zz"])
@@ -239,8 +239,8 @@ def _tree(arena, slot_of):
     takes (the resolve's +1 per page)."""
     import queue as _queue
 
-    from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     FULL = ComponentType.FULL
     pool = _pool(arena)
@@ -263,7 +263,7 @@ def _tree(arena, slot_of):
     t.root_node = root
     t.ongoing_prefetch = {"r1": rec}
     t._retired_prefetch = []
-    t._weg2_carrier_rows = {}
+    t._pdflip_carrier_rows = {}
     t.cache_controller = types.SimpleNamespace(
         host_mem_release_queue=q, mem_pool_host=types.SimpleNamespace(arena_read=True))
     return t, pool
@@ -274,18 +274,18 @@ def test_holder_census_names_every_class_and_the_gap(tmp_path, monkeypatch):
     tree 2 + in use 1 + prefetch 1 + queue 1 = own_held 5, gap 0; a reference
     no holder names (taken outside every class) shows as gap 1; another arena
     gets no line."""
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_QUEUE_REFS", "1")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_QUEUE_REFS", "1")
     arena = ShmArena(str(tmp_path / "arena-kv-census.bin"), SLOT_BYTES, SLOTS)
     other = ShmArena(str(tmp_path / "arena-other.bin"), SLOT_BYTES, SLOTS)
     try:
         slot_of = _publish(arena, CHAIN)
         t, _p = _tree(arena, slot_of)
-        line = t.weg2_arena_holder_census(arena)
+        line = t.pdflip_arena_holder_census(arena)
         assert ("pool=FULL tree=2 tree_in_use=1 prefetch=1 retired=0 queue=1 carrier=0 dormant_hold=0 "
                 "sum=5 own_held=5 gap=0") in line, line
         assert arena.ref_slots([slot_of["a0"]], +1) == 1          # nobody's class
-        assert "gap=1" in t.weg2_arena_holder_census(arena)
-        assert t.weg2_arena_holder_census(other) is None
+        assert "gap=1" in t.pdflip_arena_holder_census(arena)
+        assert t.pdflip_arena_holder_census(other) is None
     finally:
         other.close()
         arena.close()
@@ -296,14 +296,14 @@ def test_census_thread_logs_the_holder_line(tmp_path, monkeypatch, caplog):
     ARENA-REF-HOLDERS line next to ARENA-REF-CENSUS, no round path."""
     import logging
 
-    from sglang.srt.mem_cache.storage.file import hicache_arena as ha
+    from flliper.srt.mem_cache.storage.file import hicache_arena as ha
 
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_QUEUE_REFS", "1")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_QUEUE_REFS", "1")
     arena = ShmArena(str(tmp_path / "arena-kv-thread.bin"), SLOT_BYTES, SLOTS)
     try:
         slot_of = _publish(arena, CHAIN)
         t, _p = _tree(arena, slot_of)
-        ha.register_holder_census(t.weg2_arena_holder_census)
+        ha.register_holder_census(t.pdflip_arena_holder_census)
         with caplog.at_level(logging.INFO):
             lines = ha._holder_lines(arena)
         assert any("sum=5 own_held=5 gap=0" in x for x in lines), lines
@@ -318,7 +318,7 @@ def test_reset_names_the_skipped_in_use_node_and_releases_the_rest(tmp_path, mon
     reset)."""
     import logging
 
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_QUEUE_REFS", "1")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_QUEUE_REFS", "1")
     arena = ShmArena(str(tmp_path / "arena-kv-reset.bin"), SLOT_BYTES, SLOTS)
     try:
         slot_of = _publish(arena, CHAIN)

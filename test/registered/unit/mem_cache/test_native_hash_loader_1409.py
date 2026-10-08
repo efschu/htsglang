@@ -12,7 +12,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest
 
-from sglang.srt.mem_cache.cpp_utils import native_hash as nh
+from flliper.srt.mem_cache.cpp_utils import native_hash as nh
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 

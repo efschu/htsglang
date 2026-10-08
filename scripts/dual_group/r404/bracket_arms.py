@@ -28,7 +28,7 @@ WHAT MOVED, and why each move is the one the previous window asked for:
    ladder), so the deterministic one carries the verdict and the adaptive one
    says whether the policy reaches the same shape on its own.
 
-3. THE POOL CHECKSUM. With ``SGLANG_LANE_POOL_CHECKSUM=1`` on the server every
+3. THE POOL CHECKSUM. With ``FLLIPER_LANE_POOL_CHECKSUM=1`` on the server every
    arm carries per-round digests of the committed slot mapping, the committed
    KV rows and the committed conv/ssm state. ``pool_checksum_diff`` reads them
    two ways -- append-only within the arm, and against the arm's own no-spec

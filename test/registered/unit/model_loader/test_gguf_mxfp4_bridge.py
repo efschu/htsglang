@@ -2,7 +2,7 @@
 """#391 blocker 1: is the GGUF MXFP4 block bridgeable to an executable path?
 
 The published DeepSeek V4 Flash GGUF stores every routed ``down`` projection as
-GGML type 39 (MXFP4), 47.8 GiB of the 119.4 GiB file. sglang has no MXFP4 GGUF
+GGML type 39 (MXFP4), 47.8 GiB of the 119.4 GiB file. flliper has no MXFP4 GGUF
 kernel. This module answers, executably, the only question that decides which
 repair is cheapest: *what exactly is in an MXFP4 block, and which existing
 contracts can consume it without loss?*
@@ -53,9 +53,9 @@ import torch
 from gguf.constants import GGMLQuantizationType as GGMLType
 from gguf.quants import dequantize, quantize
 
-from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.model_loader.gguf_mxfp4_repack import repacked_gguf_bytes
-from sglang.test.gguf_mxfp4_state import ForcesRepackPath
+from flliper.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from flliper.srt.model_loader.gguf_mxfp4_repack import repacked_gguf_bytes
+from flliper.test.gguf_mxfp4_state import ForcesRepackPath
 
 #: llama.cpp's ``kvalues_mxfp4`` (ggml-common.h): the E2M1 lattice, doubled so
 #: it fits in int8. Indexed by the raw 4-bit code.
@@ -244,7 +244,7 @@ class TestMXFP4IsStillUnexecutable(unittest.TestCase):
 
     #398 built the MXFP4 kernels, so the #391 premise ("no executable MXFP4
     GGUF path") now holds only on a wheel that predates them -- or with
-    ``SGLANG_GGUF_MXFP4_NATIVE=0``. The assertion therefore follows the
+    ``FLLIPER_GGUF_MXFP4_NATIVE=0``. The assertion therefore follows the
     build's own capability flag instead of being a constant. Both states are
     exercised in-process by
     ``test/registered/unit/quantization/test_gguf_mxfp4_native.py``
@@ -253,7 +253,7 @@ class TestMXFP4IsStillUnexecutable(unittest.TestCase):
     """
 
     def test_mxfp4_type_set_membership_follows_the_kernel_capability(self):
-        from sglang.srt.layers.quantization.gguf import (
+        from flliper.srt.layers.quantization.gguf import (
             DEQUANT_TYPES,
             MMQ_QUANT_TYPES,
             MMVQ_QUANT_TYPES,
@@ -277,7 +277,7 @@ class TestMXFP4IsStillUnexecutable(unittest.TestCase):
             )
 
     def test_q5_0_is_executable_everywhere_mxfp4_would_need_to_be(self):
-        from sglang.srt.layers.quantization.gguf import (
+        from flliper.srt.layers.quantization.gguf import (
             DEQUANT_TYPES,
             MMQ_QUANT_TYPES,
             MMVQ_QUANT_TYPES,

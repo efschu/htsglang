@@ -49,7 +49,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import kv_backing_relief as kbr
 
 MIB = 1024 * 1024
 
@@ -559,7 +559,7 @@ class TheRungShrinksOnOneLegOnlyTest(unittest.TestCase):
     """
 
     def _sched_with_relief(self):
-        from sglang.srt.managers import phase_flip_spill as pfs
+        from flliper.srt.managers import phase_flip_spill as pfs
 
         relief, pool, _alloc, _card = _rank(free_mib=1100, live=(1000,))
         sched = _Sched()
@@ -567,7 +567,7 @@ class TheRungShrinksOnOneLegOnlyTest(unittest.TestCase):
         return sched, pool
 
     def _run(self, direction):
-        from sglang.srt.managers import phase_flip_spill as pfs
+        from flliper.srt.managers import phase_flip_spill as pfs
 
         sched, pool = self._sched_with_relief()
         calls = []
@@ -619,12 +619,12 @@ class TheRungShrinksOnOneLegOnlyTest(unittest.TestCase):
     def test_tp_to_pp_abstains_when_funding_is_disabled(self):
         """The shipped one-leg behaviour, kept as a VALUE of the same term.
 
-        SGLANG_SEAM_FUND_TP_TO_PP=0 restores it exactly, which is what makes
+        FLLIPER_SEAM_FUND_TP_TO_PP=0 restores it exactly, which is what makes
         the metal comparison a one-variable experiment.
         """
         import os
 
-        from sglang.srt.managers import phase_flip_spill as pfs
+        from flliper.srt.managers import phase_flip_spill as pfs
 
         prev = os.environ.get(pfs.ENV_FUND_TP_TO_PP)
         os.environ[pfs.ENV_FUND_TP_TO_PP] = "0"

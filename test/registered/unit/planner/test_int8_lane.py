@@ -26,9 +26,9 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt import uneven_perf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -246,7 +246,7 @@ class TestScoring(CustomTestCase):
         self.assertEqual(len(warnings), 3)
         for warning in warnings:
             self.assertIn("no int8 GEMM lane measured on this card", warning)
-            self.assertIn("SGLANG_PERF_REPROBE=1", warning)
+            self.assertIn("FLLIPER_PERF_REPROBE=1", warning)
         for label in labels:
             self.assertIn("fallback", label)
 

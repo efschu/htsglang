@@ -395,7 +395,7 @@ def smoke() -> int:
         sys.path.insert(
             0, os.path.join(os.path.dirname(__file__), "..", "..", "python")
         )
-        from sglang.srt.managers.regime_stages import load_gate_evidence
+        from flliper.srt.managers.regime_stages import load_gate_evidence
 
         gate = load_gate_evidence(ev)
         print(f"[gate read ] {GATE_KEY} accepted={GATE_KEY in gate.passed}")

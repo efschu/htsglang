@@ -45,18 +45,18 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.layers.moe.offload_capture_gate import (
+from flliper.srt.layers.moe.offload_capture_gate import (
     NO_SERVER_ARGS,
     BreakableModeRefused,
     resolved_backend,
     validate_breakable_boot,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-_GATE = "sglang.srt.layers.moe.offload_capture_gate"
+_GATE = "flliper.srt.layers.moe.offload_capture_gate"
 
 
 def _args(decode=None, prefill=None, has_config=True, disable_cuda_graph=False):
@@ -83,33 +83,33 @@ class _NoArgs:
 
 class TestResolvedBackendSeparatesAbsentFromUnresolved(unittest.TestCase):
     def test_absent_args_answer_the_sentinel(self):
-        with patch("sglang.srt.runtime_context.get_server_args", _NoArgs()):
+        with patch("flliper.srt.runtime_context.get_server_args", _NoArgs()):
             self.assertIs(resolved_backend("decode"), NO_SERVER_ARGS)
 
     def test_present_args_without_a_graph_config_answer_none(self):
         with patch(
-            "sglang.srt.runtime_context.get_server_args",
+            "flliper.srt.runtime_context.get_server_args",
             lambda: _args(has_config=False),
         ):
             self.assertIsNone(resolved_backend("decode"))
 
     def test_present_args_without_a_phase_config_answer_none(self):
         with patch(
-            "sglang.srt.runtime_context.get_server_args",
+            "flliper.srt.runtime_context.get_server_args",
             lambda: _args(prefill="disabled"),
         ):
             self.assertIsNone(resolved_backend("decode"))
 
     def test_a_resolved_backend_is_returned_verbatim(self):
         with patch(
-            "sglang.srt.runtime_context.get_server_args",
+            "flliper.srt.runtime_context.get_server_args",
             lambda: _args(decode="breakable", prefill="disabled"),
         ):
             self.assertEqual(resolved_backend("decode"), "breakable")
 
     def test_disable_cuda_graph_still_wins(self):
         with patch(
-            "sglang.srt.runtime_context.get_server_args",
+            "flliper.srt.runtime_context.get_server_args",
             lambda: _args(decode="breakable", disable_cuda_graph=True),
         ):
             self.assertEqual(resolved_backend("decode"), "disabled")
@@ -123,7 +123,7 @@ class TestValidateBreakableBootNoneArm(unittest.TestCase):
     def test_absent_server_args_still_skip(self):
         """The one situation the bypass was written for keeps working: a unit
         or test context has nothing to validate against."""
-        with patch("sglang.srt.runtime_context.get_server_args", _NoArgs()):
+        with patch("flliper.srt.runtime_context.get_server_args", _NoArgs()):
             validate_breakable_boot(0.5, layer_id=3)
 
     def test_present_args_with_an_unresolved_decode_backend_refuse(self):
@@ -144,7 +144,7 @@ class TestValidateBreakableBootNoneArm(unittest.TestCase):
         for name, args in shapes.items():
             with self.subTest(shape=name):
                 with patch(
-                    "sglang.srt.runtime_context.get_server_args", lambda a=args: a
+                    "flliper.srt.runtime_context.get_server_args", lambda a=args: a
                 ):
                     with self.assertRaises(BreakableModeRefused) as cm:
                         validate_breakable_boot(0.5, layer_id=7)
@@ -156,14 +156,14 @@ class TestValidateBreakableBootNoneArm(unittest.TestCase):
 
     def test_the_covered_shape_still_passes(self):
         with patch(
-            "sglang.srt.runtime_context.get_server_args",
+            "flliper.srt.runtime_context.get_server_args",
             lambda: _args(decode="breakable", prefill="disabled"),
         ):
             validate_breakable_boot(0.5, layer_id=1)
 
     def test_a_wrong_decode_backend_is_still_refused_by_name(self):
         with patch(
-            "sglang.srt.runtime_context.get_server_args",
+            "flliper.srt.runtime_context.get_server_args",
             lambda: _args(decode="full", prefill="disabled"),
         ):
             with self.assertRaises(BreakableModeRefused) as cm:
@@ -172,7 +172,7 @@ class TestValidateBreakableBootNoneArm(unittest.TestCase):
 
     def test_a_captured_prefill_is_still_refused(self):
         with patch(
-            "sglang.srt.runtime_context.get_server_args",
+            "flliper.srt.runtime_context.get_server_args",
             lambda: _args(decode="breakable", prefill="full"),
         ):
             with self.assertRaises(BreakableModeRefused) as cm:
@@ -182,7 +182,7 @@ class TestValidateBreakableBootNoneArm(unittest.TestCase):
     def test_no_offload_is_still_refused_first(self):
         """Precondition 1 fires before anything reads the server args, so it
         must be reachable with no runtime context at all."""
-        with patch("sglang.srt.runtime_context.get_server_args", _NoArgs()):
+        with patch("flliper.srt.runtime_context.get_server_args", _NoArgs()):
             with self.assertRaises(BreakableModeRefused) as cm:
                 validate_breakable_boot(1.0, layer_id=2)
             self.assertIn("resident fraction", str(cm.exception))

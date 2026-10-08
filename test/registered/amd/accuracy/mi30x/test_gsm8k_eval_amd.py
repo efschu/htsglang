@@ -14,10 +14,10 @@ import unittest
 import warnings
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
@@ -242,13 +242,13 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     startup_time = None
                     eval_time = None
 
-                    os.environ["SGLANG_MOE_PADDING"] = (
+                    os.environ["FLLIPER_MOE_PADDING"] = (
                         "0" if model in NO_MOE_PADDING_MODELS else "1"
                     )
                     os.environ["HF_HUB_DISABLE_XET"] = (
                         "1" if model in DISABLE_HF_XET_MODELS else "0"
                     )
-                    os.environ["SGLANG_USE_AITER"] = (
+                    os.environ["FLLIPER_USE_AITER"] = (
                         "0" if model in TRITON_MOE_MODELS else "1"
                     )
 

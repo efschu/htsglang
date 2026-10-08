@@ -12,7 +12,7 @@ dieser Test festhaelt.
 
 import inspect
 
-from sglang.srt.model_executor import model_runner as mr
+from flliper.srt.model_executor import model_runner as mr
 
 
 def _src():
@@ -22,7 +22,7 @@ def _src():
 def test_the_default_is_still_one_thread():
     src = _src()
     assert '_load_threads = 1' in src
-    assert 'os.environ.get("SGLANG_LOAD_INTRAOP_THREADS", "1")' in src
+    assert 'os.environ.get("FLLIPER_LOAD_INTRAOP_THREADS", "1")' in src
     assert "torch.set_num_threads(_load_threads)" in src
 
 
@@ -35,7 +35,7 @@ def test_a_broken_value_falls_back_instead_of_raising():
 
 def test_it_says_so_when_it_deviates():
     src = _src()
-    assert "WEG2 LOAD-INTRAOP" in src
+    assert "PDFLIP LOAD-INTRAOP" in src
     assert "if _load_threads > 1:" in src
 
 

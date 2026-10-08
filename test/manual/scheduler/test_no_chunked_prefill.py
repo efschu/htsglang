@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     run_bench_serving,

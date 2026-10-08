@@ -3,9 +3,9 @@ Lightweight DeepGEMM JIT compilation warmup without loading model weights.
 
 Reads model config.json from HF cache to derive kernel shapes, then compiles
 DeepGEMM kernels directly. This avoids the expensive model weight loading step
-that the full `sglang.compile_deep_gemm` requires.
+that the full `flliper.compile_deep_gemm` requires.
 
-Supports DeepSeek V2/V3 family models. Falls back to `sglang.compile_deep_gemm`
+Supports DeepSeek V2/V3 family models. Falls back to `flliper.compile_deep_gemm`
 for unsupported architectures.
 
 Usage:
@@ -28,12 +28,12 @@ from typing import Dict, List
 
 # Shared with warmup_server.py. Wipe alongside /root/.cache/deep_gemm if you
 # clear the DeepGEMM JIT cache — a stale marker → in-test JIT compile.
-MARKER_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sglang", "warmup_markers")
+MARKER_DIR = os.path.join(os.path.expanduser("~"), ".cache", "flliper", "warmup_markers")
 
 # Outer cap for stuck fallback subprocesses; CRASH_MARKERS abort sooner.
 FALLBACK_TIMEOUT_SEC = 600
 
-# Per-model launch flags forwarded to `sglang.compile_deep_gemm`. DeepGEMM
+# Per-model launch flags forwarded to `flliper.compile_deep_gemm`. DeepGEMM
 # cache key includes per-rank N/K (depends on tp/dp/ep) — must match each
 # model's `other_args` in test/registered/ or warmed shapes won't be hit.
 FALLBACK_ARGS: Dict[str, List[str]] = {
@@ -69,7 +69,7 @@ CRASH_MARKERS = (
 
 # Configure DeepGEMM cache before importing deep_gemm
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR",
+    "FLLIPER_DG_CACHE_DIR",
     os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm"),
 )
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
@@ -113,9 +113,9 @@ def compute_deepseek_v2v3_shapes(config, tp):
     """Compute all DeepGEMM (kernel_type, N, K, num_groups) for DeepSeek V2/V3.
 
     Shape derivation based on:
-    - MoE: python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-    - MLA: python/sglang/srt/models/deepseek_v2.py
-    - FP8: python/sglang/srt/layers/quantization/fp8_kernel.py
+    - MoE: python/flliper/srt/layers/moe/fused_moe_triton/layer.py
+    - MLA: python/flliper/srt/models/deepseek_v2.py
+    - FP8: python/flliper/srt/layers/quantization/fp8_kernel.py
     """
     shapes = []
 
@@ -409,7 +409,7 @@ def write_fallback_marker(model, tp, extra_args):
 
 
 def fallback_compile_deep_gemm(model, tp):
-    """Fall back to full sglang.compile_deep_gemm (loads model weights).
+    """Fall back to full flliper.compile_deep_gemm (loads model weights).
 
     Runs in its own process group so a hung subprocess (e.g. one TP rank
     crashes and the rest deadlock on NCCL collectives) can be killed
@@ -425,7 +425,7 @@ def fallback_compile_deep_gemm(model, tp):
     cmd = [
         sys.executable,
         "-m",
-        "sglang.compile_deep_gemm",
+        "flliper.compile_deep_gemm",
         "--model",
         model,
         "--tp",
@@ -504,7 +504,7 @@ def main():
         model, tp_str = arg.rsplit(":", 1)
         model_tp_pairs.append((model, int(tp_str)))
 
-    fast_warmup = os.environ.get("SGLANG_JIT_DEEPGEMM_FAST_WARMUP", "0").lower() in (
+    fast_warmup = os.environ.get("FLLIPER_JIT_DEEPGEMM_FAST_WARMUP", "0").lower() in (
         "1",
         "true",
     )
@@ -571,7 +571,7 @@ def main():
         print(f"{'=' * 60}")
 
         if shapes is None:
-            # Fallback path: full sglang.compile_deep_gemm with the test's launch
+            # Fallback path: full flliper.compile_deep_gemm with the test's launch
             # flags. Loading model weights inside that subprocess is the dominant
             # cost (45-170s/model) and dwarfs the actual DeepGEMM compile, so we
             # skip the whole fallback when the marker says we already populated

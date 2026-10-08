@@ -14,13 +14,13 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.layers.moe import pinned_host_ledger
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe import pinned_host_ledger
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-_ENV = "SGLANG_PINNED_HOST_LEDGER_DIR"
+_ENV = "FLLIPER_PINNED_HOST_LEDGER_DIR"
 
 
 class PinnedHostLedgerTest(CustomTestCase):
@@ -115,16 +115,16 @@ class PinnedHostLedgerTest(CustomTestCase):
         """
         from unittest import mock
 
-        from sglang.srt.layers.moe import expert_offload
+        from flliper.srt.layers.moe import expert_offload
 
         expert_offload.reset_streaming_staging_ledger()
         self.addCleanup(expert_offload.reset_streaming_staging_ledger)
         expert_offload.streaming_staging_ledger().record(pinned=5 << 30)
 
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         with mock.patch.object(
-            envs.SGLANG_MOE_STAGING_TRACE, "get", lambda: False
+            envs.FLLIPER_MOE_STAGING_TRACE, "get", lambda: False
         ):
             expert_offload.log_streaming_staging_layer("layer0", mock.MagicMock())
 

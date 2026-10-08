@@ -7,7 +7,7 @@ backends like MORI that read expert indices via raw data_ptr() assuming
 a specific dtype (int32).
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -15,12 +15,12 @@ import unittest
 
 import torch
 
-from sglang.srt.eplb.expert_location_dispatch import (
+from flliper.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     _topk_ids_logical_to_physical_dynamic,
     _topk_ids_logical_to_physical_static,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 NUM_LOGICAL = 256
 NUM_PHYSICAL = 256

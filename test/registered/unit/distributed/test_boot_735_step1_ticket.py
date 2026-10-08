@@ -24,9 +24,9 @@ import sys
 import unittest
 from pathlib import Path
 
-from sglang.srt.distributed.utils import PPLayerSetError, parse_pp_layer_sets
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.utils import PPLayerSetError, parse_pp_layer_sets
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

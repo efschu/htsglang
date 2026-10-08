@@ -11,15 +11,15 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.canonical_page_store import CanonicalPageError
-from sglang.srt.mem_cache.qsa_pool_host import (
+from flliper.srt.mem_cache.canonical_page_store import CanonicalPageError
+from flliper.srt.mem_cache.qsa_pool_host import (
     QSAPagedHostPool,
     build_qsa_index_window,
     qsa_index_bytes_per_token,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="stage-a-weg2-unit")
+register_cpu_ci(est_time=3, suite="stage-a-pdflip-unit")
 
 RATIO, PAGE, HEADS, DIM = 4, 64, 1, 128
 
@@ -74,7 +74,7 @@ class QsaIndexSidecar(unittest.TestCase):
             build_qsa_index_window(ids, _pool([4, 8]), host)  # not full-attention ids
 
     def test_storage_routes_the_qsa_key_to_its_window(self):
-        from sglang.srt.mem_cache.hicache_storage import HiCacheFile, PoolName
+        from flliper.srt.mem_cache.hicache_storage import HiCacheFile, PoolName
 
         # the key rules live on the file backend; no __init__ (no store dir)
         backend = HiCacheFile.__new__(HiCacheFile)
@@ -93,8 +93,8 @@ class QsaIndexSidecar(unittest.TestCase):
     def test_draft_install_without_qsa_page_keeps_the_window(self):
         # fnFL2x55: every P stage died at the draft window install, which
         # passes only its own slot -- qsa_page=None must mean "unchanged".
-        from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
-        from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+        from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageError
+        from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 
         backend = HiCacheFile.__new__(HiCacheFile)
         kv = SimpleNamespace(spec=SimpleNamespace(page_bytes=786432),

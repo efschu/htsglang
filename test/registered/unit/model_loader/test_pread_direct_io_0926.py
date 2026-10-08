@@ -20,7 +20,7 @@ from unittest import mock
 import safetensors.torch
 import torch
 
-from sglang.srt.model_loader import weight_utils as wu
+from flliper.srt.model_loader import weight_utils as wu
 
 O_DIRECT = getattr(os, "O_DIRECT", 0o40000)
 
@@ -77,7 +77,7 @@ class PreadDirect(_Base):
         return got, seen
 
     def test_serial_direct_is_byte_identical_and_uses_o_direct(self):
-        with mock.patch.dict(os.environ, {"SGLANG_LOAD_KEY_WORKERS": "1"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_LOAD_KEY_WORKERS": "1"}):
             got, seen = self._flags_seen(direct_io=True)
         self._same(got)
         self.assertTrue(any(f & O_DIRECT for f in seen))
@@ -85,20 +85,20 @@ class PreadDirect(_Base):
             self.assertFalse(wu._DIRECT_FALLBACK_WARNED)
 
     def test_key_parallel_direct_is_byte_identical(self):
-        with mock.patch.dict(os.environ, {"SGLANG_LOAD_KEY_WORKERS": "3"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_LOAD_KEY_WORKERS": "3"}):
             got, seen = self._flags_seen(direct_io=True)
         self._same(got)
         self.assertEqual(sum(1 for f in seen if f & O_DIRECT), 3)
 
     def test_default_never_opens_o_direct(self):
         for kw in ("1", "3"):
-            with mock.patch.dict(os.environ, {"SGLANG_LOAD_KEY_WORKERS": kw}):
+            with mock.patch.dict(os.environ, {"FLLIPER_LOAD_KEY_WORKERS": kw}):
                 got, seen = self._flags_seen()
             self._same(got)
             self.assertFalse(any(f & O_DIRECT for f in seen))
 
     def test_post_load_and_should_load_still_apply(self):
-        with mock.patch.dict(os.environ, {"SGLANG_LOAD_KEY_WORKERS": "1"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_LOAD_KEY_WORKERS": "1"}):
             got = wu.pread_safetensors_file(
                 self.path,
                 should_load=lambda n: "meta" if n == "c.f32" else n != "d.i8",
@@ -118,7 +118,7 @@ class PreadDirect(_Base):
             return real(path, flags, *a)
 
         with mock.patch.object(wu.os, "open", refuse), \
-                mock.patch.dict(os.environ, {"SGLANG_LOAD_KEY_WORKERS": "3"}), \
+                mock.patch.dict(os.environ, {"FLLIPER_LOAD_KEY_WORKERS": "3"}), \
                 self.assertLogs(wu.logger, "WARNING") as cm:
             got = wu.pread_safetensors_file(self.path, direct_io=True)
         self._same(got)
@@ -129,7 +129,7 @@ class MultiThreadIterator(_Base):
     def test_pread_branch_forwards_direct_io(self):
         # 27B-ODIRECT-STREAM 0927: pread + direct_io streams by default (the
         # per-file form held (max_workers + 1) whole shards -> b23 hit its cap);
-        # the stream carries direct_io. SGLANG_WEIGHT_LOADER_PREAD_STREAM=0 keeps
+        # the stream carries direct_io. FLLIPER_WEIGHT_LOADER_PREAD_STREAM=0 keeps
         # the per-file form, which forwards it as before.
         with mock.patch.object(wu, "pread_safetensors_stream",
                                wraps=wu.pread_safetensors_stream) as spy:

@@ -20,10 +20,10 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators import barlink_liveness as live
-from sglang.srt.utils import jit_cold_build as jcb
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.device_communicators import barlink_liveness as live
+from flliper.srt.utils import jit_cold_build as jcb
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -41,9 +41,9 @@ def _env(**kv):
 class TheOpenerIsCappedLikeItsPeers(CustomTestCase):
     def test_host_reader_is_base_plus_cap_when_the_multiplier_would_exceed_it(self):
         with _env(
-            SGLANG_BARLINK_PEER_TIMEOUT_S=10.0,
-            SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT=40,
-            SGLANG_BARLINK_BUILD_WINDOW_CAP_S=60,
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=10.0,
+            FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT=40,
+            FLLIPER_BARLINK_BUILD_WINDOW_CAP_S=60,
         ):
             self.assertEqual(live.wait_timeout_s(), 10.0)
             with jcb.cold_build_window("1158"):
@@ -52,8 +52,8 @@ class TheOpenerIsCappedLikeItsPeers(CustomTestCase):
 
     def test_device_reader_is_scaled_identically(self):
         with _env(
-            SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT=40,
-            SGLANG_BARLINK_BUILD_WINDOW_CAP_S=60,
+            FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT=40,
+            FLLIPER_BARLINK_BUILD_WINDOW_CAP_S=60,
         ):
             self.assertEqual(jcb.resolve_timeout_cycles(_BASE), _BASE)
             with jcb.cold_build_window("1158"):
@@ -68,9 +68,9 @@ class TheOpenerIsCappedLikeItsPeers(CustomTestCase):
         """The pre-#1158 pins (x7 under the 900 s default) still hold: the
         cap tightens nothing a legitimate build needs."""
         with _env(
-            SGLANG_BARLINK_PEER_TIMEOUT_S=100.0,
-            SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT=7,
-            SGLANG_BARLINK_BUILD_WINDOW_CAP_S=900,
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=100.0,
+            FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT=7,
+            FLLIPER_BARLINK_BUILD_WINDOW_CAP_S=900,
         ):
             with jcb.cold_build_window("1158"):
                 self.assertEqual(live.wait_timeout_s(), 700.0)
@@ -79,9 +79,9 @@ class TheOpenerIsCappedLikeItsPeers(CustomTestCase):
     def test_a_zero_cap_disables_the_extension_on_both_readers(self):
         """The peers' bisect switch (cap 0 = no extension) governs the opener too."""
         with _env(
-            SGLANG_BARLINK_PEER_TIMEOUT_S=10.0,
-            SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT=40,
-            SGLANG_BARLINK_BUILD_WINDOW_CAP_S=0,
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=10.0,
+            FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT=40,
+            FLLIPER_BARLINK_BUILD_WINDOW_CAP_S=0,
         ):
             with jcb.cold_build_window("1158"):
                 self.assertEqual(live.wait_timeout_s(), 10.0)

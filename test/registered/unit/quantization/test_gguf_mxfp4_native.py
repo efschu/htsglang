@@ -163,7 +163,7 @@ class TestMXFP4HostReference(unittest.TestCase):
 # 2. The dispatch flip -- both states executed
 # ---------------------------------------------------------------------------
 def _reload_gguf():
-    import sglang.srt.layers.quantization.gguf as g
+    import flliper.srt.layers.quantization.gguf as g
 
     return importlib.reload(g)
 
@@ -209,17 +209,17 @@ class TestDispatchFlip(unittest.TestCase):
     """The #398 falsifier: the same code, one predicate apart, in both states."""
 
     def setUp(self):
-        self._env = os.environ.get("SGLANG_GGUF_MXFP4_NATIVE")
+        self._env = os.environ.get("FLLIPER_GGUF_MXFP4_NATIVE")
 
     def tearDown(self):
         if self._env is None:
-            os.environ.pop("SGLANG_GGUF_MXFP4_NATIVE", None)
+            os.environ.pop("FLLIPER_GGUF_MXFP4_NATIVE", None)
         else:
-            os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = self._env
+            os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = self._env
         _reload_gguf()
 
     def test_red_mxfp4_is_unexecutable_without_the_kernels(self):
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "0"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "0"
         g = _reload_gguf()
         self.assertFalse(g.MXFP4_NATIVE)
         mxfp4 = int(GGMLType.MXFP4)
@@ -237,7 +237,7 @@ class TestDispatchFlip(unittest.TestCase):
             )
 
     def test_green_mxfp4_is_executable_with_the_kernels(self):
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "1"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "1"
         with _FakeNativeOp():
             g = _reload_gguf()
             self.assertTrue(g.MXFP4_NATIVE)
@@ -250,7 +250,7 @@ class TestDispatchFlip(unittest.TestCase):
 
     def test_env_kill_switch_beats_a_present_op(self):
         with _FakeNativeOp():
-            os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "0"
+            os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "0"
             g = _reload_gguf()
             self.assertFalse(g.MXFP4_NATIVE)
 
@@ -260,19 +260,19 @@ class TestDispatchFlip(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestRepackHandoff(unittest.TestCase):
     def setUp(self):
-        self._env = os.environ.get("SGLANG_GGUF_MXFP4_NATIVE")
+        self._env = os.environ.get("FLLIPER_GGUF_MXFP4_NATIVE")
 
     def tearDown(self):
         if self._env is None:
-            os.environ.pop("SGLANG_GGUF_MXFP4_NATIVE", None)
+            os.environ.pop("FLLIPER_GGUF_MXFP4_NATIVE", None)
         else:
-            os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = self._env
+            os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = self._env
         _reload_gguf()
 
     def test_repack_still_converts_when_the_kernels_are_absent(self):
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "0"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "0"
         _reload_gguf()
-        from sglang.srt.model_loader import gguf_mxfp4_repack as r
+        from flliper.srt.model_loader import gguf_mxfp4_repack as r
 
         importlib.reload(r)
         self.assertFalse(r.native_mxfp4_kernels())
@@ -282,10 +282,10 @@ class TestRepackHandoff(unittest.TestCase):
         self.assertEqual(r.repacked_gguf_type(GGMLType.MXFP4, "t"), GGMLType.Q5_0)
 
     def test_repack_is_a_no_op_when_the_kernels_are_native(self):
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "1"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "1"
         with _FakeNativeOp():
             _reload_gguf()
-            from sglang.srt.model_loader import gguf_mxfp4_repack as r
+            from flliper.srt.model_loader import gguf_mxfp4_repack as r
 
             importlib.reload(r)
             self.assertTrue(r.native_mxfp4_kernels())
@@ -324,7 +324,7 @@ class TestUnevenTPShardBoundaries(unittest.TestCase):
     def test_gguf_block_alignment_covers_the_32_element_mxfp4_block(self):
         """The coarsening GGUF installs must be a multiple of 32, or an MXFP4
         shard boundary can land inside a block."""
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
+        from flliper.srt.layers.quantization.gguf import GGUFConfig
 
         cfg = GGUFConfig()
         for axis, block in enumerate(cfg.weight_block_size):
@@ -337,9 +337,9 @@ class TestUnevenTPShardBoundaries(unittest.TestCase):
     def test_real_partitioner_emits_block_aligned_shards(self):
         """Through the SHIPPED code path: _quant_block_aligned_units coarsens
         the element-granular unit family, partition_sizes cuts it."""
-        from sglang.srt.distributed.utils import partition_sizes
-        from sglang.srt.layers.linear import _quant_block_aligned_units
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
+        from flliper.srt.distributed.utils import partition_sizes
+        from flliper.srt.layers.linear import _quant_block_aligned_units
+        from flliper.srt.layers.quantization.gguf import GGUFConfig
 
         cfg = GGUFConfig()
         # DSV4F ffn_down quantized dim (2048) and two other real MLP widths,

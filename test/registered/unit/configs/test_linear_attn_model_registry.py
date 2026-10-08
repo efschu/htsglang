@@ -2,7 +2,7 @@
 
 import unittest
 
-from sglang.srt.configs.linear_attn_model_registry import (
+from flliper.srt.configs.linear_attn_model_registry import (
     _LINEAR_ATTN_MODEL_REGISTRY,
     LinearAttnModelSpec,
     get_linear_attn_config,
@@ -10,8 +10,8 @@ from sglang.srt.configs.linear_attn_model_registry import (
     import_backend_class,
     register_linear_attn_model,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -48,7 +48,7 @@ class TestLinearAttnModelRegistry(CustomTestCase):
     def _make_spec(self, **overrides):
         defaults = dict(
             config_class=FakeLinearAttnConfig,
-            backend_class_name="sglang.srt.layers.attention.triton_backend.TritonAttnBackend",
+            backend_class_name="flliper.srt.layers.attention.triton_backend.TritonAttnBackend",
             arch_names=["FakeModelForCausalLM"],
         )
         defaults.update(overrides)

@@ -2,12 +2,12 @@ import unittest
 
 import numpy as np
 
-from sglang.lang.choices import (
+from flliper.lang.choices import (
     greedy_token_selection,
     token_length_normalized,
     unconditional_likelihood_normalized,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 MOCK_CHOICES_INPUT_DATA = {
     "choices": [

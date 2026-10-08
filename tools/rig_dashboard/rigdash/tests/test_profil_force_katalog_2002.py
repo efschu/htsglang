@@ -67,10 +67,10 @@ class WiredFromTheTree(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="pf2002w_")
         self.addCleanup(shutil.rmtree, tmp, True)
         tree = os.path.join(tmp, "python")
-        wd = os.path.join(tree, "sglang", "srt", "weg2")
+        wd = os.path.join(tree, "flliper", "srt", "pdflip")
         os.makedirs(wd)
-        shutil.copy(os.path.join(FIXTURE_TREE, "sglang", "srt", "weg2", "refusals.py"), wd)
-        shutil.copy(os.path.join(FIXTURE_TREE, "sglang", "srt", "weg2", "profile_json.py"), wd)
+        shutil.copy(os.path.join(FIXTURE_TREE, "flliper", "srt", "pdflip", "refusals.py"), wd)
+        shutil.copy(os.path.join(FIXTURE_TREE, "flliper", "srt", "pdflip", "profile_json.py"), wd)
         with open(os.path.join(wd, "launcher.py"), "w") as fh:
             fh.write('refuse_value("HW-COUNT", "x")\nrefuse_value("HOST-MEM", "y")\n')
         ed2, _r, _u = editor(tmp)
@@ -189,7 +189,7 @@ class Hint(unittest.TestCase):
                     self.assertTrue(ln.startswith("#"))
                     self.assertTrue(lines.index(ln) < next(i for i, x in enumerate(lines) if x.startswith("docker run")))
             self.assertTrue(lines[-1].endswith("serve"))
-            self.assertIn("  -e MODE=weg2 -e FLLIPER_PROFILE=mein \\", lines)
+            self.assertIn("  -e MODE=pdflip -e FLLIPER_PROFILE=mein \\", lines)
 
     def test_export_carries_the_hint_and_says_it_starts_nothing(self):
         r = self.ed.load("release", "demo")
@@ -227,9 +227,9 @@ class Katalog(unittest.TestCase):
         self.assertTrue(k["geladen"])
         # Katalog-Neubau 07.10.: 131 Kanten (K117-K131 neu: Waechter-Envs, D-COMPACT, AUX-SPILL, --x-mode/--x-curves; neu 65 -> 80). AP-G 06.10.: 108 Kanten (K62-K108 neu: Form A / ungleiches DCP / Draft / D-only / Dual, alle belegt; neu 10 -> 57, ohne Beleg weiter 24). Davor 61 Kanten seit 05.10.: K60 (Graph-Kalibriertabelle <-> Layer-Schnitt) und K61 (Tabelle wirkt nur bei Politik auto) sind NEU dazugekommen
         # (neu 8 -> 10, alle 61 belegt); die 24 "ohne Beleg" sind kuratierte Kantenwünsche, unverändert
-        # "ohne Beleg" = kuratierte Kanten ohne Katalogkante: 24 im Kern der 27B-Linie; der NF-eigene kuratierte Eintrag --weg2-xchg-census-map (nur NF-Baum) traegt
-        # eine weitere (braucht --weg2-xchg-census), ist der Katalog aus dem NF-Kern gebaut (Neubau NF-Linie 07.10.), sind es 25
-        nf_census_map = cat["entries"].get("--weg2-xchg-census-map", {}).get("status") == "kuratiert"
+        # "ohne Beleg" = kuratierte Kanten ohne Katalogkante: 24 im Kern der 27B-Linie; der NF-eigene kuratierte Eintrag --pdflip-xchg-census-map (nur NF-Baum) traegt
+        # eine weitere (braucht --pdflip-xchg-census), ist der Katalog aus dem NF-Kern gebaut (Neubau NF-Linie 07.10.), sind es 25
+        nf_census_map = cat["entries"].get("--pdflip-xchg-census-map", {}).get("status") == "kuratiert"
         self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"], k["kanten_ohne_beleg"]), (131, 51, 80, 25 if nf_census_map else 24))
         deps = [d for e in cat["entries"].values() for d in e["depends"]]
         self.assertTrue(all("belegt" in d and "to_kind" in d for d in deps))
@@ -302,7 +302,7 @@ def run_js(case):
 
 DEPS = [
     {"to": "--b", "rel": "braucht", "effect": "kuratierter Satz", "calc": "S4", "present": True, "belegt": True, "quelle": "katalog+kuratiert", "kante": "K01",
-     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 8617, "anker": "must be given together"}, "satz": "Tradeoff-Satz K01", "wert": None, "to_kind": "flag"},
+     "beleg": {"datei": "python/flliper/srt/pdflip/launcher.py", "zeile": 8617, "anker": "must be given together"}, "satz": "Tradeoff-Satz K01", "wert": None, "to_kind": "flag"},
     {"to": "--c", "rel": "tauscht", "effect": "nur kuratiert", "calc": "text", "present": False, "belegt": False, "quelle": "kuratiert", "beleg": None, "satz": "", "kante": "",
      "wert": None, "to_kind": "flag"},
     {"to": "HW-COUNT", "rel": "braucht", "effect": "Satz zur Ablehnung", "calc": "text", "present": None, "belegt": True, "kante": "K51", "satz": "Satz zur Ablehnung",
@@ -326,7 +326,7 @@ class ChipsJs(unittest.TestCase):
     def test_chip_shows_beleg_marker_and_sentence_in_the_title(self):
         h = self.o["chips"]
         self.assertIn("Tradeoff-Satz K01", h)
-        self.assertIn("Evidence: python/sglang/srt/weg2/launcher.py:8617", h)
+        self.assertIn("Evidence: python/flliper/srt/pdflip/launcher.py:8617", h)
         self.assertIn("must be given together", h)
         self.assertIn("pf-dep-b", h)
 

@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
 from rigdash import kvheads as KV  # noqa: E402
 
-UTILS = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", "python", "sglang", "srt", "distributed", "utils.py"))
+UTILS = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", "python", "flliper", "srt", "distributed", "utils.py"))
 
 
 def _runtime_functions():

@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers import phase_flip_boot as pfb
+from flliper.srt.managers import phase_flip_boot as pfb
 
 MIB = 1048576
 

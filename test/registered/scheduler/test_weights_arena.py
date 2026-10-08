@@ -24,7 +24,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.model_executor.weights_arena import (
+from flliper.srt.model_executor.weights_arena import (
     image_from_tensors,
     ARENA_ALIGN,
     WeightsArenaError,
@@ -38,8 +38,8 @@ from sglang.srt.model_executor.weights_arena import (
     pack_into_arena,
     plan_arena_layout,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -261,7 +261,7 @@ class TestChecksumMemory(CustomTestCase):
 
         snippet = (
             "import torch, resource\n"
-            "from sglang.srt.model_executor.weights_arena import (\n"
+            "from flliper.srt.model_executor.weights_arena import (\n"
             "    plan_arena_layout, image_from_tensors)\n"
             "named = {'w': torch.zeros(256 * 1024 * 1024, dtype=torch.uint8)}\n"
             "layout = plan_arena_layout(named)\n"
@@ -381,7 +381,7 @@ class DefectNChecksumTransientFitsFreeMemory(unittest.TestCase):
         expected = int(payload.sum(dtype=torch.int64).item())
         for chunk in (1, 7, 1024, 1 << 16, 1 << 20, 1 << 24):
             with mock.patch(
-                "sglang.srt.model_executor.weights_arena._checksum_chunk_bytes",
+                "flliper.srt.model_executor.weights_arena._checksum_chunk_bytes",
                 return_value=chunk,
             ):
                 self.assertEqual(uint8_checksum(payload), expected, f"chunk={chunk}")

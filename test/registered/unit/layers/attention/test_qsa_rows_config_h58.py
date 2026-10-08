@@ -1,4 +1,4 @@
-"""fnFL2 H58: SGLANG_FORCE_QSA_ROWS_CONFIG -- a per-arch launch override for
+"""fnFL2 H58: FLLIPER_FORCE_QSA_ROWS_CONFIG -- a per-arch launch override for
 the QSA rows kernel, whose device-name-keyed table (H20 / else L20) hands the
 rig's 3080 and 5090 the spilling (BLOCK_N 16, 1 warp, 2 stages) build for
 every P prefix chunk (sparse_attn.py, H58 comment). CPU only: the parser and
@@ -13,9 +13,9 @@ from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.qsa import sparse_attn as sa
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.qsa import sparse_attn as sa
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -51,7 +51,7 @@ class SelectionTest(unittest.TestCase):
         self.addCleanup(sa._ROWS_CONFIG_CACHE.clear)
 
     def _pick(self, total_q, capability, raw):
-        with envs.SGLANG_FORCE_QSA_ROWS_CONFIG.override(raw), \
+        with envs.FLLIPER_FORCE_QSA_ROWS_CONFIG.override(raw), \
                 mock.patch.object(sa.torch.cuda, "get_device_capability",
                                   lambda *a: capability), \
                 mock.patch.object(sa.torch.cuda, "get_device_name",
@@ -59,7 +59,7 @@ class SelectionTest(unittest.TestCase):
             return sa._get_rows_config(total_q)
 
     def test_default_is_the_l20_table_for_the_rigs_cards(self):
-        self.assertEqual(envs.SGLANG_FORCE_QSA_ROWS_CONFIG.get(), "")
+        self.assertEqual(envs.FLLIPER_FORCE_QSA_ROWS_CONFIG.get(), "")
         # a 16k P prefix chunk: the spilling one-warp build on sm86; H101: the
         # sm120 default replaces that one entry with the spill-free (64, 8, 2)
         self.assertEqual(self._pick(16384, (8, 6), ""), (16, 1, 2))
@@ -84,7 +84,7 @@ class WiringTest(unittest.TestCase):
         self.assertIn("block_n, warps, stages = _get_rows_config(total_q)", rows)
         self.assertNotIn("_get_best_config(", rows)
         # H65: the prefix-free launch reads its own knob
-        # (SGLANG_WEG2_QSA_PREFILL_CONFIG, _get_prefill_config), never this one;
+        # (FLLIPER_PDFLIP_QSA_PREFILL_CONFIG, _get_prefill_config), never this one;
         # the chunk variant keeps the table.
         expected = {
             "def sparse_gqa_fwd_interface_triton(": "_get_prefill_config(total_q)",

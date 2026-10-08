@@ -58,7 +58,7 @@ from __future__ import annotations
 import math
 import unittest
 
-from sglang.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import kv_backing_relief as kbr
 
 # PP2's measured shape, boot_798_0822_0737.log:3382.
 CURRENT = 126_976

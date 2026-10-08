@@ -1,9 +1,9 @@
 import unittest
 
-import sglang as sgl
-from sglang.srt.utils.common import temp_set_env
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper as sgl
+from flliper.srt.utils.common import temp_set_env
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=380, suite="nightly-1-gpu", nightly=True)
 

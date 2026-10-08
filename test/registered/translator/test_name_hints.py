@@ -19,7 +19,7 @@ ids and timestamps, and is driven here with a fake clock.
 
 import unittest
 
-from sglang.srt.translator.name_hints import (
+from flliper.srt.translator.name_hints import (
     KIND_ADDRESSED,
     KIND_SELF,
     KIND_THIRD_PARTY,
@@ -275,7 +275,7 @@ class TestSuggestionsInSession(unittest.IsolatedAsyncioTestCase):
     """The pipeline half: the gate, the events, and confirm/discard."""
 
     async def _session(self, answer, script=None):
-        from sglang.srt.translator.session import run_conversation
+        from flliper.srt.translator.session import run_conversation
         from test_session import VOICE_A_HZ, conversation_audio, make_session
 
         session, _asr, mt, _tts = make_session(script=script)
@@ -285,7 +285,7 @@ class TestSuggestionsInSession(unittest.IsolatedAsyncioTestCase):
         return session, scripted
 
     async def test_a_self_introduction_is_applied_at_once_and_undoable(self):
-        from sglang.srt.translator.session import EventKind
+        from flliper.srt.translator.session import EventKind
 
         session, _mt = await self._session(
             '{"candidates": [{"name": "Matthias", "kind": "self"}]}',
@@ -345,8 +345,8 @@ class TestSuggestionsInSession(unittest.IsolatedAsyncioTestCase):
             session.confirm_suggestion(suggestion_id)
 
     async def test_an_extractor_failure_does_not_fail_the_turn(self):
-        from sglang.srt.translator.backends import BackendError
-        from sglang.srt.translator.session import run_conversation
+        from flliper.srt.translator.backends import BackendError
+        from flliper.srt.translator.session import run_conversation
         from test_session import VOICE_A_HZ, conversation_audio, make_session
 
         session, _asr, mt, _tts = make_session(script=[("ich bin Matthias", LANG_A)])

@@ -45,14 +45,14 @@ from unittest import mock
 import torch
 
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate
-from sglang.srt.distributed.device_communicators.barlink import BarlinkCommunicator
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators import barlink_abort_gate
+from flliper.srt.distributed.device_communicators.barlink import BarlinkCommunicator
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     Bar1CollectiveAborted,
     BarlinkBar1Transport,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -225,7 +225,7 @@ class TestTheDeferredGuardStillSeesTheCrash(CustomTestCase):
         ev = _ScriptedEvent()
         t = _transport(rank=0, world=3, group="tp:0", event=ev)
         with mock.patch(
-            "sglang.srt.distributed.device_communicators.barlink."
+            "flliper.srt.distributed.device_communicators.barlink."
             "graph_capture_running",
             return_value=True,
         ):
@@ -288,7 +288,7 @@ class TestTheDeferredGuardStillSeesTheCrash(CustomTestCase):
 # of eating the 2000 ms default per wait. Scoped to this class so the
 # process-wide default stays untouched for every other test in the run.
 @mock.patch.dict(
-    os.environ, {"SGLANG_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "0"}
+    os.environ, {"FLLIPER_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "0"}
 )
 class TestTheLagBoundIsLoadBearing(CustomTestCase):
     """The naive cheapening, and why the shipped default is not it.

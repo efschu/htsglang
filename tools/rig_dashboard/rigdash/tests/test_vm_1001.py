@@ -25,11 +25,11 @@ def test_lines_carry_ttft_counters_and_no_rid():
     rank = {"D.tp0pp0": {"decode": {"tokens": 50, "running": 2}, "sched": {"full_token_usage": 0.4}}}
     ls = vmpush.lines_for_boot(_ipc(), rank, "NF", 1_000)
     txt = "\n".join(ls)
-    assert 'weg2_front_ttft_count{boot="boot-20261001T064831Z-2025",model="NF"} 4.0 1000' in ls
-    assert 'weg2_front_ttft_ms_sum{boot="boot-20261001T064831Z-2025",model="NF"} 8000.0 1000' in ls
-    assert 'weg2_front_queue{boot="boot-20261001T064831Z-2025",model="NF"} 2.0 1000' in ls
-    assert 'weg2_rank_decode_tokens_total{boot="boot-20261001T064831Z-2025",group="D",model="NF",rank="tp0pp0"} 50.0 1000' in ls
-    assert "rid" not in txt and "weg2-" not in txt
+    assert 'pdflip_front_ttft_count{boot="boot-20261001T064831Z-2025",model="NF"} 4.0 1000' in ls
+    assert 'pdflip_front_ttft_ms_sum{boot="boot-20261001T064831Z-2025",model="NF"} 8000.0 1000' in ls
+    assert 'pdflip_front_queue{boot="boot-20261001T064831Z-2025",model="NF"} 2.0 1000' in ls
+    assert 'pdflip_rank_decode_tokens_total{boot="boot-20261001T064831Z-2025",group="D",model="NF",rank="tp0pp0"} 50.0 1000' in ls
+    assert "rid" not in txt and "pdflip-" not in txt
 
 
 def test_flip_points_at_flip_time_without_what_none_and_only_new():
@@ -98,7 +98,7 @@ def test_ttft_series_mean_per_bucket_and_gap():
 def test_pcie_series_gb_per_bucket_and_pcie_points_from_samples(monkeypatch):
     class Fake:
         def query_range_by(self, q, start, end, step, label):
-            assert "weg2_gpu_pcie_bytes_per_second" in q and start == 15 and step == 5
+            assert "pdflip_gpu_pcie_bytes_per_second" in q and start == 15 and step == 5
             return {"0": {15: 1.5, 20: 0.25}, "2": {20: 3.0}}
     out = vmpush.pcie_series(Fake(), [10, 15], 5)
     assert out["series"]["g0.rx"] == [1.5, 0.25] and out["series"]["g2.tx"] == [None, 3.0]
@@ -116,5 +116,5 @@ def test_pcie_series_gb_per_bucket_and_pcie_points_from_samples(monkeypatch):
     sent = []
     monkeypatch.setattr(vmpush, "push", lambda lines, url: sent.extend(lines) or len(sent))
     br.tick(101.0)
-    assert 'weg2_gpu_pcie_bytes_per_second{dir="rx",gpu="0"} 2000000.0 100000' in sent
+    assert 'pdflip_gpu_pcie_bytes_per_second{dir="rx",gpu="0"} 2000000.0 100000' in sent
     assert br.pcie_t == 100.0

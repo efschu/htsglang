@@ -9,17 +9,17 @@ import unittest
 
 import torch
 
-from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+from flliper.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 
 # Conditionally import Triton path
 _has_cuda = torch.cuda.is_available()
 if _has_cuda:
-    from sglang.kernels.ops.grammar.token_filter_ops import (
+    from flliper.kernels.ops.grammar.token_filter_ops import (
         set_token_filter_triton,
     )
 

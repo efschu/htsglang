@@ -20,14 +20,14 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import AbortReq, BatchStrOutput, GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
-from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from flliper.srt.managers.io_struct import AbortReq, BatchStrOutput, GenerateReqInput
+from flliper.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from flliper.srt.observability.req_time_stats import APIServerReqTimeStats
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -604,7 +604,7 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
     """
 
     @patch(
-        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+        "flliper.srt.managers.tokenizer_manager.wrap_shm_features",
         side_effect=lambda obj: obj,
     )
     def test_cancel_after_dispatch_sends_abort_and_keeps_state(self, _wrap_shm):

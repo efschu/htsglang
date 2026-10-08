@@ -4,11 +4,11 @@
 
 ROOT CAUSE (see WEG2_BUILD_DECISIONS_0906.md SECTION 1an-S3, weg2sb5g,
 2026-09-09): ``activation_probe._global_rank()``
-(python/sglang/srt/mem_ledger/activation_probe.py:260-281) returns a rank
+(python/flliper/srt/mem_ledger/activation_probe.py:260-281) returns a rank
 that is unique only WITHIN one ``torch.distributed`` process group. Weg-2's
 P (pp_size=3, tp_size=1) and D (tp_size=3, pp_size=1) are two independently
 launched jobs that share one dump directory whenever both are armed with
-the identical ``SGLANG_PHASE_FOOTPRINT_DUMP`` -- the current recipe does
+the identical ``FLLIPER_PHASE_FOOTPRINT_DUMP`` -- the current recipe does
 exactly that. Both wrote ``phase_footprint_rank{0,1,2}.json``; D wrote
 first, P wrote later and silently overwrote every one of D's three dumps
 (``write_footprint_dump``'s ``os.replace(tmp, path)`` at line 155 was
@@ -17,14 +17,14 @@ written" while all three surviving files carried P's profile alone.
 
 THE FIX, three parts, ONE mechanism (the profile digest already computed
 for the on-disk payload -- ``profile_digest_from_canonical``, split out of
-``sglang.srt.mem_ledger.activation.profile_key`` -- reused rather than a
+``flliper.srt.mem_ledger.activation.profile_key`` -- reused rather than a
 second identity invented):
 
 1. ``activation_probe.dump_filename()`` folds the Weg-2 group tag into the
-   filename. The tag is ``SGLANG_WEG2_GROUP`` read via
-   ``weg2_memory_saver.weg2_group_name()`` -- the one thing in the tree
+   filename. The tag is ``FLLIPER_PDFLIP_GROUP`` read via
+   ``pdflip_memory_saver.pdflip_group_name()`` -- the one thing in the tree
    that already tells a rank which Weg-2 group it is in
-   (``weg2/launcher.py``'s ``build_env(group="P"|"D")``) -- not a new
+   (``pdflip/launcher.py``'s ``build_env(group="P"|"D")``) -- not a new
    identity. Outside Weg-2 the tag is ``""`` and the filename is
    byte-identical to the pre-fix shape.
 2. ``write_footprint_dump()`` refuses (does not overwrite) a same-name
@@ -44,8 +44,8 @@ import json
 import logging
 import os
 
-from sglang.srt.mem_ledger import activation_probe as ap
-from sglang.srt.mem_ledger.activation import (
+from flliper.srt.mem_ledger import activation_probe as ap
+from flliper.srt.mem_ledger.activation import (
     ActivationProfile,
     load_footprints,
     profile_digest_from_canonical,
@@ -126,8 +126,8 @@ def test_two_groups_same_rank_same_dir_write_distinct_files(tmp_path):
 
 
 def test_ungrouped_boot_keeps_the_pre_fix_filename_shape(tmp_path):
-    """No SGLANG_WEG2_GROUP -> group="" -> byte-identical to the old shape,
-    so a non-Weg2 boot's dump filenames are unaffected by this fix."""
+    """No FLLIPER_PDFLIP_GROUP -> group="" -> byte-identical to the old shape,
+    so a non-PdFlip boot's dump filenames are unaffected by this fix."""
     path = _write(2, "", PROFILE_P, "GPU-x", 900, 640, tmp_path)
     assert os.path.basename(path) == "phase_footprint_rank2.json"
 
@@ -154,7 +154,7 @@ def test_same_name_different_profile_is_refused_not_overwritten(tmp_path, caplog
     assert after == original, "a refused write must leave the existing dump untouched"
     assert any("PHASE-FOOTPRINT REFUSED" in r.message for r in caplog.records)
     assert any(
-        "W18 Weg2PhaseFootprintCollision" in r.message for r in caplog.records
+        "W18 PdFlipPhaseFootprintCollision" in r.message for r in caplog.records
     )
 
 

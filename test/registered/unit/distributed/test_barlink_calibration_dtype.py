@@ -24,13 +24,13 @@ from unittest import mock
 
 import torch
 
-import sglang
-from sglang.test.ci.ci_register import register_cpu_ci
+import flliper
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _COMM_DIR = (
-    Path(sglang.__file__).parent / "srt" / "distributed" / "device_communicators"
+    Path(flliper.__file__).parent / "srt" / "distributed" / "device_communicators"
 )
 
 
@@ -100,7 +100,7 @@ class TestCalibrationPayloadDtype(unittest.TestCase):
             self.addCleanup(patcher.stop)
         import os
 
-        os.environ.pop("SGLANG_BARLINK_PIPE_CHUNK_MIB", None)
+        os.environ.pop("FLLIPER_BARLINK_PIPE_CHUNK_MIB", None)
 
         module.BarlinkDeviceTransport._resolve_pipe_chunk(fake_self)
         return seen, fake_self

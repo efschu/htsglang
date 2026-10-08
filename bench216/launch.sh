@@ -16,9 +16,9 @@ mkdir -p "$LOGDIR"
 # #188: the measured-KV-budget cache persists per config hash. Keep the
 # feature OFF and pin the ownership vector so the KV axis is identical in
 # every arm and the only free variable is the MLP split.
-rm -f /root/.cache/sglang/kv_budget-*.json
-export SGLANG_MEASURED_KV_BUDGET=0
-export SGLANG_UNEVEN_TOKEN_VECTOR=2,3,3
+rm -f /root/.cache/flliper/kv_budget-*.json
+export FLLIPER_MEASURED_KV_BUDGET=0
+export FLLIPER_UNEVEN_TOKEN_VECTOR=2,3,3
 
 VENV="${VENV:-<VENV>}"
 NV="$VENV/lib/python3.12/site-packages/nvidia"
@@ -43,7 +43,7 @@ ARGS=(
 )
 [ "$MLP" != "none" ] && ARGS+=(--rank-mlp-ratio "$MLP")
 
-"$VENV/bin/python" -m sglang.launch_server "${ARGS[@]}" \
+"$VENV/bin/python" -m flliper.launch_server "${ARGS[@]}" \
   > "$LOG" 2>&1 &
 echo $! > "$LOGDIR/${ARM}.pid"
 echo "arm=$ARM mlp=$MLP port=$PORT pid=$(cat "$LOGDIR/${ARM}.pid") log=$LOG"

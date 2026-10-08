@@ -35,13 +35,13 @@ import threading
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _controller(worker_target=None, name="kvso-dest-io-test"):
     """A real SpillDestinationController carrying only what the stop path
     touches, with a real thread on the REAL worker loop unless overridden."""
-    from sglang.srt.managers.kv_session_spill_destination import (
+    from flliper.srt.managers.kv_session_spill_destination import (
         SpillDestinationController,
     )
 
@@ -68,7 +68,7 @@ class _StuckWorker:
 class TestTheThreadCanBeStopped(CustomTestCase):
     def test_the_controller_HAS_a_stop_path(self):
         """RED-FIRST. The inventory row in one assertion."""
-        from sglang.srt.managers.kv_session_spill_destination import (
+        from flliper.srt.managers.kv_session_spill_destination import (
             SpillDestinationController,
         )
 
@@ -93,7 +93,7 @@ class TestTheThreadCanBeStopped(CustomTestCase):
         self.assertEqual(c.stop_worker(timeout_s=2.0), "already stopped")
 
     def test_stopping_a_never_started_controller_is_safe(self):
-        from sglang.srt.managers.kv_session_spill_destination import (
+        from flliper.srt.managers.kv_session_spill_destination import (
             SpillDestinationController,
         )
 
@@ -127,7 +127,7 @@ class TestTheJoinIsBounded(CustomTestCase):
         c = _controller(worker_target=stuck)
         try:
             with self.assertLogs(
-                "sglang.srt.managers.kv_session_spill_destination", level="WARNING"
+                "flliper.srt.managers.kv_session_spill_destination", level="WARNING"
             ) as cap:
                 c.stop_worker(timeout_s=0.05)
             joined = "\n".join(cap.output)
@@ -141,7 +141,7 @@ class TestTheJoinIsBounded(CustomTestCase):
         trains readers to ignore it."""
         c = _controller()
         with self.assertNoLogs(
-            "sglang.srt.managers.kv_session_spill_destination", level="WARNING"
+            "flliper.srt.managers.kv_session_spill_destination", level="WARNING"
         ):
             c.stop_worker(timeout_s=2.0)
 
@@ -156,7 +156,7 @@ class TestTheTeardownWiring(CustomTestCase):
         )
 
     def test_graceful_teardown_stops_the_worker(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         c = _controller()
         out = td.release_kv_session_offload_io(
@@ -169,7 +169,7 @@ class TestTheTeardownWiring(CustomTestCase):
         """Same guard as release_distributed and release_host_resources: on the
         exception path the device may be wedged, and a teardown that hangs is
         worse than the abort it prevents."""
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         c = _controller()
         try:
@@ -184,7 +184,7 @@ class TestTheTeardownWiring(CustomTestCase):
 
     def test_no_kvso_manager_is_a_quiet_no_op(self):
         """kvso is off by default; the default boot must not change."""
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         self.assertIsNone(
             td.release_kv_session_offload_io(
@@ -195,7 +195,7 @@ class TestTheTeardownWiring(CustomTestCase):
         )
 
     def test_a_manager_without_destinations_is_a_no_op(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         self.assertIsNone(
             td.release_kv_session_offload_io(
@@ -208,7 +208,7 @@ class TestTheTeardownWiring(CustomTestCase):
     def test_it_NEVER_RAISES(self):
         """It runs in a finally during shutdown: raising would replace a clean
         exit with a traceback, or mask the failure that caused the exit."""
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         class Hostile:
             @property
@@ -224,7 +224,7 @@ class TestTheTeardownWiring(CustomTestCase):
         )
 
     def test_a_failing_stop_is_swallowed_and_reported(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         class Boom:
             def stop_worker(self, timeout_s=None):
@@ -256,7 +256,7 @@ class TestTheStopPathIsACTUALLYCALLED(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         tree = ast.parse(inspect.getsource(sched_mod))
         called = {
@@ -292,7 +292,7 @@ class TestTheStopPathIsACTUALLYCALLED(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         tree = ast.parse(inspect.getsource(sched_mod))
         calls = [

@@ -25,17 +25,17 @@ THE RULE: alarm only when NEITHER a first token NOR a prefill chunk landed in
 the window. Either one is progress.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     ADMISSION_WEDGE_SECONDS,
     admission_wedge_verdict,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestTheMegaPrefillSpecimenIsSilent(CustomTestCase):
@@ -156,7 +156,7 @@ class TestTheWiringCarriesTheSecondClock(CustomTestCase):
     def test_scheduler_has_a_prefill_progress_clock(self):
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler)
         self.assertIn("last_prefill_progress_time", src)
@@ -165,7 +165,7 @@ class TestTheWiringCarriesTheSecondClock(CustomTestCase):
     def test_the_check_passes_the_prefill_age(self):
         import inspect
 
-        from sglang.srt.managers.scheduler_components.invariant_checker import (
+        from flliper.srt.managers.scheduler_components.invariant_checker import (
             check_admission_wedge_once,
         )
 
@@ -178,7 +178,7 @@ class TestTheWiringCarriesTheSecondClock(CustomTestCase):
         the same distinction #699 made for the first-token clock."""
         import inspect
 
-        from sglang.srt.managers.scheduler_components import batch_result_processor
+        from flliper.srt.managers.scheduler_components import batch_result_processor
 
         src = inspect.getsource(batch_result_processor)
         # The CALL, not the field declaration: asserting the bare name passed

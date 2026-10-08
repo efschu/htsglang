@@ -1,12 +1,12 @@
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.dsv4.topk import (
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.dsv4.topk import (
     plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

@@ -24,7 +24,7 @@ Hermetic: pure arithmetic, no CUDA.
 """
 
 import pytest
-from sglang.srt.planner.pp_cut import (
+from flliper.srt.planner.pp_cut import (
     kv_dtype_width_bytes,
     kv_mib_per_token_per_attn_layer_from_config,
 )

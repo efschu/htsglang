@@ -49,8 +49,8 @@ import types
 
 import pytest
 
-from sglang.srt.managers import corridor_guard as cg
-from sglang.srt.managers import phase_flip_runtime as pfr
+from flliper.srt.managers import corridor_guard as cg
+from flliper.srt.managers import phase_flip_runtime as pfr
 
 MIB = 1 << 20
 
@@ -137,7 +137,7 @@ def test_the_corridor_law_itself_is_untouched():
 # the SAME number the runtime staging reserve uses.
 # ---------------------------------------------------------------------------
 
-from sglang.srt.managers import phase_flip_seam_reserve as sr
+from flliper.srt.managers import phase_flip_seam_reserve as sr
 
 
 def test_sizing_reserves_the_band_floor_not_the_centre():
@@ -198,7 +198,7 @@ def test_a_pool_gain_is_taken_after_the_seam_demand_not_out_of_it():
 # named 512, a number the arithmetic never touches.
 # ---------------------------------------------------------------------------
 
-from sglang.srt.managers import phase_flip_runtime as _pfr
+from flliper.srt.managers import phase_flip_runtime as _pfr
 
 
 def test_the_seam_transient_floor_is_the_bands_lower_edge():

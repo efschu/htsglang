@@ -50,12 +50,12 @@ pressure specimen is attributable when it appears.
 import types
 import unittest
 
-from sglang.srt.mem_cache.canonical_kv_page import (
+from flliper.srt.mem_cache.canonical_kv_page import (
     CanonicalPageError,
     CanonicalPageSpec,
 )
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3)
 
@@ -125,7 +125,7 @@ class TheDrainTakesNoGroupAgreement(unittest.TestCase):
         If a future edit reintroduces a group operation here, the deadlock comes
         back. torch.distributed is stubbed out entirely: any use raises.
         """
-        import sglang.srt.mem_cache.unified_radix_cache as urc
+        import flliper.srt.mem_cache.unified_radix_cache as urc
 
         class _Forbidden:
             def __getattr__(self, name):
@@ -152,7 +152,7 @@ class TheMarkerBoundsTheDivergence(unittest.TestCase):
     """
 
     def _progress(self, slots=16):
-        from sglang.srt.mem_cache.canonical_kv_page import PageCompleteness
+        from flliper.srt.mem_cache.canonical_kv_page import PageCompleteness
 
         return PageCompleteness(
             CanonicalPageSpec(num_attn_layers=slots, kv_bytes_per_token_per_attn_layer=2048)

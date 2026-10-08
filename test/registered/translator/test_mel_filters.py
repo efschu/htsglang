@@ -26,7 +26,7 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.mel_filters import (
+from flliper.srt.translator.mel_filters import (
     hz_to_mel_slaney,
     mel_filterbank,
     mel_to_hz_slaney,
@@ -132,7 +132,7 @@ class TestCompatWiring(unittest.TestCase):
         # speaker encoder reaches it on every cloned turn.
         import sys
 
-        from sglang.srt.translator.qwen3_tts_compat import (
+        from flliper.srt.translator.qwen3_tts_compat import (
             ensure_qwen3_tts_importable,
         )
 
@@ -145,7 +145,7 @@ class TestCompatWiring(unittest.TestCase):
     def test_other_librosa_members_still_raise_on_use(self):
         import sys
 
-        from sglang.srt.translator.qwen3_tts_compat import (
+        from flliper.srt.translator.qwen3_tts_compat import (
             CompatError,
             ensure_qwen3_tts_importable,
         )

@@ -30,9 +30,9 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache import canonical_page_store as store
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import (
+from flliper.srt.mem_cache import canonical_page_store as store
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import (
     OutOfSpace,
     marker_path,
     page_is_complete,
@@ -40,14 +40,14 @@ from sglang.srt.mem_cache.canonical_page_store import (
     window_for_layers,
     write_slice,
 )
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MixedLayoutError,
     audit_layout,
     page_shard,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 ATTN_LAYER_IDS = list(range(3, 64, 4))
 CELL = 64
@@ -341,7 +341,7 @@ class TestAttachKeepsPreviousBootsWork(CustomTestCase):
             other_spec, ATTN_LAYER_IDS, [i for i in ATTN_LAYER_IDS if i < 28]
         )
         with self.assertLogs(
-            "sglang.srt.mem_cache.canonical_page_store", level="WARNING"
+            "flliper.srt.mem_cache.canonical_page_store", level="WARNING"
         ) as logs:
             _backend(self.root, window=other)
         self.assertIn("geometry", "\n".join(logs.output))

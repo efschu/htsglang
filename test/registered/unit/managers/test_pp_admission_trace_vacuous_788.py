@@ -13,7 +13,7 @@
 # ==============================================================================
 """#788: the admission trace must not drown its own evidence at idle.
 
-THE SPECIMEN. Boot instr11 ran ``SGLANG_PP_ADMISSION_TRACE=1`` for about
+THE SPECIMEN. Boot instr11 ran ``FLLIPER_PP_ADMISSION_TRACE=1`` for about
 three hours against an IDLE server and wrote a 5.9 GB log. The payload census
 of the previous boot (instr10, 146023 trace lines per rank) shows what was in
 it::
@@ -55,7 +55,7 @@ import re
 import types
 import unittest
 
-LOGGER_NAME = "sglang.srt.managers.scheduler"
+LOGGER_NAME = "flliper.srt.managers.scheduler"
 
 
 class _Grab(logging.Handler):
@@ -76,7 +76,7 @@ class _Rank:
     """
 
     def __init__(self, avail=40830, evictable=130):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         self.holder = types.SimpleNamespace(
             token_to_kv_pool_allocator=types.SimpleNamespace(
@@ -209,7 +209,7 @@ class PPAdmissionTraceVacuous788(unittest.TestCase):
         instr11 could not rule out."""
         # Imported here rather than at module scope so the rest of this file
         # still reports real assertion failures against an unfixed tree.
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             PP_ADMISSION_VACUOUS_ROLLUP_EVERY as every,
         )
 

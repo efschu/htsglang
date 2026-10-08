@@ -20,7 +20,7 @@ fake kvcache here; the UnifiedKVPool view math is pure torch).
     python -m pytest test/registered/unit/mem_cache/test_multi_ended_allocator.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -29,11 +29,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.multi_ended_allocator import (
+from flliper.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.unified_memory_pool import (
+from flliper.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
     UnifiedKVPool,
@@ -1162,7 +1162,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
     # 7. SWA composite joint byte-budget in page units.
     def test_paged_swa_joint_byte_budget(self):
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from flliper.srt.mem_cache.multi_ended_allocator import (
             UnifiedSWATokenToKVPoolAllocator,
         )
 
@@ -1233,7 +1233,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # stays -1 and `translate_kv_loc(virt_token)` returns negative token
     # ids → CUDA OOB in the Triton attention kernel.
     def test_paged_alloc_extend_binds_v2p_p2v(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
+        from flliper.srt.mem_cache import multi_ended_allocator as mea_mod
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1316,7 +1316,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # prefix's tail page (num_new_pages == 0), but the page-wrapping case
     # must update tables.
     def test_paged_alloc_decode_binds_v2p_p2v_on_page_wrap(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
+        from flliper.srt.mem_cache import multi_ended_allocator as mea_mod
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1395,7 +1395,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # (the common case — the decode token reuses the prefix's tail page)
     # must NOT advance the watermark and NOT touch v2p / p2v.
     def test_paged_alloc_decode_no_op_when_no_new_page(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
+        from flliper.srt.mem_cache import multi_ended_allocator as mea_mod
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1598,7 +1598,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # `full_available_size() + allocated_tokens == static_cap` must hold for
     # the SWA composite.
     def test_paged_swa_full_available_size_in_tokens(self):
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from flliper.srt.mem_cache.multi_ended_allocator import (
             UnifiedSWATokenToKVPoolAllocator,
         )
 
@@ -1684,7 +1684,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # (`#full token`, `full token usage`) and would have crashed Mamba+radix
     # if radix weren't auto-downgraded to page=1.
     def test_paged_mamba_size_in_tokens(self):
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from flliper.srt.mem_cache.multi_ended_allocator import (
             UnifiedMambaTokenToKVPoolAllocator,
         )
 
@@ -1786,10 +1786,10 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # The instance methods in production wrap this helper, so the same
     # math is covered.
     def test_paged_pool_translate_helper_returns_physical_tokens(self):
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from flliper.srt.mem_cache.multi_ended_allocator import (
             UnifiedSWATokenToKVPoolAllocator,
         )
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+        from flliper.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
         full_spec = MHASubPoolSpec(
             name="full",
@@ -2442,7 +2442,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
         in the descending direction."""
         _pool, _fa, _kv = self._make_full(lazy=True)
         # Build a grow-down allocator standalone for the test.
-        from sglang.srt.mem_cache.unified_memory_pool import (
+        from flliper.srt.mem_cache.unified_memory_pool import (
             UnifiedKVPool,
         )
 

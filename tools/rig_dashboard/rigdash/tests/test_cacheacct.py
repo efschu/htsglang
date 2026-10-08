@@ -2,7 +2,7 @@
 
 "aus Cache" = tokens whose KV existed BEFORE the request (prefix hit at admission).  D reading
 from L2/L3 what P just prefilled for the SAME request is the hand-over P->D -- never cache.
-Both cases are constructed here, once through the log path (WEG2-SERVED legs paired by rid) and
+Both cases are constructed here, once through the log path (PDFLIP-SERVED legs paired by rid) and
 once through the IPC path (front.served_tokens with the D_after_P row agreed with NF), and both
 must give the same classes.  Every prompt token lands in exactly one of cache / P-computed /
 hand-over, or (D-direct) cache / D-computed.

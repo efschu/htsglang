@@ -7,11 +7,11 @@ import unittest
 import requests
 from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
-from sglang.test.kl_multiturn_utils import get_input_ids
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from flliper.test.kl_multiturn_utils import get_input_ids
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -98,8 +98,8 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
             timeout=DSV4_FLASH_LAUNCH_TIMEOUT,
             other_args=cls._server_args(),
             env={
-                "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "FLLIPER_DSV4_FP4_EXPERTS": "0",
+                "FLLIPER_ENABLE_UNIFIED_RADIX_TREE": "1",
             },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
@@ -169,9 +169,9 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 str(cls.max_running_requests),
             ],
             env={
-                "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
+                "FLLIPER_DSV4_FP4_EXPERTS": "0",
+                "FLLIPER_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )
 
@@ -246,9 +246,9 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
                 "4",
             ],
             env={
-                "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
+                "FLLIPER_DSV4_FP4_EXPERTS": "0",
+                "FLLIPER_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )
 

@@ -3,10 +3,10 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceLog
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.kv_canary.e2e_base import CanaryE2EBase
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.kv_canary.runner.swa_divergence import SwaDivergenceLog
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.kv_canary.e2e_base import CanaryE2EBase
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-c-test-cpu")
 

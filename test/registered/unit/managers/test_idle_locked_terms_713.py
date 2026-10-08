@@ -26,7 +26,7 @@ what the simulation READS in-process, which is why the diagnostic exists.
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # the live-measured state, verbatim
 PENDING = 22
@@ -35,7 +35,7 @@ MAMBA_SLOTS = 3
 
 
 def _sched(avail=ROWS_AVAIL, slots=MAMBA_SLOTS, evictable=0, chunk=512):
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     s = Scheduler.__new__(Scheduler)
     s.server_args = SimpleNamespace(chunked_prefill_size=chunk)
@@ -78,7 +78,7 @@ class TestIdleLockedDiagnostic713(CustomTestCase):
     could not show the divergence, which is the whole reason this exists."""
 
     def _run(self, avail, slots, pending, phase="tp"):
-        from sglang.srt.managers import scheduler as m
+        from flliper.srt.managers import scheduler as m
 
         s = _sched(avail=avail, slots=slots)
         s._round_built_nothing = True

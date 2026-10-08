@@ -12,9 +12,9 @@ import inspect
 import pytest
 import torch
 
-from sglang.srt.layers.moe import nan_disc2 as nd
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe.fused_moe_triton import fused_marlin_moe as fmm
+from flliper.srt.layers.moe import nan_disc2 as nd
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe.fused_moe_triton import fused_marlin_moe as fmm
 
 
 @pytest.fixture(autouse=True)
@@ -31,9 +31,9 @@ def test_disc2_default_on_and_env_off(monkeypatch):
     for raw, want in (("", True), ("1", True), ("0", False), ("off", False)):
         nd._STATE["on"] = None
         if raw == "":
-            monkeypatch.delenv("SGLANG_NAN_DISC2", raising=False)
+            monkeypatch.delenv("FLLIPER_NAN_DISC2", raising=False)
         else:
-            monkeypatch.setenv("SGLANG_NAN_DISC2", raw)
+            monkeypatch.setenv("FLLIPER_NAN_DISC2", raw)
         assert nd.disc2_on() is want, raw
     nd._STATE["on"] = None
 
@@ -48,9 +48,9 @@ def test_private_workspace_switch_parses_and_defaults_off(monkeypatch):
     for raw, want in (("", False), ("0", False), ("1", True), ("on", True)):
         fmm._PRIVATE_WS["on"] = None
         if raw == "":
-            monkeypatch.delenv("SGLANG_MOE_MARLIN_PRIVATE_WORKSPACE", raising=False)
+            monkeypatch.delenv("FLLIPER_MOE_MARLIN_PRIVATE_WORKSPACE", raising=False)
         else:
-            monkeypatch.setenv("SGLANG_MOE_MARLIN_PRIVATE_WORKSPACE", raw)
+            monkeypatch.setenv("FLLIPER_MOE_MARLIN_PRIVATE_WORKSPACE", raw)
         assert fmm.marlin_private_workspace_on() is want, raw
     fmm._PRIVATE_WS["on"] = None
 
@@ -70,7 +70,7 @@ def test_private_workspace_drops_the_supplied_buffer_before_the_alloc():
 def test_the_moe_path_really_is_handed_a_shared_workspace():
     """Belegt, not assumed: the wNa16 Marlin MoE scheme allocates ONE workspace
     at load and passes that same object to every fused_marlin_moe call."""
-    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    from flliper.srt.layers.quantization.compressed_tensors.schemes import (
         compressed_tensors_wNa16_moe as scheme,
     )
 
@@ -78,7 +78,7 @@ def test_the_moe_path_really_is_handed_a_shared_workspace():
     assert "layer.workspace = marlin_make_workspace(" in src
     assert "workspace=layer.workspace," in src
     # the runner path keeps a process-global one
-    from sglang.srt.layers.moe.moe_runner import marlin as runner
+    from flliper.srt.layers.moe.moe_runner import marlin as runner
 
     rsrc = inspect.getsource(runner)
     assert "MARLIN_MOE_WORKSPACE" in rsrc and "workspace=MARLIN_MOE_WORKSPACE," in rsrc
@@ -255,7 +255,7 @@ def test_class_c_names_a_dirty_lock_workspace_when_there_was_one():
     code, text = nd.classify(_obs(ws_nonzero_before=17))
     assert code == nd.CLASS_KERNEL
     assert "17 non-zero" in text
-    assert "SGLANG_MOE_MARLIN_PRIVATE_WORKSPACE" in text
+    assert "FLLIPER_MOE_MARLIN_PRIVATE_WORKSPACE" in text
 
 
 def test_a_reused_slot_refuses_to_pretend_the_bytes_prove_anything():
@@ -385,7 +385,7 @@ class _TraceHost:
 
 
 def test_the_recorder_is_a_no_op_while_the_guard_is_off(monkeypatch):
-    from sglang.srt.layers import nan_guard
+    from flliper.srt.layers import nan_guard
 
     nan_guard._reset_for_tests(on=False)
     h = _TraceHost()
@@ -396,7 +396,7 @@ def test_the_recorder_is_a_no_op_while_the_guard_is_off(monkeypatch):
 
 
 def test_the_recorder_keeps_the_slot_map_and_the_holds_of_each_wave():
-    from sglang.srt.layers import nan_guard
+    from flliper.srt.layers import nan_guard
 
     nan_guard._reset_for_tests(on=True)
     try:

@@ -1,7 +1,7 @@
 """Endpoint-level tests for `/server_info`.
 
 `/server_info` is the introspection surface that external consumers
-(SGLang's own deprecated `/get_server_info` alias, monitoring tools,
+(fLLiper's own deprecated `/get_server_info` alias, monitoring tools,
 KV-aware routers) scrape to learn about the running server's
 configuration. New `/server_info` behaviours should add their test
 classes to this file as the surface grows.
@@ -26,11 +26,11 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.entrypoints import http_server
-from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.entrypoints import http_server
+from flliper.srt.lora.lora_registry import LoRARef
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -238,7 +238,7 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
     the fields existing consumers depend on may be silently dropped.
 
     Existing `/server_info` consumers in the wild include:
-      * SGLang's own deprecated `/get_server_info` (forwards to the
+      * fLLiper's own deprecated `/get_server_info` (forwards to the
         same handler).
       * External monitoring tools that scrape the full ServerArgs.
       * KV-aware routers reading `kv_events_config`, `page_size`,

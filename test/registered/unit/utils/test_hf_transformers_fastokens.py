@@ -4,8 +4,8 @@ backend of the loaded tokenizer with fastokens' _TokenizerShim.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
 )
@@ -26,14 +26,14 @@ except ImportError:
 @unittest.skipUnless(HAS_FASTOKENS, "fastokens package not installed")
 class TestFastokensBackend(CustomTestCase):
     def test_shim_is_applied(self):
-        # `_TokenizerShim` is fastokens' private compat shim. SGLang's
+        # `_TokenizerShim` is fastokens' private compat shim. fLLiper's
         # integration relies on `tokenizer._tokenizer` being an instance of
         # this class to confirm fastokens is wired up. If fastokens renames
         # or restructures it, update both this assertion and any code in
-        # SGLang that depends on the same private name.
+        # fLLiper that depends on the same private name.
         from fastokens._compat import _TokenizerShim
 
-        from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+        from flliper.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
         tokenizer = get_tokenizer(
             TOKENIZER_MODEL,
@@ -48,7 +48,7 @@ class TestFastokensBackend(CustomTestCase):
         )
 
     def test_encode_decode_roundtrip(self):
-        from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+        from flliper.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
         tokenizer = get_tokenizer(
             TOKENIZER_MODEL,

@@ -21,7 +21,7 @@ torch tensors on CPU; the allocator is a plain-int stand-in with the
 ``MambaSlotAllocator`` surface the executor actually uses. No CUDA, no server.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -30,7 +30,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.gdn_slot_executor import (
+from flliper.srt.mem_cache.gdn_slot_executor import (
     GdnSlotError,
     GdnSlotExecutor,
     GdnSlotWindowError,
@@ -39,8 +39,8 @@ from sglang.srt.mem_cache.gdn_slot_executor import (
     flatten_blob,
     unflatten_blob,
 )
-from sglang.srt.mem_cache.gdn_slot_ladder import vacate_plan
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.gdn_slot_ladder import vacate_plan
+from flliper.test.test_utils import CustomTestCase
 
 NUM_LAYERS = 3
 
@@ -88,7 +88,7 @@ class Fixture:
     """A capped pool plus the session->slot bookkeeping the scheduler owns."""
 
     def __init__(self, cap=2, num_slots=None):
-        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from flliper.srt.mem_cache.memory_pool import MambaPool
 
         slots = num_slots if num_slots is not None else cap
         g = torch.Generator().manual_seed(7)

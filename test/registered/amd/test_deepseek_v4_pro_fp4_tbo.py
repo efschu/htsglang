@@ -14,7 +14,7 @@ combine-buffer lifetime that fixed the reserved-memory OOM at mem0.9).
 Unlike the CPU-only server-args guard unit test (TestTwoBatchOverlapBackend), this
 runs the TBO forward on the real model — which only DeepSeek-V4 implements — so it
 needs the real 8-GPU model (a dummy model path would not exercise TBO). Uses the FP4
-Pro model (fp4 routed experts); do NOT force SGLANG_DSV4_FP4_EXPERTS=false here or
+Pro model (fp4 routed experts); do NOT force FLLIPER_DSV4_FP4_EXPERTS=false here or
 the expert weights are read at the wrong (fp8) shape.
 
 Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro suite
@@ -24,10 +24,10 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -44,26 +44,26 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 )
 # Pro is 1.6T; weight load + warmup is much longer than Flash 285B.
 SERVER_LAUNCH_TIMEOUT = 5400
-FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
+FLASHMLA_BACKEND = os.environ.get("FLLIPER_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
 
 COMMON_ENV_VARS = {
-    "SGLANG_DEFAULT_THINKING": "1",
-    "SGLANG_DSV4_REASONING_EFFORT": "max",
-    "SGLANG_USE_ROCM700A": "0",
-    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
+    "FLLIPER_DEFAULT_THINKING": "1",
+    "FLLIPER_DSV4_REASONING_EFFORT": "max",
+    "FLLIPER_USE_ROCM700A": "0",
+    "FLLIPER_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
     "AITER_BF16_FP8_MOE_BOUND": "0",
     # DP TP-MoE collective path that non-EP DP TBO overlaps.
-    "SGLANG_DP_USE_GATHERV": "1",
-    "SGLANG_DP_USE_REDUCE_SCATTER": "1",
-    "SGLANG_SHARED_EXPERT_TP1": "1",
-    "SGLANG_DP_SHARED_EXPERT_LOCAL": "1",
+    "FLLIPER_DP_USE_GATHERV": "1",
+    "FLLIPER_DP_USE_REDUCE_SCATTER": "1",
+    "FLLIPER_SHARED_EXPERT_TP1": "1",
+    "FLLIPER_DP_SHARED_EXPERT_LOCAL": "1",
     # ROCm HSA-resource stability for TBO at high concurrency.
     "GPU_MAX_HW_QUEUES": "5",
 }
 
 # FP4 variant
 FP4_ENV_VARS = {
-    "SGLANG_DSV4_FP4_EXPERTS": "true",
+    "FLLIPER_DSV4_FP4_EXPERTS": "true",
 }
 
 

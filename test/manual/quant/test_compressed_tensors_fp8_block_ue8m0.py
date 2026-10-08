@@ -15,13 +15,13 @@ import unittest
 
 import torch
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestCompressedTensorsFp8BlockUE8M0(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_block_fp8_weight_scales_requantized_to_ue8m0(self):
-        from sglang.srt.layers import deep_gemm_wrapper
+        from flliper.srt.layers import deep_gemm_wrapper
 
         if not (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -34,7 +34,7 @@ class TestCompressedTensorsFp8BlockUE8M0(CustomTestCase):
             QuantizationStrategy,
         )
 
-        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+        from flliper.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
             CompressedTensorsW8A8Fp8,
         )
 
@@ -67,7 +67,7 @@ class TestCompressedTensorsFp8BlockUE8M0(CustomTestCase):
             weight_quant=weight_quant, is_static_input_scheme=False
         )
 
-        from sglang.srt.layers.quantization.fp8_utils import (
+        from flliper.srt.layers.quantization.fp8_utils import (
             deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
 

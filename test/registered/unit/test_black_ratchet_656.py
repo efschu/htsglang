@@ -39,7 +39,7 @@ are therefore absent from the list below. Everything still on it is older
 debt, named so the next shift can pick it off rather than rediscover it.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -52,14 +52,14 @@ _REPO = pathlib.Path(__file__).resolve().parents[3]
 
 #: Globs, relative to the repo root, that this ratchet governs.
 _SCOPE = (
-    "python/sglang/srt/managers/phase_flip_*.py",
-    "python/sglang/srt/managers/phase_purity.py",
-    "python/sglang/srt/managers/corridor_guard.py",
-    "python/sglang/srt/managers/kv_backing_relief.py",
-    "python/sglang/srt/managers/scheduler.py",
-    "python/sglang/srt/mem_cache/kv_vmm_backing.py",
-    "python/sglang/srt/mem_ledger/corridor_trace.py",
-    "python/sglang/srt/model_executor/weights_arena.py",
+    "python/flliper/srt/managers/phase_flip_*.py",
+    "python/flliper/srt/managers/phase_purity.py",
+    "python/flliper/srt/managers/corridor_guard.py",
+    "python/flliper/srt/managers/kv_backing_relief.py",
+    "python/flliper/srt/managers/scheduler.py",
+    "python/flliper/srt/mem_cache/kv_vmm_backing.py",
+    "python/flliper/srt/mem_ledger/corridor_trace.py",
+    "python/flliper/srt/model_executor/weights_arena.py",
     "test/registered/**/*_631.py",
     "test/registered/**/*_656.py",
 )
@@ -69,11 +69,11 @@ _SCOPE = (
 #: run green is the exact move this ratchet exists to make visible.
 _KNOWN_DIRTY = frozenset(
     {
-        "python/sglang/srt/managers/phase_flip_boot.py",
-        "python/sglang/srt/managers/phase_flip_draft_bootstrap.py",
-        "python/sglang/srt/managers/phase_flip_output_trace.py",
-        "python/sglang/srt/managers/phase_flip_presence.py",
-        "python/sglang/srt/managers/phase_flip_resident_carry.py",
+        "python/flliper/srt/managers/phase_flip_boot.py",
+        "python/flliper/srt/managers/phase_flip_draft_bootstrap.py",
+        "python/flliper/srt/managers/phase_flip_output_trace.py",
+        "python/flliper/srt/managers/phase_flip_presence.py",
+        "python/flliper/srt/managers/phase_flip_resident_carry.py",
         "test/registered/scheduler/test_flip_live_slot_agreement_656.py",
         "test/registered/scheduler/test_seam_fingerprint_and_margin_656.py",
         "test/registered/unit/distributed/test_census_wire_domain_631.py",

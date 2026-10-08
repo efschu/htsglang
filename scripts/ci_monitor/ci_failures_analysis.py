@@ -1,5 +1,5 @@
 """
-SGLang CI Consecutive Failures Analyzer
+fLLiper CI Consecutive Failures Analyzer
 
 Monitors GitHub Actions workflows for consecutive test failures and runner issues.
 Detects failure streaks, tracks job health, identifies problematic runners, and generates alerts.
@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 
-class SGLangFailuresAnalyzer:
+class FlliperFailuresAnalyzer:
     """Analyzes consecutive failures in GitHub Actions workflows."""
 
     def __init__(self, token: str):
@@ -37,7 +37,7 @@ class SGLangFailuresAnalyzer:
         self.headers = {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "SGLang-Failures-Analyzer/1.0",
+            "User-Agent": "fLLiper-Failures-Analyzer/1.0",
         }
         self.session = requests.Session()
         self.session.headers.update(self.headers)
@@ -254,7 +254,7 @@ class SGLangFailuresAnalyzer:
 
         # Patterns to match test files
         # Examples:
-        # - "sglang/test/test_example.py::TestClass::test_method[param]"
+        # - "flliper/test/test_example.py::TestClass::test_method[param]"
         # - "python3 /path/to/test_example.py"
         # - "Begin (0/0):" then "python3 /path/to/test.py" on next line
         test_patterns = [
@@ -1342,7 +1342,7 @@ class SGLangFailuresAnalyzer:
     ):
         """Generate detailed failure analysis report."""
         print("\n" + "=" * 80)
-        print("SGLang Consecutive Failures Analysis Report")
+        print("fLLiper Consecutive Failures Analysis Report")
         print("=" * 80)
 
         # Combine all general data for summary stats
@@ -1485,7 +1485,7 @@ class SGLangFailuresAnalyzer:
             print("Generating GitHub Actions summary...")
 
             summary_lines = []
-            summary_lines.append("# SGLang Consecutive Failures Analysis")
+            summary_lines.append("# fLLiper Consecutive Failures Analysis")
             summary_lines.append("")
             summary_lines.append(
                 f"**Analysis Timestamp:** {report_data['summary']['analysis_timestamp']}"
@@ -2418,7 +2418,7 @@ class SGLangFailuresAnalyzer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SGLang Consecutive Failures Analyzer")
+    parser = argparse.ArgumentParser(description="fLLiper Consecutive Failures Analyzer")
     parser.add_argument("--token", required=True, help="GitHub Personal Access Token")
     parser.add_argument(
         "--limit",
@@ -2434,7 +2434,7 @@ def main():
 
     args = parser.parse_args()
 
-    analyzer = SGLangFailuresAnalyzer(args.token)
+    analyzer = FlliperFailuresAnalyzer(args.token)
 
     try:
         # Fetch runs for each category separately

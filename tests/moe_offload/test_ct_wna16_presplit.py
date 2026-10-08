@@ -31,14 +31,14 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     MoEExpertOffloadCache,
     presplit_expert_offload_after_repack,
     reset_expert_offload_release,
     resident_slot_count,
 )
 
-FRACTION_ENV = "SGLANG_MOE_RESIDENT_EXPERT_FRACTION"
+FRACTION_ENV = "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"
 
 needs_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -71,7 +71,7 @@ class _StubCTConfig:
 def _scheme(sym: bool):
     """A CompressedTensorsWNA16MoE with just the fields create_weights reads
     (``__new__`` skips the constructor's config-group validation)."""
-    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe import (
+    from flliper.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe import (
         CompressedTensorsWNA16MoE,
     )
 
@@ -216,7 +216,7 @@ def test_scheme_is_not_refused_by_the_quant_guard():
     """CompressedTensorsWNA16MoE now has both offload halves; the fail-fast
     guard must let it through (the NVFP4 scheme that shares the
     'w13_weight_packed' name stays refused)."""
-    from sglang.srt.layers.moe.expert_offload import (
+    from flliper.srt.layers.moe.expert_offload import (
         assert_expert_offload_quant_supported,
     )
 
@@ -240,8 +240,8 @@ def test_repack_runs_before_the_presplit(monkeypatch):
     """Order gate: the marlin repack replaces every expert tensor in place, so
     it has to be finished (``is_marlin_converted``) when the presplit stages
     them. The repack kernels are stubbed with identity transforms."""
-    from sglang.srt.layers.moe import expert_offload as eo_mod
-    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    from flliper.srt.layers.moe import expert_offload as eo_mod
+    from flliper.srt.layers.quantization.compressed_tensors.schemes import (
         compressed_tensors_wNa16_moe as ct_mod,
     )
 
@@ -330,7 +330,7 @@ def _armed_layer(monkeypatch, sym=False, num_experts=4):
     (create_weights arms it only under a CUDA ambient device)."""
     import threading
 
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     layer = FusedMoE.__new__(FusedMoE)
     torch.nn.Module.__init__(layer)
@@ -381,7 +381,7 @@ def test_stream_presplit_fires_once_when_every_expected_shard_landed(monkeypatch
 
 
 def test_stream_presplit_ignores_layers_without_the_armed_state(monkeypatch):
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     layer = FusedMoE.__new__(FusedMoE)
     torch.nn.Module.__init__(layer)

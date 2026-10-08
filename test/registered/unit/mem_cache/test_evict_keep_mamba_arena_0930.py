@@ -29,17 +29,17 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
-from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
-from sglang.srt.weg2 import handoff_pending as hp  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.pdflip import handoff_pending as hp  # noqa: E402
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "weg2"))
-from test_weg2_park_l3_248 import P, SB, SLOTS, _hicache, _publish, _Store  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pdflip"))
+from test_pdflip_park_l3_248 import P, SB, SLOTS, _hicache, _publish, _Store  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc (arena.c)")
 
-PARKED = "weg2-35-112"
+PARKED = "pdflip-35-112"
 
 
 class _MStore(_Store):
@@ -61,10 +61,10 @@ def _mamba_pool(arena, store):
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_QUEUE_REFS", "1")
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_DIR", str(tmp_path / "arena"))
-    monkeypatch.setenv("SGLANG_WEG2_HANDOFF", "1")
-    monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_QUEUE_REFS", "1")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_DIR", str(tmp_path / "arena"))
+    monkeypatch.setenv("FLLIPER_PDFLIP_HANDOFF", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
     (tmp_path / "l3").mkdir()
     arena = ShmArena(str(tmp_path / "arena-mamba.bin"), SB, SLOTS)
     store = _MStore(str(tmp_path / "l3"))

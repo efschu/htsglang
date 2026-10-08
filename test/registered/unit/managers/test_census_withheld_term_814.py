@@ -41,9 +41,9 @@ import unittest
 import unittest.mock
 from types import SimpleNamespace
 
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5)
 
@@ -99,7 +99,7 @@ def _census(
     stub._census_owner_probe = lambda *a, **k: None
     stub._pool_census = PhaseFlipRuntime._pool_census.__get__(stub, SimpleNamespace)
 
-    logger = logging.getLogger("sglang.srt.managers.phase_flip_runtime")
+    logger = logging.getLogger("flliper.srt.managers.phase_flip_runtime")
     with unittest.mock.patch.object(logger, "warning") as warn:
         stub._pool_census("at-arm", "tp_to_pp")
     assert warn.called, "the census must always emit"

@@ -22,10 +22,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.managers.cache_controller as cc
-import sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller as hcc
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+import flliper.srt.managers.cache_controller as cc
+import flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller as hcc
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 
@@ -161,7 +161,7 @@ def test_no_fence_bound_means_no_wait(fakes, make):
 
 
 def _sched(**kw):
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     ns = SimpleNamespace(**kw)
     Scheduler._bind_hicache_load_fence(ns)
@@ -208,7 +208,7 @@ def test_scheduler_bind_is_inert_without_hicache():
 
 
 def test_scheduler_wires_the_bind():
-    from sglang.srt.managers import scheduler as sched_mod
+    from flliper.srt.managers import scheduler as sched_mod
 
     src = inspect.getsource(sched_mod)
     anchor = src.index("self.tree_cache = result.tree_cache")

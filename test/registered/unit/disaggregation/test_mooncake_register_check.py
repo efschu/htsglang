@@ -11,9 +11,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -128,7 +128,7 @@ class TestMooncakeStagingRegisterCheck(CustomTestCase):
             return [] if init_name == "init_staging_buffers" else object()
 
         with patch(
-            f"sglang.srt.disaggregation.common.staging_handler.{init_name}",
+            f"flliper.srt.disaggregation.common.staging_handler.{init_name}",
             fake_init,
         ):
             method()
@@ -200,7 +200,7 @@ class TestStagingHandlerRegisterContract(CustomTestCase):
     """
 
     def test_check_register_result_accepts_none_and_zero(self):
-        from sglang.srt.disaggregation.common.staging_handler import (
+        from flliper.srt.disaggregation.common.staging_handler import (
             _check_register_result,
         )
 
@@ -208,7 +208,7 @@ class TestStagingHandlerRegisterContract(CustomTestCase):
         _check_register_result(0, 0x1000, 4096, "test buffer")
 
     def test_check_register_result_rejects_nonzero(self):
-        from sglang.srt.disaggregation.common.staging_handler import (
+        from flliper.srt.disaggregation.common.staging_handler import (
             _check_register_result,
         )
 
@@ -222,7 +222,7 @@ class TestStagingHandlerRegisterContract(CustomTestCase):
         self.assertIn("4096", msg)
 
     def test_check_register_result_rejects_false(self):
-        from sglang.srt.disaggregation.common.staging_handler import (
+        from flliper.srt.disaggregation.common.staging_handler import (
             _check_register_result,
         )
 

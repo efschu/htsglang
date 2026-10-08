@@ -2,7 +2,7 @@
 Unit tests for the RadixCache implementation.
 
 This module tests the core functionality of RadixCache, RadixKey, and TreeNode
-following SGLang testing patterns.
+following fLLiper testing patterns.
 
 Test Coverage:
 - RadixKey: token ID management, slicing, iteration, representation
@@ -17,7 +17,7 @@ Usage:
     python -m pytest test_radix_cache_unit.py::TestRadixCache::test_insert_basic
 """
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-based unit test, runs quickly on any GPU runner
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
@@ -30,15 +30,15 @@ from array import array
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from flliper.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from flliper.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
+from flliper.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4

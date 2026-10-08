@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.kv_canary.config import CanaryMode
-from sglang.srt.kv_canary.perturb.config import TargetGroupKind
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+from flliper.srt.kv_canary.config import CanaryMode
+from flliper.srt.kv_canary.perturb.config import TargetGroupKind
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.e2e_base import CanaryE2EBase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=50, stage="extra-a", runner_config="1-gpu-small-amd")
@@ -16,9 +16,9 @@ class TestPerturbRaiseMha(CanaryE2EBase):
     kv_canary_mode = CanaryMode.RAISE
     extra_server_args = ("--kv-canary-real-data", "partial", "--skip-server-warmup")
     extra_env = {
-        "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
-        "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": "full",
-        "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+        "FLLIPER_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
+        "FLLIPER_KV_CANARY_PERTURB_TARGET_GROUP": "full",
+        "FLLIPER_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
     }
 
     def test_real_kv_used_perturbation_raises_in_raise_mode(self) -> None:

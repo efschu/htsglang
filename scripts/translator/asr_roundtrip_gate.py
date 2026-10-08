@@ -61,11 +61,11 @@ async def run(args) -> int:
     import numpy as np
     import soundfile as sf
 
-    from sglang.srt.translator.backends import AudioChunk
-    from sglang.srt.translator.scoring import word_error_rate
+    from flliper.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.scoring import word_error_rate
 
     try:
-        from sglang.srt.translator.asr_backends import FasterWhisperAsr
+        from flliper.srt.translator.asr_backends import FasterWhisperAsr
     except ImportError as exc:  # pragma: no cover - environment dependent
         print(f"[gate] cannot import the recognizer adapter: {exc}")
         return 1

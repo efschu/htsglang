@@ -4,7 +4,7 @@ Gepinnt (1984 A.6 Punkt 1 und 4):
 
 * ``--editor-only`` (nur mit ``--edition release``): die Seite traegt ``data-editor-only="1"`` und blendet alles ausser dem Reiter Profil aus;
   der Server antwortet NUR Seite, Module, /healthz und die drei Editor-Routengruppen (profil, modellprofil, hwprofil) -- /api/live, /api/health,
-  /api/history, /api/launch, /api/kartenplan, /api/weg2 und alles Unbekannte sind 404. Kein Probennehmer: ``App.start`` startet keinen Thread.
+  /api/history, /api/launch, /api/kartenplan, /api/pdflip und alles Unbekannte sind 404. Kein Probennehmer: ``App.start`` startet keinen Thread.
 * ``--trust-proxy`` (nur mit ``--edition release``): hinter einem eigenen Reverse-Proxy (X-Forwarded-*) antwortet der Editor statt 403; ohne
   den Schalter bleibt der Riegel (Voreinstellung unveraendert).
 * ``main()`` verweigert beide Schalter in der Rig-Ausgabe.
@@ -78,7 +78,7 @@ class Served(unittest.TestCase):
         self.ed, self.rel, self.usr = P9.editor(self.tmp)
         self.gq = H.FakeGpuq()
         hw_tree = os.path.join(self.tmp, "hwtree")
-        d = os.path.join(hw_tree, "sglang", "srt", "rigmon")
+        d = os.path.join(hw_tree, "flliper", "srt", "rigmon")
         os.makedirs(d)
         with open(os.path.join(d, "hardware_profile.py"), "w") as fh:
             fh.write(H.STUB_MODULE)
@@ -123,7 +123,7 @@ class TestEditorOnlyRoutes(Served):
 
     def test_what_is_not_answered(self):
         for path in ("/api/live", "/api/live?lean=1&dev=0", "/api/health", "/api/history", "/api/launch", "/api/kartenplan/catalog",
-                     "/api/weg2/options", "/weg2", "/kartenplan.js", "/nichts", "/api/profil", "/api/profile/list"):
+                     "/api/pdflip/options", "/pdflip", "/kartenplan.js", "/nichts", "/api/profil", "/api/profile/list"):
             self.assertEqual(self.call("GET", path)[0], 404, path)
         for path in ("/api/live", "/api/launch", "/nichts", "/healthz", "/"):
             self.assertEqual(self.call("POST", path, {})[0], 404, path)

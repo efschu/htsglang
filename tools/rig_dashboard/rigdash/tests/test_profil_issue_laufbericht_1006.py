@@ -46,9 +46,9 @@ PROFILE_OWNER="the owner"
 PROFILE_CARD_COUNT=3
 PROFILE_INVENTORY=RTX5090,RTX3080,RTX3080
 PROFILE_ARGS=(--model /spinning/llm_stuff/models-cache/Qwen3.8-27B --p-bs 2 --pp-stage-ratio 29,11,8 --p-hostgap
-              "--extra-p=--rank-moe-ratio 183,137,168" --env-p "SGLANG_MOE_SCRATCH_SLOTS=74,48,48")
+              "--extra-p=--rank-moe-ratio 183,137,168" --env-p "FLLIPER_MOE_SCRATCH_SLOTS=74,48,48")
 profile_form_env() {
-  _form SGLANG_WEG2_OWNED_BASE stated
+  _form FLLIPER_PDFLIP_OWNED_BASE stated
 }
 """
 RIG = [{"card": "rtx3080-20", "pcie": {"gen": 4, "lanes": 4}}, {"card": "rtx5090-32", "pcie": {"gen": 5, "lanes": 8}},
@@ -175,10 +175,10 @@ class AllBlocks(Base):
         self.assertRegex(t, r"\| Base profile \(sha256\) \| `[0-9a-f]{16}` \|")
 
     def test_versions_missing_are_unbelegt_never_guessed(self):
-        os.environ.pop("SGLANG_IMAGE_TAG", None)
+        os.environ.pop("FLLIPER_IMAGE_TAG", None)
         t = self.report(versions={})["text"]
         self.assertIn("| Tree (revision) | unverified |", t)
-        self.assertIn("| Image | unverified (SGLANG_IMAGE_TAG not set) |", t)
+        self.assertIn("| Image | unverified (FLLIPER_IMAGE_TAG not set) |", t)
         self.assertIn("| Driver | unverified |", t)
 
     def test_placeholder_for_measurement_and_boot_log(self):
@@ -311,7 +311,7 @@ class Redaction(Base):
         doc = self.edited([{"key": "env:P:HF_TOKEN", "op": "set", "value": SECRET_VALUE},
                            {"key": "flag:--admin-api-key", "op": "set", "value": "adminschluessel987654"},
                            {"key": "flag:--p-bs", "op": "set", "value": "4"},
-                           {"key": "env:D:SGLANG_CACHE_DIR", "op": "set", "value": "/root/.cache/huggingface/hub"},
+                           {"key": "env:D:FLLIPER_CACHE_DIR", "op": "set", "value": "/root/.cache/huggingface/hub"},
                            {"key": "var:PROFILE_STATUS", "op": "set", "value": "matthias token=abcdefgh12345678"}])
         doc["meta"]["planner"]["env:P:HF_TOKEN"] = "hf_VORSCHLAG1234567"
         return doc
@@ -341,7 +341,7 @@ class Redaction(Base):
         for n in ("HF_TOKEN", "--hf-token", "GITHUB_PAT", "OPENAI_API_KEY", "--admin-api-key", "DB_PASSWORD", "SECRET_KEY", "--api-key",
                   "OPENROUTER_KEY", "OPENAI_KEY", "WANDB_KEY", "ANTHROPIC_KEY", "--key"):
             self.assertTrue(redact.secret_name(n), n)
-        for n in ("SGLANG_LOG_DECODE_GRAPH_KEY", "SGLANG_WEG2_TOLD_PROBE_TREE_KEY", "--ssl-keyfile", "KEYBOARD", "MONKEY"):
+        for n in ("FLLIPER_LOG_DECODE_GRAPH_KEY", "FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY", "--ssl-keyfile", "KEYBOARD", "MONKEY"):
             self.assertFalse(redact.secret_name(n), n)
         self.assertEqual(redact.value_for_issue("--max-total-tokens", "4096", KNOWN), "4096")
         self.assertEqual(redact.value_for_issue("HF_TOKEN", "x"), "<redacted>")
@@ -408,8 +408,8 @@ class Redaction(Base):
         # Befund 1/2/3: Wert OHNE ``=`` in einer Tabellenzelle, harmloser Name; Env-Wert, Flag-Wert, Vorschlag, Profilwert
         edits = [{"key": "env:P:MY_THING", "op": "set", "value": self.TOK}, {"key": "env:D:OTHER_THING", "op": "set", "value": self.TOK_LOW},
                  {"key": "env:P:JWT_THING", "op": "set", "value": self.JWT},
-                 {"key": "env:P:SGLANG_CACHE_DIR", "op": "set", "value": "/nvme/hf"}, {"key": "env:D:SGLANG_DG_CACHE_DIR", "op": "set", "value": "~/cache/hf"},
-                 {"key": "env:D:SGLANG_DEBUG_HOLD_DIR", "op": "set", "value": "$HOME/x/y"},
+                 {"key": "env:P:FLLIPER_CACHE_DIR", "op": "set", "value": "/nvme/hf"}, {"key": "env:D:FLLIPER_DG_CACHE_DIR", "op": "set", "value": "~/cache/hf"},
+                 {"key": "env:D:FLLIPER_DEBUG_HOLD_DIR", "op": "set", "value": "$HOME/x/y"},
                  {"key": "flag:--model", "op": "set", "value": "/workspace/models/Qwen"},
                  {"key": "flag:--download-dir", "op": "set", "value": "/scratch/run1"},
                  {"key": "flag:--extra-thing", "op": "set", "value": self.TOK}]
@@ -419,14 +419,14 @@ class Redaction(Base):
         self.assert_clean(t, "Tabellen")
         row = next(x for x in t.split("\n") if x.startswith("| `env:P:MY_THING`"))
         self.assertEqual(row.count(HIDDEN), 2, row)                         # unbekannter Schluessel: Wert ausgeblendet (aktuell und Vorschlag)
-        self.assertIn("<hostpfad>/hf", next(x for x in t.split("\n") if x.startswith("| `env:P:SGLANG_CACHE_DIR`")))
+        self.assertIn("<hostpfad>/hf", next(x for x in t.split("\n") if x.startswith("| `env:P:FLLIPER_CACHE_DIR`")))
         self.assertIn("<hostpfad>/Qwen", next(x for x in t.split("\n") if "--model" in x and x.startswith("| `flag:")))
         # die Zeile bleibt, nur das Geheimnis ist weg
         self.assertIn("`env:D:OTHER_THING`", t)
         # der Wert ohne Zeilenkontext (so reicht ihn _issue_cell weiter)
         for tok in (self.TOK, "`%s`" % self.TOK, self.TOK_LOW, self.JWT):
             self.assertEqual(redact.value_for_issue("MY_THING", tok, KNOWN), HIDDEN)                       # unbekannter Schluessel
-            self.assertEqual(redact.value_for_issue("SGLANG_CACHE_DIR", tok, KNOWN), "<redacted>")        # Katalog-Schluessel: die Wertform schneidet
+            self.assertEqual(redact.value_for_issue("FLLIPER_CACHE_DIR", tok, KNOWN), "<redacted>")        # Katalog-Schluessel: die Wertform schneidet
             self.assertEqual(redact.value_for_issue("MY_THING", tok), HIDDEN)                              # ohne Katalog: geschlossen
 
     def test_probe_in_free_text_notes_verdict_rejection_hardware_model_and_var(self):
@@ -471,32 +471,32 @@ class Redaction(Base):
             self.assertNotIn(self.TOK_LOW, out, form)
             self.assertIn("<redacted>", out, form)
         for keep in ("task-runner-big-name-0123456789-abcdef", "173161c595de23e0aa11bb22cc33dd44ee55ff66", "sha256:" + "ab12" * 16,
-                     "SGLANG_WEG2_LANE_COVERAGE_TOKEN_X_Y_Z_0123456789", "eyJ", "eyJ.a.b", "Qwen3.6-27B-AWQ-BF16-INT4-some-very-long-variant-name-v2"):
+                     "FLLIPER_PDFLIP_LANE_COVERAGE_TOKEN_X_Y_Z_0123456789", "eyJ", "eyJ.a.b", "Qwen3.6-27B-AWQ-BF16-INT4-some-very-long-variant-name-v2"):
             self.assertEqual(redact.text_for_issue(keep), keep, keep)
 
     def test_launcher_class_names_stay_readable_but_real_base64_does_not(self):
-        """Nacharbeit 1006 Runde 6, Befund 2: ``Weg2TpOperatingPointInfeasible`` (30 Zeichen, Gross/Klein/Ziffer) war als Base64 geschwaerzt."""
-        for text in ("W64 Weg2TpOperatingPointInfeasible: position 3 derives weights [20, 12, 8]",
-                     "W71 Weg2XchgResidencyUnarmable: the exchange's predicted VRAM residency does not fit",
-                     "W64 Weg2TpOperatingPointInfeasible: x | W71 Weg2XchgResidencyUnarmable: y",
-                     "Weg2XchgSemaphoreNotRearmed Weg2FlipPeerLegAborted Weg2DualCompactBreach"):
+        """Nacharbeit 1006 Runde 6, Befund 2: ``PdFlipTpOperatingPointInfeasible`` (30 Zeichen, Gross/Klein/Ziffer) war als Base64 geschwaerzt."""
+        for text in ("W64 PdFlipTpOperatingPointInfeasible: position 3 derives weights [20, 12, 8]",
+                     "W71 PdFlipXchgResidencyUnarmable: the exchange's predicted VRAM residency does not fit",
+                     "W64 PdFlipTpOperatingPointInfeasible: x | W71 PdFlipXchgResidencyUnarmable: y",
+                     "PdFlipXchgSemaphoreNotRearmed PdFlipPeerLegAborted PdFlipDualCompactBreach"):
             self.assertEqual(redact.text_for_issue(text), text, text)
         # ein echtes Geheimnis neben dem Klassennamen wird weiter geschnitten
-        out = redact.text_for_issue("W64 Weg2TpOperatingPointInfeasible key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY and Ab3dE9xQ2mZpL0vK7sT4wY8nR1cF6hJ5gU")
-        self.assertIn("Weg2TpOperatingPointInfeasible", out)
+        out = redact.text_for_issue("W64 PdFlipTpOperatingPointInfeasible key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY and Ab3dE9xQ2mZpL0vK7sT4wY8nR1cF6hJ5gU")
+        self.assertIn("PdFlipTpOperatingPointInfeasible", out)
         self.assertNotIn("wJalrXUtnFEMI", out)
         self.assertNotIn("Ab3dE9xQ2mZpL0vK7sT4wY8nR1cF6hJ5gU", out)
 
     def test_a_token_shaped_camelcase_run_is_cut_only_source_names_stay(self):
-        """Nacharbeit 1006 Runde 7, Befund 3: die Ausnahme ist eine LISTE (Bezeichner aus dem Launcher-/weg2-Quelltext), keine Form."""
-        for probe in ("AbcdEfghIjklMnopQrstUvwxYz12Ab", "Abcd1Efgh2Ijkl3Mnop4Qrst5Uvwx6Yzab", "Weg2AbcdEfghIjklMnopQrstUvwxYz12"):
+        """Nacharbeit 1006 Runde 7, Befund 3: die Ausnahme ist eine LISTE (Bezeichner aus dem Launcher-/pdflip-Quelltext), keine Form."""
+        for probe in ("AbcdEfghIjklMnopQrstUvwxYz12Ab", "Abcd1Efgh2Ijkl3Mnop4Qrst5Uvwx6Yzab", "PdFlipAbcdEfghIjklMnopQrstUvwxYz12"):
             out = redact.text_for_issue("note " + probe)
             self.assertNotIn(probe, out, probe)
             self.assertIn("<redacted>", out, probe)
-        self.assertEqual(redact.text_for_issue("W64 Weg2TpOperatingPointInfeasible: x"), "W64 Weg2TpOperatingPointInfeasible: x")
-        # die Liste kommt aus dem Quelltext: ein Name, der dort als Klasse steht, bleibt lesbar (Beleg: class Weg2DKvStageWavesRefused)
-        self.assertIn("Weg2DKvStageWavesRefused", redact.known_idents())
-        self.assertIn("Weg2TpOperatingPointInfeasible", redact.known_idents())
+        self.assertEqual(redact.text_for_issue("W64 PdFlipTpOperatingPointInfeasible: x"), "W64 PdFlipTpOperatingPointInfeasible: x")
+        # die Liste kommt aus dem Quelltext: ein Name, der dort als Klasse steht, bleibt lesbar (Beleg: class PdFlipDKvStageWavesRefused)
+        self.assertIn("PdFlipDKvStageWavesRefused", redact.known_idents())
+        self.assertIn("PdFlipTpOperatingPointInfeasible", redact.known_idents())
         self.assertNotIn("AbcdEfghIjklMnopQrstUvwxYz12Ab", redact.known_idents())
 
     def test_without_a_source_tree_only_the_builtin_names_stay(self):
@@ -507,7 +507,7 @@ class Redaction(Base):
             os.environ.pop("KARTENPLAN_TREE", None)
             redact._tree_candidates = lambda: []
             self.assertEqual(redact.known_idents(), redact._KNOWN_IDENT_BUILTIN)
-            self.assertEqual(redact.text_for_issue("W64 Weg2TpOperatingPointInfeasible: x"), "W64 Weg2TpOperatingPointInfeasible: x")
+            self.assertEqual(redact.text_for_issue("W64 PdFlipTpOperatingPointInfeasible: x"), "W64 PdFlipTpOperatingPointInfeasible: x")
             self.assertNotIn("AbcdEfghIjklMnopQrstUvwxYz12Ab", redact.text_for_issue("note AbcdEfghIjklMnopQrstUvwxYz12Ab"))
             self.assertIsNone(redact._known_cache)            # ohne Baum nichts gemerkt: der naechste Aufruf sucht neu
         finally:
@@ -522,27 +522,27 @@ class Redaction(Base):
                   "HF_TOKENS", "--auth-tokens", "--credential"):
             self.assertTrue(redact.secret_name(n), n)
             self.assertEqual(redact.value_for_issue(n, "x"), "<redacted>", n)
-        for n in ("--max-total-tokens", "--auth-backend", "--pass-through", "SGLANG_LOG_DECODE_GRAPH_KEY", "SGLANG_X_TREE_KEYS",
-                  "--bypass", "PATH", "KEYS_PER_SEC_X", "--tokens-per-second", "SGLANG_HICACHE_BIGRAM_KEYS", "SGLANG_WEG2_MAMBA_STATE_KEYS",
-                  "SGLANG_WEG2_D_TWIN_PASS", "--kv-session-offload-budget-session-tokens"):
+        for n in ("--max-total-tokens", "--auth-backend", "--pass-through", "FLLIPER_LOG_DECODE_GRAPH_KEY", "FLLIPER_X_TREE_KEYS",
+                  "--bypass", "PATH", "KEYS_PER_SEC_X", "--tokens-per-second", "FLLIPER_HICACHE_BIGRAM_KEYS", "FLLIPER_PDFLIP_MAMBA_STATE_KEYS",
+                  "FLLIPER_PDFLIP_D_TWIN_PASS", "--kv-session-offload-budget-session-tokens"):
             self.assertFalse(redact.secret_name(n), n)
 
     def test_values_that_are_no_secrets_survive_the_shape_layer(self):
         sha = "173161c595de23e0aa11bb22cc33dd44ee55ff66"
         for v in (sha, "sha256:" + "ab12" * 16, "tree_sha=" + sha, "image=flliper:0.1.0-cu130", "disk-cache-size=10", "task-runner-big-name-0123456789-abcdef",
-                  "SGLANG_LOG_DECODE_GRAPH_KEY=1", "model=Qwen3.6-27B-AWQ-BF16-INT4-some-very-long-variant-name-v2", "tag: SGLANG_WEG2_LANE_COVERAGE_TOKEN_X_Y_Z_0123456789",
+                  "FLLIPER_LOG_DECODE_GRAPH_KEY=1", "model=Qwen3.6-27B-AWQ-BF16-INT4-some-very-long-variant-name-v2", "tag: FLLIPER_PDFLIP_LANE_COVERAGE_TOKEN_X_Y_Z_0123456789",
                   "hf_hub_cache=1", "sk-learn is a library", "https://example.org/path:8080/x", "user@host", "ssh://git@host/repo.git"):
             self.assertEqual(redact.text_for_issue(v), v, v)
 
     def test_token_as_a_catalog_word_is_not_a_secret_but_a_token_credential_is(self):
         # Befund 1 (Review): ``token`` mitten im Namen oder als Token-ID/Zaehler loescht sonst genau die Werte, die der Laufbericht zeigen soll
         for n, v in (("--d-token-placement", "bandwidth"), ("--d-kv-token-cut", "owned"), ("--turn-anchor-token", "248045"),
-                     ("--uneven-token-vector", "1,2,3"), ("SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION", "1"),
-                     ("SGLANG_UNEVEN_TOKEN_VECTOR", "4,5"), ("--fork-anchor-token", "7"), ("SGLANG_WEG2_LANE_COVERAGE_TOKEN", "x"),
+                     ("--uneven-token-vector", "1,2,3"), ("FLLIPER_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION", "1"),
+                     ("FLLIPER_UNEVEN_TOKEN_VECTOR", "4,5"), ("--fork-anchor-token", "7"), ("FLLIPER_PDFLIP_LANE_COVERAGE_TOKEN", "x"),
                      ("--bucket-time-to-first-token", "0.1"), ("--kt-max-deferred-experts-per-token", "2")):
             self.assertFalse(redact.secret_name(n), n)
             self.assertEqual(redact.value_for_issue(n, v, KNOWN), v, n)
-        for n in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN", "--hf-token", "--token", "MY_SERVICE_TOKEN", "HF_TOKEN_FILE", "SGLANG_WEG2_BOOT_TOKEN",
+        for n in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN", "--hf-token", "--token", "MY_SERVICE_TOKEN", "HF_TOKEN_FILE", "FLLIPER_PDFLIP_BOOT_TOKEN",
                   "--auth-token", "SLACK_BOT_TOKEN"):
             self.assertTrue(redact.secret_name(n), n)
             self.assertEqual(redact.value_for_issue(n, "abc"), "<redacted>", n)
@@ -552,8 +552,8 @@ class Redaction(Base):
             names = sorted(json.load(f)["entries"])
         self.assertGreater(len(names), 2000)
         hits = [n for n in names if redact.secret_name(n)]
-        self.assertEqual(hits, ["--admin-api-key", "--api-key", "--ssl-keyfile-password", "SGLANG_REGISTRY_ADMIN_API_KEY", "SGLANG_REGISTRY_API_KEY",
-                                "SGLANG_WEG2_BOOT_TOKEN"])
+        self.assertEqual(hits, ["--admin-api-key", "--api-key", "--ssl-keyfile-password", "FLLIPER_REGISTRY_ADMIN_API_KEY", "FLLIPER_REGISTRY_API_KEY",
+                                "FLLIPER_PDFLIP_BOOT_TOKEN"])
         for n in names:
             if "token" in n.lower() and n not in hits:           # jeder harmlose Token-Name behaelt seinen Wert
                 self.assertEqual(redact.value_for_issue(n, "7", KNOWN), "7", n)
@@ -575,14 +575,14 @@ class Redaction(Base):
         vf = hwprofil.version_facts({}, {"tree": "/nonexistent/python"}, environ={"HTSGLANG_REVISION_NF": "abcdef1234567", "HTSGLANG_REVISION_27B": sha,
                                                                                   "HTSGLANG_REVISION": "0000000", "STAND": "nf"})
         self.assertEqual((vf["tree_rev"], vf["tree_rev_src"]), ("abcdef1234567", "Image-ENV HTSGLANG_REVISION_NF"))
-        vf = hwprofil.version_facts({}, {}, environ={"SGLANG_BUILD_COMMIT": sha})
-        self.assertEqual((vf["tree_rev"], vf["tree_rev_src"]), (sha, "Image-ENV SGLANG_BUILD_COMMIT"))
+        vf = hwprofil.version_facts({}, {}, environ={"FLLIPER_BUILD_COMMIT": sha})
+        self.assertEqual((vf["tree_rev"], vf["tree_rev_src"]), (sha, "Image-ENV FLLIPER_BUILD_COMMIT"))
         # Dockerfile-Defaults sind kein Beleg
-        vf = hwprofil.version_facts({}, {}, environ={"SGLANG_BUILD_COMMIT": "unknown", "SGLANG_IMAGE_TAG": "local/sglang:dev"})
+        vf = hwprofil.version_facts({}, {}, environ={"FLLIPER_BUILD_COMMIT": "unknown", "FLLIPER_IMAGE_TAG": "local/flliper:dev"})
         self.assertIsNone(vf["tree_rev"])
         self.assertTrue(vf["image_default"])
         self.assertEqual(hwprofil.version_tree_text(vf), "unverified")
-        self.assertIn("unverified (default local/sglang:dev", hwprofil.version_image_text(vf))
+        self.assertIn("unverified (default local/flliper:dev", hwprofil.version_image_text(vf))
         # kein Env-Wert, der nach nichts aussieht
         self.assertIsNone(hwprofil.version_facts({}, {}, environ={"HTSGLANG_REVISION": "not-a-sha"})["tree_rev"])
 
@@ -611,10 +611,10 @@ class Redaction(Base):
     def test_the_laufbericht_names_the_revision_of_a_release_image(self):
         sha = "173161c595de23e0aa11bb22cc33dd44ee55ff66"
         vf = hwprofil.version_facts({"driver": "575.57.08"}, {"tree": "/opt/htsglang/src/python"},
-                                    environ={"HTSGLANG_REVISION": sha, "SGLANG_IMAGE_TAG": "local/sglang:dev"})
+                                    environ={"HTSGLANG_REVISION": sha, "FLLIPER_IMAGE_TAG": "local/flliper:dev"})
         t = self.report(doc=self.edited([]), versions=vf)["text"]
         self.assertIn("| Tree (revision) | %s (Image-ENV HTSGLANG_REVISION) |" % sha, t)
-        self.assertIn("| Image | unverified (default local/sglang:dev", t)
+        self.assertIn("| Image | unverified (default local/flliper:dev", t)
 
     def test_every_markdown_row_stays_one_line(self):
         doc = self.edited([{"key": "flag:--p-bs", "op": "set", "value": "a|b\nc"}])
@@ -668,23 +668,23 @@ class StructuralAllowRule(Base):
 
     def test_catalog_keys_with_harmless_values_stay_visible(self):
         doc = self.edited([{"key": "flag:--p-bs", "op": "set", "value": "4"},
-                           {"key": "env:P:SGLANG_CACHE_DIR", "op": "set", "value": "/models-cache/Qwen3.8-27B/cache"},
+                           {"key": "env:P:FLLIPER_CACHE_DIR", "op": "set", "value": "/models-cache/Qwen3.8-27B/cache"},
                            {"key": "flag:--d-token-placement", "op": "set", "value": "roundrobin"}])
         t = self.report(doc=doc, dry=None)["text"]
         self.assertIn("| `flag:--p-bs` | 4 |", t)
         self.assertIn("roundrobin", self.row(t, "flag:--d-token-placement"))
-        row = self.row(t, "env:P:SGLANG_CACHE_DIR")
+        row = self.row(t, "env:P:FLLIPER_CACHE_DIR")
         self.assertIn("/models-cache/Qwen3.8-27B/cache", row)               # ein Pfad unter dem Mount des Containers ist kein Hostpfad
         self.assertNotIn(HIDDEN, row)
         self.assertNotIn("<hostpfad>", row)
 
     def test_a_catalog_key_with_a_secret_value_is_cut_by_the_second_layer(self):
-        doc = self.edited([{"key": "env:P:SGLANG_CACHE_DIR", "op": "set", "value": self.AWS}, {"key": "env:D:SGLANG_DG_CACHE_DIR", "op": "set", "value": self.DISCORD}])
+        doc = self.edited([{"key": "env:P:FLLIPER_CACHE_DIR", "op": "set", "value": self.AWS}, {"key": "env:D:FLLIPER_DG_CACHE_DIR", "op": "set", "value": self.DISCORD}])
         t = self.report(doc=doc, dry=None)["text"]
         for v in (self.AWS, self.DISCORD):
             self.assertNotIn(v[:20], t)
-        self.assertIn("<redacted>", self.row(t, "env:P:SGLANG_CACHE_DIR"))
-        self.assertIn("<redacted>", self.row(t, "env:D:SGLANG_DG_CACHE_DIR"))
+        self.assertIn("<redacted>", self.row(t, "env:P:FLLIPER_CACHE_DIR"))
+        self.assertIn("<redacted>", self.row(t, "env:D:FLLIPER_DG_CACHE_DIR"))
 
     def test_a_secret_name_in_the_catalog_stays_entfernt_and_unknown_is_not_entfernt(self):
         doc = self.edited([{"key": "flag:--api-key", "op": "set", "value": "klartext"}, {"key": "env:P:SOME_FREE_NAME", "op": "set", "value": "1"}])
@@ -696,7 +696,7 @@ class StructuralAllowRule(Base):
     def test_the_rule_in_redact_directly(self):
         self.assertEqual(redact.value_for_issue("--p-bs", "4", KNOWN), "4")
         self.assertEqual(redact.value_for_issue("flag:--p-bs", "4", KNOWN), "4")                   # Profilschluessel mit Praefix
-        self.assertEqual(redact.value_for_issue("env:P:SGLANG_CACHE_DIR", "/app/x", KNOWN), "/app/x")
+        self.assertEqual(redact.value_for_issue("env:P:FLLIPER_CACHE_DIR", "/app/x", KNOWN), "/app/x")
         self.assertEqual(redact.value_for_issue("env:P:MY_THING", "4", KNOWN), HIDDEN)
         self.assertEqual(redact.value_for_issue("extra:P:--nicht-im-katalog", "4", KNOWN), HIDDEN)
         self.assertEqual(redact.value_for_issue("--p-bs", "4"), HIDDEN)                            # ohne Katalog nichts zeigen
@@ -709,7 +709,7 @@ class StructuralAllowRule(Base):
     def test_new_shapes_spare_names_hashes_and_hosts(self):
         for keep in ("registry.example-company-internal.com", "Qwen3.6-27B-AWQ-BF16-INT4.gguf", "model-00001-of-00004.safetensors", "ghcr.io/efschu/htsglang:0.1.0-cu130",
                      "173161c595de23e0aa11bb22cc33dd44ee55ff66", "/models-cache/Qwen3Coder30BA3BInstructX1/abcDEF12345", "ja/nein", "GB/s", "RTX 3080 / 5090",
-                     "python/sglang/srt/weg2/profile_json.py", "https://host.example/a/b/c", "1.2.3.4"):
+                     "python/flliper/srt/pdflip/profile_json.py", "https://host.example/a/b/c", "1.2.3.4"):
             self.assertEqual(redact.text_for_issue(keep), keep, keep)
         for secret in (self.DISCORD, "x." + self.MIXED24 + ".Cl2" + "FMQ" + "y" * 16, "Ab1+" * 10 + "==", self.AWS):
             self.assertEqual(redact.text_for_issue(secret), "<redacted>", secret)
@@ -812,12 +812,12 @@ class HwProfilBlocks(unittest.TestCase):
         self.assertLess(len(short), len(long_))
 
     def test_version_facts_and_long_text_unchanged(self):
-        os.environ.pop("SGLANG_IMAGE_TAG", None)
+        os.environ.pop("FLLIPER_IMAGE_TAG", None)
         f = hwprofil.version_facts(HW, {"tree": "/opt/x/releases/173161c595de23e0/python", "rigdash": "r"})
         self.assertEqual((f["tree_rev"], f["driver"], f["image"], f["rigdash"]), ("173161c595de23e0", "575.57.08", None, "r"))
         t = hwprofil.issue_text(HW, versions={"tree": "/opt/x/releases/173161c595de23e0/python"})
         self.assertIn("| Tree | 173161c595de23e0 |", t)
-        self.assertIn("| Image | unverified (SGLANG_IMAGE_TAG not set) |", t)
+        self.assertIn("| Image | unverified (FLLIPER_IMAGE_TAG not set) |", t)
 
 
 HARNESS = r"""

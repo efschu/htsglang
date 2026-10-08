@@ -20,14 +20,14 @@ from unittest.mock import MagicMock, patch
 from torch.cuda import Event as CudaEvent
 from torch.cuda import Stream as CudaStream
 
-from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader, LoRAOverlapLoadStatus
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.lora_utils import (
+from flliper.srt.lora.lora_manager import LoRAManager
+from flliper.srt.lora.lora_overlap_loader import LoRAOverlapLoader, LoRAOverlapLoadStatus
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     run_lora_batch_splitting_equivalence_test,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=48, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=75, suite="stage-b-test-1-gpu-small-amd")
@@ -49,7 +49,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
     mock_torch: MagicMock
 
     def setUp(self):
-        self.torch_patcher = patch("sglang.srt.lora.lora_overlap_loader.torch")
+        self.torch_patcher = patch("flliper.srt.lora.lora_overlap_loader.torch")
         self.mock_torch = self.torch_patcher.start()
 
         self.mock_device_module = MagicMock()

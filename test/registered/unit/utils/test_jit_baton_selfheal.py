@@ -47,15 +47,15 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 from torch.utils.file_baton import FileBaton  # noqa: E402
 
 # THE REAL MODULE, imported -- not re-implemented here.
-from sglang.jit_kernel.baton_health import (  # noqa: E402
+from flliper.jit_kernel.baton_health import (  # noqa: E402
     BATON_ORPHAN_MARKER,
     baton_verdict,
     claim_baton,
@@ -233,11 +233,11 @@ class TestBatonSelfHeal(CustomTestCase):
             self.assertEqual(verdict.action, "reclaim")
             self.assertIn("limit", verdict.reason)
 
-            os.environ["SGLANG_JIT_BATON_MAX_WAIT_SECONDS"] = "10"
+            os.environ["FLLIPER_JIT_BATON_MAX_WAIT_SECONDS"] = "10"
             try:
                 self.assertTrue(self._wait(d / "lock", 5.0))
             finally:
-                del os.environ["SGLANG_JIT_BATON_MAX_WAIT_SECONDS"]
+                del os.environ["FLLIPER_JIT_BATON_MAX_WAIT_SECONDS"]
             self.assertFalse((d / "lock").exists())
 
     def test_age_limit_without_artifact_fails_by_name(self):
@@ -250,12 +250,12 @@ class TestBatonSelfHeal(CustomTestCase):
             verdict = baton_verdict(d / "lock", max_wait_seconds=10.0)
             self.assertEqual(verdict.action, "fail")
 
-            os.environ["SGLANG_JIT_BATON_MAX_WAIT_SECONDS"] = "10"
+            os.environ["FLLIPER_JIT_BATON_MAX_WAIT_SECONDS"] = "10"
             try:
                 with self.assertRaises(RuntimeError) as caught:
                     self._wait(d / "lock", 5.0)
             finally:
-                del os.environ["SGLANG_JIT_BATON_MAX_WAIT_SECONDS"]
+                del os.environ["FLLIPER_JIT_BATON_MAX_WAIT_SECONDS"]
             message = str(caught.exception)
             self.assertIn(BATON_ORPHAN_MARKER, message)
             self.assertIn(str(d), message)
@@ -277,7 +277,7 @@ class TestBatonSelfHeal(CustomTestCase):
 
     def test_a_live_cache_health_marker_vetoes_reclaiming(self):
         """A co-located rank that says it is building is believed."""
-        from sglang.jit_kernel.cache_health import MARKER_BUILDING, _hostname
+        from flliper.jit_kernel.cache_health import MARKER_BUILDING, _hostname
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -355,11 +355,11 @@ class TestBatonSelfHeal(CustomTestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             d = _build_dir(root, "disabled", age=OLD)
-            os.environ["SGLANG_JIT_BATON_SELFHEAL"] = "0"
+            os.environ["FLLIPER_JIT_BATON_SELFHEAL"] = "0"
             try:
                 self.assertFalse(self._wait(d / "lock", 1.0))
             finally:
-                del os.environ["SGLANG_JIT_BATON_SELFHEAL"]
+                del os.environ["FLLIPER_JIT_BATON_SELFHEAL"]
             self.assertTrue((d / "lock").exists())
 
     def test_install_is_idempotent(self):

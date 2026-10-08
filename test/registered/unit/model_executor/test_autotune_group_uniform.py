@@ -25,7 +25,7 @@ from datetime import timedelta
 
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -51,7 +51,7 @@ def _worker(rank, port, tunes, out):
     )
     from unittest import mock
 
-    from sglang.srt.model_executor.runner import base_runner as BR
+    from flliper.srt.model_executor.runner import base_runner as BR
 
     group = dist.new_group([0, 1], backend="gloo", timeout=timedelta(seconds=15))
     seq = []
@@ -147,7 +147,7 @@ class TestGroupUniformAutotune(unittest.TestCase):
 
 class TestLocalShortcuts(unittest.TestCase):
     def test_single_rank_and_rank_local_runners_issue_no_collective(self):
-        from sglang.srt.model_executor.runner.flashinfer_autotune import (
+        from flliper.srt.model_executor.runner.flashinfer_autotune import (
             agree_flashinfer_autotune_across_group as agree,
         )
 

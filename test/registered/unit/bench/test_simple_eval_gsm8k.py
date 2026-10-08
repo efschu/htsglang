@@ -6,9 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.run_eval import _run_sgl_eval
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.run_eval import _run_sgl_eval
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
@@ -56,7 +56,7 @@ class TestRunSglEval(CustomTestCase):
             out_dir = Path(td)
             args = self._args(td)
             with patch(
-                "sglang.test.run_eval.subprocess.run",
+                "flliper.test.run_eval.subprocess.run",
                 side_effect=self._fake_run_factory(out_dir, "gsm8k", payload),
             ):
                 metrics = _run_sgl_eval("gsm8k", args)
@@ -88,7 +88,7 @@ class TestRunSglEval(CustomTestCase):
 
         with tempfile.TemporaryDirectory() as td:
             args = self._args(td)
-            with patch("sglang.test.run_eval.subprocess.run", side_effect=fake_run):
+            with patch("flliper.test.run_eval.subprocess.run", side_effect=fake_run):
                 _run_sgl_eval("gsm8k", args)
 
         cmd = captured["cmd"]
@@ -124,7 +124,7 @@ class TestRunSglEval(CustomTestCase):
 
         with tempfile.TemporaryDirectory() as td:
             args = self._args(td, num_examples=None)
-            with patch("sglang.test.run_eval.subprocess.run", side_effect=fake_run):
+            with patch("flliper.test.run_eval.subprocess.run", side_effect=fake_run):
                 _run_sgl_eval("gsm8k", args)
 
         self.assertNotIn("--num-examples", captured["cmd"])
@@ -135,7 +135,7 @@ class TestRunSglEval(CustomTestCase):
 
         with tempfile.TemporaryDirectory() as td:
             args = self._args(td)
-            with patch("sglang.test.run_eval.subprocess.run", side_effect=fake_run):
+            with patch("flliper.test.run_eval.subprocess.run", side_effect=fake_run):
                 with self.assertRaises(RuntimeError) as cm:
                     _run_sgl_eval("gsm8k", args)
             self.assertIn("exit code 2", str(cm.exception))
@@ -146,7 +146,7 @@ class TestRunSglEval(CustomTestCase):
 
         with tempfile.TemporaryDirectory() as td:
             args = self._args(td)
-            with patch("sglang.test.run_eval.subprocess.run", side_effect=fake_run):
+            with patch("flliper.test.run_eval.subprocess.run", side_effect=fake_run):
                 with self.assertRaises(FileNotFoundError):
                     _run_sgl_eval("gsm8k", args)
 
@@ -161,7 +161,7 @@ class TestRunSglEval(CustomTestCase):
             out_dir = Path(td)
             args = self._args(td)
             with patch(
-                "sglang.test.run_eval.subprocess.run",
+                "flliper.test.run_eval.subprocess.run",
                 side_effect=self._fake_run_factory(out_dir, "gsm8k", payload),
             ):
                 with self.assertRaises(KeyError):

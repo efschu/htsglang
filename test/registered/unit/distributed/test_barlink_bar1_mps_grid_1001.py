@@ -14,7 +14,7 @@ preempts whole contexts, so the same load is slow but never cyclic.
 DANGER DIRECTIONS guarded here:
 * an MPS client (CUDA_MPS_PIPE_DIRECTORY set) gets NO cooperative variant by
   default -- every spin kernel is one block, no co-residency demand;
-* an explicit SGLANG_BARLINK_BAR1_GRID_THRESHOLD still wins (measurements);
+* an explicit FLLIPER_BARLINK_BAR1_GRID_THRESHOLD still wins (measurements);
 * a non-MPS process keeps the 4 MiB default (default path unchanged);
 * the transport consults this one function.
 """
@@ -25,9 +25,9 @@ import os
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.distributed.device_communicators import barlink_bar1 as B
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.device_communicators import barlink_bar1 as B
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -42,9 +42,9 @@ class Bar1MpsGrid(CustomTestCase):
         self.assertGreaterEqual(thr, 1 << 62)
 
     def test_explicit_threshold_wins(self):
-        env = {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps/pipe", "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": "8388608"}
+        env = {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps/pipe", "FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": "8388608"}
         self.assertEqual(B.grid_threshold_default(env), 8 << 20)
-        self.assertEqual(B.grid_threshold_default({"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": "1024"}), 1024)
+        self.assertEqual(B.grid_threshold_default({"FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": "1024"}), 1024)
 
     def test_transport_uses_it(self):
         src = inspect.getsource(B.BarlinkBar1Transport.__init__)

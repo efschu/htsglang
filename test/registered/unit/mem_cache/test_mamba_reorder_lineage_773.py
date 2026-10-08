@@ -39,20 +39,20 @@ import os
 import unittest
 from unittest import mock
 
-import sglang.srt.mem_cache.mamba_pool_floor as floor_mod
+import flliper.srt.mem_cache.mamba_pool_floor as floor_mod
 
-from sglang.srt.mem_cache.mamba_pool_floor import (
+from flliper.srt.mem_cache.mamba_pool_floor import (
     mamba_hard_floor,
     mamba_reorder_lineage_supported,
     mamba_slot_reorder_active,
     mamba_slots_per_running_req,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5)
 
-REORDER_ENV = "SGLANG_MAMBA_SLOT_REORDER"
+REORDER_ENV = "FLLIPER_MAMBA_SLOT_REORDER"
 
 
 class _Args:

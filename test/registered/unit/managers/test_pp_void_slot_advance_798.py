@@ -35,7 +35,7 @@ deleted arc nor the downstream refusal can come back unnoticed.
 import types
 import unittest
 
-from sglang.srt.managers.scheduler_pp_mixin import (
+from flliper.srt.managers.scheduler_pp_mixin import (
     SchedulerPPMixin,
     pp_upstream_void_pending,
 )

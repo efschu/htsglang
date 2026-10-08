@@ -18,7 +18,7 @@ PINNED
 All hermetic: hand-built trees and pools (real ``UnifiedTreeNode``), no arena file, no GPU.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -31,23 +31,23 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
-from sglang.srt.weg2 import dual_arena_spill as D
-from sglang.srt.weg2 import dual_d_kv_stage as DK
-from sglang.srt.weg2 import dual_p_kv_stage as PK
-from sglang.srt.weg2 import dual_pkvwait_instr as PI
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
+from flliper.srt.pdflip import dual_arena_spill as D
+from flliper.srt.pdflip import dual_d_kv_stage as DK
+from flliper.srt.pdflip import dual_p_kv_stage as PK
+from flliper.srt.pdflip import dual_pkvwait_instr as PI
 
 FULL = ComponentType.FULL
-GATE_KEYS = ("SGLANG_WEG2_DUAL_LAYOUT", "SGLANG_WEG2_GROUP", PK.MAX_TOKENS_ENV, DK.MAX_TOKENS_ENV, PI.ENV_NAME)
-DUAL_P = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P", PK.MAX_TOKENS_ENV: "131072"}
-DUAL_D = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D", DK.MAX_TOKENS_ENV: "262144"}
+GATE_KEYS = ("FLLIPER_PDFLIP_DUAL_LAYOUT", "FLLIPER_PDFLIP_GROUP", PK.MAX_TOKENS_ENV, DK.MAX_TOKENS_ENV, PI.ENV_NAME)
+DUAL_P = {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P", PK.MAX_TOKENS_ENV: "131072"}
+DUAL_D = {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D", DK.MAX_TOKENS_ENV: "262144"}
 NOT_DUAL = [
     {},
-    {"SGLANG_WEG2_GROUP": "P"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1"},
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"},           # no P KV cap: not armed
-    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D"},           # no D KV cap: not armed
+    {"FLLIPER_PDFLIP_GROUP": "P"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1"},
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P"},           # no P KV cap: not armed
+    {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D"},           # no D KV cap: not armed
 ]
 
 
@@ -210,9 +210,9 @@ def test_blocked_kinds_and_end_anchor_are_named(monkeypatch):
     n.write_through_pending_id = 3
     assert D._reason(c, n, _Pool(), set()) == "blocked_wt_pending_id"
     n.write_through_pending_id = None
-    c._weg2_direct_mamba_rows = {n.id: 1}
+    c._pdflip_direct_mamba_rows = {n.id: 1}
     assert D._reason(c, n, _Pool(), set()) == "blocked_direct_mamba_rows"
-    c._weg2_direct_mamba_rows = {}
+    c._pdflip_direct_mamba_rows = {}
     assert D._reason(c, n, _Pool(), set()) is None
 
 
@@ -254,9 +254,9 @@ def test_switch_off_is_silent_and_the_default_is_on(monkeypatch, caplog):
 
 
 def test_environ_registers_the_switch_default_on():
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
-    assert envs.SGLANG_WEG2_DUAL_PKVWAIT_INSTR.get() is True
+    assert envs.FLLIPER_PDFLIP_DUAL_PKVWAIT_INSTR.get() is True
 
 
 # ---------------------------------------------------------------- rate limit
@@ -300,7 +300,7 @@ def test_d_arena_yield_prints_the_census_with_who_dyield(monkeypatch, caplog):
     c.page_size = 1
     pool = _Pool()
     pool.arena = types.SimpleNamespace(stats=lambda: {"complete": 7, "slots": 9})
-    c._weg2_direct_pool = lambda: pool
+    c._pdflip_direct_pool = lambda: pool
     got = D.d_yield_arena(types.SimpleNamespace(tree_cache=c), 10)
     assert got["candidates"] == 4                      # A, B, C and `skipped` (D's yield passes no skip set)
     ls = _lines(caplog, "spill_dyield")
@@ -388,10 +388,10 @@ def _sched(top_row=155645, parked=(), running=(), tree=None):
     return types.SimpleNamespace(
         req_to_token_pool=types.SimpleNamespace(req_to_token=r2t),
         running_batch=types.SimpleNamespace(reqs=list(running)), chunked_req=None, waiting_queue=[],
-        weg2_d_parked=list(parked), tree_cache=tree)
+        pdflip_d_parked=list(parked), tree_cache=tree)
 
 
-def _req(rid="weg2-0-119", idx=0):
+def _req(rid="pdflip-0-119", idx=0):
     return types.SimpleNamespace(rid=rid, req_pool_idx=idx, origin_input_ids=[1, 2, 3], output_ids=[])
 
 
@@ -408,7 +408,7 @@ class _OTree:
 
 def test_owner_is_a_request_when_a_request_holds_the_row():
     out = PI.top_row_owner(_sched(parked=[_req()]), 155645, 1)
-    assert out["owner"] == "req" and out["req_state"] == "parked" and out["rid"] == "weg2-0-119"
+    assert out["owner"] == "req" and out["req_state"] == "parked" and out["rid"] == "pdflip-0-119"
     out = PI.top_row_owner(_sched(running=[_req("r1")]), 155645, 1)
     assert out["owner"] == "req" and out["req_state"] == "running" and out["rid"] == "r1"
 
@@ -447,7 +447,7 @@ def test_shrink_blocked_line_prints_every_condition_and_the_owner(monkeypatch, c
     assert f["floor_blocks"] == "1" and f["floor_is_local"] == "1" and f["live_row"] == "155645"
     assert f["holds"] == "1" and f["parked"] == "1" and f["p_missing"] == "0" and f["regrow_hold"] == "0"
     assert f["p_wait_s"] == "36.000" and f["avail_min"] == "12345"
-    assert f["owner"] == "req" and f["req_state"] == "parked" and f["rid"] == "weg2-0-119"
+    assert f["owner"] == "req" and f["req_state"] == "parked" and f["rid"] == "pdflip-0-119"
 
 
 def test_shrink_blocked_reason_none_is_printed_as_none(monkeypatch, caplog):

@@ -44,8 +44,8 @@ WHAT IT CHECKS, and where each requirement comes from:
 
   C5 TRANSIENT CENSUS. Without a census for the target stage a flip is
      REFUSED rather than priced at zero (same help text; ticket P3). The
-     census is written under SGLANG_RESIDENCY_CENSUS_DIR (environ.py:659)
-     with SGLANG_TRANSIENT_CENSUS=1 (:667).
+     census is written under FLLIPER_RESIDENCY_CENSUS_DIR (environ.py:659)
+     with FLLIPER_TRANSIENT_CENSUS=1 (:667).
 
 EXIT CODES
   0  every check PASSed (and, with --strict, none were SKIPped)
@@ -118,7 +118,7 @@ def info(name: str, msg: str) -> None:
 def check_flags_parse() -> None:
     name = "flags-parse"
     try:
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
     except Exception as exc:  # pragma: no cover - import failure is the finding
         bad(name, f"cannot import server_args ({type(exc).__name__}: {exc})")
         return
@@ -150,7 +150,7 @@ def check_entry_gate(path: str | None) -> None:
         skip(name, "no --evidence given; act would be refused (gate closed, no file)")
         return
     try:
-        from sglang.srt.managers.regime_stages import load_gate_evidence
+        from flliper.srt.managers.regime_stages import load_gate_evidence
     except Exception as exc:
         bad(name, f"cannot import regime_stages ({type(exc).__name__}: {exc})")
         return
@@ -550,7 +550,7 @@ def main(argv=None) -> int:
         ),
     )
     ap.add_argument(
-        "--census-dir", help="SGLANG_RESIDENCY_CENSUS_DIR of the census run"
+        "--census-dir", help="FLLIPER_RESIDENCY_CENSUS_DIR of the census run"
     )
     ap.add_argument(
         "--stage",

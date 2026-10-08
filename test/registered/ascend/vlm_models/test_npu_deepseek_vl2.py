@@ -1,8 +1,8 @@
 import unittest
 
-from sglang.test.ascend.test_ascend_utils import DEEPSEEK_VL2_WEIGHTS_PATH
-from sglang.test.ascend.vlm_utils import TestVLMModels
-from sglang.test.ci.ci_register import register_npu_ci
+from flliper.test.ascend.test_ascend_utils import DEEPSEEK_VL2_WEIGHTS_PATH
+from flliper.test.ascend.vlm_utils import TestVLMModels
+from flliper.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=400,

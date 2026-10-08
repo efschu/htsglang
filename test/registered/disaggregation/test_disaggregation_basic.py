@@ -13,15 +13,15 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
-from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
-from sglang.test.kits.spec_server_kits import SpecGrammarKit
-from sglang.test.run_eval import run_eval
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.json_constrained_kit import JSONConstrainedMixin
+from flliper.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
+from flliper.test.kits.spec_server_kits import SpecGrammarKit
+from flliper.test.run_eval import run_eval
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -267,13 +267,13 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        os.environ["SGLANG_TEST_RETRACT"] = "true"
+        os.environ["FLLIPER_TEST_RETRACT"] = "true"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.launch_all()
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("SGLANG_TEST_RETRACT")
+        os.environ.pop("FLLIPER_TEST_RETRACT")
         super().tearDownClass()
 
     def test_gsm8k(self):
@@ -512,7 +512,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
                 self.assertGreater(len(body["text"]), 0)
 
     async def _get_num_running_reqs(self, session):
-        """Query sglang:num_running_reqs from prefill node's /metrics."""
+        """Query flliper:num_running_reqs from prefill node's /metrics."""
         async with session.get(
             self.prefill_url + "/metrics",
             timeout=aiohttp.ClientTimeout(total=5),
@@ -523,7 +523,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
                 # Match the gauge line, skip HELP/TYPE comments and
                 # per-priority breakdowns (which have priority="<int>")
                 if (
-                    line.startswith("sglang:num_running_reqs{")
+                    line.startswith("flliper:num_running_reqs{")
                     and "priority=" not in line
                 ):
                     return int(float(line.split()[-1]))

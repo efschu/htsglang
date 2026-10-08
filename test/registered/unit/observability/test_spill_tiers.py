@@ -19,9 +19,9 @@ truth:
 
 import unittest
 
-from sglang.srt.observability import spill_tiers as st
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.observability import spill_tiers as st
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -218,7 +218,7 @@ class TestCollect(CustomTestCase):
         self.assertNotIn(st.TIER_KV_SESSION_HOST, used)
 
     def test_tier_ids_match_the_dashboard_catalogue(self):
-        from sglang.srt.planner import tier_occupancy
+        from flliper.srt.planner import tier_occupancy
 
         rows = {r.id for r in tier_occupancy.tier_rows("")}
         self.assertIn(st.TIER_EXPERT_HOST, rows)
@@ -244,9 +244,9 @@ class TestPrometheusRoundTrip(CustomTestCase):
     _PROG = r'''
 import types, json
 from prometheus_client import REGISTRY, generate_latest
-from sglang.srt.observability.metrics_collector import (
+from flliper.srt.observability.metrics_collector import (
     SchedulerMetricsCollector, SchedulerStats)
-from sglang.srt.planner import tier_occupancy as to
+from flliper.srt.planner import tier_occupancy as to
 
 sa = types.SimpleNamespace(
     enable_metrics=True, enable_metrics_for_all_schedulers=False,

@@ -50,13 +50,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.model_executor import dual_group_lane as dgl
-from sglang.srt.model_executor.dual_group_lane import (
+from flliper.srt.model_executor import dual_group_lane as dgl
+from flliper.srt.model_executor.dual_group_lane import (
     DualGroupLane,
     plan_prefill_chunks,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 

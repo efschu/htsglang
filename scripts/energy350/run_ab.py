@@ -8,7 +8,7 @@ The original ``tokj_validation.sh`` was written at a desk and never executed.
 The #350 validation window found two defects in it, both fatal and both of the
 same kind -- an interface assumed rather than checked:
 
-1. it passed ``--base-url`` to ``sglang.srt.planner.energy``, whose flag is
+1. it passed ``--base-url`` to ``flliper.srt.planner.energy``, whose flag is
    ``--port``; and
 2. it booted a server itself and then pointed the harness at it, but the #146
    harness OWNS THE BOOT (``run_measurement`` builds the launch command from a
@@ -70,7 +70,7 @@ def build_config(
 ):
     """One arm's MeasurementConfig. Imports live here so --dry-run works
     without the heavy import chain being a hard requirement of the module."""
-    from sglang.srt.planner.energy import (
+    from flliper.srt.planner.energy import (
         CODE_WORKLOAD,
         PROSE_WORKLOAD,
         MeasurementConfig,
@@ -95,9 +95,9 @@ def build_config(
         workloads=(workloads[workload_name],),
         port=port,
         extra_env={
-            "SGLANG_UNEVEN_DCP": "1",
-            "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
-            "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
+            "FLLIPER_UNEVEN_DCP": "1",
+            "FLLIPER_UNEVEN_DCP_WEIGHTED": "1",
+            "FLLIPER_MAMBA_SSM_DTYPE": "bfloat16",
         },
         extra_flags=flags,
     )
@@ -128,7 +128,7 @@ def _measure(config, *, dry_run: bool) -> Dict[str, Any]:
             "flags": list(config.extra_flags),
         }
 
-    from sglang.srt.planner.energy import run_measurement
+    from flliper.srt.planner.energy import run_measurement
 
     t0 = time.time()
     res = run_measurement(config)

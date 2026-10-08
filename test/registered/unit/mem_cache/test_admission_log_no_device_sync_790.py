@@ -68,12 +68,12 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
-_LOGGER_NAME = "sglang.srt.mem_cache.memory_pool"
+_LOGGER_NAME = "flliper.srt.mem_cache.memory_pool"
 
 
 class _TripwireError(AssertionError):
@@ -165,7 +165,7 @@ class TheHelperNeverReadsTheTensorsValue(unittest.TestCase):
     means something."""
 
     def setUp(self):
-        from sglang.srt.mem_cache import memory_pool as m
+        from flliper.srt.mem_cache import memory_pool as m
 
         self.m = m
 
@@ -207,7 +207,7 @@ class TheAdmissionLogSiteIsSyncFree(unittest.TestCase):
     green while the real one regresses."""
 
     def setUp(self):
-        from sglang.srt.mem_cache import memory_pool as m
+        from flliper.srt.mem_cache import memory_pool as m
 
         self.m = m
 
@@ -219,7 +219,7 @@ class TheAdmissionLogSiteIsSyncFree(unittest.TestCase):
         makes the instrument still usable from a debugger on a process nobody
         started with the gate on."""
         req = _carry_req(torch.tensor([42], dtype=torch.int64))
-        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(False):
+        with envs.FLLIPER_DEBUG_MAMBA_CARRY.override(False):
             with _TensorTripwire() as trap:
                 with self.assertNoLogs(_LOGGER_NAME, level="DEBUG"):
                     select_index = _drive_alloc(self.m, req)
@@ -230,7 +230,7 @@ class TheAdmissionLogSiteIsSyncFree(unittest.TestCase):
         self,
     ):
         req = _carry_req(torch.tensor([42], dtype=torch.int64))
-        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(True):
+        with envs.FLLIPER_DEBUG_MAMBA_CARRY.override(True):
             with _TensorTripwire() as trap:
                 with self.assertLogs(_LOGGER_NAME, level="WARNING") as cm:
                     select_index = _drive_alloc(self.m, req)
@@ -254,7 +254,7 @@ class TheAdmissionLogSiteIsSyncFree(unittest.TestCase):
         played back on a box with no GPU to actually hang on.
         """
         req = _carry_req(torch.tensor([42], dtype=torch.int64))
-        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(True):
+        with envs.FLLIPER_DEBUG_MAMBA_CARRY.override(True):
             with mock.patch.object(self.m, "sync_free_tensor_repr", lambda v: v):
                 with self.assertRaises(_TripwireError):
                     with _TensorTripwire():

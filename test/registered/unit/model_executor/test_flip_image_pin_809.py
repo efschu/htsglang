@@ -67,15 +67,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache import pinned_host_budget
-from sglang.srt.model_executor import weights_arena
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache import pinned_host_budget
+from flliper.srt.model_executor import weights_arena
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
-_LOGGER = "sglang.srt.model_executor.weights_arena"
+_LOGGER = "flliper.srt.model_executor.weights_arena"
 
 #: One reader chunk under the test env below. The reader reads in
 #: ``_refill_chunk_bytes()`` units, whose floor is 1 MiB, so a payload that is
@@ -114,7 +114,7 @@ def _aligned_buffer(nbytes: int, aligned: bool = True):
 
 def _make_layout(nbytes: int):
     """A one-slot layout of ``nbytes``, which is all a refill needs."""
-    from sglang.srt.model_executor.weights_arena import ArenaLayout, ArenaSlot
+    from flliper.srt.model_executor.weights_arena import ArenaLayout, ArenaSlot
 
     slot = ArenaSlot(
         name="w",
@@ -196,7 +196,7 @@ class _FlipImagePinBase(CustomTestCase):
         # swallows a test-sized image in ONE read -- and a partial fill that
         # cannot be produced cannot be asserted. 1 MiB is the floor the
         # accessor allows and keeps every offset block-aligned.
-        self._chunk = envs.SGLANG_PHASE_FLIP_REFILL_CHUNK_MIB.override(1)
+        self._chunk = envs.FLLIPER_PHASE_FLIP_REFILL_CHUNK_MIB.override(1)
         self._chunk.__enter__()
         weights_arena.release_flip_image_pin()
         weights_arena._FILE_BACKED_IMAGES.clear()
@@ -453,7 +453,7 @@ class TestFlipImagePinRefill(_FlipImagePinBase):
     def test_t_g1_5b_default_env_is_off(self):
         """T-G1-5 (GREEN pin): the env default is OFF, and it switches."""
         self.assertFalse(weights_arena.flip_image_pin_enabled())
-        with envs.SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING.override(True):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_PIN_INCOMING.override(True):
             self.assertTrue(weights_arena.flip_image_pin_enabled())
 
     def test_g1_c1_pin_without_the_two_file_arm_is_refused(self):
@@ -463,17 +463,17 @@ class TestFlipImagePinRefill(_FlipImagePinBase):
         (``weights_arena.py:1367``): the pin reads the incoming layout's OWN
         file, and under one rotating image there is no such file.
         """
-        with envs.SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-                with envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.override(False):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_PIN_INCOMING.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+                with envs.FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE.override(False):
                     with self.assertRaises(weights_arena.WeightsArenaError):
                         weights_arena.require_pin_preconditions()
-            with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(False):
-                with envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(False):
+                with envs.FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
                     with self.assertRaises(weights_arena.WeightsArenaError):
                         weights_arena.require_pin_preconditions()
-            with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-                with envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+                with envs.FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
                     weights_arena.require_pin_preconditions()
 
     def test_g1_c4_arena_refill_cpu_routing_is_unchanged(self):
@@ -488,7 +488,7 @@ class TestFlipImagePinRefill(_FlipImagePinBase):
         with tempfile.TemporaryDirectory(dir="/tmp") as d:
             image, layout = self._image(d, "tp.img", payload, "tp")
             arena = torch.zeros(layout.total_bytes, dtype=torch.uint8)
-            with envs.SGLANG_PHASE_FLIP_REFILL_STAGED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_REFILL_STAGED.override(True):
                 with mock.patch.object(weights_arena, "_staged_file_refill", spy):
                     weights_arena.arena_refill(arena, layout, image)
         self.assertEqual(spy.calls, [])
@@ -1296,7 +1296,7 @@ class TestFlipImagePinGroupAdmission(_FlipImagePinBase):
         not merely leaked host RAM -- it is the rc=712 the next large host
         allocation dies on.
         """
-        from sglang.srt.mem_cache.pool_host import common as pool_host_common
+        from flliper.srt.mem_cache.pool_host import common as pool_host_common
 
         def _spy(buffer):
             freed.append(int(buffer.numel()))
@@ -1381,7 +1381,7 @@ class TestFlipImagePinGroupAdmission(_FlipImagePinBase):
         the buffer proceed, and that rank then allocates the very bytes the
         ledger refused it.
         """
-        from sglang.srt.distributed import parallel_state
+        from flliper.srt.distributed import parallel_state
 
         class _Group:
             world_size = 3
@@ -1421,7 +1421,7 @@ class TestFlipImagePinGroupAdmission(_FlipImagePinBase):
         collective to enter -- every unit test in this file lives here -- and
         with a world of one there is no peer whose answer could differ.
         """
-        from sglang.srt.distributed import parallel_state
+        from flliper.srt.distributed import parallel_state
 
         class _Alone:
             world_size = 1

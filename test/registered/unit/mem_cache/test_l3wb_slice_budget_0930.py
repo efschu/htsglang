@@ -14,7 +14,7 @@ write-behind gate opened (``gate=open (was leg)``) and the next pass logged at 2
         complete=4092 new=4092 on_disk=4084 ...
 
 -- 17.6 s of CPU for 8 pages, and in exactly that window TP0 logged nothing from any thread and
-answered no /get_server_info (front 20:04:06: ``WEG2 STOP W3 Weg2DrainWitnessUnreachable``).
+answered no /get_server_info (front 20:04:06: ``PDFLIP STOP W3 PdFlipDrainWitnessUnreachable``).
 
 ``new == complete``: the baseline of what is already secured (``arena._l3wb_sec``) is the
 PROCESS's; the 4084 pages P had already put on L3 are new to D TP0 until D has stat'ed them once, so
@@ -44,11 +44,11 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache import hicache_storage as HS  # noqa: E402
-from sglang.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, PoolName  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.mem_cache import hicache_storage as HS  # noqa: E402
+from flliper.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, PoolName  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
@@ -67,7 +67,7 @@ class _KVPage:
 
 @pytest.fixture(autouse=True)
 def _awake_gate():
-    from sglang.srt.mem_cache import l3_write_behind as gate
+    from flliper.srt.mem_cache import l3_write_behind as gate
 
     gate._reset_for_tests()
     yield
@@ -91,10 +91,10 @@ class _Clock:
 
 
 def _backend(tmp_path, monkeypatch, n):
-    from sglang.srt.mem_cache.storage.file.l3_index import L3Index
-    from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+    from flliper.srt.mem_cache.storage.file.l3_index import L3Index
+    from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "1")
     root = tmp_path / "store"
     root.mkdir(parents=True, exist_ok=True)
     (root / "L3_IDENTITY.json").write_text("{}")
@@ -124,7 +124,7 @@ def _backend(tmp_path, monkeypatch, n):
     be._evictor.l3_index = idx
     adir = tmp_path / "shm"
     adir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_DIR", str(adir))
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_DIR", str(adir))
     arena = ShmArena(str(adir / f"arena-{TOTAL}.bin"), TOTAL, n + 16)
     be._arenas = {TOTAL: arena}
     pay = torch.zeros(TOTAL, dtype=torch.uint8)
@@ -246,7 +246,7 @@ def test_a_census_longer_than_the_budget_still_makes_progress(tmp_path, monkeypa
 def test_a_head_that_never_secures_does_not_starve_the_tail(tmp_path, monkeypatch):
     """The first 150 slots fail their write every time (status 4: stay new). Without the cursor,
     every continuation would restart at that head and spend its whole budget there."""
-    from sglang.srt.mem_cache.storage.file import pageio
+    from flliper.srt.mem_cache.storage.file import pageio
 
     n = 600
     be, arena, stems = _backend(tmp_path, monkeypatch, n)
@@ -300,7 +300,7 @@ def test_slice_off_is_the_pre_slice_form(tmp_path, monkeypatch):
 
 
 def test_the_thread_continues_a_cut_pass_after_the_yield(monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_L3_WRITE_BEHIND_YIELD_MS", "25")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_YIELD_MS", "25")
     assert HiCacheFile._l3wb_next_wait({"sliced": True}, 2.0, 100.0, 100.3) == (True, 0.025)
     # a finished cycle waits the REST of its tick (it started at 100.0, now 100.3)
     cont, w = HiCacheFile._l3wb_next_wait({"sliced": False}, 2.0, 100.0, 100.3)
@@ -311,9 +311,9 @@ def test_the_thread_continues_a_cut_pass_after_the_yield(monkeypatch):
 
 
 def test_the_default_budget_is_25_ms():
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
-    assert envs.SGLANG_WEG2_L3_WRITE_BEHIND_SLICE_MS.get() == 25.0
+    assert envs.FLLIPER_PDFLIP_L3_WRITE_BEHIND_SLICE_MS.get() == 25.0
     assert abs(HiCacheFile._l3wb_slice_s() - 0.025) < 1e-12
 
 

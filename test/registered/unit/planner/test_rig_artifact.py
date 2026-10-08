@@ -25,8 +25,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt.planner import github_share, rig_artifact
-from sglang.srt.planner.rig_artifact import (
+from flliper.srt.planner import github_share, rig_artifact
+from flliper.srt.planner.rig_artifact import (
     ARTIFACT_SCHEMA,
     AGGREGATION_LADDER,
     Capability,

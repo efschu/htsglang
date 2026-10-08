@@ -13,8 +13,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.distributed.utils as du
-from sglang.srt.disaggregation.draft_kv_canonical import (
+import flliper.srt.distributed.utils as du
+from flliper.srt.disaggregation.draft_kv_canonical import (
     DraftKvCanonicalLayout,
     DraftKvLayoutMismatch,
     check_full_head_shipment_is_justified,
@@ -62,10 +62,10 @@ def test_full_head_shipment_weighs_every_context_layer():
 
 
 def test_cutover_seeds_a_dflash_draft_input():
-    from sglang.srt.managers.phase_flip_draft_bootstrap import (
+    from flliper.srt.managers.phase_flip_draft_bootstrap import (
         build_bootstrap_dflash_input,
     )
-    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+    from flliper.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
     reqs = [
         SimpleNamespace(rid="a", origin_input_ids=[1, 2, 3], output_ids=[7, 8]),
@@ -80,7 +80,7 @@ def test_cutover_seeds_a_dflash_draft_input():
 
 
 def test_cache_controller_translates_draft_rows_through_the_mapper():
-    from sglang.srt.managers.cache_controller import HiCacheController
+    from flliper.srt.managers.cache_controller import HiCacheController
 
     calls = []
     mapper = SimpleNamespace(
@@ -88,7 +88,7 @@ def test_cache_controller_translates_draft_rows_through_the_mapper():
         translate_write=lambda idx: calls.append(("write", idx.tolist())) or idx + 200,
     )
     cc = HiCacheController.__new__(HiCacheController)
-    cc.mem_pool_device_draft = SimpleNamespace(weg2_slot_mapper=mapper)
+    cc.mem_pool_device_draft = SimpleNamespace(pdflip_slot_mapper=mapper)
     idx = torch.tensor([3, 4])
     assert cc._draft_device_indices(idx, "write").tolist() == [103, 104]
     assert cc._draft_device_indices(idx, "load").tolist() == [203, 204]

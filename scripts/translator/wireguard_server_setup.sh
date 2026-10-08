@@ -98,7 +98,7 @@ Remaining, outside this script:
 
        cd /spinning/wt-466-translator && \\
        PYTHONPATH=/spinning/wt-466-translator/python \\
-       /spinning/htsglang-gpu/.venv/bin/python -m sglang.srt.translator.launch \\
+       /spinning/htsglang-gpu/.venv/bin/python -m flliper.srt.translator.launch \\
          --host ${WG_SERVER_ADDR%%/*} --port 30800 --participants de,es \\
          --card-uuid GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d \\
          --asr faster-whisper --asr-device cuda --asr-compute-type int8_float16 \\

@@ -2,7 +2,7 @@
 """DUAL-TP3PP3 stage 2: D round gap at admission (metal criterion: <= 2x median).
 
   join_gap_eval.py <boot prefix>      (reads .D.log)
-For every admission on D -- 'WEG2 DECODE-JOIN' (join path) or a TP0 'Prefill rank batch'
+For every admission on D -- 'PDFLIP DECODE-JOIN' (join path) or a TP0 'Prefill rank batch'
 (extend path) -- the gap between the two TP0 'Decode rank batch' rounds around it, placed
 by the rounds' own t: field (log stamps are flushed in bursts). Prints median round gap,
 per-admission gaps and the verdict gap <= 2 x median.
@@ -15,7 +15,7 @@ import datetime as dt
 
 pre = sys.argv[1]
 DR = re.compile(r"TP0\] Decode rank batch, rank: 0, #round: \d+, t: ([\d.]+),")
-ADM = re.compile(r"^\[(\S+ \S+) TP0\] (WEG2 DECODE-JOIN n=\d+|Prefill rank batch, #new-token: (\d+))")
+ADM = re.compile(r"^\[(\S+ \S+) TP0\] (PDFLIP DECODE-JOIN n=\d+|Prefill rank batch, #new-token: (\d+))")
 t, adm = [], []
 for line in open(pre + ".D.log", errors="replace"):
     m = DR.search(line)

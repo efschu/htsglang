@@ -1,4 +1,4 @@
-"""fnFL2 H65: weg2/tools/qsa_rows_bench.py, the QSA attention micro-bench for
+"""fnFL2 H65: pdflip/tools/qsa_rows_bench.py, the QSA attention micro-bench for
 a GPU window. CPU only: it refuses before any CUDA call without a running
 gpuq booking that holds the card, and the top-k rows it builds have the shape
 the kernels get (valid first, causal, 2051 wide = 512 groups x 4 + 3 tail).
@@ -9,18 +9,18 @@ from unittest import mock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class BenchToolTest(unittest.TestCase):
-    """weg2/tools/qsa_rows_bench.py: the window bench refuses before any
+    """pdflip/tools/qsa_rows_bench.py: the window bench refuses before any
     CUDA call without a running booking, and its top-k rows have the shape
     the kernel gets (valid first, causal, 2051 wide)."""
 
     def test_refuses_without_a_running_booking(self):
-        from sglang.srt.weg2.tools import qsa_rows_bench as qb
+        from flliper.srt.pdflip.tools import qsa_rows_bench as qb
 
         with self.assertRaisesRegex(SystemExit, "--booking"):
             qb.main(["--card", "0"])
@@ -46,7 +46,7 @@ class BenchToolTest(unittest.TestCase):
                 qb.main(["--card", "0", "--booking", "abc"])
 
     def test_selection_is_what_the_kernel_gets(self):
-        from sglang.srt.weg2.tools import qsa_rows_bench as qb
+        from flliper.srt.pdflip.tools import qsa_rows_bench as qb
 
         for prefix, pattern in ((0, "shared"), (32768, "shared"), (32768, "random"), (32768, "same")):
             gen = torch.Generator().manual_seed(7)

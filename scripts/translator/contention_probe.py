@@ -72,8 +72,8 @@ def median(values: list) -> float:
 async def drive(args) -> int:
     import websockets
 
-    from sglang.srt.translator.audio import negotiate_codec
-    from sglang.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.audio import negotiate_codec
+    from flliper.srt.translator.backends import AudioChunk
 
     samples, rate = load_clip(args.clip)
     codec = negotiate_codec(["pcm16"])

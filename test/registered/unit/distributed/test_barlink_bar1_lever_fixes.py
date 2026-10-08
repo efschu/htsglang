@@ -10,8 +10,8 @@ arithmetic and state bookkeeping, no card involved.
    ``1blk`` variant during every CUDA graph capture. Under the prefill
    graph that cost 16.1% throughput at eight sessions
    (1334.5 -> 1151.6 tok/s; the falsifier run with
-   ``SGLANG_BARLINK_BAR1_GRAPH_GRID=1`` recovered 1337.2). The default now
-   comes from ``SGLANG_BARLINK_GRAPH_ENABLE`` -- same question, same gate.
+   ``FLLIPER_BARLINK_BAR1_GRAPH_GRID=1`` recovered 1337.2). The default now
+   comes from ``FLLIPER_BARLINK_GRAPH_ENABLE`` -- same question, same gate.
 
 2. **The pipe range** took a quarter away from the all_reduce slot
    (8188 -> 6140 KiB, tipping point 2456 -> 1842 tokens, i.e. below the
@@ -21,20 +21,20 @@ arithmetic and state bookkeeping, no card involved.
    6140 falls out exactly from the pipe's extra slot set.
 
 3. **The result ring** broke off the graph-safe direct mode during
-   capture WARMUP, and ``SGLANG_BARLINK_BAR1_PIPE_RESULT_RING`` did not
+   capture WARMUP, and ``FLLIPER_BARLINK_BAR1_PIPE_RESULT_RING`` did not
    help, because the eager count was a constant.
 """
 
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     BarlinkBar1Transport,
     geometry,
     graph_grid_default,
     max_payload,
 )
-from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
+from flliper.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
     RESULT_EAGER_SLOTS,
     result_slot_split,
     result_eager_free_slot,
@@ -46,9 +46,9 @@ from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
     pipe_plan,
     pipe_slot_default,
 )
-from sglang.srt.distributed.parallel_state import graph_enable_set
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.parallel_state import graph_enable_set
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -95,12 +95,12 @@ class TestGridDefaultFollowsTheRelease(CustomTestCase):
         # The explicit off-ramp still stands.
         self.assertTrue(graph_grid_default({}))
         self.assertFalse(
-            graph_grid_default({"SGLANG_BARLINK_GRAPH_ENABLE": "0"})
+            graph_grid_default({"FLLIPER_BARLINK_GRAPH_ENABLE": "0"})
         )
 
     def test_the_release_carries_the_default(self):
         self.assertTrue(
-            graph_grid_default({"SGLANG_BARLINK_GRAPH_ENABLE": "1"})
+            graph_grid_default({"FLLIPER_BARLINK_GRAPH_ENABLE": "1"})
         )
 
     def test_the_override_wins_in_both_directions(self):
@@ -113,18 +113,18 @@ class TestGridDefaultFollowsTheRelease(CustomTestCase):
         would make one of the two cases untestable.
         """
         self.assertTrue(
-            graph_grid_default({"SGLANG_BARLINK_BAR1_GRAPH_GRID": "1"})
+            graph_grid_default({"FLLIPER_BARLINK_BAR1_GRAPH_GRID": "1"})
         )
         self.assertFalse(
             graph_grid_default({
-                "SGLANG_BARLINK_GRAPH_ENABLE": "1",
-                "SGLANG_BARLINK_BAR1_GRAPH_GRID": "0",
+                "FLLIPER_BARLINK_GRAPH_ENABLE": "1",
+                "FLLIPER_BARLINK_BAR1_GRAPH_GRID": "0",
             })
         )
         self.assertTrue(
             graph_grid_default({
-                "SGLANG_BARLINK_GRAPH_ENABLE": "0",
-                "SGLANG_BARLINK_BAR1_GRAPH_GRID": "1",
+                "FLLIPER_BARLINK_GRAPH_ENABLE": "0",
+                "FLLIPER_BARLINK_BAR1_GRAPH_GRID": "1",
             })
         )
 
@@ -140,7 +140,7 @@ class TestGridDefaultFollowsTheRelease(CustomTestCase):
 
         for value in ("", "0", "1", "no", "off", "false", "yes", "true", "2"):
             with mock.patch.dict(
-                os.environ, {"SGLANG_BARLINK_GRAPH_ENABLE": value}, clear=False
+                os.environ, {"FLLIPER_BARLINK_GRAPH_ENABLE": value}, clear=False
             ):
                 self.assertEqual(
                     graph_grid_default(),
@@ -157,12 +157,12 @@ class TestGridDefaultFollowsTheRelease(CustomTestCase):
         a silent enable.
         """
         self.assertTrue(
-            graph_grid_default({"SGLANG_BARLINK_GRAPH_ENABLE": "1"})
+            graph_grid_default({"FLLIPER_BARLINK_GRAPH_ENABLE": "1"})
         )
         self.assertFalse(
             graph_grid_default({
-                "SGLANG_BARLINK_GRAPH_ENABLE": "1",
-                "SGLANG_BARLINK_BAR1_GRAPH_GRID": "",
+                "FLLIPER_BARLINK_GRAPH_ENABLE": "1",
+                "FLLIPER_BARLINK_BAR1_GRAPH_GRID": "",
             })
         )
 
@@ -178,7 +178,7 @@ class TestKernelChoosesByTheDefault(CustomTestCase):
 
     def _with_capture(self):
         return mock.patch(
-            "sglang.srt.distributed.device_communicators.barlink."
+            "flliper.srt.distributed.device_communicators.barlink."
             "graph_capture_running",
             lambda: True,
         )
@@ -210,7 +210,7 @@ class TestWhoStealsTheSlot(CustomTestCase):
     """The measurement report's attribution, recomputed instead of taken on faith.
 
     The report attributed the loss to the result ring. But the pipe arm
-    ran with ``SGLANG_BARLINK_BAR1_PIPE_DIRECT=0``, which makes the ring
+    ran with ``FLLIPER_BARLINK_BAR1_PIPE_DIRECT=0``, which makes the ring
     zero (``barlink_bar1.py``, "if not self.pipe_on or not self.pipe_direct").
     Exactly one cause remains, and it matches the report's numbers to the
     byte.
@@ -564,7 +564,7 @@ def _stub(**kw):
 
 def _without_capture():
     return mock.patch(
-        "sglang.srt.distributed.device_communicators.barlink."
+        "flliper.srt.distributed.device_communicators.barlink."
         "graph_capture_running",
         lambda: False,
     )

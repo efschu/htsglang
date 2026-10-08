@@ -32,7 +32,7 @@ MARK = b"Decode rank batch, rank: 0,"
 MAX_ROUNDS = 200000          # (open, end) pairs kept per log -- ~10 h of bs1 decode
 MAX_READERS = 16
 READ_CHUNK = 8 * 1024 * 1024
-MANIFEST_ENV = "SGLANG_WEIGHT_LOADER_SHARED_CACHE_MANIFEST"   # .../evidence/<stem>.shared_cache, both models
+MANIFEST_ENV = "FLLIPER_WEIGHT_LOADER_SHARED_CACHE_MANIFEST"   # .../evidence/<stem>.shared_cache, both models
 
 
 def _log_path(ipc: dict, suffix: str, pattern: str) -> Optional[str]:
@@ -136,17 +136,17 @@ def decode_rounds(ipc: dict) -> Optional[List[Tuple[float, float]]]:
 
 # Arrival of a request at the front (Nutzer 02.10. ~18:25Z via NF: the D>P Vorlauf is split into "leer ohne Request"
 # (D's last token -> arrival of the request that needs P), "halt" (arrival -> park RPC / flip_begin) and "park").
-# The front stamps ``WEG2 SESSION rid=<rid>`` on every request it accepts, before pricing; the IPC event
+# The front stamps ``PDFLIP SESSION rid=<rid>`` on every request it accepts, before pricing; the IPC event
 # flip_user_time names the rid that triggered the flip but carries no arrival stamp (only the park-RPC send, or the
 # pricing verdict as ``oldest_waiter_arrival``).  Only the line prefix (frozen parse.RE_PREFIX / parse_ts) and the
 # rid token are read.  IPC follow-up: flip_user_time.arrival_ts at the front, then this reader falls.
-SESSION_MARK = b"WEG2 SESSION rid="
-SESSION_MARKS = N.bytes_variants("WEG2 SESSION rid=")      # F0-B: the old and the renamed spelling
+SESSION_MARK = b"PDFLIP SESSION rid="
+SESSION_MARKS = N.bytes_variants("PDFLIP SESSION rid=")      # F0-B: the old and the renamed spelling
 MAX_ARRIVALS = 200000         # rids kept per log (first stamp wins)
 
 
 class FrontArrivals:
-    """rid -> first ``WEG2 SESSION`` time of one front log."""
+    """rid -> first ``PDFLIP SESSION`` time of one front log."""
 
     def __init__(self, path: str):
         self.path = path
@@ -183,7 +183,7 @@ class FrontArrivals:
         m = parse.RE_PREFIX.match(txt)
         if not m:
             return
-        tail = N.marker_tail(txt, "WEG2 SESSION rid=")
+        tail = N.marker_tail(txt, "PDFLIP SESSION rid=")
         if tail is None:
             return
         rid = tail.split(" ", 1)[0].strip()

@@ -26,8 +26,8 @@ import unittest
 
 # Spawn children re-execute this module with the PARENT'S sys.path at spawn
 # time; a foreign entry earlier in that list (any collection-time prepend
-# elsewhere) would shadow this repo's sglang in the CHILD only. Pin the repo
-# root derived from THIS FILE, before any sglang import, so the children are
+# elsewhere) would shadow this repo's flliper in the CHILD only. Pin the repo
+# root derived from THIS FILE, before any flliper import, so the children are
 # immune to selection order (the Worktree-PYTHONPATH trap).
 import pathlib as _pl
 import sys as _sys
@@ -36,8 +36,8 @@ _REPO_PY = str(_pl.Path(__file__).resolve().parents[4] / "python")
 if _sys.path[:1] != [_REPO_PY]:
     _sys.path.insert(0, _REPO_PY)
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -130,7 +130,7 @@ def _rank_body(rank, port, q):
     try:
         import torch.distributed as dist
 
-        from sglang.srt.distributed.pp_crossing_wire import build_crossing_wire
+        from flliper.srt.distributed.pp_crossing_wire import build_crossing_wire
 
         dist.init_process_group(
             backend="gloo",
@@ -214,7 +214,7 @@ class TestTheWireOverRealGloo(CustomTestCase):
         self.assertTrue(_order_sensitivity_holds())
 
     def test_the_crossings_carried_equal_the_schedule(self):
-        from sglang.srt.distributed.pp_crossing_schedule import crossing_schedule
+        from flliper.srt.distributed.pp_crossing_schedule import crossing_schedule
 
         results = self._run()
         for rank, (status, value, _, _) in results.items():

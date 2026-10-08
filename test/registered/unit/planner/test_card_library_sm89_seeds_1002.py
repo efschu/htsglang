@@ -10,7 +10,7 @@ seeds to measured on the way: source == "seed", measured fields empty.
 
 import unittest
 
-from sglang.srt.planner.card_library import SEED_CARDS, _canonical
+from flliper.srt.planner.card_library import SEED_CARDS, _canonical
 
 
 def seed_card(name):

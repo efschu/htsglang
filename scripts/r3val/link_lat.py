@@ -39,9 +39,9 @@ SIZES = [8 * 1024, 64 * 1024, 512 * 1024, 4 * 1024 * 1024]  # bytes
 
 
 def load_transport(comm_dir):
-    """Import barlink_ucx{,_bindings} from a checkout without importing sglang."""
-    for name in ("sglang", "sglang.srt", "sglang.srt.distributed",
-                 "sglang.srt.distributed.device_communicators"):
+    """Import barlink_ucx{,_bindings} from a checkout without importing flliper."""
+    for name in ("flliper", "flliper.srt", "flliper.srt.distributed",
+                 "flliper.srt.distributed.device_communicators"):
         if name not in sys.modules or not hasattr(sys.modules[name], "__path__"):
             stub = types.ModuleType(name)
             stub.__path__ = []
@@ -54,7 +54,7 @@ def load_transport(comm_dir):
         spec.loader.exec_module(mod)
         return mod
 
-    base = "sglang.srt.distributed.device_communicators."
+    base = "flliper.srt.distributed.device_communicators."
     _load(base + "barlink_ucx_bindings",
           os.path.join(comm_dir, "barlink_ucx_bindings.py"))
     return _load(base + "barlink_ucx", os.path.join(comm_dir, "barlink_ucx.py"))
@@ -113,7 +113,7 @@ def main():
                                 world_size=a.world)
         mod = load_transport(a.comm_dir)
         bindings = sys.modules[
-            "sglang.srt.distributed.device_communicators.barlink_ucx_bindings"]
+            "flliper.srt.distributed.device_communicators.barlink_ucx_bindings"]
         lib = bindings.UcpLibrary.instance()
         print(f"[rank {a.rank}] UCX {lib.version_string()} from {lib.path}",
               file=sys.stderr, flush=True)

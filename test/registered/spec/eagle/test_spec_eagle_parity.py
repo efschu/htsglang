@@ -6,11 +6,11 @@ spec server (sequential -- one model resident at a time; see SpecParityKit).
 
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
-from sglang.test.kits.spec_server_kits import SpecParityKit
-from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
+from flliper.srt.environ import envs
+from flliper.srt.utils import is_xpu
+from flliper.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from flliper.test.kits.spec_server_kits import SpecParityKit
+from flliper.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
 register_xpu_ci(
@@ -26,7 +26,7 @@ _is_xpu = is_xpu()
 class _Eagle3ParityBase(Eagle3Base):
     """Shared knobs for EAGLE3 parity variants; no test methods."""
 
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    env_overrides = ((envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 @unittest.skipIf(_is_xpu, "CUDA runner only")

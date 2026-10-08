@@ -56,7 +56,7 @@ from pathlib import Path
 
 import pytest
 
-from sglang.srt.planner.transient_census import TransientCensus
+from flliper.srt.planner.transient_census import TransientCensus
 
 
 def _writer(out_dir: str, states: int, rounds: int, q) -> None:

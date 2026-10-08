@@ -46,29 +46,29 @@ import types
 
 import pytest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 # THE REAL MODULES, imported -- never re-implemented here. A private copy of
 # the decision in the test would keep these green across a revert of the fix.
-from sglang.srt.distributed.device_communicators import (  # noqa: E402
+from flliper.srt.distributed.device_communicators import (  # noqa: E402
     barlink_build_window as bw,
 )
-from sglang.srt.distributed.device_communicators import barlink_liveness  # noqa: E402
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (  # noqa: E402
+from flliper.srt.distributed.device_communicators import barlink_liveness  # noqa: E402
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (  # noqa: E402
     Bar1CollectiveStalled,
     BarlinkBar1Transport,
 )
-from sglang.srt.distributed.device_communicators.barlink_liveness import (  # noqa: E402
+from flliper.srt.distributed.device_communicators.barlink_liveness import (  # noqa: E402
     CollectiveTimeoutError,
     PeerIdentity,
     PeerTable,
     bounded_poll,
 )
 
-_ENV_STALL_AFTER = "SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER"
-_ENV_SYNC_MS = "SGLANG_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS"
+_ENV_STALL_AFTER = "FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER"
+_ENV_SYNC_MS = "FLLIPER_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS"
 
 
 # ---------------------------------------------------------------------------
@@ -204,14 +204,14 @@ class TestProductionHooks:
     """
 
     def test_cold_build_window_publishes(self):
-        from sglang.srt.utils.jit_cold_build import cold_build_window
+        from flliper.srt.utils.jit_cold_build import cold_build_window
 
         with cold_build_window("capture warmup"):
             assert bw.publishing() is True
         assert bw.publishing() is False
 
     def test_cold_build_window_clears_on_exception(self):
-        from sglang.srt.utils.jit_cold_build import cold_build_window
+        from flliper.srt.utils.jit_cold_build import cold_build_window
 
         with pytest.raises(ValueError):
             with cold_build_window("capture warmup"):
@@ -219,14 +219,14 @@ class TestProductionHooks:
         assert bw.publishing() is False
 
     def test_jit_build_guard_publishes(self):
-        from sglang.jit_kernel.baton_health import jit_build_guard
+        from flliper.jit_kernel.baton_health import jit_build_guard
 
         with jit_build_guard("hicache_hash_cpp_avx2"):
             assert bw.publishing() is True
         assert bw.publishing() is False
 
     def test_jit_build_guard_clears_on_exception(self):
-        from sglang.jit_kernel.baton_health import jit_build_guard
+        from flliper.jit_kernel.baton_health import jit_build_guard
 
         with pytest.raises(ValueError):
             with jit_build_guard("hicache_hash_cpp_avx2"):
@@ -239,8 +239,8 @@ class TestProductionHooks:
         The behavioural tests above would also fail, but they would fail with
         an unhelpful "publishing is False"; this one names the missing call.
         """
-        from sglang.jit_kernel import baton_health
-        from sglang.srt.utils import jit_cold_build
+        from flliper.jit_kernel import baton_health
+        from flliper.srt.utils import jit_cold_build
 
         assert "_publish_build_window" in inspect.getsource(
             jit_cold_build.cold_build_window
@@ -534,7 +534,7 @@ class TestDefaultPathUnchanged:
     def test_resolve_timeout_cycles_is_still_the_identity_outside_a_window(self):
         """The pre-#615 backward-compatibility claim of jit_cold_build, which
         this change must not have disturbed."""
-        from sglang.srt.utils.jit_cold_build import (
+        from flliper.srt.utils.jit_cold_build import (
             in_cold_build_window,
             resolve_timeout_cycles,
         )
@@ -578,7 +578,7 @@ class TestDefaultPathUnchanged:
         """``peers_building`` is called from exactly two places, both of them
         a wait that has already hit its deadline. A third caller is not
         forbidden, but it must be a deliberate act, not a merge accident."""
-        from sglang.srt.distributed.device_communicators import barlink_bar1
+        from flliper.srt.distributed.device_communicators import barlink_bar1
 
         assert "extension_for" in inspect.getsource(
             barlink_bar1.defer_stall_for_building_peer

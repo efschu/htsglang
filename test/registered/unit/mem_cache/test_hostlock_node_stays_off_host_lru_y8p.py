@@ -1,6 +1,6 @@
 """Y8P-HOSTLOCK-LRU (NF y8p, 03.10. 08:57:45Z): both D TP1/TP2 ranks died at the idle sanity walk right
 after the park of the D>P flip ("Sanity check FAILED ... mamba host-locked node(s) on the host LRU: {266}",
-RANK-DEATH lifecycle=dead; the front's quiesce then waited 12.6 s on a dead D -> WEG2-FLIP STALL).
+RANK-DEATH lifecycle=dead; the front's quiesce then waited 12.6 s on a dead D -> PDFLIP-FLIP STALL).
 
 A host-locked node (#1417 prefetch pin) is OFF the host LRU by design (#1417b); the last host unlock files
 it. Two writers filed a host-only node into the host LRU without asking for the host lock: the mamba
@@ -9,7 +9,7 @@ component's device eviction (`evict_component(DEVICE)`) and the reclaim's `_diso
 Hermetic: the real UnifiedRadixCache (FULL + MAMBA) of the #1417b test, CPU only.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -17,11 +17,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     EvictLayer,
     ComponentType,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 from test_prefetch_pin_host_lru_sanity_1417b import _metal_form, _tree
 
@@ -60,8 +60,8 @@ class HostLockStaysOffHostLru(CustomTestCase):
         comp._free_mamba_value = lambda v: None
         comp.evict_component(n249, EvictLayer.DEVICE)
         cache.lru_lists[MAMBA].remove_node(n249)  # the eviction driver's half
-        cache.pop_prefetch_loaded_tokens("weg2-16-31")
-        cache.pop_prefetch_loaded_tokens("weg2-16-38")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-31")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-38")
         self.assertEqual(n249.component_data[MAMBA].host_lock_ref, 0)
         self.assertTrue(cache.host_lru_lists[MAMBA].in_list(n249))
         cache.sanity_check()
@@ -78,8 +78,8 @@ class HostLockStaysOffHostLru(CustomTestCase):
     def test_an_unlocked_host_only_anchor_still_joins_the_host_lru(self):
         cache = _tree()
         n249, _ = _metal_form(cache)
-        cache.pop_prefetch_loaded_tokens("weg2-16-31")
-        cache.pop_prefetch_loaded_tokens("weg2-16-38")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-31")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-38")
         cache.host_lru_lists[MAMBA].remove_node(n249)
         cd = _give_device_value(cache, n249)
         cache._disown_reclaimed_value(n249, MAMBA)

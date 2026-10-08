@@ -34,16 +34,16 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.speculative.eagle_info import EagleDraftExtendInput
+from flliper.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleDraftExtendCudaGraphRunner,
     MultiLayerEagleDraftExtendInputBuffers,
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

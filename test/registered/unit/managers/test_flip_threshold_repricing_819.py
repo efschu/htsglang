@@ -39,14 +39,14 @@ it is an error, and closing it needs a group reduce that no existing
 collective carries today. Not silently assumed away here.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers import phase_policy as pp
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers import phase_policy as pp
+from flliper.srt.managers.phase_policy import (
     PHASE_TP,
     PhasePolicyConfig,
     PhasePolicyInputs,
@@ -56,7 +56,7 @@ from sglang.srt.managers.phase_policy import (
     effective_flip_threshold,
     live_flip_tokens,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # The window-3 boot's own numbers, so every assertion below is a live one.
 N_BOOT = 7004
@@ -185,7 +185,7 @@ class TestTheBarFollowsTheMeasurement(_EstimatorFixture):
 
     def test_halving_the_measured_price_halves_the_bar(self):
         # THE COUPLING #834 EXISTS FOR. break-even is linear in the seam
-        # cost, so a seam shrunk by SGLANG_SEAM_SHRINK must be visible in
+        # cost, so a seam shrunk by FLLIPER_SEAM_SHRINK must be visible in
         # the threshold without anyone editing a constant.
         cfg = _cfg()
         self._measure(8.0)
@@ -228,7 +228,7 @@ class TestTheWholeLegIsPriced(_EstimatorFixture):
 
     def test_a_shrinking_cutover_lowers_the_bar(self):
         # THE #834 COUPLING, end to end. Same flip, same movers, only the
-        # cutover shrinks -- the term SGLANG_SEAM_SHRINK moves. W13 measured
+        # cutover shrinks -- the term FLLIPER_SEAM_SHRINK moves. W13 measured
         # that term at 3449 ms with HiCache on and 50 ms with it off, against
         # movers of ~2722 ms, so these are the shape of real numbers.
         cfg = _cfg()

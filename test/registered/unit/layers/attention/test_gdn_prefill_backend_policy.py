@@ -4,14 +4,14 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
-from sglang.srt.layers.attention.linear import gdn_backend
-from sglang.srt.layers.attention.linear.gdn_backend import (
+from flliper.srt.layers.attention.linear import gdn_backend
+from flliper.srt.layers.attention.linear.gdn_backend import (
     GDNKernelDispatcher,
     maybe_set_default_flashinfer_gdn_prefill,
 )
-from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
-from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from flliper.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -64,7 +64,7 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             patch.object(torch.cuda, "get_device_capability", return_value=capability),
             patch.object(torch.version, "cuda", cuda_version),
             patch(
-                "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+                "flliper.srt.layers.attention.linear.kernels.gdn_flashinfer."
                 "is_flashinfer_gdn_prefill_available",
                 return_value=flashinfer_available,
             ),
@@ -142,7 +142,7 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         with (
             patch.object(gdn_backend, "is_cuda", return_value=True),
             patch(
-                "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+                "flliper.srt.layers.attention.linear.kernels.gdn_flashinfer."
                 "FlashInferGDNKernel",
                 return_value=flashinfer_kernel,
             ),

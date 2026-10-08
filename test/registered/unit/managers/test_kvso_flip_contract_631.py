@@ -13,7 +13,7 @@ cannot tell them apart cannot see the hazard.
 import types
 import unittest
 
-from sglang.srt.managers.kvso_flip_contract import (
+from flliper.srt.managers.kvso_flip_contract import (
     STATE_ABSENT,
     STATE_BUSY,
     STATE_IDLE,
@@ -160,7 +160,7 @@ class TestGuardWiring(unittest.TestCase):
     """The guard must consult the state, not the presence."""
 
     def _guards(self, kvso, phase="pp"):
-        from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
+        from flliper.srt.managers.phase_flip_runtime import flip_blocking_guards
 
         sched = types.SimpleNamespace(
             server_args=types.SimpleNamespace(
@@ -171,7 +171,7 @@ class TestGuardWiring(unittest.TestCase):
             is_dual_group_lane=False,
             tree_cache=types.SimpleNamespace(all_values_flatten=lambda: []),
         )
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from flliper.srt.disaggregation.utils import DisaggregationMode
 
         sched.disaggregation_mode = DisaggregationMode.NULL
         return flip_blocking_guards(sched)

@@ -4,12 +4,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+from flliper.srt.layers.attention.qwen_sparse_attn_backend import (
     QSAMTPSharedSparseIndices,
     QwenSparseAttnBackend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -245,7 +245,7 @@ def test_index_share_flag_reads_override_and_checkpoint_locations():
     hf_text_config silently disabled the feature for override-launched
     servers (caught as a boot with no 'index sharing enabled' log and
     OFF-band accept)."""
-    from sglang.srt.speculative.eagle_worker_v2 import _qsa_index_share_requested
+    from flliper.srt.speculative.eagle_worker_v2 import _qsa_index_share_requested
 
     override_style = SimpleNamespace(
         index_share_for_mtp_iteration=True, text_config=SimpleNamespace()
@@ -268,10 +268,10 @@ if __name__ == "__main__":
 def test_index_share_env_switch_forces_off(monkeypatch):
     from types import SimpleNamespace
 
-    from sglang.srt.speculative.eagle_worker_v2 import _qsa_index_share_requested
+    from flliper.srt.speculative.eagle_worker_v2 import _qsa_index_share_requested
 
     cfg = SimpleNamespace(text_config=SimpleNamespace(index_share_for_mtp_iteration=True))
-    monkeypatch.delenv("SGLANG_QSA_MTP_INDEX_SHARE", raising=False)
+    monkeypatch.delenv("FLLIPER_QSA_MTP_INDEX_SHARE", raising=False)
     assert _qsa_index_share_requested(cfg) is True
-    monkeypatch.setenv("SGLANG_QSA_MTP_INDEX_SHARE", "0")
+    monkeypatch.setenv("FLLIPER_QSA_MTP_INDEX_SHARE", "0")
     assert _qsa_index_share_requested(cfg) is False
