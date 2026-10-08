@@ -51,6 +51,19 @@ def session_raw(headers: Optional[Mapping[str, str]], payload: Any) -> Tuple[str
     return "", "none"
 
 
+def client_ip(headers: Optional[Mapping[str, str]], remote: Optional[str]) -> Optional[str]:
+    """Origin of a request for the dashboard's session overview (state.json ``request_done.client_ip``): the FIRST address
+    of ``X-Forwarded-For`` (the proxy in front appends the peer it saw, so the first is the client), else the peer of the
+    connection (``request.remote``).  ``None`` when neither is there; bounded, never text of the request."""
+    try:
+        v = (headers or {}).get("X-Forwarded-For") or (headers or {}).get("x-forwarded-for")
+    except Exception:  # noqa: BLE001
+        v = None
+    first = str(v).split(",")[0].strip() if v else ""
+    ip = first or (str(remote).strip() if remote else "")
+    return ip[:64] or None
+
+
 def short(raw: str) -> str:
     return hashlib.sha1(raw.encode(errors="replace")).hexdigest()[:10] if raw else ""
 
