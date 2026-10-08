@@ -754,6 +754,16 @@ class Envs:
     # channel exists. Off = the immediate stop (pre-H98d). Reached only
     # where that stop would have fired; everywhere else byte-identical.
     SGLANG_WEG2_ENABLE_FORM_A_STALE_VOTE_DEFER = EnvBool(True)
+    # ENABLE_FORM_A_ADMIT_ROOM_FIRST (H98e, the cause behind H98d, NF xc D
+    # 21:37:29Z 07.10., weg2-130-2093 -> weg2-130-2092): a Form A load-back
+    # whose group ADMIT is already taken (worker off the token cut, every
+    # rank on it) decides its room from the LIVE pool with a shortfall-only
+    # eviction on its FIRST attempt (H105c's follow-room). Off = the first
+    # attempt goes through the pass-published floor, whose refusal runs the
+    # xsn285 full drain (every evictable leaf, the voted-but-not-admitted
+    # prefixes of the same pass included) before H105c retries from the
+    # live pool. The host-first path (H105b/H106) is not touched.
+    SGLANG_WEG2_ENABLE_FORM_A_ADMIT_ROOM_FIRST = EnvBool(True)
     # POOLLEAK_INSTR (NF y9nf6 boot 3, 07:03:50Z: "[full] ... withheld=92672
     # ... deficit of 128 row(s)" + 3 mamba slots on TP1/TP2 right after a D
     # park): LOG-ONLY instruments, no behaviour -- per-request pool holdings
