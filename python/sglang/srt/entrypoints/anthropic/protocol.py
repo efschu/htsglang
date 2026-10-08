@@ -492,6 +492,11 @@ class AnthropicMessagesRequest(BaseModel):
     #: under a fresh uuid, the abort matched nothing, and PP1/PP2 kept it in
     #: their waiting queues -> W3 at the next flip.
     rid: Optional[str] = None
+    #: PRIORITY LANES 1008 (L1, weg2/lanes.py): the request's lane, as on ``/v1/chat/completions``
+    #: (``priority``; no number = lane 0, a higher number is a higher lane). DECLARED for the reason
+    #: ``rid`` is: undeclared, ``extra="ignore"`` drops it silently. The adapter forwards it only with
+    #: ``SGLANG_WEG2_LANES=1``; off, it is dropped here exactly as before the field existed.
+    priority: Optional[int] = None
     #: RANKSTATS-S3 DASHBOARD-GRAFIKEN Feld 2: as on ``/v1/chat/completions``,
     #: the caller asks for the cached-token tier split (answered in
     #: ``sglext.cached_tokens_details``). Declared for the reason ``rid`` is:
