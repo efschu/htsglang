@@ -80,6 +80,29 @@ def test_a_waiter_that_arrives_after_ds_last_token_starts_the_span():
     assert (ev["waiter_arrival_source"], ev["user_flipzeit_ms"]) == ("first_leg1_rid_arrival", 500)
 
 
+def test_dp_without_a_proven_waiter_arrival_has_no_start_and_pre_wait_is_only_diagnosis():
+    """NF int18 epoch 11 (planner decision 08.10.): D>P flip time = first P chunk - max(last D token,
+    waiter arrival). A D token alone is a substitute for an unproven arrival -> null, not a number.
+    The idle gap between the last token and a LATER arrival is ``pre_wait_ms``, never flip time."""
+    c = fsi.DpFlipClock()
+    c.note_d_token(50.0)
+    c.begin(3, 60.0, oldest_waiter_ts=None)
+    c.done(62.0)
+    ev = c.first_prefill("r", 62.0, {"ts": 62.5}, rid_arrival_ts=None)   # no arrival proven anywhere
+    assert ev["user_flipzeit_ms"] is None and ev["user_flipzeit_start_ts"] is None
+    assert ev["user_flipzeit_missing"] == "start_missing:waiter_arrival_unproven"
+    c.note_d_token(70.0)
+    c.begin(5, 80.0, oldest_waiter_ts=75.0)                              # arrived 5 s after the last token
+    c.done(82.0)
+    ev = c.first_prefill("r2", 82.0, {"ts": 82.5})
+    assert (ev["user_flipzeit_ms"], ev["pre_wait_ms"]) == (7500, 5000)
+    c.note_d_token(90.0)
+    c.begin(7, 100.0, oldest_waiter_ts=85.0)                             # waiter held since before the last token
+    c.done(102.0)
+    ev = c.first_prefill("r3", 102.0, {"ts": 102.5})
+    assert (ev["user_flipzeit_ms"], ev["pre_wait_ms"]) == (12500, 0)
+
+
 def test_a_missing_support_value_is_null_with_its_reason_never_a_substitute():
     c = _epoch5_clock()
     ev = c.first_prefill("weg2-2-39", FLIP_BEGIN, {"missing": "no_rise_by_leg1_end"})
