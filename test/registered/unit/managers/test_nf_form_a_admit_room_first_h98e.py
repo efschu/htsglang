@@ -351,13 +351,23 @@ class AdmitRoomFirstTest(unittest.TestCase):
         self.assertIsNone(m.form_a_host_vote_stale(trees[0], H98._req()))
 
     def test_a_real_shortfall_costs_the_shortfall_not_the_drain(self):
-        """The live pool is short by 19280: it is paid ONCE, by H105d's room
-        attempt before the gather, and the load-back finds it (base: H105d pays
-        19280, then the floor refuses and drains the remaining 149552)."""
+        """The live pool is short: it is paid ONCE, by H105d's room attempt
+        before the gather, and the load-back finds it (base: H105d pays the
+        shortfall, then the floor refuses and drains the remaining ~150k).
+        With H110 the room priced is the load-back rows PLUS the first chunk
+        behind them (what is left of the extend after the rank's own
+        load-back, cut to rem_chunk_tokens 16384, plus one page of 1): TP0
+        (extent 67392) still has a full 16384 chunk behind its 49280-row
+        load-back, TP1/TP2 (extent 49280) only 12 rows. The single eviction is
+        therefore 35665 on TP0 and 19293 on TP1/TP2 -- one payment each, far
+        below the EVICTABLE drain."""
         out, adders, reqs, ranks, _, _ = _pass(live=30000)
+        h110_chunk_rows = {0: 16384 + 1, 1: 12 + 1, 2: 12 + 1}
         for r in range(3):
             self.assertEqual(out[r], AddReqResult.CONTINUE, f"TP{r}: {out[r]}")
-            self.assertEqual(ranks[r].evicts, [KV_ROWS - 30000], f"TP{r}")
+            self.assertEqual(
+                ranks[r].evicts, [KV_ROWS + h110_chunk_rows[r] - 30000], f"TP{r}"
+            )
             self.assertEqual(ranks[r].follow_room, [True], f"TP{r}")
 
     def test_switch_off_is_the_pre_h98e_drain(self):
