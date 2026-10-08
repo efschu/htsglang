@@ -444,3 +444,17 @@ def test_main_refuses_an_asymmetric_switch_before_the_identity_for_every_boot():
     i = src.index("    l3_moe_act_resolve(getattr(ns, \"extra_p\"")
     assert i < src.index("    _l3_idx_ident = (l3_persist_identity(")
     assert "if l3_persist_enabled()" not in src[i - 200:i]  # unconditional: not behind the persistent-L3 gate
+
+
+def test_the_resolve_main_runs_for_every_boot_is_a_noop_in_the_default(tmp_path):
+    """Fix-round-2 finding (minor, kept and argued, not narrowed away): main() calls l3_moe_act_resolve for EVERY boot,
+    also one without a persistent L3. The refusal is a config-error gate: it fires only when the operator switched W4A8
+    on asymmetrically, a state that cannot exist unless they asked for it. In the DEFAULT (no source carries the switch)
+    the call must change nothing -- here with the release profile nf-int4-h6-abl's REAL argv values from the AP0 launch
+    fixture: returns False, no SystemExit, process env honored (absent key = off), and the identity dict stays the pinned
+    default dc6a8c2062 (the dry-run golden test test_planer_referenz_n3_1006 pins the whole boot dump)."""
+    argv = LAUNCH["argv"]
+    args = (_flag(argv, "--extra-p"), _flag(argv, "--extra-d"), _flag(argv, "--env-p"), _flag(argv, "--env-d"))
+    assert L.l3_moe_act_resolve(*args, None, {}) is False          # empty process env
+    assert L.l3_moe_act_resolve(*args, None) is False              # os.environ, key removed by the autouse fixture
+    assert "moe_act" not in _abl_derived_identity(tmp_path)        # and the identity does not grow the field
