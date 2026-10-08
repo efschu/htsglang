@@ -47,7 +47,7 @@ def main(root, out):
         if text is None or not R.in_scope(path) or ext in R.CXX_EXT:
             continue
         py = path.endswith(".py")
-        clash = R.file_collisions(text, R.rewrite_all(text, py, True, {})[0])
+        clash = R.file_collisions(text, R.rewrite_all(text, py, True, {}, path)[0])
         clash = {k: v for k, v in clash.items() if k not in R.COLLISION_OK.get(path, frozenset())}
         if not clash:
             continue
