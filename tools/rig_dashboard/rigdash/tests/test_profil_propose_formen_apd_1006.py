@@ -135,7 +135,7 @@ class SingleRequests(unittest.TestCase):
             self.ed.propose(self._body(inventory=two))
         self.assertIn("select exactly one card", str(cm.exception))
         with self.assertRaises(P.ProfileError) as cm:
-            self.ed.propose(self._body(emap=3))
+            self.ed.propose(self._body(**{"karte": 3}))      # the body key is "karte" (API); the kit renamed the keyword name `karte=` to `emap=` (F0-D restored)
         self.assertIn("the hardware profile has 1 cards", str(cm.exception))
         r = self.ed.propose(self._body(inventory=two[:1]))                                         # one catalog card that is not the rig's: a datasheet inventory
         self.assertTrue(r["ok"], r)

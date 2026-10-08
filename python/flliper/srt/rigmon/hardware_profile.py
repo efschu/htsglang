@@ -100,6 +100,7 @@ __all__ = [
     "DEFAULT_PERSIST_PATH",
     "persist_path",
     "load_profile",
+    "normalize_profile",
     "save_profile",
     "compare",
     "capture",
@@ -114,6 +115,23 @@ SRC_DATASHEET = "Datasheet"
 SRC_ESTIMATED = "geschätzt"
 SRC_NONE = "nicht gemessen"
 SOURCES = (SRC_MEASURED, SRC_NVML, SRC_DATASHEET, SRC_ESTIMATED, SRC_NONE)
+
+#: F0-D fix round 1: a profile persisted before the rename (``/var/lib/flliper/hardware.json`` of the rig, written at the first start)
+#: spells two vocabulary words in German; the renamed module writes and checks the English ones.  ``normalize_profile`` reads the
+#: file in either spelling (exact string values only, prose is never touched); ``load_profile`` and ``validate`` apply it, so a
+#: profile captured by the old tree is neither "unknown source" nor "borrowed" under a word nobody reads.
+LEGACY_WORDS = {"Datenblatt": SRC_DATASHEET, "borrowed-unbelegt": "borrowed-unverified"}
+
+
+def normalize_profile(x):
+    """The persisted profile with its legacy vocabulary words replaced (a new document; idempotent)."""
+    if isinstance(x, dict):
+        return {k: normalize_profile(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [normalize_profile(v) for v in x]
+    if isinstance(x, str):
+        return LEGACY_WORDS.get(x, x)
+    return x
 
 #: Where the profile is persisted (first start); the env names another file (container volume, test).
 PERSIST_ENV = "FLLIPER_HARDWARE_PROFILE"
@@ -1101,6 +1119,7 @@ def _canonical(obj) -> str:
 def validate(doc: dict) -> List[str]:
     """Every value node has a known ``src``; "gemessen" names when/where; ``v`` null means "nicht gemessen" + why."""
     problems: List[str] = []
+    doc = normalize_profile(doc)
 
     def walk(path: str, x):
         if isinstance(x, dict):
@@ -1154,7 +1173,7 @@ def load_profile(path: str) -> Tuple[Optional[dict], Optional[str]]:
         return None, f"not readable ({type(e).__name__}: {e})"
     if not isinstance(d, dict) or d.get("schema") != SCHEMA or not isinstance(d.get("cards"), list):
         return None, f"no {SCHEMA} document"
-    return d, None
+    return normalize_profile(d), None
 
 
 def save_profile(doc: dict, path: str, *, reason: str, now: Optional[float] = None) -> Dict[str, Any]:

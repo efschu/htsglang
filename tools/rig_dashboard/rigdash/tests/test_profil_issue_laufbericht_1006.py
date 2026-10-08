@@ -552,8 +552,8 @@ class Redaction(Base):
             names = sorted(json.load(f)["entries"])
         self.assertGreater(len(names), 2000)
         hits = [n for n in names if redact.secret_name(n)]
-        self.assertEqual(hits, ["--admin-api-key", "--api-key", "--ssl-keyfile-password", "FLLIPER_REGISTRY_ADMIN_API_KEY", "FLLIPER_REGISTRY_API_KEY",
-                                "FLLIPER_PDFLIP_BOOT_TOKEN"])
+        self.assertEqual(hits, ["--admin-api-key", "--api-key", "--ssl-keyfile-password", "FLLIPER_PDFLIP_BOOT_TOKEN", "FLLIPER_REGISTRY_ADMIN_API_KEY",
+                                "FLLIPER_REGISTRY_API_KEY"])    # catalog order: since the F0-D rename the subsystem prefix sorts before FLLIPER_REGISTRY
         for n in names:
             if "token" in n.lower() and n not in hits:           # jeder harmlose Token-Name behaelt seinen Wert
                 self.assertEqual(redact.value_for_issue(n, "7", KNOWN), "7", n)

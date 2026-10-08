@@ -203,7 +203,10 @@ class FileAndCliCase(unittest.TestCase):
             run("gewinn", "--id", "H1", "--modell", "NF", "--metrik", "Flipzeit", "--nachher", "2.2",
                 "--art", "gemessen")
             with open(p) as fh:
-                d = json.load(fh)
+                raw = json.load(fh)
+            self.assertIn("schalter", raw["features"][0])           # F0-D: the file on disk keeps its legacy spelling
+            self.assertNotIn("switch", raw["features"][0])
+            d = features.normalize_doc(raw)
             f = d["features"][0]
             self.assertEqual([z["sha"] for z in f["zweige"]], ["0123456789", "abcdef0123"])
             self.assertEqual([(g["metrik"], g["nachher"]) for g in f["gewinn"]], [("Flipzeit", "2.2")])
@@ -370,7 +373,9 @@ class ProduktCase(unittest.TestCase):
             run("set", "--id", "B2", "--modell", "NF", "--title", "neu", "--produkt", "F2")
             run("boot-override", "--boot", "b-20260929T002052Z-86f6", "--lifecycle", "stopped (geplant)", "--evidence", "27B")
             with open(p) as fh:
-                d = json.load(fh)
+                raw = json.load(fh)
+            self.assertEqual({x["id"]: x for x in raw["produkt"]}["F1"]["ist"]["NF"]["wert"], "2,1 s")   # legacy spelling on disk
+            d = features.normalize_doc(raw)
             P = {x["id"]: x for x in d["produkt"]}
             self.assertEqual(P["F1"]["ist"]["NF"]["belegt_am"], "2026-09-29T06:00Z")
             self.assertEqual(P["F2"]["kreuztabelle"]["zellen"]["NF"]["dcp+kvonly"], {"status": "nur Desk", "note": "F15"})
@@ -401,7 +406,9 @@ class ProduktCase(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 run("reached", "--id", "F2", "--modell", "27B", "--value", "vielleicht")
             with open(p) as fh:
-                d = json.load(fh)
+                raw = json.load(fh)
+            self.assertEqual({x["id"]: x for x in raw["produkt"]}["F2"]["ist"]["27B"]["status"], "unbelegt")   # legacy value on disk
+            d = features.normalize_doc(raw)
             P = {x["id"]: x for x in d["produkt"]}
             self.assertEqual((P["F1"]["ist"]["NF"]["status"], P["F1"]["ist"]["NF"]["reached"]), ("fertig+aktiv", "nein"))
             self.assertEqual(P["F2"]["ist"]["27B"], {"status": "unverified", "reached": "teilweise",
@@ -414,6 +421,88 @@ class ProduktCase(unittest.TestCase):
             run("md", "--out", out, "--live-url", "")
             self.assertIn("Target reached? 27B / NF", open(out).read())
             self.assertIn("NF: nein (7,06 s gegen Soll <= 3 s)", open(out).read())
+
+
+
+# ---- F0-D fix round 1: the persisted file keeps its legacy spelling, the module reads both ----------------------------------
+LEGACY_DOC = {
+    "schema": "rigdash.features/1",
+    "features": [{"id": "A", "modell": "NF", "titel": "a", "fertig": True, "zweige": [],
+                  "schalter": [{"name": "FLLIPER_A", "art": "env", "gruppe": "D", "an_wert": "1", "default": "aus"}],
+                  "gewinn": [{"metrik": "Flipzeit", "vorher": "3,1", "nachher": "2,4", "einheit": "s", "art": "unbelegt"}]}],
+    "produkt": [{"id": "F1", "nr": 1, "titel": "t1", "soll": "s1", "bausteine": ["A"],
+                 "ist": {"NF": {"status": "unbelegt", "wert": "2,1 s", "grund": "g", "beleg": "b", "erreicht": "ja",
+                                "erreicht_grund": "eg", "belegt_am": "2026-09-29T06:00Z"}},
+                 "matrix": {"zellen": {"NF": {"Form A|1|kurz|code": {"status": "wert", "wert": "131,9 tok/s", "boot": "x", "beleg": "p"}}}}}],
+    "boot_overrides": {"b-20260929T002052Z-86f6": {"lifecycle": "stopped", "beleg": "27B"}},
+}
+
+
+class LegacySpellingCase(unittest.TestCase):
+    def test_normalize_reads_both_spellings_and_is_idempotent(self):
+        n = features.normalize_doc(LEGACY_DOC)
+        self.assertEqual(n["features"][0]["title"], "a")
+        self.assertEqual(n["features"][0]["switch"][0]["an_value"], "1")
+        self.assertEqual(n["features"][0]["gewinn"][0]["unit"], "s")
+        self.assertEqual(n["features"][0]["gewinn"][0]["art"], "unverified")
+        ist = n["produkt"][0]["ist"]["NF"]
+        self.assertEqual((ist["status"], ist["value"], ist["reason"], ist["evidence"], ist["reached"], ist["reached_reason"]),
+                         ("unverified", "2,1 s", "g", "b", "ja", "eg"))
+        cell = n["produkt"][0]["matrix"]["zellen"]["NF"]["Form A|1|kurz|code"]
+        self.assertEqual((cell["status"], cell["value"], cell["evidence"]), ("value", "131,9 tok/s", "p"))
+        self.assertEqual(n["boot_overrides"]["b-20260929T002052Z-86f6"]["evidence"], "27B")
+        self.assertEqual(features.normalize_doc(n), n)
+        self.assertEqual(LEGACY_DOC["features"][0]["titel"], "a")          # the input is not touched
+
+    def test_persisted_doc_is_the_exact_inverse(self):
+        self.assertEqual(features.persisted_doc(features.normalize_doc(LEGACY_DOC)), LEGACY_DOC)
+
+    def test_no_legacy_word_survives_in_memory_and_no_translated_word_on_disk(self):
+        n = features.normalize_doc(LEGACY_DOC)
+        txt = json.dumps(n)
+        for w in features.LEGACY_KEYS:
+            self.assertNotIn('"%s":' % w, txt)
+        disk = json.dumps(features.persisted_doc(n))
+        for w in features.LEGACY_KEYS.values():
+            self.assertNotIn('"%s":' % w, disk)
+
+    def test_validate_accepts_the_legacy_file_like_the_translated_one(self):
+        self.assertEqual(features.validate_doc(LEGACY_DOC), [])
+        self.assertEqual(features.validate_doc(features.normalize_doc(LEGACY_DOC)), [])
+        bad = json.loads(json.dumps(LEGACY_DOC))
+        bad["produkt"][0]["ist"]["NF"]["erreicht"] = "fast"
+        self.assertTrue(any("reached" in x for x in features.validate_doc(bad)))
+
+    def test_file_load_of_a_legacy_file(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = os.path.join(t, "f.json")
+            with open(p, "w") as fh:
+                json.dump(LEGACY_DOC, fh)
+            ff = features.FeatureFile(p)
+            feats, err, _ = ff.load()
+            self.assertIsNone(err)
+            self.assertEqual(feats[0]["switch"][0]["an_value"], "1")
+            self.assertEqual(ff.produkt[0]["ist"]["NF"]["status"], "unverified")
+
+    def test_cli_round_trip_keeps_the_legacy_file_legacy(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = os.path.join(t, "f.json")
+            with open(p, "w") as fh:
+                json.dump(LEGACY_DOC, fh)
+            features_update.main(["--file", p, "set", "--id", "A", "--modell", "NF", "--title", "a2", "--fertig", "ja"])
+            with open(p) as fh:
+                raw = json.load(fh)
+            self.assertEqual(raw["features"][0]["titel"], "a2")
+            self.assertEqual(raw["produkt"][0]["ist"]["NF"]["wert"], "2,1 s")
+            self.assertEqual(raw["produkt"][0]["ist"]["NF"]["status"], "unbelegt")
+            self.assertEqual(raw["produkt"][0]["matrix"]["zellen"]["NF"]["Form A|1|kurz|code"]["status"], "wert")
+
+    @unittest.skipUnless(os.path.exists(features.DEFAULT_PATH), "the rig's features.json is not on this box")
+    def test_the_live_file_validates_and_round_trips(self):
+        with open(features.DEFAULT_PATH) as fh:
+            live = json.load(fh)
+        self.assertEqual(features.validate_doc(live), [])
+        self.assertEqual(features.persisted_doc(features.normalize_doc(live)), live)
 
 
 if __name__ == "__main__":

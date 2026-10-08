@@ -84,8 +84,8 @@ def tearDownModule():
 
 #: sha256 of the two Dual profile snapshots: the AP0 reference (14:01Z, the golden's profile) and the live release profile as it was at 15:21Z
 #: (moved by the 27B seat: cut 31,17,16 / attn 7,5,4, P budgets 6610,5050,5200, P pool level 266240, no 131072 cap, ``--env-d ...D_WANT_LOCKED=1``)
-PROVENANCE = {"27b-nvfp4-dual.env": "1cc8890ccece7f9bd1097c30072ec6d87031bf4a8d5e9afb03646992ab39a24e",
-              "27b-nvfp4-dual-live1521.env": "ce347c790b8e1aa466ada84c1adfa6765601de982eef0cf8f3b68382fb0e3977"}
+PROVENANCE = {"27b-nvfp4-dual.env": "747c532a4dbfc60ecf03431c4d5d960500d15294caa1ca9ecb029ca6a3f0106e",
+              "27b-nvfp4-dual-live1521.env": "45fa989293dc812fbe318d7859280fed7e0c49967ffbb7324af2c76592e0a736"}
 
 
 def _dual_profile(name: str = "27b-nvfp4-dual"):

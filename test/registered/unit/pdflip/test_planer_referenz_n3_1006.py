@@ -118,10 +118,10 @@ MC = "/spinning/llm_stuff/club-3090/models-cache/"
 
 #: sha256 of the snapshot files (the live files they were copied from, 2026-10-06)
 PROVENANCE = {
-    "27b-base.env": "7f48188299747a86c76b7eb591b57de07cd4897cd65a058fa9859295ca6026b9",
-    "27b-nvfp4-dual.env": "1cc8890ccece7f9bd1097c30072ec6d87031bf4a8d5e9afb03646992ab39a24e",
+    "27b-base.env": "a278011c9ac3d09a7679608ae96ae5224f0efc582a7cdcabec0589b5adff63bd",
+    "27b-nvfp4-dual.env": "747c532a4dbfc60ecf03431c4d5d960500d15294caa1ca9ecb029ca6a3f0106e",
     "27b-nvfp4.pchunk.json": "a56d1c7a4fb93206e6251540db80dc36656355daed95a3faf1e19de5fc99237c",
-    "nf-int4-h6-abl.env": "12f9a824b3d9fc66e065ae6856ca91f2c48be43225c55e302ddfab4fd5cb8092",
+    "nf-int4-h6-abl.env": "0f46887b41fbd71193474aa7d464949bf98f24a90e401abae51474cbfa771894",
 }
 PROFILE_FILES = {"flip": "27b-base", "dual": "27b-nvfp4-dual", "nf": "nf-int4-h6-abl"}
 
