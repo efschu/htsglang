@@ -24,7 +24,8 @@ with ``executed`` = its ``forward_ct`` (the batches whose rows it has already
 allocated). ``payable`` is what ONE peel can pay without knowing the wall: a
 post-order walk (:func:`estimate_payable`) that pays a device node only when every
 device child is paid and the node itself can leave -- backed (demote), backed up
-into the host room still free, or dropped on the local-PP floor (UD/UD-H: no
+into the host room still free (:func:`backup_room_tokens`: on an arena-bound pool
+its FREE slots, PR-ARENA int22), or dropped on the local-PP floor (UD/UD-H: no
 write-through in flight, host-only children clearable); a locked node or an
 unpayable child stops its whole chain. It is capped by PW's measured wall
 (``payable_evictable_or``). The walk is O(nodes) (86 nodes on PP2 at 13:37:49) and
@@ -146,20 +147,53 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
     return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
 
 
+def backup_room_tokens(pool) -> int:
+    """The host room a peel's write_back backup can claim now, in tokens.
+
+    PR-ARENA (NF int22, P PP1 18:34:20Z, boot ..._6b3bd1a6df_1008_171755): on an
+    arena-bound KV host pool the backup IS an arena claim (``write_backup`` ->
+    ``_pdflip_direct_claim`` -> ``alloc_write``), and the pool's
+    ``available_size()`` is the front's read gauge ``(slots - claimed) * P``
+    (``ArenaMHAHostPool.available_size``, #1440b: COMPLETE slots count as free
+    there). With 541 of 580 slots complete it read 34624 tokens of backup room
+    while every claim was refused (``#1427 ARENA-CLAIM REFUSED statuses=[0, 4]``,
+    ``ARENA-DROP freed=0``): the walk backed up the two un-backable frontier
+    leaves and paid 195968 tokens no peel could pay (``EVICT-FRONTIER-CENSUS
+    on_frontier=8192 behind_device_child=187776``) -> PP0 launched 16321 rows,
+    PP1 ``Prefill out of memory``.
+
+    Switched on (``FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM``, default) the room
+    of an arena-bound pool is its FREE slots (``slots - complete - claimed``)
+    times the slot's tokens: what a claim gets without room-making. A lower
+    bound (the claim may still evict an unreferenced complete slot, the W3
+    spill may still release one) -- an un-backed node beyond it is payable
+    only by the UD drop, the test the peel applies next. Off, or a pool without
+    a bound arena: ``available_size()`` as before. Unreadable: 0."""
+    if pool is None:
+        return 0
+    try:
+        from flliper.srt.environ import envs
+
+        inner = getattr(getattr(pool, "anchor_entry", None), "host_pool", None) or pool
+        arena = getattr(inner, "arena", None) if getattr(inner, "arena_read", False) else None
+        if arena is None or not envs.FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM.get():
+            return max(0, int(pool.available_size()))
+        st = arena.stats()
+        free = int(st["slots"]) - int(st["complete"]) - int(st["claimed"])
+        per = int(getattr(inner, "_arena_page_tokens", 1) or 1)  # arena_pool._psz
+        return max(0, free) * per
+    except Exception:  # noqa: BLE001 - no reading: no host room assumed
+        return 0
+
+
 def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: bool) -> PdFlipPpRoomFact:
     from flliper.srt.mem_cache.common import payable_evictable_or
 
     available = int(allocator.available_size())
     reported = int(tree.evictable_size())
     walled = int(payable_evictable_or(tree, tree.evictable_size))
-    host_free = 0
     cc = getattr(tree, "cache_controller", None)
-    pool = getattr(cc, "mem_pool_host", None) if cc is not None else None
-    if pool is not None:
-        try:
-            host_free = int(pool.available_size())
-        except Exception:  # noqa: BLE001 - no reading: no host room assumed
-            host_free = 0
+    host_free = backup_room_tokens(getattr(cc, "mem_pool_host", None) if cc is not None else None)
     t0 = time.perf_counter()
     walked = estimate_payable(tree, local_floor=local_floor, host_free=host_free)
     sim_us = (time.perf_counter() - t0) * 1e6
