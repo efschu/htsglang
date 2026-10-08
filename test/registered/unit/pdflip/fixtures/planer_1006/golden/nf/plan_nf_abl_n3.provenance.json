@@ -24,7 +24,7 @@
  "profile": {
   "file": "profiles/nf-int4-h6-abl.env",
   "live": "/spinning/gpu-arb/docker/profiles/nf-int4-h6-abl.env (identical sha256 on 2026-10-06)",
-  "sha256": "12f9a824b3d9fc66e065ae6856ca91f2c48be43225c55e302ddfab4fd5cb8092"
+  "sha256": "0f46887b41fbd71193474aa7d464949bf98f24a90e401abae51474cbfa771894"
  },
  "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
  "schema": "planer-ap0-golden-provenance/1",

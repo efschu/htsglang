@@ -18,12 +18,12 @@
  "profile": {
   "file": "profiles/27b-nvfp4-dual.env",
   "live": "/spinning/gpu-arb/docker/profiles_release/27b-nvfp4-dual.env (identical sha256 on 2026-10-06 14:01Z, mtime 13:17:36Z; moved twice during AP0 fix round 3, see note)",
-  "sha256": "1cc8890ccece7f9bd1097c30072ec6d87031bf4a8d5e9afb03646992ab39a24e"
+  "sha256": "747c532a4dbfc60ecf03431c4d5d960500d15294caa1ca9ecb029ca6a3f0106e"
  },
  "profile_inputs": {
   "base": {
    "file": "profiles/27b-base.env",
-   "sha256": "7f48188299747a86c76b7eb591b57de07cd4897cd65a058fa9859295ca6026b9"
+   "sha256": "a278011c9ac3d09a7679608ae96ae5224f0efc582a7cdcabec0589b5adff63bd"
   },
   "census": {
    "file": "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json",
