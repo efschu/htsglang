@@ -206,6 +206,39 @@ def test_entrypoint_is_not_exempted_from_the_collision_guard():
             assert isinstance(words, list) and all(isinstance(w, str) for w in words)
 
 
+def test_entrypoint_content_is_locked_in_the_engine():
+    """Fix round 2: the entrypoint is not exempted (test above) but content-locked: the mechanical pass leaves its bytes (F0-B/F0-G own it),
+    so the survey has no name-rule collision to report for it; the file still moves with its directory."""
+    sys.path.insert(0, KIT)
+    import rename_to_flliper as R
+    for p in ("docker/weg2-release/entrypoint.sh", "docker/pd" + "flip-release/entrypoint.sh"):
+        assert R.in_path_scope(p) and not R.in_scope(p), p
+    assert R.in_scope("docker/weg2-release/README_RELEASE_DRAFT.md")
+
+
+def test_survey_covers_the_ident_fix_guard_of_release_rename():
+    """Fix round 2: the survey's exit code is the acceptance of BOTH guards. A tiny repo with a German word whose target is already a
+    NAME of the same file: strict rule = open, default (refined, as release_rename.sh) = open only where a merge is possible."""
+    import tempfile
+    d = tempfile.mkdtemp()
+    def g(*a):
+        subprocess.run(["git", "-C", d, *a], check=True, capture_output=True)
+    g("init", "-q")
+    os.makedirs(os.path.join(d, "python"))
+    with open(os.path.join(d, "python", "a.py"), "w") as fh:
+        fh.write("def f():\n    vorlauf = 1\n    warmup = 2\n    return vorlauf + warmup\n")
+    with open(os.path.join(d, "python", "b.json"), "w") as fh:
+        fh.write('{"note": "the vorlauf phase is the warmup"}\n')
+    g("add", "-A")
+    env = {k: v for k, v in os.environ.items() if k not in ("COLLISION_OK_FILE", "IDENT_COLLISION_OK_FILE", "FIXMAP_EXTRA", "IDENT_FIX_COLLISION")}
+    r = subprocess.run([sys.executable, os.path.join(KIT, "collision_survey.py"), d], capture_output=True, text=True, env=env, timeout=120)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "ident_fix (step 2" in r.stdout and "  F python/a.py" in r.stdout and "  F python/b.json" not in r.stdout, r.stdout
+    env["IDENT_FIX_COLLISION"] = "strict"
+    r = subprocess.run([sys.executable, os.path.join(KIT, "collision_survey.py"), d], capture_output=True, text=True, env=env, timeout=120)
+    assert "  F python/b.json" in r.stdout, r.stdout
+
+
 def test_ident_collision_ok_file_is_well_formed_and_scope_separate():
     """data/ident_collision_ok_1007.json lists only (path, old word) pairs that never meet in one function scope."""
     p = os.path.join(KIT, "data", "ident_collision_ok_1007.json")

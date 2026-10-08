@@ -112,6 +112,11 @@ EXCLUDE_CONTENT = [
     # shown as altered. They are evidence like the boot logs (RENAME_PLAN 2): bytes kept. rename_rigdash.py has locked them since 05.10.;
     # the whole-tree pass needs the same lock (tools/** is in scope).
     "tools/rig_dashboard/rigdash/kartenplan_data/**",
+    # F0-A fix round 2 (08.10.2026): the container entrypoint spells old AND new names on purpose (state-path fallback, cache volume
+    # detection, package-dir test: executable compat code). The mechanical pass would make both spellings one word (3 name-rule
+    # collisions), so its content is locked here; F0-B writes it for both names, F0-G finishes it by hand on the renamed tree. The file
+    # still moves with its directory (weg2-release -> pdflip-release).
+    "docker/weg2-release/entrypoint.sh", "docker/pdflip-release/entrypoint.sh",
 ]
 # Files that spell BOTH names on purpose: the tests of the NF compat layer (name_compat 1a/1b, 00925f46bd) write the
 # new package/subsystem word as a plain literal next to imports of the old one (`["sg" "lang", "flliper"]`,
