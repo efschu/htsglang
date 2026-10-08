@@ -388,9 +388,19 @@ def user_flipzeit(direction: str, start_a: Optional[float], start_a_source: Opti
         missing = "end_missing:" + str(end_missing or "unknown")
     elif start is None:
         missing = "start_missing:no_%s_no_waiter" % pre
+    elif direction == "D>P" and waiter_ts is None:
+        # D>P: without a proven arrival of the waiter the start is unproven; the last D
+        # token alone would be a substitute (the user's start is the LATER of the two).
+        missing = "start_missing:waiter_arrival_unproven"
+        start, src = None, None
     elif float(end_ts) < float(start):
         missing = "end_before_start"
+    # DIAGNOSIS, never part of the flip time: the idle gap between the last token and the
+    # waiter's arrival (the server had nothing to do; holding a waiter is flip time, this is not)
+    pre_wait = (None if waiter_ts is None or start_a is None
+                else round(max(0.0, float(waiter_ts) - float(start_a)) * 1000.0))
     out = {
+        "pre_wait_ms": pre_wait,
         "user_flipzeit_ms": (None if missing else round((float(end_ts) - float(start)) * 1000.0)),
         "user_flipzeit_start_ts": _ts3(start), "user_flipzeit_start_source": src,
         "user_flipzeit_end_ts": _ts3(end_ts), "user_flipzeit_missing": missing,
