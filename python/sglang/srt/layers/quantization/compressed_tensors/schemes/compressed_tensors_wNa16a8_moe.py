@@ -101,7 +101,7 @@ MARKER = "MOE-ACT-INT8"
 #: ``max|s| / 4096`` over the WHOLE tensor: the largest scale magnitude maps to +-4096 (``W4A8_SCALE_INT_RANGE``). A factor
 #: adopted from another rank (H88-C: published through the store sidecar) maps THIS rank's largest scale to
 #: ``max(s) / factor``, and the kernel accumulates in int32: ``frag_c(int32) += frag_c_tmp(int32 group dot) *
-#: scale(int)`` summed over every group of K (jit_kernel/csrc/gemm/marlin_a8_moe/marlin_template.h:1488-1511).
+#: scale(int)`` summed over every group of K (jit_kernel/csrc/gemm/marlin_a8_moe/marlin_template.h:1487-1510).
 #: A scale above 4096 multiplies every group dot beyond the reference and can overflow that accumulator --
 #: a wrap is silent (wrong output, no error). Hence the band's upper end is the x4096 REFERENCE range, not the
 #: int16 storage limit 32767: with only full-view ranks publishing (:meth:`CompressedTensorsWNA16A8MoE._resolve_factor`)
