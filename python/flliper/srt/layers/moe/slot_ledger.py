@@ -23,7 +23,7 @@ bekommt Y genau diesen Platz. Die Zahl der Plaetze ist dann die Zahl der
 gleichzeitig Kalten -- nie mehr, egal wie oft getauscht wird. Das ist die
 Zeile, die in ``expert_store`` schon als Absicht steht:
 
-    "liegen zu jedem Zeitpunkt R von N Experten auf den Karten, braucht der
+    "liegen zu jedem Zeitpunkt R von N Experten auf den Karten, requires der
      Store nie mehr als N-R Plaetze -- auch wenn dauernd andere Experten
      darin stehen"
 

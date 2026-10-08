@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DUAL-TP3PP3 unified KV (A): the front pauses P's leg 1 when D is short of
 KV on a card, and resumes it later (user order 30.09. 07:25Z: "wird vram kv
-knapp, pausiert P und gibt den context frei und das erarbeitete in den L2 zur
+tight, pausiert P und gibt den context frei und das erarbeitete in den L2 zur
 späteren weiterverwendung wenn vram kv wieder frei wird").
 
 DANGER DIRECTIONS guarded here:

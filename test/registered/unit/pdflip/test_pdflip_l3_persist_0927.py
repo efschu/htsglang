@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """L3P (user 2026-09-27): the disk L3 store survives boots, one store per model.
 
-User, verbatim: "der l3 hicache wird jedesmal verworfen, oder? der soll
+User, verbatim: "der l3 hicache wird jedesmal rejected, oder? der soll
 natürlich persistent sein" and "aber natürlich zwischen 27b und nf verschiedene
 L3 caches. sonst knallts".
 

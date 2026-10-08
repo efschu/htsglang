@@ -33,7 +33,7 @@ AGGREGAT (PP0 ist der zulassende Rang, seine Zeilen zaehlen):
     agg_tok_s          P-Tokens / P-Fenster (erste leg-1-Annahme bis letzte
                        leg-1-Antwort der Front; ohne Front-Log die Client-Wand)
     sockel_ms          RECHNUNG: Achsenabschnitt a der Geraden gpu_ms = a + b*n
-                       ueber die PP0-Rangzeilen mit n >= 256 (braucht >= 2
+                       ueber die PP0-Rangzeilen mit n >= 256 (requires >= 2
                        verschiedene n); daneben moe_fetch_ms-Median aus
                        FWD-TIMING, wenn an.
     serial_tok_s_est   RECHNUNG: jeder Request allein (--p-bs 1): Summe ueber die

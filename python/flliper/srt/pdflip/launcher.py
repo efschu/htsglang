@@ -3073,7 +3073,7 @@ def kv_stage_wave_cap(ns, er, tab, max_by: Sequence[int], env: Mapping[str, str]
     if er.POOL_OVERFLOW_WAVES_ENV in env and not getattr(ns, "d_pool_waves_derived", False):
         raise PdFlipDKvStageWavesRefused(
             "W169 PdFlipDKvStageWavesRefused: die Stufenform (hoechste Stufe je Sitzzahl %s) "
-            "braucht %d Ueberlaufwellen je bs %s, --env-d nennt %s=%s -- der Capture "
+            "requires %d Ueberlaufwellen je bs %s, --env-d nennt %s=%s -- der Capture "
             "verweigerte auf TP0 ('Step ids exceed ...'); keine Stufenform geschrieben"
             % (list(max_by), need, list(tab.capture_waves(max_by)),
                er.POOL_OVERFLOW_WAVES_ENV, env.get(er.POOL_OVERFLOW_WAVES_ENV)))
@@ -3215,7 +3215,7 @@ def kv_stage_lru_floor(group, rows, fits, max_by: Sequence[int], peak: Sequence[
         need = min(int(math.ceil(p * span_now - 1e-9)), span_now, int(last.ids_per_step))
         j_by = [min(int(max_by[i]), len(t.tokens) - 1) for i in range(cap)]
         lru = min(int(t.capacity[i][j_by[i]]) for i in range(cap))
-        text = ("rang%d Spitze %d bei Spanne %d -> Bedarf %d bei Spanne %d (E %d - R %d), "
+        text = ("rang%d Peak %d bei Spanne %d -> Bedarf %d bei Spanne %d (E %d - R %d), "
                 "LRU bis S%d min %d" % (r, int(peak[r]), int(span[r]), need, span_now, E,
                                         E - span_now, max(j_by), lru))
         if need > lru:
@@ -3320,7 +3320,7 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         # in the plan. A cut the plan does not carry per rank: no form.
         return ["%s: entfaellt unter dem Token-Schnitt %s -- KV-haltende Worker %s ohne "
                 "Trim-Zelle im Plan bekaemen ihren FA-KV-Pool auf der obersten Stufe "
-                "ungetrimmt (Stufen je KV-Rang: S3g braucht den geloesten Schnitt); "
+                "ungetrimmt (Stufen je KV-Rang: S3g requires den geloesten Schnitt); "
                 "D faehrt fest %s Token"
                 % (head, kv_token_shares, "(noch ungeloest)" if cut_workers == [-1]
                    else "Rang %s" % ",".join(str(r) for r in cut_workers),
@@ -5606,7 +5606,7 @@ def d_fr_ceiling_adopt(plan, fractions, env_d: Mapping[str, str], owned: bool,
         return None, lines + [f"{FR_D_CEILING_MARKER}: Decke NICHT uebernommen: P0 aus "
                               f"({TORCH_CACHE_CAP_ENV}!=1 in --env-d) -- ohne gedeckelten "
                               f"Allokator-Cache nimmt der Cache-Swing den Platz an der naechsten "
-                              f"Spitze zurueck; gegeben {given} bleibt"]
+                              f"Peak zurueck; gegeben {given} bleibt"]
     if map_built:
         return None, lines + [f"{FR_D_CEILING_MARKER}: Decke NICHT uebernommen: die "
                               f"Platztausch-Karte ist schon aus FR_D {given} gebaut -- "
@@ -9167,7 +9167,7 @@ def _refuse_if_extra_raises_budget(
             f"Residuum; darueber ueberzieht die Karte und der zuletzt "
             f"geladene Posten faellt (fnFL2w51: der Solo-Draft, "
             f"cu_mem_create CUresult 2). Senken ist erlaubt, heben nicht: "
-            f"ist die Launcher-Rechnung zu knapp, gehoert SIE korrigiert."
+            f"ist die Launcher-Rechnung zu tight, gehoert SIE korrigiert."
         )
 
 
@@ -19800,7 +19800,7 @@ def _d_extend_rate_measure_env(ns, log, label: str, source: str, rtext: str, why
     log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_RATE_MARKER} source={source} start={rtext} "
         f"measure={'on' if _on else 'off'}{' (aus --env-d, Vorrang)' if _given else ''} "
         f"safety={_et.RATE_SAFETY} ({why}; je Rang gilt max(start, gemessen x {_et.RATE_SAFETY}), "
-        f"gemessen = max(Allokator-Spitze, reserved-Zuwachs) / Zeilen ueber jeden Ziel-Extend "
+        f"gemessen = max(Allokator-Peak, reserved-Zuwachs) / Zeilen ueber jeden Ziel-Extend "
         f">= {_et.GROWTH_PER_ROW_MIN_ROWS} Zeilen, Ratsche nur nach oben)")
 
 
@@ -20322,7 +20322,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         # 01.10. (y6n): the owned solve's wave floor needs these scratch rows
         # (rows from resident to scratch, FR_D already solved with them) --
         # the same raise-and-solve-again as the #251c LRU floor
-        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM GRENZEN: Wellenboden braucht Scratch "
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM GRENZEN: Wellenboden requires Scratch "
             + ", ".join("rang%d +%d" % (r, k) for r, k in sorted(_own_add.items())))
         _lru_add = {r: max(int((_lru_add or {}).get(r, 0)), int(_own_add.get(r, 0)))
                     for r in set(_lru_add or {}) | set(_own_add)}
@@ -20334,11 +20334,11 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         _what = ", ".join("rang%d +%d" % (r, k) for r, k in sorted(_lru_add.items()))
         if _pinned:
             log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: Scratch {_what} "
-                f"waere noetig, die Karte ist gebaut -- nicht neu geloest (die Spitze kostet "
+                f"waere noetig, die Karte ist gebaut -- nicht neu geloest (die Peak kostet "
                 f"eine Zusatzwelle)")
         elif _round >= D_KV_STAGE_LRU_FLOOR_ROUNDS:
             log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: nach {_round} "
-                f"Runden noch {_what} -- nicht erreicht, die Spitze kostet eine Zusatzwelle")
+                f"Runden noch {_what} -- nicht reached, die Peak kostet eine Zusatzwelle")
         else:
             d_kv_stage_undo(ns)
             _base = _rank_vec(parse_group_env(getattr(ns, "env_d", "") or "")
@@ -20476,7 +20476,7 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
     try:
         if _logs:
             if len(_logs) != 3:
-                raise ValueError("--wake-credit-reference-logs braucht P.log,D.log,front.log")
+                raise ValueError("--wake-credit-reference-logs requires P.log,D.log,front.log")
             texts = []
             for p in _logs:
                 with open(p, errors="replace") as fh:
@@ -20682,7 +20682,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
                        chunk_layers: Optional[int] = None) -> str:
     """Die EXPERTEN-KARTE bauen und ablegen; Pfad zurueck, sonst "".
 
-    #107, Nutzer-Gesetz 22.09.: *"alles was geshardet wird braucht ne
+    #107, Nutzer-Gesetz 22.09.: *"alles was geshardet wird requires ne
     karte"*. `expert_map.build` gab es seit dem Tag, `expert_store.expert_map`
     liest sie aus ``FLLIPER_MOE_EXPERT_MAP`` -- und NIEMAND hat sie je
     geschrieben (gemessen 22.09.: 2 Leser-Dateien, 0 Schreiber, in keinem
@@ -20763,9 +20763,9 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
             log("#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s passt "
                 "nicht zu %d P-Fractions -- Version-1-Karte wie bisher"
                 % (_stages or "unbekannt", len(fr_pp)))
-        grund = _em.refuse_if_inconsistent(emap)
-        if grund:
-            log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
+        reason = _em.refuse_if_inconsistent(emap)
+        if reason:
+            log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % reason)
             return ""
         _refuse_unbuilt_platztausch_buffers(emap, chunk_layers=chunk_layers)
         file_path = os.path.join(expert_map_dir(evidence_dir, log), f"expert_map_{ns.tag}.json")
@@ -21048,7 +21048,7 @@ def repoint_store_geometry_at_pinned_form(xchg_env: Dict[str, str], form: dict,
             xchg_env.pop("FLLIPER_PDFLIP_EXPERT_BANDS", None)
         log(f"PDFLIP-EXPERT-BAND size={_bs} count={_bc} aus der KARTE-FORM (#239 rc12z29c)")
     if xchg_env.pop(_em.MAP_ENV, None) is not None:
-        log("PDFLIP-EXPERT-MAP (V1, aus dem genannten Vektor) verworfen (#239 rc12z29c): "
+        log("PDFLIP-EXPERT-MAP (V1, aus dem genannten Vektor) rejected (#239 rc12z29c): "
             "die Karte kommt aus publish_expert_map und der gepinnten Form")
 
 
@@ -22766,7 +22766,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--force", action="store_true",
         help="PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, host memory, "
-             "card count, calibration of the inventory -- the 'wert' class of pdflip/refusals.py). Every refusal passed "
+             "card count, calibration of the inventory -- the 'value' class of pdflip/refusals.py). Every refusal passed "
              "is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation "
              "check (another process or window on a card), a missing or broken model/file, an unsupported "
              "architecture. Container: FLLIPER_FORCE=1.")
@@ -23152,7 +23152,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--p-card-prompt-tokens", type=int, default=0,
         help="H41c/H41d: die Prompt-Laenge, an deren LETZTEM Chunk die P-KARTE "
-             "verweigert. Das Chunk-Wachstum der Spitze saettigt am letzten "
+             "verweigert. Das Chunk-Wachstum der Peak saettigt am letzten "
              "wachsenden Chunk der Referenz (fnFL2x160: Chunk 3, gemessen ueber "
              "16 Chunks); ein Prompt laenger als der laengste der Referenz heisst "
              "HOCHRECHNUNG. 0 = der volle Kontext (262144).")
@@ -23787,7 +23787,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(weight_exchange.WEIGHTS_CPU_BACKUP_CHOICES),
         default=weight_exchange.WEIGHTS_CPU_BACKUP_AUTO,
         help="#1369: user order 2026-09-14 (\"DIE 48GB MUESSEN WEG... wenn es "
-             "korrekt implementiert ist braucht es NIEMALS einen Rueckfall\"). "
+             "korrekt implementiert ist requires es NIEMALS einen Rueckfall\"). "
              "The WEIGHTS region's 46.40 GiB host ring "
              "(host_ledger.host_ring_gib) has backed both groups' weights "
              "unconditionally under every arm, including an ARMED exchange, "

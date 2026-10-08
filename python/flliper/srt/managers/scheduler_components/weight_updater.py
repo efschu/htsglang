@@ -8848,7 +8848,7 @@ class SchedulerWeightUpdaterManager:
         The whole of the user law's fallback sentence, at the one call site
         that has both the plan and the device: *"notfalls wird das layer auf
         einem (vertretbar kleinen) hostpuffer vollstaendig zusammengesetzt und
-        jede karte nimmt sich von dem was er braucht (oder ihn komplett)"*.
+        jede karte nimmt sich von dem was er requires (oder ihn komplett)"*.
 
         A THIN METHOD ON PURPOSE, and the thinness is the point rather than an
         omission: #1329 was three boots spent on a shadow whose first write
@@ -11864,7 +11864,7 @@ class SchedulerWeightUpdaterManager:
                     "PDFLIP-RESUME expert-rearm layers=%d rows_from_store=%d "
                     "serial=%d deferred=%d %s ms=%.0f target_ms=%.0f models=%d "
                     "(Platztausch: Praefix kam ueber den Austausch, Pad+Extra aus dem "
-                    "Store, LRU verworfen; H31: prefetched = waehrend der Legs auf dem "
+                    "Store, LRU rejected; H31: prefetched = waehrend der Legs auf dem "
                     "Seitenstrom; H31b: deferred = erst nach dem ersten Decode-Forward, "
                     "bis dahin kalt in den Tabellen)",
                     _rl, _rz + _pf_rows + _deferred, _rz, _deferred,

@@ -3,12 +3,12 @@
 
 N=1 ist KEIN pdflip-Launcher-Lauf: ``pdflip/topology.py:50`` ``MIN_CARDS=2`` (``:140`` SINGLE-MODE) schliesst eine Karte aus.  Die Form
 ist der normale flliper-Server (``python -m flliper.launch_server``), und seine Argumente sind ``ServerArgs``
-(``python/flliper/srt/server_args.py``).  Darum gibt es hier KEIN Launcher-Orakel (Plan §2 Stufe B entfaellt fuer N=1):
+(``python/flliper/srt/server_args.py``).  Darum gibt es hier KEIN Launcher-Oracle (Plan §2 Stufe B entfaellt fuer N=1):
 
 * **Vorschlag** = Ableitung aus Modellprofil (``flliper.model/1``, ``pdflip/model_profile.py``) und Kartengroesse;
 * **Passung** = Planer-Rechnung (Gewichte + Draft + KV-Pflicht + Mamba-Pool + Reserve gegen das statische Budget);
 * **Ausfuehrbarkeit** = ``ServerArgs``-Parse (:func:`serverargs_parse`, argparse im Kindprozess, ohne GPU) PLUS Passung.  Der Parse
-  prueft Flag-Namen, Choices und Typen; ``ServerArgs.__post_init__`` (Geraeteerkennung, Kompatibilitaets-Refusals) braucht einen
+  prueft Flag-Namen, Choices und Typen; ``ServerArgs.__post_init__`` (Geraeteerkennung, Kompatibilitaets-Refusals) requires einen
   Beschleuniger und laeuft hier NICHT -- das steht in jedem Verdikt (``art``), nie als "geprueft" verkauft.
   Das Verdikt heisst deshalb **"Planer-Rechnung"** (``VERDICT_ART``), nicht "Launcher-Dry-Run".
 
@@ -16,32 +16,32 @@ STDLIB ONLY.  Das Dashboard (ohne flliper-Import) laedt die Datei per Pfad; der 
 
 Datenstruktur (AP-C uebernimmt sie oder bildet sie ab; Plan §2 Stufe C ``flliper.server/1``)
 =============================================================================================
-``propose_single`` liefert ``{"schema": SCHEMA, "form": "einzelkarte", ...}`` mit
+``propose_single`` liefert ``{"schema": SCHEMA, "form": "single_card", ...}`` mit
 
-* ``flags``: Liste von Eintraegen ``{"flag", "wert", "herkunft", "zustand", "begruendung", "verdikt"}``
+* ``flags``: Liste von Eintraegen ``{"flag", "value", "source", "state", "begruendung", "verdict"}``
 
-  - ``flag``        CLI-Name (``--kv-cache-dtype``); ``wert`` ``None`` = nicht gesetzt (ServerArgs-Standard gilt),
+  - ``flag``        CLI-Name (``--kv-cache-dtype``); ``value`` ``None`` = nicht gesetzt (ServerArgs-Standard gilt),
                     ``True`` = Schalter ohne Wert (``--enable-hierarchical-cache``);
-  - ``herkunft``    woher der Wert kommt: ``Modellprofil (Index|config|geschätzt)``, ``Kartenprofil``, ``Ziel``,
-                    ``Planer-Rechnung``, ``Doku (Datei:Zeile)``, ``ServerArgs-Standard``, ``übersteuert``, ``unbelegt``;
-  - ``zustand``     ``vorgeschlagen`` | ``übersteuert`` | ``unbelegt`` (Plan §1.1 (3); ``vom Launcher gelöst`` gibt es bei N=1 nicht);
+  - ``source``    woher der Wert kommt: ``Modellprofil (Index|config|geschätzt)``, ``Kartenprofil``, ``Ziel``,
+                    ``Planer-Rechnung``, ``Doku (Datei:Zeile)``, ``ServerArgs-Standard``, ``übersteuert``, ``unverified``;
+  - ``state``     ``vorgeschlagen`` | ``übersteuert`` | ``unverified`` (Plan §1.1 (3); ``vom Launcher gelöst`` gibt es bei N=1 nicht);
   - ``begruendung`` Text mit Beleg (Datei:Zeile) und Zahlen;
-  - ``verdikt``     ``{"state": "geht" | "verweigert" | "unbelegt", "code": None | "FIT-STATIC" | ..., "grund": str,
+  - ``verdict``     ``{"state": "geht" | "verweigert" | "unverified", "code": None | "FIT-STATIC" | ..., "reason": str,
                     "art": "Planer-Rechnung", "parse": "nicht geprüft" | "ok" | "Fehler" | "veraltet (Alias)"}``.
                     ``nur mit --force`` gibt es bei N=1 nicht (kein Refusal-Register ohne Launcher).
-* ``fit``: ``{"passt", "posten": [{"name","mib","herkunft","formel"}], "statisch_summe_mib", "statisch_budget_mib",
-  "frei_mib" | "fehlt_mib", "reserve_*", "pre_load_free_mib", "kontext_treiber_mib", "kontext_treiber_herkunft", "kontext_treiber_standard",
-  "checks": [{"code","ok","text"}], "max_context_tokens_fit", "hinweise": [...]}``
+* ``fit``: ``{"passt", "posten": [{"name","mib","source","formel"}], "statisch_summe_mib", "statisch_budget_mib",
+  "free_mib" | "missing_mib", "reserve_*", "pre_load_free_mib", "context_driver_mib", "kontext_treiber_herkunft", "kontext_treiber_standard",
+  "checks": [{"code","ok","text"}], "max_context_tokens_fit", "notes": [...]}``
 
   Statisches Budget = ``--mem-fraction-static`` x ``pre_load_free_mib`` (freier Speicher VOR dem Modellladen, wie die Runtime es rechnet,
-  model_runner_kv_cache_mixin.py:959-962), NICHT x Karte.  Der Posten "CUDA-Kontext + Treiber" (``kontext_treiber_mib``, Standard 400 MiB,
-  Herkunft unbelegt, ``goals['pre_load_free_mib']`` ersetzt ihn) steht in ``posten``, zaehlt aber nicht in ``statisch_summe_mib``.
-* ``verdikt``: ``{"state": "passt" | "passt nicht" | "unbelegt", "art": "Planer-Rechnung", "text": str}``
+  model_runner_kv_cache_mixin.py:959-962), NICHT x Karte.  Der Posten "CUDA-Kontext + Treiber" (``context_driver_mib``, Standard 400 MiB,
+  Herkunft unverified, ``goals['pre_load_free_mib']`` ersetzt ihn) steht in ``posten``, zaehlt aber nicht in ``statisch_summe_mib``.
+* ``verdict``: ``{"state": "passt" | "passt nicht" | "unverified", "art": "Planer-Rechnung", "text": str}``
 * ``relaxations``: Schritte, die der Planer selbst gegangen ist, damit es passt (KV fp8, Draft aus), je mit Zahlen;
-* ``argv``: die ServerArgs-Argumentliste (nur Eintraege mit ``wert`` != ``None``);
-* ``unbelegt``: alles, was nicht belegt ist (Eingaben ohne Quelle, nicht geprueftes ``__post_init__``).
+* ``argv``: die ServerArgs-Argumentliste (nur Eintraege mit ``value`` != ``None``);
+* ``unverified``: alles, was nicht belegt ist (Eingaben ohne Quelle, nicht geprueftes ``__post_init__``).
 
-Jede Rechenregel nennt ihre Quelle (Datei:Zeile im Baum 173161c595).  Zahlen ohne Beleg stehen als ``unbelegt``, nie geraten.
+Jede Rechenregel nennt ihre Quelle (Datei:Zeile im Baum 173161c595).  Zahlen ohne Beleg stehen als ``unverified``, nie geraten.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ import sys
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 SCHEMA = "flliper.server.single/1"
-FORM = "einzelkarte"
+FORM = "single_card"
 VERDICT_ART = "Planner calculation"
 MIB = float(1 << 20)
 
@@ -70,11 +70,11 @@ H_UNKNOWN = "unverified"
 
 Z_PROPOSED = "vorgeschlagen"
 Z_OVERRIDDEN = "übersteuert"
-Z_UNBELEGT = "unbelegt"
+Z_UNBELEGT = "unverified"
 
 V_OK = "geht"
 V_NO = "verweigert"
-V_UNK = "unbelegt"
+V_UNK = "unverified"
 
 # --- Regeln mit Beleg -------------------------------------------------------------------------------------
 #: Ziel-Kontext, wenn der Aufrufer keinen nennt: "mindestens 128K, damit das Denken erhalten bleibt"
@@ -195,7 +195,7 @@ def _ceil_to(n: float, mult: int) -> int:
 
 
 def pre_load_free(card: Mapping[str, Any], goals: Mapping[str, Any]) -> Tuple[float, float, str, bool]:
-    """``(pre_load_free_mib, kontext_treiber_mib, herkunft, ist_standard)``: freier Speicher VOR dem Modellladen (Nenner von ``--mem-fraction-static``
+    """``(pre_load_free_mib, context_driver_mib, source, ist_standard)``: freier Speicher VOR dem Modellladen (Nenner von ``--mem-fraction-static``
     in der Runtime, model_runner_kv_cache_mixin.py:959-962) und der Kontext/Treiber-Posten, der ihn von der Kartengroesse trennt.
     ``goals['pre_load_free_mib']`` (gemessen) ersetzt den Standard ``Karte - CONTEXT_OVERHEAD_DEFAULT_MIB``."""
     total = float(card["total_mib"])
@@ -275,7 +275,7 @@ def _src(profile: Mapping[str, Any], path: str) -> str:
 
 
 def model_facts(profile: Mapping[str, Any], draft_profile: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """Die Zahlen aus ``flliper.model/1`` (und einem optionalen getrennten Draft profile, ``model_profile.estimate_draft``), die die Rechnung braucht."""
+    """Die Zahlen aus ``flliper.model/1`` (und einem optionalen getrennten Draft profile, ``model_profile.estimate_draft``), die die Rechnung requires."""
     unb: List[str] = []
     total = _val(profile, "weights.total_bytes")
     if total is None:
@@ -319,7 +319,7 @@ def model_facts(profile: Mapping[str, Any], draft_profile: Optional[Mapping[str,
         "total_bytes": float(total), "visual_bytes": float(_val(profile, "weights.visual_bytes", 0) or 0), "mtp_bytes": mtp_bytes,
         "mtp_layers": mtp_layers, "mtp_found": mtp_found and mtp_layers > 0,
         "cell": cell, "per_req": float(per_req) if per_req is not None else None, "maxpos": int(_val(profile, "context.max_position_embeddings", 0) or 0),
-        "kv_sliding": bool(kvs), "ext": ext, "unbelegt": unb,
+        "kv_sliding": bool(kvs), "ext": ext, "unverified": unb,
         "src": {"total": _src(profile, "weights.total_bytes"), "visual": _src(profile, "weights.visual_bytes"), "mtp": _src(profile, "weights.mtp_bytes"),
                 "cell": _src(profile, "kv.variants.auto.cell_bytes_per_attn_layer_token"), "state": _src(profile, "state.per_request_bytes"),
                 "maxpos": _src(profile, "context.max_position_embeddings")},
@@ -346,14 +346,14 @@ def _cell_for(F: Mapping[str, Any], dtype: str) -> Tuple[Optional[float], str]:
 def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any], goals: Mapping[str, Any]) -> Dict[str, Any]:
     """Posten und Checks fuer EINEN Werte-Satz ``v`` (Schluessel wie ``_FLAG_KEYS``-Werte).  Wird fuer den Vorschlag UND fuer Uebersteuerungen genutzt."""
     posten: List[Dict[str, Any]] = []
-    hinweise: List[str] = []
+    notes: List[str] = []
     unb: List[str] = []
     total = float(card["total_mib"])
     usable = float(card["usable_mib"])
 
-    def add(name: str, nbytes: float, herkunft: str, formel: str) -> float:
+    def add(name: str, nbytes: float, source: str, formel: str) -> float:
         mib = nbytes / MIB
-        posten.append({"name": name, "mib": round(mib, 1), "herkunft": herkunft, "formel": formel})
+        posten.append({"name": name, "mib": round(mib, 1), "source": source, "formel": formel})
         return mib
 
     w_main_b = F["total_bytes"] - F["mtp_bytes"] - (F["visual_bytes"] if v.get("no_vision") else 0.0)
@@ -389,7 +389,7 @@ def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any],
                           "%d tokens x %d attention layers x %.0f B (%s)" % (kv_tokens, F["n_attn"], cell, cell_note))
             kv_bpt += kv_bpt_main
             if F["kv_sliding"]:
-                hinweise.append("Sliding-window layers of the main model are NOT deducted (upper bound)")
+                notes.append("Sliding-window layers of the main model are NOT deducted (upper bound)")
     if draft_kind == "nextn" and cell is not None:
         per_tok = cell * F["mtp_layers"]
         kv_draft = add("KV pool (draft: MTP)", per_tok * kv_tokens, F["src"]["cell"],
@@ -480,25 +480,25 @@ def account(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[str, Any],
                        "text": "Mamba slots %d %s lower bound %d (%d requests x %d slots; mamba_pool_floor.py:264)" % (
                            slots, ">=" if ok_floor else "<", floor_slots, seats, floor_slots // max(seats, 1))})
     if v.get("context") and F["maxpos"] and int(v["context"]) > F["maxpos"]:
-        hinweise.append("Context %d is above max_position_embeddings %d of the model: rope extension is unverified" % (int(v["context"]), F["maxpos"]))
+        notes.append("Context %d is above max_position_embeddings %d of the model: rope extension is unverified" % (int(v["context"]), F["maxpos"]))
     if F["family"] == "moe":
-        hinweise.append("MoE in the single server: all experts must be on the card (no expert offload in this form); partial offloading is a matter for the pdflip launcher (N>=2)")
+        notes.append("MoE in the single server: all experts must be on the card (no expert offload in this form); partial offloading is a matter for the pdflip launcher (N>=2)")
     if overhead_default:
-        hinweise.append("Context + driver %.0f MiB are the default value (unverified on the single server): the static budget is fraction x (card - context/driver); set the measured pre_model_load_memory as goals['pre_load_free_mib']" % overhead)
+        notes.append("Context + driver %.0f MiB are the default value (unverified on the single server): the static budget is fraction x (card - context/driver); set the measured pre_model_load_memory as goals['pre_load_free_mib']" % overhead)
     if card["unified"]:
-        hinweise.append("APU: device and host share the memory; torch total memory of the APU is assumed here = addressable ceiling (unverified on the rig)")
+        notes.append("APU: device and host share the memory; torch total memory of the APU is assumed here = addressable ceiling (unverified on the rig)")
     out = {"passt": all(c["ok"] for c in checks) and not unb, "posten": posten, "statisch_summe_mib": round(static_sum, 1),
            "statisch_budget_mib": round(budget, 1) if budget is not None else None,
            "reserve_bedarf_mib": round(reserve_need, 1), "reserve_herkunft": reserve_src,
            "reserve_gegeben_mib": round(reserve_given, 1) if reserve_given is not None else None,
-           "pre_load_free_mib": round(pre, 1), "kontext_treiber_mib": round(overhead, 1), "kontext_treiber_herkunft": overhead_src,
+           "pre_load_free_mib": round(pre, 1), "context_driver_mib": round(overhead, 1), "kontext_treiber_herkunft": overhead_src,
            "kontext_treiber_standard": overhead_default,
-           "checks": checks, "hinweise": hinweise, "unbelegt": unb,
+           "checks": checks, "notes": notes, "unverified": unb,
            "kv_bytes_je_token": kv_bpt, "mamba_floor_slots": floor_slots,
            "_numbers": {"w_main": w_main, "w_draft": w_draft, "mamba_spec": mamba_spec, "kv_main": kv_main, "kv_draft": kv_draft, "mamba_main": mamba_main, "host": host}}
     if budget is not None:
         d = budget - static_sum
-        out["frei_mib" if d >= 0 else "fehlt_mib"] = round(abs(d), 1)
+        out["free_mib" if d >= 0 else "missing_mib"] = round(abs(d), 1)
     return out
 
 
@@ -598,12 +598,12 @@ def derive(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str, Any]) 
         if acc["passt"]:
             break
         if dtype_goal is None and dtype == "auto" and F["cell"].get("fp8_e4m3") is not None:
-            relax.append({"schritt": "KV dtype fp8_e4m3", "grund": "with the model dtype %.0f MiB are missing (KV %.0f MiB)" % (acc.get("fehlt_mib", 0.0), acc["_numbers"]["kv_main"])})
+            relax.append({"schritt": "KV dtype fp8_e4m3", "reason": "with the model dtype %.0f MiB are missing (KV %.0f MiB)" % (acc.get("missing_mib", 0.0), acc["_numbers"]["kv_main"])})
             dtype = "fp8_e4m3"
             continue
         if draft is not None and draft_goal == "auto":
-            relax.append({"schritt": "Draft omitted", "grund": "%.0f MiB are missing; the draft costs %.0f MiB of weights + %.0f MiB KV + %.0f MiB speculation state"
-                          % (acc.get("fehlt_mib", 0.0), acc["_numbers"]["w_draft"], acc["_numbers"]["kv_draft"], acc["_numbers"]["mamba_spec"])})
+            relax.append({"schritt": "Draft omitted", "reason": "%.0f MiB are missing; the draft costs %.0f MiB of weights + %.0f MiB KV + %.0f MiB speculation state"
+                          % (acc.get("missing_mib", 0.0), acc["_numbers"]["w_draft"], acc["_numbers"]["kv_draft"], acc["_numbers"]["mamba_spec"])})
             draft = None
             continue
         break
@@ -633,7 +633,7 @@ def max_context_fit(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[st
         return None
     probe = dict(v, kv_tokens=0)
     acc = account(F, card, probe, g)
-    if acc["unbelegt"] or not acc["kv_bytes_je_token"]:
+    if acc["unverified"] or not acc["kv_bytes_je_token"]:
         return None
     room = acc["statisch_budget_mib"] - acc["statisch_summe_mib"]
     tokens = max(0, int(room * MIB // acc["kv_bytes_je_token"]))
@@ -647,10 +647,10 @@ def max_context_fit(F: Mapping[str, Any], card: Mapping[str, Any], v: Mapping[st
 # ===========================================================================
 
 
-def _entry(flag: str, value: Any, herkunft: str, begruendung: str, *, verdict_state: str = V_OK, code: Optional[str] = None, grund: str = "",
-           zustand: str = Z_PROPOSED) -> Dict[str, Any]:
-    return {"flag": flag, "wert": value, "herkunft": herkunft, "zustand": zustand, "begruendung": begruendung,
-            "verdikt": {"state": verdict_state, "code": code, "grund": grund, "art": VERDICT_ART, "parse": "nicht geprüft"}}
+def _entry(flag: str, value: Any, source: str, begruendung: str, *, verdict_state: str = V_OK, code: Optional[str] = None, reason: str = "",
+           state: str = Z_PROPOSED) -> Dict[str, Any]:
+    return {"flag": flag, "value": value, "source": source, "state": state, "begruendung": begruendung,
+            "verdict": {"state": verdict_state, "code": code, "reason": reason, "art": VERDICT_ART, "parse": "nicht geprüft"}}
 
 
 def _fmt(x: float) -> str:
@@ -661,9 +661,9 @@ def build_entries(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str,
                   relax: Sequence[Mapping[str, Any]], acc: Mapping[str, Any]) -> List[Dict[str, Any]]:
     n = acc["_numbers"]
     failing = {c["code"]: c["text"] for c in acc["checks"] if not c["ok"]}
-    fit_state = V_NO if failing else (V_UNK if acc["unbelegt"] else V_OK)
+    fit_state = V_NO if failing else (V_UNK if acc["unverified"] else V_OK)
     fit_code = "+".join(sorted(failing)) if failing else None
-    fit_grund = " | ".join(failing.values()) if failing else ("; ".join(acc["unbelegt"]) if acc["unbelegt"] else "")
+    fit_grund = " | ".join(failing.values()) if failing else ("; ".join(acc["unverified"]) if acc["unverified"] else "")
     out: Dict[str, Dict[str, Any]] = {}
     out["--model-path"] = _entry("--model-path", v["model_path"], "%s (%s)" % (H_MODEL, "Path"), "Model folder of profile %s (format %s, %s)" % (F["id"], F["format"], F["family"]))
     if F["vision"]:
@@ -674,18 +674,18 @@ def build_entries(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str,
     dtype = str(v["kv_dtype"])
     dreason = "Model dtype (auto)" if dtype == "auto" else "fp8"
     if relax and any(r["schritt"].startswith("KV dtype") for r in relax):
-        dreason = "Ladder: " + next(r["grund"] for r in relax if r["schritt"].startswith("KV dtype"))
+        dreason = "Ladder: " + next(r["reason"] for r in relax if r["schritt"].startswith("KV dtype"))
     elif g["kv_dtype"]:
         dreason = "Goal"
     out["--kv-cache-dtype"] = _entry("--kv-cache-dtype", dtype, H_GOAL if g["kv_dtype"] else H_RULE,
                                      "%s; KV cell %s B per attention layer and token (%s)" % (dreason, _fmt(_cell_for(F, dtype)[0] or 0), F["src"]["cell"]))
     out["--context-length"] = _entry("--context-length", v["context"], H_GOAL if g["context_tokens"] else H_RULE,
                                      ("Goal context" if g["context_tokens"] else "Standard goal min(max_position_embeddings %d, %d) (MiniCPM-V-4_6.mdx:63)" % (F["maxpos"], DEFAULT_CONTEXT_TOKENS)),
-                                     verdict_state=V_NO if "FIT-CTX" in failing else V_OK, code="FIT-CTX" if "FIT-CTX" in failing else None, grund=failing.get("FIT-CTX", ""))
+                                     verdict_state=V_NO if "FIT-CTX" in failing else V_OK, code="FIT-CTX" if "FIT-CTX" in failing else None, reason=failing.get("FIT-CTX", ""))
     out["--max-total-tokens"] = _entry("--max-total-tokens", v["kv_tokens"], H_RULE,
                                        "KV pool: obligation %d tokens (goal) + rest in the ratio %.1f to Mamba (server_args.py:4405); page size %d; %s MiB" % (
                                            aux["kv_goal"], MAMBA_FULL_MEMORY_RATIO, aux["page"], _fmt(n["kv_main"] + n["kv_draft"])),
-                                       verdict_state=fit_state if v["kv_tokens"] else V_UNK, code=fit_code, grund=fit_grund)
+                                       verdict_state=fit_state if v["kv_tokens"] else V_UNK, code=fit_code, reason=fit_grund)
     out["--max-running-requests"] = _entry("--max-running-requests", v["seats"], H_GOAL, "Goal 'seats at the same time' (default 1)")
     fr = v.get("fraction")
     out["--mem-fraction-static"] = _entry(
@@ -694,13 +694,13 @@ def build_entries(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str,
             _fmt(card["usable_mib"] - aux["host_unified"]), _fmt(aux["overhead"]), _fmt(aux["reserve"]), _fmt(aux["pre"]), acc["reserve_herkunft"],
             "; host pool %s MiB deducted (APU)" % _fmt(aux["host_unified"]) if aux["host_unified"] else ""))
         if fr is not None else "Reserve %s MiB (+ context/driver %s MiB) exceeds the card: no fraction possible" % (_fmt(aux["reserve"]), _fmt(aux["overhead"])),
-        verdict_state=fit_state if fr is not None else V_NO, code=fit_code if fr is not None else "FIT-RESERVE", grund=fit_grund if fr is not None else "Reserve larger than the card")
+        verdict_state=fit_state if fr is not None else V_NO, code=fit_code if fr is not None else "FIT-RESERVE", reason=fit_grund if fr is not None else "Reserve larger than the card")
     if F["n_lin"] and v.get("slots") is not None:
         out["--max-mamba-cache-size"] = _entry(
             "--max-mamba-cache-size", v["slots"], H_RULE,
             "Lower bound %d (= %d requests x %d slots, mamba_pool_floor.py:264) + rest; per slot %s MiB (%s)" % (
                 acc["mamba_floor_slots"], v["seats"], acc["mamba_floor_slots"] // max(v["seats"], 1), _fmt((F["per_req"] or 0) / MIB), F["src"]["state"]),
-            verdict_state=fit_state, code=fit_code, grund=fit_grund)
+            verdict_state=fit_state, code=fit_code, reason=fit_grund)
     out["--chunked-prefill-size"] = _entry("--chunked-prefill-size", v["cps"], H_GOAL if g["chunked_prefill_size"] else H_DEFAULT,
                                            "Card class %s MiB (server_args.py:12767-12837); determines the activation reserve" % _fmt(card["total_mib"]))
     out["--cuda-graph-max-bs-decode"] = _entry("--cuda-graph-max-bs-decode", v["max_bs"], H_RULE,
@@ -709,7 +709,7 @@ def build_entries(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str,
         "--enable-hierarchical-cache", True if v["hicache"] else None, H_GOAL if v["hicache"] else H_UNKNOWN,
         "Host budget %s MiB present (goal)" % _fmt(float(g.get("host_ram_mib") or 0)) if v["hicache"] else
         ("HiCache off: " + aux["hicache_skipped"] if aux.get("hicache_skipped") else "no host RAM budget in the goal (host_ram_mib): HiCache not proposed"),
-        zustand=Z_PROPOSED if v["hicache"] or aux.get("hicache_skipped") else Z_UNBELEGT)
+        state=Z_PROPOSED if v["hicache"] or aux.get("hicache_skipped") else Z_UNBELEGT)
     if v["hicache"]:
         out["--hicache-ratio"] = _entry("--hicache-ratio", v["hicache_ratio"], H_RULE,
                                         "Host budget %s MiB / device KV pool %s MiB (main model only; whether the draft pool is included is unverified) -> host KV %s MiB"
@@ -730,8 +730,8 @@ def build_entries(F: Mapping[str, Any], card: Mapping[str, Any], g: Mapping[str,
                 out["--speculative-dflash-block-size"] = _entry("--speculative-dflash-block-size", v["spec_block"], "%s (dflash_config.block_size)" % H_MODEL, "Verification window of the draft")
     else:
         reason = ("no draft available (MTP head/draft profile missing)" if g["draft"] != "off" and not F["mtp_found"] and not F["ext"]
-                  else ("Goal: no draft" if g["draft"] == "off" else "Ladder: " + next((r["grund"] for r in relax if r["schritt"].startswith("Draft")), "not chosen")))
-        out["--speculative-algorithm"] = _entry("--speculative-algorithm", None, H_RULE, "no draft: " + reason, zustand=Z_PROPOSED)
+                  else ("Goal: no draft" if g["draft"] == "off" else "Ladder: " + next((r["reason"] for r in relax if r["schritt"].startswith("Draft")), "not chosen")))
+        out["--speculative-algorithm"] = _entry("--speculative-algorithm", None, H_RULE, "no draft: " + reason, state=Z_PROPOSED)
     return [out[k] for k in _ORDER if k in out]
 
 
@@ -742,10 +742,10 @@ def _apply_overrides(entries: List[Dict[str, Any]], overrides: Mapping[str, Any]
         if flag in by:
             e = by[flag]
             e["begruendung"] = "overridden (proposed was %r): %s" % (proposed.get(flag), e["begruendung"])
-            e["wert"], e["herkunft"], e["zustand"] = val, H_OVERRIDE, Z_OVERRIDDEN
+            e["value"], e["source"], e["state"] = val, H_OVERRIDE, Z_OVERRIDDEN
         else:
             entries.append(_entry(flag, val, H_OVERRIDE, "overridden: the single card calculation does not know this flag; only the ServerArgs parse checks it",
-                                  verdict_state=V_UNK, grund="not in the fit calculation", zustand=Z_OVERRIDDEN))
+                                  verdict_state=V_UNK, reason="not in the fit calculation", state=Z_OVERRIDDEN))
     return entries
 
 
@@ -756,21 +756,21 @@ def _apply_overrides(entries: List[Dict[str, Any]], overrides: Mapping[str, Any]
 
 def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], goals: Optional[Mapping[str, Any]] = None, *,
                    draft_profile: Optional[Mapping[str, Any]] = None, overrides: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """Vorschlag der Form Einzelkarte aus ``model_profile`` (``flliper.model/1``) und ``card`` (:func:`normalize_card`).
+    """Vorschlag der Form SingleCard aus ``model_profile`` (``flliper.model/1``) und ``card`` (:func:`normalize_card`).
 
     ``goals`` (alle optional): ``context_tokens`` (Standard min(Modell-Maximum, 131072)), ``kv_tokens`` (Standard = Kontext), ``seats`` (Standard 1),
     ``draft`` ``auto|on|off|nextn|external`` (Standard auto: MTP-Kopf bzw. Draft profile nutzen, wenn es passt), ``kv_dtype`` (``None`` = der Planer waehlt;
     ``auto`` = Modell-Dtype, ``fp8_e4m3`` ...), ``vision`` (Standard ``False``), ``host_ram_mib`` (HiCache-Host-Budget; ohne Angabe kein HiCache),
     ``chunked_prefill_size``, ``reserve_mib`` (gemessene Reserve statt der ServerArgs-Heuristik), ``disable_radix``,
-    ``pre_load_free_mib`` (gemessenes ``pre_model_load_memory`` in MiB, 0 < Wert <= Karte; ohne Angabe Karte - ``CONTEXT_OVERHEAD_DEFAULT_MIB``, unbelegt).
-    ``overrides``: ``{flag: wert}`` -- jeder Wert ist setzbar; die Passung wird mit den uebersteuerten Werten NEU gerechnet."""
+    ``pre_load_free_mib`` (gemessenes ``pre_model_load_memory`` in MiB, 0 < Wert <= Karte; ohne Angabe Karte - ``CONTEXT_OVERHEAD_DEFAULT_MIB``, unverified).
+    ``overrides``: ``{flag: value}`` -- jeder Wert ist setzbar; die Passung wird mit den uebersteuerten Werten NEU gerechnet."""
     c = normalize_card(card)
     F = model_facts(model_profile, draft_profile)
     g = _defaults_goals(goals)
     v, aux, relax, acc = derive(F, c, g)
     entries = build_entries(F, c, g, v, aux, relax, acc)
-    proposed = {e["flag"]: e["wert"] for e in entries}
-    unb: List[str] = list(F["unbelegt"]) + list(acc["unbelegt"])
+    proposed = {e["flag"]: e["value"] for e in entries}
+    unb: List[str] = list(F["unverified"]) + list(acc["unverified"])
     if overrides:
         v2 = dict(v)
         for flag, val in overrides.items():
@@ -786,19 +786,19 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
         v = v2
         entries = build_entries(F, c, g, v, aux, relax, acc)
         entries = _apply_overrides(entries, overrides, proposed)
-    borrowed = [k for k, lab in F["src"].items() if "unbelegt" in lab or "unverified" in lab] + (["Card"] if any(w in str(c.get("total_src")) + str(c.get("usable_src")) for w in ("unbelegt", "unverified")) else [])
+    borrowed = [k for k, lab in F["src"].items() if "unverified" in lab or "unverified" in lab] + (["Card"] if any(w in str(c.get("total_src")) + str(c.get("usable_src")) for w in ("unverified", "unverified")) else [])
     if borrowed:
         for e in entries:
-            if e["zustand"] == Z_PROPOSED and e["wert"] is not None and (e["flag"] in _FIT_FLAGS or e["flag"] in ("--kv-cache-dtype", "--hicache-ratio", "--speculative-algorithm") or "unbelegt" in e["herkunft"] or "unverified" in e["herkunft"]):
-                e["zustand"] = Z_UNBELEGT
+            if e["state"] == Z_PROPOSED and e["value"] is not None and (e["flag"] in _FIT_FLAGS or e["flag"] in ("--kv-cache-dtype", "--hicache-ratio", "--speculative-algorithm") or "unverified" in e["source"] or "unverified" in e["source"]):
+                e["state"] = Z_UNBELEGT
                 e["begruendung"] += " [borrowed, unverified: %s]" % ", ".join(borrowed)
     if acc["kontext_treiber_standard"]:
         # Der Kontext/Treiber-Posten ist ein geborgter Standardwert; alles, was am statischen Budget haengt, traegt das (nur wenn nicht schon uebersteuert).
         for e in entries:
-            if e["flag"] in ("--mem-fraction-static", "--max-total-tokens", "--max-mamba-cache-size", "--hicache-ratio") and e["wert"] is not None:
-                if e["zustand"] == Z_PROPOSED:
-                    e["zustand"] = Z_UNBELEGT
-                e["begruendung"] += " [context + driver %s MiB assumed, unverified on the single server; goals pre_load_free_mib replaces it]" % _fmt(acc["kontext_treiber_mib"])
+            if e["flag"] in ("--mem-fraction-static", "--max-total-tokens", "--max-mamba-cache-size", "--hicache-ratio") and e["value"] is not None:
+                if e["state"] == Z_PROPOSED:
+                    e["state"] = Z_UNBELEGT
+                e["begruendung"] += " [context + driver %s MiB assumed, unverified on the single server; goals pre_load_free_mib replaces it]" % _fmt(acc["context_driver_mib"])
     max_ctx = max_context_fit(F, c, v, g)
     fit = {k: val for k, val in acc.items() if not k.startswith("_")}
     fit["max_context_tokens_fit"] = max_ctx
@@ -807,12 +807,12 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
     if fit["passt"]:
         verdict = {"state": "passt", "art": VERDICT_ART,
                    "text": "fits: static %s of %s MiB (= fraction x free before loading; context/driver %s MiB%s; weights %s, draft %s, KV %s, Mamba %s + %s speculation), %s MiB free; reserve %s MiB; context up to %s tokens" % (
-                       _fmt(fit["statisch_summe_mib"]), _fmt(fit["statisch_budget_mib"] or 0), _fmt(fit["kontext_treiber_mib"]),
+                       _fmt(fit["statisch_summe_mib"]), _fmt(fit["statisch_budget_mib"] or 0), _fmt(fit["context_driver_mib"]),
                        " assumed, unverified" if fit["kontext_treiber_standard"] else " (goal)", _fmt(nums["w_main"]), _fmt(nums["w_draft"]),
-                       _fmt(nums["kv_main"] + nums["kv_draft"]), _fmt(nums["mamba_main"]), _fmt(nums["mamba_spec"]), _fmt(fit.get("frei_mib", 0.0)),
+                       _fmt(nums["kv_main"] + nums["kv_draft"]), _fmt(nums["mamba_main"]), _fmt(nums["mamba_spec"]), _fmt(fit.get("free_mib", 0.0)),
                        _fmt(fit["reserve_gegeben_mib"] or 0), max_ctx if max_ctx is not None else "?")}
-    elif acc["unbelegt"] and not any(not ch["ok"] for ch in acc["checks"]):
-        verdict = {"state": "unbelegt", "art": VERDICT_ART, "text": "cannot be calculated: " + "; ".join(acc["unbelegt"])}
+    elif acc["unverified"] and not any(not ch["ok"] for ch in acc["checks"]):
+        verdict = {"state": "unverified", "art": VERDICT_ART, "text": "cannot be calculated: " + "; ".join(acc["unverified"])}
     else:
         failing = [ch["text"] for ch in acc["checks"] if not ch["ok"]]
         verdict = {"state": "passt nicht", "art": VERDICT_ART,
@@ -821,20 +821,20 @@ def propose_single(model_profile: Mapping[str, Any], card: Mapping[str, Any], go
                        max_ctx if max_ctx is not None else "?"))}
     if acc["kontext_treiber_standard"]:
         unb.append("CUDA context + driver %.0f MiB (default value, measurement in the launcher format launcher.py:253): unverified on the single server; goals['pre_load_free_mib'] = measured pre_model_load_memory"
-                   % acc["kontext_treiber_mib"])
+                   % acc["context_driver_mib"])
     unb.append("ServerArgs.__post_init__ (device detection, compatibility refusals) has not run: needs an accelerator; argparse parse only (serverargs_parse)")
     if c["unified"]:
         unb.append("APU memory model (torch total memory = addressable ceiling) unverified on the rig")
     argv: List[str] = []
     for e in entries:
-        if e["wert"] is None:
+        if e["value"] is None:
             continue
         argv.append(e["flag"])
-        if e["wert"] is not True:
-            argv.append(str(e["wert"]))
+        if e["value"] is not True:
+            argv.append(str(e["value"]))
     return {"schema": SCHEMA, "form": FORM, "n_cards": 1, "verdikt_art": VERDICT_ART,
-            "card": c, "ziele": {k: val for k, val in g.items()}, "modell": {"id": F["id"], "path": F["path"], "format": F["format"], "family": F["family"]},
-            "flags": entries, "fit": fit, "verdikt": verdict, "relaxations": relax, "argv": argv, "parse": None, "unbelegt": unb}
+            "card": c, "goals": {k: val for k, val in g.items()}, "modell": {"id": F["id"], "path": F["path"], "format": F["format"], "family": F["family"]},
+            "flags": entries, "fit": fit, "verdict": verdict, "relaxations": relax, "argv": argv, "parse": None, "unverified": unb}
 
 
 # ===========================================================================
@@ -910,28 +910,28 @@ def serverargs_parse(argv: Sequence[str], **kw: Any) -> Dict[str, Any]:
 
 
 def apply_parse(proposal: Dict[str, Any], parse: Mapping[str, Any]) -> Dict[str, Any]:
-    """Traegt ein Parse-Ergebnis in die Verdikte ein: je Flag ``verdikt.parse`` = ok / Fehler / veraltet (Alias); ``proposal['parse']`` = Gesamtergebnis."""
+    """Traegt ein Parse-Ergebnis in die Verdikte ein: je Flag ``verdict.parse`` = ok / Fehler / veraltet (Alias); ``proposal['parse']`` = Gesamtergebnis."""
     proposal["parse"] = {k: parse.get(k) for k in ("available", "ok", "error")}
     for e in proposal["flags"]:
-        if e["wert"] is None:
+        if e["value"] is None:
             continue
         if not parse.get("available"):
-            e["verdikt"]["parse"] = "nicht geprüft"
+            e["verdict"]["parse"] = "nicht geprüft"
             continue
         info = (parse.get("flags") or {}).get(e["flag"])
         if parse.get("ok") and info:
-            e["verdikt"]["parse"] = "veraltet (Alias)" if info.get("deprecated") else "ok"
+            e["verdict"]["parse"] = "veraltet (Alias)" if info.get("deprecated") else "ok"
         elif not parse.get("ok"):
             named = e["flag"] in str(parse.get("error") or "")
-            e["verdikt"]["parse"] = "Fehler" if named else "nicht geprüft"
+            e["verdict"]["parse"] = "Fehler" if named else "nicht geprüft"
             if named:
-                e["verdikt"].update(state=V_NO, code="PARSE", grund=str(parse.get("error")))
+                e["verdict"].update(state=V_NO, code="PARSE", reason=str(parse.get("error")))
         else:
-            e["verdikt"]["parse"] = "nicht geprüft"
+            e["verdict"]["parse"] = "nicht geprüft"
     if parse.get("available") and parse.get("ok") is False:
-        proposal["verdikt"] = {"state": "passt nicht", "art": VERDICT_ART + " + ServerArgs parse", "text": "ServerArgs parse refused: %s" % parse.get("error")}
+        proposal["verdict"] = {"state": "passt nicht", "art": VERDICT_ART + " + ServerArgs parse", "text": "ServerArgs parse refused: %s" % parse.get("error")}
     elif parse.get("available") and parse.get("ok"):
-        proposal["verdikt"] = dict(proposal["verdikt"], art=VERDICT_ART + " + ServerArgs parse")
+        proposal["verdict"] = dict(proposal["verdict"], art=VERDICT_ART + " + ServerArgs parse")
     return proposal
 
 
@@ -942,8 +942,8 @@ def check(proposal: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
 
 def format_text(proposal: Mapping[str, Any]) -> str:
     """Kurzer Text fuer Log/Issue: Verdikt, Posten, Flags."""
-    lines = ["Single card %s: %s" % (proposal["card"]["name"], proposal["verdikt"]["text"]), "Items (MiB):"]
+    lines = ["Single card %s: %s" % (proposal["card"]["name"], proposal["verdict"]["text"]), "Items (MiB):"]
     for p in proposal["fit"]["posten"]:
-        lines.append("  %-42s %9.1f  %s" % (p["name"], p["mib"], p["herkunft"]))
+        lines.append("  %-42s %9.1f  %s" % (p["name"], p["mib"], p["source"]))
     lines.append("Arguments: " + " ".join(proposal["argv"]))
     return "\n".join(lines)

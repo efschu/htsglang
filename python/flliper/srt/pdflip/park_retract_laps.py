@@ -1,6 +1,6 @@
 """FLIP-EDGE 2 (02.10.): the sub-laps of the park's ``retract`` lap.
 
-N5d (boot ..._0c996cf05c_1002_124821, D log): the D->P vorlauf IS the
+N5d (boot ..._0c996cf05c_1002_124821, D log): the D->P warmup IS the
 ``/pdflip/park_running`` RPC, and its largest term is ``retract_ms`` -- 0.07 to
 0.76 s, linear in the parked sequence length (~3.3-4 us per token at
 page_size 1: e18 seq 210263 -> 667 ms with only 511 host slots written,

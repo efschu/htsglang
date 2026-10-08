@@ -36,13 +36,13 @@ the records, against ``total - residue`` per card.
   + activation + extend growth + KV + context; every other card its worker
   posts. Without it D is tensor-parallel: the sum bound.
 
-THREE LEVELS: ``ja`` = the strict bound (all posts) holds, ``knapp`` = only
+THREE LEVELS: ``ja`` = the strict bound (all posts) holds, ``tight`` = only
 the FLOOR (the same without the mamba slots: the "17,3 GiB without / 19,3 GiB
 with mamba" of the D host in 1520 A) holds, ``nein`` = even the floor fails.
 
 WHAT IT DOES NOT PROVE (HOCHRECHNUNG != MESSUNG): every post of a card or a
 model the records never measured is BORROWED and printed as such
-(``HW-BORROWED/unbelegt``): the residue of a card class other than RTX5090 /
+(``HW-BORROWED/unverified``): the residue of a card class other than RTX5090 /
 RTX3080 (by arch from the reference classes), the activation of a 27B run
 (no record), the Dual mode (P and D resident together: not modelled, the
 Flip-mode bound is printed). PCIe, host RAM, BAR1, speed: not here.
@@ -62,7 +62,7 @@ import msgspec
 MIB = 1 << 20
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fit_profiles_data")
 
-JA, KNAPP, NEIN = "ja", "knapp", "nein"
+JA, TIGHT, NEIN = "ja", "tight", "nein"
 
 #: Tokens of KV the release requires (user order 05.10. ~05:40Z "P muss 262k
 #: Prefill-Kontext"). A flag of the CLI (``--kv-tokens``), an argument here.
@@ -226,7 +226,7 @@ def with_checkpoint_mib(p: FitProfile, ckpt_mib: int) -> Tuple[FitProfile, str]:
         layer_expert_mib=tuple(round(x * s, 4) for x in p.layer_expert_mib),
         embed_mib=round(p.embed_mib * s, 4), lm_head_mib=round(p.lm_head_mib * s, 4),
         draft_mib=round(p.draft_mib * s, 4), visual_mib=round(p.visual_mib * s, 4))
-    return q, (f"HW-BORROWED/unbelegt: layer geometry of the {p.weight_format} profile, weight bytes scaled x{s:.3f} "
+    return q, (f"HW-BORROWED/unverified: layer geometry of the {p.weight_format} profile, weight bytes scaled x{s:.3f} "
                f"to the checkpoint size {ckpt_mib} MiB")
 
 
@@ -336,9 +336,9 @@ def residue_mib(card: FitCard, asm: Assumptions, verdict: Verdict) -> float:
         return float(P_RESIDUE_BY_CLASS[card.cls])
     twin = RESIDUE_ARCH_TWIN.get(card.arch)
     if twin is None:
-        verdict.mark(f"residue of {card.label or card.arch}: no twin for {card.arch}, 0 MiB assumed (UNBELEGT)")
+        verdict.mark(f"residue of {card.label or card.arch}: no twin for {card.arch}, 0 MiB assumed (UNVERIFIED)")
         return 0.0
-    verdict.mark(f"HW-BORROWED/unbelegt: P-Residuum {(card.label or card.arch).split('/')[0]} <- {twin} "
+    verdict.mark(f"HW-BORROWED/unverified: P-Residuum {(card.label or card.arch).split('/')[0]} <- {twin} "
                  f"{P_RESIDUE_BY_CLASS[twin]} MiB")
     return float(P_RESIDUE_BY_CLASS[twin])
 
@@ -424,7 +424,7 @@ def _check_d(p: FitProfile, cards: Sequence[FitCard], asm: Assumptions, argv: Se
     foreign = flag_vector(argv, "--d-foreign-context-mib", "p") or flag_vector(argv, "--d-foreign-context-mib", "d")
     nontorch = flag_vector(argv, "--d-nontorch-mib", "p") or flag_vector(argv, "--d-nontorch-mib", "d")
     if foreign is None or nontorch is None:
-        verdict.mark("D context (foreign + non-torch): no vector in the launch argv, 0 MiB assumed (UNBELEGT)")
+        verdict.mark("D context (foreign + non-torch): no vector in the launch argv, 0 MiB assumed (UNVERIFIED)")
 
     def ctx(i: int) -> float:
         return role_value(foreign, i, n) + role_value(nontorch, i, n)
@@ -498,7 +498,7 @@ def evaluate(p: FitProfile, cards: Sequence[FitCard], *, argv: Sequence[str] = (
         return v
     v.first = whyp if not okp else whyd
     if fp_ok and fd_ok:
-        v.level = KNAPP
+        v.level = TIGHT
         return v
     v.level = NEIN
     v.first = fp_why if not fp_ok else fd_why

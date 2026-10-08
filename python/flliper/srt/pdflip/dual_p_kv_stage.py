@@ -1,7 +1,7 @@
 """DUAL-TP3PP3 unified KV per card (B): group P's KV actor.
 
 User orders 30.09.: "der unified kv soll doch geshared werden" (07:10Z) and
-"wird vram kv knapp, pausiert P und gibt den context frei und das erarbeitete
+"wird vram kv tight, pausiert P und gibt den context frei und das erarbeitete
 in den L2 zur späteren weiterverwendung wenn vram kv wieder frei wird"
 (07:25Z). P holds KV pages only while it prefills; otherwise its share of the
 card's ONE KV pool (``card_kv_ledger``) is free for D.

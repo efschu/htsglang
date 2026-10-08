@@ -42,7 +42,7 @@ ihm, und alle drei sind am Metall gemessen, nicht geraten:
    keinem Budget-Posten. Abschnitt 4b rechnet den Kopfraum gegen die near-
    OOM-Grenze aus gemessenen Punkten (``graph_pool_ledger``, W130).
 
-5. (H50) DER BAUM-ZUSTAND: Posten 3 und 4 sind Messungen EINES Baums. H39
+5. (H50) DER TREE-ZUSTAND: Posten 3 und 4 sind Messungen EINES Baums. H39
    (FLLIPER_PDFLIP_DENSE_REPACK_OUTSIDE_POOL, d6b7d4a1d3) nahm auf D-TP0 4354 MiB
    tote Checkpoint-/Repack-Bloecke aus den Tag-Pools (fest 11618 -> 7264 MiB,
    privat_frei 4993 -> 625 MiB, fnFL2x150 gegen x151/x158). Die Referenzen
@@ -3291,7 +3291,7 @@ def pool_step_rows_check(
         return (line,), None
     if w > 1:
         refusal = (
-            "W-SITZE D-Pool-Schritt: bei %d Sitz(en) braucht ein Decode-Schritt je Rang "
+            "W-SITZE D-Pool-Schritt: bei %d Sitz(en) requires ein Decode-Schritt je Rang "
             "%s Zeilen (LRU+Staging), %d Ueberlaufwellen x FLLIPER_MOE_SCRATCH_SLOTS %s "
             "tragen %s -- Rang %s wirft beim Capture des bs%d-Graphen 'Step ids exceed "
             "the LRU rows plus the staging rows'; %s anheben oder Scratch dort anheben"
@@ -3308,7 +3308,7 @@ def pool_step_rows_check(
         )
         return (line,), refusal
     refusal = (
-        "W-SITZE D-Pool-Schritt: bei %d Sitz(en) braucht ein Decode-Schritt je Rang "
+        "W-SITZE D-Pool-Schritt: bei %d Sitz(en) requires ein Decode-Schritt je Rang "
         "%s Zeilen (LRU+Staging), FLLIPER_MOE_SCRATCH_SLOTS gibt %s -- Rang %s "
         "wirft beim Capture des bs%d-Graphen 'Step ids exceed the LRU rows plus the "
         "staging rows'; Scratch dort anheben (Fraction senken haelt das Budget) "
@@ -4514,7 +4514,7 @@ def plan_d_residency(
                     % (marker, label,
                        ("Pool-Schritt + Wellenboden bei %d Sitzen, hoechstens %d Wellen, "
                         "oberste KV-Stufe +%d Token (Stufenzeile %.1f MiB) hart im Solve -- "
-                        "%d Kandidaten verworfen%s" % (
+                        "%d Kandidaten rejected%s" % (
                             _g.get("seats", 0), _g.get("waves", 0), _g.get("stage_tokens", 0),
                             _g.get("stage_row_bytes", 0) / MIB, sol.guard_refused,
                             ("; Scratch je Rang +%s (Zeilen von resident nach Scratch, FR_D oben "
@@ -4558,7 +4558,7 @@ def plan_d_residency(
                 % (marker, label, sol.candidates, ",".join(str(x) for x in sol.base_ratios),
                    OWNED_RATIO_STEP, OWNED_SHARE_STEP,
                    ["%.2f" % x for x in sol.base_round_ms])
-                + (" -- %d davon an den harten Grenzen verworfen (%s)"
+                + (" -- %d davon an den harten Grenzen rejected (%s)"
                    % (sol.guard_refused, dict(sol.guard)) if sol.guard_refused else ""))
             # the derived base is printed even when no cut form carries
             cut_lines = _base_lines

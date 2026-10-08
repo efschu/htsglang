@@ -2847,7 +2847,7 @@ def weights_cpu_backup_armed(*, explicit: Optional[str] = None) -> bool:
     acceptance criterion (b) calls it a FAIL. Only ``exchange`` +
     ``authoritative`` -- the exchange truly owns the bytes at the wake seam,
     nothing compares against the ring any more -- is the "korrekt
-    implementiert, braucht NIEMALS einen Rueckfall" case the user's order
+    implementiert, requires NIEMALS einen Rueckfall" case the user's order
     names. Under ``ring`` (unarmed) or ``shadow`` the ring IS still needed
     and stays backed exactly as every pre-#1369 boot was.
 

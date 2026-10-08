@@ -1,27 +1,27 @@
-"""Kartenplaner (Item 510): Katalog der Grafikkarten und der wählbaren Modelle/Profile.
+"""Kartenplaner (Item 510): Catalog der Grafikkarten und der wählbaren Modelle/Profile.
 
-Reine Daten plus kleine Prüffunktionen, nur Standardbibliothek.  Jede Zahl trägt
+Reine Data plus kleine Prüffunktionen, nur Standardbibliothek.  Jede Zahl trägt
 ihre Quelle:
 
   * ``NVML-Record``  = am Rig gemessen (vram_plan.json ``cards`` der echten Boots,
                        PCIe-Breiten vom Nutzer bestätigt 17.08., BAR1 aus NF_PROFILE.md 5.2)
-  * ``Datenblatt``   = Herstellerangabe (Nennwert; NVML meldet bei fremden Karten
+  * ``Datasheet``   = Herstellerangabe (Nennwert; NVML meldet bei fremden Karten
                        einige MiB weniger, das ist NICHT gemessen)
   * ``abgeleitet``   = aus den obigen Angaben gerechnet, Rechenweg im Feld ``src``
 
 Nie ein geratener Wert ohne dieses Etikett.
 
 Vorbelegt (``preset``, Plan Profil-Planer 06.10. R5): nur RTX 5090, RTX 3080 20 GB und RTX 3090.  Die übrigen Karten
-bleiben im Katalog (Datenblatt, ohne Messraten) und stehen in der Oberfläche eingeklappt.  Jeder Eintrag trägt seine
+bleiben im Catalog (Datasheet, ohne Messraten) und stehen in der Oberfläche eingeklappt.  Jeder Eintrag trägt seine
 ``origin`` (wie ``planner/card_library.py`` ``CardSpec.source``: ein Eintrag, der nicht beweisen kann, dass er gemessen
 wurde, ist nicht gemessen):
 
   * ``measured_on_rig``   = die Speichergröße stammt aus einem NVML-Record des Rigs
-  * ``Datenblatt``        = Herstellerangabe, am Rig nicht gemessen
-  * ``borrowed-unbelegt`` = ein Wert ist von einer anderen Variante geborgt und nicht belegt
+  * ``Datasheet``        = Herstellerangabe, am Rig nicht gemessen
+  * ``borrowed-unverified`` = ein Wert ist von einer anderen Variante borrowed und nicht belegt
 
 ``origin_fields`` nennt die Herkunft je Feld (vram, mem_bw, pcie); ein geborgtes Feld macht den Eintrag nicht zum Rig-Eintrag.  Turing (sm75) ist als deaktivierter
-Eintrag vorbereitet (Nutzer 03.10.: erst nach sm75-Port in den Katalog).
+Eintrag vorbereitet (Nutzer 03.10.: erst nach sm75-Port in den Catalog).
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ from typing import Dict, List, Optional
 MIB_PER_GB = 1024
 
 ORIGIN_MEASURED = "measured_on_rig"
-ORIGIN_DATASHEET = "Datenblatt"
-ORIGIN_BORROWED = "borrowed-unbelegt"
+ORIGIN_DATASHEET = "Datasheet"
+ORIGIN_BORROWED = "borrowed-unverified"
 ORIGIN_LABELS = {
     ORIGIN_MEASURED: "measured on the rig",
     ORIGIN_DATASHEET: "datasheet (manufacturer value, not measured)",
@@ -55,7 +55,7 @@ ARCHS: Dict[str, dict] = {
 
 
 def _card(cid, name, gb, arch, bw, pcie_gen, pcie_lanes, *, usable=None, usable_src=None,
-          bw_src="Datenblatt", pcie_src="Datenblatt", variant="", enabled=True, off_reason="",
+          bw_src="Datasheet", pcie_src="Datasheet", variant="", enabled=True, off_reason="",
           note="", bus_bits=None, nvml_name=None, preset=False, borrowed=()):
     usable_mib = usable if usable is not None else gb * MIB_PER_GB
     return {
@@ -118,7 +118,7 @@ def _build_catalog() -> List[dict]:
         # Herkunft je Feld und des Eintrags (Quelle: usable_src/bw_src/pcie_src der Eintragung, ``borrowed`` ausdrücklich)
         fields = {"vram": ORIGIN_MEASURED if rig else ORIGIN_DATASHEET,
                   "mem_bw": ORIGIN_BORROWED if "mem_bw" in e["borrowed"] else ORIGIN_DATASHEET,
-                  "pcie": ORIGIN_DATASHEET if e["pcie_native"]["src"] == "Datenblatt" else ORIGIN_MEASURED}
+                  "pcie": ORIGIN_DATASHEET if e["pcie_native"]["src"] == "Datasheet" else ORIGIN_MEASURED}
         e["origin_fields"] = fields
         e["origin"] = ORIGIN_MEASURED if rig else (ORIGIN_BORROWED if ORIGIN_BORROWED in fields.values() else ORIGIN_DATASHEET)
     return c
@@ -138,7 +138,7 @@ def label(entry: dict) -> str:
 
 
 def catalog_public(include_disabled: bool = False) -> List[dict]:
-    """Katalog für die Seite.  Deaktivierte (Turing) nur auf Wunsch."""
+    """Catalog für die Seite.  Deaktivierte (Turing) nur auf Wunsch."""
     out = []
     for e in CATALOG:
         if not e["enabled"] and not include_disabled:
@@ -176,7 +176,7 @@ def match_nvml(name: str, total_mib: Optional[int] = None, cc=None) -> Optional[
 
 
 def datasheet_of(row: dict) -> dict:
-    """Datenblatt-Angaben für das Hardwareprofil (``hardware_profile.build(datasheet=...)``): Nennbandbreite und
+    """Datasheet-Angaben für das Hardwareprofil (``hardware_profile.build(datasheet=...)``): Nennbandbreite und
     Katalogkarte einer NVML-Zeile ``{name, total_mib, cc}``, oder ``{}``.  Die Herkunft steht im Notiztext des Knotens."""
     e = match_nvml(row.get("name"), row.get("total_mib"), row.get("cc"))
     if e is None:

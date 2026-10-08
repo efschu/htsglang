@@ -108,7 +108,7 @@ def run_handler(args, total_mib: int = CARD_TOTAL_MIB) -> ServerArgs:
 
 
 class TestTheReportedGapReproduces(CustomTestCase):
-    """The beleg's own numbers, recomputed from the formula that produced them."""
+    """The evidence's own numbers, recomputed from the formula that produced them."""
 
     def test_the_fraction_withholds_a_tenth_of_the_card(self):
         """slack = pre_model_load_memory * (1 - fraction), and on a fresh solo

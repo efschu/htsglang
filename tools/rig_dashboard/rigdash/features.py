@@ -46,7 +46,7 @@ STATE_ROOTS = {"NF": "/spinning/docker-acceptance/nf/state", "27B": "/spinning/d
 PROFILE_DIRS = ("/spinning/gpu-arb/docker/profiles", "/spinning/gpu-arb/docker")
 MODELS = ("NF", "27B")
 LIVE_STATES = ("launching", "loading", "ready", "serving", "flipping")
-GAIN_ART = ("gemessen", "gerechnet", "unbelegt")
+GAIN_ART = ("gemessen", "gerechnet", "unverified")
 OFF_VALUES = ("", "0", "false", "off", "no", "none", "aus")
 GIT_TIMEOUT_S = 60
 
@@ -317,9 +317,9 @@ def _profile_text(profile: Optional[str], _depth: int = 0) -> Optional[str]:
     return None
 
 
-def _is_on(value, an_wert) -> bool:
-    if an_wert is not None and str(an_wert) != "":
-        return str(value) == str(an_wert)
+def _is_on(value, an_value) -> bool:
+    if an_value is not None and str(an_value) != "":
+        return str(value) == str(an_value)
     return str(value).strip().lower() not in OFF_VALUES
 
 
@@ -361,7 +361,7 @@ def switch_state(sw: dict, st: Optional[dict], profile_text: Optional[str]) -> d
     art = sw.get("art") or ("flag" if name.startswith("--") else "env")
     proc_group = sw.get("gruppe") or ""
     default_on = str(sw.get("default") or "aus").lower() in ("an", "on", "1", "true")
-    an_wert = sw.get("an_wert")
+    an_value = sw.get("an_value")
     groups = (st or {}).get("groups") or {}
     targets = [proc_group] if proc_group in ("P", "D") else (["P", "D"] if proc_group in ("", "beide") else [])
     launches = [(g, (groups.get(g) or {}).get("launch")) for g in targets]
@@ -376,10 +376,10 @@ def switch_state(sw: dict, st: Optional[dict], profile_text: Optional[str]) -> d
                 present, value = _flag_lookup([str(a) for a in l.get("argv") or []], name)
             if not present:
                 on = default_on
-            elif art == "flag" and not value and an_wert in (None, ""):
+            elif art == "flag" and not value and an_value in (None, ""):
                 on = True                       # a bare flag is its own value
             else:
-                on = _is_on(value, an_wert)
+                on = _is_on(value, an_value)
             vals.append((g, on, value if present else None))
         on_all = all(v[1] for v in vals)
         on_any = any(v[1] for v in vals)
@@ -392,19 +392,19 @@ def switch_state(sw: dict, st: Optional[dict], profile_text: Optional[str]) -> d
             hits = re.findall(r"(?<![A-Za-z0-9_])%s=([^;\"'\s]*)" % _name_alt(N.env_variants(name)), profile_text)
             if hits:
                 v = hits[-1]
-                return {"state": "an" if _is_on(v, an_wert) else "aus", "src": "Profile (no launch snapshot)", "value": v}
+                return {"state": "an" if _is_on(v, an_value) else "aus", "src": "Profile (no launch snapshot)", "value": v}
         else:
             m = re.search(r"(?<![\w-])%s(?:[ =]([^\s'\"]+))?" % _name_alt(N.marker_variants(name)), profile_text)
             if m:
                 v = m.group(1) or ""
-                on = _is_on(v, an_wert) if (an_wert not in (None, "")) else True
+                on = _is_on(v, an_value) if (an_value not in (None, "")) else True
                 return {"state": "an" if on else "aus", "src": "Profile (no launch snapshot)", "value": v}
         return {"state": "an" if default_on else "aus", "src": "Profile (not set -> default)", "value": None}
     return {"state": "unbekannt", "src": "no state and no profile", "value": None}
 
 
 def aktiv(feature: dict, st: Optional[dict], profile_text: Optional[str], im: dict) -> dict:
-    sws = [s for s in feature.get("schalter") or [] if isinstance(s, dict) and s.get("name")]
+    sws = [s for s in feature.get("switch") or [] if isinstance(s, dict) and s.get("name")]
     if not sws:
         if im.get("state") == "ja":
             return {"state": "an", "detail": [], "note": "without switch: takes effect as soon as it is in the image"}
@@ -428,7 +428,7 @@ def _clean(v):
     return redact.clean(str(v)) if v is not None else None
 
 
-MODELL_VALUES = ("27B", "NF", "beide")
+MODEL_VALUES = ("27B", "NF", "beide")
 SWITCH_ART = ("env", "flag")
 SWITCH_GROUPS = ("P", "D", "beide", "front", "launcher", "")   # front/launcher: not in a group's launch -> profile
 
@@ -445,12 +445,12 @@ def validate(feats: list) -> list:
         if fid in seen:
             out.append("%s: duplicate id" % fid)
         seen.add(fid)
-        if f.get("modell") not in MODELL_VALUES:
-            out.append("%s: model %r not in %s" % (fid, f.get("modell"), "/".join(MODELL_VALUES)))
+        if f.get("modell") not in MODEL_VALUES:
+            out.append("%s: model %r not in %s" % (fid, f.get("modell"), "/".join(MODEL_VALUES)))
         for z in f.get("zweige") or []:
             if not isinstance(z, dict) or not z.get("branch") or not re.fullmatch(r"[0-9a-f]{7,40}", z.get("sha") or ""):
                 out.append("%s: branch %r needs branch + sha" % (fid, z))
-        for s in f.get("schalter") or []:
+        for s in f.get("switch") or []:
             if not isinstance(s, dict) or not s.get("name"):
                 out.append("%s: switch without name" % fid)
                 continue
@@ -479,13 +479,13 @@ def validate(feats: list) -> list:
 # Nutzer-Rüge 29.09.: "Bugfixes sind keine Features." The table is the product
 # features with Soll and Ist per model; the commits/fixes above are only their
 # Bausteine (building blocks), shown collapsed under the feature they serve.
-PRODUKT_STATUS = ("fertig+aktiv", "im Image aber aus", "Desk", "offen", "unbelegt", "entfällt")
+PRODUKT_STATUS = ("fertig+aktiv", "im Image aber aus", "Desk", "offen", "unverified", "entfällt")
 KREUZ_ACHSEN = (("tp", "uneven TP"), ("dcp", "uneven DCP / token cut"),
                 ("moe", "uneven expert shard (--rank-moe-ratio)"), ("pp", "PP cut uneven"),
                 ("forma", "Form A host/worker"), ("kvonly", "KV-only rank"))
 # "Soll erreicht?" (Koordinator 29.09.) is separate from the status: fertig+aktiv only says it runs.
-SOLL_ERREICHT = ("ja", "teilweise", "nein")
-KREUZ_STATUS = ("am Metall belegt", "unterstützt", "nur Desk", "nein", "unbelegt")
+EXPECTED_REACHED = ("ja", "teilweise", "nein")
+KREUZ_STATUS = ("am Metall belegt", "unterstützt", "nur Desk", "nein", "unverified")
 _KREUZ_KEYS = [k for k, _ in KREUZ_ACHSEN]
 
 
@@ -505,15 +505,15 @@ def validate_produkt(prod: list, baustein_ids) -> list:
         if pid in seen:
             out.append("Product %s: duplicate id" % pid)
         seen.add(pid)
-        if not p.get("titel") or not p.get("soll"):
-            out.append("Product %s: titel and soll are required" % pid)
+        if not p.get("title") or not p.get("soll"):
+            out.append("Product %s: title and soll are required" % pid)
         for m, x in (p.get("ist") or {}).items():
             if m not in MODELS:
                 out.append("Product %s: ist model %r not 27B/NF" % (pid, m))
             elif (x or {}).get("status") not in PRODUKT_STATUS:
                 out.append("Product %s: %s status %r not %s" % (pid, m, (x or {}).get("status"), "/".join(PRODUKT_STATUS)))
-            elif (x or {}).get("erreicht") and x["erreicht"] not in SOLL_ERREICHT:
-                out.append("Product %s: %s erreicht %r not %s" % (pid, m, x["erreicht"], "/".join(SOLL_ERREICHT)))
+            elif (x or {}).get("reached") and x["reached"] not in EXPECTED_REACHED:
+                out.append("Product %s: %s reached %r not %s" % (pid, m, x["reached"], "/".join(EXPECTED_REACHED)))
             elif (x or {}).get("belegt_am") and belegt_ts(x["belegt_am"]) is None:
                 out.append("Product %s: %s belegt_am %r (ISO, e.g. 2026-09-29T07:10Z)" % (pid, m, x["belegt_am"]))
         for b in p.get("bausteine") or []:
@@ -562,7 +562,7 @@ def unassigned_bausteine(prod: list, baustein_ids) -> list:
 MATRIX_BS = ("1", "2", "3", "4", "5", "6")
 MATRIX_TIEFE = ("kurz", "2k", "10k", "32k", "97k", "257k", "gemischt")
 MATRIX_TEXT = ("code", "prosa", "thinking", "gemischt")
-MATRIX_ZELLSTATUS = ("wert", "ungültig")
+MATRIX_ZELLSTATUS = ("value", "ungültig")
 
 
 def matrix_key(form, bs, depth, text) -> str:
@@ -655,7 +655,7 @@ def _cur_boot(lb, fb, gpus):
 def _cur_lifecycle(lb, fb, gpus):
     if not fb:
         return None
-    return ("lifecycle %s%s" % (fb.get("lifecycle"), " (override: %s)" % fb["override_beleg"] if fb.get("override_beleg") else ""),
+    return ("lifecycle %s%s" % (fb.get("lifecycle"), " (override: %s)" % fb["override_evidence"] if fb.get("override_evidence") else ""),
             "state.json lifecycle")
 
 
@@ -752,7 +752,7 @@ def attach_current(fv: dict, live_boots: list, gpus: Optional[dict]) -> dict:
                 r, cur[m] = None, {"kein_instrument": "Evaluation failed: %s" % e}
                 continue
             tag = (lb.get("meta") or {}).get("tag") or lb.get("stem")
-            cur[m] = {"wert": _clean(r[0]), "instrument": r[1], "boot": _clean(tag) or (fb or {}).get("rc")} if r \
+            cur[m] = {"value": _clean(r[0]), "instrument": r[1], "boot": _clean(tag) or (fb or {}).get("rc")} if r \
                 else {"leer": "Instrument present, no value yet in this boot" if lb else
                       "no IPC boot of this model in the last 6 h", "boot": _clean(tag)}
         for m in MODELS:
@@ -822,24 +822,24 @@ def produkt_view(prod: list, bausteine: dict, boot_start: Optional[dict] = None)
         ist = {}
         for m in MODELS:
             x = (p.get("ist") or {}).get(m) or {}
-            ist[m] = {k: _clean(x.get(k)) for k in ("wert", "status", "grund", "beleg", "status_text", "quelle",
-                                                    "belegt_am", "erreicht", "erreicht_grund")}
-            ist[m]["status"] = ist[m]["status"] or "unbelegt"
-            if ist[m]["status"] != "unbelegt" or ist[m]["wert"]:
+            ist[m] = {k: _clean(x.get(k)) for k in ("value", "status", "reason", "evidence", "status_text", "quelle",
+                                                    "belegt_am", "reached", "reached_reason")}
+            ist[m]["status"] = ist[m]["status"] or "unverified"
+            if ist[m]["status"] != "unverified" or ist[m]["value"]:
                 _alter(ist[m], boot_start.get(m))
         bs = []
         for bid in p.get("bausteine") or []:
-            row = {"id": _clean(bid), "titel": None, "je_modell": {}}
+            row = {"id": _clean(bid), "title": None, "per_model": {}}
             for m in MODELS:
                 r = (bausteine.get(m) or {}).get(bid)
                 if r is None:
                     continue
-                row["titel"] = row["titel"] or r["titel"]
-                row["je_modell"][m] = {"fertig": r["fertig"], "im_image": r["im_image"], "aktiv": r["aktiv"]["state"],
+                row["title"] = row["title"] or r["title"]
+                row["per_model"][m] = {"fertig": r["fertig"], "im_image": r["im_image"], "aktiv": r["aktiv"]["state"],
                                        "image_aber_aus": r["image_aber_aus"], "aus_begruendung": r["aus_begruendung"],
                                        "gewinn": r["gewinn"], "zweige": r["zweige"]}
             bs.append(row)
-        out.append({"nr": p.get("nr"), "id": _clean(p.get("id")), "titel": _clean(p.get("titel")),
+        out.append({"nr": p.get("nr"), "id": _clean(p.get("id")), "title": _clean(p.get("title")),
                     "soll": _clean(p.get("soll")), "ist": ist, "bausteine": bs,
                     "kreuztabelle": _deep_clean(p.get("kreuztabelle")) if p.get("kreuztabelle") else None,
                     "untertabelle": _deep_clean(p.get("untertabelle")) if p.get("untertabelle") else None,
@@ -866,8 +866,8 @@ def gains_for(feature: dict, model: str) -> tuple:
             continue
         if gm and gm != model:
             continue
-        art = g.get("art") if g.get("art") in GAIN_ART else "unbelegt"
-        out.append({k: _clean(g.get(k)) for k in ("metrik", "vorher", "nachher", "einheit", "quelle", "boot")} | {"art": art})
+        art = g.get("art") if g.get("art") in GAIN_ART else "unverified"
+        out.append({k: _clean(g.get(k)) for k in ("metrik", "vorher", "nachher", "unit", "quelle", "boot")} | {"art": art})
     return out, problems
 
 
@@ -954,7 +954,7 @@ class Features:
                 # a state.json read wrongly at the time (27B 29.09.: rc12z30j was the planned stop
                 # after 30 min load, not a death) -- shown corrected, the file itself is never rewritten
                 bv.update(lifecycle_state_json=bv["lifecycle"], lifecycle=_clean(str(ov["lifecycle"])),
-                          override_beleg=_clean(ov.get("beleg")))
+                          override_evidence=_clean(ov.get("evidence")))
             rev = (bv or {}).get("rev") or ""
             mine = [f for f in feats if f.get("modell") in (model, "beide")]
             hit = self._im_for(model, rev, sig, mine)
@@ -976,7 +976,7 @@ class Features:
                 problems += prob
                 rows.append({
                     "id": _clean(f.get("id")),
-                    "titel": _clean(f.get("titel")),
+                    "title": _clean(f.get("title")),
                     "fertig": bool(f.get("fertig")),
                     "verantwortlich": _clean(f.get("verantwortlich")),
                     "zweige": [{"branch": _clean(z.get("branch")), "sha": _clean(z.get("sha"))}

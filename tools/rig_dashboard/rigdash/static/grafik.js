@@ -21,7 +21,7 @@
 
   // source labels delivered by the API (history.py / ipcstate.py); the German literals are accepted as well as the English ones
   const LOG = "from log (transition)", LOG_DE = "aus Log (Übergang)";
-  const NO_DATA = "no data (before IPC recording)", NO_DATA_DE = "keine Daten (vor IPC-Aufzeichnung)";
+  const NO_DATA = "no data (before IPC recording)", NO_DATA_DE = "keine Data (vor IPC-Aufzeichnung)";
   const SRC_EN = { [LOG_DE]: LOG, [NO_DATA_DE]: NO_DATA };
   let model = "27B", range = "1h";
   try {

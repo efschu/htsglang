@@ -223,18 +223,18 @@ class RowsAndEdits(unittest.TestCase):
         self.assertNotIn("flag:--p-hostgap", self.rows(e))
 
     def test_explanation_sources_and_dependencies(self):
-        cat = {"--p-bs": {"text": "Gleichzeitige Anfragen", "help": "K1 ...", "source": {"file": "launcher.py", "line": 1}, "status": "kuratiert",
-                          "depends": [{"to": "--d-bs", "rel": "tauscht", "effect": "x", "calc": "text"}]},
-               "--p-hostgap": {"help": "instrument", "source": {"file": "launcher.py", "line": 2}, "status": "geerntet", "depends": []}}
+        cat = {"--p-bs": {"text": "Gleichzeitige Anfragen", "help": "K1 ...", "source": {"file": "launcher.py", "line": 1}, "status": "curated",
+                          "depends": [{"to": "--d-bs", "rel": "trades", "effect": "x", "calc": "text"}]},
+               "--p-hostgap": {"help": "instrument", "source": {"file": "launcher.py", "line": 2}, "status": "harvested", "depends": []}}
         v = PJ.view(self.doc, cat, {"--model": {"text": "weil", "source": "base.env:3"}})
         by = {r["key"]: r for r in v["rows"]}
-        self.assertEqual(by["flag:--p-bs"]["explain"]["status"], "kuratiert")
-        self.assertEqual(by["flag:--p-hostgap"]["explain"]["status"], "geerntet")
+        self.assertEqual(by["flag:--p-bs"]["explain"]["status"], "curated")
+        self.assertEqual(by["flag:--p-hostgap"]["explain"]["status"], "harvested")
         self.assertEqual(by["flag:--model"]["explain"]["status"], "profil-kommentar")
-        self.assertEqual(by["flag:--pp-stage-ratio"]["explain"]["status"], "unerklaert")
+        self.assertEqual(by["flag:--pp-stage-ratio"]["explain"]["status"], "unexplained")
         dep = by["flag:--p-bs"]["explain"]["depends"][0]
         self.assertFalse(dep["present"])                                       # --d-bs is not set in this profile
-        self.assertEqual(v["coverage"]["unerklaert"] + v["coverage"]["erklaert"], v["coverage"]["rows"])
+        self.assertEqual(v["coverage"]["unexplained"] + v["coverage"]["explained"], v["coverage"]["rows"])
 
 
 @unittest.skipUnless(os.path.isdir(RELEASE_DIR), "release profiles are outside the repo (%s)" % RELEASE_DIR)

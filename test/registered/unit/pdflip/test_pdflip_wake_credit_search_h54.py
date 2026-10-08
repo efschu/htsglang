@@ -8,7 +8,7 @@ after 3 of 18 tags)" -- ``fixtures/wake_credit_h14/dry_fnFL2x162_refused_0410
 /spinning/evidence-665-f1/dry_fnFL2x162_refused_0410.log. Der gierige Bau in
 ``credit_order`` prueft PRAEFIXE, und ein Praefix kennt keinen Vorlauf der
 Schlaefer: schon ``[weights_0]`` allein traegt Karte 1 nicht (D TP0 gibt 1426
-MiB frei, staged 715, P PP0 braucht 2246), obwohl D TP0 im Leg sofort
+MiB frei, staged 715, P PP0 requires 2246), obwohl D TP0 im Leg sofort
 ``weights_1`` weiter freigibt. Die volle Simulation derselben Karten findet
 eine tragende Ordnung. Mit FLLIPER_PDFLIP_ENABLE_FLIP_ORDER_CREDIT_SEARCH sucht
 ``credit_order`` so weiter -- im Riegel UND in der Front (dieselbe Funktion,

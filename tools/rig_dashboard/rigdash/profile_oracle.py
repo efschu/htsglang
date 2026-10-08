@@ -1,4 +1,4 @@
-"""AP-D (Plan Profil-Planer 06.10., Stufe B/C): der Dienst hinter dem Orakel -- Kindprozess + Cache.
+"""AP-D (Plan Profil-Planer 06.10., Stufe B/C): der Dienst hinter dem Oracle -- Kindprozess + Cache.
 
 Der Dashboard-Prozess rechnet nichts selbst (kein flliper-Import, MemoryMax=1G).  ``OracleService`` haelt EINEN langlebigen Kindprozess
 (``kartenplan_build/oracle_worker.py``) mit dem Python der flliper-Umgebung, der den Launcher-Trockenlauf (``pdflip/propose_oracle``) und
@@ -23,7 +23,7 @@ import threading
 from collections import OrderedDict
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from .profil_recompute import CouplingsService
+from .profile_recompute import CouplingsService
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(os.path.dirname(HERE), "kartenplan_build", "oracle_worker.py")
@@ -65,7 +65,7 @@ def sha256_file(path: str) -> Optional[str]:
 
 
 class OracleService(CouplingsService):
-    """Orakel-Worker + Cache (siehe Modulkopf).  ``ask(kind, req, parts)``: ``kind`` ``verdikt`` | ``propose``."""
+    """Oracle-Worker + Cache (siehe Modulkopf).  ``ask(kind, req, parts)``: ``kind`` ``verdict`` | ``propose``."""
 
     def __init__(self, tree_python: Optional[str], python: Optional[str] = None, worker: str = WORKER, timeout_s: float = TIMEOUT_S,
                  start_timeout_s: float = START_TIMEOUT_S, cache_size: int = CACHE_SIZE, request_extra: Optional[Mapping[str, Any]] = None,
@@ -95,7 +95,7 @@ class OracleService(CouplingsService):
         return out
 
     def key(self, kind: str, parts: Mapping[str, Any]) -> str:
-        return sha256_text(canonical({"kind": kind, "parts": parts, "extra": self.request_extra, "quellen": self.stamp()}))
+        return sha256_text(canonical({"kind": kind, "parts": parts, "extra": self.request_extra, "sources": self.stamp()}))
 
     # ------------------------------------------------------------------ Cache
     def _get(self, key: str) -> Optional[Dict[str, Any]]:
@@ -116,13 +116,13 @@ class OracleService(CouplingsService):
 
     def cache_info(self) -> Dict[str, int]:
         with self._cache_lock:
-            return {"eintraege": len(self._cache), "treffer": self.hits, "fehlgriffe": self.misses, "groesse": self.cache_size}
+            return {"entries": len(self._cache), "treffer": self.hits, "fehlgriffe": self.misses, "groesse": self.cache_size}
 
     # ------------------------------------------------------------------ Anfrage
     def ask(self, kind: str, req: Mapping[str, Any], parts: Mapping[str, Any]) -> Dict[str, Any]:
         """Antwort des Workers (aus dem Cache, wenn Schluessel und Quellen gleich sind); ``cached`` und ``cache_key`` (16 Zeichen) stehen dabei.
         Ein Fehler des Workers kommt als ``{"ok": False, "error": ...}`` und wird nicht gemerkt."""
-        if kind not in ("verdikt", "propose"):
+        if kind not in ("verdict", "propose"):
             return {"ok": False, "error": "unknown oracle request %r" % (kind,)}
         key = self.key(kind, parts)
         hit = self._get(key)

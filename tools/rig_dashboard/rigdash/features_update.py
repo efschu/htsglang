@@ -8,13 +8,13 @@ computes them from git and the boot's state.json.
 
   # a feature (upsert by id; lists given again replace the old ones)
   python3 /opt/rigdash/current/rigdash/features_update.py set --id H106 --modell NF \\
-      --titel "Form-A-Worker folgt dem ADMIT des Hosts" --fertig ja \\
+      --title "Form-A-Worker folgt dem ADMIT des Hosts" --fertig ja \\
       --zweig desk/nf-h106-0928=49a2a04af3 \\
-      --schalter FLLIPER_PDFLIP_H106=env:D:1:an --verantwortlich NF-Implementierer
+      --switch FLLIPER_PDFLIP_H106=env:D:1:an --verantwortlich NF-Implementierer
   # 27B picked it: add its sha as a further branch (keeps the others)
   ... add-zweig --id H106 --zweig desk/27b-unified-0926=0293076975
   # a gain -- modell is mandatory when the feature is for both models
-  ... gewinn --id H106 --modell NF --metrik Flipzeit --vorher 3.1 --nachher 2.4 --einheit s \\
+  ... gewinn --id H106 --modell NF --metrik Flipzeit --vorher 3.1 --nachher 2.4 --unit s \\
       --art gemessen --quelle "fliptimes rc12z30p" --boot nfh91...-f700
   ... begruendung --id H63 --text "aus bis Faltung am Metall belegt (H63d)"
   ... show [--id H106]      ... check
@@ -80,13 +80,13 @@ def _zweig(s: str) -> dict:
 
 
 def _schalter(s: str) -> dict:
-    """NAME=art:gruppe:an_wert:default -- e.g. FLLIPER_X=env:D:1:aus, --d-foo=flag:D::aus."""
+    """NAME=art:gruppe:an_value:default -- e.g. FLLIPER_X=env:D:1:aus, --d-foo=flag:D::aus."""
     name, sep, rest = s.partition("=")
     parts = rest.split(":") if sep else []
     if len(parts) != 4:
-        raise SystemExit("--schalter needs NAME=art:gruppe:an_wert:default, not %r" % s)
-    art, proc_group, an_wert, default = parts
-    return {"name": name, "art": art, "gruppe": proc_group, "an_wert": an_wert, "default": default}
+        raise SystemExit("--switch needs NAME=art:gruppe:an_value:default, not %r" % s)
+    art, proc_group, an_value, default = parts
+    return {"name": name, "art": art, "gruppe": proc_group, "an_value": an_value, "default": default}
 
 
 def _bool(s: str) -> bool:
@@ -103,12 +103,12 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("set", help="Create or change a feature (upsert by id)")
     s.add_argument("--id", required=True)
-    s.add_argument("--modell", choices=features.MODELL_VALUES)
-    s.add_argument("--titel")
+    s.add_argument("--modell", choices=features.MODEL_VALUES)
+    s.add_argument("--title")
     s.add_argument("--fertig", type=_bool)
     s.add_argument("--zweig", action="append", type=_zweig, help="branch=sha (repeatable; replaces the list)")
-    s.add_argument("--schalter", action="append", type=_schalter,
-                   help="NAME=art:gruppe:an_wert:default (repeatable; replaces the list)")
+    s.add_argument("--switch", action="append", type=_schalter,
+                   help="NAME=art:gruppe:an_value:default (repeatable; replaces the list)")
     s.add_argument("--aus-begruendung")
     s.add_argument("--verantwortlich")
     s.add_argument("--produkt", action="append", help="attach as a building block to this product feature (F1..F24, repeatable)")
@@ -120,7 +120,7 @@ def main(argv=None) -> int:
     g.add_argument("--metrik", required=True, help="e.g. decode tok/s, flip time, KV tokens, bs parallel")
     g.add_argument("--vorher")
     g.add_argument("--nachher", required=True)
-    g.add_argument("--einheit", default="")
+    g.add_argument("--unit", default="")
     g.add_argument("--art", required=True, choices=features.GAIN_ART)
     g.add_argument("--modell", choices=("27B", "NF"), help="required for modell=beide")
     g.add_argument("--quelle", default="")
@@ -137,25 +137,25 @@ def main(argv=None) -> int:
     ps = sub.add_parser("produkt-set", help="Create/change a product feature (target, building blocks)")
     ps.add_argument("--id", required=True)
     ps.add_argument("--nr", type=int)
-    ps.add_argument("--titel")
+    ps.add_argument("--title")
     ps.add_argument("--soll", help="one sentence, measurable")
     ps.add_argument("--bausteine", help="building block ids (features[].id), comma-separated; replaces the list")
-    pi = sub.add_parser("produkt-ist", help="Set the actual of a model -- only with evidence, otherwise 'unbelegt'")
+    pi = sub.add_parser("produkt-ist", help="Set the actual of a model -- only with evidence, otherwise 'unverified'")
     pi.add_argument("--id", required=True)
     pi.add_argument("--modell", required=True, choices=features.MODELS)
     pi.add_argument("--status", required=True, choices=features.PRODUKT_STATUS)
-    pi.add_argument("--wert", default="")
-    pi.add_argument("--grund", default="", help="why off / open")
-    pi.add_argument("--beleg", default="", help="boot, number, file")
+    pi.add_argument("--value", default="")
+    pi.add_argument("--reason", default="", help="why off / open")
+    pi.add_argument("--evidence", default="", help="boot, number, file")
     pi.add_argument("--belegt-am", default=None,
                     help="when the evidence arose (ISO, e.g. 2026-09-29T07:10Z); default now. Older than the last boot of the model = 'Actual outdated, measure again'")
-    pi.add_argument("--erreicht", choices=features.SOLL_ERREICHT, help="Target reached? (separate from the status)")
-    pi.add_argument("--erreicht-grund", default="")
-    er = sub.add_parser("erreicht", help="set only 'Target reached?' of a model, the rest of the cell stays")
+    pi.add_argument("--reached", choices=features.EXPECTED_REACHED, help="Target reached? (separate from the status)")
+    pi.add_argument("--reached-reason", default="")
+    er = sub.add_parser("reached", help="set only 'Target reached?' of a model, the rest of the cell stays")
     er.add_argument("--id", required=True)
     er.add_argument("--modell", required=True, choices=features.MODELS)
-    er.add_argument("--wert", required=True, choices=features.SOLL_ERREICHT)
-    er.add_argument("--grund", default="", help="what it was measured by, e.g. '119 s against target ~21 s'")
+    er.add_argument("--value", required=True, choices=features.EXPECTED_REACHED)
+    er.add_argument("--reason", default="", help="what it was measured by, e.g. '119 s against target ~21 s'")
     kz = sub.add_parser("kreuz", help="Set a cell of the cross table (feature F2)")
     kz.add_argument("--id", default="F2")
     kz.add_argument("--modell", required=True, choices=features.MODELS)
@@ -168,8 +168,8 @@ def main(argv=None) -> int:
     fi.add_argument("--zeile", required=True, help="name of the sub-row, e.g. NVFP4")
     fi.add_argument("--modell", required=True, choices=features.MODELS)
     fi.add_argument("--status", choices=features.PRODUKT_STATUS)
-    fi.add_argument("--wert", default="")
-    fi.add_argument("--beleg", default="")
+    fi.add_argument("--value", default="")
+    fi.add_argument("--evidence", default="")
     fi.add_argument("--belegt-am", default=None, help="ISO; default now")
     mx = sub.add_parser("matrix", help="Cell of the decode matrix (F24): value or 'ungültig'; no cell = unmeasured")
     mx.add_argument("--id", default="F24")
@@ -178,16 +178,16 @@ def main(argv=None) -> int:
     mx.add_argument("--bs", required=True, choices=features.MATRIX_BS)
     mx.add_argument("--tiefe", required=True, choices=features.MATRIX_TIEFE)
     mx.add_argument("--text", required=True, choices=features.MATRIX_TEXT)
-    mx.add_argument("--wert", default="", help="with unit, e.g. '24.7 ms' or '131.9 tok/s'")
+    mx.add_argument("--value", default="", help="with unit, e.g. '24.7 ms' or '131.9 tok/s'")
     mx.add_argument("--ungueltig", action="store_true", help="cell invalid (e.g. EOS below 500 tokens)")
     mx.add_argument("--boot", default="")
-    mx.add_argument("--beleg", required=True)
+    mx.add_argument("--evidence", required=True)
     im = sub.add_parser("import-27b", help="Take over the 27B actual, cross table, P1/P2 and markers from the 27B file")
     im.add_argument("--md", default="/spinning/gpu-arb/docs/features_27b_ist_0929.md")
     bo = sub.add_parser("boot-override", help="Show the lifecycle of a boot corrected (state.json stays)")
     bo.add_argument("--boot", required=True, help="boot_id from state.json")
     bo.add_argument("--lifecycle", required=True)
-    bo.add_argument("--beleg", required=True)
+    bo.add_argument("--evidence", required=True)
     md = sub.add_parser("md", help="Product table as Markdown (with the calculated in image/active of the building blocks)")
     md.add_argument("--out", help="file, otherwise stdout")
     md.add_argument("--live-url", default="http://127.0.0.1:8890/api/live",
@@ -229,13 +229,13 @@ def main(argv=None) -> int:
         d = _load(a.file)
         if a.cmd == "set":
             f = _find(d, a.id, create=True)
-            for key, val in (("modell", a.model), ("titel", a.titel), ("fertig", a.done),
-                             ("zweige", a.branch), ("schalter", a.schalter),
+            for key, val in (("modell", a.model), ("title", a.title), ("fertig", a.done),
+                             ("zweige", a.branch), ("switch", a.switch),
                              ("aus_begruendung", a.aus_begruendung), ("verantwortlich", a.verantwortlich)):
                 if val is not None:
                     f[key] = val
             f.setdefault("zweige", [])
-            f.setdefault("schalter", [])
+            f.setdefault("switch", [])
             f.setdefault("gewinn", [])
             f.setdefault("fertig", False)
             for pid in a.produkt or []:
@@ -249,7 +249,7 @@ def main(argv=None) -> int:
         elif a.cmd == "gewinn":
             f = _find(d, a.id)
             new = {k: v for k, v in (("metrik", a.metrik), ("vorher", a.before), ("nachher", a.after),
-                                    ("einheit", a.einheit), ("art", a.art), ("modell", a.model),
+                                    ("unit", a.unit), ("art", a.art), ("modell", a.model),
                                     ("quelle", a.source), ("boot", a.boot)) if v not in (None, "")}
             keep = [x for x in f.get("gewinn") or []
                     if not (x.get("metrik") == a.metrik and x.get("modell") == a.model)]
@@ -261,7 +261,7 @@ def main(argv=None) -> int:
             d["features"].remove(f)
         elif a.cmd == "produkt-set":
             p = _find_produkt(d, a.id, create=True)
-            for key, val in (("nr", a.nr), ("titel", a.titel), ("soll", a.want)):
+            for key, val in (("nr", a.nr), ("title", a.title), ("soll", a.want)):
                 if val is not None:
                     p[key] = val
             if a.bausteine is not None:
@@ -269,16 +269,16 @@ def main(argv=None) -> int:
         elif a.cmd == "produkt-ist":
             p = _find_produkt(d, a.id)
             p.setdefault("ist", {})[a.model] = {k: v for k, v in (
-                ("status", a.status), ("wert", a.value), ("grund", a.grund), ("beleg", a.beleg),
-                ("belegt_am", _belegt_am(a.belegt_am)), ("erreicht", a.erreicht),
-                ("erreicht_grund", a.erreicht_grund)) if v}
-        elif a.cmd == "erreicht":
-            x = _find_produkt(d, a.id).setdefault("ist", {}).setdefault(a.model, {"status": "unbelegt"})
-            x["erreicht"] = a.value
-            if a.grund:
-                x["erreicht_grund"] = a.grund
+                ("status", a.status), ("value", a.value), ("reason", a.reason), ("evidence", a.evidence),
+                ("belegt_am", _belegt_am(a.belegt_am)), ("reached", a.reached),
+                ("reached_reason", a.reached_reason)) if v}
+        elif a.cmd == "reached":
+            x = _find_produkt(d, a.id).setdefault("ist", {}).setdefault(a.model, {"status": "unverified"})
+            x["reached"] = a.value
+            if a.reason:
+                x["reached_reason"] = a.reason
             else:
-                x.pop("erreicht_grund", None)
+                x.pop("reached_reason", None)
         elif a.cmd == "kreuz":
             p = _find_produkt(d, a.id)
             cells = p.setdefault("kreuztabelle", {}).setdefault("zellen", {}).setdefault(a.model, {})
@@ -291,18 +291,18 @@ def main(argv=None) -> int:
                 row = {"name": a.row_idx, "ist": {}}
                 rows.append(row)
             row.setdefault("ist", {})[a.model] = {k: v for k, v in (
-                ("status", a.status), ("wert", a.value), ("beleg", a.beleg),
+                ("status", a.status), ("value", a.value), ("evidence", a.evidence),
                 ("belegt_am", _belegt_am(a.belegt_am))) if v}
         elif a.cmd == "matrix":
             p = _find_produkt(d, a.id)
             cells = p.setdefault("matrix", {}).setdefault("zellen", {}).setdefault(a.model, {})
             cells[features.matrix_key(a.form, a.bs, a.depth, a.text)] = {k: v for k, v in (
-                ("status", "ungültig" if a.ungueltig else "wert"), ("wert", a.value), ("boot", a.boot),
-                ("beleg", a.beleg)) if v}
+                ("status", "ungültig" if a.ungueltig else "value"), ("value", a.value), ("boot", a.boot),
+                ("evidence", a.evidence)) if v}
         elif a.cmd == "import-27b":
             import_27b(d, a.md)
         elif a.cmd == "boot-override":
-            d.setdefault("boot_overrides", {})[a.boot] = {"lifecycle": a.lifecycle, "beleg": a.beleg}
+            d.setdefault("boot_overrides", {})[a.boot] = {"lifecycle": a.lifecycle, "evidence": a.evidence}
         _save(a.file, d)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
@@ -332,7 +332,7 @@ def _find_produkt(d: dict, pid: str, create: bool = False) -> dict:
 
 # ------------------------------------------------------------------ 27B-Import (27B-Sitz, 29.09.)
 
-QUELLE_27B = "27B-Sitz, features_27b_ist_0929.md"
+SOURCE_27B = "27B-Sitz, features_27b_ist_0929.md"
 
 
 def _md_rows(lines):
@@ -379,7 +379,7 @@ def map_status(text: str) -> str:
         m = re.search(pat, t)
         if m:
             hits.append((m.start(), st))
-    return min(hits)[1] if hits else "unbelegt"
+    return min(hits)[1] if hits else "unverified"
 
 
 def _stand(text: str, path: str) -> str:
@@ -397,14 +397,14 @@ def import_27b(d: dict, path: str) -> None:
     achsen = [k for k, _ in features.KREUZ_ACHSEN]
     for head, rows in _tables(text):
         hdr = [c.lower() for c in rows[0]] if rows else []
-        if hdr[:5] == ["f", "feature", "status", "ist-wert", "beleg / grund"]:
+        if hdr[:5] == ["f", "feature", "status", "ist-value", "evidence / reason"]:
             for r in rows[1:]:
                 p = prod.get("F%s" % r[0].strip())
                 if p is None:
                     continue
                 p.setdefault("ist", {})["27B"] = {k: v for k, v in (
-                    ("status", map_status(r[2])), ("status_text", _plain(r[2])), ("wert", _plain(r[3])),
-                    ("beleg", _plain(r[4])), ("quelle", QUELLE_27B), ("belegt_am", stand)) if v and v != "–"}
+                    ("status", map_status(r[2])), ("status_text", _plain(r[2])), ("value", _plain(r[3])),
+                    ("evidence", _plain(r[4])), ("quelle", SOURCE_27B), ("belegt_am", stand)) if v and v != "–"}
         elif hdr[:1] == [""] and hdr[1:] == achsen:
             cells = prod["F2"].setdefault("kreuztabelle", {}).setdefault("zellen", {})
             cells["27B"] = {}
@@ -417,19 +417,19 @@ def import_27b(d: dict, path: str) -> None:
                     st = next((s for s in features.KREUZ_STATUS if c.startswith(s)), None)
                     note = c[len(st):].strip(" ()") if st else c
                     cells["27B"][features.kreuz_key(a, b)] = {k: v for k, v in (
-                        ("status", st or "unbelegt"), ("note", note), ("quelle", QUELLE_27B)) if v}
+                        ("status", st or "unverified"), ("note", note), ("quelle", SOURCE_27B)) if v}
         elif hdr[:2] == ["format / form", "instrument"]:
             p = prod["F23"]
             row_list = p.setdefault("untertabelle", {"spalte": "Prompt length / form", "zeilen": []}).setdefault("zeilen", [])
             row_list[:] = [z for z in row_list if not z.get("name", "").startswith("27B ")]
             for r in rows[1:]:
-                werte = "; ".join("%s: %s" % (h, _plain(v)) for h, v in zip(rows[0][2:-1], r[2:-1]) if _plain(v))
+                values = "; ".join("%s: %s" % (h, _plain(v)) for h, v in zip(rows[0][2:-1], r[2:-1]) if _plain(v))
                 row_list.append({"name": "27B " + _plain(r[0]), "ist": {"27B": {
-                    "wert": "%s [Instrument %s]" % (werte, _plain(r[1])), "beleg": _plain(r[-1]), "quelle": QUELLE_27B,
+                    "value": "%s [Instrument %s]" % (values, _plain(r[1])), "evidence": _plain(r[-1]), "quelle": SOURCE_27B,
                     "belegt_am": stand}}})
         elif hdr[:3] == ["form", "tiefe", "text"]:
             m = re.search(r"(\w+) D-only \(([^)]*)\)", head)
-            fmt, beleg = (m.group(1), m.group(2)) if m else ("", head)
+            fmt, evidence = (m.group(1), m.group(2)) if m else ("", head)
             cells = prod["F24"].setdefault("matrix", {}).setdefault("zellen", {}).setdefault("27B", {})
             for r in rows[1:]:
                 form = ("%s %s" % (fmt, _plain(r[0]))).strip()
@@ -439,8 +439,8 @@ def import_27b(d: dict, path: str) -> None:
                     if not c or c == "ungemessen":
                         continue
                     k = features.matrix_key(form, bs, depth, txt)
-                    cells[k] = {"status": "ungültig", "beleg": beleg, "quelle": QUELLE_27B} if c == "ungültig" else \
-                        {"status": "wert", "wert": c + " ms", "beleg": beleg, "quelle": QUELLE_27B}
+                    cells[k] = {"status": "ungültig", "evidence": evidence, "quelle": SOURCE_27B} if c == "ungültig" else \
+                        {"status": "value", "value": c + " ms", "evidence": evidence, "quelle": SOURCE_27B}
         elif hdr[:2] == ["f", "marker (quelle des werts)"]:
             fmts = rows[0][2:]
             for r in rows[1:]:
@@ -449,14 +449,14 @@ def import_27b(d: dict, path: str) -> None:
                 if pid in prod:
                     prod[pid].setdefault("marker", {})["27B"] = {
                         "marker": _plain(r[1]), "je_format": {f: _plain(v) for f, v in zip(fmts, r[2:])},
-                        "quelle": QUELLE_27B}
+                        "quelle": SOURCE_27B}
     m = re.search(r"Gemessene Runde \(gpu-ms\):([^\n]*)", text)
     if m and "F24" in prod:
         cells = prod["F24"].setdefault("matrix", {}).setdefault("zellen", {}).setdefault("27B", {})
         for bs, ms, n in re.findall(r"bs(\d) ([0-9,]+) \(n=(\d+)\)", m.group(1)):
             cells[features.matrix_key("INT8 uneven DCP D TP3", bs, "gemischt", "gemischt")] = {
-                "status": "wert", "wert": "%s ms (n=%s)" % (ms, n), "boot": "z30j",
-                "beleg": "z30j bar1 Agentenlast, Randwert Tiefe gemischt", "quelle": QUELLE_27B}
+                "status": "value", "value": "%s ms (n=%s)" % (ms, n), "boot": "z30j",
+                "evidence": "z30j bar1 Agentenlast, Randwert Tiefe gemischt", "quelle": SOURCE_27B}
 
 
 def _cell(x) -> str:
@@ -465,8 +465,8 @@ def _cell(x) -> str:
 
 def _aktuell(p: dict, m: str) -> str:
     a = (p.get("aktuell") or {}).get(m) or {}
-    if a.get("wert"):
-        txt = "%s [%s]" % (a["wert"], a.get("instrument", ""))
+    if a.get("value"):
+        txt = "%s [%s]" % (a["value"], a.get("instrument", ""))
     elif a.get("leer"):
         txt = a["leer"]
     elif a.get("kein_instrument"):
@@ -487,13 +487,13 @@ def markdown(view: dict) -> str:
     """The product table for humans (FEATURES-SOLL-IST-*.md), from the same view the dashboard shows."""
     boots = {m["model"]: m.get("boot") or {} for m in view.get("models") or []}
     out = ["# Features target/actual per model", "",
-           "Generated with `features_update.py md` from %s on %s UTC. Actual values only with evidence, otherwise “unbelegt”; 27B values from the 27B seat (features_27b_ist_0929.md, via `import-27b`). Building blocks = commits/fixes that carry the feature; *in image* / *active* is calculated by rigdash against the running or last boot per model. “Value in the current boot” is taken by rigdash from the boot (live.py/state.json), otherwise the missing marker is shown."
+           "Generated with `features_update.py md` from %s on %s UTC. Actual values only with evidence, otherwise “unverified”; 27B values from the 27B seat (features_27b_ist_0929.md, via `import-27b`). Building blocks = commits/fixes that carry the feature; *in image* / *active* is calculated by rigdash against the running or last boot per model. “Value in the current boot” is taken by rigdash from the boot (live.py/state.json), otherwise the missing marker is shown."
            % (view.get("path"), time.strftime("%Y-%m-%d %H:%M", time.gmtime())), ""]
     for m in features.MODELS:
         b = boots.get(m) or {}
         out.append("- %s boot: %s, REV %s, %s%s" % (m, b.get("rc") or b.get("boot_id") or "—", b.get("rev") or "—",
                                                   b.get("lifecycle") or "—",
-                                                  " (override: %s)" % b["override_beleg"] if b.get("override_beleg") else ""))
+                                                  " (override: %s)" % b["override_evidence"] if b.get("override_evidence") else ""))
     out += ["", "| # | Feature | Target | Actual 27B | Actual NF | Target reached? 27B / NF | Status 27B / NF | Evidence | Value in the current boot 27B / NF | Building blocks |",
             "|---|---|---|---|---|---|---|---|---|---|"]
     for p in view.get("produkt") or []:
@@ -501,7 +501,7 @@ def markdown(view: dict) -> str:
 
         def val(m):
             x = ist[m]
-            v = x.get("wert") or ("unbelegt" if x["status"] == "unbelegt" else "—")
+            v = x.get("value") or ("unverified" if x["status"] == "unverified" else "—")
             if x.get("veraltet"):
                 v += " — **Actual outdated, measure again** (belegt %s, older than the last boot)" % x.get("belegt_am")
             return _cell(v)
@@ -509,20 +509,20 @@ def markdown(view: dict) -> str:
         def st(m):
             x = ist[m]
             txt = x.get("status_text") if x.get("status_text") and x["status_text"] != x["status"] else ""
-            return _cell(x["status"] + (" (%s)" % (x.get("grund") or txt) if (x.get("grund") or txt) else ""))
-        beleg = "; ".join("%s: %s%s" % (m, ist[m]["beleg"], " (%s)" % ist[m]["belegt_am"] if ist[m].get("belegt_am") else "")
-                          for m in features.MODELS if ist[m].get("beleg"))
+            return _cell(x["status"] + (" (%s)" % (x.get("reason") or txt) if (x.get("reason") or txt) else ""))
+        evidence = "; ".join("%s: %s%s" % (m, ist[m]["evidence"], " (%s)" % ist[m]["belegt_am"] if ist[m].get("belegt_am") else "")
+                          for m in features.MODELS if ist[m].get("evidence"))
         bs = []
         for r in p["bausteine"]:
-            nf = (r["je_modell"] or {}).get("NF") or next(iter((r["je_modell"] or {}).values()), None)
+            nf = (r["per_model"] or {}).get("NF") or next(iter((r["per_model"] or {}).values()), None)
             bs.append("%s%s" % (r["id"], " [%s/%s]" % (nf["im_image"]["state"], nf["aktiv"]) if nf else ""))
         def er(m):
             x = ist[m]
-            return _cell((x.get("erreicht") or "—") + (" (%s)" % x["erreicht_grund"] if x.get("erreicht_grund") else ""))
+            return _cell((x.get("reached") or "—") + (" (%s)" % x["reached_reason"] if x.get("reached_reason") else ""))
         out.append("| %s | %s | %s | %s | %s | 27B: %s / NF: %s | 27B: %s / NF: %s | %s | 27B: %s / NF: %s | %s |" % (
-            p.get("nr") or "", _cell(p["titel"]), _cell(p["soll"]), val("27B"), val("NF"), er("27B"), er("NF"),
+            p.get("nr") or "", _cell(p["title"]), _cell(p["soll"]), val("27B"), val("NF"), er("27B"), er("NF"),
             st("27B"), st("NF"),
-            _cell(beleg) or "—", _cell(_aktuell(p, "27B")), _cell(_aktuell(p, "NF")), _cell(", ".join(bs)) or "—"))
+            _cell(evidence) or "—", _cell(_aktuell(p, "27B")), _cell(_aktuell(p, "NF")), _cell(", ".join(bs)) or "—"))
     mk = [(p, m, x) for p in view.get("produkt") or [] for m, x in (p.get("marker") or {}).items()]
     if mk:
         fmts = []
@@ -533,7 +533,7 @@ def markdown(view: dict) -> str:
                 "|---|---|---|" + "---|" * len(fmts) + "---|"]
         for p, m, x in mk:
             jf = x.get("je_format") or {}
-            out.append("| %s %s | %s | %s | %s | %s |" % (p["id"], _cell(p["titel"]), m, _cell(x.get("marker")),
+            out.append("| %s %s | %s | %s | %s | %s |" % (p["id"], _cell(p["title"]), m, _cell(x.get("marker")),
                                                          " | ".join(_cell(jf.get(f)) or "—" for f in fmts),
                                                          _cell(x.get("quelle"))))
     for p in view.get("produkt") or []:
@@ -552,11 +552,11 @@ def markdown(view: dict) -> str:
                             row.append("")
                             continue
                         c = cells.get(features.kreuz_key(a["key"], b["key"])) or {}
-                        row.append(_cell(c.get("status", "unbelegt") + (" — " + c["note"] if c.get("note") else "")))
+                        row.append(_cell(c.get("status", "unverified") + (" — " + c["note"] if c.get("note") else "")))
                     out.append("| %s | %s |" % (a["name"], " | ".join(row)))
         ut = p.get("untertabelle")
         if ut and ut.get("zeilen"):
-            out += ["", "## %s %s" % (p["id"], p["titel"]), "",
+            out += ["", "## %s %s" % (p["id"], p["title"]), "",
                     "| %s | Target | Actual 27B | Actual NF | in the current boot |" % (ut.get("spalte") or "Row"),
                     "|---|---|---|---|---|"]
             for z in ut["zeilen"]:
@@ -564,8 +564,8 @@ def markdown(view: dict) -> str:
                     x = (z.get("ist") or {}).get(m) or {}
                     if not x:
                         return "—"
-                    return _cell("%s%s%s" % (x.get("status", ""), (": " if x.get("status") else "") + x["wert"] if x.get("wert") else "",
-                                             (" [" + x["beleg"] + "]") if x.get("beleg") else "")) or "—"
+                    return _cell("%s%s%s" % (x.get("status", ""), (": " if x.get("status") else "") + x["value"] if x.get("value") else "",
+                                             (" [" + x["evidence"] + "]") if x.get("evidence") else "")) or "—"
                 akt = "; ".join("%s: %s" % (m, v) for m, v in (z.get("aktuell") or {}).items())
                 out.append("| %s | %s | %s | %s | %s |" % (_cell(z.get("name")), _cell(z.get("soll")) or "—",
                                                           zc("27B"), zc("NF"), _cell(akt) or "—"))
@@ -602,16 +602,16 @@ def matrix_markdown(p: dict, mx: dict) -> list:
                     "| Depth | Text | " + " | ".join("bs%s" % b for b in features.MATRIX_BS) + " | Evidence |",
                     "|---|---|" + "---|" * len(features.MATRIX_BS) + "---|"]
             for t, x in rows:
-                vals, belege = [], []
+                vals, evidence_items = [], []
                 for bs in features.MATRIX_BS:
                     c = cells.get(features.matrix_key(f, bs, t, x))
                     if not c:
                         vals.append("ungemessen")
                         continue
-                    vals.append("ungültig" if c.get("status") == "ungültig" else c.get("wert", "?"))
-                    if c.get("beleg") and c["beleg"] not in belege:
-                        belege.append(c["beleg"])
-                out.append("| %s | %s | %s | %s |" % (t, x, " | ".join(_cell(v) for v in vals), _cell("; ".join(belege))))
+                    vals.append("ungültig" if c.get("status") == "ungültig" else c.get("value", "?"))
+                    if c.get("evidence") and c["evidence"] not in evidence_items:
+                        evidence_items.append(c["evidence"])
+                out.append("| %s | %s | %s | %s |" % (t, x, " | ".join(_cell(v) for v in vals), _cell("; ".join(evidence_items))))
     return out
 
 

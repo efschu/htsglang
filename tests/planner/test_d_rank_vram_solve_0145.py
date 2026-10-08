@@ -1,7 +1,7 @@
 """#145: die D-Seite des Planners spuckt ihre VRAM-Zahlen aus.
 
 Nutzer-Order 22.09., woertlich: *"diese falschen sizing zahlen tauchen jetzt
-immer und immer wieder auf, werden dann endlos analysiert und verworfen und
+immer und immer wieder auf, werden dann endlos analysiert und rejected und
 halluziniert und neu berechnet. der planner muss sie ausspucken"*. #140/#141
 haben das fuer die P-Stufen getan; hier ist das Gegenstueck fuer die D-Raenge.
 
@@ -187,8 +187,8 @@ def test_measured_occupancy_matches_the_balance():
 def test_presplit_transient_is_measured_zero():
     """WIDERLEGUNG, mit Gegenbeleg, statt einer uebernommenen Vermutung.
 
-    Die Arbeitshypothese war: 'die Spitze, die der Experten-Presplit ueber den
-    Endstand hinaus braucht' sei der fehlende Term. Sie ist es nicht. Ueber
+    Die Arbeitshypothese war: 'die Peak, die der Experten-Presplit ueber den
+    Endstand hinaus requires' sei der fehlende Term. Sie ist es nicht. Ueber
     sechs Boots (w80/w81/w82/w83/w86/w89) ist das MAXIMUM von
     ``torch ... reserved`` ueber alle 48 ``[ct-stream-presplit] layer N``-
     Zeilen eines Rangs IDENTISCH mit dem ``[vram-census] ... after load``-Wert

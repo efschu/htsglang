@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared environment for the #332 + families follow-up proof run.
 source /root/rig-env.sh 2>/dev/null || true
-export WT=/spinning/wt-beleg-332fam
+export WT=/spinning/wt-evidence-332fam
 export OUT=/spinning/gpu-battery-results/2026-07-31_332_fam_beleg
 export PORT=30332
 export V4_MODEL="$MODEL_ROOT/Qwen3.6-27B-NVFP4"

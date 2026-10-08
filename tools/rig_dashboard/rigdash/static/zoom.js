@@ -1,10 +1,10 @@
 /* Zoom per Klicken und Ziehen (Nutzer 30.09. ~21:05Z: „im dashboard der verlauf muss mit der maus beim
-   klicken und ziehen zoombar sein … das zoomen bei den grafiken verläufen und den balken oben aktivieren“).
+   klicken und ziehen zoombar sein … das zoomen bei den grafiken verläufen und den bar oben aktivieren“).
 
    Ein Zoom für die ganze Seite: jede Zeitgrafik trägt ihren sichtbaren Zeitbereich als
    data-zoom-t0 / data-zoom-t1 (Unix-Sekunden, linke und rechte Kante der Zeichenfläche). Ziehen markiert
    einen Bereich, Loslassen zoomt ALLE Grafiken auf ihn (Phasenleiste, Kurven der Boot-Karte, Verlauf,
-   Karten-Verlauf). Die Grafiken laden die Daten des Bereichs in passender Auflösung neu (RigZoom.on).
+   Karten-Verlauf). Die Grafiken laden die Data des Bereichs in passender Auflösung neu (RigZoom.on).
 
    Zurück: Doppelklick auf eine Grafik, der Knopf „Zoom zurück“ in der Zoom-Leiste, Esc/Rücktaste auf einer
    fokussierten Grafik. Tastatur auf einer fokussierten Grafik: + / − hinein/heraus, ← / → verschieben,

@@ -1,5 +1,5 @@
 """fnFL2x8 (23.09.): der D->P-Wake gab der LETZTEN P-Stufe in Runde 1 einen
-Tag; ihr Chunk braucht ~2,7 GB auf einer 3080 mit 1383 MiB frei, die TP-Quelle
+Tag; ihr Chunk requires ~2,7 GB auf einer 3080 mit 1383 MiB frei, die TP-Quelle
 gibt dort ~0,6 GB je Tag frei -> Kredit-Warten gegen eine ungeleerte Lane ->
 W108 auf PP2, 90 s 'budget expired' auf PP0. Knappe Zielkarten warten hinter
 den geraeumigen (FLLIPER_PDFLIP_WAKE_DEFER_BELOW_MIB), knappste zuletzt."""

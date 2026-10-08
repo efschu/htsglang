@@ -3,14 +3,14 @@ the VERDICTS it hands to the editor.
 
 ``propose_oracle`` (AP0) runs the launcher's real ``main`` with ``--dry-run`` on a replayed inventory; ``propose`` (AP-C) derives the
 candidate argv.  THIS module asks the oracle about a launch (a release profile, a user profile or a proposal) and turns what the
-launcher did into a document ``flliper.verdikt/1``:
+launcher did into a document ``flliper.verdict/1``:
 
-* one verdict per THING the launcher said, in the one structure ``{code, ebene, forcebar, force_state, grund, konsequenz, ...}``:
+* one verdict per THING the launcher said, in the one structure ``{code, level, forcebar, force_state, reason, consequence, ...}``:
   every ``FORCED-PAST`` line (the value refusals Force would pass), the refusal or the CRASH that ended the dry run, the vector
   blockers of the HW gate (``PROFILE-VECTORS``, ``RECORDS-NVEC``, ``METAL-UNPROVEN`` ... named inside the ``HW-COUNT`` text), the fit
   bound of ``hw_fit`` (``FIT``) and every value that is borrowed (``HW-BORROWED``) or uncalibrated (``HW-UNCALIBRATED``);
 * ``forcebar`` comes from ``refusals.by_code`` (the register), ``force_state`` from the register's ``wired`` flags exactly as the
-  dashboard reads them (``force`` | ``blockiert`` | ``ungeprueft``) plus ``geht`` / ``hinweis`` for what is no refusal;
+  dashboard reads them (``force`` | ``is_blocked`` | ``ungeprueft``) plus ``geht`` / ``note`` for what is no refusal;
 * a CRASH of the dry run (an ``IndexError`` of ``overshoot_mib[i]`` on four cards, any exception that is not a launcher refusal) is a
   verdict ``ORAKEL-ABSTURZ`` with the place it happened -- never an exception of the oracle, never a 500 of the dashboard;
 * the document carries the PROFILE HASH (plan 4c: live profiles drift): the sha256 of the profile FILE when there is one and of the
@@ -18,8 +18,8 @@ launcher did into a document ``flliper.verdikt/1``:
   verdict can always be attributed to the profile state it was asked about.
 
 The SINGLE CARD form (AP-F, ``run_propose_single``) has no launcher (``topology.py`` MIN_CARDS=2) and so no oracle run: its document is the same
-shape (values, ``flliper.verdikt/1``, verdicts per value, ``launch``) but the verdict is a PLANER-RECHNUNG of ``propose_single`` plus the ServerArgs parse
-(``ausgang`` passt | passt_nicht | unbelegt, ``lauf`` None, ``laeufe`` 0, no Force), and every verdict of it says so.
+shape (values, ``flliper.verdict/1``, verdicts per value, ``launch``) but the verdict is a PLANER-RECHNUNG of ``propose_single`` plus the ServerArgs parse
+(``outcome`` passt | does_not_fit | unverified, ``run`` None, ``runs`` 0, no Force), and every verdict of it says so.
 
 Nothing in here judges a value or re-implements a solver (R1/Q-710): every number in a verdict is a number the launcher or ``hw_fit``
 printed.  A verdict the oracle cannot give (the harness itself failed) is ``ORAKEL-FEHLER`` and says so.  GPU-free, NVML-free, Docker-free.
@@ -35,52 +35,52 @@ import tempfile
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-SCHEMA = "flliper.verdikt/1"
+SCHEMA = "flliper.verdict/1"
 #: the document the worker returns for a proposal (proposal of AP-C + verdicts of this module)
 PROPOSE_SCHEMA = "flliper.propose-d/1"
 
 #: ``force_state`` values: the three of the dashboard's ``force_verdict`` + two for what is no refusal
-FORCE, BLOCKED, UNCHECKED, GOES, HINT = "force", "blockiert", "ungeprueft", "geht", "hinweis"
+FORCE, BLOCKED, UNCHECKED, GOES, HINT = "force", "is_blocked", "ungeprueft", "geht", "note"
 
 #: codes of THIS module that are not in ``refusals.REGISTER``: ``ebene`` says where they come from, ``parent`` the register code whose
 #: text names them (a blocker inside the ``HW-COUNT`` text is judged by its parent's class), ``titel`` / ``konsequenz`` are the fixed words
 OWN_CODES: Dict[str, Dict[str, Any]] = {
-    "FIT": {"ebene": "fit", "parent": None, "titel": "Fit according to hw_fit (necessary condition)",
-            "konsequenz": "hw_fit checks only the NECESSARY condition (weights + KV + Mamba slots + items against card minus residue); whether the start runs is told by the launcher run (the other verdicts)."},
-    "DUAL-PASSUNG": {"ebene": "fit", "parent": None, "titel": "Dual fit: planner calculation, not hw_fit",
-                     "konsequenz": "hw_fit does not calculate the dual (it prints 'Dual ... NOT modelled'); the planner calculates per card P budget + overhead + rest items of D + D weights (with draft) against the card. This is a NECESSARY condition from model sizes and records, not a measurement; whether the start runs is told by the launcher run (the other verdicts)."},
-    "DUAL-PFLICHT": {"ebene": "fit", "parent": None, "titel": "P KV obligation of the dual form per card (planner calculation)",
-                     "konsequenz": "P must carry the KV obligation (default 262144 tokens) as ONE prompt: cap, level of the P pool and the shared pool of each card. The pool per card is calibrated only for the cards and the model of the reference boot; otherwise it says 'not calculated'. There is no dual pool bar in the launcher according to the 27B seat (done/dual-schnitt-262k-1006.md section 5): this calculation is the only protection against it."},
-    "EINZEL-PASSUNG": {"ebene": "fit", "parent": None, "titel": "Single card: fit as a planner calculation (no launcher run)",
-                       "konsequenz": "The single card has no pdflip launcher (topology.py MIN_CARDS=2): the planner calculates weights + draft + KV obligation + Mamba pool + reserve against the static budget (fraction x free memory before loading). This is a NECESSARY condition from model sizes, not a measurement; there is no force at N=1."},
-    "EINZEL-PARSE": {"ebene": "fit", "parent": None, "titel": "Single card: ServerArgs parse (argparse only, without device)",
-                     "konsequenz": "The parse checks flag names, choice values and types of ServerArgs.add_cli_args; ServerArgs.__post_init__ (device detection, compatibility refusals) needs an accelerator and has NOT run."},
-    "FIT-STATIC": {"ebene": "fit", "parent": None, "titel": "Weights + draft + KV + Mamba against the static budget",
-                   "konsequenz": "The pool is larger than --mem-fraction-static x free memory before loading; the runtime would fail on memory while loading or building the pool."},
-    "FIT-RESERVE": {"ebene": "fit", "parent": None, "titel": "Reserve outside the static budget too small",
-                    "konsequenz": "Activations, CUDA graphs and fragmentation need more than (1 - fraction) of the free memory: a run can fail on the reserve."},
-    "FIT-CARD": {"ebene": "fit", "parent": None, "titel": "Static budget larger than the addressable ceiling of the card",
-                 "konsequenz": "On an APU or with a host pool, device and host share the memory; the budget is above the ceiling."},
-    "FIT-CTX": {"ebene": "fit", "parent": None, "titel": "Context larger than the KV pool",
-                "konsequenz": "A prompt of the context length does not fit into the KV pool."},
-    "MAMBA-FLOOR": {"ebene": "fit", "parent": None, "titel": "Mamba pool below the lower bound",
-                    "konsequenz": "Fewer slots than requests x slots per request (mamba_pool_floor.py): the server refuses or does not hold requests."},
-    "PROFILE-VECTORS": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Positional vectors of the profile not for this inventory",
-                        "konsequenz": "The profile carries vectors (one entry per card) with a length other than the card count; the launcher cannot derive them. With a proposal of the planner all vectors have exactly N entries."},
-    "RECORDS-NVEC": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Measured records are vectors of another inventory",
-                     "konsequenz": "The records of the profile (pdflip/profile_records_data) are vectors of one inventory and cannot be derived for this one; a calibration boot of these cards must write them. In the launcher this may later appear as a crash or a refusal (see ORAKEL-ABSTURZ)."},
-    "METAL-UNPROVEN": {"ebene": "blocker", "parent": "HW-COUNT", "titel": "Card count not proven on the hardware",
-                       "konsequenz": "There is no release boot with this card count; the planner calculation is an extrapolation, not a measurement."},
-    "HW-BORROWED": {"ebene": "wert", "parent": None, "titel": "Value borrowed from another card or another profile",
-                    "konsequenz": "No refusal code: the value is borrowed from a twin card of the architecture or another profile (unverified) and not measured on the hardware of these cards."},
-    "UNBELEGT": {"ebene": "wert", "parent": None, "titel": "Value is a planner calculation, not measured",
-                 "konsequenz": "No refusal code: the value is an extrapolation of the planner and not verified on the hardware of these cards."},
-    "PLANER": {"ebene": "planer", "parent": None, "titel": "The proposal of the planner cannot verify this form",
-               "konsequenz": "Stage A (propose) found no suitable split for these cards; the launcher run shows what it makes of it."},
-    "ORAKEL-ABSTURZ": {"ebene": "absturz", "parent": None, "titel": "The launcher dry run crashed",
-                       "konsequenz": "No verdict on the values, but an error of the launcher for this form (exception instead of refusal). Force changes nothing about it; the real start aborts at the same place."},
-    "ORAKEL-FEHLER": {"ebene": "orakel", "parent": None, "titel": "The oracle could not be asked",
-                      "konsequenz": "The dry run did not take place (harness, model path, child process): there is NO verdict, neither 'goes' nor 'refused'."},
+    "FIT": {"level": "fit", "parent": None, "title": "Fit according to hw_fit (necessary condition)",
+            "consequence": "hw_fit checks only the NECESSARY condition (weights + KV + Mamba slots + items against card minus residue); whether the start runs is told by the launcher run (the other verdicts)."},
+    "DUAL-PASSUNG": {"level": "fit", "parent": None, "title": "Dual fit: planner calculation, not hw_fit",
+                     "consequence": "hw_fit does not calculate the dual (it prints 'Dual ... NOT modelled'); the planner calculates per card P budget + overhead + rest items of D + D weights (with draft) against the card. This is a NECESSARY condition from model sizes and records, not a measurement; whether the start runs is told by the launcher run (the other verdicts)."},
+    "DUAL-PFLICHT": {"level": "fit", "parent": None, "title": "P KV obligation of the dual form per card (planner calculation)",
+                     "consequence": "P must carry the KV obligation (default 262144 tokens) as ONE prompt: cap, level of the P pool and the shared pool of each card. The pool per card is calibrated only for the cards and the model of the reference boot; otherwise it says 'not calculated'. There is no dual pool bar in the launcher according to the 27B seat (done/dual-cut-262k-1006.md section 5): this calculation is the only protection against it."},
+    "EINZEL-PASSUNG": {"level": "fit", "parent": None, "title": "Single card: fit as a planner calculation (no launcher run)",
+                       "consequence": "The single card has no pdflip launcher (topology.py MIN_CARDS=2): the planner calculates weights + draft + KV obligation + Mamba pool + reserve against the static budget (fraction x free memory before loading). This is a NECESSARY condition from model sizes, not a measurement; there is no force at N=1."},
+    "EINZEL-PARSE": {"level": "fit", "parent": None, "title": "Single card: ServerArgs parse (argparse only, without device)",
+                     "consequence": "The parse checks flag names, choice values and types of ServerArgs.add_cli_args; ServerArgs.__post_init__ (device detection, compatibility refusals) needs an accelerator and has NOT run."},
+    "FIT-STATIC": {"level": "fit", "parent": None, "title": "Weights + draft + KV + Mamba against the static budget",
+                   "consequence": "The pool is larger than --mem-fraction-static x free memory before loading; the runtime would fail on memory while loading or building the pool."},
+    "FIT-RESERVE": {"level": "fit", "parent": None, "title": "Reserve outside the static budget too small",
+                    "consequence": "Activations, CUDA graphs and fragmentation need more than (1 - fraction) of the free memory: a run can fail on the reserve."},
+    "FIT-CARD": {"level": "fit", "parent": None, "title": "Static budget larger than the addressable ceiling of the card",
+                 "consequence": "On an APU or with a host pool, device and host share the memory; the budget is above the ceiling."},
+    "FIT-CTX": {"level": "fit", "parent": None, "title": "Context larger than the KV pool",
+                "consequence": "A prompt of the context length does not fit into the KV pool."},
+    "MAMBA-FLOOR": {"level": "fit", "parent": None, "title": "Mamba pool below the lower bound",
+                    "consequence": "Fewer slots than requests x slots per request (mamba_pool_floor.py): the server refuses or does not hold requests."},
+    "PROFILE-VECTORS": {"level": "blocker", "parent": "HW-COUNT", "title": "Positional vectors of the profile not for this inventory",
+                        "consequence": "The profile carries vectors (one entry per card) with a length other than the card count; the launcher cannot derive them. With a proposal of the planner all vectors have exactly N entries."},
+    "RECORDS-NVEC": {"level": "blocker", "parent": "HW-COUNT", "title": "Measured records are vectors of another inventory",
+                     "consequence": "The records of the profile (pdflip/profile_records_data) are vectors of one inventory and cannot be derived for this one; a calibration boot of these cards must write them. In the launcher this may later appear as a crash or a refusal (see ORAKEL-ABSTURZ)."},
+    "METAL-UNPROVEN": {"level": "blocker", "parent": "HW-COUNT", "title": "Card count not proven on the hardware",
+                       "consequence": "There is no release boot with this card count; the planner calculation is an extrapolation, not a measurement."},
+    "HW-BORROWED": {"level": "value", "parent": None, "title": "Value borrowed from another card or another profile",
+                    "consequence": "No refusal code: the value is borrowed from a twin card of the architecture or another profile (unverified) and not measured on the hardware of these cards."},
+    "UNVERIFIED": {"level": "value", "parent": None, "title": "Value is a planner calculation, not measured",
+                 "consequence": "No refusal code: the value is an extrapolation of the planner and not verified on the hardware of these cards."},
+    "PLANER": {"level": "planer", "parent": None, "title": "The proposal of the planner cannot verify this form",
+               "consequence": "Stage A (propose) found no suitable split for these cards; the launcher run shows what it makes of it."},
+    "ORAKEL-ABSTURZ": {"level": "crash", "parent": None, "title": "The launcher dry run crashed",
+                       "consequence": "No verdict on the values, but an error of the launcher for this form (exception instead of refusal). Force changes nothing about it; the real start aborts at the same place."},
+    "ORAKEL-FEHLER": {"level": "oracle", "parent": None, "title": "The oracle could not be asked",
+                      "consequence": "The dry run did not take place (harness, model path, child process): there is NO verdict, neither 'goes' nor 'refused'."},
 }
 
 #: launcher codes WITHOUT a row in ``refusals.REGISTER`` (R1: the launcher and the register are not changed from here).  Without this table the
@@ -90,45 +90,45 @@ OWN_CODES: Dict[str, Dict[str, Any]] = {
 #: own wording with the place it is printed (file:line of THIS tree, pinned by a test against the source text).
 SUPPLEMENT_CODES: Dict[str, Dict[str, Any]] = {
     "W71": {"code": "W71-CENSUS", "klass": "nicht_forcebar", "forcebar": False,
-            "titel": "W71 UUID-bound exchange census: residency calculation not verified",
+            "title": "W71 UUID-bound exchange census: residency calculation not verified",
             "quelle": "pdflip/xchg_residency.py:711-723 (refusal_head), :313-387 (load_census)",
-            "klasse_grund": "The launcher refuses W71 as PdFlipXchgResidencyUnarmable without a force path: the calculation needs a measured census of these cards (per UUID), and without it there is no value with which a forced start could run.",
-            "grund": "W71 PdFlipXchgResidencyUnarmable: the exchange's predicted VRAM residency does not fit (or the census file is missing/unreadable); "
+            "class_reason": "The launcher refuses W71 as PdFlipXchgResidencyUnarmable without a force path: the calculation needs a measured census of these cards (per UUID), and without it there is no value with which a forced start could run.",
+            "reason": "W71 PdFlipXchgResidencyUnarmable: the exchange's predicted VRAM residency does not fit (or the census file is missing/unreadable); "
                      "there is no fallback that makes an over-committed card fit: the boot REFUSES by name and exits 2, BEFORE either group starts. "
                      "Run --pdflip-weight-source ring, or re-cut the schedule. [Launcher-Text xchg_residency.py:714-723]",
-            "konsequenz": "Remains even with force. The census is measured per UUID and bound to the cards; foreign cards have none. Way out according to the launcher: --pdflip-weight-source ring or re-cut the schedule."},
+            "consequence": "Remains even with force. The census is measured per UUID and bound to the cards; foreign cards have none. Way out according to the launcher: --pdflip-weight-source ring or re-cut the schedule."},
     "W64": {"code": "W64-OPPOINT", "klass": "nicht_forcebar", "forcebar": False,
-            "titel": "W64 operating point: the model yields no positive KV pool",
+            "title": "W64 operating point: the model yields no positive KV pool",
             "quelle": "launcher.py:16986-16993 (PdFlipTpOperatingPointInfeasible), :17349-17352 (fatal for the shipped position, even without dual_layout)",
-            "klasse_grund": "The launcher refuses W64 as a verdict of the model (PerfCostModel.predict_capacity feasible=False) without a safety factor and without a force path: there is no value with which a forced start could run.",
-            "grund": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
+            "class_reason": "The launcher refuses W64 as a verdict of the model (PerfCostModel.predict_capacity feasible=False) without a safety factor and without a force path: there is no value with which a forced start could run.",
+            "reason": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
                      "plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank. Refused. This is the model's own verdict, "
                      "not a margin chosen here. [Launcher-Text launcher.py:16986-16993]",
-            "konsequenz": "Remains even with force. The verdict is that of the model; the only help is to change budgets, weight split or card count.",
+            "consequence": "Remains even with force. The verdict is that of the model; the only help is to change budgets, weight split or card count.",
             # nur wenn die Meldung 'W64-DUAL:' traegt (der Launcher haengt es nur bei dual_layout an, launcher.py:17231/17242): Dual-Wortlaut
-            "dual": {"titel": "W64 dual D: operating point not verified without a measured dual D log",
+            "dual": {"title": "W64 dual D: operating point not verified without a measured dual D log",
                      "quelle": "launcher.py:16986-16993 (PdFlipTpOperatingPointInfeasible), :17242-17243 (no measured dual D log)",
-                     "klasse_grund": "The launcher refuses W64 as a verdict of the model (PerfCostModel.predict_capacity feasible=False) without a safety factor; in the dual only a measured dual D log of the weights lifts the refusal (dual_w64.find_dual_d_measurement), not force.",
-                     "grund": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
+                     "class_reason": "The launcher refuses W64 as a verdict of the model (PerfCostModel.predict_capacity feasible=False) without a safety factor; in the dual only a measured dual D log of the weights lifts the refusal (dual_w64.find_dual_d_measurement), not force.",
+                     "reason": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
                               "plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank. Refused. This is the model's own verdict, "
                               "not a margin chosen here. W64-DUAL: no measured dual-share D log of the model with these weights; the model verdict stands. "
                               "[Launcher-Text launcher.py:16986-16993, :17242-17243]",
-                     "konsequenz": "Remains even with force. It is lifted only by a measured dual D log of these weights (evidence directory); without a measurement the verdict of the model stands."},
+                     "consequence": "Remains even with force. It is lifted only by a measured dual D log of these weights (evidence directory); without a measurement the verdict of the model stands."},
             # 'W64-DUAL: the refusal names no weight vector' (launcher.py:17235): die Meldung nennt keinen Gewichtsvektor, es gab also keine Suche
-            "dual_ohne_gewichte": {"titel": "W64 dual: operating point not verified (message without weight vector, no dual D log searched)",
+            "dual_without_weights": {"title": "W64 dual: operating point not verified (message without weight vector, no dual D log searched)",
                      "quelle": "launcher.py:16986-16993 (PdFlipTpOperatingPointInfeasible), :17235 (the refusal names no weight vector)",
-                     "klasse_grund": "The launcher refuses W64 as a verdict of the model without a safety factor; in the dual it could not search for the dual D log because the message names no weight vector (dual_w64.find_dual_d_measurement needs it).",
-                     "grund": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
+                     "class_reason": "The launcher refuses W64 as a verdict of the model without a safety factor; in the dual it could not search for the dual D log because the message names no weight vector (dual_w64.find_dual_d_measurement needs it).",
+                     "reason": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
                               "W64-DUAL: the refusal names no weight vector; the model verdict stands. [Launcher-Text launcher.py:16986-16993, :17235]",
-                     "konsequenz": "Remains even with force. No dual D log was searched (no weight vector in the message); the verdict of the model stands."},
+                     "consequence": "Remains even with force. No dual D log was searched (no weight vector in the message); the verdict of the model stands."},
             # 'W64-DUAL MEASURED (...) -> INFEASIBLE' (dual_w64.py:117, angehaengt launcher.py:17343-17347): ein Dual-D-Log WURDE gefunden und urteilt selbst
-            "dual_gemessen": {"titel": "W64 dual D: measured dual D log confirms: no sufficient KV pool",
+            "dual_measured": {"title": "W64 dual D: measured dual D log confirms: no sufficient KV pool",
                      "quelle": "launcher.py:16986-16993 (PdFlipTpOperatingPointInfeasible), :17343-17347 (measurement appended), dual_w64.py:117 (judge)",
-                     "klasse_grund": "The launcher refuses W64 as a verdict of the model; in the dual a measured dual D log of these weights was found (dual_w64.find_dual_d_measurement) and judges INFEASIBLE on the own items of the run. Force does not change the measurement.",
-                     "grund": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
+                     "class_reason": "The launcher refuses W64 as a verdict of the model; in the dual a measured dual D log of these weights was found (dual_w64.find_dual_d_measurement) and judges INFEASIBLE on the own items of the run. Force does not change the measurement.",
+                     "reason": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
                               "W64-DUAL MEASURED (...) -> INFEASIBLE: a measured dual-share D log of these weights also leaves less than the minimum tokens on at least "
                               "one rank. [Launcher-Text launcher.py:16986-16993, dual_w64.py:117]",
-                     "konsequenz": "Remains even with force. The measurement of these weights confirms the verdict; the only help is to change budgets, weight split or card count."}},
+                     "consequence": "Remains even with force. The measurement of these weights confirms the verdict; the only help is to change budgets, weight split or card count."}},
 }
 
 def _supp_view(supp: Mapping[str, Any], text: Any) -> Dict[str, Any]:
@@ -136,10 +136,10 @@ def _supp_view(supp: Mapping[str, Any], text: Any) -> Dict[str, Any]:
     marker (form-neutral base); ``W64-DUAL MEASURED (...) -> INFEASIBLE`` (a measured log was found, dual_w64.py:117, launcher.py:17343-17347);
     ``W64-DUAL: the refusal names no weight vector`` (no search happened, :17235); ``W64-DUAL: no measured dual-share D log`` (searched, none, :17242)."""
     t = str(text or "")
-    if "W64-DUAL MEASURED" in t and supp.get("dual_gemessen"):
-        return {**supp, **supp["dual_gemessen"]}
-    if "W64-DUAL: the refusal names no weight vector" in t and supp.get("dual_ohne_gewichte"):
-        return {**supp, **supp["dual_ohne_gewichte"]}
+    if "W64-DUAL MEASURED" in t and supp.get("dual_measured"):
+        return {**supp, **supp["dual_measured"]}
+    if "W64-DUAL: the refusal names no weight vector" in t and supp.get("dual_without_weights"):
+        return {**supp, **supp["dual_without_weights"]}
     if "W64-DUAL:" in t and supp.get("dual"):
         return {**supp, **supp["dual"]}
     return supp
@@ -187,12 +187,12 @@ def launch_hash(argv: Sequence[str], env: Mapping[str, Any]) -> str:
 
 
 def profile_identity(li: Any) -> Dict[str, Any]:
-    """The profile state the oracle was asked about: ``quelle`` (file name), ``datei_sha256`` (the profile FILE, None when the launch
-    input is not from a file), ``eingabe_sha256`` (argv + env + variables of the launch input the oracle really got), model and draft."""
+    """The profile state the oracle was asked about: ``quelle`` (file name), ``file_sha256`` (the profile FILE, None when the launch
+    input is not from a file), ``input_sha256`` (argv + env + variables of the launch input the oracle really got), model and draft."""
     src = str(getattr(li, "source", "") or "")
     vars_ = dict(getattr(li, "vars", {}) or {})
-    return {"quelle": os.path.basename(src) if src else "", "datei_sha256": file_sha256(src) if src and os.path.isfile(src) else None,
-            "eingabe_sha256": _sha(canonical({"argv": list(li.argv), "env": dict(li.env), "vars": vars_}).encode()),
+    return {"quelle": os.path.basename(src) if src else "", "file_sha256": file_sha256(src) if src and os.path.isfile(src) else None,
+            "input_sha256": _sha(canonical({"argv": list(li.argv), "env": dict(li.env), "vars": vars_}).encode()),
             "model": str(vars_.get("PROFILE_MODEL", "")), "draft": str(vars_.get("PROFILE_DRAFT", "")),
             "name": str(vars_.get("PROFILE_NAME", "")), "status": str(vars_.get("PROFILE_STATUS", ""))}
 
@@ -250,22 +250,22 @@ def _clip(text: Any, n: int = 700) -> str:
     return t if len(t) <= n else t[: n - 1].rstrip(" ,;:") + "…"
 
 
-def budget_verdict(code: str, *, ebene: str = "lauf", text: str = "", grund: Optional[str] = None, werte: Sequence[str] = (),
+def budget_verdict(code: str, *, level: str = "run", text: str = "", reason: Optional[str] = None, values: Sequence[str] = (),
             parent: Optional[str] = None, force_state: Optional[str] = None, extra: Optional[Mapping[str, Any]] = None,
-            konsequenz: Optional[str] = None) -> Dict[str, Any]:
-    """ONE verdict ``{code, ebene, forcebar, force_state, grund, konsequenz, text, ...}``.
+            consequence: Optional[str] = None) -> Dict[str, Any]:
+    """ONE verdict ``{code, level, forcebar, force_state, reason, consequence, text, ...}``.
 
-    A register code takes ``forcebar`` / ``konsequenz`` / ``klasse_grund`` from ``refusals.by_code``; a sub-blocker (``parent``) takes the
+    A register code takes ``forcebar`` / ``consequence`` / ``class_reason`` from ``refusals.by_code``; a sub-blocker (``parent``) takes the
     class of its parent and its OWN words; a code that is no refusal (``FIT``, ``HW-BORROWED`` ...) has ``forcebar: None``.  ``force_state``
-    is derived from the register unless the caller gives it (``geht`` / ``hinweis`` for what is no refusal, or a run-specific state)."""
+    is derived from the register unless the caller gives it (``geht`` / ``note`` for what is no refusal, or a run-specific state)."""
     reg = register_rows()
     supp = next((x for x in SUPPLEMENT_CODES.values() if x["code"] == code), None)
     if supp is not None and code not in reg:
-        supp = _supp_view(supp, grund if grund is not None else text)
-        out = {"code": code, "ebene": ebene, "titel": supp["titel"], "forcebar": False, "force_state": BLOCKED, "force_via": None,
-               "klasse": supp["klass"], "klasse_grund": supp["klasse_grund"], "wired_at": None, "force_scope": None,
-               "konsequenz": konsequenz if konsequenz is not None else supp["konsequenz"],
-               "grund": _clip(grund if grund is not None else text) or _clip(supp["grund"]), "text": str(text or ""), "werte": list(werte),
+        supp = _supp_view(supp, reason if reason is not None else text)
+        out = {"code": code, "level": level, "title": supp["title"], "forcebar": False, "force_state": BLOCKED, "force_via": None,
+               "class": supp["klass"], "class_reason": supp["class_reason"], "wired_at": None, "force_scope": None,
+               "consequence": consequence if consequence is not None else supp["consequence"],
+               "reason": _clip(reason if reason is not None else text) or _clip(supp["reason"]), "text": str(text or ""), "values": list(values),
                "quelle": supp["quelle"], "ergaenzung": True}
         if force_state is not None:
             out["force_state"] = force_state
@@ -275,23 +275,23 @@ def budget_verdict(code: str, *, ebene: str = "lauf", text: str = "", grund: Opt
     own = OWN_CODES.get(code) or {}
     parent = parent or own.get("parent")
     row = reg.get(code) or (reg.get(parent) if parent else None)
-    out: Dict[str, Any] = {"code": code, "ebene": own.get("ebene", ebene), "titel": own.get("titel") or (reg.get(code) or {}).get("title") or code}
+    out: Dict[str, Any] = {"code": code, "level": own.get("level", level), "title": own.get("title") or (reg.get(code) or {}).get("title") or code}
     if row is not None:
         state, via = force_state_of(row)
         out.update({"forcebar": bool(row.get("forcebar")), "force_state": state, "force_via": via,
-                    "klasse": row.get("klass"), "klasse_grund": row.get("why_class"), "wired_at": row.get("wired_at"),
+                    "class": row.get("klass"), "class_reason": row.get("why_class"), "wired_at": row.get("wired_at"),
                     "force_scope": row.get("force_scope")})
-        kons = own.get("konsequenz") or row.get("consequence") or ""
+        kons = own.get("consequence") or row.get("consequence") or ""
     else:
-        out.update({"forcebar": None, "force_state": HINT, "force_via": None, "klasse": None, "klasse_grund": None, "wired_at": None,
+        out.update({"forcebar": None, "force_state": HINT, "force_via": None, "class": None, "class_reason": None, "wired_at": None,
                     "force_scope": None})
-        kons = own.get("konsequenz") or ""
+        kons = own.get("consequence") or ""
     if force_state is not None:
         out["force_state"] = force_state
-    out["konsequenz"] = konsequenz if konsequenz is not None else kons
-    out["grund"] = _clip(grund if grund is not None else text)
+    out["consequence"] = consequence if consequence is not None else kons
+    out["reason"] = _clip(reason if reason is not None else text)
     out["text"] = str(text or "")
-    out["werte"] = list(werte)
+    out["values"] = list(values)
     if parent:
         out["parent"] = parent
     if extra:
@@ -316,7 +316,7 @@ def _is_refusal_class(exc_type: str, exc_mro: Optional[Sequence[str]]) -> bool:
 def classify_exception(exc_type: Optional[str], exc_msg: str, exc_mro: Optional[Sequence[str]] = None) -> Dict[str, Optional[str]]:
     """The register code and the launcher W-code of the exception that ended a dry run.
 
-    ``kind``: ``ablehnung`` (a launcher refusal: ``PdFlipLaunchRefused`` and subclasses), ``optionen`` (argparse / ``SystemExit``), ``absturz``
+    ``kind``: ``refusal`` (a launcher refusal: ``PdFlipLaunchRefused`` and subclasses), ``optionen`` (argparse / ``SystemExit``), ``crash``
     (anything that is not a refusal: ``IndexError``, ``KeyError``, ``FileNotFoundError``, ... -- a defect of the launcher for this form, not a
     judgement of values).  The W-code is read at the START of the message (``W10 PdFlipDrafterIdentityMismatch: ...``); only a refusal may
     carry it further inside, and then only as a whole token (``Qwen3.8-27B-DFlash2-W8-lued`` is a path, not the code W8)."""
@@ -329,19 +329,19 @@ def classify_exception(exc_type: Optional[str], exc_msg: str, exc_mro: Optional[
         mw = _W_START_RX.match(msg)
         return {"kind": "optionen", "code": "OPTIONEN", "launcher_code": "W" + mw.group(1) if mw else None}
     if not _is_refusal_class(exc_type, exc_mro):
-        return {"kind": "absturz", "code": "ORAKEL-ABSTURZ", "launcher_code": None}
+        return {"kind": "crash", "code": "ORAKEL-ABSTURZ", "launcher_code": None}
     mw = _W_START_RX.match(msg) or _W_TOKEN_RX.search(msg)
     wcode = "W" + mw.group(1) if mw else None
     hw = refusals.classify(msg)
     if hw:
-        return {"kind": "ablehnung", "code": hw, "launcher_code": wcode}
+        return {"kind": "refusal", "code": hw, "launcher_code": wcode}
     if exc_type in _CLASS_CODE:
-        return {"kind": "ablehnung", "code": _CLASS_CODE[exc_type], "launcher_code": wcode}
+        return {"kind": "refusal", "code": _CLASS_CODE[exc_type], "launcher_code": wcode}
     if wcode in _W_CODE:
-        return {"kind": "ablehnung", "code": _W_CODE[wcode], "launcher_code": wcode}
+        return {"kind": "refusal", "code": _W_CODE[wcode], "launcher_code": wcode}
     if wcode in SUPPLEMENT_CODES:
-        return {"kind": "ablehnung", "code": SUPPLEMENT_CODES[wcode]["code"], "launcher_code": wcode}
-    return {"kind": "ablehnung", "code": "LAUNCHER-UNKLASSIFIZIERT", "launcher_code": wcode}
+        return {"kind": "refusal", "code": SUPPLEMENT_CODES[wcode]["code"], "launcher_code": wcode}
+    return {"kind": "refusal", "code": "LAUNCHER-UNKLASSIFIZIERT", "launcher_code": wcode}
 
 
 def blockers_of(text: str) -> List[Dict[str, str]]:
@@ -402,38 +402,38 @@ def plan_summary(res: Any) -> Dict[str, Any]:
             "zeilen": len(p["lines"])}
 
 
-def build_verdikt(n: int, first: Any, second: Any = None, *, lens: Optional[Mapping[str, int]] = None,
-                  vorschlag: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+def build_verdict(n: int, first: Any, second: Any = None, *, lens: Optional[Mapping[str, int]] = None,
+                  proposal: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """The verdict document of one oracle question.
 
     ``first`` = the dry run WITHOUT force (what the launcher says as it is), ``second`` = the dry run WITH ``--force`` (every value
     refusal Force would pass, listed, and what still stops the start) or None when the first run needed none.  ``lens`` = the vector
-    lengths of the launch (``propose.vector_lengths``), ``vorschlag`` = the AP-C proposal when the question was one."""
+    lengths of the launch (``propose.vector_lengths``), ``proposal`` = the AP-C proposal when the question was one."""
     final = second if second is not None else first
     fin = _run_summary(final)
     v_list: List[Dict[str, Any]] = []
     # (1) every refusal Force passed: the value refusals, in the order the launcher raised them
     for f in final.forced:
         code = str(f["code"])
-        v_list.append(budget_verdict(code, ebene="lauf", text=f.get("text", ""), grund=f.get("text", ""), force_state=FORCE if (register_rows().get(code) or {}).get("forcebar") else None,
+        v_list.append(budget_verdict(code, level="run", text=f.get("text", ""), reason=f.get("text", ""), force_state=FORCE if (register_rows().get(code) or {}).get("forcebar") else None,
                               extra={"durchgelassen": True}))
         if code == "HW-COUNT":
             for b in blockers_of(f.get("text", "")):
                 keys = vector_keys_of(b["what"]) if b["code"] == "PROFILE-VECTORS" else []
-                v_list.append(budget_verdict(b["code"], ebene="blocker", text=b["what"], grund=b["what"], werte=keys, parent="HW-COUNT",
-                                      force_state=FORCE, konsequenz=(None if b["code"] in OWN_CODES else b["what"]),
+                v_list.append(budget_verdict(b["code"], level="blocker", text=b["what"], reason=b["what"], values=keys, parent="HW-COUNT",
+                                      force_state=FORCE, consequence=(None if b["code"] in OWN_CODES else b["what"]),
                                       extra={"wo": b["where"], "blocker": b["code"], "durchgelassen": True}))
     # (2) what ended the run
     if fin["kind"] is not None:
         code = fin["code"]
         extra = {"launcher_code": fin["launcher_code"], "exc_type": fin["exc_type"], "durchgelassen": False}
-        if fin["kind"] == "absturz":
+        if fin["kind"] == "crash":
             extra["wo"] = fin["exc_where"]
             blk = [b for f in final.forced for b in blockers_of(f.get("text", ""))]
             if any(b["code"] == "RECORDS-NVEC" for b in blk):
                 extra["hangt_an"] = "RECORDS-NVEC"
             txt = "%s: %s%s" % (fin["exc_type"], fin["exc_msg"], (" (" + fin["exc_where"] + ")") if fin["exc_where"] else "")
-            v_list.append(budget_verdict("ORAKEL-ABSTURZ", ebene="absturz", text=txt, grund=txt, force_state=BLOCKED, extra=extra))
+            v_list.append(budget_verdict("ORAKEL-ABSTURZ", level="crash", text=txt, reason=txt, force_state=BLOCKED, extra=extra))
         else:
             row = register_rows().get(code)
             state = force_state_of(row)[0] if row else BLOCKED
@@ -442,59 +442,59 @@ def build_verdikt(n: int, first: Any, second: Any = None, *, lens: Optional[Mapp
             nennt = _NAMED_RX.search(fin["exc_msg"])
             if nennt and nennt.group(1) != code:
                 extra["nennt"] = nennt.group(1)           # ``W19 dormant-residue reserve (HW-UNCALIBRATED): ...``: the launcher names the register code it belongs to
-            v_list.append(budget_verdict(code, ebene="lauf", text=fin["exc_msg"], grund=fin["exc_msg"], force_state=state if row else BLOCKED,
+            v_list.append(budget_verdict(code, level="run", text=fin["exc_msg"], reason=fin["exc_msg"], force_state=state if row else BLOCKED,
                                   extra=extra))
     elif fin["rc"] not in (0, None):
-        v_list.append(budget_verdict("LAUNCHER-UNKLASSIFIZIERT", ebene="lauf", text="Return value %r without an exception" % (fin["rc"],),
+        v_list.append(budget_verdict("LAUNCHER-UNKLASSIFIZIERT", level="run", text="Return value %r without an exception" % (fin["rc"],),
                               force_state=BLOCKED, extra={"durchgelassen": False}))
     # (3) the vectors of the launch: the launcher DERIVES a vector for a live subset of the cards where every card has a measured twin (the
     # HW gate lists ``PROFILE-VECTORS`` only for the vectors it cannot derive), so a vector that is not N entries long is DATA here (``vektoren``),
     # never a verdict of its own; a PROPOSAL that carries one is a defect of the planner's own result and is said so (below)
     n_bad = {k: int(c) for k, c in (lens or {}).items() if int(c) != int(n)}
     # (4) the proposal's own verdicts: fit bound, blockers of stage A, borrowed values
-    if vorschlag:
-        fit = vorschlag.get("fit") or {}
+    if proposal:
+        fit = proposal.get("fit") or {}
         lvl = str(fit.get("level") or "")
         if lvl:
-            st = {"ja": GOES, "knapp": HINT, "nein": BLOCKED}.get(lvl, HINT)
-            if vorschlag.get("form") == "dual":
+            st = {"ja": GOES, "tight": HINT, "nein": BLOCKED}.get(lvl, HINT)
+            if proposal.get("form") == "dual":
                 st = HINT          # hw_fit does not model the Dual: its Flip bound neither clears nor blocks it (DUAL-PASSUNG below does)
-            txt = "hw_fit%s: %s%s%s" % (" (flip bound, dual not modelled)" if vorschlag.get("form") == "dual" else "", {"ja": "yes", "knapp": "tight", "nein": "no"}.get(lvl, lvl), (" (rest %s MiB)" % fit["margin_mib"]) if fit.get("margin_mib") is not None else "",
+            txt = "hw_fit%s: %s%s%s" % (" (flip bound, dual not modelled)" if proposal.get("form") == "dual" else "", {"ja": "yes", "tight": "tight", "nein": "no"}.get(lvl, lvl), (" (rest %s MiB)" % fit["margin_mib"]) if fit.get("margin_mib") is not None else "",
                                       ("; " + str(fit["first"])) if fit.get("first") else "")
-            v_list.append(budget_verdict("FIT", ebene="fit", text=txt, grund=txt, force_state=st, extra={"stufe": lvl, "rest_mib": fit.get("margin_mib"),
+            v_list.append(budget_verdict("FIT", level="fit", text=txt, reason=txt, force_state=st, extra={"stage": lvl, "rest_mib": fit.get("margin_mib"),
                                                                                               "zeilen": list(fit.get("lines") or [])[:12]}))
         for m in fit.get("marks") or []:
             if str(m).startswith("HW-BORROWED") or "HW-BORROWED" in str(m):
-                v_list.append(budget_verdict("HW-BORROWED", ebene="fit", text=str(m), grund=str(m), force_state=HINT, extra={"quelle": "hw_fit"}))
+                v_list.append(budget_verdict("HW-BORROWED", level="fit", text=str(m), reason=str(m), force_state=HINT, extra={"quelle": "hw_fit"}))
         # the Dual form: its own coupling (``propose_dual``), labelled as a Planer-Rechnung and never as hw_fit
-        for dv in (vorschlag.get("dual") or {}).get("verdikte") or []:
-            stufe = str(dv.get("stufe") or "")
-            v_list.append(budget_verdict(str(dv["code"]), ebene="fit", text=str(dv.get("text", "")), grund=str(dv.get("text", "")),
-                                  force_state={"ja": GOES, "nein": BLOCKED if dv["code"] == "DUAL-PASSUNG" else HINT}.get(stufe, HINT),
-                                  extra={"stufe": stufe, "etikett": dv.get("etikett"), "rest_mib": dv.get("rest_mib")}))
-        for b in vorschlag.get("blocker") or []:
-            v_list.append(budget_verdict("PLANER", ebene="planer", text=str(b), grund=str(b), force_state=BLOCKED))
-        wrong = {k: int(c) for k, c in (vorschlag.get("vektoren_falsch") or {}).items()}
+        for dv in (proposal.get("dual") or {}).get("verdikte") or []:
+            stage = str(dv.get("stage") or "")
+            v_list.append(budget_verdict(str(dv["code"]), level="fit", text=str(dv.get("text", "")), reason=str(dv.get("text", "")),
+                                  force_state={"ja": GOES, "nein": BLOCKED if dv["code"] == "DUAL-PASSUNG" else HINT}.get(stage, HINT),
+                                  extra={"stage": stage, "etikett": dv.get("etikett"), "rest_mib": dv.get("rest_mib")}))
+        for b in proposal.get("blocker") or []:
+            v_list.append(budget_verdict("PLANER", level="planer", text=str(b), reason=str(b), force_state=BLOCKED))
+        wrong = {k: int(c) for k, c in (proposal.get("vectors_wrong") or {}).items()}
         if wrong and not any(v["code"] == "PROFILE-VECTORS" for v in v_list):
             txt = "The proposal carries vectors with a length other than the card count %d: %s" % (n, ", ".join("%s (%d)" % kv for kv in sorted(wrong.items())))
-            v_list.append(budget_verdict("PROFILE-VECTORS", ebene="blocker", text=txt, grund=txt, werte=sorted(wrong), parent="HW-COUNT",
+            v_list.append(budget_verdict("PROFILE-VECTORS", level="blocker", text=txt, reason=txt, values=sorted(wrong), parent="HW-COUNT",
                                   extra={"durchgelassen": False, "wo": "propose.vector_lengths (proposal)"}))
-    doc = {"schema": SCHEMA, "n": int(n), "verdikte": v_list, "lauf": fin,
-           "vektoren": {"laengen": {k: int(c) for k, c in (lens or {}).items()}, "nicht_n": n_bad},
+    doc = {"schema": SCHEMA, "n": int(n), "verdikte": v_list, "run": fin,
+           "vectors": {"laengen": {k: int(c) for k, c in (lens or {}).items()}, "nicht_n": n_bad},
            "ohne_force": _run_summary(first), "mit_force": _run_summary(second) if second is not None else None,
            "forced": [dict(f) for f in final.forced], "plan": plan_summary(final)}
-    refus = [v for v in v_list if v["ebene"] in ("lauf", "absturz") or (v.get("parent") == "HW-COUNT" and v.get("durchgelassen"))]
+    refus = [v for v in v_list if v["level"] in ("run", "crash") or (v.get("parent") == "HW-COUNT" and v.get("durchgelassen"))]
     clean_first = first.exc_type is None and first.rc in (0, None) and not first.forced
     if clean_first:
-        doc["ausgang"] = "geht"
-    elif fin["kind"] == "absturz":
-        doc["ausgang"] = "absturz"
+        doc["outcome"] = "geht"
+    elif fin["kind"] == "crash":
+        doc["outcome"] = "crash"
     elif fin["kind"] is not None or fin["rc"] not in (0, None):
-        doc["ausgang"] = "verweigert"
+        doc["outcome"] = "verweigert"
     else:
-        doc["ausgang"] = "geht_mit_force"
-    doc["geht"] = doc["ausgang"] == "geht"
-    doc["geht_mit_force"] = doc["ausgang"] in ("geht", "geht_mit_force")
+        doc["outcome"] = "ok_with_force"
+    doc["geht"] = doc["outcome"] == "geht"
+    doc["ok_with_force"] = doc["outcome"] in ("geht", "ok_with_force")
     doc["zaehlung"] = {s: sum(1 for v in refus if v["force_state"] == s) for s in (FORCE, BLOCKED, UNCHECKED)}
     return doc
 
@@ -504,46 +504,46 @@ def _tail(key: str) -> str:
     return str(key).split()[-1].rstrip("=") if str(key).split() else str(key)
 
 
-def slim_verdikt(v: Mapping[str, Any], grund: Optional[str] = None) -> Dict[str, Any]:
-    """A verdict as it hangs on ONE value: without the (long) ``text`` and ``werte`` fields."""
-    d = {k: v.get(k) for k in ("code", "ebene", "forcebar", "force_state", "konsequenz", "titel")}
-    d["grund"] = _clip(grund if grund is not None else v.get("grund"), 400)
+def slim_verdict(v: Mapping[str, Any], reason: Optional[str] = None) -> Dict[str, Any]:
+    """A verdict as it hangs on ONE value: without the (long) ``text`` and ``values`` fields."""
+    d = {k: v.get(k) for k in ("code", "level", "forcebar", "force_state", "consequence", "title")}
+    d["reason"] = _clip(reason if reason is not None else v.get("reason"), 400)
     return d
 
 
-def werte_verdikte(vorschlag: Mapping[str, Any], verdikt_doc: Mapping[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    """``{wert-key: [verdikt, ...]}`` for every value of a proposal (``vorschlag["werte"]``): an empty list = the oracle has no objection.
+def values_verdicts(proposal: Mapping[str, Any], verdict_doc: Mapping[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """``{value-key: [verdict, ...]}`` for every value of a proposal (``proposal["values"]``): an empty list = the oracle has no objection.
 
     A value gets: ``PROFILE-VECTORS`` when it is a vector of another length than N; ``HW-UNCALIBRATED`` when it is a per-card class
-    value and the launcher passed that refusal; ``HW-BORROWED`` when its origin says it was borrowed; ``UNBELEGT`` for any other value
-    the planner marked unbelegt.  The verdicts are copies without the (long) ``text`` and ``werte`` fields."""
-    vl = verdikt_doc.get("verdikte") or []
+    value and the launcher passed that refusal; ``HW-BORROWED`` when its origin says it was borrowed; ``UNVERIFIED`` for any other value
+    the planner marked unverified.  The verdicts are copies without the (long) ``text`` and ``values`` fields."""
+    vl = verdict_doc.get("verdikte") or []
     by_code: Dict[str, Dict[str, Any]] = {}
     for v in vl:
         by_code.setdefault(v["code"], v)
     bad_keys = set()
     for v in vl:
         if v["code"] == "PROFILE-VECTORS":
-            bad_keys |= set(v.get("werte") or [])
+            bad_keys |= set(v.get("values") or [])
     bad_tails = {_tail(k) for k in bad_keys}
     uncal = by_code.get("HW-UNCALIBRATED")
     out: Dict[str, List[Dict[str, Any]]] = {}
 
-    slim = slim_verdikt
+    slim = slim_verdict
 
-    for w in vorschlag.get("werte") or []:
+    for w in proposal.get("values") or []:
         key = str(w.get("key"))
         lst: List[Dict[str, Any]] = []
         if key in bad_keys or _tail(key) in bad_tails:
             lst.append(slim(by_code["PROFILE-VECTORS"], "Vector with a length other than the card count: %s" % key))
         if uncal is not None and w.get("policy") == "class":
             lst.append(slim(uncal))
-        herk = "%s %s" % (w.get("herkunft", ""), w.get("grund", ""))
-        if w.get("zustand") == "unbelegt":
-            if "geborgt" in herk or "borrowed" in herk or "HW-BORROWED" in herk:
-                lst.append(slim(budget_verdict("HW-BORROWED", ebene="wert", text=herk, grund=w.get("herkunft"), force_state=HINT)))
+        herk = "%s %s" % (w.get("source", ""), w.get("reason", ""))
+        if w.get("state") == "unverified":
+            if "borrowed" in herk or "borrowed" in herk or "HW-BORROWED" in herk:
+                lst.append(slim(budget_verdict("HW-BORROWED", level="value", text=herk, reason=w.get("source"), force_state=HINT)))
             elif not lst:
-                lst.append(slim(budget_verdict("UNBELEGT", ebene="wert", text=herk, grund=w.get("herkunft"), force_state=HINT)))
+                lst.append(slim(budget_verdict("UNVERIFIED", level="value", text=herk, reason=w.get("source"), force_state=HINT)))
         out[key] = lst
     return out
 
@@ -578,12 +578,12 @@ def launch_input_of(argv: Sequence[str], env: Mapping[str, str], basis: Any, sou
                          str(getattr(basis, "instruments", "0")))
 
 
-def ask(li: Any, devices: Sequence[Mapping[str, Any]], *, tree: str, form: Optional[str] = None, vorschlag: Optional[Mapping[str, Any]] = None,
+def ask(li: Any, devices: Sequence[Mapping[str, Any]], *, tree: str, form: Optional[str] = None, proposal: Optional[Mapping[str, Any]] = None,
         snapshots: Optional[Mapping[str, str]] = None, evidence_dir: Optional[str] = None, scratch: Optional[str] = None,
         extra_args: Sequence[str] = (), **run_kw: Any) -> Dict[str, Any]:
-    """Ask the launcher what it makes of the launch ``li`` (``propose_oracle.LaunchInput``) on ``devices``; returns the ``flliper.verdikt/1``
+    """Ask the launcher what it makes of the launch ``li`` (``propose_oracle.LaunchInput``) on ``devices``; returns the ``flliper.verdict/1``
     document.  NEVER raises for a refusal or a crash of the dry run, nor for a failure of the harness: those are verdicts
-    (``verweigert`` / ``absturz`` / ``orakel_fehler``).
+    (``verweigert`` / ``crash`` / ``oracle_error``).
 
     Runs the dry run as it is (no force); when the launcher refuses it runs it again with ``--force`` so that EVERY value refusal Force
     passes is listed and what still stops the start is named.  A launcher CRASH on the first run is final (a second run would crash the same)."""
@@ -595,7 +595,7 @@ def ask(li: Any, devices: Sequence[Mapping[str, Any]], *, tree: str, form: Optio
     n = len(devices)
     ident = profile_identity(li)
     head = {"schema": SCHEMA, "form": form, "n": n,
-            "inventar": [{"index": d.get("index"), "name": d.get("name"), "total_mib": int(d.get("total_bytes", 0)) >> 20,
+            "inventory": [{"index": d.get("index"), "name": d.get("name"), "total_mib": int(d.get("total_bytes", 0)) >> 20,
                           "cc": [d.get("cc_major"), d.get("cc_minor")]} for d in devices],
             "profil": ident, "argv_sha256": launch_hash(li.argv, li.env)}
     try:
@@ -604,7 +604,7 @@ def ask(li: Any, devices: Sequence[Mapping[str, Any]], *, tree: str, form: Optio
         res1, notes = r1.result, list(r1.notes)
         res2 = None
         runs = 1
-        if res1.exc_type is not None and classify_exception(res1.exc_type, res1.exc_msg, getattr(res1, "exc_mro", None))["kind"] != "absturz":
+        if res1.exc_type is not None and classify_exception(res1.exc_type, res1.exc_msg, getattr(res1, "exc_mro", None))["kind"] != "crash":
             r2 = O.run_profile("", devices, tree=tree, force=True, launch_input=li, snapshots=snapshots, evidence_dir=evidence_dir,
                                scratch=scratch, extra_args=extra_args, **run_kw)
             res2 = r2.result
@@ -613,16 +613,16 @@ def ask(li: Any, devices: Sequence[Mapping[str, Any]], *, tree: str, form: Optio
             lens = P.vector_lengths(r1.argv, li.env)
         except Exception:  # noqa: BLE001 -- the vector count is a help, the dry run is the authority
             lens = {}
-        doc = build_verdikt(n, res1, res2, lens=lens, vorschlag=vorschlag)
+        doc = build_verdict(n, res1, res2, lens=lens, proposal=proposal)
         doc["argv_final_sha256"] = launch_hash(r1.argv, li.env)
     except Exception as exc:  # noqa: BLE001 -- a failure of the harness is a verdict, never an exception
-        doc = {"schema": SCHEMA, "n": n, "ausgang": "orakel_fehler", "geht": False, "geht_mit_force": False,
-               "verdikte": [budget_verdict("ORAKEL-FEHLER", ebene="orakel", text="%s: %s" % (type(exc).__name__, exc), force_state=BLOCKED)],
-               "lauf": None, "ohne_force": None, "mit_force": None, "forced": [], "plan": {}, "zaehlung": {FORCE: 0, BLOCKED: 1, UNCHECKED: 0}}
+        doc = {"schema": SCHEMA, "n": n, "outcome": "oracle_error", "geht": False, "ok_with_force": False,
+               "verdikte": [budget_verdict("ORAKEL-FEHLER", level="oracle", text="%s: %s" % (type(exc).__name__, exc), force_state=BLOCKED)],
+               "run": None, "ohne_force": None, "mit_force": None, "forced": [], "plan": {}, "zaehlung": {FORCE: 0, BLOCKED: 1, UNCHECKED: 0}}
         notes = []
     doc.update({k: v for k, v in head.items() if k not in doc})
-    doc["orakel"] = {"version": oracle_version(), "dauer_s": round(time.time() - t0, 2), "notizen": notes,
-                     "laeufe": 0 if doc["ausgang"] == "orakel_fehler" else runs}
+    doc["oracle"] = {"version": oracle_version(), "duration_s": round(time.time() - t0, 2), "notizen": notes,
+                     "runs": 0 if doc["outcome"] == "oracle_error" else runs}
     return doc
 
 
@@ -653,14 +653,14 @@ def _basis_from(req: Mapping[str, Any], scratch: str) -> Any:
 def _devices_of(req: Mapping[str, Any]) -> List[Dict[str, Any]]:
     from flliper.srt.pdflip import propose_oracle as O
 
-    inv = req.get("inventar") or {}
+    inv = req.get("inventory") or {}
     if inv.get("hardware"):
         return O.replay_from_hardware_profile(inv["hardware"])
     if inv.get("devices"):
         return [dict(d) for d in inv["devices"]]
     if inv.get("cards"):
         return devices_from_cards(inv["cards"])
-    raise ValueError("inventar needs hardware, devices or cards")
+    raise ValueError("inventory needs hardware, devices or cards")
 
 
 def _model_profiles(li: Any, req: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[str]]:
@@ -704,12 +704,12 @@ def _model_profiles(li: Any, req: Mapping[str, Any]) -> Tuple[Optional[Dict[str,
 # ---------------------------------------------------------------------------
 
 #: the names of the single-card form in a request (the dashboard sends ``single``, the plan says ``einzel``)
-SINGLE_FORMS = ("single", "einzel", "einzelkarte")
+SINGLE_FORMS = ("single", "single", "single_card")
 #: dashboard goal -> goal of ``propose_single`` (the "Kontext" regulator of the page is the context per request); the rest of the dashboard's goals
 #: (p_cut, d_objective, draft_kv_on_p, force_rules) are group-P/D knobs and do not exist for one card
 _SINGLE_GOALS = (("seats", "seats"), ("kv_tokens", "context_tokens"), ("kv_dtype", "kv_dtype"), ("draft", "draft"), ("host_ram_mib", "host_ram_mib"),
                  ("pre_load_free_mib", "pre_load_free_mib"), ("reserve_mib", "reserve_mib"))
-_SINGLE_STATE = {"passt": ("passt", GOES), "passt nicht": ("passt_nicht", BLOCKED), "unbelegt": ("unbelegt", HINT)}
+_SINGLE_STATE = {"passt": ("passt", GOES), "passt nicht": ("does_not_fit", BLOCKED), "unverified": ("unverified", HINT)}
 
 
 class _NoLaunch:
@@ -720,11 +720,11 @@ class _NoLaunch:
 
 
 def _single_card(req: Mapping[str, Any]) -> Tuple[Dict[str, Any], str]:
-    """``(card for propose_single, note)``: the ONE card of the request.  ``inventar.hardware`` takes card ``inventar.karte`` (ordinal, default 0) of the
+    """``(card for propose_single, note)``: the ONE card of the request.  ``inventory.hardware`` takes card ``inventory.karte`` (ordinal, default 0) of the
     hardware profile; ``devices`` / ``cards`` must be exactly one."""
     from flliper.srt.pdflip import propose_single as PS
 
-    inv = req.get("inventar") or {}
+    inv = req.get("inventory") or {}
     if inv.get("hardware"):
         ordinal = int(inv.get("karte") or 0)
         card = PS.card_from_hardware(inv["hardware"], ordinal)
@@ -740,47 +740,47 @@ def _single_card(req: Mapping[str, Any]) -> Tuple[Dict[str, Any], str]:
 
 
 def _single_werte(p: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """The flags of ``propose_single`` as the list of values of the propose document (``propose.py`` ``werte``): there is no profile before, so every value that
-    is set is new (``geaendert``); a switch is the empty value (like ``--d-only``)."""
+    """The flags of ``propose_single`` as the list of values of the propose document (``propose.py`` ``values``): there is no profile before, so every value that
+    is set is new (``changed``); a switch is the empty value (like ``--d-only``)."""
     out = []
     for e in p["flags"]:
-        value = e["wert"]
+        value = e["value"]
         sval = None if value is None else ("" if value is True else str(value))
-        out.append({"key": e["flag"], "group": "-", "policy": "single", "alt": None, "wert": sval, "eintraege": 1, "zustand": e["zustand"],
-                    "herkunft": e["herkunft"], "grund": e["begruendung"], "in_argv": value is not None, "geaendert": value is not None})
+        out.append({"key": e["flag"], "group": "-", "policy": "single", "alt": None, "value": sval, "entries": 1, "state": e["state"],
+                    "source": e["source"], "reason": e["begruendung"], "in_argv": value is not None, "changed": value is not None})
     return out
 
 
 def single_verdikt(p: Mapping[str, Any], card_note: str, notes: Sequence[str], profil: Mapping[str, Any], t0: float) -> Dict[str, Any]:
-    """The ``flliper.verdikt/1`` document of a single-card proposal: the fit as a Planer-Rechnung, the failing checks, the ServerArgs parse.  There is NO
-    launcher run (``lauf`` / ``ohne_force`` / ``mit_force`` are None, ``laeufe`` 0) and no Force (nothing here is a register code)."""
-    v = p["verdikt"]
-    ausgang, st = _SINGLE_STATE.get(v["state"], ("unbelegt", HINT))
+    """The ``flliper.verdict/1`` document of a single-card proposal: the fit as a Planer-Rechnung, the failing checks, the ServerArgs parse.  There is NO
+    launcher run (``run`` / ``ohne_force`` / ``mit_force`` are None, ``runs`` 0) and no Force (nothing here is a register code)."""
+    v = p["verdict"]
+    outcome, st = _SINGLE_STATE.get(v["state"], ("unverified", HINT))
     fit = p["fit"]
-    v_list: List[Dict[str, Any]] = [budget_verdict("EINZEL-PASSUNG", ebene="fit", text=v["text"], grund=v["text"], force_state=st,
-                                            extra={"stufe": {"passt": "ja", "passt nicht": "nein"}.get(v["state"], "unbelegt"), "art": v.get("art"),
-                                                   "etikett": "Planner calculation", "rest_mib": fit.get("frei_mib")})]
+    v_list: List[Dict[str, Any]] = [budget_verdict("EINZEL-PASSUNG", level="fit", text=v["text"], reason=v["text"], force_state=st,
+                                            extra={"stage": {"passt": "ja", "passt nicht": "nein"}.get(v["state"], "unverified"), "art": v.get("art"),
+                                                   "etikett": "Planner calculation", "rest_mib": fit.get("free_mib")})]
     for ch in fit.get("checks") or []:
         if not ch["ok"]:
-            v_list.append(budget_verdict(str(ch["code"]), ebene="fit", text=ch["text"], grund=ch["text"], force_state=BLOCKED, extra={"etikett": "Planner calculation"}))
-    for u in fit.get("unbelegt") or []:
-        v_list.append(budget_verdict("UNBELEGT", ebene="fit", text=str(u), grund=str(u), force_state=HINT, extra={"etikett": "Planner calculation"}))
+            v_list.append(budget_verdict(str(ch["code"]), level="fit", text=ch["text"], reason=ch["text"], force_state=BLOCKED, extra={"etikett": "Planner calculation"}))
+    for u in fit.get("unverified") or []:
+        v_list.append(budget_verdict("UNVERIFIED", level="fit", text=str(u), reason=str(u), force_state=HINT, extra={"etikett": "Planner calculation"}))
     par = p.get("parse") or {}
     if par.get("available") and par.get("ok") is False:
-        v_list.append(budget_verdict("EINZEL-PARSE", ebene="fit", text="ServerArgs parse refused: %s" % par.get("error"), grund=str(par.get("error")), force_state=BLOCKED))
+        v_list.append(budget_verdict("EINZEL-PARSE", level="fit", text="ServerArgs parse refused: %s" % par.get("error"), reason=str(par.get("error")), force_state=BLOCKED))
     elif par.get("available") and par.get("ok"):
-        v_list.append(budget_verdict("EINZEL-PARSE", ebene="fit", text="ServerArgs parse ok (argparse; __post_init__ has not run)", force_state=GOES))
+        v_list.append(budget_verdict("EINZEL-PARSE", level="fit", text="ServerArgs parse ok (argparse; __post_init__ has not run)", force_state=GOES))
     elif par:
-        v_list.append(budget_verdict("EINZEL-PARSE", ebene="fit", text="ServerArgs parse not checked: %s" % (par.get("error") or "not available"), force_state=HINT))
+        v_list.append(budget_verdict("EINZEL-PARSE", level="fit", text="ServerArgs parse not checked: %s" % (par.get("error") or "not available"), force_state=HINT))
     n_block = sum(1 for x in v_list if x["force_state"] == BLOCKED)
     argv = list(p["argv"])
-    return {"schema": SCHEMA, "n": 1, "form": "einzel", "art": v.get("art"), "verdikte": v_list, "lauf": None,
-            "vektoren": {"laengen": {}, "nicht_n": {}}, "ohne_force": None, "mit_force": None, "forced": [], "plan": {},
-            "ausgang": ausgang, "geht": ausgang == "passt", "geht_mit_force": ausgang == "passt",
+    return {"schema": SCHEMA, "n": 1, "form": "single", "art": v.get("art"), "verdikte": v_list, "run": None,
+            "vectors": {"laengen": {}, "nicht_n": {}}, "ohne_force": None, "mit_force": None, "forced": [], "plan": {},
+            "outcome": outcome, "geht": outcome == "passt", "ok_with_force": outcome == "passt",
             "zaehlung": {FORCE: 0, BLOCKED: n_block, UNCHECKED: 0}, "profil": dict(profil), "argv_sha256": launch_hash(argv, {}),
-            "inventar": [{"index": 0, "name": p["card"]["name"], "total_mib": int(p["card"]["total_mib"])}],
-            "orakel": {"version": {"propose_single": (file_sha256(_single_file()) or "")[:16] or None}, "dauer_s": round(time.time() - t0, 2),
-                       "notizen": [card_note] + list(notes), "laeufe": 0, "art": v.get("art")}}
+            "inventory": [{"index": 0, "name": p["card"]["name"], "total_mib": int(p["card"]["total_mib"])}],
+            "oracle": {"version": {"propose_single": (file_sha256(_single_file()) or "")[:16] or None}, "duration_s": round(time.time() - t0, 2),
+                       "notizen": [card_note] + list(notes), "runs": 0, "art": v.get("art")}}
 
 
 def _num(x: Any) -> Any:
@@ -793,23 +793,23 @@ def _single_file() -> str:
     return getattr(PS, "__file__", "") or ""
 
 
-def single_je_wert(p: Mapping[str, Any], vorschlag: Mapping[str, Any], verd: Mapping[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    """Verdicts per flag: ``werte_verdikte`` (borrowed / unbelegt values) plus what the fit check and the parse said about the flag itself."""
-    out = werte_verdikte(vorschlag, verd)
+def single_je_wert(p: Mapping[str, Any], proposal: Mapping[str, Any], verd: Mapping[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """Verdicts per flag: ``values_verdicts`` (borrowed / unverified values) plus what the fit check and the parse said about the flag itself."""
+    out = values_verdicts(proposal, verd)
     for e in p["flags"]:
-        vd = e["verdikt"]
+        vd = e["verdict"]
         lst = out.setdefault(e["flag"], [])
         if vd["state"] == "verweigert" and vd.get("code"):
             for code in str(vd["code"]).split("+"):
-                lst.append(slim_verdikt(budget_verdict(code, ebene="fit", text=vd["grund"], grund=vd["grund"], force_state=BLOCKED)))
+                lst.append(slim_verdict(budget_verdict(code, level="fit", text=vd["reason"], reason=vd["reason"], force_state=BLOCKED)))
         if vd.get("parse") == "veraltet (Alias)":
-            lst.append(slim_verdikt(budget_verdict("EINZEL-PARSE", ebene="fit", text="ServerArgs knows this flag only as a deprecated alias", force_state=HINT)))
+            lst.append(slim_verdict(budget_verdict("EINZEL-PARSE", level="fit", text="ServerArgs knows this flag only as a deprecated alias", force_state=HINT)))
     return out
 
 
 def run_propose_single(req: Mapping[str, Any]) -> Dict[str, Any]:
-    """propose() of the form single card (``propose_single``, plan row AP-F) in the shape of ``run_propose``: ``vorschlag`` (the values in the list of
-    ``propose.py``), ``verdikt`` (Planer-Rechnung, no launcher run), ``je_wert``, ``launch`` ({argv, env: {}}: the arguments of ``python -m flliper.launch_server``).
+    """propose() of the form single card (``propose_single``, plan row AP-F) in the shape of ``run_propose``: ``proposal`` (the values in the list of
+    ``propose.py``), ``verdict`` (Planer-Rechnung, no launcher run), ``per_value``, ``launch`` ({argv, env: {}}: the arguments of ``python -m flliper.launch_server``).
     Model: ``model_path`` or the base profile's ``PROFILE_MODEL``; a draft only when ``draft_path`` is given (the base profile's draft is a pdflip draft)."""
     from flliper.srt.pdflip import propose_single as PS
 
@@ -821,7 +821,7 @@ def run_propose_single(req: Mapping[str, Any]) -> Dict[str, Any]:
         model, draft, notes = _model_profiles(_NoLaunch(str(getattr(li, "model", "") or "")), mreq)
         if model is None:
             return {"ok": False, "error": "no model profile: %s" % ("; ".join(notes) or "Model path missing"), "notizen": notes}
-        z = dict(req.get("ziele") or {})
+        z = dict(req.get("goals") or {})
         goals = {dst: z[src] for src, dst in _SINGLE_GOALS if z.get(src) not in (None, "")}
         ignored = sorted(k for k in z if k not in {s for s, _ in _SINGLE_GOALS} and z.get(k) not in (None, "", False))
         if ignored:
@@ -835,33 +835,33 @@ def run_propose_single(req: Mapping[str, Any]) -> Dict[str, Any]:
             p = PS.check(p)
         else:
             p["parse"] = {"available": False, "ok": None, "error": "not requested"}
-        werte = _single_werte(p)
+        values = _single_werte(p)
         fit = p["fit"]
-        lvl = {"passt": "ja", "passt nicht": "nein"}.get(p["verdikt"]["state"], "unbelegt")
-        flag_of = {w["key"]: w["wert"] for w in werte}.get          # what the proposal settled on (the goals may be defaults)
-        hint_list = [str(r.get("grund") or r.get("schritt")) for r in p.get("relaxations") or []] + list(fit.get("hinweise") or [])
-        vorschlag = {"schema": "flliper.propose-a/1", "form": "einzel", "n": 1, "werte": werte,
+        lvl = {"passt": "ja", "passt nicht": "nein"}.get(p["verdict"]["state"], "unverified")
+        flag_of = {w["key"]: w["value"] for w in values}.get          # what the proposal settled on (the goals may be defaults)
+        hint_list = [str(r.get("reason") or r.get("schritt")) for r in p.get("relaxations") or []] + list(fit.get("notes") or [])
+        proposal = {"schema": "flliper.propose-a/1", "form": "single", "n": 1, "values": values,
                      "cards": [{"name": p["card"]["name"], "total_mib": int(p["card"]["total_mib"]), "tflops_src": None}],
-                     "inventory": {"gleich_wie_profil": False, "n": 1}, "seeds": {},
-                     "fit": {"level": lvl, "first": p["verdikt"]["text"], "margin_mib": fit.get("frei_mib"), "lines": [], "marks": [],
-                             "art": p["verdikt"].get("art") or PS.VERDICT_ART},
-                     "ziele": {"seats": _num(flag_of("--max-running-requests")), "kv_tokens": _num(flag_of("--context-length")), "kv_dtype": flag_of("--kv-cache-dtype")},
-                     "unbelegt": list(p.get("unbelegt") or []), "hinweise": hint_list, "blocker": [], "vektorlaengen": {}, "vektoren_ok": True,
-                     "vektoren_falsch": {}, "basis": os.path.basename(str(getattr(li, "source", "") or "")) or "(no profile)",
-                     "argv": list(p["argv"]), "env": {}, "einzelkarte": p}
-        profil = dict(profile_identity(li), rolle="basis") if li is not None else {"rolle": "keines", "quelle": "", "datei_sha256": None, "eingabe_sha256": None}
-        profil["vorschlag_sha256"] = launch_hash(p["argv"], {})
+                     "inventory": {"same_as_profile": False, "n": 1}, "seeds": {},
+                     "fit": {"level": lvl, "first": p["verdict"]["text"], "margin_mib": fit.get("free_mib"), "lines": [], "marks": [],
+                             "art": p["verdict"].get("art") or PS.VERDICT_ART},
+                     "goals": {"seats": _num(flag_of("--max-running-requests")), "kv_tokens": _num(flag_of("--context-length")), "kv_dtype": flag_of("--kv-cache-dtype")},
+                     "unverified": list(p.get("unverified") or []), "notes": hint_list, "blocker": [], "vector_lengths": {}, "vectors_ok": True,
+                     "vectors_wrong": {}, "basis": os.path.basename(str(getattr(li, "source", "") or "")) or "(no profile)",
+                     "argv": list(p["argv"]), "env": {}, "single_card": p}
+        profil = dict(profile_identity(li), rolle="basis") if li is not None else {"rolle": "keines", "quelle": "", "file_sha256": None, "input_sha256": None}
+        profil["proposal_sha256"] = launch_hash(p["argv"], {})
         verd = single_verdikt(p, card_note, notes, profil, t0)
-        return {"ok": True, "schema": PROPOSE_SCHEMA, "vorschlag": vorschlag, "verdikt": verd, "je_wert": single_je_wert(p, vorschlag, verd),
+        return {"ok": True, "schema": PROPOSE_SCHEMA, "proposal": proposal, "verdict": verd, "per_value": single_je_wert(p, proposal, verd),
                 "launch": {"argv": list(p["argv"]), "env": {}}, "notizen": notes}
 
 
 def run_propose(req: Mapping[str, Any], *, tree: str) -> Dict[str, Any]:
     """propose() (stage A) + the oracle (stage B) + the verdicts per value (stage C) for one request of the dashboard worker.
 
-    ``req``: ``basis`` {env_path | env_text}, ``inventar`` {hardware | devices | cards}, ``form`` flip|tp|dual|single, ``ziele``, ``model_path``,
+    ``req``: ``basis`` {env_path | env_text}, ``inventory`` {hardware | devices | cards}, ``form`` flip|tp|dual|single, ``goals``, ``model_path``,
     ``draft_path``, ``snapshots`` {registry name: header snapshot dir}, ``instruments``.  Returns ``{"ok": True, "schema": PROPOSE_SCHEMA,
-    "vorschlag": <flliper.propose-a/1>, "verdikt": <flliper.verdikt/1>, "je_wert": {key: [verdikt]}, "launch": {argv, env}}`` or
+    "proposal": <flliper.propose-a/1>, "verdict": <flliper.verdict/1>, "per_value": {key: [verdict]}, "launch": {argv, env}}`` or
     ``{"ok": False, "error": ...}`` for a request the planner cannot answer at all (no model profile, wrong form)."""
     from flliper.srt.pdflip import propose as P
 
@@ -874,21 +874,21 @@ def run_propose(req: Mapping[str, Any], *, tree: str) -> Dict[str, Any]:
         if model is None:
             return {"ok": False, "error": "no model profile: %s" % ("; ".join(notes) or "Model path missing"), "notizen": notes}
         try:
-            v = P.propose(devices, model, str(req.get("form") or "flip"), dict(req.get("ziele") or {}), basis=li, draft=draft,
+            v = P.propose(devices, model, str(req.get("form") or "flip"), dict(req.get("goals") or {}), basis=li, draft=draft,
                           rates=req.get("rates"))
         except P.ProposeError as exc:
             return {"ok": False, "error": str(exc), "notizen": notes}
         pli = launch_input_of(v["argv"], v["env"], li, "propose:" + v["basis"])
-        verd = ask(pli, devices, tree=tree, form=str(v["form"]), vorschlag=v, snapshots=req.get("snapshots"), scratch=None)
+        verd = ask(pli, devices, tree=tree, form=str(v["form"]), proposal=v, snapshots=req.get("snapshots"), scratch=None)
         verd["profil"] = dict(profile_identity(li), **{"rolle": "basis"})
-        verd["profil"]["vorschlag_sha256"] = launch_hash(v["argv"], v["env"])
-        return {"ok": True, "schema": PROPOSE_SCHEMA, "vorschlag": v, "verdikt": verd, "je_wert": werte_verdikte(v, verd),
+        verd["profil"]["proposal_sha256"] = launch_hash(v["argv"], v["env"])
+        return {"ok": True, "schema": PROPOSE_SCHEMA, "proposal": v, "verdict": verd, "per_value": values_verdicts(v, verd),
                 "launch": {"argv": list(v["argv"]), "env": dict(v["env"])}, "notizen": notes}
 
 
 def run_verdikt(req: Mapping[str, Any], *, tree: str) -> Dict[str, Any]:
-    """The oracle for ONE launch (no proposal): ``basis`` {env_path | env_text} on ``inventar``; the dashboard's dry run."""
+    """The oracle for ONE launch (no proposal): ``basis`` {env_path | env_text} on ``inventory``; the dashboard's dry run."""
     with tempfile.TemporaryDirectory(prefix="apd-") as scratch:
         li = _basis_from(req, scratch)
         devices = _devices_of(req)
-        return {"ok": True, "verdikt": ask(li, devices, tree=tree, form=req.get("form"), snapshots=req.get("snapshots"))}
+        return {"ok": True, "verdict": ask(li, devices, tree=tree, form=req.get("form"), snapshots=req.get("snapshots"))}

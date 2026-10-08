@@ -35,7 +35,7 @@ VIAS = ("after_p", "d_direct", "d_single")
 #: d_first_token + other == ttft (other = a re-route's extra legs, else 0)
 TTFT_PARTS = ("queue_ms", "p_prefill_ms", "flip_wait_ms", "d_first_token_ms", "other_ms")
 #: front.flip phases
-PHASES = ("vorlauf", "layer", "nachlauf")
+PHASES = ("warmup", "layer", "nachlauf")
 #: front.d_activity values
 D_ACTIVITY = ("decode", "prefill", "idle")
 #: an events.jsonl line is cut at state_file.EVENT_MAX (4000 bytes): a
@@ -56,7 +56,7 @@ def _r3(x: Optional[float]) -> Optional[float]:
 class FlipPhase:
     """``front.flip`` = {phase, dir, since_ts, begin_ts, reason, ...}.
 
-    * ``vorlauf``: from the flip decision (the D->P park RPC, else the entry
+    * ``warmup``: from the flip decision (the D->P park RPC, else the entry
       into ``flip()``) to ``PDFLIP-FLIP begin``;
     * ``layer``: begin -> ``flip_done`` (the layer swap);
     * ``nachlauf``: done -> the woken group's first work (P->D: the first
@@ -98,17 +98,17 @@ class FlipPhase:
         s.update(kw)
         self.snap = s  # replaced, never mutated (the live writer reads it off-loop)
 
-    def vorlauf(self, direction: str, reason: str, now: float) -> bool:
+    def warmup(self, direction: str, reason: str, now: float) -> bool:
         """The flip is decided. A flip already open keeps its own decision."""
-        if self.snap["phase"] in ("vorlauf", "layer"):
+        if self.snap["phase"] in ("warmup", "layer"):
             return False
-        self._set(phase="vorlauf", dir=direction, since_ts=_r3(now), decision_ts=_r3(now),
+        self._set(phase="warmup", dir=direction, since_ts=_r3(now), decision_ts=_r3(now),
                   begin_ts=None, done_ts=None, reason=reason, first_work_ts=None)
         return True
 
     def layer(self, direction: str, now: float, reason: str) -> None:
         s = self.snap
-        same = s["phase"] == "vorlauf" and s["dir"] == direction
+        same = s["phase"] == "warmup" and s["dir"] == direction
         self._set(phase="layer", dir=direction, since_ts=_r3(now), begin_ts=_r3(now),
                   decision_ts=s["decision_ts"] if same else _r3(now),
                   reason=(s["reason"] if same and s["reason"] else reason),
@@ -152,7 +152,7 @@ class FlipPhase:
         last = {"dir": s["dir"], "reason": s["reason"], "decision_ts": s["decision_ts"],
                 "begin_ts": s["begin_ts"], "done_ts": _r3(done), "first_work_ts": _r3(fw),
                 "first_work_what": s.get("first_work_what"),
-                "vorlauf_ms": _ms(s["decision_ts"], s["begin_ts"]),
+                "warmup_ms": _ms(s["decision_ts"], s["begin_ts"]),
                 "layer_ms": _ms(s["begin_ts"], done),
                 "nachlauf_ms": max(0, _ms(done, fw) or 0) if done is not None else None,
                 "decision_to_first_work_ms": _ms(s["decision_ts"], fw)}

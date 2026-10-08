@@ -1,6 +1,6 @@
 """RANKSTATS §3 (DASHBOARD-AUS-IPC, 29.09.): prefill / decode / cache blocks in the
 rank's rankstats file, so C1-C5, D1, D2, E1, E2 leave the log (user via 27B:
-"warum sind die ganzen werte im dashboard noch aus log").
+"warum sind die ganzen values im dashboard noch aus log").
 
 Every field is a counter the path keeps anyway, summed next to the line it
 already prints; the rankstats timer thread only READS. RED on 2188e1bd98: no

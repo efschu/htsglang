@@ -173,7 +173,7 @@ class Staging(unittest.TestCase):
         self.assertEqual(modellprofil.find_tree(tree), tree)
 
 
-class ProfilTreeFlag(unittest.TestCase):
+class ProfileTreeFlag(unittest.TestCase):
     def test_the_app_hands_one_tree_to_editor_model_hardware_and_worker(self):
         with tempfile.TemporaryDirectory() as d:
             tree = os.path.join(d, "python")
@@ -182,7 +182,7 @@ class ProfilTreeFlag(unittest.TestCase):
                 write(tree, rel)
             ns = argparse.Namespace(log_glob=[], docker_ssh="", docker_host_prefix="", front=[], gpuq="", state_dir="", release_profile=[],
                                     image_changes=os.path.join(d, "ic.json"), features=os.path.join(d, "f.json"), features_repo=d,
-                                    edition="release", profil_tree=tree, hw_tree=None)
+                                    edition="release", profile_tree=tree, hw_tree=None)
             app = S.App(ns)
             self.assertEqual(app.profil.tree, tree)
             self.assertEqual(app.modellprofil.tree, tree)
@@ -197,7 +197,7 @@ class ProfilTreeFlag(unittest.TestCase):
             write(hw, "flliper/srt/rigmon/hardware_profile.py")
             ns = argparse.Namespace(log_glob=[], docker_ssh="", docker_host_prefix="", front=[], gpuq="", state_dir="", release_profile=[],
                                     image_changes=os.path.join(d, "ic.json"), features=os.path.join(d, "f.json"), features_repo=d,
-                                    edition="rig", profil_tree=tree, hw_tree=hw)
+                                    edition="rig", profile_tree=tree, hw_tree=hw)
             app = S.App(ns)
             self.assertEqual(app.profil.tree, tree)
             self.assertEqual(app.hwprofil.tree, hw)

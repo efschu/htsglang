@@ -27,7 +27,7 @@ uebernommen (``config`` | ``Index`` | ``geschaetzt`` | ``gemessen`` | ``NVML``) 
 ``Standard`` (Annahme dieses Moduls, benannt).  Posten, die nur am Metall zu messen sind (CUDA-Kontext, Graphen, Allokator-Reste,
 Seam-Staging), stehen in ``fixed_overhead_mib`` und sind OHNE Eingabe NULL -- dann ist ``free_mib`` eine OBERGRENZE und das Ergebnis
 sagt es (``warnings``).  Die Stufenzeit ist eine Roofline-Naeherung (Decode, Batch 1, Gewichtsbandbreite ``mem_gbs.gemv``); sie
-ersetzt nicht ``pp_cut.stage_costs`` (der braucht eine am Metall kalibrierte Census) und rankt keine Schnitte (#1019).
+ersetzt nicht ``pp_cut.stage_costs`` (der requires eine am Metall kalibrierte Census) und rankt keine Schnitte (#1019).
 
 Dual-Form (``--dual-share``), Belege je Posten (Datei:Zeile im Baum 173161c595, Einzelheiten in ``_dual_share_p_terms``): Gewichte/Experten von P liegen im
 Union-Image von D (pdflip/launcher.py:22707-22712 Hilfe ``--dual-share``, :14784 ``UNION_ROLES=main``) -> Referenz, nicht im P-Budget; der Festposten
@@ -786,7 +786,7 @@ def stage_bar(stage: Mapping[str, Any]) -> Dict[str, Any]:
 def bars_for(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapping[str, Any],
              phases: Optional[Mapping[str, Mapping[str, Any]]] = None) -> Dict[str, Any]:
     """Balken je Karte, je Phase.  ``phases`` = ``{"P": {Einstellungen, die gelten sollen}, "D": {...}}`` (jeweils ueber ``settings`` gelegt);
-    ohne Angabe eine Phase ``alle``.  ``Spitze`` = je Karte die Phase mit dem groessten Bedarf (gleichzeitig belegt wird nie mehr)."""
+    ohne Angabe eine Phase ``alle``.  ``Peak`` = je Karte die Phase mit dem groessten Bedarf (gleichzeitig belegt wird nie mehr)."""
     ph_in = dict(phases) if phases else {"alle": {}}
     per: Dict[str, Any] = {}
     for name, over in ph_in.items():
@@ -802,7 +802,7 @@ def bars_for(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapping[
         for i in range(len(per[names[0]]["bars"])):
             best = max(names, key=lambda n: per[n]["bars"][i]["needs_mib"])
             peak.append(dict(per[best]["bars"][i], from_phase=best))
-        out["Spitze"] = {"bars": peak}
+        out["Peak"] = {"bars": peak}
     hints = []
     for name, ph in per.items():
         for b in ph["bars"]:
@@ -813,7 +813,7 @@ def bars_for(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapping[
 
 
 def approx_payload(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapping[str, Any]) -> Dict[str, Any]:
-    """Alles, was der Browser fuer die sofortige Naeherung braucht (``profil_balken.js::approx``): lineare Arithmetik, kein Solver.
+    """Alles, was der Browser fuer die sofortige Naeherung requires (``profil_balken.js::approx``): lineare Arithmetik, kein Solver.
     Gilt fuer eine Aenderung des LAYER-SCHNITTS bei sonst gleichen Einstellungen; Experten-Anteil, Kontext, Chunk, Budget bleiben die des Servers."""
     t = _stage_terms(hw, model, settings)
     ctx = t["_ctx"]
@@ -889,7 +889,7 @@ def approx_terms(pl: Mapping[str, Any], stage_layers: Sequence[int]) -> List[Dic
 # ``herkunft: "nicht gerechnet"`` mit Grund (``detail``); er zaehlt nicht in die Summe, ``Frei`` ist dann eine Obergrenze.  Nichts wird
 # geraten (Hochrechnung != Messung).  Werte "Naeherung" sind Rechnungen dieses Moduls, nicht die des Loesers/Launchers.
 
-BALKEN_SCHEMA = "flliper.balken/1"
+BALKEN_SCHEMA = "flliper.bar/1"
 SRC_PROFILE = "Profile row"
 SRC_APPROX = "Approximation"
 SRC_NONE = "not calculated"
@@ -975,12 +975,12 @@ def _draft_info(model: Mapping[str, Any], all_args: Mapping[str, str]) -> Dict[s
 
 def p_phase_settings(args: Mapping[str, str], env: Mapping[str, str], model: Mapping[str, Any], n: int, draft: Mapping[str, Any],
                      *, carries_draft: bool) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
-    """Einstellungen fuer ``_stage_terms`` aus den Zeilen der P-Phase (oder der Einzelkarte) und die Liste der gelesenen Eingaben."""
+    """Einstellungen fuer ``_stage_terms`` aus den Zeilen der P-Phase (oder der SingleCard) und die Liste der gelesenen Eingaben."""
     s = settings_from_server(args, model)
     seen: List[Dict[str, str]] = []
 
-    def note(what: str, value: Any, herkunft: str) -> None:
-        seen.append({"was": what, "wert": str(value), "herkunft": herkunft})
+    def note(what: str, value: Any, source: str) -> None:
+        seen.append({"was": what, "value": str(value), "source": source})
 
     for key, flag in (("stage_layers", "--pp-stage-ratio"), ("attn_layers", "--pp-attn-stage-ratio"), ("budget_mib", "--rank-gpu-memory-mib"),
                       ("chunk_tokens", "--chunked-prefill-size"), ("context_tokens", "--max-kv-per-request")):
@@ -1076,7 +1076,7 @@ TORCH_CACHE_CAP_ENV = "FLLIPER_PDFLIP_TORCH_CACHE_CAP"
 
 def parse_user_reserve(raw: Any, n: int) -> List[int]:
     """``--user-reserve-mib`` -> MiB je Karte in RANG-/CUDA-ORDINAL-Reihenfolge (5090 zuerst) -- Spiegel von ``launcher.parse_user_reserve``
-    (launcher.py:14118-14165): ein Skalar gilt fuer jede Karte, eine Liste braucht genau einen Wert je Karte, Werte >= 0; leer = 0.
+    (launcher.py:14118-14165): ein Skalar gilt fuer jede Karte, eine Liste requires genau einen Wert je Karte, Werte >= 0; leer = 0.
     Der Launcher bricht bei einem Fehler ab (SystemExit); hier ist es ein ``CouplingError`` (die Phase steht dann mit ``ok: False`` da)."""
     text = str(raw if raw is not None else 0).strip()
     if not text:
@@ -1201,11 +1201,11 @@ def launcher_d_budgets(totals: Sequence[float], dc: Sequence[float], *, profile:
     for what, vec, src in (("P_DORMANT_SERVED_GROWTH_MIB", grow, grow_src), ("D_AWAKE_REST_MIB", rest, rest_src),
                            ("D_OVERSHOOT_MIB", over_rec, over_src)):
         if vec is not None:
-            seen.append({"was": what, "wert": ",".join("-" if v is None else str(v) for v in vec),
-                         "herkunft": "Record of profile %s (%s; source pdflip/form.py, like launcher._pconst)" % (profile, src)})
+            seen.append({"was": what, "value": ",".join("-" if v is None else str(v) for v in vec),
+                         "source": "Record of profile %s (%s; source pdflip/form.py, like launcher._pconst)" % (profile, src)})
     if booked is not None:
-        seen.append({"was": "D_AWAKE_REST_BOOKED_MIB", "wert": ",".join("-" if v is None else str(v) for v in booked),
-                     "herkunft": "Record of profile %s (%s); booked instead of floor + reserve + 404 (launcher.py:15318-15353)" % (profile, booked_src)})
+        seen.append({"was": "D_AWAKE_REST_BOOKED_MIB", "value": ",".join("-" if v is None else str(v) for v in booked),
+                     "source": "Record of profile %s (%s); booked instead of floor + reserve + 404 (launcher.py:15318-15353)" % (profile, booked_src)})
     return {"budgets": budgets, "notes": notes, "gaps": gaps, "seen": seen, "profile": profile}
 
 
@@ -1225,8 +1225,8 @@ def d_phase_config(args: Mapping[str, str], env: Mapping[str, str], model: Mappi
     Launchers liest sie, nicht der Rang."""
     seen: List[Dict[str, str]] = []
 
-    def note(what: str, value: Any, herkunft: str) -> None:
-        seen.append({"was": what, "wert": str(value), "herkunft": herkunft})
+    def note(what: str, value: Any, source: str) -> None:
+        seen.append({"was": what, "value": str(value), "source": source})
 
     cfg: Dict[str, Any] = {"n": n, "draft": draft}
     la = dict(launcher_args or {})
@@ -1585,7 +1585,7 @@ def d_stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], cfg: Mapping[
 
 
 def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
-    """Eine Stufe (``terms[k] = {v|None, src, note}``) -> Karten-Balken im Vertrag ``flliper.balken/1``.
+    """Eine Stufe (``terms[k] = {v|None, src, note}``) -> Karten-Balken im Vertrag ``flliper.bar/1``.
 
     Posten in logischer Reihenfolge, dann ``Reserve`` (verfuegbar - Budget, von einem Overflow ueber das Budget aufgezehrt) und ``Frei``
     (Budget - Posten im Budget).  Posten mit ``outside_budget`` (D-Phase: ``--d-foreign-context-mib`` + ``--d-nontorch-mib``, Launcher:
@@ -1618,19 +1618,19 @@ def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
         v = t.get("v")
         if t.get("ref"):
             if v is not None and v > 0:
-                refs.append({"name": key, "label": label, "mib": round(float(v), 3), "ref": t["ref"], "herkunft": _origin(t["src"]),
+                refs.append({"name": key, "label": label, "mib": round(float(v), 3), "ref": t["ref"], "source": _origin(t["src"]),
                              "detail": what + (" -- " + t["note"] if t.get("note") else ""), "gerechnet": True})
             continue
         out_b = bool(t.get("outside_budget"))
         if v is None:
-            segs.append({"name": key, "label": label, "mib": None, "herkunft": SRC_NONE, "detail": t.get("note") or what, "gerechnet": False})
+            segs.append({"name": key, "label": label, "mib": None, "source": SRC_NONE, "detail": t.get("note") or what, "gerechnet": False})
             missing.append(label)
         elif v > 0:
             if out_b:
                 outside += float(v)
             else:
                 inside += float(v)
-            seg = {"name": key, "label": label, "mib": round(float(v), 3), "herkunft": _origin(t["src"]),
+            seg = {"name": key, "label": label, "mib": round(float(v), 3), "source": _origin(t["src"]),
                    "detail": what + (" -- " + t["note"] if t.get("note") else ""), "gerechnet": True}
             if out_b:
                 seg["ausserhalb_budget"] = True
@@ -1650,11 +1650,11 @@ def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
     bsrc = stage["budget_mib"]
     if reserve > 0:
         wish = (" -- wish %.0f MiB, of which %.0f MiB consumed" % (available - budget, overflow)) if overflow > 0 else ""
-        segs.append({"name": "reserve", "label": "Reserve", "mib": round(reserve, 3), "herkunft": _origin(bsrc["src"]),
+        segs.append({"name": "reserve", "label": "Reserve", "mib": round(reserve, 3), "source": _origin(bsrc["src"]),
                      "detail": BALKEN_SEGMENTS[-2][2] + (" -- " + bsrc["note"] if bsrc.get("note") else "") + wish, "gerechnet": True})
     if free > 0:
         obergrenze = (" -- UPPER BOUND: not calculated are " + ", ".join(missing)) if missing else ""
-        segs.append({"name": "free", "label": "Free", "mib": round(free, 3), "herkunft": "gerechnet",
+        segs.append({"name": "free", "label": "Free", "mib": round(free, 3), "source": "gerechnet",
                      "detail": BALKEN_SEGMENTS[-1][2] + obergrenze, "gerechnet": True})
     return {"card": stage.get("ord"), "label": stage["label"], "phase": phase, "total_mib": total, "budget_mib": budget,
             "budget_herkunft": _origin(bsrc["src"]), "segments": segs, "posts_mib": round(known, 3), "free_mib": round(free, 3),
@@ -1734,19 +1734,19 @@ def _dual_share_p_terms(stage: Dict[str, Any], args: Mapping[str, str], seen: Op
     terms["fixed"] = {"v": ov, "src": SRC_INPUT if given else SRC_DEFAULT, "outside_budget": True,
                       "note": "--dual-p-overhead-mib: what P holds per card OUTSIDE its --rank-gpu-memory-mib (context, graphs, activation; launcher.py:22713-22716)"
                               + ("" if given else "; launcher default %d MiB (not set in the profile)" % DUAL_P_OVERHEAD_DEFAULT_MIB)}
-    stage["ref_extra"] = [{"name": "diff", "label": "Diff of the P weights", "mib": None, "ref": "shared", "herkunft": SRC_NONE, "gerechnet": False,
+    stage["ref_extra"] = [{"name": "diff", "label": "Diff of the P weights", "mib": None, "ref": "shared", "source": SRC_NONE, "gerechnet": False,
                            "detail": "What cannot be bound to D's bytes, P keeps itself (union_arena_bind.py head: \"What it cannot prove, it keeps\"); "
                                      "the amount cannot be verified without a boot"}]
     if seen is not None:
-        seen.append({"was": "dual_p_overhead_mib", "wert": "%g" % ov, "herkunft": ("Profile row --dual-p-overhead-mib" if given else
+        seen.append({"was": "dual_p_overhead_mib", "value": "%g" % ov, "source": ("Profile row --dual-p-overhead-mib" if given else
                      "Launcher default (--dual-p-overhead-mib 1500, launcher.py:22713)")})
-        seen.append({"was": "dual_share", "wert": "an", "herkunft": "Profile row --dual-share: weights/experts (and KV with --dual-unified-kv on) do not count against the P budget"})
+        seen.append({"was": "dual_share", "value": "an", "source": "Profile row --dual-share: weights/experts (and KV with --dual-unified-kv on) do not count against the P budget"})
 
 
 def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[str, str], phase_args: Optional[Mapping[str, Any]] = None,
                phase_env: Optional[Mapping[str, Any]] = None, form: Optional[str] = None, tokens: Sequence[str] = (),
                overrides: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """Balken je Karte und Phase im Vertrag ``flliper.balken/1`` aus dem Serverprofil (Flag -> Wert, Gruppenzeilen getrennt).
+    """Balken je Karte und Phase im Vertrag ``flliper.bar/1`` aus dem Serverprofil (Flag -> Wert, Gruppenzeilen getrennt).
 
     Phase ``P``: Pipeline-Stufen (``_stage_terms``).  Phase ``D``: TP-Raenge (``d_stage_terms``).  Dual: beide zugleich auf denselben Karten --
     eine Summe wird NICHT gebildet (``--dual-share``: P rechnet auf den Shards von D, Gewichte doppelt zu zaehlen waere falsch; die
@@ -1787,7 +1787,7 @@ def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[st
         except (CouplingError, KeyError, ValueError, TypeError):
             approx = None
         if name == "P" and draft["kind"] != "none" and not carries:
-            seen.append({"was": "draft", "wert": "aus", "herkunft": "Profile row --draft-kv-on-p off: P carries no MTP head"})
+            seen.append({"was": "draft", "value": "aus", "source": "Profile row --draft-kv-on-p off: P carries no MTP head"})
         label = "P phase (prefill, pipeline stages)" if name == "P" else "Single card (one phase)"
         # Kontext-Boden = Token, die nach den Gewichten ins Budget passen: unter --dual-share zaehlen die Gewichte nicht gegen das P-Budget, die Zahl
         # waere eine andere Frage -> nicht gerechnet (None) statt einer falschen 0
@@ -1835,7 +1835,7 @@ def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[st
 def run(req: Mapping[str, Any]) -> Dict[str, Any]:
     """``{"what": "compute"|"move"|"chunk"|"context"|"bars", "hardware": {..}, "model": {..}, "settings": {..}, ...}`` -> Ergebnis.
 
-    ``settings`` darf stattdessen ``server_args`` (Flag -> Wert, ``profile_json.args_dict``) tragen; ``move`` braucht ``src``/``dst``/``n``,
+    ``settings`` darf stattdessen ``server_args`` (Flag -> Wert, ``profile_json.args_dict``) tragen; ``move`` requires ``src``/``dst``/``n``,
     ``chunk`` optional ``new_chunk_tokens``.  Eine unrechenbare Eingabe kommt als ``{"ok": False, "error": ...}`` zurueck, nie als Absturz."""
     try:
         hw, model = req["hardware"], req["model"]

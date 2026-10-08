@@ -99,7 +99,7 @@ class LedgerState:
 
 def arbitrate(need: int, free: int, other_evictable: int, *, requester: str = "D",
               other_committed: int = 0) -> Tuple[int, int]:
-    """The policy (user order 30.09. 07:25Z, verbatim: "wird vram kv knapp,
+    """The policy (user order 30.09. 07:25Z, verbatim: "wird vram kv tight,
     pausiert P und gibt den context frei und das erarbeitete in den L2 zur
     späteren weiterverwendung wenn vram kv wieder frei wird"). ``need``: bytes
     the requester must commit now. Returns ``(grant, pressure)``; ``grant`` <=

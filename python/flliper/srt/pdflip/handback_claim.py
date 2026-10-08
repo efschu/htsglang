@@ -1,4 +1,4 @@
-"""HANDBACK (01.10., user via 27B: "den anker fix koennen alle brauchen"): what
+"""HANDBACK (01.10., user via 27B: "den anchor fix koennen alle brauchen"): what
 group D holds and computes after a P hand-off -- the NF side of 27B fe5c55041b.
 
 NF's contract is not 27B's N-1. P computes all N prompt tokens, publishes the
@@ -25,7 +25,7 @@ What does come: a hand-off read is read whatever its length (below).
 
 27B line (fe5c55041b, HANDBACK N-1) on the same module -- its claim half is
 gated to the 27B profile (``_claim_n_on``), NF keeps the upstream claim:
-HANDBACK N-1 (01.10.; user: "den anker fix koennen alle brauchen"): the hand-back
+HANDBACK N-1 (01.10.; user: "den anchor fix koennen alle brauchen"): the hand-back
 claim of a P-prefilled prompt is N-1 tokens -- every P->D hand-back, the flip
 form (P=PP3 -> D=TP3) and the dual layout alike. First found in the dual layout:
 

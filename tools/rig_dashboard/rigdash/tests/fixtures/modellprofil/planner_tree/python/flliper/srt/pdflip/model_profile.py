@@ -583,7 +583,7 @@ def _classify_tensors(td: TensorDir, n_layers: int, gguf_backbone: Optional[int]
 
 
 def _storage_classes(td: TensorDir) -> Dict[str, Dict[str, float]]:
-    """Gewichtsspeicherklassen der Tensoren: ``{"klasse": {"bytes": Nutzlast+Skalen, "params": Elemente}}``.
+    """Gewichtsspeicherklassen der Tensoren: ``{"class": {"bytes": Nutzlast+Skalen, "params": Elemente}}``.
 
     Erkannt wird an Dtype und Nachbartensor (``.weight_scale``): U8 + F8-Skala = nvfp4 (zwei Elemente je Byte), I8 =
     int8, F8_E4M3 = fp8, ``.weight_packed`` (I32) = gepackte Bitbreite (``packedN`` bis die Config sie auflöst),
@@ -782,7 +782,7 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
             "mtp_bytes": _v(int(mtp_bytes), SRC_INDEX),
             "ple": {"per_layer_bytes": _v([int(x) for x in per_layer_ple], SRC_INDEX),
                     "ngram_table_bytes": _v(int(ngram_total), SRC_INDEX,
-                                            note="n-gram-Einbettung: bleibt auf der Platte (mmap), erreicht das Gerät nie") if ngram_total else None},
+                                            note="n-gram-Einbettung: bleibt auf der Platte (mmap), reached das Gerät nie") if ngram_total else None},
             "other_bytes": _v(int(cl["cls"].get("other", 0.0)), SRC_INDEX),
         }
         weights["ple"] = {k: v for k, v in weights["ple"].items() if v is not None}
@@ -1234,7 +1234,7 @@ FIELD_CLASS: Dict[str, Tuple[str, str]] = {
     "records": ("policy", "Schlüssel der Messquellen: 27B mit Zeilen-Linie, NF ohne"),
     "early_read_flags": ("policy", "#1235 Frühlese-Flags: 27B TP-D"), "group_env": ("policy", "Gruppen-Env: NF uneven-DCP"),
     "prefill_transient_checkpoints": ("policy", "Checkpoints, an denen der #114-Prefill-Transient gemessen wurde"),
-    "constants": ("policy", "Messkonstanten kommen aus Records (profile_records_data): eine erzeugte Zeile hat keine -- UNCALIBRATED, nie geborgt"),
+    "constants": ("policy", "Messkonstanten kommen aus Records (profile_records_data): eine erzeugte Zeile hat keine -- UNCALIBRATED, nie borrowed"),
     "d_residue_census": ("policy", "NF cb1575e94e: Zensus statt Konstante"), "d_expect_from_p_records": ("policy", "D-EXPECT: P-Records"),
     "d_early_start_proven": ("policy", "BOOTZEIT 3: nur nach Metallbeweis je Profil"), "p_mamba_slots_from_argv": ("policy", "H92c"),
     "p_pool_posts_as_booked": ("policy", "PP-POSTEN: 27B"), "d_park_immediate": ("policy", "27B-Park, beide Linien am Metall bewiesen"),

@@ -105,7 +105,7 @@
         "top_level": "object",
         "required_keys": ["auftrag", "schritte"]
       },
-      "prompt": "Gib genau ein JSON-Objekt aus, das diesem Schema entspricht und einen Wartungsauftrag mit vier Schritten beschreibt:\n{\"auftrag\": string, \"schritte\": [{\"nummer\": int, \"titel\": string, \"dauer_minuten\": int, \"werkzeug\": string}]}\nAusgabe ausschliesslich striktes JSON. Kein Markdown, keine Kommentare, kein Text davor oder danach."
+      "prompt": "Gib genau ein JSON-Objekt aus, das diesem Schema entspricht und einen Wartungsauftrag mit vier Schritten beschreibt:\n{\"auftrag\": string, \"schritte\": [{\"nummer\": int, \"title\": string, \"dauer_minuten\": int, \"werkzeug\": string}]}\nAusgabe ausschliesslich striktes JSON. Kein Markdown, keine Kommentare, kein Text davor oder danach."
     },
     {
       "id": "json_05",

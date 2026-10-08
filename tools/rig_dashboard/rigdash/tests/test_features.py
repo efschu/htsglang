@@ -99,15 +99,15 @@ class GitCase(unittest.TestCase):
             path = os.path.join(t, "features.json")
             with open(path, "w") as fh:
                 json.dump({"features": [
-                    {"id": "A", "modell": "NF", "titel": "a", "fertig": True,
+                    {"id": "A", "modell": "NF", "title": "a", "fertig": True,
                      "zweige": [{"branch": "line", "sha": self.anc}],
-                     "schalter": [{"name": "FLLIPER_A", "art": "env", "gruppe": "D", "an_wert": "1", "default": "aus"}]},
-                    {"id": "B", "modell": "beide", "titel": "b", "fertig": True,
+                     "switch": [{"name": "FLLIPER_A", "art": "env", "gruppe": "D", "an_value": "1", "default": "aus"}]},
+                    {"id": "B", "modell": "beide", "title": "b", "fertig": True,
                      "zweige": [{"branch": "feat", "sha": self.picked_orig}],
-                     "schalter": [{"name": "FLLIPER_B", "art": "env", "gruppe": "P", "an_wert": "1", "default": "aus"}],
+                     "switch": [{"name": "FLLIPER_B", "art": "env", "gruppe": "P", "an_value": "1", "default": "aus"}],
                      "aus_begruendung": "noch kein A/B",
-                     "gewinn": [{"metrik": "Flipzeit", "nachher": "2.4", "einheit": "s", "art": "gemessen", "modell": "NF"},
-                                {"metrik": "Decode", "nachher": "40", "einheit": "tok/s", "art": "gemessen"}]},
+                     "gewinn": [{"metrik": "Flipzeit", "nachher": "2.4", "unit": "s", "art": "gemessen", "modell": "NF"},
+                                {"metrik": "Decode", "nachher": "40", "unit": "tok/s", "art": "gemessen"}]},
                 ]}, fh)
             f = features.Features(path, repo=self.repo, state_roots={"NF": nf, "27B": b27}, background=False)
             v = f.view()
@@ -137,9 +137,9 @@ class AktivCase(unittest.TestCase):
         "P": {"launch": {"argv": ["--p-host-overlap", "--chunk", "16384"], "env": {"FLLIPER_X": "1"}}},
         "D": {"launch": {"argv": ["--d-kv-token-cut=owned"], "env": {"FLLIPER_X": "0", "FLLIPER_Y": "ptx"}}}}}
 
-    def sw(self, name, proc_group, an_wert="", default="aus", art=None):
+    def sw(self, name, proc_group, an_value="", default="aus", art=None):
         return features.switch_state({"name": name, "art": art or ("flag" if name.startswith("--") else "env"),
-                                      "gruppe": proc_group, "an_wert": an_wert, "default": default}, self.ST, None)
+                                      "gruppe": proc_group, "an_value": an_value, "default": default}, self.ST, None)
 
     def test_env_per_group_and_both(self):
         self.assertEqual(self.sw("FLLIPER_X", "P", "1")["state"], "an")
@@ -161,7 +161,7 @@ class AktivCase(unittest.TestCase):
                 '# FLLIPER_D=1 ganz auskommentiert\n  --max-kv-per-request 262144\n')
         text = features.strip_comments(prof)
         st = lambda n, w="1", art="env": features.switch_state(
-            {"name": n, "art": art, "gruppe": "D", "an_wert": w, "default": "aus"}, {"groups": {}}, text)
+            {"name": n, "art": art, "gruppe": "D", "an_value": w, "default": "aus"}, {"groups": {}}, text)
         self.assertEqual(st("FLLIPER_A")["state"], "an")
         self.assertEqual(st("FLLIPER_B")["state"], "aus")
         self.assertEqual(st("FLLIPER_C")["state"], "aus")
@@ -193,13 +193,13 @@ class FileAndCliCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             p = os.path.join(t, "f.json")
             run = lambda *a: features_update.main(["--file", p, *a])
-            run("set", "--id", "H1", "--modell", "beide", "--titel", "t", "--fertig", "ja",
-                "--zweig", "desk/x=0123456789", "--schalter", "FLLIPER_H1=env:D:1:aus")
+            run("set", "--id", "H1", "--modell", "beide", "--title", "t", "--fertig", "ja",
+                "--zweig", "desk/x=0123456789", "--switch", "FLLIPER_H1=env:D:1:aus")
             run("add-zweig", "--id", "H1", "--zweig", "desk/27b-unified-0926=abcdef0123")
             with self.assertRaises(SystemExit):   # modell=beide: a gain without modell is refused
                 run("gewinn", "--id", "H1", "--metrik", "Flipzeit", "--nachher", "2.4", "--art", "gemessen")
             run("gewinn", "--id", "H1", "--modell", "NF", "--metrik", "Flipzeit", "--vorher", "3.1",
-                "--nachher", "2.4", "--einheit", "s", "--art", "gemessen")
+                "--nachher", "2.4", "--unit", "s", "--art", "gemessen")
             run("gewinn", "--id", "H1", "--modell", "NF", "--metrik", "Flipzeit", "--nachher", "2.2",
                 "--art", "gemessen")
             with open(p) as fh:
@@ -207,8 +207,8 @@ class FileAndCliCase(unittest.TestCase):
             f = d["features"][0]
             self.assertEqual([z["sha"] for z in f["zweige"]], ["0123456789", "abcdef0123"])
             self.assertEqual([(g["metrik"], g["nachher"]) for g in f["gewinn"]], [("Flipzeit", "2.2")])
-            self.assertEqual(f["schalter"][0], {"name": "FLLIPER_H1", "art": "env", "gruppe": "D",
-                                                "an_wert": "1", "default": "aus"})
+            self.assertEqual(f["switch"][0], {"name": "FLLIPER_H1", "art": "env", "gruppe": "D",
+                                                "an_value": "1", "default": "aus"})
             self.assertEqual(features.validate(d["features"]), [])
 
 
@@ -256,8 +256,8 @@ SAMPLE_27B = """# 27B-Ist-Werte (Stand 29.09.2026 ~07:10Z)
 
 
 def _prod_doc():
-    return {"features": [{"id": "B1", "modell": "beide", "titel": "Baustein", "fertig": True}],
-            "produkt": [{"id": "F%d" % i, "nr": i, "titel": "t%d" % i, "soll": "s%d" % i, "ist": {},
+    return {"features": [{"id": "B1", "modell": "beide", "title": "Baustein", "fertig": True}],
+            "produkt": [{"id": "F%d" % i, "nr": i, "title": "t%d" % i, "soll": "s%d" % i, "ist": {},
                          "bausteine": ["B1"] if i == 1 else []} for i in (1, 2, 23, 24)]}
 
 
@@ -283,15 +283,15 @@ class ProduktCase(unittest.TestCase):
 
     def test_unassigned_baustein_is_a_hint_not_a_save_blocker(self):
         d = _prod_doc()
-        d["features"].append({"id": "B2", "modell": "NF", "titel": "neu"})
+        d["features"].append({"id": "B2", "modell": "NF", "title": "neu"})
         self.assertEqual(features.validate_doc(d), [])
         self.assertEqual(len(features.unassigned_bausteine(d["produkt"], {"B1", "B2"})), 1)
 
     def test_view_joins_bausteine_and_marks_stale_ist(self):
         d = _prod_doc()
-        d["produkt"][0]["ist"] = {"NF": {"status": "fertig+aktiv", "wert": "x", "belegt_am": "2026-09-29T05:48Z"},
-                                  "27B": {"status": "fertig+aktiv", "wert": "y", "belegt_am": "2026-09-29T07:10Z"}}
-        bs = {"NF": {"B1": {"titel": "Baustein", "fertig": True, "im_image": {"state": "ja"}, "aktiv": {"state": "an"},
+        d["produkt"][0]["ist"] = {"NF": {"status": "fertig+aktiv", "value": "x", "belegt_am": "2026-09-29T05:48Z"},
+                                  "27B": {"status": "fertig+aktiv", "value": "y", "belegt_am": "2026-09-29T07:10Z"}}
+        bs = {"NF": {"B1": {"title": "Baustein", "fertig": True, "im_image": {"state": "ja"}, "aktiv": {"state": "an"},
                             "image_aber_aus": False, "aus_begruendung": None, "gewinn": [], "zweige": []}}}
         start = features.belegt_ts("2026-09-29T06:54Z")
         v = features.produkt_view(d["produkt"], bs, {"NF": start, "27B": start})
@@ -299,9 +299,9 @@ class ProduktCase(unittest.TestCase):
         self.assertEqual([p["nr"] for p in v], [1, 2, 23, 24])
         self.assertTrue(f1["ist"]["NF"]["veraltet"])
         self.assertFalse(f1["ist"]["27B"]["veraltet"])
-        self.assertEqual(v[1]["ist"]["NF"]["status"], "unbelegt")
+        self.assertEqual(v[1]["ist"]["NF"]["status"], "unverified")
         self.assertIsNone(v[1]["ist"]["NF"].get("veraltet"))
-        self.assertEqual(f1["bausteine"][0]["je_modell"]["NF"]["aktiv"], "an")
+        self.assertEqual(f1["bausteine"][0]["per_model"]["NF"]["aktiv"], "an")
 
     def test_attach_current_value_or_named_marker(self):
         fv = {"models": [{"model": "NF", "boot": {"boot_s": 281, "format": "int4-mixed", "rc": "rc12z30u"}},
@@ -310,7 +310,7 @@ class ProduktCase(unittest.TestCase):
                           {"id": "F12", "untertabelle": {"zeilen": [{"name": "INT4 (AutoRound)"}, {"name": "NVFP4"}]}}]}
         features.attach_current(fv, [], None)
         f17, f9, f12 = fv["produkt"]
-        self.assertIn("281 s", f17["aktuell"]["NF"]["wert"])
+        self.assertIn("281 s", f17["aktuell"]["NF"]["value"])
         self.assertEqual(f17["aktuell"]["NF"]["je_format"], {"INT4": "dieser Boot", "NVFP4": "no boot in this format"})
         self.assertEqual(f17["aktuell"]["27B"], {"leer": "no boot of this model found"})
         self.assertIn("marker", f9["aktuell"]["NF"]["kein_instrument"])
@@ -333,19 +333,19 @@ class ProduktCase(unittest.TestCase):
             f1, f2, f23, f24 = d["produkt"]
             self.assertEqual(f1["ist"]["NF"], {"status": "offen"})
             self.assertEqual(f1["ist"]["27B"]["status"], "fertig+aktiv")
-            self.assertEqual(f1["ist"]["27B"]["wert"], "flip_total 2167 ms")
-            self.assertEqual(f1["ist"]["27B"]["quelle"], features_update.QUELLE_27B)
+            self.assertEqual(f1["ist"]["27B"]["value"], "flip_total 2167 ms")
+            self.assertEqual(f1["ist"]["27B"]["quelle"], features_update.SOURCE_27B)
             self.assertEqual(f1["ist"]["27B"]["belegt_am"], "2026-09-29T07:10Z")
             self.assertEqual(f2["ist"]["27B"]["status"], "fertig+aktiv")   # earliest keyword wins
             k = f2["kreuztabelle"]["zellen"]["27B"]
             self.assertEqual(len(k), 21)
-            self.assertEqual(k["tp+tp"], {"status": "am Metall belegt", "note": "24g", "quelle": features_update.QUELLE_27B})
+            self.assertEqual(k["tp+tp"], {"status": "am Metall belegt", "note": "24g", "quelle": features_update.SOURCE_27B})
             self.assertEqual(k["dcp+kvonly"]["note"], "F15")
             self.assertEqual(f23["untertabelle"]["zeilen"][0]["name"], "27B INT8 PP3")
             m = f24["matrix"]["zellen"]["27B"]
-            self.assertEqual(m["NVFP4 5090 solo|1|2k|code"]["wert"], "23,6 ms")
+            self.assertEqual(m["NVFP4 5090 solo|1|2k|code"]["value"], "23,6 ms")
             self.assertEqual(m["NVFP4 5090 solo|2|10k|prosa"]["status"], "ungültig")
-            self.assertEqual(m["INT8 uneven DCP D TP3|6|gemischt|gemischt"]["wert"], "62,0 ms (n=208)")
+            self.assertEqual(m["INT8 uneven DCP D TP3|6|gemischt|gemischt"]["value"], "62,0 ms (n=208)")
             self.assertEqual(f2["marker"]["27B"]["marker"], "state.json groups.<P|D>.launch.argv")
             self.assertEqual(f24["marker"]["27B"]["je_format"]["INT8"], "ja (Tiefe gemischt)")
             self.assertEqual(features.validate_doc(d), [])
@@ -356,19 +356,19 @@ class ProduktCase(unittest.TestCase):
             with open(p, "w") as fh:
                 json.dump(_prod_doc(), fh)
             run = lambda *a: features_update.main(["--file", p, *a])
-            run("produkt-ist", "--id", "F1", "--modell", "NF", "--status", "fertig+aktiv", "--wert", "2,1 s",
-                "--beleg", "Boot x", "--belegt-am", "2026-09-29T06:00Z")
+            run("produkt-ist", "--id", "F1", "--modell", "NF", "--status", "fertig+aktiv", "--value", "2,1 s",
+                "--evidence", "Boot x", "--belegt-am", "2026-09-29T06:00Z")
             with self.assertRaises(SystemExit):
                 run("produkt-ist", "--id", "F1", "--modell", "NF", "--status", "fertig+aktiv", "--belegt-am", "heute")
             run("kreuz", "--modell", "NF", "--a", "kvonly", "--b", "dcp", "--status", "nur Desk", "--note", "F15")
             run("matrix", "--id", "F24", "--modell", "NF", "--form", "Form A", "--bs", "1", "--tiefe", "kurz",
-                "--text", "code", "--wert", "131,9 tok/s", "--boot", "x177", "--beleg", "Probe")
+                "--text", "code", "--value", "131,9 tok/s", "--boot", "x177", "--evidence", "Probe")
             run("matrix", "--id", "F24", "--modell", "NF", "--form", "Form A", "--bs", "2", "--tiefe", "kurz",
-                "--text", "prosa", "--ungueltig", "--boot", "x177", "--beleg", "EOS < 500")
+                "--text", "prosa", "--ungueltig", "--boot", "x177", "--evidence", "EOS < 500")
             run("zeile-ist", "--id", "F23", "--zeile", "97k", "--modell", "NF", "--status", "fertig+aktiv",
-                "--wert", "24,18 s", "--beleg", "x175")
-            run("set", "--id", "B2", "--modell", "NF", "--titel", "neu", "--produkt", "F2")
-            run("boot-override", "--boot", "b-20260929T002052Z-86f6", "--lifecycle", "stopped (geplant)", "--beleg", "27B")
+                "--value", "24,18 s", "--evidence", "x175")
+            run("set", "--id", "B2", "--modell", "NF", "--title", "neu", "--produkt", "F2")
+            run("boot-override", "--boot", "b-20260929T002052Z-86f6", "--lifecycle", "stopped (geplant)", "--evidence", "27B")
             with open(p) as fh:
                 d = json.load(fh)
             P = {x["id"]: x for x in d["produkt"]}
@@ -395,21 +395,21 @@ class ProduktCase(unittest.TestCase):
             with open(p, "w") as fh:
                 json.dump(_prod_doc(), fh)
             run = lambda *a: features_update.main(["--file", p, *a])
-            run("produkt-ist", "--id", "F1", "--modell", "NF", "--status", "fertig+aktiv", "--wert", "7,06 s",
-                "--beleg", "z30u", "--erreicht", "nein", "--erreicht-grund", "7,06 s gegen Soll <= 3 s")
-            run("erreicht", "--id", "F2", "--modell", "27B", "--wert", "teilweise", "--grund", "KV-only nur Desk")
+            run("produkt-ist", "--id", "F1", "--modell", "NF", "--status", "fertig+aktiv", "--value", "7,06 s",
+                "--evidence", "z30u", "--reached", "nein", "--reached-reason", "7,06 s gegen Soll <= 3 s")
+            run("reached", "--id", "F2", "--modell", "27B", "--value", "teilweise", "--reason", "KV-only nur Desk")
             with self.assertRaises(SystemExit):
-                run("erreicht", "--id", "F2", "--modell", "27B", "--wert", "vielleicht")
+                run("reached", "--id", "F2", "--modell", "27B", "--value", "vielleicht")
             with open(p) as fh:
                 d = json.load(fh)
             P = {x["id"]: x for x in d["produkt"]}
-            self.assertEqual((P["F1"]["ist"]["NF"]["status"], P["F1"]["ist"]["NF"]["erreicht"]), ("fertig+aktiv", "nein"))
-            self.assertEqual(P["F2"]["ist"]["27B"], {"status": "unbelegt", "erreicht": "teilweise",
-                                                     "erreicht_grund": "KV-only nur Desk"})
-            d["produkt"][0]["ist"]["NF"]["erreicht"] = "fast"
-            self.assertTrue(any("erreicht" in x for x in features.validate_doc(d)))
+            self.assertEqual((P["F1"]["ist"]["NF"]["status"], P["F1"]["ist"]["NF"]["reached"]), ("fertig+aktiv", "nein"))
+            self.assertEqual(P["F2"]["ist"]["27B"], {"status": "unverified", "reached": "teilweise",
+                                                     "reached_reason": "KV-only nur Desk"})
+            d["produkt"][0]["ist"]["NF"]["reached"] = "fast"
+            self.assertTrue(any("reached" in x for x in features.validate_doc(d)))
             v = features.produkt_view([P["F1"]], {})
-            self.assertEqual(v[0]["ist"]["NF"]["erreicht_grund"], "7,06 s gegen Soll <= 3 s")
+            self.assertEqual(v[0]["ist"]["NF"]["reached_reason"], "7,06 s gegen Soll <= 3 s")
             out = os.path.join(t, "o.md")
             run("md", "--out", out, "--live-url", "")
             self.assertIn("Target reached? 27B / NF", open(out).read())

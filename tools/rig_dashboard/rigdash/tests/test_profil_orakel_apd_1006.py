@@ -1,11 +1,11 @@
-"""AP-D (Plan Profil-Planer 06.10.): der Trockenlauf des Profil-Editors auf dem Orakel-Weg und ``POST /api/profil/propose``.
+"""AP-D (Plan Profil-Planer 06.10.): der Trockenlauf des Profil-Editors auf dem Oracle-Weg und ``POST /api/profil/propose``.
 
 Gepinnt:
-  * ``ProfilEditor.dry_run`` fragt das Orakel (Launcher-Trockenlauf im Kindprozess); das Rueckgabeformat bleibt (ok, goes, verdict, rejections,
-    notes, cards, force_note, reference), neu sind quelle, orakel (Ausgang, Profil-Hash, Cache) und verdikte.  Ein Absturz des Launchers ist ein
-    Verdikt ORAKEL-ABSTURZ (nicht forcebar), nie ein Fehler der Route.  Kann das Orakel nicht fragen, gilt die Teilpruefung des Planer-Gates
+  * ``ProfilEditor.dry_run`` fragt das Oracle (Launcher-Trockenlauf im Kindprozess); das Rueckgabeformat bleibt (ok, goes, verdict, rejections,
+    notes, cards, force_note, reference), neu sind quelle, oracle (Ausgang, Profil-Hash, Cache) und verdikte.  Ein Absturz des Launchers ist ein
+    Verdikt ORAKEL-ABSTURZ (nicht forcebar), nie ein Fehler der Route.  Kann das Oracle nicht fragen, gilt die Teilpruefung des Planer-Gates
     MIT Notiz.
-  * Mit dem ECHTEN Orakel (Kindprozess, Launcher-Trockenlauf): Referenz-Rig = keine Verweigerung (wie das Gate heute); zwei Karten = PROFILE-VECTORS
+  * Mit dem ECHTEN Oracle (Kindprozess, Launcher-Trockenlauf): Referenz-Rig = keine Verweigerung (wie das Gate heute); zwei Karten = PROFILE-VECTORS
     benannt; der Vorschlag traegt N-Vektoren, kein Verdikt nennt einen; das Startprofil ist ein flliper.server/1 mit Herkunft planer, Verdikt und Kanten
     je Wert; der zweite gleiche Aufruf kommt aus dem Cache.
   * ``force_verdict`` des Dashboards und ``propose_verdict.force_state_of`` des Planers lesen das Register gleich.
@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
 from rigdash import kartenplan as K  # noqa: E402
 from rigdash import profil as P  # noqa: E402
-from rigdash import profil_oracle as ORA  # noqa: E402
+from rigdash import profile_oracle as ORA  # noqa: E402
 
 FIXTURE_TREE = os.path.join(HERE, "fixtures", "kartenplan", "planner_tree", "python")
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
@@ -78,20 +78,20 @@ class FakeOracle:
             return {"ok": False, "error": self.error}
         if kind == "propose":
             return dict(copy.deepcopy(self.propose), ok=True, cached=False, cache_key="prop123")
-        return {"ok": True, "verdikt": copy.deepcopy(self.budget_verdict), "cached": False, "cache_key": "abc123"}
+        return {"ok": True, "verdict": copy.deepcopy(self.budget_verdict), "cached": False, "cache_key": "abc123"}
 
 
 def _v(code, **kw):
-    d = {"code": code, "ebene": "lauf", "forcebar": True, "force_state": "force", "grund": code + " grund", "konsequenz": "k", "text": code + " text", "titel": code,
-         "werte": [], "durchgelassen": True}
+    d = {"code": code, "level": "run", "forcebar": True, "force_state": "force", "reason": code + " reason", "consequence": "k", "text": code + " text", "title": code,
+         "values": [], "durchgelassen": True}
     d.update(kw)
     return d
 
 
-def _doc(rank_verdicts, ausgang="geht_mit_force", **kw):
-    d = {"schema": "flliper.verdikt/1", "n": 3, "verdikte": rank_verdicts, "ausgang": ausgang, "geht": ausgang == "geht", "geht_mit_force": ausgang != "absturz",
-         "forced": [], "plan": {}, "zaehlung": {}, "profil": {"datei_sha256": "f" * 64, "eingabe_sha256": "e" * 64}, "argv_sha256": "a" * 64,
-         "orakel": {"dauer_s": 1.5, "version": {"launcher": "x"}, "laeufe": 1, "notizen": ["note from the oracle"]}}
+def _doc(rank_verdicts, outcome="ok_with_force", **kw):
+    d = {"schema": "flliper.verdict/1", "n": 3, "verdikte": rank_verdicts, "outcome": outcome, "geht": outcome == "geht", "ok_with_force": outcome != "crash",
+         "forced": [], "plan": {}, "zaehlung": {}, "profil": {"file_sha256": "f" * 64, "input_sha256": "e" * 64}, "argv_sha256": "a" * 64,
+         "oracle": {"duration_s": 1.5, "version": {"launcher": "x"}, "runs": 1, "notizen": ["note from the oracle"]}}
     d.update(kw)
     return d
 
@@ -120,14 +120,14 @@ class DryRunWithOracle(unittest.TestCase):
 
     def test_the_return_format_is_kept_and_new_fields_are_added(self):
         orc = FakeOracle(_doc([]), )
-        orc.budget_verdict = _doc([], ausgang="geht")
+        orc.budget_verdict = _doc([], outcome="geht")
         _ed, d = self._run(orc)
         for k in ("ok", "goes", "verdict", "rejections", "notes", "cards", "force_note", "reference"):          # profil.py:655-669 of the base
             self.assertIn(k, d)
-        self.assertEqual(d["quelle"], "orakel")
-        self.assertEqual(d["orakel"]["ausgang"], "geht")
-        self.assertEqual(d["orakel"]["profil"]["datei_sha256"], "f" * 64)
-        self.assertEqual((d["orakel"]["cached"], d["orakel"]["cache_key"]), (False, "abc123"))
+        self.assertEqual(d["quelle"], "oracle")
+        self.assertEqual(d["oracle"]["outcome"], "geht")
+        self.assertEqual(d["oracle"]["profil"]["file_sha256"], "f" * 64)
+        self.assertEqual((d["oracle"]["cached"], d["oracle"]["cache_key"]), (False, "abc123"))
         self.assertEqual(d["verdikte"], [])
         self.assertEqual([q["code"] for q in d["rejections"]], ["PROFIL-STATUS"])          # entrypoint code, the synthetic profile is experimentell
         self.assertIn("note from the oracle", d["notes"])
@@ -135,59 +135,59 @@ class DryRunWithOracle(unittest.TestCase):
         self.assertEqual([c["index"] for c in d["cards"]], [0, 1, 2])
 
     def test_the_request_to_the_oracle_is_the_rendered_profile_on_the_chosen_cards(self):
-        orc = FakeOracle(_doc([], ausgang="geht"))
+        orc = FakeOracle(_doc([], outcome="geht"))
         ed, d = self._run(orc)
         (kind, req, parts), = orc.calls
-        self.assertEqual(kind, "verdikt")
+        self.assertEqual(kind, "verdict")
         doc = ed.load("release", "demo")["doc"]
         pj, _ = ed.mods()
         self.assertEqual(req["basis"]["env_text"], pj.render_env(doc))
-        self.assertEqual(len(req["inventar"]["cards"]), 3)
+        self.assertEqual(len(req["inventory"]["cards"]), 3)
         self.assertEqual(parts["env_sha256"], ORA.sha256_text(pj.render_env(doc)))
-        self.assertEqual([c["entry"]["id"] for c in req["inventar"]["cards"]], ["rtx3080-20", "rtx5090-32", "rtx3080-20"])
+        self.assertEqual([c["entry"]["id"] for c in req["inventory"]["cards"]], ["rtx3080-20", "rtx5090-32", "rtx3080-20"])
         self.assertTrue(any("synthetic" in n.lower() for n in d["notes"]))
 
     def test_forced_refusals_carry_class_and_force_state_of_the_register(self):
         hc = _v("HW-COUNT", text="HW-COUNT: 2 cards would be ...", launcher_code=None)
         hu = _v("HW-UNCALIBRATED", text="HW-UNCALIBRATED: profile 'x'")
-        blk = _v("PROFILE-VECTORS", ebene="blocker", parent="HW-COUNT")
+        blk = _v("PROFILE-VECTORS", level="blocker", parent="HW-COUNT")
         _ed, d = self._run(FakeOracle(_doc([hc, blk, hu])), RIG[:2])
-        by = {q["code"]: q for q in d["rejections"] if "verdikt" in q}            # the oracle's rejections (PROFILE_CARD_COUNT of the entrypoint is another HW-COUNT)
+        by = {q["code"]: q for q in d["rejections"] if "verdict" in q}            # the oracle's rejections (PROFILE_CARD_COUNT of the entrypoint is another HW-COUNT)
         self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= set(by))
         self.assertNotIn("PROFILE-VECTORS", {q["code"] for q in d["rejections"]})   # a blocker is named inside HW-COUNT, it is not a rejection of its own
         for c in ("HW-COUNT", "HW-UNCALIBRATED"):
             q = by[c]
-            self.assertEqual((q["klass"], q["force_state"], q["forcebar"]), ("wert", "force", True))
+            self.assertEqual((q["klass"], q["force_state"], q["forcebar"]), ("value", "force", True))
             self.assertIn("force overrides it", q["force"])
             self.assertTrue(q["why_class"])
-            self.assertIn("verdikt", q)
+            self.assertIn("verdict", q)
         self.assertEqual([x["code"] for x in d["verdikte"]], ["HW-COUNT", "PROFILE-VECTORS", "HW-UNCALIBRATED"])      # all verdicts, blockers too
 
     def test_a_crash_of_the_launcher_is_a_verdict_not_a_route_error(self):
-        crash = _v("ORAKEL-ABSTURZ", ebene="absturz", forcebar=None, force_state="blockiert", durchgelassen=False, exc_type="IndexError",
+        crash = _v("ORAKEL-ABSTURZ", level="crash", forcebar=None, force_state="is_blocked", durchgelassen=False, exc_type="IndexError",
                    wo="<TREE>/python/flliper/srt/pdflip/launcher.py:15326 in f", text="IndexError: list index out of range (<TREE>/python/flliper/srt/pdflip/launcher.py:15326 in f)")
-        _ed, d = self._run(FakeOracle(_doc([_v("HW-COUNT"), crash], ausgang="absturz")), RIG[:2] + RIG[:2])
+        _ed, d = self._run(FakeOracle(_doc([_v("HW-COUNT"), crash], outcome="crash")), RIG[:2] + RIG[:2])
         by = {q["code"]: q for q in d["rejections"]}
         a = by["ORAKEL-ABSTURZ"]
-        self.assertEqual((a["klass"], a["forcebar"], a["force_state"]), ("nicht_forcebar", False, "blockiert"))
+        self.assertEqual((a["klass"], a["forcebar"], a["force_state"]), ("nicht_forcebar", False, "is_blocked"))
         self.assertIn("no", a["force"])
         self.assertIn("launcher.py:15326", a["source"])
         self.assertIn("IndexError", a["text"])
         self.assertIn("remain even with force", d["verdict"])
-        self.assertEqual(d["orakel"]["ausgang"], "absturz")
+        self.assertEqual(d["oracle"]["outcome"], "crash")
         self.assertFalse(d["goes"])
 
     def test_a_refusal_with_a_register_code_keeps_the_registers_words(self):
-        last = _v("LAUNCHER-UNKLASSIFIZIERT", forcebar=False, force_state="blockiert", durchgelassen=False, launcher_code="W19", text="W19 dormant-residue ...")
-        _ed, d = self._run(FakeOracle(_doc([_v("HW-COUNT"), last], ausgang="verweigert")))
+        last = _v("LAUNCHER-UNKLASSIFIZIERT", forcebar=False, force_state="is_blocked", durchgelassen=False, launcher_code="W19", text="W19 dormant-residue ...")
+        _ed, d = self._run(FakeOracle(_doc([_v("HW-COUNT"), last], outcome="verweigert")))
         q = {x["code"]: x for x in d["rejections"]}["LAUNCHER-UNKLASSIFIZIERT"]
-        self.assertEqual((q["klass"], q["force_state"]), ("nicht_forcebar", "blockiert"))
+        self.assertEqual((q["klass"], q["force_state"]), ("nicht_forcebar", "is_blocked"))
         self.assertIn("W19", q["source"])
 
     def test_oracle_cannot_ask_falls_back_to_the_planner_gate_with_a_note(self):
         _ed, d = self._run(FakeOracle(error="Python of the flliper environment is missing: /nowhere"), RIG[:2])
         self.assertEqual(d["quelle"], "gate")
-        self.assertNotIn("orakel", d)
+        self.assertNotIn("oracle", d)
         self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= {q["code"] for q in d["rejections"]})
         self.assertTrue(any("Oracle (launcher dry run) not available" in n and "/nowhere" in n for n in d["notes"]), d["notes"])
         # the same rejections as an editor without any oracle
@@ -200,15 +200,15 @@ class DryRunWithOracle(unittest.TestCase):
         self.assertEqual(d2["quelle"], "gate")
 
     def test_an_oracle_that_could_not_ask_is_not_a_verdict(self):
-        errors = _v("ORAKEL-FEHLER", ebene="orakel", forcebar=None, force_state="blockiert", text="OSError: scratch dir not writable")
-        _ed, d = self._run(FakeOracle(_doc([errors], ausgang="orakel_fehler")), RIG[:2])
+        errors = _v("ORAKEL-FEHLER", level="oracle", forcebar=None, force_state="is_blocked", text="OSError: scratch dir not writable")
+        _ed, d = self._run(FakeOracle(_doc([errors], outcome="oracle_error")), RIG[:2])
         self.assertEqual(d["quelle"], "gate")
         self.assertNotIn("ORAKEL-FEHLER", [q["code"] for q in d["rejections"]])
         self.assertTrue(any("could not be asked" in n and "scratch dir" in n for n in d["notes"]))
 
     def test_the_card_count_of_the_profile_is_still_checked(self):
         """PROFILE_CARD_COUNT is the entrypoint's gate (the launcher does not read it): kept beside the oracle's verdicts."""
-        _ed, d = self._run(FakeOracle(_doc([], ausgang="geht")), RIG[:2])
+        _ed, d = self._run(FakeOracle(_doc([], outcome="geht")), RIG[:2])
         hc = [q for q in d["rejections"] if q["code"] == "HW-COUNT"]
         self.assertEqual(len(hc), 1)
         self.assertIn("PROFILE_CARD_COUNT=3", hc[0]["source"])
@@ -216,21 +216,21 @@ class DryRunWithOracle(unittest.TestCase):
     def test_the_rig_cards_go_with_their_real_uuids(self):
         """Chosen cards that are exactly the NVML cards of this rig (hardware profile) are asked with the real profile, not synthetic cards."""
         hw = _hw_profile(_rows(3))
-        orc = FakeOracle(_doc([], ausgang="geht"))
+        orc = FakeOracle(_doc([], outcome="geht"))
         ed = editor(self.tmp, oracle=orc, hardware=lambda: {"ok": True, "profile": hw})
         d = ed.dry_run(ed.load("release", "demo")["doc"], RIG)
         (_k, req, _p), = orc.calls
-        self.assertEqual(req["inventar"].get("hardware", {}).get("schema"), "flliper.hardware/1")
-        self.assertNotIn("cards", req["inventar"])
+        self.assertEqual(req["inventory"].get("hardware", {}).get("schema"), "flliper.hardware/1")
+        self.assertNotIn("cards", req["inventory"])
         self.assertTrue(any("real UUIDs" in n for n in d["notes"]))
         # two other cards: synthetic
-        orc2 = FakeOracle(_doc([], ausgang="geht"))
+        orc2 = FakeOracle(_doc([], outcome="geht"))
         ed2 = editor(self.tmp + "_y", oracle=orc2, hardware=lambda: {"ok": True, "profile": hw}) if os.makedirs(self.tmp + "_y") is None else None
         try:
             ed2.dry_run(ed2.load("release", "demo")["doc"], RIG[:2])
         finally:
             shutil.rmtree(self.tmp + "_y", ignore_errors=True)
-        self.assertIn("cards", orc2.calls[0][1]["inventar"])
+        self.assertIn("cards", orc2.calls[0][1]["inventory"])
 
 
 def _rows(n):
@@ -264,22 +264,22 @@ class OracleServiceCache(unittest.TestCase):
         return svc, calls
 
     def test_the_second_equal_question_is_a_cache_hit(self):
-        svc, calls = self._svc([{"ok": True, "verdikt": {"n": 1}}])
-        a = svc.ask("verdikt", {"x": 1}, {"inventar": ["a"], "env_sha256": "h1", "form": None})
-        b = svc.ask("verdikt", {"x": 1}, {"inventar": ["a"], "env_sha256": "h1", "form": None})
+        svc, calls = self._svc([{"ok": True, "verdict": {"n": 1}}])
+        a = svc.ask("verdict", {"x": 1}, {"inventory": ["a"], "env_sha256": "h1", "form": None})
+        b = svc.ask("verdict", {"x": 1}, {"inventory": ["a"], "env_sha256": "h1", "form": None})
         self.assertEqual((a["cached"], b["cached"]), (False, True))
         self.assertEqual(a["cache_key"], b["cache_key"])
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["what"], "verdikt")
+        self.assertEqual(calls[0]["what"], "verdict")
         self.assertEqual(svc.cache_info()["treffer"], 1)
 
     def test_every_part_of_the_key_matters(self):
-        base = {"inventar": ["a"], "env_sha256": "h1", "form": "flip"}
-        svc, calls = self._svc([{"ok": True, "verdikt": {}} for _ in range(4)])
-        svc.ask("verdikt", {}, base)
-        svc.ask("verdikt", {}, dict(base, inventar=["a", "b"]))             # another inventory
-        svc.ask("verdikt", {}, dict(base, form="tp"))                        # another form
-        svc.ask("verdikt", {}, dict(base, env_sha256="h2"))                  # drift of the profile (plan 4c)
+        base = {"inventory": ["a"], "env_sha256": "h1", "form": "flip"}
+        svc, calls = self._svc([{"ok": True, "verdict": {}} for _ in range(4)])
+        svc.ask("verdict", {}, base)
+        svc.ask("verdict", {}, dict(base, inventory=["a", "b"]))             # another inventory
+        svc.ask("verdict", {}, dict(base, form="tp"))                        # another form
+        svc.ask("verdict", {}, dict(base, env_sha256="h2"))                  # drift of the profile (plan 4c)
         self.assertEqual(len(calls), 4)
 
     def test_a_changed_source_of_the_oracle_is_another_key(self):
@@ -290,28 +290,28 @@ class OracleServiceCache(unittest.TestCase):
                 with open(os.path.join(w, n), "w") as fh:
                     fh.write("x")
             svc = ORA.OracleService(d, python="/nowhere/python")
-            k1 = svc.key("verdikt", {"a": 1})
+            k1 = svc.key("verdict", {"a": 1})
             with open(os.path.join(w, "launcher.py"), "w") as fh:
                 fh.write("xy")
-            self.assertNotEqual(k1, svc.key("verdikt", {"a": 1}))
+            self.assertNotEqual(k1, svc.key("verdict", {"a": 1}))
 
     def test_errors_are_not_cached(self):
-        svc, calls = self._svc([{"ok": False, "error": "tot"}, {"ok": True, "verdikt": {}}])
-        self.assertFalse(svc.ask("verdikt", {}, {"p": 1})["ok"])
-        self.assertTrue(svc.ask("verdikt", {}, {"p": 1})["ok"])
+        svc, calls = self._svc([{"ok": False, "error": "tot"}, {"ok": True, "verdict": {}}])
+        self.assertFalse(svc.ask("verdict", {}, {"p": 1})["ok"])
+        self.assertTrue(svc.ask("verdict", {}, {"p": 1})["ok"])
         self.assertEqual(len(calls), 2)
 
     def test_cache_is_bounded(self):
-        svc, calls = self._svc([{"ok": True, "verdikt": {}} for _ in range(5)])
+        svc, calls = self._svc([{"ok": True, "verdict": {}} for _ in range(5)])
         svc.cache_size = 3
         for i in range(5):
-            svc.ask("verdikt", {}, {"i": i})
-        self.assertEqual(svc.cache_info()["eintraege"], 3)
+            svc.ask("verdict", {}, {"i": i})
+        self.assertEqual(svc.cache_info()["entries"], 3)
 
     def test_unknown_kind_and_dead_worker_are_errors_not_exceptions(self):
         svc = ORA.OracleService(FIXTURE_TREE, python="/nowhere/python")
         self.assertFalse(svc.ask("start", {}, {})["ok"])
-        res = svc.ask("verdikt", {}, {"p": 1})                                # no such python: the service says so
+        res = svc.ask("verdict", {}, {"p": 1})                                # no such python: the service says so
         self.assertFalse(res["ok"])
         self.assertIn("/nowhere/python", res["error"])
 
@@ -385,21 +385,21 @@ class ProposeRequests(unittest.TestCase):
 
     def test_form_ziele_basis_and_inventory_are_checked(self):
         for body, needle in (({"basis": {"kind": "release", "name": "demo"}, "form": "quad"}, "form must be flip, tp, dual or single"),
-                             ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"x": 1}}, "unknown goals"),
-                             ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"seats": 0}}, "Goal seats must be between"),
-                             ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"p_cut": "x"}}, "Goal p_cut must be one of"),
-                             ({"basis": {"kind": "release", "name": "demo"}, "inventar": "alles"}, "inventar must be"),
+                             ({"basis": {"kind": "release", "name": "demo"}, "goals": {"x": 1}}, "unknown goals"),
+                             ({"basis": {"kind": "release", "name": "demo"}, "goals": {"seats": 0}}, "Goal seats must be between"),
+                             ({"basis": {"kind": "release", "name": "demo"}, "goals": {"p_cut": "x"}}, "Goal p_cut must be one of"),
+                             ({"basis": {"kind": "release", "name": "demo"}, "inventory": "alles"}, "inventory must be"),
                              ({"basis": {"kind": "wild", "name": "demo"}}, "basis.kind"),
                              ({"basis": {"kind": "release", "name": "../etc"}}, "invalid profile name"),
                              ({"basis": {"kind": "release", "name": "demo"}, "model_path": "/etc"}, "model root")):
-            with self.assertRaises(P.ProfilError, msg=str(body)) as cm:
+            with self.assertRaises(P.ProfileError, msg=str(body)) as cm:
                 self.ed.propose(body)
             self.assertIn(needle, str(cm.exception), body)
 
     def test_without_an_oracle_it_says_so(self):
         ed = editor(self.tmp + "_n", oracle=None) if os.makedirs(self.tmp + "_n") is None else None
         try:
-            with self.assertRaises(P.ProfilError) as cm:
+            with self.assertRaises(P.ProfileError) as cm:
                 ed.propose({"basis": {"kind": "release", "name": "demo"}})
         finally:
             shutil.rmtree(self.tmp + "_n", ignore_errors=True)
@@ -417,7 +417,7 @@ class ProposeRequests(unittest.TestCase):
     def test_the_oracle_error_comes_back_as_ok_false(self):
         ed = editor(self.tmp + "_e", oracle=FakeOracle(error="no model profile: not mounted")) if os.makedirs(self.tmp + "_e") is None else None
         try:
-            r = ed.propose({"basis": {"kind": "release", "name": "demo"}, "inventar": RIG})
+            r = ed.propose({"basis": {"kind": "release", "name": "demo"}, "inventory": RIG})
         finally:
             shutil.rmtree(self.tmp + "_e", ignore_errors=True)
         self.assertFalse(r["ok"])
@@ -426,9 +426,9 @@ class ProposeRequests(unittest.TestCase):
 
 def _values(*rows):
     out = []
-    for key, alt, value, policy, zustand in rows:
-        out.append({"key": key, "group": "-", "policy": policy, "alt": alt, "wert": value, "eintraege": 1, "zustand": zustand, "herkunft": "Herkunft von " + key,
-                    "grund": "Grund von " + key, "in_argv": value is not None, "geaendert": alt != value})
+    for key, alt, value, policy, state in rows:
+        out.append({"key": key, "group": "-", "policy": policy, "alt": alt, "value": value, "entries": 1, "state": state, "source": "Herkunft von " + key,
+                    "reason": "Grund von " + key, "in_argv": value is not None, "changed": alt != value})
     return out
 
 
@@ -437,19 +437,19 @@ class ProposeStartprofil(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="apd_")
-        werte = _values(("--p-bs", "2", "3", "seats", "vorgeschlagen"),
-                       ("--extra-p --rank-moe-ratio", "183,137,168", "300,212", "moe_ratio", "unbelegt"),
-                       ("--env-p FLLIPER_MOE_SCRATCH_SLOTS", "74,48,48", "74,48", "scratch", "unbelegt"),
-                       ("--pp-stage-ratio", "29,11,8", None, "cut", "unbelegt"),
+        values = _values(("--p-bs", "2", "3", "seats", "vorgeschlagen"),
+                       ("--extra-p --rank-moe-ratio", "183,137,168", "300,212", "moe_ratio", "unverified"),
+                       ("--env-p FLLIPER_MOE_SCRATCH_SLOTS", "74,48,48", "74,48", "scratch", "unverified"),
+                       ("--pp-stage-ratio", "29,11,8", None, "cut", "unverified"),
                        ("--d-only", None, "", "form", "vorgeschlagen"),
-                       ("--pp-stage-ratio (Seed)", None, "32,8", "cut_seed", "unbelegt"),
+                       ("--pp-stage-ratio (Seed)", None, "32,8", "cut_seed", "unverified"),
                        ("--d-bs", "6", "6", "knob", "vorgeschlagen"))
-        self.answer = {"vorschlag": {"schema": "flliper.propose-a/1", "form": "flip", "n": 2, "werte": werte, "ziele": {"seats": 3, "kv_tokens": 262144},
-                                     "cards": [], "inventory": {}, "seeds": {}, "fit": {"level": "ja"}, "unbelegt": ["x"], "hinweise": [], "blocker": [],
-                                     "vektorlaengen": {"--extra-p --rank-moe-ratio": 2}, "vektoren_ok": True, "vektoren_falsch": {}, "basis": "demo.env"},
-                       "verdikt": _doc([_v("HW-COUNT")], n=2, ausgang="geht_mit_force"),
-                       "je_wert": {"--extra-p --rank-moe-ratio": [{"code": "UNBELEGT", "ebene": "wert", "forcebar": None, "force_state": "hinweis",
-                                                                   "grund": "g", "konsequenz": "k"}]},
+        self.answer = {"proposal": {"schema": "flliper.propose-a/1", "form": "flip", "n": 2, "values": values, "goals": {"seats": 3, "kv_tokens": 262144},
+                                     "cards": [], "inventory": {}, "seeds": {}, "fit": {"level": "ja"}, "unverified": ["x"], "notes": [], "blocker": [],
+                                     "vector_lengths": {"--extra-p --rank-moe-ratio": 2}, "vectors_ok": True, "vectors_wrong": {}, "basis": "demo.env"},
+                       "verdict": _doc([_v("HW-COUNT")], n=2, outcome="ok_with_force"),
+                       "per_value": {"--extra-p --rank-moe-ratio": [{"code": "UNVERIFIED", "level": "value", "forcebar": None, "force_state": "note",
+                                                                   "reason": "g", "consequence": "k"}]},
                        "launch": {"argv": ["--model", "/m"], "env": {}}}
         self.orc = FakeOracle(propose=self.answer)
         self.ed = editor(self.tmp, oracle=self.orc, hardware=lambda: {"ok": True, "profile": _hw_profile(_rows(2))})
@@ -458,7 +458,7 @@ class ProposeStartprofil(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _body(self, **kw):
-        return dict({"basis": {"kind": "release", "name": "demo"}, "form": "flip", "inventar": "rig", "ziele": {"seats": 3}}, **kw)
+        return dict({"basis": {"kind": "release", "name": "demo"}, "form": "flip", "inventory": "rig", "goals": {"seats": 3}}, **kw)
 
     def test_the_startprofil_is_the_base_profile_with_the_proposals_values(self):
         r = self.ed.propose(self._body())
@@ -477,43 +477,43 @@ class ProposeStartprofil(unittest.TestCase):
         self.assertEqual(rows["flag:--p-hostgap"]["origin"], "profil")          # untouched values keep their origin
         self.assertEqual(rows["flag:--model"]["origin"], "profil")
         self.assertEqual(r["nicht_uebernommen"], [])
-        self.assertEqual(sp["doc"]["meta"]["vorschlag"]["form"], "flip")
+        self.assertEqual(sp["doc"]["meta"]["proposal"]["form"], "flip")
         self.assertEqual(sp["doc"]["meta"]["planner"]["flag:--pp-stage-ratio"], "32,8")       # the seed: the planner's calculation, shown as planner-only
         self.assertTrue(any(x["key"] == "flag:--pp-stage-ratio" for x in sp["view"]["planner_only"]))
-        self.assertEqual(sp["name"], "demo-vorschlag")
+        self.assertEqual(sp["name"], "demo-proposal")
         pj, _ = self.ed.mods()
         self.assertEqual(pj.doc_id(sp["doc"]), sp["doc"]["id"])
 
     def test_every_value_carries_origin_verdicts_and_edges(self):
         r = self.ed.propose(self._body())
-        by = {w["label"]: w for w in r["werte"]}
+        by = {w["label"]: w for w in r["values"]}
         w = by["--extra-p --rank-moe-ratio"]
-        self.assertEqual((w["key"], w["zustand"], w["geaendert"]), ("extra:P:--rank-moe-ratio", "unbelegt", True))
-        self.assertEqual(w["herkunft"], "Herkunft von --extra-p --rank-moe-ratio")
-        self.assertEqual([v["code"] for v in w["verdikte"]], ["UNBELEGT"])
+        self.assertEqual((w["key"], w["state"], w["changed"]), ("extra:P:--rank-moe-ratio", "unverified", True))
+        self.assertEqual(w["source"], "Herkunft von --extra-p --rank-moe-ratio")
+        self.assertEqual([v["code"] for v in w["verdikte"]], ["UNVERIFIED"])
         self.assertTrue(w["kanten"], "the catalog's edges of --rank-moe-ratio")
         for e in w["kanten"]:
             self.assertIn("to", e)
-        self.assertEqual(by["--d-bs"]["geaendert"], False)
+        self.assertEqual(by["--d-bs"]["changed"], False)
         self.assertEqual(by["--pp-stage-ratio (Seed)"]["key"], None)
         row = {x["key"]: x for x in r["startprofil"]["view"]["rows"]}["extra:P:--rank-moe-ratio"]
-        self.assertEqual(row["vorschlag"]["zustand"], "unbelegt")
-        self.assertEqual(row["vorschlag"]["verdikte"][0]["code"], "UNBELEGT")
-        self.assertEqual(row["vorschlag"]["kanten"], row["explain"]["depends"])
+        self.assertEqual(row["proposal"]["state"], "unverified")
+        self.assertEqual(row["proposal"]["verdikte"][0]["code"], "UNVERIFIED")
+        self.assertEqual(row["proposal"]["kanten"], row["explain"]["depends"])
 
     def test_the_balken_request_is_the_h2_contract(self):
         for form, want in (("flip", "flip"), ("tp", "d_only")):
             r = self.ed.propose(self._body(form=form))
-            self.assertEqual((r["balken"]["route"], r["balken"]["what"], r["balken"]["form"]), ("/api/profil/recompute", "phase_bars", want))
-            self.assertEqual(r["balken"]["doc"]["schema"], "flliper.server/1")
+            self.assertEqual((r["bar"]["route"], r["bar"]["what"], r["bar"]["form"]), ("/api/profil/recompute", "phase_bars", want))
+            self.assertEqual(r["bar"]["doc"]["schema"], "flliper.server/1")
 
     def test_the_request_to_the_child(self):
-        self.ed.propose(self._body(ziele={"seats": 3, "kv_tokens": 200000}))
+        self.ed.propose(self._body(goals={"seats": 3, "kv_tokens": 200000}))
         (kind, req, parts), = self.orc.calls
         self.assertEqual(kind, "propose")
         self.assertTrue(req["basis"]["env_path"].endswith("demo.env"))
-        self.assertEqual((req["form"], req["ziele"]), ("flip", {"seats": 3, "kv_tokens": 200000}))
-        self.assertEqual(req["inventar"]["hardware"]["schema"], "flliper.hardware/1")
+        self.assertEqual((req["form"], req["goals"]), ("flip", {"seats": 3, "kv_tokens": 200000}))
+        self.assertEqual(req["inventory"]["hardware"]["schema"], "flliper.hardware/1")
         self.assertEqual(len(parts["basis_sha256"]), 64)                        # plan 4c: the profile file's hash is part of the key
         self.assertEqual(parts["form"], "flip")
         self.assertEqual(req["model_path"], None)                               # the demo profile names no model: the child takes the basis'
@@ -528,16 +528,16 @@ class ProposeStartprofil(unittest.TestCase):
 
     def test_the_synthetic_inventory_is_a_catalog_card_list(self):
         # 5090 + 3090: not the NVML cards of this rig (5090 + 3080): datasheet cards with synthetic UUIDs
-        self.ed.propose(self._body(inventar=[{"card": "rtx5090-32", "pcie": {"gen": 5, "lanes": 16}}, {"card": "rtx3090-24", "pcie": {"gen": 4, "lanes": 16}}]))
+        self.ed.propose(self._body(inventory=[{"card": "rtx5090-32", "pcie": {"gen": 5, "lanes": 16}}, {"card": "rtx3090-24", "pcie": {"gen": 4, "lanes": 16}}]))
         (_k, req, parts), = self.orc.calls
-        self.assertEqual([c["entry"]["id"] for c in req["inventar"]["cards"]], ["rtx5090-32", "rtx3090-24"])
-        self.assertNotIn("hardware", req["inventar"])
-        self.assertEqual(parts["inventar"][0][0], "katalog")
+        self.assertEqual([c["entry"]["id"] for c in req["inventory"]["cards"]], ["rtx5090-32", "rtx3090-24"])
+        self.assertNotIn("hardware", req["inventory"])
+        self.assertEqual(parts["inventory"][0][0], "catalog")
         # the rig's own two cards go with their real UUIDs
         self.orc.calls.clear()
-        self.ed.propose(self._body(inventar=RIG[:2]))
-        self.assertIn("hardware", self.orc.calls[0][1]["inventar"])
-        self.assertEqual(self.orc.calls[0][2]["inventar"][0][0], "nvml")
+        self.ed.propose(self._body(inventory=RIG[:2]))
+        self.assertIn("hardware", self.orc.calls[0][1]["inventory"])
+        self.assertEqual(self.orc.calls[0][2]["inventory"][0][0], "nvml")
 
     def test_user_paths_need_the_model_root_check(self):
         calls = []
@@ -548,7 +548,7 @@ class ProposeStartprofil(unittest.TestCase):
         self.assertEqual(calls, [("/models/x", "model_path")])
         self.assertEqual(self.orc.calls[-1][1]["model_path"], "/ok/models/x")
         ed.check_path = lambda p, what: (_ for _ in ()).throw(ValueError("path is not under a model root"))
-        with self.assertRaises(P.ProfilError):
+        with self.assertRaises(P.ProfileError):
             ed.propose(self._body(model_path="/etc/passwd"))
 
 
@@ -640,15 +640,15 @@ class RealOracle(unittest.TestCase):
         doc = ed.load("release", "nf-int4-h6-abl")["doc"]
         t0 = time.time()
         d = ed.dry_run(doc, RIG)
-        self.assertEqual(d["quelle"], "orakel", d["notes"])
-        self.assertEqual(d["orakel"]["ausgang"], "geht", [(x["code"], x["grund"][:160]) for x in d.get("verdikte", [])])
+        self.assertEqual(d["quelle"], "oracle", d["notes"])
+        self.assertEqual(d["oracle"]["outcome"], "geht", [(x["code"], x["reason"][:160]) for x in d.get("verdikte", [])])
         self.assertEqual(d["rejections"], [])
         self.assertTrue(d["goes"])
-        self.assertEqual(d["orakel"]["profil"]["quelle"], "nf-int4-h6-abl.env")
-        self.assertEqual(len(d["orakel"]["profil"]["eingabe_sha256"]), 64)
-        self.assertEqual(len(d["orakel"]["profil_text_sha256"]), 64)
-        self.assertEqual(d["orakel"]["profil_datei_sha256"], doc["meta"]["based_on"]["sha256"])        # plan 4c: the hash of the profile FILE it was loaded from
-        self.assertTrue(d["orakel"]["plan"]["pp_cut"])
+        self.assertEqual(d["oracle"]["profil"]["quelle"], "nf-int4-h6-abl.env")
+        self.assertEqual(len(d["oracle"]["profil"]["input_sha256"]), 64)
+        self.assertEqual(len(d["oracle"]["profil_text_sha256"]), 64)
+        self.assertEqual(d["oracle"]["profile_file_sha256"], doc["meta"]["based_on"]["sha256"])        # plan 4c: the hash of the profile FILE it was loaded from
+        self.assertTrue(d["oracle"]["plan"]["pp_cut"])
         # the same codes as the planner gate alone says today (an editor without oracle)
         gate = P.ProfilEditor(kartenplaner=K.Kartenplaner(tree=REPO_PY), release_dir=self.rel, user_dir=os.path.join(self.tmp, "u2"), tree=REPO_PY,
                               catalog_file=REPO_CATALOG).dry_run(doc, RIG)
@@ -657,8 +657,8 @@ class RealOracle(unittest.TestCase):
         # the second equal question is answered from the cache
         t1 = time.time()
         d2 = ed.dry_run(doc, RIG)
-        self.assertTrue(d2["orakel"]["cached"])
-        self.assertEqual(d2["orakel"]["cache_key"], d["orakel"]["cache_key"])
+        self.assertTrue(d2["oracle"]["cached"])
+        self.assertEqual(d2["oracle"]["cache_key"], d["oracle"]["cache_key"])
         self.assertLess(time.time() - t1, 5.0)
         self.assertGreater(t1 - t0, 0.0)
 
@@ -667,22 +667,22 @@ class RealOracle(unittest.TestCase):
         doc = ed.load("release", "nf-int4-h6-abl")["doc"]
         two = [{"card": "rtx5090-32", "pcie": {"gen": 5, "lanes": 8}}, {"card": "rtx3080-20", "pcie": {"gen": 4, "lanes": 8}}]
         d = ed.dry_run(doc, two)
-        self.assertEqual(d["quelle"], "orakel", d["notes"])
+        self.assertEqual(d["quelle"], "oracle", d["notes"])
         codes = {q["code"] for q in d["rejections"]}
         self.assertIn("HW-COUNT", codes)
         pv = [x for x in d["verdikte"] if x["code"] == "PROFILE-VECTORS"]
         self.assertEqual(len(pv), 1, [(x["code"]) for x in d["verdikte"]])
-        self.assertIn("--rank-moe-ratio", pv[0]["werte"])
-        self.assertIn("FLLIPER_MOE_SCRATCH_SLOTS", pv[0]["werte"])
+        self.assertIn("--rank-moe-ratio", pv[0]["values"])
+        self.assertIn("FLLIPER_MOE_SCRATCH_SLOTS", pv[0]["values"])
         self.assertEqual(pv[0]["parent"], "HW-COUNT")
-        self.assertNotEqual(d["orakel"]["ausgang"], "geht")
+        self.assertNotEqual(d["oracle"]["outcome"], "geht")
 
     def test_3_propose_for_two_cards_is_a_startprofil_with_origin_verdict_and_edges(self):
         ed = self._ed(self.hw2)
         # the release profile of the line: the NF launcher cannot plan 27b-base (measured 07.10. on 2e68b3f94b: SystemExit '--p-chunk-policy dynamic:
         # need 0 < min_tokens <= max_tokens, got 4096/2048'); the 27B model holds 196608 tokens on two cards, the NF default is its own
-        body = {"basis": {"kind": "release", "name": "27b-base" if DUAL_LINE else "nf-int4-h6-abl"}, "form": "flip", "inventar": "rig",
-                "ziele": {"kv_tokens": 196608} if DUAL_LINE else {}}
+        body = {"basis": {"kind": "release", "name": "27b-base" if DUAL_LINE else "nf-int4-h6-abl"}, "form": "flip", "inventory": "rig",
+                "goals": {"kv_tokens": 196608} if DUAL_LINE else {}}
         r = ed.propose(body)
         self.assertTrue(r["ok"], r)
         self.assertEqual(r["schema"], "flliper.propose-d/1")
@@ -692,45 +692,45 @@ class RealOracle(unittest.TestCase):
         self.assertEqual(sp["doc"]["schema"], "flliper.server/1")
         self.assertTrue(sp["verifiziert"], sp["probleme"])
         # vectors of N entries; no verdict names a vector
-        self.assertTrue(r["vorschlag"]["vektoren_ok"], r["vorschlag"]["vektoren_falsch"])
-        self.assertEqual([x for x in r["verdikt"]["verdikte"] if x["code"] == "PROFILE-VECTORS"], [])
+        self.assertTrue(r["proposal"]["vectors_ok"], r["proposal"]["vectors_wrong"])
+        self.assertEqual([x for x in r["verdict"]["verdikte"] if x["code"] == "PROFILE-VECTORS"], [])
         # 27B line: the planner's dry run goes with --force; NF line: the same once the launcher re-stages the P-card reference, else it ends with W167
-        self.assertEqual(r["verdikt"]["ausgang"], "geht_mit_force" if (DUAL_LINE or RESTAGES_P_CARD) else "verweigert",
-                         [(x["code"], x["grund"][:100]) for x in r["verdikt"]["verdikte"]])
-        self.assertEqual(r["verdikt"]["n"], 2)
-        self.assertEqual(len(r["verdikt"]["profil"]["datei_sha256"]), 64)
-        self.assertEqual(r["basis"]["sha256"], r["verdikt"]["profil"]["datei_sha256"])
+        self.assertEqual(r["verdict"]["outcome"], "ok_with_force" if (DUAL_LINE or RESTAGES_P_CARD) else "verweigert",
+                         [(x["code"], x["reason"][:100]) for x in r["verdict"]["verdikte"]])
+        self.assertEqual(r["verdict"]["n"], 2)
+        self.assertEqual(len(r["verdict"]["profil"]["file_sha256"]), 64)
+        self.assertEqual(r["basis"]["sha256"], r["verdict"]["profil"]["file_sha256"])
         # every changed value is in the doc (origin planer) and the row shows what the proposal said
         rows = {x["key"]: x for x in sp["view"]["rows"]}
-        changed = [w for w in r["werte"] if w["geaendert"] and w["key"]]
+        changed = [w for w in r["values"] if w["changed"] and w["key"]]
         self.assertTrue(changed)
         for w in changed:
-            if w["wert"] is None:
+            if w["value"] is None:
                 self.assertNotIn(w["key"], rows, w["label"])
                 continue
             self.assertIn(w["key"], rows, w["label"])
-            self.assertEqual(rows[w["key"]]["value"], str(w["wert"]), w["label"])
+            self.assertEqual(rows[w["key"]]["value"], str(w["value"]), w["label"])
             self.assertEqual(rows[w["key"]]["origin"], "planer", w["label"])
-            self.assertEqual(rows[w["key"]]["vorschlag"]["zustand"], w["zustand"])
-        for w in r["werte"]:
-            for f in ("key", "label", "wert", "zustand", "herkunft", "grund", "verdikte", "kanten"):
+            self.assertEqual(rows[w["key"]]["proposal"]["state"], w["state"])
+        for w in r["values"]:
+            for f in ("key", "label", "value", "state", "source", "reason", "verdikte", "kanten"):
                 self.assertIn(f, w)
             for v in w["verdikte"]:
-                for f in ("code", "forcebar", "force_state", "grund", "konsequenz"):
+                for f in ("code", "forcebar", "force_state", "reason", "consequence"):
                     self.assertIn(f, v)
-        self.assertTrue(any(w["kanten"] for w in r["werte"]), "the edge catalog gives at least one value its dependencies")
-        self.assertEqual(r["balken"]["what"], "phase_bars")
-        self.assertEqual(r["balken"]["form"], "flip")
-        self.assertEqual(r["balken"]["doc"]["schema"], "flliper.server/1")
+        self.assertTrue(any(w["kanten"] for w in r["values"]), "the edge catalog gives at least one value its dependencies")
+        self.assertEqual(r["bar"]["what"], "phase_bars")
+        self.assertEqual(r["bar"]["form"], "flip")
+        self.assertEqual(r["bar"]["doc"]["schema"], "flliper.server/1")
         # the second equal question is a cache hit
         t0 = time.time()
         r2 = ed.propose(body)
-        self.assertTrue(r2["orakel"]["cached"])
-        self.assertEqual(r2["verdikt"]["argv_sha256"], r["verdikt"]["argv_sha256"])
+        self.assertTrue(r2["oracle"]["cached"])
+        self.assertEqual(r2["verdict"]["argv_sha256"], r["verdict"]["argv_sha256"])
         self.assertLess(time.time() - t0, 5.0)
         # another goal is another question
-        r3 = ed.propose(dict(body, ziele={"kv_tokens": 180000}))
-        self.assertFalse(r3["orakel"]["cached"])
+        r3 = ed.propose(dict(body, goals={"kv_tokens": 180000}))
+        self.assertFalse(r3["oracle"]["cached"])
 
     def test_4_a_dead_child_is_a_note_and_the_gate_answers(self):
         dead = ORA.OracleService(REPO_PY, python="/nowhere/python")
@@ -739,7 +739,7 @@ class RealOracle(unittest.TestCase):
         d = ed.dry_run(ed.load("release", "nf-int4-h6-abl")["doc"], RIG[:2])
         self.assertEqual(d["quelle"], "gate")
         self.assertTrue(any("Oracle (launcher dry run) not available" in n for n in d["notes"]))
-        r = ed.propose({"basis": {"kind": "release", "name": "nf-int4-h6-abl"}, "inventar": RIG[:2]})
+        r = ed.propose({"basis": {"kind": "release", "name": "nf-int4-h6-abl"}, "inventory": RIG[:2]})
         self.assertFalse(r["ok"])
         self.assertIn("/nowhere/python", r["error"])
 

@@ -101,7 +101,7 @@ class TestLiveDualReference(unittest.TestCase):
         v = APE._propose("ref3", profile=LIVE)
         self.assertEqual(v["argv"], list(li.argv))
         self.assertEqual(v["env"], dict(li.env))
-        self.assertTrue(v["vektoren_ok"], v["vektoren_falsch"])
+        self.assertTrue(v["vectors_ok"], v["vectors_wrong"])
 
     def test_proposal_dry_run_equals_the_new_golden(self):
         v = APE._propose("ref3", profile=LIVE)

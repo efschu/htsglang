@@ -2,7 +2,7 @@
 # Licensed under the Apache License, Version 2.0
 """The phone's telemetry lands on disk, and says where.
 
-User order (2026-08-04): "die website braucht quasi ganz oben ein button, wo
+User order (2026-08-04): "die website requires quasi ganz oben ein button, wo
 ich alle lokalen handy logdaten an den server uebertraegt ... so stochern wir
 die ganze zeit doch nur blind herum."
 

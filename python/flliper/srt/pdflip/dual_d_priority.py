@@ -384,7 +384,7 @@ class PressureStages:
     ``reclaim`` (the awake loan back), ``resume`` (the paused head may go back),
     ``wake`` (P maps its weights back) -- and prints the returned line.
 
-    Order is the law (user rules 01.10. and 03.10. "wenn auf D kv knapp wird,
+    Order is the law (user rules 01.10. and 03.10. "wenn auf D kv tight wird,
     gibt P seinen kv auf"): stage 1 = stop, and -- once P commits 0 bytes on
     every card -- lend at once, awake; stage 2 (sleep) only when the pressure
     still holds ``sleep_after`` ticks after the loan. D never retracts. Return

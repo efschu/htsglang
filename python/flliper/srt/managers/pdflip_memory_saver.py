@@ -2806,8 +2806,8 @@ def expert_band_geometry() -> Tuple[int, int]:
     """(experts_per_band, band_count) aus der Env; (0, 0) = Bandteilung AUS.
 
     SYMMETRISCH zu :func:`weight_chunk_geometry`, und das ist kein Stil: die
-    Tag-Bildung braucht die BREITE (welches Band eine Id trifft), die
-    Familien-Aufzaehlung braucht die ANZAHL (welche Tags es gibt).  Eine Zahl
+    Tag-Bildung requires die BREITE (welches Band eine Id trifft), die
+    Familien-Aufzaehlung requires die ANZAHL (welche Tags es gibt).  Eine Zahl
     allein kann nur eine der beiden Fragen beantworten -- die Chunk-Seite hat
     genau deshalb zwei, und ein Band, das nur die Breite kennt, waere ein
     Schreiber ohne Leser (Memory ``riegel-hinter-dem-was-er-sichert``).

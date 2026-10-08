@@ -102,7 +102,7 @@ block() {
 # Image-Python. Start im Entrypoint nur, wenn /opt/htsglang/rigdash/entrypoint_rigdash.sh existiert und HTSGLANG_RIGDASH
 # (FLLIPER_RIGDASH) nicht 0 ist, ODER mit MODE=editor als einziger Dienst. Port 30081 (HTSGLANG_RIGDASH_PORT), GET /healthz.
 COPY tools/rigdash/ /opt/htsglang/rigdash/
-RUN cd /opt/htsglang/rigdash && /opt/venv/bin/python -B -c "import rigdash.server, rigdash.profil, rigdash.profil_recompute, rigdash.hwprofil, rigdash.modellprofil; print('rigdash', rigdash.server._version())" \\
+RUN cd /opt/htsglang/rigdash && /opt/venv/bin/python -B -c "import rigdash.server, rigdash.profil, rigdash.profile_recompute, rigdash.hwprofil, rigdash.modellprofil; print('rigdash', rigdash.server._version())" \\
     && test -s rigdash/static/index.html && test -s kartenplan_build/couplings_worker.py && test -x entrypoint_rigdash.sh \\
     && bash -n entrypoint_rigdash.sh
 LABEL ${RIGDASH_LABEL}="${REV}"

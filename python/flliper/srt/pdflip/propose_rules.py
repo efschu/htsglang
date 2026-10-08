@@ -1,7 +1,7 @@
 """AP-C rules of the profile planner: the ARITHMETIC behind ``pdflip/propose.py`` (plan PLAN-PROFIL-PLANER-1006 section 1.2 K1-K5).
 
 Pure functions on plain numbers and dicts, no I/O, no NVML, no torch, no launcher import.  Every function returns the value
-AND the words that say where it came from -- ``propose.py`` stores both per value (``vorgeschlagen`` / ``unbelegt`` plus a
+AND the words that say where it came from -- ``propose.py`` stores both per value (``vorgeschlagen`` / ``unverified`` plus a
 sentence), so a figure the planner computed from a datasheet is never shown as a measurement (HOCHRECHNUNG != MESSUNG).
 
 What lives here, by criterion of the plan (section 1.2):
@@ -61,8 +61,8 @@ TOPOLOGY_VECTOR_FLAGS = tuple(f for f in POSITIONAL_VECTOR_FLAGS if f not in NON
 TOPOLOGY_VECTOR_TOKENS = tuple(t for t in POSITIONAL_VECTOR_TOKENS if t not in NON_TOPOLOGY_VECTOR_TOKENS)
 
 #: state words of a value
-VORGESCHLAGEN = "vorgeschlagen"
-UNBELEGT = "unbelegt"
+PROPOSED = "vorgeschlagen"
+UNVERIFIED = "unverified"
 
 #: the largest resident expert fraction of a MoE stage: ``(E - 2) / E`` ("groesste Offload-Fraction", PP-CUT FRACTION-SOLVE)
 FR_MAX_EXPERT_MARGIN = 2
@@ -152,8 +152,8 @@ def rate_table(cards: Sequence[Mapping[str, Any]], *, measured: Optional[Mapping
     (``library`` or, when None, ``card_rate_pass.load_measured_library()`` = ``card_library.json``) > the datasheet FP16/BF16
     peak of the card library seed (``peak_gemm_tflops_fp16``).  A measured achieved rate and a datasheet PEAK are not the same
     quantity (5090: 203 achieved of 419 peak): the table is MEASURED only when EVERY card has a measured rate; otherwise ALL
-    cards are priced on the datasheet peak and the basis says ``Datenblatt/unbelegt``.  A card with neither falls back to its
-    VRAM size as a weight and is named ``unbelegt (keine Rate)``.
+    cards are priced on the datasheet peak and the basis says ``Datasheet/unverified``.  A card with neither falls back to its
+    VRAM size as a weight and is named ``unverified (keine Rate)``.
     """
     from flliper.srt.pdflip import card_identity as ci
 
@@ -275,8 +275,8 @@ def class_rekey(values: Sequence[str], calibrated: Sequence[str], live: Sequence
 
     Per live card, in this order: the MAXIMUM over the calibrated cards of its OWN class (the conservative direction of
     ``inventory_view.CLASS_MAX``: books more, never an average, never another class); else the class of its arch twin
-    (:data:`ARCH_TWIN`, ``HW-BORROWED``), the maximum over THAT class; else the maximum of every entry (``unbelegt``).
-    Returns ``(new values, source per card)``; the source is ``"Klasse X"``, ``"geborgt: <twin> (unbelegt)"`` or
+    (:data:`ARCH_TWIN`, ``HW-BORROWED``), the maximum over THAT class; else the maximum of every entry (``unverified``).
+    Returns ``(new values, source per card)``; the source is ``"Klasse X"``, ``"borrowed: <twin> (unverified)"`` or
     ``"unverified: maximum of all cards"``."""
     def key(x: str) -> float:
         return float(x)
@@ -430,7 +430,7 @@ def mamba_slots_p(seats: int) -> int:
 
 
 def mamba_slots_d(seats: int) -> int:
-    """Mamba slots D holds for ``seats`` (reference 38 at 6 seats, linear: ONE measured point -> unbelegt)."""
+    """Mamba slots D holds for ``seats`` (reference 38 at 6 seats, linear: ONE measured point -> unverified)."""
     return max(1, int(round(D_MAMBA_SLOTS_REF * int(seats) / float(D_MAMBA_SEATS_REF))))
 
 
@@ -473,7 +473,7 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
 
     The runtime posts of the plan (host runtime 3.20 GiB, worker runtime 1.45, corridor 1.90, dispatch buffer 0.20, router
     0.12, speculative state 0.15) are the measured posts of boot fn8ah (``MeasuredPosts.from_fn8ah``): BORROWED for every
-    model and card, named in ``unbelegt``.  Returns ``{ok, error, role, tp_ratio, moe_ratio, fr, capacity, owned, unbelegt}``."""
+    model and card, named in ``unverified``.  Returns ``{ok, error, role, tp_ratio, moe_ratio, fr, capacity, owned, unverified}``."""
     from flliper.srt import form_a_plan as FA
 
     n = len(cards)
@@ -500,7 +500,7 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
     try:
         plan = FA.solve_form_a(cb, posts, geom)
     except FA.FormAInfeasible as exc:
-        return {"ok": False, "error": "the form A solver finds no split (%s: %s)" % (type(exc).__name__, exc), "unbelegt": unb}
+        return {"ok": False, "error": "the form A solver finds no split (%s: %s)" % (type(exc).__name__, exc), "unverified": unb}
     # The launcher refuses a D rank without a Platztausch buffer (W120 PdFlipPlatztauschBufferUnbuilt, ``launcher.py``
     # ``_refuse_unbuilt_platztausch_buffers``): a rank holds ``owned + pad`` local rows per layer and builds the buffer only when
     # at least MIN_SCRATCH_ROWS (2) rows stay free, i.e. ``resident_rows <= E - 2``.  A card that fits its WHOLE share (plan
@@ -524,7 +524,7 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
             "moe_ratio": [int(o) for o in plan.owned],
             "fr": fr, "fr_solver": fr_plan, "fr_cap": fr_cap,
             "capacity": [int(c) for c in plan.capacity], "owned": [int(o) for o in plan.owned],
-            "host_breakdown": dict(plan.host_breakdown), "unbelegt": unb}
+            "host_breakdown": dict(plan.host_breakdown), "unverified": unb}
 
 
 # ---------------------------------------------------------------------------

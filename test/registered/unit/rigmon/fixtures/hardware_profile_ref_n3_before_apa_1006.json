@@ -130,7 +130,7 @@
     },
     "nameplate": {
      "note": "Busbreite x max. Speichertakt x 2 aus NVML (Spitzenwert, kein Messwert)",
-     "src": "Datenblatt",
+     "src": "Datasheet",
      "unit": "GB/s",
      "v": 1792.0
     },
@@ -343,7 +343,7 @@
     },
     "nameplate": {
      "note": "Busbreite x max. Speichertakt x 2 aus NVML (Spitzenwert, kein Messwert)",
-     "src": "Datenblatt",
+     "src": "Datasheet",
      "unit": "GB/s",
      "v": 760.1
     },
@@ -556,7 +556,7 @@
     },
     "nameplate": {
      "note": "Busbreite x max. Speichertakt x 2 aus NVML (Spitzenwert, kein Messwert)",
-     "src": "Datenblatt",
+     "src": "Datasheet",
      "unit": "GB/s",
      "v": 760.1
     },
@@ -853,7 +853,7 @@
  "src_vocab": [
   "gemessen",
   "NVML",
-  "Datenblatt",
+  "Datasheet",
   "geschätzt",
   "nicht gemessen"
  ],

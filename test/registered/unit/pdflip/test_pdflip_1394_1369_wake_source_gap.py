@@ -3,7 +3,7 @@
 own wake source.
 
 USER ORDER 2026-09-14, verbatim: "auf der festplatte liegt ein snapshot. das
-ist auch ein rueckfall. aber wenn es korrekt implementiert ist braucht es
+ist auch ein rueckfall. aber wenn es korrekt implementiert ist requires es
 NIEMALS einen rueckfall....!" -- the host ring (46.40 GiB) is redundancy to a
 net (the checkpoint on disk) that is already there. Turning the ring off for
 the weights region under an armed, AUTHORITATIVE exchange is safe ONLY if two

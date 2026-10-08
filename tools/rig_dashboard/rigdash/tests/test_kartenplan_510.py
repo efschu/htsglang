@@ -1,9 +1,9 @@
-"""Item 510 (Kartenplaner): Katalog, PCIe/Transportwahl, Gate, Phasenaufschlüsselung, Ablehnungsgründe und
+"""Item 510 (Kartenplaner): Catalog, PCIe/Transportwahl, Gate, Phasenaufschlüsselung, Ablehnungsgründe und
 FIXTURE-ABGLEICH gegen die Planer-Aufzeichnungen der letzten echten Boots.
 
 Gepinnt:
-  * Katalog: jede Speichervariante ein eigener Eintrag, Rig-Karten mit NVML-Record (3080 20 GB = 20480, 5090 = 32607),
-    fremde Karten als Datenblatt gekennzeichnet; Turing nur als deaktivierter Eintrag.
+  * Catalog: jede Speichervariante ein eigener Eintrag, Rig-Karten mit NVML-Record (3080 20 GB = 20480, 5090 = 32607),
+    fremde Karten als Datasheet gekennzeichnet; Turing nur als deaktivierter Eintrag.
   * Transport: Rig-Preset -> barlink BAR1; Chipsatz -> ungeprüft; ungepatchter Host oder BAR1 < 168 MiB -> NCCL; eine Karte -> keiner.
   * Gate: die ORIGINAL-Planer-Funktionen (card_identity/topology aus dem Fixture-Baum 044316dd1a) lassen das Rig durch und
     verweigern 4090 (HW-ARCH), 4 Karten (HW-COUNT/HW-TOPOLOGY), 3x3090 (HW-UNCALIBRATED).
@@ -46,7 +46,7 @@ class TestKatalog(unittest.TestCase):
             self.assertIn(want, ids)
 
     def test_rtx3070_hat_die_datenblattwerte(self):
-        """HW-generisches Release (Nutzer): die 3070 fehlte. Datenblatt: 8 GB GDDR6, 256 Bit, 448 GB/s, PCIe 4.0 x16; Ampere = sm86 wie die anderen 30er."""
+        """HW-generisches Release (Nutzer): die 3070 fehlte. Datasheet: 8 GB GDDR6, 256 Bit, 448 GB/s, PCIe 4.0 x16; Ampere = sm86 wie die anderen 30er."""
         c = CAT.card("rtx3070-8")
         self.assertEqual((c["vram_gb"], c["usable_mib"], c["arch"], c["mem_bw_gbs"], c["bus_bits"]), (8, 8 * 1024, "sm86", 448, 256))
         self.assertEqual((c["pcie_native"]["gen"], c["pcie_native"]["lanes"]), (4, 16))
@@ -254,7 +254,7 @@ class TestFixtureAbgleich(unittest.TestCase):
 
     def test_phasenaufschluesselung_hat_beide_layouts_und_spitze(self):
         kp, r = rig("27b-int8")
-        x = r["plan"]["experte"]
+        x = r["plan"]["expert"]
         self.assertEqual(set(x["phases"]), {"P", "D"})
         self.assertEqual(len(x["peak"]), 3)
         keys_d = {s["key"] for s in x["phases"]["D"][0]["segments"]}
@@ -264,12 +264,12 @@ class TestFixtureAbgleich(unittest.TestCase):
 
     def test_nf_experten_fuellen_freien_vram(self):
         kp, r = rig("nf-int4-abl")
-        d0 = {s["key"]: s["mib"] for s in r["plan"]["experte"]["phases"]["D"][0]["segments"]}
+        d0 = {s["key"]: s["mib"] for s in r["plan"]["expert"]["phases"]["D"][0]["segments"]}
         self.assertGreater(d0["experts_lru"], 10000)
 
     def test_flags_mit_erklaerung_und_bound_by(self):
         kp, r = rig("27b-int8")
-        f = r["plan"]["experte"]["flags"]
+        f = r["plan"]["expert"]["flags"]
         d = {x["name"]: x for x in f["groups"]["D"]}
         self.assertEqual(d["--rank-gpu-memory-mib"]["value"], "27792,17384,17168")
         self.assertEqual(d["--rank-gpu-memory-mib"]["set_by"], "Planner")

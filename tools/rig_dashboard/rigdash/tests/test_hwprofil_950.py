@@ -120,7 +120,7 @@ class Base(unittest.TestCase):
     def make(self, gq=None, **kw):
         kw.setdefault("tree", self.tree)
         kw.setdefault("synchronous", True)
-        return hwprofil.HwProfil(http=gq or self.gq, **kw)
+        return hwprofil.HwProfile(http=gq or self.gq, **kw)
 
     def mod(self, hw):
         m = hw._module()
@@ -288,7 +288,7 @@ class TestRequestsAndErrors(Base):
         self.assertNotIn("TOKEN", json.dumps(a) + json.dumps(b))
 
     def test_no_planner_tree_says_how_to_stage(self):
-        hw = hwprofil.HwProfil(http=self.gq, tree=os.path.join(self.tmp, "nirgends"))
+        hw = hwprofil.HwProfile(http=self.gq, tree=os.path.join(self.tmp, "nirgends"))
         out = hw.get()
         self.assertFalse(out["ok"])
         self.assertIn("hardware_profile.py", out["error"])
@@ -445,7 +445,7 @@ class TestHttpRoutes(Base):
         st, body, h = _req(self.srv, "GET", "/hwprofil.js")
         self.assertEqual(st, 200)
         self.assertIn("javascript", h["Content-Type"])
-        self.assertIn("HwProfil", body)
+        self.assertIn("HwProfile", body)
 
 
 def _node():
@@ -496,7 +496,7 @@ class TestDisplayModule(unittest.TestCase):
     def test_structure(self):
         with open(os.path.join(STATIC, "hwprofil.js"), encoding="utf-8") as fh:
             js = fh.read()
-        for needle in ("HwProfil", "render", "mount", "api/hwprofil", "/measure", "/cancel"):
+        for needle in ("HwProfile", "render", "mount", "api/hwprofil", "/measure", "/cancel"):
             self.assertIn(needle, js)
         self.assertNotIn("eval(", js)
         self.assertNotIn("localStorage", js)       # kein Zustand im Browser: das Profil kommt vom Dienst
@@ -538,7 +538,7 @@ class TestRealModule(unittest.TestCase):
         if not tree or not os.path.isfile(os.path.join(tree, hwprofil.MODULE_REL)):
             self.skipTest("HWPROFIL_TREE zeigt auf keinen Baum mit hardware_profile.py")
         with tempfile.TemporaryDirectory() as d:
-            hw = hwprofil.HwProfil(http=FakeGpuq(), tree=tree, cache_dir=d)
+            hw = hwprofil.HwProfile(http=FakeGpuq(), tree=tree, cache_dir=d)
             mod = hw._module()
             self.assertEqual(mod.SCHEMA, "flliper.hardware/1")
             out = hw.get()

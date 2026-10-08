@@ -12,7 +12,7 @@ USER DECISION 2026-09-09, verbatim, which is the law these tests pin::
 
 and, on whether the cut becomes a switch::
 
-    "den cut als schalter? solange es nicht wirklich oom geht brauchen wir ja
+    "den cut als switch? solange es nicht wirklich oom geht brauchen wir ja
      nichts zu aendern"
 
 Five consequences follow, and each has a test below:

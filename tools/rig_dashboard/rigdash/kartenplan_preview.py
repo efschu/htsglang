@@ -1,6 +1,6 @@
 """Kartenplaner (Item 510): Vorschau des Reiters OHNE den Dashboard-Dienst.
 
-    python3 -m rigdash.kartenplan_preview --port 18890 [--tree <baum>/python]
+    python3 -m rigdash.kartenplan_preview --port 18890 [--tree <tree>/python]
 
 Startet einen eigenen kleinen Server auf einem freien Port (nur 127.0.0.1) mit der echten index.html des Dashboards
 (Edition rig), kartenplan.js und den /api/kartenplan/*-Antworten.  Alles andere (/api/live ...) antwortet leer; der

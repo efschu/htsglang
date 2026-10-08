@@ -4,7 +4,7 @@ Same term list as the dashboard glossary of parts 1/2 (card, rank, run, boot, dr
 dependency, edge, operating mode, hardware/model/server profile, planner, proposal, unverified, verified, borrowed, datasheet,
 weights, experts, seats, context, reserve, bar, overflow, cut, value, row, switch, explanation, reason, note, path, driver,
 tree, state, fit), plus the catalog-specific terms below. Machine-readable names stay as they are: flags, env names,
-refusal/register codes (W40, HW-COUNT ...), log line wordings quoted from the source, `satz_quelle`, `beleg.anker`
+refusal/register codes (W40, HW-COUNT ...), log line wordings quoted from the source, `satz_quelle`, `evidence.anchor`
 (verbatim source quotes), and the key vocabulary of the data (`rel`, `status`, `level`, `kind`).
 
 | German | English |

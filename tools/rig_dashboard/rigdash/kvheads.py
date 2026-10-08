@@ -71,8 +71,8 @@ def split_units(units: int, weights: Sequence[int]) -> List[int]:
 
 def compute(*, tp_size: int, ratios, kv_heads: Optional[int], q_heads: Optional[int] = None) -> Dict[str, object]:
     """Anzeige-Ergebnis. ``status``: ``ok`` | ``unbekannt`` | ``fehler``; ``regime``: ``gleichmaessig`` | ``verteilt`` | ``repliziert`` |
-    ``keins``; ``kv`` / ``q``: Köpfe je Rang oder None (nicht gerechnet); ``belege``: Fundstellen im Planer-Baum."""
-    out: Dict[str, object] = {"status": "unbekannt", "regime": "keins", "kv": None, "q": None, "tp": tp_size, "satz": "", "notiz": [], "belege": []}
+    ``keins``; ``kv`` / ``q``: Köpfe je Rang oder None (nicht gerechnet); ``evidence_items``: Fundstellen im Planer-Baum."""
+    out: Dict[str, object] = {"status": "unbekannt", "regime": "keins", "kv": None, "q": None, "tp": tp_size, "satz": "", "notiz": [], "evidence_items": []}
     if not kv_heads:
         out["satz"] = "Head count unknown (model not readable in the container): not calculated."
         return out
@@ -84,7 +84,7 @@ def compute(*, tp_size: int, ratios, kv_heads: Optional[int], q_heads: Optional[
         if kv_heads >= tp_size and kv_heads % tp_size == 0:
             out.update(status="ok", regime="gleichmaessig", kv=[kv_heads // tp_size] * tp_size,
                        satz="No rank plan: even, %d KV heads per rank." % (kv_heads // tp_size),
-                       belege=["%s:1721-1723 (tp_partition_sizes without plan)" % SRC])
+                       evidence_items=["%s:1721-1723 (tp_partition_sizes without plan)" % SRC])
         else:
             out["satz"] = "No rank plan and %d KV heads on %d ranks: standard path of the runtime, not calculated." % (kv_heads, tp_size)
         return out
@@ -92,7 +92,7 @@ def compute(*, tp_size: int, ratios, kv_heads: Optional[int], q_heads: Optional[
         out.update(status="ok", regime="repliziert", kv=[kv_heads] * tp_size,
                    satz="%d KV heads < %d ranks: REPLICATED, each rank holds all %d KV heads (the token axis is split by uneven DCP)."
                         % (kv_heads, tp_size, kv_heads),
-                   belege=["%s:1888-1915 (attn_kv_replicated)" % SRC])
+                   evidence_items=["%s:1888-1915 (attn_kv_replicated)" % SRC])
         nz = [r for r, w in enumerate(ratios) if w > 0]
         if q_heads and len(nz) == 1 and q_heads % kv_heads == 0:
             q = [0] * tp_size
@@ -106,12 +106,12 @@ def compute(*, tp_size: int, ratios, kv_heads: Optional[int], q_heads: Optional[
         kv = split_units(kv_heads, list(ratios))
     except ValueError as exc:
         out.update(status="fehler", satz="Distribution not possible: %s." % exc,
-                   belege=["%s:1338-1364 (_partition_units_raw)" % SRC])
+                   evidence_items=["%s:1338-1364 (_partition_units_raw)" % SRC])
         return out
     out.update(status="ok", regime="verteilt", kv=kv,
                satz="%d KV heads on %d ranks by weights %s: %s (largest remainder, each rank with weight >= 1 head)."
                     % (kv_heads, tp_size, ",".join(str(w) for w in ratios), ",".join(str(k) for k in kv)),
-               belege=["%s:1338-1364, 1367-1409 (partition_units)" % SRC])
+               evidence_items=["%s:1338-1364, 1367-1409 (partition_units)" % SRC])
     if kv_heads == tp_size:
         out["notiz"].append("KV heads = ranks: not replicated (explicitly excepted, utils.py:1895-1914).")
     if q_heads:
@@ -157,7 +157,7 @@ def view(rows: Sequence[dict], model_dir: str = "", planner_only: Sequence[dict]
         ratios = parse_ratios(raw)
         tp = len(ratios) if isinstance(ratios, list) else 0
         res = compute(tp_size=tp, ratios=ratios, kv_heads=(heads or {}).get("kv"), q_heads=(heads or {}).get("q")) if tp or isinstance(ratios, str) \
-            else {"status": "unbekannt", "regime": "keins", "kv": None, "q": None, "tp": 0, "notiz": [], "belege": [],
+            else {"status": "unbekannt", "regime": "keins", "kv": None, "q": None, "tp": 0, "notiz": [], "evidence_items": [],
                   "satz": "Weights \"%s\" not readable (shell variable?): not calculated." % raw}
         # Dict-Literal mit String-Schlüsseln, kein ``update(quelle=...)``: das Rename-Kit macht aus dem Bezeichner ``quelle`` ein ``source``, der
         # JSON-Schlüssel muss aber ``quelle`` bleiben (profil.js liest ``r.quelle``)

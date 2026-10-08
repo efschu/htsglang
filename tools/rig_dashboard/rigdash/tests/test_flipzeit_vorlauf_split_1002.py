@@ -1,6 +1,6 @@
 """Nutzer 02.10. ~18:25Z via NF: der D>P-Vorlauf wird benannt, total bleibt die Flipzeit ab D's letztem Token.
 
-  vorlauf = leer (D's letztes Token -> Ankunft des Requests, der P braucht) + halt (Ankunft -> Park/flip_begin)
+  warmup = leer (D's letztes Token -> Ankunft des Requests, der P requires) + halt (Ankunft -> Park/flip_begin)
             + park (Park-RPC) + vor_rest (Park-Quittung -> flip_begin)
 
 Leerlauf ohne Request darf echte Halte nicht verdecken.  Zahlen vom Metall:
@@ -61,7 +61,7 @@ class VorlaufSplit27B(unittest.TestCase):
         self.assertEqual(x["leer_ms"], 0.0)
         self.assertAlmostEqual(x["halt_ms"], 108, delta=2)
         self.assertEqual(x["park_ms"], 0.0)
-        self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["vorlauf_ms"], delta=1e-6)
+        self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["warmup_ms"], delta=1e-6)
         self.assertAlmostEqual(_sum(x, ipcboot.PARTS), x["total_ms"], delta=1e-6)       # total unchanged
         self.assertIn("PDFLIP SESSION", x["arrival_src"])
 
@@ -70,7 +70,7 @@ class VorlaufSplit27B(unittest.TestCase):
         self.assertAlmostEqual(x["leer_excl_ms"], 4262, delta=2)
         self.assertEqual(x["leer_ms"], 0.0)
         self.assertIn("oldest_waiter_arrival", x["arrival_src"])
-        self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["vorlauf_ms"], delta=1e-6)
+        self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["warmup_ms"], delta=1e-6)
 
     def test_late_written_rounds_keep_the_start_provisional_and_out_of_vm(self):
         x = ipcboot.flip_views(SEGS, _ipc_27b(), B27 + 5, None, d_rounds=ROUNDS_EARLY, arrivals=ARR_27B)[0]
@@ -81,7 +81,7 @@ class VorlaufSplit27B(unittest.TestCase):
         y = ipcboot.flip_views(SEGS, _ipc_27b(), B27 + 60, None, d_rounds=ROUNDS_LATE, arrivals=ARR_27B)[0]
         pts = vmpush.flip_view_points([y], "27B", "b", set())
         parts = {p.split('part="')[1].split('"')[0] for p in pts}
-        self.assertTrue({"total", "vorlauf", "leer", "halt", "park", "vor_rest"} <= parts)
+        self.assertTrue({"total", "warmup", "leer", "halt", "park", "vor_rest"} <= parts)
         # without a later round for too long the row is taken as it is
         z = ipcboot.flip_views(SEGS, _ipc_27b(), B27 + ipcboot.PROVISIONAL_MAX_S + 10, None,
                                d_rounds=ROUNDS_EARLY, arrivals=ARR_27B)[0]
@@ -116,7 +116,7 @@ class VorlaufSplitNF(unittest.TestCase):
         self.assertAlmostEqual(x["park_ms"], 1681, delta=2)
         self.assertAlmostEqual(x["vor_rest_ms"], 1, delta=2)
         self.assertEqual(x["leer_d_prefill_ms"], 0.0)       # the D prefill lay inside the excluded idle span
-        self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["vorlauf_ms"], delta=1e-6)
+        self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["warmup_ms"], delta=1e-6)
         self.assertAlmostEqual(_sum(x, ipcboot.PARTS), x["total_ms"], delta=1e-6)
 
     def test_request_waiting_before_ds_last_token_is_no_idle(self):
@@ -126,7 +126,7 @@ class VorlaufSplitNF(unittest.TestCase):
                                arrivals={"pdflip-16-52": 1790963320.0})[0]
         self.assertEqual(x["leer_ms"], 0.0)
         self.assertAlmostEqual(x["halt_ms"], 62, delta=2)
-        self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["vorlauf_ms"], delta=1e-6)
+        self.assertAlmostEqual(_sum(x, ipcboot.VOR_PARTS), x["warmup_ms"], delta=1e-6)
 
     def test_no_arrival_no_split(self):
         u = _ipc_nf()

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """L15-POOL stage S4b: the DYNAMIC anchor count (user idea 04.10.2026 ~17:50Z:
-"falls noch kv frei waere, koennte ein anker diesen platz im vram verdraengen;
+"falls noch kv frei waere, koennte ein anchor diesen platz im vram verdraengen;
 dann schrumpft zwar max kv, aber wenn der eh leer waere, so what?").
 
 Hermetic: no CUDA, no model, no network.

@@ -1,11 +1,11 @@
-"""Profil-Editor: EIN Katalog über zwei Code-Bäume (27B- und NF-Linie) und die os.environ-Ernte (Auftrag 27B-Sitz 18:58Z, 05.10.).
+"""Profil-Editor: EIN Catalog über zwei Code-Bäume (27B- und NF-Linie) und die os.environ-Ernte (Auftrag 27B-Sitz 18:58Z, 05.10.).
 
-Das Release-Image trägt zwei Code-Stände nebeneinander; der Editor-Katalog kam aus genau einem Baum, Schalter der anderen Linie fehlten.
+Das Release-Image trägt zwei Code-Stände nebeneinander; der Editor-Catalog kam aus genau einem Baum, Schalter der anderen Linie fehlten.
 
 Gepinnt:
-  * ``build_union_catalog``: jeder Eintrag nennt ``baeume`` (in welchen Bäumen er steht); ein Name nur im zweiten Baum ist ``["nf"]``, nicht verloren.
+  * ``build_union_catalog``: jeder Eintrag nennt ``trees`` (in welchen Bäumen er steht); ein Name nur im zweiten Baum ist ``["nf"]``, nicht verloren.
   * ``abweichung`` erscheint genau dann, wenn Default oder Beschreibung zwischen den Bäumen verschieden sind, und nennt dann jeden Baum.
-  * ``source.baum`` sagt, zu welchem Baum Datei:Zeile gehört.
+  * ``source.tree`` sagt, zu welchem Baum Datei:Zeile gehört.
   * Die os.environ-Ernte (``environ_constants``): ``*ENV*``-Konstante + Lesestelle (os.environ.get, Alias.get mit der Konstante, os.getenv, os.environ[...]),
     Default nur wo der Aufruf ihn wörtlich nennt; ein Name aus ``environ.py`` wird nicht doppelt geführt; ein Name, der nur in Docstring/Kommentar
     oder als nie benutzte Konstante steht, ist KEIN Verbraucher; ``dict.get("FLLIPER_X")`` auf einem fremden Dict zählt nicht.
@@ -113,10 +113,10 @@ class Union(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cat = self._build(d, ["FLLIPER_ONLY_A = EnvBool(False)", "FLLIPER_BOTH = EnvInt(1)"], ["FLLIPER_BOTH = EnvInt(1)", "FLLIPER_ONLY_B = EnvBool(True)"])
         e = cat["entries"]
-        self.assertEqual((e["FLLIPER_ONLY_A"]["baeume"], e["FLLIPER_ONLY_B"]["baeume"], e["FLLIPER_BOTH"]["baeume"]), (["27b"], ["nf"], ["27b", "nf"]))
-        self.assertEqual(cat["stats"]["baeume"]["nur_27b"], 1)
-        self.assertEqual((cat["stats"]["baeume"]["nur_nf"], cat["stats"]["baeume"]["beide"]), (1, 1))
-        self.assertEqual(e["FLLIPER_ONLY_B"]["source"]["baum"], "nf")
+        self.assertEqual((e["FLLIPER_ONLY_A"]["trees"], e["FLLIPER_ONLY_B"]["trees"], e["FLLIPER_BOTH"]["trees"]), (["27b"], ["nf"], ["27b", "nf"]))
+        self.assertEqual(cat["stats"]["trees"]["nur_27b"], 1)
+        self.assertEqual((cat["stats"]["trees"]["nur_nf"], cat["stats"]["trees"]["beide"]), (1, 1))
+        self.assertEqual(e["FLLIPER_ONLY_B"]["source"]["tree"], "nf")
         self.assertEqual(cat["trees"]["nf"]["rev"], "rnf")
 
     def test_abweichung_only_when_the_trees_disagree(self):
@@ -127,26 +127,26 @@ class Union(unittest.TestCase):
         self.assertNotIn("abweichung", e["FLLIPER_SAME"])
         self.assertEqual({k: v["default"] for k, v in e["FLLIPER_DEF"]["abweichung"].items()}, {"27b": "False", "nf": "True"})
         self.assertEqual({k: v["help"] for k, v in e["FLLIPER_HELP"]["abweichung"].items()}, {"27b": "one", "nf": "other"})
-        self.assertEqual(cat["stats"]["baeume"]["abweichung"], 2)
+        self.assertEqual(cat["stats"]["trees"]["abweichung"], 2)
 
     def test_flag_only_in_the_second_tree_is_kept(self):
         with tempfile.TemporaryDirectory() as d:
             cat = self._build(d, [], [], a_flags=[("--both", "h")], b_flags=[("--both", "h"), ("--nf-only", "nf flag")])
-        self.assertEqual(cat["entries"]["--nf-only"]["baeume"], ["nf"])
-        self.assertEqual(cat["entries"]["--both"]["baeume"], ["27b", "nf"])
+        self.assertEqual(cat["entries"]["--nf-only"]["trees"], ["nf"])
+        self.assertEqual(cat["entries"]["--both"]["trees"], ["27b", "nf"])
 
     def test_edge_anchors_are_checked_in_every_tree_and_baeume_marks_the_other_lines_code(self):
-        """Zwei Linien (NF-Katalog 07.10.): der Katalog nennt je Baum, ob alle Kanten-Anker aufloesen (``kanten.beleg_aufloesung_baeume``).  Eine Kante mit
-        ``baeume: [27b]`` ist im NF-Baum ``andere_linie`` (kein Problem, Datei und Anker dort nie gesucht), eine Kante OHNE ``baeume`` mit fehlendem Anker
-        bleibt ein Problem dieses Baums -- ``baeume`` ist der einzige Ausweg, nie ein stilles Ueberspringen."""
+        """Zwei Linien (NF-Catalog 07.10.): der Catalog nennt je Baum, ob alle Kanten-Anker aufloesen (``kanten.beleg_aufloesung_baeume``).  Eine Kante mit
+        ``trees: [27b]`` ist im NF-Baum ``other_line`` (kein Problem, Datei und Anker dort nie gesucht), eine Kante OHNE ``trees`` mit fehlendem Anker
+        bleibt ein Problem dieses Baums -- ``trees`` ist der einzige Ausweg, nie ein stilles Ueberspringen."""
         import json
         with tempfile.TemporaryDirectory() as d:
             a = _tree(d, "a", [], [("--x", "hx"), ("--y", "hy"), ("--dualonly", "hd")])
             b = _tree(d, "b", [], [("--x", "hx"), ("--y", "hy")])
-            mk = lambda i, von, nach, anker, **kw: dict({"id": i, "von": von, "nach": nach, "rel": "braucht", "calc": "text", "wert": None, "satz": "s",
-                                                         "beleg": {"datei": "python/flliper/srt/pdflip/launcher.py", "zeile": 2, "anker": anker}}, **kw)
+            mk = lambda i, von, nach, anchor, **kw: dict({"id": i, "von": von, "nach": nach, "rel": "requires", "calc": "text", "value": None, "satz": "s",
+                                                         "evidence": {"file": "python/flliper/srt/pdflip/launcher.py", "zeile": 2, "anchor": anchor}}, **kw)
             edges = {"schema": PC.EDGES_SCHEMA, "kanten": [mk("K1", "--x", "--y", "add_argument('--x'"),
-                                                           mk("K2", "--dualonly", "--x", "add_argument('--dualonly'", baeume=["27b"]),
+                                                           mk("K2", "--dualonly", "--x", "add_argument('--dualonly'", trees=["27b"]),
                                                            mk("K3", "--y", "--x", "add_argument('--dualonly'")]}
             ep = os.path.join(d, "edges.json")
             with open(ep, "w", encoding="utf-8") as fh:
@@ -155,15 +155,15 @@ class Union(unittest.TestCase):
         per = cat["kanten"]["beleg_aufloesung_baeume"]
         self.assertEqual(per["27b"]["problem"], [])
         self.assertEqual(per["nf"]["problem"], ["K3"])                                   # K3: no baeume, anchor missing in the NF tree
-        self.assertEqual(per["nf"]["status"], {"eindeutig": 1, "andere_linie": 1, "veraltet": 1})
-        dep = {x["kante"]: x for e in cat["entries"].values() for x in e["depends"]}
-        self.assertEqual(dep["K2"]["baeume"], ["27b"])
-        self.assertNotIn("baeume", dep["K1"])
-        self.assertEqual(dep["K1"]["beleg"]["aufloesung"], "eindeutig")                    # the shown line is the FIRST tree's (27b)
+        self.assertEqual(per["nf"]["status"], {"eindeutig": 1, "other_line": 1, "veraltet": 1})
+        dep = {x["edge"]: x for e in cat["entries"].values() for x in e["depends"]}
+        self.assertEqual(dep["K2"]["trees"], ["27b"])
+        self.assertNotIn("trees", dep["K1"])
+        self.assertEqual(dep["K1"]["evidence"]["aufloesung"], "eindeutig")                    # the shown line is the FIRST tree's (27b)
 
     def test_output_carries_no_build_path(self):
         """Reproduzierbarer Bau (Wunsch 27B-Sitz 05.10.): derselbe Quellstand ergibt dieselbe Datei, egal in welchem Verzeichnis die Bäume liegen.
-        Ein Baum-Pfad in der Ausgabe (``trees.<baum>.python_dir``) machte sie von Maschine zu Maschine verschieden."""
+        Ein Baum-Pfad in der Ausgabe (``trees.<tree>.python_dir``) machte sie von Maschine zu Maschine verschieden."""
         import json
         with tempfile.TemporaryDirectory() as d:
             cat = self._build(d, ["FLLIPER_A = EnvBool(False)"], ["FLLIPER_A = EnvBool(False)"])
@@ -186,7 +186,7 @@ KIT = os.environ.get("RELEASE_KIT_TOOLS") or os.path.join(REPO, "tools", "releas
 @unittest.skipUnless(os.path.isfile(RENAME) and os.path.isdir(KIT), "rename_rigdash.py oder das Release-Kit fehlt")
 class RenameRoundtrip(unittest.TestCase):
     """Die Generator-Ausgabe muss durch die Editor-Umbenennung (rename_rigdash.py) laufen: kein Rest ``FLLIPER_PDFLIP_``/``flliper/srt`` (Exit 3 sonst),
-    gleiche Eintragszahl, ``baeume``/``abweichung`` bleiben."""
+    gleiche Eintragszahl, ``trees``/``abweichung`` bleiben."""
 
     def test_union_catalog_survives_the_rename(self):
         import json
@@ -208,7 +208,7 @@ class RenameRoundtrip(unittest.TestCase):
         self.assertEqual(len(renamed["entries"]), len(cat["entries"]))
         self.assertFalse([k for k in renamed["entries"] if k.startswith("FLLIPER_PDFLIP_")])
         both = next(e for k, e in renamed["entries"].items() if k.endswith("_BOTH"))
-        self.assertEqual(both["baeume"], ["27b", "nf"])
+        self.assertEqual(both["trees"], ["27b", "nf"])
         self.assertEqual(sorted(both["abweichung"]), ["27b", "nf"])
 
 

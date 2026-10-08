@@ -1365,7 +1365,7 @@ class GreenController(_ds.ShareController):
 
 
 def pstufe_line(d: GreenDecision, obs: Mapping[str, str], kv: str = "n/a") -> str:
-    """The ONE measurement line per stage decision (grep ``P-STUFE``), section 8.5. ``stufe`` is the rung
+    """The ONE measurement line per stage decision (grep ``P-STUFE``), section 8.5. ``stage`` is the rung
     index 0..3 = 100/75/50/25 %; the hold is PP0's and appears as ``would_hold`` (observer) -- ``kv`` is n/a
     until a D-side feed exists (D's ``full token usage`` is the wrong quantity as a gate)."""
     tau = "n/a" if d.tau_s is None else f"{d.tau_s:.2f}s"
@@ -1373,6 +1373,6 @@ def pstufe_line(d: GreenDecision, obs: Mapping[str, str], kv: str = "n/a") -> st
     tg = "n/a" if d.target_ms is None else f"{d.target_ms:.0f}"
     return (f"P-STUFE bs={d.b}/{d.seats} kv={kv} arena={obs.get('arena', 'n/a')} pending={d.q_tokens:.0f} "
             f"tau={tau} d_round_ms={dr} target_ms={tg} tsolo_ms={d.tsolo_ms:.0f}({d.tsolo_src}) "
-            f"stufe={d.prev_rung}->{d.rung} f={d.fraction:.2f} start={d.start} adj={d.adj} "
+            f"stage={d.prev_rung}->{d.rung} f={d.fraction:.2f} start={d.start} adj={d.adj} "
             f"sm={obs.get('sm', 'n/a')} would_hold={obs.get('would_hold', 'n/a')} hold={obs.get('hold', 'n/a')} "
             f"reason={d.reason} flaps={d.flaps} dwell_s={d.dwell_s:.2f}")

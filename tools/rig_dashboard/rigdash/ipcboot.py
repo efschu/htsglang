@@ -638,14 +638,14 @@ _rank_first_rise = activity.first_rise
 
 
 #: the partition of a flip, in time order (Summe = total_ms)
-PARTS = ("vorlauf_ms", "layer_ms", "wake_kv_dc_ms", "nachlauf_ms", "rest_ms")
+PARTS = ("warmup_ms", "layer_ms", "wake_kv_dc_ms", "nachlauf_ms", "rest_ms")
 
 
 def flip_partition(start: float, end: float, begin: float, flip_ms, done, lo: Optional[float] = None) -> dict:
     """Nutzer 02.10. (Flipzeit-Gesetz): total = letztes Token der abgebenden Phase -> erstes Token der
     annehmenden, VOLLSTAENDIG zerlegt auf der Zeitachse -- jeder Teil ist ein Stueck von [start, end]:
 
-      vorlauf      start -> flip_begin
+      warmup      start -> flip_begin
       layer        flip_begin -> flip_begin + flip_ms           (Layer-Tausch, flip_done.flip_ms)
       wake_kv_dc   flip_begin + flip_ms -> flip_done            (FLIP-TIMELINE wake-kv@..dc@..done)
       nachlauf     flip_done -> lo                               (bis zur ersten Arbeit, sicher gemessen)
@@ -661,7 +661,7 @@ def flip_partition(start: float, end: float, begin: float, flip_ms, done, lo: Op
         return min(max(float(x), start), lo)
 
     b = clip(begin)
-    p = {"vorlauf_ms": (b - start) * 1000.0, "layer_ms": None, "wake_kv_dc_ms": None, "nachlauf_ms": None}
+    p = {"warmup_ms": (b - start) * 1000.0, "layer_ms": None, "wake_kv_dc_ms": None, "nachlauf_ms": None}
     # the marks run in time order (an event out of order never gives a negative part: running max)
     l_end = max(b, clip(begin + float(flip_ms) / 1000.0)) if flip_ms is not None else None
     if l_end is not None:
@@ -686,9 +686,9 @@ VOR_PARTS = ("leer_ms", "halt_ms", "park_ms", "vor_rest_ms")
 PROVISIONAL_MAX_S = 900.0
 
 
-def vorlauf_split(start: float, vorlauf_ms: float, arrival: Optional[float], park_sent: Optional[float],
+def vorlauf_split(start: float, warmup_ms: float, arrival: Optional[float], park_sent: Optional[float],
                   park_ms, segs: Optional[List[dict]] = None) -> dict:
-    """D>P: [start, start + vorlauf] = leer + halt + park + vor_rest, in time order (running max, every part >= 0):
+    """D>P: [start, start + warmup] = leer + halt + park + vor_rest, in time order (running max, every part >= 0):
 
       leer      start -> arrival.  Since the user's correction of 06.10. (Server-Leerlauf ist keine Flipzeit) the
                 caller passes start = max(D's last token, arrival of the waiter), so leer is 0 here; the idle span
@@ -700,9 +700,9 @@ def vorlauf_split(start: float, vorlauf_ms: float, arrival: Optional[float], par
     Without an arrival the split is unknown (all None): never a guessed part."""
     out = {k: None for k in VOR_PARTS}
     out["leer_d_prefill_ms"] = None
-    if arrival is None or vorlauf_ms is None:
+    if arrival is None or warmup_ms is None:
         return out
-    b = start + float(vorlauf_ms) / 1000.0
+    b = start + float(warmup_ms) / 1000.0
 
     def clip(x):
         return min(max(float(x), start), b)
@@ -835,7 +835,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
         t_done = fd.get("t")
         flip_ms = fd.get("flip_ms")
         row = {"dir": d, "begin": b, "done": t_done, "kind": "offen", "total_ms": None, "start": None, "end": None,
-               "vorlauf_ms": None, "layer_ms": None, "wake_kv_dc_ms": None, "nachlauf_ms": None, "rest_ms": None,
+               "warmup_ms": None, "layer_ms": None, "wake_kv_dc_ms": None, "nachlauf_ms": None, "rest_ms": None,
                "leer_ms": None, "halt_ms": None, "park_ms": None, "vor_rest_ms": None, "leer_d_prefill_ms": None,
                "leer_excl_ms": None, "arrival": None, "provisional": False,
                "nachlauf_d_extend_ms": None, "end_res_ms": None, "missing": None}
@@ -999,7 +999,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
             row["start"], row["end"] = start, end
             if d == "D>P":
                 row["arrival"] = dp_arrival
-                row.update(vorlauf_split(start, row["vorlauf_ms"], dp_arrival, dp_park[0], dp_park[1], segs))
+                row.update(vorlauf_split(start, row["warmup_ms"], dp_arrival, dp_park[0], dp_park[1], segs))
                 # D's log may write its rounds late (27B: only at the next wake); the start is final once a later
                 # round is in the log, or after PROVISIONAL_MAX_S
                 if d_rounds is not None and now - float(t_done) < PROVISIONAL_MAX_S \

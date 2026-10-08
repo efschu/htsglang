@@ -1,6 +1,6 @@
 """The exchange form's group-D dormant reserve is chosen PER MODEL PROFILE.
 
-NF cb1575e94e (user 22.09.: "diesen wert nicht doppelt oder gar nicht nehmen")
+NF cb1575e94e (user 22.09.: "diesen value nicht doppelt oder gar nicht nehmen")
 made the census of THIS model the reserve under the exchange form and let it
 replace the constant in ``dc_expect_d``. On the NF line that is the model's own
 measurement. In the unified tree it ran for EVERY profile, so a 27B exchange

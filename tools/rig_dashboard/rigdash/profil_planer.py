@@ -17,11 +17,11 @@ from typing import Any, Dict, List, Mapping, Optional
 SCHEMA = "flliper.planer-ui/1"
 
 #: Betriebsform der Seite -> Name der Form in ``ProfilEditor.propose`` (AP-D: ``flip``/``tp`` Orakel, ``dual`` AP-E Orakel + Dual-Passung, ``single`` AP-F Planer-Rechnung)
-FORM_BACKEND = {"einzel": "single", "tp": "tp", "flip": "flip", "dual": "dual"}
+FORM_BACKEND = {"single": "single", "tp": "tp", "flip": "flip", "dual": "dual"}
 
 #: die vier Formen (Plan R2); ``n_min``/``n_max`` = zulässige Kartenzahl (R2: Einzelkarte N=1, die übrigen N>=2; topology.py MIN_CARDS)
-FORMEN: List[Dict[str, Any]] = [
-    {"id": "einzel", "name": "Single card", "n_min": 1, "n_max": 1,
+FORMS: List[Dict[str, Any]] = [
+    {"id": "single", "name": "Single card", "n_min": 1, "n_max": 1,
      "satz": "One card, one rank: the normal server without the pdflip launcher, for example a laptop. The proposal there is a planner calculation, not a launcher run.",
      "quelle": "PLAN-PROFIL-PLANER-1006 R2 and R5b (user 06.10.)"},
     {"id": "tp", "name": "TP only", "n_min": 2, "n_max": None,
@@ -36,8 +36,8 @@ FORMEN: List[Dict[str, Any]] = [
 ]
 
 #: die Abschnitte der Seite und die Namen ihrer Werte (Wireframe Abschnitt 5; jeder Name steht im Katalog, ``test_profil_planer_aph1_1006``)
-ABSCHNITTE: List[Dict[str, Any]] = [
-    {"id": "A", "titel": "A  Split across the cards",
+SECTIONS: List[Dict[str, Any]] = [
+    {"id": "A", "title": "A  Split across the cards",
      "satz": "How the model is distributed across the cards: layers per card (prefill), weights per card (decode), memory budget and memory items (foreign context, non-torch, reserves, L15, extend trim) per card.",
      "namen": ["--pp-size", "--tp-size", "--pp-stage-ratio", "--pp-attn-stage-ratio", "--pp-layer-ratio", "--pp-layer-set", "--pp-solve-objective",
                "--pp-solve-pool-floor", "--pp-solve-cut", "--pp-cut-expert-device-fraction", "--pp-cut-expert-lru-rows", "--p-layer-split",
@@ -47,11 +47,11 @@ ABSCHNITTE: List[Dict[str, Any]] = [
                # Positionale Je-Karte-Vektoren des Launchers (POSITIONAL_VECTOR_FLAGS/-TOKENS, launcher.py): Speicherposten je Karte, Release-Profile nf*/27b* setzen sie
                "--d-foreign-context-mib", "--d-nontorch-mib", "--d-reserve-mib", "--pp-cut-reserve-mib",
                "FLLIPER_PDFLIP_L15_MIB", "FLLIPER_PDFLIP_EXTEND_TRIM_MIB"]},
-    {"id": "B", "titel": "B  KV: heads, token shares, DCP",
+    {"id": "B", "title": "B  KV: heads, token shares, DCP",
      "satz": "Where the KV cache lives: how many tokens per card, whether uneven DCP applies. The KV heads per rank are derived and only a display.",
      "namen": ["--dcp-size", "--uneven-dcp", "--uneven-dcp-weighted", "--rank-kv-ratio", "FLLIPER_UNEVEN_TOKEN_VECTOR", "--uneven-token-vector",
                "--d-uneven-token-vector", "--d-kv-token-cut", "--d-token-placement", "--kv-reshard-vectors"]},
-    {"id": "C", "titel": "C  Experts (MoE)",
+    {"id": "C", "title": "C  Experts (MoE)",
      "satz": "How many experts per card are in VRAM and how the experts are distributed (effective only for MoE models).",
      "namen": ["--rank-moe-resident-fraction", "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", "FLLIPER_UNEVEN_MOE_EXPERT_SHARD", "FLLIPER_UNEVEN_MOE_VECTOR",
                "FLLIPER_MOE_SCRATCH_SLOTS", "--expert-placement-override"]},
@@ -89,7 +89,7 @@ DUAL = {
     },
 }
 
-ZIELE = {"seats": [1, 256], "kv_tokens": [1024, 8 << 20], "kontext_presets": [32768, 65536, 131072, 262144]}
+GOALS = {"seats": [1, 256], "kv_tokens": [1024, 8 << 20], "context_presets": [32768, 65536, 131072, 262144]}
 
 
 #: Positionale Vektoren des Launchers (launcher.py:5964-5973 POSITIONAL_VECTOR_FLAGS = Flag-dest-Namen, POSITIONAL_VECTOR_TOKENS = --extra-/--env-Tokens;
@@ -103,9 +103,9 @@ POSITIONAL_TOKENS_ALL = ["--rank-role", "--rank-tp-ratio", "--rank-moe-ratio", "
 #: Aus der POSITIONAL-Liste des Launchers, die seine Topologie-Probe NICHT als Vektor je Karte zaehlt (launcher.py:6319-6328 _TOPOLOGY_VECTOR_FLAGS/-TOKENS):
 #: das BAR1-Fenster ("24,PP_0=96", Code BAR1-WINDOW), die d_reshard-Presets (nicht je Karte) und L1.5 (eigene Probe).  Sie bleiben Textfelder mit Katalogtext.
 #: Ein Test bildet _TOPOLOGY_VECTOR_FLAGS/-TOKENS aus dem Launcher-Quelltext nach und pinnt vector_names()/POSITIONAL_* dagegen.
-LAUNCHER_NICHT_JE_KARTE = ["--p-barlink-bar1-window-mib", "--d-reshard-presets", "FLLIPER_PDFLIP_L15_MIB"]
-POSITIONAL_FLAGS = [f for f in POSITIONAL_FLAGS_ALL if f not in LAUNCHER_NICHT_JE_KARTE]
-POSITIONAL_TOKENS = [t for t in POSITIONAL_TOKENS_ALL if t not in LAUNCHER_NICHT_JE_KARTE]
+LAUNCHER_NOT_PER_CARD = ["--p-barlink-bar1-window-mib", "--d-reshard-presets", "FLLIPER_PDFLIP_L15_MIB"]
+POSITIONAL_FLAGS = [f for f in POSITIONAL_FLAGS_ALL if f not in LAUNCHER_NOT_PER_CARD]
+POSITIONAL_TOKENS = [t for t in POSITIONAL_TOKENS_ALL if t not in LAUNCHER_NOT_PER_CARD]
 #: Je-Karte-Vektoren aus den Abschnitten A-C, die der Launcher nicht positional fuehrt (je Eintrag ein Rang bzw. eine Stufe laut Katalogtext).
 #: Bewusst NICHT dabei: Kommalisten, die keine Rang-Vektoren sind (--pp-layer-set, --p-layer-split, --p-attn-head-split, --kv-reshard-vectors,
 #: --expert-placement-override, --d-kv-token-cut, --d-token-placement) und die Dual-/Planer-Listen (--dual-share-actuators, --cuda-graph-bs ...): die bleiben ein Textfeld.
@@ -131,33 +131,33 @@ def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[s
     """Das ``planer``-Objekt der ``list``-Antwort.
 
     ``vorschlag_formen``: die Formen, die ``ProfilEditor.propose`` kann (``ProfilEditor.FORMS``); eine Seitenform mit anderem Namen bekommt
-    ``vorschlag: False`` und einen Hinweis (heute bedient ``propose`` alle vier Formen: ``flip``, ``tp``, ``dual``, ``single``).  ``entries``: der Katalog (für Text und Kanten der
-    Dual-ENV-Werte, auch wenn das Profil sie nicht setzt).  ``oracle``: ob das Orakel konfiguriert ist (ohne es gibt es keinen Vorschlag).
-    ``dual``: ob der Planer-Baum die Dual-Form traegt (``profil.dual_line_probe``); ohne sie (NF-Linie, Nutzerentscheid 07.10.) steht Dual weder in ``formen`` noch
-    als Dual-ENV-Tabelle (kein Schluessel ``dual``) in der Antwort, ``dual_verfuegbar`` sagt es."""
+    ``proposal: False`` und einen Hinweis (heute bedient ``propose`` alle vier Formen: ``flip``, ``tp``, ``dual``, ``single``).  ``entries``: der Catalog (für Text und Kanten der
+    Dual-ENV-Werte, auch wenn das Profil sie nicht setzt).  ``oracle``: ob das Oracle konfiguriert ist (ohne es gibt es keinen Vorschlag).
+    ``dual``: ob der Planer-Baum die Dual-Form traegt (``profil.dual_line_probe``); ohne sie (NF-Linie, Nutzerentscheid 07.10.) steht Dual weder in ``forms`` noch
+    als Dual-ENV-Tabelle (kein Schluessel ``dual``) in der Antwort, ``dual_available`` sagt es."""
     can = set(vorschlag_formen or ())
-    formen = []
-    for f in FORMEN:
+    forms = []
+    for f in FORMS:
         if f["id"] == "dual" and not dual:
             continue
         back = FORM_BACKEND[f["id"]]
-        d = dict(f, backend=back, vorschlag=bool(oracle and back in can))
-        if not d["vorschlag"]:
+        d = dict(f, backend=back, proposal=bool(oracle and back in can))
+        if not d["proposal"]:
             if not oracle:
-                d["hinweis"] = "The proposal needs the oracle (launcher dry run), which is not set up in this dashboard; the values can be set by hand."
+                d["note"] = "The proposal needs the oracle (launcher dry run), which is not set up in this dashboard; the values can be set by hand."
             else:
-                d["hinweis"] = "There is no proposal for this form in this version; the values can be set by hand."
-        formen.append(d)
+                d["note"] = "There is no proposal for this form in this version; the values can be set by hand."
+        forms.append(d)
     ents = entries or {}
-    out = {"schema": SCHEMA, "formen": formen, "abschnitte": [dict(a) for a in ABSCHNITTE], "vektoren": vector_names(),
-           "positional": POSITIONAL_FLAGS + [t.rstrip("=") for t in POSITIONAL_TOKENS], "je_rang": list(RANK_VECTORS), "ziele": dict(ZIELE), "oracle": bool(oracle),
-           "dual_verfuegbar": bool(dual)}
+    out = {"schema": SCHEMA, "forms": forms, "sections": [dict(a) for a in SECTIONS], "vectors": vector_names(),
+           "positional": POSITIONAL_FLAGS + [t.rstrip("=") for t in POSITIONAL_TOKENS], "per_rank": list(RANK_VECTORS), "goals": dict(GOALS), "oracle": bool(oracle),
+           "dual_available": bool(dual)}
     if dual:
         tab = dict(DUAL)
-        tab["werte"] = {}
+        tab["values"] = {}
         for key, name in DUAL_ENV.items():
             e = ents.get(name) or {}
-            tab["werte"][name] = {"name": name, "rolle": key, "text": e.get("text") or "", "help": e.get("help") or "", "depends": [dict(d) for d in e.get("depends") or []],
+            tab["values"][name] = {"name": name, "rolle": key, "text": e.get("text") or "", "help": e.get("help") or "", "depends": [dict(d) for d in e.get("depends") or []],
                                   "level": e.get("level"), "gain": e.get("gain") or "", "cost": e.get("cost") or ""}
         out["dual"] = tab
     return out
@@ -165,4 +165,4 @@ def ui_info(vorschlag_formen: Any = (), entries: Optional[Mapping[str, Mapping[s
 
 def all_section_names() -> List[str]:
     """Alle Namen der Abschnitte A-C (jeder genau einmal)."""
-    return [n for a in ABSCHNITTE for n in a["namen"]]
+    return [n for a in SECTIONS for n in a["namen"]]

@@ -719,7 +719,7 @@ class TestTheLateRouting(CustomTestCase):
         """A native rank's odd shard materialises byte-exactly as well.
 
         With this in place every one of the 48 GDN layers logs a DEQUANTISED
-        line on EVERY rank of a TP=3 boot, native rank included -- the beleg's
+        line on EVERY rank of a TP=3 boot, native rank included -- the evidence's
         96 (two Marlin ranks) becomes 144.
         """
         scheme = CompressedTensorsW4A4Fp4Dequant()

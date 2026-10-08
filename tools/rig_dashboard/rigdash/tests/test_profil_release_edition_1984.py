@@ -33,7 +33,7 @@ from rigdash.tests import test_profil_balken_1432 as B  # noqa: E402
 
 STATIC = S.STATIC
 NODE = B.NODE
-PROFIL_MODULES = ("modellprofil.js", "hwprofil.js", "profil_balken.js", "profil.js")
+PROFILE_MODULES = ("modellprofil.js", "hwprofil.js", "profil_balken.js", "profil.js")
 
 
 def page():
@@ -47,7 +47,7 @@ class TestPage(unittest.TestCase):
         self.assertIn('data-tab="profil"', rel)
         self.assertIn('id="tab-profil"', rel)
         self.assertIn('id="pf-root"', rel)
-        for js in PROFIL_MODULES:
+        for js in PROFILE_MODULES:
             self.assertIn('<script src="%s"></script>' % js, rel, js)
         # das CSS der Karte (Profil) und der gemeinsamen kp-Klassen (Urteil, Balken) ist da
         for css in ("#pf-root {", ".pf-top {", ".kp-verdict {", ".ks-over {"):
@@ -84,7 +84,7 @@ class TestPage(unittest.TestCase):
 
 
 class Served(unittest.TestCase):
-    """Eine Release-Instanz mit allem, was der Editor braucht (Fake-Gpuq, Fake-Worker, Fixture-Baum)."""
+    """Eine Release-Instanz mit allem, was der Editor requires (Fake-Gpuq, Fake-Worker, Fixture-Baum)."""
 
     edition = "release"
 
@@ -98,7 +98,7 @@ class Served(unittest.TestCase):
         os.makedirs(d)
         with open(os.path.join(d, "hardware_profile.py"), "w") as fh:
             fh.write(H.STUB_MODULE)
-        self.hw = H.hwprofil.HwProfil(http=self.gq, tree=self.hw_tree, synchronous=True, edition=self.edition)
+        self.hw = H.hwprofil.HwProfile(http=self.gq, tree=self.hw_tree, synchronous=True, edition=self.edition)
         self.est = B.Est()
         self.svc = B.fake_service(self.tmp)
         self.addCleanup(self.svc.close)

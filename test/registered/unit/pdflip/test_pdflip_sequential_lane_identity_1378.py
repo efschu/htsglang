@@ -21,7 +21,7 @@ DIE DREI BEWEISE DES SITZES, alle ohne CUDA (``CUDA_VISIBLE_DEVICES=""``):
   die Verweigerung heraus, laeuft der Test rot (siehe
   ``test_w15_refusal_is_load_bearing``).
 
-Die Namensaufloesung braucht keine Karte und kein VRAM: sie ist reine
+Die Namensaufloesung requires keine Karte und kein VRAM: sie ist reine
 String-Arithmetik ueber dem Lane-Schluessel.
 """
 

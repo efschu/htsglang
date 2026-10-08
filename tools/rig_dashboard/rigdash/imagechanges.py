@@ -20,7 +20,7 @@ from typing import Optional
 from . import redact
 
 DEFAULT_PATH = "/spinning/gpu-arb/docs/image_changes.json"
-STATUSES = ("erwartet", "unbelegt", "belegt", "wirkungslos")
+STATUSES = ("erwartet", "unverified", "belegt", "wirkungslos")
 SEATS = ("27B", "NF")
 TEXT_FIELDS = ("id", "who", "title", "expected", "status", "evidence")
 

@@ -1,4 +1,4 @@
-"""#109b: der #109-Pfad braucht einen MODUL-weiten logger.
+"""#109b: der #109-Pfad requires einen MODUL-weiten logger.
 
 fnFL2w61 starb mit `NameError: name 'logger' is not defined` in
 `presplit_expert_offload_after_repack` -- nachdem #112/4 den Rang

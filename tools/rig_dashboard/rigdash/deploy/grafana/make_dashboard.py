@@ -68,7 +68,7 @@ panels = [
         t("max by (model, dir) (pdflip_flip_user_view_ms{part=\"total\",model=~\"$model\"}) / 1000", "{{dir}} {{model}}"),
         t("max by (model, dir) (pdflip_flip_user_view_ms{part=\"layer\",model=~\"$model\"}) / 1000", "Layer-Tausch {{dir}} {{model}}")],
         "s", 0, 9, 12, 8, "Nutzersicht (01.10.): P→D = P-Ende -> erstes Decode auf D (Rang-Segmente), "
-        "D→P = Decode-Ende -> P-Prefill-Start (flip_user_time); Teile part=vorlauf|layer|nachlauf|d_extend. "
+        "D→P = Decode-Ende -> P-Prefill-Start (flip_user_time); Teile part=warmup|layer|nachlauf|d_extend. "
         "Ein Punkt je Flip zum flip_begin; Leerlauf-Flips ohne Wert.", draw="points"),
     panel("Upstream-TTFT des D-Beins (nicht Nutzer-TTFT)", [
         t("histogram_quantile(0.5, sum by (le) (rate(flliper:time_to_first_token_seconds_bucket[$__rate_interval])))", "p50"),
@@ -97,7 +97,7 @@ panels = [
         "short", 0, 52, 12, 8, "rankstats.cache.loadback_tok / mamba_resume_n, erster Rang je Gruppe"),
     panel("L3 Store: Prefetch je Ausgang /min", [
         t("sum by (model, group, outcome) (rate(pdflip_rank_l3_prefetch_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60", "{{outcome}} {{group}} {{model}}")],
-        "short", 12, 52, 12, 8, "rankstats.cache.prefetch.*; L1,5: noch keine Daten (Stufe im Bau)"),
+        "short", 12, 52, 12, 8, "rankstats.cache.prefetch.*; L1,5: noch keine Data (Stufe im Bau)"),
     row("Karten und Host", 34),
     panel("Leistungsaufnahme", [t("sum(nvidia_smi_power_draw_watts)", "Summe"),
                                 t("nvidia_smi_power_draw_watts " + GPU_NAME, "nvml {{index}} {{name}}")],

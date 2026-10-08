@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """s15 -- #296: turn the six arms' raw points into the report tables.
 
-Reads what the step wrote and NOTHING else: punkte.jsonl (prefill + decode per
+Reads what the step wrote and NOTHING else: data_points.jsonl (prefill + decode per
 arm and session count), wait/<arm>.json (the compute/wait split per rank),
 proofs/<arm>.txt (the plan the boot actually ran with, and its KV capacity) and
 power/<arm>.csv (1 s NVML samples for the joule-per-token approximation).
@@ -177,7 +177,7 @@ def main() -> int:
     args = ap.parse_args()
 
     step = args.step_dir
-    points = load_points(os.path.join(step, "punkte.jsonl"))
+    points = load_points(os.path.join(step, "data_points.jsonl"))
     arms = [a for a in ARM_ORDER if any(k[0] == a for k in points)]
     missing = [a for a in ARM_ORDER if a not in arms]
 

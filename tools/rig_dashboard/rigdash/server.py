@@ -16,8 +16,8 @@ Routes
   GET  /api/hwprofil/issue     Issue-Text "Hardwareprofil" (Markdown zum Kopieren, redigiert)
   POST /api/profil/issue       Issue-Text "Laufbericht" (AP-I, Markdown zum Kopieren, redigiert): {doc, dry?, cards?, model?}
   POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|phase_bars|compute|move|chunk|context, settings?, phases?, form?}
-  POST /api/profil/propose     Startprofil des Planers (AP-D, nur LAN): {basis: {kind, name}, form: flip|tp|dual|single, inventar: "rig" | [{card, pcie}], karte?, ziele?, model_path?, draft_path?}
-                               -> propose() + Orakel (Launcher-Trockenlauf im Kindprozess, Cache) + Verdikte; flip/tp/dual: Orakel, single (Einzelkarte, genau eine Karte): Planer-Rechnung
+  POST /api/profil/propose     Startprofil des Planers (AP-D, nur LAN): {basis: {kind, name}, form: flip|tp|dual|single, inventory: "rig" | [{card, pcie}], karte?, goals?, model_path?, draft_path?}
+                               -> propose() + Oracle (Launcher-Trockenlauf im Kindprozess, Cache) + Verdikte; flip/tp/dual: Oracle, single (SingleCard, genau eine Karte): Planer-Rechnung
                                ohne Launcher (AP-F); flliper.server/1 mit Herkunft/Verdikt/Kanten je Wert
 """
 
@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 from . import (energy, features, flipzeit, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
-               modellprofil, profil, profil_oracle, profil_recompute, redact, sampler, sources, vmpush, weg2line)
+               modellprofil, profil, profile_oracle, profile_recompute, redact, sampler, sources, vmpush, weg2line)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -254,12 +254,12 @@ class App:
         self.pdflip = weg2line.PdFlipLines(cfg["docker_ssh"], args.release_profile or [])
         self.kartenplaner = kartenplan.Kartenplaner()
         # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
-        ptree = getattr(args, "profil_tree", None) or None      # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker
+        ptree = getattr(args, "profile_tree", None) or None      # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker
         # AP-D: das Orakel (Launcher-Trockenlauf im Kindprozess + Cache); startet erst bei der ersten Anfrage, nie im Hintergrund
         # eigener cgroup-Scope (Spitze 1,75 GiB RSS > Rest der Unit-Grenze, Review AP-D); args ohne Feld (Tests) = kein Praefix
         opf = getattr(args, "oracle_prefix", None)
-        oprefix = profil_oracle.default_prefix() if opf == "auto" else (shlex.split(opf) if opf and opf != "none" else [])
-        self.oracle = profil_oracle.OracleService(profil.find_tree(ptree), python=getattr(args, "couplings_python", None), prefix=oprefix)
+        oprefix = profile_oracle.default_prefix() if opf == "auto" else (shlex.split(opf) if opf and opf != "none" else [])
+        self.oracle = profile_oracle.OracleService(profil.find_tree(ptree), python=getattr(args, "couplings_python", None), prefix=oprefix)
         self.profil = profil.ProfilEditor(
             kartenplaner=self.kartenplaner, tree=ptree,
             oracle=self.oracle, hardware=lambda: self.hwprofil.get(), check_path=lambda p, what: self.modellprofil.check_path(p, what),
@@ -271,9 +271,9 @@ class App:
         # Modellprofil schätzen (S3): liest nur config.json und Kopfzeilen unter den Modellwurzeln
         self.modellprofil = modellprofil.ModelEstimator(tree=ptree, roots=getattr(args, "model_root", None) or None)
         # Profil-Editor S4b (Auftrag 1432): Kopplungen/Balken im langlebigen Worker (startet erst bei der ersten Anfrage)
-        self.couplings = profil_recompute.CouplingsService(self.profil.tree, python=getattr(args, "couplings_python", None))
+        self.couplings = profile_recompute.CouplingsService(self.profil.tree, python=getattr(args, "couplings_python", None))
         # Profil-Editor S2 (Auftrag 950): Hardwareprofil lesen, im gebuchten gpuq-Fenster messen
-        self.hwprofil = hwprofil.HwProfil(
+        self.hwprofil = hwprofil.HwProfile(
             gpuq=args.gpuq, tree=getattr(args, "hw_tree", None) or ptree, measure_tree=getattr(args, "hw_measure_tree", None),
             python=getattr(args, "hw_python", None), prefix=shlex.split(getattr(args, "hw_prefix", "") or ""),
             state_dir=args.state_dir or None, edition=getattr(args, "edition", "rig") or "rig",
@@ -637,7 +637,7 @@ def make_handler(app: App):
                     return self._json(dict(app.profil.list(), ok=True))
                 if path == "/api/profil/modelle":
                     return self._json(app.profil.known_models())
-            except profil.ProfilError as e:
+            except profil.ProfileError as e:
                 return self._json({"ok": False, "error": str(e)}, 400)
             return self._send(404, "not found", "text/plain")
 
@@ -682,7 +682,7 @@ def make_handler(app: App):
                 parts = app.hwprofil.issue_parts()
             except Exception as e:      # noqa: BLE001 -- ohne Hardwareprofil entsteht der Bericht trotzdem, der Block sagt "nicht verfügbar"
                 parts = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
-            return self._json(app.profil.issue_report(body.get("doc"), dry=body.get("dry"), cards=body.get("cards"), model=body.get("model"), vorschlag=body.get("vorschlag"),
+            return self._json(app.profil.issue_report(body.get("doc"), dry=body.get("dry"), cards=body.get("cards"), model=body.get("model"), proposal=body.get("proposal"),
                                                       hardware_md=parts.get("short") if parts.get("ok") else "", versions=parts.get("versions") if parts.get("ok") else {}))
 
         def _profil_recompute(self, body):
@@ -694,7 +694,7 @@ def make_handler(app: App):
             hw = app.hwprofil.get()
             if not hw.get("ok", True) or not hw.get("profile"):
                 return self._json({"ok": False, "error": "Hardware profile not available: %s" % (hw.get("error") or "leer")}, 200)
-            args_ = profil_recompute.args_of(doc)
+            args_ = profile_recompute.args_of(doc)
             vars_ = {v.get("name"): v.get("value") for v in (doc.get("vars") or []) if isinstance(v, dict)}
             mpath = body.get("model_path") or vars_.get("PROFILE_MODEL") or args_.get("--model-path") or args_.get("--model")
             if not mpath:
@@ -704,7 +704,7 @@ def make_handler(app: App):
             draft_error = None
             if str(body.get("what") or "bars") == "phase_bars":
                 # AP-H2: das Draft-Verzeichnis wird mitprofiliert (Draft-Term der Balken); ist es nicht lesbar, rechnet der Balken ohne und sagt es
-                dpath = profil_recompute.draft_path_of(doc, body)
+                dpath = profile_recompute.draft_path_of(doc, body)
                 if dpath:
                     try:
                         est = app.modellprofil.estimate(dict(mreq, draft_path=dpath))
@@ -715,7 +715,7 @@ def make_handler(app: App):
                     est = app.modellprofil.estimate(mreq)
             else:
                 est = app.modellprofil.estimate(mreq)
-            req = profil_recompute.build_request(body, hardware=hw["profile"], model=est["profile"])
+            req = profile_recompute.build_request(body, hardware=hw["profile"], model=est["profile"])
             res = app.couplings.request(req)
             res["model_path"] = str(mpath)
             if draft_error:
@@ -904,7 +904,7 @@ def make_handler(app: App):
                 return self._send(404, "not found", "text/plain")
             except BrokenPipeError:
                 return None
-            except (ValueError, profil.ProfilError) as e:
+            except (ValueError, profil.ProfileError) as e:
                 return self._json({"ok": False, "error": str(e)}, 400)
             except modellprofil.ModellprofilUnavailable as e:
                 return self._json({"ok": False, "error": str(e)}, 503)

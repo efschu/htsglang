@@ -24,7 +24,7 @@ WHAT IS MEASURED (--op)
 
                 * ``gleich`` ("equal"): every destination rank gets the
                   same number of rows.
-                * ``schief`` ("skewed"): rank 0 gets ``--schief`` times as
+                * ``skewed`` ("skewed"): rank 0 gets ``--skewed`` times as
                   many rows from EVERY sender as the others do -- the hot
                   expert, the incast case.
 
@@ -87,7 +87,7 @@ INVOCATION
 
 The rank count follows from ``--devices``; it is no longer fixed at two.
 
-Other flags: --op, --hidden, --schief, --sizes, --backends, --secs,
+Other flags: --op, --hidden, --skewed, --sizes, --backends, --secs,
 --warmup, --rounds, --dtype, --slot-mib, --completion, --out, --devices. The
 cards must be free; the program does not preempt anything and aborts if more
 than --max-used-mib is in use on a target card.
@@ -130,7 +130,7 @@ MIN_WARMUP_S = 3.0
 
 #: Distribution patterns for all_to_all. all_reduce only knows "-".
 #: The two literal values are the CLI/report contract and stay German.
-PATTERNS = ("gleich", "schief")
+PATTERNS = ("gleich", "skewed")
 
 
 def cell_key(cell) -> str:
@@ -149,7 +149,7 @@ def split_sizes(rows: int, world: int, pattern: str, skew: int) -> list:
     """Send row counts per destination rank. The same math on ALL ranks.
 
     ``gleich`` (equal): ``rows/world`` to everyone.
-    ``schief`` (skewed): rank 0 gets ``skew`` times as many as the others --
+    ``skewed`` (skewed): rank 0 gets ``skew`` times as many as the others --
     a hot expert everybody writes to at once. The remainder of the division
     goes to rank 0 so that the sum is exactly ``rows``; a sum that does not
     add up would be a buffer that does not fit.
@@ -361,11 +361,11 @@ def run_rank(a: argparse.Namespace) -> int:
                     f"or a smaller --hidden."
                 )
             for pattern in PATTERNS:
-                send = split_sizes(rows, world, pattern, a.schief)
+                send = split_sizes(rows, world, pattern, a.skewed)
                 # What I receive is column `rank` of the send matrix. Every
                 # rank runs the same function, so this needs no collective --
                 # in a benchmark the pattern is known up front.
-                recv = [split_sizes(rows, world, pattern, a.schief)[rank]
+                recv = [split_sizes(rows, world, pattern, a.skewed)[rank]
                         for _ in range(world)]
                 x = torch.empty((rows, row_elems), dtype=dtype, device=dev)
                 o = 0
@@ -644,7 +644,7 @@ def run_rank(a: argparse.Namespace) -> int:
             "world": world,
             "op": a.op,
             "hidden": a.hidden,
-            "skew_factor": a.schief,
+            "skew_factor": a.skewed,
             "a2a_geometry": {
                 f"{nb}|{m}": {
                     "rows": g["rows"], "send": g["send"], "recv": g["recv"],
@@ -756,7 +756,7 @@ def report(a, ops, sizes, backends, res, peer_res, meta, a2a_tot) -> None:
                     peers = [pr.get(key, {}).get("p50", float("nan"))
                              for pr in (peer_res or [])]
                     print(
-                        f"HOSTBENCH op={op} verteilung={m} backend={be} "
+                        f"HOSTBENCH op={op} distribution={m} backend={be} "
                         f"bytes={real} dtype={meta['dtype']} n={r['n']} "
                         f"min_us={r['min']:.2f} p50_us={r['p50']:.2f} "
                         f"p90_us={r['p90']:.2f} p99_us={r['p99']:.2f} "
@@ -820,9 +820,9 @@ def main() -> int:
     ap.add_argument("--hidden", type=int, default=512,
                     help="elements per row for all_to_all; the split sizes "
                          "are row counts, as with the MoE dispatchers")
-    ap.add_argument("--schief", type=int, default=4,
+    ap.add_argument("--skewed", type=int, default=4,
                     help="multiple that rank 0 receives from EVERY sender in "
-                         "the 'schief' (skewed) pattern -- the hot expert")
+                         "the 'skewed' (skewed) pattern -- the hot expert")
     ap.add_argument("--sizes", default=DEFAULT_SIZES)
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["bfloat16", "float16", "float32"])
@@ -891,8 +891,8 @@ def main() -> int:
             f"ABORT: --devices {a.devices} names a card twice. Two ranks on "
             f"the same card do not measure a transport."
         )
-    if a.op in ("all_to_all", "beide") and a.schief < 1:
-        raise SystemExit("ABORT: --schief must be at least 1.")
+    if a.op in ("all_to_all", "beide") and a.skewed < 1:
+        raise SystemExit("ABORT: --skewed must be at least 1.")
     preflight(devices, a.max_used_mib)
 
     env = {**os.environ,

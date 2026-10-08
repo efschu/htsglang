@@ -41,7 +41,7 @@ global.document = {
 global.localStorage = { getItem() { return null; }, setItem() {} };
 global.CSS = { escape: (s) => s };
 const calls = [];
-const VIEW = { rows: [], planner_only: [], removed: [], coverage: { rows: 0, erklaert: 0, kuratiert: 0, geerntet: 0, profil_kommentar: 0, unerklaert: 0, geaendert: 0 } };
+const VIEW = { rows: [], planner_only: [], removed: [], coverage: { rows: 0, explained: 0, curated: 0, harvested: 0, profil_kommentar: 0, unexplained: 0, changed: 0 } };
 const DOC = { name: "p", line: "nf", args: [], meta: {}, vars: [] };
 const GOOD = { ok: true, result: { phases: { alle: { bars: [{ label: "K0", total_mib: 100, budget_mib: 90, overflow_mib: 0, free_mib: 10, segments: [{ key: "weights", label: "Gewichte", mib: 80, origin: "x" }] }], context_floor_tokens: 1 } }, hints: [] }, model_path: "/m" };
 let recomputeAnswer = () => [400, { ok: false, error: "kaputt-1979" }];

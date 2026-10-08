@@ -1,7 +1,7 @@
 """#1269: the host watermark is a hard bound with a named margin.
 
 User order 2026-09-08, verbatim, given AFTER the sb4 host OOM: "kein
-uebertreten mehr der schwelle. fuehrt nur zum absturz."  The base weg2sb4
+uebertreten mehr der schwelle. fuehrt nur zum crash."  The base weg2sb4
 stood green while idling at 95.92 -> 96.36 -> 96.47 GiB against a 95.90 GiB
 reap mark, growth entirely anon, and went into the OOM.  "Accept the risk"
 had been offered and taken.  It is not an option at this threshold any more.

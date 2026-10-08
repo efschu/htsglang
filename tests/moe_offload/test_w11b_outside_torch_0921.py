@@ -1,7 +1,7 @@
 """#66 (21.09.): W11b muss sagen koennen, WO die unerklaerten Bytes sind.
 
 fnFL2v86 verweigerte mit nvml_delta=5334,0 gegen resident 2202,6 +
-head_released 1212,5 + tag_pool_inactive 1385,2 -- 533,7 MiB unerklaert bei
+head_released 1212,5 + tag_pool_inactive 1385,2 -- 533,7 MiB unexplained bei
 256 MiB Toleranz. Die Zeile konnte nicht sagen, ob der Rest INNERHALB von
 torch liegt (ein Cache, den man benennen kann) oder AUSSERHALB (CUDA-Kontext,
 cuBLAS-Workspaces, JIT-Kernel). Zwei Terme beantworten das -- als echte
@@ -74,7 +74,7 @@ def test_an_unmeasured_term_is_zero_never_guessed():
 
 
 def test_the_arithmetic_of_v86_v89():
-    """Was der Gesamt-Cache erklaert und was offen bleibt."""
+    """Was der Gesamt-Cache explained und was offen bleibt."""
     delta, r, torch_cached = 5334.0, 2202.6, 2597.7
     # mit dem Gesamt-Cache allein bleiben genau die 533,7 offen, die
     # outside_torch erklaeren soll -- und die in v89 NICHT messbar war (-1)

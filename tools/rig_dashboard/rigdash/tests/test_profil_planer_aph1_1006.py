@@ -1,15 +1,15 @@
-"""AP-H1 (Plan Profil-Planer 06.10., Zeile AP-H Teil 1): die eine Seite -- Daten (``profil_planer.py``), Darstellungslogik (``static/profil_planer.js``,
+"""AP-H1 (Plan Profil-Planer 06.10., Zeile AP-H Teil 1): die eine Seite -- Data (``profil_planer.py``), Darstellungslogik (``static/profil_planer.js``,
 Node) und die Verdrahtung in ``profil.js`` (Node mit Attrappen-DOM).
 
 Gepinnt:
-  * ``list`` traegt ``planer``: vier Betriebsformen mit je einem Satz, ``vorschlag`` nur fuer die Formen, die ``propose`` kann (flip, tp) und nur mit Orakel;
-    jeder Name der Abschnitte A-C steht im Katalog, keiner doppelt; Reglergrenzen = ``ProfilEditor.ZIELE_INT``.
-  * Die Standardwerte der Dual-ENV-Tabelle stehen im Quelltext (dual_green.py, dual_share.py, environ.py); der Katalog traegt die vier Envs kuratiert,
+  * ``list`` traegt ``planer``: vier Betriebsformen mit je einem Satz, ``proposal`` nur fuer die Formen, die ``propose`` kann (flip, tp) und nur mit Oracle;
+    jeder Name der Abschnitte A-C steht im Catalog, keiner doppelt; Reglergrenzen = ``ProfilEditor.ZIELE_INT``.
+  * Die Standardwerte der Dual-ENV-Tabelle stehen im Quelltext (dual_green.py, dual_share.py, environ.py); der Catalog traegt die vier Envs curated,
     mit den Kanten K109-K116 (Belege), und ``/profil_planer.js`` wird ausgeliefert.
-  * Zustandschip je Wert (vorgeschlagen / unbelegt / vom Launcher geloest / von Ihnen uebersteuert / Profil), Verdikt-Chip (geht / nur mit --force / verweigert /
+  * Zustandschip je Wert (vorgeschlagen / unverified / vom Launcher geloest / von Ihnen uebersteuert / Profil), Verdikt-Chip (geht / nur mit --force / verweigert /
     Hinweis / nicht geprueft / ungeprueft seit Aenderung), nie als Sperre; Je-Karte-Felder mit einem Feld je Rang, Warnung bei falscher Laenge; Dual-Tabelle
     (Lesen, Schreiben, Standard bei fehlender Zeile); Escaping; Betriebsform aus dem Profil (--dual-share impliziert --dual-layout).
-  * ``profil.js`` mit ``planer`` in der Antwort: sechs Schritte; Vorschlag POSTet {basis, form, inventar, ziele}; ohne ``planer`` bleibt die alte Seite.
+  * ``profil.js`` mit ``planer`` in der Antwort: sechs Schritte; Vorschlag POSTet {basis, form, inventory, goals}; ohne ``planer`` bleibt die alte Seite.
 """
 
 import ast
@@ -46,41 +46,41 @@ def _src(name):
         return fh.read()
 
 
-class Daten(unittest.TestCase):
+class Data(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.cat = _catalog()
 
     def test_four_forms_each_with_a_sentence(self):
-        ids = [f["id"] for f in PL.FORMEN]
-        self.assertEqual(ids, ["einzel", "tp", "flip", "dual"])
-        for f in PL.FORMEN:
+        ids = [f["id"] for f in PL.FORMS]
+        self.assertEqual(ids, ["single", "tp", "flip", "dual"])
+        for f in PL.FORMS:
             self.assertGreater(len(f["satz"]), 60, f["id"])
             self.assertTrue(f["quelle"], f["id"])
-        self.assertEqual((PL.FORMEN[0]["n_min"], PL.FORMEN[0]["n_max"]), (1, 1))                # R2: Einzelkarte N=1
-        self.assertTrue(all(f["n_min"] == 2 and f["n_max"] is None for f in PL.FORMEN[1:]))     # R2: sonst N>=2
+        self.assertEqual((PL.FORMS[0]["n_min"], PL.FORMS[0]["n_max"]), (1, 1))                # R2: Einzelkarte N=1
+        self.assertTrue(all(f["n_min"] == 2 and f["n_max"] is None for f in PL.FORMS[1:]))     # R2: sonst N>=2
 
     def test_proposal_only_for_forms_the_editor_can_and_with_an_oracle(self):
         ui = PL.ui_info(P.ProfilEditor.FORMS, self.cat["entries"], True)
-        self.assertEqual({f["id"]: f["vorschlag"] for f in ui["formen"]}, {"einzel": True, "tp": True, "flip": True, "dual": True})      # AP-D Runde 2: alle vier Formen
+        self.assertEqual({f["id"]: f["proposal"] for f in ui["forms"]}, {"single": True, "tp": True, "flip": True, "dual": True})      # AP-D Runde 2: alle vier Formen
         old = PL.ui_info(("flip", "tp"), self.cat["entries"], True)                        # ein Editor, der nur flip und tp kann: ehrlicher Hinweis statt "späteres Arbeitspaket"
-        self.assertEqual({f["id"]: f["vorschlag"] for f in old["formen"]}, {"einzel": False, "tp": True, "flip": True, "dual": False})
-        self.assertFalse(any("Arbeitspaket" in f.get("hinweis", "") for f in old["formen"]))
-        for f in ui["formen"]:
-            self.assertEqual("hinweis" in f, not f["vorschlag"], f["id"])
+        self.assertEqual({f["id"]: f["proposal"] for f in old["forms"]}, {"single": False, "tp": True, "flip": True, "dual": False})
+        self.assertFalse(any("Arbeitspaket" in f.get("note", "") for f in old["forms"]))
+        for f in ui["forms"]:
+            self.assertEqual("note" in f, not f["proposal"], f["id"])
         no = PL.ui_info(P.ProfilEditor.FORMS, self.cat["entries"], False)
-        self.assertFalse(any(f["vorschlag"] for f in no["formen"]))
-        self.assertTrue(all("oracle" in f["hinweis"] for f in no["formen"]))
+        self.assertFalse(any(f["proposal"] for f in no["forms"]))
+        self.assertTrue(all("oracle" in f["note"] for f in no["forms"]))
 
     def test_every_section_name_is_in_the_catalog_exactly_once(self):
         names = PL.all_section_names()
         self.assertEqual(len(names), len(set(names)))
         self.assertEqual([n for n in names if n not in self.cat["entries"]], [])
-        self.assertEqual([a["id"] for a in PL.ABSCHNITTE], ["A", "B", "C"])
+        self.assertEqual([a["id"] for a in PL.SECTIONS], ["A", "B", "C"])
 
     def test_regulator_bounds_are_the_editors_bounds(self):
-        self.assertEqual(PL.ZIELE["seats"], list(P.ProfilEditor.ZIELE_INT["seats"]))
-        self.assertEqual(PL.ZIELE["kv_tokens"], list(P.ProfilEditor.ZIELE_INT["kv_tokens"]))
+        self.assertEqual(PL.GOALS["seats"], list(P.ProfilEditor.ZIELE_INT["seats"]))
+        self.assertEqual(PL.GOALS["kv_tokens"], list(P.ProfilEditor.ZIELE_INT["kv_tokens"]))
 
     @unittest.skipUnless(os.path.isfile(os.path.join(PDFLIP, "dual_green.py")),
                          "27B launcher line only: the Dual form (pdflip/dual_green.py, dual_share.py) does not exist in this tree (measured 07.10. on the NF tree 2e68b3f94b)")
@@ -106,14 +106,14 @@ class Daten(unittest.TestCase):
             if role == "rungs":
                 continue
             e = self.cat["entries"][name]
-            self.assertEqual(e["status"], "kuratiert", name)
+            self.assertEqual(e["status"], "curated", name)
             self.assertGreater(len(e["text"]), 80, name)
             self.assertTrue(e["depends"], name)
-            self.assertTrue(all(d["belegt"] and d["kante"] for d in e["depends"]), name)
+            self.assertTrue(all(d["belegt"] and d["edge"] for d in e["depends"]), name)
         deps = {d["to"] for d in self.cat["entries"][PL.DUAL_ENV["table"]]["depends"]}
         self.assertEqual(deps, {"--dual-priority", "--dual-share-actuators", "--dual-green-ladder", "--dual-d-min-rate-tps"})
         ui = PL.ui_info((), self.cat["entries"], False)
-        self.assertEqual(len(ui["dual"]["werte"][PL.DUAL_ENV["table"]]["depends"]), 4)
+        self.assertEqual(len(ui["dual"]["values"][PL.DUAL_ENV["table"]]["depends"]), 4)
 
     def test_list_carries_planer_and_the_route_serves_the_module(self):
         from rigdash import kartenplan as K
@@ -125,11 +125,11 @@ class Daten(unittest.TestCase):
             self.assertEqual(pl["schema"], PL.SCHEMA)
             self.assertTrue(pl["oracle"])
             # the fixture planner tree carries no Dual module (NF line 07.10.: Dual is offered only where pdflip/dual_layout_plan.py and dual_green.py exist)
-            self.assertEqual([f["id"] for f in pl["formen"]], ["einzel", "tp", "flip"])
+            self.assertEqual([f["id"] for f in pl["forms"]], ["single", "tp", "flip"])
             self.assertNotIn("dual", pl)
             with mock.patch.object(P, "dual_line_probe", return_value=True):                         # the 27B line: all four forms, as before
                 pl = ed.list()["planer"]
-            self.assertEqual([f["vorschlag"] for f in pl["formen"]], [True, True, True, True])      # einzel, tp, flip, dual: AP-D Runde 2
+            self.assertEqual([f["proposal"] for f in pl["forms"]], [True, True, True, True])      # einzel, tp, flip, dual: AP-D Runde 2
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         with open(os.path.join(os.path.dirname(HERE), "server.py"), encoding="utf-8") as fh:
@@ -144,8 +144,8 @@ const out = {};
 const dep = (d) => '<i class="dep">' + d.to + '</i>';
 const base = (o) => Object.assign({ key: "flag:--pp-stage-ratio", name: "--pp-stage-ratio", scope: "launcher", value: "31,17,16", bare: false, multi: false, origin: "profil", origin_label: "Profile",
   profile_value: "31,17,16", planner_value: null, changed: false,
-  explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Layer je Karte", source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", choices: null } }, o || {});
-const ctx = (o) => Object.assign({ vecNames: new Set(__VEC__), posNames: new Set(__POS__), rankNames: new Set(__RANK__), n: 3, ranks: [], mode: "experte", prop: null, vsrc: "prop", dry: null, open: {}, cmsg: null, hasProfileValues: true,
+  explain: { status: "curated", parts: [{ kind: "curated", text: "Layer je Karte", source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", choices: null } }, o || {});
+const ctx = (o) => Object.assign({ vecNames: new Set(__VEC__), posNames: new Set(__POS__), rankNames: new Set(__RANK__), n: 3, ranks: [], mode: "expert", prop: null, vsrc: "prop", dry: null, open: {}, cmsg: null, hasProfileValues: true,
   short: (r) => (r.explain.parts[0] || {}).text || "", explain: () => "<div>voll</div>", depChip: dep, isOpen: () => true }, o || {});
 """
 
@@ -182,44 +182,44 @@ const d = (flags) => ({ args: flags.map((f) => ({ flag: f, values: [] })) });
 out.f = [PX.formOf(d(["--dual-share"]), 3), PX.formOf(d(["--dual-layout"]), 3), PX.formOf(d(["--d-only"]), 3), PX.formOf(d(["--p-bs"]), 3), PX.formOf(d([]), 1), PX.formOf(d([]), null)];
 out.mm = [PX.formMismatch({ n_min: 1, n_max: 1 }, 3), PX.formMismatch({ n_min: 2, n_max: null }, 1), PX.formMismatch({ n_min: 2, n_max: null }, 3), PX.formMismatch({ n_min: 2, n_max: null }, null)];
 """)
-        self.assertEqual(o["f"], ["dual", "dual", "tp", "flip", "einzel", "flip"])      # --dual-share impliziert --dual-layout (launcher.py:14693)
+        self.assertEqual(o["f"], ["dual", "dual", "tp", "flip", "single", "flip"])      # --dual-share impliziert --dual-layout (launcher.py:14693)
         self.assertEqual(o["mm"], [True, True, False, False])
 
     def test_states(self):
         o = run_node("""
-const W = (o) => Object.assign({ key: "flag:--pp-stage-ratio", wert: "1,2,3", alt: "3,2,1", zustand: "vorgeschlagen", herkunft: "H", grund: "G", geaendert: true, verdikte: [] }, o || {});
+const W = (o) => Object.assign({ key: "flag:--pp-stage-ratio", value: "1,2,3", alt: "3,2,1", state: "vorgeschlagen", source: "H", reason: "G", changed: true, verdikte: [] }, o || {});
 const z = (row, c) => PX.zustandOf(row, ctx(c));
 out.z = [
-  z(base({ origin: "nutzer" }), { prop: { werte: [W()] } }).id,
-  z(base({ origin: "planer" }), { prop: { werte: [W({ zustand: "unbelegt" })] } }).id,
-  z(base({ origin: "planer" }), { prop: { werte: [W()] } }).id,
+  z(base({ origin: "nutzer" }), { prop: { values: [W()] } }).id,
+  z(base({ origin: "planer" }), { prop: { values: [W({ state: "unverified" })] } }).id,
+  z(base({ origin: "planer" }), { prop: { values: [W()] } }).id,
   z(base({ planner_value: "31,17,16" })).id,
   z(base()).id,
   z(base({ absent: true })).id,
-  z(base({ origin: "nutzer", planner_value: "31,17,16" }), { prop: { werte: [W({ zustand: "unbelegt" })] } }).id,
+  z(base({ origin: "nutzer", planner_value: "31,17,16" }), { prop: { values: [W({ state: "unverified" })] } }).id,
 ];
-out.tip = z(base({ origin: "nutzer" }), { prop: { werte: [W()] } }).tip;
+out.tip = z(base({ origin: "nutzer" }), { prop: { values: [W()] } }).tip;
 """)
-        self.assertEqual(o["z"], ["uebersteuert", "unbelegt", "vorgeschlagen", "launcher", "profil", "standard", "uebersteuert"])
+        self.assertEqual(o["z"], ["uebersteuert", "unverified", "vorgeschlagen", "launcher", "profil", "standard", "uebersteuert"])
         self.assertIn("Planner proposal: 1,2,3", o["tip"])
 
     def test_verdicts_never_lock(self):
         o = run_node("""
-const V = (code, o) => Object.assign({ code, ebene: "lauf", forcebar: true, force_state: "force", grund: code + " grund", konsequenz: "k" }, o || {});
-const W = (vs) => ({ key: "flag:--pp-stage-ratio", wert: "1", zustand: "vorgeschlagen", geaendert: true, verdikte: vs });
-const v = (vs, row, c) => PX.verdiktOf(row || base(), ctx(Object.assign({ prop: { werte: [W(vs)], verdikt: { ausgang: "geht", verdikte: [] } } }, c || {})));      // der Lauf des Vorschlags ging durch
-out.ids = [v([]).id, v([V("W40")]).id, v([V("W40"), V("X", { forcebar: false, force_state: "blockiert" })]).id, v([V("H", { forcebar: null, force_state: "hinweis" })]).id,
+const V = (code, o) => Object.assign({ code, level: "run", forcebar: true, force_state: "force", reason: code + " reason", consequence: "k" }, o || {});
+const W = (vs) => ({ key: "flag:--pp-stage-ratio", value: "1", state: "vorgeschlagen", changed: true, verdikte: vs });
+const v = (vs, row, c) => PX.verdiktOf(row || base(), ctx(Object.assign({ prop: { values: [W(vs)], verdict: { outcome: "geht", verdikte: [] } } }, c || {})));      // der Lauf des Vorschlags ging durch
+out.ids = [v([]).id, v([V("W40")]).id, v([V("W40"), V("X", { forcebar: false, force_state: "is_blocked" })]).id, v([V("H", { forcebar: null, force_state: "note" })]).id,
            v([V("U", { force_state: "ungeprueft" })]).id, PX.verdiktOf(base(), ctx()).id, v([V("W40")], base({ origin: "nutzer" })).id];
 out.label = v([V("W40")]).label;
 out.code = v([V("W40")]).code;
-// Trockenlauf-Urteile: werte nennen Bezeichnungen, verglichen wird der Name
-out.dry = PX.verdiktOf(base(), ctx({ dry: { verdikte: [V("W77", { werte: ["--extra-p --pp-stage-ratio"] }), V("W78", { werte: ["--anderer"] })] } })).code;
-out.dryWins = PX.verdiktOf(base(), ctx({ prop: { werte: [W([])] }, vsrc: "dry", dry: { verdikte: [V("W77", { werte: ["--pp-stage-ratio"] })] } })).id;
+// Trockenlauf-Urteile: values nennen Bezeichnungen, verglichen wird der Name
+out.dry = PX.verdiktOf(base(), ctx({ dry: { verdikte: [V("W77", { values: ["--extra-p --pp-stage-ratio"] }), V("W78", { values: ["--anderer"] })] } })).code;
+out.dryWins = PX.verdiktOf(base(), ctx({ prop: { values: [W([])] }, vsrc: "dry", dry: { verdikte: [V("W77", { values: ["--pp-stage-ratio"] })] } })).id;
 // jedes Feld bleibt bedienbar, auch bei "verweigert"
-const html = PX.renderRow(base(), ctx({ prop: { werte: [W([V("X", { forcebar: false, force_state: "blockiert" })])] } }));
+const html = PX.renderRow(base(), ctx({ prop: { values: [W([V("X", { forcebar: false, force_state: "is_blocked" })])] } }));
 out.html = html;
 """)
-        self.assertEqual(o["ids"], ["geht", "force", "verweigert", "hinweis", "ungeprueft", "keinlauf", "alt"])
+        self.assertEqual(o["ids"], ["geht", "force", "verweigert", "note", "ungeprueft", "keinlauf", "alt"])
         self.assertEqual((o["label"], o["code"]), ("only with --force", "W40"))
         self.assertEqual(o["dry"], "W77")
         self.assertEqual(o["dryWins"], "force")
@@ -257,8 +257,8 @@ out.nolist = PX.renderRow(base(), Object.assign({}, c, { vecNames: undefined }))
     def test_html_is_escaped(self):
         o = run_node("""
 const evil = '"><img src=x onerror=alert(1)>';
-out.h = PX.renderRow(base({ name: evil, key: "flag:" + evil, value: evil + ",2", explain: Object.assign({}, base().explain, { parts: [{ kind: "kuratiert", text: evil, source: "s" }] }) }), ctx({ short: () => evil }));
-out.p = PX.renderProposal({ n: 2, form: evil, werte: [{ label: evil, alt: evil, wert: evil, zustand: "x", geaendert: true, verdikte: [{ code: evil }] }], verdikt: { ausgang: "geht", verdikte: [{ ebene: "lauf", code: evil, grund: evil, forcebar: true }] }, vorschlag: { cards: [{ name: evil, total_mib: 1 }] }, notes: [evil] });
+out.h = PX.renderRow(base({ name: evil, key: "flag:" + evil, value: evil + ",2", explain: Object.assign({}, base().explain, { parts: [{ kind: "curated", text: evil, source: "s" }] }) }), ctx({ short: () => evil }));
+out.p = PX.renderProposal({ n: 2, form: evil, values: [{ label: evil, alt: evil, value: evil, state: "x", changed: true, verdikte: [{ code: evil }] }], verdict: { outcome: "geht", verdikte: [{ level: "run", code: evil, reason: evil, forcebar: true }] }, proposal: { cards: [{ name: evil, total_mib: 1 }] }, notes: [evil] });
 """)
         for k in ("h", "p"):
             self.assertNotIn("<img", o[k])
@@ -267,7 +267,7 @@ out.p = PX.renderProposal({ n: 2, form: evil, werte: [{ label: evil, alt: evil, 
     def test_section_keeps_the_sections_order_and_reports_its_keys(self):
         o = run_node("""
 const rows = [base({ key: "flag:--rank-gpu-memory-mib", name: "--rank-gpu-memory-mib" }), base({ key: "flag:--other", name: "--other" }), base()];
-const sec = { id: "A", titel: "A  Split across the cards", satz: "s", namen: ["--pp-stage-ratio", "--rank-gpu-memory-mib", "--rank-kv-ratio"] };
+const sec = { id: "A", title: "A  Split across the cards", satz: "s", namen: ["--pp-stage-ratio", "--rank-gpu-memory-mib", "--rank-kv-ratio"] };
 const r = PX.renderSection(sec, rows, ctx(), "<i>EXTRA</i>", [{ key: "flag:--rank-kv-ratio", value: "1,1,1" }]);
 out.keys = r.keys; out.html = r.html;
 const e = PX.renderSection(sec, rows, ctx({ mode: "einfach" }), "", []);
@@ -299,7 +299,7 @@ out.rp = [PX.rungPercents(null, [1, 0.75, 0.5, 0.25]).pct, PX.rungPercents("1,0.
         o = run_node("""
 const info = %s;
 const E = info.dual.env;
-const mk = (name, value) => base({ key: "form:" + name, name, scope: "form", value, explain: Object.assign({}, base().explain, { level: "experte" }) });
+const mk = (name, value) => base({ key: "form:" + name, name, scope: "form", value, explain: Object.assign({}, base().explain, { level: "expert" }) });
 out.full = PX.renderDual([mk(E.table, "1:1:1;2:2:2;1000000000:3:3"), mk(E.starve_age, "30"), mk(E.starve_max, "2"), mk(E.retry, "20")], info, ctx());
 out.empty = PX.renderDual([], info, ctx());
 out.none = PX.renderDual([], {}, ctx());
@@ -322,20 +322,20 @@ out.none = PX.renderDual([], {}, ctx());
         o = run_node("""
 const info = %s;
 out.pick = PX.renderFormPick(info, "flip", 3);
-out.pick1 = PX.renderFormPick(info, "einzel", 1);
+out.pick1 = PX.renderFormPick(info, "single", 1);
 const s = (o) => Object.assign({ form: "flip", seats: 6, seatsOn: false, ctx: 262144, ctxOn: false, busy: false, canPropose: true, whyNot: "", canCheck: true }, o || {});
 out.c_ok = PX.renderControls(info, s());
 out.c_dual = PX.renderControls(info, s({ form: "dual" }));
 out.c_no = PX.renderControls(info, s({ canPropose: false, whyNot: "Load a profile first" }));
 out.c_busy = PX.renderControls(info, s({ busy: true }));
-out.prop = PX.renderProposal({ n: 3, form: "flip", werte: [{ label: "--d-bs", alt: "6", wert: "4", zustand: "vorgeschlagen", geaendert: true, verdikte: [] }, { label: "x", zustand: "unbelegt", geaendert: false }],
-  verdikt: { ausgang: "geht_mit_force", verdikte: [{ ebene: "lauf", code: "W40", grund: "g", forcebar: true, force_state: "force" }] },
-  vorschlag: { cards: [{ name: "NVIDIA GeForce RTX 5090", total_mib: 32607 }], fit: { level: "ja", margin_mib: 31544.2928, first: "" } }, notes: ["n1"] });
+out.prop = PX.renderProposal({ n: 3, form: "flip", values: [{ label: "--d-bs", alt: "6", value: "4", state: "vorgeschlagen", changed: true, verdikte: [] }, { label: "x", state: "unverified", changed: false }],
+  verdict: { outcome: "ok_with_force", verdikte: [{ level: "run", code: "W40", reason: "g", forcebar: true, force_state: "force" }] },
+  proposal: { cards: [{ name: "NVIDIA GeForce RTX 5090", total_mib: 32607 }], fit: { level: "ja", margin_mib: 31544.2928, first: "" } }, notes: ["n1"] });
 """ % json.dumps(ui))
         self.assertEqual(len(re.findall(r'data-form="', o["pick"])), 4)
         self.assertIn('data-form="flip" role="radio" aria-checked="true"', o["pick"])
         self.assertIn("Does not match the card count (3 cards; this form needs 1)", o["pick"])      # Einzelkarte bei 3 Karten
-        self.assertNotIn("Does not match", o["pick1"].split('data-form="einzel"')[1].split("</button>")[0])
+        self.assertNotIn("Does not match", o["pick1"].split('data-form="single"')[1].split("</button>")[0])
         self.assertRegex(o["c_ok"], r'data-act="propose"(?! disabled)')
         self.assertRegex(o["c_dual"], r'data-act="propose" disabled')
         self.assertIn("no proposal for this form", o["c_dual"])                           # der Grund steht da, nicht nur ein grauer Knopf (kein Verweis auf ein späteres Paket)
@@ -363,9 +363,9 @@ global.CSS = { escape: (s) => s };
 const posted = [];
 const PLANER = CASE.planer;
 const row = (name, value) => ({ key: "flag:" + name, name, scope: "launcher", value, bare: false, origin: "profil", origin_label: "Profile", changed: false, profile_value: value, planner_value: null,
-  explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Erklaerung " + name, source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", planner_derived: false, source: null, default: null, choices: null } });
+  explain: { status: "curated", parts: [{ kind: "curated", text: "Erklaerung " + name, source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", planner_derived: false, source: null, default: null, choices: null } });
 const VIEW = { rows: [row("--pp-stage-ratio", "31,17,16"), row("--p-bs", "2")], planner_only: [], removed: [], kvheads: [],
-  coverage: { rows: 2, erklaert: 2, kuratiert: 2, geerntet: 0, profil_kommentar: 0, unerklaert: 0, geaendert: 0 } };
+  coverage: { rows: 2, explained: 2, curated: 2, harvested: 0, profil_kommentar: 0, unexplained: 0, changed: 0 } };
 if (CASE.extra) CASE.extra.forEach((e) => VIEW.rows.push(row(e[0], e[1])));
 const DOC = { name: "p", line: "27b", args: [{ flag: "--pp-stage-ratio", values: ["31,17,16"] }], meta: {}, vars: [] };
 global.fetch = async (url, opt) => {
@@ -376,9 +376,9 @@ global.fetch = async (url, opt) => {
     const p = u.replace(/^api\/profil\//, "");
     if (p === "list") { body = { ok: true, release: [{ name: "p" }], user: [], cards: [{ id: "a", label: "A", arch: "sm86", preset: true }], rig_preset: { cards: [{ card: "a", pcie: { gen: 4, lanes: 8 } }] }, register: [] }; if (PLANER) body.planer = PLANER; }
     else if (p === "load") body = { ok: true, doc: DOC, view: VIEW, name: "p", line: "27b", groups: [] };
-    else if (p === "propose") { posted.push(JSON.parse(opt.body)); body = { ok: true, n: 3, form: "flip", werte: [{ key: "flag:--pp-stage-ratio", label: "--pp-stage-ratio", wert: "30,18,16", alt: "31,17,16", zustand: "vorgeschlagen", herkunft: "H", grund: "G", geaendert: true, verdikte: [] }],
-      verdikt: { ausgang: "geht", verdikte: [] }, vorschlag: { cards: [{ name: "RTX 5090", total_mib: 32607 }, { name: "RTX 3080", total_mib: 20480 }, { name: "RTX 3080", total_mib: 20480 }], fit: { level: "ja", margin_mib: 100 } }, notes: [],
-      startprofil: { doc: Object.assign({}, DOC, { name: "p-vorschlag" }), view: Object.assign({}, VIEW, { rows: [Object.assign(row("--pp-stage-ratio", "30,18,16"), { origin: "planer", origin_label: "Planner", changed: true }), row("--p-bs", "2")] }), name: "p-vorschlag" } }; }
+    else if (p === "propose") { posted.push(JSON.parse(opt.body)); body = { ok: true, n: 3, form: "flip", values: [{ key: "flag:--pp-stage-ratio", label: "--pp-stage-ratio", value: "30,18,16", alt: "31,17,16", state: "vorgeschlagen", source: "H", reason: "G", changed: true, verdikte: [] }],
+      verdict: { outcome: "geht", verdikte: [] }, proposal: { cards: [{ name: "RTX 5090", total_mib: 32607 }, { name: "RTX 3080", total_mib: 20480 }, { name: "RTX 3080", total_mib: 20480 }], fit: { level: "ja", margin_mib: 100 } }, notes: [],
+      startprofil: { doc: Object.assign({}, DOC, { name: "p-proposal" }), view: Object.assign({}, VIEW, { rows: [Object.assign(row("--pp-stage-ratio", "30,18,16"), { origin: "planer", origin_label: "Planner", changed: true }), row("--p-bs", "2")] }), name: "p-proposal" } }; }
     else if (p === "recompute") body = { ok: false, error: "nicht im Test" };
     else body = { ok: false, error: "unerwartet " + p };
   }
@@ -422,7 +422,7 @@ def run_harness(case):
 
 
 @unittest.skipUnless(NODE, "node fehlt")
-class ProfilJs(unittest.TestCase):
+class ProfileJs(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.ui = PL.ui_info(("flip", "tp"), _catalog()["entries"], True)
@@ -445,7 +445,7 @@ class ProfilJs(unittest.TestCase):
         self.assertTrue(self.new["tpSelected"])
 
     def test_propose_posts_basis_form_inventory_and_goals(self):
-        self.assertEqual(self.new["posted"], [{"basis": {"kind": "release", "name": "p"}, "form": "flip", "inventar": "rig", "ziele": {"seats": 6}}])
+        self.assertEqual(self.new["posted"], [{"basis": {"kind": "release", "name": "p"}, "form": "flip", "inventory": "rig", "goals": {"seats": 6}}])
         h = self.new["afterPropose"]
         self.assertIn("Proposal for 3 card", h)
         self.assertIn("pfx-z-vorgeschlagen", h)
@@ -515,9 +515,9 @@ class OnlyNamedVectorsAreFields(unittest.TestCase):
 
     def test_the_launcher_excluded_ones_are_text_fields_not_vectors(self):
         """Review-Befund 1 (Runde 3): BAR1-Fenster, d_reshard-Presets, L1.5 zaehlt der Launcher nicht je Karte; kein PROFILE-VECTORS-Satz fuer sie."""
-        for n in PL.LAUNCHER_NICHT_JE_KARTE:
+        for n in PL.LAUNCHER_NOT_PER_CARD:
             self.assertNotIn(n, PL.vector_names())
-            self.assertNotIn(n, self.ui["vektoren"])
+            self.assertNotIn(n, self.ui["vectors"])
             self.assertNotIn(n, self.ui["positional"])
             self.assertNotRegex(self.h, r'data-vk="[a-z]+:%s"' % re.escape(n))
         for name, val in self.EXTRA[3:]:
@@ -542,11 +542,11 @@ class OnlyNamedVectorsAreFields(unittest.TestCase):
         full_t = [t.rstrip("=") for t in ns["POSITIONAL_VECTOR_TOKENS"]]
         self.assertEqual(sorted(PL.POSITIONAL_FLAGS_ALL), sorted(full_f))
         self.assertEqual(sorted(t.rstrip("=") for t in PL.POSITIONAL_TOKENS_ALL), sorted(full_t))
-        self.assertEqual(sorted(set(full_f + full_t) - set(flags + toks)), sorted(PL.LAUNCHER_NICHT_JE_KARTE))
+        self.assertEqual(sorted(set(full_f + full_t) - set(flags + toks)), sorted(PL.LAUNCHER_NOT_PER_CARD))
         names = set(PL.vector_names())
         self.assertTrue(set(flags) | set(toks) <= names)
         self.assertEqual(len(PL.vector_names()), len(names))
-        self.assertEqual(self.ui["vektoren"], PL.vector_names())
+        self.assertEqual(self.ui["vectors"], PL.vector_names())
         entries = _catalog()["entries"]
         for n in names:
             self.assertIn(n, entries, n)
@@ -559,7 +559,7 @@ class RankIdIsPerRank(unittest.TestCase):
     """Review-Befund 2 (Runde 3): --rank-gpu-id hat je RANG ein Feld; Duplikate legen mehrere Raenge auf eine Karte."""
 
     def test_ui_info_names_it(self):
-        self.assertEqual(PL.ui_info()["je_rang"], ["--rank-gpu-id"])
+        self.assertEqual(PL.ui_info()["per_rank"], ["--rank-gpu-id"])
         self.assertIn("--rank-gpu-id", PL.vector_names())
 
     def test_fields_per_rank_without_card_names_sum_or_mismatch_warning(self):

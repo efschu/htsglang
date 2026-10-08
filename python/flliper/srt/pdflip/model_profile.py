@@ -745,7 +745,7 @@ def _classify_tensors(td: TensorDir, n_layers: int, gguf_backbone: Optional[int]
 
 
 def _storage_classes(td: TensorDir) -> Dict[str, Dict[str, float]]:
-    """Gewichtsspeicherklassen der Tensoren: ``{"klasse": {"bytes": Nutzlast+Skalen, "params": Elemente}}``.
+    """Gewichtsspeicherklassen der Tensoren: ``{"class": {"bytes": Nutzlast+Skalen, "params": Elemente}}``.
 
     Erkannt wird an Dtype und Nachbartensor (``.weight_scale``): U8 + F8-Skala = nvfp4 (zwei Elemente je Byte), I8 =
     int8, F8_E4M3 = fp8, ``.weight_packed`` (I32) = gepackte Bitbreite (``packedN`` bis die Config sie auflöst),
@@ -1138,7 +1138,7 @@ PROBE_STATES: Dict[str, bool] = {
 def probe(model_path: str, *, gguf_file: Optional[str] = None) -> Dict[str, Any]:
     """Der Zustand eines Modellpfads als DATEN, nie als Ausnahme: ``{"state", "estimable", "reason", "path", ...}``.
 
-    Der Planer liest daraus "Modell fehlt" je Wert als ``unbelegt``, statt an einem Fehlertext zu hängen.  Gelesen werden nur Dateinamen
+    Der Planer liest daraus "Modell fehlt" je Wert als ``unverified``, statt an einem Fehlertext zu hängen.  Gelesen werden nur Dateinamen
     (``stat``/``listdir``), bei GGUF-Sätzen die Existenz der Teile; kein Kopf, kein Gewicht."""
     p = os.path.abspath(model_path)
     out: Dict[str, Any] = {"path": p, "has_config": False, "safetensors": 0, "gguf": [], "index": False, "subdirs": []}
@@ -1586,7 +1586,7 @@ FIELD_CLASS: Dict[str, Tuple[str, str]] = {
     "records": ("policy", "Schlüssel der Messquellen: 27B mit Zeilen-Linie, NF ohne"),
     "early_read_flags": ("policy", "#1235 Frühlese-Flags: 27B TP-D"), "group_env": ("policy", "Gruppen-Env: NF uneven-DCP"),
     "prefill_transient_checkpoints": ("policy", "Checkpoints, an denen der #114-Prefill-Transient gemessen wurde"),
-    "constants": ("policy", "Messkonstanten kommen aus Records (profile_records_data): eine erzeugte Zeile hat keine -- UNCALIBRATED, nie geborgt"),
+    "constants": ("policy", "Messkonstanten kommen aus Records (profile_records_data): eine erzeugte Zeile hat keine -- UNCALIBRATED, nie borrowed"),
     "d_residue_census": ("policy", "NF cb1575e94e: Zensus statt Konstante"), "d_expect_from_p_records": ("policy", "D-EXPECT: P-Records"),
     "d_early_start_proven": ("policy", "BOOTZEIT 3: nur nach Metallbeweis je Profil"), "p_mamba_slots_from_argv": ("policy", "H92c"),
     "p_pool_posts_as_booked": ("policy", "PP-POSTEN: 27B"), "d_park_immediate": ("policy", "27B-Park, beide Linien am Metall bewiesen"),

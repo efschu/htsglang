@@ -342,7 +342,7 @@ if [[ "$ARM" == "solo" || "$ARM" == "both" ]]; then
 fi
 
 echo
-echo "=== what to read out of ${OUT} (expectations from the 2026-07-31 beleg) ==="
+echo "=== what to read out of ${OUT} (expectations from the 2026-07-31 evidence) ==="
 echo "  1. grep -E 'fp4|nvfp4|marlin|backend' *_server.log"
 echo "     ARM 1 must show TWO different FP4 lanes across the three ranks."
 echo "  2. #332/#336 posten 1 -- grep -c 'DEQUANTISED' v4_tp3_uneven_server.log"

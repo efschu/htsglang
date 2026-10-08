@@ -44,7 +44,7 @@ MARK_KIND = "flip_t2t"          # Marke mit Wert: ein gezaehlter Flip
 SKIP_KIND = "flip_skip"         # Marke ohne Wert: ein Leerlauf-Flip (nicht gezaehlt, nur sein Zaehler)
 
 #: Zerlegung im Marken-Label, in dieser Reihenfolge (Summe = total, Rest explizit)
-PART_KEYS = ("vorlauf_ms", "layer_ms", "wake_kv_dc_ms", "nachlauf_ms", "rest_ms")
+PART_KEYS = ("warmup_ms", "layer_ms", "wake_kv_dc_ms", "nachlauf_ms", "rest_ms")
 VOR_KEYS = ("leer_ms", "halt_ms", "park_ms", "vor_rest_ms")
 
 
@@ -75,7 +75,7 @@ def mark_label(row: dict) -> str:
 
 
 def parse_label(label: str) -> Optional[dict]:
-    """Umkehrung von ``mark_label``: {"dir", "parts": {vorlauf_ms.. rest_ms, leer_ms..}}; None bei fremdem Label.
+    """Umkehrung von ``mark_label``: {"dir", "parts": {warmup_ms.. rest_ms, leer_ms..}}; None bei fremdem Label.
     (Das Label ist unser eigenes Format, kein Log: Token-Schnitt ohne regulaeren Ausdruck.)"""
     toks = (label or "").replace("(", " ").replace(")", " ").split()
     if len(toks) < 6 or toks[0] not in DIRS:

@@ -6,7 +6,7 @@ Design of record: ``/spinning/gpu-arb/weg2/WEG2_REUSE_SPEC_0908.md`` section 10.
 Plan of record: ``/spinning/gpu-arb/weg2/PLAN_S6_BOUNCE_0911.md`` steps B2/B3.
 User law (verbatim in ``memory/gewichtsaustausch-ziel-kein-dauer-hostram.md``):
 *"notfalls wird das layer auf einem (vertretbar kleinen) hostpuffer
-vollstaendig zusammengesetzt und jede karte nimmt sich von dem was er braucht
+vollstaendig zusammengesetzt und jede karte nimmt sich von dem was er requires
 (oder ihn komplett). die 27gb (oder so aehnlich) an layerbytes muessen nicht
 mehr dauerhaft im systemram gehalten werden. das ist das ziel."*
 
@@ -957,7 +957,7 @@ def _collect_band(ops: tp.DeviceOps, stream: int, descs: Sequence[object],
     """SCATTERING H2D: ``spitch`` is the run (the slot is compact), ``dpitch``
     is the destination arena's pitch -- ``tp.run_consumer_pair``'s convention.
 
-    THIS is "jede karte nimmt sich von dem was er braucht": the piece's
+    THIS is "jede karte nimmt sich von dem was er requires": the piece's
     ``dst_off``/``dpitch`` are the destination's OWN rows, and a piece whose
     band is not this destination's is simply not in its descriptor list.
     """

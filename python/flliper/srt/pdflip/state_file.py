@@ -287,9 +287,9 @@ def _check_owner(writer: str, state, cause, fields) -> None:
             raise StateFileError(f"state_file: Feld {k!r} gehoert nicht zu {STATE_SCHEMA}/{writer} "
                                  f"(erlaubt: {', '.join(OWNED_FIELDS[writer])})")
     if writer == "launcher" and state == "dead" and (cause or {}).get("origin") not in LAUNCHER_DEAD_ORIGINS:
-        raise StateFileError(f"state_file: dead des Launchers braucht origin in {LAUNCHER_DEAD_ORIGINS}")
+        raise StateFileError(f"state_file: dead des Launchers requires origin in {LAUNCHER_DEAD_ORIGINS}")
     if writer == "rank" and state == "dead" and (cause or {}).get("origin") != "rank":
-        raise StateFileError("state_file: dead eines Rangs braucht origin rank")
+        raise StateFileError("state_file: dead eines Rangs requires origin rank")
 
 
 def transition(d: str, state=None, *, if_state=None, cause=None, fields=None, heartbeat_only=False,
@@ -679,7 +679,7 @@ def health(d: str):
     tot führt: lifecycle `dead`, eine Stop-Anfrage des Wächters (stop_request.json), oder eine
     Gruppe mit groups.<G>.state == "dead". Kein Zustand oder fremdes Schema = HEALTH_NO_STATE
     (der Aufrufer entscheidet dann selbst, nie "gesund" aus Stille).
-    Rückgabe: (code, grund)."""
+    Rückgabe: (code, reason)."""
     try:
         st = read(d)
     except (StateFileError, ValueError, OSError) as e:

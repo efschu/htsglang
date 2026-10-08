@@ -3,12 +3,12 @@
 Gepinnt (die Sonde ``profil.dual_line_probe`` ist eine Dateisonde -- ``pdflip/dual_layout_plan.py`` und ``pdflip/dual_green.py`` --, nie ein Baum-SHA; sie wird in diesen
 Faellen gemockt, so dass derselbe Test auf beiden Linien beide Zweige prueft):
 
-  * ohne Dual-Module (NF-Linie): ``formen`` der Seite hat weder ``dual`` noch eine Dual-ENV-Tabelle (kein Schluessel ``dual``), ``dual_verfuegbar`` ist False,
+  * ohne Dual-Module (NF-Linie): ``forms`` der Seite hat weder ``dual`` noch eine Dual-ENV-Tabelle (kein Schluessel ``dual``), ``dual_available`` ist False,
     ``ProfilEditor.forms()`` nennt ``dual`` nicht; ``POST /api/profil/propose`` mit ``form=dual`` antwortet 400 "Dual auf dieser Linie
-    nicht verfuegbar", OHNE das Orakel zu fragen (vorher endete der Aufruf im Kindprozess mit ImportError); die anderen Formen laufen unveraendert.
+    nicht verfuegbar", OHNE das Oracle zu fragen (vorher endete der Aufruf im Kindprozess mit ImportError); die anderen Formen laufen unveraendert.
   * mit Dual-Modulen (27B-Linie): die Antwort ist die bisherige -- vier Formen, Dual-ENV-Tabelle, ``dual`` bedient ``propose``.
   * die Sonde selbst: beide Dateien noetig, eine allein genuegt nicht, kein Baum = nicht verfuegbar, Datei- und nicht Branch-Ebene.
-  * Mutante: wuerde ``propose`` die Pruefung auslassen, kaeme die Anfrage beim Orakel an (der Test auf ``calls == []`` wird rot).
+  * Mutante: wuerde ``propose`` die Pruefung auslassen, kaeme die Anfrage beim Oracle an (der Test auf ``calls == []`` wird rot).
 """
 
 import copy
@@ -72,17 +72,17 @@ class PageData(unittest.TestCase):
 
     def test_without_dual_the_page_has_no_dual_form_and_no_dual_table(self):
         ui = PL.ui_info(("flip", "tp", "single"), self.entries, True, dual=False)
-        self.assertEqual([f["id"] for f in ui["formen"]], ["einzel", "tp", "flip"])
+        self.assertEqual([f["id"] for f in ui["forms"]], ["single", "tp", "flip"])
         self.assertNotIn("dual", ui)
-        self.assertIs(ui["dual_verfuegbar"], False)
-        self.assertNotIn("dual", {f["backend"] for f in ui["formen"]})
+        self.assertIs(ui["dual_available"], False)
+        self.assertNotIn("dual", {f["backend"] for f in ui["forms"]})
         self.assertNotIn("FLLIPER_PDFLIP_DUAL_SHARE_GREEN_TABLE", json.dumps(ui))             # the Dual-ENV table is not in the page data at all
 
     def test_with_dual_the_answer_is_the_old_one(self):
         ui = PL.ui_info(("flip", "tp", "dual", "single"), self.entries, True)               # dual defaults to True: callers of the 27B line are unchanged
-        self.assertEqual([f["id"] for f in ui["formen"]], ["einzel", "tp", "flip", "dual"])
-        self.assertIs(ui["dual_verfuegbar"], True)
-        self.assertEqual(sorted(ui["dual"]["werte"]), sorted(PL.DUAL_ENV.values()))
+        self.assertEqual([f["id"] for f in ui["forms"]], ["single", "tp", "flip", "dual"])
+        self.assertIs(ui["dual_available"], True)
+        self.assertEqual(sorted(ui["dual"]["values"]), sorted(PL.DUAL_ENV.values()))
         self.assertEqual(ui, PL.ui_info(("flip", "tp", "dual", "single"), self.entries, True, dual=True))
 
 
@@ -96,7 +96,7 @@ class EditorBothLines(unittest.TestCase):
         self.addCleanup(base.tearDown)
         self.base, self.ed, self.orc = base, base.ed, base.orc
         ans = copy.deepcopy(base.answer)
-        ans["vorschlag"].update(form="dual", n=2)
+        ans["proposal"].update(form="dual", n=2)
         self.orc.propose = ans
 
     def _dual(self):
@@ -107,10 +107,10 @@ class EditorBothLines(unittest.TestCase):
             self.assertFalse(self.ed.dual_available())
             self.assertEqual(self.ed.forms(), ("flip", "tp", "single"))
             planer = self.ed.list()["planer"]
-            self.assertEqual([f["id"] for f in planer["formen"]], ["einzel", "tp", "flip"])
+            self.assertEqual([f["id"] for f in planer["forms"]], ["single", "tp", "flip"])
             self.assertNotIn("dual", planer)
-            self.assertIs(planer["dual_verfuegbar"], False)
-            with self.assertRaises(P.ProfilError) as cm:
+            self.assertIs(planer["dual_available"], False)
+            with self.assertRaises(P.ProfileError) as cm:
                 self.ed.propose(self.base._body(form="dual"))
             self.assertEqual(str(cm.exception), "Dual is not available on this line")
             self.assertEqual(self.orc.calls, [], "the child must not be asked (ImportError in the child before this fix)")
@@ -121,18 +121,18 @@ class EditorBothLines(unittest.TestCase):
     def test_nf_line_without_oracle_still_answers_dual_by_name(self):
         with mock.patch.object(P, "dual_line_probe", return_value=False):
             self.ed.oracle = None
-            with self.assertRaises(P.ProfilError) as cm:
+            with self.assertRaises(P.ProfileError) as cm:
                 self.ed.propose(self.base._body(form="dual"))
-            self.assertEqual(str(cm.exception), P.DUAL_FEHLT)
+            self.assertEqual(str(cm.exception), P.DUAL_MISSING)
 
     def test_27b_line_dual_is_offered_and_proposed_as_before(self):
         with mock.patch.object(P, "dual_line_probe", return_value=True):
             self.assertTrue(self.ed.dual_available())
             self.assertEqual(self.ed.forms(), P.ProfilEditor.FORMS)
             planer = self.ed.list()["planer"]
-            self.assertEqual([f["id"] for f in planer["formen"]], ["einzel", "tp", "flip", "dual"])
-            self.assertIs(planer["dual_verfuegbar"], True)
-            self.assertEqual(sorted(planer["dual"]["werte"]), sorted(PL.DUAL_ENV.values()))
+            self.assertEqual([f["id"] for f in planer["forms"]], ["single", "tp", "flip", "dual"])
+            self.assertIs(planer["dual_available"], True)
+            self.assertEqual(sorted(planer["dual"]["values"]), sorted(PL.DUAL_ENV.values()))
             r = self._dual()
             self.assertTrue(r["ok"], r)
             self.assertEqual(self.orc.calls[0][1]["form"], "dual")
@@ -165,7 +165,7 @@ class ProposeRouteDualLine(unittest.TestCase):
     def test_http_dual_goes_through_on_the_27b_line(self):
         port, base = self.serve()
         base.orc.propose = copy.deepcopy(base.answer)
-        base.orc.propose["vorschlag"].update(form="dual", n=2)
+        base.orc.propose["proposal"].update(form="dual", n=2)
         with mock.patch.object(P, "dual_line_probe", return_value=True):
             st, txt = self.call(port, "/api/profil/propose", base._body(form="dual"))
             self.assertEqual(st, 200, txt[:300])

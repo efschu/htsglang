@@ -25,7 +25,7 @@ Je Phase und Karte:
     proc       groesster Prozess der Karte und sein Maximum (Rolle P:PP0 ...)
     plan       Kopfraum der Planer-Karte (dry_TAG.log: P-KARTE stage/KARTE D rang)
     plan-rest  plan - rest_min: > 0 = der Planer hat mehr Luft versprochen als da war
-    verdict    UNTER near-OOM (rest_min < near-OOM-Kante) / KNAPP (< 2x) / ok
+    verdict    UNTER near-OOM (rest_min < near-OOM-Kante) / TIGHT (< 2x) / ok
 
 Zweite Tabelle: die In-Prozess-Fenster (``PDFLIP-VRAM-PEAK``) je Rang und Phase:
 Maximum von peak_reserved/transient gegen die Planer-Transiente, und daneben der
@@ -350,7 +350,7 @@ def card_rows(tr: Trace, wins: List[Window], plan, dmon, rank_cards) -> List[Dic
             verdict = "-"
             if rest is not None:
                 edge = pl["near_oom"] if pl else 400
-                verdict = ("UNTER near-OOM" if rest < edge else "KNAPP" if rest < 2 * edge else "ok")
+                verdict = ("UNTER near-OOM" if rest < edge else "TIGHT" if rest < 2 * edge else "ok")
             rows.append({
                 "phase": w.name, "win_s": (w.b_ms - w.a_ms) / 1000.0, "card": c,
                 "true_max": used, "rest_min": rest, "at_s": (at - w.a_ms) / 1000.0,

@@ -1206,7 +1206,7 @@ def solve_expert_fraction_per_stage(
 
     Nutzer-Order 22.09., woertlich: *"diese falschen sizing zahlen tauchen
     jetzt immer und immer wieder auf, werden dann endlos analysiert und
-    verworfen und halluziniert und neu berechnet. der planner muss sie
+    rejected und halluziniert und neu berechnet. der planner muss sie
     ausspucken"*. Diese Funktion spuckt sie aus.
 
     Die Bedingung je Stufe s, alles in MiB:

@@ -161,7 +161,7 @@ def replay_from_catalog(entries: Sequence[Mapping[str, Any]], *, bar1_mib: Optio
 
     The catalog carries no BAR1 size: ``bar1_mib`` (None = left out = unknown) applies to every card.  Every field the
     row gets is a catalog value; the synthetic card is a *datasheet* card -- the caller labels every value derived from
-    it "unbelegt" (plan 1.3 A2)."""
+    it "unverified" (plan 1.3 A2)."""
     rows = []
     for i, e in enumerate(entries):
         cid = str(e.get("id") or e.get("nvml_name"))

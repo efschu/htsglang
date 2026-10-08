@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Q-660 DUAL-AWAKE-LEND: in the 27B NVFP4 dual (P and D active at the same time,
 no flip) P gives its KV to D when D runs short -- AWAKE, not only asleep (user
-rule 03.10. ~15:35Z: "wenn auf D kv knapp wird, gibt P seinen kv auf").
+rule 03.10. ~15:35Z: "wenn auf D kv tight wird, gibt P seinen kv auf").
 
 Metal y8v (fs10031504, 15:20:53): D at "full token usage 0.96", the Mamba arena
 full (complete=112 of 112), the card ledgers with free bytes and no D demand ->

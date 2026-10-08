@@ -1,7 +1,7 @@
 """AP-B (Planer-Workflow 06.10.2026): ``ModelEstimator.status`` -- der Fall "Modell nicht gemountet" als Zustand statt als HTTP-400-Text.
 
 Gepinnt:
-  * ein FEHLENDER Pfad unter einer Modellwurzel ist ``ok`` mit ``state: not_mounted`` (der Planer liest ihn als ``unbelegt``), ein leeres
+  * ein FEHLENDER Pfad unter einer Modellwurzel ist ``ok`` mit ``state: not_mounted`` (der Planer liest ihn als ``unverified``), ein leeres
     Verzeichnis ``empty``; ein vollständiges Modell ``complete``;
   * Pfade außerhalb der Wurzeln, ``..`` und ungültige ``gguf_file`` bleiben ``ValueError`` (die Wurzel-Prüfung gilt auch für fehlende Pfade);
   * ein Planer-Baum ohne ``probe`` (zu alte Linie) wird benannt (``ModellprofilUnavailable``), nicht still übergangen;

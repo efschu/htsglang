@@ -1,6 +1,6 @@
 """One reader per dashboard field (DASHBOARD-AUS-IPC-INVENTAR-0929, the 25 "Übergang" rows).
 
-User 29.09. ~12:00Z (via 27B): "und warum sind die ganzen werte im dashboard noch aus log.
+User 29.09. ~12:00Z (via 27B): "und warum sind die ganzen values im dashboard noch aus log.
 warum arbeitet da niemand dran?"  -- so every field that still came from a log line gets its
 IPC reader NOW, before the producers are in a running image.  Since 30.09. there is no log
 fallback any more (NF-Operator: "Log-Rückfall für ALLE Werte entfernen"): a field is read from the
@@ -501,6 +501,6 @@ def summary(fields: dict) -> dict:
     """How many of the fields read the IPC now; the rest are named as missing, never read from a log."""
     n_ipc = sum(1 for v in fields.values() if v.get("src") == "ipc")
     return {"ipc": n_ipc, "fehlt": len(fields) - n_ipc, "n": len(fields),
-            "fehlt_keys": [k for k, v in fields.items() if v.get("src") != "ipc" and not v.get("empty")],
+            "missing_keys": [k for k, v in fields.items() if v.get("src") != "ipc" and not v.get("empty")],
             "leer_keys": [k for k, v in fields.items() if v.get("src") != "ipc" and v.get("empty")],
-            "fehlt_writer": {k: v.get("missing") for k, v in fields.items() if v.get("src") != "ipc"}}
+            "missing_writer": {k: v.get("missing") for k, v in fields.items() if v.get("src") != "ipc"}}

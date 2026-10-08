@@ -1,4 +1,4 @@
-"""AP-D (Plan Profil-Planer 06.10., Stufe B/C): langlebiger Worker fuer das Orakel (Launcher-Trockenlauf) und ``propose()``.
+"""AP-D (Plan Profil-Planer 06.10., Stufe B/C): langlebiger Worker fuer das Oracle (Launcher-Trockenlauf) und ``propose()``.
 
 Laeuft als KINDPROZESS des Dashboards mit dem Python der flliper-Umgebung (``PYTHONPATH=<Baum>/python``, ``CUDA_VISIBLE_DEVICES=``), wie
 ``couplings_worker.py``: eine JSON-Zeile je Anfrage auf stdin, eine JSON-Zeile Antwort auf stdout (``{"id", "ok", ...}``), bis stdin schliesst.
@@ -8,9 +8,9 @@ treffen.
 
 Anfragen (``what``):
 
-* ``verdikt``  ein Profil (``basis`` {env_path | env_text}) auf einem Inventar (``inventar`` {hardware | devices | cards}): das Dokument
-  ``flliper.verdikt/1`` (``pdflip/propose_verdict.run_verdikt``);
-* ``propose``  Vorschlag (``pdflip/propose.py``) + Orakel + Verdikte je Wert (``propose_verdict.run_propose``).
+* ``verdict``  ein Profil (``basis`` {env_path | env_text}) auf einem Inventar (``inventory`` {hardware | devices | cards}): das Dokument
+  ``flliper.verdict/1`` (``pdflip/propose_verdict.run_verdikt``);
+* ``propose``  Vorschlag (``pdflip/propose.py``) + Oracle + Verdikte je Wert (``propose_verdict.run_propose``).
 
 Der Worker beruehrt keine GPU, kein Netz, keinen echten Launcher-Start (nur ``launcher.main(--dry-run)`` auf einem NVML-Replay) und schreibt nur in
 ein privates Temp-Verzeichnis.  Jeder Fehler kommt als ``{"ok": False, "error": ...}``, nie als Abbruch des Prozesses."""
@@ -41,13 +41,13 @@ def handle(req: dict, tree: str) -> dict:
     from flliper.srt.pdflip import propose_verdict as PV
 
     what = req.get("what")
-    if what == "verdikt":
+    if what == "verdict":
         return PV.run_verdikt(req, tree=tree)
     if what == "propose":
         return PV.run_propose(req, tree=tree)
     if what == "ping":
         return {"ok": True, "tree": tree}
-    return {"ok": False, "error": "unbekannte Anfrage %r (verdikt | propose | ping)" % (what,)}
+    return {"ok": False, "error": "unbekannte Anfrage %r (verdict | propose | ping)" % (what,)}
 
 
 def main() -> int:
@@ -58,7 +58,7 @@ def main() -> int:
         tree = tree_of_flliper()
         from flliper.srt.pdflip import launcher, propose_oracle, propose_verdict  # noqa: F401 -- der Import ist der teure Teil: vor dem ersten Hallo
     except Exception as exc:  # noqa: BLE001 -- bereit auch ohne Orakel: jede Anfrage nennt den Grund selbst
-        boot_error = "Orakel nicht ladbar: %s: %s" % (type(exc).__name__, exc)
+        boot_error = "Oracle nicht ladbar: %s: %s" % (type(exc).__name__, exc)
     out.write(json.dumps({"id": 0, "ok": True, "ready": True, "error": boot_error, "tree": tree}) + "\n")
     out.flush()
     for line in sys.stdin:

@@ -25,7 +25,7 @@ def test_cells_match_the_three_measured_of_w123():
 
 
 def test_without_draft_matches_design_doc():
-    """DESIGN_FLIP_NEXTFLASH_0920.md: PP0 braucht '7616 x 262144' -- ohne Draft."""
+    """DESIGN_FLIP_NEXTFLASH_0920.md: PP0 requires '7616 x 262144' -- ohne Draft."""
     assert 7 * kv_cell_bytes_per_attention_layer(**NF) == 7616.0
 
 

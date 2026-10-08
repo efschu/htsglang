@@ -239,7 +239,7 @@ def window_projection(d, w4a8_tops=(117.0, 150.0)):
     for r in (0, 1, 2):
         lo, hi = ranks(CUT0)[r]
         print(f"  PP{r}: gemessene Kernsumme INT8 {sums[r]:.1f} ms vs #PGAP {stage_meas[r]:.1f} ms "
-              f"-> unerklaert {unexpl[r]:.3f} ms/Schicht ({100*(stage_meas[r]-sums[r])/stage_meas[r]:.0f} %)")
+              f"-> unexplained {unexpl[r]:.3f} ms/Schicht ({100*(stage_meas[r]-sums[r])/stage_meas[r]:.0f} %)")
 
     def stage_times(cut, m5, p5, m3, p3):
         ts = []

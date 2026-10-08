@@ -96,7 +96,7 @@ if [ "$HAVE_BASE" = 1 ]; then
   rcis 3 "zweiter --apply verweigert" "$MK" --apply --ctx "$C" --rev "$GOOD" --repo "$R"
   check "  Kontext unveraendert" test "$(snap "$C")" = "$S1"
   echo "== Importprobe wie im Dockerfile-Block (mit $PYTHON, kein Image)"
-  check "import rigdash.server ... (stdlib-Paket)" bash -c 'cd "$0" && CUDA_VISIBLE_DEVICES= PYTHONPATH="$0" "$1" -B -c "import rigdash.server, rigdash.profil, rigdash.profil_recompute, rigdash.hwprofil, rigdash.modellprofil; print(rigdash.server._version())"' "$P" "$PYTHON"
+  check "import rigdash.server ... (stdlib-Paket)" bash -c 'cd "$0" && CUDA_VISIBLE_DEVICES= PYTHONPATH="$0" "$1" -B -c "import rigdash.server, rigdash.profil, rigdash.profile_recompute, rigdash.hwprofil, rigdash.modellprofil; print(rigdash.server._version())"' "$P" "$PYTHON"
   check "bash -n entrypoint_rigdash.sh" bash -n "$P/entrypoint_rigdash.sh"
 
   echo "== Entrypoint: MODE=editor (Kommandozeile, --check)"

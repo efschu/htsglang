@@ -19,7 +19,7 @@ fnFL2w3 starb daran. Die Kette, jede Stufe gemessen:
 Die Wurzel ist EIN Praedikat fuer ZWEI Fragen. `xchg_bounce_arm_pins_host`
 beantwortet "pinnt dieser Arm Host-Bytes?" -- bei `oncard=ipc` korrekt
 FALSCH. Die Publikation der Terme hing daran, obwohl der Rang sie in JEDEM
-Austausch-Arm braucht.
+Austausch-Arm requires.
 """
 
 import inspect

@@ -58,7 +58,7 @@ class Regime(unittest.TestCase):
         r = KV.compute(tp_size=3, ratios=[1, 0, 0], kv_heads=4)
         self.assertEqual(r["kv"], [4, 0, 0])
 
-class NichtGeraten(unittest.TestCase):
+class NotGuessed(unittest.TestCase):
     def test_unknown_heads(self):
         r = KV.compute(tp_size=3, ratios=[1, 1, 1], kv_heads=None)
         self.assertEqual((r["status"], r["kv"]), ("unbekannt", None))
@@ -101,7 +101,7 @@ class RenameFest(unittest.TestCase):
         "(undefined)" (gefunden bei der Rename-Probe 05.10.)."""
         with open(os.path.join(os.path.dirname(HERE), "kvheads.py"), encoding="utf-8") as fh:
             tree = ast.parse(fh.read())
-        page_keys = {"quelle", "regime", "kv", "q", "satz", "notiz", "belege", "heads", "ratios", "group"}
+        page_keys = {"quelle", "regime", "kv", "q", "satz", "notiz", "evidence_items", "heads", "ratios", "group"}
         bad = sorted({k.arg for n in ast.walk(tree) if isinstance(n, ast.Call) for k in n.keywords if k.arg in {"quelle"}})
         self.assertEqual(bad, [], "Schlüsselwort-Argumente, die das Rename-Kit umbenennt: %s (Seitenschlüssel: %s)" % (bad, sorted(page_keys)))
 

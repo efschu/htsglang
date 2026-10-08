@@ -18,15 +18,15 @@ set -uo pipefail
 source /spinning/gpu-battery-results/2026-07-31_332_fam_beleg/env.sh
 source "$WT/scripts/dual_group/r7c/common.sh"
 
-OWNER="agent-332-fam-beleg"
+OWNER="agent-332-fam-evidence"
 BUDGET_S="${BUDGET_S:-2100}"
 ARMS="${ARMS:-v4tp3,v4solo,dense2,fp82}"
 SUMMARY="${SUMMARY:-$OUT/window_summary.txt}"
 declare -A SHARE_S=([v4tp3]=820 [v4solo]=430 [dense2]=380 [fp82]=470 [falsi]=300)
 
 assert_cards_free || exit 1
-claim_cards "332-fam-beleg (Budget ${BUDGET_S}s)"
-trap 'release_cards "332-fam-beleg window aborted"; exit 1' INT TERM
+claim_cards "332-fam-evidence (Budget ${BUDGET_S}s)"
+trap 'release_cards "332-fam-evidence window aborted"; exit 1' INT TERM
 
 eval "$(resolve_uuids | tee "$OUT/nvml_inventory.txt" | grep -E '^(FIVE|THREES)=')"
 IFS=, read -r T0 T1 <<< "$THREES"
@@ -138,4 +138,4 @@ for arm in ${ARMS//,/ }; do
 done
 
 echo "--- window done after $(( $(date +%s) - T0S ))s of ${BUDGET_S}s ---" | tee -a "$SUMMARY"
-release_cards "332-fam-beleg done ($(tr '\n' ' ' < "$SUMMARY" | tail -c 220))"
+release_cards "332-fam-evidence done ($(tr '\n' ' ' < "$SUMMARY" | tail -c 220))"

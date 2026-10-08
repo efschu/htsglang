@@ -4,7 +4,7 @@
 DER BEFUND (Boot fnFL2x120, PDFLIP-DC-BREAKDOWN stage=release): die schlafende
 Phase laesst auf der 5090 1818 MiB (PP0) bzw. 2074 MiB (TP0) liegen, davon
 1284 bzw. 1056 MiB `other (context+driver+communicator+non-torch)`. Kein Tag
-und kein empty_cache() erreicht diesen Posten (allocator_cache_released_mib=0.0
+und kein empty_cache() reached diesen Posten (allocator_cache_released_mib=0.0
 auf jedem Sleep). Ein Teil davon ist die Local-Memory-Reservierung des
 Treibers: Stack je Thread x SMs x Threads je SM, 1024 B x 170 x 1536 =
 255 MiB auf der 5090, die der Treiber nie von selbst zurueckgibt.

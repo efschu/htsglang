@@ -15,7 +15,7 @@ same points, and its noise floors are reused rather than re-derived
 the floor of its row is reported as "within noise" and not as a number, because
 below the floor the sign is not evidence.
 
-Reads the JSONL that s12_prefill_kurve.py and s14_decode_punkt.py wrote for the
+Reads the JSONL that s12_prefill_curve.py and s14_decode_punkt.py wrote for the
 bar1 arms; prefill comes from the concentrated boots and decode from the
 VRAM-auto boots, which is the #354 phase recipe.
 """
@@ -68,7 +68,7 @@ def _read_jsonl(path: str) -> list:
 
 def load_bar1(out_dir: str) -> Dict[Tuple[str, str], Optional[float]]:
     """The measured bar1 numbers, keyed like the baseline."""
-    pre = _read_jsonl(os.path.join(out_dir, "punkte.jsonl"))
+    pre = _read_jsonl(os.path.join(out_dir, "data_points.jsonl"))
     dec = _read_jsonl(os.path.join(out_dir, "decode_punkte.jsonl"))
     out: Dict[Tuple[str, str], Optional[float]] = {}
     for fmt in ("fp8", "int8"):

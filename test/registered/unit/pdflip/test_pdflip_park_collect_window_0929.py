@@ -7,7 +7,7 @@ durch"): 46 PARK-IMMEDIATE FIRED in 32 min, park -> resume median 9.5 s, p90
 22.3 s. 27B row-authority (boot ...dkr27browauthoritybar1w109290020, 00:21-00:54Z,
 agent load): 74 immediate parks, park -> resume median 8.2 s.
 
-User decision 29.09. ~09:15Z ("vorschlag akzeptiert"): D keeps decoding; once
+User decision 29.09. ~09:15Z ("proposal akzeptiert"): D keeps decoding; once
 the pending P work passes the bound it collects -- SKI RENTAL -- until waiting
 has cost what the flip costs (one measured round trip), D empty flips at once,
 hard caps stay, a fixed x is an override only. Pinned here: the policy, the

@@ -8,10 +8,10 @@ Belegte Rig-Fakten (Quelle in ``FACTS``):
   * Gruppenfenster auf den 3080 belegen "rund 168 von 256 MiB" BAR1 (NF_PROFILE.md 5.2); Weg-2-Fenster
     PP_0=96 + D 16+32+24 (HW-GENERISCH K3).  Weniger als 168 MiB BAR1 -> Fenster passen nicht.
   * Rig-BAR1: 5090 32768 MiB, 3080 je 256 MiB, EnableResizableBar 0.
-  * Host braucht den gepatchten nvidia-open 595.58.03 + dmabuf_holder (Host-Tatsache, nicht je Karte).
+  * Host requires den gepatchten nvidia-open 595.58.03 + dmabuf_holder (Host-Tatsache, nicht je Karte).
   * Alle Rig-Karten hängen an der CPU (PHB); ein Chipsatz-Slot wurde nie am Metall geprüft.
 
-Link-Bandbreite: brutto, Datenblatt (Gen3 8, Gen4 16, Gen5 32 GT/s je Lane, 128b/130b); real etwas weniger.
+Link-Bandbreite: brutto, Datasheet (Gen3 8, Gen4 16, Gen5 32 GT/s je Lane, 128b/130b); real etwas weniger.
 """
 
 from __future__ import annotations

@@ -479,8 +479,8 @@ def roundtrip_check(path: str, specs: Optional[Mapping] = None, runner=None, tmp
 # ---------------------------------------------------------------------------
 # the editor's view: rows, origins, edits
 
-ORIGIN_PROFIL, ORIGIN_NUTZER, ORIGIN_PLANER, ORIGIN_DEFAULT = "profil", "nutzer", "planer", "default"
-ORIGIN_LABEL = {ORIGIN_PROFIL: "Profile", ORIGIN_NUTZER: "User", ORIGIN_PLANER: "Planner", ORIGIN_DEFAULT: "Default"}
+ORIGIN_PROFILE, ORIGIN_NUTZER, ORIGIN_PLANER, ORIGIN_DEFAULT = "profil", "nutzer", "planer", "default"
+ORIGIN_LABEL = {ORIGIN_PROFILE: "Profile", ORIGIN_NUTZER: "User", ORIGIN_PLANER: "Planner", ORIGIN_DEFAULT: "Default"}
 
 _GROUP_SCOPE = {"--env-p": ("env", "P"), "--env-d": ("env", "D"), "--extra-p": ("extra", "P"), "--extra-d": ("extra", "D")}
 
@@ -708,7 +708,7 @@ def apply_edits(doc: Mapping, edits: Sequence[Mapping], specs: Optional[Mapping]
             src = planner if to == "planer" else pv
             if key in src:
                 _set_in_doc(new, key, src[key], specs)
-                origins[key] = ORIGIN_PLANER if to == "planer" else ORIGIN_PROFIL
+                origins[key] = ORIGIN_PLANER if to == "planer" else ORIGIN_PROFILE
             else:
                 _set_in_doc(new, key, None, specs)
                 origins.pop(key, None)
@@ -731,18 +731,18 @@ def explain_row(r: Mapping, catalog: Optional[Mapping], comments: Optional[Mappi
     name = str(r["name"])
     ent = (catalog or {}).get(name)
     parts: List[Dict[str, str]] = []
-    out: Dict[str, object] = {"status": "unerklaert", "parts": parts, "depends": [], "gain": "", "cost": "", "group": "", "level": "experte",
+    out: Dict[str, object] = {"status": "unexplained", "parts": parts, "depends": [], "gain": "", "cost": "", "group": "", "level": "expert",
                               "planner_derived": False, "source": None, "default": None, "choices": None}
     if ent:
         if ent.get("text"):
-            parts.append({"kind": "erklaert" if ent.get("status") == "erklaert" else "kuratiert", "text": str(ent["text"]),
+            parts.append({"kind": "explained" if ent.get("status") == "explained" else "curated", "text": str(ent["text"]),
                           "source": "profile_catalog_curated.py"})
         if ent.get("help"):
             src = ent.get("source") or {}
             parts.append({"kind": "code", "text": str(ent["help"])[:1400],
                           "source": "%s:%s" % (src.get("file", ""), src.get("line", ""))})
         out.update({"gain": ent.get("gain", ""), "cost": ent.get("cost", ""), "group": ent.get("group", ""),
-                    "level": ent.get("level", "experte"), "planner_derived": bool(ent.get("planner_derived")),
+                    "level": ent.get("level", "expert"), "planner_derived": bool(ent.get("planner_derived")),
                     "source": ent.get("source"), "default": ent.get("default"), "choices": ent.get("choices"),
                     "depends": [dict(d) for d in ent.get("depends", [])]})
     c = (comments or {}).get(name)
@@ -750,9 +750,9 @@ def explain_row(r: Mapping, catalog: Optional[Mapping], comments: Optional[Mappi
         parts.append({"kind": "profil", "text": str(c["text"]), "source": str(c.get("source", ""))})
     if parts:
         if ent and ent.get("text"):
-            out["status"] = "erklaert" if ent.get("status") == "erklaert" else "kuratiert"
+            out["status"] = "explained" if ent.get("status") == "explained" else "curated"
         elif ent and ent.get("help"):
-            out["status"] = "geerntet"
+            out["status"] = "harvested"
         else:
             out["status"] = "profil-kommentar"
     return out
@@ -772,8 +772,8 @@ def view(doc: Mapping, catalog: Optional[Mapping] = None, comments: Optional[Map
         ex = explain_row(r, catalog, comments)
         for d in ex["depends"]:
             # a refusal code is no value of the profile: "set in this profile" does not apply (None), the chip points at the register
-            d["present"] = None if d.get("to_kind") == "ablehnung" else d["to"] in present
-        origin = origins.get(key) or (ORIGIN_PROFIL if (key in pv or not pv) else ORIGIN_NUTZER)
+            d["present"] = None if d.get("to_kind") == "refusal" else d["to"] in present
+        origin = origins.get(key) or (ORIGIN_PROFILE if (key in pv or not pv) else ORIGIN_NUTZER)
         row = dict(r)
         row.update({"origin": origin, "origin_label": ORIGIN_LABEL[origin],
                     "profile_value": pv.get(key), "planner_value": planner.get(key),
@@ -781,13 +781,13 @@ def view(doc: Mapping, catalog: Optional[Mapping] = None, comments: Optional[Map
                     "explain": ex})
         out.append(row)
     n = len(out)
-    cov = {"rows": n, "kuratiert": sum(1 for x in out if x["explain"]["status"] == "kuratiert"),
-           "maschinell": sum(1 for x in out if x["explain"]["status"] == "erklaert"),
-           "geerntet": sum(1 for x in out if x["explain"]["status"] == "geerntet"),
+    cov = {"rows": n, "curated": sum(1 for x in out if x["explain"]["status"] == "curated"),
+           "maschinell": sum(1 for x in out if x["explain"]["status"] == "explained"),
+           "harvested": sum(1 for x in out if x["explain"]["status"] == "harvested"),
            "profil_kommentar": sum(1 for x in out if x["explain"]["status"] == "profil-kommentar"),
-           "unerklaert": sum(1 for x in out if x["explain"]["status"] == "unerklaert"),
-           "geaendert": sum(1 for x in out if x["changed"])}
-    cov["erklaert"] = n - cov["unerklaert"]
+           "unexplained": sum(1 for x in out if x["explain"]["status"] == "unexplained"),
+           "changed": sum(1 for x in out if x["changed"])}
+    cov["explained"] = n - cov["unexplained"]
     keys = {x["key"] for x in out}
     planner_only = [{"key": k, "value": v} for k, v in planner.items() if k not in keys]
     removed = [{"key": k, "value": v} for k, v in pv.items() if k not in keys]

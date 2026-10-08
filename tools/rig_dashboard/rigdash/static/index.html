@@ -142,7 +142,7 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .pf-verdict { border: 1px solid var(--line); border-left-width: 5px; border-radius: 8px; padding: 8px 12px; margin: 8px 0; background: var(--surface); }
 .pf-verdict.ok { border-left-color: var(--good); } .pf-verdict.bad { border-left-color: var(--bad); }
 .pf-rejs { list-style: none; padding: 0; margin: 6px 0; } .pf-rej { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 6px 0; background: var(--surface); font-size: 12.5px; overflow-wrap: anywhere; }
-.pf-rej.pf-force { border-left: 4px solid var(--good); } .pf-rej.pf-blockiert { border-left: 4px solid var(--bad); } .pf-rej.pf-ungeprueft { border-left: 4px solid var(--warn); }
+.pf-rej.pf-force { border-left: 4px solid var(--good); } .pf-rej.pf-is_blocked { border-left: 4px solid var(--bad); } .pf-rej.pf-ungeprueft { border-left: 4px solid var(--warn); }
 .pf-force { margin-top: 3px; font-weight: 600; } .pf-notes { margin: 4px 0 4px 18px; padding: 0; font-size: 12px; color: var(--text-2); }
 .pf-export { border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; margin: 10px 0; background: var(--surface); } .pf-export h3 { margin: 4px 0; font-size: 14px; } .pf-issue-text { display: block; width: 100%; box-sizing: border-box; min-height: 14em; margin: 6px 0; padding: 8px 10px; background: var(--surface-2); color: inherit; border: 1px solid var(--line); border-radius: 6px; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; resize: vertical; }
 .pf-ok { border-color: var(--good); color: var(--good); } .pf-bad { border-color: var(--bad); color: var(--bad); }
@@ -168,10 +168,10 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .pfx-row.pfx-z-vorgeschlagen { box-shadow: inset 3px 0 0 var(--good); padding-left: 8px; }
 .pfx-h { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; } .pfx-n { overflow-wrap: anywhere; font-weight: 600; font-size: 12.5px; }
 .pfx-zchip, .pfx-vchip { font-size: 11px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line); white-space: nowrap; background: var(--surface-2); color: var(--text-2); cursor: help; }
-.pfx-z-vorgeschlagen { border-color: var(--good); color: var(--good); } .pfx-z-unbelegt { border-color: var(--warn); color: var(--warn); border-style: dashed; }
+.pfx-z-vorgeschlagen { border-color: var(--good); color: var(--good); } .pfx-z-unverified { border-color: var(--warn); color: var(--warn); border-style: dashed; }
 .pfx-z-uebersteuert { border-color: var(--warn); color: var(--warn); font-weight: 600; } .pfx-z-launcher { border-color: var(--bar); color: var(--text); }
 .pfx-v-geht { border-color: var(--good); color: var(--good); } .pfx-v-force, .pfx-v-ungeprueft { border-color: var(--warn); color: var(--warn); font-weight: 600; }
-.pfx-v-verweigert { border-color: var(--bad); color: var(--bad); font-weight: 600; } .pfx-v-hinweis { color: var(--text); } .pfx-v-keinlauf, .pfx-v-alt, .pfx-v-nichtbeurteilt, .pfx-v-orakelfehler, .pfx-v-planerpasst, .pfx-v-planerpasstnicht, .pfx-v-planerunbelegt { border-style: dashed; } .pfx-v-nichtbeurteilt, .pfx-v-planerpasstnicht { color: var(--warn); } .pfx-v-orakelfehler { color: var(--bad); } .pfx-v-mitforce { border-color: var(--warn); color: var(--warn); font-weight: 600; }
+.pfx-v-verweigert { border-color: var(--bad); color: var(--bad); font-weight: 600; } .pfx-v-note { color: var(--text); } .pfx-v-keinlauf, .pfx-v-alt, .pfx-v-nichtbeurteilt, .pfx-v-orakelfehler, .pfx-v-planerpasst, .pfx-v-planerpasstnicht, .pfx-v-planerunbelegt { border-style: dashed; } .pfx-v-nichtbeurteilt, .pfx-v-planerpasstnicht { color: var(--warn); } .pfx-v-orakelfehler { color: var(--bad); } .pfx-v-mitforce { border-color: var(--warn); color: var(--warn); font-weight: 600; }
 .pfx-v { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; min-width: 0; } .pfx-v input[type=text], .pfx-v input[type=number], .pfx-v select { font: inherit; font-size: 12.5px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); max-width: 100%; box-sizing: border-box; }
 .pfx-v > input[type=text] { flex: 1 1 18em; min-width: 8em; font-family: ui-monospace, Menlo, Consolas, monospace; }
 .pfx-vec { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: flex-end; } .pfx-c { display: flex; flex-direction: column; gap: 1px; font-size: 11px; color: var(--text-2); }
@@ -400,7 +400,7 @@ section.card.hang { border: 3px solid var(--alarm-hang); }
 details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
 .pill { font-size: 11px; font-weight: 650; padding: 1px 8px; border-radius: 10px; border: 1px solid currentColor;
   background: var(--surface-2); white-space: nowrap; }
-.pill.s-belegt { color: var(--good); } .pill.s-wirkungslos { color: var(--bad); } .pill.s-unbelegt { color: var(--warn); }
+.pill.s-belegt { color: var(--good); } .pill.s-wirkungslos { color: var(--bad); } .pill.s-unverified { color: var(--warn); }
 .pill.s-erwartet { color: var(--bar); } .pill.s-unbekannt { color: var(--muted); }
 .pill.f-ja, .pill.f-an { color: var(--good); } .pill.f-nein, .pill.f-aus { color: var(--bad); }
 .pill.f-teilweise { color: var(--warn); } .pill.f-unbekannt { color: var(--muted); }
@@ -417,11 +417,11 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
 .prod .am { color: var(--muted); font-size: 10.5px; }
 .pill.p-fertig-aktiv { color: var(--good); } .pill.p-im-image-aber-aus { color: var(--warn); } .pill.p-desk { color: var(--bar); }
 .pill.e-ja { color: var(--good); } .pill.e-teilweise { color: var(--warn); } .pill.e-nein { color: var(--bad); }
-.pill.p-offen { color: var(--bad); } .pill.p-unbelegt, .pill.p-entfaellt { color: var(--muted); }
+.pill.p-offen { color: var(--bad); } .pill.p-unverified, .pill.p-entfaellt { color: var(--muted); }
 .kz td, .mx td { font-size: 11.5px; text-align: center; }
 .kz td:first-child, .mx td:first-child, .mx td:nth-child(2) { text-align: left; }
 .kz .k-metall { color: var(--good); } .kz .k-unterst { color: var(--bar); } .kz .k-desk { color: var(--warn); }
-.kz .k-nein { color: var(--bad); } .kz .k-unbelegt { color: var(--muted); }
+.kz .k-nein { color: var(--bad); } .kz .k-unverified { color: var(--muted); }
 .mx .m-ung { color: var(--bad); font-style: italic; } .mx .m-leer { color: var(--muted); }
 .prod details > summary { cursor: pointer; font-size: 11.5px; color: var(--text-2); }
 .imgseat td.ev { color: var(--text-2); font-size: 12px; max-width: 460px; overflow-wrap: anywhere; }
@@ -761,7 +761,7 @@ const srcOf = (b, ...keys) => {
 };
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 // display names of the German enum values the API delivers (features.json, state words); the value itself stays the CSS/logic key
-const ENUM_EN = {"ja": "yes", "nein": "no", "teilweise": "partial", "unbekannt": "unknown", "an": "on", "aus": "off", "unbelegt": "unverified", "belegt": "verified",
+const ENUM_EN = {"ja": "yes", "nein": "no", "teilweise": "partial", "unbekannt": "unknown", "an": "on", "aus": "off", "unverified": "unverified", "belegt": "verified",
   "wirkungslos": "ineffective", "erwartet": "expected", "fertig": "done", "fertig+aktiv": "done+active", "im Image aber aus": "in image but off", "Desk": "desk", "offen": "open",
   "entfällt": "dropped", "am Metall belegt": "verified on hardware", "unterstützt": "supported", "nur Desk": "desk only", "ungültig": "invalid", "ungemessen": "unmeasured"};
 const en = (s) => (s != null && Object.prototype.hasOwnProperty.call(ENUM_EN, s)) ? ENUM_EN[s] : s;
@@ -1420,7 +1420,7 @@ function bootCard(b, now, binders) {
       ${!DEV ? relHead(b, ipc, topo) : `<span class="mono">${esc(m.tag || b.stem)}</span>${ipc
         ? ` &middot; REV ${esc(ipc.rev)} &middot; profile ${esc(ipc.profile)} &middot; ${esc(ipc.image)} &middot; lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json " + (ipc.boot_id || ""))}`
         : `${m.sha ? " &middot; tree " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}`}${fieldIpc(b, "A4") ? " &middot; " + esc(Object.entries(fieldIpc(b, "A4").value).map(([g, f]) => g + ": " + (f && typeof f === "object" ? (f.describe || Object.entries(f).map(([k, v]) => k + "=" + (typeof v === "object" ? JSON.stringify(v) : v)).join(" ")) : f)).join(" | ")) + " " + ipcTag("state.json groups.form") : m.form ? " &middot; " + esc(m.form) + srcOf(b, "A4") : ""}
-      ${b.fields_summary ? ` &middot; <span class="muted" title="missing in IPC: ${esc((b.fields_summary.fehlt_keys || []).join(", "))}">fields from IPC ${b.fields_summary.ipc}/${b.fields_summary.n}</span>` : ""}
+      ${b.fields_summary ? ` &middot; <span class="muted" title="missing in IPC: ${esc((b.fields_summary.missing_keys || []).join(", "))}">fields from IPC ${b.fields_summary.ipc}/${b.fields_summary.n}</span>` : ""}
     </div>
     ${phaseHtml(b)}
     <div class="tiles">
@@ -1503,7 +1503,7 @@ function gpuqHtml(d) {
     `<tr><td class="mono">${esc(b.owner)}</td><td>${esc(b.state)}</td><td>${esc((b.cards || []).join(","))}${b.mib ? " &middot; " + fmt(b.mib) + " MiB" : ""}</td><td>${esc(((b.start || {}).local || "").slice(11, 16))}</td><td>${esc(((b.end || {}).local || "").slice(11, 16))}</td><td>${esc(b.purpose)}</td></tr>`).join("") + `</table>`;
 }
 
-const IMG_STATUS = ["belegt", "wirkungslos", "unbelegt", "erwartet", "unbekannt"];   // API values (image_changes), shown via en()
+const IMG_STATUS = ["belegt", "wirkungslos", "unverified", "erwartet", "unbekannt"];   // API values (image_changes), shown via en()
 let featOnlyOff = false;
 try { featOnlyOff = localStorage.getItem("rigdash-feat-only-off") === "1"; } catch (e) { /* no storage */ }
 function featPill(v, title) {
@@ -1522,19 +1522,19 @@ function featAkTitle(ak) {
 }
 function featGainHtml(g) {
   if (!g.length) return `<span class="muted">&mdash;</span>`;
-  return g.map((x) => `<div class="gain" title="${esc((x.quelle || "") + (x.boot ? " \u00b7 " + x.boot : ""))}">${esc(x.metrik)}: ${esc(x.vorher != null ? x.vorher + " \u2192 " : "")}<b>${esc(x.nachher)}</b> ${esc(x.einheit || "")} <span class="art">${esc(x.art)}</span></div>`).join("");
+  return g.map((x) => `<div class="gain" title="${esc((x.quelle || "") + (x.boot ? " \u00b7 " + x.boot : ""))}">${esc(x.metrik)}: ${esc(x.vorher != null ? x.vorher + " \u2192 " : "")}<b>${esc(x.nachher)}</b> ${esc(x.unit || "")} <span class="art">${esc(x.art)}</span></div>`).join("");
 }
 // Product features target/actual (user 29.09.: "bugfixes are not features") -- commits only as building blocks below
 const PROD_MODELS = ["27B", "NF"];
-function prodSlug(st) { return String(st || "unbelegt").toLowerCase().replace("fertig+aktiv", "fertig-aktiv").replace(/ä/g, "ae").replace(/[^a-z0-9]+/g, "-"); }
+function prodSlug(st) { return String(st || "unverified").toLowerCase().replace("fertig+aktiv", "fertig-aktiv").replace(/ä/g, "ae").replace(/[^a-z0-9]+/g, "-"); }
 function prodIst(x) {
-  const v = x.wert ? esc(x.wert) : `<span class="muted">${x.status === "unbelegt" || !x.status ? "unverified" : "&mdash;"}</span>`;
+  const v = x.value ? esc(x.value) : `<span class="muted">${x.status === "unverified" || !x.status ? "unverified" : "&mdash;"}</span>`;
   const am = x.belegt_am ? `<div class="am">verified ${esc(x.belegt_am)}</div>` : "";
   return x.veraltet ? `<div class="stale">${v}<div class="stale-note">Actual is stale, measure again</div>${am}</div>` : v + am;
 }
 function prodAkt(a) {
   if (!a) return `<span class="muted">&mdash;</span>`;
-  let t = a.wert ? `<span title="${esc(a.instrument || "")}">${esc(a.wert)}</span>`
+  let t = a.value ? `<span title="${esc(a.instrument || "")}">${esc(a.value)}</span>`
     : a.kein_instrument ? `<span class="muted">no instrument: ${esc(a.kein_instrument)}</span>` : `<span class="muted">${esc(a.leer || "")}</span>`;
   const jf = a.je_format || {};
   const run = Object.keys(jf).filter((f) => jf[f] === "dieser Boot");
@@ -1545,7 +1545,7 @@ function prodAkt(a) {
 function prodKreuz(p, achsen) {
   const kt = p.kreuztabelle;
   if (!kt) return "";
-  const cls = { "am Metall belegt": "k-metall", "unterstützt": "k-unterst", "nur Desk": "k-desk", "nein": "k-nein", "unbelegt": "k-unbelegt" };
+  const cls = { "am Metall belegt": "k-metall", "unterstützt": "k-unterst", "nur Desk": "k-desk", "nein": "k-nein", "unverified": "k-unverified" };
   const key = (a, b) => {
     const i = achsen.findIndex((x) => x.key === a), j = achsen.findIndex((x) => x.key === b);
     return i <= j ? a + "+" + b : b + "+" + a;
@@ -1555,7 +1555,7 @@ function prodKreuz(p, achsen) {
     return `<div style="margin-top:6px"><b>${m}</b><div class="tablewrap"><table class="kz"><tr><th></th>${achsen.map((x) => `<th>${esc(x.name)}</th>`).join("")}</tr>`
       + achsen.map((a, i) => `<tr><td><b>${esc(a.name)}</b></td>` + achsen.map((b, j) => {
         if (j < i) return "<td></td>";
-        const z = c[key(a.key, b.key)] || { status: "unbelegt" };
+        const z = c[key(a.key, b.key)] || { status: "unverified" };
         return `<td class="${cls[z.status] || ""}" title="${esc(z.note || "")}">${esc(en(z.status))}${z.note ? " *" : ""}</td>`;
       }).join("") + "</tr>").join("") + "</table></div></div>";
   }).join("");
@@ -1564,7 +1564,7 @@ function prodUnter(p) {
   const ut = p.untertabelle;
   if (!ut || !(ut.zeilen || []).length) return "";
   const cell = (x) => !x ? `<span class="muted">&mdash;</span>`
-    : (x.status ? `<span class="pill p-${prodSlug(x.status)}">${esc(en(x.status))}</span> ` : "") + prodIst(x) + (x.beleg ? `<div class="am">${esc(x.beleg)}</div>` : "");
+    : (x.status ? `<span class="pill p-${prodSlug(x.status)}">${esc(en(x.status))}</span> ` : "") + prodIst(x) + (x.evidence ? `<div class="am">${esc(x.evidence)}</div>` : "");
   return `<div class="tablewrap"><table><tr><th>${esc(ut.spalte || "Row")}</th><th>Target</th><th>Actual 27B</th><th>Actual NF</th><th>in the current boot</th></tr>`
     + ut.zeilen.map((z) => `<tr><td><b>${esc(z.name)}</b></td><td>${esc(z.soll || "")}</td><td>${cell((z.ist || {})["27B"])}</td><td>${cell((z.ist || {}).NF)}</td>
       <td class="am">${Object.entries(z.aktuell || {}).map(([m, v]) => esc(m + ": " + v)).join("<br>")}</td></tr>`).join("") + "</table></div>";
@@ -1586,8 +1586,8 @@ function prodMatrix(p) {
         + rows.map(([t, x]) => `<tr><td>${esc(MX_EN[t] || t)}</td><td>${esc(MX_EN[x] || x)}</td>` + MX_BS.map((b) => {
           const z = c[[f, b, t, x].join("|")];
           if (!z) return `<td class="m-leer">unmeasured</td>`;
-          const tip = esc([z.boot, z.beleg, z.quelle].filter(Boolean).join(" · "));
-          return z.status === "ungültig" ? `<td class="m-ung" title="${tip}">invalid</td>` : `<td title="${tip}">${esc(z.wert)}</td>`;
+          const tip = esc([z.boot, z.evidence, z.quelle].filter(Boolean).join(" · "));
+          return z.status === "ungültig" ? `<td class="m-ung" title="${tip}">invalid</td>` : `<td title="${tip}">${esc(z.value)}</td>`;
         }).join("") + "</tr>").join("") + "</table></div>";
     }).join("") + "</div>";
   }).join("");
@@ -1596,8 +1596,8 @@ function prodBausteine(p) {
   const bs = p.bausteine || [];
   if (!bs.length) return `<span class="muted">&mdash;</span>`;
   return `<details id="pb-${esc(p.id)}"><summary>${bs.length} building block${bs.length === 1 ? "" : "s"}</summary>`
-    + bs.map((b) => `<div style="margin-top:4px"><b class="mono">${esc(b.id)}</b> ${esc(b.titel || "")}`
-      + Object.entries(b.je_modell || {}).map(([m, r]) => `<div class="am">${m}: ${r.fertig ? "done" : "not done"} &middot; in image ${esc(en((r.im_image || {}).state))} &middot; active ${esc(en(r.aktiv))}${r.image_aber_aus && r.aus_begruendung ? " &middot; off: " + esc(r.aus_begruendung) : ""}</div>`).join("")
+    + bs.map((b) => `<div style="margin-top:4px"><b class="mono">${esc(b.id)}</b> ${esc(b.title || "")}`
+      + Object.entries(b.per_model || {}).map(([m, r]) => `<div class="am">${m}: ${r.fertig ? "done" : "not done"} &middot; in image ${esc(en((r.im_image || {}).state))} &middot; active ${esc(en(r.aktiv))}${r.image_aber_aus && r.aus_begruendung ? " &middot; off: " + esc(r.aus_begruendung) : ""}</div>`).join("")
       + `</div>`).join("") + `</details>`;
 }
 function prodHtml(d) {
@@ -1611,13 +1611,13 @@ function prodHtml(d) {
       const ist = p.ist || {};
       const st = PROD_MODELS.map((m) => {
         const x = ist[m] || {};
-        return `<div>${m}: <span class="pill p-${prodSlug(x.status)}" title="${esc(x.status_text || x.grund || "")}">${esc(en(x.status || "unbelegt"))}</span>${x.grund ? `<div class="am">${esc(x.grund)}</div>` : ""}</div>`;
+        return `<div>${m}: <span class="pill p-${prodSlug(x.status)}" title="${esc(x.status_text || x.reason || "")}">${esc(en(x.status || "unverified"))}</span>${x.reason ? `<div class="am">${esc(x.reason)}</div>` : ""}</div>`;
       }).join("");
       const erc = PROD_MODELS.map((m) => {
         const x = ist[m] || {};
-        return `<div>${m}: ${x.erreicht ? `<span class="pill e-${esc(x.erreicht)}">${esc(en(x.erreicht))}</span>` : `<span class="muted">&mdash;</span>`}${x.erreicht_grund ? `<div class="am">${esc(x.erreicht_grund)}</div>` : ""}</div>`;
+        return `<div>${m}: ${x.reached ? `<span class="pill e-${esc(x.reached)}">${esc(en(x.reached))}</span>` : `<span class="muted">&mdash;</span>`}${x.reached_reason ? `<div class="am">${esc(x.reached_reason)}</div>` : ""}</div>`;
       }).join("");
-      const bel = PROD_MODELS.filter((m) => (ist[m] || {}).beleg).map((m) => `<div><b>${m}:</b> ${esc(ist[m].beleg)}${ist[m].quelle ? ` <span class="am">(${esc(ist[m].quelle)})</span>` : ""}</div>`).join("") || `<span class="muted">&mdash;</span>`;
+      const bel = PROD_MODELS.filter((m) => (ist[m] || {}).evidence).map((m) => `<div><b>${m}:</b> ${esc(ist[m].evidence)}${ist[m].quelle ? ` <span class="am">(${esc(ist[m].quelle)})</span>` : ""}</div>`).join("") || `<span class="muted">&mdash;</span>`;
       const akt = PROD_MODELS.map((m) => `<div><b>${m}:</b> ${prodAkt((p.aktuell || {})[m])}</div>`).join("");
       const extra = [
         p.kreuztabelle ? `<details id="pk-${esc(p.id)}"><summary>Cross table</summary>${prodKreuz(p, achsen)}</details>` : "",
@@ -1625,7 +1625,7 @@ function prodHtml(d) {
         p.matrix ? `<details id="pm-${esc(p.id)}"><summary>Matrix form &times; bs &times; depth &times; text</summary>${prodMatrix(p)}</details>` : "",
         p.marker ? `<details id="pr-${esc(p.id)}"><summary>Instrument marker</summary>${Object.entries(p.marker).map(([m, x]) => `<div class="am"><b>${m}:</b> ${esc(x.marker)} &middot; ${Object.entries(x.je_format || {}).map(([f, v]) => esc(f + ": " + v)).join(" &middot; ")}</div>`).join("")}</details>` : "",
       ].join("");
-      return `<tr><td class="mono">${esc(p.nr || "")}</td><td><b>${esc(p.titel)}</b></td><td class="soll">${esc(p.soll)}</td>
+      return `<tr><td class="mono">${esc(p.nr || "")}</td><td><b>${esc(p.title)}</b></td><td class="soll">${esc(p.soll)}</td>
         <td class="ist">${prodIst(ist["27B"] || {})}</td><td class="ist">${prodIst(ist.NF || {})}</td><td>${erc}</td><td>${st}</td><td class="bel x">${bel}</td><td class="akt">${akt}</td><td>${prodBausteine(p)}</td></tr>`
         + (extra ? `<tr><td></td><td colspan="9">${extra}</td></tr>` : "");
     }).join("") + `</table></div>`;
@@ -1688,7 +1688,7 @@ function featHtml(d) {
     if (!rows.length) return `<div class="imgseat">${head}<div class="muted">${featOnlyOff ? "no feature in the image that is off" : "no features entered"}</div></div>`;
     return `<div class="imgseat">${head}<div class="muted" style="margin:-4px 0 8px">${(m.features || []).length} features &middot; ${nOff} in the image, but off</div><div class="tablewrap"><table>
       <tr><th>Feature</th><th>done</th><th>in image</th><th>active</th><th>Gain</th><th>Reason (if off)</th></tr>`
-      + rows.map((r) => `<tr class="${r.image_aber_aus ? "feat-off" : ""}"><td><b class="mono">${esc(r.id)}</b> ${esc(r.titel)}<div class="muted mono" style="font-size:11px">${(r.zweige || []).map((z) => esc(z.branch) + " @ " + esc((z.sha || "").slice(0, 10))).join("<br>")}</div></td>
+      + rows.map((r) => `<tr class="${r.image_aber_aus ? "feat-off" : ""}"><td><b class="mono">${esc(r.id)}</b> ${esc(r.title)}<div class="muted mono" style="font-size:11px">${(r.zweige || []).map((z) => esc(z.branch) + " @ " + esc((z.sha || "").slice(0, 10))).join("<br>")}</div></td>
         <td>${r.fertig ? `<span class="pill f-ja">yes</span>` : `<span class="pill f-teilweise">no</span>`}</td>
         <td>${featPill(r.im_image, featImTitle(r.im_image))}</td>
         <td>${featPill(r.aktiv, featAkTitle(r.aktiv))}</td>
@@ -1789,7 +1789,7 @@ function flipParts(f, dir) {
     // max(last D token, arrival), so "idle" is 0 and only appears in old marks (> 0)
     ? ` <span class="muted">(lead = ${x.leer_ms > 0 ? `idle without request ${sec(x.leer_ms)} + ` : ""}halt ${sec(x.halt_ms)} + park ${sec(x.park_ms)} + remainder ${sec(x.vor_rest_ms)})</span>`
     : (dir === "D>P" ? ` <span class="muted">(lead decomposition missing: no arrival of the request)</span>` : "");
-  return `Decomposition: ${p("lead", x.vorlauf_ms)} + ${p("layer swap", x.layer_ms)} + ${p("wake KV/DC", x.wake_kv_dc_ms)} + ${p("tail", x.nachlauf_ms)} + ${p("remainder", x.rest_ms)} = ${sec(f.last_ms)} s` + vor;
+  return `Decomposition: ${p("lead", x.warmup_ms)} + ${p("layer swap", x.layer_ms)} + ${p("wake KV/DC", x.wake_kv_dc_ms)} + ${p("tail", x.nachlauf_ms)} + ${p("remainder", x.rest_ms)} = ${sec(f.last_ms)} s` + vor;
 }
 function flipStats(f) {
   return f && f.n ? `p50 ${sec(f.p50_ms)} &middot; p90 ${sec(f.p90_ms)} &middot; max ${sec(f.max_ms)} s &middot; n=${f.n}` : "";

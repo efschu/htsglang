@@ -411,7 +411,7 @@ def test_decision_line_and_pstufe_line_carry_the_spec_fields_and_the_ctl_line_th
     c.feed_pobs({0: {"arena_ppm": "930000", "would_hold": "0", "hold": "0", "sm": "128"}, 1: {"sm": "52"}, 2: {"sm": "52"}})
     line = G.pstufe_line(d, c.pobs_view())
     for f in ("P-STUFE", "bs=1/6", "kv=n/a", "arena=0.930", "pending=", "tau=", "d_round_ms=", "target_ms=100",
-              "stufe=0->1", "f=0.75", "sm=0:128,1:52,2:52", "would_hold=0", "reason=", "flaps=0"):
+              "stage=0->1", "f=0.75", "sm=0:128,1:52,2:52", "would_hold=0", "reason=", "flaps=0"):
         assert f in line, (f, line)
     assert S.format_ctl(7, d).strip().endswith("starve=0") and "green" not in S.format_ctl(7, d)
     plain = S.Decision("dynamic", 1, 0, 1, 0.75, None, 1, 6, 0.0, None, None, "x", True, False, 0, 0.0)

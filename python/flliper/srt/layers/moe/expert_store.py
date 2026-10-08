@@ -322,7 +322,7 @@ _EXPERT_MAP_CACHE = {}
 def expert_map():
     """DIE EXPERTEN-KARTE dieses Boots, oder ``None``.
 
-    #107, Nutzer-Gesetz 22.09.: *"alles was geshardet wird braucht ne
+    #107, Nutzer-Gesetz 22.09.: *"alles was geshardet wird requires ne
     karte"*. Der Launcher publiziert sie ueber ``FLLIPER_MOE_EXPERT_MAP``,
     weil nur er beide Ranggruppen kennt -- dieselbe Stelle, an der #106
     schon die Store-Geometrie publiziert. Steht sie, rechnet KEINE Gruppe
@@ -350,12 +350,12 @@ def expert_map():
             roh = json.load(fh)
         from flliper.srt.layers.moe import expert_map as _em
 
-        grund = _em.refuse_if_inconsistent(roh)
-        if grund:
+        reason = _em.refuse_if_inconsistent(roh)
+        if reason:
             logging.getLogger(__name__).error(
                 "#107 EXPERTEN-KARTE %s VERWORFEN: %s -- dieser Lauf rechnet "
                 "wie vor der Karte, also koennen zwei Gruppen wieder "
-                "auseinanderlaufen", file_path, grund)
+                "auseinanderlaufen", file_path, reason)
         else:
             emap = roh
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -440,9 +440,9 @@ def slot_rows(local_ids: Iterable[int], lo: int, pad: bool = True,
     """Local id -> SLOT im Slot-Pool (#72). Deterministisch, ohne Absprache.
 
     `global_rows` nimmt die globale Experten-Id ALS Zeilenindex -- deshalb
-    braucht die Datei heute einen Platz je Experte, auch fuer die, die nie
+    requires die Datei heute einen Platz je Experte, auch fuer die, die nie
     geschrieben werden. Nutzer-Order 21.09.: "waehrend decode oder prefill
-    muss niemals alles im systemram liegen"; Plaetze braucht nur, wer NICHT
+    muss niemals alles im systemram liegen"; Plaetze requires nur, wer NICHT
     auf einer Karte liegt.
 
     DIE ZUORDNUNG BLEIBT EINE RECHNUNG, KEINE ABSPRACHE, und das ist die

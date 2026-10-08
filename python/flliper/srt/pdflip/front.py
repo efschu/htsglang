@@ -5599,7 +5599,7 @@ class Front:
         # rids D confirms: a failed/unsupported park writes none (withdrawn).
         t_park = time.time()
         # DASHBOARD-IPC: the D->P flip's Vorlauf starts with its park RPC (front.flip)
-        if Front._flip_phase(self).vorlauf("D>P", f"park:{body['reason']}", t_park):
+        if Front._flip_phase(self).warmup("D>P", f"park:{body['reason']}", t_park):
             Front._ipc_live_kick(self)
         try:
             code, text = await self.rpc(D, phase_policy.PARK_PATH, body, phase_policy.PARK_TIMEOUT_S)
@@ -7934,7 +7934,7 @@ class Front:
         stood green at 95.92 -> 96.36 -> 96.47 GiB against a 95.90 GiB reap
         mark, growth entirely anon and entirely at idle, and the box went into
         the OOM anyway.  User, verbatim: "kein uebertreten mehr der schwelle.
-        fuehrt nur zum absturz."
+        fuehrt nur zum crash."
 
         The margin is NAMED, not a cushion (host_ledger.resolve_margin): the
         flip transient this form actually spends plus the idle anon drift it
@@ -13970,7 +13970,7 @@ class Front:
             logger.error("PDFLIP-FLIP REFUSED-DUAL sleep=%s wake=%s: %s", src, dst, DUAL_NO_FLIP_WHY)
             return
         # DASHBOARD-IPC (front.flip): the decision -- a D->P park RPC already opened it
-        if Front._flip_phase(self).vorlauf(f"{src}>{dst}", Front._flip_vorlauf_reason(self, src, dst), time.time()):
+        if Front._flip_phase(self).warmup(f"{src}>{dst}", Front._flip_vorlauf_reason(self, src, dst), time.time()):
             Front._ipc_live_kick(self)
         # #55 F2: unlock the clocks BEFORE anything of the flip runs -- both groups' legs use the cards.
         _ic = getattr(self, "_idle_clock", None)

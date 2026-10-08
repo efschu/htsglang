@@ -1,4 +1,4 @@
-"""AP-H2 (Auftrag 880, Plan 1006 §3 AP-H Teil 2): Balken je Karte und Phase im Datenvertrag ``flliper.balken/1`` (GPU-frei).
+"""AP-H2 (Auftrag 880, Plan 1006 §3 AP-H Teil 2): Balken je Karte und Phase im Datenvertrag ``flliper.bar/1`` (GPU-frei).
 
 Gepinnt:
 
@@ -10,7 +10,7 @@ Gepinnt:
 * Draft-Term (neu): P traegt den MTP-Kopf nur ohne ``--draft-kv-on-p off``, D solo nur auf dem Host-Rang, Gewicht aus dem Draft-Profil
   (``model["draft"]["external"]``), DFlash2 = nicht gerechnet;
 * nicht belegbare Terme sind ``mib: None`` ("nicht gerechnet") mit Grund, nie 0 und nie geraten; ``Frei`` nennt dann die Obergrenze;
-* Betriebsformen: Einzelkarte (eine Phase), nur TP, Flip, Dual (beide Phasen, keine Summe); eine unrechenbare Phase laesst die andere stehen.
+* Betriebsformen: SingleCard (eine Phase), nur TP, Flip, Dual (beide Phasen, keine Summe); eine unrechenbare Phase laesst die andere stehen.
 """
 
 import copy
@@ -103,7 +103,7 @@ class TestContractSumRule(unittest.TestCase):
         self.assertEqual(b["not_computed"], ["KV", "Fixed items"])
         kv = seg(b, "kv")
         self.assertIsNone(kv["mib"])
-        self.assertEqual((kv["herkunft"], kv["gerechnet"]), ("not calculated", False))
+        self.assertEqual((kv["source"], kv["gerechnet"]), ("not calculated", False))
         self.assertEqual(b["posts_mib"], 300.0)
         self.assertIn("UPPER BOUND", seg(b, "free")["detail"])
         self.assertIn("KV", seg(b, "free")["detail"])
@@ -119,7 +119,7 @@ class TestEveryBarOfTheReferenceRig(unittest.TestCase):
         self.res = nf()
 
     def test_schema_form_and_phases(self):
-        self.assertEqual(self.res["schema"], "flliper.balken/1")
+        self.assertEqual(self.res["schema"], "flliper.bar/1")
         self.assertEqual((self.res["form"], list(self.res["phases"])), ("flip", ["P", "D"]))
         self.assertTrue(all(ph["ok"] for ph in self.res["phases"].values()))
         json.dumps(self.res)
@@ -133,7 +133,7 @@ class TestEveryBarOfTheReferenceRig(unittest.TestCase):
                 got = sum(s["mib"] for s in b["segments"] if s["mib"] is not None)
                 self.assertAlmostEqual(got, max(b["total_mib"], b["posts_mib"]), delta=0.01, msg=(name, b["label"]))
                 for s in b["segments"]:
-                    self.assertTrue(s["herkunft"], (name, b["label"], s["name"]))
+                    self.assertTrue(s["source"], (name, b["label"], s["name"]))
                     self.assertTrue(s["detail"], (name, b["label"], s["name"]))
 
     def test_unmeasured_fixed_posts_are_not_computed_in_p_not_zero(self):
@@ -150,10 +150,10 @@ class TestEveryBarOfTheReferenceRig(unittest.TestCase):
 
     def test_p_inputs_name_the_profile_lines_they_came_from(self):
         seen = {x["was"]: x for x in self.res["phases"]["P"]["inputs"]}
-        self.assertIn("--pp-stage-ratio", seen["stage_layers"]["herkunft"])
-        self.assertIn("--pp-cut-expert-device-fraction", seen["moe_resident_fraction"]["herkunft"])
-        self.assertIn("--pp-cut-expert-lru-rows", seen["scratch_rows"]["herkunft"])
-        self.assertIn("Assumption", seen["budget_mib"]["herkunft"])
+        self.assertIn("--pp-stage-ratio", seen["stage_layers"]["source"])
+        self.assertIn("--pp-cut-expert-device-fraction", seen["moe_resident_fraction"]["source"])
+        self.assertIn("--pp-cut-expert-lru-rows", seen["scratch_rows"]["source"])
+        self.assertIn("Assumption", seen["budget_mib"]["source"])
 
 
 class TestDPhaseHandCalculation(unittest.TestCase):
@@ -192,12 +192,12 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         for i, (fr, sc) in enumerate(zip((0.06, 0.51, 0.48), (104, 48, 48))):
             rows = ER.buffer_rows(local_experts=own[i], fraction=fr, scratch_rows=sc)
             self.assertAlmostEqual(seg(d[i], "experts")["mib"], rows * per_expert, delta=0.01, msg="Rang %d" % i)
-            self.assertEqual(seg(d[i], "experts")["herkunft"], "Approximation (not the solver)")
+            self.assertEqual(seg(d[i], "experts")["source"], "Approximation (not the solver)")
 
     def test_fixed_post_is_the_sum_of_the_two_profile_lines(self):
         d = nf()["phases"]["D"]["bars"]
         self.assertEqual([seg(b, "fixed")["mib"] for b in d], [1446 + 1981, 896 + 528, 894 + 524])
-        self.assertEqual(seg(d[0], "fixed")["herkunft"], "Profile row")
+        self.assertEqual(seg(d[0], "fixed")["source"], "Profile row")
         self.assertIn("--d-foreign-context-mib", seg(d[0], "fixed")["detail"])
         self.assertIn("--d-nontorch-mib", seg(d[0], "fixed")["detail"])
 
@@ -305,7 +305,7 @@ class TestDraftTerm(unittest.TestCase):
         self.assertIsNone(seg(on[1], "draft"))
         d = seg(on[2], "draft")                                        # letzte Stufe, Gewicht ohne lm_head aus dem Draft-Profil
         self.assertAlmostEqual(d["mib"], 500.0, delta=0.01)
-        self.assertEqual(d["herkunft"], "Model profile/hardware profile (Index)")
+        self.assertEqual(d["source"], "Model profile/hardware profile (Index)")
         self.assertIn("lm_head", d["detail"])
 
     def test_p_default_is_on_when_the_flag_is_absent(self):
@@ -426,7 +426,7 @@ class TestForms(unittest.TestCase):
         r = nf(overrides={"activation_mib": [5984, 2952, 2944], "ssm_dtype": "bfloat16"})
         for b, tr in zip(r["phases"]["P"]["bars"], (5984, 2952, 2944)):
             self.assertAlmostEqual(seg(b, "activation")["mib"], tr, delta=0.01)
-            self.assertEqual(seg(b, "activation")["herkunft"], "Input (user/profile)")
+            self.assertEqual(seg(b, "activation")["source"], "Input (user/profile)")
 
 
 class TestBridge(unittest.TestCase):
@@ -435,7 +435,7 @@ class TestBridge(unittest.TestCase):
                       "phase_args": NF_PA, "phase_env": NF_PE})
         self.assertTrue(res["ok"], res)
         r = res["result"]
-        self.assertEqual(r["schema"], "flliper.balken/1")
+        self.assertEqual(r["schema"], "flliper.bar/1")
         self.assertEqual(r["approx"]["stage_layers"], [29, 11, 8])
         self.assertEqual(r["approx"]["slots"], 32)
         json.dumps(res)
@@ -496,7 +496,7 @@ class TestDualSharePhase(unittest.TestCase):
         self.assertEqual(list(inside), ["state"])                                        # Mamba/GDN-Zustand ist P-eigen
         fx = next(x for x in b["segments"] if x["name"] == "fixed")
         self.assertEqual((fx["mib"], fx.get("ausserhalb_budget")), (2500.0, True))
-        self.assertEqual(fx["herkunft"], "Input (user/profile)")
+        self.assertEqual(fx["source"], "Input (user/profile)")
         self.assertIn("launcher.py:22713", fx["detail"])
         self.assertEqual(b["outside_budget_mib"], 2500.0)
         self.assertEqual(b["available_mib"], b["total_mib"] - 2500.0)
@@ -506,7 +506,7 @@ class TestDualSharePhase(unittest.TestCase):
         del a["--dual-p-overhead-mib"]
         fx = next(x for x in dual(args=a)["phases"]["P"]["bars"][0]["segments"] if x["name"] == "fixed")
         self.assertEqual(fx["mib"], 1500.0)
-        self.assertEqual(fx["herkunft"], "Assumption of this calculation")
+        self.assertEqual(fx["source"], "Assumption of this calculation")
         self.assertIn("launcher default", fx["detail"])
 
     def test_without_unified_kv_the_kv_still_counts_against_the_p_budget(self):
@@ -614,7 +614,7 @@ class TestDualShareDPhase(unittest.TestCase):
         pa["D"] = {"--rank-gpu-memory-mib": "30000,18000,18000"}
         r = dual(pa=pa)
         self.assertEqual([b["budget_mib"] for b in r["phases"]["D"]["bars"]], [20304, 10848, 10712])
-        self.assertTrue(any(x["was"] == "budget_mib" and "ignored" in x["herkunft"] for x in r["phases"]["D"]["inputs"]))
+        self.assertTrue(any(x["was"] == "budget_mib" and "ignored" in x["source"] for x in r["phases"]["D"]["inputs"]))
 
     def test_without_the_p_group_budget_the_d_budget_is_an_upper_bound_not_a_number_pretending_to_be_the_plan(self):
         d = dual(pa={})["phases"]["D"]["bars"]
@@ -631,7 +631,7 @@ class TestDualShareDPhase(unittest.TestCase):
         del a["--dual-p-overhead-mib"]
         b = dual(args=a)["phases"]["D"]["bars"][0]
         self.assertEqual(seg(b, "fixed")["mib"], 6610 + 1500)
-        self.assertEqual(seg(b, "fixed")["herkunft"], "Approximation (not the solver)")
+        self.assertEqual(seg(b, "fixed")["source"], "Approximation (not the solver)")
         self.assertIn("launcher default", seg(b, "fixed")["detail"])
 
     def test_the_hint_names_the_d_side(self):

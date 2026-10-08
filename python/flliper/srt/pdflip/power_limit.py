@@ -1,7 +1,7 @@
 """The power limit as a calibration field (27B line, release table row 27, 26.09.).
 
 User 24.09. ~18:55Z (verbatim): "die geschwindigkeiten der karten ist noch im
-powerlimit bei 400 und 230 deswegen muss der schnitt aufjedenfall anpassbar
+powerlimit bei 400 und 230 deswegen muss der cut aufjedenfall anpassbar
 sein, da ich spaeter das powerlimit ggf. erhoehen werde". Measured the same
 minute and again 26.09. (nvidia-smi power.limit): 5090 400 W (max 600),
 3080 230 W (max 320) each. The user also said the finding "more layers on the

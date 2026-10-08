@@ -12,14 +12,14 @@ and then calls :func:`apply_dual`, which owns what is Dual-specific:
   P budget is a MiB less for D.  The rule is a SHIFT from the profile's own calibration (the "dual1h method" of
   ``profiles/27b-nvfp4-dual1h.env``): ``budget = model terms(new layout) + residual`` where the residual is what the profile's own
   budget holds beyond the same model terms at the profile's layout (graphs, activations, slack: not derivable, only measured).
-  Where a card has no twin class in the profile the residual is 0 and the value is ``unbelegt``.
+  Where a card has no twin class in the profile the residual is 0 and the value is ``unverified``.
 * **P layer cut** (``--pp-stage-ratio`` / ``--pp-attn-stage-ratio``): carried, or searched against the KV obligation (below).
 * **KV obligation (Pflichtwert of the Dual form, plan 4c)**: P must carry ``kv_tokens`` (default 262144) of prefill context:
   ``--max-kv-per-request = kv_tokens`` (P-COVERS-D-SESSION), ``--dual-p-kv-max-tokens = round_up(kv_tokens + 1 page, 4096)`` (the
   level ``dual_p_kv_stage.group_grant`` asks), and per card the shared pool must hold ``FA layers of the stage x cell x level``.
   The pool floor of the cut solver is NOT a flag here: the launcher derives ``cap + chunk`` itself (``launcher.py`` PP-CUT POOL
   FLOOR RULE, p_bs=1) and a typed ``--pp-solve-pool-floor 262144`` would LOWER it below ``262144 + chunk`` (the 27B seat's own
-  note, ``done/dual-schnitt-262k-1006.md`` section 4).  The pool per card is calibrated by ONE measured boot (``POOL_REF``): it is
+  note, ``done/dual-cut-262k-1006.md`` section 4).  The pool per card is calibrated by ONE measured boot (``POOL_REF``): it is
   computed where the live cards are that boot's classes and N, else "nicht gerechnet".
 * **Dual fit: planner calculation, not hw_fit.**  ``hw_fit`` does not model Dual (``hw_fit.py`` prints "Dual ... NOT modelled").  The
   coupling "P budget + overhead + D rest + D weights incl. draft + D Mamba pool <= card" is computed here, per card, from the model terms and the
@@ -29,12 +29,12 @@ Two modes (``dual["modus"]``):
 
 * ``profil``  the live inventory IS the profile's inventory and no goal asks for a rule: every value of the profile is CARRIED
   byte for byte (plan 1.3 A1, diff 0).  The KV obligation is then only JUDGED against those values.
-* ``regel``   another inventory, ``ziele["force_rules"]``, a ``ziele["kv_tokens"]`` other than the default 262144, or ``ziele["dual_cut"]``: the
+* ``regel``   another inventory, ``goals["force_rules"]``, a ``goals["kv_tokens"]`` other than the default 262144, or ``goals["dual_cut"]``: the
               Dual values are derived.
 
 Goals read here (all optional): ``kv_tokens`` (obligation), ``dual_cut`` (pin the P cut: the budgets, the pool and the obligation follow
 from it), ``dual_p_boot_tokens`` (KV tokens each P stage contributes at boot; the
-reference boot's 95771 by default, ``unbelegt`` elsewhere), ``dual_pool_reserve_mib`` (margin the cut search keeps per card, default 0 =
+reference boot's 95771 by default, ``unverified`` elsewhere), ``dual_pool_reserve_mib`` (margin the cut search keeps per card, default 0 =
 D at rest).  STDLIB ONLY at module level.
 """
 
@@ -73,11 +73,11 @@ D_WEIGHTS_K0_MEASURED_MIB = 12308
 POOL_REF: Dict[str, Any] = {
     "classes": ("RTX5090", "RTX3080", "RTX3080"), "fmt": "nvfp4", "n_layers": 64,
     "cut": (45, 10, 9), "pool_mib": (3178, 6112, 5840), "slots": 8, "overhead_mib": 2500, "boot_tokens": 95771,
-    "quelle": "Boot b9p 05.10. LEDGER-PHYS (deskq/done/1959-dual-p-262k.md section A; dual-schnitt-262k-1006.md section 2)",
+    "quelle": "Boot b9p 05.10. LEDGER-PHYS (deskq/done/1959-dual-p-262k.md section A; dual-cut-262k-1006.md section 2)",
 }
 
 #: group P's own state words used in the records (shared with ``propose``)
-VORGESCHLAGEN, UNBELEGT = R.VORGESCHLAGEN, R.UNBELEGT
+PROPOSED, UNVERIFIED = R.PROPOSED, R.UNVERIFIED
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +144,7 @@ def kv_payload_bytes(model: Mapping[str, Any], fp: Any, kv_dtype: str) -> Tuple[
 def d_shares(fmt: str, totals: Sequence[float], reshard_wake: bool) -> Tuple[List[float], str]:
     """D's weight share per card (ONE vector for every term of a card: P-private weights, D's weights, D's Mamba pool): the installed
     vector ``INSTALLED_D_BASE`` when the profile reshards (``--d-reshard`` armed, D boots at RC9_BASE, three ranks), else proportional to the
-    card sizes (the capacity-first rule; the launcher solves the real vector by ``--d-tp-objective``: planer assumption, unbelegt)."""
+    card sizes (the capacity-first rule; the launcher solves the real vector by ``--d-tp-objective``: planer assumption, unverified)."""
     n = len(totals)
     if reshard_wake and n == len(INSTALLED_D_BASE):
         tot = float(sum(INSTALLED_D_BASE))
@@ -200,13 +200,13 @@ def compositions(total: int, parts: int):
 def _drop(rec: Any, labels: Sequence[str]) -> None:
     ls = set(labels)
     rec.values[:] = [v for v in rec.values if v["key"] not in ls]
-    rec.unbelegt[:] = [u for u in rec.unbelegt if u.split(": ", 1)[0] not in ls]
+    rec.unverified[:] = [u for u in rec.unverified if u.split(": ", 1)[0] not in ls]
 
 
-def _record(rec: Any, label: str, *, group: str, old: Optional[str], new: Optional[str], state: str, herkunft: str, grund: str,
+def _record(rec: Any, label: str, *, group: str, old: Optional[str], new: Optional[str], state: str, source: str, reason: str,
             in_argv: bool = True, policy: str = "dual") -> None:
     _drop(rec, [label])
-    rec.add(label, group=group, old=old, new=new, state=state, herkunft=herkunft, grund=grund, in_argv=in_argv, policy=policy)
+    rec.add(label, group=group, old=old, new=new, state=state, source=source, reason=reason, in_argv=in_argv, policy=policy)
 
 
 # ---------------------------------------------------------------------------
@@ -230,12 +230,12 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
     regel = (not same_inv) or bool(z.get("force_rules")) or explicit or bool(z.get("dual_cut"))
     modus = "regel" if regel else "profil"
     annahmen: List[str] = []
-    unb = rec.unbelegt
+    unb = rec.unverified
 
     # the Flip-host arithmetic of the common machinery (draft solo on rank 0, D context fallback) does not describe the Dual: its own
     # rule below replaces it
-    rec.unbelegt[:] = [u for u in rec.unbelegt if not u.startswith("D context per card:")]
-    rec.hinweise[:] = [h for h in rec.hinweise if not h.startswith("Draft: ")]
+    rec.unverified[:] = [u for u in rec.unverified if not u.startswith("D context per card:")]
+    rec.notes[:] = [h for h in rec.notes if not h.startswith("Draft: ")]
 
     # --- is the basis a Dual profile? ----------------------------------------------------------------------------------------
     if "--dual-share" not in la.t and "--dual-layout" not in la.t:
@@ -246,9 +246,9 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
                 la.t.append(flag)
             else:
                 la.set_flag(flag, val)
-            _record(rec, flag, group="-", old=None, new=val or "", state=VORGESCHLAGEN, herkunft="Form dual (the base profile is no dual profile)",
-                    grund=why, policy="dual_form")
-        rec.hinweise.append("The base profile %s is no dual profile: the planner adds only the obligatory flags of the form; MPS, priority, sleep and controls of the dual profile are missing and not invented" % bname)
+            _record(rec, flag, group="-", old=None, new=val or "", state=PROPOSED, source="Form dual (the base profile is no dual profile)",
+                    reason=why, policy="dual_form")
+        rec.notes.append("The base profile %s is no dual profile: the planner adds only the obligatory flags of the form; MPS, priority, sleep and controls of the dual profile are missing and not invented" % bname)
 
     # --- the inputs of the model ------------------------------------------------------------------------------------------------
     cut_slot = ("flag", "-", "--pp-stage-ratio") if la0.get_flag("--pp-stage-ratio") is not None else ("extra", "p", "--pp-stage-ratio")
@@ -353,14 +353,14 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
     if regel:
         cut_new = [int(x) for x in layers]
         origin_cut = "Rule: layer cut proportional to the GEMM rate (flip rule of the form), dual obligation per card in the verdict"
-        state_cut = UNBELEGT if str(rate_src[0]).startswith(("Datenblatt", "unbelegt", "datasheet", "unverified")) else VORGESCHLAGEN
+        state_cut = UNVERIFIED if str(rate_src[0]).startswith(("Datasheet", "unverified", "datasheet", "unverified")) else PROPOSED
         pin = z.get("dual_cut")
         if pin:
             pv = _ints(pin) if not isinstance(pin, (list, tuple)) else [int(x) for x in pin]
             if not pv or len(pv) != n or sum(pv) != fp.n_layers or min(pv) < 1:
                 raise _P.ProposeError("dual_cut %r: %d stages of at least one layer summing to %d needed" % (pin, n, fp.n_layers))
             cut_new = list(pv)
-            origin_cut, state_cut = "Goal dual_cut: the dual cut set by the user", VORGESCHLAGEN
+            origin_cut, state_cut = "Goal dual_cut: the dual cut set by the user", PROPOSED
             search_note = "Cut set by the user (goal dual_cut); P budgets, pool and obligation follow from it"
         elif pool_ref_ok and anchored_tokens:
             best = None
@@ -382,7 +382,7 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
                 cut_new = list(best[1])
                 search_note = ("Cut searched: the fastest (smallest stage time by GEMM rate) at which the pool of each card carries level %d (smallest rest %.0f MiB, reserve %.0f MiB)" % (lvl, best[2], reserve_mib))
                 origin_cut = "Rule dual: fastest cut whose pool per card carries the KV obligation (calibration: reference boot b9p)"
-                state_cut = UNBELEGT
+                state_cut = UNVERIFIED
             else:
                 search_note = ("no cut carries level %d on all three cards (reserve %.0f MiB): the seed by GEMM rate stays, the verdict names the shortfall" % (lvl, reserve_mib))
         elif pool_ref_ok:
@@ -390,7 +390,7 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
         else:
             search_note = ("Cut search is skipped: the pool per card is calibrated only for the cards and the model of the reference boot (%s) -- seed by GEMM rate" % ",".join(POOL_REF["classes"]))
         attn_new = R.attn_counts(fp.layer_families, cut_new)
-        rec.hinweise.append("Dual cut: " + search_note)
+        rec.notes.append("Dual cut: " + search_note)
         tn = terms(cut_new, sh_new, slots)
         bud_new = []
         unb_card = []
@@ -404,16 +404,16 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
         set_(la, *attn_slot, at)
         la.extra_set("p", "--rank-gpu-memory-mib", R.csv(bud_new))
         bud_txt = R.csv(bud_new)
-        cstate = state_cut if not unb_card else UNBELEGT
+        cstate = state_cut if not unb_card else UNVERIFIED
         _drop(rec, ["--pp-stage-ratio (Seed)"])
-        _record(rec, slot_label(*cut_slot), group=cut_slot[1], old=old_c, new=ct, state=cstate, herkunft=origin_cut, grund=search_note,
+        _record(rec, slot_label(*cut_slot), group=cut_slot[1], old=old_c, new=ct, state=cstate, source=origin_cut, reason=search_note,
                 policy="dual_cut")
         _record(rec, slot_label(*attn_slot), group=attn_slot[1], old=old_a, new=at, state=cstate,
-                herkunft="Rule: full-attention layers per stage from the layer cut", grund="exactly from the layer families of the model profile",
+                source="Rule: full-attention layers per stage from the layer cut", reason="exactly from the layer families of the model profile",
                 policy="dual_cut_attn")
-        _record(rec, "--extra-p --rank-gpu-memory-mib", group="p", old=bud_old, new=bud_txt, state=UNBELEGT,
-                herkunft="Rule dual (shift calculation): model terms at the new cut + calibration residue of profile %s" % bname,
-                grund="P budget per card = private weights of the stage + Mamba slots + boot KV (%d tokens) + calibration residue (graphs, activation, margin)%s; D is sized from the rest; unverified on the hardware (planner calculation)" % (
+        _record(rec, "--extra-p --rank-gpu-memory-mib", group="p", old=bud_old, new=bud_txt, state=UNVERIFIED,
+                source="Rule dual (shift calculation): model terms at the new cut + calibration residue of profile %s" % bname,
+                reason="P budget per card = private weights of the stage + Mamba slots + boot KV (%d tokens) + calibration residue (graphs, activation, margin)%s; D is sized from the rest; unverified on the hardware (planner calculation)" % (
                           boot_tokens, "" if not unb_card else " [card(s) %s without a twin class in the profile: calibration residue 0]" % ",".join(map(str, unb_card))),
                 policy="dual_budget")
         for k in unb_card:
@@ -429,15 +429,15 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
     if regel:
         if cap_old != cap_new:
             la.set_flag("--max-kv-per-request", str(cap_new))
-        _record(rec, "--max-kv-per-request", group="-", old=None if cap_old is None else str(cap_old), new=str(cap_new), state=VORGESCHLAGEN,
-                herkunft="Obligation of the dual form: KV obligation %d tokens (goal kv_tokens)" % kv_tokens,
-                grund="P-COVERS-D-SESSION: the D session (--max-kv-per-request) must not exceed P's cap; P carries %d tokens of prefill context" % kv_tokens,
-                policy="dual_pflicht")
+        _record(rec, "--max-kv-per-request", group="-", old=None if cap_old is None else str(cap_old), new=str(cap_new), state=PROPOSED,
+                source="Obligation of the dual form: KV obligation %d tokens (goal kv_tokens)" % kv_tokens,
+                reason="P-COVERS-D-SESSION: the D session (--max-kv-per-request) must not exceed P's cap; P carries %d tokens of prefill context" % kv_tokens,
+                policy="dual_required")
         if top_old != top_new:
             la.set_flag("--dual-p-kv-max-tokens", str(top_new))
-        _record(rec, "--dual-p-kv-max-tokens", group="-", old=None if top_old is None else str(top_old), new=str(top_new), state=VORGESCHLAGEN,
-                herkunft="Obligation of the dual form: level round_up(%d + %d side, %d)" % (kv_tokens, PAGE_TOKENS, STEP_TOKENS),
-                grund="virtual size of the P pool = largest stage a grant can request (dual_p_kv_stage.group_grant: want = min(top, round_up(tokens, step)))", policy="dual_pflicht")
+        _record(rec, "--dual-p-kv-max-tokens", group="-", old=None if top_old is None else str(top_old), new=str(top_new), state=PROPOSED,
+                source="Obligation of the dual form: level round_up(%d + %d side, %d)" % (kv_tokens, PAGE_TOKENS, STEP_TOKENS),
+                reason="virtual size of the P pool = largest stage a grant can request (dual_p_kv_stage.group_grant: want = min(top, round_up(tokens, step)))", policy="dual_required")
         cap_cur, top_cur = cap_new, top_new
     else:
         cap_cur, top_cur = cap_old, top_old
@@ -445,37 +445,37 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
                               ("--dual-p-kv-max-tokens", top_old, "virtual size of the P pool: the largest stage of a grant")):
             if old is not None:
                 st, hk, gr = carried()
-                _record(rec, lab, group="-", old=str(old), new=str(old), state=st, herkunft=hk, grund=why + "; " + gr, policy="dual_pflicht")
+                _record(rec, lab, group="-", old=str(old), new=str(old), state=st, source=hk, reason=why + "; " + gr, policy="dual_required")
     # scalars that no hardware decides: carried with their provenance
     for lab, old, why in (("--dual-p-overhead-mib", ovh_old, "what P holds per card outside its budget (context, allocator, workspaces); D is sized from budget + overhead; measured only on the 5090 with 1024 chunks"),
                           ("--dual-d-kv-max-tokens", dkv_old, "virtual size of the D pool (global)")):
         if old is not None:
             st, hk, gr = carried()
-            _record(rec, lab, group="-", old=str(old), new=str(old), state=st, herkunft=hk, grund=why + "; " + gr, policy="dual_knob")
+            _record(rec, lab, group="-", old=str(old), new=str(old), state=st, source=hk, reason=why + "; " + gr, policy="dual_knob")
     if ovh_old is None:
-        rec.hinweise.append("--dual-p-overhead-mib is missing in the profile: the launcher default 1500 applies (meant for MPS, profile 27b-nvfp4-dual: 2500 measured)")
+        rec.notes.append("--dual-p-overhead-mib is missing in the profile: the launcher default 1500 applies (meant for MPS, profile 27b-nvfp4-dual: 2500 measured)")
     # the Dual regulators and switches of the profile (names read from pdflip/dual_green.py and dual_share.py), shown, not decided
     for lab, key in (("--dual-priority", "--dual-priority"), ("--dual-share-actuators", "--dual-share-actuators"),
                      ("--dual-green-ladder", "--dual-green-ladder"), ("--dual-p-sm-pct", "--dual-p-sm-pct"), ("--dual-p-duty", "--dual-p-duty")):
         old = la0.get_flag(key)
         if old is not None:
             st, hk, gr = carried()
-            _record(rec, lab, group="-", old=old, new=old, state=st, herkunft=hk, grund="Control of the dual form (no card value); " + gr, policy="dual_knob")
+            _record(rec, lab, group="-", old=old, new=old, state=st, source=hk, reason="Control of the dual form (no card value); " + gr, policy="dual_knob")
     for name in ("FLLIPER_PDFLIP_DUAL_SHARE_GREEN_TABLE", "FLLIPER_PDFLIP_DUAL_SHARE_STARVE_AGE_S", "FLLIPER_PDFLIP_DUAL_SHARE_STARVE_MAX_RUNG",
                  "FLLIPER_PDFLIP_DUAL_GRANT_RETRY_MS"):
         if name in la0.env:
             st, hk, gr = carried()
-            _record(rec, "env " + name, group="-", old=la0.env[name], new=la0.env[name], state=st, herkunft=hk,
-                    grund="Environment variable of the dual form (name from pdflip/dual_green.py / dual_share.py / dual_p_kv_stage.py); " + gr, policy="dual_env")
+            _record(rec, "env " + name, group="-", old=la0.env[name], new=la0.env[name], state=st, source=hk,
+                    reason="Environment variable of the dual form (name from pdflip/dual_green.py / dual_share.py / dual_p_kv_stage.py); " + gr, policy="dual_env")
     # draft: D shards it over all cards (it is part of D's weights); P holds none in the Dual (it never flips)
     dk_old = la0.get_flag("--draft-kv-on-p")
     if regel and dk_old != "off":
         la.set_flag("--draft-kv-on-p", "off")
-        _record(rec, "--draft-kv-on-p", group="-", old=dk_old, new="off", state=VORGESCHLAGEN, herkunft="Rule dual: the draft runs in D, P holds none",
-                grund="the draft on P exists only for the flip (cold bytes); the dual never flips: saves weights and KV cell on the last stage",
+        _record(rec, "--draft-kv-on-p", group="-", old=dk_old, new="off", state=PROPOSED, source="Rule dual: the draft runs in D, P holds none",
+                reason="the draft on P exists only for the flip (cold bytes); the dual never flips: saves weights and KV cell on the last stage",
                 policy="dual_draft")
     elif dk_old is not None and dk_old != "off":
-        rec.hinweise.append("--draft-kv-on-p %s in the dual profile: the draft on P is meant only for the flip; the dual never flips" % dk_old)
+        rec.notes.append("--draft-kv-on-p %s in the dual profile: the draft on P is meant only for the flip; the dual never flips" % dk_old)
     # the pool floor in effect (the launcher derives it; see the module docstring)
     chunk_v = chunk if chunk is not None else 0
     floor_now = ((cap_cur or 0) + chunk_v) if (p_bs == 1 and la.get_flag("--pp-solve-pool-floor") is None) else None
@@ -484,8 +484,8 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
                   "%d = %s + %d" % (floor_now, cap_cur, chunk_v) if floor_now is not None else "set by the profile or not derivable",
                   floor_need, kv_tokens, chunk_v, kv_tokens))
     _record(rec, "--pp-solve-pool-floor", group="-", old=la.get_flag("--pp-solve-pool-floor"), new=la.get_flag("--pp-solve-pool-floor"),
-            state=VORGESCHLAGEN, herkunft="Obligatory value of the dual form (plan 4c): KV obligation %d tokens" % kv_tokens, grund=pf_txt,
-            in_argv=la.get_flag("--pp-solve-pool-floor") is not None, policy="dual_pflicht")
+            state=PROPOSED, source="Obligatory value of the dual form (plan 4c): KV obligation %d tokens" % kv_tokens, reason=pf_txt,
+            in_argv=la.get_flag("--pp-solve-pool-floor") is not None, policy="dual_required")
 
     # --- Dual-Passung: P budget + overhead + D rest + D weights (incl. draft) <= card ---------------------------------------------
     cur_slots = slots
@@ -499,7 +499,7 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
     pool_cur = pool_of(cut_cur, sh_cur, cur_slots, ovh) if tc is not None else None
     need_cur = need_of(cut_cur) if tc is not None else None
     for k in range(n):
-        row: Dict[str, Any] = {"ordinal": k, "name": cards[k].get("name"), "klasse": live_cls[k], "karte_mib": int(totals[k])}
+        row: Dict[str, Any] = {"ordinal": k, "name": cards[k].get("name"), "class": live_cls[k], "card_mib": int(totals[k])}
         p = bud_cur[k] if bud_cur and k < len(bud_cur) else None
         row["p_budget_mib"] = p
         row["overhead_mib"] = ovh
@@ -508,24 +508,24 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
             row["p_privat_mib"] = round(tc[k]["priv"], 1)
             row["p_mamba_mib"] = round(tc[k]["mam"], 1)
             row["stufe_schichten"] = cut_cur[k]
-            row["stufe_attn"] = int(tc[k]["fa"])
-            row["d_gewichte_mib"] = round(td[k]["d_total"], 1)
+            row["stage_attn"] = int(tc[k]["fa"])
+            row["d_weights_mib"] = round(td[k]["d_total"], 1)
             row["d_draft_mib"] = round(td[k]["d_draft"], 1)
             row["d_mamba_mib"] = round(d_mam[k], 1)
         if p is not None:
             row["d_budget_mib"] = int(totals[k] - p - ovh - ruhe[k])
-            row["summe_mib"] = round(p + ovh + ruhe[k] + (row.get("d_gewichte_mib") or 0.0) + d_mam[k], 1)
-            row["rest_mib"] = round(totals[k] - row["summe_mib"], 1)
+            row["sum_mib"] = round(p + ovh + ruhe[k] + (row.get("d_weights_mib") or 0.0) + d_mam[k], 1)
+            row["rest_mib"] = round(totals[k] - row["sum_mib"], 1)
             row["ok"] = row["rest_mib"] >= 0
             if tc is not None and p < tc[k]["priv"] + tc[k]["mam"]:
                 row["ok"] = False
-                row["grund"] = "the P budget (%d MiB) does not carry the private weights and Mamba slots of the stage (%.0f MiB)" % (
+                row["reason"] = "the P budget (%d MiB) does not carry the private weights and Mamba slots of the stage (%.0f MiB)" % (
                     p, tc[k]["priv"] + tc[k]["mam"])
             if not row["ok"]:
                 level = "nein"
                 if not first:
-                    first = row.get("grund") or ("Card %d (%s): P budget %d + overhead %d + rest %.0f + D weights %.0f + D Mamba %.0f = %.0f MiB > card %d MiB" % (
-                        k, live_cls[k], p, ovh, ruhe[k], row.get("d_gewichte_mib") or 0.0, d_mam[k], row["summe_mib"], totals[k]))
+                    first = row.get("reason") or ("Card %d (%s): P budget %d + overhead %d + rest %.0f + D weights %.0f + D Mamba %.0f = %.0f MiB > card %d MiB" % (
+                        k, live_cls[k], p, ovh, ruhe[k], row.get("d_weights_mib") or 0.0, d_mam[k], row["sum_mib"], totals[k]))
         if pool_cur is not None:
             row["pool_mib"] = round(pool_cur[k], 1)
         if need_cur is not None:
@@ -535,26 +535,26 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
         out_cards.append(row)
 
     # --- the obligation: verdict per card ----------------------------------------------------------------------------------------
-    pf_grund: List[str] = []
+    pf_reason: List[str] = []
     if top_cur is None or top_cur < lvl:
-        pf_grund.append("--dual-p-kv-max-tokens %s < level %d: a grant for %d tokens is never approved" % (top_cur, lvl, kv_tokens))
+        pf_reason.append("--dual-p-kv-max-tokens %s < level %d: a grant for %d tokens is never approved" % (top_cur, lvl, kv_tokens))
     if cap_cur is None or cap_cur < kv_tokens:
-        pf_grund.append("--max-kv-per-request %s < %d: the cap of the request is below the KV obligation" % (cap_cur, kv_tokens))
+        pf_reason.append("--max-kv-per-request %s < %d: the cap of the request is below the KV obligation" % (cap_cur, kv_tokens))
     if floor_now is not None and floor_now < floor_need:
-        pf_grund.append("Pool floor %d < %d (cap + chunk of the obligation)" % (floor_now, floor_need))
+        pf_reason.append("Pool floor %d < %d (cap + chunk of the obligation)" % (floor_now, floor_need))
     pool_known = pool_cur is not None and need_cur is not None
     if pool_known:
         for k, r in enumerate(out_cards):
             if r["pool_rest_mib"] < 0:
-                pf_grund.append("Card %d (%s): pool %.0f MiB < need %.0f MiB (shortfall %.0f MiB, %d attention layers of the stage)" % (
-                    k, live_cls[k], r["pool_mib"], r["bedarf_mib"], -r["pool_rest_mib"], int(out_cards[k].get("stufe_attn") or 0)))
-        erfuellt: Optional[bool] = not pf_grund
+                pf_reason.append("Card %d (%s): pool %.0f MiB < need %.0f MiB (shortfall %.0f MiB, %d attention layers of the stage)" % (
+                    k, live_cls[k], r["pool_mib"], r["bedarf_mib"], -r["pool_rest_mib"], int(out_cards[k].get("stage_attn") or 0)))
+        erfuellt: Optional[bool] = not pf_reason
     else:
-        erfuellt = False if pf_grund else None
+        erfuellt = False if pf_reason else None
     if not pool_known:
-        pf_grund.append("Pool per card not calculated: the calibration (boot b9p) applies only to %s and %s" % (",".join(POOL_REF["classes"]), POOL_REF["fmt"]))
-    pflicht = {"kv_tokens": int(kv_tokens), "level_tokens": lvl, "step": STEP_TOKENS, "top": top_cur, "cap": cap_cur, "pool_floor_in_kraft": floor_now,
-               "pool_floor_pflicht": floor_need, "erfuellt": erfuellt, "pool_geeicht": bool(pool_known), "grund": pf_grund,
+        pf_reason.append("Pool per card not calculated: the calibration (boot b9p) applies only to %s and %s" % (",".join(POOL_REF["classes"]), POOL_REF["fmt"]))
+    required = {"kv_tokens": int(kv_tokens), "level_tokens": lvl, "step": STEP_TOKENS, "top": top_cur, "cap": cap_cur, "pool_floor_in_kraft": floor_now,
+               "pool_floor_pflicht": floor_need, "erfuellt": erfuellt, "pool_geeicht": bool(pool_known), "reason": pf_reason,
                "eichung": POOL_REF["quelle"]}
 
     # --- verdicts -------------------------------------------------------------------------------------------------------------------
@@ -565,26 +565,26 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
         first = "no P budget per card in the proposal: the fit is not calculated"
     txt = "%s: %s%s%s" % (LABEL, level, (" (smallest rest %.0f MiB)" % rest_min) if rest_min is not None and level != "ungeprueft" else "",
                           ("; " + first) if first else "")
-    rank_verdicts.append({"code": "DUAL-PASSUNG", "stufe": level, "text": txt, "etikett": LABEL, "rest_mib": rest_min})
+    rank_verdicts.append({"code": "DUAL-PASSUNG", "stage": level, "text": txt, "etikett": LABEL, "rest_mib": rest_min})
     if erfuellt is True:
         ptxt, pstufe = "KV obligation %d tokens (level %d): met on all cards" % (kv_tokens, lvl), "ja"
     elif erfuellt is False:
-        ptxt, pstufe = "KV obligation %d tokens (level %d): NOT met: %s" % (kv_tokens, lvl, "; ".join(pf_grund)), "nein"
+        ptxt, pstufe = "KV obligation %d tokens (level %d): NOT met: %s" % (kv_tokens, lvl, "; ".join(pf_reason)), "nein"
     else:
-        ptxt, pstufe = "KV obligation %d tokens (level %d): not calculated: %s" % (kv_tokens, lvl, "; ".join(pf_grund)), "ungeprueft"
-    rank_verdicts.append({"code": "DUAL-PFLICHT", "stufe": pstufe, "text": "%s: %s" % (LABEL, ptxt), "etikett": LABEL, "rest_mib": None})
+        ptxt, pstufe = "KV obligation %d tokens (level %d): not calculated: %s" % (kv_tokens, lvl, "; ".join(pf_reason)), "ungeprueft"
+    rank_verdicts.append({"code": "DUAL-PFLICHT", "stage": pstufe, "text": "%s: %s" % (LABEL, ptxt), "etikett": LABEL, "rest_mib": None})
     if erfuellt is False:
-        rec.hinweise.append("Dual: " + ptxt)
+        rec.notes.append("Dual: " + ptxt)
     for a in annahmen:
         if a.startswith(("keine Eichung", "no calibration")) or "Zwilling" in a or "twin" in a:
             unb.append("Dual calibration residue: " + a)
     if regel:
-        rec.hinweise.append("Dual: the launcher dry run may report W64 (PdFlipTpOperatingPointInfeasible) with these P budgets if the evidence directory holds no measured dual D log of this model with the same D weight vector (dual_w64.find_dual_d_measurement): then the more pessimistic model of the launcher applies (2304 MiB reserve per rank), not this calculation. The run says that, not the planner.")
+        rec.notes.append("Dual: the launcher dry run may report W64 (PdFlipTpOperatingPointInfeasible) with these P budgets if the evidence directory holds no measured dual D log of this model with the same D weight vector (dual_w64.find_dual_d_measurement): then the more pessimistic model of the launcher applies (2304 MiB reserve per rank), not this calculation. The run says that, not the planner.")
     if modus == "profil" and erfuellt is False:
-        rec.hinweise.append("Dual: the profile carries its values unchanged (diff 0); it does not meet the KV obligation. With the goal force_rules (or a kv_tokens goal other than %d) the planner derives cut, P budgets, cap and level by the rule." % _P.KV_TOKENS_DEFAULT)
+        rec.notes.append("Dual: the profile carries its values unchanged (diff 0); it does not meet the KV obligation. With the goal force_rules (or a kv_tokens goal other than %d) the planner derives cut, P budgets, cap and level by the rule." % _P.KV_TOKENS_DEFAULT)
     return {"schema": SCHEMA, "etikett": LABEL, "modus": modus, "kopplung": "P budget + overhead + D rest + D weights (with draft) + D Mamba <= card",
-            "karten": out_cards, "passung": {"stufe": level, "erste": first, "rest_min_mib": rest_min}, "pflicht": pflicht,
-            "regeln": {"schnitt": cut_cur, "attn": R.attn_counts(fp.layer_families, cut_cur) if tc is not None else None, "budgets": bud_cur,
+            "karten": out_cards, "fit": {"stage": level, "erste": first, "rest_min_mib": rest_min}, "required": required,
+            "regeln": {"cut": cut_cur, "attn": R.attn_counts(fp.layer_families, cut_cur) if tc is not None else None, "budgets": bud_cur,
                        "level": lvl, "boot_tokens": boot_tokens, "uebernommen": not regel, "suche": search_note},
             "draft": {"d": "shared by D across all cards (part of the D weights)", "p": "none (--draft-kv-on-p off)", "mib": round(float(fp.draft_mib), 1)},
             "annahmen": annahmen, "verdikte": rank_verdicts}

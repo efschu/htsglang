@@ -30,7 +30,7 @@ transport).
     {"v": 62.7, "src": "gemessen", "at": 1790000000.0, "probe": "card_probe-ab12.json"}
 
 with ``src`` one of ``gemessen`` (a kernel ran, ``at``/``probe`` name when and
-in which file), ``NVML`` (read from the driver, no GPU work), ``Datenblatt``
+in which file), ``NVML`` (read from the driver, no GPU work), ``Datasheet``
 (a nameplate figure computed from NVML facts), ``geschätzt`` (derived from
 another measurement, never a measurement itself: a mirrored pair direction)
 or ``nicht gemessen`` (``v`` is ``null`` and ``note`` says WHY).  A value
@@ -45,7 +45,7 @@ first call on a machine also WRITES it (``capture``): ``/var/lib/flliper/hardwar
 cards and reports a difference instead of overwriting it, ``capture(force=True)`` ("Neu erfassen") replaces it.  Where
 NVML says nothing (editor-only container without a GPU) the persisted file is the profile.  A card's SM count and
 nominal bandwidth are merged in from the data sheets (``datasheet``: ``pdflip/hw_sim.py`` for SM, the dashboard's card
-catalog for the bandwidth), always labelled "Datenblatt"; a measured SM count wins over the data sheet.
+catalog for the bandwidth), always labelled "Datasheet"; a measured SM count wins over the data sheet.
 
 **No rig constants.**  Card classes, order and count come from NVML and from
 ``pdflip.card_identity`` (loaded by path, so this file also runs inside the
@@ -110,7 +110,7 @@ SCHEMA = "flliper.hardware/1"
 
 SRC_MEASURED = "gemessen"
 SRC_NVML = "NVML"
-SRC_DATASHEET = "Datenblatt"
+SRC_DATASHEET = "Datasheet"
 SRC_ESTIMATED = "geschätzt"
 SRC_NONE = "nicht gemessen"
 SOURCES = (SRC_MEASURED, SRC_NVML, SRC_DATASHEET, SRC_ESTIMATED, SRC_NONE)
@@ -1134,7 +1134,7 @@ def validate(doc: dict) -> List[str]:
 #: ``capture`` states.  ``erst_erfasst`` = first start, written now; ``neu_erfasst`` = replaced on request;
 #: ``vorhanden`` = file and live cards agree; ``abweichend`` = they differ (file kept); ``nur_gespeichert`` = NVML says
 #: nothing, the file is the profile; ``keine_karten`` = nothing to persist; ``nicht_schreibbar`` = the write failed.
-CAPTURE_STATES = ("erst_erfasst", "neu_erfasst", "vorhanden", "abweichend", "nur_gespeichert", "keine_karten", "nicht_schreibbar")
+CAPTURE_STATES = ("erst_erfasst", "neu_erfasst", "vorhanden", "abweichend", "nur_gespeichert", "no_cards", "nicht_schreibbar")
 
 
 def persist_path(env: Optional[dict] = None) -> str:
@@ -1223,7 +1223,7 @@ def capture(
     "live", "drift", "error", "path"}`` where ``show`` is the document to display: the live one when it has cards, else
     the persisted one.  Rules: no file -> write the live profile (``erst_erfasst``); file and live agree ->
     ``vorhanden``; they differ -> ``abweichend`` and the file stays; ``force`` replaces the file when the live profile
-    has cards (an empty live view never overwrites a persisted one); no cards anywhere -> ``keine_karten``."""
+    has cards (an empty live view never overwrites a persisted one); no cards anywhere -> ``no_cards``."""
     live = live if live is not None else build(**build_kwargs)
     has_cards = bool(live.get("cards"))
     persisted, problem = load_profile(path)
@@ -1233,7 +1233,7 @@ def capture(
         res["error"] = f"gespeicherte Datei {problem}"
     if force or persisted is None:
         if not has_cards:
-            res.update(state="keine_karten", show=persisted or live,
+            res.update(state="no_cards", show=persisted or live,
                        error=(res["error"] + "; " if res["error"] else "") + "NVML reports no card: nothing saved, nothing overwritten")
             return res
         why = reason or ("Neu erfassen" if force else "erster Start")
@@ -1373,7 +1373,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     measured = None
     if args.measure:
         if not args.cards.strip():
-            print("--measure braucht --cards (NVML-Indizes)", file=sys.stderr)
+            print("--measure requires --cards (NVML-Indizes)", file=sys.stderr)
             return 2
         idx = [int(x) for x in args.cards.split(",") if x.strip()]
         cards, driver, issues = read_nvml()
@@ -1385,7 +1385,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             print(measured["stderr_tail"], file=sys.stderr)
     doc = build(cache_dir=args.cache_dir)
     if measured is not None:
-        doc["messung"] = {k: measured[k] for k in ("ok", "rc", "seconds", "nvml_indexes", "warnings")}
+        doc["measurement"] = {k: measured[k] for k in ("ok", "rc", "seconds", "nvml_indexes", "warnings")}
     print(json.dumps(doc, indent=1, ensure_ascii=False))
     return 0 if measured is None or measured["ok"] else 1
 

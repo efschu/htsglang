@@ -36,7 +36,7 @@ und torch geladen. Kein Import dieses Moduls beruehrt CUDA.
 
 Aufruf (Beispiel, 3080 = NVML 0, Buchung ~2 GiB, ~10 min):
 
-    CUDA_VISIBLE_DEVICES= PYTHONPATH=<baum>/python \\
+    CUDA_VISIBLE_DEVICES= PYTHONPATH=<tree>/python \\
       /spinning/htsglang-gpu/.venv/bin/python -m flliper.srt.pdflip.tools.qsa_rows_bench \\
       --card 0 --booking <id> --prefix 32768,81920 \\
       --cfgs table,32/8/2,32/4/2,64/8/2 --decodes exp2,bits,ptx \\

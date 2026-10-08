@@ -1,4 +1,4 @@
-"""#96: steht die globale Residenzmenge, braucht die Slot-Zahl KEINE Vektoren.
+"""#96: steht die globale Residenzmenge, requires die Slot-Zahl KEINE Vektoren.
 
 fnFL2w26 starb wie w24 -- D wollte 512 Slots, obwohl
 FLLIPER_MOE_EXPERT_STORE_RESIDENT_IDS gesetzt war und im --env-d ankam.
