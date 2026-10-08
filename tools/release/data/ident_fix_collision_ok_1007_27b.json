@@ -1,5 +1,5 @@
 {
- "_comment": "F0-D 08.10.2026, 27B line (base 86ff356d0d + F0-D source disambiguation): ident_fix.py collision pairs {path (as after step 1): [old word]} read one by one and exempted (ident_fix.py IDENT_FIX_COLLISION_OK_FILE). Basis of the review: scope analysis on the tree after step 1 (hazard check: no function binds/uses old+new, no call passes both keywords, no dict literal / same-base access carries both keys; .py), line reading (.sh, .md, .js/.html), key/value walk of catalog.json. The two pairs that DID meet (propose_single.py zustand/state: parameter `state` of _entry + keyword `state=`; propose_verdict.py hinweise/notes: local `hinweise` next to local `notes`) are listed too because the source was disambiguated BEFORE the run (commit 'F0-D pre-rename': _entry(state=) -> verdict_state, local hinweise -> hint_list). Notes per class: tools/release/data/ident_fix_collision_ok_1007_27b.notes.json.",
+ "_comment": "F0-D 08.10.2026, 27B line (base 86ff356d0d + F0-D source disambiguation): ident_fix.py collision pairs {path (as after step 1): [old word]} read one by one and exempted (ident_fix.py IDENT_FIX_COLLISION_OK_FILE). Basis of the review: scope analysis on the tree after step 1 (hazard check: no function binds/uses old+new, no call passes both keywords, no dict literal / same-base access carries both keys; .py), line reading (.sh, .md, .js/.html), key/value walk of catalog.json. The two pairs that DID meet (propose_single.py zustand/state: parameter `state` of _entry + keyword `state=`; propose_verdict.py hinweise/notes: local `hinweise` next to local `notes`) are listed too because the source was disambiguated BEFORE the run (commit 'F0-D pre-rename': _entry(state=) -> verdict_state, local hinweise -> hint_list). Notes per class: tools/release/data/ident_fix_collision_ok_1007_27b.notes.json. Added with kit data 5 (the six files unlocked in kit data 4 surfaced three more pairs): features.py wert/value (python, hazard check SAFE: the German `wert` is a key of the cur[m]/ist[m] cell records, `value` a parameter/locals/doc word), GLOSSARY_EN.md herkunft/source and zustand/state (backticked prose).",
  "docker/pdflip-release/test_rigdash_ctx_1995.sh": [
   "baum"
  ],
@@ -45,12 +45,19 @@
   "passung",
   "schnitt"
  ],
+ "tools/rig_dashboard/rigdash/GLOSSARY_EN.md": [
+  "herkunft",
+  "zustand"
+ ],
  "tools/rig_dashboard/rigdash/README.md": [
   "einzel",
   "grund",
   "hinweis",
   "orakel",
   "verdikt",
+  "wert"
+ ],
+ "tools/rig_dashboard/rigdash/features.py": [
   "wert"
  ],
  "tools/rig_dashboard/rigdash/features_update.py": [
