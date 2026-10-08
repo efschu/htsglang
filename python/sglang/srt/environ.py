@@ -727,6 +727,13 @@ class Envs:
     # 0 = off. y4b: two needless P legs (p_ms 7712 / 7460, flips included),
     # then the third refusal ended the client's stream with W50.
     SGLANG_WEG2_RVP_CAPACITY_PARK_S = EnvFloat(120.0)
+    # CAPPARK-FLIP-HOLD (08.10., NF dauer10081045 D->P flip epoch 4->5): while
+    # a flip park is open (park_running until the sleep / the awake re-queue)
+    # the #248h capacity re-queue does not run -- the capacity-parked requests
+    # ride the flip and the wake's hold read takes them up. On metal the
+    # re-queue ran three just-parked requests to their end while the front's
+    # D->P quiesce waited 28180 ms for D. Off = the re-queue inside the park.
+    SGLANG_WEG2_ENABLE_CAPPARK_FLIP_HOLD = EnvBool(True)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing
