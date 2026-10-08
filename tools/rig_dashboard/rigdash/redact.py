@@ -17,9 +17,13 @@ import posixpath
 import re
 from typing import List, Optional
 
+from . import names as N
+
 # a line matching this is dropped whole
-DROP_LINE = re.compile(r"ADMIN-KEY|admin-api-key|\.adminkey\b|auth=bearer|Authorization:|WEG2-GROUP-ENV|GITHUB_PAT|openrouter\.key",
-                       re.IGNORECASE)
+# F0-B: ``WEG2-GROUP-ENV`` (the whole group environment) is stamped as ``PDFLIP-GROUP-ENV`` by a renamed launcher; a reader that
+# only knew the old spelling would PUBLISH that line.  Both spellings, so the drop is the same in both generations.
+DROP_LINE = N.tolerant_compile(r"ADMIN-KEY|admin-api-key|\.adminkey\b|auth=bearer|Authorization:|WEG2-GROUP-ENV|GITHUB_PAT|openrouter\.key",
+                               re.IGNORECASE)
 # inline values that are cut out of a kept line
 _VALUE = re.compile(
     r"(?i)\b(api[_-]?key|admin[_-]?key|access[_-]?key|secret|password|passwd|bearer|token)(\s*[=:]\s*|\s+)"
@@ -38,7 +42,7 @@ def clean(text: str):
 
 
 # the door: a serialized answer must not contain any of these
-_DOOR = re.compile(r"ADMIN-KEY|admin-api-key|\.adminkey|auth=bearer|GITHUB_PAT|openrouter\.key|WEG2-GROUP-ENV", re.IGNORECASE)
+_DOOR = N.tolerant_compile(r"ADMIN-KEY|admin-api-key|\.adminkey|auth=bearer|GITHUB_PAT|openrouter\.key|WEG2-GROUP-ENV", re.IGNORECASE)
 
 
 def guard(body: str) -> str:
@@ -153,9 +157,13 @@ _FULLRUN = re.compile(r"[A-Za-z0-9_\-]{32,}\Z")
 # Read once from the source tree (``HWPROFIL_TREE`` / ``KARTENPLAN_TREE`` / the tree candidates of ``hwprofil``): every ``Weg2<Word>...`` identifier of
 # ``srt/weg2/*.py`` and ``srt/flip_*.py`` (the launcher prints some as text, ``Weg2TpOperatingPointInfeasible`` is no class) plus every ``class X``
 # of those files.  No tree found -> only the built-in names below (the ones the run report is known to quote), everything else is cut: the safe side.
+# F0-B: a renamed tree spells these ``PdFlip<Word>`` (``Weg2Flip<X>`` -> ``PdFlip<X>``, ``Weg2<X>`` -> ``PdFlip<X>``, rename tool rule), so the
+# built-in list carries both spellings and the tree scan reads either layout.
 _KNOWN_IDENT_BUILTIN = frozenset(("Weg2TpOperatingPointInfeasible", "Weg2XchgResidencyUnarmable", "Weg2XchgSemaphoreNotRearmed", "Weg2FlipPeerLegAborted",
-                                  "Weg2DualCompactBreach"))
-_IDENT_IN_SOURCE = re.compile(r"\bWeg2[A-Z][A-Za-z0-9]+\b|^class ([A-Z][A-Za-z0-9]+)", re.M)
+                                  "Weg2DualCompactBreach",
+                                  "PdFlipTpOperatingPointInfeasible", "PdFlipXchgResidencyUnarmable", "PdFlipXchgSemaphoreNotRearmed",
+                                  "PdFlipPeerLegAborted", "PdFlipDualCompactBreach"))
+_IDENT_IN_SOURCE = re.compile(r"\b(?:%s|%s)[A-Z][A-Za-z0-9]+\b|^class ([A-Z][A-Za-z0-9]+)" % N.CAMEL_TOKENS, re.M)
 _known_cache: Optional[frozenset] = None
 
 
@@ -171,7 +179,10 @@ def _tree_candidates() -> List[str]:
 
 def _scan_known_idents(tree: str) -> frozenset:
     names = set()
-    for sub, pat in (("sglang/srt/weg2", "*.py"), ("sglang/srt", "flip_*.py")):
+    subs = []
+    for pkg, sub in N.PKG_PAIRS:
+        subs += [(pkg + "/srt/" + sub, "*.py"), (pkg + "/srt", "flip_*.py")]
+    for sub, pat in subs:
         for f in glob.glob(os.path.join(tree, sub, pat)):
             try:
                 with open(f, encoding="utf-8", errors="replace") as fh:
@@ -188,7 +199,7 @@ def known_idents() -> frozenset:
     if _known_cache is not None:
         return _known_cache
     for t in _tree_candidates():
-        if os.path.isdir(os.path.join(t, "sglang", "srt", "weg2")):
+        if any(os.path.isdir(os.path.join(t, pkg, "srt", sub)) for pkg, sub in N.PKG_PAIRS):
             _known_cache = _KNOWN_IDENT_BUILTIN | _scan_known_idents(t)
             return _known_cache
     return _KNOWN_IDENT_BUILTIN

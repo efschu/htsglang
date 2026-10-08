@@ -20,6 +20,7 @@ import json
 import shlex
 from typing import Dict, List, Optional, Tuple
 
+from . import names as N
 from .features import last_boot
 
 MODELS = (("27B", "/spinning/docker-acceptance/27b/state"), ("NF", "/spinning/docker-acceptance/nf/state"))
@@ -101,7 +102,7 @@ def _pretty_json(v: Optional[str]) -> Optional[str]:
 
 def flag_group(flag: str) -> str:
     for name, pre in FLAG_GROUPS:
-        if flag.startswith(pre):
+        if flag.startswith(N.marker_variants(pre)):      # F0-B: ``--<old>-x`` and ``--<new>-x`` are one group
             return name
     return FLAG_REST
 

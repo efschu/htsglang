@@ -26,7 +26,10 @@ from __future__ import annotations
 import glob
 import json
 import os
+
 from typing import Dict, List, Optional
+
+from . import names as N
 
 RANKSTATS_SCHEMA = "weg2.rankstats/1"
 RANKSTATE_SCHEMAS = (1, 2)
@@ -158,7 +161,7 @@ def read_rank_files(dirs: List[str]) -> dict:
     for d in dirs:
         for p in sorted(glob.glob(os.path.join(d, "*.rankstats"))):
             rec = _load(p)
-            if rec and rec.get("schema") == RANKSTATS_SCHEMA:
+            if rec and N.schema_ok(rec.get("schema"), RANKSTATS_SCHEMA):
                 stats[os.path.basename(p)[: -len(".rankstats")]] = rec
         for p in sorted(glob.glob(os.path.join(d, "*.json"))):
             rec = _load(p)

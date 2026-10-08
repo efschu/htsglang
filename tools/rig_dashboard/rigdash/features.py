@@ -37,6 +37,7 @@ import threading
 import time
 from typing import Optional
 
+from . import names as N
 from . import redact
 
 DEFAULT_PATH = "/spinning/gpu-arb/docs/features.json"
@@ -333,6 +334,27 @@ def _flag_value(argv: list, name: str):
     return False, None
 
 
+def _env_lookup(env: dict, name: str):
+    """(present, value) of an env name in a launch env, over every spelling (F0-B: a renamed boot carries FLLIPER_*)."""
+    for v in N.env_variants(name):
+        if v in env:
+            return True, env[v]
+    return False, None
+
+
+def _flag_lookup(argv: list, name: str):
+    """(present, value) of a flag over both spellings of the subsystem part (``--weg2-x`` / ``--pdflip-x``)."""
+    for v in N.marker_variants(name):
+        present, value = _flag_value(argv, v)
+        if present:
+            return present, value
+    return False, None
+
+
+def _name_alt(variants) -> str:
+    return "(?:%s)" % "|".join(re.escape(v) for v in variants)
+
+
 def switch_state(sw: dict, st: Optional[dict], profile_text: Optional[str]) -> dict:
     """{state: an|aus|unbekannt, src, value} of one switch in the boot."""
     name = sw.get("name") or ""
@@ -349,9 +371,9 @@ def switch_state(sw: dict, st: Optional[dict], profile_text: Optional[str]) -> d
         for g, l in launches:
             if art == "env":
                 env = l.get("env") or {}
-                present, value = (name in env), env.get(name)
+                present, value = _env_lookup(env, name)
             else:
-                present, value = _flag_value([str(a) for a in l.get("argv") or []], name)
+                present, value = _flag_lookup([str(a) for a in l.get("argv") or []], name)
             if not present:
                 on = default_on
             elif art == "flag" and not value and an_wert in (None, ""):
@@ -367,12 +389,12 @@ def switch_state(sw: dict, st: Optional[dict], profile_text: Optional[str]) -> d
                                    for g, _, v in vals)}
     if profile_text is not None:
         if art == "env":
-            hits = re.findall(r"(?<![A-Za-z0-9_])%s=([^;\"'\s]*)" % re.escape(name), profile_text)
+            hits = re.findall(r"(?<![A-Za-z0-9_])%s=([^;\"'\s]*)" % _name_alt(N.env_variants(name)), profile_text)
             if hits:
                 v = hits[-1]
                 return {"state": "an" if _is_on(v, an_wert) else "aus", "src": "Profil (kein launch-Schnappschuss)", "value": v}
         else:
-            m = re.search(r"(?<![\w-])%s(?:[ =]([^\s'\"]+))?" % re.escape(name), profile_text)
+            m = re.search(r"(?<![\w-])%s(?:[ =]([^\s'\"]+))?" % _name_alt(N.marker_variants(name)), profile_text)
             if m:
                 v = m.group(1) or ""
                 on = _is_on(v, an_wert) if (an_wert not in (None, "")) else True

@@ -51,6 +51,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from . import activity, cacheacct, flipzeit, ipcstate
+from . import names as N
 
 NO_DATA_LABEL = "keine Daten (vor IPC-Aufzeichnung)"
 TIERS = (("p0", 1, 3 * 3600), ("p1", 10, 3 * 86400), ("p2", 60, 30 * 86400))
@@ -488,7 +489,7 @@ class Recorder:
 
     # --- host -------------------------------------------------------------
     HOST_CMD = ("head -1 /proc/stat; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; "
-                "for id in $(docker ps -q --no-trunc --filter name=htsglang); do "
+                "for id in $(docker ps -q --no-trunc %s); do " % N.docker_name_filters() +      # F0-B: containers of either product name
                 "echo cg $(cat /sys/fs/cgroup/system.slice/docker-$id.scope/memory.current 2>/dev/null); done")
 
     def sample_host(self, now: float) -> None:

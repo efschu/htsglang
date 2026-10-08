@@ -36,12 +36,19 @@ import threading
 import time
 from typing import Dict, List, Optional
 
+from . import names as N
+
 HOST_ROOT = "/spinning/subvol-999-disk-0"          # this machine's / as the host sees it
 DOCKER_DIR = "/spinning/gpu-arb/docker"
 HOST_ACCEPTANCE = DOCKER_DIR + "/host_acceptance.sh"
 PROFILES_DIR = DOCKER_DIR + "/profiles"
 CTX_GLOB = DOCKER_DIR + "/ctx/*/BUILD_INFO.json"
-RE_IMAGE = re.compile(r"^htsglang:(cu\d+)-weg2-(.+?)-27b-nf(-flat)?$")
+# F0-B: the August/RC images (``htsglang:cu130-weg2-<rel>-27b-nf[-flat]``, product and subsystem token renamed by the
+# mechanical rename, both spellings read) and the fLLiper flat images (``flliper:<version>-<cu>`` / ``flliper:<cu>-<sha10>``,
+# make_flat_ctx.sh TAG/TAG2: "no sglang/weg2/htsglang/27b-nf in a tag").
+RE_IMAGE = N.tolerant_compile(r"^%s:(cu\d+)-weg2-(.+?)-27b-nf(-flat)?$" % N.name_match_rx())
+RE_IMAGE_FLLIPER_VER = re.compile(r"^flliper:(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+?)?)-(cu\d+)$")
+RE_IMAGE_FLLIPER_SHA = re.compile(r"^flliper:(cu\d+)-([0-9a-f]{10})$")
 RE_ASSIGN = re.compile(r"^(PROFILE_[A-Z_]+)=(\"[^\"]*\"|'[^']*'|[^\s#]*)")
 LINES = ("27b", "nf")
 TRANSPORTS = ("bar1", "nccl")
@@ -87,11 +94,21 @@ def parse_images(text: str) -> List[dict]:
     out = []
     for ln in text.strip().splitlines():
         parts = ln.split("\t")
-        m = RE_IMAGE.match(parts[0].strip())
-        if not m:
-            continue
-        out.append({"image": parts[0].strip(), "cuda": m.group(1), "release": m.group(2),
-                    "flat": bool(m.group(3)), "id": parts[1] if len(parts) > 1 else None,
+        ref = parts[0].strip()
+        m = RE_IMAGE.match(ref)
+        if m:
+            cuda, release, flat = m.group(1), m.group(2), bool(m.group(3))
+        else:
+            mv = RE_IMAGE_FLLIPER_VER.match(ref)
+            ms = None if mv else RE_IMAGE_FLLIPER_SHA.match(ref)
+            if mv:
+                cuda, release, flat = mv.group(2), mv.group(1), True
+            elif ms:
+                cuda, release, flat = ms.group(1), ms.group(2), True
+            else:
+                continue
+        out.append({"image": ref, "cuda": cuda, "release": release,
+                    "flat": flat, "id": parts[1] if len(parts) > 1 else None,
                     "created": parts[2] if len(parts) > 2 else None})
     return out
 
@@ -275,8 +292,12 @@ case "$HOUSE_GUARD" in memlimit|ct999-ruht) ok "HOUSE_GUARD=$HOUSE_GUARD";; *) f
 case "$PROFILE" in "$LINE"*) ok "Profil $PROFILE passt zur Linie $LINE";; *) fail "Profil $PROFILE passt nicht zur Linie $LINE";; esac
 if docker image inspect "$IMAGE" >/dev/null 2>&1; then ok "Image $IMAGE vorhanden"; else fail "Image $IMAGE fehlt auf dem Host"; fi
 _lab=$(docker image inspect --format "{{index .Config.Labels \"htsglang.revision.$LINE\"}}" "$IMAGE" 2>/dev/null)
-if [ -n "$_lab" ] && [ "$_lab" = "$REV" ]; then ok "Image-Label htsglang.revision.$LINE = Kontext-Revision ${REV:0:10}"
-else fail "Image-Label htsglang.revision.$LINE='${_lab:0:10}' != Kontext-Revision '${REV:0:10}'"; fi
+_labkey=htsglang.revision.$LINE
+if [ -z "$_lab" ]; then   # F0-B: the fLLiper image carries the label under the renamed namespace (Dockerfile.flliper)
+  _lab=$(docker image inspect --format "{{index .Config.Labels \"io.github.efschu.flliper.revision.$LINE\"}}" "$IMAGE" 2>/dev/null); _labkey=io.github.efschu.flliper.revision.$LINE
+fi
+if [ -n "$_lab" ] && [ "$_lab" = "$REV" ]; then ok "Image-Label $_labkey = Kontext-Revision ${REV:0:10}"
+else fail "Image-Label $_labkey='${_lab:0:10}' != Kontext-Revision '${REV:0:10}'"; fi
 if [ "$PROFILE_MOUNT" = 1 ]; then _pdir=$S/spinning/gpu-arb/docker/profiles; else _pdir=$HCTX/tools/profiles; fi
 if [ -f "$_pdir/$PROFILE.env" ]; then ok "Profil-Datei $_pdir/$PROFILE.env"; else fail "Profil-Datei $_pdir/$PROFILE.env fehlt"; fi
 _ps=$(cd "$_pdir" 2>/dev/null && env -i PATH=/usr/bin:/bin bash -c 'set +u; source "./'"$PROFILE"'.env" >/dev/null 2>&1 || exit 7; echo "${PROFILE_NAME:-}|${PROFILE_STATUS:-}|${#PROFILE_ARGS[@]}"')
