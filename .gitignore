@@ -189,6 +189,8 @@ benchmark/llava_bench/mme_pack
 # "clean") and the family fell back to the "no window basis" path with wrong
 # numbers instead of failing to load.
 !test/registered/unit/distributed/fixtures/gpu_battery/s12_wait_analyse/punkte.jsonl
+# F0-A: the rename kit's translation memory is tool input (a clean checkout must carry it; the blanket *.jsonl rule ate it).
+!tools/release/data/tm.jsonl
 tmp*.txt
 /tmp/
 

@@ -28,6 +28,9 @@ KIT_WORK=${KIT_WORK:-/spinning/flliper/work}; export RELEASE_KIT=$F RELEASE_WORK
 # KIT_TM points at a private copy of the translation memory; SKIP_DRY=1 skips the launcher dry-runs (item 600: no
 # launcher process); TESTS_LIST selects a targeted test set (run_tests.sh).
 TT=${RIG_TEST_WRAP:-$F/capped_run.sh}; export RIG_TEST_WRAP=$TT
+# F0-A fix round 1: reviewed ident-map collisions (different functions, never one scope) are exempt by default; the name-rule exemption
+# per line is chosen by the caller: COLLISION_OK_FILE=$F/data/collision_ok_1007_<27b|nf>.json (collision_auto merges it).
+[ -z "${IDENT_COLLISION_OK_FILE:-}" ] && [ -f "$F/data/ident_collision_ok_1007.json" ] && export IDENT_COLLISION_OK_FILE=$F/data/ident_collision_ok_1007.json
 MAP=$F/data/merged_0928.json; FIXMAP=$F/data/identfix_map.json; TM=${KIT_TM:-$F/data/tm.jsonl}
 RUN=${RUN_BASE:-$KIT_WORK/runs}/run-$(date -u +%m%d%H%M%S); mkdir -p "$RUN"; W=$RUN/wt; B=$RUN/wt-base
 # FIXMAP_EXTRA="<table.json> ..." (F0-A, 07.10.): further identifier tables for step 2 (ident_fix.py), merged over

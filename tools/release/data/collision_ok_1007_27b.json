@@ -2,14 +2,6 @@
  "docker/weg2-release/README_RELEASE_DRAFT.md": [
   "flliper"
  ],
- "docker/weg2-release/entrypoint.sh": [
-  "FLLIPER_",
-  "FLLIPER_PDFLIP_",
-  "FLLIPER_P_CHUNK_POLICY",
-  "FLLIPER_TAG",
-  "flliper",
-  "pdflip"
- ],
  "docker/weg2-release/test_rigdash_ctx_1995.sh": [
   "flliper"
  ],

@@ -1,22 +1,11 @@
 {
- "_comment": "F0-A 07.10.2026: reading notes for the files that collision_proposal.py could NOT clear by its full-token proof (standalone `sglang`/`flliper`/`SGLANG_`/`FLLIPER_` tokens both present) and that were therefore read and added to data/collision_ok_1007_<line>.json by hand. Not read by any tool.",
+ "_comment": "F0-A 07.10.2026: reading notes for the files that collision_proposal.py could NOT clear by its full-token proof (standalone `sglang`/`flliper`/`SGLANG_`/`FLLIPER_` tokens both present) and that were therefore read and added to data/collision_ok_1007_<line>.json by hand. Not read by any tool. Fix round 1: docker/weg2-release/entrypoint.sh was removed from the exemption (see _withdrawn).",
  "27b": {
   "docker/weg2-release/README_RELEASE_DRAFT.md": {
    "words": [
     "flliper"
    ],
    "note": "prose: 'upstream sglang' would read 'upstream flliper' (wrong statement); the draft README is replaced by the release README (F0-I/F0-G); the pass may run"
-  },
-  "docker/weg2-release/entrypoint.sh": {
-   "words": [
-    "FLLIPER_",
-    "FLLIPER_PDFLIP_",
-    "FLLIPER_P_CHUNK_POLICY",
-    "FLLIPER_TAG",
-    "flliper",
-    "pdflip"
-   ],
-   "note": "comment block (lines 37-44) documents the SGLANG_<X> <-> FLLIPER_<X> pairs; after the pass both sides read FLLIPER_*; F0-B/F0-G rewrite entrypoint.sh for both names, rewrite the comment there"
   },
   "python/sglang/srt/environ.py": {
    "words": [
@@ -223,6 +212,15 @@
     "flliper"
    ],
    "note": "dashboard file class reviewed 05.10. (rename_rigdash_collision_ok.json: schema id flliper.*/1 and /var/lib/flliper next to the package name in path/import strings); new since 05.10 or grown"
+  }
+ },
+ "_withdrawn": {
+  "27b": {
+   "docker/weg2-release/entrypoint.sh": {
+    "was": "exempted for FLLIPER_, FLLIPER_PDFLIP_, FLLIPER_P_CHUNK_POLICY, FLLIPER_TAG, flliper, pdflip as a 'comment block (lines 37-44)'",
+    "why_withdrawn": "the colliding tokens are executable compat code, not only the comment: ep_state_path (07c20a35e5 line 94) 'nv=FLLIPER_PDFLIP_$1 ov=SGLANG_WEG2_$1', EP_CACHE_NEW/EP_CACHE_OLD (line 116) '$HOME/.cache/flliper' / '$HOME/.cache/sglang', and the package-dir check (line 178) 'python/sglang || python/flliper'. With the exemption the mechanical pass writes the SAME token on both sides of each pair (old SGLANG_WEG2_* fallback, ~/.cache/sglang volume detection and the python/sglang path test vanish without any error): R5/A2 (old profile starts unchanged) breaks silently.",
+    "rule": "NOT exempt. collision_survey.py reports the file as an open name-rule collision and the mechanical pass (F0-D) aborts on it until entrypoint.sh no longer spells both names as plain tokens: F0-B rewrites it for both names and builds the OLD names from pieces (like the name_compat tests: \"SG\" \"LANG_\"), or the pass content-locks it. Precondition of F0-D, owner F0-B/F0-G."
+   }
   }
  }
 }
