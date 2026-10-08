@@ -1066,6 +1066,18 @@ class Envs:
     # (R12) only, never while a D park records its refusals (HY). Off = every
     # refused claim is made as before.
     SGLANG_WEG2_ENABLE_SWEEP_FULL_ARENA_SKIP = EnvBool(True)
+    # W3-ANCHOR-POOL (NF int20 1008_135412, P PP0 13:58-14:01): the W3-ARENA
+    # spill (UnifiedRadixCache._w3_arena_spill) stopped at its first gate on
+    # every hybrid boot -- the KV host pool is a HostPoolGroup whose
+    # __getattr__ forwards the claim calls but not secure_rows_to_l3, so
+    # hasattr() said False and it returned 0 before its log line ('W3-ARENA'
+    # 0x in 15 NF P logs; PUBLISH-SWEEP issued=0 refused=5130, every L3->L2
+    # fill ended at the full arena: ARENA-GET MISS, prefetch completed=0 of
+    # hit_pages=1318). On: the spill uses the group's anchor (arena) host
+    # pool, the one alloc_write already forwards to -- the 27B dual line's
+    # Q-697c (a), without its dual gate. Off = the old silent stop, byte for
+    # byte.
+    SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL = EnvBool(False)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).
