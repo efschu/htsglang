@@ -14,7 +14,11 @@ DESK PART (no GPU, no CUDA call; runs under pytest_gedeckelt.sh):
   * the whole process_weights_after_loading flow with the CUDA-bound pieces replaced
     by the CPU reference, then an fp64 emulation of the two-GEMM MoE from the
     PROCESSED tensors against the dequantised-weights reference,
-  * the refusals (store on, placeholder weights, row cut, EP, act-order, dims),
+  * the refusals (EP, act-order, dims) and, since H88-C, the AGREEMENTS where processes share rows:
+    store on = the factor is agreed through the store's ``*.factor.json`` sidecar (first converter publishes,
+    everyone else adopts; an adopted factor that does not fit this rank's scales refuses by name), placeholder
+    weights = adopt-only (no repack), a row cut (H2 veto) = kept rows only, a two-group boot without a store
+    directory = refused by name,
   * default path unchanged: sha256 pins of the untouched A16 files, a fixture hash of
     the A16 scale permutation, and "the diff to the base commit only adds lines" for
     the three files that were extended (dispatch, scheme __init__, loader name lists).
@@ -41,7 +45,9 @@ register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -51,6 +57,8 @@ import numpy as np
 import torch
 
 from sglang.jit_kernel import marlin_w4a8_utils as U
+from sglang.srt.layers.moe import expert_store as es
+from sglang.srt.layers.moe import moe_w4a8_layout as MWL
 from sglang.srt.layers.moe.fused_moe_triton import fused_marlin_moe_w4a8 as F8
 from sglang.srt.layers.quantization.compressed_tensors import (
     compressed_tensors as ct_module,
@@ -256,8 +264,8 @@ def cpu_patches(stack: ExitStack):
         mock.patch.object(
             S,
             "w4a8_repack_moe_weights",
-            lambda packed, pf, nb, repack_fn=None: _ORIG_REPACK(
-                packed, pf, nb, repack_fn=cpu_repack_fn
+            lambda packed, pf, nb, repack_fn=None, rows=None: _ORIG_REPACK(
+                packed, pf, nb, repack_fn=cpu_repack_fn, rows=rows
             ),
         )
     )
@@ -763,24 +771,190 @@ class TestRefusals(CustomTestCase):
             cpu_patches(st)
             scheme.process_weights_after_loading(layer)
 
-    def test_store_on_refuses(self):
+    # ---- H88-C: store / placeholder / row-subset are AGREEMENTS, not refusals -------------------------------
+
+    def _tmp_store(self):
+        store = tempfile.mkdtemp(prefix="h88c_test_store_")
+        self.addCleanup(shutil.rmtree, store, True)
+        return store
+
+    def _clean_env(self, **set_extra):
+        """Ambient env minus the switch/store variables that could leak into the verdict."""
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in (
+                "SGLANG_MOE_EXPERT_STORE_DIR",
+                "SGLANG_MOE_EXPERT_STORE_IDENTITY",
+                "SGLANG_MOE_ACT_INT8",
+                "SGLANG_WEG2_GROUP",
+                "SGLANG_MOE_REPACK_SKIP_VETOED",
+            )
+        }
+        env.update(set_extra)
+        return env
+
+    def test_store_on_agrees_through_the_factor_sidecar(self):
+        fx = Fixture(E=2, K=128, N=64, gs=32)
+        store = self._tmp_store()
+        prefix = "model.layers.0.mlp.experts"
+        with mock.patch.dict(
+            os.environ, self._clean_env(SGLANG_MOE_EXPERT_STORE_DIR=store, SGLANG_MOE_EXPERT_STORE_IDENTITY="")
+        ):
+            scheme, layer = self._scheme_and_layer()
+            layer._sglang_prefix = prefix
+            self._run(scheme, layer)
+        self.assertTrue(layer.is_marlin_converted)
+        want13 = S.w4a8_scale_proposal(fx.w13_scale)
+        want2 = S.w4a8_scale_proposal(fx.w2_scale)
+        self.assertIsNotNone(want13)
+        for attr, want in (("w13_weight_scale", want13), ("w2_weight_scale", want2)):
+            rec = es.read_factor(store, prefix, attr)
+            self.assertIsNotNone(rec, es.factor_path(store, prefix, attr))
+            self.assertEqual(rec["layout"], MWL.LAYOUT_W4A8)
+            self.assertEqual(rec["group_size"], 32)
+            self.assertEqual(rec["factor"], float(np.float32(want)))
+        self.assertAlmostEqual(float(layer.w13_act_scale_factor), want13, delta=abs(want13) * 1e-6)
+        # the next converting rank ADOPTS the published factor even where its own maximum differs
+        fx2 = Fixture(E=2, K=128, N=64, gs=32, seed=1)
+        own2 = S.w4a8_scale_proposal(fx2.w13_scale)
+        self.assertGreater(abs(own2 - want13), 1e-9)  # the fixtures really disagree on the maximum
+        scheme2 = CompressedTensorsWNA16A8MoE(_quant_config(group_size=32), _weight_quant(32))
+        layer2 = new_layer(scheme2, fx2)
+        layer2._sglang_prefix = prefix
+        with mock.patch.dict(
+            os.environ, self._clean_env(SGLANG_MOE_EXPERT_STORE_DIR=store, SGLANG_MOE_EXPERT_STORE_IDENTITY="")
+        ):
+            with ExitStack() as st:
+                cpu_patches(st)
+                scheme2.process_weights_after_loading(layer2)
+        self.assertAlmostEqual(float(layer2.w13_act_scale_factor), float(np.float32(want13)), delta=abs(want13) * 1e-6)
+
+    def test_store_on_out_of_band_adopted_factor_refuses_by_name(self):
+        fx = Fixture(E=2, K=128, N=64, gs=32)
+        store = self._tmp_store()
+        prefix = "model.layers.1.mlp.experts"
+        want = S.w4a8_scale_proposal(fx.w13_scale)
         scheme, layer = self._scheme_and_layer()
-        with mock.patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STORE_DIR": "/tmp/x"}):
-            with self.assertRaisesRegex(RuntimeError, "MOE-ACT-INT8 REFUSED.*store"):
+        layer._sglang_prefix = prefix
+        with mock.patch.dict(
+            os.environ, self._clean_env(SGLANG_MOE_EXPERT_STORE_DIR=store, SGLANG_MOE_EXPERT_STORE_IDENTITY="")
+        ):
+            es.claim_scale_factor(
+                store, prefix, "w13_weight_scale", want / 100.0,
+                group_size=32, layout=MWL.LAYOUT_W4A8,
+            )  # fmt: skip
+            with self.assertRaisesRegex(S.W4A8FactorOutOfBand, "FACTOR OUT OF BAND"):
                 self._run(scheme, layer)
         self.assertFalse(getattr(layer, "is_marlin_converted", False))
 
-    def test_placeholder_weights_refuse(self):
+    def test_two_group_without_store_refuses_by_name(self):
         scheme, layer = self._scheme_and_layer()
-        with mock.patch("sglang.srt.weg2.adopt.weights_are_placeholder", lambda: True):
-            with self.assertRaisesRegex(RuntimeError, "REFUSED.*placeholder"):
+        with mock.patch.dict(os.environ, self._clean_env(SGLANG_WEG2_GROUP="P"), clear=True):
+            with self.assertRaisesRegex(RuntimeError, "REFUSED.*without SGLANG_MOE_EXPERT_STORE_DIR"):
                 self._run(scheme, layer)
 
-    def test_row_cut_refuses(self):
+    def test_placeholder_adopts_the_published_factor(self):
+        fx = Fixture(E=2, K=128, N=64, gs=32)
+        store = self._tmp_store()
+        prefix = "model.layers.2.mlp.experts"
         scheme, layer = self._scheme_and_layer()
-        layer._h2d_cut_rows = [0]
-        with self.assertRaisesRegex(RuntimeError, "REFUSED.*subset"):
+        layer._sglang_prefix = prefix
+        before = layer.w13_weight_scale.clone()
+        with mock.patch.dict(
+            os.environ, self._clean_env(SGLANG_MOE_EXPERT_STORE_DIR=store, SGLANG_MOE_EXPERT_STORE_IDENTITY="")
+        ):
+            f13 = es.claim_scale_factor(
+                store, prefix, "w13_weight_scale", S.w4a8_scale_proposal(fx.w13_scale),
+                group_size=32, layout=MWL.LAYOUT_W4A8,
+            )[0]  # fmt: skip
+            f2 = es.claim_scale_factor(
+                store, prefix, "w2_weight_scale", S.w4a8_scale_proposal(fx.w2_scale),
+                group_size=32, layout=MWL.LAYOUT_W4A8,
+            )[0]  # fmt: skip
+            with mock.patch("sglang.srt.weg2.adopt.weights_are_placeholder", lambda: True), mock.patch.object(
+                torch.cuda, "is_available", lambda: False
+            ):
+                self._run(scheme, layer)
+        self.assertTrue(layer.is_marlin_converted)
+        # no repack on placeholders: scale bytes untouched, packed buffers empty at the contract shape
+        torch.testing.assert_close(layer.w13_weight_scale, before, rtol=0, atol=0)
+        self.assertEqual(tuple(layer.w13_weight_packed.shape), (2, 128 // 16, 2 * 64 * 2))
+        self.assertEqual(tuple(layer.w2_weight_packed.shape), (2, 64 // 16, 128 * 2))
+        self.assertAlmostEqual(float(layer.w13_act_scale_factor), f13, delta=abs(f13) * 1e-6)
+        self.assertAlmostEqual(float(layer.w2_act_scale_factor), f2, delta=abs(f2) * 1e-6)
+
+    def test_placeholder_without_sidecar_refuses_by_name(self):
+        store = self._tmp_store()
+        scheme, layer = self._scheme_and_layer()
+        layer._sglang_prefix = "model.layers.3.mlp.experts"
+        with mock.patch.dict(
+            os.environ, self._clean_env(SGLANG_MOE_EXPERT_STORE_DIR=store, SGLANG_MOE_EXPERT_STORE_IDENTITY="")
+        ), mock.patch("sglang.srt.weg2.adopt.weights_are_placeholder", lambda: True), mock.patch.object(
+            torch.cuda, "is_available", lambda: False
+        ):
+            with self.assertRaisesRegex(es.W4A8FactorUnavailable, "no scale factor published"):
+                self._run(scheme, layer)
+
+    def test_placeholder_single_group_without_store_uses_factor_one(self):
+        scheme, layer = self._scheme_and_layer()
+        before = layer.w13_weight_scale.clone()
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True), mock.patch(
+            "sglang.srt.weg2.adopt.weights_are_placeholder", lambda: True
+        ), mock.patch.object(torch.cuda, "is_available", lambda: False):
             self._run(scheme, layer)
+        self.assertTrue(layer.is_marlin_converted)
+        self.assertEqual(float(layer.w13_act_scale_factor), 1.0)
+        torch.testing.assert_close(layer.w13_weight_scale, before, rtol=0, atol=0)
+
+    def test_row_cut_repacks_kept_rows_only(self):
+        # H2 store-adopt veto (store_adopt.repack_rows): repack touches the kept rows only, the factor is
+        # proposed over the kept rows -- replaces the H88-B refusal of a subset
+        fx = Fixture(E=4, K=128, N=64, gs=32)
+        scheme = CompressedTensorsWNA16A8MoE(_quant_config(group_size=32), _weight_quant(32))
+        layer = new_layer(scheme, fx)
+        layer.num_experts = fx.E  # window (0, no pad): local ids == global ids
+        layer._moe_store_adopt_vetoed_global = {1}
+        keep = [0, 2, 3]
+        calls = []
+
+        def rec(packed, pf, nb, repack_fn=None, rows=None):
+            calls.append(list(rows) if rows is not None else None)
+            return _ORIG_REPACK(packed, pf, nb, repack_fn=cpu_repack_fn, rows=rows)
+
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True):
+            with ExitStack() as st:
+                cpu_patches(st)
+                st.enter_context(mock.patch.object(S, "w4a8_repack_moe_weights", rec))
+                scheme.process_weights_after_loading(layer)
+        self.assertEqual(calls, [keep, keep])  # w13 and w2 both honour the cut
+        self.assertTrue(layer.is_marlin_converted)
+        idx = torch.tensor(keep)
+        ref13 = cpu_repack_fn(fx.w13_packed[idx], fx.K, 2 * fx.N, 4)
+        torch.testing.assert_close(layer.w13_weight_packed[idx], ref13, rtol=0, atol=0)
+        ref2 = cpu_repack_fn(fx.w2_packed[idx], fx.N, fx.K, 4)
+        torch.testing.assert_close(layer.w2_weight_packed[idx], ref2, rtol=0, atol=0)
+        want = S.w4a8_scale_proposal(fx.w13_scale, keep)
+        self.assertAlmostEqual(float(layer.w13_act_scale_factor), float(np.float32(want)), delta=abs(want) * 1e-6)
+
+    def test_repack_rows_are_independent_expert_tiles(self):
+        # H88-C item 3 (Uneven-Expert-Shard tile compatibility, fused_moe_triton/layer.py:578-632): the shard
+        # unit of SGLANG_UNEVEN_MOE_EXPERT_SHARD is one WHOLE expert, so every rank repacks its own expert rows
+        # and shares rows with the store per expert. Pinned against the H88-A CPU layout reference: the rows a
+        # subset repack writes are byte-identical to the same rows of the full repack, and rows it does not
+        # touch (garbage in this rank's copy: another rank's experts) never leak into the rows it does write.
+        fx = Fixture(E=5, K=128, N=64, gs=32)
+        keep = [1, 3, 4]
+        full = S.w4a8_repack_moe_weights(fx.w13_packed, 8, 4, repack_fn=cpu_repack_fn)
+        sub = S.w4a8_repack_moe_weights(fx.w13_packed, 8, 4, repack_fn=cpu_repack_fn, rows=keep)
+        idx = torch.tensor(keep)
+        torch.testing.assert_close(sub[idx], full[idx], rtol=0, atol=0)
+        dirty = fx.w13_packed.clone()
+        for row in (0, 2):  # rows this "rank" does not own: random bytes
+            dirty[row] = torch.randint(0, 2**31 - 1, dirty[row].shape, dtype=dirty.dtype)
+        sub_dirty = S.w4a8_repack_moe_weights(dirty, 8, 4, repack_fn=cpu_repack_fn, rows=keep)
+        torch.testing.assert_close(sub_dirty[idx], full[idx], rtol=0, atol=0)
 
     def test_group_act_order_refused(self):
         wq = _weight_quant(32)
@@ -833,8 +1007,10 @@ class TestRefusals(CustomTestCase):
         fx = Fixture(E=2, K=128, N=64, gs=32)
         scheme, layer = converted_layer(fx)
         self.assertIsNotNone(layer.w13_act_scale_factor)
+        self.assertTrue(getattr(layer, MWL.OFFLOAD_COVERED_ATTR, False))
         scheme.restore_weights_before_loading(layer)
         self.assertIsNone(layer.w13_act_scale_factor)
+        self.assertFalse(getattr(layer, MWL.OFFLOAD_COVERED_ATTR, True))
         self.assertFalse(layer.is_marlin_converted)
 
 
