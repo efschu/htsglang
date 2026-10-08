@@ -5582,7 +5582,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if pool is None or getattr(pool, "arena", None) is None:
             return 0
         if not hasattr(pool, "secure_rows_to_l3"):
-            return 0
+            # W3-ANCHOR-POOL: the hybrid HostPoolGroup forwards the claim
+            # calls only; switched on, the spill works through its anchor
+            # (arena) pool. Off: the old silent stop.
+            pool = _w3_anchor_spill_pool(pool)
+            if pool is None:
+                return 0
         if _r12.role() is not None:
             # Form A: a worker's host rows mirror TP0's verdicts (R12); the
             # spill stays on the groups without the shadow protocol
@@ -12359,6 +12364,32 @@ def _full_arena_suffix(stats: dict) -> str:
         return ""
     return (" arena_full_skipped=%d (SWEEP-FULL-ARENA: counted refused without the claim -- "
             "the KV arena has no room for them after this sweep's arena_claim refusal)" % n)
+
+
+def _w3_anchor_spill_pool(pool):
+    """W3-ANCHOR-POOL (NF int20, boot 1008_135412 @ 45cdd0a290, P PP0
+    13:58:09-14:01:12): the pool that carries ``secure_rows_to_l3`` when
+    ``pool`` does not -- the anchor host pool of a hybrid ``HostPoolGroup``
+    (the arena pool its ``alloc_write`` / ``claim_would_refuse`` forward to).
+
+    Metal: the KV arena (6485 slots) was full of P's own tree references from
+    the first reads on; ``W3-ARENA`` printed 0 lines (and 0 in the 15 NF P
+    logs before it) because the group has no ``secure_rows_to_l3`` and the
+    spill returned before its log line. ``PUBLISH-SWEEP`` issued=0 refused=5130
+    (arena_full_skipped=5102) for the whole phase, and every L3->L2 fill of a
+    store hit ended at the arena (``#1436 ARENA-GET MISS``, ``#1157 PREFETCH
+    REAPED ... hit_pages=1318 completed=0``): 705k tokens the store held were
+    prefilled again (17-22 % hit rate 13:59-14:01).
+
+    None = switch ``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` off (the old
+    stop, byte for byte) or no anchor pool that has the call."""
+    if not envs.FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL.get():
+        return None
+    entry = getattr(pool, "anchor_entry", None)
+    host = getattr(entry, "host_pool", None)
+    if host is None or not hasattr(host, "secure_rows_to_l3"):
+        return None
+    return host
 
 
 def _aux_components(tree) -> tuple:
