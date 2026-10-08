@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.moe_act_int8 import require_w4a8_moe_scheme
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -947,6 +948,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                         self, weight_quant=weight_quant
                     )
                 else:
+                    # H88: --moe-act-int8 / SGLANG_MOE_ACT_INT8 asks for the W4A8
+                    # scheme; a tree without one stops here (default off: no effect).
+                    require_w4a8_moe_scheme()
                     moe_backend = get_moe_runner_backend()
                     if moe_backend.is_triton():
                         logger.info_once(

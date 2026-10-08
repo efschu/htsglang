@@ -40,8 +40,8 @@ ABSENT_ON_NF_LINE = frozenset((
     "SGLANG_WEG2_HOST_GUARD_W22", "SGLANG_WEG2_HOST_GUARD_W98", "SGLANG_ADMISSION_WEDGE_MODE", "SGLANG_PREFILL_LIVELOCK_MODE"))
 #: curated names the code of the 27B line does not carry: the NF line's own curated entry (``baeume`` ["nf"] in the catalog; measured 07.10. on
 #: 65fc0e2076: --weg2-xchg-census-map is neither a launcher flag nor a server_args flag of the 27B tree).  It stays curated (user/27B seat 07.10.:
-#: do not delete it) and this test names it.  The curated total is therefore 119 on both lines (118 + this entry).
-ABSENT_ON_27B_LINE = frozenset(("--weg2-xchg-census-map",))
+#: do not delete it) and this test names it.  The curated total is therefore 121 on both lines (118 + this entry + the two H88-E entries --moe-act-int8 / SGLANG_MOE_ACT_INT8, which the NF line carries first: 07.10. H88-E, same rule).
+ABSENT_ON_27B_LINE = frozenset(("--weg2-xchg-census-map", "--moe-act-int8", "SGLANG_MOE_ACT_INT8"))
 
 
 def _load(name, path):
