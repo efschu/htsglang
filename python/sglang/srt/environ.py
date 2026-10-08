@@ -742,6 +742,18 @@ class Envs:
     # standing still until the deadman. Decided on the host, carried by the
     # H105 verdict broadcast. 0 = never stop.
     SGLANG_WEG2_FORM_A_DEADLOCK_STOP_S = EnvFloat(120.0)
+    # ENABLE_FORM_A_STALE_VOTE_DEFER (H98d, NF xc D 21:37:29Z 07.10.,
+    # weg2-130-2092): the H98 group depth is a snapshot from the top of the
+    # pass; an earlier admission of the SAME pass can evict the attention
+    # host's tail (xsn285 load-back drain, P-FUND KV-ONLY drops the anchors),
+    # so the host admits less than the planted depth. On: the host refuses
+    # THIS admission through the H105 verdict (OTHER) -- every rank keeps
+    # the request queued, the next pass votes again from the trees as they
+    # are. The H98 stop (FormAHostBelowGroup) stays for the same
+    # (local, group) three passes running and wherever no H105 verdict
+    # channel exists. Off = the immediate stop (pre-H98d). Reached only
+    # where that stop would have fired; everywhere else byte-identical.
+    SGLANG_WEG2_ENABLE_FORM_A_STALE_VOTE_DEFER = EnvBool(True)
     # POOLLEAK_INSTR (NF y9nf6 boot 3, 07:03:50Z: "[full] ... withheld=92672
     # ... deficit of 128 row(s)" + 3 mamba slots on TP1/TP2 right after a D
     # park): LOG-ONLY instruments, no behaviour -- per-request pool holdings

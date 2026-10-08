@@ -306,8 +306,15 @@ class TestRiegelStays(unittest.TestCase):
         self.assertEqual(set(geometry.values()), {15552}, f"{planted} {geometry}")
 
     def test_host_below_group_is_a_named_stop(self):
+        # H98d: with the stale-vote deferral OFF this is the immediate H98
+        # stop; ON, the stop stays for a repeat and where no H105 verdict
+        # rides (test_nf_form_a_stale_vote_h98d.py).
+        from sglang.srt.environ import envs
+
         tree = _Tree(18112, [2560])
-        with _switch(True), self.assertRaises(m.FormAHostBelowGroup):
+        with _switch(True), envs.SGLANG_WEG2_ENABLE_FORM_A_STALE_VOTE_DEFER.override(
+            False
+        ), self.assertRaises(m.FormAHostBelowGroup):
             _admit(tree, 0, {"r": 18112}, "r")
 
     def test_follow_miss_is_a_named_stop(self):

@@ -993,6 +993,22 @@ def _h105d_load_back_kv_rows(best_match_node) -> int:
     return rows
 
 
+def _form_a_stale_vote_gate(adder, req, follow) -> AddReqResult | None:
+    """H98d (NF xc D 21:37:29Z 07.10., weg2-130-2092; tp_match_floor H98d):
+    ``OTHER`` when THIS rank -- the Form A attention host -- found its
+    admission match below the group depth planted at the top of the pass.
+    It rides the H105 verdict below, so every rank keeps the request queued
+    and the next pass votes again; without a verdict callable it is the H98
+    stop. None everywhere else (one lookup, nothing else changes)."""
+    from sglang.srt.managers.tp_match_floor import form_a_stale_vote_refuses
+
+    if form_a_stale_vote_refuses(
+        adder.tree_cache, req, has_verdict_channel=follow is not None
+    ):
+        return AddReqResult.OTHER
+    return None
+
+
 def _h105d_cut_load_back_room(adder, req) -> bool:
     """H105d (NF y9nf6 rc12z30y9nf6, 191228abc5, D log boot_weg2_dkrnfint4h6abl
     bar1dauer10040608 ~158218-158410, 06:32:52Z, weg2-32-93): may THIS rank
@@ -2769,10 +2785,17 @@ class PrefillAdder:
         # point inside the lock (`form_a_admission_follow`); everywhere else
         # the first failing gate returns exactly as before.
         _fa_follow = self.form_a_admission_follow
-        _gate = None
+        # H98d: this rank (the Form A host) found its match below the group
+        # depth planted at the top of the pass -- refused through the H105
+        # verdict on every rank (OTHER), or the H98 stop without a verdict.
+        _gate = _form_a_stale_vote_gate(self, req, _fa_follow)
         _rem_total = self.rem_total_tokens
-        if total_tokens >= _rem_total and not self._cap_lifetime_waiver(
-            total_tokens, born_input_tokens, _rem_total
+        if (
+            _gate is None
+            and total_tokens >= _rem_total
+            and not self._cap_lifetime_waiver(
+                total_tokens, born_input_tokens, _rem_total
+            )
         ):
             # Lifetime doesn't fit VRAM: wedge -- UNLESS Prefill-Spill can admit
             # it born-spilled (input transiently fits, a host region is free),

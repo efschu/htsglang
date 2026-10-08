@@ -480,6 +480,7 @@ def apply_realize_verdict(
 def plant(tree_cache: Any, group_usable: Optional[Dict[str, int]]) -> None:
     if tree_cache is not None:
         setattr(tree_cache, TREE_ATTR, group_usable)
+        _reset_host_stale(tree_cache)  # H98d: the stale record is per pass
 
 
 def group_usable_for(tree_cache: Any, rid: str) -> Optional[int]:
@@ -495,6 +496,7 @@ def group_usable_for(tree_cache: Any, rid: str) -> Optional[int]:
 def clear(tree_cache: Any) -> None:
     if tree_cache is not None and getattr(tree_cache, TREE_ATTR, None) is not None:
         setattr(tree_cache, TREE_ATTR, None)
+    _reset_host_stale(tree_cache)
 
 
 def floor_verdict(local_match: int, group_usable: Optional[int]) -> str:
@@ -963,13 +965,24 @@ def form_a_follow_admission(tree_cache: Any, req: Any, result: Any) -> Optional[
         return g
     local = host_admission_len(result)  # H105b: what the host ADMITS
     if g > 0 and local < g:
-        raise FormAHostBelowGroup(
-            f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid} local_match={local} "
-            f"group={g}: the attention host admits less than the depth the group "
-            "planted from its own admission probe; the workers adopt the group "
-            "depth, so admitting the smaller one would split the extend -- "
-            "stopping by name instead (raenge-nie-uneins)."
+        # H98d: the planted depth went stale inside this pass -- refused at
+        # the H105 gate on every rank, or the stop (_host_below_group).
+        _host_below_group(
+            tree_cache,
+            rid,
+            local=local,
+            group=g,
+            why="admission",
+            stop=(
+                f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid} local_match={local} "
+                f"group={g}: the attention host admits less than the depth the "
+                "group planted from its own admission probe; the workers adopt "
+                "the group depth, so admitting the smaller one would split the "
+                "extend -- stopping by name instead (raenge-nie-uneins)."
+            ),
         )
+        return None
+    _STALE_REPEAT.pop(rid, None)
     return None
 
 
@@ -986,11 +999,19 @@ def form_a_host_zero_guard(tree_cache: Any, req: Any, why: str) -> None:
     rid = str(getattr(req, "rid", "") or "")
     g = group.get(rid)
     if g is not None and int(g) > 0:
-        raise FormAHostBelowGroup(
-            f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid} group={int(g)} "
-            f"local=0 ({why}): the attention host refuses a depth its own "
-            "admission probe voted; the workers adopt it -- stopping by name "
-            "instead of splitting the extend (raenge-nie-uneins)."
+        # H98d: the same stale-vote verdict as a depth below the group.
+        _host_below_group(
+            tree_cache,
+            rid,
+            local=0,
+            group=int(g),
+            why=why,
+            stop=(
+                f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid} group={int(g)} "
+                f"local=0 ({why}): the attention host refuses a depth its own "
+                "admission probe voted; the workers adopt it -- stopping by "
+                "name instead of splitting the extend (raenge-nie-uneins)."
+            ),
         )
 
 
@@ -1032,6 +1053,146 @@ def follow_rematch(tree_cache: Any, params: Any, depth: int, local: int) -> Any:
             n,
         )
     return followed
+
+
+# --------------------------------------------------------------------------
+# H98d: a group depth that went stale INSIDE the pass is refused, not fatal
+# --------------------------------------------------------------------------
+#
+# NF xc D (c5da548b7c, boot dkrnfint4h6ablxcbar1dauer10071818, 07.10.
+# 21:37:20-21:37:29Z, rid weg2-130-2092, a 175353-token agent turn): the
+# usable vote at the top of the pass found TP0's whole prefix on device
+# (MATCH-CENSUS-DEEP reached=accepted=prefix=175104); TP0 voted 175104, the
+# group planted 175104. In the SAME pass weg2-130-2093 was admitted first:
+# under the #239 token cut its ADMIT is gathered before its load-back, the
+# load-back's floor refused and drained every evictable leaf (xsn285;
+# EVICT-FRONTIER-CENSUS request=168832 on all ranks). TP0's mamba host arena
+# was full (ARENA-DROP slot_bytes=58834944 freed=0), so the drain backed four
+# device nodes up KV-ONLY and dropped their anchors (P-FUND EVICT KV-ONLY
+# n=19..22: 384, 960, 320, 256 tokens; 960+320+256 = 1536 = 175104 - 173568).
+# 2092's admission match on TP0 ended on the deepest SURVIVING anchor:
+# host_admission_len 173568 < group 175104 -> H98 HOST-BELOW-GROUP, the D
+# group dead after 3 h 15 min of serving.
+#
+# The vote was right when it was taken; this rank's own eviction for an
+# earlier admission of the pass made it stale. No rank may admit a depth
+# another does not (raenge-nie-uneins), and the workers adopt the planted
+# depth at their match -- but no rank has ADMITTED yet: the H105 verdict for
+# this rid is still ahead, every rank reaches it, and it is the host's. So
+# the host records the stale pair here and refuses the admission there
+# (:func:`form_a_stale_vote_refuses` -> ``OTHER``): every rank returns the
+# same code and keeps the request queued, and the next pass votes again from
+# the trees as they are (the host then votes what it admits). The stop stays
+# where that does not hold: switch off, no verdict channel, or the same
+# (local, group) for :data:`STALE_VOTE_REPEAT_STOP` passes running -- that is
+# a probe that never sees what admission sees, not a race.
+
+#: Tree attribute: rid -> (local, group) the host found stale in THIS pass;
+#: reset by :func:`plant` / :func:`clear`, read at the H105 gate.
+HOST_STALE_ATTR = "_tp_match_floor_host_stale"
+
+#: The same (local, group) for one rid this many passes running is a named
+#: stop: no longer a depth that went stale inside one pass.
+STALE_VOTE_REPEAT_STOP = 3
+
+#: rid -> ((local, group), passes running); bounded like ``_VOTE_WHY``.
+_STALE_REPEAT: Dict[str, tuple] = {}
+_STALE_REPEAT_CAP = 256
+
+
+def _stale_vote_defer_on() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_ENABLE_FORM_A_STALE_VOTE_DEFER.get())
+
+
+def _note_stale_repeat(rid: str, *, local: int, group: int) -> int:
+    """Passes running in which ``rid`` went stale at the same pair."""
+    pair = (int(local), int(group))
+    prev = _STALE_REPEAT.get(rid)
+    n = prev[1] + 1 if prev is not None and prev[0] == pair else 1
+    if rid not in _STALE_REPEAT and len(_STALE_REPEAT) >= _STALE_REPEAT_CAP:
+        _STALE_REPEAT.pop(next(iter(_STALE_REPEAT)))
+    _STALE_REPEAT[rid] = (pair, n)
+    return n
+
+
+def _host_below_group(
+    tree_cache: Any, rid: str, *, local: int, group: int, why: str, stop: str
+) -> None:
+    """H98d: the Form A host admits ``local`` below the planted ``group``
+    (``why``: the depth itself, or the host-local zero that took it).
+
+    Records the pair for this pass's H105 gate; raises ``stop`` (the H98
+    message, unchanged) with the switch off, and on a repeat."""
+    if not _stale_vote_defer_on():
+        raise FormAHostBelowGroup(stop)
+    n = _note_stale_repeat(rid, local=local, group=group)
+    if n >= STALE_VOTE_REPEAT_STOP:
+        raise FormAHostBelowGroup(
+            f"{stop} H98d REPEAT passes={n}: the same local={int(local)} "
+            f"group={int(group)} in {n} passes running -- not a depth that went "
+            "stale inside one pass but a vote this host's admission never "
+            "reaches."
+        )
+    stale = getattr(tree_cache, HOST_STALE_ATTR, None)
+    if not isinstance(stale, dict):
+        stale = {}
+        setattr(tree_cache, HOST_STALE_ATTR, stale)
+    stale[rid] = (int(local), int(group))
+    _STATS["stale_vote_defer"] = _STATS.get("stale_vote_defer", 0) + 1
+    k = _STATS["stale_vote_defer"]
+    if k <= 20 or k % 256 == 0:
+        logger.warning(
+            "H98d RU FORM-A STALE-VOTE DEFER rid=%s local=%d group=%d repeat=%d "
+            "why=%s (n=%d): the attention host admits less than the depth the "
+            "group planted at the top of this pass (an earlier admission's "
+            "eviction took the rest); its H105 verdict refuses this admission "
+            "on every rank, the request stays queued and the next pass votes "
+            "again (raenge-nie-uneins).",
+            rid,
+            int(local),
+            int(group),
+            n,
+            why,
+            k,
+        )
+
+
+def _reset_host_stale(tree_cache: Any) -> None:
+    if tree_cache is not None and isinstance(
+        getattr(tree_cache, HOST_STALE_ATTR, None), dict
+    ):
+        setattr(tree_cache, HOST_STALE_ATTR, None)
+
+
+def form_a_host_vote_stale(tree_cache: Any, req: Any) -> Optional[tuple]:
+    """``(local, group)`` when THIS rank (the Form A host) found ``req``'s
+    admission match below the planted depth in this pass, else None."""
+    stale = getattr(tree_cache, HOST_STALE_ATTR, None) if tree_cache is not None else None
+    if not isinstance(stale, dict) or not stale:
+        return None
+    return stale.get(str(req.rid))
+
+
+def form_a_stale_vote_refuses(
+    tree_cache: Any, req: Any, *, has_verdict_channel: bool
+) -> bool:
+    """H98d, at the H105 gate (``PrefillAdder.add_one_req``): True = the host
+    refuses this admission; the caller sends ``OTHER`` through the H105
+    verdict, so every rank keeps the request queued. Without a verdict
+    channel the workers would never hear it -- the H98 stop, by name."""
+    pair = form_a_host_vote_stale(tree_cache, req)
+    if pair is None:
+        return False
+    if not has_verdict_channel:
+        raise FormAHostBelowGroup(
+            f"H98 RU FORM-A HOST-BELOW-GROUP rid={req.rid} local_match={pair[0]} "
+            f"group={pair[1]}: the planted depth went stale inside this pass and "
+            "no H105 verdict channel carries a refusal to the workers -- "
+            "stopping by name instead (raenge-nie-uneins)."
+        )
+    return True
 
 
 # --------------------------------------------------------------------------
