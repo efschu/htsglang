@@ -3317,9 +3317,10 @@ class Envs:
     # --moe-act-int8 on (H88, PLAN-H88-W4A8-1007): the compressed-tensors int4
     # (WNA16) MoE experts take int8 activations (W4A8) instead of 16-bit ones
     # (W4A16). Env form of the flag, either of the two switches it on; default
-    # off = the W4A16 Marlin path, argv and env unchanged. This tree has no W4A8
-    # MoE scheme yet: with the switch on the MoE scheme dispatch raises a
-    # RuntimeError (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).
+    # off = the W4A16 Marlin path, argv and env unchanged. This tree has the W4A8
+    # MoE scheme (CompressedTensorsWNA16A8MoE, H88-B): with the switch on, the MoE
+    # scheme dispatch picks it for the int4 expert layers on CUDA; a tree without
+    # the scheme stops with: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.
     SGLANG_MOE_ACT_INT8 = EnvBool(False)
     # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
     #

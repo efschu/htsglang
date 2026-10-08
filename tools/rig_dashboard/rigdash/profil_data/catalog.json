@@ -16668,7 +16668,7 @@
    ],
    "gain": "unbelegt (kein Metallbeweis)",
    "group": "Quantisierung",
-   "help": "H88 (PLAN-H88-W4A8-1007): the compressed-tensors int4 (WNA16) MoE experts take int8 activations (W4A8) instead of 16-bit ones (W4A16). Default off = the W4A16 Marlin path, argv and env unchanged. Environment form: SGLANG_MOE_ACT_INT8=1 (either of the two switches it on). This tree has no W4A8 MoE scheme yet: with the switch on the MoE scheme dispatch raises a RuntimeError (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).",
+   "help": "H88 (PLAN-H88-W4A8-1007): the compressed-tensors int4 (WNA16) MoE experts take int8 activations (W4A8) instead of 16-bit ones (W4A16). Default off = the W4A16 Marlin path, argv and env unchanged. Environment form: SGLANG_MOE_ACT_INT8=1 (either of the two switches it on). This tree has the W4A8 MoE scheme (CompressedTensorsWNA16A8MoE, H88-B): with the switch on, the MoE scheme dispatch picks it for the int4 expert layers on CUDA (dynamic per-token int8 activations, Marlin W4A8 kernel); together with --moe-runner-backend triton it stops with a RuntimeError. A tree without the scheme stops with: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
    "id": "--moe-act-int8",
    "kind": "flag",
    "level": "experte",
@@ -16684,7 +16684,7 @@
     "line": 4288
    },
    "status": "kuratiert",
-   "text": "H88: Die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard off = der W4A16-Marlin-Pfad, Argv und Umgebung unverändert. Umgebungsform: SGLANG_MOE_ACT_INT8=1; einer der beiden Schalter genügt. Dieser Baum hat noch kein W4A8-MoE-Schema: mit dem Schalter an bricht der Start an der ersten MoE-Schicht mit RuntimeError ab (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).",
+   "text": "H88: Die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard off = der W4A16-Marlin-Pfad, Argv und Umgebung unverändert. Umgebungsform: SGLANG_MOE_ACT_INT8=1; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
    "type": "str"
   },
   "--moe-dense-tp-size": {
@@ -38432,7 +38432,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4571
+    "line": 4572
    },
    "status": "unerklaert",
    "text": "",
@@ -38750,7 +38750,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4570
+    "line": 4571
    },
    "status": "geerntet",
    "text": "",
@@ -48698,7 +48698,7 @@
    ],
    "gain": "unbelegt (kein Metallbeweis)",
    "group": "Quantisierung",
-   "help": "--moe-act-int8 on (H88, PLAN-H88-W4A8-1007): the compressed-tensors int4 (WNA16) MoE experts take int8 activations (W4A8) instead of 16-bit ones (W4A16). Env form of the flag, either of the two switches it on; default off = the W4A16 Marlin path, argv and env unchanged. This tree has no W4A8 MoE scheme yet: with the switch on the MoE scheme dispatch raises a RuntimeError (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).",
+   "help": "--moe-act-int8 on (H88, PLAN-H88-W4A8-1007): the compressed-tensors int4 (WNA16) MoE experts take int8 activations (W4A8) instead of 16-bit ones (W4A16). Env form of the flag, either of the two switches it on; default off = the W4A16 Marlin path, argv and env unchanged. This tree has the W4A8 MoE scheme (CompressedTensorsWNA16A8MoE, H88-B): with the switch on, the MoE scheme dispatch picks it for the int4 expert layers on CUDA; a tree without the scheme stops with: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
    "id": "SGLANG_MOE_ACT_INT8",
    "kind": "env",
    "level": "experte",
@@ -48710,10 +48710,10 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 3323
+    "line": 3324
    },
    "status": "kuratiert",
-   "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat noch kein W4A8-MoE-Schema: mit dem Schalter an bricht der Start an der ersten MoE-Schicht mit RuntimeError ab (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).",
+   "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
    "type": "EnvBool"
   },
   "SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE": {
@@ -71098,7 +71098,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3606
+      "line": 3607
      }
     }
    },
@@ -71457,7 +71457,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4278
+      "line": 4279
      }
     }
    },
@@ -72325,7 +72325,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4258
+      "line": 4259
      }
     }
    },
@@ -74888,7 +74888,7 @@
      "source": {
       "file": "server_args.py",
       "kind": "os.environ",
-      "line": 14735
+      "line": 14739
      }
     }
    },
@@ -75511,7 +75511,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4378
+      "line": 4379
      }
     }
    },
@@ -77631,7 +77631,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4187
+      "line": 4188
      }
     }
    },
@@ -84829,7 +84829,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4365
+      "line": 4366
      }
     }
    },

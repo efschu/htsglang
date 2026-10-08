@@ -382,6 +382,28 @@ class TestCatalog(unittest.TestCase):
         self.assertTrue(all(d["belegt"] for n in self.NAMES for d in cat["entries"][n]["depends"]))
         self.assertEqual((cat["kanten"]["kanten_gesamt"], cat["kanten"]["kanten_belegt"]), (134, 134))
 
+    def test_no_text_says_the_tree_has_no_w4a8_scheme_yet(self):
+        """H88-F fix round 1: since H88-B the tree HAS the scheme (HAS_W4A8_MOE_SCHEME = True), so the help=, the environ.py
+        comment, the curated text and the shipped catalog must not tell the user the switch aborts the start for lack of one."""
+        stale = ("no W4A8 MoE scheme yet", "noch kein W4A8-MoE-Schema")
+        from sglang.srt.layers.quantization import moe_act_int8 as M
+
+        self.assertTrue(M.HAS_W4A8_MOE_SCHEME)
+        server = PC.server_args_flags(os.path.join(SRT, "server_args.py"))["--moe-act-int8"]["help"]
+        comment = PC.environ_fields(os.path.join(SRT, "environ.py"))["SGLANG_MOE_ACT_INT8"]["comment"]
+        texts = [server, comment] + [CU.CURATED[n]["text"] for n in self.NAMES]
+        path = os.path.join(TREE, "tools", "rig_dashboard", "rigdash", "profil_data", "catalog.json")
+        with open(path, encoding="utf-8") as fh:
+            cat = json.load(fh)
+        for n in self.NAMES:
+            e = cat["entries"][n]
+            texts += [str(e.get("text", "")), str(e.get("help", ""))]
+        for t in texts:
+            for needle in stale:
+                self.assertNotIn(needle, t)
+        for t in (server, CU.CURATED["--moe-act-int8"]["text"]):
+            self.assertIn("CompressedTensorsWNA16A8MoE", t)
+
 
 # ---------------------------------------------------------------------------
 # the planner
