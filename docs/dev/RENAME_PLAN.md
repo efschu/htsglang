@@ -38,6 +38,7 @@ Status: phase 1 (inventory, tooling, probe), extended by §8 (weg2 → pdflip, G
 * Whole trees: `3rdparty/`, `sgl-kernel/`, `sgl-model-gateway/`, `experimental/`, `rust/`, `proto/`, `.github/` (upstream CI), `docs/`, `docs_new/` (prose, separate pass), `.claude/`.
 * Host paths that exist on the rig: `/spinning/htsglang`, `/spinning/htsglang-gpu/.venv` (211 in-scope hits).
 * Published artifacts: the old image tags (`htsglang:cu130-nccl2307`), old GitHub repo links.
+* **Metric names (F0-M, user decision 08.10.2026 "pdflip as the name, the metrics are must-keep")**: the series, labels and Influx measurements that leave the process keep their spelling, so the history in VictoriaMetrics (192.168.0.88:8428) and the Grafana panels (rig-verlauf, examples/monitoring) do not break: the engine's `sglang:*` (and `sglang_*` on `/v1/loads?format=prometheus`), the P/D-flip subsystem's `weg2_*` (front, rank gauges, sampler, Influx points `weg2_req` / `weg2_flip`, label `weg2_group`) and the VictoriaMetrics scrape job name `weg2-front` (the `job` label value of every scraped front series). Module, flag, env, marker and path names stay renamed. Table: `tools/release/data/metric_names_1008.json` (read by the engine), `tools/release/metric_inventory.py` (scan / compare / keepfile / restore), words in `tools/release/data/must_keep.txt` (section "METRIC NAMES"), §8.17.
 
 ## 3. Inventory (base `489368a7ef`, 11,362 files)
 
@@ -739,3 +740,30 @@ Dockerfile lines behave exactly as before (dash -n ok, simulation above); its ma
 4. Quiet-box dry-run that reaches `build_env`; editable install + Rust `_core` (§7); pyproject/postpare.
 5. Profile/arm conversion (2b), NF monitor list (8.14), the "left on purpose" rows above if wanted; kernel lists may stay
    in the old spelling (mapped). First real image of a renamed tree: all three prebuild stages run (expected, paths moved).
+
+## 8.17 F0-M, metric names are must-keep (08.10.2026, both lines)
+
+User decision 08.10.2026 ~19:30Z: "pdflip as the name, the metrics are must-keep".  The first kit run (F0-D/E) had renamed the exported series
+(`weg2_*` -> `pdflip_*`, `sglang:*` -> `flliper:*`, `sglang_*` on /v1/loads -> `flliper_*`, Grafana panels with them), which would have cut every
+time series in VictoriaMetrics and every panel query.  Closed in three parts, each with its proof:
+
+1. **Inventory** (`metric_inventory.py scan`, AST + text): every metric-name literal that is *defined* by a constructor (`Counter`/`Gauge`/`Histogram`/
+   `GaugeHistogram`/`Ray*Wrapper`, `influx_line("...")`), every literal of the writers that build names by concatenation (`vmpush.py`,
+   `v1_loads.py`), and every use of a defined name in a reader, a probe or a panel.  Old tree vs renamed tree: the kit had renamed all of them
+   (27B 264 hits, NF 237 hits; the table of the F0-M report).
+2. **Rule in the kit** (`rename_to_flliper.py`, block `METRIC-NAME MUST-KEEP`; data `metric_names_1008.json`): the colon form `sglang:<defined name>`
+   is kept in any file (docker tags such as `sglang:dev` are not in the table and are still renamed); `weg2_<name>` is kept as an exact token where the
+   name occurs only as a metric in the old trees, and as a family prefix (`weg2_front_`, `weg2_rank_`, `weg2_boot_decode_`, `weg2_gpu_pcie_`);
+   words that are metric AND something else elsewhere (`weg2_group` = label and `server_args` attribute, `weg2_d_parked` = gauge and request key) are
+   kept per file (front_metrics.py, the writer and panel files).  The table is keyed by the old path and the renamed path, so the second pass is a no-op.
+   Proof: the engine run on the 27B base `86ff356d0d` leaves 264/264 inventory hits in their old spelling; the kept tokens of that run equal the tokens
+   `metric_inventory.py restore` produced in the renamed tree, file by file (all but the five files of the dashboard package).  The translation
+   gate keeps the same words (`must_keep.txt`, section "METRIC NAMES").
+3. **Restore on the renamed branches** (`metric_inventory.py restore --apply`, same table, same scope): the metric names are back in the emitters,
+   the in-tree readers (planner/live_metrics, rigmon/sources, probes, gpu_battery), the tests that pin them and the panels.  Test
+   `test_metric_names_must_keep_1008.py`: static scan vs the old inventory (fixture), the exporters on synthetic input (front exposition, rank gauges,
+   sampler lines, /v1/loads), the engine on the old spellings, the must-keep list; no `pdflip_*` / `flliper:*` name for the same metric appears next to the old one.
+
+Left to the dashboard package (F0-F): the readers in `tools/rig_dashboard` (`server.py` reads `flliper:*` from the servers, `rigdash` reads `pdflip_*` series: both
+must read the old and the new spelling, F0-F does this for rigdash) and the generated `catalog.json` / UI texts that mention the names.
+
