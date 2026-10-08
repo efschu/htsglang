@@ -306,8 +306,7 @@ class TestCatalog(unittest.TestCase):
         with open(os.path.join(WEG2, "kantenkatalog_1004.json"), encoding="utf-8") as fh:
             edges = {k["id"]: k for k in json.load(fh)["kanten"]}
         want = {"K132": ("--moe-act-int8", "--quantization", "braucht"),
-                "K133": ("SGLANG_MOE_ACT_INT8", "--quantization", "braucht"),
-                "K134": ("--moe-act-int8", "--hicache-storage-backend", "skaliert_mit")}
+                "K133": ("SGLANG_MOE_ACT_INT8", "--quantization", "braucht")}
         for i, (von, nach, rel) in want.items():
             e = edges[i]
             self.assertEqual((e["von"], e["nach"], e["rel"]), (von, nach, rel), i)
@@ -316,12 +315,18 @@ class TestCatalog(unittest.TestCase):
         self.assertIn("compressed-tensors", edges["K132"]["satz"])
         self.assertIn("Dual", edges["K132"]["satz"])                    # 'Dual not affected' is in the words, with its plan source
         self.assertIn("nicht betroffen", edges["K132"]["satz"])
-        self.assertIn("L3-Identität", edges["K134"]["satz"])
-        self.assertIn("nicht verdrahtet", edges["K134"]["satz"])        # the identity field is H88-D: never claimed as built here
+        # the L3-identity edge (--moe-act-int8 -> --hicache-storage-backend) has NO evidence in this tree (the field is H88-D):
+        # it is not in the proven catalog (offen.txt rule), it stands in offen.txt with the question for the H88-D anchor
+        self.assertNotIn("K134", edges)
+        self.assertFalse([k for k in edges.values() if k["von"] == "--moe-act-int8" and k["nach"] == "--hicache-storage-backend"])
+        with open(os.path.join(WEG2, "offen.txt"), encoding="utf-8") as fh:
+            offen = fh.read()
+        self.assertRegex(offen, r"(?m)^17\. --moe-act-int8 -> --hicache-storage-backend \(skaliert_mit\)")
+        self.assertIn("H88-D", offen)
 
     def test_the_edge_anchors_resolve_in_this_tree(self):
         with open(os.path.join(WEG2, "kantenkatalog_1004.json"), encoding="utf-8") as fh:
-            edges = [k for k in json.load(fh)["kanten"] if k["id"] in ("K132", "K133", "K134")]
+            edges = [k for k in json.load(fh)["kanten"] if k["id"] in ("K132", "K133")]
         res = PC.resolve_edge_belege(edges, TREE, "nf")
         for i, r in res.items():
             self.assertIn(r["status"], PC.ANKER_OK, (i, r))
@@ -341,10 +346,10 @@ class TestCatalog(unittest.TestCase):
         deps = {d["to"]: d for d in cat["entries"]["--moe-act-int8"]["depends"]}
         self.assertEqual(deps["--quantization"]["rel"], "braucht")
         self.assertEqual(deps["--quantization"]["kante"], "K132")
-        self.assertEqual(deps["--hicache-storage-backend"]["kante"], "K134")
+        self.assertNotIn("--hicache-storage-backend", deps)             # unproven in this tree: offen.txt Nr. 17, not an edge
         self.assertEqual({d["to"]: d["kante"] for d in cat["entries"]["SGLANG_MOE_ACT_INT8"]["depends"]}, {"--quantization": "K133"})
         self.assertTrue(all(d["belegt"] for n in self.NAMES for d in cat["entries"][n]["depends"]))
-        self.assertEqual(cat["kanten"]["kanten_gesamt"], 134)
+        self.assertEqual((cat["kanten"]["kanten_gesamt"], cat["kanten"]["kanten_belegt"]), (133, 133))
 
 
 # ---------------------------------------------------------------------------
