@@ -164,6 +164,7 @@ from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import usage_true as _ut  # USAGE-TRUE: the client sees the prefill really computed
 from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
 from sglang.srt.weg2 import session_trace as _st  # SESSION-TRACE: session hash + shared prefix
+from sglang.srt.weg2 import lanes as _lanes  # PRIORITY LANES 1008 (L1): request field + lane state, default off
 # DASHBOARD-IPC 01.10. (stdlib only, imported HERE: no first import on the loop, weg2rc2)
 from sglang.srt.weg2 import front_requests as _frq  # front.flip / d_activity / ttft_by_via / request_done
 from sglang.srt.weg2 import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
@@ -3655,6 +3656,9 @@ class Pending:
     #: because its hand-off was LOST while it waited for a D seat. Bounded at
     #: one -- a second loss over X ends the rid by name (W35), never sent to D.
     handoff_lost_reroutes: int = 0
+    #: PRIORITY LANES 1008 (L1, weg2/lanes.py): the request's lane (its `priority`, no number = 0).
+    #: Set only with SGLANG_WEG2_LANES=1; off it stays 0 and nothing reads it.
+    lane: int = 0
 
 
 #: H102 (#23p, dkrnfbar1agent0925): A CLIENT THAT HANGS UP BEFORE ITS ANSWER
@@ -4953,7 +4957,8 @@ class Front:
                 p = Pending(rid=rid, path=v_path, payload=v_payload, text=f"\x00rvp:{rid}",
                             t_arrive=now, fut=asyncio.get_event_loop().create_future(),
                             est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
-                            span_known=True, p_only=True, resume_via_p=True)
+                            span_known=True, p_only=True, resume_via_p=True,
+                            lane=Front._lane_for(self, rid))
                 self.counters["rvp_vision"] += 1
             else:
                 payload = {"rid": rid, "input_ids": ids,
@@ -4972,7 +4977,8 @@ class Front:
                 p = Pending(rid=rid, path="/generate", payload=payload, text=f"\x00rvp:{rid}",
                             t_arrive=now, fut=asyncio.get_event_loop().create_future(),
                             est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
-                            span_known=True, p_only=True, resume_via_p=True)
+                            span_known=True, p_only=True, resume_via_p=True,
+                            lane=Front._lane_for(self, rid))
             self.queue.append(p)
             self._rvp_inflight.add(rid)
             self.counters["rvp_rerouted"] += 1
@@ -7152,6 +7158,58 @@ class Front:
         got = (self.__dict__.get("_ns_ek") or {}).get(str(rid))
         return got is not None and ((not got[0]) or got[1] is not None)
 
+    def _lane_state(self):
+        """PRIORITY LANES 1008 (L1): ``lane_floor`` / ``lane_epoch`` and the lane of every open rid
+        (weg2/lanes.LaneState). Created on first use, so a front with the switch off never has one."""
+        ls = self.__dict__.get("_lane_state_obj")
+        if ls is None:
+            ls = self.__dict__["_lane_state_obj"] = _lanes.LaneState()
+        return ls
+
+    def _lane_note(self, rid: str, payload) -> None:
+        """PRIORITY LANES 1008 (L1): read ``payload["priority"]`` into the lane of ``rid`` (negative or
+        malformed -> lane 0 with a ``WEG2 LANE-FIELD`` warning), note it in LaneState and the request
+        book. SGLANG_WEG2_LANES off: returns before it looks at the payload."""
+        if not _lanes.enabled():
+            return
+        try:
+            raw = payload.get(_lanes.FIELD) if isinstance(payload, dict) else None
+            lane, why = _lanes.parse_lane(raw)
+            if why is not None:
+                logger.warning("%s rid=%s priority=%r -> lane %d (%s)", _lanes.MARK_FIELD, rid, raw, lane, why)
+            Front._lane_state(self).note(rid, lane)
+            Front._req_book(self).lane(rid, lane)
+        except Exception:  # noqa: BLE001 -- an instrument, never the route
+            pass
+
+    def _lane_for(self, rid: Any) -> int:
+        """The lane noted for ``rid`` (0 when none: switch off, or a rid the front never noted)."""
+        ls = self.__dict__.get("_lane_state_obj")
+        return 0 if ls is None else ls.lane_for(rid)
+
+    def _lane_end(self, rid: Any) -> None:
+        """The rid ended (the generate handler's end): its lane note goes."""
+        ls = self.__dict__.get("_lane_state_obj")
+        if ls is not None:
+            ls.end(rid)
+
+    def _lane_block(self) -> dict:
+        """``{lane_floor, lane_epoch, lanes}`` for state.json / ``/weg2/state``; ``{}`` with the switch off
+        (the state stays byte-identical)."""
+        if not _lanes.enabled():
+            return {}
+        try:
+            q = [p.rid for p in list(getattr(self, "queue", None) or ())]
+            q += [p.rid for p in list(getattr(self, "_ready_for_d", None) or ())]
+            gp, gd = self.groups.get("P"), self.groups.get("D")
+            return Front._lane_state(self).state_block(
+                pending=q,
+                running_p=list(getattr(gp, "outstanding", None) or ()),
+                running_d=list(getattr(gd, "outstanding", None) or ()),
+                parked=list(getattr(self, "_d_parked", None) or ()))
+        except Exception:  # noqa: BLE001 -- an instrument, never the route
+            return {}
+
     def _p_anchor_presence(self, rid: str, text: str, pending: Any) -> int:
         """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE).
 
@@ -7268,7 +7326,8 @@ class Front:
                     _n_hb = int(_ids_hb.size)
             p = Pending(rid, request.path, payload, text, time.time(),
                         asyncio.get_event_loop().create_future(),
-                        est_prompt=_n_hb, est_uncached=_n_hb, span_known=False)
+                        est_prompt=_n_hb, est_uncached=_n_hb, span_known=False,
+                        lane=Front._lane_for(self, rid))
         else:
             p.fut = asyncio.get_event_loop().create_future()
             p.t_arrive = time.time()
@@ -8591,6 +8650,7 @@ class Front:
                     rid = None
                 if rid:
                     self._ipc_out_book().end(rid)
+                    Front._lane_end(self, rid)  # PRIORITY LANES 1008 (L1): the lane note goes with the rid
                     try:  # DASHBOARD-IPC: request_done (+ an open park) -- never the answer's fault
                         Front._rb_done(self, rid, status)
                     except Exception as e:  # noqa: BLE001
@@ -8632,6 +8692,8 @@ class Front:
         out["d_cached_tokens"] = {"total": _d_c, "handoff": _h_c, "d_prefix_hit": max(0, _d_c - _h_c)}
         # #287 NEED0 (c): parked over N D phases without output (weg2/park_stuck.py)
         out["d_park_stuck"] = self._park_stuck().block(envs.SGLANG_WEG2_PARK_STUCK_PHASES.get())
+        # PRIORITY LANES 1008 (L1): front.lane_floor / lane_epoch / lanes -- nothing with the switch off
+        out.update(Front._lane_block(self))
         health = {}
         for g in self.groups.values():
             f = getattr(g, "health_facts", None)
@@ -8944,6 +9006,8 @@ class Front:
             **({} if self._x_setup is None else _xcurves.state_block(
                 mode=self.x_mode, source=self._x_setup.source, envelope=self._x_setup.envelope,
                 last=self._x_curve_last)),
+            # PRIORITY LANES 1008 (L1): only with SGLANG_WEG2_LANES=1 (the live state stays byte-identical off).
+            **Front._lane_block(self),
         }
 
     async def handle_passthrough_get(self, request: web.Request) -> web.Response:
@@ -9415,6 +9479,9 @@ class Front:
         # Q-530 SALT-ISOLATION: the namespace is noted at the arrival, so every
         # recording site knows it even when the exact count falls back
         Front._ns_note(self, rid, payload)
+        # PRIORITY LANES 1008 (L1): the request's lane, read from the raw payload (a no-op with
+        # SGLANG_WEG2_LANES off: the front does not read `priority`)
+        Front._lane_note(self, rid, payload)
         _pb_fut = Front._pb_register(self, rid, remainder) if self.x_exact else None
         # EARLY-FLIP: D idle and a chars/3 price far over X -> the D->P flip begins
         # NOW, beside the count and the probe below; it awaits this verdict
@@ -9758,7 +9825,9 @@ class Front:
                     # closed batch gate stops every SHORT arrival behind it --
                     # also the ones that fit -- until D's running decodes end,
                     # up to --drain-deadline-s each. Today's path keeps it here.
-                    d_eligible=short_ok and not short_refused)
+                    d_eligible=short_ok and not short_refused,
+                    # PRIORITY LANES 1008 (L1): the lane noted at the arrival (0 with the switch off)
+                    lane=Front._lane_for(self, rid))
         if _pb_to_p is not None:
             p.d_eligible = False  # PRICE-BARRIER: it rides the LONG's P phase, never handed back to D
         if _sk and self.awake == "D" and self.admit_d and self.state == "serving":
@@ -13168,7 +13237,8 @@ class Front:
                     _est = int(_ids.size)
             p = Pending(rid, request.path, payload, text, time.time(),
                         asyncio.get_event_loop().create_future(),
-                        est_prompt=_est, est_uncached=_est, span_known=False)
+                        est_prompt=_est, est_uncached=_est, span_known=False,
+                        lane=Front._lane_for(self, rid))
             # MF-3: `store_span_est` stays 0 on this path ON PURPOSE, and the
             # reason is evidence, not caution: D has just refused this rid
             # with W31, i.e. its uncached extent AFTER match_prefix was larger
