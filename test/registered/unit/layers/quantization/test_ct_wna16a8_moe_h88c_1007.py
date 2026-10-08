@@ -329,6 +329,158 @@ class TestFactorSidecar(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# publish gate and adopted-factor band (fix round 1, review finding 1)
+# ---------------------------------------------------------------------------
+
+
+def _f32(x):
+    return struct.unpack(">f", struct.pack(">f", float(x)))[0]
+
+
+class TestPublishGate(unittest.TestCase):
+    """Only a rank holding the WHOLE layer tensor publishes the factor.
+
+    A subset view -- vetoed / cut rows, placeholder weights, an expert-dim shard window of
+    SGLANG_UNEVEN_MOE_EXPERT_SHARD (layer._expert_shard_generic, fused_moe_triton/layer.py:593) -- has its own
+    maximum, smaller (or differently placed) relative to the whole tensor. First-writer-wins would let such a view
+    pin the sidecar on the tmpfs store; every later boot (P included, same identity) adopts a factor that maps the
+    full view's largest scale past the x4096 reference -- the kernel accumulates int32 and wraps silently
+    (marlin_template.h:1480-1503). Hence subset views ADOPT only; full views compute the SAME value from the same
+    tensor (vLLM semantics max/4096 over the whole tensor), so publishing carries no order dependence.
+    Pinned against the real store directory, no mocks."""
+
+    def setUp(self):
+        self.store = tempfile.mkdtemp(prefix="h88c_gate_")
+        self.addCleanup(shutil.rmtree, self.store, True)
+        self.scale = torch.rand(3, 4, 64, generator=torch.Generator().manual_seed(7)) + 0.25
+        self.scheme = S.CompressedTensorsWNA16A8MoE.__new__(S.CompressedTensorsWNA16A8MoE)
+        self.scheme.w4a8_group_size = 32
+
+    def _layer(self, **extra):
+        attrs = {"_sglang_prefix": "model.layers.0.mlp.experts", "moe_tp_rank": 0}
+        attrs.update(extra)
+        return types.SimpleNamespace(**attrs)
+
+    def _env(self):
+        return mock.patch.dict(os.environ, _clean_env(
+            SGLANG_MOE_EXPERT_STORE_DIR=self.store, SGLANG_MOE_EXPERT_STORE_IDENTITY=""))
+
+    def test_full_view_publishes(self):
+        with self._env():
+            f, src = self.scheme._resolve_factor(self._layer(), "w13_weight_scale", self.scale, None, False)
+        self.assertEqual(src, "published")
+        self.assertAlmostEqual(f, S.w4a8_scale_proposal(self.scale), delta=abs(f) * 1e-6)
+
+    def test_subset_views_on_an_empty_store_refuse_by_name(self):
+        # vetoed/cut rows, expert-shard window, placeholder weights: nothing published, refusal names the reason
+        cases = (
+            ("row cut", self._layer(), [0, 2], False),
+            ("expert window", self._layer(_expert_shard_generic=True), None, False),
+            ("placeholder", self._layer(), None, True),
+        )
+        with self._env():
+            for name, layer, rows, ph in cases:
+                with self.subTest(case=name):
+                    with self.assertRaisesRegex(
+                        es.W4A8FactorUnavailable, "only a rank with the whole tensor publishes"
+                    ):
+                        self.scheme._resolve_factor(layer, f"attr_{name.replace(' ', '_')}", self.scale, rows, ph)
+        self.assertEqual([n for n in os.listdir(self.store) if n.endswith(es.FACTOR_SUFFIX)], [])
+
+    def test_full_view_publishes_then_every_subset_adopts_identically(self):
+        with self._env():
+            f0, src0 = self.scheme._resolve_factor(self._layer(), "w13_weight_scale", self.scale, None, False)
+            self.assertEqual(src0, "published")
+            # a second FULL-view rank adopts the identical float32 (publishing has no order dependence:
+            # every full view computes the same max/4096 from the same tensor)
+            f1, src1 = self.scheme._resolve_factor(
+                self._layer(moe_tp_rank=1), "w13_weight_scale", self.scale, None, False
+            )
+            self.assertEqual(src1, "adopted")
+            self.assertEqual(f1, f0)
+            for name, kwargs, rows, ph in (
+                ("expert window", {"_expert_shard_generic": True}, None, False),
+                ("row cut", {}, [0, 2], False),
+                ("placeholder", {}, None, True),
+            ):
+                with self.subTest(case=name):
+                    f, src = self.scheme._resolve_factor(
+                        self._layer(**kwargs), "w13_weight_scale", self.scale, rows, ph
+                    )
+                    self.assertEqual(src, "adopted")
+                    self.assertEqual(f, f0)
+            rec = es.read_factor(self.store, "model.layers.0.mlp.experts", "w13_weight_scale")
+            self.assertEqual(rec["factor"], f0)  # no subset overwrote the sidecar
+
+    def test_subset_cannot_overwrite_even_with_a_larger_own_max(self):
+        with self._env():
+            f0, _ = self.scheme._resolve_factor(self._layer(), "w13_weight_scale", self.scale, None, False)
+            bigger = self.scale * 100.0  # this rank's subset view has the larger maximum
+            f, src = self.scheme._resolve_factor(
+                self._layer(_expert_shard_generic=True), "w13_weight_scale", bigger, None, False
+            )
+            self.assertEqual(src, "adopted")
+            self.assertEqual(f, f0)
+
+    def test_no_store_keeps_the_h88b_local_factor_for_every_view(self):
+        # no store = no sharing channel and no shared bytes: the rank's own factor applies, subset included
+        # (this is the H88-B arithmetic the veto path without a store relies on)
+        with mock.patch.dict(os.environ, _clean_env(), clear=True):
+            for rows in (None, [0, 2]):
+                with self.subTest(rows=rows):
+                    f, src = self.scheme._resolve_factor(self._layer(), "w13_weight_scale", self.scale, rows, False)
+                    self.assertEqual(src, "local")
+                    self.assertAlmostEqual(f, S.w4a8_scale_proposal(self.scale, rows), delta=abs(f) * 1e-6)
+
+
+class TestAdoptedFactorBand(unittest.TestCase):
+    """The band's upper end for an ADOPTED factor is the x4096 reference, not the int16 limit 32767.
+
+    The kernel sums ``frag_c(int32) += frag_c_tmp(int32 group dot) * scale(int)`` over every group of K
+    (jit_kernel/csrc/gemm/marlin_a8_moe/marlin_template.h:1480-1503); a scale mapped above 4096 multiplies
+    every group dot beyond the reference and the int32 accumulator wraps with no error. The H88-B reference and
+    the GPU numerics test D7 orders both use round(s / max * 4096) (marlin_w4a8_utils.py:45-46,267-269)."""
+
+    def setUp(self):
+        self.s = (torch.rand(2, 4, 64, generator=torch.Generator().manual_seed(3)) + 0.25).to(torch.bfloat16)
+        self.smax = float(self.s.float().abs().max())
+
+    def test_upper_end_is_4096(self):
+        self.assertEqual(S.W4A8_MAX_INT_BAND, (64, 4096))
+
+    def test_self_consistent_factor_passes_including_the_float32_sidecar_round_trip(self):
+        ref = _f32(self.smax / 4096)  # what claim_scale_factor stores and every rank adopts
+        out, fac = S.w4a8_process_moe_scales(self.s, factor=ref)
+        self.assertEqual(float(fac), ref)
+        self.assertEqual(int(out.view(torch.int16).max()), 4096)  # largest scale lands exactly on the reference
+
+    def test_factors_in_the_old_int16_headroom_refuse_by_name(self):
+        # max_int in (4096, 32767] was accepted before the fix (int16 storage fits) but leaves the x4096
+        # reference -> the int32 accumulator can overflow silently. Now: refused, named, with the sidecar hint.
+        for target in (5000.0, 8000.0, 32000.0):
+            with self.subTest(max_int=target):
+                with self.assertRaisesRegex(
+                    S.W4A8FactorOutOfBand, "FACTOR OUT OF BAND.*above the band.*int32 accumulator"
+                ):
+                    S.w4a8_process_moe_scales(self.s, factor=self.smax / target)
+
+    def test_lower_end_unchanged(self):
+        with self.assertRaisesRegex(S.W4A8FactorOutOfBand, "below the band"):
+            S.w4a8_process_moe_scales(self.s, factor=self.smax / 40.0)
+
+    def test_band_covers_rows_only(self):
+        # only the rows this rank keeps are priced: a kept-row maximum inside the band passes even when a
+        # never-read row would exceed it (that row is another process's, garbage here)
+        s = torch.zeros(3, 4, 64, dtype=torch.bfloat16)
+        s[0] = 0.5   # kept row: max 0.5
+        s[2] = 9.0   # row this rank never reads
+        factor = _f32(0.5 / 4096)  # maps the KEPT maximum to exactly 4096
+        out, fac = S.w4a8_process_moe_scales(s, factor=factor, rows=[0, 1])
+        self.assertEqual(float(fac), factor)
+        self.assertEqual(int(out.view(torch.int16)[0].max()), 4096)
+
+
+# ---------------------------------------------------------------------------
 # compute_identity: the default layout stays byte-identical, others carry the tag (D5)
 # ---------------------------------------------------------------------------
 

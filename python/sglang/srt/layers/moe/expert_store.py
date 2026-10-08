@@ -183,9 +183,12 @@ def sentinel_is_ours(data: dict) -> bool:
 #
 # The agreement is a sidecar next to the store file: ``<store file>.factor.json``, published FIRST-WRITER-WINS
 # (``os.link`` of a private temp file fails when the name exists), carrying the boot's store identity (which carries
-# the layout tag) so a sidecar of another checkpoint / layout vouches for nothing. Whoever converts a layer first
-# proposes ITS factor; everyone after adopts it. A rank whose own scales exceed the adopted factor's int16 range
-# (> 32767) refuses by name (:class:`W4A8FactorSaturated` in the scheme) -- never a silent clip.
+# the layout tag) so a sidecar of another checkpoint / layout vouches for nothing. Only a rank that holds the WHOLE
+# layer tensor publishes (the scheme gates it: rows None, not placeholder, no expert-dim shard window) -- every
+# full-view rank computes the same factor (max/4096 over the whole tensor, vLLM semantics), so first-writer-wins
+# only ever races identical values; subset views adopt. A rank whose own scales map above the adopted factor's
+# x4096 reference band (the kernel's int32 accumulator overflows silently there; the int16 would fit to 32767)
+# refuses by name (``W4A8FactorOutOfBand`` in the scheme) -- never a silent clip.
 
 FACTOR_SUFFIX = ".factor.json"
 FACTOR_MARKER = "H88C SCALE-FACTOR"
@@ -239,7 +242,9 @@ def claim_scale_factor(
 ) -> Tuple[float, str]:
     """The factor of (layer, ``attr``) for this boot: ``(factor, source)``, source in ``"adopted"`` (somebody
     published first) or ``"published"`` (this call did). ``proposal=None`` means "I cannot propose" (placeholder
-    weights, a subset of the rows): then only an existing sidecar helps, else :class:`W4A8FactorUnavailable`.
+    weights, a subset of the rows, an expert-dim shard window): then only an existing sidecar helps, else
+    :class:`W4A8FactorUnavailable`. A proposal is only ever published by the caller's scheme when that caller holds
+    the whole layer tensor (the scheme gates it), so identical data cannot publish two different factors.
 
     A record that disagrees on the layout or the group size is an error (two different boots share the directory)."""
     path = factor_path(directory, layer_key, attr)
@@ -257,8 +262,9 @@ def claim_scale_factor(
         if proposal is None:
             raise W4A8FactorUnavailable(
                 f"{FACTOR_MARKER}: no scale factor published for {layer_key}/{attr} in {directory} and this rank "
-                f"cannot compute one (placeholder weights or a subset of the expert rows). The factor is the first "
-                f"converting rank's: start the group that holds the whole layer (P) first, or run with the "
+                f"cannot compute one -- it sees only a subset of the tensor (placeholder weights, vetoed / cut "
+                f"rows, or an expert-dim shard window of SGLANG_UNEVEN_MOE_EXPERT_SHARD) and only a rank with the "
+                f"whole tensor publishes. Start the group that holds the whole layer (P) first, or run with the "
                 f"checkpoint rows complete."
             )
         os.makedirs(directory, exist_ok=True)

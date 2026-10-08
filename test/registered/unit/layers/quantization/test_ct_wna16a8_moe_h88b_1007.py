@@ -816,10 +816,20 @@ class TestRefusals(CustomTestCase):
             self.assertEqual(rec["group_size"], 32)
             self.assertEqual(rec["factor"], float(np.float32(want)))
         self.assertAlmostEqual(float(layer.w13_act_scale_factor), want13, delta=abs(want13) * 1e-6)
-        # the next converting rank ADOPTS the published factor even where its own maximum differs
+        # the next converting rank ADOPTS the published factor even where its own maximum differs.
+        # Fix-round-1 regime note: one store identity pins one checkpoint, so an adopting FULL-view rank reads the
+        # same tensor and the adopted factor maps its largest scale to <= 4096 by construction. A fixture whose
+        # own maximum were LARGER would be different data under one identity -- the band refuses that
+        # (test_store_on_out_of_band_adopted_factor_refuses_by_name and TestAdoptedFactorBand in
+        # test_ct_wna16a8_moe_h88c_1007.py). The adoption test therefore prices the second fixture BELOW the
+        # publisher's maxima (band-internal adoption), still a different factor than its own proposal.
         fx2 = Fixture(E=2, K=128, N=64, gs=32, seed=1)
+        fx2.w13_scale = fx2.w13_scale * 0.5
+        fx2.w2_scale = fx2.w2_scale * 0.5
         own2 = S.w4a8_scale_proposal(fx2.w13_scale)
         self.assertGreater(abs(own2 - want13), 1e-9)  # the fixtures really disagree on the maximum
+        self.assertLessEqual(own2, want13)  # adoption regime: own view priced below the publisher's
+        self.assertLessEqual(S.w4a8_scale_proposal(fx2.w2_scale), want2)
         scheme2 = CompressedTensorsWNA16A8MoE(_quant_config(group_size=32), _weight_quant(32))
         layer2 = new_layer(scheme2, fx2)
         layer2._sglang_prefix = prefix

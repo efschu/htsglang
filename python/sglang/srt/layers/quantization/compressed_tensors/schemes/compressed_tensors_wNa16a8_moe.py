@@ -34,10 +34,13 @@ H88-C (loader / offload / store / flip) -- what the scheme does with the rows ot
   tensor as UNCOVERED (W84);
 * a store row is a function of (expert, factor) in this layout. Where processes share rows (the expert store, the
   D-store-adopt veto, the flip exchange between P and D) the factor of a (layer, tensor) is agreed through the store
-  (``expert_store.claim_scale_factor``: first converting rank publishes, everybody else adopts); a rank that sees only
-  a subset of the rows (vetoed rows / h2d cut) or holds placeholder weights can only ADOPT. A two-group boot without a
-  store directory has no agreement channel and is refused by name. The factor is checked against the int16 range of
-  this rank's own scales (:data:`W4A8_MAX_INT_BAND`), never clipped silently;
+  (``expert_store.claim_scale_factor``); only a rank holding the WHOLE tensor publishes (vLLM semantics: max/4096
+  over the whole tensor, so every full-view rank computes the same value and publishing is order-independent), and
+  every subset view -- vetoed rows / h2d cut, placeholder weights, an expert-dim shard window
+  (``SGLANG_UNEVEN_MOE_EXPERT_SHARD``) -- can only ADOPT. A two-group boot without a store directory has no
+  agreement channel and is refused by name. An adopted factor must map this rank's largest scale into
+  :data:`W4A8_MAX_INT_BAND` (upper end 4096 = the x4096 reference, the kernel accumulates the scaled group dots in
+  int32 and overflows silently above it), never clipped silently;
 * the layout tag goes into the store identity (``expert_store.compute_identity(layout=...)``, launcher) and P and D
   must run the same layout (``moe_w4a8_layout.check_one_layout_per_boot``).
 
@@ -75,6 +78,7 @@ __all__ = [
     "CompressedTensorsWNA16A8MoE",
     "W4A8FactorOutOfBand",
     "W4A8_MAX_INT_BAND",
+    "W4A8_BAND_TOL_REL",
     "w4a8_scale_proposal",
     "validate_w4a8_moe_dims",
     "w4a8_process_moe_scales",
@@ -92,12 +96,21 @@ W4A8_DIM_MULTIPLE = 64
 
 MARKER = "MOE-ACT-INT8"
 
-#: the int16 scale of a group is ``round(s / factor)``. With the factor ``max(s) / 4096`` of one rank's own view the
-#: largest scale is 4096 (8x headroom to int16). A factor adopted from another rank (H88-C: the first converting rank
-#: of the store publishes) maps THIS rank's largest scale to ``max(s) / factor``: it must stay inside this band --
-#: above the upper end the int16 saturates (silent clipping), below the lower end fewer than ~6 bits of the largest
-#: scale survive. Outside the band the rank REFUSES by name (:class:`W4A8FactorOutOfBand`).
-W4A8_MAX_INT_BAND = (64, 32767)
+#: the int16 scale of a group is ``round(s / factor)``. The reference factor (H88-B, vLLM semantics) is
+#: ``max(s) / 4096`` over the WHOLE tensor: the largest scale maps to 4096 (``W4A8_SCALE_INT_RANGE``). A factor
+#: adopted from another rank (H88-C: published through the store sidecar) maps THIS rank's largest scale to
+#: ``max(s) / factor``, and the kernel accumulates in int32: ``frag_c(int32) += frag_c_tmp(int32 group dot) *
+#: scale(int)`` summed over every group of K (jit_kernel/csrc/gemm/marlin_a8_moe/marlin_template.h:1480-1503).
+#: A scale above 4096 multiplies every group dot beyond the reference and can overflow that accumulator --
+#: a wrap is silent (wrong output, no error). Hence the band's upper end is the x4096 REFERENCE range, not the
+#: int16 storage limit 32767: with only full-view ranks publishing (:meth:`CompressedTensorsWNA16A8MoE._resolve_factor`)
+#: every adopting rank's view is a subset of the publisher's tensor, so its max_int stays <= 4096; a factor from
+#: a subset view (a stale sidecar included) that would push a full view past 4096 REFUSES by name instead of
+#: letting the accumulator wrap. Below the lower end fewer than ~6 bits of the largest scale survive. The
+#: tolerance covers the float32 round trip of the sidecar (relative 2**-24) so the publisher itself, whose own
+#: max lands exactly on 4096, is never refused. Outside the band: :class:`W4A8FactorOutOfBand`.
+W4A8_MAX_INT_BAND = (64, 4096)
+W4A8_BAND_TOL_REL = 1e-6
 
 
 class W4A8FactorOutOfBand(RuntimeError):
@@ -200,7 +213,8 @@ def w4a8_process_moe_scales(
     ``factor=<float>`` (H88-C, a factor agreed with other processes through the store): the int16 is
     ``round(s / factor)``; the rows in ``rows`` (None = all) are the ones this rank actually holds -- the others are
     never read and are ignored by the range check; the largest viewed scale must map into
-    :data:`W4A8_MAX_INT_BAND`, else :class:`W4A8FactorOutOfBand`."""
+    :data:`W4A8_MAX_INT_BAND` -- upper end 4096, the x4096 reference range, because the kernel's int32 accumulator
+    overflows silently above it (:data:`W4A8_MAX_INT_BAND` names the reason) -- else :class:`W4A8FactorOutOfBand`."""
     from sglang.jit_kernel import marlin_w4a8_utils as U
 
     E, G, N = s.shape
@@ -228,16 +242,22 @@ def w4a8_process_moe_scales(
     if vmax > 0.0:
         max_int = vmax / float(fac32)
         lo, hi = W4A8_MAX_INT_BAND
-        if not (lo <= max_int <= hi):
+        # the float32 round trip through the sidecar (relative 2**-24) must not refuse the publisher itself,
+        # whose own largest scale lands exactly on the band upper end
+        hi_ok = hi * (1.0 + W4A8_BAND_TOL_REL)
+        if not (lo <= max_int <= hi_ok):
+            why = (
+                "above the band: the int16 would still fit (up to 32767), but the kernel multiplies every group "
+                "dot by this scale in its int32 accumulator and overflows SILENTLY"
+                if max_int > hi_ok
+                else "below the band: fewer than ~6 bits of the largest scale would survive"
+            )
             raise W4A8FactorOutOfBand(
-                f"{MARKER} FACTOR OUT OF BAND: {what or 'a layer tensor'} -- the agreed scale factor {float(fac32):.6g} "
-                f"maps this rank's largest group scale {vmax:.6g} to {max_int:.1f}, outside the int16 band "
-                f"[{lo}, {hi}] ("
-                + ("above: the int16 would saturate and clip scales silently" if max_int > hi else
-                   "below: fewer than ~6 bits of the largest scale would survive")
-                + "). The factor came from another rank's view of the same tensor; remove the factor sidecars "
-                f"(*.factor.json in the expert store directory) and boot again with the group that holds the "
-                f"whole layer (P) converting first."
+                f"{MARKER} FACTOR OUT OF BAND: {what or 'a layer tensor'} -- the agreed scale factor "
+                f"{float(fac32):.6g} maps this rank's largest group scale {vmax:.6g} to {max_int:.1f}, outside "
+                f"the band [{lo}, {hi}] (the x4096 scale reference), {why}. The factor came from another "
+                "process's view of the same tensor; remove the factor sidecars (*.factor.json in the expert "
+                "store directory) and boot again with a rank that holds the whole tensor converting first."
             )
     out = (perm.float() / fac32).round().clamp_(-32768, 32767).to(torch.int16).view(s.dtype)
     return out.contiguous(), fac32.reshape(())
@@ -378,6 +398,15 @@ class CompressedTensorsWNA16A8MoE(CompressedTensorsWNA16MoE):
         ``None`` = channelwise (no factor). Sources: ``local`` (one process, whole tensor: H88-B), ``published`` /
         ``adopted`` (agreed through the store), ``placeholder`` (single-group dummy load: nothing to agree on).
 
+        Only a rank that sees the WHOLE tensor publishes through the sidecar: a row cut (``rows``: H2 store-adopt
+        veto / h2d cut), placeholder weights and an expert-dim shard window (``SGLANG_UNEVEN_MOE_EXPERT_SHARD``,
+        ``layer._expert_shard_generic``, fused_moe_triton/layer.py:593) are all SUBSET views -- their own maximum is
+        smaller than the whole tensor's, and a factor published from one would price the shared rows below every
+        other process's range (the band check at :data:`W4A8_MAX_INT_BAND` then refuses, per boot, until the
+        sidecars are removed). Subset views ADOPT; every full-view rank computes the SAME factor from the same
+        tensor (vLLM semantics, max/4096 over the whole tensor), so publishing is order-independent. Without a
+        store there is no channel and nothing is shared: the rank's own factor applies (H88-B arithmetic).
+
         Two-group boot (``SGLANG_WEG2_GROUP``): P and D share store rows and the flip moves bytes from one to the
         other, so the factor MUST be agreed -- without a store directory there is no channel and the boot is refused."""
         from sglang.srt.layers.moe import expert_store
@@ -389,12 +418,14 @@ class CompressedTensorsWNA16A8MoE(CompressedTensorsWNA16MoE):
         proposal = None if placeholder else w4a8_scale_proposal(scale, rows)
         two_group = bool(os.environ.get(GROUP_ENV, "").strip())
         if expert_store.store_enabled():
+            expert_window = bool(getattr(layer, "_expert_shard_generic", False))
+            full_view = rows is None and not placeholder and not expert_window
             try:
                 factor, source = expert_store.claim_scale_factor(
                     expert_store.store_dir(),
                     self._factor_key(layer),
                     scale_attr,
-                    proposal,
+                    proposal if full_view else None,  # subset views adopt, never publish
                     group_size=self.w4a8_group_size,
                     layout=LAYOUT_W4A8,
                     writer=f"{os.environ.get(GROUP_ENV, '-') or '-'}:rank{getattr(layer, 'moe_tp_rank', '?')}",
