@@ -9,7 +9,7 @@ prefix extraction, and inbox routing) on CPU; there is no GPU or transport here.
 
 import unittest
 
-from sglang.srt.speculative.decoupled_spec_io import (
+from flliper.srt.speculative.decoupled_spec_io import (
     DraftClose,
     DraftControlBatch,
     DraftMeshMessage,
@@ -21,8 +21,8 @@ from sglang.srt.speculative.decoupled_spec_io import (
     build_draft_scheduler_rid,
     parse_draft_scheduler_rid,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -133,7 +133,7 @@ class TestVerifierCommitSegment(CustomTestCase):
 
 class TestDraftControlInbox(CustomTestCase):
     def _inbox(self):
-        from sglang.srt.speculative.decoupled_spec_io import DraftControlInbox
+        from flliper.srt.speculative.decoupled_spec_io import DraftControlInbox
 
         return DraftControlInbox()
 
@@ -257,7 +257,7 @@ class TestDraftMeshMessageEnvelope(CustomTestCase):
         self.assertIsNone(msg.tail_stream_output_batch)
 
     def test_from_tail_stream_output_batch_sets_discriminant_and_slot(self):
-        from sglang.srt.speculative.decoupled_spec_io import DraftTailStreamOutputBatch
+        from flliper.srt.speculative.decoupled_spec_io import DraftTailStreamOutputBatch
 
         batch = DraftTailStreamOutputBatch()
         msg = DraftMeshMessage.from_tail_stream_output_batch(batch)

@@ -1,6 +1,6 @@
 """Benchmark: int8 linear-attention checkpoint pool — prefix-reuse capacity & latency.
 
-Drives a *running* SGLang server that serves a linear-attention (KDA / GDN) hybrid
+Drives a *running* fLLiper server that serves a linear-attention (KDA / GDN) hybrid
 model, and measures how prefix reuse — and the probe-phase prefill latency that
 depends on it — holds up as the number of DISTINCT cached prefixes grows.
 
@@ -19,7 +19,7 @@ Method, per K in ``--num-prefixes``:
 
 Run the server twice and compare (same flags, toggle int8):
 
-  python -m sglang.launch_server --model-path <gdn-or-kda-hybrid> --tp 4 \
+  python -m flliper.launch_server --model-path <gdn-or-kda-hybrid> --tp 4 \
       --trust-remote-code --mamba-scheduler-strategy extra_buffer \
       --max-mamba-cache-size 256 [--enable-int8-mamba-checkpoint] --port 30000
 

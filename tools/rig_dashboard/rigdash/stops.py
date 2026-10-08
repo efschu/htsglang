@@ -3,7 +3,7 @@
 Operator order 2026-09-27 ~18Z: NF rc12s (09271719) was stopped ON PURPOSE
 (stop file of the NF endless loop, switch to rc12t) and the dashboard showed
 "Gruppe D tot" -- the teardown after a planned stop kills the processes, and
-WEG2-HEALTH then reports process_alive=False like a death.
+PDFLIP-HEALTH then reports process_alive=False like a death.
 
 Both the NF endless loop (gpu-arb/docker/nf_dauer_loop.sh) and the 27B arms
 run host_acceptance.sh, which writes ``<model dir>/abnahme_cu130.log`` next to

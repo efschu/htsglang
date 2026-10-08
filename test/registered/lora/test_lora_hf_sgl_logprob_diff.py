@@ -13,10 +13,10 @@
 # ==============================================================================
 
 """
-Test to compare log probabilities between HuggingFace+LoRA and SGLang+LoRA.
+Test to compare log probabilities between HuggingFace+LoRA and fLLiper+LoRA.
 
 This test:
-1. Runs SGLang with LoRA and collects log probabilities
+1. Runs fLLiper with LoRA and collects log probabilities
 2. Runs HuggingFace with LoRA and collects log probabilities
 3. Compares the differences (max and mean) between the two implementations
 4. Uses unittest framework for easy integration with test suites
@@ -35,9 +35,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.runners import HFRunner, SRTRunner
+from flliper.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 register_cuda_ci(
     est_time=150,
@@ -50,7 +50,7 @@ register_amd_ci(
 )
 # Test configuration constants
 BASE_MODEL = "meta-llama/Llama-2-7b-hf"
-LORA_PATHS = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
+LORA_PATHS = ["yushengsu/flliper_lora_logprob_diff_without_tuning"]
 LORA_BACKEND = "csgmv"
 DISABLE_CUDA_GRAPH = False
 LORA_TARGET_MODULES = None
@@ -94,23 +94,23 @@ def print_config_info(title: str, config: Dict[str, Any]):
 
 
 def compare_logprobs_for_type(
-    sglang_logprobs: torch.Tensor, hf_logprobs: torch.Tensor, logprob_type: str
+    flliper_logprobs: torch.Tensor, hf_logprobs: torch.Tensor, logprob_type: str
 ) -> Dict[str, Any]:
     """
     Compare logprobs for a specific type (prefill or decode).
 
     Args:
-        sglang_logprobs: SGLang log probabilities
+        flliper_logprobs: fLLiper log probabilities
         hf_logprobs: HuggingFace log probabilities
         logprob_type: Type of logprobs ("prefill" or "decode")
 
     Returns:
         Dictionary containing comparison statistics
     """
-    diff = torch.abs(sglang_logprobs - hf_logprobs)
+    diff = torch.abs(flliper_logprobs - hf_logprobs)
     max_diff = torch.max(diff).item()
     mean_diff = torch.mean(diff).item()
-    shape = list(sglang_logprobs.shape)
+    shape = list(flliper_logprobs.shape)
     matches_threshold = max_diff < LOGPROB_THRESHOLD
 
     return {
@@ -135,26 +135,26 @@ def print_logprob_comparison(comparison: Dict[str, Any]):
 
 
 def compare_output_strings(
-    sglang_output: str, hf_output: str, max_display_len: int = 200
+    flliper_output: str, hf_output: str, max_display_len: int = 200
 ) -> Dict[str, Any]:
     """
-    Compare output strings between SGLang and HuggingFace.
+    Compare output strings between fLLiper and HuggingFace.
 
     Args:
-        sglang_output: SGLang generated text
+        flliper_output: fLLiper generated text
         hf_output: HuggingFace generated text
         max_display_len: Maximum length for display
 
     Returns:
         Dictionary containing comparison results
     """
-    outputs_match = sglang_output.strip() == hf_output.strip()
+    outputs_match = flliper_output.strip() == hf_output.strip()
 
     # Truncate for display if needed
-    sglang_display = (
-        sglang_output[:max_display_len]
-        if len(sglang_output) > max_display_len
-        else sglang_output
+    flliper_display = (
+        flliper_output[:max_display_len]
+        if len(flliper_output) > max_display_len
+        else flliper_output
     )
     hf_display = (
         hf_output[:max_display_len] if len(hf_output) > max_display_len else hf_output
@@ -162,9 +162,9 @@ def compare_output_strings(
 
     return {
         "match": outputs_match,
-        "sglang_output": sglang_output,
+        "flliper_output": flliper_output,
         "hf_output": hf_output,
-        "sglang_display": sglang_display,
+        "flliper_display": flliper_display,
         "hf_display": hf_display,
     }
 
@@ -174,7 +174,7 @@ def print_output_comparison(comparison: Dict[str, Any]):
     print(f"\nOutput strings:")
     status = "MATCH" if comparison["match"] else "DIFFER"
     print(f"  Status:      {status}")
-    print(f"  SGLang:      {comparison['sglang_display']}")
+    print(f"  fLLiper:      {comparison['flliper_display']}")
     print(f"  HuggingFace: {comparison['hf_display']}")
 
 
@@ -197,7 +197,7 @@ def prepare_lora_paths_per_prompt(
     return [lora_paths[i % len(lora_paths)] for i in range(num_prompts)]
 
 
-def run_sglang_with_lora(
+def run_flliper_with_lora(
     model_path: str,
     lora_paths: List[str],
     prompts: List[str],
@@ -209,7 +209,7 @@ def run_sglang_with_lora(
     lora_target_modules: Optional[List[str]],
     tp_size: int,
 ) -> Dict[str, Any]:
-    """Run SGLang with LoRA and return log probabilities."""
+    """Run fLLiper with LoRA and return log probabilities."""
     config = {
         "Model": model_path,
         "LoRA paths": lora_paths,
@@ -219,7 +219,7 @@ def run_sglang_with_lora(
         "Number of prompts": len(prompts),
         "Tensor parallel size": tp_size,
     }
-    print_config_info("Running SGLang with LoRA", config)
+    print_config_info("Running fLLiper with LoRA", config)
 
     lora_paths_per_prompt = prepare_lora_paths_per_prompt(lora_paths, len(prompts))
 
@@ -290,7 +290,7 @@ def run_hf_with_lora(
 
 def compare_single_prompt(
     prompt_idx: int,
-    sglang_data: Dict[str, Any],
+    flliper_data: Dict[str, Any],
     hf_data: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
@@ -298,25 +298,25 @@ def compare_single_prompt(
 
     Args:
         prompt_idx: Index of the prompt being compared
-        sglang_data: SGLang results data
+        flliper_data: fLLiper results data
         hf_data: HuggingFace results data
 
     Returns:
         Dictionary containing all comparison results
     """
     print_subsection_header(f"Prompt {prompt_idx + 1}")
-    print(f"LoRA adapter: {sglang_data['lora_paths'][prompt_idx]}")
+    print(f"LoRA adapter: {flliper_data['lora_paths'][prompt_idx]}")
 
     result = {
         "prompt_idx": prompt_idx,
-        "lora_path": sglang_data["lora_paths"][prompt_idx],
+        "lora_path": flliper_data["lora_paths"][prompt_idx],
     }
 
     # Compare prefill (input) logprobs
-    sglang_prefill = torch.tensor(sglang_data["top_input_logprobs"][prompt_idx])
+    flliper_prefill = torch.tensor(flliper_data["top_input_logprobs"][prompt_idx])
     hf_prefill = torch.tensor(hf_data["top_input_logprobs"][prompt_idx])
     prefill_comparison = compare_logprobs_for_type(
-        sglang_prefill, hf_prefill, "prefill"
+        flliper_prefill, hf_prefill, "prefill"
     )
     print_logprob_comparison(prefill_comparison)
 
@@ -327,9 +327,9 @@ def compare_single_prompt(
     result["prefill_logprob_match"] = prefill_comparison["matches_threshold"]
 
     # Compare decode (output) logprobs
-    sglang_decode = torch.tensor(sglang_data["top_output_logprobs"][prompt_idx])
+    flliper_decode = torch.tensor(flliper_data["top_output_logprobs"][prompt_idx])
     hf_decode = torch.tensor(hf_data["top_output_logprobs"][prompt_idx])
-    decode_comparison = compare_logprobs_for_type(sglang_decode, hf_decode, "decode")
+    decode_comparison = compare_logprobs_for_type(flliper_decode, hf_decode, "decode")
     print_logprob_comparison(decode_comparison)
 
     # Store decode results
@@ -345,14 +345,14 @@ def compare_single_prompt(
     )
 
     # Compare output strings
-    sglang_output = sglang_data["output_strs"][prompt_idx]
+    flliper_output = flliper_data["output_strs"][prompt_idx]
     hf_output = hf_data["output_strs"][prompt_idx]
-    output_comparison = compare_output_strings(sglang_output, hf_output)
+    output_comparison = compare_output_strings(flliper_output, hf_output)
     print_output_comparison(output_comparison)
 
     # Store output results
     result["outputs_match"] = output_comparison["match"]
-    result["sglang_output"] = output_comparison["sglang_output"]
+    result["flliper_output"] = output_comparison["flliper_output"]
     result["hf_output"] = output_comparison["hf_output"]
 
     return result
@@ -420,16 +420,16 @@ def print_overall_statistics(results: List[Dict[str, Any]]):
 
 
 def compare_logprobs(
-    sglang_logprobs: Dict[str, Any], hf_logprobs: Dict[str, Any]
+    flliper_logprobs: Dict[str, Any], hf_logprobs: Dict[str, Any]
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Compare log probabilities and compute statistics."""
     print_section_header("Comparing Log Probabilities")
 
     results = []
-    num_prompts = len(sglang_logprobs["top_input_logprobs"])
+    num_prompts = len(flliper_logprobs["top_input_logprobs"])
 
     for i in range(num_prompts):
-        result = compare_single_prompt(i, sglang_logprobs, hf_logprobs)
+        result = compare_single_prompt(i, flliper_logprobs, hf_logprobs)
         results.append(result)
 
     overall_stats = print_overall_statistics(results)
@@ -439,7 +439,7 @@ def compare_logprobs(
 
 class TestLoRAHFSGLLogprobDifference(CustomTestCase):
     """
-    Test case to compare log probabilities between HuggingFace+LoRA and SGLang+LoRA.
+    Test case to compare log probabilities between HuggingFace+LoRA and fLLiper+LoRA.
     """
 
     def _run_comparison_test(
@@ -456,12 +456,12 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         tp_size: int = 1,
     ):
         """
-        Run comparison test between SGLang and HuggingFace with LoRA.
+        Run comparison test between fLLiper and HuggingFace with LoRA.
         """
         print_section_header(f"Testing {model_path} with LoRA adapters")
 
-        # Step 1: Run SGLang with LoRA
-        sglang_logprobs = run_sglang_with_lora(
+        # Step 1: Run fLLiper with LoRA
+        flliper_logprobs = run_flliper_with_lora(
             model_path=model_path,
             lora_paths=lora_paths,
             prompts=prompts,
@@ -488,7 +488,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         )
 
         # Step 3: Compare log probabilities
-        results, overall_stats = compare_logprobs(sglang_logprobs, hf_logprobs)
+        results, overall_stats = compare_logprobs(flliper_logprobs, hf_logprobs)
 
         # Assert that all prompts pass the threshold
         for result in results:
@@ -509,7 +509,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
 
     def test_lora_logprob_comparison_basic(self):
         """
-        Basic test comparing HF and SGLang LoRA logprobs with small model.
+        Basic test comparing HF and fLLiper LoRA logprobs with small model.
         """
         prompts = DEFAULT_TEST_PROMPTS[:2]  # Use fewer prompts for faster testing
 
@@ -521,7 +521,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
 
     def test_lora_logprob_comparison_full(self):
         """
-        Full test comparing HF and SGLang LoRA logprobs with all prompts.
+        Full test comparing HF and fLLiper LoRA logprobs with all prompts.
         """
         self._run_comparison_test(
             model_path=BASE_MODEL,
@@ -536,8 +536,8 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         saved = {}
         env_overrides = {
-            "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK": "true",
-            "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "4",
+            "FLLIPER_ENABLE_LOGITS_PROCESSER_CHUNK": "true",
+            "FLLIPER_LOGITS_PROCESSER_CHUNK_SIZE": "4",
         }
         for key, val in env_overrides.items():
             saved[key] = os.environ.get(key)

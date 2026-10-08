@@ -11,7 +11,7 @@ THE METAL.
   was short. The pool ratcheted until the reset (``R12 SHADOW-OWN-EVICT-
   REFUSED n=1->592``), the prefetch vote took the workers' shortfall, W88.
 
-THE FIX (``weg2.park_l3.release_loaded_host``, called from ``loading_check``):
+THE FIX (``pdflip.park_l3.release_loaded_host``, called from ``loading_check``):
 the span is on the device -> TP0 frees the KV host rows of the loaded path
 (the arena page stays COMPLETE), records a STATE event per node, and the next
 request broadcast takes the workers' mirror rows with it. The mamba anchor
@@ -38,7 +38,7 @@ h = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(h)
 
 try:  # absent on the base -- that absence is part of the red
-    from sglang.srt.weg2 import park_l3
+    from flliper.srt.pdflip import park_l3
 except ImportError:  # pragma: no cover - base
     park_l3 = None
 
@@ -58,7 +58,7 @@ class _Ev:
 class _ArenaRank(h._Rank):
     """TP0 owns an arena KV host pool; the workers do not (Form A)."""
 
-    def _weg2_arena_pools(self):
+    def _pdflip_arena_pools(self):
         return {FULL: object()} if self.is_host else {}
 
 
@@ -71,7 +71,7 @@ def _ranks(n_nodes=3):
 
 @pytest.fixture(autouse=True)
 def _group_d(monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
 
 
 def _load_back(r, depth=None):
@@ -188,14 +188,14 @@ def test_a_node_under_a_host_lock_or_without_its_device_copy_is_kept():
 
 
 def test_switch_off_and_group_p_are_the_old_path(monkeypatch):
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     ranks = _ranks()
-    with h._switch(True), envs.SGLANG_WEG2_ENABLE_PARK_L3.override(False):
+    with h._switch(True), envs.FLLIPER_PDFLIP_ENABLE_PARK_L3.override(False):
         h._each(ranks, lambda r: r.ack_store_writes())
         h._each(ranks, lambda r: _load_back(r, 3 * NODE))
         h._broadcast(ranks)
     assert h._same(ranks) == {NODE: (1, 1), 2 * NODE: (1, 1), 3 * NODE: (1, 1)}
-    monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "P")
     with h._as_rank(ranks[0]):
         assert park_l3.release_loaded_host(ranks[0], ranks[0].node_at(3 * NODE)) == 0

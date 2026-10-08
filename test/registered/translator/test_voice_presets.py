@@ -12,13 +12,13 @@ and the refusal to render a language whose sentence is missing.
 import unittest
 from collections import Counter
 
-from sglang.srt.translator.voice_presets import (
+from flliper.srt.translator.voice_presets import (
     PRESET_DESCRIPTORS,
     RENDER_SENTENCES,
     descriptors_for_class,
     render_plan,
 )
-from sglang.srt.translator.voices import VoiceClass, VoicePool
+from flliper.srt.translator.voices import VoiceClass, VoicePool
 
 
 class TestPoolShape(unittest.TestCase):

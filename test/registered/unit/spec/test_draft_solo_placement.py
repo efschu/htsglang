@@ -40,19 +40,19 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.model_executor.model_runner import compute_draft_solo_role
-from sglang.srt.speculative.base_spec_worker import (
+from flliper.srt.model_executor.model_runner import compute_draft_solo_role
+from flliper.srt.speculative.base_spec_worker import (
     BaseSpecWorker,
     EagleDraftWorkerBase,
 )
-from sglang.srt.speculative.eagle_worker_v2 import (
+from flliper.srt.speculative.eagle_worker_v2 import (
     EagleDraftWorker,
     EAGLEWorkerV2,
     _broadcast_draft_picks,
     _solo_gather_full_vocab_rows,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -141,15 +141,15 @@ class TestClassDefaults(CustomTestCase):
     draft-worker / spec-worker variant, defaulting to the split path."""
 
     def _variant_classes(self):
-        from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+        from flliper.srt.speculative.frozen_kv_mtp_worker_v2 import (
             FrozenKVMTPDraftWorker,
             FrozenKVMTPWorkerV2,
         )
-        from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+        from flliper.srt.speculative.multi_layer_eagle_worker_v2 import (
             MultiLayerEagleDraftWorker,
             MultiLayerEagleWorkerV2,
         )
-        from sglang.srt.speculative.standalone_worker_v2 import (
+        from flliper.srt.speculative.standalone_worker_v2 import (
             StandaloneDraftWorker,
             StandaloneWorkerV2,
         )
@@ -189,7 +189,7 @@ class TestBroadcastDraftPicksSoloGate(CustomTestCase):
         # Must return before touching any distributed state: exactly one
         # rank runs the draft forward, a broadcast here would hang.
         with patch(
-            "sglang.srt.distributed.get_tp_group",
+            "flliper.srt.distributed.get_tp_group",
             side_effect=AssertionError("group must not be touched"),
         ):
             _broadcast_draft_picks(
@@ -203,10 +203,10 @@ class TestBroadcastDraftPicksSoloGate(CustomTestCase):
         )
         with (
             patch(
-                "sglang.srt.distributed.get_tp_group", return_value=fake_group
+                "flliper.srt.distributed.get_tp_group", return_value=fake_group
             ),
             patch(
-                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                "flliper.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
         ):
@@ -257,10 +257,10 @@ class TestBroadcastDraftPicksCaptureSafe(CustomTestCase):
         )
         with (
             patch(
-                "sglang.srt.distributed.get_tp_group", return_value=fake_group
+                "flliper.srt.distributed.get_tp_group", return_value=fake_group
             ),
             patch(
-                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                "flliper.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
         ):
@@ -288,7 +288,7 @@ class TestBroadcastDraftPicksCaptureSafe(CustomTestCase):
         self.assertEqual(c10d_calls, [0, 0])
 
     def test_helper_src_passthrough_and_none_skip(self):
-        from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+        from flliper.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
         pynccl = _FakePyNccl(available=True)
         group = SimpleNamespace(pynccl_comm=pynccl)
@@ -539,7 +539,7 @@ class TestShadowDraftRunnerSurface(CustomTestCase):
             self.model_config = SimpleNamespace()
 
     def _installed(self):
-        from sglang.srt.speculative.eagle_worker_v2 import (
+        from flliper.srt.speculative.eagle_worker_v2 import (
             install_shadow_draft_runner_surface,
         )
 
@@ -560,7 +560,7 @@ class TestShadowDraftRunnerSurface(CustomTestCase):
             self.assertIsNone(getattr(runner, attr), attr)
 
     def test_preexisting_attrs_not_clobbered(self):
-        from sglang.srt.speculative.eagle_worker_v2 import (
+        from flliper.srt.speculative.eagle_worker_v2 import (
             install_shadow_draft_runner_surface,
         )
 
@@ -584,7 +584,7 @@ class TestShadowDraftRunnerSurface(CustomTestCase):
         self.assertTrue(isinstance(runner, self._FakeRunner))
 
     def test_idempotent_no_class_chain_growth(self):
-        from sglang.srt.speculative.eagle_worker_v2 import (
+        from flliper.srt.speculative.eagle_worker_v2 import (
             install_shadow_draft_runner_surface,
         )
 
@@ -594,7 +594,7 @@ class TestShadowDraftRunnerSurface(CustomTestCase):
         self.assertIs(type(runner), cls_after_first)
 
     def test_disagg_kv_builder_returns_none_for_shadow(self):
-        from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool
+        from flliper.srt.mem_cache.kv_cache_builder import get_draft_kv_pool
 
         runner = self._installed()
         draft_worker = SimpleNamespace(
@@ -616,7 +616,7 @@ class TestSoloHostRankLocalCaptureBarrier(CustomTestCase):
     must skip that barrier; unflagged runners keep it."""
 
     def _backend(self, flagged):
-        from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+        from flliper.srt.model_executor.runner_backend.full_cuda_graph_backend import (
             FullCudaGraphBackend,
         )
 
@@ -656,7 +656,7 @@ class TestSoloHostRankLocalCaptureBarrier(CustomTestCase):
         """Source-level check: every runner-backend warmup barrier is gated
         by _skip_warmup_barrier (a new backend copying the old unguarded
         pattern would reintroduce the solo deadlock)."""
-        import sglang.srt.model_executor.runner_backend as rb_pkg
+        import flliper.srt.model_executor.runner_backend as rb_pkg
 
         rb_dir = Path(list(rb_pkg.__path__)[0])
         offenders = []
@@ -702,7 +702,7 @@ class TestNoNonzeroSrcBroadcastObject(CustomTestCase):
         return text[start : i - 1]
 
     def test_speculative_sources_use_only_src0_broadcast_object(self):
-        import sglang.srt.speculative.eagle_worker_v2 as eagle_mod
+        import flliper.srt.speculative.eagle_worker_v2 as eagle_mod
 
         spec_dir = Path(eagle_mod.__file__).resolve().parent
         offenders = []
@@ -774,7 +774,7 @@ class TestShadowInitGating(CustomTestCase):
 
     def test_host_build_ctx_overrides_to_tp1(self):
         worker = _make_worker(is_host=True)
-        from sglang.srt.runtime_context import get_parallel
+        from flliper.srt.runtime_context import get_parallel
 
         with worker._solo_build_ctx():
             self.assertEqual(get_parallel().tp_size, 1)
@@ -854,7 +854,7 @@ class TestPrefillRunnerConstructorBarrier(CustomTestCase):
     def _entered_ranks(tp_size, solo_rank, is_draft_worker):
         """Replay one boot's group protocol; return the ranks that actually
         entered the capture barrier."""
-        from sglang.srt.model_executor.runner.base_runner import (
+        from flliper.srt.model_executor.runner.base_runner import (
             enter_capture_group_barrier,
         )
 
@@ -905,7 +905,7 @@ class TestPrefillRunnerConstructorBarrier(CustomTestCase):
         )
 
     def test_helper_reports_whether_it_entered(self):
-        from sglang.srt.model_executor.runner.base_runner import (
+        from flliper.srt.model_executor.runner.base_runner import (
             enter_capture_group_barrier,
         )
 
@@ -928,7 +928,7 @@ class TestPrefillRunnerConstructorBarrier(CustomTestCase):
         ``self.model_runner.tp_group.barrier()`` would reintroduce the solo
         deadlock in a fresh place -- this is the 6th sighting of that
         family."""
-        import sglang.srt.model_executor.runner as runner_pkg
+        import flliper.srt.model_executor.runner as runner_pkg
 
         runner_dir = Path(list(runner_pkg.__path__)[0])
         offenders = []

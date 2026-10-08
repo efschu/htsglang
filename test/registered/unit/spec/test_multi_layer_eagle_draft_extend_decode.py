@@ -34,9 +34,9 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.speculative.eagle_info import EagleDraftExtendInput
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -94,7 +94,7 @@ def _fake_rotate(input_ids, extend_start_loc, extend_seq_lens, new_ids, select_i
 
 
 def _make_worker(rank_eps, trace):
-    from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+    from flliper.srt.speculative.multi_layer_eagle_worker_v2 import (
         MultiLayerEagleDraftWorker,
     )
 
@@ -168,12 +168,12 @@ def _run_rank(rank_eps, broadcast_impl, trace):
     fake_group = SimpleNamespace(world_size=2, broadcast=broadcast_impl)
     with (
         patch(
-            "sglang.srt.speculative.multi_layer_eagle_worker_v2.rotate_input_ids",
+            "flliper.srt.speculative.multi_layer_eagle_worker_v2.rotate_input_ids",
             _recording_rotate,
         ),
-        patch("sglang.srt.distributed.get_tp_group", return_value=fake_group),
+        patch("flliper.srt.distributed.get_tp_group", return_value=fake_group),
         patch(
-            "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+            "flliper.srt.layers.dp_attention.is_dp_attention_enabled",
             return_value=False,
         ),
     ):
@@ -246,12 +246,12 @@ class TestDecodeDraftExtendRankSync(CustomTestCase):
         fake_group = SimpleNamespace(world_size=1, broadcast=boom)
         with (
             patch(
-                "sglang.srt.speculative.multi_layer_eagle_worker_v2.rotate_input_ids",
+                "flliper.srt.speculative.multi_layer_eagle_worker_v2.rotate_input_ids",
                 _fake_rotate,
             ),
-            patch("sglang.srt.distributed.get_tp_group", return_value=fake_group),
+            patch("flliper.srt.distributed.get_tp_group", return_value=fake_group),
             patch(
-                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                "flliper.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
         ):
@@ -279,7 +279,7 @@ class TestDecodeDraftExtendPerRungMetadata(CustomTestCase):
         """The template: the composite graph runner re-plans the rung's
         backend inside replay(). Pinned so the eager fix cannot drift away
         from the path that is known to work."""
-        import sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner as gr
+        import flliper.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner as gr
 
         tree = ast.parse(inspect.getsource(gr))
         found = []
@@ -303,7 +303,7 @@ class TestDecodeDraftExtendPerRungMetadata(CustomTestCase):
     def test_eager_loop_plans_the_rung_backend_by_step(self):
         """Ratchet: the plan call must index draft_extend_attn_backend_list
         with the loop's step, inside the rung loop."""
-        import sglang.srt.speculative.multi_layer_eagle_worker_v2 as ml
+        import flliper.srt.speculative.multi_layer_eagle_worker_v2 as ml
 
         tree = ast.parse(inspect.getsource(ml))
         hits = []

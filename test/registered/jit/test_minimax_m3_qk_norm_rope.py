@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from sglang.srt.utils import is_hip
+from flliper.srt.utils import is_hip
 
 if not is_hip():
     pytest.skip(
@@ -14,12 +14,12 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
-from sglang.jit_kernel.minimax_m3.qk_norm_rope import (  # noqa: E402
+from flliper.jit_kernel.minimax_m3.qk_norm_rope import (  # noqa: E402
     qk_gemma_rmsnorm_rope,
     sparse_qk_index_gemma_rmsnorm_rope,
     sparse_qk_index_gemma_rmsnorm_rope_cache,
 )
-from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
+from flliper.test.ci.ci_register import register_amd_ci  # noqa: E402
 
 # ROCm-only fused kernel; runs in the AMD jit-kernel unit suite.
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")

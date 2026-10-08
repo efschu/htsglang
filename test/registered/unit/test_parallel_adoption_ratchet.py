@@ -13,7 +13,7 @@ Exemptions, pinned by path: ``runtime_context.py`` and
 out-of-tree callers. Sweeping an exempt path must remove it from the pin.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -21,10 +21,10 @@ import re
 import unittest
 from pathlib import Path
 
-import sglang.srt
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt
+from flliper.test.test_utils import CustomTestCase
 
-_SRT_ROOT = Path(next(iter(sglang.srt.__path__)))
+_SRT_ROOT = Path(next(iter(flliper.srt.__path__)))
 
 _BANNED_CALLS = re.compile(
     r"\b(?:dcp_enabled|get_(?:"

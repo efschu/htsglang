@@ -62,14 +62,14 @@ class TestEdition(unittest.TestCase):
             self.assertNotIn("ipc." + w, head, w)
         mk = lambda: {"stem": "x", "meta": {"tag": "nfh91-profil", "sha": "abc", "launch": ["--x"], "model": "M"},
                 "container": {"Names": "htsglang-acc-nf-h91", "State": "running", "Status": "Up"},
-                "ipc": {"launch": {"P": {"argv": ["--tp-size", "1"], "env": {"SGLANG_X": "1"}}}, "rev": "62357f2ba1",
+                "ipc": {"launch": {"P": {"argv": ["--tp-size", "1"], "env": {"FLLIPER_X": "1"}}}, "rev": "62357f2ba1",
                         "profile": "nf-h91", "image": "htsglang:cu130-weg2", "tag": "nfh91", "boot_id": "nfh91-boot",
                         "dir": "/spinning/docker-acceptance/nf/state/nfh91-boot", "lifecycle": "serving"}}
         out = server.edition_snapshot({"boots": [mk()], "docker": {"age_s": 1.0, "value": [
             {"Names": "htsglang-acc-nf-h91", "Image": "htsglang:cu130-weg2", "State": "running"}]}}, "release")
         self.assertEqual(out["docker"], {"age_s": 1.0})
         blob = repr(out)
-        for w in ("62357f2ba1", "nf-h91", "nfh91", "cu130", "SGLANG_X", "--tp-size", "htsglang-acc", "abc"):
+        for w in ("62357f2ba1", "nf-h91", "nfh91", "cu130", "FLLIPER_X", "--tp-size", "htsglang-acc", "abc"):
             self.assertNotIn(w, blob, w)
         self.assertEqual(out["boots"][0]["ipc"]["lifecycle"], "serving")
         self.assertEqual(out["boots"][0]["container"], {"State": "running", "Status": "Up"})

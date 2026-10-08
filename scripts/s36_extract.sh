@@ -52,7 +52,7 @@ c() { grep -c "$1" "$SCAN" 2>/dev/null | head -1; }
 import sys
 
 sys.path.insert(0, "/spinning/wt-631-routea/python")
-from sglang.srt.managers.corridor_guard import (  # noqa: E402
+from flliper.srt.managers.corridor_guard import (  # noqa: E402
     free_spread_mib,
     water_fill_transfers,
 )

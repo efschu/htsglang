@@ -3,17 +3,17 @@ import unittest
 import torch
 from utils import precision
 
-from sglang.srt.layers.rotary_embedding import (
+from flliper.srt.layers.rotary_embedding import (
     MRotaryEmbedding,
     RotaryEmbedding,
 )
-from sglang.srt.layers.rotary_embedding.rope_variant import (
+from flliper.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
     apply_rotary_pos_emb_native,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")

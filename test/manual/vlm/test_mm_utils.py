@@ -3,8 +3,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers import mm_utils, schedule_batch
-from sglang.srt.managers.schedule_batch import (
+from flliper.srt.managers import mm_utils, schedule_batch
+from flliper.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
@@ -34,7 +34,7 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
             patch.object(schedule_batch.torch.cuda, "is_available", return_value=True),
             patch.object(schedule_batch.torch.cuda, "current_device", return_value=0),
             patch.object(
-                schedule_batch.envs.SGLANG_MM_BUFFER_SIZE_MB, "get", return_value=0
+                schedule_batch.envs.FLLIPER_MM_BUFFER_SIZE_MB, "get", return_value=0
             ),
         ):
             mm_inputs = MultimodalInputs.from_dict({"mm_items": [mm_item]})
@@ -58,7 +58,7 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
             patch.object(schedule_batch.torch.cuda, "is_available", return_value=True),
             patch.object(schedule_batch.torch.cuda, "current_device", return_value=0),
             patch.object(
-                schedule_batch.envs.SGLANG_MM_BUFFER_SIZE_MB, "get", return_value=0
+                schedule_batch.envs.FLLIPER_MM_BUFFER_SIZE_MB, "get", return_value=0
             ),
         ):
             mm_inputs = MultimodalInputs.from_dict({"mm_items": [mm_item]})
@@ -84,7 +84,7 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
             patch.object(schedule_batch.torch.cuda, "is_available", return_value=True),
             patch.object(schedule_batch.torch.cuda, "current_device", return_value=0),
             patch.object(
-                schedule_batch.envs.SGLANG_MM_BUFFER_SIZE_MB, "get", return_value=0
+                schedule_batch.envs.FLLIPER_MM_BUFFER_SIZE_MB, "get", return_value=0
             ),
         ):
             mm_inputs = MultimodalInputs.from_dict({"mm_items": [mm_item]})

@@ -3,14 +3,14 @@ host's, like every other admission decision (H105 / H105b / H105c).
 
 THE DEATH (NF cand4 ytwa2e, image htsglang:cu130-weg2-rc12z30y9int7-27b-nf,
 NF 93c41b6434, D log boot_weg2_dkrnfint4h6ablxcbar1dauer10062336_93c41b6434_
-1006_233638.D.log, 249181-249239, 00:41:55Z, weg2-82-573, 39251 tokens, prefix
+1006_233638.D.log, 249181-249239, 00:41:55Z, pdflip-82-573, 39251 tokens, prefix
 31040): the group stopped by name,
 
     FormAAdmissionSplit: H105 RU FORM-A EXTEND-SET SPLIT
-        host=[('weg2-82-573', 33280, 35840)] local=[('weg2-82-573', 33280, 35828)]
+        host=[('pdflip-82-573', 33280, 35840)] local=[('pdflip-82-573', 33280, 35828)]
 
 on TP1 and TP2. Chunk 1 of 573 had ended at 33280 on every rank (2240 tokens
-behind the last 320 of weg2-82-574). The next chunk is the CONTINUATION of the
+behind the last 320 of pdflip-82-574). The next chunk is the CONTINUATION of the
 resident chunked request: ``PrefillAdder.add_chunked_req``, which takes
 ``_rem_tokens = min(rem_chunk_tokens, int(rem_total_tokens))``. The first term
 is the group's MIN reduce (2560 everywhere). The second is this rank's own
@@ -38,17 +38,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils.common import Range
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.schedule_policy import PrefillAdder
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.utils.common import Range
 
-RID = "weg2-82-573"
+RID = "pdflip-82-573"
 PAGE = 64
-FILL = 39251            # 31040 prefix + 8211 uncached ('WEG2 X-GATE ... uncached=8211')
+FILL = 39251            # 31040 prefix + 8211 uncached ('PDFLIP X-GATE ... uncached=8211')
 CHUNK_START = 33280     # the end of chunk 1 on every rank
 REM_CHUNK = 2560        # '#794 GROUP-NARROWED ... 2560', the group MIN
 HOST_FUNDABLE = 60032   # '#996 group_floor' TP0

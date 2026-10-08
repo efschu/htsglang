@@ -3,14 +3,14 @@ from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 
-from sglang.srt.lora.lora_drainer import LoRADrainer
-from sglang.srt.managers.schedule_batch import Req
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.lora_utils import (
+from flliper.srt.lora.lora_drainer import LoRADrainer
+from flliper.srt.managers.schedule_batch import Req
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     run_lora_batch_splitting_equivalence_test,
 )
-from sglang.test.test_utils import is_in_ci
+from flliper.test.test_utils import is_in_ci
 
 register_cuda_ci(est_time=100, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")

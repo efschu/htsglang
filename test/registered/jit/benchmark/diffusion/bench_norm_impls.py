@@ -13,14 +13,14 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
-from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
-from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
-from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
-from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
-from sglang.jit_kernel.utils import KERNEL_PATH
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.jit_kernel.benchmark.utils import DEFAULT_DEVICE
+from flliper.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
+from flliper.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
+from flliper.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
+from flliper.jit_kernel.norm import rmsnorm as jit_rmsnorm
+from flliper.jit_kernel.utils import KERNEL_PATH
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=120,
@@ -38,10 +38,10 @@ FLAGGEMS_REPO = "https://github.com/flagos-ai/FlagGems.git"
 QUACK_REPO = "https://github.com/Dao-AILab/quack.git"
 
 TORCH_LN = "torch.nn.LayerNorm"
-SGL_RMS = "sglang.RMSNorm.forward_cuda"
+SGL_RMS = "flliper.RMSNorm.forward_cuda"
 SGL_FUSED = "sgl_kernel.fused_add_rmsnorm"
-SGL_LN = "sglang.LayerNormScaleShift"
-SGL_RES_LN = "sglang.ScaleResidualLayerNormScaleShift"
+SGL_LN = "flliper.LayerNormScaleShift"
+SGL_RES_LN = "flliper.ScaleResidualLayerNormScaleShift"
 SGL_LN_PAIR = f"{SGL_LN} / {SGL_RES_LN}"
 MOVA_LN_MIX = f"{TORCH_LN} / {SGL_LN_PAIR}"
 

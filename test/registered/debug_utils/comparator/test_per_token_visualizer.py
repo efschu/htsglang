@@ -9,11 +9,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.output_types import ComparisonTensorRecord
-from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+from flliper.srt.debug_utils.comparator.output_types import ComparisonTensorRecord
+from flliper.srt.debug_utils.comparator.tensor_comparator.comparator import (
     compare_tensor_pair,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 
@@ -45,7 +45,7 @@ def _make_comparison_record(
 class TestPerTokenVisualizer:
     def test_no_data_returns_none(self, tmp_path: Path) -> None:
         """Empty records list → None returned, no file created."""
-        from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+        from flliper.srt.debug_utils.comparator.per_token_visualizer import (
             generate_per_token_heatmap,
         )
 
@@ -57,7 +57,7 @@ class TestPerTokenVisualizer:
 
     def test_no_per_token_data_returns_none(self, tmp_path: Path) -> None:
         """Records without per_token_rel_diff → None."""
-        from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+        from flliper.srt.debug_utils.comparator.per_token_visualizer import (
             generate_per_token_heatmap,
         )
 
@@ -75,7 +75,7 @@ class TestPerTokenVisualizer:
 
     def test_generates_valid_png(self, tmp_path: Path) -> None:
         """Records with per-token data → valid PNG file."""
-        from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+        from flliper.srt.debug_utils.comparator.per_token_visualizer import (
             generate_per_token_heatmap,
         )
 
@@ -101,7 +101,7 @@ class TestPerTokenVisualizer:
 
     def test_variable_length_sequences(self, tmp_path: Path) -> None:
         """Records with different token lengths → NaN padding, no crash."""
-        from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+        from flliper.srt.debug_utils.comparator.per_token_visualizer import (
             generate_per_token_heatmap,
         )
 
@@ -135,7 +135,7 @@ class TestPerTokenVisualizer:
 
     def test_creates_parent_dirs(self, tmp_path: Path) -> None:
         """Output path with non-existent parent dirs → dirs created automatically."""
-        from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+        from flliper.srt.debug_utils.comparator.per_token_visualizer import (
             generate_per_token_heatmap,
         )
 

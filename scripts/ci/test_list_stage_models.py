@@ -1,6 +1,6 @@
 """Unit tests for list_stage_models extraction logic.
 
-Pure-logic tests (stdlib only, no GPU, no sglang import) so they run in the
+Pure-logic tests (stdlib only, no GPU, no flliper import) so they run in the
 ci-model-inventory workflow without installing dependencies:
 
     python -m unittest discover -s scripts/ci -p 'test_list_stage_models.py'
@@ -26,7 +26,7 @@ _REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 _REAL_CI_REGISTER = os.path.join(
-    _REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
+    _REPO_ROOT, "python", "flliper", "test", "ci", "ci_register.py"
 )
 
 
@@ -41,15 +41,15 @@ def _make_fake_repo(root, registered, helpers=None):
     """Build a temp repo: copy the real ci_register.py, write test + helper files.
 
     ``registered`` maps ``test/registered/...`` relpaths to file content;
-    ``helpers`` maps ``python/sglang/test/...`` relpaths to content.
+    ``helpers`` maps ``python/flliper/test/...`` relpaths to content.
     """
-    dst = os.path.join(root, "python", "sglang", "test", "ci", "ci_register.py")
+    dst = os.path.join(root, "python", "flliper", "test", "ci", "ci_register.py")
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copy(_REAL_CI_REGISTER, dst)
     for rel, content in registered.items():
         _write(root, os.path.join("test", "registered", rel), content)
     for rel, content in (helpers or {}).items():
-        _write(root, os.path.join("python", "sglang", "test", rel), content)
+        _write(root, os.path.join("python", "flliper", "test", rel), content)
 
 
 class LooksLikeModelId(unittest.TestCase):
@@ -128,7 +128,7 @@ class ExtractModels(unittest.TestCase):
             "DEFAULT_MODEL_NAME_FOR_TEST": {"meta-llama/Llama-3.1-8B-Instruct"}
         }
         source = (
-            "from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST\n"
+            "from flliper.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST\n"
             "class T:\n"
             "    model = DEFAULT_MODEL_NAME_FOR_TEST\n"
             '    draft = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"\n'
@@ -200,7 +200,7 @@ class Overrides(unittest.TestCase):
 class CollectSuiteFiles(unittest.TestCase):
     REG = (
         "import unittest\n"
-        "from sglang.test.ci.ci_register import register_cuda_ci, register_amd_ci\n"
+        "from flliper.test.ci.ci_register import register_cuda_ci, register_amd_ci\n"
         "{calls}\n"
         'MODEL = "{model}"\n'
         'if __name__ == "__main__":\n    unittest.main()\n'
@@ -267,7 +267,7 @@ class CollectSuiteFiles(unittest.TestCase):
                 registered={
                     # est_time missing -> RegistryVisitor raises ValueError
                     "d/test_bad.py": (
-                        "from sglang.test.ci.ci_register import register_cuda_ci\n"
+                        "from flliper.test.ci.ci_register import register_cuda_ci\n"
                         'register_cuda_ci(suite="base-x")\n'
                     ),
                 },
@@ -285,8 +285,8 @@ class BuildInventory(unittest.TestCase):
                 # resolves a model via an imported constant
                 "a/test_a.py": (
                     "import unittest\n"
-                    "from sglang.test.ci.ci_register import register_cuda_ci\n"
-                    "from sglang.test.test_utils import DEFAULT_MODEL\n"
+                    "from flliper.test.ci.ci_register import register_cuda_ci\n"
+                    "from flliper.test.test_utils import DEFAULT_MODEL\n"
                     'register_cuda_ci(est_time=1, stage="base-x", '
                     'runner_config="1-gpu")\n'
                     "MODEL = DEFAULT_MODEL\n"
@@ -295,7 +295,7 @@ class BuildInventory(unittest.TestCase):
                 # model-less -> lands in unresolved_files (same suite as a)
                 "b/test_b.py": (
                     "import unittest\n"
-                    "from sglang.test.ci.ci_register import register_cuda_ci\n"
+                    "from flliper.test.ci.ci_register import register_cuda_ci\n"
                     'register_cuda_ci(est_time=1, stage="base-x", '
                     'runner_config="1-gpu")\n'
                     'if __name__ == "__main__":\n    unittest.main()\n'
@@ -461,7 +461,7 @@ class LoadRunnerLabels(unittest.TestCase):
 class RunnerLabelAggregation(unittest.TestCase):
     REG = (
         "import unittest\n"
-        "from sglang.test.ci.ci_register import register_cuda_ci\n"
+        "from flliper.test.ci.ci_register import register_cuda_ci\n"
         "{calls}\n"
         'MODEL = "{model}"\n'
         'if __name__ == "__main__":\n    unittest.main()\n'

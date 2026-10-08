@@ -13,16 +13,16 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.hicache import can_use_write_back_jit_kernel
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.mem_cache.pool_host.common import (
+from flliper.jit_kernel.hicache import can_use_write_back_jit_kernel
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from flliper.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from flliper.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from flliper.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")

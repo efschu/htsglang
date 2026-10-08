@@ -16,10 +16,10 @@ import time
 import unittest
 from unittest import mock
 
-from sglang.srt.rigmon import card_probe as cp
-from sglang.srt.rigmon import hardware_profile as hp
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.rigmon import card_probe as cp
+from flliper.srt.rigmon import hardware_profile as hp
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -290,7 +290,7 @@ class TestMeasurementRun(CustomTestCase):
         self.assertEqual(seen["env"]["CUDA_VISIBLE_DEVICES"], U1)
         self.assertEqual(seen["env"]["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
         self.assertEqual(seen["cmd"][:3], ["systemd-run", "--scope", "/venv/bin/python"])
-        self.assertIn("sglang.srt.rigmon.card_probe", seen["cmd"])
+        self.assertIn("flliper.srt.rigmon.card_probe", seen["cmd"])
         self.assertIn("--run", seen["cmd"])
         self.assertEqual(seen["timeout"], 300)
         self.assertEqual(r["warnings"], ["lanes int8/w4a8/w4a16 not measured: no sgl_kernel"])
@@ -348,7 +348,7 @@ class TestProbeArms(CustomTestCase):
     def _measure(self, *, env_issue="", w4a8=(62.0, ""), w4a16=(55.0, ""), int8=(180.0, "")):
         import torch
 
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
         rates = up.MembwRates(read_gbs=700.0, copy_gbs=690.0, gemv_gbs=650.0)
         calls = []

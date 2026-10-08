@@ -18,10 +18,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache.pool_host import arena_pool as ap
-from sglang.srt.mem_cache.pool_host.arena_pool import PLACEHOLDERS, ArenaMHAHostPool
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.pool_host import arena_pool as ap
+from flliper.srt.mem_cache.pool_host.arena_pool import PLACEHOLDERS, ArenaMHAHostPool
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -167,7 +167,7 @@ def test_the_draft_role_refuses_pages(tmp_path):
 
 
 def test_planned_capacity_matches_the_backends_slot_rule(monkeypatch):
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_GIB", "1")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_GIB", "1")
     monkeypatch.delenv(ap.ENV_ARENA_KV_PAGE_BYTES, raising=False)
     slots = ap.planned_arena_slots(PAGE)
     assert slots == max(1024, (1 << 30) // PAGE)

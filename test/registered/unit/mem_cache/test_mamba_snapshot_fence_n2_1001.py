@@ -27,8 +27,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc  # noqa: E402
 
 
 class _Log(list):
@@ -149,7 +149,7 @@ def test_a_kv_only_write_stays_unordered(monkeypatch):
 
 
 def test_the_switch_turns_the_fence_off(monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_MAMBA_SNAPSHOT_FENCE", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_MAMBA_SNAPSHOT_FENCE", "0")
     log, _ = _run(monkeypatch, _mamba())
     assert ("wait", "compute", "finish") not in log
 

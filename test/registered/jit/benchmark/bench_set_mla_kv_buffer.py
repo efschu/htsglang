@@ -14,17 +14,17 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from flliper.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     DEFAULT_QUANTILES,
     get_benchmark_range,
 )
-from sglang.jit_kernel.set_mla_kv_buffer import set_mla_kv_buffer as jit_set
-from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.srt.mem_cache.utils import set_mla_kv_buffer_kernel as sglang_triton_kernel
-from sglang.srt.mem_cache.utils import set_mla_kv_buffer_triton as sglang_wrapper
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.set_mla_kv_buffer import set_mla_kv_buffer as jit_set
+from flliper.jit_kernel.utils import is_arch_support_pdl
+from flliper.srt.mem_cache.utils import set_mla_kv_buffer_kernel as flliper_triton_kernel
+from flliper.srt.mem_cache.utils import set_mla_kv_buffer_triton as flliper_wrapper
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=9, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -39,7 +39,7 @@ def _triton_baseline(kv_buffer, loc, cache_k_nope, cache_k_rope):
     n_loc = loc.numel()
     grid = (n_loc, triton.cdiv(total_dim, BLOCK))
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-    sglang_triton_kernel[grid](
+    flliper_triton_kernel[grid](
         kv_buffer,
         cache_k_nope,
         cache_k_rope,
@@ -107,7 +107,7 @@ def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
     torch.cuda.synchronize()
 
     FN_MAP = {
-        "wrapper": sglang_wrapper,
+        "wrapper": flliper_wrapper,
         "jit_tma": lambda buf, loc, n, r: jit_set(buf, loc, n, r),
         "triton": _triton_baseline,
     }

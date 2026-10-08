@@ -71,8 +71,8 @@ async def run(args) -> int:
     import soundfile as sf
     import torch
 
-    from sglang.srt.translator.backends import AudioChunk
-    from sglang.srt.translator.inprocess_tts import (
+    from flliper.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.inprocess_tts import (
         InProcessQwen3Tts,
         InProcessTtsConfig,
     )
@@ -157,7 +157,7 @@ async def run(args) -> int:
 
     # -- ASR ---------------------------------------------------------------
     if args.with_asr:
-        from sglang.srt.translator.asr_backends import FasterWhisperAsr
+        from flliper.srt.translator.asr_backends import FasterWhisperAsr
 
         t0 = time.monotonic()
         asr = FasterWhisperAsr(

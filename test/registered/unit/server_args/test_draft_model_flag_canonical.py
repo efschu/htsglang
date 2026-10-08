@@ -22,9 +22,9 @@ and these tests pin that it is not.
 
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -61,9 +61,9 @@ class TestEveryMessageNamesTheCanonicalForm(CustomTestCase):
     def _sources(self):
         import inspect
 
-        from sglang.srt import server_args as sa_mod
-        from sglang.srt.planner import placement
-        from sglang.srt.speculative import cross_algo_utils
+        from flliper.srt import server_args as sa_mod
+        from flliper.srt.planner import placement
+        from flliper.srt.speculative import cross_algo_utils
 
         return {
             "server_args": inspect.getsource(sa_mod),
@@ -99,7 +99,7 @@ class TestEveryMessageNamesTheCanonicalForm(CustomTestCase):
         # The specific message sweep-2 tripped over.
         import inspect
 
-        from sglang.srt.speculative import cross_algo_utils
+        from flliper.srt.speculative import cross_algo_utils
 
         src = inspect.getsource(cross_algo_utils)
         self.assertIn(f"requires {CANONICAL} pointing at the DFLASH", src)
@@ -111,14 +111,14 @@ class TestBothSpellingsKeepWorking(CustomTestCase):
     def test_the_alias_is_still_declared_on_the_field(self):
         import inspect
 
-        from sglang.srt import server_args as sa_mod
+        from flliper.srt import server_args as sa_mod
 
         src = inspect.getsource(sa_mod)
         self.assertIn(f'aliases=["{ALIAS}"]', src)
 
     def test_the_notice_fires_for_the_alias(self):
         args = ServerArgs.__new__(ServerArgs)
-        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.server_args", level="WARNING") as cm:
             args._handle_deprecated_flag_spellings(["prog", ALIAS, "/p"])
         joined = "\n".join(cm.output)
         self.assertIn(ALIAS, joined)
@@ -127,13 +127,13 @@ class TestBothSpellingsKeepWorking(CustomTestCase):
 
     def test_the_notice_fires_for_the_equals_form(self):
         args = ServerArgs.__new__(ServerArgs)
-        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.server_args", level="WARNING") as cm:
             args._handle_deprecated_flag_spellings(["prog", f"{ALIAS}=/p"])
         self.assertIn(CANONICAL, "\n".join(cm.output))
 
     def test_the_canonical_spelling_is_silent(self):
         args = ServerArgs.__new__(ServerArgs)
-        with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+        with self.assertNoLogs("flliper.srt.server_args", level="WARNING"):
             args._handle_deprecated_flag_spellings(["prog", CANONICAL, "/p"])
 
     def test_the_siblings_are_not_matched(self):
@@ -142,12 +142,12 @@ class TestBothSpellingsKeepWorking(CustomTestCase):
         args = ServerArgs.__new__(ServerArgs)
         for sibling in ("--speculative-draft-model-quantization",
                         "--speculative-draft-model-revision"):
-            with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+            with self.assertNoLogs("flliper.srt.server_args", level="WARNING"):
                 args._handle_deprecated_flag_spellings(["prog", sibling, "x"])
 
     def test_an_unrelated_argv_is_silent(self):
         args = ServerArgs.__new__(ServerArgs)
-        with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+        with self.assertNoLogs("flliper.srt.server_args", level="WARNING"):
             args._handle_deprecated_flag_spellings(
                 ["prog", "--speculative-algorithm", "NEXTN", "--tp-size", "3"]
             )

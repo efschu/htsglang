@@ -1,4 +1,4 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=99, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
@@ -6,9 +6,9 @@ register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 import time
 import unittest
 
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.kits.eval_accuracy_kit import MMLUMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import is_hip, kill_process_tree
+from flliper.test.kits.eval_accuracy_kit import MMLUMixin
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

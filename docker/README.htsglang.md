@@ -11,7 +11,7 @@ derived from the code and the wheels.
 | `htsglang.Dockerfile` | the runtime image. ARG surface for CUDA/torch/kernel versions and three feature toggles |
 | `htsglang-entrypoint.sh` | ENV-driven launch. `MODE=server` (default) or `MODE=planner`. `--help` prints the whole variable surface |
 | `htsglang.yml` | single-node serving compose |
-| `htsglang-gui.yml` | GUI mode: the planner is the only process started, and it launches sglang inside the same container |
+| `htsglang-gui.yml` | GUI mode: the planner is the only process started, and it launches flliper inside the same container |
 | `htsglang-node2.yml` | second node, worker only, plus the weights question answered in the header |
 | `htsglang.env.example` | every placeholder, commented |
 | `htsglang-qwen35-gguf.Dockerfile` | thin GGUF overlay on the base image |
@@ -30,7 +30,7 @@ docker compose -f docker/htsglang.yml up
 surface without starting anything.
 
 The entrypoint's own defaults are neutral — a bare run behaves like a stock
-sglang image (TP=1, no speculation, no HiCache, no rank mapping, no chat
+flliper image (TP=1, no speculation, no HiCache, no rank mapping, no chat
 template). The rig profile lives in the compose file and the `.env`, not in the
 image. **This is a change from the previous entrypoint**, which defaulted to
 TP=3 / `--rank-gpu-id 0,1,2` / NEXTN / HiCache / the froggeric template. Those
@@ -89,7 +89,7 @@ image has to change, the op schema set is identical.
 ### sm75 without sgl-kernel
 
 This is already handled in the fork, and it does not require a separate image.
-`python/sglang/srt/utils/common.py` defines a two-level predicate:
+`python/flliper/srt/utils/common.py` defines a two-level predicate:
 
 * `sgl_kernel_importable()` — answered at import time, never touches the device
 * `sgl_kernel_runnable()` — answered on first use, compares the live device
@@ -154,7 +154,7 @@ Checked against the code, not assumed.
 **Every rank loads its own shard from its own filesystem. There is no weight
 transfer over the process group during the initial load.**
 
-* `DefaultModelLoader._prepare_weights` (`python/sglang/srt/model_loader/loader.py`)
+* `DefaultModelLoader._prepare_weights` (`python/flliper/srt/model_loader/loader.py`)
   does `os.path.isdir` plus a plain `glob` of the checkpoint files, in every
   rank process on every node. No rank gating, no scatter.
 * The only `torch.distributed.broadcast` in `model_loader/` is inside
@@ -175,7 +175,7 @@ transfer over the process group during the initial load.**
 
 So the pre-assessment holds: *"the model is on the second rig too"* is the
 existing state and costs nothing, and *"it comes over the network link"* is a
-**mount** question rather than a transfer question. From sglang's side both are
+**mount** question rather than a transfer question. From flliper's side both are
 "it is on disk".
 
 | Way | Cost | Benefit |
@@ -206,8 +206,8 @@ more code. Left unbuilt deliberately.
 
 ## GUI mode
 
-`MODE=planner` starts `python3 -m sglang.planner --serve` and nothing else. The
-planner builds the `python3 -m sglang.launch_server` command line from the UI
+`MODE=planner` starts `python3 -m flliper.planner --serve` and nothing else. The
+planner builds the `python3 -m flliper.launch_server` command line from the UI
 inputs, spawns it in its own process group with `start_new_session=True`,
 polls `/get_model_info` until ready, and can stop and restart it. It signals
 only the captured process group — never a broad `pkill` — and waits for NVML to
@@ -234,7 +234,7 @@ init process reaps anything that gets orphaned when a worker dies.
 The driver refuses `nvidia-smi -pm`, `-lgc`, `-lmc` and `-pl` from inside a
 container even as root with full capabilities. This belongs in the
 documentation rather than in a silent failure, and the codebase already treats
-it honestly: `python/sglang/srt/rigmon/facilities.py` decides GPU-control
+it honestly: `python/flliper/srt/rigmon/facilities.py` decides GPU-control
 reachability by container-kind rather than by privilege, and reports
 `power_target`, `clock_lock` and `persistence_mode` as visible-but-disabled
 with the remedy "run the collector on the hypervisor host".
@@ -245,7 +245,7 @@ the live telemetry are unaffected. `NVIDIA_DRIVER_CAPABILITIES` must include
 `utility`, which the `nvidia/cuda` base image already sets.
 
 The one NVML write in the codebase is `nvmlDeviceSetPowerManagementLimit` in
-`python/sglang/srt/planner/energy.py`, reached from the energy sweep
+`python/flliper/srt/planner/energy.py`, reached from the energy sweep
 (`--run-study`). It is not wrapped in a `try`, so a permission denial
 propagates as an exception rather than degrading. *Whether the UI's
 `/api/measure_power` button can reach that path was not traced end to end —
@@ -253,7 +253,7 @@ treat it as unverified.*
 
 Two further rough edges, flagged rather than fixed, both pre-existing:
 
-* `python/sglang/srt/planner/webui.py` serves and references
+* `python/flliper/srt/planner/webui.py` serves and references
   `/assets/quality_chess_reference.png`, but `planner/assets/` does not exist
   in the repository. That image always 404s. No mount helps.
 * The rigmon UI has no shipped HTML: `--ui-dir` defaults to `None`, and the
@@ -270,17 +270,17 @@ Two further rough edges, flagged rather than fixed, both pre-existing:
 | `/templates` | swappable chat templates. The froggeric v21.3 template is baked in at `/etc/htsglang/chat_template.jinja` | only the baked-in and builtin templates are available |
 | `/var/lib/htsglang/hicache` | HiCache L3 disk tier | the backend falls back to `/tmp/hicache` inside the container layer: it works, but every prefix is lost on recreate and the layer grows unbounded |
 | `/var/lib/htsglang/hibernate` | hibernate (#89) per-rank weight shards | every boot is a cold load. Measured elsewhere at 50 s versus 8-14 s for uneven TP=3 dense GGUF |
-| `/root/.cache/sglang` | `hw_profile-*.json` (NVML rig probe), `kv_budget-*.json` (the measured KV budget one boot writes for the next), `planner_profiles.json`, `graph_mem_anchors.json`, `power_profile.json`, `quality_shots.jsonl`, `gguf_headers/`, `rigmon/node_tokens.json` | re-probe and re-derive on every boot |
+| `/root/.cache/flliper` | `hw_profile-*.json` (NVML rig probe), `kv_budget-*.json` (the measured KV budget one boot writes for the next), `planner_profiles.json`, `graph_mem_anchors.json`, `power_profile.json`, `quality_shots.jsonl`, `gguf_headers/`, `rigmon/node_tokens.json` | re-probe and re-derive on every boot |
 | `/root/.cache/flashinfer` | flashinfer JIT cubins | minutes of recompilation per cold start |
 | `/root/.cache/torch_extensions` | the HiCache page-hash C++ extension, JIT-compiled against `openssl/sha.h` | rebuilt on every boot |
 | `/root/.triton` | Triton kernel cache | repeated autotuning, worst on sm75 |
 | `/var/log/htsglang` | server logs outside the json-file driver | logs only via `docker logs` |
-| `/tmp` (GUI mode) | `sglang_boot_<port>.log`, written by the planner's supervisor and read back by the graph-memory anchor scraper. The path is hardcoded in GUI mode | boot-log history lost on restart; graph-memory anchors cannot be re-derived |
+| `/tmp` (GUI mode) | `flliper_boot_<port>.log`, written by the planner's supervisor and read back by the graph-memory anchor scraper. The path is hardcoded in GUI mode | boot-log history lost on restart; graph-memory anchors cannot be re-derived |
 | `/var/lib/htsglang/planner-results` (GUI mode) | `measured_results.jsonl` and `hicache_savings.json`, which the code otherwise writes *inside* the installed package | benchmark and HiCache-savings history lost on recreate |
 
 The HiCache mount deserves a note: the file backend's default is
 `/tmp/hicache`, and `--hicache-storage-backend file` alone does **not** move it.
-The entrypoint exports `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` from
+The entrypoint exports `FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR` from
 `HICACHE_STORAGE_DIR` — that export is what makes the mount effective. The
 previous compose mounted `/sgl-workspace/sglang_storage`, which is the OpenAI
 file-storage path, not HiCache's.
@@ -318,7 +318,7 @@ Open questions the build cannot answer on its own:
    The Vega 64 rank needs a ROCm image, which this Dockerfile does not build;
    `docker/rocm.Dockerfile` is the upstream starting point and has not been
    adapted to the fork.
-5. **`SGLANG_PLANNER_PYTHONPATH` / `LD_LIBRARY_PATH` in GUI mode.** The
+5. **`FLLIPER_PLANNER_PYTHONPATH` / `LD_LIBRARY_PATH` in GUI mode.** The
    planner's supervisor computes the child's `LD_LIBRARY_PATH` from the running
    interpreter's `site-packages/nvidia/*/lib`. The image installs into
    `dist-packages`, so this should resolve — but it was derived from a venv

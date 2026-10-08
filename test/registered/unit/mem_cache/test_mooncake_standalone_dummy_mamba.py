@@ -2,8 +2,8 @@ import types
 import unittest
 from unittest.mock import patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -51,14 +51,14 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
             "sys.modules",
             _fake_mooncake_modules(FakeMooncakeDistributedStore),
         ):
-            from sglang.srt.mem_cache.hicache_storage import (
+            from flliper.srt.mem_cache.hicache_storage import (
                 HiCacheStorageConfig,
                 PoolName,
             )
-            from sglang.srt.mem_cache.storage.mooncake_store import (
+            from flliper.srt.mem_cache.storage.mooncake_store import (
                 mooncake_store as mc_mod,
             )
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            from flliper.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeStore,
             )
 

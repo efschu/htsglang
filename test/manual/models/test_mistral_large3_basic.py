@@ -2,10 +2,10 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.send_one import BenchArgs, send_one_prompt
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.send_one import BenchArgs, send_one_prompt
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,7 +21,7 @@ class TestMistralLarge3Basic(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Set environment variable to disable JIT DeepGemm
-        os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = "0"
+        os.environ["FLLIPER_ENABLE_JIT_DEEPGEMM"] = "0"
 
         cls.model = MISTRAL_LARGE3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -46,8 +46,8 @@ class TestMistralLarge3Basic(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
         # Clean up environment variable
-        if "SGLANG_ENABLE_JIT_DEEPGEMM" in os.environ:
-            del os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"]
+        if "FLLIPER_ENABLE_JIT_DEEPGEMM" in os.environ:
+            del os.environ["FLLIPER_ENABLE_JIT_DEEPGEMM"]
 
     def test_a_gsm8k(
         self,

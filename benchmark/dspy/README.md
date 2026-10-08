@@ -15,13 +15,13 @@ or set the environment variable
 export DSP_CACHEBOOL=false
 ```
 
-## Benchmark SGLang
+## Benchmark fLLiper
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
 ```
-python3 bench_dspy_intro.py --backend sglang
+python3 bench_dspy_intro.py --backend flliper
 ```
 
 

@@ -1,4 +1,4 @@
-"""fnFL2 H69 (SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY): the verify round's PLE
+"""fnFL2 H69 (FLLIPER_PDFLIP_PLE_STAGE_BEHIND_REPLAY): the verify round's PLE
 stage is filled AFTER the verify graph was launched; a one-warp gate on the
 prefetch stream holds only layer 1's PLE gather until the host publishes the
 round.
@@ -47,13 +47,13 @@ from unittest import mock
 import torch
 from triton.runtime.interpreter import InterpretedFunction
 
-from sglang.srt.environ import envs
-from sglang.srt.managers.scheduler_components import decode_host_split as dhs
-from sglang.srt.model_executor.runner import post_replay_hook as hook
-from sglang.srt.models import qwen4_exp_ple_decode_pread as dp
-from sglang.srt.models import qwen4_exp_ple_prefetch as pf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.managers.scheduler_components import decode_host_split as dhs
+from flliper.srt.model_executor.runner import post_replay_hook as hook
+from flliper.srt.models import qwen4_exp_ple_decode_pread as dp
+from flliper.srt.models import qwen4_exp_ple_prefetch as pf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # the H40 file's fixtures: two checkpoint-like files, the hash stand-in, the
 # interpreted plain and staged kernels
@@ -72,7 +72,7 @@ from test_qwen4_exp_ple_decode_pread_h40 import (  # noqa: E402
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
-LOGGER = "sglang.srt.models.qwen4_exp_ple_decode_pread"
+LOGGER = "flliper.srt.models.qwen4_exp_ple_decode_pread"
 SRC = pathlib.Path(dp.__file__).resolve().parents[1]
 GATE = InterpretedFunction(dp._ple_stage_gate_kernel.fn)
 GATED = InterpretedFunction(dp._gather_ple_embedding_gated_kernel.fn)
@@ -370,17 +370,17 @@ class TestStagerGate(CustomTestCase):
         self.assertEqual((int(m[1]), int(m[2])), (1, 0))
 
     def test_switch_reaches_the_stager_default_off(self):
-        self.assertFalse(envs.SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY.get())
+        self.assertFalse(envs.FLLIPER_PDFLIP_PLE_STAGE_BEHIND_REPLAY.get())
         fn = lambda: pf.PleHashParams.of(self.emb)  # noqa: E731
         for on in (False, True):
-            with envs.SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY.override(on):
+            with envs.FLLIPER_PDFLIP_PLE_STAGE_BEHIND_REPLAY.override(on):
                 st = dp.make_ple_decode_stager(
                     self.f.table, fn, vocab_start=0, vocab_end=TOTAL, device=torch.device("cpu")
                 )
             self.stagers.append(st)
             self.assertEqual(st.gated, on)
             self.assertEqual(st.done_word is not None, on)
-        self.assertEqual(st._gate_spins, dp.ple_gate_spins(envs.SGLANG_QWEN4_PLE_DECODE_PREAD_BUDGET_MS.get()))
+        self.assertEqual(st._gate_spins, dp.ple_gate_spins(envs.FLLIPER_QWEN4_PLE_DECODE_PREAD_BUDGET_MS.get()))
         self.assertEqual(dp.ple_gate_spins(8.0), 32000)
         self.assertEqual(dp.ple_gate_spins(0.1), dp._GATE_SPINS_MIN)
 
@@ -411,7 +411,7 @@ class TestPostReplayHook(CustomTestCase):
         self.assertEqual(seen, ["a"])
 
     def test_decode_graph_runner_fires_right_after_the_replay(self):
-        from sglang.srt.model_executor.runner import decode_cuda_graph_runner as dcgr
+        from flliper.srt.model_executor.runner import decode_cuda_graph_runner as dcgr
 
         order = []
         runner = types.SimpleNamespace(
@@ -496,7 +496,7 @@ class TestVerifyWiring(CustomTestCase):
         self.assertIn("ple_runner = self.target_worker.model_runner", v)
 
     def test_an_unfired_hook_is_staged_late_and_warned_once(self):
-        from sglang.srt.speculative import eagle_worker_v2 as ew
+        from flliper.srt.speculative import eagle_worker_v2 as ew
 
         ran = []
         ew._PLE_UNFIRED_WARNED = False

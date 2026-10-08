@@ -14,7 +14,7 @@ import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 SB = 64
 
@@ -91,7 +91,7 @@ def test_join_of_a_live_claim_is_status_1_not_fresh(tmp_path):
 
 
 def test_claim_by_stems_hashes_in_c_like_python(tmp_path):
-    from sglang.srt.mem_cache.storage.file.hicache_arena import key128
+    from flliper.srt.mem_cache.storage.file.hicache_arena import key128
     a = _arena(tmp_path, 2048)
     st = _stems("h", 300)
     got = _claim(a, st)
@@ -105,7 +105,7 @@ def test_claim_by_stems_hashes_in_c_like_python(tmp_path):
 
 
 def test_pending_mask_mirrors_the_pending_dict():
-    from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as M
+    from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as M
     import torch
     p = M.__new__(M)
     p._pending = {}
@@ -121,8 +121,8 @@ def test_the_mamba_pool_borrows_the_pending_helpers_too():
     """xsn356: ArenaMambaPoolHost borrows _claim/complete_write/abort_write from
     ArenaMHAHostPool; the helpers those call must be borrowed as well (the boot
     died on AttributeError: '_pend_mark')."""
-    from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost as M
-    from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as B
+    from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost as M
+    from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as B
     for name in ("_claim", "complete_write", "abort_write", "_pend_mark", "_pend_pop"):
         assert getattr(M, name) is getattr(B, name), name
     p = M.__new__(M)
@@ -135,7 +135,7 @@ def test_the_mamba_pool_borrows_the_pending_helpers_too():
 def test_claim_np_and_vectorised_complete_abort(tmp_path):
     """xsn359: the KV pool's pending state as mask/gen/fresh tensors."""
     import torch
-    from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as M
+    from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as M
     a = _arena(tmp_path, 4096)
     p = M.__new__(M)
     p.arena = a; p._backend = None; p._page_bytes = SB; p._own_extents = [(0, SB)]
@@ -161,7 +161,7 @@ def test_claim_np_and_vectorised_complete_abort(tmp_path):
 def test_publish_direct_on_the_tensor_path(tmp_path, monkeypatch):
     """xsn360: the draft producer's publish_direct read the dict (KeyError: 0)."""
     import torch
-    from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as M
+    from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as M
     a = _arena(tmp_path, 4096)
     p = M.__new__(M)
     p.arena = a; p._backend = object(); p._page_bytes = SB; p._own_extents = [(0, SB)]

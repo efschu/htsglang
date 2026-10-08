@@ -1,4 +1,4 @@
-"""ZR-1 (NF y6h D, weg2-4-14): three pages of a 1091-page prefix stayed
+"""ZR-1 (NF y6h D, pdflip-4-14): three pages of a 1091-page prefix stayed
 CLAIMED for good -- ``#1439 ARENA-PRESENT keys=1091 leading_complete=1067
 census=[(1, 3), (2, 1088)] claimed=6``, ``READ-TRACE asked=24 readable=21``
 -- and the wake re-computed what D had published itself.
@@ -26,8 +26,8 @@ import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.storage.file import hicache_arena  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.storage.file import hicache_arena  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 SLOT = 4096
 HALF = SLOT // 2
@@ -151,7 +151,7 @@ def test_a_dead_holder_of_the_index_lock_is_named_and_taken_over(arena, tmp_path
 def test_short_read_names_the_open_claims(tmp_path, caplog):
     """READ-TRACE short -> one ARENA-CLAIM-OPEN line per CLAIMED page it could
     not read, with the census of its writers."""
-    from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 
     a = ShmArena(str(tmp_path / "arena-4096.bin"), SLOT, 16)
     hicache_arena.ensure_writer_tag(a._lib, tag=9)

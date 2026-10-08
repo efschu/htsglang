@@ -20,11 +20,11 @@ REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-# Load ci_register.py directly: `import sglang.test...` pulls torch/orjson via
-# sglang.__init__ but check-changes runs on bare ubuntu-latest. ci_register
+# Load ci_register.py directly: `import flliper.test...` pulls torch/orjson via
+# flliper.__init__ but check-changes runs on bare ubuntu-latest. ci_register
 # itself is stdlib-only (AST).
 _CI_REGISTER_PATH = os.path.join(
-    REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
+    REPO_ROOT, "python", "flliper", "test", "ci", "ci_register.py"
 )
 _spec = importlib.util.spec_from_file_location("ci_register", _CI_REGISTER_PATH)
 _ci_register = importlib.util.module_from_spec(_spec)
@@ -83,7 +83,7 @@ def discover_files(repo_root: str) -> list[str]:
         )
         if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
     ]
-    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
+    jit_kernel_dir = os.path.join(repo_root, "python", "flliper", "jit_kernel")
     files += glob.glob(
         os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
     )
@@ -94,7 +94,7 @@ def discover_files(repo_root: str) -> list[str]:
 
 
 def load_partition_model(path):
-    """Read sglang-ci-stats' model.json; None on missing/unparsable.
+    """Read flliper-ci-stats' model.json; None on missing/unparsable.
     Cross-repo schema -- guard against non-dict top-level."""
     if not path or not os.path.exists(path):
         return None
@@ -116,7 +116,7 @@ def compute_partitions(
     """Group per-commit tests by suite and emit partition metadata.
 
     `run_timeouts`: `suite -> minutes` from `load_run_timeouts`.
-    `partition_model`: optional sglang-ci-stats `model.json`; per-file
+    `partition_model`: optional flliper-ci-stats `model.json`; per-file
     `est` and per-suite `(coeff, bias)` each fall back independently to
     in-source `est_time` / `(1.0, 0.0)`.
     `full_parallel=True` lifts the matrix-fanout throttle.
@@ -213,7 +213,7 @@ def main():
     parser.add_argument(
         "--partition-model-file",
         default=None,
-        help="Path to sglang-ci-stats model.json (omit/missing -> static fallback)",
+        help="Path to flliper-ci-stats model.json (omit/missing -> static fallback)",
     )
     parser.add_argument(
         "--pr-test-yml",

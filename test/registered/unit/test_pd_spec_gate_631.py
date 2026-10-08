@@ -40,12 +40,12 @@ from dataclasses import dataclass
 from typing import Optional
 from unittest import mock
 
-from sglang.srt.arg_groups.pd_disaggregation_hook import (
+from flliper.srt.arg_groups.pd_disaggregation_hook import (
     handle_pd_disaggregation,
     validate_pd_speculation,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -87,7 +87,7 @@ class PdSpecRefusalTest(CustomTestCase):
         self.assertIn("NEXTN", msg, "refusal does not name the algorithm asked for")
         self.assertIn("head-sharded", msg, "refusal does not give the reason")
         self.assertIn(
-            "SGLANG_PD_AUTO_DISABLE_SPEC", msg, "refusal does not name the escape hatch"
+            "FLLIPER_PD_AUTO_DISABLE_SPEC", msg, "refusal does not name the escape hatch"
         )
 
     def test_head_sharded_prefill_arm_is_refused(self):
@@ -134,7 +134,7 @@ class PdSpecRefusalTest(CustomTestCase):
             tp_size=2,
         )
         with mock.patch(
-            "sglang.srt.environ.envs.SGLANG_PD_AUTO_DISABLE_SPEC.get",
+            "flliper.srt.environ.envs.FLLIPER_PD_AUTO_DISABLE_SPEC.get",
             return_value=True,
         ):
             validate_pd_speculation(args)
@@ -143,9 +143,9 @@ class PdSpecRefusalTest(CustomTestCase):
 
     def test_escape_hatch_is_off_by_default(self):
         """The knob's default decides whether the fix is real. Pin it."""
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        self.assertFalse(envs.SGLANG_PD_AUTO_DISABLE_SPEC.get())
+        self.assertFalse(envs.FLLIPER_PD_AUTO_DISABLE_SPEC.get())
 
 
 class PdSpecAdmissionTest(CustomTestCase):
@@ -193,7 +193,7 @@ class PdSpecAdmissionTest(CustomTestCase):
             draft_kv_layout="replicated",
         )
         validate_pd_speculation(args)  # admitted here...
-        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+        from flliper.srt.arg_groups.pd_disaggregation_hook import (
             validate_pd_draft_kv_layout,
         )
 
@@ -244,7 +244,7 @@ class PdSpecGatePlacementTest(CustomTestCase):
             tp_size=2,
         )
         with mock.patch(
-            "sglang.srt.environ.envs.SGLANG_PD_AUTO_DISABLE_SPEC.get",
+            "flliper.srt.environ.envs.FLLIPER_PD_AUTO_DISABLE_SPEC.get",
             return_value=True,
         ):
             handle_pd_disaggregation(args)

@@ -24,7 +24,7 @@ either -- not the uneven [42, 30, 24], not the even TP=3 32, not replication
 every quantizer leaves it dense: the AWQ (auto-round) and FP8 siblings of the
 same base model list `linear_attn.in_proj_a` / `in_proj_b` (FP8 also the fused
 `in_proj_ba`) in `modules_to_not_convert`, and the fork's GGUF loader carves it
-out as F32. GPTQModel writes no ignore list at all, so sglang built a Marlin
+out as F32. GPTQModel writes no ignore list at all, so flliper built a Marlin
 layer whose `qweight` no checkpoint tensor ever reaches and whose repack then
 aborts.
 
@@ -37,7 +37,7 @@ module -- silent garbage instead of a hard abort).
 Plan-time arithmetic plus real layer construction; no GPU, no server.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -46,30 +46,30 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     partition_sizes,
     scoped_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.srt.layers.linear import (
+from flliper.srt.layers.linear import (
     LinearBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.quantization.gptq.gptq import (
+from flliper.srt.layers.quantization.gptq.gptq import (
     GPTQMarlinConfig,
     GPTQMarlinLinearMethod,
     gptq_marlin_unpackable_reason,
 )
-from sglang.srt.layers.quantization.gptq.schemes.gptq_marlin import (
+from flliper.srt.layers.quantization.gptq.schemes.gptq_marlin import (
     GPTQMarlinLinearScheme,
 )
-from sglang.srt.layers.quantization.marlin_utils import (
+from flliper.srt.layers.quantization.marlin_utils import (
     GPTQ_MARLIN_MIN_THREAD_K,
     GPTQ_MARLIN_MIN_THREAD_N,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from flliper.test.test_utils import CustomTestCase
 
 # Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4.
 HIDDEN = 5120
@@ -320,7 +320,7 @@ class TestRealLayerConstruction(CustomTestCase):
         with (
             scoped_tp_partition_ratios(R7B_WEIGHTS),
             mock.patch(
-                "sglang.srt.layers.quantization.gptq.schemes.gptq_marlin.verify_marlin_supported"
+                "flliper.srt.layers.quantization.gptq.schemes.gptq_marlin.verify_marlin_supported"
             ),
             mock.patch.object(
                 GPTQMarlinLinearScheme, "_init_kernel", return_value=mock.MagicMock()

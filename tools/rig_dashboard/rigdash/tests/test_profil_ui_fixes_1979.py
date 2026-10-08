@@ -3,8 +3,8 @@
 * ``profil.js``: schlägt die ERSTE Balken-Rechnung fehl, darf ``draw()`` nicht werfen (vorher: ``Object.keys(b.phases)`` auf undefined,
   der ganze Reiter fror auf "computing …" ein); ein Fehler NACH erfolgreicher Rechnung kennzeichnet die alten Balken als veraltet;
   die Rechnung läuft beim Öffnen des Faltbereichs nur einmal (nicht je Neuzeichnen).  Läuft in node mit einer Attrappe des DOM.
-* ``ProfilEditor.dry_run``: ``topology.plan_topology`` importiert für N != 3 ``sglang`` (``weg2/weight_exchange_region``); im Dashboard-
-  Prozess ohne sglang-Umgebung ist das KEINE Ablehnung und darf nicht als HTTP 500 enden, sondern wird als nicht geprüft vermerkt.
+* ``ProfilEditor.dry_run``: ``topology.plan_topology`` importiert für N != 3 ``flliper`` (``pdflip/weight_exchange_region``); im Dashboard-
+  Prozess ohne flliper-Umgebung ist das KEINE Ablehnung und darf nicht als HTTP 500 enden, sondern wird als nicht geprüft vermerkt.
 * CSS-Struktur: Kartenraster ohne Mindestbreite des Inhalts, Hardware-Tabelle im eigenen Scrollbereich (Seite scrollte bei 390 und 1100 px seitlich).
 """
 
@@ -117,21 +117,21 @@ class ProfilJsBars(unittest.TestCase):
         self.assertEqual(o["unhandled"], [])
 
 
-class DryRunWithoutSglang(unittest.TestCase):
+class DryRunWithoutFlliper(unittest.TestCase):
     def test_import_error_of_the_topology_probe_is_a_note_not_a_500(self):
         tmp = tempfile.mkdtemp(prefix="pf1979_")
         self.addCleanup(shutil.rmtree, tmp, True)
         ed, _, _ = editor(tmp)
         ci, tp = ed.kp._mods()
 
-        class NoSglangTopology:
+        class NoFlliperTopology:
             TopologyRefused = tp.TopologyRefused
 
             @staticmethod
             def plan_topology(n):
-                raise ModuleNotFoundError("No module named 'sglang'")
+                raise ModuleNotFoundError("No module named 'flliper'")
 
-        ed.kp._mods = lambda: (ci, NoSglangTopology)
+        ed.kp._mods = lambda: (ci, NoFlliperTopology)
         d = ed.dry_run(ed.load("release", "demo")["doc"], RIG[:2])
         self.assertTrue(d["ok"])
         self.assertTrue(any("Topology for 2 card(s) not checked" in n for n in d["notes"]), d["notes"])

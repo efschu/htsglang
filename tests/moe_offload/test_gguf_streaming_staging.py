@@ -22,7 +22,7 @@ What is pinned here:
   * default unchanged -- with no resident fraction the stream takes the old
     accumulate path and produces the same full ``[E, ...]`` stack;
   * #394 -- a delegated cold expert is released IN STREAM (never copied into
-    this rank's pinned tier), and without ``SGLANG_MOE_HOST_SHARD_RATIO`` the
+    this rank's pinned tier), and without ``FLLIPER_MOE_HOST_SHARD_RATIO`` the
     door constructs no context at all.
 
 Run:
@@ -40,8 +40,8 @@ from torch.nn.parameter import UninitializedParameter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe import expert_offload  # noqa: E402
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe import expert_offload  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     plan_load_time_staging,
     reset_expert_offload_release,
     reset_host_shard_log_latch,
@@ -49,13 +49,13 @@ from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
     streaming_staging_ledger,
 )
 
-FRACTION_ENV = "SGLANG_MOE_RESIDENT_EXPERT_FRACTION"
-SCRATCH_ENV = "SGLANG_MOE_SCRATCH_SLOTS"
-STREAM_ENV = "SGLANG_MOE_GGUF_STREAM_STAGING"
-TRACE_ENV = "SGLANG_MOE_STAGING_TRACE"
-RATIO_ENV = "SGLANG_MOE_HOST_SHARD_RATIO"
-CARD_UUIDS_ENV = "SGLANG_RANK_CARD_UUIDS"
-UNSAFE_DELEGATE_ENV = "SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE"
+FRACTION_ENV = "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"
+SCRATCH_ENV = "FLLIPER_MOE_SCRATCH_SLOTS"
+STREAM_ENV = "FLLIPER_MOE_GGUF_STREAM_STAGING"
+TRACE_ENV = "FLLIPER_MOE_STAGING_TRACE"
+RATIO_ENV = "FLLIPER_MOE_HOST_SHARD_RATIO"
+CARD_UUIDS_ENV = "FLLIPER_RANK_CARD_UUIDS"
+UNSAFE_DELEGATE_ENV = "FLLIPER_MOE_HOST_SHARD_UNSAFE_DELEGATE"
 
 # Toy geometry. Row byte counts are whole ggml K-quant blocks (Q4_K 144 B,
 # Q6_K 210 B) so the byte arithmetic is the arithmetic of a real checkpoint;
@@ -113,7 +113,7 @@ def _stream_plan(num_layers=LAYERS, owned=range(E)):
 
 
 def _stub_layer_type():
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     members = {
         name: value
@@ -152,7 +152,7 @@ def _make_layer(
     moe_tp_size=1,
     moe_tp_rank=0,
 ):
-    from sglang.srt.layers.quantization.gguf import GGUFUninitializedParameter
+    from flliper.srt.layers.quantization.gguf import GGUFUninitializedParameter
 
     layer = _stub_layer_type()()
     layer.layer_id = layer_id
@@ -296,7 +296,7 @@ def test_streamed_peak_stays_under_pinned_plus_one_layer(monkeypatch):
 def test_the_peak_bound_can_fail_on_the_old_accumulate_path(monkeypatch):
     """Can-fail companion: the same bound, the same stream, the old door.
 
-    ``SGLANG_MOE_GGUF_STREAM_STAGING=0`` restores accumulate-then-materialize.
+    ``FLLIPER_MOE_GGUF_STREAM_STAGING=0`` restores accumulate-then-materialize.
     Its ledger peak is the FULL streamed set -- every layer's every expert alive
     at once -- which is precisely the 126.19 GiB against 98.5 GiB of host RAM
     that OOM-killed boot attempt 5.
@@ -331,7 +331,7 @@ def test_trace_logs_cumulative_host_bytes_at_layer_boundaries(monkeypatch, caplo
     reset_streaming_staging_ledger()
 
     layers = [_make_layer(i, 0.5) for i in range(LAYERS)]
-    with caplog.at_level("INFO", logger="sglang.srt.layers.moe.expert_offload"):
+    with caplog.at_level("INFO", logger="flliper.srt.layers.moe.expert_offload"):
         # NO materialization pass: the boundaries must be reached DURING the
         # stream. A line printed at the drain would print for all N layers at
         # once, after the load, and could not be lined up against a
@@ -369,7 +369,7 @@ def test_trace_is_silent_without_the_env(monkeypatch, caplog):
     reset_streaming_staging_ledger()
 
     layers = [_make_layer(0, 0.5)]
-    with caplog.at_level("INFO", logger="sglang.srt.layers.moe.expert_offload"):
+    with caplog.at_level("INFO", logger="flliper.srt.layers.moe.expert_offload"):
         _run_stream(layers, _stream_plan(num_layers=1))
 
     assert not [r for r in caplog.records if "[moe-staging-trace]" in r.getMessage()]
@@ -453,7 +453,7 @@ def test_the_byte_identity_pin_can_fail(monkeypatch):
 
 
 def test_process_weights_after_loading_is_idempotent_after_streaming(monkeypatch):
-    from sglang.srt.layers.moe.expert_offload import expert_offload_release_totals
+    from flliper.srt.layers.moe.expert_offload import expert_offload_release_totals
 
     monkeypatch.setenv(FRACTION_ENV, "0.5")
     monkeypatch.setenv(SCRATCH_ENV, "1")

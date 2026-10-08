@@ -43,8 +43,8 @@ import sys
 import textwrap
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -56,9 +56,9 @@ _WORKER = textwrap.dedent("""
 
     import torch
 
-    from sglang.srt.layers import fused_qk_rmsnorm_rope_gate as mod
-    from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
-    from sglang.srt.server_args import (
+    from flliper.srt.layers import fused_qk_rmsnorm_rope_gate as mod
+    from flliper.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+    from flliper.srt.server_args import (
         ServerArgs,
         set_global_server_args_for_scheduler,
     )
@@ -66,7 +66,7 @@ _WORKER = textwrap.dedent("""
     # PDL is a CUDA launch attribute; the interpreter has no card to ask.
     mod._enable_pdl = lambda device: False
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-    cpu_patch = patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
+    cpu_patch = patch("flliper.srt.layers.rotary_embedding.base._is_cpu", True)
     cpu_patch.start()
 
     torch.manual_seed(0)

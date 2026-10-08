@@ -18,7 +18,7 @@ the scheduler subprocess) lives in
 GPU-backed metrics tests.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -26,7 +26,7 @@ import unittest
 
 import prometheus_client
 
-from sglang.srt.observability.metrics_collector import (
+from flliper.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     STAT_LOGGER_ROLE_RADIX_CACHE,
     STAT_LOGGER_ROLE_SCHEDULER,

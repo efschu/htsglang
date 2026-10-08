@@ -1,12 +1,12 @@
-"""Unit tests for SGLANG_CHECK_KV_PAGE_INVARIANTS: watermark + double-free checks."""
+"""Unit tests for FLLIPER_CHECK_KV_PAGE_INVARIANTS: watermark + double-free checks."""
 
 import unittest
 from types import SimpleNamespace
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -34,7 +34,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         get_last_batch = lambda self: None
         count_memory_leak_warnings = 0
 
-        from sglang.srt.managers.scheduler_components.invariant_checker import (
+        from flliper.srt.managers.scheduler_components.invariant_checker import (
             SchedulerInvariantChecker as _RIC,
         )
 

@@ -1,9 +1,9 @@
 """Unit tests for the uneven-TP shard-plan helpers in
-sglang.srt.distributed.utils — pure functions, no GPU, no server."""
+flliper.srt.distributed.utils — pure functions, no GPU, no server."""
 
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     partition_offsets,
     partition_sizes,
@@ -13,8 +13,8 @@ from sglang.srt.distributed.utils import (
     tp_partition_size,
     tp_partition_sizes,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

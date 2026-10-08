@@ -10,7 +10,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.layers.moe import shared_pinned as sp
+from flliper.srt.layers.moe import shared_pinned as sp
 
 
 class _FakeCudart:

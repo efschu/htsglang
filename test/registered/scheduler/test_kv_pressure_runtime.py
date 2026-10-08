@@ -11,17 +11,17 @@ import logging
 import threading
 import unittest
 
-from sglang.srt.managers.admission_limiter import (
+from flliper.srt.managers.admission_limiter import (
     DEFAULT_RELEASE_LOW,
     DEFAULT_THROTTLE_HIGH,
     AdmissionLimiter,
 )
-from sglang.srt.managers.kv_pressure_runtime import (
+from flliper.srt.managers.kv_pressure_runtime import (
     LOG_PREFIX,
     KvPressureRuntime,
     build_kv_pressure_runtime,
 )
-from sglang.srt.model_executor.kv_pressure_ladder import (
+from flliper.srt.model_executor.kv_pressure_ladder import (
     DEFAULT_ASCEND_THRESHOLD,
     DEFAULT_DESCEND_THRESHOLD,
     DEFAULT_PRE_STAGE_THRESHOLD,
@@ -264,7 +264,7 @@ class TestDeterministicSelection(unittest.TestCase):
         ladder = _ladder(with_grid=True, with_admission=False)
         rt = _runtime(ladder=ladder, consensus_interval=2)
         with self.assertLogs(
-            "sglang.srt.managers.kv_pressure_runtime", level=logging.WARNING
+            "flliper.srt.managers.kv_pressure_runtime", level=logging.WARNING
         ) as logs:
             _drive(rt, RAMP, phase="decode")
         flip_lines = [
@@ -290,7 +290,7 @@ class TestActuators(unittest.TestCase):
             consensus_interval=2,
         )
         with self.assertLogs(
-            "sglang.srt.managers.kv_pressure_runtime", level=logging.WARNING
+            "flliper.srt.managers.kv_pressure_runtime", level=logging.WARNING
         ) as logs:
             _drive(rt, RAMP[:8])
         self.assertEqual(rt.ladder.current_rung, 1)  # dcp_ratio
@@ -387,7 +387,7 @@ class TestNoPressureRegression(unittest.TestCase):
         the active path (rung, limiter, spill) is untouched."""
         # Geometry rung above base so a pre-stage target exists (relief
         # rungs are never staged).
-        from sglang.srt.model_executor.kv_pressure_ladder import (
+        from flliper.srt.model_executor.kv_pressure_ladder import (
             HANDOVER_BACKGROUND_MIGRATE,
             STEP_GEOMETRY,
         )
@@ -414,7 +414,7 @@ class TestNoPressureRegression(unittest.TestCase):
         self.assertEqual(lim.current, lim.start)
 
     def test_warm_shadow_flip_is_delta_only(self):
-        from sglang.srt.model_executor.kv_pressure_ladder import (
+        from flliper.srt.model_executor.kv_pressure_ladder import (
             HANDOVER_ANTICIPATORY_SHADOW,
             HANDOVER_BACKGROUND_MIGRATE,
             STEP_GEOMETRY,
@@ -459,7 +459,7 @@ class TestLogging(unittest.TestCase):
     def test_flip_is_loud_and_greppable(self):
         rt = _runtime(consensus_interval=2)
         with self.assertLogs(
-            "sglang.srt.managers.kv_pressure_runtime", level=logging.WARNING
+            "flliper.srt.managers.kv_pressure_runtime", level=logging.WARNING
         ) as logs:
             _drive(rt, RAMP[:8])
         self.assertTrue(
@@ -471,7 +471,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-LADDER_LOGGER = "sglang.srt.managers.kv_pressure_runtime"
+LADDER_LOGGER = "flliper.srt.managers.kv_pressure_runtime"
 
 
 def _hold_lines(ctx) -> list:

@@ -5,7 +5,7 @@ Usage:
 python3 sgl_gen_min_tokens.py
 """
 
-import sglang as sgl
+import flliper as sgl
 
 
 @sgl.function

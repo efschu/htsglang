@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from json_decode import character_regex
 
-from sglang.utils import http_request
+from flliper.utils import http_request
 
 character_names = ["Hermione Granger", "Ron Weasley", "Harry Potter"]
 

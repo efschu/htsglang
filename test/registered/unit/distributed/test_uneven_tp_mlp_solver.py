@@ -1,6 +1,6 @@
 """Unit tests for the uneven-TP self-calibration solver
 (solve_unit_rebalance / suggest_unit_rebalance in
-sglang.srt.distributed.utils) — pure functions, no GPU, no torch.
+flliper.srt.distributed.utils) — pure functions, no GPU, no torch.
 
 The solver models the KV-pool maximin problem: rank r's token capacity is
 (free_bytes + shed_mlp_units * bytes_per_unit) / bytes_per_token, and the
@@ -13,14 +13,14 @@ raise the projected minimum.
 
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     solve_unit_rebalance,
     solve_unit_rebalance_multi,
     suggest_unit_rebalance,
     suggest_unit_rebalance_multi,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

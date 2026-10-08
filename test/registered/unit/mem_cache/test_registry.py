@@ -1,13 +1,13 @@
 """Unit tests for the radix-cache registry, routing, and selection chain."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.registry import (
+from flliper.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
     create_tree_cache,
@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.registry import (
     register_radix_cache_backend,
     registered_radix_cache_backends,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _make_ctx(
@@ -108,7 +108,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         with self.assertRaises(ValueError):
             create_tree_cache(_make_ctx(backend="not_a_real_backend"))
 
-    @patch("sglang.srt.mem_cache.registry.default_radix_cache_factory")
+    @patch("flliper.srt.mem_cache.registry.default_radix_cache_factory")
     def test_unset_backend_falls_back_to_default(self, default_factory):
         cache = MagicMock()
         cache.supports_streaming_session.return_value = True
@@ -125,7 +125,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         register_radix_cache_backend("nonstreaming", MagicMock(return_value=inner))
 
         with patch(
-            "sglang.srt.session.streaming_session.StreamingSession"
+            "flliper.srt.session.streaming_session.StreamingSession"
         ) as session_cls:
             session_cls.return_value = MagicMock(name="wrapped")
             result = create_tree_cache(
@@ -157,7 +157,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
 
     def test_chunk_cache_when_chunked_prefill_and_disable_radix(self):
         ctx = _make_ctx(effective_chunked_prefill_size=512, disable_radix_cache=True)
-        with patch("sglang.srt.mem_cache.chunk_cache.ChunkCache") as ChunkCache:
+        with patch("flliper.srt.mem_cache.chunk_cache.ChunkCache") as ChunkCache:
             ChunkCache.return_value = MagicMock()
             result = default_radix_cache_factory(ctx)
             ChunkCache.assert_called_once_with(ctx.params)
@@ -169,7 +169,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             disable_radix_cache=True,
             is_hybrid_swa=True,
         )
-        with patch("sglang.srt.mem_cache.chunk_cache.SWAChunkCache") as SWAChunkCache:
+        with patch("flliper.srt.mem_cache.chunk_cache.SWAChunkCache") as SWAChunkCache:
             SWAChunkCache.return_value = MagicMock()
             result = default_radix_cache_factory(ctx)
             SWAChunkCache.assert_called_once_with(ctx.params)
@@ -183,7 +183,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             full_tokens_per_layer=0,
         )
         with patch(
-            "sglang.srt.mem_cache.chunk_cache.PureSWAChunkCache"
+            "flliper.srt.mem_cache.chunk_cache.PureSWAChunkCache"
         ) as PureSWAChunkCache:
             PureSWAChunkCache.return_value = MagicMock()
             result = default_radix_cache_factory(ctx)
@@ -198,12 +198,12 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         fake_module = MagicMock()
         with (
             patch(
-                "sglang.srt.mem_cache.registry.envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get",
+                "flliper.srt.mem_cache.registry.envs.FLLIPER_EXPERIMENTAL_CPP_RADIX_TREE.get",
                 return_value=True,
             ),
             patch.dict(
                 "sys.modules",
-                {"sglang.srt.mem_cache.radix_cache_cpp": fake_module},
+                {"flliper.srt.mem_cache.radix_cache_cpp": fake_module},
             ),
         ):
             result = default_radix_cache_factory(ctx)
@@ -219,14 +219,14 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         fake_radix = MagicMock()
         with (
             patch(
-                "sglang.srt.mem_cache.registry.envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get",
+                "flliper.srt.mem_cache.registry.envs.FLLIPER_ENABLE_UNIFIED_RADIX_TREE.get",
                 return_value=True,
             ),
             patch.dict(
                 "sys.modules",
                 {
-                    "sglang.srt.mem_cache.unified_cache_components": fake_components,
-                    "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+                    "flliper.srt.mem_cache.unified_cache_components": fake_components,
+                    "flliper.srt.mem_cache.unified_radix_cache": fake_radix,
                 },
             ),
         ):
@@ -242,7 +242,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         fake_module = MagicMock()
         with patch.dict(
             "sys.modules",
-            {"sglang.srt.mem_cache.hiradix_cache": fake_module},
+            {"flliper.srt.mem_cache.hiradix_cache": fake_module},
         ):
             result = default_radix_cache_factory(ctx)
             fake_module.HiRadixCache.assert_called_once_with(
@@ -259,8 +259,8 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         with patch.dict(
             "sys.modules",
             {
-                "sglang.srt.mem_cache.unified_cache_components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+                "flliper.srt.mem_cache.unified_cache_components": fake_components,
+                "flliper.srt.mem_cache.unified_radix_cache": fake_radix,
             },
         ):
             result = default_radix_cache_factory(ctx)
@@ -279,8 +279,8 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         with patch.dict(
             "sys.modules",
             {
-                "sglang.srt.mem_cache.unified_cache_components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+                "flliper.srt.mem_cache.unified_cache_components": fake_components,
+                "flliper.srt.mem_cache.unified_radix_cache": fake_radix,
             },
         ):
             result = default_radix_cache_factory(ctx)
@@ -293,7 +293,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
 
     def test_swa_radix_cache_when_hybrid_swa(self):
         ctx = _make_ctx(is_hybrid_swa=True)
-        with patch("sglang.srt.mem_cache.swa_radix_cache.SWARadixCache") as SWA:
+        with patch("flliper.srt.mem_cache.swa_radix_cache.SWARadixCache") as SWA:
             SWA.return_value = MagicMock()
             result = default_radix_cache_factory(ctx)
             SWA.assert_called_once_with(params=ctx.params)
@@ -302,7 +302,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
     def test_pure_swa_radix_cache_when_all_swa(self):
         ctx = _make_ctx(is_hybrid_swa=True, full_tokens_per_layer=0)
         with patch(
-            "sglang.srt.mem_cache.pure_swa_radix_cache.PureSWARadixCache"
+            "flliper.srt.mem_cache.pure_swa_radix_cache.PureSWARadixCache"
         ) as PureSWA:
             PureSWA.return_value = MagicMock()
             result = default_radix_cache_factory(ctx)
@@ -311,7 +311,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
 
     def test_mamba_radix_cache_when_hybrid_ssm(self):
         ctx = _make_ctx(is_hybrid_ssm=True)
-        with patch("sglang.srt.mem_cache.mamba_radix_cache.MambaRadixCache") as Mamba:
+        with patch("flliper.srt.mem_cache.mamba_radix_cache.MambaRadixCache") as Mamba:
             Mamba.return_value = MagicMock()
             result = default_radix_cache_factory(ctx)
             Mamba.assert_called_once_with(ctx.params)
@@ -325,7 +325,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         fake_module = MagicMock()
         with patch.dict(
             "sys.modules",
-            {"sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache": fake_module},
+            {"flliper.srt.mem_cache.storage.lmcache.lmc_radix_cache": fake_module},
         ):
             result = default_radix_cache_factory(ctx)
             fake_module.LMCRadixCache.assert_called_once_with(
@@ -339,7 +339,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
 
     def test_fallback_to_radix_cache(self):
         ctx = _make_ctx()
-        with patch("sglang.srt.mem_cache.radix_cache.RadixCache") as RadixCache:
+        with patch("flliper.srt.mem_cache.radix_cache.RadixCache") as RadixCache:
             RadixCache.return_value = MagicMock()
             result = default_radix_cache_factory(ctx)
             RadixCache.assert_called_once_with(ctx.params)

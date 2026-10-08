@@ -2,11 +2,11 @@
 
 import json
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.entrypoints.openai.protocol import Function, Tool
+from flliper.srt.function_call.function_call_parser import FunctionCallParser
+from flliper.srt.function_call.poolside_v1_detector import PoolsideV1Detector
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 

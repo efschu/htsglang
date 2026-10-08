@@ -81,7 +81,7 @@ _PYTHON_DIR = os.path.abspath(os.path.join(_HERE, "..", "..", "python"))
 if _PYTHON_DIR not in sys.path:
     sys.path.insert(0, _PYTHON_DIR)
 
-from sglang.srt.mem_ledger.host_shmem import (  # noqa: E402
+from flliper.srt.mem_ledger.host_shmem import (  # noqa: E402
     CLASS_ANON_SHARED,
     HOST_RAM_CLASSES,
     parse_shared_mappings,
@@ -97,18 +97,18 @@ def _is_power_of_two(n: int) -> bool:
 
 #: What a rank's ``comm`` can actually be compared against.
 #:
-#: The ranks ask to be called ``sglang::scheduler_PP0`` and the like, but the
+#: The ranks ask to be called ``flliper::scheduler_PP0`` and the like, but the
 #: kernel stores ``comm`` in ``TASK_COMM_LEN`` = 16 bytes, so what
 #: ``/proc/<pid>/comm`` returns is the 15-character prefix
-#: ``sglang::schedul``. Testing for ``"sglang::scheduler"`` (17 chars) is
+#: ``flliper::schedul``. Testing for ``"flliper::scheduler"`` (17 chars) is
 #: therefore False for every process that ever existed -- which is what this
-#: script did, and why it reported "no sglang::scheduler process found"
+#: script did, and why it reported "no flliper::scheduler process found"
 #: against a healthy three-rank boot.
 #:
 #: 13 characters, so it survives the truncation with room to spare, and long
 #: enough not to collide with the launcher's other children (the sibling
-#: ``sglang::detoken`` does not share this prefix).
-_SCHEDULER_COMM_PREFIX = "sglang::sched"
+#: ``flliper::detoken`` does not share this prefix).
+_SCHEDULER_COMM_PREFIX = "flliper::sched"
 
 
 def is_scheduler_comm(comm: str) -> bool:
@@ -357,7 +357,7 @@ def main() -> int:
     pids = args.pid or discover_scheduler_pids()
     if not pids:
         print(
-            "no sglang::scheduler process found. Boot the server first, or "
+            "no flliper::scheduler process found. Boot the server first, or "
             "name the pids with --pid.",
             file=sys.stderr,
         )

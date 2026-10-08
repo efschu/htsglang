@@ -28,7 +28,7 @@ this crash.
 
 THE PRODUCER THAT DID FIRE is two statements above the reader, in the traceback
 itself. `scheduler_pp_mixin.py:2159` calls `pp_apply_dead_premise_anywhere(self)`
--- #948's relocated actuator, armed for that boot by `SGLANG_946_ACT_AT_RING=1`
+-- #948's relocated actuator, armed for that boot by `FLLIPER_946_ACT_AT_RING=1`
 (TICKET_958_WINDOW.md, boot recipe) -- and `:2161` calls
 `get_next_batch_to_run`. `pp_request_locations` (`scheduler_pp_mixin.py:1350`)
 lists `chunked_req` among the four places it sweeps, so the terminator truncates
@@ -94,10 +94,10 @@ line and not on a re-spelling of it.
 import types
 import unittest
 
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.utils.common import Range
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.schedule_batch import Req, ScheduleBatch
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.utils.common import Range
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=25)
 
@@ -139,7 +139,7 @@ def _holder(req):
 
 def _run_the_ring_actuator(holder):
     """The REAL #948 sweep, as `scheduler_pp_mixin.py:2159` calls it."""
-    from sglang.srt.managers.scheduler_pp_mixin import (
+    from flliper.srt.managers.scheduler_pp_mixin import (
         pp_apply_dead_premise_anywhere,
         pp_mark_premise_dead,
     )
@@ -263,7 +263,7 @@ class TheRealReadersAfterTheTruncation(unittest.TestCase):
         )
 
     def test_READER_schedule_batch_2620_next_prompt_token(self):
-        from sglang.srt.managers.schedule_batch import (
+        from flliper.srt.managers.schedule_batch import (
             _compute_chunked_req_next_prompt_token,
         )
 
@@ -276,7 +276,7 @@ class TheRealReadersAfterTheTruncation(unittest.TestCase):
         )
 
     def test_READER_pp_chunked_local_match_reports_a_measured_zero(self):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_chunked_local_match
+        from flliper.srt.managers.scheduler_pp_mixin import pp_chunked_local_match
 
         self.assertEqual(
             pp_chunked_local_match(self._truncated()),
@@ -289,7 +289,7 @@ class TheRealReadersAfterTheTruncation(unittest.TestCase):
 
     def test_READER_executed_extent_is_readable_and_the_offer_MOVES(self):
         """The #958 delivery line, now via a geometry instead of a refusal."""
-        from sglang.srt.managers.pp_admission_congruence import _executed_extent
+        from flliper.srt.managers.pp_admission_congruence import _executed_extent
 
         before = _Req()
         self.assertEqual(_executed_extent(before), (PREFIX, CHUNK))
@@ -304,7 +304,7 @@ class TheRealReadersAfterTheTruncation(unittest.TestCase):
 
     def test_the_PRODUCER_puts_a_zero_offer_on_the_wire(self):
         """Read off `build_pp_admission_decision`, never re-derived here."""
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             PPAdmissionCongruenceGuard,
             build_pp_admission_decision,
         )
@@ -345,7 +345,7 @@ class TheInvariantIsLoadBearingAtEveryReader(unittest.TestCase):
         )
 
     def test_MUTANT_kills_reader_schedule_batch_2620(self):
-        from sglang.srt.managers.schedule_batch import (
+        from flliper.srt.managers.schedule_batch import (
             _compute_chunked_req_next_prompt_token,
         )
 
@@ -353,12 +353,12 @@ class TheInvariantIsLoadBearingAtEveryReader(unittest.TestCase):
             _compute_chunked_req_next_prompt_token(self._mutant(), vocab_size=TOTAL + 1)
 
     def test_MUTANT_makes_the_offer_UNREADABLE(self):
-        from sglang.srt.managers.pp_admission_congruence import _executed_extent
+        from flliper.srt.managers.pp_admission_congruence import _executed_extent
 
         self.assertIsNone(_executed_extent(self._mutant()))
 
     def test_MUTANT_makes_local_match_report_UNKNOWN_instead_of_zero(self):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_chunked_local_match
+        from flliper.srt.managers.scheduler_pp_mixin import pp_chunked_local_match
 
         self.assertIsNone(pp_chunked_local_match(self._mutant()))
 
@@ -371,7 +371,7 @@ class TheInvariantIsLoadBearingAtEveryReader(unittest.TestCase):
         downstream of the reader that dies. This asserts the structural fact,
         so "the net is unnecessary here" is measured rather than assumed.
         """
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             PPAdmissionCongruenceGuard,
             build_pp_admission_decision,
         )

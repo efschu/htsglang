@@ -25,13 +25,13 @@ test_a_lone_declining_site_is_refused red. Verified.
 
 from test_uneven_token_vector_role_797 import _run
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     assert_seed_superseded,
     note_seed_awaiting_supersession,
     reset_seed_liveness,
 )
-from sglang.srt.planner.retracted import SeedNotSupersededError
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner.retracted import SeedNotSupersededError
+from flliper.test.test_utils import CustomTestCase
 
 # The capacities boot 0646 actually profiled, and the vector that rode.
 CAPS = [620560, 360392, 375560]

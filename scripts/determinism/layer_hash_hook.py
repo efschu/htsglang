@@ -1,4 +1,4 @@
-"""#190 forward-hook factory for sglang's native --forward-hooks.
+"""#190 forward-hook factory for flliper's native --forward-hooks.
 
 Writes a blake2b byte-hash of every hooked module's output, once per forward,
 so two flushed identical prefills can be diffed module by module.  The FIRST
@@ -6,7 +6,7 @@ module whose hash differs between two runs is where the nondeterminism enters.
 
 The native hook mechanism lives inside the TP worker processes, which is why
 this is used instead of monkeypatching the launcher (spawned workers re-import
-sglang and never see a parent-process patch).
+flliper and never see a parent-process patch).
 
 Wire it up with:
 

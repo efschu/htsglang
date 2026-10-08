@@ -48,7 +48,7 @@ configure_environment() {
     SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
     if [ "$USE_VENV" = "1" ]; then
-        UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
+        UV_VENV="/tmp/flliper-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
         uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
         # shellcheck disable=SC1091
         source "$UV_VENV/bin/activate"
@@ -59,7 +59,7 @@ configure_environment() {
             # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
             mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
             echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
-            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "FLLIPER_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
             echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
             touch "$UV_VENV/env.sh"
         fi
@@ -110,7 +110,7 @@ detect_host() {
 }
 
 kill_existing_processes() {
-    python3 "${REPO_ROOT}/python/sglang/cli/killall.py"
+    python3 "${REPO_ROOT}/python/flliper/cli/killall.py"
     KILLALL_EXIT=$?
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
@@ -127,8 +127,8 @@ cleanup_stale_shm() {
     # jobs; leaked segments accumulate until the tmpfs fills and scheduler
     # init dies with SIGBUS. Runs right after killall so every dead creator's
     # segments are reclaimable. The module is dependency-free and runnable by
-    # path, so this works before sglang is installed.
-    SGLANG_IS_IN_CI=true python3 "${REPO_ROOT}/python/sglang/srt/utils/stale_shm_cleanup.py" || true
+    # path, so this works before flliper is installed.
+    FLLIPER_IS_IN_CI=true python3 "${REPO_ROOT}/python/flliper/srt/utils/stale_shm_cleanup.py" || true
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -191,7 +191,7 @@ setup_pip_toolchain() {
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
 
-    $PIP_UNINSTALL_CMD sgl-kernel sglang-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
+    $PIP_UNINSTALL_CMD sgl-kernel sglang-kernel flliper sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -259,7 +259,7 @@ uninstall_stale_flashinfer() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_sglang() {
+install_flliper() {
     EXTRAS="dev,runai,tracing"
     if [ -n "$OPTIONAL_DEPS" ]; then
         EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
@@ -280,7 +280,7 @@ install_sglang() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_sglang_kernel() {
+install_flliper_kernel() {
     SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
     SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sglang-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
     echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
@@ -347,9 +347,9 @@ install_sglang_kernel() {
     fi
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
-        # install_sglang above pulls sglang-kernel from PyPI, whose default wheel
+        # install_flliper above pulls sglang-kernel from PyPI, whose default wheel
         # tracks one CUDA version (currently cu130). Force-reinstall from the
-        # CU_VERSION-matched sglang wheel index so runners on a different CUDA
+        # CU_VERSION-matched flliper wheel index so runners on a different CUDA
         # (e.g. h20 / cu129) get a wheel linked against the right libnvrtc.
         $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     else
@@ -365,7 +365,7 @@ install_sglang_kernel() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_sglang_router() {
+install_flliper_router() {
     $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
     $PIP_CMD list
 
@@ -436,7 +436,7 @@ stabilize_flashinfer_jit_paths() {
     if [ -d "${HOME}/.cache/flashinfer" ]; then
         STALE_COUNT=0
         while IFS= read -r ninja_file; do
-            STALE_PATH=$(grep -o '/tmp/sglang-ci-[^ ]*\|flashinfer-src' "$ninja_file" 2>/dev/null | head -1 || true)
+            STALE_PATH=$(grep -o '/tmp/flliper-ci-[^ ]*\|flashinfer-src' "$ninja_file" 2>/dev/null | head -1 || true)
             if [ -n "$STALE_PATH" ]; then
                 if echo "$STALE_PATH" | grep -q "flashinfer-src" || [ ! -d "$STALE_PATH" ]; then
                     rm -rf "$(dirname "$ninja_file")"
@@ -528,9 +528,9 @@ install_test_tools() {
     # Download kernels from kernels community
     kernels download python || true
     kernels lock python || true
-    [ -e "${HOME}/.cache/sglang" ] && [ ! -d "${HOME}/.cache/sglang" ] && rm -f "${HOME}/.cache/sglang"
-    mkdir -p "${HOME}/.cache/sglang/"
-    mv python/kernels.lock "${HOME}/.cache/sglang/" || true
+    [ -e "${HOME}/.cache/flliper" ] && [ ! -d "${HOME}/.cache/flliper" ] && rm -f "${HOME}/.cache/flliper"
+    mkdir -p "${HOME}/.cache/flliper/"
+    mv python/kernels.lock "${HOME}/.cache/flliper/" || true
 
     # Install human-eval (subshell keeps cd local)
     $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
@@ -591,14 +591,14 @@ main() {
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
-    install_sglang
-    # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
+    install_flliper
+    # Diffusion B200 CI imports torch inside install_flliper_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
-    if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
+    if [ "${FLLIPER_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
         setup_ld_library_path
     fi
-    install_sglang_kernel
-    install_sglang_router
+    install_flliper_kernel
+    install_flliper_router
     install_flashinfer_cubin
     download_flashinfer_cache
     force_reinstall_cutlass_dsl_libs_cu13

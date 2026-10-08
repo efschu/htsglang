@@ -18,10 +18,10 @@ After this sweep's first ``#1421 arena_claim`` refusal, a node whose claim the
 arena provably cannot serve now (``ArenaMHAHostPool.claim_would_refuse``) is
 counted refused without the claim. The same nodes are backed, the same ones
 refused; only the futile claims go. Switch
-``SGLANG_WEG2_ENABLE_SWEEP_FULL_ARENA_SKIP`` (default on).
+``FLLIPER_PDFLIP_ENABLE_SWEEP_FULL_ARENA_SKIP`` (default on).
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -31,16 +31,16 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache import form_a_host_shadow
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
-from sglang.srt.mem_cache.pool_host import arena_pool
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache import form_a_host_shadow
+from flliper.srt.mem_cache.base_prefix_cache import InsertParams
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup
+from flliper.srt.mem_cache.pool_host import arena_pool
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
@@ -114,8 +114,8 @@ def _chains(cache):
 
 
 def _sweep(cache, pool, *, on=True):
-    with envs.SGLANG_WEG2_ENABLE_SWEEP_FULL_ARENA_SKIP.override(on), \
-            mock.patch.object(UnifiedRadixCache, "_weg2_direct_pool", lambda self: pool), \
+    with envs.FLLIPER_PDFLIP_ENABLE_SWEEP_FULL_ARENA_SKIP.override(on), \
+            mock.patch.object(UnifiedRadixCache, "_pdflip_direct_pool", lambda self: pool), \
             mock.patch.object(UnifiedRadixCache, "_mamba_write_through_pin_admissible",
                               lambda self, node, write_back=False: True):
         return cache.publish_unbacked_sweep(max_issue=256)
@@ -177,7 +177,7 @@ class TestAFullArenaIsClaimedOncePerSweep(CustomTestCase):
     def test_a_recording_d_park_and_the_form_a_shadow_keep_every_claim(self):
         cache = _tree()
         pool = _DirectPool(room=())
-        cache._weg2_park_track = {}
+        cache._pdflip_park_track = {}
         _sweep(cache, pool, on=True)
         self.assertEqual(len(pool.claims), 2 * CHAIN, "HY records every refused park backup")
         cache2 = _tree()

@@ -42,7 +42,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 
 
 def _enospc(*_a, **_kw):

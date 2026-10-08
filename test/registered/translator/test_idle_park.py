@@ -26,15 +26,15 @@ from typing import List, Optional
 import torch
 from torch import nn
 
-from sglang.srt.translator import residency
-from sglang.srt.translator.idle_park import (
+from flliper.srt.translator import residency
+from flliper.srt.translator.idle_park import (
     IdleParkConfig,
     IdleParkController,
     ParkState,
     WakeTimeout,
     percentile,
 )
-from sglang.srt.translator.ledger import AudioAssetLedger
+from flliper.srt.translator.ledger import AudioAssetLedger
 
 
 class FakeClock:
@@ -682,7 +682,7 @@ class TestStagedWake(unittest.TestCase):
         return controller, ledger, clock
 
     def test_the_need_order_is_the_pipeline_order_not_the_alphabet(self):
-        from sglang.srt.translator.ledger import DEFAULT_WAKE_RANKS
+        from flliper.srt.translator.ledger import DEFAULT_WAKE_RANKS
 
         _controller, ledger, _clock = self._stack()
         order = ledger.wake_order()
@@ -795,7 +795,7 @@ class TestStagedWake(unittest.TestCase):
 
 class TestParkRoute(unittest.TestCase):
     def _route(self):
-        from sglang.srt.translator.asr_backends import CtranslateWhisperParkRoute
+        from flliper.srt.translator.asr_backends import CtranslateWhisperParkRoute
 
         handle = FakeCt2Handle()
         return handle, CtranslateWhisperParkRoute(handle, device="cuda")
@@ -825,8 +825,8 @@ class TestParkRoute(unittest.TestCase):
         self.assertEqual(len(handle.load_calls), 1)
 
     def test_a_handle_without_the_api_is_refused_at_registration(self):
-        from sglang.srt.translator.asr_backends import CtranslateWhisperParkRoute
-        from sglang.srt.translator.backends import BackendError
+        from flliper.srt.translator.asr_backends import CtranslateWhisperParkRoute
+        from flliper.srt.translator.backends import BackendError
 
         class NotAWhisper:
             pass
@@ -1015,10 +1015,10 @@ class TestRegisterAccounting(unittest.TestCase):
         import os
         from unittest.mock import patch
 
-        from sglang.srt.model_executor import offload_register
+        from flliper.srt.model_executor import offload_register
 
         self.module_under_test = offload_register
-        env = patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"})
+        env = patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"})
         env.start()
         self.addCleanup(env.stop)
         self.register = offload_register.configure_global_register("capacity")
@@ -1066,7 +1066,7 @@ class TestRegisterAccounting(unittest.TestCase):
 
 class TestConfigSurface(unittest.TestCase):
     def test_the_launcher_exposes_the_documented_flags_and_defaults(self):
-        from sglang.srt.translator.launch import build_parser
+        from flliper.srt.translator.launch import build_parser
 
         args = build_parser().parse_args([])
         self.assertTrue(args.idle_park, "the translator deployment defaults to ON")
@@ -1079,7 +1079,7 @@ class TestConfigSurface(unittest.TestCase):
         self.assertEqual(args.residency_event_url, "")
 
     def test_the_off_switches_parse(self):
-        from sglang.srt.translator.launch import build_parser
+        from flliper.srt.translator.launch import build_parser
 
         args = build_parser().parse_args(["--no-idle-park"])
         self.assertFalse(args.idle_park)
@@ -1088,7 +1088,7 @@ class TestConfigSurface(unittest.TestCase):
         self.assertTrue(args.idle_park)  # never-park wins at the config layer
 
     def test_the_deployment_config_carries_the_park_settings(self):
-        from sglang.srt.translator.config import TranslatorConfig
+        from flliper.srt.translator.config import TranslatorConfig
 
         config = TranslatorConfig()
         config.validate()
@@ -1096,7 +1096,7 @@ class TestConfigSurface(unittest.TestCase):
         self.assertEqual(config.idle_park.floor_s, 120.0)
 
     def test_an_invalid_park_config_is_refused_by_the_deployment(self):
-        from sglang.srt.translator.config import (
+        from flliper.srt.translator.config import (
             TranslatorConfig,
             TranslatorConfigError,
         )
@@ -1119,7 +1119,7 @@ class TestConfigSurface(unittest.TestCase):
         import inspect
         import textwrap
 
-        from sglang.srt.translator.server import TranslatorService
+        from flliper.srt.translator.server import TranslatorService
 
         def calls(fn) -> bool:
             # The CALL, not the word: the docstring names the rule it obeys.
@@ -1160,11 +1160,11 @@ class TestConfigSurface(unittest.TestCase):
 class TestAssetClassProvenance(unittest.TestCase):
     def test_the_park_is_defined_over_the_ledger_asset_class(self):
         """#488 replaces the BACKENDS, not the class or the state machine."""
-        from sglang.srt.model_executor.short_term_offload_register import (
+        from flliper.srt.model_executor.short_term_offload_register import (
             ASSET_CLASSES,
             LadderRank,
         )
-        from sglang.srt.translator.ledger import OFFLOAD_CLASS
+        from flliper.srt.translator.ledger import OFFLOAD_CLASS
 
         descriptor = ASSET_CLASSES[OFFLOAD_CLASS]
         self.assertEqual(descriptor.ladder_rank, LadderRank.COLD_SECOND_MODEL)

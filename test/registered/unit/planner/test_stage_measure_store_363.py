@@ -28,7 +28,7 @@ import os
 
 import pytest
 
-from sglang.srt.planner.stage_measure_store import (
+from flliper.srt.planner.stage_measure_store import (
     MIN_MEASURE_SECONDS,
     StageMeasurement,
     StageMeasurementError,
@@ -36,7 +36,7 @@ from sglang.srt.planner.stage_measure_store import (
     rig_key_from_uuids,
     stage_measure_path,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -90,13 +90,13 @@ def test_a_duplicated_uuid_is_refused_as_a_per_rank_list():
 def test_the_path_prefers_an_explicit_argument_then_the_env(monkeypatch, tmp_path):
     explicit = str(tmp_path / "explicit.json")
     assert stage_measure_path(explicit) == explicit
-    monkeypatch.setenv("SGLANG_STAGE_MEASUREMENTS", str(tmp_path / "env.json"))
+    monkeypatch.setenv("FLLIPER_STAGE_MEASUREMENTS", str(tmp_path / "env.json"))
     assert stage_measure_path() == str(tmp_path / "env.json")
 
 
 def test_the_default_path_sits_beside_the_card_library(monkeypatch, tmp_path):
-    monkeypatch.delenv("SGLANG_STAGE_MEASUREMENTS", raising=False)
-    monkeypatch.setenv("SGLANG_CARD_LIBRARY", str(tmp_path / "cards" / "lib.json"))
+    monkeypatch.delenv("FLLIPER_STAGE_MEASUREMENTS", raising=False)
+    monkeypatch.setenv("FLLIPER_CARD_LIBRARY", str(tmp_path / "cards" / "lib.json"))
     got = stage_measure_path()
     assert os.path.dirname(got) == str(tmp_path / "cards")
     assert got.endswith("stage_measurements.json")

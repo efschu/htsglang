@@ -2,7 +2,7 @@
 """Rig-Dashboard -- live view of the heterogeneous 3-GPU rig.
 
 A single self-contained process: it polls NVML for live per-card VRAM / temp /
-util / power / PCIe, optionally scrapes a running sglang server
+util / power / PCIe, optionally scrapes a running flliper server
 (``/get_server_info`` + ``/metrics``), parses the boot-log uneven-TP plan, and
 serves one static HTML page that renders it all as SVG.
 
@@ -10,7 +10,7 @@ No third-party web deps: stdlib ``http.server`` + ``urllib`` + optional
 ``pynvml`` (falls back to parsing ``nvidia-smi`` if pynvml is absent).
 
     python3 server.py --port 8770 \
-        --sglang http://127.0.0.1:30010 \
+        --flliper http://127.0.0.1:30010 \
         --boot-log /path/to/server.log
 
 Then open http://localhost:8770/ .  The page auto-refreshes ~1 Hz.
@@ -45,7 +45,7 @@ DEFAULT_GEOMETRY = {
 }
 
 _G = {}          # active geometry (filled in main)
-_CFG = {}        # runtime config (sglang url, boot log path)
+_CFG = {}        # runtime config (flliper url, boot log path)
 
 
 # ===========================================================================
@@ -157,7 +157,7 @@ def sample_nvml():
 
 
 # ===========================================================================
-# sglang live scraping (robust to server-down)
+# flliper live scraping (robust to server-down)
 # ===========================================================================
 def _get(url, timeout=1.5):
     with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -165,7 +165,7 @@ def _get(url, timeout=1.5):
 
 
 def scrape_server_info():
-    base = _CFG.get("sglang")
+    base = _CFG.get("flliper")
     if not base:
         return None
     for path in ("/get_server_info", "/server_info"):
@@ -176,11 +176,11 @@ def scrape_server_info():
     return None
 
 
-_METRIC = re.compile(r'^(sglang:[a-z_]+)(?:\{[^}]*\})?\s+([0-9eE.+-]+)\s*$')
+_METRIC = re.compile(r'^(flliper:[a-z_]+)(?:\{[^}]*\})?\s+([0-9eE.+-]+)\s*$')
 
 
 def scrape_metrics():
-    base = _CFG.get("sglang")
+    base = _CFG.get("flliper")
     if not base:
         return None
     try:
@@ -200,18 +200,18 @@ def scrape_metrics():
         except ValueError:
             pass
     keep = {
-        "gen_throughput": "sglang:gen_throughput",
-        "num_running_reqs": "sglang:num_running_reqs",
-        "num_queue_reqs": "sglang:num_queue_reqs",
-        "num_paused_reqs": "sglang:num_paused_reqs",
-        "token_usage": "sglang:token_usage",
-        "kv_used_tokens": "sglang:kv_used_tokens",
-        "kv_available_tokens": "sglang:kv_available_tokens",
-        "mamba_used_tokens": "sglang:mamba_used_tokens",
-        "max_total_num_tokens": "sglang:max_total_num_tokens",
-        "cache_hit_rate": "sglang:cache_hit_rate",
-        "spec_accept_length": "sglang:spec_accept_length",
-        "num_requests_total": "sglang:num_requests_total",
+        "gen_throughput": "flliper:gen_throughput",
+        "num_running_reqs": "flliper:num_running_reqs",
+        "num_queue_reqs": "flliper:num_queue_reqs",
+        "num_paused_reqs": "flliper:num_paused_reqs",
+        "token_usage": "flliper:token_usage",
+        "kv_used_tokens": "flliper:kv_used_tokens",
+        "kv_available_tokens": "flliper:kv_available_tokens",
+        "mamba_used_tokens": "flliper:mamba_used_tokens",
+        "max_total_num_tokens": "flliper:max_total_num_tokens",
+        "cache_hit_rate": "flliper:cache_hit_rate",
+        "spec_accept_length": "flliper:spec_accept_length",
+        "num_requests_total": "flliper:num_requests_total",
     }
     return {k: vals[v] for k, v in keep.items() if v in vals}
 
@@ -421,7 +421,7 @@ def map_plan_gpus_to_nvml(plan, nvml):
     """Map the boot log's GPU indices onto live NVML card indices.
 
     The server's boot-time enumeration and the current NVML order can diverge
-    (observed live: sglang's GPU 0 = RTX 5090, system NVML index 1). Match by
+    (observed live: flliper's GPU 0 = RTX 5090, system NVML index 1). Match by
     card NAME when the auto-performance block logged it (unique names only),
     then by per-rank memory budget best-fit (a 29607 MiB budget can only live
     on the 32 GB card). Falls back to identity for anything unresolved.
@@ -477,10 +477,10 @@ _CROSSOVER_MOD: list = []   # memoised: [module] or [None]
 
 
 def _crossover_module():
-    """``sglang.srt.planner.crossover``, or None when it cannot be reached.
+    """``flliper.srt.planner.crossover``, or None when it cannot be reached.
 
     Two ways in, because the dashboard is a standalone process that is often
-    run against a checkout whose sglang is not the installed one: the package
+    run against a checkout whose flliper is not the installed one: the package
     import first, then the module file next to this checkout loaded directly.
     The module is stdlib-only, so the direct load has nothing to satisfy.
     The panel degrades to "not available" rather than taking the server down.
@@ -489,12 +489,12 @@ def _crossover_module():
         return _CROSSOVER_MOD[0]
     mod = None
     try:
-        import sglang.srt.planner.crossover as mod  # noqa: PLC0415
+        import flliper.srt.planner.crossover as mod  # noqa: PLC0415
     except Exception:
         import importlib.util  # noqa: PLC0415
 
         src = os.path.join(
-            HERE, "..", "..", "python", "sglang", "srt", "planner", "crossover.py"
+            HERE, "..", "..", "python", "flliper", "srt", "planner", "crossover.py"
         )
         if os.path.isfile(src):
             try:
@@ -524,7 +524,7 @@ def crossover_state(path=None):
         return {
             "state": "unavailable",
             "usable": False,
-            "caveats": ["sglang.srt.planner.crossover is not importable here"],
+            "caveats": ["flliper.srt.planner.crossover is not importable here"],
             "offer": [],
         }
     return m.describe_evidence(m.load_finding(path))
@@ -601,20 +601,20 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8770)
     ap.add_argument(
-        "--sglang",
+        "--flliper",
         default="http://127.0.0.1:30010",
-        help="base URL of the sglang server (blank to disable scraping)",
+        help="base URL of the flliper server (blank to disable scraping)",
     )
     ap.add_argument(
         "--boot-log",
         default=os.environ.get("RIG_BOOT_LOG", ""),
-        help="path to the sglang boot log for the uneven-TP plan",
+        help="path to the flliper boot log for the uneven-TP plan",
     )
     ap.add_argument(
         "--crossover-file",
         default=os.environ.get("RIG_CROSSOVER_FILE", ""),
         help="path to this rig's measured MLP-split crossover "
-        "(default ~/.cache/sglang/mlp_crossover.json)",
+        "(default ~/.cache/flliper/mlp_crossover.json)",
     )
     for k in DEFAULT_GEOMETRY:
         ap.add_argument(f"--{k.replace('_', '-')}", type=int, default=None)
@@ -625,13 +625,13 @@ def main():
         v = getattr(args, k)
         if v is not None:
             _G[k] = v
-    _CFG["sglang"] = args.sglang.rstrip("/") if args.sglang else ""
+    _CFG["flliper"] = args.flliper.rstrip("/") if args.flliper else ""
     _CFG["boot_log"] = args.boot_log
     _CFG["crossover_file"] = args.crossover_file
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Rig-Dashboard on http://{args.host}:{args.port}/")
-    print(f"  sglang   : {_CFG['sglang'] or '(disabled)'}")
+    print(f"  flliper   : {_CFG['flliper'] or '(disabled)'}")
     print(f"  boot log : {_CFG['boot_log'] or '(none)'}")
     print(f"  crossover: {_CFG['crossover_file'] or '(default cache path)'}")
     try:

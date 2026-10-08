@@ -28,8 +28,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost  # noqa: E402
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
+from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost  # noqa: E402
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "_t_h99",
@@ -78,7 +78,7 @@ class _Pool:
         return self.room
 
 
-def _intake(pools, rid="weg2-7-31", spans=None):
+def _intake(pools, rid="pdflip-7-31", spans=None):
     group = h99.MockGlooGroup()
     caches = {}
     spans = spans or {0: SPAN, 1: SPAN, 2: SPAN}
@@ -86,7 +86,7 @@ def _intake(pools, rid="weg2-7-31", spans=None):
     def _rank(r):
         caches[r] = c = h99._carrier(r, group)
         c.cache_controller.mem_pool_host = pools[r]
-        c._weg2_rank_label = r
+        c._pdflip_rank_label = r
         c.prefetch_cut_terms = types.MethodType(UnifiedRadixCache.prefetch_cut_terms, c)
         c.prefetch_from_storage(rid, h99._host_node(), list(range(spans[r])), last_hash=None, prefix_keys=None)
         return h99._registered_len(c, rid)
@@ -125,12 +125,12 @@ def test_tp0_short_still_cuts_and_is_named(caplog):
     pools = {0: _Pool(4000), 1: _byteless_pool(WORKER_ROWS, 0),
              2: _byteless_pool(WORKER_ROWS, 0)}
     with caplog.at_level(logging.WARNING):
-        caches, results, errors, _g = _intake(pools, rid="weg2-cut")
+        caches, results, errors, _g = _intake(pools, rid="pdflip-cut")
     assert errors == {}, errors
     assert set(results.values()) == {(4000, 4000)}, results
     lines = [r.getMessage() for r in caplog.records if "#915 PREFETCH TRUNCATED" in r.getMessage()]
     assert len(lines) == 3 and all("cut_rank=0 " in ln for ln in lines), lines
-    assert {c.prefetch_cut_terms("weg2-cut") for c in caches.values()} == {
+    assert {c.prefetch_cut_terms("pdflip-cut") for c in caches.values()} == {
         f"min_rank=0 group_len=4000 need={SPAN}"
     }
     assert caches[1].prefetch_cut_terms("never") == "min_rank=-"
@@ -177,7 +177,7 @@ def test_a_pool_with_bytes_is_unchanged():
 
 
 def test_w88_names_the_min_rank():
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
-    src = inspect.getsource(Scheduler._weg2_store_load_terminal)
+    src = inspect.getsource(Scheduler._pdflip_store_load_terminal)
     assert "prefetch_cut_terms" in src

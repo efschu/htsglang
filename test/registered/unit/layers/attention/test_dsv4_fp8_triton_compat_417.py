@@ -36,14 +36,14 @@ import torch  # noqa: E402
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
-from sglang.srt.layers.attention.dsv4.fp8_triton_compat import (  # noqa: E402
+from flliper.srt.layers.attention.dsv4.fp8_triton_compat import (  # noqa: E402
     TRITON_FP8E4NV_MIN_CAPABILITY,
     e4m3fn_bits_to_f32,
     nope_cache_view,
     triton_fp8e4nv_supported,
 )
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -191,7 +191,7 @@ class TestPagedDequantKernel(CustomTestCase):
     """
 
     def _make_cache(self, num_pages, page_size, num_tokens, seed=0):
-        from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
+        from flliper.srt.layers.attention.dsv4.dequant_k_cache import (
             NOPE_ROPE_BYTES,
             PADDED_SCALE_PER_TOKEN,
         )
@@ -234,7 +234,7 @@ class TestPagedDequantKernel(CustomTestCase):
         return cache, page_table
 
     def test_manual_branch_matches_the_torch_reference(self):
-        import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+        import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
         page_size = 4
         cache, page_table = self._make_cache(
@@ -258,7 +258,7 @@ class TestPagedDequantKernel(CustomTestCase):
 
     def test_manual_branch_is_not_trivially_equal(self):
         """Can-fail proof for the kernel test: corrupt one byte, it must diverge."""
-        import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+        import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
         page_size = 4
         cache, page_table = self._make_cache(
@@ -290,7 +290,7 @@ class TestCapabilityGate(CustomTestCase):
         self.addCleanup(triton_fp8e4nv_supported.cache_clear)
 
     def _with_capability(self, major, minor, cuda=True):
-        import sglang.srt.layers.attention.dsv4.fp8_triton_compat as mod
+        import flliper.srt.layers.attention.dsv4.fp8_triton_compat as mod
 
         return mock.patch.multiple(
             mod,
@@ -343,7 +343,7 @@ class TestCapabilityGate(CustomTestCase):
         """#343: one process, two architectures. The gate is cached per device
         id, not in a single slot, or the second card gets the first's answer.
         """
-        import sglang.srt.layers.attention.dsv4.fp8_triton_compat as mod
+        import flliper.srt.layers.attention.dsv4.fp8_triton_compat as mod
 
         caps = {0: (12, 0), 1: (8, 6)}
         with mock.patch.multiple(

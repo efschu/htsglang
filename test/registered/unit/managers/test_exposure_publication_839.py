@@ -57,7 +57,7 @@ The rank-local level is put on the allocator first and the group bound is
 applied afterwards, out of a value nobody checked was measured in this arena.
 
 SEGMENT B IS THE NATURAL EXPERIMENT AND IT IS NOT THE PROOF. The same tree
-with ``SGLANG_SEAM_SHRINK=1`` -- which defers the grow, so the levelling and
+with ``FLLIPER_SEAM_SHRINK=1`` -- which defers the grow, so the levelling and
 the clamp are adjacent instead of a round apart -- produced ONE clamp level
 (118784) over 36 lines and zero "poorest rank" refusals. It differs only in
 that ordering, which is why it is cited; it is an A/B on metal, not a bisect,
@@ -121,7 +121,7 @@ class _Rank:
     """
 
     def __init__(self, name: str, narrow_rows: int):
-        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+        from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
         self.name = name
         self.narrow = _FakeVmmPool(narrow_rows, W4_RESERVATION)
@@ -384,7 +384,7 @@ class ThePublicationIsWired(unittest.TestCase):
     def test_the_rung_publishes_after_taking_the_floor(self):
         import inspect
 
-        from sglang.srt.managers import phase_flip_spill
+        from flliper.srt.managers import phase_flip_spill
 
         src = inspect.getsource(phase_flip_spill.collective_kv_backing_relief)
         self.assertIn(

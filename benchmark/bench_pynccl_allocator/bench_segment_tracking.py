@@ -25,7 +25,7 @@ def setup_segments(num_segments: int, segment_size: int = 1024 * 1024):
 
     import torch.distributed as dist
 
-    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    from flliper.srt.distributed.device_communicators.pynccl_allocator import (
         get_nccl_mem_pool,
     )
 
@@ -145,7 +145,7 @@ def bench_with_various_segment_counts(
         torch.cuda.synchronize()
 
         # Import _nccl_allocator_lib after setup_segments (ensures library is loaded)
-        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        from flliper.srt.distributed.device_communicators.pynccl_allocator import (
             _nccl_allocator_lib,
         )
 

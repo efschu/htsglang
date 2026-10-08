@@ -29,10 +29,10 @@ from typing import Dict, List
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -118,7 +118,7 @@ class TestKimiK25MXFP4BcgMI35x(CustomTestCase):
 
     def _run_variant(self, config: CaptureConfig) -> float:
         env = os.environ.copy()
-        env["SGLANG_AITER_MLA_PERSIST"] = "1"
+        env["FLLIPER_AITER_MLA_PERSIST"] = "1"
         for key, value in config.env_vars.items():
             env[key] = value
 

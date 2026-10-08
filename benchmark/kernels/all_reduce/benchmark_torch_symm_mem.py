@@ -33,18 +33,18 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.distributed import init_distributed_environment
-from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
-from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+from flliper.srt.distributed import init_distributed_environment
+from flliper.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+from flliper.srt.distributed.device_communicators.torch_symm_mem import (
     TorchSymmMemCommunicator,
 )
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.parallel_state import (
     get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
     set_torch_symm_mem_all_reduce,
 )
-from sglang.utils import is_in_ci
+from flliper.utils import is_in_ci
 
 IS_CI = is_in_ci()
 

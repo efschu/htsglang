@@ -20,7 +20,7 @@ Two sources, one rule:
 * IPC (preferred): ``state.json front.served_tokens`` with the row ``D_after_P`` (subset of ``D``,
   written by the front beside the ``D`` row when ``pending.leg1_ran``; agreed with NF 29.09.,
   RANKSTATS-S3-SCHEMA-0929 "Vorschlag DASHBOARD-GRAFIKEN").  :func:`from_served_tokens`.
-* Log (Übergang, until that row is in the image): the front's ``WEG2-SERVED group=P leg=1 rid=``
+* Log (Übergang, until that row is in the image): the front's ``PDFLIP-SERVED group=P leg=1 rid=``
   and ``group=D leg=2 rid=`` lines, paired by rid.  :func:`split_legs`.
 
 ``est_uncached`` / ``agent_span`` is NOT a source: it is the admission-time estimate (character

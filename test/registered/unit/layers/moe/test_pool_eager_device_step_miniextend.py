@@ -19,7 +19,7 @@ What must hold, black-box through ``run_eager_pool`` on a CPU cache:
 * the limit is the graph form (captured max step ids, never above the step
   buffers' width); past it, past the wave cap, with a host-side routing
   instrument or with the switch off the host plans as before;
-* the metal check (SGLANG_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK) compares against
+* the metal check (FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK) compares against
   the plain host plan (fresh fetch) and stops by name on a deviation.
 """
 
@@ -34,11 +34,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe import expert_pool_device as ep
-from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_pool_device as ep
+from flliper.srt.layers.moe.topk import StandardTopKOutput
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -56,7 +56,7 @@ SPILL = sorted({e for row in ROUTES for e in row if e >= R})
 def _pool_cache(monkeypatch, warm=(), *, scratch=C, staging=S):
     """A CPU pool cache whose bank rows carry their expert id as bytes; the
     experts in ``warm`` sit in LRU rows as a decode round left them."""
-    monkeypatch.setenv("SGLANG_MOE_SCRATCH_SLOTS", str(scratch))
+    monkeypatch.setenv("FLLIPER_MOE_SCRATCH_SLOTS", str(scratch))
     monkeypatch.setitem(eo._PARTIALS_MODE, "mode", "stream")  # no combine kernel on CPU
     layer = SimpleNamespace(
         num_local_experts=E, layer_id=7,
@@ -148,7 +148,7 @@ def test_the_output_is_bit_identical_to_the_host_plan(monkeypatch):
     routes = [[5, 6, 0], [7, 5, 1], [9, 11, 2], [13, 17, 3], [6, 9, 21]]
     dev = _pool_cache(monkeypatch, warm=[6, 13])
     on = _extend(dev, routes, seed=3)
-    with envs.SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP.override(False):
+    with envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP.override(False):
         host = _pool_cache(monkeypatch, warm=[6, 13])
     assert host._pool_eager_device_step is False
     off = _extend(host, routes, seed=3)
@@ -194,9 +194,9 @@ def test_past_the_graph_form_the_host_plans(monkeypatch):
 def test_the_wave_cap_bounds_the_device_step(monkeypatch):
     # C=6 (3 LRU + 3 staging): 12 ids -> min(12, 20) = 12 needs 2 waves
     cache = _pool_cache(monkeypatch, scratch=6, staging=3)
-    with envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.override(0):
+    with envs.FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES.override(0):
         assert cache.eager_device_waves(12) == (0, "waves_cap")
-    with envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.override(2):
+    with envs.FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES.override(2):
         assert cache.eager_device_waves(12) == (2, "device")
         _forbid_host_plan(monkeypatch, cache)
         got = _extend(cache)
@@ -212,15 +212,15 @@ def test_a_host_routing_instrument_or_the_switch_keep_the_host_plan(monkeypatch)
     assert cache.eager_device_waves(12) == (0, "host_instrument")
     cache._route_note = False
     assert cache.eager_device_waves(0) == (0, "empty")
-    with envs.SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP.override(False):
+    with envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP.override(False):
         off = _pool_cache(monkeypatch)
     assert off.eager_device_waves(12) == (0, "switch_off")
 
 
 def test_the_metal_check_matches_the_plain_host_plan(monkeypatch, caplog):
-    with envs.SGLANG_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK.override(1):
+    with envs.FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK.override(1):
         cache = _pool_cache(monkeypatch, warm=[6, 13])
-        cache._pool_eager_device_checks = int(envs.SGLANG_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK.get())
+        cache._pool_eager_device_checks = int(envs.FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK.get())
     with caplog.at_level(logging.INFO, logger=eo.__name__):
         got = _extend(cache)
     assert cache._pool_eager_device_checks == 0

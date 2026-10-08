@@ -21,10 +21,10 @@ def _boot(root, ts):
     d = os.path.join(root, "nfx-boot-20260930T153426Z-051f")
     os.makedirs(os.path.join(d, "rankstate", "D"), exist_ok=True)
     with open(os.path.join(d, "state.json"), "w") as fh:
-        json.dump({"schema": "weg2.state/1", "boot_id": os.path.basename(d), "kind": "boot", "tag": "nfx",
+        json.dump({"schema": "pdflip.state/1", "boot_id": os.path.basename(d), "kind": "boot", "tag": "nfx",
                    "lifecycle": {"state": "serving"}, "front": {"awake": "D", "queue": 0}}, fh)
     with open(os.path.join(d, "rankstate", "D", "D.tp0pp0.rankstats"), "w") as fh:
-        json.dump({"schema": "weg2.rankstats/1", "ts": ts, "decode": {"tokens": int(100 * ts), "running": 2,
+        json.dump({"schema": "pdflip.rankstats/1", "ts": ts, "decode": {"tokens": int(100 * ts), "running": 2,
                    "gpu_ms_by_bs": {"2": [int(50 * ts), 1000.0 * ts]}}, "prefill": {"chunks": 0, "new_tokens": 0},
                    "sched": {"full_token_usage": 0.5}}, fh)
     return os.path.basename(d)

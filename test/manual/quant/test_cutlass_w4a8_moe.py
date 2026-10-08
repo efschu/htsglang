@@ -5,8 +5,8 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from flliper.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+from flliper.srt.layers.moe.topk import TopKConfig, select_experts
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:

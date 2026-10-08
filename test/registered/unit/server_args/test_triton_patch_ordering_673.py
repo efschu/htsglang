@@ -30,9 +30,9 @@ import sys
 import textwrap
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
-PATCH_MODULE = "sglang.srt.utils.triton_patch"
+PATCH_MODULE = "flliper.srt.utils.triton_patch"
 
 
 def _hook_path() -> str:
@@ -40,12 +40,12 @@ def _hook_path() -> str:
 
     The isolated probes load THIS by path rather than ``triton_patch``: since
     the triton patch now delegates to the shared hook, importing it by name
-    executes the sglang package root (transformers -> torch._dynamo -> triton)
+    executes the flliper package root (transformers -> torch._dynamo -> triton)
     and the probe would no longer be isolated. The ordering guarantee lives in
     the generic hook, so that is where it is proven -- stdlib-only, therefore
     loadable standalone.
     """
-    import sglang.srt.utils.post_import_hook as hook
+    import flliper.srt.utils.post_import_hook as hook
 
     return hook.__file__
 
@@ -72,7 +72,7 @@ class TestTritonPatchOrdering(CustomTestCase):
         """The entire reason the patch moved: arming must be free.
 
         The hook module is loaded BY FILE PATH, not by import: importing
-        ``sglang.srt.utils.triton_patch`` normally would first execute the
+        ``flliper.srt.utils.triton_patch`` normally would first execute the
         package root, which pulls transformers and therefore triton -- and the
         probe would then measure the root rather than the hook. The module
         imports nothing but stdlib, so loading it standalone is faithful.
@@ -98,7 +98,7 @@ class TestTritonPatchOrdering(CustomTestCase):
         import triton and read the attribute immediately.
 
         The hook is loaded BY FILE PATH so triton is genuinely not yet
-        imported. A normal ``from sglang... import install`` executes the
+        imported. A normal ``from flliper... import install`` executes the
         package root, which pulls transformers and therefore triton, and
         install() would then patch it RETROACTIVELY -- so this test would pass
         without ever exercising the loader wrapper it exists to prove. Found by
@@ -154,10 +154,10 @@ class TestTritonPatchOrdering(CustomTestCase):
 
     def test_the_real_boot_path_ends_up_patched(self):
         """Integration: whatever order the package root imports things in,
-        a process that imported sglang has patched triton."""
+        a process that imported flliper has patched triton."""
         answer = _probe(f"""
             import sys
-            import sglang
+            import flliper
             mod = sys.modules.get('triton')
             print(mod is None or mod.next_power_of_2.__module__ == {PATCH_MODULE!r})
             """)
@@ -188,7 +188,7 @@ class TestImportWeightLadder(CustomTestCase):
     def test_common_no_longer_imports_triton_at_module_scope(self):
         import pathlib
 
-        import sglang.srt.utils.common as common
+        import flliper.srt.utils.common as common
 
         text = pathlib.Path(common.__file__).read_text()
         self.assertNotIn(
@@ -204,7 +204,7 @@ class TestImportWeightLadder(CustomTestCase):
         """torch remains structural to this module -- named, not fixed."""
         import pathlib
 
-        import sglang.srt.utils.common as common
+        import flliper.srt.utils.common as common
 
         text = pathlib.Path(common.__file__).read_text()
         self.assertIn("\nimport torch\n", text)
@@ -215,14 +215,14 @@ class TestImportWeightLadder(CustomTestCase):
         no longer loaded by every process that imports utils/common."""
         answer = _probe("""
             import sys
-            import sglang.srt.utils.common
+            import flliper.srt.utils.common
             print('torchcodec' in sys.modules)
             """)
         self.assertEqual(answer, "False")
 
     def test_the_video_backend_still_resolves(self):
         """Deferring a probe must not change its answer."""
-        from sglang.srt.utils.video_decoder import backend
+        from flliper.srt.utils.video_decoder import backend
 
         self.assertIn(backend(), ("torchcodec", "decord"))
 
@@ -230,7 +230,7 @@ class TestImportWeightLadder(CustomTestCase):
         """Existing readers of ``video_decoder._BACKEND`` keep working through
         PEP 562, so deferring the probe is not an API break."""
         answer = _probe("""
-            from sglang.srt.utils.video_decoder import _BACKEND
+            from flliper.srt.utils.video_decoder import _BACKEND
             print(_BACKEND in ('torchcodec', 'decord'))
             """)
         self.assertEqual(answer, "True")
@@ -238,7 +238,7 @@ class TestImportWeightLadder(CustomTestCase):
     def test_triton_now_arrives_through_transformers_not_through_us(self):
         """Attribution for what REMAINS, asserting today's unfixed state.
 
-        triton is still in a bare ``import sglang`` -- but now via
+        triton is still in a bare ``import flliper`` -- but now via
         ``transformers`` (masking_utils -> torch._dynamo -> triton), reached
         from the package root's HF patch. Plain ``import torch`` does NOT pull
         it. When the root is made lazy this test fails, which is the signal

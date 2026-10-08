@@ -33,7 +33,7 @@ import re
 import unittest
 from pathlib import Path
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ from sglang.test.test_utils import CustomTestCase
 
 _COMM = (
     Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/distributed/device_communicators"
+    / "python/flliper/srt/distributed/device_communicators"
 )
 _EXT = _COMM / "barlink_bar1_ext.py"
 

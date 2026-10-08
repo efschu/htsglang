@@ -51,11 +51,11 @@ unconditionally, ignoring swap, and
 
 import unittest
 
-from sglang.srt.memtier.profile import (
+from flliper.srt.memtier.profile import (
     _read_cgroup_memory,
     honest_host_memory_bytes,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -196,7 +196,7 @@ class LiveCgroupReader(unittest.TestCase):
 
     def test_reader_survives_a_missing_cgroupfs(self):
         """cgroup v1 / no cgroupfs: all-None, never an exception."""
-        import sglang.srt.memtier.profile as profile_mod
+        import flliper.srt.memtier.profile as profile_mod
 
         real_open = open
 

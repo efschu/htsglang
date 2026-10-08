@@ -1,7 +1,7 @@
 """Anthropic Messages front conformance, driven over the REAL HTTP boundary.
 
 Every case here posts to the actual FastAPI ``app`` from
-``sglang.srt.entrypoints.http_server`` through ``TestClient``, with only the
+``flliper.srt.entrypoints.http_server`` through ``TestClient``, with only the
 OpenAI serving handler and its tokenizer manager mocked. That is deliberate:
 the sibling ``test_serving.py`` calls ``AnthropicServing`` methods directly
 and therefore cannot see anything the route layer does — request validation,
@@ -17,19 +17,19 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from sglang.srt.entrypoints.anthropic import serving as anthropic_serving  # noqa: E402
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
-from sglang.srt.entrypoints.http_server import app  # noqa: E402
-from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
+from flliper.srt.entrypoints.anthropic import serving as anthropic_serving  # noqa: E402
+from flliper.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from flliper.srt.entrypoints.http_server import app  # noqa: E402
+from flliper.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionResponse,
 )
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -304,7 +304,7 @@ class TestThinkingDefaultsOff(_FrontTestCase):
         client = self._client(fake)
 
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level="WARNING"
+            "flliper.srt.entrypoints.anthropic.serving", level="WARNING"
         ) as log:
             resp = client.post("/v1/messages", json=self._body())
 
@@ -336,7 +336,7 @@ class TestUnknownContentBlocks(_FrontTestCase):
             ]
         )
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level="WARNING"
+            "flliper.srt.entrypoints.anthropic.serving", level="WARNING"
         ) as log:
             resp = client.post("/v1/messages", json=body)
 

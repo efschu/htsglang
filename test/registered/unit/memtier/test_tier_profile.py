@@ -31,7 +31,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.memtier.profile import (
+from flliper.srt.memtier.profile import (
     BUNDLED_PROFILE_PATH,
     CardFact,
     FilesystemFact,
@@ -46,10 +46,10 @@ from sglang.srt.memtier.profile import (
     load_profile,
     profile_from_json,
 )
-from sglang.srt.memtier.registry import TierRegistry
-from sglang.srt.memtier.tiers import TierKind, Volatility
-from sglang.srt.planner.cost_model import Provenance
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.memtier.registry import TierRegistry
+from flliper.srt.memtier.tiers import TierKind, Volatility
+from flliper.srt.planner.cost_model import Provenance
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

@@ -5,7 +5,7 @@ Contract: docs/NVFP4_NATIVE_LAYOUT_CONTRACT.md. Pure functions, mocked device
 capabilities, CPU tensors; no GPU, no server, no checkpoint.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -15,14 +15,14 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.quantization import fp4_utils
-from sglang.srt.layers.quantization import nvfp4_native_mixed as nm
-from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
-from sglang.srt.layers.quantization.modelopt_quant import (
+from flliper.srt.layers.quantization import fp4_utils
+from flliper.srt.layers.quantization import nvfp4_native_mixed as nm
+from flliper.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+from flliper.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 @contextlib.contextmanager
@@ -52,33 +52,33 @@ def _fake_w4a8(x, weight, scale, gscale, n):
 
 def _resolve_rig(backend, caps, *, kernel=True, sm8x="w4a8", allow_broken=None, sm12x=None):
     """One scheduler process per rank: TP0 = 5090, TP1/TP2 = 3080. ``sm8x=None``: the env default.
-    ``allow_broken`` / ``sm12x`` None: the env default of SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN /
-    SGLANG_FP4_NATIVE_MIXED_SM12X."""
+    ``allow_broken`` / ``sm12x`` None: the env default of FLLIPER_FP4_ALLOW_BROKEN_SM8X_MARLIN /
+    FLLIPER_FP4_NATIVE_MIXED_SM12X."""
     args = mock.Mock(fp4_gemm_runner_backend=backend)
     out = []
     def env_patch():
         if sm8x is None:
             return contextlib.nullcontext()
-        return mock.patch("sglang.srt.environ.envs.SGLANG_FP4_NATIVE_MIXED_SM8X.get", return_value=sm8x)
+        return mock.patch("flliper.srt.environ.envs.FLLIPER_FP4_NATIVE_MIXED_SM8X.get", return_value=sm8x)
 
     def allow_patch():
         if allow_broken is None:
             return contextlib.nullcontext()
         return mock.patch(
-            "sglang.srt.environ.envs.SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN.get", return_value=allow_broken
+            "flliper.srt.environ.envs.FLLIPER_FP4_ALLOW_BROKEN_SM8X_MARLIN.get", return_value=allow_broken
         )
 
     def sm12x_patch():
         if sm12x is None:
             return contextlib.nullcontext()
-        return mock.patch("sglang.srt.environ.envs.SGLANG_FP4_NATIVE_MIXED_SM12X.get", return_value=sm12x)
+        return mock.patch("flliper.srt.environ.envs.FLLIPER_FP4_NATIVE_MIXED_SM12X.get", return_value=sm12x)
 
     for cap in caps:
         with (
             env_patch(),
             allow_patch(),
             sm12x_patch(),
-            mock.patch("sglang.srt.utils.common.get_device_capability", return_value=cap),
+            mock.patch("flliper.srt.utils.common.get_device_capability", return_value=cap),
             mock.patch.object(fp4_utils, "get_device_capability", return_value=cap),
             mock.patch.object(fp4_utils, "is_sm100_supported", return_value=cap[0] == 10),
             mock.patch.object(fp4_utils, "is_sm120_supported", return_value=cap[0] == 12),
@@ -171,7 +171,7 @@ class TestRankResolution(CustomTestCase):
         with _fp4_state(), mock.patch.dict("os.environ", {}, clear=False):
             import os as _os
 
-            _os.environ.pop("SGLANG_FP4_NATIVE_MIXED_SM8X", None)
+            _os.environ.pop("FLLIPER_FP4_NATIVE_MIXED_SM8X", None)
             got = _resolve_rig("native-mixed", RIG, sm8x=None)
         self.assertEqual(
             got,
@@ -212,7 +212,7 @@ class TestRankResolution(CustomTestCase):
             self.assertTrue(all(not g[1] for g in got))
 
     def test_cli_choice_registered(self):
-        from sglang.srt.server_args import FP4_GEMM_RUNNER_BACKEND_CHOICES
+        from flliper.srt.server_args import FP4_GEMM_RUNNER_BACKEND_CHOICES
 
         self.assertIn("native-mixed", FP4_GEMM_RUNNER_BACKEND_CHOICES)
         self.assertNotIn("w4a8_int8", FP4_GEMM_RUNNER_BACKEND_CHOICES)
@@ -237,25 +237,25 @@ def _kernel_offset(m, kb, kp):
 
 class TestSm8xMarlinGuard(CustomTestCase):
     """NVFP4-SM8X-MARLIN-GUARD (26.09.): boot dkr27bnvfp4bar1marlin09261251 (d98b3ba08a, arm
-    n4old = SGLANG_FP4_NATIVE_MIXED_SM8X=marlin, 5090 on flashinfer_cutlass) served wrong
-    tokens. The in-place Marlin rank is refused unless SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN=1."""
+    n4old = FLLIPER_FP4_NATIVE_MIXED_SM8X=marlin, 5090 on flashinfer_cutlass) served wrong
+    tokens. The in-place Marlin rank is refused unless FLLIPER_FP4_ALLOW_BROKEN_SM8X_MARLIN=1."""
 
     def test_env_default_is_off(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         with mock.patch.dict("os.environ", {}, clear=False):
             import os as _os
 
             _os.environ.pop(nm.SM8X_MARLIN_ALLOW_ENV, None)
-            self.assertFalse(envs.SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN.get())
-        self.assertEqual(nm.SM8X_MARLIN_ALLOW_ENV, "SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN")
+            self.assertFalse(envs.FLLIPER_FP4_ALLOW_BROKEN_SM8X_MARLIN.get())
+        self.assertEqual(nm.SM8X_MARLIN_ALLOW_ENV, "FLLIPER_FP4_ALLOW_BROKEN_SM8X_MARLIN")
 
     def test_guard_refuses_marlin_by_default(self):
         for kernel in (True, False):
             with self.assertRaisesRegex(nm.NativeMixedUnsupported, nm.SM8X_MARLIN_GUARD) as cm:
                 nm.resolve_rank_backend((8, 6), w4a8_available=kernel, sm8x_choice="marlin")
             msg = str(cm.exception)
-            self.assertIn("SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN=1", msg)
+            self.assertIn("FLLIPER_FP4_ALLOW_BROKEN_SM8X_MARLIN=1", msg)
             self.assertIn("w4a8", msg)
         # case/whitespace variants of the value hit the same guard
         with self.assertRaisesRegex(nm.NativeMixedUnsupported, nm.SM8X_MARLIN_GUARD):
@@ -421,7 +421,7 @@ class TestLoaderUnderNativeMixed(CustomTestCase):
             _fp4_state(),
             mock.patch.object(torch.Tensor, "cuda", lambda self, *a, **kw: self),
             mock.patch(
-                "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
+                "flliper.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
                 return_value=False,
             ),
         ):
@@ -468,7 +468,7 @@ class TestW4A8RankHasNoFlipReshape(CustomTestCase):
             _fp4_state(),
             mock.patch.object(torch.Tensor, "cuda", lambda self, *a, **kw: self),
             mock.patch(
-                "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
+                "flliper.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
                 return_value=False,
             ),
         ):
@@ -481,7 +481,7 @@ class TestW4A8RankHasNoFlipReshape(CustomTestCase):
         return model, layer
 
     def test_hooks_are_noops_on_a_w4a8_rank(self):
-        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+        from flliper.srt.layers.quantization import nvfp4_marlin_inplace as mi
 
         model, layer = self._loaded(Fp4GemmRunnerBackend.W4A8_INT8)
         self.assertFalse(getattr(layer, mi.LAYER_FLAG, False))
@@ -499,28 +499,28 @@ class TestW4A8RankHasNoFlipReshape(CustomTestCase):
 
     def test_weight_updater_hooks_do_nothing_on_a_w4a8_rank(self):
         """The two WeightUpdater methods the sleep/wake legs call, on a stub owner."""
-        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
-        from sglang.srt.managers.scheduler_components.weight_updater import (
+        from flliper.srt.layers.quantization import nvfp4_marlin_inplace as mi
+        from flliper.srt.managers.scheduler_components.weight_updater import (
             SchedulerWeightUpdaterManager as WeightUpdater,
         )
 
         model, layer = self._loaded(Fp4GemmRunnerBackend.W4A8_INT8)
         stub = mock.Mock()
-        stub._weg2_wake_models.return_value = [model]
-        stub._weg2_nvfp4_draft_disk_reloaded = True
+        stub._pdflip_wake_models.return_value = [model]
+        stub._pdflip_nvfp4_draft_disk_reloaded = True
         w0 = layer.weight.detach().clone()
         with mock.patch.object(mi, "layer_to_native") as to_nat, mock.patch.object(mi, "layer_to_marlin") as to_mar:
-            WeightUpdater._weg2_nvfp4_marlin_to_native(stub)
-            WeightUpdater._weg2_nvfp4_marlin_after_wake(stub)
+            WeightUpdater._pdflip_nvfp4_marlin_to_native(stub)
+            WeightUpdater._pdflip_nvfp4_marlin_after_wake(stub)
         to_nat.assert_not_called()
         to_mar.assert_not_called()
-        stub._weg2_wake_weight_carrier.assert_not_called()  # returned before asking for the carrier
-        self.assertFalse(stub._weg2_nvfp4_draft_disk_reloaded)  # read-and-clear still happens
+        stub._pdflip_wake_weight_carrier.assert_not_called()  # returned before asking for the carrier
+        self.assertFalse(stub._pdflip_nvfp4_draft_disk_reloaded)  # read-and-clear still happens
         self.assertTrue(torch.equal(layer.weight, w0))
 
     def test_marlin_opt_in_still_flags_the_layer(self):
         """Control: the same load on the opt-in Marlin rank IS flagged (the hooks have work there)."""
-        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+        from flliper.srt.layers.quantization import nvfp4_marlin_inplace as mi
 
         with mock.patch.object(mi, "prepare_layer", side_effect=lambda l, **kw: setattr(l, mi.LAYER_FLAG, True)):
             model, layer = self._loaded(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE)
@@ -550,7 +550,7 @@ class TestNvfp4DraftTakesTheSameBackend(CustomTestCase):
     FP4 backend (fp4_utils, resolved once per scheduler process) -- no draft-specific branch exists."""
 
     def _draft_method(self, prefix):
-        from sglang.srt.layers.linear import LinearBase
+        from flliper.srt.layers.linear import LinearBase
 
         cfg = ModelOptFp4Config.from_config(DRAFT_HF_QUANT_CONFIG)
         # set by the model loader from the model class (qwen3-style fused projections)
@@ -558,7 +558,7 @@ class TestNvfp4DraftTakesTheSameBackend(CustomTestCase):
         return cfg.get_quant_method(mock.Mock(spec=LinearBase), prefix)
 
     def test_draft_linears_are_modelopt_fp4(self):
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from flliper.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         for p in ("layers.0.mlp.gate_up_proj", "layers.0.mlp.down_proj", "layers.4.self_attn.qkv_proj",
                   "layers.2.self_attn.o_proj"):
@@ -567,7 +567,7 @@ class TestNvfp4DraftTakesTheSameBackend(CustomTestCase):
             self.assertIsInstance(self._draft_method(p), UnquantizedLinearMethod, p)
 
     def test_draft_layer_on_a_w4a8_rank_runs_the_w4a8_kernel_without_reshape(self):
-        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+        from flliper.srt.layers.quantization import nvfp4_marlin_inplace as mi
 
         method = self._draft_method("layers.0.mlp.gate_up_proj")
         layer, raw = _make_layer(method, 2, 256, 512)
@@ -581,7 +581,7 @@ class TestNvfp4DraftTakesTheSameBackend(CustomTestCase):
             _fp4_state(),
             mock.patch.object(torch.Tensor, "cuda", lambda self, *a, **kw: self),
             mock.patch(
-                "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
+                "flliper.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
                 return_value=False,
             ),
         ):
@@ -613,14 +613,14 @@ class TestExchangeTileView(CustomTestCase):
         return p
 
     def test_row_parallel_scale_uses_the_tile_view(self):
-        from sglang.srt.weg2 import weight_exchange as wx
+        from flliper.srt.pdflip import weight_exchange as wx
 
         g = wx.StorageGeom.of(self._scale(5120, 1088, k_sharded=True))
         self.assertEqual((g.rows, g.cols, g.pitch, g.itemsize), (40, 1088 * 128, 1088 * 128, 1))
         self.assertEqual(g.nbytes, 5120 * 1088)
 
     def test_unstamped_and_column_parallel_unchanged(self):
-        from sglang.srt.weg2 import weight_exchange as wx
+        from flliper.srt.pdflip import weight_exchange as wx
 
         for t in (
             torch.zeros(5120, 1088, dtype=torch.float8_e4m3fn),
@@ -630,8 +630,8 @@ class TestExchangeTileView(CustomTestCase):
             self.assertEqual((g.rows, g.cols), tuple(t.shape))
 
     def test_the_join_reads_a_plain_cols_cut_in_the_tile_view(self):
-        from sglang.srt.weg2 import weight_exchange as wx
-        from sglang.srt.weg2 import xchg_manifest as xm
+        from flliper.srt.pdflip import weight_exchange as wx
+        from flliper.srt.pdflip import xchg_manifest as xm
 
         def piece(n, kb):
             g = wx.StorageGeom.of(self._scale(n, kb, k_sharded=True))
@@ -650,7 +650,7 @@ class TestExchangeTileView(CustomTestCase):
         self.assertEqual(widths, (584 * 128, 256 * 128, 248 * 128))
 
     def test_component_rows_in_tiles(self):
-        from sglang.srt.weg2 import weight_exchange_shadow as sh
+        from flliper.srt.pdflip import weight_exchange_shadow as sh
 
         owner = torch.nn.Module()
         owner.weight_scale = self._scale(256, 8, k_sharded=True)
@@ -662,7 +662,7 @@ class TestExchangeTileView(CustomTestCase):
 
 class TestLauncherFlag(CustomTestCase):
     def test_default_argv_unchanged(self):
-        from sglang.srt.weg2 import launcher as L
+        from flliper.srt.pdflip import launcher as L
 
         self.assertEqual(L.uniform_marlin_argv("modelopt", True), ["--fp4-gemm-backend", "marlin"])
         self.assertEqual(L.uniform_marlin_argv("modelopt", False), [])
@@ -671,7 +671,7 @@ class TestLauncherFlag(CustomTestCase):
         self.assertIsNone(L.fp4_native_mixed_refusal("fp8", False, False))
 
     def test_native_mixed_argv(self):
-        from sglang.srt.weg2 import launcher as L
+        from flliper.srt.pdflip import launcher as L
 
         self.assertEqual(
             L.uniform_marlin_argv("modelopt", True, True), ["--fp4-gemm-backend", "native-mixed"]
@@ -679,15 +679,15 @@ class TestLauncherFlag(CustomTestCase):
         self.assertIsNone(L.fp4_native_mixed_refusal("modelopt", True, True))
 
     def test_native_mixed_refusals(self):
-        from sglang.srt.weg2 import launcher as L
+        from flliper.srt.pdflip import launcher as L
 
         self.assertIn("--fp8-uniform-marlin", L.fp4_native_mixed_refusal("modelopt", False, True))
         self.assertIn("ModelOpt", L.fp4_native_mixed_refusal("compressed-tensors", True, True))
 
     def test_pinned_marlin_extra_is_refused_against_native_mixed(self):
-        from sglang.srt.weg2 import launcher as L
+        from flliper.srt.pdflip import launcher as L
 
-        with self.assertRaises(L.Weg2LaunchRefused):
+        with self.assertRaises(L.PdFlipLaunchRefused):
             L.with_uniform_marlin_argv(
                 "--fp4-gemm-backend marlin", L.uniform_marlin_argv("modelopt", True, True)
             )

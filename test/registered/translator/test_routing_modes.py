@@ -30,13 +30,13 @@ same reason test_languages.py's AST falsifier exists.
 import unittest
 
 
-from sglang.srt.translator.languages import (
+from flliper.srt.translator.languages import (
     LanguageError,
     LanguageMatrix,
     LanguagePair,
     RoutingTable,
 )
-from sglang.srt.translator.session import EventKind, run_conversation
+from flliper.srt.translator.session import EventKind, run_conversation
 from test_session import (  # noqa: E402  - sibling helper module
     LANG_A,
     LANG_B,
@@ -277,7 +277,7 @@ class TestConstrainedDetection(unittest.TestCase):
     """The identifier still decides -- from a narrowed candidate set."""
 
     def setUp(self):
-        from sglang.srt.translator.asr_backends import constrained_language_choice
+        from flliper.srt.translator.asr_backends import constrained_language_choice
 
         self.choose = constrained_language_choice
 
@@ -371,8 +371,8 @@ class TestCapabilityListing(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         from test_audio_and_http import build_service
-        from sglang.srt.translator.backends import FakeTts
-        from sglang.srt.translator.server import build_app
+        from flliper.srt.translator.backends import FakeTts
+        from flliper.srt.translator.server import build_app
 
         service = build_service()
         # ASR hears both, TTS speaks only one.

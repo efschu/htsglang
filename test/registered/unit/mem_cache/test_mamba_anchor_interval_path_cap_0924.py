@@ -2,12 +2,12 @@
 4 spaeter"; 1 = Agent B's c255e10ddb, 4 = int8 pool, deferred):
 
   (B) point 3: group P's anchors "simply spread wider, not after every chunk"
-      -- one every SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL tokens (4096) whatever the
+      -- one every FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL tokens (4096) whatever the
       chunk size, plus at the request end (#1481 N-1 stays), NO rigid grid: a
       WRITE-side thinning, every anchor stays matchable; forks keep theirs
       under the cap;
   (A) point 2: an upper bound per root-to-tail path
-      (SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH = 4, upstream 1417345f5f
+      (FLLIPER_PDFLIP_MAMBA_MAX_STATES_PER_PATH = 4, upstream 1417345f5f
       `_evict_excess_path_states`): the shallowest anchors beyond it are taken,
       tail / forks / the end anchor stay, the KV always stays.
 
@@ -22,32 +22,32 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.mamba_ckpt_utils import (
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.mamba_ckpt_utils import (
     ANCHOR_INTERVAL_ENV,
     ANCHOR_STEP_END,
     ANCHOR_STEP_INTERVAL,
     MAX_STATES_PER_PATH_ENV,
     RESUME_REFUSAL_PATH_CAP,
-    weg2_anchor_interval,
-    weg2_anchor_step,
-    weg2_max_states_per_path,
+    pdflip_anchor_interval,
+    pdflip_anchor_step,
+    pdflip_max_states_per_path,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
     EvictLayer,
 )
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 MAMBA_SLOTS = 20
 KV_SIZE = 512
@@ -67,25 +67,25 @@ PROMPT = list(range(1000, 1000 + N))
 
 @pytest.fixture
 def group_p(monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "P")
     monkeypatch.delenv(ANCHOR_INTERVAL_ENV, raising=False)
     monkeypatch.delenv(MAX_STATES_PER_PATH_ENV, raising=False)
     return monkeypatch
 
 
 def test_switches_default_off_and_group_p_only():
-    assert weg2_anchor_interval({}) == 0
-    assert weg2_max_states_per_path({}) == -1
-    p = {"SGLANG_WEG2_GROUP": "P"}
-    assert weg2_anchor_interval(p) == 0, "default off"
-    assert weg2_max_states_per_path(p) == -1, "default off"
+    assert pdflip_anchor_interval({}) == 0
+    assert pdflip_max_states_per_path({}) == -1
+    p = {"FLLIPER_PDFLIP_GROUP": "P"}
+    assert pdflip_anchor_interval(p) == 0, "default off"
+    assert pdflip_max_states_per_path(p) == -1, "default off"
     for bad in ("", "0", "-4", "abc", "4.5"):
-        assert weg2_anchor_interval({**p, ANCHOR_INTERVAL_ENV: bad}) == 0
-        assert weg2_max_states_per_path({**p, MAX_STATES_PER_PATH_ENV: bad}) == -1
-    assert weg2_anchor_interval({**p, ANCHOR_INTERVAL_ENV: "4096"}) == 4096
-    assert weg2_max_states_per_path({**p, MAX_STATES_PER_PATH_ENV: "4"}) == 4
-    d = {"SGLANG_WEG2_GROUP": "D", ANCHOR_INTERVAL_ENV: "4096", MAX_STATES_PER_PATH_ENV: "4"}
-    assert weg2_anchor_interval(d) == 0 and weg2_max_states_per_path(d) == -1, "group P only"
+        assert pdflip_anchor_interval({**p, ANCHOR_INTERVAL_ENV: bad}) == 0
+        assert pdflip_max_states_per_path({**p, MAX_STATES_PER_PATH_ENV: bad}) == -1
+    assert pdflip_anchor_interval({**p, ANCHOR_INTERVAL_ENV: "4096"}) == 4096
+    assert pdflip_max_states_per_path({**p, MAX_STATES_PER_PATH_ENV: "4"}) == 4
+    d = {"FLLIPER_PDFLIP_GROUP": "D", ANCHOR_INTERVAL_ENV: "4096", MAX_STATES_PER_PATH_ENV: "4"}
+    assert pdflip_anchor_interval(d) == 0 and pdflip_max_states_per_path(d) == -1, "group P only"
 
 
 # -- the spacing, as arithmetic (the expectation the boot is read against) -----
@@ -98,7 +98,7 @@ def _anchored(prompt_len, chunk, interval, start=0):
     bounds = list(range(start + chunk, prompt_len - 1, chunk)) + [prompt_len - 1]
     last, out = start, []
     for pos in bounds:
-        why = weg2_anchor_step(pos, prompt_len, last, interval)
+        why = pdflip_anchor_step(pos, prompt_len, last, interval)
         if why is not None:
             out.append((pos, why))
             last = pos
@@ -130,10 +130,10 @@ def test_the_rule_reads_only_rank_uniform_inputs():
     switch -- no rank-local match depth (on P only PP0 reads the store)."""
     import inspect
 
-    assert list(inspect.signature(weg2_anchor_step).parameters) == [
+    assert list(inspect.signature(pdflip_anchor_step).parameters) == [
         "pos", "prompt_len", "last_anchor", "interval"]
-    assert weg2_anchor_step(8999, 9000, 8000, 4096) == ANCHOR_STEP_END
-    assert weg2_anchor_step(8998, 9000, 8000, 4096) is None
+    assert pdflip_anchor_step(8999, 9000, 8000, 4096) == ANCHOR_STEP_END
+    assert pdflip_anchor_step(8998, 9000, 8000, 4096) is None
 
 
 # -- the live tree ------------------------------------------------------------
@@ -144,7 +144,7 @@ def _fixture(chunk=CHUNK):
     server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
     server_args.chunked_prefill_size = chunk
     set_global_server_args_for_scheduler(server_args)
-    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+    with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
         shape = Mamba2StateShape.create(
             tp_world_size=1, intermediate_size=256, n_groups=1, num_heads=2,
             head_dim=16, state_size=16, conv_kernel=4,
@@ -298,27 +298,27 @@ def test_the_switch_off_is_the_per_node_default(group_p):
 
 
 def test_group_d_is_unchanged(group_p):
-    group_p.setenv("SGLANG_WEG2_GROUP", "D")
+    group_p.setenv("FLLIPER_PDFLIP_GROUP", "D")
     group_p.setenv(ANCHOR_INTERVAL_ENV, str(INTERVAL))
     group_p.setenv(MAX_STATES_PER_PATH_ENV, "2")
     fx = _fixture()
     _prefill(fx, "d", PROMPT, UNFINISHED)
     assert _anchor_depths(fx.cache) == UNFINISHED + [21]
-    assert not any(getattr(n, "_weg2_capped", False) for _, n in _nodes(fx.cache))
+    assert not any(getattr(n, "_pdflip_capped", False) for _, n in _nodes(fx.cache))
 
 
 def test_the_cap_takes_the_shallowest_anchors_the_kv_stays(group_p, monkeypatch):
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
-    monkeypatch.setattr(urc, "_WEG2_END_ANCHOR", True)   # the launcher sets it on P
+    monkeypatch.setattr(urc, "_PDFLIP_END_ANCHOR", True)   # the launcher sets it on P
     group_p.setenv(ANCHOR_INTERVAL_ENV, str(INTERVAL))
     group_p.setenv(MAX_STATES_PER_PATH_ENV, "2")
     fx = _fixture()
     _prefill(fx, "cap", PROMPT, UNFINISHED)
     n8, n16, n20, n21 = (_node_at(fx.cache, d) for d in (8, 16, 20, 21))
-    assert n20._weg2_end_anchor, "#1481 mark"
-    assert (n8._weg2_capped, n16._weg2_capped) == (True, True)
-    assert not getattr(n20, "_weg2_capped", False) and not getattr(n21, "_weg2_capped", False)
+    assert n20._pdflip_end_anchor, "#1481 mark"
+    assert (n8._pdflip_capped, n16._pdflip_capped) == (True, True)
+    assert not getattr(n20, "_pdflip_capped", False) and not getattr(n21, "_pdflip_capped", False)
     # their device slots went back, the KV did not
     assert _anchor_depths(fx.cache) == [20, 21]
     assert all(n.component_data[ComponentType.FULL].value is not None for n in (n8, n16))
@@ -330,9 +330,9 @@ def test_the_cap_takes_the_shallowest_anchors_the_kv_stays(group_p, monkeypatch)
 
 
 def test_forks_and_the_end_anchor_stay(group_p, monkeypatch):
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
-    monkeypatch.setattr(urc, "_WEG2_END_ANCHOR", True)
+    monkeypatch.setattr(urc, "_PDFLIP_END_ANCHOR", True)
     group_p.setenv(ANCHOR_INTERVAL_ENV, str(INTERVAL))
     group_p.setenv(MAX_STATES_PER_PATH_ENV, "10")    # armed from the start, nothing over it yet
     fx = _fixture()
@@ -342,16 +342,16 @@ def test_forks_and_the_end_anchor_stay(group_p, monkeypatch):
     _prefill(fx, "b", b_prompt, [10, 12, 14, 16, 18, 20])
     n8 = _node_at(fx.cache, 8)
     assert len(n8.children) == 2
-    assert not any(getattr(n, "_weg2_capped", False) for _, n in _nodes(fx.cache))
+    assert not any(getattr(n, "_pdflip_capped", False) for _, n in _nodes(fx.cache))
     group_p.setenv(MAX_STATES_PER_PATH_ENV, "1")
     # a third prompt on a's path pushes it over the bound
     c_prompt = PROMPT + list(range(5000, 5010))
     _prefill(fx, "c", c_prompt, [22, 24, 26, 28, 30])
-    taken = sorted(d for d, n in _nodes(fx.cache) if getattr(n, "_weg2_capped", False))
+    taken = sorted(d for d, n in _nodes(fx.cache) if getattr(n, "_pdflip_capped", False))
     assert taken == [16, 21], taken      # a's inner anchor and a's old N; c's N-1 is its end anchor
-    assert not getattr(n8, "_weg2_capped", False), "a fork keeps its anchor"
+    assert not getattr(n8, "_pdflip_capped", False), "a fork keeps its anchor"
     assert _resume(fx.cache, b_prompt, 12) == 8
-    assert not getattr(_node_at(fx.cache, 20), "_weg2_capped", False), "the end anchor stays"
+    assert not getattr(_node_at(fx.cache, 20), "_pdflip_capped", False), "the end anchor stays"
     _assert_owned_once(fx)
 
 
@@ -375,7 +375,7 @@ def test_a_child_only_pp0_has_does_not_make_a_fork(group_p):
         for fx, r in zip(ranks, reqs):
             _chunk(fx, r, end)
     del n8.children["pp0-host-only"]
-    taken = [[d for d, n in _nodes(fx.cache) if getattr(n, "_weg2_capped", False)] for fx in ranks]
+    taken = [[d for d, n in _nodes(fx.cache) if getattr(n, "_pdflip_capped", False)] for fx in ranks]
     assert taken[0] == taken[1] == [8]
 
 
@@ -390,12 +390,12 @@ def test_a_locked_anchor_is_no_resume_point_at_once_its_slot_goes_when_free(grou
     fx.cache.inc_lock_ref(n8)          # a reader (or a write-through) holds it
     for end in [18, 20]:
         _chunk(fx, req, end)           # the anchor at 20 pushes 8 over the bound
-    assert n8._weg2_capped
+    assert n8._pdflip_capped
     assert n8.component_data[ComponentType.MAMBA].value is not None, "the copy waits for the lock"
-    assert n8.id in fx.cache._weg2_cap_deferred
+    assert n8.id in fx.cache._pdflip_cap_deferred
     assert _resume(fx.cache, PROMPT, 12) == 0, "but it is no resume point any more"
     fx.cache.dec_lock_ref(n8)
-    assert fx.cache._weg2_cap_drain() == 1
+    assert fx.cache._pdflip_cap_drain() == 1
     assert n8.component_data[ComponentType.MAMBA].value is None
     _finish(fx, req)
     _assert_owned_once(fx)
@@ -421,7 +421,7 @@ def test_the_cap_decides_the_same_on_every_rank_whatever_a_rank_local_lock_says(
     probes = [PROMPT[:k] for k in range(1, N + 1)] + [PROMPT[:13] + [1, 2, 3]]
     for p in probes:
         assert _resume(ranks[0].cache, p, len(p)) == _resume(slow.cache, p, len(p)), p
-    taken = [[d for d, n in _nodes(fx.cache) if getattr(n, "_weg2_capped", False)] for fx in ranks]
+    taken = [[d for d, n in _nodes(fx.cache) if getattr(n, "_pdflip_capped", False)] for fx in ranks]
     assert taken[0] == taken[1] == [8]
 
 
@@ -431,13 +431,13 @@ def test_an_insert_at_a_taken_anchor_makes_it_an_anchor_again(group_p):
     fx = _fixture()
     _prefill(fx, "x", PROMPT, UNFINISHED)
     n8 = _node_at(fx.cache, 8)
-    assert n8._weg2_capped and _resume(fx.cache, PROMPT, 12) == 0
+    assert n8._pdflip_capped and _resume(fx.cache, PROMPT, 12) == 0
     slot = fx.pool.mamba_allocator.alloc(1)
     res = fx.cache.insert(InsertParams(key=RadixKey(array("q", PROMPT[:8])),
                                        value=fx.allocator.alloc(8), mamba_value=slot))
     if res.mamba_exist:
         fx.pool.mamba_allocator.free(slot)
-    assert not n8._weg2_capped and n8._weg2_anchored
+    assert not n8._pdflip_capped and n8._pdflip_anchored
     assert _resume(fx.cache, PROMPT, 12) == 8
     _assert_owned_once(fx)
 
@@ -452,16 +452,16 @@ def test_the_reset_drops_waiting_releases(group_p):
     fx.cache.inc_lock_ref(_node_at(fx.cache, 8))
     for end in [10, 12, 14, 16]:
         _chunk(fx, req, end)
-    assert fx.cache._weg2_cap_deferred
+    assert fx.cache._pdflip_cap_deferred
     fx.cache.reset()
-    assert fx.cache._weg2_cap_deferred == {} and fx.cache._weg2_cap_tail is None
+    assert fx.cache._pdflip_cap_deferred == {} and fx.cache._pdflip_cap_tail is None
 
 
 def test_the_ack_drains_the_waiting_release():
     import inspect
 
     src = inspect.getsource(UnifiedRadixCache._finish_write_through_ack)
-    assert src.index("self.dec_lock_ref(lock_node, lock_params)") < src.index("self._weg2_cap_drain()")
+    assert src.index("self.dec_lock_ref(lock_node, lock_params)") < src.index("self._pdflip_cap_drain()")
 
 
 def test_an_anchor_awaiting_its_publish_keeps_its_device_copy(group_p):
@@ -473,16 +473,16 @@ def test_an_anchor_awaiting_its_publish_keeps_its_device_copy(group_p):
     mc = fx.cache.components[ComponentType.MAMBA]
     _prefill(fx, "pub", PROMPT, [8, 16, 20])
     n8 = _node_at(fx.cache, 8)
-    assert n8._weg2_capped
+    assert n8._pdflip_capped
     # re-create the situation with a controller present and n8 unpublished
     slot = fx.pool.mamba_allocator.alloc(1)
     n8.component_data[ComponentType.MAMBA].value = slot
     fx.cache.component_evictable_size_[ComponentType.MAMBA] += 1
     fx.cache.cache_controller = SimpleNamespace()
     try:
-        assert fx.cache._weg2_cap_release(n8, mc) is False
+        assert fx.cache._pdflip_cap_release(n8, mc) is False
         n8.component_data[ComponentType.FULL].host_value = torch.tensor([0])  # published
-        assert fx.cache._weg2_cap_release(n8, mc) is True
+        assert fx.cache._pdflip_cap_release(n8, mc) is True
         assert n8.component_data[ComponentType.MAMBA].value is None
     finally:
         fx.cache.cache_controller = None
@@ -510,5 +510,5 @@ def test_a_copy_lost_on_one_rank_does_not_change_what_the_cap_takes(group_p):
     for end in [18, 20]:
         for fx, r in zip(ranks, reqs):
             _chunk(fx, r, end)
-    taken = [[d for d, n in _nodes(fx.cache) if getattr(n, "_weg2_capped", False)] for fx in ranks]
+    taken = [[d for d, n in _nodes(fx.cache) if getattr(n, "_pdflip_capped", False)] for fx in ranks]
     assert taken[0] == taken[1] == [8]

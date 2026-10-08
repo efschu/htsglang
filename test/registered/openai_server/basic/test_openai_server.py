@@ -14,12 +14,12 @@ from typing import Optional
 import openai
 import requests
 
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.runners import TEST_RERANK_QUERY_DOCS
-from sglang.test.test_utils import (
+from flliper.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.runners import TEST_RERANK_QUERY_DOCS
+from flliper.test.test_utils import (
     DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

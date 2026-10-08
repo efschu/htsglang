@@ -13,12 +13,12 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.flashattention_backend import (
+from flliper.srt.layers.attention.flashattention_backend import (
     normal_decode_set_metadata,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 # Register this test for CUDA CI in base-b (fast attention/kernel tests)
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")

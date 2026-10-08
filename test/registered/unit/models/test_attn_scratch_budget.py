@@ -6,7 +6,7 @@ THE DEFECT, as it stood
 ------------------------
 ``DeepseekMHAForwardMixin.init_mha_forward`` set
 ``self.chunked_prefix_cache_threshold`` straight from
-``SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD`` -- a flat token count, carrying
+``FLLIPER_CHUNKED_PREFIX_CACHE_THRESHOLD`` -- a flat token count, carrying
 ``# TODO: Design a finer way to determine the threshold``. The threshold
 gates whether a batch's prefix is served by MLA absorption (compressed
 ``kv_lora_rank + qk_rope_head_dim`` latent) or by materializing per-token K/V
@@ -51,18 +51,18 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha as forward_mha_module
-import sglang.srt.server_args as server_args_module
-from sglang.srt.environ import envs
-from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
+import flliper.srt.models.deepseek_common.attention_forward_methods.forward_mha as forward_mha_module
+import flliper.srt.server_args as server_args_module
+from flliper.srt.environ import envs
+from flliper.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DEFAULT_ATTN_SCRATCH_BUDGET_MIB,
     DeepseekMHAForwardMixin,
     attn_scratch_bytes_per_token,
     attn_scratch_token_threshold,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -222,7 +222,7 @@ class DeprecatedAliasTest(CustomTestCase):
 
     def test_deprecated_env_overrides_mib_conversion(self):
         fake_self = _fake_self(**REFERENCE_TP1)
-        with envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.override(4321):
+        with envs.FLLIPER_CHUNKED_PREFIX_CACHE_THRESHOLD.override(4321):
             _run_init_mha_forward(fake_self, attn_scratch_budget_mib=None)
         self.assertEqual(fake_self.chunked_prefix_cache_threshold, 4321)
 
@@ -230,7 +230,7 @@ class DeprecatedAliasTest(CustomTestCase):
         # A value the MiB formula could never produce from a clean budget on
         # THIS geometry proves the conversion path was skipped entirely.
         fake_self = _fake_self(num_local_heads=17, qk_head_dim=193, v_head_dim=129)
-        with envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.override(999):
+        with envs.FLLIPER_CHUNKED_PREFIX_CACHE_THRESHOLD.override(999):
             _run_init_mha_forward(fake_self, attn_scratch_budget_mib=None)
         self.assertEqual(fake_self.chunked_prefix_cache_threshold, 999)
 
@@ -246,23 +246,23 @@ class ServerArgsMutualExclusivityTest(CustomTestCase):
 
     def test_both_set_is_a_hard_error_naming_both_flags(self):
         sa = self._args(attn_scratch_budget_mib=512)
-        with envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.override(8192):
+        with envs.FLLIPER_CHUNKED_PREFIX_CACHE_THRESHOLD.override(8192):
             with self.assertRaises(ValueError) as cm:
                 sa._handle_attn_scratch_budget_deprecation()
         message = str(cm.exception)
         self.assertIn("--attn-scratch-budget-mib", message)
-        self.assertIn("SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD", message)
+        self.assertIn("FLLIPER_CHUNKED_PREFIX_CACHE_THRESHOLD", message)
 
     def test_env_only_is_a_deprecation_notice_not_an_error(self):
         sa = self._args(attn_scratch_budget_mib=None)
-        with envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.override(8192):
+        with envs.FLLIPER_CHUNKED_PREFIX_CACHE_THRESHOLD.override(8192):
             with self.assertLogs(
                 server_args_module.logger, level="WARNING"
             ) as cm:
                 sa._handle_attn_scratch_budget_deprecation()
         self.assertTrue(
             any(
-                "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD is deprecated" in line
+                "FLLIPER_CHUNKED_PREFIX_CACHE_THRESHOLD is deprecated" in line
                 for line in cm.output
             )
         )

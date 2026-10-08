@@ -5,13 +5,13 @@ import shutil
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
-from sglang.srt.utils.hf_transformers.mistral_utils import is_bare_tekken_checkpoint
-from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+from flliper.srt.utils.hf_transformers.mistral_utils import is_bare_tekken_checkpoint
+from flliper.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 TEKKEN_REPO = "mistralai/Leanstral-1.5-119B-A6B"
 PROMPT = "The capital of France is"

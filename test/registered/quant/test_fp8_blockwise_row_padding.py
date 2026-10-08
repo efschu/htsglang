@@ -1,7 +1,7 @@
 """Unit tests for the row-padded quant path of the cutlass FP8 blockwise linear.
 
 `cutlass_w8a8_block_fp8_linear_with_fallback` quantizes activations into
-row-aligned buffers (`sglang_per_token_group_quant_fp8_row_padded`) so the
+row-aligned buffers (`flliper_per_token_group_quant_fp8_row_padded`) so the
 `fp8_blockwise_scaled_mm` wrapper's per-call mat_a/scales_a padding short-
 circuits. These tests pin the invariant that this is numerically identical to
 the legacy unpadded path, across both row-aligned and unaligned M.
@@ -11,17 +11,17 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import (
+from flliper.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_token_group_quant_fp8,
-    sglang_per_token_group_quant_fp8_row_padded,
+    flliper_per_token_group_quant_fp8_row_padded,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
+from flliper.srt.layers.quantization.fp8_utils import (
     _check_cutlass_block_fp8_hardware_support,
     cutlass_w8a8_block_fp8_linear_with_fallback,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 
@@ -69,7 +69,7 @@ class TestFP8BlockwiseRowPadding(CustomTestCase):
         match the legacy column-major quant bit-for-bit."""
         for m in _M_VALUES:
             x = torch.randn(m, self.K, device="cuda", dtype=torch.bfloat16) * 0.1
-            xq, xs = sglang_per_token_group_quant_fp8_row_padded(x, _BLOCK)
+            xq, xs = flliper_per_token_group_quant_fp8_row_padded(x, _BLOCK)
             m_pad = (m + 3) // 4 * 4
 
             self.assertEqual(xq.shape, (m_pad, self.K), f"M={m}")

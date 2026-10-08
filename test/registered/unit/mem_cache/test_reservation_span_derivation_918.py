@@ -57,9 +57,9 @@ driver, no pool construction.
 
 import unittest
 
-from sglang.srt.managers.kv_backing_relief import lawful_reservation_rows
-from sglang.srt.mem_cache.kv_vmm_backing import serviceable_reserved_tokens
-from sglang.srt.mem_cache.memory_pool import KvBufferDesc, MHATokenToKVPool
+from flliper.srt.managers.kv_backing_relief import lawful_reservation_rows
+from flliper.srt.mem_cache.kv_vmm_backing import serviceable_reserved_tokens
+from flliper.srt.mem_cache.memory_pool import KvBufferDesc, MHATokenToKVPool
 
 #: boot_rerun0826, PP1, TP-layout full-attention pool, to the byte.
 BOOT_SIZE = 115532
@@ -147,7 +147,7 @@ class TheOwnerRefusesACeilingItCannotHonour(unittest.TestCase):
     """The boot-time gate: a divergent pair must not survive construction."""
 
     def test_the_specimen_pair_is_refused_with_both_numbers_named(self):
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 
         with self.assertRaises(ValueError) as caught:
             KvVmmBufferOwner.__init__(
@@ -171,7 +171,7 @@ class TheOwnerRefusesACeilingItCannotHonour(unittest.TestCase):
         that point IS the assertion, so the refusal above is attributable to
         the gate and not to the environment.
         """
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 
         try:
             KvVmmBufferOwner.__init__(

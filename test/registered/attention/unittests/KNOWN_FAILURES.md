@@ -21,7 +21,7 @@ Last updated: 2026-06-05
 |---|---|---|
 | **A** | Container dependency missing | **Re-image** with SM10.x-compatible wheels |
 | **B** | Hardware-architecture gate | None — tests skip cleanly when SM doesn't match; correctly designed |
-| **C** | Backend production-side bug or structural reject | **Production code change** in `python/sglang/srt/layers/attention/` |
+| **C** | Backend production-side bug or structural reject | **Production code change** in `python/flliper/srt/layers/attention/` |
 | **D** | Production-design constraint | None — these are intentional rejects (page-size pins, topk limits) |
 
 Within **C**, sub-sections by bug category (layout / speculative / graph-runner /
@@ -45,7 +45,7 @@ ImportError: cannot import name 'flash_attn_varlen_func' from 'flash_attn'
 ```
 
 **Root cause**: `DualChunkFlashAttentionBackend` calls `flash_attn_varlen_func`
-via `sglang.jit_kernel.flash_attention`. On SM 8.x / 9.x that resolves to
+via `flliper.jit_kernel.flash_attention`. On SM 8.x / 9.x that resolves to
 sgl-kernel's FA3 build (works on H200). On other SMs, the JIT kernel falls
 back to the upstream `flash_attn` (FA2) wheel — but the
 `lmsysorg/sglang:nightly-dev-cu13` container's `flash_attn` package on
@@ -75,7 +75,7 @@ it. PTX compilation fails.
 
 **Gate**: `dsa_impl_capability("tilelang")` in
 `common/attention_methods/dsa_attention.py` skips on `major >= 10`. Override
-with `SGLANG_TEST_DSA_TILELANG_FORCE=1` after re-imaging.
+with `FLLIPER_TEST_DSA_TILELANG_FORCE=1` after re-imaging.
 
 **Fix**: Re-image with an SM10.x-compatible tilelang version.
 

@@ -1,13 +1,13 @@
-"""ANCHOR-PIN (z30y15, P PP0 04:21:39Z, rid weg2-12-56): the recurrent anchor a
+"""ANCHOR-PIN (z30y15, P PP0 04:21:39Z, rid pdflip-12-56): the recurrent anchor a
 storage prefetch brings back must stay pinned until the admission, like the
 KV chain #1417 pins.
 
 MEASURED (P log boot_weg2_dkr27browauthoritybar1fs10010415_86d80796e0):
 
     #1028B FETCH CAP ... caps={mamba: 16383} anchors_in_range=(4, 16382)
-    #1423 INSERT-PLACED req=weg2-12- ... matched=16383 inserted=0 deepest=107
+    #1423 INSERT-PLACED req=pdflip-12- ... matched=16383 inserted=0 deepest=107
     #1427 ARENA-DROP n=3 need=1 freed=1 slot_bytes=78446592   (the 112-slot mamba arena)
-    #TF TOLD-FIDELITY rid=weg2-12-56 told=16383 pp0_admissible=0   (04:21:40)
+    #TF TOLD-FIDELITY rid=pdflip-12-56 told=16383 pp0_admissible=0   (04:21:40)
     PP1/PP2 [#928 anchor] REFUSING resume ... best_value_len=0 NONE-ON-THIS-PATH
 
 The read brought the anchor at 16383, the insert named node 107 (Full host
@@ -29,9 +29,9 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture  # noqa: E402
 

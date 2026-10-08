@@ -67,7 +67,7 @@ done
 if [ -z "$OLD_PID" ]; then
   # MATCH ON ARGV STRUCTURE, NEVER `pgrep -f <pattern>`.
   #
-  # `pgrep -f "sglang.launch_server.*--port 30030"` matches ANY process whose
+  # `pgrep -f "flliper.launch_server.*--port 30030"` matches ANY process whose
   # command line CONTAINS that text -- including the shell that is running the
   # pgrep, and including any monitoring loop that mentions it. On 2026-08-10
   # this cost two incidents in one shift: the reboot captured a bash wrapper's
@@ -77,7 +77,7 @@ if [ -z "$OLD_PID" ]; then
   # self-kill the brief forbids -- eleven occurrences in this chain.
   #
   # A real server is: argv[0] is a python interpreter, argv[2] is exactly
-  # "sglang.launch_server", and "--port <PORT>" appears as adjacent argv
+  # "flliper.launch_server", and "--port <PORT>" appears as adjacent argv
   # entries. A shell that merely quotes those strings satisfies none of it.
   OLD_PID=$(
     for d in /proc/[0-9]*; do
@@ -86,7 +86,7 @@ if [ -z "$OLD_PID" ]; then
       mapfile -d '' -t a < "$d/cmdline" 2>/dev/null || continue
       [ "${#a[@]}" -ge 4 ] || continue
       case "${a[0]}" in *python*) ;; *) continue ;; esac
-      [ "${a[2]}" = "sglang.launch_server" ] || continue
+      [ "${a[2]}" = "flliper.launch_server" ] || continue
       for i in "${!a[@]}"; do
         if [ "${a[$i]}" = "--port" ] && [ "${a[$((i+1))]}" = "$PORT" ]; then
           echo "$pid"; break
@@ -159,7 +159,7 @@ if kill -0 "$OLD_PID" 2>/dev/null; then
 fi
 echo "[reboot] old instance gone; waiting for its workers to release VRAM"
 # WAIT ON THE CHILDREN, NOT THE PARENT. The VRAM is held by the
-# `sglang::scheduler_PP*` worker processes, which do NOT match the
+# `flliper::scheduler_PP*` worker processes, which do NOT match the
 # launch_server pattern -- the first version of this loop polled only the
 # parent, saw it gone immediately, and printed free-memory figures
 # (1625/4154/1895) that were the OLD instance's, while the relaunch was

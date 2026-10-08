@@ -27,17 +27,17 @@ NINE recorded rank/series combinations, worst case +0.0021 hit rate, mean
 metal, which is why the default is 0.0.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.layers.moe.expert_heat_migration import (
+from flliper.srt.layers.moe.expert_heat_migration import (
     HeatMigrationConfig,
     HeatWindow,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _window(budget: float, hits: int, misses: int) -> HeatWindow:
@@ -130,7 +130,7 @@ class TestTheDecisionIsPureAndLossless(CustomTestCase):
         would no longer be sufficient and quality-last would apply."""
         import inspect
 
-        from sglang.srt.layers.moe.expert_heat_migration import HeatWindow as HW
+        from flliper.srt.layers.moe.expert_heat_migration import HeatWindow as HW
 
         src = inspect.getsource(HW.budget_holds)
         for forbidden in ("topk", "router", "logits", "route", "fallback"):

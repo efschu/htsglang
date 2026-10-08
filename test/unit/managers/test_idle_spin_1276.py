@@ -3,7 +3,7 @@
 Boot weg2sb4 (e4f1b9fcc6) ran 1,499.8 HICACHE-ROUND/s on group P and 303.1/s
 on group D with an empty queue and a live front, for 34 idle minutes.  The
 #547 blocking-poll ladder was fully built and simply never constructed: the
-boot set neither --sleep-on-idle nor SGLANG_IDLE_BLOCKING_POLL, so
+boot set neither --sleep-on-idle nor FLLIPER_IDLE_BLOCKING_POLL, so
 `Scheduler.idle_sleeper` was None on all six ranks.
 
 These tests pin the three facts the fix rests on:
@@ -20,7 +20,7 @@ import types
 
 import pytest
 
-from sglang.srt.managers.scheduler_components.idle_sleeper import (
+from flliper.srt.managers.scheduler_components.idle_sleeper import (
     IDLE_POLL_CAP_MS,
     IdleSleeper,
     idle_poll_timeout_ms,
@@ -69,14 +69,14 @@ def _scheduler_stub(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0):
     return s
 
 
-def _arms(monkeypatch, weg2_group, **rank):
+def _arms(monkeypatch, pdflip_group, **rank):
     """Run the real init_idle_sleeper against a stub; return whether it armed."""
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
-    if weg2_group is None:
-        monkeypatch.delenv("SGLANG_WEG2_GROUP", raising=False)
+    if pdflip_group is None:
+        monkeypatch.delenv("FLLIPER_PDFLIP_GROUP", raising=False)
     else:
-        monkeypatch.setenv("SGLANG_WEG2_GROUP", weg2_group)
+        monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", pdflip_group)
     s = _scheduler_stub(**rank)
     made = {}
 
@@ -85,13 +85,13 @@ def _arms(monkeypatch, weg2_group, **rank):
             made["sockets"] = sockets
 
     monkeypatch.setattr(
-        "sglang.srt.managers.scheduler.IdleSleeper", _FakeSleeper, raising=True
+        "flliper.srt.managers.scheduler.IdleSleeper", _FakeSleeper, raising=True
     )
     Scheduler.init_idle_sleeper(s)
     return s.idle_sleeper is not None, made
 
 
-def test_weg2_group_arms_the_idle_poll_on_the_origin(monkeypatch):
+def test_pdflip_group_arms_the_idle_poll_on_the_origin(monkeypatch):
     """THE #1276 FIX. Before it this was False and the loop spun."""
     armed, made = _arms(monkeypatch, "P")
     assert armed
@@ -101,7 +101,7 @@ def test_weg2_group_arms_the_idle_poll_on_the_origin(monkeypatch):
     assert len(made["sockets"]) == 2
 
 
-def test_without_the_weg2_group_the_stock_default_is_untouched(monkeypatch):
+def test_without_the_pdflip_group_the_stock_default_is_untouched(monkeypatch):
     armed, _ = _arms(monkeypatch, None)
     assert not armed
 
@@ -148,7 +148,7 @@ class _RoundStub:
 
 
 def _run(stub, n):
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     for _ in range(n):
         UnifiedRadixCache.check_hicache_events(stub)

@@ -9,10 +9,10 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.nightly_bench_utils import BenchmarkResult
-from sglang.test.nightly_utils import NightlyBenchmarkRunner
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.nightly_bench_utils import BenchmarkResult
+from flliper.test.nightly_utils import NightlyBenchmarkRunner
+from flliper.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - Grok-1 INT4 benchmark on MI35x (~25 min)
 register_amd_ci(
@@ -85,8 +85,8 @@ class TestGrok1INT4PerfMI35x(unittest.TestCase):
             ],
             "env_vars": {
                 "RCCL_MSCCL_ENABLE": "0",
-                "SGLANG_USE_AITER": "1",
-                "SGLANG_INT4_WEIGHT": "1",
+                "FLLIPER_USE_AITER": "1",
+                "FLLIPER_INT4_WEIGHT": "1",
             },
         }
 

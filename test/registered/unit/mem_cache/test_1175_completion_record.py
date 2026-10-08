@@ -33,8 +33,8 @@ FIFO trim; print `synced=yes` unconditionally; drop the population field.
 
 import unittest
 
-from sglang.srt.mem_cache import unified_radix_cache as urc
-from sglang.srt.mem_cache.producer_phase_census import DoublePrefillCensus
+from flliper.srt.mem_cache import unified_radix_cache as urc
+from flliper.srt.mem_cache.producer_phase_census import DoublePrefillCensus
 
 
 def _bare():

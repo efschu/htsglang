@@ -3,14 +3,14 @@ from typing import Tuple
 import torch
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
-from sglang.jit_kernel.diffusion.triton.norm import norm_infer
-from sglang.jit_kernel.diffusion.triton.scale_shift import (
+from flliper.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from flliper.jit_kernel.diffusion.triton.norm import norm_infer
+from flliper.jit_kernel.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

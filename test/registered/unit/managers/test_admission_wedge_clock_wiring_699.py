@@ -41,17 +41,17 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     ADMISSION_WEDGE_SECONDS,
     check_admission_wedge_once,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -121,7 +121,7 @@ class TestCheckAdmissionWedgeOnce(CustomTestCase):
         self.assertFalse(alarm)
         self.assertIn("initializing", detail)
 
-    @patch("sglang.srt.managers.scheduler_components.invariant_checker.logger")
+    @patch("flliper.srt.managers.scheduler_components.invariant_checker.logger")
     def test_a_firing_alarm_logs_a_single_loud_line_naming_age_and_clock(
         self, mock_logger
     ):
@@ -204,7 +204,7 @@ class _FakeGenerationResult:
 
 class TestFirstTokenCommitCallsTheProgressClock(CustomTestCase):
     @patch(
-        "sglang.srt.managers.scheduler_components.batch_result_processor."
+        "flliper.srt.managers.scheduler_components.batch_result_processor."
         "maybe_cache_unfinished_req"
     )
     def test_a_finishing_prefill_chunk_records_progress_exactly_once(self, _mock_cache):

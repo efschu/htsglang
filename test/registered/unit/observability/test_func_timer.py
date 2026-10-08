@@ -1,6 +1,6 @@
 """Unit tests for func_timer.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -9,8 +9,8 @@ import asyncio
 import unittest
 from unittest.mock import MagicMock, patch
 
-import sglang.srt.observability.func_timer as func_timer
-from sglang.srt.observability.func_timer import enable_func_timer, time_func_latency
+import flliper.srt.observability.func_timer as func_timer
+from flliper.srt.observability.func_timer import enable_func_timer, time_func_latency
 
 
 class TestFuncTimer(unittest.TestCase):

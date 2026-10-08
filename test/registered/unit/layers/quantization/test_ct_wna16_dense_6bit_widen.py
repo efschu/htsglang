@@ -10,8 +10,8 @@ from fractions import Fraction
 import pytest
 import torch
 
-from sglang.srt.layers.parameter import _exact_div
-from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+from flliper.srt.layers.parameter import _exact_div
+from flliper.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
     unpack_dense_subbyte,
     widen_dense_packed_to_8bit,
 )
@@ -77,7 +77,7 @@ def test_exact_div_with_fraction_pack_factor():
 
 
 def test_scheme_widens_six_bits_to_the_8bit_kernel_type():
-    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+    from flliper.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
         CompressedTensorsWNA16,
     )
 
@@ -95,8 +95,8 @@ def test_uneven_tp_block_covers_dense_6bit_words_and_the_g64_groups():
     elements (16 * 6 = 96 bits = 3 int32 words) and Minachist's groups are
     64 wide: both must divide that block, or a row-parallel shard (shared
     expert down_proj, in=640, ratio 39:13:12) would land mid-word."""
-    from sglang.srt.layers.linear import _marlin_uneven_tp_block
-    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    from flliper.srt.layers.linear import _marlin_uneven_tp_block
+    from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
 

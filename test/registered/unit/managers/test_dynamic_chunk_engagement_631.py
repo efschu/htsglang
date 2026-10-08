@@ -15,7 +15,7 @@ import logging
 import types
 import unittest
 
-from sglang.srt.managers.scheduler import Scheduler
+from flliper.srt.managers.scheduler import Scheduler
 
 
 class _Sched:
@@ -33,13 +33,13 @@ class TestEngagementLine(unittest.TestCase):
         self.s = _Sched()
 
     def test_it_is_info_not_debug(self):
-        with self.assertLogs("sglang.srt.managers.scheduler", level="INFO") as cm:
+        with self.assertLogs("flliper.srt.managers.scheduler", level="INFO") as cm:
             self.s._log_dynamic_chunk_engagement(128, 0)
         self.assertTrue(any("ENGAGED" in m for m in cm.output))
         self.assertTrue(any(r.levelno == logging.INFO for r in cm.records))
 
     def test_it_reports_the_delta_against_the_static_size(self):
-        with self.assertLogs("sglang.srt.managers.scheduler", level="INFO") as cm:
+        with self.assertLogs("flliper.srt.managers.scheduler", level="INFO") as cm:
             self.s._log_dynamic_chunk_engagement(128, 4096)
         line = cm.output[0]
         self.assertIn("chunk width 128", line)
@@ -49,14 +49,14 @@ class TestEngagementLine(unittest.TestCase):
 
     def test_repeats_of_the_same_width_are_silent(self):
         # Edge-triggered: this helper is on a per-iteration path.
-        with self.assertLogs("sglang.srt.managers.scheduler", level="INFO") as cm:
+        with self.assertLogs("flliper.srt.managers.scheduler", level="INFO") as cm:
             self.s._log_dynamic_chunk_engagement(128, 0)
             for _ in range(500):
                 self.s._log_dynamic_chunk_engagement(128, 0)
         self.assertEqual(len(cm.output), 1)
 
     def test_each_new_width_is_reported(self):
-        with self.assertLogs("sglang.srt.managers.scheduler", level="INFO") as cm:
+        with self.assertLogs("flliper.srt.managers.scheduler", level="INFO") as cm:
             self.s._log_dynamic_chunk_engagement(128, 0)
             self.s._log_dynamic_chunk_engagement(256, 0)
             self.s._log_dynamic_chunk_engagement(128, 0)
@@ -66,7 +66,7 @@ class TestEngagementLine(unittest.TestCase):
         # The predictor moves in BOTH directions (down to base//4, up via the
         # raised prefill ceiling); an engagement proof that only saw the
         # downward half would miss the risky one.
-        with self.assertLogs("sglang.srt.managers.scheduler", level="INFO") as cm:
+        with self.assertLogs("flliper.srt.managers.scheduler", level="INFO") as cm:
             self.s._log_dynamic_chunk_engagement(640, 0)
         self.assertIn("+128", cm.output[0])
 

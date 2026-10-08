@@ -4,13 +4,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -43,7 +43,7 @@ def _fake_mooncake_modules(fake_store_cls, replicate_config_cls):
 
 
 def _fake_pool_host_mla_module():
-    pool_host_mla = types.ModuleType("sglang.srt.mem_cache.pool_host.mla")
+    pool_host_mla = types.ModuleType("flliper.srt.mem_cache.pool_host.mla")
 
     class MLATokenToKVPoolHost:
         pass
@@ -53,7 +53,7 @@ def _fake_pool_host_mla_module():
 
 
 def _fake_pool_host_module():
-    pool_host = types.ModuleType("sglang.srt.mem_cache.pool_host")
+    pool_host = types.ModuleType("flliper.srt.mem_cache.pool_host")
 
     class HostKVCache:
         pass
@@ -68,8 +68,8 @@ def _fake_pool_host_module():
 
 def _fake_host_pool_modules():
     return {
-        "sglang.srt.mem_cache.pool_host": _fake_pool_host_module(),
-        "sglang.srt.mem_cache.pool_host.mla": _fake_pool_host_mla_module(),
+        "flliper.srt.mem_cache.pool_host": _fake_pool_host_module(),
+        "flliper.srt.mem_cache.pool_host.mla": _fake_pool_host_mla_module(),
     }
 
 
@@ -261,7 +261,7 @@ def _make_store(
             **_fake_host_pool_modules(),
         },
     ):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+        from flliper.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
         )
 
@@ -283,7 +283,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
                 **_fake_host_pool_modules(),
             },
         ):
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            from flliper.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeBaseStore,
             )
 
@@ -330,10 +330,10 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(
             call["args"][0].group_ids,
             [
-                "sglang-hicache:tag_page0",
-                "sglang-hicache:tag_page0",
-                "sglang-hicache:tag_page1",
-                "sglang-hicache:tag_page1",
+                "flliper-hicache:tag_page0",
+                "flliper-hicache:tag_page0",
+                "flliper-hicache:tag_page1",
+                "flliper-hicache:tag_page1",
             ],
         )
 
@@ -358,7 +358,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(result, [True])
         call = fake_store.batch_put_calls[0]
         self.assertEqual(call["keys"], ["page0__k"])
-        self.assertEqual(call["args"][0].group_ids, ["sglang-hicache:page0"])
+        self.assertEqual(call["args"][0].group_ids, ["flliper-hicache:page0"])
 
     def test_split_heads_group_ids(self):
         store, fake_store = _make_store(
@@ -379,7 +379,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         )
         self.assertEqual(
             call["args"][0].group_ids,
-            ["sglang-hicache:page0"] * 4,
+            ["flliper-hicache:page0"] * 4,
         )
 
     def test_existing_filter_keeps_group_ids_aligned_with_missing_keys(self):
@@ -394,7 +394,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(call["keys"], ["page0_0_v", "page1_0_k"])
         self.assertEqual(
             call["args"][0].group_ids,
-            ["sglang-hicache:page0", "sglang-hicache:page1"],
+            ["flliper-hicache:page0", "flliper-hicache:page1"],
         )
 
     def test_v2_indexer_group_ids_use_logical_page_key(self):
@@ -417,7 +417,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(call["keys"], ["tag_page0__indexer", "tag_page1__indexer"])
         self.assertEqual(
             call["args"][0].group_ids,
-            ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
+            ["flliper-hicache:tag_page0", "flliper-hicache:tag_page1"],
         )
 
     def test_v2_multi_buffer_put_passes_group_ids(self):
@@ -446,7 +446,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(call["sizes"], [[8, 16], [8, 16]])
         self.assertEqual(
             call["args"][0].group_ids,
-            ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
+            ["flliper-hicache:tag_page0", "flliper-hicache:tag_page1"],
         )
 
 

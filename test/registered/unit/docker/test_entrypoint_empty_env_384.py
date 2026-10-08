@@ -29,8 +29,8 @@ import subprocess
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -91,7 +91,7 @@ class TestEntrypointEmptyEnv(CustomTestCase):
     def test_unset_variables_produce_a_stock_launch(self):
         """The baseline the other assertions are read against."""
         argv = _run({})
-        self.assertEqual(argv[:3], ["-m", "sglang.launch_server", "--model-path"])
+        self.assertEqual(argv[:3], ["-m", "flliper.launch_server", "--model-path"])
         for flag in _ONCE_DEFAULTED.values():
             self.assertNotIn(flag, argv)
 

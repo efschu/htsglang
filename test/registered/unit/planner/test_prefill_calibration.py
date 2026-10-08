@@ -26,7 +26,7 @@ follow from the same campaign's measured per-prompt-token savings (0.0473 /
 13.0 % => base slope 0.7875 ms/token): +6.4 % / +9.0 %.
 
 These tests also pin the refit seam (task #230): the four fitted/assumed
-scalars are parameters (``PerfCalibration`` / ``SGLANG_PERF_*`` env), so a
+scalars are parameters (``PerfCalibration`` / ``FLLIPER_PERF_*`` env), so a
 foreign-hardware refit is a value change, not a code edit.
 """
 
@@ -34,11 +34,11 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.srt.environ import envs
-from sglang.srt.uneven_perf import PerfCalibration, PerfCostModel, PlanInputs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.srt.environ import envs
+from flliper.srt.uneven_perf import PerfCalibration, PerfCostModel, PlanInputs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -168,7 +168,7 @@ class TestRefitSeam(CustomTestCase):
     MEASURED per rig (probe): GEMM, streaming membw, decode GEMV, links.
     FITTED/ASSUMED (reference rig only): the two exponents, the decode
     non-weight fraction, the prefill invariant fraction. A foreign-hardware
-    refit sets a ``PerfCalibration`` or an ``SGLANG_PERF_*`` env var.
+    refit sets a ``PerfCalibration`` or an ``FLLIPER_PERF_*`` env var.
     """
 
     def test_explicit_calibration_object_wins(self):
@@ -179,7 +179,7 @@ class TestRefitSeam(CustomTestCase):
         )
 
     def test_prefill_fraction_env_override(self):
-        with envs.SGLANG_PERF_PREFILL_INVARIANT_FRACTION.override(0.0):
+        with envs.FLLIPER_PERF_PREFILL_INVARIANT_FRACTION.override(0.0):
             m_env = _model()
             self.assertEqual(
                 m_env.calibration.overridden_fields(),
@@ -196,7 +196,7 @@ class TestRefitSeam(CustomTestCase):
         """Same behavior the constant-patch test pins, through the seam: at
         exponent 1.0 the unexponentiated GEMV divisor flips the predicted
         decode cost to a gain."""
-        with envs.SGLANG_PERF_DECODE_GEMV_RESIDUAL_EXP.override(1.0):
+        with envs.FLLIPER_PERF_DECODE_GEMV_RESIDUAL_EXP.override(1.0):
             m = _model()
             _, beta, _ = m.decode_bw_basis(_MEMBW, _MEMBW_GEMV)
             self.assertEqual(beta, 1.0)
@@ -205,7 +205,7 @@ class TestRefitSeam(CustomTestCase):
             )
 
     def test_decode_peak_exponent_env_override(self):
-        with envs.SGLANG_PERF_DECODE_PEAK_COMPRESSION_EXP.override(1.0):
+        with envs.FLLIPER_PERF_DECODE_PEAK_COMPRESSION_EXP.override(1.0):
             m = _model()
             _, beta, basis = m.decode_bw_basis(_MEMBW, None)
             self.assertEqual(beta, 1.0)

@@ -37,14 +37,14 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.hicache_collective import (
+from flliper.srt.mem_cache.hicache_collective import (
     COLLECTIVE_POLL_MIN_S,
     COLLECTIVE_POLL_SPINS,
     HiCacheCollectiveTimeoutError,
 )
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -221,7 +221,7 @@ class TestDrainAsyncWorkBounded(unittest.TestCase):
                 self.assertIn("[1]", msg)
                 self.assertIn("pp_rank=1/3", msg)
                 self.assertIn("waited", msg)
-                self.assertIn("SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S", msg)
+                self.assertIn("FLLIPER_HICACHE_COLLECTIVE_TIMEOUT_S", msg)
 
     def test_healthy_drain_waits_each_work_once_and_clears(self):
         for label, make in _HOLDERS:
@@ -287,7 +287,7 @@ class TestPPSyncRecvBounded(unittest.TestCase):
                 self.assertIs(irecv.call_args.args[0], data)
                 self.assertEqual(kwargs["group_src"], 1)
                 self.assertIs(kwargs["group"], h.pp_group)
-                from sglang.srt.distributed.communication_tags import P2PTag
+                from flliper.srt.distributed.communication_tags import P2PTag
 
                 self.assertEqual(kwargs["tag"], P2PTag.HIRADIX_PP_SYNC)
 

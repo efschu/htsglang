@@ -35,16 +35,16 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import numpy as np
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache import unified_radix_cache as u
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import HybridCacheController
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
-from sglang.srt.mem_cache.pool_host.arena_pool import PLACEHOLDERS, ArenaMHAHostPool
-from sglang.srt.mem_cache.storage.file import hicache_arena as ha
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache import unified_radix_cache as u
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import HybridCacheController
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from flliper.srt.mem_cache.pool_host.arena_pool import PLACEHOLDERS, ArenaMHAHostPool
+from flliper.srt.mem_cache.storage.file import hicache_arena as ha
+from flliper.test.test_utils import CustomTestCase
 
-ENV = "SGLANG_HICACHE_ARENA_QUEUE_REFS"
+ENV = "FLLIPER_HICACHE_ARENA_QUEUE_REFS"
 P, L, LT, H, D = 4, 3, 3, 2, 4   # x59 geometry (page tokens, layers, model layers, heads, head_dim)
 CELL = H * D
 BLOCK = P * CELL
@@ -88,8 +88,8 @@ class _Op:
 def _hdr(arena):
     out = (np.ctypeslib.ctypes.c_int64 * 6)()
     arena._lib.arena_layout(arena.slots, arena.slot_bytes, out)
-    hb, hoff = int(out[0]), int(out[3])
-    u32 = np.frombuffer(arena._mm, dtype=np.uint32, count=arena.slots * hb // 4, offset=hoff)
+    hb, hope = int(out[0]), int(out[3])
+    u32 = np.frombuffer(arena._mm, dtype=np.uint32, count=arena.slots * hb // 4, offset=hope)
     h = u32.reshape(arena.slots, hb // 4)
     return h[:, 0].copy(), h[:, 1].copy()
 
@@ -268,7 +268,7 @@ class ThePagedQueueReturnsOneReferencePerPage(_Case):
         self.on()
         a = _Rank(self.path)
         hi = a.pool.alloc_read(2 * P)  # never resolved (a revoke's span)
-        with mock.patch("sglang.srt.mem_cache.memory_pool_host.logger") as lg:
+        with mock.patch("flliper.srt.mem_cache.memory_pool_host.logger") as lg:
             a.group.free(hi)
         self.assertFalse(any("HICACHE-INDEX REFUSED" in str(c) for c in lg.error.call_args_list))
         self.assertEqual(a.group._queue_refs["placeholders"], 2 * P)
@@ -330,7 +330,7 @@ class TheLedgerOnlyReleasesOwnReferences(_Case):
         placeholders and keep their reference -- the test above must catch it."""
         self.on()
         a = _Rank(self.path)
-        with mock.patch("sglang.srt.mem_cache.memory_pool_host._arena_id_tokens",
+        with mock.patch("flliper.srt.mem_cache.memory_pool_host._arena_id_tokens",
                         lambda pool: int(pool.arena_slots)):
             slots = a.publish([f"m{j}" for j in range(A)])
             hi, _ = a.prefetch([f"m{j}" for j in range(A)])
@@ -380,7 +380,7 @@ class TheReleaseFormNeedsNoArmEnvHX(_Case):
         one."""
         a = _Rank(self.path)
         hi = a.pool.alloc_read(2 * P)
-        with mock.patch("sglang.srt.mem_cache.memory_pool_host.logger") as lg:
+        with mock.patch("flliper.srt.mem_cache.memory_pool_host.logger") as lg:
             a.release_via_queue(hi)
         self.assertFalse(any("HICACHE-INDEX REFUSED" in str(c) for c in lg.error.call_args_list))
 
@@ -393,7 +393,7 @@ class TheReleaseFormNeedsNoArmEnvHX(_Case):
         slots = a.publish(["n0", "n1"])
         hi, _ = a.prefetch(["n0", "n1"])
         ph = a.pool.alloc_read(P)
-        with mock.patch("sglang.srt.mem_cache.memory_pool_host.logger") as lg:
+        with mock.patch("flliper.srt.mem_cache.memory_pool_host.logger") as lg:
             a.group.free(torch.cat([hi, ph]))
         lines = [c.args[0] % c.args[1:] for c in lg.error.call_args_list
                  if "HICACHE-INDEX REFUSED" in str(c.args[0])]

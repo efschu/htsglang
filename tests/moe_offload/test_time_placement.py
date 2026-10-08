@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from sglang.srt.layers.moe.expert_compute_placement import (
+from flliper.srt.layers.moe.expert_compute_placement import (
     COMPUTE_PLACEMENT_SYMBOLS,
     COMPUTE_PLACEMENT_TIME,
     NoComputeLever,

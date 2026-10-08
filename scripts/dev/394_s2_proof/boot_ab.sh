@@ -4,13 +4,13 @@
 # Recipe is boot394.sh from the 2026-08-02 battery verbatim, except for the
 # worktree, the run dir, and ARM. Two arms, one boot each:
 #
-#   ARM=equal         SGLANG_MOE_HOST_SHARD_RATIO=1,1,1 -> is_equal -> no
+#   ARM=equal         FLLIPER_MOE_HOST_SHARD_RATIO=1,1,1 -> is_equal -> no
 #                     ColdShardContext at all, i.e. the pre-#394 plan field for
 #                     field. Named explicitly rather than left unset, so the
 #                     baseline identifies itself in the #390 dump.
 #   ARM=proportional  the launcher-published rank->card vector reaches
 #                     _gguf_cold_shard_context, the ratio resolves from the
-#                     MEASURED card-probe H2D, and SGLANG_MOE_COLD_TIER_SHM=1
+#                     MEASURED card-probe H2D, and FLLIPER_MOE_COLD_TIER_SHM=1
 #                     makes the delegated experts REACHABLE. Arm A of the
 #                     2026-08-02 battery could not run this: the delegated
 #                     experts were absent and the boot was refused.
@@ -21,7 +21,7 @@
 #   ARM=compute-cal   FALSIFIED (2026-08-03), kept only to test a better
 #                     hit-rate model. --rank-moe-ratio link-calibrated with the
 #                     per-rank cold-traffic coefficients measured on the equal
-#                     arm supplied through SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS.
+#                     arm supplied through FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS.
 #                     It is falsified on TWO legs, and the transfer term is not
 #                     one of them: (1) END-TO-END, -0.94 % against -7.67 % for
 #                     plain 'compute', i.e. inside the same-window floor; and
@@ -125,21 +125,21 @@ if [ "$DRY_RUN" != "1" ] && ss -ltn 2>/dev/null | grep -q ":$PORT "; then
 fi
 
 export PYTHONPATH="$WT/python"
-export SGLANG_MOE_SCRATCH_SLOTS=6
-export SGLANG_FORWARD_PEAK_PATH="$RUN/peak_$ARM"
-export SGLANG_GGUF_STREAM_TRIM_SOFT_GIB=88
-export SGLANG_GGUF_STREAM_TRIM_TARGET_GIB=78
-export SGLANG_DSV4_FP4_EXPERTS=0
-export SGLANG_EXPERT_STATS=1
-export SGLANG_EXPERT_STATS_PATH="$RUN/expert_stats_$ARM"
+export FLLIPER_MOE_SCRATCH_SLOTS=6
+export FLLIPER_FORWARD_PEAK_PATH="$RUN/peak_$ARM"
+export FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB=88
+export FLLIPER_GGUF_STREAM_TRIM_TARGET_GIB=78
+export FLLIPER_DSV4_FP4_EXPERTS=0
+export FLLIPER_EXPERT_STATS=1
+export FLLIPER_EXPERT_STATS_PATH="$RUN/expert_stats_$ARM"
 # Interval dumps, never SIGUSR2. SIGUSR2 has no handler in the FRONTEND
 # process (no MoE layers there, so no collector, so no handler installed) and
 # its default action is terminate -- that is how the first arm-A boot of the
 # 2026-08-02 battery died. See INCIDENT_394_sigusr2.md.
-export SGLANG_EXPERT_STATS_INTERVAL_SEC=45
-export SGLANG_MOE_STAGING_TRACE=1
-export SGLANG_OPT_FUSE_WQA_WKV=0
-export SGLANG_OPT_USE_TOPK_V2=0
+export FLLIPER_EXPERT_STATS_INTERVAL_SEC=45
+export FLLIPER_MOE_STAGING_TRACE=1
+export FLLIPER_OPT_FUSE_WQA_WKV=0
+export FLLIPER_OPT_USE_TOPK_V2=0
 
 # Extra launch arguments the arm adds. Empty for the two slice-2 arms, so their
 # command line is byte-identical to the one the 2026-08-02 battery ran.
@@ -147,15 +147,15 @@ ARM_ARGS=()
 
 case "$ARM" in
   equal)
-    export SGLANG_MOE_HOST_SHARD_RATIO=1,1,1
-    unset SGLANG_MOE_COLD_TIER_SHM || true
+    export FLLIPER_MOE_HOST_SHARD_RATIO=1,1,1
+    unset FLLIPER_MOE_COLD_TIER_SHM || true
     ;;
   proportional)
-    unset SGLANG_MOE_HOST_SHARD_RATIO || true
+    unset FLLIPER_MOE_HOST_SHARD_RATIO || true
     # Refuse a nameplate-weighted arm: an A/B whose treatment is a datasheet
     # derivation is not the experiment anybody intended to run.
-    export SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE=measured
-    export SGLANG_MOE_COLD_TIER_SHM=1
+    export FLLIPER_MOE_HOST_SHARD_MIN_PROVENANCE=measured
+    export FLLIPER_MOE_COLD_TIER_SHM=1
     ;;
   compute|compute-cal)
     # Slice 3. Byte ownership stays at the baseline on purpose -- this arm's
@@ -163,19 +163,19 @@ case "$ARM" in
     # produce a delta neither mechanism could claim. That is achieved by
     # leaving the shared cold tier OFF: without it _gguf_cold_shard_context
     # returns None and no expert is delegated, whatever the ratio says.
-    unset SGLANG_MOE_COLD_TIER_SHM || true
+    unset FLLIPER_MOE_COLD_TIER_SHM || true
     # NOT set to 1,1,1 the way the equal arm does. That variable is the FIRST
     # source of the link weights this arm's solve is built on (resolve_host_
     # shard_ratio), so pinning it equal here would hand the solver a uniform
     # link profile and quietly turn the treatment into the baseline. Byte
     # ownership is held at the baseline by the line above instead.
-    unset SGLANG_MOE_HOST_SHARD_RATIO || true
+    unset FLLIPER_MOE_HOST_SHARD_RATIO || true
     # Same refusal as the proportional arm: the placement must be weighted by a
     # timed transfer, not by a datasheet.
-    export SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE=measured
+    export FLLIPER_MOE_HOST_SHARD_MIN_PROVENANCE=measured
     if [ "$ARM" = "compute-cal" ]; then
-      if [ -z "${SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS:-}" ]; then
-        echo "FAIL ARM=compute-cal needs SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS" >&2
+      if [ -z "${FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS:-}" ]; then
+        echo "FAIL ARM=compute-cal needs FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS" >&2
         echo "     derive them from the EQUAL arm's per-rank h2d_bytes; see" >&2
         echo "     scripts/dev/394_s2_proof/ARM3_COMPUTE.md" >&2
         exit 1
@@ -186,7 +186,7 @@ case "$ARM" in
       # turn the next arm into this one.
       ARM_ARGS+=(--rank-moe-ratio link-calibrated)
     else
-      unset SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS || true
+      unset FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS || true
       ARM_ARGS+=(--rank-moe-ratio link)
     fi
     ;;
@@ -197,7 +197,7 @@ case "$ARM" in
 esac
 
 LAUNCH=(
-  "$VENV/bin/python" -u -m sglang.launch_server
+  "$VENV/bin/python" -u -m flliper.launch_server
   --model-path "$GGUF_DIR/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
   --tp-size 3 --rank-gpu-id "$RANK_GPU_ID" --rank-tp-ratio auto
   --rank-auto-reserve-mib "$RESERVE_MIB"

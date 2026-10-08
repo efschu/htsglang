@@ -40,7 +40,7 @@ def p_chunks():
 def rec_p(stage, ts, ch):
     done = [c for c in ch if c[0] == stage and c[3] <= ts]
     last = max(done, key=lambda c: c[3]) if done else None
-    return {"schema": "weg2.rankstats/1", "ts": ts,
+    return {"schema": "pdflip.rankstats/1", "ts": ts,
             "prefill": {"chunks": len(done), "new_tokens": CH * len(done), "cached_tokens": 0,
                         "compute_ms": 1000.0 * sum(c[3] - c[2] for c in done),
                         "last": {"t": last[3], "gpu_ms": 1000.0 * (last[3] - last[2]), "new": CH} if last else None},
@@ -51,7 +51,7 @@ def rec_p(stage, ts, ch):
 def rec_d(ts):
     ext = ts >= 28.4
     dec = max(0.0, min(ts, 48.5) - 28.5)
-    return {"schema": "weg2.rankstats/1", "ts": ts,
+    return {"schema": "pdflip.rankstats/1", "ts": ts,
             "prefill": {"chunks": 1 if ext else 0, "new_tokens": 1 if ext else 0, "cached_tokens": 65535 if ext else 0,
                         "compute_ms": 200.0 if ext else 0.0,
                         "last": {"t": 28.4, "gpu_ms": 200.0, "new": 1} if ext else None},

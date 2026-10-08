@@ -1,8 +1,8 @@
 """#1424 (rc12m-dpr D-TP0 11:49:05 and 12:19:06): park loadbacks over a
 prefix that arrived in two prefetch pieces died in the paged arena load.
 
-11:49: weg2-17-71 and weg2-11-56, each re-read its last 384 tokens
-(START-LOADING nodes=3 tokens=37376). 12:19: weg2-18-63 alone (15168 +
+11:49: pdflip-17-71 and pdflip-11-56, each re-read its last 384 tokens
+(START-LOADING nodes=3 tokens=37376). 12:19: pdflip-18-63 alone (15168 +
 1984, #988 17152) -- one request, so not two copies of a shared page; the
 chain check below proves (and re-points) such a chain. ``move_indices``
 (io_backend direct, layer_first) sorts the merged host indices, so each
@@ -10,7 +10,7 @@ duplicated row sits next to its twin -- r0,r0,r1,r1,... -- and
 ``_page_slots`` raised 'a page's token rows are not consecutive from its
 first id'. Loading one row into two device rows is legal; only the
 whole-page fast path cannot express it. The control batch at 11:45:38
-(weg2-0-3 + weg2-5-28, same prefix 34304) survived because the second
+(pdflip-0-3 + pdflip-5-28, same prefix 34304) survived because the second
 request found the shared nodes already on the device and loaded only its
 own 3904 tokens -- no duplicate rows. 27B's arena is unpaged (P == 1).
 
@@ -25,7 +25,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
+from flliper.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
 
 P = 4
 SLOTS = 3
@@ -91,7 +91,7 @@ def test_the_fallback_is_named():
 
 # -- the park loadback over a prefix that arrived in TWO prefetch pieces --------
 #
-# 12:19:06 (weg2-18-63, ONE request in the batch): prefetch 1 INCOMPLETE
+# 12:19:06 (pdflip-18-63, ONE request in the batch): prefetch 1 INCOMPLETE
 # (matched 3840 + loaded 11328 = 15168, shortfall 1984), prefetch 2 loaded
 # the rest (matched 0, loaded 1984), then the #988 park loadback of 17152
 # died in the paged load. One request, one chain -- so the rows the page
@@ -206,7 +206,7 @@ def test_load_back_proves_the_chain_before_it_is_queued():
     """The real ``UnifiedRadixCache._1424_verify_load_chain`` on the tree's
     own objects: the kv transfer's host indices and the node's host value
     come back re-pointed, keys run through the store's stem suffix."""
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
     arena = _Arena({"a#": 0, "b#": 2, "c#": 1})
     pool = _chain_pool(arena)

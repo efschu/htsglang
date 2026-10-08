@@ -6,17 +6,17 @@ import unittest
 
 import jsonschema
 
-from sglang.srt.entrypoints.openai.protocol import (
+from flliper.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
-from sglang.srt.function_call.utils import (
+from flliper.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")

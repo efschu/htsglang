@@ -1,4 +1,4 @@
-"""Stub CUDA-only deps before importing sglang.srt serving modules. Must
+"""Stub CUDA-only deps before importing flliper.srt serving modules. Must
 be imported first by every /v1/responses test that runs on CPU."""
 
 try:
@@ -16,7 +16,7 @@ except ImportError:
     torch = None
     _ORIGINAL_TORCH_COMPILE = None
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -24,8 +24,8 @@ import json
 from typing import AsyncIterator
 from unittest.mock import Mock
 
-from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
     est_time=0,

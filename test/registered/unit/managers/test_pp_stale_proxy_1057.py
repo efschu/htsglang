@@ -27,7 +27,7 @@ and reproduce the window death exactly.
 
 import pytest
 
-from sglang.srt.distributed.pp_typed_channel import (
+from flliper.srt.distributed.pp_typed_channel import (
     _INBOX_ATTR,
     stash_typed,
     take_typed,

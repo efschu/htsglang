@@ -15,14 +15,14 @@ a GPU. The load-bearing invariants:
 
 import unittest
 
-from sglang.srt.planner.placement import (
+from flliper.srt.planner.placement import (
     PlacementFlags,
     _build_cost_model,
     compute_placement,
     compute_placement_struct,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 

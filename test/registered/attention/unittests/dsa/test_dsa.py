@@ -4,13 +4,13 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.attention_unittest.attention_methods.dsa_attention import (
     DSA_DECODE_IMPL_VARIANTS,
     DSA_PAGE_SIZE,
     DSA_PREFILL_IMPL_VARIANTS,
@@ -28,10 +28,10 @@ from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import 
     run_dsa_sparse_tilelang_decode_case,
     run_dsa_sparse_tilelang_prefill_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dsa_sparse_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_dsa_eagle_draft_cuda_graph_runner_case,
 )
 
@@ -375,7 +375,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
     # raw uint8 K buffer bytes, which round-trip correctly across
     # capture/replay regardless of bf16 vs FP8 packing.
     def test_sparse_fp8_cuda_graph_decode_case(self):
-        from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
+        from flliper.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
             run_dsa_sparse_cuda_graph_decode_case,
         )
 

@@ -1,16 +1,16 @@
 """Fp8MoEMethod builds a triton runner when the global MoE runner backend is
 flashinfer_cutlass or flashinfer_cutedsl, which have no fp8 MoE path."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.layers.quantization.fp8 as fp8
-from sglang.srt.layers.moe import MoeRunnerBackend, MoeRunnerConfig
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.layers.quantization.fp8 as fp8
+from flliper.srt.layers.moe import MoeRunnerBackend, MoeRunnerConfig
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestFp8MoeRunnerFallback(CustomTestCase):

@@ -1,6 +1,6 @@
-"""Benchmark FP4 quantize: sglang jit_kernel vs flashinfer.
+"""Benchmark FP4 quantize: flliper jit_kernel vs flashinfer.
 
-Compares ``sglang.jit_kernel.nvfp4.scaled_fp4_quant`` against
+Compares ``flliper.jit_kernel.nvfp4.scaled_fp4_quant`` against
 ``flashinfer.fp4_quantize`` over a sweep of (M, K) shapes.
 
 Timing uses ``flashinfer.testing.bench_gpu_time`` (CUDA-graph based with
@@ -15,7 +15,7 @@ import torch
 from flashinfer import fp4_quantize as flashinfer_fp4_quantize
 from flashinfer.testing import bench_gpu_time
 
-from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
+from flliper.jit_kernel.nvfp4 import scaled_fp4_quant
 
 Ms = [1, 8, 32, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 Ks = [128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 8192, 16384]
@@ -36,7 +36,7 @@ def benchmark(M: int, K: int, dtype: torch.dtype, device: str):
     x = torch.randn(M, K, device=device, dtype=dtype)
     global_scale = torch.ones(1, device=device, dtype=torch.float32)
 
-    sglang_ms = _bench(
+    flliper_ms = _bench(
         lambda x, gs: scaled_fp4_quant(x, gs),
         input_args=(x, global_scale),
     )
@@ -45,7 +45,7 @@ def benchmark(M: int, K: int, dtype: torch.dtype, device: str):
         input_args=(x, global_scale),
     )
 
-    return sglang_ms, flashinfer_ms
+    return flliper_ms, flashinfer_ms
 
 
 def plot_speedup(rows, path):
@@ -79,7 +79,7 @@ def plot_speedup(rows, path):
     ax.set_yticklabels(Ms_unique)
     ax.set_xlabel("K")
     ax.set_ylabel("M")
-    ax.set_title("Speedup: flashinfer / sglang  (>1 means sglang faster)")
+    ax.set_title("Speedup: flashinfer / flliper  (>1 means flliper faster)")
     for i in range(len(Ms_unique)):
         for j in range(len(Ks_unique)):
             v = grid[i, j]
@@ -103,28 +103,28 @@ def main():
 
     rows = []
     header = (
-        f"{'M':>8} {'K':>8} {'sglang(us)':>12} {'flashinfer(us)':>16} {'speedup':>10}"
+        f"{'M':>8} {'K':>8} {'flliper(us)':>12} {'flashinfer(us)':>16} {'speedup':>10}"
     )
     print(header)
     print("-" * len(header))
 
     for M, K in itertools.product(Ms, Ks):
         try:
-            sglang_ms, flashinfer_ms = benchmark(M, K, dtype, args.device)
+            flliper_ms, flashinfer_ms = benchmark(M, K, dtype, args.device)
         except Exception as e:
             print(f"{M:>8} {K:>8}  skipped: {e}")
             continue
-        sglang_us = sglang_ms * 1e3
+        flliper_us = flliper_ms * 1e3
         flashinfer_us = flashinfer_ms * 1e3
-        speedup = flashinfer_us / sglang_us
+        speedup = flashinfer_us / flliper_us
         print(
-            f"{M:>8} {K:>8} {sglang_us:>12.3f} {flashinfer_us:>16.3f} {speedup:>10.3f}"
+            f"{M:>8} {K:>8} {flliper_us:>12.3f} {flashinfer_us:>16.3f} {speedup:>10.3f}"
         )
-        rows.append((M, K, sglang_us, flashinfer_us, speedup))
+        rows.append((M, K, flliper_us, flashinfer_us, speedup))
 
     if args.csv:
         with open(args.csv, "w") as f:
-            f.write("M,K,sglang_us,flashinfer_us,speedup_flashinfer_over_sglang\n")
+            f.write("M,K,flliper_us,flashinfer_us,speedup_flashinfer_over_flliper\n")
             for M, K, s, fi, sp in rows:
                 f.write(f"{M},{K},{s:.6f},{fi:.6f},{sp:.6f}\n")
         print(f"Saved CSV to {args.csv}")

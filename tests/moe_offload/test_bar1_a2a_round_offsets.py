@@ -5,7 +5,7 @@ import os
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.distributed.device_communicators import barlink_bar1 as bb
+from flliper.srt.distributed.device_communicators import barlink_bar1 as bb
 
 
 def _rounds_seen(send_bytes, recv_bytes, slot):

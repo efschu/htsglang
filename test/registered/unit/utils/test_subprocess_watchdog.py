@@ -20,9 +20,9 @@ import threading
 import time
 import unittest.mock
 
-from sglang.srt.utils.watchdog import SubprocessWatchdog
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils.watchdog import SubprocessWatchdog
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_cpu_ci(est_time=9, suite="base-c-test-cpu")
@@ -180,7 +180,7 @@ class TestTheWatchdogSaysHowTheChildDied(CustomTestCase):
     def _sweep(self, procs, names):
         """One synchronous sweep, so the assertion is on the RECORD it wrote."""
         self._monitor = SubprocessWatchdog(processes=procs, process_names=names)
-        with self.assertLogs("sglang.srt.utils.watchdog", level="ERROR") as cm:
+        with self.assertLogs("flliper.srt.utils.watchdog", level="ERROR") as cm:
             self._monitor._check_processes()
         return "\n".join(cm.output)
 
@@ -244,7 +244,7 @@ class TestTheWatchdogSaysHowTheChildDied(CustomTestCase):
         proc = self._spawn(healthy_worker)
         self._monitor = SubprocessWatchdog(processes=[proc], process_names=["live"])
         with unittest.mock.patch.object(
-            __import__("sglang.srt.utils.watchdog", fromlist=["logger"]), "logger"
+            __import__("flliper.srt.utils.watchdog", fromlist=["logger"]), "logger"
         ) as log:
             self.assertFalse(self._monitor._check_processes())
             log.error.assert_not_called()
@@ -255,7 +255,7 @@ class TestTheWatchdogSaysHowTheChildDied(CustomTestCase):
         proc = self._spawn(noop_worker)
         proc.join(timeout=5)
         self._monitor = SubprocessWatchdog(processes=[proc], process_names=["s0"])
-        with self.assertLogs("sglang.srt.utils.watchdog", level="ERROR") as cm:
+        with self.assertLogs("flliper.srt.utils.watchdog", level="ERROR") as cm:
             self._monitor._check_processes()
             first = len(cm.output)
             self._monitor._check_processes()

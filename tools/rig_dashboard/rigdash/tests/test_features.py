@@ -35,7 +35,7 @@ def _commit(repo, name, text, msg):
 def _boot(root, boot_id, lifecycle, groups=None, profile="nf-test", rev="", image="htsglang:cu130-weg2-rc12z30p-27b-nf"):
     d = os.path.join(root, boot_id)
     os.makedirs(d, exist_ok=True)
-    st = {"schema": "weg2.state/1", "kind": "boot", "boot_id": boot_id, "rev": rev, "image": image,
+    st = {"schema": "pdflip.state/1", "kind": "boot", "boot_id": boot_id, "rev": rev, "image": image,
           "profile": profile, "lifecycle": {"state": lifecycle}, "groups": groups or {}}
     with open(os.path.join(d, "state.json"), "w") as fh:
         json.dump(st, fh)
@@ -92,7 +92,7 @@ class GitCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             nf, b27 = os.path.join(t, "nf"), os.path.join(t, "27b")
             _boot(nf, "nf-boot-1", "serving", rev=self.rev, groups={
-                "D": {"state": "ready", "launch": {"argv": ["--x"], "env": {"SGLANG_A": "1"}}},
+                "D": {"state": "ready", "launch": {"argv": ["--x"], "env": {"FLLIPER_A": "1"}}},
                 "P": {"state": "ready", "launch": {"argv": [], "env": {}}}})
             _boot(b27, "27b-boot-1", "dead", rev=self.rev, image="htsglang:cu130-weg2-rc12z30j-27b-nf")
             os.symlink("27b-boot-1", os.path.join(b27, "current"))
@@ -101,10 +101,10 @@ class GitCase(unittest.TestCase):
                 json.dump({"features": [
                     {"id": "A", "modell": "NF", "titel": "a", "fertig": True,
                      "zweige": [{"branch": "line", "sha": self.anc}],
-                     "schalter": [{"name": "SGLANG_A", "art": "env", "gruppe": "D", "an_wert": "1", "default": "aus"}]},
+                     "schalter": [{"name": "FLLIPER_A", "art": "env", "gruppe": "D", "an_wert": "1", "default": "aus"}]},
                     {"id": "B", "modell": "beide", "titel": "b", "fertig": True,
                      "zweige": [{"branch": "feat", "sha": self.picked_orig}],
-                     "schalter": [{"name": "SGLANG_B", "art": "env", "gruppe": "P", "an_wert": "1", "default": "aus"}],
+                     "schalter": [{"name": "FLLIPER_B", "art": "env", "gruppe": "P", "an_wert": "1", "default": "aus"}],
                      "aus_begruendung": "noch kein A/B",
                      "gewinn": [{"metrik": "Flipzeit", "nachher": "2.4", "einheit": "s", "art": "gemessen", "modell": "NF"},
                                 {"metrik": "Decode", "nachher": "40", "einheit": "tok/s", "art": "gemessen"}]},
@@ -134,22 +134,22 @@ class GitCase(unittest.TestCase):
 
 class AktivCase(unittest.TestCase):
     ST = {"groups": {
-        "P": {"launch": {"argv": ["--p-host-overlap", "--chunk", "16384"], "env": {"SGLANG_X": "1"}}},
-        "D": {"launch": {"argv": ["--d-kv-token-cut=owned"], "env": {"SGLANG_X": "0", "SGLANG_Y": "ptx"}}}}}
+        "P": {"launch": {"argv": ["--p-host-overlap", "--chunk", "16384"], "env": {"FLLIPER_X": "1"}}},
+        "D": {"launch": {"argv": ["--d-kv-token-cut=owned"], "env": {"FLLIPER_X": "0", "FLLIPER_Y": "ptx"}}}}}
 
-    def sw(self, name, gruppe, an_wert="", default="aus", art=None):
+    def sw(self, name, proc_group, an_wert="", default="aus", art=None):
         return features.switch_state({"name": name, "art": art or ("flag" if name.startswith("--") else "env"),
-                                      "gruppe": gruppe, "an_wert": an_wert, "default": default}, self.ST, None)
+                                      "gruppe": proc_group, "an_wert": an_wert, "default": default}, self.ST, None)
 
     def test_env_per_group_and_both(self):
-        self.assertEqual(self.sw("SGLANG_X", "P", "1")["state"], "an")
-        self.assertEqual(self.sw("SGLANG_X", "D", "1")["state"], "aus")
-        self.assertEqual(self.sw("SGLANG_X", "beide", "1")["state"], "teilweise")
-        self.assertEqual(self.sw("SGLANG_Y", "D", "ptx")["state"], "an")
+        self.assertEqual(self.sw("FLLIPER_X", "P", "1")["state"], "an")
+        self.assertEqual(self.sw("FLLIPER_X", "D", "1")["state"], "aus")
+        self.assertEqual(self.sw("FLLIPER_X", "beide", "1")["state"], "teilweise")
+        self.assertEqual(self.sw("FLLIPER_Y", "D", "ptx")["state"], "an")
 
     def test_absent_switch_takes_its_default(self):
-        self.assertEqual(self.sw("SGLANG_NONE", "D", "1", default="an")["state"], "an")
-        self.assertEqual(self.sw("SGLANG_NONE", "D", "1", default="aus")["state"], "aus")
+        self.assertEqual(self.sw("FLLIPER_NONE", "D", "1", default="an")["state"], "an")
+        self.assertEqual(self.sw("FLLIPER_NONE", "D", "1", default="aus")["state"], "aus")
 
     def test_flags_presence_and_value(self):
         self.assertEqual(self.sw("--p-host-overlap", "P")["state"], "an")
@@ -157,20 +157,20 @@ class AktivCase(unittest.TestCase):
         self.assertEqual(self.sw("--chunk", "P", "8192")["state"], "aus")
 
     def test_profile_fallback_ignores_comments(self):
-        prof = ('NF_ENV_D="SGLANG_A=1;SGLANG_B=0"   # SGLANG_C=1 steht nur im Kommentar\n'
-                '# SGLANG_D=1 ganz auskommentiert\n  --max-kv-per-request 262144\n')
+        prof = ('NF_ENV_D="FLLIPER_A=1;FLLIPER_B=0"   # FLLIPER_C=1 steht nur im Kommentar\n'
+                '# FLLIPER_D=1 ganz auskommentiert\n  --max-kv-per-request 262144\n')
         text = features.strip_comments(prof)
         st = lambda n, w="1", art="env": features.switch_state(
             {"name": n, "art": art, "gruppe": "D", "an_wert": w, "default": "aus"}, {"groups": {}}, text)
-        self.assertEqual(st("SGLANG_A")["state"], "an")
-        self.assertEqual(st("SGLANG_B")["state"], "aus")
-        self.assertEqual(st("SGLANG_C")["state"], "aus")
-        self.assertEqual(st("SGLANG_D")["state"], "aus")
+        self.assertEqual(st("FLLIPER_A")["state"], "an")
+        self.assertEqual(st("FLLIPER_B")["state"], "aus")
+        self.assertEqual(st("FLLIPER_C")["state"], "aus")
+        self.assertEqual(st("FLLIPER_D")["state"], "aus")
         self.assertEqual(st("--max-kv-per-request", "524288", "flag")["state"], "aus")
-        self.assertIn("Profil", st("SGLANG_A")["src"])
+        self.assertIn("Profil", st("FLLIPER_A")["src"])
 
     def test_no_state_no_profile_is_unknown(self):
-        r = features.switch_state({"name": "SGLANG_A", "art": "env", "gruppe": "D", "default": "aus"}, None, None)
+        r = features.switch_state({"name": "FLLIPER_A", "art": "env", "gruppe": "D", "default": "aus"}, None, None)
         self.assertEqual(r["state"], "unbekannt")
 
 
@@ -194,7 +194,7 @@ class FileAndCliCase(unittest.TestCase):
             p = os.path.join(t, "f.json")
             run = lambda *a: features_update.main(["--file", p, *a])
             run("set", "--id", "H1", "--modell", "beide", "--titel", "t", "--fertig", "ja",
-                "--zweig", "desk/x=0123456789", "--schalter", "SGLANG_H1=env:D:1:aus")
+                "--zweig", "desk/x=0123456789", "--schalter", "FLLIPER_H1=env:D:1:aus")
             run("add-zweig", "--id", "H1", "--zweig", "desk/27b-unified-0926=abcdef0123")
             with self.assertRaises(SystemExit):   # modell=beide: a gain without modell is refused
                 run("gewinn", "--id", "H1", "--metrik", "Flipzeit", "--nachher", "2.4", "--art", "gemessen")
@@ -207,7 +207,7 @@ class FileAndCliCase(unittest.TestCase):
             f = d["features"][0]
             self.assertEqual([z["sha"] for z in f["zweige"]], ["0123456789", "abcdef0123"])
             self.assertEqual([(g["metrik"], g["nachher"]) for g in f["gewinn"]], [("Flipzeit", "2.2")])
-            self.assertEqual(f["schalter"][0], {"name": "SGLANG_H1", "art": "env", "gruppe": "D",
+            self.assertEqual(f["schalter"][0], {"name": "FLLIPER_H1", "art": "env", "gruppe": "D",
                                                 "an_wert": "1", "default": "aus"})
             self.assertEqual(features.validate(d["features"]), [])
 
@@ -218,7 +218,7 @@ SAMPLE_27B = """# 27B-Ist-Werte (Stand 29.09.2026 ~07:10Z)
 
 | F | Feature | Status | Ist-Wert | Beleg / Grund |
 |---|---|---|---|---|
-| 1 | Flip | fertig+aktiv | flip_total **2167 ms** | z30j front.log `WEG2-FLIP` |
+| 1 | Flip | fertig+aktiv | flip_total **2167 ms** | z30j front.log `PDFLIP-FLIP` |
 | 2 | Heterogen | INT8 fertig+aktiv; NVFP4 im Image aus | TP3 | z30j |
 | 3 | nicht im Produkt | offen | – | – |
 

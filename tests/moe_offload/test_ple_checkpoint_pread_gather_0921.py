@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.srt.models import qwen4_exp_ple_table as pt
+from flliper.srt.models import qwen4_exp_ple_table as pt
 
 DIM = 16
 SHARD_ROWS = 1000
@@ -104,7 +104,7 @@ def test_factory_is_off_by_default_and_reads_the_env(tmp_path, monkeypatch):
     assert pt.make_ple_checkpoint_pread_gather(table) is None
     monkeypatch.setenv(pt.PLE_CKPT_GATHER_ENV, "pread")
     monkeypatch.setenv(pt.PLE_CKPT_PREAD_WORKERS_ENV, "7")
-    monkeypatch.setenv("SGLANG_QWEN4_PLE_PREFETCH_MIN_ROWS", "123")
+    monkeypatch.setenv("FLLIPER_QWEN4_PLE_PREFETCH_MIN_ROWS", "123")
     g = pt.make_ple_checkpoint_pread_gather(table)
     assert g is not None and g.min_rows == 123 and g._workers == 7
     g.close()
@@ -116,7 +116,7 @@ def test_factory_is_off_by_default_and_reads_the_env(tmp_path, monkeypatch):
 def test_the_model_routes_prefill_gathers_to_pread():
     import inspect
 
-    from sglang.srt.models import qwen4_exp as m
+    from flliper.srt.models import qwen4_exp as m
 
     src = inspect.getsource(m)
     assert "self._ckpt_pread = make_ple_checkpoint_pread_gather(table)" in src

@@ -1,11 +1,11 @@
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.performance_test_runner import PerformanceTestParams
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from flliper.srt.environ import envs
+from flliper.test.accuracy_test_runner import AccuracyTestParams
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.performance_test_runner import PerformanceTestParams
+from flliper.test.run_combined_tests import run_combined_tests
+from flliper.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # Runs on both Hopper and Blackwell via nightly-8-gpu-common suite
 register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
@@ -77,7 +77,7 @@ class TestNvidiaNemotron3SuperNightly(unittest.TestCase):
             ),
         ]
 
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0):
+        with envs.FLLIPER_ENABLE_ASYNC_ASSERT.override(0):
             run_combined_tests(
                 models=variants,
                 test_name="Nemotron-3-Super-120B-BF16",
@@ -114,7 +114,7 @@ class TestNvidiaNemotron3SuperNightly(unittest.TestCase):
             ),
         ]
 
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0):
+        with envs.FLLIPER_ENABLE_ASYNC_ASSERT.override(0):
             run_combined_tests(
                 models=variants,
                 test_name="Nemotron-3-Super-120B-NVFP4",

@@ -16,7 +16,7 @@
 WHY THIS IS NOT COSMETIC. Three times on 2026-08-22 a diagnostic rather than a
 mechanism set this chain's direction, and this line is the clearest instance
 left. It names two causes -- "the arena has no commit chunk, or its handles are
-retained (SGLANG_FLIP_SEAM_RETAIN_HANDLES)" -- separates them in neither code
+retained (FLLIPER_FLIP_SEAM_RETAIN_HANDLES)" -- separates them in neither code
 nor fact, and on boot_798_0822_0810.log is wrong about both:
 
   * A CHUNKLESS ARENA CANNOT REACH THIS LINE. Registration refuses outright
@@ -49,7 +49,7 @@ import logging
 import unittest
 from unittest import mock
 
-from sglang.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import kv_backing_relief as kbr
 
 ROW_BYTES = 32_768
 BUFFERS = 28
@@ -179,7 +179,7 @@ class TestTheRefusalReportsMeasuredState(unittest.TestCase):
 
     def test_retention_is_reported_as_a_number_not_as_an_env_var(self):
         with mock.patch(
-            "sglang.srt.mem_cache.kv_vmm_backing.arena_census",
+            "flliper.srt.mem_cache.kv_vmm_backing.arena_census",
             return_value={
                 0: {
                     "reserved": 8 << 30,
@@ -196,7 +196,7 @@ class TestTheRefusalReportsMeasuredState(unittest.TestCase):
             f"arena_census() measures retention; print it. Got {msg!r}",
         )
         self.assertNotIn(
-            "SGLANG_FLIP_SEAM_RETAIN_HANDLES",
+            "FLLIPER_FLIP_SEAM_RETAIN_HANDLES",
             msg,
             "naming an env var the reader must go and check is strictly worse "
             "than printing the number it controls",
@@ -205,7 +205,7 @@ class TestTheRefusalReportsMeasuredState(unittest.TestCase):
     def test_an_unreadable_census_says_unknown_rather_than_inventing_one(self):
         """A census that cannot be read must not become a confident zero."""
         with mock.patch(
-            "sglang.srt.mem_cache.kv_vmm_backing.arena_census",
+            "flliper.srt.mem_cache.kv_vmm_backing.arena_census",
             side_effect=RuntimeError("registry gone"),
         ):
             msg = _warn(_relief(claimed_bytes=0)).lower()

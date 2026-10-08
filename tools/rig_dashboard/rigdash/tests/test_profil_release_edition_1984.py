@@ -7,7 +7,7 @@ Nutzer-Entscheid 05.10.: der Profil-Editor kommt INS Release.  Gepinnt:
 * Routen: Editor (list/modelle/load/edit/save/delete/export/dry), Balken (recompute), Hardwareprofil ANZEIGEN (GET), Modellprofil
   schaetzen sind in Release erreichbar -- im LAN, ueber den oeffentlichen Proxy weiter 403.
 * Rig-Eingriffe bleiben in Release zu: Hardware MESSEN und Fenster zurueckgeben (bucht gpuq) -> 403 mit Klartext, keine Buchung;
-  Kartenplaner, Startzeile, /api/launch, /api/weg2/* -> 404.
+  Kartenplaner, Startzeile, /api/launch, /api/pdflip/* -> 404.
 * hwprofil.js: in Release ist der Messknopf aus und sagt "needs gpuq".
 """
 
@@ -94,7 +94,7 @@ class Served(unittest.TestCase):
         self.ed, self.rel, self.usr = P9.editor(self.tmp)
         self.gq = H.FakeGpuq()
         self.hw_tree = os.path.join(self.tmp, "hwtree")
-        d = os.path.join(self.hw_tree, "sglang", "srt", "rigmon")
+        d = os.path.join(self.hw_tree, "flliper", "srt", "rigmon")
         os.makedirs(d)
         with open(os.path.join(d, "hardware_profile.py"), "w") as fh:
             fh.write(H.STUB_MODULE)
@@ -215,8 +215,8 @@ class TestReleaseRigActionsStayClosed(Served):
         self.assertEqual(self.gq.log, [])
 
     def test_planer_launch_wizard_and_dev_state_stay_404(self):
-        for method, path in (("GET", "/api/kartenplan/catalog"), ("GET", "/kartenplan.js"), ("GET", "/weg2"), ("GET", "/api/launch"),
-                             ("GET", "/api/weg2/options"), ("GET", "/api/weg2/dry")):
+        for method, path in (("GET", "/api/kartenplan/catalog"), ("GET", "/kartenplan.js"), ("GET", "/pdflip"), ("GET", "/api/launch"),
+                             ("GET", "/api/pdflip/options"), ("GET", "/api/pdflip/dry")):
             self.assertEqual(self.call(method, path)[0], 404, path)
 
 

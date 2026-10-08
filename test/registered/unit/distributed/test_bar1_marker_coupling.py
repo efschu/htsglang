@@ -110,7 +110,7 @@ class TestS11RegexesAgainstTheRealEmitters:
 class TestS12RegexAgainstTheRealEmitter:
     def test_re_bar1_setup_matches_and_extracts_the_geometry(self):
         line = src.render_setup_line(
-            dauer_ms=324, peer_targets=2, region_mib=96.0,
+            duration_ms=324, peer_targets=2, region_mib=96.0,
             slots_desc="12 slots (of which 2(R-1) for all_to_all)",
             slot_kib=8188, payload_kib=24564,
         )
@@ -124,9 +124,9 @@ class TestS12RegexAgainstTheRealEmitter:
         assert d["schlitz_kib"] == "8188"
         assert d["max_nutzlast_kib"] == "24564"
 
-    def test_parse_bar1_geometrie_end_to_end(self):
+    def test_parse_bar1_geometry_end_to_end(self):
         line = src.render_setup_line()
-        out = s12.parse_bar1_geometrie([line])
+        out = s12.parse_bar1_geometry([line])
         assert out is not None
         assert out["peers"] == 2
         assert out["schlitze"] == 12
@@ -259,7 +259,7 @@ class TestShellHarvestMarkersAgainstTheRealEmitters:
 
 
 class TestS13StringChecksAgainstTheRealEmitters:
-    def test_bar1_gruppen_marker_matches_a_real_setup_line(self):
+    def test_bar1_group_marker_matches_a_real_setup_line(self):
         text = _read("s13_auswertung.py")
         m = re.search(r'text\.count\("([^"]+)"\)', text)
         assert m, "s13_auswertung.py: bar1_gruppen marker literal not found"
@@ -269,7 +269,7 @@ class TestS13StringChecksAgainstTheRealEmitters:
             f"a real setup line: {_SETUP_LINE_SAMPLE!r}"
         )
 
-    def test_vorrat_leer_marker_matches_the_real_pool_exhausted_line(self):
+    def test_supply_empty_marker_matches_the_real_pool_exhausted_line(self):
         text = _read("s13_auswertung.py")
         m = re.search(r'"vorrat_leer": \(\s*"([^"]+)" in text', text)
         assert m, "s13_auswertung.py: vorrat_leer marker literal not found"

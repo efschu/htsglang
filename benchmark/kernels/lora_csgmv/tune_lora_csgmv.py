@@ -58,14 +58,14 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.gemm.chunked_sgmv_expand import _chunked_lora_expand_kernel
-from sglang.kernels.ops.gemm.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
-from sglang.kernels.ops.gemm.lora_tuning_config import (
+from flliper.kernels.ops.gemm.chunked_sgmv_expand import _chunked_lora_expand_kernel
+from flliper.kernels.ops.gemm.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
+from flliper.kernels.ops.gemm.lora_tuning_config import (
     DEFAULT_EXPAND_CONFIG,
     DEFAULT_SHRINK_CONFIG,
     get_lora_config_file_name,
 )
-from sglang.srt.lora.utils import LoRABatchInfo
+from flliper.srt.lora.utils import LoRABatchInfo
 
 
 def _get_raw_kernel(cached_kernel):
@@ -361,7 +361,7 @@ def save_config(
         "..",
         "..",
         "python",
-        "sglang",
+        "flliper",
         "kernels",
         "ops",
         "gemm",

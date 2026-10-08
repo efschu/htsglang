@@ -14,9 +14,9 @@ the call and publishes the summary the real `readmit_seam_residents` publishes.
 import types
 import unittest
 
-from sglang.srt.managers import phase_flip_runtime as pfr
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import phase_flip_runtime as pfr
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

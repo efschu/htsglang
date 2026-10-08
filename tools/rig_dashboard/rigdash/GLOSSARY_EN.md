@@ -4,12 +4,12 @@ Merge note (part 4): Part 1 (static JS/HTML) and Part 2 (Python texts) each crea
 below unchanged, Part 2 table first as "Python-text terms", then the Part 1 sections. Where both define the same German
 term the English wording agrees except: `unbelegt` (Part 2: unverified / Part 1: unverified), `Vorschlag` (proposal in both),
 `Verdikt` (verdict in both; Part 1 lists "judgement / verdict" for Urteil). The catalog glossary lives separately in
-`python/sglang/srt/weg2/GLOSSARY_EN.md`.
+`python/flliper/srt/pdflip/GLOSSARY_EN.md`.
 
 ## Part 2: Python-text terms
 
 One English term per German term, used by the UI (static/*.js, index.html), the Python texts (rigdash/*.py,
-weg2/propose*.py, planner/profile_couplings.py) and the catalog texts. Machine-readable names (JSON keys, flags,
+pdflip/propose*.py, planner/profile_couplings.py) and the catalog texts. Machine-readable names (JSON keys, flags,
 env names, refusal codes, enum values such as `zustand`/`force_state`) are NOT translated.
 
 | German | English |
@@ -75,7 +75,7 @@ env names, refusal codes, enum values such as `zustand`/`force_state`) are NOT t
 
 ## Part 1: UI terms (rigdash)
 
-Single word list for the English UI. Part 1 (static JS/HTML) created it; Part 2 (Python texts, `weg2/propose*.py`,
+Single word list for the English UI. Part 1 (static JS/HTML) created it; Part 2 (Python texts, `pdflip/propose*.py`,
 `profile_couplings.py`) and Part 3 (catalog files) append to it and use the same terms. Style: terse developer English.
 
 Not translated (API contract `flliper.*/1`, logic keys, CSS): JSON keys and field names (`werte`, `herkunft`, `verdikt`,
@@ -190,7 +190,7 @@ Numbers use `en-US` (`1,234.5`), clock times `en-GB` (24 h). The decimal comma i
 
 | DE | EN | Where |
 |---|---|---|
-| Wert-Ablehnung (forcebar) / nicht forcebar | value refusal (forceable) / not forceable | `weg2/refusals.py` `CLASS_LABEL`, `force_scope` (register display texts; codes, `klass` keys, `source`, `enforced_by` unchanged) |
+| Wert-Ablehnung (forcebar) / nicht forcebar | value refusal (forceable) / not forceable | `pdflip/refusals.py` `CLASS_LABEL`, `force_scope` (register display texts; codes, `klass` keys, `source`, `enforced_by` unchanged) |
 | blockiert / ungeprueft (force_state in the run report) | blocked / unchecked | `profil.py` `_STATE_DISPLAY` (API values stay German) |
 | keiner / belegt / entwicklung (transport, confidence) | none / verified / development | `kartenplan_transport.py` |
 | gerechnet (bar origin) | computed | `profile_couplings.py` |

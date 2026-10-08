@@ -4,9 +4,9 @@ The 27B operator keeps /spinning/gpu-arb/docs/image_changes.json at every delta
 build (user order 28.09.: "im dashboard sollen auch die aktuellen aenderungen am
 boot img aufgelistet werden und die erwartete verbesserung durch den fix"):
 ``images -> <rev, 10 chars> -> {rc, base, built_utc, changes[{id, who, title,
-expected, status, evidence}]}``.  The rev a boot runs is the one its weg2
+expected, status, evidence}]}``.  The rev a boot runs is the one its pdflip
 launcher line names (``tree=/opt/htsglang/src-nf @ f833fcbb2d``, parsed into
-``meta.sha``/``meta.tree`` by live.py) -- the same rev the image's sglang
+``meta.sha``/``meta.tree`` by live.py) -- the same rev the image's flliper
 version carries.  Pure except for ``ImageChanges.load`` (one stat per call,
 reread only when the file changed).
 """

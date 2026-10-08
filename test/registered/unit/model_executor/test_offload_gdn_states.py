@@ -12,7 +12,7 @@ Hermetic unit tests (no GPU, no CUDA; fakes/meta tensors only) for:
 * the per-set size model from real tensor shapes (fakes + meta tensors),
 * the MambaPool adapter incl. the allocator activity probe,
 * ServerArgs parsing of the new flags,
-* flag off (SGLANG_OFFLOAD_REGISTER unset) = zero behavior.
+* flag off (FLLIPER_OFFLOAD_REGISTER unset) = zero behavior.
 """
 
 import dataclasses
@@ -21,7 +21,7 @@ import unittest
 from typing import List, Optional
 from unittest.mock import patch
 
-from sglang.srt.model_executor.offload_gdn_states import (
+from flliper.srt.model_executor.offload_gdn_states import (
     GDN_STATE_SET_CLASS,
     SessionSetLadder,
     attach_state_set_activity_probe,
@@ -30,14 +30,14 @@ from sglang.srt.model_executor.offload_gdn_states import (
     register_mamba_state_sets,
     state_set_item_id,
 )
-from sglang.srt.model_executor.offload_register import (
+from flliper.srt.model_executor.offload_register import (
     CpuFakeMovementBackend,
     OffloadRegister,
     get_global_register,
     reset_global_register,
     resolve_class_policies,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -253,7 +253,7 @@ class TestAdmissionBoundaryHook(unittest.TestCase):
         self.assertEqual(plan.skipped[state_set_item_id(3)], "hot (active session)")
 
     def test_hot_set_park_is_refused_by_the_register_too(self):
-        from sglang.srt.model_executor.offload_register import OffloadRefused
+        from flliper.srt.model_executor.offload_register import OffloadRefused
 
         clock = _Clock()
         reg = _make_register(clock=clock)
@@ -456,12 +456,12 @@ class TestMambaPoolAdapter(unittest.TestCase):
         self.addCleanup(reset_global_register)
 
     def test_flag_off_registers_nothing(self):
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "0"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "0"}):
             self.assertEqual(register_mamba_state_sets(_FakePool(4)), [])
             self.assertIsNone(get_global_register())
 
     def test_registers_one_item_per_session_slot_never_slot_zero(self):
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
             ids = register_mamba_state_sets(_FakePool(4))
             self.assertEqual(ids, [state_set_item_id(s) for s in (1, 2, 3, 4)])
             reg = get_global_register()
@@ -475,16 +475,16 @@ class TestMambaPoolAdapter(unittest.TestCase):
                 self.assertEqual(item.size_bytes, 100 * 2 + 200 * 2)
 
     def test_without_probe_every_set_is_hot_the_safe_direction(self):
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
             register_mamba_state_sets(_FakePool(2))
             reg = get_global_register()
             for item in reg.items_of_class(GDN_STATE_SET_CLASS):
                 self.assertTrue(item.hot())
 
     def test_activity_probe_marks_allocated_slots_hot(self):
-        from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+        from flliper.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
             pool = _FakePool(3)
             register_mamba_state_sets(pool)
             allocator = MambaSlotAllocator(size=3, device="cpu")
@@ -506,7 +506,7 @@ class TestMambaPoolAdapter(unittest.TestCase):
         self.assertIsNone(getattr(pool, "_offload_slot_active_fn", None))
 
     def test_ladder_from_global_server_args(self):
-        from sglang.srt.server_args import (
+        from flliper.srt.server_args import (
             ServerArgs,
             set_global_server_args_for_scheduler,
         )
@@ -518,7 +518,7 @@ class TestMambaPoolAdapter(unittest.TestCase):
         )
         set_global_server_args_for_scheduler(args)
         try:
-            with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+            with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
                 register_mamba_state_sets(_FakePool(4))
                 ladder = get_global_register().session_ladder
                 self.assertIsNotNone(ladder)
@@ -529,13 +529,13 @@ class TestMambaPoolAdapter(unittest.TestCase):
             set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     def test_no_ladder_flag_means_no_ladder(self):
-        from sglang.srt.server_args import (
+        from flliper.srt.server_args import (
             ServerArgs,
             set_global_server_args_for_scheduler,
         )
 
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
             register_mamba_state_sets(_FakePool(4))
             self.assertIsNone(get_global_register().session_ladder)
 
@@ -544,15 +544,15 @@ class TestMambaPoolAdapter(unittest.TestCase):
         the pool constructor books one item per session slot with the true
         per-set byte figure."""
 
-        from sglang.srt.configs.mamba_utils import (
+        from flliper.srt.configs.mamba_utils import (
             Mamba2CacheParams,
             Mamba2StateShape,
         )
-        from sglang.srt.environ import envs
-        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from flliper.srt.environ import envs
+        from flliper.srt.mem_cache.memory_pool import MambaPool
 
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
-            with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
+            with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
                 shape = Mamba2StateShape.create(
                     tp_world_size=1,
                     intermediate_size=512,
@@ -592,7 +592,7 @@ class TestServerArgsFlags(unittest.TestCase):
     lane-offload flag tests), so the handler is driven explicitly."""
 
     def _args(self, **kwargs):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         return ServerArgs(model_path="dummy", **kwargs)
 
@@ -627,7 +627,7 @@ class TestServerArgsFlags(unittest.TestCase):
     def test_cli_roundtrip(self):
         import argparse
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)

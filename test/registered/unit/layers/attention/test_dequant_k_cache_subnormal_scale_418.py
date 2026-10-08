@@ -68,8 +68,8 @@ os.environ.setdefault("TRITON_INTERPRET", "1")
 
 import torch  # noqa: E402
 
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -108,7 +108,7 @@ def _subnormal_product_codes() -> set:
 
 def _build_cache(page_size: int, scale_byte: int, nope_byte: int):
     """A single page whose token 0 carries one chosen fp8 code and scale."""
-    from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
+    from flliper.srt.layers.attention.dsv4.dequant_k_cache import (
         NOPE_ROPE_BYTES,
         PADDED_SCALE_PER_TOKEN,
     )
@@ -124,7 +124,7 @@ def _build_cache(page_size: int, scale_byte: int, nope_byte: int):
 
 def _run_kernel(cache, page_table, page_size):
     """The shipping Triton path, manual-decode branch forced (no fp8 pointer)."""
-    import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+    import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
     original = dqc.nope_cache_view
     try:
@@ -144,7 +144,7 @@ class TestDequantSubnormalScale(CustomTestCase):
 
     def test_reference_does_not_flush_the_subnormal_scale(self):
         """THE falsifier. On the unfixed reference this value is 0.0."""
-        import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+        import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
         cache, page_table = _build_cache(
             self.page_size, _SUBNORMAL_SCALE_BYTE, _FP8_MAX_BYTE
@@ -160,7 +160,7 @@ class TestDequantSubnormalScale(CustomTestCase):
         self.assertNotEqual(ref[0, 0, 0].item(), 0.0)
 
     def test_reference_and_kernel_agree_on_the_subnormal_scale(self):
-        import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+        import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
         cache, page_table = _build_cache(
             self.page_size, _SUBNORMAL_SCALE_BYTE, _FP8_MAX_BYTE
@@ -177,7 +177,7 @@ class TestDequantSubnormalScale(CustomTestCase):
         test_subnormal_products_are_the_only_remaining_divergence for why the
         rest is deliberately not asserted here.
         """
-        import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+        import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
         checked = 0
         for nope_byte in range(256):
@@ -212,7 +212,7 @@ class TestDequantSubnormalScale(CustomTestCase):
         What IS asserted: the divergence never escapes that regime. If a future
         change makes the two disagree on a normal-product input, this fires.
         """
-        import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+        import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
         diverged = set()
         for nope_byte in range(256):
@@ -236,7 +236,7 @@ class TestDequantSubnormalScale(CustomTestCase):
 
     def test_the_corpus_of_every_scale_encoding(self):
         """All 256 scale bytes, reference vs kernel, exact."""
-        import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+        import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
         for scale_byte in range(256):
             with self.subTest(scale_byte=scale_byte):
@@ -256,7 +256,7 @@ class TestDequantSubnormalScale(CustomTestCase):
         NON-CONFORMANCE shared by both sides, and folding it in here would let
         this test assert that the two agree while both are wrong.
         """
-        import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+        import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
         for scale_byte in range(255):
             with self.subTest(scale_byte=scale_byte):
@@ -279,7 +279,7 @@ class TestDequantSubnormalScale(CustomTestCase):
         between two wrong implementations is worth a name. If this ever starts
         failing because one side moved to NaN, the other must move with it.
         """
-        import sglang.srt.layers.attention.dsv4.dequant_k_cache as dqc
+        import flliper.srt.layers.attention.dsv4.dequant_k_cache as dqc
 
         self.assertTrue(torch.isnan(torch.tensor(_spec_scale(255))))
 

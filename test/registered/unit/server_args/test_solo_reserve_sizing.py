@@ -36,17 +36,17 @@ renumbering and pins the fix.
 CPU only, NVML mocked.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.server_args as server_args_module
-import sglang.srt.utils as sglang_utils
-from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.server_args as server_args_module
+import flliper.srt.utils as flliper_utils
+from flliper.srt.server_args import ServerArgs
+from flliper.test.test_utils import CustomTestCase
 
 # ---------------------------------------------------------------------------
 # The measured arm (INTEGRATION_R3_VALIDATION.md, "NVFP4-Beleg")
@@ -272,8 +272,8 @@ class TestItReadsTheCardTheProcessRunsOn(CustomTestCase):
         """
         import contextlib
 
-        from sglang.srt.registry import nvml as registry_nvml
-        from sglang.srt.registry.nvml import DeviceInfo
+        from flliper.srt.registry import nvml as registry_nvml
+        from flliper.srt.registry.nvml import DeviceInfo
 
         def _bdf(nvml_index):
             return f"00000000:{nvml_index + 1:02X}:00.0"
@@ -405,7 +405,7 @@ class TestItReadsTheCardTheProcessRunsOn(CustomTestCase):
         """NVML is CUDA-only; an XPU/HPU boot has no bridge to cross."""
         args = make_args(rank_auto_reserve_mib=2048, device="xpu")
         with patch.object(
-            sglang_utils, "get_device_memory_capacity", return_value=16384
+            flliper_utils, "get_device_memory_capacity", return_value=16384
         ):
             with self._nvml_rig({0: 0}, self.RIG):
                 args._handle_uneven_tp()
@@ -416,7 +416,7 @@ class TestItStillDefersToTheRankPath(CustomTestCase):
     def test_rank_gpu_id_keeps_owning_the_conversion(self):
         """With ``--rank-gpu-id`` the per-rank budget path converts instead,
         and the reserve keeps its original per-GPU placement meaning."""
-        import sglang.srt.server_args as server_args_module
+        import flliper.srt.server_args as server_args_module
 
         fake = {0: (32768, 30000), 1: (20480, 19000)}
         args = make_args(
@@ -431,7 +431,7 @@ class TestItStillDefersToTheRankPath(CustomTestCase):
             lambda ids: {i: fake[i] for i in sorted(set(ids))},
         ):
             with patch.object(
-                sglang_utils, "get_device_memory_capacity", return_value=32768
+                flliper_utils, "get_device_memory_capacity", return_value=32768
             ):
                 args._handle_uneven_tp()
         # Per-rank fractions, not one card-wide fraction.

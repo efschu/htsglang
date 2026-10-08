@@ -102,19 +102,19 @@ echo "== 6. every recipe through the REAL server-args validator =="
 # BEFORE the window, and record the refusal text as a matrix result.
 export PYTHONPATH="$WT/python"
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
-export SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1 FLLIPER_UNEVEN_DCP_WEIGHTED=1 FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 for r in K0 K1 K2 K3 K4 L1 C1; do
     # Re-derive the argv exactly as boot.sh would, including its env exports.
     line=$(DRY=1 bash "$HERE/boot.sh" "$r" | tail -1)
-    argv=${line#*-m sglang.launch_server }
+    argv=${line#*-m flliper.launch_server }
     envs=""
     case "$r" in
         K2) envs="KVSO_ALLOW_SPEC=1 KVSO_RESUME=1" ;;
-        K3) envs="KVSO_ALLOW_SPEC=1 KVSO_RESUME=1 SGLANG_KVSO_SPILL_GRAPH=1" ;;
+        K3) envs="KVSO_ALLOW_SPEC=1 KVSO_RESUME=1 FLLIPER_KVSO_SPILL_GRAPH=1" ;;
     esac
     out=$(env $envs timeout 180 "$VENV/bin/python" -c '
 import sys
-from sglang.srt.server_args import prepare_server_args
+from flliper.srt.server_args import prepare_server_args
 try:
     prepare_server_args(sys.argv[1:])
     print("ACCEPTED")

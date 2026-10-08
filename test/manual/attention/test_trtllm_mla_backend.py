@@ -5,31 +5,31 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from flliper.srt.runtime_context import get_parallel, get_server_args
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
-from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import (
+from flliper.srt.configs.model_config import AttentionArch
+from flliper.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from flliper.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
-from sglang.srt.layers.attention.utils import get_num_page_per_block_flashmla
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.forward_context import (
+from flliper.srt.layers.attention.utils import get_num_page_per_block_flashmla
+from flliper.srt.layers.radix_attention import RadixAttention
+from flliper.srt.mem_cache.memory_pool import MLATokenToKVPool
+from flliper.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from flliper.srt.model_executor.forward_context import (
     ForwardContext,
     set_forward_context,
 )
-from sglang.srt.server_args import (
+from flliper.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import is_flashinfer_available
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import is_flashinfer_available
+from flliper.test.test_utils import CustomTestCase
 
 # Global configuration for all tests
 DEFAULT_CONFIG = {
@@ -69,7 +69,7 @@ ROPE_SCALING_CONFIG = {
 
 
 def build_rotary_emb(config, device=None):
-    from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+    from flliper.srt.layers.rotary_embedding import get_rope_wrapper
 
     dev = device or config["device"]
     rope_scaling = config.get("rope_scaling", ROPE_SCALING_CONFIG)
@@ -1264,7 +1264,7 @@ class TestTRTLLMMLA(CustomTestCase):
         """Test TRTLLM MLA Triton kernels: pad_draft_extend_query_kernel and unpad_draft_extend_output_kernel."""
 
         # Import the kernels
-        from sglang.srt.layers.attention.trtllm_mla_backend import (
+        from flliper.srt.layers.attention.trtllm_mla_backend import (
             pad_draft_extend_query_kernel,
             unpad_draft_extend_output_kernel,
         )

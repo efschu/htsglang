@@ -1,13 +1,13 @@
 """Unit tests for label_transform — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 import unittest
 
-from sglang.srt.observability.label_transform import (
+from flliper.srt.observability.label_transform import (
     UNKNOWN_PRIORITY_VALUE,
     transform_priority,
 )

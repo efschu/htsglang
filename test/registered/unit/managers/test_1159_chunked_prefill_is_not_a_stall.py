@@ -32,14 +32,14 @@ that neither shrinks nor advances still arms exactly as it does today.
 
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PhasePolicyConfig,
     PhasePolicyInputs,
     PhasePolicyState,
     TP_TO_PP,
     observe_idle,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -89,7 +89,7 @@ def _state(now: float):
 
 
 def _decide(cfg, state, inp):
-    from sglang.srt.managers.phase_policy import _decide_from_load
+    from flliper.srt.managers.phase_policy import _decide_from_load
 
     return _decide_from_load(cfg, state, inp)
 

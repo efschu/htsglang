@@ -9,9 +9,9 @@ import time
 import unittest
 import urllib.request
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -71,7 +71,7 @@ class TestLoadSnapshotNoDP(CustomTestCase):
     def test_zmq_backend(self):
         _launch_and_check(
             self,
-            env={"SGLANG_LOAD_SNAPSHOT_USE_ZMQ": "1"},
+            env={"FLLIPER_LOAD_SNAPSHOT_USE_ZMQ": "1"},
             expected_dp_size=1,
         )
 
@@ -88,7 +88,7 @@ class TestLoadSnapshotNormalDP(CustomTestCase):
         _launch_and_check(
             self,
             other_args=["--dp", "2"],
-            env={"SGLANG_LOAD_SNAPSHOT_USE_ZMQ": "1"},
+            env={"FLLIPER_LOAD_SNAPSHOT_USE_ZMQ": "1"},
             expected_dp_size=2,
         )
 

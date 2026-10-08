@@ -288,7 +288,7 @@ def read_single(run_dir: pathlib.Path, arm: str) -> list:
         if arm == "compute-cal" and compute_policy != "link-proportional-calibrated":
             print(
                 "    WARNING: the calibrated sub-arm ran UNCALIBRATED "
-                "(SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS did not reach the "
+                "(FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS did not reach the "
                 "launcher); it is a duplicate of the 'compute' arm."
             )
 

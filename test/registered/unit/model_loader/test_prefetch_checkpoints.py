@@ -15,15 +15,15 @@ from unittest.mock import patch
 import safetensors.torch
 import torch
 
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.model_loader.loader import DefaultModelLoader
-from sglang.srt.model_loader.weight_utils import (
+from flliper.srt.configs.load_config import LoadConfig, LoadFormat
+from flliper.srt.model_loader.loader import DefaultModelLoader
+from flliper.srt.model_loader.weight_utils import (
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -117,7 +117,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", RecordingExecutor),
             patch("concurrent.futures.wait", side_effect=record_pending_size),
-            patch("sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
+            patch("flliper.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
         ):
             _prefetch_all_checkpoints(paths, num_threads=4)
 
@@ -136,10 +136,10 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
             patch(
-                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                "flliper.srt.model_loader.weight_utils._prefetch_checkpoint_file",
                 side_effect=fail_prefetch,
             ),
-            patch("sglang.srt.model_loader.weight_utils.logger.warning") as warning,
+            patch("flliper.srt.model_loader.weight_utils.logger.warning") as warning,
         ):
             _prefetch_all_checkpoints(paths, num_threads=1)
 
@@ -159,8 +159,8 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch("sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
-            patch("sglang.srt.model_loader.weight_utils.logger.info") as log_info,
+            patch("flliper.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
+            patch("flliper.srt.model_loader.weight_utils.logger.info") as log_info,
         ):
             _prefetch_all_checkpoints(paths, num_threads=1)
 
@@ -187,11 +187,11 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
             patch(
-                "sglang.srt.model_loader.weight_utils.get_world_group",
+                "flliper.srt.model_loader.weight_utils.get_world_group",
                 return_value=FakeWorldGroup(),
             ),
             patch(
-                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                "flliper.srt.model_loader.weight_utils._prefetch_checkpoint_file",
                 side_effect=loaded_paths.append,
             ),
         ):
@@ -205,7 +205,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             paths = self._create_safetensors_files(tmpdir, num_shards=3)
 
             with patch(
-                "sglang.srt.model_loader.weight_utils._drop_file_cache_after_load"
+                "flliper.srt.model_loader.weight_utils._drop_file_cache_after_load"
             ) as drop_cache:
                 loaded = list(
                     buffered_multi_thread_safetensors_weights_iterator(
@@ -271,19 +271,19 @@ class TestPrefetchDispatch(CustomTestCase):
                 return_value=("/dummy", ["f.safetensors"], True),
             ),
             patch(
-                "sglang.srt.model_loader.loader.get_server_args",
+                "flliper.srt.model_loader.loader.get_server_args",
                 return_value=self._server_args(prefetch, disable_mmap),
             ),
             patch(
-                "sglang.srt.model_loader.loader."
+                "flliper.srt.model_loader.loader."
                 "buffered_multi_thread_safetensors_weights_iterator",
                 return_value=iter([]),
             ),
             patch(
-                "sglang.srt.model_loader.loader.safetensors_weights_iterator",
+                "flliper.srt.model_loader.loader.safetensors_weights_iterator",
                 return_value=iter([]),
             ),
-            patch("sglang.srt.model_loader.loader.logger.warning"),
+            patch("flliper.srt.model_loader.loader.logger.warning"),
         )
 
     def test_prefetch_uses_single_thread_for_default_config(self):
@@ -393,7 +393,7 @@ class TestPrefetchDispatch(CustomTestCase):
         )
         with (
             patch(
-                "sglang.srt.model_loader.loader.fastsafetensors_weights_iterator",
+                "flliper.srt.model_loader.loader.fastsafetensors_weights_iterator",
                 return_value=iter([]),
             ) as mock_fast,
             p_prep,

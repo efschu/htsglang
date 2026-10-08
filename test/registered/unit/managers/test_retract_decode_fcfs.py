@@ -45,12 +45,12 @@ import types
 import unittest
 from http import HTTPStatus
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
+from flliper.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -221,11 +221,11 @@ class TestRetractDecodeGivesUpAfterRepeatedSoloOOM(unittest.TestCase):
     """
 
     def test_bounded_retries_then_a_clean_non_500_failure(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         server_args = types.SimpleNamespace(retraction_policy="length")
         req = _make_req("stuck-session", num_decoded=100)
-        max_retries = envs.SGLANG_RETRACT_SOLO_OOM_MAX_RETRIES.get()
+        max_retries = envs.FLLIPER_RETRACT_SOLO_OOM_MAX_RETRIES.get()
         # VALUE PINNING (#514/#505-C-05). Reading the default and deriving the
         # loop bound from it -- which is all this test used to do -- makes the
         # test pass for EVERY possible value: it proves the guard fires, never
@@ -237,7 +237,7 @@ class TestRetractDecodeGivesUpAfterRepeatedSoloOOM(unittest.TestCase):
         self.assertEqual(
             max_retries,
             8,
-            "SGLANG_RETRACT_SOLO_OOM_MAX_RETRIES changed; see environ.py:482-486 "
+            "FLLIPER_RETRACT_SOLO_OOM_MAX_RETRIES changed; see environ.py:482-486 "
             "for the argument behind 8 (ordinary pressure resolves in a couple "
             "of scheduler iterations) and update it together with this pin",
         )

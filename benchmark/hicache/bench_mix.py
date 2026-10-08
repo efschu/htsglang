@@ -12,9 +12,9 @@ from functools import wraps
 
 import aiohttp
 
-from sglang.bench_serving import RequestFuncOutput
-from sglang.benchmark.datasets.random import sample_random_requests
-from sglang.benchmark.utils import get_tokenizer, remove_prefix
+from flliper.bench_serving import RequestFuncOutput
+from flliper.benchmark.datasets.random import sample_random_requests
+from flliper.benchmark.utils import get_tokenizer, remove_prefix
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -296,7 +296,7 @@ def gen_payload(prompt, output_len):
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
 
-async def async_request_sglang_generate(
+async def async_request_flliper_generate(
     user_data,
     url,
     atomic_counter,
@@ -416,7 +416,7 @@ class WorkloadGenerator:
 
     async def handle_request(self, user_data):
         try:
-            response = await async_request_sglang_generate(
+            response = await async_request_flliper_generate(
                 user_data, self.url, self.atomic_counter
             )
             self.response_queue.put((user_data, response))

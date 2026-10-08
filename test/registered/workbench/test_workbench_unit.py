@@ -21,30 +21,30 @@ import time
 import unittest
 from pathlib import Path
 
-from sglang.srt.training.feasibility import GIB, CardResources, MachineResources
-from sglang.srt.training.tenant import DemandSample, IdleMonitor
-from sglang.srt.workbench.arb import (
+from flliper.srt.training.feasibility import GIB, CardResources, MachineResources
+from flliper.srt.training.tenant import DemandSample, IdleMonitor
+from flliper.srt.workbench.arb import (
     ArbDirectory,
     ArbRefused,
     parse_free_until,
     parse_holder,
 )
-from sglang.srt.workbench.http_api import (
+from flliper.srt.workbench.http_api import (
     enqueue_payload,
     events_payload,
     pause_payload,
     snapshot_payload,
 )
-from sglang.srt.workbench.log import WorkLog
-from sglang.srt.workbench.scheduler import Workbench, WorkbenchConfig
-from sglang.srt.workbench.service import (
+from flliper.srt.workbench.log import WorkLog
+from flliper.srt.workbench.scheduler import Workbench, WorkbenchConfig
+from flliper.srt.workbench.service import (
     UnknownTenant,
     WorkbenchDisabled,
     WorkbenchError,
     WorkbenchService,
     build_tenants,
 )
-from sglang.srt.workbench.tenant import (
+from flliper.srt.workbench.tenant import (
     MIB,
     IdleWorkTenant,
     SegmentOutcome,
@@ -54,14 +54,14 @@ from sglang.srt.workbench.tenant import (
     WorkSegment,
     price_segment,
 )
-from sglang.srt.workbench.tenants.card_probe import CardProbeTenant, probe_posts
-from sglang.srt.workbench.tenants.fp8_tuner import (
+from flliper.srt.workbench.tenants.card_probe import CardProbeTenant, probe_posts
+from flliper.srt.workbench.tenants.fp8_tuner import (
     Fp8BlockTunerTenant,
     TunerCombo,
     combo_posts,
     parse_queue,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # No card is touched anywhere in this file; that is the point of it.
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -779,7 +779,7 @@ class Fp8TunerSegmentTest(unittest.IsolatedAsyncioTestCase):
             combos=[TunerCombo(n=7168, k=5120, batch_size=4)],
         )
         events = []
-        from sglang.srt.workbench.tenant import WorkGrant
+        from flliper.srt.workbench.tenant import WorkGrant
 
         grant = WorkGrant(
             card_uuids=("GPU-big",),
@@ -803,7 +803,7 @@ class Fp8TunerSegmentTest(unittest.IsolatedAsyncioTestCase):
             device_resolver=lambda: list(DEVICES),
             combos=[TunerCombo(n=7168, k=5120, batch_size=4)],
         )
-        from sglang.srt.workbench.tenant import WorkGrant
+        from flliper.srt.workbench.tenant import WorkGrant
 
         grant = WorkGrant(
             card_uuids=("GPU-big",),
@@ -870,8 +870,8 @@ class CardProbeTenantTest(unittest.TestCase):
 
 def training_service(root: Path, *, enabled: bool = True):
     """A real #341 service with a mock executor and a synthetic 80 GiB card."""
-    from sglang.srt.training.backends.mock import MockBackend
-    from sglang.srt.training.service import TrainingService, TrainingServiceConfig
+    from flliper.srt.training.backends.mock import MockBackend
+    from flliper.srt.training.service import TrainingService, TrainingServiceConfig
 
     (root / "base-model").mkdir(parents=True, exist_ok=True)
     (root / "base-model" / "config.json").write_text(
@@ -941,7 +941,7 @@ class TrainingAdapterTest(unittest.IsolatedAsyncioTestCase):
         await self.service.stop()
 
     def adapter(self):
-        from sglang.srt.workbench.tenants.training import TrainingWorkTenant
+        from flliper.srt.workbench.tenants.training import TrainingWorkTenant
 
         return TrainingWorkTenant(self.service, idle_settle_s=0.05)
 
@@ -959,7 +959,7 @@ class TrainingAdapterTest(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_a_disabled_training_tenant_is_a_named_skip(self):
-        from sglang.srt.workbench.tenants.training import TrainingWorkTenant
+        from flliper.srt.workbench.tenants.training import TrainingWorkTenant
 
         off = training_service(Path(tempfile.mkdtemp(prefix="off-")), enabled=False)
         available, reason = TrainingWorkTenant(off).available()
@@ -1122,7 +1122,7 @@ class Args:
 
 class AssemblyTest(unittest.TestCase):
     def test_the_default_tenant_set_is_registered_in_priority_order(self):
-        from sglang.srt.workbench.service import build_config
+        from flliper.srt.workbench.service import build_config
 
         args = Args(workbench_artifact_root=tempfile.mkdtemp(prefix="wb-"))
         config = build_config(args)
@@ -1131,7 +1131,7 @@ class AssemblyTest(unittest.TestCase):
         self.assertEqual(sorted(t.name for t in tenants), ["card_probe", "fp8_tuner"])
 
     def test_an_unknown_tenant_name_is_a_startup_error(self):
-        from sglang.srt.workbench.service import build_config
+        from flliper.srt.workbench.service import build_config
 
         args = Args(workbench_tenants="fp8_tuner,typo")
         with self.assertRaises(ValueError):
@@ -1140,7 +1140,7 @@ class AssemblyTest(unittest.TestCase):
     def test_the_arb_directory_comes_from_the_flag_then_the_environment(self):
         import os
 
-        from sglang.srt.workbench.service import build_config
+        from flliper.srt.workbench.service import build_config
 
         root = tempfile.mkdtemp(prefix="arb-")
         self.assertEqual(build_config(Args(workbench_arb_dir=root)).arb_dir, root)

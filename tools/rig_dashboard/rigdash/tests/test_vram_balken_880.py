@@ -110,7 +110,7 @@ def rec_d(ts, wide_at=22.0, wide_tok=2000, wide_ms=2000.0):
     admits = int(ts) - w                              # one 1-token admit per second, 30 ms each; none in the wide second
     last = {"t": wide_at, "gpu_ms": wide_ms, "new": wide_tok} if (w and ts - wide_at < 1.0) else \
         {"t": float(admits), "gpu_ms": 30.0, "new": 1}
-    return {"schema": "weg2.rankstats/1", "ts": ts,
+    return {"schema": "pdflip.rankstats/1", "ts": ts,
             "prefill": {"chunks": admits + w, "new_tokens": admits + wide_tok * w, "cached_tokens": 14000 * admits,
                         "compute_ms": 30.0 * admits + wide_ms * w, "gpu_ms": 30.0 * admits + wide_ms * w, "last": last},
             "decode": {"tokens": 0, "rounds": 0, "gpu_ms": 0.0, "running": 0}, "sched": {"full_token_usage": 0.1}}

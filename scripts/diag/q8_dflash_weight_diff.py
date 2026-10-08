@@ -53,7 +53,7 @@ def main() -> int:
     import gguf
     from safetensors import safe_open
 
-    from sglang.srt.model_loader.gguf_dflash import (
+    from flliper.srt.model_loader.gguf_dflash import (
         audit_dflash_name_map,
         build_dflash_name_map,
     )

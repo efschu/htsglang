@@ -34,8 +34,8 @@ import gc
 import types
 import unittest
 
-from sglang.srt.mem_cache import hicache_phase_guard as guard
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state
+from flliper.srt.mem_cache import hicache_phase_guard as guard
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state
 
 
 class _FakeRuntime:
@@ -143,7 +143,7 @@ class TestHybridControllerIsGuardedToo(_GuardCase):
         guard.register_flip_phase_authority(self._rt)
 
     def test_hybrid_write_refuses_while_disarmed(self):
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
         )
 
@@ -153,7 +153,7 @@ class TestHybridControllerIsGuardedToo(_GuardCase):
         self.assertIsNone(HybridCacheController.write(cc, _FakeTensor()))
 
     def test_hybrid_load_refuses_while_disarmed(self):
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
         )
 
@@ -184,7 +184,7 @@ class _RecordingStream:
 
 class TestQuiesceDrainsBothStreams(unittest.TestCase):
     def test_quiesce_synchronizes_write_and_load_streams(self):
-        from sglang.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.managers.cache_controller import HiCacheController
 
         calls: list[str] = []
         fake = types.SimpleNamespace(
@@ -199,7 +199,7 @@ class TestQuiesceDrainsBothStreams(unittest.TestCase):
 class TestRuntimeQuiesceHelper(unittest.TestCase):
     def _runtime_shell(self):
         # The helper only reads _census_scheduler; no full runtime needed.
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         rt = object.__new__(PhaseFlipRuntime)
         rt._census_scheduler = None

@@ -49,14 +49,14 @@ REPO_PYTHON = Path(__file__).resolve().parents[2] / "python"
 if str(REPO_PYTHON) not in sys.path:
     sys.path.insert(0, str(REPO_PYTHON))
 
-from sglang.srt.translator.voice_presets import RENDER_SENTENCES  # noqa: E402
+from flliper.srt.translator.voice_presets import RENDER_SENTENCES  # noqa: E402
 
 
 async def run(args) -> int:
     import soundfile as sf
 
-    from sglang.srt.translator.backends import AudioChunk
-    from sglang.srt.translator.inprocess_tts import (
+    from flliper.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.inprocess_tts import (
         InProcessQwen3Tts,
         InProcessTtsConfig,
     )

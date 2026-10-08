@@ -13,7 +13,7 @@ ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.4
 ARG SGL_VERSION
 ARG SGL_DEEP_GEMM_VERSION=0.1.4.post1
-ARG USE_LATEST_SGLANG=0
+ARG USE_LATEST_FLLIPER=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
@@ -21,7 +21,7 @@ ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.14
 ARG MOONCAKE_VERSION=0.3.11.post1
-ARG MSCCLPP_VERSION=sglang-v0.9.1
+ARG MSCCLPP_VERSION=flliper-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -218,11 +218,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Rust extension during the stub wheel build; the crate's build.rs references
 # ../../proto for tonic_build. Split from the pip install so source changes to
 # these paths invalidate the dep-install layer, but Python source changes don't.
-COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
-COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
-COPY proto                 /tmp/sglang_deps/proto
+COPY python/pyproject.toml /tmp/flliper_deps/python/pyproject.toml
+COPY rust/sglang-grpc      /tmp/flliper_deps/rust/sglang-grpc
+COPY proto                 /tmp/flliper_deps/proto
 
-# Install sglang dependencies (torch, transformers, etc.)
+# Install flliper dependencies (torch, transformers, etc.)
 # Generate constraints.txt to prevent reinstalling these deps in later stages
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
@@ -233,10 +233,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.1) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && cd /tmp/sglang_deps/python \
-    && mkdir -p sglang \
-    && touch sglang/__init__.py \
-    && echo '__version__ = "0.0.0"' > sglang/version.py \
+    && cd /tmp/flliper_deps/python \
+    && mkdir -p flliper \
+    && touch flliper/__init__.py \
+    && echo '__version__ = "0.0.0"' > flliper/version.py \
     && touch README.md \
     && touch LICENSE \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
@@ -253,8 +253,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
-    && rm -rf /tmp/sglang_deps \
-    && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
+    && rm -rf /tmp/flliper_deps \
+    && pip freeze | grep -v "^flliper==" > /sgl-workspace/constraints.txt
 
 ########################################################
 # PARALLEL STAGE 2: DeepEP Builder (needs torch_deps)
@@ -417,7 +417,7 @@ FROM base AS gateway_builder
 ARG GITHUB_ARTIFACTORY
 ARG BRANCH_TYPE
 ARG SGL_VERSION
-ARG USE_LATEST_SGLANG
+ARG USE_LATEST_FLLIPER
 
 WORKDIR /build
 
@@ -449,7 +449,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG BUILD_AND_DOWNLOAD_PARALLEL
 ARG SGL_VERSION
-ARG USE_LATEST_SGLANG
+ARG USE_LATEST_FLLIPER
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MOONCAKE_COMPILE_ARG
@@ -573,7 +573,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
-# Optional ai-dynamo nightly for Dynamo + SGLang integration testing. Gated by
+# Optional ai-dynamo nightly for Dynamo + fLLiper integration testing. Gated by
 # INSTALL_DYNAMO so it lands only in the dev image (release-docker-dev.yml sets
 # it), not the version-tagged release/runtime images. Empty DYNAMO_VERSION
 # resolves the latest (highest-version) nightly, matching `pip install --pre`;
@@ -613,9 +613,9 @@ fi
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
 
 # These configs are optional; users can override them by mounting their own files
-COPY docker/configs/opt/.vimrc /opt/sglang/.vimrc
-COPY docker/configs/opt/.tmux.conf /opt/sglang/.tmux.conf
-COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
+COPY docker/configs/opt/.vimrc /opt/flliper/.vimrc
+COPY docker/configs/opt/.tmux.conf /opt/flliper/.tmux.conf
+COPY docker/configs/opt/.gitconfig /opt/flliper/.gitconfig
 
 # Configure development environment
 COPY docker/configs/.zshrc /root/.zshrc
@@ -640,7 +640,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && rm -rf /var/lib/apt/lists/*
 
 # =============================================================================
-# Copy sglang source and do editable install (LAST for better caching)
+# Copy flliper source and do editable install (LAST for better caching)
 # =============================================================================
 
 # Copy local source if building from local
@@ -653,7 +653,7 @@ ARG BRANCH_TYPE
 ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
-ARG USE_LATEST_SGLANG
+ARG USE_LATEST_FLLIPER
 ARG INSTALL_DYNAMO=0
 
 WORKDIR /sgl-workspace
@@ -661,10 +661,10 @@ WORKDIR /sgl-workspace
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
-    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
+    elif [ "$USE_LATEST_FLLIPER" = "1" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     elif [ -z "$SGL_VERSION" ]; then \
-        echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
+        echo "ERROR: SGL_VERSION must be set when USE_LATEST_FLLIPER=0 and BRANCH_TYPE!=local" && exit 1; \
     else \
         git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
@@ -703,8 +703,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
              fi; \
          fi; \
          [ "$success" = "1" ] ) \
-    && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
-    && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
+    && mkdir -p /root/.cache/huggingface /root/.cache/flliper \
+    && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/flliper/; fi ) \
     && ( find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 
@@ -726,19 +726,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
-ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_URL=
-ARG SGLANG_IMAGE_TAG=local/sglang:dev
-ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
-    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+ARG FLLIPER_BUILD_COMMIT=unknown
+ARG FLLIPER_BUILD_URL=
+ARG FLLIPER_IMAGE_TAG=local/flliper:dev
+ENV FLLIPER_BUILD_COMMIT=${FLLIPER_BUILD_COMMIT:-unknown} \
+    FLLIPER_BUILD_URL=${FLLIPER_BUILD_URL:-} \
+    FLLIPER_IMAGE_TAG=${FLLIPER_IMAGE_TAG:-local/flliper:dev}
 LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
-      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
-      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
-      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+      org.opencontainers.image.revision="${FLLIPER_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${FLLIPER_IMAGE_TAG}" \
+      org.opencontainers.image.url="${FLLIPER_BUILD_URL}" \
+      ai.flliper.build.commit="${FLLIPER_BUILD_COMMIT}" \
+      ai.flliper.build.url="${FLLIPER_BUILD_URL}" \
+      ai.flliper.image.tag="${FLLIPER_IMAGE_TAG}"
 
 ########################################################
 ########## Runtime Image ##############################
@@ -747,13 +747,13 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
 # PURPOSE: Production runtime environment with JIT support
 #
 # This stage creates a production-ready image containing:
-# - Pre-compiled SGLang and DeepEP components
+# - Pre-compiled fLLiper and DeepEP components
 # - Full CUDA toolchain for JIT compilation (DeepGEMM, Triton, FlashInfer)
 # - Optimized for inference workloads and deployment
 # - Smaller than framework (no dev tools like vim, tmux, nsight, etc.)
 #
 # Use this stage when you need:
-# - Production deployment of SGLang
+# - Production deployment of fLLiper
 # - JIT compilation support for FP8/microscaling kernels
 # - Ready-to-run inference server environment
 #
@@ -852,21 +852,21 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
 
-# Copy SGLang workspace
+# Copy fLLiper workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace
 
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
 
-# Copy sglang binary
-COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
+# Copy flliper binary
+COPY --from=framework_final /usr/local/bin/flliper /usr/local/bin/flliper
 
 # Copy py-spy binary
 COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
 
 # Copy cache for kernels from kernels community
 COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
-COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
+COPY --from=framework_final /root/.cache/flliper /root/.cache/flliper
 
 # Copy GDRCopy runtime libraries (but not the build artifacts)
 COPY --from=framework_final /usr/lib/libgdrapi.so* /usr/lib/
@@ -879,19 +879,19 @@ RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linu
 WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
-ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_URL=
-ARG SGLANG_IMAGE_TAG=local/sglang:dev
-ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
-    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+ARG FLLIPER_BUILD_COMMIT=unknown
+ARG FLLIPER_BUILD_URL=
+ARG FLLIPER_IMAGE_TAG=local/flliper:dev
+ENV FLLIPER_BUILD_COMMIT=${FLLIPER_BUILD_COMMIT:-unknown} \
+    FLLIPER_BUILD_URL=${FLLIPER_BUILD_URL:-} \
+    FLLIPER_IMAGE_TAG=${FLLIPER_IMAGE_TAG:-local/flliper:dev}
 LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
-      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
-      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
-      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+      org.opencontainers.image.revision="${FLLIPER_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${FLLIPER_IMAGE_TAG}" \
+      org.opencontainers.image.url="${FLLIPER_BUILD_URL}" \
+      ai.flliper.build.commit="${FLLIPER_BUILD_COMMIT}" \
+      ai.flliper.build.url="${FLLIPER_BUILD_URL}" \
+      ai.flliper.image.tag="${FLLIPER_IMAGE_TAG}"
 
 # Default command
 CMD ["/bin/bash"]

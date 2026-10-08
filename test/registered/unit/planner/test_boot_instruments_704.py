@@ -27,7 +27,7 @@ Hermetic: pure arithmetic, no CUDA.
 
 import pytest
 
-from sglang.srt.planner.boot_instruments import (
+from flliper.srt.planner.boot_instruments import (
     RankInstruments,
     recover_reserve_mib,
     verify_sizing_chain,
@@ -154,7 +154,7 @@ def test_world_pool_is_the_min_over_ranks_and_reproduces_the_boot():
 
 def test_predicting_an_unbooted_cut_without_its_reserve_is_refused():
     """The reserve does not transfer between layouts; saying so is the point."""
-    from sglang.srt.planner.boot_instruments import predict_tokens_for_cut
+    from flliper.srt.planner.boot_instruments import predict_tokens_for_cut
 
     with pytest.raises(ValueError, match="reserve"):
         predict_tokens_for_cut(
@@ -166,7 +166,7 @@ def test_predicting_an_unbooted_cut_without_its_reserve_is_refused():
 
 
 def test_predicting_with_a_supplied_reserve_is_arithmetic_only():
-    from sglang.srt.planner.boot_instruments import predict_tokens_for_cut
+    from flliper.srt.planner.boot_instruments import predict_tokens_for_cut
 
     # The measured PP2 stage, so it must land back on the boot.
     tokens = predict_tokens_for_cut(
@@ -186,7 +186,7 @@ def test_the_arming_floor_is_inside_the_reserve_not_a_second_subtraction():
     already contains it. A solver that subtracted the floor again would charge
     it twice.
     """
-    from sglang.srt.planner.boot_instruments import predict_tokens_for_cut
+    from flliper.srt.planner.boot_instruments import predict_tokens_for_cut
 
     pp2 = INCUMBENT[2]
     reserve = recover_reserve_mib(pp2)

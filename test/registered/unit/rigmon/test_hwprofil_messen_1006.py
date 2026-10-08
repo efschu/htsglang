@@ -31,12 +31,12 @@ from test_hardware_profile_950 import (  # noqa: E402
     NOW, U0, U1, U2, _nvml, _probe_card, _write_probe,
 )
 
-from sglang.srt.rigmon import bar1_probe as bp  # noqa: E402
-from sglang.srt.rigmon import card_probe as cp  # noqa: E402
-from sglang.srt.rigmon import hardware_profile as hp  # noqa: E402
-from sglang.srt.rigmon import nccl_probe as npb  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.srt.rigmon import bar1_probe as bp  # noqa: E402
+from flliper.srt.rigmon import card_probe as cp  # noqa: E402
+from flliper.srt.rigmon import hardware_profile as hp  # noqa: E402
+from flliper.srt.rigmon import nccl_probe as npb  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -67,7 +67,7 @@ def _out(rep):
 class TestBar1Commands(CustomTestCase):
     def test_rank_command_carries_the_uuids_in_rank_order_and_the_rank(self):
         c = bp.rank_command("/venv/py", 1, UUIDS, 300.0)
-        self.assertEqual(c[:3], ["/venv/py", "-m", "sglang.srt.rigmon.bar1_probe"])
+        self.assertEqual(c[:3], ["/venv/py", "-m", "flliper.srt.rigmon.bar1_probe"])
         self.assertEqual(c[c.index("--rank") + 1], "1")
         self.assertEqual(c[c.index("--uuids") + 1], ",".join(UUIDS))
 
@@ -333,7 +333,7 @@ class TestHostLatencyIsTheMedian(CustomTestCase):
     def test_measure_card_stores_median_headline_and_minimum_beside_it(self):
         import torch
 
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
         rates = up.MembwRates(read_gbs=1.0, copy_gbs=1.0, gemv_gbs=1.0)
         with mock.patch.object(torch.cuda, "set_device"), \
@@ -506,7 +506,7 @@ class TestNativeW4A4(CustomTestCase):
     def _measure(self, cc, *, env_issue="", w4a4=(900.0, "")):
         import torch
 
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
         rates = up.MembwRates(read_gbs=1.0, copy_gbs=1.0, gemv_gbs=1.0)
         calls = []
@@ -568,7 +568,7 @@ class TestNativeW4A4(CustomTestCase):
         self.assertIn("did not run", m.lane_notes["nvfp4_w4a4"])
 
     def test_the_bench_says_why_when_the_fork_kernel_is_not_there_and_leaves_the_backend_global_alone(self):
-        from sglang.srt.layers.quantization import fp4_utils
+        from flliper.srt.layers.quantization import fp4_utils
 
         before = fp4_utils.FP4_GEMM_RUNNER_BACKEND
         with mock.patch.object(fp4_utils, "has_fork_nvfp4_cutlass_kernel", lambda: False):
@@ -818,7 +818,7 @@ class TestPcieLink(CustomTestCase):
     def test_measure_card_records_the_link_it_read_after_the_transfer_arm(self):
         import torch
 
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
         rates = up.MembwRates(read_gbs=1.0, copy_gbs=1.0, gemv_gbs=1.0)
         with mock.patch.object(torch.cuda, "set_device"), \
@@ -1207,7 +1207,7 @@ class TestSecondLatencyAndReferences(CustomTestCase):
             with open(os.path.join(root, rel), encoding="utf-8") as fh:
                 return fh.read().splitlines()
 
-        bb = lines("python/sglang/srt/distributed/device_communicators/barlink_bar1.py")
+        bb = lines("python/flliper/srt/distributed/device_communicators/barlink_bar1.py")
         self.assertIn("28.22", " ".join(bb[74:83]))
         self.assertIn("4077.43", " ".join(bb[74:83]))
         self.assertTrue(bb[1527].startswith("DEFAULT_ROUND_US = 323.2"))

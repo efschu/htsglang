@@ -11,7 +11,7 @@ import torch
 
 
 def test_rows_route_is_armed_on_a_cuda_rank_without_dcp():
-    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    from flliper.srt.layers.attention.qwen_sparse_attn_backend import (
         _speculative_rows_route,
     )
 
@@ -23,7 +23,7 @@ def test_rows_route_is_armed_on_a_cuda_rank_without_dcp():
 
 
 def test_speculative_row_bound_reads_num_tokens_per_req_for_draft_extend():
-    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    from flliper.srt.layers.attention.qwen_sparse_attn_backend import (
         QwenSparseAttnBackend,
     )
 

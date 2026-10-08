@@ -18,8 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "python"))
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.weg2 import form as F  # noqa: E402
-from sglang.srt.weg2 import model_profile as MP  # noqa: E402
+from flliper.srt.pdflip import form as F  # noqa: E402
+from flliper.srt.pdflip import model_profile as MP  # noqa: E402
 
 GIB = float(1 << 30)
 MC = "/spinning/llm_stuff/club-3090/models-cache/"
@@ -134,8 +134,8 @@ def main(argv=None):
     print("|---|---:|---:|---:|---|")
     e27 = est.get("Qwen3.8-27B-INT8-gdncov-vocabembed")
     enf = est.get("Qwen3.8-Flash-Next-NVFP4-nvidia")
-    rec27 = {r["name"]: r["value"] for r in json.load(open(os.path.join(os.path.dirname(HERE), "python/sglang/srt/weg2/profile_records_data/qwen27b.json")))["records"]}
-    recnf = {r["name"]: r["value"] for r in json.load(open(os.path.join(os.path.dirname(HERE), "python/sglang/srt/weg2/profile_records_data/nextflash.json")))["records"]}
+    rec27 = {r["name"]: r["value"] for r in json.load(open(os.path.join(os.path.dirname(HERE), "python/flliper/srt/pdflip/profile_records_data/qwen27b.json")))["records"]}
+    recnf = {r["name"]: r["value"] for r in json.load(open(os.path.join(os.path.dirname(HERE), "python/flliper/srt/pdflip/profile_records_data/nextflash.json")))["records"]}
     if e27:
         v = e27["kv"]["variants"]["fp8_e4m3"]["payload_per_token_all_attn_layers"]["v"]
         print("| 27B KV-Seitenbytes je Token (16 Attn-Layer, fp8) | %d B | %d B | %s | STORE_CENSUS_KV_PAGE_BYTES (weg2sb5g) |" % (v, rec27["STORE_CENSUS_KV_PAGE_BYTES"], pct(v, rec27["STORE_CENSUS_KV_PAGE_BYTES"])))

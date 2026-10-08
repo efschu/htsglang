@@ -1,8 +1,8 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.server_fixtures.standalone_fixture import StandaloneServerBase
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.server_fixtures.standalone_fixture import StandaloneServerBase
+from flliper.test.test_utils import CustomTestCase
 
 # V2 standalone speculative decoding tests (FA3, Triton, FlashInfer backends).
 # Non-V2 backends moved to test_spec_standalone_extra.py.

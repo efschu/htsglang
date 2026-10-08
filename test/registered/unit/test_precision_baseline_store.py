@@ -1,6 +1,6 @@
 """Unit tests for precision_baseline_store — no server, no model loading, no HF network."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from sglang.test import precision_baseline_store as hfs
-from sglang.test.test_utils import CustomTestCase
+from flliper.test import precision_baseline_store as hfs
+from flliper.test.test_utils import CustomTestCase
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,7 +44,7 @@ def _make_rows(n: int, *, model: str = "org/model", base_index: int = 0) -> list
 class TestHfStoreConfig(CustomTestCase):
     def test_from_env_reads_required_var(self):
         with patch.dict(
-            os.environ, {"SGLANG_PRECISION_HF_REPO": "my/repo"}, clear=False
+            os.environ, {"FLLIPER_PRECISION_HF_REPO": "my/repo"}, clear=False
         ):
             cfg = hfs.HfStoreConfig.from_env()
         self.assertEqual(cfg.repo, "my/repo")
@@ -54,8 +54,8 @@ class TestHfStoreConfig(CustomTestCase):
         with patch.dict(
             os.environ,
             {
-                "SGLANG_PRECISION_HF_REPO": "my/repo",
-                "SGLANG_PRECISION_HF_REVISION": "dev",
+                "FLLIPER_PRECISION_HF_REPO": "my/repo",
+                "FLLIPER_PRECISION_HF_REVISION": "dev",
             },
             clear=False,
         ):
@@ -218,7 +218,7 @@ class TestSelectLatestRun(CustomTestCase):
 
 
 class TestReadManifest(CustomTestCase):
-    @patch("sglang.test.precision_baseline_store.hf_hub_download")
+    @patch("flliper.test.precision_baseline_store.hf_hub_download")
     def test_parses_valid_manifest(self, mock_download):
         content = (
             '{"model":"a","run_path":"p1","push_index":1}\n'
@@ -236,7 +236,7 @@ class TestReadManifest(CustomTestCase):
         self.assertEqual(rows[0]["model"], "a")
         self.assertEqual(text, content)
 
-    @patch("sglang.test.precision_baseline_store.hf_hub_download")
+    @patch("flliper.test.precision_baseline_store.hf_hub_download")
     def test_skips_blank_and_corrupt_lines(self, mock_download):
         content = (
             '{"model":"a","run_path":"p1"}\n\nnot-json\n{"model":"b","run_path":"p2"}\n'
@@ -251,7 +251,7 @@ class TestReadManifest(CustomTestCase):
             os.unlink(tmp.name)
         self.assertEqual(len(rows), 2)
 
-    @patch("sglang.test.precision_baseline_store.hf_hub_download")
+    @patch("flliper.test.precision_baseline_store.hf_hub_download")
     def test_returns_empty_on_not_found(self, mock_download):
         from huggingface_hub.errors import EntryNotFoundError
 
@@ -262,7 +262,7 @@ class TestReadManifest(CustomTestCase):
 
 
 class TestFetchLatestBaseline(CustomTestCase):
-    @patch("sglang.test.precision_baseline_store.snapshot_download")
+    @patch("flliper.test.precision_baseline_store.snapshot_download")
     @patch.object(hfs, "_read_manifest")
     def test_downloads_and_copies_tensors(self, mock_manifest, mock_snapshot):
         rows = [
@@ -299,7 +299,7 @@ class TestFetchLatestBaseline(CustomTestCase):
             )
         self.assertIsNone(result)
 
-    @patch("sglang.test.precision_baseline_store.snapshot_download")
+    @patch("flliper.test.precision_baseline_store.snapshot_download")
     @patch.object(hfs, "_read_manifest")
     def test_passes_capture_signature(self, mock_manifest, mock_snapshot):
         rows = [
@@ -351,7 +351,7 @@ class TestPushRun(CustomTestCase):
         )
         return mock_api, captured
 
-    @patch("sglang.test.precision_baseline_store.HfApi")
+    @patch("flliper.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
     def test_uploads_tensors_and_manifest(self, mock_manifest, mock_api_cls):
         mock_api, captured = self._make_push_mocks(mock_manifest, mock_api_cls)
@@ -363,7 +363,7 @@ class TestPushRun(CustomTestCase):
             run_path = hfs.push_run(
                 config=_make_config(),
                 model="org/m",
-                sglang_commit="abc1234567",
+                flliper_commit="abc1234567",
                 today_tensors_dir=Path(tensor_dir),
                 meta=meta,
             )
@@ -376,7 +376,7 @@ class TestPushRun(CustomTestCase):
         self.assertEqual(row["tp_size"], 8)
         self.assertTrue(run_path.startswith("org__m/"))
 
-    @patch("sglang.test.precision_baseline_store.HfApi")
+    @patch("flliper.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
     def test_skips_existing_tensors_unless_force(self, mock_manifest, mock_api_cls):
         # The run_path must match what push_run generates: model/date/sha7.
@@ -403,14 +403,14 @@ class TestPushRun(CustomTestCase):
             hfs.push_run(
                 config=_make_config(),
                 model="org/m",
-                sglang_commit="abc1234567",
+                flliper_commit="abc1234567",
                 today_tensors_dir=Path(tensor_dir),
                 meta={"tp_size": 8},
             )
 
         self.assertEqual(captured_pt_count[0], 0)
 
-    @patch("sglang.test.precision_baseline_store.HfApi")
+    @patch("flliper.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
     def test_force_re_uploads(self, mock_manifest, mock_api_cls):
         # Use today's date so the run_path matches what push_run generates.
@@ -436,7 +436,7 @@ class TestPushRun(CustomTestCase):
             hfs.push_run(
                 config=_make_config(),
                 model="org/m",
-                sglang_commit="abc1234567",
+                flliper_commit="abc1234567",
                 today_tensors_dir=Path(tensor_dir),
                 meta={"tp_size": 8},
                 force=True,
@@ -444,7 +444,7 @@ class TestPushRun(CustomTestCase):
 
         self.assertGreater(captured_pt_count[0], 0)
 
-    @patch("sglang.test.precision_baseline_store.HfApi")
+    @patch("flliper.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
     def test_manifest_row_promotes_keys(self, mock_manifest, mock_api_cls):
         _mock_api, captured = self._make_push_mocks(mock_manifest, mock_api_cls)
@@ -465,7 +465,7 @@ class TestPushRun(CustomTestCase):
             hfs.push_run(
                 config=_make_config(),
                 model="org/m",
-                sglang_commit="abc1234567",
+                flliper_commit="abc1234567",
                 today_tensors_dir=Path(tensor_dir),
                 meta=meta,
             )
@@ -480,7 +480,7 @@ class TestPushRun(CustomTestCase):
                 )
         self.assertNotIn("extra_key_not_promoted", row)
 
-    @patch("sglang.test.precision_baseline_store.HfApi")
+    @patch("flliper.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
     def test_includes_comparator_report(self, mock_manifest, mock_api_cls):
         mock_manifest.return_value = ([], "")
@@ -500,7 +500,7 @@ class TestPushRun(CustomTestCase):
             hfs.push_run(
                 config=_make_config(),
                 model="org/m",
-                sglang_commit="abc1234567",
+                flliper_commit="abc1234567",
                 today_tensors_dir=Path(tensor_dir),
                 meta={"tp_size": 8},
                 comparator_report=report_path,
@@ -550,7 +550,7 @@ class TestPruneOldRuns(CustomTestCase):
         self.assertEqual(result["kept"], [])
         self.assertEqual(len(result["pruned"]), 2)
 
-    @patch("sglang.test.precision_baseline_store.HfApi")
+    @patch("flliper.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
     def test_dry_run_does_not_delete(self, mock_manifest, mock_api_cls):
         rows = [
@@ -562,7 +562,7 @@ class TestPruneOldRuns(CustomTestCase):
         mock_api_cls.return_value.upload_file.assert_not_called()
         mock_api_cls.return_value.delete_folder.assert_not_called()
 
-    @patch("sglang.test.precision_baseline_store.HfApi")
+    @patch("flliper.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
     def test_live_mode_deletes(self, mock_manifest, mock_api_cls):
         rows = [
@@ -600,13 +600,13 @@ class TestPruneOldRuns(CustomTestCase):
 
 
 class TestWithRetries(CustomTestCase):
-    @patch("sglang.test.precision_baseline_store.time")
+    @patch("flliper.test.precision_baseline_store.time")
     def test_succeeds_on_first_attempt(self, mock_time):
         result = hfs._with_retries(lambda: 42, what="test")
         self.assertEqual(result, 42)
         mock_time.sleep.assert_not_called()
 
-    @patch("sglang.test.precision_baseline_store.time")
+    @patch("flliper.test.precision_baseline_store.time")
     def test_retries_on_429(self, mock_time):
         from huggingface_hub.errors import HfHubHTTPError
 
@@ -619,7 +619,7 @@ class TestWithRetries(CustomTestCase):
         self.assertEqual(result, "ok")
         mock_time.sleep.assert_called_once()
 
-    @patch("sglang.test.precision_baseline_store.time")
+    @patch("flliper.test.precision_baseline_store.time")
     def test_raises_on_auth_error(self, mock_time):
         from huggingface_hub.errors import HfHubHTTPError
 
@@ -632,7 +632,7 @@ class TestWithRetries(CustomTestCase):
             hfs._with_retries(mock_op, what="test")
         mock_time.sleep.assert_not_called()
 
-    @patch("sglang.test.precision_baseline_store.time")
+    @patch("flliper.test.precision_baseline_store.time")
     def test_raises_after_max_attempts(self, mock_time):
         from huggingface_hub.errors import HfHubHTTPError
 

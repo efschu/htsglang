@@ -2,14 +2,14 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.moe.topk import (
+from flliper.srt.layers.moe.topk import (
     biased_grouped_topk_gpu,
 )
-from sglang.srt.layers.moe.topk import (
+from flliper.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
-from sglang.test.ci.ci_register import register_xpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_xpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_xpu_ci(est_time=5, suite="stage-b-test-1-gpu-xpu")
 

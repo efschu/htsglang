@@ -21,9 +21,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.video_enhance.chain import ChainRequest, build_chain
-from sglang.srt.video_enhance.frame_math import MIB, Resolution
-from sglang.srt.video_enhance.multicard import (
+from flliper.srt.video_enhance.chain import ChainRequest, build_chain
+from flliper.srt.video_enhance.frame_math import MIB, Resolution
+from flliper.srt.video_enhance.multicard import (
     UNASSIGNED_CARD,
     ChunkResult,
     ChunkRunner,
@@ -40,8 +40,8 @@ from sglang.srt.video_enhance.multicard import (
     total_output_frames,
     verify_chunk_arithmetic,
 )
-from sglang.srt.video_enhance.mux import expected_frame_count
-from sglang.srt.video_enhance.shard_plan import (
+from flliper.srt.video_enhance.mux import expected_frame_count
+from flliper.srt.video_enhance.shard_plan import (
     CardAvailability,
     RateTable,
     ReservationInputs,
@@ -51,8 +51,8 @@ from sglang.srt.video_enhance.shard_plan import (
     static_single_card_plan,
     vsgan_style_modulo_plan,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

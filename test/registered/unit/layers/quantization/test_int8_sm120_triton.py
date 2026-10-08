@@ -1,4 +1,4 @@
-"""SGLANG_INT8_SM120_TRITON (27b-int8tri 26.09.): the Triton INT8 W8A8
+"""FLLIPER_INT8_SM120_TRITON (27b-int8tri 26.09.): the Triton INT8 W8A8
 small-M GEMM for sm_120 behind a switch.
 
 Desk-only (no GPU, CUDA_VISIBLE_DEVICES=""). Pins:
@@ -27,8 +27,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from sglang.srt.layers.quantization import int8_sm120_triton as tri
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+from flliper.srt.layers.quantization import int8_sm120_triton as tri
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_w8a8_int8 as w8a8,
 )
 
@@ -345,22 +345,22 @@ def test_switch_on_uses_triton_or_the_identical_sgl_call(monkeypatch):
 
 
 def test_switch_resolution(monkeypatch):
-    monkeypatch.delenv("SGLANG_INT8_SM120_TRITON", raising=False)
+    monkeypatch.delenv("FLLIPER_INT8_SM120_TRITON", raising=False)
     monkeypatch.setattr(w8a8, "_is_cuda", True)
     assert w8a8._resolve_int8_sm120_triton() is False
-    monkeypatch.setenv("SGLANG_INT8_SM120_TRITON", "1")
+    monkeypatch.setenv("FLLIPER_INT8_SM120_TRITON", "1")
     assert w8a8._resolve_int8_sm120_triton() is True
     monkeypatch.setattr(w8a8, "_is_cuda", False)
     assert w8a8._resolve_int8_sm120_triton() is False
     monkeypatch.setattr(w8a8, "_is_cuda", True)
-    monkeypatch.setenv("SGLANG_INT8_SM120_TRITON", "0")
+    monkeypatch.setenv("FLLIPER_INT8_SM120_TRITON", "0")
     assert w8a8._resolve_int8_sm120_triton() is False
 
 
 # ------------------------------------------------------ (d) interpreter numerics
 _INTERP = textwrap.dedent("""
     import sys, torch
-    from sglang.srt.layers.quantization import int8_sm120_triton as tri
+    from flliper.srt.layers.quantization import int8_sm120_triton as tri
     g = torch.Generator().manual_seed(1234)
     bad = []
 

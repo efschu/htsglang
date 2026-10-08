@@ -47,7 +47,7 @@ Exit code 1 if any finding, 0 if clean -- so it can gate.
 PRECISION NOTES -- READ BEFORE ACTING ON A COUNT (the #950 lesson: a rule's
 own honesty about its false-positive shape is part of the rule).
 
-  B1 is PRECISE inside python/sglang/srt/distributed (8 findings, all read)
+  B1 is PRECISE inside python/flliper/srt/distributed (8 findings, all read)
   and a TRIAGE LIST outside it (84 tree-wide, measured 2026-09-04).  The
   noise is NAME COLLISION: `poll` / `empty` / `query` / `done` also name
   methods on queues, tensors, dicts and model modules that have nothing to
@@ -79,7 +79,7 @@ own honesty about its false-positive shape is part of the rule).
   receiver (`work`, `p2p_work.work`, `handle`, `async_handle`, `req`, `w`).
   A wait on a handle named something else -- `self._x.wait()` -- is
   invisible, and a `.wait()` on a threading.Event named `work_ready` is a
-  false positive.  Measured 2026-09-04 over python/sglang/srt: 17 findings,
+  false positive.  Measured 2026-09-04 over python/flliper/srt: 17 findings,
   all 17 read by hand, 11 real (a torch.distributed Work or an unbounded
   thread/executor join) and 6 name collisions.  It is a SHORT list on
   purpose -- read all of it, do not quote the count.

@@ -16,10 +16,10 @@ from unittest.mock import patch
 
 import torch
 
-import sglang.srt.model_executor.model_runner_kv_cache_mixin as kv_cache_mixin
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.model_executor.model_runner_kv_cache_mixin as kv_cache_mixin
+from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -45,7 +45,7 @@ class TestSWAKVPoolMemorySaver(CustomTestCase):
         if enable_memory_saver is not None:
             kwargs["enable_memory_saver"] = enable_memory_saver
         with patch(
-            "sglang.srt.mem_cache.swa_memory_pool.maybe_init_custom_mem_pool",
+            "flliper.srt.mem_cache.swa_memory_pool.maybe_init_custom_mem_pool",
             return_value=(False, None, None),
         ):
             return SWAKVPool(

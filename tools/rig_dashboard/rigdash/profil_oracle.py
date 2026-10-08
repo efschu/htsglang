@@ -1,7 +1,7 @@
 """AP-D (Plan Profil-Planer 06.10., Stufe B/C): der Dienst hinter dem Orakel -- Kindprozess + Cache.
 
-Der Dashboard-Prozess rechnet nichts selbst (kein sglang-Import, MemoryMax=1G).  ``OracleService`` haelt EINEN langlebigen Kindprozess
-(``kartenplan_build/oracle_worker.py``) mit dem Python der sglang-Umgebung, der den Launcher-Trockenlauf (``weg2/propose_oracle``) und
+Der Dashboard-Prozess rechnet nichts selbst (kein flliper-Import, MemoryMax=1G).  ``OracleService`` haelt EINEN langlebigen Kindprozess
+(``kartenplan_build/oracle_worker.py``) mit dem Python der flliper-Umgebung, der den Launcher-Trockenlauf (``pdflip/propose_oracle``) und
 ``propose()`` fuer das Dashboard fragt.  Er benutzt Start, Neustart nach Tod/Zeitueberschreitung und die Fehlerform des
 ``CouplingsService`` (``{"ok": False, "error": ...}``, nie ein Absturz des Dashboards), ist aber ein EIGENER Prozess: ein Trockenlauf
 dauert Sekunden (gemessen 06.10.: 16-18 s, wenn der Launcher bis zum Ende plant; 0,3-3 s bei fruehem Abbruch), importiert den Launcher und
@@ -43,7 +43,7 @@ def default_prefix() -> List[str]:
     import shutil
     exe = shutil.which("systemd-run")
     return [exe] + list(ORACLE_PREFIX[1:]) if exe else []
-#: die Quellen, von denen ein Verdikt abhaengt (relativ zu ``<Baum>/sglang/srt/weg2/``)
+#: die Quellen, von denen ein Verdikt abhaengt (relativ zu ``<Baum>/flliper/srt/pdflip/``)
 SOURCES = ("launcher.py", "refusals.py", "hw_fit.py", "topology.py", "propose.py", "propose_rules.py", "propose_oracle.py",
            "propose_dual.py", "dual_layout_plan.py", "propose_single.py", "propose_verdict.py", "card_identity.py", "model_profile.py", "profile_json.py")
 
@@ -85,7 +85,7 @@ class OracleService(CouplingsService):
     def stamp(self) -> List[List[Any]]:
         """Groesse und mtime der Quellen des Orakels im Planer-Baum (``None`` = Datei fehlt): ein anderer Launcher ist ein anderer Schluessel."""
         out: List[List[Any]] = []
-        base = os.path.join(self.tree_python or "", "sglang", "srt", "weg2")
+        base = os.path.join(self.tree_python or "", "flliper", "srt", "pdflip")
         for name in SOURCES:
             try:
                 st = os.stat(os.path.join(base, name))

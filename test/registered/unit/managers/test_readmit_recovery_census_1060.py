@@ -19,7 +19,7 @@ asserts that shape is DISTINGUISHABLE from the healthy one, so a future
 refactor cannot silently produce it.
 """
 
-import sglang.srt.managers.schedule_batch as sb
+import flliper.srt.managers.schedule_batch as sb
 
 
 class _Pool:

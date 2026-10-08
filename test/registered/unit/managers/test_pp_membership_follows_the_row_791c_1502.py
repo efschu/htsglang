@@ -46,14 +46,14 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers import scheduler_pp_mixin as ppm
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers import scheduler_pp_mixin as ppm
+from flliper.srt.managers.pp_admission_congruence import (
     PPAdmissionDecision,
     PPAdmissionEntry,
     reconcile_pp_admission_decision,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -154,7 +154,7 @@ class DownstreamRankExecutesTheRowTest(CustomTestCase):
             mb_id=LIVE_MB, entries=(decision.entries[0], excluded)
         )
         with self.assertNoLogs(
-            "sglang.srt.managers.pp_admission_congruence", level="WARNING"
+            "flliper.srt.managers.pp_admission_congruence", level="WARNING"
         ):
             effective, amended = reconcile_pp_admission_decision(
                 decision, {}, rank=VICTIM, pp_size=WORLD

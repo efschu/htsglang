@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Nordstern L2: sglang-free self-test for the barlink UCX transport.
+"""Nordstern L2: flliper-free self-test for the barlink UCX transport.
 
 Same assertions as ``test/registered/unit/distributed/test_barlink_ucx_collectives.py``
 -- real multi-process ranks over a real UCX worker on loopback (self/sm/tcp) --
 but loaded the way ``l1_ucx_crossrig.py`` loads it: the two transport modules
-by path, with the ``sglang`` package tree stubbed out.
+by path, with the ``flliper`` package tree stubbed out.
 
-That is not a convenience. The registered unit test needs the whole sglang
+That is not a convenience. The registered unit test needs the whole flliper
 runtime importable, which neither rig in this fleet has; this file needs
 nothing but torch and a loadable ``libucp``. It is therefore the version that
 can actually be run where the hardware is, and it is the one that guards the
@@ -28,17 +28,17 @@ import types
 
 REPO_COMM = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "..", "..", "python", "sglang", "srt", "distributed", "device_communicators",
+    "..", "..", "python", "flliper", "srt", "distributed", "device_communicators",
 )
 
 
 def load_transport(comm_dir):
-    """Import barlink_ucx{,_bindings} from `comm_dir` without importing sglang."""
+    """Import barlink_ucx{,_bindings} from `comm_dir` without importing flliper."""
     for name in (
-        "sglang",
-        "sglang.srt",
-        "sglang.srt.distributed",
-        "sglang.srt.distributed.device_communicators",
+        "flliper",
+        "flliper.srt",
+        "flliper.srt.distributed",
+        "flliper.srt.distributed.device_communicators",
     ):
         if name not in sys.modules or not hasattr(sys.modules[name], "__path__"):
             stub = types.ModuleType(name)
@@ -52,7 +52,7 @@ def load_transport(comm_dir):
         spec.loader.exec_module(mod)
         return mod
 
-    base = "sglang.srt.distributed.device_communicators."
+    base = "flliper.srt.distributed.device_communicators."
     _load(base + "barlink_ucx_bindings", os.path.join(comm_dir, "barlink_ucx_bindings.py"))
     return _load(base + "barlink_ucx", os.path.join(comm_dir, "barlink_ucx.py"))
 

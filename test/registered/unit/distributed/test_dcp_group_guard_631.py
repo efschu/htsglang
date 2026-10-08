@@ -26,17 +26,17 @@ on the paths that must stay byte-identical.
 import logging
 import unittest
 
-from sglang.srt.distributed import parallel_state
-from sglang.srt.distributed.dcp_group_guard import (
+from flliper.srt.distributed import parallel_state
+from flliper.srt.distributed.dcp_group_guard import (
     assert_dcp_group_formed,
     assert_pd_decode_dcp_supported,
 )
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     set_cp_token_ratios,
     set_tp_partition_ratios,
     uneven_dcp_owner_bounds,
 )
-from sglang.srt.runtime_context import get_parallel
+from flliper.srt.runtime_context import get_parallel
 
 # Uneven TP over three ranks: 5/5/6 token shares, block size S = 16.
 RATIOS = [5, 5, 6]
@@ -235,7 +235,7 @@ class GuardIsWiredIntoTheScheduler(_RatiosInstalled):
         # The regression guard for the dead-code bug described above: a
         # paged allocator must be REACHED and refused through the real
         # call site, not merely through a direct call to the function.
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         stub = self._StubScheduler(
             _Args(dcp_size=3, disaggregation_mode="decode"), page_size=64
@@ -248,7 +248,7 @@ class GuardIsWiredIntoTheScheduler(_RatiosInstalled):
         self.assertEqual(stub.order, [])
 
     def test_page_size_1_from_the_worker_is_accepted(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         stub = self._StubScheduler(
             _Args(dcp_size=3, disaggregation_mode="decode"), page_size=1
@@ -258,7 +258,7 @@ class GuardIsWiredIntoTheScheduler(_RatiosInstalled):
         self.assertEqual(stub.order, ["build_backends"])
 
     def test_guard_refuses_before_backends_are_built(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         stub = self._StubScheduler(_Args(dcp_size=3))
         with self.assertRaises(RuntimeError) as ctx:
@@ -269,7 +269,7 @@ class GuardIsWiredIntoTheScheduler(_RatiosInstalled):
         self.assertEqual(stub.order, [])
 
     def test_backends_are_built_when_the_group_matches(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         stub = self._StubScheduler(_Args(dcp_size=3))
         with self._as_rank(0):
@@ -277,7 +277,7 @@ class GuardIsWiredIntoTheScheduler(_RatiosInstalled):
         self.assertEqual(stub.order, ["build_backends"])
 
     def test_default_server_reaches_the_backends_unchanged(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         stub = self._StubScheduler(_Args(dcp_size=1))
         Scheduler.init_all_attention_backends(stub)

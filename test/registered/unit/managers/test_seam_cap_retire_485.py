@@ -4,7 +4,7 @@
 WHAT THIS FILE PINS, AND WHY IT EXISTS
 
 ``_install_seam_cap_guard`` appends ``SEAM_ABANDON_CAP_GUARD`` to
-``blocking_guards`` after ``SGLANG_SEAM_ABANDON_CAP`` consecutive group
+``blocking_guards`` after ``FLLIPER_SEAM_ABANDON_CAP`` consecutive group
 abandons. That was the right fix for the livelock it replaced: 185 group
 abandons in nine minutes, each running the full spill ladder while the armed
 window withheld admissions, until the detokenizer heartbeat expired.
@@ -40,7 +40,7 @@ carries its own counter over the same transport.
 
 AND IT IS BOUNDED. A retire path with no limit re-opens the livelock through
 the back door: install, retire, re-abandon, forever. After
-``SGLANG_SEAM_CAP_RETIRE_LIMIT`` retirements the guard is installed for good
+``FLLIPER_SEAM_CAP_RETIRE_LIMIT`` retirements the guard is installed for good
 and says which limit it hit. The default is deliberately small -- the point is
 to survive a transient crowd, not to keep trying a configuration that does not
 fit.
@@ -55,7 +55,7 @@ Nothing here changes shipped behaviour: with no caller, no guard retires.
 
 import os
 
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     PP_TO_TP,
     SEAM_ABANDON_CAP_GUARD,
     TP_TO_PP,
@@ -219,7 +219,7 @@ class TestRetirementIsEarned:
 
 class TestTheRetireLimitClosesTheBackDoor:
     def test_the_limit_is_reachable_and_the_last_verdict_is_permanent(self):
-        with _Env(SGLANG_SEAM_CAP_RETIRE_LIMIT=2):
+        with _Env(FLLIPER_SEAM_CAP_RETIRE_LIMIT=2):
             r = _runtime()
             for _ in range(2):
                 _install(r)
@@ -243,7 +243,7 @@ class TestTheRetireLimitClosesTheBackDoor:
     def test_a_zero_limit_restores_the_shipped_behaviour_exactly(self):
         # The off switch is a VALUE of the same term, not a second code path,
         # so it cannot drift from the on switch.
-        with _Env(SGLANG_SEAM_CAP_RETIRE_LIMIT=0):
+        with _Env(FLLIPER_SEAM_CAP_RETIRE_LIMIT=0):
             assert seam_cap_retire_limit() == 0
             r = _runtime()
             _install(r)
@@ -256,12 +256,12 @@ class TestTheRetireLimitClosesTheBackDoor:
             assert r.blocking_guards != ()
 
     def test_the_limit_defaults_small(self):
-        with _Env(SGLANG_SEAM_CAP_RETIRE_LIMIT=None):
-            os.environ.pop("SGLANG_SEAM_CAP_RETIRE_LIMIT", None)
+        with _Env(FLLIPER_SEAM_CAP_RETIRE_LIMIT=None):
+            os.environ.pop("FLLIPER_SEAM_CAP_RETIRE_LIMIT", None)
             assert 0 < seam_cap_retire_limit() <= 4
 
     def test_a_bad_limit_falls_back_rather_than_raising(self):
-        with _Env(SGLANG_SEAM_CAP_RETIRE_LIMIT="not-a-number"):
+        with _Env(FLLIPER_SEAM_CAP_RETIRE_LIMIT="not-a-number"):
             assert seam_cap_retire_limit() >= 0
 
 

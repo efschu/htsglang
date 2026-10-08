@@ -7,9 +7,9 @@ import sys
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -46,7 +46,7 @@ class TestVLMViTCudaGraph(CustomTestCase):
         # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
         os.environ["OPENAI_API_KEY"] = cls.api_key
         os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
-        os.environ["SGLANG_VIT_ENABLE_CUDA_GRAPH"] = cls.enable_vit_cuda_graph
+        os.environ["FLLIPER_VIT_ENABLE_CUDA_GRAPH"] = cls.enable_vit_cuda_graph
 
     def run_mmmu_eval(
         self,
@@ -121,8 +121,8 @@ class TestVLMViTCudaGraph(CustomTestCase):
             if custom_env:
                 process_env.update(custom_env)
             # if test vlm with cuda_ipc feature, open this env_var
-            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
-            process_env["SGLANG_VIT_ENABLE_CUDA_GRAPH"] = "1"
+            process_env["FLLIPER_USE_CUDA_IPC_TRANSPORT"] = "1"
+            process_env["FLLIPER_VIT_ENABLE_CUDA_GRAPH"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None

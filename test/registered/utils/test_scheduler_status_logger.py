@@ -8,9 +8,9 @@ from pathlib import Path
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -27,8 +27,8 @@ class TestSchedulerStatusLogger(CustomTestCase):
         cls.temp_dir = tempfile.mkdtemp()
         cls.addClassCleanup(shutil.rmtree, cls.temp_dir)
         env = os.environ.copy()
-        env["SGLANG_LOG_SCHEDULER_STATUS_TARGET"] = cls.temp_dir
-        env["SGLANG_LOG_SCHEDULER_STATUS_INTERVAL"] = "1"
+        env["FLLIPER_LOG_SCHEDULER_STATUS_TARGET"] = cls.temp_dir
+        env["FLLIPER_LOG_SCHEDULER_STATUS_INTERVAL"] = "1"
         cls.process = popen_launch_server(
             "Qwen/Qwen3-0.6B",
             DEFAULT_URL_FOR_TEST,

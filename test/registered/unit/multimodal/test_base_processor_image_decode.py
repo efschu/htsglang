@@ -9,7 +9,7 @@ letting it fire lazily on the main event-loop thread later (inside
 No server, no model loading — pure CPU.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -19,9 +19,9 @@ import unittest
 import numpy as np
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.schedule_batch import Modality
+from flliper.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from flliper.test.test_utils import CustomTestCase
 
 
 class _StubProcessor(BaseMultimodalProcessor):

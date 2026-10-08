@@ -30,14 +30,14 @@ WT=/spinning/wt-631-routea
 
 mkdir -p "$OUT"
 
-echo "[ab] booting with SGLANG_CORRIDOR_REBALANCE=0"
+echo "[ab] booting with FLLIPER_CORRIDOR_REBALANCE=0"
 LOG="$OUT/serving.log" SELF=656-successor36 \
 ARGV_SRC=/tmp/s33_argv.txt ENV_SRC=/tmp/s30_env.txt \
-EXTRA_ENV='SGLANG_UNEVEN_TOKEN_VECTOR=14,10,8
-SGLANG_CORRIDOR_FLOOR_MIB=1536
-SGLANG_KV_BACKING_RELIEF=1
-SGLANG_FLIP_SEAM_CHUNK_MIB=8
-SGLANG_CORRIDOR_REBALANCE=0' \
+EXTRA_ENV='FLLIPER_UNEVEN_TOKEN_VECTOR=14,10,8
+FLLIPER_CORRIDOR_FLOOR_MIB=1536
+FLLIPER_KV_BACKING_RELIEF=1
+FLLIPER_FLIP_SEAM_CHUNK_MIB=8
+FLLIPER_CORRIDOR_REBALANCE=0' \
     bash "$WT/scripts/s33_boot_from_capture.sh" || exit 1
 
 for i in $(seq 1 90); do
@@ -50,7 +50,7 @@ done
 # invalidate the whole comparison, so the run refuses rather than produce a
 # number nobody can trust.
 if grep -q "CORRIDOR-REBALANCE ARMED" "$OUT/serving.log" 2>/dev/null; then
-    echo "[ab] REFUSE: the lender armed despite SGLANG_CORRIDOR_REBALANCE=0" >&2
+    echo "[ab] REFUSE: the lender armed despite FLLIPER_CORRIDOR_REBALANCE=0" >&2
     exit 2
 fi
 echo "[ab] confirmed: no lender arm line"

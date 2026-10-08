@@ -21,7 +21,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError, CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageError, CanonicalPageSpec
 
 PAGE = 64
 LAYERS = 3
@@ -29,7 +29,7 @@ ROW = 16  # bytes of one token row of one layer in one K/V half (heads x dim x i
 
 
 def _store():
-    from sglang.srt.mem_cache import canonical_page_store as cps
+    from flliper.srt.mem_cache import canonical_page_store as cps
 
     return cps
 

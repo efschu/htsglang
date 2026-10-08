@@ -40,12 +40,12 @@ import torch
 
 torch.set_default_device("cpu")
 
-from sglang.srt.managers.scheduler_components.metrics_reporter import (  # noqa: E402
+from flliper.srt.managers.scheduler_components.metrics_reporter import (  # noqa: E402
     RankPrefillLog,
     SchedulerMetricsReporter,
 )
 
-LOGGER_NAME = "sglang.srt.managers.scheduler_components.metrics_reporter"
+LOGGER_NAME = "flliper.srt.managers.scheduler_components.metrics_reporter"
 
 
 class FakeTimer:

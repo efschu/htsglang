@@ -30,19 +30,19 @@ say() { printf '%-6s %s\n' "$1" "$2"; [ "$1" = FAIL ] && fail=1; return 0; }
 
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 # The whole feature is dark-launched behind this. Without it the register is
 # None and the flags are legitimately inert -- which is what let F2 hide.
-export SGLANG_OFFLOAD_REGISTER=1
+export FLLIPER_OFFLOAD_REGISTER=1
 
 boot() {
   # $1 = log path, $2.. = extra flags
   local log="$1"; shift
   : > "$log"
   cd "$WT" || return 1
-  setsid "$VENV/bin/python" -u -m sglang.launch_server \
+  setsid "$VENV/bin/python" -u -m flliper.launch_server \
     --model-path "$MODEL" \
     --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
     --rank-auto-reserve-mib 5500,3800,3800 \

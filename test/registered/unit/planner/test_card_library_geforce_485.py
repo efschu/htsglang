@@ -19,7 +19,7 @@ Caught by running the path against a real census rather than by reading it.
 
 import unittest
 
-from sglang.srt.planner.card_library import CardLibrary, _canonical
+from flliper.srt.planner.card_library import CardLibrary, _canonical
 
 
 class TheLibraryMatchesDriverReportedNamesTest(unittest.TestCase):

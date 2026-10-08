@@ -29,7 +29,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Result:
@@ -70,7 +70,7 @@ class TestArenaCommitReclaimsTorchCache(CustomTestCase):
         # The module imports torch at top level; the reclaim path calls
         # torch.cuda.empty_cache / memory_reserved / memory_allocated only.
         self.events = []
-        import sglang.srt.mem_cache.kv_vmm_backing as backing
+        import flliper.srt.mem_cache.kv_vmm_backing as backing
 
         self.backing = backing
 

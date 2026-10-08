@@ -11,7 +11,7 @@ the consumers:
       ``ratio_r / S`` share (``dcp_compact_pool_rows``).  Every consumer that
       reads ``max_total_num_tokens`` as a global token count is right.
 
-  EVEN-MODULO (``SGLANG_UNEVEN_DCP=1`` with ``SGLANG_UNEVEN_DCP_WEIGHTED=0``)
+  EVEN-MODULO (``FLLIPER_UNEVEN_DCP=1`` with ``FLLIPER_UNEVEN_DCP_WEIGHTED=0``)
       ``max_total_num_tokens`` is this rank's PHYSICAL pool P, while the
       allocator hands out ``P * cp_token_split_factor(dcp_size)`` GLOBAL slot
       ids -- global slot L lives on rank ``L % S`` at compact row ``L // S``.
@@ -45,7 +45,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     cp_token_split_factor,
     get_cp_token_ratios,
     get_tp_partition_ratios,
@@ -54,18 +54,18 @@ from sglang.srt.distributed.utils import (
     uneven_dcp_active,
     uneven_dcp_kv_replicated,
 )
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.layers.dcp.owner import (
     dcp_accounting_total_slots,
     dcp_global_context_slots,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.memory_pool import graph_safe_store_bound, kv_store_bound
-from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.memory_pool import graph_safe_store_bound, kv_store_bound
+from flliper.srt.model_executor.model_runner import ModelRunner
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

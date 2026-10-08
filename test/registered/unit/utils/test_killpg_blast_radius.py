@@ -12,8 +12,8 @@ import unittest
 
 import psutil
 
-from sglang.srt.utils.common import process_group_is_confined_to_tree
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils.common import process_group_is_confined_to_tree
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 

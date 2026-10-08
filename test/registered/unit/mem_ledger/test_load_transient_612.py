@@ -25,7 +25,7 @@ derivation string.
 
 import unittest
 
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     BUDGET_FUNDED_TERMS,
     LOAD_TRANSIENT_REFERENCE_MIB,
     LOAD_TRANSIENT_REFERENCE_TAG,
@@ -35,9 +35,9 @@ from sglang.srt.mem_ledger.engine import (
     build_card_ledgers,
     demand_outside_budget_mib,
 )
-from sglang.srt.mem_ledger.reconcile import TERM_TO_POST
-from sglang.srt.mem_ledger.terms import Provenance
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_ledger.reconcile import TERM_TO_POST
+from flliper.srt.mem_ledger.terms import Provenance
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -144,7 +144,7 @@ class TestTheTermMovesTheNeedModel(unittest.TestCase):
         given back at the anchor while the serving phase raises one again.
         Leaving it out is exactly why the solve could land below its own
         target under load."""
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         self.assertIn(TERM_LOAD_TRANSIENT, ServerArgs.corridor_late_term_names())
 
@@ -192,7 +192,7 @@ class TestTheRecorderMeasuresWhatTheTermClaims(unittest.TestCase):
         of one line does not have to know which two counters to subtract."""
         import inspect
 
-        from sglang.srt.mem_ledger import flight_recorder
+        from flliper.srt.mem_ledger import flight_recorder
 
         src = inspect.getsource(flight_recorder.mark)
         self.assertIn("allocator_transient_bytes", src)
@@ -203,7 +203,7 @@ class TestTheRecorderMeasuresWhatTheTermClaims(unittest.TestCase):
         instead would produce a number the free-memory floor never feels."""
         import inspect
 
-        from sglang.srt.mem_ledger import flight_recorder
+        from flliper.srt.mem_ledger import flight_recorder
 
         src = inspect.getsource(flight_recorder.mark)
         line = [

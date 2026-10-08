@@ -32,14 +32,14 @@ THE TWO DANGER DIRECTIONS ARE BOTH PINNED:
     evict-and-also-free-again implementation fails here.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import drop_prefix_tree_returning_rows
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_flip_runtime import drop_prefix_tree_returning_rows
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Allocator:
@@ -308,11 +308,11 @@ class TestTheContractIsTheOneTheRealTreesImplement(CustomTestCase):
     boot."""
 
     def test_every_shipped_prefix_cache_answers_full_evictable_size(self):
-        from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-        from sglang.srt.mem_cache.radix_cache import RadixCache
-        from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.base_prefix_cache import BasePrefixCache
+        from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+        from flliper.srt.mem_cache.radix_cache import RadixCache
+        from flliper.srt.mem_cache.swa_radix_cache import SWARadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         for cls in (
             BasePrefixCache,
@@ -332,7 +332,7 @@ class TestTheContractIsTheOneTheRealTreesImplement(CustomTestCase):
         # returned 0 on the two that keep the count elsewhere.
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import tree_evictable_full_rows
+        from flliper.srt.managers.phase_flip_runtime import tree_evictable_full_rows
 
         def _body(fn) -> str:
             # The docstrings NAME the private attribute on purpose -- that is
@@ -347,7 +347,7 @@ class TestTheContractIsTheOneTheRealTreesImplement(CustomTestCase):
     def test_a_tree_that_cannot_answer_is_not_treated_as_empty(self):
         # `None` is not zero. Zero is a licence to skip the eviction, and
         # skipping it is the whole defect.
-        from sglang.srt.managers.phase_flip_runtime import tree_evictable_full_rows
+        from flliper.srt.managers.phase_flip_runtime import tree_evictable_full_rows
 
         class _Mute:
             pass
@@ -368,7 +368,7 @@ class TestTheCheckerStaysStrict(CustomTestCase):
     a later change ever buys a green boot by relaxing the checker instead."""
 
     def _check(self, **kw):
-        from sglang.srt.managers.scheduler_components.invariant_checker import (
+        from flliper.srt.managers.scheduler_components.invariant_checker import (
             SchedulerInvariantChecker,
         )
 
@@ -417,7 +417,7 @@ class TestTheSeamUsesIt(CustomTestCase):
         # and it is exactly what leaked on metal.
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+        from flliper.srt.managers.phase_flip_runtime import build_cutover_release
 
         src = inspect.getsource(build_cutover_release)
         self.assertIn("drop_prefix_tree_returning_rows", src)
@@ -430,7 +430,7 @@ class TestTheSeamUsesIt(CustomTestCase):
         # measurement.
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         src = inspect.getsource(PhaseFlipRuntime._release_residents_for_cutover)
         self.assertIn("tree_rows_returned", src)

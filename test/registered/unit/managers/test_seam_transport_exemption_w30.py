@@ -39,14 +39,14 @@ genuine new request, or to an OOM-preempted request's re-prefill, it has
 stopped being transport and become a hole in the purity rule.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import types
 import unittest
 
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.managers.phase_purity import (
     MODE_PREFILL_IN_TP,
     MODE_STRICT,
     SEAM_READMIT_ATTR,
@@ -56,8 +56,8 @@ from sglang.srt.managers.phase_purity import (
     seam_readmit_candidates,
     seam_transport_exempt,
 )
-from sglang.srt.managers.phase_policy import PHASE_PP, PHASE_TP
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_policy import PHASE_PP, PHASE_TP
+from flliper.test.test_utils import CustomTestCase
 
 
 def _req(rid, *, seam_epoch=None, oom_retracted=False, cached_prefix=4096):
@@ -250,7 +250,7 @@ class TestTheStampIsSeamOnlyAndOneShot(CustomTestCase):
                 "-rn",
                 "seam_readmit_epoch *=",
                 "--include=*.py",
-                "python/sglang/",
+                "python/flliper/",
             ],
             capture_output=True,
             text=True,
@@ -275,7 +275,7 @@ class TestTheStampIsSeamOnlyAndOneShot(CustomTestCase):
         # that asks for it on a never-retracted request gets a defined answer.
         import inspect
 
-        from sglang.srt.managers.schedule_batch import Req
+        from flliper.srt.managers.schedule_batch import Req
 
         self.assertIn("self.seam_readmit_epoch = None", inspect.getsource(Req.__init__))
 
@@ -286,7 +286,7 @@ class TestTheBuilderKeepsAnExemptBatchToTransportOnly(CustomTestCase):
     def test_the_builder_skips_unstamped_requests_on_an_exempt_round(self):
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
         self.assertIn("transport_only", src)
@@ -299,7 +299,7 @@ class TestTheBuilderKeepsAnExemptBatchToTransportOnly(CustomTestCase):
         # hole in the purity rule.
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
         self.assertIn("setattr(req, SEAM_READMIT_ATTR, None)", src)
@@ -334,7 +334,7 @@ class TestTheExemptionOutranksDrainModeSuppression(CustomTestCase):
     """
 
     def _drain_sched(self, queue):
-        from sglang.srt.managers.phase_policy import PhasePolicyConfig
+        from flliper.srt.managers.phase_policy import PhasePolicyConfig
 
         sched = _Sched(PHASE_TP, PhasePurity(mode=MODE_STRICT), queue)
         sched.phase_policy_cfg = PhasePolicyConfig(
@@ -361,7 +361,7 @@ class TestTheExemptionOutranksDrainModeSuppression(CustomTestCase):
         # arm 1 got wrong and no behavioural test on a passing path can see.
         import inspect
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         src = inspect.getsource(phase_purity.prefill_blocked_here)
         exempt_at = src.find("seam_transport_exempt(scheduler)")
@@ -376,7 +376,7 @@ class TestTheExemptionOutranksDrainModeSuppression(CustomTestCase):
         # It was moved, not copied. Two call sites would drift.
         import inspect
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         src = inspect.getsource(phase_purity.prefill_blocked_here)
         self.assertEqual(src.count("seam_transport_exempt(scheduler)"), 1)
@@ -419,7 +419,7 @@ class TestOnePredicateBothCallers(CustomTestCase):
     def test_both_answers_come_from_the_same_candidate_function(self):
         import inspect
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         for fn in (
             phase_purity.seam_transport_exempt,
@@ -435,7 +435,7 @@ class TestOnePredicateBothCallers(CustomTestCase):
         # THE DIVERGENCE PROOF. If the two ever stop sharing a source of
         # truth, this passes while the real system contradicts itself -- which
         # is precisely what W32 measured.
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         stamped = _req("a", seam_epoch=1)
         stamped.origin_input_ids = list(range(100))
@@ -465,7 +465,7 @@ class TestOnePredicateBothCallers(CustomTestCase):
         # subtraction would be a fourth copy of the same judgement.
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler)
         self.assertIn("seam_transport_pending_tokens", src)
@@ -473,7 +473,7 @@ class TestOnePredicateBothCallers(CustomTestCase):
     def test_unstamped_pending_is_still_pp_work(self):
         # CAN-FAIL: ordinary queued prefill must still count toward the
         # tp_to_pp arm, or the policy stops returning to PP at all.
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         fresh = _req("fresh")
         fresh.origin_input_ids = list(range(500))
@@ -501,7 +501,7 @@ class TheExemptionsPremiseIsCheckedNotAsserted(unittest.TestCase):
     def setUp(self):
         import inspect as _inspect
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         self.pp = phase_purity
         self.inspect = _inspect

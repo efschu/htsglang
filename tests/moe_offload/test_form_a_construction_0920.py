@@ -15,7 +15,7 @@ tensors per 3080. This is the half that gets them back.
 import pytest
 import torch.nn as nn
 
-from sglang.srt.form_a_construction import (
+from flliper.srt.form_a_construction import (
     HOST_ONLY_KINDS,
     FormAHostOnlyModuleUsed,
     HostOnlyModule,
@@ -25,7 +25,7 @@ from sglang.srt.form_a_construction import (
     skip_on_worker,
     worker_builds,
 )
-from sglang.srt.rank_role import (
+from flliper.srt.rank_role import (
     RankRoleError,
     RankRolePlan,
     set_form_a_role_plan,
@@ -191,7 +191,7 @@ def test_the_model_wires_the_skip_at_the_posts_that_cost_the_most():
     later refactor that drops it fails here."""
     import inspect
 
-    from sglang.srt.models import qwen4_exp
+    from flliper.srt.models import qwen4_exp
 
     src = inspect.getsource(qwen4_exp)
     assert src.count("skip_on_worker(") >= 3

@@ -3,7 +3,7 @@
 THE SPECIMEN. Gapped boot v6, ``boot_735_760gapped.log``, 2026-08-18 16:03:07Z,
 PP=3 over one 32.6 GiB and two smaller cards, with
 
-    SGLANG_PP_LAYER_SET=
+    FLLIPER_PP_LAYER_SET=
       PP0  0-2,4-6,8-10,...,60-62        48 GDN layers, span [0, 63)
       PP1  3,7,11,15,19,23,27,31          8 full-attention layers
       PP2  35,39,43,47,51,55,59,63        8 full-attention layers
@@ -66,10 +66,10 @@ from the log above or computed by the function under test.
 
 import unittest
 
-from sglang.srt.distributed.utils import stage_owned_layer_ids
-from sglang.srt.mem_cache.kv_vmm_backing import arena_reserve_bytes
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.utils import stage_owned_layer_ids
+from flliper.srt.mem_cache.kv_vmm_backing import arena_reserve_bytes
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -207,7 +207,7 @@ class TestTheShippedCallSiteUsesIt(CustomTestCase):
     def test_the_hybrid_pool_resolves_ownership_set_aware(self):
         import inspect
 
-        from sglang.srt.model_executor import model_runner_kv_cache_mixin as mixin
+        from flliper.srt.model_executor import model_runner_kv_cache_mixin as mixin
 
         src = inspect.getsource(mixin)
         marker = "full_attention_layer_ids=("
@@ -218,13 +218,13 @@ class TestTheShippedCallSiteUsesIt(CustomTestCase):
             "if self.start_layer <= i < self.end_layer",
             window,
             "the KV pool is resolving stage ownership from the INTERVAL again; "
-            "under SGLANG_PP_LAYER_SET that is the span, not the set",
+            "under FLLIPER_PP_LAYER_SET that is the span, not the set",
         )
 
     def test_the_owner_uses_the_extracted_reserve_formula(self):
         import inspect
 
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 
         src = inspect.getsource(KvVmmBufferOwner.__init__)
         self.assertIn("arena_reserve_bytes(", src)
@@ -234,7 +234,7 @@ class TestTheShippedCallSiteUsesIt(CustomTestCase):
         rule is how the lineages drift."""
         import inspect
 
-        from sglang.srt.mem_cache import memory_pool
+        from flliper.srt.mem_cache import memory_pool
 
         src = inspect.getsource(memory_pool._owned_layers_for_pool)
         self.assertIn("current_stage_layer_set", src)

@@ -4,9 +4,9 @@ import pytest
 import torch
 import triton
 
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.jit_kernel.utils import get_ci_test_range
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=64, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=256, suite="nightly-kernel-1-gpu", nightly=True)
@@ -24,7 +24,7 @@ def create_cos_sin_cache(
     max_position: int = MAX_SEQ_LEN,
     base: float = ROPE_BASE,
 ) -> torch.Tensor:
-    """Create cos/sin cache compatible with SGLang layout: [max_pos, rotary_dim]."""
+    """Create cos/sin cache compatible with fLLiper layout: [max_pos, rotary_dim]."""
     inv_freq = 1.0 / (
         base
         ** (
@@ -45,14 +45,14 @@ def create_cos_sin_cache(
 # ---------------------------------------------------------------------------
 
 
-def sglang_jit_rope(
+def flliper_jit_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope import apply_rope_inplace
+    from flliper.jit_kernel.rope import apply_rope_inplace
 
     apply_rope_inplace(q, k, cos_sin_cache, positions, is_neox=is_neox)
 
@@ -181,7 +181,7 @@ def test_rope(
     q_jit, k_jit = q.clone(), k.clone()
 
     reference_rope(q_fi, k_fi, cos_sin_cache, positions, is_neox)
-    sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
+    flliper_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
     triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
@@ -203,7 +203,7 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     q_jit, k_jit = q.clone(), k.clone()
 
     reference_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
-    sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
+    flliper_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
     triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
@@ -229,7 +229,7 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
     rope = ..., slice(rope_dim)  # NOTE: flashinfer by default apply to first rope_dim
 
     reference_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
-    sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
+    flliper_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
     triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
@@ -249,7 +249,7 @@ def test_fused_rope_store(
     is_neox: bool,
 ) -> None:
     """Test fused RoPE + KV cache store against separate RoPE + manual store."""
-    from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
+    from flliper.jit_kernel.rope import apply_rope_inplace_with_kvcache
 
     num_qo_heads = num_kv_heads * gqa_ratio
     dtype = DTYPE

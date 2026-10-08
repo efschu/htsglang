@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.flip_nextflash_plan import Weg2FlipDraftStateOrphaned
-from sglang.srt.flip_state_carry import (
+from flliper.srt.flip_nextflash_plan import PdFlipDraftStateOrphaned
+from flliper.srt.flip_state_carry import (
     DRAFT_REBUILD_TOKENS,
     KIND_KV_FOLLOWING,
     KIND_RECURRENT,
@@ -77,7 +77,7 @@ def test_declaring_the_solo_draft_as_carried_is_W115():
         else StateFamily(f.name, f.kind, "", f.owner_d, 0, "carried", 0, f.why)
         for f in NEXT_FLASH_STATES
     )
-    with pytest.raises(Weg2FlipDraftStateOrphaned) as exc:
+    with pytest.raises(PdFlipDraftStateOrphaned) as exc:
         solve_flip_state_carry(_LIVE, families=bad)
     msg = str(exc.value)
     assert "no P-side owner" in msg
@@ -91,7 +91,7 @@ def test_a_rebuild_priced_at_zero_is_W115():
         else StateFamily(f.name, f.kind, "", f.owner_d, 0, "rebuilt", 0, f.why)
         for f in NEXT_FLASH_STATES
     )
-    with pytest.raises(Weg2FlipDraftStateOrphaned) as exc:
+    with pytest.raises(PdFlipDraftStateOrphaned) as exc:
         solve_flip_state_carry(_LIVE, families=bad)
     assert "undeclared cost" in str(exc.value)
 
@@ -112,10 +112,10 @@ def test_the_qsa_raw_key_ring_is_declared_now():
 def test_an_undeclared_live_family_is_W115_not_silently_absent():
     """The whole mechanism: feed the runner's ACTUAL inventory and an
     undeclared family falls out as a refusal."""
-    with pytest.raises(Weg2FlipDraftStateOrphaned) as exc:
+    with pytest.raises(PdFlipDraftStateOrphaned) as exc:
         solve_flip_state_carry(_LIVE + ["hyper_connection_mixer_buffer"])
     msg = str(exc.value)
-    assert "W115 Weg2FlipDraftStateOrphaned" in msg
+    assert "W115 PdFlipDraftStateOrphaned" in msg
     assert "hyper_connection_mixer_buffer" in msg
     assert "risk R5" in msg
     assert "belonging to nobody" in msg
@@ -123,7 +123,7 @@ def test_an_undeclared_live_family_is_W115_not_silently_absent():
 
 def test_a_declared_family_the_runner_does_not_hold_is_also_W115():
     """A carry is a claim about something; a stale claim is still a claim."""
-    with pytest.raises(Weg2FlipDraftStateOrphaned) as exc:
+    with pytest.raises(PdFlipDraftStateOrphaned) as exc:
         solve_flip_state_carry([n for n in _LIVE if n != "mamba_ssm_state"])
     assert "does not hold" in str(exc.value)
     assert "stale" in str(exc.value)
@@ -176,22 +176,22 @@ class _Sched:
 
 
 def test_the_cutover_verifies_the_state_carry_on_the_decode_side():
-    from sglang.srt.managers.phase_flip_runtime import _verify_flip_state_carry
+    from flliper.srt.managers.phase_flip_runtime import _verify_flip_state_carry
 
     _verify_flip_state_carry(_Sched(_LIVE), tp_phase=True)  # no raise
 
 
 def test_the_cutover_raises_W115_for_an_undeclared_live_family():
-    from sglang.srt.managers.phase_flip_runtime import _verify_flip_state_carry
+    from flliper.srt.managers.phase_flip_runtime import _verify_flip_state_carry
 
     sched = _Sched(_LIVE + ["hyper_connection_mixer_buffer"])
-    with pytest.raises(Weg2FlipDraftStateOrphaned) as exc:
+    with pytest.raises(PdFlipDraftStateOrphaned) as exc:
         _verify_flip_state_carry(sched, tp_phase=True)
     assert "hyper_connection_mixer_buffer" in str(exc.value)
 
 
 def test_the_pp_side_is_not_checked_because_it_rebuilds_anyway():
-    from sglang.srt.managers.phase_flip_runtime import _verify_flip_state_carry
+    from flliper.srt.managers.phase_flip_runtime import _verify_flip_state_carry
 
     sched = _Sched(_LIVE + ["something_undeclared"])
     _verify_flip_state_carry(sched, tp_phase=False)  # no raise
@@ -200,7 +200,7 @@ def test_the_pp_side_is_not_checked_because_it_rebuilds_anyway():
 def test_a_runner_without_an_inventory_stands_aside_rather_than_passing_empty():
     """An empty list would pass the completeness test for every declared
     family at once -- an ABSENCE must be reported as one."""
-    from sglang.srt.managers.phase_flip_runtime import (
+    from flliper.srt.managers.phase_flip_runtime import (
         _next_flash_live_state_families,
         _verify_flip_state_carry,
     )
@@ -213,13 +213,13 @@ def test_a_runner_without_an_inventory_stands_aside_rather_than_passing_empty():
 
 
 def test_a_raising_inventory_is_an_absence_not_a_crash():
-    from sglang.srt.managers.phase_flip_runtime import _next_flash_live_state_families
+    from flliper.srt.managers.phase_flip_runtime import _next_flash_live_state_families
 
     assert _next_flash_live_state_families(_Sched(raising=True)) is None
 
 
 def test_a_plain_sequence_inventory_also_works():
-    from sglang.srt.managers.phase_flip_runtime import _next_flash_live_state_families
+    from flliper.srt.managers.phase_flip_runtime import _next_flash_live_state_families
 
     class Seq:
         next_flash_state_families = tuple(_LIVE)

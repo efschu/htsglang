@@ -1,7 +1,7 @@
 """
-SGLang Embeddings Benchmark Script
+fLLiper Embeddings Benchmark Script
 
-This script benchmarks SGLang's /v1/embeddings API performance using HTTP requests.
+This script benchmarks fLLiper's /v1/embeddings API performance using HTTP requests.
 
 Features:
 - HTTP-only implementation
@@ -12,7 +12,7 @@ Features:
 
 Usage:
 - Update configuration variables at the top of the file
-- Ensure SGLang server is running on the configured HTTP_URL
+- Ensure fLLiper server is running on the configured HTTP_URL
 - Run: python bench_embeddings.py
 """
 
@@ -47,7 +47,7 @@ config.profile = False
 config.freeze_gc = True  # Enable GC freeze functionality
 # Profiler output directory - by default uses present working directory (pwd)
 # Uncomment and customize the line below to override the default location:
-# config.profiler_dir = "/sglang-oss-trace"
+# config.profiler_dir = "/flliper-oss-trace"
 
 # HTTP Configuration
 HTTP_URL = "http://localhost:30000/v1/embeddings"

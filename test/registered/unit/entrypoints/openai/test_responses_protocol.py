@@ -2,8 +2,8 @@ import unittest
 
 from utils import make_serving  # noqa: F401 — bootstrap import
 
-from sglang.srt.entrypoints.openai.protocol import ResponsesRequest, UsageInfo
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.openai.protocol import ResponsesRequest, UsageInfo
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -125,7 +125,7 @@ class ResponsesSamplingParamsTestCase(unittest.TestCase):
 
 class ResponsesResponseFromRequestTestCase(unittest.TestCase):
     def test_parallel_tool_calls_false_preserved(self):
-        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+        from flliper.srt.entrypoints.openai.protocol import ResponsesResponse
 
         request = ResponsesRequest(
             model="x", input="hi", parallel_tool_calls=False, store=False

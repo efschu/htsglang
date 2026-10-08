@@ -28,18 +28,18 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.managers.regime_classifier import (
+from flliper.srt.managers.regime_classifier import (
     REGIME_DECODE_HEAVY,
     REGIME_PREFILL_HEAVY,
     RegimeError,
     Stage,
 )
-from sglang.srt.managers.regime_stages import apply_measurements, build_stage_table
-from sglang.srt.planner.stage_measure_store import (
+from flliper.srt.managers.regime_stages import apply_measurements, build_stage_table
+from flliper.srt.planner.stage_measure_store import (
     StageMeasurement,
     StageMeasurementLibrary,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -214,10 +214,10 @@ def test_the_production_wiring_reads_the_canon_and_gates_on_the_file(
     """
     import types
 
-    from sglang.srt.managers import regime_runtime
+    from flliper.srt.managers import regime_runtime
 
     store = tmp_path / "stage_measurements.json"
-    monkeypatch.setenv("SGLANG_STAGE_MEASUREMENTS", str(store))
+    monkeypatch.setenv("FLLIPER_STAGE_MEASUREMENTS", str(store))
     server_args = types.SimpleNamespace(model_path=MODEL)
 
     # No file -> the pre-#584 path, and nothing was read.
@@ -230,7 +230,7 @@ def test_the_production_wiring_reads_the_canon_and_gates_on_the_file(
         cards=[types.SimpleNamespace(uuid=u) for u in ("GPU-ccc", "GPU-aaa", "GPU-bbb")]
     )
     monkeypatch.setattr(
-        "sglang.srt.registry.nvml.identity_map", lambda *a, **k: fake, raising=False
+        "flliper.srt.registry.nvml.identity_map", lambda *a, **k: fake, raising=False
     )
     library, rig, model = regime_runtime._stage_measurements(server_args)
     assert library is not None and len(library) == 1
@@ -252,7 +252,7 @@ def test_the_boot_table_builder_actually_hands_the_canon_over():
     import ast
     import inspect
 
-    from sglang.srt.managers import regime_runtime
+    from flliper.srt.managers import regime_runtime
 
     tree = ast.parse(inspect.getsource(regime_runtime.build_regime_stage_table))
     calls = [
@@ -275,11 +275,11 @@ def test_a_canon_that_cannot_be_read_is_skipped_not_raised(tmp_path, monkeypatch
     admit anything either: it lands on the same refusal a missing file does."""
     import types
 
-    from sglang.srt.managers import regime_runtime
+    from flliper.srt.managers import regime_runtime
 
     store = tmp_path / "stage_measurements.json"
     store.write_text("{not json")
-    monkeypatch.setenv("SGLANG_STAGE_MEASUREMENTS", str(store))
+    monkeypatch.setenv("FLLIPER_STAGE_MEASUREMENTS", str(store))
     assert regime_runtime._stage_measurements(
         types.SimpleNamespace(model_path=MODEL)
     ) == (None, "", "")

@@ -62,8 +62,8 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.gdn_flip_mover import agree_mamba_slots
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.gdn_flip_mover import agree_mamba_slots
+from flliper.test.test_utils import CustomTestCase
 
 
 class _DeviceOnlyGroup:

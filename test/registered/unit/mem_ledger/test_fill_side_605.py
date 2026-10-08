@@ -33,8 +33,8 @@ import sys
 import tempfile
 import unittest
 
-from sglang.srt.mem_ledger import flight_recorder
-from sglang.srt.mem_ledger.flight_recorder import MIB, mark, read_marks
+from flliper.srt.mem_ledger import flight_recorder
+from flliper.srt.mem_ledger.flight_recorder import MIB, mark, read_marks
 
 sys.path.insert(
     0,

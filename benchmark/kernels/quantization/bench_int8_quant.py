@@ -4,8 +4,8 @@ import torch
 import triton
 from vllm._custom_ops import scaled_int8_quant as vllm_scaled_int8_quant
 
-from sglang.benchmark.bench_utils import run_bench
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from flliper.benchmark.bench_utils import run_bench
+from flliper.srt.layers.quantization.int8_kernel import per_token_quant_int8
 
 
 @torch.compile(backend="inductor")

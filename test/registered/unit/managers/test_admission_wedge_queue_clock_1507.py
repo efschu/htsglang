@@ -2,7 +2,7 @@
 
 Both verdicts aged a request from the LAST PROGRESS (classic: first-token clock; PREFILL-LIVELOCK: decode
 clock), so a request arriving after a long idle met an old clock and the first 10 s poll that saw it alarmed.
-Behind SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK (default off) the age of both verdicts and of the recovery driver is
+Behind FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK (default off) the age of both verdicts and of the recovery driver is
 counted from max(last progress, the poll that saw the queue/running set go from empty to non-empty).
 
 DANGER DIRECTIONS: env off -> the pre-fix numbers, nothing written onto the scheduler; env on -> the arrival after
@@ -10,7 +10,7 @@ idle does not alarm before 20 s of its own waiting, and a stand that begins whil
 same poll as with the env off.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -18,14 +18,14 @@ import time
 import types
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.managers.scheduler_components import invariant_checker as IC
+from flliper.srt.environ import envs
+from flliper.srt.managers.scheduler_components import invariant_checker as IC
 
 
 class _Base(unittest.TestCase):
     def tearDown(self):  # Env.override() does not restore on an exception inside the block
-        envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.clear()
-        envs.SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS.clear()
+        envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.clear()
+        envs.FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS.clear()
 
 
 def _sched(first_token, queued=0, running=0, decode=None, prefill=None):
@@ -38,7 +38,7 @@ def _sched(first_token, queued=0, running=0, decode=None, prefill=None):
         last_decode_progress_time=decode,
         forward_ct=0,
         _wedge_class_sample=None,
-        weg2_dormant=False,
+        pdflip_dormant=False,
     )
 
 
@@ -55,7 +55,7 @@ class Alarm2ClassicAfterIdle(_Base):
     def _run(self, on):
         s = _sched(first_token=0.0)
         out = []
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
             out.append(IC.check_admission_wedge_once(s, now=90.0)[0])  # idle poll
             _set(s, queued=1)  # the request arrives
             for t in (95.0, 105.0, 114.0, 116.0, 126.0):  # polls every 10 s, +2 s jitter
@@ -76,7 +76,7 @@ class Alarm1PrefillLivelockAfterPause(_Base):
     def _scenario(self, on):
         s = _sched(first_token=0.0, decode=0.0)
         out = []
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
             IC.check_admission_wedge_once(s, now=100.0)  # idle poll
             _set(s, queued=2, running=1)
             for t in (105.0, 115.0, 124.0, 126.0):
@@ -92,7 +92,7 @@ class Alarm1PrefillLivelockAfterPause(_Base):
     def test_a_group_that_never_decoded_is_still_not_judged(self):
         s = _sched(first_token=0.0, decode=None)
         _set(s, queued=2, running=1)
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
             for t in (100.0, 200.0, 400.0):
                 self.assertNotIn("PREFILL-LIVELOCK", IC.check_admission_wedge_once(s, now=t)[1])
 
@@ -104,7 +104,7 @@ class RealWedgeNotLater(_Base):
         # busy from t=0, last first token at t=5, then nothing
         s = _sched(first_token=5.0, queued=1, decode=5.0)
         out = []
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
             for t in (0.0, 5.0, 10.0, 20.0, 25.0, 30.0, 40.0):
                 out.append(IC.check_admission_wedge_once(s, now=t)[0])
         return out
@@ -117,7 +117,7 @@ class RealWedgeNotLater(_Base):
     def test_livelock_begun_while_busy_same_first_alarm_poll(self):
         def run(on):
             s = _sched(first_token=0.0, queued=2, running=3, decode=5.0)
-            with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
+            with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
                 return [
                     "PREFILL-LIVELOCK" in IC.check_admission_wedge_once(s, now=t)[1]
                     for t in (0.0, 10.0, 24.0, 26.0, 40.0)
@@ -128,7 +128,7 @@ class RealWedgeNotLater(_Base):
 
     def test_arrival_with_nothing_served_still_alarms_after_20s(self):
         s = _sched(first_token=0.0)
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
             IC.check_admission_wedge_once(s, now=100.0)
             _set(s, queued=1)
             self.assertFalse(IC.check_admission_wedge_once(s, now=110.0)[0])
@@ -138,7 +138,7 @@ class RealWedgeNotLater(_Base):
 
     def test_running_request_is_never_the_classic_wedge(self):
         s = _sched(first_token=0.0, queued=1, running=1)
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
             IC.check_admission_wedge_once(s, now=100.0)
             self.assertFalse(IC.check_admission_wedge_once(s, now=300.0)[0])
 
@@ -146,7 +146,7 @@ class RealWedgeNotLater(_Base):
 class QueueEmptiesAgain(_Base):
     def test_idle_poll_drops_the_floor_and_a_new_arrival_gets_a_new_one(self):
         s = _sched(first_token=0.0, queued=1)
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
             IC.check_admission_wedge_once(s, now=100.0)
             self.assertEqual(s._wedge_busy_since, 100.0)
             _set(s, queued=0)
@@ -159,7 +159,7 @@ class QueueEmptiesAgain(_Base):
 
 class EnvOffUnchanged(_Base):
     def test_default_is_off(self):
-        self.assertFalse(envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.get())
+        self.assertFalse(envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.get())
 
     def test_off_verdict_and_detail_are_the_old_ones_and_nothing_is_stamped(self):
         s = _sched(first_token=0.0, queued=1)
@@ -180,11 +180,11 @@ class EnvOffUnchanged(_Base):
 
 class RecoveryDriverUsesTheSameAge(_Base):
     def _post(self, on):
-        from sglang.srt.managers.wedge_recovery import RECOVERY_CHANNEL_ATTR
+        from flliper.srt.managers.wedge_recovery import RECOVERY_CHANNEL_ATTR
 
         s = _sched(first_token=time.perf_counter() - 100.0, queued=1)
         s._wedge_busy_since = time.perf_counter() - 1.0
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(on), envs.SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS.override(5.0):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(on), envs.FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS.override(5.0):
             IC.AdmissionWedgeRecovery(s, clock=lambda: 1000.0).step(True)
         return getattr(s, RECOVERY_CHANNEL_ATTR, None)
 
@@ -208,7 +208,7 @@ class StuckStateStamp1515(_Base):
     def _flow(self, on):
         s = _sched(first_token=0.0, running=1)
         out = []
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
             for t in self.BUSY_POLLS:  # A decodes, the set is never seen empty
                 IC.check_admission_wedge_once(s, now=t)
             _set(s, queued=1, running=0)  # A ended at 115, B queued at 117
@@ -225,7 +225,7 @@ class StuckStateStamp1515(_Base):
 
     def test_stuck_stamp_is_dropped_when_the_state_ends(self):
         s = _sched(first_token=0.0, running=1)
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
             IC.check_admission_wedge_once(s, now=0.0)
             self.assertIsNone(getattr(s, "_wedge_stuck_since", None))
             _set(s, queued=1, running=0)
@@ -240,7 +240,7 @@ class StuckStateStamp1515(_Base):
 
     def test_real_wedge_after_a_ends_is_still_found_20s_after_its_first_poll(self):
         s = _sched(first_token=0.0, running=1)
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(True):
             IC.check_admission_wedge_once(s, now=0.0)
             _set(s, queued=1, running=0)
             out = [IC.check_admission_wedge_once(s, now=t)[0] for t in (110.0, 120.0, 129.0, 131.0, 200.0, 400.0)]
@@ -249,7 +249,7 @@ class StuckStateStamp1515(_Base):
     def test_livelock_is_judged_by_the_busy_floor_not_the_stuck_stamp(self):
         def run(on):
             s = _sched(first_token=0.0, queued=2, running=3, decode=5.0)
-            with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
+            with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(on):
                 got = [
                     "PREFILL-LIVELOCK" in IC.check_admission_wedge_once(s, now=t)[1]
                     for t in (0.0, 10.0, 24.0, 26.0, 40.0)
@@ -267,12 +267,12 @@ class StuckStateStamp1515(_Base):
         self.assertFalse(hasattr(s, "_wedge_stuck_since"))
 
     def test_recovery_driver_counts_from_the_stuck_stamp_too(self):
-        from sglang.srt.managers.wedge_recovery import RECOVERY_CHANNEL_ATTR
+        from flliper.srt.managers.wedge_recovery import RECOVERY_CHANNEL_ATTR
 
         s = _sched(first_token=time.perf_counter() - 100.0, queued=1)
         s._wedge_busy_since = time.perf_counter() - 100.0  # A's start: old
         s._wedge_stuck_since = time.perf_counter() - 1.0  # the state is 1 s old
-        with envs.SGLANG_ADMISSION_WEDGE_QUEUE_CLOCK.override(True), envs.SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS.override(5.0):
+        with envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.override(True), envs.FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS.override(5.0):
             IC.AdmissionWedgeRecovery(s, clock=lambda: 1000.0).step(True)
         self.assertIsNone(getattr(s, RECOVERY_CHANNEL_ATTR, None))
 

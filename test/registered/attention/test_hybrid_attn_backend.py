@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.server_fixtures.hybrid_attn_backend_fixture import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.server_fixtures.hybrid_attn_backend_fixture import (
     TestHybridAttnBackendBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
 )

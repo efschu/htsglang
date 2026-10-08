@@ -22,16 +22,16 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_cp_token_ratios,
     set_cp_token_ratios,
 )
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.layers.dcp.owner import (
     dcp_weighted_owner_bounds,
     dcp_weighted_write_slots,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.kv_canary.utils import (
+from flliper.jit_kernel.benchmark.kv_canary.utils import (
     POOL_AXIS,
     SWA_WINDOW,
     BenchCase,
@@ -15,15 +15,15 @@ from sglang.jit_kernel.benchmark.kv_canary.utils import (
     build_full_matrix_cases,
     naive_cumsum_fn,
 )
-from sglang.jit_kernel.benchmark.utils import (
+from flliper.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
-from sglang.jit_kernel.kv_canary.write import WritePlan
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
+from flliper.jit_kernel.kv_canary.verify import VerifyPlan
+from flliper.jit_kernel.kv_canary.write import WritePlan
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 # AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).

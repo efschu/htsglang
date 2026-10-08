@@ -51,14 +51,14 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.unified_radix_cache import (
+from flliper.srt.mem_cache.unified_radix_cache import (
     HiCacheCollectiveError,
     UnifiedRadixCache,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # ~25s: TestGlooReproduction spawns three child interpreters that each import
-# sglang and stand up a real gloo group.
+# flliper and stand up a real gloo group.
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 #: Payload posted by the peers in the production crash: the kv-pressure
@@ -266,7 +266,7 @@ class TestSchedulerPrefetchGateIsRankUniform(unittest.TestCase):
     hold the node."""
 
     def _driver(self, *, backuped: bool, symmetric: bool):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         calls = []
         root = _node()
@@ -314,7 +314,7 @@ class TestSchedulerPrefetchGateIsRankUniform(unittest.TestCase):
 # End-to-end falsifier: the real method, a real gloo group, three processes.
 # --------------------------------------------------------------------------
 
-_CHILD_ENV = "SGLANG_580_GLOO_CHILD"
+_CHILD_ENV = "FLLIPER_580_GLOO_CHILD"
 
 
 def _gloo_child() -> None:

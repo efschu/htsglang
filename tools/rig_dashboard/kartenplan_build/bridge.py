@@ -2,7 +2,7 @@
 
 * ``gate``       im Server-Prozess, reine Funktionen aus card_identity/topology (kartenplan_gate).
 * ``rederive``   Nachrechnen der Budgets mit ``launcher.budgets_from_dc`` in einem KINDPROZESS mit der
-                 sglang-Umgebung (der Import zieht torch, ~1 GB und ~10 s; der Dashboard-Dienst hat
+                 flliper-Umgebung (der Import zieht torch, ~1 GB und ~10 s; der Dashboard-Dienst hat
                  MemoryMax=1G und läuft ohne torch).  Gebraucht beim Bau der Records und im Test, nicht
                  bei jeder Seitenabfrage: das Ergebnis steht dann als ``planer_nachrechnung`` im Record.
 
@@ -93,7 +93,7 @@ def _d_rows(rec: dict, cards: List[dict]) -> List[dict]:
     growth = [int(x.get("growth") or 0) for x in t]
     dorm = [int(x["dormant"]) - g for x, g in zip(t, growth)]
     row = {"id": "%s:D" % rec["id"], "label": "D", "cards": cards, "dormant_other": dorm, "growth": growth,
-           "growth_prov": "WEG2-DORMANT-SERVED record", "charge_carve": any(int(x["carve"]) > 0 for x in t),
+           "growth_prov": "PDFLIP-DORMANT-SERVED record", "charge_carve": any(int(x["carve"]) > 0 for x in t),
            "expected_mib": [int(x["budget"]) for x in t]}
     src = [str(x.get("awake_source", "")) for x in t]
     if all(s.startswith("RECORD") for s in src):
@@ -125,7 +125,7 @@ def rederive_rows(rec: dict) -> List[dict]:
 
 
 def call(op: str, payload: dict, *, tree_python: str, python: str = DEFAULT_PYTHON, timeout: int = 120) -> dict:
-    """Kindprozess mit der sglang-Umgebung.  Kein GPU-Zugriff (CUDA_VISIBLE_DEVICES leer)."""
+    """Kindprozess mit der flliper-Umgebung.  Kein GPU-Zugriff (CUDA_VISIBLE_DEVICES leer)."""
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": tree_python, "CUDA_VISIBLE_DEVICES": "",
            "HOME": os.environ.get("KARTENPLAN_RIG_HOME", "/root"), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONWARNINGS": "ignore"}
     req = dict(payload, op=op)
@@ -171,7 +171,7 @@ def main(argv=None) -> int:
     from . import records as R
 
     ap = argparse.ArgumentParser(description=main.__doc__)
-    ap.add_argument("--trees-root", required=True, help="Ordner mit <rev>/python/sglang (git archive der Boot-Revisionen)")
+    ap.add_argument("--trees-root", required=True, help="Ordner mit <rev>/python/flliper (git archive der Boot-Revisionen)")
     ap.add_argument("--python", default=DEFAULT_PYTHON)
     ap.add_argument("ids", nargs="*")
     ns = ap.parse_args(argv)

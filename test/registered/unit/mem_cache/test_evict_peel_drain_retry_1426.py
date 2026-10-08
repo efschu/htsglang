@@ -7,7 +7,7 @@ import types
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 def _peel(written_seq, ongoing):
@@ -38,7 +38,7 @@ def test_nothing_in_flight_means_nothing_to_drain():
 
 
 def test_full_evictable_size_is_the_tree_counter_again():
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
     t = object.__new__(UnifiedRadixCache)
     t.component_evictable_size_ = {urc.BASE_COMPONENT_TYPE: 4711}
     assert t.full_evictable_size() == 4711

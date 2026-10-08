@@ -49,9 +49,9 @@ from __future__ import annotations
 import inspect
 import unittest
 
-from sglang.srt.managers import phase_flip_spill
-from sglang.srt.managers.corridor_guard import GuardResult
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers import phase_flip_spill
+from flliper.srt.managers.corridor_guard import GuardResult
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
 MIB = 1024 * 1024
 
@@ -144,7 +144,7 @@ class TheVerdictTravelsAsAStringTest(unittest.TestCase):
         # the same one 23 MiB short. The margin's own semantics are pinned
         # in test_seam_entry_margin_631; what this asserts is that the
         # staging the gate was GIVEN still reaches the guard intact.
-        from sglang.srt.managers.phase_flip_runtime import seam_entry_margin_bytes
+        from flliper.srt.managers.phase_flip_runtime import seam_entry_margin_bytes
 
         r = _runtime()
         with _Patched(_Guard(_cleared())) as g:
@@ -273,7 +273,7 @@ class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):
     memory that would end it. Measured: 411 abandons, 0 requests in 6 min."""
 
     def test_a_raised_arming_floor_does_not_manufacture_refusals(self):
-        from sglang.srt.managers import corridor_guard as cg
+        from flliper.srt.managers import corridor_guard as cg
 
         free = [2306 * MIB]
         g = cg.CorridorGuard(
@@ -301,7 +301,7 @@ class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):
         the box at 06:47:48 with 727004 tokens waiting. The allocation fits;
         only an allocation LARGER than free is still refused.
         """
-        from sglang.srt.managers import corridor_guard as cg
+        from flliper.srt.managers import corridor_guard as cg
 
         free = [1100 * MIB]
         g = cg.CorridorGuard(
@@ -318,7 +318,7 @@ class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):
         self.assertFalse(g.ensure_headroom(5000 * MIB).ok)
 
     def test_by_default_the_two_floors_coincide(self):
-        from sglang.srt.managers import corridor_guard as cg
+        from flliper.srt.managers import corridor_guard as cg
 
         g = cg.CorridorGuard(0, probe=lambda: 0)
         self.assertEqual(g.law_floor_mib, cg.DEFAULT_FLOOR_MIB)
@@ -582,7 +582,7 @@ class TheRungReportsAZeroTest(unittest.TestCase):
     def test_the_gate_logs_the_rung_even_when_it_pays_nothing(self):
         import inspect as _inspect
 
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         src = _inspect.getsource(phase_flip_runtime.PhaseFlipRuntime._corridor_gate)
         self.assertIn("returned NOTHING before the gate", src)
@@ -594,7 +594,7 @@ class TheRungReportsAZeroTest(unittest.TestCase):
         """Without this clause the next reader repeats the misdiagnosis."""
         import inspect as _inspect
 
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         src = _inspect.getsource(phase_flip_runtime.PhaseFlipRuntime._corridor_gate)
         self.assertIn("no KV provider is registered with", src)

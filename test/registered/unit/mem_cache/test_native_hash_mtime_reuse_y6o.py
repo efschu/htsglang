@@ -23,11 +23,11 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest
 
-from sglang.srt.mem_cache.cpp_utils import native_hash as nh
+from flliper.srt.mem_cache.cpp_utils import native_hash as nh
 
 _SRC_DIR = os.path.dirname(os.path.abspath(nh.__file__))
 _PY_ROOT = os.path.dirname(
-    os.path.dirname(os.path.abspath(sys.modules["sglang"].__file__))
+    os.path.dirname(os.path.abspath(sys.modules["flliper"].__file__))
 )
 
 

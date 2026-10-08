@@ -10,7 +10,7 @@ TWO PROBLEMS, and the second is the one that makes this more than a one-line
 caller fix.
 
 1. ORPHANED. ``stop()`` had no callers, so on any boot with
-   ``SGLANG_LOCKSTEP_SENTINEL=1`` the thread ran until the interpreter died.
+   ``FLLIPER_LOCKSTEP_SENTINEL=1`` the thread ran until the interpreter died.
 
 2. ``stop()`` DOES NOT WAIT. Its whole body was ``self._stop.set()``. The loop
    is ``while not stop: sleep(interval); compare_once()``, and
@@ -34,9 +34,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
-SENTINEL_MOD = "sglang.srt.distributed.device_communicators.lockstep_sentinel"
+SENTINEL_MOD = "flliper.srt.distributed.device_communicators.lockstep_sentinel"
 
 
 class _Blocked:
@@ -52,7 +52,7 @@ class _Blocked:
 
 def _sentinel(worker_target=None):
     """A real LockstepSentinel carrying only what the stop path touches."""
-    from sglang.srt.distributed.device_communicators.lockstep_sentinel import (
+    from flliper.srt.distributed.device_communicators.lockstep_sentinel import (
         LockstepSentinel,
     )
 
@@ -122,7 +122,7 @@ class TestStopActuallyWaits(CustomTestCase):
         self.assertEqual(s.stop(timeout_s=2.0), "already stopped")
 
     def test_a_sentinel_that_never_started_a_thread_is_safe(self):
-        from sglang.srt.distributed.device_communicators.lockstep_sentinel import (
+        from flliper.srt.distributed.device_communicators.lockstep_sentinel import (
             LockstepSentinel,
         )
 
@@ -135,7 +135,7 @@ class TestStopActuallyWaits(CustomTestCase):
 
 class TestTheModuleLevelStop(CustomTestCase):
     def test_it_stops_the_installed_sentinel(self):
-        from sglang.srt.distributed.device_communicators import lockstep_sentinel as ls
+        from flliper.srt.distributed.device_communicators import lockstep_sentinel as ls
 
         s = _sentinel()
         thread = s._thread
@@ -144,13 +144,13 @@ class TestTheModuleLevelStop(CustomTestCase):
         self.assertFalse(thread.is_alive())
 
     def test_no_sentinel_installed_is_a_quiet_no_op(self):
-        from sglang.srt.distributed.device_communicators import lockstep_sentinel as ls
+        from flliper.srt.distributed.device_communicators import lockstep_sentinel as ls
 
         with mock.patch.object(ls, "_SENTINEL", None):
             self.assertIsNone(ls.stop_sentinel(timeout_s=0.05))
 
     def test_it_NEVER_RAISES(self):
-        from sglang.srt.distributed.device_communicators import lockstep_sentinel as ls
+        from flliper.srt.distributed.device_communicators import lockstep_sentinel as ls
 
         class Boom:
             def stop(self, timeout_s=None):
@@ -183,18 +183,18 @@ class TestTheORDERINGIsEnforcedByConstruction(CustomTestCase):
         exact trap that let an earlier #673 test run the real destroy and pass
         by accident.
         """
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         order = []
         with mock.patch(
-            "sglang.srt.distributed.device_communicators.lockstep_sentinel"
+            "flliper.srt.distributed.device_communicators.lockstep_sentinel"
             ".stop_sentinel",
             side_effect=lambda *a, **k: (order.append("stop_sentinel"), "joined")[1],
         ), mock.patch(
-            "sglang.srt.distributed.parallel_state.destroy_model_parallel",
+            "flliper.srt.distributed.parallel_state.destroy_model_parallel",
             side_effect=lambda: order.append("destroy_model_parallel"),
         ), mock.patch(
-            "sglang.srt.distributed.parallel_state.destroy_distributed_environment",
+            "flliper.srt.distributed.parallel_state.destroy_distributed_environment",
             side_effect=lambda: order.append("destroy_world"),
         ):
             td.release_distributed(self._armed_scheduler(), graceful=True)
@@ -212,7 +212,7 @@ class TestTheORDERINGIsEnforcedByConstruction(CustomTestCase):
         """Source-order pin, so a reorder in the finally is caught too."""
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         src = inspect.getsource(sched_mod)
         i_sent = src.index("release_lockstep_sentinel(scheduler")
@@ -226,8 +226,8 @@ class TestTheORDERINGIsEnforcedByConstruction(CustomTestCase):
 
 class TestTheTeardownWiring(CustomTestCase):
     def test_graceful_stops_it(self):
-        from sglang.srt.distributed.device_communicators import lockstep_sentinel as ls
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.distributed.device_communicators import lockstep_sentinel as ls
+        from flliper.srt.managers import scheduler_teardown as td
 
         s = _sentinel()
         thread = s._thread
@@ -239,8 +239,8 @@ class TestTheTeardownWiring(CustomTestCase):
         self.assertFalse(thread.is_alive())
 
     def test_the_exception_path_leaves_it_alone(self):
-        from sglang.srt.distributed.device_communicators import lockstep_sentinel as ls
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.distributed.device_communicators import lockstep_sentinel as ls
+        from flliper.srt.managers import scheduler_teardown as td
 
         s = _sentinel()
         try:
@@ -255,8 +255,8 @@ class TestTheTeardownWiring(CustomTestCase):
     def test_it_is_UNGATED(self):
         """The sentinel leaks on every opt-in boot, whether or not the
         process-group destroy is armed, so it must not inherit that gate."""
-        from sglang.srt.distributed.device_communicators import lockstep_sentinel as ls
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.distributed.device_communicators import lockstep_sentinel as ls
+        from flliper.srt.managers import scheduler_teardown as td
 
         s = _sentinel()
         sched = SimpleNamespace(
@@ -266,11 +266,11 @@ class TestTheTeardownWiring(CustomTestCase):
             self.assertEqual(td.release_lockstep_sentinel(sched, graceful=True), "joined")
 
     def test_it_NEVER_RAISES(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         with mock.patch.dict(
             "sys.modules",
-            {"sglang.srt.distributed.device_communicators.lockstep_sentinel": None},
+            {"flliper.srt.distributed.device_communicators.lockstep_sentinel": None},
         ):
             self.assertIsNone(
                 td.release_lockstep_sentinel(SimpleNamespace(), graceful=True)
@@ -282,7 +282,7 @@ class TestTheStopPathIsACTUALLYCALLED(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         tree = ast.parse(inspect.getsource(sched_mod))
         called = {

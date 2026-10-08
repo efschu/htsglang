@@ -16,7 +16,7 @@ These tests pin the two halves of the fix on ONE pool state:
   * WITH it the same rung funds the whole distance down to the RESIDENT
     half of the live set, which is the memory the seam actually needs.
 
-The two runs differ ONLY by SGLANG_KV_RADIX_EVICT_RELIEF. Nothing about
+The two runs differ ONLY by FLLIPER_KV_RADIX_EVICT_RELIEF. Nothing about
 the pool, the live set or the corridor changes between them.
 
 Hermetic: tensor-backed fakes, no CUDA, no scheduler.
@@ -28,7 +28,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import kv_backing_relief as kbr
 
 MIB = 1024 * 1024
 

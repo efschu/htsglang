@@ -73,7 +73,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40)
 
@@ -143,7 +143,7 @@ class _RingWire:
 
 
 def _make_holder(rank: int, wire: _RingWire):
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=wire,
@@ -168,7 +168,7 @@ def _make_holder(rank: int, wire: _RingWire):
 
 
 def _sender_worker(init_file, out_dir, mode):
-    from sglang.srt.managers.pp_admission_congruence import PPAdmissionDecision
+    from flliper.srt.managers.pp_admission_congruence import PPAdmissionDecision
 
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=SENDER, world_size=WORLD
@@ -268,7 +268,7 @@ def _run(mode, bound_s):
         # the same primitive it would have used, read at the moment the
         # verdict matters. `pid_alive` treats PermissionError as "exists",
         # which is why it is called rather than a bare os.kill here.
-        from sglang.srt.distributed.device_communicators.barlink_liveness import (
+        from flliper.srt.distributed.device_communicators.barlink_liveness import (
             pid_alive,
         )
 
@@ -361,11 +361,11 @@ class TheAdmissionWireCannotReachTheDeviceLeg(unittest.TestCase):
     """
 
     def _wire_dict(self):
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             PPAdmissionDecision,
             PPAdmissionEntry,
         )
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_admission_decision_to_wire,
         )
 

@@ -16,14 +16,14 @@ relies on.
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.schedule_batch import (
+from flliper.srt.managers.io_struct import GenerateReqInput
+from flliper.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     _compute_pad_value,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=2, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
@@ -50,7 +50,7 @@ class TestMmHashesContract(CustomTestCase):
         # If hash_feature is invoked, the test fails — we patch it to
         # raise so any accidental recompute is loud.
         with patch(
-            "sglang.srt.managers.mm_utils.hash_feature",
+            "flliper.srt.managers.mm_utils.hash_feature",
             side_effect=AssertionError(
                 "hash_feature must NOT be called when hash is preset"
             ),

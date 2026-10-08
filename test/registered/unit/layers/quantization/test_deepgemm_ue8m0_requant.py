@@ -1,6 +1,6 @@
 """CPU guards for DeepGEMM UE8M0 weight-scale requantization decisions."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -10,12 +10,12 @@ from unittest.mock import patch
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
-import sglang.srt.layers.quantization.fp8_utils as fp8_utils
-from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+import flliper.srt.layers.quantization.fp8_utils as fp8_utils
+from flliper.srt.layers import deep_gemm_wrapper
+from flliper.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     CompressedTensorsW8A8Fp8,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 BLOCK_SIZE = [128, 128]
 

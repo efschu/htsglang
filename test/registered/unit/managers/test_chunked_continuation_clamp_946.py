@@ -49,7 +49,7 @@ import logging
 import types
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20)
 
@@ -100,7 +100,7 @@ class TheReissueCandidateSetMustSeeAChunkedContinuation(unittest.TestCase):
     """
 
     def _locations(self, holder):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_request_locations
+        from flliper.srt.managers.scheduler_pp_mixin import pp_request_locations
 
         return pp_request_locations(holder)
 
@@ -163,14 +163,14 @@ class TheEscalationMarkIsStampedWithTheBindingGeneration(unittest.TestCase):
     """ARM 2 -- DECIDE AT THE VOID, and make the decision self-invalidating."""
 
     def _mark(self, req):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_mark_premise_dead,
         )
 
         return pp_mark_premise_dead(req)
 
     def _is_live(self, req):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_premise_is_dead,
         )
 
@@ -193,7 +193,7 @@ class TheEscalationMarkIsStampedWithTheBindingGeneration(unittest.TestCase):
         recorded under the old one is exactly the stale state that must not
         outlive it. No `reset_for_retract` special case -- the stamp does it.
         Same rule #911 uses for completion routing."""
-        from sglang.srt.mem_cache import hicache_phase_binding as hpb
+        from flliper.srt.mem_cache import hicache_phase_binding as hpb
 
         req = _Req(RID_CHUNKED, prefix_len=8192)
         self._mark(req)
@@ -216,14 +216,14 @@ class TheEscapePrefersARefetchOverARecompute(unittest.TestCase):
     on an 8192-token prefix breaks it by two full chunks."""
 
     def _apply(self, holder, req):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_apply_dead_premise_at_chunk_boundary,
         )
 
         return pp_apply_dead_premise_at_chunk_boundary(holder, req)
 
     def _marked(self, req):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+        from flliper.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
 
         pp_mark_premise_dead(req)
         return req
@@ -274,7 +274,7 @@ class TheEscapePrefersARefetchOverARecompute(unittest.TestCase):
         req = self._marked(_Req(RID_CHUNKED, prefix_len=8192, extend_len=4096))
         holder = _holder(chunked_req=req)  # no _prefetch_kvcache available
         catcher = _Catcher(logging.WARNING)
-        log = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        log = logging.getLogger("flliper.srt.managers.scheduler_pp_mixin")
         log.addHandler(catcher)
         try:
             self.assertEqual(self._apply(holder, req), "recompute")
@@ -335,7 +335,7 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
     """
 
     def _note(self, holder, site, voided):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_ring_note
+        from flliper.srt.managers.scheduler_pp_mixin import pp_ring_note
 
         return pp_ring_note(holder, site, voided)
 
@@ -388,7 +388,7 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
 
         RE-PINNED 2026-09-02 (weg1 drift pass; PRE-EXISTING red at pin
         228a66db32, NOT branch drift). Four sibling instruments were put ON
-        the census tick on 2026-08-29 and share ``SGLANG_947_RING_EVERY``:
+        the census tick on 2026-08-29 and share ``FLLIPER_947_RING_EVERY``:
         #996b ac25c748a3 (group_floor/rank_budget), #997d 8b057bc8d9
         (OUTPUT-FILL), #998 bf3058eea8 (EXTEND-INVARIANT), #1000 59830ce72d
         (SLOT-OCCUPANT). All of them sit inside the same
@@ -410,10 +410,10 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
 
         h = _holder()
         catcher = _Catcher(logging.WARNING)
-        log = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        log = logging.getLogger("flliper.srt.managers.scheduler_pp_mixin")
         log.addHandler(catcher)
-        old = os.environ.get("SGLANG_947_RING_EVERY")
-        os.environ["SGLANG_947_RING_EVERY"] = "25"
+        old = os.environ.get("FLLIPER_947_RING_EVERY")
+        os.environ["FLLIPER_947_RING_EVERY"] = "25"
         try:
             for _ in range(60):
                 self._note(h, "ring:pre_plan", True)
@@ -421,9 +421,9 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
         finally:
             log.removeHandler(catcher)
             if old is None:
-                os.environ.pop("SGLANG_947_RING_EVERY", None)
+                os.environ.pop("FLLIPER_947_RING_EVERY", None)
             else:
-                os.environ["SGLANG_947_RING_EVERY"] = old
+                os.environ["FLLIPER_947_RING_EVERY"] = old
         census = [m for m in catcher.messages if "#947 VOID-RING CENSUS" in m]
         self.assertEqual(
             len(census),
@@ -449,21 +449,21 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
         were shipped armed and each cost a boot; this one measures first."""
         import os
 
-        from sglang.srt.managers.scheduler_pp_mixin import pp_act_at_ring_enabled
+        from flliper.srt.managers.scheduler_pp_mixin import pp_act_at_ring_enabled
 
-        old = os.environ.get("SGLANG_946_ACT_AT_RING")
+        old = os.environ.get("FLLIPER_946_ACT_AT_RING")
         try:
-            os.environ.pop("SGLANG_946_ACT_AT_RING", None)
+            os.environ.pop("FLLIPER_946_ACT_AT_RING", None)
             self.assertFalse(pp_act_at_ring_enabled(), "must ship inert")
-            os.environ["SGLANG_946_ACT_AT_RING"] = "1"
+            os.environ["FLLIPER_946_ACT_AT_RING"] = "1"
             self.assertTrue(pp_act_at_ring_enabled(), "and must be flippable")
-            os.environ["SGLANG_946_ACT_AT_RING"] = "0"
+            os.environ["FLLIPER_946_ACT_AT_RING"] = "0"
             self.assertFalse(pp_act_at_ring_enabled())
         finally:
             if old is None:
-                os.environ.pop("SGLANG_946_ACT_AT_RING", None)
+                os.environ.pop("FLLIPER_946_ACT_AT_RING", None)
             else:
-                os.environ["SGLANG_946_ACT_AT_RING"] = old
+                os.environ["FLLIPER_946_ACT_AT_RING"] = old
 
 
 class TheThreeCandidatesMustBeSEPARABLE(unittest.TestCase):
@@ -477,7 +477,7 @@ class TheThreeCandidatesMustBeSEPARABLE(unittest.TestCase):
     """
 
     def _probe(self, holder, kind, **f):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_premise_probe
+        from flliper.srt.managers.scheduler_pp_mixin import pp_premise_probe
 
         return pp_premise_probe(holder, kind, **f)
 
@@ -524,11 +524,11 @@ class TheThreeCandidatesMustBeSEPARABLE(unittest.TestCase):
     def test_the_gen_mismatch_counter_fires_from_the_REAL_act_path(self):
         """Not a hand-called probe: drive the shipped actuator with a stamp
         from a superseded generation and require counter (c) to move."""
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             _PREMISE_DEAD_STAMP,
             pp_apply_dead_premise_at_chunk_boundary,
         )
-        from sglang.srt.mem_cache import hicache_phase_binding as hpb
+        from flliper.srt.mem_cache import hicache_phase_binding as hpb
 
         req = _Req(RID_CHUNKED, prefix_len=8192, extend_len=4096)
         setattr(req, _PREMISE_DEAD_STAMP, int(hpb.current_generation()) - 1)
@@ -544,7 +544,7 @@ class TheThreeCandidatesMustBeSEPARABLE(unittest.TestCase):
         and inspected never -- which is candidate (b), and it needs no metal to
         demonstrate: it is a property of the two call sites.
         """
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_apply_dead_premise_at_chunk_boundary,
             pp_mark_premise_dead,
             pp_request_locations,
@@ -595,14 +595,14 @@ class TheActMustSweepTheFourPlacesNotOneField(unittest.TestCase):
     """
 
     def _sweep(self, holder):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_apply_dead_premise_anywhere,
         )
 
         return pp_apply_dead_premise_anywhere(holder)
 
     def test_it_acts_on_a_marked_request_in_the_RUNNING_BATCH(self):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+        from flliper.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
 
         stuck = _Req(RID_RUNNING, prefix_len=8192, extend_len=4096)
         h = _holder(
@@ -614,7 +614,7 @@ class TheActMustSweepTheFourPlacesNotOneField(unittest.TestCase):
         self.assertEqual(len(stuck.prefix_indices), 0, "the terminator applied")
 
     def test_it_acts_on_a_marked_request_in_the_WAITING_QUEUE(self):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+        from flliper.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
 
         # CONTRACT INVERTED 2026-08-27 (#949): the stub must now report what
         # actually happened. `lambda r: None` used to read as a successful
@@ -626,7 +626,7 @@ class TheActMustSweepTheFourPlacesNotOneField(unittest.TestCase):
         self.assertEqual(self._sweep(h), {RID_WAITING: "refetch"})
 
     def test_it_still_prefers_the_refetch_and_keeps_the_prefix(self):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+        from flliper.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
 
         stuck = _Req(RID_RUNNING, prefix_len=8192, extend_len=4096)
         seen = []
@@ -657,7 +657,7 @@ class TheActMustSweepTheFourPlacesNotOneField(unittest.TestCase):
         self.assertEqual(self._sweep(h), {})
 
     def test_each_marked_request_is_acted_on_ONCE(self):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+        from flliper.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
 
         stuck = _Req(RID_RUNNING, prefix_len=8192, extend_len=4096)
         h = _holder(running_batch=types.SimpleNamespace(reqs=[stuck]))
@@ -687,7 +687,7 @@ class _FakeTreeCache:
     def prefetch_from_storage(self, req_id, *a, **kw):
         self.calls.append(req_id)
         if self._gate_reason is not None:
-            from sglang.srt.mem_cache.match_refusal_census import note_prefetch_gate
+            from flliper.srt.mem_cache.match_refusal_census import note_prefetch_gate
 
             note_prefetch_gate(self._gate_reason, 4096)
         if self._register:
@@ -704,7 +704,7 @@ class TheRefetchVerdictMustBeAnOBSERVATIONNotAPromise(unittest.TestCase):
     the first time in this family, provably ON the defect's path -- and its
     SUCCESS VALUE WAS NOT EVIDENCE THAT IT ACTED.
 
-    THIS ARM IS DELIBERATELY NOT BEHIND `SGLANG_946_ACT_AT_RING`. My own
+    THIS ARM IS DELIBERATELY NOT BEHIND `FLLIPER_946_ACT_AT_RING`. My own
     pre-boot finding this window was that the #948 discriminator counters sat
     inside the actuator's env gate, so the stage that was supposed to read them
     could not. An indicator must never sit behind the gate whose state it
@@ -713,7 +713,7 @@ class TheRefetchVerdictMustBeAnOBSERVATIONNotAPromise(unittest.TestCase):
     """
 
     def _scheduler_with(self, tree_cache, enable=True):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         sched = types.SimpleNamespace()
         sched.enable_hicache_storage = enable
@@ -790,7 +790,7 @@ class TheRefetchVerdictMustBeAnOBSERVATIONNotAPromise(unittest.TestCase):
         (cache_controller.py:841) and #905 measured 703472 PP rows against
         30518 TP rows, a 23x gap -- can now ARRIVE at the escape as a named
         reason instead of being re-derived from a comment."""
-        from sglang.srt.mem_cache import match_refusal_census as mrc
+        from flliper.srt.mem_cache import match_refusal_census as mrc
 
         before = dict(mrc.PREFETCH_GATE_COUNTS)
         try:
@@ -814,14 +814,14 @@ class ADeclinedRefetchKeepsTheMarkAndIsBounded(unittest.TestCase):
     """
 
     def _apply(self, holder, req):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_apply_dead_premise_at_chunk_boundary,
         )
 
         return pp_apply_dead_premise_at_chunk_boundary(holder, req)
 
     def _marked(self, req):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+        from flliper.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
 
         pp_mark_premise_dead(req)
         return req
@@ -831,7 +831,7 @@ class ADeclinedRefetchKeepsTheMarkAndIsBounded(unittest.TestCase):
         holder = _holder(chunked_req=req)
         holder._prefetch_kvcache = lambda r: "declined:rate_limited"
         self.assertEqual(self._apply(holder, req), "refetch-declined")
-        from sglang.srt.managers.scheduler_pp_mixin import pp_premise_is_dead
+        from flliper.srt.managers.scheduler_pp_mixin import pp_premise_is_dead
 
         self.assertTrue(
             pp_premise_is_dead(req),
@@ -859,7 +859,7 @@ class ADeclinedRefetchKeepsTheMarkAndIsBounded(unittest.TestCase):
         holder = _holder(chunked_req=req)
         holder._prefetch_kvcache = lambda r: "declined:rate_limited"
         catcher = _Catcher(logging.WARNING)
-        log = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        log = logging.getLogger("flliper.srt.managers.scheduler_pp_mixin")
         log.addHandler(catcher)
         try:
             self._apply(holder, req)
@@ -885,13 +885,13 @@ class ADeclinedRefetchKeepsTheMarkAndIsBounded(unittest.TestCase):
         """UNBOUNDED RETRY IS THE #858 LIVELOCK SHAPE. The cap is what makes
         keeping the mark safe, and the terminator still names its discard so a
         Kein-Doppel-Prefill breach can never be silent."""
-        from sglang.srt.managers.scheduler_pp_mixin import REFETCH_DECLINE_CAP
+        from flliper.srt.managers.scheduler_pp_mixin import REFETCH_DECLINE_CAP
 
         req = self._marked(_Req(RID_CHUNKED, prefix_len=8192, extend_len=4096))
         holder = _holder(chunked_req=req)
         holder._prefetch_kvcache = lambda r: "declined:rate_limited"
         catcher = _Catcher(logging.WARNING)
-        log = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        log = logging.getLogger("flliper.srt.managers.scheduler_pp_mixin")
         log.addHandler(catcher)
         try:
             outcomes = [self._apply(holder, req) for _ in range(REFETCH_DECLINE_CAP)]
@@ -913,7 +913,7 @@ class ADeclinedRefetchKeepsTheMarkAndIsBounded(unittest.TestCase):
         holder = _holder(chunked_req=req)
         holder._prefetch_kvcache = lambda r: None
         self.assertEqual(self._apply(holder, req), "refetch-declined")
-        from sglang.srt.managers.scheduler_pp_mixin import pp_premise_is_dead
+        from flliper.srt.managers.scheduler_pp_mixin import pp_premise_is_dead
 
         self.assertTrue(pp_premise_is_dead(req))
 
@@ -929,7 +929,7 @@ class The915GateLineMustBeWIREDNotMerelyPresent(unittest.TestCase):
     """
 
     def test_the_formatter_has_an_importer_OUTSIDE_its_own_module(self):
-        import sglang.srt.mem_cache.unified_radix_cache as urc
+        import flliper.srt.mem_cache.unified_radix_cache as urc
 
         self.assertTrue(
             hasattr(urc, "_format_prefetch_gate"),
@@ -938,15 +938,15 @@ class The915GateLineMustBeWIREDNotMerelyPresent(unittest.TestCase):
         )
 
     def test_the_gate_line_is_rate_limited_and_shares_the_census_knob(self):
-        from sglang.srt.mem_cache import match_refusal_census as mrc
+        from flliper.srt.mem_cache import match_refusal_census as mrc
 
         self.assertEqual(
             mrc.prefetch_gate_due.__module__,
-            "sglang.srt.mem_cache.match_refusal_census",
+            "flliper.srt.mem_cache.match_refusal_census",
         )
 
     def test_ABSENT_is_not_zero_in_the_gate_line(self):
-        from sglang.srt.mem_cache import match_refusal_census as mrc
+        from flliper.srt.mem_cache import match_refusal_census as mrc
 
         before = dict(mrc.PREFETCH_GATE_COUNTS)
         try:
@@ -990,7 +990,7 @@ class TheTerminatorMustSurviveATensorPrefix(unittest.TestCase):
     """
 
     def _apply(self, holder, req):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_apply_dead_premise_at_chunk_boundary,
         )
 
@@ -1006,7 +1006,7 @@ class TheTerminatorMustSurviveATensorPrefix(unittest.TestCase):
             req.prefix_indices = req.prefix_indices[:told]
 
         req.truncate_prefix_to = _truncate
-        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+        from flliper.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
 
         pp_mark_premise_dead(req)
         return req
@@ -1016,7 +1016,7 @@ class TheTerminatorMustSurviveATensorPrefix(unittest.TestCase):
         req = self._tensor_req(8192)
         holder = _holder(chunked_req=req)  # no _prefetch_kvcache -> terminator
         catcher = _Catcher(logging.WARNING)
-        log = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        log = logging.getLogger("flliper.srt.managers.scheduler_pp_mixin")
         log.addHandler(catcher)
         try:
             self.assertEqual(self._apply(holder, req), "recompute")
@@ -1045,7 +1045,7 @@ class TheTerminatorMustSurviveATensorPrefix(unittest.TestCase):
         three of them did it again in window-946rf."""
         import inspect
 
-        from sglang.srt.managers import scheduler_pp_mixin as m
+        from flliper.srt.managers import scheduler_pp_mixin as m
 
         src = inspect.getsource(m.pp_apply_dead_premise_at_chunk_boundary)
         # CODE ONLY. The first version of this assertion grepped raw source and
@@ -1097,7 +1097,7 @@ class TheEscapeMustIssueWithoutALocalAnchor(unittest.TestCase):
     """
 
     def _sched(self, tc, enable=True):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         s = types.SimpleNamespace()
         s.enable_hicache_storage = enable

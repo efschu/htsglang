@@ -18,8 +18,8 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu")
 
@@ -29,7 +29,7 @@ MIB = 1024 * 1024
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA (driver VMM API)")
 class TestKvVmmDial(CustomTestCase):
     def test_arena_chunked_commit_and_tail_decommit(self):
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmArena
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmArena
 
         arena = KvVmmArena(
             torch.cuda.current_device(),
@@ -72,8 +72,8 @@ class TestKvVmmDial(CustomTestCase):
         its buffers and leave the rest mapped and readable -- a whole-owner
         shrink would unmap layers the next wave still has to read.
         """
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
-        from sglang.srt.mem_cache.memory_pool import KvBufferDesc
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+        from flliper.srt.mem_cache.memory_pool import KvBufferDesc
 
         rows, row_elems = 8192, 4096  # 64 MiB per buffer
         descs = [
@@ -135,8 +135,8 @@ class TestKvVmmDial(CustomTestCase):
         a half-applied subset would leave one layout's layers backed and
         the other's not.
         """
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
-        from sglang.srt.mem_cache.memory_pool import KvBufferDesc
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+        from flliper.srt.mem_cache.memory_pool import KvBufferDesc
 
         rows, row_elems = 4096, 1024
         descs = [
@@ -164,8 +164,8 @@ class TestKvVmmDial(CustomTestCase):
             owner.close()
 
     def test_owner_shrink_grow_roundtrip_stable_addresses(self):
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
-        from sglang.srt.mem_cache.memory_pool import KvBufferDesc
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+        from flliper.srt.mem_cache.memory_pool import KvBufferDesc
 
         rows, row_elems = 8192, 4096  # 8k rows x 8 KiB = 64 MiB per buffer
         descs = [

@@ -41,7 +41,7 @@ restart**. Discovering it mid-load costs a ~7 minute boot.
 Never broadcast `SIGUSR2` to a matched process set — the frontend has no
 handler and the default action is terminate; that is how the first arm-A boot
 of the 2026-08-02 battery died (`docs/dev/INCIDENT_394_sigusr2.md`). Both arms
-use `SGLANG_EXPERT_STATS_INTERVAL_SEC=45`, which needs no signal at all.
+use `FLLIPER_EXPERT_STATS_INTERVAL_SEC=45`, which needs no signal at all.
 
 ## What the arms predict — read this before quoting a delta
 
@@ -110,7 +110,7 @@ BOOT-PENDING and refused by name. `install_capturable_buffers` raises when a
 peer-backed pool is present: the capturable scratch gather needs a UVA device
 pointer for the peer segment's `cudaHostRegister`'d mapping, and that pointer
 has not been verified on hardware. Graphs pin ADDRESSES, not contents, so the
-seam is sound in principle — `SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1` opens it
+seam is sound in principle — `FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE=1` opens it
 for a card window to prove the pointer against the eager path. Both arms above
 run `--disable-cuda-graph`, as the published baseline for this configuration
 does.

@@ -1,14 +1,14 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.benchmark.serving import run_benchmark
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.benchmark.serving import run_benchmark
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     get_benchmark_args,
@@ -34,7 +34,7 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.FLLIPER_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 

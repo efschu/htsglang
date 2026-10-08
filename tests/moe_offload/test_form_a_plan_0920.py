@@ -27,8 +27,8 @@ injected, so what is pinned here is the CONTRACT, not a table of numbers:
 
 import pytest
 
-from sglang.srt.distributed.utils import partition_sizes, partition_units
-from sglang.srt.form_a_plan import (
+from flliper.srt.distributed.utils import partition_sizes, partition_units
+from flliper.srt.form_a_plan import (
     CardBudget,
     ExpertGeometry,
     FormAGeometryInvalid,

@@ -1,5 +1,5 @@
 """CPU unit tests for the PP-boundary metadata shape cache
-(SGLANG_PP_SHAPE_CACHE, #201 slice 3 item 5).
+(FLLIPER_PP_SHAPE_CACHE, #201 slice 3 item 5).
 
 The slice-2 measurement: at bs=1 the gloo-pickled metadata costs more than
 the hidden-state payload (249 us vs 142 us one-way). The cache replaces a
@@ -47,9 +47,9 @@ _install_sgl_kernel_stub()
 
 import torch  # noqa: E402,F401  (spawn workers re-import this module before dist init)
 
-from sglang.srt.distributed.parallel_state import GroupCoordinator  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.srt.distributed.parallel_state import GroupCoordinator  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 

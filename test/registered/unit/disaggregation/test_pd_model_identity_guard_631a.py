@@ -28,13 +28,13 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.disaggregation.common.conn import (
+from flliper.srt.disaggregation.common.conn import (
     CommonKVManager,
     PrefillServerInfo,
 )
-from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_storage import compute_model_identity_hash
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -204,7 +204,7 @@ class HandshakeIdentityGuardTest(CustomTestCase):
             }
         }
         with mock.patch(
-            "sglang.srt.disaggregation.common.conn.requests.get",
+            "flliper.srt.disaggregation.common.conn.requests.get",
             return_value=response,
         ):
             return CommonKVManager.try_ensure_parallel_info(

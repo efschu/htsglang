@@ -33,7 +33,7 @@ and stay green there.
 import logging
 import unittest
 
-from sglang.srt.managers.regime_classifier import (
+from flliper.srt.managers.regime_classifier import (
     _MS_ABSENT,
     DEFAULT_ENTER_PREFILL,
     KV_ASCEND_MARK,
@@ -51,7 +51,7 @@ from sglang.srt.managers.regime_classifier import (
     clears_band,
     signal_band,
 )
-from sglang.srt.managers.regime_runtime import (
+from flliper.srt.managers.regime_runtime import (
     ENV_MODE,
     MODE_OBSERVE,
     MODE_OFF,
@@ -63,9 +63,9 @@ from sglang.srt.managers.regime_runtime import (
     phase_of_last_batch,
     rank_forward_ms_from,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -352,7 +352,7 @@ class TestF3NoiseFloor(CustomTestCase):
     def test_an_occupancy_threshold_is_not_re_derived(self):
         """The KV marks are #287's, so their band is #287's problem and not a
         second measurement that could disagree with the first."""
-        from sglang.srt.model_executor import kv_pressure_ladder as ladder
+        from flliper.srt.model_executor import kv_pressure_ladder as ladder
 
         self.assertEqual(KV_ASCEND_MARK, ladder.DEFAULT_ASCEND_THRESHOLD)
 
@@ -817,7 +817,7 @@ class TestF5Desync(CustomTestCase):
             consensus_interval=2, tp_size=2, collective_min=self._diverging()
         )
         with self.assertLogs(
-            "sglang.srt.managers.regime_runtime", level=logging.WARNING
+            "flliper.srt.managers.regime_runtime", level=logging.WARNING
         ) as cm:
             _drive(obs, 2, phase="prefill", ms=10.0)
         joined = "\n".join(cm.output)
@@ -871,7 +871,7 @@ class TestF4DoNothingBaseline(CustomTestCase):
         import ast
         import pathlib
 
-        import sglang.srt.managers.regime_runtime as mod
+        import flliper.srt.managers.regime_runtime as mod
 
         tree = ast.parse(pathlib.Path(mod.__file__).read_text())
         modules = set()
@@ -974,7 +974,7 @@ class TestSchedulerHookContract(CustomTestCase):
     def _scheduler_src():
         import pathlib
 
-        import sglang.srt.managers.scheduler as mod
+        import flliper.srt.managers.scheduler as mod
 
         return pathlib.Path(mod.__file__).read_text()
 
@@ -1047,7 +1047,7 @@ class TestSchedulerHookContract(CustomTestCase):
         import ast
         import pathlib
 
-        import sglang.srt.managers.scheduler as mod
+        import flliper.srt.managers.scheduler as mod
 
         tree = ast.parse(pathlib.Path(mod.__file__).read_text())
         calls = [
@@ -1096,7 +1096,7 @@ class TestSchedulerHookContract(CustomTestCase):
         import ast
         import pathlib
 
-        import sglang.srt.managers.scheduler as mod
+        import flliper.srt.managers.scheduler as mod
 
         src = pathlib.Path(mod.__file__).read_text()
         tree = ast.parse(src)

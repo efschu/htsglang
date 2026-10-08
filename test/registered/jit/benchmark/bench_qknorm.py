@@ -1,10 +1,10 @@
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import create_random
-from sglang.jit_kernel.norm import fused_inplace_qknorm
-from sglang.srt.utils import get_current_device_stream_fast
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.benchmark.utils import create_random
+from flliper.jit_kernel.norm import fused_inplace_qknorm
+from flliper.srt.utils import get_current_device_stream_fast
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -16,7 +16,7 @@ torch._dynamo.config.recompile_limit = 100
 
 
 # NOTE: now aot fallback to flashinfer
-def sglang_aot_qknorm(
+def flliper_aot_qknorm(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -49,7 +49,7 @@ def torch_impl_qknorm(
 
 
 FN_MAP = {
-    "aot": sglang_aot_qknorm,
+    "aot": flliper_aot_qknorm,
     "jit": fused_inplace_qknorm,
     "torch": torch_impl_qknorm,
 }

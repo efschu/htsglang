@@ -14,9 +14,9 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import Range
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from flliper.srt.utils.common import Range
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
@@ -86,7 +86,7 @@ class TestHiSparseUnit(unittest.TestCase):
             torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
         cls.tp_group = torch.distributed.group.WORLD
 
-        from sglang.srt.mem_cache.pool_host.common import (
+        from flliper.srt.mem_cache.pool_host.common import (
             ALLOC_MEMORY_FUNCS,
             alloc_with_pin_memory,
         )
@@ -95,7 +95,7 @@ class TestHiSparseUnit(unittest.TestCase):
         ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
 
         if is_hip():
-            from sglang.srt.layers.attention.dsa.utils import (
+            from flliper.srt.layers.attention.dsa.utils import (
                 aiter_can_use_preshuffle_paged_mqa,
             )
 
@@ -103,10 +103,10 @@ class TestHiSparseUnit(unittest.TestCase):
         else:
             global_page_size = PAGE_SIZE
 
-        from sglang.srt.mem_cache.allocator.hisparse import (
+        from flliper.srt.mem_cache.allocator.hisparse import (
             HiSparseTokenToKVPoolAllocator,
         )
-        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+        from flliper.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 
         cls.device_pool = HiSparseDSATokenToKVPool(
             size=SIZE,
@@ -131,7 +131,7 @@ class TestHiSparseUnit(unittest.TestCase):
             host_to_device_ratio=HOST_TO_DEVICE_RATIO,
         )
 
-        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
 
         cls.req_to_token_pool = ReqToTokenPool(
             size=MAX_NUM_REQS,
@@ -140,7 +140,7 @@ class TestHiSparseUnit(unittest.TestCase):
             enable_memory_saver=False,
         )
 
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from flliper.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
         cls.page_size = global_page_size
         cls.coordinator = HiSparseCoordinator(
@@ -155,7 +155,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+        from flliper.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 
         ALLOC_MEMORY_FUNCS["cuda"] = cls._original_alloc
         if torch.distributed.is_initialized():
@@ -744,7 +744,7 @@ class TestHiSparseUnit(unittest.TestCase):
         fill_len = self.page_size * 2 + 1
         req = _make_req("pd-decode-prealloc", list(range(fill_len)))
 
-        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+        from flliper.srt.disaggregation.decode import DecodePreallocQueue
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.req_to_token_pool = self.req_to_token_pool

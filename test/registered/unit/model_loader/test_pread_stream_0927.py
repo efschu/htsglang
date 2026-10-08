@@ -3,7 +3,7 @@
 in-flight window instead of whole shards.
 
 Boot b23 (27b-park-odirect-draft, rc12g-flat, 27.09.): --weight-loader-disable-mmap
---weight-loader-direct-io + SGLANG_WEIGHT_LOADER_PREAD=1 hit the 76g container cap
+--weight-loader-direct-io + FLLIPER_WEIGHT_LOADER_PREAD=1 hit the 76g container cap
 (oom_kill 3, anon+shmem 72,5 GiB) before serving -- the multi-thread iterator held
 (max_workers + 1) whole shards as anon (pread returned one dict per file). These tests use
 mock safetensors files: same bytes, same order as the per-file path, and a window that never
@@ -19,7 +19,7 @@ from unittest import mock
 import torch
 from safetensors.torch import save_file
 
-from sglang.srt.model_loader import weight_utils as W
+from flliper.srt.model_loader import weight_utils as W
 
 MIB = 1 << 20
 

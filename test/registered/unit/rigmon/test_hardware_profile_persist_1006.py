@@ -18,9 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import _hwprofile_fixture_1006 as fx  # noqa: E402
 
-from sglang.srt.rigmon import hardware_profile as hp  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.srt.rigmon import hardware_profile as hp  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

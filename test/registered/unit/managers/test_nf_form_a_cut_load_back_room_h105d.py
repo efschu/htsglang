@@ -5,17 +5,17 @@ THE DEATH (NF y9nf6, image rc12z30y9nf6, tree 191228abc5; D log
 boot_weg2_dkrnfint4h6ablbar1dauer10040608_191228abc5_1004_060857.D.log
 ~158218-158410, 06:32:52Z, Form A x #239 token cut [0, 7, 1]):
 
-* ``WEG2 X-GATE rid=weg2-32-93 uncached=359 ... verdict=admit`` on TP0/1/2 --
+* ``PDFLIP X-GATE rid=pdflip-32-93 uncached=359 ... verdict=admit`` on TP0/1/2 --
   the gathered H105 verdict ADMIT, priced against ``rem_total_tokens=318912``
   (available 85568 + reported evictable 237568 - this pass's offset);
 * the load-back then needed 121856 rows per rank; the peel delivered 7616
-  (``WEG2-LOADBACK-EVICT ... floor=85568 ... requested=237568 evicted=7616``,
+  (``PDFLIP-LOADBACK-EVICT ... floor=85568 ... requested=237568 evicted=7616``,
   ``EVICT-FRONTIER-CENSUS ... on_frontier=29312 aux_locked={}
   behind_device_child=200640``: write_back leaves whose backup the full host
   arena refused, ``R12 SHADOW-SHORT why=arena_claim``);
 * ``H105c FORM-A FOLLOW-ROOM ... kv_tokens=121856 evicted=0 available=93184``
   -> ``FormAAdmissionSplit: H105c FORM-A FOLLOW LOAD-BACK UNSERVABLE
-  rid=weg2-32-93`` on all three ranks -> RANK-DEATH, D group gone.
+  rid=pdflip-32-93`` on all three ranks -> RANK-DEATH, D group gone.
 
 Driven through the REAL ``PrefillAdder.add_one_req`` and the REAL
 ``Scheduler._form_a_admission_follow_fn`` with the token cut's gather (three
@@ -34,25 +34,25 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers import schedule_policy as sp
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.managers import schedule_policy as sp
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
-RID = "weg2-32-93"
-UNCACHED = 359  # 'WEG2 X-GATE rid=weg2-32-93 uncached=359'
+RID = "pdflip-32-93"
+UNCACHED = 359  # 'PDFLIP X-GATE rid=pdflip-32-93 uncached=359'
 KV_ROWS = 121856  # 'kv_tokens=121856' on TP0/TP1/TP2
 EXTENT = {0: 134144, 1: 121856, 2: 121856}  # 'H105c ... extent=' per rank
-AVAILABLE = 85568  # 'WEG2-LOADBACK-EVICT ... floor=85568'
+AVAILABLE = 85568  # 'PDFLIP-LOADBACK-EVICT ... floor=85568'
 REPORTED_EVICTABLE = 237568  # 'requested=237568'
 DELIVERED = 7616  # 'evicted=7616' -- what the peel could pay
-TOKEN_CUT = "sglang.srt.rank_role.form_a_token_cut_active"
+TOKEN_CUT = "flliper.srt.rank_role.form_a_token_cut_active"
 
 
 class _Gather:
@@ -111,7 +111,7 @@ def _tree_cache(alloc, *, deliverable):
     tc.swa_evictable_size.return_value = 0
     tc.disable = False
     tc.uniform_avail_floor = None
-    tc._weg2_loadback_no_room = 0
+    tc._pdflip_loadback_no_room = 0
     tc._h105c_follow_room = False
     tc.inc_lock_ref.return_value = IncLockRefResult()
     tc.dec_lock_ref.return_value = DecLockRefResult()
@@ -210,7 +210,7 @@ def _adder(tp_rank, gather, *, deliverable):
 
 
 def _group_gate(*, deliverable):
-    """One gate call for weg2-32-93 on TP0/1/2 at once; per rank the result
+    """One gate call for pdflip-32-93 on TP0/1/2 at once; per rank the result
     or the exception it raised."""
     gather = _Gather()
     out, adders, reqs = {}, {}, {}
@@ -229,7 +229,7 @@ def _group_gate(*, deliverable):
 
         with patch.object(
             sp, "_pp_load_back_extent", side_effect=lambda q: q._h105d_extent
-        ), patch("sglang.srt.mem_cache.common.release_admission_acquired_mamba_slot"):
+        ), patch("flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"):
             threads = [threading.Thread(target=_run, args=(r,)) for r in range(3)]
             for t in threads:
                 t.start()
@@ -300,7 +300,7 @@ class TokenCutLoadBackRoomTest(unittest.TestCase):
 
             with patch.object(
                 sp, "_pp_load_back_extent", side_effect=lambda q: q._h105d_extent
-            ), patch("sglang.srt.mem_cache.common.release_admission_acquired_mamba_slot"):
+            ), patch("flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"):
                 ts = [threading.Thread(target=_run, args=(r,)) for r in range(3)]
                 for t in ts:
                     t.start()

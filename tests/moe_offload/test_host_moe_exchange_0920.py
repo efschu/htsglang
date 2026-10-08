@@ -32,7 +32,7 @@ What is pinned:
 import pytest
 import torch
 
-from sglang.srt.layers.moe.host_moe_exchange import (
+from flliper.srt.layers.moe.host_moe_exchange import (
     ExchangeGeometry,
     HostMoEExchange,
     HostMoEShapeMismatch,

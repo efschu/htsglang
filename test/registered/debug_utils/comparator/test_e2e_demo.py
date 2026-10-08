@@ -15,16 +15,16 @@ from typing import Dict, List, Optional
 import pytest
 import torch
 
-import sglang.srt.debug_utils.dumper as _dumper_module
-from sglang.srt.debug_utils.comparator.entrypoint import parse_args, run
-from sglang.srt.debug_utils.comparator.output_types import (
+import flliper.srt.debug_utils.dumper as _dumper_module
+from flliper.srt.debug_utils.comparator.entrypoint import parse_args, run
+from flliper.srt.debug_utils.comparator.output_types import (
     AnyRecord,
     ComparisonErrorRecord,
     SummaryRecord,
     parse_record_json,
 )
-from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.dumper import DumperConfig, _Dumper
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="default", nightly=True)
 
@@ -204,7 +204,7 @@ def _dump_rank(
         )
         static_meta: Dict[str, object] = {"world_rank": rank, "world_size": 1}
         if parallel_info is not None:
-            static_meta["sglang_parallel_info"] = parallel_info
+            static_meta["flliper_parallel_info"] = parallel_info
         dumper.__dict__["_static_meta"] = static_meta
         dumper.dump(name, tensor, dims=dims)
         dumper.step()
@@ -228,12 +228,12 @@ def _run(
         "--verbosity",
         verbosity,
         "--preset",
-        "sglang_dev",
+        "flliper_dev",
         "--report-path",
         str(report_path),
     ]
     print(
-        f"\n  $ python -m sglang.srt.debug_utils.comparator {' '.join(argv)}\n",
+        f"\n  $ python -m flliper.srt.debug_utils.comparator {' '.join(argv)}\n",
         flush=True,
     )
     return run(parse_args(argv))

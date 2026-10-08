@@ -17,7 +17,7 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.lora_utils import (
+from flliper.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     CI_LORA_MODELS,
     DEFAULT_PROMPTS,
@@ -26,7 +26,7 @@ from sglang.test.lora_utils import (
     run_lora_test_by_batch,
     run_lora_test_one_by_one,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from flliper.test.test_utils import CustomTestCase, is_in_ci
 
 TEST_CUDA_GRAPH_PADDING_PROMPTS = [
     "AI is a field of computer science focused on",

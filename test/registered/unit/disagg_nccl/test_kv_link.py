@@ -14,7 +14,7 @@ P2P/NVLink fastpath (#110) inherits the contract rather than re-agreeing to it.
 import ctypes
 import unittest
 
-from sglang.srt.disaggregation.nccl import (
+from flliper.srt.disaggregation.nccl import (
     KvLink,
     LinkError,
     LinkRegistrationError,
@@ -26,8 +26,8 @@ from sglang.srt.disaggregation.nccl import (
     get_link,
     register_link,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -344,7 +344,7 @@ class TestLinkRegistry(CustomTestCase):
         try:
             self.assertIsInstance(get_link("fast_test_only"), KvLink)
         finally:
-            from sglang.srt.disaggregation.nccl import link as link_mod
+            from flliper.srt.disaggregation.nccl import link as link_mod
 
             link_mod._LINKS.pop("fast_test_only", None)
 
@@ -363,7 +363,7 @@ class TestBoundedFormation(CustomTestCase):
     otherwise decide the timeout -- #259's shape, one layer up."""
 
     def test_a_prompt_factory_returns_its_value(self):
-        from sglang.srt.disaggregation.nccl import bounded_formation
+        from flliper.srt.disaggregation.nccl import bounded_formation
 
         sentinel = object()
         self.assertIs(
@@ -373,7 +373,7 @@ class TestBoundedFormation(CustomTestCase):
     def test_a_hanging_factory_is_bounded_and_names_the_peer(self):
         import time as _t
 
-        from sglang.srt.disaggregation.nccl import LinkTimeoutError, bounded_formation
+        from flliper.srt.disaggregation.nccl import LinkTimeoutError, bounded_formation
 
         started = _t.monotonic()
         with self.assertRaises(LinkTimeoutError) as cm:
@@ -384,7 +384,7 @@ class TestBoundedFormation(CustomTestCase):
         self.assertIn("#259", msg)
 
     def test_a_raising_factory_surfaces_as_a_link_error(self):
-        from sglang.srt.disaggregation.nccl import LinkError, bounded_formation
+        from flliper.srt.disaggregation.nccl import LinkError, bounded_formation
 
         with self.assertRaises(LinkError) as cm:
             bounded_formation(
@@ -398,7 +398,7 @@ class TestBoundedFormation(CustomTestCase):
         """The seam-level check: a hanging factory must not hang setup()."""
         import time as _t
 
-        from sglang.srt.disaggregation.nccl import LinkTimeoutError
+        from flliper.srt.disaggregation.nccl import LinkTimeoutError
 
         link = NcclLink(group_factory=lambda **kw: _t.sleep(30), timeout_s=0.3)
         with self.assertRaises(LinkTimeoutError):

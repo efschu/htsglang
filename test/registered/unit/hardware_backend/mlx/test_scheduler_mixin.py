@@ -18,7 +18,7 @@ import platform
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from flliper.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
@@ -41,7 +41,7 @@ class TestFinalizeMlxPendingJob(unittest.TestCase):
         return scheduler
 
     def test_finalize_advances_forward_ct_and_runs_predicate(self):
-        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+        from flliper.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )
 
@@ -60,7 +60,7 @@ class TestFinalizeMlxPendingJob(unittest.TestCase):
         scheduler.process_batch_result.assert_called_once()
 
     def test_forward_ct_advances_once_per_step(self):
-        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+        from flliper.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )
 

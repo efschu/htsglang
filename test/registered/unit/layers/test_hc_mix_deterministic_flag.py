@@ -4,11 +4,11 @@ keeps the flag flat on ServerArgs."""
 
 from types import SimpleNamespace
 
-from sglang.srt.layers import hc_mix_triton as m
+from flliper.srt.layers import hc_mix_triton as m
 
 
 def test_reads_the_flat_flag_and_defaults_to_false(monkeypatch):
-    import sglang.srt.runtime_context as rc
+    import flliper.srt.runtime_context as rc
 
     monkeypatch.setattr(rc, "get_server_args", lambda: SimpleNamespace(enable_deterministic_inference=True))
     assert m._deterministic_inference() is True

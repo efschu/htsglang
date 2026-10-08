@@ -11,8 +11,8 @@ import unittest
 import pytest
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.models import qwen4_exp as m
+from flliper.srt.model_executor.forward_batch_info import PPProxyTensors
+from flliper.srt.models import qwen4_exp as m
 
 
 class _Layer(torch.nn.Module):
@@ -89,7 +89,7 @@ def test_single_stage_is_the_old_path(monkeypatch):
 
 
 def test_load_weights_skips_tensors_of_layers_this_stage_does_not_own():
-    from sglang.srt.models.qwen4_exp import weight_layer_is_owned
+    from flliper.srt.models.qwen4_exp import weight_layer_is_owned
 
     assert weight_layer_is_owned("model.layers.29.mlp.experts.0.gate_proj.weight_packed", 29, 40)
     assert not weight_layer_is_owned("model.layers.28.mlp.experts.0.gate_proj.weight_packed", 29, 40)
@@ -105,7 +105,7 @@ class OuterForwardSignature(unittest.TestCase):
     def test_conditional_generation_forward_names_pp_proxy_tensors(self):
         """fn5c: the runner's PP check reads the OUTER class's signature."""
         import inspect
-        from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+        from flliper.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
         params = inspect.signature(Qwen4ExpForConditionalGeneration.forward).parameters
         self.assertIn("pp_proxy_tensors", params)
         self.assertNotIn("kwargs", params)

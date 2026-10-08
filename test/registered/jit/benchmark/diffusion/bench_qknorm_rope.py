@@ -5,13 +5,13 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from flliper.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     get_benchmark_range,
     run_benchmark_no_cudagraph,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -131,7 +131,7 @@ def clone_inputs(
 def split_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
-    from sglang.jit_kernel.norm import fused_inplace_qknorm
+    from flliper.jit_kernel.norm import fused_inplace_qknorm
 
     q = inputs["q"]
     k = inputs["k"]
@@ -153,7 +153,7 @@ def split_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
 
 
 def fused_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
-    from sglang.jit_kernel.diffusion.qknorm_rope import fused_inplace_qknorm_rope
+    from flliper.jit_kernel.diffusion.qknorm_rope import fused_inplace_qknorm_rope
 
     fused_inplace_qknorm_rope(
         inputs["q"],

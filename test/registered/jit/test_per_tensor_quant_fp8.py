@@ -5,15 +5,15 @@ from typing import Optional, Tuple
 import pytest
 import torch
 
-from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+from flliper.jit_kernel.utils import get_ci_test_range
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 try:
-    from sglang.srt.utils import is_hip
+    from flliper.srt.utils import is_hip
 
     _is_hip = is_hip()
 except ImportError:
@@ -22,7 +22,7 @@ except ImportError:
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
-def sglang_scaled_fp8_quant(
+def flliper_scaled_fp8_quant(
     input: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -64,11 +64,11 @@ def test_jit_per_tensor_quant_compare_implementations(
     device = torch.device("cuda")
     x = torch.rand((num_tokens, hidden_dim), dtype=torch.float16, device=device)
 
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
-    torch_out = torch_scaled_fp8_quant(x, sglang_scale)
+    flliper_out, flliper_scale = flliper_scaled_fp8_quant(x)
+    torch_out = torch_scaled_fp8_quant(x, flliper_scale)
 
     torch.testing.assert_close(
-        sglang_out.float(), torch_out.float(), rtol=1e-3, atol=1e-3
+        flliper_out.float(), torch_out.float(), rtol=1e-3, atol=1e-3
     )
 
 
@@ -88,11 +88,11 @@ def test_jit_per_tensor_quant_supports_3d(shape):
     torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-3, atol=1e-3)
 
     scale = torch.rand(1, dtype=torch.float32, device=device)
-    sglang_out, _ = sglang_scaled_fp8_quant(x, scale)
+    flliper_out, _ = flliper_scaled_fp8_quant(x, scale)
     torch_out = torch_scaled_fp8_quant(x, scale)
 
     torch.testing.assert_close(
-        sglang_out.float(), torch_out.float(), rtol=1e-3, atol=1e-3
+        flliper_out.float(), torch_out.float(), rtol=1e-3, atol=1e-3
     )
 
 

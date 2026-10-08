@@ -10,7 +10,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.corridor_steering import (
+from flliper.srt.managers.corridor_steering import (
     _NO_PROPOSAL,
     AllocationSteering,
     absorbing_card,
@@ -280,9 +280,9 @@ class TestTheRealAllocatorMethods(unittest.TestCase):
         subclass. They belong on the shared base, and this test fails if they
         ever move back down.
         """
-        from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
         for cls in (
             BaseTokenToKVPoolAllocator,
@@ -293,7 +293,7 @@ class TestTheRealAllocatorMethods(unittest.TestCase):
             self.assertTrue(hasattr(cls, "_apply_owner_bias"), cls.__name__)
 
     def test_the_unpaged_allocator_partitions_identically(self):
-        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
         a = TokenToKVPoolAllocator.__new__(TokenToKVPoolAllocator)
         a.page_size = 1
@@ -314,7 +314,7 @@ class TestTheRealAllocatorMethods(unittest.TestCase):
         self.assertTrue(bool(((res >= 14) & (res < 24)).all()))
 
     def _real(self, size=320):
-        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 
         a = PagedTokenToKVPoolAllocator.__new__(PagedTokenToKVPoolAllocator)
         a.page_size = 1
@@ -423,7 +423,7 @@ class TestTheAgreementIdiomHasOneOwner(unittest.TestCase):
     """
 
     def test_the_primitives_are_the_shared_ones(self):
-        from sglang.srt.managers import corridor_steering, tree_congruence
+        from flliper.srt.managers import corridor_steering, tree_congruence
 
         self.assertIs(corridor_steering.digest_pair, tree_congruence.digest_pair)
         self.assertIs(corridor_steering.agreement, tree_congruence.agreement)
@@ -431,7 +431,7 @@ class TestTheAgreementIdiomHasOneOwner(unittest.TestCase):
     def test_the_shared_agreement_still_decides_both_ways(self):
         # The can-fail direction for the import above: the shared primitive
         # must actually discriminate, or pointing at it proves nothing.
-        from sglang.srt.managers.tree_congruence import agreement, digest_pair
+        from flliper.srt.managers.tree_congruence import agreement, digest_pair
 
         lo, neg = digest_pair(7)
         self.assertTrue(agreement(lo, neg))

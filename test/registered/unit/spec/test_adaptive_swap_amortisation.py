@@ -21,7 +21,7 @@ Two independent defects, one test file each half:
 
 import unittest
 
-from sglang.srt.speculative.adaptive_chain import (
+from flliper.srt.speculative.adaptive_chain import (
     AdaptiveChainPolicy,
     ChainConsensusError,
     ChainCostModel,
@@ -29,8 +29,8 @@ from sglang.srt.speculative.adaptive_chain import (
     expected_tokens,
     switch_is_profitable,
 )
-from sglang.srt.speculative.adaptive_graph_memory import plan_residency
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.speculative.adaptive_graph_memory import plan_residency
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-cpu")
 
@@ -44,7 +44,7 @@ FN8S4_STATE_BYTES = {
 }
 # Device-free with every state paused, on the three ranks of that boot.
 FN8S4_FREE_MIB = (3535.5, 4001.5, 5720.7)
-FN8S4_MARGIN_MIB = 512  # SGLANG_ADAPTIVE_SERVING_MARGIN_MIB default
+FN8S4_MARGIN_MIB = 512  # FLLIPER_ADAPTIVE_SERVING_MARGIN_MIB default
 
 
 class TestResidencyPlanner(unittest.TestCase):

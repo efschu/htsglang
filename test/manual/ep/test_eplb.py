@@ -5,11 +5,11 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-import sglang as sgl
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+import flliper as sgl
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -20,8 +20,8 @@ from sglang.test.test_utils import (
 
 def get_a2a_backend_config():
     # On Blackwell or machines where DeepEP is hard to compile, set
-    # SGLANG_EPLB_TEST_MOE_A2A_BACKEND=flashinfer to use FlashInfer A2A.
-    moe_a2a_backend = os.environ.get("SGLANG_EPLB_TEST_MOE_A2A_BACKEND", "deepep")
+    # FLLIPER_EPLB_TEST_MOE_A2A_BACKEND=flashinfer to use FlashInfer A2A.
+    moe_a2a_backend = os.environ.get("FLLIPER_EPLB_TEST_MOE_A2A_BACKEND", "deepep")
     args = ["--moe-a2a-backend", moe_a2a_backend]
     kwargs = {"moe_a2a_backend": moe_a2a_backend}
     if moe_a2a_backend == "deepep":
@@ -49,8 +49,8 @@ class _BaseTestDynamicEPLB(CustomTestCase):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         with (
-            envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False),
-            envs.SGLANG_EXPERT_LOCATION_UPDATER_CANARY.override(True),
+            envs.FLLIPER_ENABLE_JIT_DEEPGEMM.override(False),
+            envs.FLLIPER_EXPERT_LOCATION_UPDATER_CANARY.override(True),
         ):
             cls.process = popen_launch_server(
                 cls.model,
@@ -111,7 +111,7 @@ class TestDynamicEPLBMultiChunk(_BaseTestDynamicEPLB):
 
 class TestStaticEPLB(CustomTestCase):
     def test_save_expert_distribution_and_init_expert_location(self):
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.FLLIPER_ENABLE_JIT_DEEPGEMM.set(False)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             engine_kwargs = dict(
@@ -130,7 +130,7 @@ class TestStaticEPLB(CustomTestCase):
             engine_kwargs.update(get_a2a_backend_kwargs())
 
             print(f"Action: start engine")
-            envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.set(tmp_dir)
+            envs.FLLIPER_EXPERT_DISTRIBUTION_RECORDER_DIR.set(tmp_dir)
             engine = sgl.Engine(
                 **engine_kwargs,
                 disable_overlap_schedule=True,

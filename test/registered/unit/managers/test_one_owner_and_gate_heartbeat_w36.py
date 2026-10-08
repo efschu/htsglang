@@ -28,7 +28,7 @@ whose gates were never reached. The rung was lost to an ambiguity created by
 the very lines meant to detect it.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -37,8 +37,8 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.cache_controller import gate_heartbeat
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import gate_heartbeat
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Alloc:
@@ -54,7 +54,7 @@ class _Alloc:
 
 
 def _cap_with(alloc, withheld):
-    from sglang.srt.managers.kv_backing_relief import KvRowCap
+    from flliper.srt.managers.kv_backing_relief import KvRowCap
 
     cap = KvRowCap.__new__(KvRowCap)
     cap._alloc = alloc
@@ -113,7 +113,7 @@ class TestTheCheckerIsNotSoftened(CustomTestCase):
     the one instrument that has been right every time."""
 
     def _check(self, **kw):
-        from sglang.srt.managers.scheduler_components.invariant_checker import (
+        from flliper.srt.managers.scheduler_components.invariant_checker import (
             SchedulerInvariantChecker,
         )
 
@@ -170,7 +170,7 @@ class TestTheGateHeartbeat(CustomTestCase):
     def test_the_seam_emits_it_every_cutover(self):
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         src = inspect.getsource(PhaseFlipRuntime._release_residents_for_cutover)
         self.assertIn("gate_heartbeat", src)
@@ -179,7 +179,7 @@ class TestTheGateHeartbeat(CustomTestCase):
     def test_the_gates_count_checks_not_only_refusals(self):
         import inspect
 
-        from sglang.srt.managers.cache_controller import (
+        from flliper.srt.managers.cache_controller import (
             consume_gate,
             operation_is_stale,
         )
@@ -208,7 +208,7 @@ class TestTheFreeListOverlap(CustomTestCase):
     """
 
     def _cap(self, free, release, withheld=()):
-        from sglang.srt.managers.kv_backing_relief import KvRowCap
+        from flliper.srt.managers.kv_backing_relief import KvRowCap
 
         alloc = _Alloc(free=free, release=release)
         cap = KvRowCap.__new__(KvRowCap)
@@ -271,7 +271,7 @@ class TestTheFreeListOverlap(CustomTestCase):
         # now caught three defects, including my own wrong fix.
         import inspect
 
-        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
         src = inspect.getsource(TokenToKVPoolAllocator.available_size)
         for banned in ("unique", "set(", "frozenset"):

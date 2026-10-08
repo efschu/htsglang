@@ -11,8 +11,8 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.speculative.spec_utils import traverse_tree
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.speculative.spec_utils import traverse_tree
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 

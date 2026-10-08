@@ -1,8 +1,8 @@
-"""SGLANG_OPT_MOE_POOL_KEEP_LRU: an eager forward keeps the decode LRU it did not write.
+"""FLLIPER_OPT_MOE_POOL_KEEP_LRU: an eager forward keeps the decode LRU it did not write.
 
-THE MEASUREMENT. Device-planned expert pool (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool):
+THE MEASUREMENT. Device-planned expert pool (FLLIPER_MOE_OFFLOAD_GRAPH_MODE=pool):
 every eager forward (the extend of a request, and under
-SGLANG_SPEC_EAGER_VERIFY=first also the first verify) ends in ``sync_tables``,
+FLLIPER_SPEC_EAGER_VERIFY=first also the first verify) ends in ``sync_tables``,
 which used to FREE every LRU row the eager pass had not written. The rows' bytes
 had not changed -- only the mapping was thrown away. fnFL2x100 (23.09.) MID-2, a
 radix-hit repeat of the prompt D had just decoded: TP0 ``pool.fetch`` 53-68 ms in
@@ -19,7 +19,7 @@ routed to -1 (its contribution silently dropped). (3) keep off = the old form,
 byte-for-byte: every unwritten LRU row is freed.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -32,8 +32,8 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.moe import expert_pool_device as ep
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe import expert_pool_device as ep
+from flliper.test.test_utils import CustomTestCase
 
 # residents 0,1 in rows 0,1; LRU rows 2..5; staging rows 6,7
 E, ROWS, R, S = 10, 8, 2, 2

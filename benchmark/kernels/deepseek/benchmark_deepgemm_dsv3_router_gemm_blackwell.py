@@ -40,7 +40,7 @@ def dsv3_router_gemm_sgl(
     hidden_states: torch.Tensor,
     router_weights: torch.Tensor,
 ):
-    """SGLang implementation of dsv3 router gemm"""
+    """fLLiper implementation of dsv3 router gemm"""
     output = dsv3_router_gemm(
         hidden_states,
         router_weights,
@@ -90,11 +90,11 @@ def calculate_diff(m: int, n: int, k: int):
     print(f"Shape m={m}, n={n}, k={k}:")
     print(f"Using PDL={args.use_pdl}")
     print(f"Flashinfer output: {out_flashinfer[0, 0:5]}")
-    print(f"SGLang output: {out_sgl[0, 0:5]}")
+    print(f"fLLiper output: {out_sgl[0, 0:5]}")
 
     flashinfer_sgl_match = check_accuracy(out_flashinfer, out_sgl, 0.1, 0.6, 0.95)
     print("Correctness check:")
-    print(f"  - Flashinfer vs SGLang: {'✅' if flashinfer_sgl_match else '❌'}")
+    print(f"  - Flashinfer vs fLLiper: {'✅' if flashinfer_sgl_match else '❌'}")
 
 
 def _benchmark(m, n, k, tp_size, provider):
@@ -108,7 +108,7 @@ def _benchmark(m, n, k, tp_size, provider):
 
     quantiles = [0.5, 0.2, 0.8]
 
-    if provider == "sglang":
+    if provider == "flliper":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: dsv3_router_gemm_sgl(
                 hidden_states.clone(memory_format=torch.contiguous_format),
@@ -143,8 +143,8 @@ def get_benchmark_plot_friendly(tp_sizes):
             x_names=["cfg_id"],
             x_vals=x_vals,
             line_arg="provider",
-            line_vals=["sglang", "flashinfer"],
-            line_names=["SGLang", "Flashinfer"],
+            line_vals=["flliper", "flashinfer"],
+            line_names=["fLLiper", "Flashinfer"],
             styles=[("blue", "-"), ("red", "-")],
             ylabel="us",
             plot_name=f"fp8-gemm-performance-comparison-tp-{'-'.join(str(tp) for tp in tp_sizes)}",
@@ -172,8 +172,8 @@ def get_benchmark(tp_sizes):
             ],
             x_vals=[list(config) for config in all_configs],
             line_arg="provider",
-            line_vals=["sglang", "flashinfer"],
-            line_names=["SGLang", "Flashinfer"],
+            line_vals=["flliper", "flashinfer"],
+            line_names=["fLLiper", "Flashinfer"],
             styles=[("blue", "-"), ("red", "-")],
             ylabel="us",
             plot_name=f"fp8-gemm-performance-comparison-tp-{'-'.join(str(tp) for tp in tp_sizes)}",

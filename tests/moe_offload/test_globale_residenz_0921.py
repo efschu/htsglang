@@ -20,11 +20,11 @@ import os
 
 import pytest
 
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import expert_store as es
 
 
 @pytest.fixture(autouse=True)
-def _saubere_env(tmp_path):
+def _clean_env(tmp_path):
     alt = os.environ.pop(es.RESIDENT_IDS_ENV, None)
     yield tmp_path
     if alt is not None:
@@ -33,25 +33,25 @@ def _saubere_env(tmp_path):
         os.environ.pop(es.RESIDENT_IDS_ENV, None)
 
 
-def test_ohne_env_bleibt_alles_wie_bisher():
+def test_without_env_nothing_changes():
     assert es.shared_resident_ids() is None
 
 
-def test_komma_liste_wird_gelesen():
+def test_comma_list_is_read():
     os.environ[es.RESIDENT_IDS_ENV] = "3,1,2,1"
     assert es.shared_resident_ids() == frozenset({1, 2, 3})
 
 
-def test_datei_wird_gelesen(_saubere_env):
-    p = _saubere_env / "res.json"
+def test_file_is_read(_clean_env):
+    p = _clean_env / "res.json"
     p.write_text(json.dumps(sorted({0, 5, 9})))
     os.environ[es.RESIDENT_IDS_ENV] = str(p)
     assert es.shared_resident_ids() == frozenset({0, 5, 9})
 
 
-def test_beide_gruppen_kommen_auf_DIESELBE_slotzahl(_saubere_env):
+def test_both_groups_reach_same_slot_count(_clean_env):
     """Der Kern: 188 global resident -> 324 Plaetze, egal wer fragt."""
-    p = _saubere_env / "res.json"
+    p = _clean_env / "res.json"
     global_res = sorted(set(range(0, 92)) | set(range(183, 229)) | set(range(320, 370)))
     assert len(global_res) == 188
     p.write_text(json.dumps(global_res))
@@ -62,15 +62,15 @@ def test_beide_gruppen_kommen_auf_DIESELBE_slotzahl(_saubere_env):
 
 
 @pytest.mark.parametrize("roh", ["", "abc", "1,,2", "-4", "[1,2", "1.5"])
-def test_krumme_angaben_geben_none_statt_halber_menge(roh, _saubere_env):
+def test_bad_input_gives_none_not_half_set(roh, _clean_env):
     """Eine falsche globale Menge waere eine falsche Slot-Zuordnung -- und die
     ist Datenverlust, nicht Speicherverlust."""
     os.environ[es.RESIDENT_IDS_ENV] = roh
     assert es.shared_resident_ids() is None
 
 
-def test_leere_menge_gilt_nicht_als_angabe(_saubere_env):
-    p = _saubere_env / "leer.json"
+def test_empty_set_is_not_an_input(_clean_env):
+    p = _clean_env / "leer.json"
     p.write_text("[]")
     os.environ[es.RESIDENT_IDS_ENV] = str(p)
     assert es.shared_resident_ids() is None

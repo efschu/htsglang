@@ -7,9 +7,9 @@ import string
 import unittest
 from typing import ClassVar
 
-from sglang.srt.kv_canary.config import CanaryMode
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+from flliper.srt.kv_canary.config import CanaryMode
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.e2e_base import CanaryE2EBase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=99, stage="extra-a", runner_config="1-gpu-small-amd")
@@ -39,7 +39,7 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
     def setUpClass(cls) -> None:
         if cls is _EagleChunkedRotationBase:
             raise unittest.SkipTest("abstract base; concrete subclasses set revert_pr")
-        cls.extra_env = {"SGLANG_DEBUG_REVERT_PR": "26329"} if cls.revert_pr else {}
+        cls.extra_env = {"FLLIPER_DEBUG_REVERT_PR": "26329"} if cls.revert_pr else {}
         super().setUpClass()
 
     def make_prompts(self, n: int) -> list[str]:

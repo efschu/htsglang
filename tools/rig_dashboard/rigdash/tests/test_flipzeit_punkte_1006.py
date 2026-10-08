@@ -1,5 +1,5 @@
 """NF 06.10.2026 (Boot dkrnfint4h6ablbar1dauer10061420, boot-20261006T142041Z-3e55): von 47 D>P-Flips hatte VM nur 20
-Punkte weg2_flip_user_view_ms{def="t2t",dir="D>P",part="total"}.  Nachgerechnet mit dem echten State (events.jsonl +
+Punkte pdflip_flip_user_view_ms{def="t2t",dir="D>P",part="total"}.  Nachgerechnet mit dem echten State (events.jsonl +
 D-Log): 20 ok, 17 "fehlt" (Start), 9 "leerlauf", 1 "fehlt" (Ende) -- zwei Ursachen, beide in ipcboot.flip_views:
 
   A  D>P-Flip, in dessen D-Phase D KEINE Decode-Runde schrieb (D wurde geweckt, rechnete nur einen Prefill-Forward und
@@ -7,7 +7,7 @@ D-Log): 20 ok, 17 "fehlt" (Start), 9 "leerlauf", 1 "fehlt" (Ende) -- zwei Ursach
      D's letzter Runde war auf die D-Phase begrenzt -> Start None -> "fehlt", nie ein Punkt.  Strikt ist es das letzte
      Decode-Token, das D je erzeugt hat -- auch aus einer frueheren Phase (27B: int8_matrix_lib.last_d_token).
   B  Die Front stempelt idle_flip am BEGIN (kein Wartender, kein Park).  9 Flips (Epochen 3, 5, 11, 37, 55, 61, 69, 77,
-     87) hatten einen Request, der 0,00-0,07 s VOR dem Begin ankam (WEG2 DP-WAIT, Rennen mit der Wartelliste): der
+     87) hatten einen Request, der 0,00-0,07 s VOR dem Begin ankam (PDFLIP DP-WAIT, Rennen mit der Wartelliste): der
      Request wartete auf den Flip, es stand Prefill an -> kein Leerlauf-Flip, aber kind="leerlauf", nie ein Punkt.
 
 Echte Leerlauf-Flips (der Request kommt erst NACH flip_done, oder nichts ist bekannt) bleiben "leerlauf" und zaehlen
@@ -28,7 +28,7 @@ def _ev(typ, ts, **data):
     return {"type": typ, "ts": ts, "data": data}
 
 
-def _ipc(idle=False, rid="weg2-2-16"):
+def _ipc(idle=False, rid="pdflip-2-16"):
     """Two flips of the NF boot's shape: P>D (epoch 2: begin +20.0, done +22.5), then D>P (epoch 3: begin +40.0,
     done +42.2, P's first forward on PP0 at +42.45)."""
     ev = [_ev("flip_begin", T + 20.0, flip_begin_ts=T + 20.0, sleep="P", wake="D", epoch_before=1),
@@ -61,16 +61,16 @@ class NoRoundInTheDPhase(unittest.TestCase):
 
     def test_start_without_a_later_round_is_provisional_and_not_counted_yet(self):
         # D's log writes late: until a round after flip_done is in it, the start is not final (PROVISIONAL_MAX_S)
-        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS_BEFORE, arrivals={"weg2-2-16": T + 39.0}))
+        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS_BEFORE, arrivals={"pdflip-2-16": T + 39.0}))
         self.assertTrue(x["provisional"])
         self.assertFalse(flipzeit.counted(x))
         y = _dp(ipcboot.flip_views(SEGS, _ipc(), T + 42.2 + ipcboot.PROVISIONAL_MAX_S + 1, None,
-                                   d_rounds=self.ROUNDS_BEFORE, arrivals={"weg2-2-16": T + 39.0}))
+                                   d_rounds=self.ROUNDS_BEFORE, arrivals={"pdflip-2-16": T + 39.0}))
         self.assertTrue(flipzeit.counted(y))
 
     def test_start_is_the_last_token_of_an_earlier_d_phase_and_the_flip_gets_a_point(self):
         x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS_BEFORE + [self.LATER],
-                                   arrivals={"weg2-2-16": T + 39.0}))
+                                   arrivals={"pdflip-2-16": T + 39.0}))
         self.assertEqual(x["kind"], "ok")
         # Nutzer 06.10. (Korrektur): Server-Leerlauf ist keine Flipzeit -> Start = max(letztes D-Token +9.8, Ankunft +39.0)
         self.assertAlmostEqual(x["start"], T + 39.0, places=3)
@@ -90,7 +90,7 @@ class NoRoundInTheDPhase(unittest.TestCase):
     def test_arrival_before_the_last_token_changes_nothing(self):
         """The request was already waiting when D produced its last token: the start is that token (no idle gap)."""
         rounds = self.ROUNDS_BEFORE + [self.LATER]
-        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=rounds, arrivals={"weg2-2-16": T + 5.0}))
+        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=rounds, arrivals={"pdflip-2-16": T + 5.0}))
         self.assertAlmostEqual(x["start"], T + 9.8, places=3)
         self.assertIsNone(x["leer_excl_ms"])
         self.assertAlmostEqual(x["total_ms"], (42.45 - 9.8) * 1000, delta=1)
@@ -98,10 +98,10 @@ class NoRoundInTheDPhase(unittest.TestCase):
 
     def test_a_round_inside_the_phase_still_wins(self):
         rounds = self.ROUNDS_BEFORE + [(T + 30.0, T + 30.4), self.LATER]
-        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=rounds, arrivals={"weg2-2-16": T + 25.0}))
+        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=rounds, arrivals={"pdflip-2-16": T + 25.0}))
         self.assertAlmostEqual(x["start"], T + 30.4, places=3)
         self.assertFalse(x.get("start_prev_phase"))
-        y = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=rounds, arrivals={"weg2-2-16": T + 39.0}))
+        y = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=rounds, arrivals={"pdflip-2-16": T + 39.0}))
         self.assertAlmostEqual(y["start"], T + 39.0, places=3)                  # arrival after the last token: max()
         self.assertAlmostEqual(y["leer_excl_ms"], (39.0 - 30.4) * 1000, delta=1)
 
@@ -117,7 +117,7 @@ class IdleFlipWithAWaitingRequest(unittest.TestCase):
     ROUNDS = [(T + 30.0, T + 30.4), (T + 50.0, T + 50.3)]
 
     def test_request_that_arrived_before_the_done_waited_for_the_flip(self):
-        x = _dp(ipcboot.flip_views(SEGS, _ipc(idle=True), NOW, None, d_rounds=self.ROUNDS, arrivals={"weg2-2-16": T + 39.94}))
+        x = _dp(ipcboot.flip_views(SEGS, _ipc(idle=True), NOW, None, d_rounds=self.ROUNDS, arrivals={"pdflip-2-16": T + 39.94}))
         self.assertEqual(x["kind"], "ok")
         self.assertTrue(x["idle_waited"])
         self.assertAlmostEqual(x["total_ms"], (42.45 - 39.94) * 1000, delta=1)     # from the arrival, not D's last token
@@ -126,7 +126,7 @@ class IdleFlipWithAWaitingRequest(unittest.TestCase):
         self.assertTrue(flipzeit.counted(x))
 
     def test_request_that_arrives_after_the_done_leaves_a_real_idle_flip(self):
-        x = _dp(ipcboot.flip_views(SEGS, _ipc(idle=True), NOW, None, d_rounds=self.ROUNDS, arrivals={"weg2-2-16": T + 47.0}))
+        x = _dp(ipcboot.flip_views(SEGS, _ipc(idle=True), NOW, None, d_rounds=self.ROUNDS, arrivals={"pdflip-2-16": T + 47.0}))
         self.assertEqual(x["kind"], "leerlauf")
         self.assertFalse(flipzeit.counted(x))
         self.assertEqual(vmpush.flip_view_points([x], "NF", "boot-x", set()), [])
@@ -143,14 +143,14 @@ class DefinitionGuards(unittest.TestCase):
     ROUNDS = [(T + 30.0, T + 30.4), (T + 50.0, T + 50.3)]
 
     def test_an_arrival_after_the_first_prefill_forward_is_missing_never_a_zero_total(self):
-        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS, arrivals={"weg2-2-16": T + 44.0}))
+        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS, arrivals={"pdflip-2-16": T + 44.0}))
         self.assertEqual((x["kind"], x["total_ms"]), ("fehlt", None))
         self.assertEqual(x["missing"], ipcboot.F_DP_ARRIVAL)
         self.assertFalse(flipzeit.counted(x))
         self.assertEqual(vmpush.flip_view_points([x], "NF", "boot-x", set()), [])
 
     def test_clock_skew_inside_the_tolerance_clamps_to_the_end_of_the_flip(self):
-        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS, arrivals={"weg2-2-16": T + 42.6}))
+        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS, arrivals={"pdflip-2-16": T + 42.6}))
         self.assertEqual(x["kind"], "ok")
         self.assertAlmostEqual(x["start"], T + 42.45, places=3)
 
@@ -164,7 +164,7 @@ class DefinitionGuards(unittest.TestCase):
             self.assertEqual(vmpush.flip_view_points([x], "NF", "boot-x", set()), [])
 
     def test_idle_span_is_never_in_the_total_and_never_in_the_points_total(self):
-        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS, arrivals={"weg2-2-16": T + 39.0}))
+        x = _dp(ipcboot.flip_views(SEGS, _ipc(), NOW, None, d_rounds=self.ROUNDS, arrivals={"pdflip-2-16": T + 39.0}))
         self.assertAlmostEqual(x["total_ms"], (42.45 - 39.0) * 1000, delta=1)
         self.assertGreater(x["leer_excl_ms"], 8000)
         tot = [p for p in vmpush.flip_view_points([x], "NF", "boot-x", set()) if 'part="total"' in p]

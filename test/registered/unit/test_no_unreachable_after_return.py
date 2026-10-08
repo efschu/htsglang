@@ -38,14 +38,14 @@ import ast
 import pathlib
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-_SCAN_ROOTS = [_REPO_ROOT / "python" / "sglang", _REPO_ROOT / "test"]
+_SCAN_ROOTS = [_REPO_ROOT / "python" / "flliper", _REPO_ROOT / "test"]
 
 # Pre-existing, deliberate dead code inherited from upstream. Keyed by
 # (path relative to repo root, function name) so it survives line drift.
@@ -55,13 +55,13 @@ _KNOWN_UPSTREAM_DEAD_CODE = {
     # Upstream TODO: rid handling is disabled with an early `return None`,
     # the real body is kept below it on purpose.
     (
-        "python/sglang/srt/entrypoints/openai/serving_base.py",
+        "python/flliper/srt/entrypoints/openai/serving_base.py",
         "_generate_request_id_base",
     ),
     # Upstream stub: `raise NotImplementedError("teacache is not supported
     # yet ...")` in front of the not-yet-wired teacache body.
     (
-        "python/sglang/multimodal_gen/runtime/models/dits/hunyuanvideo.py",
+        "python/flliper/multimodal_gen/runtime/models/dits/hunyuanvideo.py",
         "should_skip_forward_for_cached_states",
     ),
 }

@@ -27,14 +27,14 @@ be reached.
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.arg_groups.pd_disaggregation_hook import validate_pd_draft_kv_layout
-from sglang.srt.disaggregation.draft_kv_canonical import (
+from flliper.srt.arg_groups.pd_disaggregation_hook import validate_pd_draft_kv_layout
+from flliper.srt.disaggregation.draft_kv_canonical import (
     CANONICAL_LAYOUT_VERSION,
     DraftKvCanonicalLayout,
     DraftKvLayoutMismatch,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -217,7 +217,7 @@ class LayoutAgreementTest(CustomTestCase):
         as coverage" failure this whole task has been removing, so it must not
         be the only thing standing here.
         """
-        from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
+        from flliper.srt.mem_cache.hicache_storage import compute_model_identity_hash
 
         def _sa(layout):
             return SimpleNamespace(
@@ -256,7 +256,7 @@ class LayoutAgreementTest(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
+        from flliper.srt.mem_cache.hicache_storage import compute_model_identity_hash
 
         self.assertNotIn(
             "draft_kv_layout",

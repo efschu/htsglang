@@ -1,7 +1,7 @@
 from math import exp
 from pprint import pformat
 
-import sglang as sgl
+import flliper as sgl
 
 YELLOW = "\033[1;33m"
 GREEN = "\033[1;32m"

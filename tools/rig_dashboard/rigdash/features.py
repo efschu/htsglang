@@ -15,7 +15,7 @@ there but computed here, so they cannot go stale:
     boot runs, OR a commit with the same ``git patch-id`` is on that line (27B
     picks NF branches under a new sha), OR -- weakest -- a commit with the same
     subject.  Computed once per (rev, feature file) and cached.
-  * aktiv     -- from the boot's state.json (weg2.state/1), never from log text
+  * aktiv     -- from the boot's state.json (pdflip.state/1), never from log text
     (user order against log IPC): ``groups.<G>.launch`` = {argv, env} written by
     the launcher; for an older image without that snapshot, the profile file the
     state names.  A switch absent from argv/env takes its ``default``.
@@ -343,7 +343,7 @@ def _env_lookup(env: dict, name: str):
 
 
 def _flag_lookup(argv: list, name: str):
-    """(present, value) of a flag over both spellings of the subsystem part (``--weg2-x`` / ``--pdflip-x``)."""
+    """(present, value) of a flag over both spellings of the subsystem part (``--pdflip-x`` / ``--pdflip-x``)."""
     for v in N.marker_variants(name):
         present, value = _flag_value(argv, v)
         if present:
@@ -359,11 +359,11 @@ def switch_state(sw: dict, st: Optional[dict], profile_text: Optional[str]) -> d
     """{state: an|aus|unbekannt, src, value} of one switch in the boot."""
     name = sw.get("name") or ""
     art = sw.get("art") or ("flag" if name.startswith("--") else "env")
-    gruppe = sw.get("gruppe") or ""
+    proc_group = sw.get("gruppe") or ""
     default_on = str(sw.get("default") or "aus").lower() in ("an", "on", "1", "true")
     an_wert = sw.get("an_wert")
     groups = (st or {}).get("groups") or {}
-    targets = [gruppe] if gruppe in ("P", "D") else (["P", "D"] if gruppe in ("", "beide") else [])
+    targets = [proc_group] if proc_group in ("P", "D") else (["P", "D"] if proc_group in ("", "beide") else [])
     launches = [(g, (groups.get(g) or {}).get("launch")) for g in targets]
     launches = [(g, l) for g, l in launches if isinstance(l, dict)]
     if launches:
@@ -409,7 +409,7 @@ def aktiv(feature: dict, st: Optional[dict], profile_text: Optional[str], im: di
         if im.get("state") == "ja":
             return {"state": "an", "detail": [], "note": "without switch: takes effect as soon as it is in the image"}
         return {"state": "aus" if im.get("state") == "nein" else "unbekannt", "detail": []}
-    det = [dict(switch_state(s, st, profile_text), name=s.get("name"), gruppe=s.get("gruppe")) for s in sws]
+    det = [dict(switch_state(s, st, profile_text), name=s.get("name"), proc_group=s.get("gruppe")) for s in sws]
     states = {d["state"] for d in det}
     if states == {"an"}:
         state = "an"
@@ -565,8 +565,8 @@ MATRIX_TEXT = ("code", "prosa", "thinking", "gemischt")
 MATRIX_ZELLSTATUS = ("wert", "ungültig")
 
 
-def matrix_key(form, bs, tiefe, text) -> str:
-    return "%s|%s|%s|%s" % (form, bs, tiefe, text)
+def matrix_key(form, bs, depth, text) -> str:
+    return "%s|%s|%s|%s" % (form, bs, depth, text)
 
 
 def matrix_key_error(k: str) -> Optional[str]:
@@ -685,7 +685,7 @@ def _cur_api(lb, fb, gpus):
     served = (lb.get("front") or {}).get("served")
     if isinstance(served, dict) and served:
         return ("%s requests served (P %s / D %s)" % (served.get("D", 0), served.get("P", 0), served.get("D", 0)),
-                "Front /weg2/state served")
+                "Front /pdflip/state served")
     tot = lb.get("totals") or {}
     return ("%s requests served" % tot["served_requests"], "state.json front.served (IPC)") if tot.get("served_requests") else None
 
@@ -704,7 +704,7 @@ MISSING = {"F6": "Expert rows per rank (marker MOE-POOL rows / LRU rows)",
            "F9": "L3 hits per request (marker HiCacheFile index / STORE READ)",
            "F10": "Vision stage (marker W102 / VISION-STAGE)",
            "F16": "Prefix hits per follow-up turn (marker #cached-token per rid)",
-           "F18": "Store occupancy (marker WEG2-HOST WATERMARK)",
+           "F18": "Store occupancy (marker PDFLIP-HOST WATERMARK)",
            "F19": "Planner budget per rank (marker BUDGET-REACH / budget P/D)"}
 
 

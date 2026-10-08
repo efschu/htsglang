@@ -51,7 +51,7 @@ So the shape of the fix is fixed by the defect:
     not by a default -- it is taken ONCE per pass, at one point, and handed
     to the consumers as a VALUE (a parameter cannot be missing);
   * and every degradation must be LOUD. Under
-    `SGLANG_TP_HEAD_CONGRUENCE=1` a rank-local fallback is a DEFECT, so it
+    `FLLIPER_TP_HEAD_CONGRUENCE=1` a rank-local fallback is a DEFECT, so it
     carries a named counter and a rate-limited log on both arms, plus the
     recovery edge -- the half a latch can never report.
 
@@ -123,8 +123,8 @@ import unittest
 from types import SimpleNamespace
 from typing import Optional
 
-from sglang.srt.managers import tp_head_congruence as thc
-from sglang.srt.managers.scheduler import Scheduler
+from flliper.srt.managers import tp_head_congruence as thc
+from flliper.srt.managers.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # Part 1 -- ROOT 1 as an executable invariant. THIS IS THE RED-FIRST CASE.
@@ -458,14 +458,14 @@ class ADegradationUnderAnArmedEnforcerIsLoud(unittest.TestCase):
 
     def test_the_order_arm_says_so_when_the_decision_is_missing(self):
         h = _PassHarness(_CANON)
-        with self.assertLogs("sglang.srt.managers.scheduler", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.managers.scheduler", level="WARNING") as cm:
             h._apply_uniform_head_order(h.run_pass_prologue())
         self.assertTrue(any("DEGRADED" in line and "order" in line for line in cm.output))
         self.assertEqual(h._tp_head_degrade_total_order, 1)
 
     def test_the_count_arm_says_so_too_and_this_is_the_new_instrument(self):
         h = _PassHarness(_CANON, allocatable=7)
-        with self.assertLogs("sglang.srt.managers.scheduler", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.managers.scheduler", level="WARNING") as cm:
             self.assertEqual(h._uniform_allocatable_reqs(0, h.run_pass_prologue()), 7)
         self.assertTrue(any("DEGRADED" in line and "count" in line for line in cm.output))
         self.assertEqual(h._tp_head_degrade_total_count, 1)
@@ -502,7 +502,7 @@ class ADegradationUnderAnArmedEnforcerIsLoud(unittest.TestCase):
         h._apply_uniform_head_order(h.run_pass_prologue())
         self.assertEqual(h._tp_head_degrade_streak_order, 1)
         h.publish(_CANON, _GROUP_LENS, admit_limit=None)
-        with self.assertLogs("sglang.srt.managers.scheduler", level="INFO") as cm:
+        with self.assertLogs("flliper.srt.managers.scheduler", level="INFO") as cm:
             h._apply_uniform_head_order(h.run_pass_prologue())
         self.assertTrue(any("RESTORED" in line for line in cm.output))
         self.assertEqual(h._tp_head_degrade_streak_order, 0)
@@ -632,7 +632,7 @@ class ThePpPhaseFormsCongruentlyThroughItsOwnActuator(unittest.TestCase):
         ]
 
     def test_all_three_stages_form_the_same_batch(self):
-        from sglang.srt.managers import pp_admission_congruence as ppc
+        from flliper.srt.managers import pp_admission_congruence as ppc
 
         # PP0 owns admission truth and commits its own batch order.
         pp0_order = ["r-charlie", "r-alpha", "r-bravo"]

@@ -2,7 +2,7 @@
 Benchmark & Correctness: Triton GDN vs CuTeDSL GDN (prefill, SM100 Blackwell).
 
 Compares:
-  - Triton:  sglang's chunk_gated_delta_rule (FLA chunkwise, fp32 state, K-contig pool)
+  - Triton:  flliper's chunk_gated_delta_rule (FLA chunkwise, fp32 state, K-contig pool)
   - CuteDSL: ported vLLM #43273 chunk_gated_delta_rule_cutedsl (SM100 only)
 
 The two kernels share the same math and the same g/beta convention (log-space
@@ -26,11 +26,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python")
 
 import torch
 
-from sglang.srt.layers.attention.fla.chunk import (
+from flliper.srt.layers.attention.fla.chunk import (
     chunk_gated_delta_rule as triton_chunk_gated_delta_rule,
 )
-from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-from sglang.srt.layers.attention.linear.kernels.gdn_blackwell import (
+from flliper.srt.layers.attention.fla.l2norm import l2norm_fwd
+from flliper.srt.layers.attention.linear.kernels.gdn_blackwell import (
     chunk_gated_delta_rule_cutedsl,
     prepare_metadata_cutedsl,
 )

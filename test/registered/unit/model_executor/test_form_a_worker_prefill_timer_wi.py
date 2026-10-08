@@ -26,8 +26,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest  # noqa: E402
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
-from sglang.srt.model_executor.model_runner import ModelRunner  # noqa: E402
+from flliper.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from flliper.srt.model_executor.model_runner import ModelRunner  # noqa: E402
 
 
 class _Timer:

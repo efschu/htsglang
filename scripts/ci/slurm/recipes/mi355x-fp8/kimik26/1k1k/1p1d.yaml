@@ -1,14 +1,14 @@
 # MI355X Kimi-K2.6 (FP8) 2-node 1P1D disaggregation recipe (base).
 #
 # All Kimi-specific config lives in this recipe's `model:` block (docker env +
-# sglang server args) and `runtime` (split attention backends); nothing about
+# flliper server args) and `runtime` (split attention backends); nothing about
 # Kimi is hardcoded in launch_mi355x.sh. Mirrors the single-node registered test
 # test/registered/amd/accuracy/mi35x/test_kimi_k26_eval_mi35x.py (TP8, split
 # attention backends, multithread loader, GSM8K > 0.92).
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
-#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#     `backend.flliper_config` (TP/EP/DP + worker counts) for the summary table.
 #   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, `model`, `mtp`.
 
 resources:
@@ -16,7 +16,7 @@ resources:
   decode_workers: 1
 
 backend:
-  sglang_config:
+  flliper_config:
     prefill:
       tensor-parallel-size: 8
       expert-parallel-size: 1
@@ -26,12 +26,12 @@ backend:
       expert-parallel-size: 1
       data-parallel-size: 1
 
-# Model-specific docker env + sglang server args (written verbatim via
+# Model-specific docker env + flliper server args (written verbatim via
 # model_flags.sh). Each server arg + value is a SEPARATE list item.
 model:
   env:
-    SGLANG_USE_AITER: 1
-    SGLANG_ROCM_FUSED_DECODE_MLA: 0
+    FLLIPER_USE_AITER: 1
+    FLLIPER_ROCM_FUSED_DECODE_MLA: 0
   server_args:
     - --model-loader-extra-config
     - '{"enable_multithread_load": true}'

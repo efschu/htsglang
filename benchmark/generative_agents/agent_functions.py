@@ -1,4 +1,4 @@
-import sglang as sgl
+import flliper as sgl
 
 # here are the top five agent functions contributing ~70% LLM calls
 # reference: https://github.com/joonspk-research/generative_agents/

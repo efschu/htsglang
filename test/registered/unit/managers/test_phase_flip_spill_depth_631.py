@@ -38,7 +38,7 @@ import re
 import unittest
 from typing import List
 
-from sglang.srt.managers import phase_flip_spill as spill
+from flliper.srt.managers import phase_flip_spill as spill
 
 
 class _Pool:
@@ -170,7 +170,7 @@ class SeamOrderingTest(unittest.TestCase):
     """The rung must sit strictly between release and restore."""
 
     def _run(self, depth: str, direction: str) -> List[str]:
-        from sglang.srt.managers import phase_flip_runtime as rt
+        from flliper.srt.managers import phase_flip_runtime as rt
 
         log: List[str] = []
         pp_pool = _Pool("pp", log)
@@ -250,7 +250,7 @@ class SeamOrderingTest(unittest.TestCase):
         # Resolution happens when the swap is BUILT. If it happened inside the
         # swap, the exception would land after release_backing() had already
         # handed the source pool's pages back, leaving neither layout backed.
-        from sglang.srt.managers import phase_flip_runtime as rt
+        from flliper.srt.managers import phase_flip_runtime as rt
 
         # "draft+graphs" rather than "draft": rung 2 became implemented in
         # #656 successor 29, so the still-unwired rung is now 3. The property
@@ -395,7 +395,7 @@ def test_the_drafter_is_never_spilled_while_the_instance_is_in_TP():
     pages back. Survivable while the seam gate was the only caller; not
     survivable once the rebalance lender spends the same ladder on a 2 s
     clock in both phases."""
-    from sglang.srt.managers.phase_flip_spill import _late_bound_draft_provider
+    from flliper.srt.managers.phase_flip_spill import _late_bound_draft_provider
 
     carrier = _Carrier()
     provider = _late_bound_draft_provider(_Sched("tp", carrier))
@@ -405,7 +405,7 @@ def test_the_drafter_is_never_spilled_while_the_instance_is_in_TP():
 
 
 def test_the_drafter_IS_spilled_in_PP_where_it_is_unreachable():
-    from sglang.srt.managers.phase_flip_spill import _late_bound_draft_provider
+    from flliper.srt.managers.phase_flip_spill import _late_bound_draft_provider
 
     carrier = _Carrier()
     provider = _late_bound_draft_provider(_Sched("pp", carrier))
@@ -414,7 +414,7 @@ def test_the_drafter_IS_spilled_in_PP_where_it_is_unreachable():
 
 
 def test_an_unknown_phase_refuses_rather_than_guesses():
-    from sglang.srt.managers.phase_flip_spill import _late_bound_draft_provider
+    from flliper.srt.managers.phase_flip_spill import _late_bound_draft_provider
 
     carrier = _Carrier()
     provider = _late_bound_draft_provider(_Sched(None, carrier))

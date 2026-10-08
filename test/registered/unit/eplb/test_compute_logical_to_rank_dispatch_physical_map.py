@@ -1,6 +1,6 @@
 """Unit tests for compute_logical_to_rank_dispatch_physical_map — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -9,10 +9,10 @@ import unittest
 
 import torch
 
-from sglang.srt.eplb.expert_location import (
+from flliper.srt.eplb.expert_location import (
     compute_logical_to_rank_dispatch_physical_map,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _make_server_args(ep_size: int, nnodes: int):

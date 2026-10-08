@@ -13,15 +13,15 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
+from flliper.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - GROK1-INT4 accuracy tests on MI35x (~70 min)
 register_amd_ci(
@@ -60,8 +60,8 @@ def get_answer_value(answer_str):
 
 
 def run_gsm8k_benchmark(base_url, num_questions=200, num_shots=5, parallel=64):
-    import sglang as sgl
-    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+    import flliper as sgl
+    from flliper.lang.backend.runtime_endpoint import RuntimeEndpoint
 
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     data_path = download_and_cache_file(url)
@@ -109,8 +109,8 @@ class TestGrok1INT4EvalMI35x(unittest.TestCase):
         """Test Grok-1 INT4 with GSM8K completion benchmark."""
         env = os.environ.copy()
         env["RCCL_MSCCL_ENABLE"] = "0"
-        env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_INT4_WEIGHT"] = "1"
+        env["FLLIPER_USE_AITER"] = "1"
+        env["FLLIPER_INT4_WEIGHT"] = "1"
 
         other_args = [
             "--tp",

@@ -7,7 +7,7 @@ that a wrapper addresses with re-indexed ids.
 `HybridLinearKVPool` (the GDN + full-attention pool the family plan uses) maps a
 global id through `_transfer_full_attention_id` into a DENSE full-attention
 index, then calls `full_kv_pool.get_key_buffer(mapped)`. Under
-`SGLANG_PP_LAYER_SET` the sub-pool's map is keyed {35: 0, 39: 1, ...} while the
+`FLLIPER_PP_LAYER_SET` the sub-pool's map is keyed {35: 0, 39: 1, ...} while the
 id arriving is 0..7 -- so every lookup misses.
 
 It fails loudly rather than silently (the accessor refuses an unowned layer
@@ -17,15 +17,15 @@ plain subtraction in its own dense frame. This is a defect introduced with the
 accessor itself, not a pre-existing one.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import inspect
 import unittest
 
-from sglang.srt.mem_cache.memory_pool import KVCache, mark_as_sub_pool
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.memory_pool import KVCache, mark_as_sub_pool
+from flliper.test.test_utils import CustomTestCase
 
 FA_STAGE = [35, 39, 43, 47, 51, 55, 59, 63]
 
@@ -86,13 +86,13 @@ class TestMarkingASubPoolFixesTheFrame(CustomTestCase):
 
 class TestTheWrappersMarkTheirSubPools(CustomTestCase):
     def test_hybrid_linear_pool_marks_its_full_pool(self):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         src = inspect.getsource(HybridLinearKVPool.__init__)
         self.assertIn("mark_as_sub_pool(", src)
 
     def test_swa_pool_marks_both_sub_pools(self):
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         src = inspect.getsource(SWAKVPool.__init__)
         self.assertEqual(src.count("mark_as_sub_pool("), 2)

@@ -36,11 +36,11 @@ import openai
 import requests
 from openai_sdk_harness import TOKENIZER_NAME, live_server
 
-from sglang.srt.training.backends.mock import MockBackend
-from sglang.srt.training.feasibility import GIB, CardResources, MachineResources
-from sglang.srt.training.service import TrainingService, TrainingServiceConfig
-from sglang.srt.training.tenant import DemandSample, IdleMonitor
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.training.backends.mock import MockBackend
+from flliper.srt.training.feasibility import GIB, CardResources, MachineResources
+from flliper.srt.training.service import TrainingService, TrainingServiceConfig
+from flliper.srt.training.tenant import DemandSample, IdleMonitor
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # The engine, the machine and the executor are all mocked; this needs no card.
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")

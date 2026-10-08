@@ -17,7 +17,7 @@ is being revisited rather than a new mechanism invented.
 
 import pytest
 
-from sglang.srt.managers.arena_tail_probe import (
+from flliper.srt.managers.arena_tail_probe import (
     STACK_RESIDUAL_MIB,
     post_sizing_stack_bytes,
 )

@@ -12,8 +12,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.mem_cache.utils import get_hash_str
-from sglang.srt.speculative.dflash_draft_kv_producer import (
+from flliper.srt.mem_cache.utils import get_hash_str
+from flliper.srt.speculative.dflash_draft_kv_producer import (
     DFlashDraftKvProduceError,
     batch_page_hashes,
     chunk_page_hashes,
@@ -101,7 +101,7 @@ class _Backend:
 
 
 def _bound_pool(monkeypatch, arena):
-    from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+    from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
 
     pool = ArenaMHAHostPool.__new__(ArenaMHAHostPool)
     pool.size = 0  # staging rows: none (the fixture never stages)
@@ -147,13 +147,13 @@ def test_publish_direct_counts_a_refused_claim_as_zero(monkeypatch):
 
 
 def test_cache_controller_direct_publish_disarms_row_transfers():
-    from sglang.srt.managers.cache_controller import HiCacheController
+    from flliper.srt.managers.cache_controller import HiCacheController
 
     cc = HiCacheController.__new__(HiCacheController)
     cc.has_draft = True
     cc.draft_owner_phase = None
     cc.draft_binding_generation = None
-    cc.mem_pool_device_draft = SimpleNamespace(weg2_direct_publish=True)
+    cc.mem_pool_device_draft = SimpleNamespace(pdflip_direct_publish=True)
     assert cc.draft_tier_armed("write") is False
     assert cc.draft_tier_armed("load") is False
     # the hash-keyed L3 points stay armed for this pool
@@ -161,7 +161,7 @@ def test_cache_controller_direct_publish_disarms_row_transfers():
 
 
 def test_cache_controller_publish_routes_to_the_host_pool():
-    from sglang.srt.managers.cache_controller import HiCacheController
+    from flliper.srt.managers.cache_controller import HiCacheController
 
     seen = {}
 
@@ -189,8 +189,8 @@ def test_xsn262_the_token_stream_comes_from_the_forks_req_get_fill_ids():
     prefill. The stream is read through `get_fill_ids()` (cut at the extend
     range), then a plain `fill_ids`, then origin + output."""
     from types import SimpleNamespace
-    from sglang.srt.mem_cache.utils import get_hash_str
-    from sglang.srt.speculative.dflash_draft_kv_producer import (
+    from flliper.srt.mem_cache.utils import get_hash_str
+    from flliper.srt.speculative.dflash_draft_kv_producer import (
         _token_stream, chunk_page_hashes,
     )
     toks = list(range(100, 112))
@@ -213,7 +213,7 @@ def test_xsn262_the_token_stream_comes_from_the_forks_req_get_fill_ids():
 
 # ---------------------------------------------------------------------------
 # weg2xsn268/269 (18.09.2026): 0 draft hits on D. Every Weg 2 group runs with
-# SGLANG_HICACHE_BIGRAM_KEYS=1, so the tree keys page i by the bigram chain up
+# FLLIPER_HICACHE_BIGRAM_KEYS=1, so the tree keys page i by the bigram chain up
 # to (t_i, t_i+1); the producer hashed the raw unigram list -- a disjoint key
 # space (PP2 published 4316 pages, D's draft L3 READ found 0). The producer
 # now hashes in the tree's own scheme and drops the one position that has no
@@ -224,7 +224,7 @@ def _tree_hashes_bigram(tokens):
     """What the tree keys these tokens' pages by (compute_node_hash_values
     over a bigram RadixKey, one node)."""
     from array import array
-    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from flliper.srt.mem_cache.radix_cache import RadixKey
     return get_hash_str(RadixKey(array("q", tokens), None, is_bigram=True), None, page_size=1)
 
 
@@ -265,7 +265,7 @@ def test_xsn269_unigram_form_is_unchanged():
 
 
 def test_xsn269_rows_to_publish_slices_the_ring_per_request():
-    from sglang.srt.speculative.dflash_draft_kv_producer import _rows_to_publish
+    from flliper.srt.speculative.dflash_draft_kv_producer import _rows_to_publish
     a, b = list(range(10, 22)), list(range(40, 48))      # 12 and 8 tokens
     batch = SimpleNamespace(reqs=[_req(a, "a"), _req(b, "b")], prefix_lens=[0, 0], extend_lens=[12, 8])
     ring = torch.arange(20, dtype=torch.int64)
@@ -277,8 +277,8 @@ def test_xsn269_rows_to_publish_slices_the_ring_per_request():
 
 
 def test_xsn269_the_flag_comes_from_the_tree_not_the_env(monkeypatch):
-    from sglang.srt.speculative.dflash_draft_kv_producer import tree_keys_are_bigram
-    monkeypatch.setenv("SGLANG_HICACHE_BIGRAM_KEYS", "1")
+    from flliper.srt.speculative.dflash_draft_kv_producer import tree_keys_are_bigram
+    monkeypatch.setenv("FLLIPER_HICACHE_BIGRAM_KEYS", "1")
     assert tree_keys_are_bigram(SimpleNamespace(tree_cache=SimpleNamespace(is_eagle=False))) is False
     assert tree_keys_are_bigram(SimpleNamespace(tree_cache=SimpleNamespace(is_eagle=True))) is True
     assert tree_keys_are_bigram(SimpleNamespace()) is False

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.kv_canary.config import CanaryMode
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.consts import SWA_POOL_SERVER_ARGS
-from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+from flliper.srt.kv_canary.config import CanaryMode
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.consts import SWA_POOL_SERVER_ARGS
+from flliper.test.kv_canary.e2e_base import CanaryE2EBase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=175, stage="extra-a", runner_config="1-gpu-small-amd")
@@ -14,14 +14,14 @@ register_amd_ci(est_time=175, stage="extra-a", runner_config="1-gpu-small-amd")
 class _PerturbReqToTokenBase(CanaryE2EBase):
     kv_canary_mode = CanaryMode.LOG
     extra_env = {
-        "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0.1",
-        "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+        "FLLIPER_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0.1",
+        "FLLIPER_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
         # req_to_token perturbation deliberately corrupts the slot mapping
         # by design, which the scheduler's on-idle invariant checker reports
         # as a pool memory leak (perturbed slot is freed, original slot
         # still looks busy). That's expected for this test; disable strict
         # mode so the leak warning doesn't crash the scheduler.
-        "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "0",
+        "FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "0",
     }
 
     @classmethod

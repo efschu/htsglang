@@ -18,7 +18,7 @@ source semantics it depends on are pinned against the real
 ``memory_pool.py`` so this file cannot quietly drift away from them.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -27,8 +27,8 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import PhaseFlipTransition
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.dcp.phase_flip_plan import PhaseFlipTransition
+from flliper.test.test_utils import CustomTestCase
 
 PP_TO_TP = "pp_to_tp"
 TP_TO_PP = "tp_to_pp"
@@ -134,7 +134,7 @@ class _FakePool:
 
 
 def _swap(pp_pool, tp_pool):
-    from sglang.srt.managers.phase_flip_runtime import WavedBackingSwap
+    from flliper.srt.managers.phase_flip_runtime import WavedBackingSwap
 
     s = object.__new__(WavedBackingSwap)
     s._pp_pool = pp_pool
@@ -150,13 +150,13 @@ class TestTheFakePoolIsFaithful(CustomTestCase):
     """The model above is only evidence if it models the real thing."""
 
     def test_residency_is_the_absence_of_released_layers(self):
-        from sglang.srt.mem_cache import memory_pool
+        from flliper.srt.mem_cache import memory_pool
 
         src = inspect.getsource(memory_pool.MHATokenToKVPool.backing_is_resident.fget)
         self.assertIn("not self._released_layers", src)
 
     def test_a_full_restore_clears_every_released_layer(self):
-        from sglang.srt.mem_cache import memory_pool
+        from flliper.srt.mem_cache import memory_pool
 
         src = inspect.getsource(memory_pool.MHATokenToKVPool.restore_backing)
         self.assertIn("if layers is None:", src)

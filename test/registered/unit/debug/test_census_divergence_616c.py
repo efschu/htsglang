@@ -5,7 +5,7 @@ No CUDA, no torch, no distributed backend required.
 
 import unittest
 
-from sglang.srt.distributed.collective_census import (
+from flliper.srt.distributed.collective_census import (
     CollectiveCensus,
     Divergence,
 )

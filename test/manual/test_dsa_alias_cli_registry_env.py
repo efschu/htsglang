@@ -4,8 +4,8 @@ Manual test for step 01: NSA → DSA user-facing alias layer.
 Tests:
   1. CLI: --dsa-* non-CP canonical flags write to dsa_* attrs
   2. Registry: "dsa" key creates the backend; "nsa" key triggers DeprecationWarning
-  3. Env: SGLANG_DSA_* canonical vars work
-  4. Env: SGLANG_NSA_* deprecated vars fall back to SGLANG_DSA_* with DeprecationWarning
+  3. Env: FLLIPER_DSA_* canonical vars work
+  4. Env: FLLIPER_NSA_* deprecated vars fall back to FLLIPER_DSA_* with DeprecationWarning
 
 Run:
     python test/manual/test_dsa_alias_cli_registry_env.py
@@ -24,7 +24,7 @@ class TestDSAChoicesAndFields(unittest.TestCase):
     """Verify DSA_CHOICES constant and ServerArgs field renaming."""
 
     def setUp(self):
-        from sglang.srt.server_args import (
+        from flliper.srt.server_args import (
             DSA_CHOICES,
             NSA_CHOICES,
             ServerArgs,
@@ -67,7 +67,7 @@ class TestCLICanonicalFlags(unittest.TestCase):
     """Canonical flags write to canonical attributes with no warning."""
 
     def setUp(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         self.parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(self.parser)
@@ -99,7 +99,7 @@ class TestCLIDeprecatedFlags(unittest.TestCase):
     def setUp(self):
         import logging
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         self.parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(self.parser)
@@ -159,18 +159,18 @@ class TestAttentionRegistry(unittest.TestCase):
     """Registry: 'dsa' key creates backend; 'nsa' key emits DeprecationWarning."""
 
     def test_dsa_key_registered(self):
-        from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+        from flliper.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 
         self.assertIn("dsa", ATTENTION_BACKENDS)
 
     def test_nsa_key_still_registered(self):
-        from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+        from flliper.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 
         self.assertIn("nsa", ATTENTION_BACKENDS, "nsa must remain as deprecated alias")
 
     def test_nsa_key_emits_deprecation_warning(self):
         """Calling the nsa factory should emit DeprecationWarning."""
-        from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+        from flliper.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 
         nsa_factory = ATTENTION_BACKENDS.get("nsa")
         self.assertIsNotNone(nsa_factory)
@@ -193,65 +193,65 @@ class TestAttentionRegistry(unittest.TestCase):
 
 
 class TestEnvVarAliases(unittest.TestCase):
-    """SGLANG_DSA_* canonical; SGLANG_NSA_* fall back with DeprecationWarning."""
+    """FLLIPER_DSA_* canonical; FLLIPER_NSA_* fall back with DeprecationWarning."""
 
     def setUp(self):
         # Clean state for every test
         for key in [
-            "SGLANG_DSA_FUSE_TOPK",
-            "SGLANG_NSA_FUSE_TOPK",
-            "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
-            "SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
+            "FLLIPER_DSA_FUSE_TOPK",
+            "FLLIPER_NSA_FUSE_TOPK",
+            "FLLIPER_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
+            "FLLIPER_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
         ]:
             os.environ.pop(key, None)
         # Re-import to reset descriptor state
         from importlib import reload
 
-        import sglang.srt.environ as e
+        import flliper.srt.environ as e
 
         reload(e)
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         self.envs = envs
 
     def tearDown(self):
         for key in [
-            "SGLANG_DSA_FUSE_TOPK",
-            "SGLANG_NSA_FUSE_TOPK",
-            "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
-            "SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
+            "FLLIPER_DSA_FUSE_TOPK",
+            "FLLIPER_NSA_FUSE_TOPK",
+            "FLLIPER_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
+            "FLLIPER_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
         ]:
             os.environ.pop(key, None)
 
     def test_dsa_fuse_topk_default(self):
-        self.assertTrue(self.envs.SGLANG_DSA_FUSE_TOPK.get())
+        self.assertTrue(self.envs.FLLIPER_DSA_FUSE_TOPK.get())
 
     def test_dsa_fuse_topk_canonical_set(self):
-        os.environ["SGLANG_DSA_FUSE_TOPK"] = "0"
-        self.assertFalse(self.envs.SGLANG_DSA_FUSE_TOPK.get())
+        os.environ["FLLIPER_DSA_FUSE_TOPK"] = "0"
+        self.assertFalse(self.envs.FLLIPER_DSA_FUSE_TOPK.get())
 
     def test_nsa_fuse_topk_deprecated_fallback(self):
-        """SGLANG_NSA_FUSE_TOPK=0 should be read by SGLANG_DSA_FUSE_TOPK with DeprecationWarning."""
-        os.environ["SGLANG_NSA_FUSE_TOPK"] = "0"
+        """FLLIPER_NSA_FUSE_TOPK=0 should be read by FLLIPER_DSA_FUSE_TOPK with DeprecationWarning."""
+        os.environ["FLLIPER_NSA_FUSE_TOPK"] = "0"
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            val = self.envs.SGLANG_DSA_FUSE_TOPK.get()
+            val = self.envs.FLLIPER_DSA_FUSE_TOPK.get()
             self.assertFalse(val)
             dep = [x for x in w if issubclass(x.category, DeprecationWarning)]
             self.assertTrue(
-                len(dep) > 0, "Expected DeprecationWarning for SGLANG_NSA_FUSE_TOPK"
+                len(dep) > 0, "Expected DeprecationWarning for FLLIPER_NSA_FUSE_TOPK"
             )
 
     def test_dsa_threshold_default(self):
         self.assertEqual(
-            self.envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get(), 2048
+            self.envs.FLLIPER_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get(), 2048
         )
 
     def test_nsa_threshold_deprecated_fallback(self):
-        os.environ["SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"] = "1024"
+        os.environ["FLLIPER_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"] = "1024"
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            val = self.envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
+            val = self.envs.FLLIPER_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
             self.assertEqual(val, 1024)
             dep = [x for x in w if issubclass(x.category, DeprecationWarning)]
             self.assertTrue(len(dep) > 0)

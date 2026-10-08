@@ -64,7 +64,7 @@ def _build_lines(dwords: list[int]) -> bytes:
 
 def _call_snapshot(obj: FakeBar1Transport, max_lines: int = 64) -> Optional[str]:
     """Import and call the real `_abort_flag_snapshot` on our fake object."""
-    from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+    from flliper.srt.distributed.device_communicators.barlink_bar1 import (
         BarlinkBar1Transport,
     )
 

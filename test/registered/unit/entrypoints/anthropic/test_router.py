@@ -12,7 +12,7 @@ import unittest
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestServer
 
-from sglang.srt.entrypoints.anthropic.router import (
+from flliper.srt.entrypoints.anthropic.router import (
     STATS_PATH,
     THINKING_ALIAS_SUFFIX,
     create_app,
@@ -166,7 +166,7 @@ class RouterTestCase(AioHTTPTestCase):
 
     async def test_credentials_are_never_logged(self):
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.router", level="DEBUG"
+            "flliper.srt.entrypoints.anthropic.router", level="DEBUG"
         ) as log:
             await self.client.post(
                 "/v1/messages",

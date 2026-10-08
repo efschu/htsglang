@@ -7,8 +7,8 @@
 at `:3000` with the board "Rig – history". It is installed with `deploy/vm/install_vm.sh` and
 `deploy/grafana/install_grafana.sh`, both idempotent. Units and `scrape.yml` are in the repo.
 
-- The sampler writes the IPC to VM every 5 s (`vmpush.Bridge`): `weg2_front_*`, `weg2_rank_*` and
-  `weg2_flip_*`, the flips at the time of the flip. Labels are `model`, `boot`, `group`, `rank`, `dir`, `kind`. **Never a rid as a label.**
+- The sampler writes the IPC to VM every 5 s (`vmpush.Bridge`): `pdflip_front_*`, `pdflip_rank_*` and
+  `pdflip_flip_*`, the flips at the time of the flip. Labels are `model`, `boot`, `group`, `rank`, `dir`, `kind`. **Never a rid as a label.**
 - rigdash reads via PromQL (`vmpush.VmClient`):
   - the TTFT tiles (`/api/live` → `vm`),
   - the TTFT history (`/api/history` → `ttft`).
@@ -52,9 +52,9 @@ range/zoom, boot list = whole boot. Tests: `tests/test_flipzeit_1006.py`.
 `TIMING-FLUSH-WAIT t_unix_ms` at the head of the forward to + `FWD-TIMING-PREFILL total_ms` (paired
 via #new-token and gpu-ms; the timing line comes only at the head of the next forward and then corrects
 retroactively), D extends from `HOST-ANON-PASS phase=EXTEND wall_ms` (discarded below 50 ms).
-Without an anchor the old drawing stays. Between `WEG2-FLIP done woke=D` and the first TP0
+Without an anchor the old drawing stays. Between `PDFLIP-FLIP done woke=D` and the first TP0
 decode token the bar shows **flip lead-out D** instead of "awake, no work", split by
-`WEG2-POST-WAKE-PASS n=0` (readings before pass 0, prepare = park resume, run = re-extend).
+`PDFLIP-POST-WAKE-PASS n=0` (readings before pass 0, prepare = park resume, run = re-extend).
 Applies to NF and 27B.
 
 **TODO (27B review 29.09.):** this too is a pure display from log lines. Switch to
@@ -215,7 +215,7 @@ aus_begruendung, verantwortlich`.
 U=/opt/rigdash/current/rigdash/features_update.py
 # feature done/built (upsert by id; --zweig/--schalter replace the lists)
 python3 $U set --id H106 --modell NF --titel "…" --fertig ja \
-    --zweig desk/nf-…=<sha> --schalter SGLANG_X=env:D:1:aus --verantwortlich NF-Implementierer
+    --zweig desk/nf-…=<sha> --schalter FLLIPER_X=env:D:1:aus --verantwortlich NF-Implementierer
 # 27B has picked it (new sha, old ones stay)
 python3 $U add-zweig --id H106 --zweig desk/27b-unified-0926=<sha>
 # gain -- measured (boot + source), calculated (planner/model) or unverified
@@ -288,7 +288,7 @@ spread through our part, in the page design (same tokens, font, cards, light and
 
 `history.Recorder.ingest_ipc` reads every 5 s with its **own** `IpcStates` (not the one of the
 log collector, which polls only after a round over all logs) every boot state store and in it
-`rankstate/<G>/*.rankstats` (weg2.rankstats/1, timer-written). Per group the first rank (TP0/PP0) counts:
+`rankstate/<G>/*.rankstats` (pdflip.rankstats/1, timer-written). Per group the first rank (TP0/PP0) counts:
 
 | Series | Calculation |
 |---|---|
@@ -318,21 +318,21 @@ the knowledge `Pending.leg1_ran` is in the front and would have to go with the l
 fLLiper edition: `server.edition_page` cuts out every block `<!--DEV:BEGIN-->…<!--DEV:END-->`
 (HTML, CSS `/* … */` and JS `// …`), i.e. development state, start flags, features target/actual, building blocks,
 image changes, containers, GPU window plan, last boots and the LAN links. No empty shell remains.
-`/api/live` answers without `features`, `image_changes`, `gpuq`; `/api/launch`, `/weg2` and `/api/weg2/*`
+`/api/live` answers without `features`, `image_changes`, `gpuq`; `/api/launch`, `/pdflip` and `/api/pdflip/*`
 return 404. New development parts belong in a DEV block (`tests/test_edition_0930.py` checks this).
 **Exception profile tab (user decision 05.10., order 1984):** tab, panel, CSS and the modules `profil.js`, `profil_balken.js`,
 `hwprofil.js`, `modellprofil.js` are NOT in a DEV block; `/api/profil/*` (load, edit, save, export, dry run,
 bar `recompute`), `GET /api/hwprofil` (display only, does not talk to gpuq) and `/api/modellprofil/*` (reads only `config.json` and headers
 under the model roots) also answer in `release`, still only in the LAN (proxy 403). Rig operation stays closed:
-`POST /api/hwprofil/measure|cancel` (books gpuq) 403 with plain text, card planner, start line, `/api/launch`, `/api/weg2/*` 404
+`POST /api/hwprofil/measure|cancel` (books gpuq) 403 with plain text, card planner, start line, `/api/launch`, `/api/pdflip/*` 404
 (`tests/test_profil_release_edition_1984.py`).
 
 ### Deploying the profile editor: staging the planner modules and unit flags (order 1984)
 
-`install.sh` puts `python/sglang` of the DASHBOARD revision to `/opt/rigdash/planner`; that is a dashboard line and does not carry the calculation modules of the
-editor (`weg2/profile_json, refusals, profile_catalog(+_curated), model_profile, card_identity, topology`, `rigmon/hardware_profile`,
+`install.sh` puts `python/flliper` of the DASHBOARD revision to `/opt/rigdash/planner`; that is a dashboard line and does not carry the calculation modules of the
+editor (`pdflip/profile_json, refusals, profile_catalog(+_curated), model_profile, card_identity, topology`, `rigmon/hardware_profile`,
 `planner/profile_couplings, expert_residency, pp_cut`). They are on the Python release branches (`desk/profil-editor-release-27b-1005`,
-`-nf-1005`). `deploy/stage_profil_modules.sh <rev>` puts the full tree `python/sglang` of the revision under
+`-nf-1005`). `deploy/stage_profil_modules.sh <rev>` puts the full tree `python/flliper` of the revision under
 `/opt/rigdash/kartenplan/profil/releases/<sha>` and switches `profil/current` (the card planner tree `kartenplan/current` stays untouched):
 
     deploy/stage_profil_modules.sh --check   fa9e7d5c4c    # check, write nothing (default); dashboard revision -> REFUSED, exit 3
@@ -341,18 +341,18 @@ editor (`weg2/profile_json, refusals, profile_catalog(+_curated), model_profile,
     deploy/stage_profil_modules.sh --unit-flags            # the unit lines
 
 Afterwards the lead sets in the unit `RIGDASH_PROFIL_TREE` (= `--profil-tree`, ONE tree for editor, model profile, hardware profile and the couplings worker;
-`--hw-tree` overrides it only for the hardware), `--couplings-python`/`RIGDASH_COUPLINGS_PYTHON` (Python of the sglang environment), if needed
+`--hw-tree` overrides it only for the hardware), `--couplings-python`/`RIGDASH_COUPLINGS_PYTHON` (Python of the flliper environment), if needed
 `--profiles-release-dir`, `--profile-dir`, `--model-root`, `--edition release` and, only in the rig edition, `--hw-measure-tree/--hw-python/--hw-prefix`.
-**MemoryMax:** the worker (`import sglang`) is in the cgroup of the unit (measured RSS 612 MiB), the unit stood at MemoryCurrent 487 MiB / peak 715 MiB
+**MemoryMax:** the worker (`import flliper`) is in the cgroup of the unit (measured RSS 612 MiB), the unit stood at MemoryCurrent 487 MiB / peak 715 MiB
 against `MemoryMax=1G`: raise to 2G. The worker also calculates the topology verdict of the dry run (op `topology`); if it is missing, the note
 "Topology for N card(s) not checked" stays (tests: `tests/test_profil_staging_1984.py`, `tests/test_profil_topology_child_1984.py`).
 
 ### Oracle and proposal (AP-D, plan profile planner 06.10.)
 
 Since AP-D the dry run (`POST /api/profil/dry`) asks the LAUNCHER itself: `profil_oracle.OracleService` holds a child process of its own
-(`kartenplan_build/oracle_worker.py`, Python of the sglang environment like `--couplings-python`) that runs `launcher.main(--dry-run)` on an NVML replay of the
-selected cards (`weg2/propose_oracle`), first without and, on a refusal, once more with `--force`, and builds from it the document
-`flliper.verdikt/1` (`weg2/propose_verdict`): per item a verdict `{code, forcebar (from refusals.by_code), force_state, grund, konsequenz}`, plus
+(`kartenplan_build/oracle_worker.py`, Python of the flliper environment like `--couplings-python`) that runs `launcher.main(--dry-run)` on an NVML replay of the
+selected cards (`pdflip/propose_oracle`), first without and, on a refusal, once more with `--force`, and builds from it the document
+`flliper.verdikt/1` (`pdflip/propose_verdict`): per item a verdict `{code, forcebar (from refusals.by_code), force_state, grund, konsequenz}`, plus
 `PROFILE-VECTORS`, `RECORDS-NVEC`, `METAL-UNPROVEN` (the blockers in the text of HW-COUNT), `FIT` (hw_fit), `HW-BORROWED`, `HW-UNCALIBRATED` and a crash of the
 launcher as `ORAKEL-ABSTURZ`. The return format of the dry run stays; new are `quelle` (`orakel` | `gate`), `orakel` (outcome, profile hash, cache) and
 `verdikte`. If the oracle cannot be asked (child process, Python, model paths), the partial check of the planner gate applies WITH a note. A run to the end takes
@@ -366,9 +366,9 @@ value, the verdicts and the request for the bars (`what=phase_bars`, `form` flip
 (`DUAL-PASSUNG`, `DUAL-PFLICHT`). `single` (single card, AP-F; `einzel` is a name for it) has no launcher: exactly ONE card (`karte` = ordinal in the
 hardware profile, default 0), a model path (`model_path` or the `PROFILE_MODEL` of the base profile; without a base profile it works too), the verdict is a
 planner calculation (`ausgang` passt | passt_nicht | unbelegt, `art` planner calculation, no force) plus ServerArgs parse, the server profile a new profile from the
-arguments of the normal server (`launch.argv` for `python -m sglang.launch_server`).
-The oracle child process imports the launcher: the planner tree of the unit must carry `weg2/launcher.py`, `propose*.py`, `hw_fit.py` and `fit_profiles_data`
-(the full tree `python/sglang` of the revision, as with `stage_profil_modules.sh`).
+arguments of the normal server (`launch.argv` for `python -m flliper.launch_server`).
+The oracle child process imports the launcher: the planner tree of the unit must carry `pdflip/launcher.py`, `propose*.py`, `hw_fit.py` and `fit_profiles_data`
+(the full tree `python/flliper` of the revision, as with `stage_profil_modules.sh`).
 
 **Memory of the oracle child process (MEASURED 06.10., review AP-D):** a full NF dry run on the reference rig (`nf-int4-h6-abl`, NVML replay) needs
 a peak of **1.75 GiB RSS** (`/usr/bin/time -v`: maximum resident set size 1789432 kB; 47.98 s under CPUQuota 200%). Against `MemoryMax=2G` of the unit
@@ -383,7 +383,7 @@ the command prefix itself. If the prefix fails at once (no `systemd-run`, no D-B
   and p2 (60 s). Retention 3 h / 3 d / 30 d, cap 256 MB. There is no additional service.
   Every series is a rate or a level, never a counter. Therefore the mean stays right over every tier.
 - `cacheacct.py` calculates the cache trap: "from cache" = prefix hit at admission. The handoff P→D
-  is a series of its own and never cache. For boots without an IPC sample the pairing of the `WEG2-SERVED` lines
+  is a series of its own and never cache. For boots without an IPC sample the pairing of the `PDFLIP-SERVED` lines
   per rid stays (label "from log (transition)").
 - New series: add the name in `history.view`. Put the writer in `Recorder`, never from
   a new log regex (`tests/test_no_new_log_parsers.py`).
@@ -401,7 +401,7 @@ on 1..6 selected cards (catalog `kartenplan_catalog.py`, PCIe per card: gen, lan
   flag explanations, `planer_nachrechnung` = `launcher.budgets_from_dc` in a child process against the boot numbers).
 * Other cards/numbers: the planner refuses (HW-COUNT/HW-ARCH/HW-UNCALIBRATED/HW-TOPOLOGY); then there is only a labelled APPROXIMATION.
 * Renew records (desk; reads logs, hence outside this package): `cd tools/rig_dashboard; python3 -m kartenplan_build.records;
-  python3 -m kartenplan_build.bridge --trees-root <folder with <rev>/python/sglang>`.
+  python3 -m kartenplan_build.bridge --trees-root <folder with <rev>/python/flliper>`.
 * VRAM bar per card and phase (order 880): one bar = the card in the state in which the row group (P or D) is awake. The items lie as
   contiguous blocks in a fixed order **shared (driver) → P → D** (server: `kartenplan._annotate_segments`, stable by `SEG_ORDER`;
   the bracket below the bar shows the blocks). Mouse pointer/tap on an item: name, MiB/GiB, share of the card, phase, origin
@@ -421,7 +421,7 @@ on 1..6 selected cards (catalog `kartenplan_catalog.py`, PCIe per card: gen, lan
 `profile` is `flliper.model/1` (every value `{v, src}` with source `config|Index|geschätzt|stat`), `registry_fields` the fields of a `form.ModelProfile` row
 derived from the estimated profile.  `GET /api/modellprofil/modelle` lists the model directories under the roots (only `stat`).
 
-* **The estimator is not here.**  `sglang/srt/weg2/model_profile.py` (pure standard library) is loaded by file path from the planner tree like the gate of the card planner
+* **The estimator is not here.**  `flliper/srt/pdflip/model_profile.py` (pure standard library) is loaded by file path from the planner tree like the gate of the card planner
   (`MODELLPROFIL_TREE`, otherwise `KARTENPLAN_TREE`, otherwise the candidates in `kartenplan.TREE_CANDIDATES` and `<repo>/python`).
   If the file is missing in the tree, the route answers 503 with the name of the file.  The tree under `tests/fixtures/modellprofil/` is a copy of
   `desk/profil-s3-modell-1003`.
@@ -439,7 +439,7 @@ Routes and JSON, no UI (that is built by the profile editor, order 930; `static/
 * `GET /api/hwprofil` → `{profile, problems, window, job, gpuq, owner, window_len}`. `profile` is `flliper.hardware/1`: a **view** (not a fourth
   measurement file) over the card probe cache (`card_probe-*.json`), the stage-0 profile (`hw_profile-*.json`) and NVML. Every numeric value is
   `{v, src, at, probe, note}` with `src` = `gemessen` | `NVML` | `Datenblatt` | `geschätzt` | `nicht gemessen` (then `v: null` and `note` = reason).
-  It is built in `sglang/srt/rigmon/hardware_profile.py` of the planner tree (loaded by file path, no `import sglang` in this process).
+  It is built in `flliper/srt/rigmon/hardware_profile.py` of the planner tree (loaded by file path, no `import flliper` in this process).
 * `POST /api/hwprofil/measure` `{"cards": [<NVML index>, ...]}` books a gpuq window **itself** (owner `profil-editor`, only these cards,
   15 min (order 1006: all compute formats incl. native W4A4 + BAR1 link per pair in child processes), without `not_before`, exclusive; `mib` only if the body asks for it) and measures in it. Answer `action`:
   `messung_gestartet` (measurement started: child process runs, the window goes back AT ONCE afterwards, also after an error) · `wartet` (waiting: window `pending`: status, **nothing
@@ -456,7 +456,7 @@ Routes and JSON, no UI (that is built by the profile editor, order 930; `static/
   also carries `persist` = `{enabled, state, label, captured_at, reason, id, drift, error, from_persisted, file}`; `state` = `erst_erfasst` | `neu_erfasst` |
   `vorhanden` | `abweichend` (file stays, `drift.changes` names the difference) | `nur_gespeichert` (NVML is silent: the file applies) | `keine_karten` |
   `nicht_schreibbar`. `POST /api/hwprofil/recapture` ("Capture again") reads NVML again and replaces the file: no gpuq window, also in release; a
-  successful measurement also captures again. SM count (`weg2/hw_sim.py`) and nominal bandwidth (`kartenplan_catalog.py`, field `mem_gbs.nominal`) enter the profile as
+  successful measurement also captures again. SM count (`pdflip/hw_sim.py`) and nominal bandwidth (`kartenplan_catalog.py`, field `mem_gbs.nominal`) enter the profile as
   `Datenblatt`, a measured SM count wins; `cards[].catalog` names the catalog card, `preset` and origin (`measured_on_rig` | `Datenblatt` |
   `borrowed-unbelegt`, per field in `origin_fields`). `GET /api/hwprofil/issue` returns the issue text "Hardware profile" as Markdown (`{ok, format, text}`);
   secrets and host paths are removed (`redact.text_for_issue`).
@@ -475,8 +475,8 @@ Routes and JSON, no UI (that is built by the profile editor, order 930; `static/
   `file://` is dropped, a path with spaces in quotation marks counts as one path; `/models-cache` (model mount of the container) stays like `/app`.
   Without the hardware service the report is still produced ("not available"). UI: section "Issue text: run report" below the export in `profil.js`.
 * No background poller: only whoever operates the page asks. A running window that was not used after 180 s is returned at the next call.
-* Service parameters (deploy by the lead): `--hw-tree` (staged tree with `hardware_profile.py` + `weg2/card_identity.py`, `deploy/stage_hwprofil.sh`),
-  `--hw-measure-tree` (full sglang tree for the child process), `--hw-python` (interpreter with torch + sgl_kernel; without sgl_kernel the int8/W4A16 arms stay
+* Service parameters (deploy by the lead): `--hw-tree` (staged tree with `hardware_profile.py` + `pdflip/card_identity.py`, `deploy/stage_hwprofil.sh`),
+  `--hw-measure-tree` (full flliper tree for the child process), `--hw-python` (interpreter with torch + sgl_kernel; without sgl_kernel the int8/W4A16 arms stay
   empty and the run reports that as a warning), `--hw-prefix` (e.g. `systemd-run --scope -q -p MemoryMax=6G`: the service has
   `MemoryMax=1G`, torch/CUDA belongs in a cgroup frame of its own). Env: `HWPROFIL_TREE`, `HWPROFIL_MEASURE_TREE`, `HWPROFIL_PYTHON`, `HWPROFIL_PREFIX`.
 * Mounting into a page: `<div id="x"></div><script src="hwprofil.js"></script><script>HwProfil.mount(document.getElementById("x"))</script>`;
@@ -496,6 +496,6 @@ button "Proposal" = `POST /api/profil/propose`, "Check again" = dry run) -> **5 
   wrong length = warning), **state chip** per value (proposed / unverified / solved by the launcher / overridden by you / profile / default), **verdict chip**
   per value (works / only with --force / refused / note / not checked / unchecked since your change) with code and reason visible, **dependency chips**
   from the edge catalog. A verdict is a note, never a lock (user decision 4a): every field stays operable, force is in the export. Filter simple/expert.
-* Dual ENV table (section D, plan 4c): `SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE` as a table (D seats up to | P share at small / large tau, rungs 0-3 = 100/75/50/25 %),
-  `..._STARVE_AGE_S`, `..._STARVE_MAX_RUNG`, `SGLANG_WEG2_DUAL_GRANT_RETRY_MS`; catalog entries curated, edges K109-K116 with evidence.
+* Dual ENV table (section D, plan 4c): `FLLIPER_PDFLIP_DUAL_SHARE_GREEN_TABLE` as a table (D seats up to | P share at small / large tau, rungs 0-3 = 100/75/50/25 %),
+  `..._STARVE_AGE_S`, `..._STARVE_MAX_RUNG`, `FLLIPER_PDFLIP_DUAL_GRANT_RETRY_MS`; catalog entries curated, edges K109-K116 with evidence.
 * Tests: `tests/test_profil_planer_aph1_1006.py`.

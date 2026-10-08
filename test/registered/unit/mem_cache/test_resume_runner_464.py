@@ -62,7 +62,7 @@ class TestTheCallCountModel(unittest.TestCase):
         # 2 MiB is the granularity fallback; no default chunk sets it. Pinned so
         # the "~500 x 2 MiB" figure is not silently adopted as this path's shape.
         runner = _load()
-        self.assertEqual(runner.KNOWN_CHUNKS_MIB["kv_seam (SGLANG_FLIP_SEAM_CHUNK_MIB default)"], 8)
+        self.assertEqual(runner.KNOWN_CHUNKS_MIB["kv_seam (FLLIPER_FLIP_SEAM_CHUNK_MIB default)"], 8)
         self.assertEqual(runner.KNOWN_CHUNKS_MIB["carriers (CARRIER_COMMIT_CHUNK)"], 64)
 
 

@@ -31,9 +31,9 @@ import sys
 import time
 from pathlib import Path
 
-from sglang.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
-from sglang.srt.video_enhance.frame_math import Resolution
-from sglang.srt.video_enhance.mux import (
+from flliper.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
+from flliper.srt.video_enhance.frame_math import Resolution
+from flliper.srt.video_enhance.mux import (
     StreamRemuxer,
     TrackSelection,
     alignment_report,
@@ -43,13 +43,13 @@ from sglang.srt.video_enhance.mux import (
     retimed_rate,
     strip_empty_mov_text,
 )
-from sglang.srt.video_enhance.pipeline import PipelineExecutor
-from sglang.srt.video_enhance.ring import OverloadPolicy
+from flliper.srt.video_enhance.pipeline import PipelineExecutor
+from flliper.srt.video_enhance.ring import OverloadPolicy
 
 
 def build_source(path: Path, resolution: Resolution, frames: int, fps: int) -> Path:
     """A deterministic clip with one video, two audio and one subtitle track."""
-    from sglang.srt.video_enhance.codec import make_test_clip
+    from flliper.srt.video_enhance.codec import make_test_clip
 
     video = path.with_name("src_video.mp4")
     make_test_clip(video, resolution, frames, fps)
@@ -168,10 +168,10 @@ def subtitle_content_hash(path: Path, selector: str) -> str:
 
 
 async def run_chain(source: Path, out_path: Path, args) -> dict:
-    from sglang.srt.video_enhance import codec
-    from sglang.srt.video_enhance.resize import ResizeStage
-    from sglang.srt.video_enhance.rife import RifeStage, download_weights
-    from sglang.srt.video_enhance.sr import SuperResolutionStage
+    from flliper.srt.video_enhance import codec
+    from flliper.srt.video_enhance.resize import ResizeStage
+    from flliper.srt.video_enhance.rife import RifeStage, download_weights
+    from flliper.srt.video_enhance.sr import SuperResolutionStage
 
     info = probe(str(source))
     src_res = Resolution(info.track(0).width, info.track(0).height)

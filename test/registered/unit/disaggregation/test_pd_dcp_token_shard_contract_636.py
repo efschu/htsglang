@@ -28,11 +28,11 @@ future refactor breaks quietly:
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.arg_groups.pd_disaggregation_hook import (
+from flliper.srt.arg_groups.pd_disaggregation_hook import (
     validate_pd_dcp_token_shard_contract,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -164,7 +164,7 @@ class GateRunsAfterDcpResolutionTest(CustomTestCase):
     def _post_init_source(self):
         import inspect
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         return inspect.getsource(ServerArgs.__post_init__)
 

@@ -38,21 +38,21 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "99")
 
 import torch
 
-from sglang.srt.configs.qwen3_tts import (
+from flliper.srt.configs.qwen3_tts import (
     MRopeMappingError,
     Qwen3TTSConfig,
     Qwen3TTSTalkerConfig,
     assert_mrope_mapped,
     normalize_rope_scaling,
 )
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     attn_q_partition_groups,
     attn_q_partition_units,
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -100,7 +100,7 @@ def _ensure_dist_initialized():
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
-    from sglang.srt.distributed.parallel_state import (
+    from flliper.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
         model_parallel_is_initialized,
@@ -115,8 +115,8 @@ def _ensure_dist_initialized():
             pipeline_model_parallel_size=1,
             backend="gloo",
         )
-    from sglang.srt.runtime_context import get_context
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.runtime_context import get_context
+    from flliper.srt.server_args import ServerArgs
 
     try:
         get_context().server_args
@@ -164,7 +164,7 @@ class TestQwen3TTSHeadGeometry(CustomTestCase):
 
     def test_tp3_needs_the_uneven_plan(self):
         """The even split does not exist for this checkpoint: 16 % 3 != 0."""
-        from sglang.srt.models.qwen3_tts import _head_split
+        from flliper.srt.models.qwen3_tts import _head_split
 
         set_tp_partition_ratios(None)
         with self.assertRaises(ValueError) as ctx:
@@ -210,7 +210,7 @@ class TestQwen3TTSConstruction(CustomTestCase):
         return Qwen3TTSConfig(talker_config=kwargs)
 
     def test_constructs_and_exposes_the_entry_class(self):
-        from sglang.srt.models.qwen3_tts import (
+        from flliper.srt.models.qwen3_tts import (
             EntryClass,
             Qwen3TTSForConditionalGeneration,
         )
@@ -225,7 +225,7 @@ class TestQwen3TTSConstruction(CustomTestCase):
         # (models/registry.py:61-78), so a boot succeeds on the generic
         # backend with none of this fork's features. Assert the RESOLVED
         # class rather than trusting a green boot.
-        from sglang.srt.models.registry import ModelRegistry
+        from flliper.srt.models.registry import ModelRegistry
 
         self.assertIs(
             ModelRegistry.models.get("Qwen3TTSForConditionalGeneration"),
@@ -246,7 +246,7 @@ class TestQwen3TTSConstruction(CustomTestCase):
     def test_forward_refuses_a_cleared_embeds_channel(self):
         """The talker is embed-driven; a token-id call is the scheduler
         unblock (DESIGN_466 §11.2) surfacing, not a model bug."""
-        from sglang.srt.models.qwen3_tts import EntryClass
+        from flliper.srt.models.qwen3_tts import EntryClass
 
         with torch.device("cpu"):
             model = EntryClass(self._tiny_config())
@@ -273,7 +273,7 @@ class TestQwen3TTSWeightCover(CustomTestCase):
             self.skipTest(f"no checkpoint under {_CHECKPOINT}")
 
     def _full_model(self):
-        from sglang.srt.models.qwen3_tts import EntryClass
+        from flliper.srt.models.qwen3_tts import EntryClass
 
         # Full depth, tiny text vocab: the 593 MiB text embedding is not what
         # this arm is about and materialising it on CPU would dominate runtime.
@@ -283,7 +283,7 @@ class TestQwen3TTSWeightCover(CustomTestCase):
             return EntryClass(Qwen3TTSConfig(talker_config=kwargs))
 
     def test_every_checkpoint_name_is_classified(self):
-        from sglang.srt.models.qwen3_tts import _NON_LANE_PREFIXES
+        from flliper.srt.models.qwen3_tts import _NON_LANE_PREFIXES
 
         model = self._full_model()
         params = dict(model.named_parameters())

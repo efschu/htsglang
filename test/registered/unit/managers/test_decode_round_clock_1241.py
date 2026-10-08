@@ -14,12 +14,12 @@ from __future__ import annotations
 import logging
 import unittest
 
-from sglang.srt.debug_utils.rank_phase_summary import (
+from flliper.srt.debug_utils.rank_phase_summary import (
     parse_rank_batch_line,
     parse_unsplit_line,
 )
-from sglang.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
-from sglang.srt.utils.collective_clock import ClockBackend, CollectiveClock
+from flliper.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
+from flliper.srt.utils.collective_clock import ClockBackend, CollectiveClock
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ class DecodeRoundClockTest(unittest.TestCase):
         self.h = Harness()
         self.cap = _Capture()
         self.logger = logging.getLogger(
-            "sglang.srt.managers.scheduler_components.decode_round_log"
+            "flliper.srt.managers.scheduler_components.decode_round_log"
         )
         self.logger.addHandler(self.cap)
         self.logger.setLevel(logging.INFO)
@@ -458,7 +458,7 @@ class DecodeRoundClockTest(unittest.TestCase):
         """A summary that silently drops withheld rounds reports a mean over
         the readable minority of a graph-covered boot and labels it the
         boot's."""
-        from sglang.srt.debug_utils.rank_phase_summary import report, summarize
+        from flliper.srt.debug_utils.rank_phase_summary import report, summarize
 
         self.h.log.begin_round(round_id=600, bs=6, rows=24)
         self.run_forward(compute_ms=10.0, waits=[("tp.all_reduce", 2.0)])
@@ -479,7 +479,7 @@ class DecodeRoundClockTest(unittest.TestCase):
         self.assertIn("graph-replay-no-event-nodes x1", text)
 
     def test_a_window_of_MOSTLY_withheld_rounds_is_named_not_evidence(self):
-        from sglang.srt.debug_utils.rank_phase_summary import report, summarize
+        from flliper.srt.debug_utils.rank_phase_summary import report, summarize
 
         for i in range(3):
             self.h.log.begin_round(round_id=700 + i, bs=6, rows=24)
@@ -513,7 +513,7 @@ class DecodeRoundClockTest(unittest.TestCase):
         the suite passed with `_retire_open` gutted. Assert the call site."""
         import inspect
 
-        import sglang.srt.managers.scheduler as sched
+        import flliper.srt.managers.scheduler as sched
 
         src = inspect.getsource(sched.Scheduler._run_batch_forward)
         self.assertIn("_drl.end_round()", src)
@@ -525,7 +525,7 @@ class DecodeRoundClockTest(unittest.TestCase):
     def test_the_decode_log_is_FLUSHED_where_the_prefill_log_is_flushed(self):
         import inspect
 
-        import sglang.srt.managers.scheduler_components.metrics_reporter as mr
+        import flliper.srt.managers.scheduler_components.metrics_reporter as mr
 
         for fn, call in (
             (mr.SchedulerMetricsReporter.report_prefill_stats, "_drl.flush()"),
@@ -547,7 +547,7 @@ class DecodeRoundClockTest(unittest.TestCase):
         found, not by reasoning about it."""
         from types import SimpleNamespace
 
-        import sglang.srt.managers.scheduler_components.metrics_reporter as mr
+        import flliper.srt.managers.scheduler_components.metrics_reporter as mr
 
         stub = SimpleNamespace(
             rank_prefill_log=mr.RankPrefillLog(),
@@ -568,7 +568,7 @@ class DecodeRoundClockTest(unittest.TestCase):
         a three-rank comparison silently missing a rank is worse than none."""
         import inspect
 
-        import sglang.srt.model_executor.model_runner as mrun
+        import flliper.srt.model_executor.model_runner as mrun
 
         src = inspect.getsource(mrun.ModelRunner)
         # The graph-replay branch of the weightless worker path...
@@ -600,7 +600,7 @@ class DecodeRoundClockTest(unittest.TestCase):
     def test_the_clock_backend_defaults_to_torch_and_is_the_only_cuda_seam(self):
         import inspect
 
-        import sglang.srt.utils.collective_clock as cc
+        import flliper.srt.utils.collective_clock as cc
 
         src = inspect.getsource(cc)
         body = src.split("class TorchCudaBackend", 1)[1].split("@dataclasses", 1)[0]

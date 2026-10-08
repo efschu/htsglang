@@ -9,10 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.boot_matrix.arms import ARMS
-from sglang.srt.workbench.tenants.boot_matrix import BootMatrixTenant
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.boot_matrix.arms import ARMS
+from flliper.srt.workbench.tenants.boot_matrix import BootMatrixTenant
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -47,7 +47,7 @@ class TestBootMatrixTenant(CustomTestCase):
     def test_segment_argv_targets_one_arm(self):
         t = self._tenant()
         argv = t.segment_argv(ARMS[0])
-        self.assertIn("sglang.srt.boot_matrix.sweep", argv)
+        self.assertIn("flliper.srt.boot_matrix.sweep", argv)
         self.assertIn("--only", argv)
         self.assertIn(ARMS[0].name, argv)
         self.assertIn("--model", argv)
@@ -75,8 +75,8 @@ class TestBootMatrixTenant(CustomTestCase):
         """build_tenants must accept 'boot_matrix' and wire the model through."""
         from types import SimpleNamespace
 
-        from sglang.srt.workbench.scheduler import WorkbenchConfig
-        from sglang.srt.workbench.service import build_tenants
+        from flliper.srt.workbench.scheduler import WorkbenchConfig
+        from flliper.srt.workbench.service import build_tenants
 
         with tempfile.TemporaryDirectory() as d:
             cfg = WorkbenchConfig(enabled=True, artifact_root=d)

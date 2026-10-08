@@ -3,7 +3,7 @@
 "das dashboard soll auch aus der inter prozess kommunikation gespeist werden, nicht aus logs".
 Every regex literal the package compiles or matches today is frozen below (file + sha1 of the
 pattern).  A new one fails this test: a new display reads its IPC source (state.json,
-events.jsonl, rankstate/, /weg2/state -- see /spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md);
+events.jsonl, rankstate/, /pdflip/state -- see /spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md);
 if the source does not exist yet, the writer gets it first (IPC-STATE-PLAN §2.2: the source
 writes, then the reader moves, then the parser falls).  Removing a frozen pattern is always
 allowed -- that is the point.  A regex that parses no log at all (a profile, a git subject)
@@ -36,14 +36,14 @@ FROZEN = {
     ("live.py", "91cecd3b000b"),  # '^(?P<stem>.+?)\\.(?P<group>P|D|front)\\.log$'
     ("live.py", "c2d5149d091b"),  # '27b'
     ("parse.py", "009c7604b034"),  # 'FWD-TIMING-PREFILL forward=(\\d+) tokens=(\\d+) .*'
-    ("parse.py", "054d4bf381c0"),  # 'WEG2-HEALTH group=(\\w+) http_ok=(\\w+) process_al'
+    ("parse.py", "054d4bf381c0"),  # 'PDFLIP-HEALTH group=(\\w+) http_ok=(\\w+) process_al'
     ("parse.py", "0e036f00de7e"),  # '\\bsleep=(\\d+(?:\\.\\d+)?) ms'
     ("parse.py", "1230919b6c23"),  # '#running-req: (\\d+)'
     ("parse.py", "1327917382dc"),  # 'accept len: ([\\d.]+)'
-    ("parse.py", "16d78071c6ff"),  # 'WEG2-CORRIDOR phase=(\\w)\\((\\w+)\\)'
-    ("parse.py", "2f20bd0593be"),  # 'WEG2-FLIP done epoch=(\\d+) slept=(\\w+) woke=(\\w+'
+    ("parse.py", "16d78071c6ff"),  # 'PDFLIP-CORRIDOR phase=(\\w)\\((\\w+)\\)'
+    ("parse.py", "2f20bd0593be"),  # 'PDFLIP-FLIP done epoch=(\\d+) slept=(\\w+) woke=(\\w+'
     ("parse.py", "3325f8ed0925"),  # '\\bprompt_tokens=(\\d+)'
-    ("parse.py", "35d76907b67a"),  # 'WEG2 D-PHASE-SEATS \\(H95\\) epoch=\\S+ handoff_n=('
+    ("parse.py", "35d76907b67a"),  # 'PDFLIP D-PHASE-SEATS \\(H95\\) epoch=\\S+ handoff_n=('
     ("parse.py", "37155ad88cff"),  # '(?:^|\\s)([A-Za-z_][A-Za-z0-9_.]*(?:Error|Excepti'
     ("parse.py", "39bbb9a7c7f6"),  # '#new-token: (\\d+)'
     ("parse.py", "3a476bb8c4f0"),  # 'drain\\+quiesce=(\\d+(?:\\.\\d+)?) ms'
@@ -55,19 +55,19 @@ FROZEN = {
     ("parse.py", "4eba07a97419"),  # '^#988 LOADBACK rid=(\\S+)'
     ("parse.py", "5b27b48b9199"),  # '#queue-req: (\\d+)'
     ("parse.py", "5b3bb06e4856"),  # '\\banchor_depth=(\\d+)'
-    ("parse.py", "5c339fc08969"),  # 'WEG2-POST-WAKE-PASS n=0 mode=(\\w+) .*?\\bschedule'
+    ("parse.py", "5c339fc08969"),  # 'PDFLIP-POST-WAKE-PASS n=0 mode=(\\w+) .*?\\bschedule'
     ("parse.py", "5d4a8b62b5d7"),  # "served_model_name='([^']*)'"
     ("parse.py", "6c44e7aed221"),  # '#new-seq: (\\d+)'
     ("parse.py", "6f5519dd5fca"),  # 'flip_total=(\\d+(?:\\.\\d+)?) ms'
     ("parse.py", "6f7245404f4b"),  # "model_path='([^']*)'"
     ("parse.py", "71b94360877f"),  # '#pending-token: (\\d+)'
-    ("parse.py", "794a8d875f7b"),  # 'WEG2-SERVED group=(\\w+) leg=(\\d+) rid=(\\S+)'
-    ("parse.py", "7cc6ca438d70"),  # 'WEG2 BOOT tag=(\\S+) tree=(\\S+) @ (\\w+)'
+    ("parse.py", "794a8d875f7b"),  # 'PDFLIP-SERVED group=(\\w+) leg=(\\d+) rid=(\\S+)'
+    ("parse.py", "7cc6ca438d70"),  # 'PDFLIP BOOT tag=(\\S+) tree=(\\S+) @ (\\w+)'
     ("parse.py", "8281b2005948"),  # 'accept rate: ([\\d.]+)'
     ("parse.py", "857b4b2f30b0"),  # 'bubble_ms=([\\d.]+)'
-    ("parse.py", "85b2958c0db7"),  # 'WEG2-ROUTE .*?\\(awake=(\\w+)\\b.*?queue=(\\d+)'
+    ("parse.py", "85b2958c0db7"),  # 'PDFLIP-ROUTE .*?\\(awake=(\\w+)\\b.*?queue=(\\d+)'
     ("parse.py", "8db93d227ba4"),  # '\\bcached_tokens=(\\d+)'
-    ("parse.py", "95eda8eafa36"),  # 'WEG2-FORM (.*?) \\(sources:'
+    ("parse.py", "95eda8eafa36"),  # 'PDFLIP-FORM (.*?) \\(sources:'
     ("parse.py", "9ff3008b9834"),  # '#cached-token: (\\d+)'
     ("parse.py", "a7daeb65d2c6"),  # 'input throughput \\(token/s\\): ([\\d.]+)'
     ("parse.py", "aaba130354a5"),  # '\\bcompletion_tokens=(\\d+)'
@@ -79,12 +79,12 @@ FROZEN = {
     ("parse.py", "c0d93e39a648"),  # ', t: (\\d+\\.\\d+),'
     ("parse.py", "c362bae3b899"),  # '\\bpp_size=(\\d+)'
     ("parse.py", "c5c364cd0b6a"),  # '#full token: (\\d+)'
-    ("parse.py", "c97f11d7dbcb"),  # 'WEG2-FORM .*?\\bmodel=(\\S+)'
+    ("parse.py", "c97f11d7dbcb"),  # 'PDFLIP-FORM .*?\\bmodel=(\\S+)'
     ("parse.py", "c9db86cc0a57"),  # 'gpu-ms: ([\\d.]+)'
     ("parse.py", "ce879329bfd3"),  # '^\\s*(ERROR|CRITICAL)\\b'
     ("parse.py", "d2b5f73b70ff"),  # '^max_total_num_tokens=(\\d+),.*\\bmax_running_requ'
     ("parse.py", "d3dc7505fac3"),  # '^\\[(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2}):(\\'
-    ("parse.py", "dab7a8287157"),  # 'WEG2-FLIP begin epoch=(\\d+) sleep=(\\w+) wake=(\\w'
+    ("parse.py", "dab7a8287157"),  # 'PDFLIP-FLIP begin epoch=(\\d+) sleep=(\\w+) wake=(\\w'
     ("parse.py", "daf24911d6db"),  # '^#\\d+ PREFETCH (LANDED|REFUSED|DEFERRED|TIMEOUT)'
     ("parse.py", "ed220b25da90"),  # '^#\\d+ STORE READ INCOMPLETE rid=(\\S+) delivered='
     ("parse.py", "f1b24eb4784e"),  # '\\bbs: (\\d+)'
@@ -99,7 +99,7 @@ FROZEN = {
     ("stops.py", "c5f61547d2a6"),  # '^\\[host-acc (\\d\\d):(\\d\\d):(\\d\\d)Z\\] AGENT-HOLD \\'
     ("stops.py", "f171b2129f1c"),  # '^\\[nf-dauer (\\d{4})-(\\d\\d)-(\\d\\d)T(\\d\\d):(\\d\\d):'
     ("weg2line.py", "5268c821ce44"),  # '^(PROFILE_[A-Z_]+)=(\\"[^\\"]*\\"|\'[^\']*\'|[^\\s#]*)'
-    ("weg2line.py", "93beb1e2ce98"),  # '^htsglang:(cu\\d+)-weg2-(.+?)-27b-nf(-flat)?$'
+    ("weg2line.py", "93beb1e2ce98"),  # '^htsglang:(cu\\d+)-pdflip-(.+?)-27b-nf(-flat)?$'
     ("weg2line.py", "e2973332316e"),  # '^\\s*(trap |mkdir |docker |rm |pct |systemctl )'
 }
 
@@ -113,8 +113,8 @@ NON_LOG_ALLOWED = {
     ("redact.py", "30650dce59ee"): "schneidet lange Token-Laeufe hinter = oder : aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "b598ffb1ba83"): "schneidet absolute Pfade (/root/..., /spinning/..., /var/lib/...) aus einem Text, der in ein öffentliches Issue kommt; liest keine Logzeile",
     # AP-I Fix-Runde 4: JWT, nackte Token-Laeufe (Freitext, Tabellenzelle) und ein ganzer Wert als Token-Lauf aus dem Issue-Text schneiden
-    # Nacharbeit 1006 Runde 7: die Namen der Launcher-/weg2-Quelltexte (Klassen, Weg2...-Bezeichner) bleiben im Issue-Text lesbar; die Liste kommt aus dem Quelltext-Baum
-    ("redact.py", "60366c652db4"): "liest Klassen- und Weg2...-Bezeichner aus dem QUELLTEXT von srt/weg2 (kein Log), damit ein Launcher-Klassenname im Issue-Text nicht als Token geschwaerzt wird",
+    # Nacharbeit 1006 Runde 7: die Namen der Launcher-/pdflip-Quelltexte (Klassen, PdFlip...-Bezeichner) bleiben im Issue-Text lesbar; die Liste kommt aus dem Quelltext-Baum
+    ("redact.py", "60366c652db4"): "liest Klassen- und PdFlip...-Bezeichner aus dem QUELLTEXT von srt/pdflip (kein Log), damit ein Launcher-Klassenname im Issue-Text nicht als Token geschwaerzt wird",
     ("redact.py", "231d7a884f21"): "schneidet ein JWT (eyJ....) aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "39494d8580a4"): "schneidet lange Token-Laeufe ohne = / : davor aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "d02b41e88f24"): "prueft, ob ein ganzer Wert fuer eine Tabellenzelle ein einziger langer Token-Lauf ist; liest keine Logzeile",
@@ -154,7 +154,7 @@ class TestNoNewLogParsers(unittest.TestCase):
         new = sorted((fn, h, p) for fn, h, p in regex_literals()
                      if (fn, h) not in FROZEN and (fn, h) not in NON_LOG_ALLOWED)
         self.assertEqual(new, [], "neuer Log-Parser im rigdash verboten (DASHBOARD-AUS-IPC): %s -- "
-                         "IPC-Quelle lesen (state.json/events.jsonl/rankstate//weg2/state), fehlt sie, "
+                         "IPC-Quelle lesen (state.json/events.jsonl/rankstate//pdflip/state), fehlt sie, "
                          "zuerst beim Schreiber anlegen; siehe DASHBOARD-AUS-IPC-INVENTAR-0929.md" % new)
 
     def test_ipc_reader_parses_no_log(self):

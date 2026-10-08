@@ -25,7 +25,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.hicache_migrate import (  # noqa: I001
+from flliper.srt.mem_cache.hicache_migrate import (  # noqa: I001
     store_path,
     MambaBlobSpec,
     StoreEntry,
@@ -43,7 +43,7 @@ from sglang.srt.mem_cache.hicache_migrate import (  # noqa: I001
     temporal_extents,
     verify_plan,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -164,8 +164,8 @@ class TestMambaShardGeometry(unittest.TestCase):
 
     def test_shard_matches_the_runtime_partition_rule(self):
         """The split must be the model's own, not a re-derivation: compare
-        against sglang.srt.distributed.utils directly."""
-        from sglang.srt.distributed.utils import partition_sizes
+        against flliper.srt.distributed.utils directly."""
+        from flliper.srt.distributed.utils import partition_sizes
 
         ratios = [6, 1, 1]
         want_heads = partition_sizes(_SPEC.num_heads, ratios, _SPEC.units)

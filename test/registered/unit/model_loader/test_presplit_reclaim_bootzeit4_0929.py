@@ -4,7 +4,7 @@
 Metal (z30w-park, NF D, LOAD-PROFILE of the loader thread): expert_offload.py
 ``gc.collect()`` 7.8-9.6 % and ``malloc_trim(0)`` 1.3-4.0 %, under the GIL,
 48 times per D rank. The reclaim is now one clocked function
-(``presplit_host_reclaim``) behind ``SGLANG_OPT_LOAD_PRESPLIT_GC``; the
+(``presplit_host_reclaim``) behind ``FLLIPER_OPT_LOAD_PRESPLIT_GC``; the
 ``[ct-stream-presplit]`` line prints ``reclaim gc= found= trim=``.
 
 The call-edge tests read the real modules (AST), not a stand-in: the class of
@@ -19,9 +19,9 @@ import textwrap
 import unittest
 from unittest import mock
 
-from sglang.srt.environ import PresplitGcMode, envs
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe.fused_moe_triton import layer as fl
+from flliper.srt.environ import PresplitGcMode, envs
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe.fused_moe_triton import layer as fl
 
 
 class TestPresplitHostReclaim(unittest.TestCase):
@@ -32,11 +32,11 @@ class TestPresplitHostReclaim(unittest.TestCase):
         eo._STORE_CLOCK.update(self._saved)
 
     def test_default_is_full(self):
-        self.assertEqual(envs.SGLANG_OPT_LOAD_PRESPLIT_GC.get(), PresplitGcMode.FULL)
+        self.assertEqual(envs.FLLIPER_OPT_LOAD_PRESPLIT_GC.get(), PresplitGcMode.FULL)
 
     def test_full_collects_and_counts_what_it_found(self):
         before = eo.expert_store_clock()
-        with envs.SGLANG_OPT_LOAD_PRESPLIT_GC.override(PresplitGcMode.FULL), \
+        with envs.FLLIPER_OPT_LOAD_PRESPLIT_GC.override(PresplitGcMode.FULL), \
                 mock.patch("gc.collect", return_value=7) as collect:
             eo.presplit_host_reclaim()
         collect.assert_called_once_with()
@@ -47,7 +47,7 @@ class TestPresplitHostReclaim(unittest.TestCase):
 
     def test_trim_skips_the_collect_but_still_trims(self):
         before = eo.expert_store_clock()
-        with envs.SGLANG_OPT_LOAD_PRESPLIT_GC.override(PresplitGcMode.TRIM), \
+        with envs.FLLIPER_OPT_LOAD_PRESPLIT_GC.override(PresplitGcMode.TRIM), \
                 mock.patch("gc.collect") as collect, \
                 mock.patch("ctypes.CDLL") as cdll:
             eo.presplit_host_reclaim()

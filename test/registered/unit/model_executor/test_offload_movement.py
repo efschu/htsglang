@@ -15,7 +15,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.model_executor.offload_movement import (
+from flliper.srt.model_executor.offload_movement import (
     DEFAULT_PARK_TARGET_ORDER,
     STATE_PARK_IN_FLIGHT,
     STATE_PARKED,
@@ -30,7 +30,7 @@ from sglang.srt.model_executor.offload_movement import (
     TagPayload,
     TensorPayload,
 )
-from sglang.srt.model_executor.offload_register import (
+from flliper.srt.model_executor.offload_register import (
     CpuFakeMovementBackend,
     OffloadItem,
     OffloadRegister,
@@ -44,8 +44,8 @@ from sglang.srt.model_executor.offload_register import (
     reset_global_register,
     resolve_class_policies,
 )
-from sglang.srt.model_executor.offload_sizes import resolve_size_bytes
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.model_executor.offload_sizes import resolve_size_bytes
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -380,7 +380,7 @@ class TestTargetLadder(unittest.TestCase):
         item = make_item()
         backend.bind(item.item_id, TensorPayload((_FakeTensor(),)), 0)
         with self.assertLogs(
-            "sglang.srt.model_executor.offload_movement", logging.INFO
+            "flliper.srt.model_executor.offload_movement", logging.INFO
         ) as logs:
             backend.park(item)  # degrades, never errors
         self.assertEqual(backend.target_of(item.item_id), "host_ram")
@@ -686,13 +686,13 @@ class TestAdapterHelpers(unittest.TestCase):
         self.addCleanup(reset_global_register)
 
     def test_maybe_helpers_are_noops_when_flag_off(self):
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "0"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "0"}):
             self.assertEqual(maybe_refresh_item_sizes(), 0)
             maybe_bind_movement_payload("x", TagPayload("t"))  # must not raise
             self.assertIsNone(get_global_register())
 
     def test_maybe_bind_reaches_the_backend(self):
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
             reg = configure_global_register("capacity")
             maybe_register_item(
                 "w", "lane_workspaces", 0, 1.0, size_source=lambda: _FakeTensor(4, 4)

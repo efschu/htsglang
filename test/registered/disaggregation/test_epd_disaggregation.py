@@ -11,20 +11,20 @@ import openai
 import zmq
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.network import get_zmq_socket_on_host
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.network import get_zmq_socket_on_host
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.mmmu_vlm_kit import MMMUMixin
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
     popen_launch_server,
 )
-from sglang.test.vlm_utils import (
+from flliper.test.vlm_utils import (
     AUDIO_TRUMP_SPEECH_URL,
     IMAGE_MAN_IRONING_URL,
     IMAGE_SGL_LOGO_URL,
@@ -123,7 +123,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
                 [
                     "python3",
                     "-m",
-                    "sglang.launch_server",
+                    "flliper.launch_server",
                     "--model-path",
                     cls.model,
                     "--host",
@@ -189,7 +189,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
         prefill_args += cls.transfer_backend + cls.rdma_devices
         prefill_env = os.environ.copy()
         if cls.server_type == "grpc":
-            prefill_env["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
+            prefill_env["FLLIPER_ENCODER_MM_RECEIVER_MODE"] = "grpc"
         cls.process_prefill = popen_launch_server(
             cls.model,
             base_url=cls.prefill_url,
@@ -1133,7 +1133,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase
         encode_command = [
             "python3",
             "-m",
-            "sglang.launch_server",
+            "flliper.launch_server",
             "--model-path",
             cls.model,
             "--host",
@@ -1175,7 +1175,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         prefill_env = os.environ.copy()
-        prefill_env["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
+        prefill_env["FLLIPER_ENCODER_MM_RECEIVER_MODE"] = "grpc"
         cls.process_prefill = popen_launch_server(
             cls.model,
             base_url=cls.prefill_url,
@@ -1236,7 +1236,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("SGLANG_ENCODER_MM_RECEIVER_MODE", None)
+        os.environ.pop("FLLIPER_ENCODER_MM_RECEIVER_MODE", None)
         os.environ.pop("OPENAI_API_KEY", None)
         os.environ.pop("OPENAI_API_BASE", None)
         for process in [
@@ -1259,7 +1259,7 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        os.environ["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
+        os.environ["FLLIPER_ENCODER_MM_RECEIVER_MODE"] = "grpc"
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
         cls.encode_port = f"{int(cls.lb_port) + 302}"
 
@@ -1273,7 +1273,7 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
         encode_command = [
             "python3",
             "-m",
-            "sglang.launch_server",
+            "flliper.launch_server",
             "--model-path",
             cls.model,
             "--host",
@@ -1322,7 +1322,7 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("SGLANG_ENCODER_MM_RECEIVER_MODE", None)
+        os.environ.pop("FLLIPER_ENCODER_MM_RECEIVER_MODE", None)
         if cls.process_encode:
             try:
                 kill_process_tree(cls.process_encode.pid)

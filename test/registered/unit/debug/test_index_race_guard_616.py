@@ -14,7 +14,7 @@ import logging
 import pytest
 import torch
 
-from sglang.srt.debug_utils import index_race_guard
+from flliper.srt.debug_utils import index_race_guard
 
 
 @pytest.fixture(autouse=True)

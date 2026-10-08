@@ -1,11 +1,11 @@
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
-from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.kl_divergence_kit import KLDivergenceMixin
+from flliper.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=250, stage="base-c", runner_config="4-gpu-h100")
 
@@ -66,15 +66,15 @@ class TestQwen3NextLazyExtraBufferAllocFail(
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL"] = "1"
-        os.environ["SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"] = "1"
+        os.environ["FLLIPER_TEST_MAMBA_LAZY_ALLOC_FAIL"] = "1"
+        os.environ["FLLIPER_TEST_SKIP_CACHE_HIT_ASSERT"] = "1"
         super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
-        os.environ.pop("SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL", None)
-        os.environ.pop("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT", None)
+        os.environ.pop("FLLIPER_TEST_MAMBA_LAZY_ALLOC_FAIL", None)
+        os.environ.pop("FLLIPER_TEST_SKIP_CACHE_HIT_ASSERT", None)
 
 
 @unittest.skip("Manual-only: forces all lazy preallocs to fail")
@@ -89,15 +89,15 @@ class TestQwen3NextLazyExtraBufferLargePageAllocFail(
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL"] = "1"
-        os.environ["SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"] = "1"
+        os.environ["FLLIPER_TEST_MAMBA_LAZY_ALLOC_FAIL"] = "1"
+        os.environ["FLLIPER_TEST_SKIP_CACHE_HIT_ASSERT"] = "1"
         super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
-        os.environ.pop("SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL", None)
-        os.environ.pop("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT", None)
+        os.environ.pop("FLLIPER_TEST_MAMBA_LAZY_ALLOC_FAIL", None)
+        os.environ.pop("FLLIPER_TEST_SKIP_CACHE_HIT_ASSERT", None)
 
 
 if __name__ == "__main__":

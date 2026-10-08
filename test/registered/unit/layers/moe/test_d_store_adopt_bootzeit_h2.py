@@ -29,7 +29,7 @@ from unittest import mock
 import torch
 
 try:
-    from sglang.srt.layers.moe import store_adopt as sa
+    from flliper.srt.layers.moe import store_adopt as sa
 except ImportError:  # pragma: no cover - base
     sa = None
 
@@ -77,10 +77,10 @@ class _Env(unittest.TestCase):
                 json.dump({"rank": 0, "rows": rows, "identity": "h2-toy"}, fh)
         # H2c: adoption needs the boot's store identity, and P's sentinels carry it
         self._env = mock.patch.dict(os.environ, {
-            "SGLANG_WEG2_GROUP": "D", "SGLANG_MOE_EXPERT_STORE_DIR": self.store,
-            "SGLANG_MOE_EXPERT_STORE_IDENTITY": "h2-toy"})
+            "FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_MOE_EXPERT_STORE_DIR": self.store,
+            "FLLIPER_MOE_EXPERT_STORE_IDENTITY": "h2-toy"})
         self._env.start()
-        self._map = mock.patch("sglang.srt.layers.moe.expert_store.expert_map",
+        self._map = mock.patch("flliper.srt.layers.moe.expert_store.expert_map",
                                return_value=KARTE)
         self._map.start()
 
@@ -96,11 +96,11 @@ class TestVetoSet(_Env):
 
     def test_inert_on_group_p_and_when_disabled(self):
         self.assertIsNotNone(sa, "store_adopt missing (base)")
-        with mock.patch.dict(os.environ, {"SGLANG_WEG2_GROUP": "P"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_GROUP": "P"}):
             self.assertEqual(sa.vetoed_global_ids(_layer()), frozenset())
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_WEG2_ENABLE_D_STORE_ADOPT.override(False):
+        with envs.FLLIPER_PDFLIP_ENABLE_D_STORE_ADOPT.override(False):
             self.assertEqual(sa.vetoed_global_ids(_layer()), frozenset())
 
     def test_snapshot_is_taken_once_before_d_writes(self):
@@ -128,7 +128,7 @@ class TestEarlyPresplitCounter(_Env):
         self.assertEqual(sa.vetoed_global_ids(lay), frozenset())
 
     def test_layer_presplits_once_every_non_vetoed_shard_landed(self):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         lay = _layer()
         del lay._moe_store_adopt_ok  # the scheme arms it, as in create_weights
@@ -158,7 +158,7 @@ class TestEarlyPresplitCounter(_Env):
     def test_wna16_arm_discounts(self):
         import inspect
 
-        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        from flliper.srt.layers.quantization.compressed_tensors.schemes import (
             compressed_tensors_wNa16_moe as m,
         )
 
@@ -188,7 +188,7 @@ class TestPresplitFilter(_Env):
     def test_presplit_writes_the_filtered_rows(self):
         import inspect
 
-        from sglang.srt.layers.moe import expert_offload as eo
+        from flliper.srt.layers.moe import expert_offload as eo
 
         src = inspect.getsource(eo.presplit_expert_offload_after_repack)
         self.assertIn("filter_store_rows", src)
@@ -199,7 +199,7 @@ class TestLoaderVeto(_Env):
     """The checkpoint tensor of a vetoed expert is never read."""
 
     def _model(self):
-        from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration as C
+        from flliper.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration as C
 
         lay = _layer()
         lay._gguf_expert_shard = True

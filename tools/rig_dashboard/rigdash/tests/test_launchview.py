@@ -74,11 +74,11 @@ class Masking(unittest.TestCase):
         st = copy.deepcopy(_load("nf"))
         p = st["groups"]["P"]["launch"]
         p["argv"] += ["--hf-token", "hf_SECRETVALUE", "--api-key=sk-live-xyz", "--admin-key-file", "/run/x.adminkey"]
-        p["env"].update({"HF_TOKEN": "hf_abc", "GITHUB_PAT": "ghp_x", "DB_PASSWORD": "pw", "WEG2_SECRET_SALT": "s"})
+        p["env"].update({"HF_TOKEN": "hf_abc", "GITHUB_PAT": "ghp_x", "DB_PASSWORD": "pw", "PDFLIP_SECRET_SALT": "s"})
         p["env_base"] = {"PATH": "/usr/bin", "OPENAI_API_KEY": "sk-1"}
         st["launch"] = {"container": {"image": "htsglang:x", "image_id": "sha256:1", "rev": "abc", "profile": "p",
-                                      "run": {"argv": ["docker", "run", "-e", "HF_TOKEN=hf_run", "-e", "SGLANG_X=1"],
-                                              "env": {"HF_TOKEN": "hf_run", "SGLANG_X": "1"},
+                                      "run": {"argv": ["docker", "run", "-e", "HF_TOKEN=hf_run", "-e", "FLLIPER_X=1"],
+                                              "env": {"HF_TOKEN": "hf_run", "FLLIPER_X": "1"},
                                               "mounts": [{"src": "/l3/nf", "dst": "/var/lib/x", "mode": "rw"}]}}}
         v = lv.model_view("NF", st)
         dump = json.dumps(v)
@@ -100,7 +100,7 @@ class Masking(unittest.TestCase):
         self.assertEqual(dict(c["env_set"])["HF_TOKEN"], lv.MASK)
 
     def test_not_secret_token_counts_and_path(self):
-        for name in ("--max-total-tokens", "--speculative-num-draft-tokens", "PATH", "SGLANG_HICACHE_KEY_SCHEME",
+        for name in ("--max-total-tokens", "--speculative-num-draft-tokens", "PATH", "FLLIPER_HICACHE_KEY_SCHEME",
                      "--tp-prefill-max-tokens", "CUDA_HOME"):
             self.assertFalse(lv.is_secret_name(name), name)
         for name in ("HF_TOKEN", "--hf-token", "--admin-api-key", "GITHUB_PAT", "DB_PASSWORD", "X_SECRET_Y", "OPENAI_API_KEY"):
@@ -166,8 +166,8 @@ class SnapshotAndVersion(unittest.TestCase):
 
     def test_front_layer_with_env_base(self):
         st = copy.deepcopy(_load("27b"))
-        st["launch"] = {"front": {"argv": ["python", "-m", "sglang.srt.weg2.front", "--port", "30030"],
-                                  "env": {"SGLANG_WEG2_FRONT_SPAN_INFLIGHT": "1"}, "env_base": {"PATH": "/bin"}}}
+        st["launch"] = {"front": {"argv": ["python", "-m", "flliper.srt.pdflip.front", "--port", "30030"],
+                                  "env": {"FLLIPER_PDFLIP_FRONT_SPAN_INFLIGHT": "1"}, "env_base": {"PATH": "/bin"}}}
         v = lv.model_view("27B", st)
         f = v["layers"]["front"]
         self.assertEqual((f["n_flags"], f["n_env"], f["n_env_base"]), (1, 1, 1))

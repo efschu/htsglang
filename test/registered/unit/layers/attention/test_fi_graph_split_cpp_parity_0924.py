@@ -34,8 +34,8 @@ import subprocess
 import tempfile
 import unittest
 
-from sglang.srt.layers.attention import fi_graph_split as G
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.attention import fi_graph_split as G
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 

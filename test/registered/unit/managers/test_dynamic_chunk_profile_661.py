@@ -42,8 +42,8 @@ import contextlib
 import threading
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -98,7 +98,7 @@ class _StubScheduler:
 
 
 def _run(rank: int, barrier: threading.Barrier, out: dict):
-    from sglang.srt.managers.scheduler_pp_mixin import (
+    from flliper.srt.managers.scheduler_pp_mixin import (
         SchedulerPPMixin,
     )
 
@@ -187,7 +187,7 @@ class TestProfileFailureIsGroupUniform(CustomTestCase):
         self._drive()
         # The raise happens before ChunkSizePredictor is constructed; if a
         # successor moves the check below the fit, this catches it.
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
         import inspect
 
         src = inspect.getsource(SchedulerPPMixin.profile_and_init_predictor)

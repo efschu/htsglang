@@ -20,7 +20,7 @@ Also asserts the work-normalized per-card efficiency column.
 
 import unittest
 
-from sglang.srt.planner.energy import (
+from flliper.srt.planner.energy import (
     CODE_BEHAVIOR,
     PROSE_BEHAVIOR,
     GpuPowerState,
@@ -321,17 +321,17 @@ class TestLiveRates(unittest.TestCase):
 
     def test_parse_prometheus_sums_label_sets(self):
         text = (
-            "# HELP sglang:generation_tokens_total foo\n"
-            "# TYPE sglang:generation_tokens_total counter\n"
-            'sglang:generation_tokens_total{worker="0"} 100\n'
-            'sglang:generation_tokens_total{worker="1"} 55\n'
-            "sglang:prompt_tokens_total 1000\n"
-            'sglang:spec_ema_accept_len{model="m"} 2.75\n'
+            "# HELP flliper:generation_tokens_total foo\n"
+            "# TYPE flliper:generation_tokens_total counter\n"
+            'flliper:generation_tokens_total{worker="0"} 100\n'
+            'flliper:generation_tokens_total{worker="1"} 55\n'
+            "flliper:prompt_tokens_total 1000\n"
+            'flliper:spec_ema_accept_len{model="m"} 2.75\n'
         )
         m = parse_prometheus_metrics(text)
-        self.assertAlmostEqual(m["sglang:generation_tokens_total"], 155.0)
-        self.assertAlmostEqual(m["sglang:prompt_tokens_total"], 1000.0)
-        self.assertAlmostEqual(m["sglang:spec_ema_accept_len"], 2.75)
+        self.assertAlmostEqual(m["flliper:generation_tokens_total"], 155.0)
+        self.assertAlmostEqual(m["flliper:prompt_tokens_total"], 1000.0)
+        self.assertAlmostEqual(m["flliper:spec_ema_accept_len"], 2.75)
         snap = LiveSnapshot.from_metrics(m, t=1.0)
         self.assertAlmostEqual(snap.generation_tokens_total, 155.0)
         self.assertAlmostEqual(snap.spec_ema_accept_len, 2.75)

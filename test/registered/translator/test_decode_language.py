@@ -33,8 +33,8 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.asr_backends import FasterWhisperAsr
-from sglang.srt.translator.backends import AudioChunk
+from flliper.srt.translator.asr_backends import FasterWhisperAsr
+from flliper.srt.translator.backends import AudioChunk
 
 #: Whisper's posterior for that utterance: Icelandic overwhelming, German a
 #: distant second. Taken from the journal's shape, not invented -- the point

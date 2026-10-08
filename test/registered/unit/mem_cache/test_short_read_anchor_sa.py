@@ -1,8 +1,8 @@
 """SA: a short store read still reads the recurrent state at its deepest anchor.
 
-Metal (NF y3v 5327bdfa17, P log, weg2-46-98, prompt 54226, session c34ae69c6e):
+Metal (NF y3v 5327bdfa17, P log, pdflip-46-98, prompt 54226, session c34ae69c6e):
 
-* PP0 01:16:04 ``WEG2-READ-STAGES req=weg2-46-98 pages=757 ... kv_ms=249`` --
+* PP0 01:16:04 ``PDFLIP-READ-STAGES req=pdflip-46-98 pages=757 ... kv_ms=249`` --
   no ``extra_ms`` term: the hybrid pools were never read.
 * PP0 01:16:06 ``#1028B FETCH CAP ... kv=757 claimed=716 ... anchors_in_range
   {mamba: (15, 715)}`` and ``#257 PREFETCH BELOW-ANCHOR read=48448 of 52672
@@ -12,7 +12,7 @@ Metal (NF y3v 5327bdfa17, P log, weg2-46-98, prompt 54226, session c34ae69c6e):
 * PP0 01:16:11 ``[#904 match-census] verdict=refused reached=45824 accepted=0
   refusers=MambaComponent:45824 why=MambaComponent:absent=45824`` ->
   ``#TF TOLD-FIDELITY told=45824 depth=45824 pp0_admissible=0`` -> told=0 on
-  every rank; front ``WEG2-SERVED group=P ... cached_tokens=0 wall=37.68s``.
+  every rank; front ``PDFLIP-SERVED group=P ... cached_tokens=0 wall=37.68s``.
 
 The root: ``HybridCacheController._page_transfer`` skips the extra pools for
 EVERY read whose KV ended short, and #257 (b) cut the claim to the anchor the
@@ -35,20 +35,20 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt import rank_role  # noqa: E402
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.managers import cache_controller as cc  # noqa: E402
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import (  # noqa: E402
+from flliper.srt import rank_role  # noqa: E402
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.srt.managers import cache_controller as cc  # noqa: E402
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import (  # noqa: E402
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (  # noqa: E402
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (  # noqa: E402
     HybridCacheController,
 )
-from sglang.srt.mem_cache.short_read_anchor import state_depth_mismatch  # noqa: E402
+from flliper.srt.mem_cache.short_read_anchor import state_depth_mismatch  # noqa: E402
 
 # the metal in pages of 64: 823 probed, 757 landed, deepest anchor at page 715
 PROBED, LANDED, ANCHOR_IDX = 823, 757, 715
@@ -102,10 +102,10 @@ def _ctl(store, tp_group=None, consumer=True):
 
 def _op(transfers):
     return types.SimpleNamespace(
-        request_id="weg2-46-98", hash_value=list(KEYS), completed_tokens=0,
+        request_id="pdflip-46-98", hash_value=list(KEYS), completed_tokens=0,
         host_indices=torch.arange(PROBED * PAGE), pool_transfers=transfers,
         pool_storage_result=PoolTransferResult.empty(), pool_transfers_done=False,
-        _weg2_short_anchor_pages=None,
+        _pdflip_short_anchor_pages=None,
     )
 
 
@@ -118,7 +118,7 @@ def short_kv(monkeypatch):
 
 
 # ------------------------------------------------------------ the controller
-def test_weg2_46_98_the_short_read_reads_the_state_at_its_deepest_anchor(short_kv):
+def test_pdflip_46_98_the_short_read_reads_the_state_at_its_deepest_anchor(short_kv):
     """RED on 339476bee2: nothing is read (store.gets == []), the operation
     carries no read anchor and the mamba hit stays 0 -- the metal's
     READ-STAGES without extra_ms. GREEN: the state at page 715 is read."""
@@ -130,7 +130,7 @@ def test_weg2_46_98_the_short_read_reads_the_state_at_its_deepest_anchor(short_k
     got = store.gets[0]
     assert got[PoolName.MAMBA][0] == [KEYS[ANCHOR_IDX]]        # the anchor page, not 822
     assert got[PoolName.QSA_INDEXER] == (KEYS[: ANCHOR_IDX + 1], (ANCHOR_IDX + 1) * PAGE)
-    assert op._weg2_short_anchor_pages == ANCHOR_IDX + 1        # 716 pages = 45824 tokens
+    assert op._pdflip_short_anchor_pages == ANCHOR_IDX + 1        # 716 pages = 45824 tokens
     assert op.pool_storage_result.extra_pool_hit_pages[PoolName.MAMBA] == 1
     assert op.pool_transfers_done
 
@@ -139,7 +139,7 @@ def test_a_failed_state_read_names_no_anchor(short_kv):
     store = _Store(fail_read=True)
     op = _op([_mamba()])
     HybridCacheController._page_transfer(_ctl(store), op)
-    assert op._weg2_short_anchor_pages == 0
+    assert op._pdflip_short_anchor_pages == 0
     assert op.pool_storage_result.extra_pool_hit_pages.get(PoolName.MAMBA, 0) == 0
 
 
@@ -149,7 +149,7 @@ def test_no_anchor_inside_the_landed_pages_reads_nothing(short_kv, monkeypatch):
     store = _Store()
     op = _op([_mamba()])
     HybridCacheController._page_transfer(_ctl(store), op)
-    assert store.gets == [] and op._weg2_short_anchor_pages == 0
+    assert store.gets == [] and op._pdflip_short_anchor_pages == 0
 
 
 def test_a_tp_group_keeps_the_old_skip(short_kv, monkeypatch):
@@ -159,15 +159,15 @@ def test_a_tp_group_keeps_the_old_skip(short_kv, monkeypatch):
     store = _Store()
     op = _op([_mamba()])
     HybridCacheController._page_transfer(_ctl(store, tp_group=object()), op)
-    assert store.gets == [] and op._weg2_short_anchor_pages is None
+    assert store.gets == [] and op._pdflip_short_anchor_pages is None
 
 
 def test_the_switch_off_is_the_old_skip(short_kv):
     store = _Store()
     op = _op([_mamba()])
-    with envs.SGLANG_WEG2_ENABLE_SHORT_READ_ANCHOR.override(False):
+    with envs.FLLIPER_PDFLIP_ENABLE_SHORT_READ_ANCHOR.override(False):
         HybridCacheController._page_transfer(_ctl(store), op)
-    assert store.gets == [] and op._weg2_short_anchor_pages is None
+    assert store.gets == [] and op._pdflip_short_anchor_pages is None
 
 
 def test_a_tree_that_does_not_cut_to_the_read_anchor_keeps_the_old_skip(short_kv):
@@ -177,12 +177,12 @@ def test_a_tree_that_does_not_cut_to_the_read_anchor_keeps_the_old_skip(short_kv
     store = _Store()
     op = _op([_mamba()])
     HybridCacheController._page_transfer(_ctl(store, consumer=False), op)
-    assert store.gets == [] and op._weg2_short_anchor_pages is None
+    assert store.gets == [] and op._pdflip_short_anchor_pages is None
     assert HybridCacheController.short_read_anchor_consumer is False
 
 
 def test_the_unified_stack_arms_its_controller():
-    from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
+    from flliper.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
 
     ctl = object.__new__(HybridCacheController)
     ctl.layer_done_counter = object()
@@ -206,7 +206,7 @@ def test_a_full_read_is_unchanged(short_kv, monkeypatch):
     op = _op([_mamba()])
     HybridCacheController._page_transfer(_ctl(store), op)
     assert store.gets[0][PoolName.MAMBA][0] == [KEYS[-1]]
-    assert op._weg2_short_anchor_pages is None
+    assert op._pdflip_short_anchor_pages is None
 
 
 # ------------------------------------------------------------ the reap (#257 cut)
@@ -232,7 +232,7 @@ def _reap(read_anchor_pages):
     op.probed_hit_tokens = SPAN
     op.increment(READ)
     op.mark_terminate()
-    op._weg2_short_anchor_pages = read_anchor_pages
+    op._pdflip_short_anchor_pages = read_anchor_pages
     cache.cache_controller.storage_backend = _Presence()
     cache.cache_controller._presence_pool_transfers = lambda: [types.SimpleNamespace(name=PoolName.MAMBA)]
     cache.check_prefetch_progress(REQ)

@@ -22,14 +22,14 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.backends import AudioChunk
-from sglang.srt.translator.session import EventKind, run_conversation
-from sglang.srt.translator.speakers import (
+from flliper.srt.translator.backends import AudioChunk
+from flliper.srt.translator.session import EventKind, run_conversation
+from flliper.srt.translator.speakers import (
     SpeakerEmbedding,
     SpeakerRegistry,
     SpeakerRegistryConfig,
 )
-from sglang.srt.translator.transcript_log import ORIGIN_AUTO, ORIGIN_MANUAL
+from flliper.srt.translator.transcript_log import ORIGIN_AUTO, ORIGIN_MANUAL
 from test_session import (  # noqa: E402  - sibling helper module
     RATE,
     VOICE_A_HZ,
@@ -280,7 +280,7 @@ class TestSpeakerDeletion(unittest.IsolatedAsyncioTestCase):
     """A speaker created by mistake must be removable (user order)."""
 
     async def test_deleting_frees_the_slot_the_buffer_and_the_voice(self):
-        from sglang.srt.translator.voices import VoiceMode, synthetic_pool
+        from flliper.srt.translator.voices import VoiceMode, synthetic_pool
         from test_session import LANG_A, LANG_B
 
         session, _asr, _mt, _tts = make_session(
@@ -333,7 +333,7 @@ class TestManualSpeakerClass(unittest.IsolatedAsyncioTestCase):
     """The class must steer the VOICE, not just be stored (design 17.5b)."""
 
     def _session_with_pool(self):
-        from sglang.srt.translator.voices import VoiceClass, VoiceMode, synthetic_pool
+        from flliper.srt.translator.voices import VoiceClass, VoiceMode, synthetic_pool
         from test_session import LANG_A, LANG_B
 
         session, _asr, _mt, _tts = make_session(
@@ -548,7 +548,7 @@ class TestSpeakerMerge(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.armed_speaker, first)
 
     async def test_the_preset_voice_of_the_source_goes_back_to_the_pool(self):
-        from sglang.srt.translator.voices import VoiceMode, synthetic_pool
+        from flliper.srt.translator.voices import VoiceMode, synthetic_pool
         from test_session import LANG_A, LANG_B
 
         session, _asr, _mt, _tts = make_session(

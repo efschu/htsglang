@@ -2,7 +2,7 @@
 
 These are pure-Python reference implementations of the two core rules from the
 Triton kernel `generate_draft_decode_kv_indices` in
-`python/sglang/kernels/ops/speculative/cache_locs.py` (lines 120-197).
+`python/flliper/kernels/ops/speculative/cache_locs.py` (lines 120-197).
 
 IMPORTANT: These tests do NOT execute the device kernel. They define the
 expected arithmetic via explicit Python implementations. Any host-side

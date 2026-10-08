@@ -2,7 +2,7 @@
 Benchmark & Correctness: Triton GDN vs FlashInfer GDN (prefill).
 
 Compares:
-  - Triton:     sglang's chunk_gated_delta_rule (K-contiguous pool, pool-indexed)
+  - Triton:     flliper's chunk_gated_delta_rule (K-contiguous pool, pool-indexed)
   - FlashInfer: flashinfer's chunk_gated_delta_rule (gather/scatter, 3D tensors)
 
 The two kernels have different APIs:
@@ -29,10 +29,10 @@ from flashinfer.gdn_prefill import (
     chunk_gated_delta_rule as flashinfer_chunk_gated_delta_rule,
 )
 
-from sglang.srt.layers.attention.fla.chunk import (
+from flliper.srt.layers.attention.fla.chunk import (
     chunk_gated_delta_rule as triton_chunk_gated_delta_rule,
 )
-from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+from flliper.srt.layers.attention.fla.l2norm import l2norm_fwd
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -183,7 +183,7 @@ def run_triton(inp):
 
 
 def run_flashinfer(inp):
-    """FlashInfer path: matches sglang FlashInferGDNKernel.extend() exactly.
+    """FlashInfer path: matches flliper FlashInferGDNKernel.extend() exactly.
 
     Key differences from Triton path:
       - q, k are L2-normalized BEFORE calling the kernel
@@ -192,7 +192,7 @@ def run_flashinfer(inp):
       - g is alpha = exp(logsigmoid(...)) = sigmoid(...), float32
       - beta is float32
       - initial_state is gathered from pool (no pool-index support)
-      - Uses keyword arguments (matching sglang production code)
+      - Uses keyword arguments (matching flliper production code)
 
     NOTE: FlashInfer GDN requires K == V (square head_size).
     """
@@ -220,7 +220,7 @@ def run_flashinfer(inp):
 
     cu_seqlens_fi = inp["cu_seqlens"].to(torch.int64)
 
-    # Call FlashInfer with keyword args (matching sglang production code)
+    # Call FlashInfer with keyword args (matching flliper production code)
     # use_qk_l2norm_in_kernel=False because we pre-normalized above
     o_fi, state_fi = flashinfer_chunk_gated_delta_rule(
         q=q_fi,
@@ -386,7 +386,7 @@ def bench_shape(B, H, T_per_seq, K, V, pool_size, device, dtype):
 
     def fn_flashinfer():
         # -- Pre-compute FlashInfer format tensors (outside timing) --
-        # Pre-normalize q and k (matching sglang production: l2norm_fwd)
+        # Pre-normalize q and k (matching flliper production: l2norm_fwd)
         # q_fi = torch.nn.functional.normalize(q[0].contiguous().float(), p=2.0, dim=-1).to(
         #     dtype
         # )

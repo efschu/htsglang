@@ -23,14 +23,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt.planner import bench_history
+from flliper.srt.planner import bench_history
 
 
 class _Rooted(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="bhist_")
         self._env = mock.patch.dict(
-            os.environ, {"SGLANG_PLANNER_BENCH_HISTORY": self.tmp})
+            os.environ, {"FLLIPER_PLANNER_BENCH_HISTORY": self.tmp})
         self._env.start()
 
     def tearDown(self):

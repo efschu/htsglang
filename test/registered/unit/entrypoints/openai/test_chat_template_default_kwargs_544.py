@@ -20,7 +20,7 @@ Run with:
       test/registered/unit/entrypoints/openai/test_chat_template_default_kwargs_544.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -28,9 +28,9 @@ import json
 import os
 import unittest
 
-from sglang.srt.entrypoints.openai.serving_chat import merge_chat_template_kwargs
-from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.entrypoints.openai.serving_chat import merge_chat_template_kwargs
+from flliper.srt.server_args import ServerArgs
+from flliper.test.test_utils import CustomTestCase
 
 TOKENIZER_PATH = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8"
 

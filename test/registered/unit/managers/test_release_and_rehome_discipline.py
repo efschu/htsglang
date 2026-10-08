@@ -53,12 +53,12 @@ import textwrap
 import types
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 
 def _release_try() -> ast.Try:
     """The one `try` of `_release_voided_request`: normal path vs containment."""
-    from sglang.srt.managers import scheduler_pp_mixin as m
+    from flliper.srt.managers import scheduler_pp_mixin as m
 
     src = textwrap.dedent(inspect.getsource(m._release_voided_request))
     fn = ast.parse(src).body[0]
@@ -185,7 +185,7 @@ class RehomeDisplacedChunkedReq(unittest.TestCase):
     """
 
     def setUp(self):
-        from sglang.srt.managers import scheduler_pp_mixin as m
+        from flliper.srt.managers import scheduler_pp_mixin as m
 
         self.m = m
         self.parked = []

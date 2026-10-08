@@ -28,28 +28,28 @@ from typing import Optional
 import torch  # type: ignore
 import torch.distributed as dist  # type: ignore
 
-from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from flliper.srt.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     graph_capture,
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.layers.layernorm import RMSNorm  # noqa
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as SGLANG_FP8_DTYPE
-from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
+from flliper.srt.layers.layernorm import RMSNorm  # noqa
+from flliper.srt.layers.quantization.fp8_kernel import fp8_dtype as FLLIPER_FP8_DTYPE
+from flliper.srt.layers.quantization.fp8_kernel import static_quant_fp8
 
 try:
     from sgl_kernel import fused_add_rmsnorm as SGL_FUSED_ADD_RMS_NORM
     from sgl_kernel import rmsnorm as SGL_RMS_NORM
 
-    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as SGL_SCALED_FP4_QUANT
+    from flliper.jit_kernel.nvfp4 import scaled_fp4_quant as SGL_SCALED_FP4_QUANT
 except Exception:  # pragma: no cover - fallback on non-supported platforms
     SGL_FUSED_ADD_RMS_NORM = None
     SGL_RMS_NORM = None
     SGL_SCALED_FP4_QUANT = None
 
-FP8_DTYPE = SGLANG_FP8_DTYPE
+FP8_DTYPE = FLLIPER_FP8_DTYPE
 
 logger = logging.getLogger(__name__)
 
@@ -577,7 +577,7 @@ def benchmark_operation(
     graph = torch.cuda.CUDAGraph()
     num_op_per_cudagraph = 10
 
-    # Use sglang's graph_capture to make tensor_model_parallel_all_reduce graph-safe
+    # Use flliper's graph_capture to make tensor_model_parallel_all_reduce graph-safe
     with graph_capture() as graph_capture_context:
         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
             for _ in range(num_op_per_cudagraph):
@@ -729,7 +729,7 @@ def run_benchmarks(
                 input_tensor,
                 residual=residual,
                 rmsnorm_layer=rmsnorm_layer,
-                # quant_fp8_layer removed in sglang version; static_quant_fp8 is used within the function
+                # quant_fp8_layer removed in flliper version; static_quant_fp8 is used within the function
                 scale_factor=scale_fp8,
                 norm_out=norm_out,
                 quant_out=quant_out_fp8,

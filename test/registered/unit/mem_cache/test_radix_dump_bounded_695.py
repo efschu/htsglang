@@ -48,7 +48,7 @@ import logging
 import unittest
 from contextlib import redirect_stdout
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -101,7 +101,7 @@ def _tree(n_nodes=200, locked_every=7):
 
 class TheDumpIsBoundedByDefault(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.mem_cache import mamba_radix_cache as m
+        from flliper.srt.mem_cache import mamba_radix_cache as m
 
         self.m = m
         self.cache = m.MambaRadixCache.__new__(m.MambaRadixCache)
@@ -112,7 +112,7 @@ class TheDumpIsBoundedByDefault(unittest.TestCase):
 
     def _capture(self):
         buf = io.StringIO()
-        with self.assertLogs("sglang.srt.mem_cache.mamba_radix_cache", level="ERROR") as cm:
+        with self.assertLogs("flliper.srt.mem_cache.mamba_radix_cache", level="ERROR") as cm:
             with redirect_stdout(buf):
                 self.cache.pretty_print()
         return buf.getvalue(), cm.output
@@ -155,7 +155,7 @@ class TheFullDumpIsStillAvailable(unittest.TestCase):
     """Bounding it must not delete it -- the detail is real when asked for."""
 
     def setUp(self):
-        from sglang.srt.mem_cache import mamba_radix_cache as m
+        from flliper.srt.mem_cache import mamba_radix_cache as m
 
         self.m = m
         self.cache = m.MambaRadixCache.__new__(m.MambaRadixCache)
@@ -167,32 +167,32 @@ class TheFullDumpIsStillAvailable(unittest.TestCase):
     def test_the_flag_restores_the_per_node_detail(self):
         import os
 
-        os.environ["SGLANG_RADIX_DEBUG_DUMP"] = "1"
+        os.environ["FLLIPER_RADIX_DEBUG_DUMP"] = "1"
         try:
             with self.assertLogs(
-                "sglang.srt.mem_cache.mamba_radix_cache", level="ERROR"
+                "flliper.srt.mem_cache.mamba_radix_cache", level="ERROR"
             ) as cm:
                 self.cache.pretty_print()
             body = "\n".join(cm.output)
             self.assertIn("fr=", body)
             self.assertIn("mv=", body)
         finally:
-            os.environ.pop("SGLANG_RADIX_DEBUG_DUMP", None)
+            os.environ.pop("FLLIPER_RADIX_DEBUG_DUMP", None)
 
     def test_even_the_debug_dump_does_not_use_stdout(self):
         import os
 
-        os.environ["SGLANG_RADIX_DEBUG_DUMP"] = "1"
+        os.environ["FLLIPER_RADIX_DEBUG_DUMP"] = "1"
         buf = io.StringIO()
         try:
             with self.assertLogs(
-                "sglang.srt.mem_cache.mamba_radix_cache", level="ERROR"
+                "flliper.srt.mem_cache.mamba_radix_cache", level="ERROR"
             ):
                 with redirect_stdout(buf):
                     self.cache.pretty_print()
             self.assertEqual("", buf.getvalue())
         finally:
-            os.environ.pop("SGLANG_RADIX_DEBUG_DUMP", None)
+            os.environ.pop("FLLIPER_RADIX_DEBUG_DUMP", None)
 
 
 if __name__ == "__main__":

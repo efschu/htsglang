@@ -1,6 +1,6 @@
 # ASR Benchmark
 
-This benchmark evaluates the performance and accuracy (Word Error Rate - WER) of Automatic Speech Recognition (ASR) models served via SGLang.
+This benchmark evaluates the performance and accuracy (Word Error Rate - WER) of Automatic Speech Recognition (ASR) models served via fLLiper.
 
 ## Supported Models
 
@@ -20,12 +20,12 @@ pip install librosa soundfile datasets evaluate jiwer transformers openai torchc
 
 ## Running the Benchmark
 
-### 1. Start SGLang Server
+### 1. Start fLLiper Server
 
-Launch the SGLang server with a Whisper model:
+Launch the fLLiper server with a Whisper model:
 
 ```bash
-python -m sglang.launch_server --model-path openai/whisper-large-v3 --port 30000
+python -m flliper.launch_server --model-path openai/whisper-large-v3 --port 30000
 ```
 
 ### 2. Run the Benchmark Script
@@ -33,13 +33,13 @@ python -m sglang.launch_server --model-path openai/whisper-large-v3 --port 30000
 Basic usage (using chat completions API):
 
 ```bash
-python bench_sglang.py --base-url http://localhost:30000 --model openai/whisper-large-v3 --n-examples 10
+python bench_flliper.py --base-url http://localhost:30000 --model openai/whisper-large-v3 --n-examples 10
 ```
 
 Using the OpenAI-compatible transcription API:
 
 ```bash
-python bench_sglang.py \
+python bench_flliper.py \
     --base-url http://localhost:30000 \
     --model openai/whisper-large-v3 \
     --api-type transcription \
@@ -50,7 +50,7 @@ python bench_sglang.py \
 Run with streaming and show real-time output:
 
 ```bash
-python bench_sglang.py \
+python bench_flliper.py \
     --base-url http://localhost:30000 \
     --model openai/whisper-large-v3 \
     --api-type transcription \
@@ -62,7 +62,7 @@ python bench_sglang.py \
 Run with higher concurrency and save results:
 
 ```bash
-python bench_sglang.py \
+python bench_flliper.py \
     --base-url http://localhost:30000 \
     --model openai/whisper-large-v3 \
     --concurrency 8 \
@@ -75,7 +75,7 @@ python bench_sglang.py \
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--base-url` | SGLang server URL | `http://localhost:30000` |
+| `--base-url` | fLLiper server URL | `http://localhost:30000` |
 | `--model` | Model name on the server | `openai/whisper-large-v3` |
 | `--dataset` | HuggingFace dataset for evaluation | `D4nt3/esb-datasets-earnings22-validation-tiny-filtered` |
 | `--split` | Dataset split to use | `validation` |
@@ -105,7 +105,7 @@ The benchmark outputs:
 ## Example Output
 
 ```bash
-python bench_sglang.py --api-type transcription --concurrency 128 --model openai/whisper-large-v3 --show-predictions
+python bench_flliper.py --api-type transcription --concurrency 128 --model openai/whisper-large-v3 --show-predictions
 
 Loading dataset: D4nt3/esb-datasets-earnings22-validation-tiny-filtered...
 Using API type: transcription
@@ -160,7 +160,7 @@ Sample 5:
 ## Troubleshooting
 
 **Server connection refused**
-- Ensure the SGLang server is running and accessible at the specified `--base-url`
+- Ensure the fLLiper server is running and accessible at the specified `--base-url`
 - Check that the port is not blocked by a firewall
 
 **Out of memory errors**

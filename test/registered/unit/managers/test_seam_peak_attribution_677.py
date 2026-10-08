@@ -29,7 +29,7 @@ mislead a reader:
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers import phase_flip_runtime as pfr
+from flliper.srt.managers import phase_flip_runtime as pfr
 
 
 class _Runtime:
@@ -65,18 +65,18 @@ def _run(runtime, staging=8192, driver_free=1 << 30, cached=1 << 20):
     cap = _Capture()
     import sys
 
-    saved = sys.modules.get("sglang.srt.mem_ledger.flight_recorder")
-    sys.modules["sglang.srt.mem_ledger.flight_recorder"] = cap
+    saved = sys.modules.get("flliper.srt.mem_ledger.flight_recorder")
+    sys.modules["flliper.srt.mem_ledger.flight_recorder"] = cap
     fake_pkg = SimpleNamespace(flight_recorder=cap)
-    saved_pkg = sys.modules.get("sglang.srt.mem_ledger")
-    sys.modules["sglang.srt.mem_ledger"] = fake_pkg
+    saved_pkg = sys.modules.get("flliper.srt.mem_ledger")
+    sys.modules["flliper.srt.mem_ledger"] = fake_pkg
     try:
         runtime._record_seam_peak("pp_to_tp", staging, driver_free, cached)
     finally:
         if saved is not None:
-            sys.modules["sglang.srt.mem_ledger.flight_recorder"] = saved
+            sys.modules["flliper.srt.mem_ledger.flight_recorder"] = saved
         if saved_pkg is not None:
-            sys.modules["sglang.srt.mem_ledger"] = saved_pkg
+            sys.modules["flliper.srt.mem_ledger"] = saved_pkg
     return cap
 
 
@@ -148,13 +148,13 @@ class TestItCannotBreakAFlip(unittest.TestCase):
 
         import sys
 
-        saved = sys.modules.get("sglang.srt.mem_ledger")
-        sys.modules["sglang.srt.mem_ledger"] = SimpleNamespace(flight_recorder=_Angry())
+        saved = sys.modules.get("flliper.srt.mem_ledger")
+        sys.modules["flliper.srt.mem_ledger"] = SimpleNamespace(flight_recorder=_Angry())
         try:
             _Runtime()._record_seam_peak("pp_to_tp", 1, 2, 3)
         finally:
             if saved is not None:
-                sys.modules["sglang.srt.mem_ledger"] = saved
+                sys.modules["flliper.srt.mem_ledger"] = saved
 
     def test_a_runtime_missing_its_fields_does_not_escape(self):
         bare = SimpleNamespace()

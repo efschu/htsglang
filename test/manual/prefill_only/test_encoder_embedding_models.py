@@ -6,8 +6,8 @@ import unittest
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
+from flliper.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
+from flliper.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
 # Encoder embedding model tests (CUDA only)
 

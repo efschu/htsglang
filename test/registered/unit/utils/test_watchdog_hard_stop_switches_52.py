@@ -2,9 +2,9 @@
 
   * Scheduler watchdog (WatchdogRaw, soft=False): after the dump it sends SIGQUIT to the parent process.
     Until now the only way to avoid that was a very large --watchdog-timeout.
-    SGLANG_ENABLE_SCHEDULER_WATCHDOG_KILL (default 1 = today's kill) = 0: dump and line stay, no signal.
+    FLLIPER_ENABLE_SCHEDULER_WATCHDOG_KILL (default 1 = today's kill) = 0: dump and line stay, no signal.
   * SubprocessWatchdog: a scheduler/detokenizer child that exited non-zero makes it SIGQUIT its own process.
-    SGLANG_ENABLE_SUBPROCESS_WATCHDOG_KILL (default 1) = 0: the death is reported, nothing is signalled.
+    FLLIPER_ENABLE_SUBPROCESS_WATCHDOG_KILL (default 1) = 0: the death is reported, nothing is signalled.
 
 Red on the base (d10a4c3d60): the env is unknown there, so the "off" cases still signal. Green with the change.
 The env is set through ``mock.patch.dict(os.environ)`` and not ``envs.X.override`` on purpose: the same file must be
@@ -19,13 +19,13 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.utils import watchdog as W
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils import watchdog as W
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
-SCHED = "SGLANG_ENABLE_SCHEDULER_WATCHDOG_KILL"
-SUB = "SGLANG_ENABLE_SUBPROCESS_WATCHDOG_KILL"
+SCHED = "FLLIPER_ENABLE_SCHEDULER_WATCHDOG_KILL"
+SUB = "FLLIPER_ENABLE_SUBPROCESS_WATCHDOG_KILL"
 
 _REAL_SLEEP = time.sleep
 
@@ -78,7 +78,7 @@ class SchedulerWatchdogKill(unittest.TestCase):
         wd.parent_process.send_signal.assert_not_called()
         lines = [str(c.args[0]) for c in log.error.call_args_list]
         self.assertTrue(any("watchdog timeout" in m for m in lines), lines)
-        self.assertTrue(any("SGLANG_ENABLE_SCHEDULER_WATCHDOG_KILL=0" in m for m in lines), lines)
+        self.assertTrue(any("FLLIPER_ENABLE_SCHEDULER_WATCHDOG_KILL=0" in m for m in lines), lines)
 
     def test_soft_watchdog_is_unaffected_by_the_switch(self):
         """soft=True never signalled; the switch must not change that (nor start signalling)."""
@@ -113,14 +113,14 @@ class SubprocessWatchdogKill(unittest.TestCase):
         self.assertFalse(stop, "the loop must go on watching: a later death must still be reported")
         lines = [str(c.args[0]) for c in log.error.call_args_list]
         self.assertTrue(any("Subprocess p0" in m and "is gone" in m for m in lines), lines)
-        self.assertTrue(any("SGLANG_ENABLE_SUBPROCESS_WATCHDOG_KILL=0" in m for m in lines), lines)
+        self.assertTrue(any("FLLIPER_ENABLE_SUBPROCESS_WATCHDOG_KILL=0" in m for m in lines), lines)
 
     def test_switch_off_names_the_suppression_once_not_every_poll(self):
         sw = _sub_watchdog(_dead(103, 1))
         with _env(**{SUB: "0"}), mock.patch("os.kill"), mock.patch.object(W, "logger") as log:
             for _ in range(5):
                 sw._check_processes()
-        n = sum("SGLANG_ENABLE_SUBPROCESS_WATCHDOG_KILL=0" in str(c.args[0]) for c in log.error.call_args_list)
+        n = sum("FLLIPER_ENABLE_SUBPROCESS_WATCHDOG_KILL=0" in str(c.args[0]) for c in log.error.call_args_list)
         self.assertEqual(n, 1)
 
     def test_clean_exit_never_signals_in_either_setting(self):

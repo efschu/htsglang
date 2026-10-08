@@ -90,7 +90,7 @@ fi
 assert_metrics_flag "${BOOT_ARGS[@]}"
 
 log "launching: ${FIRST_SHARD}"
-setsid "$PY" -u -m sglang.launch_server "${BOOT_ARGS[@]}" \
+setsid "$PY" -u -m flliper.launch_server "${BOOT_ARGS[@]}" \
     > "$BOOT_LOG" 2>&1 < /dev/null &
 record_pids "$ARM" $!
 

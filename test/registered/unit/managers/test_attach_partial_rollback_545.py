@@ -29,11 +29,11 @@ Hermetic: the communicators are stubs; no scheduler, no server, no CUDA.
 import asyncio
 import unittest
 
-from sglang.srt.managers.io_struct import (
+from flliper.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     DetachHiCacheStorageReqOutput,
 )
-from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from flliper.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
 
 def _ok(rank):

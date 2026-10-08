@@ -3,23 +3,23 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.unsharder.executor import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.executor import (
     UnsharderResult,
     _apply_unshard,
     _verify_replicated_group,
     execute_unsharder_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.planner import (
     compute_unsharder_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.types import (
     AxisInfo,
     CpThdConcatParams,
     PickParams,
     ReduceSumParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import (
+from flliper.srt.debug_utils.comparator.dims_spec import (
     DimSpec,
     ParallelAxis,
     apply_dim_names,
@@ -27,8 +27,8 @@ from sglang.srt.debug_utils.comparator.dims_spec import (
     parse_dims,
     without_dim_names,
 )
-from sglang.srt.debug_utils.comparator.output_types import ReplicatedCheckResult
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.output_types import ReplicatedCheckResult
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")

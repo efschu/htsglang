@@ -45,8 +45,8 @@ PROFILES_DIR = DOCKER_DIR + "/profiles"
 CTX_GLOB = DOCKER_DIR + "/ctx/*/BUILD_INFO.json"
 # F0-B: the August/RC images (``htsglang:cu130-weg2-<rel>-27b-nf[-flat]``, product and subsystem token renamed by the
 # mechanical rename, both spellings read) and the fLLiper flat images (``flliper:<version>-<cu>`` / ``flliper:<cu>-<sha10>``,
-# make_flat_ctx.sh TAG/TAG2: "no sglang/weg2/htsglang/27b-nf in a tag").
-RE_IMAGE = N.tolerant_compile(r"^%s:(cu\d+)-weg2-(.+?)-27b-nf(-flat)?$" % N.name_match_rx())
+# make_flat_ctx.sh TAG/TAG2: "no flliper/pdflip/htsglang/27b-nf in a tag").
+RE_IMAGE = N.tolerant_compile(r"^%s:(cu\d+)-pdflip-(.+?)-27b-nf(-flat)?$" % N.name_match_rx())
 RE_IMAGE_FLLIPER_VER = re.compile(r"^flliper:(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+?)?)-(cu\d+)$")
 RE_IMAGE_FLLIPER_SHA = re.compile(r"^flliper:(cu\d+)-([0-9a-f]{10})$")
 RE_ASSIGN = re.compile(r"^(PROFILE_[A-Z_]+)=(\"[^\"]*\"|'[^']*'|[^\s#]*)")
@@ -90,7 +90,7 @@ def list_contexts(ctx_glob: str = CTX_GLOB) -> List[dict]:
 
 
 def parse_images(text: str) -> List[dict]:
-    """``docker images --format '{{.Repository}}:{{.Tag}}\\t{{.ID}}\\t{{.CreatedAt}}'`` -> weg2 images."""
+    """``docker images --format '{{.Repository}}:{{.Tag}}\\t{{.ID}}\\t{{.CreatedAt}}'`` -> pdflip images."""
     out = []
     for ln in text.strip().splitlines():
         parts = ln.split("\t")
@@ -120,7 +120,7 @@ def ctx_for_image(img: dict, contexts: List[dict]) -> Optional[dict]:
     return None
 
 
-class Weg2Lines:
+class PdFlipLines:
     def __init__(self, ssh: List[str], release_profiles: List[str], docker_dir: str = DOCKER_DIR,
                  host_root: str = HOST_ROOT, ctx_glob: str = CTX_GLOB):
         self.ssh = ssh

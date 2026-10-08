@@ -72,7 +72,7 @@ if __name__ == "__main__":  # python _hwprofile_fixture_1006.py <module_path> <c
     hp = importlib.util.module_from_spec(spec)
     sys.modules["hp_old"] = hp
     spec.loader.exec_module(hp)
-    ispec = importlib.util.spec_from_file_location("ci_mod", os.path.join(tree_python, "sglang", "srt", "weg2", "card_identity.py"))
+    ispec = importlib.util.spec_from_file_location("ci_mod", os.path.join(tree_python, "flliper", "srt", "pdflip", "card_identity.py"))
     ci = importlib.util.module_from_spec(ispec)
     sys.modules["ci_mod"] = ci
     ispec.loader.exec_module(ci)

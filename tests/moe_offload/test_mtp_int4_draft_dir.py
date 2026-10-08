@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _ct_config():
-    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
 
@@ -36,7 +36,7 @@ class _Moe(torch.nn.Module):
 
 
 def test_draft_experts_resolve_to_int4_group32_and_dense_layers_stay_unquantized():
-    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    from flliper.srt.layers.quantization.compressed_tensors.schemes import (
         CompressedTensorsWNA16MoE,
     )
 
@@ -58,13 +58,13 @@ def test_draft_experts_resolve_to_int4_group32_and_dense_layers_stay_unquantized
 
 
 def test_draft_namespace_is_packed_not_dense():
-    from sglang.srt.configs.model_config import _draft_checkpoint_is_dense
+    from flliper.srt.configs.model_config import _draft_checkpoint_is_dense
 
     assert _draft_checkpoint_is_dense(DRAFT_DIR) is False
 
 
 def test_index_names_only_the_mtp_namespace_plus_the_shared_vocab_copies():
-    from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+    from flliper.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
 
     idx = json.load(open(os.path.join(DRAFT_DIR, "model.safetensors.index.json")))
     names = list(idx["weight_map"])

@@ -4,13 +4,13 @@
 THE QUESTION THAT HAD NO INSTRUMENT. Boots weg2xsn406 and weg2xsn408 both
 died at their SECOND flip because the kv_cache resume no longer fit:
 
-    D TP1  wake 1 (17:55:41)  WEG2-WAKE-KV-FIRST LATE free=8387 MiB need=6904 MiB
-    D TP1  wake 2 (17:57:21)  WEG2-WAKE-KV-FIRST LATE free=5974 MiB need=6904 MiB
+    D TP1  wake 1 (17:55:41)  PDFLIP-WAKE-KV-FIRST LATE free=8387 MiB need=6904 MiB
+    D TP1  wake 2 (17:57:21)  PDFLIP-WAKE-KV-FIRST LATE free=5974 MiB need=6904 MiB
 
 2413 MiB gone between two wakes of the same rank. This rank's own dormant
-residue accounts for a tenth of it -- `WEG2-SLEEP-RESIDUE` reads
+residue accounts for a tenth of it -- `PDFLIP-SLEEP-RESIDUE` reads
 untagged_live 224 -> 437 MiB and nvml_proc_used 1598 -> 1830 MiB -- and
-nothing in any log said where the rest went, because `WEG2-DC-BREAKDOWN`
+nothing in any log said where the rest went, because `PDFLIP-DC-BREAKDOWN`
 (a) runs only at the SLEEP (`stage=release`) and (b) decomposes only THIS
 pid. The co-resident P group prefills on the same card between D's wakes and
 appeared in no reading at all.
@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.managers.weg2_memory_saver import (
+from flliper.srt.managers.pdflip_memory_saver import (
     DC_CREEP_POSTS,
     dc_breakdown,
     dc_creep,

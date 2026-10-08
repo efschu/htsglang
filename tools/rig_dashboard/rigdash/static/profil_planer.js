@@ -293,7 +293,7 @@
     const base = (dflt || [1, 0.75, 0.5, 0.25]).slice();
     if (rungsText == null || String(rungsText).trim() === "") return { pct: base.map((x) => Math.round(x * 100)), src: "default" };
     const v = String(rungsText).split(",").map((x) => parseFloat(x));
-    if (v.length && v.every((x) => isFinite(x) && x > 0 && x <= 1)) return { pct: v.map((x) => Math.round(x * 100)), src: "SGLANG_WEG2_DUAL_SHARE_RUNGS" };
+    if (v.length && v.every((x) => isFinite(x) && x > 0 && x <= 1)) return { pct: v.map((x) => Math.round(x * 100)), src: "FLLIPER_PDFLIP_DUAL_SHARE_RUNGS" };
     return { pct: base.map((x) => Math.round(x * 100)), src: "default (the RUNGS row is not readable)" };
   }
   function pseudoRow(name, dual, rows, dflt) {
@@ -387,8 +387,8 @@
   }
   const AUSGANG = { geht: ["ok", "The launcher dry run passes without force."], geht_mit_force: ["force", "The dry run only passes with force."], verweigert: ["bad", "The launcher refuses, even with force."],
                     absturz: ["bad", "The launcher dry run crashed (no judgement of the values, force does not change that)."], orakel_fehler: ["bad", "The oracle could not be asked: there is no judgement."],
-                    // single card (no weg2 launcher, AP-F): the judgement is a planner calculation, not a launcher run; there is no force there
-                    passt: ["ok", "Planner estimate: fits (no launcher run, the single card has no weg2 launcher)."], passt_nicht: ["bad", "Planner estimate: does not fit (no launcher run; there is no force for a single card)."],
+                    // single card (no pdflip launcher, AP-F): the judgement is a planner calculation, not a launcher run; there is no force there
+                    passt: ["ok", "Planner estimate: fits (no launcher run, the single card has no pdflip launcher)."], passt_nicht: ["bad", "Planner estimate: does not fit (no launcher run; there is no force for a single card)."],
                     unbelegt: ["", "Planner estimate: not computable (inputs without evidence, see notes)."] };
   function renderProposal(p) {
     if (!p) return "";

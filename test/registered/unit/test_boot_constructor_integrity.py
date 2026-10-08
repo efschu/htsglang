@@ -36,14 +36,14 @@ import ast
 import pathlib
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-_SRT = _REPO_ROOT / "python" / "sglang" / "srt"
+_SRT = _REPO_ROOT / "python" / "flliper" / "srt"
 
 # (source file, class, attributes that MUST still be assigned inside __init__).
 # The attributes are picked from the second half of each constructor -- the

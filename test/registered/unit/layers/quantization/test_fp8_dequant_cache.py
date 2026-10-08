@@ -19,7 +19,7 @@ import unittest.mock
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_utils import (
+from flliper.srt.layers.quantization.fp8_utils import (
     cached_dequant,
     dequant_cache_clear,
     dequant_cache_stats,
@@ -86,10 +86,10 @@ class TestCacheIsByteExact(unittest.TestCase):
 
     def test_cached_equals_uncached_bytes(self):
         with unittest.mock.patch.dict(
-            "os.environ", {"SGLANG_FP8_DEQUANT_CACHE_MIB": _mib(64)}
+            "os.environ", {"FLLIPER_FP8_DEQUANT_CACHE_MIB": _mib(64)}
         ):
             dequant_cache_clear()
-            from sglang.srt.layers.quantization import fp8_utils
+            from flliper.srt.layers.quantization import fp8_utils
 
             fp8_utils._dequant_cache._budget = None  # re-read env
             uncached = self._make()
@@ -103,8 +103,8 @@ class TestCacheIsByteExact(unittest.TestCase):
         with unittest.mock.patch.dict("os.environ", {}, clear=False):
             import os
 
-            os.environ.pop("SGLANG_FP8_DEQUANT_CACHE_MIB", None)
-            from sglang.srt.layers.quantization import fp8_utils
+            os.environ.pop("FLLIPER_FP8_DEQUANT_CACHE_MIB", None)
+            from flliper.srt.layers.quantization import fp8_utils
 
             fp8_utils._dequant_cache._budget = None
             dequant_cache_clear()
@@ -117,7 +117,7 @@ class TestCacheIsByteExact(unittest.TestCase):
 
 class TestCacheInvalidationAndBudget(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.layers.quantization import fp8_utils
+        from flliper.srt.layers.quantization import fp8_utils
 
         self.fp8_utils = fp8_utils
         dequant_cache_clear()

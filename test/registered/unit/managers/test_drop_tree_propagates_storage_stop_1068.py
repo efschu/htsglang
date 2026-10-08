@@ -37,18 +37,18 @@ import unittest
 
 import torch
 
-from sglang.srt.managers import phase_flip_runtime
-from sglang.srt.managers.phase_flip_runtime import drop_prefix_tree_returning_rows
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.managers import phase_flip_runtime
+from flliper.srt.managers.phase_flip_runtime import drop_prefix_tree_returning_rows
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # ~3s: one tiny CPU-only radix tree, no accelerator, no group, no boot.
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")

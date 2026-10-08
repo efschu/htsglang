@@ -12,7 +12,7 @@ import struct
 
 import huggingface_hub
 
-from sglang.srt.planner import model as M
+from flliper.srt.planner import model as M
 
 # Minimal valid GGUF header: magic + version=3 + n_tensors=0 + n_kv=0.
 MINIMAL_GGUF = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)

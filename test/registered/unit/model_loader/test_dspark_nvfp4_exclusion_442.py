@@ -25,9 +25,9 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.modelopt_quant import HybridFp8NvFp4Config
-from sglang.srt.model_loader.loader import _get_quantization_config
+from flliper.srt.layers.quantization.fp8 import Fp8Config
+from flliper.srt.layers.quantization.modelopt_quant import HybridFp8NvFp4Config
+from flliper.srt.model_loader.loader import _get_quantization_config
 
 # One DSpark stage, one NEXTN decoder block, one ordinary target layer. The
 # first two must be excluded from NVFP4, the third must not.
@@ -52,10 +52,10 @@ def _hybrid_nvfp4_quant_config() -> HybridFp8NvFp4Config:
     model_class = types.SimpleNamespace(
         packed_modules_mapping={},
         remap_prefix=None,
-        hf_to_sglang_mapper=None,
+        hf_to_flliper_mapper=None,
     )
 
-    loader = "sglang.srt.model_loader.loader"
+    loader = "flliper.srt.model_loader.loader"
     with (
         mock.patch(
             f"{loader}.get_model_architecture", return_value=(model_class, "arch")
@@ -98,7 +98,7 @@ class TestDsparkNvfp4Exclusion(unittest.TestCase):
     def test_dspark_name_mapping_really_produces_the_stages_prefix(self) -> None:
         """The pattern is only correct if DSpark still emits ``stages.N.*``."""
 
-        from sglang.srt.models.deepseek_v4_dspark import (
+        from flliper.srt.models.deepseek_v4_dspark import (
             DeepseekV4ForCausalLMDSpark,
         )
 

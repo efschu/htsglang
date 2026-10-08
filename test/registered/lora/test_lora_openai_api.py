@@ -8,9 +8,9 @@ that enables OpenAI-compatible LoRA adapter selection.
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import (
+from flliper.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,

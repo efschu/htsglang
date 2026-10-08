@@ -14,18 +14,18 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
-from sglang.srt.managers.scheduler_components import (
+from flliper.srt.environ import envs
+from flliper.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from flliper.srt.managers.scheduler_components import (
     batch_result_processor as brp,
 )
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
+from flliper.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative import accept_profile as ap
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.speculative import accept_profile as ap
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -121,7 +121,7 @@ class TestArithmetic(CustomTestCase):
         self.assertEqual(getattr(req, ap.HEAD_HISTOGRAM_ATTR), [0, 0, 4])
 
     def test_cold_attr_is_the_bootstrap_constant(self):
-        from sglang.srt.managers import phase_flip_draft_bootstrap as pfdb
+        from flliper.srt.managers import phase_flip_draft_bootstrap as pfdb
 
         self.assertEqual(ap.DRAFT_COLD_ATTR, pfdb.COLD_ARMED_ATTR)
 
@@ -131,7 +131,7 @@ class TestProcessorWiring(CustomTestCase):
         proc = _make_processor()
         req = _make_req()
         seq = [0, 1, 3, 3] + [3, 2] * 3
-        with envs.SGLANG_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS.override(4):
+        with envs.FLLIPER_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS.override(4):
             _run_rounds(proc, req, seq)
         self.assertEqual(req.spec_verify_ct, len(seq))
         self.assertEqual(req.spec_correct_drafts_histogram, [1, 1, 3, 5])
@@ -148,7 +148,7 @@ class TestProcessorWiring(CustomTestCase):
     def test_off_switch_keeps_no_head(self):
         proc = _make_processor()
         req = _make_req()
-        with envs.SGLANG_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS.override(0):
+        with envs.FLLIPER_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS.override(0):
             _run_rounds(proc, req, [3, 3])
             self.assertIsNone(ap.log_finished(req))
         self.assertFalse(hasattr(req, ap.HEAD_HISTOGRAM_ATTR))
@@ -172,21 +172,21 @@ class TestProcessorWiring(CustomTestCase):
 
     def test_finish_writes_the_line(self):
         proc = _make_processor()
-        req = _make_req("weg2-2-6")
+        req = _make_req("pdflip-2-6")
         setattr(req, ap.DRAFT_COLD_ATTR, True)
-        with envs.SGLANG_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS.override(2):
+        with envs.FLLIPER_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS.override(2):
             _run_rounds(proc, req, [0, 3, 3, 1])
             with self.assertLogs(ap.logger, level=logging.INFO) as logs:
                 self._finish(proc, req)
         text = "\n".join(logs.output)
-        self.assertIn("SPEC-ACCEPT-PROFILE rid=weg2-2-6 draft_cold=yes prompt=100", text)
+        self.assertIn("SPEC-ACCEPT-PROFILE rid=pdflip-2-6 draft_cold=yes prompt=100", text)
         self.assertIn("head2 rounds=2 accept_length=2.50 hist=[1, 0, 0, 1]", text)
         self.assertIn("rest rounds=2 accept_length=3.00 hist=[0, 1, 0, 1]", text)
 
     def test_no_line_without_verify_rounds(self):
         proc = _make_processor()
         req = _make_req()
-        with envs.SGLANG_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS.override(64):
+        with envs.FLLIPER_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS.override(64):
             with mock.patch.object(ap, "log_finished") as spy:
                 self._finish(proc, req)
         spy.assert_not_called()

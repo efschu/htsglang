@@ -19,8 +19,8 @@ a claim about the work — and reading mode exists to avoid the work.
 
 import unittest
 
-from sglang.srt.translator.session import EventKind, run_conversation
-from sglang.srt.translator.voices import OutputMode, VoicePoolError
+from flliper.srt.translator.session import EventKind, run_conversation
+from flliper.srt.translator.voices import OutputMode, VoicePoolError
 from test_session import (  # noqa: E402  - sibling helper module
     VOICE_A_HZ,
     VOICE_B_HZ,
@@ -171,7 +171,7 @@ class TestSilenceMode(unittest.IsolatedAsyncioTestCase):
     def test_the_two_modes_are_orthogonal(self):
         # Reading mode says WHETHER a session speaks; voice mode says in
         # WHOSE voice. Collapsing them would make "silent" a third voice.
-        from sglang.srt.translator.voices import VoiceMode
+        from flliper.srt.translator.voices import VoiceMode
 
         self.assertNotIn("silent", [m.value for m in VoiceMode])
         self.assertNotIn("clone", [m.value for m in OutputMode])

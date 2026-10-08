@@ -7,7 +7,7 @@ import unittest
 from collections import deque
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from flliper.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -21,12 +21,12 @@ if _HAS_MLX:
     import torch
     from mlx_lm.models.cache import ArraysCache
 
-    import sglang.srt.hardware_backend.mlx.aot as mlx_aot
-    from sglang.srt.hardware_backend.mlx.aot import (
+    import flliper.srt.hardware_backend.mlx.aot as mlx_aot
+    from flliper.srt.hardware_backend.mlx.aot import (
         MlxAOTKernelSet,
         MlxAOTRoPEKernel,
     )
-    from sglang.srt.hardware_backend.mlx.kv_cache import (
+    from flliper.srt.hardware_backend.mlx.kv_cache import (
         BatchedDecodeContext,
         ContiguousAttentionKVCache,
         MlxAttentionKVPool,
@@ -38,23 +38,23 @@ if _HAS_MLX:
         find_attention_layers,
         patch_model_attention,
     )
-    from sglang.srt.hardware_backend.mlx.model_runner import (
+    from flliper.srt.hardware_backend.mlx.model_runner import (
         MlxModelRunner,
         MlxPendingDecode,
     )
-    from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+    from flliper.srt.hardware_backend.mlx.scheduler_mixin import (
         MlxPendingJob,
         SchedulerMlxOverlapMixin,
     )
-    from sglang.srt.managers.scheduler_components import (
+    from flliper.srt.managers.scheduler_components import (
         batch_result_processor as batch_result_processor_module,
     )
-    from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    from flliper.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
     )
-    from sglang.srt.managers.utils import GenerationBatchResult
-    from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
-    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+    from flliper.srt.managers.utils import GenerationBatchResult
+    from flliper.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+    from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
 def _set_runner_cache_layout(
@@ -405,11 +405,11 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(pending.lazy_tokens.tolist(), [8])
 
     def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
-        from sglang.srt.managers import scheduler as scheduler_module
-        from sglang.srt.managers.overlap_utils import RelayPayload
-        from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from flliper.srt.managers import scheduler as scheduler_module
+        from flliper.srt.managers.overlap_utils import RelayPayload
+        from flliper.srt.managers.scheduler import Scheduler
+        from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
+        from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
         scheduler = object.__new__(Scheduler)
         scheduler.device = "cpu"
@@ -1118,7 +1118,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         # (deferred input materialization) before launching the forward.
         # Without resolve_forward_inputs in _launch_fresh, input_ids stays
         # None and async_forward_batch_generation_mlx dereferences a None.
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
         class _StopLoop(Exception):
             pass

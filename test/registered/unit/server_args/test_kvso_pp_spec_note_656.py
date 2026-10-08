@@ -38,8 +38,8 @@ Run:
 
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -115,7 +115,7 @@ class TestTheLadderRungsQuotedAreTheRealOnes(unittest.TestCase):
     def test_the_rung_names_come_from_the_ladder_module(self):
         """A message that names rungs the ladder does not accept sends the
         operator to a flag value that is refused at parse time."""
-        from sglang.srt.managers.phase_flip_spill import (
+        from flliper.srt.managers.phase_flip_spill import (
             DEPTH_NAMES,
             IMPLEMENTED_DEPTH,
         )

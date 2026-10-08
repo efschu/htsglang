@@ -38,16 +38,16 @@ The counts are scaled down (a 40-row pool, 22 shared rows) but the shape and
 the resulting imbalance are the rig's: 22 rows claimed twice.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 #: The rig's shape, scaled. 22 is the exact number of doubly-claimed rows the
 #: arm B crash reported, kept so the fixture is traceable to the specimen.

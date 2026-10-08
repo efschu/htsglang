@@ -31,15 +31,15 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.configs.mamba_utils import (
+from flliper.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
 )
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -244,7 +244,7 @@ class TestServerArgsStaticChecks(_Base):
 
 class TestUnwiredReadersRefuse(_Base):
     def test_intermediate_scatter_refuses_a_missing_intermediate(self):
-        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+        from flliper.srt.layers.attention.mamba.mamba_state_scatter_triton import (
             scatter_mamba_states_after_mtp_verify,
         )
 

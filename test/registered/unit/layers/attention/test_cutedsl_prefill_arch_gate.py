@@ -12,9 +12,9 @@ cases patch -- the range arithmetic under test stays real.
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import CuteDSLGDNKernel
-from sglang.srt.layers.attention.linear.kernels.kda_cutedsl import CuteDSLKDAKernel
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.attention.linear.kernels.gdn_cutedsl import CuteDSLGDNKernel
+from flliper.srt.layers.attention.linear.kernels.kda_cutedsl import CuteDSLKDAKernel
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -33,7 +33,7 @@ class TestCuteDSLPrefillArchitectureGate(unittest.TestCase):
             with (
                 self.subTest(capability=capability),
                 patch(
-                    "sglang.srt.utils.common.get_cuda_capability",
+                    "flliper.srt.utils.common.get_cuda_capability",
                     return_value=capability,
                 ),
             ):
@@ -47,7 +47,7 @@ class TestCuteDSLPrefillArchitectureGate(unittest.TestCase):
         integers never reach a comparison; the gate must treat None as "no".
         """
         with patch(
-            "sglang.srt.utils.common.get_cuda_capability",
+            "flliper.srt.utils.common.get_cuda_capability",
             return_value=None,
         ):
             self.assertFalse(CuteDSLGDNKernel().supports_prefill)

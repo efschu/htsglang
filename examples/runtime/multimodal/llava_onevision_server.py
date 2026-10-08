@@ -1,7 +1,7 @@
 """
 Usage:
 
-python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8
+python3 -m flliper.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8
 
 python3 llava_onevision_server.py
 """
@@ -17,7 +17,7 @@ import pybase64
 import requests
 from PIL import Image
 
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from flliper.srt.utils.video_decoder import VideoDecoderWrapper
 
 # pip install httpx==0.23.3
 # pip install torchcodec

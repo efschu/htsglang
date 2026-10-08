@@ -5,9 +5,9 @@ Log-Parsing als Datenquelle; wo unsere Anbindung nicht passt, machen wir UNSERE 
 Bis die Front und die Ränge ihre Marker selbst nach VictoriaMetrics schreiben (Liste an 27B, 01.10.),
 übersetzt der Probennehmer die IPC, die er ohnehin jede Sekunde liest, in Prometheus-Metriken:
 
-  state.json front       weg2_front_*  (served, served_tokens, arrival_seat.ttft_* , Warteschlange ...)
-  rankstate/*.rankstats  weg2_rank_*   (kumulative Zähler und Pegel je Rang)
-  events.jsonl + Ring    weg2_flip_user_view_ms{def="t2t",dir,part} je Flip zum flip_begin (ipcboot.flip_views)
+  state.json front       pdflip_front_*  (served, served_tokens, arrival_seat.ttft_* , Warteschlange ...)
+  rankstate/*.rankstats  pdflip_rank_*   (kumulative Zähler und Pegel je Rang)
+  events.jsonl + Ring    pdflip_flip_user_view_ms{def="t2t",dir,part} je Flip zum flip_begin (ipcboot.flip_views)
 
 Kein Log wird geöffnet.  Labels: ``model`` (27B|NF), ``boot`` (Kurzform der Boot-ID, ein Wert je Boot),
 ``group``/``rank``/``dir``/``kind`` -- nie eine rid (Nutzer: keine Labels mit hoher Kardinalität).
@@ -81,47 +81,47 @@ def lines_for_boot(ipc: dict, rankstats: Dict[str, dict], model: str, now_ms: in
         out.append("%s%s %s %d" % (name, _lbl(dict(base, **(extra or {}))), repr(x), ts if ts is not None else now_ms))
 
     fr = ipc.get("front") or {}
-    put("weg2_front_up", 0.0 if ipc.get("terminal") else 1.0)
+    put("pdflip_front_up", 0.0 if ipc.get("terminal") else 1.0)
     for g, n in (fr.get("served") or {}).items():
-        put("weg2_front_served_total", n, {"group": g})
+        put("pdflip_front_served_total", n, {"group": g})
     for g, st in (fr.get("served_tokens") or {}).items():
         if isinstance(st, dict):
             for k in ("prompt", "cached", "completion", "n"):
-                put("weg2_front_served_tokens_total", st.get(k), {"group": g, "kind": k})
+                put("pdflip_front_served_tokens_total", st.get(k), {"group": g, "kind": k})
     a = fr.get("arrival_seat") or {}
     # TTFT der Nutzer: Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT, IPC-Zähler)
-    put("weg2_front_ttft_count", a.get("ttft_n"))
-    put("weg2_front_ttft_ms_sum", a.get("ttft_ms_sum"))
-    put("weg2_front_ttft_ms_max", a.get("ttft_ms_max"))
-    put("weg2_front_verdict_count", a.get("verdict_n"))
-    put("weg2_front_verdict_ms_sum", a.get("verdict_ms_sum"))
+    put("pdflip_front_ttft_count", a.get("ttft_n"))
+    put("pdflip_front_ttft_ms_sum", a.get("ttft_ms_sum"))
+    put("pdflip_front_ttft_ms_max", a.get("ttft_ms_max"))
+    put("pdflip_front_verdict_count", a.get("verdict_n"))
+    put("pdflip_front_verdict_ms_sum", a.get("verdict_ms_sum"))
     for k in ("outstanding_n", "d_phase_n", "d_parked_n", "epoch", "oldest_outstanding_age_s"):
-        put("weg2_front_" + k, fr.get(k))
+        put("pdflip_front_" + k, fr.get(k))
     q = fr.get("queue")
-    put("weg2_front_queue", len(q) if isinstance(q, list) else q)
+    put("pdflip_front_queue", len(q) if isinstance(q, list) else q)
     aw = fr.get("awake")
     if aw in ("P", "D"):
         for g in ("P", "D"):
-            put("weg2_front_awake", 1.0 if aw == g else 0.0, {"group": g})
+            put("pdflip_front_awake", 1.0 if aw == g else 0.0, {"group": g})
     for rk, rec in sorted((rankstats or {}).items()):
         g, _, r = rk.partition(".")
         ex = {"group": g, "rank": r or "?"}
         for sec, field, name in RANK_FIELDS:
             blk = rec.get(sec) if isinstance(rec.get(sec), dict) else {}
-            put("weg2_rank_" + name, blk.get(field), ex)
+            put("pdflip_rank_" + name, blk.get(field), ex)
         cache = rec.get("cache") if isinstance(rec.get("cache"), dict) else {}
         for k in ("store_incomplete_delivered", "store_incomplete_deliverable", "mamba_tok"):
-            put("weg2_rank_cache_%s_total" % k, cache.get(k), ex)
+            put("pdflip_rank_cache_%s_total" % k, cache.get(k), ex)
         pf = cache.get("prefetch") if isinstance(cache.get("prefetch"), dict) else {}
         for k, v in pf.items():          # L3 prefetch census (attempted/issued/landed/refused/expired/timeout ...)
-            put("weg2_rank_l3_prefetch_total", v, dict(ex, outcome=k))
+            put("pdflip_rank_l3_prefetch_total", v, dict(ex, outcome=k))
     return out
 
 
 def flip_points(ipc: dict, model: str, since_ts: float) -> Tuple[List[str], float]:
     """Nutzer 02.10.: the front's own small numbers (flip_first_work.flip_time_ms, flip_user_time.flip_user_ms =
-    up to the leg-1 DISPATCH) are no Flipzeit and are no longer pushed -- weg2_flip_time_ms / weg2_flip_user_ms
-    stay empty from this build on.  The Flipzeit is weg2_flip_user_view_ms{def="t2t"} (flip_view_points).
+    up to the leg-1 DISPATCH) are no Flipzeit and are no longer pushed -- pdflip_flip_time_ms / pdflip_flip_user_ms
+    stay empty from this build on.  The Flipzeit is pdflip_flip_user_view_ms{def="t2t"} (flip_view_points).
     Returns no lines; ``newest`` still advances so the caller's bookkeeping stays as it was."""
     newest = since_ts
     for d in list(ipc.get("flip_first_work") or []) + list(ipc.get("flip_user_time") or []):
@@ -193,7 +193,7 @@ class Bridge:
                 for i, (rx, tx) in enumerate(row):
                     for d, v in (("rx", rx), ("tx", tx)):
                         if v is not None:      # KB/s from NVML -> bytes/s
-                            lines.append("weg2_gpu_pcie_bytes_per_second%s %s %d" % (_lbl({"gpu": str(i), "dir": d}), repr(float(v) * 1000.0), int(t * 1000)))
+                            lines.append("pdflip_gpu_pcie_bytes_per_second%s %s %d" % (_lbl({"gpu": str(i), "dir": d}), repr(float(v) * 1000.0), int(t * 1000)))
                 self.pcie_t = max(self.pcie_t, t)
         n = push(lines, self.url)
         self.last = {"t": now, "lines": n, "error": None}
@@ -296,12 +296,12 @@ class VmClient:
 
 #: the first tiles out of VictoriaMetrics (Nutzer-Order 01.10.): TTFT of the users per model, the cards' power
 TILE_QUERIES = {
-    "ttft_mean_5m_ms": ("sum by (model) (increase(weg2_front_ttft_ms_sum[5m])) / "
-                        "sum by (model) (increase(weg2_front_ttft_count[5m]))", "model"),
-    "ttft_n_5m": ("sum by (model) (increase(weg2_front_ttft_count[5m]))", "model"),
+    "ttft_mean_5m_ms": ("sum by (model) (increase(pdflip_front_ttft_ms_sum[5m])) / "
+                        "sum by (model) (increase(pdflip_front_ttft_count[5m]))", "model"),
+    "ttft_n_5m": ("sum by (model) (increase(pdflip_front_ttft_count[5m]))", "model"),
     # instant = only the boots the sampler still pushes (live); a stopped boot goes stale
-    "ttft_mean_boot_ms": ("sum by (model) (weg2_front_ttft_ms_sum) / sum by (model) (weg2_front_ttft_count)", "model"),
-    "ttft_max_boot_ms": ("max by (model) (weg2_front_ttft_ms_max)", "model"),
+    "ttft_mean_boot_ms": ("sum by (model) (pdflip_front_ttft_ms_sum) / sum by (model) (pdflip_front_ttft_count)", "model"),
+    "ttft_max_boot_ms": ("max by (model) (pdflip_front_ttft_ms_max)", "model"),
     "power_sum_w": ("sum(nvidia_smi_power_draw_watts)", ""),
 }
 
@@ -328,8 +328,8 @@ def ttft_series(client: VmClient, model: str, ts: List[int], step: int) -> dict:
     w = max(int(step), 5)
     sel = 'model="%s"' % model
     try:
-        s = client.query_range("sum(increase(weg2_front_ttft_ms_sum{%s}[%ds]))" % (sel, w), ts[0] + step, ts[-1] + step, step)
-        n = client.query_range("sum(increase(weg2_front_ttft_count{%s}[%ds]))" % (sel, w), ts[0] + step, ts[-1] + step, step)
+        s = client.query_range("sum(increase(pdflip_front_ttft_ms_sum{%s}[%ds]))" % (sel, w), ts[0] + step, ts[-1] + step, step)
+        n = client.query_range("sum(increase(pdflip_front_ttft_count{%s}[%ds]))" % (sel, w), ts[0] + step, ts[-1] + step, step)
     except Exception as e:  # noqa: BLE001 -- the chart says so
         return {"mean_ms": [None] * len(ts), "n": [None] * len(ts), "error": "%s: %s" % (type(e).__name__, e)}
     mean, cnt = [], []
@@ -340,7 +340,7 @@ def ttft_series(client: VmClient, model: str, ts: List[int], step: int) -> dict:
         mean.append(ss / nn if ok else None)
         cnt.append(nn if nn is not None and nn >= 0.5 else None)
     return {"mean_ms": mean, "n": cnt, "error": None, "window_s": w,
-            "src": "VictoriaMetrics weg2_front_ttft_* (state.json front.arrival_seat, LEG2-FIRST-CONTENT)"}
+            "src": "VictoriaMetrics pdflip_front_ttft_* (state.json front.arrival_seat, LEG2-FIRST-CONTENT)"}
 
 
 #: VM parts of one flip: total and its complete partition (Summe = total), d_extend only as "davon" of nachlauf;
@@ -355,7 +355,7 @@ VIEW_PARTS = (("total", "total_ms"), ("vorlauf", "vorlauf_ms"), ("layer", "layer
 
 def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -> List[str]:
     """Flipzeit (ipcboot.flip_views, Nutzer 02.10.: letztes Token -> erstes Token, beide Richtungen) als Punkte
-    zum flip_begin: weg2_flip_user_view_ms{def="t2t",dir,part}, part = total | vorlauf | layer | wake_kv_dc |
+    zum flip_begin: pdflip_flip_user_view_ms{def="t2t",dir,part}, part = total | vorlauf | layer | wake_kv_dc |
     nachlauf | rest (die Teile summieren zu total) | d_extend (davon im Nachlauf); D>P dazu leer | halt | park |
     vor_rest (summieren zu vorlauf) | leer_d_prefill (davon in leer).  Das Label def trennt die Reihen von den
     alten (bis 02.10. endete D>P am Leg-1-Dispatch).  Nur gemessene Flips (kind ok), jeder einmal -- ein D>P mit
@@ -372,7 +372,7 @@ def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -
         for part, k in VIEW_PARTS:
             v = x.get(k)
             if v is not None:
-                out.append("weg2_flip_user_view_ms%s %s %d" % (
+                out.append("pdflip_flip_user_view_ms%s %s %d" % (
                     _lbl({"model": model, "boot": boot, "dir": x["dir"], "part": part, "def": "t2t"}), repr(float(v)), ts))
     return out
 
@@ -384,9 +384,9 @@ def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -
 # Prefill: the rank counters, new tokens / compute seconds of the group's slowest rank, over the whole boot.
 
 #: per-boot decode sums -> metric (fields of activity.decode_intervals; seat_s/busy only where the seats are known)
-BOOT_DECODE_FIELDS = (("tok", "weg2_boot_decode_tokens_total"), ("dur", "weg2_boot_decode_seconds_total"),
-                      ("seat_s", "weg2_boot_decode_seat_seconds_total"), ("busy", "weg2_boot_decode_busy_seconds_total"),
-                      ("last_e", "weg2_boot_decode_settled_ts"))
+BOOT_DECODE_FIELDS = (("tok", "pdflip_boot_decode_tokens_total"), ("dur", "pdflip_boot_decode_seconds_total"),
+                      ("seat_s", "pdflip_boot_decode_seat_seconds_total"), ("busy", "pdflip_boot_decode_busy_seconds_total"),
+                      ("last_e", "pdflip_boot_decode_settled_ts"))
 #: below this many new tokens a group's prefill rate is noise (activity.MIN_RATE_TOK)
 BOOT_RATE_MIN_TOK = 1024
 
@@ -436,12 +436,12 @@ def boot_rates_from(series: Dict[Tuple[str, str, str], List[Tuple[float, float]]
         return max((v for _, v in series.get((m, g, r)) or []), default=None)
 
     prefill = {}
-    for g in sorted({g for (m, g, _) in series if m == "weg2_rank_prefill_new_tokens_total"}):
+    for g in sorted({g for (m, g, _) in series if m == "pdflip_rank_prefill_new_tokens_total"}):
         rows = []
         for (m, gg, r) in series:
-            if m != "weg2_rank_prefill_new_tokens_total" or gg != g:
+            if m != "pdflip_rank_prefill_new_tokens_total" or gg != g:
                 continue
-            tok, ms = last(m, g, r), last("weg2_rank_prefill_compute_ms_total", g, r)
+            tok, ms = last(m, g, r), last("pdflip_rank_prefill_compute_ms_total", g, r)
             if tok and ms and tok >= BOOT_RATE_MIN_TOK:
                 rows.append((tok / (ms / 1000.0), tok, ms / 1000.0, r))
         if rows:
@@ -453,20 +453,20 @@ def boot_rates_from(series: Dict[Tuple[str, str, str], List[Tuple[float, float]]
         decode = {"gen_tps_boot": (s["tok"] / s["dur"]) if s["dur"] >= 2.0 else None, "boot_decode_s": s["dur"],
                   "tokens": s["tok"], "seats_boot": (s["seat_s"] / s["busy"]) if s["busy"] else None}
     return {"prefill": prefill, "decode": decode,
-            "src": "VictoriaMetrics: prefill weg2_rank_prefill_* (compute time, slowest rank), "
-                   "decode weg2_boot_decode_* (1-s ring of the sampler, steady intervals, whole boot)"}
+            "src": "VictoriaMetrics: prefill pdflip_rank_prefill_* (compute time, slowest rank), "
+                   "decode pdflip_boot_decode_* (1-s ring of the sampler, steady intervals, whole boot)"}
 
 
 def boot_rates(client: "VmClient", boot_id: str, span_s: int = 12 * 3600) -> dict:
     """boot_rates_from over what VictoriaMetrics holds for one boot (label boot = short_boot)."""
     sel = 'boot="%s"' % short_boot(boot_id)
     series: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = {}
-    names = ["weg2_rank_prefill_new_tokens_total", "weg2_rank_prefill_compute_ms_total"] + [n for _, n in BOOT_DECODE_FIELDS]
+    names = ["pdflip_rank_prefill_new_tokens_total", "pdflip_rank_prefill_compute_ms_total"] + [n for _, n in BOOT_DECODE_FIELDS]
     for m in names:
         for met, pts in client.raw("%s{%s}" % (m, sel), span_s):
             series[(m, met.get("group", ""), met.get("rank", ""))] = pts
     # the Flipzeit of a boot is NOT read from here (Nutzer 06.10.: one computation, flipzeit.py over the history marks;
-    # the Grafana points weg2_flip_user_view_ms stay a view of the same counted flips)
+    # the Grafana points pdflip_flip_user_view_ms stay a view of the same counted flips)
     return boot_rates_from(series)
 
 
@@ -475,8 +475,8 @@ def ttft_last(client: "VmClient", now: Optional[float] = None, span_s: int = 900
     ttft_count; bei genau einer Anfrage im Takt ist es ihr exakter Wert, sonst das Mittel dieser n (gesagt)."""
     import time as _t
     now = now or _t.time()
-    s = client.query_range_by("sum by (model) (weg2_front_ttft_ms_sum)", now - span_s, now, 5, "model")
-    n = client.query_range_by("sum by (model) (weg2_front_ttft_count)", now - span_s, now, 5, "model")
+    s = client.query_range_by("sum by (model) (pdflip_front_ttft_ms_sum)", now - span_s, now, 5, "model")
+    n = client.query_range_by("sum by (model) (pdflip_front_ttft_count)", now - span_s, now, 5, "model")
     out = {}
     for m, cs in n.items():
         ss = s.get(m) or {}
@@ -498,11 +498,11 @@ def pcie_series(client: VmClient, ts: List[int], step: int) -> dict:
     try:
         out = {}
         for d in ("rx", "tx"):
-            got = client.query_range_by("avg by (gpu) (avg_over_time(weg2_gpu_pcie_bytes_per_second{dir=\"%s\"}[%ds])) / 1e9" % (d, w),
+            got = client.query_range_by("avg by (gpu) (avg_over_time(pdflip_gpu_pcie_bytes_per_second{dir=\"%s\"}[%ds])) / 1e9" % (d, w),
                                         ts[0] + step, ts[-1] + step, step, "gpu")
             for g, vals in got.items():
                 out["g%s.%s" % (g, d)] = [vals.get(t + step) for t in ts]
-        return {"series": out, "error": None, "src": "VictoriaMetrics weg2_gpu_pcie_bytes_per_second (NVML at a 1 s cadence)"}
+        return {"series": out, "error": None, "src": "VictoriaMetrics pdflip_gpu_pcie_bytes_per_second (NVML at a 1 s cadence)"}
     except Exception as e:  # noqa: BLE001
         return {"series": {}, "error": "%s: %s" % (type(e).__name__, e)}
 

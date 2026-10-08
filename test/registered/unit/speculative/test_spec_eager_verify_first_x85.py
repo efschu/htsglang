@@ -1,4 +1,4 @@
-"""fnFL2x85 (23.09.): ``SGLANG_SPEC_EAGER_VERIFY=first`` -- every request's
+"""fnFL2x85 (23.09.): ``FLLIPER_SPEC_EAGER_VERIFY=first`` -- every request's
 FIRST verify round runs eager, every later round replays the graph.
 
 Bug regression (x44-x50, Next Flash Form A, D group): the first graph verify
@@ -15,7 +15,7 @@ import os
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.speculative import spec_stage_sync as ss  # noqa: E402
+from flliper.srt.speculative import spec_stage_sync as ss  # noqa: E402
 
 
 def _reset(monkeypatch, value):

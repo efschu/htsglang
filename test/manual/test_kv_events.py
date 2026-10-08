@@ -5,14 +5,14 @@ import requests
 import zmq
 from msgspec.msgpack import Decoder
 
-from sglang.srt.disaggregation.kv_events import (
+from flliper.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
     KVEventBatch,
 )
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -36,7 +36,7 @@ class TestKvEvents(CustomTestCase):
         topic = "kv-events"
         sub.setsockopt_string(zmq.SUBSCRIBE, topic)
 
-        # Launch sglang server
+        # Launch flliper server
         process = popen_launch_server(
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             DEFAULT_URL_FOR_TEST,
@@ -180,7 +180,7 @@ class TestKvEvents(CustomTestCase):
         sub_dp1.connect("tcp://localhost:5558")  # DP rank 1 (offset by rank)
         sub_dp1.setsockopt_string(zmq.SUBSCRIBE, topic)
 
-        # Launch sglang server with DP attention enabled
+        # Launch flliper server with DP attention enabled
         process = popen_launch_server(
             DEFAULT_MLA_MODEL_NAME_FOR_TEST,
             DEFAULT_URL_FOR_TEST,

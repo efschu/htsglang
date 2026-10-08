@@ -5,17 +5,17 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
-from sglang.srt.layers.attention.dsv4.metadata import NonPagedIndexerPlan
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
+from flliper.srt.layers.attention.dsv4.metadata import NonPagedIndexerPlan
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.runtime_context import get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-_INDEXER = "sglang.srt.layers.attention.dsv4.indexer"
+_INDEXER = "flliper.srt.layers.attention.dsv4.indexer"
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
@@ -32,12 +32,12 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             use_prefill_cuda_graph=overrides.get("prefill_graph", False)
         )
         with (
-            envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.override(
+            envs.FLLIPER_OPT_DSV4_NONPAGED_INDEXER.override(
                 overrides.get("enabled", True)
             ),
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            envs.FLLIPER_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.FLLIPER_OPT_USE_AITER_INDEXER.override(False),
+            envs.FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             patch(f"{_INDEXER}.is_cuda", return_value=True),
             patch(f"{_INDEXER}.is_hip", return_value=False),
             get_parallel().override(attn_cp_size=1),
@@ -56,9 +56,9 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             )
 
     def test_eligibility_is_fail_closed(self):
-        self.assertIs(envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.default, True)
+        self.assertIs(envs.FLLIPER_OPT_DSV4_NONPAGED_INDEXER.default, True)
         self.assertEqual(
-            envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.default, 8192
+            envs.FLLIPER_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.default, 8192
         )
         self.assertTrue(self._is_eligible())
         for case in (
@@ -102,7 +102,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 query_rows=query_rows,
             )
 
-        threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
+        threshold = envs.FLLIPER_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
         with threshold.override(threshold.default):
             self.assertIsNone(build_plan())
         with threshold.override(query_rows):
@@ -149,7 +149,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 query_rows=query_rows,
             )
 
-        threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
+        threshold = envs.FLLIPER_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
         with threshold.override(query_rows):
             plan = build_plan()
         self.assertEqual(plan.seq_len_sum, 125_000)
@@ -206,7 +206,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                     can_use_nonpaged_indexer.assert_not_called()
 
         metadata.nonpaged_plan = None
-        threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
+        threshold = envs.FLLIPER_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
         with threshold.override(8193):
             self.assertIsNone(build_plan(8192))
 

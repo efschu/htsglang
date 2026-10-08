@@ -11,16 +11,16 @@ from nextqa import NExTQALoader
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets.common import (
+from flliper.benchmark.datasets.common import (
     SHAREGPT_FILENAME,
     SHAREGPT_REPO_ID,
     gen_prompt,
 )
-from sglang.benchmark.datasets.generated_shared_prefix import get_gen_prefix_cache_path
-from sglang.benchmark.utils import download_and_cache_hf_file
-from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
-from sglang.utils import encode_video_base64
+from flliper.benchmark.datasets.generated_shared_prefix import get_gen_prefix_cache_path
+from flliper.benchmark.utils import download_and_cache_hf_file
+from flliper.lang.chat_template import get_chat_template, get_chat_template_by_model_path
+from flliper.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
+from flliper.utils import encode_video_base64
 
 # type of content fields, can be only prompts or with images/videos
 MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
@@ -272,7 +272,7 @@ def sample_nextqa_requests(
     model_path: str,
     disable_shuffle: bool = False,
     enable_multiturn: bool = True,  # No multiturn support for now
-    backend: str = "sglang-oai",
+    backend: str = "flliper-oai",
     chat_template_name: Optional[str] = None,
     fixed_output_len: Optional[int] = None,
 ) -> SampleOutput:
@@ -314,7 +314,7 @@ def sample_nextqa_requests(
 
             # NOTE: Chat Template is a must for video benchmark because we have to
             # add special image token for later expansion
-            if backend == "sglang" or backend == "sglang-native":
+            if backend == "flliper" or backend == "flliper-native":
                 if "chat_template" in tokenizer.init_kwargs:
                     chat_template = get_chat_template(tokenizer.get_chat_template())
                 elif chat_template_name is not None:

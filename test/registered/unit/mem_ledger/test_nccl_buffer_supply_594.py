@@ -27,13 +27,13 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.mem_ledger.nccl_probe import (
+from flliper.srt.mem_ledger.nccl_probe import (
     SIGNATURE_ENV,
     ingest_dumps,
     load_nccl_buffers,
     write_nccl_dump,
 )
-from sglang.srt.mem_ledger.nccl_transport import CommunicatorGroup, nccl_signature
+from flliper.srt.mem_ledger.nccl_transport import CommunicatorGroup, nccl_signature
 
 UUID_A = "GPU-aaaaaaaa-0000-0000-0000-000000000001"
 UUID_B = "GPU-bbbbbbbb-0000-0000-0000-000000000002"
@@ -167,7 +167,7 @@ class TestCallSiteIsWired(unittest.TestCase):
     def test_parallel_state_brackets_the_constructor(self):
         import inspect
 
-        from sglang.srt.distributed import parallel_state
+        from flliper.srt.distributed import parallel_state
 
         src = inspect.getsource(parallel_state)
         self.assertIn("measure_communicator_init", src)
@@ -179,7 +179,7 @@ class TestCallSiteIsWired(unittest.TestCase):
     def test_demand_inputs_assigns_both_nccl_fields(self):
         import inspect
 
-        from sglang.srt.mem_ledger.engine import DemandInputs
+        from flliper.srt.mem_ledger.engine import DemandInputs
 
         src = inspect.getsource(DemandInputs.from_server_args)
         self.assertIn("nccl_buffer_mib_per_gpu=", src)
@@ -189,7 +189,7 @@ class TestCallSiteIsWired(unittest.TestCase):
         """cuda:0 is not NVML 0 on this rig; the map must go through uuids."""
         import inspect
 
-        from sglang.srt.mem_ledger.engine import DemandInputs
+        from flliper.srt.mem_ledger.engine import DemandInputs
 
         src = inspect.getsource(DemandInputs.from_server_args)
         self.assertIn("card_uuid_by_gpu", src)
@@ -210,7 +210,7 @@ class TestDumpShape(unittest.TestCase):
             self.assertAlmostEqual(payload["total_mib"], 155.5)
 
     def test_unarmed_writes_nothing(self):
-        os.environ.pop("SGLANG_NCCL_BUFFER_DUMP", None)
+        os.environ.pop("FLLIPER_NCCL_BUFFER_DUMP", None)
         self.assertIsNone(
             write_nccl_dump(
                 card_uuid=UUID_A,

@@ -16,8 +16,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc  # noqa: E402
 
 from test_mamba_snapshot_fence_n2_1001 import _controller, _Dev, _Log, _mamba  # noqa: E402
 

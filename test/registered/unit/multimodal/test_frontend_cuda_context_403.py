@@ -9,14 +9,14 @@ Sweep arms D and G died there, in ``image.to(device)``, not in the engine.
 The falsifier below is the same move, hermetically: a stand-in image records
 every ``.to`` target the processor asks for. Post-fix the only target is
 ``cpu``; the two opt-ins that genuinely consume a device-resident feature
-(``--keep-mm-feature-on-device``, ``SGLANG_USE_CUDA_IPC_TRANSPORT``) and the
-explicit ``SGLANG_MM_FRONTEND_GPU_PREPROCESS`` escape hatch still ask for the
+(``--keep-mm-feature-on-device``, ``FLLIPER_USE_CUDA_IPC_TRANSPORT``) and the
+explicit ``FLLIPER_MM_FRONTEND_GPU_PREPROCESS`` escape hatch still ask for the
 card, so the assertion can fail in both directions.
 
 No server, no model, no GPU.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -27,12 +27,12 @@ from unittest import mock
 import torch
 from transformers import BaseImageProcessor
 
-from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.multimodal.processors import base_processor as bp
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.runtime_context import get_context
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.managers.schedule_batch import Modality
+from flliper.srt.multimodal.processors import base_processor as bp
+from flliper.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from flliper.srt.runtime_context import get_context
+from flliper.test.test_utils import CustomTestCase
 
 
 class _RecordingImage:
@@ -149,7 +149,7 @@ class TestFastImageProcessorStaysOffTheCard(CustomTestCase):
         self.assertEqual(to_targets, ["cuda:3"])
 
     def test_env_escape_hatch_restores_the_pre_fix_behavior(self):
-        with envs.SGLANG_MM_FRONTEND_GPU_PREPROCESS.override(True):
+        with envs.FLLIPER_MM_FRONTEND_GPU_PREPROCESS.override(True):
             device, to_targets = _run_processor(base_gpu_id=2)
         self.assertEqual(device, "cuda:2")
         self.assertEqual(to_targets, ["cuda:2"])
@@ -228,7 +228,7 @@ class TestFrontendGpuPolicy(CustomTestCase):
             context._server_args = previous
 
     def test_device_string_carries_the_index_when_allowed(self):
-        with envs.SGLANG_MM_FRONTEND_GPU_PREPROCESS.override(True):
+        with envs.FLLIPER_MM_FRONTEND_GPU_PREPROCESS.override(True):
             self.assertEqual(bp.mm_frontend_device(), "cuda")
             self.assertEqual(bp.mm_frontend_device(4), "cuda:4")
 
@@ -237,20 +237,20 @@ class TestSameClassSitesFollowThePolicy(CustomTestCase):
     """Stichprobenbreite: the other default-on frontend GPU sites."""
 
     def test_step3_gpu_transform_needs_more_than_an_available_card(self):
-        from sglang.srt.multimodal.processors import step3_vl
+        from flliper.srt.multimodal.processors import step3_vl
 
         override = get_context().override_server_args()
         override.install()
         try:
             with mock.patch.object(torch.cuda, "is_available", lambda: True):
                 self.assertFalse(step3_vl._gpu_transform_allowed())
-                with envs.SGLANG_MM_FRONTEND_GPU_PREPROCESS.override(True):
+                with envs.FLLIPER_MM_FRONTEND_GPU_PREPROCESS.override(True):
                     self.assertTrue(step3_vl._gpu_transform_allowed())
         finally:
             override.restore()
 
     def test_kimi_k25_dispatches_to_the_cpu_processor(self):
-        from sglang.srt.multimodal.processors.kimi_k25 import KimiGPUProcessorWrapper
+        from flliper.srt.multimodal.processors.kimi_k25 import KimiGPUProcessorWrapper
 
         wrapper = KimiGPUProcessorWrapper.__new__(KimiGPUProcessorWrapper)
         wrapper._gpu_call = lambda text, images: "gpu"
@@ -261,20 +261,20 @@ class TestSameClassSitesFollowThePolicy(CustomTestCase):
         try:
             with mock.patch.object(torch.cuda, "is_available", lambda: True):
                 self.assertEqual(wrapper(text="hi", images=["img"]), "cpu")
-                with envs.SGLANG_MM_FRONTEND_GPU_PREPROCESS.override(True):
+                with envs.FLLIPER_MM_FRONTEND_GPU_PREPROCESS.override(True):
                     self.assertEqual(wrapper(text="hi", images=["img"]), "gpu")
         finally:
             override.restore()
 
     def test_internvl_tiles_on_cpu_by_default(self):
-        from sglang.srt.multimodal.processors import internvl
+        from flliper.srt.multimodal.processors import internvl
 
         override = get_context().override_server_args()
         override.install()
         try:
             with mock.patch.object(internvl, "get_device", lambda: "cuda"):
                 self.assertEqual(internvl._preprocess_device(), "cpu")
-                with envs.SGLANG_MM_FRONTEND_GPU_PREPROCESS.override(True):
+                with envs.FLLIPER_MM_FRONTEND_GPU_PREPROCESS.override(True):
                     self.assertEqual(internvl._preprocess_device(), "cuda")
             # Non-CUDA accelerators are out of scope and must be left alone.
             with mock.patch.object(internvl, "get_device", lambda: "xpu"):

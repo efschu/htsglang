@@ -4,23 +4,23 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.decode_attention import (
+from flliper.kernels.ops.attention.decode_attention import (
     decode_attention_fwd,
     decode_attention_fwd_grouped,
     decode_attention_fwd_normal,
 )
-from sglang.kernels.ops.attention.extend_attention import (
+from flliper.kernels.ops.attention.extend_attention import (
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
     redundant_attention,
 )
-from sglang.kernels.ops.attention.prefill_attention import (
+from flliper.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
 register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
@@ -320,7 +320,7 @@ class TestTritonAttention(CustomTestCase):
             self._test_extend_attention_once(19, 12331, 12, 4, value)
 
     def test_extend_attention_block_sizes(self):
-        from sglang.kernels.ops.attention import extend_attention as ea
+        from flliper.kernels.ops.attention import extend_attention as ea
 
         if not ea._is_hip:
             self.skipTest("HIP-only block-size selection")

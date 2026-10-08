@@ -35,7 +35,7 @@ import logging
 import unittest
 from unittest import mock
 
-from sglang.srt.managers import phase_flip_seam_census as census
+from flliper.srt.managers import phase_flip_seam_census as census
 
 MIB = 1024 * 1024
 
@@ -134,16 +134,16 @@ class SeamCensusRecognisesTheLaw(unittest.TestCase):
         # The arming floor (1536) belongs to the admission gate and carries a
         # margin ON TOP of the law; reporting a breach against it would cry
         # wolf on every cutover that legally spends its margin.
-        with mock.patch.dict("os.environ", {"SGLANG_CORRIDOR_LAW_FLOOR_MIB": "1024"}):
+        with mock.patch.dict("os.environ", {"FLLIPER_CORRIDOR_LAW_FLOOR_MIB": "1024"}):
             self.assertEqual(census.law_floor_bytes(), 1024 * MIB)
-        with mock.patch.dict("os.environ", {"SGLANG_CORRIDOR_LAW_FLOOR_MIB": "0"}):
+        with mock.patch.dict("os.environ", {"FLLIPER_CORRIDOR_LAW_FLOOR_MIB": "0"}):
             self.assertEqual(census.law_floor_bytes(), 0)
             probe = _probe_sequence((3006, 4000, 2946), (940, 4000, 2946))
             c = census.begin("pp_to_tp", 1, probe=probe)
             census.mark("kv_write")
             self.assertEqual(c.below_law, [])
         # A junk value must not disable the law by accident.
-        with mock.patch.dict("os.environ", {"SGLANG_CORRIDOR_LAW_FLOOR_MIB": "nope"}):
+        with mock.patch.dict("os.environ", {"FLLIPER_CORRIDOR_LAW_FLOOR_MIB": "nope"}):
             self.assertEqual(census.law_floor_bytes(), 1024 * MIB)
 
 
@@ -151,7 +151,7 @@ class ArenaPreemptsTheCrossing(unittest.TestCase):
     """The actuator: spend torch's cache BEFORE the commit that would cross."""
 
     def _backing(self):
-        from sglang.srt.mem_cache import kv_vmm_backing
+        from flliper.srt.mem_cache import kv_vmm_backing
 
         return kv_vmm_backing
 
@@ -228,7 +228,7 @@ class ArenaPreemptsTheCrossing(unittest.TestCase):
     def test_the_preemption_can_be_disabled_and_then_never_fires(self):
         mod = self._backing()
         stub, calls = self._torch_stub(100, 4000, 2946)  # deeply sub-law
-        with mock.patch.dict("os.environ", {"SGLANG_CORRIDOR_LAW_FLOOR_MIB": "0"}):
+        with mock.patch.dict("os.environ", {"FLLIPER_CORRIDOR_LAW_FLOOR_MIB": "0"}):
             with mock.patch.object(mod, "torch", stub):
                 mod._corridor_preempt(24 * MIB, "cuMemCreate", None)
         self.assertEqual(calls["empty_cache"], 0)

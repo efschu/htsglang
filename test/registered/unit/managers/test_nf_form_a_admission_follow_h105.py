@@ -2,16 +2,16 @@
 group's; the expert workers take it, and a split is a named stop.
 
 THE DEATH (dpr, rc12j 3e97ef0c8f, boot dkrnfh91dprbar1dauer09270832, D log
-203833-203988). weg2-14-70 arrived at D with a host-backed hit: KV key match
+203833-203988). pdflip-14-70 arrived at D with a host-backed hit: KV key match
 81856, mamba anchor 75264, uncached 6817. Every rank matched 75264 (#1042),
 every rank passed the X gate ("uncached=6817 ... verdict=admit") and the #794
 group chunk (3712). Then:
 
-* TP1/TP2 built the extend -- ``#969 EXTENT n=68 ... ('weg2-14-', 75264,
+* TP1/TP2 built the extend -- ``#969 EXTENT n=68 ... ('pdflip-14-', 75264,
   78976, 75264, 3712)`` -- and entered the forward;
 * TP0 printed nothing for the rid: no #969, no ``#988 LOADBACK`` (logged
-  unconditionally for every host load-back), no ``WEG2-ARENA-LOAD``, no
-  ``WEG2-LOADBACK-WAIT`` (never printed in the whole boot, and it prints its
+  unconditionally for every host load-back), no ``PDFLIP-ARENA-LOAD``, no
+  ``PDFLIP-LOADBACK-WAIT`` (never printed in the whole boot, and it prints its
   first three). So TP0 left ``add_one_req`` BEFORE ``init_load_back`` -- the
   only rank-local exits there are the ``total_tokens >= rem_total_tokens``
   gates (NO_TOKEN; ``batch_is_full`` then keeps the rid in the queue). The
@@ -41,28 +41,28 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.managers import schedule_policy as sp
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.managers import schedule_policy as sp
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
-#: dpr weg2-14-70 geometry.
+#: dpr pdflip-14-70 geometry.
 FILL = 82081
 HOST_HIT = 75264
 TP0_AVAILABLE = 80000  # below the host's price (82081 + 64 + 1), far above a worker's (6817 + 65)
 
 
-def _isolate_weg2_group(testcase):
+def _isolate_pdflip_group(testcase):
     """These cases price the WHOLE extend (82081 > TP0_AVAILABLE) at the NO_TOKEN
-    gate.  That holds only in a process whose WEG2 group reads as "no chunk
-    admission": ``schedule_policy._weg2_chunk_admit`` / ``_weg2_park_on`` read
-    SGLANG_WEG2_GROUP ONCE and cache the verdict in module globals.  A file that
+    gate.  That holds only in a process whose PDFLIP group reads as "no chunk
+    admission": ``schedule_policy._pdflip_chunk_admit`` / ``_pdflip_park_on`` read
+    FLLIPER_PDFLIP_GROUP ONCE and cache the verdict in module globals.  A file that
     ran earlier in the same pytest process with the group set to P (e.g.
     test_996_fork_cut_second_mint_1001) leaves ``True`` behind; the gate then
     prices the next CHUNK (4096 < 80000), NO_TOKEN falls away and the add is
@@ -71,13 +71,13 @@ def _isolate_weg2_group(testcase):
     env = patch.dict(os.environ)
     env.start()
     testcase.addCleanup(env.stop)
-    os.environ.pop("SGLANG_WEG2_GROUP", None)
-    sp._WEG2_CHUNK_ADMIT = None
-    sp._WEG2_PARK_ON = None
+    os.environ.pop("FLLIPER_PDFLIP_GROUP", None)
+    sp._PDFLIP_CHUNK_ADMIT = None
+    sp._PDFLIP_PARK_ON = None
 
     def _reset():
-        sp._WEG2_CHUNK_ADMIT = None
-        sp._WEG2_PARK_ON = None
+        sp._PDFLIP_CHUNK_ADMIT = None
+        sp._PDFLIP_PARK_ON = None
 
     testcase.addCleanup(_reset)
 
@@ -124,10 +124,10 @@ def _adder(available):
 
 
 def _req(*, device_prefix: int):
-    """weg2-14-70 as a rank sees it at ``add_one_req``: TP0 with the hit on
+    """pdflip-14-70 as a rank sees it at ``add_one_req``: TP0 with the hit on
     the host (0 device rows), a worker with it as device rows."""
     req = MagicMock(spec=Req)
-    req.rid = "weg2-14-70"
+    req.rid = "pdflip-14-70"
     req.priority = 0
     req.prefix_indices = list(range(device_prefix))
     req.full_untruncated_fill_ids = list(range(FILL))
@@ -189,7 +189,7 @@ def _install(adder, sched, tp_rank):
 
 class DprAdmissionIsTheHostsTest(unittest.TestCase):
     def setUp(self):
-        _isolate_weg2_group(self)
+        _isolate_pdflip_group(self)
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     def _run_dpr(self):
@@ -211,7 +211,7 @@ class DprAdmissionIsTheHostsTest(unittest.TestCase):
         self.assertEqual(
             {results[1], results[2]},
             {AddReqResult.NO_TOKEN},
-            f"the workers admitted weg2-14-70 ({results[1]}, {results[2]}) while the "
+            f"the workers admitted pdflip-14-70 ({results[1]}, {results[2]}) while the "
             "attention host refused it -- the dpr split: workers in the extend's "
             "collectives, the host in a decode pass",
         )
@@ -251,10 +251,10 @@ class DprAdmissionIsTheHostsTest(unittest.TestCase):
         self.assertTrue(hasattr(m, "form_a_admission_verdict"), "H105 absent")
         with self.assertRaises(m.FormAAdmissionSplit) as cm:
             m.form_a_admission_verdict(
-                "weg2-14-71",
+                "pdflip-14-71",
                 "ADMIT",
                 is_host=False,
-                exchange=lambda p: ("weg2-14-70", "ADMIT", 1, 2),
+                exchange=lambda p: ("pdflip-14-70", "ADMIT", 1, 2),
             )
         self.assertIn("H105 RU FORM-A ADMISSION SPLIT", str(cm.exception))
 
@@ -266,7 +266,7 @@ class DprAdmissionIsTheHostsTest(unittest.TestCase):
         worker = group.scheduler(1)
         self.assertTrue(hasattr(worker, "_form_a_extend_set_riegel"), "H105 absent")
         built = MagicMock()
-        built.rid = "weg2-14-70"
+        built.rid = "pdflip-14-70"
         built.extend_range = SimpleNamespace(start=75264, end=78976)
         with patch.object(m, "form_a_follow_active", return_value=True):
             with patch.object(m, "this_rank_follows", return_value=False):
@@ -281,7 +281,7 @@ class DprAdmissionIsTheHostsTest(unittest.TestCase):
         host, worker = group.scheduler(0), group.scheduler(2)
         self.assertTrue(hasattr(worker, "_form_a_extend_set_riegel"), "H105 absent")
         b = MagicMock()
-        b.rid = "weg2-14-70"
+        b.rid = "pdflip-14-70"
         b.extend_range = SimpleNamespace(start=75264, end=78976)
         with patch.object(m, "form_a_follow_active", return_value=True):
             with patch.object(m, "this_rank_follows", return_value=False):
@@ -340,34 +340,34 @@ class GateCallCountTest(unittest.TestCase):
     stops by NAME at the next broadcast -- never a hang, never a guess."""
 
     def setUp(self):
-        _isolate_weg2_group(self)
+        _isolate_pdflip_group(self)
         self.assertTrue(hasattr(m, "form_a_extend_set_check"), "H105 absent")
 
     def test_worker_skips_the_rid_the_host_gates(self):
-        """The host gates weg2-14-70 then ends its loop; the worker skipped
-        14-70 rank-locally and gates weg2-14-71 -> named SPLIT."""
+        """The host gates pdflip-14-70 then ends its loop; the worker skipped
+        14-70 rank-locally and gates pdflip-14-71 -> named SPLIT."""
         ch = _Channel()
-        m.form_a_admission_verdict("weg2-14-70", "NO_TOKEN", is_host=True, exchange=ch.exchange(0))
+        m.form_a_admission_verdict("pdflip-14-70", "NO_TOKEN", is_host=True, exchange=ch.exchange(0))
         m.form_a_extend_set_check([], is_host=True, exchange=ch.exchange(0))
         with self.assertRaises(m.FormAAdmissionSplit) as cm:
-            m.form_a_admission_verdict("weg2-14-71", "ADMIT", is_host=False, exchange=ch.exchange(1))
+            m.form_a_admission_verdict("pdflip-14-71", "ADMIT", is_host=False, exchange=ch.exchange(1))
         self.assertIn("ADMISSION SPLIT", str(cm.exception))
 
     def test_worker_loop_ends_while_the_host_is_at_a_gate(self):
         """The host made one gate call, the worker none (its loop broke
         earlier): the worker's riegel reads the host's verdict -> named."""
         ch = _Channel()
-        m.form_a_admission_verdict("weg2-14-70", "ADMIT", is_host=True, exchange=ch.exchange(0))
+        m.form_a_admission_verdict("pdflip-14-70", "ADMIT", is_host=True, exchange=ch.exchange(0))
         with self.assertRaises(m.FormAAdmissionSplit) as cm:
             m.form_a_extend_set_check([], is_host=False, exchange=ch.exchange(1))
         self.assertIn("EXTEND-SET MALFORMED", str(cm.exception))
 
-    def test_worker_at_a_gate_while_the_host_is_in_the_riegel(self):
+    def test_worker_at_a_gate_while_the_host_is_in_the_guard(self):
         """The mirror: the host's loop ended, the worker is still at a gate."""
         ch = _Channel()
         m.form_a_extend_set_check([], is_host=True, exchange=ch.exchange(0))
         with self.assertRaises(m.FormAAdmissionSplit) as cm:
-            m.form_a_admission_verdict("weg2-14-70", "ADMIT", is_host=False, exchange=ch.exchange(1))
+            m.form_a_admission_verdict("pdflip-14-70", "ADMIT", is_host=False, exchange=ch.exchange(1))
         self.assertIn("ADMISSION MALFORMED", str(cm.exception))
 
     def test_same_calls_same_stream(self):
@@ -396,7 +396,7 @@ class NoStarvationTest(unittest.TestCase):
     agree in every pass, and the wait is on the log with both prices."""
 
     def setUp(self):
-        _isolate_weg2_group(self)
+        _isolate_pdflip_group(self)
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         m._ADMISSION_WAIT.clear() if hasattr(m, "_ADMISSION_WAIT") else None
 
@@ -422,14 +422,14 @@ class NoStarvationTest(unittest.TestCase):
             self.assertNotEqual(n3[r][0], AddReqResult.NO_TOKEN, r)
             self.assertEqual(len(n3[r][1].can_run_list), 1, r)
         text = "\n".join(logs.output)
-        self.assertIn("H105 RU FORM-A ADMISSION WAIT rid=weg2-14-70 host=NO_TOKEN", text)
+        self.assertIn("H105 RU FORM-A ADMISSION WAIT rid=pdflip-14-70 host=NO_TOKEN", text)
         # both prices on the line: the host's full span, the worker's uncached rest
         self.assertIn(f"host_price={FILL + 64 + 1}", text)
         self.assertIn(f"local_price={FILL - HOST_HIT + 64 + 1}", text)
         self.assertIn("refusals=2", text)
         # both worker ranks share this test process (and its wait ledger), so
         # the admission line counts their refusals together: 2 passes x 2 ranks
-        self.assertIn("H105 RU FORM-A ADMISSION AFTER-WAIT rid=weg2-14-70 refusals=4", text)
+        self.assertIn("H105 RU FORM-A ADMISSION AFTER-WAIT rid=pdflip-14-70 refusals=4", text)
         self.assertIn("host_budget=200000", text)
 
 

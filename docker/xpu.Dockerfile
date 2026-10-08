@@ -1,4 +1,4 @@
-# docker build -t sglang:xpu -f xpu.Dockerfile --build-arg http_proxy=${http_proxy} --build-arg https_proxy=${https_proxy} --build-arg no_proxy=${no_proxy} --no-cache .
+# docker build -t flliper:xpu -f xpu.Dockerfile --build-arg http_proxy=${http_proxy} --build-arg https_proxy=${https_proxy} --build-arg no_proxy=${no_proxy} --no-cache .
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
 FROM intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04
@@ -46,8 +46,8 @@ RUN  pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors ggu
      pip install --no-cache-dir torch==2.12.0+xpu torchao==0.17.0+xpu torchvision==0.27.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
-    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
-    cd sglang && cd python && \
+    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} flliper && \
+    cd flliper && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33

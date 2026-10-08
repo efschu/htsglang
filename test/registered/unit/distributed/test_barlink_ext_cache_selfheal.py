@@ -13,7 +13,7 @@ one #172b removed from the tvm-ffi cache.
 
 WHY THIS IS NOT THE SAME FIX TWICE
 ----------------------------------
-The mechanics are reused from ``sglang.jit_kernel.cache_health`` (completeness
+The mechanics are reused from ``flliper.jit_kernel.cache_health`` (completeness
 by artifact, host+pid+time build marker with a liveness check so a co-located
 rank's live build is never mistaken for residue, rename-before-delete purge,
 env kill switch, and never failing a boot on cache hygiene). Only the two
@@ -21,7 +21,7 @@ things that genuinely differ are passed in: what the finished artifact is, and
 WHICH entries the sweep may judge.
 
 That second one is the sharp edge here and has no counterpart in #172b: the
-tvm-ffi root belongs to sglang alone, but torch's extensions root is SHARED
+tvm-ffi root belongs to flliper alone, but torch's extensions root is SHARED
 with every other cpp_extension on the machine. A half-built entry there may be
 another extension's live business. So the sweep is scoped by name to
 ``barlink_device_ext*``, and the tests below pin that a foreign wreck survives
@@ -36,7 +36,7 @@ WHAT IS PINNED
  3. A complete entry (its ``.so`` is present) is never touched -- 150 s of
     nvcc is not thrown away on every boot.
  4. A co-located peer's live build directory is never touched.
- 5. The kill switch ``SGLANG_EXT_CACHE_SELFHEAL=0`` disables the sweep.
+ 5. The kill switch ``FLLIPER_EXT_CACHE_SELFHEAL=0`` disables the sweep.
  6. Cache hygiene NEVER fails a boot: if the sweep itself raises, the build
     still runs.
  7. The build is wrapped in the build marker, so the next process can tell
@@ -55,16 +55,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
-from sglang.jit_kernel.cache_health import (  # noqa: E402
+from flliper.jit_kernel.cache_health import (  # noqa: E402
     MARKER_BUILDING,
     sweep_cache_root,
 )
-from sglang.srt.distributed.device_communicators import barlink_device as hd  # noqa: E402
+from flliper.srt.distributed.device_communicators import barlink_device as hd  # noqa: E402
 
 #: What the stubbed arch resolution reports, and the entry name it implies.
 _ARCHES = {"cuda": ["8.6", "12.0"]}
@@ -216,18 +216,18 @@ class BarlinkExtCacheSelfHealTest(CustomTestCase):
             root = Path(tmp)
             _residue(root / _NAME)
 
-            seen, _, _ = self._load(root, env={"SGLANG_EXT_CACHE_SELFHEAL": "0"})
+            seen, _, _ = self._load(root, env={"FLLIPER_EXT_CACHE_SELFHEAL": "0"})
 
             self.assertIn(
                 "main.o",
                 seen,
-                "SGLANG_EXT_CACHE_SELFHEAL=0 did not disable the sweep",
+                "FLLIPER_EXT_CACHE_SELFHEAL=0 did not disable the sweep",
             )
 
     # ------------------------------------------------------------------- 6
 
     def test_cache_hygiene_never_fails_a_boot(self):
-        from sglang.jit_kernel import cache_health
+        from flliper.jit_kernel import cache_health
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

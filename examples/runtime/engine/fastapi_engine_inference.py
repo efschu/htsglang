@@ -1,5 +1,5 @@
 """
-FastAPI server example for text generation using SGLang Engine and demonstrating client usage.
+FastAPI server example for text generation using fLLiper Engine and demonstrating client usage.
 
 Starts the server, sends requests to it, and prints responses.
 
@@ -15,8 +15,8 @@ from contextlib import asynccontextmanager
 import requests
 from fastapi import FastAPI, Request
 
-import sglang as sgl
-from sglang.utils import terminate_process
+import flliper as sgl
+from flliper.utils import terminate_process
 
 engine = None
 
@@ -24,20 +24,20 @@ engine = None
 # Use FastAPI's lifespan manager to initialize/shutdown the engine
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manages SGLang engine initialization during server startup."""
+    """Manages fLLiper engine initialization during server startup."""
     global engine
-    # Initialize the SGLang engine when the server starts
+    # Initialize the fLLiper engine when the server starts
     # Adjust model_path and other engine arguments as needed
-    print("Loading SGLang engine...")
+    print("Loading fLLiper engine...")
     engine = sgl.Engine(
         model_path=os.getenv("MODEL_PATH"), tp_size=int(os.getenv("TP_SIZE"))
     )
-    print("SGLang engine loaded.")
+    print("fLLiper engine loaded.")
     yield
     # Clean up engine resources when the server stops (optional, depends on engine needs)
-    print("Shutting down SGLang engine...")
+    print("Shutting down fLLiper engine...")
     # engine.shutdown() # Or other cleanup if available/necessary
-    print("SGLang engine shutdown.")
+    print("fLLiper engine shutdown.")
 
 
 app = FastAPI(lifespan=lifespan)

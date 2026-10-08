@@ -20,13 +20,13 @@ mkdir -p "$STORE"
 
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$STORE"
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR="$STORE"
 # The 5090 in CUDA device order (checked by the caller against the device name).
 export CUDA_VISIBLE_DEVICES="${HANDOVER_CVD_5090:-0}"
 
 cd "$WT"
-setsid "$VENV/bin/python" -m sglang.launch_server \
+setsid "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$GGUF" \
   --tokenizer-path "$GGUF_DIR" \
   --load-format gguf --quantization gguf \

@@ -35,17 +35,17 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache import pool_host as _ph  # noqa: F401
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import (
+from flliper.srt.mem_cache import pool_host as _ph  # noqa: F401
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import (
     CanonicalPageWindow,
     owner_row_window,
     owner_token_runs,
 )
-from sglang.srt.mem_cache.pool_host import arena_lane_dma as ld
-from sglang.srt.mem_cache.pool_host import arena_pool as ap
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool, owner_page_tokens
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.mem_cache.pool_host import arena_lane_dma as ld
+from flliper.srt.mem_cache.pool_host import arena_pool as ap
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool, owner_page_tokens
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -136,8 +136,8 @@ def _expect_from_arena(pool, dev, host, dev_rows):
 
 
 def _marker_bytes(caplog):
-    lines = [r.getMessage() for r in caplog.records if "WEG2-ARENA-PAGE-LOAD" in r.getMessage()]
-    assert lines, "no WEG2-ARENA-PAGE-LOAD marker"
+    lines = [r.getMessage() for r in caplog.records if "PDFLIP-ARENA-PAGE-LOAD" in r.getMessage()]
+    assert lines, "no PDFLIP-ARENA-PAGE-LOAD marker"
     return [int(re.search(r" bytes=(\d+)", x).group(1)) for x in lines], lines
 
 
@@ -148,8 +148,8 @@ def arena(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _dma(monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", "dma")
-    monkeypatch.delenv("SGLANG_WEG2_ARENA_OWNER_LANE_DMA", raising=False)
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE", "dma")
+    monkeypatch.delenv("FLLIPER_PDFLIP_ARENA_OWNER_LANE_DMA", raising=False)
     monkeypatch.setattr(ap, "_PAGE_LOAD_N", 0)
 
 
@@ -246,7 +246,7 @@ def test_loaded_kv_is_byte_equal_to_the_whole_page_path(tmp_path, monkeypatch, o
         host = _owner_rows(w, slots)
         g = torch.Generator().manual_seed(3)
         dev_rows = (torch.randperm(len(host) + 9, generator=g)[:len(host)] + 2).tolist()
-        monkeypatch.setenv("SGLANG_WEG2_ARENA_OWNER_LANE_DMA", lane_dma)
+        monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_OWNER_LANE_DMA", lane_dma)
         if stage_pages is not None:
             monkeypatch.setattr(ap, "lane_stage_pages", lambda **k: stage_pages)
         dev = _load(w, host, dev_rows)
@@ -256,7 +256,7 @@ def test_loaded_kv_is_byte_equal_to_the_whole_page_path(tmp_path, monkeypatch, o
 
 
 def test_switch_off_restores_the_whole_page_bytes(arena, caplog, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_OWNER_LANE_DMA", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_OWNER_LANE_DMA", "0")
     w = _pool(arena, TP1)
     _fill_random(w)
     slots = [5, 6, 7]
@@ -307,7 +307,7 @@ def test_a_refused_copy_falls_back_to_whole_pages_for_the_rest(arena, monkeypatc
     _expect_from_arena(w, dev, host, dev_rows)
     assert w._lane_dma_off is True
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("WEG2-ARENA-LANE-DMA failed after 4 of 7 pages" in x for x in msgs), msgs
+    assert any("PDFLIP-ARENA-LANE-DMA failed after 4 of 7 pages" in x for x in msgs), msgs
     got, _ = _marker_bytes(caplog)
     assert got == [3 * PAGE]                   # the rest, as whole pages
     # the next load stays on whole pages
@@ -328,7 +328,7 @@ def test_a_lane_set_without_the_row_form_loads_whole_pages(arena, caplog):
         dev = _load(w, host, list(range(len(host))))
     got, _ = _marker_bytes(caplog)
     assert got == [len(slots) * PAGE]
-    assert any("WEG2-ARENA-LANE-DMA off" in r.getMessage() for r in caplog.records)
+    assert any("PDFLIP-ARENA-LANE-DMA off" in r.getMessage() for r in caplog.records)
     _expect_from_arena(w, dev, host, list(range(len(host))))
 
 

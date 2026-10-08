@@ -62,16 +62,16 @@ import unittest
 import unittest.mock
 from types import SimpleNamespace
 
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     PhaseFlipRuntime,
     controller_device_queue_depth,
     parse_gate_heartbeat,
     stale_gate_zero_streak,
 )
-from sglang.srt.mem_cache import hicache_phase_guard
-from sglang.srt.mem_cache.hicache_flip_writeback import FlipWritebackReport
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache import hicache_phase_guard
+from flliper.srt.mem_cache.hicache_flip_writeback import FlipWritebackReport
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5)
 
@@ -237,7 +237,7 @@ def _census_line(running_mbs):
     stub._census_owner_probe = lambda *a, **k: None
     stub._pool_census = PhaseFlipRuntime._pool_census.__get__(stub, SimpleNamespace)
 
-    logger = logging.getLogger("sglang.srt.managers.phase_flip_runtime")
+    logger = logging.getLogger("flliper.srt.managers.phase_flip_runtime")
     with unittest.mock.patch.object(logger, "warning") as warn:
         stub._pool_census("at-arm", "pp_to_tp")
     assert warn.called, "the census must always emit"
@@ -303,7 +303,7 @@ class TestSeamRefusalSentinel(CustomTestCase):
         in and printed them beside `refused_silently` -- the #1205 defect
         class, committed inside the #1205 fix.
         """
-        from sglang.srt.mem_cache import hicache_flip_writeback as hfw
+        from flliper.srt.mem_cache import hicache_flip_writeback as hfw
 
         hicache_phase_guard.reset_seam_refusals()
         runtime = _Runtime(hicache_seam_active=True, phase="pp")

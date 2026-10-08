@@ -1,6 +1,6 @@
 """
 Usage:
-python -m sglang.launch_server --model meta-llama/Llama-2-7b-hf --port 30000
+python -m flliper.launch_server --model meta-llama/Llama-2-7b-hf --port 30000
 python vertex_predict.py
 
 This example shows the request and response formats of the prediction route for

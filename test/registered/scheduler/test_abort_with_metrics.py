@@ -14,9 +14,9 @@ import unittest
 
 from starlette.requests import Request
 
-from sglang.srt.utils.http_middleware_patch import _PureASGIDispatch
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils.http_middleware_patch import _PureASGIDispatch
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")

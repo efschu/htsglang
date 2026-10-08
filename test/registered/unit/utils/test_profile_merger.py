@@ -13,14 +13,14 @@ import shutil
 import tempfile
 import unittest
 
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
-from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.test.ci.ci_register import (
+from flliper.srt.managers.io_struct import ProfileReq, ProfileReqType
+from flliper.srt.utils.profile_merger import ProfileMerger
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
@@ -161,7 +161,7 @@ class TestProfileMerger(CustomTestCase):
         # Test file ordering by capturing log messages
         import logging
 
-        logger = logging.getLogger("sglang.srt.utils.profile_merger")
+        logger = logging.getLogger("flliper.srt.utils.profile_merger")
         with self.assertLogs(logger, level="INFO") as log_capture:
             merged_path = self.merger.merge_chrome_traces()
 

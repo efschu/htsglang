@@ -2,12 +2,12 @@
 compare day-over-day against a rolling baseline.
 
 Env knobs:
-  SGLANG_PRECISION_MODELS         comma-separated model ids (default GLM-5.2-FP8)
-  SGLANG_PRECISION_BASELINE_DIR   local baseline dir
-  SGLANG_PRECISION_DIFF_THRESHOLD per-tensor rel_diff cutoff (default 1e-3)
-  SGLANG_PRECISION_FORCE_UPDATE=1 skip comparison, refresh baseline
-  SGLANG_PRECISION_COMMIT         override sglang sha (7-40 hex) tagged on push
-  SGLANG_PRECISION_HF_REPO        required HF dataset repo for cross-runner
+  FLLIPER_PRECISION_MODELS         comma-separated model ids (default GLM-5.2-FP8)
+  FLLIPER_PRECISION_BASELINE_DIR   local baseline dir
+  FLLIPER_PRECISION_DIFF_THRESHOLD per-tensor rel_diff cutoff (default 1e-3)
+  FLLIPER_PRECISION_FORCE_UPDATE=1 skip comparison, refresh baseline
+  FLLIPER_PRECISION_COMMIT         override flliper sha (7-40 hex) tagged on push
+  FLLIPER_PRECISION_HF_REPO        required HF dataset repo for cross-runner
                                   baseline storage; see precision_baseline_store
 """
 
@@ -30,9 +30,9 @@ from typing import Any, Optional
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
     is_in_ci,
@@ -43,7 +43,7 @@ from sglang.test.test_utils import (
 
 # Soft dep: missing huggingface_hub → import fails loudly in setUpClass.
 try:
-    from sglang.test import precision_baseline_store as _hfs
+    from flliper.test import precision_baseline_store as _hfs
 except Exception:  # pragma: no cover
     _hfs = None
 
@@ -160,7 +160,7 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
 def _get_git_commit() -> str:
-    val = os.environ.get("SGLANG_PRECISION_COMMIT", "").strip()
+    val = os.environ.get("FLLIPER_PRECISION_COMMIT", "").strip()
     if _SHA_RE.match(val):
         return val
     try:
@@ -190,9 +190,9 @@ def _collect_runtime_context() -> dict[str, Any]:
     except Exception:
         pass
     try:
-        import sglang
+        import flliper
 
-        ctx["sglang_version"] = getattr(sglang, "__version__", None)
+        ctx["flliper_version"] = getattr(flliper, "__version__", None)
     except Exception:
         pass
     try:
@@ -302,31 +302,31 @@ class TestNightlyPrecisionRegression(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         models_str = os.environ.get(
-            "SGLANG_PRECISION_MODELS", DEFAULT_MODELS_FOR_NIGHTLY_PRECISION
+            "FLLIPER_PRECISION_MODELS", DEFAULT_MODELS_FOR_NIGHTLY_PRECISION
         )
         cls.models = [
             ModelLaunchSettings(m, tp_size=8) for m in parse_models(models_str)
         ]
         cls.baseline_dir = Path(
             os.environ.get(
-                "SGLANG_PRECISION_BASELINE_DIR", "/tmp/sglang_precision_baselines"
+                "FLLIPER_PRECISION_BASELINE_DIR", "/tmp/flliper_precision_baselines"
             )
         )
         cls.baseline_dir.mkdir(parents=True, exist_ok=True)
         cls.diff_threshold = float(
             os.environ.get(
-                "SGLANG_PRECISION_DIFF_THRESHOLD", str(DEFAULT_DIFF_THRESHOLD)
+                "FLLIPER_PRECISION_DIFF_THRESHOLD", str(DEFAULT_DIFF_THRESHOLD)
             )
         )
-        cls.force_update = os.environ.get("SGLANG_PRECISION_FORCE_UPDATE", "0") == "1"
+        cls.force_update = os.environ.get("FLLIPER_PRECISION_FORCE_UPDATE", "0") == "1"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         if _hfs is None:
             raise RuntimeError(
                 "precision baseline store unavailable: could not import "
-                "sglang.test.precision_baseline_store"
+                "flliper.test.precision_baseline_store"
             )
-        # Raises if SGLANG_PRECISION_HF_REPO is unset — the test requires a
+        # Raises if FLLIPER_PRECISION_HF_REPO is unset — the test requires a
         # remote baseline store, there is no local-only mode.
         cls.hf_cfg = _hfs.HfStoreConfig.from_env()
 
@@ -524,7 +524,7 @@ def _maybe_hf_push(
             "schema_version": SCHEMA_VERSION,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "model": model,
-            "sglang_commit": _get_git_commit(),
+            "flliper_commit": _get_git_commit(),
             "tp_size": model_setup.tp_size,
             "prompt": PROMPT,
             "max_tokens": dump_cfg["max_tokens"],
@@ -547,7 +547,7 @@ def _maybe_hf_push(
         run_path = _hfs.push_run(
             config=hf_cfg,
             model=model,
-            sglang_commit=meta["sglang_commit"],
+            flliper_commit=meta["flliper_commit"],
             today_tensors_dir=tensors_dir,
             meta=meta,
             comparator_report=comparator_report,
@@ -639,7 +639,7 @@ def _run_comparator(
     cmd: list[str] = [
         sys.executable,
         "-m",
-        "sglang.srt.debug_utils.comparator",
+        "flliper.srt.debug_utils.comparator",
         "--baseline-path",
         str(baseline),
         "--target-path",

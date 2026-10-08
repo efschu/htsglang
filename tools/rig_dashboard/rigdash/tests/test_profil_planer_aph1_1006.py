@@ -31,7 +31,7 @@ from rigdash import profil_planer as PL  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(HERE), "static")
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
-WEG2 = os.path.join(REPO_ROOT, "python", "sglang", "srt", "weg2")
+PDFLIP = os.path.join(REPO_ROOT, "python", "flliper", "srt", "pdflip")
 CATALOG = os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json")
 NODE = shutil.which("node") or ("/opt/node-v22.14.0-linux-x64/bin/node" if os.path.exists("/opt/node-v22.14.0-linux-x64/bin/node") else None)
 
@@ -42,7 +42,7 @@ def _catalog():
 
 
 def _src(name):
-    with open(os.path.join(WEG2, name), encoding="utf-8") as fh:
+    with open(os.path.join(PDFLIP, name), encoding="utf-8") as fh:
         return fh.read()
 
 
@@ -82,8 +82,8 @@ class Daten(unittest.TestCase):
         self.assertEqual(PL.ZIELE["seats"], list(P.ProfilEditor.ZIELE_INT["seats"]))
         self.assertEqual(PL.ZIELE["kv_tokens"], list(P.ProfilEditor.ZIELE_INT["kv_tokens"]))
 
-    @unittest.skipUnless(os.path.isfile(os.path.join(WEG2, "dual_green.py")),
-                         "27B launcher line only: the Dual form (weg2/dual_green.py, dual_share.py) does not exist in this tree (measured 07.10. on the NF tree 2e68b3f94b)")
+    @unittest.skipUnless(os.path.isfile(os.path.join(PDFLIP, "dual_green.py")),
+                         "27B launcher line only: the Dual form (pdflip/dual_green.py, dual_share.py) does not exist in this tree (measured 07.10. on the NF tree 2e68b3f94b)")
     def test_dual_defaults_are_in_the_source(self):
         g, s, e, dsh = _src("dual_green.py"), _src("dual_share.py"), None, _src("dual_share.py")
         self.assertIn("((2, 1, 0), (4, 2, 1), (10 ** 9, 3, 2))", g)
@@ -93,10 +93,10 @@ class Daten(unittest.TestCase):
         self.assertIn("starve_age_s: float = 60.0", s)
         self.assertIn("starve_max_rung: int = 1", s)
         self.assertEqual((PL.DUAL["starve_age_default"], PL.DUAL["starve_max_default"]), (60.0, 1))
-        with open(os.path.join(REPO_ROOT, "python", "sglang", "srt", "environ.py"), encoding="utf-8") as fh:
-            self.assertIn("SGLANG_WEG2_DUAL_GRANT_RETRY_MS = EnvInt(0)", fh.read())
+        with open(os.path.join(REPO_ROOT, "python", "flliper", "srt", "environ.py"), encoding="utf-8") as fh:
+            self.assertIn("FLLIPER_PDFLIP_DUAL_GRANT_RETRY_MS = EnvInt(0)", fh.read())
         self.assertEqual(PL.DUAL["retry_default"], 0)
-        self.assertIn('ENV_PREFIX = "SGLANG_WEG2_DUAL_SHARE_"', dsh)
+        self.assertIn('ENV_PREFIX = "FLLIPER_PDFLIP_DUAL_SHARE_"', dsh)
         self.assertIn('g("TABLE")', g)
         self.assertIn('("STARVE_AGE_S", "starve_age_s", float)', s)
         self.assertIn('("STARVE_MAX_RUNG", "starve_max_rung", int)', s)
@@ -124,7 +124,7 @@ class Daten(unittest.TestCase):
             pl = ed.list()["planer"]
             self.assertEqual(pl["schema"], PL.SCHEMA)
             self.assertTrue(pl["oracle"])
-            # the fixture planner tree carries no Dual module (NF line 07.10.: Dual is offered only where weg2/dual_layout_plan.py and dual_green.py exist)
+            # the fixture planner tree carries no Dual module (NF line 07.10.: Dual is offered only where pdflip/dual_layout_plan.py and dual_green.py exist)
             self.assertEqual([f["id"] for f in pl["formen"]], ["einzel", "tp", "flip"])
             self.assertNotIn("dual", pl)
             with mock.patch.object(P, "dual_line_probe", return_value=True):                         # the 27B line: all four forms, as before
@@ -308,7 +308,7 @@ out.none = PX.renderDual([], {}, ctx());
         self.assertIn('value="30"', o["full"])
         self.assertIn('<option value="2" selected>Stage 2 · P at least 50 %</option>', o["full"])
         self.assertIn("all larger", o["full"])                           # Schwelle 10**9
-        self.assertIn('data-gtab="form:SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE"', o["full"])
+        self.assertIn('data-gtab="form:FLLIPER_PDFLIP_DUAL_SHARE_GREEN_TABLE"', o["full"])
         self.assertIn("Stage 3 · P at least 25 % (clamp OFF)", o["full"])
         # ohne Zeilen im Profil: Standard des Codes (2:1:0;4:2:1;10**9:3:2), jede Zeile mit "Standard"-Chip und den Kanten des Katalogs
         self.assertIn('value="60"', o["empty"])
@@ -463,7 +463,7 @@ class ProfilJs(unittest.TestCase):
 class AllVectorsAreFields(unittest.TestCase):
     """Review-Befund 1: auch die positionalen Launcher-Vektoren ausserhalb der Namen A-C (Release-Profile nf*/27b*) bekommen ein Feld je Karte, kein Kommastring."""
 
-    EXTRA = [["--d-foreign-context-mib", "1446,896,894"], ["--d-nontorch-mib", "1981,528,524"], ["SGLANG_WEG2_EXTEND_TRIM_MIB", "1200,0,0"],
+    EXTRA = [["--d-foreign-context-mib", "1446,896,894"], ["--d-nontorch-mib", "1981,528,524"], ["FLLIPER_PDFLIP_EXTEND_TRIM_MIB", "1200,0,0"],
              ["--d-reserve-mib", "100,200,300"], ["--pp-cut-reserve-mib", "10,20,30"]]
 
     @classmethod
@@ -474,7 +474,7 @@ class AllVectorsAreFields(unittest.TestCase):
 
     def test_the_launcher_vectors_are_named_in_the_sections(self):
         names = PL.all_section_names()
-        for n in ("--d-foreign-context-mib", "--d-nontorch-mib", "--d-reserve-mib", "--pp-cut-reserve-mib", "SGLANG_WEG2_L15_MIB", "SGLANG_WEG2_EXTEND_TRIM_MIB"):
+        for n in ("--d-foreign-context-mib", "--d-nontorch-mib", "--d-reserve-mib", "--pp-cut-reserve-mib", "FLLIPER_PDFLIP_L15_MIB", "FLLIPER_PDFLIP_EXTEND_TRIM_MIB"):
             self.assertIn(n, names)
 
     def test_every_vector_is_one_field_per_rank_and_no_comma_text_field(self):
@@ -497,7 +497,7 @@ class OnlyNamedVectorsAreFields(unittest.TestCase):
 
     EXTRA = [["--dual-share-actuators", "green,duty"], ["--cuda-graph-bs", "1,2,4,8"], ["--pp-layer-set", "0-2,4-6,7-9"],
              # Runde 3: vom Launcher aus der Je-Karte-Zaehlung genommen (_TOPOLOGY_VECTOR_FLAGS/-TOKENS): Textfeld, nie "N Einträge, aber M Karten"
-             ["--p-barlink-bar1-window-mib", "24,PP_0=96"], ["--d-reshard-presets", "a:1,b:2"], ["SGLANG_WEG2_L15_MIB", "512,512"]]
+             ["--p-barlink-bar1-window-mib", "24,PP_0=96"], ["--d-reshard-presets", "a:1,b:2"], ["FLLIPER_PDFLIP_L15_MIB", "512,512"]]
 
     @classmethod
     def setUpClass(cls):

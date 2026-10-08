@@ -2,27 +2,27 @@
 set -euo pipefail
 
 # Get version from git tags
-SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
+FLLIPER_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
 # Fetch tags from origin to ensure we have the latest
 if git fetch --tags origin; then
   # Use the shared helper so stable/post releases sort above rc tags.
   VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only || true)
   if [ -n "$VERSION_FROM_TAG" ]; then
-    SGLANG_VERSION="$VERSION_FROM_TAG"
-    echo "Using SGLang version from git tags: $SGLANG_VERSION"
+    FLLIPER_VERSION="$VERSION_FROM_TAG"
+    echo "Using fLLiper version from git tags: $FLLIPER_VERSION"
   else
-    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
+    echo "Warning: No version tags found; using default $FLLIPER_VERSION" >&2
   fi
 else
-  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
+  echo "Warning: Failed to fetch tags from origin; using default $FLLIPER_VERSION" >&2
 fi
 
 
 # Default base tags (can be overridden by command line arguments)
 ROCM_VERSION="rocm700"
-DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
-DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+DEFAULT_MI30X_BASE_TAG="${FLLIPER_VERSION}-${ROCM_VERSION}-mi30x"
+DEFAULT_MI35X_BASE_TAG="${FLLIPER_VERSION}-${ROCM_VERSION}-mi35x"
 LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 
 # Parse command line arguments
@@ -41,8 +41,8 @@ while [[ $# -gt 0 ]]; do
     --gpu-arch) GPU_ARCH_BUILD="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
-      MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
-      MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+      MI30X_BASE_TAG="${FLLIPER_VERSION}-${ROCM_VERSION}-mi30x"
+      MI35X_BASE_TAG="${FLLIPER_VERSION}-${ROCM_VERSION}-mi35x"
       echo "Using ROCm version override: ${ROCM_VERSION}"
       shift 2;;
     -h|--help)
@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
-      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 0."
+      echo "      Mount /home/runner/flliper-data to /sgl-data. Defaults to 0."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -258,7 +258,7 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
     exit 1
   fi
 
-  IMAGE="sglang-ci:${GPU_ARCH_BUILD}-$(date +%Y%m%d)"
+  IMAGE="flliper-ci:${GPU_ARCH_BUILD}-$(date +%Y%m%d)"
   echo "Building Docker image from ${DOCKERFILE} with GPU_ARCH=${GPU_ARCH_BUILD}..."
 
   # Pass full GPU_ARCH (e.g., gfx950-rocm720) - Dockerfile handles stripping suffix
@@ -287,7 +287,7 @@ else
   fi
 fi
 
-CACHE_HOST=/home/runner/sglang-data
+CACHE_HOST=/home/runner/flliper-data
 ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-0}"
 case "${ENABLE_CACHE_HOST,,}" in
   1|true|yes|on|pvc|persistent)
@@ -309,10 +309,10 @@ case "${ENABLE_CACHE_HOST,,}" in
     ;;
 esac
 
-echo "Launching container: ci_sglang"
+echo "Launching container: ci_flliper"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --ulimit nofile=65536:65536 \
-  -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
+  -v "${GITHUB_WORKSPACE:-$PWD}:/flliper-checkout" \
   $CACHE_VOLUME \
   --group-add video \
   --shm-size 32g \
@@ -325,11 +325,11 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
   -e PYTHONPATH="/opt/tilelang:${PYTHONPATH:-}" \
   --security-opt seccomp=unconfined \
-  -w /sglang-checkout \
-  --name ci_sglang \
+  -w /flliper-checkout \
+  --name ci_flliper \
   "${IMAGE}"
 
-docker exec ci_sglang mkdir -p \
+docker exec ci_flliper mkdir -p \
   /sgl-data/hf-cache/hub \
   /sgl-data/pip-cache \
   /sgl-data/miopen-cache \
@@ -338,4 +338,4 @@ docker exec ci_sglang mkdir -p \
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
 # setuptools-scm / vcs_versioning can resolve the package version.
-docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
+docker exec ci_flliper git config --global --add safe.directory /flliper-checkout

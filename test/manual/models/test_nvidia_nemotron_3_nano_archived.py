@@ -7,9 +7,9 @@ Run with `python3 test/manual/models/test_nvidia_nemotron_3_nano_archived.py`.
 
 import unittest
 
-from sglang.srt.utils import is_sm80_supported, is_sm90_supported
-from sglang.test.kits.lm_eval_kit import LMEvalMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.srt.utils import is_sm80_supported, is_sm90_supported
+from flliper.test.kits.lm_eval_kit import LMEvalMixin
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
 
 NEMOTRON_3_NANO_THINKING_ARGS = [
     "--trust-remote-code",

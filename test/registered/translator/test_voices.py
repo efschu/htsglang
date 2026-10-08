@@ -19,18 +19,18 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.backends import (
+from flliper.srt.translator.backends import (
     AudioChunk,
     FakeAsr,
     FakeEmbedder,
     FakeMt,
     FakeTts,
 )
-from sglang.srt.translator.languages import ConversationLanguages, LanguageMatrix
-from sglang.srt.translator.segmenter import SegmenterConfig
-from sglang.srt.translator.session import Journal, TranslatorSession, run_conversation
-from sglang.srt.translator.speakers import SpeakerRegistryConfig
-from sglang.srt.translator.voices import (
+from flliper.srt.translator.languages import ConversationLanguages, LanguageMatrix
+from flliper.srt.translator.segmenter import SegmenterConfig
+from flliper.srt.translator.session import Journal, TranslatorSession, run_conversation
+from flliper.srt.translator.speakers import SpeakerRegistryConfig
+from flliper.srt.translator.voices import (
     F0VoiceClassifier,
     PresetVoice,
     VoiceClass,

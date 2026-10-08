@@ -26,8 +26,8 @@ import json
 
 import pytest
 
-from sglang.srt.planner.pp_cut import LAYER_FAMILY_ATTENTION, LAYER_FAMILY_LINEAR
-from sglang.srt.planner.rung_pool import (
+from flliper.srt.planner.pp_cut import LAYER_FAMILY_ATTENTION, LAYER_FAMILY_LINEAR
+from flliper.srt.planner.rung_pool import (
     PoolContext,
     RungPoolSolution,
     solve_rung_pool,

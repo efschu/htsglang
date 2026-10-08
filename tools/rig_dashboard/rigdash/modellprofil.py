@@ -1,7 +1,7 @@
 """PROFIL-EDITOR S3 (Auftrag 960): Modellprofil am Desk schätzen -- POST Modellpfad, Antwort ``flliper.model/1`` als JSON.
 
-Der Schätzer ``sglang/srt/weg2/model_profile.py`` ist reine Standardbibliothek ("PURE: stdlib only") und wird, wie das Gate des
-Kartenplaners (``kartenplan_gate``), per Dateipfad aus dem ausgelieferten Planer-Baum geladen -- nicht über ``import sglang``, das
+Der Schätzer ``flliper/srt/pdflip/model_profile.py`` ist reine Standardbibliothek ("PURE: stdlib only") und wird, wie das Gate des
+Kartenplaners (``kartenplan_gate``), per Dateipfad aus dem ausgelieferten Planer-Baum geladen -- nicht über ``import flliper``, das
 torch zieht.  Gelesen werden nur ``config.json`` und die Kopfzeilen der Safetensors-/GGUF-Dateien; kein Gewicht, keine GPU, kein
 Launcher.  Der Pfad muss unter einer der Modellwurzeln liegen (``--model-root`` bzw. ``RIGDASH_MODEL_ROOTS``, Standard der
 Modell-Cache des Rigs); Symlinks aus der Wurzel hinaus werden abgewiesen.
@@ -25,7 +25,7 @@ DEFAULT_ROOTS = ("/spinning/llm_stuff/club-3090/models-cache",)
 TREE_CANDIDATES = tuple(kartenplan.TREE_CANDIDATES) + (
     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "python"),
 )
-MODULE_REL = os.path.join("sglang", "srt", "weg2", "model_profile.py")
+MODULE_REL = os.path.join("flliper", "srt", "pdflip", "model_profile.py")
 MAX_PATH = 1024
 KV_DTYPES = (None, "auto", "fp8_e4m3")
 SSM_DTYPES = (None, "float32", "bfloat16")
@@ -101,7 +101,7 @@ class ModelEstimator:
             if self._mod is None:
                 if not self.tree:
                     raise ModellprofilUnavailable(
-                        "no planner tree with sglang/srt/weg2/model_profile.py found (MODELLPROFIL_TREE or KARTENPLAN_TREE)")
+                        "no planner tree with flliper/srt/pdflip/model_profile.py found (MODELLPROFIL_TREE or KARTENPLAN_TREE)")
                 self._mod = _load(os.path.join(self.tree, MODULE_REL))
             return self._mod
 

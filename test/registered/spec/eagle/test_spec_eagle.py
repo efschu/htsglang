@@ -6,17 +6,17 @@ silently alter what this exercises.
 
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.matched_stop_kit import MatchedStopMixin
-from sglang.test.kits.spec_server_kits import (
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.matched_stop_kit import MatchedStopMixin
+from flliper.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecCorrectnessKit,
     SpecFeatureKit,
     SpecLogprobKit,
     SpecPenaltyKit,
 )
-from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
+from flliper.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-small")
 
@@ -31,7 +31,7 @@ _KITS = (
 
 
 class _Core(Eagle3Base):
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    env_overrides = ((envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagle3Overlap(_Core, *_KITS):

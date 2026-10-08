@@ -28,7 +28,7 @@ from . import kartenplan_transport as TR
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kartenplan_data")
 SCHEMA = "kartenplan.record/1"
-#: so viele Karten bietet die Seite an: dieselbe Grenze wie der Planer (weg2/topology.py MAX_CARDS_BAR1 = 8, MIN_CARDS = 2); was dort außerhalb liegt,
+#: so viele Karten bietet die Seite an: dieselbe Grenze wie der Planer (pdflip/topology.py MAX_CARDS_BAR1 = 8, MIN_CARDS = 2); was dort außerhalb liegt,
 #: sagt der Planer selbst als HW-TOPOLOGY ab. test_max_cards_follows_the_planner hält beide Zahlen zusammen.
 MAX_CARDS = 8
 
@@ -38,7 +38,7 @@ def _canonical(obj) -> str:
 
 
 def plan_id_ok(plan: dict) -> bool:
-    """Wie weg2/vram_plan.compute_plan_id: sha256 über den Plan ohne plan_id (Veränderung der Aufzeichnung fällt auf)."""
+    """Wie pdflip/vram_plan.compute_plan_id: sha256 über den Plan ohne plan_id (Veränderung der Aufzeichnung fällt auf)."""
     body = {k: v for k, v in plan.items() if k != "plan_id"}
     return plan.get("plan_id") == "sha256:" + hashlib.sha256(_canonical(body).encode()).hexdigest()
 
@@ -65,7 +65,7 @@ PHASE_LABEL = {"P": "P layout (prefill, PP3)", "D": "D layout (decode, TP3)"}
 
 def _find_tree(explicit: Optional[str] = None) -> Optional[str]:
     for t in (explicit, os.environ.get("KARTENPLAN_TREE"), *TREE_CANDIDATES):
-        if t and os.path.isfile(os.path.join(t, "sglang", "srt", "weg2", "card_identity.py")):
+        if t and os.path.isfile(os.path.join(t, "flliper", "srt", "pdflip", "card_identity.py")):
             return t
     return None
 
@@ -193,13 +193,13 @@ class Kartenplaner:
             if archs:
                 reasons.append({"code": "HW-ARCH", "text": archs[0]["arch"]["message"] + (
                     "  [same message for %d more card(s)]" % (len(archs) - 1) if len(archs) > 1 else ""),
-                    "source": "weg2/card_identity.arch_gate", "cards": [a["nvml_index"] for a in archs]})
+                    "source": "pdflip/card_identity.arch_gate", "cards": [a["nvml_index"] for a in archs]})
             if gate["count"] and gate["count"]["ok"] is False:
-                reasons.append({"code": "HW-COUNT", "text": gate["count"]["message"], "source": "weg2/card_identity.order_cards"})
+                reasons.append({"code": "HW-COUNT", "text": gate["count"]["message"], "source": "pdflip/card_identity.order_cards"})
             if gate["topology"] and not gate["topology"]["ok"]:
-                reasons.append({"code": "HW-TOPOLOGY", "text": gate["topology"]["message"], "source": "weg2/topology.plan_topology"})
+                reasons.append({"code": "HW-TOPOLOGY", "text": gate["topology"]["message"], "source": "pdflip/topology.plan_topology"})
             if gate["calibration"] and not gate["calibration"]["ok"]:
-                reasons.append({"code": "HW-UNCALIBRATED", "text": gate["calibration"]["message"], "source": "weg2/card_identity.uncalibrated_message"})
+                reasons.append({"code": "HW-UNCALIBRATED", "text": gate["calibration"]["message"], "source": "pdflip/card_identity.uncalibrated_message"})
         else:
             reasons.append({"code": "GATE-FEHLT", "text": gate.get("why", "Gate not available"), "source": "kartenplan_gate"})
         if transport["transport"] == "nccl":
@@ -696,8 +696,8 @@ def _docker_run(rec: dict, prof: dict, transport: dict) -> dict:
              "  --gpus all --security-opt apparmor=unconfined -v /sys/devices:/sys/devices --shm-size=%s --ulimit memlock=-1:-1 --init \\" % shm,
              "  -v $MODELS:/spinning/llm_stuff/club-3090/models-cache:ro \\",
              "  -v $ACC/evidence:/var/lib/htsglang/evidence -v $ACC/arb:/var/lib/htsglang/arb -v $ACC/store:/var/lib/htsglang/hicache-weg2 \\",
-             "  -v $ACC/sglang:/root/.cache/sglang -v $ACC/triton:/root/.triton \\",
-             "  -e MODE=weg2 " + " ".join("-e %s=%s" % kv for kv in sorted(pick.items())) + " \\",
+             "  -v $ACC/flliper:/root/.cache/flliper -v $ACC/triton:/root/.triton \\",
+             "  -e MODE=pdflip " + " ".join("-e %s=%s" % kv for kv in sorted(pick.items())) + " \\",
              "  --memory $CAP --memory-swap $CAP --oom-score-adj 500 --device /dev/dmabuf_holder \\"]
     if line == "nf":
         lines.append("  --mount type=tmpfs,dst=/mnt/nf-experts,tmpfs-size=77309411328,tmpfs-mode=1777 \\")

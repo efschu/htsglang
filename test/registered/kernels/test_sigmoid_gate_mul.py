@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci
+from flliper.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=4, suite="jit-kernel-unit-test-amd")
 
@@ -30,7 +30,7 @@ def reference_sigmoid_gate_mul(x, gate):
     ],
 )
 def test_sigmoid_gate_mul_correctness(shape, dtype):
-    from sglang.jit_kernel.triton.sigmoid_gate_mul import sigmoid_gate_mul
+    from flliper.jit_kernel.triton.sigmoid_gate_mul import sigmoid_gate_mul
 
     torch.manual_seed(42)
     x = torch.randn(shape, dtype=dtype, device=DEVICE)
@@ -60,7 +60,7 @@ def test_sigmoid_gate_mul_correctness(shape, dtype):
     ],
 )
 def test_sigmoid_gate_mul_broadcast_correctness(shape, dtype):
-    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+    from flliper.jit_kernel.triton.sigmoid_gate_mul import (
         sigmoid_gate_mul_broadcast,
     )
 
@@ -79,7 +79,7 @@ def test_sigmoid_gate_mul_broadcast_correctness(shape, dtype):
 
 @pytest.mark.parametrize("shape", [(4, 4096), (1, 128)])
 def test_sigmoid_gate_mul_broadcast_does_not_modify_inputs(shape):
-    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+    from flliper.jit_kernel.triton.sigmoid_gate_mul import (
         sigmoid_gate_mul_broadcast,
     )
 
@@ -97,7 +97,7 @@ def test_sigmoid_gate_mul_broadcast_does_not_modify_inputs(shape):
 
 
 def test_sigmoid_gate_mul_broadcast_output_dtype():
-    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+    from flliper.jit_kernel.triton.sigmoid_gate_mul import (
         sigmoid_gate_mul_broadcast,
     )
 
@@ -109,7 +109,7 @@ def test_sigmoid_gate_mul_broadcast_output_dtype():
 
 
 def test_sigmoid_gate_mul_broadcast_contiguous_output():
-    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+    from flliper.jit_kernel.triton.sigmoid_gate_mul import (
         sigmoid_gate_mul_broadcast,
     )
 

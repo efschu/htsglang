@@ -3,7 +3,7 @@
 #
 # Meant to run in a post-job workflow step with `if: always()` so the venv is
 # destroyed even on job failure/cancel. Runner-level safety net: a cron or
-# startup task should also purge stale /tmp/sglang-ci-* directories to catch
+# startup task should also purge stale /tmp/flliper-ci-* directories to catch
 # cancelled or crashed jobs that never reached this cleanup.
 
 # Best-effort cleanup: never fail the job.
@@ -28,7 +28,7 @@ if command -v uv >/dev/null 2>&1; then
     fi
 fi
 
-# Skip entirely when venv mode is disabled — no /tmp/sglang-ci-* dir exists
+# Skip entirely when venv mode is disabled — no /tmp/flliper-ci-* dir exists
 # and there's nothing to sweep. Matches the USE_VENV parsing in
 # ci_install_dependency.sh (accepts 1/true/yes, case-insensitive).
 USE_VENV_RAW="${USE_VENV:-true}"
@@ -42,30 +42,30 @@ esac
 
 # Prefer the path propagated via GITHUB_ENV. Fallback: glob for any venv from
 # this run+job (covers the case where install crashed before exporting the path).
-if [ -n "${SGLANG_CI_VENV_PATH:-}" ] && [ -d "$SGLANG_CI_VENV_PATH" ]; then
-    if rm -rf "$SGLANG_CI_VENV_PATH"; then
-        echo "Cleaned up venv: $SGLANG_CI_VENV_PATH"
+if [ -n "${FLLIPER_CI_VENV_PATH:-}" ] && [ -d "$FLLIPER_CI_VENV_PATH" ]; then
+    if rm -rf "$FLLIPER_CI_VENV_PATH"; then
+        echo "Cleaned up venv: $FLLIPER_CI_VENV_PATH"
     else
-        echo "::warning::Failed to remove $SGLANG_CI_VENV_PATH — runner cron should sweep /tmp/sglang-ci-*"
+        echo "::warning::Failed to remove $FLLIPER_CI_VENV_PATH — runner cron should sweep /tmp/flliper-ci-*"
     fi
 else
     matched=0
-    for venv in /tmp/sglang-ci-${GITHUB_RUN_ID:-unknownrun}-${GITHUB_JOB:-unknownjob}-*; do
+    for venv in /tmp/flliper-ci-${GITHUB_RUN_ID:-unknownrun}-${GITHUB_JOB:-unknownjob}-*; do
         [ -d "$venv" ] || continue
         matched=1
         if rm -rf "$venv"; then
             echo "Cleaned up venv (via glob): $venv"
         else
-            echo "::warning::Failed to remove $venv — runner cron should sweep /tmp/sglang-ci-*"
+            echo "::warning::Failed to remove $venv — runner cron should sweep /tmp/flliper-ci-*"
         fi
     done
     [ "$matched" -eq 0 ] && echo "No venv to clean for run=${GITHUB_RUN_ID:-?} job=${GITHUB_JOB:-?}"
 fi
 
 # Sweep stale venvs from cancelled/crashed jobs that never reached cleanup.
-# Any /tmp/sglang-ci-* dir older than 4 hours is considered orphaned.
+# Any /tmp/flliper-ci-* dir older than 4 hours is considered orphaned.
 stale_count=0
-for venv in /tmp/sglang-ci-*; do
+for venv in /tmp/flliper-ci-*; do
     [ -d "$venv" ] || continue
     if find "$venv" -maxdepth 0 -mmin +240 -print -quit | grep -q .; then
         rm -rf "$venv" && stale_count=$((stale_count + 1))

@@ -34,14 +34,14 @@ import inspect
 import unittest
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed import collective_census as cc  # noqa: E402
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
-from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from flliper.srt.distributed import collective_census as cc  # noqa: E402
+from flliper.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
+from flliper.srt.managers.scheduler import Scheduler  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -147,7 +147,7 @@ class CensusAttributeSurfaceTest(unittest.TestCase):
         with (
             mock.patch.object(cc, "_CENSUS", census),
             mock.patch.multiple(
-                "sglang.srt.managers.scheduler",
+                "flliper.srt.managers.scheduler",
                 _CENSUS=census,
                 _CENSUS_ON=True,
                 _CENSUS_INTERVAL=1,
@@ -181,7 +181,7 @@ class CensusAttributeSurfaceTest(unittest.TestCase):
         obj = mock.Mock()
         del obj.ps  # the exact production failure: no parallel state
         with mock.patch.multiple(
-            "sglang.srt.managers.scheduler",
+            "flliper.srt.managers.scheduler",
             _CENSUS=census,
             _CENSUS_ON=True,
             _CENSUS_INTERVAL=1,

@@ -19,11 +19,11 @@ import numpy as np
 import requests
 from transformers import AutoTokenizer
 
-from sglang.bench_serving import benchmark, set_global_args
-from sglang.benchmark.datasets import DatasetRow
-from sglang.benchmark.datasets.mmmu import sample_mmmu_requests
-from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import (
+from flliper.bench_serving import benchmark, set_global_args
+from flliper.benchmark.datasets import DatasetRow
+from flliper.benchmark.datasets.mmmu import sample_mmmu_requests
+from flliper.srt.server_args import ServerArgs
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     kill_process_tree,
     popen_launch_server,
@@ -55,7 +55,7 @@ class FakeTokenizer:
 def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
     # format: (prompt, input_len, output len). We set input_len as a dummy value 0.
     if is_multimodal:
-        backend = "sglang-oai-chat"
+        backend = "flliper-oai-chat"
         api_url = f"{base_url}/v1/chat/completions"
         input_requests = sample_mmmu_requests(
             num_prompts,
@@ -71,7 +71,7 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
         input_requests: List[DatasetRow] = [
             DatasetRow(p, 0, 512) for p in padded_prompts
         ]
-        backend = "sglang"
+        backend = "flliper"
         api_url = f"{base_url}/generate"
         tokenizer = processor
 
@@ -224,7 +224,7 @@ def main(args, server_args):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
             env={
-                "SGLANG_RECORD_STEP_TIME": "1",
+                "FLLIPER_RECORD_STEP_TIME": "1",
                 **os.environ,
             },
         )

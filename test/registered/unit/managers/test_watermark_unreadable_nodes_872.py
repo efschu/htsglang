@@ -19,7 +19,7 @@ IT IS LIVE, NOT HYPOTHETICAL. ``UnifiedTreeNode`` -- the node type of
 ``.value`` attribute at all, at class or instance level; its payload sits at
 ``component_data[BASE_COMPONENT_TYPE].value``. So the #662 "evict recomputable
 prefix before capping the pool" rung has always freed exactly zero rows on the
-live cache, on every call, without ever saying so. ``SGLANG_KV_RADIX_EVICT_RELIEF``
+live cache, on every call, without ever saying so. ``FLLIPER_KV_RADIX_EVICT_RELIEF``
 defaults to on, so this is the default path, not an experimental one.
 
 THE MODULE MAKES THREE SHAPE ASSUMPTIONS, AND ALL THREE ARE WRONG HERE.
@@ -56,12 +56,12 @@ import inspect
 import re
 import unittest
 
-from sglang.srt.managers import kv_radix_watermark
-from sglang.srt.managers.kv_radix_watermark import (
+from flliper.srt.managers import kv_radix_watermark
+from flliper.srt.managers.kv_radix_watermark import (
     evictable_rows_above,
     tree_ceiling,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _safe_source(cls) -> bool:
@@ -290,9 +290,9 @@ class TestWatermarkUnreadableNodes(CustomTestCase):
 
         found = {}
         for mod_name, cls_name in (
-            ("sglang.srt.mem_cache.unified_radix_cache", "UnifiedTreeNode"),
-            ("sglang.srt.mem_cache.radix_cache", "TreeNode"),
-            ("sglang.srt.mem_cache.mamba_radix_cache", "MambaRadixTreeNode"),
+            ("flliper.srt.mem_cache.unified_radix_cache", "UnifiedTreeNode"),
+            ("flliper.srt.mem_cache.radix_cache", "TreeNode"),
+            ("flliper.srt.mem_cache.mamba_radix_cache", "MambaRadixTreeNode"),
         ):
             try:
                 mod = __import__(mod_name, fromlist=[cls_name])
@@ -333,7 +333,7 @@ class TestWatermarkUnreadableNodes(CustomTestCase):
         read ``component_data``, this assertion is what says so out loud
         instead of leaving the alarm above testing only its own stand-in.
         """
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 
         self.assertFalse(
             hasattr(UnifiedTreeNode, "value"),

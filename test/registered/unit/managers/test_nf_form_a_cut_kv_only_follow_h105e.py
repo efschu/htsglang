@@ -12,19 +12,19 @@ boot_weg2_dkrnfint4h6ablxcbar1dauer10061548_220e3f8b70_1006_154845.D.log
   -- the workers' trees carry no mamba state on the path; TP0
   ``MAMBA-HOST-RESUME ... anchor accepted at depth=16640 on a HOST-backed
   state``;
-* all three ``H98x X-FLOOR-CREDIT rid=weg2-72-531 head=0 store=0 floor=16640
-  total=18729 uncached=2089`` and ``WEG2 X-GATE ... verdict=admit``; the
+* all three ``H98x X-FLOOR-CREDIT rid=pdflip-72-531 head=0 store=0 floor=16640
+  total=18729 uncached=2089`` and ``PDFLIP X-GATE ... verdict=admit``; the
   gathered H105 verdict ADMIT (no H105d refusal: every rank had the room);
-* TP1/TP2: ``#1048 EXTENT STALE rid=weg2-72-531: this rank's stamp asked for
+* TP1/TP2: ``#1048 EXTENT STALE rid=pdflip-72-531: this rank's stamp asked for
   16640 token(s) and its own load-back served 0`` -> ``#988 LOADBACK ...
   prefix moved to 0 ... kv_only=2`` -- no anchor adopted, so H105c's follow
   did not apply and the #1048 arm took 0;
-* TP0: ``H105c FORM-A FOLLOW-ROOM rid=weg2-72-531 kv_tokens=16640 evicted=0
+* TP0: ``H105c FORM-A FOLLOW-ROOM rid=pdflip-72-531 kv_tokens=16640 evicted=0
   available=65536`` -> ``H105c FORM-A FOLLOW LOAD-BACK ... applied=16640`` --
   its first load-back had also served 0 (the group floor refused it, the live
   pool had the room) and it followed;
 * TP1/TP2 riegel: ``FormAAdmissionSplit: H105 RU FORM-A EXTEND-SET SPLIT
-  host=[('weg2-72-531', 16640, 18729)] local=[('weg2-72-531', 0, 2688)]``.
+  host=[('pdflip-72-531', 16640, 18729)] local=[('pdflip-72-531', 0, 2688)]``.
 
 Driven through the REAL ``PrefillAdder.add_one_req``, the REAL
 ``Scheduler._form_a_admission_follow_fn`` with the token cut's gather (three
@@ -43,24 +43,24 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers import schedule_policy as sp
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache import unified_radix_cache as urc
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.managers import schedule_policy as sp
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache import unified_radix_cache as urc
+from flliper.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
-RID = "weg2-72-531"
+RID = "pdflip-72-531"
 EXTENT = 16640  # '#1042 EXTENT ... extent=16640' on TP0/1/2
 TOTAL = 18729  # 'X-FLOOR-CREDIT ... total=18729'
-CHUNK = 2688  # the workers' chunk on the metal: local=[('weg2-72-531', 0, 2688)]
+CHUNK = 2688  # the workers' chunk on the metal: local=[('pdflip-72-531', 0, 2688)]
 AVAILABLE = {0: 65536, 1: 40000, 2: 40000}  # TP0: 'FOLLOW-ROOM ... available=65536'
-TOKEN_CUT = "sglang.srt.rank_role.form_a_token_cut_active"
+TOKEN_CUT = "flliper.srt.rank_role.form_a_token_cut_active"
 
 
 class _Gather:
@@ -115,7 +115,7 @@ def _tree_cache(alloc, *, adopts_anchor):
     tc.swa_evictable_size.return_value = 0
     tc.disable = False
     tc.uniform_avail_floor = None
-    tc._weg2_loadback_no_room = 0
+    tc._pdflip_loadback_no_room = 0
     tc._h105c_follow_room = False
     tc.inc_lock_ref.return_value = IncLockRefResult()
     tc.dec_lock_ref.return_value = DecLockRefResult()
@@ -213,7 +213,7 @@ def _group_gate(*, token_cut=True):
                 out[r] = e
 
         with patch.object(sp, "_pp_load_back_extent", return_value=EXTENT), patch(
-            "sglang.srt.mem_cache.common.release_admission_acquired_mamba_slot"
+            "flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"
         ):
             threads = [threading.Thread(target=_run, args=(r,)) for r in range(3)]
             for t in threads:
@@ -312,8 +312,8 @@ class LoadBackFloorMarkTest(unittest.TestCase):
     def _call(self, t, req):
         with patch.object(urc, "_form_a_load_back_floor", side_effect=lambda tree, f, k, rid=None: f), \
                 patch.object(urc, "_form_a_note_loaded"), \
-                patch("sglang.srt.weg2.pp_slot_fidelity.local_pp_room", return_value=None), \
-                patch("sglang.srt.weg2.pp_slot_fidelity.note_loaded"):
+                patch("flliper.srt.pdflip.pp_slot_fidelity.local_pp_room", return_value=None), \
+                patch("flliper.srt.pdflip.pp_slot_fidelity.note_loaded"):
             return urc.UnifiedRadixCache.load_back(t, MagicMock(), None, req=req)
 
     def test_floor_refusal_marks_the_request(self):

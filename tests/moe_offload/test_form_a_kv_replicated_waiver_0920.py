@@ -7,7 +7,7 @@ import inspect
 
 
 def test_the_refusal_is_waived_when_the_host_owns_every_head():
-    from sglang.srt.models import qwen3_5 as m
+    from flliper.srt.models import qwen3_5 as m
 
     src = inspect.getsource(m)
     i = src.index("TP > num_kv_heads: layer")
@@ -17,14 +17,14 @@ def test_the_refusal_is_waived_when_the_host_owns_every_head():
 
 
 def test_form_a_dense_is_unsharded_is_false_on_a_classic_boot():
-    from sglang.srt.rank_role import form_a_dense_is_unsharded
+    from flliper.srt.rank_role import form_a_dense_is_unsharded
 
     assert form_a_dense_is_unsharded() is False
 
 
 def test_the_flashinfer_backend_waives_the_same_refusal(  # fnFA8 (20.09.)
 ):
-    from sglang.srt.layers.attention import flashinfer_backend as fb
+    from flliper.srt.layers.attention import flashinfer_backend as fb
 
     src = inspect.getsource(fb)
     i = src.index("TP > num_kv_heads requires the uneven-DCP token-sharded KV")

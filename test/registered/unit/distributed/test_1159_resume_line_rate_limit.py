@@ -25,8 +25,8 @@ RED-FIRST: before the fix the emitter logged on every call, so
 
 import unittest
 
-from sglang.srt.distributed.device_communicators import barlink_liveness as bl
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.distributed.device_communicators import barlink_liveness as bl
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -50,7 +50,7 @@ class _Clock:
 class _Window:
     """Stand-in for ``barlink_build_window``: a fixed cap, a named env key."""
 
-    ENV_CAP_S = "SGLANG_BARLINK_BUILD_WINDOW_CAP_S"
+    ENV_CAP_S = "FLLIPER_BARLINK_BUILD_WINDOW_CAP_S"
 
     @staticmethod
     def build_cap_s():
@@ -86,9 +86,9 @@ class TheResumeLineIsRateLimited(unittest.TestCase):
         import sys
         import types
 
-        mod = types.ModuleType("sglang.srt.utils.jit_cold_build")
+        mod = types.ModuleType("flliper.srt.utils.jit_cold_build")
         mod.in_cold_build_window = _JitColdBuild.in_cold_build_window
-        pkg = sys.modules["sglang.srt.utils"]
+        pkg = sys.modules["flliper.srt.utils"]
         self._saved_jit = getattr(pkg, "jit_cold_build", None)
         pkg.jit_cold_build = mod
         self._saved_win = bl_window_get()
@@ -101,7 +101,7 @@ class TheResumeLineIsRateLimited(unittest.TestCase):
     def tearDown(self):
         import sys
 
-        sys.modules["sglang.srt.utils"].jit_cold_build = self._saved_jit
+        sys.modules["flliper.srt.utils"].jit_cold_build = self._saved_jit
         bl_window_set(self._saved_win)
         bl.time.monotonic = self._saved_time
         bl.logger = self._saved_logger
@@ -155,12 +155,12 @@ class TheResumeLineIsRateLimited(unittest.TestCase):
         self.wd.abort_poll_suspended()
         import sys
 
-        sys.modules["sglang.srt.utils"].jit_cold_build.in_cold_build_window = lambda: (
+        sys.modules["flliper.srt.utils"].jit_cold_build.in_cold_build_window = lambda: (
             False
         )
         self.clock.t = 1062.0
         self.wd.abort_poll_suspended()  # window closed -> state reset
-        sys.modules["sglang.srt.utils"].jit_cold_build.in_cold_build_window = lambda: (
+        sys.modules["flliper.srt.utils"].jit_cold_build.in_cold_build_window = lambda: (
             True
         )
         self.clock.t = 1063.0
@@ -175,20 +175,20 @@ _WIN_HOLDER = {}
 
 
 def bl_window_get():
-    import sglang.srt.distributed.device_communicators as pkg
+    import flliper.srt.distributed.device_communicators as pkg
 
     return getattr(pkg, "barlink_build_window", None)
 
 
 def bl_window_set(mod):
-    import sglang.srt.distributed.device_communicators as pkg
+    import flliper.srt.distributed.device_communicators as pkg
 
     if mod is None:
         return
     pkg.barlink_build_window = mod
     import sys
 
-    sys.modules["sglang.srt.distributed.device_communicators.barlink_build_window"] = (
+    sys.modules["flliper.srt.distributed.device_communicators.barlink_build_window"] = (
         mod
     )
 

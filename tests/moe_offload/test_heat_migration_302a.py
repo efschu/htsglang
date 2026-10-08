@@ -27,7 +27,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe.expert_heat_migration import (  # noqa: E402
+from flliper.srt.layers.moe.expert_heat_migration import (  # noqa: E402
     HeatMigrationConfig,
     HeatMigrationStats,
     HeatWindow,
@@ -357,7 +357,7 @@ def test_padding_ids_are_not_counted_as_heat():
 # --------------------------------------------------------------------------- #
 torch = pytest.importorskip("torch")
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     MoEExpertOffloadCache,
     plan_load_time_staging,
 )
@@ -561,19 +561,19 @@ def test_pinned_experts_published_by_the_staging_plan_survive_migration(cpu_pin)
 # 4. refusals
 # --------------------------------------------------------------------------- #
 def test_refused_under_graph_capture():
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     cfg = HeatMigrationConfig(enabled=True)
-    with envs.SGLANG_MOE_OFFLOAD_CUDA_GRAPH.override(True):
-        with pytest.raises(RuntimeError, match="SGLANG_MOE_OFFLOAD_CUDA_GRAPH"):
+    with envs.FLLIPER_MOE_OFFLOAD_CUDA_GRAPH.override(True):
+        with pytest.raises(RuntimeError, match="FLLIPER_MOE_OFFLOAD_CUDA_GRAPH"):
             refuse_heat_migration_under_graph_capture(cfg)
 
 
 def test_not_refused_when_disabled():
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     cfg = HeatMigrationConfig(enabled=False)
-    with envs.SGLANG_MOE_OFFLOAD_CUDA_GRAPH.override(True):
+    with envs.FLLIPER_MOE_OFFLOAD_CUDA_GRAPH.override(True):
         refuse_heat_migration_under_graph_capture(cfg)  # must not raise
 
 
@@ -612,7 +612,7 @@ def test_stats_dict_shape_is_stable():
 
 
 def test_expert_stats_snapshot_carries_the_counters():
-    from sglang.srt.layers.moe.expert_stats import LayerExpertStats
+    from flliper.srt.layers.moe.expert_stats import LayerExpertStats
 
     s = LayerExpertStats(layer_id=3, num_experts=16, resident_count=6)
     assert "heat_migration" not in s.snapshot()
@@ -627,8 +627,8 @@ def test_expert_stats_snapshot_carries_the_counters():
 # --------------------------------------------------------------------------- #
 def _dispatch(rows, hidden_dim=4):
     """A minimal StandardDispatchOutput over CPU tensors."""
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from flliper.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+    from flliper.srt.layers.moe.topk import StandardTopKOutput
 
     T = len(rows)
     K = len(rows[0])
@@ -652,7 +652,7 @@ def _apply_fn(layer):
     so a migration that installed a wrong map, or moved the wrong bytes, shows
     up as a different output rather than as a passing test.
     """
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from flliper.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     def apply(dispatch_output):
         hs = dispatch_output.hidden_states

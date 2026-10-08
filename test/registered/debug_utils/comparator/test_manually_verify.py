@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu", nightly=True)
 
@@ -54,7 +54,7 @@ def _generate_and_publish(
     tmp_path: Path,
     publish_dir: Path,
 ) -> Path:
-    from sglang.srt.debug_utils.comparator.visualizer import (
+    from flliper.srt.debug_utils.comparator.visualizer import (
         generate_comparison_figure,
     )
 
@@ -207,13 +207,13 @@ class TestPerTokenHeatmapManualVerify:
         the left (small diff), bright/hot on the right (large diff). Multiple
         rows for different tensor names. Colorbar shows log10 scale.
         """
-        from sglang.srt.debug_utils.comparator.output_types import (
+        from flliper.srt.debug_utils.comparator.output_types import (
             ComparisonTensorRecord,
         )
-        from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+        from flliper.srt.debug_utils.comparator.per_token_visualizer import (
             generate_per_token_heatmap,
         )
-        from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+        from flliper.srt.debug_utils.comparator.tensor_comparator.comparator import (
             compare_tensor_pair,
         )
 
@@ -251,13 +251,13 @@ class TestPerTokenHeatmapManualVerify:
         Expected: Heatmap shows one bright vertical stripe at the spike position,
         rest is dark/cold.
         """
-        from sglang.srt.debug_utils.comparator.output_types import (
+        from flliper.srt.debug_utils.comparator.output_types import (
             ComparisonTensorRecord,
         )
-        from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+        from flliper.srt.debug_utils.comparator.per_token_visualizer import (
             generate_per_token_heatmap,
         )
-        from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+        from flliper.srt.debug_utils.comparator.tensor_comparator.comparator import (
             compare_tensor_pair,
         )
 

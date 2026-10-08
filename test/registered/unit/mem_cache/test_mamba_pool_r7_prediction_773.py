@@ -27,8 +27,8 @@ Numbers are the standing boot's binding rank (PP0, boot_798_0822_0646):
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 from test_mamba_checkpoint_interval import _FakeServerArgs, _make_mock_runner
 
@@ -47,8 +47,8 @@ PINNED = 24
 
 def _size(pin, reorder_on: bool) -> int:
     """Run the production sizing path and report the pool it installs."""
-    prev = os.environ.get("SGLANG_MAMBA_SLOT_REORDER")
-    os.environ["SGLANG_MAMBA_SLOT_REORDER"] = "1" if reorder_on else "0"
+    prev = os.environ.get("FLLIPER_MAMBA_SLOT_REORDER")
+    os.environ["FLLIPER_MAMBA_SLOT_REORDER"] = "1" if reorder_on else "0"
     try:
         sa = _FakeServerArgs(
             max_running_requests=8,
@@ -71,9 +71,9 @@ def _size(pin, reorder_on: bool) -> int:
         return sa.max_mamba_cache_size
     finally:
         if prev is None:
-            os.environ.pop("SGLANG_MAMBA_SLOT_REORDER", None)
+            os.environ.pop("FLLIPER_MAMBA_SLOT_REORDER", None)
         else:
-            os.environ["SGLANG_MAMBA_SLOT_REORDER"] = prev
+            os.environ["FLLIPER_MAMBA_SLOT_REORDER"] = prev
 
 
 class TestTheDerivedPoolThroughTheRealPath(CustomTestCase):

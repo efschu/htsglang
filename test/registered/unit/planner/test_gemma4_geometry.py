@@ -9,7 +9,7 @@ alone are missing + inconsistent; the weight tensors settle the geometry
 unambiguously. Trusting the scalars would hard-error (missing key) or, if
 defaulted naively to head_count, 4x the KV-cache size.
 """
-import sglang.srt.uneven_perf as U
+import flliper.srt.uneven_perf as U
 
 
 def _meta(head_count_kv=None, with_attn_tensors=True):

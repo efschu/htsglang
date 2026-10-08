@@ -38,9 +38,9 @@ against a fixture that has drifted from the checkpoint being served.
 import os
 import unittest
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
-from sglang.srt.mem_cache.canonical_page_store import resolve_attn_layer_ids
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageError
+from flliper.srt.mem_cache.canonical_page_store import resolve_attn_layer_ids
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 
@@ -73,7 +73,7 @@ class TheRealCheckpointResolvesToItsOwnLayers(unittest.TestCase):
         os.path.isdir(CHECKPOINT), f"deployed checkpoint not present: {CHECKPOINT}"
     )
     def test_the_deployed_hybrid_gives_16_attention_layers(self):
-        from sglang.srt.configs.model_config import ModelConfig
+        from flliper.srt.configs.model_config import ModelConfig
 
         mc = ModelConfig(model_path=CHECKPOINT, trust_remote_code=True)
         # The SWA-scoped list is EMPTY for this model -- that is the trap.
@@ -86,8 +86,8 @@ class TheRealCheckpointResolvesToItsOwnLayers(unittest.TestCase):
     @unittest.skipUnless(os.path.isdir(CHECKPOINT), "deployed checkpoint not present")
     def test_the_last_stage_maps_to_a_contiguous_run(self):
         """The exact failure: layers [51,55,59,63] must be slots [12..16)."""
-        from sglang.srt.configs.model_config import ModelConfig
-        from sglang.srt.mem_cache.canonical_kv_page import attn_layer_index
+        from flliper.srt.configs.model_config import ModelConfig
+        from flliper.srt.mem_cache.canonical_kv_page import attn_layer_index
 
         mc = ModelConfig(model_path=CHECKPOINT, trust_remote_code=True)
         ids = resolve_attn_layer_ids(mc)

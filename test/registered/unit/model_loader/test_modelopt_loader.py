@@ -11,22 +11,22 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization.modelopt_quant import (
+from flliper.srt.configs.device_config import DeviceConfig
+from flliper.srt.configs.load_config import LoadConfig
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from flliper.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from flliper.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
-from sglang.srt.model_loader.loader import ModelOptModelLoader
-from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_loader.loader import ModelOptModelLoader
+from flliper.srt.models.utils import WeightsMapper
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 # Note: PYTHONPATH=python should be set when running tests
 
@@ -75,27 +75,27 @@ class TestModelOptModelLoader(CustomTestCase):
         """Set up test fixtures."""
         # Mock distributed functionality to avoid initialization errors
         self.mock_tp_rank = patch(
-            "sglang.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
+            "flliper.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
             return_value=0,
         )
         self.mock_tp_rank.start()
 
-        self.mock_rank0_log = patch("sglang.srt.model_loader.loader.rank0_log")
+        self.mock_rank0_log = patch("flliper.srt.model_loader.loader.rank0_log")
         self.mock_rank0_log.start()
 
         # Mock logger to avoid issues
-        self.mock_logger = patch("sglang.srt.model_loader.loader.logger")
+        self.mock_logger = patch("flliper.srt.model_loader.loader.logger")
         self.mock_logger.start()
 
         # Mock all distributed functions that might be called
         self.mock_get_tp_group = patch(
-            "sglang.srt.distributed.parallel_state.get_tp_group"
+            "flliper.srt.distributed.parallel_state.get_tp_group"
         )
         self.mock_get_tp_group.start()
 
         # Mock model parallel initialization check
         self.mock_mp_is_initialized = patch(
-            "sglang.srt.distributed.parallel_state.model_parallel_is_initialized",
+            "flliper.srt.distributed.parallel_state.model_parallel_is_initialized",
             return_value=True,
         )
         self.mock_mp_is_initialized.start()
@@ -131,7 +131,7 @@ class TestModelOptModelLoader(CustomTestCase):
         self.mock_get_tp_group.stop()
         self.mock_mp_is_initialized.stop()
 
-    @patch("sglang.srt.model_loader.loader.logger")
+    @patch("flliper.srt.model_loader.loader.logger")
     def test_missing_modelopt_import(self, mock_logger):
         """Test error handling when modelopt library is not available."""
 
@@ -163,9 +163,9 @@ class TestModelOptModelLoader(CustomTestCase):
                     "Please install it to use ModelOpt quantization."
                 )
 
-    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
-    @patch("sglang.srt.model_loader.loader.AutoTokenizer")
-    @patch("sglang.srt.model_loader.loader.logger")
+    @patch("flliper.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
+    @patch("flliper.srt.model_loader.loader.AutoTokenizer")
+    @patch("flliper.srt.model_loader.loader.logger")
     def test_calibration_workflow_integration(self, mock_logger, mock_auto_tokenizer):
         """Test end-to-end calibration workflow integration."""
 
@@ -223,9 +223,9 @@ class TestModelOptModelLoader(CustomTestCase):
                 # Note: We can't easily verify the exact calls due to dynamic imports,
                 # but we can verify the workflow completed successfully
 
-    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
-    @patch("sglang.srt.model_loader.loader.AutoTokenizer")
-    @patch("sglang.srt.model_loader.loader.logger")
+    @patch("flliper.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
+    @patch("flliper.srt.model_loader.loader.AutoTokenizer")
+    @patch("flliper.srt.model_loader.loader.logger")
     def test_quantized_checkpoint_restore(self, mock_logger, mock_auto_tokenizer):
         """Test restoring from a quantized checkpoint."""
 
@@ -314,9 +314,9 @@ class TestModelOptModelLoader(CustomTestCase):
                     # Verify we get the expected model back
                     self.assertEqual(result_model, self.mock_base_model)
 
-    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
-    @patch("sglang.srt.model_loader.loader.AutoTokenizer")
-    @patch("sglang.srt.model_loader.loader.logger")
+    @patch("flliper.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
+    @patch("flliper.srt.model_loader.loader.AutoTokenizer")
+    @patch("flliper.srt.model_loader.loader.logger")
     def test_quantized_checkpoint_save(self, mock_logger, mock_auto_tokenizer):
         """Test saving quantized checkpoint after calibration."""
 
@@ -435,8 +435,8 @@ class TestModelOptModelLoader(CustomTestCase):
 class TestModelOptLoaderIntegration(CustomTestCase):
     """Integration tests for ModelOptModelLoader with Engine API."""
 
-    @patch("sglang.srt.model_loader.loader.get_model_loader")
-    @patch("sglang.srt.entrypoints.engine.Engine.__init__")
+    @patch("flliper.srt.model_loader.loader.get_model_loader")
+    @patch("flliper.srt.entrypoints.engine.Engine.__init__")
     def test_engine_with_modelopt_quant_cli_argument(
         self, mock_engine_init, mock_get_model_loader
     ):
@@ -452,7 +452,7 @@ class TestModelOptLoaderIntegration(CustomTestCase):
         # Test CLI argument parsing
         import argparse
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         # Create parser and add arguments
         parser = argparse.ArgumentParser()
@@ -497,13 +497,13 @@ class TestParseQuantHfConfig(CustomTestCase):
     def setUp(self):
         """Set up a real ModelConfig using TinyLlama (already used elsewhere)."""
         self.mock_tp_rank = patch(
-            "sglang.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
+            "flliper.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
             return_value=0,
         )
         self.mock_tp_rank.start()
 
         self.mock_mp_is_initialized = patch(
-            "sglang.srt.distributed.parallel_state.model_parallel_is_initialized",
+            "flliper.srt.distributed.parallel_state.model_parallel_is_initialized",
             return_value=True,
         )
         self.mock_mp_is_initialized.start()
@@ -599,7 +599,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         )
 
     @patch(
-        "sglang.srt.layers.quantization.modelopt_quant.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
+        "flliper.srt.layers.quantization.modelopt_quant.envs.FLLIPER_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
         return_value=True,
     )
     def test_explicit_nvfp4_per_token_activation_false_overrides_env(self, _):

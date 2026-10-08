@@ -4,18 +4,18 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.axis_aligner import (
+from flliper.srt.debug_utils.comparator.aligner.axis_aligner import (
     AxisAlignerPlan,
     compute_axis_aligner_plan,
     execute_axis_aligner_plan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import (
+from flliper.srt.debug_utils.comparator.dims_spec import (
     apply_dim_names,
     without_dim_names,
 )
-from sglang.srt.debug_utils.comparator.log_sink import log_sink
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.log_sink import log_sink
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
@@ -445,7 +445,7 @@ class TestSeqTokenEquivalencePlan:
     """Tests for s≡t dimension name equivalence in compute_axis_aligner_plan."""
 
     def test_s_t_equivalence_squeeze(self) -> None:
-        """sglang 't h' vs megatron 's 1 h': plan squeezes y-side singleton, x-side no-op."""
+        """flliper 't h' vs megatron 's 1 h': plan squeezes y-side singleton, x-side no-op."""
         result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
             Pair(x="t h", y="s 1 h")
         )

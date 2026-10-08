@@ -1,11 +1,11 @@
-"""SGLANG_GRAPH_EAGER_CHECK (19.09. diagnosis tap): hook selection and the comparison."""
+"""FLLIPER_GRAPH_EAGER_CHECK (19.09. diagnosis tap): hook selection and the comparison."""
 import os
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.model_executor import graph_eager_check as gec
+from flliper.srt.model_executor import graph_eager_check as gec
 
 
 class _Stack(torch.nn.Module):

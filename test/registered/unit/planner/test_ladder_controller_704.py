@@ -14,9 +14,9 @@ Hermetic: pure arithmetic, no CUDA, no server.
 """
 
 import pytest
-from sglang.srt.planner.ladder_controller import LadderController
-from sglang.srt.planner.layout_ladder import LadderInputs, solve_layout_ladder
-from sglang.srt.planner.pp_cut import (
+from flliper.srt.planner.ladder_controller import LadderController
+from flliper.srt.planner.layout_ladder import LadderInputs, solve_layout_ladder
+from flliper.srt.planner.pp_cut import (
     PhasePoolModel,
     kv_mib_per_token_per_attn_layer_from_config,
     layer_families_from_config,

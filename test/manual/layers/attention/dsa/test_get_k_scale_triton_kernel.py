@@ -1,6 +1,6 @@
 import torch
 
-from sglang.srt.layers.attention.dsa.index_buf_accessor import (
+from flliper.srt.layers.attention.dsa.index_buf_accessor import (
     _get_k_and_s_triton_kernel,
 )
 

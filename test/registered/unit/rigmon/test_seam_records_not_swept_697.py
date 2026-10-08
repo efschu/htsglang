@@ -1,7 +1,7 @@
 """#697: the planner's budget sweep was deleting the seam records too.
 
 THE SYMPTOM. ``kv_budget-<digest>-seam-rank<N>.json`` kept vanishing from
-``~/.cache/sglang`` -- three times on 2026-08-16, once mid-soak. The cost is
+``~/.cache/flliper`` -- three times on 2026-08-16, once mid-soak. The cost is
 not the file: a boot that cannot find its seam record sizes COLD, and cold
 sizing is what took the oversized 550000 pin into an OOM while loading the
 NEXTN weights at 12:04.
@@ -45,8 +45,8 @@ import shutil
 import tempfile
 import unittest
 
-from sglang.srt.rigmon import kvbudget
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.rigmon import kvbudget
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -141,7 +141,7 @@ class ThePlannerSweepLeavesTheSeamRecords(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
 
     def test_the_default_policy_clears_the_budget_but_not_the_seam(self):
-        from sglang.srt.planner.runner import RunPolicy, neutralise_kv_budget
+        from flliper.srt.planner.runner import RunPolicy, neutralise_kv_budget
 
         policy = RunPolicy()
         self.assertTrue(policy.reset_kv_budget)
@@ -163,7 +163,7 @@ class ThePlannerSweepLeavesTheSeamRecords(unittest.TestCase):
             )
 
     def test_a_pinned_policy_still_touches_nothing(self):
-        from sglang.srt.planner.runner import RunPolicy, neutralise_kv_budget
+        from flliper.srt.planner.runner import RunPolicy, neutralise_kv_budget
 
         policy = RunPolicy(pin_token_vector="32,16,16")
         out = neutralise_kv_budget(policy, cache_dir=self.dir)

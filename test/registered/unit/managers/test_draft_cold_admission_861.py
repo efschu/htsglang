@@ -28,7 +28,7 @@ import types
 import pytest
 import torch
 
-from sglang.srt.managers.phase_flip_draft_bootstrap import (
+from flliper.srt.managers.phase_flip_draft_bootstrap import (
     BOOTSTRAP_ATTR,
     COLD_ARMED_ATTR,
     DEFAULT_DRAFT_COLD_ROUNDS,
@@ -41,7 +41,7 @@ from sglang.srt.managers.phase_flip_draft_bootstrap import (
     mark_draft_cold,
     rounds_owed,
 )
-from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
+from flliper.srt.managers.phase_purity import SEAM_READMIT_ATTR
 
 N_SLOTS = 64
 
@@ -169,7 +169,7 @@ def test_no_host_tier_at_all_is_warm_not_disarmed():
     and reallocated -- the original request's `_draft_extend_for_prefill` wrote
     their draft half. Reading "no controller" as "disarmed" would mark every
     prefix-cache hit on every non-HiCache speculating deployment draft-cold."""
-    from sglang.srt.managers.phase_flip_draft_bootstrap import draft_tier_armed_for
+    from flliper.srt.managers.phase_flip_draft_bootstrap import draft_tier_armed_for
 
     sched = make_scheduler(FakeKVPool(), tier_armed=False)
     sched.tree_cache = types.SimpleNamespace(cache_controller=None)
@@ -183,7 +183,7 @@ def test_a_host_tier_with_its_draft_half_off_is_cold():
     """CAN-FAIL for the pin above: the SAME shape with a controller present and
     its gate closed IS cold, so the assertion measures the distinction rather
     than the default."""
-    from sglang.srt.managers.phase_flip_draft_bootstrap import draft_tier_armed_for
+    from flliper.srt.managers.phase_flip_draft_bootstrap import draft_tier_armed_for
 
     sched = make_scheduler(FakeKVPool(), tier_armed=False)
     assert draft_tier_armed_for(sched) is False

@@ -39,8 +39,8 @@ monkeypatched exactly as ``test_gemma4_geometry.py`` does for the same
 function.
 """
 
-import sglang.srt.uneven_perf as U
-from sglang.test.ci.ci_register import register_cpu_ci
+import flliper.srt.uneven_perf as U
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

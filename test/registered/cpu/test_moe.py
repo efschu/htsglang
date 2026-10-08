@@ -4,7 +4,7 @@ import unittest
 # TODO: use interface in cpu.py
 import torch
 
-from sglang.srt.layers.amx_utils import CPUQuantMethod
+from flliper.srt.layers.amx_utils import CPUQuantMethod
 
 kernel = torch.ops.sgl_kernel
 
@@ -27,8 +27,8 @@ from utils import (
     unpack_and_dequant_awq,
 )
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 

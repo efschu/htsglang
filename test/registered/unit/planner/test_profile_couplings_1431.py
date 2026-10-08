@@ -23,12 +23,12 @@ import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.planner import expert_residency as ER  # noqa: E402
-from sglang.srt.planner import profile_couplings as PC  # noqa: E402
-from sglang.srt.weg2 import model_profile as MP  # noqa: E402
+from flliper.srt.planner import expert_residency as ER  # noqa: E402
+from flliper.srt.planner import profile_couplings as PC  # noqa: E402
+from flliper.srt.pdflip import model_profile as MP  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FX = os.path.join(HERE, "..", "weg2", "fixtures", "profil_s3_1003")
+FX = os.path.join(HERE, "..", "pdflip", "fixtures", "profil_s3_1003")
 MIB = float(1 << 20)
 
 # Referenz-Rig (Karten in Planer-Reihenfolge: 5090 vor den 3080, wie order_cards)
@@ -331,7 +331,7 @@ class TestBridgeCall(unittest.TestCase):
         req = {"what": "compute", "hardware": hw3(), "model": model("qwen27b_int8_vocabembed"), "settings": {"stage_layers": [32, 16, 16]}}
         repo = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
         env = dict(os.environ, PYTHONPATH=os.path.join(repo, "python"), CUDA_VISIBLE_DEVICES="")
-        p = subprocess.run([sys.executable, "-m", "sglang.srt.planner.profile_couplings"], input=json.dumps(req), capture_output=True, text=True,
+        p = subprocess.run([sys.executable, "-m", "flliper.srt.planner.profile_couplings"], input=json.dumps(req), capture_output=True, text=True,
                            env=env, timeout=120)
         self.assertEqual(p.returncode, 0, p.stderr[-400:])
         self.assertTrue(json.loads(p.stdout)["ok"])

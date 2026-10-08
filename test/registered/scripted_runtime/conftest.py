@@ -29,7 +29,7 @@ import pytest
 
 def _accelerator_available() -> bool:
     try:
-        from sglang.srt.utils.common import get_device
+        from flliper.srt.utils.common import get_device
 
         get_device()
         return True

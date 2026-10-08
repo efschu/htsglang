@@ -9,7 +9,7 @@ So avoid getting hidden states and completions alternately.
 
 import torch
 
-import sglang as sgl
+import flliper as sgl
 
 
 def main():

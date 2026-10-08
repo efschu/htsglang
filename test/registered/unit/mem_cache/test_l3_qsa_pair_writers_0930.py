@@ -1,4 +1,4 @@
-"""QS: a KV page reaches L3 only with its QSA index (NF y4b, weg2-52-142).
+"""QS: a KV page reaches L3 only with its QSA index (NF y4b, pdflip-52-142).
 
 Metal (y4b 0114232648, P PP0 04:05:26): ``#1028B FETCH CAP n=5: kv=1500
 claimed=0 lost=1500 caps={qsa_indexer: 359}`` -> ``#1035c ZERO-ANSWER
@@ -29,15 +29,15 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import (  # noqa: E402
+from flliper.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import (  # noqa: E402
     HiCacheFile,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
@@ -55,8 +55,8 @@ class _KVPage:
 
 
 def _backend(root, l3idx_path, arena_dir, monkeypatch):
-    from sglang.srt.mem_cache.storage.file.l3_index import L3Index
-    from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+    from flliper.srt.mem_cache.storage.file.l3_index import L3Index
+    from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
     be = object.__new__(HiCacheFile)
     be.file_path = str(root)
@@ -83,7 +83,7 @@ def _backend(root, l3idx_path, arena_dir, monkeypatch):
     be._l3idx = idx
     be._l3idx_tried = True
     be._evictor.l3_index = idx
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_DIR", str(arena_dir))
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_DIR", str(arena_dir))
     arena_dir.mkdir(parents=True, exist_ok=True)
     be._arenas = {
         KV_TOTAL: ShmArena(str(arena_dir / f"arena-{KV_TOTAL}.bin"), KV_TOTAL, 32),
@@ -93,7 +93,7 @@ def _backend(root, l3idx_path, arena_dir, monkeypatch):
 
 
 def _boot(tmp_path, monkeypatch, name):
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "1")
     root = tmp_path / "store" / "l3-nextflash-identity"
     root.mkdir(parents=True, exist_ok=True)
     (root / "L3_IDENTITY.json").write_text("{}")
@@ -139,7 +139,7 @@ def _pairs_on_disk(be, hashes):
 @pytest.fixture(autouse=True)
 def _awake_gate():
     try:
-        from sglang.srt.mem_cache import l3_write_behind as gate
+        from flliper.srt.mem_cache import l3_write_behind as gate
     except ImportError:
         yield
         return
@@ -152,7 +152,7 @@ def test_park_demote_never_puts_a_kv_page_on_disk_without_its_qsa_index(tmp_path
     """RED on 768cb0b257: the demoter copied all 8 KV pages, page 3 without
     its index (``qsa_absent=1`` after the fact). GREEN: page 3 stays out of L3,
     the marker names the writer."""
-    monkeypatch.setenv("SGLANG_WEG2_L3_WRITE_BEHIND_S", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_S", "0")
     be = _boot(tmp_path, monkeypatch, "boot1")
     hs = _hashes("a")
     _prefill_with_gap(be, hs)
@@ -170,7 +170,7 @@ def test_an_evicting_writer_drops_the_unpaired_kv_page_with_its_index(tmp_path, 
     """#257 d claim room and the arena clock: the page leaves L2; without its
     index it does not go to L3 either -- counted apart from ``lost`` (the W3
     spill releases rows on lost == 0). RED on 768cb0b257: 8 KV written."""
-    monkeypatch.setenv("SGLANG_WEG2_L3_WRITE_BEHIND_S", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_S", "0")
     be = _boot(tmp_path, monkeypatch, "boot1")
     hs = _hashes("b")
     _prefill_with_gap(be, hs)
@@ -215,7 +215,7 @@ def test_the_fork_stands_on_what_the_fetch_can_claim(tmp_path, monkeypatch):
     """y4b: KV on disk for 8 pages, QSA index for the leading 3 (the state the
     base writers leave). The probe's MIN caps the claim at 3; the fork must
     say 3 too (``P-FORK-CUT TOLD fork=96000`` against ``caps={qsa: 359}``)."""
-    from sglang.srt.weg2 import p_fork_cut
+    from flliper.srt.pdflip import p_fork_cut
 
     be = _boot(tmp_path, monkeypatch, "boot1")
     hs = _hashes("e")

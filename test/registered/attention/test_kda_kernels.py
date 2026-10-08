@@ -2,20 +2,20 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
-from sglang.srt.layers.attention.fla.fused_recurrent import (
+from flliper.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+from flliper.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
-from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+from flliper.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.kda import (
+from flliper.srt.layers.attention.fla.index import prepare_chunk_indices
+from flliper.srt.layers.attention.fla.kda import (
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
-from sglang.srt.utils.common import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.utils.common import get_device
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
@@ -399,7 +399,7 @@ class TestKDAPackedDecode(unittest.TestCase):
           - A_log:           [1, 1, HV, 1]
           - dt_bias:         [HV*K]
         """
-        from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+        from flliper.srt.layers.attention.linear.kernels.kda_triton import (
             TritonKDAKernel,
         )
 

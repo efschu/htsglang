@@ -18,9 +18,9 @@ import pathlib
 
 import pytest
 
-from sglang.srt.rank_role import SEAMS
+from flliper.srt.rank_role import SEAMS
 
-SRT = pathlib.Path(__file__).resolve().parents[2] / "python" / "sglang" / "srt"
+SRT = pathlib.Path(__file__).resolve().parents[2] / "python" / "flliper" / "srt"
 #: How far an anchor may drift before it must be re-pinned. Small on purpose:
 #: a window wide enough to absorb real drift is a window wide enough to match
 #: the wrong thing.

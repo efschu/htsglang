@@ -34,7 +34,7 @@ class _Tree:
 
 
 def _drain():
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     return Scheduler._drain_prefetch_progress
 

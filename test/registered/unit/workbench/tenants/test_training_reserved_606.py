@@ -9,8 +9,8 @@ If a training job lacks the contractually required
 import types
 import unittest
 
-from sglang.srt.workbench.tenants.training import TrainingWorkTenant
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.workbench.tenants.training import TrainingWorkTenant
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

@@ -12,7 +12,7 @@
 #               This arm exists to re-measure that floor on the SAME boot day,
 #               because a delta against a number from another day is a delta
 #               against that day's clocks.
-#   ARM=graphs  graphs on, SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1. The port under
+#   ARM=graphs  graphs on, FLLIPER_MOE_OFFLOAD_CUDA_GRAPH=1. The port under
 #               test.
 #
 # WHAT THIS WINDOW PROVES, AND WHAT IT CANNOT
@@ -48,7 +48,7 @@
 # with capture is refused by name (refuse_capturable_cold_tier): the captured
 # gather has no peer source, and the peer UVA pointer is itself unverified.
 # Opening that seam in the same window would make a failure un-attributable.
-# SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1 is the switch for a LATER window, and
+# FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE=1 is the switch for a LATER window, and
 # past it the replay-boundary gate (offload_capture_gate) names any delegated
 # expert that gets routed instead of letting it read row 0.
 #
@@ -71,7 +71,7 @@ GGUF_DIR="${GGUF_DIR:-$MODEL_ROOT/DeepSeek-V4-Flash-0731-GGUF/UD-IQ3_XXS}"
 # assumption: NVML order and CUDA order differ on this rig.
 RANK_GPU_ID="${RANK_GPU_ID:-0,1,2}"
 # Captured decode buckets. bs * top_k is what the scratch region must serve, so
-# this and SGLANG_MOE_SCRATCH_SLOTS move together -- run scratch_preflight.py.
+# this and FLLIPER_MOE_SCRATCH_SLOTS move together -- run scratch_preflight.py.
 # Defaults are the pair the 2026-08-02 battery already ran (6 slots) at the
 # recipe's own operating point (--max-running-requests 1 -> bs 1), so the graph
 # arm costs no extra resident VRAM. Raising MAX_GRAPH_BS costs top_k more slots
@@ -88,36 +88,36 @@ if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
 fi
 
 export PYTHONPATH="$WT/python"
-export SGLANG_MOE_SCRATCH_SLOTS="$SCRATCH_SLOTS"
-export SGLANG_FORWARD_PEAK_PATH="$RUN/peak_$ARM"
-export SGLANG_GGUF_STREAM_TRIM_SOFT_GIB=88
-export SGLANG_GGUF_STREAM_TRIM_TARGET_GIB=78
-export SGLANG_DSV4_FP4_EXPERTS=0
-export SGLANG_EXPERT_STATS=1
-export SGLANG_EXPERT_STATS_PATH="$RUN/expert_stats_$ARM"
+export FLLIPER_MOE_SCRATCH_SLOTS="$SCRATCH_SLOTS"
+export FLLIPER_FORWARD_PEAK_PATH="$RUN/peak_$ARM"
+export FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB=88
+export FLLIPER_GGUF_STREAM_TRIM_TARGET_GIB=78
+export FLLIPER_DSV4_FP4_EXPERTS=0
+export FLLIPER_EXPERT_STATS=1
+export FLLIPER_EXPERT_STATS_PATH="$RUN/expert_stats_$ARM"
 # Interval dumps, never SIGUSR2 -- see INCIDENT_394_sigusr2.md.
-export SGLANG_EXPERT_STATS_INTERVAL_SEC=45
-export SGLANG_OPT_FUSE_WQA_WKV=0
-export SGLANG_OPT_USE_TOPK_V2=0
+export FLLIPER_EXPERT_STATS_INTERVAL_SEC=45
+export FLLIPER_OPT_FUSE_WQA_WKV=0
+export FLLIPER_OPT_USE_TOPK_V2=0
 # Equal byte ownership, no shared cold tier: the treatment is capture alone.
-export SGLANG_MOE_HOST_SHARD_RATIO=1,1,1
-unset SGLANG_MOE_COLD_TIER_SHM || true
-unset SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE || true
+export FLLIPER_MOE_HOST_SHARD_RATIO=1,1,1
+unset FLLIPER_MOE_COLD_TIER_SHM || true
+unset FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE || true
 # Residency must be FROZEN before capture and IDENTICAL across the two arms.
 # Live calibration is refused under graph mode on purpose; static [0,R) is the
 # default and is what both arms get unless a hot-set file is supplied.
-unset SGLANG_MOE_HOT_RESIDENCY || true
+unset FLLIPER_MOE_HOT_RESIDENCY || true
 
 ARM_ARGS=()
 
 case "$ARM" in
   eager)
-    unset SGLANG_MOE_OFFLOAD_CUDA_GRAPH || true
+    unset FLLIPER_MOE_OFFLOAD_CUDA_GRAPH || true
     ARM_ARGS+=(--disable-cuda-graph)
     ;;
   graphs)
-    export SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1
-    export SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS="$MAX_GRAPH_BS"
+    export FLLIPER_MOE_OFFLOAD_CUDA_GRAPH=1
+    export FLLIPER_MOE_OFFLOAD_MAX_GRAPH_BS="$MAX_GRAPH_BS"
     ARM_ARGS+=(--cuda-graph-max-bs "$MAX_GRAPH_BS")
     ;;
   *)
@@ -126,7 +126,7 @@ case "$ARM" in
     ;;
 esac
 
-setsid "$VENV/bin/python" -u -m sglang.launch_server \
+setsid "$VENV/bin/python" -u -m flliper.launch_server \
   --model-path "$GGUF_DIR/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf" \
   --tp-size 3 --rank-gpu-id "$RANK_GPU_ID" --rank-tp-ratio auto \
   --rank-auto-reserve-mib 2200,1400,1400 \

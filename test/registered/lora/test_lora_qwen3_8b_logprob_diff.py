@@ -15,7 +15,7 @@
 """
 Regression test for Qwen3-8B LoRA logprob accuracy.
 
-Compares SGLang LoRA logprobs against reference training logprobs from a
+Compares fLLiper LoRA logprobs against reference training logprobs from a
 pre-computed dataset. The LoRA adapter and reference data are downloaded from:
 https://huggingface.co/datasets/yushengsu/lora-diff-Qwen3-8B
 
@@ -32,10 +32,10 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 
-import sglang as sgl
-from sglang.srt.lora.utils import auto_detect_lora_target_modules
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper as sgl
+from flliper.srt.lora.utils import auto_detect_lora_target_modules
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=40, stage="extra-a", runner_config="1-gpu-large")
 
@@ -111,12 +111,12 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
         model = _build_qwen3_mock()
 
         with (
-            patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase),
+            patch("flliper.srt.layers.linear.LinearBase", _MockLinearBase),
             patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
+                "flliper.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
             ),
             patch(
-                "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
+                "flliper.srt.layers.vocab_parallel_embedding.ParallelLMHead",
                 _MockParallelLMHead,
             ),
         ):
@@ -166,20 +166,20 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
                 "LoRA logprobs should differ from base model logprobs",
             )
 
-            kl_sglang_trainer = kl_v2(cdata["training_logprobs"], logprobs)
+            kl_flliper_trainer = kl_v2(cdata["training_logprobs"], logprobs)
             kl_orig_trainer = kl_v2(
                 cdata["training_logprobs"], cdata["sampling_logprobs"]
             )
-            kl_sglang_orig = kl_v2(logprobs, cdata["sampling_logprobs"])
+            kl_flliper_orig = kl_v2(logprobs, cdata["sampling_logprobs"])
 
             print(f"KL(orig_sampler, trainer) = {kl_orig_trainer:.6e}")
-            print(f"KL(sglang, trainer)       = {kl_sglang_trainer:.6e}")
-            print(f"KL(sglang, orig_sampler)  = {kl_sglang_orig:.6e}")
+            print(f"KL(flliper, trainer)       = {kl_flliper_trainer:.6e}")
+            print(f"KL(flliper, orig_sampler)  = {kl_flliper_orig:.6e}")
 
             self.assertLessEqual(
-                kl_sglang_trainer,
+                kl_flliper_trainer,
                 KL_THRESHOLD,
-                f"KL(sglang, trainer) = {kl_sglang_trainer:.6e} exceeds "
+                f"KL(flliper, trainer) = {kl_flliper_trainer:.6e} exceeds "
                 f"threshold {KL_THRESHOLD}",
             )
 

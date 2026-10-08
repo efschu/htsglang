@@ -38,9 +38,9 @@ two-phase comparison code runs exactly as it does on a rig.
 import unittest
 from typing import List, Optional, Tuple
 
-from sglang.srt.distributed.device_communicators import barlink_capture_census as cc
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.device_communicators import barlink_capture_census as cc
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

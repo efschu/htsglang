@@ -4,7 +4,7 @@ import polars as pl
 import pytest
 import torch
 
-from sglang.srt.debug_utils.dump_loader import (
+from flliper.srt.debug_utils.dump_loader import (
     LOAD_FAILED,
     ValueWithMeta,
     _add_duplicate_index,
@@ -13,7 +13,7 @@ from sglang.srt.debug_utils.dump_loader import (
     parse_meta_from_filename,
     read_meta,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 

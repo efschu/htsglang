@@ -13,7 +13,7 @@ Hermetic: pure arithmetic, no CUDA, no server, no clock.
 """
 
 import pytest
-from sglang.srt.managers.progress_liveness import (
+from flliper.srt.managers.progress_liveness import (
     ACTION_ALARM,
     ACTION_NONE,
     ACTION_RESTART,
@@ -284,7 +284,7 @@ class _FakeScheduler:
 
 
 def test_the_binding_reads_the_real_attribute_names():
-    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+    from flliper.srt.managers.progress_liveness import sample_from_scheduler
 
     s = _FakeScheduler(forward_ct=42, waiting=[_Req(100), _Req(200)])
     got = sample_from_scheduler(s, t_s=1.0)
@@ -301,7 +301,7 @@ def test_the_binding_reads_the_real_attribute_names():
 
 
 def test_the_binding_prefers_the_load_inquirer_when_present():
-    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+    from flliper.srt.managers.progress_liveness import sample_from_scheduler
 
     s = _FakeScheduler(forward_ct=1, waiting=[_Req(100)], pending_tokens=77_777)
     assert sample_from_scheduler(s, t_s=0.0).pending_tokens == 77_777
@@ -313,7 +313,7 @@ def test_a_stale_binding_is_refused_not_silently_frozen():
     A binding that quietly returns a frozen counter reads as a PERMANENT wedge,
     which is the worst possible failure for a wedge detector.
     """
-    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+    from flliper.srt.managers.progress_liveness import sample_from_scheduler
 
     class _Renamed:
         waiting_queue = ()
@@ -324,7 +324,7 @@ def test_a_stale_binding_is_refused_not_silently_frozen():
 
 def test_the_bound_signal_still_catches_the_specimen():
     """End to end on real attribute names: frozen attempts + pending = alarm."""
-    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+    from flliper.srt.managers.progress_liveness import sample_from_scheduler
 
     s = _FakeScheduler(forward_ct=9_000, waiting=[_Req(90_000)] * 7)
     trace = [sample_from_scheduler(s, t_s=float(i * 10)) for i in range(6)]
@@ -340,7 +340,7 @@ def test_attempts_without_commits_is_a_RETRY_LOOP_wedge():
     progresses. An attempts-only watchdog reads that as healthy; with the
     committed-chunk counter bound it is named as a wedge.
     """
-    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+    from flliper.srt.managers.progress_liveness import sample_from_scheduler
 
     trace = []
     for i in range(6):
@@ -358,7 +358,7 @@ def test_attempts_without_commits_is_a_RETRY_LOOP_wedge():
 
 def test_attempts_advancing_with_real_commits_is_healthy():
     """The retry-loop rule must not fire when work genuinely commits."""
-    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+    from flliper.srt.managers.progress_liveness import sample_from_scheduler
 
     class _WithLedger(_FakeScheduler):
         pass

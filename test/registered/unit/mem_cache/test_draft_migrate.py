@@ -23,7 +23,7 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.mem_cache.draft_migrate import (
+from flliper.srt.mem_cache.draft_migrate import (
     DraftBlobSpec,
     DraftReshardCapability,
     DraftReshardError,
@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.draft_migrate import (
     draft_shard_sizes,
     resolve_draft_reshard,
 )
-from sglang.srt.mem_cache.hicache_migrate import (  # noqa: I001
+from flliper.srt.mem_cache.hicache_migrate import (  # noqa: I001
     store_path,
     execute_plan,
     filter_entries_by_manifest,
@@ -43,8 +43,8 @@ from sglang.srt.mem_cache.hicache_migrate import (  # noqa: I001
     scan_store,
     verify_plan,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

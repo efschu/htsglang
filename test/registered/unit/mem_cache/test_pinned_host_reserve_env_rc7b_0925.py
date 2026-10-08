@@ -4,10 +4,10 @@ NF host acceptance, 2026-09-25: under a container memory cap of 82g the fixed
 10 GiB reserve left nothing for the pins that come late -- `available`
 (cap - nonreclaim) was 8.7 GB, minus 10 GiB = 0 usable, so the P->D KV
 hand-back's lazy read buffers (0.54 GB) were refused: W53
-Weg2StoreHandbackFailed and 413 on long prompts. The 27B ran the same
+PdFlipStoreHandbackFailed and 413 on long prompts. The 27B ran the same
 acceptance at cap 76g with nonreclaim 61-66 GiB, just through.
 
-SGLANG_PINNED_HOST_RESERVE_GIB (GiB, finite >= 0) states the OS's share of
+FLLIPER_PINNED_HOST_RESERVE_GIB (GiB, finite >= 0) states the OS's share of
 THIS machine; unset keeps 10 GiB (byte-identical natively). Every check reads it
 at call time through pinned_host_budget.pinned_host_reserve() and names the
 value and its source. Invalid values are refused loudly.
@@ -18,10 +18,10 @@ import pathlib
 
 import pytest
 
-from sglang.srt.mem_cache import pinned_host_budget as B
+from flliper.srt.mem_cache import pinned_host_budget as B
 
 GIB = 1024**3
-ENV = "SGLANG_PINNED_HOST_RESERVE_GIB"
+ENV = "FLLIPER_PINNED_HOST_RESERVE_GIB"
 
 
 def _post(nbytes):
@@ -103,7 +103,7 @@ def _code_uses(path, name):
 def test_no_check_reads_the_fixed_constant_any_more():
     """Every place that entered the reserve into a calculation reads the env now:
     the constant survives only as the documented default inside its module."""
-    root = pathlib.Path(B.__file__).resolve().parents[1]  # python/sglang/srt
+    root = pathlib.Path(B.__file__).resolve().parents[1]  # python/flliper/srt
     offenders = {}
     for path in root.rglob("*.py"):
         if path.name == "pinned_host_budget.py":
@@ -118,7 +118,7 @@ def test_no_check_reads_the_fixed_constant_any_more():
 
 
 def test_the_weg1_planner_sizes_with_the_same_reserve():
-    from sglang.srt.planner import weg1_host_sizing as W
+    from flliper.srt.planner import weg1_host_sizing as W
 
     assert _code_uses(W.__file__, "RESERVE_BYTES") == [], "weg1 still computes with its fixed copy"
     assert "pinned_host_reserve" in pathlib.Path(W.__file__).read_text()

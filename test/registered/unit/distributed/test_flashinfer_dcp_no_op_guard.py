@@ -4,7 +4,7 @@ Every DCP branch in ``FlashInferAttnBackend`` is gated on ``self.uneven_dcp``
 (a --rank-tp-ratio plan with dcp_size == tp_size, or the weightless-KV fast
 lane). Upstream flashinfer has no DCP path at all, so with that predicate
 false the backend does not fall back to a slower DCP -- it runs stock full-KV
-attention. Measured (Qwen3.5-2B, TP=2/DCP=2, SGLANG_UNEVEN_TOKEN_VECTOR=2,1,
+attention. Measured (Qwen3.5-2B, TP=2/DCP=2, FLLIPER_UNEVEN_TOKEN_VECTOR=2,1,
 no plan): boots green, output token-identical to TP=1, zero uneven-machinery
 log lines. Correct answers, and the flag did nothing.
 
@@ -19,12 +19,12 @@ CPU only: the rule is a pure function of the decision inputs.
 import inspect
 import unittest
 
-from sglang.srt.layers.attention.flashinfer_backend import (
+from flliper.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     reject_silently_inert_dcp,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -101,7 +101,7 @@ class TestFlashInferDcpNoOpGuard(CustomTestCase):
         """
         from types import SimpleNamespace
 
-        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+        from flliper.srt.layers.dcp.owner import draft_pool_is_replicated
 
         for args in (
             None,

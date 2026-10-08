@@ -6,13 +6,13 @@ IPC reader NOW, before the producers are in a running image.  Since 30.09. there
 fallback any more (NF-Operator: "Log-Rückfall für ALLE Werte entfernen"): a field is read from the
 boot's IPC (``src="ipc"``) or it is ``src="fehlt"`` and names the writer that would have to write it.
 
-Sources (read-only; the writers are weg2/state_file.py, weg2/front.py, weg2/rankstats.py):
+Sources (read-only; the writers are pdflip/state_file.py, pdflip/front.py, pdflip/rankstats.py):
 
   state.json      groups.<G>.form, front.{groups,errors,served_tokens,d_phase_n,d_parked_n,d_seats},
                   lifecycle, serving_since_ts
   events.jsonl    flip_begin, flip_done, flip_first_work, group_health, rank_stop,
                   post_wake_pass, group_ready
-  <log>.rankstate/<G>.tp<t>pp<p>.rankstats   weg2.rankstats/1: work, tokens, spec, sched,
+  <log>.rankstate/<G>.tp<t>pp<p>.rankstats   pdflip.rankstats/1: work, tokens, spec, sched,
                   errors, last_post_wake and (plan §3) prefill, decode, cache
   <log>.rankstate/<G>.tp<t>pp<p>.json        RankState (schema 1/2), kv{holds_kv,kv_tokens,share}, seats
 
@@ -31,7 +31,7 @@ from typing import Dict, List, Optional
 
 from . import names as N
 
-RANKSTATS_SCHEMA = "weg2.rankstats/1"
+RANKSTATS_SCHEMA = "pdflip.rankstats/1"
 RANKSTATE_SCHEMAS = (1, 2)
 
 #: the 25 rows of the inventory that were "Übergang" (order = the page's order)
@@ -45,17 +45,17 @@ KEYS = ("A1", "A4", "A12", "A13", "A14", "A15",
 
 #: who would have to write a field that the IPC of a boot does not carry (the page names it instead of
 #: reading a log -- NF-Operator 30.09.: "Wo das IPC-Feld fehlt ... NICHT aus dem Log holen")
-W_RS = "python/sglang/srt/weg2/rankstats.py"
-W_FI = "python/sglang/srt/weg2/front_state_ipc.py"
+W_RS = "python/flliper/srt/pdflip/rankstats.py"
+W_FI = "python/flliper/srt/pdflip/front_state_ipc.py"
 MISSING_WRITER = {
-    "A1": "state.json boot_id/lifecycle -- weg2/state_file.py:init/transition",
-    "A4": "state.json groups.<G>.form -- launcher (SGLANG_WEG2_FORM) via weg2/state_file.py:transition",
+    "A1": "state.json boot_id/lifecycle -- pdflip/state_file.py:init/transition",
+    "A4": "state.json groups.<G>.form -- launcher (FLLIPER_PDFLIP_FORM) via pdflip/state_file.py:transition",
     "A12": "state.json front.groups -- %s:publish_front_fields + publish_event(group_health)" % W_FI,
     "A13": "rankstats.errors -- %s:ErrorTally / front.errors -- %s:publish_front_fields" % (W_RS, W_FI),
     "A14": "events rank_stop -- %s:publish_rank_stops / rankstats.stops -- %s:note_stop" % (W_FI, W_RS),
     "A15": "rankstats ts + work.forward_ct -- %s:RankStats.record" % W_RS,
     "B1": "events flip_first_work P>D -- %s:FirstWorkClock.seen" % W_FI,
-    "B2": "events flip_user_time (D>P: Decode-Ende -> P-Prefill-Start) -- weg2 Front, ab Build y4z (53977b2b67)",
+    "B2": "events flip_user_time (D>P: Decode-Ende -> P-Prefill-Start) -- pdflip Front, ab Build y4z (53977b2b67)",
     "B3": "events flip_done -- %s:flip_done_payload + publish_event" % W_FI,
     "B4": "events flip_done -- %s:flip_done_payload + publish_event" % W_FI,
     "B5": "events flip_done -- %s:flip_done_payload + publish_event" % W_FI,
@@ -65,13 +65,13 @@ MISSING_WRITER = {
     "C2": "rankstats.sched -- %s:scheduler_counters" % W_RS,
     "C3": "rankstats.decode/spec -- %s:_decode_block" % W_RS,
     "C4": "rankstats.decode.gpu_ms_by_bs -- %s:_decode_block" % W_RS,
-    "C5": "RankState kv/seats -- python/sglang/srt/weg2/rank_state.py:note_capacity / rankstats.cap -- %s:RankStats.sync_capacity" % W_RS,
+    "C5": "RankState kv/seats -- python/flliper/srt/pdflip/rank_state.py:note_capacity / rankstats.cap -- %s:RankStats.sync_capacity" % W_RS,
     "C6": "state.json front.d_seats (bzw. d_phase_n) -- %s:publish_front_fields" % W_FI,
     "C7": "rankstats counters (deltas) -- %s:RankStats.record" % W_RS,
     "D1": "rankstats.work.spans (otherwise prefill.last) -- %s:RankStats.record" % W_RS,
     "D2": "rankstats.work.spans kind=extend (otherwise prefill.last on D) -- %s:RankStats.record" % W_RS,
     "D3": "events flip_first_work + flip_done -- %s" % W_FI,
-    "D4": "state.json serving_since_ts / events group_ready -- weg2/state_file.py:transition, add_event",
+    "D4": "state.json serving_since_ts / events group_ready -- pdflip/state_file.py:transition, add_event",
     "E1": "rankstats.prefill.cached_tokens -- %s:_prefill_block" % W_RS,
     "E2": "rankstats.cache -- %s:_cache_block" % W_RS,
     "E3": "state.json front.served_tokens -- %s:publish_front_fields" % W_FI,
@@ -131,7 +131,7 @@ def rankstate_dirs(files: dict) -> List[str]:
 
 def state_rankstate_dirs(ipc: Optional[dict]) -> List[str]:
     """The rank state dirs of a boot with a state dir (IPC §2.2 H5): the launcher names
-    ``$WEG2_STATE_DIR/rankstate/<G>`` in ``SGLANG_WEG2_RANK_STATE_DIR``, and host_acceptance mounts
+    ``$PDFLIP_STATE_DIR/rankstate/<G>`` in ``FLLIPER_PDFLIP_RANK_STATE_DIR``, and host_acceptance mounts
     that state dir from ``/spinning/docker-acceptance/<line>/state/<boot_id>`` -- so the files sit
     under ``ipc["dir"]/rankstate/<G>/``, not next to the group logs."""
     d = (ipc or {}).get("dir") if isinstance(ipc, dict) else None

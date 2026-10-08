@@ -10,7 +10,7 @@ from unittest import mock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -119,8 +119,8 @@ class TestUMBPHostAllocator(unittest.TestCase):
     def test_umbp_allocator_dispatch_and_tensor_wrap(self):
         self._install_fake_mori()
 
-        from sglang.srt.mem_cache.memory_pool_host import get_allocator_from_storage
-        from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+        from flliper.srt.mem_cache.memory_pool_host import get_allocator_from_storage
+        from flliper.srt.mem_cache.storage.umbp.umbp_host_allocator import (
             UMBPHostTensorAllocator,
         )
 
@@ -146,7 +146,7 @@ class TestUMBPHostAllocator(unittest.TestCase):
         self._install_fake_mori()
 
         module = importlib.import_module(
-            "sglang.srt.mem_cache.storage.umbp.umbp_host_allocator"
+            "flliper.srt.mem_cache.storage.umbp.umbp_host_allocator"
         )
         allocator = module.UMBPHostTensorAllocator()
         tensor = allocator.allocate((16,), dtype=torch.uint8, device="cpu")
@@ -181,11 +181,11 @@ class TestUMBPHostAllocator(unittest.TestCase):
                 raise ImportError("mori unavailable in test")
             return real_import(name, globals, locals, fromlist, level)
 
-        from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
+        from flliper.srt.mem_cache.pool_host.common import HostTensorAllocator
 
         with mock.patch.object(builtins, "__import__", fake_import):
             with self.assertLogs(level="WARNING") as cm:
-                from sglang.srt.mem_cache.memory_pool_host import (
+                from flliper.srt.mem_cache.memory_pool_host import (
                     get_allocator_from_storage,
                 )
 

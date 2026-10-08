@@ -1,5 +1,5 @@
 """
-Benchmark SGLang logical TP all-gather against Aiter custom all-gather.
+Benchmark fLLiper logical TP all-gather against Aiter custom all-gather.
 
 This benchmark is intended for captured logits all-gather shapes such as
 ``1,32320;2,32320;4,32320`` and for correctness coverage across metadata
@@ -203,7 +203,7 @@ def aiter_logical_all_gather(
     raw_out: torch.Tensor,
     dim: int = -1,
 ):
-    # SGLang's patched path writes Aiter output into the same preallocated raw
+    # fLLiper's patched path writes Aiter output into the same preallocated raw
     # buffer used by all_gather_into_tensor, then applies the standard reshape.
     comm.all_gather_unreg(inp, out=raw_out, dim=0)
     return reshape_logical(raw_out, tuple(inp.shape), comm.world_size, dim)

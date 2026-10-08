@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import MAX_REAL_KV_SOURCES, RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import (
+from flliper.jit_kernel.kv_canary.consts import MAX_REAL_KV_SOURCES, RealKvHashMode
+from flliper.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
@@ -13,16 +13,16 @@ from sglang.jit_kernel.kv_canary.verify import (
     VerifyPlan,
     launch_canary_verify_kernel,
 )
-from sglang.srt.kv_canary.buffer_group import PoolKind
-from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.fixtures import (
+from flliper.srt.kv_canary.buffer_group import PoolKind
+from flliper.srt.kv_canary.pool_patcher.api import attach_canary_buffers
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_base_config,
     make_mha_pool,
     make_swa_pool,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")

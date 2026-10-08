@@ -56,13 +56,13 @@ from __future__ import annotations
 import os
 import unittest
 
-from sglang.srt.managers import phase_flip_spill
-from sglang.srt.managers.corridor_guard import GuardResult
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers import phase_flip_spill
+from flliper.srt.managers.corridor_guard import GuardResult
+from flliper.srt.managers.phase_flip_runtime import (
     SEAM_MARGIN_DELAY_TAG,
     PhaseFlipRuntime,
 )
-from sglang.srt.managers.phase_flip_spill import (
+from flliper.srt.managers.phase_flip_spill import (
     ENV_SEAM_UNFUNDABLE,
     seam_unfundable_objection,
     unfundable_seam_directions,
@@ -203,8 +203,8 @@ class TheShippedKnobsCannotProduceTheShapeTest(unittest.TestCase):
         """
         detail, patched = _verdict(
             PP_TO_TP,
-            SGLANG_KV_BACKING_RELIEF="0",
-            SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=None,
+            FLLIPER_KV_BACKING_RELIEF="0",
+            FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=None,
         )
         self.assertEqual(
             detail,
@@ -214,15 +214,15 @@ class TheShippedKnobsCannotProduceTheShapeTest(unittest.TestCase):
         )
 
     def test_the_one_directional_knob_shipped_does_not_refuse_anything(self):
-        """``SGLANG_SEAM_FUND_TP_TO_PP=0`` abstains the rung; it does not refuse.
+        """``FLLIPER_SEAM_FUND_TP_TO_PP=0`` abstains the rung; it does not refuse.
 
         It is the only direction-scoped term that existed, and it is the wrong
         kind of term: it removes a FUNDER, it does not produce a REFUSAL.
         """
         detail, _ = _verdict(
             TP_TO_PP,
-            SGLANG_SEAM_FUND_TP_TO_PP="0",
-            SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=None,
+            FLLIPER_SEAM_FUND_TP_TO_PP="0",
+            FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=None,
         )
         self.assertEqual(detail, "")
 
@@ -231,19 +231,19 @@ class TheDefaultChangesNothingTest(unittest.TestCase):
     def test_unset_leaves_both_directions_exactly_as_the_gate_left_them(self):
         for d in (PP_TO_TP, TP_TO_PP):
             with self.subTest(direction=d):
-                detail, _ = _verdict(d, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=None)
+                detail, _ = _verdict(d, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=None)
                 self.assertEqual(detail, "")
 
     def test_an_empty_value_is_the_same_as_unset(self):
         for raw in ("", "   ", ","):
             with self.subTest(raw=raw):
-                detail, _ = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=raw)
+                detail, _ = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=raw)
                 self.assertEqual(detail, "")
 
     def test_a_refusal_the_gate_reached_itself_is_passed_through_verbatim(self):
         """Unset must not reword the gate's own refusal either."""
         detail, _ = _verdict(
-            PP_TO_TP, free=STARVED, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=None
+            PP_TO_TP, free=STARVED, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=None
         )
         self.assertNotEqual(detail, "")
         self.assertIn("corridor gate refused", detail)
@@ -254,8 +254,8 @@ class TheLeverIsPerDirectionTest(unittest.TestCase):
     """THE FALSIFIER FOR THE WHOLE DESIGN: the two directions must disagree."""
 
     def test_naming_pp_to_tp_refuses_it_while_tp_to_pp_still_funds(self):
-        refused, _ = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
-        funded, _ = _verdict(TP_TO_PP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
+        refused, _ = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
+        funded, _ = _verdict(TP_TO_PP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
         self.assertNotEqual(refused, "", "the named direction must be refused")
         self.assertEqual(
             funded,
@@ -266,8 +266,8 @@ class TheLeverIsPerDirectionTest(unittest.TestCase):
         )
 
     def test_it_works_the_other_way_round_too(self):
-        refused, _ = _verdict(TP_TO_PP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=TP_TO_PP)
-        funded, _ = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=TP_TO_PP)
+        refused, _ = _verdict(TP_TO_PP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=TP_TO_PP)
+        funded, _ = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=TP_TO_PP)
         self.assertNotEqual(refused, "")
         self.assertEqual(funded, "")
 
@@ -275,16 +275,16 @@ class TheLeverIsPerDirectionTest(unittest.TestCase):
         raw = f"{PP_TO_TP},{TP_TO_PP}"
         for d in (PP_TO_TP, TP_TO_PP):
             with self.subTest(direction=d):
-                detail, _ = _verdict(d, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=raw)
+                detail, _ = _verdict(d, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=raw)
                 self.assertNotEqual(detail, "")
 
     def test_surrounding_whitespace_is_not_a_different_direction(self):
         padded = f"  {PP_TO_TP} , {TP_TO_PP}  "
-        detail, _ = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=padded)
+        detail, _ = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=padded)
         self.assertNotEqual(detail, "")
         # Asserted INSIDE the env, or it reads a restored environment and
         # passes for the wrong reason.
-        with _Env(SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=padded):
+        with _Env(FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=padded):
             self.assertEqual(
                 unfundable_seam_directions(), frozenset({PP_TO_TP, TP_TO_PP})
             )
@@ -300,7 +300,7 @@ class TheGateStillRunsInFullTest(unittest.TestCase):
     """
 
     def test_the_KV_rung_reduction_is_still_entered_on_a_refused_direction(self):
-        _, patched = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
+        _, patched = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
         self.assertEqual(
             patched.kv_calls,
             [PP_TO_TP],
@@ -309,12 +309,12 @@ class TheGateStillRunsInFullTest(unittest.TestCase):
         )
 
     def test_the_guard_is_still_asked_on_a_refused_direction(self):
-        _, patched = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
+        _, patched = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
         self.assertEqual(len(patched.g.asks), 1)
 
     def test_the_ladder_is_asked_for_the_same_bytes_as_without_the_injection(self):
-        _, clean = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=None)
-        _, armed = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
+        _, clean = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=None)
+        _, armed = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
         self.assertEqual(armed.g.asks, clean.g.asks)
 
 
@@ -327,11 +327,11 @@ class TheRefusalIsAnAbandonNotADelayTest(unittest.TestCase):
         needs to stay silent, and the operator needs to see -- would never
         run. The tag is also exempt from the abandon cap by design.
         """
-        detail, _ = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
+        detail, _ = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
         self.assertNotIn(SEAM_MARGIN_DELAY_TAG, detail)
 
     def test_the_message_names_the_variable_that_caused_it(self):
-        detail, _ = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
+        detail, _ = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
         self.assertIn(ENV_SEAM_UNFUNDABLE, detail)
         self.assertIn(PP_TO_TP, detail)
 
@@ -342,13 +342,13 @@ class TheRefusalIsAnAbandonNotADelayTest(unittest.TestCase):
         fundable and was refused anyway -- otherwise an injected boot cannot
         be told apart from a genuinely starved one after the fact.
         """
-        detail, _ = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
+        detail, _ = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP)
         self.assertIn("the gate itself said", detail)
         self.assertIn("the seam was fundable", detail)
 
     def test_a_real_refusal_underneath_is_preserved_not_replaced(self):
         detail, _ = _verdict(
-            PP_TO_TP, free=STARVED, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP
+            PP_TO_TP, free=STARVED, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP
         )
         self.assertIn(ENV_SEAM_UNFUNDABLE, detail)
         self.assertIn("corridor gate refused", detail)
@@ -364,7 +364,7 @@ class AnUnparseableValueInjectsNothingTest(unittest.TestCase):
     """
 
     def test_an_unknown_direction_arms_nothing(self):
-        with _Env(SGLANG_SEAM_UNFUNDABLE_DIRECTIONS="pp2tp"):
+        with _Env(FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS="pp2tp"):
             self.assertEqual(unfundable_seam_directions(), frozenset())
             self.assertIsNone(seam_unfundable_objection(PP_TO_TP))
             self.assertIsNone(seam_unfundable_objection(TP_TO_PP))
@@ -372,14 +372,14 @@ class AnUnparseableValueInjectsNothingTest(unittest.TestCase):
     def test_one_bad_name_rejects_the_whole_value(self):
         """Partial acceptance would arm a DIFFERENT experiment than the one
         the operator wrote, which is worse than arming none."""
-        with _Env(SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=f"{PP_TO_TP},pp2tp"):
+        with _Env(FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=f"{PP_TO_TP},pp2tp"):
             self.assertEqual(unfundable_seam_directions(), frozenset())
             self.assertIsNone(seam_unfundable_objection(PP_TO_TP))
 
     def test_it_says_so_at_ERROR(self):
-        with _Env(SGLANG_SEAM_UNFUNDABLE_DIRECTIONS="sideways"):
+        with _Env(FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS="sideways"):
             with self.assertLogs(
-                "sglang.srt.managers.phase_flip_spill", level="ERROR"
+                "flliper.srt.managers.phase_flip_spill", level="ERROR"
             ) as cm:
                 unfundable_seam_directions()
         joined = "\n".join(cm.output)
@@ -387,7 +387,7 @@ class AnUnparseableValueInjectsNothingTest(unittest.TestCase):
         self.assertIn("NOT armed", joined)
 
     def test_the_seam_still_proceeds_normally_after_a_typo(self):
-        detail, _ = _verdict(PP_TO_TP, SGLANG_SEAM_UNFUNDABLE_DIRECTIONS="nonsense")
+        detail, _ = _verdict(PP_TO_TP, FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS="nonsense")
         self.assertEqual(detail, "")
 
 
@@ -401,9 +401,9 @@ class AnArmedInjectionAnnouncesItselfTest(unittest.TestCase):
     """
 
     def test_the_boot_log_names_the_armed_directions(self):
-        with _Env(SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP):
+        with _Env(FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP):
             with self.assertLogs(
-                "sglang.srt.managers.phase_flip_spill", level="WARNING"
+                "flliper.srt.managers.phase_flip_spill", level="WARNING"
             ) as cm:
                 unfundable_seam_directions()
         joined = "\n".join(cm.output)
@@ -412,9 +412,9 @@ class AnArmedInjectionAnnouncesItselfTest(unittest.TestCase):
         self.assertIn(PP_TO_TP, joined)
 
     def test_it_is_announced_once_not_once_per_seam(self):
-        with _Env(SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP):
+        with _Env(FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=PP_TO_TP):
             with self.assertLogs(
-                "sglang.srt.managers.phase_flip_spill", level="WARNING"
+                "flliper.srt.managers.phase_flip_spill", level="WARNING"
             ) as cm:
                 for _ in range(5):
                     unfundable_seam_directions()
@@ -422,9 +422,9 @@ class AnArmedInjectionAnnouncesItselfTest(unittest.TestCase):
         self.assertEqual(len(armed), 1, "the ARMED line must not repeat per seam")
 
     def test_nothing_is_announced_when_it_is_unset(self):
-        with _Env(SGLANG_SEAM_UNFUNDABLE_DIRECTIONS=None):
+        with _Env(FLLIPER_SEAM_UNFUNDABLE_DIRECTIONS=None):
             with self.assertNoLogs(
-                "sglang.srt.managers.phase_flip_spill", level="WARNING"
+                "flliper.srt.managers.phase_flip_spill", level="WARNING"
             ):
                 self.assertEqual(unfundable_seam_directions(), frozenset())
 

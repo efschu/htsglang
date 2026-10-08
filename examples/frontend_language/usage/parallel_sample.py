@@ -3,7 +3,7 @@ Usage:
 python3 parallel_sample.py
 """
 
-import sglang as sgl
+import flliper as sgl
 
 
 @sgl.function

@@ -21,15 +21,15 @@ import unittest
 
 import torch
 
-from sglang.srt.model_loader.gguf_deepseek4 import (
+from flliper.srt.model_loader.gguf_deepseek4 import (
     DEEPSEEK4_GGUF_ARCH,
     Deepseek4GGUFAdapter,
 )
-from sglang.srt.model_loader.gguf_registry import (
+from flliper.srt.model_loader.gguf_registry import (
     get_gguf_adapter_class,
     sibling_config_gguf_archs,
 )
-from sglang.test.gguf_mxfp4_state import native_path, repack_path
+from flliper.test.gguf_mxfp4_state import native_path, repack_path
 
 DSV4_GGUF_DIR = (
     "/spinning/llm_stuff/club-3090/models-cache/DeepSeek-V4-Flash-0731-GGUF/UD-Q3_K_XL"
@@ -265,7 +265,7 @@ class TestDeepseek4NameMapAgainstFile(unittest.TestCase):
         """#391 blocker 2: split sets are loaded, not refused. ``split.count``
         is in every part's KV block, so pointing at part 3 must resolve the same
         four files as pointing at part 1."""
-        from sglang.srt.model_loader.gguf_shards import (
+        from flliper.srt.model_loader.gguf_shards import (
             gguf_metadata_path,
             resolve_gguf_shard_paths,
         )
@@ -291,7 +291,7 @@ class TestDeepseek4NameMapAgainstFile(unittest.TestCase):
         """Header reads prove resolution; this proves the payload is reachable
         through the same stream. ``attn_sinks`` is 64 floats, so it costs a
         page, not a shard."""
-        from sglang.srt.model_loader.gguf_shards import iter_gguf_tensors
+        from flliper.srt.model_loader.gguf_shards import iter_gguf_tensors
 
         wanted = "blk.0.attn_sinks.weight"
         for tensor in iter_gguf_tensors(self.adapter.shard_paths()):
@@ -306,7 +306,7 @@ class TestDeepseek4NameMapAgainstFile(unittest.TestCase):
         part 2 while every KV field it compares lives on part 1."""
         import json
 
-        from sglang.srt.model_loader.gguf_registry import reconcile_sibling_config
+        from flliper.srt.model_loader.gguf_registry import reconcile_sibling_config
 
         config_path = os.path.join(DSV4_GGUF_DIR, "config.json")
         if not os.path.isfile(config_path):
@@ -351,17 +351,17 @@ class TestDeepseek4NameMapAgainstFile(unittest.TestCase):
         and this assertion described nothing. The native half is the test
         below.
         """
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         with repack_path():
             self.adapter.assert_quant_types_executable()
 
-            with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
+            with envs.FLLIPER_GGUF_MXFP4_REPACK.override(False):
                 with self.assertRaises(RuntimeError) as ctx:
                     self.adapter.assert_quant_types_executable()
             message = str(ctx.exception)
             self.assertIn("MXFP4", message)
-            self.assertIn("SGLANG_GGUF_MXFP4_REPACK", message)
+            self.assertIn("FLLIPER_GGUF_MXFP4_REPACK", message)
 
     def test_mxfp4_passes_the_gate_without_the_repack_when_kernels_are_native(self):
         """The path this rig actually serves (#529).
@@ -372,11 +372,11 @@ class TestDeepseek4NameMapAgainstFile(unittest.TestCase):
         the property the repack-scoped test above cannot express, and the one
         that decides whether today's boot gets past the gate.
         """
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         with native_path():
             self.adapter.assert_quant_types_executable()
-            with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
+            with envs.FLLIPER_GGUF_MXFP4_REPACK.override(False):
                 self.adapter.assert_quant_types_executable()
 
 

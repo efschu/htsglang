@@ -6,12 +6,12 @@ import uuid
 
 import numpy as np
 
-from sglang.srt.speculative.cpp_ngram.external_corpus import (
+from flliper.srt.speculative.cpp_ngram.external_corpus import (
     iter_external_corpus_chunks,
 )
-from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
@@ -31,7 +31,7 @@ def _make_corpus(match_type="BFS", **kwargs):
     defaults["match_type"] = match_type
     corpus = NgramCorpus(**defaults)
     if external_corpus_documents is not None:
-        from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
+        from flliper.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
 
         chunks = []
         has_prev = False
@@ -896,12 +896,12 @@ class TestMultiSamHttpMock(CustomTestCase):
         try:
             from starlette.testclient import TestClient
 
-            from sglang.srt.entrypoints.http_server import app, set_global_state
+            from flliper.srt.entrypoints.http_server import app, set_global_state
         except (ImportError, OSError):
             raise unittest.SkipTest(
                 "http_server import requires CUDA libraries not available on CPU"
             )
-        from sglang.srt.managers.io_struct import (
+        from flliper.srt.managers.io_struct import (
             AddExternalCorpusReqOutput,
             ListExternalCorporaReqOutput,
             RemoveExternalCorpusReqOutput,

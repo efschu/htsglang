@@ -34,8 +34,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 # CPU marker is AST-parsed "this test exists"; actual CPU-side execution is
 # gated by the @skipUnless guard below. MLX marker runs for real on the MLX
@@ -165,7 +165,7 @@ class TestMlxExtendRouting(unittest.TestCase):
 
     @staticmethod
     def _worker(known_rids):
-        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+        from flliper.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
@@ -211,7 +211,7 @@ class TestMlxExtendRouting(unittest.TestCase):
     # ---------- async path: _async_extend_batch ----------
 
     def _run_async(self, reqs, extend_lens, known_rids, decoding_reqs, forward_mode):
-        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+        from flliper.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)

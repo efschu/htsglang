@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.utils.common import MultiprocessingSerializer, safe_pickle_loads
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils.common import MultiprocessingSerializer, safe_pickle_loads
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -74,22 +74,22 @@ class TestSafeUnpicklerForkLayout(CustomTestCase):
     The upstream allowlist names module paths of the upstream tree
     (disaggregation/encoder/receiver.py, model_runner_components/...). An
     entry that does not import in THIS tree silently turns a working payload
-    into a "Blocked unsafe global" refusal, so every sglang entry must
+    into a "Blocked unsafe global" refusal, so every flliper entry must
     resolve here.
     """
 
     # Defined only inside the NPU branch of patch_torch (same as upstream).
-    _NPU_ONLY = {("sglang.srt.utils.patch_torch", "_rebuild_npu_tensor_modified")}
+    _NPU_ONLY = {("flliper.srt.utils.patch_torch", "_rebuild_npu_tensor_modified")}
 
-    def test_allowlisted_sglang_globals_resolve_in_this_tree(self):
+    def test_allowlisted_flliper_globals_resolve_in_this_tree(self):
         import importlib
 
-        from sglang.srt.utils.common import SafeUnpickler
+        from flliper.srt.utils.common import SafeUnpickler
 
         entries = sorted(
             (m, n)
             for (m, n) in SafeUnpickler.ALLOWED_GLOBALS
-            if m.startswith("sglang.") and (m, n) not in self._NPU_ONLY
+            if m.startswith("flliper.") and (m, n) not in self._NPU_ONLY
         )
         self.assertTrue(entries)
         for module, name in entries:
@@ -98,8 +98,8 @@ class TestSafeUnpicklerForkLayout(CustomTestCase):
                 self.assertTrue(hasattr(mod, name), f"{module}.{name} missing")
 
     def test_round_trips_embedding_data_from_fork_module(self):
-        from sglang.srt.disaggregation.encode_receiver import EmbeddingData
-        from sglang.srt.managers.schedule_batch import Modality
+        from flliper.srt.disaggregation.encode_receiver import EmbeddingData
+        from flliper.srt.managers.schedule_batch import Modality
 
         value = EmbeddingData(
             req_id="r0",
@@ -117,14 +117,14 @@ class TestSafeUnpicklerForkLayout(CustomTestCase):
         self.assertEqual(restored.grid_dim, [1, 2, 2])
         self.assertTrue(torch.equal(restored.embedding, value.embedding))
 
-    def test_rejects_sglang_code_module_gadget(self):
-        # The old prefix list allowed every global under sglang.srt.utils.*,
+    def test_rejects_flliper_code_module_gadget(self):
+        # The old prefix list allowed every global under flliper.srt.utils.*,
         # including dynamic_import (an import-by-string gadget).
         with self.assertRaisesRegex(
             RuntimeError,
-            r"Blocked unsafe global \(sglang\.srt\.utils\.common\.dynamic_import\)",
+            r"Blocked unsafe global \(flliper\.srt\.utils\.common\.dynamic_import\)",
         ):
-            safe_pickle_loads(b"csglang.srt.utils.common\ndynamic_import\n.")
+            safe_pickle_loads(b"cflliper.srt.utils.common\ndynamic_import\n.")
 
 
 if __name__ == "__main__":

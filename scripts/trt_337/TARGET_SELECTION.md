@@ -62,7 +62,7 @@ to rediscover them:
 
 Derived from the checkpoint's `config.json` and the deployed shard plan,
 cross-checked at runtime against
-`sglang.srt.distributed.utils._partition_units_raw` (the harness refuses to emit
+`flliper.srt.distributed.utils._partition_units_raw` (the harness refuses to emit
 a table that disagrees with what the ranks would actually build). These match
 the #368 shape table, which was independently validated against the same
 checkpoint.

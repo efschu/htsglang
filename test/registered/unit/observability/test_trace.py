@@ -2,7 +2,7 @@
 
 import os
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -10,8 +10,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.observability.trace as mod
-from sglang.srt.observability.trace import (
+import flliper.srt.observability.trace as mod
+from flliper.srt.observability.trace import (
     SpanAttributes,
     TraceEvent,
     TraceNullContext,
@@ -30,7 +30,7 @@ try:
     from opentelemetry import trace as otel_trace
     from opentelemetry.sdk.trace import TracerProvider
 
-    from sglang.srt.observability.trace import get_otlp_span_exporter
+    from flliper.srt.observability.trace import get_otlp_span_exporter
 
     _has_otel = True
 except ImportError:
@@ -50,7 +50,7 @@ class TestTraceFunctions(unittest.TestCase):
         self.assertEqual(extract_trace_headers({}), {})
 
     def test_set_global_trace_level(self):
-        from sglang.srt.runtime_context import get_resources
+        from flliper.srt.runtime_context import get_resources
 
         orig = get_resources().trace_level
         try:
@@ -62,14 +62,14 @@ class TestTraceFunctions(unittest.TestCase):
     def test_global_trace_level_env_var(self):
         # The level lives on ctx.resources and is seeded lazily from the env
         # on first read after a reset (no module reload involved).
-        from sglang.srt.runtime_context import get_resources
+        from flliper.srt.runtime_context import get_resources
 
         orig = get_resources().trace_level
         try:
-            with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "2"}):
+            with patch.dict(os.environ, {"FLLIPER_TRACE_LEVEL": "2"}):
                 get_resources().trace_level = None
                 self.assertEqual(get_global_trace_level(), 2)
-            get_resources().trace_level = None  # SGLANG_TRACE_LEVEL unset → 3
+            get_resources().trace_level = None  # FLLIPER_TRACE_LEVEL unset → 3
             self.assertEqual(get_global_trace_level(), 3)
         finally:
             get_resources().trace_level = orig
@@ -210,7 +210,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.orig_initialized = mod.opentelemetry_initialized
         self.orig_tracer = mod.tracer
         self.orig_threads = mod.threads_info.copy()
-        from sglang.srt.runtime_context import get_resources
+        from flliper.srt.runtime_context import get_resources
 
         self.orig_level = get_resources().trace_level
 
@@ -229,7 +229,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         mod.tracer = self.orig_tracer
         mod.threads_info.clear()
         mod.threads_info.update(self.orig_threads)
-        from sglang.srt.runtime_context import get_resources
+        from flliper.srt.runtime_context import get_resources
 
         get_resources().trace_level = self.orig_level
 
@@ -428,7 +428,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
     def test_abort_with_base_finish_reason(self):
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
-        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+        from flliper.srt.managers.schedule_batch import FINISH_LENGTH
 
         abort_obj = FINISH_LENGTH(length=10)
         ctx.abort(ts=2000, abort_info=abort_obj)

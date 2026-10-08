@@ -5,15 +5,15 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.utils import get_ci_test_range, get_jit_cuda_arch, is_hip_runtime
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.utils import get_ci_test_range, get_jit_cuda_arch, is_hip_runtime
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from sglang.jit_kernel.cutedsl_bf16_gemm import cutedsl_bf16_gemm  # noqa: E402
+from flliper.jit_kernel.cutedsl_bf16_gemm import cutedsl_bf16_gemm  # noqa: E402
 
 N_VALUES = [1024, 2624, 6144]
 K_VALUES = [2048, 6144]

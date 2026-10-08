@@ -8,9 +8,9 @@ from pathlib import Path
 
 from test_deepseek_ocr import TestDeepSeekOCR
 
-from sglang.srt.utils.hf_transformers import get_tokenizer
-from sglang.test.ci.ci_register import register_xpu_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils.hf_transformers import get_tokenizer
+from flliper.test.ci.ci_register import register_xpu_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -42,7 +42,7 @@ class TestDeepSeekOCRTriton(TestDeepSeekOCR):
             "--attention-backend",
             "intel_xpu",
         ]
-        os.environ["SGLANG_USE_SGL_XPU"] = "0"
+        os.environ["FLLIPER_USE_SGL_XPU"] = "0"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

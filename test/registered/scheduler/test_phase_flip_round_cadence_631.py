@@ -38,12 +38,12 @@ still passes.
 CPU-only.
 """
 
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     PHASE_PP,
     PP_TO_TP,
     PhaseFlipRuntime,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 MAP = ((0, 1, 2, 3, 4, 5, 6, 7), (8, 9, 10, 11), (12, 13, 14, 15))
 N_LAYERS = 16

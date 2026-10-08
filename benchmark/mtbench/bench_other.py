@@ -8,8 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from fastchat.model import get_conversation_template
 from tqdm import tqdm
 
-from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
-from sglang.utils import download_and_cache_file
+from flliper.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from flliper.utils import download_and_cache_file
 
 
 def load_questions(filename):

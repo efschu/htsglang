@@ -8,7 +8,7 @@ control daemon (decided by the control directory only — no process scan).
 
 import unittest
 
-from sglang.srt.rigmon.capabilities import (
+from flliper.srt.rigmon.capabilities import (
     ACTIVE,
     AVAILABLE,
     UNAVAILABLE,
@@ -18,8 +18,8 @@ from sglang.srt.rigmon.capabilities import (
     probe_mps,
     probe_nccl_colocation,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -62,7 +62,7 @@ class TestNcclColocationProbe(CustomTestCase):
         self.assertIn("2.28.9", cap.reason)
         self.assertIn("libnccl.so.2", cap.reason)
         self.assertIn("2.30", cap.reason)
-        self.assertIn("SGLANG_NCCL_SO_PATH", cap.reason)
+        self.assertIn("FLLIPER_NCCL_SO_PATH", cap.reason)
 
     def test_no_loadable_library_carries_the_loader_error(self):
         cap = probe_nccl_colocation(

@@ -59,16 +59,16 @@ def fake_service(tmp, **kw):
 SETUP_SCRIPT = r"""
 import json, os, sys
 sys.path.insert(0, sys.argv[1])
-from sglang.srt.planner import profile_couplings as PC
-from sglang.srt.weg2 import model_profile as MP
-fx = os.path.join(sys.argv[1], "..", "test", "registered", "unit", "weg2", "fixtures", "profil_s3_1003", sys.argv[2])
+from flliper.srt.planner import profile_couplings as PC
+from flliper.srt.pdflip import model_profile as MP
+fx = os.path.join(sys.argv[1], "..", "test", "registered", "unit", "pdflip", "fixtures", "profil_s3_1003", sys.argv[2])
 hw = PC.synthetic_hardware([("NVIDIA GeForce RTX 5090", 32607, 1400.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0)])
 print(json.dumps({"hw": hw, "model": MP.estimate(os.path.abspath(fx))}))
 """
 
 
 def profiles_via_subprocess(tree, fixture):
-    """Hardware- und Modellprofil im KINDPROZESS bauen: der Dashboard-Testprozess darf sglang nicht importieren
+    """Hardware- und Modellprofil im KINDPROZESS bauen: der Dashboard-Testprozess darf flliper nicht importieren
     (test_modellprofil_960::test_tree_is_found_by_file_path_not_by_import)."""
     p = subprocess.run([sys.executable, "-c", SETUP_SCRIPT, tree, fixture], capture_output=True, text=True, timeout=120,
                        env=dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONWARNINGS="ignore"))
@@ -146,7 +146,7 @@ class TestWorkerLifecycle(unittest.TestCase):
         self.assertIn("no planner tree", r["error"])
         r = R.CouplingsService(self.tmp, python="/nicht/da/python").request({"what": "bars"})
         self.assertFalse(r["ok"])
-        self.assertIn("Python of the sglang environment is missing", r["error"])
+        self.assertIn("Python of the flliper environment is missing", r["error"])
 
     def test_a_tree_without_the_module_is_named_by_the_real_worker(self):
         fixture = os.path.join(HERE, "fixtures", "kartenplan", "planner_tree", "python")

@@ -15,7 +15,7 @@ import unittest
 import torch
 import torch.nn as nn
 
-from sglang.srt.model_executor import vram_family_census as vc
+from flliper.srt.model_executor import vram_family_census as vc
 
 
 def _target_and_draft():

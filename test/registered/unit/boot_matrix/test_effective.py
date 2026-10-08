@@ -7,13 +7,13 @@ reads as NOT engaged. Every parser here runs on synthetic log text; no server.
 
 import unittest
 
-from sglang.srt.boot_matrix.effective import (
+from flliper.srt.boot_matrix.effective import (
     READY_MARKER,
     first_refusal,
     report_effective,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -42,7 +42,7 @@ GOOD_BOOT = "\n".join(
         _args_dump(),
         "[2026-08-01 00:00:01 TP0] Uneven-DCP token sizing: rank 0 local "
         "capacity 320340 tokens / ratio 30 = unit 10678 (vector [30, 17, 17]).",
-        "[2026-08-01 00:00:02 TP0] sglang is using nccl==2.28.9",
+        "[2026-08-01 00:00:02 TP0] flliper is using nccl==2.28.9",
         "[2026-08-01 00:00:05 TP0] Capture draft decode CUDA graph begin.",
         # A real spec boot prints BOTH roles; the target line is the one
         # `graphs` is resolved from (#349).
@@ -73,7 +73,7 @@ class TestReportEffective(CustomTestCase):
         log = "\n".join(
             [
                 _args_dump(dcp_size="2"),
-                "[2026-08-01 00:00:02 TP0] sglang is using nccl==2.28.9",
+                "[2026-08-01 00:00:02 TP0] flliper is using nccl==2.28.9",
                 f"[2026-08-01 00:00:09] {READY_MARKER}",
             ]
         )

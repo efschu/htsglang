@@ -1,7 +1,7 @@
 """fnFL2 H74 (x172): a TP rank with one store write more than its peers still drains it.
 
 Hermetic (no CUDA). Metal x172 (D, Form A TP3: TP0 host with the arena staging pool,
-TP1/TP2 workers), 24.09. 23:37:33: D finished a 6144-token answer (rid weg2-8-13,
+TP1/TP2 workers), 24.09. 23:37:33: D finished a 6144-token answer (rid pdflip-8-13,
 prompt 107) and the front, flipping to P, polled /flush_cache. The flush publish issued
 7 write-throughs on TP0 and 6 on TP1/TP2 (``#1470 FLUSH-PUBLISH issued=7`` / ``issued=6``,
 sweeps 3+3+1 against 3+2+1): TP0 alone split the answer's 6080-token node
@@ -26,7 +26,7 @@ What these cases hold:
 * the rank-local drain alone empties asymmetric counts (7/6/6 forced); switched off the
   x172 livelock comes back, named;
 * revokes and host releases still drain the group MIN;
-* x174 (tree dbf3db8a38, D arm SGLANG_HICACHE_DRAIN_AGREE_EVERY=8), the mirror image:
+* x174 (tree dbf3db8a38, D arm FLLIPER_HICACHE_DRAIN_AGREE_EVERY=8), the mirror image:
   TP1/TP2 carried two store writes TP0 did not -- a store-loaded span keeps its host
   rows on TP0 (arena rows, #1424) and releases them on the workers (plain host pool,
   #1408 transit release), so when the burst evicted two such nodes (``#1469 EVICT
@@ -73,11 +73,11 @@ class _Rank:
     """One TP rank's tree cache: the REAL drain, window and world helpers on the
     state they touch (its queues, its ongoing_backup, its host pool)."""
 
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache as _U
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache as _U
 
     drain_storage_control_queues = _U.drain_storage_control_queues
     _drain_storage_control_queues_impl = _U._drain_storage_control_queues_impl
-    _weg2_publish_window = _U._weg2_publish_window
+    _pdflip_publish_window = _U._pdflip_publish_window
     _attn_reduce_world = _U._attn_reduce_world
     page_size = PAGE
     enable_storage_metrics = False
@@ -104,18 +104,18 @@ class _Rank:
     def dec_host_lock_ref(self, node, params):
         pass
 
-    def _weg2_rebind_host_to_arena(self, node):
+    def _pdflip_rebind_host_to_arena(self, node):
         return False
 
-    def _weg2_host_is_transit(self):
+    def _pdflip_host_is_transit(self):
         return False
 
-    def _weg2_release_chain_piece_host(self, node):
+    def _pdflip_release_chain_piece_host(self, node):
         pass
 
     def store_write_acked(self) -> None:
         """One node's store write, issued at its write-through ack
-        (``_weg2_write_plain_sidecars`` / ``write_backup_storage`` register it
+        (``_pdflip_write_plain_sidecars`` / ``write_backup_storage`` register it
         in ``ongoing_backup``) and acked by the backup thread."""
         op = SimpleNamespace(id=next(_IDS), completed_tokens=0)
         self.ongoing_backup[op.id] = (SimpleNamespace(l3_present=False), None)
@@ -139,7 +139,7 @@ def _pass(ranks) -> None:
 
 def _blockers(rank) -> list:
     """The REAL Scheduler.idle_blockers of a rank that is otherwise idle."""
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     s = SimpleNamespace(
         running_batch=SimpleNamespace(is_empty=lambda: True), chunked_req=None, anchor_tails=None,
@@ -159,7 +159,7 @@ def _flush_publish(ranks) -> list:
     the idle passes of the polling front. Returns the per-rank store writes."""
     totals = []
     for r in ranks:
-        w = r._weg2_publish_window()
+        w = r._pdflip_publish_window()
         totals.append(OTHER_NODES + (-(-ANSWER_NODE // w) if 0 < w < ANSWER_NODE else 1))
     for sweep in range(3):
         for r, total in zip(ranks, totals):
@@ -185,7 +185,7 @@ def test_d_flush_after_a_long_answer_drains_every_rank():
 
 def test_the_publish_window_is_the_same_on_every_tp_rank():
     ranks = _x172()
-    assert [r._weg2_publish_window() for r in ranks] == [4096, 4096, 4096]
+    assert [r._pdflip_publish_window() for r in ranks] == [4096, 4096, 4096]
     # ... so every rank splits the answer's node alike: 7 store writes each
     assert _flush_publish(_x172()) == [7, 7, 7]
 
@@ -193,9 +193,9 @@ def test_the_publish_window_is_the_same_on_every_tp_rank():
 def test_a_single_rank_group_keeps_its_pool_window():
     """Default path: P's stages (attn world 1) keep a quarter of their pool."""
     solo = _Group(1)
-    assert _Rank(0, solo, 6976)._weg2_publish_window() == 4096  # P's arena staging rows
-    assert _Rank(0, solo, 353600)._weg2_publish_window() == 86016
-    assert _Rank(0, solo, 54254)._weg2_publish_window() == 12288  # the #1407 pool (xsn148)
+    assert _Rank(0, solo, 6976)._pdflip_publish_window() == 4096  # P's arena staging rows
+    assert _Rank(0, solo, 353600)._pdflip_publish_window() == 86016
+    assert _Rank(0, solo, 54254)._pdflip_publish_window() == 12288  # the #1407 pool (xsn148)
 
 
 def _asymmetric(ranks, counts) -> None:
@@ -212,11 +212,11 @@ def test_the_rank_local_drain_empties_asymmetric_counts():
 
 
 def test_switched_off_the_x172_livelock_is_back(caplog):
-    """SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN=0 restores the MIN for the
+    """FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN=0 restores the MIN for the
     backup acks -- and with it the surplus that never drains."""
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
-    with envs.SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
+    with envs.FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
         ranks = _x172()
         _asymmetric(ranks, (7, 6, 6))
         for _ in range(5):
@@ -230,7 +230,7 @@ def test_the_surplus_is_named(caplog):
 
     ranks = _x172()
     _asymmetric(ranks, (1, 0, 0))
-    with caplog.at_level(logging.INFO, logger="sglang.srt.mem_cache.unified_radix_cache"):
+    with caplog.at_level(logging.INFO, logger="flliper.srt.mem_cache.unified_radix_cache"):
         _pass(ranks)
     assert "H74 BACKUP-ACK DRAIN rank-local: acks=1 group_min=0 ongoing_backup=1" in caplog.text
     assert not ranks[0].ongoing_backup
@@ -276,9 +276,9 @@ def test_x174_the_workers_surplus_drains_on_the_agreement_cadence():
 
 
 def test_x174_switched_off_the_workers_stay_stuck():
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
-    with envs.SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
+    with envs.FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
         ranks = _x172()
         _asymmetric(ranks, (0, 2, 2))
         _rounds(ranks, 24, every=8)

@@ -1,5 +1,5 @@
 """HP1 (rc12z20, boot dkrnfh91dprsavisnoadoptstbar1dauer09281220 on
-3a86888ba5, D 12:30:32-12:31:36, rid weg2-8-2): on a Form A D group the #580
+3a86888ba5, D 12:30:32-12:31:36, rid pdflip-8-2): on a Form A D group the #580
 prefetch vote compares span ENDS, not lengths from different starts.
 
 MEASURED: TP0 matched 0 (``[#904 match-census] ... refusers=MambaComponent:
@@ -24,10 +24,10 @@ import unittest
 
 import test_nf_form_a_prefetch_span_h99 as h99
 
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.mem_cache import unified_radix_cache as urc
-from sglang.srt.mem_cache.match_refusal_census import PREFETCH_GATE_COUNTS
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.mem_cache import unified_radix_cache as urc
+from flliper.srt.mem_cache.match_refusal_census import PREFETCH_GATE_COUNTS
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 END = 33600
 PROMPT = list(range(END))
@@ -59,7 +59,7 @@ RC12Z20 = {0: 0, 1: 32704, 2: 32704}
 class TestRc12z20HostReadsItsWholeSpan(unittest.TestCase):
     def test_no_group_cut_host_33600_workers_896(self):
         before = PREFETCH_GATE_COUNTS.get("host_pool_truncated_group", 0)
-        _c, results, errors, group = _intake(RC12Z20, "weg2-8-2")
+        _c, results, errors, group = _intake(RC12Z20, "pdflip-8-2")
         self.assertEqual(errors, {}, errors)
         self.assertEqual(group.errors, [])
         self.assertEqual(
@@ -72,9 +72,9 @@ class TestRc12z20HostReadsItsWholeSpan(unittest.TestCase):
         )
 
     def test_the_completion_min_keeps_the_hosts_read(self):
-        caches, _r, errors, _g = _intake(RC12Z20, "weg2-8-2")
+        caches, _r, errors, _g = _intake(RC12Z20, "pdflip-8-2")
         self.assertEqual(errors, {})
-        bases = {r: caches[r]._hp1_end_base_by_rid["weg2-8-2"] for r in caches}
+        bases = {r: caches[r]._hp1_end_base_by_rid["pdflip-8-2"] for r in caches}
         self.assertEqual(bases, RC12Z20)
         completed = {0: 33600, 1: 896, 2: 896}
         packs = {r: urc._hp1_end_pack(bases[r], completed[r], completed[r], urc._ANCHOR_ABSTAIN)
@@ -104,7 +104,7 @@ class TestRc12z20HostReadsItsWholeSpan(unittest.TestCase):
 
     def test_rc9o_shape_workers_register_to_the_hosts_end(self):
         bases = {0: h99.TP0_PREFIX, 1: h99.WORKER_PREFIX, 2: h99.WORKER_PREFIX}
-        _c, results, errors, _g = _intake(bases, "weg2-33-33", end=h99.MATCH_END)
+        _c, results, errors, _g = _intake(bases, "pdflip-33-33", end=h99.MATCH_END)
         self.assertEqual(errors, {}, errors)
         self.assertEqual(results[0], (320, 320))
         self.assertEqual(results[1], (6720, 6720), "worker ends where the host ends")
@@ -138,7 +138,7 @@ class TestPieces(unittest.TestCase):
     def test_scheduler_passes_the_span_start(self):
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler._prefetch_kvcache)
         self.assertIn("span_base=int(_matched_len)", src)
@@ -148,13 +148,13 @@ class _Sched:
     def __init__(self):
         self.observed = 0
 
-    def _weg2_note_prefetch_progress(self, req):
+    def _pdflip_note_prefetch_progress(self, req):
         self.observed += 1
         return "stalled"
 
 
 def _due(sched, req):
-    from sglang.srt.managers.scheduler import _hp1_group_retry_due
+    from flliper.srt.managers.scheduler import _hp1_group_retry_due
 
     return _hp1_group_retry_due(sched, req)
 
@@ -162,7 +162,7 @@ def _due(sched, req):
 class TestRetryBackoff(unittest.TestCase):
     def test_group_mark_retries_on_a_pass_backoff(self):
         s = _Sched()
-        req = types.SimpleNamespace(rid="weg2-8-2", prefetch_deferred="host_pool_shortfall",
+        req = types.SimpleNamespace(rid="pdflip-8-2", prefetch_deferred="host_pool_shortfall",
                                     prefetch_defer_since=1.0)
         due = [n for n in range(1, 65) if _due(s, req)]
         self.assertEqual(due, [1, 2, 4, 8, 16, 32, 48, 64])

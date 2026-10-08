@@ -186,7 +186,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60)
 
@@ -217,7 +217,7 @@ JOIN_TIMEOUT_S = 20.0
 
 def _make_holder(rank):
     """Bind the SHIPPED PP mixin methods to a minimal holder, #757-style."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     ps = types.SimpleNamespace(
         pp_rank=rank,
@@ -315,7 +315,7 @@ def _worker(rank, init_file, out_dir, variant, n_local_passes, downstream_passes
     waiting on before teardown, so a rank that intentionally outruns a
     downstream peer that already exited (the asymmetric/telescoping case)
     does not hang waiting for a receive nobody will ever post."""
-    from sglang.srt.utils.common import point_to_point_pyobj
+    from flliper.srt.utils.common import point_to_point_pyobj
 
     neutered = variant == "neutered"
     progress_path = os.path.join(out_dir, f"progress_r{rank}.json")

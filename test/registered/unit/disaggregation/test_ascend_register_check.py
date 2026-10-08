@@ -9,10 +9,10 @@ manager does not check it. Same failure family as the Mooncake path.
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.ascend.conn import AscendKVManager
-from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.disaggregation.ascend.conn import AscendKVManager
+from flliper.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

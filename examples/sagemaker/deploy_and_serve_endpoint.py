@@ -22,7 +22,7 @@ model = Model(
     image_uri=image_uri,
     role=sm_role,
     env={
-        "SM_SGLANG_MODEL_PATH": model_id,
+        "SM_FLLIPER_MODEL_PATH": model_id,
         "HF_TOKEN": hf_token,
     },
 )

@@ -8,18 +8,18 @@ import pytest
 import torch
 from rich.console import Console
 
-from sglang.srt.debug_utils.comparator.display import (
+from flliper.srt.debug_utils.comparator.display import (
     _collect_input_ids_and_positions,
     _collect_rank_info,
     _extract_parallel_info,
     _render_polars_as_rich_table,
     _render_polars_as_text,
 )
-from sglang.srt.debug_utils.comparator.output_types import (
+from flliper.srt.debug_utils.comparator.output_types import (
     InputIdsRecord,
     RankInfoRecord,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 
@@ -72,7 +72,7 @@ class TestRenderPolarsAsText:
 
 class TestCollectRankInfo:
     def test_collects_rank_info(self, tmp_path: Path) -> None:
-        sglang_info = {
+        flliper_info = {
             "tp_rank": 0,
             "tp_size": 2,
             "pp_rank": 0,
@@ -85,7 +85,7 @@ class TestCollectRankInfo:
             rank=0,
             dump_index=0,
             value=torch.tensor([1, 2, 3]),
-            meta={"sglang_parallel_info": sglang_info},
+            meta={"flliper_parallel_info": flliper_info},
         )
         df = _make_df(
             [
@@ -123,7 +123,7 @@ class TestCollectRankInfo:
         assert result is None
 
     def test_deduplicates_ranks(self, tmp_path: Path) -> None:
-        meta = {"sglang_parallel_info": {"tp_rank": 0, "tp_size": 1}}
+        meta = {"flliper_parallel_info": {"tp_rank": 0, "tp_size": 1}}
         f1: str = _save_dump_file(
             tmp_path,
             name="input_ids",

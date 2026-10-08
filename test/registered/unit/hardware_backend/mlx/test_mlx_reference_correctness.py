@@ -5,10 +5,10 @@ black-box smoke tests: they only check that a served model emits *plausible* tex
 ("Paris" appears, "4" appears). A subtly broken KV cache, slot allocator, or
 prefill-chunking change can still pass those.
 
-This is the strong guard. The SGLang MLX backend executes models by wrapping
+This is the strong guard. The fLLiper MLX backend executes models by wrapping
 ``mlx_lm`` (``mlx_lm.load`` + the model's own forward, with attention patched for
-SGLang's cache) and decodes greedily (``mx.argmax``). So the ground truth for "did
-SGLang corrupt the output?" is raw, *unpatched* ``mlx_lm`` greedy generation on the
+fLLiper's cache) and decodes greedily (``mx.argmax``). So the ground truth for "did
+fLLiper corrupt the output?" is raw, *unpatched* ``mlx_lm`` greedy generation on the
 same prompt. We record those reference tokens, then drive ``MlxModelRunner``
 (prefill + decode_batch) and assert the tokens match exactly, up to and including
 EOS. Empirically the agreement is exact (not approximate), so any divergence here
@@ -28,9 +28,9 @@ runner -- keeping peak at a single model copy. A pre-flight free-memory check sk
 
 MLX-gated like its siblings: registered on the CPU suite but skipped wherever the
 ``mlx`` package is absent (all current CI runners), so it runs for real only on
-Apple Silicon. Override the model with ``SGLANG_MLX_TEST_MODEL`` (e.g. a local path
+Apple Silicon. Override the model with ``FLLIPER_MLX_TEST_MODEL`` (e.g. a local path
 or ``mlx-community/Qwen3-30B-A3B-4bit`` for qwen3_moe); bump
-``SGLANG_MLX_TEST_MIN_FREE_GB`` accordingly for larger models.
+``FLLIPER_MLX_TEST_MIN_FREE_GB`` accordingly for larger models.
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ import importlib.util
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-b-e2e-mlx")
@@ -55,14 +55,14 @@ _SKIP_REASON = "requires mlx + mlx_lm (Apple Silicon only)"
 # Default to the portable mlx-community 4-bit qwen2_moe repo; override to a local
 # dir or another MoE arch (e.g. Qwen3-30B-A3B-4bit) via the env var.
 MODEL_PATH = os.environ.get(
-    "SGLANG_MLX_TEST_MODEL", "mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit"
+    "FLLIPER_MLX_TEST_MODEL", "mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit"
 )
-MEM_FRACTION_STATIC = float(os.environ.get("SGLANG_MLX_TEST_MEM_FRACTION", "0.7"))
+MEM_FRACTION_STATIC = float(os.environ.get("FLLIPER_MLX_TEST_MEM_FRACTION", "0.7"))
 # Skip (do NOT crash) unless this much system memory is free: enough for ONE
 # resident model copy plus activations. An MLX Metal OOM is uncatchable and can
 # reboot the machine, so this guard must fail safe. ~12 GB suits the default
 # 14.3B-param 4-bit qwen2_moe; raise it for qwen3_moe (~18+).
-MIN_FREE_GB = float(os.environ.get("SGLANG_MLX_TEST_MIN_FREE_GB", "12"))
+MIN_FREE_GB = float(os.environ.get("FLLIPER_MLX_TEST_MIN_FREE_GB", "12"))
 
 # Short prompts with deterministic, quickly-terminating greedy answers.
 PROMPTS = [
@@ -94,7 +94,7 @@ class TestMlxReferenceCorrectness(CustomTestCase):
         if avail is not None and avail < MIN_FREE_GB:
             raise unittest.SkipTest(
                 f"insufficient free memory: {avail:.1f} GB < {MIN_FREE_GB} GB needed "
-                f"to safely load {MODEL_PATH} (override SGLANG_MLX_TEST_MIN_FREE_GB)"
+                f"to safely load {MODEL_PATH} (override FLLIPER_MLX_TEST_MIN_FREE_GB)"
             )
 
         # --- Phase 1: reference tokens from UNPATCHED mlx_lm (one copy resident) ---
@@ -135,8 +135,8 @@ class TestMlxReferenceCorrectness(CustomTestCase):
                 "skipping to avoid a double-resident OOM"
             )
 
-        # --- Phase 2: SGLang runner (one copy resident) ---
-        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
+        # --- Phase 2: fLLiper runner (one copy resident) ---
+        from flliper.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
         cls.runner = MlxModelRunner(
             model_path=MODEL_PATH,
@@ -192,8 +192,8 @@ class TestMlxReferenceCorrectness(CustomTestCase):
     def _decode(self, rids):
         return [int(t) for t in self.runner.decode_batch(rids)]
 
-    def _sglang_greedy(self, rid, prompt_ids, max_new):
-        """SGLang MLX greedy generation, stopping at EOS like the reference."""
+    def _flliper_greedy(self, rid, prompt_ids, max_new):
+        """fLLiper MLX greedy generation, stopping at EOS like the reference."""
         tok = self._prefill(rid, prompt_ids)
         out = [tok]
         while len(out) < max_new and tok not in self.eos_ids:
@@ -215,9 +215,9 @@ class TestMlxReferenceCorrectness(CustomTestCase):
     # --- tests ------------------------------------------------------------
 
     def test_greedy_matches_reference_exact(self):
-        """SGLang MLX greedy output == unpatched mlx_lm greedy output, token-for-token."""
+        """fLLiper MLX greedy output == unpatched mlx_lm greedy output, token-for-token."""
         for i, (prompt, prompt_ids, ref) in enumerate(self.cases):
-            sgl = self._sglang_greedy(f"ref-{i}", prompt_ids, MAX_NEW_TOKENS)
+            sgl = self._flliper_greedy(f"ref-{i}", prompt_ids, MAX_NEW_TOKENS)
             self.assertEqual(sgl, ref, self._diff_msg(prompt, ref, sgl))
 
     def test_batched_decode_matches_solo(self):

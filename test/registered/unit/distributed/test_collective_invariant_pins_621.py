@@ -7,7 +7,7 @@ list holds seven items across ``expert_offload``, ``hiradix_cache``,
 ``distributed/`` sweep. That audit does carry operator-verified quotes of
 exactly the right class inline, so these pins were RE-DERIVED: seeded from the
 audit's own quotes and extended by a scoped sweep of
-``python/sglang/srt/distributed/``.
+``python/flliper/srt/distributed/``.
 
 THE CLASS. Comments and docstrings claiming a collective-correctness invariant
 -- "must", "never", "rank-uniform", "every rank" -- with nothing in the code
@@ -35,11 +35,11 @@ falsehood, and none of them would block the fix.
 import inspect
 import unittest
 
-from sglang.srt.distributed.device_communicators import (
+from flliper.srt.distributed.device_communicators import (
     barlink_bar1,
     barlink_path_dispatcher,
 )
-from sglang.srt.distributed.device_communicators.barlink_path_dispatcher import (
+from flliper.srt.distributed.device_communicators.barlink_path_dispatcher import (
     STATUS_QUO,
     DispatchRequest,
     PathDispatcher,
@@ -153,7 +153,7 @@ class TestTheRealReconciliationsStayInPlace(unittest.TestCase):
     def test_custom_allreduce_enablement_is_harmonised_on_divergence(self):
         """The known-good exemplar the other sites should imitate: gather the
         local answer, and disable for EVERYONE when the ranks disagree."""
-        from sglang.srt.distributed import parallel_state
+        from flliper.srt.distributed import parallel_state
 
         # It is a METHOD on GroupCoordinator (parallel_state.py:1074), called
         # from the constructor at :974 -- not a module-level function.

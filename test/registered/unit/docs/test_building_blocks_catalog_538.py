@@ -6,7 +6,7 @@ line makes this test fail instead of leaving a dead pointer in the catalog.
 
 Deliberately cheap: no imports of the target modules, no torch, no GPU. It
 resolves paths and counts lines, nothing else -- the checks themselves run in
-well under a tenth of a second, and the only real cost is the shared ``sglang``
+well under a tenth of a second, and the only real cost is the shared ``flliper``
 import that CI registration requires. It does NOT check that the
 cited line still holds the cited symbol -- that would need a parser per
 language and would fail on every unrelated insertion above; the line number is
@@ -21,15 +21,15 @@ from pathlib import Path
 
 import pytest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CATALOG = REPO_ROOT / "docs" / "dev" / "FEATURE_CATALOG.md"
-SRT = REPO_ROOT / "python" / "sglang" / "srt"
+SRT = REPO_ROOT / "python" / "flliper" / "srt"
 
-#: Paths in section 18 are relative to ``python/sglang/srt`` unless they start
+#: Paths in section 18 are relative to ``python/flliper/srt`` unless they start
 #: with one of these repo-root-relative prefixes.
 ROOT_RELATIVE_PREFIXES = ("tests/", "test/", "docs/", "scripts/", "python/")
 

@@ -19,11 +19,11 @@ import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.planner import profile_couplings as PC  # noqa: E402
-from sglang.srt.weg2 import model_profile as MP  # noqa: E402
+from flliper.srt.planner import profile_couplings as PC  # noqa: E402
+from flliper.srt.pdflip import model_profile as MP  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FX = os.path.join(HERE, "..", "weg2", "fixtures", "profil_s3_1003")
+FX = os.path.join(HERE, "..", "pdflip", "fixtures", "profil_s3_1003")
 RIG3 = [("NVIDIA GeForce RTX 5090", 32607, 1400.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0)]
 _M = {}
 

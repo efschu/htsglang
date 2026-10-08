@@ -36,7 +36,7 @@ import unittest
 
 import torch
 
-from sglang.srt.configs.model_config import ModelConfig
+from flliper.srt.configs.model_config import ModelConfig
 
 MODEL_ROOT = "/spinning/llm_stuff/club-3090/models-cache"
 DFLASH_GGUF = f"{MODEL_ROOT}/qwen3.6-27b-dflash-gguf/Qwen3.6-27B-DFlash-Q8_0.gguf"
@@ -159,8 +159,8 @@ class TestReplicatedLinearTakesAPackedWeight(unittest.TestCase):
     """`fc` is a ReplicatedLinear, and the drafter ships it packed."""
 
     def _module(self):
-        from sglang.srt.layers.linear import ReplicatedLinear
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
+        from flliper.srt.layers.linear import ReplicatedLinear
+        from flliper.srt.layers.quantization.gguf import GGUFConfig
 
         return ReplicatedLinear(
             256, 64, bias=False, quant_config=GGUFConfig(), prefix="fc"
@@ -188,7 +188,7 @@ class TestReplicatedLinearTakesAPackedWeight(unittest.TestCase):
         self.assertEqual(lin.qweight_type.weight_type, 8)
 
     def test_a_dense_replicated_linear_is_unchanged(self):
-        from sglang.srt.layers.linear import ReplicatedLinear
+        from flliper.srt.layers.linear import ReplicatedLinear
 
         lin = ReplicatedLinear(256, 64, bias=False, prefix="fc")
         w = torch.randn(64, 256, dtype=lin.weight.dtype)
@@ -213,7 +213,7 @@ class TestTheDrafterLoadsOrSaysSo(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sglang.srt.runtime_context import _CONTEXT
+        from flliper.srt.runtime_context import _CONTEXT
 
         # RotaryEmbedding reads one server-args field during construction.
         if getattr(_CONTEXT, "_server_args", None) is None:
@@ -221,8 +221,8 @@ class TestTheDrafterLoadsOrSaysSo(unittest.TestCase):
         cls.cfg = _draft_hf_config()
 
     def _build(self, quant_config):
-        from sglang.srt.models.dflash import DFlashDraftModel
-        from sglang.srt.runtime_context import get_parallel
+        from flliper.srt.models.dflash import DFlashDraftModel
+        from flliper.srt.runtime_context import get_parallel
 
         with get_parallel().override(
             tp_size=1, tp_rank=0, world_size=1, world_rank=0, pp_size=1, pp_rank=0
@@ -235,14 +235,14 @@ class TestTheDrafterLoadsOrSaysSo(unittest.TestCase):
                 torch.set_default_dtype(prev)
 
     def _stream(self):
-        from sglang.srt.model_loader.gguf_dflash import build_dflash_name_map
-        from sglang.srt.model_loader.weight_utils import gguf_quant_weights_iterator
+        from flliper.srt.model_loader.gguf_dflash import build_dflash_name_map
+        from flliper.srt.model_loader.weight_utils import gguf_quant_weights_iterator
 
         return gguf_quant_weights_iterator(DFLASH_GGUF, build_dflash_name_map(self.cfg))
 
     def _gguf_quant_config(self):
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
-        from sglang.srt.model_loader.gguf_dflash import (
+        from flliper.srt.layers.quantization.gguf import GGUFConfig
+        from flliper.srt.model_loader.gguf_dflash import (
             dflash_unquantized_module_prefixes,
         )
 

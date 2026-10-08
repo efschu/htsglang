@@ -1,0 +1,441 @@
+# Copyright 2025 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Common config utils for mamba2 - NemotronH, FalconH1, Qwen3Next, LFM2, etc."""
+
+import logging
+from abc import ABC
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import numpy as np
+import torch
+
+from flliper.srt.distributed.utils import divide, tp_partition_size, tp_plan_active
+from flliper.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
+
+def extra_groups_for_head_shards(ngroups: int, tp_size: int):
+    """Compute the increase in group numbers to account for
+    replication in order to accompany the head shards."""
+
+    # in the case ngoups % tp_size == 0, this will be zero
+    if ngroups % tp_size == 0:
+        return 0
+
+    # for n_groups == 1, this is exactly tp_size - n_groups
+    return tp_size - ngroups
+
+
+@dataclass(kw_only=True, frozen=True)
+class Mamba2StateDType:
+    conv: torch.dtype
+    temporal: torch.dtype
+
+
+def _model_dtype_from_config(config) -> Optional[torch.dtype]:
+    """Best-effort extraction of the model's runtime activation dtype from a
+    (text) config. Returns one of {float16, bfloat16, float32} or None.
+
+    For VL/hybrid models the runtime dtype lives on the text sub-config; the
+    mamba cache is built from the text config directly, but we also look into
+    a nested ``text_config`` defensively. transformers renamed ``torch_dtype``
+    to ``dtype`` (with the old name deprecated), so accept either.
+    """
+    if config is None:
+        return None
+
+    def _extract(cfg):
+        return getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None)
+
+    dt = _extract(config)
+    if dt is None and hasattr(config, "text_config"):
+        dt = _extract(config.text_config)
+
+    if isinstance(dt, str):
+        return {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "half": torch.float16,
+        }.get(dt)
+    if isinstance(dt, torch.dtype):
+        if dt in (torch.float16, torch.bfloat16, torch.float32):
+            return dt
+    return None
+
+
+def mamba2_state_dtype(config=None) -> Mamba2StateDType:
+    """
+    Get mamba2 state dtype from config or environment variable.
+
+    Priority (from highest to lowest):
+    1. Environment variable FLLIPER_MAMBA_SSM_DTYPE
+    2. Config file (config.mamba_ssm_dtype or config.text_config.mamba_ssm_dtype)
+    3. Default "float32"
+
+    Args:
+        config: Optional config object (PretrainedConfig). If provided, will read
+                mamba_ssm_dtype from it. For VL models, reads from text_config.
+
+    Returns:
+        Mamba2StateDType with conv and temporal dtypes
+    """
+    dtype_map = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
+
+    # The conv-state cache stores recent *input activations* for the causal
+    # conv1d, so its dtype MUST match the model's runtime activation dtype.
+    # Hardcoding bfloat16 silently breaks any model whose config resolves to
+    # float16 (e.g. AWQ / compressed-tensors checkpoints without an explicit
+    # torch_dtype -> "auto" downcasts float32 to float16): the GDN in_proj
+    # emits fp16 while a bf16 conv cache rejects the write
+    # (`Index put requires source and destination dtypes match`). Follow the
+    # model dtype from the config instead; fall back to bfloat16 only when no
+    # config dtype is available. An explicit FLLIPER_MAMBA_CONV_DTYPE always wins.
+    #
+    # There are TWO ways the config can disagree with the runtime dtype, and the
+    # AWQ downcast above is only the first. The second is a runtime override:
+    # ModelRunner.load_model() re-decides the dtype on a device without bfloat16
+    # (`_needs_float16_fallback()`, sm75 / gfx900) LONG after the HF config was
+    # read, so a bf16 checkpoint runs in fp16 with the config still saying bf16.
+    # Reading `config` here would then hand back bf16 and every hybrid GDN
+    # Qwen3.5 would be unbootable on sm75 with exactly the error above. That is
+    # handled at the source: `ModelConfig.dtype` is a property whose setter pins
+    # the resolved dtype onto the HF config(s), so the override is visible here
+    # too and this function needs no notion of the runtime at all.
+    # NOTE: FLLIPER_MAMBA_CONV_DTYPE has a non-None default ("bfloat16"), so we
+    # must check is_set() — not the returned value — to know whether the user
+    # explicitly pinned the conv dtype. Only an explicit override wins; the
+    # default defers to the model's runtime dtype.
+    if envs.FLLIPER_MAMBA_CONV_DTYPE.is_set():
+        conv_dtype = dtype_map.get(
+            envs.FLLIPER_MAMBA_CONV_DTYPE.get(), torch.bfloat16
+        )
+    else:
+        conv_dtype = _model_dtype_from_config(config) or torch.bfloat16
+
+    # Get SSM dtype: default -> config -> env var
+    ssm_dtype = torch.float32  # Step 1: Default value
+
+    # Step 2: Try to read from config
+    if config is not None:
+        config_dtype = None
+        if hasattr(config, "text_config") and hasattr(
+            config.text_config, "mamba_ssm_dtype"
+        ):
+            # VL model: read from text_config
+            config_dtype = config.text_config.mamba_ssm_dtype
+        elif hasattr(config, "mamba_ssm_dtype"):
+            # Text model: read from root config
+            config_dtype = config.mamba_ssm_dtype
+
+        if config_dtype is not None:
+            if config_dtype not in dtype_map:
+                logger.warning(
+                    f"Invalid mamba_ssm_dtype '{config_dtype}' in config. "
+                    f"Must be one of {list(dtype_map.keys())}. Using default 'float32'."
+                )
+            else:
+                ssm_dtype = dtype_map[config_dtype]
+
+    # Step 3: Check environment variable, if not None, override
+    env_ssm_dtype = envs.FLLIPER_MAMBA_SSM_DTYPE.get()
+    if env_ssm_dtype is not None:
+        if env_ssm_dtype not in dtype_map:
+            logger.warning(
+                f"Invalid mamba_ssm_dtype '{env_ssm_dtype}' from environment variable. "
+                f"Must be one of {list(dtype_map.keys())}. Using default 'float32'."
+            )
+        else:
+            ssm_dtype = dtype_map[env_ssm_dtype]
+
+    logger.debug(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
+
+    return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
+
+
+@dataclass(kw_only=True, frozen=True)
+class BaseLinearStateParams(ABC):
+    dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
+    layers: list[int]
+
+    @property
+    def mamba_cache_per_req(self) -> int:
+        conv_numel = int(
+            np.sum([np.prod(conv_shape) for conv_shape in self.shape.conv])
+        )
+
+        ssm_numel = int(np.prod(self.shape.temporal))
+        return (
+            conv_numel * self.dtype.conv.itemsize
+            + ssm_numel * self.dtype.temporal.itemsize
+        ) * len(self.layers)
+
+    def spec_ring_workspace_bytes_per_req(self, draft_tokens: int, ring_len: int) -> int:
+        """27B ReplaySSM package (S5): the target-verify workspace of ONE request
+        row, all layers, when the spec ring replaces the per-draft intermediate
+        state (--enable-linear-replayssm-spec).
+
+        Exactly what the pool allocates per request row in that mode: the conv
+        verify windows, which stay (the deduplicated sliding-window layout,
+        ``[conv_dim, D + (K-1) - 1]`` per layer -- the layout of every
+        ring-eligible verify, CUDA with a linear draft chain), plus the ring
+        (:meth:`replayssm_ring_bytes_per_req`). The recurrent route keeps its
+        established post, ``mamba_cache_per_req * D``.
+        """
+        conv_b = self.dtype.conv.itemsize
+        conv_windows = (
+            sum(
+                int(dim) * (int(draft_tokens) + int(win) - 1)
+                for dim, win in self.shape.conv
+            )
+            * conv_b
+            * len(self.layers)
+        )
+        return conv_windows + self.replayssm_ring_bytes_per_req(ring_len)
+
+    def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
+        """ReplaySSM spec-verify scratch bytes of ONE request row, all layers.
+
+        Upstream main (configs/mamba_utils.py, chain #28695..#35544). GDN keeps
+        compact d/k/g plus low parts for the activation-dtype d/k rings; KDA
+        keeps its raw-input fold window and d/k rings. The shape is this
+        rank's (uneven GDN TP: num_k_heads_per_tp / temporal come from the
+        per-rank plan), so the same formula prices every rank of the group.
+        """
+        hv, v_dim, k_dim = self.shape.temporal
+        h_k = self.shape.num_k_heads_per_tp
+        conv_b = self.dtype.conv.itemsize
+        fp32_b = 4
+        if self.is_kda:
+            per_layer = (
+                hv * record_len * v_dim * conv_b  # rawv
+                + h_k * record_len * k_dim * conv_b  # rawk
+                + hv * record_len * fp32_b  # beta
+                + hv * record_len * k_dim * fp32_b  # vector g
+                + hv * record_len * v_dim * conv_b  # d
+                + h_k * record_len * k_dim * conv_b  # k
+            )
+        else:
+            per_layer = (
+                hv * record_len * v_dim * conv_b  # d
+                + h_k * record_len * k_dim * conv_b  # normalized k
+                + hv * record_len * fp32_b  # scalar g
+            )
+            if self.dtype.conv != torch.float32:
+                per_layer += (
+                    hv * record_len * v_dim * conv_b  # d low part
+                    + h_k * record_len * k_dim * conv_b  # normalized-k low part
+                )
+        return per_layer * len(self.layers)
+
+    @property
+    def is_kda(self) -> bool:
+        """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
+        the ReplaySSM ring ``g_cache`` layout ([.., L] scalar vs [.., L, K]
+        per-K) and the gate-generic decode kernel's ``IS_KDA`` path."""
+        return False
+
+
+@dataclass(kw_only=True, frozen=True)
+class Mamba2StateShape:
+    conv: list[tuple[int, int]]
+    temporal: tuple[int, int, int]
+
+    intermediate_size: int
+    conv_dim: int
+    ssm_state_size: int
+    num_heads: int
+    head_dim: int
+    state_size: int
+    conv_kernel: int
+    # Number of key/group heads after TP sharding (== runtime `H` the packed
+    # GDN kernels infer from `mixed_qkv`). Used by the GDN ReplaySSM ring
+    # buffer (k_cache) to size/stride exactly like the kernel expects.
+    num_k_heads_per_tp: int = 1
+    # Unit family the uneven-TP (--rank-tp-ratio) partition was computed in
+    # (see tp_partition_size); None on the classic even-divide path. Kept so
+    # PD disaggregation can recompute every rank's dim slice offsets
+    # (prefix sums over tp_partition_size) for uneven state transfer.
+    partition_units: Optional[int] = None
+
+    @staticmethod
+    def create(
+        *,
+        tp_world_size: int,
+        intermediate_size: int,
+        n_groups: int,
+        num_heads: int,
+        head_dim: int,
+        state_size: int,
+        conv_kernel: int,
+        tp_rank: Optional[int] = None,
+        tp_units: Optional[int] = None,
+    ) -> "Mamba2StateShape":
+        if tp_plan_active(tp_world_size):
+            # Uneven TP (--rank-tp-ratio): the GDN layers partition the
+            # k/v heads and the conv channels in whole units (see
+            # Qwen3_5GatedDeltaNet.gdn_tp_units — normally the k heads, but
+            # coarsened for GGUF K-quant so shards land on a quant block), so
+            # the per-rank state shapes must follow the SAME unit partition.
+            # Requires the caller to pass this rank (worker processes know it).
+            if tp_rank is None:
+                raise ValueError(
+                    "Mamba2StateShape.create needs tp_rank when an "
+                    "uneven-TP shard plan is installed."
+                )
+            units = tp_units if tp_units is not None else n_groups
+            num_k_heads_per_tp = tp_partition_size(
+                n_groups, tp_world_size, tp_rank, units
+            )
+            conv_dim = intermediate_size + 2 * n_groups * state_size
+            conv_state_shape = (
+                tp_partition_size(conv_dim, tp_world_size, tp_rank, units),
+                conv_kernel - 1,
+            )
+            temporal_state_shape = (
+                tp_partition_size(num_heads, tp_world_size, tp_rank, units),
+                head_dim,
+                state_size,
+            )
+            return Mamba2StateShape(
+                conv=[conv_state_shape],
+                temporal=temporal_state_shape,
+                intermediate_size=intermediate_size,
+                conv_dim=conv_dim,
+                ssm_state_size=state_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                state_size=state_size,
+                conv_kernel=conv_kernel,
+                num_k_heads_per_tp=num_k_heads_per_tp,
+                partition_units=units,
+            )
+        # The q/k projections are sharded by `num_k_heads // tp` heads (the
+        # ORIGINAL n_groups, before the conv head-shard extension below), so the
+        # runtime `H` the packed kernels see equals divide(n_groups, tp). Only
+        # meaningful (and only consumed) for the GDN ReplaySSM path, which
+        # requires evenly divisible heads; fall back to ceil-div otherwise.
+        num_k_heads_per_tp = (
+            divide(n_groups, tp_world_size)
+            if n_groups % tp_world_size == 0
+            else -(-n_groups // tp_world_size)
+        )
+        # if n_groups is not divisible by world_size, need to extend the shards
+        # to ensure all groups needed by a head is sharded along with it
+        if n_groups % tp_world_size != 0:
+            extra_groups = extra_groups_for_head_shards(n_groups, tp_world_size)
+            n_groups += extra_groups
+        # heads and n_groups are TP-ed
+        conv_dim = intermediate_size + 2 * n_groups * state_size
+
+        # contiguous along 'dim' axis
+        conv_state_shape = divide(conv_dim, tp_world_size), conv_kernel - 1
+
+        # These are not TP-ed as they depend on A, dt_bias, D
+        # - they are typically small
+        #   e.g., QWen3-Next: (32, 128, 128)
+        temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+        return Mamba2StateShape(
+            conv=[conv_state_shape],
+            temporal=temporal_state_shape,
+            intermediate_size=intermediate_size,
+            conv_dim=conv_dim,
+            ssm_state_size=state_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+            num_k_heads_per_tp=num_k_heads_per_tp,
+        )
+
+
+@dataclass(kw_only=True, frozen=True)
+class Mamba2CacheParams(BaseLinearStateParams):
+    shape: Mamba2StateShape
+
+
+@dataclass(kw_only=True, frozen=True)
+class KimiLinearStateShape:
+    conv: List[tuple[int, int]]
+    temporal: tuple[int, int, int]
+
+    num_heads: int
+    head_dim: int
+    num_k_heads: int
+    head_k_dim: int
+    conv_kernel: int
+    num_spec: int
+    # Number of key heads after TP sharding (== runtime ``H`` the KDA packed
+    # kernels infer from ``mixed_qkv``). Mirrors Mamba2StateShape; consumed by
+    # the ReplaySSM ring (k_cache) to size/stride exactly like the kernel.
+    num_k_heads_per_tp: int = 1
+
+    @staticmethod
+    def create(
+        *,
+        tp_world_size: int,
+        num_heads: int,
+        head_dim: int,
+        num_k_heads: Optional[int] = None,
+        head_k_dim: Optional[int] = None,
+        conv_kernel_size: int = 4,
+        num_spec: int = 0,
+    ) -> "KimiLinearStateShape":
+        if num_k_heads is None:
+            num_k_heads = num_heads
+        if head_k_dim is None:
+            head_k_dim = head_dim
+        num_k_heads_per_tp = (
+            divide(num_k_heads, tp_world_size)
+            if num_k_heads % tp_world_size == 0
+            else -(-num_k_heads // tp_world_size)
+        )
+
+        proj_size = num_heads * head_dim
+        proj_k_size = num_k_heads * head_k_dim
+
+        conv_state_shape = (divide(proj_size, tp_world_size), conv_kernel_size - 1)
+        conv_state_k_shape = (divide(proj_k_size, tp_world_size), conv_kernel_size - 1)
+        temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
+
+        conv_state_shape = (
+            conv_state_shape[1],
+            conv_state_shape[0] + conv_state_k_shape[0] * 2,
+        )
+
+        return KimiLinearStateShape(
+            conv=[conv_state_shape],
+            temporal=temporal_state_shape,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            conv_kernel=conv_kernel_size,
+            num_spec=num_spec,
+            num_k_heads_per_tp=num_k_heads_per_tp,
+        )
+
+
+@dataclass(kw_only=True, frozen=True)
+class KimiLinearCacheParams(BaseLinearStateParams):
+    shape: KimiLinearStateShape
+
+    @property
+    def is_kda(self) -> bool:
+        return True

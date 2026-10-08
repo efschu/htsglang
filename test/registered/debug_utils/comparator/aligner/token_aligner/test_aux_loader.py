@@ -5,23 +5,23 @@ import polars as pl
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader import (
     _detect_plugin,
     _ensure_dims_in_metas,
     _load_and_align_aux_tensor,
     _load_non_tensor_aux,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins import (
     _MegatronPlugin,
-    _SGLangPlugin,
+    _FlliperPlugin,
 )
-from sglang.srt.debug_utils.comparator.log_sink import LogSink
-from sglang.srt.debug_utils.comparator.output_types import ErrorLog, InfoLog
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.log_sink import LogSink
+from flliper.srt.debug_utils.comparator.output_types import ErrorLog, InfoLog
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 
-_sglang_plugin = _SGLangPlugin()
+_flliper_plugin = _FlliperPlugin()
 _megatron_plugin = _MegatronPlugin()
 
 
@@ -65,7 +65,7 @@ class TestEnsureDimsInMetas:
 
     def _make_meta(self, *, cp_size: int = 1, cp_rank: int = 0) -> dict:
         return {
-            "sglang_parallel_info": {
+            "flliper_parallel_info": {
                 "tp_rank": 0,
                 "tp_size": 1,
                 "cp_rank": cp_rank,
@@ -77,7 +77,7 @@ class TestEnsureDimsInMetas:
         """Without CP parallelism, metas are returned as-is."""
         metas: list[dict] = [self._make_meta(cp_size=1)]
         result = _ensure_dims_in_metas(
-            name="input_ids", plugin=_sglang_plugin, metas=metas, ndim=1
+            name="input_ids", plugin=_flliper_plugin, metas=metas, ndim=1
         )
         assert result is metas
 
@@ -85,31 +85,31 @@ class TestEnsureDimsInMetas:
         """If dims is already in meta, metas are returned as-is."""
         metas: list[dict] = [{**self._make_meta(cp_size=2, cp_rank=0), "dims": "t"}]
         result = _ensure_dims_in_metas(
-            name="input_ids", plugin=_sglang_plugin, metas=metas, ndim=1
+            name="input_ids", plugin=_flliper_plugin, metas=metas, ndim=1
         )
         assert result is metas
 
-    def test_cp_sharded_sglang_input_ids_infers_dims(self):
-        """CP + input_ids in sglang infers dims 't[cp:zigzag]'."""
+    def test_cp_sharded_flliper_input_ids_infers_dims(self):
+        """CP + input_ids in flliper infers dims 't[cp:zigzag]'."""
         metas: list[dict] = [
             self._make_meta(cp_size=2, cp_rank=0),
             self._make_meta(cp_size=2, cp_rank=1),
         ]
         result = _ensure_dims_in_metas(
-            name="input_ids", plugin=_sglang_plugin, metas=metas, ndim=1
+            name="input_ids", plugin=_flliper_plugin, metas=metas, ndim=1
         )
         assert result is not metas
         assert result[0]["dims"] == "t[cp:zigzag]"
         assert result[1]["dims"] == "t[cp:zigzag]"
 
-    def test_cp_sharded_sglang_positions_infers_dims(self):
-        """CP + positions in sglang infers dims 't[cp:zigzag]'."""
+    def test_cp_sharded_flliper_positions_infers_dims(self):
+        """CP + positions in flliper infers dims 't[cp:zigzag]'."""
         metas: list[dict] = [
             self._make_meta(cp_size=2, cp_rank=0),
             self._make_meta(cp_size=2, cp_rank=1),
         ]
         result = _ensure_dims_in_metas(
-            name="positions", plugin=_sglang_plugin, metas=metas, ndim=1
+            name="positions", plugin=_flliper_plugin, metas=metas, ndim=1
         )
         assert result[0]["dims"] == "t[cp:zigzag]"
 
@@ -142,14 +142,14 @@ class TestEnsureDimsInMetas:
             self._make_meta(cp_size=2, cp_rank=1),
         ]
         result = _ensure_dims_in_metas(
-            name="seq_lens", plugin=_sglang_plugin, metas=metas, ndim=1
+            name="seq_lens", plugin=_flliper_plugin, metas=metas, ndim=1
         )
         assert result is metas
 
     def test_unknown_plugin_returns_metas_unchanged(self):
         """CP + plugin with empty cp_sharded_names returns metas as-is."""
 
-        class _DummyPlugin(_SGLangPlugin):
+        class _DummyPlugin(_FlliperPlugin):
             @property
             def cp_sharded_names(self) -> frozenset[str]:
                 return frozenset()
@@ -165,7 +165,7 @@ class TestEnsureDimsInMetas:
 
 
 class TestDetectPlugin:
-    def test_discriminating_names_sglang(self, tmp_path: Path) -> None:
+    def test_discriminating_names_flliper(self, tmp_path: Path) -> None:
         fn: str = _save_pt(
             tmp_path, name="seq_lens", step=0, rank=0, value=torch.tensor([3])
         )
@@ -174,7 +174,7 @@ class TestDetectPlugin:
         result = _detect_plugin(df, dump_path=tmp_path)
 
         assert result is not None
-        assert result.name == "sglang"
+        assert result.name == "flliper"
 
     def test_fallback_to_meta_based_detection(self, tmp_path: Path) -> None:
         fn: str = _save_pt(
@@ -183,14 +183,14 @@ class TestDetectPlugin:
             step=0,
             rank=0,
             value=torch.tensor([1, 2, 3]),
-            meta={"sglang_parallel_info": {"tp_rank": 0, "tp_size": 1}},
+            meta={"flliper_parallel_info": {"tp_rank": 0, "tp_size": 1}},
         )
         df: pl.DataFrame = _make_df_from_filenames([fn])
 
         result = _detect_plugin(df, dump_path=tmp_path)
 
         assert result is not None
-        assert result.name == "sglang"
+        assert result.name == "flliper"
 
     def test_returns_none_no_match(self, tmp_path: Path) -> None:
         fn: str = _save_pt(
@@ -214,7 +214,7 @@ class TestLoadNonTensorAux:
             from unittest.mock import patch
 
             with patch(
-                "sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.log_sink",
+                "flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.log_sink",
                 sink,
             ):
                 result = _load_non_tensor_aux(
@@ -243,7 +243,7 @@ class TestLoadAndAlignAuxTensor:
             rank=0,
             value=torch.tensor([1, 2, 3]),
             meta={
-                "sglang_parallel_info": {
+                "flliper_parallel_info": {
                     "tp_rank": 0,
                     "tp_size": 2,
                     "cp_rank": 0,
@@ -258,7 +258,7 @@ class TestLoadAndAlignAuxTensor:
             rank=1,
             value=torch.tensor([4, 5, 6]),
             meta={
-                "sglang_parallel_info": {
+                "flliper_parallel_info": {
                     "tp_rank": 1,
                     "tp_size": 2,
                     "cp_rank": 0,
@@ -273,7 +273,7 @@ class TestLoadAndAlignAuxTensor:
             from unittest.mock import patch
 
             with patch(
-                "sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.log_sink",
+                "flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.log_sink",
                 sink,
             ):
                 result = _load_and_align_aux_tensor(
@@ -281,7 +281,7 @@ class TestLoadAndAlignAuxTensor:
                     step=0,
                     df=df,
                     dump_path=tmp_path,
-                    plugin=_sglang_plugin,
+                    plugin=_flliper_plugin,
                 )
 
         assert result is not None
@@ -303,7 +303,7 @@ class TestLoadNonTensorAuxDp:
             rank=0,
             value=["req_A"],
             meta={
-                "sglang_parallel_info": {
+                "flliper_parallel_info": {
                     "dp_rank": 0,
                     "dp_size": 2,
                 }
@@ -316,7 +316,7 @@ class TestLoadNonTensorAuxDp:
             rank=1,
             value=["req_A"],
             meta={
-                "sglang_parallel_info": {
+                "flliper_parallel_info": {
                     "dp_rank": 1,
                     "dp_size": 2,
                 }
@@ -329,7 +329,7 @@ class TestLoadNonTensorAuxDp:
             from unittest.mock import patch
 
             with patch(
-                "sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.log_sink",
+                "flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_loader.log_sink",
                 sink,
             ):
                 result = _load_non_tensor_aux(
@@ -351,7 +351,7 @@ class TestLoadAndAlignAuxTensorDp:
             rank=0,
             value=torch.tensor([10, 20, 30]),
             meta={
-                "sglang_parallel_info": {
+                "flliper_parallel_info": {
                     "dp_rank": 0,
                     "dp_size": 2,
                 }
@@ -364,7 +364,7 @@ class TestLoadAndAlignAuxTensorDp:
             rank=1,
             value=torch.tensor([]),
             meta={
-                "sglang_parallel_info": {
+                "flliper_parallel_info": {
                     "dp_rank": 1,
                     "dp_size": 2,
                 }
@@ -377,7 +377,7 @@ class TestLoadAndAlignAuxTensorDp:
             step=0,
             df=df,
             dump_path=tmp_path,
-            plugin=_sglang_plugin,
+            plugin=_flliper_plugin,
         )
 
         assert result is not None

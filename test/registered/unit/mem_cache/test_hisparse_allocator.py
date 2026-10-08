@@ -4,11 +4,11 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.hisparse import (
+from flliper.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -50,7 +50,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(kwargs["swa_tail_len"], 128)
 
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
-        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+        from flliper.srt.disaggregation.decode import DecodePreallocQueue
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         logical_allocator = SimpleNamespace(
@@ -74,7 +74,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         logical_allocator.available_size.assert_not_called()
 
     def test_hisparse_prealloc_uses_swa_tail_for_direct_host_path(self):
-        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+        from flliper.srt.disaggregation.decode import DecodePreallocQueue
 
         fill_len = 512
         swa_tail_len = 128

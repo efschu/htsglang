@@ -7,10 +7,10 @@ translates field annotations into argparse arguments.
 import argparse
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import configure_media_url_security
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.srt.utils.common import configure_media_url_security
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

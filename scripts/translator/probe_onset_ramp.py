@@ -56,7 +56,7 @@ import threading
 from pathlib import Path
 CLIENT = Path(os.environ.get(
     "ONSET_PROBE_CLIENT",
-    "/spinning/wt-466-translator/python/sglang/srt/translator/client/index.html"))
+    "/spinning/wt-466-translator/python/flliper/srt/translator/client/index.html"))
 STUB = """(() => { class D { constructor(){this.readyState=0;} send(){} close(){} addEventListener(){} }
 window.WebSocket = D; window.fetch = () => Promise.resolve(new Response("{}", {status:200, headers:{"content-type":"application/json"}})); })();"""
 # `turns` selects the turn identity per push: null (no identity, the original

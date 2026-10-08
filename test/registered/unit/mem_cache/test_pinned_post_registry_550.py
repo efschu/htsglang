@@ -31,7 +31,7 @@ allocations.
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.mem_cache.pinned_host_budget import (
+from flliper.srt.mem_cache.pinned_host_budget import (
     PinnedHostPost,
     check_and_register_pinned_post,
     clear_registered_posts,
@@ -75,7 +75,7 @@ class TheAdmissionChargesEveryRegisteredPost(unittest.TestCase):
 
     def _with_host(self, total_gb, avail_gb):
         return patch(
-            "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+            "flliper.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
             return_value=(total_gb * _GB, avail_gb * _GB),
         )
 
@@ -118,7 +118,7 @@ class TheAdmissionChargesEveryRegisteredPost(unittest.TestCase):
         actually does, and the assertion is the same one: the second post sees
         the first."""
         with patch(
-            "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+            "flliper.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
             side_effect=[(64 * _GB, 40 * _GB), (64 * _GB, 20 * _GB)],
         ):
             check_and_register_pinned_post(
@@ -132,7 +132,7 @@ class TheAdmissionChargesEveryRegisteredPost(unittest.TestCase):
     def test_an_unreadable_host_figure_does_not_refuse(self):
         """Refusing to guess beats refusing a boot on a fabricated number."""
         with patch(
-            "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+            "flliper.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
             return_value=(None, None),
         ):
             check_and_register_pinned_post(
@@ -163,7 +163,7 @@ class TheAllocationFailureWindow(unittest.TestCase):
         self.addCleanup(clear_registered_posts)
 
     def test_a_failed_pinned_image_leaves_no_post_behind(self):
-        from sglang.srt.model_executor import weights_arena
+        from flliper.srt.model_executor import weights_arena
 
         boom = RuntimeError("cudaHostRegister refused: cannot lock pages")
         with (
@@ -184,7 +184,7 @@ class TheAllocationFailureWindow(unittest.TestCase):
 
     def test_the_real_error_is_not_masked_by_the_cleanup(self):
         """#386 discipline: cleanup never substitutes the diagnosis."""
-        from sglang.srt.model_executor import weights_arena
+        from flliper.srt.model_executor import weights_arena
 
         boom = RuntimeError("cudaHostRegister refused: cannot lock pages")
         with (
@@ -199,7 +199,7 @@ class TheAllocationFailureWindow(unittest.TestCase):
     def test_a_successful_image_still_registers(self):
         """The other half: the fix must not unregister a post that DID
         allocate. Without this the failure case passes trivially."""
-        from sglang.srt.model_executor import weights_arena
+        from flliper.srt.model_executor import weights_arena
 
         import torch
 
@@ -216,13 +216,13 @@ class TheAllocationFailureWindow(unittest.TestCase):
 
     def test_a_failed_read_buffer_ring_leaves_no_post_behind(self):
         """The same window in the sibling producer (read_buffer_pool.py:73-79)."""
-        from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
+        from flliper.srt.mem_cache.read_buffer_pool import ReadBufferPool
 
         def _boom():
             raise RuntimeError("cannot pin the ring")
 
         with patch(
-            "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+            "flliper.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
             return_value=(64 * _GB, 40 * _GB),
         ):
             with self.assertRaises(RuntimeError) as ctx:
@@ -270,7 +270,7 @@ class TheSixConstructorsRevertTheirPost(unittest.TestCase):
     def _decorated_init(self, module_suffix, cls_name):
         import importlib
 
-        module = importlib.import_module(f"sglang.srt.{module_suffix}")
+        module = importlib.import_module(f"flliper.srt.{module_suffix}")
         return getattr(module, cls_name).__init__
 
     def test_every_site_carries_the_guard(self):
@@ -287,7 +287,7 @@ class TheSixConstructorsRevertTheirPost(unittest.TestCase):
 
     def test_a_failing_call_reverts_only_what_it_registered(self):
         """The behaviour half, driven through the real decorator."""
-        from sglang.srt.mem_cache.pinned_host_budget import (
+        from flliper.srt.mem_cache.pinned_host_budget import (
             revert_pinned_posts_on_failure,
         )
 
@@ -315,7 +315,7 @@ class TheSixConstructorsRevertTheirPost(unittest.TestCase):
 
     def test_a_successful_call_keeps_its_post(self):
         """Without this the guard could pass by never registering anything."""
-        from sglang.srt.mem_cache.pinned_host_budget import (
+        from flliper.srt.mem_cache.pinned_host_budget import (
             revert_pinned_posts_on_failure,
         )
 
@@ -331,7 +331,7 @@ class TheSixConstructorsRevertTheirPost(unittest.TestCase):
     def test_a_nested_failure_undoes_the_super_call_too(self):
         """A subclass __init__ that fails after super().__init__() registered
         must undo BOTH -- the object as a whole failed."""
-        from sglang.srt.mem_cache.pinned_host_budget import (
+        from flliper.srt.mem_cache.pinned_host_budget import (
             revert_pinned_posts_on_failure,
         )
 

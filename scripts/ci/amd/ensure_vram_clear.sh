@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/check_vram_clear.sh"
 
 # Stop and remove every container that holds any /dev/kfd or /dev/dri device.
-# Some failing CI runs leave behind containers other than `ci_sglang` (e.g.
+# Some failing CI runs leave behind containers other than `ci_flliper` (e.g.
 # from previous AMD jobs that were force-killed mid-run); those still hold
 # VRAM via KFD even though the host pgrep finds nothing.
 stop_all_gpu_containers() {
@@ -170,9 +170,9 @@ ensure_vram_clear() {
     echo "Running in ROCm mode"
 
     # Always stop the well-known CI container first (best-effort).
-    echo "Stopping any existing ci_sglang container..."
-    docker stop ci_sglang 2>/dev/null || true
-    docker rm -f ci_sglang 2>/dev/null || true
+    echo "Stopping any existing ci_flliper container..."
+    docker stop ci_flliper 2>/dev/null || true
+    docker rm -f ci_flliper 2>/dev/null || true
 
     # Show initial GPU status
     echo "=== Initial GPU Memory Status ==="
@@ -189,13 +189,13 @@ ensure_vram_clear() {
     while [ $retry_count -lt $max_retries ]; do
         echo "=== Cleanup Attempt $((retry_count + 1))/$max_retries ==="
 
-        # Step 1: kill SGLang-named processes on the host (cheap, fast).
+        # Step 1: kill fLLiper-named processes on the host (cheap, fast).
         # NOTE: host pgrep cannot see PIDs inside a container's PID
         # namespace, so in CI this almost never matches anything; the
         # heavy lifting is done by step 2 below. Kept as a fast early
         # cleanup for the rare case where something runs on the host.
-        echo "Killing SGLang processes..."
-        pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt' \
+        echo "Killing fLLiper processes..."
+        pgrep -f 'flliper::|flliper\.launch_server|flliper\.bench|flliper\.data_parallel|flliper\.srt' \
             | xargs -r kill -9 2>/dev/null || true
 
         # Step 2: aggressive cleanup. Run on EVERY attempt — the previous
@@ -204,7 +204,7 @@ ensure_vram_clear() {
         # holding VRAM, invisible to host pgrep).
         echo "Performing aggressive cleanup..."
 
-        # 2a. Stop ALL GPU-attached containers, not just ci_sglang. A
+        # 2a. Stop ALL GPU-attached containers, not just ci_flliper. A
         # leftover container from a previous job will keep VRAM held even
         # though `pgrep` on the host shows nothing.
         stop_all_gpu_containers

@@ -10,8 +10,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.runtime_context import get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -20,16 +20,16 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
     """Mock GPU-dependent functions for CPU-only testing.
 
-    swa_eviction_interval pins SGLANG_SWA_EVICTION_INTERVAL (decode batches between
+    swa_eviction_interval pins FLLIPER_SWA_EVICTION_INTERVAL (decode batches between
     SWA evictions) to a small value so the chunk-cap formula stays hand-computable;
     only SWAChunkCapPoolConfigurator reads it.
     """
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
         get_parallel().override(attn_tp_size=tp_size),
-        envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
+        envs.FLLIPER_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
         yield
 
@@ -171,7 +171,7 @@ class TestDefaultConfigurator(unittest.TestCase):
     def _run(self, available_bytes, page_size=1, **kwargs):
         mr = _make_model_runner(page_size=page_size, **kwargs)
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -227,7 +227,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
     def _run(self, available_bytes, **kwargs):
         mr = self._make_swa_runner(**kwargs)
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -321,7 +321,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disable_overlap_schedule=True,  # spec-v1: no double allocation
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -360,7 +360,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disable_overlap_schedule=False,  # spec-v2: 2 * get_alloc_len_per_decode
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -386,7 +386,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disaggregation_mode="decode",
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -417,7 +417,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disable_overlap_schedule=False,  # overlap -> 2 chunks in flight
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -449,7 +449,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disaggregation_decode_extra_slots=2,
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -477,7 +477,7 @@ class TestAllSWAConfigurator(unittest.TestCase):
             **kwargs,
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -527,7 +527,7 @@ class TestEagleConfigurator(unittest.TestCase):
         mr.eagle_draft_num_layers = eagle_draft_num_layers
 
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -544,7 +544,7 @@ class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(is_hybrid_swa=False)
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 DefaultPoolConfigurator,
                 create_memory_pool_configurator,
             )
@@ -560,7 +560,7 @@ class TestFactory(unittest.TestCase):
             swa_num_kv_heads=4,
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
+            from flliper.srt.model_executor.pool_configurator import (
                 HybridSWAPoolConfigurator,
                 create_memory_pool_configurator,
             )
@@ -582,13 +582,13 @@ class TestFactory(unittest.TestCase):
                 max_running_requests=max_running_requests,
             )
             with mock_cpu_env():
-                from sglang.srt.model_executor.pool_configurator import (
+                from flliper.srt.model_executor.pool_configurator import (
                     create_memory_pool_configurator,
                 )
 
                 return create_memory_pool_configurator(mr)
 
-        from sglang.srt.model_executor.pool_configurator import (
+        from flliper.srt.model_executor.pool_configurator import (
             SWAChunkCapPoolConfigurator,
         )
 

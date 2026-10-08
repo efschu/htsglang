@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from flliper.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
+from flliper.test.test_utils import CustomTestCase, is_in_ci
 
 # Cross encoder model tests
 

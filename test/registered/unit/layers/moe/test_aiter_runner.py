@@ -4,15 +4,15 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.layers.moe.moe_runner.aiter as aiter_runner
-from sglang.srt.layers.moe.moe_runner.aiter import (
+import flliper.srt.layers.moe.moe_runner.aiter as aiter_runner
+from flliper.srt.layers.moe.moe_runner.aiter import (
     AiterMoeQuantInfo,
     AiterQuantType,
     AiterRunnerCore,
     AiterRunnerInput,
 )
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-c-test-cpu")
 

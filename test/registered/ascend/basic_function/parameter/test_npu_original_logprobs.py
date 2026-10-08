@@ -1,13 +1,13 @@
-"""Test original log probability alignment between SGLang and Hugging Face.
+"""Test original log probability alignment between fLLiper and Hugging Face.
 
 This test suite verifies the correctness of the `origin_logprobs` output (temperature=1)
-and the `logprobs` output (temperature=0.5) in SGLang by comparing it against
+and the `logprobs` output (temperature=0.5) in fLLiper by comparing it against
 raw logit-based probabilities computed directly from a reference Hugging Face model.
 
 The test covers the following scenarios:
 - Next-token prediction: Verifies that the log probability of the next token from
-  SGLang matches the Hugging Face model.
-- Top-k logprobs: Ensures that the top-k original logprobs returned by SGLang are
+  fLLiper matches the Hugging Face model.
+- Top-k logprobs: Ensures that the top-k original logprobs returned by fLLiper are
   consistent with Hugging Face outputs.
 - Specified token IDs: Confirms that the original logprobs for specific token IDs
   match the values computed from Hugging Face logits.
@@ -21,9 +21,9 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import sglang as sgl
-from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
+import flliper as sgl
+from flliper.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+from flliper.test.ci.ci_register import register_npu_ci
 
 # ------------------------- Configurable via env ------------------------- #
 MODEL_ID = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
@@ -50,11 +50,11 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
 class TestOriginalLogprob(unittest.TestCase):
-    """Testcase: Verify the behavior and log probability alignment of SGLang under two configurations of the environment variable `SGLANG_RETURN_ORIGINAL_LOGPROB` (True/False),
-        by comparing SGLang's output with reference values from Hugging Face.
+    """Testcase: Verify the behavior and log probability alignment of fLLiper under two configurations of the environment variable `FLLIPER_RETURN_ORIGINAL_LOGPROB` (True/False),
+        by comparing fLLiper's output with reference values from Hugging Face.
 
     [Test Category] Parameter
-    [Test Target] SGLANG_RETURN_ORIGINAL_LOGPROB
+    [Test Target] FLLIPER_RETURN_ORIGINAL_LOGPROB
     """
 
     def setUp(self):
@@ -66,14 +66,14 @@ class TestOriginalLogprob(unittest.TestCase):
 
         # Shared sampling parameters
         self.sampling_params = {
-            "temperature": 0.5,  # SGLang uses 0.5, but original logprobs are used 1.0
+            "temperature": 0.5,  # fLLiper uses 0.5, but original logprobs are used 1.0
             "top_p": 1.0,
             "top_k": 10,
             "max_new_tokens": 1,
         }
 
     # ---------------------------------------------------------------------
-    # Helper: compare one SGLang block (token_logprobs / top_logprobs / ids_logprobs)
+    # Helper: compare one fLLiper block (token_logprobs / top_logprobs / ids_logprobs)
     #         against a reference HF log‑prob vector.
     # ---------------------------------------------------------------------
     def assert_logprobs_block_equal(
@@ -136,9 +136,9 @@ class TestOriginalLogprob(unittest.TestCase):
 
         for env_val in ["True", "False"]:
             with self.subTest(return_original_logprob=env_val):
-                os.environ["SGLANG_RETURN_ORIGINAL_LOGPROB"] = env_val
+                os.environ["FLLIPER_RETURN_ORIGINAL_LOGPROB"] = env_val
 
-                # ----- SGLang side -----
+                # ----- fLLiper side -----
                 sgl_engine = sgl.Engine(
                     model_path=MODEL_ID,
                     skip_tokenizer_init=True,
@@ -189,7 +189,7 @@ class TestOriginalLogprob(unittest.TestCase):
                             top_log_probs=meta["output_top_logprobs"],
                             ids_log_probs=meta["output_token_ids_logprobs"],
                             random_token_ids=random_token_ids,
-                            tag=f"Original logprobs SGLang vs HF: {prompt} ({env_val})",
+                            tag=f"Original logprobs fLLiper vs HF: {prompt} ({env_val})",
                         )
                     else:
                         # Always check regular logprobs
@@ -199,7 +199,7 @@ class TestOriginalLogprob(unittest.TestCase):
                             top_log_probs=meta["output_top_logprobs"],
                             ids_log_probs=meta["output_token_ids_logprobs"],
                             random_token_ids=random_token_ids,
-                            tag=f"logprobs SGLang vs HF: {prompt} ({env_val})",
+                            tag=f"logprobs fLLiper vs HF: {prompt} ({env_val})",
                         )
                 sgl_engine.shutdown()
 

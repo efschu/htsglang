@@ -17,15 +17,15 @@ import unittest
 
 import torch
 
-from sglang.srt.video_enhance import rife
-from sglang.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
-from sglang.srt.video_enhance.frame_math import (
+from flliper.srt.video_enhance import rife
+from flliper.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
+from flliper.srt.video_enhance.frame_math import (
     PixelFormat,
     Resolution,
     UnprobedFootprintError,
 )
-from sglang.srt.video_enhance.frames import Frame
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.video_enhance.frames import Frame
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # Pure CPU: version-enum arithmetic, the padding rule, and a 64x48 forward pass
 # through three IFNets with random weights. The real-weights case self-skips.

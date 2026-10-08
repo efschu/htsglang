@@ -5,7 +5,7 @@ Covers the client-visible contract: ``extra_body={"thinking_budget": N}`` on
 without the client serializing a logit processor.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -13,9 +13,9 @@ import unittest
 
 from pydantic import ValidationError
 
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.thinking_budget import (
+from flliper.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.sampling.thinking_budget import (
     THINKING_BUDGET_INTERNAL_KEY,
     THINKING_BUDGET_KEY,
     THINKING_BUDGET_TOKEN_IDS_KEY,
@@ -23,7 +23,7 @@ from sglang.srt.sampling.thinking_budget import (
     attach_thinking_budget,
     internal_thinking_budget_processor_str,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 QWEN36_THINK_START_ID = 248068
 QWEN36_THINK_END_ID = 248069

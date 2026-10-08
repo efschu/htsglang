@@ -38,7 +38,7 @@
 # deleted by 1509). Both rows are exactly what the builder emits for a module
 # with no solo log -- SERIAL, unproven:no_solo_log -- and the sha256 is
 # gate_partition_build.sha() over the current bytes. A fresh solo proof may
-# promote them. 1503's test lives under unit/weg2, outside this gate path.
+# promote them. 1503's test lives under unit/pdflip, outside this gate path.
 #
 # verdicts
 #   PARALLEL  solo failure set == serial failure set -> wide lane

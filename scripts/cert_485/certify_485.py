@@ -437,7 +437,7 @@ def cmd_flags(argv) -> int:
     ] + list(args.extra)
 
     try:
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
     except Exception as exc:
         print(f"FAIL: cannot import server_args ({type(exc).__name__}: {exc})")
         return 1

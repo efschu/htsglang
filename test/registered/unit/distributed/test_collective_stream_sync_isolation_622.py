@@ -69,7 +69,7 @@ and re-proposed.
 import itertools
 import unittest
 
-from sglang.srt.distributed.device_communicators.barlink_stream_policy import (
+from flliper.srt.distributed.device_communicators.barlink_stream_policy import (
     COLLECTIVE_STREAM,
     ISOLATED_PREP,
     LEGACY,
@@ -339,7 +339,7 @@ class TestPolicyHygiene(unittest.TestCase):
         # Nothing in this branch has run on a GPU. The default must stay on the
         # shipped placement so that merging the seam cannot change production
         # numerics or performance; flipping it is a separate, evidenced change.
-        from sglang.srt.distributed.device_communicators import (
+        from flliper.srt.distributed.device_communicators import (
             barlink_stream_policy,
         )
 

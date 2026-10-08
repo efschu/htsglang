@@ -4,14 +4,14 @@ test_basic_sanity.py / test_basic_sanity_eagle3.py with the DFLASH path active
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
-from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.basic_api_contract_kit import BasicAPIContractMixin
+from flliper.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from flliper.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -70,7 +70,7 @@ class TestBasicSanityDFlash(
                 "--enable-metrics",
                 "--disable-piecewise-cuda-graph",
             ],
-            env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
+            env={"FLLIPER_ENABLE_METRICS_DEVICE_TIMER": "1"},
         )
 
     @classmethod

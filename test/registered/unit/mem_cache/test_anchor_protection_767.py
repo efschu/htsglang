@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.mem_cache.mamba_ckpt_utils import protect_deepest_anchors
+from flliper.srt.mem_cache.mamba_ckpt_utils import protect_deepest_anchors
 
 
 class TestProtectionDoesNotDependOnTheInterval(unittest.TestCase):

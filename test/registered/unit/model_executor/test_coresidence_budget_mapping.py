@@ -43,9 +43,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.model_executor import model_runner_kv_cache_mixin as M
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor import model_runner_kv_cache_mixin as M
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

@@ -1,4 +1,4 @@
-"""HTTP front of the rig dashboard (stdlib only, no CUDA, no sglang import).
+"""HTTP front of the rig dashboard (stdlib only, no CUDA, no flliper import).
 
 Routes
   GET /               the live page
@@ -244,14 +244,14 @@ class App:
             "gpu_period": 2.0,
             "docker_ssh": shlex.split(args.docker_ssh) if args.docker_ssh else [],
             "docker_host_prefix": args.docker_host_prefix,
-            "weg2_fronts": args.front or [],
+            "pdflip_fronts": args.front or [],
             "gpuq": args.gpuq,
             "state_dir": args.state_dir or None,
         }
         # the cards (NVML), docker, gpuq, fronts and the energy book are the sampler's too (30.09. ~22Z):
         # this process reads what it published and measures nothing
         self.src = sources.SourcesReader(self.ring_store) if self.sup is not None else sources.Sources(cfg)
-        self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
+        self.pdflip = weg2line.PdFlipLines(cfg["docker_ssh"], args.release_profile or [])
         self.kartenplaner = kartenplan.Kartenplaner()
         # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
         ptree = getattr(args, "profil_tree", None) or None      # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker
@@ -265,7 +265,7 @@ class App:
             oracle=self.oracle, hardware=lambda: self.hwprofil.get(), check_path=lambda p, what: self.modellprofil.check_path(p, what),
             release_dir=getattr(args, "profiles_release_dir", None) or profil.DEFAULT_RELEASE_DIR,
             user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR,
-            # Auftrag 1984 (C): die Topologie-Prüfung des Trockenlaufs läuft im Kopplungs-Worker (sglang-Umgebung), nicht in diesem Prozess;
+            # Auftrag 1984 (C): die Topologie-Prüfung des Trockenlaufs läuft im Kopplungs-Worker (flliper-Umgebung), nicht in diesem Prozess;
             # self.couplings entsteht erst unten, darum erst beim Aufruf aufgelöst
             topology=lambda n: self.couplings.topology(n))
         # Modellprofil schätzen (S3): liest nur config.json und Kopfzeilen unter den Modellwurzeln
@@ -401,7 +401,7 @@ class App:
             b["front"] = sources.front_for_boot(fronts, b["meta"].get("tag"))
             ipc = b.get("ipc") or {}
             if b["front"] is None and ipc.get("front") and not ipc.get("terminal"):
-                # the front's own /weg2/state is unreachable: the host's mirror in state.json, not a log line
+                # the front's own /pdflip/state is unreachable: the host's mirror in state.json, not a log line
                 b["front"] = dict(ipc["front"], src="state.json front (Host-Spiegel)")
             b["alarm"] = health.assess(b, now)
         gser = self.src.gpu_series() if with_series else None
@@ -600,23 +600,23 @@ def make_handler(app: App):
             # the public reverse proxy (LXC 208 nginx, https://efeu.ddnss.de/rigdash/) sets these
             return bool(self.headers.get("X-Forwarded-Prefix") or self.headers.get("X-Forwarded-For"))
 
-        def _weg2(self, path):
+        def _pdflip(self, path):
             if self._via_proxy():
                 # the dry run executes a check script on the Proxmox host: LAN only
                 return self._json({"ok": False, "error": "Start line and dry run only in the LAN (http://192.168.0.88:8890/weg2)"}, 403)
             from urllib.parse import parse_qs, urlsplit
 
             q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
-            if not app.weg2.release_profiles:
+            if not app.pdflip.release_profiles:
                 return self._json({"ok": False, "error": "no release profiles configured (--release-profile)"}, 400)
-            if path == "/api/weg2/options":
-                return self._json(dict(app.weg2.options(), ok=True))
-            built = app.weg2.build(q.get("profile", ""), q.get("image", ""), q.get("transport", "bar1"),
+            if path == "/api/pdflip/options":
+                return self._json(dict(app.pdflip.options(), ok=True))
+            built = app.pdflip.build(q.get("profile", ""), q.get("image", ""), q.get("transport", "bar1"),
                                    q.get("house_guard", "memlimit"))
-            if path == "/api/weg2/line":
+            if path == "/api/pdflip/line":
                 return self._json(dict(built, ok=True))
-            if path == "/api/weg2/dry":
-                return self._json(dict(app.weg2.dry_run(built), ok=True, line=built))
+            if path == "/api/pdflip/dry":
+                return self._json(dict(app.pdflip.dry_run(built), ok=True, line=built))
             return self._send(404, "not found", "text/plain")
 
         def _profil_guard(self):
@@ -845,16 +845,16 @@ def make_handler(app: App):
                     name = "mark.svg" if path == "/favicon.svg" else path[1:]
                     with open(os.path.join(STATIC, name), "rb") as fh:
                         return self._send(200, fh.read(), "image/svg+xml")
-                if app.edition == "release" and (path in ("/weg2", "/weg2.html", "/api/launch")
-                                                 or path.startswith("/api/weg2/")):
+                if app.edition == "release" and (path in ("/pdflip", "/pdflip.html", "/api/launch")
+                                                 or path.startswith("/api/pdflip/")):
                     return self._send(404, "not found", "text/plain")
-                if path in ("/weg2", "/weg2.html") and self._via_proxy():
+                if path in ("/pdflip", "/pdflip.html") and self._via_proxy():
                     return self._send(403, "Start line only in the LAN: http://192.168.0.88:8890/weg2", "text/plain; charset=utf-8")
-                if path in ("/weg2", "/weg2.html"):
-                    with open(os.path.join(STATIC, "weg2.html"), "rb") as fh:
+                if path in ("/pdflip", "/pdflip.html"):
+                    with open(os.path.join(STATIC, "pdflip.html"), "rb") as fh:
                         return self._send(200, fh.read(), "text/html; charset=utf-8")
-                if path.startswith("/api/weg2/"):
-                    return self._weg2(path)
+                if path.startswith("/api/pdflip/"):
+                    return self._pdflip(path)
                 if path == "/api/launch":
                     # Startflags + ENV je Modell aus state.json (launchview); ?ver= spart den Körper,
                     # solange sich das Gezeigte nicht geändert hat
@@ -924,7 +924,7 @@ def main(argv=None):
     ap.add_argument("--docker-host-prefix", default="/spinning/subvol-999-disk-0",
                     help="where the Docker host sees this machine's filesystem")
     ap.add_argument("--front", action="append", default=[],
-                    help="weg2 front base URL to read /weg2/state from (repeatable)")
+                    help="pdflip front base URL to read /pdflip/state from (repeatable)")
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
     ap.add_argument("--vm-url", default=os.environ.get("RIGDASH_VM_URL", vmpush.DEFAULT_URL),
                     help="VictoriaMetrics (read PromQL; the sampler writes the IPC there); '' = off")
@@ -936,15 +936,15 @@ def main(argv=None):
     ap.add_argument("--features", default=features.DEFAULT_PATH,
                     help="the feature list (built / in image / active / gain; in image and active are computed here)")
     ap.add_argument("--profil-tree", default=os.environ.get("RIGDASH_PROFIL_TREE"),
-                    help="Order 1984: planner tree (<tree>/python) for the profile editor: profile_json/refusals/profile_catalog, model_profile, hardware_profile AND the couplings worker (PYTHONPATH). Full python/sglang of the Python release revision (deploy/stage_profil_modules.sh); if omitted: KARTENPLAN_TREE or /opt/rigdash/kartenplan/current. --hw-tree overrides it only for the hardware profile")
+                    help="Order 1984: planner tree (<tree>/python) for the profile editor: profile_json/refusals/profile_catalog, model_profile, hardware_profile AND the couplings worker (PYTHONPATH). Full python/flliper of the Python release revision (deploy/stage_profil_modules.sh); if omitted: KARTENPLAN_TREE or /opt/rigdash/kartenplan/current. --hw-tree overrides it only for the hardware profile")
     ap.add_argument("--hw-tree", default=os.environ.get("HWPROFIL_TREE"),
-                    help="Planner tree (<tree>/python) with sglang/srt/rigmon/hardware_profile.py: read the hardware profile (order 950)")
+                    help="Planner tree (<tree>/python) with flliper/srt/rigmon/hardware_profile.py: read the hardware profile (order 950)")
     ap.add_argument("--hw-profile-file", default=hwprofil.default_persist_path(),
                     help="AP-A: file in which the hardware profile is saved at the first start (env FLLIPER_HARDWARE_PROFILE; default /var/lib/flliper/hardware.json, rig and release alike); Capture again replaces it")
     ap.add_argument("--hw-measure-tree", default=os.environ.get("HWPROFIL_MEASURE_TREE"),
-                    help="full sglang tree (<tree>/python) for the measuring run; empty = --hw-tree (then card_probe must be in it)")
+                    help="full flliper tree (<tree>/python) for the measuring run; empty = --hw-tree (then card_probe must be in it)")
     ap.add_argument("--couplings-python", default=os.environ.get("RIGDASH_COUPLINGS_PYTHON"),
-                    help="Profile editor S4b: Python of the sglang environment for the couplings worker (default /spinning/htsglang-gpu/.venv/bin/python)")
+                    help="Profile editor S4b: Python of the flliper environment for the couplings worker (default /spinning/htsglang-gpu/.venv/bin/python)")
     ap.add_argument("--oracle-prefix", default=os.environ.get("RIGDASH_ORACLE_PREFIX", "auto"),
                     help="Command prefix of the oracle child process (launcher dry run, peak 1.75 GiB RSS measured): 'auto' = systemd-run --scope -q -p MemoryMax=4G (own cgroup frame outside the unit), 'none' = without, otherwise the command itself")
     ap.add_argument("--hw-python", default=os.environ.get("HWPROFIL_PYTHON"),

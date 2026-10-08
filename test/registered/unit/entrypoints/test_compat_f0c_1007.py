@@ -18,11 +18,11 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang import _compat_boot as boot
-from sglang.srt import compat_shims as cs
-from sglang.srt import name_compat as nc
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper import _compat_boot as boot
+from flliper.srt import compat_shims as cs
+from flliper.srt import name_compat as nc
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -192,9 +192,9 @@ class TestAnnouncement(CustomTestCase):
 
     def test_the_package_init_runs_the_bridge_first(self):
         """An import must fold the environment before ANY other statement of the package runs."""
-        import sglang
+        import flliper
 
-        tree = ast.parse(open(sglang.__file__, encoding="utf-8").read())
+        tree = ast.parse(open(flliper.__file__, encoding="utf-8").read())
         body = [n for n in tree.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
         self.assertIsInstance(body[0], ast.ImportFrom)
         self.assertEqual(body[0].module, "_compat_boot")
@@ -244,7 +244,7 @@ class TestFlagAliasRegistration(CustomTestCase):
         self.assertEqual(cs.register_flag_aliases(object()), 0)
 
     def test_the_launcher_parser_accepts_every_flip_flag_in_both_spellings(self):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         ap = launcher.build_parser()
         run = cs.FLAG_TOKENS[0] if cs.running_package() == PKG_OLD else cs.FLAG_TOKENS[1]
@@ -257,7 +257,7 @@ class TestFlagAliasRegistration(CustomTestCase):
             self.assertIn(alias, act.option_strings)
 
     def test_the_launcher_parser_parses_a_profile_in_the_other_spelling(self):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         run = cs.FLAG_TOKENS[0] if cs.running_package() == PKG_OLD else cs.FLAG_TOKENS[1]
         other = cs.FLAG_TOKENS[1] if run == cs.FLAG_TOKENS[0] else cs.FLAG_TOKENS[0]
@@ -270,7 +270,7 @@ class TestFlagAliasRegistration(CustomTestCase):
         """ServerArgs defines no flip-subsystem flag (they live in the launcher parser): the hook registers 0."""
         import argparse
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         ap = argparse.ArgumentParser()
         ServerArgs.add_cli_args(ap)
@@ -338,9 +338,9 @@ class TestCacheReadFallback(CustomTestCase):
     # -- the wired readers ---------------------------------------------------
 
     def test_load_measured_library_reads_the_library_of_the_other_name_and_does_not_write(self):
-        from sglang.srt.planner import card_rate_pass as crp
-        from sglang.srt.planner.card_library import CardLibrary
-        from sglang.srt.rigmon import card_probe
+        from flliper.srt.planner import card_rate_pass as crp
+        from flliper.srt.planner.card_library import CardLibrary
+        from flliper.srt.rigmon import card_probe
 
         CardLibrary().save(os.path.join(self.oth, "card_library.json"))
         with mock.patch.dict(os.environ, {"HOME": self.home}), mock.patch.object(card_probe, "CACHE_DIR", self.run):
@@ -352,8 +352,8 @@ class TestCacheReadFallback(CustomTestCase):
         self.assertEqual(os.listdir(self.run), [])
 
     def test_load_measured_library_still_refuses_when_neither_exists(self):
-        from sglang.srt.planner import card_rate_pass as crp
-        from sglang.srt.rigmon import card_probe
+        from flliper.srt.planner import card_rate_pass as crp
+        from flliper.srt.rigmon import card_probe
 
         with mock.patch.dict(os.environ, {"HOME": self.home}), mock.patch.object(card_probe, "CACHE_DIR", self.run):
             for side in (0, 1):
@@ -361,7 +361,7 @@ class TestCacheReadFallback(CustomTestCase):
             self.assertIsNone(crp.load_measured_library())
 
     def test_the_hardware_profile_of_the_other_name_is_found_by_the_collector(self):
-        from sglang.srt.rigmon import collector
+        from flliper.srt.rigmon import collector
 
         self._put(self.oth, "hw_profile-aaaa.json", json.dumps({"created": "2026-10-01 00:00:00", "gpus": {}}))
         self._put(self.oth, "power_profile.json", json.dumps({"limit": 1}))
@@ -376,7 +376,7 @@ class TestCacheReadFallback(CustomTestCase):
         self.assertEqual(hw["created"], "2026-10-05 00:00:00")
 
     def test_stage0_and_probes_are_listed_from_both_dirs_by_the_hardware_profile_module(self):
-        from sglang.srt.rigmon import hardware_profile as hp
+        from flliper.srt.rigmon import hardware_profile as hp
 
         for d, n in ((self.run, "hw_profile-run.json"), (self.oth, "hw_profile-oth.json")):
             self._put(d, n, json.dumps({"created": "2026-10-01 00:00:00", "driver": "1", "gpus": {"0": {}}}))
@@ -389,7 +389,7 @@ class TestCacheReadFallback(CustomTestCase):
             self.assertEqual(hp.load_stage0(self.run + "-elsewhere"), [])   # not the rig cache: no redirect
 
     def test_the_profile_for_a_narrowed_view_is_found_in_the_other_dir(self):
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
         prof = {"driver": "595", "uuids": ["GPU-A", "GPU-B"], "version": up.PROFILE_VERSION}
         self._put(self.oth, "hw_profile-zz.json", json.dumps(prof))
@@ -401,7 +401,7 @@ class TestCacheReadFallback(CustomTestCase):
         self.assertEqual(os.listdir(self.run), [])      # nothing was written
 
     def test_a_tmp_cache_dir_is_read_as_before(self):
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
         d = tempfile.mkdtemp()
         prof = {"driver": "595", "uuids": ["GPU-A"], "version": up.PROFILE_VERSION}
@@ -413,7 +413,7 @@ class TestCacheReadFallback(CustomTestCase):
 
 class TestCensusSeesBothGenerations(CustomTestCase):
     def test_titles_and_module_names_of_either_generation(self):
-        from sglang.srt.weg2 import host_census as hc
+        from flliper.srt.pdflip import host_census as hc
 
         for pkg, sub in ((PKG_OLD, cs.FLAG_TOKENS[0]), (PKG_NEW, cs.FLAG_TOKENS[1])):
             self.assertEqual(hc.classify_process("%s::scheduler_PP0" % pkg, ""), hc.RANK_ROLE, pkg)

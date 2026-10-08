@@ -29,7 +29,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.memtier.fingerprint import (
+from flliper.srt.memtier.fingerprint import (
     FINGERPRINT_VERSION,
     MatchScope,
     card_signature,
@@ -41,18 +41,18 @@ from sglang.srt.memtier.fingerprint import (
     model_key_for,
     model_signature,
 )
-from sglang.srt.memtier.profile import (
+from flliper.srt.memtier.profile import (
     CardFact,
     FilesystemFact,
     LocalFacts,
     ProfileError,
 )
-from sglang.srt.memtier.profile_store import (
+from flliper.srt.memtier.profile_store import (
     PROFILE_PATH_ENV,
     save_profile,
     select_profile,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

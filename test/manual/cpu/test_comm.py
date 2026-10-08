@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.test_utils import CustomTestCase, find_available_port
+from flliper.test.test_utils import CustomTestCase, find_available_port
 
 
 def run_distributed_test(rank, world_size, master_port, output_writer, fn):

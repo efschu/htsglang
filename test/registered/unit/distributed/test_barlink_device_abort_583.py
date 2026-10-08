@@ -24,15 +24,15 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate
-from sglang.srt.distributed.device_communicators.barlink_device import (
+from flliper.srt.distributed.device_communicators import barlink_abort_gate
+from flliper.srt.distributed.device_communicators.barlink_device import (
     _ABORT_KERNELS,
     BarlinkDeviceTransport,
     DeviceCollectiveAborted,
 )
 
 _MODULE = Path(
-    "python/sglang/srt/distributed/device_communicators/barlink_device.py"
+    "python/flliper/srt/distributed/device_communicators/barlink_device.py"
 )
 
 
@@ -213,7 +213,7 @@ class TestCheckAbortedRaises(unittest.TestCase):
 
     def test_capture_suppresses_the_device_read(self):
         """Reading the word inside a stream capture is illegal, not just slow."""
-        import sglang.srt.distributed.device_communicators.barlink as barlink
+        import flliper.srt.distributed.device_communicators.barlink as barlink
 
         t = _fake_transport(code=2)
         original = barlink.graph_capture_running

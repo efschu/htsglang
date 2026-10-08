@@ -4,7 +4,7 @@ import unittest
 from collections import namedtuple
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -14,7 +14,7 @@ class TestCpuMonitor(unittest.TestCase):
     def test_cpu_monitor(self):
         from prometheus_client import REGISTRY
 
-        from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+        from flliper.srt.observability.cpu_monitor import start_cpu_monitor_thread
 
         thread = start_cpu_monitor_thread("test", interval=0.1)
         self.assertTrue(thread.is_alive())
@@ -29,11 +29,11 @@ class TestCpuMonitor(unittest.TestCase):
         for metric in REGISTRY.collect():
             for sample in metric.samples:
                 if (
-                    sample.name == "sglang:process_cpu_seconds_total"
+                    sample.name == "flliper:process_cpu_seconds_total"
                     and sample.labels.get("component") == "test"
                 ):
                     value = sample.value
-        print(f"sglang:process_cpu_seconds_total = {value}")
+        print(f"flliper:process_cpu_seconds_total = {value}")
         self.assertIsNotNone(value)
         self.assertGreater(value, 0)
 
@@ -42,13 +42,13 @@ class TestCpuMonitorMocked(unittest.TestCase):
     """Fast, deterministic tests for start_cpu_monitor_thread using mocks."""
 
     @patch("prometheus_client.Counter")
-    @patch("sglang.srt.observability.cpu_monitor.psutil.Process")
-    @patch("sglang.srt.observability.cpu_monitor.time.sleep")
+    @patch("flliper.srt.observability.cpu_monitor.psutil.Process")
+    @patch("flliper.srt.observability.cpu_monitor.time.sleep")
     def test_delta_calculation_over_two_iterations(
         self, mock_sleep, MockProcess, MockCounter
     ):
         """Verify delta=(user_diff+system_diff) and last_times update across iterations."""
-        from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+        from flliper.srt.observability.cpu_monitor import start_cpu_monitor_thread
 
         CpuTimes = namedtuple("CpuTimes", ["user", "system"])
         mock_process = MockProcess.return_value

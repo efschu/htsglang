@@ -1,7 +1,7 @@
 """1001: the front's PLE hint reads the prompt's tail; the told re-keys it.
 
 NF bfpgwv (boot ...dauer10011823_a11cc7cbc6), PP0: 27 hint admissions, 0
-used. Every hint was read from token 0 (``admit rid=weg2-12-87 rows=262144
+used. Every hint was read from token 0 (``admit rid=pdflip-12-87 rows=262144
 started source=hint dormant=1 start=0``) and dropped at PP0's told as
 ``tokens_differ`` -- the told named the first chunk behind the store prefix
 (``rows=155040 started source=told ... start=84544``), and that read started
@@ -26,8 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_qwen4_exp_ple_admit_h43 as h43  # noqa: E402
 
-from sglang.srt.models import qwen4_exp_ple_admit as adm  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.models import qwen4_exp_ple_admit as adm  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -54,11 +54,11 @@ def _req(rid, n, seed):
 
 
 def test_the_hint_reads_the_tail_and_the_told_rekeys_it(rig, caplog):
-    """weg2-12-87's shape (94234 tokens, told 84544, chunk 16384) scaled to the
+    """pdflip-12-87's shape (94234 tokens, told 84544, chunk 16384) scaled to the
     rig's chunk of 200: 500 tokens, store prefix 420. The told arrives right
     before the forward -- the hint's read, done long before, serves it."""
     _warm(rig)
-    w = _req("weg2-12-87", 500, 1)
+    w = _req("pdflip-12-87", 500, 1)
     with caplog.at_level(logging.INFO):
         assert adm.admit_ple_hint(w.rid, w.origin_input_ids, rig.chunk, dormant=True) == "started"
         assert rig.g._adm.start == 300  # the last chunk of the prompt
@@ -73,7 +73,7 @@ def test_the_hint_reads_the_tail_and_the_told_rekeys_it(rig, caplog):
     assert line["wait_ms"] < 60.0 and fwd_s < 0.2  # not the 0.3 s read
     lines = h43._admit_lines(caplog.records)
     assert not any("dropped" in m for m in lines), lines
-    assert any("rid=weg2-12-87 rekeyed source=told (admitted by hint) start=300->420 rows=80 row_off=120"
+    assert any("rid=pdflip-12-87 rekeyed source=told (admitted by hint) start=300->420 rows=80 row_off=120"
                in m for m in lines), lines
     assert rig.g.stats["admit_started"] == 1 and rig.g.stats["admit_used"] == 1
 
@@ -92,7 +92,7 @@ def test_an_intake_inside_the_window_rekeys_too(rig, caplog):
 
 
 def test_a_told_before_the_window_drops_as_start_moved(rig, caplog):
-    """The rest behind the store prefix is longer than one chunk (weg2-42-307:
+    """The rest behind the store prefix is longer than one chunk (pdflip-42-307:
     told 22400, many chunks): no re-key, named, the chunk gathered right."""
     _warm(rig)
     w = _req("w", 500, 3)

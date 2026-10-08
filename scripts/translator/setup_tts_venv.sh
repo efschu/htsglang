@@ -6,9 +6,9 @@
 #
 # Why separate, restated here because it is the first thing a reader will
 # question: every candidate TTS package pins a `transformers` version that
-# conflicts with the one the sglang venv carries (`qwen-tts` wants
+# conflicts with the one the flliper venv carries (`qwen-tts` wants
 # transformers==4.57.3 against 5.12.1 here), and vLLM-Omni additionally pulls
-# vLLM's torch against sglang's. One environment cannot hold both. Making the
+# vLLM's torch against flliper's. One environment cannot hold both. Making the
 # boundary a process boundary turns an unresolvable pin conflict into an HTTP
 # hop -- which we wanted anyway, because the translator talks to its services
 # the way any client would.
@@ -22,11 +22,11 @@ set -euo pipefail
 
 VENV="${TRANSLATOR_TTS_VENV:-/spinning/llm_stuff/translator-models/tts-venv}"
 MODEL_DIR="${TRANSLATOR_TTS_MODEL_DIR:-/spinning/llm_stuff/translator-models/qwen3-tts-0.6b-base}"
-SGLANG_VENV="/spinning/htsglang-gpu/.venv"
+FLLIPER_VENV="/spinning/htsglang-gpu/.venv"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-[ "$VENV" != "$SGLANG_VENV" ] || die "refusing to install into the sglang venv"
+[ "$VENV" != "$FLLIPER_VENV" ] || die "refusing to install into the flliper venv"
 
 if [ ! -d "$VENV" ]; then
   echo "creating $VENV"
@@ -78,6 +78,6 @@ fi
 echo
 echo "done. venv: $VENV"
 "$VENV/bin/python" -c "import sys; print('python', sys.version.split()[0])"
-echo "the sglang venv was not modified:"
-"$SGLANG_VENV/bin/python" -c "import transformers; print('  sglang transformers', transformers.__version__)" 2>/dev/null \
-  || echo "  (could not read the sglang venv, which is fine -- it was not touched)"
+echo "the flliper venv was not modified:"
+"$FLLIPER_VENV/bin/python" -c "import transformers; print('  flliper transformers', transformers.__version__)" 2>/dev/null \
+  || echo "  (could not read the flliper venv, which is fine -- it was not touched)"

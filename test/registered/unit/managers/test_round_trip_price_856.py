@@ -29,21 +29,21 @@ softened here: the remedy for a bar that is too high is to make the seam
 cheaper, not to keep under-pricing it.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers import phase_policy as pp
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers import phase_policy as pp
+from flliper.srt.managers.phase_policy import (
     PhasePolicyConfig,
     RoundTripFlipCost,
     break_even_tokens,
     live_flip_cost_s,
     live_flip_tokens,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 SEED_C = 3.2
 N_BOOT = 7004

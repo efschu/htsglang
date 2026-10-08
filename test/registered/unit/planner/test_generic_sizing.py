@@ -7,7 +7,7 @@ fell back to BF16 -- doubling an FP8/INT4 checkpoint's sized weights and
 producing a spurious "does not fit / 0 KV / >100% budget". The SAME repo given
 as a local path (weights present) sized correctly; given as a hub id it did
 not. See ``PerfCostModel._build_families`` + ``_config_quant_bpp`` in
-``sglang.srt.uneven_perf``.
+``flliper.srt.uneven_perf``.
 
 The fix makes the quant + bytes/param CONFIG-AUTHORITATIVE:
   * HF checkpoints  -> ``quantization_config.quant_method`` (+bits/group/
@@ -34,12 +34,12 @@ import shutil
 import tempfile
 import unittest
 
-from sglang.srt.planner.feasibility import plan
-from sglang.srt.planner.hardware import hardware_from_manual
-from sglang.srt.planner.model import resolve_model_ref
-from sglang.srt.uneven_perf import _config_quant_bpp
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner.feasibility import plan
+from flliper.srt.planner.hardware import hardware_from_manual
+from flliper.srt.planner.model import resolve_model_ref
+from flliper.srt.uneven_perf import _config_quant_bpp
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.distributed.device_communicators.barlink_abort_gate import (
+from flliper.srt.distributed.device_communicators.barlink_abort_gate import (
     ENV_DEFER,
     ENV_ENABLE,
     ENV_EVERY,
@@ -258,10 +258,10 @@ class TestPausePolling:
         """polling_paused flips True during __enter__ and back to False."""
         # We need to reset any pre-existing depth; _PausePolling uses a global.
         monkeypatch.setattr(
-            "sglang.srt.distributed.device_communicators.barlink_abort_gate._capture_depth",
+            "flliper.srt.distributed.device_communicators.barlink_abort_gate._capture_depth",
             0,
         )
-        from sglang.srt.distributed.device_communicators import barlink_abort_gate as m
+        from flliper.srt.distributed.device_communicators import barlink_abort_gate as m
 
         ctx = pause_polling()
         assert m.polling_paused() is False  # before
@@ -271,7 +271,7 @@ class TestPausePolling:
 
     def test_reentrant_nested(self, monkeypatch):
         """Two pause_polling() contexts nested -> depth 2, unpauses fully only after both exit."""
-        from sglang.srt.distributed.device_communicators import barlink_abort_gate as m
+        from flliper.srt.distributed.device_communicators import barlink_abort_gate as m
 
         monkeypatch.setattr(m, "_capture_depth", 0)
 
@@ -286,7 +286,7 @@ class TestPausePolling:
 
     def test_pause_polling_does_not_swallow_exceptions(self, monkeypatch):
         """__exit__ returns None, so exceptions propagate (line 235)."""
-        from sglang.srt.distributed.device_communicators import barlink_abort_gate as m
+        from flliper.srt.distributed.device_communicators import barlink_abort_gate as m
 
         monkeypatch.setattr(m, "_capture_depth", 0)
 
@@ -375,7 +375,7 @@ class TestPollStatusWords:
         assert poll_status_words() == 0
 
     def test_paused_does_not_poll(self, monkeypatch):
-        from sglang.srt.distributed.device_communicators import barlink_abort_gate as m
+        from flliper.srt.distributed.device_communicators import barlink_abort_gate as m
 
         m._capture_depth = 1
         monkeypatch.setenv(ENV_ENABLE, "1")

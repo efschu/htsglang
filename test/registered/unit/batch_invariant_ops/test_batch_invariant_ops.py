@@ -4,10 +4,10 @@ import unittest
 
 import torch
 
-from sglang.srt.batch_invariant_ops import batch_invariant_ops
-from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.batch_invariant_ops import batch_invariant_ops
+from flliper.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 # Note: MI300 (gfx942) has 64KB shared memory limit but kernel needs 66KB
 # MI35x (gfx950/CDNA4) may have different limits - testing on MI35x only

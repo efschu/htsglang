@@ -6,11 +6,11 @@ from typing import Dict
 
 import requests
 
-from sglang.benchmark.utils import get_tokenizer
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.benchmark.utils import get_tokenizer
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
@@ -65,7 +65,7 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         prefill_args += cls.transfer_backend + cls.rdma_devices
         env = {
             **os.environ,
-            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
         }
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -144,7 +144,7 @@ class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):
         decode_args += cls.transfer_backend + cls.rdma_devices
         env = {
             **os.environ,
-            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
         }
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -203,7 +203,7 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
         decode_args += cls.transfer_backend + cls.rdma_devices
         env = {
             **os.environ,
-            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
         }
         cls.process_decode = popen_launch_pd_server(
             cls.model,

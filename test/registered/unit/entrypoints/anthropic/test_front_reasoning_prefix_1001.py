@@ -17,26 +17,26 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
-from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+from flliper.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
-from sglang.srt.entrypoints.openai.serving_chat import (  # noqa: E402
+from flliper.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from flliper.srt.entrypoints.openai.serving_chat import (  # noqa: E402
     OpenAIServingChat,
 )
-from sglang.srt.parser.jinja_template_utils import (  # noqa: E402
+from flliper.srt.parser.jinja_template_utils import (  # noqa: E402
     detect_jinja_template_content_format,
 )
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 MODEL_DIR = os.environ.get(
-    "SGLANG_TEST_QWEN38_27B_DIR",
+    "FLLIPER_TEST_QWEN38_27B_DIR",
     "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8",
 )
 
@@ -245,7 +245,7 @@ class TestFrontReasoningPrefix(unittest.TestCase):
             {"role": "user", "content": "again"},
         ]
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+            "flliper.srt.entrypoints.anthropic.serving", level=logging.WARNING
         ) as log:
             ids = self._prompt_ids(messages)
         self.assertTrue(any("redacted_thinking" in line for line in log.output))

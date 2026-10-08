@@ -53,20 +53,20 @@ from typing import List, Tuple
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
+from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20)
 
@@ -83,7 +83,7 @@ CHUNK = 64
 
 
 def _build_pools(mamba_size: int = 8, max_num_reqs: int = 8):
-    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+    from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
     server_args = ServerArgs(model_path="dummy", page_size=1)
     server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
@@ -94,7 +94,7 @@ def _build_pools(mamba_size: int = 8, max_num_reqs: int = 8):
         i for i in range(GLOBAL_INTERVAL - 1, NUM_LAYERS, GLOBAL_INTERVAL)
     ]
     mamba_layers = [i for i in range(NUM_LAYERS) if i not in full_attention_layer_ids]
-    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+    with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
         shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=512,

@@ -6,7 +6,7 @@ The anchor store is machine-local, but keys used to name only the CONFIG
 whose boot logs landed in the same store (or whose config mirrors a measured
 one) got the reference rig's measured capture numbers handed over with
 provenance "measured". K8: the key gains a ``cards:`` segment (the
-``weg2.card_identity`` class labels; ``?`` when NVML cannot answer), so an
+``pdflip.card_identity`` class labels; ``?`` when NVML cannot answer), so an
 anchor is only ever claimed by a boot on the card class it was measured on.
 
 Red on the base tree: base ``anchor_key`` has no ``cards:`` segment (the
@@ -17,7 +17,7 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner import graphmem
+from flliper.srt.planner import graphmem
 
 RIG = ("RTX5090", "RTX3080", "RTX3080")
 ADA = ("RTX4090/24564MiB/sm89", "RTX4090/24564MiB/sm89", "RTX4090/24564MiB/sm89")
@@ -76,7 +76,7 @@ class TestAnchorCardClass(unittest.TestCase):
         self.assertIsNone(self.store.lookup(_meta(card_classes=RIG)))
 
     def test_live_card_classes_reads_the_replay_seam(self):
-        from sglang.srt.registry import nvml as nvml_registry
+        from flliper.srt.registry import nvml as nvml_registry
 
         rows = [
             {"index": 0, "uuid": "GPU-a", "name": "NVIDIA GeForce RTX 3080",

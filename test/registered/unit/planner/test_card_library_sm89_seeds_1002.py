@@ -10,7 +10,7 @@ seeds to measured on the way: source == "seed", measured fields empty.
 
 import unittest
 
-from sglang.srt.planner.card_library import seed_card
+from flliper.srt.planner.card_library import seed_card
 
 SM89_SEEDS = ("RTX 4090", "RTX 4080")
 

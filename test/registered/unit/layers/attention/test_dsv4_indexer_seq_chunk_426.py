@@ -37,14 +37,14 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4.indexer import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     fp8_paged_mqa_logits_torch,
     fp8_paged_mqa_logits_torch_sm120,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -134,11 +134,11 @@ def _chunk_env():
     unfixed tree (one oversized bmm) instead of erroring at import -- an
     ImportError is not evidence that the peak is unbounded.
     """
-    return getattr(envs, "SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK", None)
+    return getattr(envs, "FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK", None)
 
 
 def _chunk_pages_fn():
-    from sglang.srt.layers.attention.dsv4 import indexer
+    from flliper.srt.layers.attention.dsv4 import indexer
 
     return getattr(indexer, "_indexer_logits_chunk_pages", None)
 

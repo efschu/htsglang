@@ -40,15 +40,15 @@ import torch
 
 torch.set_default_device("cpu")
 
-from sglang.srt.managers import phase_flip_seam_reserve as seam  # noqa: E402
-from sglang.srt.managers.seam_slope import (  # noqa: E402
+from flliper.srt.managers import phase_flip_seam_reserve as seam  # noqa: E402
+from flliper.srt.managers.seam_slope import (  # noqa: E402
     derive_seam_slope_for_rank,
 )
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (  # noqa: E402
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (  # noqa: E402
     ModelRunnerKVCacheMixin,
 )
 
-MIXIN_LOGGER = "sglang.srt.model_executor.model_runner_kv_cache_mixin"
+MIXIN_LOGGER = "flliper.srt.model_executor.model_runner_kv_cache_mixin"
 
 #: The live flagset.
 FLIP_VECTOR_STR = "32,16,16"
@@ -85,7 +85,7 @@ class TheSingleRankDerivationExists(unittest.TestCase):
             self.assertEqual(got, 0.0, f"rank {rank}")
 
     def test_it_agrees_with_the_whole_vector_form(self):
-        from sglang.srt.managers.seam_slope import (
+        from flliper.srt.managers.seam_slope import (
             derive_seam_slope_bytes_per_token,
         )
 

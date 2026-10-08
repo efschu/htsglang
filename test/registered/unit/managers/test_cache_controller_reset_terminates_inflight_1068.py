@@ -72,11 +72,11 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers import cache_controller as cc_module
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
-from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hyb_module
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import cache_controller as cc_module
+from flliper.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hyb_module
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 

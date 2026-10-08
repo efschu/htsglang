@@ -11,12 +11,12 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
-from sglang.bench_serving import RequestFuncOutput
-from sglang.benchmark.datasets.random import sample_random_requests
-from sglang.benchmark.utils import get_tokenizer
-from sglang.test.kits.cache_hit_kit import (
+from flliper.bench_serving import RequestFuncOutput
+from flliper.benchmark.datasets.random import sample_random_requests
+from flliper.benchmark.utils import get_tokenizer
+from flliper.test.kits.cache_hit_kit import (
     async_request_openai_chat_completions,
-    async_request_sglang_generate,
+    async_request_flliper_generate,
     gen_payload,
     gen_payload_openai,
 )
@@ -160,9 +160,9 @@ def parse_args():
     parser.add_argument(
         "--api-format",
         type=str,
-        default="sglang",
-        choices=["sglang", "openai"],
-        help="API format to use: 'sglang' for native /generate endpoint, "
+        default="flliper",
+        choices=["flliper", "openai"],
+        help="API format to use: 'flliper' for native /generate endpoint, "
         "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
     )
     return parser.parse_args()
@@ -219,7 +219,7 @@ class WorkloadGenerator:
             self.request_func = async_request_openai_chat_completions
         else:
             self.url = f"http://{args.host}:{args.port}/generate"
-            self.request_func = async_request_sglang_generate
+            self.request_func = async_request_flliper_generate
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
@@ -333,7 +333,7 @@ class WorkloadGenerator:
                 for i in range(args.num_clients)
             }
         else:
-            # SGLang mode: history is List[int] (token ids)
+            # fLLiper mode: history is List[int] (token ids)
             init_requests = [
                 (
                     i,

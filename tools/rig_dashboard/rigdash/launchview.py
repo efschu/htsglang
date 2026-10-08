@@ -26,7 +26,7 @@ from .features import last_boot
 MODELS = (("27B", "/spinning/docker-acceptance/27b/state"), ("NF", "/spinning/docker-acceptance/nf/state"))
 LAYERS = ("container", "front", "P", "D")
 #: Präfix-Gruppen der Flags in dieser Reihenfolge; was keiner passt, is listed under "other"
-FLAG_GROUPS = (("--weg2-*", "--weg2-"), ("--p-*", "--p-"), ("--d-*", "--d-"),
+FLAG_GROUPS = (("--pdflip-*", "--pdflip-"), ("--p-*", "--p-"), ("--d-*", "--d-"),
                ("--hicache*", "--hicache"), ("--speculative*", "--speculative"))
 FLAG_REST = "other"
 #: vom Image mitgebracht, auch wenn der Launcher sie unter env führt
@@ -36,7 +36,7 @@ IMAGE_BASE_KEYS = ("CUDA_HOME", "CUDA_VERSION", "CUDA_PATH", "CUDA_ROOT", "PATH"
                    "NV_CUDA_CUDART_VERSION", "VIRTUAL_ENV")
 MASK = "***"
 #: Wortstücke, die überall ein Geheimnis anzeigen; KEY/TOKEN nur als letztes Stück
-#: (HF_TOKEN, ADMIN_API_KEY) -- sonst wären --max-total-tokens oder SGLANG_..._KEY_SCHEME maskiert
+#: (HF_TOKEN, ADMIN_API_KEY) -- sonst wären --max-total-tokens oder FLLIPER_..._KEY_SCHEME maskiert
 _SECRET_PARTS = ("SECRET", "SECRETS", "PASS", "PASSWD", "PASSWORD", "PAT", "CREDENTIAL", "CREDENTIALS",
                  "APIKEY", "BEARER")
 _SECRET_LAST = ("TOKEN", "KEY")

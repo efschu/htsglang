@@ -1,19 +1,19 @@
 # Copyright 2026 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
-"""#791T: the #631 row frame must not overtake its Weg2StoreTold either.
+"""#791T: the #631 row frame must not overtake its PdFlipStoreTold either.
 
 THE SPECIMEN (27B proof boot rc12z20 3a86888ba5, Fix B armed,
 /spinning/docker-acceptance/27b/evidence/
 boot_weg2_dkr27browauthoritybar1w109281300_3a86888ba5_0928_130013.P.log):
 
-    PP0  #1400 STORE-TOLD INTAKE rid=weg2-0-8 verdict=issued span=62505 matched=0
-    PP1  REQ-TRACE r24 TokenizedGenerateReqInput weg2-0-8
-    PP2  REQ-TRACE r24 TokenizedGenerateReqInput weg2-0-8
-    PP1  REQ-TRACE r25 Weg2StoreTold weg2-0-8 -> ABSORBED told=0   (told BEFORE frame)
-    PP1  #631 ROW-PROBE drained a proxy at slot=2 ... ('weg2-0-8', 0, 2048)
-    PP2  #631 ROW-PROBE drained a proxy at slot=2 ... ('weg2-0-8', 0, 2048)
-    PP2  #791 FORWARDED SCHEDULE UNEXECUTABLE STOP rank=2 slot=0 told=[weg2-0-8]
-         reached=[] census=loop_skips(weg2_store_told_pending=1(first=weg2-0-8))
+    PP0  #1400 STORE-TOLD INTAKE rid=pdflip-0-8 verdict=issued span=62505 matched=0
+    PP1  REQ-TRACE r24 TokenizedGenerateReqInput pdflip-0-8
+    PP2  REQ-TRACE r24 TokenizedGenerateReqInput pdflip-0-8
+    PP1  REQ-TRACE r25 PdFlipStoreTold pdflip-0-8 -> ABSORBED told=0   (told BEFORE frame)
+    PP1  #631 ROW-PROBE drained a proxy at slot=2 ... ('pdflip-0-8', 0, 2048)
+    PP2  #631 ROW-PROBE drained a proxy at slot=2 ... ('pdflip-0-8', 0, 2048)
+    PP2  #791 FORWARDED SCHEDULE UNEXECUTABLE STOP rank=2 slot=0 told=[pdflip-0-8]
+         reached=[] census=loop_skips(pdflip_store_told_pending=1(first=pdflip-0-8))
                                                                   (frame BEFORE told)
 
 The request chain carries the request (r24) and, one hop later, PP0's told
@@ -33,9 +33,9 @@ from __future__ import annotations
 import types
 import unittest
 
-from sglang.srt.managers import scheduler_pp_mixin as ppm
-from sglang.srt.managers.pp_row_defer_cap import ROW_DEFER_LAP_CAP, PpRowDeferCapExceeded
-from sglang.srt.weg2 import p_intake
+from flliper.srt.managers import scheduler_pp_mixin as ppm
+from flliper.srt.managers.pp_row_defer_cap import ROW_DEFER_LAP_CAP, PpRowDeferCapExceeded
+from flliper.srt.pdflip import p_intake
 
 
 def _wire_row(rid: str, *, admitted: bool = True, retracted: bool = False):
@@ -44,7 +44,7 @@ def _wire_row(rid: str, *, admitted: bool = True, retracted: bool = False):
 
 def _frame(slot: int, epoch: int, rids, *, pass_ct: int = 179):
     return {
-        "__stamp__": (slot, pass_ct, 2048, epoch, pass_ct, ("weg2-0-8", 0, 2048)),
+        "__stamp__": (slot, pass_ct, 2048, epoch, pass_ct, ("pdflip-0-8", 0, 2048)),
         ppm._ADMISSION_DECISION_PAYLOAD_KEY: (slot, tuple(_wire_row(r) for r in rids)),
     }
 
@@ -52,7 +52,7 @@ def _frame(slot: int, epoch: int, rids, *, pass_ct: int = 179):
 class ToldOrderProbeTest(unittest.TestCase):
     SLOT = 2
     EPOCH = 2
-    RID = "weg2-0-8"
+    RID = "pdflip-0-8"
 
     def setUp(self):
         self._orig_src = ppm.resolve_src
@@ -75,10 +75,10 @@ class ToldOrderProbeTest(unittest.TestCase):
         sched.running_batch = None
         sched._pp_row_chain_owed = False
         sched._pp_flip_epoch = lambda: self.EPOCH
-        # weg2_store_told.armed() resolved once per scheduler (boot constant)
-        sched._weg2_store_told_armed = armed
-        sched._weg2_store_told = {}
-        sched._weg2_store_held = {self.RID: self.req}
+        # pdflip_store_told.armed() resolved once per scheduler (boot constant)
+        sched._pdflip_store_told_armed = armed
+        sched._pdflip_store_told = {}
+        sched._pdflip_store_held = {self.RID: self.req}
         return sched
 
     def _probe(self, sched):
@@ -87,8 +87,8 @@ class ToldOrderProbeTest(unittest.TestCase):
     @staticmethod
     def _absorb(sched, rid, told):
         """What _follower_absorb_impl stores when r25 lands (the part the gate reads)."""
-        sched._weg2_store_told[rid] = told
-        sched._weg2_store_held.pop(rid, None)
+        sched._pdflip_store_told[rid] = told
+        sched._pdflip_store_held.pop(rid, None)
 
     # ------------------------------------------------ the 1300 order, both ranks
 
@@ -107,7 +107,7 @@ class ToldOrderProbeTest(unittest.TestCase):
         self._pp2_frame_before_told(0)             # the specimen: matched=0 -> told=0
 
     def test_pp2_frame_before_told_positive_defers_until_the_told_lands(self):
-        self._pp2_frame_before_told(61439)         # a store hit (weg2-0-7's shape)
+        self._pp2_frame_before_told(61439)         # a store hit (pdflip-0-7's shape)
 
     def test_pp1_told_before_frame_does_not_defer(self):
         for told in (0, 61439):
@@ -147,7 +147,7 @@ class ToldOrderProbeTest(unittest.TestCase):
 
     def test_a_retracted_row_entry_does_not_defer(self):
         queue = [{
-            "__stamp__": (self.SLOT, 179, 2048, self.EPOCH, 179, ("weg2-0-8", 0, 2048)),
+            "__stamp__": (self.SLOT, 179, 2048, self.EPOCH, 179, ("pdflip-0-8", 0, 2048)),
             ppm._ADMISSION_DECISION_PAYLOAD_KEY: (
                 self.SLOT, (_wire_row(self.RID, admitted=True, retracted=True),)),
         }]
@@ -164,7 +164,7 @@ class ToldOrderProbeTest(unittest.TestCase):
                 self.assertIs(self._probe(sched), False)
         msg = str(cm.exception)
         self.assertIn("#791T STORE-TOLD HOP OVERDUE", msg)
-        self.assertIn("weg2-0-8", msg)
+        self.assertIn("pdflip-0-8", msg)
         self.assertIn("#1180 PP ROW DEFER PAST ITS LAP CAP", msg)
         self.assertEqual(len(queue), 1, "the frame is never consumed on the stop")
 

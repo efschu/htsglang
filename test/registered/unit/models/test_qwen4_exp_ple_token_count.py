@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.models.qwen4_exp import _get_processed_token_count
+from flliper.srt.models.qwen4_exp import _get_processed_token_count
 
 
 def _fb(**kw):

@@ -40,30 +40,30 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+from flliper.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
-from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+from flliper.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
-from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+from flliper.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
     TcPiecewiseCudaGraphBackend,
 )
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+from flliper.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     enable_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+from flliper.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.model_executor.runner_utils.capture_mode import (
+from flliper.srt.model_executor.runner_utils.capture_mode import (
     get_is_capture_mode,
     model_capture_mode,
 )
-from sglang.srt.runtime_context import get_flags
-from sglang.srt.utils.common import dispose_tensor
+from flliper.srt.runtime_context import get_flags
+from flliper.srt.utils.common import dispose_tensor
 
-import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as pcg_module
+import flliper.srt.model_executor.runner.prefill_cuda_graph_runner as pcg_module
 
 PrefillCudaGraphRunner = pcg_module.PrefillCudaGraphRunner
 

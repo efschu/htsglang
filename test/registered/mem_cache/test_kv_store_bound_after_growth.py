@@ -24,8 +24,8 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu")
 
@@ -58,7 +58,7 @@ class TestKvStoreBoundAfterGrowth(CustomTestCase):
         k = torch.ones(1, ROW_DIM, dtype=STORE_DTYPE, device=dev)
         v = torch.ones(1, ROW_DIM, dtype=STORE_DTYPE, device=dev)
 
-        from sglang.jit_kernel.kvcache import can_use_store_cache
+        from flliper.jit_kernel.kvcache import can_use_store_cache
 
         if not can_use_store_cache(ROW_DIM * STORE_DTYPE.itemsize):
             # Without the JIT kernel _set_kv_buffer_impl takes the indexing
@@ -67,7 +67,7 @@ class TestKvStoreBoundAfterGrowth(CustomTestCase):
         return k, v, k_cache, v_cache
 
     def _store(self, k, v, k_cache, v_cache, loc, size_limit):
-        from sglang.srt.mem_cache.memory_pool import _set_kv_buffer_impl
+        from flliper.srt.mem_cache.memory_pool import _set_kv_buffer_impl
 
         _set_kv_buffer_impl(
             k,
@@ -84,7 +84,7 @@ class TestKvStoreBoundAfterGrowth(CustomTestCase):
         )
 
     def test_bound_helper_admits_every_reachable_capacity(self):
-        from sglang.srt.mem_cache.memory_pool import graph_safe_store_bound
+        from flliper.srt.mem_cache.memory_pool import graph_safe_store_bound
 
         # Pre-growth live bound, VA-reserve-sized buffers.
         bound = graph_safe_store_bound(BOOT_ROWS + PAGE_SIZE, RESERVE_ROWS)

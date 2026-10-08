@@ -14,7 +14,7 @@ dies on AttributeError before it reaches any logic (4 of 4 red on base
 702d5e90c9). The neighbours do not cover the epoch half either:
 test_pp_stale_proxy_1057.py runs a hand-written MIRROR of the predicate (not
 the shipped function) and only the same-epoch high-water mark;
-test_weg2_s0_unweave_1233.py pins ``_pp_flip_epoch`` as None and the receive
+test_pdflip_s0_unweave_1233.py pins ``_pp_flip_epoch`` as None and the receive
 path with epoch-less stamps, so the epoch branch of the shipped predicate is
 never taken by a green test.
 
@@ -37,11 +37,11 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.pp_typed_channel import typed_inbox
-from sglang.srt.managers import scheduler_pp_mixin as ppm
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.distributed.pp_typed_channel import typed_inbox
+from flliper.srt.managers import scheduler_pp_mixin as ppm
+from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from flliper.srt.model_executor.forward_batch_info import PPProxyTensors
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

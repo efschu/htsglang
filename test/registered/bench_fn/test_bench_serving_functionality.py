@@ -6,12 +6,12 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from sglang.benchmark.serving import run_benchmark
-from sglang.benchmark.utils import parse_custom_headers
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.benchmark.serving import run_benchmark
+from flliper.benchmark.utils import parse_custom_headers
+from flliper.srt.constants import HEALTH_CHECK_RID_PREFIX
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -49,7 +49,7 @@ class TestBenchServingFunctionality(CustomTestCase):
             try:
                 args = get_benchmark_args(
                     base_url=DEFAULT_URL_FOR_TEST,
-                    backend="sglang-oai-chat",
+                    backend="flliper-oai-chat",
                     tokenizer=MODEL,
                     dataset_name="generated-shared-prefix",
                     num_prompts=NUM_CONVERSATIONS,
@@ -156,7 +156,7 @@ class TestBenchServingCustomHeaders(CustomTestCase):
         try:
             args = get_benchmark_args(
                 base_url=f"http://127.0.0.1:{port}",
-                backend="sglang",
+                backend="flliper",
                 dataset_name="random",
                 tokenizer="gpt2",
                 num_prompts=1,

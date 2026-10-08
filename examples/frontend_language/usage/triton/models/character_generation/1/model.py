@@ -2,9 +2,9 @@ import numpy
 import triton_python_backend_utils as pb_utils
 from pydantic import BaseModel
 
-import sglang as sgl
-from sglang import function
-from sglang.srt.constrained.outlines_backend import build_regex_from_object
+import flliper as sgl
+from flliper import function
+from flliper.srt.constrained.outlines_backend import build_regex_from_object
 
 sgl.set_default_backend(sgl.RuntimeEndpoint("http://localhost:30000"))
 

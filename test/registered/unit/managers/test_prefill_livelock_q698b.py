@@ -9,7 +9,7 @@ middle prefill chunk for >= 20 s is a livelock. Report only (the corridor-relief
 on the classic alarm); P (never decodes) and a dormant D are never judged.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -18,8 +18,8 @@ import time
 import types
 import unittest
 
-from sglang.srt.managers.scheduler_components import invariant_checker as IC
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
+from flliper.srt.managers.scheduler_components import invariant_checker as IC
+from flliper.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 
@@ -63,7 +63,7 @@ def _stub(queued, running, decode_age, dormant=False):
         last_decode_progress_time=None if decode_age is None else now - decode_age,
         forward_ct=0,
         _wedge_class_sample=None,
-        weg2_dormant=dormant,
+        pdflip_dormant=dormant,
     )
 
 
@@ -91,7 +91,7 @@ class Wiring(unittest.TestCase):
         self.assertTrue(body.strip().startswith("self.record_decode_progress()"), body[:200])
 
     def test_scheduler_wires_the_clock(self):
-        from sglang.srt.managers import scheduler as S
+        from flliper.srt.managers import scheduler as S
 
         self.assertIn("record_decode_progress=self.note_decode_progress", inspect.getsource(S))
         s = types.SimpleNamespace()

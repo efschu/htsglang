@@ -42,8 +42,8 @@ trigger it.
 
 import unittest
 
-from sglang.srt.managers import phase_policy as pp
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import phase_policy as pp
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -203,7 +203,7 @@ class TheWindowIsSolvedNotSet(unittest.TestCase):
 
 
 class TheOuterBackstopStillExists(unittest.TestCase):
-    """The 180s SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S mitigation stays; this
+    """The 180s FLLIPER_PHASE_POLICY_DECODE_STALL_SLO_S mitigation stays; this
     exit must fire FIRST so the wedge is bounded by progress, not by a clock."""
 
     def test_the_progress_exit_beats_the_decode_stall_cap(self):

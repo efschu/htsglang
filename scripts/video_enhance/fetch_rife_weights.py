@@ -33,7 +33,7 @@ REPO_PYTHON = Path(__file__).resolve().parents[2] / "python"
 if str(REPO_PYTHON) not in sys.path:  # pragma: no cover - script bootstrap
     sys.path.insert(0, str(REPO_PYTHON))
 
-from sglang.srt.video_enhance.rife import (  # noqa: E402
+from flliper.srt.video_enhance.rife import (  # noqa: E402
     KNOWN_WEIGHT_SHA256,
     SUPPORTED_VERSIONS,
     WEIGHT_URL_TEMPLATE,

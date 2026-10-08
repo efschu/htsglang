@@ -62,7 +62,7 @@ import types
 import pytest
 import torch
 
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
 _DLLM_BLOCK = 8
 

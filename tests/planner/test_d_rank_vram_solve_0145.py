@@ -19,7 +19,7 @@ rang0 -> nvml1 (5090), rang1 -> nvml0 (3080), rang2 -> nvml2 (3080).
 """
 import pytest
 
-from sglang.srt.planner.pp_cut import (
+from flliper.srt.planner.pp_cut import (
     d_rank_available_mib,
     d_rank_budget_verdict,
     solve_expert_fraction_per_d_rank,
@@ -28,7 +28,7 @@ from sglang.srt.planner.pp_cut import (
 # --- DIE GEMESSENEN TABELLEN, in Rang-/Ordinal-Reihenfolge (5090 zuerst) ----
 
 #: NVML-Gesamtgroesse. vramwatch-Spalte ``total_mib``, alle sieben Boots.
-KARTE_MIB = [32607.0, 20480.0, 20480.0]
+CARD_MIB = [32607.0, 20480.0, 20480.0]
 
 #: TERM (b) -- der Fremd-Kontext der SCHLAFENDEN Phase je Karte. Plateau
 #: zwischen P's Einschlafen und D's Anstieg, IDENTISCH in sieben Boots
@@ -46,7 +46,7 @@ FREMD_MIB = [1342.0, 852.0, 844.0]
 NICHTTORCH_MIB = [3628.0, 555.0, 522.0]
 
 #: Was der Launcher den Raengen in w83 gegeben hat -- die drei
-#: ``WEG2-LAUNCH budget D group=D ordinal=i``-Zeilen des Arm-Logs, identisch
+#: ``PDFLIP-LAUNCH budget D group=D ordinal=i``-Zeilen des Arm-Logs, identisch
 #: mit ``rank_gpu_memory_mib=[29680, 18560, 18552]`` in D's server_args.
 BUD_D_W83 = [29680.0, 18560.0, 18552.0]
 
@@ -55,14 +55,14 @@ BUD_D_W83 = [29680.0, 18560.0, 18552.0]
 #:     rang0/nvml1: >= 32050 - 1342 = 30708 (w86; noch steigend, dann OOM)
 #:     rang1/nvml0:    18498 -  852 = 17646
 #:     rang2/nvml2:    20034 -  844 = 19190
-BELEGT_W83 = [30708.0, 17646.0, 19190.0]
+OCCUPIED_W83 = [30708.0, 17646.0, 19190.0]
 
 
 # ---------------------------------------------------------------------------
 # 1. Die Arithmetik, von Hand nachgerechnet
 # ---------------------------------------------------------------------------
 
-def test_verfuegbar_ist_karte_minus_die_drei_terme():
+def test_available_is_card_minus_three_terms():
     a = d_rank_available_mib(
         card_total_mib=[10000.0], foreign_context_mib=[1000.0],
         nontorch_mib=[500.0], reserve_mib_by_rank=[2000.0],
@@ -70,8 +70,8 @@ def test_verfuegbar_ist_karte_minus_die_drei_terme():
     assert a == [6500.0]
 
 
-def test_ohne_reserve_ist_es_die_decke_nicht_die_empfehlung():
-    ohne = d_rank_available_mib(
+def test_without_reserve_it_is_ceiling_not_recommendation():
+    without = d_rank_available_mib(
         card_total_mib=[10000.0], foreign_context_mib=[1000.0],
         nontorch_mib=[500.0],
     )[0]
@@ -79,10 +79,10 @@ def test_ohne_reserve_ist_es_die_decke_nicht_die_empfehlung():
         card_total_mib=[10000.0], foreign_context_mib=[1000.0],
         nontorch_mib=[500.0], reserve_mib_by_rank=[2000.0],
     )[0]
-    assert ohne == 8500.0 and mit == 6500.0 and mit < ohne
+    assert without == 8500.0 and mit == 6500.0 and mit < without
 
 
-def test_halbe_bilanz_wird_verweigert():
+def test_half_balance_is_refused():
     with pytest.raises(ValueError, match="halbe Bilanz"):
         d_rank_available_mib(
             card_total_mib=[1.0, 2.0, 3.0], foreign_context_mib=[1.0],
@@ -94,7 +94,7 @@ def test_halbe_bilanz_wird_verweigert():
 # 2. DER W83-NACHSPIELTEST -- der eigentliche Punkt dieser Datei
 # ---------------------------------------------------------------------------
 
-def test_w83_das_verdikt_nennt_rang_null_und_nur_rang_null():
+def test_w83_verdict_names_rank_zero_only():
     """Mit den gemessenen Termen faellt das Urteil, das w83 gefehlt hat.
 
     Rang 0 fragt 29680 MiB gegen 32607 - 1342 - 3628 = 27637 verfuegbar.
@@ -102,7 +102,7 @@ def test_w83_das_verdikt_nennt_rang_null_und_nur_rang_null():
     Verdikt, das alle drei verdaechtigt, ist so wertlos wie keins.
     """
     v = d_rank_budget_verdict(
-        budgets_mib=BUD_D_W83, card_total_mib=KARTE_MIB,
+        budgets_mib=BUD_D_W83, card_total_mib=CARD_MIB,
         foreign_context_mib=FREMD_MIB, nontorch_mib=NICHTTORCH_MIB,
     )
     assert [x.rank for x in v if not x.fits] == [0]
@@ -115,7 +115,7 @@ def test_w83_das_verdikt_nennt_rang_null_und_nur_rang_null():
     assert v[2].over_mib == pytest.approx(-562.0)
 
 
-def test_w83_ohne_den_fremd_kontext_bleibt_rang_null_unentdeckt():
+def test_w83_without_foreign_context_rank_zero_undetected():
     """MUTANT (b): Term (b) entfernt -> das Verdikt kippt.
 
     Ohne den Fremd-Kontext meldet Rang 0 nur noch 701 MiB Ueberschreitung
@@ -123,47 +123,47 @@ def test_w83_ohne_den_fremd_kontext_bleibt_rang_null_unentdeckt():
     kann die Karte nicht mehr richtig bilanzieren: die verfuegbare Zahl liegt
     um exakt den Fremd-Kontext zu hoch, auf JEDEM Rang.
     """
-    ohne_b = d_rank_budget_verdict(
-        budgets_mib=BUD_D_W83, card_total_mib=KARTE_MIB,
+    without_b = d_rank_budget_verdict(
+        budgets_mib=BUD_D_W83, card_total_mib=CARD_MIB,
         foreign_context_mib=[0.0, 0.0, 0.0], nontorch_mib=NICHTTORCH_MIB,
     )
     mit = d_rank_budget_verdict(
-        budgets_mib=BUD_D_W83, card_total_mib=KARTE_MIB,
+        budgets_mib=BUD_D_W83, card_total_mib=CARD_MIB,
         foreign_context_mib=FREMD_MIB, nontorch_mib=NICHTTORCH_MIB,
     )
-    for i, (a, b) in enumerate(zip(ohne_b, mit)):
+    for i, (a, b) in enumerate(zip(without_b, mit)):
         assert a.available_mib - b.available_mib == pytest.approx(FREMD_MIB[i]), (
             f"Rang {i}: der fehlende Term --d-foreign-context-mib verschiebt "
             f"die Bilanz um genau {FREMD_MIB[i]} MiB"
         )
-    assert ohne_b[0].over_mib == pytest.approx(701.0)
+    assert without_b[0].over_mib == pytest.approx(701.0)
 
 
-def test_w83_ohne_den_nichttorch_term_faellt_das_verdikt_falsch_aus():
+def test_w83_without_non_torch_term_verdict_is_wrong():
     """MUTANT (c): Term (c) entfernt -> Rang 0 sieht aus, als passte er.
 
     Das ist der Mutant, der zaehlt: OHNE --d-nontorch-mib lautet das Urteil
     'alle drei passen', und genau dieses Urteil hat w83 in den Tod geschickt.
     Der Test nennt den fehlenden Term ausdruecklich.
     """
-    ohne_c = d_rank_budget_verdict(
-        budgets_mib=BUD_D_W83, card_total_mib=KARTE_MIB,
+    without_c = d_rank_budget_verdict(
+        budgets_mib=BUD_D_W83, card_total_mib=CARD_MIB,
         foreign_context_mib=FREMD_MIB, nontorch_mib=[0.0, 0.0, 0.0],
     )
-    assert [x.rank for x in ohne_c if not x.fits] == [], (
+    assert [x.rank for x in without_c if not x.fits] == [], (
         "ohne --d-nontorch-mib sieht w83 wie ein passender Boot aus -- "
         "genau das war der Defekt"
     )
-    assert ohne_c[0].fits and ohne_c[0].over_mib == pytest.approx(-1585.0)
+    assert without_c[0].fits and without_c[0].over_mib == pytest.approx(-1585.0)
     # mit dem Term kippt es
     mit_c = d_rank_budget_verdict(
-        budgets_mib=BUD_D_W83, card_total_mib=KARTE_MIB,
+        budgets_mib=BUD_D_W83, card_total_mib=CARD_MIB,
         foreign_context_mib=FREMD_MIB, nontorch_mib=NICHTTORCH_MIB,
     )
     assert not mit_c[0].fits
 
 
-def test_die_gemessene_belegung_deckt_sich_mit_der_bilanz():
+def test_measured_occupancy_matches_the_balance():
     """Gegenprobe am Metall, nicht am Modell.
 
     Was die Raenge am Ende WIRKLICH belegten (BELEGT_W83, aus vramwatch minus
@@ -171,20 +171,20 @@ def test_die_gemessene_belegung_deckt_sich_mit_der_bilanz():
     darunter, die 5090 an der Decke. Auf der 5090 bleiben von 31265
     verfuegbaren MiB nur 557 uebrig -- und der Rang war noch am Wachsen.
     """
-    frei = [k - f for k, f in zip(KARTE_MIB, FREMD_MIB)]
-    assert frei == [31265.0, 19628.0, 19636.0]
-    rest = [a - b for a, b in zip(frei, BELEGT_W83)]
+    free_mib = [k - f for k, f in zip(CARD_MIB, FREMD_MIB)]
+    assert free_mib == [31265.0, 19628.0, 19636.0]
+    rest = [a - b for a, b in zip(free_mib, OCCUPIED_W83)]
     assert rest[0] == pytest.approx(557.0)      # 5090: an der physischen Kante
     assert rest[1] == pytest.approx(1982.0)
     assert rest[2] == pytest.approx(446.0)
     # Rang 1 blieb unter seinem Budget, Rang 2 hat seins UEBERSCHRITTEN --
     # gemessen, nicht erwartet: 19190 belegt gegen 18552 gegeben.
-    assert BELEGT_W83[1] < BUD_D_W83[1]
-    assert BELEGT_W83[2] > BUD_D_W83[2]
-    assert BELEGT_W83[2] - BUD_D_W83[2] == pytest.approx(638.0)
+    assert OCCUPIED_W83[1] < BUD_D_W83[1]
+    assert OCCUPIED_W83[2] > BUD_D_W83[2]
+    assert OCCUPIED_W83[2] - BUD_D_W83[2] == pytest.approx(638.0)
 
 
-def test_die_presplit_transiente_ist_gemessen_null():
+def test_presplit_transient_is_measured_zero():
     """WIDERLEGUNG, mit Gegenbeleg, statt einer uebernommenen Vermutung.
 
     Die Arbeitshypothese war: 'die Spitze, die der Experten-Presplit ueber den
@@ -198,15 +198,15 @@ def test_die_presplit_transiente_ist_gemessen_null():
     wiederkommt.
     """
     # (rang, max reserved waehrend Presplit GiB, reserved after load GiB)
-    gemessen = [(1, 16.69, 16.69), (2, 18.23, 18.23)]
-    for rang, spitze, endstand in gemessen:
-        assert spitze - endstand == pytest.approx(0.0), rang
+    measured = [(1, 16.69, 16.69), (2, 18.23, 18.23)]
+    for rang, peak, final_state in measured:
+        assert peak - final_state == pytest.approx(0.0), rang
     # Rang 0 hat den Presplit VOLLSTAENDIG durchlaufen (layer 47, reserved
     # 26.26 GiB = 26890 MiB) und ist erst DANACH gestorben, hinter
     # '#68 WORKER-TRANSPOSE'. 26890 + 555 (eigener Kontext, wie Rang 1) +
     # 1342 (fremd) = 28787 MiB haetten in 32607 gepasst -- der Tod kam aus
     # dem, was NACH dem Presplit noch ausserhalb von torch dazukam.
-    assert 26890.0 + 555.0 + 1342.0 < KARTE_MIB[0]
+    assert 26890.0 + 555.0 + 1342.0 < CARD_MIB[0]
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +221,7 @@ NUM_EXPERTS = 512
 N_LAYERS = 48
 
 
-def test_fraction_decke_rechnet_die_bedingung_rueckwaerts():
+def test_fraction_ceiling_inverts_the_condition():
     f = solve_expert_fraction_per_d_rank(
         card_total_mib=[10000.0], foreign_context_mib=[1000.0],
         nontorch_mib=[500.0], n_layers=10,
@@ -243,8 +243,8 @@ def test_fraction_decke_rechnet_die_bedingung_rueckwaerts():
     assert f2 == pytest.approx(0.45)
 
 
-def test_scratch_zeilen_kosten_mit():
-    ohne = solve_expert_fraction_per_d_rank(
+def test_scratch_rows_are_charged():
+    without = solve_expert_fraction_per_d_rank(
         card_total_mib=[10000.0], foreign_context_mib=[0.0],
         nontorch_mib=[0.0], n_layers=10, dense_layer_mib_by_rank=[0.0],
         expert_layer_mib=1000.0, num_experts=500, expert_span_by_rank=[500],
@@ -257,11 +257,11 @@ def test_scratch_zeilen_kosten_mit():
         scratch_rows_by_rank=[50],
     )[0]
     # 50 Zeilen x 2 MiB x 10 Layer = 1000 MiB weniger fuer die Residenz
-    assert mit < ohne
-    assert (ohne - mit) * (10 * 2 * 500) == pytest.approx(1000.0)
+    assert mit < without
+    assert (without - mit) * (10 * 2 * 500) == pytest.approx(1000.0)
 
 
-def test_halbe_geometrie_wird_verweigert():
+def test_half_geometry_is_refused():
     with pytest.raises(ValueError, match="halbe Geometrie"):
         solve_expert_fraction_per_d_rank(
             card_total_mib=[1.0, 2.0, 3.0], foreign_context_mib=[0.0] * 3,
@@ -280,14 +280,14 @@ def test_die_w83_form_je_rang():
     """
     span = [192, 144, 176]  # 183/137/168 auf 512 skaliert, Rest auf den letzten
     f = solve_expert_fraction_per_d_rank(
-        card_total_mib=KARTE_MIB, foreign_context_mib=FREMD_MIB,
+        card_total_mib=CARD_MIB, foreign_context_mib=FREMD_MIB,
         nontorch_mib=NICHTTORCH_MIB, n_layers=N_LAYERS,
         dense_layer_mib_by_rank=[62.0, 0.0, 0.0],   # --rank-tp-ratio 1,0,0
         expert_layer_mib=EXPERT_LAYER_MIB, num_experts=NUM_EXPERTS,
         expert_span_by_rank=span, scratch_rows_by_rank=[44, 48, 48],
     )
     assert len(f) == 3 and all(0.0 <= x <= 1.0 for x in f)
-    gefahren = [0.70, 0.60, 0.55]
+    used_fractions = [0.70, 0.60, 0.55]
 
     # EIGENE ANNAHME, VOM TEST WIDERLEGT (dieselbe Klasse wie in #140, wo
     # 'f[0] < f[1] < f[2]' fiel): ich hatte erwartet, die Decke nenne Rang 0.
@@ -296,7 +296,7 @@ def test_die_w83_form_je_rang():
     # D-Seite nichts; die RESERVE (KV-Pool, Draft, Aktivierungen) ist der
     # tragende Eingang, und ohne sie sagt die Decke 'passt' ueber einen Boot,
     # der gestorben ist. Genau dafuer gibt es --d-reserve-mib.
-    assert all(m > g for g, m in zip(gefahren, f)), f
+    assert all(m > g for g, m in zip(used_fractions, f)), f
     assert f == pytest.approx([0.8775, 0.8079, 0.6630], abs=1e-3), f
 
     # WIE die Reserve wirkt, als GEMESSENE Tabelle statt als behaupteter
@@ -313,52 +313,52 @@ def test_die_w83_form_je_rang():
     # sich mit dem Metall, wo genau Rang 2 sein Budget ueberschritten hat.
     # Der Test bindet die MONOTONIE und diese REIHENFOLGE, nicht eine Zahl,
     # die kein Boot gemessen hat.
-    vorher = f
+    before = f
     for r in (1000.0, 2000.0, 3000.0, 4000.0, 6000.0):
-        jetzt = solve_expert_fraction_per_d_rank(
-            card_total_mib=KARTE_MIB, foreign_context_mib=FREMD_MIB,
+        now = solve_expert_fraction_per_d_rank(
+            card_total_mib=CARD_MIB, foreign_context_mib=FREMD_MIB,
             nontorch_mib=NICHTTORCH_MIB, n_layers=N_LAYERS,
             dense_layer_mib_by_rank=[62.0, 0.0, 0.0],
             expert_layer_mib=EXPERT_LAYER_MIB, num_experts=NUM_EXPERTS,
             expert_span_by_rank=span, scratch_rows_by_rank=[44, 48, 48],
             reserve_mib_by_rank=[r, r, r],
         )
-        assert all(a <= b for a, b in zip(jetzt, vorher)), (r, jetzt, vorher)
-        vorher = jetzt
+        assert all(a <= b for a, b in zip(now, before)), (r, now, before)
+        before = now
     # Rang 2 ist der engste relativ zu seiner gefahrenen Fraction -- und das
     # deckt sich mit dem Metall: Rang 2 hat sein Budget als einziger
     # ueberschritten (19190 belegt gegen 18552 gegeben, Test darueber).
-    def _drueber(r):
-        jetzt = solve_expert_fraction_per_d_rank(
-            card_total_mib=KARTE_MIB, foreign_context_mib=FREMD_MIB,
+    def _above(r):
+        now = solve_expert_fraction_per_d_rank(
+            card_total_mib=CARD_MIB, foreign_context_mib=FREMD_MIB,
             nontorch_mib=NICHTTORCH_MIB, n_layers=N_LAYERS,
             dense_layer_mib_by_rank=[62.0, 0.0, 0.0],
             expert_layer_mib=EXPERT_LAYER_MIB, num_experts=NUM_EXPERTS,
             expert_span_by_rank=span, scratch_rows_by_rank=[44, 48, 48],
             reserve_mib_by_rank=[r, r, r],
         )
-        return [i for i, (g, m) in enumerate(zip(gefahren, jetzt)) if g > m]
+        return [i for i, (g, m) in enumerate(zip(used_fractions, now)) if g > m]
 
-    assert _drueber(2000.0) == []            # unter 2308 ist noch keiner drueber
-    assert _drueber(2400.0) == [2]           # Rang 2 zuerst
-    assert _drueber(3500.0) == [1, 2]        # dann Rang 1
-    assert _drueber(4000.0) == [0, 1, 2]     # zuletzt die 5090
+    assert _above(2000.0) == []            # unter 2308 ist noch keiner drueber
+    assert _above(2400.0) == [2]           # Rang 2 zuerst
+    assert _above(3500.0) == [1, 2]        # dann Rang 1
+    assert _above(4000.0) == [0, 1, 2]     # zuletzt die 5090
 
     # MUTANT (c), eine Ebene tiefer als im Verdikt: ohne --d-nontorch-mib
     # steigt JEDE Decke, und die der 5090 am staerksten -- der Rang, der den
     # Boot verloren hat, ist genau der, dem der fehlende Term am meisten
     # Luft vorgaukelt.
-    ohne_c = solve_expert_fraction_per_d_rank(
-        card_total_mib=KARTE_MIB, foreign_context_mib=FREMD_MIB,
+    without_c = solve_expert_fraction_per_d_rank(
+        card_total_mib=CARD_MIB, foreign_context_mib=FREMD_MIB,
         nontorch_mib=[0.0, 0.0, 0.0], n_layers=N_LAYERS,
         dense_layer_mib_by_rank=[62.0, 0.0, 0.0],
         expert_layer_mib=EXPERT_LAYER_MIB, num_experts=NUM_EXPERTS,
         expert_span_by_rank=span, scratch_rows_by_rank=[44, 48, 48],
     )
-    assert all(a > b for a, b in zip(ohne_c, f)), (ohne_c, f)
-    zuwachs = [a - b for a, b in zip(ohne_c, f)]
-    assert zuwachs[0] == max(zuwachs), (
+    assert all(a > b for a, b in zip(without_c, f)), (without_c, f)
+    growth = [a - b for a, b in zip(without_c, f)]
+    assert growth[0] == max(growth), (
         "ohne --d-nontorch-mib gewinnt Rang 0 (5090) die groesste Schein-Luft "
-        f"({zuwachs[0]:.3f} gegen {zuwachs[1]:.3f} / {zuwachs[2]:.3f}) -- das "
+        f"({growth[0]:.3f} gegen {growth[1]:.3f} / {growth[2]:.3f}) -- das "
         "ist die Falschaussage, an der w83 gestorben ist"
     )

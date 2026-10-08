@@ -4,7 +4,7 @@ import argparse
 
 import torch
 
-from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
+from flliper.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
 
 DTYPES = {
     "bf16": torch.bfloat16,

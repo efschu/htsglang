@@ -25,8 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_qwen4_exp_ple_admit_h43 as h43  # noqa: E402
 
-from sglang.srt.models import qwen4_exp_ple_admit as adm  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.models import qwen4_exp_ple_admit as adm  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -49,11 +49,11 @@ def _req(rid, n, seed):
 
 
 def test_y7l_shape_the_told_confirms_the_spanned_hint(rig, caplog):
-    """weg2-2-7 (79484 tokens, store span 6208, chunk 16384, page 64) scaled to
+    """pdflip-2-7 (79484 tokens, store span 6208, chunk 16384, page 64) scaled to
     the rig's chunk of 200: 800 tokens, store span 70 -> page 8 -> told 64. The
     tail window would be 600..800 and the told at 64 would drop it."""
     rig.chunk_of(h43._Req("warm", torch.randint(0, 256, (100,))), 0)
-    w = _req("weg2-2-7", 800, 7)
+    w = _req("pdflip-2-7", 800, 7)
     with caplog.at_level(logging.INFO):
         assert adm.admit_ple_hint(w.rid, w.origin_input_ids, rig.chunk, dormant=True,
                                   start_hint=70, page_size=8) == "started"
@@ -69,14 +69,14 @@ def test_y7l_shape_the_told_confirms_the_spanned_hint(rig, caplog):
     assert line["wait_ms"] < 60.0 and fwd_s < 0.2  # not the 0.3 s read
     lines = h43._admit_lines(caplog.records)
     assert not any("dropped" in m for m in lines), lines
-    assert any("rid=weg2-2-7 confirmed source=told (admitted by hint)" in m for m in lines), lines
+    assert any("rid=pdflip-2-7 confirmed source=told (admitted by hint)" in m for m in lines), lines
     assert rig.g.stats["admit_started"] == 1 and rig.g.stats["admit_used"] == 1
 
 
 def test_without_the_span_the_same_told_drops_the_tail_hint(rig, caplog):
     """The base form, for contrast: the tail window, start_moved, a cold read."""
     rig.chunk_of(h43._Req("warm", torch.randint(0, 256, (100,))), 0)
-    w = _req("weg2-2-7", 800, 7)
+    w = _req("pdflip-2-7", 800, 7)
     adm.admit_ple_hint(w.rid, w.origin_input_ids, rig.chunk, dormant=True)
     assert rig.g._adm.start == 600
     time.sleep(0.5)
@@ -85,4 +85,4 @@ def test_without_the_span_the_same_told_drops_the_tail_hint(rig, caplog):
         time.sleep(0.45)
         ids, out = rig.batch([(w, 64, 264)])
     assert h43._same(out, h43._serial(rig.table, ids))
-    assert any("rid=weg2-2-7 dropped reason=start_moved" in m for m in h43._admit_lines(caplog.records))
+    assert any("rid=pdflip-2-7 dropped reason=start_moved" in m for m in h43._admit_lines(caplog.records))

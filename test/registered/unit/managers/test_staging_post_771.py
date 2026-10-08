@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers import phase_flip_seam_reserve as seam
+from flliper.srt.managers import phase_flip_seam_reserve as seam
 
 MIB = 1 << 20
 

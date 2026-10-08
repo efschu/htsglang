@@ -8,8 +8,8 @@ import types
 
 import pytest
 
-from sglang.srt import rank_role
-from sglang.srt.speculative import eagle_worker_v2 as ew
+from flliper.srt import rank_role
+from flliper.srt.speculative import eagle_worker_v2 as ew
 
 
 class _Refuse:

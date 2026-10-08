@@ -17,7 +17,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.model_executor import model_runner as mr
+from flliper.srt.model_executor import model_runner as mr
 
 
 class TestBf16FallbackIsVendorFirst(unittest.TestCase):

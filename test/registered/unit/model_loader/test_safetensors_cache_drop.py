@@ -57,8 +57,8 @@ import numpy as np
 import safetensors.torch
 import torch
 
-from sglang.srt.model_loader.gguf_shards import _PAGE_SIZE as PAGE
-from sglang.srt.model_loader.weight_utils import (
+from flliper.srt.model_loader.gguf_shards import _PAGE_SIZE as PAGE
+from flliper.srt.model_loader.weight_utils import (
     _drop_file_cache_after_load,
     safetensors_weights_iterator,
 )

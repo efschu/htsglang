@@ -46,14 +46,14 @@ WHAT THIS FILE PINS:
 Hermetic: pure formatting and bookkeeping over a stubbed probe, no CUDA.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.phase_flip_seam_census import SeamCensus
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_flip_seam_census import SeamCensus
+from flliper.test.test_utils import CustomTestCase
 
 # The real PP0 pp_to_tp numbers from boot_w40_857strict_0826_0516.log, in
 # seconds, so the assertions are about the specimen and not about a toy.
@@ -211,7 +211,7 @@ class TestTheInstrumentCannotKillAFlip(CustomTestCase):
     def test_the_module_level_explain_is_a_no_op_with_no_census_open(self):
         """`mark()` already has this property and `explain()` is called from the
         same places, so it needs it for the same reason."""
-        from sglang.srt.managers import phase_flip_seam_census as sc
+        from flliper.srt.managers import phase_flip_seam_census as sc
 
         sc.explain("weights_refill", (("save", 1.0),))
 
@@ -248,7 +248,7 @@ class TestTheRefillWiringExists(CustomTestCase):
         import ast
         from pathlib import Path
 
-        import sglang.srt.managers.phase_flip_boot as boot
+        import flliper.srt.managers.phase_flip_boot as boot
 
         tree = ast.parse(Path(boot.__file__).read_text())
         labels = set()
@@ -278,8 +278,8 @@ class TestTheRefillWiringExists(CustomTestCase):
         import ast
         from pathlib import Path
 
-        import sglang.srt.managers.phase_flip_boot as boot
-        from sglang.srt.model_executor.rotation_executor import RotationPhases
+        import flliper.srt.managers.phase_flip_boot as boot
+        from flliper.srt.model_executor.rotation_executor import RotationPhases
 
         src = Path(boot.__file__).read_text()
         tree = ast.parse(src)

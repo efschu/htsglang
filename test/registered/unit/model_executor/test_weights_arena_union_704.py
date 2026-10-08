@@ -36,8 +36,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.model_executor.weights_arena import plan_arena_layout
-from sglang.srt.model_executor.weights_arena_union import (
+from flliper.srt.model_executor.weights_arena import plan_arena_layout
+from flliper.srt.model_executor.weights_arena_union import (
     UnionArenaError,
     flip_delta,
     plan_union_arena,

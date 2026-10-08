@@ -5,7 +5,7 @@ dcp 1, the whole D KV on TP0): TP1/TP2 died in ``alloc_req_slots`` with
 On the workers the eviction chain was ``MAMBA-EVICT NO-PROGRESS`` (every
 device leaf refused) behind ``#1421 BACKUP-REFUSED why=write_none:?`` and
 ``R12 SHADOW-OWN-EVICT-REFUSED comp=MAMBA``. A worker that owns no KV rows
-has no KV arena (``store=FormAWorkerNullStorage``), so ``_weg2_direct_claim``
+has no KV arena (``store=FormAWorkerNullStorage``), so ``_pdflip_direct_claim``
 returns None and the backup takes the staging path; the controller needs a
 row of the byteless R12 shadow mamba pool for the anchor, the pool is full,
 R12 refuses the worker's own host eviction, ``write`` returns None and the
@@ -25,11 +25,11 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache import form_a_host_shadow as r12  # noqa: E402
-from sglang.srt.mem_cache import unified_radix_cache as urc  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode  # noqa: E402
+from flliper.srt.mem_cache import form_a_host_shadow as r12  # noqa: E402
+from flliper.srt.mem_cache import unified_radix_cache as urc  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode  # noqa: E402
 
 TC = (ComponentType.FULL, ComponentType.MAMBA)
 F, M = ComponentType.FULL, ComponentType.MAMBA
@@ -78,10 +78,10 @@ def _tree(shadow_free):
     t.sidecar_pool_specs = []
     t.ongoing_write_through = {}
     t.staging_write_ring = None
-    t._weg2_rid_anchor_cfg = 8
+    t._pdflip_rid_anchor_cfg = 8
     t.components = {F: _Comp(F), M: _Comp(M)}
     t._components_tuple = (t.components[F], t.components[M])
-    t._weg2_direct_pool = lambda: None  # FormAWorkerNullStorage: no KV arena
+    t._pdflip_direct_pool = lambda: None  # FormAWorkerNullStorage: no KV arena
     shadow = _ShadowMambaHost(shadow_free)
     t.writes = []
 
@@ -119,8 +119,8 @@ def _leaf(t, name="tail"):
     n.hash_value = [f"{name}{i}" for i in range(PAGES)]
     n.component_data[F].value = torch.arange(PAGE * PAGES)
     n.component_data[M].value = torch.tensor([7])
-    n.weg2_anchor_rid = None
-    n._weg2_end_anchor = False
+    n.pdflip_anchor_rid = None
+    n._pdflip_end_anchor = False
     return n
 
 

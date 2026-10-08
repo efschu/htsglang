@@ -11,14 +11,14 @@ def launch_server(args):
     lora_path = args.lora_path
 
     if args.base_only:
-        cmd = f"python3 -m sglang.launch_server --model-path {base_path} "
+        cmd = f"python3 -m flliper.launch_server --model-path {base_path} "
     else:
         if args.num_loras <= 0:
             raise ValueError(
                 "--num-loras must be greater than 0 unless --base-only is set"
             )
 
-        cmd = f"python3 -m sglang.launch_server --model-path {base_path} --lora-paths "
+        cmd = f"python3 -m flliper.launch_server --model-path {base_path} --lora-paths "
         for i in range(args.num_loras):
             lora_name = f"lora{i}"
             cmd += f"{lora_name}={lora_path} "

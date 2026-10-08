@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Convert a speculators-format EAGLE3 draft head (vLLM ecosystem, e.g.
-RedHatAI/*-speculator.eagle3) into the SpecForge-style layout that sglang's
+RedHatAI/*-speculator.eagle3) into the SpecForge-style layout that flliper's
 LlamaForCausalLMEagle3 loads.
 
 Two convention differences are handled here so the runtime needs no special
@@ -8,15 +8,15 @@ cases beyond the `norm_before_residual` flag:
 
 1. AUX LAYER IDS (off-by-one): speculators/vLLM `eagle_aux_hidden_state_layer_ids`
    follow vLLM's capture convention where id i means the hidden state at the
-   INPUT of decoder layer i (= output of layer i-1); sglang's convention is
-   "output of layer i" (sglang then adds +1 internally to place the capture
+   INPUT of decoder layer i (= output of layer i-1); flliper's convention is
+   "output of layer i" (flliper then adds +1 internally to place the capture
    before layer i+1). We therefore write ids-1 into the converted config.
    Feeding the raw ids loses ~0.2 accept probability per drafted token
    (measured: overlap@1 0.36 raw vs 0.56 translated, T101).
 
 2. RESIDUAL NORM ORDER: speculators heads are trained with
    `norm_before_residual=True` (residual = hidden_norm(hidden)); the flag is
-   passed through and honored by sglang's llama_eagle3 input layer.
+   passed through and honored by flliper's llama_eagle3 input layer.
 
 Weight names (layers.0.*, fc, lm_head, norm, embed_tokens, d2t, t2d) already
 match what LlamaForCausalLMEagle3.load_weights resolves; the safetensors file
@@ -56,7 +56,7 @@ def convert(src: str, dst: str) -> None:
             "target_hidden_size": cfg.get("target_hidden_size")
             or layer_cfg["hidden_size"],
             # speculators id i = INPUT of layer i = output of layer i-1;
-            # sglang expects "output of layer i" -> translate by -1.
+            # flliper expects "output of layer i" -> translate by -1.
             "eagle_config": {
                 "eagle_aux_hidden_state_layer_ids": [i - 1 for i in aux_ids],
                 "use_aux_hidden_state": True,
@@ -80,7 +80,7 @@ def convert(src: str, dst: str) -> None:
             shutil.copy2(src_st, dst_st)
 
     print(f"converted {src} -> {dst}")
-    print(f"  aux ids (speculators) {aux_ids} -> (sglang) {[i-1 for i in aux_ids]}")
+    print(f"  aux ids (speculators) {aux_ids} -> (flliper) {[i-1 for i in aux_ids]}")
     print(f"  norm_before_residual = {out['norm_before_residual']}")
 
 

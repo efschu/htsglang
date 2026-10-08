@@ -44,19 +44,19 @@ interval, and this file pins the two things that must hold in that world.
 Hermetic: predicate level plus source-level wiring pins. No CUDA, no pools.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
 import inspect
 import unittest
 
-from sglang.srt.mem_cache.mamba_ckpt_utils import (
+from flliper.srt.mem_cache.mamba_ckpt_utils import (
     RESUME_REFUSAL_ABSENT,
     is_resume_candidate,
     resume_refusal_reason,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestPresenceIsStillTheGefahrrichtung(CustomTestCase):
@@ -113,7 +113,7 @@ class TestTheAnchorIsAckedBeforeTheDrop(CustomTestCase):
         """Retraction already donates the state (``release_req`` ->
         ``cache_finished_req``); the stamp is what stops the hit-count
         write-through heuristic from leaving it device-only."""
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         src = inspect.getsource(phase_flip_runtime.build_cutover_release)
         self.assertIn("FORCE_HOST_WRITE_THROUGH_ATTR", src)
@@ -123,7 +123,7 @@ class TestTheAnchorIsAckedBeforeTheDrop(CustomTestCase):
         RETRACT callable -- `release_residents_for_cutover` calls
         `reset_tree()` immediately after it returns, and that is what frees the
         mamba values."""
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         src = inspect.getsource(
             phase_flip_runtime.PhaseFlipRuntime._release_residents_for_cutover
@@ -133,7 +133,7 @@ class TestTheAnchorIsAckedBeforeTheDrop(CustomTestCase):
     def test_the_fence_cannot_take_the_cutover_down(self):
         """Past the no-return point a raise kills the flip, and a lost anchor
         only costs a recompute -- so this one is best-effort by design."""
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         src = inspect.getsource(
             phase_flip_runtime.PhaseFlipRuntime._release_residents_for_cutover
@@ -143,7 +143,7 @@ class TestTheAnchorIsAckedBeforeTheDrop(CustomTestCase):
 
     def test_the_order_is_retract_then_reset(self):
         """The property the fence placement depends on."""
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         src = inspect.getsource(phase_flip_runtime.release_residents_for_cutover)
         self.assertLess(src.index("retract(reqs)"), src.index("reset_tree()"))

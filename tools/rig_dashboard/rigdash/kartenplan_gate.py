@@ -1,7 +1,7 @@
 """Kartenplaner (Item 510): das Gate des Planers, als reine Funktion im Server-Prozess.
 
-``sglang/srt/weg2/card_identity.py`` und ``topology.py`` sind laut ihren Köpfen "PURE: stdlib only".  Sie
-werden hier per Dateipfad aus dem ausgelieferten Planer-Baum geladen (nicht über ``import sglang``, das
+``flliper/srt/pdflip/card_identity.py`` und ``topology.py`` sind laut ihren Köpfen "PURE: stdlib only".  Sie
+werden hier per Dateipfad aus dem ausgelieferten Planer-Baum geladen (nicht über ``import flliper``, das
 torch zieht), und dann genauso gerufen wie der Launcher sie ruft: ``arch_gate``, ``order_cards``,
 ``uncalibrated_message``, ``plan_topology``.  Die Meldungen sind die ORIGINALTEXTE des Planers.
 
@@ -31,7 +31,7 @@ def _load(name: str, path: str):
 
 
 def load_modules(tree_python: str):
-    base = os.path.join(tree_python, "sglang", "srt", "weg2")
+    base = os.path.join(tree_python, "flliper", "srt", "pdflip")
     return _load("kp_card_identity", os.path.join(base, "card_identity.py")), _load("kp_topology", os.path.join(base, "topology.py"))
 
 

@@ -29,7 +29,7 @@ place, so at that instant every queued entry belongs to the binding still
 installed.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -39,11 +39,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.hicache_phase_binding import (
+from flliper.srt.mem_cache.hicache_phase_binding import (
     RebindRefused,
     settle_pending_releases,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Pool:
@@ -138,7 +138,7 @@ class TestLoudInBothWrongDirections(CustomTestCase):
     def test_nothing_is_discarded_silently(self):
         import inspect
 
-        from sglang.srt.mem_cache import hicache_phase_binding
+        from flliper.srt.mem_cache import hicache_phase_binding
 
         src = inspect.getsource(hicache_phase_binding.settle_pending_releases)
         self.assertIn("RebindRefused", src)
@@ -152,7 +152,7 @@ class TestItRunsBeforeTheSwap(CustomTestCase):
     def test_the_settle_precedes_the_rebind(self):
         import inspect
 
-        from sglang.srt.mem_cache import hicache_phase_binding
+        from flliper.srt.mem_cache import hicache_phase_binding
 
         src = inspect.getsource(hicache_phase_binding.rebind_for_cutover)
         settle_at = src.find("settle_pending_releases")
@@ -165,7 +165,7 @@ class TestItRunsBeforeTheSwap(CustomTestCase):
         # Ein-Job-ein-Mover: no parallel per-entry stamp / generation->pool map.
         import inspect
 
-        from sglang.srt.mem_cache import hicache_phase_binding
+        from flliper.srt.mem_cache import hicache_phase_binding
 
         src = inspect.getsource(hicache_phase_binding.settle_pending_releases)
         for rival in ("generation_of_entry", "_gen_map", "stamp_release"):
@@ -179,7 +179,7 @@ class TestAgainstTheRealClasses(CustomTestCase):
     def test_the_real_drain_path_frees_through_mem_pool_host(self):
         import inspect
 
-        from sglang.srt.mem_cache import unified_radix_cache
+        from flliper.srt.mem_cache import unified_radix_cache
 
         src = inspect.getsource(unified_radix_cache)
         self.assertIn("cc.mem_pool_host.free(torch.cat(host_indices_list", src)
@@ -190,7 +190,7 @@ class TestAgainstTheRealClasses(CustomTestCase):
         # the metal assertion came from. Pin that the raiser still exists.
         import inspect
 
-        from sglang.srt.mem_cache.pool_host import base
+        from flliper.srt.mem_cache.pool_host import base
 
         self.assertIn("Double-free detected", inspect.getsource(base))
 
@@ -198,7 +198,7 @@ class TestAgainstTheRealClasses(CustomTestCase):
         # Why settling must happen first: this is the attribute the drain reads.
         import inspect
 
-        from sglang.srt.mem_cache import hicache_phase_binding
+        from flliper.srt.mem_cache import hicache_phase_binding
 
         self.assertIn(
             '"mem_pool_host"', inspect.getsource(hicache_phase_binding._stamp)

@@ -32,7 +32,7 @@ CPU-only: the guard runs before any device work, which is the whole point.
 import pytest
 import torch
 
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+from flliper.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 

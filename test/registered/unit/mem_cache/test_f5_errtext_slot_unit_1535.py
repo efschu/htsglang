@@ -22,10 +22,10 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.kv_backing_relief import KvRowCap
-from sglang.srt.mem_cache import common as mc
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.kv_backing_relief import KvRowCap
+from flliper.srt.mem_cache import common as mc
+from flliper.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

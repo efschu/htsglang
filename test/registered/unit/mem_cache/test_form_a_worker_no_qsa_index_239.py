@@ -17,10 +17,10 @@ import types
 
 import pytest
 
-from sglang.srt import rank_role
-from sglang.srt.mem_cache import qsa_kv_pool
-from sglang.srt.model_executor import pool_configurator
-from sglang.srt.model_executor import model_runner_kv_cache_mixin as mixin
+from flliper.srt import rank_role
+from flliper.srt.mem_cache import qsa_kv_pool
+from flliper.srt.model_executor import pool_configurator
+from flliper.srt.model_executor import model_runner_kv_cache_mixin as mixin
 
 NF_TEXT = types.SimpleNamespace(
     indexer_n_heads=4,
@@ -73,8 +73,8 @@ def test_the_mixin_hands_the_role_to_the_pool():
 
 
 def test_the_empty_list_is_the_shape_the_hicache_side_reads_as_no_sidecar():
-    from sglang.srt.managers import cache_controller
-    from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+    from flliper.srt.managers import cache_controller
+    from flliper.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 
     assert "if not device_pool.qsa_compressed_k_buffer_pool:" in inspect.getsource(
         cache_controller

@@ -99,7 +99,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=45)
 
@@ -191,7 +191,7 @@ class _FakeReq:
 
 
 def _make_holder(rank: int, wire: _RingWire, waiting_queue):
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=wire,
@@ -231,14 +231,14 @@ class _WarningCatcher(logging.Handler):
 
 
 def _worker(rank, init_file, out_dir):
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         PPAdmissionDecision,
         PPAdmissionEntry,
     )
 
     res = {"rank": rank, "ok": False, "error": None}
     catcher = _WarningCatcher()
-    mixin_logger = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+    mixin_logger = logging.getLogger("flliper.srt.managers.scheduler_pp_mixin")
     mixin_logger.addHandler(catcher)
     mixin_logger.setLevel(logging.WARNING)
     try:
@@ -427,8 +427,8 @@ class PPAdmissionWiringNoOpWithoutPP(unittest.TestCase):
         path must never touch the wire. Checked in-process -- no
         multiprocessing needed since the shipped methods return before
         touching self.pp_group at all."""
-        from sglang.srt.managers.pp_admission_congruence import PPAdmissionDecision
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.pp_admission_congruence import PPAdmissionDecision
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         class _ExplodingWire:
             def send_tensor_dict(self, *a, **k):
@@ -466,7 +466,7 @@ class PPAdmissionOrdering791(unittest.TestCase):
         ordinary prefix-length divergence is degraded before the #789
         proxy-readiness contract's raise path could ever be reached on a
         healthy pass."""
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         src = inspect.getsource(SchedulerPPMixin._event_loop_pp_body)
         i_admission = src.index("_pp_recv_admission_decision(")

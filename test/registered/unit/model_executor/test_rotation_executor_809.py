@@ -35,7 +35,7 @@ so byte-exactness, the checksum and the absence of a leak are executed rather
 than modelled. Only the CUDA lane mapping needs metal.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -44,21 +44,21 @@ import unittest.mock
 
 import torch
 
-from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
-from sglang.srt.model_executor.rotation_executor import (
+from flliper.srt.mem_cache.read_buffer_pool import ReadBufferPool
+from flliper.srt.model_executor.rotation_executor import (
     RotationHazard,
     RotationStats,
     TorchRotationOps,
     rotate_arena,
 )
-from sglang.srt.model_executor.rotation_plan import rotation_overshoot_bytes
-from sglang.srt.model_executor.weights_arena import (
+from flliper.srt.model_executor.rotation_plan import rotation_overshoot_bytes
+from flliper.srt.model_executor.weights_arena import (
     _CHECKSUM_BYTES,
     RefillLegTiming,
     refill_bound_phrase,
     uint8_checksum,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 CHUNK = 4096
 DEPTH = 4
@@ -545,7 +545,7 @@ class TestTheHostPostIsPricedNotHandPinned(CustomTestCase):
     helper commit 272d0d9d8c deleted."""
 
     def test_the_host_cost_is_ONE_image_plus_the_ring(self):
-        from sglang.srt.model_executor.rotation_executor import rotation_host_bytes
+        from flliper.srt.model_executor.rotation_executor import rotation_host_bytes
 
         image, ring = rotation_host_bytes(INCOMING, OUTGOING, CHUNK, DEPTH)
         self.assertEqual(image, max(INCOMING, OUTGOING) + _CHECKSUM_BYTES)
@@ -555,7 +555,7 @@ class TestTheHostPostIsPricedNotHandPinned(CustomTestCase):
         self.assertLess(image + ring, INCOMING + OUTGOING)
 
     def test_the_ring_is_registered_ONCE_and_reused(self):
-        from sglang.srt.model_executor import rotation_executor as rx
+        from flliper.srt.model_executor import rotation_executor as rx
 
         saved = rx._rotation_ring
         try:
@@ -575,7 +575,7 @@ class TestTheHostPostIsPricedNotHandPinned(CustomTestCase):
                     return real(**kw)
 
                 with unittest.mock.patch(
-                    "sglang.srt.mem_cache.read_buffer_pool.ReadBufferPool", _spy
+                    "flliper.srt.mem_cache.read_buffer_pool.ReadBufferPool", _spy
                 ):
                     a = rx.rotation_ring(CHUNK, DEPTH)
                     b = rx.rotation_ring(CHUNK, DEPTH)
@@ -585,12 +585,12 @@ class TestTheHostPostIsPricedNotHandPinned(CustomTestCase):
             rx._rotation_ring = saved
 
     def test_the_launcher_PRICES_the_ring_and_refuses_when_it_cannot_fit(self):
-        from sglang.srt import server_args as sa
+        from flliper.srt import server_args as sa
 
         args = sa.ServerArgs.__new__(sa.ServerArgs)
         args.tp_size, args.pp_size = 3, 1
         with unittest.mock.patch(
-            "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+            "flliper.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
             return_value=(1024, 1024),  # a machine with 1 KiB to pin
         ):
             with self.assertRaises(ValueError) as caught:
@@ -600,12 +600,12 @@ class TestTheHostPostIsPricedNotHandPinned(CustomTestCase):
     def test_it_does_NOT_refuse_on_a_machine_that_has_the_room(self):
         # THE CAN-FAIL PARTNER: a check that refused every boot would be
         # indistinguishable from one that works.
-        from sglang.srt import server_args as sa
+        from flliper.srt import server_args as sa
 
         args = sa.ServerArgs.__new__(sa.ServerArgs)
         args.tp_size, args.pp_size = 3, 1
         with unittest.mock.patch(
-            "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+            "flliper.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
             return_value=(1 << 40, 1 << 40),
         ):
             args._post_phase_flip_rotation_host_ledger()

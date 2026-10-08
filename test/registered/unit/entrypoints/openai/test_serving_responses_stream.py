@@ -10,11 +10,11 @@ from utils import (
     make_serving,
 )
 
-from sglang.srt.entrypoints.openai.protocol import (
+from flliper.srt.entrypoints.openai.protocol import (
     RequestResponseMetadata,
     ResponsesRequest,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -139,7 +139,7 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         self.assertIn("function_call", added_kinds)
 
     def test_final_output_preserves_text_tool_text_order(self):
-        from sglang.srt.function_call.core_types import (
+        from flliper.srt.function_call.core_types import (
             StreamingParseResult,
             ToolCallItem,
         )
@@ -189,7 +189,7 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
             return sp.normal_text, sp.calls
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
+            "flliper.srt.entrypoints.openai.serving_responses.FunctionCallParser"
         ) as parser_cls:
             parser_cls.return_value.detector.supports_structural_tag.return_value = True
             parser_cls.return_value.parse_stream_chunk.side_effect = (

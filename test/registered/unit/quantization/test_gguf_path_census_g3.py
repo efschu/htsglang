@@ -22,8 +22,8 @@ import torch
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.layers.quantization import gguf as G  # noqa: E402
-from sglang.srt.layers.quantization import gguf_path_census as C  # noqa: E402
+from flliper.srt.layers.quantization import gguf as G  # noqa: E402
+from flliper.srt.layers.quantization import gguf_path_census as C  # noqa: E402
 
 IQ4_XS, Q5_K, Q8_0, F16 = 23, 13, 8, 1
 
@@ -135,7 +135,7 @@ def test_every_branch_is_attributed_to_the_path_the_dispatch_took(census):
 
 
 def test_the_mmq_cap_moves_the_k_quants_off_dequant(census, monkeypatch):
-    """(c) SGLANG_GGUF_MMQ_MAX_TOKENS=16, as the census sees it."""
+    """(c) FLLIPER_GGUF_MMQ_MAX_TOKENS=16, as the census sees it."""
     monkeypatch.setattr(G, "_MMQ_MAX_TOKENS", 16)
     G.fused_mul_mat_gguf(_x(16), _w(Q5_K, 4096, 176), Q5_K)
     G.fused_mul_mat_gguf(_x(16), _w(IQ4_XS, 6144, 136), IQ4_XS)
@@ -209,7 +209,7 @@ def test_a_first_call_inside_a_capture_stays_unmeasured(stub_kernels):
 
 
 def test_the_scheduler_closes_a_census_round_where_dgap_does():
-    from sglang.srt.managers import scheduler as S
+    from flliper.srt.managers import scheduler as S
 
     src = inspect.getsource(S)
     i = src.index("_dgap.end_round(deferred=")
@@ -232,7 +232,7 @@ def test_arm_allocates_once_before_capture_and_is_a_no_op_when_off(monkeypatch):
 
 
 def test_the_model_runner_arms_before_any_graph_is_captured():
-    from sglang.srt.model_executor import model_runner as MR
+    from flliper.srt.model_executor import model_runner as MR
 
     src = inspect.getsource(MR)
     arm = src.index("_gguf_path_census_arm(self.device)")

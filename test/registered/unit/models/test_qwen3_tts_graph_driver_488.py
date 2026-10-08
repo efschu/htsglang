@@ -33,8 +33,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "99")
 
 import torch
 
-from sglang.srt.models.qwen3_tts_fast_predictor import step_schedule
-from sglang.srt.models.qwen3_tts_graph_driver import (
+from flliper.srt.models.qwen3_tts_fast_predictor import step_schedule
+from flliper.srt.models.qwen3_tts_graph_driver import (
     GraphCaptureRefusal,
     _OrderedReplay,
     decode_mask,
@@ -43,8 +43,8 @@ from sglang.srt.models.qwen3_tts_graph_driver import (
     reference_subtalker_defaults as refs,
     reset_cache_positions,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -201,7 +201,7 @@ class TestUniformPool(CustomTestCase):
     """Sampling entropy a captured graph can advance without the host."""
 
     def _pool(self, frames=4, groups=3):
-        from sglang.srt.models.qwen3_tts_graph_driver import UniformPool
+        from flliper.srt.models.qwen3_tts_graph_driver import UniformPool
 
         return UniformPool(frames, groups, device="cpu", seed=488)
 
@@ -245,7 +245,7 @@ class TestUniformPool(CustomTestCase):
         self.assertFalse(torch.equal(before, pool.pool))
 
     def test_empty_pool_refuses(self):
-        from sglang.srt.models.qwen3_tts_graph_driver import UniformPool
+        from flliper.srt.models.qwen3_tts_graph_driver import UniformPool
 
         with self.assertRaises(ValueError):
             UniformPool(0, 3, device="cpu")
@@ -294,7 +294,7 @@ class TestInstallSamplingValidation(CustomTestCase):
         # drive the trunk. The predictor keeps top_p=1.0, top_k=50. Installing
         # the former would bake a warper the reference never applies -- silent,
         # permanent, audible only as timbre. This is the can-fail proof.
-        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+        from flliper.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
 
         with self.assertRaises(GraphCaptureRefusal) as caught:
             GraphedPredictorFrame.install(
@@ -308,7 +308,7 @@ class TestInstallSamplingValidation(CustomTestCase):
     def test_missing_sampling_arguments_are_a_type_error(self):
         # Required keyword arguments with no defaults: a graph bakes its
         # warpers, so these are part of what was compiled, not configuration.
-        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+        from flliper.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
 
         with self.assertRaises(TypeError):
             GraphedPredictorFrame.install(talker=object())
@@ -318,7 +318,7 @@ class TestSamplingFallback(CustomTestCase):
     """A mismatch must serve correct audio, loudly and counted -- not raise."""
 
     def _driver(self):
-        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+        from flliper.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
 
         driver = GraphedPredictorFrame.__new__(GraphedPredictorFrame)
         driver.steps = ["one captured step"]
@@ -329,7 +329,7 @@ class TestSamplingFallback(CustomTestCase):
         return driver
 
     def test_mismatch_falls_back_to_the_reference_and_counts(self):
-        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+        from flliper.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
 
         driver = self._driver()
         GraphedPredictorFrame.generate(
@@ -346,7 +346,7 @@ class TestSamplingFallback(CustomTestCase):
         Raising would break a live turn to protect against something the
         fallback already prevents.
         """
-        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+        from flliper.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
 
         driver = self._driver()
         for _ in range(3):
@@ -364,7 +364,7 @@ class TestReplayBeforeCapture(CustomTestCase):
         graphed arm's -- the one failure that corrupts a measurement instead of
         the audio.
         """
-        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+        from flliper.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
 
         driver = GraphedPredictorFrame.__new__(GraphedPredictorFrame)
         driver.steps = []

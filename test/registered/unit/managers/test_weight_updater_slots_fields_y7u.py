@@ -3,7 +3,7 @@ so every ``self.<name> = ...`` in its methods must name a declared field.
 
 y7u died on all six ranks in its first flip on ``AttributeError:
 'SchedulerWeightUpdaterManager' object has no attribute
-'_weg2_leg_order_na_epoch'`` -- and y7t had silently logged 0 WEG2-LEG-ORDER
+'_pdflip_leg_order_na_epoch'`` -- and y7t had silently logged 0 PDFLIP-LEG-ORDER
 lines because the same mistake one line earlier was swallowed.  This is the
 fourth time the lesson in the class comments was learnt at the metal, so the
 check is static and covers the whole class.
@@ -15,7 +15,7 @@ import unittest
 
 _SRC = (
     pathlib.Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/managers/scheduler_components/weight_updater.py"
+    / "python/flliper/srt/managers/scheduler_components/weight_updater.py"
 )
 
 
@@ -46,13 +46,13 @@ class TestWeightUpdaterSlotsFields(unittest.TestCase):
         self.assertEqual(_undeclared_assignments(), {})
 
     def test_leg_order_epochs_are_fields(self):
-        from sglang.srt.managers.scheduler_components.weight_updater import (
+        from flliper.srt.managers.scheduler_components.weight_updater import (
             SchedulerWeightUpdaterManager,
         )
 
         names = SchedulerWeightUpdaterManager.__slots__
-        self.assertIn("_weg2_leg_order_epoch", names)
-        self.assertIn("_weg2_leg_order_na_epoch", names)
+        self.assertIn("_pdflip_leg_order_epoch", names)
+        self.assertIn("_pdflip_leg_order_na_epoch", names)
 
 
 if __name__ == "__main__":

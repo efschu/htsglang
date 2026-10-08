@@ -39,7 +39,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from sglang.srt.planner.cost_model import stage_rates_from_reports
+from flliper.srt.planner.cost_model import stage_rates_from_reports
 
 
 def nvml_card_names(cards: list[str]) -> dict[str, str]:
@@ -95,7 +95,7 @@ def run_one_card(
     cmd = [
         sys.executable,
         "-m",
-        "sglang.srt.video_enhance.probes",
+        "flliper.srt.video_enhance.probes",
         # Inside the child, the one visible card is ordinal 0. The NVML index
         # is carried in the output filename and in the host block, not by
         # asking the child to re-derive it from an enumeration that no longer

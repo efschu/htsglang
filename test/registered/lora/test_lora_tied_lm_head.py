@@ -18,12 +18,12 @@ Test LoRA on models with tied lm_head (tie_word_embeddings=True).
 When tie_word_embeddings=True, lm_head shares the same weight tensor as
 embed_tokens. PyTorch's named_modules() deduplicates by object identity,
 so lm_head won't appear as a separate module. This test validates that
-SGLang correctly handles this case by untying lm_head before LoRA wrapping.
+fLLiper correctly handles this case by untying lm_head before LoRA wrapping.
 
 The test:
 1. Programmatically creates a LoRA adapter with lm_head in target_modules
    using PEFT on a model with tie_word_embeddings=True (Qwen/Qwen2.5-0.5B).
-2. Compares logprobs between HuggingFace+PEFT and SGLang to ensure numerical
+2. Compares logprobs between HuggingFace+PEFT and fLLiper to ensure numerical
    consistency. This implicitly verifies no NaN values are produced and that
    LoRA is actually being applied (since HF+PEFT is the trusted reference).
 """
@@ -46,9 +46,9 @@ except ImportError:
 
 from transformers import AutoModelForCausalLM
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.runners import HFRunner, SRTRunner
+from flliper.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
@@ -71,9 +71,9 @@ def create_lora_adapter_with_lm_head(base_model_name: str, output_dir: str):
 
     The adapter uses randomly initialized LoRA weights (no training).
     This is sufficient to test that:
-    - SGLang can load the adapter without errors
+    - fLLiper can load the adapter without errors
     - lm_head LoRA is applied (output differs from base model)
-    - Logprobs match between HF and SGLang
+    - Logprobs match between HF and fLLiper
     """
     model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
@@ -137,7 +137,7 @@ class TestLoRATiedLMHead(CustomTestCase):
     def setUpClass(cls):
         """Create a temporary LoRA adapter with lm_head targeting."""
         super().setUpClass()
-        cls._adapter_dir = tempfile.mkdtemp(prefix="sglang_test_lora_tied_lm_head_")
+        cls._adapter_dir = tempfile.mkdtemp(prefix="flliper_test_lora_tied_lm_head_")
         create_lora_adapter_with_lm_head(BASE_MODEL, cls._adapter_dir)
 
     @classmethod
@@ -149,12 +149,12 @@ class TestLoRATiedLMHead(CustomTestCase):
 
     def test_tied_lm_head_lora_hf_sgl_logprob_match(self):
         """
-        Compare logprobs between HuggingFace+PEFT and SGLang+LoRA
+        Compare logprobs between HuggingFace+PEFT and fLLiper+LoRA
         for a tied lm_head adapter, ensuring numerical consistency.
         """
         prompts = TEST_PROMPTS[:2]
 
-        # Run SGLang with LoRA
+        # Run fLLiper with LoRA
         with SRTRunner(
             BASE_MODEL,
             torch_dtype=torch.float16,
@@ -193,7 +193,7 @@ class TestLoRATiedLMHead(CustomTestCase):
             srt_logprobs = torch.tensor(srt_outputs.top_input_logprobs[i])
             hf_logprobs = torch.tensor(hf_outputs.top_input_logprobs[i])
             max_diff = torch.max(torch.abs(srt_logprobs - hf_logprobs)).item()
-            print(f"Prompt {i} prefill logprob max_diff (SGLang vs HF): {max_diff:.6e}")
+            print(f"Prompt {i} prefill logprob max_diff (fLLiper vs HF): {max_diff:.6e}")
             self.assertLess(
                 max_diff,
                 LOGPROB_THRESHOLD,
@@ -206,7 +206,7 @@ class TestLoRATiedLMHead(CustomTestCase):
             srt_logprobs = torch.tensor(srt_outputs.top_output_logprobs[i])
             hf_logprobs = torch.tensor(hf_outputs.top_output_logprobs[i])
             max_diff = torch.max(torch.abs(srt_logprobs - hf_logprobs)).item()
-            print(f"Prompt {i} decode logprob max_diff (SGLang vs HF): {max_diff:.6e}")
+            print(f"Prompt {i} decode logprob max_diff (fLLiper vs HF): {max_diff:.6e}")
             self.assertLess(
                 max_diff,
                 LOGPROB_THRESHOLD,

@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.speculative.dspark_components.dspark_observability import (
+from flliper.srt.environ import envs
+from flliper.srt.speculative.dspark_components.dspark_observability import (
     DecodeStepObservation,
     DsparkInfoDumper,
     InfoComponent,
@@ -12,8 +12,8 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     resolve_components,
     resolve_enabled_components,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -95,17 +95,17 @@ class TestResolveComponents(CustomTestCase):
             resolve_components(("core", "bogus"))
 
     def test_sps_record_env_enables_core_and_cpu_timing(self):
-        """SGLANG_DSPARK_ENABLE_SPS_RECORD=1 is the published SPS-profiling
+        """FLLIPER_DSPARK_ENABLE_SPS_RECORD=1 is the published SPS-profiling
         switch; it must keep enabling the components the table fit reads."""
-        with envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.override(True):
+        with envs.FLLIPER_DSPARK_ENABLE_SPS_RECORD.override(True):
             self.assertEqual(
                 resolve_enabled_components(),
                 {InfoComponent.CORE, InfoComponent.STEP_CPU_TIME},
             )
 
     def test_sps_record_env_unions_with_debug_dump(self):
-        with envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.override(True):
-            with envs.SGLANG_DSPARK_DEBUG_DUMP.override("reqs"):
+        with envs.FLLIPER_DSPARK_ENABLE_SPS_RECORD.override(True):
+            with envs.FLLIPER_DSPARK_DEBUG_DUMP.override("reqs"):
                 self.assertEqual(
                     resolve_enabled_components(),
                     {

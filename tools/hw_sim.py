@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HW-P1b 1003: the hardware simulation harness (CPU only, no GPU, no NVML).
 
-Thin wrapper of ``python -m sglang.srt.weg2.hw_sim`` that finds the tree's
+Thin wrapper of ``python -m flliper.srt.pdflip.hw_sim`` that finds the tree's
 ``python/`` itself:
 
     tools/hw_sim.py                                  # grid 1..6 cards x arch x model
@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "python"))
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.weg2.hw_sim import main  # noqa: E402
+from flliper.srt.pdflip.hw_sim import main  # noqa: E402
 
 if __name__ == "__main__":
     sys.exit(main())

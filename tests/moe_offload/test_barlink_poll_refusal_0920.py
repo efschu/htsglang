@@ -3,10 +3,10 @@
 process down.
 
 THE SPECIMEN (boot weg2xsn406, 2026-09-20 16:49:25Z, D ranks TP0 and TP1).
-A manual `POST /weg2/flip` arrived while D was awake. The wake's
+A manual `POST /pdflip/flip` arrived while D was awake. The wake's
 `resume_memory_occupation` hit
 
-    [core.cpp] WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
+    [core.cpp] PDFLIP-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
                ... every allocation of the tag is PAUSED again
 
 which leaves the tag's physical handles unmapped while the VIRTUAL
@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate as gate
+from flliper.srt.distributed.device_communicators import barlink_abort_gate as gate
 
 
 class _Transport:
@@ -163,7 +163,7 @@ def test_pause_polling_suppresses_the_pass(monkeypatch):
 def test_tms_adapter_excludes_the_poll_for_the_length_of_the_call(monkeypatch):
     """The window weg2xsn406 fell into: a wake's TMS resume and the 10 ms
     watchdog poll in the same microsecond."""
-    from sglang.srt.utils import torch_memory_saver_adapter as tms
+    from flliper.srt.utils import torch_memory_saver_adapter as tms
 
     a = _Transport("a", trips=True)
     _register(monkeypatch, a)
@@ -182,7 +182,7 @@ def test_tms_adapter_exclusion_never_raises(monkeypatch):
     """A guard that can break bring-up is worse than the gap it closes."""
     import builtins
 
-    from sglang.srt.utils import torch_memory_saver_adapter as tms
+    from flliper.srt.utils import torch_memory_saver_adapter as tms
 
     real_import = builtins.__import__
 
@@ -197,7 +197,7 @@ def test_tms_adapter_exclusion_never_raises(monkeypatch):
 
 
 def test_tms_adapter_exclusion_releases_on_an_exception(monkeypatch):
-    from sglang.srt.utils import torch_memory_saver_adapter as tms
+    from flliper.srt.utils import torch_memory_saver_adapter as tms
 
     with pytest.raises(ValueError):
         with tms._abort_poll_excluded():
@@ -221,7 +221,7 @@ class _Poll:
     def __init__(self, **kw):
         import torch
 
-        from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+        from flliper.srt.distributed.device_communicators.barlink_bar1 import (
             BarlinkBar1Transport,
         )
 
@@ -287,7 +287,7 @@ def test_refusal_names_an_int_destination():
 def test_refusal_names_a_dtype_mismatch(monkeypatch):
     import torch
 
-    from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+    from flliper.srt.distributed.device_communicators.barlink_bar1 import (
         BarlinkBar1Transport,
     )
 
@@ -310,7 +310,7 @@ def test_refusal_names_a_dtype_mismatch(monkeypatch):
 def test_refusal_passes_a_sound_set(monkeypatch):
     import torch
 
-    from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+    from flliper.srt.distributed.device_communicators.barlink_bar1 import (
         BarlinkBar1Transport,
     )
 

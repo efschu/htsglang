@@ -20,9 +20,9 @@ from typing import Optional
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
+from flliper.test.test_utils import (
     CustomTestCase,
     get_similarities,
     is_in_amd_ci,
@@ -44,7 +44,7 @@ MODEL_TO_CONFIG = {
     # Temporarily disable: HF reference path in runners.py runs this Qwen2-VL
     # fine-tune with bidirectional attention (the non-sentence-transformers
     # branch in _get_sentence_transformer_embedding_model does not pass
-    # is_causal=True), while SGLang's Qwen2-VL embedding is always causal —
+    # is_causal=True), while fLLiper's Qwen2-VL embedding is always causal —
     # producing ~0.30 cosine diffs vs HF on short prompts.
     # See https://github.com/sgl-project/sglang/actions/runs/25224929325/job/73966043206
     # "marco/mcdse-2b-v1": (1, 1e-5),

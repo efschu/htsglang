@@ -6,7 +6,7 @@ second, shmem flat, every other rank flat, TP0's last line the MoE-input
 carrier of layer 31. Nothing in the rank log said which allocator took the
 bytes or where. x108 ran the same prefill without the jump.
 
-The instrument (debug_utils/host_anon_probe.py, SGLANG_DEBUG_HOST_ANON_PROBE)
+The instrument (debug_utils/host_anon_probe.py, FLLIPER_DEBUG_HOST_ANON_PROBE)
 must, at the next boot, turn that into ONE grep-able line naming the site:
 
 * the checkpoints bracket a jump between two named forward-path sites
@@ -25,7 +25,7 @@ import os
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -38,7 +38,7 @@ import unittest.mock
 from collections import namedtuple
 from types import SimpleNamespace
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 MIB = 1 << 20
 
@@ -84,7 +84,7 @@ class _Clock:
 
 
 def _probe(read, log, **kw):
-    from sglang.srt.debug_utils.host_anon_probe import HostAnonProbe
+    from flliper.srt.debug_utils.host_anon_probe import HostAnonProbe
 
     return HostAnonProbe(
         threshold_bytes=256 * MIB,
@@ -102,7 +102,7 @@ def _probe(read, log, **kw):
 
 class TestMeasurement(CustomTestCase):
     def test_statm_resident_minus_shared_is_rss_anon(self):
-        from sglang.srt.debug_utils import host_anon_probe as hap
+        from flliper.srt.debug_utils import host_anon_probe as hap
 
         with tempfile.NamedTemporaryFile("w", suffix="statm", delete=False) as fh:
             fh.write("900000 1000 300 10 0 5000 0\n")
@@ -116,7 +116,7 @@ class TestMeasurement(CustomTestCase):
         """The x109 jump was anon with shmem flat. A MAP_SHARED|MAP_ANONYMOUS
         map (cudaHostAlloc, torch pin_memory) is RssShmem and must not be
         counted; touched private bytes must."""
-        from sglang.srt.debug_utils import host_anon_probe as hap
+        from flliper.srt.debug_utils import host_anon_probe as hap
 
         n = 320 * MIB
         a0 = hap.read_anon_bytes()
@@ -132,7 +132,7 @@ class TestMeasurement(CustomTestCase):
         shared.close()
 
     def test_glibc_names_a_large_malloc_as_mmapped_chunks(self):
-        from sglang.srt.debug_utils import host_anon_probe as hap
+        from flliper.srt.debug_utils import host_anon_probe as hap
 
         m0 = hap._mallinfo2()
         if not m0:
@@ -143,7 +143,7 @@ class TestMeasurement(CustomTestCase):
         del big
 
     def test_smaps_top_vmas_by_anonymous_pages(self):
-        from sglang.srt.debug_utils import host_anon_probe as hap
+        from flliper.srt.debug_utils import host_anon_probe as hap
 
         text = (
             "7f0000000000-7f0200000000 rw-p 00000000 00:00 0 \n"
@@ -163,7 +163,7 @@ class TestMeasurement(CustomTestCase):
                          [(7424, "rw-p", "[anon]"), (4, "rw-p", "[heap]")])
 
     def test_thread_stacks_innermost_first_and_named(self):
-        from sglang.srt.debug_utils import host_anon_probe as hap
+        from flliper.srt.debug_utils import host_anon_probe as hap
 
         stacks = hap.thread_stacks()
         mine = [s for s in stacks if s.startswith(threading.current_thread().name)]
@@ -248,7 +248,7 @@ class TestSampler(CustomTestCase):
 
     def test_real_sampler_thread_sees_a_real_allocation(self):
         log, cap = _logger("h13.thread")
-        from sglang.srt.debug_utils.host_anon_probe import HostAnonProbe
+        from flliper.srt.debug_utils.host_anon_probe import HostAnonProbe
 
         p = HostAnonProbe(threshold_bytes=256 * MIB, sample_ms=5, log=log,
                           vmas=lambda: [])
@@ -272,29 +272,29 @@ class TestSampler(CustomTestCase):
 
 class TestWiring(CustomTestCase):
     def tearDown(self):
-        from sglang.srt.debug_utils import host_anon_probe as hap
+        from flliper.srt.debug_utils import host_anon_probe as hap
 
         hap._reset_for_tests()
 
     def test_off_by_default_and_a_noop_when_off(self):
-        from sglang.srt.debug_utils import host_anon_probe as hap
-        from sglang.srt.environ import envs
+        from flliper.srt.debug_utils import host_anon_probe as hap
+        from flliper.srt.environ import envs
 
-        self.assertFalse(envs.SGLANG_DEBUG_HOST_ANON_PROBE.get())
-        self.assertEqual(envs.SGLANG_DEBUG_HOST_ANON_PROBE_DELTA_MIB.get(), 256)
-        self.assertEqual(envs.SGLANG_DEBUG_HOST_ANON_PROBE_SAMPLE_MS.get(), 50)
+        self.assertFalse(envs.FLLIPER_DEBUG_HOST_ANON_PROBE.get())
+        self.assertEqual(envs.FLLIPER_DEBUG_HOST_ANON_PROBE_DELTA_MIB.get(), 256)
+        self.assertEqual(envs.FLLIPER_DEBUG_HOST_ANON_PROBE_SAMPLE_MS.get(), 50)
         hap._reset_for_tests()
         self.assertIsNone(hap.checkpoint("layer", layer=0))
         self.assertFalse(hap.enabled())
 
     def test_env_arms_the_singleton(self):
-        from sglang.srt.debug_utils import host_anon_probe as hap
-        from sglang.srt.environ import envs
+        from flliper.srt.debug_utils import host_anon_probe as hap
+        from flliper.srt.environ import envs
 
         hap._reset_for_tests()
-        with envs.SGLANG_DEBUG_HOST_ANON_PROBE.override(True), \
-                envs.SGLANG_DEBUG_HOST_ANON_PROBE_SAMPLE_MS.override(0), \
-                envs.SGLANG_DEBUG_HOST_ANON_PROBE_DELTA_MIB.override(512):
+        with envs.FLLIPER_DEBUG_HOST_ANON_PROBE.override(True), \
+                envs.FLLIPER_DEBUG_HOST_ANON_PROBE_SAMPLE_MS.override(0), \
+                envs.FLLIPER_DEBUG_HOST_ANON_PROBE_DELTA_MIB.override(512):
             self.assertTrue(hap.enabled())
             self.assertIsInstance(hap.checkpoint("layer", layer=0), int)
             self.assertEqual(hap._probe.threshold, 512 * MIB)
@@ -305,15 +305,15 @@ class TestWiring(CustomTestCase):
         line must say moe.apply, layer 23, wave 1 of N, since moe.fetch."""
         import torch
 
-        from sglang.srt.debug_utils import host_anon_probe as hap
-        from sglang.srt.layers.moe import expert_offload as eo
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from flliper.srt.debug_utils import host_anon_probe as hap
+        from flliper.srt.layers.moe import expert_offload as eo
+        from flliper.srt.layers.moe.topk import StandardTopKOutput
 
         E, R, C, W = 10, 2, 3, 4
         Dispatch = namedtuple("Dispatch", "hidden_states hidden_states_scale topk_output")
         Combine = namedtuple("Combine", "hidden_states")
-        with unittest.mock.patch.dict(os.environ, {"SGLANG_MOE_SCRATCH_SLOTS": str(C),
-                                                   "SGLANG_MOE_OFFLOAD_WAVE_ORDER": "token"}):
+        with unittest.mock.patch.dict(os.environ, {"FLLIPER_MOE_SCRATCH_SLOTS": str(C),
+                                                   "FLLIPER_MOE_OFFLOAD_WAVE_ORDER": "token"}):
             cache = eo.MoEExpertOffloadCache(SimpleNamespace(num_local_experts=E, layer_id=23), R / E)
         cache._pinned = {"w13": torch.zeros((E - R, W))}
         cache._resident = {"w13": torch.zeros((R + C, W))}

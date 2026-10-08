@@ -34,7 +34,7 @@ _PYTHON_ROOT = str(Path(__file__).resolve().parents[4] / "python")
 
 class TestNIsARuntimeScalar(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.mem_cache import memory_pool
+        from flliper.srt.mem_cache import memory_pool
 
         self.fn = memory_pool.masked_set_kv_buffer_kernel
 
@@ -62,7 +62,7 @@ _INTERP_SCRIPT = textwrap.dedent(
     os.environ["TRITON_INTERPRET"] = "1"
     sys.path.insert(0, sys.argv[1])
     import torch
-    from sglang.srt.mem_cache import memory_pool as mp
+    from flliper.srt.mem_cache import memory_pool as mp
 
     fn = mp.masked_set_kv_buffer_kernel
     H, D, ROWS = 2, 8, 64

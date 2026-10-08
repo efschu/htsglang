@@ -5,13 +5,13 @@ import unittest
 
 import aiohttp
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     STDERR_FILENAME,
@@ -28,7 +28,7 @@ register_cpu_ci(est_time=184, suite="base-c-test-cpu")
 class TestRoutingKeyScheduling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG"] = "1"
+        os.environ["FLLIPER_ROUTING_KEY_POLICY_DEBUG_LOG"] = "1"
 
         cls.model = "Qwen/Qwen3-0.6B"
         cls.base_url = DEFAULT_URL_FOR_TEST

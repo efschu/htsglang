@@ -5,14 +5,14 @@ free_and_cached=22, #924 MAMBA SLOT ALIASING: mamba_num_used=-22".
 
 THE METAL SEQUENCE (D log boot_weg2_dkrnfint4h6ablbar1dauer10030924_044316dd1a_1003_092457):
 
-* 09:53:40 the front's quiesce answered "WEG2-FLUSH-NONBLOCK quiesced" (B1): tree, pools and
+* 09:53:40 the front's quiesce answered "PDFLIP-FLUSH-NONBLOCK quiesced" (B1): tree, pools and
   in-flight writes kept, "the sleep leg drains, publishes, joins and resets BEFORE the kv_cache pause".
 * 09:53:41 TP0/TP2: the sleep leg's flush_cache(zero_kv=False) reset (TP0 "Cache flushed successfully!").
 * 09:53:43 TP1: the same flush ran its #1470 sweep (issued=1 in_flight_after=2) and then REFUSED
   rank-locally: "Cache not flushed ... not-idle because: hicache_backup(2) | single-rank verdict".
   The release leg ignored the return value and paused kv_cache anyway -- TP1 slept with a tree whose
-  nodes still held device KV indices and 22 device mamba slots ("WEG2-DORMANT set" one line later).
-* 09:53:58 the wake: "Reset HybridReqToTokenPool", "WEG2-WAKE-RESTORE pools cleared, radix tree KEPT"
+  nodes still held device KV indices and 22 device mamba slots ("PDFLIP-DORMANT set" one line later).
+* 09:53:58 the wake: "Reset HybridReqToTokenPool", "PDFLIP-WAKE-RESTORE pools cleared, radix tree KEPT"
   -- every device slot the kept tree references is now ALSO in the free lists. The first idle pass
   after the W50-REROUTE park raised the leak; TREE CENSUS on TP1 still showed MAMBA tracked_evictable=22.
 
@@ -20,7 +20,7 @@ Hermetic: the real UnifiedRadixCache (FULL + MAMBA) with the real CPU pools of
 test_unified_radix_cache_unittest. Nothing here touches a GPU.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -29,17 +29,17 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler_components.weight_updater import (
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager as WU,
 )
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.base_prefix_cache import InsertParams
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
@@ -54,7 +54,7 @@ def _metal_tree():
     cfg = CacheConfig(page_size=1, components=(FULL, MAMBA))
     cache, allocator, r2t = build_fixture(cfg)
     req = Req(
-        rid="weg2-36-194",
+        rid="pdflip-36-194",
         origin_input_text="",
         origin_input_ids=array("q"),
         sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
@@ -112,7 +112,7 @@ class WakeRestoreOnAKeptDeviceTree(CustomTestCase):
         cache, allocator, r2t = _metal_tree()
         upd, _ = _updater(cache, allocator, r2t)
         try:
-            WU._weg2_wake_restore_pools(upd)
+            WU._pdflip_wake_restore_pools(upd)
         except RuntimeError as exc:
             self.assertIn("W26b", str(exc))
         self.assertEqual(_aliased(cache, allocator, r2t), (0, 0))
@@ -121,14 +121,14 @@ class WakeRestoreOnAKeptDeviceTree(CustomTestCase):
         cache, allocator, r2t = _metal_tree()
         cache.reset()
         upd, calls = _updater(cache, allocator, r2t)
-        self.assertTrue(WU._weg2_wake_restore_pools(upd))
+        self.assertTrue(WU._pdflip_wake_restore_pools(upd))
         self.assertEqual(calls, [])  # no fallback flush on the #1455 path
         self.assertEqual(_aliased(cache, allocator, r2t), (0, 0))
 
 
 class SleepFlushLeavesNoDeviceTree(CustomTestCase):
     def _guard(self):
-        from sglang.srt.managers.weg2_sleep_drain import sleep_flush_until_reset
+        from flliper.srt.managers.pdflip_sleep_drain import sleep_flush_until_reset
 
         return sleep_flush_until_reset
 
@@ -171,20 +171,20 @@ class SleepFlushLeavesNoDeviceTree(CustomTestCase):
         self.assertEqual(flushes, [1])  # only the sleep leg's own flush
         self.assertEqual(drains, [1])  # the collective drain every rank posts
         self.assertEqual([v for v, _ in votes], [[0], [0]])
-        self.assertTrue(all(lbl == "weg2_sleep_flush/held" for _, lbl in votes))
+        self.assertTrue(all(lbl == "pdflip_sleep_flush/held" for _, lbl in votes))
 
     def test_a_tree_that_stays_held_refuses_by_name_before_the_pause(self):
         guard = self._guard()
-        from sglang.srt.managers.weg2_sleep_drain import (
-            Weg2SleepDrainRefused,
-            Weg2SleepFlushRefused,
+        from flliper.srt.managers.pdflip_sleep_drain import (
+            PdFlipSleepDrainRefused,
+            PdFlipSleepFlushRefused,
         )
 
         cache, allocator, r2t = _metal_tree()
         drains = []
-        with self.assertRaises(Weg2SleepFlushRefused) as ctx:
+        with self.assertRaises(PdFlipSleepFlushRefused) as ctx:
             guard(flush=lambda: False, tree=cache, drain=lambda: drains.append(1), attempts=2)
-        self.assertIsInstance(ctx.exception, Weg2SleepDrainRefused)  # the W120 family
+        self.assertIsInstance(ctx.exception, PdFlipSleepDrainRefused)  # the W120 family
         self.assertIn("W120b", str(ctx.exception))
         self.assertIn("full=%d" % SPAN, str(ctx.exception))
         self.assertEqual(len(drains), 2)
@@ -192,8 +192,8 @@ class SleepFlushLeavesNoDeviceTree(CustomTestCase):
     def test_the_release_leg_uses_the_guard_not_a_bare_flush(self):
         src = inspect.getsource(WU.release_memory_occupation)
         self.assertNotIn("self.flush_cache(zero_kv=False)", src)
-        self.assertIn("self._weg2_sleep_flush()", src)
-        i_flush = src.index("self._weg2_sleep_flush()")
+        self.assertIn("self._pdflip_sleep_flush()", src)
+        i_flush = src.index("self._pdflip_sleep_flush()")
         i_pause = src.index("self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)")
         self.assertLess(i_flush, i_pause)
 

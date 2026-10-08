@@ -1,5 +1,5 @@
 """
-Unit tests for SGLang platform abstraction layer.
+Unit tests for fLLiper platform abstraction layer.
 
 Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
@@ -9,18 +9,18 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.platforms import _load_platform_class, _resolve_platform
-from sglang.srt.platforms.cpu import CpuSRTPlatform
-from sglang.srt.platforms.cuda import CudaSRTPlatform
-from sglang.srt.platforms.device_mixin import (
+from flliper.srt.platforms import _load_platform_class, _resolve_platform
+from flliper.srt.platforms.cpu import CpuSRTPlatform
+from flliper.srt.platforms.cuda import CudaSRTPlatform
+from flliper.srt.platforms.device_mixin import (
     CpuArchEnum,
     DeviceCapability,
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.platforms.interface import SRTPlatform
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -213,8 +213,8 @@ class TestCudaDeviceMixin(CustomTestCase):
 
     @patch("torch.cuda.manual_seed_all")
     @patch("torch.manual_seed")
-    @patch("sglang.srt.platforms.device_mixin.np.random.seed")
-    @patch("sglang.srt.platforms.device_mixin.random.seed")
+    @patch("flliper.srt.platforms.device_mixin.np.random.seed")
+    @patch("flliper.srt.platforms.device_mixin.random.seed")
     def test_default_seed_everything_seeds_cuda(
         self, mock_random_seed, mock_np_seed, mock_torch_seed, mock_cuda_seed
     ):
@@ -240,7 +240,7 @@ class TestCpuDeviceMixin(CustomTestCase):
         self.assertEqual(base.get_device(0), torch.device("cpu"))
         self.assertEqual(base.get_device(7), torch.device("cpu"))
 
-    @patch("sglang.srt.platforms.cpu.psutil.virtual_memory")
+    @patch("flliper.srt.platforms.cpu.psutil.virtual_memory")
     def test_default_get_current_memory_usage_is_system_used(self, mock_vm):
         mock_vm.return_value.total = 1000
         mock_vm.return_value.available = 300
@@ -248,7 +248,7 @@ class TestCpuDeviceMixin(CustomTestCase):
         # system-used == total - available (not per-process RSS)
         self.assertEqual(base.get_current_memory_usage(), 700.0)
 
-    @patch("sglang.srt.platforms.cpu.psutil.virtual_memory")
+    @patch("flliper.srt.platforms.cpu.psutil.virtual_memory")
     def test_memory_free_contract_yields_available(self, mock_vm):
         # The [Active] contract free = total - used must yield psutil.available.
         mock_vm.return_value.total = 1000
@@ -301,61 +301,61 @@ class TestCpuDeviceMixin(CustomTestCase):
 
 
 class TestResolvePlatformWithEnv(CustomTestCase):
-    """Tests for _resolve_platform when SGLANG_PLATFORM is set."""
+    """Tests for _resolve_platform when FLLIPER_PLATFORM is set."""
 
-    @patch("sglang.srt.platforms.entry_points")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.entry_points")
+    @patch("flliper.srt.platforms.envs")
     def test_selected_plugin_activates(self, mock_envs, mock_ep):
-        """When SGLANG_PLATFORM matches an entry point, it activates that plugin."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = "my_hardware"
+        """When FLLIPER_PLATFORM matches an entry point, it activates that plugin."""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = "my_hardware"
         plugin_fn = MagicMock(return_value="pkg.Mod:MyPlatform")
         mock_ep.return_value = [_make_platform_ep("my_hardware", plugin_fn)]
-        with patch("sglang.srt.platforms._load_platform_class") as mock_load:
+        with patch("flliper.srt.platforms._load_platform_class") as mock_load:
             mock_instance = MagicMock()
             mock_load.return_value = MagicMock(return_value=mock_instance)
             result = _resolve_platform()
             mock_load.assert_called_once_with("pkg.Mod:MyPlatform")
             self.assertEqual(result, mock_instance)
 
-    @patch("sglang.srt.platforms.entry_points")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.entry_points")
+    @patch("flliper.srt.platforms.envs")
     def test_selected_plugin_not_found(self, mock_envs, mock_ep):
-        """When SGLANG_PLATFORM names a nonexistent plugin, raise RuntimeError."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = "nonexistent"
+        """When FLLIPER_PLATFORM names a nonexistent plugin, raise RuntimeError."""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = "nonexistent"
         mock_ep.return_value = []
         with self.assertRaises(RuntimeError):
             _resolve_platform()
 
-    @patch("sglang.srt.platforms.entry_points")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.entry_points")
+    @patch("flliper.srt.platforms.envs")
     def test_selected_plugin_hardware_unavailable(self, mock_envs, mock_ep):
         """When activate() returns None, hardware is not available."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = "my_hardware"
+        mock_envs.FLLIPER_PLATFORM.get.return_value = "my_hardware"
         plugin_fn = MagicMock(return_value=None)
         mock_ep.return_value = [_make_platform_ep("my_hardware", plugin_fn)]
         with self.assertRaises(RuntimeError):
             _resolve_platform()
 
-    @patch("sglang.srt.platforms.entry_points")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.entry_points")
+    @patch("flliper.srt.platforms.envs")
     def test_selected_plugin_load_exception(self, mock_envs, mock_ep):
         """When ep.load() or activate() throws, exception is re-raised."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = "my_hardware"
+        mock_envs.FLLIPER_PLATFORM.get.return_value = "my_hardware"
         plugin_fn = MagicMock(side_effect=ImportError("missing dep"))
         mock_ep.return_value = [_make_platform_ep("my_hardware", plugin_fn)]
         with self.assertRaises(ImportError):
             _resolve_platform()
 
-    @patch("sglang.srt.platforms.entry_points")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.entry_points")
+    @patch("flliper.srt.platforms.envs")
     def test_other_plugins_not_loaded(self, mock_envs, mock_ep):
-        """When SGLANG_PLATFORM is set, other plugins are not imported."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = "target_hw"
+        """When FLLIPER_PLATFORM is set, other plugins are not imported."""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = "target_hw"
         target_fn = MagicMock(return_value="pkg.Mod:TargetPlatform")
         other_ep = _make_platform_ep("other_hw")  # default load returns MagicMock
         target_ep = _make_platform_ep("target_hw", target_fn)
         mock_ep.return_value = [other_ep, target_ep]
-        with patch("sglang.srt.platforms._load_platform_class") as mock_load:
+        with patch("flliper.srt.platforms._load_platform_class") as mock_load:
             mock_load.return_value = MagicMock(return_value=MagicMock())
             _resolve_platform()
             # Only the target entry point should be loaded
@@ -364,67 +364,67 @@ class TestResolvePlatformWithEnv(CustomTestCase):
 
 
 class TestResolvePlatformAutoDiscover(CustomTestCase):
-    """Tests for _resolve_platform auto-discovery when SGLANG_PLATFORM is not set."""
+    """Tests for _resolve_platform auto-discovery when FLLIPER_PLATFORM is not set."""
 
-    @patch("sglang.srt.platforms.torch")
+    @patch("flliper.srt.platforms.torch")
     def test_is_cuda_available_excludes_rocm(self, mock_torch):
         """ROCm exposes torch.cuda, but should not use the CUDA platform identity."""
         mock_torch.cuda.is_available.return_value = True
         mock_torch.version.hip = "6.0"
 
-        import sglang.srt.platforms as plat_mod
+        import flliper.srt.platforms as plat_mod
 
         self.assertFalse(plat_mod._is_cuda_available())
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms.envs")
     def test_single_plugin_activates(self, mock_envs, mock_load):
         """When exactly one plugin activates, return its platform instance."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         plugin_fn = MagicMock(return_value="pkg.Mod:MyPlatform")
         mock_load.return_value = {"my_hw": (plugin_fn, "my-hw-dist")}
-        with patch("sglang.srt.platforms._load_platform_class") as mock_resolve:
+        with patch("flliper.srt.platforms._load_platform_class") as mock_resolve:
             mock_instance = MagicMock()
             mock_resolve.return_value = MagicMock(return_value=mock_instance)
             result = _resolve_platform()
             mock_resolve.assert_called_once_with("pkg.Mod:MyPlatform")
             self.assertEqual(result, mock_instance)
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms._is_cuda_available")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms._is_cuda_available")
+    @patch("flliper.srt.platforms.envs")
     def test_no_plugin_activates_cuda_fallback(
         self, mock_envs, mock_is_cuda_available, mock_load
     ):
         """When CUDA is available and no plugin activates, return CUDA defaults."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         mock_is_cuda_available.return_value = True
         mock_load.return_value = {}
         result = _resolve_platform()
         self.assertIsInstance(result, CudaSRTPlatform)
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms._is_cuda_available")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms._is_cuda_available")
+    @patch("flliper.srt.platforms.envs")
     def test_no_plugin_no_cuda_activates_base_fallback(
         self, mock_envs, mock_is_cuda_available, mock_load
     ):
         """When no plugin or CUDA is available, return the abstract base platform."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         mock_is_cuda_available.return_value = False
         mock_load.return_value = {}
         result = _resolve_platform()
         self.assertIsInstance(result, SRTPlatform)
         self.assertNotIsInstance(result, CudaSRTPlatform)
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms.torch")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms.torch")
+    @patch("flliper.srt.platforms.envs")
     def test_no_plugin_rocm_does_not_activate_cuda_fallback(
         self, mock_envs, mock_torch, mock_load
     ):
         """ROCm exposes torch.cuda but must not use the CUDA fallback platform."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         mock_torch.cuda.is_available.return_value = True
         mock_torch.version.hip = "6.0"
         mock_load.return_value = {}
@@ -434,92 +434,92 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         self.assertIsInstance(result, SRTPlatform)
         self.assertNotIsInstance(result, CudaSRTPlatform)
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms._is_cuda_available")
-    @patch("sglang.srt.platforms._is_cpu_available")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms._is_cuda_available")
+    @patch("flliper.srt.platforms._is_cpu_available")
+    @patch("flliper.srt.platforms.envs")
     def test_no_plugin_cpu_engine_enabled_activates_cpu_fallback(
         self, mock_envs, mock_is_cpu, mock_is_cuda, mock_load
     ):
-        """SGLANG_USE_CPU_ENGINE=1 + no plugins → CpuSRTPlatform."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        """FLLIPER_USE_CPU_ENGINE=1 + no plugins → CpuSRTPlatform."""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         mock_is_cpu.return_value = True
         mock_is_cuda.return_value = False
         mock_load.return_value = {}
         result = _resolve_platform()
         self.assertIsInstance(result, CpuSRTPlatform)
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms._is_cuda_available")
-    @patch("sglang.srt.platforms._is_cpu_available")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms._is_cuda_available")
+    @patch("flliper.srt.platforms._is_cpu_available")
+    @patch("flliper.srt.platforms.envs")
     def test_cpu_engine_wins_over_cuda(
         self, mock_envs, mock_is_cpu, mock_is_cuda, mock_load
     ):
         """When both CPU engine and CUDA are available, explicit opt-in wins."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         mock_is_cpu.return_value = True
         mock_is_cuda.return_value = True
         mock_load.return_value = {}
         result = _resolve_platform()
         self.assertIsInstance(result, CpuSRTPlatform)
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms._is_cuda_available")
-    @patch("sglang.srt.platforms._is_cpu_available")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms._is_cuda_available")
+    @patch("flliper.srt.platforms._is_cpu_available")
+    @patch("flliper.srt.platforms.envs")
     def test_no_plugin_cpu_engine_disabled_prefers_cuda(
         self, mock_envs, mock_is_cpu, mock_is_cuda, mock_load
     ):
         """Regression: CPU opt-out leaves the existing CUDA fallback path intact."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         mock_is_cpu.return_value = False
         mock_is_cuda.return_value = True
         mock_load.return_value = {}
         result = _resolve_platform()
         self.assertIsInstance(result, CudaSRTPlatform)
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms.envs")
     def test_multiple_plugins_activate_raises(self, mock_envs, mock_load):
         """When multiple plugins activate, raise RuntimeError."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         fn1 = MagicMock(return_value="pkg1.Mod:Platform1")
         fn2 = MagicMock(return_value="pkg2.Mod:Platform2")
         mock_load.return_value = {"hw1": (fn1, "hw1-dist"), "hw2": (fn2, "hw2-dist")}
         with self.assertRaises(RuntimeError):
             _resolve_platform()
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms.envs")
     def test_plugin_exception_does_not_crash(self, mock_envs, mock_load):
         """When a plugin's activate() throws, it is skipped, others continue."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         bad_fn = MagicMock(side_effect=RuntimeError("broken"))
         good_fn = MagicMock(return_value="pkg.Mod:GoodPlatform")
         mock_load.return_value = {
             "bad": (bad_fn, "bad-dist"),
             "good": (good_fn, "good-dist"),
         }
-        with patch("sglang.srt.platforms._load_platform_class") as mock_resolve:
+        with patch("flliper.srt.platforms._load_platform_class") as mock_resolve:
             mock_instance = MagicMock()
             mock_resolve.return_value = MagicMock(return_value=mock_instance)
             result = _resolve_platform()
             mock_resolve.assert_called_once_with("pkg.Mod:GoodPlatform")
             self.assertEqual(result, mock_instance)
 
-    @patch("sglang.srt.platforms.load_plugins_by_group")
-    @patch("sglang.srt.platforms.envs")
+    @patch("flliper.srt.platforms.load_plugins_by_group")
+    @patch("flliper.srt.platforms.envs")
     def test_plugin_returns_none_is_skipped(self, mock_envs, mock_load):
         """When a plugin's activate() returns None, it is skipped (hardware unavailable)."""
-        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.FLLIPER_PLATFORM.get.return_value = ""
         none_fn = MagicMock(return_value=None)
         good_fn = MagicMock(return_value="pkg.Mod:GoodPlatform")
         mock_load.return_value = {
             "unavailable": (none_fn, "unavail-dist"),
             "good": (good_fn, "good-dist"),
         }
-        with patch("sglang.srt.platforms._load_platform_class") as mock_resolve:
+        with patch("flliper.srt.platforms._load_platform_class") as mock_resolve:
             mock_instance = MagicMock()
             mock_resolve.return_value = MagicMock(return_value=mock_instance)
             result = _resolve_platform()
@@ -535,21 +535,21 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
 class TestLoadPlatformClass(CustomTestCase):
     """Tests for _load_platform_class qualname resolution."""
 
-    @patch("sglang.srt.platforms.pkgutil.resolve_name")
+    @patch("flliper.srt.platforms.pkgutil.resolve_name")
     def test_valid_subclass(self, mock_resolve):
         """Valid SRTPlatform subclass resolves successfully."""
         mock_resolve.return_value = type("MyPlatform", (SRTPlatform,), {})
         result = _load_platform_class("pkg.Mod:MyPlatform")
         self.assertTrue(issubclass(result, SRTPlatform))
 
-    @patch("sglang.srt.platforms.pkgutil.resolve_name")
+    @patch("flliper.srt.platforms.pkgutil.resolve_name")
     def test_non_subclass_raises_type_error(self, mock_resolve):
         """Non-SRTPlatform class raises TypeError."""
         mock_resolve.return_value = str
         with self.assertRaises(TypeError):
             _load_platform_class("builtins.str")
 
-    @patch("sglang.srt.platforms.pkgutil.resolve_name")
+    @patch("flliper.srt.platforms.pkgutil.resolve_name")
     def test_non_type_raises_type_error(self, mock_resolve):
         """Non-type object raises TypeError."""
         mock_resolve.return_value = "not a class"
@@ -567,34 +567,34 @@ class TestCurrentPlatformLazyInit(CustomTestCase):
 
     def setUp(self):
         """Reset module-level cache before each test."""
-        import sglang.srt.platforms as plat_mod
+        import flliper.srt.platforms as plat_mod
 
         self._saved_platform = plat_mod._current_platform
         plat_mod._current_platform = None
 
     def tearDown(self):
         """Restore original _current_platform after each test."""
-        import sglang.srt.platforms as plat_mod
+        import flliper.srt.platforms as plat_mod
 
         plat_mod._current_platform = self._saved_platform
 
-    @patch("sglang.srt.platforms._resolve_platform")
+    @patch("flliper.srt.platforms._resolve_platform")
     def test_first_access_triggers_resolve(self, mock_resolve):
         """First access to current_platform calls _resolve_platform."""
         mock_instance = MagicMock(spec=SRTPlatform)
         mock_resolve.return_value = mock_instance
-        import sglang.srt.platforms as plat_mod
+        import flliper.srt.platforms as plat_mod
 
         result = plat_mod.current_platform
         mock_resolve.assert_called_once()
         self.assertEqual(result, mock_instance)
 
-    @patch("sglang.srt.platforms._resolve_platform")
+    @patch("flliper.srt.platforms._resolve_platform")
     def test_subsequent_access_uses_cache(self, mock_resolve):
         """Subsequent accesses return cached instance without re-resolving."""
         mock_instance = MagicMock(spec=SRTPlatform)
         mock_resolve.return_value = mock_instance
-        import sglang.srt.platforms as plat_mod
+        import flliper.srt.platforms as plat_mod
 
         _ = plat_mod.current_platform
         _ = plat_mod.current_platform
@@ -602,7 +602,7 @@ class TestCurrentPlatformLazyInit(CustomTestCase):
 
     def test_other_attribute_raises_error(self):
         """Accessing non-existent module attribute raises AttributeError."""
-        import sglang.srt.platforms as plat_mod
+        import flliper.srt.platforms as plat_mod
 
         with self.assertRaises(AttributeError):
             _ = plat_mod.nonexistent_attribute

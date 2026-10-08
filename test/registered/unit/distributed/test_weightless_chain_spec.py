@@ -33,7 +33,7 @@ import pathlib
 import types
 import unittest
 
-from sglang.srt.layers.dcp.lockstep import (
+from flliper.srt.layers.dcp.lockstep import (
     AG_HEADS_TAG_PREFIX,
     LSE_MERGE_TAG,
     chain_spec_verify_rows,
@@ -42,12 +42,12 @@ from sglang.srt.layers.dcp.lockstep import (
     weightless_layer_op_tags,
     weightless_step_op_tags,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
-_SRT = pathlib.Path(__file__).resolve().parents[4] / "python" / "sglang" / "srt"
+_SRT = pathlib.Path(__file__).resolve().parents[4] / "python" / "flliper" / "srt"
 _COMM = _SRT / "layers" / "dcp" / "comm.py"
 _FLASHINFER = _SRT / "layers" / "attention" / "flashinfer_backend.py"
 _MODEL_RUNNER = _SRT / "model_executor" / "model_runner.py"
@@ -190,7 +190,7 @@ class TestPrefixGateIsForwardModeFirst(CustomTestCase):
         drift surface; pin that neither re-derives it.
         """
         src = _FLASHINFER.read_text()
-        self.assertIn("from sglang.srt.layers.dcp.lockstep import", src)
+        self.assertIn("from flliper.srt.layers.dcp.lockstep import", src)
         self.assertEqual(
             src.count("weightless_has_prefix("),
             2,  # exactly the two call sites (the import has no parenthesis)
@@ -314,7 +314,7 @@ class TestWeightlessWorkerPredicateSurvivesTheSpecWorker(CustomTestCase):
 
     @staticmethod
     def _predicate(model_worker):
-        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+        from flliper.srt.managers.scheduler_components.batch_result_processor import (
             SchedulerBatchResultProcessor,
         )
 
@@ -365,7 +365,7 @@ class TestWeightlessWorkerPredicateSurvivesTheSpecWorker(CustomTestCase):
         would flip the predicate to False again, since draft runners are
         deliberately never weightless.
         """
-        from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+        from flliper.srt.speculative.base_spec_worker import BaseSpecWorker
 
         self.assertFalse(
             hasattr(BaseSpecWorker, "model_runner"),

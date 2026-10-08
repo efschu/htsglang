@@ -27,13 +27,13 @@ Hermetic: no CUDA, no model. Fake pools with the real call under test.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.mem_cache import common as mc  # noqa: E402
-from sglang.srt.mem_cache.common import alloc_req_slots  # noqa: E402
+from flliper.srt.mem_cache import common as mc  # noqa: E402
+from flliper.srt.mem_cache.common import alloc_req_slots  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

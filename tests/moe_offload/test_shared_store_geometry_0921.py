@@ -15,11 +15,11 @@ import os
 
 import pytest
 
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import expert_store as es
 
 
 @pytest.fixture(autouse=True)
-def _saubere_env():
+def _clean_env():
     alt = os.environ.pop(es.STORE_GEOMETRY_ENV, None)
     yield
     if alt is not None:
@@ -28,23 +28,23 @@ def _saubere_env():
         os.environ.pop(es.STORE_GEOMETRY_ENV, None)
 
 
-def test_ohne_env_bleibt_alles_wie_bisher():
+def test_without_env_nothing_changes():
     assert es.shared_geometry() is None
 
 
-def test_gesetzte_geometrie_wird_gelesen():
+def test_set_geometry_is_read():
     os.environ[es.STORE_GEOMETRY_ENV] = "183,137,168|0.006,0.564,0.467"
     assert es.shared_geometry() == ([183, 137, 168], [0.006, 0.564, 0.467])
 
 
-def test_beide_gruppen_rechnen_dieselbe_slotzahl():
+def test_both_groups_compute_same_slot_count():
     """Der Zweck der Sache: EINE Zahl, egal wer fragt."""
     os.environ[es.STORE_GEOMETRY_ENV] = "183,137,168|0.006,0.564,0.467"
     rat, fr = es.shared_geometry()
     slots = es.slot_base_for_rank(rat, fr, len(rat))
     # Was P aus SEINEN Vektoren rechnen wuerde -- die Zahl, die kollidiert.
-    p_allein = es.slot_base_for_rank([512], [0.30], 1)
-    assert slots != p_allein, "Test waere sinnlos, wenn beide ohnehin gleich waeren"
+    p_alone = es.slot_base_for_rank([512], [0.30], 1)
+    assert slots != p_alone, "Test waere sinnlos, wenn beide ohnehin gleich waeren"
     assert slots == es.slot_base_for_rank(rat, fr, len(rat))
 
 
@@ -59,7 +59,7 @@ def test_beide_gruppen_rechnen_dieselbe_slotzahl():
         "abc|0.1",                # unlesbar
     ],
 )
-def test_krumme_angaben_geben_none_statt_halber_geometrie(roh):
+def test_bad_input_gives_none_not_half_geometry(roh):
     """Eine falsche gemeinsame Zuordnung waere schlimmer als gar keine:
     sie sieht aus wie Ersparnis und ist Datenverlust."""
     os.environ[es.STORE_GEOMETRY_ENV] = roh

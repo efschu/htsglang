@@ -21,9 +21,9 @@ import unittest
 
 import test_nf_form_a_prefetch_span_h99 as h99
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-RID = "weg2-hb-24"
+RID = "pdflip-hb-24"
 BASE = 4096
 NEED = 24
 

@@ -45,7 +45,7 @@ import unittest.mock
 
 import torch
 
-from sglang.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import kv_backing_relief as kbr
 
 MIB = 1024 * 1024
 
@@ -270,7 +270,7 @@ class WatermarkTest(unittest.TestCase):
 
 class HonestAccountingTest(unittest.TestCase):
     def test_reports_the_measured_driver_delta_not_the_pools_claim(self):
-        # With SGLANG_FLIP_SEAM_RETAIN_HANDLES the arena UNMAPS without
+        # With FLLIPER_FLIP_SEAM_RETAIN_HANDLES the arena UNMAPS without
         # releasing, so the pool's returned byte count is address space and
         # NVML never moves. The ledger law says price from what the driver
         # gave back, so the provider measures instead of believing.
@@ -417,7 +417,7 @@ class ReleaseGranularityTest(unittest.TestCase):
         self.assertGreater(pool.calls[0], 400000)
 
 
-class WithheldCapacityIsANamedPostenTest(unittest.TestCase):
+class WithheldCapacityIsANamedItemTest(unittest.TestCase):
     """The second metal kill: the cap read as a pool leak.
 
     The scheduler's idle invariant is ``available + evictable + protected +
@@ -449,7 +449,7 @@ class WithheldCapacityIsANamedPostenTest(unittest.TestCase):
         self.assertEqual(a.residency_withheld_slots, 600 * 16)
 
     def test_the_invariant_accepts_withheld_capacity(self):
-        from sglang.srt.managers.scheduler_components.invariant_checker import (
+        from flliper.srt.managers.scheduler_components.invariant_checker import (
             SchedulerInvariantChecker,
         )
 
@@ -461,7 +461,7 @@ class WithheldCapacityIsANamedPostenTest(unittest.TestCase):
     def test_the_invariant_still_catches_a_real_leak(self):
         # The term must not become a licence: an unexplained shortfall with no
         # cap engaged is still a leak.
-        from sglang.srt.managers.scheduler_components.invariant_checker import (
+        from flliper.srt.managers.scheduler_components.invariant_checker import (
             SchedulerInvariantChecker,
         )
 
@@ -493,7 +493,7 @@ class ChunklessArenaIsDisqualifiedTest(unittest.TestCase):
         # ENABLED explicitly: the rung is opt-in until its shrink target is a
         # collective minimum, and without this the assertion would pass on the
         # opt-in gate rather than on the chunk check it names.
-        with unittest.mock.patch.dict(os.environ, {"SGLANG_KV_BACKING_RELIEF": "1"}):
+        with unittest.mock.patch.dict(os.environ, {"FLLIPER_KV_BACKING_RELIEF": "1"}):
             self.assertIsNone(
                 kbr.kv_backing_provider(self._Sched(False), device_index=0)
             )
@@ -509,7 +509,7 @@ class ChunklessArenaIsDisqualifiedTest(unittest.TestCase):
         # unrelated and equally correct reason. The gate announces itself in
         # the log when it declines, so its silence is the evidence.
         with unittest.mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_KV_BACKING_RELIEF", None)
+            os.environ.pop("FLLIPER_KV_BACKING_RELIEF", None)
             with self.assertLogs(kbr.logger, level="DEBUG") as caught:
                 kbr.logger.debug("marker")
                 kbr.kv_backing_provider(self._Sched(True), device_index=0)
@@ -520,7 +520,7 @@ class ChunklessArenaIsDisqualifiedTest(unittest.TestCase):
 
     def test_the_escape_hatch_still_turns_it_off(self):
         with unittest.mock.patch.dict(
-            os.environ, {"SGLANG_KV_BACKING_RELIEF": "0"}, clear=False
+            os.environ, {"FLLIPER_KV_BACKING_RELIEF": "0"}, clear=False
         ):
             with self.assertLogs(kbr.logger, level="WARNING") as caught:
                 self.assertIsNone(
@@ -549,7 +549,7 @@ class FlushMustNotTouchUnbackedRowsTest(unittest.TestCase):
             self.safe_zero_rows = limit
 
     def test_only_the_backed_rows_are_zeroed(self):
-        from sglang.srt.mem_cache.memory_pool import zero_kv_data_buffers
+        from flliper.srt.mem_cache.memory_pool import zero_kv_data_buffers
 
         pool = self._Pool(1000, 400)
         zero_kv_data_buffers(pool)
@@ -559,7 +559,7 @@ class FlushMustNotTouchUnbackedRowsTest(unittest.TestCase):
         self.assertEqual(float(pool.k_buffer[0][400:].sum()), 2400.0)
 
     def test_a_fully_backed_pool_is_still_zeroed_whole(self):
-        from sglang.srt.mem_cache.memory_pool import zero_kv_data_buffers
+        from flliper.srt.mem_cache.memory_pool import zero_kv_data_buffers
 
         pool = self._Pool(1000, None)
         zero_kv_data_buffers(pool)

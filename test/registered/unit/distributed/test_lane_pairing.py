@@ -32,7 +32,7 @@ import json
 import random
 import unittest
 
-from sglang.srt.model_executor.lane_pairing import (
+from flliper.srt.model_executor.lane_pairing import (
     DEFAULT_SAT_ROWS,
     IDLE_LABEL,
     PHASE_DECODE,

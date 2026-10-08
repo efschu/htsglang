@@ -5,9 +5,9 @@ import shutil
 import unittest
 from typing import Any, List, Optional, Tuple
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -23,17 +23,17 @@ register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 
 def _no_server_here() -> Optional[str]:
-    """Why this file cannot run where ``sglang`` is not installed, else None.
+    """Why this file cannot run where ``flliper`` is not installed, else None.
 
     It is NOT hermetic: every ``setUpClass`` launches a real server through
-    ``popen_launch_server`` (a ``sglang serve`` subprocess plus a model fetch).
-    Where the ``sglang`` console script is not on PATH it errors in setup
-    (nb14: ``FileNotFoundError: 'sglang'``, 7 setup errors, also alone) -- an
+    ``popen_launch_server`` (a ``flliper serve`` subprocess plus a model fetch).
+    Where the ``flliper`` console script is not on PATH it errors in setup
+    (nb14: ``FileNotFoundError: 'flliper'``, 7 setup errors, also alone) -- an
     environment fact, not a result about priority scheduling. On the CUDA
     runner it is registered for, the script exists and nothing changes.
     """
-    if shutil.which("sglang") is None:
-        return "needs the installed `sglang` entry point (popen_launch_server)"
+    if shutil.which("flliper") is None:
+        return "needs the installed `flliper` entry point (popen_launch_server)"
     return None
 
 

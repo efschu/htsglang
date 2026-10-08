@@ -20,7 +20,7 @@ import time
 
 import pytest
 
-from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
+from flliper.test.scripted_runtime.http_server import ScriptedHttpServer
 
 
 class DeadChild:
@@ -82,7 +82,7 @@ def test_the_raise_carries_the_childs_own_output():
 def test_a_live_but_silent_child_still_hits_the_deadline():
     """BOTH DIRECTIONS. The liveness check must not swallow the timeout: a peer
     that is alive and mute is a different failure and keeps its own message."""
-    import sglang.test.scripted_runtime.http_server as mod
+    import flliper.test.scripted_runtime.http_server as mod
 
     original = mod.LISTENER_ACCEPT_TIMEOUT_S
     mod.LISTENER_ACCEPT_TIMEOUT_S = 0.5

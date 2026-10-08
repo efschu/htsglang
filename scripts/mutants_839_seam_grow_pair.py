@@ -30,9 +30,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RELIEF = ROOT / "python/sglang/srt/managers/kv_backing_relief.py"
-RUNTIME = ROOT / "python/sglang/srt/managers/phase_flip_runtime.py"
-SPILL = ROOT / "python/sglang/srt/managers/phase_flip_spill.py"
+RELIEF = ROOT / "python/flliper/srt/managers/kv_backing_relief.py"
+RUNTIME = ROOT / "python/flliper/srt/managers/phase_flip_runtime.py"
+SPILL = ROOT / "python/flliper/srt/managers/phase_flip_spill.py"
 
 SCHED_TESTS = ROOT / "test/registered/scheduler"
 MGR_TESTS = ROOT / "test/registered/unit/managers"

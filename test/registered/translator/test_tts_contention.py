@@ -30,12 +30,12 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.backends import TTS_QUEUE_WAIT_S, AudioChunk
-from sglang.srt.translator.inprocess_tts import (
+from flliper.srt.translator.backends import TTS_QUEUE_WAIT_S, AudioChunk
+from flliper.srt.translator.inprocess_tts import (
     InProcessQwen3Tts,
     InProcessTtsConfig,
 )
-from sglang.srt.translator.session import EventKind, run_conversation
+from flliper.srt.translator.session import EventKind, run_conversation
 from test_session import (  # noqa: E402  - sibling helper module
     VOICE_A_HZ,
     conversation_audio,

@@ -17,14 +17,14 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.layers.dcp import prefix_lens_check as plc  # noqa: E402
-from sglang.srt.layers.dcp.lockstep import (  # noqa: E402
+from flliper.srt.layers.dcp import prefix_lens_check as plc  # noqa: E402
+from flliper.srt.layers.dcp.lockstep import (  # noqa: E402
     PrefixLensRankDivergence,
     prefix_lens_ballot,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
+from flliper.srt.managers.scheduler import Scheduler  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(__file__)
 
@@ -122,10 +122,10 @@ def test_run_batch_decides_before_a_forward_but_not_before_a_skip(dist):
     import types
 
     plc.assert_prefix_lens_rank_uniform([0, 2048], defer=True)
-    skip = types.SimpleNamespace(weg2_skip_extend=True)
+    skip = types.SimpleNamespace(pdflip_skip_extend=True)
     assert Scheduler.run_batch(_sched_stub(), skip) == "ran"
     assert plc.has_deferred()                        # the skip's own pass does not wait
-    decode = types.SimpleNamespace(weg2_skip_extend=False)
+    decode = types.SimpleNamespace(pdflip_skip_extend=False)
     assert Scheduler.run_batch(_sched_stub(), decode) == "ran"
     assert not plc.has_deferred() and dist.events[-1] == "wait"
 
@@ -135,7 +135,7 @@ def test_the_result_decides_and_prepare_defers_only_skips():
     at = src.index("_prefix_lens_check.resolve_deferred()")
     assert src.index("process_batch_result_prefill(batch, result)") < at
     psrc = inspect.getsource(ScheduleBatch.prepare_for_extend)
-    assert "assert_prefix_lens_rank_uniform(prefix_lens, defer=self.weg2_skip_extend)" in psrc
+    assert "assert_prefix_lens_rank_uniform(prefix_lens, defer=self.pdflip_skip_extend)" in psrc
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""#894 S5 -- ``SGLANG_GGUF_MMQ_DECODE_THRESHOLD`` beats the CLI flag, silently.
+"""#894 S5 -- ``FLLIPER_GGUF_MMQ_DECODE_THRESHOLD`` beats the CLI flag, silently.
 
 THE DEFECT, at base commit 2b13ba92d1 (= pin 0cd27d957d + #889)
 ---------------------------------------------------------------
@@ -10,7 +10,7 @@ PRESENCE, not on value::
         _mmq_threshold_cached = env == "1"
         return _mmq_threshold_cached
 
-So a stale ``SGLANG_GGUF_MMQ_DECODE_THRESHOLD=0`` left in a shell or an env
+So a stale ``FLLIPER_GGUF_MMQ_DECODE_THRESHOLD=0`` left in a shell or an env
 capture from an old A/B run beats ``--gguf-mmq-decode-threshold`` without ever
 consulting it, and never says a word: the ONLY log on the whole path
 (``gguf.py:682-694``, "MMQ decode threshold ACTIVE") fires when a reroute
@@ -43,7 +43,7 @@ A SECOND SILENCE IN THE SAME THREE LINES
 ``"01"`` -- is read as OFF without complaint. Same class, same fix: say so.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -51,11 +51,11 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.layers.quantization import gguf as G
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization import gguf as G
+from flliper.test.test_utils import CustomTestCase
 
-ENV = "SGLANG_GGUF_MMQ_DECODE_THRESHOLD"
-LOGGER = "sglang.srt.layers.quantization.gguf"
+ENV = "FLLIPER_GGUF_MMQ_DECODE_THRESHOLD"
+LOGGER = "flliper.srt.layers.quantization.gguf"
 
 
 class _Base(CustomTestCase):
@@ -75,13 +75,13 @@ class _Base(CustomTestCase):
             args = types.SimpleNamespace(gguf_mmq_decode_threshold=flag)
             patches.append(
                 mock.patch(
-                    "sglang.srt.runtime_context.get_server_args", return_value=args
+                    "flliper.srt.runtime_context.get_server_args", return_value=args
                 )
             )
         else:
             patches.append(
                 mock.patch(
-                    "sglang.srt.runtime_context.get_server_args",
+                    "flliper.srt.runtime_context.get_server_args",
                     side_effect=RuntimeError("ServerArgs not published yet"),
                 )
             )

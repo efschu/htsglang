@@ -46,14 +46,14 @@ import types
 import pytest
 import torch
 
-from sglang.srt.layers.dcp.layout import (
+from flliper.srt.layers.dcp.layout import (
     dcp_fresh_host_lens,
     dcp_host_lens,
     get_dcp_lens,
 )
-from sglang.srt.layers.dcp.owner import dcp_verify_paged_lens
+from flliper.srt.layers.dcp.owner import dcp_verify_paged_lens
 
-_TRITON = "sglang.srt.layers.attention.triton_backend"
+_TRITON = "flliper.srt.layers.attention.triton_backend"
 
 # The rig's weighted split for rank 0 (the 5090): 30/64 of the tokens.
 _CP_S, _CP_LO, _CP_HI, _CP_RATIO = 64, 0, 30, 30
@@ -89,7 +89,7 @@ def _forward_mode(mode: str):
 
 def _graph_backend(weighted: bool = True, bs: int = 1):
     """A TritonAttnBackend stand-in carrying only what the fills touch."""
-    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
     fake = types.SimpleNamespace(
         uneven_dcp_weighted=weighted,
@@ -171,7 +171,7 @@ def test_the_unguarded_helper_is_what_accepts_the_stale_slice():
 
 
 def _run_entry(*, seq_lens_cpu, seq_lens_sum, in_capture, captured, bs=1):
-    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
     fake = _graph_backend()
 
@@ -377,7 +377,7 @@ def test_no_replay_prep_index_build_is_left_unwired():
     import inspect
     import re
 
-    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
     unwired = []
     for name in ("_update_decode_kv_buffers", "_update_target_verify_buffers"):
@@ -454,7 +454,7 @@ def _capture_begin_forward(updater):
 
 
 def test_cross_attention_updater_forwards_the_mirrors():
-    from sglang.srt.layers.attention.flashinfer_backend import (
+    from flliper.srt.layers.attention.flashinfer_backend import (
         FlashInferIndicesUpdaterPrefill,
     )
 
@@ -485,7 +485,7 @@ def test_cross_attention_updater_forwards_the_mirrors():
 
 
 def test_sliding_window_updater_forwards_the_mirrors():
-    from sglang.srt.layers.attention.flashinfer_backend import (
+    from flliper.srt.layers.attention.flashinfer_backend import (
         FlashInferIndicesUpdaterPrefill,
     )
 
@@ -526,7 +526,7 @@ def test_sliding_window_updater_claims_no_mirror_it_cannot_justify():
     """prefix_lens=None is re-derived on the device from seq_lens (and maybe a
     device-only num_accept_tokens), so the incoming prefix mirror no longer
     describes it and must be dropped rather than paired with it."""
-    from sglang.srt.layers.attention.flashinfer_backend import (
+    from flliper.srt.layers.attention.flashinfer_backend import (
         FlashInferIndicesUpdaterPrefill,
     )
 
@@ -556,7 +556,7 @@ def test_no_prefill_updater_arm_is_left_off_the_mirror_channel():
     new unbounded D2H in the collective window."""
     import inspect
 
-    from sglang.srt.layers.attention.flashinfer_backend import (
+    from flliper.srt.layers.attention.flashinfer_backend import (
         FlashInferIndicesUpdaterPrefill,
     )
 
@@ -587,7 +587,7 @@ def test_the_prefill_arms_do_not_size_from_a_stale_slice():
     but the mirror used for SIZING must be dropped -- sizing an index buffer
     from a stale vector is a silent mis-size.
     """
-    from sglang.srt.layers.attention.flashinfer_backend import (
+    from flliper.srt.layers.attention.flashinfer_backend import (
         FlashInferIndicesUpdaterPrefill,
     )
 

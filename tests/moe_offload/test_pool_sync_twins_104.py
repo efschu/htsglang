@@ -1,6 +1,6 @@
 """Blocker #104 (fnFL2x44-x50, 23.09.): D's first graph verify after a
 request's extend died on TP0 with an illegal memory access; an eager verify
-round in between healed it (SGLANG_SPEC_EAGER_VERIFY=first), and Form A
+round in between healed it (FLLIPER_SPEC_EAGER_VERIFY=first), and Form A
 without the flip (fnFA22/23) never died.
 
 Mechanism, black-box: the extend is an eager forward under the device-planned
@@ -30,9 +30,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe import expert_pool_device as ep
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_pool_device as ep
+from flliper.srt.layers.moe.topk import StandardTopKOutput
 
 # residents 0,1 in rows 0,1; scratch C=5 = LRU rows 2..5 + staging row 6
 E, R, C, S, W = 10, 2, 5, 1, 4
@@ -42,9 +42,9 @@ CombineOutput = namedtuple("CombineOutput", "hidden_states")
 
 
 def _pool_cache(monkeypatch, keep):
-    monkeypatch.setenv("SGLANG_MOE_SCRATCH_SLOTS", str(C))
-    monkeypatch.setenv("SGLANG_OPT_MOE_POOL_KEEP_LRU", "1" if keep else "0")
-    monkeypatch.setenv("SGLANG_MOE_OFFLOAD_WAVE_ORDER", "token")
+    monkeypatch.setenv("FLLIPER_MOE_SCRATCH_SLOTS", str(C))
+    monkeypatch.setenv("FLLIPER_OPT_MOE_POOL_KEEP_LRU", "1" if keep else "0")
+    monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_WAVE_ORDER", "token")
     cache = eo.MoEExpertOffloadCache(SimpleNamespace(num_local_experts=E, layer_id=23), R / E)
     assert (cache.resident_count, cache.scratch) == (R, C)
     spill = torch.zeros((E - R, W), dtype=torch.int32)

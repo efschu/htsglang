@@ -33,16 +33,16 @@ Two quantities that must not be conflated, and both directions are wrong:
 
 import unittest
 
-from sglang.srt.layers.dcp.phase_flip_plan import (
+from flliper.srt.layers.dcp.phase_flip_plan import (
     ordered_layer_waves,
     seam_transient_peaks,
 )
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     DEFAULT_STAGING_RESERVE_BYTES,
     PhaseFlipRuntime,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

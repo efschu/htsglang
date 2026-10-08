@@ -36,7 +36,7 @@
 #   the next lever if this boot is clean, not a rejection.
 #
 # DEVIATION from the flip script, stated per speed-mode rules:
-#   SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION is left at its default (1) here.
+#   FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION is left at its default (1) here.
 #   The flip strand forced it to 0 because a flip could delay the reply past
 #   the curl timeout.  The standing dead-man order (2026-08-30) makes
 #   /health_generate the only honest liveness probe, and the deadman requires
@@ -93,28 +93,28 @@ set -a
 set +a
 export PYTHONPATH="$TREE/python"
 
-export SGLANG_ARMING_FLOOR_SOLVED=1
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
-export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=1
+export FLLIPER_ARMING_FLOOR_SOLVED=1
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION=1
 # Residency census (#485): armed only when CENSUS_DIR_ARG is passed. The census
 # must be measured ON THE CHECKPOINT THAT WILL BE SOLVED FOR -- it splits
 # parameter bytes by family from the parameter NAMES, so a census taken on the
 # incumbent would price the GDN layers at their BF16 size and solve a cut for a
 # model that no longer exists.
 if [ -n "${CENSUS_DIR_ARG:-}" ]; then
-  export SGLANG_RESIDENCY_CENSUS=1
+  export FLLIPER_RESIDENCY_CENSUS=1
   # The cut gate funds the WORST load state each rank served, so the transient
   # table must exist AND the census boot must serve REAL traffic -- an idle
   # boot measures an idle transient and the solver refuses it by name.
-  export SGLANG_TRANSIENT_CENSUS=1
-  export SGLANG_RESIDENCY_CENSUS_DIR="$CENSUS_DIR_ARG"
+  export FLLIPER_TRANSIENT_CENSUS=1
+  export FLLIPER_RESIDENCY_CENSUS_DIR="$CENSUS_DIR_ARG"
   mkdir -p "$CENSUS_DIR_ARG"
 fi
 # FRESH HiCache store: the model changed, and a store keyed on the previous
 # checkpoint's geometry would be a two-geometry key (HiCache-Phasen-Uniform).
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/tmp/hicache_855_${TAG}
+export FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR=/tmp/hicache_855_${TAG}
 mkdir -p "/tmp/hicache_855_${TAG}"
 
 mkdir -p /spinning/evidence-665-f1
@@ -130,7 +130,7 @@ mkdir -p /spinning/evidence-665-f1
   echo "census_dir  : ${CENSUS_DIR_ARG:-<not armed>}"
   echo "pp_cut_flags: ${PP_CUT_FLAGS:-<default hand pins 32,18,14 / 8,4,4>}"
   echo "model       : $MODEL"
-  echo "footprint   : ${SGLANG_PHASE_FOOTPRINT_DUMP:-<not armed>}"
+  echo "footprint   : ${FLLIPER_PHASE_FOOTPRINT_DUMP:-<not armed>}"
   echo "model bytes : $(du -sbL "$MODEL" | awk '{printf "%s (%.3f GiB)", $1, $1/1073741824}')"
   echo "arm A ref   : /spinning/evidence-665-f1/boot_969nogrid_a51e5e8f28_0830_030705.log"
   echo "arm A model : /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-vocabint8-embed"
@@ -138,7 +138,7 @@ mkdir -p /spinning/evidence-665-f1
   echo "CVD         : ${CUDA_VISIBLE_DEVICES}"
   nvidia-smi --query-gpu=index,name,memory.total,memory.used,uuid --format=csv,noheader | sed 's/^/  nvml: /'
   echo "SEAM-CACHE RECORDS CONSUMED (WINDOW-PROTOCOL gate 2, named):"
-  for f in /root/.cache/sglang/kv_budget-*-seam-rank*.json; do
+  for f in /root/.cache/flliper/kv_budget-*-seam-rank*.json; do
     [ -f "$f" ] && echo "  $f  mtime=$(date -u -r "$f" +%Y-%m-%dT%H:%M:%SZ)"
   done
   echo "  NOTE: the seam reserve is read from the PREVIOUS boot's record, so"
@@ -147,7 +147,7 @@ mkdir -p /spinning/evidence-665-f1
   echo "  (-5.154 GiB) is exact; the KV-token delta carries this caveat."
 } | tee -a "$LOG"
 
-setsid choom -n 1000 -- "$VENV/bin/python" -m sglang.launch_server \
+setsid choom -n 1000 -- "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$MODEL" \
   --trust-remote-code \
   --served-model-name Qwen3.8-27B \

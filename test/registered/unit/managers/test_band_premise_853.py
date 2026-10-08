@@ -120,9 +120,9 @@ retry` still overrides it when the backlog is worth more than the wait.
 import inspect
 import unittest
 
-from sglang.srt.managers import layout_conformance as lc
-from sglang.srt.managers import phase_policy as pp
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers import layout_conformance as lc
+from flliper.srt.managers import phase_policy as pp
+from flliper.srt.managers.phase_policy import (
     PHASE_TP,
     TP_TO_PP,
     PhasePolicyConfig,
@@ -134,8 +134,8 @@ from sglang.srt.managers.phase_policy import (
     live_flip_tokens,
     observe_idle,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

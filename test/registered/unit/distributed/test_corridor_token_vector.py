@@ -10,7 +10,7 @@ process group, no model.
 import itertools
 import unittest
 
-from sglang.srt.distributed.corridor_vector import (
+from flliper.srt.distributed.corridor_vector import (
     CORRIDOR_GRAIN,
     CorridorInfeasible,
     RankCapacity,
@@ -19,9 +19,9 @@ from sglang.srt.distributed.corridor_vector import (
     solve_corridor_vector,
     solve_token_vector,
 )
-from sglang.srt.distributed.utils import partition_units
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.utils import partition_units
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 

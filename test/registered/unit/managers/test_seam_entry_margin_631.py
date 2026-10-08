@@ -74,9 +74,9 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers import phase_flip_spill
-from sglang.srt.managers.corridor_guard import GuardResult
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers import phase_flip_spill
+from flliper.srt.managers.corridor_guard import GuardResult
+from flliper.srt.managers.phase_flip_runtime import (
     SEAM_MARGIN_DELAY_TAG,
     PhaseFlipRuntime,
 )
@@ -182,9 +182,9 @@ class _Margin:
     def __init__(self, margin_mib=None, budget=None):
         self.env = {}
         if margin_mib is not None:
-            self.env["SGLANG_SEAM_ENTRY_MARGIN_MIB"] = str(margin_mib)
+            self.env["FLLIPER_SEAM_ENTRY_MARGIN_MIB"] = str(margin_mib)
         if budget is not None:
-            self.env["SGLANG_SEAM_ENTRY_DELAY_BUDGET"] = str(budget)
+            self.env["FLLIPER_SEAM_ENTRY_DELAY_BUDGET"] = str(budget)
 
     def __enter__(self):
         import os

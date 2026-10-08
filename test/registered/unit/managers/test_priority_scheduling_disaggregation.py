@@ -8,14 +8,14 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.decode import (  # noqa: E402
+from flliper.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
-from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from flliper.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
+from flliper.srt.managers.scheduler import Scheduler  # noqa: E402
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
@@ -157,7 +157,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         ]
         queue = self._new_queue(reqs)
 
-        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
+        with patch("flliper.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
             preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(
@@ -178,7 +178,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         ]
         queue = self._new_queue(reqs, low_priority_values_first=True)
 
-        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
+        with patch("flliper.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
             preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(
@@ -196,7 +196,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         healthy_high = self._new_decode_req("healthy-high", 10)
         queue = self._new_queue([failed_low, healthy_high])
 
-        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
+        with patch("flliper.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
             preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(
@@ -272,7 +272,7 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
     """
 
     def _new_manager(self):
-        from sglang.srt.disaggregation.common.conn import CommonKVManager
+        from flliper.srt.disaggregation.common.conn import CommonKVManager
 
         mgr = CommonKVManager.__new__(CommonKVManager)
         mgr._prefill_recompute_executor = None
@@ -293,7 +293,7 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         return mgr
 
     def _register_prefill_info(self, mgr, bootstrap_addr, http_port):
-        from sglang.srt.disaggregation.common.conn import PrefillServerInfo
+        from flliper.srt.disaggregation.common.conn import PrefillServerInfo
 
         mgr.prefill_info_table[bootstrap_addr] = PrefillServerInfo(
             attn_tp_size=1,
@@ -437,7 +437,7 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
 
         new_batch = MagicMock()
         with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            "flliper.srt.disaggregation.decode.ScheduleBatch.init_new",
             return_value=new_batch,
         ) as init_new:
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(

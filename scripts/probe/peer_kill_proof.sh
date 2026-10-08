@@ -12,7 +12,7 @@
 #   kill  -- boot, warm up past the JIT window, SIGKILL one TP worker,
 #            measure the wall time until a named PeerLostError reaches the
 #            log on the surviving ranks and the process group exits.
-#   ab    -- boot twice, with SGLANG_BARLINK_PEER_LIVENESS=1 and =0, and
+#   ab    -- boot twice, with FLLIPER_BARLINK_PEER_LIVENESS=1 and =0, and
 #            compare ms/verify and ms/prefill on the SUCCESS path. The fix
 #            costs nothing on a collective that completes, and this is the
 #            measurement that has to show it.
@@ -25,9 +25,9 @@
 # for rig 1 -- each one enough to make the run measure nothing:
 #   * VENV here is /spinning/shvllm/.venv, which is torch 2.14.0a0 with no
 #     nvidia/cu13 tree. The GPU venv is /spinning/htsglang-gpu/.venv.
-#   * SGLANG_BARLINK_GRAPH_ENABLE is not a variable this fork reads. The name is
-#     SGLANG_BARLINK_GRAPH_ENABLE.
-#   * SGLANG_BARLINK_BAR1_NV_SOURCE and CUDA_HOME are missing. bar1 needs the
+#   * FLLIPER_BARLINK_GRAPH_ENABLE is not a variable this fork reads. The name is
+#     FLLIPER_BARLINK_GRAPH_ENABLE.
+#   * FLLIPER_BARLINK_BAR1_NV_SOURCE and CUDA_HOME are missing. bar1 needs the
 #     patched driver headers; the JIT build fails on ninja without CUDA_HOME.
 #   * it boots locally, but bar1 runs on the PVE host -- the container has
 #     neither the driver source nor a usable NCCL for it.
@@ -103,22 +103,22 @@ boot() {
 
     export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
     export PYTHONPATH="$WT/python"
-    export SGLANG_UNEVEN_DCP=1
-    export SGLANG_UNEVEN_DCP_WEIGHTED=1
-    export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+    export FLLIPER_UNEVEN_DCP=1
+    export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+    export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
     # The collective family under test. bar1 is the transport whose spin
     # kernels the abort word reaches; the defect was seen there.
-    export SGLANG_BARLINK=1
-    export SGLANG_BARLINK_TRANSPORT=bar1
-    export SGLANG_BARLINK_GRAPH_ENABLE=1
+    export FLLIPER_BARLINK=1
+    export FLLIPER_BARLINK_TRANSPORT=bar1
+    export FLLIPER_BARLINK_GRAPH_ENABLE=1
     # Short probe interval so the proof is about the mechanism, not about
     # waiting out a 1 s default. Production default stays 1 s.
-    export SGLANG_BARLINK_PEER_PROBE_S="${SGLANG_BARLINK_PEER_PROBE_S:-0.5}"
-    export SGLANG_BARLINK_PEER_TIMEOUT_S="${SGLANG_BARLINK_PEER_TIMEOUT_S:-120}"
-    export SGLANG_BARLINK_PEER_LIVENESS="${SGLANG_BARLINK_PEER_LIVENESS:-1}"
+    export FLLIPER_BARLINK_PEER_PROBE_S="${FLLIPER_BARLINK_PEER_PROBE_S:-0.5}"
+    export FLLIPER_BARLINK_PEER_TIMEOUT_S="${FLLIPER_BARLINK_PEER_TIMEOUT_S:-120}"
+    export FLLIPER_BARLINK_PEER_LIVENESS="${FLLIPER_BARLINK_PEER_LIVENESS:-1}"
 
     cd "$WT" || exit 1
-    setsid "$VENV/bin/python" -u -m sglang.launch_server \
+    setsid "$VENV/bin/python" -u -m flliper.launch_server \
         --model-path "$MODEL" \
         --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
         --rank-auto-reserve-mib 3000,2700,2700 \
@@ -287,11 +287,11 @@ import sys
 path, tag = sys.argv[1], sys.argv[2]
 text = open(path).read()
 wanted = (
-    "sglang:e2e_request_latency_seconds_sum",
-    "sglang:time_per_output_token_seconds_sum",
-    "sglang:time_to_first_token_seconds_sum",
-    "sglang:num_generation_tokens_total",
-    "sglang:prompt_tokens_total",
+    "flliper:e2e_request_latency_seconds_sum",
+    "flliper:time_per_output_token_seconds_sum",
+    "flliper:time_to_first_token_seconds_sum",
+    "flliper:num_generation_tokens_total",
+    "flliper:prompt_tokens_total",
 )
 print(f"--- {tag}")
 for key in wanted:
@@ -305,8 +305,8 @@ EOF
 arm_ab() {
     for enabled in 1 0; do
         local tag="ab_liveness_$enabled"
-        echo "=== arm: ab, SGLANG_BARLINK_PEER_LIVENESS=$enabled"
-        SGLANG_BARLINK_PEER_LIVENESS="$enabled" boot "$tag" || return 1
+        echo "=== arm: ab, FLLIPER_BARLINK_PEER_LIVENESS=$enabled"
+        FLLIPER_BARLINK_PEER_LIVENESS="$enabled" boot "$tag" || return 1
         measure "$tag"
         teardown "$tag"
         # Let the cards settle so the second arm does not inherit the first

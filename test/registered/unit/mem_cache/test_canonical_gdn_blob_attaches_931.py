@@ -11,7 +11,7 @@ for either phase. ``HiCacheController._canonical_mamba_window`` opened with
 
 and ``mamba2_cache_params`` is a property of the CHECKPOINT config
 (``Qwen3NextConfig``, configs/qwen3_next.py:288, ``layers=self.linear_layer_ids``),
-never of sglang's ``ModelConfig`` -- ``grep -c mamba2_cache_params
+never of flliper's ``ModelConfig`` -- ``grep -c mamba2_cache_params
 configs/model_config.py`` is 0. The getattr missed on every model, the list was
 always empty, and the blob has NEVER attached on any boot.
 
@@ -63,7 +63,7 @@ measurement window exercises exactly that path.
 
 import unittest
 
-from sglang.srt.mem_cache.canonical_page_store import (
+from flliper.srt.mem_cache.canonical_page_store import (
     CanonicalPageError,
     resolve_linear_layer_ids,
 )
@@ -94,7 +94,7 @@ class _HfConfig:
 
 
 class _ModelConfig:
-    """sglang's ModelConfig: note it deliberately has NO mamba2_cache_params
+    """flliper's ModelConfig: note it deliberately has NO mamba2_cache_params
     and NO linear_layer_ids, which is exactly why the old lookup missed."""
 
     def __init__(self, text_config, *, is_hybrid=False) -> None:
@@ -155,8 +155,8 @@ class TestCanonicalGdnBlobAttaches931(unittest.TestCase):
         the test has to prove the code gets past it -- a green resolver with a
         caller still holding its own bare getattr would look identical from
         outside."""
-        from sglang.srt.managers.cache_controller import HiCacheController
-        from sglang.srt.mem_cache import canonical_page_store
+        from flliper.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.mem_cache import canonical_page_store
 
         class _Sentinel(Exception):
             pass
@@ -237,7 +237,7 @@ class TestTheSecondObjectHop931(unittest.TestCase):
     """
 
     def test_the_map_derives_from_the_pools_own_layer_ids(self):
-        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from flliper.srt.mem_cache.memory_pool import MambaPool
 
         pool = object.__new__(MambaPool)
         pool.mamba_layer_ids = (0, 1, 2, 4, 5, 6)
@@ -250,7 +250,7 @@ class TestTheSecondObjectHop931(unittest.TestCase):
 
     def test_the_wrong_object_still_refuses(self):
         """NO SILENT FALLBACK: a pool with no map is still a refusal."""
-        from sglang.srt.mem_cache.canonical_page_store import (
+        from flliper.srt.mem_cache.canonical_page_store import (
             local_mamba_layer_range,
         )
 
@@ -262,7 +262,7 @@ class TestTheSecondObjectHop931(unittest.TestCase):
         self.assertIn("mamba_map", str(caught.exception))
 
     def test_the_right_object_yields_the_range(self):
-        from sglang.srt.mem_cache.canonical_page_store import (
+        from flliper.srt.mem_cache.canonical_page_store import (
             local_mamba_layer_range,
         )
 
@@ -274,8 +274,8 @@ class TestTheSecondObjectHop931(unittest.TestCase):
 
     def test_the_caller_passes_the_map_owner_not_the_kv_pool(self):
         """THE HOP ITSELF. Records which object the callee is handed."""
-        from sglang.srt.managers.cache_controller import HiCacheController
-        from sglang.srt.mem_cache import canonical_page_store
+        from flliper.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.mem_cache import canonical_page_store
 
         seen = {}
 

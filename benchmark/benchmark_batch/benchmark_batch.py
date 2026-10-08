@@ -9,7 +9,7 @@ import requests
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from flliper.lang.backend.runtime_endpoint import RuntimeEndpoint
 
 ###############################################################################
 # CONFIG

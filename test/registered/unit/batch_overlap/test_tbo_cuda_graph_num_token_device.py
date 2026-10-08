@@ -23,13 +23,13 @@ from unittest.mock import patch
 
 import torch
 
-import sglang.srt.batch_overlap.two_batch_overlap as tbo
-from sglang.srt.batch_overlap.two_batch_overlap import (
+import flliper.srt.batch_overlap.two_batch_overlap as tbo
+from flliper.srt.batch_overlap.two_batch_overlap import (
     TboCudaGraphRunnerPlugin,
     TboForwardBatchPreparer,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

@@ -18,18 +18,18 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import window_for_layers
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import window_for_layers
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.qsa_pool_host import QSAPagedHostPool, build_qsa_index_window
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.qsa_pool_host import QSAPagedHostPool, build_qsa_index_window
+from flliper.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=4, suite="stage-a-weg2-unit")
+register_cpu_ci(est_time=4, suite="stage-a-pdflip-unit")
 
 # the deployment's shape: 12 full-attention layers, PP cut 7/3/2, page 64,
 # compress ratio 4, one index head of 128 bf16 -> 256 B per group, 4096 B per
@@ -143,7 +143,7 @@ class QsaIndexSidecarBytes(unittest.TestCase):
         """D2H then H2D with the pool's own ``direct`` transport: the bytes of
         every layer land on the row of their KV page, and back on the device
         rows they came from -- including rows loaded out of order."""
-        from sglang.srt.mem_cache.qsa_pool_host import QSAPagedHostPool as _P
+        from flliper.srt.mem_cache.qsa_pool_host import QSAPagedHostPool as _P
 
         dev = _device_pool(ATTN_IDS, device="cuda")
         host = _P([dev], num_host_tokens=(N_PAGES + 1) * PAGE, page_size=PAGE,

@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from sglang.srt.managers.kv_session_offload import (
+from flliper.srt.managers.kv_session_offload import (
     BUDGET_ADMISSION_ORDER,
     GDN_STATE_MIN_ITEMSIZE,
     KVSessionOffloadManager,
@@ -66,7 +66,7 @@ def test_default_config_is_open():
     )
 
 
-def test_each_regler_arms_individually():
+def test_each_controller_arms_individually():
     for name in (
         "kv_session_offload_budget_total_tokens",
         "kv_session_offload_budget_session_tokens",
@@ -108,7 +108,7 @@ def _all_binding_cfg():
     )
 
 
-def test_admission_first_binding_regler_wins_in_fixed_order():
+def test_admission_first_binding_controller_wins_in_fixed_order():
     cfg = _all_binding_cfg()
     kw = dict(
         n_open_slots=5,
@@ -348,7 +348,7 @@ def test_gdn_state_quantization_is_rejected():
 def test_budget_layer_never_touches_allocator_or_tree_state():
     import inspect
 
-    from sglang.srt.managers import kv_session_offload as kvso
+    from flliper.srt.managers import kv_session_offload as kvso
 
     sources = [
         inspect.getsource(kvso.SpillBudgetConfig),
@@ -491,7 +491,7 @@ def test_demotion_marks_the_request_for_a_lossless_host_handover():
     write-through heuristic -- otherwise the leaves under the threshold (the
     newest tokens) are dropped silently. The mark is the whole mechanism; a
     session that is NOT demoted keeps the stock heuristic."""
-    from sglang.srt.mem_cache.base_prefix_cache import (
+    from flliper.srt.mem_cache.base_prefix_cache import (
         requests_forced_host_write_through,
     )
 
@@ -741,7 +741,7 @@ def _fake_server_args(**over):
 
 
 def _validate(ns):
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     ServerArgs._handle_kv_session_offload(ns)
 

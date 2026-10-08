@@ -33,20 +33,20 @@ import unittest
 import torch
 
 try:
-    from sglang.srt.mem_cache.canonical_page_store import sweep_partials
+    from flliper.srt.mem_cache.canonical_page_store import sweep_partials
 except ImportError:  # canonical_page_store is not in this lineage (#411 recon)
     # The pinned-partial protection is an integration with the canonical page
     # store, which the adopted #410 lineage does not carry. Skipped rather than
     # deleted so it lights up by itself the day that store is ported, instead
     # of being a gap nobody remembers to re-test.
     sweep_partials = None
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
-from sglang.srt.mem_cache.pin_ledger import (
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from flliper.srt.mem_cache.pin_ledger import (
     PinBudgetExceeded,
     PinLedger,
     stems_with_sizes,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 IDENTITY = "0123456789abcdef"
 PAGE = torch.arange(64, dtype=torch.uint8)

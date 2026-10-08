@@ -8,22 +8,22 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.managers.mm_utils import embed_mm_inputs, init_mm_embedding_cache
-from sglang.srt.managers.schedule_batch import (
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from flliper.srt.managers.mm_utils import embed_mm_inputs, init_mm_embedding_cache
+from flliper.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import download_image_with_retry
+from flliper.srt.model_executor.model_runner import ModelRunner
+from flliper.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from flliper.srt.parser.conversation import generate_chat_conv
+from flliper.srt.server_args import ServerArgs
+from flliper.test.test_utils import download_image_with_retry
 
 
-# Test the logits output between HF and SGLang
+# Test the logits output between HF and fLLiper
 class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
@@ -34,16 +34,16 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         cls.processor = ""
         cls.main_image = download_image_with_retry(cls.image_url)
 
-    def compare_outputs(self, sglang_output: torch.Tensor, hf_output: torch.Tensor):
+    def compare_outputs(self, flliper_output: torch.Tensor, hf_output: torch.Tensor):
         # Convert to float32 for numerical stability if needed
         hf = hf_output.float()
-        sg = sglang_output.float()
+        sg = flliper_output.float()
 
         # Basic shape and dtype comparison
         print("\n=== Basic Properties ===")
         print(f"Shapes match: {hf.shape == sg.shape}")
-        print(f"HF shape: {hf.shape}, SGLang shape: {sg.shape}")
-        print(f"HF dtype: {hf.dtype}, SGLang dtype: {sg.dtype}")
+        print(f"HF shape: {hf.shape}, fLLiper shape: {sg.shape}")
+        print(f"HF dtype: {hf.dtype}, fLLiper dtype: {sg.dtype}")
 
         # Move tensors to CPU for numpy operations
         hf_np = hf.cpu().numpy()
@@ -80,7 +80,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
             "Index".ljust(30)
             + "Difference".ljust(15)
             + "HF Value".ljust(15)
-            + "SGLang Value"
+            + "fLLiper Value"
         )
         print("-" * 75)
 
@@ -139,7 +139,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
 
         return inputs
 
-    def get_sglang_model(self):
+    def get_flliper_model(self):
         self.model_runner = ModelRunner(
             model_config=ModelConfig(self.model_path, model_override_args="{}"),
             mem_fraction_static=0.8,
@@ -199,8 +199,8 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
             )
             hf_output = hf_output.squeeze(0)
 
-            # sglang
-            model = self.get_sglang_model()
+            # flliper
+            model = self.get_flliper_model()
             input_ids = inputs["input_ids"].to(self.device).flatten()
 
             pixel_values = inputs["pixel_values"]
@@ -236,7 +236,7 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
             image_offsets.extend(slice_offsets)
             image_offsets = sorted(image_offsets)
 
-            sglang_output = embed_mm_inputs(
+            flliper_output = embed_mm_inputs(
                 mm_inputs_list=[
                     MultimodalInputs(
                         mm_items=[
@@ -260,7 +260,7 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
                 },
             )
 
-        self.compare_outputs(sglang_output, hf_output)
+        self.compare_outputs(flliper_output, hf_output)
 
 
 class TestMiniCPMV4Logits(VisionLLMLogitsBase):
@@ -302,9 +302,9 @@ class TestMiniCPMV4Logits(VisionLLMLogitsBase):
             }
             hf_output = self.hf_model.get_input_embeddings()(inputs.input_ids)
 
-            # sglang
+            # flliper
             model = self.get_model()
-            sglang_output = self.vlm_func(
+            flliper_output = self.vlm_func(
                 model,
                 input_ids=inputs.input_ids.to(self.device),
                 pixel_values=inputs.pixel_values,
@@ -317,4 +317,4 @@ class TestMiniCPMV4Logits(VisionLLMLogitsBase):
                 },
             )
 
-        self.compare_outputs(sglang_output, hf_output)
+        self.compare_outputs(flliper_output, hf_output)

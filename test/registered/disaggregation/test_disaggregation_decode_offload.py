@@ -3,13 +3,13 @@ import shutil
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
@@ -33,10 +33,10 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         # Set environment variable to make offloading more frequent for testing purposes
-        cls.old_stride = os.environ.get("SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE")
+        cls.old_stride = os.environ.get("FLLIPER_HICACHE_DECODE_OFFLOAD_STRIDE")
         cls.hicache_dir = "/tmp/hicache_test"
-        os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.hicache_dir
-        os.environ["SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE"] = "16"
+        os.environ["FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.hicache_dir
+        os.environ["FLLIPER_HICACHE_DECODE_OFFLOAD_STRIDE"] = "16"
 
         # Ensure a clean cache directory
         if os.path.exists(cls.hicache_dir):
@@ -61,11 +61,11 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
         # Restore the original environment variable state
         super().tearDownClass()
         if cls.old_stride is not None:
-            os.environ["SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE"] = cls.old_stride
+            os.environ["FLLIPER_HICACHE_DECODE_OFFLOAD_STRIDE"] = cls.old_stride
         else:
-            os.environ.pop("SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE", None)
+            os.environ.pop("FLLIPER_HICACHE_DECODE_OFFLOAD_STRIDE", None)
 
-        os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", None)
+        os.environ.pop("FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR", None)
 
         # Clean up the cache directory
         if os.path.exists(cls.hicache_dir):

@@ -5,7 +5,7 @@ forward() hands every non-last stage's stream on before ``mix``, but the mixer
 was built on every stage. The flip join takes the first stage that publishes a
 replicated name as its holder, so the bytes moved to PP0: the one stage that
 mixes (PP2) received nothing at a D->P wake, and PP1's dead copy had no source
-at the P->D sleep -- ``W106 Weg2XchgWakeSourceGapRefused ... tag=weights
+at the P->D sleep -- ``W106 PdFlipXchgWakeSourceGapRefused ... tag=weights
 expected_bytes=23068672`` on P rank 1, every rank stopped in the fence.
 """
 
@@ -14,8 +14,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.models import qwen4_exp as m
+from flliper.srt.layers.utils import PPMissingLayer
+from flliper.srt.models import qwen4_exp as m
 
 
 def _stage(*, last: bool):

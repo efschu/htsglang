@@ -29,7 +29,7 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -133,17 +133,17 @@ def _worker(rank, port, cases, q_out):
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=WORLD)
     try:
-        from sglang.srt import rank_role, runtime_context
-        from sglang.srt.distributed.utils import set_cp_token_ratios
-        from sglang.srt.layers.attention import qwen_sparse_attn_backend as be
-        from sglang.srt.layers.attention.qsa import form_a_dcp as fa
-        from sglang.srt.layers.dcp import comm as c
-        from sglang.srt.layers.dcp.owner import (
+        from flliper.srt import rank_role, runtime_context
+        from flliper.srt.distributed.utils import set_cp_token_ratios
+        from flliper.srt.layers.attention import qwen_sparse_attn_backend as be
+        from flliper.srt.layers.attention.qsa import form_a_dcp as fa
+        from flliper.srt.layers.dcp import comm as c
+        from flliper.srt.layers.dcp.owner import (
             dcp_compact_pool_rows,
             dcp_weighted_owner_bounds,
             dcp_weighted_write_slots,
         )
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         be._QSA_ROWS_COMPACT["on"] = False
         be.sparse_attn_rows_triton = (
@@ -283,19 +283,19 @@ def test_host_and_worker_issue_the_same_sequence(run, i):
 # ---- the worker forward's per-layer order ------------------------------------------
 
 def _plan(rank):
-    from sglang.srt import rank_role
+    from flliper.srt import rank_role
 
     rank_role.set_form_a_role_plan(rank_role.RankRolePlan(("host", "worker", "worker")), rank)
 
 
 def teardown_function(_fn):
-    from sglang.srt import rank_role
+    from flliper.srt import rank_role
 
     rank_role.set_form_a_role_plan(None, 0)
 
 
 def test_the_attention_step_sits_before_its_layers_moe_carrier():
-    from sglang.srt.form_a_worker_forward import run_form_a_worker_layers
+    from flliper.srt.form_a_worker_forward import run_form_a_worker_layers
 
     _plan(1)
     seq = []
@@ -318,7 +318,7 @@ def test_the_attention_step_sits_before_its_layers_moe_carrier():
 
 
 def test_an_attention_layer_without_a_moe_block_or_without_a_step_is_refused():
-    from sglang.srt.form_a_worker_forward import (
+    from flliper.srt.form_a_worker_forward import (
         FormAWorkerForwardError,
         FormAWorkerLayerMismatch,
         run_form_a_worker_layers,
@@ -338,8 +338,8 @@ def test_an_attention_layer_without_a_moe_block_or_without_a_step_is_refused():
 
 
 def test_form_a_attends_restates_the_host_branching():
-    from sglang.srt.layers.attention.qsa.form_a_dcp import form_a_attends
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from flliper.srt.layers.attention.qsa.form_a_dcp import form_a_attends
+    from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
     def fb(mode, seq, ext):
         return SimpleNamespace(forward_mode=mode, seq_lens_cpu=seq, extend_seq_lens_cpu=ext)
@@ -353,7 +353,7 @@ def test_form_a_attends_restates_the_host_branching():
 
 
 def test_the_host_shares_a_topk_only_at_the_workers_width():
-    from sglang.srt.layers.attention.qsa.form_a_dcp import form_a_dcp_geometry, share_topk
+    from flliper.srt.layers.attention.qsa.form_a_dcp import form_a_dcp_geometry, share_topk
 
     _plan(0)
     geo = form_a_dcp_geometry(H, KV, 3, 0, head_dim=D, topk_width=K, scaling=SCALE)
@@ -362,7 +362,7 @@ def test_the_host_shares_a_topk_only_at_the_workers_width():
 
 
 def test_the_qsa_topk_width_is_the_config_fact():
-    from sglang.srt.layers.attention.qsa.form_a_dcp import qsa_topk_width
+    from flliper.srt.layers.attention.qsa.form_a_dcp import qsa_topk_width
 
     assert qsa_topk_width(SimpleNamespace(indexer_budget=2048, indexer_compress_ratio=4)) == 2051
 
@@ -370,8 +370,8 @@ def test_the_qsa_topk_width_is_the_config_fact():
 # ---- boot gate and graph guard ---------------------------------------------------------
 
 def test_the_boot_gate_declares_a_t_q_m_on_every_rank():
-    from sglang.srt import rank_role
-    from sglang.srt.form_a_boot_gate import declare_layer_collectives
+    from flliper.srt import rank_role
+    from flliper.srt.form_a_boot_gate import declare_layer_collectives
 
     plan = rank_role.RankRolePlan(("host", "worker", "worker"))
     kw = dict(worker_skips_dense=True, host_dense_is_unsharded=True,
@@ -398,7 +398,7 @@ def test_the_boot_gate_declares_a_t_q_m_on_every_rank():
 
 
 def test_the_graph_guard_knows_the_dcp_route():
-    from sglang.srt import rank_role
+    from flliper.srt import rank_role
 
     plan = rank_role.RankRolePlan(("host", "worker", "worker"))
     rank_role.guard_graph_mode(plan, 1, "full", body=rank_role.GRAPH_BODY_MOE_ROUTE_DCP)
@@ -409,9 +409,9 @@ def test_the_graph_guard_knows_the_dcp_route():
 
 
 def test_form_a_dcp_of_reads_the_backend_by_its_type():
-    from sglang.srt.form_a_construction import FormAWorkerAttnBackend
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as be
-    from sglang.srt.layers.attention.qsa.form_a_dcp import form_a_dcp_of
+    from flliper.srt.form_a_construction import FormAWorkerAttnBackend
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as be
+    from flliper.srt.layers.attention.qsa.form_a_dcp import form_a_dcp_of
 
     qsa = object.__new__(be.QwenSparseAttnBackend)
     qsa.form_a_dcp = "geo"
@@ -424,8 +424,8 @@ def test_form_a_dcp_of_reads_the_backend_by_its_type():
 def test_the_runner_wires_the_worker_step_and_the_gate():
     import inspect
 
-    from sglang.srt.model_executor import model_runner as mr
-    from sglang.srt.model_executor.runner import decode_cuda_graph_runner as gr
+    from flliper.srt.model_executor import model_runner as mr
+    from flliper.srt.model_executor.runner import decode_cuda_graph_runner as gr
 
     # model_runner.py is frozen (large-class-style): it only delegates to
     # form_a_dcp_wiring, whose three decisions are tested below by behaviour.
@@ -445,9 +445,9 @@ def test_the_runner_wires_the_worker_step_and_the_gate():
 def test_the_wiring_chooses_the_worker_backend_by_the_cut():
     from unittest import mock
 
-    from sglang.srt import form_a_dcp_wiring as w
-    from sglang.srt.form_a_construction import FormAWorkerAttnBackend
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as be
+    from flliper.srt import form_a_dcp_wiring as w
+    from flliper.srt.form_a_construction import FormAWorkerAttnBackend
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as be
 
     def runner(cut, draft=False, qsa=True):
         return SimpleNamespace(
@@ -458,7 +458,7 @@ def test_the_wiring_chooses_the_worker_backend_by_the_cut():
 
     sentinel = object()
     with mock.patch(
-        "sglang.srt.form_a_construction.FormAWorkerAttnBackend",
+        "flliper.srt.form_a_construction.FormAWorkerAttnBackend",
         lambda r: sentinel,
     ):
         for r in (runner(None), runner([64, 0, 0], draft=True)):
@@ -470,7 +470,7 @@ def test_the_wiring_chooses_the_worker_backend_by_the_cut():
             self.form_a_dcp = geo
 
     with mock.patch(
-        "sglang.srt.layers.attention.qsa.config.is_qwen_qsa",
+        "flliper.srt.layers.attention.qsa.config.is_qwen_qsa",
         lambda hf: hf.qsa,
     ), mock.patch.object(be, "QwenSparseAttnBackend", _Qsa):
         got = w.form_a_worker_attn_backend(runner([32, 0, 32]))
@@ -488,15 +488,15 @@ def test_the_wiring_chooses_the_worker_backend_by_the_cut():
 def test_the_wiring_declares_the_merge_and_builds_the_step():
     from unittest import mock
 
-    from sglang.srt import form_a_dcp_wiring as w
-    from sglang.srt.form_a_construction import FormAWorkerAttnBackend
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as be
+    from flliper.srt import form_a_dcp_wiring as w
+    from flliper.srt.form_a_construction import FormAWorkerAttnBackend
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as be
 
     qsa = object.__new__(be.QwenSparseAttnBackend)
     qsa.form_a_dcp = "geo"
     calls = []
     qsa.form_a_worker_attention = lambda fb, lid: calls.append((fb, lid))
-    with mock.patch("sglang.srt.layers.dcp.comm.lse_merge_mode", lambda: "a2a"):
+    with mock.patch("flliper.srt.layers.dcp.comm.lse_merge_mode", lambda: "a2a"):
         assert w.form_a_dcp_merge_of(qsa) == "a2a"
         assert w.form_a_dcp_merge_of(SimpleNamespace(full_attn_backend=qsa)) == "a2a"
         assert w.form_a_dcp_merge_of(object.__new__(FormAWorkerAttnBackend)) is None

@@ -10,7 +10,7 @@ right and the half that is wrong matters.
 
 * TRUE: neither quant directory's ``tokenizer_config.json`` has a
   ``chat_template`` key, and neither has any ``added_tokens_decoder`` entries.
-  So the tokenizer sglang loads from the sidecar HF directory carries no
+  So the tokenizer flliper loads from the sidecar HF directory carries no
   template, and ``--chat-template`` really is required.
 * FALSE: the GGUF files themselves DO carry ``tokenizer.chat_template`` in
   their metadata KV block -- 13698 bytes of Unsloth-fixed DeepSeek-V4 jinja,
@@ -166,7 +166,7 @@ REQUIRED_MARKERS = ["<｜User｜>", "<｜Assistant｜>", "</think>"]
 def _render(template_src: str, messages, **kwargs) -> str:
     """Render through the EXACT environment the server will use.
 
-    ``sglang``'s chat path calls the tokenizer's ``apply_chat_template``, which
+    ``flliper``'s chat path calls the tokenizer's ``apply_chat_template``, which
     compiles the template with
     ``transformers.utils.chat_template_utils._compile_jinja_template``:
     an ``ImmutableSandboxedEnvironment`` with ``trim_blocks=True``,
@@ -282,7 +282,7 @@ def selftest(template_src: str) -> int:
     # serving_chat wrap it in a list of parts.
     try:
         sys.path.insert(0, os.path.join("/spinning/wt-dsv4f-window", "python"))
-        from sglang.srt.parser.jinja_template_utils import (  # noqa: PLC0415
+        from flliper.srt.parser.jinja_template_utils import (  # noqa: PLC0415
             detect_jinja_template_content_format,
         )
 

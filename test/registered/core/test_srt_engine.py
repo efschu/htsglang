@@ -9,12 +9,12 @@ import unittest
 
 import torch
 
-import sglang as sgl
-from sglang.benchmark.offline_throughput import BenchArgs, throughput_test
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+import flliper as sgl
+from flliper.benchmark.offline_throughput import BenchArgs, throughput_test
+from flliper.srt.server_args import ServerArgs
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,

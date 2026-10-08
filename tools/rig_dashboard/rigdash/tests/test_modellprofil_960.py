@@ -1,8 +1,8 @@
 """PROFIL-EDITOR S3 (Auftrag 960): die Route ``POST /api/modellprofil/schaetzen`` und das Modul ``static/modellprofil.js``.
 
 Gepinnt:
-  * der Schätzer (``sglang/srt/weg2/model_profile.py``, reine Standardbibliothek) wird aus dem Fixture-Planer-Baum per Dateipfad
-    geladen, nicht über ``import sglang``; die Antwort ist ``flliper.model/1`` mit Quelle an jedem Wert, ohne Geheimnis;
+  * der Schätzer (``flliper/srt/pdflip/model_profile.py``, reine Standardbibliothek) wird aus dem Fixture-Planer-Baum per Dateipfad
+    geladen, nicht über ``import flliper``; die Antwort ist ``flliper.model/1`` mit Quelle an jedem Wert, ohne Geheimnis;
   * der Pfad muss unter einer Modellwurzel liegen (relativ, ``..``, Symlink hinaus, NUL, fehlend: ValueError / HTTP 400);
   * die Antwort wird je Pfad+Dateistand gemerkt, eine geänderte Datei rechnet neu;
   * Route nur im LAN (Proxy 403), nicht im Release (404); Körper <= 64 KiB; das Modul wird ausgeliefert;
@@ -95,7 +95,7 @@ class TestEstimator(Base):
         self.assertEqual(self.est.tree, TREE)
         self.assertEqual(M.find_tree(TREE), TREE)
         self.est.module()
-        self.assertNotIn("sglang", sys.modules)                    # der Schätzer kommt per Dateipfad, ohne torch-Kette
+        self.assertNotIn("flliper", sys.modules)                    # der Schätzer kommt per Dateipfad, ohne torch-Kette
         self.assertTrue(self.est._mod.__file__.endswith(M.MODULE_REL))
 
     def test_estimate_returns_flliper_model_1_with_sources(self):

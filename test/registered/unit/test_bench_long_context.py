@@ -13,8 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -25,7 +25,7 @@ if str(HICACHE_DIR) not in sys.path:
 
 import bench_long_context  # noqa: E402
 
-from sglang.test.kits.cache_hit_kit import async_request_sglang_generate  # noqa: E402
+from flliper.test.kits.cache_hit_kit import async_request_flliper_generate  # noqa: E402
 
 
 def _build_args(dataset_path: str) -> SimpleNamespace:
@@ -83,7 +83,7 @@ class TestContextWorkloadGeneratorInit(CustomTestCase):
             _build_args(self.dataset_path)
         )
         self.assertTrue(callable(getattr(gen, "request_func", None)))
-        self.assertIs(gen.request_func, async_request_sglang_generate)
+        self.assertIs(gen.request_func, async_request_flliper_generate)
 
     def test_inherits_workload_generator_contract(self):
         """All attributes WorkloadGenerator's run-time methods touch must exist."""
@@ -110,7 +110,7 @@ class TestContextWorkloadGeneratorInit(CustomTestCase):
         for attr in ("performance_metrics", "enable_round_barrier"):
             self.assertTrue(hasattr(gen, attr), f"missing attribute: {attr}")
 
-    def test_url_targets_sglang_generate_endpoint(self):
+    def test_url_targets_flliper_generate_endpoint(self):
         gen = bench_long_context.ContextWorkloadGenerator(
             _build_args(self.dataset_path)
         )

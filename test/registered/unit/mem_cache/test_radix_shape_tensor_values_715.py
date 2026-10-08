@@ -21,7 +21,7 @@ import unittest
 
 import torch
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Node:
@@ -38,7 +38,7 @@ class _Node:
 
 class TestRadixShapeSurvivesTensorValues715(CustomTestCase):
     def _summary(self, root):
-        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+        from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
         cache = MambaRadixCache.__new__(MambaRadixCache)
         cache.root_node = root

@@ -18,7 +18,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
-from sglang.srt.entrypoints.openai.protocol import (
+from flliper.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -30,7 +30,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     UsageInfo,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -82,8 +82,8 @@ class TestCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream)  # default
         self.assertFalse(request.echo)  # default
 
-    def test_completion_request_sglang_extensions(self):
-        """Test completion request with SGLang-specific extensions"""
+    def test_completion_request_flliper_extensions(self):
+        """Test completion request with fLLiper-specific extensions"""
         request = CompletionRequest(
             model="test-model",
             prompt="Hello",
@@ -161,8 +161,8 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertEqual(request2.tool_choice, "auto")
 
-    def test_chat_completion_sglang_extensions(self):
-        """Test chat completion with SGLang extensions"""
+    def test_chat_completion_flliper_extensions(self):
+        """Test chat completion with fLLiper extensions"""
         messages = [{"role": "user", "content": "Hello"}]
         request = ChatCompletionRequest(
             model="test-model",
@@ -260,7 +260,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
 
     def test_chat_completion_reasoning_effort_max(self):
-        """`max` is an sglang extension on chat completion's top-level
+        """`max` is an flliper extension on chat completion's top-level
         `reasoning_effort` only; the Responses-API-style nested
         `reasoning.effort` path stays aligned with OpenAI's three levels."""
         from pydantic import ValidationError

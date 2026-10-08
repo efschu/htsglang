@@ -40,13 +40,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.triton.gdn_fused_proj import (
+from flliper.jit_kernel.triton.gdn_fused_proj import (
     qwen3_5_gdn_prefill_projection_views,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.models import qwen3_5
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.models import qwen3_5
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -188,8 +188,8 @@ _WORKER = textwrap.dedent("""
     os.environ["TRITON_INTERPRET"] = "1"
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "99")
     import torch
-    from sglang.srt.layers.attention.fla import layernorm_gated as lg
-    from sglang.jit_kernel.triton.gdn_fused_proj import (
+    from flliper.srt.layers.attention.fla import layernorm_gated as lg
+    from flliper.jit_kernel.triton.gdn_fused_proj import (
         qwen3_5_gdn_prefill_projection_views,
     )
 

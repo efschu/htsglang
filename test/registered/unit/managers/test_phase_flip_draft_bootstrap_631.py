@@ -30,8 +30,8 @@ import types
 import pytest
 import torch
 
-from sglang.srt.managers.scheduler import Scheduler as _Scheduler
-from sglang.srt.managers.phase_flip_draft_bootstrap import (
+from flliper.srt.managers.scheduler import Scheduler as _Scheduler
+from flliper.srt.managers.phase_flip_draft_bootstrap import (
     BOOTSTRAP_ATTR,
     DraftBootstrapError,
     arm_draft_bootstrap,
@@ -372,7 +372,7 @@ def test_seed_refuses_a_request_with_no_pending_token_at_all():
 
 def test_seed_survives_a_merge_with_a_freshly_prefilled_request():
     """The pin that matters for a batch mixing carried and new requests."""
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from flliper.srt.speculative.eagle_info import EagleDraftInput
 
     sched, _ = make_scheduler()
     batch = make_batch()
@@ -395,7 +395,7 @@ def test_can_fail_a_bonus_tokens_only_seed_breaks_the_merge():
     This is the exact shape ``spec_in_tick_bootstrap_seed`` builds -- valid
     there because that batch is a single request that is never merged.
     """
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from flliper.srt.speculative.eagle_info import EagleDraftInput
 
     thin = EagleDraftInput(
         bonus_tokens=torch.tensor([14], dtype=torch.int64),

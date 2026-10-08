@@ -191,7 +191,7 @@ def load_kernels(mock: bool) -> Kernels:
             stub=True,
         )
     missing = []
-    from sglang.srt.layers.quantization.int8_kernel import (  # noqa: PLC0415
+    from flliper.srt.layers.quantization.int8_kernel import (  # noqa: PLC0415
         per_token_quant_int8,
     )
     from sgl_kernel import int8_scaled_mm  # noqa: PLC0415

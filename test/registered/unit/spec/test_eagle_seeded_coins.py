@@ -31,19 +31,19 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative.eagle_utils import (
+from flliper.srt.speculative.eagle_utils import (
     _seeded_verify_coins,
     _verify_coins,
     eagle_sample,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 DRAFT_TOKEN_NUM = 4
 UMAX = torch.iinfo(torch.uint32).max
-HASH_PATH = "sglang.srt.layers.utils.hash.murmur_hash32"
+HASH_PATH = "flliper.srt.layers.utils.hash.murmur_hash32"
 
 
 def _reference_hash(seed, positions, col_indices):

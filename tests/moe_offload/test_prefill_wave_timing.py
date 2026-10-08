@@ -1,4 +1,4 @@
-"""SGLANG_MOE_OFFLOAD_TIMING=1 on the expert-major prefill path: per-wave
+"""FLLIPER_MOE_OFFLOAD_TIMING=1 on the expert-major prefill path: per-wave
 (fetch, apply) CUDA-event triples are collected per layer and the forward's
 split is logged once the next forward starts (layer 0 again)."""
 
@@ -6,7 +6,7 @@ import logging
 
 import torch
 
-from sglang.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_offload as eo
 
 
 class _Ev:
@@ -50,21 +50,21 @@ def test_the_expert_major_path_records_events_only_when_timing_is_on():
 
 
 def test_wave_token_slice_is_env_gated_and_bounded(monkeypatch):
-    """SGLANG_MOE_OFFLOAD_WAVE_SLICE bounds the grouped GEMM of one expert-major
+    """FLLIPER_MOE_OFFLOAD_WAVE_SLICE bounds the grouped GEMM of one expert-major
     wave to that many (token, expert) pairs; 0 = whole wave; default 81920 =
     8192 tokens x top-k 10 (the shape that fits a 3080's Marlin workspace)."""
     import ast
     import inspect
     import textwrap
 
-    from sglang.srt.layers.moe import expert_offload as eo
+    from flliper.srt.layers.moe import expert_offload as eo
 
     for raw, want in (("", 81920), ("0", 0), ("4096", 4096), ("-5", 0), ("abc", 81920)):
         eo._WAVE_SLICE["pairs"] = None
         if raw == "":
-            monkeypatch.delenv("SGLANG_MOE_OFFLOAD_WAVE_SLICE", raising=False)
+            monkeypatch.delenv("FLLIPER_MOE_OFFLOAD_WAVE_SLICE", raising=False)
         else:
-            monkeypatch.setenv("SGLANG_MOE_OFFLOAD_WAVE_SLICE", raw)
+            monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_WAVE_SLICE", raw)
         assert eo.wave_token_slice_pairs() == want, raw
     eo._WAVE_SLICE["pairs"] = None
     src = textwrap.dedent(inspect.getsource(eo.MoEExpertOffloadCache._run_waves_expert_major))
@@ -76,21 +76,21 @@ def test_wave_token_slice_is_env_gated_and_bounded(monkeypatch):
 
 
 def test_partials_mode_is_env_gated_and_defaults_to_the_table(monkeypatch):
-    """SGLANG_MOE_OFFLOAD_PARTIALS=stream drops the [T*K, H] partials table
+    """FLLIPER_MOE_OFFLOAD_PARTIALS=stream drops the [T*K, H] partials table
     (1.7 GB at a 32k chunk, fn6v OOM) for an fp32 [T, H] accumulator; the
     default keeps the byte-identical combine."""
     import ast
     import inspect
     import textwrap
 
-    from sglang.srt.layers.moe import expert_offload as eo
+    from flliper.srt.layers.moe import expert_offload as eo
 
     for raw, want in (("", "table"), ("table", "table"), ("stream", "stream"), ("STREAM", "stream"), ("x", "table")):
         eo._PARTIALS_MODE["mode"] = None
         if raw == "":
-            monkeypatch.delenv("SGLANG_MOE_OFFLOAD_PARTIALS", raising=False)
+            monkeypatch.delenv("FLLIPER_MOE_OFFLOAD_PARTIALS", raising=False)
         else:
-            monkeypatch.setenv("SGLANG_MOE_OFFLOAD_PARTIALS", raw)
+            monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_PARTIALS", raw)
         assert eo.partials_mode() == want, raw
     eo._PARTIALS_MODE["mode"] = None
     src = textwrap.dedent(inspect.getsource(eo.MoEExpertOffloadCache._run_waves_expert_major))

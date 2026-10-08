@@ -4,10 +4,10 @@ LRU.
 
 MEASURED (D log boot_weg2_dkrnfh91bar1rc11b09261915, TP1; TP2 identical):
 
-    19:30:47 #1423 INSERT-PLACED req=weg2-16- ... matched=2560 inserted=12480 deepest=249
-    19:30:47 HiCache prefetch success req=weg2-16-31 ... loaded=12480
-    19:30:47 #1423 INSERT-PLACED req=weg2-16- ... matched=15040 inserted=128 deepest=250
-    19:30:47 HiCache prefetch success req=weg2-16-38 ... loaded=128
+    19:30:47 #1423 INSERT-PLACED req=pdflip-16- ... matched=2560 inserted=12480 deepest=249
+    19:30:47 HiCache prefetch success req=pdflip-16-31 ... loaded=12480
+    19:30:47 #1423 INSERT-PLACED req=pdflip-16- ... matched=15040 inserted=128 deepest=250
+    19:30:47 HiCache prefetch success req=pdflip-16-38 ... loaded=128
     19:30:47 Sanity check FAILED (1 violations across 7 nodes):
                mamba host LRU: +S3={249}, +lru=set()
 
@@ -18,11 +18,11 @@ THE MECHANISM, in the completion's own order (``check_prefetch_progress``:
 ``_insert_helper_host`` -> ``_pin_prefetched_span`` -> the components'
 ``commit_hicache_transfer(PREFETCH)``):
 
-1. weg2-16-31 inserts its chain down to 249 and pins it BEFORE the mamba
+1. pdflip-16-31 inserts its chain down to 249 and pins it BEFORE the mamba
    commit, so 249's mamba ``host_value`` is still None at pin time and the
    mamba lock is skipped. The commit then gives 249 its anchor and puts it on
    the mamba host LRU.
-2. weg2-16-38 extends the same prefix by one node (250) and pins 250 -> 249
+2. pdflip-16-38 extends the same prefix by one node (250) and pins 250 -> 249
    -> ... . Now 249 HAS a mamba host copy, so ``acquire_component_lock(
    lock_host=True)`` takes 249 OFF the host LRU -- by design: a host-locked
    anchor must not be an eviction candidate.
@@ -45,7 +45,7 @@ Hermetic: real UnifiedRadixCache (FULL + MAMBA) on CPU, real insert, pin,
 mamba commit, lock protocol and sanity_check. No CUDA.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -54,20 +54,20 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
 FULL, MAMBA = ComponentType.FULL, ComponentType.MAMBA
 PAGE = 1
-HEAD = 12  # tokens of the first prefetch (weg2-16-31)
-TAIL = 4  # tokens the second prefetch adds below it (weg2-16-38)
+HEAD = 12  # tokens of the first prefetch (pdflip-16-31)
+TAIL = 4  # tokens the second prefetch adds below it (pdflip-16-38)
 
 
 class _Controller:
@@ -106,9 +106,9 @@ def _prefetch_complete(cache, rid, tokens, mamba_slot):
 
 
 def _metal_form(cache):
-    """weg2-16-31 then weg2-16-38 on the same prefix, both still unadmitted."""
-    n249 = _prefetch_complete(cache, "weg2-16-31", range(1, HEAD + 1), 7)
-    n250 = _prefetch_complete(cache, "weg2-16-38", range(1, HEAD + TAIL + 1), 8)
+    """pdflip-16-31 then pdflip-16-38 on the same prefix, both still unadmitted."""
+    n249 = _prefetch_complete(cache, "pdflip-16-31", range(1, HEAD + 1), 7)
+    n250 = _prefetch_complete(cache, "pdflip-16-38", range(1, HEAD + TAIL + 1), 8)
     return n249, n250
 
 
@@ -135,8 +135,8 @@ class PrefetchPinHostLru1417b(CustomTestCase):
     def test_admission_returns_the_anchor_to_the_lru(self):
         cache = _tree()
         n249, _ = _metal_form(cache)
-        cache.pop_prefetch_loaded_tokens("weg2-16-31")
-        cache.pop_prefetch_loaded_tokens("weg2-16-38")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-31")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-38")
         self.assertEqual(n249.component_data[MAMBA].host_lock_ref, 0)
         self.assertTrue(cache.host_lru_lists[MAMBA].in_list(n249))
         cache.sanity_check()
@@ -154,8 +154,8 @@ class PrefetchPinHostLru1417b(CustomTestCase):
     def test_an_unlocked_anchor_missing_from_the_lru_is_still_named(self):
         cache = _tree()
         n249, _ = _metal_form(cache)
-        cache.pop_prefetch_loaded_tokens("weg2-16-31")
-        cache.pop_prefetch_loaded_tokens("weg2-16-38")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-31")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-38")
         cache.host_lru_lists[MAMBA].remove_node(n249)
         with self.assertRaises(AssertionError) as ctx:
             cache.sanity_check()

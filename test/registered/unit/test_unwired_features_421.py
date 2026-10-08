@@ -25,14 +25,14 @@ import ast
 import pathlib
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-_SRT = _REPO_ROOT / "python" / "sglang" / "srt"
+_SRT = _REPO_ROOT / "python" / "flliper" / "srt"
 
 
 def _is_test_path(path: pathlib.Path) -> bool:
@@ -47,8 +47,8 @@ def _is_test_path(path: pathlib.Path) -> bool:
 
 
 def _production_py_files():
-    """Every .py under python/sglang that is not itself test/bench code."""
-    for path in (_REPO_ROOT / "python" / "sglang").rglob("*.py"):
+    """Every .py under python/flliper that is not itself test/bench code."""
+    for path in (_REPO_ROOT / "python" / "flliper").rglob("*.py"):
         if not _is_test_path(path):
             yield path
 
@@ -152,7 +152,7 @@ class TestRuntimeDraftLifecycleIsUnreachable(CustomTestCase):
     """
 
     def test_no_production_importer(self):
-        importers = _production_importers_of("sglang.srt.speculative.runtime_draft")
+        importers = _production_importers_of("flliper.srt.speculative.runtime_draft")
         self.assertEqual(
             importers,
             [],
@@ -164,7 +164,7 @@ class TestRuntimeDraftLifecycleIsUnreachable(CustomTestCase):
         """``draft_selection.arms_from_server_args`` is the #309 sibling."""
         callers = _production_callers_of(
             "arms_from_server_args",
-            defining_rel_paths=("python/sglang/srt/speculative/draft_selection.py",),
+            defining_rel_paths=("python/flliper/srt/speculative/draft_selection.py",),
         )
         self.assertEqual(
             callers,
@@ -185,7 +185,7 @@ class TestDrafterParkHasNoCaller(CustomTestCase):
 
     That registration is real code, so a reader checking only for a descriptor
     concludes the park path is live. It is not, for two independent reasons
-    beyond the default-off ``SGLANG_OFFLOAD_REGISTER`` flag:
+    beyond the default-off ``FLLIPER_OFFLOAD_REGISTER`` flag:
 
     * no movement payload is bound -- the registration site says so itself
       ("No payload bind yet ... binding a TensorPayload here would be refused
@@ -202,7 +202,7 @@ class TestDrafterParkHasNoCaller(CustomTestCase):
     cannot.
     """
 
-    _DEFINER = "python/sglang/srt/model_executor/short_term_offload_register.py"
+    _DEFINER = "python/flliper/srt/model_executor/short_term_offload_register.py"
 
     def test_nothing_calls_the_only_function_that_parks_a_drafter(self):
         callers = _production_callers_of(
@@ -294,8 +294,8 @@ class TestMemTierRegistryHasItsFirstConsumer(CustomTestCase):
     hatch and the #394 apportionment stayed invisible.
     """
 
-    CONSUMER_MODULE = "sglang.srt.memtier.consumers"
-    EXPECTED_CALLER = "python/sglang/srt/managers/session_checkpoint.py"
+    CONSUMER_MODULE = "flliper.srt.memtier.consumers"
+    EXPECTED_CALLER = "python/flliper/srt/managers/session_checkpoint.py"
 
     def test_the_checkpoint_runtime_imports_the_consumer_shim(self):
         importers = _production_importers_of(self.CONSUMER_MODULE, exclude_package=True)
@@ -310,7 +310,7 @@ class TestMemTierRegistryHasItsFirstConsumer(CustomTestCase):
     def test_the_checkpoint_runtime_calls_the_selection_helper(self):
         callers = _production_callers_of(
             "checkpoint_tier_targets",
-            defining_rel_paths=("python/sglang/srt/memtier/consumers.py",),
+            defining_rel_paths=("python/flliper/srt/memtier/consumers.py",),
         )
         self.assertTrue(
             any(hit.startswith(self.EXPECTED_CALLER) for hit in callers),

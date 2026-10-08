@@ -3,7 +3,7 @@
 AST-based parser for diffusion test cases.
 
 This module parses the diffusion case source and run_suite.py using AST to
-extract test case information without requiring sglang dependencies. The case
+extract test case information without requiring flliper dependencies. The case
 source file is discovered from ONE_GPU_CASES/TWO_GPU_CASES imports in
 run_suite.py so CI keeps a single source of truth.
 
@@ -42,15 +42,15 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 
 # Paths relative to repository root
-BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines"
+BASELINE_REL_PATH = "python/flliper/multimodal_gen/test/server/perf_baselines"
 BASELINE_PLATFORM_ORDER = ("h100", "b200", "5090")
-RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
+RUN_SUITE_REL_PATH = "python/flliper/multimodal_gen/test/run_suite.py"
 
 USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
 
 if USE_NPU_CONFIGS:
     BASELINE_REL_PATH = (
-        "python/sglang/multimodal_gen/test/server/perf_baselines_npu.json"
+        "python/flliper/multimodal_gen/test/server/perf_baselines_npu.json"
     )
     CASE_LIST_TO_SUITE = {
         "ONE_NPU_CASES": "1-npu",

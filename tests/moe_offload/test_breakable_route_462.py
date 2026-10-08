@@ -35,8 +35,8 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe import offload_capture_gate as gate  # noqa: E402
-from sglang.srt.layers.moe.breakable_offload import (  # noqa: E402
+from flliper.srt.layers.moe import offload_capture_gate as gate  # noqa: E402
+from flliper.srt.layers.moe.breakable_offload import (  # noqa: E402
     EAGER_HOST_BLOCKING_CROSSINGS_PER_LAYER_PER_STEP,
     HOST_BLOCKING_CROSSINGS_PER_LAYER_PER_STEP,
     HOST_SYNCS_PER_LAYER_PER_STEP,
@@ -44,11 +44,11 @@ from sglang.srt.layers.moe.breakable_offload import (  # noqa: E402
     BreakableScratchOverflow,
     breakable_opt_in,
 )
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     MoEExpertOffloadCache,
     remap_ids_host,
 )
-from sglang.srt.model_executor import short_term_offload_register as reg  # noqa: E402
+from flliper.srt.model_executor import short_term_offload_register as reg  # noqa: E402
 
 E, R, C = 32, 8, 6
 HID, INTER = 4, 6
@@ -86,11 +86,11 @@ class _StubLayer:
 
 @pytest.fixture(autouse=True)
 def _no_scratch_env_leak():
-    """``_cache`` sets SGLANG_MOE_SCRATCH_SLOTS, which ``scratch_slot_count``
+    """``_cache`` sets FLLIPER_MOE_SCRATCH_SLOTS, which ``scratch_slot_count``
     reads from the raw environment. Restore it after every test so this module
     cannot change what a later one measures (it did: test_planner's default-C
     assertion went red)."""
-    key = "SGLANG_MOE_SCRATCH_SLOTS"
+    key = "FLLIPER_MOE_SCRATCH_SLOTS"
     before = os.environ.get(key)
     try:
         yield
@@ -102,7 +102,7 @@ def _no_scratch_env_leak():
 
 
 def _cache(layer=None, scratch=C):
-    os.environ["SGLANG_MOE_SCRATCH_SLOTS"] = str(scratch)
+    os.environ["FLLIPER_MOE_SCRATCH_SLOTS"] = str(scratch)
     cache = MoEExpertOffloadCache(layer or _StubLayer(scratch=scratch), R / E)
     assert cache.resident_count == R and cache.scratch == scratch
     cache.install()
@@ -346,7 +346,7 @@ def test_arena_consumes_the_286_descriptor_rather_than_restating_it():
 def clean_env(monkeypatch):
     for name in (
         gate.ENV_GRAPH_MODE,
-        "SGLANG_MOE_OFFLOAD_CUDA_GRAPH",
+        "FLLIPER_MOE_OFFLOAD_CUDA_GRAPH",
         gate.ENV_GRAPH_REFUTED_OVERRIDE,
     ):
         monkeypatch.delenv(name, raising=False)
@@ -400,7 +400,7 @@ def test_breakable_boot_refuses_without_an_offload(clean_env):
 
 
 def test_breakable_boot_refuses_alongside_the_capturable_opt_in(clean_env):
-    clean_env.setenv("SGLANG_MOE_OFFLOAD_CUDA_GRAPH", "1")
+    clean_env.setenv("FLLIPER_MOE_OFFLOAD_CUDA_GRAPH", "1")
     with pytest.raises(gate.BreakableModeRefused) as excinfo:
         gate.validate_breakable_boot(0.5, layer_id=2)
     assert "mutually exclusive" in str(excinfo.value)
@@ -425,7 +425,7 @@ class _Args:
 
 
 def _with_args(monkeypatch, decode, prefill):
-    import sglang.srt.runtime_context as rc
+    import flliper.srt.runtime_context as rc
 
     monkeypatch.setattr(rc, "get_server_args", lambda: _Args(decode, prefill))
 
@@ -450,7 +450,7 @@ def test_breakable_boot_accepts_the_one_working_shape(clean_env):
 
 
 def test_legacy_disable_cuda_graph_reads_as_disabled(clean_env):
-    import sglang.srt.runtime_context as rc
+    import flliper.srt.runtime_context as rc
 
     args = _Args("breakable", "disabled")
     args.disable_cuda_graph = True
@@ -471,7 +471,7 @@ def test_scratch_overflow_refuses_by_name_with_the_numbers():
     message = str(excinfo.value)
     assert excinfo.value.spill == 4 and excinfo.value.scratch == 2
     assert "cannot wave-split" in message
-    assert "SGLANG_MOE_SCRATCH_SLOTS" in message
+    assert "FLLIPER_MOE_SCRATCH_SLOTS" in message
 
 
 def test_the_overflow_check_runs_before_any_counter_moves():
@@ -537,7 +537,7 @@ def test_the_eager_lut_build_stages_its_two_vectors_through_pinned_memory(monkey
     vectors are already where they are read); with a card the two copies are
     issued from PINNED sources."""
     import numpy as np
-    from sglang.srt.layers.moe import expert_offload as eo
+    from flliper.srt.layers.moe import expert_offload as eo
 
     cache = _cache()
     transfers = []

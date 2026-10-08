@@ -1,7 +1,7 @@
 import unittest
 
-import sglang as sgl
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
+import flliper as sgl
+from flliper.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
 class TestBind(CustomTestCase):

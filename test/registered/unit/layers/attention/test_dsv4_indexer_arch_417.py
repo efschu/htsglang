@@ -3,7 +3,7 @@
 The DSpark layers of DeepSeek-V4-Flash (layers 40-42, `compress_ratio` 4/128)
 run a paged-MQA-logits step whose default implementation is DeepGEMM: Hopper
 and datacenter Blackwell only. A torch implementation has existed since #24692
-but was reachable only by setting `SGLANG_FP8_PAGED_MQA_LOGITS_TORCH`, so an
+but was reachable only by setting `FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH`, so an
 Ampere or consumer-Blackwell rank went to DeepGEMM anyway and died there --
 one step past where Cuts 1 and 2 leave it.
 
@@ -25,9 +25,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4 import indexer_arch
-from sglang.srt.layers.attention.dsv4.indexer_arch import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.dsv4 import indexer_arch
+from flliper.srt.layers.attention.dsv4.indexer_arch import (
     BACKEND_AITER,
     BACKEND_DEEPGEMM,
     BACKEND_TILELANG,
@@ -38,8 +38,8 @@ from sglang.srt.layers.attention.dsv4.indexer_arch import (
     resolve_paged_mqa_logits_backend,
     warn_torch_indexer_substitution_once,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -94,9 +94,9 @@ class _ArchMixin:
     @staticmethod
     def _with_envs(tilelang=False, aiter=False, torch_impl=False):
         return (
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(tilelang),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(aiter),
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(torch_impl),
+            envs.FLLIPER_OPT_USE_TILELANG_INDEXER.override(tilelang),
+            envs.FLLIPER_OPT_USE_AITER_INDEXER.override(aiter),
+            envs.FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH.override(torch_impl),
         )
 
 
@@ -209,9 +209,9 @@ class TestPagedIndexerMetadataBypass(_ArchMixin, CustomTestCase):
     DeepGEMM must not import or call DeepGEMM."""
 
     def _build(self, capability):
-        from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+        from flliper.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 
-        with self._with_capability(capability), envs.SGLANG_OPT_USE_TOPK_V2.override(
+        with self._with_capability(capability), envs.FLLIPER_OPT_USE_TOPK_V2.override(
             False
         ):
             return PagedIndexerMetadata(
@@ -260,7 +260,7 @@ class TestTorchVariantChoice(_ArchMixin, CustomTestCase):
         return q, kv, weight, page_table
 
     def test_trimmed_variant_accepts_the_shape_the_call_site_passes(self):
-        from sglang.srt.layers.attention.dsv4.indexer import (
+        from flliper.srt.layers.attention.dsv4.indexer import (
             fp8_paged_mqa_logits_torch_sm120,
         )
 
@@ -273,7 +273,7 @@ class TestTorchVariantChoice(_ArchMixin, CustomTestCase):
 
     def test_untrimmed_variant_rejects_it(self):
         """The reason the dispatch may not send a non-SM120 card there."""
-        from sglang.srt.layers.attention.dsv4.indexer import (
+        from flliper.srt.layers.attention.dsv4.indexer import (
             fp8_paged_mqa_logits_torch,
         )
 
@@ -289,7 +289,7 @@ class TestDispatchSelectsTheImplementation(_ArchMixin, CustomTestCase):
     """`select_paged_mqa_logits_fn` is the whole of Cut 3; pin what it returns."""
 
     def _select(self, capability, use_fp4=False, **env_kwargs):
-        from sglang.srt.layers.attention.dsv4.indexer import (
+        from flliper.srt.layers.attention.dsv4.indexer import (
             select_paged_mqa_logits_fn,
         )
 
@@ -301,7 +301,7 @@ class TestDispatchSelectsTheImplementation(_ArchMixin, CustomTestCase):
                 )
 
     def test_ampere_gets_the_trimmed_torch_implementation(self):
-        from sglang.srt.layers.attention.dsv4.indexer import (
+        from flliper.srt.layers.attention.dsv4.indexer import (
             fp8_paged_mqa_logits_torch_sm120,
         )
 
@@ -314,7 +314,7 @@ class TestDispatchSelectsTheImplementation(_ArchMixin, CustomTestCase):
     def test_it_is_never_the_untrimmed_one(self):
         """The old `is_sm120_supported()` split sent everything non-SM120 here,
         where the 2-D `seq_lens` this call site passes trips an assert."""
-        from sglang.srt.layers.attention.dsv4.indexer import (
+        from flliper.srt.layers.attention.dsv4.indexer import (
             fp8_paged_mqa_logits_torch,
         )
 
@@ -362,20 +362,20 @@ class TestNonPagedIndexerNeedsDeepgemm(_ArchMixin, CustomTestCase):
     def _is_eligible(self, capability):
         from types import SimpleNamespace
 
-        from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-        from sglang.srt.runtime_context import get_parallel
+        from flliper.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.runtime_context import get_parallel
 
-        indexer_mod = "sglang.srt.layers.attention.dsv4.indexer"
+        indexer_mod = "flliper.srt.layers.attention.dsv4.indexer"
         with self._with_capability(
             capability
-        ), envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.override(
+        ), envs.FLLIPER_OPT_DSV4_NONPAGED_INDEXER.override(
             True
-        ), envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(
+        ), envs.FLLIPER_OPT_USE_TILELANG_INDEXER.override(
             False
-        ), envs.SGLANG_OPT_USE_AITER_INDEXER.override(
+        ), envs.FLLIPER_OPT_USE_AITER_INDEXER.override(
             False
-        ), envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(
+        ), envs.FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH.override(
             False
         ), mock.patch(
             f"{indexer_mod}.is_cuda", return_value=True

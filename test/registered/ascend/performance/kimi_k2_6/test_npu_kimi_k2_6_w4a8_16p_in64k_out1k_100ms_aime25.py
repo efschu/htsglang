@@ -1,17 +1,17 @@
 import unittest
 
-from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
+from flliper.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdMixTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
-from sglang.test.ascend.e2e.test_npu_performance_utils import (
+from flliper.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
+from flliper.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
     KIMI_K2_6_EAGLE3_MODEL_PATH,
     KIMI_K2_6_W4A8_MODEL_PATH,
     TestNpuPerfMultiNodePdMixTestCaseBase,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+from flliper.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=1800,
@@ -22,13 +22,13 @@ register_npu_ci(
 
 ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-    "SGLANG_SET_CPU_AFFINITY": "1",
+    "FLLIPER_SET_CPU_AFFINITY": "1",
     "STREAMS_PER_DEVICE": "32",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
+    "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
     "HCCL_BUFFSIZE": "4400",
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "FLLIPER_ENABLE_SPEC_V2": "1",
+    "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
 }

@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.nvfp4 import (
+from flliper.jit_kernel.nvfp4 import (
     scaled_fp4_grouped_quant,
     scaled_fp4_quant,
     silu_and_mul_scaled_fp4_grouped_quant,
@@ -14,7 +14,7 @@ try:
 except Exception:
     _sgl_silu_and_mul = None
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)

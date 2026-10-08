@@ -7,10 +7,10 @@ import inspect
 
 import pytest
 
-from sglang.srt import rank_role
-from sglang.srt.configs import model_config as mc
-from sglang.srt.distributed import utils as du
-from sglang.srt.rank_role import HOST, WORKER, RankRolePlan, set_form_a_role_plan
+from flliper.srt import rank_role
+from flliper.srt.configs import model_config as mc
+from flliper.srt.distributed import utils as du
+from flliper.srt.rank_role import HOST, WORKER, RankRolePlan, set_form_a_role_plan
 
 FORM_A = RankRolePlan((HOST, WORKER, WORKER))
 
@@ -39,7 +39,7 @@ def test_classic_boot_keeps_the_replicated_count(replicated_plan):
 
 
 def test_mamba_sizing_admits_zero_state_bytes_on_a_worker_only():
-    from sglang.srt.model_executor import model_runner_kv_cache_mixin as mix
+    from flliper.srt.model_executor import model_runner_kv_cache_mixin as mix
 
     src = inspect.getsource(mix.ModelRunnerKVCacheMixin.handle_max_mamba_cache)
     assert "assert per_req > 0 or this_rank_is_form_a_worker()" in src

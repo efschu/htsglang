@@ -21,14 +21,14 @@ hf download --repo-type dataset \
     allenai/olmOCR-bench --local-dir ./olmOCR-bench
 # This places bench_data/  (7 JSONL files + pdfs/ directory) under ./olmOCR-bench/
 
-# Required: benchmark dependencies (pymupdf is in sglang[test]; aiohttp/tqdm are in core)
-pip install "sglang[test]"
+# Required: benchmark dependencies (pymupdf is in flliper[test]; aiohttp/tqdm are in core)
+pip install "flliper[test]"
 # OR install PDF rendering manually (choose one):
 #   pip install pymupdf          # recommended (faster, pure Python wheel)
 #   pip install pdf2image        # needs poppler: sudo apt install poppler-utils
 
-# Start the sglang server (matches run.sh in this repo)
-python -m sglang.launch_server \
+# Start the flliper server (matches run.sh in this repo)
+python -m flliper.launch_server \
     --model-path deepseek-ai/DeepSeek-OCR-2 \
     --host 127.0.0.1 --port 30000
 ```
@@ -45,7 +45,7 @@ python -m sglang.launch_server \
 
 ```bash
 # Full benchmark — all 7 splits (~7,010 tests)
-python -m benchmark.ocr.bench_sglang \
+python -m benchmark.ocr.bench_flliper \
     --port 30000 \
     --model deepseek-ai/DeepSeek-OCR-2 \
     --split all \
@@ -53,16 +53,16 @@ python -m benchmark.ocr.bench_sglang \
     --output-dir ./ocr_bench_results
 
 # Single split
-python -m benchmark.ocr.bench_sglang --port 30000 --split arxiv_math --concurrency 16
+python -m benchmark.ocr.bench_flliper --port 30000 --split arxiv_math --concurrency 16
 
 # Quick smoke-test (50 samples from one split)
-python -m benchmark.ocr.bench_sglang --port 30000 --split old_scans --max-samples 50
+python -m benchmark.ocr.bench_flliper --port 30000 --split old_scans --max-samples 50
 
 # Use "Free OCR" prompt instead of markdown conversion
-python -m benchmark.ocr.bench_sglang --port 30000 --split all --prompt-mode free_ocr
+python -m benchmark.ocr.bench_flliper --port 30000 --split all --prompt-mode free_ocr
 
 # Save raw model outputs for inspection
-python -m benchmark.ocr.bench_sglang --port 30000 --split multi_column --save-raw-outputs
+python -m benchmark.ocr.bench_flliper --port 30000 --split multi_column --save-raw-outputs
 
 ```
 
@@ -72,8 +72,8 @@ python -m benchmark.ocr.bench_sglang --port 30000 --split multi_column --save-ra
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--port` | `30000` | sglang server port |
-| `--host` | `127.0.0.1` | sglang server host |
+| `--port` | `30000` | flliper server port |
+| `--host` | `127.0.0.1` | flliper server host |
 | `--model` | `deepseek-ai/DeepSeek-OCR-2` | Model ID (must match running server) |
 | `--split` | `all` | Split name or `all` |
 | `--concurrency` | `8` | Concurrent requests to server |
@@ -165,7 +165,7 @@ Each split JSON contains:
 
 | File | Description |
 |------|-------------|
-| `bench_sglang.py` | Main benchmark runner — loads dataset, sends requests, aggregates |
+| `bench_flliper.py` | Main benchmark runner — loads dataset, sends requests, aggregates |
 | `eval_utils.py` | Test evaluators, Normalized Edit Distance metric, aggregation helpers |
 | `generate_report.py` | Generates self-contained HTML reports with MathJax from result JSONs |
 | `README.md` | This file |

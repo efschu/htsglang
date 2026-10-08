@@ -18,9 +18,9 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
-from sglang.test.test_utils import DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.test_utils import DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large")
 
@@ -55,7 +55,7 @@ class TestPageMajorQwenHybrid(DefaultServerBase):
     ]
 
     def test_gsm8k(self):
-        from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
+        from flliper.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
 
         url = urlparse(self.base_url)
         args = SimpleNamespace(

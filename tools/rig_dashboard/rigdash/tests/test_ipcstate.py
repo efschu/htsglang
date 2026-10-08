@@ -21,7 +21,7 @@ BOOT_ID = "nfh91dprsavisadoptstcutvsyncodx2bswre2cutdauer-boot-20260929T065359Z-
 
 def _state(lc="serving", cause=None, **kw):
     st = {
-        "schema": "weg2.state/1", "seq": 17, "boot_id": BOOT_ID, "kind": "boot", "tag": TAG, "line": "nf",
+        "schema": "pdflip.state/1", "seq": 17, "boot_id": BOOT_ID, "kind": "boot", "tag": TAG, "line": "nf",
         "rev": "4f23714e2d", "profile": "nf-h91-dpr-sa-vis-adopt-st-cut-vsync-odx-2b-swr-e2cut",
         "image": "htsglang:cu130-weg2-rc12z30u-27b-nf", "container": "htsglang-acc-nf-x",
         "lifecycle": {"state": lc, "since_ts": 1790667599.9, "prev": "flipping"},
@@ -29,11 +29,11 @@ def _state(lc="serving", cause=None, **kw):
         "heartbeat": {"host_acceptance": {"pid": 1, "ts": 1790667599.9, "seq": 1}},
         "front": {"awake": "P", "epoch": 165, "outstanding": 2, "queue": 1, "state": "serving"},
         "groups": {
-            "P": {"state": "ready", "launch": {"argv": ["python", "-m", "sglang.launch_server", "--model-path",
+            "P": {"state": "ready", "launch": {"argv": ["python", "-m", "flliper.launch_server", "--model-path",
                                                         "/m/Qwen3.8-Flash-Next-INT4", "--served-model-name", "NF-INT4",
                                                         "--pp-size", "3"],
                                                "env": {"HTSGLANG_TRANSPORT": "bar1"}}},
-            "D": {"state": "ready", "launch": {"argv": ["python", "-m", "sglang.launch_server", "--tp-size", "3"],
+            "D": {"state": "ready", "launch": {"argv": ["python", "-m", "flliper.launch_server", "--tp-size", "3"],
                                                "env": {}}},
         },
     }
@@ -48,7 +48,7 @@ def _write_boot(root, st, events=(), stop_request=None):
         json.dump(st, fh)
     with open(os.path.join(d, "events.jsonl"), "w") as fh:
         for i, e in enumerate(events):
-            fh.write(json.dumps(dict({"schema": "weg2.event/1", "seq": i + 1, "boot_id": st["boot_id"],
+            fh.write(json.dumps(dict({"schema": "pdflip.event/1", "seq": i + 1, "boot_id": st["boot_id"],
                                       "group": None, "rank": None, "code": None}, **e)) + "\n")
     if stop_request:
         with open(os.path.join(d, "stop_request.json"), "w") as fh:
@@ -86,18 +86,18 @@ class TestClassifyIpc(unittest.TestCase):
             self.assertEqual(e["src"], "state.json")
 
     def test_dead_wins_over_stopping(self):
-        v = ipcstate.boot_view("/x", _state("dead", {"code": "W98_Weg2HostRateLatched", "origin": "front", "rc": 24}),
+        v = ipcstate.boot_view("/x", _state("dead", {"code": "W98_PdFlipHostRateLatched", "origin": "front", "rc": 24}),
                                None, 0)
         e = stops.classify_ipc(v)
         self.assertIsNone(e["planned"])
-        self.assertIn("W98_Weg2HostRateLatched", e["death"]["text"])
+        self.assertIn("W98_PdFlipHostRateLatched", e["death"]["text"])
 
     def test_front_stop_event_is_a_death_while_the_boot_still_runs(self):
         with tempfile.TemporaryDirectory() as root:
             _write_boot(root, _state("serving"),
-                        events=[{"type": "front_stop", "ts": 1790666000.0, "code": "W98_Weg2HostRateLatched",
-                                 "data": {"name": "W98 Weg2HostRateLatched"}}],
-                        stop_request={"code": "W98_Weg2HostRateLatched", "origin": "front"})
+                        events=[{"type": "front_stop", "ts": 1790666000.0, "code": "W98_PdFlipHostRateLatched",
+                                 "data": {"name": "W98 PdFlipHostRateLatched"}}],
+                        stop_request={"code": "W98_PdFlipHostRateLatched", "origin": "front"})
             s = ipcstate.IpcStates(roots=(root,))
             s.poll(now=os.stat(os.path.join(root, BOOT_ID, "state.json")).st_mtime + 1)
             e = stops.classify_ipc(s.for_tag(TAG))
@@ -116,7 +116,7 @@ class TestClassifyIpc(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             d = _write_boot(root, _state())
             with open(os.path.join(d, "events.jsonl"), "a") as fh:
-                fh.write('{"schema": "weg2.event/1", "type": "hold_end", "ts": 1.0, "data": {"reason"')
+                fh.write('{"schema": "pdflip.event/1", "type": "hold_end", "ts": 1.0, "data": {"reason"')
             s = ipcstate.IpcStates(roots=(root,))
             s.poll()
             self.assertEqual(s.for_tag(TAG)["events"]["hold_end"], [])
@@ -130,7 +130,7 @@ def _fw(direction, begin, ms, what):
     # shaped like the y4j front's events (nfh91...clkpodauer-boot-20260930T101130Z-74d3)
     return {"type": "flip_first_work", "ts": begin + ms / 1000.0,
             "data": {"clock": "time.time front", "dir": direction, "epoch": 1, "flip_begin_ts": begin,
-                     "first_work_ts": begin + ms / 1000.0, "flip_time_ms": ms, "rid": "weg2-0-2", "what": what}}
+                     "first_work_ts": begin + ms / 1000.0, "flip_time_ms": ms, "rid": "pdflip-0-2", "what": what}}
 
 
 class TestFlipFirstWork(unittest.TestCase):
@@ -151,7 +151,7 @@ class TestFlipFirstWork(unittest.TestCase):
 
 class TestHealthFrontMirror(unittest.TestCase):
     def test_state_json_front_outstanding_is_one_number(self):
-        # IPC §2.2 H4: the state.json mirror keeps outstanding as one number, /weg2/state per group
+        # IPC §2.2 H4: the state.json mirror keeps outstanding as one number, /pdflip/state per group
         b = {"live": True, "front": {"queue": 1, "outstanding": 2, "src": "state.json front (Host-Spiegel)"},
              "last_activity_any": 0.0, "health": {}, "stops": [], "end": {}}
         a = health.assess(b, now=1000.0)

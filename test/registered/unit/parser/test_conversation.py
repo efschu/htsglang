@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.entrypoints.openai.protocol import (
+from flliper.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentAudioPart,
     ChatCompletionMessageContentAudioURL,
     ChatCompletionMessageContentImagePart,
@@ -17,7 +17,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageUserParam,
     ChatCompletionRequest,
 )
-from sglang.srt.parser.conversation import (
+from flliper.srt.parser.conversation import (
     Conversation,
     SeparatorStyle,
     _get_full_multimodal_text_prompt,
@@ -29,8 +29,8 @@ from sglang.srt.parser.conversation import (
     get_model_type,
     register_conv_template,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")

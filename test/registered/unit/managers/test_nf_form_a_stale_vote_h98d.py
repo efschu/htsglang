@@ -2,14 +2,14 @@
 through the H105 verdict on every rank -- not an H98 HOST-BELOW-GROUP death.
 
 THE DEATH (NF xc D, c5da548b7c, boot dkrnfint4h6ablxcbar1dauer10071818,
-D log 841600-843160, 07.10.2026 21:37:20-21:37:29Z, rid weg2-130-2092, a
+D log 841600-843160, 07.10.2026 21:37:20-21:37:29Z, rid pdflip-130-2092, a
 175353-token agent turn, uncached 249):
 
-* 21:37:20 TP0 ``MATCH-CENSUS-DEEP rid=weg2-130-2092 reached=175104
+* 21:37:20 TP0 ``MATCH-CENSUS-DEEP rid=pdflip-130-2092 reached=175104
   accepted=175104 prefix=175104`` -- the whole prefix on TP0's DEVICE, its
   anchor at 175104. The pass's usable vote (scheduler ~10740,
   ``local_usable_matches`` -> ``admission_probe``) plants 175104.
-* 21:37:29, the SAME pass, weg2-130-2093 is admitted first. Under the #239
+* 21:37:29, the SAME pass, pdflip-130-2093 is admitted first. Under the #239
   token cut its ADMIT is gathered before its load-back; the load-back's
   floor refuses and drains every evictable leaf (xsn285, unified_radix_cache
   ``load_back``; ``EVICT-FRONTIER-CENSUS request=168832`` on all three
@@ -19,9 +19,9 @@ D log 841600-843160, 07.10.2026 21:37:20-21:37:29Z, rid weg2-130-2092, a
   four device nodes up KV-ONLY and drops their anchors (``P-FUND EVICT
   KV-ONLY n=19..22`` tokens 384, 960, 320, 256; 960+320+256 = 1536 =
   175104 - 173568).
-* weg2-130-2092's admission match on TP0 now ends on the deepest SURVIVING
+* pdflip-130-2092's admission match on TP0 now ends on the deepest SURVIVING
   anchor: ``host_admission_len`` 173568 < planted 175104 -> ``H98 RU FORM-A
-  HOST-BELOW-GROUP rid=weg2-130-2092 local_match=173568 group=175104``,
+  HOST-BELOW-GROUP rid=pdflip-130-2092 local_match=173568 group=175104``,
   RANK_EXCEPTION, the D group dead after 3 h 15 min. TP1/TP2 had already
   followed 175104 (``#1042 EXTENT LIFECYCLE set ... extent=44032``,
   ``X-GATE ... uncached=249 ... verdict=admit``).
@@ -49,38 +49,38 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt import rank_role
-from sglang.srt.managers import schedule_policy as sp
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt import rank_role
+from flliper.srt.managers import schedule_policy as sp
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 FLOOR_ATTR = "_tp_match_floor_group"
 FOLLOW_ATTR = "_tp_match_floor_follow_walk"
-FOLLOW_SWITCH = "SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW"
-DEFER_SWITCH = "SGLANG_WEG2_ENABLE_FORM_A_STALE_VOTE_DEFER"
+FOLLOW_SWITCH = "FLLIPER_PDFLIP_ENABLE_FORM_A_TP0_FOLLOW"
+DEFER_SWITCH = "FLLIPER_PDFLIP_ENABLE_FORM_A_STALE_VOTE_DEFER"
 
 PAGE = 64
 SLOTS = 8
 ROLES = ("host", "worker", "worker")
 
-#: weg2-130-2092 geometry (D log 21:37:20-21:37:29Z).
-RID = "weg2-130-2092"
+#: pdflip-130-2092 geometry (D log 21:37:20-21:37:29Z).
+RID = "pdflip-130-2092"
 FILL = 175353  # 175104 cached + 249 uncached (X-GATE uncached=249)
 KV = 175104  # the KV reach on every rank (the drain backs the tail up KV-only)
 GROUP = 175104  # planted at the top of the pass (TP0 anchor on device)
@@ -184,7 +184,7 @@ def _as_rank(rank, roles=ROLES):
 @contextlib.contextmanager
 def _switches(follow=True, defer=None):
     """The H98 follow switch and (when not None) the H98d deferral switch."""
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(getattr(envs, FOLLOW_SWITCH).override(follow))
@@ -263,7 +263,7 @@ def _trees_at_vote():
 
 
 def _drain(host_tree):
-    """The xsn285 drain for weg2-130-2093: the 175104 anchor leaves TP0's
+    """The xsn285 drain for pdflip-130-2093: the 175104 anchor leaves TP0's
     tree (P-FUND KV-ONLY), its KV stays host-backed."""
     host_tree.anchors = sorted(HOST_AFTER_DRAIN)
 
@@ -273,7 +273,7 @@ def _reset_module_state():
     m._STATS.pop("stale_vote_defer", None)
 
 
-class TestWeg2_130_2092(unittest.TestCase):
+class TestPdFlip_130_2092(unittest.TestCase):
     """The death, replayed: vote -> in-pass drain -> admission."""
 
     def setUp(self):
@@ -314,19 +314,19 @@ class TestWeg2_130_2092(unittest.TestCase):
         self.assertNotIn(RID, m._STALE_REPEAT, "a clean admission forgets the repeat")
 
 
-def _isolate_weg2_group(testcase):
+def _isolate_pdflip_group(testcase):
     """As in test_nf_form_a_admission_follow_h105: the chunk-admission module
-    globals read SGLANG_WEG2_GROUP once; keep them neutral here."""
+    globals read FLLIPER_PDFLIP_GROUP once; keep them neutral here."""
     env = patch.dict(os.environ)
     env.start()
     testcase.addCleanup(env.stop)
-    os.environ.pop("SGLANG_WEG2_GROUP", None)
-    sp._WEG2_CHUNK_ADMIT = None
-    sp._WEG2_PARK_ON = None
+    os.environ.pop("FLLIPER_PDFLIP_GROUP", None)
+    sp._PDFLIP_CHUNK_ADMIT = None
+    sp._PDFLIP_PARK_ON = None
 
     def _reset():
-        sp._WEG2_CHUNK_ADMIT = None
-        sp._WEG2_PARK_ON = None
+        sp._PDFLIP_CHUNK_ADMIT = None
+        sp._PDFLIP_PARK_ON = None
 
     testcase.addCleanup(_reset)
 
@@ -369,7 +369,7 @@ def _adder(available=10**7):
 
 
 def _mreq(*, device_prefix):
-    """weg2-130-2092 at ``add_one_req``: TP0 host-backed (0 device rows),
+    """pdflip-130-2092 at ``add_one_req``: TP0 host-backed (0 device rows),
     a worker with the followed depth."""
     req = MagicMock(spec=Req)
     req.rid = RID
@@ -435,7 +435,7 @@ def _host_stale_record():
 class TestH105VerdictCarriesTheRefusal(unittest.TestCase):
     def setUp(self):
         _reset_module_state()
-        _isolate_weg2_group(self)
+        _isolate_pdflip_group(self)
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     def test_every_rank_keeps_the_request_queued(self):

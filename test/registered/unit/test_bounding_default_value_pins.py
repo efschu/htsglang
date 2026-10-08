@@ -24,9 +24,9 @@ rather than left as an absence.
 
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -46,14 +46,14 @@ class BoundingDefaultValuePinTest(CustomTestCase):
 
         The value is NOT changed here. Deriving the right one is a per-rank-role
         question (#505-C-03) and needs the measurement, not a desk edit -- and
-        the feature is opt-in (SGLANG_MEASURED_KV_BUDGET defaults False), which
+        the feature is opt-in (FLLIPER_MEASURED_KV_BUDGET defaults False), which
         is why it is a backlog item rather than an incident. The pin exists so
         the next person to touch this number meets the contradiction.
         """
         self.assertEqual(
-            str(envs.SGLANG_MEASURED_KV_BUDGET_SAFETY_MIB.get()),
+            str(envs.FLLIPER_MEASURED_KV_BUDGET_SAFETY_MIB.get()),
             "400",
-            "SGLANG_MEASURED_KV_BUDGET_SAFETY_MIB changed. It is a DESK value "
+            "FLLIPER_MEASURED_KV_BUDGET_SAFETY_MIB changed. It is a DESK value "
             "that the measurement at model_runner_kv_cache_mixin.py:809-815 "
             "already contradicts (10k prefill ~1 GiB, 50k ~2-3.5 GiB on the "
             "draft-solo host). Deriving it per rank role is #505-C-03",
@@ -75,9 +75,9 @@ class BoundingDefaultValuePinTest(CustomTestCase):
         off, nothing".
         """
         self.assertEqual(
-            envs.SGLANG_GGUF_STREAM_TRIM_SOFT_GIB.get(),
+            envs.FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB.get(),
             0.0,
-            "SGLANG_GGUF_STREAM_TRIM_SOFT_GIB is no longer 0.0. Arming it is "
+            "FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB is no longer 0.0. Arming it is "
             "the right direction (#505-C-02) but the value needs the measured "
             "stream slew behind it, not a desk number -- update this pin with "
             "the measurement in the same change",
@@ -101,9 +101,9 @@ class BoundingDefaultValuePinTest(CustomTestCase):
         when it exists (``gguf_shards.ProgressCoupledTrim._effective_target``).
         """
         self.assertEqual(
-            envs.SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB.get(),
+            envs.FLLIPER_GGUF_STREAM_TRIM_HEADROOM_GIB.get(),
             0.0,
-            "SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB is no longer 0.0. It is the "
+            "FLLIPER_GGUF_STREAM_TRIM_HEADROOM_GIB is no longer 0.0. It is the "
             "only policy term in the #537 trim budget; arming it needs the "
             "measured load-time read-ahead working set, not a desk number -- "
             "record the measurement in this pin in the same change",
@@ -115,7 +115,7 @@ class BoundingDefaultValuePinTest(CustomTestCase):
         than here, because that is where the reader who would change it looks.
         This test only asserts the two have not drifted apart.
         """
-        self.assertEqual(envs.SGLANG_RETRACT_SOLO_OOM_MAX_RETRIES.get(), 8)
+        self.assertEqual(envs.FLLIPER_RETRACT_SOLO_OOM_MAX_RETRIES.get(), 8)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ bit-for-bit.
 import os
 import unittest
 
-from sglang.srt.uneven_perf import (
+from flliper.srt.uneven_perf import (
     PerfCostModel,
     PlanInputs,
     _attn_candidates,
@@ -39,8 +39,8 @@ from sglang.srt.uneven_perf import (
     _cand_vectors,
     _mlp_candidates,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 

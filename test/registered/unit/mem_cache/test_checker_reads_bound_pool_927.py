@@ -50,7 +50,7 @@ Hermetic: two real allocators over one id space, a real cache, real
 ``read_free_rows``. No CUDA.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -58,14 +58,14 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams
-from sglang.srt.mem_cache.kv_row_ownership import read_free_rows
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.mem_cache.base_prefix_cache import InsertParams
+from flliper.srt.mem_cache.kv_row_ownership import read_free_rows
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
@@ -163,7 +163,7 @@ class TheCheckerFollowsTheRebind927(CustomTestCase):
         """Wiring: the fix is inert unless the construction passes it."""
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler.init_invariant_checker)
         self.assertIn("get_token_to_kv_pool_allocator=", src)

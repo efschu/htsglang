@@ -7,16 +7,16 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.utils.common import Range
+from flliper.srt.distributed.parallel_state_wrapper import ParallelState
+from flliper.srt.managers.schedule_batch import NextBatchPlan, Req
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.chunk_cache import ChunkCache
+from flliper.srt.utils.common import Range
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -156,8 +156,8 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.req_to_token_pool = tree_cache.req_to_token_pool
     s.congruent_prefill_lane = None
     # H18 STUB DRIFT: `stash_chunked_request` hands the tail capture the page
-    # size and the forward stream (weg2/tail_handoff.capture_state); a plain
-    # (non-weg2) request never captures, so any values do.
+    # size and the forward stream (pdflip/tail_handoff.capture_state); a plain
+    # (non-pdflip) request never captures, so any values do.
     s.page_size = tree_cache.page_size
     s.forward_stream = None
     # #815 STUB DRIFT: `get_next_batch_to_run` grew a `self.ps.pp_size` read

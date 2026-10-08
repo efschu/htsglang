@@ -82,7 +82,7 @@ PY
   echo "--- posten1/fp8: two-card FP8 lane, host cuda:$BIG part cuda:$SMALL0"
 
   cd "$WT" || exit 1
-  setsid "$PY" -m sglang.launch_server \
+  setsid "$PY" -m flliper.launch_server \
     --model-path "$MODEL" --tokenizer-path "$MODEL" \
     --tp-size 2 --rank-gpu-id "$BIG,$SMALL0" \
     --rank-tp-ratio 6,1 --rank-gpu-memory-mib 27000,9500 \

@@ -37,8 +37,8 @@ depends on it staying live, and a fix that quietly disabled the rung would
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -58,7 +58,7 @@ def _relief(
     live_max=None,
 ):
     """A rung carrying only what these methods read (the #717 idiom)."""
-    from sglang.srt.managers import kv_backing_relief as m
+    from flliper.srt.managers import kv_backing_relief as m
 
     r = m.KvBackingRelief.__new__(m.KvBackingRelief)
     r._pool = type("P", (), {"page_size": 1})()
@@ -184,7 +184,7 @@ class TestTheArmedGate(CustomTestCase):
     """Line 2: refuse while armed, and ONLY while armed."""
 
     def setUp(self):
-        import sglang.srt.managers.kv_radix_watermark as w
+        import flliper.srt.managers.kv_radix_watermark as w
 
         self._w_orig = w.evictable_rows_above
         w.evictable_rows_above = lambda tree, floor: (50_000, 1)
@@ -198,7 +198,7 @@ class TestTheArmedGate(CustomTestCase):
         w.evict_rows_above = _spy
 
     def tearDown(self):
-        import sglang.srt.managers.kv_radix_watermark as w
+        import flliper.srt.managers.kv_radix_watermark as w
 
         w.evictable_rows_above = self._w_orig
         w.evict_rows_above = self._e_orig
@@ -323,7 +323,7 @@ class TestTheChannelsAreActuallyWired(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.managers import kv_backing_relief as m
+        from flliper.srt.managers import kv_backing_relief as m
 
         tree = ast.parse(inspect.getsource(m))
         for node in ast.walk(tree):
@@ -386,7 +386,7 @@ class TestBothLinesTogether(CustomTestCase):
     def test_neither_line_reproduces_the_specimen(self):
         """CAN-FAIL for the pair: with both removed, the bug is back."""
         r = _relief({"req_max": -1, "req_rows": 0}, pending=None, armed=None)
-        import sglang.srt.managers.kv_radix_watermark as w
+        import flliper.srt.managers.kv_radix_watermark as w
 
         orig_e, orig_v = w.evict_rows_above, w.evictable_rows_above
         w.evictable_rows_above = lambda tree, floor: (50_000, 1)

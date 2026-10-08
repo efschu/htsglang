@@ -16,7 +16,7 @@ properties the boot reading depends on:
 * a raised forward leaves no half line behind.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -25,9 +25,9 @@ import re
 import unittest
 from unittest import mock
 
-from sglang.srt.environ import envs
-from sglang.srt.layers import fwd_timeline as ft
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.layers import fwd_timeline as ft
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Ev:
@@ -121,7 +121,7 @@ class TestFwdTimeline(CustomTestCase):
         return spent
 
     def test_segments_sum_to_total_and_land_in_their_class(self):
-        with envs.SGLANG_WEG2_PREFILL_TIMING.override(True):
+        with envs.FLLIPER_PDFLIP_PREFILL_TIMING.override(True):
             self.assertTrue(ft.begin_if_timed(forward_mode=_Mode(True), tokens=16384, layers=29))
             spent = self._one_layer_forward()
             ft.fwd_end()
@@ -145,7 +145,7 @@ class TestFwdTimeline(CustomTestCase):
         self.assertEqual(set(_fields(line)), set(ft.LABELS) | {"total"})
 
     def test_switch_off_creates_no_event(self):
-        with envs.SGLANG_WEG2_PREFILL_TIMING.override(False):
+        with envs.FLLIPER_PDFLIP_PREFILL_TIMING.override(False):
             self.assertFalse(ft.begin_if_timed(forward_mode=_Mode(True), tokens=8, layers=1))
             self._seg("dense", 1.0)
             ft.fwd_end()
@@ -153,19 +153,19 @@ class TestFwdTimeline(CustomTestCase):
         self.assertEqual(self.lines, [])
 
     def test_decode_or_verify_is_not_timed(self):
-        with envs.SGLANG_WEG2_PREFILL_TIMING.override(True):
+        with envs.FLLIPER_PDFLIP_PREFILL_TIMING.override(True):
             self.assertFalse(ft.begin_if_timed(forward_mode=_Mode(False), tokens=1, layers=29))
             self._seg("moe_plan", 1.0)
         self.assertEqual(self.clock.made, 0)
 
     def test_unknown_label_raises(self):
-        with envs.SGLANG_WEG2_PREFILL_TIMING.override(True):
+        with envs.FLLIPER_PDFLIP_PREFILL_TIMING.override(True):
             ft.begin_if_timed(forward_mode=_Mode(True), tokens=8, layers=1)
             with self.assertRaises(ValueError):
                 ft.fwd_mark("moe_fetchh")
 
     def test_aborted_forward_leaves_no_line(self):
-        with envs.SGLANG_WEG2_PREFILL_TIMING.override(True):
+        with envs.FLLIPER_PDFLIP_PREFILL_TIMING.override(True):
             ft.begin_if_timed(forward_mode=_Mode(True), tokens=8, layers=1)
             self._seg("dense", 3.0)
             ft.fwd_abort()

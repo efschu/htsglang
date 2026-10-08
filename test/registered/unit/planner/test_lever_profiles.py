@@ -11,7 +11,7 @@ and the reported figure IS the ranked one -- and these tests keep it holding.
 The second thing pinned is the refusal discipline. A figure that cannot be
 computed comes back absent WITH a reason; it never comes back as zero, and it
 never comes back as a plausible-looking constant. The registry convention
-(:mod:`sglang.srt.planner.tooltips`) is the same one, and its coverage test
+(:mod:`flliper.srt.planner.tooltips`) is the same one, and its coverage test
 lives next door.
 
 The rig and the model are the reference ones: Qwen3.6-27B FP8 geometry on the
@@ -23,10 +23,10 @@ import json
 import os
 import tempfile
 
-from sglang.srt.planner import lever_profiles as lp
-from sglang.srt.planner import webui
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import lever_profiles as lp
+from flliper.srt.planner import webui
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -143,7 +143,7 @@ class TestShape(ProfileFixture):
         )
 
     def test_session_target_and_its_options_come_from_the_balance_module(self):
-        from sglang.srt.planner import mrr_balance
+        from flliper.srt.planner import mrr_balance
 
         d = self._report()
         self.assertEqual(
@@ -329,7 +329,7 @@ class TestTooltips(CustomTestCase):
     """The control's hover text lives in the one registry, like every other."""
 
     def test_every_stop_and_the_slider_are_covered(self):
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
 
         want = ["lever_profile.slider"] + [
             "lever_profile." + k for k in lp.PROFILE_KEYS
@@ -340,7 +340,7 @@ class TestTooltips(CustomTestCase):
             self.assertIn("Costs:", txt)
 
     def test_a_stop_that_points_at_a_study_says_when_it_has_not_run(self):
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
 
         txt = tipsmod.describe("lever_profile.max_prefill", measurements={})
         self.assertIn("Not measured on this rig", txt)
@@ -381,7 +381,7 @@ class TestFrontend(CustomTestCase):
         self.assertIn("if(row.tune) applyTune(row.tune)", js)
 
     def test_the_page_holds_no_copy_of_the_profile_text(self):
-        from sglang.srt.planner import tooltips as tipsmod
+        from flliper.srt.planner import tooltips as tipsmod
 
         js = self._js()
         for key in ["lever_profile.slider"] + [

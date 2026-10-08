@@ -13,14 +13,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention_reference
-from sglang.srt.layers.attention.qsa.sparse_attn import qwen_sparse_kv_extraction_compact_triton
-from sglang.srt.layers.attention.qsa.sparse_attn import (
+from flliper.srt.layers.attention.qsa.kernel import qsa_sparse_attention_reference
+from flliper.srt.layers.attention.qsa.sparse_attn import qwen_sparse_kv_extraction_compact_triton
+from flliper.srt.layers.attention.qsa.sparse_attn import (
     merge_partial_attention,
     sparse_attn_rows_reference,
     sparse_attn_rows_triton,
 )
-from sglang.srt.layers.dcp.owner import dcp_weighted_read_slots
+from flliper.srt.layers.dcp.owner import dcp_weighted_read_slots
 
 TQ, HQ, HKV, D, N, TOPK = 5, 6, 2, 32, 64, 8
 
@@ -88,7 +88,7 @@ def test_owned_partials_merge_to_the_full_attention():
 
 
 def _backend(dcp_size=1, weighted=False, ratios=(3, 1), rank=0):
-    from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+    from flliper.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 
     b = QwenSparseAttnBackend(runner=None)
     assert b.dcp_size == 1  # no runner: DCP off, identity mapping
@@ -130,7 +130,7 @@ def test_backend_write_is_masked_to_the_owned_rows_under_dcp():
 
 
 def test_exports():
-    from sglang.srt.layers.attention.qsa import sparse_attn as m
+    from flliper.srt.layers.attention.qsa import sparse_attn as m
 
     assert {"sparse_attn_rows_triton", "sparse_attn_rows_reference", "merge_partial_attention"} <= set(m.__all__)
 
@@ -157,8 +157,8 @@ def test_backend_is_a_valid_owner_bounds_consumer(monkeypatch):
     """The owner-bounds registry (layers/dcp/owner.py) refuses a consumer
     without refresh_dcp_owner_bounds(); fn1v (2026-09-16) died at backend
     init on exactly that. The refresh re-derives the bounds."""
-    from sglang.srt.layers.dcp import owner
-    from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+    from flliper.srt.layers.dcp import owner
+    from flliper.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 
     b = _backend(2, True, (3, 1), rank=1)
     assert callable(getattr(b, "refresh_dcp_owner_bounds", None))
@@ -174,14 +174,14 @@ def test_init_dcp_runs_end_to_end_the_way_the_server_builds_it(monkeypatch):
     """The whole _init_dcp path with a fake parallel state (DCP 3, weighted,
     replicated kv), including the owner-bounds registry -- the site fn1v
     (2026-09-16) died at."""
-    import sglang.srt.runtime_context as rc
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
-    from sglang.srt.layers.dcp import owner
+    import flliper.srt.runtime_context as rc
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
+    from flliper.srt.layers.dcp import owner
 
     monkeypatch.setattr(rc, "get_parallel", lambda: SimpleNamespace(attn_dcp_size=3, attn_dcp_rank=1, attn_tp_size=3))
-    monkeypatch.setattr("sglang.srt.distributed.utils.uneven_dcp_kv_replicated", lambda n: True)
-    monkeypatch.setattr("sglang.srt.distributed.utils.uneven_dcp_active", lambda n: True)
-    monkeypatch.setattr("sglang.srt.distributed.utils.attn_kv_replicated", lambda tp, kv: True)
+    monkeypatch.setattr("flliper.srt.distributed.utils.uneven_dcp_kv_replicated", lambda n: True)
+    monkeypatch.setattr("flliper.srt.distributed.utils.uneven_dcp_active", lambda n: True)
+    monkeypatch.setattr("flliper.srt.distributed.utils.attn_kv_replicated", lambda tp, kv: True)
     monkeypatch.setattr(owner, "dcp_weighted_owner_bounds", lambda size, rank: (64, 39, 52, 13))
     cfg = SimpleNamespace(get_total_num_kv_heads=lambda: 2, hf_text_config=None, hf_config=None, context_len=32768)
     b = qb.QwenSparseAttnBackend(runner=SimpleNamespace(model_config=cfg, is_draft_worker=False))
@@ -196,7 +196,7 @@ def test_fp8_byte_decode_matches_torch_for_every_code():
     """The rows kernel loads an fp8 pool as bytes and decodes them itself
     (Triton has no fp8e4nv on sm86 -- the 3080 ranks died at compile in
     fn1w). Same arithmetic, pinned against torch's conversion for all 256."""
-    from sglang.srt.layers.attention.qsa.sparse_attn import fp8_e4m3_bytes_to_f32_reference
+    from flliper.srt.layers.attention.qsa.sparse_attn import fp8_e4m3_bytes_to_f32_reference
 
     codes = torch.arange(256, dtype=torch.uint8)
     ref = codes.view(torch.float8_e4m3fn).float()
@@ -209,10 +209,10 @@ def test_fp8_byte_decode_matches_torch_for_every_code():
 def test_attend_rows_returns_the_query_dtype_after_the_merge(monkeypatch):
     """fn1x (2026-09-16): the group merge computes in fp32 and returned fp32;
     o_proj then refused 'float != BFloat16' on every rank."""
-    import sglang.srt.runtime_context as rc
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
-    from sglang.srt.layers.attention.qsa import sparse_attn as sa
-    from sglang.srt.layers.dcp import comm
+    import flliper.srt.runtime_context as rc
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
+    from flliper.srt.layers.attention.qsa import sparse_attn as sa
+    from flliper.srt.layers.dcp import comm
 
     b = _backend(2, True, (3, 1), rank=0)
     pool = SimpleNamespace(get_key_buffer=lambda i: "k", get_value_buffer=lambda i: "v")
@@ -256,7 +256,7 @@ def test_rows_path_is_the_decode_path_on_every_rank_fn5e():
     """fn5e: the paged FA4-cute fallback failed to build on a 3080 PP stage;
     decode and the non-DCP extend branch route through the rows kernel."""
     import inspect
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
     assert qb._qsa_rows_path_armed()
     dec = inspect.getsource(qb.QwenSparseAttnBackend.forward_decode)
     assert "_qsa_rows_path_armed() and q.is_cuda" in dec
@@ -269,7 +269,7 @@ def test_graph_rows_resolve_through_req_to_token_not_the_capture_dummy_table():
     """fn3q 19.09.: under a CUDA graph the metadata's token_slot_table is the
     (rows, 1) capture dummy; the rows path must read req_to_token through the
     replay-refreshed row_req_pool_indices, and land on the eager table's slots."""
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
 
     b = _backend()
     n_req, width = 4, 16

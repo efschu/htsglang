@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers import nan_guard as ng
+from flliper.srt.layers import nan_guard as ng
 
 
 def test_off_costs_nothing_and_on_logs_first_hit_per_layer(monkeypatch, caplog):

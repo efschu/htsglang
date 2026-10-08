@@ -10,16 +10,16 @@ Der Planner hat den richtigen Zweig ("Hot residency: resident == frozen id
 set at its assigned slot") -- er bekam die Menge nur nie.
 """
 
-from sglang.srt.layers.moe.expert_offload import ExpertResidencyPlanner
+from flliper.srt.layers.moe.expert_offload import ExpertResidencyPlanner
 
 
-def test_statisch_ohne_ids_bleibt_wie_bisher():
+def test_static_without_ids_unchanged():
     p = ExpertResidencyPlanner(num_local_experts=512, resident_count=188, scratch=32)
     hot, cold = p.split_needed(list(range(180, 200)))
     assert hot == list(range(180, 188)) and cold == list(range(188, 200))
 
 
-def test_mit_hotset_zaehlen_die_ids_nicht_die_ersten_R():
+def test_with_hotset_ids_count_not_first_r():
     """Id 370 ist resident, obwohl sie weit ueber resident_count liegt --
     genau der Fall, an dem w22 starb."""
     ids = frozenset(list(range(0, 92)) + list(range(183, 229)) + list(range(320, 370)))
@@ -32,7 +32,7 @@ def test_mit_hotset_zaehlen_die_ids_nicht_die_ersten_R():
     assert 250 in cold and 370 in cold and 400 in cold
 
 
-def test_kein_residenter_landet_im_scratch():
+def test_no_resident_lands_in_scratch():
     """Die Eigenschaft, die der IndexError verletzt hat: was resident ist,
     geht NIE in den Scratch -- egal wie gross seine Id ist."""
     ids = frozenset({0, 91, 183, 369})

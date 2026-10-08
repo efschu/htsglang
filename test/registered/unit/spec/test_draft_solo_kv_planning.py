@@ -19,9 +19,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.distributed.utils import set_cp_token_ratios, set_tp_partition_ratios
-from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.distributed.utils import set_cp_token_ratios, set_tp_partition_ratios
+from flliper.srt.runtime_context import get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -68,7 +68,7 @@ class TestSoloDraftKvCellFactor(unittest.TestCase):
         set_tp_partition_ratios(None)
 
     def _factor(self, mr, *, dcp_size=3, tp_size=3):
-        from sglang.srt.model_executor.pool_configurator import (
+        from flliper.srt.model_executor.pool_configurator import (
             solo_draft_kv_cell_factor,
         )
 
@@ -157,7 +157,7 @@ class TestApplySoloDraftKvCellFactor(unittest.TestCase):
         set_tp_partition_ratios(None)
 
     def _apply(self, mr, target_cell, cell_with_draft, *, dcp_size=3):
-        from sglang.srt.model_executor.pool_configurator import (
+        from flliper.srt.model_executor.pool_configurator import (
             apply_solo_draft_kv_cell_factor,
         )
 
@@ -213,34 +213,34 @@ class TestDcpVerifySpecInputTypes(unittest.TestCase):
     """The uneven-DCP target-verify branch must cover DFLASH as well as EAGLE."""
 
     def test_both_verify_types_are_covered(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             _DCP_VERIFY_SPEC_INPUT_TYPES,
         )
-        from sglang.srt.speculative.spec_info import SpecInputType
+        from flliper.srt.speculative.spec_info import SpecInputType
 
         self.assertIn(SpecInputType.EAGLE_VERIFY, _DCP_VERIFY_SPEC_INPUT_TYPES)
         self.assertIn(SpecInputType.DFLASH_VERIFY, _DCP_VERIFY_SPEC_INPUT_TYPES)
 
     def test_draft_only_types_are_not_covered(self):
         """Draft-side / non-verify spec inputs must keep the old branch."""
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             _DCP_VERIFY_SPEC_INPUT_TYPES,
         )
-        from sglang.srt.speculative.spec_info import SpecInputType
+        from flliper.srt.speculative.spec_info import SpecInputType
 
         self.assertNotIn(SpecInputType.EAGLE_DRAFT, _DCP_VERIFY_SPEC_INPUT_TYPES)
 
     def test_dflash_verify_is_a_linear_chain(self):
         """The DCP split plans the ragged draft->draft block as plain CAUSAL.
         That is only correct because DFLASH verify is non-tree (topk == 1)."""
-        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+        from flliper.srt.speculative.dflash_info import DFlashVerifyInput
 
         self.assertEqual(DFlashVerifyInput.topk, 1)
 
     def test_flashinfer_skips_the_dflash_verify_custom_mask(self):
         """...and because flashinfer gets no DFLASH custom mask, so the paged
         prefix read stays non-causal exactly as in the EAGLE branch."""
-        from sglang.srt.speculative.dflash_utils import (
+        from flliper.srt.speculative.dflash_utils import (
             resolve_dflash_verify_mask_policy,
         )
 

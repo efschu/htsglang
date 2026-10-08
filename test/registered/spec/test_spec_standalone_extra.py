@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.server_fixtures.standalone_fixture import StandaloneServerBase
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.server_fixtures.standalone_fixture import StandaloneServerBase
+from flliper.test.test_utils import CustomTestCase
 
 # Non-V2 standalone speculative decoding tests (FA3, Triton, FlashInfer
 # backends). Sibling V2 classes stay per-commit in test_spec_standalone.py.

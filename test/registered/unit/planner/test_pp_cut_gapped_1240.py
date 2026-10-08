@@ -26,11 +26,11 @@ from unittest import mock
 import pytest
 
 try:
-    from sglang.srt.distributed.utils import (
+    from flliper.srt.distributed.utils import (
         PP_GAPPED_KNOWN_WRONG_ENV,
         pp_gapped_forward_known_wrong_allowed,
     )
-    from sglang.srt.planner.pp_cut import (
+    from flliper.srt.planner.pp_cut import (
         LAYER_FAMILY_ATTENTION,
         LAYER_FAMILY_LINEAR,
         FamilyDepthCost,
@@ -49,8 +49,8 @@ try:
         layer_set_flag,
         pp_phase_pool,
     )
-    from sglang.srt.planner.pp_cut_launch import PPCutRefused, solve_launch_cut
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.srt.planner.pp_cut_launch import PPCutRefused, solve_launch_cut
+    from flliper.test.ci.ci_register import register_cpu_ci
 except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
     pytest.skip(
         f"#249 default-device collection leak broke the import chain: {_import_err}",

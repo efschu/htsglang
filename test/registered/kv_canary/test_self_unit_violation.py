@@ -6,17 +6,17 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.consts import FailReason
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
-from sglang.srt.kv_canary.config import CanaryMode
-from sglang.srt.kv_canary.runner import violation_reporter as violation_reporter_module
-from sglang.srt.kv_canary.runner.violation_reporter import (
+from flliper.jit_kernel.kv_canary import consts
+from flliper.jit_kernel.kv_canary.consts import FailReason
+from flliper.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from flliper.srt.kv_canary.config import CanaryMode
+from flliper.srt.kv_canary.runner import violation_reporter as violation_reporter_module
+from flliper.srt.kv_canary.runner.violation_reporter import (
     ViolationReporter,
     _format_violation,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, suite="extra-a-test-1-gpu-small-amd")

@@ -9,7 +9,7 @@ graph and replayed with fresh inputs. Static and frozen-hot-set layouts.
 
 Context (measured on the 35B validation vehicle, 2026-07-19): an end-to-end
 captured-decode vs eager-decode server comparison can NOT reach machine-zero on
-stock sglang -- at fraction=1.0 with no offload code active at all, graph vs
+stock flliper -- at fraction=1.0 with no offload code active at all, graph vs
 eager already shows an argmax-token logprob Δ of ~3.4e-2 (capture-gated
 dual-stream branches in qwen2_moe/qwen3_5 + capture-context kernel selection).
 This test therefore pins the Δ=0 claim where it is provable: the Stage-3
@@ -26,7 +26,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     ExpertResidencyPlanner,
     build_capturable_luts,
     device_view_of_pinned,

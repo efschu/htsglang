@@ -351,7 +351,7 @@ def test_no_matrix_row_claims_spec_vs_nospec_token_identity():
 
 
 def _dump_record(accept_lens, bs=1, d=4, vocab=VOCAB):
-    """A record in the shape sglang.srt.speculative.spec_verify_dump writes."""
+    """A record in the shape flliper.srt.speculative.spec_verify_dump writes."""
     logits = torch.zeros(bs * d, vocab, dtype=torch.float32)
     for r in range(bs * d):
         logits[r, (r + 3) % vocab] = 5.0

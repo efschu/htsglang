@@ -32,15 +32,15 @@ FIXTURE_TREE = os.path.join(HERE, "fixtures", "kartenplan", "planner_tree", "pyt
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 REPO_PY = os.path.join(REPO_ROOT, "python")
 REPO_CATALOG = os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json")
-PLANER_FIX = os.path.join(REPO_ROOT, "test", "registered", "unit", "weg2", "fixtures", "planer_1006")
-REPLAY_REF = os.path.join(REPO_ROOT, "test", "registered", "unit", "weg2", "fixtures", "xchg_launch_replay_0911", "nvml_devices_1378.json")
+PLANER_FIX = os.path.join(REPO_ROOT, "test", "registered", "unit", "pdflip", "fixtures", "planer_1006")
+REPLAY_REF = os.path.join(REPO_ROOT, "test", "registered", "unit", "pdflip", "fixtures", "xchg_launch_replay_0911", "nvml_devices_1378.json")
 CENSUS_27B = "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json"
 #: line probes (module / function exists in the tree under test, never a sha or a branch name): the Dual form (dual_green.py) marks the 27B launcher
 #: line; the NF line re-stages the P-card reference at N != 3 (AP2 1006, ``launcher._restage_p_card_reference``), the 27B line refuses W167
-DUAL_LINE = os.path.isfile(os.path.join(REPO_ROOT, "python", "sglang", "srt", "weg2", "dual_green.py"))
+DUAL_LINE = os.path.isfile(os.path.join(REPO_ROOT, "python", "flliper", "srt", "pdflip", "dual_green.py"))
 def _launcher_defines(name):
     try:
-        with open(os.path.join(REPO_ROOT, "python", "sglang", "srt", "weg2", "launcher.py"), encoding="utf-8") as fh:
+        with open(os.path.join(REPO_ROOT, "python", "flliper", "srt", "pdflip", "launcher.py"), encoding="utf-8") as fh:
             return ("\ndef %s(" % name) in fh.read()
     except OSError:
         return False
@@ -56,9 +56,9 @@ PROFILE_OWNER="the owner"
 PROFILE_CARD_COUNT=3
 PROFILE_INVENTORY=RTX5090,RTX3080,RTX3080
 PROFILE_ARGS=(--model /m --p-bs 2 --pp-stage-ratio 29,11,8 --pp-attn-stage-ratio 8,4,4 --p-hostgap
-              "--extra-p=--rank-moe-ratio 183,137,168" --env-p "SGLANG_MOE_SCRATCH_SLOTS=74,48,48")
+              "--extra-p=--rank-moe-ratio 183,137,168" --env-p "FLLIPER_MOE_SCRATCH_SLOTS=74,48,48")
 profile_form_env() {
-  _form SGLANG_WEG2_OWNED_BASE stated
+  _form FLLIPER_PDFLIP_OWNED_BASE stated
 }
 """
 
@@ -69,8 +69,8 @@ RIG = [{"card": "rtx3080-20", "pcie": {"gen": 4, "lanes": 4}}, {"card": "rtx5090
 class FakeOracle:
     """Stand-in for ``OracleService``: records the requests, answers with a canned document (or an error)."""
 
-    def __init__(self, verdikt=None, error=None, propose=None):
-        self.verdikt, self.error, self.propose, self.calls = verdikt, error, propose, []
+    def __init__(self, budget_verdict=None, error=None, propose=None):
+        self.budget_verdict, self.error, self.propose, self.calls = budget_verdict, error, propose, []
 
     def ask(self, kind, req, parts):
         self.calls.append((kind, req, parts))
@@ -78,7 +78,7 @@ class FakeOracle:
             return {"ok": False, "error": self.error}
         if kind == "propose":
             return dict(copy.deepcopy(self.propose), ok=True, cached=False, cache_key="prop123")
-        return {"ok": True, "verdikt": copy.deepcopy(self.verdikt), "cached": False, "cache_key": "abc123"}
+        return {"ok": True, "verdikt": copy.deepcopy(self.budget_verdict), "cached": False, "cache_key": "abc123"}
 
 
 def _v(code, **kw):
@@ -88,8 +88,8 @@ def _v(code, **kw):
     return d
 
 
-def _doc(verdikte, ausgang="geht_mit_force", **kw):
-    d = {"schema": "flliper.verdikt/1", "n": 3, "verdikte": verdikte, "ausgang": ausgang, "geht": ausgang == "geht", "geht_mit_force": ausgang != "absturz",
+def _doc(rank_verdicts, ausgang="geht_mit_force", **kw):
+    d = {"schema": "flliper.verdikt/1", "n": 3, "verdikte": rank_verdicts, "ausgang": ausgang, "geht": ausgang == "geht", "geht_mit_force": ausgang != "absturz",
          "forced": [], "plan": {}, "zaehlung": {}, "profil": {"datei_sha256": "f" * 64, "eingabe_sha256": "e" * 64}, "argv_sha256": "a" * 64,
          "orakel": {"dauer_s": 1.5, "version": {"launcher": "x"}, "laeufe": 1, "notizen": ["note from the oracle"]}}
     d.update(kw)
@@ -120,7 +120,7 @@ class DryRunWithOracle(unittest.TestCase):
 
     def test_the_return_format_is_kept_and_new_fields_are_added(self):
         orc = FakeOracle(_doc([]), )
-        orc.verdikt = _doc([], ausgang="geht")
+        orc.budget_verdict = _doc([], ausgang="geht")
         _ed, d = self._run(orc)
         for k in ("ok", "goes", "verdict", "rejections", "notes", "cards", "force_note", "reference"):          # profil.py:655-669 of the base
             self.assertIn(k, d)
@@ -165,7 +165,7 @@ class DryRunWithOracle(unittest.TestCase):
 
     def test_a_crash_of_the_launcher_is_a_verdict_not_a_route_error(self):
         crash = _v("ORAKEL-ABSTURZ", ebene="absturz", forcebar=None, force_state="blockiert", durchgelassen=False, exc_type="IndexError",
-                   wo="<TREE>/python/sglang/srt/weg2/launcher.py:15326 in f", text="IndexError: list index out of range (<TREE>/python/sglang/srt/weg2/launcher.py:15326 in f)")
+                   wo="<TREE>/python/flliper/srt/pdflip/launcher.py:15326 in f", text="IndexError: list index out of range (<TREE>/python/flliper/srt/pdflip/launcher.py:15326 in f)")
         _ed, d = self._run(FakeOracle(_doc([_v("HW-COUNT"), crash], ausgang="absturz")), RIG[:2] + RIG[:2])
         by = {q["code"]: q for q in d["rejections"]}
         a = by["ORAKEL-ABSTURZ"]
@@ -185,7 +185,7 @@ class DryRunWithOracle(unittest.TestCase):
         self.assertIn("W19", q["source"])
 
     def test_oracle_cannot_ask_falls_back_to_the_planner_gate_with_a_note(self):
-        _ed, d = self._run(FakeOracle(error="Python of the sglang environment is missing: /nowhere"), RIG[:2])
+        _ed, d = self._run(FakeOracle(error="Python of the flliper environment is missing: /nowhere"), RIG[:2])
         self.assertEqual(d["quelle"], "gate")
         self.assertNotIn("orakel", d)
         self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= {q["code"] for q in d["rejections"]})
@@ -200,8 +200,8 @@ class DryRunWithOracle(unittest.TestCase):
         self.assertEqual(d2["quelle"], "gate")
 
     def test_an_oracle_that_could_not_ask_is_not_a_verdict(self):
-        fehler = _v("ORAKEL-FEHLER", ebene="orakel", forcebar=None, force_state="blockiert", text="OSError: scratch dir not writable")
-        _ed, d = self._run(FakeOracle(_doc([fehler], ausgang="orakel_fehler")), RIG[:2])
+        errors = _v("ORAKEL-FEHLER", ebene="orakel", forcebar=None, force_state="blockiert", text="OSError: scratch dir not writable")
+        _ed, d = self._run(FakeOracle(_doc([errors], ausgang="orakel_fehler")), RIG[:2])
         self.assertEqual(d["quelle"], "gate")
         self.assertNotIn("ORAKEL-FEHLER", [q["code"] for q in d["rejections"]])
         self.assertTrue(any("could not be asked" in n and "scratch dir" in n for n in d["notes"]))
@@ -284,7 +284,7 @@ class OracleServiceCache(unittest.TestCase):
 
     def test_a_changed_source_of_the_oracle_is_another_key(self):
         with tempfile.TemporaryDirectory() as d:
-            w = os.path.join(d, "sglang", "srt", "weg2")
+            w = os.path.join(d, "flliper", "srt", "pdflip")
             os.makedirs(w)
             for n in ORA.SOURCES:
                 with open(os.path.join(w, n), "w") as fh:
@@ -410,8 +410,8 @@ class ProposeRequests(unittest.TestCase):
         self.assertEqual(dk("--d-bs"), "flag:--d-bs")
         self.assertEqual(dk("--extra-d --rank-moe-ratio"), "extra:D:--rank-moe-ratio")
         self.assertEqual(dk("--extra-p --pp-stage-ratio"), "extra:P:--pp-stage-ratio")
-        self.assertEqual(dk("--env-p SGLANG_MOE_SCRATCH_SLOTS"), "env:P:SGLANG_MOE_SCRATCH_SLOTS")
-        self.assertEqual(dk("env SGLANG_WEG2_L15_MIB"), "export:SGLANG_WEG2_L15_MIB")
+        self.assertEqual(dk("--env-p FLLIPER_MOE_SCRATCH_SLOTS"), "env:P:FLLIPER_MOE_SCRATCH_SLOTS")
+        self.assertEqual(dk("env FLLIPER_PDFLIP_L15_MIB"), "export:FLLIPER_PDFLIP_L15_MIB")
         self.assertIsNone(dk("--pp-stage-ratio (Seed)"))
 
     def test_the_oracle_error_comes_back_as_ok_false(self):
@@ -424,11 +424,11 @@ class ProposeRequests(unittest.TestCase):
         self.assertIn("not mounted", r["error"])
 
 
-def _werte(*rows):
+def _values(*rows):
     out = []
-    for key, alt, wert, policy, zustand in rows:
-        out.append({"key": key, "group": "-", "policy": policy, "alt": alt, "wert": wert, "eintraege": 1, "zustand": zustand, "herkunft": "Herkunft von " + key,
-                    "grund": "Grund von " + key, "in_argv": wert is not None, "geaendert": alt != wert})
+    for key, alt, value, policy, zustand in rows:
+        out.append({"key": key, "group": "-", "policy": policy, "alt": alt, "wert": value, "eintraege": 1, "zustand": zustand, "herkunft": "Herkunft von " + key,
+                    "grund": "Grund von " + key, "in_argv": value is not None, "geaendert": alt != value})
     return out
 
 
@@ -437,9 +437,9 @@ class ProposeStartprofil(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="apd_")
-        werte = _werte(("--p-bs", "2", "3", "seats", "vorgeschlagen"),
+        werte = _values(("--p-bs", "2", "3", "seats", "vorgeschlagen"),
                        ("--extra-p --rank-moe-ratio", "183,137,168", "300,212", "moe_ratio", "unbelegt"),
-                       ("--env-p SGLANG_MOE_SCRATCH_SLOTS", "74,48,48", "74,48", "scratch", "unbelegt"),
+                       ("--env-p FLLIPER_MOE_SCRATCH_SLOTS", "74,48,48", "74,48", "scratch", "unbelegt"),
                        ("--pp-stage-ratio", "29,11,8", None, "cut", "unbelegt"),
                        ("--d-only", None, "", "form", "vorgeschlagen"),
                        ("--pp-stage-ratio (Seed)", None, "32,8", "cut_seed", "unbelegt"),
@@ -471,7 +471,7 @@ class ProposeStartprofil(unittest.TestCase):
         self.assertEqual(rows["flag:--p-bs"]["value"], "3")
         self.assertEqual(rows["flag:--p-bs"]["origin"], "planer")
         self.assertEqual(rows["extra:P:--rank-moe-ratio"]["value"], "300,212")
-        self.assertEqual(rows["env:P:SGLANG_MOE_SCRATCH_SLOTS"]["value"], "74,48")
+        self.assertEqual(rows["env:P:FLLIPER_MOE_SCRATCH_SLOTS"]["value"], "74,48")
         self.assertIn("flag:--d-only", rows)                                   # a flag the profile did not have
         self.assertNotIn("flag:--pp-stage-ratio", rows)                         # the value the proposal could not derive is removed, not invented
         self.assertEqual(rows["flag:--p-hostgap"]["origin"], "profil")          # untouched values keep their origin
@@ -604,7 +604,7 @@ class ProposeRoute(unittest.TestCase):
 
 @unittest.skipUnless(os.path.exists(CENSUS_27B) and os.path.isdir(REPO_PY), "the real oracle needs the rig box (census, models) and the planner tree")
 class RealOracle(unittest.TestCase):
-    """The REAL oracle: a child process with this checkout's sglang, the launcher dry run on a replayed inventory (16-18 s a run to the end)."""
+    """The REAL oracle: a child process with this checkout's flliper, the launcher dry run on a replayed inventory (16-18 s a run to the end)."""
 
     @classmethod
     def setUpClass(cls):
@@ -673,7 +673,7 @@ class RealOracle(unittest.TestCase):
         pv = [x for x in d["verdikte"] if x["code"] == "PROFILE-VECTORS"]
         self.assertEqual(len(pv), 1, [(x["code"]) for x in d["verdikte"]])
         self.assertIn("--rank-moe-ratio", pv[0]["werte"])
-        self.assertIn("SGLANG_MOE_SCRATCH_SLOTS", pv[0]["werte"])
+        self.assertIn("FLLIPER_MOE_SCRATCH_SLOTS", pv[0]["werte"])
         self.assertEqual(pv[0]["parent"], "HW-COUNT")
         self.assertNotEqual(d["orakel"]["ausgang"], "geht")
 

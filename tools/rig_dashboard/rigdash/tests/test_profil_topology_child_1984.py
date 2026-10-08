@@ -1,8 +1,8 @@
 """Auftrag 1984 (C): F2 sauber -- ``plan_topology`` im Kindprozess mit der Kopplungs-Python.
 
 Befund (Browsertest 1979, F2): der Trockenlauf mit N != 3 Karten rechnete ``topology.plan_topology`` im Dashboard-Prozess; fuer N != 3
-importiert es ``sglang.srt.weg2.weight_exchange_region`` -> ``No module named 'sglang'`` -> HTTP 500 bzw. (gepflastert) "nicht geprueft".
-Jetzt: der Kopplungs-Worker (Kindprozess mit der sglang-Umgebung) beantwortet ``{"what": "topology", "n": N}``; der Editor fragt ihn zuerst.
+importiert es ``flliper.srt.pdflip.weight_exchange_region`` -> ``No module named 'flliper'`` -> HTTP 500 bzw. (gepflastert) "nicht geprueft".
+Jetzt: der Kopplungs-Worker (Kindprozess mit der flliper-Umgebung) beantwortet ``{"what": "topology", "n": N}``; der Editor fragt ihn zuerst.
 Gepinnt:
 
 * Worker: ``refused`` traegt den Text einer TopologyRefused, ``None`` heisst "durchgelassen"; ein Import-Fehler im Kind ist ``ok: false``
@@ -30,21 +30,21 @@ from rigdash.tests import test_profil_930 as P9  # noqa: E402
 
 REAL_TREE = os.environ.get("COUPLINGS_TREE")
 
-#: ein Baum, in dem sglang importierbar ist (Stubs): topology verweigert N=5 (Wert-Ablehnung), N=9 (keine Topologie), wirft ImportError fuer N=7
+#: ein Baum, in dem flliper importierbar ist (Stubs): topology verweigert N=5 (Wert-Ablehnung), N=9 (keine Topologie), wirft ImportError fuer N=7
 STUB_FILES = {
-    "sglang/__init__.py": "",
-    "sglang/srt/__init__.py": "",
-    "sglang/srt/planner/__init__.py": "",
-    "sglang/srt/planner/profile_couplings.py": "def run(req):\n    return {'ok': True, 'result': {'echo': req}}\n",
-    "sglang/srt/weg2/__init__.py": "",
-    "sglang/srt/weg2/topology.py": '''
+    "flliper/__init__.py": "",
+    "flliper/srt/__init__.py": "",
+    "flliper/srt/planner/__init__.py": "",
+    "flliper/srt/planner/profile_couplings.py": "def run(req):\n    return {'ok': True, 'result': {'echo': req}}\n",
+    "flliper/srt/pdflip/__init__.py": "",
+    "flliper/srt/pdflip/topology.py": '''
 class TopologyRefused(RuntimeError):
     pass
 
 
 def plan_topology(n_cards, ctx=None):
     if n_cards == 7:
-        from sglang.srt.weg2 import weight_exchange_region      # fehlt: ImportError im Kind
+        from flliper.srt.pdflip import weight_exchange_region      # fehlt: ImportError im Kind
     if n_cards == 5:
         raise TopologyRefused("HW-COUNT: 5 cards would be P = (2,3), proven on metal only for N in [3]")
     if n_cards == 9:
@@ -116,12 +116,12 @@ class TestDryRunUsesTheChild(unittest.TestCase):
         self.ed, _rel, _usr = P9.editor(self.tmp)
         self.doc = self.ed.load("release", "demo")["doc"]
         self.calls = []
-        # der Planer-Baum des Dashboards hat KEIN sglang: plan_topology wirft fuer N != 3 den ImportError des Befunds F2
+        # der Planer-Baum des Dashboards hat KEIN flliper: plan_topology wirft fuer N != 3 den ImportError des Befunds F2
         ci, tp = self.ed.kp._mods()
 
         def in_process(n, *a, **kw):
             if n != 3:
-                raise ModuleNotFoundError("No module named 'sglang'")
+                raise ModuleNotFoundError("No module named 'flliper'")
             return object()
         self.ed.kp._mods = lambda: (ci, SimpleNamespace(plan_topology=in_process, TopologyRefused=tp.TopologyRefused))
 
@@ -141,24 +141,24 @@ class TestDryRunUsesTheChild(unittest.TestCase):
         self.ed.topology = child
         d = self.dry(4)
         self.assertEqual(self.calls, [4])
-        top = [r for r in d["rejections"] if r["source"] == "weg2/topology.plan_topology"]
+        top = [r for r in d["rejections"] if r["source"] == "pdflip/topology.plan_topology"]
         self.assertEqual([r["code"] for r in top], ["HW-COUNT"])
         self.assertFalse([n for n in d["notes"] if "not checked" in n])
 
     def test_the_childs_missing_topology_is_hw_topology(self):
         self.ed.topology = lambda n: {"ok": True, "refused": "no topology for 9 cards"}
-        top = [r for r in self.dry(6)["rejections"] if r["source"] == "weg2/topology.plan_topology"]
+        top = [r for r in self.dry(6)["rejections"] if r["source"] == "pdflip/topology.plan_topology"]
         self.assertEqual([r["code"] for r in top], ["HW-TOPOLOGY"])
 
     def test_the_child_letting_the_count_through_adds_no_topology_rejection_and_no_note(self):
         self.ed.topology = lambda n: {"ok": True, "refused": None}
         d = self.dry(4)
-        self.assertFalse([r for r in d["rejections"] if r["source"] == "weg2/topology.plan_topology"])
+        self.assertFalse([r for r in d["rejections"] if r["source"] == "pdflip/topology.plan_topology"])
         self.assertFalse([n for n in d["notes"] if "not checked" in n])
 
     def test_without_a_child_the_old_path_and_its_note_remain(self):
         self.ed.topology = None
-        d = self.dry(4)                                  # N=4: im Prozess ImportError (kein sglang) -> Notiz, kein 500
+        d = self.dry(4)                                  # N=4: im Prozess ImportError (kein flliper) -> Notiz, kein 500
         self.assertTrue([n for n in d["notes"] if "Topology for 4 card(s) not checked" in n], d["notes"])
 
     def test_a_child_that_cannot_work_falls_back_and_names_both(self):

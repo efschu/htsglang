@@ -46,8 +46,8 @@ from unittest import mock
 # and not the interpreter (measured: 4.28 s of a 0.20 s bound, 0 polls).
 import torch  # noqa: F401,E402
 
-from sglang.srt.managers import pp_admission_congruence as pac
-from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams  # noqa: F401,E402
+from flliper.srt.managers import pp_admission_congruence as pac
+from flliper.srt.mem_cache.base_prefix_cache import InitLoadBackParams  # noqa: F401,E402
 
 
 class _Tree:
@@ -133,7 +133,7 @@ class TestEveryFollowerSpeaksBeforeItCanBeStuck(unittest.TestCase):
         pac._PREFIX_EXEC_SHORT_SEEN = 0
         tree = _Tree()
         with _ShortBound(), self.assertLogs(
-            "sglang.srt.managers.pp_admission_congruence", level=logging.INFO
+            "flliper.srt.managers.pp_admission_congruence", level=logging.INFO
         ) as cap:
             with self.assertRaises(RuntimeError):
                 pac.execute_scheduled_prefix(_req(), tree, 12288)
@@ -150,7 +150,7 @@ class TestEveryFollowerSpeaksBeforeItCanBeStuck(unittest.TestCase):
         with _ShortBound():
             for _ in range(24):
                 with self.assertLogs(
-                    "sglang.srt.managers.pp_admission_congruence", level=logging.INFO
+                    "flliper.srt.managers.pp_admission_congruence", level=logging.INFO
                 ) as cap:
                     # assertLogs needs at least one record; past the rate limit
                     # this call emits none, which is the point.
@@ -169,7 +169,7 @@ class TestTheHealthyPathIsNoLongerSilent(unittest.TestCase):
     def test_local_equals_scheduled_prints_a_bounded_no_op_line(self):
         pac._PREFIX_EXEC_NOOP_SEEN = 0
         with self.assertLogs(
-            "sglang.srt.managers.pp_admission_congruence", level=logging.INFO
+            "flliper.srt.managers.pp_admission_congruence", level=logging.INFO
         ) as cap:
             moved = pac.execute_scheduled_prefix(_req(local=4096), _Tree(), 4096)
         self.assertEqual(moved, 0)
@@ -182,7 +182,7 @@ class TestTheHealthyPathIsNoLongerSilent(unittest.TestCase):
         seen = 0
         for _ in range(9):
             with self.assertLogs(
-                "sglang.srt.managers.pp_admission_congruence", level=logging.INFO
+                "flliper.srt.managers.pp_admission_congruence", level=logging.INFO
             ) as cap:
                 # assertLogs needs at least one record; the warning below is
                 # unrelated and only keeps the context manager satisfied.
@@ -196,7 +196,7 @@ class TestTruncationIsStillTheSafeDirection(unittest.TestCase):
     def test_local_above_scheduled_truncates_and_says_so(self):
         req = _req(local=8192)
         with self.assertLogs(
-            "sglang.srt.managers.pp_admission_congruence", level=logging.INFO
+            "flliper.srt.managers.pp_admission_congruence", level=logging.INFO
         ) as cap:
             moved = pac.execute_scheduled_prefix(req, _Tree(), 4096)
         self.assertEqual(moved, 0)

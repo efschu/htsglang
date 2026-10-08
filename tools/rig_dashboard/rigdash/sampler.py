@@ -195,7 +195,7 @@ def main(argv=None) -> int:
     # the page's other readings (30.09. ~22Z): cards/PCIe via NVML, docker, gpuq, fronts, and the energy book
     ssh = shlex.split(args.docker_ssh) if args.docker_ssh else []
     src = sources.Sources({"gpu_period": 1.0, "docker_ssh": ssh, "docker_host_prefix": args.docker_host_prefix,
-                           "weg2_fronts": args.front, "gpuq": args.gpuq, "state_dir": args.state_dir})
+                           "pdflip_fronts": args.front, "gpuq": args.gpuq, "state_dir": args.state_dir})
     threading.Thread(target=src.run_forever, args=(stop,), name="sampler-sources", daemon=True).start()
     if bridge is not None:
         bridge.pcie_source = lambda: list(src.pcie_hist)

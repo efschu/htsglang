@@ -13,9 +13,9 @@ import threading
 import time
 import unittest
 
-from sglang.srt.rigmon import compat, pairing
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.rigmon import compat, pairing
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

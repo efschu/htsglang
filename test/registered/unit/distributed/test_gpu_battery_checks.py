@@ -606,7 +606,7 @@ class TestP2PCheck:
         silence, indistinguishable from a rig without P2P."""
         results = _copy_real_run(tmp_path)
         sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
-        from sglang.srt.distributed.device_communicators.barlink_path_rates import (
+        from flliper.srt.distributed.device_communicators.barlink_path_rates import (
             load_p2p_capability_matrix,
         )
 
@@ -2118,7 +2118,7 @@ class TestVerdictContract:
 class TestFatalScanSkipsQuotedSubprocessLogs:
     """A boot is judged by its OWN lines (#303 part 4).
 
-    An sglang server QUOTES the log of helper subprocesses it ran and recovered
+    An flliper server QUOTES the log of helper subprocesses it ran and recovered
     from -- above all the stage-0 hardware probe, whose failure is caught,
     named and worked around. When that probe is killed (which the #289 evidence
     run did on purpose, to stop it burning 600 s of card time), the server logs
@@ -2204,6 +2204,6 @@ class TestFatalScanSkipsQuotedSubprocessLogs:
         sys.path.insert(0, CHECKS)
         from check_common import QUOTED_SUBLOG_PREFIX  # noqa: E402
 
-        from sglang.srt.uneven_perf import QUOTED_SUBLOG_PREFIX as EMITTED
+        from flliper.srt.uneven_perf import QUOTED_SUBLOG_PREFIX as EMITTED
 
         assert QUOTED_SUBLOG_PREFIX == EMITTED

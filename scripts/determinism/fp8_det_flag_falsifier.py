@@ -1,4 +1,4 @@
-"""#192: does SGLANG_DETERMINISTIC_FP8_GEMM actually buy bit-determinism on sm8x?
+"""#192: does FLLIPER_DETERMINISTIC_FP8_GEMM actually buy bit-determinism on sm8x?
 
 #190 measured that ``gptq_marlin_gemm`` -- the ONLY fp8 GEMM available on
 sm80..sm88 -- is not run-to-run reproducible there: repeating one
@@ -18,7 +18,7 @@ helper, so the second arm cannot simply re-read it; the runner therefore clears
 those caches between arms and asserts the resulting routing flags, which also
 proves the chain the flag is supposed to trigger:
 
-    SGLANG_DETERMINISTIC_FP8_GEMM
+    FLLIPER_DETERMINISTIC_FP8_GEMM
       -> deterministic_fp8_marlin_disabled()  = True   (sm8x only)
       -> Fp8LinearMethod.use_marlin           = False
       -> fp8_needs_dequant_fallback()         = True
@@ -77,11 +77,11 @@ def make_method(deterministic: bool):
     flag is read once per process by design (so the warning fires once per rank),
     which is right in production and wrong in an A/B harness.
     """
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.quantization import fp8_utils as U
-    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+    from flliper.srt.environ import envs
+    from flliper.srt.layers.quantization import fp8_utils as U
+    from flliper.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 
-    envs.SGLANG_DETERMINISTIC_FP8_GEMM.set(deterministic)
+    envs.FLLIPER_DETERMINISTIC_FP8_GEMM.set(deterministic)
     U.deterministic_fp8_marlin_disabled.cache_clear()
     U.fp8_needs_dequant_fallback.cache_clear()
 
@@ -131,7 +131,7 @@ def main():
     arms = {}
     for name, deterministic in (("marlin", False), ("flag_on", True)):
         method = make_method(deterministic)
-        from sglang.srt.layers.quantization import fp8_utils as U
+        from flliper.srt.layers.quantization import fp8_utils as U
 
         routing = (
             f"use_marlin={method.use_marlin} "
@@ -142,7 +142,7 @@ def main():
         if name == "marlin" and method.use_marlin:
             # Marlin wants its repacked layout + workspace; build it once, on
             # the same weights, so both arms answer for the same checkpoint.
-            from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+            from flliper.srt.layers.quantization.marlin_utils_fp8 import (
                 prepare_fp8_layer_for_marlin,
             )
 

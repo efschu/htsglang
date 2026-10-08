@@ -116,7 +116,7 @@ as a second attempt.
 * **Never break a foreign lock.** `/tmp/gpu-card-N.lock` with a foreign
   `holder` is off limits — expired heartbeat or not. That is an operator
   decision.
-* **Never kill broadly.** No `pkill python`, no `pkill sglang`, no `killall`.
+* **Never kill broadly.** No `pkill python`, no `pkill flliper`, no `killall`.
   Other people's servers run on this box. Only PIDs listed in `<step>/pids`.
 * **Never kill without a py-spy dump.** `run_step.sh` dumps before every kill.
   If you exceptionally have to kill yourself: first

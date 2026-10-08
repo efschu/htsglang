@@ -17,11 +17,11 @@ test_yarn_rope_cache_growth.py and are parametrized over the lazy path there.
 import pytest
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.rotary_embedding import lazy_cos_sin_cache
-from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
-from sglang.srt.runtime_context import get_context
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.environ import envs
+from flliper.srt.layers.rotary_embedding import lazy_cos_sin_cache
+from flliper.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
+from flliper.srt.runtime_context import get_context
+from flliper.srt.server_args import ServerArgs
 
 get_context().set_server_args(ServerArgs(model_path="dummy"))
 
@@ -41,8 +41,8 @@ def _lazy_env():
     growth, not once at construction -- so the overrides have to span the
     whole test, not just the constructor."""
     with (
-        envs.SGLANG_ROPE_LAZY_CHUNK_ROWS.override(CHUNK),
-        envs.SGLANG_ROPE_LAZY_MIN_ROWS.override(MIN_ROWS),
+        envs.FLLIPER_ROPE_LAZY_CHUNK_ROWS.override(CHUNK),
+        envs.FLLIPER_ROPE_LAZY_MIN_ROWS.override(MIN_ROWS),
     ):
         yield
     for module in list(lazy_cos_sin_cache._LAZY_MODULES):
@@ -51,8 +51,8 @@ def _lazy_env():
 
 def _build(lazy: bool, min_rows: int = MIN_ROWS):
     with (
-        envs.SGLANG_ROPE_LAZY_CACHE.override(lazy),
-        envs.SGLANG_ROPE_LAZY_MIN_ROWS.override(min_rows),
+        envs.FLLIPER_ROPE_LAZY_CACHE.override(lazy),
+        envs.FLLIPER_ROPE_LAZY_MIN_ROWS.override(min_rows),
     ):
         return YaRNScalingRotaryEmbedding(
             head_size=HEAD_SIZE,
@@ -219,7 +219,7 @@ def test_an_unverified_subclass_declines_the_lazy_path():
     class UnverifiedYaRN(YaRNScalingRotaryEmbedding):
         pass
 
-    with envs.SGLANG_ROPE_LAZY_CACHE.override(True):
+    with envs.FLLIPER_ROPE_LAZY_CACHE.override(True):
         rope = UnverifiedYaRN(
             head_size=HEAD_SIZE,
             rotary_dim=ROTARY_DIM,
@@ -281,8 +281,8 @@ def test_a_cache_born_small_becomes_lazy_when_the_ceiling_arrives():
     born_with = int(rope.cos_sin_cache.shape[0])
 
     with (
-        envs.SGLANG_ROPE_LAZY_CACHE.override(True),
-        envs.SGLANG_ROPE_LAZY_MIN_ROWS.override(EAGER_ROWS),
+        envs.FLLIPER_ROPE_LAZY_CACHE.override(True),
+        envs.FLLIPER_ROPE_LAZY_MIN_ROWS.override(EAGER_ROWS),
     ):
         rope.ensure_cos_sin_cache_capacity(EAGER_ROWS * 4)
 

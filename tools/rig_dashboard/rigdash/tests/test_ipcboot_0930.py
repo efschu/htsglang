@@ -26,7 +26,7 @@ PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def rec(g, ts, pnew=0, pcached=0, pchunks=0, pcomp=0.0, dtok=0, rounds=0, dgpu=0.0, running=None, kv=None):
-    return {"schema": "weg2.rankstats/1", "group": g, "ts": ts,
+    return {"schema": "pdflip.rankstats/1", "group": g, "ts": ts,
             "prefill": {"new_tokens": pnew, "cached_tokens": pcached, "chunks": pchunks, "compute_ms": pcomp,
                         "last": {"t": ts, "gpu_ms": 1000.0, "new": 1000} if pchunks else None},
             "decode": {"tokens": dtok, "rounds": rounds, "gpu_ms": dgpu, "running": running,
@@ -100,7 +100,7 @@ class TestBuildView(unittest.TestCase):
     def test_missing_fields_name_their_writer(self):
         f = self.v["fields"]
         self.assertEqual(f["A4"]["src"], "fehlt")
-        self.assertIn("SGLANG_WEG2_FORM", f["A4"]["missing"])
+        self.assertIn("FLLIPER_PDFLIP_FORM", f["A4"]["missing"])
         self.assertIn("rankstats.py", f["C1"]["missing"])
         self.assertNotIn("Log", json.dumps(self.v["fields"], ensure_ascii=False))
 
@@ -112,7 +112,7 @@ class TestNoLogOpened(unittest.TestCase):
             d = os.path.join(root, "nfx-boot-20260930T153426Z-051f")
             os.makedirs(os.path.join(d, "rankstate", "D"))
             with open(os.path.join(d, "state.json"), "w") as fh:
-                json.dump({"schema": "weg2.state/1", "boot_id": os.path.basename(d), "kind": "boot", "tag": "nfx",
+                json.dump({"schema": "pdflip.state/1", "boot_id": os.path.basename(d), "kind": "boot", "tag": "nfx",
                            "lifecycle": {"state": "serving"}, "front": {"awake": "D"}}, fh)
             with open(os.path.join(d, "events.jsonl"), "w") as fh:
                 fh.write("")
@@ -170,7 +170,7 @@ class TestStaticScan(unittest.TestCase):
                     if name == "grouplog.py" and v in (".D.log", "boot_weg2_%s_*.D.log", ".front.log",
                                                        "boot_weg2_%s_*.front.log"):
                         # .front.log: Nutzer 02.10. ~18:25Z via NF, Vorlauf-Zerlegung -- Ankunft des Requests
-                        # (WEG2 SESSION rid=); IPC-Nachfolger flip_user_time.arrival_ts, dann faellt der Leser
+                        # (PDFLIP SESSION rid=); IPC-Nachfolger flip_user_time.arrival_ts, dann faellt der Leser
                         continue     # Nutzer 02.10. ~17:50Z: Flipzeit-Endpunkte = D's eigene Decode-Runden (TP0
                                      # 'Decode rank batch' t:); rankstats hat keine Rundenzeit -- IPC-Nachfolger
                                      # decode.last_t beim Rang-Schreiber, dann faellt dieser eine Leser

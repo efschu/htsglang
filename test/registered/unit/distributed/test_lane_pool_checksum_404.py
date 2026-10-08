@@ -16,7 +16,7 @@ here is checked three ways:
   somewhere, and not merely eventually;
 * it is MISSED under two deliberate mis-settings: with the probe off, and with
   the probe pointed at the FREED TAIL instead of the committed prefix
-  (``SGLANG_LANE_POOL_CHECKSUM_TAIL``). The second is the sharper of the two,
+  (``FLLIPER_LANE_POOL_CHECKSUM_TAIL``). The second is the sharper of the two,
   because the freed tail is exactly where a careless version of this
   instrument would have looked.
 
@@ -36,9 +36,9 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.dual_group_lane import DualGroupLane
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.dual_group_lane import DualGroupLane
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -55,15 +55,15 @@ SSM_DIM = 5
 DRAFT_STEPS = 4
 
 _ENV = (
-    "SGLANG_LANE_POOL_CHECKSUM",
-    "SGLANG_LANE_POOL_CHECKSUM_TAIL",
-    "SGLANG_LANE_POOL_CHECKSUM_PER_POS",
-    "SGLANG_LANE_POOL_CHECKSUM_PATH",
-    "SGLANG_LANE_MARGIN_PROBE",
-    "SGLANG_LANE_SPEC_DEBUG",
-    "SGLANG_LANE_SPEC_ROW_ORACLE",
-    "SGLANG_LANE_SPEC_TV_MAX_ACCEPT",
-    "SGLANG_LANE_SPEC_VERIFY",
+    "FLLIPER_LANE_POOL_CHECKSUM",
+    "FLLIPER_LANE_POOL_CHECKSUM_TAIL",
+    "FLLIPER_LANE_POOL_CHECKSUM_PER_POS",
+    "FLLIPER_LANE_POOL_CHECKSUM_PATH",
+    "FLLIPER_LANE_MARGIN_PROBE",
+    "FLLIPER_LANE_SPEC_DEBUG",
+    "FLLIPER_LANE_SPEC_ROW_ORACLE",
+    "FLLIPER_LANE_SPEC_TV_MAX_ACCEPT",
+    "FLLIPER_LANE_SPEC_VERIFY",
 )
 
 
@@ -139,7 +139,7 @@ def _mamba_cache():
     ``conv`` is a per-layer list and ``temporal`` one tensor; both are indexed
     ``[:, slot]``, which is the layout the probe reads.
     """
-    from sglang.srt.mem_cache.memory_pool import MambaPool
+    from flliper.srt.mem_cache.memory_pool import MambaPool
 
     return MambaPool.SpeculativeState(
         conv=[torch.zeros(2, POOL_SLOTS, CONV_WIDTH) for _ in range(LAYERS)],
@@ -398,7 +398,7 @@ class _Harness:
 
 
 def _on(**extra):
-    os.environ["SGLANG_LANE_POOL_CHECKSUM"] = "1"
+    os.environ["FLLIPER_LANE_POOL_CHECKSUM"] = "1"
     for key, value in extra.items():
         os.environ[key] = str(value)
 
@@ -453,7 +453,7 @@ class TestTheProbeIsOffUnlessAskedFor(_Base):
     def test_records_reach_the_jsonl_one_line_per_round(self):
         with tempfile.TemporaryDirectory() as tmp:
             prefix = os.path.join(tmp, "ck")
-            _on(SGLANG_LANE_POOL_CHECKSUM_PATH=prefix)
+            _on(FLLIPER_LANE_POOL_CHECKSUM_PATH=prefix)
             h = _Harness()
             for _ in range(3):
                 h.spec_round()
@@ -528,7 +528,7 @@ class TestTheProbeLocalizesAPlantedKvPerturbation(_Base):
         ``committed_len``; hashing THERE reads a region the plant never
         touched, and the leak walks straight past the probe.
         """
-        _on(SGLANG_LANE_POOL_CHECKSUM_TAIL=4)
+        _on(FLLIPER_LANE_POOL_CHECKSUM_TAIL=4)
         h = self._run()
         recs = h.records()
         self.assertEqual({r["region"] for r in recs}, {"freed_tail"})
@@ -542,7 +542,7 @@ class TestTheProbeLocalizesAPlantedKvPerturbation(_Base):
         and without the plant. That is what "the instrument was pointed at the
         wrong region" looks like when it is demonstrated rather than argued.
         """
-        _on(SGLANG_LANE_POOL_CHECKSUM_TAIL=4)
+        _on(FLLIPER_LANE_POOL_CHECKSUM_TAIL=4)
         planted = self._run(plant=True)
         clean = self._run(plant=False)
         recs = planted.records()
@@ -679,7 +679,7 @@ class TestTheSpeculativeAndPlainPathsAgreeOnTheCommittedPrefix(_Base):
 
 class TestPerPositionDigestsNarrowTheLocalisationToAToken(_Base):
     def test_the_per_position_list_names_the_position_that_moved(self):
-        _on(SGLANG_LANE_POOL_CHECKSUM_PER_POS=1)
+        _on(FLLIPER_LANE_POOL_CHECKSUM_PER_POS=1)
         h = _Harness()
         h.spec_round()
         before = list(h.records()[0]["kv_pos"])
@@ -706,7 +706,7 @@ class TestPerPositionDigestsNarrowTheLocalisationToAToken(_Base):
         """
         import hashlib
 
-        _on(SGLANG_LANE_POOL_CHECKSUM_PER_POS=1)
+        _on(FLLIPER_LANE_POOL_CHECKSUM_PER_POS=1)
         h = _Harness()
         h.spec_round()
         rec = h.records()[0]
@@ -753,7 +753,7 @@ class TestTheNumericCrossJobFingerprints(_Base):
 
     def test_a_last_bit_difference_breaks_the_digest_and_not_the_number(self):
         """The defect class the cross-job reading was drowning in."""
-        _on(SGLANG_LANE_POOL_CHECKSUM_PER_POS=1)
+        _on(FLLIPER_LANE_POOL_CHECKSUM_PER_POS=1)
         h = _Harness()
         h.spec_round()
         before = h.records()[0]
@@ -766,7 +766,7 @@ class TestTheNumericCrossJobFingerprints(_Base):
         self.assertLess(self._deviation(before["kv_num"][3], after["kv_num"][3]), 1e-3)
 
     def test_a_leaked_row_moves_the_number_by_an_order_of_magnitude_more(self):
-        _on(SGLANG_LANE_POOL_CHECKSUM_PER_POS=1)
+        _on(FLLIPER_LANE_POOL_CHECKSUM_PER_POS=1)
         h = _Harness()
         h.spec_round()
         before = h.records()[0]
@@ -790,7 +790,7 @@ class TestTheRungSchedule(_Base):
     """
 
     def _lane(self, rungs, pin):
-        from sglang.srt.model_executor.lane_spec_policy import LaneSpecPolicy
+        from flliper.srt.model_executor.lane_spec_policy import LaneSpecPolicy
 
         lane = DualGroupLane.__new__(DualGroupLane)
         lane.spec_steps = max(rungs)

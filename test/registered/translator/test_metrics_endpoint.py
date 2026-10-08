@@ -16,7 +16,7 @@ was queued.
 
 import unittest
 
-from sglang.srt.translator import metrics
+from flliper.srt.translator import metrics
 
 
 class TestMetrics(unittest.TestCase):

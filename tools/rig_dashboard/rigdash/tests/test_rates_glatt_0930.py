@@ -45,7 +45,7 @@ def rec_d(ts):
     s4, s2 = _dec_s(ts, 10.0, 20.0), _dec_s(ts, 20.0, 30.0)
     ext = [(a, b) for a, b in PAUSES if b <= ts]
     last = ext[-1] if ext else None
-    return {"schema": "weg2.rankstats/1", "ts": ts,
+    return {"schema": "pdflip.rankstats/1", "ts": ts,
             "prefill": {"chunks": len(ext), "new_tokens": 2000 * len(ext), "cached_tokens": 0,
                         "compute_ms": 2000.0 * len(ext),
                         "last": {"t": last[1], "gpu_ms": 2000.0, "new": 2000} if last else None},
@@ -183,7 +183,7 @@ class TestHistoryHonestTiers(unittest.TestCase):
             os.makedirs(d)
             import json
             with open(os.path.join(d, "state.json"), "w") as fh:
-                json.dump({"schema": "weg2.state/1", "boot_id": os.path.basename(d), "kind": "boot", "tag": "nfx",
+                json.dump({"schema": "pdflip.state/1", "boot_id": os.path.basename(d), "kind": "boot", "tag": "nfx",
                            "lifecycle": {"state": "serving"}, "front": {"awake": "D"}}, fh)
             ib = ipcboot.IpcBoots(roots=(root,))
             ib.poll(self.T0 + 0.1)

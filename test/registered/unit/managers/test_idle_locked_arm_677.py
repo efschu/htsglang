@@ -50,7 +50,7 @@ false on the other side.
 
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PHASE_PP,
     PHASE_TP,
     PP_TO_TP,
@@ -61,7 +61,7 @@ from sglang.srt.managers.phase_policy import (
     PhasePolicyState,
     decide,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

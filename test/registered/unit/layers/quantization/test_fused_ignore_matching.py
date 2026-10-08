@@ -24,18 +24,18 @@ The three exclusion-list dialects that exist on this box are exercised with
 excerpts of the real lists.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.layers.quantization.awq.awq import is_layer_skipped_awq
-from sglang.srt.layers.quantization.compressed_tensors.utils import (
+from flliper.srt.layers.quantization.awq.awq import is_layer_skipped_awq
+from flliper.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
-from sglang.srt.layers.quantization.utils import FALLBACK_FUSED_SHARDS, is_layer_skipped
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.utils import FALLBACK_FUSED_SHARDS, is_layer_skipped
+from flliper.test.test_utils import CustomTestCase
 
 TARGET = "model.language_model.layers.0"
 DRAFT = "mtp.layers.0"
@@ -99,7 +99,7 @@ class TestTheSharedFusionTable(CustomTestCase):
         )
 
     def test_it_agrees_with_the_model_class(self):
-        from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+        from flliper.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 
         self.assertEqual(
             dict(FALLBACK_FUSED_SHARDS), Qwen3_5ForCausalLM.packed_modules_mapping
@@ -108,8 +108,8 @@ class TestTheSharedFusionTable(CustomTestCase):
 
 class TestTheDraftArchitectureDeclaresItsFusions(CustomTestCase):
     def test_the_mtp_wrapper_carries_the_target_table(self):
-        from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
-        from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+        from flliper.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+        from flliper.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 
         self.assertEqual(
             Qwen3_5ForCausalLMMTP.packed_modules_mapping,
@@ -118,8 +118,8 @@ class TestTheDraftArchitectureDeclaresItsFusions(CustomTestCase):
 
     def test_the_table_is_copied_not_aliased(self):
         """``_get_quantization_config`` mutates it in place for quark / NPU."""
-        from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
-        from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+        from flliper.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+        from flliper.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 
         self.assertIsNot(
             Qwen3_5ForCausalLMMTP.packed_modules_mapping,
@@ -271,7 +271,7 @@ class TestThePrefixHalfOfTheDiagnosis(CustomTestCase):
         )
 
     def test_the_draft_prefix_is_the_checkpoint_namespace(self):
-        from sglang.srt.utils import add_prefix
+        from flliper.srt.utils import add_prefix
 
         self.assertEqual(add_prefix("mtp", ""), "mtp")
 

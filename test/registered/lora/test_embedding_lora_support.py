@@ -24,16 +24,16 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.entrypoints.openai.protocol import EmbeddingRequest
-from sglang.srt.managers.io_struct import EmbeddingReqInput, TokenizedEmbeddingReqInput
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.runners import SRTRunner
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
+from flliper.srt.entrypoints.openai.protocol import EmbeddingRequest
+from flliper.srt.managers.io_struct import EmbeddingReqInput, TokenizedEmbeddingReqInput
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.runners import SRTRunner
+from flliper.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 # Test configuration (same model/LoRA as test_lora_hf_sgl_logprob_diff.py)
 MODEL_PATH = "meta-llama/Llama-2-7b-hf"
-LORA_PATH = "yushengsu/sglang_lora_logprob_diff_without_tuning"
+LORA_PATH = "yushengsu/flliper_lora_logprob_diff_without_tuning"
 LORA_BACKEND = "triton"
 SIMILARITY_THRESHOLD = 0.9999
 
@@ -100,7 +100,7 @@ class TestEmbeddingLoraSupport(unittest.TestCase):
 
 
 class TestEmbeddingLoraHFComparison(CustomTestCase):
-    """Compare HF+LoRA vs SGLang+LoRA embedding outputs."""
+    """Compare HF+LoRA vs fLLiper+LoRA embedding outputs."""
 
     @classmethod
     def get_hf_embedding_with_lora(cls, model_path, lora_path, texts, torch_dtype):
@@ -132,7 +132,7 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
             outputs = model.model(**inputs, output_hidden_states=True)
             hidden_states = outputs.hidden_states[-1]
 
-            # Last token pooling with L2 normalization (matching SGLang)
+            # Last token pooling with L2 normalization (matching fLLiper)
             attention_mask = inputs["attention_mask"]
             last_token_indices = attention_mask.sum(dim=1) - 1
             batch_size = hidden_states.shape[0]
@@ -148,8 +148,8 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
         return embeddings.cpu().numpy()
 
     @classmethod
-    def get_sglang_embedding_with_lora(cls, model_path, lora_path, texts, torch_dtype):
-        """Get embeddings from SGLang with LoRA adapter."""
+    def get_flliper_embedding_with_lora(cls, model_path, lora_path, texts, torch_dtype):
+        """Get embeddings from fLLiper with LoRA adapter."""
         with SRTRunner(
             model_path,
             torch_dtype=torch_dtype,
@@ -174,8 +174,8 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
         """Compute cosine similarity between vectors."""
         return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-    def test_embedding_lora_hf_sglang_similarity(self):
-        """Test that HF+LoRA and SGLang+LoRA produce similar embeddings."""
+    def test_embedding_lora_hf_flliper_similarity(self):
+        """Test that HF+LoRA and fLLiper+LoRA produce similar embeddings."""
         test_texts = [
             "Hello world",
             "This is a test sentence for embedding comparison",
@@ -184,10 +184,10 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
         print(f"\nModel: {MODEL_PATH}")
         print(f"LoRA: {LORA_PATH}")
 
-        # Get SGLang embeddings first (before HF loads model into GPU)
+        # Get fLLiper embeddings first (before HF loads model into GPU)
         # This order matches test_lora_hf_sgl_logprob_diff.py and avoids OOM
-        print("\nGetting SGLang embeddings...")
-        sglang_embeddings = self.get_sglang_embedding_with_lora(
+        print("\nGetting fLLiper embeddings...")
+        flliper_embeddings = self.get_flliper_embedding_with_lora(
             MODEL_PATH, LORA_PATH, test_texts, torch.float16
         )
 
@@ -201,9 +201,9 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
         )
 
         # Compare embeddings
-        print("\nHF vs SGLang LoRA Embedding Comparison:")
+        print("\nHF vs fLLiper LoRA Embedding Comparison:")
         similarities = []
-        for i, (hf_emb, sgl_emb) in enumerate(zip(hf_embeddings, sglang_embeddings)):
+        for i, (hf_emb, sgl_emb) in enumerate(zip(hf_embeddings, flliper_embeddings)):
             sim = self.cosine_similarity(hf_emb, sgl_emb)
             similarities.append(sim)
             print(f"  Text {i}: cosine similarity = {sim:.6f}")

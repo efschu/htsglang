@@ -51,14 +51,14 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.managers.cache_controller import LayerDoneCounter
-from sglang.srt.mem_cache.hicache_phase_binding import PhasePools, _stamp
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.managers.cache_controller import LayerDoneCounter
+from flliper.srt.mem_cache.hicache_phase_binding import PhasePools, _stamp
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 
 # Qwen3.8-27B, 64 layers, ``full_attention_interval = 4``: full attention sits
 # at [3, 7, 11, ..., 63] and every other layer is GDN (48 GDN + 16 full).
@@ -206,7 +206,7 @@ class TestDraftTierDomain(unittest.TestCase):
     """T-2b."""
 
     def test_draft_tier_loop_uses_a_domain_not_a_frozen_count(self):
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             _host_pool_covers_layer,
         )
 
@@ -227,7 +227,7 @@ class TestDraftTierDomain(unittest.TestCase):
     def test_a_plain_draft_tier_is_dense_from_zero(self):
         """A non-composite host pool: membership IS ``range(layer_num)``, so
         the conversion is byte-identical there."""
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             _host_pool_covers_layer,
         )
 
@@ -473,7 +473,7 @@ class _LoopDriver:
             )
 
     def run(self):
-        from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
+        from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
 
         saved_dm = hcc.device_module
         saved_gate = hcc.consume_gate
@@ -608,7 +608,7 @@ class TestTheTwoWiringLines(unittest.TestCase):
         satisfy the width and leave the device and req pools holding the narrow
         object nobody rebinds.
         """
-        from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
+        from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
 
         group = _CountingHostGroup(50, keys=range(32, 50))
         # 18 = the base's own `mem_pool_device.layer_num` meaning: this PP
@@ -696,7 +696,7 @@ class TestTheAttachInstrument(unittest.TestCase):
     """
 
     def _attach_records(self, group, pp_rank=2):
-        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
+        from flliper.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
 
         cache = MagicMock()
         cache.components = {}
@@ -776,7 +776,7 @@ class TestTheDraftTierDomainTerm(unittest.TestCase):
     """
 
     def _controller(self, domain):
-        from sglang.srt.managers import cache_controller as cc
+        from flliper.srt.managers import cache_controller as cc
 
         controller = object.__new__(cc.HiCacheController)
         controller.has_draft = False
@@ -792,7 +792,7 @@ class TestTheDraftTierDomainTerm(unittest.TestCase):
     def test_registering_a_narrower_draft_tier_is_silent(self):
         """RED BEFORE THE FIX: a 1-layer MTP draft tier under a 64-layer
         target domain emitted one ERROR line and voted the group down."""
-        from sglang.srt.managers import cache_controller as cc
+        from flliper.srt.managers import cache_controller as cc
 
         for draft_layers in (1, 18, 64):
             with self.subTest(draft_layers=draft_layers):
@@ -817,8 +817,8 @@ class TestTheDraftTierDomainTerm(unittest.TestCase):
         leaves the other voting or logging it."""
         import inspect
 
-        from sglang.srt.managers import cache_controller as cc
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import cache_controller as cc
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         self.assertFalse(hasattr(pdv, "_draft_tier_domain_matches"))
         self.assertNotIn(
@@ -832,7 +832,7 @@ class TestTheDraftTierDomainTerm(unittest.TestCase):
         domain for it to be truncated against."""
         import inspect
 
-        from sglang.srt.managers import cache_controller as cc
+        from flliper.srt.managers import cache_controller as cc
 
         src = inspect.getsource(cc.HiCacheController.start_loading)
         self.assertIn("i < self.mem_pool_host_draft.layer_num", src)
@@ -876,7 +876,7 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
     """
 
     def _rebind_with(self, controller, group):
-        from sglang.srt.mem_cache import hicache_phase_binding as hpb
+        from flliper.srt.mem_cache import hicache_phase_binding as hpb
 
         incoming = MagicMock(spec=PhasePools)
         incoming.phase = "tp"
@@ -916,7 +916,7 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
     def test_a_quiescent_rebind_resizes_the_counter_and_is_silent(self):
         """RED BEFORE THE FIX: the counter kept its boot width, the detector
         fired, and slot 15 voted the group down at the next packed reduce."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         tp_group, _f, _m = _group_for_stage(0, 64)
         self.assertEqual(tp_group.transfer_layer_domain, 64)
@@ -937,7 +937,7 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
         """The spy above proves the CALL; this proves the tree's own class
         answers it -- ``LayerDoneCounter.resize`` rebuilds every event list,
         not only the scalar the term reads."""
-        from sglang.srt.managers.cache_controller import LayerDoneCounter
+        from flliper.srt.managers.cache_controller import LayerDoneCounter
 
         tp_group, _f, _m = _group_for_stage(0, 64)
         counter = LayerDoneCounter(50)
@@ -958,7 +958,7 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
         were driven together until this round, so a change to the consumer arm
         moved no assertion at all.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         tp_group, _f, _m = _group_for_stage(0, 64)
         counter = _CounterSpy(50, consumer_index=-1)
@@ -1005,7 +1005,7 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
         `:487-489`), and it stays >= 0 until a batch without a load or a
         ``reset()`` moves it.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         tp_group, _f, _m = _group_for_stage(0, 64)
         counter = _CounterSpy(50, consumer_index=1)
@@ -1055,7 +1055,7 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
         grow-only actuator cannot pass: ``finish_event`` is ``load_events[-1]``
         (`cache_controller.py:77-79`), so after narrowing to 32 the ACK's
         finish event must BE the 32nd event and not a 64th nothing records."""
-        from sglang.srt.managers.cache_controller import LayerDoneCounter
+        from flliper.srt.managers.cache_controller import LayerDoneCounter
 
         tp_group, _f, _m = _group_for_stage(0, 32)
         counter = LayerDoneCounter(64)
@@ -1125,7 +1125,7 @@ class TestTheRebindDomainTerm(unittest.TestCase):
         return pools
 
     def _rebind(self, counter_width, group, *, loads_in_flight=0):
-        from sglang.srt.mem_cache import hicache_phase_binding as hpb
+        from flliper.srt.mem_cache import hicache_phase_binding as hpb
 
         controller = self._readers(
             counter_width, group, loads_in_flight=loads_in_flight
@@ -1166,7 +1166,7 @@ class TestTheRebindDomainTerm(unittest.TestCase):
         still lag is a resize the quiescence precondition declined -- which is
         the state this arm drives. The detector's subject is unchanged: the
         readers moved and the counter did not follow."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         tp_group, _f, _m = _group_for_stage(0, 64)
         self.assertEqual(tp_group.transfer_layer_domain, 64)
@@ -1190,7 +1190,7 @@ class TestTheRebindDomainTerm(unittest.TestCase):
         nothing recorded. Reached whenever the resize is declined across a
         tp->pp cutover, where the outgoing width is the larger one.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         pp_group, _f, _m = _group_for_stage(0, 32)
         self.assertEqual(pp_group.transfer_layer_domain, 32)
@@ -1204,7 +1204,7 @@ class TestTheRebindDomainTerm(unittest.TestCase):
         )
 
     def test_arm_1_a_counter_that_followed_logs_nothing_and_votes_one(self):
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         tp_group, _f, _m = _group_for_stage(0, 64)
         controller, lines = self._rebind(64, tp_group)
@@ -1217,7 +1217,7 @@ class TestTheRebindDomainTerm(unittest.TestCase):
     def test_arm_0_before_any_rebind_the_term_is_the_min_neutral(self):
         """CAN-NOT-FIRE PIN. A controller with no counter votes the neutral
         rather than dereferencing one."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         group, _f, _m = _group_for_stage(32, 50)
         controller = types.SimpleNamespace(layer_done_counter=None)

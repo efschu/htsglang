@@ -43,16 +43,16 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 
-from sglang.srt.layers.dcp.phase_flip_plan import (
+from flliper.srt.layers.dcp.phase_flip_plan import (
     PP_TO_TP,
     TP_TO_PP,
     build_phase_flip_transition,
 )
-from sglang.srt.layers.dcp.reshard_plan import owner_of, rows_of
-from sglang.srt.managers.kv_reshard import _CHECKSUM_BYTES, KvPoolView
-from sglang.srt.managers.phase_flip_runtime import PHASE_PP, PhaseFlipRuntime
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.dcp.reshard_plan import owner_of, rows_of
+from flliper.srt.managers.kv_reshard import _CHECKSUM_BYTES, KvPoolView
+from flliper.srt.managers.phase_flip_runtime import PHASE_PP, PhaseFlipRuntime
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -572,7 +572,7 @@ class TestWireFormatUnchanged(CustomTestCase):
         src = pp_views[0]
         tr, *_ = _plan_legs(live, 0, PP_TO_TP, src, tp_views[0])
 
-        from sglang.srt.managers.kv_reshard import _checksum
+        from flliper.srt.managers.kv_reshard import _checksum
 
         for peer in tr.send_layers:
             parts = [

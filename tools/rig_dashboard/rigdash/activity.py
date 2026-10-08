@@ -96,7 +96,7 @@ def rank_pairs(ring, key: str):
 def first_rise(ring, key: Optional[str], fields, t_from: float, t_to: float):
     """The first rise of any of ``fields`` on rank ``key`` whose rank clock lies after ``t_from``:
     (seen_ts, lo) -- the work began in (lo, seen_ts], lo = max(previous rank clock, t_from).  The rank file
-    is written every SGLANG_WEG2_RANKSTATS_PERIOD_S (1 s), so seen_ts - lo is the instrument's resolution.
+    is written every FLLIPER_PDFLIP_RANKSTATS_PERIOD_S (1 s), so seen_ts - lo is the instrument's resolution.
     None when the ring holds no such rise up to ``t_to``."""
     if not ring or key is None:
         return None

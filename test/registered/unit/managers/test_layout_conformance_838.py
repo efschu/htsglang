@@ -37,14 +37,14 @@ mutant section proves the over-eager version dies.
 import types
 import unittest
 
-from sglang.srt.managers import layout_conformance as lc
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers import layout_conformance as lc
+from flliper.srt.managers.phase_policy import (
     PHASE_PP,
     PHASE_TP,
     PhasePolicyConfig,
     drain_stall_deadline_s,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -360,7 +360,7 @@ class TheAlarmQuotesTheVerdictItSaw(unittest.TestCase):
     """
 
     def _holder(self, calls, phase_seq):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         batch = types.SimpleNamespace(
             reqs=[types.SimpleNamespace(rid="rid-9")],

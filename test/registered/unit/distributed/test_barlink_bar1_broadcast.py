@@ -32,12 +32,12 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     BarlinkBar1Transport,
     bc_plan,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -217,7 +217,7 @@ class TestBcPlanArithmetic(CustomTestCase):
 
     def test_send_offsets_are_aligned_when_the_slot_is(self):
         for nbytes in (4096 * 3 + 5, 100, 16, 1 << 20):
-            for offset, _laenge in bc_plan(nbytes, 4096):
+            for offset, _length in bc_plan(nbytes, 4096):
                 self.assertEqual(offset % 16, 0, msg=f"{nbytes}")
 
     def test_rejects_nonsense(self):
@@ -451,7 +451,7 @@ class TestInPlaceContract(CustomTestCase):
         self.assertEqual(calls, [])
 
     def test_a_source_outside_the_group_is_refused(self):
-        from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+        from flliper.srt.distributed.device_communicators.barlink_bar1 import (
             Bar1Unavailable,
         )
 
@@ -512,11 +512,11 @@ class TestHandlesGate(CustomTestCase):
 
     def test_the_answer_does_not_depend_on_the_rank(self):
         """Two ranks answering differently is a hang, not an error."""
-        antworten = {
+        answers = {
             _stub(rank=r, world=4).handles("broadcast", HANDOVER_BYTES)
             for r in range(4)
         }
-        self.assertEqual(antworten, {True})
+        self.assertEqual(answers, {True})
 
     def test_the_other_ops_are_unaffected(self):
         t = _stub(ag_on=True, ag_min_bytes=16, ag_max_rounds=16)
@@ -531,7 +531,7 @@ class TestHandlesGate(CustomTestCase):
 #: packet, above one packet, exactly one slot, one over) are the same as
 #: at 8 MiB.
 _SLOT = 1024
-_LEITER = (1, 4, 12, 128, 1024 - 1, 1024, 1024 + 1, 4096)
+_LADDER = (1, 4, 12, 128, 1024 - 1, 1024, 1024 + 1, 4096)
 
 
 class TestTheShippedFloor(CustomTestCase):
@@ -547,7 +547,7 @@ class TestTheShippedFloor(CustomTestCase):
         import re
         from pathlib import Path
 
-        import sglang.srt.distributed.device_communicators.barlink_bar1 as mod
+        import flliper.srt.distributed.device_communicators.barlink_bar1 as mod
 
         text = Path(mod.__file__).read_text(encoding="utf-8")
         hits = re.search(
@@ -558,7 +558,7 @@ class TestTheShippedFloor(CustomTestCase):
         return hits.group(1)
 
     def test_broadcast_floor_is_one_byte(self):
-        self.assertEqual(self._default("SGLANG_BARLINK_BAR1_BC_MIN_BYTES"), "1")
+        self.assertEqual(self._default("FLLIPER_BARLINK_BAR1_BC_MIN_BYTES"), "1")
 
     def test_all_gather_floor_is_one_byte(self):
         """The twin of the same bug, and it was live.
@@ -568,12 +568,12 @@ class TestTheShippedFloor(CustomTestCase):
         capture" situation. A 12-byte shard would have aborted a run the
         same way.
         """
-        self.assertEqual(self._default("SGLANG_BARLINK_BAR1_AG_MIN_BYTES"), "1")
+        self.assertEqual(self._default("FLLIPER_BARLINK_BAR1_AG_MIN_BYTES"), "1")
 
     def test_the_stub_mirrors_the_shipped_floor(self):
         self.assertEqual(
             str(_stub().bc_min_bytes),
-            self._default("SGLANG_BARLINK_BAR1_BC_MIN_BYTES"),
+            self._default("FLLIPER_BARLINK_BAR1_BC_MIN_BYTES"),
         )
 
 
@@ -591,13 +591,13 @@ class TestTheSizeLadder(CustomTestCase):
         return _stub(rank=rank, world=world, a2a_slot=_SLOT)
 
     def test_the_gate_says_yes_to_every_rung(self):
-        for n in _LEITER:
+        for n in _LADDER:
             self.assertTrue(
                 self._stub().handles("broadcast", n), msg=f"{n} B rejected"
             )
 
     def test_the_plan_covers_every_rung_exactly_once(self):
-        for n in _LEITER:
+        for n in _LADDER:
             plan = bc_plan(n, _SLOT)
             seen = []
             for offset, length in plan:
@@ -607,7 +607,7 @@ class TestTheSizeLadder(CustomTestCase):
             self.assertEqual(seen, list(range(n)), msg=f"{n} B")
 
     def test_the_round_count_matches_the_gate(self):
-        for n in _LEITER:
+        for n in _LADDER:
             self.assertEqual(
                 len(bc_plan(n, _SLOT)), self._stub().bc_rounds(n), msg=f"{n} B"
             )
@@ -623,13 +623,13 @@ class TestTheSizeLadder(CustomTestCase):
         self.assertEqual(self._stub().bc_rounds(12), 1)
 
     def test_every_rung_delivers_the_right_bytes(self):
-        for n in _LEITER:
+        for n in _LADDER:
             for src in range(3):
                 _assert_all_hold_the_source(self, 3, n, src, _SLOT)
 
     def test_every_rung_keeps_the_pairwise_contract(self):
         """Per round: ``e_len[i]`` here == ``s_len[rank]`` on rank ``i``."""
-        for n in _LEITER:
+        for n in _LADDER:
             tables = _tables(3, n, src=1, slot=_SLOT)
             for k in range(len(tables[0])):
                 for r in range(3):
@@ -645,7 +645,7 @@ class TestLoudBar(CustomTestCase):
     """The bar in barlink._select, before and after this change."""
 
     def _comm(self, transport):
-        from sglang.srt.distributed.device_communicators.barlink import (
+        from flliper.srt.distributed.device_communicators.barlink import (
             BarlinkCommunicator,
         )
 
@@ -655,7 +655,7 @@ class TestLoudBar(CustomTestCase):
         return c
 
     def test_the_handover_case_no_longer_raises(self):
-        from sglang.srt.distributed.device_communicators import barlink as mod
+        from flliper.srt.distributed.device_communicators import barlink as mod
 
         t = _stub(a2a_slot=8384512)
         c = self._comm(t)
@@ -666,7 +666,7 @@ class TestLoudBar(CustomTestCase):
             )
 
     def test_reduce_scatter_still_raises_and_names_the_new_coverage(self):
-        from sglang.srt.distributed.device_communicators import barlink as mod
+        from flliper.srt.distributed.device_communicators import barlink as mod
 
         c = self._comm(_stub())
         with mock.patch.object(mod, "graph_capture_running", lambda: True):
@@ -688,7 +688,7 @@ class TestLoudBar(CustomTestCase):
         `bc_max_rounds` would make the transport a loop), not a threshold
         somebody copied.
         """
-        from sglang.srt.distributed.device_communicators import barlink as mod
+        from flliper.srt.distributed.device_communicators import barlink as mod
 
         t = _stub(a2a_slot=1024, bc_max_rounds=4)
         c = self._comm(t)
@@ -705,7 +705,7 @@ class TestLoudBar(CustomTestCase):
         reads like a contradiction and was one: coverage is not the op, it
         is the op AND the size.
         """
-        from sglang.srt.distributed.device_communicators import barlink as mod
+        from flliper.srt.distributed.device_communicators import barlink as mod
 
         t = _stub()
         c = self._comm(t)

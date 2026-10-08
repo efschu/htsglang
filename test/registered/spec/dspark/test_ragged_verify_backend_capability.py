@@ -6,15 +6,15 @@ wheels (sgl_kernel) at module scope, which fail to import on CPU runners.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestRaggedVerifyGraphCapability(CustomTestCase):
     def test_base_backend_defaults_false(self):
-        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+        from flliper.srt.layers.attention.base_attn_backend import AttentionBackend
 
         self.assertFalse(AttentionBackend.supports_ragged_verify_graph)
 
@@ -22,13 +22,13 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         """Every backend with a ragged-verify metadata path must opt in; a
         dropped flag silently disables ragged graphs for that backend (the
         runner falls back to eager with no other test going red)."""
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from flliper.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
-        from sglang.srt.layers.attention.flashattention_backend import (
+        from flliper.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
-        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+        from flliper.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 
         for backend in (
             TRTLLMHAAttnBackend,

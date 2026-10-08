@@ -11,7 +11,7 @@ model. The mamba conv-state cache is the case that bites: it stores recent
 *input activations* of the causal conv1d, `mamba_utils.mamba2_state_dtype()`
 builds it from the config, and on sm75 the GDN in_proj emits float16 into a
 bfloat16 cache -- `Index put requires source and destination dtypes match`, on
-the boot path of every hybrid GDN Qwen3.5. (`SGLANG_MAMBA_CONV_DTYPE=float16`
+the boot path of every hybrid GDN Qwen3.5. (`FLLIPER_MAMBA_CONV_DTYPE=float16`
 is the workaround this removes.)
 
 The fix is a pin on assignment: `ModelConfig.dtype` is a property whose setter
@@ -28,10 +28,10 @@ import unittest
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.mamba_utils import mamba2_state_dtype
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.configs.mamba_utils import mamba2_state_dtype
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -60,7 +60,7 @@ class TestRuntimeDtypeOverrideReachesTheConvCache(unittest.TestCase):
     def setUp(self):
         # The conv dtype has an explicit env override that outranks everything;
         # it must be absent for the config-derived default to be observable.
-        env = envs.SGLANG_MAMBA_CONV_DTYPE
+        env = envs.FLLIPER_MAMBA_CONV_DTYPE
         prior = os.environ.get(env.name)
 
         def restore():
@@ -117,13 +117,13 @@ class TestRuntimeDtypeOverrideReachesTheConvCache(unittest.TestCase):
         self.assertIs(mamba2_state_dtype(hf_config).conv, torch.float16)
 
     def test_an_explicit_env_override_still_outranks_the_runtime_dtype(self):
-        """SGLANG_MAMBA_CONV_DTYPE is the documented escape hatch and keeps
+        """FLLIPER_MAMBA_CONV_DTYPE is the documented escape hatch and keeps
         precedence -- including against the runtime override."""
         hf_config = _bf16_checkpoint_config()
         mc = _model_config_without_loading(hf_config)
         mc.dtype = torch.float16
 
-        with envs.SGLANG_MAMBA_CONV_DTYPE.override("bfloat16"):
+        with envs.FLLIPER_MAMBA_CONV_DTYPE.override("bfloat16"):
             self.assertIs(mamba2_state_dtype(hf_config).conv, torch.bfloat16)
 
         # ... and without it, the runtime dtype is back in charge.
