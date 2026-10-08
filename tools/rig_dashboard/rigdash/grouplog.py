@@ -25,6 +25,7 @@ import os
 import threading
 from typing import Dict, List, Optional, Tuple
 
+from . import names as N
 from . import parse
 
 MARK = b"Decode rank batch, rank: 0,"
@@ -43,14 +44,15 @@ def _log_path(ipc: dict, suffix: str, pattern: str) -> Optional[str]:
     ev = os.path.join(os.path.dirname(os.path.dirname(os.path.normpath(d))), "evidence")
     for g in ("D", "P"):
         env = (((ipc.get("launch") or {}).get(g) or {}).get("env") or {})
-        m = env.get(MANIFEST_ENV)
+        m = N.env_get(env, MANIFEST_ENV)
         if m and m.endswith(".shared_cache"):
             p = os.path.join(ev, os.path.basename(m)[:-len(".shared_cache")] + suffix)
             if os.path.exists(p):
                 return p
     tag = ipc.get("tag")
     if tag:
-        cands = glob.glob(os.path.join(ev, pattern % tag))
+        # F0-B: logs of the old tree are ``boot_<old>_<tag>_*``, of a renamed tree ``boot_<new>_<tag>_*``
+        cands = [c for pat in N.glob_variants(pattern) for c in glob.glob(os.path.join(ev, pat % tag))]
         if cands:
             return max(cands, key=lambda p: os.path.getmtime(p))
     return None
@@ -139,6 +141,7 @@ def decode_rounds(ipc: dict) -> Optional[List[Tuple[float, float]]]:
 # pricing verdict as ``oldest_waiter_arrival``).  Only the line prefix (frozen parse.RE_PREFIX / parse_ts) and the
 # rid token are read.  IPC follow-up: flip_user_time.arrival_ts at the front, then this reader falls.
 SESSION_MARK = b"WEG2 SESSION rid="
+SESSION_MARKS = N.bytes_variants("WEG2 SESSION rid=")      # F0-B: the old and the renamed spelling
 MAX_ARRIVALS = 200000         # rids kept per log (first stamp wins)
 
 
@@ -171,7 +174,7 @@ class FrontArrivals:
                         lines = (self.tail + buf).split(b"\n")
                         self.tail = lines.pop()
                         for ln in lines:
-                            if SESSION_MARK in ln:
+                            if any(m in ln for m in SESSION_MARKS):
                                 self._add(ln)
             return self.first
 
@@ -180,7 +183,10 @@ class FrontArrivals:
         m = parse.RE_PREFIX.match(txt)
         if not m:
             return
-        rid = txt.split("WEG2 SESSION rid=", 1)[1].split(" ", 1)[0].strip()
+        tail = N.marker_tail(txt, "WEG2 SESSION rid=")
+        if tail is None:
+            return
+        rid = tail.split(" ", 1)[0].strip()
         if rid and rid not in self.first and len(self.first) < MAX_ARRIVALS:
             self.first[rid] = parse.parse_ts(m)
 
