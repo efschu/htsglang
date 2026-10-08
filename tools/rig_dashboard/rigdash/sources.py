@@ -27,6 +27,8 @@ import time
 import urllib.request
 from typing import Callable, Dict, List, Optional
 
+from . import names as N
+
 NVSMI_FIELDS = [
     "index", "name", "uuid", "power.draw", "power.limit", "memory.used",
     "memory.total", "utilization.gpu", "temperature.gpu", "clocks.sm",
@@ -85,7 +87,7 @@ def container_log_dirs(inspect: List[dict], host_prefix: str) -> Dict[str, str]:
     for c in inspect:
         name = (c.get("Name") or "").lstrip("/")
         for m in c.get("Mounts") or []:
-            if m.get("Destination") == "/var/lib/htsglang/evidence":
+            if m.get("Destination") in N.state_path_variants("/var/lib/htsglang/evidence"):     # F0-B: old and renamed volume
                 src = m.get("Source") or ""
                 if host_prefix and src.startswith(host_prefix):
                     src = src[len(host_prefix):] or "/"
@@ -155,6 +157,31 @@ def http_json(url: str, timeout: float = 3.0):
         return json.loads(r.read().decode("utf-8"))
 
 
+_FRONT_ROUTE: Dict[str, str] = {}     # endpoint -> the route spelling that answered last
+
+
+def front_state(endpoint: str, timeout: float = 3.0):
+    """``GET <endpoint>/weg2/state`` for a front of either generation (F0-B): the renamed front serves ``/pdflip/state`` and
+    keeps the old prefix as an alias (shims.patch); an old front only knows ``/weg2/state``.  The spelling that answered is
+    remembered per endpoint, so the second poll is one request again; when it stops answering, the other one is tried."""
+    base = endpoint.rstrip("/")
+    routes = list(N.marker_variants("/weg2/state"))
+    known = _FRONT_ROUTE.get(base)
+    if known in routes:
+        routes.remove(known)
+        routes.insert(0, known)
+    err: Optional[Exception] = None
+    for route in routes:
+        try:
+            val = http_json(base + route, timeout)
+        except Exception as e:      # noqa: BLE001 -- 404 on the other generation's route, or the front is down: try the next
+            err = e
+            continue
+        _FRONT_ROUTE[base] = route
+        return val
+    raise err if err else RuntimeError("no front route")
+
+
 def pcie_mean(hist, now: float, window_s: float = 2.0):
     """Mean PCIe RX/TX per card over the samples inside the window.
 
@@ -195,7 +222,7 @@ class Sources:
         for ep in cfg.get("weg2_fronts") or []:
             self.samplers["front:" + ep] = Sampler(
                 "front:" + ep, cfg.get("front_period", 10.0),
-                (lambda ep=ep: http_json(ep.rstrip("/") + "/weg2/state", 3.0)))
+                (lambda ep=ep: front_state(ep)))
         self.gpu_hist = collections.deque(maxlen=int(15 * 60 / cfg.get("gpu_period", 2.0)) + 5)
         # ~10 s of PCIe samples at the 0.25-s period (the mean uses the last 2 s)
         self.pcie_hist = collections.deque(maxlen=int(30.0 / cfg.get("pcie_period", 1.0)))
@@ -328,7 +355,7 @@ class Sources:
 
     def sample_docker(self):
         ssh = self.cfg["docker_ssh"]
-        ps = run(ssh + ["docker ps -a --filter name=htsglang --format '%s'" % DOCKER_PS_FORMAT], 12.0)
+        ps = run(ssh + ["docker ps -a %s --format '%s'" % (N.docker_name_filters(), DOCKER_PS_FORMAT)], 12.0)
         rows = parse_docker_ps(ps)
         running = [r["Names"] for r in rows if (r.get("State") == "running")]
         dirs, health_out = {}, {}

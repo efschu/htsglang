@@ -211,6 +211,22 @@ add_flag() { # add_flag <flag> <bool-ish> : append flag when value is truthy
 export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="${SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR:-$HICACHE_STORAGE_DIR}"
 mkdir -p "$SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR" 2>/dev/null || true
 
+# --- module name of the tree that runs (F0-B, rename R5) --------------------
+# The release entrypoint hands this wrapper either generation of the code stand (PYTHONPATH=<stand>/python): the old layout
+# python/<old package> or the renamed python/flliper. "-m sglang.launch_server" only exists in the first. The old token is
+# written split (sg""lang) so the mechanical rename leaves this detection alone. No interpreter is started for the check
+# (the package dir is looked up on PYTHONPATH, then in the usual site-packages): the renamed tree is the one that has a
+# flliper/__init__.py, the old tree has none.
+# F0B-PKGMOD-BEGIN
+PKGMOD=sg""lang
+_f0b_ifs=$IFS; IFS=:
+for _f0b_d in ${PYTHONPATH:-} ${F0B_SITE_DIRS:-${VIRTUAL_ENV:-/opt/venv}/lib/python3*/site-packages:/usr/local/lib/python3*/site-packages:/usr/lib/python3/dist-packages}; do
+    if [ -f "$_f0b_d/flliper/__init__.py" ]; then PKGMOD=flliper; break; fi
+done
+IFS=$_f0b_ifs
+unset _f0b_ifs _f0b_d
+# F0B-PKGMOD-END
+
 # --- planner / GUI mode ---------------------------------------------------
 : "${MODE:=server}"
 if [ "$MODE" = "planner" ] || [ "$MODE" = "gui" ]; then
@@ -226,7 +242,7 @@ if [ "$MODE" = "planner" ] || [ "$MODE" = "gui" ]; then
         echo "[htsglang-entrypoint] and it can start, stop and download models." >&2
         echo "[htsglang-entrypoint] Publish this port to 127.0.0.1 only." >&2
     fi
-    args=(python3 -m sglang.planner --serve --host "$PLANNER_HOST" --port "$PLANNER_PORT")
+    args=(python3 -m "$PKGMOD.planner" --serve --host "$PLANNER_HOST" --port "$PLANNER_PORT")
     # shellcheck disable=SC2206  # deliberate word splitting
     [ -n "$PLANNER_ARGS" ] && args+=($PLANNER_ARGS)
     args+=("$@")
@@ -341,7 +357,7 @@ done
 # --- uneven-TP runtime knobs (passed through to the process) --------------
 export SGLANG_UNEVEN_MLP_VECTOR="${SGLANG_UNEVEN_MLP_VECTOR:-}"
 
-args=(python3 -m sglang.launch_server)
+args=(python3 -m "$PKGMOD.launch_server")
 
 add --model-path "$MODEL_PATH"
 add --served-model-name "$SERVED_MODEL_NAME"

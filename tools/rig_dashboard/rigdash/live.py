@@ -25,6 +25,7 @@ import time
 from typing import Dict, List, Optional
 
 from . import ipcfields, ipcstate, parse, redact, stops
+from . import names as N
 
 DEFAULT_LOG_GLOBS = [
     "/spinning/docker-acceptance/*/evidence/boot_*.log",
@@ -49,11 +50,11 @@ FLIP_TAIL_MAX_S = 60.0        # a 'first decode' later than this after FLIP done
 
 # Launcher summary lines worth showing as the boot's "start form" (read-only
 # view of what the weg2 launcher actually emitted; the full list is ~250 lines).
-LAUNCH_KEYS = (
+LAUNCH_KEYS = tuple(v for k in (
     "WEG2 BOOT tag=", "WEG2-FORM ", "NVML -> CUDA ordinal map", "POWER-LIMIT nvml",
     "SCHEDULING FLAGS AS EMITTED", "SCHEDULING KNOBS", "X PROVENANCE", "X CEILING",
     "IDLE POLICY", "budget P group=", "budget D group=", "host preflight", "WEG2-L2 D hicache_size",
-)
+) for v in N.marker_variants(k))     # F0-B: a renamed launcher stamps the renamed marker; both spellings are listed
 MAX_LAUNCH_LINES = 40
 
 RE_GROUP = re.compile(r"^(?P<stem>.+?)\.(?P<group>P|D|front)\.log$")
@@ -123,10 +124,10 @@ def launch_lines(lines: List[str]) -> List[str]:
     """The launcher's key summary lines, de-duplicated, in order, prefix stripped."""
     out, seen = [], set()
     for ln in lines:
-        i = ln.find("WEG2-LAUNCH ")
+        i, spelled = N.find_marker(ln, "WEG2-LAUNCH ")
         if i < 0:
             continue
-        body = redact.clean(ln[i + len("WEG2-LAUNCH "):].strip())
+        body = redact.clean(ln[i + len(spelled):].strip())
         if body is None or not any(k in body for k in LAUNCH_KEYS) or body in seen:
             continue
         seen.add(body)

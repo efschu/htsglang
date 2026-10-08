@@ -123,6 +123,9 @@ NON_LOG_ALLOWED = {
     ("redact.py", "64fd5740307d"): "schneidet Punkt-geteilte Token (Discord) aus einem Issue-Text; liest keine Logzeile",
     ("redact.py", "7199860700f8"): "streift file:// vor einem Pfad im Issue-Text ab; liest keine Logzeile",
     ("redact.py", "ecfef1f2b1e9"): "erkennt einen Pfad mit Leerzeichen in Anfuehrungszeichen im Issue-Text; liest keine Logzeile",
+    # F0-B (rename R5): the fLLiper flat images of `docker images` (tag schema flliper:<version>-<cu> / flliper:<cu>-<sha10>, make_flat_ctx.sh)
+    ("weg2line.py", "0962e4486896"): "parses a repository:tag line of `docker images` (flliper:<version>-<cu>); reads no log line",
+    ("weg2line.py", "110301f6e596"): "parses a repository:tag line of `docker images` (flliper:<cu>-<sha10>); reads no log line",
 }
 
 
