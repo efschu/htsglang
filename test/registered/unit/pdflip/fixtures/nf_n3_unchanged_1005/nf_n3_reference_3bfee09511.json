@@ -44,8 +44,8 @@
   "--rank-tp-ratio": 3,
   "--rank-user-reserve-mib": 3,
   "--user-reserve-mib": 3,
-  "SGLANG_MOE_RESIDENT_EXPERT_FRACTION": 3,
-  "SGLANG_MOE_SCRATCH_SLOTS": 3
+  "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION": 3,
+  "FLLIPER_MOE_SCRATCH_SLOTS": 3
  },
  "vectors": {
   "d_foreign_context_mib": "1446,896,894",
