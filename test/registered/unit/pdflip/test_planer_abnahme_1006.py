@@ -55,6 +55,33 @@ def _sha(path: str) -> str:
         return hashlib.sha256(fh.read()).hexdigest()
 
 
+def _live_sha_as_snapshot(path: str) -> list:
+    """sha256 of a live profile in the spelling(s) the committed snapshot may be in (F0-G): the file as it is (a live dir already converted
+    by ``tools/release/profconv.py --convert-live``) and the kit's conversion of it (a live dir still carrying the old names -- the snapshots
+    are of the renamed spelling).  The snapshot is current when EITHER equals its recorded sha."""
+    import hashlib as _h
+    import importlib.util as _u
+    import sys as _s
+
+    kit = os.path.join(str(__import__("pathlib").Path(__file__).resolve().parents[4]), "tools", "release")
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    out = [_h.sha256(raw).hexdigest()]
+    try:
+        spec = _u.spec_from_file_location("profconv_snap", os.path.join(kit, "profconv.py"))
+        mod = _u.module_from_spec(spec)
+        _s.path.insert(0, kit)
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            _s.path.remove(kit)
+        imap = mod.R._load_imap(os.path.join(kit, "data", "merged_0928.json"))
+        out.append(_h.sha256(mod.convert(raw.decode("utf-8"), imap).encode("utf-8")).hexdigest())
+    except Exception:
+        pass
+    return out
+
+
 def _prov() -> dict:
     with open(GOLDEN_PROV, encoding="utf-8") as fh:
         return json.load(fh)
@@ -73,10 +100,10 @@ class TestProvenance(unittest.TestCase):
     def test_live_file_is_the_snapshot(self):
         if not os.path.isfile(LIVE_RELEASE):
             self.skipTest("live release profile not on this box: %s" % LIVE_RELEASE)
-        live = _sha(LIVE_RELEASE)
-        if live != _prov()["profile"]["sha256"]:
+        live = _live_sha_as_snapshot(LIVE_RELEASE)
+        if _prov()["profile"]["sha256"] not in live:
             self.skipTest("LIVE PROFILE MOVED under the AP-J snapshot (re-snapshot, regenerate golden + launch json + provenance): "
-                          "%s sha %s" % (LIVE_RELEASE, live))
+                          "%s sha %s" % (LIVE_RELEASE, live[0]))
 
     def test_launch_json_is_the_snapshot(self):
         # the ``launch`` sub-command leaves image paths as they are (asset_dirs=()), so does this comparison; the pchunk token is an
