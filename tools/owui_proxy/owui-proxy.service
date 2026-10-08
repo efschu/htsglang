@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenWebUI-Proxy vor der Rig-Front (feste Modellliste, Halten, Fortsetzen ueber Boots/Stundenwechsel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/spinning/htsglang-gpu/.venv/bin/python3 /opt/owui_proxy/owui_proxy.py --host 0.0.0.0 --port 30032 --upstream http://127.0.0.1:30030 --state-file /var/lib/owui_proxy/models.json
+StateDirectory=owui_proxy
+Restart=always
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

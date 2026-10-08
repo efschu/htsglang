@@ -6912,6 +6912,10 @@ class Front:
             logger.info("PDFLIP SESSION rid=%s sess=%s src=%s", rid, sess or "-", src)
         except Exception:  # noqa: BLE001 -- an instrument, never the route
             pass
+        try:
+            Front._req_book(self).client(rid, _st.client_ip(getattr(request, "headers", None), getattr(request, "remote", None)))  # DASHBOARD-IPC: client_ip
+        except Exception:  # noqa: BLE001 -- an instrument, never the route
+            pass
 
     def _sess_tag(self, rid: str) -> str:
         """`` sess=<hash>`` for a SERVED line (empty without one)."""

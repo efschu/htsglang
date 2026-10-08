@@ -235,6 +235,12 @@ class RequestBook:
             self.turns.popitem(last=False)
         row["sess"], row["turn"] = sess, n
 
+    def client(self, rid: Any, ip: Optional[str]) -> None:
+        """Origin address of the request (session_trace.client_ip), for the dashboard's session overview."""
+        row = self._row(rid)
+        if row is not None and ip:
+            row["client_ip"] = str(ip)
+
     def est_prompt(self, rid: Any, n: Optional[int]) -> None:
         row = self._row(rid)
         if row is not None and n:
@@ -483,7 +489,7 @@ class RequestBook:
         ft, end = row.get("first_token_ts"), float(now)
         ctx = self._context_tokens(row)
         rec = {
-            "rid": row["rid"], "session_id": row.get("sess"), "turn": row.get("turn"), "via": via,
+            "rid": row["rid"], "session_id": row.get("sess"), "turn": row.get("turn"), "client_ip": row.get("client_ip"), "via": via,
             "stream": row.get("stream"), "status": status,
             "arrival_ts": _r3(row["arrival_ts"]), "first_token_ts": _r3(ft), "end_ts": _r3(end),
             "ttft_ms": t.get("ttft_ms"), "queue_ms": t.get("queue_ms") if t else _ms(row["arrival_ts"], row.get("first_dispatch_ts")),
