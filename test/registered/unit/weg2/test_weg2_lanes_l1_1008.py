@@ -9,7 +9,7 @@ What is pinned (all hermetic, no GPU, no network):
   state.json / the request book / ``request_done`` / any log line, the Anthropic adapter drops the field as before;
 * ``weg2/lanes.py``: names fixed for L2-L4 (markers, the RPC), ``LaneState`` (floor, epoch, counters, no controller);
 * the progress beacon's lane trailer (16 bytes behind the 32 only with the switch on);
-* the catalog entries (CURATED) and the two edges K132/K133.
+* the catalog entries (CURATED) and the two edges K135/K136.
 """
 from __future__ import annotations
 
@@ -175,6 +175,22 @@ def test_the_anthropic_adapter_forwards_priority_only_with_the_switch():
         assert _convert_anthropic(priority=2, stream=True).priority == 2
 
 
+@pytest.mark.parametrize("raw", ["abc", 1.5, [1], {"a": 1}, float("nan"), float("inf"), True, ""])
+@pytest.mark.parametrize("switch", [False, True])
+def test_a_malformed_anthropic_priority_never_refuses_the_request(raw, switch):
+    """Before L1 `extra="ignore"` swallowed any `priority`; declaring the field must not make /v1/messages
+    refuse a request it ran before (switch off: nothing changes). Malformed -> the field is dropped."""
+    with envs.SGLANG_WEG2_LANES.override(switch):
+        assert _convert_anthropic(priority=raw).priority is None
+
+
+@pytest.mark.parametrize("raw,want", [("3", 3), (2.0, 2), (-4, 0), (10 ** 30, LN.LANE_MAX)])
+def test_the_anthropic_adapter_forwards_the_normalised_lane(raw, want):
+    with envs.SGLANG_WEG2_LANES.override(True):
+        assert _convert_anthropic(priority=raw).priority == want
+    assert _convert_anthropic(priority=raw).priority is None  # switch off: dropped
+
+
 def test_the_anthropic_model_declares_the_field():
     from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
 
@@ -219,6 +235,35 @@ def test_a_negative_or_malformed_priority_is_lane_0_with_a_warning(raw, why, cap
     line = next(m for m in caplog.messages if LN.MARK_FIELD in m)
     assert queued[0].rid in line and "lane 0" in line and why in line
     assert [r for r in caplog.records if LN.MARK_FIELD in r.getMessage()][0].levelno == logging.WARNING
+
+
+@pytest.mark.parametrize("raw,want", [
+    (-3, 0), ("abc", 0), (True, 0), (1.5, 0), ("2", 2), (2.0, 2), (4, 4), (0, 0), (10 ** 30, LN.LANE_MAX),
+])
+def test_the_forwarded_payload_carries_the_normalised_lane(raw, want):
+    """Front and scheduler must agree on one number: P and D get `payload["priority"]` as the front read it
+    (negative -> 0, malformed -> 0), so `req.priority >= floor` can never lock a lane-0 request out and the
+    P server never refuses a request for a malformed priority."""
+    with envs.SGLANG_WEG2_LANES.override(True):
+        body = _body(raw)
+        f, queued = _arrive(body)
+    assert queued[0].lane == want
+    assert queued[0].payload["priority"] == want and type(queued[0].payload["priority"]) is int
+    assert body["priority"] == want, "the dict the front posts on to P and D"
+
+
+def test_an_absent_priority_stays_absent_in_the_forwarded_payload():
+    with envs.SGLANG_WEG2_LANES.override(True):
+        body = _body()
+        _arrive(body)
+    assert "priority" not in body
+
+
+def test_switch_off_the_forwarded_payload_is_untouched():
+    for raw in (-3, "abc", True, 1.5, 5):
+        body = _body(raw)
+        _arrive(body)
+        assert body["priority"] == raw and type(body["priority"]) is type(raw)
 
 
 def test_the_lane_note_goes_with_the_rid_and_request_done_carries_the_lane():
@@ -375,7 +420,7 @@ def test_catalog_entries_and_edges_for_the_three_envs():
         assert hasattr(envs, n), n
     with open(os.path.join(WEG2, "kantenkatalog_1004.json"), encoding="utf-8") as fh:
         kanten = {k["id"]: k for k in json.load(fh)["kanten"]}
-    for kid, von in (("K132", "SGLANG_WEG2_LANE_KEEPALIVE_S"), ("K133", "SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS")):
+    for kid, von in (("K135", "SGLANG_WEG2_LANE_KEEPALIVE_S"), ("K136", "SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS")):
         k = kanten[kid]
         assert (k["von"], k["nach"], k["rel"]) == (von, "SGLANG_WEG2_LANES", "braucht")
         assert k["beleg"]["datei"] == "python/sglang/srt/environ.py" and "baeume" not in k
