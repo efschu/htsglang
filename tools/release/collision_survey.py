@@ -1,7 +1,14 @@
 """Item 600: list EVERY identifier collision of the mechanical pass in one tree (the tool itself exits at the first).
-usage: collision_survey.py <worktree root | ref:<git-ref>>   -- read only (ref: REPO=<git-repo>, no checkout)."""
+usage: collision_survey.py <worktree root | ref:<git-ref>>   -- read only (ref: REPO=<git-repo>, no checkout).
+Exemptions: COLLISION_OK_FILE (name rule, per line: data/collision_ok_1007_<line>.json) and IDENT_COLLISION_OK_FILE (ident map; default
+data/ident_collision_ok_1007.json) -- the same two files the mechanical pass reads. Exit code 0 = no OPEN collision (the acceptance
+"0 ungeklaerte Kollisionen"), 1 = open collisions listed, exempted ones are listed separately."""
 import os, sys, json, collections
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+KITDIR = os.path.dirname(os.path.abspath(__file__))
+_okf = os.path.join(KITDIR, "data", "ident_collision_ok_1007.json")
+if not os.environ.get("IDENT_COLLISION_OK_FILE") and os.path.isfile(_okf):
+    os.environ["IDENT_COLLISION_OK_FILE"] = _okf        # before the engine import: it reads the env at import time
+sys.path.insert(0, KITDIR)
 import rename_to_flliper as R
 
 
@@ -16,6 +23,7 @@ imap = R._load_imap(os.path.join(os.path.dirname(os.path.abspath(__file__)), "da
 n_files = 0
 coll = {}
 imapcoll = {}
+imapexempt = {}
 for path, mode, data in iter_tree(root):
     if mode == "120000":
         continue
@@ -32,6 +40,10 @@ for path, mode, data in iter_tree(root):
         coll[path] = clash
     if path.endswith(".py"):
         ic = R.ident_collisions(text, imap)
+        okw = R.IDENT_COLLISION_OK.get(path, frozenset())
+        if [c for c in ic if c[0] in okw]:
+            imapexempt[path] = [c for c in ic if c[0] in okw]
+        ic = [c for c in ic if c[0] not in okw]
         if ic:
             imapcoll[path] = ic
 print("files scanned:", n_files)
@@ -41,3 +53,8 @@ for p, c in sorted(coll.items()):
 print("ident-map collisions (files):", len(imapcoll))
 for p, c in sorted(imapcoll.items()):
     print("  I", p, json.dumps(c, sort_keys=True, default=str))
+print("ident-map collisions exempted by IDENT_COLLISION_OK_FILE (files):", len(imapexempt))
+for p, c in sorted(imapexempt.items()):
+    print("  E", p, json.dumps(c, sort_keys=True, default=str))
+print("OPEN collisions:", len(coll) + len(imapcoll))
+sys.exit(1 if coll or imapcoll else 0)

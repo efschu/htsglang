@@ -1,0 +1,486 @@
+{"text": "f\"unbekannte Verteilung {distribution!r}\"", "translation": "f\"unknown distribution {distribution!r}\""}
+{"text": "\"MoE-Dispatch/Combine -- verschraenkt im selben Lauf\"", "translation": "\"MoE-Dispatch/Combine -- interleaved in the same run\""}
+{"text": "\"TOTE VARIANTEN (nicht gemessen, nicht ersetzt):\"", "translation": "\"DEAD VARIANTS (not measured, not replaced):\""}
+{"text": "\"Keine lebende Variante. Es gibt nichts zu berichten.\"", "translation": "\"No alive variant. Nothing to report.\""}
+{"text": "\"ACHTUNG: Zeilen mit Fehlrunden sind KEINE Messwerte -- in diesen \"", "translation": "\"WARNING: Rows with failed rounds are NOT measurements -- in these \""}
+{"text": "\"Komma-getrennt. Eine nicht genannte Variante wird weder gebaut \"", "translation": "\"Comma-separated. A variant not mentioned will neither be built \""}
+{"text": "\"Sekunden Vorlauf je Variante und Form. Untergrenze 3.\"", "translation": "\"Seconds of warmup per variant and form. Lower bound 3.\""}
+{"text": "\"Groesste erlaubte Abweichung vom Sollergebnis. 0 heisst \"", "translation": "\"Maximum allowed deviation from the expected result. 0 means \""}
+{"text": "\"Vorlauf unter 3 s ist nicht vorgesehen -- auf 3 s gehoben.\"", "translation": "\"Warmup below 3 s is not intended -- raised to 3 s.\""}
+{"text": "\"Dieses Programm misst ein Kollektiv; mit einem Rang gibt es \"", "translation": "\"This program measures a collective; with one rank there is \""}
+{"text": "f\"--experts {args.experts} ist nicht durch {welt} teilbar. Beide \"", "translation": "f\"--experts {args.experts} is not divisible by {welt}. Both \""}
+{"text": "\"FLLIPER_BARLINK ist nicht gesetzt. Ohne barlink gibt es keinen \"", "translation": "\"FLLIPER_BARLINK is not set. Without barlink there is no \""}
+{"text": "\"HOCHRECHNUNG -- keine Messung (Eingaben: #PGAP-Fits = Messung, Lane-Raten = Messung, Rest = Modell)\"", "translation": "\"EXTRAPOLATION -- no measurement (inputs: #PGAP-Fits = measurement, Lane-Rates = measurement, rest = model)\""}
+{"text": "f\"  3080 Marlin (FP4+FP8) bei M=512 aus PP1-NVFP4-Fit: {m3080:.1f} TFLOPS (Lane-Wert M=2048: 63/60)\"", "translation": "f\"  3080 Marlin (FP4+FP8) at M=512 from PP1-NVFP4-Fit: {m3080:.1f} TFLOPS (Lane-value M=2048: 63/60)\""}
+{"text": "f\"  Modellprobe 8k: INT8 {8192/w_i:.0f} (gemessen 8905, Faktor {1/cal_i:.3f}), \"", "translation": "f\"  Model probe 8k: INT8 {8192/w_i:.0f} (measured 8905, factor {1/cal_i:.3f}), \""}
+{"text": "f\"  W4A8 {w:.0f} TOPS | {label}: Schnitt {cut}, Stufen {[round(t,1) for t in ts]} ms -> \"", "translation": "f\"  W4A8 {w:.0f} TOPS | {label}: Average {cut}, Stages {[round(t,1) for t in ts]} ms -> \""}
+{"text": "\"D, 5090-Rang, GEMM-Anteil je Verify-Runde (ms), gemessen je Kernel, summiert:\"", "translation": "\"D, 5090-rank, GEMM share per Verify-round (ms), measured per kernel, summed:\""}
+{"text": "\"\\n== v3: Kerne GEMESSEN (zcx7pv), Zusammensetzung/Schnitt/W4A8 = HOCHRECHNUNG ==\"", "translation": "\"\\n== v3: Cores MEASURED (zcx7pv), Composition/Average/W4A8 = EXTRAPOLATION ==\""}
+{"text": "f\"  3080 {lab3} | 5090 NVFP4 nativ + {lab}: Schnitt {cut}, Stufen \"", "translation": "f\"  3080 {lab3} | 5090 NVFP4 native + {lab}: Average {cut}, Stages \""}
+{"text": "f\"  3080 W4A8 {t:.0f} TOPS | 5090 NVFP4 nativ + {lab}: Schnitt {cut}, Stufen \"", "translation": "f\"  3080 W4A8 {t:.0f} TOPS | 5090 NVFP4 native + {lab}: Average {cut}, Stages \""}
+{"text": "f\"p_layer_stage nennt Stufe {max(stages)} bei {len(fs)} \"", "translation": "f\"p_layer_stage names stage {max(stages)} at {len(fs)} \""}
+{"text": "f\"resident_order nennt {len(order)} Ids, die Residenz dieses \"", "translation": "f\"resident_order names {len(order)} Ids, the residency of this \""}
+{"text": "f\"Platztausch-Karte: Layer {layer_id} Phase {phase} nennt Ids \"", "translation": "f\"Slot-swap card: Layer {layer_id} Phase {phase} names Ids \""}
+{"text": "f\"Platztausch-Karte: Extra-Experte {g} (Layer {layer_id}, \"", "translation": "f\"Slot-swap card: Extra-expert {g} (Layer {layer_id}, \""}
+{"text": "\"rearm_expert_offload_after_wake: der H31-Prefetch ist nicht gejoint \"", "translation": "\"rearm_expert_offload_after_wake: the H31-Prefetch is not joined \""}
+{"text": "\"ExpertRearmPrefetch.issue nach dem Join\"", "translation": "\"ExpertRearmPrefetch.issue after the join\""}
+{"text": "f\"#107: {len(_missing)} eigene kalte Experten haben in der \"", "translation": "f\"#107: {len(_missing)} own cold experts have in the \""}
+{"text": "f\"#97: {len(_missing)} eigene kalte Experten stehen in der \"", "translation": "f\"#97: {len(_missing)} own cold experts are in the \""}
+{"text": "f\"#91: {len(_missing)} kalte Experten stehen im Hotset \"", "translation": "f\"#91: {len(_missing)} cold experts are in the Hotset \""}
+{"text": "\"#134: resident_ids ist nicht sortiert, ein Experten-Band waere \"", "translation": "\"#134: resident_ids is not sorted, an expert band would be \""}
+{"text": "f\"Platztausch-Karte nennt {len(_order)} residente Zeilen fuer \"", "translation": "f\"Slot-swap card names {len(_order)} resident rows for \""}
+{"text": "f\"#159: die KARTE nennt {len(_card_res)} residente Experten \"", "translation": "f\"#159: the CARD names {len(_card_res)} resident experts \""}
+{"text": "\"#107 EXPERTEN-KARTE %s VERWORFEN: %s -- dieser Lauf rechnet \"", "translation": "\"#107 EXPERTEN-KARTE %s REJECTED: %s -- this run computes \""}
+{"text": "\"#108 STORE-WRITE UNTERDRUECKT: dieser Rang haelt \"", "translation": "\"#108 STORE-WRITE SUPPRESSED: this rank holds \""}
+{"text": "f\"#94: {len(outside_rows)} Zeilen liegen ausserhalb der Store-Datei \"", "translation": "f\"#94: {len(outside_rows)} rows lie outside the Store-file \""}
+{"text": "f\"#109: Store-Zeile {r} liegt ausserhalb der Datei \"", "translation": "f\"#109: Store-row {r} lies outside the file \""}
+{"text": "f\"capacity muss positiv sein, nicht {capacity}\"", "translation": "f\"capacity must be positive, not {capacity}\""}
+{"text": "f\"Platz {slot} liegt ausserhalb von 0..{self._capacity-1}\"", "translation": "f\"Slot {slot} lies outside 0..{self._capacity-1}\""}
+{"text": "f\"Platz {slot} gehoert schon Experte {occupied_rows}, nicht {expert}\"", "translation": "f\"Slot {slot} already belongs to expert {occupied_rows}, not {expert}\""}
+{"text": "f\"alle {self._capacity} Plaetze belegt, Experte {expert} bekaeme keinen\"", "translation": "f\"all {self._capacity} slots occupied, Expert {expert} would get none\""}
+{"text": "\"Tausch mit sich selbst ist keiner\"", "translation": "\"Swap with itself is no swap\""}
+{"text": "\"#112 REPACK UEBERSPRUNGEN: dieser Rang haelt Platzhalter \"", "translation": "\"#112 REPACK SKIPPED: this rank holds a placeholder \""}
+{"text": "\"PLATZHALTER GELOEST, dieser Rang rechnet\"", "translation": "\"PLACEHOLDER RESOLVED, this rank computes\""}
+{"text": "f\"RIEGEL BLEIBT ({_adopt.placeholder_reason()})\"", "translation": "f\"GUARD STAYS ({_adopt.placeholder_reason()})\""}
+{"text": "\"#108 ADOPTION ARMED: dieser Rang haelt PLATZHALTER. Kein \"", "translation": "\"#108 ADOPTION ARMED: this rank holds PLACEHOLDER. No \""}
+{"text": "\"Skip dequant fp8 wo_a (GGUF: wo_a carries no scale)\"", "translation": "\"Skip dequant fp8 wo_a (GGUF: wo_a carries no scale)\""}
+{"text": "f\"Image {i}:{im_begin}-{im_end} is split across chunk boundaries.\\n\"", "translation": "f\"Image {i}:{im_begin}-{im_end} is split across chunk boundaries.\\n\""}
+{"text": "\"H1b MTP-EMBED baut_eigenen=%s | from_target=%s \"", "translation": "\"H1b MTP-EMBED baut_eigenen=%s | from_target=%s \""}
+{"text": "\"#162 MTP-LM-HEAD baut_eigenen=%s | from_target=%s tie_word_embeddings=%s\"", "translation": "\"#162 MTP-LM-HEAD baut_eigenen=%s | from_target=%s tie_word_embeddings=%s\""}
+{"text": "\"#68 WORKER-TRANSPOSE: gedreht=%d von angeboten=%d (Schalter %s)\"", "translation": "\"#68 WORKER-TRANSPOSE: rotated=%d of offered=%d (switch %s)\""}
+{"text": "## Stufe 4 (#1427, 16.09. abends): die Schreibseite ist gemappt", "translation": "## Stage 4 (#1427, 16.09. evening): the write side is mapped"}
+{"text": "Stufe 3 hatte nur die Leseseite in place gebracht; Schreiben lief weiter", "translation": "Stage 3 had only brought the read side in place; Writing continued"}
+{"text": "Karte -> 1-GB-Staging-Ring -> Store-Thread -> Arena -> Umbindung, und die", "translation": "Card -> 1-GB-Staging-Ring -> Store-Thread -> Arena -> Rebinding, and the"}
+{"text": "Mamba-Zustaende durch einen 13-Slot-Host-Anker-Pool. Der Park-Test (6 x 100k)", "translation": "Mamba states through a 13-slot host anchor pool. The park test (6 x 100k)"}
+{"text": "starb an genau diesem Transit (xsn184-187).", "translation": "died at exactly this transit (xsn184-187)."}
+{"text": "* KV/Draft (`pool_host/arena_pool.py`): `write_backup` beansprucht je Seiten-", "translation": "* KV/Draft (`pool_host/arena_pool.py`): `write_backup` claims per page-"}
+{"text": "  Hash einen Arena-Slot (`arena_claim`: frisch / einem frueheren Shard", "translation": "  hash one arena slot (`arena_claim`: fresh / join a previous shard"}
+{"text": "  beitreten / schon COMPLETE), der Backup-Thread DMA't die K- und V-Extents", "translation": "  join / already COMPLETE), the backup thread DMAs the K and V extents"}
+{"text": "  dieses Rangs mit dem All-Layer-Kernel direkt in den Slot (Arena-Datenregion", "translation": "  of this rank with the All-Layer-Kernel directly into the slot (arena data region"}
+{"text": "  als Host-Puffer, Seitenschritt), der Ack merged die Extents in die", "translation": "  as host buffer, page stride), the ack merges the extents into the"}
+{"text": "  Abdeckung (`arena_complete`, COMPLETE sobald jeder Layer-Shard drin ist),", "translation": "  coverage (`arena_complete`, COMPLETE as soon as each layer shard is inside),"}
+{"text": "  nimmt die Leser-Referenz und markiert den Knoten store-praesent. Kein", "translation": "  takes the reader reference and marks the node store-present. No"}
+{"text": "  Staging, kein Ring, kein Store-Write, keine Umbindung.", "translation": "  staging, no ring, no store-write, no rebinding."}
+{"text": "* Mamba (`pool_host/arena_mamba_pool.py`): Ansichten je lokalem Layer", "translation": "* Mamba (`pool_host/arena_mamba_pool.py`): views per local layer"}
+{"text": "  (temporal) und je Conv-Segment (q|k|v) auf die Mamba-Arena, exakt der Schnitt", "translation": "  (temporal) and per Conv segment (q|k|v) onto the Mamba arena, exactly the slice"}
+{"text": "  aus `temporal_extents`/`conv_extents`; Backup = Index-Kopie Karte -> Ansicht,", "translation": "  from `temporal_extents`/`conv_extents`; Backup = index copy card -> view,"}
+{"text": "  Load = Rueckweg, Prefetch loest COMPLETE-Blobs in place auf", "translation": "  Load = return path, Prefetch resolves COMPLETE blobs in place"}
+{"text": "  (`arena_resolve_reads`, Haken in `_batch_io_v2`). Fensterteile kommen aus", "translation": "  (`arena_resolve_reads`, hook in `_batch_io_v2`). Window parts come from"}
+{"text": "* Refs auf CLAIMED-Slots sind erlaubt (der Knoten des Schreibers haelt eine ab", "translation": "* Refs to CLAIMED slots are allowed (the writer's node holds one from"}
+{"text": "  dem Claim); `free_slots` bumpt die Generation, eine spaete Vervollstaendigung", "translation": "  the claim); `free_slots` bumps the generation, a late completion"}
+{"text": "  wird abgewiesen.", "translation": "  is rejected."}
+{"text": "* Noch Transit: nichts fuer KV/Draft/Mamba; Sidecar-Pools (SWA/Indexer) gibt es", "translation": "* Still in transit: nothing for KV/Draft/Mamba; Sidecar pools (SWA/Indexer) do not exist"}
+{"text": "  auf diesem Modell nicht.", "translation": "  on this model."}
+{"text": "### Stufe 4, Metall-Lehren (xsn188-192, 16.09. abends)", "translation": "### Stage 4, metal lessons (xsn188-192, 16.09. evening)"}
+{"text": "* Bindung VOR der Pruefung (#1427e): `pool.arena` ist erst nach `ensure_bound`", "translation": "* Binding BEFORE the check (#1427e): `pool.arena` is only set after `ensure_bound`"}
+{"text": "  gesetzt; wer erst schaut und dann bindet, laesst jeden Rang ohne Prefetch", "translation": "  set; whoever checks first and then binds lets every rank without Prefetch"}
+{"text": "  (PP1/PP2 lesen den Store nie) auf dem Staging-Ring. Gleiches fuer den", "translation": "  (PP1/PP2 never read the store) on the staging ring. Same for the"}
+{"text": "  Draft-Pool (#1427g, bindet sonst erst beim ersten Draft-Lesen, das P nie tut)", "translation": "  Draft pool (#1427g, otherwise only binds at the first draft read, which P never does)"}
+{"text": "  und den Mamba-Pool der neu gebauten D-Gruppe (#1427c, Fensterteile nach dem", "translation": "  and the Mamba pool of the newly built D group (#1427c, window parts after the"}
+{"text": "  Rebind an den AKTUELLEN Pool).", "translation": "  Rebind to the CURRENT Pool)."}
+{"text": "* Ein ungebundener Pool gibt keine Platzhalter aus und schreibt keine fremden", "translation": "* An unbound pool emits no placeholders and writes no foreign"}
+{"text": "  Arena-Ids in seinen Staging-Puffer (#1427c/#1427g).", "translation": "  Arena-Ids into its staging buffer (#1427c/#1427g)."}
+{"text": "* Nicht in der Arena = Miss, nie Platten-Lesen in einen Platzhalter (#1427d);", "translation": "* Not in the Arena = Miss, never disk-read into a placeholder (#1427d);"}
+{"text": "  ein Raise im Storage-Thread liess die Anfrage ewig auf", "translation": "  a Raise in the Storage-Thread left the request waiting forever on"}
+{"text": "  `pool_transfers_done` warten (#1033e: Flag bei jedem Ausgang).", "translation": "  `pool_transfers_done` (#1033e: Flag on every exit)."}
+{"text": "* `op_fn is self._read_page` vergleicht zwei frische Bound-Method-Objekte und", "translation": "* `op_fn is self._read_page` compares two fresh Bound-Method-Objects and"}
+{"text": "  ist immer False (#1427e) -- per Name vergleichen.", "translation": "  is always False (#1427e) -- compare by name."}
+{"text": "* KV-Legs des Front brauchen denselben Epoch-Retry wie die Gewichts-Legs", "translation": "* KV-Legs of the Front need the same Epoch-Retry as the Weight-Legs"}
+{"text": "  (#1428); ein abgerissener Keep-alive hat sonst den Boot beim ersten Wake", "translation": "  (#1428); a dropped Keep-alive would otherwise kill the Boot on the first Wake"}
+{"text": "  gekillt, obwohl P 200 antwortete.", "translation": "  even though P answered 200."}
+{"text": "## Nachtrag 16.09. spät: Layout-Leiter je Größenklasse, YaRN je Klasse (Design, Nutzer-Order)", "translation": "## Addendum 16.09. late: Layout-Ladder per size class, YaRN per class (Design, user order)"}
+{"text": "**Ist (nach #1447):** Der P-Cut-Solver preist jeden Frontier-Kandidaten mit seinem", "translation": "**Is (after #1447):** The P-Cut-Solver prices every Frontier-Candidate with its"}
+{"text": "Host-Bounce (`PP-CUT HOST-PRICE`), der Cap-Floor (262144 + Chunk) ist auf dem", "translation": "Host-Bounce (`PP-CUT HOST-PRICE`), the Cap-Floor (262144 + Chunk) is on the"}
+{"text": "Austausch-Arm Standard, und es schifft der schnellste fundierbare Schnitt. Fundierbar", "translation": "Exchange-Arm standard, and it ships the fastest fundable cut. Fundable"}
+{"text": "ist heute nur 39,13,12, weil nur dessen Lane-Satz vermessen ist (5 Lanes, 15,75 GiB);", "translation": "is today only 39,13,12, because only its lane set is surveyed (5 Lanes, 15,75 GiB);"}
+{"text": "jeder unvermessene Schnitt wird mit dem Worst-Case (9 Lanes, 27,75 GiB) bepreist und", "translation": "each unsurveyed cut is priced at the worst-case (9 Lanes, 27,75 GiB) and"}
+{"text": "fällt am Ledger (Excess −1,3 GiB). Das `PDFLIP-XCHG-HOST-SLOT`-Instrument, aus dem die", "translation": "falls on the ledger (Excess −1,3 GiB). The `PDFLIP-XCHG-HOST-SLOT` instrument, from which the"}
+{"text": "Lanes gelernt werden, liefert seit Ring-off keine Zeilen mehr (0 in xsn203–208) —", "translation": "Lanes are learned, has delivered no rows since Ring-off (0 in xsn203–208) —"}
+{"text": "das ist die eine Wand vor der Leiter: **erst Lane-Messung wieder verdrahten, dann", "translation": "that is the single wall before the Ladder: **first re-wire Lane-Measurement, then"}
+{"text": "kann ein zweiter Schnitt überhaupt vermessen werden** (Boot mit", "translation": "can a second cut be measured at all** (Boot with"}
+{"text": "`FLLIPER_PDFLIP_PCUT_BOUNCE_SLACK_GIB` und Ledger-Spielraum, danach ist er in", "translation": "`FLLIPER_PDFLIP_PCUT_BOUNCE_SLACK_GIB` and Ledger-headroom, after that it is in"}
+{"text": "**Leiter (Design):** Größenklassen nach geschätzter Prompt-Länge des Frontends", "translation": "**Ladder (Design):** Size classes by estimated Prompt-Length of the Frontend"}
+{"text": "(`est_prompt`, schon vorhanden): ≤32k, ≤64k, ≤128k, ≤262k. Je Klasse der schnellste", "translation": "(`est_prompt`, already present): ≤32k, ≤64k, ≤128k, ≤262k. Per class the fastest"}
+{"text": "Schnitt der Frontier, dessen Pool `Klasse + Chunk` hält (bs1: der Pool muss nur den", "translation": "cut of the frontier, whose pool holds `Klasse + Chunk` (bs1: the pool only needs the"}
+{"text": "einen Prefill halten). Der Solver liefert die ganze Frontier bereits je Boot; die", "translation": "single Prefill). The Solver already delivers the whole Frontier per Boot; the"}
+{"text": "Leiter ist eine Tabelle `Klasse → (Schnitt, Pool, ms/Chunk)` aus derselben Rechnung.", "translation": "Ladder is a table `Klasse → (Schnitt, Pool, ms/Chunk)` from the same computation."}
+{"text": "**Re-Cut zur Laufzeit:** ein P-interner Layout-Flip (PP-Stufen tauschen Layer über", "translation": "**Re-Cut at runtime:** a P-internal Layout-Flip (PP-Stages swap Layers over"}
+{"text": "dieselben Host-Bounce-Lanes wie der P↔D-Austausch, kein D-Beteiligter), ausgelöst vom", "translation": "the same Host-Bounce-Lanes as the P↔D-Exchange, no D-party involved), triggered by the"}
+{"text": "Frontend, wenn die nächste Batch-Klasse einen anderen Schnitt verlangt als der", "translation": "Frontend, if the next Batch-class demands a different cut than the"}
+{"text": "installierte; Kosten ~1 Flip (1,6–2,0 s). Nur wenn der Backlog der Klasse den Flip", "translation": "installed; cost ~1 Flip (1,6–2,0 s). Only if the class backlog the Flip"}
+{"text": "amortisiert (dieselbe Break-even-Regel wie `FLIP-ECONOMICS`).", "translation": "(same Break-even-Rule as `FLIP-ECONOMICS`)."}
+{"text": "**YaRN je Klasse:** RoPE-Skalierung ist Ladezeit-Konfiguration des Modells; ein", "translation": "**YaRN per class:** RoPE-Scaling is load-time configuration of the Model; a"}
+{"text": "Faktorwechsel zur Laufzeit hieße Neu-Laden. Deshalb: Faktor pro Boot fest", "translation": "factor change at runtime would mean re-loading. Therefore: factor fixed per Boot"}
+{"text": "(`--json-model-override-args rope_scaling`), Klassen >262k (Faktor 2/3/4 → 524k/786k/", "translation": "(`--json-model-override-args rope_scaling`), classes >262k (factor 2/3/4 → 524k/786k/"}
+{"text": "1M) nur mit einem Boot dieses Faktors; D-Pool 697856 hält ~2,6×262k, P braucht dafür", "translation": "1M) only with one boot of this factor; D-Pool 697856 holds ~2,6×262k, P needs for that"}
+{"text": "die Pool-lastigen Schnitte (33,18,13 ff.). Automatik = Boot-Wahl, nicht Laufzeit-Wechsel.", "translation": "the Pool-heavy cuts (33,18,13 ff.). Automation = Boot-Choice, not runtime-Switch."}
+{"text": "f\"{REFUSAL_MARKER}: dieser Rang haelt PLATZHALTER-Gewichte \"", "translation": "f\"{REFUSAL_MARKER}: this rank holds PLACEHOLDER-weights \""}
+{"text": "f\"AH RANKS DISAGREE (raenge-nie-uneins): owner PP{owner} sent \"", "translation": "f\"AH RANKS DISAGREE (raenge-nie-uneins): owner PP{owner} sent \""}
+{"text": "f\"AH RANKS DISAGREE (raenge-nie-uneins): owner PP{owner} announced a chunk the \"", "translation": "f\"AH RANKS DISAGREE (raenge-nie-uneins): owner PP{owner} announced a chunk the \""}
+{"text": "f\"AH RANKS DISAGREE (raenge-nie-uneins): owner PP{owner} layer {lid} \"", "translation": "f\"AH RANKS DISAGREE (raenge-nie-uneins): owner PP{owner} layer {lid} \""}
+{"text": "\"PDFLIP-ADOPT-FIRSTFLIP begin -- D haelt Platzhalter, das erste \"", "translation": "\"PDFLIP-ADOPT-FIRSTFLIP begin -- D holds placeholder, the first \""}
+{"text": "\"PDFLIP-ADOPT-FIRSTFLIP done in %.2f s -- D traegt jetzt P's \"", "translation": "\"PDFLIP-ADOPT-FIRSTFLIP done in %.2f s -- D now carries P's \""}
+{"text": "\"H91 part C rule 3 (user: 'wartegrenze 60 s, dann zurueck zu P'): a request \"", "translation": "\"H91 part C rule 3 (user: 'wait limit 60 s, then back to P' (user order, translated)): a request \""}
+{"text": "\"W11b ACCOUNTING-GAP GEMELDET STATT VERWEIGERT: \"", "translation": "\"W11b ACCOUNTING-GAP REPORTED INSTEAD OF REFUSED: \""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} IGNORIERT: {name} hat {len(v)} \"", "translation": "f\"{D_RANK_SOLVE_MARKER} IGNORED: {name} has {len(v)} \""}
+{"text": "\" -- DARUEBER auf Rang %s\"", "translation": "\" -- OVER on rank %s\""}
+{"text": "\" -- KORRIDOR GERISSEN auf Rang %s: die Bytes passen, die \"", "translation": "\" -- CORRIDOR TORN on rank %s: the bytes fit, the \""}
+{"text": "\" [NICHT GEBUCHT: %s -- diese Zeile ist damit eine OBERGRENZE, \"", "translation": "\" [NOT BOOKED: %s -- this row is thus an UPPER LIMIT, \""}
+{"text": "f\"{_wc.MARKER} {label} ENTFAELLT: {', '.join(gaps)} fehlt -- \"", "translation": "f\"{_wc.MARKER} {label} DROPPED: {', '.join(gaps)} missing -- \""}
+{"text": "f\"{_wpd.MARKER} {_wpd.DIRECTION} {label}: Verweigerung abgeschaltet \"", "translation": "f\"{_wpd.MARKER} {_wpd.DIRECTION} {label}: Refusal disabled \""}
+{"text": "\"#159 FLIP-JOIN UNMOEGLICH -- dieser Boot kann nicht flippen:\"", "translation": "\"#159 FLIP-JOIN IMPOSSIBLE -- this boot cannot flip:\""}
+{"text": "\"     Der Austausch ist ein BESITZERWECHSEL: was die eine \"", "translation": "\"     The swap is an OWNER CHANGE: what the one \""}
+{"text": "\"#159 FLIP-JOIN ok: beide Gruppen halten je Layer dieselben Ids\"", "translation": "\"#159 FLIP-JOIN ok: both groups hold per layer the same Ids\""}
+{"text": "\"#107 EXPERTEN-KARTE failed: %s: %s\"", "translation": "\"#107 EXPERTEN-KARTE failed: %s: %s\""}
+{"text": "\". Ein Rang mit weniger als 2 Scratch-Zeilen baut keinen \"", "translation": "\". A rank with fewer than 2 Scratch-rows builds no \""}
+{"text": "f\"{_p_card.CARD_MARKER} ENTFAELLT: die Chunk-Transiente ist auf \"", "translation": "f\"{_p_card.CARD_MARKER} DROPPED: the Chunk-Transient is on \""}
+{"text": "f\"{_p_card.CARD_MARKER} ENTFAELLT: Referenz unlesbar: \"", "translation": "f\"{_p_card.CARD_MARKER} DROPPED: reference unreadable: \""}
+{"text": "f\"{_p_card.CARD_MARKER} ENTFAELLT: kein KV-Preis je Stufe (#156 entfiel \"", "translation": "f\"{_p_card.CARD_MARKER} DROPPED: no KV-price per stage (#156 dropped \""}
+{"text": "f\"{_p_card.CARD_MARKER} ENTFAELLT: Draft auf P \"", "translation": "f\"{_p_card.CARD_MARKER} DROPPED: Draft on P \""}
+{"text": "\"PP-CUT RESERVE (#141) IGNORIERT: --pp-cut-reserve-mib hat \"", "translation": "\"PP-CUT RESERVE (#141) IGNORED: --pp-cut-reserve-mib has \""}
+{"text": "\"PP-CUT KV-PREIS (#156): %d Token x Zelle je Stufe \"", "translation": "\"PP-CUT KV-PREIS (#156): %d Token x cell per Stage \""}
+{"text": "\" -- DARUEBER auf Stufe(n) %s\"", "translation": "\" -- OVER on stage(s) %s\""}
+{"text": "\"Nutzer 25.09.: NUR Gruppe D (TP3 auf allen Karten), kein P, kein Flip, keine \"", "translation": "\"User 25.09.: ONLY group D (TP3 on all cards), no P, no Flip, no \""}
+{"text": "\"#141: je P-Stufe die MiB, die auf der Karte NICHT den Gewichten \"", "translation": "\"#141: per P-stage the MiB that on the card NOT the weights \""}
+{"text": "\"#145 Term (b): je D-RANG (ordinal) der VRAM, den die SCHLAFENDE \"", "translation": "\"#145 Term (b): per D-RANG (ordinal) of the VRAM, which the SLEEPING \""}
+{"text": "\"#145 Term (c): je D-RANG (ordinal) der VRAM, den der Rang \"", "translation": "\"#145 Term (c): per D-RANG (ordinal) of the VRAM, which the rank \""}
+{"text": "\"#145: das Gegenstueck zu --pp-cut-reserve-mib auf der D-Seite. \"", "translation": "\"#145: the counterpart to --pp-cut-reserve-mib on the D-side. \""}
+{"text": "\"H91b: die Sitze (--max-running-requests), mit denen die Boots aus \"", "translation": "\"H91b: the seats (--max-running-requests), with which the boots from \""}
+{"text": "\"H91b: GEMESSENE Mehrkosten des Decode-CUDA-Graphen je zusaetzlichem \"", "translation": "\"H91b: MEASURED extra cost of the Decode-CUDA-Graph per additional \""}
+{"text": "\"H8: Komma-Liste von D-Boot-Logs (boot_weg2_<tag>_*.D.log), aus \"", "translation": "\"H8: comma-separated list of D-Boot-Logs (boot_weg2_<tag>_*.D.log), from \""}
+{"text": "\"H33: Komma-Liste von D-Boot-Logs, aus denen die KARTEN-Bilanz des \"", "translation": "\"H33: comma-separated list of D-Boot-Logs, from which the CARDS-balance of the \""}
+{"text": "\"H41: Komma-Liste von P-Boot-Logs (PDFLIP-GRAPH-POOL-Zeilen), aus denen \"", "translation": "\"H41: comma-separated list of P-Boot-Logs (PDFLIP-GRAPH-POOL-rows), from which \""}
+{"text": "\"H41c: Komma-Liste von P-Boot-Logs DERSELBEN Form mit mehr \"", "translation": "\"H41c: comma-separated list of P-boat logs of the SAME form with more \""}
+{"text": "\"H14: P.log,D.log,front.log EINES Boots, dessen erster Wake (D->P) \"", "translation": "\"H14: P.log,D.log,front.log of ONE boat, whose first Wake (D->P) \""}
+{"text": "\"#1369: user order 2026-09-14 (\\\"DIE 48GB MUESSEN WEG... wenn es \"", "translation": "\"#1369: user order 2026-09-14 (\\\"THE 48GB MUST GO... if it \\\" (user order, translated)\""}
+{"text": "\"dormant residue RESERVE for group D (census-korrigiert, neuere Messung \"", "translation": "\"dormant residue RESERVE for group D (census-corrected, newer measurement \""}
+{"text": "\"PDFLIP-VMM-EXPORTABLE on -- jede TMS-Allokation bekommt \"", "translation": "\"PDFLIP-VMM-EXPORTABLE on -- each TMS allocation gets \""}
+{"text": "\"PDFLIP-D-ADOPT on -- D startet mit --load-format dummy und \"", "translation": "\"PDFLIP-D-ADOPT on -- D starts with --load-format dummy and \""}
+{"text": "f\"PDFLIP-EXPERT-MAP REFUSED: {_reason} -- keine Karte \"", "translation": "f\"PDFLIP-EXPERT-MAP REFUSED: {_reason} -- no card \""}
+{"text": "\"max_tokens je Antwort; der Code steht vorn, D dekodiert bs1 nacheinander\"", "translation": "\"max_tokens per response; the code stands first, D decodes bs1 one by one\""}
+{"text": "\"Zusatz in der Kopfzeile gegen Store-Treffer aus Vorlaeufen\"", "translation": "\"Addition in the header against store hits from previous runs\""}
+{"text": "\"Default: aus --p-log abgeleitet\"", "translation": "\"Default: derived from --p-log\""}
+{"text": "\"Wartezeit fuer die letzten Logzeilen\"", "translation": "\"Wait time for the last log rows\""}
+{"text": "\"%s: keine WAKE-CREDIT P->D-Zeile mit Referenz -- die Form ist \"", "translation": "\"%s: no WAKE-CREDIT P->D row with reference -- the form is \""}
+{"text": "\"Eimer-CSV; Rohstrom daneben als .raw.csv\"", "translation": "\"Bucket CSV; raw stream beside as .raw.csv\""}
+{"text": "\"Tick-Preis hoechstens dieser Anteil der Periode, sonst Periode anheben\"", "translation": "\"Tick price at most this fraction of the period, otherwise raise the period\""}
+{"text": "\"nur 1-s-Eimer (Rohstrom ist Standard)\"", "translation": "\"only 1-s buckets (raw stream is default)\""}
+{"text": "\"argv-Regex des Eigentuemers; 'auto' = launcher/front dieses --tag\"", "translation": "\"argv regex of the owner; 'auto' = launcher/front of this --tag\""}
+{"text": "\"%s: keine PDFLIP-FLIP-ORDER epoch=0 src=D-Zeile\"", "translation": "\"%s: no PDFLIP-FLIP-ORDER epoch=0 src=D row\""}
+{"text": "\"%s: nur %d PDFLIP-FLIP-ORDER src=P-Zeilen, Flip %d fehlt\"", "translation": "\"%s: only %d PDFLIP-FLIP-ORDER src=P rows, Flip %d missing\""}
+{"text": "\"%s: Lane p%d ohne Quelle/Ziel im Flip seq %d\"", "translation": "\"%s: Lane p%d without source/target in Flip seq %d\""}
+{"text": "\"%s: Stufe %d ohne PDFLIP-SLEEP-TAG-TIME im Flip\"", "translation": "\"%s: stage %d without PDFLIP-SLEEP-TAG-TIME in the Flip\""}
+{"text": "\"%s: nur %d PDFLIP-FLIP-ORDER src=P-Zeilen, Flip %d fehlt\"", "translation": "\"%s: only %d PDFLIP-FLIP-ORDER src=P rows, Flip %d missing\""}
+{"text": "\"%s: P-Zeilen %s oder D-Verify-Graph %s fehlen\"", "translation": "\"%s: P rows %s or D-Verify-Graph %s missing\""}
+{"text": "\"RAENGE NIE UNEINS: ranks disagree on page_size \"", "translation": "\"RANKS NEVER DISAGREE: ranks disagree on page_size \""}
+{"text": "f\"expert pool: {E} lokale Zeilen mit {R} resident lassen {room} \"", "translation": "f\"expert pool: {E} local rows with {R} resident leave {room} \""}
+{"text": "f\"{units} Experten reichen nicht fuer {n} Raenge\"", "translation": "f\"{units} experts are not enough for {n} ranks\""}
+{"text": "f\"--rank-moe-ratio {list(ratios)} hat Summe <= 0\"", "translation": "f\"--rank-moe-ratio {list(ratios)} has sum <= 0\""}
+{"text": "f'{DRAFT_SHARE_EMBED_ENV}=\"{raw}\" ist kein Boolean'", "translation": "f'{DRAFT_SHARE_EMBED_ENV}=\"{raw}\" is not a Boolean'"}
+{"text": "f'{DENSE_REPACK_OUTSIDE_POOL_ENV}=\"{raw}\" ist kein Boolean'", "translation": "f'{DENSE_REPACK_OUTSIDE_POOL_ENV}=\"{raw}\" is not a Boolean'"}
+{"text": "\"Referenz mischt Baeume vor und nach H39 (checkpoint-format pool \"", "translation": "\"Reference mixes trees before and after H39 (checkpoint-format pool \""}
+{"text": "\"D-Referenz unvollstaendig in %s: %s\"", "translation": "\"D-reference incomplete in %s: %s\""}
+{"text": "f\"solve_stage_fraction_by_buffer_rule: {n} Stufen, aber {len(budgets_mib)} \"", "translation": "f\"solve_stage_fraction_by_buffer_rule: {n} stages, but {len(budgets_mib)} \""}
+{"text": "\"D-Karten-Referenz unvollstaendig in %s: Rang %s ohne gemessenen \"", "translation": "\"D-cards-reference incomplete in %s: rank %s without measured \""}
+{"text": "f\"solve_d_card: {n} Raenge, aber die Karten-Referenz \"", "translation": "f\"solve_d_card: {n} ranks, but the cards-reference \""}
+{"text": "f\"solve_d_card_ledger: {n} Raenge, aber das Ledger ({ledger.source}) \"", "translation": "f\"solve_d_card_ledger: {n} ranks, but the ledger ({ledger.source}) \""}
+{"text": "\"Referenz mischt D-Boots verschiedener Verify-Form ('%s', L): %s\"", "translation": "\"Reference mixes D-boats of different Verify-form ('%s', L): %s\""}
+{"text": "\"GDN-Geometrie: %d v-Koepfe sind kein Vielfaches von %d k-Koepfen\"", "translation": "\"GDN geometry: %d v-heads are not a multiple of %d k-heads\""}
+{"text": "'%s=\"%s\" ist keine Zahl'", "translation": "'%s=\"%s\" is not a number'"}
+{"text": "\"D_FIXED_MIB hat %d Eintraege, die D-Gruppe %d Raenge\"", "translation": "\"D_FIXED_MIB has %d entries, the D group %d ranks\""}
+{"text": "\"D_ACTIVATION_MIB hat %d Eintraege, die D-Gruppe %d Raenge\"", "translation": "\"D_ACTIVATION_MIB has %d entries, the D-group %d ranks\""}
+{"text": "\"keine P-Transiente in %s: kein Boot mit [vram-peak] auf allen %d Stufen\"", "translation": "\"no P-transient in %s: no boot with [vram-peak] on all %d stages\""}
+{"text": "\"Ueber-Boot %s: Chunk %s / Draft %s, die Referenz %s hat %d / %s\"", "translation": "\"Over-Boot %s: Chunk %s / Draft %s, the reference %s has %d / %s\""}
+{"text": "\"P-Karten-Referenz: %s Stufe %d -- kein weights-Release des D-Rangs %d \"", "translation": "\"P-cards-reference: %s stage %d -- no weights-release of D-rank %d \""}
+{"text": "\"ohne Zeitstempel\"", "translation": "\"without timestamp\""}
+{"text": "\"P-Karten-Referenz unvollstaendig in %s: Stufe %s ohne Chunk-0-Punkt, ohne \"", "translation": "\"P-cards-reference incomplete in %s: stage %s without Chunk-0 point, without \""}
+{"text": "\"P-Karten-Referenz %s mischt Chunks %s, Draft-auf-P %s bzw. Sitze %s; eine \"", "translation": "\"P-cards-reference %s mixes Chunks %s, Draft-on-P %s or seats %s; a \""}
+{"text": "\"P-Karten-Referenz %s mischt Mamba-Slots %s; K0 enthaelt den Mamba-Pool, \"", "translation": "\"P-cards-reference %s mixes Mamba-Slots %s; K0 contains the Mamba pool, \""}
+{"text": "\"P-Karte: Schnitt %s, die Referenz (%s) ist bei %s gemessen; der Kopfraum \"", "translation": "\"P-card: split %s, the reference (%s) is measured at %s; the headroom \""}
+{"text": "\"P-Karte: %d Sitze (P --max-running-requests), die Referenz (%s) ist bei \"", "translation": "\"P-card: %d seats (P --max-running-requests), the reference (%s) is at \""}
+{"text": "\"P-Karte: %d Stufen, aber %d Fractions / %d LRU / %d KV\"", "translation": "\"P-card: %d stages, but %d Fractions / %d LRU / %d KV\""}
+{"text": "\"%s: %d Stempel fuer %d Stufen\"", "translation": "\"%s: %d stamps for %d stages\""}
+{"text": "\"%s: kein voller %d-Token-Chunk auf Stufe(n) %s\"", "translation": "\"%s: no full %d-token chunk on stage(s) %s\""}
+{"text": "\"kein Schnitt von %d Schichten auf %d Stufen gibt jeder Stufe \"", "translation": "\"no split of %d layers on %d stages gives each stage \""}
+{"text": "\"%s: Launcher-Log ohne POWER-LIMIT- oder NVML-Ordinal-Zeile -- der Boot ist \"", "translation": "\"%s: Launcher log without POWER-LIMIT or NVML-ordinal line -- the boot is \""}
+{"text": "\"%s: kein 'REALIZED layer split' im Launcher-Log; --layers angeben\"", "translation": "\"%s: no 'REALIZED layer split' in the Launcher log; specify --layers\""}
+{"text": "\"%s: POWER-LIMIT-Zeile ohne Limit fuer nvml%s\"", "translation": "\"%s: POWER-LIMIT line without limit for nvml%s\""}
+{"text": "\"Stufenraten eines Boots (ab H57) als StageRates-Satz drucken.\"", "translation": "\"Print stage rates of a boot (from H57) as a StageRates set.\""}
+{"text": "\"Schnitt, sonst aus 'REALIZED layer split'\"", "translation": "\"Split, otherwise from 'REALIZED layer split'\""}
+{"text": "f\"kv_reserve_mib_per_stage: {n} Stufen, aber {len(draft)} \"", "translation": "f\"kv_reserve_mib_per_stage: {n} stages, but {len(draft)} \""}
+{"text": "f\"solve_expert_fraction_per_stage: {n} Stufen, aber \"", "translation": "f\"solve_expert_fraction_per_stage: {n} stages, but \""}
+{"text": "f\"d_rank_available_mib: {n} Karten, aber {len(fk)} Fremd-Kontexte / \"", "translation": "f\"d_rank_available_mib: {n} cards, but {len(fk)} foreign contexts / \""}
+{"text": "\"floor_bytes without floor_reason: the user law is 'Reserven NIE, \"", "translation": "\"floor_bytes without floor_reason: the user law is 'Reserves NEVER, \""}
+{"text": "Per-rank, always — the slowest rank is the clock (`langsamster-rang-taktgeber`),", "translation": "Per-rank, always — the slowest rank is the clock (`langsamster-rang-taktgeber`),"}
+{"text": "**No kill threshold** — Aufwand/Ertrag decides, and a small win that is cheap", "translation": "**No kill threshold** — effort/yield decides, and a small win that is cheap"}
+{"text": "r8-E-Werte mit korrigiertem Fenster — und ein Befund\"*:", "translation": "r8-E-values with corrected window — and a finding\"*:"}
+{"text": "  `BATTERY-STOP ... Prozesse halten die Module` (processes are holding the", "translation": "  `BATTERY-STOP ... Prozesse halten die Module` (processes are holding the"}
+{"text": "  cat $S/belege/*.txt | grep ERREICHT      # s12: arm proof per point", "translation": "  cat $S/belege/*.txt | grep ERREICHT      # s12: arm proof per point"}
+{"text": "  `prefill_kurve.json` (`abort_reason`, `reihenfolge`,", "translation": "  `prefill_kurve.json` (`abort_reason`, `reihenfolge`,"}
+{"text": "  `grundlinie_abweichung_pct`). On a hang, the py-spy dumps run on the host", "translation": "  `grundlinie_abweichung_pct`). On a hang, the py-spy dumps run on the host"}
+{"text": "f\"smoke output inkohaerent: only {smoke.get('zahlen_in_folge')} of \"", "translation": "f\"smoke output incoherent: only {smoke.get('zahlen_in_folge')} of \""}
+{"text": "f\"{len(unharvested)} boot(s) ohne Fatal-Ernte, first: \"", "translation": "f\"{len(unharvested)} boot(s) without Fatal harvest, first: \""}
+{"text": "f\"Grundlinie reproduziert nicht: at {worst} session(s) \"", "translation": "f\"Baseline not reproduced: at {worst} session(s) \""}
+{"text": "f\"rank {rank}: {visible} cards visible, erwartet genau 1 \"", "translation": "f\"rank {rank}: {visible} cards visible, expected exact 1 \""}
+{"text": "f\"  tick_fehler: {point.get('tick_fehler')}\"", "translation": "f\"  tick_fehler: {point.get('tick_fehler')}\""}
+{"text": "| V2 | Custom allreduce never activates on this rig (can_p2p false), so its capture/registration path was dead code | custom_all_reduce.py + #195 fix commit (this branch); \"Custom-Allreduce blieb inaktiv\" in R3 validation | Q5. NOTE: with P2P the path goes LIVE for the first time; the #195 collective-family fix in this branch is the prerequisite for even booting it under solo-draft/lane placements |", "translation": "| V2 | Custom allreduce never activates on this rig (can_p2p false), so its capture/registration path was dead code | custom_all_reduce.py + #195 fix commit (this branch); \"Custom-Allreduce remained inactive\" in R3 validation | Q5. NOTE: with P2P the path goes LIVE for the first time; the #195 collective-family fix in this branch is the prerequisite for even booting it under solo-draft/lane placements |"}
+{"text": "| V8 | Cross-rig RDMA plans (NORDSTERN) treat intra-rig links as SHM-bound floor | NORDSTERN L0/L1 notes | Q3; a higher intra-rig floor changes the cross-rig split, remeasure before re-planning |", "translation": "| V8 | Cross-rig RDMA plans (NORDSTERN) treat intra-rig links as SHM-bound floor | NORDSTERN L0/L1 notes | Q3; a higher intra-rig floor changes the cross-rig split, remeasure before re-planning |"}
+{"text": "f\"{nb} B ist kein Vielfaches von {esize} B ({a.dtype})\"", "translation": "f\"{nb} B is not a multiple of {esize} B ({a.dtype})\""}
+{"text": "f\"# {k}: NICHT hochgekommen -- {why}\"", "translation": "f\"# {k}: NOT come up -- {why}\""}
+{"text": "f\"# Pilot ({a.pilot} Iterationen je Zelle, feste Zahl auf beiden Raengen)\"", "translation": "f\"# Pilot ({a.pilot} iterations per cell, fixed number on both ranks)\""}
+{"text": "f\"# Plan von Rang 0 verteilt; geschaetzte Messdauer ~{est:.0f} s\"", "translation": "f\"# Plan from rank 0 distributed; estimated measurement duration ~{est:.0f} s\""}
+{"text": "f\"# Runde {rnd + 1}/{a.rounds} nach {time.time() - t0:.1f} s\"", "translation": "f\"# Round {rnd + 1}/{a.rounds} after {time.time() - t0:.1f} s\""}
+{"text": "f\"# Messung fertig in {time.time() - t0:.1f} s\"", "translation": "f\"# Measurement done in {time.time() - t0:.1f} s\""}
+{"text": "\"barlink gegen NCCL -- Kollektive, zwei Raenge, ein Lauf, verschraenkt\"", "translation": "\"barlink against NCCL -- collectives, two ranks, one run, interleaved\""}
+{"text": "f\"  nicht hochgekommen: {kk} -- {vv}\"", "translation": "f\"  did not come up: {kk} -- {vv}\""}
+{"text": "\"  Alle Zeiten in Mikrosekunden und VOLLE OPERATIONSDAUER.\"", "translation": "\"  All times in microseconds and FULL OPERATION DURATION.\""}
+{"text": "\"  Ein all_reduce hat keinen halben Weg -- nicht mit den\"", "translation": "\"  An all_reduce has no half way -- do not reconcile with the\""}
+{"text": "\"  Punkt-zu-Punkt-Zahlen (halber Round-trip) verrechnen.\"", "translation": "\"  point-to-point numbers (half round-trip).\""}
+{"text": "\"  MB/s = Nutzlast je Operation / p50, keine Busbandbreite.\"", "translation": "\"  MB/s = payload per operation / p50, not bus bandwidth.\""}
+{"text": "\"  ACHTUNG zu 'broadcast / barlink:shm': der shm-Transport bedient\"", "translation": "\"  NOTE on 'broadcast / barlink:shm': the shm transport serves\""}
+{"text": "\"  laut BarlinkShmTransport.BARLINK_OPS nur all_reduce. Ein broadcast\"", "translation": "\"  per BarlinkShmTransport.BARLINK_OPS only all_reduce. A broadcast\""}
+{"text": "\"  faellt dort auf die host-gestagte gloo-Ebene in barlink.py zurueck.\"", "translation": "\"  falls back to the host-based gloo layer in barlink.py there.\""}
+{"text": "\"  Die Zeile misst also NICHT den shm-Datenpfad, sondern gloo.\"", "translation": "\"  The row therefore does NOT measure the shm data path, but gloo.\""}
+{"text": "\"# Maschinenlesbar (VOLLE Operationsdauer, us):\"", "translation": "\"# Machine-readable (FULL operation duration, us):\""}
+{"text": "\"ABBRUCH: Zielkarten sind nicht frei -- \"", "translation": "\"ABORT: target cards are not free -- \""}
+{"text": "\". Es wird nichts verdraengt.\"", "translation": "\". Nothing is displaced.\""}
+{"text": "\"Messbudget je Zelle in Sekunden (ueber alle Runden)\"", "translation": "\"Measurement budget per cell in seconds (over all rounds)\""}
+{"text": "\"Warmup-Budget je Zelle in Sekunden\"", "translation": "\"Warmup budget per cell in seconds\""}
+{"text": "\"Verschraenkungsrunden; je Runde eine kurze Serie je Zelle\"", "translation": "\"Interleaving rounds; one short series per cell per round\""}
+{"text": "\"feste Pilotiterationen je Zelle (Rundenzahl-Schaetzung)\"", "translation": "\"Fixed pilot iterations per cell (round count estimate)\""}
+{"text": "  (`BEFUND_L2_NICHT_KOHAERENT.md`), so the second read path here is not a", "translation": "  (`BEFUND_L2_NICHT_KOHAERENT.md`), so the second read path here is not a"}
+{"text": "\"s13_auswertung.py: bar1_gruppen marker literal not found\"", "translation": "\"s13_auswertung.py: bar1_gruppen marker literal not found\""}
+{"text": "\"s13_auswertung.py: vorrat_leer marker literal not found\"", "translation": "\"s13_auswertung.py: vorrat_leer marker literal not found\""}
+{"text": "f\"{check} gab {len(lines)} Zeilen aus, der Executor liest genau eine: {lines}\"", "translation": "f\"{check} emitted {len(lines)} rows, the Executor reads exactly one: {lines}\""}
+{"text": "f\"{check}: erwartet PASS, bekam rc={rc} / {line}\"", "translation": "f\"{check}: expected PASS, got rc={rc} / {line}\""}
+{"text": "f\"{check}: erwartet FAIL, bekam rc={rc} / {line}\"", "translation": "f\"{check}: expected FAIL, got rc={rc} / {line}\""}
+{"text": "f\"{check}: erwartet STOP, bekam rc={rc} / {line}\"", "translation": "f\"{check}: expected STOP, got rc={rc} / {line}\""}
+{"text": "f\"{step.step_id} haengt an {dep}, das spaeter kommt\"", "translation": "f\"{step.step_id} depends on {dep}, which comes later\""}
+{"text": "\"Kinder leben nach dem Timeout\"", "translation": "\"Children survive after the timeout\""}
+{"text": "f\"kein Dump fuer Rang {rank}\"", "translation": "f\"no dump for rank {rank}\""}
+{"text": "\"unbeteiligte Klassen bleiben auto\"", "translation": "\"unrelated classes remain auto\""}
+{"text": "f\"{step.check} auf leerem Verzeichnis: rc={rc} / {line}\"", "translation": "f\"{step.check} on empty directory: rc={rc} / {line}\""}
+{"text": "\"erste Zeile\\nzweite Zeile\\n\\ndritte\"", "translation": "\"first row\\nsecond row\\n\\nthird\""}
+{"text": "f\"{check} gab {len(lines)} Zeilen aus, der Executor liest genau eine: {lines}\"", "translation": "f\"{check} emitted {len(lines)} rows, the Executor reads exactly one: {lines}\""}
+{"text": "f\"{check}: erwartet PASS, bekam rc={rc} / {line}\"", "translation": "f\"{check}: expected PASS, got rc={rc} / {line}\""}
+{"text": "f\"{check}: erwartet FAIL, bekam rc={rc} / {line}\"", "translation": "f\"{check}: expected FAIL, got rc={rc} / {line}\""}
+{"text": "f\"{check}: erwartet STOP, bekam rc={rc} / {line}\"", "translation": "f\"{check}: expected STOP, got rc={rc} / {line}\""}
+{"text": "\"der Fortsetzungs-Prompt in s11_bar1_e2e.sh und SMOKE_PROMPT \"", "translation": "\"the continuation prompt in s11_bar1_e2e.sh and SMOKE_PROMPT \""}
+{"text": "\"kein max_new_tokens im Smoke-Request\"", "translation": "\"no max_new_tokens in the smoke request\""}
+{"text": "f\"kein Aggregat fuer {arm}/{sessions}/TP{rang}\"", "translation": "f\"no aggregate for {arm}/{sessions}/TP{rang}\""}
+{"text": "\"user order 2026-09-09: 'der decode bs6 soll mit bs6 \"", "translation": "\"user order 2026-09-09: 'the decode bs6 shall use bs6 (user order, translated) \""}
+{"text": "\"keine DC-BREAKDOWN-Zeile\"", "translation": "\"no DC-BREAKDOWN row\""}
+{"text": "\"keine eingebauten free0-Messungen\"", "translation": "\"no built-in free0 measurements\""}
+{"text": "\"kaputte Bibliothek\"", "translation": "\"broken library\""}
+{"text": "\"Front-Voreinstellung: min_work folgt X\"", "translation": "\"Front default: min_work follows X\""}
+{"text": "\"keine Messung, keine erfundene Zahl\"", "translation": "\"no measurement, no invented number\""}
+{"text": "\"die Statuszeile ist nicht gemappt\"", "translation": "\"the status row is not mapped\""}
+{"text": "\"der Transport wurde nicht stillgelegt\"", "translation": "\"the transport was not shut down\""}
+{"text": "\"der Werfer wurde nicht stillgelegt\"", "translation": "\"the thrower was not shut down\""}
+{"text": "\"nach einem gescheiterten Poll wurde ein weiteres Geraet gelesen -- \"", "translation": "\"after a failed poll, another device was read -- \""}
+{"text": "\"wenn diese Signatur Gift WAERE, pruefte dieser Test den #100-Pfad nicht\"", "translation": "\"if this signature WERE Gift, this test would not check the #100 path\""}
+{"text": "\"das Disarm-break greift im Normalfall\"", "translation": "\"the Disarm-break applies in the normal case\""}
+{"text": "\"ohne Adoption darf der normale Plattenweg schreiben wie immer\"", "translation": "\"without Adoption, the normal disk path may write as always\""}
+{"text": "\"ein Rang hat kein argv\"", "translation": "\"a rank has no argv\""}
+{"text": "\"mit echten Bytes ist D ein normaler Schreiber\"", "translation": "\"with real bytes, D is a normal writer\""}
+{"text": "\"unter Adoption darf KEIN Byte in den geteilten Store -- sonst \"", "translation": "\"under Adoption, NO byte may go into the shared store -- otherwise \""}
+{"text": "\"nach dem Erstflip ist D ein normaler Schreiber\"", "translation": "\"after the first flip, D is a normal writer\""}
+{"text": "\"erst P->D (Bytes holen), dann D->P (Rollen zurueck)\"", "translation": "\"first P->D (fetch bytes), then D->P (roll back)\""}
+{"text": "\"der Erstflip gehoert vor die Serving-Schleife\"", "translation": "\"the first flip belongs before the serving loop\""}
+{"text": "\"erst pruefen, dann flippen\"", "translation": "\"check first, then flip\""}
+{"text": "\"ohne Flag sofort zurueck\"", "translation": "\"without flag, return immediately\""}
+{"text": "\"die Deckung muss dort festgehalten werden, wo plan.descs und die \"", "translation": "\"the coverage must be recorded where plan.descs and the \""}
+{"text": "\"der Leser darf sie NICHT neu ableiten\"", "translation": "\"the reader must NOT re-derive them\""}
+{"text": "\"keine Produktions-Aufrufstelle von argv_d gefunden\"", "translation": "\"no production call site of argv_d found\""}
+{"text": "\"eine argv_d-Aufrufstelle gibt d_adopt NICHT mit -- dann faellt \"", "translation": "\"an argv_d call site does NOT pass d_adopt -- then \""}
+{"text": "\"die Terme muessen hinter dem Austausch-Arm stehen\"", "translation": "\"the terms must stand behind the exchange arm\""}
+{"text": "\"der Host-Pin darf die Publikation nicht mehr torwaechtern\"", "translation": "\"the Host-Pin must no longer watchdog the publication\""}
+{"text": "f\"Lane-Budget {budget}s -- fnFL2w3 mass 120,0 s gegen einen \"", "translation": "f\"Lane-Budget {budget}s -- fnFL2w3 mass 120,0 s against a \""}
+{"text": "\"die Verweigerung nennt den Tensor\"", "translation": "\"the rejection names the tensor\""}
+{"text": "\"und den gemessenen Fall, der sie erzwungen hat\"", "translation": "\"and the measured case that forced it\""}
+{"text": "\"sonst testet dieser Test nichts\"", "translation": "\"otherwise this test tests nothing\""}
+{"text": "\"keine Id darf zwischen zwei Baendern verschwinden\"", "translation": "\"no Id may disappear between two bands\""}
+{"text": "\"die Zahl, die w49 belegt hat\"", "translation": "\"the number that w49 has occupied\""}
+{"text": "\"was auf den Karten liegen bleibt\"", "translation": "\"what stays on the cards\""}
+{"text": "\"96 raus + 96 rein, Platz gegen Platz\"", "translation": "\"96 out + 96 in, slot against slot\""}
+{"text": "\"keine Id darf beides sein\"", "translation": "\"no Id may be both\""}
+{"text": "\"und keine darf fehlen\"", "translation": "\"and none may be missing\""}
+{"text": "f\"{phase}: Plaetze muessen 0..n-1 sein, luecken- und doppelfrei\"", "translation": "f\"{phase}: Slots must be 0..n-1, gap- and duplicate-free\""}
+{"text": "\"Id 0 haelt P auf der Karte\"", "translation": "\"Id 0 holds P on the card\""}
+{"text": "\"Id 511 liegt im Store\"", "translation": "\"Id 511 lies in the store\""}
+{"text": "\"ein Experte bleibt immer auf der Karte\"", "translation": "\"an expert always stays on the card\""}
+{"text": "\"voll resident heisst: kein Store\"", "translation": "\"fully resident means: no store\""}
+{"text": "\"der Leser verwirft, was der Schreiber schreibt\"", "translation": "\"the reader discards what the writer writes\""}
+{"text": "\"ohne Env bleibt alles wie vor #107\"", "translation": "\"without Env everything stays as before #107\""}
+{"text": "\"die Karte muss der ERSTE Zweig sein, und die beiden alten Wege \"", "translation": "\"the card must be the FIRST branch, and the two old paths \""}
+{"text": "\"ohne diese Zeile liest der alte Weg wieder shared_resident_ids()\"", "translation": "\"without this line the old path reads shared_resident_ids() again\""}
+{"text": "\"jedes Band haelt hier 4 der 16 Ids\"", "translation": "\"each band holds 4 of the 16 Ids here\""}
+{"text": "\"ein Band ist ein VIEW, keine Kopie\"", "translation": "\"a band is a VIEW, no copy\""}
+{"text": "f\"der Walk fand {len(hit)} Baender\"", "translation": "f\"the walk found {len(hit)} bands\""}
+{"text": "\"ohne Bandteilung muss ein Name mit Marker den Chunk-Tag liefern -- \"", "translation": "\"without band splitting a name with marker must deliver the chunk tag -- \""}
+{"text": "\"kein einziges Band -- die Residenz ist leer?\"", "translation": "\"not a single band -- is the residency empty?\""}
+{"text": "\"jeder residente Slot gehoert genau einem Band\"", "translation": "\"each resident slot belongs to exactly one band\""}
+{"text": "\"die gepinnten bleiben resident\"", "translation": "\"the pinned ones stay resident\""}
+{"text": "\"ohne Bandteilung muss eine expert_id den Layer-Tag liefern -- sonst \"", "translation": "\"without band splitting an expert_id must deliver the layer tag -- otherwise \""}
+{"text": "f\"{tag} liegt auf {cs}, sein Chunk auf {cards[chunk]}\"", "translation": "f\"{tag} lies on {cs}, its chunk on {cards[chunk]}\""}
+{"text": "\"ohne Karten-Eintrag nimmt interleave_pause_order den missing-Zweig \"", "translation": "\"without a card entry interleave_pause_order takes the missing branch \""}
+{"text": "\"derive_waves liest tags[-1] als Basis-Tag, der die letzte Welle \"", "translation": "\"derive_waves reads tags[-1] as the base tag, which the last wave \""}
+{"text": "f\"{len(without)} Wellen ohne Baender, {len(mit)} mit. Ein Band bringt \"", "translation": "f\"{len(without)} waves without bands, {len(mit)} with. A band brings \""}
+{"text": "\"build_plan verlangt eine PERMUTATION: ein Tag in zwei Wellen ist \"", "translation": "\"build_plan requires a PERMUTATION: a tag in two waves is \""}
+{"text": "\"Geometrie und Tensor muessen aus DEMSELBEN Walk-Schritt kommen -- \"", "translation": "\"geometry and tensor must come from the SAME walk step -- \""}
+{"text": "\"der leere Puffer landete in der Skip-Liste statt frueh auszusteigen \"", "translation": "\"the empty buffer landed in the skip list instead of bailing out early \""}
+{"text": "\"das Manifest-Inventar sieht den Puffer nicht\"", "translation": "\"the manifest inventory does not see the buffer\""}
+{"text": "f\"{fn.__name__} walkt die Modul-Dicts selbst statt den Helfer zu \"", "translation": "f\"{fn.__name__} walks the module dicts itself instead of calling the helper \""}
+{"text": "\"die Verengung nimmt die Experten-Puffer nicht aus -- sie fallen \"", "translation": "\"the narrowing does not exclude the expert buffers -- they fall \""}
+{"text": "\"die Geometrie-Pruefung ist ganz entfallen -- sie MUSS fuer jeden \"", "translation": "\"the geometry check is gone entirely -- it MUST be for every \""}
+{"text": "\"keine Zeile gedruckt\"", "translation": "\"no line printed\""}
+{"text": "f\"der Puffer gilt als abwesend, obwohl der Walk ihn liefert: {z}\"", "translation": "f\"the buffer is treated as absent, even though the walk delivers it: {z}\""}
+{"text": "f\"ein gewoehnliches Attribut zaehlt jetzt als Parameter: {z}\"", "translation": "f\"a plain attribute now counts as a parameter: {z}\""}
+{"text": "f\"{fn} baut argv, ohne den Riegel zu rufen -- dann gewinnt die \"", "translation": "f\"{fn} builds argv without calling the guard -- then the \""}
+{"text": "\"der Launcher mittelt wieder\"", "translation": "\"the launcher averages again\""}
+{"text": "f\"die Raenge sind uneins: {z}\"", "translation": "f\"the ranks disagree: {z}\""}
+{"text": "\"ohne globale Menge darf nichts geraten werden\"", "translation": "\"without a global set nothing may be guessed\""}
+{"text": "\"das ist die Zahl, die P am Metall schrieb\"", "translation": "\"this is the number P wrote on the metal\""}
+{"text": "\"der Kartenbauer sucht das Launcher-Flag wieder in extra_p -- \"", "translation": "\"the card builder searches the launcher flag in extra_p again -- \""}
+{"text": "\"der Default ist nicht 1\"", "translation": "\"the default is not 1\""}
+{"text": "\"die Ausnahme wurde verschluckt -- ein halb \"", "translation": "\"the exception was swallowed -- a half \""}
+{"text": "f\"post_load lief in {len(threads)} Thread(s) -- die CPU-Arbeit ist \"", "translation": "f\"post_load ran in {len(threads)} thread(s) -- the CPU work is \""}
+{"text": "\"der pread-Pfad faellt in die serielle Schleife durch -- post_load \"", "translation": "\"the pread path falls through into the serial loop -- post_load \""}
+{"text": "f\"{k} kam UNVERAENDERT zurueck -- post_load lief im seriellen \"", "translation": "f\"{k} came back UNCHANGED -- post_load ran in the serial \""}
+{"text": "f\"nur {lead}s Vorlauf\"", "translation": "f\"only {lead}s warmup\""}
+{"text": "\"Frame-Referenz ueberlebt das wait\"", "translation": "\"Frame reference survives the wait\""}
+{"text": "\"der Pfad loggt nicht mehr -- Test veraltet?\"", "translation": "\"the path no longer logs -- test outdated?\""}
+{"text": "\"der Solo-Halter muss geplant werden, nicht verweigert\"", "translation": "\"the solo holder must be planned, not refused\""}
+{"text": "\"die MIXED_FUSED-Ausnahme muss VOR der Null-Breiten-Klausel stehen \"", "translation": "\"the MIXED_FUSED exception must come BEFORE the zero-width clause \""}
+{"text": "\"der Repack steht nicht im Chunk-Scope\"", "translation": "\"the repack is not in chunk scope\""}
+{"text": "f\"Rang {r} haette Breite 0\"", "translation": "f\"Rank {r} would have width 0\""}
+{"text": "\"kein Praefix-Fall\"", "translation": "\"no prefix case\""}
+{"text": "\"widest_layer_terms muss PLE_SEGMENTS durchreichen\"", "translation": "\"widest_layer_terms must pass through PLE_SEGMENTS\""}
+{"text": "\"beide Klauseln stehen nacheinander, keine ersetzt die andere\"", "translation": "\"both clauses stand in sequence, neither replaces the other\""}
+{"text": "\"369 steht im Hotset und ist resident\"", "translation": "\"369 is in the hotset and is resident\""}
+{"text": "\"ein Host-Tensor darf die Karte nicht verschlucken\"", "translation": "\"a host tensor must not swallow the card\""}
+{"text": "\"der Aufrufer liest wieder das Device des Gewichts -- die w60-Wurzel\"", "translation": "\"the caller reads the weight's device again -- the w60 root\""}
+{"text": "\"der Repack steht vor seinem Riegel -- dann indiziert er wieder mit \"", "translation": "\"the repack comes before its guard -- then it indexes again with \""}
+{"text": "\"der Modul-Lookup steht noch in der Schleife\"", "translation": "\"the module lookup is still in the loop\""}
+{"text": "\"der Attention-Host haelt ihn\"", "translation": "\"the attention host holds it\""}
+{"text": "\"die Worker-Karten halten ihn NICHT -- sonst entstehen c1 und c2\"", "translation": "\"the worker cards do NOT hold it -- otherwise c1 and c2 would be created\""}
+{"text": "\"drei Raenge, drei Karten -- mit nur einer Karte haelt \"", "translation": "\"three ranks, three cards -- with only one card, holds \""}
+{"text": "\"Rang 0 haelt den Tensor\"", "translation": "\"Rank 0 holds the tensor\""}
+{"text": "\"die Schatten halten NICHTS -- Breite 0, nicht 'fehlt'\"", "translation": "\"the shadows hold NOTHING -- width 0, not 'missing'\""}
+{"text": "\"ohne die Schatten-Manifeste bleibt eine Karte uebrig -- das ist \"", "translation": "\"without the shadow manifests, one card remains -- that is \""}
+{"text": "\"alle drei Raenge muessen den Filter ueberleben -- sonst zaehlt der \"", "translation": "\"all three ranks must survive the filter -- otherwise the \""}
+{"text": "\"nur Rang 0 haelt Stuecke\"", "translation": "\"only Rank 0 holds pieces\""}
+{"text": "\"Rang 0 haelt den Draft und bewegt ihn\"", "translation": "\"Rank 0 holds the draft and moves it\""}
+{"text": "f\"Rang {rank} publiziert ein LEERES Manifest -- er haelt nichts, \"", "translation": "f\"Rank {rank} publishes an EMPTY manifest -- it holds nothing, \""}
+{"text": "\"der LegPlan gehoert weiter diesem Rang\"", "translation": "\"the LegPlan still belongs to this rank\""}
+{"text": "\"Test waere sinnlos, wenn beide ohnehin gleich waeren\"", "translation": "\"The test would be pointless if both were equal anyway\""}
+{"text": "\"eine leere NVML-Liste muss beim Prozess nachfragen, nicht toeten\"", "translation": "\"an empty NVML list must ask the process, not kill it\""}
+{"text": "\"nur ein LEERES /proc heisst tot\"", "translation": "\"only an EMPTY /proc means dead\""}
+{"text": "\"der Lesefehler-Pfad muss True antworten\"", "translation": "\"the read-error path must answer True\""}
+{"text": "\"der Heisse liegt jetzt auf der Karte\"", "translation": "\"the hot one is now on the card\""}
+{"text": "\"der freie Platz wird wiederverwendet\"", "translation": "\"the free slot is reused\""}
+{"text": "\"ueber die Freiliste waere es Platz 0 geworden\"", "translation": "\"via the free list it would have been slot 0\""}
+{"text": "\"Platz 0 wurde frei und ist der kleinste\"", "translation": "\"slot 0 became free and is the smallest\""}
+{"text": "\"Zeile 3 hatte keinen Beleg\"", "translation": "\"row 3 had no evidence\""}
+{"text": "\"der Presplit holt nichts aus dem Store -- dann liest D die Shards \"", "translation": "\"the presplit fetches nothing from the store -- then D reads the shards \""}
+{"text": "\"gefuellt wird erst nach dem Schreiben\"", "translation": "\"filled only after writing\""}
+{"text": "\"gefuellt wird erst nach dem Kopieren auf die Karte\"", "translation": "\"filled only after copying to the card\""}
+{"text": "\"ohne diesen Riegel wuerde auch ein normal geladener Rang seine \"", "translation": "\"without this guard, even a normally loaded rank would its \""}
+{"text": "\"ohne Karte darf nichts als gefuellt gelten\"", "translation": "\"without a card, nothing may count as filled\""}
+{"text": "\"arm_placeholder steht hinter dem Loader -- der Presplit sieht den \"", "translation": "\"arm_placeholder is behind the loader -- the presplit sees the \""}
+{"text": "f\"der Leser verwirft, was der Schreiber publiziert: {published!r}\"", "translation": "f\"the reader discards what the writer publishes: {published!r}\""}
+{"text": "\"write_rows indiziert noch ueber global_rows -- der Slot-Pool braucht \"", "translation": "\"write_rows still indexes over global_rows -- the slot pool needs \""}
+{"text": "\"der veraltete Satz ist wieder da\"", "translation": "\"the stale set is back\""}
+{"text": "\"die Datei muss wieder einen Platz je Experte haben\"", "translation": "\"the file must have a slot per expert again\""}
+{"text": "\"ohne Ratios bleibt es beim vollen Store\"", "translation": "\"without Ratios it stays with the full store\""}
+{"text": "\"ein Zweig von pread_safetensors_file wendet post_load nicht an -- \"", "translation": "\"a branch of pread_safetensors_file does not apply post_load -- \""}
+{"text": "\"genau dieser Fall war v87: ein compressed-tensors-Schema, das der \"", "translation": "\"exactly this case was v87: a compressed-tensors schema that the \""}
+{"text": "\"die alte Verriegelung steht noch\"", "translation": "\"the old lock is still there\""}
+{"text": "\"der Worker transponiert ohne das gemeinsame Praedikat zu fragen\"", "translation": "\"the worker transposes without asking the shared predicate\""}
+{"text": "\"die Env wird nicht auf '1' geprueft\"", "translation": "\"the Env is not checked against '1'\""}
+{"text": "\"die quant_method steht nicht in _CT_TRANSPOSING_METHODS -- genau \"", "translation": "\"the quant_method is not in _CT_TRANSPOSING_METHODS -- exactly \""}
+{"text": "\"der Verbraucher loest die Methode wieder selbst auf\"", "translation": "\"the consumer resolves the method itself again\""}
+{"text": "\"der Worker fragt wieder nur die quant_method -- das war die w59-Wurzel\"", "translation": "\"the worker only asks the quant_method again -- that was the w59 root\""}
+{"text": "\"gedreht falsch gezaehlt\"", "translation": "\"rotated counted wrong\""}
+{"text": "\"angeboten falsch gezaehlt\"", "translation": "\"offered counted wrong\""}
+{"text": "\"Platz 12 traegt Experte 370\"", "translation": "\"slot 12 carries expert 370\""}
+{"text": "\"drei Raenge, drei Blocklisten\"", "translation": "\"three ranks, three block lists\""}
+{"text": "\"Rang 0 HAELT den Tensor ganz\"", "translation": "\"rank 0 HOLDS the tensor whole\""}
+{"text": "\"Rang 1 haelt unter Form A kein Dense -- bekommt er hier Bytes, \"", "translation": "\"rank 1 holds no Dense under Form A -- does it get bytes here, \""}
+{"text": "\"ohne Halter-Karte teilt der Plan weiter ueber alle Raenge -- diese \"", "translation": "\"without the holder card the plan still distributes over all ranks -- this \""}
+{"text": "\"ohne diese Karte verlangt der Plan Dense von einem Rang, der es \"", "translation": "\"without this card the plan demands Dense from a rank that \""}
+{"text": "\"als Quelle ist die Zielkarte nicht dran\"", "translation": "\"as source the target card is not involved\""}
+{"text": "\"die Gegenrichtung bleibt, wie sie war\"", "translation": "\"the reverse direction stays as it was\""}
+{"text": "f\"Rang {i}: der fehlende Term --d-foreign-context-mib verschiebt \"", "translation": "f\"rank {i}: the missing term --d-foreign-context-mib shifts \""}
+{"text": "\"ohne --d-nontorch-mib sieht w83 wie ein passender Boot aus -- \"", "translation": "\"without --d-nontorch-mib w83 looks like a fitting boot -- \""}
+{"text": "\"ohne --d-nontorch-mib gewinnt Rang 0 (5090) die groesste Schein-Luft \"", "translation": "\"without --d-nontorch-mib rank 0 (5090) gets the largest phantom headroom \""}
+{"text": "f\"bei 11 GB Reserve muss auch die kleinste Stufe unter die \"", "translation": "f\"with 11 GB reserve even the smallest stage must be below the \""}
+{"text": "\"die 3080er halten 79+80\"", "translation": "\"the 3080s hold 79+80\""}
+{"text": "f\"slots={k['slots']} -- die Karte spart nichts\"", "translation": "f\"slots={k['slots']} -- the card saves nothing\""}
+{"text": "\"der Leser findet die Datei nicht\"", "translation": "\"the reader does not find the file\""}
+{"text": "\"Id 200 ist auf D-Rang 1 resident\"", "translation": "\"Id 200 is resident on D-rank 1\""}
+{"text": "\"Id 500 haelt niemand\"", "translation": "\"no one holds Id 500\""}
+{"text": "\"alle drei PP-Stufen passen nicht zu D\"", "translation": "\"all three PP stages do not fit D\""}
+{"text": "\"identische Mengen -> der Flip bewegt NICHTS\"", "translation": "\"identical sets -> the flip moves NOTHING\""}
+{"text": "\"FR_P 0.377 -> 194 < D-Menge 292, das muss auffallen\"", "translation": "\"FR_P 0.377 -> 194 < D set 292, that must stand out\""}
+{"text": "\"die Physik passt -- das war nie das Problem\"", "translation": "\"the physics fits -- that was never the problem\""}
+{"text": "\"ohne die Terme faellt nichts auf\"", "translation": "\"without the terms nothing stands out\""}
+{"text": "\"genau auf dem Floor ist ok\"", "translation": "\"exactly on the floor is ok\""}
+{"text": "\"ein MiB darunter ist es nicht\"", "translation": "\"one MiB below it is not\""}
+{"text": "f\"\\nDecke OHNE KV-Posten: {[round(f,3) for f in without]}\"", "translation": "f\"\\nceiling WITHOUT KV items: {[round(f,3) for f in without]}\""}
+{"text": "f\"Decke MIT  KV-Posten: {[round(f,3) for f in mit]}\"", "translation": "f\"Cap WITH  KV items: {[round(f,3) for f in mit]}\""}
+{"text": "f\"KV-Preis je Stufe MiB: {[round(x) for x in kv]}\"", "translation": "f\"KV price per stage MiB: {[round(x) for x in kv]}\""}
+{"text": "f\"mamba-Term wirkt nicht: mit={mit} ohne={without} conc={expected_conc}\"", "translation": "f\"mamba-Term has no effect: mit={mit} ohne={without} conc={expected_conc}\""}
+{"text": "\"die Probe misst nichts -- ratio zu gross gewaehlt\"", "translation": "\"the probe measures nothing -- ratio chosen too large\""}
+{"text": "\"der Deckel darf den Pool nur SENKEN, nie anheben\"", "translation": "\"the cap may only LOWER the pool, never raise\""}
+{"text": "\"PLATZTAUSCH-KARTE %s: %d Experten, Store %d Plaetze je Layer \"", "translation": "\"PLATZTAUSCH-KARTE %s: %d experts, Store %d slots per Layer \""}
+{"text": "\"#107 EXPERTEN-KARTE %s: %d Experten, %d Store-Plaetze, P haelt je \"", "translation": "\"#107 EXPERTEN-KARTE %s: %d experts, %d Store-slots, P holds per \""}
+{"text": "\"PP-CUT KV-PREIS (#156) ENTFAELLT: tokens=%d, \"", "translation": "\"PP-CUT KV-PREIS (#156) DROPPED: tokens=%d, \""}
+{"text": "\"#107 EXPERTEN-KARTE %s unlesbar (%s: %s)\"", "translation": "\"#107 EXPERTEN-KARTE %s unreadable (%s: %s)\""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} {label} EXTEND-STUECKELUNG rows_cap aus card_free_post: \"", "translation": "f\"{D_RANK_SOLVE_MARKER} {label} EXTEND-STUECKELUNG rows_cap from card_free_post: \""}
+{"text": "\"#107 EXPERTEN-KARTE ENTFAELLT: %s fehlt. Ohne sie rechnet \"", "translation": "\"#107 EXPERTEN-KARTE ENTFAELLT: %s missing. Without it, computes \""}
+{"text": "\"#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s passt \"", "translation": "\"#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s fits \""}
+{"text": "\"#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s\"", "translation": "\"#107 EXPERTEN-KARTE VERWORFEN (not written): %s\""}
+{"text": "\"H41c/H41d: die Prompt-Laenge, an deren LETZTEM Chunk die P-KARTE \"", "translation": "\"H41c/H41d: the prompt-length, at whose LETZTEM chunk the P-card \""}
+{"text": "\"#108 ERSTBOOT-ADOPTION (Nutzer-Order 22.09.): 'on' laesst die \"", "translation": "\"#108 ERSTBOOT-ADOPTION (user-order 22.09.): 'on' lets the \""}
+{"text": "\"W169 PdFlipDKvStageWavesRefused: die Stufenform (hoechste Stufe je Sitzzahl %s) \"", "translation": "\"W169 PdFlipDKvStageWavesRefused: the stage form (highest stage per seat count %s) \""}
+{"text": "\" / Stufenzeilen ohne KV auf %s\"", "translation": "\" / stage rows without KV on %s\""}
+{"text": "\"W168 PdFlipDKvStageMaxRefused: --env-d %s=%s passt nicht zur Stufentabelle \"", "translation": "\"W168 PdFlipDKvStageMaxRefused: --env-d %s=%s does not fit the stage table \""}
+{"text": "f\"{KV_TOKEN_CUT_MARKER} F14-FREI (kein Host-Tier): --d-kv-token-cut \"", "translation": "f\"{KV_TOKEN_CUT_MARKER} F14-FREI (no Host-Tier): --d-kv-token-cut \""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) NICHT GEPINNT: der Solve \"", "translation": "f\"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) NICHT GEPINNT: the Solve \""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) GEPINNT: die Platztausch-Karte \"", "translation": "f\"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) GEPINNT: the slot swap card \""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} {label} KARTE-FORM (#239 rc12z29c): geprueft, nicht neu \"", "translation": "f\"{D_RANK_SOLVE_MARKER} {label} KARTE-FORM (#239 rc12z29c): checked, not new \""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} {label} KV-PFLICHT {_d_kv} Token aus {_d_kv_src} \"", "translation": "f\"{D_RANK_SOLVE_MARKER} {label} KV-PFLICHT {_d_kv} tokens from {_d_kv_src} \""}
+{"text": "\"H2c STORE-IDENTITY ENTFAELLT: keine Experten-Karte -> D-Store-Adopt inaktiv\"", "translation": "\"H2c STORE-IDENTITY ENTFAELLT: no experts card -> D-Store-Adopt inactive\""}
+{"text": "\"H2c STORE-IDENTITY ENTFAELLT: %s: %s -> D-Store-Adopt inaktiv\"", "translation": "\"H2c STORE-IDENTITY ENTFAELLT: %s: %s -> D-Store-Adopt inactive\""}
+{"text": "\"H2c STORE-IDENTITY id=%s model=%s map=%s (beide Gruppen; ein Sentinel \"", "translation": "\"H2c STORE-IDENTITY id=%s model=%s map=%s (both groups; one Sentinel \""}
+{"text": "f\"KARTE-FORM (#239 rc12z29c) D-START geprueft: --rank-moe-ratio \"", "translation": "f\"KARTE-FORM (#239 rc12z29c) D-START checked: --rank-moe-ratio \""}
+{"text": "f\"PDFLIP-EXPERT-BAND size={_bs} count={_bc} aus der KARTE-FORM (#239 rc12z29c)\"", "translation": "f\"PDFLIP-EXPERT-BAND size={_bs} count={_bc} from the KARTE-FORM (#239 rc12z29c)\""}
+{"text": "\"PDFLIP-EXPERT-MAP (V1, aus dem genannten Vektor) verworfen (#239 rc12z29c): \"", "translation": "\"PDFLIP-EXPERT-MAP (V1, from the referenced vector) rejected (#239 rc12z29c): \""}
+{"text": "\"D-EXPECT DORMANT-OTHER D(Karte, Erwartung): \"", "translation": "\"D-EXPECT DORMANT-OTHER D(card, expectation): \""}
+{"text": "f\"state_file: {_path(d)} hat schema {st.get('schema')!r}, erwartet {STATE_SCHEMA}\"", "translation": "f\"state_file: {_path(d)} has schema {st.get('schema')!r}, expected {STATE_SCHEMA}\""}
+{"text": "f\"state_file: Schreiber {writer!r} (erlaubt: {', '.join(WRITERS)})\"", "translation": "f\"state_file: writer {writer!r} (allowed: {', '.join(WRITERS)})\""}
+{"text": "f\"state_file: Zustand {state!r} gehoert nicht dem Schreiber {writer!r}\"", "translation": "f\"state_file: state {state!r} does not belong to writer {writer!r}\""}
+{"text": "f\"state_file: Feld {k!r} gehoert nicht zu {STATE_SCHEMA}/{writer} \"", "translation": "f\"state_file: field {k!r} does not belong to {STATE_SCHEMA}/{writer} \""}
+{"text": "f\"state_file: dead des Launchers braucht origin in {LAUNCHER_DEAD_ORIGINS}\"", "translation": "f\"state_file: dead of the Launcher needs origin in {LAUNCHER_DEAD_ORIGINS}\""}
+{"text": "f\"state_file: unbekannter Zustand {state!r} (erlaubt: {', '.join(STATES)})\"", "translation": "f\"state_file: unknown state {state!r} (allowed: {', '.join(STATES)})\""}
+{"text": "f\"state_file: {_path(d)} fehlt (erst init)\"", "translation": "f\"state_file: {_path(d)} missing (init first)\""}
+{"text": "f\"state_file: Feld {k!r} gehoert nicht zu {STATE_SCHEMA}\"", "translation": "f\"state_file: field {k!r} does not belong to {STATE_SCHEMA}\""}
+{"text": "f\"state_file: {_path(d)} existiert schon (boot_id doppelt)\"", "translation": "f\"state_file: {_path(d)} already exists (boot_id duplicate)\""}
+{"text": "\"%s: %s -- die Referenz %s nennt ihren Schnitt nicht (keine 'MoE expert-offload \"", "translation": "\"%s: %s -- the reference %s does not name its cut (no 'MoE expert-offload \""}
+{"text": "\"W167 PdFlipPCutRecutRefused: %s %s -- der Schnitt der Referenz %s ist %s\"", "translation": "\"W167 PdFlipPCutRecutRefused: %s %s -- the cut of reference %s is %s\""}
+{"text": "\"%s: %s %s %s -- Schnitt %s: die Geometrie fuer den Umschnitt fehlt (%s)\"", "translation": "\"%s: %s %s %s -- Cut %s: the geometry for the recut is missing (%s)\""}
+{"text": "\"keine Zeilen\"", "translation": "\"no rows\""}
+{"text": "\"%s: %s -- Schnitt %s ist aus der Referenz (Schnitt %s) nicht umrechenbar: %s. \"", "translation": "\"%s: %s -- Cut %s is not convertible from the reference (Cut %s): %s. \""}
+{"text": "\"%s: %s -- Schnitt %s: die Referenz traegt %d Mamba-Slots, der Preis je \"", "translation": "\"%s: %s -- Cut %s: the reference carries %d Mamba-Slots, the price per \""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): \"", "translation": "f\"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): \""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN JE RANG (01.10.): \"", "translation": "f\"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN JE RANG (01.10.): \""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM GRENZEN: Wellenboden braucht Scratch \"", "translation": "f\"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM GRENZEN: wave floor needs Scratch \""}
+{"text": "\"BOOTZEIT 3 (29.09., 27B-Auflage): jede Lesung des freien Kartenspeichers \"", "translation": "\"BOOTZEIT 3 (29.09., 27B-edition): each read of the free card memory \""}
+{"text": "f\"{D_RANK_SOLVE_MARKER} D(Karte, Erwartung) {D_KV_STAGE_LRU_FLOOR_MARKER}: \"", "translation": "f\"{D_RANK_SOLVE_MARKER} D(card, expectation) {D_KV_STAGE_LRU_FLOOR_MARKER}: \""}
+{"text": "\"D-EXPECT DORMANT-OTHER D(frueh, Erwartung): \"", "translation": "\"D-EXPECT DORMANT-OTHER D(early, expectation): \""}
+{"text": "\"state_file: dead eines Rangs braucht origin rank\"", "translation": "\"state_file: dead of a rank needs origin rank\""}
+{"text": "\"der Anker bleibt (y5a)\"", "translation": "\"the anchor stays (y5a)\""}
+{"text": "\"die Zeilen kamen aus dem Store\"", "translation": "\"the rows came from the Store\""}
+{"text": "\"der Mamba-Slot geht an den Pool\"", "translation": "\"the Mamba-slot goes to the Pool\""}
+{"text": "\"nicht pauschal: nobody is displaced for a head its elders block\"", "translation": "\"not blanket: nobody is displaced for a head its elders block\""}

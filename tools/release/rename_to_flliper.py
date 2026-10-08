@@ -149,7 +149,8 @@ IDENT_COLLISION_OK: Dict[str, frozenset] = {}
 if os.environ.get("IDENT_COLLISION_OK_FILE"):
     import json as _json_f0a
     for _p, _ws in _json_f0a.load(open(os.environ["IDENT_COLLISION_OK_FILE"])).items():
-        IDENT_COLLISION_OK[_p] = frozenset(_ws)
+        if _p != "_comment":
+            IDENT_COLLISION_OK[_p] = frozenset(_ws)
 CXX_EXT = {".c", ".cc", ".cpp", ".cxx", ".cu", ".cuh", ".h", ".hh", ".hpp", ".inl", ".metal"}
 
 # --------------------------------------------------------------------------

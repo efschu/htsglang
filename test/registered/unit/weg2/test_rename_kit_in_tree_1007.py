@@ -166,3 +166,76 @@ def test_reviewed_ident_collision_is_exempted_and_listed(tmp_path):
     assert man["ident_collisions_allowed"] == {"python/%s/m.py" % pkg: ["%s->%s" % (old, new)]}
     out = (root / "python" / "fl" "liper" / "m.py").read_text()
     assert old not in out and out.count(new) == 4
+
+
+def test_translation_memory_is_tracked_not_ignored():
+    """F0-A fix round 1: the blanket `*.jsonl` rule of .gitignore ate data/tm.jsonl, so a clean checkout carried no translation memory and
+    a run would silently re-translate every prose unit. The file must be tracked (or at least not ignored) and be a well-formed memory."""
+    tm = os.path.join(KIT, "data", "tm.jsonl")
+    assert os.path.isfile(tm)
+    rows = [json.loads(l) for l in open(tm, encoding="utf-8") if l.strip()]
+    assert len(rows) > 100 and all("text" in r and "translation" in r for r in rows[:50])
+    if not os.path.isdir(os.path.join(REPO, ".git")) and not os.path.isfile(os.path.join(REPO, ".git")):
+        pytest.skip("no git metadata")
+    rel = "tools/release/data/tm.jsonl"
+    ign = subprocess.run(["git", "-C", REPO, "check-ignore", "-q", rel])
+    assert ign.returncode == 1, "tm.jsonl is git-ignored"
+    ls = subprocess.run(["git", "-C", REPO, "ls-files", "--error-unmatch", rel], capture_output=True, text=True)
+    assert ls.returncode == 0, "tm.jsonl is not tracked: " + ls.stderr
+
+
+def test_translate_shard_refuses_a_missing_translation_memory(tmp_path):
+    units = tmp_path / "u.jsonl"
+    units.write_text(json.dumps({"kind": "log", "text": "\"x\""}) + "\n")
+    base = [sys.executable, os.path.join(KIT, "translate_shard.py"), str(units), str(tmp_path / "o.jsonl"), str(tmp_path / "t.jsonl"),
+            "m", "log", str(tmp_path / "no_such_tm.jsonl")]
+    env = {k: v for k, v in os.environ.items() if k != "KIT_TM_ALLOW_EMPTY"}
+    r = subprocess.run(base, capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode != 0 and "translation memory" in (r.stdout + r.stderr) and "not found" in (r.stdout + r.stderr)
+
+
+def test_entrypoint_is_not_exempted_from_the_collision_guard():
+    """The entrypoint's colliding tokens are executable compat code (state-path fallback, cache volume detection, package-dir test):
+    an exemption would collapse the old and new name onto one token without any error."""
+    for line in ("27b", "nf"):
+        p = os.path.join(KIT, "data", "collision_ok_1007_%s.json" % line)
+        with open(p, encoding="utf-8") as fh:
+            ok = json.load(fh)
+        assert not [k for k in ok if k.endswith("weg2-release/entrypoint.sh")], (line, "entrypoint.sh exempted")
+        for words in ok.values():
+            assert isinstance(words, list) and all(isinstance(w, str) for w in words)
+
+
+def test_ident_collision_ok_file_is_well_formed_and_scope_separate():
+    """data/ident_collision_ok_1007.json lists only (path, old word) pairs that never meet in one function scope."""
+    p = os.path.join(KIT, "data", "ident_collision_ok_1007.json")
+    with open(p, encoding="utf-8") as fh:
+        ok = {k: v for k, v in json.load(fh).items() if k != "_comment"}
+    assert ok and all(isinstance(v, list) and v for v in ok.values())
+    with open(os.path.join(KIT, "data", "merged_0928.json"), encoding="utf-8") as fh:
+        imap = json.load(fh)
+    import ast
+    fn = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+    def names(node):
+        out = set()
+        for x in ast.walk(node):
+            if isinstance(x, ast.Name):
+                out.add(x.id)
+            elif isinstance(x, ast.arg):
+                out.add(x.arg)
+            elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.add(x.name)
+        return out
+
+    for path, words in ok.items():
+        src = os.path.join(REPO, path)
+        if not os.path.isfile(src):
+            continue                      # another line's tree may not carry the file
+        tree = ast.parse(open(src, encoding="utf-8").read())
+        for w in words:
+            tgt = imap[w]
+            for s in ast.walk(tree):
+                if isinstance(s, fn):
+                    n = names(s)
+                    assert not (w in n and tgt in n), (path, w, tgt, s.name)
