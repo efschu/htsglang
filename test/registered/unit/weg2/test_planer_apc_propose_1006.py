@@ -178,8 +178,8 @@ def _measured_library(only=("RTX 5090", "RTX 3080 20GB")):
 
 def _propose(model: str, inv: str, form: str = "flip", **ziele):
     hw, _ = _inventory(inv)
-    modell, draft = _MODELS[model]
-    return P.propose(hw, modell, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES, library=_seed_library())
+    model_spec, draft = _MODELS[model]
+    return P.propose(hw, model_spec, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES, library=_seed_library())
 
 
 def _dry(model: str, v: dict, rows, *, force: bool = True):
@@ -362,37 +362,37 @@ class TestInputs(unittest.TestCase):
     def test_rates_of_a_loaded_measured_library_without_rates_argument(self):
         """The product path: no ``rates=``, the library row's measured ``gemm_tflops`` (card_rate_pass) is the rate, not the peak."""
         hw, _ = _inventory("ref3")
-        modell, draft = _MODELS["27b"]
-        v = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft, library=_measured_library())
+        model_spec, draft = _MODELS["27b"]
+        v = P.propose(hw, model_spec, "flip", {}, basis=_profile("27b"), draft=draft, library=_measured_library())
         self.assertEqual([c["tflops"] for c in v["cards"]], [203.42, 50.97, 50.97])
         self.assertTrue(all(c["tflops_src"] == "gemessen (card_library)" for c in v["cards"]), v["cards"])
         self.assertEqual(v["seeds"]["p_cut"]["basis"], "gemessen: GEMM-Rate je Karte")
         self.assertFalse(any("GEMM-Raten" in u for u in v["unbelegt"]), v["unbelegt"])
         # the measured ratio is not the datasheet ratio (419/119): the cut seed follows the measurement
-        d = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft, library=_seed_library())
+        d = P.propose(hw, model_spec, "flip", {}, basis=_profile("27b"), draft=draft, library=_seed_library())
         self.assertEqual([c["tflops"] for c in d["cards"]], [419.0, 119.0, 119.0])
         self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in d["cards"]))
         self.assertNotEqual(v["seeds"]["p_cut"]["layers"], d["seeds"]["p_cut"]["layers"])
 
     def test_one_measured_library_row_among_datasheet_rows_prices_all_on_the_datasheet(self):
         hw, _ = _inventory("ref3")
-        modell, draft = _MODELS["27b"]
-        v = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft, library=_measured_library(("RTX 5090",)))
+        model_spec, draft = _MODELS["27b"]
+        v = P.propose(hw, model_spec, "flip", {}, basis=_profile("27b"), draft=draft, library=_measured_library(("RTX 5090",)))
         self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in v["cards"]), v["cards"])
 
     def test_default_library_is_the_measured_card_library_file(self):
         """``library=None`` reads ``card_rate_pass.load_measured_library()`` (``SGLANG_CARD_LIBRARY``), seed-only otherwise."""
         hw, _ = _inventory("ref3")
-        modell, draft = _MODELS["27b"]
+        model_spec, draft = _MODELS["27b"]
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "card_library.json")
             _measured_library().save(path)
             old = os.environ.get("SGLANG_CARD_LIBRARY")
             try:
                 os.environ["SGLANG_CARD_LIBRARY"] = path
-                v = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft)
+                v = P.propose(hw, model_spec, "flip", {}, basis=_profile("27b"), draft=draft)
                 os.environ["SGLANG_CARD_LIBRARY"] = os.path.join(td, "absent.json")
-                w = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft)
+                w = P.propose(hw, model_spec, "flip", {}, basis=_profile("27b"), draft=draft)
             finally:
                 if old is None:
                     os.environ.pop("SGLANG_CARD_LIBRARY", None)
@@ -422,19 +422,19 @@ class TestInputs(unittest.TestCase):
 
     def test_forms_that_are_other_packages_and_bad_input_raise(self):
         hw, _ = _inventory("n2")
-        modell, draft = _MODELS["27b"]
+        model_spec, draft = _MODELS["27b"]
         for form in ("single", "einzel"):                             # dual is AP-E now (test_planer_ape_dual_1006)
             with self.assertRaises(P.ProposeError) as cm:
-                P.propose(hw, modell, form, {})
+                P.propose(hw, model_spec, form, {})
             self.assertIn("AP-", str(cm.exception))
         with self.assertRaises(P.ProposeError):
-            P.propose(hw, modell, "ring", {})
+            P.propose(hw, model_spec, "ring", {})
         with self.assertRaises(P.ProposeError):
-            P.propose(hw[:1], modell, "flip", {})                     # one card: AP-F
+            P.propose(hw[:1], model_spec, "flip", {})                     # one card: AP-F
         with self.assertRaises(P.ProposeError):
-            P.propose({"schema": "other"}, modell, "flip", {})
+            P.propose({"schema": "other"}, model_spec, "flip", {})
         with self.assertRaises(P.ProposeError):
-            P.propose([], modell, "flip", {})
+            P.propose([], model_spec, "flip", {})
 
 
 class TestVectorLengths(unittest.TestCase):
@@ -477,8 +477,8 @@ class TestVectorLengths(unittest.TestCase):
 
     def test_a_moe_without_a_profile_gets_the_form_a_tokens_and_the_p_fractions(self):
         hw, _ = _inventory("n4_mixed")
-        modell, draft = _MODELS["nf"]
-        v = P.propose(hw, modell, "flip", {}, draft=draft, rates=MEASURED_RATES)           # no basis profile
+        model_spec, draft = _MODELS["nf"]
+        v = P.propose(hw, model_spec, "flip", {}, draft=draft, rates=MEASURED_RATES)           # no basis profile
         self.assertTrue(v["vektoren_ok"], v["vektoren_falsch"])
         la = P.LaunchArgv(v["argv"], v["env"])
         self.assertEqual(la.extra_get("d", "--rank-role"), "host,worker,worker,worker")
@@ -582,8 +582,8 @@ class TestSyntheticDryRun(unittest.TestCase):
 
     def _check(self, model, inv, form="flip", *, refused=None, **ziele):
         hw, rows = _inventory(inv)
-        modell, draft = _MODELS[model]
-        v = P.propose(hw, modell, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES)
+        model_spec, draft = _MODELS[model]
+        v = P.propose(hw, model_spec, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES)
         n = len(rows)
         self.assertTrue(v["vektoren_ok"], v["vektoren_falsch"])
         run = _dry(model, v, rows)
@@ -752,8 +752,8 @@ class TestSeats(unittest.TestCase):
         b = _profile("nf")
         li = {"argv": list(b.argv) + ["--d-bs", "4"], "env": dict(b.env), "vars": dict(b.vars), "name": "nf-int4-h6-abl.env"}
         hw, _ = _inventory("ref3")
-        modell, draft = _MODELS["nf"]
-        v = P.propose(hw, modell, "flip", {"seats": 9}, basis=li, draft=draft, rates=MEASURED_RATES, library=_seed_library())
+        model_spec, draft = _MODELS["nf"]
+        v = P.propose(hw, model_spec, "flip", {"seats": 9}, basis=li, draft=draft, rates=MEASURED_RATES, library=_seed_library())
         self.assertEqual(v["argv"].count("--d-bs"), 1)
         self.assertEqual(P.LaunchArgv(v["argv"], v["env"]).get_flag("--d-bs"), "9")
 
@@ -882,8 +882,8 @@ class TestNonTopologyValuesStayAsTheProfileHasThem(unittest.TestCase):
             for inv in ("ref3", "n2", "n4_3090"):
                 with self.subTest(model=model, inv=inv):
                     hw, _ = _inventory(inv)
-                    modell, draft = _MODELS[model]
-                    v = P.propose(hw, modell, "flip", {}, basis=self._basis(model), draft=draft, rates=MEASURED_RATES,
+                    model_spec, draft = _MODELS[model]
+                    v = P.propose(hw, model_spec, "flip", {}, basis=self._basis(model), draft=draft, rates=MEASURED_RATES,
                                   library=_seed_library())
                     la = P.LaunchArgv(v["argv"], v["env"])
                     for f, val in self.FLAGS.items():
@@ -924,10 +924,10 @@ class TestK4ScalarRegulators(unittest.TestCase):
         argv[i + 1] = "262144"
         basis = {"argv": argv, "env": dict(b.env), "vars": dict(b.vars), "name": "nf-int4-h6-abl.env"}
         hw, _ = _inventory("ref3")
-        modell, draft = _MODELS["nf"]
-        v0 = P.propose(hw, modell, "flip", {}, basis=basis, draft=draft, rates=MEASURED_RATES, library=_seed_library())
+        model_spec, draft = _MODELS["nf"]
+        v0 = P.propose(hw, model_spec, "flip", {}, basis=basis, draft=draft, rates=MEASURED_RATES, library=_seed_library())
         self.assertEqual(self._vals(v0)["--pp-solve-pool-floor"]["wert"], "262144")        # no goal: stays
-        v1 = P.propose(hw, modell, "flip", {"kv_tokens": 131072}, basis=basis, draft=draft, rates=MEASURED_RATES,
+        v1 = P.propose(hw, model_spec, "flip", {"kv_tokens": 131072}, basis=basis, draft=draft, rates=MEASURED_RATES,
                        library=_seed_library())
         w = self._vals(v1)["--pp-solve-pool-floor"]
         self.assertEqual((w["alt"], w["wert"]), ("262144", "131072"))

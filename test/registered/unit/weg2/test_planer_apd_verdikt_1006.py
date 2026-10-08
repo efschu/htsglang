@@ -124,8 +124,8 @@ def _library():
 
 
 def _propose(model: str, rows, form: str = "flip", **ziele):
-    modell, draft = _MODELS[model]
-    return P.propose(rows, modell, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES, library=_library())
+    model_spec, draft = _MODELS[model]
+    return P.propose(rows, model_spec, form, ziele, basis=_profile(model), draft=draft, rates=MEASURED_RATES, library=_library())
 
 
 def _result(rc=0, exc_type=None, exc_msg="", forced=(), where="", text="PLAN\n"):

@@ -31,6 +31,9 @@ TT=${RIG_TEST_WRAP:-$F/capped_run.sh}; export RIG_TEST_WRAP=$TT
 # F0-A fix round 1: reviewed ident-map collisions (different functions, never one scope) are exempt by default; the name-rule exemption
 # per line is chosen by the caller: COLLISION_OK_FILE=$F/data/collision_ok_1007_<27b|nf>.json (collision_auto merges it).
 [ -z "${IDENT_COLLISION_OK_FILE:-}" ] && [ -f "$F/data/ident_collision_ok_1007.json" ] && export IDENT_COLLISION_OK_FILE=$F/data/ident_collision_ok_1007.json
+# F0-A fix round 2: step 2 (ident_fix.py) uses the refined collision rule by default (a common English word as prose or inside a longer string no
+# longer aborts: catalog.json `vorlauf -> warmup`, 1 strict collision on both heads, 0 refined). IDENT_FIX_COLLISION=strict restores the 28.09. rule.
+export IDENT_FIX_COLLISION=${IDENT_FIX_COLLISION:-refined}
 MAP=$F/data/merged_0928.json; FIXMAP=$F/data/identfix_map.json; TM=${KIT_TM:-$F/data/tm.jsonl}
 RUN=${RUN_BASE:-$KIT_WORK/runs}/run-$(date -u +%m%d%H%M%S); mkdir -p "$RUN"; W=$RUN/wt; B=$RUN/wt-base
 # FIXMAP_EXTRA="<table.json> ..." (F0-A, 07.10.): further identifier tables for step 2 (ident_fix.py), merged over

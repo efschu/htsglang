@@ -219,7 +219,7 @@
    "docker/weg2-release/entrypoint.sh": {
     "was": "exempted for FLLIPER_, FLLIPER_PDFLIP_, FLLIPER_P_CHUNK_POLICY, FLLIPER_TAG, flliper, pdflip as a 'comment block (lines 37-44)'",
     "why_withdrawn": "the colliding tokens are executable compat code, not only the comment: ep_state_path (07c20a35e5 line 94) 'nv=FLLIPER_PDFLIP_$1 ov=SGLANG_WEG2_$1', EP_CACHE_NEW/EP_CACHE_OLD (line 116) '$HOME/.cache/flliper' / '$HOME/.cache/sglang', and the package-dir check (line 178) 'python/sglang || python/flliper'. With the exemption the mechanical pass writes the SAME token on both sides of each pair (old SGLANG_WEG2_* fallback, ~/.cache/sglang volume detection and the python/sglang path test vanish without any error): R5/A2 (old profile starts unchanged) breaks silently.",
-    "rule": "NOT exempt. collision_survey.py reports the file as an open name-rule collision and the mechanical pass (F0-D) aborts on it until entrypoint.sh no longer spells both names as plain tokens: F0-B rewrites it for both names and builds the OLD names from pieces (like the name_compat tests: \"SG\" \"LANG_\"), or the pass content-locks it. Precondition of F0-D, owner F0-B/F0-G."
+    "rule": "NOT exempt, but CONTENT-LOCKED since F0-A fix round 2 (rename_to_flliper.py EXCLUDE_CONTENT: docker/weg2-release/entrypoint.sh and docker/pdflip-release/entrypoint.sh): the mechanical pass keeps its bytes, the file moves with its directory, the survey has nothing to report. F0-B writes it for both names (old names built from pieces), F0-G finishes it by hand on the renamed tree. Owner F0-B/F0-G."
    }
   }
  }
