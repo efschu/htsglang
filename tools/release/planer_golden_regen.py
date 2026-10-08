@@ -32,12 +32,18 @@ def masked(l):
 
 
 def dumps(tree, sub):
-    """child process: the test module of `tree` dumps the profiles; returns {golden name: (golden text, dump text)}"""
+    """child process: the test modules of `tree` dump the reference profiles; returns {golden name: (golden text, dump text)}"""
     code = (
         "import importlib,sys,json;t,s=sys.argv[1:3];sys.path.insert(0,t+'/python');sys.path.insert(0,t+'/test/registered/unit/'+s)\n"
         "m=importlib.import_module('test_planer_referenz_n3_1006');o={}\n"
         "for p,g in %r:\n"
         "    r=m._dump_of(p,m.O.read_replay(m.REPLAY_REF));o[g]=[m._read(m._golden_file(g)),r.result.dump()]\n"
+        # the live Dual snapshot of AP-J (test_planer_abnahme_1006.TestLiveDualReference): the proposal's dry run, a named launcher refusal
+        "ab=importlib.import_module('test_planer_abnahme_1006');ab.setUpModule();A=ab.APE;O=ab.O\n"
+        "v=A._propose('ref3',profile=ab.LIVE);b=A._dual_profile(ab.LIVE)\n"
+        "li=O.LaunchInput(v['argv'],v['env'],b.vars,[],'propose:'+v['basis'],b.instruments)\n"
+        "res=O.run_profile('',A._ref_rows(),tree=A.TREE,force=False,launch_input=li).result\n"
+        "o['plan_27b_dual_live1521_n3.txt']=[open(ab.GOLDEN_TXT,encoding='utf-8').read(),res.dump()]\n"
         "print('@@JSON@@'+json.dumps(o))\n" % (PROFILES,))
     out = subprocess.run([sys.executable, "-W", "ignore", "-c", code, tree, sub], capture_output=True, text=True, cwd=tree,
                          env=dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=""))
@@ -53,7 +59,7 @@ imap = R._load_imap(os.path.join(KIT, "data", "merged_0928.json"))
 OLD = dumps(old_tree, "weg2")
 NEW = dumps(new_tree, "pdflip")
 bad = 0
-for _p, g in PROFILES:
+for g in OLD:
     G, D = [x.split("\n") for x in OLD[g]]
     D2 = NEW[g][1].split("\n")
     rule = [R.rewrite_all(l, False, True, imap)[0] for l in G]

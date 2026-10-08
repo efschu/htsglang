@@ -7,8 +7,8 @@ One class of fixture is NOT a log but a golden of the code's OWN output: the HW-
 `WEG2-DORMANT-SERVED record` into it; after the rename the planner says `PDFLIP-DORMANT-SERVED`, the golden still says `WEG2-`
 and `test_hw_generic_profile_gate_1003` fails (found by the item 600 dry-run on y8t 968d99d312: the only new test failure).
 
-This step renames exactly two spellings in those goldens and nothing else: the marker prefix `WEG2-` -> `PDFLIP-` and the module path
-`weg2.` -> `pdflip.` (NF tree: `ImportError: weg2.l15_plan not in this tree`); boot tags such as `weg2ls1b2` stay, they are evidence names.
+This step renames exactly three spellings in those goldens and nothing else: the marker prefix `WEG2-` -> `PDFLIP-` and the module path
+`weg2.` / `weg2/` -> `pdflip.` / `pdflip/` (NF tree: `ImportError: weg2.l15_plan not in this tree`); boot tags such as `weg2ls1b2` stay, they are evidence names.
 It checks that the file still parses as JSON and that the change is exactly reversible (nothing else touched).
 Prints `FIXTURE-SYNC files=<n> replacements=<m>`; exit 3 on any problem."""
 import glob, json, os, re, sys
@@ -24,8 +24,13 @@ for f in files:
     new, k = re.subn(r"WEG2-", "PDFLIP-", old)
     new, k2 = re.subn(r"\bweg2\.", "pdflip.", new)
     k += k2
+    # F0-D (08.10.2026): the module path written with a slash (`(weg2/power_limit.RIG_POWER_LIMIT_W_0924)` in the note of the builtin rig limits)
+    new, k3 = re.subn(r"(?<![\w/.-])weg2/", "pdflip/", new)          # not behind a path: /spinning/gpu-arb/weg2/ is a host dir and stays
+    k += k3
     json.loads(new)                                   # still JSON
-    if re.sub(r"\bpdflip\.", "weg2.", re.sub(r"PDFLIP-", "WEG2-", new)) != old:   # reversible == only those spellings changed
+    def _canon(t):      # both spellings of the three renamed forms collapse to one token: nothing else may differ
+        return re.sub(r"(?<![\w/.-])(?:weg2|pdflip)/", "@", re.sub(r"\b(?:weg2|pdflip)\.", "@", re.sub(r"(?:WEG2|PDFLIP)-", "#", t)))
+    if _canon(new) != _canon(old):   # reversible == only those spellings changed (also on a file an earlier pass already converted)
         sys.exit("fixture_sync: not reversible for " + f)
     if k:
         open(f, "w", encoding="utf-8").write(new)
