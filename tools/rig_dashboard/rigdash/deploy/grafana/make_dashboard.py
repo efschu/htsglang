@@ -68,7 +68,7 @@ panels = [
         t("max by (model, dir) (weg2_flip_user_view_ms{part=\"total\",model=~\"$model\"}) / 1000", "{{dir}} {{model}}"),
         t("max by (model, dir) (weg2_flip_user_view_ms{part=\"layer\",model=~\"$model\"}) / 1000", "Layer-Tausch {{dir}} {{model}}")],
         "s", 0, 9, 12, 8, "Nutzersicht (01.10.): P→D = P-Ende -> erstes Decode auf D (Rang-Segmente), "
-        "D→P = Decode-Ende -> P-Prefill-Start (flip_user_time); Teile part=warmup|layer|nachlauf|d_extend. "
+        "D→P = Decode-Ende -> P-Prefill-Start (flip_user_time); Teile part=vorlauf|layer|nachlauf|d_extend. "
         "Ein Punkt je Flip zum flip_begin; Leerlauf-Flips ohne Wert.", draw="points"),
     panel("Upstream-TTFT des D-Beins (nicht Nutzer-TTFT)", [
         t("histogram_quantile(0.5, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))", "p50"),

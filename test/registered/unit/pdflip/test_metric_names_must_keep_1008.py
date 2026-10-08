@@ -287,3 +287,49 @@ def test_restore_is_a_noop_on_this_tree():
     mi = _kit("metric_inventory")
     left = _in_git(lambda: mi.restore(REPO, os.path.join(KIT, "data", "metric_names_1008.json"), apply=False, skip=OWNED_BY_F0F))
     assert left == [], left[:10]
+
+
+# ---- 4. label VALUES of the VictoriaMetrics push (a translated value cuts a series like a translated name) --------------------
+
+LABELS_FIXTURE = os.path.join(HERE, "fixtures", "metric_names_1008", "label_values_old.json")
+
+
+def _label_triples(vp):
+    """(metric, label, value) of everything the sampler pushes for a synthetic boot with every rank field, both flip directions
+    and every part of a flip view -- the same driver is run on the pre-rename tree to make the fixture."""
+    ipc = {"boot_id": "nfh91xyz-boot-20261001T064831Z-2025", "terminal": False,
+           "front": {"served": {"P": 3, "D": 9}, "awake": "D", "queue": [1, 2], "outstanding_n": 1, "d_phase_n": 1,
+                     "d_parked_n": 0, "epoch": 4, "oldest_outstanding_age_s": 1.5,
+                     "served_tokens": {"D": {"prompt": 100, "cached": 80, "completion": 7, "n": 9}},
+                     "arrival_seat": {"ttft_n": 4, "ttft_ms_sum": 8000, "ttft_ms_max": 3100, "verdict_n": 2, "verdict_ms_sum": 5}}}
+    rec = {sec: {} for sec in ("prefill", "decode", "sched", "cap", "cache")}
+    for sec, field, _ in vp.RANK_FIELDS:
+        rec[sec][field] = 1
+    rec["cache"].update({"store_incomplete_delivered": 1, "store_incomplete_deliverable": 1, "mamba_tok": 1,
+                         "prefetch": {"attempted": 3, "landed": 2, "refused": 1}})
+    lines = vp.lines_for_boot(ipc, {"D.tp0pp0": rec, "P.tp1pp0": rec}, "27B", 1000)
+    lines += vp.decode_sum_lines(vp.decode_sums_empty(), "27B", "boot-1", 1000)
+    # a flip view row carries the parts under either spelling of the internal key; VIEW_PARTS reads the one it knows
+    keys = {k for _, k in vp.VIEW_PARTS} | {"vorlauf_ms", "warmup_ms"}
+    done = set()
+    for i, d in enumerate(("P>D", "D>P")):
+        row = dict({k: 1.0 + i for k in keys}, kind="ok", total_ms=5.0, dir=d, begin=100.0 + i)
+        lines += vp.flip_view_points([row], "27B", "boot-1", done)
+    out = set()
+    for ln in lines:
+        name = re.split(r"[{ ]", ln, 1)[0]
+        for k, v in re.findall(r'([A-Za-z_][A-Za-z0-9_]*)="((?:[^"\\]|\\.)*)"', ln):
+            out.add((name, k, v))
+    return out
+
+
+@pytest.mark.skipif(not os.path.isfile(LABELS_FIXTURE), reason="label-value fixture not in this tree")
+def test_vm_push_label_values_are_the_pre_rename_ones():
+    """Fixture = the same driver on the pre-rename dashboard (27B 86ff356d0d / NF a452294dd2; both spell every label value alike).
+    An exact comparison: a changed part name (vorlauf -> warmup, F0-M finding 1) or a new label value fails it."""
+    with open(LABELS_FIXTURE) as f:
+        old = {tuple(x) for x in json.load(f)["triples"]}
+    got = _label_triples(_vmpush())
+    assert got == old, {"missing": sorted(old - got)[:10], "new": sorted(got - old)[:10]}
+    assert ("%s_flip_user_view_ms" % OLD_SUB, "part", "vorlauf") in got
+    assert not [t for t in got if t[1] == "part" and t[2] == "warmup"]

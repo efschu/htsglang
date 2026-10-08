@@ -345,8 +345,10 @@ def ttft_series(client: VmClient, model: str, ts: List[int], step: int) -> dict:
 
 #: VM parts of one flip: total and its complete partition (Summe = total), d_extend only as "davon" of nachlauf;
 #: D>P also the split of vorlauf (leer + halt + park + vor_rest = vorlauf, ipcboot.vorlauf_split) and leer_d_prefill
-#: ("davon" of leer) -- consumers select by part, the total partition stays the five parts above
-VIEW_PARTS = (("total", "total_ms"), ("warmup", "warmup_ms"), ("layer", "layer_ms"), ("wake_kv_dc", "wake_kv_dc_ms"),
+#: ("davon" of leer) -- consumers select by part, the total partition stays the five parts above.
+#: F0-M: the part LABEL VALUE is exported as before the rename ("vorlauf", series in VictoriaMetrics); only the internal row
+#: key of ipcboot.flip_views is spelled warmup_ms
+VIEW_PARTS = (("total", "total_ms"), ("vorlauf", "warmup_ms"), ("layer", "layer_ms"), ("wake_kv_dc", "wake_kv_dc_ms"),
               ("nachlauf", "nachlauf_ms"), ("rest", "rest_ms"), ("d_extend", "nachlauf_d_extend_ms"),
               ("leer", "leer_ms"), ("halt", "halt_ms"), ("park", "park_ms"), ("vor_rest", "vor_rest_ms"),
               ("leer_d_prefill", "leer_d_prefill_ms"),
@@ -355,9 +357,9 @@ VIEW_PARTS = (("total", "total_ms"), ("warmup", "warmup_ms"), ("layer", "layer_m
 
 def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -> List[str]:
     """Flipzeit (ipcboot.flip_views, Nutzer 02.10.: letztes Token -> erstes Token, beide Richtungen) als Punkte
-    zum flip_begin: weg2_flip_user_view_ms{def="t2t",dir,part}, part = total | warmup | layer | wake_kv_dc |
+    zum flip_begin: weg2_flip_user_view_ms{def="t2t",dir,part}, part = total | vorlauf | layer | wake_kv_dc |
     nachlauf | rest (die Teile summieren zu total) | d_extend (davon im Nachlauf); D>P dazu leer | halt | park |
-    vor_rest (summieren zu warmup) | leer_d_prefill (davon in leer).  Das Label def trennt die Reihen von den
+    vor_rest (summieren zu vorlauf) | leer_d_prefill (davon in leer).  Das Label def trennt die Reihen von den
     alten (bis 02.10. endete D>P am Leg-1-Dispatch).  Nur gemessene Flips (kind ok), jeder einmal -- ein D>P mit
     vorlaeufigem Start (D's Log hat seine letzten Runden noch nicht geschrieben) erst, wenn er feststeht."""
     out = []

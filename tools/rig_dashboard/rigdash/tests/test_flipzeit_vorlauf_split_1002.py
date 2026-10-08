@@ -81,7 +81,7 @@ class VorlaufSplit27B(unittest.TestCase):
         y = ipcboot.flip_views(SEGS, _ipc_27b(), B27 + 60, None, d_rounds=ROUNDS_LATE, arrivals=ARR_27B)[0]
         pts = vmpush.flip_view_points([y], "27B", "b", set())
         parts = {p.split('part="')[1].split('"')[0] for p in pts}
-        self.assertTrue({"total", "warmup", "leer", "halt", "park", "vor_rest"} <= parts)
+        self.assertTrue({"total", "vorlauf", "leer", "halt", "park", "vor_rest"} <= parts)
         # without a later round for too long the row is taken as it is
         z = ipcboot.flip_views(SEGS, _ipc_27b(), B27 + ipcboot.PROVISIONAL_MAX_S + 10, None,
                                d_rounds=ROUNDS_EARLY, arrivals=ARR_27B)[0]

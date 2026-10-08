@@ -171,7 +171,7 @@ class FlipzeitPush(unittest.TestCase):
         parts = sorted(l.split('part="')[1].split('"')[0] for l in lines)
         # with the waiter's arrival the Vorlauf split rides along (leer = 0: Server-Leerlauf is never in the total)
         self.assertEqual(parts, ["halt", "layer", "leer", "leer_d_prefill", "nachlauf", "park", "rest", "total",
-                                 "vor_rest", "wake_kv_dc", "warmup"])    # sorted: F0-D rename vorlauf -> warmup moved the key behind wake_kv_dc
+                                 "vor_rest", "vorlauf", "wake_kv_dc"])    # F0-M: the part LABEL VALUE keeps its pre-rename spelling
         self.assertTrue(all('def="t2t"' in l for l in lines))
         # the front's own small numbers are no longer pushed as weg2_flip_time_ms / weg2_flip_user_ms
         pts, newest = vmpush.flip_points(_ipc_dp(), "NF", 0.0)
