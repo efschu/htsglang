@@ -1,0 +1,19 @@
+{
+ "_comment": "F0-E NF line: why the NF exemption lists differ from the 27B ones. Reading notes only, not read by any tool.",
+ "collision_ok_1007_nf.json": {
+  "added_in_F0_E": [
+   "test/registered/unit/weg2/test_f0b_tool_names_1007.py flliper",
+   "tools/rig_dashboard/README.md flliper",
+   "tools/rig_dashboard/rigdash/GLOSSARY_EN.md flliper",
+   "tools/rig_dashboard/rigdash/features.py pdflip",
+   "tools/rig_dashboard/rigdash/redact.py PDFLIP, PdFlip",
+   "tools/rig_dashboard/rigdash/sources.py pdflip",
+   "tools/rig_dashboard/rigdash/weg2line.py flliper"
+  ],
+  "why": "collision_auto.py on the NF tree (a452294dd2 + kit data) REFUSED exactly these seven files (the F0-B/F0-C double-read files, the same set as the 27B probe). The seven are byte-identical to the 27B tree (git diff a452294dd2 86ff356d0d shows no hunk), so the review of F0-D kit data 4 holds: colliding words are comments, docstrings and the split-token machinery, no executable old-name literal. The two shell tools stay content-locked (EXCLUDE_CONTENT)."
+ },
+ "ident_fix_collision_ok_1007_nf.json": {
+  "base": "copy of ident_fix_collision_ok_1007_27b.json minus docker/pdflip-release/test_rigdash_ctx_1995.sh (the file does not exist on the NF line)",
+  "extra_pairs": "none yet (see the F0-E run log)"
+ }
+}

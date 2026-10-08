@@ -1,0 +1,136 @@
+{
+ "_comment": "F0-E 08.10.2026, NF line (base a452294dd2 + the F0-D source disambiguation commits): ident_fix.py collision pairs {path (as after step 1): [old word]}, starting from the reviewed 27B list (ident_fix_collision_ok_1007_27b.json; its comment holds the review method). The NF tree carries the same planner/dashboard files byte for byte (git diff a452294dd2 86ff356d0d on the listed files); pairs are added below only where the NF run met a collision the 27B run did not, each read once. Notes: ident_fix_collision_ok_1007_nf.notes.json.",
+ "python/flliper/srt/pdflip/launcher.py": [
+  "grund"
+ ],
+ "python/flliper/srt/pdflip/profile_catalog.py": [
+  "baeume",
+  "baum",
+  "datei",
+  "kuratiert"
+ ],
+ "python/flliper/srt/pdflip/propose.py": [
+  "geborgt"
+ ],
+ "python/flliper/srt/pdflip/propose_dual.py": [
+  "schnitt"
+ ],
+ "python/flliper/srt/pdflip/propose_single.py": [
+  "grund",
+  "zustand"
+ ],
+ "python/flliper/srt/pdflip/propose_verdict.py": [
+  "herkunft",
+  "hinweise",
+  "klasse",
+  "werte",
+  "zustand"
+ ],
+ "scripts/nvfp4/launch_when_free.sh": [
+  "beleg"
+ ],
+ "scripts/probe/crossrig_ladder_run.sh": [
+  "klasse"
+ ],
+ "scripts/translator/wait_for_cards.sh": [
+  "zustand"
+ ],
+ "test/registered/unit/distributed/_bar1_marker_source.py": [
+  "grund"
+ ],
+ "test/registered/unit/pdflip/test_planer_ape_dual_1006.py": [
+  "passung",
+  "schnitt"
+ ],
+ "tools/rig_dashboard/rigdash/GLOSSARY_EN.md": [
+  "herkunft",
+  "zustand"
+ ],
+ "tools/rig_dashboard/rigdash/README.md": [
+  "einzel",
+  "grund",
+  "hinweis",
+  "orakel",
+  "verdikt",
+  "wert"
+ ],
+ "tools/rig_dashboard/rigdash/features.py": [
+  "wert"
+ ],
+ "tools/rig_dashboard/rigdash/features_update.py": [
+  "werte"
+ ],
+ "tools/rig_dashboard/rigdash/profil.py": [
+  "eintraege",
+  "einzel",
+  "herkunft",
+  "hinweise",
+  "konsequenz",
+  "orakel",
+  "verdikt",
+  "wert",
+  "werte",
+  "zustand"
+ ],
+ "tools/rig_dashboard/rigdash/profil_data/catalog.json": [
+  "abgeleitet_von",
+  "baeume",
+  "braucht",
+  "datei",
+  "erklaert",
+  "geerntet",
+  "kuratiert",
+  "schliesst_aus",
+  "skaliert_mit",
+  "tauscht",
+  "unerklaert"
+ ],
+ "tools/rig_dashboard/rigdash/static/index.html": [
+  "beleg",
+  "titel",
+  "unbelegt",
+  "wert"
+ ],
+ "tools/rig_dashboard/rigdash/static/modellprofil.js": [
+  "hinweis"
+ ],
+ "tools/rig_dashboard/rigdash/static/profil.js": [
+  "datei",
+  "ebene",
+  "geaendert",
+  "konsequenz",
+  "unerklaert",
+  "verdikt",
+  "wert"
+ ],
+ "tools/rig_dashboard/rigdash/static/profil_balken.js": [
+  "balken",
+  "herkunft"
+ ],
+ "tools/rig_dashboard/rigdash/static/profil_planer.js": [
+  "ausgang",
+  "ebene",
+  "geaendert",
+  "herkunft",
+  "hinweis",
+  "hinweise",
+  "orakel",
+  "profil_wert",
+  "unbelegt",
+  "vorschlag",
+  "wert",
+  "zustand"
+ ],
+ "tools/rig_dashboard/rigdash/tests/fixtures/kartenplan/planner_tree/python/flliper/srt/pdflip/profile_catalog.py": [
+  "datei"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_profil_nacharbeit_1006.py": [
+  "werte"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_profil_orakel_apd_1006.py": [
+  "wert"
+ ],
+ "tools/rig_dashboard/rigdash/tests/test_profil_planer_aph1_1006.py": [
+  "FORMEN"
+ ]
+}
