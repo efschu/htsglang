@@ -69,6 +69,19 @@ def _lbl(d: Dict[str, str]) -> str:
     return "{" + ",".join('%s="%s"' % (k, str(v).replace("\\", "\\\\").replace('"', '\\"')) for k, v in sorted(d.items())) + "}"
 
 
+def ttft_from_via(block) -> Optional[dict]:
+    """front.ttft_by_via ({after_p|d_direct|d_single: {n, ms_sum, ms_max}}, the request book, written by both lines) as the
+    ttft_* counters of front.arrival_seat -- the same clock (arrival -> first content), for a boot whose front does not arm
+    the arrival-seat rule (08.10.: the 27B boots delivered no ttft_*, VM had no weg2_front_ttft_count for model 27B)."""
+    if not isinstance(block, dict):
+        return None
+    rows = [x for x in (block.get(k) for k in ("after_p", "d_direct", "d_single")) if isinstance(x, dict)]
+    if not rows:
+        return None
+    return {"ttft_n": sum(x.get("n") or 0 for x in rows), "ttft_ms_sum": sum(x.get("ms_sum") or 0 for x in rows),
+            "ttft_ms_max": max(x.get("ms_max") or 0 for x in rows)}
+
+
 def lines_for_boot(ipc: dict, rankstats: Dict[str, dict], model: str, now_ms: int) -> List[str]:
     """Exposition lines (``name{labels} value ts_ms``) for one live boot -- pure, unit-tested."""
     base = {"model": model, "boot": short_boot(ipc.get("boot_id") or ipc.get("dir"))}
@@ -89,6 +102,8 @@ def lines_for_boot(ipc: dict, rankstats: Dict[str, dict], model: str, now_ms: in
             for k in ("prompt", "cached", "completion", "n"):
                 put("weg2_front_served_tokens_total", st.get(k), {"group": g, "kind": k})
     a = fr.get("arrival_seat") or {}
+    if a.get("ttft_n") is None:
+        a = ttft_from_via(fr.get("ttft_by_via")) or a      # no arrival-seat block (rule not armed): the request book's counters
     # TTFT der Nutzer: Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT, IPC-Zähler)
     put("weg2_front_ttft_count", a.get("ttft_n"))
     put("weg2_front_ttft_ms_sum", a.get("ttft_ms_sum"))
