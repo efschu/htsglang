@@ -56,6 +56,14 @@ LATE_HOLD_ATTR = "_pdflip_d_park_late_since"
 #: its list; an awake re-queue gives it back to the settle, not to the queue.
 FROM_SETTLE_ATTR = "_pdflip_park_from_settle"
 
+#: CAPPARK-FLIP-HOLD (08.10., NF dauer10081045 epoch 4->5): the epoch of the
+#: flip park ``park_running`` opened (its sleep follows); None = no flip park
+#: open. Closed like the late hold: by the sleep (hold_parked) or by the awake
+#: re-queue (park_tick). While open, the #248h capacity re-queue does not run.
+#: Replicated: set and cleared by the same broadcast RPC / sleep on every rank.
+FLIP_PARK_OPEN_ATTR = "_pdflip_d_flip_park_open"
+_CAPPARK_HOLD_LOGGED_ATTR = "_pdflip_cappark_flip_hold_logged"
+
 
 def rearm_window_draft_cold(sched, reqs) -> int:
     """27B PARK (DFlash2): a flip-parked request on a SLOT-MAPPED draft pool
@@ -275,6 +283,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # releases into the queue behind the park's back -- the late hold holds.
     late_hold = bool(late_hold_armed)
     setattr(sched, LATE_HOLD_ATTR, now if late_hold else None)
+    setattr(sched, FLIP_PARK_OPEN_ATTR, epoch)  # CAPPARK-FLIP-HOLD: until the sleep / awake re-queue
     rids = [str(r.rid) for r in sched.pdflip_d_parked if d_seats.park_site(r) is not None]
     held = [str(r.rid) for r in sched.pdflip_d_parked if d_seats.park_site(r) is None]
     # #59b: the depth each parked request resumes from, after the retraction
@@ -484,6 +493,7 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     so it runs during the flip. Hold not armed: they stay parked and the first
     awake pass re-queues them."""
     setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the sleep closes the late hold
+    setattr(sched, FLIP_PARK_OPEN_ATTR, None)  # CAPPARK-FLIP-HOLD: ... and the flip park
     parked = list(getattr(sched, "pdflip_d_parked", None) or [])
     if not parked:
         return 0
@@ -545,11 +555,14 @@ def park_tick(sched) -> int:
         )
         due = bool(sched._pdflip_group_min_flags([local])[0])
     if not due:
+        if _flip_park_holds_capacity(sched, parked):
+            return 0
         return _capacity_requeue(sched, parked)
     moved = list(parked)
     sched.pdflip_d_parked = []
     sched._pdflip_d_park_slept = False
     setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the re-queue closes the late hold
+    setattr(sched, FLIP_PARK_OPEN_ATTR, None)  # CAPPARK-FLIP-HOLD: ... and the flip park
     # PARK-SETTLE: a folded settle request goes back to the settle (its read is
     # still short; the queue would hand it to the X gate unsettled).
     back = [r for r in moved if getattr(r, FROM_SETTLE_ATTR, False)]
@@ -571,6 +584,31 @@ def park_tick(sched) -> int:
                 (", %d back to the #1471 settle %s" % (len(back), [str(r.rid) for r in back]))
                 if back else "")
     return len(mine) + len(back)
+
+
+def _flip_park_holds_capacity(sched, parked) -> bool:
+    """CAPPARK-FLIP-HOLD (08.10., NF dauer10081045, D->P flip epoch 4->5): a
+    flip park is open -- the #248h capacity re-queue waits for the wake's hold
+    read (or the awake re-queue). Before, park_tick re-queued the capacity-
+    parked requests the park had just folded in (pdflip-0-9/-0-10/-0-12, #248h
+    requeue 10:53:17); D ran them to their end and the front's D->P quiesce,
+    told they were parked, waited 28180 ms. ``FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD=0``
+    = the old re-queue inside the park. Replicated verdict (the attribute and
+    the switch are the same on every rank), no collective."""
+    from flliper.srt.environ import envs
+
+    epoch = getattr(sched, FLIP_PARK_OPEN_ATTR, None)
+    if epoch is None or not envs.FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD.get():
+        return False
+    from flliper.srt.pdflip import resume_via_p as _rvp
+
+    held = [str(r.rid) for r in parked if getattr(r, _rvp.CAPPARK_AT_ATTR, None) is not None]
+    if held and getattr(sched, _CAPPARK_HOLD_LOGGED_ATTR, None) != epoch:
+        setattr(sched, _CAPPARK_HOLD_LOGGED_ATTR, epoch)
+        logger.info("#248h CAPPARK-FLIP-HOLD epoch=%s n=%d rids=%s -- a flip park is open: the capacity "
+                    "re-read waits for the wake's hold read / the awake re-queue, nothing of the park runs "
+                    "on D during the flip (FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD)", epoch, len(held), held)
+    return True
 
 
 def _capacity_requeue(sched, parked) -> int:
