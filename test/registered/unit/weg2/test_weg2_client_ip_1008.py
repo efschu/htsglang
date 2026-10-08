@@ -1,5 +1,5 @@
 """08.10. (user: "ja einbauen"): the dashboard's session overview shows the ORIGIN IP of a session.  The front never recorded the peer;
-now ``request_done.client_ip`` = the first address of ``X-Forwarded-For`` (the owui proxy / router append the peer they saw), else
+now ``request_done.client_ip`` = the LAST address of ``X-Forwarded-For`` (the owui proxy appends the peer it saw; an XFF the client sent itself stays in front), else
 ``request.remote``.  Additive instrument next to the session hash (``_sess_note``): no routing, flip, admission or scheduler path.
 
 RED before: ``session_trace.client_ip`` and ``RequestBook.client`` do not exist, ``request_done`` has no ``client_ip``.
@@ -34,8 +34,8 @@ def _front():
 
 
 class TestClientIp(CustomTestCase):
-    def test_first_forwarded_address_wins_then_the_peer(self):
-        self.assertEqual(st.client_ip({"X-Forwarded-For": "10.1.2.3, 127.0.0.1"}, "127.0.0.1"), "10.1.2.3")
+    def test_last_forwarded_address_wins_then_the_peer(self):
+        self.assertEqual(st.client_ip({"X-Forwarded-For": "6.6.6.6, 10.1.2.3"}, "127.0.0.1"), "10.1.2.3")
         self.assertEqual(st.client_ip({"x-forwarded-for": " 192.168.0.7 "}, "127.0.0.1"), "192.168.0.7")
         self.assertEqual(st.client_ip({}, "192.168.0.9"), "192.168.0.9")
         self.assertIsNone(st.client_ip({}, None))
@@ -46,7 +46,7 @@ class TestClientIp(CustomTestCase):
         f = _front()
         book = front_mod.Front._req_book(f)
         book.arrive("weg2-1-1", 100.0, 0)
-        f._sess_note("weg2-1-1", FakeRequest({"X-Forwarded-For": "10.1.2.3, 127.0.0.1", "X-Claude-Code-Session-Id": "abc"}, "127.0.0.1"), {})
+        f._sess_note("weg2-1-1", FakeRequest({"X-Forwarded-For": "6.6.6.6, 10.1.2.3", "X-Claude-Code-Session-Id": "abc"}, "127.0.0.1"), {})
         rec, _ = book.done("weg2-1-1", 101.0, 200, 0)
         self.assertEqual(rec["client_ip"], "10.1.2.3")
         self.assertIsNotNone(rec["session_id"])                                           # the session note is untouched
