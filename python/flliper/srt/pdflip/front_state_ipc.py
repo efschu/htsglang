@@ -381,7 +381,7 @@ def user_flipzeit(direction: str, start_a: Optional[float], start_a_source: Opti
     support value gives ``user_flipzeit_ms`` None and the reason -- never a
     substitute."""
     pre = "last_d_token" if direction == "D>P" else "last_p_chunk_end"
-    cands = [(t, s) for t, s in ((start_a, pre), (waiter_ts, "waiter_arrival")) if t is not None]
+    cands = [(t, s) for t, s in ((start_a, start_a_source or pre), (waiter_ts, "waiter_arrival")) if t is not None]
     start, src = (max(cands, key=lambda c: float(c[0])) if cands else (None, None))
     missing = None
     if end_ts is None:
@@ -416,7 +416,8 @@ def user_flipzeit(direction: str, start_a: Optional[float], start_a_source: Opti
     return out
 
 
-def p_last_forward_done(beacons: Optional[dict], not_after: Optional[float] = None) -> Optional[float]:
+def p_last_forward_done(beacons: Optional[dict], not_after: Optional[float] = None,
+                       not_before: Optional[float] = None) -> Optional[float]:
     """The end of P's last forward from its ranks' progress beacons
     ({pid: (forward_ct, t_start_ns, t_done_ns)}): the latest ``t_done`` of a
     FINISHED forward (t_done >= t_start), no later than ``not_after`` -- the
@@ -429,6 +430,8 @@ def p_last_forward_done(beacons: Optional[dict], not_after: Optional[float] = No
         t = float(td) / 1e9
         if not_after is not None and t > float(not_after):
             continue
+        if not_before is not None and t < float(not_before):
+            continue   # a forward of an EARLIER P phase is not this phase's last chunk
         best = t if best is None else max(best, t)
     return best
 
@@ -442,6 +445,23 @@ def pp_prefill_start(pp_first: Optional[dict]) -> Tuple[Optional[float], str, Op
         return float(pp_first["ts"]), "pp_first_forward", None
     reason = (pp_first or {}).get("missing") or "no_probe"
     return None, "missing", str(reason)
+
+
+def _dp_queue_diagnosis(armed: dict, leg1_arrival: Optional[float], d_term: Optional[float]) -> dict:
+    """Diagnosis of a D->P flip, NEVER part of the flip time: how old the oldest queued
+    request was at the flip's begin (``queue_age_max_ms``), whether P served a YOUNGER request
+    first (``queue_skip_ms`` > 0 = the oldest one was skipped: a scheduling / starvation finding,
+    not flip time) and, for an idle flip (no waiter, no park), the gap between D's last term and
+    the flip's begin (``idle_ms``)."""
+    oldest, begin = armed.get("oldest_waiter_ts"), armed["flip_begin_ts"]
+    skip = None if oldest is None or leg1_arrival is None else max(0.0, leg1_arrival - oldest)
+    return {
+        "queue_age_max_ms": None if oldest is None else round((begin - oldest) * 1000.0),
+        "queue_skip_ms": None if skip is None else round(skip * 1000.0),
+        "queue_skip": bool(skip),
+        "idle_ms": (round(max(0.0, begin - d_term) * 1000.0)
+                    if armed.get("idle_flip") and d_term is not None else None),
+    }
 
 
 class DpFlipClock:
@@ -472,6 +492,8 @@ class DpFlipClock:
         self._last_d_served: Optional[float] = None
         #: USER-FLIPZEIT: the last D stream chunk with content (front clock)
         self._last_d_token: Optional[float] = None
+        #: USER-FLIPZEIT: where the CURRENT D phase began (the P->D flip's done)
+        self._d_phase_start: Optional[float] = None
         self._armed: Optional[dict] = None
 
     def note_park(self, epoch: int, t_sent: Optional[float], rpc_ms: Optional[float]) -> None:
@@ -488,6 +510,30 @@ class DpFlipClock:
         this, not the park's send."""
         if self._last_d_token is None or now > self._last_d_token:
             self._last_d_token = float(now)
+
+    def note_d_phase_start(self, flip_begin_ts: float, done_ts: float) -> None:
+        """USER-FLIPZEIT: a P->D flip is done -- a new D phase begins. A D token or
+        served leg 2 older than that flip's begin belongs to the PREVIOUS D phase and
+        never starts this phase's D->P span (NF int18 epoch 23: the last token of
+        epoch 21 was carried over a whole P phase, 41.8 s). Chunks that streamed
+        between the flip's begin and its logged done (tail overlap) stay."""
+        self._d_phase_start = float(done_ts)
+        if self._last_d_token is not None and self._last_d_token < float(flip_begin_ts):
+            self._last_d_token = None
+        if self._last_d_served is not None and self._last_d_served < float(flip_begin_ts):
+            self._last_d_served = None
+
+    def d_phase_term(self) -> Tuple[Optional[float], Optional[str]]:
+        """The start term of the D->P span: this D phase's last token, else the phase's
+        begin (an empty D phase with a waiter is HOLDING it, the flip cycle holds it).
+        None when neither is known (never a substitute)."""
+        tok, src = self.last_d_token()
+        ph = self._d_phase_start
+        if tok is not None and (ph is None or tok >= ph):
+            return tok, src
+        if ph is not None:
+            return ph, "d_phase_start"
+        return None, None
 
     def last_d_token(self) -> Tuple[Optional[float], Optional[str]]:
         """The last D token the front saw: the later of the last streamed
@@ -540,16 +586,15 @@ class DpFlipClock:
         if a is None:
             return None
         ev = self._first_prefill(rid, t_dispatch, pp_first, pp_last)
-        # USER-FLIPZEIT (08.10.): the user's definition beside the old fields
-        if a.get("oldest_waiter_ts") is not None:
-            w, wsrc = a["oldest_waiter_ts"], "oldest_queued_at_flip_begin"
-        elif rid_arrival_ts is not None:
-            w, wsrc = float(rid_arrival_ts), "first_leg1_rid_arrival"
-        else:
-            w, wsrc = None, None
-        tok, tok_src = self.last_d_token()
-        ev.update(user_flipzeit("D>P", tok, tok_src, w, wsrc,
+        # USER-FLIPZEIT (08.10., planner decision): the span starts at the LATER of this D
+        # phase's last token (else the phase's begin) and the arrival of the request P serves
+        # FIRST after this flip -- the one the flip ends with. Without a proven arrival: no start.
+        w = None if rid_arrival_ts is None else float(rid_arrival_ts)
+        tok, tok_src = self.d_phase_term()
+        ev.update(user_flipzeit("D>P", tok, tok_src, w, None if w is None else "first_leg1_rid_arrival",
                                 ev.get("prefill_start_ts"), ev.get("prefill_start_missing")))
+        ev.update(_dp_queue_diagnosis(a, w, tok))
+        self._last_d_token = self._last_d_served = self._d_phase_start = None  # consumed: the next span needs a new D phase
         ev["flip_total_ms"] = ev["parts"]["legs_ms"]
         ev["flip_total_note"] = FLIP_TOTAL_NOTE
         return ev
@@ -678,7 +723,7 @@ class FirstWorkClock:
 
     @staticmethod
     def pd_user(ev: dict, p_last_done_ts: Optional[float], waiter_ts: Optional[float],
-                waiter_source: Optional[str]) -> dict:
+                waiter_source: Optional[str], p_phase_start: Optional[float] = None) -> dict:
         """USER-FLIPZEIT (08.10.) of a P->D ``flip_first_work`` (``dir`` P>D):
         P's last prefill chunk end -- its ranks' last finished forward
         (``p_beacon_last_forward_done``, :func:`p_last_forward_done`), else the
@@ -688,8 +733,12 @@ class FirstWorkClock:
         out = dict(ev)
         if p_last_done_ts is not None:
             start, src = float(p_last_done_ts), "p_beacon_last_forward_done"
-        elif ev.get("p_end_ts") is not None:
+        elif ev.get("p_end_ts") is not None and (p_phase_start is None
+                                                 or float(ev["p_end_ts"]) >= float(p_phase_start)):
             start, src = float(ev["p_end_ts"]), "p_leg1_end"
+        elif p_phase_start is not None:
+            # this P phase ran no chunk: the span starts where the phase began (mirror of the D side)
+            start, src = float(p_phase_start), "p_phase_start"
         else:
             start, src = None, None
         out.update(user_flipzeit("P>D", start, src, waiter_ts, waiter_source,
