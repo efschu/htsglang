@@ -1,0 +1,432 @@
+# fLLiper release image, FLAT build (no delta chain) -- FB for the 27B operator, 2026-09-26. Plan:
+# /spinning/gpu-arb/docs/FLAT_IMAGE_PLAN.md. Derived from ./Dockerfile (the proven rc8b full build, FL6 layout-agnostic);
+# every RUN body of steps 1-7 is unchanged except the marked FLAT changes:
+#   FLAT-1  release defaults: CUDA 13.0.2 base, kernel wheel 605c54e7, PREBUILD_STRICT=1, cuda label cu130.
+#   FLAT-2  ONE tree: REV_27B must equal REV_NF (both slots carry the same unified revision); item 600: a Duo ctx bakes ALLOW_DUO_TREES=1.
+#   FLAT-3  new step 6b: kernel list (tvm-ffi + FlashInfer 0.7.0 extras + barlink pipe) via delta_prebuild.py -- the
+#           full Dockerfile never had this step; until now only the delta images carried these kernels.
+#   FLAT-4  fLLiper labels (OCI + io.github.efschu.flliper.*), revision label = the plain 40-hex SHA; no htsglang.* labels.
+#   FLAT-5  B4 placeholders (source repo, version scheme) are baked by make_flat_ctx.sh; the build refuses an unbaked file.
+# F0-G (08.10., renamed trees): the image is built from the RENAMED trees (python/flliper, srt/pdflip). Runtime-only variables the image bakes
+#   (barlink NV source, launch dump, planner files) carry the renamed spelling FLLIPER_*; a legacy spelling in the image ENV would make every
+#   process log the compat DEPRECATED line. The five variables the ENTRYPOINT reads under the legacy spelling (SGLANG_WEG2_VENV,
+#   _DEVTOOLS_DIR and the three state dirs, where "value == the /var/lib/htsglang default" means "no choice of the caller", entrypoint
+#   ep_state_path) stay as they are -- the entrypoint exports both spellings from there. /sgl-workspace/flliper is linked next to
+#   /sgl-workspace/sglang. Labels: io.github.efschu.flliper.revision (plain 40-hex of the 27B slot) next to .revision.27b/.nf.
+# Internal paths (/opt/htsglang, /var/lib/htsglang, HTSGLANG_* env) stay as the image's internal names. B2 is done: the
+# entrypoint accepts FLLIPER_* (EP 2026-09-26, entrypoint.sh block ENTRYPOINT-NAMES: FLLIPER_<X> -> HTSGLANG_<X>,
+# /var/lib/flliper/* volumes, ~/.cache/flliper), so callers use the FLLIPER_* names; the old names keep working.
+# Context: make_flat_ctx.sh --write (ctx/flat-<release>-<sha10>-<cu>/). Build: host_build.sh with IMAGE=flliper:<tag>
+# (BUILD_INFO layout "duo" + build "flat", so host_build.sh passes REV_27B/REV_NF/... and runs D1 per slot unchanged).
+# Never publish from here; publication is a separate gate after the user's Go.
+
+ARG CUDA_BASE=nvidia/cuda:13.0.2-devel-ubuntu24.04
+FROM ${CUDA_BASE}
+
+# SCHICHTFOLGE UND CACHE (RELEASE_PLAN §7.1): jede ARG-Deklaration geht als Umgebung in ALLE folgenden RUN-Schritte
+# und damit in deren Cache-Schluessel ein. Oben stehen darum nur Argumente, die sich NICHT je SHA aendern.
+# HTSGLANG_REVISION und SGLANG_SCM_VERSION werden erst in Schritt 4 (Quellbaum) deklariert -- hier oben invalidierte
+# jede neue SHA schon apt, pip und den FlashInfer-Vorbau. Ebenso HTSGLANG_LINE (27b|nf) und PUSH_STATE erst ganz am Ende:
+# so teilen sich das 27B- und das NF-Image alle Schichten bis einschliesslich FlashInfer-Vorbau (gleiches Lock,
+# gleiche Modulliste, gleiches prebuild_jit.py vorausgesetzt).
+ARG PIP_VERSION=26.1.2
+# torch-Erwartung (Prefix); F kann sie mit den FlashInfer-Pins aendern (lock/overrides.txt + dieses ARG).
+ARG TORCH_EXPECT=2.11.0
+ARG NCCL_PIN=2.28.9
+ARG NCCL_PACKAGE=nvidia-nccl-cu13
+ARG NCCL_BANNER="NCCL version 2.28.9+cuda13.0"
+# sha256 der Rig-Datei (BUILD_INFO.json .nccl.sha256; host_acceptance.sh reicht es durch). Leer = nur Banner.
+ARG NCCL_SHA256=
+ARG KERNEL_WHEEL=sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
+ARG KERNEL_WHEEL_SHA256=605c54e76b351a3715ef8a875ca6101e4a88e18f1b1206576fbd81ddfdde1de9
+ARG REQUIRE_INT8_ARM=1
+# Erwartete nvcc-Version der Basis (z.B. V13.0.88); leer = nur loggen.
+ARG NVCC_EXPECT=
+ARG INSTALL_UCX=1
+ARG INSTALL_PLANNER=1
+# F6: die Header binden das Image an den Treiberstand 595.58.03 (+smallbar). Default AUS.
+ARG WITH_NV_HEADERS=0
+ARG SEED_TVM_FFI=1
+ARG PREBUILD_ARCHS=8.6,12.0
+# Parallele nvcc-Schritte im JIT-Vorbau. 4 reichten am 25.09. nicht unter 24 GiB (gemm_sm120, CUTLASS: >23 GiB, OOM);
+# host_build.sh setzt den Wert zusammen mit dem Speicher-Deckel des Builders.
+ARG MAX_JOBS=3
+# Nur fuer die CUTLASS-Module (prebuild_jit.py HEAVY_URIS, Default gemm_sm120): leer = MAX_JOBS. cu130-Bau: 1 (Host >= 80 GiB).
+ARG HEAVY_MAX_JOBS=
+# 1 = jeder Modul-Fehler im Vorbau bricht den Bau ab; 0 (Default) = laut im Log und in JIT_PREBUILD.json
+# (verdict INCOMPLETE), das Modul baut dann beim ersten Boot per JIT.
+ARG PREBUILD_STRICT=1
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 TZ=Etc/UTC
+
+# --- 1. System (August-Liste + weg2-Werkzeuge) -----------------------------------
+# procps/psmisc: pgrep/ps/fuser (Launcher #1217, Deadman, Teardown). protobuf-compiler + rustup:
+# Rust-Ext sglang.srt.grpc._core (python/pyproject.toml, nicht optional). libssl-dev: HiCache-Hash-Ext.
+# KEIN apt ninja-build: Vorbau und Laufzeit muessen DASSELBE ninja nehmen (das aus dem venv).
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-dev python3.12-venv \
+      build-essential git curl wget ca-certificates jq \
+      protobuf-compiler libssl-dev libnuma1 libnuma-dev \
+      procps psmisc iproute2 util-linux \
+      libgl1 libglib2.0-0 libcairo2 ffmpeg
+ARG INSTALL_UCX
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    if [ "${INSTALL_UCX}" = "1" ]; then \
+      apt-get install -y --no-install-recommends libucx0 ibverbs-providers libibverbs1 librdmacm1; \
+    else echo "INSTALL_UCX=0 -> no UCX, barlink ucx transport unavailable"; fi
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+# 1b) Toolchain der Basis benennen: FlashInfer, barlink, TMS und tvm-ffi bauen mit CUDA_HOME/bin/nvcc.
+ARG NVCC_EXPECT
+RUN set -eu; V=$(/usr/local/cuda/bin/nvcc --version | grep -oE 'V[0-9]+\.[0-9]+\.[0-9]+'); \
+    echo "Basis-nvcc: $V ($(readlink -f /usr/local/cuda))"; \
+    if [ -n "${NVCC_EXPECT}" ] && [ "$V" != "${NVCC_EXPECT}" ]; then echo "FATAL: nvcc $V != NVCC_EXPECT ${NVCC_EXPECT}"; exit 1; fi
+
+# --- 2. venv mit dem Paketstand des Referenz-venv ---------------------------------
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:/root/.cargo/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CUDA_HOME=/usr/local/cuda
+COPY lock/requirements.lock /opt/htsglang/lock/requirements.lock
+RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
+    pip install "pip==${PIP_VERSION}" \
+    && pip install --no-deps -r /opt/htsglang/lock/requirements.lock \
+    && python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+ARG NCCL_PIN
+ARG NCCL_PACKAGE
+ARG NCCL_BANNER
+ARG NCCL_SHA256
+# Eine Datei, zwei RECORDs: nie `pip uninstall nvidia-nccl-cu12` im Image -- das loescht die geteilte
+# libnccl.so.2 mit (RECORD listet sie). Der erzwungene cu13-Einbau zuletzt legt den Gewinner fest.
+RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
+    set -eu; \
+    [ -n "${NCCL_PIN}" ] || { echo "FATAL: NCCL_PIN leer -- F10 verlangt eine benannte NCCL-Version"; exit 1; }; \
+    pip install --no-deps --force-reinstall "${NCCL_PACKAGE}==${NCCL_PIN}"; \
+    L=/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2; \
+    V=$(strings "$L" | grep -m1 -oE 'NCCL version [0-9.]+\+cuda[0-9.]+' || true); \
+    H=$(sha256sum "$L" | cut -d' ' -f1); \
+    echo "bundled libnccl: $L -> ${V:-?} sha256=$H"; \
+    [ "$V" = "${NCCL_BANNER}" ] || { echo "FATAL: libnccl.so.2 meldet '${V:-?}', erwartet '${NCCL_BANNER}'"; exit 1; }; \
+    if [ -n "${NCCL_SHA256}" ]; then [ "$H" = "${NCCL_SHA256}" ] || { echo "FATAL: libnccl.so.2 sha256 $H != Rig ${NCCL_SHA256}"; exit 1; }; fi; \
+    for r in /opt/venv/lib/python3.12/site-packages/nvidia_nccl_cu1*.dist-info/RECORD; do \
+      echo "RECORD-Anspruch $(basename "$(dirname "$r")"): $(grep -E '^nvidia/nccl/lib/libnccl\.so\.2,' "$r" | cut -d, -f2)"; \
+    done
+
+# --- 2b. FlashInfer / CuTe DSL (/ torch) aus lock/overrides.txt (Nutzer 25.09.: FlashInfer-Upgrade in DIESES Image) --
+# overrides.txt = pip-Anforderungen, eine je Zeile (Version, git+URL@SHA oder /tmp/htsglang-fi-wheels/<datei>.whl aus
+# assets/fi-wheels/); leer = Lock-Stand. --no-deps: die Pins legt F vollstaendig fest, pip loest nichts nach.
+# Die Wheel-Dateien (flashinfer-cubin 0.7.0 allein 1,6 GB) kommen per Bind-Mount, nicht per COPY: eine COPY-Schicht
+# bliebe im Image, auch wenn ein spaeterer Schritt die Dateien loescht.
+COPY lock/overrides.txt /opt/htsglang/lock/overrides.txt
+ARG TORCH_EXPECT
+# FI_WHEEL_SHA256S = "<datei>=<sha256> ..." (BUILD_INFO.fi_wheels, host_build.sh): JEDES Wheel in assets/fi-wheels muss
+# gelistet sein und stimmen, sonst Abbruch -- vor allem das FlashInfer-QUELLBAU-Wheel 2f3bc5ac (708abc83..., #5242);
+# das PyPI-0.7.0 ohne #5242 liesse die NVFP4-Naht (SGLANG_FP4_SM12X_W4A16_MAX_M) hart abbrechen (Operator 25.09.).
+ARG FI_WHEEL_SHA256S=
+RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
+    --mount=type=bind,source=assets/fi-wheels,target=/tmp/htsglang-fi-wheels \
+    set -eu; O=/opt/htsglang/lock/overrides.txt; \
+    for w in /tmp/htsglang-fi-wheels/*.whl; do [ -f "$w" ] || continue; b=$(basename "$w"); h=$(sha256sum "$w" | cut -d' ' -f1); \
+      want=$(printf '%s\n' ${FI_WHEEL_SHA256S} | sed -n "s/^$b=//p"); \
+      [ -n "$want" ] || { echo "FATAL: $b ohne erwarteten sha256 (FI_WHEEL_SHA256S)"; exit 1; }; \
+      [ "$h" = "$want" ] || { echo "FATAL: $b sha256 $h != erwartet $want"; exit 1; }; echo "fi-wheel ok $b $h"; done; \
+    if grep -qvE '^\s*(#|$)' "$O"; then echo "overrides:"; grep -vE '^\s*(#|$)' "$O"; pip install --no-deps -r "$O"; \
+    else echo "overrides.txt leer -> Lock-Stand"; fi; \
+    if [ -n "${FI_WHEEL_SHA256S}" ]; then \
+      python -c "import importlib.metadata as m, json, sys; d = m.distribution('flashinfer-python'); u = json.loads(d.read_text('direct_url.json') or '{}'); print('flashinfer-python', d.version, 'aus', u.get('url'), (u.get('archive_info') or {}).get('hash')); sys.exit(0 if str(u.get('url', '')).startswith('file:///tmp/htsglang-fi-wheels/') else 'FATAL: flashinfer-python stammt nicht aus dem geprueften Wheel in assets/fi-wheels')"; \
+    fi; \
+    python -c "import importlib.metadata as m, torch; \
+v = {d: m.version(d) for d in ('torch', 'triton', 'flashinfer-python', 'nvidia-cutlass-dsl', 'nvidia-nccl-cu13', 'apache-tvm-ffi')}; print(v); \
+assert torch.__version__.startswith('${TORCH_EXPECT}'), torch.__version__; assert torch.version.cuda.startswith('13.'), torch.version.cuda"
+
+# --- 3b. FlashInfer-Vorbau VOR dem Quellbaum und VOR dem sgl-kernel-Wheel (RELEASE_PLAN §7.1) -------------------
+# Der teure Teil des Vorbaus (FlashInfer 86 + 120f, ~36 von 38,7 min am 25.09.) braucht nur das venv (flashinfer, torch
+# aus dem Lock), die CUDA-Toolchain der Basis, prebuild_jit.py und die Modulliste -- KEIN src/: fi_child importiert nur
+# flashinfer und bildet den Flag-Kontext (Import- vs. Server-Kontext) selbst nach. Darum steht er hier: eine neue SHA
+# trifft diese Schicht im Builder-Cache. Neu gebaut wird sie nur, wenn sich Lock, Modulliste, prebuild_jit.py oder
+# PREBUILD_ARCHS/MAX_JOBS/PREBUILD_STRICT aendern. Alles, was in eine build.ninja eingeht, steht wie zur Laufzeit:
+# CUDA_HOME, PATH (nvcc/ninja), HOME, kein CC, FLASHINFER_NVCC_THREADS ungesetzt, FLASHINFER_JIT_DEBUG/VERBOSE ungesetzt.
+COPY tools/prebuild_jit.py /opt/htsglang/tools/prebuild_jit.py
+COPY assets/flashinfer_modules.txt /opt/htsglang/tools/flashinfer_modules.txt
+ARG PREBUILD_ARCHS
+ARG MAX_JOBS
+ARG HEAVY_MAX_JOBS
+ARG PREBUILD_STRICT
+# Parallel je Modul (prebuild_jit.py, 25.09.): PREBUILD_MODULE_JOBS leichte Module gleichzeitig (Summe ueber 120f+86) mit je
+# PREBUILD_LIGHT_MAX_JOBS nvcc-Schritten, dazu PREBUILD_HEAVY_MODULE_JOBS schwere (gemm_sm120) mit je HEAVY_MAX_JOBS.
+# RAM: je Worker ~1 GiB (Python + torch + flashinfer, gemessen: 4 Worker sprengten 5 GiB) + je nvcc-Schritt ~0,8 GiB
+# (leicht) bzw. ~6 GiB (gemm_sm120).
+ARG PREBUILD_MODULE_JOBS=10
+ARG PREBUILD_LIGHT_MAX_JOBS=2
+ARG PREBUILD_HEAVY_MODULE_JOBS=1
+RUN set -eu; cd /; \
+    STRICT=""; if [ "${PREBUILD_STRICT}" = "1" ]; then STRICT="--strict"; fi; \
+    MAX_JOBS=${MAX_JOBS} HEAVY_MAX_JOBS=${HEAVY_MAX_JOBS} PREBUILD_MODULE_JOBS=${PREBUILD_MODULE_JOBS} \
+    PREBUILD_LIGHT_MAX_JOBS=${PREBUILD_LIGHT_MAX_JOBS} PREBUILD_HEAVY_MODULE_JOBS=${PREBUILD_HEAVY_MODULE_JOBS} python /opt/htsglang/tools/prebuild_jit.py --only flashinfer --archs ${PREBUILD_ARCHS} \
+      --flashinfer-manifest /opt/htsglang/tools/flashinfer_modules.txt \
+      --report /opt/htsglang/JIT_PREBUILD.json ${STRICT}
+
+# --- 3. sgl-kernel: genau EIN Anbieter, Arm verlangt (#384, August-Gate unbedingt) --
+# Steht HINTER dem FlashInfer-Vorbau (25.09., CUDA 13): fi_child importiert nur flashinfer, nie sgl_kernel -- ein neues
+# Wheel (cu130: 86;120a) kostet so nur diese und die folgenden Schichten, nicht den Vorbau.
+COPY assets/wheels/ /tmp/htsglang-wheels/
+ARG KERNEL_WHEEL
+ARG KERNEL_WHEEL_SHA256
+RUN set -eu; W="/tmp/htsglang-wheels/${KERNEL_WHEEL}"; \
+    echo "${KERNEL_WHEEL_SHA256}  ${W}" | sha256sum -c -; \
+    pip uninstall -y sgl-kernel sglang-kernel >/dev/null 2>&1 || true; \
+    pip install --no-deps "${W}"; rm -rf /tmp/htsglang-wheels
+
+# --- 4. Zwei Quellbaeume (sauber, mit Historie), KEIN sglang-Paket in site-packages --------------------------
+# Revision je Stand als Build-Arg (BUILD_INFO.lines.<fam>.revision); jeder Baum muss darauf stehen und sauber sein.
+# _version.py (gitignored, sonst schreibt es setuptools-scm beim pip install) traegt Linie, Release und SHA.
+# Layout-agnostisch (FL6 26.09., fLLiper-Umbenennung; wie entrypoint.sh): je Baum entscheidet python/flliper ueber den
+# Paketnamen ($pkg), sonst python/sglang -- ein Image kann einen umbenannten und einen alten Stand tragen.
+COPY src-27b/ /opt/htsglang/src-27b/
+COPY src-nf/ /opt/htsglang/src-nf/
+ARG REV_27B
+ARG REV_NF
+ARG SCM_27B=0.0.0.dev0
+ARG SCM_NF=0.0.0.dev0
+ARG REQUIRE_INT8_ARM
+# Item 600: FLAT-2 stays the default (ONE tree). make_flat_ctx.sh bakes ALLOW_DUO_TREES=1 only for a Duo ctx (--rev-nf <other renamed tree>).
+ARG ALLOW_DUO_TREES=0
+RUN set -eu; \
+    [ "${REV_27B}" = "${REV_NF}" ] || [ "${ALLOW_DUO_TREES}" = 1 ] || { echo "FATAL (FLAT-2): REV_27B ${REV_27B} != REV_NF ${REV_NF} -- the flat image carries ONE tree (Duo only with ALLOW_DUO_TREES=1)"; exit 1; }; \
+    for f in 27b nf; do \
+      d=/opt/htsglang/src-$f; case $f in 27b) want=${REV_27B}; scm=${SCM_27B};; nf) want=${REV_NF}; scm=${SCM_NF};; esac; \
+      pkg=sglang; if [ -d $d/python/flliper ]; then pkg=flliper; fi; \
+      test -n "$want" || { echo "FATAL: REV_$f fehlt"; exit 1; }; \
+      test "$(git -C $d rev-parse HEAD)" = "$want" || { echo "FATAL: $d HEAD != $want"; exit 1; }; \
+      test -z "$(git -C $d status --porcelain)" || { echo "FATAL: $d nicht sauber"; git -C $d status --porcelain | head; exit 1; }; \
+      git -C $d check-ignore -q python/$pkg/_version.py || { echo "FATAL: $d/python/$pkg/_version.py nicht ignoriert"; exit 1; }; \
+      printf '__version__ = "%s"\n__version_tuple__ = tuple(__version__.split("."))\n' "$scm" > $d/python/$pkg/_version.py; \
+      echo "Stand $f: $d @ $(printf %.10s "$want") ($scm, Paket $pkg)"; \
+    done; \
+    for m in sglang flliper; do if python -c "import $m" 2>/dev/null; then echo "FATAL: $m in site-packages -- zwei Staende duerfen sich nicht schatten"; exit 1; fi; done; \
+    ARM=""; if [ "${REQUIRE_INT8_ARM}" = "1" ]; then ARM="--require-arm"; fi; \
+    for f in 27b nf; do \
+      d=/opt/htsglang/src-$f; pkg=sglang; if [ -d $d/python/flliper ]; then pkg=flliper; fi; \
+      python -I $d/python/$pkg/srt/utils/kernel_dist_guard.py \
+        --site-packages /opt/venv/lib/python3.12/site-packages ${ARM} --expect-sha256 "${KERNEL_WHEEL_SHA256}"; \
+    done; \
+    mkdir -p /sgl-workspace && ln -sfn /opt/htsglang/src-27b /sgl-workspace/sglang && ln -sfn /opt/htsglang/src-27b /sgl-workspace/flliper; \
+    ln -sf /opt/venv/bin/python /usr/local/bin/python
+
+# 4b) Planner-Extra wie im August (nur der Quality-Benchmark-Reiter braucht es).
+ARG INSTALL_PLANNER
+RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
+    if [ "${INSTALL_PLANNER}" = "1" ]; then \
+      pip install "chess>=1.11.0" "cairosvg>=2.7.0" "defusedxml>=0.7.1"; \
+    else echo "INSTALL_PLANNER=0 -> planner quality-benchmark tab unavailable"; fi
+
+# --- 5. Optionale NV-Header (barlink BAR1) ------------------------------------------
+# assets/nvidia-open-595/ existiert immer (leer ohne --with-nv-headers in prepare_context.sh).
+# Ohne Header lehnt barlink_bar1_ext.load_dmabuf_ext() mit Grund ab; der Entrypoint verweigert
+# dann HTSGLANG_TRANSPORT=bar1 mit diesem Grund (oder die Header werden zur Laufzeit gemountet:
+# -v <treiberbaum>:/opt/nvidia-open-595:ro, passend zum LAUFENDEN Host-Treiber).
+COPY assets/nvidia-open-595/ /opt/nvidia-open-595/
+ARG WITH_NV_HEADERS
+RUN set -eu; H=/opt/nvidia-open-595/src/common/sdk/nvidia/inc/nvos.h; \
+    if [ "${WITH_NV_HEADERS}" = "1" ]; then test -f "$H" || { echo "FATAL: WITH_NV_HEADERS=1, aber $H fehlt im Kontext"; exit 1; }; \
+    else rm -rf /opt/nvidia-open-595/* ; echo "WITH_NV_HEADERS=0 -> keine NV-Header im Image (bar1 nur mit gemounteten Headern)"; fi
+ENV FLLIPER_BARLINK_BAR1_NV_SOURCE=/opt/nvidia-open-595
+# --- 6. Vorbau Teil B JE STAND: barlink, HiCache-Hash, TMS-Hook ----------------------------------------------
+# Beide Staende bauen Erweiterungen mit DENSELBEN Namen (barlink_device_ext_cuda_86_120, ...) aus ggf. anderen Quellen.
+# In einem gemeinsamen Verzeichnis baute torch beim Boot des jeweils anderen Stands neu (Quell-Hash anders) und
+# ueberschriebe den ersten. Darum je Stand ein eigenes TORCH_EXTENSIONS_DIR und ein eigenes TMS-Verzeichnis -- der
+# Entrypoint setzt zur Laufzeit dieselben Pfade (D1 prueft den effektiven Suchpfad je Stand).
+ENV SGLANG_WEG2_VENV=/opt/venv \
+    SGLANG_WEG2_DEVTOOLS_DIR=/opt/htsglang/devtools
+# Zuerst die Rig-Paritaet der cu13-Links: der Referenz-venv traegt seit 17.07. zehn VON HAND angelegte Links unter
+# nvidia/cu13/lib, die in keinem RECORD stehen (unversionierte .so fuer cudart, curand, nvrtc, cufft, cusolver, cublas,
+# nvJitLink, cusparse, cublasLt, dazu stubs/libcuda.so). Ohne libcudart.so scheitert der Link des TMS-Preload-Hooks
+# (Bau 25.09. 02:44Z: "ld: cannot find -lcudart") -- und der Launcher baut den Hook bei JEDEM Boot.
+RUN set -eu; L=/opt/venv/lib/python3.12/site-packages/nvidia/cu13/lib; \
+    for n in cudart.so.13 curand.so.10 nvrtc.so.13 cufft.so.12 cusolver.so.12 cublas.so.13 nvJitLink.so.13 cusparse.so.12 cublasLt.so.13; do \
+      test -f "$L/lib$n" || { echo "FATAL: $L/lib$n fehlt"; exit 1; }; \
+      ln -sfn "lib$n" "$L/lib${n%%.so.*}.so"; \
+    done; \
+    STUB="$(readlink -f /usr/local/cuda)/lib64/stubs/libcuda.so"; \
+    test -f "$STUB" || { echo "FATAL: $STUB fehlt"; exit 1; }; \
+    mkdir -p "$L/stubs"; ln -sfn "$STUB" "$L/stubs/libcuda.so"
+# Beide Staende GLEICHZEITIG (Operator 25.09.: der Vorbau lief seriell); getrennte TORCH_EXTENSIONS_DIR/TMS/Berichte,
+# je Stand die halbe MAX_JOBS; Ausgabe je Stand in eine eigene Datei, danach beide ins Bau-Log (POSIX sh, kein Bashismus).
+RUN set -eu; STRICT=""; if [ "${PREBUILD_STRICT}" = "1" ]; then STRICT="--strict"; fi; \
+    J=$(( ${MAX_JOBS} / 2 )); [ "$J" -ge 1 ] || J=1; \
+    for f in 27b nf; do \
+      d=/opt/htsglang/src-$f; cp /opt/htsglang/JIT_PREBUILD.json /opt/htsglang/JIT_PREBUILD-$f.json; \
+      ( cd $d || exit 1; \
+        if MAX_JOBS=$J PYTHONPATH=$d/python \
+           TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions/py312_cu130-$f SGLANG_WEG2_TMS_OUT_DIR=/opt/htsglang/tms-$f \
+           python /opt/htsglang/tools/prebuild_jit.py --only barlink,cpu_ext,tms --continue-report \
+             --tree $d --venv /opt/venv --archs ${PREBUILD_ARCHS} \
+             --report /opt/htsglang/JIT_PREBUILD-$f.json ${STRICT} > /tmp/prebuild-$f.log 2>&1; \
+        then echo 0 > /tmp/prebuild-$f.rc; else echo 1 > /tmp/prebuild-$f.rc; fi ) & \
+    done; \
+    wait; rc=0; \
+    for f in 27b nf; do \
+      echo "===== Vorbau Stand $f (rc $(cat /tmp/prebuild-$f.rc))"; cat /tmp/prebuild-$f.log; \
+      [ "$(cat /tmp/prebuild-$f.rc)" = 0 ] || rc=1; \
+      test -z "$(git -C /opt/htsglang/src-$f status --porcelain)" || { echo "FATAL: Vorbau hat src-$f veraendert"; rc=1; }; \
+    done; \
+    rm -f /tmp/prebuild-27b.log /tmp/prebuild-nf.log /tmp/prebuild-27b.rc /tmp/prebuild-nf.rc; exit $rc
+
+# --- 6b. FLAT-3: kernel list for both slots (tvm-ffi jit_kernel, FlashInfer 0.7.0 extras, barlink pipe) ---------------
+# tools/flat/kernels.txt = union of all delta lists (make_flat_ctx.sh); the lines run with the 27B slot env (tvm-ffi and
+# FlashInfer caches are ONE directory each, so NF lines -- PYTHONPATH=/opt/htsglang/src-nf/python -- land as hits on the
+# same names and prove the NF slot). tools/flat/kernels-nf.txt = the barlink lines again, built into the NF slot's own
+# TORCH_EXTENSIONS_DIR. Heavy lines (an explicit MAX_JOBS= token, e.g. fp4_gemm_cutlass_sm120 with 17 CUTLASS TUs at
+# ~6 GiB per nvcc) run FIRST and ALONE with HEAVY_MAX_JOBS; the light lines then run DELTA_JOBS at a time with
+# DELTA_ENTRY_MAX_JOBS nvcc each (~1 GiB + 2 x 0.8 GiB per job, host_build_delta.sh model). DELTA_JOBS empty ->
+# 3/2 x MAX_JOBS (MAX_JOBS tiers 16/12/8 of the plan fit caps >= 64/48/32 GiB). --base/--rev only go into the report.
+COPY tools/delta_prebuild.py tools/delta_postcheck.py tools/kernels.txt tools/kernels-nf.txt /opt/htsglang/tools/flat/
+ARG DELTA_JOBS=
+ARG DELTA_ENTRY_MAX_JOBS=2
+RUN set -eu; K=/opt/htsglang/tools/flat; \
+    DJ=${DELTA_JOBS}; [ -n "$DJ" ] || DJ=$(( ${MAX_JOBS} * 3 / 2 )); [ "$DJ" -ge 1 ] || DJ=1; \
+    HJ=${HEAVY_MAX_JOBS}; [ -n "$HJ" ] || HJ=${MAX_JOBS}; \
+    grep -vE '^[[:space:]]*(#|$)' $K/kernels.txt | grep -E '(^|[[:space:]])MAX_JOBS=' \
+      | sed -E "s/(^|[[:space:]])MAX_JOBS=[0-9]+/\1MAX_JOBS=$HJ/" > /tmp/k-heavy.txt || true; \
+    grep -vE '^[[:space:]]*(#|$)' $K/kernels.txt | grep -vE '(^|[[:space:]])MAX_JOBS=' > /tmp/k-light.txt || true; \
+    echo "Kernel list: $(wc -l < /tmp/k-heavy.txt) heavy (MAX_JOBS=$HJ, alone), $(wc -l < /tmp/k-light.txt) light (DELTA_JOBS=$DJ x ${DELTA_ENTRY_MAX_JOBS})"; \
+    d=/opt/htsglang/src-27b; \
+    if [ -s /tmp/k-heavy.txt ]; then \
+      ( cd $d && DELTA_JOBS=1 DELTA_ENTRY_MAX_JOBS=$HJ PYTHONPATH=$d/python \
+        TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions/py312_cu130-27b SGLANG_WEG2_TMS_OUT_DIR=/opt/htsglang/tms-27b \
+        python $K/delta_prebuild.py --list /tmp/k-heavy.txt --report /opt/htsglang/JIT_PREBUILD-27b-heavy.json \
+          --tree $d --base "${REV_27B}" --rev "${REV_27B}" ); \
+    fi; \
+    ( cd $d && DELTA_JOBS=$DJ DELTA_ENTRY_MAX_JOBS=${DELTA_ENTRY_MAX_JOBS} PYTHONPATH=$d/python \
+      TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions/py312_cu130-27b SGLANG_WEG2_TMS_OUT_DIR=/opt/htsglang/tms-27b \
+      python $K/delta_prebuild.py --list /tmp/k-light.txt --report /opt/htsglang/JIT_PREBUILD-27b.json \
+        --tree $d --base "${REV_27B}" --rev "${REV_27B}" ); \
+    d=/opt/htsglang/src-nf; \
+    if grep -qvE '^[[:space:]]*(#|$)' $K/kernels-nf.txt; then \
+      ( cd $d && DELTA_JOBS=$DJ DELTA_ENTRY_MAX_JOBS=${DELTA_ENTRY_MAX_JOBS} PYTHONPATH=$d/python \
+        TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions/py312_cu130-nf SGLANG_WEG2_TMS_OUT_DIR=/opt/htsglang/tms-nf \
+        python $K/delta_prebuild.py --list $K/kernels-nf.txt --report /opt/htsglang/JIT_PREBUILD-nf.json \
+          --tree $d --base "${REV_NF}" --rev "${REV_NF}" ); \
+    fi; \
+    rm -f /tmp/k-heavy.txt /tmp/k-light.txt; \
+    for f in 27b nf; do \
+      test -z "$(git -C /opt/htsglang/src-$f status --porcelain)" || { echo "FATAL: kernel-list prebuild changed src-$f"; exit 1; }; \
+    done
+
+# --- 7. Werkzeuge, Saat, Profile, Einstieg, Zustands-Mountpunkte ----------------------
+# Alles hier aendert sich oft (Profile beim Freischalten, tvm-ffi-Saat nach neuen Rig-Boots, BUILD_INFO) und steht
+# darum HINTER dem Vorbau: ein Profilwechsel kostet nur diese Schichten und den Export.
+COPY assets/devtools/ /opt/htsglang/devtools/
+COPY assets/arb-seed-27b/ /opt/htsglang/arb-seed-27b/
+COPY assets/arb-seed-nf/ /opt/htsglang/arb-seed-nf/
+COPY tools/profiles/ /opt/htsglang/profiles/
+COPY assets/profiles/ /opt/htsglang/profiles/
+# Der py-spy-Symlink bedient boot_deadman.sh:484 (Rig-Werkzeug, ruft py-spy ueber den Rig-venv-Pfad).
+RUN chmod 0755 /opt/htsglang/devtools/*.sh \
+    && mkdir -p /spinning/htsglang-gpu/.venv/bin && ln -sf /opt/venv/bin/py-spy /spinning/htsglang-gpu/.venv/bin/py-spy
+
+# tvm-ffi (sglang jit_kernel, u.a. Marlin FP8/NVFP4/INT4 fuer sm_86) ist inhaltsadressiert und
+# pfadunabhaengig (jit_kernel/utils.py:196-345, 600-700): die Rig-Saat wird zur LAUFZEIT gelesen, soweit
+# Quellen und Flags zum Baum passen -- der Vorbau braucht sie nicht, darum steht sie hinter ihm.
+# assets/tvm-ffi/ ist leer, wenn prepare_context.sh ohne Saat lief.
+ARG SEED_TVM_FFI
+COPY assets/tvm-ffi/ /root/.cache/tvm-ffi/
+RUN set -eu; if [ "${SEED_TVM_FFI}" != "1" ]; then rm -rf /root/.cache/tvm-ffi/*; fi; \
+    M=$(/usr/local/cuda/bin/nvcc --version | sed -n 's/.*release \([0-9]*\)\..*/\1/p'); n=0; \
+    for e in /root/.cache/tvm-ffi/*/; do [ -d "$e" ] || continue; \
+      if find "$e" -name '*.so' -exec readelf -d {} \; 2>/dev/null | grep -oE 'libcudart\.so\.[0-9]+' | grep -qv "libcudart\.so\.$M$"; then \
+        rm -rf "$e"; n=$((n + 1)); fi; \
+    done; \
+    echo "tvm-ffi Saat: $(ls /root/.cache/tvm-ffi | wc -l) Eintraege (verworfen: $n mit fremder cudart-Hauptversion, Basis-nvcc $M)"
+
+RUN mkdir -p /etc/htsglang \
+    && cp /opt/htsglang/src-27b/docker/htsglang-chat_template.jinja /etc/htsglang/chat_template.jinja \
+    && install -m 0755 /opt/htsglang/src-27b/docker/htsglang-entrypoint.sh /usr/local/bin/htsglang-entrypoint.sh
+COPY tools/entrypoint.sh /opt/htsglang/entrypoint.sh
+COPY tools/healthcheck.sh /opt/htsglang/healthcheck.sh
+COPY BUILD_INFO.json /opt/htsglang/BUILD_INFO.json
+COPY BUILD_INFO-27b.json BUILD_INFO-nf.json /opt/htsglang/
+RUN chmod 0755 /opt/htsglang/entrypoint.sh /opt/htsglang/healthcheck.sh \
+    && mkdir -p /root/.cache/sglang/rigmon /root/.cache/flashinfer /root/.cache/torch_extensions \
+                /root/.cache/tvm-ffi /root/.cache/cute-dsl /root/.triton \
+                /root/.cache/torch_extensions/py312_cu130-27b /root/.cache/torch_extensions/py312_cu130-nf \
+                /var/lib/htsglang/hicache /var/lib/htsglang/hibernate \
+                /var/lib/htsglang/evidence /var/lib/htsglang/arb /var/lib/htsglang/hicache-weg2
+
+# August-ENV unveraendert (Server-/Planner-Modus), dazu der Loader-Pfad des venv und Stufe B.
+# TORCH_CUDA_ARCH_LIST bleibt fuer den Server-Modus wie im August; der weg2-Modus entfernt es
+# (sonst passten die vorgebauten barlink-Namen *_cuda_86_120 nicht). Bewusst NICHT gesetzt:
+# FLASHINFER_CUDA_ARCH_LIST, PYTORCH_CUDA_ALLOC_CONF.
+ARG REV_27B
+ARG REV_NF
+# Push-Stand der Revision aus BUILD_INFO.json (prepare_context.sh): "pushed ..." oder
+# "UNPUSHED, Veroeffentlichung erst nach Push durch den Nutzer" -- host_publish.sh liest das Label und sperrt.
+ARG PUSH_STATE=unbekannt
+# cu129|cu130 (host_build.sh CU), nur Label.
+ARG HTSGLANG_CUDA=cu130
+# KEIN TORCH_EXTENSIONS_DIR (Abnahme 25.09.): der Vorbau legt die Erweiterungen wie der Rig unter
+# ~/.cache/torch_extensions/py312_cu130/<name>/ ab (torch-Default ohne die Variable); mit gesetzter Variable sucht torch
+# unter $TORCH_EXTENSIONS_DIR/<name>/ und der erste Boot baut barlink_bar1_ext + hicache_hash neu (D1 prueft das jetzt).
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}" \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 8.9 9.0 10.0 12.0" \
+    FLLIPER_BARLINK_LAUNCH_DUMP=0 \
+    HICACHE_STORAGE_DIR=/var/lib/htsglang/hicache \
+    TRITON_CACHE_DIR=/root/.triton \
+    CUTE_DSL_CACHE_DIR=/root/.cache/cute-dsl \
+    FLLIPER_PLANNER_PROFILES=/root/.cache/sglang/planner_profiles.json \
+    FLLIPER_PLANNER_GRAPH_ANCHORS=/root/.cache/sglang/graph_mem_anchors.json \
+    SGLANG_WEG2_EVIDENCE_DIR=/var/lib/htsglang/evidence \
+    SGLANG_WEG2_GPU_ARB=/var/lib/htsglang/arb \
+    SGLANG_WEG2_STORE_ROOT=/var/lib/htsglang/hicache-weg2 \
+    HTSGLANG_LINES="27b nf" \
+    HTSGLANG_REVISION_27B=${REV_27B} \
+    HTSGLANG_REVISION_NF=${REV_NF} \
+    FLLIPER_LINES="27b nf" \
+    FLLIPER_REVISION_27B=${REV_27B} \
+    FLLIPER_REVISION_NF=${REV_NF}
+
+# --- FLAT-4/5: fLLiper labels ------------------------------------------------------------------------------------
+# FLLIPER_VERSION / FLLIPER_SOURCE / FLLIPER_LOCK_SHA256 are baked into the context copy of this file by make_flat_ctx.sh.
+# B4 (user decision pending): the source repo and the version scheme are PLACEHOLDERS; the label
+# io.github.efschu.flliper.placeholders names every value that is still one. An unbaked file (__...__) is refused.
+ARG FLASHINFER_LABEL=0.7.0
+ARG FLLIPER_VERSION=__FLLIPER_VERSION__
+ARG FLLIPER_SOURCE=__FLLIPER_SOURCE__
+ARG FLLIPER_PLACEHOLDERS=__FLLIPER_PLACEHOLDERS__
+ARG FLLIPER_LOCK_SHA256=__FLLIPER_LOCK_SHA256__
+ARG CUDA_BASE
+RUN set -eu; for v in "${FLLIPER_VERSION}" "${FLLIPER_SOURCE}" "${FLLIPER_PLACEHOLDERS}" "${FLLIPER_LOCK_SHA256}"; do \
+      case "$v" in __*__) echo "FATAL (FLAT-5): Dockerfile not baked by make_flat_ctx.sh ($v)"; exit 1;; esac; done; \
+    echo "${REV_27B}" | grep -qxE '[0-9a-f]{40}' || { echo "FATAL: REV_27B is not a 40-hex SHA"; exit 1; }
+ENV FLLIPER_VERSION=${FLLIPER_VERSION} \
+    FLLIPER_REVISION=${REV_27B}
+LABEL org.opencontainers.image.title="fLLiper" \
+      org.opencontainers.image.version="${FLLIPER_VERSION}" \
+      org.opencontainers.image.revision="${REV_27B}" \
+      org.opencontainers.image.source="${FLLIPER_SOURCE}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.description="fLLiper: prefill/decode flip serving on heterogeneous GPUs; slots 27b and nf from one tree; transport barlink BAR1 or NCCL" \
+      org.opencontainers.image.base.name="${CUDA_BASE}" \
+      io.github.efschu.flliper.slots="27b nf" \
+      io.github.efschu.flliper.revision="${REV_27B}" \
+      io.github.efschu.flliper.revision.27b="${REV_27B}" \
+      io.github.efschu.flliper.revision.nf="${REV_NF}" \
+      io.github.efschu.flliper.push_state="${PUSH_STATE}" \
+      io.github.efschu.flliper.cuda="${HTSGLANG_CUDA}" \
+      io.github.efschu.flliper.kernel_wheel.sha256="${KERNEL_WHEEL_SHA256}" \
+      io.github.efschu.flliper.kernel_archs="86;120a" \
+      io.github.efschu.flliper.flashinfer="${FLASHINFER_LABEL}+2f3bc5ac" \
+      io.github.efschu.flliper.cute_dsl="4.7.1" \
+      io.github.efschu.flliper.nccl="2.28.9+cuda13.0" \
+      io.github.efschu.flliper.driver.expected="595.58.03" \
+      io.github.efschu.flliper.lock.sha256="${FLLIPER_LOCK_SHA256}" \
+      io.github.efschu.flliper.build="flat" \
+      io.github.efschu.flliper.placeholders="${FLLIPER_PLACEHOLDERS}"
+
+# 30000 Server (MODE=server), 8780 Planner, 8770 rigmon, 30030 pdflip front (MODE=pdflip, alias MODE=weg2).
+EXPOSE 30000 8780 8770 30030
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=10s --start-period=1200s --retries=3 CMD ["/opt/htsglang/healthcheck.sh"]
+ENTRYPOINT ["/opt/htsglang/entrypoint.sh"]

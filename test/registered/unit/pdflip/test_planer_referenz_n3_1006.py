@@ -126,6 +126,33 @@ PROVENANCE = {
 PROFILE_FILES = {"flip": "27b-base", "dual": "27b-nvfp4-dual", "nf": "nf-int4-h6-abl"}
 
 
+def _live_sha_as_snapshot(path: str) -> list:
+    """sha256 of a live profile in the spelling(s) the committed snapshot may be in (F0-G): the file as it is (a live dir already converted
+    by ``tools/release/profconv.py --convert-live``) and the kit's conversion of it (a live dir still carrying the old names -- the snapshots
+    are of the renamed spelling).  The snapshot is current when EITHER equals its recorded sha."""
+    import hashlib as _h
+    import importlib.util as _u
+    import sys as _s
+
+    kit = os.path.join(str(__import__("pathlib").Path(__file__).resolve().parents[4]), "tools", "release")
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    out = [_h.sha256(raw).hexdigest()]
+    try:
+        spec = _u.spec_from_file_location("profconv_snap", os.path.join(kit, "profconv.py"))
+        mod = _u.module_from_spec(spec)
+        _s.path.insert(0, kit)
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            _s.path.remove(kit)
+        imap = mod.R._load_imap(os.path.join(kit, "data", "merged_0928.json"))
+        out.append(_h.sha256(mod.convert(raw.decode("utf-8"), imap).encode("utf-8")).hexdigest())
+    except Exception:
+        pass
+    return out
+
+
 def _p(name: str) -> str:
     return os.path.join(PROFILES, name + ".env")
 
@@ -773,9 +800,8 @@ class TestDryRunGolden(unittest.TestCase):
         for prof, d in live_dir.items():
             live = os.path.join(d, prof + ".env")
             if os.path.isfile(live):
-                with open(live, "rb") as fh:
-                    if hashlib.sha256(fh.read()).hexdigest() != PROVENANCE[prof + ".env"]:
-                        moved.append(live)
+                if PROVENANCE[prof + ".env"] not in _live_sha_as_snapshot(live):     # F0-G: the live dir may still hold the old spelling
+                    moved.append(live)
         if moved:
             self.skipTest("LIVE PROFILE MOVED under its snapshot (re-snapshot, regenerate golden + launch json, update PROVENANCE): "
                           + ", ".join(moved))
