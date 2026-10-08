@@ -232,7 +232,7 @@
    "id": 5,
    "type": "timeseries",
    "title": "Flipzeit (je Flip)",
-   "description": "Nutzersicht (01.10.): P→D = P-Ende -> erstes Decode auf D (Rang-Segmente), D→P = Decode-Ende -> P-Prefill-Start (flip_user_time); Teile part=warmup|layer|nachlauf|d_extend. Ein Punkt je Flip zum flip_begin; Leerlauf-Flips ohne Wert.",
+   "description": "Nutzersicht (01.10.): P→D = P-Ende -> erstes Decode auf D (Rang-Segmente), D→P = Decode-Ende -> P-Prefill-Start (flip_user_time); Teile part=vorlauf|layer|nachlauf|d_extend. Ein Punkt je Flip zum flip_begin; Leerlauf-Flips ohne Wert.",
    "datasource": {
     "type": "prometheus",
     "uid": "vm"
