@@ -306,6 +306,24 @@ def hicache_draft_tier_off_line(*, where: str) -> str:
 STORAGE_BATCH_SIZE = int(os.environ.get("SGLANG_HICACHE_STORAGE_BATCH", "128") or 128)
 
 
+#: H88-D: the W4A8 switch, as H88-E registers it (flag ``--moe-act-int8 on|off`` ->
+#: ``server_args.moe_act_int8``; env ``SGLANG_MOE_ACT_INT8``). Read DEFENSIVELY
+#: (an attribute that does not exist yet is "off"); on = any source says on.
+MOE_ACT_INT8_ENV = "SGLANG_MOE_ACT_INT8"
+_MOE_ACT_INT8_ON = ("1", "on", "true", "yes", "int8")
+
+
+def moe_act_int8_active(server_args: Any) -> bool:
+    def _on(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        return str("" if v is None else v).strip().lower() in _MOE_ACT_INT8_ON
+
+    return _on(getattr(server_args, "moe_act_int8", None)) or _on(
+        os.environ.get(MOE_ACT_INT8_ENV)
+    )
+
+
 def compute_model_identity_hash(
     server_args: Any, *, include_parallel_vectors: bool = True
 ) -> str:
@@ -370,6 +388,16 @@ def compute_model_identity_hash(
             value = getattr(server_args, name, None)
             if value:
                 identity_parts.append(f"{name}={value}")
+    # H88-D (D4): W4A8 experts (``--moe-act-int8 on`` / ``SGLANG_MOE_ACT_INT8``).
+    # Activations are rounded to int8 before the expert GEMM, so the KV bytes of
+    # a page differ while its token-id key does not: another identity, but ONLY
+    # while the switch is on -- with it off nothing is appended and the key is
+    # byte-identical to the one persisted stores already carry. Appended after
+    # the vectors, outside the ``include_parallel_vectors`` gate: it answers
+    # "same weights math?", which the PD handshake and the L3 rank identity ask
+    # as well as the storage key does.
+    if moe_act_int8_active(server_args):
+        identity_parts.append("moe_act=int8")
     identity_str = "|".join(identity_parts)
     return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
 

@@ -7542,6 +7542,18 @@ L3_IDENTITY_FILE = "L3_IDENTITY.json"
 #: YaRN x2: how the runtime applies a rope override (hf_transformers.config.
 #: apply_model_override_args, nested sub-config merge). Bump when that changes.
 L3_ROPE_APPLY = "merge-v1"
+#: H88-D (D4): the W4A8 switch of the MoE experts (flag ``--moe-act-int8 on|off``,
+#: env ``SGLANG_MOE_ACT_INT8``; registered by H88-E, read here DEFENSIVELY and
+#: default off). It changes the BYTES of every KV page the experts feed
+#: (activations are rounded to int8 before the expert GEMM) without changing a
+#: page key, so a store written under it must be another identity. The field
+#: ``moe_act`` enters the identity ONLY while the switch is on -- with it off the
+#: dict is byte-identical to the one the running stores carry (generation stays
+#: ``L3_PERSIST_GENERATION``; nothing is renamed, swept or invalidated).
+L3_MOE_ACT_FLAG = "--moe-act-int8"
+L3_MOE_ACT_ENV = "SGLANG_MOE_ACT_INT8"
+L3_MOE_ACT_VALUE = "int8"
+_L3_SWITCH_ON = ("1", "on", "true", "yes", "int8")
 
 
 def _l3_extra_flag(extra: str, flag: str) -> str:
@@ -7583,9 +7595,35 @@ def l3_weights_fingerprint(model: str) -> str:
     return hashlib.sha1(repr(rows).encode()).hexdigest()
 
 
+def l3_moe_act_active(extra: str = "", env_spec: str = "", flag: object = None,
+                      env: Optional[Mapping[str, str]] = None) -> bool:
+    """H88-D: is the W4A8 switch on for ONE group? True when ANY source says on:
+    the group's own EXTRA string (``--moe-act-int8 on``, last occurrence like
+    argparse), the launcher-wide flag value (``flag``: ns.moe_act_int8, whatever
+    type H88-E gives it), the group env (``--env-p``/``--env-d`` spec) or the
+    process env. A union on purpose: the wrong direction here is a store that
+    mixes pages of two activation precisions, the cheap one a store that was
+    renamed once too many. Anything unparsable or absent is OFF (default)."""
+    def _on(v: object) -> bool:
+        if isinstance(v, bool):
+            return v
+        return str("" if v is None else v).strip().lower() in _L3_SWITCH_ON
+
+    if _on(_l3_extra_flag(extra, L3_MOE_ACT_FLAG)) or _on(flag):
+        return True
+    try:
+        if _on(parse_group_env(env_spec).get(L3_MOE_ACT_ENV)):
+            return True
+    except ValueError:  # a malformed --env-p/-d is refused by name where it is parsed
+        pass
+    return _on((os.environ if env is None else env).get(L3_MOE_ACT_ENV))
+
+
 def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
                         kv_cache_dtype: str = KV_CACHE_DTYPE, extra_p: str = "",
-                        extra_d: str = "", vision: str = "") -> dict:
+                        extra_d: str = "", vision: str = "", *, env_p: str = "",
+                        env_d: str = "", moe_act_int8: object = None,
+                        env: Optional[Mapping[str, str]] = None) -> dict:
     """L3P: what a persistent store is FOR. User 2026-09-27: "aber natürlich
     zwischen 27b und nf verschiedene L3 caches. sonst knallts" -- one model,
     one directory. Beside the checkpoint (path, config sha, weight-file stat
@@ -7634,6 +7672,16 @@ def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
     if rope_p or rope_d:
         ident["rope"] = rope_p if rope_p == rope_d else f"P={rope_p},D={rope_d}"
         ident["rope_apply"] = L3_ROPE_APPLY
+    # H88-D (D4): W4A8 experts -> another store, ONLY while the switch is on.
+    # Rule (a): the new weight math is a new identity (one full recompute);
+    # rule (b): everything else leaves the identity alone, so with the switch
+    # off no key is added; rule (c): ``generation`` is NOT raised for this.
+    p_on = l3_moe_act_active(extra_p, env_p, moe_act_int8, env)
+    d_on = l3_moe_act_active(extra_d, env_d, moe_act_int8, env)
+    if p_on or d_on:
+        ident["moe_act"] = (L3_MOE_ACT_VALUE if p_on and d_on
+                            else f"P={L3_MOE_ACT_VALUE},D=off" if p_on
+                            else f"P=off,D={L3_MOE_ACT_VALUE}")
     return ident
 
 
@@ -25749,7 +25797,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                          getattr(ns, "form_kv", "") or "",
                                          extra_p=getattr(ns, "extra_p", "") or "",
                                          extra_d=getattr(ns, "extra_d", "") or "",
-                                         vision=str(getattr(ns, "weg2_vision", "") or ""))
+                                         vision=str(getattr(ns, "weg2_vision", "") or ""),
+                                         env_p=getattr(ns, "env_p", "") or "",
+                                         env_d=getattr(ns, "env_d", "") or "",
+                                         moe_act_int8=getattr(ns, "moe_act_int8", None))
                      if l3_persist_enabled() else None)
     _l3_idx_owners = 1 if getattr(ns, "d_only", False) else 2
     _l3_idx_n, _l3_idx_src = (
@@ -25943,7 +25994,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                      getattr(ns, "form_kv", "") or "",
                                      extra_p=getattr(ns, "extra_p", "") or "",
                                      extra_d=getattr(ns, "extra_d", "") or "",
-                                     vision=str(getattr(ns, "weg2_vision", "") or ""))
+                                     vision=str(getattr(ns, "weg2_vision", "") or ""),
+                                     env_p=getattr(ns, "env_p", "") or "",
+                                     env_d=getattr(ns, "env_d", "") or "",
+                                     moe_act_int8=getattr(ns, "moe_act_int8", None))
                  if l3_persist_enabled() else None)
     store_plan = plan_store(
         ns.tag,
