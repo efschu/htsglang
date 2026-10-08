@@ -226,9 +226,10 @@ def test_survey_covers_the_ident_fix_guard_of_release_rename():
     g("init", "-q")
     os.makedirs(os.path.join(d, "python"))
     with open(os.path.join(d, "python", "a.py"), "w") as fh:
-        fh.write("def f():\n    vorlauf = 1\n    warmup = 2\n    return vorlauf + warmup\n")
+        german = "vor" "lauf"      # split: the kit pass over this very file must not turn the German test word into its English target
+        fh.write("def f():\n    %s = 1\n    warmup = 2\n    return %s + warmup\n" % (german, german))
     with open(os.path.join(d, "python", "b.json"), "w") as fh:
-        fh.write('{"note": "the vorlauf phase is the warmup"}\n')
+        fh.write('{"note": "the %s phase is the warmup"}\n' % german)
     g("add", "-A")
     env = {k: v for k, v in os.environ.items() if k not in ("COLLISION_OK_FILE", "IDENT_COLLISION_OK_FILE", "FIXMAP_EXTRA", "IDENT_FIX_COLLISION")}
     r = subprocess.run([sys.executable, os.path.join(KIT, "collision_survey.py"), d], capture_output=True, text=True, env=env, timeout=120)
