@@ -123,6 +123,29 @@ def pp_size_of(holder) -> int:
         return 1
 
 
+#: PR (weg2/pp_room_vote.py; mem_cache.common.PP_ROOM_CAP_ATTR): the room the
+#: stages agreed for this pass (R_m), read by its literal name.
+_AGREED_ATTR = "weg2_pp_room_cap"
+
+
+def agreed_room(tree) -> Optional[int]:
+    cap = getattr(tree, _AGREED_ATTR, None)
+    if isinstance(cap, int) and not isinstance(cap, bool):
+        return max(0, cap)
+    return None
+
+
+def agreed_floor(tree, floor: int) -> int:
+    """PR: under an agreed R_m the load-back's floor is at most R_m, on every
+    stage alike (14:11Z int20: PP1 loaded weg2-8-75 a pass before PP0 -> #1004)."""
+    cap = agreed_room(tree)
+    return int(floor) if cap is None else min(int(floor), cap)
+
+
+class AgreedRoomShort(RuntimeError):
+    """PR: this stage cannot hold a load-back the stages agreed it can."""
+
+
 def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
     """The load-back room verdict on a local floor under pp > 1.
 
@@ -137,6 +160,10 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
     if alloc is None:
         return None
     kv_tokens = int(kv_tokens)
+    agreed = agreed_room(tree)
+    if agreed is not None and kv_tokens > agreed:
+        # every stage reads the same R_m: every stage refuses this pass
+        return False
     avail0 = int(alloc.available_size())
     evictable = int(tree.evictable_size())
     evicted = 0
@@ -159,6 +186,18 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
                 "would only skew this stage one pass behind its peers (#1004, b23)",
                 rid, kv_tokens, int(floor), avail0, evictable, evicted, avail1, n,
             )
+    elif agreed is not None:
+        # the stages agreed this load-back fits; this one cannot pay it. A local
+        # refusal would start it on the peers alone (#1004) -- stop by name.
+        from sglang.srt.weg2.pp_room_vote import agreed_short
+
+        n = agreed_short("loadback", rid, kv_tokens, agreed, avail1)
+        raise AgreedRoomShort(
+            f"PR AGREED-ROOM SHORT rid={rid} kv_tokens={kv_tokens} agreed={agreed} "
+            f"avail={avail0} evictable={evictable} evicted={evicted} avail_after={avail1} "
+            f"(n={n}): the stages agreed this pass can hold the load-back and this "
+            "stage cannot; refusing alone would start it on the peers only (#1004)"
+        )
     else:
         n = _sampled(tree, "_weg2_sf_room_residual")
         if n is not None:
@@ -196,20 +235,24 @@ def note_loaded(tree, rows: int) -> None:
         pass
 
 
-def unbacked_drop_allowed(tree, node) -> bool:
-    """UD (NF rc12q PP2 16:28:19Z): may an eviction DROP a write_back leaf whose
-    backup was refused? Only on the local-PP floor (the tree is this rank's own;
-    on a TP group a rank-local drop would split the replicas), only a node with
-    no children (#841: an un-backed node with children would orphan them) and
-    no write-through in flight."""
+def unbacked_drop_floor(tree, node) -> bool:
+    """UD's floor half: the local-PP floor (the tree is this rank's own; on a TP
+    group a rank-local drop would split the replicas) and no write-through of
+    ``node`` in flight. Children are not looked at here."""
     if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
         return False
-    if getattr(node, "children", None):
-        return False
     ongoing = getattr(tree, "ongoing_write_through", None) or {}
-    if getattr(node, "id", None) in ongoing:
+    return getattr(node, "id", None) not in ongoing
+
+
+def unbacked_drop_allowed(tree, node) -> bool:
+    """UD (NF rc12q PP2 16:28:19Z): may an eviction DROP a write_back leaf whose
+    backup was refused? Only on the local-PP floor, only a node with no children
+    (#841: an un-backed node with children would orphan them) and no
+    write-through in flight."""
+    if not unbacked_drop_floor(tree, node):
         return False
-    return True
+    return not getattr(node, "children", None)
 
 
 def note_unbacked_drop(tree, node, tokens: int) -> None:

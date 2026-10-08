@@ -727,6 +727,13 @@ class Envs:
     # 0 = off. y4b: two needless P legs (p_ms 7712 / 7460, flips included),
     # then the third refusal ended the client's stream with W50.
     SGLANG_WEG2_RVP_CAPACITY_PARK_S = EnvFloat(120.0)
+    # CAPPARK-FLIP-HOLD (08.10., NF dauer10081045 D->P flip epoch 4->5): while
+    # a flip park is open (park_running until the sleep / the awake re-queue)
+    # the #248h capacity re-queue does not run -- the capacity-parked requests
+    # ride the flip and the wake's hold read takes them up. On metal the
+    # re-queue ran three just-parked requests to their end while the front's
+    # D->P quiesce waited 28180 ms for D. Off = the re-queue inside the park.
+    SGLANG_WEG2_ENABLE_CAPPARK_FLIP_HOLD = EnvBool(True)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing
@@ -754,6 +761,16 @@ class Envs:
     # channel exists. Off = the immediate stop (pre-H98d). Reached only
     # where that stop would have fired; everywhere else byte-identical.
     SGLANG_WEG2_ENABLE_FORM_A_STALE_VOTE_DEFER = EnvBool(True)
+    # ENABLE_FORM_A_ADMIT_ROOM_FIRST (H98e, the cause behind H98d, NF xc D
+    # 21:37:29Z 07.10., weg2-130-2093 -> weg2-130-2092): a Form A load-back
+    # whose group ADMIT is already taken (worker off the token cut, every
+    # rank on it) decides its room from the LIVE pool with a shortfall-only
+    # eviction on its FIRST attempt (H105c's follow-room). Off = the first
+    # attempt goes through the pass-published floor, whose refusal runs the
+    # xsn285 full drain (every evictable leaf, the voted-but-not-admitted
+    # prefixes of the same pass included) before H105c retries from the
+    # live pool. The host-first path (H105b/H106) is not touched.
+    SGLANG_WEG2_ENABLE_FORM_A_ADMIT_ROOM_FIRST = EnvBool(True)
     # POOLLEAK_INSTR (NF y9nf6 boot 3, 07:03:50Z: "[full] ... withheld=92672
     # ... deficit of 128 row(s)" + 3 mamba slots on TP1/TP2 right after a D
     # park): LOG-ONLY instruments, no behaviour -- per-request pool holdings
@@ -1049,6 +1066,18 @@ class Envs:
     # (R12) only, never while a D park records its refusals (HY). Off = every
     # refused claim is made as before.
     SGLANG_WEG2_ENABLE_SWEEP_FULL_ARENA_SKIP = EnvBool(True)
+    # W3-ANCHOR-POOL (NF int20 1008_135412, P PP0 13:58-14:01): the W3-ARENA
+    # spill (UnifiedRadixCache._w3_arena_spill) stopped at its first gate on
+    # every hybrid boot -- the KV host pool is a HostPoolGroup whose
+    # __getattr__ forwards the claim calls but not secure_rows_to_l3, so
+    # hasattr() said False and it returned 0 before its log line ('W3-ARENA'
+    # 0x in 15 NF P logs; PUBLISH-SWEEP issued=0 refused=5130, every L3->L2
+    # fill ended at the full arena: ARENA-GET MISS, prefetch completed=0 of
+    # hit_pages=1318). On: the spill uses the group's anchor (arena) host
+    # pool, the one alloc_write already forwards to -- the 27B dual line's
+    # Q-697c (a), without its dual gate. Off = the old silent stop, byte for
+    # byte.
+    SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL = EnvBool(False)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).

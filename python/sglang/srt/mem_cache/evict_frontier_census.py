@@ -172,7 +172,102 @@ def deliverable_evictable(cache, base_ct) -> int:
     reported = int(cache.component_evictable_size_.get(base_ct, 0) or 0)
     if not deliverable_enabled() or getattr(cache, EXEMPT_ATTR, False):
         return reported
-    return max(0, reported - blocked_tokens_memo(cache, base_ct))
+    held = max(blocked_tokens_memo(cache, base_ct), known_unpayable(cache, base_ct))
+    return max(0, reported - held)
+
+
+# ---------------------------------------------------------------------------
+# PW (NF int18 1008, D log boot_weg2_dkrnfint4h6ablxcbar1dauer10081149_
+# e69f28a7f6_1008_115011.D.log): the BACKUP WALL. The peel pays a write_back
+# leaf only by backing it up first; with the host arena full (``#1427
+# ARENA-DROP need=1052 freed=0 stages=i:0,ii:0,iii:0``) every such leaf is
+# refused and the peel delivers nothing while the tree keeps REPORTING it:
+# ``EVICT-FRONTIER-CENSUS request=31552 delivered_before=0
+# delivered_after_repair=0 reported_evictable=182528 ... aux_locked={}``
+# (12:15:00Z TP0). Two readers of the same capacity then disagreed:
+# ``SEAT-AGE ... need=182428 free=190528 -> fits free, nobody leaves`` against
+# ``H105d FORM-A-CUT LOAD-BACK ROOM need=180928 available=144832 evicted=0``,
+# and the cut re-ran the futile peel (two backup attempts per leaf, the
+# census scan) in EVERY scheduler round: host gap 5-9 ms -> 124-129 ms per
+# decode round, decode 100 -> 35 tok/s; at running=0 the group stood still
+# (12:27:36-12:29:52, ``available=1408 reported_evictable=507136``).
+#
+# THE RULE: a peel that ended short (after the census' repair retry) MEASURED
+# that whatever the tree still reports evictable cannot be paid now. That
+# remainder is kept as the KNOWN-UNPAYABLE count until an input of the wall
+# moves -- the tree's evictable/protected counts, the aux lock set, the host
+# arena's free room, the write-throughs in flight -- or ``UNPAYABLE_TTL_S``
+# passed (then the next peel measures again). The deliverable count (ED) and
+# the cut subtract it, so every admission reader prices the same capacity the
+# load-back actually gets.
+# ---------------------------------------------------------------------------
+#: cache attribute: ``(key, unpayable_tokens, monotonic_t)`` of the last short peel.
+UNPAYABLE_ATTR = "_ef_unpayable_memo"
+#: a measured wall is re-measured at the latest after this many seconds, even
+#: when none of its inputs moved (a missed input costs one peel, not a wedge).
+UNPAYABLE_TTL_S = 2.0
+
+
+def _host_free_reading(cache):
+    """The host tier's free room as its pool reports it (the arena's free slot
+    tokens on an arena pool); None when the cache has no host pool."""
+    cc = getattr(cache, "cache_controller", None)
+    pool = getattr(cc, "mem_pool_host", None) if cc is not None else None
+    if pool is None:
+        return None
+    try:
+        return int(pool.available_size())
+    except Exception:  # noqa: BLE001 -- no reading: the key carries None
+        return None
+
+
+def _unpayable_key(cache, base_ct) -> tuple:
+    return (
+        int(cache.component_evictable_size_.get(base_ct, 0) or 0),
+        int(getattr(cache, "component_protected_size_", {}).get(base_ct, 0) or 0),
+        int(getattr(cache, "_ef_aux_version", 0) or 0),
+        _host_free_reading(cache),
+        len(getattr(cache, "ongoing_write_through", None) or ()),
+    )
+
+
+def note_peel_short(cache, base_ct, now=None) -> int:
+    """Called where a peel ended short of its request AFTER the census'
+    repair retry: the tokens the tree still reports evictable are unpayable
+    as long as the wall's inputs stand. Returns the count kept."""
+    import time
+
+    remainder = int(cache.component_evictable_size_.get(base_ct, 0) or 0)
+    t = time.monotonic() if now is None else float(now)
+    try:
+        setattr(cache, UNPAYABLE_ATTR, (_unpayable_key(cache, base_ct), remainder, t))
+    except Exception:  # noqa: BLE001 -- a cache that takes no attribute keeps the reported count
+        return 0
+    return remainder
+
+
+def known_unpayable(cache, base_ct, now=None) -> int:
+    """The KNOWN-UNPAYABLE evictable tokens: the last short peel's remainder
+    while the wall's inputs are unchanged and the measurement is younger than
+    ``UNPAYABLE_TTL_S``; 0 otherwise (and 0 on a cache that never had a short
+    peel -- byte-identical to the pre-PW count there)."""
+    import time
+
+    memo = getattr(cache, UNPAYABLE_ATTR, None)
+    if not isinstance(memo, tuple) or len(memo) != 3:
+        return 0
+    key, val, t = memo
+    t_now = time.monotonic() if now is None else float(now)
+    if t_now - float(t) > UNPAYABLE_TTL_S or key != _unpayable_key(cache, base_ct):
+        return 0
+    return max(0, int(val))
+
+
+def payable_evictable(cache, base_ct, now=None) -> int:
+    """The reported FULL-evictable count minus the known-unpayable remainder,
+    on EVERY rank (no ED exemption): what a peel asked now can pay at most."""
+    reported = int(cache.component_evictable_size_.get(base_ct, 0) or 0)
+    return max(0, reported - known_unpayable(cache, base_ct, now=now))
 
 
 def census_and_repair(cache, base_ct) -> Dict[str, object]:

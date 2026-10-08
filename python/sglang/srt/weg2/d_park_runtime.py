@@ -56,6 +56,14 @@ LATE_HOLD_ATTR = "_weg2_d_park_late_since"
 #: its list; an awake re-queue gives it back to the settle, not to the queue.
 FROM_SETTLE_ATTR = "_weg2_park_from_settle"
 
+#: CAPPARK-FLIP-HOLD (08.10., NF dauer10081045 epoch 4->5): the epoch of the
+#: flip park ``park_running`` opened (its sleep follows); None = no flip park
+#: open. Closed like the late hold: by the sleep (hold_parked) or by the awake
+#: re-queue (park_tick). While open, the #248h capacity re-queue does not run.
+#: Replicated: set and cleared by the same broadcast RPC / sleep on every rank.
+FLIP_PARK_OPEN_ATTR = "_weg2_d_flip_park_open"
+_CAPPARK_HOLD_LOGGED_ATTR = "_weg2_cappark_flip_hold_logged"
+
 
 def rearm_window_draft_cold(sched, reqs) -> int:
     """27B PARK (DFlash2): a flip-parked request on a SLOT-MAPPED draft pool
@@ -275,6 +283,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # releases into the queue behind the park's back -- the late hold holds.
     late_hold = bool(late_hold_armed)
     setattr(sched, LATE_HOLD_ATTR, now if late_hold else None)
+    setattr(sched, FLIP_PARK_OPEN_ATTR, epoch)  # CAPPARK-FLIP-HOLD: until the sleep / awake re-queue
     rids = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is not None]
     held = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is None]
     # #59b: the depth each parked request resumes from, after the retraction
@@ -484,6 +493,7 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     so it runs during the flip. Hold not armed: they stay parked and the first
     awake pass re-queues them."""
     setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the sleep closes the late hold
+    setattr(sched, FLIP_PARK_OPEN_ATTR, None)  # CAPPARK-FLIP-HOLD: ... and the flip park
     parked = list(getattr(sched, "weg2_d_parked", None) or [])
     if not parked:
         return 0
@@ -545,11 +555,14 @@ def park_tick(sched) -> int:
         )
         due = bool(sched._weg2_group_min_flags([local])[0])
     if not due:
+        if _flip_park_holds_capacity(sched, parked):
+            return 0
         return _capacity_requeue(sched, parked)
     moved = list(parked)
     sched.weg2_d_parked = []
     sched._weg2_d_park_slept = False
     setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the re-queue closes the late hold
+    setattr(sched, FLIP_PARK_OPEN_ATTR, None)  # CAPPARK-FLIP-HOLD: ... and the flip park
     # PARK-SETTLE: a folded settle request goes back to the settle (its read is
     # still short; the queue would hand it to the X gate unsettled).
     back = [r for r in moved if getattr(r, FROM_SETTLE_ATTR, False)]
@@ -571,6 +584,31 @@ def park_tick(sched) -> int:
                 (", %d back to the #1471 settle %s" % (len(back), [str(r.rid) for r in back]))
                 if back else "")
     return len(mine) + len(back)
+
+
+def _flip_park_holds_capacity(sched, parked) -> bool:
+    """CAPPARK-FLIP-HOLD (08.10., NF dauer10081045, D->P flip epoch 4->5): a
+    flip park is open -- the #248h capacity re-queue waits for the wake's hold
+    read (or the awake re-queue). Before, park_tick re-queued the capacity-
+    parked requests the park had just folded in (weg2-0-9/-0-10/-0-12, #248h
+    requeue 10:53:17); D ran them to their end and the front's D->P quiesce,
+    told they were parked, waited 28180 ms. ``SGLANG_WEG2_ENABLE_CAPPARK_FLIP_HOLD=0``
+    = the old re-queue inside the park. Replicated verdict (the attribute and
+    the switch are the same on every rank), no collective."""
+    from sglang.srt.environ import envs
+
+    epoch = getattr(sched, FLIP_PARK_OPEN_ATTR, None)
+    if epoch is None or not envs.SGLANG_WEG2_ENABLE_CAPPARK_FLIP_HOLD.get():
+        return False
+    from sglang.srt.weg2 import resume_via_p as _rvp
+
+    held = [str(r.rid) for r in parked if getattr(r, _rvp.CAPPARK_AT_ATTR, None) is not None]
+    if held and getattr(sched, _CAPPARK_HOLD_LOGGED_ATTR, None) != epoch:
+        setattr(sched, _CAPPARK_HOLD_LOGGED_ATTR, epoch)
+        logger.info("#248h CAPPARK-FLIP-HOLD epoch=%s n=%d rids=%s -- a flip park is open: the capacity "
+                    "re-read waits for the wake's hold read / the awake re-queue, nothing of the park runs "
+                    "on D during the flip (SGLANG_WEG2_ENABLE_CAPPARK_FLIP_HOLD)", epoch, len(held), held)
+    return True
 
 
 def _capacity_requeue(sched, parked) -> int:
@@ -1004,6 +1042,31 @@ SA_PASS_ATTR = "_weg2_sa_pass"
 VIEW_MAX_AGE_PASSES = 1
 
 
+def _evictable_reading(tree) -> int:
+    """PW (NF int18 1008): the evictable tokens the peel can PAY -- the ED count,
+    which subtracts what the last short peel measured unpayable (the backup
+    wall, mem_cache/evict_frontier_census.py) -- the same basis the adder's
+    ``rem_total_tokens`` and the H105d cut read. On 12:13:14Z the reported
+    count made ``free=190528 -> fits free, nobody leaves`` while the cut found
+    ``available=144832 evicted=0``."""
+    from sglang.srt.mem_cache.common import deliverable_evictable_or
+
+    return int(deliverable_evictable_or(tree, tree.evictable_size) or 0)
+
+
+def backup_wall_up(tree) -> bool:
+    """PW: True while the tree's last short peel stands (payable < reported):
+    rows that go back to the tree now -- a displaced seat's retained span, a
+    finished request's cache -- meet the same wall and free no device row."""
+    from sglang.srt.mem_cache.common import payable_evictable_or
+
+    try:
+        reported = int(tree.evictable_size() or 0)
+        return int(payable_evictable_or(tree, tree.evictable_size)) < reported
+    except Exception:  # noqa: BLE001 -- no reading: no wall
+        return False
+
+
 def _pool_reading(sched) -> Optional[int]:
     """available + evictable as the (legacy) verdict reads them; None = no reading."""
     try:
@@ -1011,7 +1074,7 @@ def _pool_reading(sched) -> Optional[int]:
     except Exception:  # noqa: BLE001 -- no reading
         return None
     try:
-        have += int(sched.tree_cache.evictable_size() or 0)
+        have += _evictable_reading(sched.tree_cache)
     except Exception:  # noqa: BLE001
         pass
     return have
@@ -1125,6 +1188,9 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
     young = sorted((r for r in running if _sa.rid_age(str(r.rid)) > _sa.rid_age(str(older_rid))),
                    key=lambda r: _sa.rid_age(str(r.rid)), reverse=True)
     basis = "legacy"
+    # PW: under the backup wall a victim's retained KV goes back to the tree and
+    # is as unpayable as the rest -- only its decode reserve comes free.
+    wall = backup_wall_up(getattr(sched, "tree_cache", None))
     if view is not None and str(view.get("rid")) == str(older_rid):
         need = int(view["price"]) + 1
         avail = int(view["budget"])
@@ -1132,7 +1198,7 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
         if now is not None and then is not None:
             avail += now - int(then)
         reserve = view.get("reserve") or {}
-        sizes = [_req_kv_tokens(r) + int(reserve.get(str(r.rid), 0)) for r in young]
+        sizes = [(0 if wall else _req_kv_tokens(r)) + int(reserve.get(str(r.rid), 0)) for r in young]
         basis = "adder"
     else:
         need = max(0, _req_kv_tokens(older) - _n(getattr(older, "prefix_indices", None)))
@@ -1141,10 +1207,12 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
         except Exception:  # noqa: BLE001 -- no reading: no displacement
             return False
         try:
-            avail += int(sched.tree_cache.evictable_size() or 0)
+            avail += _evictable_reading(sched.tree_cache)
         except Exception:  # noqa: BLE001
             pass
-        sizes = [_req_kv_tokens(r) for r in young]
+        sizes = [0 if wall else _req_kv_tokens(r) for r in young]
+    if wall:
+        basis += "+wall"
     k = victims_needed(need, avail, sizes)
     if seat and k is not None:
         if not young:
@@ -1155,7 +1223,7 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
     sched._sa_kv_fit_n = n
     # Q-702 (Auftrag 1522): the adder basis names k == 1 too (the displacement itself) -- the
     # metal probe reads ``basis=adder`` per RANK on exactly that line (review 1110/1140).
-    if (k != 1 or basis == "adder") and (n <= 8 or (n & (n - 1)) == 0):
+    if (k != 1 or basis.startswith("adder")) and (n <= 8 or (n & (n - 1)) == 0):
         logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d basis=%s -> %s (n=%d)",
                     "SEAT" if seat else "KV", str(older_rid), need, avail, len(young), basis,
                     "fits free, nobody leaves" if k == 0 else
