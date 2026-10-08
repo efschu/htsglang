@@ -16,6 +16,8 @@
 (function () {
   "use strict";
   const $ = (id) => document.getElementById(id);
+  const T = (s) => (typeof RigI18n === "undefined" ? s : RigI18n.t(s));                  // i18n.js: the German of a canvas text
+  const LANG = () => (typeof RigI18n === "undefined" ? "en" : RigI18n.lang());
   const root = $("verlauf");
   if (!root || typeof uPlot === "undefined") return;
 
@@ -96,19 +98,34 @@
   const FLIP_DEF = {"P>D": "last P chunk done → first decode token produced",
     "D>P": "last decode token produced → first prefill chunk starts computing (first forward on PP0)"};
 
+  // ordered classes bs1..bs6: one hue, light -> dark (the batch size is an ordered quantity, not a category)
+  function mixHex(a, b, k) {
+    const h = (c) => [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16));
+    const [x, y] = [h(a), h(b)];
+    return "#" + x.map((v, i) => Math.round(v * k + y[i] * (1 - k)).toString(16).padStart(2, "0")).join("");
+  }
+  const BS = [1, 2, 3, 4, 5, 6];
+  const bsCol = (k) => mixHex(C.s7, C.surface, 0.45 + 0.55 * (k - 1) / (BS.length - 1));
+
   function tiles(d) {
     const t = d.tiles || {}, s = d.src || {};
     const over = d.zoom ? "in the zoom range" : `over ${d.range}`;
     const seatTxt = t.seats_mean == null ? "Seats: –"
-      : `at avg ${fmtN(t.seats_mean, 1)} seats${t.seats_min != null ? ` (${fmtN(t.seats_min, 0)}–${fmtN(t.seats_max, 0)})` : ""}` +
-        (t.stream_mean != null ? ` · mean ${fmtN(t.stream_mean, 1)} tok/s per stream, total ≈ ${fmtN(t.stream_mean * t.seats_mean, 0)} tok/s` : "");
+      : `at avg ${fmtN(t.seats_mean, 1)} seats${t.seats_min != null ? ` (${fmtN(t.seats_min, 0)}–${fmtN(t.seats_max, 0)})` : ""}`;
+    // decode tok/s per batch size: the mean over the time at exactly this size (history.seat_tiles dec_by_bs), "–" without such time
+    const byBs = t.dec_by_bs || {};
+    const bsCells = BS.map((k) => {
+      const c = byBs[k] || {};
+      return `<div class="vt-bsc" title="${esc(c.rate == null ? `no decode time at exactly bs ${k} ${over}` : `bs ${k}: ${fmtN(c.rate, 1)} tok/s over ${fmtN(c.busy_s, 0)} s of decode at exactly this batch size`)}">`
+        + `<span class="vt-bsk"><i style="background:${bsCol(k)}"></i>${k}</span><b class="num">${c.rate == null ? "–" : fmtN(c.rate, 0)}</b></div>`;
+    }).join("");
     const tierTxt = t.tiers
       ? `Device ${fmtN(t.tiers.device)} · L2 ${fmtN(t.tiers.host)} · L3 ${fmtN(t.tiers.storage)} · no tier ${fmtN(t.tiers.unassigned)}`
       : "Tiers device/L2/L3: –";
     const hitPct = t.cache_hit == null ? null : 100 * t.cache_hit;
     $("vl-tiles").innerHTML = [
-      tile("Decode per stream p50", big(fmtN(t.out_p50), "tok/s"), `Median ${over} (${d.step} s bucket) · ${seatTxt}`, s.decode),
-      tile("Decode per stream p90", big(fmtN(t.out_p90), "tok/s"), `90th percentile ${over} · seats = batch size of the decode rounds, averaged over decode time only`, s.seats || s.decode),
+      tile("Decode tok/s (all streams)", big(fmtN(t.dec_rate_mean), "tok/s"), `mean ${over} while decoding (tokens / decode time) · ${seatTxt}`, s.decode),
+      tile("Decode tok/s by bs", `<div class="vt-bs">${bsCells}</div>`, `bs 1 … 6: tok/s, mean over the time at exactly that batch size ${over}; – = no such time`, s.seats || s.decode),
       tile("Prefix cache hits", gauge(hitPct == null ? null : hitPct / 100, hitPct == null ? "–" : fmtN(hitPct, 1) + " %", C.s1),
         `from cache / (cache + recomputed); handoff P→D is never cache (${t.handoff_share == null ? "–" : fmtN(100 * t.handoff_share, 1) + " %"} of the input tokens) · ${tierTxt}`, s.cache),
       ...["P>D", "D>P"].map((dir) => {
@@ -326,16 +343,10 @@
       series: [{}, line("P prefill (during prefill)", C.s1, "tok/s"), line("D prefill (during prefill)", C.s2, "tok/s"),
         wall("P wall clock incl. pauses", C.s1), wall("D wall clock incl. pauses", C.s2)],
     }, rowsPre(d));
-    // Decode: die Rate WÄHREND D dekodierte (Tokens / Decode-Zeit im Eimer); je Stream und die Sitze mit
-    // demselben Nenner (Nutzer 30.09. ~21:10Z: je Stream nur mit der Zahl der Sitze). Sitze auf der
-    // rechten Achse, gestuft; Schlaf, Flip und Extend zählen nicht als 0 Sitze, sie sind Lücken.
-    const streamVal = (u, v, si, i) => {
-      const S = data.series;
-      const idx = i == null ? lastIdx(u, si) : i;
-      if (idx == null || S["m.stream_tps"][idx] == null) return "–";
-      const st = S["m.stream_tps"][idx], se = S["m.seats"][idx], all = S["m.dec_rate"][idx];
-      return fmtN(st, 1) + " tok/s" + (se != null ? ` at avg ${fmtN(se, 1)} seats (total ≈ ${fmtN(all, 0)} tok/s)` : "");
-    };
+    // Decode (user 08.10.: "decode tok/s gesamt und aufgeteilt ... bs1 bs2 bs3 bs4 bs5 bs6" instead of per stream): the
+    // rate WHILE D decoded (tokens / decode time in the bucket) in total, and per batch size the same rate in the buckets
+    // whose rounds all ran at exactly that size (the other buckets are gaps of that line, never 0).  Seats = the mean
+    // batch size on the right axis, stepped; sleep, flip and extend are gaps, not 0 seats.
     const seatVal = (u, v, si, i) => {
       const S = data.series;
       const idx = i == null ? lastIdx(u, si) : i;
@@ -343,14 +354,19 @@
       const lo = S["m.seats_min"][idx], hi = S["m.seats_max"][idx];
       return "Ø " + fmtN(S["m.seats"][idx], 1) + (lo != null && hi != null && lo !== hi ? ` (${fmtN(lo, 0)}–${fmtN(hi, 0)})` : "");
     };
+    // legend of a batch-size line: at the cursor the value of that bucket, otherwise the mean over the shown range
+    const bsVal = (k) => (u, v, si, i) => {
+      const x = i == null ? ((data.tiles.dec_by_bs || {})[k] || {}).rate : data.series["m.dec_bs" + k + "_rate"][i];
+      return x == null ? "–" : fmtN(x, 1) + " tok/s" + (i == null ? " (mean)" : "");
+    };
     charts.dec = mk("vl-c-dec", {
       scales: { y: { range: zeroUp(10) }, seats: { range: (u, a, b) => [0, Math.max(4, Math.ceil((b || 0) * 1.15))] } },
-      axes: [axisX(), axisY(tps), Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "seats", side: 1, grid: { show: false }, size: 40, label: "Seats", labelSize: 14, labelFont: FONT })],
-      series: [{}, line("all streams (during decode)", C.s3, "tok/s"),
-        line("per stream", C.text, "tok/s", { fill: undefined, width: 1.5, points: { show: true, size: 4, fill: C.text }, value: streamVal }),
-        line("Seats (batch size, avg over decode time)", C.s4, "", { fill: undefined, width: 1.5, scale: "seats", noDot: true,
+      axes: [axisX(), axisY(tps), Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "seats", side: 1, grid: { show: false }, size: 40, label: T("Seats"), labelSize: 14, labelFont: FONT })],
+      series: [{}, line("all streams (during decode)", C.s3, "tok/s")]
+        .concat(BS.map((k) => line("bs " + k, bsCol(k), "tok/s", { fill: undefined, width: 1.25, points: { show: true, size: 5, fill: bsCol(k) }, value: bsVal(k) })))
+        .concat([line("Seats (batch size, avg over decode time)", C.s4, "", { fill: undefined, width: 1.5, scale: "seats", noDot: true,
           paths: uPlot.paths && uPlot.paths.stepped ? uPlot.paths.stepped({ align: 1 }) : undefined, value: seatVal }),
-        wall("wall clock incl. pauses", C.s3)],
+          wall("wall clock incl. pauses", C.s3)]),
     }, rowsDec(d));
     charts.cache = mk("vl-c-cache", {
       scales: { y: { range: zeroUp(10) } },
@@ -431,7 +447,7 @@
 
   const raw = { v: [[], [], []] };
   const rowsPre = (d) => [d.t, d.series["m.p_rate"], d.series["m.d_rate"], d.series["m.p_tps"], d.series["m.d_tps"]];
-  const rowsDec = (d) => [d.t, d.series["m.dec_rate"], d.series["m.stream_tps"], d.series["m.seats"], d.series["m.dec_tps"]];
+  const rowsDec = (d) => [d.t, d.series["m.dec_rate"]].concat(BS.map((k) => d.series["m.dec_bs" + k + "_rate"]), [d.series["m.seats"], d.series["m.dec_tps"]]);
   const rowsTtft = (d) => { const x = d.ttft || {}; const nul = d.t.map(() => null); return [d.t, x.mean_ms || nul, x.n || nul]; };
   const rowsHost = (d) => [d.t, d.series["host.cpu"], d.series["host.mem_pct"], d.series["host.bootmem_pct"]];
   const rowsCards = (d, k) => [d.t].concat((d.cards || []).map((c) => d.series["g" + c.index + "." + k] || d.t.map(() => null)));

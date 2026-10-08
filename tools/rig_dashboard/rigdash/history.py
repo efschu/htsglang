@@ -582,6 +582,7 @@ class Recorder:
                             "p_busy": b["p_busy"][i], "d_busy": b["d_busy"][i], "dec_busy": b["dec_busy"][i],
                             "dec_seat": b["dec_seat"][i], "dec_bs_min": b["dec_bs_min"][i],
                             "dec_bs_max": b["dec_bs_max"][i]}
+                    vals.update({"dec_bs%d_%s" % (k, f): b["dec_bs%d_%s" % (k, f)][i] for k in activity.BS_CLASSES for f in ("tps", "busy")})
                     vals.update({"ph_" + k: b["ph_" + k][i] for k in activity.STATES})
                     # dual boots only (activity.CO_STATES): the part of ph_P with D working at the same time
                     vals.update({"ph_" + k: b["ph_" + k][i] for k in activity.CO_STATES if "ph_" + k in b})
@@ -712,20 +713,14 @@ def parse_host(text: str) -> dict:
 
 # ----------------------------------------------------------------------------- the answer
 
-def _pct(xs: List[float], p: float) -> Optional[float]:
-    xs = sorted(x for x in xs if x is not None)
-    if not xs:
-        return None
-    return xs[max(0, math.ceil(p * len(xs)) - 1)]
-
-
 def model_src(ipc_marks: List[Optional[float]]) -> Optional[str]:
     """Source label of the model series over the shown range: only IPC (Nutzer 30.09.: keine Reihe aus
     Boot-Logs, ohne Ausnahme).  A range without any IPC sample says so instead of naming a log."""
     return IPC_LABEL if any(v is not None for v in ipc_marks) else NO_DATA_LABEL
 
 
-BUSY_SERIES = ("p_busy", "d_busy", "dec_busy", "dec_seat", "dec_bs_min", "dec_bs_max")
+BS_SERIES = tuple("dec_bs%d_%s" % (k, f) for k in activity.BS_CLASSES for f in ("tps", "busy"))
+BUSY_SERIES = ("p_busy", "d_busy", "dec_busy", "dec_seat", "dec_bs_min", "dec_bs_max") + BS_SERIES
 
 
 def derive_rates(series: Dict[str, List[Optional[float]]]) -> None:
@@ -747,11 +742,13 @@ def derive_rates(series: Dict[str, List[Optional[float]]]) -> None:
     old = s.get("m.stream_tps") or [None] * n
     s["m.stream_tps"] = [a if (s.get("m.dec_seat") or [None] * n)[i] is not None else b
                          for i, (a, b) in enumerate(zip(new_stream, old))]
+    for k in activity.BS_CLASSES:
+        s["m.dec_bs%d_rate" % k] = _ratio(s.get("m.dec_bs%d_tps" % k) or [None] * n, s.get("m.dec_bs%d_busy" % k) or [None] * n)
     s["m.seats_min"] = list(s.get("m.dec_bs_min") or [None] * n)
     s["m.seats_max"] = list(s.get("m.dec_bs_max") or [None] * n)
 
 
-def seat_tiles(series) -> dict:
+def seat_tiles(series, step: float = 1.0) -> dict:
     """Nutzer 30.09. ~21:10Z: "bei verlauf wo decode je stream steht soll auch die anzahl oder das
     mittel der sitze" -- over the shown stretch: seats time-weighted over the decode time only,
     their span, the rate while decoding; per stream = that rate / those seats."""
@@ -762,7 +759,14 @@ def seat_tiles(series) -> dict:
     sc = sum(c for _, _, c in rows)
     mins = [v for v in series.get("m.seats_min") or [] if v is not None]
     maxs = [v for v in series.get("m.seats_max") or [] if v is not None]
-    return {"seats_mean": (sc / sb) if sb > 1e-6 else None,
+    by_bs = {}
+    for k in activity.BS_CLASSES:
+        t_k = [(a, b) for a, b in zip(series.get("m.dec_bs%d_tps" % k) or [], series.get("m.dec_bs%d_busy" % k) or [])
+               if a is not None and b is not None]
+        busy_k = sum(b for _, b in t_k)
+        # rate while working at exactly this batch size over the shown stretch; None = no interval of this size
+        by_bs[str(k)] = {"rate": (sum(a for a, _ in t_k) / busy_k) if busy_k > 1e-6 else None, "busy_s": busy_k * step}
+    return {"seats_mean": (sc / sb) if sb > 1e-6 else None, "dec_by_bs": by_bs,
             "seats_min": min(mins) if mins else None, "seats_max": max(maxs) if maxs else None,
             "dec_rate_mean": (stok / sb) if sb > 1e-6 else None,
             "stream_mean": (stok / sc) if sc > 1e-6 else None}
@@ -893,7 +897,6 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     roles = {m: (db.get("roles." + m) or {}) for m in MODELS}
     card_info = [dict(c, roles={m: roles[m].get(c["uuid"], []) for m in MODELS}) for c in cards]
     tiles = {
-        "out_p50": _pct(series["m.stream_tps"], 0.5), "out_p90": _pct(series["m.stream_tps"], 0.9),
         "cache_hit": cacheacct.hit_share(tok), "tok": tok, "tiers": tiers,
         "handoff_share": (tok["handoff"] / (tok["handoff"] + tok["cache"] + tok["comp_p"] + tok["comp_d"])
                           if sum(tok.values()) else None),
@@ -907,7 +910,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         "live": latest("m.ipc") is not None,
         "flip": flip_win,
     }
-    tiles.update(seat_tiles(series))
+    tiles.update(seat_tiles(series, step))
     thin = [m for m in marks if m["kind"] not in ("flip", "flip_user", "flip_pd_user", flipzeit.MARK_KIND, flipzeit.SKIP_KIND)] + \
         [m for m in marks if m["kind"] == flipzeit.MARK_KIND]
     fl = [dict(m, v=None) for m in marks if m["kind"] == "flip"]

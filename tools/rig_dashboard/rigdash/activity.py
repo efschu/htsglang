@@ -661,6 +661,8 @@ def spread(items, lo: float, n: int, step: float, key: str = "tok", excl=None) -
     return acc
 
 
+#: batch sizes the history tells apart in the decode throughput (user 08.10.: "bs1 bs2 bs3 bs4 bs5 bs6")
+BS_CLASSES = (1, 2, 3, 4, 5, 6)
 #: the states of the phase bar (Nutzer 30.09. ~18Z: "idle sieht aus wie flip ... das muss eindeutig
 #: unterscheidbar sein").  Each comes from data; what no data explains is "unknown", never idle or flip.
 STATES = ("P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "vis_load", "vis_enc", "vis_unload",
@@ -1038,6 +1040,14 @@ class Model:
         out["p_busy"], out["d_busy"], out["dec_busy"] = g(p_busy), g(d_busy), g(dec_busy)
         out["dec_seat"] = g(dec_seat)
         out["dec_bs_min"], out["dec_bs_max"] = bmin, bmax
+        # decode per batch size (user 08.10.): only the intervals whose rounds ALL ran at exactly bs = k count
+        # for class k (tokens and busy seconds), so tokens / busy of a class is the group's tok/s at that bs
+        for k in BS_CLASSES:
+            pure = [x for x in self.dec if x.get("bs_min") is not None and x["bs_min"] == x["bs_max"] == k]
+            tk, bk = spread(pure, lo, n, step), spread(pure, lo, n, step, key="busy")
+            used = [have[i] and bk[i] > 1e-9 for i in range(n)]
+            out["dec_bs%d_tps" % k] = [(tk[i] / step) if used[i] else None for i in range(n)]
+            out["dec_bs%d_busy" % k] = [(bk[i] / step) if used[i] else None for i in range(n)]
         # rates while working (None = the phase did not work in this bucket: a real gap)
         rate = lambda tok, busy: [(t / b) if have[i] and b > 1e-6 else None  # noqa: E731
                                   for i, (t, b) in enumerate(zip(tok, busy))]
