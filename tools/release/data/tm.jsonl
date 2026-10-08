@@ -586,3 +586,52 @@
 {"text": "\"gpuq nicht erreichbar (Test)\"", "translation": "\"gpuq not reachable (Test)\""}
 {"text": "\"Zeile fehlt: \"", "translation": "\"Row missing: \""}
 {"text": "\"%s liegt nicht unter einer Modellwurzel\"", "translation": "\"%s is not under a model root\""}
+{"text": "`Verdikt` (verdict in both; Part 1 lists \"judgement / verdict\" for Urteil). The catalog glossary lives separately in", "translation": "`Verdikt` (verdict in both; Part 1 lists \"judgement / verdict\" for Urteil). The catalog glossary lives separately in"}
+{"text": "| Verdikt, Urteil | verdict |", "translation": "| Verdikt, Urteil | verdict |"}
+{"text": "| Verweigerung, Ablehnung | refusal |", "translation": "| Verweigerung, Ablehnung | refusal |"}
+{"text": "| verweigert, abgelehnt | refused |", "translation": "| verweigert, abgelehnt | refused |"}
+{"text": "| geloest (vom Launcher) | solved (by the launcher) |", "translation": "| geloest (vom Launcher) | solved (by the launcher) |"}
+{"text": "| gemessen / geschaetzt | measured / estimated |", "translation": "| gemessen / geschaetzt | measured / estimated |"}
+{"text": "| Sitze (gleichzeitig) | seats (concurrent) |", "translation": "| Sitze (gleichzeitig) | seats (concurrent) |"}
+{"text": "`state`, `forms`, `outcome`, ...), enum values that the JS compares (`geht`, `ok_with_force`, `verweigert`,", "translation": "`state`, `forms`, `outcome`, ...), enum values that the JS compares (`geht`, `ok_with_force`, `verweigert`,\""}
+{"text": "`unverified`, `vorgeschlagen`, `einfach`, `expert`, `GESTOPPT`, `TOT`, `HAENGT`, ...), env/flag names, CSS classes, element IDs,", "translation": "`unverified`, `vorgeschlagen`, `einfach`, `expert`, `GESTOPPT`, `TOT`, `HAENGT`, ...), env/flag names, CSS classes, element IDs,"}
+{"text": "| nur mit --force | only with --force |", "translation": "| only with --force | only with --force |"}
+{"text": "| Force ungeprüft | force unchecked |", "translation": "| force unchecked | force unchecked |"}
+{"text": "| nicht beurteilt | not judged |", "translation": "| not judged | not judged |"}
+{"text": "| kein Lauf | no run |", "translation": "| no run | no run |"}
+{"text": "| Planer-Rechnung: passt / passt nicht / unbelegt | planner estimate: fits / does not fit / unverified |", "translation": "| planner computation: fits / does not fit / unverified | planner estimate: fits / does not fit / unverified |"}
+{"text": "| Orakel / Orakel-Fehler | oracle / oracle error |", "translation": "| oracle / oracle error | oracle / oracle error |"}
+{"text": "| Neu prüfen | Re-check |", "translation": "| Re-check | Re-check |"}
+{"text": "| geschätzt | estimated |", "translation": "| estimated | estimated |"}
+{"text": "| gemessen / nicht gemessen | measured / not measured |", "translation": "| measured / not measured | measured / not measured |"}
+{"text": "| gerechnet / nicht gerechnet | computed / not computed |", "translation": "| computed / not computed | computed / not computed |"}
+{"text": "| Zustand (je Wert) | state |", "translation": "| state (per value) | state |"}
+{"text": "| Urteil / Verdikt | judgement / verdict |", "translation": "| judgement / verdict | judgement / verdict |"}
+{"text": "| vom Launcher gelöst | solved by the launcher |", "translation": "| solved by the launcher | solved by the launcher |"}
+{"text": "| von Ihnen übersteuert | overridden by you |", "translation": "| overridden by you | overridden by you |"}
+{"text": "| ungeprüft seit Ihrer Änderung | unchecked since your change |", "translation": "| unchecked since your change | unchecked since your change |"}
+{"text": "| Standard (nicht im Profil) | default (not in the profile) |", "translation": "| default (not in the profile) | default (not in the profile) |"}
+{"text": "| Übernehmen | Take over |", "translation": "| Take over | Take over |"}
+{"text": "| Abhängigkeiten / Kanten | dependencies / edges |", "translation": "| dependencies / edges | dependencies / edges |"}
+{"text": "| Einzelkarte / nur TP / Flip PP/TP / Dual PP/TP | single card / TP only / Flip PP/TP / Dual PP/TP |", "translation": "| single card / TP only / Flip PP/TP / Dual PP/TP | single card / TP only / Flip PP/TP / Dual PP/TP |"}
+{"text": "| Karten-Balken | card bars |", "translation": "| card bars | card bars |"}
+{"text": "| Gewichte / Experten / Draft / KV / Mamba-Zustand | weights / experts / draft / KV / Mamba state |", "translation": "| weights / experts / draft / KV / Mamba state | weights / experts / draft / KV / Mamba state |"}
+{"text": "| Überlauf | overflow |", "translation": "| overflow | overflow |"}
+{"text": "| Sitze (gleichzeitig) | seats (concurrent seats) |", "translation": "| seats (concurrent) | seats (concurrent seats) |"}
+{"text": "| Eimer (Zeitraster) | bucket |", "translation": "| bucket (time grid) | bucket |"}
+{"text": "| Übergabe P->D | handoff P->D |", "translation": "| handoff P->D | handoff P->D |"}
+{"text": "| Vorlauf / Nachlauf | lead / tail |", "translation": "| warmup / tail | lead / tail |"}
+{"text": "| ruht / schläft | idle / asleep |", "translation": "| idle / asleep | idle / asleep |"}
+{"text": "| Expertenansicht / Einfach / Experte | expert view / Simple / Expert |", "translation": "| expert view / Simple / Expert | expert view / Simple / Expert |"}
+{"text": "| Überblick | overview |", "translation": "| overview | overview |"}
+{"text": "| Soll / Ist | target / actual |", "translation": "| expected / actual | target / actual |"}
+{"text": "| model profile source tags (`src`) (modellprofil.js shows `geschätzt` as `estimated`) | config / Index / estimated / stat |", "translation": "| model profile source tags (`src`) (modellprofil.js shows `geschätzt` as `estimated`) | config / Index / estimated / stat |"}
+{"text": "| `profile_couplings.BAR_SEGMENTS` labels (profil_balken.js `SEGS`) | Weights / Experts (resident) / Draft/MTP / KV / Mamba/GDN state / Activation / Fixed items; tail: Reserve / Free; Overflow |", "translation": "| `profile_couplings.BAR_SEGMENTS` labels (profil_balken.js `SEGS`) | Weights / Experts (resident) / Draft/MTP / KV / Mamba/GDN state / Activation / Fixed items; tail: Reserve / Free; Overflow |"}
+{"text": "| alarm states `a.state` (index.html accepts both) | GESTOPPT=STOPPED, TOT=DEAD, HAENGT=HANGING, WARNUNG=WARNING |", "translation": "| alarm states `a.state` (index.html accepts both) | GESTOPPT=STOPPED, TOT=DEAD, HAENGT=HANGING, WARNUNG=WARNING |"}
+{"text": "| Wert-Ablehnung (forcebar) / nicht forcebar | value refusal (forceable) / not forceable | `pdflip/refusals.py` `CLASS_LABEL`, `force_scope` (register display texts; codes, `klass` keys, `source`, `enforced_by` unchanged) |", "translation": "| value refusal (forcebar) / not forcebar | value refusal (forceable) / not forceable | `pdflip/refusals.py` `CLASS_LABEL`, `force_scope` (register display texts; codes, `klass` keys, `source`, `enforced_by` unchanged) |"}
+{"text": "| blockiert / ungeprueft (force_state in the run report) | blocked / unchecked | `profil.py` `_STATE_DISPLAY` (API values stay German) |", "translation": "| blocked / unchecked (force_state in the run report) | blocked / unchecked | `profil.py` `_STATE_DISPLAY` (API values stay German) |"}
+{"text": "| keiner / belegt / entwicklung (transport, confidence) | none / verified / development | `kartenplan_transport.py` |", "translation": "| none / occupied / development (transport, confidence) | none / verified / development | `kartenplan_transport.py` |"}
+{"text": "| letzte 60 min / gezoomter Ausschnitt | last 60 min / zoomed section | `flipzeit.window_label` |", "translation": "| last 60 min / zoomed section | last 60 min / zoomed section | `flipzeit.window_label` |"}
+{"text": "| P aktiv / D aktiv | P active / D active | `ipcboot.PHASE_LABEL` |", "translation": "| P active / D active | P active / D active | `ipcboot.PHASE_LABEL` |"}
+{"text": "| Vision laden / rechnen / entladen | Vision load / encode / unload | `ipcboot.VIS_NAME` |", "translation": "| Vision load / compute / unload | Vision load / encode / unload | `ipcboot.VIS_NAME` |"}
+{"text": "| ja / knapp / nein (hw_fit level, shown) | yes / tight / no | `profil_planer.js`, `propose_verdict.py` |", "translation": "| yes / tight / no (hw_fit level, shown) | yes / tight / no | `profil_planer.js`, `propose_verdict.py` |"}
