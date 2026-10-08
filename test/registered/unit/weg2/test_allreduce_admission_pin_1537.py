@@ -206,6 +206,10 @@ EXPECTED_HELPER_REFS = {
     ("managers/scheduler.py", "Scheduler._weg2_post_wake_settle_tick"): {"_weg2_group_min_flags"},
     ("managers/scheduler.py", "Scheduler._weg2_release_dormant_hold"): {"_weg2_group_min_flags"},
     ("managers/scheduler.py", "Scheduler._weg2_answer_x_refusals"): {"_weg2_group_min_flags"},
+    # PW-R (weg2/d_wall_head.py, NF int18 1008): entered iff the pass's HOL head
+    # (its first NO_TOKEN on group D -- the Form A gather's verdict, the same rid on
+    # every rank) is still in the replicated waiting queue; one MIN per pass.
+    ("managers/scheduler.py", "Scheduler._get_new_batch_prefill_raw"): {"_weg2_group_min_flags"},
     ("weg2/d_park_runtime.py", "park_tick"): {"_weg2_group_min_flags"},
     ("weg2/d_park_runtime.py", "_capacity_requeue"): {"_weg2_group_min_flags"},
     ("weg2/d_park_runtime.py", "_lift_holds_when_idle"): {"_weg2_group_min_flags"},
