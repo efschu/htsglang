@@ -640,6 +640,52 @@ def _busy_spans(cs: List[dict]) -> List[dict]:
     return [{"s": a, "e": b, "parts": [(a, b)], "w": b - a} for a, b in seen]
 
 
+def prefill_requests(cs: List[dict], is_d: bool = False) -> List[dict]:
+    """The requests behind a group's prefill chunk records (user 08.10.: "input tokens (from cache)": a jump to the
+    cached prefix, then the newly prefilled tokens rise on top of it).  rankstats count a request's cached prefix
+    ONCE, at its first chunk (``prefill.cached_tokens``, later chunks add 0), so a record with cached > 0 starts a
+    request, a record without it extends the running one while it follows within CHUNK_GAP_S.  ``pts`` = (time, new
+    tokens so far): 0 at the start, the running sum at the end of each chunk record; ``cached`` stays level from
+    the start.  Without the per-chunk extent (prefill.last.ext) this is the finest honest split."""
+    out: List[dict] = []
+    cur = None
+    for c in sorted(cs, key=lambda x: x["e0"]):
+        if cur is None or (c.get("cached") or 0) > 0 or c["s"] > cur["e"] + CHUNK_GAP_S:
+            cur = {"s": c["s"], "e": c["e0"], "cached": float(c.get("cached") or 0.0), "d": is_d,
+                   "pts": [(c["s"], 0.0)], "new": 0.0}
+            out.append(cur)
+        cur["new"] += c.get("tok") or 0.0
+        cur["pts"].append((max(c["e0"], cur["pts"][-1][0]), cur["new"]))
+        cur["e"] = max(cur["e"], c["e0"])
+    return out
+
+
+def _new_at(pts: List[Tuple[float, float]], t: float) -> float:
+    """New tokens of a request by time t: linear between its chunk ends, 0 before the start, all after the end."""
+    if t <= pts[0][0]:
+        return 0.0
+    for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+        if t <= t1:
+            return v0 + (v1 - v0) * ((t - t0) / (t1 - t0) if t1 > t0 else 1.0)
+    return pts[-1][1]
+
+
+def prefill_levels(reqs: List[dict], lo: float, n: int, step: float) -> Dict[str, List[Optional[float]]]:
+    """Per bucket the prefill in progress at the END of the bucket (the request that finished its newest chunk last
+    among those that began before the bucket's end): ``pf_cached`` = its cached prefix (level from its start),
+    ``pf_new`` = the tokens it has newly prefilled by then, ``pf_isd`` = 1 for a D request.  None = no prefill in
+    progress (a gap, never 0): the curve starts at the cached prefix and climbs, it does not come up from zero."""
+    cached: List[Optional[float]] = [None] * n
+    new: List[Optional[float]] = [None] * n
+    isd: List[Optional[float]] = [None] * n
+    for r in sorted(reqs, key=lambda x: (x["e"], x["s"])):
+        i0, i1 = int((r["s"] - lo) // step), int((r["e"] - lo - 1e-9) // step)
+        for i in range(max(0, i0), min(n - 1, i1) + 1):
+            t = min(lo + (i + 1) * step, r["e"])
+            cached[i], new[i], isd[i] = r["cached"], _new_at(r["pts"], t), 1.0 if r["d"] else 0.0
+    return {"pf_cached": cached, "pf_new": new, "pf_isd": isd}
+
+
 def spread(items, lo: float, n: int, step: float, key: str = "tok", excl=None) -> List[float]:
     """Tokens of each interval spread uniformly over the time it ran (flip windows cut out), per bucket."""
     acc = [0.0] * n
@@ -1039,6 +1085,9 @@ class Model:
         out["tok_cache"], out["tok_dcached"] = g(cache_p), g(cache_d)
         out["p_busy"], out["d_busy"], out["dec_busy"] = g(p_busy), g(d_busy), g(dec_busy)
         out["dec_seat"] = g(dec_seat)
+        lv = prefill_levels(prefill_requests(pcs) + prefill_requests(pc.get("D", []), True), lo, n, step)
+        for k, arr in lv.items():
+            out[k] = [v if have[i] else None for i, v in enumerate(arr)]
         out["dec_bs_min"], out["dec_bs_max"] = bmin, bmax
         # decode per batch size (user 08.10.): only the intervals whose rounds ALL ran at exactly bs = k count
         # for class k (tokens and busy seconds), so tokens / busy of a class is the group's tok/s at that bs
