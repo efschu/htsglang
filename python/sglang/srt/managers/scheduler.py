@@ -15670,6 +15670,7 @@ class Scheduler(
         # and one lap of latency disappears with it.
 
         # Check if the grammar is ready in the grammar queue
+        ready_grammar_requests = ()
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
@@ -15739,6 +15740,26 @@ class Scheduler(
         prefetch_verdicts = self.__dict__.pop("_pass_prefetch_verdicts", None)
         if prefetch_verdicts is None:
             prefetch_verdicts = self._drain_prefetch_progress()
+        elif ready_grammar_requests and self.enable_hicache_storage:
+            # NF 08.10. (#580 after #791b): the memo was drained at the budget
+            # site, BEFORE the grammar intake above -- its rids are pending
+            # this pass (the ballot does not hold them either), drained next
+            # pass. See prefetch_ballot.cover_post_drain_intake.
+            _covered = prefetch_ballot.cover_post_drain_intake(
+                prefetch_verdicts, ready_grammar_requests
+            )
+            if _covered:
+                _n = getattr(self, "_grammar_intake_covered_n", 0) + 1
+                self._grammar_intake_covered_n = _n
+                if _n <= 8 or _n % 64 == 0:
+                    logger.info(
+                        "#580 GRAMMAR-INTAKE PENDING rids=%s n=%d: entered the "
+                        "waiting queue after this pass's memoised prefetch drain "
+                        "(grammar compiled); not-done this pass, drained and "
+                        "balloted from the next",
+                        _covered,
+                        _n,
+                    )
         _prefetch_ballot = self.__dict__.pop("_uniform_prefetch_ballot", None)
         # #823 W9b: take the group's batch verdict HERE, once, above every
         # early return and above both consumers -- the same position and the
