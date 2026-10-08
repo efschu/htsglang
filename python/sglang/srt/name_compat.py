@@ -229,9 +229,10 @@ def canonical_env(env: MutableMapping, *, foreign_keep=FOREIGN_READERS,
     different values (the renamed one won); ``report["legacy"]`` = the legacy
     spellings that were read through the mirror although this tree reads the
     renamed ones (empty before the rename: there the legacy names ARE the
-    canonical ones). A foreign reader's legacy spelling that sits beside an
-    equal renamed one is this function's own output of a parent process, not a
-    use, and is not listed.
+    canonical ones). A foreign reader's legacy spelling that sits beside the
+    renamed one is this function's own output of a parent process (or a stale
+    twin the launcher's write overrode), not a use: it is neither listed nor
+    reported as a conflict, on either side of the rename.
     """
     groups: Dict[Tuple[str, str, str], List[str]] = {}
     for k in list(env.keys()):
@@ -241,9 +242,11 @@ def canonical_env(env: MutableMapping, *, foreign_keep=FOREIGN_READERS,
     for (leg, new, canon), present in groups.items():
         foreign = leg in foreign_keep
         if report is not None:
-            if leg in env and new in env and env[leg] != env[new] and not (foreign and canon == leg):
+            # a foreign reader's twin is derived from the other spelling by the parent's own fold (or is the stale
+            # twin the launcher's write overrides), so on either side of the rename: no conflict, not a use
+            if leg in env and new in env and env[leg] != env[new] and not foreign:
                 report.setdefault("conflicts", []).append((leg, new))
-            if leg in env and canon != leg and not (foreign and new in env and env[leg] == env[new]):
+            if leg in env and canon != leg and not (foreign and new in env):
                 report.setdefault("legacy", []).append(leg)
         if present == [canon] and (not foreign or leg == canon):
             continue

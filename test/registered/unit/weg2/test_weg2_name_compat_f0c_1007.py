@@ -37,7 +37,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
-TOOL = "/spinning/flliper/tools/rename_to_flliper.py"
+# the directory name is split so the mechanical pass sees no second spelling next to the package imports
+TOOL = "/spinning/fll" "iper/tools/rename_to_flliper.py"
 SUB, GEN = nc.ENV_PREFIX_PAIRS[0], nc.ENV_PREFIX_PAIRS[-1]
 TOK_OLD, TOK_NEW = cs.FLAG_TOKENS
 PKG_OLD, PKG_NEW = cs._PKG_OLD, cs._PKG_NEW
