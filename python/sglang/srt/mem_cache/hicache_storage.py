@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.canonical_page_store import (
     CanonicalAbstainWindow,
     kv_extents_for,
 )
+from sglang.srt.weg2 import moe_act_switch as _moe_act_switch
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.mem_cache.weg2_store_gates import (
     owner_write_covers_whole_file,
@@ -308,20 +309,15 @@ STORAGE_BATCH_SIZE = int(os.environ.get("SGLANG_HICACHE_STORAGE_BATCH", "128") o
 
 #: H88-D: the W4A8 switch, as H88-E registers it (flag ``--moe-act-int8 on|off`` ->
 #: ``server_args.moe_act_int8``; env ``SGLANG_MOE_ACT_INT8``). Read DEFENSIVELY
-#: (an attribute that does not exist yet is "off"); on = any source says on.
-MOE_ACT_INT8_ENV = "SGLANG_MOE_ACT_INT8"
-_MOE_ACT_INT8_ON = ("1", "on", "true", "yes", "int8")
+#: (an attribute that does not exist yet is "off") and with the RUNTIME's own
+#: spelling rules (``weg2.moe_act_switch``, shared with the launcher identity).
+MOE_ACT_INT8_ENV = _moe_act_switch.MOE_ACT_INT8_ENV
 
 
 def moe_act_int8_active(server_args: Any) -> bool:
-    def _on(v: Any) -> bool:
-        if isinstance(v, bool):
-            return v
-        return str("" if v is None else v).strip().lower() in _MOE_ACT_INT8_ON
-
-    return _on(getattr(server_args, "moe_act_int8", None)) or _on(
-        os.environ.get(MOE_ACT_INT8_ENV)
-    )
+    return _moe_act_switch.flag_value_on(
+        getattr(server_args, "moe_act_int8", None)
+    ) or _moe_act_switch.env_value_on(os.environ.get(MOE_ACT_INT8_ENV))
 
 
 def compute_model_identity_hash(

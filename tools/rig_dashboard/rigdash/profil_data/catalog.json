@@ -6497,7 +6497,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22096
+      "line": 22163
      }
     }
    },
@@ -7066,7 +7066,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22100
+      "line": 22167
      }
     }
    },
@@ -11276,7 +11276,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22152
+      "line": 22219
      }
     }
    },
@@ -18112,7 +18112,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23578
+      "line": 23645
      }
     }
    },
@@ -18816,7 +18816,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22857
+      "line": 22924
      }
     }
    },
@@ -27047,7 +27047,7 @@
     "baum": "nf",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23395
+    "line": 23462
    },
    "status": "kuratiert",
    "text": "Benennt die Census-Zeile, aus der eine Karte gepreist wird, die nicht per UUID in der Census-Datei steht: Liste <live>=<Census-UUID>, <live> = Karten-UUID, nvml<N> oder Klasse (RTX3080). Ohne Eintrag leiht der Start die schwerste Zeile der gleichen Klasse (sonst der ganzen Census) und verweigert das als HW-BORROWED, bis Force gesetzt ist.",
@@ -28185,7 +28185,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22295
+      "line": 22362
      }
     }
    },
@@ -85399,7 +85399,7 @@
   "kuratiert": 119,
   "unerklaert": 602
  },
- "tree_rev": "27b=65fc0e2076+nf=66a895898e+hebel2b",
+ "tree_rev": "27b=65fc0e2076+nf=6cb6580482+h88d",
  "trees": {
   "27b": {
    "entries": 2641,
@@ -85407,7 +85407,7 @@
   },
   "nf": {
    "entries": 2497,
-   "rev": "66a895898e+hebel2b"
+   "rev": "6cb6580482+h88d"
   }
  },
  "warnungen": []

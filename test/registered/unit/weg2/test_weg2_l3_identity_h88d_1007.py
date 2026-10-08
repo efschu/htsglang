@@ -96,6 +96,9 @@ def test_other_inputs_that_must_not_move_the_identity_do_not(tmp_path):
         dict(moe_act_int8="off"), dict(moe_act_int8=False), dict(moe_act_int8=""), dict(moe_act_int8=None),
         dict(moe_act_int8="0"), dict(env={"SGLANG_MOE_ACT_INT8": "0"}), dict(env={"SGLANG_MOE_ACT_INT8": "off"}),
         dict(env={"SGLANG_MOE_ACT_INT8": ""}), dict(env={}),
+        # not the runtime's spelling: EnvBool does not know on/int8 (unparsable -> default OFF at runtime), the flag is == "on"
+        dict(env={"SGLANG_MOE_ACT_INT8": "on"}), dict(env={"SGLANG_MOE_ACT_INT8": "int8"}),
+        dict(moe_act_int8="1"), dict(moe_act_int8="true"), dict(moe_act_int8="int8"),
     )):
         sub = tmp_path / f"v{i}"
         sub.mkdir()
@@ -142,18 +145,97 @@ def test_switch_on_on_the_live_identity_is_not_dc6a8c2062_and_names_the_field(tm
     assert ident == dict(LIVE_IDENT, moe_act="int8")
 
 
-def test_p_and_d_asymmetric_switch_is_a_third_identity_and_never_the_same(tmp_path):
-    for n in ("p", "d", "b"):
-        (tmp_path / n).mkdir()
-    # an --env-p/--env-d spec REPLACES the profile's own (the helper passes the profile's as the base), so give the full spec
+def test_p_and_d_asymmetric_switch_is_refused_by_name_never_a_third_identity(tmp_path):
+    """Review finding 3: the rank key suffix is per group, so P on / D off would make D miss every page P wrote."""
     argv = LAUNCH["argv"]
-    p_only = _abl_derived_identity(tmp_path / "p", env_p=_flag(argv, "--env-p") + ";SGLANG_MOE_ACT_INT8=1")
-    d_only = _abl_derived_identity(tmp_path / "d", env_d=_flag(argv, "--env-d") + ";SGLANG_MOE_ACT_INT8=1")
-    both = _abl_derived_identity(tmp_path / "b", moe_act_int8="on")
-    assert p_only["moe_act"] == "P=int8,D=off"
-    assert d_only["moe_act"] == "P=off,D=int8"
+    on = ";SGLANG_MOE_ACT_INT8=1"
+    for n in ("p", "d", "pe", "de"):
+        (tmp_path / n).mkdir()
+    cases = {
+        "p": dict(env_p=_flag(argv, "--env-p") + on),
+        "d": dict(env_d=_flag(argv, "--env-d") + on),
+        "pe": dict(extra_p=_flag(argv, "--extra-p") + " --moe-act-int8 on"),
+        "de": dict(extra_d=_flag(argv, "--extra-d") + " --moe-act-int8=on"),
+    }
+    for n, kw in cases.items():
+        with pytest.raises(SystemExit) as e:
+            _abl_derived_identity(tmp_path / n, **kw)
+        msg = str(e.value)
+        assert "REFUSED" in msg and "P and D must agree" in msg and "SGLANG_MOE_ACT_INT8" in msg, n
+        with pytest.raises(SystemExit):  # the boot-wide check main() runs for every boot (persistent L3 or not)
+            L.l3_moe_act_resolve(kw.get("extra_p", _flag(argv, "--extra-p")), kw.get("extra_d", _flag(argv, "--extra-d")),
+                                 kw.get("env_p", _flag(argv, "--env-p")), kw.get("env_d", _flag(argv, "--env-d")), None, {})
+    # both groups on (any source) is the one valid "on"; neither is the default
+    (tmp_path / "ok1").mkdir()
+    (tmp_path / "ok2").mkdir()
+    assert _abl_derived_identity(tmp_path / "ok1", moe_act_int8="on")["moe_act"] == "int8"
+    both = _abl_derived_identity(tmp_path / "ok2", env_p=_flag(argv, "--env-p") + on, env_d=_flag(argv, "--env-d") + on)
     assert both["moe_act"] == "int8"
-    assert len({L.l3_persist_dir_name(i) for i in (p_only, d_only, both)}) == 3
+    # a d_only boot has no group P: only D's value counts, and a P-only switch is no asymmetry there
+    assert L.l3_moe_act_resolve("", "--moe-act-int8 on", "", "", None, {}, d_only=True) is True
+    assert L.l3_moe_act_resolve("--moe-act-int8 on", "", "", "", None, {}, d_only=True) is False
+    assert L.l3_moe_act_resolve("", "", "", "", None, {}) is False
+
+
+# ---------------------------------------------------------------- one predicate = the runtime's reading (review finding 2)
+SPELLINGS = ["1", "0", "true", "True", "TRUE", "false", "yes", "YES", "y", "Y", "no", "n", "N", "on", "off", "int8", "", " 1", "2"]
+
+
+def _envbool(v):
+    from sglang.srt.environ import EnvBool
+
+    try:
+        return EnvBool(False).parse(v)
+    except ValueError:
+        return False  # EnvField.get(): an unparsable value warns and falls back to the default (OFF)
+
+
+@pytest.mark.parametrize("v", SPELLINGS)
+def test_env_spelling_launcher_rank_and_runtime_envbool_agree(v, monkeypatch):
+    runtime = _envbool(v)
+    assert L.l3_moe_act_active("", f"SGLANG_MOE_ACT_INT8={v}", None, {}) is runtime or v == " 1"  # the spec parser strips
+    assert L.l3_moe_act_active("", "", None, {"SGLANG_MOE_ACT_INT8": v}) is runtime
+    monkeypatch.setenv("SGLANG_MOE_ACT_INT8", v)
+    assert HS.moe_act_int8_active(_sa()) is runtime
+    # y/Y are on at runtime: launcher identity AND rank identity must move, not stay default
+    if runtime:
+        assert HS.compute_model_identity_hash(_sa()) != LIVE_RANK_HASH
+
+
+@pytest.mark.parametrize("v", ["on", "ON", "off", "1", "true", "y", "", "int8"])
+def test_flag_spelling_launcher_and_rank_agree_with_the_runtime_eq_on(v):
+    runtime = str(v).lower() == "on"  # moe_act_int8._requested: str(server_args.moe_act_int8).lower() == "on"
+    assert L.l3_moe_act_active(f"--moe-act-int8 {v}" if v else "", "", None, {}) is runtime
+    assert L.l3_moe_act_active("", "", v, {}) is runtime
+    assert HS.moe_act_int8_active(_sa(moe_act_int8=v)) is runtime
+
+
+def test_y_in_both_group_envs_moves_launcher_and_rank_identity_alike(tmp_path, monkeypatch):
+    argv = LAUNCH["argv"]
+    for y in ("y", "Y"):
+        sub = tmp_path / y
+        sub.mkdir()
+        ident = _abl_derived_identity(sub, env_p=_flag(argv, "--env-p") + f";SGLANG_MOE_ACT_INT8={y}",
+                                      env_d=_flag(argv, "--env-d") + f";SGLANG_MOE_ACT_INT8={y}")
+        assert ident["moe_act"] == "int8"
+        monkeypatch.setenv("SGLANG_MOE_ACT_INT8", y)
+        assert HS.compute_model_identity_hash(_sa(), include_parallel_vectors=False) != LIVE_RANK_HASH
+
+
+def test_the_two_predicates_are_one_module():
+    from sglang.srt.environ import EnvBool  # noqa: F401
+    from sglang.srt.weg2 import moe_act_switch as M
+
+    assert HS._moe_act_switch is M and L._moe_act_switch is M
+    assert [v for v in SPELLINGS if M.env_value_on(v)] == [v for v in SPELLINGS if _envbool(v) and v != " 1"]
+    assert L.L3_MOE_ACT_ENV == HS.MOE_ACT_INT8_ENV == M.MOE_ACT_INT8_ENV == "SGLANG_MOE_ACT_INT8"
+    assert M.MOE_ACT_INT8_FLAG == L.L3_MOE_ACT_FLAG == "--moe-act-int8"
+
+
+def test_p_and_d_rank_identity_is_one_value_when_the_switch_is_symmetric(monkeypatch):
+    """P and D ranks of one boot compute the key suffix from the same inputs -> the same hash (the launcher refuses the rest)."""
+    monkeypatch.setenv("SGLANG_MOE_ACT_INT8", "y")
+    assert HS.compute_model_identity_hash(_sa()) == HS.compute_model_identity_hash(_sa())
 
 
 def test_a_malformed_group_env_is_off_here_the_refusal_is_where_it_is_parsed():
@@ -197,14 +279,14 @@ def test_rank_identity_with_the_switch_differs_attr_and_env(monkeypatch):
     base_nov = HS.compute_model_identity_hash(_sa(), include_parallel_vectors=False)
     base_vec = HS.compute_model_identity_hash(_sa())
     assert base_nov == base_vec == LIVE_RANK_HASH  # no vectors set -> the two forms agree
-    for attr in ("on", "1", "true", "int8", True):
+    for attr in ("on", "ON", True):
         on = HS.compute_model_identity_hash(_sa(moe_act_int8=attr), include_parallel_vectors=False)
         assert on != base_nov, attr
         assert on == HS.compute_model_identity_hash(_sa(moe_act_int8=attr))
     # recipe with the extra part, written out independently
     parts = [FIX["rank_server_args"]["model_path"], "", "auto", "", "fp8_e4m3", "moe_act=int8"]
     assert HS.compute_model_identity_hash(_sa(moe_act_int8="on")) == hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-    for off in ("off", "0", "", None, False):
+    for off in ("off", "0", "", None, False, "1", "true", "int8"):
         assert HS.compute_model_identity_hash(_sa(moe_act_int8=off), include_parallel_vectors=False) == base_nov, off
     monkeypatch.setenv("SGLANG_MOE_ACT_INT8", "1")
     assert HS.compute_model_identity_hash(_sa(), include_parallel_vectors=False) != base_nov
@@ -294,5 +376,12 @@ def test_both_launcher_call_sites_pass_the_group_envs_and_the_flag():
         i = src.index(f"{var} = (l3_persist_identity(")
         call = src[i:i + 900]
         for needle in ('env_p=getattr(ns, "env_p", "") or ""', 'env_d=getattr(ns, "env_d", "") or ""',
-                       'moe_act_int8=getattr(ns, "moe_act_int8", None)'):
+                       'moe_act_int8=getattr(ns, "moe_act_int8", None)', 'd_only=bool(getattr(ns, "d_only", False))'):
             assert needle in call, (var, needle)
+
+
+def test_main_refuses_an_asymmetric_switch_before_the_identity_for_every_boot():
+    src = open(L.__file__).read()
+    i = src.index("    l3_moe_act_resolve(getattr(ns, \"extra_p\"")
+    assert i < src.index("    _l3_idx_ident = (l3_persist_identity(")
+    assert "if l3_persist_enabled()" not in src[i - 200:i]  # unconditional: not behind the persistent-L3 gate
