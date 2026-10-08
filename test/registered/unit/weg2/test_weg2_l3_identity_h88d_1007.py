@@ -177,6 +177,65 @@ def test_p_and_d_asymmetric_switch_is_refused_by_name_never_a_third_identity(tmp
     assert L.l3_moe_act_resolve("", "", "", "", None, {}) is False
 
 
+# ---------------------------------------------------------------- group env beats process env (fix round 2, finding 1)
+def _runtime_group_env(process_env, group_spec):
+    """What the group's rank really sees: build_env applies --env-p/--env-d LAST over the process env."""
+    merged = dict(process_env)
+    merged.update(L.parse_group_env(group_spec))
+    return L.l3_moe_act_active.__globals__["_moe_act_switch"].env_value_on(merged.get("SGLANG_MOE_ACT_INT8"))
+
+
+def test_group_env_decides_alone_when_it_carries_the_key():
+    off, on = "SGLANG_MOE_ACT_INT8=0", "SGLANG_MOE_ACT_INT8=1"
+    glob = {"SGLANG_MOE_ACT_INT8": "1"}
+    assert L.l3_moe_act_active("", off, None, glob) is False   # global export 1, group says 0 -> the group runs OFF
+    assert L.l3_moe_act_active("", on, None, {}) is True
+    assert L.l3_moe_act_active("", on, None, {"SGLANG_MOE_ACT_INT8": "0"}) is True  # group 1 beats global 0
+    assert L.l3_moe_act_active("", "FOO=1", None, glob) is True  # key absent in the group env -> process env counts
+    assert L.l3_moe_act_active("", "", None, glob) is True
+    # an unparsable group value is OFF at runtime and alone decides, however the process env reads
+    assert L.l3_moe_act_active("", "SGLANG_MOE_ACT_INT8=int8", None, glob) is False
+    # launcher == runtime merge for every combination
+    for pv in (None, "0", "1", "y", "off"):
+        for gv in (None, "0", "1", "y", "off", "int8"):
+            penv = {} if pv is None else {"SGLANG_MOE_ACT_INT8": pv}
+            spec = "" if gv is None else f"SGLANG_MOE_ACT_INT8={gv}"
+            assert L.l3_moe_act_active("", spec, None, penv) is _runtime_group_env(penv, spec), (pv, gv)
+
+
+def test_process_env_on_with_one_group_overridden_to_off_is_refused(tmp_path):
+    argv = LAUNCH["argv"]
+    glob = {"SGLANG_MOE_ACT_INT8": "1"}
+    off = ";SGLANG_MOE_ACT_INT8=0"
+    for n, (ep, ed) in {"p": (off, ""), "d": ("", off)}.items():
+        (tmp_path / n).mkdir()
+        kp, kd = _flag(argv, "--env-p") + ep, _flag(argv, "--env-d") + ed
+        with pytest.raises(SystemExit) as e:
+            L.l3_moe_act_resolve("", "", kp, kd, None, glob)
+        assert "REFUSED" in str(e.value) and "P and D must agree" in str(e.value), n
+        with pytest.raises(SystemExit):
+            _abl_derived_identity(tmp_path / n, env_p=kp, env_d=kd, env=glob)
+
+
+def test_process_env_on_and_both_groups_overridden_to_off_is_the_default_identity(tmp_path):
+    argv = LAUNCH["argv"]
+    glob = {"SGLANG_MOE_ACT_INT8": "1"}
+    off = ";SGLANG_MOE_ACT_INT8=0"
+    kp, kd = _flag(argv, "--env-p") + off, _flag(argv, "--env-d") + off
+    assert L.l3_moe_act_resolve("", "", kp, kd, None, glob) is False
+    ident = _abl_derived_identity(tmp_path, env_p=kp, env_d=kd, env=glob)
+    assert "moe_act" not in ident and ident == LIVE_IDENT
+    assert L.l3_persist_dir_name(ident) == FIX["dir_name"]
+
+
+def test_process_env_on_and_both_groups_on_is_the_switch_identity(tmp_path):
+    argv = LAUNCH["argv"]
+    on = ";SGLANG_MOE_ACT_INT8=1"
+    ident = _abl_derived_identity(tmp_path, env_p=_flag(argv, "--env-p") + on, env_d=_flag(argv, "--env-d") + on,
+                                  env={"SGLANG_MOE_ACT_INT8": "1"})
+    assert ident["moe_act"] == "int8"
+
+
 # ---------------------------------------------------------------- one predicate = the runtime's reading (review finding 2)
 SPELLINGS = ["1", "0", "true", "True", "TRUE", "false", "yes", "YES", "y", "Y", "no", "n", "N", "on", "off", "int8", "", " 1", "2"]
 

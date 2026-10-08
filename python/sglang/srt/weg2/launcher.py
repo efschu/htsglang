@@ -7605,15 +7605,21 @@ def l3_moe_act_active(extra: str = "", env_spec: str = "", flag: object = None,
     EnvBool true-set true/1/yes/y), never wider and never narrower: narrower is a
     store that mixes pages of two activation precisions (runtime W4A8, identity
     default), wider a store renamed for a switch that does nothing. A union over
-    the sources on purpose. Anything unparsable or absent is OFF (default)."""
+    the flag sources on purpose; for the ENV the group env wins over the process env (see below).
+    Anything unparsable or absent is OFF (default)."""
     if (_moe_act_switch.flag_value_on(_l3_extra_flag(extra, L3_MOE_ACT_FLAG))
             or _moe_act_switch.flag_value_on(flag)):
         return True
+    # ENV SOURCES ARE NOT A UNION: the runtime applies the group env LAST over the process env
+    # (build_env: "Applied LAST so an operator value is what the group runs"). A key present in the
+    # group env therefore decides alone (``--env-p SGLANG_MOE_ACT_INT8=0`` beats a global export of 1);
+    # the process env counts only when the group env does not carry the key.
     try:
-        if _moe_act_switch.env_value_on(parse_group_env(env_spec).get(L3_MOE_ACT_ENV)):
-            return True
+        genv = parse_group_env(env_spec)
     except ValueError:  # a malformed --env-p/-d is refused by name where it is parsed
-        pass
+        genv = {}
+    if L3_MOE_ACT_ENV in genv:
+        return _moe_act_switch.env_value_on(genv[L3_MOE_ACT_ENV])
     return _moe_act_switch.env_value_on((os.environ if env is None else env).get(L3_MOE_ACT_ENV))
 
 
