@@ -1948,24 +1948,29 @@ function gpuqStrip(d) {
     + (next.length ? ` <span class="muted">&middot; next: ${next.map(one).join(" &middot; ")}</span>` : "") + `</div>`;
 }
 // <!--DEV:END-->
-// Sessions (user 01.10. ~08:30Z): the front knows the session (SESSION-TRACE sess=<10-hex>), but writes it
-// only to the log -- per request the IPC currently carries only the open requests (front.outstanding_stalest). What
-// exists is shown; the rest is listed as fields, never taken from the log.
-const SESS_FIELDS = ["session_id (SESSION-TRACE sess, 10 hex)", "turn", "via (after_p | d_direct | d_single)", "ttft_ms", "queue_ms",
-  "prefill_ms + prefill_tokens (new, per group)", "cached_tokens per source (device / host / storage / told)", "common_prefix (SESSION-PREFIX)",
-  "decode_tokens + decode_ms", "context_tokens / kv_pages", "parks / resumes", "flip epochs during the request", "status, wall_s"];
+// Sessions (user 01.10. ~08:30Z, 08.10.): per session the origin IP and the current context size.  The sessions come from
+// the front's request_done events (ipcboot -> b.sessions, sessions.py): session_id = the 10-hex hash of the session id, the
+// context = context_tokens of its newest request.  The origin IP would be request_done.client_ip -- the front does not write
+// it yet (it keeps the session hash, never the peer), so the column shows "–" and the note names the writer.
+const SESS_IP_MISSING = "the front records the session hash but not the peer address: request_done has no client_ip, and behind the router :30099 the front would only see the router unless the router forwards X-Forwarded-For (front.py _sess_note / router.py _request_headers)";
 function sessionsHtml(d, shown, now) {
-  const rows = shown.flatMap((b) => {
-    const f = ((b.ipc || {}).front) || {};
-    return (f.outstanding_stalest || []).map((e) => Object.assign({model: lineOf(b)}, e));
-  });
-  const tbl = rows.length ? `<div class="tablewrap"><table><tr><th>Model</th><th>rid</th><th>where</th><th class="num">Age</th><th class="num">last token ago</th><th>Stream</th></tr>`
-    + rows.map((e) => `<tr><td>${esc(e.model)}</td><td class="mono">${esc(e.rid)}</td><td>${esc(e.where)}</td><td class="num">${ago(e.age_s)}</td><td class="num">${e.last_token_s == null ? "—" : ago(e.last_token_s)}</td><td>${e.stream ? "yes" : "no"}</td></tr>`).join("") + `</table></div>`
+  const rows = shown.flatMap((b) => ((b.sessions || {}).rows || []).map((r) => Object.assign({model: lineOf(b)}, r)));
+  const nReq = shown.reduce((a, b) => a + ((b.sessions || {}).n_requests || 0), 0);
+  const hidden = shown.some((b) => (b.sessions || {}).ip_hidden), haveIp = rows.some((r) => r.ip);
+  const ipCell = (r) => r.ip ? `<span class="mono">${esc(r.ip)}</span>${(r.ips || []).length > 1 ? ` <span class="muted" title="${esc(r.ips.join(", "))}">+${r.ips.length - 1}</span>` : ""}`
+    : `<span class="muted" title="${esc(hidden ? "hidden on the public view" : "not recorded: " + SESS_IP_MISSING)}">–</span>`;
+  const sess = rows.length ? `<div class="tablewrap"><table><tr><th>Model</th><th>Session</th><th>Origin IP</th><th class="num" title="context_tokens of the session's newest request (prompt + answer)">Context now (tokens)</th><th class="num">peak</th><th class="num">Requests</th><th>Last request</th><th>via</th></tr>`
+    + rows.map((r) => `<tr><td>${esc(r.model)}</td><td class="mono">${r.session ? esc(r.session) : '<span class="muted">(no session id)</span>'}</td><td>${ipCell(r)}</td>`
+      + `<td class="num"><b>${r.ctx == null ? "—" : fmt(r.ctx)}</b></td><td class="num muted">${r.ctx_max == null ? "—" : fmt(r.ctx_max)}</td>`
+      + `<td class="num">${fmt(r.n)}${r.turn ? ` <span class="muted">(turn ${fmt(r.turn)})</span>` : ""}</td><td>${r.last_ts ? ago(now - r.last_ts) + " ago" : "—"}</td><td>${esc(r.via || "—")}</td></tr>`).join("")
+    + `</table></div>` : `<div class="muted">no finished request in this boot yet</div>`;
+  const ipNote = haveIp ? "" : `<div class="stand warn"><b>Origin IP: ${hidden ? "hidden on the public view." : "not recorded."}</b> ${hidden ? "" : esc(SESS_IP_MISSING) + "."}</div>`;
+  const out = shown.flatMap((b) => ((b.ipc || {}).front || {}).outstanding_stalest ? ((b.ipc.front.outstanding_stalest) || []).map((e) => Object.assign({model: lineOf(b)}, e)) : []);
+  const open = out.length ? `<div class="tablewrap"><table><tr><th>Model</th><th>rid</th><th>where</th><th class="num">Age</th><th class="num">last token ago</th><th>Stream</th></tr>`
+    + out.map((e) => `<tr><td>${esc(e.model)}</td><td class="mono">${esc(e.rid)}</td><td>${esc(e.where)}</td><td class="num">${ago(e.age_s)}</td><td class="num">${e.last_token_s == null ? "—" : ago(e.last_token_s)}</td><td>${e.stream ? "yes" : "no"}</td></tr>`).join("") + `</table></div>`
     : `<div class="muted">no open request</div>`;
-  return `<div class="stand warn"><b>Session overview is missing in IPC.</b> The front knows the session per request (SESSION-TRACE, header X-Claude-Code-Session-Id
-    or metadata.user_id, as a 10-hex hash), but writes it only to its log. Needed per request is an event or VM point
-    <span class="mono">weg2_req</span> (session as label, rid as field) with: ${SESS_FIELDS.map(esc).join(" &middot; ")}.</div>
-    <h3 style="font-size:13px;margin:10px 0 6px">Open requests now <span class="muted">state.json front.outstanding_stalest (IPC)</span></h3>${tbl}`;
+  return `${ipNote}<h3 style="font-size:13px;margin:10px 0 6px">Sessions of the finished requests <span class="muted">state.json/events.jsonl request_done (IPC) &middot; ${fmt(nReq)} requests in this window, newest session first &middot; a request without session header is listed as one row</span></h3>${sess}
+    <h3 style="font-size:13px;margin:14px 0 6px">Open requests now <span class="muted">state.json front.outstanding_stalest (IPC) &middot; the open request carries no session id yet</span></h3>${open}`;
 }
 function overviewHtml(d, shown, now) {
   const lines = new Set(shown.map(lineOf));

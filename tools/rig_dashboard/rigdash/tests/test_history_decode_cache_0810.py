@@ -110,5 +110,31 @@ class TestInputTokenLevels(unittest.TestCase):
         self.assertEqual(stack[30], 0.0)               # and down to 0 again after the burst
 
 
+class TestSessions(unittest.TestCase):
+    """08.10.: per session the origin IP and the current context (the newest request's context_tokens)."""
+
+    REQ = [{"session_id": "aaaaaaaaaa", "turn": 1, "end_ts": 100.0, "context_tokens": 20000, "via": "d_direct"},
+           {"session_id": "aaaaaaaaaa", "turn": 2, "end_ts": 200.0, "context_tokens": 45000, "via": "after_p", "client_ip": "192.168.0.7"},
+           {"session_id": "bbbbbbbbbb", "turn": 1, "end_ts": 150.0, "context_tokens": 9000},
+           {"session_id": None, "end_ts": 120.0, "context_tokens": 1300}]
+
+    def test_context_is_the_newest_request_and_ip_is_never_invented(self):
+        from rigdash import sessions
+        v = sessions.sessions_view(self.REQ)
+        rows = {r["session"]: r for r in v["rows"]}
+        self.assertEqual([r["session"] for r in v["rows"]], ["aaaaaaaaaa", "bbbbbbbbbb", None])      # newest first
+        self.assertEqual((rows["aaaaaaaaaa"]["ctx"], rows["aaaaaaaaaa"]["n"], rows["aaaaaaaaaa"]["ip"]), (45000, 2, "192.168.0.7"))
+        self.assertIsNone(rows["bbbbbbbbbb"]["ip"])             # the front wrote no client_ip: no value, no guess
+        self.assertTrue(v["ip_known"])
+        self.assertFalse(sessions.sessions_view(self.REQ[2:])["ip_known"])
+
+    def test_public_view_hides_the_ips(self):
+        from rigdash import server, sessions
+        snap = {"boots": [{"sessions": sessions.sessions_view(self.REQ)}]}
+        pub = server.without_client_ips(snap)
+        self.assertTrue(all(r["ip"] is None for r in pub["boots"][0]["sessions"]["rows"]))
+        self.assertEqual(snap["boots"][0]["sessions"]["rows"][0]["ip"], "192.168.0.7")          # the shared snapshot is untouched
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -458,6 +458,15 @@ def lean_boot(b: dict) -> dict:
     return out
 
 
+def without_client_ips(snap: dict) -> dict:
+    """The public view (behind the proxy) never carries the origin IPs of the sessions (08.10.); the cached snapshot is shared
+    by every reader, so the boots are copied, not edited."""
+    out = dict(snap)
+    out["boots"] = [dict(b, sessions=dict(b["sessions"], ip_hidden=True, rows=[dict(r, ip=None, ips=[]) for r in b["sessions"]["rows"]]))
+                    if b.get("sessions") else b for b in snap.get("boots") or []]
+    return out
+
+
 def shown_boots(boots: list) -> list:
     """Same rule as the page: live (or container running), else the primary boot."""
     live = [b for b in boots if b.get("live") or ((b.get("container") or {}).get("State") == "running")]
@@ -784,7 +793,7 @@ def make_handler(app: App):
                     if zoom is not None or not series:
                         snap = app.snapshot(series, zoom)          # a zoomed stretch: its own computation
                         snap["via_proxy"] = self._via_proxy()
-                        return self._json(edition_snapshot(snap, app.edition))
+                        return self._json(edition_snapshot(without_client_ips(snap) if snap["via_proxy"] else snap, app.edition))
                     from urllib.parse import parse_qs, urlsplit
                     q = parse_qs(urlsplit(self.path).query)
                     lean = (q.get("lean") or ["0"])[0] == "1"
@@ -794,6 +803,8 @@ def make_handler(app: App):
 
                     def make(snap, lean=lean, dev=dev, via=via):
                         x = dict(lean_snapshot(snap, dev) if lean else snap, via_proxy=via)
+                        if via:
+                            x = without_client_ips(x)
                         return redact.guard(json.dumps(edition_snapshot(x, app.edition), default=str)).encode("utf-8")
                     gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
                     body = app.live_cache.get(variant, make, gz)
