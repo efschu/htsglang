@@ -1078,6 +1078,16 @@ class Envs:
     # Q-697c (a), without its dual gate. Off = the old silent stop, byte for
     # byte.
     SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL = EnvBool(False)
+    # MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D
+    # mamba anchor arena (32 slots, 6 staging) held only END and deepest
+    # anchors, so the flush / park-first spill found victim=none (`#1427
+    # ARENA-DROP ... slot_bytes=58834944 freed=0` x59, `WEG2-ANCHOR-LOST
+    # at=flush n=15` incl. the END anchor 112896 of the parked weg2-24-128).
+    # On: with no victim by the old rules, the shallowest settled END/deepest
+    # anchor OFF the claimer's park chain is secured to L3 first
+    # (arena_secure_to_disk) and then released -- never one whose copy could
+    # not be secured. Off = the old answer, byte for byte.
+    SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT = EnvBool(False)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).
