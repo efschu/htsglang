@@ -3314,6 +3314,13 @@ class Envs:
     # NVFP4-SM8X-MARLIN-GUARD (26.09.): SM8X=marlin serves wrong output on the
     # current line and is refused; "1" runs it anyway, for DIAGNOSIS ONLY.
     SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN = EnvBool(False)
+    # --moe-act-int8 on (H88, PLAN-H88-W4A8-1007): the compressed-tensors int4
+    # (WNA16) MoE experts take int8 activations (W4A8) instead of 16-bit ones
+    # (W4A16). Env form of the flag, either of the two switches it on; default
+    # off = the W4A16 Marlin path, argv and env unchanged. This tree has no W4A8
+    # MoE scheme yet: with the switch on the MoE scheme dispatch raises a
+    # RuntimeError (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).
+    SGLANG_MOE_ACT_INT8 = EnvBool(False)
     # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
     #
     # WHAT IS BROKEN. On sm80..88 an fp8 checkpoint has exactly one GEMM
