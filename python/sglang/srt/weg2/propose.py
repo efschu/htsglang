@@ -937,6 +937,24 @@ def propose(hardware: Any, modell: Mapping[str, Any], form: str = "flip", ziele:
         rec.add("--x-ceiling-tokens", group="-", old=None, new=None, state=R.VORGESCHLAGEN,
                 herkunft="nicht im Profil %s: Launcher-Standard 0 (aus)" % bname, grund=xc_expl, in_argv=False, policy="knob")
 
+    # --- H88-E: the W4A8 MoE switch is a scalar of the profile (no card decides it): kept as the profile has it, with its origin ------
+    # Every place the profile can say it: the launcher environment, --env-p/--env-d, and the flag inside --extra-p/--extra-d.  Nothing
+    # is added where the profile says nothing (the release profiles stay byte-identical); a place that says it is recorded as ONE
+    # value whose origin is the profile, never changed by the planner.
+    moe_act_on = False
+    for kind, group, name in (("proc", "-", R.MOE_ACT_INT8_ENV), ("env", "p", R.MOE_ACT_INT8_ENV), ("env", "d", R.MOE_ACT_INT8_ENV),
+                              ("extra", "p", R.MOE_ACT_INT8_FLAG), ("extra", "d", R.MOE_ACT_INT8_FLAG)):
+        cur = _get(la, kind, group, name)
+        if cur is None:
+            continue
+        on = R.parse_switch(cur)
+        moe_act_on = moe_act_on or bool(on)
+        rec.add(slot_label(kind, group, name), group=group, old=cur, new=cur, state=R.VORGESCHLAGEN,
+                herkunft="vom Profil %s (unveraendert; ein Schalter der Form, keine Kartenmessung)" % bname,
+                grund=R.MOE_ACT_INT8_GROUND + ("" if on is not None else " Wert unlesbar (erwartet 1/0 bzw. on/off)."), policy="scalar")
+    if moe_act_on:
+        rec.hinweise.append(R.MOE_ACT_INT8_HINT)
+
     # --- the Dual form (AP-E): what is specific to P and D awake together on the same cards -------------------------------------
     dual = None
     if form == "dual":

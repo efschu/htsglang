@@ -16594,6 +16594,84 @@
    "text": "",
    "type": "str"
   },
+  "--moe-act-int8": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": [
+    "on",
+    "off"
+   ],
+   "cost": "unbelegt (kein Metallbeweis)",
+   "default": "off",
+   "depends": [
+    {
+     "baeume": [
+      "nf"
+     ],
+     "beleg": {
+      "anker": "require_w4a8_moe_scheme()",
+      "aufloesung": "andere_linie",
+      "datei": "python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py",
+      "zeile": 953,
+      "zeile_hinweis": 953
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Der Schalter wirkt nur im Zweig der int4-Experten eines compressed-tensors-Checkpoints (WNA16-MoE, Quantisierung compressed-tensors, die --quantization nennt oder aus dem Checkpoint kommt): dort wird er beim Wählen des MoE-Schemas gelesen, bei jedem anderen Checkpoint bewirkt er nichts. Die Dual-Form (R2 des Planer-Plans: nur 27B-Linie) ist nicht betroffen (Plan H88 D2: Umfang sind die MoE-Experten des NF-Modells).",
+     "kante": "K132",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Der Schalter wirkt nur im Zweig der int4-Experten eines compressed-tensors-Checkpoints (WNA16-MoE, Quantisierung compressed-tensors, die --quantization nennt oder aus dem Checkpoint kommt): dort wird er beim Wählen des MoE-Schemas gelesen, bei jedem anderen Checkpoint bewirkt er nichts. Die Dual-Form (R2 des Planer-Plans: nur 27B-Linie) ist nicht betroffen (Plan H88 D2: Umfang sind die MoE-Experten des NF-Modells).",
+     "to": "--quantization",
+     "to_kind": "flag",
+     "wert": null
+    },
+    {
+     "baeume": [
+      "nf"
+     ],
+     "beleg": {
+      "anker": "def compute_model_identity_hash(",
+      "aufloesung": "andere_linie",
+      "datei": "python/sglang/srt/mem_cache/hicache_storage.py",
+      "zeile": 309,
+      "zeile_hinweis": 309
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Mit dem Schalter an rechnen die Experten anders; der Plan (H88 D4) gibt der L3-Identität (die Modell-Identität der HiCache-Ablage, compute_model_identity_hash, und die des Launchers, l3_persist_identity) dafür ein eigenes Feld, so dass das erste Boot dieser Form einmal alle L3-Seiten neu berechnet. Dieses Feld ist in diesem Baum noch nicht verdrahtet (H88-D, unbelegt bis zu dessen Merge): belegt ist hier nur die Stelle, an der die Identität gebaut wird.",
+     "kante": "K134",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "Mit dem Schalter an rechnen die Experten anders; der Plan (H88 D4) gibt der L3-Identität (die Modell-Identität der HiCache-Ablage, compute_model_identity_hash, und die des Launchers, l3_persist_identity) dafür ein eigenes Feld, so dass das erste Boot dieser Form einmal alle L3-Seiten neu berechnet. Dieses Feld ist in diesem Baum noch nicht verdrahtet (H88-D, unbelegt bis zu dessen Merge): belegt ist hier nur die Stelle, an der die Identität gebaut wird.",
+     "to": "--hicache-storage-backend",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
+   "gain": "unbelegt (kein Metallbeweis)",
+   "group": "Quantisierung",
+   "help": "H88 (PLAN-H88-W4A8-1007): the compressed-tensors int4 (WNA16) MoE experts take int8 activations (W4A8) instead of 16-bit ones (W4A16). Default off = the W4A16 Marlin path, argv and env unchanged. Environment form: SGLANG_MOE_ACT_INT8=1 (either of the two switches it on). This tree has no W4A8 MoE scheme yet: with the switch on the MoE scheme dispatch raises a RuntimeError (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).",
+   "id": "--moe-act-int8",
+   "kind": "flag",
+   "level": "experte",
+   "name": "--moe-act-int8",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "server_args.py moe_act_int8 (help=); environ.py SGLANG_MOE_ACT_INT8 (Kommentar); layers/quantization/moe_act_int8.py (NO_SCHEME_MESSAGE)",
+   "scope": "server",
+   "source": {
+    "baum": "nf",
+    "file": "server_args.py",
+    "kind": "argparse",
+    "line": 4288
+   },
+   "status": "kuratiert",
+   "text": "H88: Die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard off = der W4A16-Marlin-Pfad, Argv und Umgebung unverändert. Umgebungsform: SGLANG_MOE_ACT_INT8=1; einer der beiden Schalter genügt. Dieser Baum hat noch kein W4A8-MoE-Schema: mit dem Schalter an bricht der Start an der ersten MoE-Schicht mit RuntimeError ab (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).",
+   "type": "str"
+  },
   "--moe-dense-tp-size": {
    "baeume": [
     "27b",
@@ -38339,7 +38417,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4540
+    "line": 4547
    },
    "status": "unerklaert",
    "text": "",
@@ -38657,7 +38735,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4539
+    "line": 4546
    },
    "status": "geerntet",
    "text": "",
@@ -48569,6 +48647,58 @@
    },
    "status": "erklaert",
    "text": "Ersetzt den Inhalts-Hash von Bildern durch eine Zufalls-ID; mit --weg2-vision transient wird das abgelehnt, weil D dann das Bild nie wiederfindet.",
+   "type": "EnvBool"
+  },
+  "SGLANG_MOE_ACT_INT8": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "unbelegt (kein Metallbeweis)",
+   "default": "False",
+   "depends": [
+    {
+     "baeume": [
+      "nf"
+     ],
+     "beleg": {
+      "anker": "require_w4a8_moe_scheme()",
+      "aufloesung": "andere_linie",
+      "datei": "python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py",
+      "zeile": 953,
+      "zeile_hinweis": 953
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "Dieselbe Voraussetzung wie beim Flag --moe-act-int8: gelesen wird der Schalter nur im WNA16-MoE-Zweig eines compressed-tensors-Checkpoints (Wahl des MoE-Schemas); die Dual-Form ist nicht betroffen (Plan H88 D2, R2).",
+     "kante": "K133",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "Dieselbe Voraussetzung wie beim Flag --moe-act-int8: gelesen wird der Schalter nur im WNA16-MoE-Zweig eines compressed-tensors-Checkpoints (Wahl des MoE-Schemas); die Dual-Form ist nicht betroffen (Plan H88 D2, R2).",
+     "to": "--quantization",
+     "to_kind": "flag",
+     "wert": null
+    }
+   ],
+   "gain": "unbelegt (kein Metallbeweis)",
+   "group": "Quantisierung",
+   "help": "--moe-act-int8 on (H88, PLAN-H88-W4A8-1007): the compressed-tensors int4 (WNA16) MoE experts take int8 activations (W4A8) instead of 16-bit ones (W4A16). Env form of the flag, either of the two switches it on; default off = the W4A16 Marlin path, argv and env unchanged. This tree has no W4A8 MoE scheme yet: with the switch on the MoE scheme dispatch raises a RuntimeError (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).",
+   "id": "SGLANG_MOE_ACT_INT8",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_MOE_ACT_INT8",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "environ.py SGLANG_MOE_ACT_INT8 (Kommentar); server_args.py moe_act_int8 (help=); Profil docker/profiles/nf-int4-w4a8.env (Kopfkommentar)",
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3299
+   },
+   "status": "kuratiert",
+   "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat noch kein W4A8-MoE-Schema: mit dem Schalter an bricht der Start an der ersten MoE-Schicht mit RuntimeError ab (MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree).",
    "type": "EnvBool"
   },
   "SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE": {
@@ -70953,7 +71083,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3575
+      "line": 3582
      }
     }
    },
@@ -71312,7 +71442,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4247
+      "line": 4254
      }
     }
    },
@@ -72152,7 +72282,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4227
+      "line": 4234
      }
     }
    },
@@ -75290,7 +75420,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4347
+      "line": 4354
      }
     }
    },
@@ -77410,7 +77540,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4156
+      "line": 4163
      }
     }
    },
@@ -84608,7 +84738,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4334
+      "line": 4341
      }
     }
    },
@@ -85333,6 +85463,7 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
+    "andere_linie": 3,
     "eindeutig": 119,
     "nah": 12
    }
@@ -85341,6 +85472,7 @@
    "27b": {
     "problem": [],
     "status": {
+     "andere_linie": 3,
      "eindeutig": 119,
      "nah": 12
     }
@@ -85349,7 +85481,7 @@
     "problem": [],
     "status": {
      "andere_linie": 44,
-     "eindeutig": 77,
+     "eindeutig": 80,
      "nah": 10
     }
    }
@@ -85357,10 +85489,10 @@
   "datei": "kantenkatalog_1004.json",
   "geladen": true,
   "grund": "",
-  "kanten_belegt": 131,
-  "kanten_gesamt": 131,
+  "kanten_belegt": 134,
+  "kanten_gesamt": 134,
   "kanten_ohne_beleg": 25,
-  "neu": 80,
+  "neu": 83,
   "rel_abweichend": [
    "K12",
    "K19",
@@ -85389,25 +85521,25 @@
    "abweichung": 43,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 36
+   "nur_nf": 38
   },
-  "entries": 2695,
-  "envs": 1818,
+  "entries": 2697,
+  "envs": 1819,
   "erklaert": 304,
-  "flags": 862,
+  "flags": 863,
   "geerntet": 1670,
-  "kuratiert": 119,
+  "kuratiert": 121,
   "unerklaert": 602
  },
- "tree_rev": "27b=65fc0e2076+nf=66a895898e+hebel2b",
+ "tree_rev": "27b=07c20a35e5+nf=6cb6580482+h88e",
  "trees": {
   "27b": {
    "entries": 2641,
-   "rev": "65fc0e2076"
+   "rev": "07c20a35e5"
   },
   "nf": {
-   "entries": 2497,
-   "rev": "66a895898e+hebel2b"
+   "entries": 2499,
+   "rev": "6cb6580482+h88e"
   }
  },
  "warnungen": []
