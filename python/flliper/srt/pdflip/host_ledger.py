@@ -1534,7 +1534,19 @@ def arena_fill_gib(tag: Optional[str], root: str = "/dev/shm") -> Optional[Tuple
     49.72 -> 53.95 GiB over the serving of boot ...z30x2bar1dauer09291358
     (arena 5461 x 768 KiB + 32 x 56 MiB = 5.75 GiB) with anon flat at
     24.5 GiB, and W98 fired on that rise at cg_room 2.73 GiB. Two ``stat``
-    calls per file; never raises."""
+    calls per file; never raises.
+
+    W98 int16 (boot ...dauer10080701, front 09:47:35.906): the arena's
+    ``handoff/`` subdirectory (``FLLIPER_HICACHE_ARENA_DIR/handoff``, where
+    tail_handoff publishes the D park's tails and handoff.py the leg-1 ids) is
+    the SAME writer and is counted here. Before, the scan stopped at the top
+    level and skipped the directory, so the D park of an ordinary D->P flip --
+    15 tail parts, 0.370 GiB at 09:47:30, removed again by P's consume (memts
+    shmem 61.51 -> 60.96 GiB five seconds later) -- read as an UNBOUNDED writer
+    still rising, and W98 tore a serving boot down with the cgroup 13.97 GiB
+    below its memory.max. A hand-off file is complete once written, so it adds
+    to ``touched`` and ``size`` alike (nothing left to write); its growth is
+    the park's, which ends with the park."""
     if not tag:
         return None
     d = os.path.join(root, f"pdflip-arena-{tag}")
@@ -1542,10 +1554,16 @@ def arena_fill_gib(tag: Optional[str], root: str = "/dev/shm") -> Optional[Tuple
         names = os.listdir(d)
     except OSError:
         return None
+    paths = [os.path.join(d, n) for n in names]
+    try:
+        hd = os.path.join(d, "handoff")
+        paths += [os.path.join(hd, n) for n in os.listdir(hd)]
+    except OSError:
+        pass
     touched = size = 0
-    for n in names:
+    for p in paths:
         try:
-            st = os.stat(os.path.join(d, n))
+            st = os.stat(p)
         except OSError:
             continue
         if not (st.st_mode & 0o170000) == 0o100000:
