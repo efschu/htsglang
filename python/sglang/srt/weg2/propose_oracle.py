@@ -1014,7 +1014,11 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
             return t
         pre, argv = [_sub(t) for t in pre], [_sub(t) for t in argv]
         env = {k: _sub(str(v)) for k, v in env.items()}
-    if farmed and "--weg2-xchg-census" in argv and "--weg2-xchg-census-foreign" not in argv:
+    # rename transition (compat_shims): a profile in either flag spelling names the census; the flag added is the launcher's own
+    from sglang.srt.compat_shims import canonical_flags
+
+    named = canonical_flags(argv)
+    if farmed and "--weg2-xchg-census" in named and "--weg2-xchg-census-foreign" not in named:
         pre += ["--weg2-xchg-census-foreign"]
         notes.append("--weg2-xchg-census-foreign added (the census names the registry path, the farm is another path)")
     final = pre + argv + list(extra_args)

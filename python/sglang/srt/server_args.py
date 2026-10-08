@@ -20107,6 +20107,13 @@ class ServerArgs:
             "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
 
+        # rename transition (compat_shims): a flip-subsystem flag of this parser is also accepted under the
+        # other spelling, same dest. ServerArgs defines none today (the flip flags live in the launcher
+        # parser): registration only, nothing to alias until one is added.
+        from sglang.srt.compat_shims import register_flag_aliases
+
+        register_flag_aliases(parser)
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI

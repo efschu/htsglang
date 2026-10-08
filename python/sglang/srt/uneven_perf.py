@@ -90,6 +90,7 @@ logger = logging.getLogger(__name__)
 #: topped up, never discarded -- see ``_PROFILE_VERSION_FIELDS``.
 PROFILE_VERSION = 3
 PROFILE_CACHE_DIR = os.path.expanduser("~/.cache/sglang")
+from sglang.srt.compat_shims import cache_dirs as _cache_dirs, read_fallback as _read_fallback  # noqa: E402  rename transition
 
 #: Probe GROUPS: the per-GPU keys one measurement pass produces. The stage-0
 #: probe can run any subset of them, which is what makes a version bump
@@ -1719,6 +1720,8 @@ def _load_profile(path: str, driver: str, uuids: Sequence[str]) -> Optional[dict
     """A cached profile from ``path`` whose rig key matches, else None. The
     schema version is NOT checked here -- the caller decides between using and
     migrating it."""
+    # rename transition (compat_shims): a profile measured under the other name is read, not re-probed
+    path = _read_fallback(path)
     if not os.path.exists(path):
         return None
     try:
@@ -1888,14 +1891,23 @@ def _cached_profile_for_view(uuids: Sequence[str], driver: str) -> Optional[dict
     if not want:
         return None
     best = None  # (-extra, mtime, profile)
-    try:
-        names = os.listdir(PROFILE_CACHE_DIR)
-    except OSError:
+    # rename transition (compat_shims): the cache dir of the other name is scanned too (first one wins on a name)
+    entries: List[Tuple[str, str]] = []
+    seen_names = set()
+    for cache_dir in _cache_dirs(PROFILE_CACHE_DIR):
+        try:
+            for name in os.listdir(cache_dir):
+                if name not in seen_names:
+                    seen_names.add(name)
+                    entries.append((cache_dir, name))
+        except OSError:
+            continue
+    if not entries:
         return None
-    for name in names:
+    for cache_dir, name in entries:
         if not (name.startswith("hw_profile-") and name.endswith(".json")):
             continue
-        path = os.path.join(PROFILE_CACHE_DIR, name)
+        path = os.path.join(cache_dir, name)
         try:
             with open(path) as f:
                 profile = json.load(f)
