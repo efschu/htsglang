@@ -1076,6 +1076,16 @@ class Envs:
     # (R12) only, never while a D park records its refusals (HY). Off = every
     # refused claim is made as before.
     FLLIPER_PDFLIP_ENABLE_SWEEP_FULL_ARENA_SKIP = EnvBool(True)
+    # W3-HOST-LEAF (NF int22, P 18:33:37-18:34:20Z, boot 1008_171755): the W3
+    # spill found candidates=0 on all three stages -- it releases only host
+    # copies of device-resident nodes; the full KV arena freed nothing for a
+    # claim (ARENA-DROP freed=0). On (local-PP floor only, as UD-H): the 27B
+    # line's Q-697c host-only spill, ported (pdflip/host_only_spill.py): host-only
+    # H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257),
+    # then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs
+    # the spill's arena pool (on hybrid boots
+    # FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL). Off = the old spill.
+    FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES = EnvBool(False)
     # W3-ANCHOR-POOL (NF int20 1008_135412, P PP0 13:58-14:01): the W3-ARENA
     # spill (UnifiedRadixCache._w3_arena_spill) stopped at its first gate on
     # every hybrid boot -- the KV host pool is a HostPoolGroup whose
