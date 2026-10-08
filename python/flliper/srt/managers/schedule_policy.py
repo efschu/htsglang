@@ -857,6 +857,54 @@ from flliper.srt.mem_cache.common import (  # F1
 )
 
 
+@contextmanager
+def _form_a_admit_taken_room(tree_cache, admit_taken: bool):
+    """H98e (NF xc D 21:37:29Z 07.10., pdflip-130-2093 -> pdflip-130-2092; the
+    WURZEL behind H98d): the room rule of a load-back whose group ADMIT is
+    already taken, applied to its FIRST attempt.
+
+    ``admit_taken``: this rank read the H105 verdict BEFORE its load-back and
+    it was ADMIT -- a worker off the token cut, every rank on it (H105d
+    gathers before any load-back). The admission is then decided; what is
+    left is room, and H105c/H105d already answer that from the LIVE pool with
+    a shortfall-only eviction (``_form_a_load_back_floor`` under
+    ``_h105c_follow_room``). The first attempt used to go through the
+    pass-published, ledger-charged floor instead -- published once per
+    iteration, debited for allocations (#694), never credited for frees, so
+    it can sit below the live pool. On the token cut H105d had just proven
+    the live pool held these rows on every rank, yet the floor refused, and
+    the refusal ran the xsn285 drain --
+    ``evict(num_tokens=evictable_size())``, EVERY evictable leaf -- before
+    H105c's retry loaded from the very room that had been there all along
+    (D log 21:37:29: ``EVICT-FRONTIER-CENSUS request=168832`` on every rank,
+    then ``H105c FORM-A FOLLOW-ROOM rid=pdflip-130-2093 kv_tokens=49280
+    evicted=0 available=142464``). The drain took the device tail of
+    pdflip-130-2092, whose depth the pass had voted (175104) but not yet
+    admitted; the full mamba arena backed it up KV-only (P-FUND), the anchor
+    was gone, and the H98 depth went stale (H98d's death).
+
+    On (switch ``FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST``): no drain for
+    room that exists; a real shortfall is evicted in LRU order -- the pass's
+    vote probes just refreshed every voted path, so they go last -- and only
+    a live pool that still cannot hold the rows reaches the xsn285 branch and
+    H105c's retry, as before. The host-first path (H105b/H106: the host
+    loads back BEFORE its verdict) is untouched, as is every non-Form-A
+    boot (no verdict callable -> ``admit_taken`` False)."""
+    if not admit_taken or tree_cache is None:
+        yield
+        return
+    from flliper.srt.environ import envs
+
+    if not envs.FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST.get():
+        yield
+        return
+    tree_cache._h105c_follow_room = True
+    try:
+        yield
+    finally:
+        tree_cache._h105c_follow_room = False
+
+
 def _h105c_follow(adder, req, lb_extent, follow, new_indices) -> torch.Tensor:
     """H105c (rc12z30g D 23:23:28, pdflip-180-304): a load-back that served 0
     rows under an adopted anchor, on a rank that already TOOK the group's
@@ -2937,18 +2985,24 @@ class PrefillAdder:
                 _h106_d0 = int(
                     getattr(self.tree_cache, "_pdflip_loadback_drained_total", 0) or 0
                 )
-                new_indices, req.last_node = self.tree_cache.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        # THE TOLD EXTENT, NOT THIS RANK'S OWN HIT. On
-                        # `pp_size <= 1` the two are the same value by
-                        # construction (`_pp_load_back_extent` returns the
-                        # local hit there), so upstream's path is byte-for-byte
-                        # what it was.
-                        host_hit_length=_lb_extent,
-                        req=req,
+                # H98e: past a gathered/followed ADMIT the load-back decides
+                # its room from the live pool on the FIRST attempt (H105c's
+                # follow-room), never through the xsn285 full drain.
+                with _form_a_admit_taken_room(
+                    self.tree_cache, _fa_follow is not None and not _fa_host_first
+                ):
+                    new_indices, req.last_node = self.tree_cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=req.best_match_node,
+                            # THE TOLD EXTENT, NOT THIS RANK'S OWN HIT. On
+                            # `pp_size <= 1` the two are the same value by
+                            # construction (`_pp_load_back_extent` returns the
+                            # local hit there), so upstream's path is
+                            # byte-for-byte what it was.
+                            host_hit_length=_lb_extent,
+                            req=req,
+                        )
                     )
-                )
                 PDFLIP_ADMIT_T["lb_ms"] += (time.perf_counter() - _lb_t0) * 1000.0
                 if _fa_host_first:
                     req._h106_host_drained = max(
