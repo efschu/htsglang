@@ -1,0 +1,10 @@
+PROFILE nf-h91-dpr-sa-vis
+OLD  tree fd9bf48fe9 (pre-rename)   profile file nf-h91-dpr-sa-vis.env.alt (pure old-spelling chain)
+NEW  tree d6e3feb6c1 (renamed)      profile file nf-h91-dpr-sa-vis.env
+BOUNDARY old: refusal W128   [EXIT=1]
+BOUNDARY new: refusal W128   [EXIT=1]
+PROFILE_ARGS folded: equal
+compile warnings dropped (fresh checkout, not launcher output): old=2 new=0
+OTHER lines: old=26 new=26  equal after name folding=26  equal except digits (live-box readings/timings)=0  matched by skeleton=26
+RESIDUAL old-side 0 (German prose 0, other 0)   new-side 0
+VERDICT OK: 0 diff modulo names (up to the boundary above)

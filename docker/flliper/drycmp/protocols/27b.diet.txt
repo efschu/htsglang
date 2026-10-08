@@ -1,0 +1,10 @@
+PROFILE 27b.diet
+OLD  tree dab894b021 (pre-rename)   profile file 27b.diet.env.alt (pure old-spelling chain)
+NEW  tree 67366ac820 (renamed)      profile file 27b.diet.env
+BOUNDARY old: refusal: config.json of the model is invisible on this box   [EXIT=1]
+BOUNDARY new: refusal: config.json of the model is invisible on this box   [EXIT=1]
+PROFILE_ARGS folded: equal
+compile warnings dropped (fresh checkout, not launcher output): old=0 new=0
+OTHER lines: old=11 new=11  equal after name folding=11  equal except digits (live-box readings/timings)=0  matched by skeleton=11
+RESIDUAL lines old-side 0  new-side 0 (full lines first, then the word-level pairing)
+VERDICT OK: 0 diff modulo names (up to the boundary above)

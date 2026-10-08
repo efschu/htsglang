@@ -4,6 +4,7 @@ usage: profconv.py [--src /spinning/gpu-arb/docker/profiles_release] [--dst <kit
        profconv.py --tree-out <tree>/docker/flliper [--check]       (F0-G: the release set INTO the tree, with *.env.alt)
        profconv.py --list-live [--src ...] [--src2 ...]            (F0-G: the live files that need converting, one per line)
        profconv.py --convert-live [--src ...] [--src2 ...] [--apply]   (F0-G: convert the live dirs IN PLACE: X.env -> X.env.alt + new X.env)
+       profconv.py --rollback-live [--src ...] [--src2 ...] [--apply]  (F0-G: the way back: X.env := the old file from X.env.alt)
 
 Die Umsetzung ist rename_to_flliper.rewrite_all(text, is_py=False, weg2=True, ident-map) -- dieselbe Funktion, mit der das
 Kit den Baum umbenennt (gegengeprueft: die 28.09.-Stande 27b-base.env ergeben byte-gleich die alte profconv/27b-base.env).
@@ -43,7 +44,13 @@ PLAN2 = [
 AUX = ["27b-nvfp4.graphcal.json", "27b-nvfp4.pchunk.json"]
 # F0-G: data files of the release dir that are not read by a release profile but travel with the set (the X-curve file the Dashboard/launcher reads)
 AUX_TREE = AUX + ["27b.xcurves.json"]
-ALT = ".alt"          # F0-G: <profile>.env.alt = the old file, byte for byte, next to the converted <profile>.env
+ALT = ".alt"          # F0-G: <profile>.env.alt = the old file, next to the converted <profile>.env
+# F0-G fix round 1: a profile that sources a sibling (`source "$(dirname "${BASH_SOURCE[0]}")/27b-base.env"`) would, as a .alt, source the
+# CONVERTED sibling (mixed spelling: the old loop looks for the old flag, the new base delivers the new one). So the .alt is the old file
+# with exactly ONE kind of line changed: the sibling-source line names `<sibling>.env.alt`. alt_text()/from_alt() are the two directions;
+# from_alt(alt_text(x)) == x byte for byte, and a .alt run is a pure old-spelling run.
+SIB_SRC = re.compile(r'^(\s*source\s+"\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)/[A-Za-z0-9._-]+\.env)(")', re.M)
+SIB_SRC_ALT = re.compile(r'^(\s*source\s+"\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)/[A-Za-z0-9._-]+\.env)\.alt(")', re.M)
 # a pre-rename spelling: SGLANG_* (HTSGLANG_* is the product env and stays: the letter in front excludes it), --weg2-* flags, WEG2-* log
 # markers, the sglang.srt package path. Host paths and evidence names (/spinning/gpu-arb/weg2, boot_weg2_*) are R2 and are not matched.
 # (written in pieces: this file is itself a text file the rename kit rewrites -- a whole legacy token here would be renamed along with the tree)
@@ -53,6 +60,23 @@ OLD_NAME_RE = re.compile(r"(?<![A-Za-z])SG" r"LANG_|--we" r"g2-|(?<![A-Za-z_])WE
 def convert(text, imap):
     """The conversion function of the kit (rename_to_flliper.rewrite_all) -- ONE function for profiles and tree."""
     return R.rewrite_all(text, False, True, imap)[0]
+
+
+def alt_text(old):
+    """The old file as <profile>.env.alt: only the sibling-source lines point at the sibling's .alt (see SIB_SRC)."""
+    return SIB_SRC.sub(r"\1.alt\2", old)
+
+
+def from_alt(alt):
+    """Inverse of alt_text(): the old file byte for byte."""
+    return SIB_SRC_ALT.sub(r"\1\2", alt)
+
+
+def read_old(path):
+    """The old-spelling text of a profile: <path>.alt (inverse-mapped) when the profile was converted in place, else the file itself."""
+    if os.path.exists(path + ALT):
+        return from_alt(open(path + ALT, encoding="utf-8").read())
+    return open(path, encoding="utf-8").read()
 
 
 def old_name_lines(text):
@@ -76,9 +100,9 @@ def tree_out(a, imap):
     jobs = [(os.path.join(a.src, f), os.path.join(a.tree_out, "profiles_release"), f) for _, f in live_files(a.src, "/nonexistent")]
     jobs += [(os.path.join(a.src2, s), os.path.join(a.tree_out, "profiles"), s) for s, _ in PLAN2]
     for srcpath, dd, name in jobs:
-        old = open(srcpath, encoding="utf-8").read()
+        old = read_old(srcpath)
         new = convert(old, imap)
-        for fn, content in ((name, new), (name + ALT, old)):
+        for fn, content in ((name, new), (name + ALT, alt_text(old))):
             p = os.path.join(dd, fn)
             cur = open(p, encoding="utf-8").read() if os.path.exists(p) else None
             if cur == content:
@@ -121,12 +145,36 @@ def convert_live(a, imap):
         alt = p + ALT
         if not os.path.exists(alt):
             shutil.copy2(p, alt)
+            open(alt, "w", encoding="utf-8").write(alt_text(old))      # sibling-source lines -> the sibling's .alt (pure old-spelling run)
         tmp = p + ".tmp_f0g"
         open(tmp, "w", encoding="utf-8").write(new)
         shutil.copymode(p, tmp)
         os.replace(tmp, p)
         print("converted", p)
     print("%s: %d to convert, %d already converted/without old names" % ("applied" if a.apply else "plan (use --apply)", n_conv, n_same))
+    return 0
+
+
+def rollback_live(a):
+    """F0-G fix round 1: the way back for convert_live. Per X.env.alt: X.env := from_alt(X.env.alt) (the old file byte for byte); the .alt stays.
+    Without --apply only the plan is printed. Operator action, never an agent."""
+    n = 0
+    for d, f in live_files(a.src, a.src2):
+        p = os.path.join(d, f)
+        if not os.path.exists(p + ALT):
+            continue
+        old = from_alt(open(p + ALT, encoding="utf-8").read())
+        if open(p, encoding="utf-8").read() == old:
+            continue
+        n += 1
+        if not a.apply:
+            print("would restore", p, "<-", f + ALT); continue
+        tmp = p + ".tmp_f0g"
+        open(tmp, "w", encoding="utf-8").write(old)
+        shutil.copymode(p, tmp)
+        os.replace(tmp, p)
+        print("restored", p)
+    print("%s: %d to restore" % ("applied" if a.apply else "plan (use --apply)", n))
     return 0
 
 
@@ -139,6 +187,7 @@ def main():
     ap.add_argument("--tree-out", help="F0-G: <tree>/docker/flliper -- write profiles_release/ + profiles/ (converted + *.env.alt) there")
     ap.add_argument("--list-live", action="store_true", help="F0-G: print the live *.env files of --src/--src2")
     ap.add_argument("--convert-live", action="store_true", help="F0-G: convert the live dirs in place (X.env -> X.env.alt); needs --apply to write")
+    ap.add_argument("--rollback-live", action="store_true", help="F0-G: restore X.env from X.env.alt in the live dirs; needs --apply to write")
     ap.add_argument("--apply", action="store_true")
     a = ap.parse_args()
     imap = R._load_imap(os.path.join(KIT, "data", "merged_0928.json"))
@@ -148,6 +197,8 @@ def main():
         return 0
     if a.convert_live:
         return convert_live(a, imap)
+    if a.rollback_live:
+        return rollback_live(a)
     if a.tree_out:
         return 1 if tree_out(a, imap) else 0
     bad = 0

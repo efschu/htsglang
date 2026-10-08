@@ -1,0 +1,29 @@
+F0-G dry-run comparison, old (pre-rename tree + <profile>.env.alt) vs new (renamed tree + <profile>.env), 16 profiles
+27B line: old tree dab894b021, new tree = desk/flliper-27b-f0g-1008 (11 profiles). NF line: old tree fd9bf48fe9, new tree = desk/flliper-nf-f0g-1008 (5 profiles).
+New tree = the F0-G commit plus the working tree of fix round 1 (the .env files and the launcher code are those of the commit; the .alt files are the fixed ones).
+Raw logs: /spinning/flliper/work/release/f0g-1008/{27b,nf}/old_<profile>.log, new_<profile>.log (outside the tree).
+
+profile                boundary    verdict  prose  env groups (keys old/new) | other lines old/new
+27b-base.diet          config.json OK       0      none (stops before the env is built) | 11/11
+27b-base               config.json OK       0      none (stops before the env is built) | 11/11
+27b-fp8                config.json OK       0      none (stops before the env is built) | 76/76
+27b-gguf               W163        OK       0      none (stops before the env is built) | 23/23
+27b-nvfp4-dual.diet    complete    OK       3      D:68/68 P:68/68 | 261/261
+27b-nvfp4-dual         W64         OK       2      P:80/80 | 243/243
+27b-nvfp4              complete    OK       3      D:74/74 P:71/71 | 229/229
+27b-release-draft      config.json OK       0      none (stops before the env is built) | 11/11
+27b-row-authority      config.json OK       0      none (stops before the env is built) | 11/11
+27b.diet               config.json OK       0      none (stops before the env is built) | 11/11
+27b                    config.json OK       0      none (stops before the env is built) | 11/11
+nf-h91-dpr-sa-vis      W128        OK       0      none (stops before the env is built) | 26/26
+nf-int4-h6-abl         W128        OK       0      none (stops before the env is built) | 24/24
+nf-int4.diet           W128        OK       0      none (stops before the env is built) | 26/26
+nf-int4                W128        OK       0      none (stops before the env is built) | 24/24
+nf                     W128        OK       0      none (stops before the env is built) | 26/26
+
+COUNT: 16 profiles. Stop where the launcher refuses for model/draft files this box cannot see: 13 (config.json 7, W163 1, W128 5).
+       Stop at the plan's own infeasibility (W64): 1. Plan complete (DRY-RUN complete, EXIT=0): 2.  13 + 1 + 2 = 16.
+VERDICT: 16 OK, 0 FAIL.
+LIMIT (stated, not a success): behind its boundary line nothing was compared. 13 profiles are compared only up to the first refusal; 3 reach a plan (2 complete, 1 W64).
+'prose' = residual line pairs that differ only by a German -> English translation (word level, listed in the protocol); they are the only lines that are not
+equal modulo names, digits (live-box readings) and name sort order.
