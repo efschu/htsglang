@@ -4377,6 +4377,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # paid, and its parent becomes the next leaf.
                     from flliper.srt.pdflip import pp_slot_fidelity as _sf
 
+                    if _sf.unbacked_drop_floor(self, node) and node.children:
+                        # UD-H: the leaf's only children are host-only nodes
+                        self._ud_clear_host_children(node)
                     if _sf.unbacked_drop_allowed(self, node):
                         self._ud_drop_unbacked_leaf(node, tracker)
                     return
@@ -4423,6 +4426,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _ud_clear_host_children(self, node: UnifiedTreeNode) -> bool:
+        """UD-H (NF int19 1008, P PP2 13:37:49Z; int18 12:53:27Z PP2 ``#1421 ...
+        node=341 backuped=True parent=277 parent_backuped=False``): a device leaf
+        whose backup the full arena refused, with children that hold NO device
+        rows (backed children already demoted to the host), cannot be dropped
+        (#841: it would orphan them) and cannot be backed up -- it blocks
+        everything behind it (``EVICT-FRONTIER-CENSUS on_frontier=3456
+        behind_device_child=128768``, the peel paid 0, ``Prefill out of memory``,
+        RANK-DEATH). On the local-PP floor (the caller checked it) the host-only
+        subtree below is evicted from the host first -- cache content lost,
+        recomputable, and its arena slots come free -- so the leaf becomes
+        droppable. All or nothing: any device row, device lock or host lock
+        below leaves the subtree untouched. True when no child is left."""
+        order = []
+        stack = list(node.children.values())
+        while stack:
+            d = stack.pop()
+            if not d.evicted or not d.backuped:
+                return False
+            if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in d.component_data):
+                return False
+            order.append(d)
+            stack.extend(d.children.values())
+        host_tracker = {ct: 0 for ct in self.tree_components}
+        for d in reversed(order):  # children before their parent
+            attached = d.parent is not None and any(c is d for c in d.parent.children.values())
+            if not attached:
+                continue  # a cascade above already removed it
+            if not self._is_host_leaf(d):
+                break
+            self._evict_host_leaf(d, host_tracker)
+        left = len(node.children)
+        n = getattr(UnifiedRadixCache, "_ud_h_n", 0) + 1
+        UnifiedRadixCache._ud_h_n = n
+        if n <= 24 or (n & (n - 1)) == 0:
+            logger.warning(
+                "UD-H HOST-CHILDREN-CLEARED node=%s host_nodes=%d host_tokens=%d left=%d (n=%d): "
+                "a write_back leaf the full arena refused had host-only children; they leave "
+                "the host so the leaf can be dropped on the local-PP floor",
+                node.id, len(order), host_tracker.get(BASE_COMPONENT_TYPE, 0), left, n,
+            )
+        return left == 0
 
     def _ud_drop_unbacked_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
