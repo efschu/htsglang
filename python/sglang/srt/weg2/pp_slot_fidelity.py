@@ -196,20 +196,24 @@ def note_loaded(tree, rows: int) -> None:
         pass
 
 
-def unbacked_drop_allowed(tree, node) -> bool:
-    """UD (NF rc12q PP2 16:28:19Z): may an eviction DROP a write_back leaf whose
-    backup was refused? Only on the local-PP floor (the tree is this rank's own;
-    on a TP group a rank-local drop would split the replicas), only a node with
-    no children (#841: an un-backed node with children would orphan them) and
-    no write-through in flight."""
+def unbacked_drop_floor(tree, node) -> bool:
+    """UD's floor half: the local-PP floor (the tree is this rank's own; on a TP
+    group a rank-local drop would split the replicas) and no write-through of
+    ``node`` in flight. Children are not looked at here."""
     if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
         return False
-    if getattr(node, "children", None):
-        return False
     ongoing = getattr(tree, "ongoing_write_through", None) or {}
-    if getattr(node, "id", None) in ongoing:
+    return getattr(node, "id", None) not in ongoing
+
+
+def unbacked_drop_allowed(tree, node) -> bool:
+    """UD (NF rc12q PP2 16:28:19Z): may an eviction DROP a write_back leaf whose
+    backup was refused? Only on the local-PP floor, only a node with no children
+    (#841: an un-backed node with children would orphan them) and no
+    write-through in flight."""
+    if not unbacked_drop_floor(tree, node):
         return False
-    return True
+    return not getattr(node, "children", None)
 
 
 def note_unbacked_drop(tree, node, tokens: int) -> None:
