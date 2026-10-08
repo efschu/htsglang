@@ -6,6 +6,14 @@ Live-Zustand.  Eine Quelle der Wahrheit für die Tafel ist diese Datei; nach Än
 """
 
 import json
+import os
+import sys
+
+# F0-F (rename): the metrics were pushed as <old subsystem>_* before the rename and as pdflip_* after it; every panel reads
+# both families (the metric names themselves are not turned back, open user decision). One rule for the dashboard and
+# for this file: rigdash.vmpush.dual_promql.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+from rigdash.vmpush import dual_promql  # noqa: E402
 
 DS = {"type": "prometheus", "uid": "vm"}
 _id = [0]
@@ -36,7 +44,7 @@ def panel(title, targets, unit="short", x=0, y=0, w=12, h=8, desc="", draw="line
 
 
 def t(expr, legend):
-    return {"expr": expr, "legendFormat": legend}
+    return {"expr": dual_promql(expr), "legendFormat": legend}
 
 
 def row(title, y):

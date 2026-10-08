@@ -102,7 +102,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model) (increase(pdflip_front_ttft_ms_sum{model=~\"$model\"}[5s])) / (sum by (model) (increase(pdflip_front_ttft_count{model=~\"$model\"}[5s])) > 0) / 1000",
+     "expr": "sum by (model) (increase({__name__=~\"(weg2|pdflip)_front_ttft_ms_sum\",model=~\"$model\"}[5s])) / (sum by (model) (increase({__name__=~\"(weg2|pdflip)_front_ttft_count\",model=~\"$model\"}[5s])) > 0) / 1000",
      "legendFormat": "{{model}}"
     }
    ],
@@ -163,7 +163,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model) (pdflip_front_ttft_ms_max{model=~\"$model\"}) / 1000",
+     "expr": "max by (model) ({__name__=~\"(weg2|pdflip)_front_ttft_ms_max\",model=~\"$model\"}) / 1000",
      "legendFormat": "max {{model}}"
     }
    ]
@@ -223,7 +223,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model) (rate(pdflip_front_served_total{group=\"D\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "expr": "sum by (model) (rate({__name__=~\"(weg2|pdflip)_front_served_total\",group=\"D\",model=~\"$model\"}[$__rate_interval])) * 60",
      "legendFormat": "{{model}}"
     }
    ]
@@ -283,7 +283,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model, dir) (pdflip_flip_user_view_ms{def=\"t2t\",part=\"total\",model=~\"$model\"}) / 1000",
+     "expr": "max by (model, dir) ({__name__=~\"(weg2|pdflip)_flip_user_view_ms\",def=\"t2t\",part=\"total\",model=~\"$model\"}) / 1000",
      "legendFormat": "Flipzeit {{dir}} {{model}}"
     },
     {
@@ -292,7 +292,7 @@
       "uid": "vm"
      },
      "refId": "B",
-     "expr": "max by (model, dir) (pdflip_flip_user_view_ms{def=\"t2t\",part=\"layer\",model=~\"$model\"}) / 1000",
+     "expr": "max by (model, dir) ({__name__=~\"(weg2|pdflip)_flip_user_view_ms\",def=\"t2t\",part=\"layer\",model=~\"$model\"}) / 1000",
      "legendFormat": "Teil Layer-Tausch (in Flipzeit enthalten) {{dir}} {{model}}"
     }
    ]
@@ -434,7 +434,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model) (rate(pdflip_rank_decode_tokens_total{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
+     "expr": "sum by (model) (rate({__name__=~\"(weg2|pdflip)_rank_decode_tokens_total\",group=\"D\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
      "legendFormat": "{{model}}"
     }
    ]
@@ -494,7 +494,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model, group) (rate(pdflip_rank_prefill_new_tokens_total{rank=\"tp0pp0\",group=~\"P|D\",model=~\"$model\"}[$__rate_interval]))",
+     "expr": "sum by (model, group) (rate({__name__=~\"(weg2|pdflip)_rank_prefill_new_tokens_total\",rank=\"tp0pp0\",group=~\"P|D\",model=~\"$model\"}[$__rate_interval]))",
      "legendFormat": "{{group}} {{model}}"
     }
    ]
@@ -554,7 +554,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model) (pdflip_rank_decode_last_bs{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"})",
+     "expr": "max by (model) ({__name__=~\"(weg2|pdflip)_rank_decode_last_bs\",group=\"D\",rank=\"tp0pp0\",model=~\"$model\"})",
      "legendFormat": "bs {{model}}"
     },
     {
@@ -563,7 +563,7 @@
       "uid": "vm"
      },
      "refId": "B",
-     "expr": "max by (model) (pdflip_front_outstanding_n{model=~\"$model\"})",
+     "expr": "max by (model) ({__name__=~\"(weg2|pdflip)_front_outstanding_n\",model=~\"$model\"})",
      "legendFormat": "outstanding {{model}}"
     },
     {
@@ -572,7 +572,7 @@
       "uid": "vm"
      },
      "refId": "C",
-     "expr": "max by (model) (pdflip_front_queue{model=~\"$model\"})",
+     "expr": "max by (model) ({__name__=~\"(weg2|pdflip)_front_queue\",model=~\"$model\"})",
      "legendFormat": "Warteschlange {{model}}"
     }
    ]
@@ -632,7 +632,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model, group) (pdflip_rank_kv_usage_ratio{model=~\"$model\"}) * 100",
+     "expr": "max by (model, group) ({__name__=~\"(weg2|pdflip)_rank_kv_usage_ratio\",model=~\"$model\"}) * 100",
      "legendFormat": "{{group}} {{model}}"
     }
    ]
@@ -705,7 +705,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model, group) (rate(pdflip_rank_l2_loadback_tokens_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
+     "expr": "sum by (model, group) (rate({__name__=~\"(weg2|pdflip)_rank_l2_loadback_tokens_total\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
      "legendFormat": "Load-back Tok/s {{group}} {{model}}"
     },
     {
@@ -714,7 +714,7 @@
       "uid": "vm"
      },
      "refId": "B",
-     "expr": "sum by (model, group) (rate(pdflip_rank_mamba_resume_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "expr": "sum by (model, group) (rate({__name__=~\"(weg2|pdflip)_rank_mamba_resume_total\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
      "legendFormat": "Mamba-Resumes/min {{group}} {{model}}"
     }
    ]
@@ -774,7 +774,7 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model, group, outcome) (rate(pdflip_rank_l3_prefetch_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "expr": "sum by (model, group, outcome) (rate({__name__=~\"(weg2|pdflip)_rank_l3_prefetch_total\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
      "legendFormat": "{{outcome}} {{group}} {{model}}"
     }
    ]

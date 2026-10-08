@@ -26,6 +26,12 @@ from . import kartenplan_catalog as CAT
 from . import kartenplan_gate as GATE
 from . import kartenplan_transport as TR
 
+#: F0-F (rename): the boot recordings in this directory KEEP the spelling of the pre-rename tree (env names, package paths, flag
+#: sources inside the recorded argv/env/flag_docs). They are evidence of boots that ran before the rename, and each record's
+#: ``plan_id`` is a sha256 over its content (``plan_id_ok``): a renamed record fails that check (measured, F0-D:
+#: test_plan_id_wird_nachgerechnet red). rename_rigdash.py locks the directory (LOCKED) and copies it back byte-identical.
+#: A reader of a record's env/argv therefore reads the recorded (old) spelling, and a future recording in the new one needs both (``names.env_get``); the planner texts the page shows
+#: next to them come from the renamed planner tree.
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kartenplan_data")
 SCHEMA = "kartenplan.record/1"
 #: so viele Karten bietet die Seite an: dieselbe Grenze wie der Planer (pdflip/topology.py MAX_CARDS_BAR1 = 8, MIN_CARDS = 2); was dort außerhalb liegt,
