@@ -48,6 +48,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import kartenplan_catalog as CAT
+from . import names as N
 from . import redact
 
 OWNER = "profil-editor"
@@ -200,13 +201,19 @@ def version_facts(doc: dict, versions: Optional[dict] = None, environ: Optional[
             rev, src = g, "git HEAD of the tree"
         else:
             stand = str(env.get("STAND") or "").lower()
+            # F0-F: the image ENV of the revision under either product prefix (names.env_variants: HTSGLANG_<X> <-> FLLIPER_<X>)
+            name, val = None, None
             for k in (("HTSGLANG_REVISION_%s" % stand.upper()) if stand in ("27b", "nf") else None, "HTSGLANG_REVISION"):
-                if k and _is_sha(env.get(k)):
-                    rev, src = str(env[k]).strip().lower(), "Image-ENV %s" % k
+                for cand in (N.env_variants(k) if k else ()):
+                    if _is_sha(env.get(cand)):
+                        name, val = cand, str(env[cand]).strip().lower()
+                        break
+                if name:
                     break
-            else:
-                if _is_sha(env.get("FLLIPER_BUILD_COMMIT")):
-                    rev, src = str(env["FLLIPER_BUILD_COMMIT"]).strip().lower(), "Image-ENV FLLIPER_BUILD_COMMIT"
+            if name:
+                rev, src = val, "Image-ENV %s" % name
+            elif _is_sha(env.get("FLLIPER_BUILD_COMMIT")):
+                rev, src = str(env["FLLIPER_BUILD_COMMIT"]).strip().lower(), "Image-ENV FLLIPER_BUILD_COMMIT"
     image = env.get("FLLIPER_IMAGE_TAG") or versions.get("image") or None
     image_default = image == "local/flliper:dev"
     return {"image": image, "image_default": image_default, "tree_rev": rev or None, "tree_rev_src": src,

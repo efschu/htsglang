@@ -180,6 +180,17 @@ def env_variants(name: str) -> Tuple[str, ...]:
     return (name,)
 
 
+def canonical_env_name(name: str) -> str:
+    """The renamed spelling of a legacy RUNTIME env name (``<LEGACY>_<OLD>_X`` -> ``FLLIPER_PDFLIP_X``, ``<LEGACY>_OPT_<OLD>_X`` ->
+    ``FLLIPER_OPT_PDFLIP_X``, ``<LEGACY>_X`` -> ``FLLIPER_X``); every other name, the product prefix (a container env, not a group env)
+    included, comes back unchanged.  For readers of a profile's ``--env-p/-d`` text: a live profile written before the rename still
+    carries the legacy spelling, the renamed planner modules look up the new one (F0-F)."""
+    for leg, new in ENV_PREFIX_PAIRS[:3]:
+        if name.startswith(leg) and len(name) > len(leg):
+            return new + name[len(leg):]
+    return name
+
+
 def env_get(env: Optional[Mapping[str, Any]], name: str, default: Any = None) -> Any:
     """``env.get(name, default)`` over every spelling of ``name`` (the given one wins when several are set)."""
     if not env:

@@ -692,7 +692,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
     <div id="history" class="tablewrap"></div>
   </details>
   <details class="card fold" id="fold-containers">
-    <summary><h2>Containers <span class="muted">Docker on the Proxmox host (htsglang-*)</span></h2></summary>
+    <summary><h2>Containers <span class="muted">Docker on the Proxmox host (flliper-*, before the rename htsglang-*)</span></h2></summary>
     <div id="containers" class="tablewrap"></div>
   </details>
   </div>
@@ -1484,7 +1484,7 @@ function containersHtml(d) {
   if (!dk) return `<div class="muted">Docker query switched off</div>`;
   const rows = dk.value || [];
   let h = dk.error ? `<div class="err">${esc(dk.error)}</div>` : "";
-  if (!rows.length) return h + `<div class="muted">no htsglang container on the host</div>`;
+  if (!rows.length) return h + `<div class="muted">no flliper/htsglang container on the host</div>`;
   h += `<table><tr><th>Name</th><th>State</th><th>Image</th><th>Ports</th></tr>` + rows.map((r) =>
     `<tr><td class="mono">${esc(r.Names)}</td><td><span class="chip ${r.State !== "running" ? "bad" : /unhealthy/.test(r.Status || "") ? "warn" : "ok"}">${esc(r.Status)}</span></td><td class="mono">${esc(r.Image)}</td><td class="mono">${esc(r.Ports)}</td></tr>`).join("") + `</table>`;
   return h + `<div class="muted" style="font-size:12px;margin-top:4px">Status ${ago(dk.age_s)} ago</div>`;

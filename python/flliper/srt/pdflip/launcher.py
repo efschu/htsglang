@@ -14444,6 +14444,8 @@ OWNED_MISS_RECORD_ENV = "FLLIPER_PDFLIP_OWNED_MISS_RECORD"
 
 
 def owned_miss_record_root() -> str:
+    """The records root the D ranks WRITE to. What the pre-rename tree wrote lies next to it under the old subsystem name
+    and is READ as well (``pool_miss_cost.record_dirs_for``, F0-F); nothing is moved."""
     return os.path.join(EVIDENCE_DIR, "records", "pdflip")
 
 
@@ -14512,10 +14514,11 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
     from flliper.srt.layers.moe import pool_miss_cost as _miss_cost
 
     root = str(env_d.get("FLLIPER_PDFLIP_OWNED_MISS_RECORD", "") or "").strip()
-    rank_dir = _miss_cost.record_dir_for(root, model) if root else None
+    # F0-F: the records root of the line AND its pre-rename sibling are read (writers: the root alone)
+    rank_dirs = _miss_cost.record_dirs_for(root, model) if root else None
     ms, tier, src = _er.resolve_owned_miss_ms(
         _er.read_owned_miss_records(measured_record_path()),
-        rank_records=_er.read_owned_miss_rank_records(rank_dir), host=int(host),
+        rank_records=_er.read_owned_miss_rank_records(rank_dirs), host=int(host),
         model=model, builtin=builtin, builtin_source=builtin_src)
     if tier == _er.OWNED_MISS_UNMEASURED:
         # PR: the seed stays -- the line still names a too-young RECORD's count
@@ -14538,7 +14541,7 @@ def d_owned_miss_ms_rank(ns, *, env_d: Mapping[str, str], n: int
     if not root:
         return None, ""
     got = _er.owned_miss_per_rank_from_records(
-        _er.read_owned_miss_rank_records(_miss_cost.record_dir_for(root, model)),
+        _er.read_owned_miss_rank_records(_miss_cost.record_dirs_for(root, model)),
         n=int(n), model=model)
     if got is None:
         return None, ""

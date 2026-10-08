@@ -75,7 +75,7 @@ HW = {"schema": "flliper.hardware/1", "id": "sha256:abcdef0123456789abcdef", "dr
           {"ord": 1, "nvml_index": 0, "name": "NVIDIA GeForce RTX 3080", "cc": [8, 6], "sm_count": _n(68, "Datasheet"), "vram_total_mib": _n(20480, unit="MiB"),
            "pcie": {"max_gen": _n(4), "max_width": _n(16)}, "mem_gbs": {"nominal": _n(760, "Datasheet", "GB/s")}},
       ]}
-VERSIONS = {"tree_rev": "173161c595de23e0", "image": "ghcr.io/efschu/htsglang:0.1.0-cu130", "driver": "575.57.08", "cuda": "13.0", "torch": "2.9.1", "rigdash": "r1006"}
+VERSIONS = {"tree_rev": "173161c595de23e0", "image": "ghcr.io/efschu/flliper:0.1.0-cu130", "driver": "575.57.08", "cuda": "13.0", "torch": "2.9.1", "rigdash": "r1006"}
 MODEL = {"schema": "flliper.model/1", "path": "/spinning/llm_stuff/models-cache/Qwen3.8-27B", "config_sha": "0123456789abcdef",
          "format": _n("int8-w8a8", "Index"),
          "arch": {"family": _n("dense", "config"), "hybrid": _n(True, "config"), "n_layers": _n(64, "config"), "layer_counts": _n({"attn": 16, "gdn": 48, "mamba": 0}, "config"),
@@ -169,7 +169,7 @@ class AllBlocks(Base):
 
     def test_versions_block(self):
         t = self.report()["text"]
-        for want in ("| Tree (revision) | 173161c595de23e0 |", "| Image | ghcr.io/efschu/htsglang:0.1.0-cu130 |", "| Driver | 575.57.08 |",
+        for want in ("| Tree (revision) | 173161c595de23e0 |", "| Image | ghcr.io/efschu/flliper:0.1.0-cu130 |", "| Driver | 575.57.08 |",
                      "| CUDA / torch (measuring process) | 13.0 / 2.9.1 |", "| Dashboard | r1006 |"):
             self.assertIn(want, t)
         self.assertRegex(t, r"\| Base profile \(sha256\) \| `[0-9a-f]{16}` \|")
@@ -707,7 +707,7 @@ class StructuralAllowRule(Base):
         self.assertEqual(redact.bare_key("var:PROFILE_NAME"), "PROFILE_NAME")
 
     def test_new_shapes_spare_names_hashes_and_hosts(self):
-        for keep in ("registry.example-company-internal.com", "Qwen3.6-27B-AWQ-BF16-INT4.gguf", "model-00001-of-00004.safetensors", "ghcr.io/efschu/htsglang:0.1.0-cu130",
+        for keep in ("registry.example-company-internal.com", "Qwen3.6-27B-AWQ-BF16-INT4.gguf", "model-00001-of-00004.safetensors", "ghcr.io/efschu/flliper:0.1.0-cu130",
                      "173161c595de23e0aa11bb22cc33dd44ee55ff66", "/models-cache/Qwen3Coder30BA3BInstructX1/abcDEF12345", "ja/nein", "GB/s", "RTX 3080 / 5090",
                      "python/flliper/srt/pdflip/profile_json.py", "https://host.example/a/b/c", "1.2.3.4"):
             self.assertEqual(redact.text_for_issue(keep), keep, keep)
