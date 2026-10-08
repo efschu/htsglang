@@ -762,6 +762,12 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
+#: PR (weg2/pp_room_vote.py): PP0's tree attribute carrying the room every PP
+#: stage can pay this pass (an int), or None -- published only on a PP group
+#: whose followers sent a fact; absent everywhere else (byte-identical).
+PP_ROOM_CAP_ATTR = "weg2_pp_room_cap"
+
+
 def fundable_extend_tokens(tree_cache) -> int:
     """Tokens an extend allocation could actually get RIGHT NOW, group-uniform.
 
@@ -795,7 +801,12 @@ def fundable_extend_tokens(tree_cache) -> int:
         evictable = 0
     # F1 (nf-next-1006-01): minus the group's cap-blind gap (0 unless a residency
     # cap is engaged AND the iteration's reduce published one)
-    return max(0, max(0, avail) + max(0, evictable) - cap_blind_gap_published(tree_cache))
+    fundable = max(0, max(0, avail) + max(0, evictable) - cap_blind_gap_published(tree_cache))
+    # PR (weg2/pp_room_vote.py): on PP0, the room every PP stage can pay
+    room_cap = getattr(tree_cache, PP_ROOM_CAP_ATTR, None)
+    if isinstance(room_cap, int) and not isinstance(room_cap, bool):
+        fundable = min(fundable, max(0, room_cap))
+    return fundable
 
 
 def published_fundable_floor(tree_cache) -> Optional[int]:
@@ -818,7 +829,9 @@ def published_fundable_floor(tree_cache) -> Optional[int]:
     """
     if tree_cache is None:
         return None
-    if getattr(tree_cache, "uniform_avail_floor", None) is None:
+    room_cap = getattr(tree_cache, PP_ROOM_CAP_ATTR, None)
+    has_cap = isinstance(room_cap, int) and not isinstance(room_cap, bool)
+    if getattr(tree_cache, "uniform_avail_floor", None) is None and not has_cap:
         return None
     return fundable_extend_tokens(tree_cache)
 
