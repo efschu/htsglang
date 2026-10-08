@@ -765,7 +765,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
 
     # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
-        # flliper:eplb_gpu_physical_count metric is disabled if FLLIPER_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
+        # sglang:eplb_gpu_physical_count metric is disabled if FLLIPER_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
         interval = get_int_env_var("FLLIPER_EPLB_HEATMAP_COLLECTION_INTERVAL", 0)
         if interval > 0 and self._metric_heatmap_collection_counter % interval == 0:
             for layer_idx in range(self._expert_location_metadata.num_layers):

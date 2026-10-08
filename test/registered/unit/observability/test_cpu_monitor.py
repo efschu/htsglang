@@ -29,11 +29,11 @@ class TestCpuMonitor(unittest.TestCase):
         for metric in REGISTRY.collect():
             for sample in metric.samples:
                 if (
-                    sample.name == "flliper:process_cpu_seconds_total"
+                    sample.name == "sglang:process_cpu_seconds_total"
                     and sample.labels.get("component") == "test"
                 ):
                     value = sample.value
-        print(f"flliper:process_cpu_seconds_total = {value}")
+        print(f"sglang:process_cpu_seconds_total = {value}")
         self.assertIsNotNone(value)
         self.assertGreater(value, 0)
 

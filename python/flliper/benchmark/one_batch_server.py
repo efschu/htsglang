@@ -56,21 +56,21 @@ def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
             return None
 
         # Parse Prometheus text format
-        # Looking for: flliper:cached_tokens_total{...} <value>
-        #              flliper:prompt_tokens_total{...} <value>
+        # Looking for: sglang:cached_tokens_total{...} <value>
+        #              sglang:prompt_tokens_total{...} <value>
         cached_tokens_total = 0.0
         prompt_tokens_total = 0.0
 
         for line in response.text.split("\n"):
-            if line.startswith("flliper:cached_tokens_total{"):
+            if line.startswith("sglang:cached_tokens_total{"):
                 match = re.search(
-                    r"flliper:cached_tokens_total\{[^}]*\}\s+([\d.eE+-]+)", line
+                    r"sglang:cached_tokens_total\{[^}]*\}\s+([\d.eE+-]+)", line
                 )
                 if match:
                     cached_tokens_total += float(match.group(1))
-            elif line.startswith("flliper:prompt_tokens_total{"):
+            elif line.startswith("sglang:prompt_tokens_total{"):
                 match = re.search(
-                    r"flliper:prompt_tokens_total\{[^}]*\}\s+([\d.eE+-]+)", line
+                    r"sglang:prompt_tokens_total\{[^}]*\}\s+([\d.eE+-]+)", line
                 )
                 if match:
                     prompt_tokens_total += float(match.group(1))

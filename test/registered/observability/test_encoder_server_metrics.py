@@ -1,4 +1,4 @@
-"""Integration test: the EPD encoder server exports flliper:encoder_* metrics."""
+"""Integration test: the EPD encoder server exports sglang:encoder_* metrics."""
 
 import unittest
 import uuid
@@ -86,11 +86,11 @@ class TestEncoderServerMetrics(CustomTestCase):
             self.assertEqual(metrics_response.status_code, 200)
             metrics_text = metrics_response.text
 
-            self.assertIn("flliper:encoder_requests_received_total", metrics_text)
+            self.assertIn("sglang:encoder_requests_received_total", metrics_text)
             self.assertIn(f'model_name="{_MODEL_NAME}"', metrics_text)
 
             metrics = _parse_prometheus_metrics(metrics_text)
-            received = metrics.get("flliper:encoder_requests_received_total", [])
+            received = metrics.get("sglang:encoder_requests_received_total", [])
             self.assertGreater(sum(s.value for s in received), 0)
         finally:
             recv_socket.close()

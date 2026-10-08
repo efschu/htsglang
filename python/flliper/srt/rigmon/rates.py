@@ -175,7 +175,7 @@ CAVEAT_TOKS_IS_NOT_THE_YARDSTICK = Caveat(
 CAVEAT_NO_FORWARD_TIMER = Caveat(
     "no_forward_timer",
     "The engine exports no forward-time counter, so round times are "
-    "unavailable — not zero. flliper:forward_execution_seconds_total is fed "
+    "unavailable — not zero. sglang:forward_execution_seconds_total is fed "
     "only by the CUDA-event device timer, which the scheduler installs under "
     "FLLIPER_ENABLE_METRICS_DEVICE_TIMER=1. Set it (together with "
     "--enable-metrics-for-all-schedulers for the per-rank split) and the "
@@ -466,7 +466,7 @@ def group_throughput(
             return gt
     if metrics.get("gen_throughput") is not None:
         gt.gen_tok_s = metrics["gen_throughput"]
-        gt.source = "engine gauge flliper:gen_throughput (engine-internal window)"
+        gt.source = "engine gauge sglang:gen_throughput (engine-internal window)"
     else:
         gt.source = "no throughput metric exposed"
     return gt

@@ -28,11 +28,11 @@ _MEMINFO = "MemTotal:      131072000 kB\nMemFree: 1 kB\n"
 
 
 def _scrape(**tiers):
-    lines = ["# HELP flliper:spill_tier_used_bytes x", "# TYPE ... gauge"]
+    lines = ["# HELP sglang:spill_tier_used_bytes x", "# TYPE ... gauge"]
     for tier, val in tiers.items():
         tier = tier.replace("__", ":")
         lines.append(
-            f'flliper:spill_tier_used_bytes{{{_LBL},spill_tier="{tier}"}} {val}')
+            f'sglang:spill_tier_used_bytes{{{_LBL},spill_tier="{tier}"}} {val}')
     return "\n".join(lines) + "\n"
 
 
@@ -49,7 +49,7 @@ class TestScrapeParsing(CustomTestCase):
         self.assertEqual(total, {})
 
     def test_totals_parse_into_their_own_map(self):
-        text = (f'flliper:spill_tier_total_bytes{{{_LBL},'
+        text = (f'sglang:spill_tier_total_bytes{{{_LBL},'
                 'spill_tier="kv_session_host_ram"} 8192\n')
         used, total = to.spill_tier_bytes(text)
         self.assertEqual(used, {})
@@ -57,8 +57,8 @@ class TestScrapeParsing(CustomTestCase):
 
     def test_comments_and_unlabelled_lines_are_ignored(self):
         used, _ = to.spill_tier_bytes(
-            "# flliper:spill_tier_used_bytes fake\n"
-            "flliper:spill_tier_used_bytes 55\n")
+            "# sglang:spill_tier_used_bytes fake\n"
+            "sglang:spill_tier_used_bytes 55\n")
         self.assertEqual(used, {})
 
     def test_empty_scrape_is_empty_not_an_error(self):
@@ -132,7 +132,7 @@ class TestMeasuredRows(CustomTestCase):
 
     def test_kvso_capacity_comes_from_the_scrape_not_from_proc(self):
         text = _scrape(kv_session_host_ram=2 ** 31) + (
-            f'flliper:spill_tier_total_bytes{{{_LBL},'
+            f'sglang:spill_tier_total_bytes{{{_LBL},'
             'spill_tier="kv_session_host_ram"} 8589934592\n')
         r = _by_id([x.to_json() for x in to.tier_rows(
             text, host_total=2 ** 37)])["kv_session_host_ram"]

@@ -50,7 +50,7 @@ an operational counter (a tally of cache hits), not a perf measurement, so it is
 always safe to accumulate.
 
 The recovered-token signal itself comes from the running server's Prometheus
-counter ``flliper:cached_tokens_total{cache_source=...}`` (see
+counter ``sglang:cached_tokens_total{cache_source=...}`` (see
 ``metrics_collector.py``). Only the RAM/disk tiers count as HiCache recovery —
 ``cache_source="host"`` (RAM) and ``cache_source="storage_*"`` (disk backend).
 ``cache_source="device"`` is the on-GPU radix cache (already-resident KV, not the
@@ -109,12 +109,12 @@ HICACHE_CACHE_SOURCES = _is_hicache_source
 # Prometheus: recovered-prefill-token counter, split by cache_source.
 # ---------------------------------------------------------------------------
 
-_CACHED_TOKENS_METRIC = "flliper:cached_tokens_total"
+_CACHED_TOKENS_METRIC = "sglang:cached_tokens_total"
 _CACHE_SOURCE_RE = re.compile(r'cache_source="([^"]*)"')
 
 
 def cached_tokens_by_source(metrics_text: str) -> Dict[str, float]:
-    """Parse ``flliper:cached_tokens_total{...,cache_source="X"} V`` lines out of a
+    """Parse ``sglang:cached_tokens_total{...,cache_source="X"} V`` lines out of a
     Prometheus ``/metrics`` scrape into ``{cache_source: summed_value}``.
 
     ``energy.parse_prometheus_metrics`` collapses ALL label sets of a metric into
@@ -150,7 +150,7 @@ def cached_tokens_by_source(metrics_text: str) -> Dict[str, float]:
 def hicache_recovered_from_metrics(metrics_text: str) -> float:
     """Total recovered-prefill-token counter across the HiCache RAM/disk tiers.
 
-    This is the cumulative ``flliper:cached_tokens_total`` restricted to
+    This is the cumulative ``sglang:cached_tokens_total`` restricted to
     ``cache_source in {host, storage_*}`` — the prompt tokens served from the
     RAM/disk prefix cache that would otherwise have been prefilled. It is an
     absolute counter value (monotonic within one server lifetime), fed to

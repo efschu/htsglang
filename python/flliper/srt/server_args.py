@@ -5386,8 +5386,8 @@ class ServerArgs:
         Arg(
             help="Window length of the ONLINE card-equivalent estimator "
             "(#274 slice D): share_c = rate_c(shared window) / rate_c(solo "
-            "floor), E = SUM_c share_c, published as flliper:lane_share / "
-            'flliper:lane_share_e and under internal_states[...]["lane_share"]. '
+            "floor), E = SUM_c share_c, published as sglang:lane_share / "
+            'sglang:lane_share_e and under internal_states[...]["lane_share"]. '
             "The window has to sit above the A-vs-A noise floor of the "
             "underlying rates (0.25-0.39 %%), which is what ~1 s buys; shorter "
             "windows measure noise, longer ones smear load changes. "

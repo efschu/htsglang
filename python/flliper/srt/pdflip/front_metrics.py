@@ -1,12 +1,12 @@
 """TSDB push (user order 01.10. ~07:40Z, spec docs/TSDB-DELTA-27B-1001.md 1c):
 the Influx-line protocol and the bounded pusher the pdflip front uses to write
-its ``pdflip_req`` points to VictoriaMetrics (``FLLIPER_PDFLIP_METRICS_PUSH_URL``,
+its ``weg2_req`` points to VictoriaMetrics (``FLLIPER_PDFLIP_METRICS_PUSH_URL``,
 default OFF).
 
 This is the PUSH SUBSET of the 27B front's ``front_metrics.py`` (desk/27b-
 tsdb-metrics-1001 30c4c22c3f), byte-identical in ``influx_line`` /
 ``InfluxPusher`` / ``_http_post``, so the full module (the front's own
-``/metrics`` route and ``pdflip_*`` families) supersedes this file when it is
+``/metrics`` route and ``weg2_*`` families) supersedes this file when it is
 ported to the NF line -- one implementation, not two.
 
 Rules: the HTTP write runs in the front's BoundedWriter thread (``submit``),

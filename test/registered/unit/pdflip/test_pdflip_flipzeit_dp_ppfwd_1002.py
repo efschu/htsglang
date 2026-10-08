@@ -9,7 +9,7 @@ i.e. prefill (y7l: ~6.5 s). The front reads it off the progress beacon of the PP
 (``<arena>/progress/P-pid<pid>.bin``, ``t_start_ns``) at the first ``forward_ct`` rise after
 ``flip_done``: ``flip_user_time.prefill_start_ts`` with ``prefill_start_source="pp_first_forward"``,
 the same end in the D>P ``flip_first_work`` and in the front's flip phase (front.flip Nachlauf,
-the dashboard's / VictoriaMetrics' pdflip_flip_user_view_ms input). The PP-last stage's first
+the dashboard's / VictoriaMetrics' weg2_flip_user_view_ms input). The PP-last stage's first
 forward rides along as ``flip_user_time.pp_last_start_ts``. Without the beacon:
 ``prefill_start_source="missing"``, ``prefill_start_ts`` None, no flip time -- never the
 leg-1 dispatch (before: ``leg1_dispatch`` / ``leg1_end_minus_p_prefill_s``).

@@ -188,8 +188,8 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         # One more decode so the reporter emits a fresh logging interval.
         self._generate(HIGH_ACCEPT_PROMPT)
 
-        steps = self._scrape_metric("flliper:spec_num_steps")
-        draft_tokens = self._scrape_metric("flliper:spec_num_draft_tokens")
+        steps = self._scrape_metric("sglang:spec_num_steps")
+        draft_tokens = self._scrape_metric("sglang:spec_num_draft_tokens")
 
         self.assertIn(steps, {1.0, 3.0}, "spec_num_steps gauge has unexpected value")
         self.assertIn(

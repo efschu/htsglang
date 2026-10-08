@@ -15,7 +15,7 @@ and that every later wiring depends on:
      are supposed to be inert until something moves; two identical greedy
      generations that differ would mean they are not inert.
   3. the sensor consumes a REAL occupancy series from this rig -- scraped from
-     flliper:token_usage against the real token capacity -- and produces a
+     sglang:token_usage against the real token capacity -- and produces a
      reading with a verdict. Feeding it invented numbers proves nothing about
      the units, the denominator or the trend projection; feeding it the rig's
      own numbers proves all three.
@@ -36,7 +36,7 @@ import threading
 import time
 import urllib.request
 
-TOKEN_USAGE_RE = re.compile(r"^flliper:token_usage\{[^}]*\}\s+([0-9.eE+-]+)\s*$", re.M)
+TOKEN_USAGE_RE = re.compile(r"^sglang:token_usage\{[^}]*\}\s+([0-9.eE+-]+)\s*$", re.M)
 
 
 def http_get(url: str, timeout: float = 10.0) -> str:

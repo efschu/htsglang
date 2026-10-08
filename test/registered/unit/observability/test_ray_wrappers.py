@@ -38,9 +38,9 @@ class TestRayWrapperBase(unittest.TestCase):
 class TestNameSanitization(TestRayWrapperBase):
     def test_replaces_colons_with_underscores(self):
         sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
-            "flliper:num_running_reqs"
+            "sglang:num_running_reqs"
         )
-        self.assertEqual(sanitized, "flliper_num_running_reqs")
+        self.assertEqual(sanitized, "sglang_num_running_reqs")
 
     def test_replaces_all_punctuation(self):
         sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
@@ -143,7 +143,7 @@ class TestHistogramWrapper(TestRayWrapperBase):
         # silently filters non-positive entries so engine startup never breaks
         # when the Ray backend is in use.
         hist = self.rw.RayHistogramWrapper(
-            "flliper:queue_time_seconds", "doc", buckets=[0.0, 0.001, 1.0]
+            "sglang:queue_time_seconds", "doc", buckets=[0.0, 0.001, 1.0]
         )
         self.assertEqual(hist.metric.boundaries, [0.001, 1.0])
 
