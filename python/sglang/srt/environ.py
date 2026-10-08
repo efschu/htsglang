@@ -1054,6 +1054,16 @@ class Envs:
     # stands where that round left it, a repeat round cannot issue (kvs2 W3), so
     # the poll skips its ~1.2 s sweep (P.log 144297 sweep_ms=1221.1 per poll).
     SGLANG_WEG2_FLUSH_SWEEP_MEMO = EnvBool(False)
+    # PR-ARENA (NF int22, P PP1 18:34:20Z, boot 1008_171755 @ 6b3bd1a6df): the
+    # PP room vote's walk (weg2/pp_room_vote.estimate_payable) priced a peel's
+    # write_back backup at the KV host pool's available_size() -- on an arena
+    # pool (slots - claimed) * P, complete slots counted free -- while every
+    # claim was refused (no free slot): PP1's fact paid 195968 tokens the peel
+    # could not (on_frontier=8192 behind_device_child=187776), PP0 launched
+    # 16321 rows, PP1 'Prefill out of memory'. On: an arena-bound pool's backup
+    # room is its FREE slots (slots - complete - claimed) times the slot's
+    # tokens. Off = the available_size() reading, byte for byte.
+    SGLANG_WEG2_ENABLE_PP_ROOM_ARENA_FREE_ROOM = EnvBool(True)
     # SWEEP-FULL-ARENA (NF boot 1007_2142, P->D flip epoch 2: drain+quiesce
     # 41730 ms, sleep-kv 8883 ms, cards idle): once a publish sweep's backup
     # was refused for KV arena room (#1421 arena_claim), every later node
