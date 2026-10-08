@@ -283,6 +283,25 @@ def _load_hw_sim():
         return None
 
 
+def _cache_dirs(cache_dir: str) -> Tuple[str, ...]:
+    """``cache_dir`` and, when it is the rig cache of this tree's name, the cache of the other name
+    (``srt/compat_shims.py`` of the tree this file sits in, loaded by path like the siblings above: this module
+    stays stdlib-only and importable without ``import sglang``). Without the sibling: ``cache_dir`` alone."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.normpath(os.path.join(here, "..", "compat_shims.py"))
+    if not os.path.isfile(path):
+        return (cache_dir,)
+    pkg = os.path.basename(os.path.dirname(os.path.dirname(here)))
+    try:
+        # the module name carries the package name: compat_shims reads which side it runs on from it
+        spec = importlib.util.spec_from_file_location(pkg + ".srt.compat_shims", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.cache_dirs(cache_dir)
+    except Exception:  # pragma: no cover - a broken sibling must not break the view
+        return (cache_dir,)
+
+
 def hw_sim_datasheet(row: dict) -> Dict[str, Any]:
     """The data-sheet SM count of one NVML card row from ``weg2/hw_sim.py`` ``CATALOG`` (``SimCard.sm_count``).
 
@@ -458,7 +477,14 @@ def load_probes(cache_dir: str) -> List[dict]:
     Each is returned as ``{"file", "created", "driver", "data"}``.  A file of
     another probe version is ignored, not reinterpreted (the card-probe rule)."""
     out = []
-    for path in glob.glob(os.path.join(cache_dir, "card_probe-*.json")):
+    seen = set()
+    paths = []
+    for cd in _cache_dirs(cache_dir):   # rename transition: the cache dir of the other name too (first one wins)
+        for path in glob.glob(os.path.join(cd, "card_probe-*.json")):
+            if os.path.basename(path) not in seen:
+                seen.add(os.path.basename(path))
+                paths.append(path)
+    for path in paths:
         d = _read_json(path)
         if not d or not d.get("cards") or int(d.get("version", -1)) != _PROBE_VERSION:
             continue
@@ -485,7 +511,15 @@ def _parse_local_time(s: Any, fallback: float) -> float:
 def load_stage0(cache_dir: str) -> List[dict]:
     """Every readable stage-0 ``hw_profile-*.json`` (``uneven_perf``), oldest first."""
     out = []
-    for path in glob.glob(os.path.join(cache_dir, "hw_profile-*.json")):
+    seen = set()
+    # rename transition: the cache dir of the other name is scanned too (first one wins on a name)
+    paths = []
+    for cd in _cache_dirs(cache_dir):
+        for path in glob.glob(os.path.join(cd, "hw_profile-*.json")):
+            if os.path.basename(path) not in seen:
+                seen.add(os.path.basename(path))
+                paths.append(path)
+    for path in paths:
         d = _read_json(path)
         if not d or not isinstance(d.get("gpus"), dict):
             continue
