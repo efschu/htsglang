@@ -166,7 +166,7 @@ class Weg2Lines:
     def build(self, profile: str, image: str, transport: str = "bar1", house_guard: str = "memlimit") -> dict:
         """Validated inputs -> the host line.  Raises ValueError on anything not offered."""
         if profile not in self.release_profiles:
-            raise ValueError("Profil %r ist kein Release-Profil (%s)" % (profile, ", ".join(self.release_profiles)))
+            raise ValueError("Profile %r is not a release profile (%s)" % (profile, ", ".join(self.release_profiles)))
         if transport not in TRANSPORTS:
             raise ValueError("Transport %r (bar1|nccl)" % transport)
         if house_guard not in HOUSE_GUARDS:
@@ -174,42 +174,40 @@ class Weg2Lines:
         imgs, err = self.images()
         im = next((i for i in imgs if i["image"] == image), None)
         if im is None:
-            raise ValueError("Image %r steht nicht in 'docker images' auf dem Host%s" % (image, " (%s)" % err if err else ""))
+            raise ValueError("Image %r is not in 'docker images' on the host%s" % (image, " (%s)" % err if err else ""))
         ctx = ctx_for_image(im, list_contexts(self.ctx_glob))
         if ctx is None:
-            raise ValueError("kein Build-Kontext mit release=%s cuda=%s fuer %s" % (im["release"], im["cuda"], image))
+            raise ValueError("no build context with release=%s cuda=%s for %s" % (im["release"], im["cuda"], image))
         pr = self.profile(profile, ctx)
         if not pr["line"]:
-            raise ValueError("Profil %s nennt keine Linie" % profile)
+            raise ValueError("Profile %s names no line" % profile)
         rev = (ctx["revisions"] or {}).get(pr["line"]) or ctx["revision"]
         mount = 0 if pr["in_image"] else 1
         if mount and not pr["on_host"]:
-            raise ValueError("Profil %s weder im Image-Kontext noch auf dem Host" % profile)
+            raise ValueError("Profile %s neither in the image context nor on the host" % profile)
         allow_exp = (pr["status"] or "") in EXPERIMENTAL
         ctx_lxc = ctx["ctx"]            # host_acceptance.sh wants the LXC path and prefixes S itself
         env = [("CTX", ctx_lxc), ("IMAGE", image), ("LINE", pr["line"]), ("PROFILE", profile),
                ("PROFILE_MOUNT", str(mount))]
         if allow_exp:
             env.append(("ALLOW_EXPERIMENTAL", "1"))
-        env += [("HOUSE_GUARD", house_guard), ("GPUQ_ID", "<fenster-id>")]
+        env += [("HOUSE_GUARD", house_guard), ("GPUQ_ID", "<window-id>")]
         script = self.host_root + HOST_ACCEPTANCE
-        cmd = " ".join("%s=%s" % (k, v if v == "<fenster-id>" else shlex.quote(v)) for k, v in env)
+        cmd = " ".join("%s=%s" % (k, v if v == "<window-id>" else shlex.quote(v)) for k, v in env)
         cmd += " bash %s serve %s" % (script, transport)
         notes = [
-            "ZUERST ein gpuq-Fenster buchen (Karten 0,1,2, ganze Karten) und dessen id als GPUQ_ID einsetzen; "
-            "ohne laufendes Fenster wird nicht gebootet. Ausfuehren als root auf dem Proxmox-Host.",
+            "FIRST book a gpuq window (cards 0,1,2, whole cards) and insert its id as GPUQ_ID; without a running window nothing is booted. Run as root on the Proxmox host.",
         ]
         if allow_exp:
-            notes.append("Profil-Status '%s': der Entrypoint verlangt ALLOW_EXPERIMENTAL=1 (steht in der Zeile)." % pr["status"])
+            notes.append("Profile status '%s': the entrypoint demands ALLOW_EXPERIMENTAL=1 (it is in the line)." % pr["status"])
         if mount:
-            notes.append("Profil liegt nicht im Image -> PROFILE_MOUNT=1 bindet die Host-Datei ein.")
+            notes.append("Profile is not in the image -> PROFILE_MOUNT=1 mounts the host file.")
         elif pr["differs_from_host"]:
-            notes.append("Die Profil-Fassung im Image weicht von %s/profiles/%s.env ab; es gilt die Image-Fassung "
-                         "(PROFILE_MOUNT=1 naehme die Host-Fassung)." % (self.docker_dir, profile))
+            notes.append("The profile version in the image differs from %s/profiles/%s.env; the image version applies (PROFILE_MOUNT=1 would take the host version)." % (self.docker_dir, profile))
         if transport == "nccl" and (pr["nccl_status"] or "") == "unproven":
-            notes.append("PROFILE_NCCL_STATUS=unproven: dieses Profil wurde nie unter nccl gebootet.")
+            notes.append("PROFILE_NCCL_STATUS=unproven: this profile was never booted under nccl.")
         if house_guard == "ct999-ruht":
-            notes.append("ct999-ruht: CT999 (Router 30099, gpuq, alle Agenten) ruht vorher -- das tut nur der Nutzer selbst.")
+            notes.append("ct999-ruht: CT999 (router 30099, gpuq, all agents) rests beforehand -- only the user does that themselves.")
         return {"command": cmd, "env": env, "step": "serve", "transport": transport, "profile": pr,
                 "image": im, "ctx": ctx_lxc, "revision": rev, "notes": notes}
 
@@ -225,7 +223,7 @@ class Weg2Lines:
                 return hit
             with open(os.path.join(self.docker_dir, "host_acceptance.sh"), encoding="utf-8") as fh:
                 script = self.dry_script(fh.read())
-            envs = ["%s=%s" % (k, shlex.quote("DRYRUN" if v == "<fenster-id>" else v)) for k, v in built["env"]]
+            envs = ["%s=%s" % (k, shlex.quote("DRYRUN" if v == "<window-id>" else v)) for k, v in built["env"]]
             envs += ["DRY_STEP=serve", "DRY_TRANSPORT=%s" % built["transport"]]
             remote = "env %s bash -s" % " ".join(envs)
             t0 = time.time()
@@ -250,7 +248,7 @@ def _extract_fn(lines: List[str], name: str) -> List[str]:
             for j in range(i + 1, len(lines)):
                 if lines[j].startswith("}"):
                     return lines[i:j + 1]
-    raise ValueError("host_acceptance.sh: Funktion %s() nicht gefunden -- Skriptform geaendert, Trockenlauf verweigert" % name)
+    raise ValueError("host_acceptance.sh: function %s() not found -- script form changed, dry run refused" % name)
 
 
 def _index(lines: List[str], pattern: str) -> int:
@@ -258,7 +256,7 @@ def _index(lines: List[str], pattern: str) -> int:
     for i, ln in enumerate(lines):
         if rx.match(ln):
             return i
-    raise ValueError("host_acceptance.sh: Marke %r nicht gefunden -- Skriptform geaendert, Trockenlauf verweigert" % pattern)
+    raise ValueError("host_acceptance.sh: marker %r not found -- script form changed, dry run refused" % pattern)
 
 
 DRY_CHECKS = r'''
@@ -268,31 +266,31 @@ NF=0; ok(){ echo "DRY OK   $*"; }; fail(){ echo "DRY FEHL $*"; NF=$((NF + 1)); }
 T=${DRY_TRANSPORT:-bar1}
 echo "DRY abgeleitet: CTX=$CTX HCTX=$HCTX CU=$CU REV=${REV:0:10} IMAGE=$IMAGE LINE=$LINE PROFILE=$PROFILE PSFX=$PSFX"
 echo "DRY abgeleitet: VOLKEY=$VOLKEY PORT=$PORT SHM=$SHM MEM_LIMIT=$MEM_LIMIT MEMAVAIL_MIN_GIB=$MEMAVAIL_MIN_GIB HOUSE_GUARD=$HOUSE_GUARD"
-if bash -n "$S/spinning/gpu-arb/docker/host_acceptance.sh"; then ok "host_acceptance.sh Syntax"; else fail "host_acceptance.sh Syntax"; fi
-case "${DRY_STEP:-}" in serve) ok "Schritt serve";; *) fail "Schritt '${DRY_STEP:-}'";; esac
-case "$T" in bar1|nccl) ok "Transport $T";; *) fail "Transport '$T' (bar1|nccl)";; esac
-case "$HOUSE_GUARD" in memlimit|ct999-ruht) ok "HOUSE_GUARD=$HOUSE_GUARD";; *) fail "HOUSE_GUARD='$HOUSE_GUARD' (Pflicht fuer serve)";; esac
-case "$PROFILE" in "$LINE"*) ok "Profil $PROFILE passt zur Linie $LINE";; *) fail "Profil $PROFILE passt nicht zur Linie $LINE";; esac
-if docker image inspect "$IMAGE" >/dev/null 2>&1; then ok "Image $IMAGE vorhanden"; else fail "Image $IMAGE fehlt auf dem Host"; fi
+if bash -n "$S/spinning/gpu-arb/docker/host_acceptance.sh"; then ok "host_acceptance.sh syntax"; else fail "host_acceptance.sh syntax"; fi
+case "${DRY_STEP:-}" in serve) ok "step serve";; *) fail "step '${DRY_STEP:-}'";; esac
+case "$T" in bar1|nccl) ok "transport $T";; *) fail "transport '$T' (bar1|nccl)";; esac
+case "$HOUSE_GUARD" in memlimit|ct999-ruht) ok "HOUSE_GUARD=$HOUSE_GUARD";; *) fail "HOUSE_GUARD='$HOUSE_GUARD' (required for serve)";; esac
+case "$PROFILE" in "$LINE"*) ok "profile $PROFILE matches line $LINE";; *) fail "profile $PROFILE does not match line $LINE";; esac
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then ok "image $IMAGE present"; else fail "image $IMAGE missing on the host"; fi
 _lab=$(docker image inspect --format "{{index .Config.Labels \"htsglang.revision.$LINE\"}}" "$IMAGE" 2>/dev/null)
-if [ -n "$_lab" ] && [ "$_lab" = "$REV" ]; then ok "Image-Label htsglang.revision.$LINE = Kontext-Revision ${REV:0:10}"
-else fail "Image-Label htsglang.revision.$LINE='${_lab:0:10}' != Kontext-Revision '${REV:0:10}'"; fi
+if [ -n "$_lab" ] && [ "$_lab" = "$REV" ]; then ok "image label htsglang.revision.$LINE = context revision ${REV:0:10}"
+else fail "image label htsglang.revision.$LINE='${_lab:0:10}' != context revision '${REV:0:10}'"; fi
 if [ "$PROFILE_MOUNT" = 1 ]; then _pdir=$S/spinning/gpu-arb/docker/profiles; else _pdir=$HCTX/tools/profiles; fi
-if [ -f "$_pdir/$PROFILE.env" ]; then ok "Profil-Datei $_pdir/$PROFILE.env"; else fail "Profil-Datei $_pdir/$PROFILE.env fehlt"; fi
+if [ -f "$_pdir/$PROFILE.env" ]; then ok "profile file $_pdir/$PROFILE.env"; else fail "profile file $_pdir/$PROFILE.env missing"; fi
 _ps=$(cd "$_pdir" 2>/dev/null && env -i PATH=/usr/bin:/bin bash -c 'set +u; source "./'"$PROFILE"'.env" >/dev/null 2>&1 || exit 7; echo "${PROFILE_NAME:-}|${PROFILE_STATUS:-}|${#PROFILE_ARGS[@]}"')
 _prc=$?
 IFS='|' read -r _pn _pst _pna <<<"$_ps"
-if [ "$_prc" = 0 ] && [ "$_pn" = "$PROFILE" ] && [ "${_pna:-0}" -gt 0 ]; then ok "Profil trocken gesourct: PROFILE_NAME=$_pn PROFILE_STATUS=${_pst:-?} PROFILE_ARGS=$_pna"
-else fail "Profil trocken gesourct: rc=$_prc NAME='$_pn' ARGS='$_pna'"; fi
+if [ "$_prc" = 0 ] && [ "$_pn" = "$PROFILE" ] && [ "${_pna:-0}" -gt 0 ]; then ok "profile sourced dry: PROFILE_NAME=$_pn PROFILE_STATUS=${_pst:-?} PROFILE_ARGS=$_pna"
+else fail "profile sourced dry: rc=$_prc NAME='$_pn' ARGS='$_pna'"; fi
 case "$_pst" in experimentell|formnachweis)
-  if [ "${ALLOW_EXPERIMENTAL:-0}" = 1 ]; then ok "Status $_pst -> ALLOW_EXPERIMENTAL=1 gesetzt"; else fail "Status $_pst verlangt ALLOW_EXPERIMENTAL=1"; fi ;;
+  if [ "${ALLOW_EXPERIMENTAL:-0}" = 1 ]; then ok "status $_pst -> ALLOW_EXPERIMENTAL=1 set"; else fail "status $_pst demands ALLOW_EXPERIMENTAL=1"; fi ;;
 esac
 if _ha=$(house_args "$T" 2>&1); then ok "house_args $T: $(echo $_ha)"; else fail "house_args $T: $_ha"; fi
-[ -n "${GPUQ_ID:-}" ] && ok "GPUQ_ID gesetzt (${GPUQ_ID}; im echten Lauf die Fenster-id)" || fail "GPUQ_ID fehlt"
-echo "DRY Hinweis (kein Gate): Haus-Zustand JETZT per house_check $T (nur lesend):"
-( die(){ echo "house_check wuerde jetzt abbrechen: $*"; exit 1; }; house_check "$T" ) 2>&1 | grep -v 'awk: warning' | sed 's/^/DRY   | /' | tail -4
-if [ "$NF" = 0 ]; then echo "DRY GRUEN ($(date -u +%FT%TZ)): die Zeile passiert Parameter-, Image-, Profil- und Haus-Argument-Pruefung von host_acceptance.sh; kein Container, keine Karte."; exit 0
-else echo "DRY ROT: $NF Pruefung(en) fehlgeschlagen"; exit 1; fi
+[ -n "${GPUQ_ID:-}" ] && ok "GPUQ_ID set (${GPUQ_ID}; in the real run the window id)" || fail "GPUQ_ID missing"
+echo "DRY note (no gate): house state NOW via house_check $T (read-only):"
+( die(){ echo "house_check would abort now: $*"; exit 1; }; house_check "$T" ) 2>&1 | grep -v 'awk: warning' | sed 's/^/DRY   | /' | tail -4
+if [ "$NF" = 0 ]; then echo "DRY GRUEN ($(date -u +%FT%TZ)): the line passes the parameter, image, profile and house argument checks of host_acceptance.sh; no container, no card."; exit 0
+else echo "DRY ROT: $NF check(s) failed"; exit 1; fi
 '''
 
 
@@ -302,12 +300,12 @@ def build_dry_script(text: str, host_root: str = HOST_ROOT) -> str:
     pb0 = _index(lines, r"^for _kv in \$NCCL_EXTRA_ENV")
     pb1 = _index(lines, r"^\[\[ \$RUN_LABEL")
     if not (cut < pb0 <= pb1):
-        raise ValueError("host_acceptance.sh: Marken in unerwarteter Reihenfolge -- Trockenlauf verweigert")
+        raise ValueError("host_acceptance.sh: markers in unexpected order -- dry run refused")
     prelude = lines[:cut]
     # the prelude must not contain the side effects we cut at (defensive: a moved mkdir/trap would slip in)
     for ln in prelude:
         if re.match(r"^\s*(trap |mkdir |docker |rm |pct |systemctl )", ln):
-            raise ValueError("host_acceptance.sh: Seiteneffekt im Vorspann (%r) -- Trockenlauf verweigert" % ln.strip())
+            raise ValueError("host_acceptance.sh: side effect in the prelude (%r) -- dry run refused" % ln.strip())
     fns = []
     for name in ("ct999_state", "ct999_mem_mib", "house_args", "ct999_tmpfs_note", "house_check"):
         fns += _extract_fn(lines, name)

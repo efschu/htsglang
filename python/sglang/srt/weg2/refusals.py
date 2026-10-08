@@ -39,7 +39,7 @@ MARKER = "FORCED-PAST"
 
 CLASS_VALUE = "wert"
 CLASS_HARD = "nicht_forcebar"
-CLASS_LABEL = {CLASS_VALUE: "Wert-Ablehnung (forcebar)", CLASS_HARD: "nicht forcebar"}
+CLASS_LABEL = {CLASS_VALUE: "value refusal (forceable)", CLASS_HARD: "not forceable"}
 
 
 @dataclass(frozen=True)
@@ -66,107 +66,107 @@ def _h(code, title, why, source, by):
 
 
 REGISTER: Tuple[Refusal, ...] = (
-    # ------------------------------------------------------------------ Wert-Ablehnungen
-    _v("HW-COUNT", "Kartenzahl ist nicht die bewiesene / nicht zum Profil",
-       "Das Profil nennt die Kartenzahl (PROFILE_CARD_COUNT, Topologie P = PPn / D = TPn) bzw. der Planer kennt fuer N nur den Beweisstand "
-       "(topology.plan_topology, blockers); er vergleicht eine Zahl mit der sichtbaren Zahl. Ein Wert-Urteil ueber Zahlen und Beweisstand, "
-       "kein Fehler der Hardware.",
-       "weg2/topology.py plan_topology (HW-COUNT mit Blockern); weg2/card_identity.py order_cards; launcher.topology_check_line, launcher.order_cards", "launcher",
-       "Der Start läuft mit den sichtbaren Karten. Die genannten Blocker (Positions-Vektoren, BAR1-Fenster, PP-Schnitt-Boden, Records) bleiben bestehen; "
-       "die nächste Verweigerung kommt aus dem ersten davon, den der Launcher prüft."),
-    _v("HW-UNCALIBRATED", "Karteninventar ist nicht das gemessene",
-       "Die Positions-Messwerte des Profils (Budgets, Raten, Rest) gelten für ein anderes Inventar. Der Planer weigert sich, "
-       "fremde Messungen zu leihen. Das ist ein Urteil über die Güte der Zahlen, nicht über die Möglichkeit zu starten.",
+    # ------------------------------------------------------------------ value refusals
+    _v("HW-COUNT", "Card count is not the proven one / not the one of the profile",
+       "The profile names the card count (PROFILE_CARD_COUNT, topology P = PPn / D = TPn), or the planner knows only the proof state for N "
+       "(topology.plan_topology, blockers); it compares one number with the visible number. A value judgement about numbers and proof state, "
+       "not a fault of the hardware.",
+       "weg2/topology.py plan_topology (HW-COUNT with blockers); weg2/card_identity.py order_cards; launcher.topology_check_line, launcher.order_cards", "launcher",
+       "The start runs with the visible cards. The named blockers (positional vectors, BAR1 window, PP cut floor, records) remain; "
+       "the next refusal comes from the first of them that the launcher checks."),
+    _v("HW-UNCALIBRATED", "Card inventory is not the measured one",
+       "The positional measured values of the profile (budgets, rates, rest) apply to another inventory. The planner refuses "
+       "to borrow foreign measurements. This is a judgement about the quality of the numbers, not about the possibility to start.",
        "weg2/card_identity.py uncalibrated_message; launcher.inventory_check_line; "
        "AP1 1006: launcher.dc_measured_d_mib (W19, borrows the arch twin's residue), launcher.attn_anchor_stage "
        "(borrows the reference stage), launcher._unpin_foreign_cut (drops an infeasible profile pin)", "launcher",
-       "Die Zahlen des Profils werden auf das fremde Inventar angewendet, als wären sie dafür gemessen (Boot-Log trägt FORCED-PAST). "
-       "Zu erwarten: Fehlbudgets, im schlechten Fall OOM beim Laden oder Graph-Aufbau."),
-    _v("HW-BORROWED", "Census-Zeile einer Karte ist von einer anderen Karte geliehen",
-       "AP4 1526: der W71-Residenz-Census (--weg2-xchg-census) ist je Karten-UUID gemessen. Eine Karte des laufenden Inventars, die "
-       "nicht im Census steht (fremdes Rig, andere Kartenzahl, andere Klasse), bekommt die Zeile der schwersten Census-Karte "
-       "gleicher Klasse bzw. (ohne Klasse) der schwersten Zeile ueberhaupt. Eine geliehene Messung ist ein Urteil ueber die Guete "
-       "der Zahlen, nicht ueber die Moeglichkeit zu starten; der Peak wird weiter gegen die LIVE-NVML-Summe der Karte geprueft.",
+       "The numbers of the profile are applied to the foreign inventory as if they had been measured for it (the boot log carries FORCED-PAST). "
+       "To be expected: wrong budgets, in the worst case OOM at loading or graph building."),
+    _v("HW-BORROWED", "Census row of a card is borrowed from another card",
+       "AP4 1526: the W71 residency census (--weg2-xchg-census) is measured per card UUID. A card of the running inventory that is not "
+       "in the census (foreign rig, other card count, other class) gets the row of the heaviest census card of the same class, or "
+       "(without class) the heaviest row at all. A borrowed measurement is a judgement about the quality of the numbers, not about the "
+       "possibility to start; the peak is still checked against the LIVE NVML sum of the card.",
        "weg2/xchg_residency.py resolve_census; launcher.load_xchg_census_for_cards", "launcher",
-       "Der Austausch-Peak wird aus der geliehenen Zeile gerechnet (Boot-Log traegt FORCED-PAST HW-BORROWED). Zu erwarten: Peak "
-       "ueber- oder unterschaetzt; eine zu kleine Karte verweigert weiter ueber W71 (Peak gegen NVML-Summe)."),
-    _v("HOST-MEM", "Host-Speicher unter der Schwelle",
-       "Eine Schwelle (host_ledger-Preflight, MemAvailable >= 40 GiB) gegen einen gemessenen Wert: Kapazität, kein Fehler.",
+       "The exchange peak is calculated from the borrowed row (the boot log carries FORCED-PAST HW-BORROWED). To be expected: peak "
+       "over- or underestimated; a card that is too small keeps refusing through W71 (peak against the NVML sum)."),
+    _v("HOST-MEM", "Host memory below the threshold",
+       "A threshold (host_ledger preflight, MemAvailable >= 40 GiB) against a measured value: capacity, not a fault.",
        "launcher.host_preflight", "launcher",
-       "Der Start läuft mit weniger freiem Host-Speicher. Zu erwarten: OOM-Kill des Containers, wenn der Cache wächst."),
-    _v("D-BUDGET", "Gruppe D: Speicherplan unlösbar (Rang-Solver)",
-       "Der D-Rang-Solver hat gerechnet und meldet, dass seine Zielgrößen (KV, Experten, Reste) nicht in die Karten passen: "
-       "Kapazität, Zahlen bleiben für den Start verfügbar.",
+       "The start runs with less free host memory. To be expected: OOM kill of the container when the cache grows."),
+    _v("D-BUDGET", "Group D: memory plan unsolvable (rank solver)",
+       "The D rank solver has calculated and reports that its target sizes (KV, experts, rests) do not fit into the cards: "
+       "capacity; the numbers stay available for the start.",
        "launcher (D_RANK_SOLVE, plan.refusal)", "launcher",
-       "D startet mit dem gerechneten, nicht passenden Plan. Zu erwarten: OOM bei Pool-Anlage oder Graphen."),
-    _v("WAKE-CREDIT", "Aufwach-Kredit reicht nicht (P↔D-Wechsel)",
-       "Der Wake-Credit-Solver gibt ein Kapazitätsurteil über den Gruppenwechsel (Zeit/Bytes je Karte); die Zahlen existieren.",
+       "D starts with the calculated plan that does not fit. To be expected: OOM at pool allocation or graphs."),
+    _v("WAKE-CREDIT", "Wake credit is not enough (P↔D switch)",
+       "The wake credit solver gives a capacity judgement about the group switch (time/bytes per card); the numbers exist.",
        "launcher (wake_credit plan.refusal / log_wake_credit_solve_pd)", "launcher",
-       "Der Wechsel P↔D läuft mit unzureichendem Kredit. Zu erwarten: Wartezeit oder OOM im Flip."),
-    _v("P-CARD", "Gruppe P: Karten-Budget reicht nicht (Chunk/Experten)",
-       "Der P-Karten-Solver urteilt, dass der Chunk mit den Experten-Brüchen nicht in die Karte passt: Kapazitätsurteil über Zahlen.",
+       "The P↔D switch runs with insufficient credit. To be expected: waiting time or OOM in the flip."),
+    _v("P-CARD", "Group P: card budget is not enough (chunk/experts)",
+       "The P card solver judges that the chunk with the expert fractions does not fit into the card: a capacity judgement about numbers.",
        "launcher.p_card_verdict (p_card_refusal_text)", "launcher",
-       "P startet mit dem nicht passenden Chunk-/Experten-Plan. Zu erwarten: OOM im ersten Prefill-Chunk."),
-    _v("PP-CUT", "PP-Schnitt / Pipeline-Tiefe nicht finanzierbar",
-       "W40/W42/W43: der Schnitt-Solver findet keinen Schnitt unter den Pool-Böden bzw. die Tiefe wird nicht vom KV-Pool getragen: Zahlenurteil.",
+       "P starts with the chunk/expert plan that does not fit. To be expected: OOM in the first prefill chunk."),
+    _v("PP-CUT", "PP cut / pipeline depth not fundable",
+       "W40/W42/W43: the cut solver finds no cut under the pool floors, or the depth is not carried by the KV pool: a judgement about numbers.",
        "launcher (Weg2PPCutRefused, Weg2DepthUnfunded, Weg2DepthGapped)", "launcher",
-       "Noch nicht verdrahtet: Es gibt keinen Plan, mit dem weitergestartet werden könnte (der Solver liefert keinen Schnitt)."),
-    _v("PROFIL-STATUS", "Profil ist nicht abgenommen",
-       "PROFILE_STATUS (experimentell/formnachweis/vorbereitet/geplant) sagt, wie weit das Profil bewiesen ist: Urteil über den Beweisstand.",
+       "Not wired yet: there is no plan with which the start could continue (the solver delivers no cut)."),
+    _v("PROFIL-STATUS", "Profile is not accepted",
+       "PROFILE_STATUS (experimentell/formnachweis/vorbereitet/geplant) says how far the profile is proven: a judgement about the proof state.",
        "docker/entrypoint.sh (PROFILE_STATUS)", "entrypoint",
-       "Wie HTSGLANG_ALLOW_EXPERIMENTAL=1, aber auch für vorbereitet/geplant. Der Entrypoint liegt außerhalb des Repos (gestagter Patch)."),
-    _v("SHM", "/dev/shm zu klein",
-       "Schwelle (PROFILE_SHM_MIN_GIB) gegen die Größe des gemounteten shm: Kapazität.",
+       "Like HTSGLANG_ALLOW_EXPERIMENTAL=1, but also for vorbereitet/geplant. The entrypoint lies outside the repo (staged patch)."),
+    _v("SHM", "/dev/shm too small",
+       "Threshold (PROFILE_SHM_MIN_GIB) against the size of the mounted shm: capacity.",
        "docker/entrypoint.sh (SHM)", "entrypoint",
-       "Der Start läuft mit kleinerem shm. Zu erwarten: Bus-/Allokationsfehler beim Anlegen der Arena."),
-    _v("STORE", "Experten-Store (tmpfs) zu klein oder nicht tmpfs",
-       "Schwelle (PROFILE_TMPFS_GIB) gegen die Größe des Store-Mounts: Kapazität.",
+       "The start runs with a smaller shm. To be expected: bus/allocation error when the arena is created."),
+    _v("STORE", "Expert store (tmpfs) too small or not tmpfs",
+       "Threshold (PROFILE_TMPFS_GIB) against the size of the store mount: capacity.",
        "docker/entrypoint.sh (STORE)", "entrypoint",
-       "Der Start läuft mit zu kleinem Store. Zu erwarten: Absturz bei cudaHostRegister bzw. voller Store."),
+       "The start runs with a store that is too small. To be expected: crash at cudaHostRegister or a full store."),
     _v("MEMAVAIL", "MemAvailable unter PROFILE_MEMAVAIL_MIN_GIB",
-       "Schwelle des Profils gegen den gemessenen Host-Wert: Kapazität.",
+       "Threshold of the profile against the measured host value: capacity.",
        "docker/entrypoint.sh (MEMORY)", "entrypoint",
-       "Der Start läuft mit weniger freiem Host-Speicher (siehe HOST-MEM)."),
-    # ------------------------------------------------------------------ nicht forcebar
-    _h("HW-TOPOLOGY", "Kartenzahl ausserhalb von 2..8: es gibt gar keine Flip-Topologie",
-       "Keine Wert-Ablehnung: topology.plan_topology kennt fuer N ausserhalb [MIN_CARDS, MAX_CARDS_BAR1] keine Topologie (P/D-Form, BAR1-Fenster, "
-       "Pipeline), es gibt nichts, womit weitergestartet werden koennte. Ein N innerhalb des Bereichs, das nur noch nicht bewiesen ist, heisst "
-       "HW-COUNT und ist forcebar.",
+       "The start runs with less free host memory (see HOST-MEM)."),
+    # ------------------------------------------------------------------ not forceable
+    _h("HW-TOPOLOGY", "Card count outside 2..8: there is no flip topology at all",
+       "Not a value refusal: topology.plan_topology knows no topology for N outside [MIN_CARDS, MAX_CARDS_BAR1] (P/D form, BAR1 window, "
+       "pipeline), there is nothing with which the start could continue. An N inside the range that is merely not proven yet is called "
+       "HW-COUNT and is forceable.",
        "weg2/topology.py plan_topology; launcher.topology_check_line", "launcher"),
-    _h("HW-ARCH", "Compute-Capability ohne Kernel im Image",
-       "Keine Wert-Ablehnung: das Image trägt nur Code für sm_86 und sm_120 (Wheel 86;120a). Eine andere Architektur hat keinen "
-       "ausführbaren Kernel, und der Entrypoint verweigert sie schon heute ausdrücklich immer. Force würde einen Absturz im ersten "
-       "Kernel statt einer Meldung liefern.",
+    _h("HW-ARCH", "Compute capability without a kernel in the image",
+       "Not a value refusal: the image carries only code for sm_86 and sm_120 (wheel 86;120a). Another architecture has no "
+       "executable kernel, and the entrypoint expressly always refuses it already today. Force would deliver a crash in the first "
+       "kernel instead of a message.",
        "weg2/card_identity.py arch_gate; launcher.resolve_cards", "launcher"),
-    _h("KARTE-BELEGT", "Fremder Prozess oder fremdes Fenster auf der Karte",
-       "Keine Wert-Ablehnung, sondern Schutz anderer Nutzer: die Belegungsprüfung (NVML-Fremdnutzung, gpuq-Fenster) darf nie "
-       "übergangen werden, sonst trifft der Start die Daten eines anderen.",
-       "launcher.cards_free_check; gpuq-Fenster", "launcher"),
-    _h("SHM-BELEGT", "Lebender Halter auf eigenen /dev/shm-Einträgen",
-       "Fremder lebender Prozess hält Einträge des Launchers: Belegung, nicht Wert. Wegräumen würde ihn zerstören.",
+    _h("KARTE-BELEGT", "Foreign process or foreign window on the card",
+       "Not a value refusal but protection of other users: the occupancy check (NVML foreign use, gpuq window) must never "
+       "be passed, otherwise the start hits the data of someone else.",
+       "launcher.cards_free_check; gpuq window", "launcher"),
+    _h("SHM-BELEGT", "Live holder on own /dev/shm entries",
+       "A foreign live process holds entries of the launcher: occupancy, not a value. Sweeping them away would destroy it.",
        "launcher.shm_residue_sweep (#1217/#1233)", "launcher"),
-    _h("PORT-BELEGT", "Front-Port ist schon gebunden",
-       "Echter Fehler: ein anderer Listener hält den Port. Ein Start würde scheitern oder den fremden Listener stören.",
+    _h("PORT-BELEGT", "Front port is already bound",
+       "A real fault: another listener holds the port. A start would fail or disturb the foreign listener.",
        "launcher.refuse_if_front_unbindable", "launcher"),
-    _h("MODELL-FEHLT", "Modell, Draft, Tokenizer oder vom Profil verlangter Pfad fehlt oder ist kaputt",
-       "Echter Fehler, kein Wert: ohne die Datei gibt es nichts zu laden (Entrypoint MODEL, Launcher W162/W163).",
+    _h("MODELL-FEHLT", "Model, draft, tokenizer or a path demanded by the profile is missing or broken",
+       "A real fault, not a value: without the file there is nothing to load (entrypoint MODEL, launcher W162/W163).",
        "docker/entrypoint.sh (MODEL); launcher (Weg2GgufDepthRefused, Weg2TokenizerRefused)", "entrypoint"),
-    _h("FORMAT", "Format des Checkpoints passt nicht zum Profil",
-       "Echter Fehler: der Checkpoint ist in einem anderen Format als das Profil annimmt (Entrypoint detect_format, Launcher W160).",
+    _h("FORMAT", "Format of the checkpoint does not match the profile",
+       "A real fault: the checkpoint is in another format than the profile assumes (entrypoint detect_format, launcher W160).",
        "docker/entrypoint.sh (MODEL); launcher (Weg2Fp8LayoutRefused)", "entrypoint"),
-    _h("BAUM", "Code-Stand unsauber oder nicht das Image",
-       "Herkunftsprüfung: ein Boot aus einem anderen oder geänderten Baum wäre nicht reproduzierbar und nichts darüber belegbar.",
+    _h("BAUM", "Code state unclean or not the image",
+       "Provenance check: a boot from another or modified tree would not be reproducible and nothing about it could be verified.",
        "launcher (tree is not clean); docker/entrypoint.sh (TREE)", "launcher"),
-    _h("OPTIONEN", "Widersprüchliche oder unbekannte Optionen",
-       "Der Aufruf widerspricht sich (z. B. --pp-stage-ratio ohne --pp-attn-stage-ratio, Draft-Schalter gegen Env): ein Bedienfehler, "
-       "kein Wert-Urteil. Der Start hätte keine eindeutige Bedeutung.",
-       "launcher (W40 Pflichtpaare, W44, W104, W151/W152, Argparse)", "launcher"),
-    _h("LAUF-FEHLER", "Gruppe starb oder wurde nicht READY",
-       "Laufzeitfehler nach dem Start: es gibt nichts zu übergehen.",
+    _h("OPTIONEN", "Contradictory or unknown options",
+       "The call contradicts itself (e.g. --pp-stage-ratio without --pp-attn-stage-ratio, draft switch against env): an operating error, "
+       "not a value judgement. The start would have no unambiguous meaning.",
+       "launcher (W40 mandatory pairs, W44, W104, W151/W152, argparse)", "launcher"),
+    _h("LAUF-FEHLER", "Group died or did not become READY",
+       "Runtime error after the start: there is nothing to pass.",
        "launcher.wait_ready", "launcher"),
-    _h("LAUNCHER-UNKLASSIFIZIERT", "Übrige Weg2LaunchRefused-Stellen des Launchers",
-       "Die Stellen sind noch nicht einzeln klassifiziert (Stand: siehe launcher_raise_sites()). Bis dahin bleiben sie hart; "
-       "ehrliche Teilabdeckung, kein Pauschalfreibrief.",
+    _h("LAUNCHER-UNKLASSIFIZIERT", "Remaining Weg2LaunchRefused sites of the launcher",
+       "The sites are not classified individually yet (state: see launcher_raise_sites()). Until then they stay hard; "
+       "honest partial coverage, no blanket pass.",
        "launcher (Weg2LaunchRefused)", "launcher"),
 )
 

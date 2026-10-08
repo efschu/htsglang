@@ -223,7 +223,7 @@ class TestMeasureOnlyInABookedWindow(Base):
         m = self.mod(hw)
         out = hw.measure({"cards": [0, 1]})
         self.assertEqual(out["action"], "abgelehnt")
-        self.assertIn("belegt", out["error"])
+        self.assertIn("occupied", out["error"])
         self.assertEqual(m.CALLS, [])
         self.assertEqual(self.gq.bookings["bk1"]["state"], "released")
 
@@ -514,12 +514,12 @@ class TestDisplayModule(unittest.TestCase):
         h = out.stdout
         self.assertIn("nicht gemessen", h)
         self.assertIn("kein sgl_kernel", h)        # der Grund steht im Hover
-        self.assertIn("gem.", h)                   # Quellenmarke
+        self.assertIn("meas.", h)                   # Quellenmarke
         self.assertIn("NVML", h)
         self.assertIn("host staging", h)
         self.assertIn("BAR1 stretch per pair: NOT MEASURED", h)
-        self.assertIn("gedrosselt: sw_thermal_slowdown", h)
-        self.assertIn("Fenster bk1", h)
+        self.assertIn("throttled: sw_thermal_slowdown", h)
+        self.assertIn("Window bk1", h)
         self.assertIn("lanes nicht gemessen", h)
         self.assertNotIn("<script", h)
         # Escapes: ein Gerätename mit Markup wird nicht eingebettet

@@ -109,8 +109,8 @@ class TestBarContract(unittest.TestCase):
             self.assertEqual(len(ov), 1)
             self.assertAlmostEqual(sum(c["mib"] for c in ov[0]["cut"]), ov[0]["mib"], delta=0.01)
             self.assertNotIn("free_in_budget", [g["key"] for g in b["segments"]])
-        self.assertTrue(any("ueber dem Budget" in h for h in r["hints"]))
-        self.assertTrue(any("Force" in h for h in r["hints"]))
+        self.assertTrue(any("over the budget" in h for h in r["hints"]))
+        self.assertTrue(any("force" in h for h in r["hints"]))
 
     def test_no_free_segment_when_overflowing_and_no_overflow_segment_when_fitting(self):
         s = {"stage_layers": [32, 16, 16], "kv_dtype": "fp8_e4m3", "context_tokens": 4096}

@@ -29,12 +29,12 @@ BAR1_WINDOW_NEED_MIB = 168
 BAR1_NO_REBAR_MIB = 256
 
 FACTS = {
-    "barlink_default": "NF_PROFILE.md 5.1: Kollektive und Flip-Lanes über barlink BAR1; PP-send/recv über NCCL",
-    "window_need": "NF_PROFILE.md 5.2: Gruppenfenster rund 168 von 256 MiB; HW-GENERISCH K3: BAR1 < ~168 MiB passt nicht",
-    "rig_bar1": "NF_PROFILE.md 5.2: 5090 32768 MiB, 3080 je 256 MiB, EnableResizableBar 0 (24.09.)",
-    "rig_widths": "Nutzer-bestätigt 17.08.: 5090 x8, eine 3080 x8, eine 3080 x4 (memory rig-interconnect-p2p)",
-    "host": "Host braucht gepatchten nvidia-open 595.58.03, RegistryDwords RMSmallBarP2PPeerBar1=1;PeerMappingOverride=1, dmabuf_holder",
-    "nccl": "NF_PROFILE.md 5.1: reiner NCCL-Betrieb (--transport nccl) ist Entwicklungsschalter, für NF nie gebootet",
+    "barlink_default": "NF_PROFILE.md 5.1: collectives and flip lanes via barlink BAR1; PP send/recv via NCCL",
+    "window_need": "NF_PROFILE.md 5.2: group window about 168 of 256 MiB; HW-GENERISCH K3: BAR1 < ~168 MiB does not fit",
+    "rig_bar1": "NF_PROFILE.md 5.2: 5090 32768 MiB, 3080 256 MiB each, EnableResizableBar 0 (24.09.)",
+    "rig_widths": "User-confirmed 17.08.: 5090 x8, one 3080 x8, one 3080 x4 (memory rig-interconnect-p2p)",
+    "host": "Host needs the patched nvidia-open 595.58.03, RegistryDwords RMSmallBarP2PPeerBar1=1;PeerMappingOverride=1, dmabuf_holder",
+    "nccl": "NF_PROFILE.md 5.1: pure NCCL operation (--transport nccl) is a development switch, never booted for NF",
 }
 
 
@@ -46,11 +46,11 @@ def bar1_mib(vram_mib: int, rebar: bool) -> dict:
     """BAR1-Größe.  Aus: 256 MiB (am Rig an den 3080 gemessen).  An: kleinste Zweierpotenz >= VRAM
     (abgeleitet; am Rig nur die 5090 mit 32768 MiB bestätigt)."""
     if not rebar:
-        return {"mib": BAR1_NO_REBAR_MIB, "src": "Resizable BAR aus: 256 MiB (gemessen an den Rig-3080, NF_PROFILE.md 5.2)"}
+        return {"mib": BAR1_NO_REBAR_MIB, "src": "Resizable BAR off: 256 MiB (measured on the rig 3080s, NF_PROFILE.md 5.2)"}
     p = 1
     while p < int(vram_mib):
         p <<= 1
-    return {"mib": p, "src": "Resizable BAR an: Zweierpotenz >= VRAM (abgeleitet; Rig-Bestätigung nur 5090 = 32768 MiB)"}
+    return {"mib": p, "src": "Resizable BAR on: power of two >= VRAM (derived; rig confirmation only 5090 = 32768 MiB)"}
 
 
 def effective_link(card_native: dict, slot: dict) -> dict:
@@ -65,9 +65,9 @@ def normalize_slot(raw: Optional[dict]) -> dict:
     gen = int(raw.get("gen", 4))
     lanes = int(raw.get("lanes", 16))
     if gen not in GENS:
-        raise ValueError("PCIe-Generation muss 3, 4 oder 5 sein, nicht %r" % gen)
+        raise ValueError("PCIe generation must be 3, 4 or 5, not %r" % gen)
     if lanes not in LANES:
-        raise ValueError("PCIe-Lanes müssen 1, 4, 8 oder 16 sein, nicht %r" % lanes)
+        raise ValueError("PCIe lanes must be 1, 4, 8 or 16, not %r" % lanes)
     return {"gen": gen, "lanes": lanes, "rebar": bool(raw.get("rebar", False)),
             "chipset": bool(raw.get("chipset", False))}
 
@@ -78,64 +78,57 @@ def per_card_link(cat_entry: dict, slot: dict) -> dict:
     bar = bar1_mib(cat_entry["usable_mib"], s["rebar"])
     return {"slot": s, "effective": eff, "bar1_mib": bar["mib"], "bar1_src": bar["src"],
             "limited_by": ("Slot" if (s["gen"] < cat_entry["pcie_native"]["gen"]
-                                      or s["lanes"] < cat_entry["pcie_native"]["lanes"]) else "Karte"),
+                                      or s["lanes"] < cat_entry["pcie_native"]["lanes"]) else "card"),
             "chipset": s["chipset"]}
 
 
 def choose_transport(links: List[dict], labels: List[str], *, host_patched: bool = True) -> dict:
     """Transport für die weg2-Kollektive und den Flip.  ``links`` = Ausgaben von ``per_card_link``.
 
-    Ergebnis: ``transport`` ('bar1' | 'nccl' | 'keiner'), ``confidence`` ('belegt' | 'ungeprüft' | 'entwicklung'),
+    Ergebnis: ``transport`` ('bar1' | 'nccl' | 'none'), ``confidence`` ('verified' | 'unchecked' | 'development'),
     ``reasons`` (jede Angabe, die in die Wahl einging), ``warnings``, ``card_notes`` (je Karte)."""
     reasons: List[str] = []
     warns: List[str] = []
     notes: List[str] = []
     n = len(links)
     if n < 2:
-        return {"transport": "keiner", "confidence": "belegt",
-                "reasons": ["Eine Karte: kein Kartenverkehr, weder barlink noch NCCL nötig. Der weg2-Flip braucht zwei Gruppen auf denselben Karten "
-                            "und mindestens 2 Karten (topology.MIN_CARDS)."],
-                "warnings": [], "card_notes": ["%s: %s" % (labels[0], "keine Gegenstelle")] if labels else []}
+        return {"transport": "none", "confidence": "verified",
+                "reasons": ["One card: no card traffic, neither barlink nor NCCL needed. The weg2 flip needs two groups on the same cards and at least 2 cards (topology.MIN_CARDS)."],
+                "warnings": [], "card_notes": ["%s: %s" % (labels[0], "no peer")] if labels else []}
     small = [(labels[i], l["bar1_mib"]) for i, l in enumerate(links) if l["bar1_mib"] < BAR1_WINDOW_NEED_MIB]
     chip = [labels[i] for i, l in enumerate(links) if l["chipset"]]
     narrow = [(labels[i], l["effective"]) for i, l in enumerate(links) if l["effective"]["lanes"] <= 4]
     for i, l in enumerate(links):
         e = l["effective"]
-        notes.append("%s: PCIe Gen%d x%d = %.1f GB/s brutto (%s begrenzt), BAR1 %d MiB%s%s"
+        notes.append("%s: PCIe Gen%d x%d = %.1f GB/s gross (%s limited), BAR1 %d MiB%s%s"
                      % (labels[i], e["gen"], e["lanes"], e["gbs"], l["limited_by"], l["bar1_mib"],
-                        " (Resizable BAR %s)" % ("an" if l["slot"]["rebar"] else "aus"),
-                        ", über Chipsatz" if l["chipset"] else ""))
+                        " (Resizable BAR %s)" % ("on" if l["slot"]["rebar"] else "off"),
+                        ", via chipset" if l["chipset"] else ""))
     if not host_patched:
-        reasons.append("Der Host hat NICHT den gepatchten nvidia-open 595.58.03 mit RMSmallBarP2PPeerBar1=1/PeerMappingOverride=1 und "
-                       "dmabuf_holder: barlink BAR1 verweigert (Quelle: " + FACTS["host"] + ").")
-        reasons.append("Bleibt NCCL (kein GPUDirect-P2P auf GeForce: Host-Staging). " + FACTS["nccl"] + ".")
-        return {"transport": "nccl", "confidence": "entwicklung", "reasons": reasons,
-                "warnings": ["NCCL-Betrieb der weg2-Linie ist ein Entwicklungsschalter und für NF nie gebootet."],
+        reasons.append("The host does NOT have the patched nvidia-open 595.58.03 with RMSmallBarP2PPeerBar1=1/PeerMappingOverride=1 and dmabuf_holder: barlink BAR1 refused (source: " + FACTS["host"] + ").")
+        reasons.append("NCCL remains (no GPUDirect P2P on GeForce: host staging). " + FACTS["nccl"] + ".")
+        return {"transport": "nccl", "confidence": "development", "reasons": reasons,
+                "warnings": ["NCCL operation of the weg2 line is a development switch and never booted for NF."],
                 "card_notes": notes}
     if small:
-        reasons.append("BAR1 zu klein für die weg2-Gruppenfenster (nötig %d MiB, Quelle: %s): %s."
+        reasons.append("BAR1 too small for the weg2 group windows (needed %d MiB, source: %s): %s."
                        % (BAR1_WINDOW_NEED_MIB, FACTS["window_need"], ", ".join("%s %d MiB" % s for s in small)))
-        reasons.append("Darum NCCL statt barlink BAR1.")
-        return {"transport": "nccl", "confidence": "entwicklung", "reasons": reasons,
-                "warnings": ["NCCL-Betrieb ist ein Entwicklungsschalter (nie gebootet, " + FACTS["nccl"] + ")."],
+        reasons.append("Hence NCCL instead of barlink BAR1.")
+        return {"transport": "nccl", "confidence": "development", "reasons": reasons,
+                "warnings": ["NCCL operation is a development switch (never booted, " + FACTS["nccl"] + ")."],
                 "card_notes": notes}
-    reasons.append("barlink BAR1: gepatchter Host-Treiber vorausgesetzt (Annahme der Seite: ja), alle Karten haben BAR1 >= %d MiB "
-                   "(kleinste: %d MiB). Das ist die Bestform des Rigs (%s)."
+    reasons.append("barlink BAR1: patched host driver assumed (assumption of the page: yes), all cards have BAR1 >= %d MiB (smallest: %d MiB). This is the best form of the rig (%s)."
                    % (BAR1_WINDOW_NEED_MIB, min(l["bar1_mib"] for l in links), FACTS["barlink_default"]))
-    reasons.append("PP-Aktivierungen zwischen den P-Stufen laufen unabhängig davon über NCCL (send/recv).")
-    conf = "belegt"
+    reasons.append("PP activations between the P stages run via NCCL (send/recv) regardless of this.")
+    conf = "verified"
     if any(not l["slot"]["rebar"] for l in links):
-        reasons.append("Resizable BAR aus auf %s: BAR1 = 256 MiB, genug für die Fenster (am Rig so gebootet); größere BAR1 bringt "
-                       "keine belegte Beschleunigung." % ", ".join(labels[i] for i, l in enumerate(links) if not l["slot"]["rebar"]))
+        reasons.append("Resizable BAR off on %s: BAR1 = 256 MiB, enough for the windows (booted like this on the rig); a larger BAR1 brings no verified speedup." % ", ".join(labels[i] for i, l in enumerate(links) if not l["slot"]["rebar"]))
     if chip:
-        conf = "ungeprüft"
-        warns.append("Über Chipsatz angebunden: %s. Der DMA-Weg Karte-zu-Karte über den Chipsatz-Uplink (DMI) ist am Metall nicht geprüft "
-                     "(alle Rig-Karten hängen an der CPU, PHB); der Uplink ist geteilt und schmaler als ein CPU-Slot." % ", ".join(chip))
-        reasons.append("Wegen Chipsatz-Anbindung bleibt barlink BAR1 'ungeprüft'; Rückfall wäre NCCL (Entwicklungsschalter).")
+        conf = "unchecked"
+        warns.append("Connected via chipset: %s. The DMA path card to card via the chipset uplink (DMI) is not checked on the hardware (all rig cards hang on the CPU, PHB); the uplink is shared and narrower than a CPU slot." % ", ".join(chip))
+        reasons.append("Because of the chipset connection barlink BAR1 stays 'unchecked'; fallback would be NCCL (development switch).")
     if narrow:
-        warns.append("Schmale Anbindung (<= x4): %s. Am Rig läuft eine 3080 auf x4; der Planer legt dort die Stufe mit den wenigsten "
-                     "Attention-Layern hin (Platzierungsregel #704b). Flip-Preise (Pull-Rate 6,5 GB/s 'x4-3080-Kante', HW-GENERISCH K4) "
-                     "sind nur für das Rig gemessen." % ", ".join("%s x%d" % (a, e["lanes"]) for a, e in narrow))
+        warns.append("Narrow link (<= x4): %s. On the rig one 3080 runs at x4; the planner puts the stage with the fewest attention layers there (placement rule #704b). Flip prices (pull rate 6.5 GB/s 'x4-3080 edge', HW-GENERISCH K4) are measured only for the rig." % ", ".join("%s x%d" % (a, e["lanes"]) for a, e in narrow))
     slow = min(links, key=lambda l: l["effective"]["gbs"])
-    warns.append("Engste Anbindung: %.1f GB/s brutto; sie bestimmt Flip-Gewichtstausch und Ring-Restore (theoretisch, nicht gemessen)." % slow["effective"]["gbs"])
+    warns.append("Narrowest link: %.1f GB/s gross; it determines the flip weight exchange and ring restore (theoretical, not measured)." % slow["effective"]["gbs"])
     return {"transport": "bar1", "confidence": conf, "reasons": reasons, "warnings": warns, "card_notes": notes}

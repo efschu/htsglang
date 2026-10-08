@@ -177,12 +177,12 @@ def rate_table(cards: Sequence[Mapping[str, Any]], *, measured: Optional[Mapping
     for c in cards:
         v, s = None, ""
         if c.get("tflops") is not None and str(c.get("tflops_src", "")) == "gemessen":
-            v, s = float(c["tflops"]), "gemessen (Hardwareprofil)"
+            v, s = float(c["tflops"]), "measured (hardware profile)"
         elif measured:
             nm = ci.model_name(c.get("name", ""))
             for key in ("%s %dGB" % (nm, round(int(c["total_mib"]) / 1024.0)), nm):
                 if measured.get(key):
-                    v, s = float(measured[key]), "gemessen (%s)" % key
+                    v, s = float(measured[key]), "measured (%s)" % key
                     break
         if v is None and lib is not None:
             # the MEASURED GEMM rate of the library row (spec.gemm_tflops, written by card_rate_pass), not the datasheet peak
@@ -190,13 +190,13 @@ def rate_table(cards: Sequence[Mapping[str, Any]], *, measured: Optional[Mapping
                 spec = lib.resolve(str(c.get("name", "")), int(c["total_mib"]))
                 g = getattr(spec, "gemm_tflops", None)
                 if g:
-                    v, s = float(g), "gemessen (card_library)"
+                    v, s = float(g), "measured (card_library)"
             except Exception:  # noqa: BLE001 - UncalibratedCard / CardCapacityMismatch: no library row for this card
                 pass
         meas.append(v)
         src.append(s)
     if all(v is not None for v in meas) and meas:
-        return [float(v) for v in meas], src, "gemessen: GEMM-Rate je Karte"
+        return [float(v) for v in meas], src, "measured: GEMM rate per card"
     # datasheet basis for ALL cards
     peaks: List[Optional[float]] = []
     for c in cards:
@@ -211,11 +211,11 @@ def rate_table(cards: Sequence[Mapping[str, Any]], *, measured: Optional[Mapping
             p = float(c["peak_tflops"])
         peaks.append(p)
     if all(p is not None for p in peaks) and peaks:
-        return [float(p) for p in peaks], ["Datenblatt/unbelegt (FP16-Spitze)"] * len(peaks), (
-            "Datenblatt/unbelegt: FP16-Spitzenrate je Karte (%s)" % (
-                "nicht jede Karte hat eine Messrate" if any(m is not None for m in meas) else "keine Messrate"))
-    return ([float(c["total_mib"]) for c in cards], ["unbelegt (keine Rate)"] * len(cards),
-            "unbelegt: keine GEMM-Rate und keine Datenblattspitze, die VRAM-Groesse ersetzt die Rate")
+        return [float(p) for p in peaks], ["datasheet/unverified (FP16 peak)"] * len(peaks), (
+            "datasheet/unverified: FP16 peak rate per card (%s)" % (
+                "not every card has a measured rate" if any(m is not None for m in meas) else "no measured rate"))
+    return ([float(c["total_mib"]) for c in cards], ["unverified (no rate)"] * len(cards),
+            "unverified: no GEMM rate and no datasheet peak, the VRAM size stands in for the rate")
 
 
 def split_layers(n_layers: int, weights: Sequence[float], caps: Sequence[Optional[int]]) -> Tuple[List[int], List[str]]:
@@ -250,8 +250,7 @@ def split_layers(n_layers: int, weights: Sequence[float], caps: Sequence[Optiona
     layers = [fixed.get(i, 1) for i in range(k)]
     diff = n_layers - sum(layers)
     if diff != 0:
-        notes.append("Die Speicherkapazitaet der Stufen (%s Schichten) fasst %d Schichten nicht: der Rest von %d Schichten liegt auf "
-                     "der Stufe mit der meisten freien Kapazitaet" % (csv([c if c < n_layers else "-" for c in capv]), n_layers, diff))
+        notes.append("The memory capacity of the stages (%s layers) does not hold %d layers: the rest of %d layers lies on the stage with the most free capacity" % (csv([c if c < n_layers else "-" for c in capv]), n_layers, diff))
         spare = sorted(range(k), key=lambda i: (-(capv[i] - layers[i]), i))
         layers[spare[0]] += diff
     return layers, notes
@@ -278,7 +277,7 @@ def class_rekey(values: Sequence[str], calibrated: Sequence[str], live: Sequence
     ``inventory_view.CLASS_MAX``: books more, never an average, never another class); else the class of its arch twin
     (:data:`ARCH_TWIN`, ``HW-BORROWED``), the maximum over THAT class; else the maximum of every entry (``unbelegt``).
     Returns ``(new values, source per card)``; the source is ``"Klasse X"``, ``"geborgt: <twin> (unbelegt)"`` or
-    ``"unbelegt: Maximum aller Karten"``."""
+    ``"unverified: maximum of all cards"``."""
     def key(x: str) -> float:
         return float(x)
 
@@ -289,16 +288,16 @@ def class_rekey(values: Sequence[str], calibrated: Sequence[str], live: Sequence
         same = [values[i] for i, k in enumerate(calibrated) if k == cls]
         if same:
             out.append(max(same, key=key))
-            srcs.append("Klasse %s" % cls)
+            srcs.append("class %s" % cls)
             continue
         twin = ARCH_TWIN.get(str(c.get("arch")))
         tw = [values[i] for i, k in enumerate(calibrated) if k == twin]
         if twin and tw:
             out.append(max(tw, key=key))
-            srcs.append("geborgt: %s (unbelegt)" % twin)
+            srcs.append("borrowed: %s (unverified)" % twin)
             continue
         out.append(max(values, key=key))
-        srcs.append("unbelegt: Maximum aller Karten")
+        srcs.append("unverified: maximum of all cards")
     return out, srcs
 
 
@@ -421,8 +420,7 @@ def fr_p(p: Any, layers: Sequence[int], avail: Sequence[float], costs: Sequence[
         f = 0.0 if exp <= 0 else max(0.0, min(fmax, spare / exp))
         out.append(math.floor(f * 1000.0) / 1000.0)
         if spare < 0:
-            notes.append("Stufe %d: die Grundlast ihrer Schichten (%.0f MiB) uebersteigt, was die Karte anbietet (%.0f MiB): "
-                         "residenter Expertenanteil 0" % (i, floor, avail[i]))
+            notes.append("Stage %d: the base load of its layers (%.0f MiB) exceeds what the card offers (%.0f MiB): resident expert share 0" % (i, floor, avail[i]))
     return out, notes
 
 
@@ -448,8 +446,8 @@ def link_rate(card: Mapping[str, Any]) -> Tuple[float, str]:
         return float(card["h2d_gbs"]), "gemessen"
     g, w = card.get("pcie_max_gen"), card.get("pcie_max_width")
     if g and w and int(g) in PCIE_GBS_PER_LANE:
-        return PCIE_GBS_PER_LANE[int(g)] * int(w), "Datenblatt (PCIe-Nennwert, unbelegt)"
-    return 1.0, "unbelegt (keine PCIe-Angabe, gleiche Rate angenommen)"
+        return PCIE_GBS_PER_LANE[int(g)] * int(w), "datasheet (PCIe nominal value, unverified)"
+    return 1.0, "unverified (no PCIe information, same rate assumed)"
 
 
 def draft_placement(p: Any, host_budget_mib: float, host_fixed_mib: float, kv_mib: float, mamba_mib: float,
@@ -462,9 +460,8 @@ def draft_placement(p: Any, host_budget_mib: float, host_fixed_mib: float, kv_mi
     margin = host_budget_mib - need
     return {"placement": "solo" if margin >= 0 else "split", "need_mib": need, "budget_mib": host_budget_mib,
             "margin_mib": margin,
-            "why": ("Draft %.0f + dichte Gewichte %.0f + KV-Pflicht %.0f + Mamba-Zustand %.0f = %.0f MiB; Budget von Rang 0 %.0f MiB: "
-                    "%s (Spielraum %.0f MiB)" % (draft_mib, host_fixed_mib, kv_mib, mamba_mib, need, host_budget_mib,
-                                                  "passt" if margin >= 0 else "passt nicht", margin))}
+            "why": ("Draft %.0f + dense weights %.0f + KV obligation %.0f + Mamba state %.0f = %.0f MiB; budget of rank 0 %.0f MiB: %s (margin %.0f MiB)" % (draft_mib, host_fixed_mib, kv_mib, mamba_mib, need, host_budget_mib,
+                                                  "fits" if margin >= 0 else "does not fit", margin))}
 
 
 def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[int], reserves_mib: Sequence[int], *,
@@ -497,14 +494,13 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
     cb = [FA.CardBudget(rank=i, name=str(c.get("name", "")), nameplate_mib=int(c["total_mib"]), budget_mib=int(budgets_mib[i]),
                         reserve_mib=int(reserves_mib[i]), link_gib_s=link_rate(c)[0], role="host" if i == 0 else "worker")
           for i, c in enumerate(cards)]
-    unb = ["Laufzeitposten von Form A (Host %.2f / Worker %.2f GiB, Korridor %.2f, Dispatch %.2f, Router %.2f, Spekulativ-Zustand %.2f) "
-           "sind die gemessenen Posten des Boots fn8ah: geborgt, fuer dieses Modell und diese Karten unbelegt" % (
+    unb = ["Runtime items of form A (host %.2f / worker %.2f GiB, corridor %.2f, dispatch %.2f, router %.2f, speculative state %.2f) are the measured items of boot fn8ah: borrowed, unverified for this model and these cards" % (
                ref.host_runtime_gib, ref.worker_runtime_gib, ref.corridor_gib, ref.dispatch_buffer_gib, ref.worker_router_gib,
                ref.spec_state_gib)]
     try:
         plan = FA.solve_form_a(cb, posts, geom)
     except FA.FormAInfeasible as exc:
-        return {"ok": False, "error": "der Form-A-Loeser findet keine Aufteilung (%s: %s)" % (type(exc).__name__, exc), "unbelegt": unb}
+        return {"ok": False, "error": "the form A solver finds no split (%s: %s)" % (type(exc).__name__, exc), "unbelegt": unb}
     # The launcher refuses a D rank without a Platztausch buffer (W120 Weg2PlatztauschBufferUnbuilt, ``launcher.py``
     # ``_refuse_unbuilt_platztausch_buffers``): a rank holds ``owned + pad`` local rows per layer and builds the buffer only when
     # at least MIN_SCRATCH_ROWS (2) rows stay free, i.e. ``resident_rows <= E - 2``.  A card that fits its WHOLE share (plan
@@ -521,8 +517,7 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
     fr = [min(f, c) if c is not None else f for f, c in zip(fr_plan, fr_cap)]
     capped = [i for i, (f, g) in enumerate(zip(fr_plan, fr)) if g < f]
     if capped:
-        unb.append("residenter Anteil von Rang %s auf den Platztausch-Puffer begrenzt (Loeser: %s, Grenze: %s): ein Rang mit weniger als "
-                   "2 Scratch-Zeilen baut keinen Puffer, der Launcher verweigert das als W120" % (
+        unb.append("resident share of rank %s limited to the swap buffer (solver: %s, limit: %s): a rank with fewer than 2 scratch rows builds no buffer, the launcher refuses that as W120" % (
                        ",".join(str(i) for i in capped), ",".join("%.3f" % fr_plan[i] for i in capped),
                        ",".join("%.3f" % fr[i] for i in capped)))
     return {"ok": True, "error": "", "role": ["host"] + ["worker"] * (n - 1), "tp_ratio": [1] + [0] * (n - 1),

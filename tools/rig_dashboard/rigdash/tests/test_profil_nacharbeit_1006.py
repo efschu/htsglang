@@ -2,7 +2,7 @@
 Verdikt-Register, steht in test/registered/unit/weg2/test_planer_nacharbeit_1006.py).
 
   F1  Verdikt-Chip: nach "Neu pruefen" steht der Chip eines uebersteuerten Werts auf dem Urteil des Trockenlaufs; "ungeprueft seit Ihrer Aenderung" nur bis zum naechsten Lauf.
-  F2  Seed-Zeile ``--pp-stage-ratio (Seed)``: nie "nicht gesetzt", wo das Profil den Wert setzt; als Aenderung zaehlt nur, was im argv steht.
+  F2  Seed-Zeile ``--pp-stage-ratio (Seed)``: nie "not set", wo das Profil den Wert setzt; als Aenderung zaehlt nur, was im argv steht.
   F3  Laufbericht: nimmt den Orakel-Lauf des Vorschlags auf, wenn es keinen Trockenlauf gibt; ein Trockenlauf geht vor.
   F4  Hardware-Issue-Text: die UUID steht nie drin (Tabelle und Erklaertext sagen dasselbe).
   F5  Kartenauswahl im synthetischen Inventar hat ein aria-label.
@@ -53,7 +53,7 @@ out.html = PX.renderRow(nutzer, ctx({ prop: { werte: [W] }, vsrc: "dry", dry: { 
 
     def test_before_the_run_the_chip_says_unchecked_since_your_change(self):
         self.assertEqual(self.o["vor"], "alt")
-        self.assertEqual(self.o["nachEdit"], "ungeprüft seit Ihrer Änderung")
+        self.assertEqual(self.o["nachEdit"], "unchecked since your change")
 
     def test_after_recheck_the_chip_is_the_verdict_of_the_dry_run(self):
         self.assertEqual((self.o["nachForce"], self.o["nachGeht"], self.o["nachVerweigert"], self.o["nurDry"]), ("force", "geht", "verweigert", "geht"))
@@ -105,7 +105,7 @@ out.html = PX.renderRow(reserve, ctx({ prop: null, vsrc: "dry", dry: dry("verwei
     def test_a_refused_run_leaves_unnamed_values_not_judged_never_goes(self):
         for k in ("dryReserve", "dryMib", "propRefused"):
             self.assertEqual(self.o[k]["id"], "nichtbeurteilt", k)
-            self.assertEqual(self.o[k]["label"], "nicht beurteilt (Lauf verweigert: W64-OPPOINT)", k)
+            self.assertEqual(self.o[k]["label"], "not judged (run refused: W64-OPPOINT)", k)
         self.assertEqual(self.o["dryAbsturz"], "nichtbeurteilt")
 
     def test_goes_only_when_the_run_went_through_or_the_value_is_named_ok(self):
@@ -120,7 +120,7 @@ out.html = PX.renderRow(reserve, ctx({ prop: null, vsrc: "dry", dry: dry("verwei
         h = self.o["html"]
         self.assertIn("pfx-v-nichtbeurteilt", h)
         self.assertNotIn("pfx-v-geht", h)
-        self.assertIn("nicht beurteilt (Lauf verweigert: W64-OPPOINT)", h)
+        self.assertIn("not judged (run refused: W64-OPPOINT)", h)
         self.assertIn("pfx-z-uebersteuert", h)
 
     def test_the_chip_has_a_style(self):
@@ -135,11 +135,11 @@ const w = (o) => Object.assign({ key: null, label: "--pp-stage-ratio (Seed)", al
 const p = (werte) => ({ n: 3, form: "dual", werte, verdikt: { ausgang: "geht", verdikte: [] }, vorschlag: {} });
 const real = { key: "flag:--p-bs", label: "--p-bs", alt: "1", wert: "2", zustand: "vorgeschlagen", herkunft: "H", grund: "G", geaendert: true, in_argv: true, verdikte: [] };
 const removed = { key: "flag:--x", label: "--x", alt: "5", wert: null, zustand: "unbelegt", herkunft: "H", grund: "entfernt", geaendert: true, in_argv: false, verdikte: [] };
-// Dual: das Profil setzt 31,17,16 schon (Referenz-Dual): keine Aenderung, kein "nicht gesetzt"
+// Dual: das Profil setzt 31,17,16 schon (Referenz-Dual): keine Aenderung, kein "not set"
 out.dual = PX.renderProposal(p([w({ profil_wert: "31,17,16" })]));
 // Flip: der Seed steht nicht im argv: keine Aenderung
 out.flip = PX.renderProposal(p([w({ in_argv: false, geaendert: true })]));
-// Seed im argv, Profil hat den Wert nicht: eine Aenderung, "nicht gesetzt" ist hier wahr
+// Seed im argv, Profil hat den Wert nicht: eine Aenderung, "not set" ist hier wahr
 out.neu = PX.renderProposal(p([w()]));
 // Seed im argv, Profil hat einen anderen Wert: der Profilwert steht als alt
 out.anders = PX.renderProposal(p([w({ profil_wert: "30,18,16" })]));
@@ -153,31 +153,31 @@ out.mix = PX.renderProposal(p([real, removed, w({ in_argv: false })]));
 
     @staticmethod
     def _n(h):
-        return int(re.search(r"(\d+) Werte geändert", h).group(1))
+        return int(re.search(r"(\d+) values changed", h).group(1))
 
     def test_dual_profile_value_equal_is_no_change_and_never_says_not_set(self):
         h = self.o["dual"]
         self.assertEqual(self._n(h), 0)
-        self.assertNotIn("nicht gesetzt", h)
-        self.assertNotIn("Was der Vorschlag geändert hat", h)
-        self.assertIn("Das Profil setzt denselben Wert schon", h)
+        self.assertNotIn("not set", h)
+        self.assertNotIn("What the proposal changed", h)
+        self.assertIn("The profile already sets the same value.", h)
 
     def test_flip_seed_outside_argv_is_not_counted(self):
         h = self.o["flip"]
         self.assertEqual(self._n(h), 0)
-        self.assertIn("Steht nicht im argv", h)
-        self.assertNotIn("Was der Vorschlag geändert hat", h)
+        self.assertIn("Not in the argv", h)
+        self.assertNotIn("What the proposal changed", h)
 
     def test_seed_in_argv_and_new_is_a_change(self):
         h = self.o["neu"]
         self.assertEqual(self._n(h), 1)
-        self.assertIn("nicht gesetzt", h)
+        self.assertIn("not set", h)
 
     def test_seed_in_argv_shows_the_profile_value_as_the_old_one(self):
         h = self.o["anders"]
         self.assertEqual(self._n(h), 1)
         self.assertIn("30,18,16", h)
-        self.assertNotIn("nicht gesetzt", h)
+        self.assertNotIn("not set", h)
 
     def test_real_and_removed_values_still_count(self):
         self.assertEqual(self._n(self.o["mix"]), 2)
@@ -246,34 +246,34 @@ class F3Laufbericht(Base):
 
     def test_without_a_dry_run_the_report_takes_the_oracle_run_of_the_proposal(self):
         t = self.report(dry=None, vorschlag=self.VD)["text"]
-        self.assertNotIn("Kein Trockenlauf gefahren", t)
-        self.assertIn("Orakel-Lauf des Vorschlags (Launcher-Trockenlauf, 2 Lauf/Läufe): geht nur mit Force durch.", t)
+        self.assertNotIn("No dry run was made", t)
+        self.assertIn("Oracle run of the proposal (launcher dry run, 2 run(s)): passes only with force.", t)
         self.assertIn("`HW-COUNT`", t)
         self.assertIn("`W64`", t)
         self.assertNotIn("`METAL-UNPROVEN`", t)             # Blocker und Fit-Verdikte sind keine Ablehnung des Laufs
         self.assertNotIn("`FIT`", t)
-        self.assertIn("Änderungen danach sind darin nicht geprüft", t)
+        self.assertIn("changes made afterwards are not checked in it", t)
 
     def test_a_code_without_register_row_shows_its_class_and_consequence_but_stays_blocked(self):
         vd = {"schema": "flliper.verdikt/1", "ausgang": "verweigert", "orakel": {"laeufe": 2},
               "verdikte": [{"code": "W64-OPPOINT", "ebene": "lauf", "text": "W64 Weg2TpOperatingPointInfeasible: x", "klasse": "nicht_forcebar",
-                            "konsequenz": "Bleibt auch mit Force bestehen.", "forcebar": True, "force_state": "force"}]}       # der Browser behauptet forcebar: nicht geglaubt
+                            "konsequenz": "Remains even with force.", "forcebar": True, "force_state": "force"}]}       # der Browser behauptet forcebar: nicht geglaubt
         t = self.report(dry=None, vorschlag=vd)["text"]
         row = [x for x in t.split("\n") if x.startswith("| `W64-OPPOINT`")][0]
-        self.assertIn("| nicht forcebar | blockiert:", row)
-        self.assertIn("Bleibt auch mit Force bestehen.", row)
-        self.assertIn("Auch mit Force bestehen bleiben: `W64-OPPOINT`", t)
-        self.assertNotIn("FLLIPER_FORCE=1", t.split("### Versionen")[0].split("### Verdikte und Force")[1])
+        self.assertIn("| not forceable | blocked:", row)
+        self.assertIn("Remains even with force.", row)
+        self.assertIn("Remaining even with force: `W64-OPPOINT`", t)
+        self.assertNotIn("FLLIPER_FORCE=1", t.split("### Versions")[0].split("### Verdicts and force")[1])
 
     def test_without_both_it_still_says_no_dry_run(self):
-        self.assertIn("Kein Trockenlauf gefahren", self.report(dry=None)["text"])
-        self.assertIn("Kein Trockenlauf gefahren", self.report(dry=None, vorschlag={"schema": "x"})["text"])
+        self.assertIn("No dry run was made", self.report(dry=None)["text"])
+        self.assertIn("No dry run was made", self.report(dry=None, vorschlag={"schema": "x"})["text"])
 
     def test_a_dry_run_is_younger_and_wins(self):
-        dry = {"rejections": [], "verdict": "Der Planer lehnt nichts ab.", "cards": [{"label": "RTX 5090"}]}
+        dry = {"rejections": [], "verdict": "The planner refuses nothing.", "cards": [{"label": "RTX 5090"}]}
         t = self.report(dry=dry, vorschlag=self.VD)["text"]
-        self.assertIn("Trockenlauf: Der Planer lehnt nichts ab.", t)
-        self.assertNotIn("Orakel-Lauf des Vorschlags", t)
+        self.assertIn("Dry run: The planner refuses nothing.", t)
+        self.assertNotIn("Oracle run of the proposal", t)
 
     def test_forceability_is_read_from_the_register_not_from_the_browser(self):
         vd = json.loads(json.dumps(self.VD))
@@ -304,15 +304,15 @@ class F4HardwareIssueText(unittest.TestCase):
         t = hwprofil.issue_text(self.DOC)
         self.assertNotIn("GPU-aaaaaaaa", t)
         row = [x for x in t.split("\n") if "RTX 5090" in x and "00000000:01:00.0" in x][0]
-        self.assertTrue(row.rstrip().endswith("| 00000000:01:00.0 | <entfernt> |"), row)
-        self.assertIn("00000000:02:00.0 | unbelegt |", t)         # keine UUID gemeldet: "unbelegt", nicht "entfernt"
+        self.assertTrue(row.rstrip().endswith("| 00000000:01:00.0 | <redacted> |"), row)
+        self.assertIn("00000000:02:00.0 | unverified |", t)         # keine UUID gemeldet: "unbelegt", nicht "entfernt"
 
     def test_the_explanation_says_what_the_table_does(self):
         with open(os.path.join(STATIC, "hwprofil.js"), encoding="utf-8") as fh:
             js = fh.read()
-        self.assertNotIn("UUID und PCI-Bus der Karten stehen drin", js)
-        self.assertIn("UUID der Karten ist immer als", js)
-        self.assertIn("PCI-Bus stehen drin", js)
+        self.assertNotIn("UUID and PCI bus of the cards are included", js)
+        self.assertIn("the UUID of the cards is always redacted as", js)
+        self.assertIn("PCI bus are included", js)
 
 
 class F5AriaLabel(unittest.TestCase):
@@ -321,7 +321,7 @@ class F5AriaLabel(unittest.TestCase):
             js = fh.read()
         sels = re.findall(r"<select data-cf=\"card\"[^>]*>", js)
         self.assertEqual(len(sels), 1)
-        self.assertIn('aria-label="Karte ${i + 1} wählen"', sels[0])
+        self.assertIn('aria-label="Choose card ${i + 1}"', sels[0])
 
 
 if __name__ == "__main__":  # pragma: no cover
@@ -338,39 +338,39 @@ class F1LaufberichtOhneLauf(Base):
 
     def _v(self, vd):
         t = self.report(dry=None, vorschlag=vd)["text"]
-        return t.split("### Verdikte und Force")[1].split("### Versionen")[0]
+        return t.split("### Verdicts and force")[1].split("### Versions")[0]
 
     def test_passt_nicht_is_a_planer_calculation_block_without_force_claims(self):
         vd = self.VD("passt_nicht", [{"code": "EINZEL-PASSUNG", "ebene": "fit", "text": "passt nicht: 3 MiB zu wenig"},
                                      {"code": "KV-MIN", "ebene": "fit", "text": "KV-Pool unter dem Minimum"}])
         v = self._v(vd)
-        self.assertIn("Planer-Rechnung: passt nicht (kein Launcher-Lauf).", v)
+        self.assertIn("Planner calculation: does not fit (no launcher run).", v)
         self.assertIn("`KV-MIN`: KV-Pool unter dem Minimum", v)
-        for bad in ("Trockenlauf:", "Orakel-Lauf des Vorschlags", "Der Planer lehnt nichts ab", "Force wird nicht gebraucht", "0 Lauf", "FLLIPER_FORCE"):
+        for bad in ("Dry run:", "Oracle run of the proposal", "The planner refuses nothing", "force is not needed", "0 run", "FLLIPER_FORCE"):
             self.assertNotIn(bad, v)
-        self.assertIn("Kein Launcher-Lauf", v)
-        self.assertIn("zeigt erst ein Trockenlauf", v)
+        self.assertIn("No launcher run", v)
+        self.assertIn("is shown only by a dry run", v)
 
     def test_unbelegt_and_zero_runs_are_no_dry_run_either(self):
         v = self._v(self.VD("unbelegt", []))
-        self.assertIn("Planer-Rechnung: nicht rechenbar.", v)
-        self.assertNotIn("Trockenlauf:", v)
+        self.assertIn("Planner calculation: cannot be calculated.", v)
+        self.assertNotIn("Dry run:", v)
         v0 = self._v(self.VD("geht", [], laeufe=0))              # laeufe 0 allein genuegt
-        self.assertNotIn("Orakel-Lauf des Vorschlags", v0)
-        self.assertNotIn("Der Planer lehnt nichts ab", v0)
+        self.assertNotIn("Oracle run of the proposal", v0)
+        self.assertNotIn("The planner refuses nothing", v0)
 
     def test_orakel_fehler_is_named_and_force_does_not_help_is_not_said(self):
         vd = self.VD("orakel_fehler", [{"code": "ORAKEL-FEHLER", "ebene": "orakel", "text": "OSError: kein Kindprozess"}])
         v = self._v(vd)
-        self.assertIn("Orakel-Fehler: OSError: kein Kindprozess.", v)
-        self.assertIn("kein Urteil", v)
-        for bad in ("Force hilft hier nicht", "Trockenlauf:", "Der Planer lehnt nichts ab", "0 Lauf"):
+        self.assertIn("Oracle error: OSError: kein Kindprozess.", v)
+        self.assertIn("no verdict", v)
+        for bad in ("Force does not help here", "Dry run:", "The planner refuses nothing", "0 run"):
             self.assertNotIn(bad, v)
 
     def test_a_real_run_keeps_its_header_and_the_run_count(self):
         vd = self.VD("geht_mit_force", [{"code": "HW-COUNT", "ebene": "lauf", "text": "HW-COUNT: x"}], laeufe=2)
         t = self.report(dry=None, vorschlag=vd)["text"]
-        self.assertIn("Orakel-Lauf des Vorschlags (Launcher-Trockenlauf, 2 Lauf/Läufe): geht nur mit Force durch.", t)
+        self.assertIn("Oracle run of the proposal (launcher dry run, 2 run(s)): passes only with force.", t)
 
     def test_dry_from_vorschlag_shape_for_no_run(self):
         d = P.dry_from_vorschlag(self.VD("passt_nicht", []))
@@ -382,17 +382,17 @@ class F1LaufberichtOhneLauf(Base):
 
 # Runde 7: die Chip-Entscheidung je Wert ist EINE Tabelle (chipFor in profil_planer.js); eine Zelle = ein Fall.
 # Spalten: N nicht genannt | OK genannt ok | F verweigert, forcebar | B verweigert, nicht forcebar | H Hinweis | U Force ungeprueft
-_COLS = {"OK": ("geht", "geht"), "F": ("force", "nur mit --force"), "B": ("verweigert", "verweigert"), "H": ("hinweis", "Hinweis"), "U": ("ungeprueft", "Force ungeprüft")}
+_COLS = {"OK": ("geht", "ok"), "F": ("force", "only with --force"), "B": ("verweigert", "refused"), "H": ("hinweis", "note"), "U": ("ungeprueft", "force unchecked")}
 _N = {
-    "geht": ("geht", "geht"),
-    "geht_mit_force": ("geht", "geht"),
-    "verweigert": ("nichtbeurteilt", "nicht beurteilt (Lauf verweigert: W64-OPPOINT)"),
-    "absturz": ("nichtbeurteilt", "nicht beurteilt (Lauf verweigert: ORAKEL-ABSTURZ)"),
-    "orakel_fehler": ("orakelfehler", "Orakel-Fehler"),
-    "passt": ("planerpasst", "Planer-Rechnung: passt"),
-    "passt_nicht": ("planerpasstnicht", "Planer-Rechnung: passt nicht"),
-    "unbelegt": ("planerunbelegt", "Planer-Rechnung: unbelegt"),
-    "kein_dokument": ("keinlauf", "kein Lauf"),
+    "geht": ("geht", "ok"),
+    "geht_mit_force": ("geht", "ok"),
+    "verweigert": ("nichtbeurteilt", "not judged (run refused: W64-OPPOINT)"),
+    "absturz": ("nichtbeurteilt", "not judged (run refused: ORAKEL-ABSTURZ)"),
+    "orakel_fehler": ("orakelfehler", "oracle error"),
+    "passt": ("planerpasst", "planner estimate: fits"),
+    "passt_nicht": ("planerpasstnicht", "planner estimate: does not fit"),
+    "unbelegt": ("planerunbelegt", "planner estimate: unverified"),
+    "kein_dokument": ("keinlauf", "no run"),
 }
 TABLE = {(a, c): (_N[a] if c == "N" else _COLS[c]) for a in _N for c in ("N", "OK", "F", "B", "H", "U")}
 LAUNCHER_LAEUFE = ("geht", "geht_mit_force", "verweigert", "absturz")
@@ -410,11 +410,11 @@ const LAUF = {
   absturz: [V("ORAKEL-ABSTURZ", { ebene: "absturz", forcebar: false, force_state: "blockiert", durchgelassen: false })] };
 out.cells = {};
 for (const a of PX.AUSGAENGE) for (const c of PX.SPALTEN) {
-  const r = PX.chipFor(a, LAUF[a] || [], COLS[c], "Trockenlauf (Orakel)");
+  const r = PX.chipFor(a, LAUF[a] || [], COLS[c], "dry run (oracle)");
   out.cells[a + "|" + c] = { id: r.id, label: r.label, tip: r.tip, code: r.code || null };
 }
 out.axes = [PX.AUSGAENGE.length, PX.SPALTEN.length];
-const n = (a, lauf) => PX.chipFor(a, lauf, [], "Vorschlag (Orakel)");
+const n = (a, lauf) => PX.chipFor(a, lauf, [], "proposal (oracle)");
 // Widerspruch im Dokument: geht_mit_force MIT einem beendenden Verdikt ist nicht durchgelaufen
 out.forceWiderspruch = n("geht_mit_force", [V("W64-OPPOINT", { durchgelassen: false })]);
 // verweigert / absturz ohne beendendes Verdikt: nie "geht", nie ein erfundener Code
@@ -466,9 +466,9 @@ out.zeileForce = PX.renderRow(row, ctx({ prop: { werte: [W], verdikt: { ausgang:
                 continue
             text = cell["label"] + " " + cell["tip"]
             if a in LAUNCHER_LAEUFE:
-                self.assertIn("Launcher", text, key)
+                self.assertIn("launcher", text, key)
             else:
-                self.assertNotIn("Launcher", text, key)
+                self.assertNotIn("launcher", text, key)
 
     def test_a_named_value_has_its_own_verdict_in_every_row(self):
         for key, cell in self.o["cells"].items():
@@ -478,16 +478,16 @@ out.zeileForce = PX.renderRow(row, ctx({ prop: { werte: [W], verdikt: { ausgang:
 
     def test_force_run_value_is_judged_not_unjudged_and_the_force_note_is_at_the_start(self):
         o = self.o
-        self.assertEqual(o["cells"]["geht_mit_force|N"]["label"], "geht")
-        self.assertNotIn("Lauf verweigert", o["zeileForce"])
+        self.assertEqual(o["cells"]["geht_mit_force|N"]["label"], "ok")
+        self.assertNotIn("run refused", o["zeileForce"])
         self.assertIn("pfx-v-geht", o["zeileForce"])
         self.assertNotIn("pfx-v-nichtbeurteilt", o["zeileForce"])
-        self.assertIn("mit --force", o["propForce"])
+        self.assertIn("with --force", o["propForce"])
         self.assertIn("pfx-v-mitforce", o["propForce"])
         self.assertNotIn("pfx-v-mitforce", o["propGeht"])
-        self.assertEqual([x["label"] if x else None for x in o["start"]], [None, "mit --force", None, None, None])
+        self.assertEqual([x["label"] if x else None for x in o["start"]], [None, "with --force", None, None, None])
         self.assertIsNone(o["startWiderspruch"])
-        self.assertNotIn("mit --force", o["zeileForce"].replace("nur mit --force", ""))      # nie je Wert
+        self.assertNotIn("with --force", o["zeileForce"].replace("only with --force", ""))      # nie je Wert
 
     def test_edge_cells_never_invent_a_judgement(self):
         o = self.o
@@ -495,8 +495,8 @@ out.zeileForce = PX.renderRow(row, ctx({ prop: { werte: [W], verdikt: { ausgang:
         self.assertIn("W64-OPPOINT", o["forceWiderspruch"]["label"])
         for k in ("verwOhne", "absOhne", "nurDurchgelassen"):
             self.assertEqual(o[k]["id"], "nichtbeurteilt", k)
-            self.assertIn("ohne Lauf-Verdikt", o[k]["label"], k)
-            self.assertNotIn("Lauf verweigert", o[k]["label"], k)
+            self.assertIn("no run verdict", o[k]["label"], k)
+            self.assertNotIn("run refused", o[k]["label"], k)
         self.assertEqual((o["unbekannt"]["id"], o["fehlt"]["id"]), ("keinlauf", "keinlauf"))
 
     def test_every_chip_id_has_a_style(self):

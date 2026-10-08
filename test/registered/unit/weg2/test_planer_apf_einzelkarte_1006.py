@@ -30,10 +30,10 @@ MC = "/spinning/llm_stuff/club-3090/models-cache/"
 MIB = float(1 << 20)
 
 #: Rig-Einzelkarte: RTX 5090, NVML-Gesamtspeicher 32607 MiB (~/.claude/CLAUDE.md, Rig-Regeln).
-CARD_5090 = {"name": "NVIDIA GeForce RTX 5090", "total_mib": 32607, "total_src": "Kartenprofil (NVML 32607 MiB laut Rig-Regeln)"}
+CARD_5090 = {"name": "NVIDIA GeForce RTX 5090", "total_mib": 32607, "total_src": "Card profile (NVML 32607 MiB per rig rules)"}
 #: Laptop efeu-TP14 als Beispiel (APU, adressierbare Decke 25600 MiB laut Memory laptop-efeu-tp14) -- am Rig UNBELEGT.
 CARD_LAPTOP = {"name": "AMD Radeon 780M (APU, Beispiel efeu-TP14)", "total_mib": 25600, "usable_mib": 25600, "unified": True, "platform": "rocm",
-               "total_src": "unbelegt (Memory laptop-efeu-tp14: adressierbare Decke 25600 MiB; torch-Gesamtspeicher der APU nicht gemessen)"}
+               "total_src": "unverified (memory laptop-efeu-tp14: addressable ceiling 25600 MiB; torch total memory of the APU not measured)"}
 
 
 def n(v, src="Index", **kw):
@@ -45,7 +45,7 @@ def n(v, src="Index", **kw):
 def synthetic_laptop_profile():
     """flliper.model/1-Auszug fuer ein 35B-A3B-Hybridmodell (10 Attention + 30 GDN-Layer, 2 KV-Koepfe x 256).  ALLE Zahlen sind Annahmen aus der
     Memory-Datei laptop-efeu-tp14 (75 MB/Slot gemessen am Laptop; Gewichte ~17 GB 'Dienst') oder Geometrie-Beispiel -> Quelle ``unbelegt``."""
-    U = "unbelegt"
+    U = "unverified"
     return {
         "schema": "flliper.model/1", "path": "/models/synthetic-35b-a3b", "id": "synthetic-laptop",
         "format": n("gguf-q3", U),
@@ -53,7 +53,7 @@ def synthetic_laptop_profile():
         "weights": {"total_bytes": n(17000 * 1 << 20, U), "visual_bytes": n(0, U), "mtp_bytes": n(0, U)},
         "kv": {"attn_layers": n(10, U),
                "variants": {"auto": {"cell_bytes_per_attn_layer_token": n(2048.0, U)}, "fp8_e4m3": {"cell_bytes_per_attn_layer_token": n(1088.0, U)}}},
-        "state": {"linear_layers": n(30, U), "per_request_bytes": n(75_000_000, "gemessen am Laptop (Memory), unbelegt am Rig")},
+        "state": {"linear_layers": n(30, U), "per_request_bytes": n(75_000_000, "measured on the laptop (memory), unverified on the rig")},
         "context": {"max_position_embeddings": n(262144, U)},
         "draft": {"mtp_layers": n(0, U)},
     }
@@ -152,10 +152,10 @@ class TestRig5090Qwen27(unittest.TestCase):
         self.assertEqual(p["schema"], PS.SCHEMA)
         self.assertEqual(p["form"], "einzelkarte")
         self.assertEqual(p["verdikt"]["state"], "passt", p["verdikt"]["text"])
-        self.assertEqual(p["verdikt"]["art"], "Planer-Rechnung")
+        self.assertEqual(p["verdikt"]["art"], "Planner calculation")
         flags = {e["flag"]: e for e in p["flags"]}
         # Leiter: Modell-Dtype (bf16) passt nicht, fp8 passt; Draft bleibt
-        self.assertEqual([r["schritt"] for r in p["relaxations"]], ["KV-Dtype fp8_e4m3"])
+        self.assertEqual([r["schritt"] for r in p["relaxations"]], ["KV dtype fp8_e4m3"])
         self.assertEqual(flags["--kv-cache-dtype"]["wert"], "fp8_e4m3")
         self.assertEqual(flags["--no-enable-multimodal"]["wert"], True)
         self.assertEqual(flags["--speculative-algorithm"]["wert"], "NEXTN")
@@ -192,9 +192,9 @@ class TestRig5090Qwen27(unittest.TestCase):
         mp = q27("q27_int8")
         p = PS.propose_single(mp, CARD_5090)
         self.assertEqual(p["verdikt"]["state"], "passt nicht")
-        self.assertIn("es fehlen", p["verdikt"]["text"])
+        self.assertIn("are missing", p["verdikt"]["text"])
         # Leiter ging bis zum Ende: fp8 und Draft aus
-        self.assertEqual([r["schritt"] for r in p["relaxations"]], ["KV-Dtype fp8_e4m3", "Draft weggelassen"])
+        self.assertEqual([r["schritt"] for r in p["relaxations"]], ["KV dtype fp8_e4m3", "Draft omitted"])
         w = mp["weights"]
         main = (w["total_bytes"]["v"] - w["mtp_bytes"]["v"] - w["visual_bytes"]["v"]) / MIB
         flags = {e["flag"]: e for e in p["flags"]}
@@ -209,7 +209,7 @@ class TestRig5090Qwen27(unittest.TestCase):
         for f in ("--max-total-tokens", "--mem-fraction-static", "--max-mamba-cache-size"):
             self.assertEqual(flags[f]["verdikt"]["state"], "verweigert", f)
             self.assertEqual(flags[f]["verdikt"]["code"], "FIT-STATIC", f)
-            self.assertIn("fehlen", flags[f]["verdikt"]["grund"])
+            self.assertIn("missing", flags[f]["verdikt"]["grund"])
         # Flags ohne Passungsbezug bleiben "geht" (die Karte ist nur fuer die Pools zu klein)
         self.assertEqual(flags["--kv-cache-dtype"]["verdikt"]["state"], "geht")
         self.assertEqual(flags["--model-path"]["verdikt"]["state"], "geht")
@@ -228,9 +228,9 @@ class TestRig5090Qwen27(unittest.TestCase):
         p = PS.propose_single(mp, CARD_5090, {"kv_dtype": "auto"})
         flags = {e["flag"]: e for e in p["flags"]}
         self.assertEqual(flags["--kv-cache-dtype"]["wert"], "auto")
-        self.assertEqual(flags["--kv-cache-dtype"]["herkunft"], "Ziel")
+        self.assertEqual(flags["--kv-cache-dtype"]["herkunft"], "Goal")
         # bf16-KV mit Ziel-Kontext 131072: Gewichte 20644 + KV 8192 + Mamba >= 28531 -> passt nicht; die Leiter nimmt nur den Draft weg
-        self.assertEqual([r["schritt"] for r in p["relaxations"]], ["Draft weggelassen"])
+        self.assertEqual([r["schritt"] for r in p["relaxations"]], ["Draft omitted"])
         self.assertEqual(p["verdikt"]["state"], "passt nicht")
         main, _, _, _, _, _ = hand_posten_nvfp4_fp8(mp, 0, 0, draft=False)
         kv_auto = 131072 * mp["kv"]["variants"]["auto"]["cell_bytes_per_attn_layer_token"]["v"] * 16 / MIB
@@ -288,14 +288,14 @@ class TestRig5090Qwen27(unittest.TestCase):
         fo = {e["flag"]: e for e in over["flags"]}
         self.assertEqual(fo["--max-total-tokens"]["wert"], 400000)
         self.assertEqual(fo["--max-total-tokens"]["zustand"], "übersteuert")
-        self.assertEqual(fo["--max-total-tokens"]["herkunft"], "übersteuert")
-        self.assertIn("vorgeschlagen war", fo["--max-total-tokens"]["begruendung"])
+        self.assertEqual(fo["--max-total-tokens"]["herkunft"], "overridden")
+        self.assertIn("proposed was", fo["--max-total-tokens"]["begruendung"])
         self.assertEqual(over["verdikt"]["state"], "passt nicht")
         self.assertEqual(fo["--max-total-tokens"]["verdikt"]["state"], "verweigert")
         self.assertEqual(fo["--max-total-tokens"]["verdikt"]["code"], "FIT-STATIC")
         self.assertEqual(base["verdikt"]["state"], "passt")
         # KV-Posten = 400000 Token x 16 Layer x 2176 B (Handrechnung)
-        kv = next(x for x in over["fit"]["posten"] if x["name"] == "KV-Pool (Hauptmodell)")
+        kv = next(x for x in over["fit"]["posten"] if x["name"] == "KV pool (main model)")
         cell = mp["kv"]["variants"]["fp8_e4m3"]["cell_bytes_per_attn_layer_token"]["v"]
         self.assertAlmostEqual(kv["mib"], 400000 * cell * 16 / MIB, delta=0.1)
         # Flags, die der Planer nicht kennt: Durchgriff, unbelegt
@@ -313,7 +313,7 @@ class TestRig5090Qwen27(unittest.TestCase):
         mp = q27("q27_nvfp4")
         p = PS.propose_single(mp, CARD_5090, {"reserve_mib": 2000})
         self.assertEqual(p["fit"]["reserve_bedarf_mib"], 2000.0)
-        self.assertEqual(p["fit"]["reserve_herkunft"], "Ziel")
+        self.assertEqual(p["fit"]["reserve_herkunft"], "Goal")
         f = {e["flag"]: e for e in p["flags"]}
         pre = 32607 - PS.CONTEXT_OVERHEAD_DEFAULT_MIB
         self.assertEqual(f["--mem-fraction-static"]["wert"], math.floor((pre - 2000) / pre * 1000) / 1000)
@@ -327,7 +327,7 @@ class TestRig5090Qwen27(unittest.TestCase):
             self.assertEqual(set(e), {"flag", "wert", "herkunft", "zustand", "begruendung", "verdikt"})
             self.assertIn(e["zustand"], ("vorgeschlagen", "übersteuert", "unbelegt"))
             self.assertEqual(set(e["verdikt"]), {"state", "code", "grund", "art", "parse"})
-            self.assertEqual(e["verdikt"]["art"], "Planer-Rechnung")
+            self.assertEqual(e["verdikt"]["art"], "Planner calculation")
             self.assertTrue(e["begruendung"])
 
     def test_karte_aus_hardwareprofil(self):
@@ -335,7 +335,7 @@ class TestRig5090Qwen27(unittest.TestCase):
                                                          "cc": [12, 0], "mem_gbs": {"nameplate": {"v": 1792.0, "src": "Datenblatt"}}}]}
         c = PS.card_from_hardware(hw, 0)
         self.assertEqual(c["total_mib"], 32607.0)
-        self.assertEqual(c["total_src"], "Kartenprofil (NVML)")
+        self.assertEqual(c["total_src"], "Card profile (NVML)")
         self.assertEqual(c["bandwidth_gbs"], 1792.0)
         p = PS.propose_single(q27("q27_nvfp4"), c)
         self.assertEqual(p["verdikt"]["state"], "passt")
@@ -366,12 +366,12 @@ class TestKontextTreiberBudget(unittest.TestCase):
         self.assertAlmostEqual(f["reserve_gegeben_mib"], pre * (1 - fr), delta=0.1)
         self.assertGreaterEqual(f["reserve_gegeben_mib"], f["reserve_bedarf_mib"])
         # eigener Posten, Herkunft unbelegt, nicht in der statischen Summe
-        post = next(x for x in f["posten"] if x["name"].startswith("CUDA-Kontext + Treiber"))
+        post = next(x for x in f["posten"] if x["name"].startswith("CUDA context + driver"))
         self.assertEqual(post["mib"], 400.0)
-        self.assertIn("unbelegt", post["herkunft"])
-        self.assertAlmostEqual(f["statisch_summe_mib"], sum(x["mib"] for x in f["posten"] if not x["name"].startswith("CUDA-Kontext")), delta=0.6)
+        self.assertIn("unverified", post["herkunft"])
+        self.assertAlmostEqual(f["statisch_summe_mib"], sum(x["mib"] for x in f["posten"] if not x["name"].startswith("CUDA context")), delta=0.6)
         # Der Pool, den die Runtime wirklich haelt (f x pre - Gewichte), deckt KV + Mamba des Vorschlags (Rest-Regel fuellt gegen DASSELBE Budget)
-        w = f["posten"][0]["mib"] + next(x for x in f["posten"] if x["name"].startswith("Gewichte (Draft")) ["mib"]
+        w = f["posten"][0]["mib"] + next(x for x in f["posten"] if x["name"].startswith("Weights (draft")) ["mib"]
         pool_need = f["statisch_summe_mib"] - w
         self.assertGreaterEqual(self.runtime_pool_mib(fr, pre, w) + 1e-6, pool_need)
         self.assertLess(self.runtime_pool_mib(fr, pre, w) - pool_need, 100.0)    # und ist bis auf Slot-/Seitengranularitaet ausgeschoepft
@@ -381,10 +381,10 @@ class TestKontextTreiberBudget(unittest.TestCase):
         flags = {e["flag"]: e for e in p["flags"]}
         for fl in ("--mem-fraction-static", "--max-total-tokens", "--max-mamba-cache-size"):
             self.assertEqual(flags[fl]["zustand"], "unbelegt", fl)
-            self.assertIn("Kontext + Treiber 400 MiB angenommen", flags[fl]["begruendung"], fl)
-        self.assertIn("Kontext/Treiber 400 MiB angenommen, unbelegt", p["verdikt"]["text"])
-        self.assertTrue(any("CUDA-Kontext + Treiber 400 MiB" in u for u in p["unbelegt"]))
-        self.assertTrue(any("Kontext + Treiber 400 MiB" in h for h in p["fit"]["hinweise"]))
+            self.assertIn("context + driver 400 MiB assumed", flags[fl]["begruendung"], fl)
+        self.assertIn("context/driver 400 MiB assumed, unverified", p["verdikt"]["text"])
+        self.assertTrue(any("CUDA context + driver" in u for u in p["unbelegt"]))
+        self.assertTrue(any("Context + driver 400 MiB" in h for h in p["fit"]["hinweise"]))
         # die alte Zahl (Budget gegen die ganze Karte, 88 MiB frei, Kontext bis 154837) darf nicht mehr vorkommen
         self.assertNotIn("154837", p["verdikt"]["text"])
         self.assertNotIn(28531, [round(p["fit"]["statisch_budget_mib"])])
@@ -400,11 +400,11 @@ class TestKontextTreiberBudget(unittest.TestCase):
             f = p["fit"]
             self.assertEqual(f["kontext_treiber_mib"], float(overhead))
             self.assertFalse(f["kontext_treiber_standard"])
-            self.assertEqual(f["kontext_treiber_herkunft"], "Ziel (pre_load_free_mib)")
+            self.assertEqual(f["kontext_treiber_herkunft"], "Goal (pre_load_free_mib)")
             flags = {e["flag"]: e for e in p["flags"]}
             self.assertEqual(flags["--mem-fraction-static"]["zustand"], "vorgeschlagen")
             self.assertNotIn("angenommen", flags["--max-total-tokens"]["begruendung"])
-            self.assertFalse(any("CUDA-Kontext" in u for u in p["unbelegt"]))
+            self.assertFalse(any("CUDA context" in u for u in p["unbelegt"]))
             pre = 32607 - overhead
             self.assertAlmostEqual(f["statisch_budget_mib"], flags["--mem-fraction-static"]["wert"] * pre, delta=0.1)
             toks.append(flags["--max-total-tokens"]["wert"])
@@ -432,7 +432,7 @@ class TestKontextTreiberBudget(unittest.TestCase):
         self.assertGreater(over["fit"]["statisch_summe_mib"], over["fit"]["statisch_budget_mib"])
         self.assertEqual(over["verdikt"]["state"], "passt nicht")
         self.assertEqual(fo["--max-total-tokens"]["verdikt"]["code"], "FIT-STATIC")
-        self.assertIn("freier Speicher vor dem Laden", fo["--max-total-tokens"]["verdikt"]["grund"])
+        self.assertIn("free memory before loading", fo["--max-total-tokens"]["verdikt"]["grund"])
 
     def test_max_context_fit_gegen_dasselbe_budget(self):
         mp = q27("q27_nvfp4")
@@ -450,7 +450,7 @@ class TestKontextTreiberBudget(unittest.TestCase):
         p = PS.propose_single(synthetic_laptop_profile(), CARD_LAPTOP, {"seats": 2, "context_tokens": 131072, "host_ram_mib": 2000})
         card = next(c for c in p["fit"]["checks"] if c["code"] == "FIT-CARD")
         self.assertTrue(card["ok"], card["text"])
-        self.assertIn("Kontext/Treiber 400 MiB", card["text"])
+        self.assertIn("context/driver 400 MiB", card["text"])
         self.assertLessEqual(p["fit"]["statisch_budget_mib"], 25600 - 400 - 2000 + 1e-6)
 
 
@@ -488,12 +488,12 @@ class TestLaptopSynthetisch(unittest.TestCase):
         self.assertEqual(self.f["--max-running-requests"]["wert"], 2)
         self.assertEqual(self.f["--cuda-graph-max-bs-decode"]["wert"], 2)
         self.assertNotIn("--speculative-algorithm", p["argv"])            # kein MTP-Kopf im Modell
-        self.assertIn("MoE im einzelnen Server", " ".join(p["fit"]["hinweise"]))
-        self.assertIn("APU: Geraet und Host teilen den Speicher", " ".join(p["fit"]["hinweise"]))
-        host = next(x for x in p["fit"]["posten"] if x["name"].startswith("HiCache-Hostpool"))
+        self.assertIn("MoE in the single server", " ".join(p["fit"]["hinweise"]))
+        self.assertIn("APU: device and host share the memory", " ".join(p["fit"]["hinweise"]))
+        host = next(x for x in p["fit"]["posten"] if x["name"].startswith("HiCache host pool"))
         self.assertEqual(host["mib"], 2000.0)
         # das Hostpool liegt NICHT im statischen Posten, sondern verengt den Bruchteil
-        self.assertAlmostEqual(p["fit"]["statisch_summe_mib"], sum(x["mib"] for x in p["fit"]["posten"] if not x["name"].startswith(("HiCache", "CUDA-Kontext"))), delta=0.6)
+        self.assertAlmostEqual(p["fit"]["statisch_summe_mib"], sum(x["mib"] for x in p["fit"]["posten"] if not x["name"].startswith(("HiCache", "CUDA context"))), delta=0.6)
 
     def test_hicache(self):
         self.assertTrue(self.f["--enable-hierarchical-cache"]["wert"])
@@ -505,15 +505,15 @@ class TestLaptopSynthetisch(unittest.TestCase):
     def test_geborgtes_ist_unbelegt(self):
         for fl in ("--max-total-tokens", "--mem-fraction-static", "--max-mamba-cache-size", "--kv-cache-dtype"):
             self.assertEqual(self.f[fl]["zustand"], "unbelegt", fl)
-            self.assertIn("geborgt, unbelegt", self.f[fl]["begruendung"], fl)
-        self.assertTrue(all("unbelegt" in x["herkunft"] for x in self.p["fit"]["posten"] if x["name"] != "HiCache-Hostpool (gleicher Speicher)"))
-        self.assertTrue(any("APU-Speichermodell" in u for u in self.p["unbelegt"]))
+            self.assertIn("borrowed, unverified", self.f[fl]["begruendung"], fl)
+        self.assertTrue(all("unverified" in x["herkunft"] for x in self.p["fit"]["posten"] if x["name"] != "HiCache host pool (same memory)"))
+        self.assertTrue(any("APU memory model" in u for u in self.p["unbelegt"]))
         self.assertTrue(any("__post_init__" in u for u in self.p["unbelegt"]))
 
     def test_gleiche_form_auf_diskreter_karte_ohne_host_posten(self):
         card = dict(CARD_LAPTOP, unified=False, platform="cuda")
         p = PS.propose_single(self.mp, card, self.goals)
-        self.assertFalse(any(x["name"].startswith("HiCache-Hostpool") for x in p["fit"]["posten"]))
+        self.assertFalse(any(x["name"].startswith("HiCache host pool") for x in p["fit"]["posten"]))
         self.assertEqual(p["fit"]["reserve_bedarf_mib"], 3716.0 + len(PS.prefill_graph_sizes(2048)) * 8)
 
     def test_zu_kleine_karte_passt_nicht(self):
@@ -522,7 +522,7 @@ class TestLaptopSynthetisch(unittest.TestCase):
         self.assertEqual(p["verdikt"]["state"], "passt nicht")
         self.assertGreater(p["fit"]["fehlt_mib"], 0)
         # Reserve und Hostpool allein lassen 18000 - 2000 - 3716 = 12284 MiB < Gewichte 17000
-        self.assertIn("es fehlen", p["verdikt"]["text"])
+        self.assertIn("are missing", p["verdikt"]["text"])
 
     def test_reserve_groesser_als_karte(self):
         card = dict(CARD_LAPTOP, total_mib=3000, usable_mib=3000)
@@ -547,16 +547,16 @@ class TestExternerDraft(unittest.TestCase):
         self.assertEqual(f["--speculative-dflash-block-size"]["wert"], 8)
         self.assertNotIn("--speculative-num-steps", f)
         post = {x["name"]: x for x in p["fit"]["posten"]}
-        drf = next(v for k, v in post.items() if k.startswith("Gewichte (Draft"))
+        drf = next(v for k, v in post.items() if k.startswith("Weights (draft"))
         self.assertAlmostEqual(drf["mib"], dp["total_bytes"]["v"] / MIB, delta=0.1)
-        kvd = next(v for k, v in post.items() if k.startswith("KV-Pool (Draft"))
+        kvd = next(v for k, v in post.items() if k.startswith("KV pool (draft"))
         dtype_key = "fp8_e4m3" if f["--kv-cache-dtype"]["wert"].startswith("fp8") else "auto"
         cell = dp["kv"]["cell_bytes_per_attn_layer_token"][dtype_key]["v"]
         # Gleitfenster 2048 x 5 Layer: NICHT der volle Kontext (Plan: AP-B L6)
         self.assertAlmostEqual(kvd["mib"], 2048 * 5 * cell / MIB, delta=0.1)
-        self.assertIn("Gleitfenster 2048", kvd["formel"])
+        self.assertIn("sliding window 2048", kvd["formel"])
         # Spekulationszustand rechnet mit dem Verifikationsfenster 8
-        sp = post["Mamba-Zwischenzustaende (Spekulation)"]
+        sp = post["Mamba intermediate states (speculation)"]
         self.assertAlmostEqual(sp["mib"], 1 * 8 * mp["state"]["per_request_bytes"]["v"] / MIB, delta=0.1)
 
 
@@ -579,7 +579,7 @@ class TestEingaben(unittest.TestCase):
         del mp["kv"]["variants"]
         p = PS.propose_single(mp, CARD_5090)
         self.assertEqual(p["verdikt"]["state"], "unbelegt", p["verdikt"]["text"])
-        self.assertTrue(any("KV-Zelle" in u for u in p["unbelegt"]))
+        self.assertTrue(any("KV cell" in u for u in p["unbelegt"]))
         self.assertFalse(p["fit"]["passt"])
 
     def test_kontext_ueber_modellmaximum_wird_vermerkt(self):
@@ -624,7 +624,7 @@ class TestServerArgsParse(unittest.TestCase):
         self.assertEqual(flags["--no-enable-multimodal"]["dest"], "enable_multimodal")
         self.assertIs(flags["--no-enable-multimodal"]["value"], False)     # --no-enable-multimodal setzt das Tri-State-Feld auf False (server_args.py:1061-1076)
         self.assertEqual(flags["--speculative-algorithm"]["value"], "NEXTN")
-        self.assertFalse(any(info["deprecated"] for info in flags.values()), "kanonische Namen, kein veralteter Alias")
+        self.assertFalse(any(info["deprecated"] for info in flags.values()), "canonical names, no deprecated alias")
 
     def test_fehler_werden_benannt(self):
         r = self.batch["results"]
@@ -642,7 +642,7 @@ class TestServerArgsParse(unittest.TestCase):
     def test_apply_parse_traegt_verdikte_ein(self):
         p = copy.deepcopy(self.rig)
         ok = PS.apply_parse(p, {"available": True, "ok": True, "error": None, "flags": self.batch["results"][0]["flags"]})
-        self.assertEqual(ok["verdikt"]["art"], "Planer-Rechnung + ServerArgs-Parse")
+        self.assertEqual(ok["verdikt"]["art"], "Planner calculation + ServerArgs parse")
         self.assertEqual(ok["verdikt"]["state"], "passt")
         for e in ok["flags"]:
             if e["wert"] is not None:

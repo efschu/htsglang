@@ -162,8 +162,8 @@ class Supervisor:
         return {"mode": "prozess", "ok": ok, "vmpush": beat.get("vmpush"), "alive": alive, "pid": p.pid if p else None, "server_pid": os.getpid(),
                 "restarts": self.restarts, "last_exit": self.last_exit, "beat_age_s": round(age, 2) if age is not None else None,
                 "held": beat.get("held"), "errors": beat.get("errors") or {},
-                "why": None if ok else ("Probennehmer-Prozess läuft nicht" if not alive else
-                                        "Probennehmer meldet sich nicht (Herzschlag %s s alt)" % (round(age, 1) if age is not None else "–"))}
+                "why": None if ok else ("Sampler process is not running" if not alive else
+                                        "Sampler does not report (heartbeat %s s old)" % (round(age, 1) if age is not None else "–"))}
 
 
 def main(argv=None) -> int:

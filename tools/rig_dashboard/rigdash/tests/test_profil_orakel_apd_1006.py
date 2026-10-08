@@ -91,7 +91,7 @@ def _v(code, **kw):
 def _doc(verdikte, ausgang="geht_mit_force", **kw):
     d = {"schema": "flliper.verdikt/1", "n": 3, "verdikte": verdikte, "ausgang": ausgang, "geht": ausgang == "geht", "geht_mit_force": ausgang != "absturz",
          "forced": [], "plan": {}, "zaehlung": {}, "profil": {"datei_sha256": "f" * 64, "eingabe_sha256": "e" * 64}, "argv_sha256": "a" * 64,
-         "orakel": {"dauer_s": 1.5, "version": {"launcher": "x"}, "laeufe": 1, "notizen": ["note aus dem Orakel"]}}
+         "orakel": {"dauer_s": 1.5, "version": {"launcher": "x"}, "laeufe": 1, "notizen": ["note from the oracle"]}}
     d.update(kw)
     return d
 
@@ -130,8 +130,8 @@ class DryRunWithOracle(unittest.TestCase):
         self.assertEqual((d["orakel"]["cached"], d["orakel"]["cache_key"]), (False, "abc123"))
         self.assertEqual(d["verdikte"], [])
         self.assertEqual([q["code"] for q in d["rejections"]], ["PROFIL-STATUS"])          # entrypoint code, the synthetic profile is experimentell
-        self.assertIn("note aus dem Orakel", d["notes"])
-        self.assertTrue(any("Abbild der Karten" in n for n in d["notes"]))
+        self.assertIn("note from the oracle", d["notes"])
+        self.assertTrue(any("replica of the cards" in n for n in d["notes"]))
         self.assertEqual([c["index"] for c in d["cards"]], [0, 1, 2])
 
     def test_the_request_to_the_oracle_is_the_rendered_profile_on_the_chosen_cards(self):
@@ -145,7 +145,7 @@ class DryRunWithOracle(unittest.TestCase):
         self.assertEqual(len(req["inventar"]["cards"]), 3)
         self.assertEqual(parts["env_sha256"], ORA.sha256_text(pj.render_env(doc)))
         self.assertEqual([c["entry"]["id"] for c in req["inventar"]["cards"]], ["rtx3080-20", "rtx5090-32", "rtx3080-20"])
-        self.assertTrue(any("synthetische" in n.lower() for n in d["notes"]))
+        self.assertTrue(any("synthetic" in n.lower() for n in d["notes"]))
 
     def test_forced_refusals_carry_class_and_force_state_of_the_register(self):
         hc = _v("HW-COUNT", text="HW-COUNT: 2 cards would be ...", launcher_code=None)
@@ -158,7 +158,7 @@ class DryRunWithOracle(unittest.TestCase):
         for c in ("HW-COUNT", "HW-UNCALIBRATED"):
             q = by[c]
             self.assertEqual((q["klass"], q["force_state"], q["forcebar"]), ("wert", "force", True))
-            self.assertIn("Force übergeht", q["force"])
+            self.assertIn("force overrides it", q["force"])
             self.assertTrue(q["why_class"])
             self.assertIn("verdikt", q)
         self.assertEqual([x["code"] for x in d["verdikte"]], ["HW-COUNT", "PROFILE-VECTORS", "HW-UNCALIBRATED"])      # all verdicts, blockers too
@@ -170,10 +170,10 @@ class DryRunWithOracle(unittest.TestCase):
         by = {q["code"]: q for q in d["rejections"]}
         a = by["ORAKEL-ABSTURZ"]
         self.assertEqual((a["klass"], a["forcebar"], a["force_state"]), ("nicht_forcebar", False, "blockiert"))
-        self.assertIn("nein", a["force"])
+        self.assertIn("no", a["force"])
         self.assertIn("launcher.py:15326", a["source"])
         self.assertIn("IndexError", a["text"])
-        self.assertIn("bleiben auch mit Force bestehen", d["verdict"])
+        self.assertIn("remain even with force", d["verdict"])
         self.assertEqual(d["orakel"]["ausgang"], "absturz")
         self.assertFalse(d["goes"])
 
@@ -185,11 +185,11 @@ class DryRunWithOracle(unittest.TestCase):
         self.assertIn("W19", q["source"])
 
     def test_oracle_cannot_ask_falls_back_to_the_planner_gate_with_a_note(self):
-        _ed, d = self._run(FakeOracle(error="Python der sglang-Umgebung fehlt: /nowhere"), RIG[:2])
+        _ed, d = self._run(FakeOracle(error="Python of the sglang environment is missing: /nowhere"), RIG[:2])
         self.assertEqual(d["quelle"], "gate")
         self.assertNotIn("orakel", d)
         self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= {q["code"] for q in d["rejections"]})
-        self.assertTrue(any("Orakel (Launcher-Trockenlauf) nicht verfügbar" in n and "/nowhere" in n for n in d["notes"]), d["notes"])
+        self.assertTrue(any("Oracle (launcher dry run) not available" in n and "/nowhere" in n for n in d["notes"]), d["notes"])
         # the same rejections as an editor without any oracle
         ed2 = editor(self.tmp + "_x", oracle=None) if os.makedirs(self.tmp + "_x") is None else None
         try:
@@ -204,7 +204,7 @@ class DryRunWithOracle(unittest.TestCase):
         _ed, d = self._run(FakeOracle(_doc([fehler], ausgang="orakel_fehler")), RIG[:2])
         self.assertEqual(d["quelle"], "gate")
         self.assertNotIn("ORAKEL-FEHLER", [q["code"] for q in d["rejections"]])
-        self.assertTrue(any("konnte nicht fragen" in n and "scratch dir" in n for n in d["notes"]))
+        self.assertTrue(any("could not be asked" in n and "scratch dir" in n for n in d["notes"]))
 
     def test_the_card_count_of_the_profile_is_still_checked(self):
         """PROFILE_CARD_COUNT is the entrypoint's gate (the launcher does not read it): kept beside the oracle's verdicts."""
@@ -222,7 +222,7 @@ class DryRunWithOracle(unittest.TestCase):
         (_k, req, _p), = orc.calls
         self.assertEqual(req["inventar"].get("hardware", {}).get("schema"), "flliper.hardware/1")
         self.assertNotIn("cards", req["inventar"])
-        self.assertTrue(any("echten UUIDs" in n for n in d["notes"]))
+        self.assertTrue(any("real UUIDs" in n for n in d["notes"]))
         # two other cards: synthetic
         orc2 = FakeOracle(_doc([], ausgang="geht"))
         ed2 = editor(self.tmp + "_y", oracle=orc2, hardware=lambda: {"ok": True, "profile": hw}) if os.makedirs(self.tmp + "_y") is None else None
@@ -245,7 +245,7 @@ def _hw_profile(rows):
     for r in rows:
         cards.append({"nvml_index": r["index"], "uuid": r["uuid"], "name": r["name"], "pci_bus_id": r["pci_bus_id"],
                       "cc": [r["cc_major"], r["cc_minor"]], "vram_total_mib": {"v": r["total_bytes"] >> 20, "src": "NVML"},
-                      "bar1_total_mib": {"v": None, "src": "nicht gemessen"}, "pcie": {"max_gen": {"v": None}, "max_width": {"v": None}}})
+                      "bar1_total_mib": {"v": None, "src": "not measured"}, "pcie": {"max_gen": {"v": None}, "max_width": {"v": None}}})
     return {"schema": "flliper.hardware/1", "cards": cards}
 
 
@@ -384,14 +384,14 @@ class ProposeRequests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_form_ziele_basis_and_inventory_are_checked(self):
-        for body, needle in (({"basis": {"kind": "release", "name": "demo"}, "form": "quad"}, "form muss flip, tp, dual oder single"),
-                             ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"x": 1}}, "unbekannte Ziele"),
-                             ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"seats": 0}}, "seats muss zwischen"),
-                             ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"p_cut": "x"}}, "p_cut muss eines"),
-                             ({"basis": {"kind": "release", "name": "demo"}, "inventar": "alles"}, "inventar muss"),
+        for body, needle in (({"basis": {"kind": "release", "name": "demo"}, "form": "quad"}, "form must be flip, tp, dual or single"),
+                             ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"x": 1}}, "unknown goals"),
+                             ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"seats": 0}}, "Goal seats must be between"),
+                             ({"basis": {"kind": "release", "name": "demo"}, "ziele": {"p_cut": "x"}}, "Goal p_cut must be one of"),
+                             ({"basis": {"kind": "release", "name": "demo"}, "inventar": "alles"}, "inventar must be"),
                              ({"basis": {"kind": "wild", "name": "demo"}}, "basis.kind"),
-                             ({"basis": {"kind": "release", "name": "../etc"}}, "ungültiger Profilname"),
-                             ({"basis": {"kind": "release", "name": "demo"}, "model_path": "/etc"}, "Modellwurzel")):
+                             ({"basis": {"kind": "release", "name": "../etc"}}, "invalid profile name"),
+                             ({"basis": {"kind": "release", "name": "demo"}, "model_path": "/etc"}, "model root")):
             with self.assertRaises(P.ProfilError, msg=str(body)) as cm:
                 self.ed.propose(body)
             self.assertIn(needle, str(cm.exception), body)
@@ -403,7 +403,7 @@ class ProposeRequests(unittest.TestCase):
                 ed.propose({"basis": {"kind": "release", "name": "demo"}})
         finally:
             shutil.rmtree(self.tmp + "_n", ignore_errors=True)
-        self.assertIn("Orakel ist nicht konfiguriert", str(cm.exception))
+        self.assertIn("The oracle is not configured", str(cm.exception))
 
     def test_doc_keys_of_the_proposals_labels(self):
         dk = P.ProfilEditor.doc_key
@@ -415,13 +415,13 @@ class ProposeRequests(unittest.TestCase):
         self.assertIsNone(dk("--pp-stage-ratio (Seed)"))
 
     def test_the_oracle_error_comes_back_as_ok_false(self):
-        ed = editor(self.tmp + "_e", oracle=FakeOracle(error="kein Modellprofil: nicht gemountet")) if os.makedirs(self.tmp + "_e") is None else None
+        ed = editor(self.tmp + "_e", oracle=FakeOracle(error="no model profile: not mounted")) if os.makedirs(self.tmp + "_e") is None else None
         try:
             r = ed.propose({"basis": {"kind": "release", "name": "demo"}, "inventar": RIG})
         finally:
             shutil.rmtree(self.tmp + "_e", ignore_errors=True)
         self.assertFalse(r["ok"])
-        self.assertIn("nicht gemountet", r["error"])
+        self.assertIn("not mounted", r["error"])
 
 
 def _werte(*rows):
@@ -547,7 +547,7 @@ class ProposeStartprofil(unittest.TestCase):
         ed.propose(self._body(model_path="/models/x"))
         self.assertEqual(calls, [("/models/x", "model_path")])
         self.assertEqual(self.orc.calls[-1][1]["model_path"], "/ok/models/x")
-        ed.check_path = lambda p, what: (_ for _ in ()).throw(ValueError("Pfad liegt nicht unter einer Modellwurzel"))
+        ed.check_path = lambda p, what: (_ for _ in ()).throw(ValueError("path is not under a model root"))
         with self.assertRaises(P.ProfilError):
             ed.propose(self._body(model_path="/etc/passwd"))
 
@@ -591,7 +591,7 @@ class ProposeRoute(unittest.TestCase):
         self.assertEqual((js["ok"], js["schema"], js["startprofil"]["schema"]), (True, "flliper.propose-d/1", "flliper.server/1"))
         st, txt = self.call(port, "/api/profil/propose", base._body(form="quad"))
         self.assertEqual(st, 400)
-        self.assertIn("form muss flip, tp, dual oder single", json.loads(txt)["error"])
+        self.assertIn("form must be flip, tp, dual or single", json.loads(txt)["error"])
         st, txt = self.call(port, "/api/profil/propose", base._body(basis={"kind": "release", "name": "../x"}))
         self.assertEqual(st, 400)
 
@@ -738,7 +738,7 @@ class RealOracle(unittest.TestCase):
                             catalog_file=REPO_CATALOG, oracle=dead)
         d = ed.dry_run(ed.load("release", "nf-int4-h6-abl")["doc"], RIG[:2])
         self.assertEqual(d["quelle"], "gate")
-        self.assertTrue(any("Orakel (Launcher-Trockenlauf) nicht verfügbar" in n for n in d["notes"]))
+        self.assertTrue(any("Oracle (launcher dry run) not available" in n for n in d["notes"]))
         r = ed.propose({"basis": {"kind": "release", "name": "nf-int4-h6-abl"}, "inventar": RIG[:2]})
         self.assertFalse(r["ok"])
         self.assertIn("/nowhere/python", r["error"])

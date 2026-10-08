@@ -70,7 +70,7 @@ class Daten(unittest.TestCase):
             self.assertEqual("hinweis" in f, not f["vorschlag"], f["id"])
         no = PL.ui_info(P.ProfilEditor.FORMS, self.cat["entries"], False)
         self.assertFalse(any(f["vorschlag"] for f in no["formen"]))
-        self.assertTrue(all("Orakel" in f["hinweis"] for f in no["formen"]))
+        self.assertTrue(all("oracle" in f["hinweis"] for f in no["formen"]))
 
     def test_every_section_name_is_in_the_catalog_exactly_once(self):
         names = PL.all_section_names()
@@ -142,7 +142,7 @@ JS_HEAD = r"""
 const PX = require(process.argv[2] + "/profil_planer.js");
 const out = {};
 const dep = (d) => '<i class="dep">' + d.to + '</i>';
-const base = (o) => Object.assign({ key: "flag:--pp-stage-ratio", name: "--pp-stage-ratio", scope: "launcher", value: "31,17,16", bare: false, multi: false, origin: "profil", origin_label: "Profil",
+const base = (o) => Object.assign({ key: "flag:--pp-stage-ratio", name: "--pp-stage-ratio", scope: "launcher", value: "31,17,16", bare: false, multi: false, origin: "profil", origin_label: "Profile",
   profile_value: "31,17,16", planner_value: null, changed: false,
   explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Layer je Karte", source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", choices: null } }, o || {});
 const ctx = (o) => Object.assign({ vecNames: new Set(__VEC__), posNames: new Set(__POS__), rankNames: new Set(__RANK__), n: 3, ranks: [], mode: "experte", prop: null, vsrc: "prop", dry: null, open: {}, cmsg: null, hasProfileValues: true,
@@ -201,7 +201,7 @@ out.z = [
 out.tip = z(base({ origin: "nutzer" }), { prop: { werte: [W()] } }).tip;
 """)
         self.assertEqual(o["z"], ["uebersteuert", "unbelegt", "vorgeschlagen", "launcher", "profil", "standard", "uebersteuert"])
-        self.assertIn("Vorschlag des Planers: 1,2,3", o["tip"])
+        self.assertIn("Planner proposal: 1,2,3", o["tip"])
 
     def test_verdicts_never_lock(self):
         o = run_node("""
@@ -220,11 +220,11 @@ const html = PX.renderRow(base(), ctx({ prop: { werte: [W([V("X", { forcebar: fa
 out.html = html;
 """)
         self.assertEqual(o["ids"], ["geht", "force", "verweigert", "hinweis", "ungeprueft", "keinlauf", "alt"])
-        self.assertEqual((o["label"], o["code"]), ("nur mit --force", "W40"))
+        self.assertEqual((o["label"], o["code"]), ("only with --force", "W40"))
         self.assertEqual(o["dry"], "W77")
         self.assertEqual(o["dryWins"], "force")
         self.assertIn("pfx-v-verweigert", o["html"])
-        self.assertIn("auch mit Force nicht übergehbar", o["html"])
+        self.assertIn("cannot be overridden even with force", o["html"])
         self.assertNotIn("disabled", o["html"])
         self.assertNotIn("readonly", o["html"])
 
@@ -240,17 +240,17 @@ out.unnamed = PX.renderRow(base({ key: "flag:--dual-share-actuators", name: "--d
 out.nolist = PX.renderRow(base(), Object.assign({}, c, { vecNames: undefined }));
 """)
         self.assertEqual(len(re.findall(r'data-vi="', o["ok"])), 3)
-        self.assertIn("Rang 0 · RTX 5090", o["ok"])
+        self.assertIn("Rank 0 · RTX 5090", o["ok"])
         self.assertIn("Σ 64", o["ok"])
-        self.assertNotIn("Einträge, aber", o["ok"])
+        self.assertNotIn("entries, but", o["ok"])
         self.assertEqual(len(re.findall(r'data-vi="', o["bad"])), 2)
-        self.assertIn("2 Einträge, aber 3 Karten", o["bad"])
+        self.assertIn("2 entries, but 3 cards", o["bad"])
         self.assertNotIn("data-vi", o["scalar"])
         self.assertIn('data-k="flag:--d-tp-objective"', o["scalar"])
         self.assertNotIn("data-vi", o["choice"])                    # eine Auswahl bleibt eine Auswahl
         self.assertNotIn("data-vi", o["nonum"])
         self.assertNotIn("data-vi", o["unnamed"])                   # Review Runde 2: ein Kommatext allein ist noch kein Rang-Vektor
-        self.assertNotIn("Einträge, aber", o["unnamed"])
+        self.assertNotIn("entries, but", o["unnamed"])
         self.assertIn('data-k="flag:--dual-share-actuators" value="green,duty"', o["unnamed"])
         self.assertNotIn("data-vi", o["nolist"])                    # ohne Vektorliste vom Server: Textfeld
 
@@ -267,7 +267,7 @@ out.p = PX.renderProposal({ n: 2, form: evil, werte: [{ label: evil, alt: evil, 
     def test_section_keeps_the_sections_order_and_reports_its_keys(self):
         o = run_node("""
 const rows = [base({ key: "flag:--rank-gpu-memory-mib", name: "--rank-gpu-memory-mib" }), base({ key: "flag:--other", name: "--other" }), base()];
-const sec = { id: "A", titel: "A  Aufteilung", satz: "s", namen: ["--pp-stage-ratio", "--rank-gpu-memory-mib", "--rank-kv-ratio"] };
+const sec = { id: "A", titel: "A  Split across the cards", satz: "s", namen: ["--pp-stage-ratio", "--rank-gpu-memory-mib", "--rank-kv-ratio"] };
 const r = PX.renderSection(sec, rows, ctx(), "<i>EXTRA</i>", [{ key: "flag:--rank-kv-ratio", value: "1,1,1" }]);
 out.keys = r.keys; out.html = r.html;
 const e = PX.renderSection(sec, rows, ctx({ mode: "einfach" }), "", []);
@@ -277,10 +277,10 @@ out.einfach = e.html;
         self.assertLess(o["html"].index("--pp-stage-ratio"), o["html"].index("--rank-gpu-memory-mib"))
         self.assertNotIn("--other", o["html"])
         self.assertIn("EXTRA", o["html"])
-        self.assertIn("vom Launcher gelöst: 1,1,1", o["html"])             # nicht im Profil, aber der Launcher rechnet ihn (planner_only)
+        self.assertIn("solved by the launcher: 1,1,1", o["html"])             # nicht im Profil, aber der Launcher rechnet ihn (planner_only)
         self.assertIn('data-take="flag:--rank-kv-ratio"', o["html"])
         self.assertIn('data-addflag="--rank-kv-ratio"', o["html"])
-        self.assertNotIn("nicht im Profil gesetzt", o["einfach"])           # die Liste fehlender Werte nur in der Expertenansicht
+        self.assertNotIn("not set in the profile", o["einfach"])           # die Liste fehlender Werte nur in der Expertenansicht
 
     def test_green_table_round_trip(self):
         o = run_node("""
@@ -306,13 +306,13 @@ out.none = PX.renderDual([], {}, ctx());
 """ % json.dumps(ui))
         self.assertEqual(len(re.findall(r'data-gt="lo"', o["full"])), 3)
         self.assertIn('value="30"', o["full"])
-        self.assertIn('<option value="2" selected>Stufe 2 · P mindestens 50 %</option>', o["full"])
-        self.assertIn("alle größeren", o["full"])                           # Schwelle 10**9
+        self.assertIn('<option value="2" selected>Stage 2 · P at least 50 %</option>', o["full"])
+        self.assertIn("all larger", o["full"])                           # Schwelle 10**9
         self.assertIn('data-gtab="form:SGLANG_WEG2_DUAL_SHARE_GREEN_TABLE"', o["full"])
-        self.assertIn("Stufe 3 · P mindestens 25 % (Klemme AUS)", o["full"])
+        self.assertIn("Stage 3 · P at least 25 % (clamp OFF)", o["full"])
         # ohne Zeilen im Profil: Standard des Codes (2:1:0;4:2:1;10**9:3:2), jede Zeile mit "Standard"-Chip und den Kanten des Katalogs
         self.assertIn('value="60"', o["empty"])
-        self.assertIn("Standard (nicht im Profil)", o["empty"])
+        self.assertIn("default (not in the profile)", o["empty"])
         self.assertIn("--dual-priority", o["empty"])
         self.assertRegex(o["empty"], r'data-gt="lo" data-gi="0"[^>]*>(?:(?!</select>).)*<option value="1" selected>')     # Zeile 1: tau niedrig 1
         self.assertEqual(o["none"], "")
@@ -326,7 +326,7 @@ out.pick1 = PX.renderFormPick(info, "einzel", 1);
 const s = (o) => Object.assign({ form: "flip", seats: 6, seatsOn: false, ctx: 262144, ctxOn: false, busy: false, canPropose: true, whyNot: "", canCheck: true }, o || {});
 out.c_ok = PX.renderControls(info, s());
 out.c_dual = PX.renderControls(info, s({ form: "dual" }));
-out.c_no = PX.renderControls(info, s({ canPropose: false, whyNot: "Erst ein Profil laden" }));
+out.c_no = PX.renderControls(info, s({ canPropose: false, whyNot: "Load a profile first" }));
 out.c_busy = PX.renderControls(info, s({ busy: true }));
 out.prop = PX.renderProposal({ n: 3, form: "flip", werte: [{ label: "--d-bs", alt: "6", wert: "4", zustand: "vorgeschlagen", geaendert: true, verdikte: [] }, { label: "x", zustand: "unbelegt", geaendert: false }],
   verdikt: { ausgang: "geht_mit_force", verdikte: [{ ebene: "lauf", code: "W40", grund: "g", forcebar: true, force_state: "force" }] },
@@ -334,18 +334,18 @@ out.prop = PX.renderProposal({ n: 3, form: "flip", werte: [{ label: "--d-bs", al
 """ % json.dumps(ui))
         self.assertEqual(len(re.findall(r'data-form="', o["pick"])), 4)
         self.assertIn('data-form="flip" role="radio" aria-checked="true"', o["pick"])
-        self.assertIn("Passt nicht zur Kartenzahl (3 Karten; diese Form braucht 1)", o["pick"])      # Einzelkarte bei 3 Karten
-        self.assertNotIn("Passt nicht", o["pick1"].split('data-form="einzel"')[1].split("</button>")[0])
+        self.assertIn("Does not match the card count (3 cards; this form needs 1)", o["pick"])      # Einzelkarte bei 3 Karten
+        self.assertNotIn("Does not match", o["pick1"].split('data-form="einzel"')[1].split("</button>")[0])
         self.assertRegex(o["c_ok"], r'data-act="propose"(?! disabled)')
         self.assertRegex(o["c_dual"], r'data-act="propose" disabled')
-        self.assertIn("keinen Vorschlag", o["c_dual"])                           # der Grund steht da, nicht nur ein grauer Knopf (kein Verweis auf ein späteres Paket)
+        self.assertIn("no proposal for this form", o["c_dual"])                           # der Grund steht da, nicht nur ein grauer Knopf (kein Verweis auf ein späteres Paket)
         self.assertRegex(o["c_no"], r'data-act="propose" disabled')
-        self.assertIn("Erst ein Profil laden", o["c_no"])
-        self.assertIn("rechnet …", o["c_busy"])
-        self.assertIn("Rand 31544 MiB", o["prop"])
+        self.assertIn("Load a profile first", o["c_no"])
+        self.assertIn("computing …", o["c_busy"])
+        self.assertIn("margin 31544 MiB", o["prop"])
         self.assertIn("--d-bs", o["prop"])
-        self.assertIn("nur mit --force", o["prop"])
-        self.assertIn("keine Sperre", o["prop"])
+        self.assertIn("only with --force", o["prop"])
+        self.assertIn("not a block", o["prop"])
 
 
 HARNESS = r"""
@@ -362,7 +362,7 @@ global.localStorage = { getItem() { return null; }, setItem() {} };
 global.CSS = { escape: (s) => s };
 const posted = [];
 const PLANER = CASE.planer;
-const row = (name, value) => ({ key: "flag:" + name, name, scope: "launcher", value, bare: false, origin: "profil", origin_label: "Profil", changed: false, profile_value: value, planner_value: null,
+const row = (name, value) => ({ key: "flag:" + name, name, scope: "launcher", value, bare: false, origin: "profil", origin_label: "Profile", changed: false, profile_value: value, planner_value: null,
   explain: { status: "kuratiert", parts: [{ kind: "kuratiert", text: "Erklaerung " + name, source: "c.py" }], depends: [], gain: "", cost: "", group: "", level: "einfach", planner_derived: false, source: null, default: null, choices: null } });
 const VIEW = { rows: [row("--pp-stage-ratio", "31,17,16"), row("--p-bs", "2")], planner_only: [], removed: [], kvheads: [],
   coverage: { rows: 2, erklaert: 2, kuratiert: 2, geerntet: 0, profil_kommentar: 0, unerklaert: 0, geaendert: 0 } };
@@ -378,7 +378,7 @@ global.fetch = async (url, opt) => {
     else if (p === "load") body = { ok: true, doc: DOC, view: VIEW, name: "p", line: "27b", groups: [] };
     else if (p === "propose") { posted.push(JSON.parse(opt.body)); body = { ok: true, n: 3, form: "flip", werte: [{ key: "flag:--pp-stage-ratio", label: "--pp-stage-ratio", wert: "30,18,16", alt: "31,17,16", zustand: "vorgeschlagen", herkunft: "H", grund: "G", geaendert: true, verdikte: [] }],
       verdikt: { ausgang: "geht", verdikte: [] }, vorschlag: { cards: [{ name: "RTX 5090", total_mib: 32607 }, { name: "RTX 3080", total_mib: 20480 }, { name: "RTX 3080", total_mib: 20480 }], fit: { level: "ja", margin_mib: 100 } }, notes: [],
-      startprofil: { doc: Object.assign({}, DOC, { name: "p-vorschlag" }), view: Object.assign({}, VIEW, { rows: [Object.assign(row("--pp-stage-ratio", "30,18,16"), { origin: "planer", origin_label: "Planer", changed: true }), row("--p-bs", "2")] }), name: "p-vorschlag" } }; }
+      startprofil: { doc: Object.assign({}, DOC, { name: "p-vorschlag" }), view: Object.assign({}, VIEW, { rows: [Object.assign(row("--pp-stage-ratio", "30,18,16"), { origin: "planer", origin_label: "Planner", changed: true }), row("--p-bs", "2")] }), name: "p-vorschlag" } }; }
     else if (p === "recompute") body = { ok: false, error: "nicht im Test" };
     else body = { ok: false, error: "unerwartet " + p };
   }
@@ -438,25 +438,25 @@ class ProfilJs(unittest.TestCase):
         h = self.new["afterLoad"]
         idx = [h.index('id="pfx-h%d"' % i) for i in range(1, 7)]
         self.assertEqual(idx, sorted(idx))
-        for t in ("Hardware", "Modell und Profil", "Betriebsform", "Vorschlag", "Anpassen", "Export"):
+        for t in ("Hardware", "Model and profile", "Operating form", "Proposal", "Adjust", "Export"):
             self.assertIn(t, h)
-        self.assertIn("3 Karten", h)                                  # das Hardwareprofil des Rigs (api/hwprofil)
+        self.assertIn("3 cards", h)                                  # das Hardwareprofil des Rigs (api/hwprofil)
         self.assertEqual(len(re.findall(r'data-vi="', h)), 3)         # --pp-stage-ratio als drei Felder
         self.assertTrue(self.new["tpSelected"])
 
     def test_propose_posts_basis_form_inventory_and_goals(self):
         self.assertEqual(self.new["posted"], [{"basis": {"kind": "release", "name": "p"}, "form": "flip", "inventar": "rig", "ziele": {"seats": 6}}])
         h = self.new["afterPropose"]
-        self.assertIn("Vorschlag für 3 Karte", h)
+        self.assertIn("Proposal for 3 card", h)
         self.assertIn("pfx-z-vorgeschlagen", h)
-        self.assertIn("Rang 0 · RTX 5090", h)                         # nach dem Vorschlag tragen die Felder die Karten in Rangfolge
+        self.assertIn("Rank 0 · RTX 5090", h)                         # nach dem Vorschlag tragen die Felder die Karten in Rangfolge
 
     def test_without_planer_data_or_module_the_old_page_is_drawn(self):
         for o in (self.legacy_no_planer, self.legacy_no_module):
             self.assertEqual(o["unhandled"], [])
             self.assertEqual(o["steps0"], 0)
             self.assertNotIn("pfx-step", o["afterLoad"])
-            self.assertIn("Trockenlauf", o["afterLoad"])
+            self.assertIn("Dry run", o["afterLoad"])
 
 
 @unittest.skipUnless(NODE, "node fehlt")
@@ -484,7 +484,7 @@ class AllVectorsAreFields(unittest.TestCase):
             self.assertNotRegex(self.h, r'<input type="text" data-k="flag:%s" value="[^"]*,' % re.escape(name))
 
     def test_the_rest_list_does_not_repeat_them(self):
-        i = self.h.index("E  Übrige Werte")
+        i = self.h.index("E  Remaining values")
         self.assertNotIn("--d-foreign-context-mib", self.h[i:])      # steht in A, nicht noch einmal in E
 
     def test_nothing_unhandled(self):
@@ -511,7 +511,7 @@ class OnlyNamedVectorsAreFields(unittest.TestCase):
             self.assertIn('data-k="flag:%s" value="%s"' % (name, val), self.h, name)
 
     def test_no_made_up_rank_hint_for_them(self):
-        self.assertNotIn("Einträge, aber", self.h)
+        self.assertNotIn("entries, but", self.h)
 
     def test_the_launcher_excluded_ones_are_text_fields_not_vectors(self):
         """Review-Befund 1 (Runde 3): BAR1-Fenster, d_reshard-Presets, L1.5 zaehlt der Launcher nicht je Karte; kein PROFILE-VECTORS-Satz fuer sie."""
@@ -572,13 +572,13 @@ out.other = PX.renderRow(base({ key: "flag:--rank-tp-ratio", name: "--rank-tp-ra
 """)
         for k, n in (("four", 4), ("three", 3)):
             self.assertEqual(len(re.findall(r'data-vi="', o[k])), n, k)
-            self.assertIn("%d Ränge" % n, o[k])
-            self.assertNotIn("Einträge, aber", o[k])
+            self.assertIn("%d ranks" % n, o[k])
+            self.assertNotIn("entries, but", o[k])
             self.assertNotIn("Σ", o[k])
             self.assertNotIn("RTX", o[k])                          # kein Kartenname am Rangfeld
-            self.assertIn("Rang 3" if n == 4 else "Rang 2", o[k])
+            self.assertIn("Rank 3" if n == 4 else "Rank 2", o[k])
         self.assertIn("Σ 3", o["other"])                           # die anderen Vektoren bleiben je Karte mit Summe
-        self.assertIn("Rang 0 · RTX 5090", o["other"])
+        self.assertIn("Rank 0 · RTX 5090", o["other"])
 
 
 class Css(unittest.TestCase):

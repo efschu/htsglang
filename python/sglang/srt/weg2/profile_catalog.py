@@ -223,6 +223,12 @@ def harvest_profile_comments(env_path: str) -> Dict[str, Dict[str, str]]:
 # edge catalog (Auftrag 2002 C): evidence + one sentence per dependency, merged into ``depends``
 
 EDGES_SCHEMA = "flliper.kanten/1"
+#: Display wording (English) for the vocabulary that stays a KEY in the data: the edge ``rel`` values and the entry ``status`` values.
+#: The keys (``tauscht`` ... / ``kuratiert`` ...) are what code, tests and ``catalog.json`` entries carry; only the text a person reads is English.
+#: ``main`` ships both tables in ``catalog.json`` under ``anzeige`` so the page does not need its own copy.
+REL_ANZEIGE: Dict[str, str] = {"tauscht": "trades", "braucht": "requires", "schliesst_aus": "excludes", "abgeleitet_von": "derived_from",
+                               "skaliert_mit": "scales_with"}
+STATUS_ANZEIGE: Dict[str, str] = {"kuratiert": "curated", "erklaert": "explained", "geerntet": "harvested", "unerklaert": "unexplained"}
 EDGES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kantenkatalog_1004.json")
 _RX_CODE = re.compile(r"^[A-Z]+(?:-[A-Z]+)+$")
 
@@ -236,12 +242,12 @@ def load_edges(path: str = "") -> Tuple[List[Dict[str, object]], Dict[str, objec
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
     except (OSError, ValueError) as exc:
-        info["grund"] = "nicht lesbar: %s" % exc
+        info["grund"] = "not readable: %s" % exc
         return [], info
     info["schema"] = str(doc.get("schema", ""))
     edges = doc.get("kanten")
     if info["schema"] != EDGES_SCHEMA or not isinstance(edges, list):
-        info["grund"] = "Schema %r (erwartet %s) oder keine Kantenliste" % (info["schema"], EDGES_SCHEMA)
+        info["grund"] = "schema %r (expected %s) or no edge list" % (info["schema"], EDGES_SCHEMA)
         return [], info
     ok = [e for e in edges if isinstance(e, dict) and e.get("von") and e.get("nach") and e.get("rel")]
     info.update({"geladen": True, "kanten_gesamt": len(ok), "verworfen": len(edges) - len(ok)})
@@ -715,10 +721,10 @@ def build_union_catalog(trees: Sequence[Tuple[str, str]], curated: Mapping[str, 
     cat["stats"]["baeume"]["beide"] = sum(1 for e in union.values() if len(e.get("baeume", [])) == len(labels) > 1)
     cat["stats"]["baeume"]["abweichung"] = sum(1 for e in union.values() if "abweichung" in e)
     cat["warnungen"] = [
-        "%s: der Text erwartet die Bäume %s, der Eintrag steht in %s" % (n, c["baeume_erwartet"], union[n].get("baeume"))
+        "%s: the text expects the trees %s, the entry is in %s" % (n, c["baeume_erwartet"], union[n].get("baeume"))
         for n, c in sorted((erklaert or {}).items())
         if "baeume_erwartet" in c and n in union and union[n].get("baeume") != c["baeume_erwartet"]]
-    cat["warnungen"] += ["%s: der Text erwartet die Bäume %s, der Name steht in keinem Baum" % (n, c["baeume_erwartet"])
+    cat["warnungen"] += ["%s: the text expects the trees %s, the name is in no tree" % (n, c["baeume_erwartet"])
                          for n, c in sorted((erklaert or {}).items()) if "baeume_erwartet" in c and n not in union]
     return cat
 
@@ -771,6 +777,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cat = build_catalog(launcher, environ, mod.CURATED, ns.rev, sargs, erklaert=mod.ERKLAERT, srt_dir=os.path.join(py, "sglang", "srt"),
                             baum=ns.baum)
     cat["glossar"] = dict(mod.GLOSSAR)
+    cat["anzeige"] = {"rel": dict(REL_ANZEIGE), "status": dict(STATUS_ANZEIGE)}
     text = json.dumps(cat, indent=1, sort_keys=True, ensure_ascii=False, default=str) + "\n"
     if ns.out:
         with open(ns.out, "w", encoding="utf-8") as fh:

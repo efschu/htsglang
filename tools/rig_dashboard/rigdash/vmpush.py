@@ -453,8 +453,8 @@ def boot_rates_from(series: Dict[Tuple[str, str, str], List[Tuple[float, float]]
         decode = {"gen_tps_boot": (s["tok"] / s["dur"]) if s["dur"] >= 2.0 else None, "boot_decode_s": s["dur"],
                   "tokens": s["tok"], "seats_boot": (s["seat_s"] / s["busy"]) if s["busy"] else None}
     return {"prefill": prefill, "decode": decode,
-            "src": "VictoriaMetrics: Prefill weg2_rank_prefill_* (Rechenzeit, langsamster Rang), "
-                   "Decode weg2_boot_decode_* (1-s-Ring des Samplers, stetige Intervalle, ganzer Boot)"}
+            "src": "VictoriaMetrics: prefill weg2_rank_prefill_* (compute time, slowest rank), "
+                   "decode weg2_boot_decode_* (1-s ring of the sampler, steady intervals, whole boot)"}
 
 
 def boot_rates(client: "VmClient", boot_id: str, span_s: int = 12 * 3600) -> dict:
@@ -502,7 +502,7 @@ def pcie_series(client: VmClient, ts: List[int], step: int) -> dict:
                                         ts[0] + step, ts[-1] + step, step, "gpu")
             for g, vals in got.items():
                 out["g%s.%s" % (g, d)] = [vals.get(t + step) for t in ts]
-        return {"series": out, "error": None, "src": "VictoriaMetrics weg2_gpu_pcie_bytes_per_second (NVML im 1-s-Takt)"}
+        return {"series": out, "error": None, "src": "VictoriaMetrics weg2_gpu_pcie_bytes_per_second (NVML at a 1 s cadence)"}
     except Exception as e:  # noqa: BLE001
         return {"series": {}, "error": "%s: %s" % (type(e).__name__, e)}
 

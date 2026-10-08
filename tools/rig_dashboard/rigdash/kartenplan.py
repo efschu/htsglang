@@ -6,7 +6,7 @@ Quelle der Wahrheit ist UNSER Planer, nicht ein Nachbau:
      uncalibrated_message und topology.plan_topology (kartenplan_gate), mit synthetischem Karteninventar,
      ohne GPU, ohne Launcher.  Die Meldungen sind die Originaltexte des Planers.
   2. Geht das Inventar durch, kommt der Plan aus der Planer-AUFZEICHNUNG des Referenz-Boots (kartenplan_data/):
-     vram_plan.json, Budgetzeilen des Launchers, argv/env der Gruppen, Posten aus den Rang-Logs.  Dass der Planer
+     vram_plan.json, Budgetzeilen des Launchers, argv/env der Gruppen, Posten aus den Rank logs.  Dass der Planer
      diese Budgets heute noch genauso rechnet, steht je Record als ``planer_nachrechnung``
      (launcher.budgets_from_dc im Kindprozess, kartenplan_bridge).
   3. Geht es NICHT durch (andere Karten, andere Zahl), gibt es keinen Plan.  Es gibt die Gründe des Planers und
@@ -50,7 +50,7 @@ def load_record(record_id: str, data_dir: str = DATA_DIR) -> Optional[dict]:
     except (OSError, ValueError):
         return None
     if rec.get("schema") != SCHEMA:
-        raise ValueError("Record %s: Schema %r unbekannt" % (record_id, rec.get("schema")))
+        raise ValueError("Record %s: schema %r unknown" % (record_id, rec.get("schema")))
     if rec.get("vram_plan") and not plan_id_ok(rec["vram_plan"]):
         rec["vram_plan_ok"] = False
     return rec
@@ -60,7 +60,7 @@ TREE_CANDIDATES = (
     "/spinning/htsglang/.claude/worktrees/rigdash-zoom-1001/.wt-hwgen/python",
 )
 
-PHASE_LABEL = {"P": "P-Layout (Prefill, PP3)", "D": "D-Layout (Decode, TP3)"}
+PHASE_LABEL = {"P": "P layout (prefill, PP3)", "D": "D layout (decode, TP3)"}
 
 
 def _find_tree(explicit: Optional[str] = None) -> Optional[str]:
@@ -93,8 +93,7 @@ class Kartenplaner:
                     {"card": "rtx3080-20", "pcie": {"gen": 4, "lanes": 4, "rebar": False, "chipset": False}},
                     {"card": "rtx5090-32", "pcie": {"gen": 5, "lanes": 8, "rebar": False, "chipset": False}},
                     {"card": "rtx3080-20", "pcie": {"gen": 4, "lanes": 8, "rebar": False, "chipset": False}}],
-                    "src": "Breiten nutzer-bestätigt 17.08. (5090 x8, eine 3080 x8, eine 3080 x4, memory rig-interconnect-p2p); "
-                           "Generationen = Maximum der Karte, am Rig nicht je Slot ausgelesen (ASPM-Downclock im Leerlauf)"},
+                    "src": "Widths user-confirmed 17.08. (5090 x8, one 3080 x8, one 3080 x4, memory rig-interconnect-p2p); generations = maximum of the card, not read per slot on the rig (ASPM downclock at idle)"},
                 "planner_tree": self.tree, "gate_ok": self.tree is not None}
 
     def _record(self, rid: str) -> Optional[dict]:
@@ -105,7 +104,7 @@ class Kartenplaner:
     def _mods(self):
         if self._gate_mods is None:
             if not self.tree:
-                raise GATE.GateUnavailable("kein Planer-Baum mit card_identity.py gefunden (KARTENPLAN_TREE bzw. install_510.sh)")
+                raise GATE.GateUnavailable("no planner tree with card_identity.py found (KARTENPLAN_TREE or install_510.sh)")
             self._gate_mods = GATE.load_modules(self.tree)
         return self._gate_mods
 
@@ -113,16 +112,16 @@ class Kartenplaner:
     def plan(self, req: dict) -> dict:
         prof = CAT.profile(req.get("profile"))
         if prof is None:
-            raise ValueError("unbekanntes Profil %r (wählbar: %s)" % (req.get("profile"), ", ".join(p["id"] for p in CAT.PROFILES)))
+            raise ValueError("unknown profile %r (selectable: %s)" % (req.get("profile"), ", ".join(p["id"] for p in CAT.PROFILES)))
         raw_cards = req.get("cards") or []
         if not 1 <= len(raw_cards) <= MAX_CARDS:
-            raise ValueError("1 bis %d Karten wählen, nicht %d" % (MAX_CARDS, len(raw_cards)))
+            raise ValueError("select 1 to %d cards, not %d" % (MAX_CARDS, len(raw_cards)))
         host_patched = bool(req.get("host_patched", True))
         cards = []
         for i, rc in enumerate(raw_cards):
             e = CAT.card(rc.get("card"))
             if e is None:
-                raise ValueError("Karte %r nicht im Katalog" % rc.get("card"))
+                raise ValueError("Card %r not in the catalog" % rc.get("card"))
             link = TR.per_card_link(e, rc.get("pcie"))
             cards.append({"index": i, "entry": e, "label": CAT.label(e), "link": link,
                           "status": self._card_status(e, prof)})
@@ -136,7 +135,7 @@ class Kartenplaner:
         rec = self._record(prof["record"])
         if rec is None:
             verdict["goes"] = False
-            verdict["reasons"].append({"code": "KEIN-RECORD", "text": "Für dieses Profil liegt keine Planer-Aufzeichnung vor (kartenplan_data/%s.json)." % prof["record"],
+            verdict["reasons"].append({"code": "KEIN-RECORD", "text": "There is no planner recording for this profile (kartenplan_data/%s.json)." % prof["record"],
                                        "source": "kartenplan_records"})
         elif verdict["goes"]:
             out["plan"] = self._plan_from_record(rec, prof, cards, gate, transport)
@@ -185,15 +184,15 @@ class Kartenplaner:
                     seen[key]["cards"].append(c["index"])
                     continue
                 seen[key] = {"code": "ARCH-" + c["entry"]["arch"], "text": c["status"]["why"],
-                             "source": "Katalog + HW-Gate (card_identity.arch_gate)", "cards": [c["index"]]}
+                             "source": "Catalog + HW gate (card_identity.arch_gate)", "cards": [c["index"]]}
                 reasons.append(seen[key])
         for r in reasons:
-            r["text"] = "%s (betrifft Karte%s %s)" % (r["text"], "n" if len(r["cards"]) > 1 else "", ", ".join(str(i + 1) for i in r["cards"]))
+            r["text"] = "%s (concerns card%s %s)" % (r["text"], "s" if len(r["cards"]) > 1 else "", ", ".join(str(i + 1) for i in r["cards"]))
         if gate.get("available"):
             archs = [pc for pc in gate["per_card"] if not pc["arch"]["ok"]]
             if archs:
                 reasons.append({"code": "HW-ARCH", "text": archs[0]["arch"]["message"] + (
-                    "  [dieselbe Meldung für %d weitere Karte(n)]" % (len(archs) - 1) if len(archs) > 1 else ""),
+                    "  [same message for %d more card(s)]" % (len(archs) - 1) if len(archs) > 1 else ""),
                     "source": "weg2/card_identity.arch_gate", "cards": [a["nvml_index"] for a in archs]})
             if gate["count"] and gate["count"]["ok"] is False:
                 reasons.append({"code": "HW-COUNT", "text": gate["count"]["message"], "source": "weg2/card_identity.order_cards"})
@@ -202,16 +201,16 @@ class Kartenplaner:
             if gate["calibration"] and not gate["calibration"]["ok"]:
                 reasons.append({"code": "HW-UNCALIBRATED", "text": gate["calibration"]["message"], "source": "weg2/card_identity.uncalibrated_message"})
         else:
-            reasons.append({"code": "GATE-FEHLT", "text": gate.get("why", "Gate nicht verfügbar"), "source": "kartenplan_gate"})
+            reasons.append({"code": "GATE-FEHLT", "text": gate.get("why", "Gate not available"), "source": "kartenplan_gate"})
         if transport["transport"] == "nccl":
             reasons.append({"code": "TRANSPORT-NCCL", "text": " ".join(transport["reasons"]),
-                            "source": "kartenplan_transport (Bestform ist barlink BAR1)"})
+                            "source": "kartenplan_transport (best form is barlink BAR1)"})
         goes = not reasons
         if goes:
-            head = "Geht: %s auf %d Karten, Transport %s." % (prof["label"], len(cards), "barlink BAR1" if transport["transport"] == "bar1" else transport["transport"])
+            head = "Works: %s on %d cards, transport %s." % (prof["label"], len(cards), "barlink BAR1" if transport["transport"] == "bar1" else transport["transport"])
         else:
-            head = "Geht nicht: %s." % reasons[0]["code"] if len(reasons) == 1 else \
-                "Geht nicht: %s." % ", ".join(sorted({r["code"] for r in reasons}))
+            head = "Does not work: %s." % reasons[0]["code"] if len(reasons) == 1 else \
+                "Does not work: %s." % ", ".join(sorted({r["code"] for r in reasons}))
         return {"goes": goes, "headline": head, "reasons": reasons,
                 "cards_ok": [bool(c["status"]["ok"]) for c in cards]}
 
@@ -223,8 +222,8 @@ class Kartenplaner:
             bad = [c["label"] for c in cards if not CAT.arch_status(c["entry"]["cc"], p["format"])["ok"] or not c["entry"]["enabled"]]
             ok = gate.get("available") and gate.get("ok") and not bad
             out.append({"profile": p["id"], "label": p["label"], "goes": bool(ok),
-                        "why": ("gleiches Gate-Urteil wie oben (Inventar passt zur Aufzeichnung)" if ok else
-                                ("Karte(n) nicht lauffähig: " + ", ".join(bad) if bad else "Planer-Gate verweigert dieses Inventar")),
+                        "why": ("same gate verdict as above (inventory matches the recording)" if ok else
+                                ("Card(s) not runnable: " + ", ".join(bad) if bad else "Planner gate refuses this inventory")),
                         "has_record": self._record(p["record"]) is not None})
         return out
 
@@ -250,13 +249,11 @@ class Kartenplaner:
                        "plan_id": (rec.get("vram_plan") or {}).get("plan_id"), "plan_pass": (rec.get("vram_plan") or {}).get("pass"),
                        "plan_id_ok": rec.get("vram_plan_ok"),
                        "nachrechnung": _nachrechnung_summary(rec),
-                       "note": "Zahlen = Aufzeichnung des Planers beim echten Boot auf dem Referenz-Rig; PCIe-Angaben ändern sie nicht "
-                               "(Flip-Preise sind nur für das Rig gemessen, HW-GENERISCH K4)."},
+                       "note": "Numbers = recording of the planner at the real boot on the reference rig; PCIe settings do not change them (flip prices are measured only for the rig, HW-GENERISCH K4)."},
             "einfach": {"docker_run": dr, "bars": bars, "context": ctx,
-                        "legend": ["Gewichte", "Experten", "KV", "Mamba/State", "Draft", "Aktivierung/Graphen", "Schlafrest", "Treiber", "Rest"]},
+                        "legend": ["Weights", "Experts", "KV", "Mamba/State", "Draft", "Activation/graphs", "Sleep residue", "Driver", "Rest"]},
             "experte": {"flags": flags, "phases": phases, "peak": peak, "warnings": _warnings(rec, phases, transport),
-                        "flip_note": ("Der Flip-Übergang selbst (Austauschpuffer, Lane-Fenster, Arena) ist im Plan als Posten nicht gebucht "
-                                      "(flip_legs leer): ungemessen.  Die Spitze unten ist das Maximum der beiden Phasen je Karte."),
+                        "flip_note": ("The flip transition itself (exchange buffer, lane window, arena) is not booked as an item in the plan (flip_legs empty): unmeasured.  The peak below is the maximum of the two phases per card."),
                         "closure": (rec.get("vram_plan") or {}).get("closure", []),
                         "open": (rec.get("vram_plan") or {}).get("open", []),
                         "overrides": (rec.get("vram_plan") or {}).get("overrides", [])},
@@ -265,11 +262,11 @@ class Kartenplaner:
     # ------------------------------------------------------------------ Näherung (kein Planer-Ergebnis)
     def _naeherung(self, rec: dict, prof: dict, cards: List[dict]) -> dict:
         """Eine NÄHERUNG für Inventare, die der Planer verweigert.  Rechnet nur mit gemessenen Posten des Referenz-Rigs
-        (Rang-Logs), skaliert grob; jede Zeile ist 'geschätzt'.  Startet nichts, behauptet keinen Plan."""
+        (Rank logs), skaliert grob; jede Zeile ist 'geschätzt'.  Startet nichts, behauptet keinen Plan."""
         plan_cards = _plan_cards(rec)
         ref_non_budget = [pc["total_mib"] - pc["d_budget_mib"] for pc in plan_cards if pc.get("d_budget_mib")]
         if not ref_non_budget:
-            return {"available": False, "why": "Referenz-Record ohne D-Budgets"}
+            return {"available": False, "why": "Reference record without D budgets"}
         fixed = round(sum(ref_non_budget) / len(ref_non_budget))
         usable = [c["entry"]["usable_mib"] for c in cards]
         budget_est = [max(0, u - fixed) for u in usable]
@@ -281,23 +278,22 @@ class Kartenplaner:
         cell = posts.get("kv_cell_bytes")
         tokens = int(kv_room * 1048576 / cell) if (cell and kv_room > 0) else None
         fits = kv_room > 0
-        notes.append("Fester Abzug je Karte %d MiB = Mittel (Karte minus D-Budget) der drei Referenzkarten, Boot %s: geschätzt, auf Karten anderer Größe nicht gemessen."
+        notes.append("Fixed deduction per card %d MiB = mean (card minus D budget) of the three reference cards, boot %s: estimated, not measured on cards of another size."
                      % (fixed, rec["boot"]["tag"]))
-        notes.append("Gewichte %d MiB = Summe der gemessenen Lade-Posten (Rang-Logs, D-Gruppe) des Referenz-Boots." % w
+        notes.append("Weights %d MiB = sum of the measured load items (rank logs, D group) of the reference boot." % w
                      if posts["weights_src"] == "rank_log" else posts["weights_src"])
         ctx = (_context(rec).get("context_tokens") or 0)
         kv_for_ctx = round(ctx * cell / 1048576) if (cell and ctx) else None
-        return {"available": True, "label": "Näherung (KEIN Planer-Ergebnis, nichts davon wird gestartet)",
+        return {"available": True, "label": "Approximation (NOT a planner result, none of it is started)",
                 "context_target_tokens": ctx or None, "kv_for_context_mib": kv_for_ctx,
                 "remainder_after_context_mib": (kv_room - kv_for_ctx) if kv_for_ctx is not None else None,
                 "fixed_deduction_mib": fixed, "per_card": [{"label": c["label"], "usable_mib": u, "budget_est_mib": b}
                                                            for c, u, b in zip(cards, usable, budget_est)],
                 "weights_mib": w, "side_posts_mib": side, "kv_room_mib": kv_room, "kv_tokens_est": tokens,
                 "fits": fits, "notes": notes + posts["notes"],
-                "verdict": ("Rechnerisch passen die Gewichte (Summe der Karten ohne festen Abzug ≥ Gewichte + Nebenposten)." if fits else
-                            "Rechnerisch passen die Gewichte NICHT: Summe der Karten abzüglich fester Abzüge ist kleiner als Gewichte + Nebenposten."),
-                "unplannable": "Ein Plan (Schnitt PP/TP, Experten, Flags) fehlt: der Planer hat nur für das Referenz-Inventar gemessene Records "
-                               "(HW-GENERISCH K1/K2) und die Schnittsuche für andere Kartenzahlen/-mischungen ist nicht gebaut (Stufe 2b, Wochen)."}
+                "verdict": ("The weights fit by calculation (sum of the cards without fixed deduction ≥ weights + side items)." if fits else
+                            "The weights do NOT fit by calculation: sum of the cards minus fixed deductions is smaller than weights + side items."),
+                "unplannable": "A plan (PP/TP cut, experts, flags) is missing: the planner has measured records only for the reference inventory (HW-GENERISCH K1/K2) and the cut search for other card counts/mixes is not built (stage 2b, weeks)."}
 
 
 # ====================================================================== Hilfsfunktionen auf Records
@@ -338,23 +334,23 @@ def _seg(key, label, mib, src, kind="post"):
 
 #: Ein-Satz-Erklärung je Posten-Schlüssel (Tooltip des VRAM-Balkens)
 SEG_WHAT = {
-    "weights": "Dichte Modellgewichte dieser Gruppe auf dieser Karte (Attention, Normen, Embeddings, dichte MLP).",
-    "runtime": "Laufzeit-Zustand neben den geladenen Gewichten (Puffer, Skalen, Metadaten).",
-    "experts": "MoE-Experten, die dauerhaft auf der Karte liegen.",
-    "experts_lru": "Experten-Cache (LRU), der den sonst freien VRAM füllt (Grundgesetz: freier VRAM gehört den Experten).",
-    "kv": "KV-Cache-Pool: Schlüssel und Werte der laufenden und der gecachten Requests.",
-    "state": "Mamba/GDN-State-Pools: Rekurrenzzustand je Sitz (kein KV).",
-    "draft": "Draft-/MTP-Modell für spekulatives Decoding.",
-    "graphs": "CUDA-Graphen (aufgezeichnete Decode-/Prefill-Läufe) samt ihrem privaten Speicherpool.",
-    "transient": "Aktivierungen und Zwischenpuffer während Prefill/Decode (Spitzenwert).",
-    "act": "Aktivierungsreserve, die der Rang-Planer für den Prefill einplant.",
-    "free_in_budget": "Teil des Rang-Budgets, der nicht einzeln verbucht ist (Allokator-Cache, Workspaces, ungenutzter Pool).",
-    "carve": "Vom Treiber reservierter Teil der Karte (CUDA-Kontext), für nichts nutzbar.",
-    "asleep": "VRAM, den die schlafende andere Gruppe auf dieser Karte behält (Schlafrest).",
-    "corridor": "Korridor: gemessener Aktivierungs-Peak, den der Planer freihält, damit Spitzen keinen OOM auslösen.",
-    "overshoot": "Gemessener Wach-Überschuss über dem Plan, den der Planer zusätzlich abzieht.",
-    "awake_rest": "Wach-Rest: VRAM, den die wache Gruppe über ihre gebuchten Posten hinaus belegt (Record).",
-    "l15": "L1.5-Cache auf der Karte (Post, Trade gegen Experten/KV).",
+    "weights": "Dense model weights of this group on this card (attention, norms, embeddings, dense MLP).",
+    "runtime": "Runtime state next to the loaded weights (buffers, scales, metadata).",
+    "experts": "MoE experts that stay on the card permanently.",
+    "experts_lru": "Expert cache (LRU) that fills the otherwise free VRAM (basic law: free VRAM belongs to the experts).",
+    "kv": "KV cache pool: keys and values of the running and the cached requests.",
+    "state": "Mamba/GDN state pools: recurrent state per seat (no KV).",
+    "draft": "Draft/MTP model for speculative decoding.",
+    "graphs": "CUDA graphs (recorded decode/prefill runs) with their private memory pool.",
+    "transient": "Activations and intermediate buffers during prefill/decode (peak value).",
+    "act": "Activation reserve that the rank planner schedules for the prefill.",
+    "free_in_budget": "Part of the rank budget that is not booked individually (allocator cache, workspaces, unused pool).",
+    "carve": "Part of the card reserved by the driver (CUDA context), usable for nothing.",
+    "asleep": "VRAM that the sleeping other group keeps on this card (sleep residue).",
+    "corridor": "Corridor: measured activation peak that the planner keeps free so that peaks trigger no OOM.",
+    "overshoot": "Measured awake excess over the plan, which the planner deducts in addition.",
+    "awake_rest": "Awake residue: VRAM that the awake group occupies beyond its booked items (record).",
+    "l15": "L1.5 cache on the card (item, trade against experts/KV).",
 }
 #: Reihenfolge der Posten INNERHALB eines Phasenblocks (stabil: gleicher Schlüssel behält die Planer-Reihenfolge)
 SEG_ORDER = ["weights", "runtime", "experts", "experts_lru", "state", "draft", "kv", "graphs", "transient", "act",
@@ -378,13 +374,13 @@ def _annotate_segments(segs: List[dict], group: str, dual: bool) -> List[dict]:
     other = "D" if group == "P" else "P"
     for s in segs:
         s["phase"] = _seg_phase(s["key"], group, other)
-        measured = str(s["src"]).startswith("Rang-Log") or s["key"] == "carve"
-        s["origin"] = "gemessen" if measured else "Planerwert"
-        s["origin_note"] = ("NVML-Reservierung der Karte" if s["key"] == "carve" else ("Rang-Log des Referenz-Boots" if measured
-                            else "vram_plan bzw. Budgetzeile des Launchers"))
+        measured = str(s["src"]).startswith("Rank log") or s["key"] == "carve"
+        s["origin"] = "measured" if measured else "planner value"
+        s["origin_note"] = ("NVML reservation of the card" if s["key"] == "carve" else ("Rank log of the reference boot" if measured
+                            else "vram_plan or budget line of the launcher"))
         s["what"] = SEG_WHAT.get(s["key"], s["label"])
         if dual and s["key"] == "asleep":
-            s["what"] += " Im Dual-Profil ist diese Gruppe gleichzeitig wach."
+            s["what"] += " In the dual profile this group is awake at the same time."
     order = {k: i for i, k in enumerate(SEG_ORDER)}
     idx = {id(s): i for i, s in enumerate(segs)}
     return sorted(segs, key=lambda s: (PHASE_BLOCKS.index(s["phase"]), order.get(s["key"], len(order)), idx[id(s)]))
@@ -416,31 +412,31 @@ def _phase_breakdown(rec: dict, group: str, plan_cards: List[dict], dual: bool =
         if has_plan_posts:
             f, e = r["fixed"], r["elastic"]
             if "weights" in f:
-                segs.append(_seg("weights", "Gewichte (dicht)", f["weights"], "vram_plan fixed.weights"))
+                segs.append(_seg("weights", "Weights (dense)", f["weights"], "vram_plan fixed.weights"))
             else:
-                notes.append("Dichte Gewichte dieser Gruppe sind im Plan (fixed) nicht ausgewiesen; sie stecken im 'Rest im Rang-Budget'.")
+                notes.append("Dense weights of this group are not shown in the plan (fixed); they are in the 'Rest in the rank budget'.")
             if f.get("experts_resident"):
-                segs.append(_seg("experts", "Experten resident", f["experts_resident"], "vram_plan fixed.experts_resident"))
+                segs.append(_seg("experts", "Experts resident", f["experts_resident"], "vram_plan fixed.experts_resident"))
             if (e.get("experts_lru") or {}).get("mib"):
-                segs.append(_seg("experts_lru", "Experten-LRU (füllt freien VRAM)", e["experts_lru"]["mib"],
-                                 "vram_plan elastic.experts_lru (%s Zeilen)" % e["experts_lru"].get("rows")))
+                segs.append(_seg("experts_lru", "Expert LRU (fills free VRAM)", e["experts_lru"]["mib"],
+                                 "vram_plan elastic.experts_lru (%s rows)" % e["experts_lru"].get("rows")))
             elif (e.get("experts_lru") or {}).get("rows"):
-                notes.append("Experten-LRU: %s Zeilen (MiB im Plan nicht ausgewiesen)" % e["experts_lru"]["rows"])
+                notes.append("Expert LRU: %s rows (MiB not shown in the plan)" % e["experts_lru"]["rows"])
             if f.get("state_pools"):
-                segs.append(_seg("state", "Mamba/State-Pools", f["state_pools"], "vram_plan fixed.state_pools"))
+                segs.append(_seg("state", "Mamba/state pools", f["state_pools"], "vram_plan fixed.state_pools"))
             if f.get("draft"):
                 segs.append(_seg("draft", "Draft", f["draft"], "vram_plan fixed.draft"))
             if (e.get("kv") or {}).get("mib"):
-                segs.append(_seg("kv", ("KV (%s Token)" % e["kv"]["tokens"]) if e["kv"].get("tokens") else "KV (Pool)", e["kv"]["mib"], "vram_plan elastic.kv"))
+                segs.append(_seg("kv", ("KV (%s tokens)" % e["kv"]["tokens"]) if e["kv"].get("tokens") else "KV (pool)", e["kv"]["mib"], "vram_plan elastic.kv"))
             elif (e.get("kv") or {}).get("mib") == 0:
                 pass
             for st, v in (r.get("transient_by_state") or {}).items():
-                segs.append(_seg("transient", "Aktivierung/Transient (%s)" % st, v, "vram_plan transient_by_state", kind="transient"))
+                segs.append(_seg("transient", "Activation/transient (%s)" % st, v, "vram_plan transient_by_state", kind="transient"))
             cl = closure.get((pc["uuid"], "%s awake" % group))
             if cl:
                 for k, v in cl["terms"].items():
-                    notes.append("Abschluss %s: %s %d MiB" % (cl["phase"], k, v))
-                notes.append("Abschluss-Rest %d MiB (rest_to=%s, bound_by=%s)" % (cl["rest_mib"], cl["rest_to"], cl["bound_by"] or "-"))
+                    notes.append("Closing %s: %s %d MiB" % (cl["phase"], k, v))
+                notes.append("Closing rest %d MiB (rest_to=%s, bound_by=%s)" % (cl["rest_mib"], cl["rest_to"], cl["bound_by"] or "-"))
         elif i < len(rank_keys) and rk_posts[rank_keys[i]]:
             segs, extras = _rank_log_segments(rk_posts[rank_keys[i]], group)
         # --- Posten um das Budget herum (Terme der Planer-Budgetzeile)
@@ -458,19 +454,19 @@ def _phase_breakdown(rec: dict, group: str, plan_cards: List[dict], dual: bool =
             res_mib = extras.get("reserve_mib") or 0
             if res_mib:
                 take = max(0, min(res_mib, free_in_budget))
-                segs = segs + [_seg("act", "Aktivierungsreserve (Rang-Planer bucht %d)" % res_mib, take,
-                                    "Rang-Planer 'prefill activation reserve'; steckt im Rest des Budgets", kind="reserve")]
+                segs = segs + [_seg("act", "Activation reserve (rank planner books %d)" % res_mib, take,
+                                    "Rank planner 'prefill activation reserve'; is part of the rest of the budget", kind="reserve")]
                 if take < res_mib:
-                    notes.append("Der Rang-Planer reservierte %d MiB Aktivierung, im Budget bleiben nach den gemessenen Posten nur %d MiB." % (res_mib, max(free_in_budget, 0)))
+                    notes.append("The rank planner reserved %d MiB of activation, only %d MiB remain in the budget after the measured items." % (res_mib, max(free_in_budget, 0)))
                 free_in_budget_rest = free_in_budget - take
             else:
                 free_in_budget_rest = free_in_budget
-            segs = segs + [_seg("free_in_budget", "Rest im Rang-Budget (nicht einzeln verbucht)", free_in_budget_rest,
-                                "Budget minus Summe der gemessenen Posten (Allokator-Cache, Workspaces, ungenutzter Pool)", kind="rest")]
+            segs = segs + [_seg("free_in_budget", "Rest in the rank budget (not booked individually)", free_in_budget_rest,
+                                "Budget minus sum of the measured items (allocator cache, workspaces, unused pool)", kind="rest")]
             if extras.get("ctx_mib"):
-                notes.append("CUDA-Kontext/NCCL-Init %d MiB (Rang-Log 'Init torch distributed') liegen vor dem Rang-Budget." % extras["ctx_mib"])
+                notes.append("CUDA context/NCCL init %d MiB (rank log 'Init torch distributed') lie before the rank budget." % extras["ctx_mib"])
         allsegs = _annotate_segments(segs + around, group, dual)
-        # Summe der gezeichneten Posten gegen die Karte.  Ein negativer Rest im Rang-Budget (Posten > Budget, weil sie
+        # Summe der gezeichneten Posten gegen die Karte.  Ein negativer Rest in the rank budget (Posten > Budget, weil sie
         # überlappen bzw. in der anderen Phase gemessen wurden) ist keine Überfüllung: der Planer schließt die Karte
         # trotzdem (rest_mib ~ 0).  Der Überstand zeigt sich im Balken, wird aber getrennt als ``overlap_mib`` benannt.
         sum_mib = sum(max(0, x["mib"]) for x in allsegs)
@@ -488,40 +484,40 @@ def _outside_terms(rec: dict, group: str, pc: dict, terms: dict, other: str) -> 
     out: List[dict] = []
     if lines:
         g = lines[-1]["parsed"]
-        src = "Budgetzeile des Launchers (Front-Log)"
+        src = "Budget line of the launcher (front log)"
         if g["carve"]:
-            out.append(_seg("carve", "Treiber-Carve (NVML reserved)", g["carve"], src, kind="outside"))
+            out.append(_seg("carve", "Driver carve (NVML reserved)", g["carve"], src, kind="outside"))
         if g["dormant"] is not None:
-            out.append(_seg("asleep", "Schlafrest %s-Gruppe" % other + (" + Wachstum %d" % g["growth"] if g["growth"] else ""),
+            out.append(_seg("asleep", "Sleep residue %s group" % other + (" + growth %d" % g["growth"] if g["growth"] else ""),
                             g["dormant"] + (g["growth"] or 0), src, kind="outside"))
         if g["corridor"]:
-            out.append(_seg("corridor", ("Korridor (Floor %s, Quelle %s, + Reserve/Überschuss 404)" % (g["floor"], g["floor_source"])
-                                         if g["floor"] is not None else "Korridor"), g["corridor"], src, kind="outside"))
+            out.append(_seg("corridor", ("Corridor (floor %s, source %s, + reserve/excess 404)" % (g["floor"], g["floor_source"])
+                                         if g["floor"] is not None else "Corridor"), g["corridor"], src, kind="outside"))
         if g["over"] and not g["booked"]:      # beim gebuchten Wach-Rest steht der Überschuss nur als "ersetzt" in der Zeile
-            out.append(_seg("overshoot", "gemessener Wach-Überschuss", g["over"], src, kind="outside"))
+            out.append(_seg("overshoot", "measured awake excess", g["over"], src, kind="outside"))
         if g["booked"]:
-            out.append(_seg("awake_rest", "Wach-Rest (Record D_AWAKE_REST_BOOKED)", g["booked"], src, kind="outside"))
+            out.append(_seg("awake_rest", "Awake residue (record D_AWAKE_REST_BOOKED)", g["booked"], src, kind="outside"))
         if g["awake_rest"]:
-            out.append(_seg("awake_rest", "Wach-Rest (Record D_AWAKE_REST_MIB)", g["awake_rest"], src, kind="outside"))
+            out.append(_seg("awake_rest", "Awake residue (record D_AWAKE_REST_MIB)", g["awake_rest"], src, kind="outside"))
         if g["l15"]:
-            out.append(_seg("l15", "L1.5-Cache (Post, Trade gegen Experten/KV)", g["l15"], src, kind="outside"))
+            out.append(_seg("l15", "L1.5 cache (item, trade against experts/KV)", g["l15"], src, kind="outside"))
         return out
     if terms:
         src = "vram_plan budget_terms"
-        out.append(_seg("carve", "Treiber-Carve (NVML reserved)", terms.get("carve", 0), src, kind="outside"))
-        out.append(_seg("asleep", "Schlafrest %s-Gruppe (inkl. Wachstum %s)" % (other, terms.get("growth", 0)), terms.get("dormant", 0), src, kind="outside"))
-        out.append(_seg("corridor", "Korridor-Floor (gemessener Aktivierungs-Peak)", terms.get("floor", 0), src, kind="outside"))
-        out.append(_seg("awake_rest", "Wach-Rest/Überschuss (%s)" % str(terms.get("awake_source", ""))[:40], terms.get("awake", 0), src, kind="outside"))
+        out.append(_seg("carve", "Driver carve (NVML reserved)", terms.get("carve", 0), src, kind="outside"))
+        out.append(_seg("asleep", "Sleep residue %s group (incl. growth %s)" % (other, terms.get("growth", 0)), terms.get("dormant", 0), src, kind="outside"))
+        out.append(_seg("corridor", "Corridor floor (measured activation peak)", terms.get("floor", 0), src, kind="outside"))
+        out.append(_seg("awake_rest", "Awake residue/excess (%s)" % str(terms.get("awake_source", ""))[:40], terms.get("awake", 0), src, kind="outside"))
         return out
-    out.append(_seg("carve", "Treiber-Carve (NVML reserved)", pc["carve_mib"], "vram_plan cards.driver_reserved_mib", kind="outside"))
+    out.append(_seg("carve", "Driver carve (NVML reserved)", pc["carve_mib"], "vram_plan cards.driver_reserved_mib", kind="outside"))
     if pc.get("asleep_" + other) is not None:
-        out.append(_seg("asleep", "Schlafrest %s-Gruppe" % other, pc["asleep_" + other], "vram_plan asleep", kind="outside"))
+        out.append(_seg("asleep", "Sleep residue %s group" % other, pc["asleep_" + other], "vram_plan asleep", kind="outside"))
     return out
 
 
 def _rank_log_segments(rp: dict, group: str):
     segs = []
-    src = "Rang-Log (gemessen)"
+    src = "Rank log (measured)"
     w = rp.get("weights") or []
     tgt = next((x for x in w if "Draft" not in x["type"] and "MTP" not in x["type"]), None)
     drf = next((x for x in w if "Draft" in x["type"] or "MTP" in x["type"]), None)
@@ -529,21 +525,21 @@ def _rank_log_segments(rp: dict, group: str):
     posts = kvp.get("posts_mib") or {}
     wr = posts.get("weights + runtime state")
     if tgt:
-        segs.append(_seg("weights", "Gewichte", tgt["mib"], src + " Load weight end"))
+        segs.append(_seg("weights", "Weights", tgt["mib"], src + " Load weight end"))
     if drf and drf["mib"]:
         segs.append(_seg("draft", "Draft", drf["mib"], src + " Load weight end (Draft)"))
     if wr is not None and tgt:
         runtime = wr - tgt["mib"] - (drf["mib"] if drf else 0)
         if runtime > 0:
-            segs.append(_seg("runtime", "Laufzeit-Zustand", runtime, "Rang-Planer 'weights + runtime state' minus geladene Gewichte"))
+            segs.append(_seg("runtime", "Runtime state", runtime, "Rank planner 'weights + runtime state' minus loaded weights"))
     if rp.get("mamba"):
-        segs.append(_seg("state", "Mamba/State-Pool", rp["mamba"]["mib"], src + " Mamba Cache is allocated", kind="post"))
+        segs.append(_seg("state", "Mamba/state pool", rp["mamba"]["mib"], src + " Mamba Cache is allocated", kind="post"))
     kv = sum(p["k_mib"] + p["v_mib"] for p in rp.get("kv_pools") or [])
     if kv:
-        segs.append(_seg("kv", "KV (%s)" % ((rp["kv_pools"][0]["dtype"] if rp["kv_pools"] else "").replace("torch.", "")), kv, src + " KV Cache is allocated (Ziel + Draft)"))
+        segs.append(_seg("kv", "KV (%s)" % ((rp["kv_pools"][0]["dtype"] if rp["kv_pools"] else "").replace("torch.", "")), kv, src + " KV Cache is allocated (goal + draft)"))
     gr = sum(g["mib"] for g in rp.get("graphs") or []) or rp.get("prefill_graph_mib", 0)
     if gr:
-        segs.append(_seg("graphs", "CUDA-Graphen", gr, src + " Capture ... CUDA graph end", kind="post"))
+        segs.append(_seg("graphs", "CUDA graphs", gr, src + " Capture ... CUDA graph end", kind="post"))
     return segs, {"reserve_mib": posts.get("prefill activation reserve"), "ctx_mib": rp.get("init_dist_mib")}
 
 
@@ -579,7 +575,7 @@ def _context(rec: dict) -> dict:
     for o in plan.get("overrides", []):
         if o["group"] == "P" and o["key"] == "--max-running-requests":
             seats_p = o["value"]
-    return {"context_tokens": int(ctx) if ctx else None, "context_src": "argv D --context-length (state.json bzw. Rang-Log-Kopf)",
+    return {"context_tokens": int(ctx) if ctx else None, "context_src": "argv D --context-length (state.json or rank log head)",
             "kv_pool_tokens": kv_tokens, "kv_pool_src": "rankstate D kv.kv_tokens (IPC)" if kv_tokens else None,
             "seats_d": int(val(d, "--max-running-requests") or 0) or None, "seats_p": int(seats_p) if seats_p else None,
             "seats_src": "argv D/P --max-running-requests"}
@@ -596,15 +592,15 @@ def _nachrechnung_summary(rec: dict) -> Optional[dict]:
 # ---------------------------------------------------------------------- Flags
 #: Flags, deren Wert der Planer rechnet (nicht das Profil festlegt) -> Bindung
 PLANNER_DERIVED = {
-    "--rank-gpu-memory-mib": "Planer: Budget je Karte = Karte - Carve - Schlafrest - Wach-Rest/Korridor (launcher.budgets_from_dc)",
-    "--pp-stage-ratio": "Planer: PP-Schnitt-Solver (pp_cut) bzw. Profil-Pin; Quelle siehe Overrides",
-    "--pp-attn-stage-ratio": "Planer: PP-Schnitt, Attention-Layer je Stufe",
-    "--rank-tp-ratio": "Planer: D-TP-Operating-Point (FRACTION-SOLVE)",
-    "--rank-mlp-ratio": "Planer: D-Reshard-Preset (drq 652:218:218)",
-    "--rank-moe-ratio": "Planer: D-Experten-Aufteilung je Rang",
-    "--rank-moe-resident-fraction": "Planer: Experten füllen freien VRAM (Grundgesetz VRAM = Experten)",
-    "--dc-reserve": "Planer: Schlafrest der D-Gruppe je Karte (W19-Record)",
-    "--measured-record": "Record-Datei der gemessenen Werte",
+    "--rank-gpu-memory-mib": "Planner: budget per card = card - carve - sleep residue - awake residue/corridor (launcher.budgets_from_dc)",
+    "--pp-stage-ratio": "Planner: PP cut solver (pp_cut) or profile pin; source see overrides",
+    "--pp-attn-stage-ratio": "Planner: PP cut, attention layers per stage",
+    "--rank-tp-ratio": "Planner: D-TP operating point (FRACTION-SOLVE)",
+    "--rank-mlp-ratio": "Planner: D reshard preset (drq 652:218:218)",
+    "--rank-moe-ratio": "Planner: D expert split per rank",
+    "--rank-moe-resident-fraction": "Planner: experts fill free VRAM (basic law VRAM = experts)",
+    "--dc-reserve": "Planner: sleep residue of the D group per card (W19 record)",
+    "--measured-record": "Record file of the measured values",
 }
 
 
@@ -619,15 +615,15 @@ def _flags(rec: dict) -> dict:
         d = docs.get(name) or {}
         why = []
         if d.get("profile_comment"):
-            why.append({"kind": "Profil", "text": d["profile_comment"]["text"], "source": d["profile_comment"]["source"]})
+            why.append({"kind": "Profile", "text": d["profile_comment"]["text"], "source": d["profile_comment"]["source"]})
         if d.get("code_help"):
             why.append({"kind": "Code (argparse-help)", "text": d["code_help"], "source": rec["flag_docs_sources"]["code"]})
         bound = PLANNER_DERIVED.get(name)
         o = [x for x in ov.get(name, []) if x["group"] in (group, "launcher")]
         if o:
-            bound = (bound + "; " if bound else "") + "gesetzt über " + ", ".join(sorted({x["source"] for x in o}))
-        return {"name": name, "value": value, "why": why, "set_by": ("Planer" if name in PLANNER_DERIVED else ("Override" if o else "Profil")),
-                "bound_by": bound or "Profil-Vorgabe (kein Planer-Term)", "explained": bool(why)}
+            bound = (bound + "; " if bound else "") + "set via " + ", ".join(sorted({x["source"] for x in o}))
+        return {"name": name, "value": value, "why": why, "set_by": ("Planner" if name in PLANNER_DERIVED else ("Override" if o else "Profile")),
+                "bound_by": bound or "Profile default (no planner term)", "explained": bool(why)}
 
     argv = rec["launch"]["argv"]
     res = {"groups": {}, "env": {}}
@@ -636,9 +632,9 @@ def _flags(rec: dict) -> dict:
     res["groups"]["front"] = _flag_list(rec["launch"].get("front_argv") or [], lambda n, v: one(n, v, "front"))
     for g in ("P", "D"):
         env = rec["launch"]["env"].get(g) or {}
-        res["env"][g] = [{"name": k, "value": v, "why": ([{"kind": "Profil", "text": docs[k]["profile_comment"]["text"],
+        res["env"][g] = [{"name": k, "value": v, "why": ([{"kind": "Profile", "text": docs[k]["profile_comment"]["text"],
                                                               "source": docs[k]["profile_comment"]["source"]}] if k in docs and docs[k].get("profile_comment") else []),
-                          "set_by": "Profil/Launcher", "bound_by": "Profil-Vorgabe", "explained": k in docs and bool(docs[k])}
+                          "set_by": "Profile/launcher", "bound_by": "Profile default", "explained": k in docs and bool(docs[k])}
                          for k, v in sorted(env.items())]
     res["totals"] = {"flags": sum(len(v) for v in res["groups"].values()),
                      "explained": sum(1 for v in res["groups"].values() for f in v if f["explained"]),
@@ -670,16 +666,16 @@ def _warnings(rec: dict, phases: Dict[str, List[dict]], transport: dict) -> List
     w = list(transport.get("warnings", []))
     plan = rec.get("vram_plan") or {}
     for o in plan.get("open", []):
-        w.append("Planer-Offenpunkt: " + o)
+        w.append("Planner open point: " + o)
     for c in plan.get("closure", []):
         if c.get("idle"):
-            w.append("IDLE (Planer): %s auf nvml%s ungenutzt %d MiB (>= 1 Expertenzeile, kein Nutzerziel bindet)" % (c["phase"], "?", c["rest_mib"]))
+            w.append("IDLE (planner): %s on nvml%s unused %d MiB (>= 1 expert row, no user goal binds)" % (c["phase"], "?", c["rest_mib"]))
     if not rec["boot"]["ipc_era"]:
-        w.append("Dieser Record stammt von einem Boot vor dem IPC-Zustand (26.09.): argv aus dem Rang-Log-Kopf, kein Env, kein vram_plan.")
+        w.append("This record comes from a boot before the IPC state (26.09.): argv from the rank log head, no env, no vram_plan.")
     for g in ("P", "D"):
         for ph in phases[g]:
             if ph["rest_mib"] < 0:
-                w.append("%s-Phase Karte %d: die gemessenen Posten übersteigen die Karte um %d MiB (Posten überlappen oder wurden in anderer Phase gemessen)"
+                w.append("%s phase card %d: the measured items exceed the card by %d MiB (items overlap or were measured in another phase)"
                          % (g, ph["ordinal"], -ph["rest_mib"]))
     return w
 
@@ -706,13 +702,11 @@ def _docker_run(rec: dict, prof: dict, transport: dict) -> dict:
     if line == "nf":
         lines.append("  --mount type=tmpfs,dst=/mnt/nf-experts,tmpfs-size=77309411328,tmpfs-mode=1777 \\")
     lines.append("  %s serve" % image)
-    host = ("CTX=<ctx> IMAGE=%s LINE=%s PROFILE=%s PROFILE_MOUNT=1 ALLOW_EXPERIMENTAL=1 HOUSE_GUARD=memlimit GPUQ_ID=<Fenster> "
+    host = ("CTX=<ctx> IMAGE=%s LINE=%s PROFILE=%s PROFILE_MOUNT=1 ALLOW_EXPERIMENTAL=1 HOUSE_GUARD=memlimit GPUQ_ID=<window> "
             "bash /spinning/gpu-arb/docker/host_acceptance.sh serve %s" % (image, line, pick["HTSGLANG_PROFILE"], t))
     return {"docker_run": "\n".join(lines), "host_line": host,
             "env": pick,
-            "note": ("Abgeleitet aus host_acceptance.sh run_args (Struktur) und dem state.json des Referenz-Boots (Profil, Image, Env). "
-                     "$MODELS=<Host>/spinning/llm_stuff/club-3090/models-cache, $ACC=<Host>/spinning/docker-acceptance/%s, $CAP = Haus-Speicherdecke "
-                     "(host_acceptance.sh cap_for), SHM %s je Linie. Gestartet wird in einem gpuq-Fenster, nie von dieser Seite." % (line, shm)),
+            "note": ("Derived from host_acceptance.sh run_args (structure) and the state.json of the reference boot (profile, image, env). $MODELS=<host>/spinning/llm_stuff/club-3090/models-cache, $ACC=<host>/spinning/docker-acceptance/%s, $CAP = house memory ceiling (host_acceptance.sh cap_for), SHM %s per line. It is started in a gpuq window, never from this page." % (line, shm)),
             "image": image}
 
 
@@ -731,9 +725,8 @@ def _reference_posts(rec: dict) -> dict:
             side += sum((r.get("transient_by_state") or {}).values())
         n = max(1, len(ranks))
         kv_cells = sum(d["kv_cell_bytes"] for d in ((plan.get("demand") or {}).get("D") or {}).get("ranks", {}).values()) or None
-        notes.append("NF: Experten liegen im Host-Speicher; auf den Karten stehen dichte Gewichte und State-Pools fest, Experten und KV teilen den Rest "
-                     "(Grundgesetz VRAM = Experten). 'Nebenposten' = Aktivierung/Transient aus vram_plan.")
-        return {"weights_total_mib": w, "weights_src": "vram_plan fixed.weights + fixed.state_pools (D-Gruppe, Summe)",
+        notes.append("NF: experts live in host memory; dense weights and state pools are fixed on the cards, experts and KV share the rest (basic law VRAM = experts). 'Side items' = activation/transient from vram_plan.")
+        return {"weights_total_mib": w, "weights_src": "vram_plan fixed.weights + fixed.state_pools (D group, sum)",
                 "side_per_rank_mib": round(side / n), "kv_cell_bytes": kv_cells, "notes": notes}
     w = side = kvb = 0
     toks = 0
@@ -753,5 +746,5 @@ def _reference_posts(rec: dict) -> dict:
     n = max(1, len(rp))
     cell = int(kvb * 1048576 / toks) if toks and kvb else None
     if cell:
-        notes.append("KV-Zelle %d B/Token = gemessene KV-Pools (K+V) / Pool-Token des Referenz-Boots." % cell)
+        notes.append("KV cell %d B/token = measured KV pools (K+V) / pool tokens of the reference boot." % cell)
     return {"weights_total_mib": w, "weights_src": "rank_log", "side_per_rank_mib": round(side / n), "kv_cell_bytes": cell, "notes": notes}

@@ -261,7 +261,7 @@ class TestRules(unittest.TestCase):
         self.assertEqual(layers, [2, 1, 1])
         layers, notes = R.split_layers(48, [1, 1], [10, 10])                     # 20 < 48: nothing can hold it
         self.assertEqual(sum(layers), 48)
-        self.assertTrue(notes and "fasst" in notes[0], notes)
+        self.assertTrue(notes and "does not hold" in notes[0], notes)
 
     def test_attn_counts_are_exact_from_the_family_list(self):
         fam = (["gdn"] * 3 + ["attn"]) * 12                                      # NF: period 4, 12 attention layers
@@ -272,11 +272,11 @@ class TestRules(unittest.TestCase):
         live = [{"class": "RTX5090", "arch": "sm120"}, {"class": "RTX3080", "arch": "sm86"}]
         new, src = R.class_rekey(["1446", "896", "894"], ("RTX5090", "RTX3080", "RTX3080"), live)
         self.assertEqual(new, ["1446", "896"])                                  # the max of the 3080 pair, never an average
-        self.assertEqual(src, ["Klasse RTX5090", "Klasse RTX3080"])
+        self.assertEqual(src, ["class RTX5090", "class RTX3080"])
         foreign = [{"class": "RTX3090/24576MiB/sm86", "arch": "sm86"}, {"class": "X/1/sm?", "arch": "sm?"}]
         new, src = R.class_rekey(["1446", "896", "894"], ("RTX5090", "RTX3080", "RTX3080"), foreign)
         self.assertEqual(new, ["896", "1446"])
-        self.assertTrue(src[0].startswith("geborgt: RTX3080") and src[1].startswith("unbelegt"), src)
+        self.assertTrue(src[0].startswith("borrowed: RTX3080") and src[1].startswith("unverified"), src)
 
     def test_role_rekey_and_seats(self):
         self.assertEqual(R.role_rekey(["104", "48", "48"], 5), ["104", "48", "48", "48", "48"])
@@ -349,15 +349,15 @@ class TestInputs(unittest.TestCase):
 
     def test_rates_are_measured_or_a_datasheet_basis_for_all(self):
         v = _propose("27b", "n2")
-        self.assertTrue(all(c["tflops_src"].startswith("gemessen") for c in v["cards"]), v["cards"])
-        self.assertEqual(v["seeds"]["p_cut"]["basis"], "gemessen: GEMM-Rate je Karte")
+        self.assertTrue(all(c["tflops_src"].startswith("measured") for c in v["cards"]), v["cards"])
+        self.assertEqual(v["seeds"]["p_cut"]["basis"], "measured: GEMM rate per card")
         w = _propose("27b", "n4_3090")
-        self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in w["cards"]), w["cards"])
-        self.assertTrue(any("GEMM-Raten: Datenblatt/unbelegt" in u for u in w["unbelegt"]), w["unbelegt"])
+        self.assertTrue(all(c["tflops_src"].startswith("datasheet/unverified") for c in w["cards"]), w["cards"])
+        self.assertTrue(any("GEMM rates: datasheet/unverified" in u for u in w["unbelegt"]), w["unbelegt"])
         # one measured card among datasheet cards: the measured achieved rate and a datasheet PEAK are not comparable ->
         # ALL cards on the datasheet basis
         m = _propose("27b", "n2_5090_3090")
-        self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in m["cards"]), m["cards"])
+        self.assertTrue(all(c["tflops_src"].startswith("datasheet/unverified") for c in m["cards"]), m["cards"])
 
     def test_rates_of_a_loaded_measured_library_without_rates_argument(self):
         """The product path: no ``rates=``, the library row's measured ``gemm_tflops`` (card_rate_pass) is the rate, not the peak."""
@@ -365,20 +365,20 @@ class TestInputs(unittest.TestCase):
         modell, draft = _MODELS["27b"]
         v = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft, library=_measured_library())
         self.assertEqual([c["tflops"] for c in v["cards"]], [203.42, 50.97, 50.97])
-        self.assertTrue(all(c["tflops_src"] == "gemessen (card_library)" for c in v["cards"]), v["cards"])
-        self.assertEqual(v["seeds"]["p_cut"]["basis"], "gemessen: GEMM-Rate je Karte")
-        self.assertFalse(any("GEMM-Raten" in u for u in v["unbelegt"]), v["unbelegt"])
+        self.assertTrue(all(c["tflops_src"] == "measured (card_library)" for c in v["cards"]), v["cards"])
+        self.assertEqual(v["seeds"]["p_cut"]["basis"], "measured: GEMM rate per card")
+        self.assertFalse(any("GEMM rates" in u for u in v["unbelegt"]), v["unbelegt"])
         # the measured ratio is not the datasheet ratio (419/119): the cut seed follows the measurement
         d = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft, library=_seed_library())
         self.assertEqual([c["tflops"] for c in d["cards"]], [419.0, 119.0, 119.0])
-        self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in d["cards"]))
+        self.assertTrue(all(c["tflops_src"].startswith("datasheet/unverified") for c in d["cards"]))
         self.assertNotEqual(v["seeds"]["p_cut"]["layers"], d["seeds"]["p_cut"]["layers"])
 
     def test_one_measured_library_row_among_datasheet_rows_prices_all_on_the_datasheet(self):
         hw, _ = _inventory("ref3")
         modell, draft = _MODELS["27b"]
         v = P.propose(hw, modell, "flip", {}, basis=_profile("27b"), draft=draft, library=_measured_library(("RTX 5090",)))
-        self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in v["cards"]), v["cards"])
+        self.assertTrue(all(c["tflops_src"].startswith("datasheet/unverified") for c in v["cards"]), v["cards"])
 
     def test_default_library_is_the_measured_card_library_file(self):
         """``library=None`` reads ``card_rate_pass.load_measured_library()`` (``SGLANG_CARD_LIBRARY``), seed-only otherwise."""
@@ -409,7 +409,7 @@ class TestInputs(unittest.TestCase):
              "vram_total_mib": {"v": 20480, "src": "NVML"}, "compute": {"bf16": {"v": 52.0, "src": "gemessen"}}}]}
         v = P.propose(hw, _MODELS["27b"][0], "flip", {}, basis=_profile("27b"), draft=_MODELS["27b"][1])
         self.assertEqual([c["tflops"] for c in v["cards"]], [210.0, 52.0])
-        self.assertTrue(all(c["tflops_src"] == "gemessen (Hardwareprofil)" for c in v["cards"]))
+        self.assertTrue(all(c["tflops_src"] == "measured (hardware profile)" for c in v["cards"]))
 
     def test_the_proposal_is_json(self):
         v = _propose("nf", "n4_3090")
@@ -462,7 +462,7 @@ class TestVectorLengths(unittest.TestCase):
         ur = w["--user-reserve-mib"]
         self.assertEqual(ur["wert"], "1400,1400,1400,1400")
         self.assertEqual(ur["zustand"], "unbelegt")
-        self.assertIn("geborgt: RTX3080 (unbelegt)", ur["herkunft"])
+        self.assertIn("borrowed: RTX3080 (unverified)", ur["herkunft"])
         n = _propose("nf", "n4_3090")
         for k in ("--d-foreign-context-mib", "--d-nontorch-mib"):
             self.assertEqual(len(R.parse_csv({x["key"]: x for x in n["werte"]}[k]["wert"])), 4)
@@ -505,7 +505,7 @@ class TestReferenceDiff0(unittest.TestCase):
             for w in v["werte"]:
                 if w["policy"] in ("class", "cut", "cut_attn", "fr_p", "fr_d", "moe_ratio", "role", "tp_ratio", "lru", "scratch"):
                     self.assertFalse(w["geaendert"], w["key"])
-                    self.assertTrue(w["herkunft"].startswith("Profil "), w)
+                    self.assertTrue(w["herkunft"].startswith("Profile "), w)
 
     @_ON_27B_LINE
     @_NEEDS_BOX
@@ -663,7 +663,7 @@ class TestSyntheticDryRun(unittest.TestCase):
             self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= {f["code"] for f in run.result.forced} <= _FORCED_OK)
             # every value the planner derived for these cards is labelled unbelegt
             self.assertTrue(v["unbelegt"])
-            self.assertTrue(all(c["tflops_src"].startswith("Datenblatt/unbelegt") for c in v["cards"]))
+            self.assertTrue(all(c["tflops_src"].startswith("datasheet/unverified") for c in v["cards"]))
 
     @_NEEDS_BOX
     def test_n4_known_classes_stop_at_the_uuid_bound_census(self):
@@ -739,7 +739,7 @@ class TestSeats(unittest.TestCase):
             w = {x["key"]: x for x in v["werte"]}
             for key in ("--pp-cut-expert-device-fraction", "--extra-d --rank-moe-resident-fraction"):
                 self.assertEqual(w[key]["zustand"], R.UNBELEGT, key)
-                self.assertIn("Sitze gleichzeitig %d" % seats, w[key]["herkunft"] + w[key]["grund"])
+                self.assertIn("Seats at the same time %d" % seats, w[key]["herkunft"] + w[key]["grund"])
             self.assertTrue(v["vektoren_ok"])
 
     def test_seats_goal_graph_ladder_follows_the_goal(self):
@@ -770,8 +770,8 @@ class TestSeats(unittest.TestCase):
             self.assertEqual(la.get_flag("--p-bs"), "1")                  # P keeps its own seat count
             self.assertEqual(v["ziele"]["seats"], seats)
             w = {x["key"]: x for x in v["werte"]}
-            self.assertIn("%d Sitzen (Launcher-Default" % DEFAULT_D_BS, w["--d-bs"]["grund"])
-            self.assertNotIn("(1 Sitze)", w["--d-bs"]["grund"])
+            self.assertIn("%d seats (Launcher-Default" % DEFAULT_D_BS, w["--d-bs"]["grund"])
+            self.assertNotIn("(1 seats)", w["--d-bs"]["grund"])
             self.assertTrue(v["vektoren_ok"])
         v6 = _propose("27b", "ref3", seats=DEFAULT_D_BS)
         self.assertEqual(v6["argv"], list(_profile("27b").argv))          # goal == what D runs: nothing moves
@@ -787,7 +787,7 @@ class TestSeats(unittest.TestCase):
             self.assertIn(key, w)
             self.assertEqual(w[key]["zustand"], R.UNBELEGT, key)
             self.assertTrue(any(u.startswith(key + ":") for u in v["unbelegt"]), (key, v["unbelegt"]))
-            self.assertIn("Hochrechnung", w[key]["herkunft"])
+            self.assertIn("extrapolation", w[key]["herkunft"])
         b = _propose("nf", "ref3")
         wb = {x["key"]: x for x in b["werte"]}
         for key in ("--env-d SGLANG_MOE_SCRATCH_SLOTS", "--env-p SGLANG_MOE_SCRATCH_SLOTS"):
@@ -804,21 +804,21 @@ class TestOriginOfTransferredValues(unittest.TestCase):
     the origin texts are German prose without the planner's internal keys."""
 
     _INTERNAL = re.compile(r"Regel \((cut|cut_attn|fr_p|fr_d|moe_ratio|role|tp_ratio|lru|scratch|class)\)|\bK[1-5]\b|\bFR_[PD]\b")
-    _ENGLISH = ("exceed the host budget", "does not hold", "does not fit", "runtime posts of Form A")
+    _GERMAN = ("ueberschreiten das Host-Budget", "fasst nicht", "passt nicht", "Laufzeitposten von Form A")      # a leak of the old German texts
 
     def _check(self, v):
         for w in v["werte"]:
             if not v["inventory"]["gleich_wie_profil"]:
                 if w["zustand"] == R.VORGESCHLAGEN:
-                    self.assertNotIn("gleiches Inventar", w["herkunft"], w)
-                    self.assertNotIn("gilt fuer genau diese Karten", w["grund"], w)
-                if w["herkunft"].startswith("aus Profil"):
+                    self.assertNotIn("same inventory", w["herkunft"], w)
+                    self.assertNotIn("applies to exactly these cards", w["grund"], w)
+                if w["herkunft"].startswith("taken from profile"):
                     self.assertEqual(w["zustand"], R.UNBELEGT, w)
-                    self.assertIn("Inventar hier [", w["herkunft"], w)
+                    self.assertIn("inventory here [", w["herkunft"], w)
             self.assertIsNone(self._INTERNAL.search(w["herkunft"]), w["herkunft"])
         for text in v["hinweise"] + v["blocker"] + v["unbelegt"]:
             self.assertIsNone(self._INTERNAL.search(text), text)
-            for en in self._ENGLISH:
+            for en in self._GERMAN:
                 self.assertNotIn(en, text)
 
     def test_no_foreign_inventory_value_claims_the_same_inventory(self):
@@ -836,8 +836,8 @@ class TestOriginOfTransferredValues(unittest.TestCase):
                        draft=_MODELS["nf"][1], rates=MEASURED_RATES, library=_seed_library())
         w = {x["key"]: x for x in v3["werte"]}["--env-d SGLANG_MOE_SCRATCH_SLOTS"]
         self.assertEqual(w["zustand"], R.UNBELEGT)
-        self.assertTrue(w["herkunft"].startswith("aus Profil nf-int4-h6-abl.env fuer ["), w["herkunft"])
-        self.assertIn("Inventar hier [RTX3090", w["herkunft"])
+        self.assertTrue(w["herkunft"].startswith("taken from profile nf-int4-h6-abl.env for ["), w["herkunft"])
+        self.assertIn("inventory here [RTX3090", w["herkunft"])
         self._check(v3)
         self._check(v)
 
@@ -846,19 +846,19 @@ class TestOriginOfTransferredValues(unittest.TestCase):
         w = {x["key"]: x for x in v["werte"]}
         for key in ("--env-d SGLANG_MOE_SCRATCH_SLOTS", "--env-p SGLANG_MOE_SCRATCH_SLOTS"):
             if w[key]["alt"] != w[key]["wert"]:
-                self.assertIn("umgeschluesselt", w[key]["herkunft"], key)
-                self.assertNotIn("linear in den Sitzen", w[key]["herkunft"], key)
+                self.assertIn("re-keyed", w[key]["herkunft"], key)
+                self.assertNotIn("scaled linearly in the seats", w[key]["herkunft"], key)
                 self.assertNotIn("6 -> 6", w[key]["herkunft"], key)
         v12 = _propose("nf", "n2", seats=12)
         w12 = {x["key"]: x for x in v12["werte"]}["--env-d SGLANG_MOE_SCRATCH_SLOTS"]
-        self.assertIn("linear in den Sitzen skaliert (6 -> 12)", w12["herkunft"])
+        self.assertIn("scaled linearly in the seats (6 -> 12)", w12["herkunft"])
 
     def test_the_reference_inventory_keeps_the_profile_origin(self):
         v = _propose("nf", "ref3")
         self.assertTrue(v["inventory"]["gleich_wie_profil"])
         w = {x["key"]: x for x in v["werte"]}["--env-d SGLANG_MOE_SCRATCH_SLOTS"]
         self.assertEqual(w["zustand"], R.VORGESCHLAGEN)
-        self.assertIn("gleiches Inventar", w["herkunft"])
+        self.assertIn("same inventory", w["herkunft"])
 
 
 class TestNonTopologyValuesStayAsTheProfileHasThem(unittest.TestCase):
@@ -907,13 +907,13 @@ class TestK4ScalarRegulators(unittest.TestCase):
         w = self._vals(v)
         self.assertEqual((w["--pp-solve-pool-floor"]["wert"], w["--x-ceiling-tokens"]["wert"]), ("0", "12288"))
         for key in ("--pp-solve-pool-floor", "--x-ceiling-tokens"):
-            self.assertTrue(w[key]["herkunft"].startswith("Profil") or w[key]["herkunft"].startswith("vom Profil"), w[key])
+            self.assertTrue(w[key]["herkunft"].startswith("Profile") or w[key]["herkunft"].startswith("from profile"), w[key])
             self.assertTrue(w[key]["grund"], key)
         self.assertEqual(v["argv"], list(_profile("nf").argv))
         v27 = _propose("27b", "ref3")
         w27 = self._vals(v27)
         self.assertIsNone(w27["--pp-solve-pool-floor"]["wert"])                 # 27B profile: no flag, launcher default
-        self.assertIn("Launcher-Standard", w27["--pp-solve-pool-floor"]["herkunft"])
+        self.assertIn("launcher default", w27["--pp-solve-pool-floor"]["herkunft"])
         self.assertEqual(w27["--x-ceiling-tokens"]["wert"], "12288")
         self.assertEqual(v27["argv"], list(_profile("27b").argv))
 
@@ -932,7 +932,7 @@ class TestK4ScalarRegulators(unittest.TestCase):
         w = self._vals(v1)["--pp-solve-pool-floor"]
         self.assertEqual((w["alt"], w["wert"]), ("262144", "131072"))
         self.assertEqual(P.LaunchArgv(v1["argv"], v1["env"]).get_flag("--pp-solve-pool-floor"), "131072")
-        self.assertIn("KV-Pflicht", w["herkunft"])
+        self.assertIn("KV obligation", w["herkunft"])
         v_off = _propose("nf", "ref3", kv_tokens=131072)                                   # floor 0 = OFF: never pulled
         self.assertEqual(P.LaunchArgv(v_off["argv"], v_off["env"]).get_flag("--pp-solve-pool-floor"), "0")
 
@@ -942,7 +942,7 @@ class TestKvObligation(unittest.TestCase):
         v = _propose("27b", "n2", kv_tokens=131072)
         self.assertEqual(P.LaunchArgv(v["argv"], v["env"]).get_flag("--max-kv-per-request"), "131072")
         w = {x["key"]: x for x in v["werte"]}["--max-kv-per-request"]
-        self.assertEqual((w["alt"], w["wert"], w["herkunft"]), ("262144", "131072", "Ziel kv_tokens"))
+        self.assertEqual((w["alt"], w["wert"], w["herkunft"]), ("262144", "131072", "Goal kv_tokens"))
 
     def test_a_draft_that_does_not_fit_rank_0_is_a_blocker_for_form_a(self):
         v = _propose("nf", "n2_3070")                      # 2x RTX 3070 8 GB: neither dense + KV nor the draft fit one host card

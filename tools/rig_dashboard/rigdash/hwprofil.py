@@ -56,7 +56,7 @@ OWNER = "profil-editor"
 #: etwa 4-5 min, mit kalter JIT-Übersetzung des W4A8-Kernels 8-12 min: 10 min waren dafür zu knapp, 15 min tragen den
 #: kalten Lauf (Kindprozess-Deckel CHILD_CAP_S, BAR1-Schritt darin höchstens 300 s).
 WINDOW = "15m"
-PURPOSE = "Hardwareprofil messen (Profil-Editor S2)"
+PURPOSE = "Measure hardware profile (profile editor S2)"
 #: gpuq: ab so viel belegtem Speicher gilt eine Karte als belegt (CLAUDE.md-Regel: ~500 MiB).
 BUSY_MIB = 500
 #: Obergrenze für den Kindprozess (Fenster 15 min minus Sicherheitsabstand); kürzer, wenn das Fenster früher endet.
@@ -71,23 +71,22 @@ IDLE_RELEASE_S = 180.0
 VIEW_TTL_S = 4.0
 
 #: Release-Ausgabe (Auftrag 1984): das Hardwareprofil wird nur ANGEZEIGT; Messen bucht ein gpuq-Fenster des Rigs und bleibt zu
-RELEASE_NO_MEASURE = ("Hardware messen braucht gpuq (den Fensterplan des Rigs: es bucht ein Karten-Fenster und startet einen Messlauf) "
-                      "und ist in der Release-Ausgabe gesperrt. Das Hardwareprofil wird hier nur angezeigt.")
-RELEASE_NO_GPUQ = "gpuq gibt es in der Release-Ausgabe nicht (Hardware messen ist dort gesperrt)"
+RELEASE_NO_MEASURE = ("Measuring hardware needs gpuq (the window plan of the rig: it books a card window and starts a measuring run) and is locked in the release edition. The hardware profile is only displayed here.")
+RELEASE_NO_GPUQ = "gpuq does not exist in the release edition (measuring hardware is locked there)"
 
 #: Wo das Profil gespeichert wird (Env überstimmt; das Modul im Baum trägt dieselben Namen, hier gelten sie auch ohne Modul)
 PERSIST_ENV = "FLLIPER_HARDWARE_PROFILE"
 DEFAULT_PERSIST = "/var/lib/flliper/hardware.json"
 
-#: Zustand der Speicherung -> Klartext für die Seite
+#: State of the storage -> plain text for the page
 PERSIST_LABELS = {
-    "erst_erfasst": "beim ersten Start gespeichert",
-    "neu_erfasst": "neu erfasst und gespeichert",
-    "vorhanden": "gespeichert, stimmt mit den Karten überein",
-    "abweichend": "gespeichert, WEICHT von den Karten ab (Datei unverändert; Neu erfassen ersetzt sie)",
-    "nur_gespeichert": "NVML meldet nichts: es gilt das gespeicherte Profil",
-    "keine_karten": "keine Karte gemeldet, nichts gespeichert",
-    "nicht_schreibbar": "Speichern fehlgeschlagen",
+    "erst_erfasst": "saved at the first start",
+    "neu_erfasst": "captured anew and saved",
+    "vorhanden": "saved, matches the cards",
+    "abweichend": "saved, DEVIATES from the cards (file unchanged; Capture again replaces it)",
+    "nur_gespeichert": "NVML reports nothing: the saved profile applies",
+    "keine_karten": "no card reported, nothing saved",
+    "nicht_schreibbar": "Saving failed",
 }
 
 MODULE_REL = os.path.join("sglang", "srt", "rigmon", "hardware_profile.py")
@@ -118,7 +117,7 @@ def datasheet_provider(mod) -> Callable[[dict], dict]:
 
 
 # ---------------------------------------------------------------------------------------------------------- Issue-Text
-_SRC_SHORT = {"gemessen": "gem.", "NVML": "NVML", "Datenblatt": "Datenbl.", "geschätzt": "gesch."}
+_SRC_SHORT = {"gemessen": "meas.", "NVML": "NVML", "Datenblatt": "datasheet", "geschätzt": "est.", "nicht gemessen": "not measured"}
 
 
 def _md(x) -> str:
@@ -129,7 +128,7 @@ def _md(x) -> str:
 def _cell(n, digits: int = 1) -> str:
     """Wertknoten ``{v, src, unit}`` -> ``62.7 TFLOPS (gem.)``; ohne Wert ``nicht gemessen``."""
     if not isinstance(n, dict) or n.get("v") is None:
-        return "nicht gemessen"
+        return "not measured"
     v = n["v"]
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         txt = str(v)
@@ -140,7 +139,7 @@ def _cell(n, digits: int = 1) -> str:
 
 
 def _utc(ts) -> str:
-    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts)) if isinstance(ts, (int, float)) else "unbekannt"
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts)) if isinstance(ts, (int, float)) else "unknown"
 
 
 def _tree_rev(tree: Optional[str]) -> Optional[str]:
@@ -192,13 +191,13 @@ def version_facts(doc: dict, versions: Optional[dict] = None, environ: Optional[
     env = os.environ if environ is None else environ
     rev, src = None, None
     if versions.get("tree_rev"):
-        rev, src = versions["tree_rev"], "übergeben"
+        rev, src = versions["tree_rev"], "passed"
     elif _tree_rev(versions.get("tree")):
-        rev, src = _tree_rev(versions.get("tree")), "Baumpfad releases/<sha>"
+        rev, src = _tree_rev(versions.get("tree")), "tree path releases/<sha>"
     else:
         g = _git_head(versions.get("tree")) if versions.get("tree") else None
         if g:
-            rev, src = g, "git HEAD des Baums"
+            rev, src = g, "git HEAD of the tree"
         else:
             stand = str(env.get("STAND") or "").lower()
             for k in (("HTSGLANG_REVISION_%s" % stand.upper()) if stand in ("27b", "nf") else None, "HTSGLANG_REVISION"):
@@ -218,8 +217,8 @@ def version_facts(doc: dict, versions: Optional[dict] = None, environ: Optional[
 def version_image_text(vf: dict) -> str:
     """Die Image-Zelle: der Tag mit Herkunft, der Dockerfile-Default als "unbelegt (Default)", ohne Angabe wie bisher."""
     if vf.get("image_default"):
-        return "unbelegt (Default %s, beim Bau nicht gesetzt)" % vf["image"]
-    return vf.get("image") or "unbelegt (SGLANG_IMAGE_TAG nicht gesetzt)"
+        return "unverified (default %s, not set at build)" % vf["image"]
+    return vf.get("image") or "unverified (SGLANG_IMAGE_TAG not set)"
 
 
 def version_tree_text(vf: dict) -> str:
@@ -227,7 +226,7 @@ def version_tree_text(vf: dict) -> str:
     if vf.get("tree_rev"):
         src = vf.get("tree_rev_src") or ""
         return "%s (%s)" % (vf["tree_rev"], src) if src.startswith(("git", "Image-ENV")) else vf["tree_rev"]     # Pfad/übergeben: der Wert spricht für sich
-    return "unbelegt"
+    return "unverified"
 
 
 def issue_short(doc: dict, *, persist: Optional[dict] = None, level: int = 3) -> str:
@@ -236,12 +235,12 @@ def issue_short(doc: dict, *, persist: Optional[dict] = None, level: int = 3) ->
     cards = doc.get("cards") or []
     h = "#" * level
     cap = (persist or {}).get("captured_at")
-    L: List[str] = ["%s Hardwareprofil (Kurzform)" % h, ""]
+    L: List[str] = ["%s Hardware profile (short form)" % h, ""]
     pid = str(doc.get("id") or "")
-    L.append("Profil `%s`, %s; %d Karte(n). Die Langform (Takt, Messraten, Katalogherkunft) steht im Issue-Text des Abschnitts Hardware."
-             % (_md(pid[:19] if pid else "unbelegt"), _utc(cap) + " gespeichert" if cap else "lebende Sicht, nicht gespeichert", len(cards)))
+    L.append("Profile `%s`, %s; %d card(s). The long form (clock, measured rates, catalog origin) is in the issue text of the Hardware section."
+             % (_md(pid[:19] if pid else "unverified"), _utc(cap) + " saved" if cap else "live view, not saved", len(cards)))
     L.append("")
-    L.append("| Ord | NVML | Name | cc | SM-Zahl | VRAM | PCIe max. | Speicherbandbreite |")
+    L.append("| Ord | NVML | Name | cc | SM count | VRAM | PCIe max. | Memory bandwidth |")
     L.append("|---|---|---|---|---|---|---|---|")
     for c in cards:
         pc = c.get("pcie") or {}
@@ -251,48 +250,48 @@ def issue_short(doc: dict, *, persist: Optional[dict] = None, level: int = 3) ->
         L.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % tuple(_md(x) for x in (
             c.get("ord"), c.get("nvml_index"), _short_name(c.get("name")), ".".join(str(x) for x in (c.get("cc") or [])) or "?",
             _cell(c.get("sm_count"), 0), _cell(c.get("vram_total_mib"), 0),
-            ("Gen%s x%s" % (gen, wd)) if gen is not None and wd is not None else "nicht gemessen", _cell(bw, 0))))
+            ("Gen%s x%s" % (gen, wd)) if gen is not None and wd is not None else "not measured", _cell(bw, 0))))
     if not cards:
-        L.append("| | | keine Karte gemeldet | | | | | |")
+        L.append("| | | no card reported | | | | | |")
     if doc.get("measure_needed"):
         L.append("")
-        L.append("Das Profil ist unvollständig: es fehlen Messwerte.")
+        L.append("The profile is incomplete: measured values are missing.")
     return redact.text_for_issue("\n".join(L)) + "\n"
 
 
 #: Die UUID einer Karte steht NIE im Issue-Text: sie kennzeichnet genau diese Karte und ihren Rechner (Entscheid Nacharbeit 06.10.: sie wurde bisher nur von der
 #: Geheimnis-Heuristik von ``redact`` entfernt, wenn sie wie eines aussah; jetzt immer, damit Text und Tabelle dasselbe sagen).  Die Messwerte ordnen NVML-Index,
 #: Ord und die PCI-Bus-Adresse zu.
-UUID_REDACTED = "<entfernt>"
+UUID_REDACTED = "<redacted>"
 
 
 def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[dict] = None, now: Optional[float] = None) -> str:
     """Der Issue-Text "Hardwareprofil" (GitHub-Markdown): NVML-Identität, Größen, cc, SM, Takt, Messraten (soweit vorhanden),
     Treiber/Image/Baum.  Geheimnisse und Hostpfade sind entfernt (``redact.text_for_issue``).  Ein Wert ohne Messung steht als
-    "nicht gemessen", ein Wert ohne bekannte Version als "unbelegt"."""
+    "not measured", ein Wert ohne bekannte Version als "unbelegt"."""
     versions = versions or {}
     cards = doc.get("cards") or []
     now = time.time() if now is None else now
     vf = version_facts(doc, versions)
     L: List[str] = []
-    L.append("## Hardwareprofil (`%s`)" % _md(doc.get("schema") or "flliper.hardware/1"))
+    L.append("## Hardware profile (`%s`)" % _md(doc.get("schema") or "flliper.hardware/1"))
     L.append("")
-    L.append("| Angabe | Wert |")
+    L.append("| Item | Value |")
     L.append("|---|---|")
     pid = str(doc.get("id") or "")
-    L.append("| Profil-ID | `%s` |" % _md(pid[:19] if pid else "unbelegt"))
+    L.append("| Profile ID | `%s` |" % _md(pid[:19] if pid else "unverified"))
     cap = ((persist or {}).get("captured_at"))
-    L.append("| Erfasst | %s |" % (_utc(cap) + " (gespeichert)" if cap else _utc(doc.get("created")) + " (lebende Sicht, nicht gespeichert)"))
-    L.append("| Treiber | %s |" % _md(doc.get("driver") or "unbelegt"))
-    L.append("| CUDA / torch (Messprozess) | %s / %s |" % (_md(doc.get("cuda") or "unbelegt"), _md(doc.get("torch") or "unbelegt")))
+    L.append("| Captured | %s |" % (_utc(cap) + " (saved)" if cap else _utc(doc.get("created")) + " (live view, not saved)"))
+    L.append("| Driver | %s |" % _md(doc.get("driver") or "unverified"))
+    L.append("| CUDA / torch (measuring process) | %s / %s |" % (_md(doc.get("cuda") or "unverified"), _md(doc.get("torch") or "unverified")))
     L.append("| Image | %s |" % _md(version_image_text(vf)))
-    L.append("| Baum | %s |" % _md(version_tree_text(vf)))
-    L.append("| Dashboard | %s |" % _md(versions.get("rigdash") or "unbelegt"))
-    L.append("| Karten | %d |" % len(cards))
+    L.append("| Tree | %s |" % _md(version_tree_text(vf)))
+    L.append("| Dashboard | %s |" % _md(versions.get("rigdash") or "unverified"))
+    L.append("| Cards | %d |" % len(cards))
     L.append("")
-    L.append("### Karten (NVML-Identität)")
+    L.append("### Cards (NVML identity)")
     L.append("")
-    L.append("| Ord | NVML | Name | Klasse | cc | SM-Zahl | VRAM | BAR1 | PCIe max. | SM-Takt max. | Speichertakt max. | Busbreite | Leistungsgrenze | PCI-Bus | UUID |")
+    L.append("| Ord | NVML | Name | Class | cc | SM count | VRAM | BAR1 | PCIe max. | SM clock max. | Memory clock max. | Bus width | Power limit | PCI bus | UUID |")
     L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for c in cards:
         pc = c.get("pcie") or {}
@@ -301,62 +300,61 @@ def issue_text(doc: dict, *, persist: Optional[dict] = None, versions: Optional[
         L.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % tuple(_md(x) for x in (
             c.get("ord"), c.get("nvml_index"), _short_name(c.get("name")), c.get("class_key"),
             ".".join(str(x) for x in (c.get("cc") or [])) or "?", _cell(c.get("sm_count"), 0), _cell(c.get("vram_total_mib"), 0),
-            _cell(c.get("bar1_total_mib"), 0), ("Gen%s x%s" % (gen, wd)) if gen is not None and wd is not None else "nicht gemessen",
+            _cell(c.get("bar1_total_mib"), 0), ("Gen%s x%s" % (gen, wd)) if gen is not None and wd is not None else "not measured",
             _cell(ck.get("sm_max_mhz"), 0), _cell(ck.get("mem_max_mhz"), 0), _cell(c.get("mem_bus_bits"), 0),
-            _cell((c.get("power") or {}).get("limit_w"), 0), c.get("pci_bus_id") or "unbelegt", UUID_REDACTED if c.get("uuid") else "unbelegt")))
+            _cell((c.get("power") or {}).get("limit_w"), 0), c.get("pci_bus_id") or "unverified", UUID_REDACTED if c.get("uuid") else "unverified")))
     L.append("")
-    L.append("### Speicher und Rechenleistung")
+    L.append("### Memory and compute")
     L.append("")
-    L.append("| Wert | " + " | ".join("Karte %s (NVML %s)" % (_md(c.get("ord")), _md(c.get("nvml_index"))) for c in cards) + " |")
+    L.append("| Value | " + " | ".join("Card %s (NVML %s)" % (_md(c.get("ord")), _md(c.get("nvml_index"))) for c in cards) + " |")
     L.append("|---|" + "---|" * len(cards))
 
     def row(label, f):
         L.append("| %s | %s |" % (_md(label), " | ".join(_md(f(c)) for c in cards)))
 
-    row("Speicher lesen", lambda c: _cell((c.get("mem_gbs") or {}).get("read"), 0))
-    row("Speicher kopieren (D2D)", lambda c: _cell((c.get("mem_gbs") or {}).get("copy"), 0))
-    row("Speicher GEMV (Decode)", lambda c: _cell((c.get("mem_gbs") or {}).get("gemv"), 0))
-    row("Spitze aus NVML (Busbreite x Takt)", lambda c: _cell((c.get("mem_gbs") or {}).get("nameplate"), 0))
-    row("Nennbandbreite (Katalog)", lambda c: _cell((c.get("mem_gbs") or {}).get("nominal"), 0))
+    row("Memory read", lambda c: _cell((c.get("mem_gbs") or {}).get("read"), 0))
+    row("Memory copy (D2D)", lambda c: _cell((c.get("mem_gbs") or {}).get("copy"), 0))
+    row("Memory GEMV (decode)", lambda c: _cell((c.get("mem_gbs") or {}).get("gemv"), 0))
+    row("Peak from NVML (bus width x clock)", lambda c: _cell((c.get("mem_gbs") or {}).get("nameplate"), 0))
+    row("Nominal bandwidth (catalog)", lambda c: _cell((c.get("mem_gbs") or {}).get("nominal"), 0))
     for f in doc.get("formats") or []:
         row(f.get("label") or f.get("key"), lambda c, k=f.get("key"): _cell((c.get("compute") or {}).get(k), 1))
-    row("Host -> Karte (H2D)", lambda c: _cell((c.get("h2d") or {}).get("gbs"), 1))
-    row("Karte -> Host (D2H)", lambda c: _cell((c.get("d2h") or {}).get("gbs"), 1))
+    row("Host -> card (H2D)", lambda c: _cell((c.get("h2d") or {}).get("gbs"), 1))
+    row("Card -> host (D2H)", lambda c: _cell((c.get("d2h") or {}).get("gbs"), 1))
     cat = [c for c in cards if c.get("catalog")]
     if cat:
         L.append("")
-        L.append("### Katalogkarte und Herkunft der Datenblattwerte")
+        L.append("### Catalog card and origin of the datasheet values")
         L.append("")
         for c in cards:
             k = c.get("catalog")
             if not k:
-                L.append("- Karte %s: kein Katalogeintrag" % _md(c.get("ord")))
+                L.append("- Card %s: no catalog entry" % _md(c.get("ord")))
                 continue
             of = k.get("origin_fields") or {}
-            extra = "; Nennbandbreite: %s" % _md(of.get("mem_bw")) if of.get("mem_bw") and of.get("mem_bw") != k.get("origin") else ""
-            L.append("- Karte %s: %s, Herkunft: %s%s" % (_md(c.get("ord")), _md(k.get("label")), _md(k.get("origin")), extra))
+            extra = "; nominal bandwidth: %s" % _md(of.get("mem_bw")) if of.get("mem_bw") and of.get("mem_bw") != k.get("origin") else ""
+            L.append("- Card %s: %s, origin: %s%s" % (_md(c.get("ord")), _md(k.get("label")), _md(k.get("origin")), extra))
     meas = [lk for lk in (doc.get("links") or []) if (lk.get("gbs") or {}).get("src") == "gemessen" and lk.get("transport") != "bar1"]
     if meas:
         L.append("")
-        L.append("### Karte-zu-Karte (gemessen)")
+        L.append("### Card to card (measured)")
         L.append("")
-        L.append("| Von | Nach | Weg | Bandbreite |")
+        L.append("| From | To | Path | Bandwidth |")
         L.append("|---|---|---|---|")
         for lk in meas:
             L.append("| %s | %s | %s | %s |" % (_md(lk.get("src")), _md(lk.get("dst")), _md(lk.get("transport_label") or lk.get("transport")), _md(_cell(lk.get("gbs"), 2))))
     L.append("")
-    L.append("### Herkunft der Werte")
+    L.append("### Origin of the values")
     L.append("")
-    L.append("gem. = Messlauf auf dieser Karte, NVML = vom Treiber gelesen, Datenbl. = Herstellerangabe aus dem Katalog (nicht gemessen), "
-             "gesch. = abgeleitet, nicht gemessen = keine Messung vorhanden.")
+    L.append("meas. = measuring run on this card, NVML = read from the driver, datasheet = manufacturer value from the catalog (not measured), est. = derived, not measured = no measurement available.")
     if doc.get("measure_needed"):
         L.append("")
-        L.append("Das Profil ist unvollständig: es fehlen Messwerte (Hardwareprofil messen).")
+        L.append("The profile is incomplete: measured values are missing (Measure hardware profile).")
     notes = ((doc.get("sources") or {}).get("nvml") or {}).get("issues") or []
     if notes:
         L.append("")
         for n in notes:      # je Hinweis eine Zeile: ein Geheimnis in einem Hinweis nimmt nur diese Zeile mit
-            L.append("- NVML-Hinweis: " + _md(n))
+            L.append("- NVML note: " + _md(n))
     return redact.text_for_issue("\n".join(L)) + "\n"
 
 
@@ -397,7 +395,7 @@ def urllib_http(method: str, url: str, body: Optional[dict] = None, headers: Opt
     except urllib.error.HTTPError as e:
         raw, status = e.read(), e.code
     except (urllib.error.URLError, OSError) as e:
-        raise GpuqUnavailable("gpuq nicht erreichbar (%s): %s" % (url, e))
+        raise GpuqUnavailable("gpuq not reachable (%s): %s" % (url, e))
     try:
         return status, json.loads(raw.decode() or "null")
     except ValueError:
@@ -454,8 +452,7 @@ class HwProfil:
         if self._mod is None:
             if not self.tree:
                 raise RuntimeError(
-                    "kein Planer-Baum mit sglang/srt/rigmon/hardware_profile.py gefunden (--hw-tree, HWPROFIL_TREE bzw. "
-                    "KARTENPLAN_TREE; stagen: deploy/stage_hwprofil.sh)")
+                    "no planner tree with sglang/srt/rigmon/hardware_profile.py found (--hw-tree, HWPROFIL_TREE or KARTENPLAN_TREE; to stage: deploy/stage_hwprofil.sh)")
             self._mod = _load_module(self.tree)
         return self._mod
 
@@ -589,7 +586,7 @@ class HwProfil:
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e)}
         if not self._can_persist(mod):
-            return {"ok": False, "error": "Speichern ist nicht eingerichtet (kein Speicherort: Env %s) oder das Profilmodul des Baums kann es nicht" % PERSIST_ENV}
+            return {"ok": False, "error": "Saving is not set up (no storage location: env %s) or the profile module of the tree cannot do it" % PERSIST_ENV}
         with self._lock:
             live = self._build(mod)
             res = mod.capture(self.persist_path, live=live, force=True, now=self.clock())
@@ -602,7 +599,7 @@ class HwProfil:
         """Der Issue-Text "Hardwareprofil" (Markdown, redigiert) aus dem Profil, das ``get`` zeigt."""
         got = self.get()
         if not got.get("ok"):
-            return {"ok": False, "error": got.get("error") or "kein Profil"}
+            return {"ok": False, "error": got.get("error") or "no profile"}
         v = dict(self.versions() or {}) if self.versions else {}
         v.setdefault("tree", self.tree)
         return {"ok": True, "format": "markdown", "text": issue_text(got["profile"], persist=got.get("persist"), versions=v, now=self.clock())}
@@ -611,7 +608,7 @@ class HwProfil:
         """Bausteine für den Laufbericht des Profil-Editors: der Hardwareprofil-Block in Kurzform und die Versionsangaben (``version_facts``)."""
         got = self.get()
         if not got.get("ok"):
-            return {"ok": False, "error": got.get("error") or "kein Profil"}
+            return {"ok": False, "error": got.get("error") or "no profile"}
         v = dict(self.versions() or {}) if self.versions else {}
         v.setdefault("tree", os.path.realpath(self.tree) if self.tree else None)     # ``current`` -> ``releases/<sha>``: so der Baum seine Revision nennt
         return {"ok": True, "short": issue_short(got["profile"], persist=got.get("persist")), "versions": version_facts(got["profile"], v),
@@ -631,7 +628,7 @@ class HwProfil:
                 b.setdefault("running_since", now)
                 if now - b["running_since"] > IDLE_RELEASE_S:
                     self._release("ungenutzt")
-                    self._job = dict(self._job, note="Fenster ungenutzt zurückgegeben (kein Knopfdruck innerhalb %d s)" % IDLE_RELEASE_S)
+                    self._job = dict(self._job, note="Window returned unused (no button press within %d s)" % IDLE_RELEASE_S)
 
     def _job_view(self) -> dict:
         j = dict(self._job)
@@ -646,10 +643,10 @@ class HwProfil:
         cards = req.get("cards")
         if (not isinstance(cards, list) or not cards or not all(isinstance(c, int) and not isinstance(c, bool) for c in cards)
                 or len(set(cards)) != len(cards)):
-            raise ValueError("cards muss eine nichtleere Liste verschiedener NVML-Indizes sein, z. B. [0, 1, 2]")
+            raise ValueError("cards must be a non-empty list of distinct NVML indices, e.g. [0, 1, 2]")
         mib = req.get("mib")
         if mib is not None and not (isinstance(mib, (int, str)) and not isinstance(mib, bool)):
-            raise ValueError("mib: Zahl oder Text wie \"8g\"")
+            raise ValueError("mib: number or text such as \"8g\"")
         mod = self._module()
         known = self.gpuq_cards()
         if not known["reachable"]:
@@ -657,7 +654,7 @@ class HwProfil:
         have = {c["index"] for c in known["cards"]}
         bad = [c for c in cards if c not in have]
         if bad:
-            raise ValueError("unbekannte Karte(n) %s; gpuq kennt %s" % (bad, sorted(have)))
+            raise ValueError("unknown card(s) %s; gpuq knows %s" % (bad, sorted(have)))
         with self._lock:
             if self._job.get("state") == "running":
                 return {"ok": False, "action": "laeuft_bereits", "job": self._job_view(), "window": None}
@@ -674,7 +671,7 @@ class HwProfil:
             st, js = self._gq("POST", "/api/v1/bookings", body)
             if st != 200 or not isinstance(js, dict) or not js.get("id"):
                 detail = (js or {}).get("detail") if isinstance(js, dict) else None
-                return {"ok": False, "action": "abgelehnt", "error": "gpuq-Buchung abgelehnt (HTTP %s): %s" % (st, detail)}
+                return {"ok": False, "action": "abgelehnt", "error": "gpuq booking refused (HTTP %s): %s" % (st, detail)}
             b = {"id": js["id"], "token": js.get("token"), "cards": sorted(cards), "booked_at": self.clock()}
             with self._lock:
                 self._booking = b
@@ -686,24 +683,24 @@ class HwProfil:
                 with self._lock:
                     self._booking = None
                     self._persist()
-                return {"ok": False, "action": "abgelehnt", "error": "die Buchung %s ist beim Fensterplan nicht mehr bekannt; bitte erneut drücken" % b["id"]}
+                return {"ok": False, "action": "abgelehnt", "error": "the booking %s is no longer known to the window plan; please press again" % b["id"]}
         state = live.get("state")
         window = _window_view(live)
         if state == "pending":
             return {"ok": True, "action": "wartet", "window": window,
-                    "message": "Fenster wartet (%s). Nichts gemessen. Erneut drücken, sobald es läuft." % (live.get("note") or "in der Warteschlange")}
+                    "message": "Window is waiting (%s). Nothing measured. Press again as soon as it runs." % (live.get("note") or "in the queue")}
         if state != "running":
             with self._lock:
                 self._booking = None
                 self._persist()
             return {"ok": False, "action": "abgelehnt", "window": window,
-                    "error": "Fenster %s ist %s: %s" % (b["id"], state, live.get("note") or "")}
+                    "error": "Window %s is %s: %s" % (b["id"], state, live.get("note") or "")}
         left = live.get("seconds_left")
         if left is not None and left < MIN_LEFT_S:
             with self._lock:
                 self._release("zu_kurz")
             return {"ok": False, "action": "abgelehnt", "window": window,
-                    "error": "Fenster hat nur noch %.0f s; Fenster zurückgegeben, bitte neu buchen" % left}
+                    "error": "Window has only %.0f s left; window returned, please book again" % left}
         # Gegenprobe (nvidia-smi über gpuq): der Dienst sperrt nichts
         used = {c["index"]: c.get("used_mib") for c in self.gpuq_cards()["cards"]}
         busy = {i: used.get(i) for i in cards if (used.get(i) or 0) >= BUSY_MIB}
@@ -711,7 +708,7 @@ class HwProfil:
             with self._lock:
                 self._release("karte_belegt")
             return {"ok": False, "action": "abgelehnt", "window": window,
-                    "error": "Karte(n) belegt trotz Fenster (used_mib %s): Fenster zurückgegeben, nichts gemessen" % busy}
+                    "error": "Card(s) occupied despite the window (used_mib %s): window returned, nothing measured" % busy}
         timeout = CHILD_CAP_S if left is None else max(30.0, min(CHILD_CAP_S, left - END_MARGIN_S))
         with self._lock:
             b["running_since"] = b.get("running_since") or self.clock()
@@ -730,7 +727,7 @@ class HwProfil:
             nvml = mod.read_nvml()[0]
             job.update(state="ok" if res.get("ok") else "error", rc=res.get("rc"), seconds=res.get("seconds"),
                        line=mod.duration_line(res, nvml), warnings=res.get("warnings") or [],
-                       error=None if res.get("ok") else (res.get("stderr_tail") or "Messlauf ohne Ergebnis"))
+                       error=None if res.get("ok") else (res.get("stderr_tail") or "Measuring run without result"))
         except Exception as e:  # noqa: BLE001 -- jeder Fehlschlag muss das Fenster freigeben und gemeldet werden
             job.update(state="error", error="%s: %s" % (type(e).__name__, e))
         finally:
@@ -751,7 +748,7 @@ class HwProfil:
             return {"ok": False, "error": RELEASE_NO_MEASURE}
         with self._lock:
             if self._job.get("state") == "running":
-                return {"ok": False, "error": "Messung läuft; das Fenster geht nach dem Lauf von selbst zurück"}
+                return {"ok": False, "error": "Measurement is running; the window is returned by itself after the run"}
             had = self._booking is not None
             self._release("abgebrochen")
         return {"ok": True, "released": had}

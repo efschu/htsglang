@@ -87,8 +87,8 @@ class TestContractSumRule(unittest.TestCase):
         self.assertEqual(seg(b, "reserve")["mib"], 50.0)
         self.assertIsNone(seg(b, "free"))
         self.assertAlmostEqual(sum(s["mib"] for s in b["segments"]), 1000.0, places=6)
-        self.assertIn("ueber dem Budget", b["over_text"])
-        self.assertIn("aufgezehrt", seg(b, "reserve")["detail"])
+        self.assertIn("over the budget", b["over_text"])
+        self.assertIn("is consumed", seg(b, "reserve")["detail"])
 
     def test_over_the_card_the_bar_grows_past_the_edge_and_nothing_is_clipped(self):
         b = PC.contract_bar(stage(1000, 900, weights=700, kv=500), "D")          # 1200 Posten auf einer 1000er Karte
@@ -96,16 +96,16 @@ class TestContractSumRule(unittest.TestCase):
         self.assertEqual(b["overflow_mib"], 300.0)
         self.assertEqual([s["name"] for s in b["segments"]], ["weights", "kv"])
         self.assertEqual(sum(s["mib"] for s in b["segments"]), 1200.0)          # Summe = Posten > Kartengroesse
-        self.assertIn("ueber der KARTE", b["over_text"])
+        self.assertIn("over the CARD", b["over_text"])
 
     def test_not_computed_terms_are_null_not_zero_and_bound_the_free_figure(self):
         b = PC.contract_bar(stage(1000, 900, weights=300, kv=None, fixed=None), "P")
-        self.assertEqual(b["not_computed"], ["KV", "Festposten"])
+        self.assertEqual(b["not_computed"], ["KV", "Fixed items"])
         kv = seg(b, "kv")
         self.assertIsNone(kv["mib"])
-        self.assertEqual((kv["herkunft"], kv["gerechnet"]), ("nicht gerechnet", False))
+        self.assertEqual((kv["herkunft"], kv["gerechnet"]), ("not calculated", False))
         self.assertEqual(b["posts_mib"], 300.0)
-        self.assertIn("OBERGRENZE", seg(b, "free")["detail"])
+        self.assertIn("UPPER BOUND", seg(b, "free")["detail"])
         self.assertIn("KV", seg(b, "free")["detail"])
 
     def test_zero_terms_are_left_out_and_the_order_is_the_contract_order(self):
@@ -139,21 +139,21 @@ class TestEveryBarOfTheReferenceRig(unittest.TestCase):
     def test_unmeasured_fixed_posts_are_not_computed_in_p_not_zero(self):
         for b in self.res["phases"]["P"]["bars"]:
             self.assertIsNone(seg(b, "fixed")["mib"])
-            self.assertIn("Festposten", b["not_computed"])
+            self.assertIn("Fixed items", b["not_computed"])
 
     def test_the_geometry_overshoot_on_a_3080_is_shown_with_the_reserve_eaten(self):
         # ohne gemessene Aktivierungsspitze rechnet die Engine die Geometrie (benannte Grenze, Test 1432): Karte 1 laeuft ueber das Budget
         b = self.res["phases"]["P"]["bars"][1]
         self.assertGreater(b["overflow_mib"], 0)
         self.assertEqual(b["beyond_card_mib"], 0.0)
-        self.assertTrue(any("Budget" in h for h in self.res["hints"]))
+        self.assertTrue(any("budget" in h for h in self.res["hints"]))
 
     def test_p_inputs_name_the_profile_lines_they_came_from(self):
         seen = {x["was"]: x for x in self.res["phases"]["P"]["inputs"]}
         self.assertIn("--pp-stage-ratio", seen["stage_layers"]["herkunft"])
         self.assertIn("--pp-cut-expert-device-fraction", seen["moe_resident_fraction"]["herkunft"])
         self.assertIn("--pp-cut-expert-lru-rows", seen["scratch_rows"]["herkunft"])
-        self.assertIn("Annahme", seen["budget_mib"]["herkunft"])
+        self.assertIn("Assumption", seen["budget_mib"]["herkunft"])
 
 
 class TestDPhaseHandCalculation(unittest.TestCase):
@@ -168,7 +168,7 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         for b in res["phases"]["D"]["bars"]:
             self.assertAlmostEqual(seg(b, "weights")["mib"], dense / 2, delta=0.01)
             self.assertIsNone(seg(b, "experts"))                       # dichtes Modell
-            self.assertIn("gleichmaessiger TP", seg(b, "weights")["detail"])
+            self.assertIn("even TP", seg(b, "weights")["detail"])
         attn = sum(1 for f in m["arch"]["layer_families"]["v"] if f == "attn")
         cell = m["kv"]["cell_bytes_per_attn_layer_token"]["v"]
         if m["arch"]["heads_kv"]["v"] % 2 == 0:
@@ -192,12 +192,12 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         for i, (fr, sc) in enumerate(zip((0.06, 0.51, 0.48), (104, 48, 48))):
             rows = ER.buffer_rows(local_experts=own[i], fraction=fr, scratch_rows=sc)
             self.assertAlmostEqual(seg(d[i], "experts")["mib"], rows * per_expert, delta=0.01, msg="Rang %d" % i)
-            self.assertEqual(seg(d[i], "experts")["herkunft"], "Naeherung (nicht der Loeser)")
+            self.assertEqual(seg(d[i], "experts")["herkunft"], "Approximation (not the solver)")
 
     def test_fixed_post_is_the_sum_of_the_two_profile_lines(self):
         d = nf()["phases"]["D"]["bars"]
         self.assertEqual([seg(b, "fixed")["mib"] for b in d], [1446 + 1981, 896 + 528, 894 + 524])
-        self.assertEqual(seg(d[0], "fixed")["herkunft"], "Profilzeile")
+        self.assertEqual(seg(d[0], "fixed")["herkunft"], "Profile row")
         self.assertIn("--d-foreign-context-mib", seg(d[0], "fixed")["detail"])
         self.assertIn("--d-nontorch-mib", seg(d[0], "fixed")["detail"])
 
@@ -222,7 +222,7 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         pa["D"]["--rank-gpu-memory-mib"] = "31583,19456,19456"
         b = nf(pa=pa)["phases"]["D"]["bars"][0]
         self.assertAlmostEqual(b["budget_over_available_mib"], 31583 - (32607 - 3427), delta=0.01)
-        self.assertIn("groesser als das Verfuegbare", b["over_text"])
+        self.assertIn("larger than what is available", b["over_text"])
         self.assertEqual(b["beyond_card_mib"], 0)
 
     def test_contract_bar_by_hand_outside_posts_shrink_available_not_free(self):
@@ -246,7 +246,7 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         #   Karte 0: 32607 - Boden 1024 (Wach-Rest-Record 2672 ersetzt die 404) - dc 3427 - Wachstum 482 - Wach-Rest 2672 = 25002 -> 25000
         #   Karte 1: 20480 - (1024 + 404) - dc 1424 - Wachstum 572 = 17056;  Karte 2: 20480 - 1428 - dc 1418 - Wachstum 384 = 17250 -> 17248
         self.assertEqual([b["budget_mib"] for b in d], [25000, 17056, 17248])
-        self.assertEqual(d[0]["budget_herkunft"], "gerechnet")
+        self.assertEqual(d[0]["budget_herkunft"], "computed")
         for b in d:
             self.assertEqual(b["budget_over_available_mib"], 0)
             self.assertAlmostEqual(seg(b, "reserve")["mib"], b["available_mib"] - b["budget_mib"], places=2)
@@ -254,7 +254,7 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         pa["D"]["--rank-gpu-memory-mib"] = "28000,17000,17000"
         d2 = nf(pa=pa)["phases"]["D"]["bars"]
         self.assertEqual([b["budget_mib"] for b in d2], [28000, 17000, 17000])
-        self.assertEqual(d2[0]["budget_herkunft"], "Profilzeile")
+        self.assertEqual(d2[0]["budget_herkunft"], "Profile row")
         self.assertEqual(seg(d2[0], "reserve")["mib"], 32607 - 3427 - 28000)          # verfuegbar - Budget
 
     def test_unsolvable_assignments_are_not_computed_and_say_why(self):
@@ -264,7 +264,7 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         d = nf(pa=pa)["phases"]["D"]["bars"]
         for b in d:
             self.assertIsNone(seg(b, "weights")["mib"])
-            self.assertIn("loest der Launcher", seg(b, "weights")["detail"])
+            self.assertIn("the launcher solves", seg(b, "weights")["detail"])
             self.assertIsNone(seg(b, "experts")["mib"])
             self.assertIn("link", seg(b, "experts")["detail"])
 
@@ -284,7 +284,7 @@ class TestDPhaseHandCalculation(unittest.TestCase):
         self.assertAlmostEqual(kvs[0] / kvs[1], 2.0, places=3)
         self.assertAlmostEqual(kvs[1], kvs[2], places=6)
         # der Gesamtpreis steht als Hinweis, auch wenn die Verteilung nicht gerechnet ist
-        self.assertTrue(any("KV gesamt" in h for h in nf()["hints"]))
+        self.assertTrue(any("KV total" in h for h in nf()["hints"]))
 
 
 class TestDraftTerm(unittest.TestCase):
@@ -305,7 +305,7 @@ class TestDraftTerm(unittest.TestCase):
         self.assertIsNone(seg(on[1], "draft"))
         d = seg(on[2], "draft")                                        # letzte Stufe, Gewicht ohne lm_head aus dem Draft-Profil
         self.assertAlmostEqual(d["mib"], 500.0, delta=0.01)
-        self.assertEqual(d["herkunft"], "Modellprofil/Hardwareprofil (Index)")
+        self.assertEqual(d["herkunft"], "Model profile/hardware profile (Index)")
         self.assertIn("lm_head", d["detail"])
 
     def test_p_default_is_on_when_the_flag_is_absent(self):
@@ -319,8 +319,8 @@ class TestDraftTerm(unittest.TestCase):
         self.assertAlmostEqual(seg(d[0], "draft")["mib"], 300.0, delta=0.01)
         self.assertIsNone(seg(d[1], "draft"))
         self.assertIsNone(seg(d[2], "draft"))
-        self.assertIn("solo auf Rang 0", seg(d[0], "draft")["detail"])
-        self.assertIn("Einbettung und lm_head", seg(d[0], "draft")["detail"])
+        self.assertIn("solo on rank 0", seg(d[0], "draft")["detail"])
+        self.assertIn("embedding and lm_head", seg(d[0], "draft")["detail"])
 
     def test_d_solo_draft_adds_one_kv_row_on_the_host_only(self):
         a = dict(NF_ARGS)
@@ -361,7 +361,7 @@ class TestDraftTerm(unittest.TestCase):
         r2 = nf(m=m, pa=pa)
         self.assertEqual(r2["draft"]["kind"], "nextn")
         self.assertIsNone(seg(r2["phases"]["D"]["bars"][0], "draft")["mib"])
-        self.assertIn("nicht profiliert", seg(r2["phases"]["D"]["bars"][0], "draft")["detail"])
+        self.assertIn("not profiled", seg(r2["phases"]["D"]["bars"][0], "draft")["detail"])
 
     def test_no_spec_flag_and_no_mtp_head_means_no_draft(self):
         m = copy.deepcopy(model("nextflash_int4mixed"))
@@ -406,7 +406,7 @@ class TestForms(unittest.TestCase):
         a["--dual-share"] = ""
         r = nf(args=a)
         self.assertEqual((r["form"], list(r["phases"])), ("dual", ["P", "D"]))
-        self.assertTrue(any("Summe beider Balken ist nicht gerechnet" in h for h in r["hints"]))
+        self.assertTrue(any("The sum of both bars is not calculated" in h for h in r["hints"]))
         self.assertNotIn("Summe", r["phases"])
 
     def test_one_unsolvable_phase_leaves_the_other_standing(self):
@@ -414,7 +414,7 @@ class TestForms(unittest.TestCase):
         a.pop("--pp-stage-ratio")
         r = nf(args=a)
         self.assertFalse(r["phases"]["P"]["ok"])
-        self.assertIn("--pp-stage-ratio fehlt", r["phases"]["P"]["error"])
+        self.assertIn("--pp-stage-ratio is missing", r["phases"]["P"]["error"])
         self.assertTrue(r["phases"]["D"]["ok"])
         pa = copy.deepcopy(NF_PA)
         pa["D"]["--rank-tp-ratio"] = "1,0"                                # falsche Vektorlaenge
@@ -426,7 +426,7 @@ class TestForms(unittest.TestCase):
         r = nf(overrides={"activation_mib": [5984, 2952, 2944], "ssm_dtype": "bfloat16"})
         for b, tr in zip(r["phases"]["P"]["bars"], (5984, 2952, 2944)):
             self.assertAlmostEqual(seg(b, "activation")["mib"], tr, delta=0.01)
-            self.assertEqual(seg(b, "activation")["herkunft"], "Eingabe (Nutzer/Profil)")
+            self.assertEqual(seg(b, "activation")["herkunft"], "Input (user/profile)")
 
 
 class TestBridge(unittest.TestCase):
@@ -484,8 +484,8 @@ class TestDualSharePhase(unittest.TestCase):
             self.assertGreater(refs["kv"]["mib"], 0)
             self.assertEqual(refs["activation"]["ref"], "in_festposten")
             self.assertIsNone(refs["diff"]["mib"])                                      # Diff nicht gerechnet, nie geraten
-            self.assertIn("Diff der P-Gewichte", b["not_computed"])
-            self.assertIn("OBERGRENZE", next(x for x in b["segments"] if x["name"] == "free")["detail"])
+            self.assertIn("Diff of the P weights", b["not_computed"])
+            self.assertIn("UPPER BOUND", next(x for x in b["segments"] if x["name"] == "free")["detail"])
             # Summenregel unveraendert: Segmente = Karte, Referenz zaehlt nicht mit
             self.assertAlmostEqual(sum(x["mib"] for x in b["segments"]), b["total_mib"], places=2)
         self.assertIsNone(p["context_floor_tokens"])                                     # "Kontext-Boden 0 Token" war eine falsche Zahl
@@ -496,7 +496,7 @@ class TestDualSharePhase(unittest.TestCase):
         self.assertEqual(list(inside), ["state"])                                        # Mamba/GDN-Zustand ist P-eigen
         fx = next(x for x in b["segments"] if x["name"] == "fixed")
         self.assertEqual((fx["mib"], fx.get("ausserhalb_budget")), (2500.0, True))
-        self.assertEqual(fx["herkunft"], "Eingabe (Nutzer/Profil)")
+        self.assertEqual(fx["herkunft"], "Input (user/profile)")
         self.assertIn("launcher.py:22713", fx["detail"])
         self.assertEqual(b["outside_budget_mib"], 2500.0)
         self.assertEqual(b["available_mib"], b["total_mib"] - 2500.0)
@@ -506,8 +506,8 @@ class TestDualSharePhase(unittest.TestCase):
         del a["--dual-p-overhead-mib"]
         fx = next(x for x in dual(args=a)["phases"]["P"]["bars"][0]["segments"] if x["name"] == "fixed")
         self.assertEqual(fx["mib"], 1500.0)
-        self.assertEqual(fx["herkunft"], "Annahme dieser Rechnung")
-        self.assertIn("Standard des Launchers", fx["detail"])
+        self.assertEqual(fx["herkunft"], "Assumption of this calculation")
+        self.assertIn("launcher default", fx["detail"])
 
     def test_without_unified_kv_the_kv_still_counts_against_the_p_budget(self):
         a = dict(DUAL_ARGS)
@@ -522,7 +522,7 @@ class TestDualSharePhase(unittest.TestCase):
         pa["P"]["--rank-gpu-memory-mib"] = "100,100,100"
         for b in dual(pa=pa)["phases"]["P"]["bars"]:
             self.assertGreater(b["overflow_mib"], 0)
-            self.assertIn("ueber dem Budget", b["over_text"])
+            self.assertIn("over the budget", b["over_text"])
 
     def test_flip_and_d_only_are_unchanged_by_the_dual_share_branch(self):
         flip = dual(args={k: v for k, v in DUAL_ARGS.items() if not k.startswith("--dual-")}, form="flip")
@@ -538,7 +538,7 @@ class TestDualSharePhase(unittest.TestCase):
         self.assertEqual(list(d["phases"]), ["D"])
 
     def test_the_hint_explains_the_reference_row(self):
-        self.assertTrue(any("Union-Image von D" in h for h in dual()["hints"]))
+        self.assertTrue(any("union image of D" in h for h in dual()["hints"]))
 
 
 class TestLauncherSemanticsOfTheTexts(unittest.TestCase):
@@ -548,7 +548,7 @@ class TestLauncherSemanticsOfTheTexts(unittest.TestCase):
         b = PC.contract_bar(dict(stage(1000, 900, weights=300, fixed=150), terms={"weights": {"v": 300.0, "src": "Eingabe", "note": ""},
                                                                                      "fixed": {"v": 150.0, "src": "Eingabe", "note": "", "outside_budget": True}}), "D")
         self.assertEqual(b["budget_over_available_mib"], 50.0)
-        self.assertIn("Launcher meldet DARUEBER und startet trotzdem", b["over_text"])
+        self.assertIn("launcher reports THIS and starts anyway", b["over_text"])
         self.assertNotIn("lehnt ab", b["over_text"])
         self.assertNotIn("Force", b["over_text"])
 
@@ -562,7 +562,7 @@ class TestLauncherSemanticsOfTheTexts(unittest.TestCase):
         b = PC.contract_bar(st, "D")
         self.assertEqual(b["budget_over_available_mib"], 100.0)                           # 900 gefragt, 1000 - 200 = 800 verfuegbar
         self.assertEqual(b["user_reserve_mib"], 200.0)
-        self.assertIn("Nutzerreserve 200 MiB (--d-reserve-mib)", b["over_text"])
+        self.assertIn("user reserve 200 MiB (--d-reserve-mib)", b["over_text"])
         self.assertAlmostEqual(sum(s["mib"] for s in b["segments"]), 1000.0, places=6)    # nicht als eigenes Segment gezeichnet
         self.assertEqual(PC.contract_bar(stage(1000, 900, weights=300), "D")["budget_over_available_mib"], 0.0)
 
@@ -588,7 +588,7 @@ class TestDualShareDPhase(unittest.TestCase):
         for b, tot, x, rb in zip(d, (32607, 20480, 20480), dc, (3191, 2079, 2067)):
             fx = seg(b, "fixed")
             self.assertEqual((fx["mib"], fx.get("ausserhalb_budget")), (x, True))
-            self.assertIn("aus P-Plan", fx["detail"])
+            self.assertIn("from P plan", fx["detail"])
             self.assertIn("launcher.py:14976", fx["detail"])
             self.assertEqual(b["outside_budget_mib"], x)
             self.assertEqual(b["available_mib"], tot - x)
@@ -614,29 +614,29 @@ class TestDualShareDPhase(unittest.TestCase):
         pa["D"] = {"--rank-gpu-memory-mib": "30000,18000,18000"}
         r = dual(pa=pa)
         self.assertEqual([b["budget_mib"] for b in r["phases"]["D"]["bars"]], [20304, 10848, 10712])
-        self.assertTrue(any(x["was"] == "budget_mib" and "ignoriert" in x["herkunft"] for x in r["phases"]["D"]["inputs"]))
+        self.assertTrue(any(x["was"] == "budget_mib" and "ignored" in x["herkunft"] for x in r["phases"]["D"]["inputs"]))
 
     def test_without_the_p_group_budget_the_d_budget_is_an_upper_bound_not_a_number_pretending_to_be_the_plan(self):
         d = dual(pa={})["phases"]["D"]["bars"]
         for b, tot, rb in zip(d, (32607, 20480, 20480), (3191, 2079, 2067)):
             self.assertIsNone(seg(b, "fixed")["mib"])
-            self.assertIn("nicht gerechnet", seg(b, "fixed")["detail"])
-            self.assertNotIn("CUDA-Kontext der schlafenden Phase", seg(b, "fixed")["detail"])    # Befund 2: Text je Form, unter --dual-share ist es P's Plan
+            self.assertIn("not calculated", seg(b, "fixed")["detail"])
+            self.assertNotIn("CUDA context of the sleeping phase", seg(b, "fixed")["detail"])    # Befund 2: Text je Form, unter --dual-share ist es P's Plan
             self.assertEqual(b["budget_mib"], (tot - rb) // 8 * 8)
             self.assertIn("fixed", [x["name"] for x in b["segments"]])
-            self.assertIn("Festposten", b["not_computed"])
+            self.assertIn("Fixed items", b["not_computed"])
 
     def test_the_overhead_default_is_named_when_the_flag_is_absent(self):
         a = dict(DUAL_ARGS)
         del a["--dual-p-overhead-mib"]
         b = dual(args=a)["phases"]["D"]["bars"][0]
         self.assertEqual(seg(b, "fixed")["mib"], 6610 + 1500)
-        self.assertEqual(seg(b, "fixed")["herkunft"], "Naeherung (nicht der Loeser)")
-        self.assertIn("Standard des Launchers", seg(b, "fixed")["detail"])
+        self.assertEqual(seg(b, "fixed")["herkunft"], "Approximation (not the solver)")
+        self.assertIn("launcher default", seg(b, "fixed")["detail"])
 
     def test_the_hint_names_the_d_side(self):
-        self.assertTrue(any("D-Seite" in h and "P's Plan" in h for h in dual()["hints"]))
-        self.assertFalse(any("D-Seite" in h for h in dual(args={k: v for k, v in DUAL_ARGS.items() if k != "--dual-share"}, tokens=["--dual-layout"])["hints"]))
+        self.assertTrue(any("D side" in h and "P's plan" in h for h in dual()["hints"]))
+        self.assertFalse(any("D side" in h for h in dual(args={k: v for k, v in DUAL_ARGS.items() if k != "--dual-share"}, tokens=["--dual-layout"])["hints"]))
 
 
 FLIP27_ARGS = {"--pp-stage-ratio": "31,17,16", "--pp-attn-stage-ratio": "7,5,4", "--max-kv-per-request": "262144", "--draft-kv-on-p": "off",
@@ -708,7 +708,7 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
         self.check_d_bar(d, dc, av, profile="qwen27b", reserve="1800,1400,1400")
         # von Hand: (Karte - dc - gebuchter Rest 3191/2079/2067) // 8 * 8; die Nutzerreserve 1800/1400/1400 wird daneben nicht gebucht
         self.assertEqual([b["budget_mib"] for b in d], [(t - x - rb) // 8 * 8 for t, x, rb in zip(self.TOTALS, dc, (3191, 2079, 2067))])
-        self.assertIn("gebuchter Rest", d[0]["budget_note"] if "budget_note" in d[0] else seg(d[0], "reserve")["detail"])
+        self.assertIn("booked rest", d[0]["budget_note"] if "budget_note" in d[0] else seg(d[0], "reserve")["detail"])
         self.assertIn("--user-reserve-mib (1800)", seg(d[0], "reserve")["detail"])
 
     def test_the_reserve_path_charges_user_reserve_in_the_floor_where_no_booked_rest_exists(self):
@@ -722,7 +722,7 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
         self.check_d_bar(r1, dc, av, profile="nextflash", reserve="1800,1400,1400")
         for x0, b1, res in zip(b0, r1, (1800, 1400, 1400)):
             self.assertAlmostEqual(x0 - b1["budget_mib"], res, delta=7.01)                    # um genau die Reserve (Rundung auf 8)
-        self.assertIn("Nutzerreserve 1800", seg(r1[0], "reserve")["detail"])
+        self.assertIn("user reserve 1800", seg(r1[0], "reserve")["detail"])
 
     def test_d_phase_flip_and_d_only_foreign_plus_nontorch_is_dc(self):
         fo, nt = (1446, 896, 894), (1981, 528, 524)
@@ -782,7 +782,7 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
 
     def test_the_unpriced_inputs_are_named_in_the_budget_tooltip(self):
         t = seg(nf()["phases"]["D"]["bars"][1], "reserve")["detail"]
-        for word in ("NICHT GERECHNET", "Treiber-Carve", "Korridor-Boden", "Korridor-Pass"):
+        for word in ("NOT CALCULATED", "Driver carve", "measured corridor floor", "Corridor pass"):
             self.assertIn(word, t)
 
     def test_d_phase_explicit_budget_is_taken_as_asked_and_the_rest_is_available_minus_budget(self):
@@ -832,7 +832,7 @@ class TestLauncherFormulaForEveryPhaseAndForm(unittest.TestCase):
         self.assertIsNone(r["phases"]["P"]["context_floor_tokens"])
         self.assertNotIn("context_floor_tokens", r["phases"]["D"])
         # P: Hinweiszeile -> D: Hinweiszeile
-        self.assertTrue(any("Union-Image von D" in h for h in r["hints"]) and any("D-Seite" in h for h in r["hints"]))
+        self.assertTrue(any("union image of D" in h for h in r["hints"]) and any("D side" in h for h in r["hints"]))
 
 
 if __name__ == "__main__":

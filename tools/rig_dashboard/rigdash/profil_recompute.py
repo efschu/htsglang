@@ -145,14 +145,14 @@ def build_request(body: Mapping[str, Any], *, hardware: Mapping[str, Any], model
     """Anfrage an ``profile_couplings.run`` aus dem Körper der Route."""
     what = str(body.get("what") or "bars")
     if what not in WHAT:
-        raise RecomputeError("what muss eines von %s sein" % ", ".join(WHAT))
+        raise RecomputeError("what must be one of %s" % ", ".join(WHAT))
     doc = body.get("doc", {})
     if not isinstance(doc, dict):
-        raise RecomputeError("doc muss ein JSON-Objekt sein")
+        raise RecomputeError("doc must be a JSON object")
     settings = body.get("settings", {})
     phases = body.get("phases")
     if not isinstance(settings, dict) or (phases is not None and not isinstance(phases, dict)):
-        raise RecomputeError("settings und phases müssen JSON-Objekte sein")
+        raise RecomputeError("settings and phases must be JSON objects")
     req: Dict[str, Any] = {"what": what, "hardware": hardware, "model": model, "settings": settings, "server_args": args_of(doc)}
     if phases:
         req["phases"] = phases
@@ -224,9 +224,9 @@ class CouplingsService:
             return None
         self._stop()
         if not self.tree_python or not os.path.isdir(self.tree_python):
-            return "kein Planer-Baum mit planner/profile_couplings.py (KARTENPLAN_TREE bzw. install_510.sh)"
+            return "no planner tree with planner/profile_couplings.py (KARTENPLAN_TREE or install_510.sh)"
         if not os.path.isfile(self.python):
-            return "Python der sglang-Umgebung fehlt: %s (RIGDASH_COUPLINGS_PYTHON)" % self.python
+            return "Python of the sglang environment is missing: %s (RIGDASH_COUPLINGS_PYTHON)" % self.python
 
         def spawn(cmd: List[str]) -> Optional[str]:
             try:
@@ -244,18 +244,18 @@ class CouplingsService:
             self.prefix_fallback = True
             line = spawn([self.python, self.worker])
         if self._proc is None:
-            return "Kopplungs-Worker startet nicht (Befehl nicht startbar)"
+            return "Couplings worker does not start (command cannot be started)"
         if not line:
             self._stop()
-            return "Kopplungs-Worker startet nicht (Zeitüberschreitung oder sofort beendet)"
+            return "Couplings worker does not start (timeout or exited at once)"
         try:
             hello = json.loads(line)
         except ValueError:
             self._stop()
-            return "Kopplungs-Worker meldet sich ohne JSON"
+            return "Couplings worker answers without JSON"
         if not hello.get("ok"):
             self._stop()
-            return str(hello.get("error") or "Kopplungs-Worker nicht bereit")
+            return str(hello.get("error") or "Couplings worker not ready")
         return None
 
     # ------------------------------------------------------------------ Anfrage
@@ -271,15 +271,15 @@ class CouplingsService:
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 self._stop()
-                return {"ok": False, "error": "Kopplungs-Worker ist beendet (wird bei der nächsten Eingabe neu gestartet)"}
+                return {"ok": False, "error": "Couplings worker has exited (restarted at the next input)"}
             while True:
                 line = self._readline(self.timeout_s)
                 if line is None:
                     self._stop()
-                    return {"ok": False, "error": "Kopplungsrechnung nicht fertig nach %.0f s (Worker neu gestartet)" % self.timeout_s}
+                    return {"ok": False, "error": "Couplings calculation not finished after %.0f s (worker restarted)" % self.timeout_s}
                 if line == "":
                     self._stop()
-                    return {"ok": False, "error": "Kopplungs-Worker ist während der Rechnung gestorben"}
+                    return {"ok": False, "error": "Couplings worker died during the calculation"}
                 try:
                     res = json.loads(line)
                 except ValueError:
@@ -294,7 +294,7 @@ class CouplingsService:
         res = self.request({"what": "topology", "n": int(n)})
         if res.get("ok"):
             return {"ok": True, "refused": res.get("refused")}
-        return {"ok": False, "error": str(res.get("error") or "unbekannter Fehler")}
+        return {"ok": False, "error": str(res.get("error") or "unknown error")}
 
     def close(self) -> None:
         with self._lock:

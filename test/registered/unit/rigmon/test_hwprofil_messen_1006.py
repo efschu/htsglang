@@ -219,7 +219,7 @@ class TestBar1Run(CustomTestCase):
         out = bp._spawn_all([[sys.executable, "-c", "import time;time.sleep(60)"]], dict(os.environ), 2.0)
         self.assertLess(time.time() - t0, 30)
         self.assertEqual(out[0][0], 124)
-        self.assertIn("Zeitüberschreitung", out[0][2])
+        self.assertIn("timeout after", out[0][2])
 
 
 class TestCardProbeBar1Wiring(CustomTestCase):
@@ -356,7 +356,7 @@ class TestHostLatencyIsTheMedian(CustomTestCase):
         c0 = next(c for c in doc["cards"] if c["uuid"] == U0)
         n = c0["h2d"]["lat_us"]
         self.assertEqual((n["v"], n["src"]), (12.5, hp.SRC_MEASURED))
-        self.assertIn("Median", n["note"])
+        self.assertIn("median", n["note"])
         self.assertIn("9.5", n["note"])
         self.assertEqual(hp.validate(doc), [])
 
@@ -440,7 +440,7 @@ class TestProfileBar1Column(CustomTestCase):
         self.assertEqual(doc["bar1"]["pairs_measured"], 5)
         self.assertFalse(doc["bar1"]["complete"])
         self.assertTrue(doc["bar1"]["measured"])
-        self.assertIn("5 von 6", doc["bar1"]["note"])
+        self.assertIn("5 of 6", doc["bar1"]["note"])
         self.assertEqual(hp.validate(doc), [])
         # the step RAN and said why: final, "Hardwareprofil messen" does not stay lit for it
         self.assertNotIn("bar1", doc["unmeasured"])
@@ -464,7 +464,7 @@ class TestProfileBar1Column(CustomTestCase):
         self.assertTrue(doc["measure_needed"])
         for l in self._bar1(doc).values():
             self.assertIsNone(l["gbs"]["v"])
-            self.assertIn("nicht gemessen", l["gbs"]["note"])
+            self.assertIn("not measured", l["gbs"]["note"])
         self.assertIn("NOT MEASURED", doc["bar1"]["note"])
         self.assertFalse(doc["bar1"]["measured"])
 
@@ -578,7 +578,7 @@ class TestNativeW4A4(CustomTestCase):
         self.assertIs(fp4_utils.FP4_GEMM_RUNNER_BACKEND, before)
 
     def test_the_row_is_in_the_view_and_the_formats_list(self):
-        self.assertIn(("nvfp4_w4a4", "TFLOPS", "NVFP4 W4A4 (nativ)"), hp.COMPUTE_FORMATS)
+        self.assertIn(("nvfp4_w4a4", "TFLOPS", "NVFP4 W4A4 (native)"), hp.COMPUTE_FORMATS)
         self.assertIn("nvfp4_w4a4", hp.PROBE_FORMATS)
 
     def test_only_the_sm120_card_gets_the_row_filled_the_3080s_keep_their_reason(self):
@@ -609,7 +609,7 @@ class TestNativeW4A4(CustomTestCase):
         n = next(c for c in doc["cards"] if c["uuid"] == U0)["compute"]["nvfp4_w4a4"]
         self.assertIsNone(n["v"])
         self.assertEqual(n["src"], hp.SRC_NONE)
-        self.assertIn("verworfen", n["note"])
+        self.assertIn("discarded", n["note"])
         self.assertEqual(hp.validate(doc), [])
 
     def test_a_probe_from_before_the_row_leaves_it_an_open_gap(self):
@@ -798,7 +798,7 @@ class TestPcieLink(CustomTestCase):
         self.assertAlmostEqual(k["h2d_pct"]["v"], 82.5, places=1)       # 6.5 / 7.88, NOT 6.5 / 31.51
         self.assertAlmostEqual(k["d2h_pct"]["v"], 83.8, places=1)
         self.assertEqual(k["h2d_pct"]["src"], hp.SRC_ESTIMATED)         # a calculation, labelled as one
-        self.assertIn("Rechnung", k["h2d_pct"]["note"])
+        self.assertIn("calculation", k["h2d_pct"]["note"])
         self.assertEqual(hp.validate(doc), [])
 
     def test_a_probe_without_link_fields_shows_the_link_as_nicht_gemessen_with_reason_and_keeps_the_button_lit(self):
@@ -1066,8 +1066,8 @@ class TestD2DTable(CustomTestCase):
         doc = self._doc()
         self.assertEqual(doc["d2d"]["headline"], "barlink_bar1")
         self.assertEqual([c["key"] for c in doc["d2d"]["columns"]], ["barlink_bar1", "nccl", "host_staging"])
-        self.assertIn("Betriebsweg", doc["d2d"]["columns"][0]["label"])
-        self.assertIn("Fallback, nicht der Betriebsweg", doc["d2d"]["columns"][2]["label"])
+        self.assertIn("operating path", doc["d2d"]["columns"][0]["label"])
+        self.assertIn("fallback, not the operating path", doc["d2d"]["columns"][2]["label"])
         self.assertEqual(len(doc["d2d"]["pairs"]), 6)
 
     def test_without_a_bar1_measurement_the_headline_is_nicht_gemessen_even_if_staging_and_nccl_are_measured(self):
@@ -1119,7 +1119,7 @@ class TestD2DTable(CustomTestCase):
         doc = self._doc(bar1=[])
         self.assertEqual(len(doc["unmeasured"]["nccl"]), 6)
         self.assertTrue(doc["measure_needed"])
-        self.assertIn("nicht gemessen", doc["d2d"]["pairs"][0]["nccl"]["gbs"]["note"])
+        self.assertIn("not measured", doc["d2d"]["pairs"][0]["nccl"]["gbs"]["note"])
 
     def test_a_pre_pipelined_probe_shows_its_number_as_the_serial_one_and_the_pipelined_rate_as_not_measured(self):
         old = [{"src_uuid": a, "dst_uuid": b, "bandwidth_gbs": 6.9, "latency_us": 21.0, "transport": cp.HOST_STAGING,
@@ -1127,7 +1127,7 @@ class TestD2DTable(CustomTestCase):
         doc = self._doc(stage=old)
         r = doc["d2d"]["pairs"][0]["host_staging"]
         self.assertIsNone(r["gbs"]["v"])
-        self.assertIn("pipelined nicht gemessen", r["gbs"]["note"])
+        self.assertIn("pipelined not measured", r["gbs"]["note"])
         self.assertEqual(r["gbs_serial"]["v"], 6.9)                                    # never relabelled as pipelined
 
     def test_no_bar1_number_ever_comes_from_the_nccl_or_the_staging_pairs(self):
@@ -1146,10 +1146,10 @@ class TestD2DTable(CustomTestCase):
         for k, v in hp.D2D_DEFINITIONS.items():
             self.assertTrue(v, k)
         # the definitions say what each latency IS, in the plain words the reader needs
-        self.assertIn("SENDERseite", hp.D2D_DEFINITIONS["barlink_bar1"])
-        self.assertIn("keine Zustellzeit", hp.D2D_DEFINITIONS["barlink_bar1"])
-        self.assertIn("Rückweg / 2", hp.D2D_DEFINITIONS["nccl"])
-        self.assertIn("seriell", hp.D2D_DEFINITIONS["host_staging"])
+        self.assertIn("SENDER side", hp.D2D_DEFINITIONS["barlink_bar1"])
+        self.assertIn("no delivery time", hp.D2D_DEFINITIONS["barlink_bar1"])
+        self.assertIn("round trip / 2", hp.D2D_DEFINITIONS["nccl"])
+        self.assertIn("serial", hp.D2D_DEFINITIONS["host_staging"])
 
 
 class TestSecondLatencyAndReferences(CustomTestCase):
@@ -1172,8 +1172,8 @@ class TestSecondLatencyAndReferences(CustomTestCase):
         self.assertEqual((r["barlink_bar1"]["lat_us"]["v"], r["barlink_bar1"]["lat_dev_us"]["v"]), (10.5, 1.25))
         self.assertEqual((r["nccl"]["lat_us"]["v"], r["nccl"]["lat_dev_us"]["v"]), (31.0, 14.0))
         self.assertIn("KEIN Rundlauf", r["barlink_bar1"]["lat_dev_us"]["note"])
-        self.assertIn("Start", r["barlink_bar1"]["lat_us"]["note"])
-        self.assertIn("keine Wire-Latenz", r["barlink_bar1"]["lat_us"]["note"])
+        self.assertIn("start", r["barlink_bar1"]["lat_us"]["note"])
+        self.assertIn("no wire latency", r["barlink_bar1"]["lat_us"]["note"])
         self.assertEqual(hp.validate(doc), [])
 
     def test_a_probe_without_the_second_latency_says_so_and_shows_no_number(self):
@@ -1188,7 +1188,7 @@ class TestSecondLatencyAndReferences(CustomTestCase):
     def test_the_references_carry_the_measured_values_with_file_and_line_and_no_comparison(self):
         refs = hp.D2D_REFERENCES
         blob = " ".join(r["what"] + " " + r["source"] for r in refs)
-        for needle in ("28,22", "323,2", "6,02", "7,30", "37,41", "45,59", "0,08 ms", "0,53-0,80", "SHM/direct/direct", "32,4", "361,3"):
+        for needle in ("28.22", "323.2", "6.02", "7.30", "37.41", "45.59", "0.08 ms", "0.53-0.80", "SHM/direct/direct", "32.4", "361.3"):
             self.assertIn(needle, blob, needle)
         for src in ("barlink_bar1.py:75-83", "roundbench_fixed_0907.out:19", "bench_host_transport.py:10-12", "ANALYSE_732_bar1_repricing.md:58-64",
                     "27b-nvfp4-dual.env:122", "nccl_transport.json", "hw_profile-9a5e9b49b7dc.json"):
@@ -1229,7 +1229,7 @@ class TestSecondLatencyAndReferences(CustomTestCase):
         self.assertEqual(len(nccl), 2)                                   # measured direction + the mirrored one
         want = time.strftime("%d.%m.%Y", time.localtime(NOW - 100))
         for l in nccl:
-            self.assertEqual(l["transport_label"], f"NCCL über Host (Stufe-0-Probe, {want})")
+            self.assertEqual(l["transport_label"], f"NCCL via host (stage-0 probe, {want})")
             self.assertNotIn("p2p", l["transport_label"].lower())
         self.assertEqual({l["gbs"]["src"] for l in nccl}, {hp.SRC_MEASURED, hp.SRC_ESTIMATED})
 

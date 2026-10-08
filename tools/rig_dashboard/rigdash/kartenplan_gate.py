@@ -22,7 +22,7 @@ class GateUnavailable(RuntimeError):
 
 def _load(name: str, path: str):
     if not os.path.isfile(path):
-        raise GateUnavailable("%s fehlt im Planer-Baum (%s)" % (os.path.basename(path), path))
+        raise GateUnavailable("%s is missing in the planner tree (%s)" % (os.path.basename(path), path))
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod          # @dataclass löst Typen über sys.modules[__module__] auf
@@ -68,8 +68,8 @@ def gate(ci, tp, rows: List[dict]) -> dict:
     res["order"] = [{"nvml_index": ci.props_of(o).nvml_index, "class": ci.class_label(o)} for o in ordered]
     msg = ci.uncalibrated_message(
         ordered, list(ci.REFERENCE_INVENTORY),
-        ["D_FIXED_MIB / D_AWAKE_REST / P_OVERSHOOT / P_ACTIVATION (positionale Rang-Records)", "Dormant-Residue W19",
-         "P-Chunk-Modell", "PP-Schnitt-Stufenmodell"], "the release record set")
+        ["D_FIXED_MIB / D_AWAKE_REST / P_OVERSHOOT / P_ACTIVATION (positional rank records)", "Dormant-Residue W19",
+         "P chunk model", "PP cut stage model"], "the release record set")
     res["calibration"] = {"ok": msg is None, "code": ci.CODE_UNCALIBRATED, "message": msg}
     try:
         t = tp.plan_topology(len(rows))

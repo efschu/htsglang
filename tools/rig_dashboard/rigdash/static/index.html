@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rig-Dashboard</title>
+<title>Rig dashboard</title>
 <link rel="icon" type="image/svg+xml" href="mark.svg">
 <link rel="stylesheet" href="uplot.min.css">
 <style>
@@ -560,163 +560,163 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
 </head>
 <body>
 <header>
-  <a class="brand" href="./" aria-label="fLLiper Rig-Dashboard">
+  <a class="brand" href="./" aria-label="fLLiper rig dashboard">
     <picture class="logo-full"><source srcset="logo-dark.svg" media="(prefers-color-scheme: dark)"><img src="logo.svg" alt="fLLiper" height="30"></picture>
     <img class="logo-mark" src="mark.svg" alt="fLLiper" height="30" width="30">
   </a>
-  <h1 id="title">Rig-Dashboard</h1>
-  <span class="sub" id="sub">verbinde&hellip;</span>
-  <label class="livebox" title="Expertenansicht (Nutzer 01.10.): alle Messdetails, Quellen und Instrumente; gemerkt in diesem Browser"><input type="checkbox" id="expert"> Expertenansicht</label>
-  <label class="livebox"><input type="checkbox" id="live-pause"> Live-Update pausieren <span class="note" id="pausenote"></span></label>
+  <h1 id="title">Rig dashboard</h1>
+  <span class="sub" id="sub">connecting&hellip;</span>
+  <label class="livebox" title="Expert view (user 01.10.): all measurement details, sources and instruments; remembered in this browser"><input type="checkbox" id="expert"> Expert view</label>
+  <label class="livebox"><input type="checkbox" id="live-pause"> Pause live update <span class="note" id="pausenote"></span></label>
   <nav>
     <!--DEV:BEGIN-->
-    <a id="gpuqlink" class="lan" href="#" target="_blank" rel="noopener">GPU-Fensterplan</a>
-    <a id="weg2link" class="lan" href="weg2" target="_blank" rel="noopener">Startzeile</a>
-    <a id="plannerlink" class="lan" href="#" target="_blank" rel="noopener">Planer (Tafeln, Wizard)</a>
-    <span id="lannote" class="muted" style="display:none">Planer, GPU-Fensterplan, Startzeile: nur im LAN</span>
+    <a id="gpuqlink" class="lan" href="#" target="_blank" rel="noopener">GPU window plan</a>
+    <a id="weg2link" class="lan" href="weg2" target="_blank" rel="noopener">Launch line</a>
+    <a id="plannerlink" class="lan" href="#" target="_blank" rel="noopener">Planner (boards, wizard)</a>
+    <span id="lannote" class="muted" style="display:none">Planner, GPU window plan, launch line: LAN only</span>
     <!--DEV:END-->
-    <a id="grafanalink" class="lan" href="#" target="_blank" rel="noopener" title="Verläufe aus VictoriaMetrics (nur im LAN)">Grafana</a>
+    <a id="grafanalink" class="lan" href="#" target="_blank" rel="noopener" title="History from VictoriaMetrics (LAN only)">Grafana</a>
     <a href="api/live" target="_blank" rel="noopener">JSON</a>
   </nav>
 </header>
-<!-- Tabs (Nutzer 01.10.: "Tabs und einklappbare Bereiche, eine schlaue Ordnung"); Auswahl in localStorage und #hash -->
-<nav class="tabbar" id="tabbar" role="tablist" aria-label="Bereiche">
-  <button type="button" role="tab" data-tab="ueberblick">Überblick</button>
+<!-- Tabs (user 01.10.: "tabs and collapsible areas, a clever order"); selection in localStorage and #hash -->
+<nav class="tabbar" id="tabbar" role="tablist" aria-label="Sections">
+  <button type="button" role="tab" data-tab="ueberblick">Overview</button>
   <button type="button" role="tab" data-tab="boots">Boots</button>
-  <button type="button" role="tab" data-tab="verlauf">Verlauf</button>
-  <button type="button" role="tab" data-tab="sitzungen">Sitzungen</button>
-  <button type="button" role="tab" data-tab="karten">Karten</button>
-  <button type="button" role="tab" data-tab="profil">Profil-Planer</button>
+  <button type="button" role="tab" data-tab="verlauf">History</button>
+  <button type="button" role="tab" data-tab="sitzungen">Sessions</button>
+  <button type="button" role="tab" data-tab="karten">Cards</button>
+  <button type="button" role="tab" data-tab="profil">Profile planner</button>
   <!--DEV:BEGIN-->
-  <button type="button" role="tab" data-tab="entwicklung">Entwicklung <span class="cnt" id="tab-dev-cnt"></span></button>
+  <button type="button" role="tab" data-tab="entwicklung">Development <span class="cnt" id="tab-dev-cnt"></span></button>
   <!--DEV:END-->
 </nav>
 <main>
-  <!-- Oberer Teil: Geschwindigkeit, Effizienz, Statistik (auch in der veröffentlichten fLLiper-Ausgabe) -->
+  <!-- Upper part: speed, efficiency, statistics (also in the published fLLiper edition) -->
   <div class="chips x" id="chips"></div>
   <div class="tab" id="tab-ueberblick" role="tabpanel">
     <div id="overview"></div>
     <div class="cardstrip" id="cardstrip"></div>
-    <div class="vtiles x" id="vmtiles" aria-label="aus VictoriaMetrics"></div>
+    <div class="vtiles x" id="vmtiles" aria-label="from VictoriaMetrics"></div>
   </div>
   <div class="tab" id="tab-boots" role="tabpanel" hidden>
   <div id="boots"></div>
   </div>
   <div class="tab" id="tab-verlauf" role="tabpanel" hidden>
-  <section class="card" id="verlauf" aria-label="Verlauf je Modell">
-    <div class="vl-bar"><h2>Verlauf</h2><span class="seg" id="vl-model"></span><span class="seg" id="vl-range"></span>
-      <span class="vl-note" id="vl-note">lade&hellip;</span></div>
+  <section class="card" id="verlauf" aria-label="History per model">
+    <div class="vl-bar"><h2>History</h2><span class="seg" id="vl-model"></span><span class="seg" id="vl-range"></span>
+      <span class="vl-note" id="vl-note">loading&hellip;</span></div>
     <div class="vtiles" id="vl-tiles"></div>
     <div class="ph-head" id="vl-legend" style="font-size:12px;color:var(--text-2);display:flex;flex-wrap:wrap;gap:4px 12px;margin:-4px 0 10px"></div>
     <div class="vgrid">
-      <div class="vp w2"><h3><span>TTFT der Nutzer <span class="muted">s &middot; Ankunft an der Front &rarr; erster Inhalt von D, Mittel der Anfragen je Eimer &middot; aus VictoriaMetrics (PromQL)</span></span><span id="vl-s-ttft"></span></h3><div class="u" id="vl-c-ttft"></div></div>
-      <div class="vp"><h3><span>Prefill-Durchsatz <span class="muted">tok/s &middot; P und D, je Chunk</span></span><span id="vl-s-pre"></span></h3><div class="u" id="vl-c-pre"></div></div>
-      <div class="vp"><h3><span>Decode-Durchsatz <span class="muted">tok/s &middot; alle Streams und je Stream</span></span><span id="vl-s-dec"></span></h3><div class="u" id="vl-c-dec"></div></div>
-      <div class="vp"><h3><span>Input-Tokens: aus Cache / neu gerechnet <span class="muted">tok/s, gestapelt &middot; Übergabe P&rarr;D gestrichelt, nie Cache</span></span><span id="vl-s-cache"></span></h3><div class="u" id="vl-c-cache"></div></div>
-      <div class="vp"><h3><span>KV-Cache-Belegung <span class="muted">% der KV-Token je Gruppe</span></span><span id="vl-s-kv"></span></h3><div class="u" id="vl-c-kv"></div></div>
-      <div class="vp w2"><h3><span>Flipzeit je Flip <span class="muted">s &middot; P&rarr;D: letzter P-Chunk fertig &rarr; erstes Decode-Token erzeugt &middot; D&rarr;P: letztes Decode-Token erzeugt &rarr; erster Prefill-Chunk beginnt zu rechnen &middot; nur gez&auml;hlte Flips (Nutzer 06.10.)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
+      <div class="vp w2"><h3><span>User TTFT <span class="muted">s &middot; arrival at the front &rarr; first content from D, mean of the requests per bucket &middot; from VictoriaMetrics (PromQL)</span></span><span id="vl-s-ttft"></span></h3><div class="u" id="vl-c-ttft"></div></div>
+      <div class="vp"><h3><span>Prefill throughput <span class="muted">tok/s &middot; P and D, per chunk</span></span><span id="vl-s-pre"></span></h3><div class="u" id="vl-c-pre"></div></div>
+      <div class="vp"><h3><span>Decode throughput <span class="muted">tok/s &middot; all streams and per stream</span></span><span id="vl-s-dec"></span></h3><div class="u" id="vl-c-dec"></div></div>
+      <div class="vp"><h3><span>Input tokens: from cache / recomputed <span class="muted">tok/s, stacked &middot; handoff P&rarr;D dashed, never cache</span></span><span id="vl-s-cache"></span></h3><div class="u" id="vl-c-cache"></div></div>
+      <div class="vp"><h3><span>KV cache occupancy <span class="muted">% of the KV tokens per group</span></span><span id="vl-s-kv"></span></h3><div class="u" id="vl-c-kv"></div></div>
+      <div class="vp w2"><h3><span>Flip time per flip <span class="muted">s &middot; P&rarr;D: last P chunk done &rarr; first decode token produced &middot; D&rarr;P: last decode token produced &rarr; first prefill chunk starts computing &middot; counted flips only (user 06.10.)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
     </div>
     <div class="vl-grafana" id="vl-grafana"></div>
   </section>
   </div>
   <div class="tab" id="tab-sitzungen" role="tabpanel" hidden>
   <section class="card" id="sess-card">
-    <h2>Sitzungen <span class="muted">je Konversation bzw. Agentensitzung mit mehreren Turns (Nutzer 01.10. ~08:30Z)</span></h2>
+    <h2>Sessions <span class="muted">per conversation or agent session with several turns (user 01.10. ~08:30Z)</span></h2>
     <div id="sessions"></div>
   </section>
   </div>
   <div class="tab" id="tab-karten" role="tabpanel" hidden>
   <section class="card" id="gpus-card">
-    <h2>Karten <span class="muted">NVML &middot; jetzt und Verlauf (Zeitraum wie oben)</span></h2>
+    <h2>Cards <span class="muted">NVML &middot; now and history (period as above)</span></h2>
     <div class="vtiles" id="hw-tiles"></div>
     <div id="gpus"></div>
     <div class="vgrid" style="margin-top:12px">
-      <div class="vp w2"><h3><span>Leistungsaufnahme (Power draw) <span class="muted">W &middot; Summe aller Karten, darunter je Karte</span></span><span id="hw-s-power"></span></h3><div class="u" id="hw-c-power"></div></div>
-      <div class="vp"><h3><span>GPU-Temperatur <span class="muted">&deg;C &middot; Kern (Hotspot per NVML nicht lesbar)</span></span><span id="hw-s-temp"></span></h3><div class="u" id="hw-c-temp"></div></div>
-      <div class="vp"><h3><span>SM-Takt <span class="muted">MHz</span></span><span id="hw-s-clock"></span></h3><div class="u" id="hw-c-clock"></div></div>
-      <div class="vp x"><h3><span>Speichertakt <span class="muted">MHz &middot; NVML CLOCK_MEM</span></span><span id="hw-s-memclk"></span></h3><div class="u" id="hw-c-memclk"></div></div>
-      <div class="vp w2"><h3><span>PCIe RX / TX je Karte <span class="muted">GB/s &middot; RX durchgezogen, TX gestrichelt, unten je Karte beide Werte &middot; NVML im 1-s-Takt, aus VictoriaMetrics</span></span><span id="hw-s-pcie"></span></h3><div class="u" id="hw-c-pcie"></div></div>
-      <div class="vp w2"><h3><span>Host: CPU &amp; Speicher <span class="muted">%</span></span><span id="hw-s-host"></span></h3><div class="u" id="hw-c-host"></div></div>
+      <div class="vp w2"><h3><span>Power draw <span class="muted">W &middot; sum of all cards, below it per card</span></span><span id="hw-s-power"></span></h3><div class="u" id="hw-c-power"></div></div>
+      <div class="vp"><h3><span>GPU temperature <span class="muted">&deg;C &middot; core (hotspot not readable via NVML)</span></span><span id="hw-s-temp"></span></h3><div class="u" id="hw-c-temp"></div></div>
+      <div class="vp"><h3><span>SM clock <span class="muted">MHz</span></span><span id="hw-s-clock"></span></h3><div class="u" id="hw-c-clock"></div></div>
+      <div class="vp x"><h3><span>Memory clock <span class="muted">MHz &middot; NVML CLOCK_MEM</span></span><span id="hw-s-memclk"></span></h3><div class="u" id="hw-c-memclk"></div></div>
+      <div class="vp w2"><h3><span>PCIe RX / TX per card <span class="muted">GB/s &middot; RX solid, TX dashed, below per card both values &middot; NVML at 1 s tick, from VictoriaMetrics</span></span><span id="hw-s-pcie"></span></h3><div class="u" id="hw-c-pcie"></div></div>
+      <div class="vp w2"><h3><span>Host: CPU &amp; memory <span class="muted">%</span></span><span id="hw-s-host"></span></h3><div class="u" id="hw-c-host"></div></div>
     </div>
   </section>
   </div>
   <div class="tab" id="tab-profil" role="tabpanel" hidden>
-    <section class="card" id="pf-card" aria-label="Profil-Editor">
-      <h2>Profil-Planer <span class="muted">ein Serverprofil laden, jeden Wert erklärt bearbeiten, Karten und Plan dazu sehen, prüfen, speichern &middot; erstellt nur, startet nichts &middot; nur im LAN</span></h2>
-      <div id="pf-root"><div class="muted">lädt &hellip;</div></div>
+    <section class="card" id="pf-card" aria-label="Profile editor">
+      <h2>Profile planner <span class="muted">load a server profile, edit every value with an explanation, see cards and plan alongside, check, save &middot; only creates, starts nothing &middot; LAN only</span></h2>
+      <div id="pf-root"><div class="muted">loading &hellip;</div></div>
     </section>
     <!--DEV:BEGIN-->
-    <section class="card" id="kp-card" aria-label="Plan für andere Karten">
+    <section class="card" id="kp-card" aria-label="Plan for other cards">
       <details id="kp-fold" class="pf-fold">
-        <summary><b>Plan für andere Karten</b> <span class="muted">Kartenplaner &middot; dasselbe Modell auf anderen oder mehr Karten (auch solchen, die wir nicht haben), Zahlen aus unserem Planer und seinen Aufzeichnungen &middot; nichts wird gestartet</span></summary>
-        <div class="muted pf-note">Die Balken im Profil oben gelten für das geladene Profil auf der gemessenen Hardware dieses Rigs. Hier wählst du Karten frei und siehst den Plan dazu.</div>
-        <div id="kp-root"><div class="muted">lädt &hellip;</div></div>
+        <summary><b>Plan for other cards</b> <span class="muted">card planner &middot; the same model on other or more cards (including ones we do not have), figures from our planner and its recordings &middot; nothing is started</span></summary>
+        <div class="muted pf-note">The bars in the profile above apply to the loaded profile on the measured hardware of this rig. Here you choose cards freely and see the plan for them.</div>
+        <div id="kp-root"><div class="muted">loading &hellip;</div></div>
       </details>
     </section>
     <!--DEV:END-->
   </div>
   <!--DEV:BEGIN-->
   <div class="tab" id="tab-entwicklung" role="tabpanel" hidden>
-  <div class="devhead" id="dev-head"><h2>Entwicklungsstand</h2><span class="muted">nur im Rig-Dashboard; die veröffentlichte fLLiper-Ausgabe (<span class="mono">--edition release</span>) liefert diesen Teil nicht aus &middot; Bereiche auf-/zuklappen, der Zustand bleibt gemerkt</span></div>
+  <div class="devhead" id="dev-head"><h2>Development status</h2><span class="muted">rig dashboard only; the published fLLiper edition (<span class="mono">--edition release</span>) does not serve this part &middot; sections can be expanded/collapsed, the state is remembered</span></div>
   <details class="card fold" id="launch-card">
-    <summary><h2>Startflags &amp; ENV <span class="muted">je Modell, laufender bzw. letzter Boot &middot; Container / Front / P / D &middot; P&harr;D-Vergleich</span><span class="ipcsrc" title="state.json: groups.{P,D}.launch, launch.front, launch.container">state.json</span></h2></summary>
+    <summary><h2>Launch flags &amp; ENV <span class="muted">per model, running or last boot &middot; container / front / P / D &middot; P&harr;D comparison</span><span class="ipcsrc" title="state.json: groups.{P,D}.launch, launch.front, launch.container">state.json</span></h2></summary>
     <div class="lf-tools">
-      <input type="search" id="lf-filter" placeholder="Filter über alle Flags und ENV (Name oder Wert)" autocomplete="off">
-      <span class="lf-legend lf"><span class="d-differ">P&ne;D</span><span class="d-onlyp">nur P</span><span class="d-onlyd">nur D</span></span>
+      <input type="search" id="lf-filter" placeholder="Filter across all flags and ENV (name or value)" autocomplete="off">
+      <span class="lf-legend lf"><span class="d-differ">P&ne;D</span><span class="d-onlyp">P only</span><span class="d-onlyd">D only</span></span>
       <span class="muted" id="lf-note"></span>
     </div>
     <div id="launchbox"></div>
   </details>
   <details class="card fold" id="prod-card" open>
-    <summary><h2>Features Soll/Ist <span class="muted">Produkt-Features je Modell: Soll (messbar) &middot; Ist nur mit Beleg, sonst &bdquo;unbelegt&ldquo; &middot; <span class="stale-key">gelb</span> = Beleg &auml;lter als der letzte Boot des Modells, neu messen &middot; Wert im aktuellen Boot aus live.py/state.json &middot; Bausteine = Commits/Fixes darunter</span></h2></summary>
+    <summary><h2>Features target/actual <span class="muted">product features per model: target (measurable) &middot; actual only with evidence, otherwise &ldquo;unverified&rdquo; &middot; <span class="stale-key">yellow</span> = evidence older than the last boot of the model, measure again &middot; value in the current boot from live.py/state.json &middot; building blocks = commits/fixes below</span></h2></summary>
     <div id="prod-stand"></div>
     <div id="prod"></div>
   </details>
   <details class="card fold" id="feat-card">
-    <summary><h2>Bausteine <span class="muted">Commits/Fixes je Modell: je Modell: fertig &middot; im Image (git-Vorfahr / patch-id / Betreff gegen die Image-REV, hier gerechnet) &middot; aktiv (state.json launch, sonst Profil) &middot; Gewinn &middot; Begr&uuml;ndung wenn aus</span>
+    <summary><h2>Building blocks <span class="muted">commits/fixes per model: done &middot; in the image (git ancestor / patch-id / subject against the image REV, computed here) &middot; active (state.json launch, otherwise profile) &middot; gain &middot; reason if off</span>
       </h2></summary>
-    <label class="muted" style="font-size:12px;display:block;margin:-4px 0 8px"><input type="checkbox" id="feat-only-off"> nur &bdquo;im Image, aber aus&ldquo;</label>
+    <label class="muted" style="font-size:12px;display:block;margin:-4px 0 8px"><input type="checkbox" id="feat-only-off"> only &ldquo;in the image, but off&rdquo;</label>
     <div id="feat-new"></div>
     <div id="feat"></div>
   </details>
   <details class="card fold" id="imgchg-card">
-    <summary><h2>Image-&Auml;nderungen <span class="muted">was das laufende Boot-Image je Sitz gegen&uuml;ber seinem Vorg&auml;nger tr&auml;gt, erwartete Wirkung und Stand am Metall</span></h2></summary>
+    <summary><h2>Image changes <span class="muted">what the running boot image carries per seat compared to its predecessor, expected effect and status on the hardware</span></h2></summary>
     <div id="imgchg"></div>
   </details>
   <details class="card fold" id="fold-gpuq" open>
-    <summary><h2>GPU-Fensterplan <span class="muted">gpuq, laufende und wartende Fenster</span></h2></summary>
+    <summary><h2>GPU window plan <span class="muted">gpuq, running and waiting windows</span></h2></summary>
     <div id="gpuq" class="tablewrap"></div>
   </details>
   <details class="card fold" id="fold-history" open>
-    <summary><h2>Letzte Boots <span class="muted">aus den state-Ordnern der letzten 6 h: Kopf, Lebenszyklus, Stopp-Ursache und Zahlen aus state.json, events.jsonl und rankstats</span><span class="ipcsrc">IPC</span></h2></summary>
+    <summary><h2>Recent boots <span class="muted">from the state folders of the last 6 h: header, lifecycle, stop cause and figures from state.json, events.jsonl and rankstats</span><span class="ipcsrc">IPC</span></h2></summary>
     <div id="history" class="tablewrap"></div>
   </details>
   <details class="card fold" id="fold-containers">
-    <summary><h2>Container <span class="muted">Docker auf dem Proxmox-Host (htsglang-*)</span></h2></summary>
+    <summary><h2>Containers <span class="muted">Docker on the Proxmox host (htsglang-*)</span></h2></summary>
     <div id="containers" class="tablewrap"></div>
   </details>
   </div>
   <!--DEV:END-->
   <details class="card note fold" id="fold-instrumente">
-    <summary><h2>Instrumente <span class="muted">woher die Zahlen kommen</span></h2></summary>
-    <p>Alle Zahlen oben kommen aus der Inter-Prozess-Kommunikation, kein Boot-Protokoll wird gelesen (NF-Operator 30.09.):
-    je Boot <span class="mono">state.json</span>, <span class="mono">events.jsonl</span> und je Rang
-    <span class="mono">rankstate/&lt;G&gt;/*.rankstats</span> (kumulative Z&auml;hler, vom Rang alle ~1 s geschrieben);
-    rigdash nimmt jede Sekunde eine Probe und rechnet Raten aus den Deltas. Wo ein Wert kein IPC-Feld hat, steht
-    &bdquo;fehlt in IPC&ldquo; mit dem Schreiber, der ihn liefern m&uuml;sste.</p>
-    <p><b>Prefill tok/s (Rechenrate)</b> = &Delta;<span class="mono">prefill.new_tokens</span> / &Delta;<span class="mono">prefill.compute_ms</span>
-    je Rang; die Kachel zeigt den <b>langsamsten Rang</b>, denn eine PP-Stufe bzw. ein TP-Partner begrenzt jeden Chunk.
-    Das ist Ger&auml;tezeit, also rechen-ehrlich: Leerlauf zwischen Anfragen senkt sie nicht.</p>
-    <p><b>Durchsatz Wandzeit</b> = &Delta;<span class="mono">prefill.new_tokens</span> des ersten Rangs durch die Zeit der Proben
-    mit Arbeit (Leerlauf-Proben z&auml;hlen nicht); <b>jetzt</b> = die letzte Probe.</p>
-    <p><b>Decode tok/s</b> = &Delta;<span class="mono">decode.tokens</span> (TP0) / &Delta;ts &uuml;ber die Proben mit Arbeit;
-    <b>je Stream</b> = das durch <span class="mono">decode.running</span>; Rechenrate = &Delta;decode.tokens / &Delta;<span class="mono">decode.gpu_ms</span>.</p>
-    <p>Das Dashboard schickt keinem Modell eine Anfrage au&szlig;er <span class="mono">GET /weg2/state</span> alle 10 s.
-    VictoriaMetrics (:8428) holt <span class="mono">/metrics</span> der Front alle 15 s (Nutzer-Order 01.10.: Zeitreihen-DB).</p>
-    <p><b>TTFT</b> = Ankunft an der Front &rarr; erster Inhalt von D (<span class="mono">LEG2-FIRST-CONTENT</span>), als IPC-Z&auml;hler
-    <span class="mono">state.json front.arrival_seat.ttft_*</span> (NF-Front); der Probennehmer schreibt ihn nach VictoriaMetrics
-    (<span class="mono">weg2_front_ttft_*</span>), die Kachel liest per PromQL. Die 27B-Front hat ihn bis zum Image mit
-    <span class="mono">weg2_ttft_seconds</span> nicht.</p>
+    <summary><h2>Instruments <span class="muted">where the figures come from</span></h2></summary>
+    <p>All figures above come from inter-process communication, no boot log is read (NF operator 30.09.):
+    per boot <span class="mono">state.json</span>, <span class="mono">events.jsonl</span> and per rank
+    <span class="mono">rankstate/&lt;G&gt;/*.rankstats</span> (cumulative counters, written by the rank about every 1 s);
+    rigdash takes a sample every second and computes rates from the deltas. Where a value has no IPC field, it says
+    &ldquo;missing in IPC&rdquo; with the writer that would have to supply it.</p>
+    <p><b>Prefill tok/s (compute rate)</b> = &Delta;<span class="mono">prefill.new_tokens</span> / &Delta;<span class="mono">prefill.compute_ms</span>
+    per rank; the tile shows the <b>slowest rank</b>, because a PP stage or a TP partner limits every chunk.
+    This is device time, hence compute-honest: idle time between requests does not lower it.</p>
+    <p><b>Wall-clock throughput</b> = &Delta;<span class="mono">prefill.new_tokens</span> of the first rank divided by the time of the samples
+    with work (idle samples do not count); <b>now</b> = the last sample.</p>
+    <p><b>Decode tok/s</b> = &Delta;<span class="mono">decode.tokens</span> (TP0) / &Delta;ts over the samples with work;
+    <b>per stream</b> = that divided by <span class="mono">decode.running</span>; compute rate = &Delta;decode.tokens / &Delta;<span class="mono">decode.gpu_ms</span>.</p>
+    <p>The dashboard sends no request to any model except <span class="mono">GET /weg2/state</span> every 10 s.
+    VictoriaMetrics (:8428) fetches <span class="mono">/metrics</span> of the front every 15 s (user order 01.10.: time-series DB).</p>
+    <p><b>TTFT</b> = arrival at the front &rarr; first content from D (<span class="mono">LEG2-FIRST-CONTENT</span>), as IPC counter
+    <span class="mono">state.json front.arrival_seat.ttft_*</span> (NF front); the sampler writes it to VictoriaMetrics
+    (<span class="mono">weg2_front_ttft_*</span>), the tile reads it via PromQL. The 27B front does not have it until the image with
+    <span class="mono">weg2_ttft_seconds</span>.</p>
   </details>
 </main>
 <div class="tip" id="tip"></div>
@@ -737,12 +737,12 @@ const $ = (id) => document.getElementById(id);
 const EDITION = document.documentElement.dataset.edition || "rig";
 const DEV = !!document.getElementById("dev-head");
 const EDITOR_ONLY = document.documentElement.dataset.editorOnly === "1";     // Auftrag 1995: Docker-Image, nur der Profil-Editor
-const PAGE_TITLE = EDITION === "release" ? "fLLiper Dashboard" : "Rig-Dashboard";
+const PAGE_TITLE = EDITION === "release" ? "fLLiper Dashboard" : "Rig dashboard";
 document.getElementById("title").textContent = PAGE_TITLE;
 // DASHBOARD-AUS-IPC (Nutzer 29.09.): what still comes from a log line says so; the rest names its IPC source
-const MISSTAG = (what, title) => `<span class="logsrc" title="${esc(title || "")}">fehlt in IPC${what ? ": " + esc(what) : ""}</span>`;
-const LOGSRC = `<span class="logsrc" title="Kein IPC-Feld fuer diesen Wert; aus einem Log wird nicht gelesen (NF-Operator 30.09.)">fehlt in IPC</span>`;
-const ipcTag = (what) => `<span class="ipcsrc" title="Quelle: IPC (${esc(what)})">${esc(what)}</span>`;
+const MISSTAG = (what, title) => `<span class="logsrc" title="${esc(title || "")}">missing in IPC${what ? ": " + esc(what) : ""}</span>`;
+const LOGSRC = `<span class="logsrc" title="No IPC field for this value; nothing is read from a log (NF operator 30.09.)">missing in IPC</span>`;
+const ipcTag = (what) => `<span class="ipcsrc" title="Source: IPC (${esc(what)})">${esc(what)}</span>`;
 // ipcfields.py (Nutzer 29.09. ~12:00Z): one reader per field -- the IPC value when the boot carries the
 // source, else the log value with its label. The switch is per field, by presence: no deploy waits for a boot.
 const fieldIpc = (b, k) => { const f = (b.fields || {})[k]; return f && f.src === "ipc" ? f : null; };
@@ -757,12 +757,17 @@ const srcOf = (b, ...keys) => {
   const empty = off.filter((k) => F(k).empty), gone = [...off.filter((k) => !F(k).empty), ...part];
   const writers = gone.map((k) => k + ": " + (F(k.split(".")[0]).missing || "?")).join(" | ");
   const leer = empty.length ? ` <span class="ipcsrc" title="${esc(empty.join(", "))}: ${esc(F(empty[0]).empty)}">${esc(F(empty[0]).empty)}</span>` : "";
-  return (gone.length ? (tag ? tag + " " : "") + MISSTAG(gone.join(", "), "Schreiber: " + writers) : tag) + leer;
+  return (gone.length ? (tag ? tag + " " : "") + MISSTAG(gone.join(", "), "Writer: " + writers) : tag) + leer;
 };
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("de-DE", {maximumFractionDigits: d, minimumFractionDigits: d});
+// display names of the German enum values the API delivers (features.json, state words); the value itself stays the CSS/logic key
+const ENUM_EN = {"ja": "yes", "nein": "no", "teilweise": "partial", "unbekannt": "unknown", "an": "on", "aus": "off", "unbelegt": "unverified", "belegt": "verified",
+  "wirkungslos": "ineffective", "erwartet": "expected", "fertig": "done", "fertig+aktiv": "done+active", "im Image aber aus": "in image but off", "Desk": "desk", "offen": "open",
+  "entfällt": "dropped", "am Metall belegt": "verified on hardware", "unterstützt": "supported", "nur Desk": "desk only", "ungültig": "invalid", "ungemessen": "unmeasured"};
+const en = (s) => (s != null && Object.prototype.hasOwnProperty.call(ENUM_EN, s)) ? ENUM_EN[s] : s;
+const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("en-US", {maximumFractionDigits: d, minimumFractionDigits: d});
 const ago = (s) => s == null ? "—" : s < 90 ? Math.round(s) + " s" : s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h";
-const hhmm = (t) => new Date(t * 1000).toLocaleTimeString("de-DE", {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+const hhmm = (t) => new Date(t * 1000).toLocaleTimeString("en-GB", {hour: "2-digit", minute: "2-digit", second: "2-digit"});
 const tip = $("tip");
 
 function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
@@ -817,7 +822,7 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
   const endLbl = last && last[0] >= t1 - 3 * step
     ? `<span class="endv" style="top:${Math.max(7, Math.min(H - 7, y(last[1]))).toFixed(0)}px">${fmt(last[1], digits)}</span>` : "";
   const svg = `<div class="sparkbox"><span class="ymax">${fmt(nice, digits)} ${unit}</span>${hasGap ? `<span class="gapmark${planned ? " planned" : ""}">${planned ? "■" : "✕"} ${esc(opt.gapReason || "Ausfall")} ${hhmm(opt.gapFrom)}</span>` : ""}${hasGap ? "" : endLbl}
-    <svg class="spark" id="${svgId}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" tabindex="0" data-zoom-t0="${t0}" data-zoom-t1="${t1}" aria-label="Verlauf ${zd ? "Zoom " + hhmm(t0) + " bis " + hhmm(t1) : "15 min"}, ${unit}; ziehen zoomt, Doppelklick oder Esc zurück" style="height:${H}px">
+    <svg class="spark" id="${svgId}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" tabindex="0" data-zoom-t0="${t0}" data-zoom-t1="${t1}" aria-label="History ${zd ? "Zoom " + hhmm(t0) + " to " + hhmm(t1) : "15 min"}, ${unit}; drag zooms, double-click or Esc to go back" style="height:${H}px">
     ${grid}
     <line class="grid" x1="0" x2="${W}" y1="${y(nice)}" y2="${y(nice)}" vector-effect="non-scaling-stroke"/>
     <line class="grid" x1="0" x2="${W}" y1="${y(0)}" y2="${y(0)}" vector-effect="non-scaling-stroke"/>
@@ -828,7 +833,7 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
     ${gap}
     <line class="cross" x1="0" x2="0" y1="0" y2="${H}" stroke="var(--muted)" stroke-width="1" vector-effect="non-scaling-stroke" visibility="hidden"/>
     </svg>${opt.noAxis ? "" : zd ? `<div class="xaxis"><span>${hhmm(t0)}</span><span>${hhmm(t0 + (t1 - t0) / 3)}</span><span>${hhmm(t0 + 2 * (t1 - t0) / 3)}</span><span>${hhmm(t1)}</span></div>`
-      : `<div class="xaxis"><span>−15 min</span><span>−10</span><span>−5</span><span>jetzt</span></div>`}${opt.caption ? `<div class="caption">${opt.caption}</div>` : ""}</div>`;
+      : `<div class="xaxis"><span>−15 min</span><span>−10</span><span>−5</span><span>now</span></div>`}${opt.caption ? `<div class="caption">${opt.caption}</div>` : ""}</div>`;
   return {svg, bind: () => {
     const el = document.getElementById(svgId);
     if (!el) return;
@@ -840,7 +845,7 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
       for (const p of pts) if (best == null || Math.abs(p[0] - tx) < Math.abs(best[0] - tx)) best = p;
       if (!best || Math.abs(best[0] - tx) > Math.max(2 * step, (t1 - t0) / 45)) { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); return; }
       cross.setAttribute("x1", x(best[0])); cross.setAttribute("x2", x(best[0])); cross.setAttribute("visibility", "visible");
-      tip.innerHTML = `<b>${fmt(best[1], digits)}</b> ${unit} &middot; ${hhmm(best[0])}${best[1] === 0 ? " &middot; ruht / keine Arbeit" : ""}${opt.tipExtra ? opt.tipExtra(best[2]) : ""}`;
+      tip.innerHTML = `<b>${fmt(best[1], digits)}</b> ${unit} &middot; ${hhmm(best[0])}${best[1] === 0 ? " &middot; idle / no work" : ""}${opt.tipExtra ? opt.tipExtra(best[2]) : ""}`;
       tip.style.display = "block"; tip.style.left = (e.clientX + 12) + "px"; tip.style.top = (e.clientY - 28) + "px";
     };
     el.onmouseleave = () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); };
@@ -864,16 +869,16 @@ function rateCharts(b, key, color, digits, now, binders) {
   const dec = /_decode_tps$/.test(key);
   const seats = ser[g + "_decode_seats"], stream = ser[g + "_decode_stream"];
   const extra = dec ? (i) => (seats && seats[i] != null
-    ? ` &middot; je Stream <b>${fmt(stream[i], 1)}</b> tok/s bei &Oslash; <b>${fmt(seats[i], 1)}</b> Sitzen` : "") +
+    ? ` &middot; per stream <b>${fmt(stream[i], 1)}</b> tok/s at avg <b>${fmt(seats[i], 1)}</b> seats` : "") +
       (ser[key][i] != null ? ` <span class="muted">&middot; Wanduhr inkl. Pausen ${fmt(ser[key][i], 1)}</span>` : "")
     : (i) => (ser[key][i] != null ? ` <span class="muted">&middot; Wanduhr inkl. Pausen ${fmt(ser[key][i], 0)}</span>` : "");
   const a = spark(`sp-${b.stem}-${key}`, ser.t, ser[rk] || ser[key], color, "tok/s", digits, now,
-    Object.assign({}, o, {tipExtra: extra, caption: ser[rk] ? `tok/s w&auml;hrend ${dec ? "Decode" : "Prefill"} (Tokens / Rechenzeit im ${stepTxt}; L&uuml;cke = Phase ruht)` : ""}));
+    Object.assign({}, o, {tipExtra: extra, caption: ser[rk] ? `tok/s during ${dec ? "decode" : "prefill"} (tokens / compute time in ${stepTxt}; gap = phase idle)` : ""}));
   binders.push(a.bind);
   let h = a.svg;
   if (ser[key + "_per_w"]) {
     const w = spark(`sp-${b.stem}-${key}-w`, ser.t, ser[key + "_per_w"], color, "tok/s/W", 2, now,
-      Object.assign({}, o, {h: 40, caption: "tok/s pro Watt (Wanduhr) &middot; Nenner: &Sigma; power.draw aller 3 Karten (nvidia-smi, 5-s-Mittel), inkl. Idle der schlafenden Gruppe"}));
+      Object.assign({}, o, {h: 40, caption: "tok/s per watt (wall clock) &middot; denominator: &Sigma; power.draw of all 3 cards (nvidia-smi, 5 s mean), incl. idle of the sleeping group"}));
     binders.push(w.bind);
     h += `<div class="x">${w.svg}</div>`;
   }
@@ -895,18 +900,18 @@ function bsBadge(d, on) {
   const bs = rb && rb.bs != null ? rb.bs : d.running;
   if (bs == null) return "";
   const q = d.queue_req;
-  return `<span class="bsbadge${on ? "" : " off"}" title="${rb && rb.bs != null ? "bs der j&uuml;ngsten Runde (rankstats decode.last_bs)" : "laufende Anfragen (decode.running; decode.last_bs fehlt in IPC bis zum Build mit 8654c4e647)"}${cap != null ? "; Sitze = " + (se.n != null ? "front d_seats/d_phase_n dieser Phase (cap " + fmt(se.cap) + ")" : "--max-running-requests") : ""}; wartend = sched.queue_req (rankstats)">bs <b>${fmt(bs)}</b>${cap != null ? " / " + fmt(cap) : ""}${q ? ` <span class="q">&middot; ${fmt(q)} wartend</span>` : ""}</span>`;
+  return `<span class="bsbadge${on ? "" : " off"}" title="${rb && rb.bs != null ? "bs of the newest round (rankstats decode.last_bs)" : "running requests (decode.running; decode.last_bs is missing in IPC until the build with 8654c4e647)"}${cap != null ? "; seats = " + (se.n != null ? "front d_seats/d_phase_n of this phase (cap " + fmt(se.cap) + ")" : "--max-running-requests") : ""}; waiting = sched.queue_req (rankstats)">bs <b>${fmt(bs)}</b>${cap != null ? " / " + fmt(cap) : ""}${q ? ` <span class="q">&middot; ${fmt(q)} waiting</span>` : ""}</span>`;
 }
 
 // ---- phase bar: P-Prefill / D-Prefill / Decode runs and the flips between them
-const PHASE = {P: ["P-Prefill"], D: ["D-Prefill/Extend"], dec: ["D-Decode"], flip_pd: ["Flip P→D"], flip_dp: ["Flip D→P"],
-  flip_tail: ["Flip-Nachlauf"], vis_load: ["Vision laden"], vis_enc: ["Vision rechnen"], vis_unload: ["Vision entladen"],
-  idle: ["Leerlauf"], off: ["aus/lädt/tot"], unknown: ["unbekannt"],
-  Pdec: ["P-Prefill + D-Decode gleichzeitig"], PD: ["P-Prefill + D-Prefill gleichzeitig"]};
+const PHASE = {P: ["P prefill"], D: ["D prefill/extend"], dec: ["D decode"], flip_pd: ["Flip P→D"], flip_dp: ["Flip D→P"],
+  flip_tail: ["Flip tail"], vis_load: ["Vision load"], vis_enc: ["Vision encode"], vis_unload: ["Vision unload"],
+  idle: ["Idle"], off: ["off/loading/dead"], unknown: ["unknown"],
+  Pdec: ["P prefill + D decode simultaneously"], PD: ["P prefill + D prefill simultaneously"]};
 const CO_KEY = {dec: "Pdec", D: "PD"};      // dual: P segment with D's simultaneous work (seg.co)
 const PHASE_ORDER = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "vis_load", "vis_enc", "vis_unload", "idle", "off", "unknown"];
-const VIS_TIP = {vis_load: "Tower bauen + KV-Tail reservieren + Gewichte laden", vis_enc: "Bild-Encoder + Embeddings anh&auml;ngen",
-  vis_unload: "Tower abbauen, KV-Tail zur&uuml;ckgeben"};
+const VIS_TIP = {vis_load: "build tower + reserve KV tail + load weights", vis_enc: "image encoder + append embeddings",
+  vis_unload: "tear down tower, return KV tail"};
 const phaseData = {};
 let phaseSpan = 0;
 try { phaseSpan = +localStorage.getItem("rigdash.phaseSpan") || 0; } catch (e) { phaseSpan = 0; }
@@ -926,14 +931,14 @@ function setFlipWin(v) {
   refresh(true);
 }
 const flipWinOf = (b) => (flipWinMode === "boot" ? b.flip_boot : b.flip_zeit) || {};
-const flipWinSwitch = () => `<span class="span">${[["60", "60 min"], ["boot", "seit Boot"]].map(([v, t]) =>
+const flipWinSwitch = () => `<span class="span">${[["60", "60 min"], ["boot", "since boot"]].map(([v, t]) =>
   `<button type="button" class="${flipWinMode === v ? "sel" : ""}" onclick="setFlipWin('${v}')">${t}</button>`).join("")}</span>`;
 const dur = (s) => s < 90 ? fmt(s, s < 10 ? 1 : 0) + " s" : fmt(s / 60, 1) + " min";
 function phaseName(k, single) { return single && k === "P" ? "Prefill" : (PHASE[k] || [k])[0]; }
 /* DEPTH-BEGIN -- Nutzer 02.10. ~12:04Z/~12:15Z: beim Hover nicht nur wie viele Token, sondern
    "Token x–y (n neu)" (x = Start-Tiefe/Präfix, y = End-Tiefe, n = neu gerechnet) und tok/s am Anfang/Ende;
-   beim Decode tok/s je Batchgröße und je Anfrage Token x–y (n neu). Texte DE/EN (i18nLang, sobald die
-   Umschaltung da ist; sonst Deutsch). tests/test_depth_1002.py führt diesen Block in node aus. */
+   beim Decode tok/s je Batchgröße und je Anfrage Token x–y (n neu). Texts DE/EN (i18nLang once the
+   switch exists; otherwise English). tests/test_depth_1002.py führt diesen Block in node aus. */
 const DEPTH_I18N = {
   tok: {de: "Token", en: "Tokens"},
   neu: {de: "neu", en: "new"},
@@ -955,9 +960,9 @@ const DEPTH_I18N = {
 };
 const dt = (k) => {
   const e = DEPTH_I18N[k] || {};
-  let l = "de";
-  try { if (typeof window !== "undefined" && typeof window.i18nLang === "function") l = window.i18nLang() || "de"; } catch (err) { l = "de"; }
-  return e[l] || e.de || k;
+  let l = "en";
+  try { if (typeof window !== "undefined" && typeof window.i18nLang === "function") l = window.i18nLang() || "en"; } catch (err) { l = "en"; }
+  return e[l] || e.en || e.de || k;
 };
 const tokRange = (x, y, n) => `${dt("tok")} ${fmt(x)}&ndash;${fmt(y)} (${fmt(n)} ${dt("neu")})`;
 function depthTip(d) {
@@ -990,44 +995,44 @@ function decodeDetailTip(x) {
 // handful of new tokens is a RESUME EXTEND (P's request taken over from the cache, loadback + 1-token extend): say what it
 // took over, never a tok/s.  D's decode keeps its tok/s (real, the rounds are slower under P) plus the round time.
 function coDetail(x, dec) {
-  if (dec) return `${x.co_tps != null ? `<b>${fmt(x.co_tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / Dauer)</span>` : "&mdash;"} &middot; ${fmt(x.co_tok)} Tok`;
+  if (dec) return `${x.co_tps != null ? `<b>${fmt(x.co_tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / duration)</span>` : "&mdash;"} &middot; ${fmt(x.co_tok)} tok`;
   const nq = x.co_n != null ? Math.max(1, x.co_n) : null, cached = x.co_cached != null ? fmt(Math.round(x.co_cached)) : null;
-  if (x.co_resume) return `<b>&uuml;bernimmt ${nq != null ? nq : ""} Anfrage${nq === 1 ? "" : "n"} aus dem Cache</b> <span class="muted">(${cached != null ? cached + " Tok gecacht, " : ""}${fmt(Math.round(x.co_new != null ? x.co_new : x.co_tok))} neu &middot; kein Prefill, keine tok/s)</span>`;
-  return `${x.co_tps != null ? `<b>${fmt(x.co_tps, 0)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"} &middot; ${fmt(x.co_tok)} Tok`
-    + (nq != null && cached != null ? ` <span class="muted">(${nq} Anfrage${nq === 1 ? "" : "n"}, ${cached} Tok gecacht)</span>` : "");
+  if (x.co_resume) return `<b>takes over ${nq != null ? nq : ""} request${nq === 1 ? "" : "s"} from the cache</b> <span class="muted">(${cached != null ? cached + " tok cached, " : ""}${fmt(Math.round(x.co_new != null ? x.co_new : x.co_tok))} new &middot; no prefill, no tok/s)</span>`;
+  return `${x.co_tps != null ? `<b>${fmt(x.co_tps, 0)}</b> tok/s <span class="muted">(chunks at compute time)</span>` : "&mdash;"} &middot; ${fmt(x.co_tok)} tok`
+    + (nq != null && cached != null ? ` <span class="muted">(${nq} request${nq === 1 ? "" : "s"}, ${cached} tok cached)</span>` : "");
 }
 function coRoundTip(x) {
   if (x.co_round_ms == null) return "";
-  const slow = x.co_solo_ms ? ` <span class="muted">(ohne P &Oslash; ${fmt(x.co_solo_ms, 0)} ms, &times;${fmt(x.co_round_ms / x.co_solo_ms, 1)})</span>` : "";
-  const rows = (x.co_round || []).filter((r) => r.n >= 1).map((r) => `bs ${esc(String(r.bs))}: ${fmt(r.ms, 0)} ms${r.solo_ms ? " (ohne P " + fmt(r.solo_ms, 0) + ")" : ""}`).join(" &middot; ");
-  return `<br>D-Runde &Oslash; <b>${fmt(x.co_round_ms, 0)}</b> ms${slow} &middot; P rechnet gleichzeitig` + (rows ? `<br><span class="muted">${rows} &middot; rankstats decode.gpu_ms_by_bs</span>` : "");
+  const slow = x.co_solo_ms ? ` <span class="muted">(without P avg ${fmt(x.co_solo_ms, 0)} ms, &times;${fmt(x.co_round_ms / x.co_solo_ms, 1)})</span>` : "";
+  const rows = (x.co_round || []).filter((r) => r.n >= 1).map((r) => `bs ${esc(String(r.bs))}: ${fmt(r.ms, 0)} ms${r.solo_ms ? " (without P " + fmt(r.solo_ms, 0) + ")" : ""}`).join(" &middot; ");
+  return `<br>D round avg <b>${fmt(x.co_round_ms, 0)}</b> ms${slow} &middot; P computes simultaneously` + (rows ? `<br><span class="muted">${rows} &middot; rankstats decode.gpu_ms_by_bs</span>` : "");
 }
 function phaseTip(x, single) {
-  const when = `${hhmm(x.s)}&ndash;${x.running ? "jetzt" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
-  if (x.k === "flip_pd" || x.k === "flip_dp") return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}<br>${when} <span class="muted">flip_begin bis flip_done (events.jsonl, Front-Uhr)</span>`;
-  if (x.k === "flip_tail") return `<b>Flip-Nachlauf</b> &middot; ${dur(x.e - x.s)} &middot; flip_done bis zur ersten Arbeit (P&rarr;D: erstes Decode-Token; D&rarr;P: erster Prefill-Forward auf P (PP0))<br>${when}`;
+  const when = `${hhmm(x.s)}&ndash;${x.running ? "now" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
+  if (x.k === "flip_pd" || x.k === "flip_dp") return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}<br>${when} <span class="muted">flip_begin to flip_done (events.jsonl, front clock)</span>`;
+  if (x.k === "flip_tail") return `<b>Flip tail</b> &middot; ${dur(x.e - x.s)} &middot; flip_done until the first work (P&rarr;D: first decode token; D&rarr;P: first prefill forward on P (PP0))<br>${when}`;
   if (VIS_TIP[x.k]) {
     const legs = x.legs_ms ? Object.entries(x.legs_ms).map(([k, v]) => `${esc(k)} ${fmt(v)} ms`).join(", ") : "";
-    return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}${x.vis_live ? " &middot; l&auml;uft (" + esc(x.vis_live) + ")" : ""}<br>${when}`
-      + `<br>${VIS_TIP[x.k]}${legs ? " &middot; " + legs : ""}${x.mib != null ? " &middot; Tower " + fmt(x.mib) + " MiB" : ""}`
-      + `${(x.rids || []).length ? "<br>" + esc(x.rids.join(", ")) : ""}${x.run != null ? " &middot; Lauf " + esc(String(x.run)) : ""}`
+    return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}${x.vis_live ? " &middot; running (" + esc(x.vis_live) + ")" : ""}<br>${when}`
+      + `<br>${VIS_TIP[x.k]}${legs ? " &middot; " + legs : ""}${x.mib != null ? " &middot; tower " + fmt(x.mib) + " MiB" : ""}`
+      + `${(x.rids || []).length ? "<br>" + esc(x.rids.join(", ")) : ""}${x.run != null ? " &middot; run " + esc(String(x.run)) : ""}`
       + ` <span class="muted">(rankstats vision, P/PP0)</span>`;
   }
-  if (x.k === "idle") return `<b>Leerlauf</b>${x.awake ? " &middot; " + esc(x.awake) + " wach" : ""} &middot; keine Arbeit<br>${when} <span class="muted">belegt: queue 0, outstanding 0 (state.json front), kein Rang-Z&auml;hler bewegt sich</span>`;
-  if (x.k === "off") return `<b>aus/l&auml;dt/tot</b> &middot; ${esc(x.why || "")}<br>${when} <span class="muted">state.json lifecycle</span>`;
-  if (x.k === "unknown") return `<b>unbekannt</b> &middot; ${esc(x.why || "keinem Zustand zuordenbar")}<br>${when}`;
+  if (x.k === "idle") return `<b>Idle</b>${x.awake ? " &middot; " + esc(x.awake) + " awake" : ""} &middot; no work<br>${when} <span class="muted">evidence: queue 0, outstanding 0 (state.json front), no rank counter moves</span>`;
+  if (x.k === "off") return `<b>off/loading/dead</b> &middot; ${esc(x.why || "")}<br>${when} <span class="muted">state.json lifecycle</span>`;
+  if (x.k === "unknown") return `<b>unknown</b> &middot; ${esc(x.why || "cannot be assigned to any state")}<br>${when}`;
   const nm = phaseName(x.k, single);
   if (x.k === "P" && CO_KEY[x.co]) {
     // dual: both phases of the stretch, each with its own rate (the same instruments as their own segments)
     const dec = x.co === "dec", sw = (k) => `<i class="ph-k-${k}" style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px"></i>`;
-    return `<b>${PHASE[CO_KEY[x.co]][0]}</b> <span class="muted">(Dual: P und D laufen parallel, kein Flip)</span><br>${when}${x.running ? " &middot; l&auml;uft" : ""}`
-      + `<br>${sw("P")} <b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"} &middot; ${fmt(x.tok)} Tok`
+    return `<b>${PHASE[CO_KEY[x.co]][0]}</b> <span class="muted">(dual: P and D run in parallel, no flip)</span><br>${when}${x.running ? " &middot; running" : ""}`
+      + `<br>${sw("P")} <b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(chunks at compute time)</span>` : "&mdash;"} &middot; ${fmt(x.tok)} tok`
       + `<br>${sw(dec ? "dec" : "D")} <b>${PHASE[dec ? "dec" : "D"][0]}</b> &middot; ${coDetail(x, dec)}`
       + (dec ? decodeDetailTip({by_bs: x.co_by_bs}) + coRoundTip(x) : "") + depthTip(x.depth);
   }
-  if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / Dauer)</span>` : "&mdash;"}<br>${when}${x.running ? " &middot; l&auml;uft" : ""}${decodeDetailTip(x)}`;
-  const adm = x.k === "D" && x.admit_n ? `<br>D-Admit/Extend (Tokens je Request): <b>${fmt(x.admit_n)}</b> Extends &middot; ${fmt(x.admit_tok)} Tok &middot; &Oslash; ${fmt(x.admit_tok / x.admit_n, 1)} Tok je Request <span class="muted">(keine Prefill-Rate)</span>` : "";
-  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit${x.k === "D" ? ", nur Chunks &ge; 64 Tok" : ""})</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok${x.running ? " &middot; l&auml;uft" : ""}${adm}${depthTip(x.depth)}`;
+  if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / duration)</span>` : "&mdash;"}<br>${when}${x.running ? " &middot; running" : ""}${decodeDetailTip(x)}`;
+  const adm = x.k === "D" && x.admit_n ? `<br>D admit/extend (tokens per request): <b>${fmt(x.admit_n)}</b> extends &middot; ${fmt(x.admit_tok)} tok &middot; avg ${fmt(x.admit_tok / x.admit_n, 1)} tok per request <span class="muted">(no prefill rate)</span>` : "";
+  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(chunks at compute time${x.k === "D" ? ", only chunks &ge; 64 tok" : ""})</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} tok${x.running ? " &middot; running" : ""}${adm}${depthTip(x.depth)}`;
 }
 function phaseHtml(b, pre) {
   const tl = b.timeline;
@@ -1043,7 +1048,7 @@ function phaseHtml(b, pre) {
     let full = "", short = "";
     if (x.k === "flip_pd" || x.k === "flip_dp") { full = short = fmt(x.e - x.s, 1) + " s"; }
     else if (x.k === "P" && CO_KEY[x.co] && x.tps != null) {
-      if (x.co_resume) { short = fmt(x.tps) + " / Üb. " + (x.co_n != null ? Math.max(1, x.co_n) : ""); full = "P " + fmt(x.tps) + " tok/s · D übernimmt " + (x.co_n != null ? Math.max(1, x.co_n) : "") + " aus dem Cache"; }
+      if (x.co_resume) { short = fmt(x.tps) + " / tok. " + (x.co_n != null ? Math.max(1, x.co_n) : ""); full = "P " + fmt(x.tps) + " tok/s · D takes over " + (x.co_n != null ? Math.max(1, x.co_n) : "") + " from the cache"; }
       else { const d = x.co === "dec" ? 1 : 0; short = fmt(x.tps) + " / " + fmt(x.co_tps, d); full = "P " + fmt(x.tps) + " · D " + fmt(x.co_tps, d) + " tok/s"; }
     }
     else if ((x.k === "P" || x.k === "D" || x.k === "dec") && x.tps != null) { const d = x.k === "dec" ? 1 : 0; short = fmt(x.tps, d); full = short + " tok/s"; }
@@ -1051,7 +1056,7 @@ function phaseHtml(b, pre) {
     return `<div class="seg ph-k-${x.k}${x.k === "P" && CO_KEY[x.co] ? " co-" + x.co : ""}${x.running ? " run" : ""}" data-i="${i}" style="${ic}left:${pos(x.s)}%;width:${(100 * (x.e - x.s) / span).toFixed(3)}%"><span data-full="${esc(full)}" data-short="${esc(short)}"></span></div>`;
   }).join("");
   const cut = tl.cut_at && tl.cut_at > t0 ? `<div class="cut${tl.cut_kind === "planned" ? " planned" : ""}" style="left:${pos(tl.cut_at)}%" title="${esc(tl.cut_reason || "")}"></div>` : "";
-  let end = b.live ? "jetzt" : "letzte IPC-Probe " + hhmm(t1);
+  let end = b.live ? "now" : "last IPC sample " + hhmm(t1);
   if (tl.cut_at) end = tl.cut_kind === "planned" ? `<span style="color:var(--text-2)">■ ${esc(tl.cut_reason)} ${hhmm(tl.cut_at)}</span> &middot; ${end}`
     : `<span style="color:var(--bad)">✕ ${esc(tl.cut_reason)} ${hhmm(tl.cut_at)}</span> &middot; ${end}`;
   const ticks = z ? [hhmm(t0), hhmm(t0 + span / 2), hhmm(t1)]
@@ -1059,9 +1064,9 @@ function phaseHtml(b, pre) {
   const coKeys = ["dec", "D"].filter((c) => tl.segs.some((x) => x.k === "P" && x.co === c)).map((c) => CO_KEY[c]);
   const lg = (k) => `<span class="lg"><i class="sw ph-k-${k}"${k === "idle" ? ' style="--ic:var(--muted)"' : ""}></i>${phaseName(k, single)}</span>`;
   return `<div class="phasewrap">
-    <div class="ph-head"><b style="color:var(--text)">Phasen</b>${srcOf(b, "D1", "D2", "D3", "D4")} ${PHASE_ORDER.concat(coKeys).map(lg).join("")}
+    <div class="ph-head"><b style="color:var(--text)">Phases</b>${srcOf(b, "D1", "D2", "D3", "D4")} ${PHASE_ORDER.concat(coKeys).map(lg).join("")}
       <span class="span">${[300, 900].map((v) => `<button type="button" class="${span === v ? "sel" : ""}" onclick="setPhaseSpan(${v})">${v / 60} min</button>`).join("")}</span></div>
-    <div class="phasebar" id="${esc(id)}" role="img" tabindex="0" data-zoom-t0="${t0}" data-zoom-t1="${t1}" aria-label="Phasenverlauf ${z ? "Zoom " + hhmm(t0) + " bis " + hhmm(t1) : "der letzten " + span / 60 + " Minuten"}; ziehen zoomt, Doppelklick oder Esc zurück">${bars}${cut}</div>
+    <div class="phasebar" id="${esc(id)}" role="img" tabindex="0" data-zoom-t0="${t0}" data-zoom-t1="${t1}" aria-label="Phase history ${z ? "Zoom " + hhmm(t0) + " to " + hhmm(t1) : "of the last " + span / 60 + " minutes"}; drag zooms, double-click or Esc to go back">${bars}${cut}</div>
     <div class="xaxis">${ticks.map((t) => `<span>${t}</span>`).join("")}</div>
   </div>`;
 }
@@ -1130,7 +1135,7 @@ function tiersHtml(b) {
   const f = fieldIpc(b, "E2");
   const ranks = f && f.value ? Object.entries(f.value).filter(([, v]) => v) : [];
   const ring = b.series || {};
-  const miss = (k) => `<div class="miss" style="font-size:11.5px">fehlt in IPC: <span class="mono">${esc(TIER_MISSING[k])}</span></div>`;
+  const miss = (k) => `<div class="miss" style="font-size:11.5px">missing in IPC: <span class="mono">${esc(TIER_MISSING[k])}</span></div>`;
   const rows = ranks.map(([r, v]) => {
     const pf = v.prefetch || {};
     return `<tr><td class="mono">${esc(r)}</td><td class="num">${fmt(v.loadback_n)}</td><td class="num">${fmt(v.loadback_tok)}</td>`
@@ -1138,14 +1143,14 @@ function tiersHtml(b) {
       + `<td class="num">${["attempted", "issued", "landed", "refused", "expired", "timeout"].map((k) => fmt(pf[k])).join(" / ")}</td></tr>`;
   }).join("");
   const tile = (title, body) => `<div class="tile"><div class="label">${title}</div>${body}</div>`;
-  return `<div class="x" style="margin-top:12px"><h3 style="font-size:13px;margin:4px 0 6px">Speicherstufen und PLE <span class="muted">je Rang, P und D getrennt &middot; Zähler seit Boot aus rankstats.cache (IPC) &middot; Einzelereignisse werden Punkte, sobald die Rang-IPC sie trägt</span></h3>
+  return `<div class="x" style="margin-top:12px"><h3 style="font-size:13px;margin:4px 0 6px">Memory tiers and PLE <span class="muted">per rank, P and D separate &middot; counters since boot from rankstats.cache (IPC) &middot; single events become points once the rank IPC carries them</span></h3>
     <div class="tiles" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-bottom:8px">
-      ${tile("L1,5 &middot; Brach-VRAM 3080 (KV + Anker, P2P)", `<div class="big" style="font-size:16px;color:var(--muted)">noch keine Daten</div><div class="state">Stufe im Bau (L1,5-Lead); Kachel füllt sich, sobald rankstats sie trägt</div>${miss("l15")}`)}
-      ${tile("L2 &middot; Host-Arena: Load-back", `<div class="state">Anzahl und Token je Rang in der Tabelle; Dauer, Seiten, Bytes und Rate je Load-back:</div>${miss("l2")}`)}
-      ${tile("L3 &middot; Store/Disk: Read und Prefetch", `<div class="state">unvollständige Lesungen und Prefetch-Zensus je Rang in der Tabelle; Dauer, Bytes und Rate je Read/Prefetch:</div>${miss("l3")}`)}
-      ${tile("PLE &middot; Per-Layer-Embedding Gather / pread-Stage", `<div class="state">je Prefill-Chunk und je Decode-Runde, P und D getrennt (Verteilung, letzte Werte, Hit/Miss, Wartezeit):</div>${miss("ple")}`)}
+      ${tile("L1.5 &middot; idle VRAM 3080 (KV + anchor, P2P)", `<div class="big" style="font-size:16px;color:var(--muted)">no data yet</div><div class="state">Tier under construction (L1.5 lead); the tile fills once rankstats carries it</div>${miss("l15")}`)}
+      ${tile("L2 &middot; host arena: load-back", `<div class="state">Count and tokens per rank in the table; duration, pages, bytes and rate per load-back:</div>${miss("l2")}`)}
+      ${tile("L3 &middot; store/disk: read and prefetch", `<div class="state">incomplete reads and prefetch census per rank in the table; duration, bytes and rate per read/prefetch:</div>${miss("l3")}`)}
+      ${tile("PLE &middot; per-layer-embedding gather / pread stage", `<div class="state">per prefill chunk and per decode round, P and D separate (distribution, last values, hit/miss, wait time):</div>${miss("ple")}`)}
     </div>
-    ${rows ? `<div class="tablewrap"><table><tr><th>Rang ${ipcTag(f.ipc_src)}</th><th class="num">L2 Load-back n</th><th class="num">L2 Load-back Tok</th><th class="num">Mamba-Resume n</th><th class="num">L3 unvollständig n (geliefert/lieferbar)</th><th class="num">Prefetch versucht / ausgegeben / gelandet / abgelehnt / abgelaufen / timeout</th></tr>${rows}</table></div>` : `<div class="muted">rankstats.cache fehlt in diesem Boot</div>`}
+    ${rows ? `<div class="tablewrap"><table><tr><th>Rank ${ipcTag(f.ipc_src)}</th><th class="num">L2 load-back n</th><th class="num">L2 load-back tok</th><th class="num">Mamba resume n</th><th class="num">L3 incomplete n (delivered/deliverable)</th><th class="num">Prefetch attempted / issued / landed / refused / expired / timeout</th></tr>${rows}</table></div>` : `<div class="muted">rankstats.cache is missing in this boot</div>`}
   </div>`;
 }
 // E2 prefetch census per rank (rankstats.cache.prefetch): deferred = #1068 DEFERRED, refused = #915 REFUSED,
@@ -1156,7 +1161,7 @@ function prefetchRows(b) {
   const cols = ["attempted", "issued", "landed", "deferred", "defer_refused", "expired", "refused", "timeout"];
   const rows = Object.entries(f.value).filter(([, v]) => v && v.prefetch)
     .map(([r, v]) => `<tr><td>${esc(r)}</td>${cols.map((c) => `<td class="num">${fmt(v.prefetch[c])}</td>`).join("")}<td class="num">${fmt(v.mamba_tok)}</td></tr>`).join("");
-  return rows ? `<div class="tablewrap" style="margin-top:6px"><table><tr><th>Prefetch je Rang ${ipcTag(f.ipc_src)}</th>${cols.map((c) => `<th class="num">${c}</th>`).join("")}<th class="num">mamba_tok</th></tr>${rows}</table></div>` : "";
+  return rows ? `<div class="tablewrap" style="margin-top:6px"><table><tr><th>Prefetch per rank ${ipcTag(f.ipc_src)}</th>${cols.map((c) => `<th class="num">${c}</th>`).join("")}<th class="num">mamba_tok</th></tr>${rows}</table></div>` : "";
 }
 
 // the IPC rows of one tile: one row per rank of this group whose field value the IPC carries
@@ -1169,136 +1174,139 @@ function ipcRankRows(b, g, key, show) {
 
 function bigPair(lbl60, v60, one, digits, extra, max3, L) {
   // L: labels + titles per tile (prefill: bursts of chunks; decode: continuous rounds)
-  L = L || {one: "jetzt ~1 s", oneT: "letzte Probe (~1 s): Δdecode.tokens / Rang-Uhr, Flip-Fenster ausgenommen; 0 = D dekodiert gerade nicht",
-    max: "max 3 s", maxT: "höchste 3-s-Rate der letzten 120 s, nur über Decode-Zeit"};
+  L = L || {one: "now ~1 s", oneT: "last sample (~1 s): Δdecode.tokens / rank clock, flip window excluded; 0 = D is not decoding right now",
+    max: "max 3 s", maxT: "highest 3 s rate of the last 120 s, over decode time only"};
   const on = one > 0;
   return `<div class="bigrow ${on ? "on" : "off"}" title="${L.oneT}"><span class="bl">${L.one}</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span>${extra || ""}</div>
     <div class="bigrow x" title="${L.maxT}"><span class="bl">${L.max}</span><span class="big num">${max3 == null ? "–" : fmt(max3, digits) + "<small>tok/s</small>"}</span></div>
     <div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${v60 == null ? "–" : fmt(v60, digits) + "<small>tok/s</small>"}</span></div>`;
 }
-const PREFILL_L = {one: "Rate laufender Schub", oneT: "Tokens des laufenden Schubs / (jetzt letztes Chunk-Ende − Start seines ersten Chunks); ein Chunk zählt über die Sekunden, in denen er rechnete (prefill.last t/gpu_ms), nie in der Probe, in der sein Zähler sprang; 0 = die Phase rechnet gerade nicht",
-  max: "beste Schub-Rate", maxT: "höchste Schub-Rate (Tokens / Wanduhr des Schubs) im 15-min-Speicher (Schübe unter 512 Tokens haben keine Rate)"};
+const PREFILL_L = {one: "rate of the running burst", oneT: "tokens of the running burst / (now last chunk end − start of its first chunk); a chunk counts over the seconds in which it computed (prefill.last t/gpu_ms), never in the sample in which its counter jumped; 0 = the phase is not computing right now",
+  max: "best burst rate", maxT: "highest burst rate (tokens / wall clock of the burst) in the 15 min memory (bursts under 512 tokens have no rate)"};
 function prefillTile(b, g, color, label, binders, now) {
   const p = (b.prefill || {})[g];
-  if (!p) return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div><div class="big">—</div><div class="state">fehlt in IPC: rankstats.prefill dieser Gruppe</div></div>`;
+  if (!p) return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div><div class="big">—</div><div class="state">missing in IPC: rankstats.prefill of this group</div></div>`;
   const n = p.now, lb = p.last_burst;
   const active = !!(n && n.tokens);
   const src = active ? n : lb;
   const ranks = src ? Object.entries(src.ranks || {}).map(([r, a]) => `${r} ${fmt(a.tps)}`).join(" &middot; ") : "—";
   const small = src && src.tokens != null && src.tokens < 512;
-  const state = active ? `Chunks der letzten ${Math.round(p.window_s)} s`
-    : (p.last_t ? `ruht &middot; letzter Chunk fertig vor ${ago(now - p.last_t)}, Zahlen = letzter Schub` : (p.min_chunk_tok ? `noch kein Prefill mit mindestens ${p.min_chunk_tok} neuen Tokens` : "noch kein Chunk"));
-  const ad = p.admit, adRow = !ad ? null : ["<span title=\"Auf D beginnt jeder &uuml;bernommene Request mit einem Extend von meist 1 neuen Token (nach der P&rarr;D-&Uuml;bergabe, Rest kommt aus dem Cache). Das ist Aufnahme, keine Prefill-Geschwindigkeit: der Stock-Logwert &bdquo;input throughput&ldquo; dieser Zeilen (1 Token / Wanduhr seit der letzten Zeile) liegt bei ~6 tok/s und wird hier nicht als Rate gezeigt.\">D-Admit/Extend (Tokens je Request) &#9432;</span>",
-    `${fmt(ad.now.n)} Extends &middot; ${fmt(ad.now.tokens)} Tok${ad.now.tok_per_req != null ? ` &middot; &Oslash; ${fmt(ad.now.tok_per_req, 1)} Tok je Request` : ""} <span class="muted">(${Math.round(ad.window_s)} s; Ring ${fmt(ad.ring.n)} Extends${ad.ring.tok_per_req != null ? `, &Oslash; ${fmt(ad.ring.tok_per_req, 1)}` : ""})</span>`];
+  const state = active ? `chunks of the last ${Math.round(p.window_s)} s`
+    : (p.last_t ? `idle &middot; last chunk done ${ago(now - p.last_t)} ago, figures = last burst` : (p.min_chunk_tok ? `no prefill with at least ${p.min_chunk_tok} new tokens yet` : "no chunk yet"));
+  const ad = p.admit, adRow = !ad ? null : ["<span title=\"On D every taken-over request begins with an extend of usually 1 new token (after the P&rarr;D handoff, the rest comes from the cache). This is admission, not prefill speed: the stock log value &ldquo;input throughput&rdquo; of these lines (1 token / wall clock since the last line) is about 6 tok/s and is not shown as a rate here.\">D admit/extend (tokens per request) &#9432;</span>",
+    `${fmt(ad.now.n)} extends &middot; ${fmt(ad.now.tokens)} tok${ad.now.tok_per_req != null ? ` &middot; avg ${fmt(ad.now.tok_per_req, 1)} tok per request` : ""} <span class="muted">(${Math.round(ad.window_s)} s; ring ${fmt(ad.ring.n)} extends${ad.ring.tok_per_req != null ? `, avg ${fmt(ad.ring.tok_per_req, 1)}` : ""})</span>`];
   const charts = rateCharts(b, g + "_prefill_tps", color, 0, now, binders);
   const one = p.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}${srcOf(b, "C1", "C2", "C7")}</div>
-    ${bigPair(active ? "Rate Schübe 60 s" : "Rate letzter Schub", src && src.wall_tps, one, 0,
-      (one > 0 && lb && lb.wall_s) ? `<span class="muted" style="font-size:12px"> = ${fmt(lb.tokens)} Tok / ${fmt(lb.wall_s, 1)} s</span>` : null,
+    ${bigPair(active ? "rate bursts 60 s" : "rate last burst", src && src.wall_tps, one, 0,
+      (one > 0 && lb && lb.wall_s) ? `<span class="muted" style="font-size:12px"> = ${fmt(lb.tokens)} tok / ${fmt(lb.wall_s, 1)} s</span>` : null,
       p.max3s_120, PREFILL_L)}
-    <div class="state">${state} &middot; <span class="muted" title="Tokens / (Ende letzter Chunk auf der letzten PP-Stufe − Start erster Chunk auf PP0), je Schub; Schübe ohne die Pausen dazwischen">Tokens / Wanduhr der Schübe${src && src.wall_s ? " (" + fmt(src.tokens) + " Tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span>${small ? ` <span class="muted">&middot; unter 512 Tokens (z.&nbsp;B. Re-Extend nach der Übergabe): keine Rate</span>` : ""}</div>
+    <div class="state">${state} &middot; <span class="muted" title="Tokens / (end of the last chunk on the last PP stage − start of the first chunk on PP0), per burst; bursts without the pauses in between">tokens / wall clock of the bursts${src && src.wall_s ? " (" + fmt(src.tokens) + " tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span>${small ? ` <span class="muted">&middot; under 512 tokens (e.g. re-extend after the handoff): no rate</span>` : ""}</div>
     ${kv([
-      src && src.tps_gpu_exact ? ["Rang-Rechenrate (Tokens / compute_only_ms, langsamster Rang)", src.tps_gpu != null ? fmt(src.tps_gpu) + " tok/s" : "—"]
-        : ["<span title=\"compute_ms des Rangs enth&auml;lt am PP0 das Warten hinter dem Vorg&auml;nger-Chunk (gemessen NF 30.09.: 67-Token-Chunk mit 1.876 ms, 0,13 s nach dem 16k-Chunk fertig) -- Untergrenze; prefill.last.compute_only_ms ab Build y5a\">Rang-Zeit-Rate, Untergrenze (Tokens / compute_ms) &#9432;</span>",
-           (src && src.tps_gpu != null ? fmt(src.tps_gpu) + " tok/s " : "— ") + MISSTAG("compute_only_ms (ab Build y5a)")],
-      ["Rechenrate je Rang (compute-ms)", ranks || "—"],
-      [active ? "Tokens / Chunks, 60 s" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
-      ["mittl. Chunk &middot; aus Cache", src ? `${fmt(src.mean_chunk)} &middot; ${fmt(src.cached)}` : "—"],
+      src && src.tps_gpu_exact ? ["Rank compute rate (tokens / compute_only_ms, slowest rank)", src.tps_gpu != null ? fmt(src.tps_gpu) + " tok/s" : "—"]
+        : ["<span title=\"compute_ms of the rank includes on PP0 the wait behind the predecessor chunk (measured NF 30.09.: 67-token chunk with 1,876 ms, done 0.13 s after the 16k chunk) -- lower bound; prefill.last.compute_only_ms from build y5a\">Rank-time rate, lower bound (tokens / compute_ms) &#9432;</span>",
+           (src && src.tps_gpu != null ? fmt(src.tps_gpu) + " tok/s " : "— ") + MISSTAG("compute_only_ms (from build y5a)")],
+      ["Compute rate per rank (compute-ms)", ranks || "—"],
+      [active ? "Tokens / chunks, 60 s" : "Tokens / chunks in the last burst", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
+      ["mean chunk &middot; from cache", src ? `${fmt(src.mean_chunk)} &middot; ${fmt(src.cached)}` : "—"],
       adRow,
-      lb && lb.depth && lb.depth.x != null ? [`letzter Schub: Tiefe`, `${tokRange(lb.depth.x, lb.depth.y, lb.depth.n)}${lb.depth.tps_start != null ? ` &middot; ${fmt(lb.depth.tps_start)} &rarr; ${fmt(lb.depth.tps_end)} tok/s` : ""}`] : null,
-      active ? ["Durchsatz Wandzeit (Tokens / " + Math.round(p.window_s) + " s, mit Pausen)", fmt(n.tokens / p.window_s)] : null,
-      ["Warteschlange &middot; ausstehende Tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
-      ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_prefill_tps"], 2)],
+      lb && lb.depth && lb.depth.x != null ? [`last burst: depth`, `${tokRange(lb.depth.x, lb.depth.y, lb.depth.n)}${lb.depth.tps_start != null ? ` &middot; ${fmt(lb.depth.tps_start)} &rarr; ${fmt(lb.depth.tps_end)} tok/s` : ""}`] : null,
+      active ? ["Wall-clock throughput (tokens / " + Math.round(p.window_s) + " s, with pauses)", fmt(n.tokens / p.window_s)] : null,
+      ["Queue &middot; pending tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
+      ["avg tok/s/W &middot; 60 s (curve mean, idle = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_prefill_tps"], 2)],
     ])}
     ${charts}</div>`;
 }
 
 function decodeTile(b, g, color, binders, now) {
   const d = (b.decode || {})[g];
-  if (!d) return `<div class="tile"><div class="label"><i style="background:${color}"></i>Decode</div><div class="big">—</div><div class="state">fehlt in IPC: rankstats.decode</div></div>`;
+  if (!d) return `<div class="tile"><div class="label"><i style="background:${color}"></i>Decode</div><div class="big">—</div><div class="state">missing in IPC: rankstats.decode</div></div>`;
   const active = d.gen_tps != null;
   const v = active ? d.gen_tps : d.gen_tps_last;
-  const state = active ? `aktiv &middot; Tokens / Decode-Zeit der letzten ${Math.round(d.window_s)} s (&Delta;decode.tokens / Rang-Uhr, nur Proben mit Decode davor und danach, Flips ausgenommen; ${d.rows} Proben)`
-    : (d.last_t ? `ruht &middot; zuletzt dekodiert vor ${ago(now - d.last_t)}, Zahl = letzter Schub` : "noch kein Decode");
+  const state = active ? `active &middot; tokens / decode time of the last ${Math.round(d.window_s)} s (&Delta;decode.tokens / rank clock, only samples with decode before and after, flips excluded; ${d.rows} samples)`
+    : (d.last_t ? `idle &middot; last decoded ${ago(now - d.last_t)} ago, figure = last burst` : "no decode yet");
   const charts = rateCharts(b, g + "_decode_tps", color, 1, now, binders);
   const per = d.per_stream;
   const one = d.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}${srcOf(b, "C3", "C4", "C7")}</div>
-    ${bigPair(active ? "Wanduhr 60 s" : "letzter Wert", v, one, 1, bsBadge(d, one > 0), d.max3s_120)}
+    ${bigPair(active ? "wall clock 60 s" : "last value", v, one, 1, bsBadge(d, one > 0), d.max3s_120)}
     <div class="state">${state}</div>
     ${kv([
-      ["laufende Anfragen (bs) &middot; je Stream", `${fmt(d.last_bs != null ? d.last_bs : d.running)} &middot; ${per == null ? "—" : fmt(per, 1) + " tok/s"}${d.per_stream_n ? ` <span class="muted x">(${d.per_stream_n} Proben mit Decode davor und danach)</span>` : ""}`, "keep"],
+      ["running requests (bs) &middot; per stream", `${fmt(d.last_bs != null ? d.last_bs : d.running)} &middot; ${per == null ? "—" : fmt(per, 1) + " tok/s"}${d.per_stream_n ? ` <span class="muted x">(${d.per_stream_n} samples with decode before and after)</span>` : ""}`, "keep"],
       // Nutzer 30.09. ~21:10Z: je Stream nur mit der Zahl der Sitze -- beide mit demselben Nenner (Decode-Zeit)
-      ["<span title=\"Sitze = Batchgr&ouml;&szlig;e der Decode-Runden, nach Rundenzeit gewichtet und nur &uuml;ber die Zeit gemittelt, in der D dekodierte (Schlaf, Flip, Extend z&auml;hlen nicht als 0 Sitze). Gesamt = je Stream &times; &Oslash; Sitze.\">je Stream bei &Oslash; Sitzen, 60 s &#9432;</span>",
-        per != null && d.seats_mean != null ? `<b>${fmt(per, 1)}</b> tok/s je Stream bei &Oslash; <b>${fmt(d.seats_mean, 1)}</b> Sitzen${d.seats_min != null ? ` (${fmt(d.seats_min)}&ndash;${fmt(d.seats_max)})` : ""} &middot; Gesamt &asymp; ${fmt(per * d.seats_mean, 0)} tok/s${d.seats_src ? ` <span class="muted">(${esc(d.seats_src)})</span>` : ""}` : "—"],
-      d.seats ? ["Sitze dieser D-Phase (front.d_seats)", `${fmt(d.seats.n)} von ${fmt(d.seats.cap)}${d.seats.handoff_n != null ? " &middot; &uuml;bergeben " + fmt(d.seats.handoff_n) : ""} &middot; geparkt ${fmt(d.seats.parked_n)}${d.seats.clamped ? " (gekappt)" : ""}${d.seats.source ? ` <span class="muted">(${esc(d.seats.source)}, n des Wakes)</span>` : ""}`]
-        : ["Sitze dieser D-Phase", MISSTAG("front.d_seats (ab Build mit 8654c4e647)")],
+      ["<span title=\"Seats = batch size of the decode rounds, weighted by round time and averaged only over the time in which D decoded (sleep, flip, extend do not count as 0 seats). Total = per stream &times; avg seats.\">per stream at avg seats, 60 s &#9432;</span>",
+        per != null && d.seats_mean != null ? `<b>${fmt(per, 1)}</b> tok/s per stream at avg <b>${fmt(d.seats_mean, 1)}</b> seats${d.seats_min != null ? ` (${fmt(d.seats_min)}&ndash;${fmt(d.seats_max)})` : ""} &middot; total &asymp; ${fmt(per * d.seats_mean, 0)} tok/s${d.seats_src ? ` <span class="muted">(${esc(d.seats_src)})</span>` : ""}` : "—"],
+      d.seats ? ["Seats of this D phase (front.d_seats)", `${fmt(d.seats.n)} of ${fmt(d.seats.cap)}${d.seats.handoff_n != null ? " &middot; handed over " + fmt(d.seats.handoff_n) : ""} &middot; parked ${fmt(d.seats.parked_n)}${d.seats.clamped ? " (clamped)" : ""}${d.seats.source ? ` <span class="muted">(${esc(d.seats.source)}, n of the wake)</span>` : ""}`]
+        : ["Seats of this D phase", MISSTAG("front.d_seats (from build with 8654c4e647)")],
       ["accept len &middot; accept rate", `${fmt(d.accept_len, 2)} &middot; ${fmt(d.accept_rate, 2)}`],
-      ...ipcRankRows(b, g, "C3", (v) => `${v.gen_tps != null ? fmt(v.gen_tps, 1) + " tok/s (Deltas)" : "—"} &middot; accept len ${fmt(v.accept_len_mean != null ? v.accept_len_mean : v.accept_len_ewma, 2)}`),
-      ...ipcRankRows(b, g, "C5", (v) => `KV ${fmt(v.kv_tokens)} Tok${v.share != null ? " &middot; Anteil " + fmt(v.share, 3) : ""}${v.holds_kv === false ? " (h&auml;lt kein KV)" : ""} &middot; Sitze ${fmt(v.seats)}`),
-      ["Rechenrate (bs&times;accept / gpu-ms)", d.compute_tps != null ? `${fmt(d.compute_tps, 1)} tok/s` : "—"],
-      ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_decode_tps"], 2)],
-      ["KV-Belegung &middot; CUDA-Graph", `${d.full_use != null ? fmt(d.full_use * 100) + " %" : "—"} &middot; ${d.cuda_graph == null ? "—" : d.cuda_graph ? "ja" : "nein"}`],
+      ...ipcRankRows(b, g, "C3", (v) => `${v.gen_tps != null ? fmt(v.gen_tps, 1) + " tok/s (deltas)" : "—"} &middot; accept len ${fmt(v.accept_len_mean != null ? v.accept_len_mean : v.accept_len_ewma, 2)}`),
+      ...ipcRankRows(b, g, "C5", (v) => `KV ${fmt(v.kv_tokens)} tok${v.share != null ? " &middot; share " + fmt(v.share, 3) : ""}${v.holds_kv === false ? " (holds no KV)" : ""} &middot; seats ${fmt(v.seats)}`),
+      ["Compute rate (bs&times;accept / gpu-ms)", d.compute_tps != null ? `${fmt(d.compute_tps, 1)} tok/s` : "—"],
+      ["avg tok/s/W &middot; 60 s (curve mean, idle = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_decode_tps"], 2)],
+      ["KV occupancy &middot; CUDA graph", `${d.full_use != null ? fmt(d.full_use * 100) + " %" : "—"} &middot; ${d.cuda_graph == null ? "—" : d.cuda_graph ? "yes" : "no"}`],
     ])}
     ${charts}</div>`;
 }
 
 const plannedStopped = (b) => !!(((b.alarm || {}).planned_stop || {}).stopping);
+// alarm states (API: activity.py): the German codes are the contract; English aliases are accepted
+const ALARM_NORM = {GESTOPPT: "GESTOPPT", STOPPED: "GESTOPPT", TOT: "TOT", DEAD: "TOT", HAENGT: "HAENGT", HANGING: "HAENGT", HUNG: "HAENGT", WARNUNG: "WARNUNG", WARNING: "WARNUNG"};
+const alarmState = (a) => ALARM_NORM[(a || {}).state] || (a || {}).state;
 function alarmHtml(b, now) {
-  const a = b.alarm || {};
+  const a = Object.assign({}, b.alarm || {}, {state: alarmState(b.alarm)});
   if (a.state === "GESTOPPT") {
     const ps = a.planned_stop || {};
     const t0 = ps.teardown_t || ps.t;
-    return `<div class="alarm planned" role="status"><div class="head">■ gestoppt (geplant)${t0 ? ` <span style="font-size:13px;font-weight:600">seit ${hhmm(t0)} (${ago(now - t0)})</span>` : ""}</div>
-      <div class="why"><b>Stopp-Marker</b> &middot; ${esc(ps.text || "")}</div>
-      ${(ps.teardown || []).map((r) => `<div class="why muted">Abbau danach &middot; ${r.t ? hhmm(r.t) + " &middot; " : ""}${esc(r.text)}</div>`).join("")}</div>`;
+    return `<div class="alarm planned" role="status"><div class="head">■ stopped (planned)${t0 ? ` <span style="font-size:13px;font-weight:600">since ${hhmm(t0)} (${ago(now - t0)})</span>` : ""}</div>
+      <div class="why"><b>Stop marker</b> &middot; ${esc(ps.text || "")}</div>
+      ${(ps.teardown || []).map((r) => `<div class="why muted">Teardown afterwards &middot; ${r.t ? hhmm(r.t) + " &middot; " : ""}${esc(r.text)}</div>`).join("")}</div>`;
   }
   if (!a.state) return "";
   const cls = a.state === "TOT" ? "" : a.state === "HAENGT" ? "hang" : "warn";
   const groups = [...new Set((a.reasons || []).filter((r) => r.level === "dead" || r.level === "hang").map((r) => r.group).filter(Boolean))];
-  const head = a.state === "TOT" ? `GRUPPE ${groups.join(" + ") || ""} TOT`.replace("GRUPPE  TOT", "MODELL TOT")
-    : a.state === "HAENGT" ? (groups.length ? `GRUPPE ${groups.join(" + ")} H\u00c4NGT` : "MODELL H\u00c4NGT") : "WARNUNG";
+  const head = a.state === "TOT" ? `GROUP ${groups.join(" + ") || ""} DEAD`.replace("GROUP  DEAD", "MODEL DEAD")
+    : a.state === "HAENGT" ? (groups.length ? `GROUP ${groups.join(" + ")} HANGING` : "MODEL HANGING") : "WARNING";
   const since = (a.reasons || []).map((r) => r.t).filter((t) => t != null);
   const t0 = since.length ? Math.min(...since) : null;
-  return `<div class="alarm ${cls}" role="alert"><div class="head">${esc(head)}${t0 ? ` <span style="font-size:14px;font-weight:600">seit ${hhmm(t0)} (${ago(now - t0)})</span>` : ""}</div>
-    ${(a.reasons || []).map((r) => `<div class="why"><b>${r.level === "dead" ? "tot" : r.level === "hang" ? "h\u00e4ngt" : "Hinweis"}</b> &middot; ${r.t ? hhmm(r.t) + " &middot; " : ""}${esc(r.text)}</div>`).join("")}</div>`;
+  return `<div class="alarm ${cls}" role="alert"><div class="head">${esc(head)}${t0 ? ` <span style="font-size:14px;font-weight:600">since ${hhmm(t0)} (${ago(now - t0)})</span>` : ""}</div>
+    ${(a.reasons || []).map((r) => `<div class="why"><b>${r.level === "dead" ? "dead" : r.level === "hang" ? "hanging" : "note"}</b> &middot; ${r.t ? hhmm(r.t) + " &middot; " : ""}${esc(r.text)}</div>`).join("")}</div>`;
 }
 
 const pct = (x) => x == null ? "\u2014" : fmt(100 * x, x >= 0.995 || x < 0.1 ? 1 : 0) + " %";
 // D (Auftrag 880): the since-boot sum mixes 1-token admit extends with real prefill; the rates are over the ring and
-// real chunks only, the admit extends are named (Tokens je Request)
+// real chunks only, the admit extends are named (tokens per request)
 function dTileOpt(t) {
   const sp = t.d_split;
   if (!sp) return {};
   const w = sp.wide, a = sp.admit, ring = Math.round((sp.span_s || 0) / 60);
-  return {gpuLabel: `Prefill-Rate &middot; GPU-Rechenzeit, nur Chunks &ge; ${sp.min_chunk_tok} Tok (letzte ${ring} min)`,
-    wallLabel: `Prefill-Rate &middot; Wandzeit, nur Chunks &ge; ${sp.min_chunk_tok} Tok (letzte ${ring} min)`,
-    row: ["D-Admit/Extend (Tokens je Request), letzte " + ring + " min",
-      `${fmt(a.chunks)} Extends &middot; ${fmt(a.tokens)} Tok${a.tok_per_req != null ? ` &middot; &Oslash; ${fmt(a.tok_per_req, 1)} Tok je Request` : ""} <span class="muted">(Prefill: ${fmt(w.chunks)} Chunks, ${fmt(w.tokens)} Tok)</span>`]};
+  return {gpuLabel: `Prefill rate &middot; GPU compute time, only chunks &ge; ${sp.min_chunk_tok} tok (last ${ring} min)`,
+    wallLabel: `Prefill rate &middot; wall clock, only chunks &ge; ${sp.min_chunk_tok} tok (last ${ring} min)`,
+    row: ["D admit/extend (tokens per request), last " + ring + " min",
+      `${fmt(a.chunks)} extends &middot; ${fmt(a.tokens)} tok${a.tok_per_req != null ? ` &middot; avg ${fmt(a.tok_per_req, 1)} tok per request` : ""} <span class="muted">(prefill: ${fmt(w.chunks)} chunks, ${fmt(w.tokens)} tok)</span>`]};
 }
 function bootTile(label, tok, src, rGpu, rGpuNote, rWall, e, opt) {
   e = e || {};
   opt = opt || {};
   const wall = rWall == null ? "\u2014" : fmt(rWall, rWall < 100 ? 1 : 0);
   return `<div class="tile"><div class="label">${label}</div>
-    <div class="big num" style="font-size:24px">${fmt(tok)}<small>Tok (Summe)</small></div><div class="state">${src}</div>
+    <div class="big num" style="font-size:24px">${fmt(tok)}<small>tok (sum)</small></div><div class="state">${src}</div>
     ${kv([
-      [opt.gpuLabel || "&Oslash; tok/s seit Boot &middot; GPU-Rechenzeit", rGpu == null ? "\u2014" : fmt(rGpu, rGpu < 100 ? 1 : 0), "kvb"],
-      [opt.wallLabel || "&Oslash; tok/s seit Boot &middot; Wandzeit (inkl. Leerlauf und andere Phase)", wall],
+      [opt.gpuLabel || "avg tok/s since boot &middot; GPU compute time", rGpu == null ? "\u2014" : fmt(rGpu, rGpu < 100 ? 1 : 0), "kvb"],
+      [opt.wallLabel || "avg tok/s since boot &middot; wall clock (incl. idle and other phase)", wall],
       opt.row || null,
-      ["Energie je Token", e.j_per_tok == null ? "\u2014" : `${fmt(e.j_per_tok, e.j_per_tok < 1 ? 3 : 2)} J &middot; ${fmt(e.wh_per_1k, 3)} Wh/1k`],
-      ["&Oslash; tok/s/W seit Boot (Token / Energie)", e.tok_per_j == null ? "\u2014" : fmt(e.tok_per_j, 2)],
+      ["Energy per token", e.j_per_tok == null ? "\u2014" : `${fmt(e.j_per_tok, e.j_per_tok < 1 ? 3 : 2)} J &middot; ${fmt(e.wh_per_1k, 3)} Wh/1k`],
+      ["avg tok/s/W since boot (tokens / energy)", e.tok_per_j == null ? "\u2014" : fmt(e.tok_per_j, 2)],
     ])}
-    <div class="muted" style="font-size:10px">${rGpuNote}; Wandzeit = &Sigma; Token / Zeit seit Boot-Start (Boot-ID)</div></div>`;
+    <div class="muted" style="font-size:10px">${rGpuNote}; wall clock = &Sigma; tokens / time since boot start (boot ID)</div></div>`;
 }
 
-// D cached = Übergabe P->D + echter D-Präfix-Treffer; getrennt nur mit front.d_cached_tokens (8654c4e647)
+// D cached = handoff P->D + real D prefix hit; separated only with front.d_cached_tokens (8654c4e647)
 function dsplit(x) {
   if (!x) return "";
   const a = x.boot || {};
-  const v = a.handoff != null ? `Übergabe ${fmt(a.handoff)} &middot; D-Präfix-Treffer ${fmt(a.d_prefix_hit)} ${ipcTag("front.d_cached_tokens")}`
-    : `${MISSTAG("front.d_cached_tokens (ab Build mit 8654c4e647)")} <span class="muted">bis dahin z&auml;hlt D-cached als &Uuml;bergabe, nie als Cache</span>`;
-  return `<tr><td class="muted">&nbsp;&nbsp;davon</td><td colspan="6" class="num" style="text-align:left">${v}</td></tr>`;
+  const v = a.handoff != null ? `handoff ${fmt(a.handoff)} &middot; D prefix hit ${fmt(a.d_prefix_hit)} ${ipcTag("front.d_cached_tokens")}`
+    : `${MISSTAG("front.d_cached_tokens (from build with 8654c4e647)")} <span class="muted">until then D-cached counts as handoff, never as cache</span>`;
+  return `<tr><td class="muted">&nbsp;&nbsp;of which</td><td colspan="6" class="num" style="text-align:left">${v}</td></tr>`;
 }
 function cacheHtml(b, now, awake) {
   const c = b.cache || {}, t = b.totals || {};
@@ -1308,15 +1316,15 @@ function cacheHtml(b, now, awake) {
     const x = c[g]; if (!x) return "";
     const w = x.window || {}, a = x.boot || {};
     const hit = (o) => o.hit_share == null ? "\u2014" : `${pct(o.hit_share)} <span class="muted">(${fmt(o.cached)} / ${fmt(o.new)})</span>`;
-    const l2 = (o) => o.loadback_n ? `${fmt(o.loadback_n)} &times; &middot; ${fmt(o.loadback_tok)} Tok${o.l2_share != null ? " &middot; " + pct(o.l2_share) : ""}` : "0";
-    const l3 = (o) => !o.l3inc_n ? "0" : o.l3inc_share == null ? `${fmt(o.l3inc_n)} &times; &middot; ${MISSTAG("Anteil (ab Build mit 8654c4e647)")}`
+    const l2 = (o) => o.loadback_n ? `${fmt(o.loadback_n)} &times; &middot; ${fmt(o.loadback_tok)} tok${o.l2_share != null ? " &middot; " + pct(o.l2_share) : ""}` : "0";
+    const l3 = (o) => !o.l3inc_n ? "0" : o.l3inc_share == null ? `${fmt(o.l3inc_n)} &times; &middot; ${MISSTAG("share (from build with 8654c4e647)")}`
       : `${fmt(o.l3inc_n)} &times; &middot; ${pct(o.l3inc_share)} <span class="muted">(${fmt(o.l3inc_delivered)} / ${fmt(o.l3inc_deliverable)})</span>`;
     // Asleep P: the 60-s cell would only say "—"; show its last burst (from the backend) instead
     let w60 = hit(w);
     if (g === "P" && awake !== "P" && !w.chunks) {
       w60 = x.last_burst
-        ? `P schl&auml;ft &middot; letzter Burst ${hit(x.last_burst)} vor ${ago(now - x.last_burst_t)}`
-        : "P schl&auml;ft &middot; kein Burst im Speicher";
+        ? `P asleep &middot; last burst ${hit(x.last_burst)} ${ago(now - x.last_burst_t)} ago`
+        : "P asleep &middot; no burst in memory";
     }
     let bootCell = hit(a);
     if (g === "P") {
@@ -1328,30 +1336,30 @@ function cacheHtml(b, now, awake) {
     const x = c[g]; if (!x) return "";
     const w = x.window || {}, a = x.boot || {};
     const r = (o) => o.req_hit_share == null ? "\u2014" : `${pct(o.req_hit_share)} <span class="muted">(${fmt(o.cached)} / ${fmt(o.prompt)})</span>`;
-    const bu = x.bursts_n ? `<tr><td class="muted">&nbsp;&nbsp;davon Burst identischer Prompts (Bench)</td><td class="num">${x.window.hit_no_burst == null ? "—" : pct(x.window.hit_no_burst) + " <span class=\"muted\">ohne Burst</span>"}</td><td class="num">${x.ring && x.ring.hit_no_burst != null ? pct(x.ring.hit_no_burst) + ` <span class="muted">ohne Burst, ${fmt(x.ring.span_s / 60)} min</span>` : "—"}</td><td colspan="4" class="muted">${fmt(x.bursts_n)} Burst(s) in ${fmt((x.ring || {}).span_s / 60 || 16)} min: ${x.bursts.map((z) => `${z.n}&times;${fmt(z.len)} Tok um ${hhmm(z.t)}`).join(", ")} &middot; k gleiche Prompts im selben P-Pass: keiner kann auf den ersten warten, cached = 0 ist dort Physik, kein Cache-Fehler</td></tr>` : "";
-    return `<tr><td>${label}</td><td class="num">${r(w)}</td><td class="num">${r(a)}</td><td colspan="4" class="muted">${fmt(a.n)} Anfragen seit Boot</td></tr>` + bu;
+    const bu = x.bursts_n ? `<tr><td class="muted">&nbsp;&nbsp;of which burst of identical prompts (bench)</td><td class="num">${x.window.hit_no_burst == null ? "—" : pct(x.window.hit_no_burst) + " <span class=\"muted\">without burst</span>"}</td><td class="num">${x.ring && x.ring.hit_no_burst != null ? pct(x.ring.hit_no_burst) + ` <span class="muted">without burst, ${fmt(x.ring.span_s / 60)} min</span>` : "—"}</td><td colspan="4" class="muted">${fmt(x.bursts_n)} burst(s) in ${fmt((x.ring || {}).span_s / 60 || 16)} min: ${x.bursts.map((z) => `${z.n}&times;${fmt(z.len)} tok at ${hhmm(z.t)}`).join(", ")} &middot; k identical prompts in the same P pass: none can wait for the first, cached = 0 is physics there, not a cache error</td></tr>` : "";
+    return `<tr><td>${label}</td><td class="num">${r(w)}</td><td class="num">${r(a)}</td><td colspan="4" class="muted">${fmt(a.n)} requests since boot</td></tr>` + bu;
   };
   const prog = "";
   return `<div class="cachebox">
     <div class="tiles" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:10px">
-      ${bootTile("P-Prefill seit Boot", t.p_new, `rankstats prefill.new_tokens, erster Rang (${fmt(t.p_chunks)} Chunks), ohne Cache-Treffer`, t.p_rate_gpu, "GPU-Rechenzeit: prefill.new_tokens / prefill.compute_ms je Rang, langsamster Rang", t.p_rate_wall, E.P)}
-      ${bootTile(t.d_split ? "D-Prefill + Admit seit Boot" : "D-Prefill seit Boot", t.d_new, `rankstats prefill.new_tokens, TP0 (${fmt(t.d_chunks)} Chunks${t.d_mean_chunk != null ? `, &Oslash; ${fmt(t.d_mean_chunk, 1)} Tok je Chunk` : ""}), ohne &Uuml;bernahme/Cache`, t.d_rate_gpu, "GPU-Rechenzeit: prefill.new_tokens / prefill.compute_ms je Rang, langsamster Rang", t.d_rate_wall, E.D, dTileOpt(t))}
-      ${bootTile("Decode seit Boot", t.decoded, `rankstats decode.tokens, TP0 (${fmt(t.served_requests)} D-Beine bedient laut front.served)`, t.dec_rate_gpu, "GPU-Rechenzeit: decode.tokens / decode.gpu_ms (TP0)", t.dec_rate_wall, E.dec)}
+      ${bootTile("P prefill since boot", t.p_new, `rankstats prefill.new_tokens, first rank (${fmt(t.p_chunks)} chunks), without cache hits`, t.p_rate_gpu, "GPU compute time: prefill.new_tokens / prefill.compute_ms per rank, slowest rank", t.p_rate_wall, E.P)}
+      ${bootTile(t.d_split ? "D prefill + admit since boot" : "D prefill since boot", t.d_new, `rankstats prefill.new_tokens, TP0 (${fmt(t.d_chunks)} chunks${t.d_mean_chunk != null ? `, avg ${fmt(t.d_mean_chunk, 1)} tok per chunk` : ""}), without takeover/cache`, t.d_rate_gpu, "GPU compute time: prefill.new_tokens / prefill.compute_ms per rank, slowest rank", t.d_rate_wall, E.D, dTileOpt(t))}
+      ${bootTile("Decode since boot", t.decoded, `rankstats decode.tokens, TP0 (${fmt(t.served_requests)} D legs served per front.served)`, t.dec_rate_gpu, "GPU compute time: decode.tokens / decode.gpu_ms (TP0)", t.dec_rate_wall, E.dec)}
     </div>
-    <div class="muted" style="font-size:11px;margin:-4px 0 10px">Energie je Token: jedes abgeschlossene 5-s-Intervall kostet
-      (Mittel der Summe power.draw aller 3 Karten) &times; 5 s; das geht an die Klassen, deren Rang-Z&auml;hler (rankstats) in dem Intervall Arbeit zeigten
-      (mehrere: zu gleichen Teilen); Intervalle ohne Arbeit z&auml;hlen als Leerlauf (${fmt((en.idle_j || 0) / 3600, 1)} Wh) und keiner Klasse.
-      Token nur aus denselben Intervallen. Gemessen seit der Dashboard-Messung l&auml;uft: Abdeckung
-      ${en.coverage == null ? "\u2014" : fmt(100 * en.coverage) + " %"} der Bootdauer (${fmt((en.covered_s || 0) / 60)} min).</div>
-    <h3 style="font-size:13px;margin:4px 0 6px">Cache-Treffer${srcOf(b, "E1", "E2", "E3")}${prog}</h3>
+    <div class="muted" style="font-size:11px;margin:-4px 0 10px">Energy per token: every completed 5 s interval costs
+      (mean of the sum of power.draw of all 3 cards) &times; 5 s; this goes to the classes whose rank counters (rankstats) showed work in the interval
+      (several: in equal parts); intervals without work count as idle (${fmt((en.idle_j || 0) / 3600, 1)} Wh) and belong to no class.
+      Tokens only from the same intervals. Measured since the dashboard measurement has been running: coverage
+      ${en.coverage == null ? "\u2014" : fmt(100 * en.coverage) + " %"} of the boot duration (${fmt((en.covered_s || 0) / 60)} min).</div>
+    <h3 style="font-size:13px;margin:4px 0 6px">Cache hits${srcOf(b, "E1", "E2", "E3")}${prog}</h3>
     <div class="tablewrap"><table>
-      <tr><th></th><th class="num">aus Cache / neu &middot; 60 s</th><th class="num">seit Boot</th><th class="num">L2 Host: #988 Load-back &middot; 60 s</th><th class="num">seit Boot</th><th class="num">MAMBA-HOST-RESUME</th><th class="num">L3 Store: unvollst. Lesungen</th></tr>
-      ${row("P-Gruppe", "P")}${row("D-Gruppe", "D")}${dsplit(c.D)}${row("Gruppe", "single")}
-      ${req("Front je Anfrage, P-Bein (cached/prompt)", "served_P")}${req("Front je Anfrage, D-Bein (cached/prompt)", "served_D")}
+      <tr><th></th><th class="num">from cache / new &middot; 60 s</th><th class="num">since boot</th><th class="num">L2 host: #988 load-back &middot; 60 s</th><th class="num">since boot</th><th class="num">MAMBA-HOST-RESUME</th><th class="num">L3 store: incomplete reads</th></tr>
+      ${row("P group", "P")}${row("D group", "D")}${dsplit(c.D)}${row("Group", "single")}
+      ${req("Front per request, P leg (cached/prompt)", "served_P")}${req("Front per request, D leg (cached/prompt)", "served_D")}
     </table></div>
     ${prefetchRows(b)}
-    <div class="muted" style="font-size:11px;margin-top:4px">Quelle: rankstats des ersten Rangs je Gruppe (IPC). aus Cache = prefill.cached_tokens, neu = prefill.new_tokens (jeder Chunk einmal). Bei D ist &bdquo;aus Cache&ldquo; vor allem der von P &uuml;bergebene Pr&auml;fix, nicht nur echte Treffer.
-      L2: cache.loadback_n / loadback_tok. Mamba: cache.mamba_resume_n. L3: cache.store_incomplete_n (nur unvollst&auml;ndige Lesungen). Front je Anfrage: state.json front.served_tokens.</div>
+    <div class="muted" style="font-size:11px;margin-top:4px">Source: rankstats of the first rank per group (IPC). from cache = prefill.cached_tokens, new = prefill.new_tokens (every chunk once). For D, &ldquo;from cache&rdquo; is mostly the prefix handed over by P, not only real hits.
+      L2: cache.loadback_n / loadback_tok. Mamba: cache.mamba_resume_n. L3: cache.store_incomplete_n (incomplete reads only). Front per request: state.json front.served_tokens.</div>
   </div>`;
 }
 
@@ -1363,9 +1371,9 @@ function cacheHtml(b, now, awake) {
 // also direkt auf D = D-Legs − P-Legs (Spiegel alle 5 s, Umleitungen nicht erkennbar)
 function prefillOrt(b) {
   const r = b.prefill_route || {};
-  if (r.via_p == null) return ["Prefill-Ort (Anfragen)", MISSTAG("front.routes")];
-  const v = `&uuml;ber P ${fmt(r.via_p)} &middot; direkt auf D ${fmt(r.d_direct)}${r.d_drain != null ? " &middot; D-Drain " + fmt(r.d_drain) : ""}${r.reroute_midstream != null ? " &middot; umgeleitet " + fmt(r.reroute_midstream) : ""}`;
-  return ["Prefill-Ort (Anfragen)", r.exact ? `${v} ${ipcTag(r.src)}` : `${v} <span class="muted">(abgeleitet: D-Legs − P-Legs)</span> ${MISSTAG("front.routes (exakt)")}`];
+  if (r.via_p == null) return ["Prefill location (requests)", MISSTAG("front.routes")];
+  const v = `via P ${fmt(r.via_p)} &middot; directly on D ${fmt(r.d_direct)}${r.d_drain != null ? " &middot; D drain " + fmt(r.d_drain) : ""}${r.reroute_midstream != null ? " &middot; rerouted " + fmt(r.reroute_midstream) : ""}`;
+  return ["Prefill location (requests)", r.exact ? `${v} ${ipcTag(r.src)}` : `${v} <span class="muted">(derived: D legs − P legs)</span> ${MISSTAG("front.routes (exact)")}`];
 }
 function relHead(b, ipc, topo) {
   if (!ipc) return topo ? esc(topo) : "";
@@ -1391,68 +1399,68 @@ function bootCard(b, now, binders) {
   let flipHtml = "";
   if (recent.length) {
     const mx = Math.max(...recent.map((r) => r.ms), 1);
-    flipHtml = `<div class="flipbar" title="letzte Flips (blau P→D, orange D→P), Höhe = Flipzeit">${recent.map((r) =>
-      `<b class="${r.dir === "D>P" ? "dp" : ""}" style="height:${Math.max(6, 100 * r.ms / mx)}%" title="${esc(r.dir.replace(">", "→"))} Flipzeit ${fmt(r.ms)} ms um ${hhmm(r.t)}"></b>`).join("")}</div>`;
+    flipHtml = `<div class="flipbar" title="last flips (blue P→D, orange D→P), height = flip time">${recent.map((r) =>
+      `<b class="${r.dir === "D>P" ? "dp" : ""}" style="height:${Math.max(6, 100 * r.ms / mx)}%" title="${esc(r.dir.replace(">", "→"))} flip time ${fmt(r.ms)} ms at ${hhmm(r.t)}"></b>`).join("")}</div>`;
   }
   const errs = (fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.last : (b.errors || [])).slice(-3).reverse();
-  const st = (b.alarm || {}).state;
+  const st = alarmState(b.alarm);
   return `<section class="card ${st === "TOT" ? "dead" : st === "HAENGT" ? "hang" : ""}" id="boot-${esc(b.stem)}">
     ${alarmHtml(b, now)}
     <div class="boot-head">
       <span class="model">${esc((ipc && ipc.model) || m.model || b.stem)}</span>
-      ${plannedStopped(b) ? `<span class="badge stopped">■ gestoppt (geplant) &middot; ${b.live ? "Abbau l&auml;uft" : "keine IPC-Probe seit " + ago(b.age_s)}</span>`
+      ${plannedStopped(b) ? `<span class="badge stopped">■ stopped (planned) &middot; ${b.live ? "teardown running" : "no IPC sample for " + ago(b.age_s)}</span>`
         : ipc && ipc.terminal ? `<span class="badge ${ipc.lifecycle === "dead" ? "dead" : "stopped"}">■ ${esc(ipc.lifecycle)}${ipc.cause && ipc.cause.code ? " &middot; " + esc(ipc.cause.code) : ""} &middot; state.json</span>`
-        : `<span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "keine IPC-Probe seit " + ago(b.age_s)}</span>`}
-      ${b.live && ((b.alarm || {}).planned_stop || {}).t && !plannedStopped(b) ? `<span class="chip">Stopp angefordert ${hhmm(b.alarm.planned_stop.t)} (geplant)</span>` : ""}
-      ${awake ? `<span class="badge phase">wach: ${esc(awake)}${frState ? " &middot; Front: " + esc(frState) : flipping ? " &middot; flippt" : ""}</span>` : ""}
-      ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${DEV ? esc(c.Names) : "Container"} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Boot</span>`}
-      ${health.length && !plannedStopped(b) ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (front.groups)${srcOf(b, "A12")}</span>` : ""}
+        : `<span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "no IPC sample for " + ago(b.age_s)}</span>`}
+      ${b.live && ((b.alarm || {}).planned_stop || {}).t && !plannedStopped(b) ? `<span class="chip">Stop requested ${hhmm(b.alarm.planned_stop.t)} (planned)</span>` : ""}
+      ${awake ? `<span class="badge phase">awake: ${esc(awake)}${frState ? " &middot; front: " + esc(frState) : flipping ? " &middot; flipping" : ""}</span>` : ""}
+      ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${DEV ? esc(c.Names) : "Container"} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">no running container for this boot</span>`}
+      ${health.length && !plannedStopped(b) ? `<span class="chip bad">Group ${health.map((h) => esc(h.group)).join(", ")} dead (front.groups)${srcOf(b, "A12")}</span>` : ""}
     </div>
     <div class="muted x" style="font-size:12px;margin:-6px 0 10px">
       ${!DEV ? relHead(b, ipc, topo) : `<span class="mono">${esc(m.tag || b.stem)}</span>${ipc
-        ? ` &middot; REV ${esc(ipc.rev)} &middot; Profil ${esc(ipc.profile)} &middot; ${esc(ipc.image)} &middot; lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json " + (ipc.boot_id || ""))}`
-        : `${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}`}${fieldIpc(b, "A4") ? " &middot; " + esc(Object.entries(fieldIpc(b, "A4").value).map(([g, f]) => g + ": " + (f && typeof f === "object" ? (f.describe || Object.entries(f).map(([k, v]) => k + "=" + (typeof v === "object" ? JSON.stringify(v) : v)).join(" ")) : f)).join(" | ")) + " " + ipcTag("state.json groups.form") : m.form ? " &middot; " + esc(m.form) + srcOf(b, "A4") : ""}
-      ${b.fields_summary ? ` &middot; <span class="muted" title="fehlt in IPC: ${esc((b.fields_summary.fehlt_keys || []).join(", "))}">Felder aus IPC ${b.fields_summary.ipc}/${b.fields_summary.n}</span>` : ""}
+        ? ` &middot; REV ${esc(ipc.rev)} &middot; profile ${esc(ipc.profile)} &middot; ${esc(ipc.image)} &middot; lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json " + (ipc.boot_id || ""))}`
+        : `${m.sha ? " &middot; tree " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}`}${fieldIpc(b, "A4") ? " &middot; " + esc(Object.entries(fieldIpc(b, "A4").value).map(([g, f]) => g + ": " + (f && typeof f === "object" ? (f.describe || Object.entries(f).map(([k, v]) => k + "=" + (typeof v === "object" ? JSON.stringify(v) : v)).join(" ")) : f)).join(" | ")) + " " + ipcTag("state.json groups.form") : m.form ? " &middot; " + esc(m.form) + srcOf(b, "A4") : ""}
+      ${b.fields_summary ? ` &middot; <span class="muted" title="missing in IPC: ${esc((b.fields_summary.fehlt_keys || []).join(", "))}">fields from IPC ${b.fields_summary.ipc}/${b.fields_summary.n}</span>` : ""}
     </div>
     ${phaseHtml(b)}
     <div class="tiles">
-      ${prefillTile(b, "P", "var(--s1)", "P-Prefill", binders, now)}
-      ${prefillTile(b, "D", "var(--s2)", "D-Prefill <small class=\"muted\" title=\"Rate nur aus Chunks mit mindestens 64 neuen Tokens; die 1-Token-Admit-Extends nach der Übergabe stehen getrennt als D-Admit/Extend\">(Chunks &ge; 64 Tok)</small>", binders, now)}
+      ${prefillTile(b, "P", "var(--s1)", "P prefill", binders, now)}
+      ${prefillTile(b, "D", "var(--s2)", "D prefill <small class=\"muted\" title=\"Rate only from chunks with at least 64 new tokens; the 1-token admit extends after the handoff are shown separately as D admit/extend\">(chunks &ge; 64 tok)</small>", binders, now)}
       ${decodeTile(b, "D", "var(--s3)", binders, now)}
-      <div class="tile"><div class="label">Flips &middot; Warteschlange${srcOf(b, "B1", "B2", "B3", "B4", "B5", "B6")}</div>
+      <div class="tile"><div class="label">Flips &middot; queue${srcOf(b, "B1", "B2", "B3", "B4", "B5", "B6")}</div>
         <div class="big num">${fmt(fieldIpc(b, "B4") ? fieldIpc(b, "B4").value.n : b.flip_count)}<small>Flips</small></div>
-        <div class="state">${lastFlip ? `letzter ${esc(lastFlip.slept)}→${esc(lastFlip.woke)} vor ${ago(now - lastFlip.t)}` : "noch kein Flip"}</div>
+        <div class="state">${lastFlip ? `last ${esc(lastFlip.slept)}→${esc(lastFlip.woke)} ${ago(now - lastFlip.t)} ago` : "no flip yet"}</div>
         ${kv([
           ...["P>D", "D>P"].map((dir) => {
             const fz = flipWinOf(b), f = flipWin(fz, dir), miss = flipMissing(b, dir);
-            return [`<b>Flipzeit ${dir.replace(">", "&rarr;")}</b> <span class="muted" title="${esc(FLIP_DEF[dir])}">(letzte)</span>`,
-              (miss ? `<b>neuester: ${miss}</b>` + (f.n ? "<br>" : "") : "")
-              + (f.n ? `<b>${sec(f.last_ms)} s</b> <span class="muted">&middot; ${flipStats(f)} &middot; ${esc(flipWinLabel(fz))}${f.idle_n ? " &middot; Leerlauf-Flips " + f.idle_n : ""}</span><br><span class="muted">${flipParts(f, dir)}</span>`
+            return [`<b>Flip time ${dir.replace(">", "&rarr;")}</b> <span class="muted" title="${esc(FLIP_DEF[dir])}">(last)</span>`,
+              (miss ? `<b>newest: ${miss}</b>` + (f.n ? "<br>" : "") : "")
+              + (f.n ? `<b>${sec(f.last_ms)} s</b> <span class="muted">&middot; ${flipStats(f)} &middot; ${esc(flipWinLabel(fz))}${f.idle_n ? " &middot; idle flips " + f.idle_n : ""}</span><br><span class="muted">${flipParts(f, dir)}</span>`
                 + flipDepth(b, dir, f)
                 : miss ? "" : "—"), "keep"];
           }),
-          ["Warteschlange Front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : MISSTAG("front.queue")), "keep"],
-          fr && fr.served ? ["bedient P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)} ${ipcTag(fr.src || "/weg2/state")}`] : null,
+          ["Queue front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : MISSTAG("front.queue")), "keep"],
+          fr && fr.served ? ["served P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)} ${ipcTag(fr.src || "/weg2/state")}`] : null,
           prefillOrt(b),
-          ["Fehlerzeilen (ERROR)", fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count) + " " + srcOf(b, "A13")],
-          ["Rang-Stopps (benannt)", fieldIpc(b, "A14") ? fieldIpc(b, "A14").value.slice(-3).map((x) => `${esc(x.group)}.${esc(x.rank)} ${esc(x.code)}${x.ticket ? " " + esc(x.ticket) : ""}`).join(" &middot; ") + " " + ipcTag(fieldIpc(b, "A14").ipc_src) : fmt(b.stop_count || 0) + " " + srcOf(b, "A14")],
-          fieldIpc(b, "C6") ? ["D-Sitze n &middot; geparkt", `${fmt(fieldIpc(b, "C6").value.n)} &middot; ${fmt(fieldIpc(b, "C6").value.parked_n)} ${ipcTag("front.d_seats")}`] : null,
+          ["Error lines (ERROR)", fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count) + " " + srcOf(b, "A13")],
+          ["Rank stops (named)", fieldIpc(b, "A14") ? fieldIpc(b, "A14").value.slice(-3).map((x) => `${esc(x.group)}.${esc(x.rank)} ${esc(x.code)}${x.ticket ? " " + esc(x.ticket) : ""}`).join(" &middot; ") + " " + ipcTag(fieldIpc(b, "A14").ipc_src) : fmt(b.stop_count || 0) + " " + srcOf(b, "A14")],
+          fieldIpc(b, "C6") ? ["D seats n &middot; parked", `${fmt(fieldIpc(b, "C6").value.n)} &middot; ${fmt(fieldIpc(b, "C6").value.parked_n)} ${ipcTag("front.d_seats")}`] : null,
         ])}
-        ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${recent.length} gezählte Flips, Höhe = Flipzeit &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
+        ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">last ${recent.length} counted flips, height = flip time &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
       </div>
     </div>
     <div class="x">${cacheHtml(b, now, awake)}</div>
     ${tiersHtml(b)}
-    ${!DEV ? "" : ipc && Object.keys(ipc.launch || {}).length ? `<details class="x" id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform je Gruppe (argv + Schalter-Env) ${ipcTag("state.json groups.launch")}</summary><div class="launch mono">${Object.entries(ipc.launch).map(([g, l]) => `<div><b>${esc(g)}</b> ${esc((l.argv || []).join(" "))}</div>${Object.entries(l.env || {}).map(([k, v]) => `<div>&nbsp;&nbsp;${esc(k)}=${esc(v)}</div>`).join("")}`).join("")}</div></details>`
+    ${!DEV ? "" : ipc && Object.keys(ipc.launch || {}).length ? `<details class="x" id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Launch form per group (argv + switch env) ${ipcTag("state.json groups.launch")}</summary><div class="launch mono">${Object.entries(ipc.launch).map(([g, l]) => `<div><b>${esc(g)}</b> ${esc((l.argv || []).join(" "))}</div>${Object.entries(l.env || {}).map(([k, v]) => `<div>&nbsp;&nbsp;${esc(k)}=${esc(v)}</div>`).join("")}`).join("")}</div></details>`
       : ""}
-    ${errs.length ? `<details class="x" id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count)})${srcOf(b, "A13")}</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
+    ${errs.length ? `<details class="x" id="err-${esc(b.stem)}" style="margin-top:10px"><summary>last error lines (${fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count)})${srcOf(b, "A13")}</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
   </section>`;
 }
 
 function gpusHtml(d, binders) {
   const g = d.gpus || {};
   const cards = g.value || [];
-  if (!cards.length) return `<div class="err">${esc(g.error || "keine Karten")}</div>`;
+  if (!cards.length) return `<div class="err">${esc(g.error || "no cards")}</div>`;
   const pcie = {};
   (((d.pcie || {}).value) || []).forEach((p) => { pcie[p.index] = p; });
   return cards.map((c, i) => {
@@ -1461,50 +1469,50 @@ function gpusHtml(d, binders) {
     const rx = pc.rx_mb_s, tx = pc.tx_mb_s;
     return `<div class="gpu">
       <div class="name">${esc(c.name.replace("NVIDIA GeForce ", ""))} <span>nvml ${c.index} &middot; ${fmt(c["temperature.gpu"])} &deg;C &middot; ${fmt(c["clocks.sm"])} MHz</span></div>
-      <div class="meter">Leistung <b class="num">${fmt(pw)} / ${fmt(pl)} W</b><div class="bar"><b style="width:${pl ? Math.min(100, 100 * pw / pl) : 0}%"></b></div></div>
-      <div class="meter">VRAM <b class="num">${fmt(mu / 1024, 1)} / ${fmt(mt / 1024, 1)} GiB</b> &middot; Last ${fmt(c["utilization.gpu"])} %<div class="bar"><b style="width:${mt ? Math.min(100, 100 * mu / mt) : 0}%"></b></div></div>
-      <div class="meter">PCIe &Oslash; 3 s <b class="num">RX ${fmt(rx, 1)} &middot; TX ${fmt(tx, 1)} MB/s</b>
-        &middot; Speichertakt <b class="num">${fmt(c["clocks.mem"])} MHz</b><span class="x"> / max ${fmt(c["clocks.max.mem"])}</span>
-        <div class="x" style="font-size:11.5px">Link Gen ${fmt(c["pcie.link.gen.current"])}/${fmt(c["pcie.link.gen.max"])} &middot; x${fmt(c["pcie.link.width.current"])}/x${fmt(c["pcie.link.width.max"])} <span class="muted">(aktuell/max, NVML; im Leerlauf schaltet der Link herunter)</span></div></div>
+      <div class="meter">Power <b class="num">${fmt(pw)} / ${fmt(pl)} W</b><div class="bar"><b style="width:${pl ? Math.min(100, 100 * pw / pl) : 0}%"></b></div></div>
+      <div class="meter">VRAM <b class="num">${fmt(mu / 1024, 1)} / ${fmt(mt / 1024, 1)} GiB</b> &middot; load ${fmt(c["utilization.gpu"])} %<div class="bar"><b style="width:${mt ? Math.min(100, 100 * mu / mt) : 0}%"></b></div></div>
+      <div class="meter">PCIe avg 3 s <b class="num">RX ${fmt(rx, 1)} &middot; TX ${fmt(tx, 1)} MB/s</b>
+        &middot; memory clock <b class="num">${fmt(c["clocks.mem"])} MHz</b><span class="x"> / max ${fmt(c["clocks.max.mem"])}</span>
+        <div class="x" style="font-size:11.5px">Link Gen ${fmt(c["pcie.link.gen.current"])}/${fmt(c["pcie.link.gen.max"])} &middot; x${fmt(c["pcie.link.width.current"])}/x${fmt(c["pcie.link.width.max"])} <span class="muted">(current/max, NVML; the link steps down when idle)</span></div></div>
     </div>`;
   }).join("");
 }
 
-// <!--DEV:BEGIN-->  (Container, gpuq, Features Soll/Ist, Bausteine, Image-Änderungen, Letzte Boots: nur Rig-Ausgabe)
+// <!--DEV:BEGIN-->  (containers, gpuq, features target/actual, building blocks, image changes, recent boots: rig edition only)
 function containersHtml(d) {
   const dk = d.docker;
-  if (!dk) return `<div class="muted">Docker-Abfrage abgeschaltet</div>`;
+  if (!dk) return `<div class="muted">Docker query switched off</div>`;
   const rows = dk.value || [];
   let h = dk.error ? `<div class="err">${esc(dk.error)}</div>` : "";
-  if (!rows.length) return h + `<div class="muted">kein htsglang-Container auf dem Host</div>`;
-  h += `<table><tr><th>Name</th><th>Zustand</th><th>Image</th><th>Ports</th></tr>` + rows.map((r) =>
+  if (!rows.length) return h + `<div class="muted">no htsglang container on the host</div>`;
+  h += `<table><tr><th>Name</th><th>State</th><th>Image</th><th>Ports</th></tr>` + rows.map((r) =>
     `<tr><td class="mono">${esc(r.Names)}</td><td><span class="chip ${r.State !== "running" ? "bad" : /unhealthy/.test(r.Status || "") ? "warn" : "ok"}">${esc(r.Status)}</span></td><td class="mono">${esc(r.Image)}</td><td class="mono">${esc(r.Ports)}</td></tr>`).join("") + `</table>`;
-  return h + `<div class="muted" style="font-size:12px;margin-top:4px">Stand vor ${ago(dk.age_s)}</div>`;
+  return h + `<div class="muted" style="font-size:12px;margin-top:4px">Status ${ago(dk.age_s)} ago</div>`;
 }
 
 function gpuqHtml(d) {
   const q = d.gpuq || {};
   const v = q.value;
-  if (!v) return `<div class="err">${esc(q.error || "gpuq nicht erreichbar")}</div>`;
+  if (!v) return `<div class="err">${esc(q.error || "gpuq not reachable")}</div>`;
   const cards = v.cards || [];
   const ownerOf = (id) => { const b = (v.bookings || []).find((x) => x.id === id); return b ? b.owner : id; };
-  let h = `<div class="chips">${cards.map((c) => `<span class="chip ${c.busy ? "warn" : "ok"}">${c.index} ${esc(c.short_name)} &middot; frei ${fmt(c.free_mib)} MiB${c.current_booking ? " &middot; " + esc(ownerOf(c.current_booking)) : ""}</span>`).join("")}</div>`;
+  let h = `<div class="chips">${cards.map((c) => `<span class="chip ${c.busy ? "warn" : "ok"}">${c.index} ${esc(c.short_name)} &middot; free ${fmt(c.free_mib)} MiB${c.current_booking ? " &middot; " + esc(ownerOf(c.current_booking)) : ""}</span>`).join("")}</div>`;
   const bk = v.bookings || [];
-  if (!bk.length) return h + `<div class="muted">kein laufendes oder wartendes Fenster</div>`;
-  return h + `<table><tr><th>Wer</th><th>Zustand</th><th>Karten</th><th>von</th><th>bis</th><th>Zweck</th></tr>` + bk.map((b) =>
+  if (!bk.length) return h + `<div class="muted">no running or waiting window</div>`;
+  return h + `<table><tr><th>Who</th><th>State</th><th>Cards</th><th>from</th><th>to</th><th>Purpose</th></tr>` + bk.map((b) =>
     `<tr><td class="mono">${esc(b.owner)}</td><td>${esc(b.state)}</td><td>${esc((b.cards || []).join(","))}${b.mib ? " &middot; " + fmt(b.mib) + " MiB" : ""}</td><td>${esc(((b.start || {}).local || "").slice(11, 16))}</td><td>${esc(((b.end || {}).local || "").slice(11, 16))}</td><td>${esc(b.purpose)}</td></tr>`).join("") + `</table>`;
 }
 
-const IMG_STATUS = ["belegt", "wirkungslos", "unbelegt", "erwartet", "unbekannt"];
+const IMG_STATUS = ["belegt", "wirkungslos", "unbelegt", "erwartet", "unbekannt"];   // API values (image_changes), shown via en()
 let featOnlyOff = false;
 try { featOnlyOff = localStorage.getItem("rigdash-feat-only-off") === "1"; } catch (e) { /* no storage */ }
 function featPill(v, title) {
   const st = (v || {}).state || "unbekannt";
-  return `<span class="pill f-${esc(st)}" title="${esc(title || "")}">${esc(st)}</span>`;
+  return `<span class="pill f-${esc(st)}" title="${esc(title || "")}">${esc(en(st))}</span>`;
 }
 function featImTitle(im) {
   if (!im) return "";
-  if (im.state === "ja") return `${im.how}: ${im.sha}${im.line_sha ? " = " + im.line_sha + " auf der Image-Linie" : ""}`;
+  if (im.state === "ja") return `${im.how}: ${im.sha}${im.line_sha ? " = " + im.line_sha + " on the image line" : ""}`;
   return im.detail || "";
 }
 function featAkTitle(ak) {
@@ -1516,22 +1524,22 @@ function featGainHtml(g) {
   if (!g.length) return `<span class="muted">&mdash;</span>`;
   return g.map((x) => `<div class="gain" title="${esc((x.quelle || "") + (x.boot ? " \u00b7 " + x.boot : ""))}">${esc(x.metrik)}: ${esc(x.vorher != null ? x.vorher + " \u2192 " : "")}<b>${esc(x.nachher)}</b> ${esc(x.einheit || "")} <span class="art">${esc(x.art)}</span></div>`).join("");
 }
-// Produkt-Features Soll/Ist (Nutzer 29.09.: "Bugfixes sind keine Features") -- Commits nur als Bausteine darunter
+// Product features target/actual (user 29.09.: "bugfixes are not features") -- commits only as building blocks below
 const PROD_MODELS = ["27B", "NF"];
 function prodSlug(st) { return String(st || "unbelegt").toLowerCase().replace("fertig+aktiv", "fertig-aktiv").replace(/ä/g, "ae").replace(/[^a-z0-9]+/g, "-"); }
 function prodIst(x) {
-  const v = x.wert ? esc(x.wert) : `<span class="muted">${x.status === "unbelegt" || !x.status ? "unbelegt" : "&mdash;"}</span>`;
-  const am = x.belegt_am ? `<div class="am">belegt ${esc(x.belegt_am)}</div>` : "";
-  return x.veraltet ? `<div class="stale">${v}<div class="stale-note">Ist veraltet, neu messen</div>${am}</div>` : v + am;
+  const v = x.wert ? esc(x.wert) : `<span class="muted">${x.status === "unbelegt" || !x.status ? "unverified" : "&mdash;"}</span>`;
+  const am = x.belegt_am ? `<div class="am">verified ${esc(x.belegt_am)}</div>` : "";
+  return x.veraltet ? `<div class="stale">${v}<div class="stale-note">Actual is stale, measure again</div>${am}</div>` : v + am;
 }
 function prodAkt(a) {
   if (!a) return `<span class="muted">&mdash;</span>`;
   let t = a.wert ? `<span title="${esc(a.instrument || "")}">${esc(a.wert)}</span>`
-    : a.kein_instrument ? `<span class="muted">kein Instrument: ${esc(a.kein_instrument)}</span>` : `<span class="muted">${esc(a.leer || "")}</span>`;
+    : a.kein_instrument ? `<span class="muted">no instrument: ${esc(a.kein_instrument)}</span>` : `<span class="muted">${esc(a.leer || "")}</span>`;
   const jf = a.je_format || {};
   const run = Object.keys(jf).filter((f) => jf[f] === "dieser Boot");
   const rest = Object.keys(jf).filter((f) => !run.includes(f));
-  if (run.length) t += `<div class="am">Format ${esc(run.join("/"))}${rest.length ? " &middot; " + esc(rest.join("/")) + ": kein Boot" : ""}</div>`;
+  if (run.length) t += `<div class="am">Format ${esc(run.join("/"))}${rest.length ? " &middot; " + esc(rest.join("/")) + ": no boot" : ""}</div>`;
   return t;
 }
 function prodKreuz(p, achsen) {
@@ -1548,7 +1556,7 @@ function prodKreuz(p, achsen) {
       + achsen.map((a, i) => `<tr><td><b>${esc(a.name)}</b></td>` + achsen.map((b, j) => {
         if (j < i) return "<td></td>";
         const z = c[key(a.key, b.key)] || { status: "unbelegt" };
-        return `<td class="${cls[z.status] || ""}" title="${esc(z.note || "")}">${esc(z.status)}${z.note ? " *" : ""}</td>`;
+        return `<td class="${cls[z.status] || ""}" title="${esc(z.note || "")}">${esc(en(z.status))}${z.note ? " *" : ""}</td>`;
       }).join("") + "</tr>").join("") + "</table></div></div>";
   }).join("");
 }
@@ -1556,29 +1564,30 @@ function prodUnter(p) {
   const ut = p.untertabelle;
   if (!ut || !(ut.zeilen || []).length) return "";
   const cell = (x) => !x ? `<span class="muted">&mdash;</span>`
-    : (x.status ? `<span class="pill p-${prodSlug(x.status)}">${esc(x.status)}</span> ` : "") + prodIst(x) + (x.beleg ? `<div class="am">${esc(x.beleg)}</div>` : "");
-  return `<div class="tablewrap"><table><tr><th>${esc(ut.spalte || "Zeile")}</th><th>Soll</th><th>Ist 27B</th><th>Ist NF</th><th>im aktuellen Boot</th></tr>`
+    : (x.status ? `<span class="pill p-${prodSlug(x.status)}">${esc(en(x.status))}</span> ` : "") + prodIst(x) + (x.beleg ? `<div class="am">${esc(x.beleg)}</div>` : "");
+  return `<div class="tablewrap"><table><tr><th>${esc(ut.spalte || "Row")}</th><th>Target</th><th>Actual 27B</th><th>Actual NF</th><th>in the current boot</th></tr>`
     + ut.zeilen.map((z) => `<tr><td><b>${esc(z.name)}</b></td><td>${esc(z.soll || "")}</td><td>${cell((z.ist || {})["27B"])}</td><td>${cell((z.ist || {}).NF)}</td>
       <td class="am">${Object.entries(z.aktuell || {}).map(([m, v]) => esc(m + ": " + v)).join("<br>")}</td></tr>`).join("") + "</table></div>";
 }
-const MX_TIEFE = ["kurz", "2k", "10k", "32k", "97k", "257k", "gemischt"], MX_TEXT = ["code", "prosa", "thinking", "gemischt"];
+const MX_TIEFE = ["kurz", "2k", "10k", "32k", "97k", "257k", "gemischt"], MX_TEXT = ["code", "prosa", "thinking", "gemischt"];   // API keys of the matrix cells, shown via en()
 const MX_BS = ["1", "2", "3", "4", "5", "6"];
+const MX_EN = {"kurz": "short", "gemischt": "mixed", "prosa": "prose"};
 function prodMatrix(p) {
   const mx = p.matrix;
   if (!mx) return "";
   return PROD_MODELS.map((m) => {
     const c = (mx.zellen || {})[m] || {};
     const forms = [...new Set(Object.keys(c).map((k) => k.split("|")[0]))];
-    if (!forms.length) return `<div style="margin-top:6px"><b>${m}</b> <span class="muted">alle Zellen ungemessen</span></div>`;
+    if (!forms.length) return `<div style="margin-top:6px"><b>${m}</b> <span class="muted">all cells unmeasured</span></div>`;
     return `<div style="margin-top:6px"><b>${m}</b>` + forms.map((f) => {
       const rows = [];
       MX_TIEFE.forEach((t) => MX_TEXT.forEach((x) => { if (MX_BS.some((b) => c[[f, b, t, x].join("|")])) rows.push([t, x]); }));
-      return `<div class="muted" style="margin-top:4px">${esc(f)} &middot; &uuml;brige Tiefe/Text-Zeilen ungemessen</div><div class="tablewrap"><table class="mx"><tr><th>Tiefe</th><th>Text</th>${MX_BS.map((b) => `<th>bs${b}</th>`).join("")}</tr>`
-        + rows.map(([t, x]) => `<tr><td>${t}</td><td>${x}</td>` + MX_BS.map((b) => {
+      return `<div class="muted" style="margin-top:4px">${esc(f)} &middot; remaining depth/text rows unmeasured</div><div class="tablewrap"><table class="mx"><tr><th>Depth</th><th>Text</th>${MX_BS.map((b) => `<th>bs${b}</th>`).join("")}</tr>`
+        + rows.map(([t, x]) => `<tr><td>${esc(MX_EN[t] || t)}</td><td>${esc(MX_EN[x] || x)}</td>` + MX_BS.map((b) => {
           const z = c[[f, b, t, x].join("|")];
-          if (!z) return `<td class="m-leer">ungemessen</td>`;
+          if (!z) return `<td class="m-leer">unmeasured</td>`;
           const tip = esc([z.boot, z.beleg, z.quelle].filter(Boolean).join(" · "));
-          return z.status === "ungültig" ? `<td class="m-ung" title="${tip}">ung&uuml;ltig</td>` : `<td title="${tip}">${esc(z.wert)}</td>`;
+          return z.status === "ungültig" ? `<td class="m-ung" title="${tip}">invalid</td>` : `<td title="${tip}">${esc(z.wert)}</td>`;
         }).join("") + "</tr>").join("") + "</table></div>";
     }).join("") + "</div>";
   }).join("");
@@ -1586,64 +1595,64 @@ function prodMatrix(p) {
 function prodBausteine(p) {
   const bs = p.bausteine || [];
   if (!bs.length) return `<span class="muted">&mdash;</span>`;
-  return `<details id="pb-${esc(p.id)}"><summary>${bs.length} Baustein${bs.length === 1 ? "" : "e"}</summary>`
+  return `<details id="pb-${esc(p.id)}"><summary>${bs.length} building block${bs.length === 1 ? "" : "s"}</summary>`
     + bs.map((b) => `<div style="margin-top:4px"><b class="mono">${esc(b.id)}</b> ${esc(b.titel || "")}`
-      + Object.entries(b.je_modell || {}).map(([m, r]) => `<div class="am">${m}: ${r.fertig ? "fertig" : "nicht fertig"} &middot; im Image ${esc((r.im_image || {}).state)} &middot; aktiv ${esc(r.aktiv)}${r.image_aber_aus && r.aus_begruendung ? " &middot; aus: " + esc(r.aus_begruendung) : ""}</div>`).join("")
+      + Object.entries(b.je_modell || {}).map(([m, r]) => `<div class="am">${m}: ${r.fertig ? "done" : "not done"} &middot; in image ${esc(en((r.im_image || {}).state))} &middot; active ${esc(en(r.aktiv))}${r.image_aber_aus && r.aus_begruendung ? " &middot; off: " + esc(r.aus_begruendung) : ""}</div>`).join("")
       + `</div>`).join("") + `</details>`;
 }
 function prodHtml(d) {
   const fv = d.features;
-  if (!fv || !(fv.produkt || []).length) return `<div class="muted">keine Produkt-Features in features.json</div>`;
+  if (!fv || !(fv.produkt || []).length) return `<div class="muted">no product features in features.json</div>`;
   const achsen = fv.kreuz_achsen || [];
   const nStale = fv.produkt.reduce((n, p) => n + PROD_MODELS.filter((m) => (p.ist[m] || {}).veraltet).length, 0);
-  return `<div class="muted" style="margin:-4px 0 8px">${fv.produkt.length} Features &middot; ${nStale} Ist-Zellen veraltet (Beleg &auml;lter als der letzte Boot)</div><div class="tablewrap"><table class="prod">
-    <tr><th>#</th><th>Feature</th><th>Soll</th><th>Ist 27B</th><th>Ist NF</th><th>Soll erreicht?</th><th>Status</th><th class="x">Beleg</th><th>Wert im aktuellen Boot</th><th>Bausteine</th></tr>`
+  return `<div class="muted" style="margin:-4px 0 8px">${fv.produkt.length} features &middot; ${nStale} actual cells stale (evidence older than the last boot)</div><div class="tablewrap"><table class="prod">
+    <tr><th>#</th><th>Feature</th><th>Target</th><th>Actual 27B</th><th>Actual NF</th><th>Target reached?</th><th>Status</th><th class="x">Evidence</th><th>Value in the current boot</th><th>Building blocks</th></tr>`
     + fv.produkt.map((p) => {
       const ist = p.ist || {};
       const st = PROD_MODELS.map((m) => {
         const x = ist[m] || {};
-        return `<div>${m}: <span class="pill p-${prodSlug(x.status)}" title="${esc(x.status_text || x.grund || "")}">${esc(x.status || "unbelegt")}</span>${x.grund ? `<div class="am">${esc(x.grund)}</div>` : ""}</div>`;
+        return `<div>${m}: <span class="pill p-${prodSlug(x.status)}" title="${esc(x.status_text || x.grund || "")}">${esc(en(x.status || "unbelegt"))}</span>${x.grund ? `<div class="am">${esc(x.grund)}</div>` : ""}</div>`;
       }).join("");
       const erc = PROD_MODELS.map((m) => {
         const x = ist[m] || {};
-        return `<div>${m}: ${x.erreicht ? `<span class="pill e-${esc(x.erreicht)}">${esc(x.erreicht)}</span>` : `<span class="muted">&mdash;</span>`}${x.erreicht_grund ? `<div class="am">${esc(x.erreicht_grund)}</div>` : ""}</div>`;
+        return `<div>${m}: ${x.erreicht ? `<span class="pill e-${esc(x.erreicht)}">${esc(en(x.erreicht))}</span>` : `<span class="muted">&mdash;</span>`}${x.erreicht_grund ? `<div class="am">${esc(x.erreicht_grund)}</div>` : ""}</div>`;
       }).join("");
       const bel = PROD_MODELS.filter((m) => (ist[m] || {}).beleg).map((m) => `<div><b>${m}:</b> ${esc(ist[m].beleg)}${ist[m].quelle ? ` <span class="am">(${esc(ist[m].quelle)})</span>` : ""}</div>`).join("") || `<span class="muted">&mdash;</span>`;
       const akt = PROD_MODELS.map((m) => `<div><b>${m}:</b> ${prodAkt((p.aktuell || {})[m])}</div>`).join("");
       const extra = [
-        p.kreuztabelle ? `<details id="pk-${esc(p.id)}"><summary>Kreuztabelle</summary>${prodKreuz(p, achsen)}</details>` : "",
-        p.untertabelle ? `<details id="pu-${esc(p.id)}"><summary>${esc((p.untertabelle || {}).spalte || "Zeilen")} je Zeile</summary>${prodUnter(p)}</details>` : "",
-        p.matrix ? `<details id="pm-${esc(p.id)}"><summary>Matrix Form &times; bs &times; Tiefe &times; Text</summary>${prodMatrix(p)}</details>` : "",
-        p.marker ? `<details id="pr-${esc(p.id)}"><summary>Instrument-Marker</summary>${Object.entries(p.marker).map(([m, x]) => `<div class="am"><b>${m}:</b> ${esc(x.marker)} &middot; ${Object.entries(x.je_format || {}).map(([f, v]) => esc(f + ": " + v)).join(" &middot; ")}</div>`).join("")}</details>` : "",
+        p.kreuztabelle ? `<details id="pk-${esc(p.id)}"><summary>Cross table</summary>${prodKreuz(p, achsen)}</details>` : "",
+        p.untertabelle ? `<details id="pu-${esc(p.id)}"><summary>${esc((p.untertabelle || {}).spalte || "Rows")} per row</summary>${prodUnter(p)}</details>` : "",
+        p.matrix ? `<details id="pm-${esc(p.id)}"><summary>Matrix form &times; bs &times; depth &times; text</summary>${prodMatrix(p)}</details>` : "",
+        p.marker ? `<details id="pr-${esc(p.id)}"><summary>Instrument marker</summary>${Object.entries(p.marker).map(([m, x]) => `<div class="am"><b>${m}:</b> ${esc(x.marker)} &middot; ${Object.entries(x.je_format || {}).map(([f, v]) => esc(f + ": " + v)).join(" &middot; ")}</div>`).join("")}</details>` : "",
       ].join("");
       return `<tr><td class="mono">${esc(p.nr || "")}</td><td><b>${esc(p.titel)}</b></td><td class="soll">${esc(p.soll)}</td>
         <td class="ist">${prodIst(ist["27B"] || {})}</td><td class="ist">${prodIst(ist.NF || {})}</td><td>${erc}</td><td>${st}</td><td class="bel x">${bel}</td><td class="akt">${akt}</td><td>${prodBausteine(p)}</td></tr>`
         + (extra ? `<tr><td></td><td colspan="9">${extra}</td></tr>` : "");
     }).join("") + `</table></div>`;
 }
-// Stand der Liste (Nutzer 01.10.: "ewig nicht aktualisiert ... künftig nicht wieder veralten"): Alter von
-// features.json gegen Uhr und letzten Boot, gelb ab 12 h oder wenn danach gebootet wurde, rot ab 24 h
+// Status of the list (user 01.10.: "never updated ... must not go stale again"): age of
+// features.json against the clock and the last boot, yellow from 12 h or if booted after, red from 24 h
 function standHtml(d) {
   const st = (d.features || {}).stand;
   if (!st) return "";
-  const after = Object.entries(st.boots_after || {}).map(([m, t]) => `${m}-Boot ${hhmm(t)}`).join(", ");
-  const msg = st.level === "bad" ? `veraltet: seit ${fmt(st.age_h, 1)} h nicht gepflegt`
-    : st.level === "warn" ? (after ? `nach dem letzten Eintrag gebootet: ${after}` : `seit ${fmt(st.age_h, 1)} h nicht gepflegt`) : "aktuell";
-  return `<div class="stand ${st.level === "ok" ? "" : st.level}"><b>Stand features.json:</b> ${esc(st.updated_utc || "—")} (vor ${fmt(st.age_h, 1)} h) &middot; `
-    + `jüngster Ist-Beleg ${esc(st.newest_ist || "—")} &middot; <b>${msg}</b>`
-    + ` <span class="muted">&middot; pflegen mit <span class="mono">features_update.py</span> (README: Features Soll/Ist); gelb ab ${fmt(st.warn_h)} h oder nach einem neueren Boot, rot ab ${fmt(st.bad_h)} h</span></div>`;
+  const after = Object.entries(st.boots_after || {}).map(([m, t]) => `${m} boot ${hhmm(t)}`).join(", ");
+  const msg = st.level === "bad" ? `stale: not maintained for ${fmt(st.age_h, 1)} h`
+    : st.level === "warn" ? (after ? `booted after the last entry: ${after}` : `not maintained for ${fmt(st.age_h, 1)} h`) : "current";
+  return `<div class="stand ${st.level === "ok" ? "" : st.level}"><b>Status of features.json:</b> ${esc(st.updated_utc || "—")} (${fmt(st.age_h, 1)} h ago) &middot; `
+    + `newest actual evidence ${esc(st.newest_ist || "—")} &middot; <b>${msg}</b>`
+    + ` <span class="muted">&middot; maintain with <span class="mono">features_update.py</span> (README: features target/actual); yellow from ${fmt(st.warn_h)} h or after a newer boot, red from ${fmt(st.bad_h)} h</span></div>`;
 }
-// Commits der Image-Linie (letzte 48 h), die in keinem Baustein stehen -- aus git gerechnet, nicht gepflegt
+// commits of the image line (last 48 h) that are in no building block -- computed from git, not maintained
 function featNewHtml(d) {
   const ms = ((d.features || {}).models || []).filter((m) => m.new_commits);
   if (!ms.length) return "";
   return ms.map((m) => {
     const nc = m.new_commits;
-    if (nc.error) return `<div class="muted" style="font-size:12px">${esc(m.model)}: neue Commits nicht lesbar (${esc(nc.error)})</div>`;
+    if (nc.error) return `<div class="muted" style="font-size:12px">${esc(m.model)}: new commits not readable (${esc(nc.error)})</div>`;
     const n = nc.n || 0;
-    return `<details class="fold-sub" id="newc-${esc(m.model)}"${n ? "" : ""}><summary><b>${esc(m.model)}</b>: ${n ? `<span style="color:var(--warn);font-weight:650">${fmt(n)} Commits der Image-Linie (${fmt(nc.hours)} h) ohne Baustein</span>` : "alle Commits der Image-Linie der letzten " + fmt(nc.hours) + " h stehen in Bausteinen"} <span class="muted mono">REV ${esc((nc.rev || "").slice(0, 10))}</span></summary>`
-      + (n ? `<div class="tablewrap"><table><tr><th>Commit</th><th>wann</th><th>Betreff</th></tr>${(nc.commits || []).map((c) => `<tr><td class="mono">${esc(c.sha)}</td><td class="num">${c.t ? hhmm(c.t) + " " + new Date(c.t * 1000).toLocaleDateString("de-DE", {day: "2-digit", month: "2-digit"}) : ""}</td><td>${esc(c.subject)}</td></tr>`).join("")}</table></div>`
-        + `<div class="muted" style="font-size:11.5px;margin:4px 0 8px">eintragen: <span class="mono">python3 /opt/rigdash/current/rigdash/features_update.py set --id … --zweig &lt;branch&gt;=&lt;sha&gt;</span> (oder <span class="mono">add-zweig</span>, wenn es ein Pick eines vorhandenen Bausteins ist)</div>` : "")
+    return `<details class="fold-sub" id="newc-${esc(m.model)}"${n ? "" : ""}><summary><b>${esc(m.model)}</b>: ${n ? `<span style="color:var(--warn);font-weight:650">${fmt(n)} commits of the image line (${fmt(nc.hours)} h) without a building block</span>` : "all commits of the image line of the last " + fmt(nc.hours) + " h are in building blocks"} <span class="muted mono">REV ${esc((nc.rev || "").slice(0, 10))}</span></summary>`
+      + (n ? `<div class="tablewrap"><table><tr><th>Commit</th><th>when</th><th>Subject</th></tr>${(nc.commits || []).map((c) => `<tr><td class="mono">${esc(c.sha)}</td><td class="num">${c.t ? hhmm(c.t) + " " + new Date(c.t * 1000).toLocaleDateString("en-GB", {day: "2-digit", month: "2-digit"}) : ""}</td><td>${esc(c.subject)}</td></tr>`).join("")}</table></div>`
+        + `<div class="muted" style="font-size:11.5px;margin:4px 0 8px">enter: <span class="mono">python3 /opt/rigdash/current/rigdash/features_update.py set --id … --zweig &lt;branch&gt;=&lt;sha&gt;</span> (or <span class="mono">add-zweig</span> if it is a pick of an existing building block)</div>` : "")
       + `</details>`;
   }).join("");
 }
@@ -1653,14 +1662,14 @@ function devBadge(d) {
   if (!el || !fv) return;
   const n = (fv.models || []).reduce((a, m) => a + ((m.new_commits || {}).n || 0), 0);
   const st = (fv.stand || {}).level;
-  const txt = st && st !== "ok" ? (st === "bad" ? "veraltet" : "Stand?") + (n ? " · " + n : "") : (n ? String(n) : "");
+  const txt = st && st !== "ok" ? (st === "bad" ? "stale" : "status?") + (n ? " · " + n : "") : (n ? String(n) : "");
   if (el.textContent !== txt) el.textContent = txt;
   el.classList.toggle("bad", st === "bad");
-  el.title = `features.json: ${st || "?"}; ${n} Commits der Image-Linie ohne Baustein`;
+  el.title = `features.json: ${st || "?"}; ${n} commits of the image line without a building block`;
 }
 function featHtml(d) {
   const fv = d.features;
-  if (!fv) return `<div class="muted">keine Daten</div>`;
+  if (!fv) return `<div class="muted">no data</div>`;
   let h = fv.error ? `<div class="err">features.json: ${esc(fv.error)}</div>` : "";
   if ((fv.problems || []).length) h += `<div class="err">${fv.problems.map(esc).join("<br>")}</div>`;
   return h + (fv.models || []).map((m) => {
@@ -1668,48 +1677,48 @@ function featHtml(d) {
     const head = `<div class="boot-head"><span class="model">${esc(m.model)}</span>`
       + (b ? (b.rc ? `<span class="badge phase">${esc(b.rc)}</span>` : "")
         + `<span class="chip mono">REV ${esc(b.rev)}</span>`
-        + `<span class="chip ${b.running ? "ok" : "warn"}">${b.running ? "l&auml;uft (" + esc(b.lifecycle) + ")" : "letzter " + esc(m.model) + "-Boot " + esc(b.rc || b.boot_id) + " (" + esc(b.lifecycle) + ")"}</span>`
-        + `<span class="chip mono" title="Quelle f&uuml;r &bdquo;aktiv&ldquo;">${(b.launch_groups || []).length ? "launch " + esc(b.launch_groups.join("+")) : "Profil " + esc(b.profile)}</span>`
-        : `<span class="chip warn">kein Boot-Zustand</span>`)
+        + `<span class="chip ${b.running ? "ok" : "warn"}">${b.running ? "running (" + esc(b.lifecycle) + ")" : "last " + esc(m.model) + " boot " + esc(b.rc || b.boot_id) + " (" + esc(b.lifecycle) + ")"}</span>`
+        + `<span class="chip mono" title="Source for &ldquo;active&rdquo;">${(b.launch_groups || []).length ? "launch " + esc(b.launch_groups.join("+")) : "profile " + esc(b.profile)}</span>`
+        : `<span class="chip warn">no boot state</span>`)
       + (m.git_s != null ? `<span class="chip">git ${esc(m.git_s)} s</span>` : "")
       + `</div>`;
     let rows = m.features || [];
     const nOff = rows.filter((r) => r.image_aber_aus).length;
     if (featOnlyOff) rows = rows.filter((r) => r.image_aber_aus);
-    if (!rows.length) return `<div class="imgseat">${head}<div class="muted">${featOnlyOff ? "kein Feature im Image, das aus ist" : "keine Features eingetragen"}</div></div>`;
-    return `<div class="imgseat">${head}<div class="muted" style="margin:-4px 0 8px">${(m.features || []).length} Features &middot; ${nOff} im Image, aber aus</div><div class="tablewrap"><table>
-      <tr><th>Feature</th><th>fertig</th><th>im Image</th><th>aktiv</th><th>Gewinn</th><th>Begr&uuml;ndung (wenn aus)</th></tr>`
+    if (!rows.length) return `<div class="imgseat">${head}<div class="muted">${featOnlyOff ? "no feature in the image that is off" : "no features entered"}</div></div>`;
+    return `<div class="imgseat">${head}<div class="muted" style="margin:-4px 0 8px">${(m.features || []).length} features &middot; ${nOff} in the image, but off</div><div class="tablewrap"><table>
+      <tr><th>Feature</th><th>done</th><th>in image</th><th>active</th><th>Gain</th><th>Reason (if off)</th></tr>`
       + rows.map((r) => `<tr class="${r.image_aber_aus ? "feat-off" : ""}"><td><b class="mono">${esc(r.id)}</b> ${esc(r.titel)}<div class="muted mono" style="font-size:11px">${(r.zweige || []).map((z) => esc(z.branch) + " @ " + esc((z.sha || "").slice(0, 10))).join("<br>")}</div></td>
-        <td>${r.fertig ? `<span class="pill f-ja">ja</span>` : `<span class="pill f-teilweise">nein</span>`}</td>
+        <td>${r.fertig ? `<span class="pill f-ja">yes</span>` : `<span class="pill f-teilweise">no</span>`}</td>
         <td>${featPill(r.im_image, featImTitle(r.im_image))}</td>
         <td>${featPill(r.aktiv, featAkTitle(r.aktiv))}</td>
         <td>${featGainHtml(r.gewinn || [])}</td>
-        <td>${r.image_aber_aus ? (r.aus_begruendung ? esc(r.aus_begruendung) : `<span class="err">Begr&uuml;ndung fehlt</span>`) : `<span class="muted">${esc(r.aus_begruendung || "")}</span>`}</td></tr>`).join("")
+        <td>${r.image_aber_aus ? (r.aus_begruendung ? esc(r.aus_begruendung) : `<span class="err">reason missing</span>`) : `<span class="muted">${esc(r.aus_begruendung || "")}</span>`}</td></tr>`).join("")
       + `</table></div></div>`;
   }).join("");
 }
 function imgChgHtml(d) {
   const ic = d.image_changes;
-  if (!ic) return `<div class="muted">keine Daten</div>`;
+  if (!ic) return `<div class="muted">no data</div>`;
   const err = ic.error ? `<div class="err">image_changes.json: ${esc(ic.error)}</div>` : "";
-  if (!(ic.seats || []).length) return err + `<div class="muted">kein Boot eines Sitzes (27B, NF) in den state-Ordnern der letzten 6 h</div>`;
+  if (!(ic.seats || []).length) return err + `<div class="muted">no boot of a seat (27B, NF) in the state folders of the last 6 h</div>`;
   return err + ic.seats.map((s) => {
     const head = `<div class="boot-head"><span class="model">${esc(s.seat)}</span>`
       + (s.rc ? `<span class="badge phase">${esc(s.rc)}</span>` : "")
       + `<span class="chip mono">REV ${esc(s.rev)}</span>`
-      + `<span class="chip ${s.running ? "ok" : "warn"}">${s.running ? "l&auml;uft" : "zuletzt gebootet, nicht live"}</span>`
-      + (s.built_utc ? `<span class="chip">gebaut ${esc(String(s.built_utc).replace("T", " ").slice(5))}${s.base ? " &middot; Basis " + esc(s.base) : ""}</span>` : "")
+      + `<span class="chip ${s.running ? "ok" : "warn"}">${s.running ? "running" : "last booted, not live"}</span>`
+      + (s.built_utc ? `<span class="chip">built ${esc(String(s.built_utc).replace("T", " ").slice(5))}${s.base ? " &middot; base " + esc(s.base) : ""}</span>` : "")
       + (s.image ? `<span class="chip mono">${esc(s.image)}</span>` : "")
       + `</div>`;
-    if (!s.found) return `<div class="imgseat">${head}<div class="muted">keine Eintr&auml;ge f&uuml;r REV ${esc(s.rev)}</div></div>`;
+    if (!s.found) return `<div class="imgseat">${head}<div class="muted">no entries for REV ${esc(s.rev)}</div></div>`;
     const ch = s.changes || [];
-    if (!ch.length) return `<div class="imgseat">${head}<div class="muted">Eintrag ohne &Auml;nderungen</div></div>`;
+    if (!ch.length) return `<div class="imgseat">${head}<div class="muted">Entry without changes</div></div>`;
     const n = {};
     ch.forEach((c) => { n[c.status] = (n[c.status] || 0) + 1; });
-    const sum = IMG_STATUS.filter((k) => n[k]).map((k) => `<span class="pill s-${k}">${n[k]} ${k}</span>`).join(" ");
+    const sum = IMG_STATUS.filter((k) => n[k]).map((k) => `<span class="pill s-${k}">${n[k]} ${en(k)}</span>`).join(" ");
     return `<div class="imgseat">${head}<div style="margin:-4px 0 8px">${sum}</div><div class="tablewrap"><table>
-      <tr><th>Stand</th><th>Fix</th><th>erwartet</th><th>Beleg</th><th>wer</th></tr>`
-      + ch.map((c) => `<tr><td><span class="pill s-${esc(c.status)}" title="${esc(c.status_raw || c.status)}">${esc(c.status)}</span></td>
+      <tr><th>Status</th><th>Fix</th><th>Expected</th><th>Evidence</th><th>Who</th></tr>`
+      + ch.map((c) => `<tr><td><span class="pill s-${esc(c.status)}" title="${esc(c.status_raw || c.status)}">${esc(en(c.status))}</span></td>
         <td><b class="mono">${esc(c.id)}</b> ${esc(c.title)}</td><td>${esc(c.expected)}</td><td class="ev">${esc(c.evidence)}</td><td>${esc(c.who)}</td></tr>`).join("")
       + `</table></div></div>`;
   }).join("");
@@ -1718,16 +1727,16 @@ function imgChgHtml(d) {
 function endCell(b) {
   const a = b.alarm || {}, e = a.ended_on, ps = a.planned_stop;
   if (ps && (ps.stopping || (e && e.planned)))
-    return `<td class="stopped" style="max-width:420px">■ gestoppt (geplant) ${hhmm(ps.t)} <span class="mono">${esc((ps.src || "") === "nf-dauer" ? "Stop-Datei der NF-Dauerschleife" : "AGENT-HOLD Ende")}</span></td>`;
+    return `<td class="stopped" style="max-width:420px">■ stopped (planned) ${hhmm(ps.t)} <span class="mono">${esc((ps.src || "") === "nf-dauer" ? "stop file of the NF endless loop" : "AGENT-HOLD end")}</span></td>`;
   return `<td class="err mono" style="max-width:420px">${e && !e.recovered ? esc(e.group + ": " + e.text.slice(0, 140)) : ""}</td>`;
 }
 // Nutzer 02.10.: two boots of one image showed 146,5 vs 114 -- the LAST stretch (bs 5 vs bs 2), not the boot.
 // Nutzer 02.10. (später): a finished boot past the 16-min ring had no tok/s -- its whole-boot figures come from
 // VictoriaMetrics (vm_boot: the sampler's decode sums, the rank counters' prefill), the ring only as fallback.
 function flipCell(b, dir) {
-  const f = ((b.flip_boot || {})[dir]) || null;      // ganzer Boot, flipzeit.py über die Historie-Marken (eine Berechnung)
+  const f = ((b.flip_boot || {})[dir]) || null;      // whole boot, flipzeit.py over the history marks (one calculation)
   if (!f || !f.n) return "—";
-  return `<span title="n=${f.n} · ganzer Boot · gezählte Flips · ${esc(FLIP_DEF[dir])}">${sec(f.p50_ms)} / ${sec(f.p90_ms)} / ${sec(f.max_ms)}</span>`;
+  return `<span title="n=${f.n} · whole boot · counted flips · ${esc(FLIP_DEF[dir])}">${sec(f.p50_ms)} / ${sec(f.p90_ms)} / ${sec(f.max_ms)}</span>`;
 }
 function decCell(b) {
   const vd = (b.vm_boot || {}).decode;
@@ -1735,62 +1744,62 @@ function decCell(b) {
   if (!d) return "—";
   const v = d.gen_tps_boot != null ? d.gen_tps_boot : d.gen_tps_last;
   if (v == null) return "—";
-  const tip = (d === vd ? "ganzer Boot aus VictoriaMetrics (1-s-Ring des Samplers, stetige Intervalle)"
-    : `letzter Abschnitt: ${d.gen_tps_last == null ? "—" : fmt(d.gen_tps_last, 1)} tok/s`) +
-    (d.boot_decode_s != null ? `; Decode-Zeit ${fmt(d.boot_decode_s, 0)} s` : "");
-  const seats = d.seats_boot != null ? `<br><span class="muted">Ø ${fmt(d.seats_boot, 1)} Sitze</span>` : "";
+  const tip = (d === vd ? "whole boot from VictoriaMetrics (1 s ring of the sampler, continuous intervals)"
+    : `last stretch: ${d.gen_tps_last == null ? "—" : fmt(d.gen_tps_last, 1)} tok/s`) +
+    (d.boot_decode_s != null ? `; decode time ${fmt(d.boot_decode_s, 0)} s` : "");
+  const seats = d.seats_boot != null ? `<br><span class="muted">avg ${fmt(d.seats_boot, 1)} seats</span>` : "";
   return `<span title="${esc(tip)}">${fmt(v, 1)}</span>${seats}`;
 }
 function historyHtml(boots, now) {
   const rows = boots.filter((b) => !b.live);
-  if (!rows.length) return `<div class="muted">keine weiteren Boots</div>`;
+  if (!rows.length) return `<div class="muted">no further boots</div>`;
   const r = (b, g) => {
     const vp = ((b.vm_boot || {}).prefill || {})[g];
     if (vp && vp.tps != null)
-      return `<span title="ganzer Boot: ${esc(fmt(vp.tokens))} neue Token / ${esc(fmt(vp.compute_s, 1))} s Rechenzeit des langsamsten Rangs (${esc(vp.rank)}), VictoriaMetrics">${fmt(vp.tps)}</span>`;
+      return `<span title="whole boot: ${esc(fmt(vp.tokens))} new tokens / ${esc(fmt(vp.compute_s, 1))} s compute time of the slowest rank (${esc(vp.rank)}), VictoriaMetrics">${fmt(vp.tps)}</span>`;
     const p = (b.prefill || {})[g];
     return p && p.last_burst && p.last_burst.tps != null ? fmt(p.last_burst.tps) : "—";
   };
-  return `<table><tr><th>Modell</th><th>Tag</th><th class="num" title="Boot-Start (boot_id) bis Ende bzw. letztes IPC-Lebenszeichen">Dauer</th><th class="num" title="Boot-Start (boot_id) bis serving (state.json serving_since_ts)">Bootzeit</th><th class="num">letzte IPC-Probe</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Flipzeit P→D = letzter P-Chunk fertig → erstes Decode-Token erzeugt; p50 / p90 / max über alle gezählten Flips des GANZEN Boots (dieselbe Berechnung wie die Kacheln, flipzeit.py)">Flipzeit P&rarr;D<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Flipzeit D→P = letztes Decode-Token erzeugt → erster Prefill-Chunk beginnt zu rechnen; sonst wie links (ganzer Boot, gezählte Flips)">Flipzeit D&rarr;P<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Summe #new-token, Prefill batch, nur PP0">P neu &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Summe #new-token, Prefill batch, nur TP0">D neu &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Summe completion_tokens der Front-Zeilen WEG2-SERVED">dekodiert &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>Ende</th></tr>` +
-    rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">${ago(b.dur_s)}</td><td class="num">${b.boot_s == null ? "—" : fmt(b.boot_s, 0) + " s"}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${decCell(b)}</td><td class="num">${fmt(b.flip_count)}</td><td class="num">${flipCell(b, "P>D")}</td><td class="num">${flipCell(b, "D>P")}</td><td class="num">${fmt((b.totals || {}).p_new)}</td><td class="num">${fmt((b.totals || {}).d_new)}</td><td class="num">${fmt((b.totals || {}).decoded)}${(b.totals || {}).read_progress < 1 ? "*" : ""}</td>${endCell(b)}</tr>`).join("") +
-    `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill-Spalten: Rechenrate (gpu-ms) des letzten Schubs, langsamster Rang; Decode: Mittel über die ganze Dekodierzeit des Boots (Token / Decode-Sekunden, nur stetige Intervalle), darunter Ø Sitze; der letzte Wert steht im Tooltip.</div>`;
+  return `<table><tr><th>Model</th><th>Tag</th><th class="num" title="boot start (boot_id) to end or last IPC sign of life">Duration</th><th class="num" title="boot start (boot_id) to serving (state.json serving_since_ts)">Boot time</th><th class="num">last IPC sample</th><th class="num">P prefill</th><th class="num">D prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Flip time P→D = last P chunk done → first decode token produced; p50 / p90 / max over all counted flips of the WHOLE boot (same calculation as the tiles, flipzeit.py)">Flip time P&rarr;D<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Flip time D→P = last decode token produced → first prefill chunk starts computing; otherwise as on the left (whole boot, counted flips)">Flip time D&rarr;P<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Sum #new-token, prefill batch, PP0 only">P new &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Sum #new-token, prefill batch, TP0 only">D new &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Sum of completion_tokens of the front lines WEG2-SERVED">decoded &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>End</th></tr>` +
+    rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">${ago(b.dur_s)}</td><td class="num">${b.boot_s == null ? "—" : fmt(b.boot_s, 0) + " s"}</td><td class="num">${ago(b.age_s)} ago</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${decCell(b)}</td><td class="num">${fmt(b.flip_count)}</td><td class="num">${flipCell(b, "P>D")}</td><td class="num">${flipCell(b, "D>P")}</td><td class="num">${fmt((b.totals || {}).p_new)}</td><td class="num">${fmt((b.totals || {}).d_new)}</td><td class="num">${fmt((b.totals || {}).decoded)}${(b.totals || {}).read_progress < 1 ? "*" : ""}</td>${endCell(b)}</tr>`).join("") +
+    `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill columns: compute rate (gpu-ms) of the last burst, slowest rank; decode: mean over the whole decode time of the boot (tokens / decode seconds, continuous intervals only), below it avg seats; the last value is in the tooltip.</div>`;
 }
 
 // <!--DEV:END-->
-// ---------------------------------------------------------------- Überblick (Nutzer 01.10. ~07:20Z)
-// Je Modell auf einen Blick: läuft was, welches Modell, TTFT, Decode tok/s, Prefill tok/s, Flipzeit, Tode/Hänger,
-// Fenster. Jede Zahl ist dieselbe wie im Boots-Tab (gleiche Felder), nur ohne die Messdetails.
+// ---------------------------------------------------------------- Overview (user 01.10. ~07:20Z)
+// Per model at a glance: what runs, which model, TTFT, decode tok/s, prefill tok/s, flip time, deaths/hangs,
+// window. Every number is the same as in the Boots tab (same fields), just without the measurement details.
 const lineOf = (b) => /27b/i.test(`${(b.meta || {}).tag || ""} ${b.stem || ""} ${((b.ipc || {}).dir) || ""}`) ? "27B" : "NF";
 const sec = (ms) => ms == null || !isFinite(ms) ? "—" : fmt(ms / 1000, ms < 10000 ? 2 : 1);
-// Nutzer 06.10. (EINZIGE Definition, flipzeit.DEFINITION; tests/test_flipzeit_1006.py prüft die Gleichheit):
-// P>D = letzter P-Chunk fertig -> erstes Decode-Token erzeugt; D>P = letztes Decode-Token erzeugt -> erster Prefill-Chunk
-// beginnt zu rechnen.  Ausnahme: kein Flip zählt, wenn kein Prefill oder Decode ansteht.  Layer/Vorlauf/Nachlauf nur als
-// Zerlegung der einen Zahl (Summe = Flipzeit, + Rest), nie als eigene Flipzeit.
-const FLIP_DEF = {"P>D": "letzter P-Chunk fertig → erstes Decode-Token erzeugt",
-  "D>P": "letztes Decode-Token erzeugt → erster Prefill-Chunk beginnt zu rechnen (erster Forward auf PP0)"};
-const FLIP_EXCEPTION = "Kein Flip zählt, wenn kein Prefill oder Decode ansteht (Leerlauf-Flip).";
+// User 06.10. (ONLY definition, flipzeit.DEFINITION; tests/test_flipzeit_1006.py checks the equality):
+// P>D = last P chunk done -> first decode token produced; D>P = last decode token produced -> first prefill chunk
+// starts computing.  Exception: no flip counts when no prefill or decode is pending.  Layer/lead/tail only as
+// a decomposition of the one number (sum = flip time, + remainder), never as a flip time of their own.
+const FLIP_DEF = {"P>D": "last P chunk done → first decode token produced",
+  "D>P": "last decode token produced → first prefill chunk starts computing (first forward on PP0)"};
+const FLIP_EXCEPTION = "No flip counts when no prefill or decode is pending (idle flip).";
 const flipWin = (fz, dir) => ((fz || {})[dir]) || {};
-const flipWinLabel = (fz) => "Fenster: " + (((fz || {}).window || {}).label || "?");
-// die Zerlegung der einen Zahl aus dem Marken-Label (f.parts: Millisekunden, Summe = Flipzeit +- Rundung)
+const flipWinLabel = (fz) => "Window: " + (((fz || {}).window || {}).label || "?");
+// the decomposition of the one number from the mark label (f.parts: milliseconds, sum = flip time +- rounding)
 function flipParts(f, dir) {
   if (!f || f.last_ms == null || !f.parts) return "";
   const x = f.parts, p = (k, v) => `${k} ${sec(v)}`;
   const vor = x.leer_ms != null
-    // Nutzer 06.10.: Server-Leerlauf (letztes D-Token -> Ankunft des Wartenden) ist keine Flipzeit; der Start ist
-    // max(letztes D-Token, Ankunft), "leer" ist also 0 und erscheint nur noch in alten Marken (> 0)
-    ? ` <span class="muted">(Vorlauf = ${x.leer_ms > 0 ? `leer ohne Request ${sec(x.leer_ms)} + ` : ""}Halt ${sec(x.halt_ms)} + Park ${sec(x.park_ms)} + Rest ${sec(x.vor_rest_ms)})</span>`
-    : (dir === "D>P" ? ` <span class="muted">(Vorlauf-Zerlegung fehlt: keine Ankunft des Requests)</span>` : "");
-  return `Zerlegung: ${p("Vorlauf", x.vorlauf_ms)} + ${p("Layer-Tausch", x.layer_ms)} + ${p("Wake-KV/DC", x.wake_kv_dc_ms)} + ${p("Nachlauf", x.nachlauf_ms)} + ${p("Rest", x.rest_ms)} = ${sec(f.last_ms)} s` + vor;
+    // user 06.10.: server idle (last D token -> arrival of the waiting one) is not flip time; the start is
+    // max(last D token, arrival), so "idle" is 0 and only appears in old marks (> 0)
+    ? ` <span class="muted">(lead = ${x.leer_ms > 0 ? `idle without request ${sec(x.leer_ms)} + ` : ""}halt ${sec(x.halt_ms)} + park ${sec(x.park_ms)} + remainder ${sec(x.vor_rest_ms)})</span>`
+    : (dir === "D>P" ? ` <span class="muted">(lead decomposition missing: no arrival of the request)</span>` : "");
+  return `Decomposition: ${p("lead", x.vorlauf_ms)} + ${p("layer swap", x.layer_ms)} + ${p("wake KV/DC", x.wake_kv_dc_ms)} + ${p("tail", x.nachlauf_ms)} + ${p("remainder", x.rest_ms)} = ${sec(f.last_ms)} s` + vor;
 }
 function flipStats(f) {
   return f && f.n ? `p50 ${sec(f.p50_ms)} &middot; p90 ${sec(f.p90_ms)} &middot; max ${sec(f.max_ms)} s &middot; n=${f.n}` : "";
 }
-// nicht gezählt, aber benannt: ein Flip ohne Endpunkt (b.flip_diag, 16-min-Ring der IPC-Probe)
+// not counted, but named: a flip without an end point (b.flip_diag, 16 min ring of the IPC sample)
 function flipMissing(b, dir) {
   const dg = ((b.flip_diag || {})[dir]) || {};
-  return dg.missing ? `fehlt (Feld ${esc(dg.missing)})` : "";
+  return dg.missing ? `missing (field ${esc(dg.missing)})` : "";
 }
-// das Tiefen-Detail der P-Seite gehört nur dann zum letzten Flip, wenn es dessen Beginn trägt
+// the depth detail of the P side belongs to the last flip only if it carries its start
 function flipDepth(b, dir, f) {
   const dg = ((b.flip_diag || {})[dir]) || {}, pd = dg.p_depth;
   if (!pd || pd.x == null || f.last_t == null || dg.p_depth_t == null || Math.abs(dg.p_depth_t - f.last_t) > 0.01) return "";
@@ -1803,8 +1812,8 @@ function ttftOf(b, d) {
     mx: (v.ttft_max_boot_ms || {})[m], src: v.error ? null : "VictoriaMetrics", n: a ? a.ttft_n : null};
   if (r.mb == null && a && a.ttft_n) { r.mb = a.ttft_ms_sum / a.ttft_n; r.mx = a.ttft_ms_max; r.src = "state.json"; }
   if (!a || a.ttft_n == null)
-    r.missing = m === "27B" ? "27B-Front liefert keine TTFT (bis zum Image mit weg2_ttft_seconds, TSDB-Delta 01.10.)"
-      : "front.arrival_seat.ttft_* fehlt in IPC";
+    r.missing = m === "27B" ? "27B front delivers no TTFT (until the image with weg2_ttft_seconds, TSDB delta 01.10.)"
+      : "front.arrival_seat.ttft_* missing in IPC";
   return r;
 }
 function kpi(k, v, unit, sub, cls, color, title) {
@@ -1814,13 +1823,13 @@ function kpi(k, v, unit, sub, cls, color, title) {
 }
 function rateOfPrefill(p, now) {
   if (!p) return [null, ""];
-  if (p.one_s > 0) return [p.one_s, "laufender Schub"];
-  if (p.now && p.now.wall_tps != null) return [p.now.wall_tps, "Schübe 60 s"];
-  if (p.last_burst && p.last_burst.wall_tps != null) return [p.last_burst.wall_tps, p.last_t ? `letzter Schub vor ${ago(now - p.last_t)}` : "letzter Schub"];
-  return [null, p.last_t ? `ruht seit ${ago(now - p.last_t)}` : "noch kein Chunk"];
+  if (p.one_s > 0) return [p.one_s, "running burst"];
+  if (p.now && p.now.wall_tps != null) return [p.now.wall_tps, "bursts 60 s"];
+  if (p.last_burst && p.last_burst.wall_tps != null) return [p.last_burst.wall_tps, p.last_t ? `last burst ${ago(now - p.last_t)} ago` : "last burst"];
+  return [null, p.last_t ? `idle for ${ago(now - p.last_t)}` : "no chunk yet"];
 }
-// Phase jetzt (Nutzer 01.10. ~08:20Z: "gerade beim Flippen sieht der Server aus, als würde nichts passieren"):
-// ipcboot.phase_now; der Sekundenzähler läuft im Browser je Sekunde weiter (tickSince), ohne Neuzeichnen
+// Phase now (user 01.10. ~08:20Z: "while flipping the server looks as if nothing happens"):
+// ipcboot.phase_now; the seconds counter keeps running in the browser every second (tickSince), without redrawing
 const PH_CLS = {P: "ph-k-P", single: "ph-k-P", D: "ph-k-D", dec: "ph-k-dec", idle: "ph-k-idle", unknown: "ph-k-unknown",
   vis_load: "ph-k-vis_load", vis_enc: "ph-k-vis_enc", vis_unload: "ph-k-vis_unload"};
 function phaseNowHtml(b, now) {
@@ -1829,11 +1838,11 @@ function phaseNowHtml(b, now) {
   const cls = p.k === "flip" ? (p.dir === "D>P" ? "ph-k-flip_dp" : "ph-k-flip_pd") : (PH_CLS[p.k] || "ph-k-unknown") + (p.k === "P" && CO_KEY[p.co] ? " co-" + p.co : "");
   const since = p.since != null ? `<span class="since num" data-since="${p.since}" data-now="${now}">${dur(Math.max(0, now - p.since))}</span>` : "";
   const fl = p.k === "flip" && p.flip_since != null && p.flip_since !== p.since
-    ? ` <span class="muted">&middot; Flip seit <span class="since num" data-since="${p.flip_since}" data-now="${now}">${dur(Math.max(0, now - p.flip_since))}</span></span>` : "";
-  return `<div class="phnow${p.k === "flip" ? " flip" : ""}" title="Quelle: events.jsonl (Flip) + Rang-Segmente (rankstats), Auflösung ~1 s">`
+    ? ` <span class="muted">&middot; flip for <span class="since num" data-since="${p.flip_since}" data-now="${now}">${dur(Math.max(0, now - p.flip_since))}</span></span>` : "";
+  return `<div class="phnow${p.k === "flip" ? " flip" : ""}" title="Source: events.jsonl (flip) + rank segments (rankstats), resolution ~1 s">`
     + `<i class="sw ${cls}"></i><b>${esc(p.label)}</b>${p.sub ? ` <span class="sub">${esc(p.sub)}</span>` : ""} ${since}${fl}</div>`;
 }
-// Nutzer 02.10.: welche KPI gerade den Aktivrahmen trägt -- aus phase_now (dieselbe Quelle wie die Phasenzeile)
+// user 02.10.: which KPI currently carries the active frame -- from phase_now (same source as the phase line)
 function actKey(b) {
   const p = b.live ? b.phase_now : null;
   if (!p) return "";
@@ -1843,56 +1852,56 @@ function actKey(b) {
 function flipKpi(b, dir, now) {
   const fz = flipWinOf(b), f = flipWin(fz, dir), dg = ((b.flip_diag || {})[dir]) || {};
   const miss = flipMissing(b, dir);
-  const sub = [miss ? `<b>neuester Flip: ${miss}</b>` : null,
-    f.n ? flipParts(f, dir) : (b.flip_count ? "noch kein gezählter Flip im Fenster" : "noch kein Flip"),
-    f.n ? `<span class="muted">${ago(now - f.last_t)} her &middot; ${flipStats(f)}</span>` : null,
-    `<span class="muted">${esc(flipWinLabel(fz))}${flipWinMode === "60" ? " (alle Boots dieses Modells)" : " (dieser Boot)"}</span> ${flipWinSwitch()}`,
-    dg.missing_n ? `<span class="muted">${dg.missing_n} Flips mit fehlendem Endpunkt im 16-min-Ring, nicht gezählt</span>` : null,
-    f.idle_n ? `<span class="muted">Leerlauf-Flips (kein Prefill/Decode stand an): ${f.idle_n}, nicht gezählt</span>` : null].filter(Boolean).join("<br>");
-  return kpi(`Flipzeit ${dir.replace(">", "&rarr;")} &middot; letzte`, miss && !f.n ? {na: miss} : f.n ? sec(f.last_ms) : null, "s", sub,
+  const sub = [miss ? `<b>newest flip: ${miss}</b>` : null,
+    f.n ? flipParts(f, dir) : (b.flip_count ? "no counted flip in the window yet" : "no flip yet"),
+    f.n ? `<span class="muted">${ago(now - f.last_t)} ago &middot; ${flipStats(f)}</span>` : null,
+    `<span class="muted">${esc(flipWinLabel(fz))}${flipWinMode === "60" ? " (all boots of this model)" : " (this boot)"}</span> ${flipWinSwitch()}`,
+    dg.missing_n ? `<span class="muted">${dg.missing_n} flips with a missing end point in the 16 min ring, not counted</span>` : null,
+    f.idle_n ? `<span class="muted">idle flips (no prefill/decode pending): ${f.idle_n}, not counted</span>` : null].filter(Boolean).join("<br>");
+  return kpi(`Flip time ${dir.replace(">", "&rarr;")} &middot; last`, miss && !f.n ? {na: miss} : f.n ? sec(f.last_ms) : null, "s", sub,
     "wide" + (actKey(b) === "flip:" + dir ? " act" : ""), dir === "P>D" ? "var(--s7)" : "var(--s5)",
-    "Flipzeit = " + FLIP_DEF[dir] + " · " + FLIP_EXCEPTION + " · " + flipWinLabel(fz));
+    "Flip time = " + FLIP_DEF[dir] + " · " + FLIP_EXCEPTION + " · " + flipWinLabel(fz));
 }
 function ovCard(b, d, now) {
-  const a = b.alarm || {}, st = a.state, ipc = b.ipc || {};
+  const a = b.alarm || {}, st = alarmState(b.alarm), ipc = b.ipc || {};
   const fr = b.front || {};
   const awake = fr.awake || (b.awake ? b.awake.awake : null);
   const ttft = ttftOf(b, d);
   const head = `<div class="ovhead"><span class="model">${esc(ipc.model || (b.meta || {}).model || b.stem)}</span>`
-    + (plannedStopped(b) ? `<span class="badge stopped">■ gestoppt (geplant)</span>`
+    + (plannedStopped(b) ? `<span class="badge stopped">■ stopped (planned)</span>`
       : ipc.terminal ? `<span class="badge ${ipc.lifecycle === "dead" ? "dead" : "stopped"}">■ ${esc(ipc.lifecycle)}</span>`
-      : `<span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "keine IPC-Probe seit " + ago(b.age_s)}</span>`)
+      : `<span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "no IPC sample for " + ago(b.age_s)}</span>`)
     + (b.live && ipc.lifecycle && ipc.lifecycle !== "serving" ? `<span class="chip warn">${esc(ipc.lifecycle)}</span>` : "")
-    + (awake ? `<span class="badge phase">wach: ${esc(awake)}${b.live && fr.state && fr.state !== "serving" ? " &middot; " + esc(fr.state) : ""}</span>` : "")
-    + `<span class="when">${lineOf(b)}${b.first_t ? ` &middot; Boot seit ${ago(now - b.first_t)}` : ""}</span></div>`;
-  // TTFT (Nutzer 01.10. ~08:20Z): der LETZTE Wert fett, Ø 5 min und n klein; Weg (über P / direkt D) und
-  // Zerlegung nur, soweit die IPC sie trägt -- sonst "fehlt in IPC" mit dem Feld
+    + (awake ? `<span class="badge phase">awake: ${esc(awake)}${b.live && fr.state && fr.state !== "serving" ? " &middot; " + esc(fr.state) : ""}</span>` : "")
+    + `<span class="when">${lineOf(b)}${b.first_t ? ` &middot; boot for ${ago(now - b.first_t)}` : ""}</span></div>`;
+  // TTFT (user 01.10. ~08:20Z): the LAST value bold, avg 5 min and n small; route (via P / directly D) and
+  // decomposition only as far as the IPC carries them -- otherwise "missing in IPC" with the field
   const tl = ((d.vm || {}).ttft_last || {})[lineOf(b)];
   const tv = tl ? tl.ms : (ttft.m5 != null ? ttft.m5 : ttft.mb);
-  const tK = tl ? "TTFT &middot; letzte Anfrage" : ttft.m5 != null ? "TTFT &middot; &Oslash; 5 min" : "TTFT &middot; &Oslash; seit Boot";
+  const tK = tl ? "TTFT &middot; last request" : ttft.m5 != null ? "TTFT &middot; avg 5 min" : "TTFT &middot; avg since boot";
   const as = ((ipc.front || {}).arrival_seat) || {};
   const rt = b.prefill_route || {};
   const tSub = ttft.missing && tv == null ? "" : [
-    tl ? `${tl.exact ? "" : "Mittel von " + tl.n + " im 5-s-Takt, "}${ago(now - tl.t)} her` : null,
-    ttft.m5 != null ? `&Oslash; 5 min ${sec(ttft.m5)} s (n=${fmt(ttft.n5)})` : null,
-    ttft.mb != null ? `seit Boot &Oslash; ${sec(ttft.mb)} s, max ${sec(ttft.mx)} s, n=${fmt(ttft.n)}` : null,
-    as.verdict_n ? `davon Ankunft&rarr;Sitz-Entscheidung &Oslash; ${sec(as.verdict_ms_sum / as.verdict_n)} s` : null,
-    rt.via_p != null ? `Anfragen über P ${fmt(rt.via_p)} &middot; direkt D ${fmt(rt.d_direct)}` : null,
-    `<span class="miss">über P / direkt D getrennt: fehlt in IPC (front.arrival_seat.ttft_by_via)</span>`].filter(Boolean).join("<br>");
+    tl ? `${tl.exact ? "" : "mean of " + tl.n + " in the 5 s tick, "}${ago(now - tl.t)} ago` : null,
+    ttft.m5 != null ? `avg 5 min ${sec(ttft.m5)} s (n=${fmt(ttft.n5)})` : null,
+    ttft.mb != null ? `since boot avg ${sec(ttft.mb)} s, max ${sec(ttft.mx)} s, n=${fmt(ttft.n)}` : null,
+    as.verdict_n ? `of which arrival&rarr;seat decision avg ${sec(as.verdict_ms_sum / as.verdict_n)} s` : null,
+    rt.via_p != null ? `requests via P ${fmt(rt.via_p)} &middot; directly D ${fmt(rt.d_direct)}` : null,
+    `<span class="miss">split via P / directly D: missing in IPC (front.arrival_seat.ttft_by_via)</span>`].filter(Boolean).join("<br>");
   const tKpi = kpi(tK, tv != null ? sec(tv) : (ttft.missing ? {na: ttft.missing} : null), "s", tSub, "hl wide", "var(--s7)",
-    "Ankunft an der Front → erster Inhalt von D (LEG2-FIRST-CONTENT), beide Wege gemischt; Quelle " + (ttft.src || "–"));
+    "arrival at the front → first content from D (LEG2-FIRST-CONTENT), both routes mixed; source " + (ttft.src || "–"));
   // Decode
   const dd = (b.decode || {}).D || (b.decode || {}).single;
   let dv = null, dl = "";
   if (dd) {
-    if (dd.one_s > 0) { dv = dd.one_s; dl = "jetzt"; }
-    else if (dd.gen_tps != null) { dv = dd.gen_tps; dl = "&Oslash; 60 s"; }
-    else if (dd.gen_tps_last != null) { dv = dd.gen_tps_last; dl = "letzter Wert"; }
+    if (dd.one_s > 0) { dv = dd.one_s; dl = "now"; }
+    else if (dd.gen_tps != null) { dv = dd.gen_tps; dl = "avg 60 s"; }
+    else if (dd.gen_tps_last != null) { dv = dd.gen_tps_last; dl = "last value"; }
   }
   const bs = dd ? (dd.round_bs && dd.round_bs.bs != null ? dd.round_bs.bs : (dd.last_bs != null ? dd.last_bs : dd.running)) : null;
-  const dKpi = kpi("Decode tok/s", dv != null ? fmt(dv, 1) : (dd ? null : {na: "kein Decode-Rang"}), "",
-    [dl, dd && dd.per_stream != null ? `je Stream ${fmt(dd.per_stream, 1)}` : null,
-      dd && dd.seats_mean != null ? `Ø ${fmt(dd.seats_mean, 1)} Sitze` : null, bs != null ? `<b>bs ${fmt(bs)}</b>` : null].filter(Boolean).join(" &middot; "),
+  const dKpi = kpi("Decode tok/s", dv != null ? fmt(dv, 1) : (dd ? null : {na: "no decode rank"}), "",
+    [dl, dd && dd.per_stream != null ? `per stream ${fmt(dd.per_stream, 1)}` : null,
+      dd && dd.seats_mean != null ? `avg ${fmt(dd.seats_mean, 1)} seats` : null, bs != null ? `<b>bs ${fmt(bs)}</b>` : null].filter(Boolean).join(" &middot; "),
     (dd && dd.one_s > 0 ? "on" : "") + (actKey(b) === "dec" ? " act" : ""), "var(--s3)");
   // Prefill P und D (bzw. eine Gruppe)
   const pre = b.prefill || {};
@@ -1901,117 +1910,117 @@ function ovCard(b, d, now) {
     const ak = actKey(b) === (g === "single" ? "P" : g);
     return kpi(label + " tok/s", v != null ? fmt(v) : null, "", l, (pre[g] && pre[g].one_s > 0 ? "on" : "") + (ak ? " act" : ""), color);
   };
-  const pKpis = pre.single && !pre.P ? pk("single", "Prefill", "var(--s1)") : pk("P", "P-Prefill", "var(--s1)") + pk("D", "D-Prefill", "var(--s2)");
-  // Flipzeit in Nutzersicht (Nutzer 01.10. ~08:20Z): letzte je Richtung FETT, Vorlauf/Layer-Tausch/Nachlauf
+  const pKpis = pre.single && !pre.P ? pk("single", "Prefill", "var(--s1)") : pk("P", "P prefill", "var(--s1)") + pk("D", "D prefill", "var(--s2)");
+  // Flip time from the user's view (user 01.10. ~08:20Z): last per direction BOLD, lead/layer swap/tail
   const fKpi = ["P>D", "D>P"].map((dir) => flipKpi(b, dir, now)).join("");
-  // Warteschlange
+  // queue
   const fq = (ipc.front || {});
   const q = fr.queue != null ? fr.queue : (b.queue ? b.queue.queue : null);
-  const qKpi = kpi("Warteschlange", q != null ? fmt(Array.isArray(q) ? q.length : q) : null, "",
-    [fq.outstanding_n != null ? `offen ${fmt(fq.outstanding_n)}` : null,
-      fq.oldest_outstanding_age_s != null && fq.outstanding_n ? `älteste ${ago(fq.oldest_outstanding_age_s)}` : null,
-      fr.served ? `bedient ${fmt((fr.served || {}).D)}` : null].filter(Boolean).join(" &middot; "));
-  // Tode / Hänger
+  const qKpi = kpi("Queue", q != null ? fmt(Array.isArray(q) ? q.length : q) : null, "",
+    [fq.outstanding_n != null ? `open ${fmt(fq.outstanding_n)}` : null,
+      fq.oldest_outstanding_age_s != null && fq.outstanding_n ? `oldest ${ago(fq.oldest_outstanding_age_s)}` : null,
+      fr.served ? `served ${fmt((fr.served || {}).D)}` : null].filter(Boolean).join(" &middot; "));
+  // deaths / hangs
   const a14 = fieldIpc(b, "A14") ? fieldIpc(b, "A14").value : null;
   const nStop = a14 ? a14.length : (b.stop_count || 0);
   const nErr = fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count;
-  const hv = st === "TOT" ? "TOT" : st === "HAENGT" ? "HÄNGT" : st === "GESTOPPT" ? "gestoppt" : st === "WARNUNG" ? "Warnung" : "keine";
-  const hKpi = kpi("Tode / Hänger", hv, "", [`Rang-Stopps ${fmt(nStop)}`, `Fehlerzeilen ${fmt(nErr)}`,
+  const hv = st === "TOT" ? "DEAD" : st === "HAENGT" ? "HANGING" : st === "GESTOPPT" ? "stopped" : st === "WARNUNG" ? "warning" : "none";
+  const hKpi = kpi("Deaths / hangs", hv, "", [`Rank stops ${fmt(nStop)}`, `Error lines ${fmt(nErr)}`,
     (a.reasons || []).length ? esc((a.reasons[0] || {}).text || "").slice(0, 80) : null].filter(Boolean).join(" &middot; "),
     st === "TOT" || st === "HAENGT" ? "bad" : st === "WARNUNG" ? "warn" : st === "GESTOPPT" ? "" : "ok");
   return `<section class="ovcard ${st === "TOT" ? "dead" : st === "HAENGT" ? "hang" : b.live ? "" : "off"}" id="ov-${esc(b.stem)}">${head}
     ${phaseNowHtml(b, now)}<div class="kpis">${tKpi}${dKpi}${pKpis}${fKpi}${qKpi}${hKpi}</div>${phaseHtml(b, "ovpb-")}</section>`;
 }
-// <!--DEV:BEGIN-->  (gpuq: nur Rig-Ausgabe)
+// <!--DEV:BEGIN-->  (gpuq: rig edition only)
 function gpuqStrip(d) {
   const v = (d.gpuq || {}).value;
   if (!v) return "";
   const bk = v.bookings || [];
   const hm = (x) => ((x || {}).local || "").slice(11, 16);
   const run = bk.filter((x) => x.state === "running"), next = bk.filter((x) => x.state !== "running").slice(0, 2);
-  const one = (x) => `<b>${esc(x.owner)}</b> Karten ${esc((x.cards || []).join(","))}${x.mib ? " (" + fmt(x.mib) + " MiB)" : ""} ${hm(x.start)}&ndash;${hm(x.end)}`;
-  return `<div class="gpuqstrip" id="ov-gpuq" title="gpuq-Fensterplan (http://&lt;host&gt;:8770/)"><span class="chip ${run.length ? "ok" : ""}">GPU-Fenster</span>`
-    + (run.length ? run.map((x) => `<span>jetzt: ${one(x)}</span>`).join(" ") : `<span class="muted">kein laufendes Fenster</span>`)
-    + (next.length ? ` <span class="muted">&middot; danach: ${next.map(one).join(" &middot; ")}</span>` : "") + `</div>`;
+  const one = (x) => `<b>${esc(x.owner)}</b> cards ${esc((x.cards || []).join(","))}${x.mib ? " (" + fmt(x.mib) + " MiB)" : ""} ${hm(x.start)}&ndash;${hm(x.end)}`;
+  return `<div class="gpuqstrip" id="ov-gpuq" title="gpuq window plan (http://&lt;host&gt;:8770/)"><span class="chip ${run.length ? "ok" : ""}">GPU window</span>`
+    + (run.length ? run.map((x) => `<span>now: ${one(x)}</span>`).join(" ") : `<span class="muted">no running window</span>`)
+    + (next.length ? ` <span class="muted">&middot; next: ${next.map(one).join(" &middot; ")}</span>` : "") + `</div>`;
 }
 // <!--DEV:END-->
-// Sitzungen (Nutzer 01.10. ~08:30Z): die Front kennt die Sitzung (SESSION-TRACE sess=<10-hex>), schreibt sie aber
-// nur ins Log -- die IPC trägt je Request heute nur die offenen Anfragen (front.outstanding_stalest). Gezeigt wird,
-// was da ist; der Rest steht als Feldliste da, nie aus dem Log.
+// Sessions (user 01.10. ~08:30Z): the front knows the session (SESSION-TRACE sess=<10-hex>), but writes it
+// only to the log -- per request the IPC currently carries only the open requests (front.outstanding_stalest). What
+// exists is shown; the rest is listed as fields, never taken from the log.
 const SESS_FIELDS = ["session_id (SESSION-TRACE sess, 10 hex)", "turn", "via (after_p | d_direct | d_single)", "ttft_ms", "queue_ms",
-  "prefill_ms + prefill_tokens (neu, je Gruppe)", "cached_tokens je Quelle (device / host / storage / told)", "common_prefix (SESSION-PREFIX)",
-  "decode_tokens + decode_ms", "context_tokens / kv_pages", "parks / resumes", "Flip-Epochen während der Anfrage", "status, wall_s"];
+  "prefill_ms + prefill_tokens (new, per group)", "cached_tokens per source (device / host / storage / told)", "common_prefix (SESSION-PREFIX)",
+  "decode_tokens + decode_ms", "context_tokens / kv_pages", "parks / resumes", "flip epochs during the request", "status, wall_s"];
 function sessionsHtml(d, shown, now) {
   const rows = shown.flatMap((b) => {
     const f = ((b.ipc || {}).front) || {};
     return (f.outstanding_stalest || []).map((e) => Object.assign({model: lineOf(b)}, e));
   });
-  const tbl = rows.length ? `<div class="tablewrap"><table><tr><th>Modell</th><th>rid</th><th>wo</th><th class="num">Alter</th><th class="num">letztes Token vor</th><th>Stream</th></tr>`
-    + rows.map((e) => `<tr><td>${esc(e.model)}</td><td class="mono">${esc(e.rid)}</td><td>${esc(e.where)}</td><td class="num">${ago(e.age_s)}</td><td class="num">${e.last_token_s == null ? "—" : ago(e.last_token_s)}</td><td>${e.stream ? "ja" : "nein"}</td></tr>`).join("") + `</table></div>`
-    : `<div class="muted">keine offene Anfrage</div>`;
-  return `<div class="stand warn"><b>Sitzungsübersicht fehlt in IPC.</b> Die Front kennt die Sitzung je Anfrage (SESSION-TRACE, Kopf X-Claude-Code-Session-Id
-    bzw. metadata.user_id, als 10-hex-Hash), schreibt sie aber nur in ihr Log. Gebraucht wird je Anfrage ein Ereignis bzw. VM-Punkt
-    <span class="mono">weg2_req</span> (Sitzung als Label, rid als Feld) mit: ${SESS_FIELDS.map(esc).join(" &middot; ")}.</div>
-    <h3 style="font-size:13px;margin:10px 0 6px">Offene Anfragen jetzt <span class="muted">state.json front.outstanding_stalest (IPC)</span></h3>${tbl}`;
+  const tbl = rows.length ? `<div class="tablewrap"><table><tr><th>Model</th><th>rid</th><th>where</th><th class="num">Age</th><th class="num">last token ago</th><th>Stream</th></tr>`
+    + rows.map((e) => `<tr><td>${esc(e.model)}</td><td class="mono">${esc(e.rid)}</td><td>${esc(e.where)}</td><td class="num">${ago(e.age_s)}</td><td class="num">${e.last_token_s == null ? "—" : ago(e.last_token_s)}</td><td>${e.stream ? "yes" : "no"}</td></tr>`).join("") + `</table></div>`
+    : `<div class="muted">no open request</div>`;
+  return `<div class="stand warn"><b>Session overview is missing in IPC.</b> The front knows the session per request (SESSION-TRACE, header X-Claude-Code-Session-Id
+    or metadata.user_id, as a 10-hex hash), but writes it only to its log. Needed per request is an event or VM point
+    <span class="mono">weg2_req</span> (session as label, rid as field) with: ${SESS_FIELDS.map(esc).join(" &middot; ")}.</div>
+    <h3 style="font-size:13px;margin:10px 0 6px">Open requests now <span class="muted">state.json front.outstanding_stalest (IPC)</span></h3>${tbl}`;
 }
 function overviewHtml(d, shown, now) {
   const lines = new Set(shown.map(lineOf));
   const rest = ["NF", "27B"].filter((m) => !lines.has(m)).map((m) => {
     const b = (d.boots || []).find((x) => lineOf(x) === m);
-    if (!b) return `<div class="ovline" id="ovl-${m}"><b>${m}</b> &middot; kein Boot in den letzten 6 h</div>`;
+    if (!b) return `<div class="ovline" id="ovl-${m}"><b>${m}</b> &middot; no boot in the last 6 h</div>`;
     const ipc = b.ipc || {};
-    return `<div class="ovline" id="ovl-${m}"><b>${m}</b> &middot; kein Boot live &middot; zuletzt ${esc(ipc.model || (b.meta || {}).model || "")} `
-      + `${esc(ipc.lifecycle || (plannedStopped(b) ? "gestoppt (geplant)" : ""))}${b.age_s != null ? " vor " + ago(b.age_s) : ""}</div>`;
+    return `<div class="ovline" id="ovl-${m}"><b>${m}</b> &middot; no boot live &middot; last ${esc(ipc.model || (b.meta || {}).model || "")} `
+      + `${esc(ipc.lifecycle || (plannedStopped(b) ? "stopped (planned)" : ""))}${b.age_s != null ? " " + ago(b.age_s) + " ago" : ""}</div>`;
   });
   const g = typeof gpuqStrip === "function" ? gpuqStrip(d) : "";
   return g + `<div class="ov">${shown.map((b) => ovCard(b, d, now)).join("")}${rest.join("")}</div>`;
 }
 
-// Nutzer-Order 01.10. ~07:40Z: die Zeitreihen liegen in VictoriaMetrics; diese Kacheln lesen per PromQL daraus.
-// TTFT = Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT), als IPC-Zähler
-// state.json front.arrival_seat.ttft_* vom Probennehmer nach VM geschrieben (vmpush.py).
+// User order 01.10. ~07:40Z: the time series live in VictoriaMetrics; these tiles read from it via PromQL.
+// TTFT = arrival at the front -> first content from D (front.py LEG2-FIRST-CONTENT), as IPC counter
+// state.json front.arrival_seat.ttft_* written to VM by the sampler (vmpush.py).
 function vmHtml(d) {
   const v = d.vm;
   if (!v) return "";
   const vmsrc = `<span class="ipcsrc" title="${esc(v.src || "")}">VictoriaMetrics</span>`;
-  if (v.error) return `<div class="vtile"><div class="vt-h">TTFT</div><div class="vt-big" style="font-size:16px;color:var(--bad)">VictoriaMetrics nicht lesbar</div><div class="vt-f"><span class="vt-sub">${esc(v.error)}</span></div></div>`;
+  if (v.error) return `<div class="vtile"><div class="vt-h">TTFT</div><div class="vt-big" style="font-size:16px;color:var(--bad)">VictoriaMetrics not readable</div><div class="vt-f"><span class="vt-sub">${esc(v.error)}</span></div></div>`;
   const models = ["NF", "27B"];
   const t = (m) => {
     const m5 = (v.ttft_mean_5m_ms || {})[m], n5 = (v.ttft_n_5m || {})[m];
     const mb = (v.ttft_mean_boot_ms || {})[m], mx = (v.ttft_max_boot_ms || {})[m];
     const any = m5 != null || mb != null;
-    const miss = m === "27B" ? "27B-Front: kein arrival_seat.ttft_* (Schreiber front.py _asr.note_ms, nur NF-Linie)" : "kein laufender Boot";
-    return `<div class="vtile" id="vm-ttft-${m}"><div class="vt-h">TTFT ${m} &middot; &Oslash; 5 min</div>
+    const miss = m === "27B" ? "27B front: no arrival_seat.ttft_* (writer front.py _asr.note_ms, NF line only)" : "no running boot";
+    return `<div class="vtile" id="vm-ttft-${m}"><div class="vt-h">TTFT ${m} &middot; avg 5 min</div>
       <div class="vt-big num">${any ? (m5 != null ? sec(m5) : "—") + "<small>s</small>" : `<span style="font-size:14px;color:var(--muted)">${esc(miss)}</span>`}</div>
-      <div class="vt-f"><span class="vt-sub">${any ? `${n5 != null ? fmt(n5) + " Anfragen in 5 min &middot; " : ""}seit Boot &Oslash; ${sec(mb)} s &middot; max ${sec(mx)} s` : ""}</span>${vmsrc}</div></div>`;
+      <div class="vt-f"><span class="vt-sub">${any ? `${n5 != null ? fmt(n5) + " requests in 5 min &middot; " : ""}since boot avg ${sec(mb)} s &middot; max ${sec(mx)} s` : ""}</span>${vmsrc}</div></div>`;
   };
-  return models.map(t).join("") + `<div class="vtile" id="vm-power"><div class="vt-h">Leistung alle Karten</div>
+  return models.map(t).join("") + `<div class="vtile" id="vm-power"><div class="vt-h">Power all cards</div>
     <div class="vt-big num">${fmt(v.power_sum_w)}<small>W</small></div><div class="vt-f"><span class="vt-sub">nvidia_gpu_exporter (NVML)</span>${vmsrc}</div></div>`;
 }
 
 function chipsHtml(d) {
   const out = [];
-  const src = [["Karten", d.gpus], ["Docker", d.docker], ["gpuq", d.gpuq]];
+  const src = [["Cards", d.gpus], ["Docker", d.docker], ["gpuq", d.gpuq]];
   for (const [k, v] of Object.entries(d.fronts || {})) src.push(["Front " + k.replace("front:http://", ""), v]);
   for (const [name, s] of src) {
     if (!s) continue;
     const cls = s.error ? "bad" : (s.age_s != null && s.age_s < 3 * s.period_s + 5 ? "ok" : "warn");
-    out.push(`<span class="chip ${cls}" title="${esc(s.error || "")}">${esc(name)}${s.error ? " &middot; Fehler" : s.age_s != null ? " &middot; " + ago(s.age_s) : ""}</span>`);
+    out.push(`<span class="chip ${cls}" title="${esc(s.error || "")}">${esc(name)}${s.error ? " &middot; error" : s.age_s != null ? " &middot; " + ago(s.age_s) : ""}</span>`);
   }
-  if (d.collector_error) out.push(`<span class="chip bad">IPC-Leser: ${esc(d.collector_error)}</span>`);
+  if (d.collector_error) out.push(`<span class="chip bad">IPC reader: ${esc(d.collector_error)}</span>`);
   return out.join("");
 }
 
-// Ruhige Anzeige (Nutzer 29.09.: "das dashboard lässt sich schlecht anschauen, ständig verschiebt
-// sich das nach oben/unten automatisch"):
-// (1) morph(): neues HTML wird abseits geparst und Knoten für Knoten eingearbeitet -- was gleich
-//     bleibt, bleibt derselbe Knoten; Kinder mit id werden über die id gepaart.
-// (1b) holdAnchor(): das Element auf Lesehöhe steht nach dem Neuzeichnen an derselben Stelle.
-// (2) reserveHeights(): jeder Abschnitt schrumpft beim Refresh nicht (min-height ratscht), erst ein
-//     Auf-/Zuklappen des Lesers gibt die Höhe frei.
-// (3) <details open> fasst morph() nicht an -- aufgeklappt bleibt aufgeklappt.
-// (4) pauseReason(): 10 s nach Scrollen/Tippen/Klicken und solange markiert ist, kein Neuzeichnen;
-//     dazu der Schalter "Live-Update pausieren".
+// Calm display (user 29.09.: "the dashboard is hard to look at, it keeps shifting
+// up/down automatically"):
+// (1) morph(): new HTML is parsed off to the side and worked in node by node -- what stays the
+//     same stays the same node; children with an id are paired by id.
+// (1b) holdAnchor(): the element at reading height stays at the same place after redrawing.
+// (2) reserveHeights(): no section shrinks on refresh (min-height ratchets), only the reader
+//     expanding/collapsing releases the height.
+// (3) <details open> is not touched by morph() -- open stays open.
+// (4) pauseReason(): 10 s after scrolling/typing/clicking and while text is selected, no redraw;
+//     plus the "pause live update" switch.
 const tplEl = document.createElement("template");
 function morph(el, html) {
   if (!el) return;              // release: the dev part is not in the page
@@ -2076,25 +2085,25 @@ function reserveHeights() {
 }
 function releaseHeight(box) { if (box) { box._minH = 0; box.style.minHeight = ""; } }
 document.addEventListener("toggle", (e) => releaseHeight(e.target.closest && e.target.closest(RESERVED.map((i) => "#" + i).join(","))), true);
-// Nutzer 01.10. ("vollkommen buggy"): 10 s Stillstand nach jedem Scrollen/Tippen und danach ein Sprung wirkten
-// wie ein Fehler.  Jetzt wartet das Neuzeichnen nur, solange der Finger/die Maus wirklich scrollt (1,2 s), der
-// Leseanker (holdAnchor) hält die Position; dazu Markierung, ein festgehaltener Tooltip und der Schalter.
+// User 01.10. ("completely buggy"): 10 s standstill after every scroll/typing and then a jump looked
+// like an error.  Now the redraw waits only while the finger/mouse is really scrolling (1.2 s), the
+// reading anchor (holdAnchor) keeps the position; plus selection, a pinned tooltip and the switch.
 const PAUSE_AFTER_INPUT_MS = 1200;
 let lastInput = -Infinity;
 const noteInput = () => { lastInput = performance.now(); };
 ["wheel", "touchmove"].forEach((t) => window.addEventListener(t, noteInput, {passive: true, capture: true}));
 window.addEventListener("scroll", () => { if (performance.now() > selfScrollUntil) noteInput(); }, {passive: true});
 function pauseReason() {
-  if ($("live-pause").checked) return "pausiert (Schalter)";
+  if ($("live-pause").checked) return "paused (switch)";
   const sel = document.getSelection();
-  if (sel && !sel.isCollapsed && sel.toString().trim()) return "pausiert, solange markiert ist";
-  if (tapPinned) return "pausiert, solange der Hinweis offen ist";
+  if (sel && !sel.isCollapsed && sel.toString().trim()) return "paused while text is selected";
+  if (tapPinned) return "paused while the hint is open";
   return performance.now() - lastInput < PAUSE_AFTER_INPUT_MS ? "…" : "";
 }
-// ---------------------------------------------------------------- Tabs und Expertenansicht (Nutzer 01.10.)
+// ---------------------------------------------------------------- Tabs and expert view (user 01.10.)
 const TABS = [...document.querySelectorAll("#tabbar button[data-tab]")].map((b) => b.dataset.tab);
 let curTab = "ueberblick";
-// der Kartenplaner-Reiter ist im Profil-Planer aufgegangen: alte Links und ein gespeicherter Reiter "kartenplan" führen dorthin
+// the card planner tab was merged into the profile planner: old links and a stored tab "kartenplan" lead there
 const TAB_ALIAS = { kartenplan: "profil" };
 try {
   const alias = (t) => TAB_ALIAS[t] || t;
@@ -2140,7 +2149,7 @@ $("expert").addEventListener("change", (e) => {
   RESERVED.forEach((id) => releaseHeight($(id)));
   fitPhaseLabels();
 });
-// einklappbare Bereiche: offen/zu je id gemerkt
+// collapsible sections: open/closed remembered per id
 const FOLD_KEY = "rigdash.fold";
 let foldState = {};
 try { foldState = JSON.parse(localStorage.getItem(FOLD_KEY) || "{}"); } catch (e) { foldState = {}; }
@@ -2152,12 +2161,12 @@ document.querySelectorAll("details.fold[id]").forEach((d) => {
   });
 });
 
-// <!--DEV:BEGIN-->  (Startflags: nur Rig-Ausgabe)
-// ---------------------------------------------------------------- Startflags (launchview.py)
-// Nur neu zeichnen, wenn sich ver (Digest des Gezeigten) ändert; Auf/Zu je <details> in localStorage.
+// <!--DEV:BEGIN-->  (launch flags: rig edition only)
+// ---------------------------------------------------------------- Launch flags (launchview.py)
+// Redraw only when ver (digest of what is shown) changes; open/closed per <details> in localStorage.
 const LF_KEY = "rigdash.launch.open";
 let lfOpen = new Set(), lfVer = "", lfData = null, lfInflight = false;
-const lfAutoIds = new Set();   // vom Filter aufgeklappt: zählt nicht als Leser-Zustand
+const lfAutoIds = new Set();   // opened by the filter: does not count as reader state
 try { lfOpen = new Set(JSON.parse(localStorage.getItem(LF_KEY) || "[]")); } catch (e) { lfOpen = new Set(); }
 function lfSaveOpen() { try { localStorage.setItem(LF_KEY, JSON.stringify([...lfOpen])); } catch (e) { /* private window */ } }
 const lfId = (...p) => "lf-" + p.join("-").replace(/[^A-Za-z0-9_-]/g, "_");
@@ -2166,7 +2175,7 @@ function lfDet(id, summary, body, extra) {
 }
 function lfVal(v, js) {
   if (js) return `<pre class="json mono">${esc(js)}</pre>`;
-  return v == null ? `<span class="muted">(Schalter)</span>` : `<span class="mono">${esc(v)}</span>`;
+  return v == null ? `<span class="muted">(switch)</span>` : `<span class="mono">${esc(v)}</span>`;
 }
 function lfKv(rows, cls) {
   return rows.map(([k, v]) => `<tr class="lfr ${cls || ""}"><td class="mono">${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join("");
@@ -2178,22 +2187,22 @@ function lfTable(head, body, three) {
 function lfLayer(m, name, L) {
   const id = lfId(m.model, name);
   if (!L) return "";
-  const copy = `<div style="margin:4px 0"><button class="copy" data-copy="${id}|argv">argv kopieren</button> <button class="copy" data-copy="${id}|env">ENV kopieren</button>`
+  const copy = `<div style="margin:4px 0"><button class="copy" data-copy="${id}|argv">copy argv</button> <button class="copy" data-copy="${id}|env">copy ENV</button>`
     + (L.cmd ? ` <span class="muted mono" style="font-size:11px">${esc(L.cmd)}</span>` : "") + `</div>`;
   let flags = "";
   if (L.meta) {
-    flags = lfTable(["Feld", "Wert"], lfKv(L.meta))
-      + (L.mounts && L.mounts.length ? lfTable(["Quelle", "Ziel &middot; Modus"], L.mounts.map(([s, d, mo, ty]) =>
+    flags = lfTable(["Field", "Value"], lfKv(L.meta))
+      + (L.mounts && L.mounts.length ? lfTable(["Source", "Target &middot; mode"], L.mounts.map(([s, d, mo, ty]) =>
         `<tr class="lfr"><td class="mono">${esc(s)}</td><td class="mono">${esc(d)} ${esc(mo)} ${esc(ty)}</td></tr>`).join("")) : "");
   } else {
-    flags = lfTable(["Flag", "Wert"], L.flags.map((g) => `<tr class="grp"><td colspan="2">${esc(g.group)} (${g.rows.length})</td></tr>`
+    flags = lfTable(["Flag", "Value"], L.flags.map((g) => `<tr class="grp"><td colspan="2">${esc(g.group)} (${g.rows.length})</td></tr>`
       + g.rows.map((f) => `<tr class="lfr"><td class="mono">${esc(f.flag)}</td><td>${lfVal(f.value, f.json)}</td></tr>`).join("")).join(""));
   }
-  const envSet = L.env_set.length ? lfTable(["ENV gesetzt", "Wert"], lfKv(L.env_set)) : `<div class="muted">keine gesetzte ENV</div>`;
-  const envBase = L.env_base.length ? lfDet(id + "-base", `Basis/Image (${L.env_base.length})`, lfTable(["ENV Basis/Image", "Wert"], lfKv(L.env_base)))
-    : (L.has_env_base === false ? `<div class="muted" style="font-size:12px">Basis/Image-ENV: vom Launcher dieses Images noch nicht geschrieben (env_base ab 814c6657bb)</div>` : "");
+  const envSet = L.env_set.length ? lfTable(["ENV set", "Value"], lfKv(L.env_set)) : `<div class="muted">no ENV set</div>`;
+  const envBase = L.env_base.length ? lfDet(id + "-base", `Base/image (${L.env_base.length})`, lfTable(["ENV base/image", "Value"], lfKv(L.env_base)))
+    : (L.has_env_base === false ? `<div class="muted" style="font-size:12px">Base/image ENV: not yet written by the launcher of this image (env_base from 814c6657bb)</div>` : "");
   const label = {container: "Container", front: "Front", P: "P", D: "D"}[name];
-  return lfDet(id, `<b>${label}</b> <span class="muted">&middot; ${L.meta ? `${L.meta.length} Felder, ${L.mounts.length} Mounts` : `${L.n_flags} Flags`} &middot; ${L.n_env} ENV gesetzt${L.n_env_base ? ` &middot; ${L.n_env_base} Basis` : ""}</span>`,
+  return lfDet(id, `<b>${label}</b> <span class="muted">&middot; ${L.meta ? `${L.meta.length} fields, ${L.mounts.length} mounts` : `${L.n_flags} flags`} &middot; ${L.n_env} ENV set${L.n_env_base ? ` &middot; ${L.n_env_base} base` : ""}</span>`,
     copy + flags + envSet + envBase);
 }
 function lfDiffRows(d) {
@@ -2205,19 +2214,19 @@ function lfPd(m) {
   const pd = m.pd;
   if (!pd) return "";
   const id = lfId(m.model, "pd");
-  const part = (what, d) => `<div style="margin-top:4px"><b style="font-size:12px">${what}</b> <span class="muted" style="font-size:12px">${d.differ.length} verschieden &middot; ${d.only_a.length} nur P &middot; ${d.only_b.length} nur D &middot; ${d.same.length} gleich</span></div>`
+  const part = (what, d) => `<div style="margin-top:4px"><b style="font-size:12px">${what}</b> <span class="muted" style="font-size:12px">${d.differ.length} different &middot; ${d.only_a.length} P only &middot; ${d.only_b.length} D only &middot; ${d.same.length} equal</span></div>`
     + lfTable([what === "Flags" ? "Flag" : "ENV", "P", "D"], lfDiffRows(d), true)
-    + lfDet(id + "-" + what + "-same", `gemeinsam (${d.same.length})`, lfTable([what === "Flags" ? "Flag" : "ENV", "Wert (P = D)"], lfKv(d.same)));
-  return lfDet(id, `<b>Vergleich P &harr; D</b> <span class="muted">&middot; Flags ${pd.flags.differ.length} verschieden, ${pd.flags.only_a.length}/${pd.flags.only_b.length} nur P/D &middot; ENV ${pd.env.differ.length} verschieden, ${pd.env.only_a.length}/${pd.env.only_b.length} nur P/D</span>`,
+    + lfDet(id + "-" + what + "-same", `common (${d.same.length})`, lfTable([what === "Flags" ? "Flag" : "ENV", "Value (P = D)"], lfKv(d.same)));
+  return lfDet(id, `<b>Comparison P &harr; D</b> <span class="muted">&middot; flags ${pd.flags.differ.length} different, ${pd.flags.only_a.length}/${pd.flags.only_b.length} P/D only &middot; ENV ${pd.env.differ.length} different, ${pd.env.only_a.length}/${pd.env.only_b.length} P/D only</span>`,
     part("Flags", pd.flags) + part("ENV", pd.env));
 }
 function lfModel(m) {
   const id = lfId(m.model);
-  if (!m.boot_id) return lfDet(id, `<b>${esc(m.model)}</b> <span class="muted">&middot; kein Boot mit state.json gefunden</span>`, "", ` class="lf"`);
+  if (!m.boot_id) return lfDet(id, `<b>${esc(m.model)}</b> <span class="muted">&middot; no boot with state.json found</span>`, "", ` class="lf"`);
   const cnt = ["P", "D", "front"].filter((g) => m.counts[g]).map((g) => `${g} ${m.counts[g].flags}/${m.counts[g].env}`).join(" &middot; ");
-  const kopf = `<b>${esc(m.model)}</b> <span class="kopf">&middot; <b>${esc(m.lifecycle || "?")}</b> &middot; Tag ${esc(m.tag || "?")} &middot; Image <b>${esc(m.image || "?")}</b> &middot; REV <b class="mono">${esc((m.rev || "?").slice(0, 10))}</b> &middot; Profil ${esc(m.profile || "?")} &middot; Flags/ENV ${cnt}</span>`;
+  const kopf = `<b>${esc(m.model)}</b> <span class="kopf">&middot; <b>${esc(m.lifecycle || "?")}</b> &middot; tag ${esc(m.tag || "?")} &middot; image <b>${esc(m.image || "?")}</b> &middot; REV <b class="mono">${esc((m.rev || "?").slice(0, 10))}</b> &middot; profile ${esc(m.profile || "?")} &middot; flags/ENV ${cnt}</span>`;
   const miss = m.missing.filter((k) => k === "container" || k === "front");
-  const note = miss.length ? `<div class="miss">fehlt im state.json dieses Boots: ${miss.map((k) => k === "front" ? "launch.front (Launcher ab 814c6657bb)" : "launch.container (Host-Teil, 27B)").join(", ")}</div>` : "";
+  const note = miss.length ? `<div class="miss">missing in the state.json of this boot: ${miss.map((k) => k === "front" ? "launch.front (launcher from 814c6657bb)" : "launch.container (host part, 27B)").join(", ")}</div>` : "";
   return lfDet(id, kopf, note + `<div class="muted mono" style="font-size:11px">${esc(m.boot_id)}</div>` + lfPd(m)
     + ["container", "front", "P", "D"].map((k) => lfLayer(m, k, m.layers[k])).join(""), ` class="lf"`);
 }
@@ -2235,12 +2244,12 @@ function lfApplyFilter() {
     for (; n && !n.classList.contains("grp"); n = n.nextElementSibling) if (!n.hidden) { any = true; break; }
     tr.hidden = !!q && !any;
   });
-  if (q) {                                  // Treffer sichtbar machen, ohne den gespeicherten Zustand zu ändern
+  if (q) {                                  // make hits visible without changing the stored state
     box.querySelectorAll("details").forEach((d) => {
       if (!d.open && [...d.querySelectorAll("tr.lfr")].some((tr) => !tr.hidden)) { lfAutoIds.add(d.id); d.open = true; }
     });
   }
-  $("lf-note").textContent = q ? `${hits} Treffer` : "";
+  $("lf-note").textContent = q ? `${hits} hits` : "";
 }
 function lfRender(d) {
   const anchor = readAnchor();
@@ -2258,7 +2267,7 @@ async function refreshLaunch() {
     lfVer = d.ver; lfData = d;
     lfRender(d);
   } catch (e) {
-    $("lf-note").textContent = `api/launch nicht erreichbar: ${e}`;
+    $("lf-note").textContent = `api/launch not reachable: ${e}`;
   } finally {
     lfInflight = false;
   }
@@ -2276,13 +2285,13 @@ if (DEV) $("launchbox").addEventListener("click", async (e) => {
   const m = lfData.models.find((x) => id.startsWith(lfId(x.model) + "-"));
   const L = m && m.layers[id.slice(lfId(m.model).length + 1)];
   const text = L ? (what === "argv" ? L.argv_raw : L.env_raw) : "";
-  try { await navigator.clipboard.writeText(text); b.textContent = "kopiert"; }
-  catch (err) {                              // http ohne Clipboard-API: Auswahl-Fallback
+  try { await navigator.clipboard.writeText(text); b.textContent = "copied"; }
+  catch (err) {                              // http without clipboard API: selection fallback
     const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select();
-    try { document.execCommand("copy"); b.textContent = "kopiert"; } catch (e2) { b.textContent = "nicht kopiert"; }
+    try { document.execCommand("copy"); b.textContent = "copied"; } catch (e2) { b.textContent = "not copied"; }
     ta.remove();
   }
-  setTimeout(() => { b.textContent = what === "argv" ? "argv kopieren" : "ENV kopieren"; }, 1500);
+  setTimeout(() => { b.textContent = what === "argv" ? "copy argv" : "copy ENV"; }, 1500);
 });
 if (DEV) $("lf-filter").addEventListener("input", lfApplyFilter);
 // <!--DEV:END-->
@@ -2291,7 +2300,7 @@ let failures = 0, inflight = false, refreshAgain = false, devTick = 0, devData =
 // the zoomed stretch a request was made for: an answer for another stretch is never drawn
 const zoomKey = () => { const z = window.RigZoom && RigZoom.get(); return z ? `${z[0].toFixed(3)},${z[1].toFixed(3)}` : ""; };
 async function refresh(force) {
-  if (EDITOR_ONLY) return;       // kein /api/live im Editor-Image: der Server antwortet es nicht
+  if (EDITOR_ONLY) return;       // no /api/live in the editor image: the server does not answer it
   const why = force ? "" : pauseReason();
   $("pausenote").textContent = why;
   if (why) return;
@@ -2323,13 +2332,13 @@ async function refresh(force) {
     const live = d.boots.filter((b) => b.live || (b.container && b.container.State === "running"));
     const shown = live.length ? live : d.boots.filter((b) => b.primary).slice(0, 1);
     const banner = !live.length && shown.length ? (shown.every(plannedStopped)
-      ? `<section class="card" id="boots-banner" style="border-color:var(--flip)"><b>Kein Boot liefert gerade IPC</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
-      : `<section class="card" id="boots-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Boot liefert gerade IPC.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`) : "";
+      ? `<section class="card" id="boots-banner" style="border-color:var(--flip)"><b>No boot is delivering IPC right now</b> <span class="muted">&middot; the last boot was stopped as planned. Its last figures below.</span></section>`
+      : `<section class="card" id="boots-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">No boot is delivering IPC right now.</b> <span class="muted">Below the most recently active boot with its last figures.</span></section>`) : "";
     // the sampler runs in its own process (30.09. ~21:40Z): dead or silent is said, never hidden
     const smp = d.sampler || {};
-    const smpBanner = smp.ok === false ? `<section class="card" id="sampler-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">${esc(smp.why || "Probennehmer steht")}</b>
-      <span class="muted">&middot; Kurven und Verlauf bekommen keine neuen Proben${smp.restarts ? ` &middot; ${fmt(smp.restarts)}&times; neu gestartet` : ""}${smp.last_exit ? ` &middot; zuletzt beendet mit Code ${esc(smp.last_exit.code)}` : ""} &middot; der Webserver startet ihn neu</span></section>` : "";
-    // Nutzer 01.10.: nur der sichtbare Tab wird gezeichnet, ein unveränderter Abschnitt nicht angefasst
+    const smpBanner = smp.ok === false ? `<section class="card" id="sampler-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">${esc(smp.why || "Sampler is stopped")}</b>
+      <span class="muted">&middot; curves and history receive no new samples${smp.restarts ? ` &middot; restarted ${fmt(smp.restarts)}&times;` : ""}${smp.last_exit ? ` &middot; last exited with code ${esc(smp.last_exit.code)}` : ""} &middot; the web server restarts it</span></section>` : "";
+    // user 01.10.: only the visible tab is drawn, an unchanged section is not touched
     if (curTab === "ueberblick") {
       put("overview", smpBanner + overviewHtml(d, shown, now));
       put("vmtiles", vmHtml(d));
@@ -2340,7 +2349,7 @@ async function refresh(force) {
     }
     if (curTab === "boots")
       put("boots", smpBanner + banner + (shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
-        : `<section class="card" id="boots-none"><div class="muted">Kein Boot-Zustand (state.json) der letzten 6 h gefunden.</div></section>`));
+        : `<section class="card" id="boots-none"><div class="muted">No boot state (state.json) found in the last 6 h.</div></section>`));
     if (DEV && curTab === "entwicklung") {
       if (freshDev || force || lastHtml.prod == null) {
         put("prod-stand", standHtml(d));
@@ -2360,18 +2369,18 @@ async function refresh(force) {
     // behind the public proxy the LAN-only services are not reachable: hide their links, say so once
     document.querySelectorAll("a.lan").forEach((a) => { a.style.display = d.via_proxy ? "none" : ""; });
     if ($("lannote")) $("lannote").style.display = d.via_proxy ? "" : "none";
-    const bad = live.filter((b) => b.alarm && (b.alarm.state === "TOT" || b.alarm.state === "HAENGT"));
-    document.title = bad.length ? `[${bad.map((b) => b.alarm.state === "TOT" ? "TOT" : "H\u00c4NGT").join(",")}] ${PAGE_TITLE}` : PAGE_TITLE;
-    const held = smp.held && smp.held.last_5min != null ? ` · gehalten 5 min: ${smp.held.last_5min}` : "";
-    $("sub").textContent = `${live.length} Modell${live.length === 1 ? "" : "e"} live · Stand ${hhmm(now)} · rigdash ${d.version}` +
-      (smp.mode === "prozess" ? ` · Probennehmer PID ${smp.pid}${smp.ok ? "" : " STEHT"}${held}` : "");
+    const bad = live.filter((b) => b.alarm && (alarmState(b.alarm) === "TOT" || alarmState(b.alarm) === "HAENGT"));
+    document.title = bad.length ? `[${bad.map((b) => alarmState(b.alarm) === "TOT" ? "DEAD" : "HANGING").join(",")}] ${PAGE_TITLE}` : PAGE_TITLE;
+    const held = smp.held && smp.held.last_5min != null ? ` · held 5 min: ${smp.held.last_5min}` : "";
+    $("sub").textContent = `${live.length} model${live.length === 1 ? "" : "s"} live · as of ${hhmm(now)} · rigdash ${d.version}` +
+      (smp.mode === "prozess" ? ` · sampler PID ${smp.pid}${smp.ok ? "" : " STOPPED"}${held}` : "");
     binders.forEach((f) => f());
     bindPhaseBars();
     reserveHeights();
     window.__lastShift = holdAnchor(anchor);       // headless check reads it (tests: scroll_hold.py)
   } catch (e) {
     failures++;
-    $("sub").textContent = `Dashboard-API nicht erreichbar (${failures}×): ${e}`;
+    $("sub").textContent = `Dashboard API not reachable (${failures}×): ${e}`;
   } finally {
     inflight = false;
     if (refreshAgain) { refreshAgain = false; refresh(true); }
@@ -2379,7 +2388,7 @@ async function refresh(force) {
   }
 }
 $("grafanalink").href = `${location.protocol}//${location.hostname}:3000/d/rig-verlauf/rig-verlauf`;
-if ($("vl-grafana")) $("vl-grafana").innerHTML = `Längere Zeiträume, freie Zeitwahl und PromQL-Auswertungen: <a class="lan" href="${location.protocol}//${location.hostname}:3000/d/rig-verlauf/rig-verlauf" target="_blank" rel="noopener">Grafana &bdquo;Rig – Verlauf&ldquo;</a> (VictoriaMetrics, nur im LAN)`;
+if ($("vl-grafana")) $("vl-grafana").innerHTML = `Longer periods, free time selection and PromQL queries: <a class="lan" href="${location.protocol}//${location.hostname}:3000/d/rig-verlauf/rig-verlauf" target="_blank" rel="noopener">Grafana &ldquo;Rig – history&rdquo;</a> (VictoriaMetrics, LAN only)`;
 if (DEV) {
 $("gpuqlink").href = `${location.protocol}//${location.hostname}:8770/`;
 $("plannerlink").href = `${location.protocol}//${location.hostname}:8780/`;
@@ -2397,8 +2406,8 @@ $("live-pause").addEventListener("change", (e) => {
   if (!e.target.checked) refresh(true); else $("pausenote").textContent = pauseReason();
 });
 setTab(curTab, true);
-setInterval(() => refresh(), 1000);      // Nutzer 01.10.: Phase/Flip ≤ 1 s (api/live kommt aus dem LiveCache)
-// Sekundenzähler der Phase: läuft im Browser weiter, zwischen zwei Abfragen ohne Neuzeichnen
+setInterval(() => refresh(), 1000);      // user 01.10.: phase/flip ≤ 1 s (api/live comes from the LiveCache)
+// seconds counter of the phase: keeps running in the browser between two requests without redrawing
 const clockSkew = {v: 0};
 setInterval(() => {
   document.querySelectorAll(".since[data-since]").forEach((el) => {

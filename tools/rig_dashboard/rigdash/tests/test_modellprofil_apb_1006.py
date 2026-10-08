@@ -5,7 +5,7 @@ Gepinnt:
     Verzeichnis ``empty``; ein vollständiges Modell ``complete``;
   * Pfade außerhalb der Wurzeln, ``..`` und ungültige ``gguf_file`` bleiben ``ValueError`` (die Wurzel-Prüfung gilt auch für fehlende Pfade);
   * ein Planer-Baum ohne ``probe`` (zu alte Linie) wird benannt (``ModellprofilUnavailable``), nicht still übergangen;
-  * ``estimate`` und ``check_path`` verhalten sich unverändert (fehlender Pfad = ValueError "existiert nicht").
+  * ``estimate`` und ``check_path`` verhalten sich unverändert (fehlender Pfad = ValueError "does not exist").
 """
 
 import os
@@ -44,7 +44,7 @@ class TestStatus(unittest.TestCase):
         r = self.est.status({"path": os.path.join(self.root, "NF-nicht-da")})
         self.assertTrue(r["ok"])
         self.assertEqual((r["state"], r["estimable"]), ("not_mounted", False))
-        self.assertIn("nicht gemountet", r["reason"])
+        self.assertIn("not mounted", r["reason"])
 
     def test_empty_directory_is_an_empty_mountpoint(self):
         os.makedirs(os.path.join(self.root, "mountpunkt"))
@@ -52,8 +52,8 @@ class TestStatus(unittest.TestCase):
         self.assertEqual((r["state"], r["estimable"]), ("empty", False))
 
     def test_the_root_check_holds_for_missing_paths_too(self):
-        for req, word in (({"path": "/gibt/es/nicht"}, "Modellwurzel"), ({"path": os.path.join(self.root, "..", "x")}, "Modellwurzel"),
-                          ({"path": "relativ"}, "absolut"), ({}, "fehlt"), ({"path": self.model, "gguf_file": "../a.gguf"}, "gguf_file"),
+        for req, word in (({"path": "/gibt/es/nicht"}, "model root"), ({"path": os.path.join(self.root, "..", "x")}, "model root"),
+                          ({"path": "relativ"}, "absolut"), ({}, "missing"), ({"path": self.model, "gguf_file": "../a.gguf"}, "gguf_file"),
                           ({"path": self.model, "gguf_file": "a.bin"}, "gguf_file")):
             with self.assertRaises(ValueError, msg=str(req)) as cm:
                 self.est.status(req)
@@ -64,7 +64,7 @@ class TestStatus(unittest.TestCase):
     def test_estimate_still_refuses_a_missing_path_with_text(self):
         with self.assertRaises(ValueError) as cm:
             self.est.estimate({"path": os.path.join(self.root, "NF-nicht-da")})
-        self.assertIn("existiert nicht", str(cm.exception))
+        self.assertIn("does not exist", str(cm.exception))
 
     def test_an_old_planner_tree_without_probe_is_named(self):
         old = M.ModelEstimator(tree=OLD_TREE, roots=[self.root])

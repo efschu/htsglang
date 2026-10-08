@@ -46,7 +46,7 @@ W_RS = "python/sglang/srt/weg2/rankstats.py"
 W_FI = "python/sglang/srt/weg2/front_state_ipc.py"
 MISSING_WRITER = {
     "A1": "state.json boot_id/lifecycle -- weg2/state_file.py:init/transition",
-    "A4": "state.json groups.<G>.form -- Launcher (SGLANG_WEG2_FORM) über weg2/state_file.py:transition",
+    "A4": "state.json groups.<G>.form -- launcher (SGLANG_WEG2_FORM) via weg2/state_file.py:transition",
     "A12": "state.json front.groups -- %s:publish_front_fields + publish_event(group_health)" % W_FI,
     "A13": "rankstats.errors -- %s:ErrorTally / front.errors -- %s:publish_front_fields" % (W_RS, W_FI),
     "A14": "events rank_stop -- %s:publish_rank_stops / rankstats.stops -- %s:note_stop" % (W_FI, W_RS),
@@ -64,9 +64,9 @@ MISSING_WRITER = {
     "C4": "rankstats.decode.gpu_ms_by_bs -- %s:_decode_block" % W_RS,
     "C5": "RankState kv/seats -- python/sglang/srt/weg2/rank_state.py:note_capacity / rankstats.cap -- %s:RankStats.sync_capacity" % W_RS,
     "C6": "state.json front.d_seats (bzw. d_phase_n) -- %s:publish_front_fields" % W_FI,
-    "C7": "rankstats-Zähler (Deltas) -- %s:RankStats.record" % W_RS,
-    "D1": "rankstats.work.spans (sonst prefill.last) -- %s:RankStats.record" % W_RS,
-    "D2": "rankstats.work.spans kind=extend (sonst prefill.last auf D) -- %s:RankStats.record" % W_RS,
+    "C7": "rankstats counters (deltas) -- %s:RankStats.record" % W_RS,
+    "D1": "rankstats.work.spans (otherwise prefill.last) -- %s:RankStats.record" % W_RS,
+    "D2": "rankstats.work.spans kind=extend (otherwise prefill.last on D) -- %s:RankStats.record" % W_RS,
     "D3": "events flip_first_work + flip_done -- %s" % W_FI,
     "D4": "state.json serving_since_ts / events group_ready -- weg2/state_file.py:transition, add_event",
     "E1": "rankstats.prefill.cached_tokens -- %s:_prefill_block" % W_RS,
@@ -74,10 +74,10 @@ MISSING_WRITER = {
     "E3": "state.json front.served_tokens -- %s:publish_front_fields" % W_FI,
     "F3": "wie B1", "F4": "wie A4", "F6": "wie C1-C6",
 }
-MISSING_LABEL = "fehlt in IPC"
+MISSING_LABEL = "missing in IPC"
 #: Nutzer 02.10.: the front's own flip numbers (B1/B2) are raw instruments, never the Flipzeit -- that is
 #: the Flipzeit is flipzeit.py's one number (Nutzer 06.10., from ipcboot.flip_views over the history marks)
-NOT_FLIPZEIT = "Front-Rohwert, keine Flipzeit (Flipzeit: flipzeit.py, eine Definition, siehe Flipzeit-Kacheln)"
+NOT_FLIPZEIT = "Front raw value, not a flip time (flip time: flipzeit.py, one definition, see the flip time tiles)"
 
 
 def field(key: str, ipc_value, ipc_src: Optional[str], log_value=None, from_log: Optional[List[str]] = None) -> dict:
@@ -485,12 +485,12 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     f["F4"] = field("F4", f["A4"]["value"] if f["A4"]["src"] == "ipc" else None, f["A4"]["ipc_src"],
                     f["A4"]["value"])
     c = {k: f[k]["value"] for k in ("C1", "C2", "C3", "C4", "C5", "C6") if f[k]["src"] == "ipc"}
-    f["F6"] = field("F6", c or None, "C1-C6 aus IPC", None)
+    f["F6"] = field("F6", c or None, "C1-C6 from IPC", None)
     return f
 
 
 def for_page(fields: dict) -> dict:
-    """What goes to the page: the IPC value, or the "fehlt in IPC" marker with its writer."""
+    """What goes to the page: the IPC value, or the "missing in IPC" marker with its writer."""
     return {k: dict(fv) for k, fv in fields.items()}
 
 

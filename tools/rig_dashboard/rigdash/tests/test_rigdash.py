@@ -329,7 +329,7 @@ class HealthTests(unittest.TestCase):
         b = self._boot(health={"P": {"t": self.NOW - 10, "alive": False, "http_ok": False, "streak": 4}})
         a = health.assess(b, self.NOW)
         self.assertEqual(a["state"], "WARNUNG")
-        self.assertIn("Hinweis (IPC front.groups)", a["reasons"][0]["text"])
+        self.assertIn("Note (IPC front.groups)", a["reasons"][0]["text"])
         self.assertNotIn("dead", {r["level"] for r in a["reasons"]})
 
     def test_stale_health_line_does_not_alarm(self):
@@ -348,7 +348,7 @@ class HealthTests(unittest.TestCase):
         a = health.assess(b, self.NOW)
         self.assertEqual(a["state"], "WARNUNG")
         self.assertIn("W27", a["reasons"][0]["text"])
-        self.assertIn("[Quelle: x.P.log]", a["reasons"][0]["text"])
+        self.assertIn("[source: x.P.log]", a["reasons"][0]["text"])
 
     def test_stop_followed_by_activity_is_only_a_warning(self):
         t = self.NOW - 300
@@ -360,8 +360,8 @@ class HealthTests(unittest.TestCase):
         b = self._boot(front={"queue": 3, "outstanding": {"P": 1, "D": 0}}, last_activity_any=self.NOW - 125)
         a = health.assess(b, self.NOW)
         self.assertEqual(a["state"], "HAENGT")
-        self.assertIn("4 Anfrage(n) warten", a["reasons"][0]["text"])
-        self.assertIn("seit 125 s", a["reasons"][0]["text"])
+        self.assertIn("4 request(s) waiting", a["reasons"][0]["text"])
+        self.assertIn("for 125 s", a["reasons"][0]["text"])
 
     def test_no_hang_verdict_while_the_log_is_still_being_read(self):
         b = self._boot(front={"queue": 4, "outstanding": {"P": 0, "D": 6}}, last_activity_any=self.NOW - 550,
@@ -369,7 +369,7 @@ class HealthTests(unittest.TestCase):
                        container={"Names": "c", "State": "running", "Status": "Up 51 minutes (unhealthy)"})
         a = health.assess(b, self.NOW)
         self.assertEqual(a["state"], "WARNUNG")
-        self.assertIn("noch nicht beurteilbar", a["reasons"][0]["text"])
+        self.assertIn("not assessable yet", a["reasons"][0]["text"])
 
     def test_queue_with_recent_progress_is_fine(self):
         b = self._boot(front={"queue": 3, "outstanding": {}}, last_activity_any=self.NOW - 20)
@@ -388,7 +388,7 @@ class HealthTests(unittest.TestCase):
                        last_activity_any=self.NOW - 5)
         a = health.assess(b, self.NOW)
         self.assertEqual(a["state"], "WARNUNG")
-        self.assertIn("widerspricht dem Fortschritt", a["reasons"][0]["text"])
+        self.assertIn("contradicts the progress", a["reasons"][0]["text"])
         self.assertIn("W27", a["reasons"][0]["text"])
 
     def test_finished_boot_not_judged_but_ended_on_named(self):
@@ -545,7 +545,7 @@ class RedactTests(unittest.TestCase):
         from rigdash import redact
         self.assertIsNone(redact.clean("WEG2 ADMIN-KEY minted for this boot -> /x/boot.adminkey (mode 0600)"))
         self.assertIsNone(redact.clean("RPC auth=bearer abcdefghijklmnop"))
-        self.assertEqual(redact.clean("failed: api_key=sk-or-v1-abcdef0123456789 x"), "failed: api_key=<entfernt> x")
+        self.assertEqual(redact.clean("failed: api_key=sk-or-v1-abcdef0123456789 x"), "failed: api_key=<redacted> x")
         self.assertEqual(redact.clean("#new-token: 16384, tokens: 5"), "#new-token: 16384, tokens: 5")
         self.assertNotIn("ADMIN-KEY", redact.guard('{"t": "WEG2 ADMIN-KEY x"}'))
 
@@ -797,7 +797,7 @@ class PlannedStopTests(unittest.TestCase):
                        last_activity={"P": _utc(17, 37, 0)})
         a = health.assess(b, self.NOW)
         self.assertNotEqual(a["state"], "TOT")
-        self.assertTrue(any("benannter Stopp, Gruppe P" in r["text"] for r in a["reasons"]))
+        self.assertTrue(any("named stop, group P" in r["text"] for r in a["reasons"]))
 
     def test_stop_requested_while_serving_changes_nothing(self):
         end = {"planned": {"t": self.NOW - 200, "text": H_DAUER_STOP, "src": "nf-dauer"}, "death": None}
@@ -815,7 +815,7 @@ class PlannedStopTests(unittest.TestCase):
         b["series"] = {"t": ts, "D_decode_tps": [100.0] * 12}
         b["timeline"] = {"segs": [{"k": "dec", "s": ts[0], "e": self.NOW}]}
         server.finish_series(b, None, self.NOW, 5.0)
-        self.assertEqual((b["series"]["gap_kind"], b["series"]["gap_reason"]), ("planned", "gestoppt (geplant)"))
+        self.assertEqual((b["series"]["gap_kind"], b["series"]["gap_reason"]), ("planned", "stopped (planned)"))
         self.assertEqual(b["series"]["gap_from"], _utc(17, 40, 2))
         self.assertEqual(b["timeline"]["cut_kind"], "planned")
 
@@ -1235,7 +1235,7 @@ class IpcDeathAndWallRateTests(unittest.TestCase):
         a = health.assess(b, self.NOW)
         self.assertNotEqual(a["state"], "TOT")
         self.assertNotIn("dead", {r["level"] for r in a["reasons"]})
-        self.assertIn("[Quelle: boot_weg2_x_110211.D.log]", a["reasons"][0]["text"])
+        self.assertIn("[source: boot_weg2_x_110211.D.log]", a["reasons"][0]["text"])
 
     def test_death_only_from_ipc(self):
         end = stops.classify_ipc({"lifecycle": "dead", "lifecycle_since": self.NOW - 30,

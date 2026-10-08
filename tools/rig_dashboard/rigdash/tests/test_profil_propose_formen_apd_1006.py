@@ -6,7 +6,7 @@ Gepinnt:
   * ``single`` (Einzelkarte): genau EINE Karte, ein Modellpfad, kein Basisprofil noetig; Startprofil = neues ``flliper.server/1`` aus den Argumenten des normalen
     Servers (Herkunft ``planer``, nie die weg2-Zeilen eines Release-Profils); das Verdikt ist eine Planer-Rechnung, es gibt keinen Launcher-Lauf.
   * Mit dem ECHTEN Kindprozess: Referenz-Dual (``27b-nvfp4-dual``, Referenz-Rig, 3 Karten): Argv und Env des Vorschlags = der Golden des Dual (Diff 0), kein Wert
-    geaendert, Verdikt traegt ``DUAL-PASSUNG`` als "Planer-Rechnung, nicht hw_fit", der Launcher-Trockenlauf des Vorschlags geht ohne Force durch.
+    geaendert, Verdikt traegt ``DUAL-PASSUNG`` als "planner calculation, not hw_fit", der Launcher-Trockenlauf des Vorschlags geht ohne Force durch.
     Einzelkarte 5090 + 27B NVFP4: Verdikt "passt" mit den Zahlen von AP-F (Bruchteil 0.874, KV fp8, Reserve 4050 MiB); 27B INT8: "passt nicht".
 """
 
@@ -46,17 +46,17 @@ def _canned_single():
     werte = [{"key": "--model-path", "group": "-", "policy": "single", "alt": None, "wert": "/m", "eintraege": 1, "zustand": "vorgeschlagen",
               "herkunft": "Modellprofil (Pfad)", "grund": "Modellordner", "in_argv": True, "geaendert": True},
              {"key": "--mem-fraction-static", "group": "-", "policy": "single", "alt": None, "wert": "0.874", "eintraege": 1, "zustand": "unbelegt",
-              "herkunft": "Planer-Rechnung", "grund": "Bruchteil", "in_argv": True, "geaendert": True},
+              "herkunft": "Planner calculation", "grund": "Bruchteil", "in_argv": True, "geaendert": True},
              {"key": "--max-running-requests", "group": "-", "policy": "single", "alt": None, "wert": "1", "eintraege": 1, "zustand": "vorgeschlagen",
               "herkunft": "Ziel", "grund": "Sitze", "in_argv": True, "geaendert": True},
              {"key": "--no-enable-multimodal", "group": "-", "policy": "single", "alt": None, "wert": "", "eintraege": 1, "zustand": "vorgeschlagen",
               "herkunft": "Ziel", "grund": "Sichtturm aus", "in_argv": True, "geaendert": True},
              {"key": "--speculative-algorithm", "group": "-", "policy": "single", "alt": None, "wert": None, "eintraege": 1, "zustand": "vorgeschlagen",
-              "herkunft": "Planer-Rechnung", "grund": "kein Draft", "in_argv": False, "geaendert": False}]
+              "herkunft": "Planner calculation", "grund": "kein Draft", "in_argv": False, "geaendert": False}]
     return {"vorschlag": {"schema": "flliper.propose-a/1", "form": "einzel", "n": 1, "werte": werte, "ziele": {"seats": 1}, "cards": [{"name": "RTX 5090", "total_mib": 32607}],
-                          "inventory": {}, "seeds": {}, "fit": {"level": "ja", "art": "Planer-Rechnung"}, "unbelegt": [], "hinweise": [], "blocker": [],
+                          "inventory": {}, "seeds": {}, "fit": {"level": "ja", "art": "Planner calculation"}, "unbelegt": [], "hinweise": [], "blocker": [],
                           "vektorlaengen": {}, "vektoren_ok": True, "vektoren_falsch": {}, "basis": "(kein Profil)"},
-            "verdikt": _doc([], n=1, ausgang="passt", form="einzel", art="Planer-Rechnung"), "je_wert": {},
+            "verdikt": _doc([], n=1, ausgang="passt", form="einzel", art="Planner calculation"), "je_wert": {},
             "launch": {"argv": ["--model-path", "/m"], "env": {}}}
 
 
@@ -82,8 +82,8 @@ class SingleRequests(unittest.TestCase):
         for name in ("profil_planer.py", os.path.join("static", "profil_planer.js")):
             with open(os.path.join(os.path.dirname(HERE), name), encoding="utf-8") as fh:
                 txt = fh.read()
-            self.assertNotIn("späteres Arbeitspaket", txt, name)
-            self.assertNotIn("eigenes Arbeitspaket (AP-F)", txt, name)
+            self.assertNotIn("later work package", txt, name)
+            self.assertNotIn("own work package (AP-F)", txt, name)
             self.assertNotIn("eigenes Arbeitspaket (AP-E)", txt, name)
         self.assertEqual(P.ProfilEditor.BALKEN_FORM, {"flip": "flip", "tp": "d_only", "dual": "dual", "single": "single"})        # profile_couplings.FORMS
 
@@ -118,12 +118,12 @@ class SingleRequests(unittest.TestCase):
         by = {w["label"]: w for w in r["werte"]}
         self.assertEqual(by["--mem-fraction-static"]["key"], "flag:--mem-fraction-static")
         self.assertTrue(by["--max-running-requests"]["kanten"], "the catalog gives --max-running-requests its edges")
-        self.assertTrue(any("Einzelkarte" in n and "kein weg2-Launcher" in n for n in sp["doc"]["meta"]["notes"]))
+        self.assertTrue(any("single card" in n and "no weg2 launcher" in n for n in sp["doc"]["meta"]["notes"]))
 
     def test_without_a_profile_the_model_path_is_needed(self):
         with self.assertRaises(P.ProfilError) as cm:
             self.ed.propose({"form": "single", "inventar": "rig"})
-        self.assertIn("model_path angeben", str(cm.exception))
+        self.assertIn("give model_path", str(cm.exception))
         r = self.ed.propose({"form": "single", "inventar": "rig", "model_path": "/m"})              # no basis at all is fine for one card
         self.assertTrue(r["ok"], r)
         self.assertEqual(r["basis"]["kind"], "keines")
@@ -133,10 +133,10 @@ class SingleRequests(unittest.TestCase):
         two = [{"card": "rtx3080-20", "pcie": {"gen": 4, "lanes": 8}}] * 2
         with self.assertRaises(P.ProfilError) as cm:
             self.ed.propose(self._body(inventar=two))
-        self.assertIn("genau eine Karte", str(cm.exception))
+        self.assertIn("select exactly one card", str(cm.exception))
         with self.assertRaises(P.ProfilError) as cm:
             self.ed.propose(self._body(karte=3))
-        self.assertIn("das Hardwareprofil hat 1 Karten", str(cm.exception))
+        self.assertIn("the hardware profile has 1 cards", str(cm.exception))
         r = self.ed.propose(self._body(inventar=two[:1]))                                         # one catalog card that is not the rig's: a datasheet inventory
         self.assertTrue(r["ok"], r)
         self.assertIn("cards", self.orc.calls[-1][1]["inventar"])
@@ -180,25 +180,25 @@ class Darstellung(unittest.TestCase):
 out.single = PX.renderProposal({ n: 1, form: "single", werte: [{ label: "--mem-fraction-static", alt: null, wert: "0.874", zustand: "vorgeschlagen", geaendert: true, verdikte: [] }],
   verdikt: { ausgang: "passt", verdikte: [{ ebene: "fit", code: "EINZEL-PASSUNG", grund: "passt: statisch 28000 MiB", force_state: "geht", forcebar: null },
                                           { ebene: "fit", code: "FIT-STATIC", grund: "es fehlen 100 MiB", force_state: "blockiert", forcebar: null }] },
-  vorschlag: { cards: [{ name: "NVIDIA GeForce RTX 5090", total_mib: 32607 }], fit: { level: "ja", margin_mib: 12.4, first: "x", art: "Planer-Rechnung" } }, notes: [] });
-out.dual = PX.renderProposal({ n: 3, form: "dual", werte: [], verdikt: { ausgang: "geht", verdikte: [{ ebene: "fit", code: "DUAL-PASSUNG", grund: "Dual-Passung: Planer-Rechnung, nicht hw_fit", force_state: "geht" },
+  vorschlag: { cards: [{ name: "NVIDIA GeForce RTX 5090", total_mib: 32607 }], fit: { level: "ja", margin_mib: 12.4, first: "x", art: "Planner calculation" } }, notes: [] });
+out.dual = PX.renderProposal({ n: 3, form: "dual", werte: [], verdikt: { ausgang: "geht", verdikte: [{ ebene: "fit", code: "DUAL-PASSUNG", grund: "Dual fit: planner calculation, not hw_fit", force_state: "geht" },
                                                                                                 { ebene: "fit", code: "FIT", grund: "hw_fit", force_state: "hinweis" }] },
   vorschlag: { cards: [], fit: { level: "ja", margin_mib: 1, first: "" } }, notes: [] });
 out.flip = PX.renderProposal({ n: 3, form: "flip", werte: [], verdikt: { ausgang: "geht", verdikte: [] }, vorschlag: { cards: [], fit: { level: "ja", margin_mib: 1, first: "" } }, notes: [] });
 """)
         s = o["single"]
-        self.assertIn("Planer-Rechnung: passt (kein Launcher-Lauf", s)
-        self.assertNotIn("Der Launcher-Trockenlauf geht ohne Force durch", s)
-        self.assertIn("Passung (Planer-Rechnung)", s)
-        self.assertIn("Passung als Planer-Rechnung", s)
+        self.assertIn("Planner estimate: fits (no launcher run", s)
+        self.assertNotIn("The launcher dry run passes without force", s)
+        self.assertIn("Fit (Planner calculation)", s)
+        self.assertIn("Fit as a planner estimate", s)
         self.assertIn("EINZEL-PASSUNG", s)
         self.assertIn("pfx-v-verweigert", s)                                                    # the failing check is shown as failing
         d = o["dual"]
-        self.assertIn("Passung als Planer-Rechnung", d)
+        self.assertIn("Fit as a planner estimate", d)
         self.assertIn("DUAL-PASSUNG", d)
         self.assertNotIn("<b class=\"mono\">FIT</b>", d)                                         # hw_fit's FIT line stays the hw_fit line
-        self.assertIn("Passung (hw_fit, notwendige Bedingung)", d)
-        self.assertNotIn("Passung als Planer-Rechnung", o["flip"])
+        self.assertIn("Fit (hw_fit, necessary condition)", d)
+        self.assertNotIn("Fit as a planner estimate", o["flip"])
 
 
 @unittest.skipUnless(os.path.exists(CENSUS_27B) and os.path.isdir(REPO_PY) and os.path.exists(GOLDEN_DUAL)
@@ -268,10 +268,10 @@ class RealForms(unittest.TestCase):
         codes = {x["code"]: x for x in vd["verdikte"]}
         self.assertIn("DUAL-PASSUNG", codes)
         self.assertIn("DUAL-PFLICHT", codes)
-        self.assertEqual(codes["DUAL-PASSUNG"]["titel"], "Dual-Passung: Planer-Rechnung, nicht hw_fit")
-        self.assertIn("Planer-Rechnung, nicht hw_fit", codes["DUAL-PASSUNG"]["text"])
+        self.assertEqual(codes["DUAL-PASSUNG"]["titel"], "Dual fit: planner calculation, not hw_fit")
+        self.assertIn("planner calculation, not hw_fit", codes["DUAL-PASSUNG"]["text"])
         self.assertEqual(codes["DUAL-PASSUNG"]["ebene"], "fit")
-        self.assertIn("Dual nicht modelliert", codes["FIT"]["text"])
+        self.assertIn("dual not modelled", codes["FIT"]["text"])
         self.assertEqual(codes["FIT"]["force_state"], "hinweis")                         # hw_fit does not clear or block the Dual
         for w in r["werte"]:
             for f in ("key", "label", "wert", "zustand", "herkunft", "grund", "verdikte", "kanten"):
@@ -294,7 +294,7 @@ class RealForms(unittest.TestCase):
         self.assertEqual((r["form"], r["n"]), ("single", 1))
         vd = r["verdikt"]
         self.assertEqual((vd["ausgang"], vd["orakel"]["laeufe"]), ("passt", 0))
-        self.assertTrue(vd["art"].startswith("Planer-Rechnung"), vd["art"])                    # "+ ServerArgs-Parse" when the parse ran
+        self.assertTrue(vd["art"].startswith("Planner calculation"), vd["art"])                    # "+ ServerArgs-Parse" when the parse ran
         self.assertIsNone(vd["lauf"])
         by = {w["label"]: w for w in r["werte"]}
         # AP-F (test_nvfp4_passt_mit_zahlen, Handrechnung dort): fraction = floor3((32607-400-4050)/(32607-400)) = 0.874, KV fp8, MTP-Draft NEXTN

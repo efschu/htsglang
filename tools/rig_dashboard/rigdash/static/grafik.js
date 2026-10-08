@@ -19,8 +19,10 @@
   const root = $("verlauf");
   if (!root || typeof uPlot === "undefined") return;
 
-  const LOG = "aus Log (Übergang)";
-  const NO_DATA = "keine Daten (vor IPC-Aufzeichnung)";
+  // source labels delivered by the API (history.py / ipcstate.py); the German literals are accepted as well as the English ones
+  const LOG = "from log (transition)", LOG_DE = "aus Log (Übergang)";
+  const NO_DATA = "no data (before IPC recording)", NO_DATA_DE = "keine Daten (vor IPC-Aufzeichnung)";
+  const SRC_EN = { [LOG_DE]: LOG, [NO_DATA_DE]: NO_DATA };
   let model = "27B", range = "1h";
   try {
     model = localStorage.getItem("rigdash-gf-model") || model;
@@ -45,14 +47,14 @@
   function fmtN(v, d) {
     if (v == null || !isFinite(v)) return "–";
     const a = Math.abs(v);
-    if (a >= 1e6) return (v / 1e6).toFixed(1).replace(".", ",") + " M";
-    if (a >= 1e4) return (v / 1e3).toFixed(1).replace(".", ",") + " k";
-    return v.toFixed(d == null ? (a >= 100 ? 0 : 1) : d).replace(".", ",");
+    if (a >= 1e6) return (v / 1e6).toFixed(1) + " M";
+    if (a >= 1e4) return (v / 1e3).toFixed(1) + " k";
+    return v.toFixed(d == null ? (a >= 100 ? 0 : 1) : d);
   }
-  const srcBadge = (s) => !s ? "" : (s !== NO_DATA && (s === LOG || /Übergang|fehlt|–/.test(s)))
-    ? `<span class="logsrc" title="Quelle: ${esc(s)}">${esc(s)}</span>`
-    : s === NO_DATA ? `<span class="logsrc" title="Im Zeitraum keine IPC-Probe">${esc(s)}</span>`
-    : `<span class="ipcsrc" title="Quelle: ${esc(s)}">${esc(s)}</span>`;
+  const srcBadge = (s0) => { const s = SRC_EN[s0] || s0; return !s ? "" : (s !== NO_DATA && (s === LOG || /transition|Übergang|missing|fehlt|–/.test(s)))
+    ? `<span class="logsrc" title="Source: ${esc(s)}">${esc(s)}</span>`
+    : s === NO_DATA ? `<span class="logsrc" title="No IPC sample in this period">${esc(s)}</span>`
+    : `<span class="ipcsrc" title="Source: ${esc(s)}">${esc(s)}</span>`; };
 
   // ---------------------------------------------------------------- Kopfzeile
   function bar() {
@@ -91,41 +93,41 @@
   const big = (v, unit) => `<div class="vt-big num">${v}${unit && v !== "–" ? `<small>${unit}</small>` : ""}</div>`;
 
   // die EINE Definition (flipzeit.DEFINITION; tests/test_flipzeit_1006.py prüft die Gleichheit mit index.html)
-  const FLIP_DEF = {"P>D": "letzter P-Chunk fertig → erstes Decode-Token erzeugt",
-    "D>P": "letztes Decode-Token erzeugt → erster Prefill-Chunk beginnt zu rechnen (erster Forward auf PP0)"};
+  const FLIP_DEF = {"P>D": "last P chunk done → first decode token produced",
+    "D>P": "last decode token produced → first prefill chunk starts computing (first forward on PP0)"};
 
   function tiles(d) {
     const t = d.tiles || {}, s = d.src || {};
-    const over = d.zoom ? "im Zoom-Bereich" : `über ${d.range}`;
-    const seatTxt = t.seats_mean == null ? "Sitze: –"
-      : `bei Ø ${fmtN(t.seats_mean, 1)} Sitzen${t.seats_min != null ? ` (${fmtN(t.seats_min, 0)}–${fmtN(t.seats_max, 0)})` : ""}` +
-        (t.stream_mean != null ? ` · im Mittel ${fmtN(t.stream_mean, 1)} tok/s je Stream, Gesamt ≈ ${fmtN(t.stream_mean * t.seats_mean, 0)} tok/s` : "");
+    const over = d.zoom ? "in the zoom range" : `over ${d.range}`;
+    const seatTxt = t.seats_mean == null ? "Seats: –"
+      : `at avg ${fmtN(t.seats_mean, 1)} seats${t.seats_min != null ? ` (${fmtN(t.seats_min, 0)}–${fmtN(t.seats_max, 0)})` : ""}` +
+        (t.stream_mean != null ? ` · mean ${fmtN(t.stream_mean, 1)} tok/s per stream, total ≈ ${fmtN(t.stream_mean * t.seats_mean, 0)} tok/s` : "");
     const tierTxt = t.tiers
-      ? `Device ${fmtN(t.tiers.device)} · L2 ${fmtN(t.tiers.host)} · L3 ${fmtN(t.tiers.storage)} · ohne Stufe ${fmtN(t.tiers.unassigned)}`
-      : "Stufen Device/L2/L3: –";
+      ? `Device ${fmtN(t.tiers.device)} · L2 ${fmtN(t.tiers.host)} · L3 ${fmtN(t.tiers.storage)} · no tier ${fmtN(t.tiers.unassigned)}`
+      : "Tiers device/L2/L3: –";
     const hitPct = t.cache_hit == null ? null : 100 * t.cache_hit;
     $("vl-tiles").innerHTML = [
-      tile("Decode je Stream p50", big(fmtN(t.out_p50), "tok/s"), `Median ${over} (${d.step}-s-Eimer) · ${seatTxt}`, s.decode),
-      tile("Decode je Stream p90", big(fmtN(t.out_p90), "tok/s"), `90. Perzentil ${over} · Sitze = Batchgröße der Decode-Runden, nur über die Decode-Zeit gemittelt`, s.seats || s.decode),
-      tile("Prefix-Cache-Treffer", gauge(hitPct == null ? null : hitPct / 100, hitPct == null ? "–" : fmtN(hitPct, 1) + " %", C.s1),
-        `aus Cache / (Cache + neu gerechnet); Übergabe P→D nie Cache (${t.handoff_share == null ? "–" : fmtN(100 * t.handoff_share, 1) + " %"} der Input-Tokens) · ${tierTxt}`, s.cache),
+      tile("Decode per stream p50", big(fmtN(t.out_p50), "tok/s"), `Median ${over} (${d.step} s bucket) · ${seatTxt}`, s.decode),
+      tile("Decode per stream p90", big(fmtN(t.out_p90), "tok/s"), `90th percentile ${over} · seats = batch size of the decode rounds, averaged over decode time only`, s.seats || s.decode),
+      tile("Prefix cache hits", gauge(hitPct == null ? null : hitPct / 100, hitPct == null ? "–" : fmtN(hitPct, 1) + " %", C.s1),
+        `from cache / (cache + recomputed); handoff P→D is never cache (${t.handoff_share == null ? "–" : fmtN(100 * t.handoff_share, 1) + " %"} of the input tokens) · ${tierTxt}`, s.cache),
       ...["P>D", "D>P"].map((dir) => {
         // Nutzer 06.10.: dieselbe Berechnung wie die Überblick-Kachel (flipzeit.tile über die Marken flip_t2t); nur das
         // Fenster ist ein anderes und steht dabei
         const fw = t.flip || {}, f = fw[dir] || {}, sx = (v) => v == null ? "–" : fmtN(v / 1000, 2);
         const age = f.last_t ? Math.max(0, d.now - f.last_t) : null;
-        return tile("Flipzeit " + dir.replace(">", "→"), big(sx(f.last_ms), "s"),
-          `zuletzt${age != null ? " vor " + fmtN(age / 60, 0) + " min" : ""} · p50 ${sx(f.p50_ms)} · p90 ${sx(f.p90_ms)} · max ${sx(f.max_ms)} s (n=${f.n || 0}, Fenster: ${(fw.window || {}).label || "?"}) · `
-          + FLIP_DEF[dir] + (f.idle_n ? ` · Leerlauf-Flips (kein Prefill/Decode stand an), nicht gezählt: ${f.idle_n}` : ""), s.flip);
+        return tile("Flip time " + dir.replace(">", "→"), big(sx(f.last_ms), "s"),
+          `last${age != null ? " " + fmtN(age / 60, 0) + " min ago" : ""} · p50 ${sx(f.p50_ms)} · p90 ${sx(f.p90_ms)} · max ${sx(f.max_ms)} s (n=${f.n || 0}, window: ${(fw.window || {}).label || "?"}) · `
+          + FLIP_DEF[dir] + (f.idle_n ? ` · idle flips (no prefill/decode pending), not counted: ${f.idle_n}` : ""), s.flip);
       }),
     ].join("");
     $("hw-tiles").innerHTML = [
-      tile("Leistungsaufnahme", big(t.power_sum_w == null ? "–" : fmtN(t.power_sum_w, 0), "W"),
-        `Summe aller ${(d.cards || []).length} Karten · Ø ${t.power_mean_w == null ? "–" : fmtN(t.power_mean_w, 0) + " W"} je Karte`, s.power),
-      tile("Heißeste GPU", gauge(t.hottest_c == null ? null : t.hottest_c / 100, t.hottest_c == null ? "–" : fmtN(t.hottest_c, 0) + " °C", thr(t.hottest_c, 75, 85)),
-        `${esc(t.hottest_card || "")} · Kerntemperatur (Hotspot per NVML nicht lesbar)`, "NVML"),
+      tile("Power draw", big(t.power_sum_w == null ? "–" : fmtN(t.power_sum_w, 0), "W"),
+        `sum of all ${(d.cards || []).length} cards · avg ${t.power_mean_w == null ? "–" : fmtN(t.power_mean_w, 0) + " W"} per card`, s.power),
+      tile("Hottest GPU", gauge(t.hottest_c == null ? null : t.hottest_c / 100, t.hottest_c == null ? "–" : fmtN(t.hottest_c, 0) + " °C", thr(t.hottest_c, 75, 85)),
+        `${esc(t.hottest_card || "")} · core temperature (hotspot not readable via NVML)`, "NVML"),
       tile("Host-CPU", gauge(t.cpu_pct == null ? null : t.cpu_pct / 100, t.cpu_pct == null ? "–" : fmtN(t.cpu_pct, 1) + " %", thr(t.cpu_pct, 70, 90)),
-        "Proxmox-Host, alle Kerne", s.host),
+        "Proxmox host, all cores", s.host),
     ].join("");
   }
 
@@ -286,7 +288,7 @@
     o.dataset.zoomT1 = u.scales.x.max;
     if (!o.hasAttribute("tabindex")) {
       o.setAttribute("tabindex", "0");
-      o.setAttribute("aria-label", "Diagramm: ziehen zoomt alle Grafiken, Doppelklick oder Esc zurück, + / − / Pfeile");
+      o.setAttribute("aria-label", "Chart: drag zooms all graphs, double-click or Esc to go back, + / − / arrows");
     }
   }
   // alle Diagramme auf dieselbe Zeitachse: der gezeigte Bereich (gezoomt oder der Zeitraum bis jetzt)
@@ -321,8 +323,8 @@
     charts.pre = mk("vl-c-pre", {
       scales: { y: { range: zeroUp(10) } },
       axes: [axisX(), axisY(tps)],
-      series: [{}, line("P-Prefill (während Prefill)", C.s1, "tok/s"), line("D-Prefill (während Prefill)", C.s2, "tok/s"),
-        wall("P Wanduhr inkl. Pausen", C.s1), wall("D Wanduhr inkl. Pausen", C.s2)],
+      series: [{}, line("P prefill (during prefill)", C.s1, "tok/s"), line("D prefill (during prefill)", C.s2, "tok/s"),
+        wall("P wall clock incl. pauses", C.s1), wall("D wall clock incl. pauses", C.s2)],
     }, rowsPre(d));
     // Decode: die Rate WÄHREND D dekodierte (Tokens / Decode-Zeit im Eimer); je Stream und die Sitze mit
     // demselben Nenner (Nutzer 30.09. ~21:10Z: je Stream nur mit der Zahl der Sitze). Sitze auf der
@@ -332,7 +334,7 @@
       const idx = i == null ? lastIdx(u, si) : i;
       if (idx == null || S["m.stream_tps"][idx] == null) return "–";
       const st = S["m.stream_tps"][idx], se = S["m.seats"][idx], all = S["m.dec_rate"][idx];
-      return fmtN(st, 1) + " tok/s" + (se != null ? ` bei Ø ${fmtN(se, 1)} Sitzen (Gesamt ≈ ${fmtN(all, 0)} tok/s)` : "");
+      return fmtN(st, 1) + " tok/s" + (se != null ? ` at avg ${fmtN(se, 1)} seats (total ≈ ${fmtN(all, 0)} tok/s)` : "");
     };
     const seatVal = (u, v, si, i) => {
       const S = data.series;
@@ -343,31 +345,31 @@
     };
     charts.dec = mk("vl-c-dec", {
       scales: { y: { range: zeroUp(10) }, seats: { range: (u, a, b) => [0, Math.max(4, Math.ceil((b || 0) * 1.15))] } },
-      axes: [axisX(), axisY(tps), Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "seats", side: 1, grid: { show: false }, size: 40, label: "Sitze", labelSize: 14, labelFont: FONT })],
-      series: [{}, line("alle Streams (während Decode)", C.s3, "tok/s"),
-        line("je Stream", C.text, "tok/s", { fill: undefined, width: 1.5, points: { show: true, size: 4, fill: C.text }, value: streamVal }),
-        line("Sitze (Batchgröße, Ø über Decode-Zeit)", C.s4, "", { fill: undefined, width: 1.5, scale: "seats", noDot: true,
+      axes: [axisX(), axisY(tps), Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "seats", side: 1, grid: { show: false }, size: 40, label: "Seats", labelSize: 14, labelFont: FONT })],
+      series: [{}, line("all streams (during decode)", C.s3, "tok/s"),
+        line("per stream", C.text, "tok/s", { fill: undefined, width: 1.5, points: { show: true, size: 4, fill: C.text }, value: streamVal }),
+        line("Seats (batch size, avg over decode time)", C.s4, "", { fill: undefined, width: 1.5, scale: "seats", noDot: true,
           paths: uPlot.paths && uPlot.paths.stepped ? uPlot.paths.stepped({ align: 1 }) : undefined, value: seatVal }),
-        wall("Wanduhr inkl. Pausen", C.s3)],
+        wall("wall clock incl. pauses", C.s3)],
     }, rowsDec(d));
     charts.cache = mk("vl-c-cache", {
       scales: { y: { range: zeroUp(10) } },
       axes: [axisX(), axisY(tps)],
       series: [{},
-        line("aus Cache", C.s1, "tok/s", { fill: C.s1 + "66", value: valFmt("tok/s", null, (i) => raw.v[0][i]) }),
-        line("neu gerechnet P", C.s2, "tok/s", { fill: C.s2 + "66", value: valFmt("tok/s", null, (i) => raw.v[1][i]) }),
-        line("neu gerechnet D", C.s3, "tok/s", { fill: C.s3 + "66", value: valFmt("tok/s", null, (i) => raw.v[2][i]) }),
-        line("Übergabe P→D (kein Cache)", C.s4, "tok/s", { fill: undefined, dash: [5, 4], width: 1.5 })],
+        line("from cache", C.s1, "tok/s", { fill: C.s1 + "66", value: valFmt("tok/s", null, (i) => raw.v[0][i]) }),
+        line("recomputed P", C.s2, "tok/s", { fill: C.s2 + "66", value: valFmt("tok/s", null, (i) => raw.v[1][i]) }),
+        line("recomputed D", C.s3, "tok/s", { fill: C.s3 + "66", value: valFmt("tok/s", null, (i) => raw.v[2][i]) }),
+        line("Handoff P→D (no cache)", C.s4, "tok/s", { fill: undefined, dash: [5, 4], width: 1.5 })],
       bands: [{ series: [2, 1], fill: C.s2 + "66" }, { series: [3, 2], fill: C.s3 + "66" }],
     }, rowsCache(d));
     // TTFT der Nutzer (Nutzer 01.10.: zentrale Messgroesse, mit Verlauf) aus VictoriaMetrics; Balken je Eimer
     charts.ttft = mk("vl-c-ttft", {
       scales: { y: { range: zeroUp(1000) }, n: { range: (u, a, b) => [0, Math.max(4, Math.ceil((b || 0) * 1.2))] } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " s"),
-        Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "n", side: 1, grid: { show: false }, size: 40, label: "Anfragen", labelSize: 14, labelFont: FONT })],
-      series: [{}, line("TTFT je Takt (Punkt = Anfragen mit erstem Token im Eimer, Mittel)", C.s7, "s", { value: valFmt("s", 2, null, 0.001),
+        Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "n", side: 1, grid: { show: false }, size: 40, label: "Requests", labelSize: 14, labelFont: FONT })],
+      series: [{}, line("TTFT per tick (dot = requests with first token in the bucket, mean)", C.s7, "s", { value: valFmt("s", 2, null, 0.001),
           width: 0, fill: undefined, noDot: true, paths: () => null, points: { show: true, size: 7, fill: C.s7 } }),
-        line("Anfragen mit erstem Token im Eimer (Hilfslinie, Klick blendet ein)", C.s4, "", { width: 1, fill: undefined, scale: "n", noDot: true, show: false,
+        line("Requests with first token in the bucket (helper line, click to show)", C.s4, "", { width: 1, fill: undefined, scale: "n", noDot: true, show: false,
           paths: uPlot.paths && uPlot.paths.stepped ? uPlot.paths.stepped({ align: 1 }) : undefined })],
     }, rowsTtft(d));
     charts.kv = mk("vl-c-kv", {
@@ -385,7 +387,7 @@
     charts.power = mk("hw-c-power", {
       scales: { y: { range: zeroUp(100) } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v, 0) + " W")],
-      series: [{}, line("Summe aller Karten", C.text, "W", { fill: C.text + "14", width: 2.25 })]
+      series: [{}, line("Sum of all cards", C.text, "W", { fill: C.text + "14", width: 2.25 })]
         .concat(cards.map((c, i) => thin(cardLabel(c), cardCol(i), "W"))),
     }, rowsPower(d));
     charts.temp = mk("hw-c-temp", {
@@ -421,8 +423,8 @@
     charts.host = mk("hw-c-host", {
       scales: { y: { range: [0, 100] } },
       axes: [axisX(), axisY(pct)],
-      series: [{}, line("CPU", C.s7, "%", { fill: C.s7 + "1f" }), thin("Speicher belegt (MemAvailable)", C.s4, "%"),
-        thin("Boot-Container memory.current", C.s5, "%")],
+      series: [{}, line("CPU", C.s7, "%", { fill: C.s7 + "1f" }), thin("Memory in use (MemAvailable)", C.s4, "%"),
+        thin("Boot container memory.current", C.s5, "%")],
     }, rowsHost(d));
     sig = sigOf(d);
   }
@@ -482,13 +484,13 @@
     const set = (id, src) => { const el = $(id); if (el) el.innerHTML = srcBadge(src); };
     set("vl-s-pre", s.prefill); set("vl-s-dec", s.decode); set("vl-s-cache", s.cache); set("vl-s-kv", s.kv);
     const fw = (d.tiles || {}).flip || {};
-    set("vl-s-flip", `Fenster ${(fw.window || {}).label || "?"}: P→D n=${(fw["P>D"] || {}).n || 0}, D→P n=${(fw["D>P"] || {}).n || 0} · ` + (s.flip || "")); set("vl-s-ttft", (d.ttft || {}).error ? "VictoriaMetrics: " + d.ttft.error : (d.ttft || {}).src); set("hw-s-power", s.power); set("hw-s-temp", s.temp); set("hw-s-clock", s.cards);
+    set("vl-s-flip", `Window ${(fw.window || {}).label || "?"}: P→D n=${(fw["P>D"] || {}).n || 0}, D→P n=${(fw["D>P"] || {}).n || 0} · ` + (s.flip || "")); set("vl-s-ttft", (d.ttft || {}).error ? "VictoriaMetrics: " + d.ttft.error : (d.ttft || {}).src); set("hw-s-power", s.power); set("hw-s-temp", s.temp); set("hw-s-clock", s.cards);
     set("hw-s-host", s.host); set("hw-s-pcie", (d.pcie || {}).error ? "VictoriaMetrics: " + d.pcie.error : (d.pcie || {}).src); set("hw-s-memclk", "NVML");
     const err = Object.entries(d.errors || {}).map(([k, v]) => k + ": " + v).join(" · ");
     const nb = (d.marks || []).filter((m) => m.kind === "boot").length;
     const zt = d.zoom && window.RigZoom ? `Zoom ${RigZoom.hms(d.zoom[0])}–${RigZoom.hms(d.zoom[1])} · ` : "";
-    $("vl-note").textContent = `${d.model} · ${zt}${d.zoom ? "" : d.range + " · "}Raster ${d.step} s · ziehen = zoomen, Doppelklick/Esc = zurück · grün = Boot-Start (${nb}), gestrichelt = Boot-Ende, fein = Flip · Punkt = letzter Wert · Speicher ${fmtN(d.db.size_mb, 1)} MB` +
-      (err ? " · Fehler: " + err : "");
+    $("vl-note").textContent = `${d.model} · ${zt}${d.zoom ? "" : d.range + " · "}grid ${d.step} s · drag = zoom, double-click/Esc = back · green = boot start (${nb}), dashed = boot end, fine = flip · dot = last value · storage ${fmtN(d.db.size_mb, 1)} MB` +
+      (err ? " · error: " + err : "");
   }
 
   let again = false;
@@ -500,7 +502,7 @@
       const zq = z ? `&from=${z[0].toFixed(3)}&to=${z[1].toFixed(3)}` : "";
       const r = await fetch(`api/history?model=${encodeURIComponent(model)}&range=${encodeURIComponent(range)}${zq}`, { cache: "no-store" });
       const d = await r.json();
-      if (!d.t) throw new Error(d.error || "keine Daten");
+      if (!d.t) throw new Error(d.error || "no data");
       data = d;
       if (!C) C = tokens();
       tiles(d);
@@ -508,7 +510,7 @@
       if (force) sig = "";
       update(d);
     } catch (e) {
-      $("vl-note").textContent = "Verlauf nicht erreichbar: " + e;
+      $("vl-note").textContent = "History not reachable: " + e;
     } finally {
       inflight = false;
       if (again) { again = false; load(true); }
@@ -520,11 +522,11 @@
   window.addEventListener("resize", rebuild);
   try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", rebuild); } catch (e) { /* old browser */ }
   // Legende der Phasen-Bänder: dieselben Klassen wie die Phasenleiste der Boot-Karte
-  const PH_NAME = { P: "P-Prefill", D: "D-Prefill/Extend", dec: "D-Decode", flip_pd: "Flip P→D", flip_dp: "Flip D→P",
-    flip_tail: "Flip-Nachlauf", vis_load: "Vision laden", vis_enc: "Vision rechnen", vis_unload: "Vision entladen",
-    idle: "Leerlauf", off: "aus/lädt/tot", unknown: "unbekannt", Pdec: "P-Prefill + D-Decode (Dual)", PD: "P-Prefill + D-Prefill (Dual)" };
+  const PH_NAME = { P: "P prefill", D: "D prefill/extend", dec: "D decode", flip_pd: "Flip P→D", flip_dp: "Flip D→P",
+    flip_tail: "Flip tail", vis_load: "Vision load", vis_enc: "Vision encode", vis_unload: "Vision unload",
+    idle: "Idle", off: "off/loading/dead", unknown: "unknown", Pdec: "P prefill + D decode (dual)", PD: "P prefill + D prefill (dual)" };
   const lgEl = $("vl-legend");
-  if (lgEl) lgEl.innerHTML = "<b style=\"color:var(--text)\">Band unter den Diagrammen = Phase:</b>" + PH.concat(["Pdec", "PD"]).map((k) =>
+  if (lgEl) lgEl.innerHTML = "<b style=\"color:var(--text)\">Band below the charts = phase:</b>" + PH.concat(["Pdec", "PD"]).map((k) =>
     `<span class="lg" style="display:inline-flex;align-items:center;gap:4px"><i class="ph-k-${k}" style="display:inline-block;width:18px;height:11px;border-radius:2px${k === "idle" ? ";--ic:var(--muted)" : ""}"></i>${PH_NAME[k]}</span>`).join("");
   bar();
   // Tabs (Nutzer 01.10.): Verlauf und Karten liegen in eigenen Tabs; versteckt wird nicht geladen, beim Zeigen

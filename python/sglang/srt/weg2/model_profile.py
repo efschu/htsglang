@@ -94,7 +94,7 @@ def load_config(path: str) -> Tuple[Dict[str, Any], str]:
     base = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
     cfg_path = os.path.join(base, "config.json")
     if not os.path.isfile(cfg_path):
-        raise ModelProfileError("%s: keine config.json neben dem Modell" % path)
+        raise ModelProfileError("%s: no config.json next to the model" % path)
     with open(cfg_path, encoding="utf-8") as fh:
         return json.load(fh), cfg_path
 
@@ -119,12 +119,12 @@ def layer_families(t: Mapping[str, Any]) -> Tuple[str, ...]:
     sonst ``full_attention_interval`` (Layer l ist Attention, wenn ``(l+1) % interval == 0``), sonst alles Attention."""
     n = _int(t.get("num_hidden_layers"))
     if n <= 0:
-        raise ModelProfileError("num_hidden_layers fehlt oder ist nicht positiv: die Tiefe ist unbekannt")
+        raise ModelProfileError("num_hidden_layers is missing or not positive: the depth is unknown")
     explicit = t.get("layer_types") or t.get("layers_block_type")
     linear_kind = FAM_MAMBA if (t.get("mamba_num_heads") or t.get("ssm_state_size")) and not t.get("linear_num_value_heads") else FAM_GDN
     if explicit:
         if len(explicit) != n:
-            raise ModelProfileError("layer_types hat %d Einträge, num_hidden_layers ist %d" % (len(explicit), n))
+            raise ModelProfileError("layer_types has %d entries, num_hidden_layers is %d" % (len(explicit), n))
         out = []
         for k in explicit:
             s = str(k)
@@ -210,16 +210,16 @@ def _read_safetensors_header(path: str) -> Dict[str, Any]:
         with open(path, "rb") as fh:
             raw = fh.read(8)
             if len(raw) < 8:
-                raise ModelProfileError("%s: Datei kürzer als 8 Byte" % path)
+                raise ModelProfileError("%s: file shorter than 8 bytes" % path)
             (n,) = struct.unpack("<Q", raw)
             if n > (1 << 30):
-                raise ModelProfileError("%s: Header-Länge %d unplausibel" % (path, n))
+                raise ModelProfileError("%s: header length %d implausible" % (path, n))
             blob = fh.read(n)
             if len(blob) < n:
-                raise ModelProfileError("%s: Header abgeschnitten (%d von %d Byte)" % (path, len(blob), n))
+                raise ModelProfileError("%s: header truncated (%d of %d bytes)" % (path, len(blob), n))
         return {"__len__": 8 + n, **json.loads(blob)}
     except (OSError, ValueError) as exc:
-        raise ModelProfileError("Safetensors-Kopf von %s nicht lesbar: %s" % (path, exc)) from exc
+        raise ModelProfileError("safetensors header of %s not readable: %s" % (path, exc)) from exc
 
 
 def scan_safetensors(model_dir: str) -> TensorDir:
@@ -253,7 +253,7 @@ def scan_safetensors(model_dir: str) -> TensorDir:
                 elems *= int(d)
             dt = str(meta.get("dtype"))
             if dt not in SAFETENSORS_DTYPE_BYTES:
-                warnings.append("unbekannter Dtype %s bei %s: mit 2 Byte gerechnet" % (dt, name))
+                warnings.append("unknown dtype %s at %s: calculated with 2 bytes" % (dt, name))
             tensors.append(Tensor(name, elems * SAFETENSORS_DTYPE_BYTES.get(dt, 2), dt, tuple(int(d) for d in meta.get("shape", []))))
     return TensorDir("safetensors", tensors, files, header_bytes, idx_total, warnings[:20])
 
@@ -294,7 +294,7 @@ def _gguf_value(b: _Buf, vt: int) -> Any:
             b.read(struct.calcsize(_GGUF_SCALAR[et]) * n)      # grosse Zahlenfelder (Token-Typen) überspringen
             return None
         return [_gguf_value(b, et) for _ in range(n)]
-    raise ModelProfileError("GGUF: Werttyp %d unbekannt" % vt)
+    raise ModelProfileError("GGUF: value type %d unknown" % vt)
 
 
 def scan_gguf(gguf_file: str) -> Tuple[TensorDir, Dict[str, Any]]:
@@ -305,10 +305,10 @@ def scan_gguf(gguf_file: str) -> Tuple[TensorDir, Dict[str, Any]]:
         with open(gguf_file, "rb") as fh:
             b = _Buf(fh)
             if b.read(4) != b"GGUF":
-                raise ModelProfileError("%s: kein GGUF (Magic fehlt)" % gguf_file)
+                raise ModelProfileError("%s: not a GGUF (magic missing)" % gguf_file)
             version = b.u32()
             if version < 2:
-                raise ModelProfileError("%s: GGUF-Version %d wird nicht gelesen" % (gguf_file, version))
+                raise ModelProfileError("%s: GGUF version %d is not read" % (gguf_file, version))
             n_tensors = b.u64()
             n_kv = b.u64()
             for _ in range(n_kv):
@@ -322,14 +322,14 @@ def scan_gguf(gguf_file: str) -> Tuple[TensorDir, Dict[str, Any]]:
                 gt = b.u32()
                 b.u64()                                  # Datenoffset
                 if gt not in GGML_TYPES:
-                    raise ModelProfileError("%s: ggml-Typ %d bei %s unbekannt" % (gguf_file, gt, name))
+                    raise ModelProfileError("%s: ggml type %d at %s unknown" % (gguf_file, gt, name))
                 tname, blck, tsize = GGML_TYPES[gt]
                 elems = 1
                 for d in dims:
                     elems *= d
                 tensors.append(Tensor(name, elems // blck * tsize, tname, dims))
     except (OSError, struct.error) as exc:
-        raise ModelProfileError("GGUF-Kopf von %s nicht lesbar: %s" % (gguf_file, exc)) from exc
+        raise ModelProfileError("GGUF header of %s not readable: %s" % (gguf_file, exc)) from exc
     files = {os.path.basename(gguf_file): os.path.getsize(gguf_file)}
     return TensorDir("gguf", tensors, files, 0), kv
 
@@ -381,7 +381,7 @@ def scan_gguf_set(gguf_file: str) -> Tuple[TensorDir, Dict[str, Any], List[str]]
     Fehlt ein Teil, wird verweigert (benannt): die Gewichtssumme eines unvollständigen Satzes wäre ein Bruchteil und gälte als Wert."""
     parts, missing = gguf_parts(gguf_file)
     if missing:
-        raise ModelProfileError("%s: GGUF-Satz unvollständig, es fehlt %s" % (gguf_file, ", ".join(missing)))
+        raise ModelProfileError("%s: GGUF set incomplete, missing %s" % (gguf_file, ", ".join(missing)))
     if len(parts) == 1:
         td, kv = scan_gguf(parts[0])
         return td, kv, parts
@@ -408,7 +408,7 @@ def config_from_gguf(kv: Mapping[str, Any], td: TensorDir) -> Tuple[Dict[str, An
     im Kopf: ``bfloat16`` ist angenommen."""
     arch = str(kv.get("general.architecture") or "")
     if not arch:
-        raise ModelProfileError("GGUF ohne general.architecture: keine Geometrie lesbar")
+        raise ModelProfileError("GGUF without general.architecture: no geometry readable")
 
     def g(key: str) -> Any:
         return kv.get(arch + "." + key)
@@ -421,7 +421,7 @@ def config_from_gguf(kv: Mapping[str, Any], td: TensorDir) -> Tuple[Dict[str, An
 
     bc = num(g("block_count"))
     if bc <= 0:
-        raise ModelProfileError("GGUF ohne %s.block_count: die Tiefe ist unbekannt" % arch)
+        raise ModelProfileError("GGUF without %s.block_count: the depth is unknown" % arch)
     notes: List[str] = []
     nextn = num(g("nextn_predict_layers"))
     n_layers = bc - nextn if 0 < nextn < bc else bc
@@ -431,7 +431,7 @@ def config_from_gguf(kv: Mapping[str, Any], td: TensorDir) -> Tuple[Dict[str, An
     key_len = num(g("attention.key_length")) or (emb // heads if heads else 0)
     t: Dict[str, Any] = {"model_type": arch, "num_hidden_layers": n_layers, "hidden_size": emb, "num_attention_heads": heads,
                          "num_key_value_heads": kvh, "head_dim": key_len, "dtype": "bfloat16"}
-    notes.append("config aus dem GGUF-Kopf (%s): Aktivierungs-Dtype bfloat16 angenommen, Wortschatz aus token_embd" % arch)
+    notes.append("config from the GGUF header (%s): activation dtype bfloat16 assumed, vocabulary from token_embd" % arch)
     if num(g("context_length")):
         t["max_position_embeddings"] = num(g("context_length"))
     ffn = g("feed_forward_length")
@@ -452,7 +452,7 @@ def config_from_gguf(kv: Mapping[str, Any], td: TensorDir) -> Tuple[Dict[str, An
             t["linear_value_head_dim"] = num(g("ssm.inner_size")) // rank if rank else 0
             t["linear_conv_kernel_dim"] = num(g("ssm.conv_kernel")) or 4
         else:
-            notes.append("ssm.*-Schlüssel der Architektur %s nicht abgebildet: Mixer-Zustand unbekannt" % arch)
+            notes.append("ssm.* keys of architecture %s not mapped: mixer state unknown" % arch)
     if num(g("expert_count")):
         t["num_experts"] = num(g("expert_count"))
         t["num_experts_per_tok"] = num(g("expert_used_count"))
@@ -826,7 +826,7 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
     Wert, der als ``v`` gilt; beide Varianten stehen daneben.  Nichts wird geladen, nichts geschrieben."""
     model_path = os.path.abspath(model_path)
     if not os.path.exists(model_path):
-        raise ModelProfileError("%s existiert nicht" % model_path)
+        raise ModelProfileError("%s does not exist" % model_path)
     warnings: List[str] = []
 
     # --- Tensorverzeichnis (zuerst: ein GGUF ohne config.json trägt die Geometrie im Kopf) ----------------
@@ -875,16 +875,16 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
                            "config_path": cfg_path,
                            "config_sha": hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:16]}
     if cfg_source == "gguf":
-        out["config_source"] = _v("gguf", SRC_INDEX, note="keine config.json: Geometrie aus den Schlüsseln des GGUF-Kopfes (config_from_gguf)")
+        out["config_source"] = _v("gguf", SRC_INDEX, note="no config.json: geometry from the keys of the GGUF header (config_from_gguf)")
     if td.kind == "gguf":
         ft = _int(gguf_kv.get("general.file_type"), -1)
         out["gguf"] = {
             "architecture": _v(str(gguf_kv.get("general.architecture") or ""), SRC_INDEX),
             "block_count": _v(_int(gguf_kv.get(str(gguf_kv.get("general.architecture") or "") + ".block_count")), SRC_INDEX),
             "nextn_predict_layers": _v(_int(gguf_kv.get(str(gguf_kv.get("general.architecture") or "") + ".nextn_predict_layers")), SRC_INDEX),
-            "file_type": _v(GGUF_FILE_TYPES.get(ft, "ftype %d" % ft if ft >= 0 else "unbekannt"), SRC_INDEX,
+            "file_type": _v(GGUF_FILE_TYPES.get(ft, "ftype %d" % ft if ft >= 0 else "unknown"), SRC_INDEX,
                             note="general.file_type = %d" % ft),
-            "files": _v(len(gguf_files) or 1, SRC_STAT, note="Dateien des Satzes: %s" % ", ".join(os.path.basename(x) for x in gguf_files)),
+            "files": _v(len(gguf_files) or 1, SRC_STAT, note="files of the set: %s" % ", ".join(os.path.basename(x) for x in gguf_files)),
         }
 
     # --- Architektur ---------------------------------------------------------------------------------
@@ -932,7 +932,7 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
         ln, le = cl["layer_nonexp"], cl["layer_exp"]
         missing = [i for i in range(n_layers) if i not in ln and i not in le]
         if missing:
-            warnings.append("Layer ohne Tensoren: %s" % missing[:8])
+            warnings.append("layers without tensors: %s" % missing[:8])
         # Layerfamilie aus den Tensoren bestätigen
         for i, f in cl["fam_seen"].items():
             if i < n_layers and fams[i] != f and not (fams[i] != FAM_ATTN and f != FAM_ATTN):
@@ -951,15 +951,15 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
         n_experts_found = max(ids_per_layer) if ids_per_layer else 0
         mtp_bytes = cl["cls"].get("mtp", 0.0)
         weights = {
-            "total_bytes": _v(int(td.total_bytes), SRC_INDEX, note="Summe der Tensorgrößen aus den Köpfen (%s)" % td.kind),
-            "disk_bytes": _v(td.disk_bytes, SRC_STAT, note="Summe der Dateigrößen; der Rest zur Tensorsumme sind die Köpfe (%d B)" % td.header_bytes) if td.disk_bytes else None,
-            "header_bytes": _v(td.header_bytes, SRC_STAT, note="Safetensors-Köpfe (8 B + JSON je Shard); Tensorsumme + Köpfe = Dateigröße") if td.header_bytes else None,
+            "total_bytes": _v(int(td.total_bytes), SRC_INDEX, note="sum of the tensor sizes from the headers (%s)" % td.kind),
+            "disk_bytes": _v(td.disk_bytes, SRC_STAT, note="sum of the file sizes; the rest to the tensor sum are the headers (%d B)" % td.header_bytes) if td.disk_bytes else None,
+            "header_bytes": _v(td.header_bytes, SRC_STAT, note="safetensors headers (8 B + JSON per shard); tensor sum + headers = file size") if td.header_bytes else None,
             "layers_bytes_nonexpert": _v(int(sum(per_layer)), SRC_INDEX),
             "layers_bytes_expert": _v(int(sum(per_layer_exp)), SRC_INDEX),
             "per_family_mean_bytes": {f: _v(int(sum(v) / len(v)), SRC_INDEX) for f, v in by_fam.items() if v},
             "per_role_bytes": _v({r: int(sum(cl["role_bytes"].get(i, {}).get(r, 0.0) for i in range(n_layers)))
                                   for r in sorted({r for d in cl["role_bytes"].values() for r in d})}, SRC_INDEX),
-            "layer_bytes": _v([int(x) for x in per_layer], SRC_INDEX, note="ohne Experten, PLE, n-gram"),
+            "layer_bytes": _v([int(x) for x in per_layer], SRC_INDEX, note="without experts, PLE, n-gram"),
             "layer_expert_bytes": _v([int(x) for x in per_layer_exp], SRC_INDEX),
             "embed_bytes": _v(int(cl["cls"].get("embed", 0.0)), SRC_INDEX),
             "lm_head_bytes": _v(int(cl["cls"].get("lm_head", 0.0)), SRC_INDEX),
@@ -967,7 +967,7 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
             "mtp_bytes": _v(int(mtp_bytes), SRC_INDEX),
             "ple": {"per_layer_bytes": _v([int(x) for x in per_layer_ple], SRC_INDEX),
                     "ngram_table_bytes": _v(int(ngram_total), SRC_INDEX,
-                                            note="n-gram-Einbettung: bleibt auf der Platte (mmap), erreicht das Gerät nie") if ngram_total else None},
+                                            note="n-gram embedding: stays on disk (mmap), never reaches the device") if ngram_total else None},
             "other_bytes": _v(int(cl["cls"].get("other", 0.0)), SRC_INDEX),
         }
         weights["ple"] = {k: v for k, v in weights["ple"].items() if v is not None}
@@ -977,7 +977,7 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
         mtp_layers_found = len(cl["mtp_layers"]) or (1 if mtp_bytes > 0 else 0)
     else:
         if td.kind == "none" and not allow_config_only:
-            raise ModelProfileError("%s: keine Shards und keine GGUF-Datei" % model_path)
+            raise ModelProfileError("%s: no shards and no GGUF file" % model_path)
         cw = estimate_weights_from_config(cfg, fmt_hint=None)
         fmt_name, fmt_src = cw["format"], SRC_ESTIMATE
         fmt_detail["storage"] = cw["storage"]
@@ -989,7 +989,7 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
         src_total = SRC_INDEX if td.index_total_size else SRC_ESTIMATE
         weights = {
             "total_bytes": _v(int(td.index_total_size or total), src_total,
-                              note=("model.safetensors.index.json total_size" if td.index_total_size else "Formel aus Geometrie und Quantisierungsformat")),
+                              note=("model.safetensors.index.json total_size" if td.index_total_size else "formula from geometry and quantisation format")),
             "total_bytes_formula": _v(int(total), SRC_ESTIMATE, note="Geometrieformel (estimate_weights_from_config)"),
             "layers_bytes_nonexpert": _v(int(sum(per_layer)), SRC_ESTIMATE),
             "layers_bytes_expert": _v(int(sum(per_layer_exp)), SRC_ESTIMATE),
@@ -1031,11 +1031,11 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
     }
     if qsa:
         out["kv"]["indexer"] = _v({k: t.get(k) for k in t if k.startswith("indexer_")}, SRC_CONFIG,
-                                  note="Indexer-Cache nicht in der KV-Zelle gerechnet (Metall: Zelle = Attention-Layer x 1088 B fp8)")
+                                  note="indexer cache not calculated in the KV cell (metal: cell = attention layer x 1088 B fp8)")
     slide = sliding_info(t)
     if slide is not None:
         out["kv"]["sliding"] = {"window_tokens": _v(slide[0], SRC_CONFIG), "layers": _v(slide[1], SRC_CONFIG),
-                                "note": "Gleitfenster-Layer halten höchstens window_tokens Token; die KV-Zelle oben gilt je Layer und Token"}
+                                "note": "sliding-window layers hold at most window_tokens tokens; the KV cell above applies per layer and token"}
 
     # --- Mamba/GDN-Zustand ------------------------------------------------------------------------------
     ms_cfg = mamba_state_bytes(t, None)
@@ -1084,10 +1084,10 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
     dec_src = SRC_INDEX if have_tensors else SRC_ESTIMATE
     out["decode"] = {
         "bytes_per_token": _v(int(weights["layers_bytes_nonexpert"]["v"] + exp_active + lm_dec), dec_src,
-                              note="Nicht-Experten-Layer + top_k/n der Expertenbytes + lm_head (bei geteilter Einbettung deren Bytes); "
-                                   "ohne Einbettungszeile, PLE-Projektionen und n-gram-Tabelle"),
+                              note="non-expert layers + top_k/n of the expert bytes + lm_head (with a shared embedding its bytes); "
+                                   "without the embedding row, PLE projections and the n-gram table"),
         "layers_nonexpert_bytes": _v(int(weights["layers_bytes_nonexpert"]["v"]), dec_src),
-        "experts_active_bytes": _v(int(exp_active), dec_src, note="%d von %d Experten je MoE-Layer" % (k_dec, n_e_dec) if n_e_dec else "dicht: keine Experten"),
+        "experts_active_bytes": _v(int(exp_active), dec_src, note="%d of %d experts per MoE layer" % (k_dec, n_e_dec) if n_e_dec else "dense: no experts"),
         "lm_head_bytes": _v(int(lm_dec), dec_src),
     }
 
@@ -1114,7 +1114,7 @@ def estimate(model_path: str, *, draft_path: Optional[str] = None, kv_dtype: Opt
     # --- Aktivierung (Extend-Rate, Geometrie) --------------------------------------------------------------
     rate = extend_rate_mib_per_row(cfg)
     out["activation"] = {"extend_rate_mib_per_row": _v(rate, SRC_ESTIMATE if rate is not None else SRC_ESTIMATE,
-                                                       note="Q-694b-Geometrieformel; die Messung am Rang ersetzt sie")}
+                                                       note="Q-694b geometry formula; the measurement at the rank replaces it")}
     out["warnings"] = warnings
     out["id"] = profile_id(out)
     return out
@@ -1148,29 +1148,29 @@ def probe(model_path: str, *, gguf_file: Optional[str] = None) -> Dict[str, Any]
         return out
 
     if not os.path.exists(p):
-        return done("not_mounted", "Pfad existiert nicht (Modellordner nicht gemountet?)")
+        return done("not_mounted", "path does not exist (model folder not mounted?)")
     if os.path.isfile(p):
         if not p.endswith(".gguf"):
-            return done("no_model_files", "Datei ist weder Modellverzeichnis noch .gguf")
+            return done("no_model_files", "file is neither a model directory nor a .gguf")
         out["gguf"] = [os.path.basename(p)]
         out["has_config"] = os.path.isfile(os.path.join(os.path.dirname(p), "config.json"))
         _, missing = gguf_parts(p)
         if missing:
-            return done("gguf_incomplete", "GGUF-Satz unvollständig, es fehlt %s" % ", ".join(missing))
-        return done("complete", "GGUF-Datei" + ("" if out["has_config"] else " ohne config.json (Geometrie aus dem Kopf)"))
+            return done("gguf_incomplete", "GGUF set incomplete, missing %s" % ", ".join(missing))
+        return done("complete", "GGUF file" + ("" if out["has_config"] else " without config.json (geometry from the header)"))
     try:
         entries = sorted(os.listdir(p))
     except OSError as exc:
-        return done("unreadable", "Verzeichnis nicht lesbar: %s" % exc)
+        return done("unreadable", "directory not readable: %s" % exc)
     if not entries:
-        return done("empty", "leeres Verzeichnis (Mountpunkt ohne eingehängtes Modell?)")
+        return done("empty", "empty directory (mount point without a mounted model?)")
     out["has_config"] = "config.json" in entries
     out["safetensors"] = sum(1 for e in entries if e.endswith(".safetensors"))
     out["gguf"] = [e for e in entries if e.endswith(".gguf")]
     out["index"] = "model.safetensors.index.json" in entries
     out["subdirs"] = [e for e in entries if not e.startswith(".") and os.path.isdir(os.path.join(p, e))]
     if out["safetensors"]:
-        return done("complete", "Safetensors-Shards") if out["has_config"] else done("no_config", "Shards ohne config.json")
+        return done("complete", "safetensors shards") if out["has_config"] else done("no_config", "shards without config.json")
     if out["gguf"] or gguf_file:
         sets = gguf_sets(out["gguf"])
         if gguf_file:
@@ -1178,16 +1178,16 @@ def probe(model_path: str, *, gguf_file: Optional[str] = None) -> Dict[str, Any]
         elif len(sets) == 1:
             first = next(iter(sets.values()))[0]
         else:
-            return done("ambiguous", "mehrere GGUF-Sätze (%s): die Datei nennen" % ", ".join(sorted(sets)))
+            return done("ambiguous", "several GGUF sets (%s): name the file" % ", ".join(sorted(sets)))
         _, missing = gguf_parts(os.path.join(p, first))
         if missing:
-            return done("gguf_incomplete", "GGUF-Satz unvollständig, es fehlt %s" % ", ".join(missing))
-        return done("complete", "GGUF" + ("" if out["has_config"] else " ohne config.json (Geometrie aus dem Kopf)"))
+            return done("gguf_incomplete", "GGUF set incomplete, missing %s" % ", ".join(missing))
+        return done("complete", "GGUF" + ("" if out["has_config"] else " without config.json (geometry from the header)"))
     if out["has_config"]:
-        return done("index_only", "Config und Index, keine Shards") if out["index"] else done("config_only", "nur config.json, keine Gewichtsdateien")
+        return done("index_only", "config and index, no shards") if out["index"] else done("config_only", "only config.json, no weight files")
     if out["index"]:
-        return done("no_config", "Index ohne config.json")
-    return done("no_model_files", "weder config.json noch Gewichte" + ((" (Unterverzeichnisse: %s)" % ", ".join(out["subdirs"])) if out["subdirs"] else ""))
+        return done("no_config", "index without config.json")
+    return done("no_model_files", "neither config.json nor weights" + ((" (subdirectories: %s)" % ", ".join(out["subdirs"])) if out["subdirs"] else ""))
 
 
 def estimate_or_state(model_path: str, **kw: Any) -> Dict[str, Any]:
@@ -1214,12 +1214,12 @@ def draft_kind(cfg: Mapping[str, Any], t: Mapping[str, Any], mtp_found: bool, ba
     (``mtp.layers.N``-Tensoren ohne eigenen Backbone), ``eagle`` (Architekturname), sonst ``unbekannt`` -- nie geraten."""
     arch = " ".join(str(a) for a in (cfg.get("architectures") or t.get("architectures") or [])).lower()
     if "dflash" in arch or cfg.get("dflash_config") or t.get("dflash_config"):
-        return ("dflash2" if "dflash2" in arch else "dflash"), "Architektur/dflash_config der Config"
+        return ("dflash2" if "dflash2" in arch else "dflash"), "architecture/dflash_config of the config"
     if mtp_found and not backbone_found:
-        return "nextn", "mtp.layers.N-Tensoren und kein eigener Backbone (Config = Geometrie des Ziels)"
+        return "nextn", "mtp.layers.N tensors and no backbone of its own (config = geometry of the target)"
     if "eagle" in arch:
-        return "eagle", "Architekturname der Config"
-    return "unbekannt", "weder dflash_config noch MTP-Tensoren noch bekannter Architekturname"
+        return "eagle", "architecture name of the config"
+    return "unbekannt", "neither dflash_config nor MTP tensors nor a known architecture name"
 
 
 def estimate_draft(draft_path: str) -> Dict[str, Any]:
@@ -1254,11 +1254,11 @@ def estimate_draft(draft_path: str) -> Dict[str, Any]:
         both = sum(tn.nbytes for tn in td.tensors if "embed_tokens" in tn.name or "lm_head" in tn.name)
         out["total_bytes"] = _v(int(total), SRC_INDEX)
         out["disk_bytes"] = _v(td.disk_bytes, SRC_STAT)
-        out["embed_bytes"] = _v(int(embed), SRC_INDEX, note="Tensoren mit 'embed_tokens' im Namen")
-        out["lm_head_bytes"] = _v(int(lm), SRC_INDEX, note="Tensoren mit 'lm_head' im Namen")
-        out["bytes_without_lm_head"] = _v(int(total - lm), SRC_INDEX, note="P-Posten des Drafts vor Laufzeitpuffer (draft_post.p_draft_post_mib)")
+        out["embed_bytes"] = _v(int(embed), SRC_INDEX, note="tensors with 'embed_tokens' in the name")
+        out["lm_head_bytes"] = _v(int(lm), SRC_INDEX, note="tensors with 'lm_head' in the name")
+        out["bytes_without_lm_head"] = _v(int(total - lm), SRC_INDEX, note="P item of the draft before runtime buffer (draft_post.p_draft_post_mib)")
         out["bytes_without_embed_lm_head"] = _v(int(total - both), SRC_INDEX,
-                                                note="D-Hostbild bei geteilter Einbettung vor Laufzeitpuffer (draft_post.d_draft_host_mib share_embed)")
+                                                note="D host image with a shared embedding before runtime buffer (draft_post.d_draft_host_mib share_embed)")
         if mtp_ids:
             out["mtp_layers_found"] = _v(len(mtp_ids), SRC_INDEX)
     elif td.index_total_size:
@@ -1487,7 +1487,7 @@ def estimate_weights_from_config(cfg: Mapping[str, Any], fmt_hint: Optional[str]
             mtp += 3 * lin(p + "mlp.up_proj", hidden, inter)
         mtp += lin("mtp.fc", 2 * hidden, hidden) + 6 * hidden * dtype_b
     if _int(t.get("indexer_n_heads")):
-        warnings.append("Formel modelliert die Indexer-Projektionen der Attention-Layer nicht (indexer_*): wenige MiB je Attention-Layer")
+        warnings.append("formula does not model the indexer projections of the attention layers (indexer_*): a few MiB per attention layer")
     total = sum(layer_bytes) + sum(layer_exp) + embed + lm_head + vis + mtp + hidden * dtype_b + other_b + ple_b + ngram_b
     cls_sorted = sorted(((k, v) for k, v in storage.items() if k != "bf16"), key=lambda kv_: -kv_[1])
     fmt = cls_sorted[0][0] if cls_sorted else "bf16"
@@ -1740,7 +1740,7 @@ def register_profile(row) -> None:
     from sglang.srt.weg2 import form as F
 
     if row.id in F.PROFILES:
-        raise ModelProfileError("Registry-Zeile %r existiert schon: nie überschrieben" % row.id)
+        raise ModelProfileError("registry row %r already exists: never overwritten" % row.id)
     F.PROFILES[row.id] = row
     F.PROFILE_EXPECT[row.id] = {a: tuple(v) for a, v in row.expect.items()}
     F.PROFILE_SWITCH_DEFAULTS[row.id] = row.switch_defaults()
@@ -1751,12 +1751,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
     import sys
 
-    ap = argparse.ArgumentParser(description="Modellprofil flliper.model/1 aus config.json und Köpfen (keine Gewichte)")
-    ap.add_argument("path", help="Modellverzeichnis oder .gguf-Datei")
-    ap.add_argument("--draft", help="getrenntes Draft-Verzeichnis")
-    ap.add_argument("--kv-dtype", help="auto | fp8_e4m3 (wählt den Wert in kv.cell_bytes_per_attn_layer_token)")
-    ap.add_argument("--ssm-dtype", help="float32 | bfloat16 (Mamba-Zustand; Standard: die Config)")
-    ap.add_argument("--registry", metavar="ID", help="zusätzlich die abgeleiteten Registry-Felder unter dieser Kennung")
+    ap = argparse.ArgumentParser(description="Model profile flliper.model/1 from config.json and headers (no weights)")
+    ap.add_argument("path", help="model directory or .gguf file")
+    ap.add_argument("--draft", help="separate draft directory")
+    ap.add_argument("--kv-dtype", help="auto | fp8_e4m3 (selects the value in kv.cell_bytes_per_attn_layer_token)")
+    ap.add_argument("--ssm-dtype", help="float32 | bfloat16 (Mamba state; default: the config)")
+    ap.add_argument("--registry", metavar="ID", help="additionally the derived registry fields under this identifier")
     a = ap.parse_args(argv)
     try:
         prof = estimate(a.path, draft_path=a.draft, kv_dtype=a.kv_dtype, mamba_ssm_dtype=a.ssm_dtype)

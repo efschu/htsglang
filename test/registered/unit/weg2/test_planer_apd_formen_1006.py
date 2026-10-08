@@ -1,7 +1,7 @@
 """AP-D Fix-Runde 2: die Worker-Seite von ``POST /api/profil/propose`` fuer ALLE VIER Formen (Plan PLAN-PROFIL-PLANER-1006 Abschnitt 3 Zeilen AP-D/AP-E/AP-F).
 
 * ``flip`` / ``tp`` / ``dual``: ``propose_verdict.run_propose`` fragt Planer (``propose``) + Orakel (Launcher-Trockenlauf).  Dual traegt die Dual-Passung
-  (``DUAL-PASSUNG`` / ``DUAL-PFLICHT``) als "Planer-Rechnung, nicht hw_fit" im Verdikt-Dokument (Orakel-Dry-Run wie Flip; Test in ``test_planer_ape_dual_1006``).
+  (``DUAL-PASSUNG`` / ``DUAL-PFLICHT``) als "planner calculation, not hw_fit" im Verdikt-Dokument (Orakel-Dry-Run wie Flip; Test in ``test_planer_ape_dual_1006``).
 * ``single`` (Einzelkarte): ``run_propose_single`` -- KEIN Launcher-Lauf (``topology.py`` MIN_CARDS=2), Verdikt = Planer-Rechnung aus ``propose_single``
   plus ServerArgs-Parse; Ausgabe im selben Format wie die uebrigen Formen (Werteliste, ``flliper.verdikt/1``, ``je_wert``, ``launch``).
 
@@ -74,23 +74,23 @@ class TestSingleDocument(unittest.TestCase):
         self.assertEqual(e["fit"]["reserve_bedarf_mib"], 4050.0)
         self.assertAlmostEqual(e["fit"]["statisch_budget_mib"], 0.874 * (32607 - PS.CONTEXT_OVERHEAD_DEFAULT_MIB), delta=0.1)
         self.assertEqual(v["fit"]["level"], "ja")
-        self.assertEqual(v["fit"]["art"], "Planer-Rechnung")
+        self.assertEqual(v["fit"]["art"], "Planner calculation")
         self.assertEqual(v["cards"], [{"name": "NVIDIA GeForce RTX 5090", "total_mib": 32607, "tflops_src": None}])
 
     def test_the_verdict_says_planer_rechnung_and_has_no_launcher_run(self):
         d = self.res["verdikt"]
-        self.assertEqual((d["schema"], d["n"], d["form"], d["ausgang"], d["art"]), ("flliper.verdikt/1", 1, "einzel", "passt", "Planer-Rechnung"))
+        self.assertEqual((d["schema"], d["n"], d["form"], d["ausgang"], d["art"]), ("flliper.verdikt/1", 1, "einzel", "passt", "Planner calculation"))
         self.assertTrue(d["geht"])
         self.assertIsNone(d["lauf"])
         self.assertEqual((d["orakel"]["laeufe"], d["forced"]), (0, []))
         self.assertEqual(len(d["profil"]["vorschlag_sha256"]), 64)
         codes = {x["code"]: x for x in d["verdikte"]}
         self.assertIn("EINZEL-PASSUNG", codes)
-        self.assertEqual((codes["EINZEL-PASSUNG"]["force_state"], codes["EINZEL-PASSUNG"]["etikett"]), ("geht", "Planer-Rechnung"))
-        self.assertIn("Planer-Rechnung", codes["EINZEL-PASSUNG"]["titel"])
+        self.assertEqual((codes["EINZEL-PASSUNG"]["force_state"], codes["EINZEL-PASSUNG"]["etikett"]), ("geht", "Planner calculation"))
+        self.assertIn("planner calculation", codes["EINZEL-PASSUNG"]["titel"])
         self.assertIn("EINZEL-PARSE", codes)                                    # parse=False in this request: stated as not checked, never as "ok"
         self.assertEqual(codes["EINZEL-PARSE"]["force_state"], "hinweis")
-        self.assertIn("nicht geprueft", codes["EINZEL-PARSE"]["text"])
+        self.assertIn("not checked", codes["EINZEL-PARSE"]["text"])
         # there is no Force for one card: nothing here is a register code
         self.assertTrue(all(x["forcebar"] is None for x in d["verdikte"]), [(x["code"], x["forcebar"]) for x in d["verdikte"]])
         self.assertEqual(d["zaehlung"], {"force": 0, "blockiert": 0, "ungeprueft": 0})
@@ -98,7 +98,7 @@ class TestSingleDocument(unittest.TestCase):
     def test_a_single_card_only_with_a_named_model(self):
         r = PV.run_propose(req(model_path=os.path.join(FX, "gibt-es-nicht")), tree="/nonexistent")
         self.assertFalse(r["ok"])
-        self.assertIn("kein Modellprofil", r["error"])
+        self.assertIn("no model profile", r["error"])
 
 
 class TestSingleVerdicts(unittest.TestCase):
@@ -132,7 +132,7 @@ class TestSingleVerdicts(unittest.TestCase):
         two = [{"index": i, "name": "x", "total_bytes": 1 << 34, "cc_major": 8, "cc_minor": 6} for i in range(2)]
         r2 = PV.run_propose(req(inventar={"devices": two}), tree="/nonexistent")
         self.assertFalse(r2["ok"])
-        self.assertIn("genau eine Karte", r2["error"])
+        self.assertIn("needs exactly one card", r2["error"])
 
     def test_an_unknown_goal_value_is_an_error_not_a_crash(self):
         r = PV.run_propose(req(ziele={"seats": 0}), tree="/nonexistent")
@@ -147,7 +147,7 @@ class TestSingleVerdicts(unittest.TestCase):
         if par["available"]:
             self.assertTrue(par["ok"], par)
             self.assertEqual(pv["force_state"], "geht")
-            self.assertIn("__post_init__ nicht gelaufen", pv["text"])
+            self.assertIn("__post_init__ has not run", pv["text"])
         else:                                                                  # no sglang import in the child: stated, never "ok"
             self.assertEqual(pv["force_state"], "hinweis")
 

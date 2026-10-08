@@ -50,7 +50,7 @@ class TestKatalog(unittest.TestCase):
         c = CAT.card("rtx3070-8")
         self.assertEqual((c["vram_gb"], c["usable_mib"], c["arch"], c["mem_bw_gbs"], c["bus_bits"]), (8, 8 * 1024, "sm86", 448, 256))
         self.assertEqual((c["pcie_native"]["gen"], c["pcie_native"]["lanes"]), (4, 16))
-        self.assertTrue(c["usable_src"].startswith("Datenblatt"))
+        self.assertTrue(c["usable_src"].startswith("datasheet"))
         self.assertFalse(c["measured_on_rig"])
 
     def test_max_cards_follows_the_planner(self):
@@ -67,7 +67,7 @@ class TestKatalog(unittest.TestCase):
         self.assertEqual(CAT.card("rtx3080-20")["usable_mib"], 20480)
         self.assertEqual(CAT.card("rtx5090-32")["usable_mib"], 32607)
         self.assertTrue(CAT.card("rtx3080-20")["usable_src"].startswith("NVML-Record"))
-        self.assertTrue(CAT.card("rtx4090-24")["usable_src"].startswith("Datenblatt"))
+        self.assertTrue(CAT.card("rtx4090-24")["usable_src"].startswith("datasheet"))
         self.assertEqual(CAT.card("rtx3080-10")["usable_mib"], 10 * 1024)
 
     def test_turing_nur_als_deaktivierter_eintrag(self):
@@ -114,15 +114,15 @@ class TestTransport(unittest.TestCase):
     def test_rig_barlink_belegt(self):
         ls, lb = self._links(["rtx5090-32", "rtx3080-20", "rtx3080-20"])
         t = TR.choose_transport(ls, lb)
-        self.assertEqual((t["transport"], t["confidence"]), ("bar1", "belegt"))
+        self.assertEqual((t["transport"], t["confidence"]), ("bar1", "verified"))
         self.assertTrue(any("256 MiB" in r for r in t["reasons"]))
 
     def test_chipsatz_macht_barlink_ungeprueft(self):
         ls, lb = self._links(["rtx5090-32", "rtx3080-20", "rtx3080-20"])
         ls[1] = TR.per_card_link(CAT.card("rtx3080-20"), {"gen": 4, "lanes": 4, "rebar": False, "chipset": True})
         t = TR.choose_transport(ls, lb)
-        self.assertEqual((t["transport"], t["confidence"]), ("bar1", "ungeprüft"))
-        self.assertTrue(any("Chipsatz" in w for w in t["warnings"]))
+        self.assertEqual((t["transport"], t["confidence"]), ("bar1", "unchecked"))
+        self.assertTrue(any("chipset" in w for w in t["warnings"]))
 
     def test_ungepatchter_host_nccl(self):
         ls, lb = self._links(["rtx3090-24", "rtx3090-24"])
@@ -140,7 +140,7 @@ class TestTransport(unittest.TestCase):
 
     def test_eine_karte_kein_transport(self):
         ls, lb = self._links(["rtx5090-32"])
-        self.assertEqual(TR.choose_transport(ls, lb)["transport"], "keiner")
+        self.assertEqual(TR.choose_transport(ls, lb)["transport"], "none")
 
     def test_ungueltige_pcie_angaben(self):
         with self.assertRaises(ValueError):
@@ -195,7 +195,7 @@ class TestGateUndAblehnung(unittest.TestCase):
         self.assertFalse(r["verdict"]["goes"])
         self.assertIn("ARCH-sm75", self.codes(r))
         txt = " ".join(x["text"] for x in r["verdict"]["reasons"])
-        self.assertIn("kein bf16", txt)
+        self.assertIn("no bf16", txt)
 
     def test_sm89_status_ehrlich(self):
         st = CAT.arch_status([8, 9], "fp8")
@@ -218,9 +218,9 @@ class TestGateUndAblehnung(unittest.TestCase):
     def test_naeherung_ist_gekennzeichnet_und_ohne_plan(self):
         r = self.plan("27b-int8", ["rtx3090-24"] * 4)
         n = r["naeherung"]
-        self.assertIn("KEIN Planer-Ergebnis", n["label"])
+        self.assertIn("NOT a planner result", n["label"])
         self.assertNotIn("docker_run", json.dumps(n))
-        self.assertTrue(any("geschätzt" in t for t in n["notes"]))
+        self.assertTrue(any("estimated" in t for t in n["notes"]))
 
     def test_eine_5090_passt_rechnerisch_nicht(self):
         r = self.plan("27b-int8", ["rtx5090-32"])
@@ -272,7 +272,7 @@ class TestFixtureAbgleich(unittest.TestCase):
         f = r["plan"]["experte"]["flags"]
         d = {x["name"]: x for x in f["groups"]["D"]}
         self.assertEqual(d["--rank-gpu-memory-mib"]["value"], "27792,17384,17168")
-        self.assertEqual(d["--rank-gpu-memory-mib"]["set_by"], "Planer")
+        self.assertEqual(d["--rank-gpu-memory-mib"]["set_by"], "Planner")
         self.assertIn("budgets_from_dc", d["--rank-gpu-memory-mib"]["bound_by"])
         self.assertTrue(d["--tp-size"]["explained"])
         self.assertEqual(d["--tp-size"]["value"], "3")

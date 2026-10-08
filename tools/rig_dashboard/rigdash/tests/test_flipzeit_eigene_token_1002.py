@@ -49,7 +49,7 @@ class DPStartIsDsLastToken(unittest.TestCase):
         self.assertEqual(x["kind"], "ok")
         self.assertAlmostEqual(x["start"], T + 26.417, places=3)
         self.assertAlmostEqual(x["total_ms"], (37.776 - 26.417) * 1000, delta=1)   # 11,36 s, not 5,31 s
-        self.assertIn("D-Log letzte Decode-Runde", x["start_src"])
+        self.assertIn("D log last decode round", x["start_src"])
         self.assertAlmostEqual(x["start_front"], T + 32.463, places=3)              # named, no endpoint
         self.assertAlmostEqual(x["vorlauf_ms"], (33.891 - 26.417) * 1000, delta=1)
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)
@@ -108,7 +108,7 @@ class PDEndpointsAreTheGroupsOwn(unittest.TestCase):
         # D's first round (open 22,40, 30 gpu-ms) ended before the front saw the handed-off rid's token
         x = ipcboot.flip_views(SEGS_PD, _ipc_pd(), T + 120.0, None, d_rounds=[(T + 22.40, T + 22.43)])[0]
         self.assertAlmostEqual(x["end"], T + 22.43, places=3)
-        self.assertIn("D-Log erste Decode-Runde", x["end_src"])
+        self.assertIn("D log first decode round", x["end_src"])
         # the front's token (from D's extend) came first: it stays the end
         y = ipcboot.flip_views(SEGS_PD, _ipc_pd(first_work=22.35), T + 120.0, None,
                                d_rounds=[(T + 22.40, T + 22.43)])[0]
