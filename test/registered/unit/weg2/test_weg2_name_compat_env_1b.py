@@ -25,7 +25,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
-(SUB_LEG, SUB_NEW), (GEN_LEG, GEN_NEW) = nc.ENV_PREFIX_PAIRS
+(SUB_LEG, SUB_NEW), (GEN_LEG, GEN_NEW) = nc.ENV_PREFIX_PAIRS[0], nc.ENV_PREFIX_PAIRS[-1]
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 
@@ -39,7 +39,7 @@ def other(prefix_pair, rest):
 
 
 SUB = nc.ENV_PREFIX_PAIRS[0]
-GEN = nc.ENV_PREFIX_PAIRS[1]
+GEN = nc.ENV_PREFIX_PAIRS[-1]  # the generic pair is always last (specific families first)
 
 
 def _load_as(pkg: str):
@@ -82,7 +82,7 @@ def test_without_other_spellings_the_env_is_byte_identical():
 @pytest.mark.parametrize("mod_pkg", ["sg" "lang", "flliper"])
 def test_every_spelling_folds_onto_one_name(mod_pkg):
     m = _load_as(mod_pkg)
-    s, g = m.ENV_PREFIX_PAIRS
+    s, g = m.ENV_PREFIX_PAIRS[0], m.ENV_PREFIX_PAIRS[-1]
     c = m.CANONICAL_SIDE
     assert c == (0 if mod_pkg == "sg" "lang" else 1)
     env = {s[1 - c] + "GROUP": "P", g[1 - c] + "HICACHE_X": "1", "PATH": "/bin"}
@@ -91,13 +91,14 @@ def test_every_spelling_folds_onto_one_name(mod_pkg):
 
 
 @pytest.mark.parametrize("mod_pkg", ["sg" "lang", "flliper"])
-def test_canonical_value_wins_and_no_name_is_doubled(mod_pkg):
+def test_renamed_value_wins_and_no_name_is_doubled(mod_pkg):
     m = _load_as(mod_pkg)
-    s, g = m.ENV_PREFIX_PAIRS
+    s, g = m.ENV_PREFIX_PAIRS[0], m.ENV_PREFIX_PAIRS[-1]
     c = m.CANONICAL_SIDE
     env = {s[0] + "FORM": "legacy", s[1] + "FORM": "renamed", g[0] + "X": "l", g[1] + "X": "r"}
     m.canonical_env(env)
-    assert env == {s[c] + "FORM": ("legacy", "renamed")[c], g[c] + "X": ("l", "r")[c]}
+    # F0-C: the RENAMED spelling wins on either side of the rename (RENAME_PLAN 4.1), not the one the tree reads
+    assert env == {s[c] + "FORM": "renamed", g[c] + "X": "r"}
     fams = {}
     for k in env:
         fams.setdefault(m.canonical_env_name(k), []).append(k)
@@ -107,7 +108,7 @@ def test_canonical_value_wins_and_no_name_is_doubled(mod_pkg):
 @pytest.mark.parametrize("mod_pkg", ["sg" "lang", "flliper"])
 def test_foreign_readers_keep_the_legacy_spelling(mod_pkg):
     m = _load_as(mod_pkg)
-    s, g = m.ENV_PREFIX_PAIRS
+    s, g = m.ENV_PREFIX_PAIRS[0], m.ENV_PREFIX_PAIRS[-1]
     for leg in sorted(m.FOREIGN_READERS):
         pair = s if leg.startswith(s[0]) else g
         rest = leg[len(pair[0]):]
@@ -178,7 +179,7 @@ def test_no_popped_name_is_a_foreign_reader():
 def _build_with(monkeypatch, names, spelling):
     with monkeypatch.context() as mp:
         for n in names:
-            pair = SUB if n.startswith(SUB[nc.CANONICAL_SIDE]) else GEN
+            pair = next(p for p in nc.ENV_PREFIX_PAIRS if n.startswith(p[nc.CANONICAL_SIDE]))
             rest = n[len(pair[nc.CANONICAL_SIDE]):]
             mp.delenv(canon(pair, rest), raising=False)
             mp.delenv(other(pair, rest), raising=False)

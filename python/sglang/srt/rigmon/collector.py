@@ -138,21 +138,25 @@ def load_cached_profiles(cache_dir: str = "") -> tuple:
     """
     import os
 
+    from sglang.srt.compat_shims import cache_dirs, read_fallback
+
     cache_dir = cache_dir or os.path.expanduser("~/.cache/sglang")
     hw, power = None, None
+    # rename transition: the cache dir of the other name is read too (files of the first one win on a name)
+    for d in cache_dirs(cache_dir):
+        try:
+            for name in sorted(os.listdir(d)):
+                if name.startswith("hw_profile-") and name.endswith(".json"):
+                    with open(os.path.join(d, name)) as f:
+                        cand = json.load(f)
+                    if hw is None or str(cand.get("created", "")) > str(
+                        hw.get("created", "")
+                    ):
+                        hw = cand
+        except OSError:
+            pass
     try:
-        for name in sorted(os.listdir(cache_dir)):
-            if name.startswith("hw_profile-") and name.endswith(".json"):
-                with open(os.path.join(cache_dir, name)) as f:
-                    cand = json.load(f)
-                if hw is None or str(cand.get("created", "")) > str(
-                    hw.get("created", "")
-                ):
-                    hw = cand
-    except OSError:
-        pass
-    try:
-        with open(os.path.join(cache_dir, "power_profile.json")) as f:
+        with open(read_fallback(os.path.join(cache_dir, "power_profile.json"))) as f:
             power = json.load(f)
     except (OSError, ValueError):
         pass

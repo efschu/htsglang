@@ -155,7 +155,7 @@ PORT_D = 30032
 #: reaches the ring tables), so the environment is the one seam an image has.
 EVIDENCE_DIR = os.environ.get("SGLANG_WEG2_EVIDENCE_DIR") or "/spinning/evidence-665-f1"
 GPU_ARB = os.environ.get("SGLANG_WEG2_GPU_ARB") or "/spinning/gpu-arb"
-from sglang.srt.compat_shims import canonical_flags as _canonical_flags, env_name_variants as _env_name_variants, name_counterparts as _name_counterparts, name_variants as _name_variants, operator_dir as _operator_dir  # noqa: E402  rename transition
+from sglang.srt.compat_shims import canonical_flags as _canonical_flags, env_name_variants as _env_name_variants, name_counterparts as _name_counterparts, name_variants as _name_variants, operator_dir as _operator_dir, register_flag_aliases as _register_flag_aliases  # noqa: E402  rename transition
 #: The step-0 metal probe's RECORD (C0, WEG2_BUILD_DECISIONS_0906 section 1p).
 #: A FILE, not a number: the per-card duplex ratios C12/C13 gate on are parsed
 #: out of its own measured rows and printed with this path beside them.
@@ -24100,6 +24100,7 @@ def build_parser() -> argparse.ArgumentParser:
              "lost at the flip.",
     )
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
+    _register_flag_aliases(ap)   # rename transition (compat_shims): every flip flag also under the other spelling, same dest
     return ap
 
 
