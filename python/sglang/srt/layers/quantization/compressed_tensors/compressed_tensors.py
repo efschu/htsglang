@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.moe_act_int8 import require_w4a8_moe_scheme
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -947,7 +948,33 @@ class CompressedTensorsConfig(QuantizationConfig):
                         self, weight_quant=weight_quant
                     )
                 else:
+                    # H88: --moe-act-int8 / SGLANG_MOE_ACT_INT8 asks for the W4A8
+                    # scheme; a tree without one stops here (default off: no effect).
+                    require_w4a8_moe_scheme()
                     moe_backend = get_moe_runner_backend()
+                    if (
+                        _is_cuda
+                        and weight_quant.num_bits == 4
+                        and _w4a8_moe_requested()
+                    ):
+                        # H88-B: int4 experts x dynamic per-token int8 activations
+                        # (Marlin W4A8), only behind --moe-act-int8 / SGLANG_MOE_ACT_INT8.
+                        # The scheme calls its own kernel, not a runner backend: an
+                        # explicit triton backend is a conflict, not something to override.
+                        if moe_backend.is_triton():
+                            raise RuntimeError(
+                                "MOE-ACT-INT8 requested together with "
+                                "--moe-runner-backend triton: the W4A8 MoE scheme runs "
+                                "the Marlin W4A8 kernel, drop one of the two"
+                            )
+                        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+                            CompressedTensorsWNA16A8MoE,
+                        )
+
+                        logger.info_once("Using CompressedTensorsWNA16A8MoE (W4A8 int8)")
+                        return CompressedTensorsWNA16A8MoE(
+                            self, weight_quant=weight_quant
+                        )
                     if moe_backend.is_triton():
                         logger.info_once(
                             "Using CompressedTensorsWNA16TritonMoE "
@@ -1427,3 +1454,12 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
             group_list,
             output_dtype,
         )
+
+
+def _w4a8_moe_requested() -> bool:
+    """H88-B: is the W4A8 MoE scheme asked for (flag --moe-act-int8 on OR env
+    SGLANG_MOE_ACT_INT8; H88-E layers/quantization/moe_act_int8.py)? Imported at call
+    time so the switch reader stays patchable and this file's earlier lines stay put."""
+    from sglang.srt.layers.quantization.moe_act_int8 import moe_act_int8_requested
+
+    return moe_act_int8_requested()

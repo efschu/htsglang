@@ -388,7 +388,29 @@ def _kernel_notes(model: SimModel, cards: Sequence) -> List[str]:
     if model.kv_heads and n > model.kv_heads:
         notes.append(f"D = TP{n} > {model.kv_heads} KV heads: replicated KV / uneven DCP "
                      "(KV capacity cost, plan 3.1, S)")
+    notes.extend(_moe_act_int8_notes(model))
     return notes
+
+
+def _moe_act_int8_notes(model: SimModel) -> List[str]:
+    """H88-E: the W4A8 MoE switch is a SCALAR of the profile (no card decides it): when the model's argv/env carries it, the cell shows it
+    with its origin (the profile, ``model.source``) -- a note, never a refusal, and no hardware verdict (whether the W4A8 kernel runs on a
+    given sm86/sm89/sm120 card is unbelegt).  The same places ``propose.propose`` records: the launcher env, --env-p/--env-d, the flag in
+    --extra-p/--extra-d.  Nothing for a profile that does not carry it."""
+    from sglang.srt.weg2 import propose as P
+    from sglang.srt.weg2 import propose_rules as R
+
+    la = P.LaunchArgv(model.argv, model.env)
+    seen = []
+    for kind, group, name in (("proc", "-", R.MOE_ACT_INT8_ENV), ("env", "p", R.MOE_ACT_INT8_ENV), ("env", "d", R.MOE_ACT_INT8_ENV),
+                              ("extra", "p", R.MOE_ACT_INT8_FLAG), ("extra", "d", R.MOE_ACT_INT8_FLAG)):
+        cur = P._get(la, kind, group, name)
+        if cur is not None:
+            seen.append(f"{P.slot_label(kind, group, name)}={cur}")
+    if not seen:
+        return []
+    return [f"MOE-ACT-INT8 (profile scalar, from {model.source or model.key}): " + ", ".join(seen)
+            + "; int4 MoE experts with int8 activations (W4A8), needs the W4A8 MoE scheme; benefit/cost and per-arch kernel: unbelegt"]
 
 
 def fit_of(model: SimModel, order: Sequence, asm=None) -> Optional[Dict[str, object]]:

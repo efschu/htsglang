@@ -536,3 +536,34 @@ def dense_d_shares(budgets_mib: Sequence[float]) -> List[float]:
     asks the launcher for exactly this family of splits; the launcher solves the exact ratios at boot)."""
     s = float(sum(budgets_mib))
     return [round(float(b) / s, 4) for b in budgets_mib]
+
+
+# ---------------------------------------------------------------------------
+# H88-E: the W4A8 MoE switch, a profile SCALAR the planner passes through (no card decides it)
+# ---------------------------------------------------------------------------
+
+#: the two spellings of ONE switch (``environ.SGLANG_MOE_ACT_INT8`` and the ServerArgs flag ``--moe-act-int8``; either switches
+#: the int4 (WNA16) MoE experts to int8 activations, W4A8).  A profile carries it in ``--env-p/--env-d``, in ``--extra-p/-d``
+#: or in the launcher environment; the planner keeps it exactly as the profile has it and says where it stands.
+MOE_ACT_INT8_ENV = "SGLANG_MOE_ACT_INT8"
+MOE_ACT_INT8_FLAG = "--moe-act-int8"
+#: what the planner says beside the switch (sources: the ``--moe-act-int8`` help, the ``environ.py`` comment and the profile header
+#: of ``nf-int4-w4a8.env``; the benefit and the cost of the switch are NOT measured: unbelegt)
+MOE_ACT_INT8_GROUND = ("int4-MoE-Experten rechnen mit int8-Aktivierungen (W4A8) statt 16-Bit-Aktivierungen (W4A16); Standard aus. "
+                       "Nutzen und Kosten: unbelegt (kein Metallbeweis).")
+MOE_ACT_INT8_HINT = ("MOE-ACT-INT8 an: braucht das W4A8-MoE-Schema (ohne es bricht der Boot an der ersten MoE-Schicht mit RuntimeError ab); "
+                     "die L3-Identitaet aendert sich (einmal volle Neuberechnung), ein Census kann neu noetig sein; die Schalterwirkung auf "
+                     "Speicher und Tempo ist unbelegt")
+
+
+def parse_switch(value: Optional[str]) -> Optional[bool]:
+    """A switch value as the code reads it: the env (``EnvBool``: 1/true/yes/y | 0/false/no/n) or the flag (``on`` | ``off``)
+    -> True/False; ``None`` when the profile does not say it (or says something neither reader accepts)."""
+    if value is None:
+        return None
+    v = str(value).strip().strip("'\"").lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return None

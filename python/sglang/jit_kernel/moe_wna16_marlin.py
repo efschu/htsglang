@@ -297,3 +297,124 @@ def moe_wna16_marlin_gemm(
     )
 
     return c
+
+
+# =============================================================================
+# H88-A (2026-10-07): Marlin W4A8 MoE -- int4 expert weights x int8 activations.
+#
+# Everything BELOW this line is new; everything above (including the task #49
+# arch-override / switch census machinery) is the unchanged A16 path. The kernel
+# is a separate JIT module (csrc/gemm/marlin_a8_moe/ + csrc/gemm/marlin_a8/,
+# vendored from vLLM PR #24722, Apache-2.0). It does NOT carry the A16 local
+# patches (no is_ep switch: expert_ids must not contain -1, no K-split lever, no
+# sms override). Contract and CPU reference: marlin_w4a8_utils.py.
+# =============================================================================
+
+
+@cache_once_per_arch
+def _jit_moe_wna16_marlin_a8_module(dtype: torch.dtype) -> Module:
+    args = make_cpp_args(dtype)
+    return load_jit(
+        "moe_wna16_marlin_a8",
+        *args,
+        cuda_files=["gemm/marlin_a8_moe/moe_wna16_marlin_a8.cuh"],
+        cuda_wrappers=[("moe_wna16_marlin_gemm_a8", f"moe_wna16_marlin_gemm_a8<{args}>")],
+    )
+
+
+@debug_kernel_api
+def moe_wna16_marlin_gemm_w4a8(
+    a: torch.Tensor,
+    a_scales: torch.Tensor,
+    c_or_none: Optional[torch.Tensor],
+    b_q_weight: torch.Tensor,
+    b_bias_or_none: Optional[torch.Tensor],
+    b_scales: torch.Tensor,
+    b_zeros_or_none: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    moe_block_size: int,
+    top_k: int,
+    mul_topk_weights: bool,
+    b_q_type: ScalarType,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = True,
+) -> torch.Tensor:
+    """Grouped GEMM over experts, int8 activations.
+
+    a          int8 [size_m, size_k], a_scales float32 [size_m] (rows are
+               expanded by top_k in-kernel through sorted_token_ids)
+    b_q_weight int32 [E, K/16, N*16/8] (gptq_marlin_moe_repack_w4a8 /
+               awq_marlin_moe_repack_w4a8); b_scales fp16/bf16 [E, groups, N]
+    expert_ids must NOT contain -1: build sorted_token_ids/expert_ids with the
+    invalid (non-local) experts dropped, as vLLM's moe_align_block_size does
+    with ignore_invalid_experts=True. moe_block_size in {16, 32, 48, 64}.
+    Returns c [size_m * top_k, size_n] (dtype = b_scales dtype).
+    """
+    from sglang.jit_kernel.marlin_w4a8_utils import check_w4a8_moe_args, w4a8_arch_support
+
+    device = a.device
+    cap = torch.cuda.get_device_capability(device)
+    ok, why = w4a8_arch_support(*cap)
+    if not ok:
+        raise RuntimeError(f"moe_wna16_marlin_gemm_w4a8: {why}")
+    check_w4a8_moe_args(
+        a, a_scales, b_q_weight, b_scales, b_zeros_or_none, b_bias_or_none,
+        _w4a8_b_q_type_name(b_q_type), moe_block_size, top_k, size_m, size_n, size_k,
+    )  # fmt: skip
+    out_dtype = b_scales.dtype
+
+    c = c_or_none if c_or_none is not None else torch.empty(
+        (size_m * top_k, size_n), dtype=out_dtype, device=device
+    )
+    if size_m == 0:
+        return c
+
+    if use_fp32_reduce and not use_atomic_add:
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        # max num of threadblocks is sms * 4
+        max_c_tmp_size = min(size_n * sorted_token_ids.size(0), sms * 4 * moe_block_size * _MAX_THREAD_N)
+        c_tmp = torch.empty(max_c_tmp_size, dtype=torch.float32, device=device)
+    else:
+        c_tmp = torch.empty(0, dtype=torch.float32, device=device)
+
+    zeros_t = _or_empty(b_zeros_or_none, device, torch.int32)
+    bias_t = _or_empty(b_bias_or_none, device, out_dtype)
+
+    module = _jit_moe_wna16_marlin_a8_module(out_dtype)
+    module.moe_wna16_marlin_gemm_a8(
+        a,
+        a_scales.reshape(-1),
+        c,
+        b_q_weight,
+        bias_t,
+        b_scales,
+        zeros_t,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        c_tmp,
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        b_q_type.id,
+        size_m,
+        size_n,
+        size_k,
+        use_atomic_add,
+        use_fp32_reduce,
+    )
+    return c
+
+
+def _w4a8_b_q_type_name(b_q_type) -> str:
+    # ScalarType.__str__ names: "uint4b8" (GPTQ, symmetric) / "uint4" (AWQ, zp)
+    return str(b_q_type)

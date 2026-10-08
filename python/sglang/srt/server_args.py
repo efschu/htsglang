@@ -4285,6 +4285,23 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = "auto"
+    moe_act_int8: A[
+        Literal["on", "off"],
+        Arg(
+            help="H88 (PLAN-H88-W4A8-1007): the compressed-tensors int4 (WNA16) "
+            "MoE experts take int8 activations (W4A8) instead of 16-bit ones "
+            "(W4A16). Default off = the W4A16 Marlin path, argv and env "
+            "unchanged. Environment form: SGLANG_MOE_ACT_INT8=1 (either of the "
+            "two switches it on). This tree has the W4A8 MoE scheme "
+            "(CompressedTensorsWNA16A8MoE, H88-B): with the switch on, the MoE "
+            "scheme dispatch picks it for the int4 expert layers on CUDA "
+            "(dynamic per-token int8 activations, Marlin W4A8 kernel); together "
+            "with --moe-runner-backend triton it stops with a RuntimeError. A "
+            "tree without the scheme stops with: MOE-ACT-INT8 requested but no "
+            "W4A8 MoE scheme in this tree.",
+            choices=["on", "off"],
+        ),
+    ] = "off"
     flashinfer_mxfp4_moe_precision: A[
         Literal["default", "bf16"],
         "Choose the computation precision of flashinfer mxfp4 moe",

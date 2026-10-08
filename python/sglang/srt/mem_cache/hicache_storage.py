@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.canonical_page_store import (
     CanonicalAbstainWindow,
     kv_extents_for,
 )
+from sglang.srt.weg2 import moe_act_switch as _moe_act_switch
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.mem_cache.weg2_store_gates import (
     owner_write_covers_whole_file,
@@ -306,6 +307,19 @@ def hicache_draft_tier_off_line(*, where: str) -> str:
 STORAGE_BATCH_SIZE = int(os.environ.get("SGLANG_HICACHE_STORAGE_BATCH", "128") or 128)
 
 
+#: H88-D: the W4A8 switch, as H88-E registers it (flag ``--moe-act-int8 on|off`` ->
+#: ``server_args.moe_act_int8``; env ``SGLANG_MOE_ACT_INT8``). Read DEFENSIVELY
+#: (an attribute that does not exist yet is "off") and with the RUNTIME's own
+#: spelling rules (``weg2.moe_act_switch``, shared with the launcher identity).
+MOE_ACT_INT8_ENV = _moe_act_switch.MOE_ACT_INT8_ENV
+
+
+def moe_act_int8_active(server_args: Any) -> bool:
+    return _moe_act_switch.flag_value_on(
+        getattr(server_args, "moe_act_int8", None)
+    ) or _moe_act_switch.env_value_on(os.environ.get(MOE_ACT_INT8_ENV))
+
+
 def compute_model_identity_hash(
     server_args: Any, *, include_parallel_vectors: bool = True
 ) -> str:
@@ -370,6 +384,16 @@ def compute_model_identity_hash(
             value = getattr(server_args, name, None)
             if value:
                 identity_parts.append(f"{name}={value}")
+    # H88-D (D4): W4A8 experts (``--moe-act-int8 on`` / ``SGLANG_MOE_ACT_INT8``).
+    # Activations are rounded to int8 before the expert GEMM, so the KV bytes of
+    # a page differ while its token-id key does not: another identity, but ONLY
+    # while the switch is on -- with it off nothing is appended and the key is
+    # byte-identical to the one persisted stores already carry. Appended after
+    # the vectors, outside the ``include_parallel_vectors`` gate: it answers
+    # "same weights math?", which the PD handshake and the L3 rank identity ask
+    # as well as the storage key does.
+    if moe_act_int8_active(server_args):
+        identity_parts.append("moe_act=int8")
     identity_str = "|".join(identity_parts)
     return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
 

@@ -90,6 +90,11 @@ __all__ = [
     "written_rows_cached",
     "forget_written_rows",
     "store_has_row",
+    "compute_identity",
+    "claim_scale_factor",
+    "read_factor",
+    "factor_path",
+    "W4A8FactorUnavailable",
 ]
 
 
@@ -106,7 +111,13 @@ def store_identity() -> str:
     return os.environ.get(STORE_IDENTITY_ENV, "").strip()
 
 
-def compute_identity(model: str, map_path: str) -> str:
+#: H88-C: the weight LAYOUT of the rows in the store (``moe_w4a8_layout.LAYOUTS``). The store file of a (layer, tensor)
+#: has the same name and shape in both layouts, so only the identity can keep a W4A16 sentinel from vouching for
+#: W4A8 rows (and the reverse).
+DEFAULT_LAYOUT = "marlin_w4a16"
+
+
+def compute_identity(model: str, map_path: str, layout: str = DEFAULT_LAYOUT) -> str:
     """H2c: der Fingerabdruck, unter dem ein Sentinel gueltig ist.
 
     Aus dem Checkpoint (``config.json``, ``*.safetensors.index.json`` als Bytes,
@@ -115,6 +126,11 @@ def compute_identity(model: str, map_path: str) -> str:
     gehasht: das kostete je Boot 50 GB Lesung, genau das, was H2 spart.
     ``""`` wenn die Karte fehlt -- dann gibt es keine Slot-Zuordnung, der ein
     Sentinel gehoeren koennte, und niemand adoptiert.
+
+    H88-C: ``layout`` ist das Gewichts-Layout der Zeilen (``marlin_w4a16`` =
+    Default, ``marlin_w4a8``). Der Default-Layout-Tag geht NICHT in den Hash:
+    die Identitaet eines A16-Boots bleibt Byte fuer Byte die von vor H88-C
+    (Default-Pfad unveraendert); jedes andere Layout haengt seinen Tag an.
     """
     import hashlib
 
@@ -122,6 +138,8 @@ def compute_identity(model: str, map_path: str) -> str:
         return ""
     h = hashlib.sha256()
     h.update(b"h2c-v1\0")
+    if layout != DEFAULT_LAYOUT:
+        h.update(b"layout\0" + str(layout).encode() + b"\0")
     if os.path.isdir(model):
         names = sorted(os.listdir(model))
         for name in names:
@@ -150,6 +168,137 @@ def sentinel_is_ours(data: dict) -> bool:
     if not ours:
         return True
     return str(data.get("identity", "")) == ours
+
+
+# ---------------------------------------------------------------------------
+# H88-C: the per-tensor scale FACTOR of the W4A8 layout, agreed through the store
+# ---------------------------------------------------------------------------
+#
+# The W4A8 group scales are int16 = round(s / factor) with ONE float32 factor per layer tensor. In the W4A16 layout a
+# store row is a pure function of its expert; in the W4A8 layout it is a function of (expert, factor). Every process
+# that writes a row into the store, reads one from it (spill pool, D-store-adopt) or receives one over the flip
+# exchange must therefore use the SAME factor for the same (layer, tensor) -- else the int16 values are read under a
+# foreign scale (silently wrong output). P holds whole layers (PP), the D ranks hold windows of experts (uneven
+# expert shard): their own maxima differ, so the factor is not derivable by each rank alone.
+#
+# The agreement is a sidecar next to the store file: ``<store file>.factor.json``, published FIRST-WRITER-WINS
+# (``os.link`` of a private temp file fails when the name exists), carrying the boot's store identity (which carries
+# the layout tag) so a sidecar of another checkpoint / layout vouches for nothing. Only a rank that holds the WHOLE
+# layer tensor publishes (the scheme gates it: rows None, not placeholder, no expert-dim shard window) -- every
+# full-view rank computes the same factor (max/4096 over the whole tensor, vLLM semantics), so first-writer-wins
+# only ever races identical values; subset views adopt. A rank whose own scales map above the adopted factor's
+# x4096 reference band (the kernel's int32 accumulator overflows silently there; the int16 would fit to 32767)
+# refuses by name (``W4A8FactorOutOfBand`` in the scheme) -- never a silent clip.
+
+FACTOR_SUFFIX = ".factor.json"
+FACTOR_MARKER = "H88C SCALE-FACTOR"
+
+
+class W4A8FactorUnavailable(RuntimeError):
+    """A rank that cannot compute the factor itself (placeholder weights, a subset of the expert rows) found no
+    factor published for its (layer, tensor)."""
+
+
+def factor_path(directory: str, layer_key: str, attr: str) -> str:
+    return store_path(directory, layer_key, attr) + FACTOR_SUFFIX
+
+
+def _f32_bits(value: float) -> str:
+    import struct
+
+    return struct.pack(">f", float(value)).hex()
+
+
+def _f32_from_bits(bits: str) -> float:
+    import struct
+
+    return struct.unpack(">f", bytes.fromhex(bits))[0]
+
+
+def read_factor(directory: str, layer_key: str, attr: str) -> Optional[dict]:
+    """The published sidecar record of this boot, or None (absent, unreadable, or another boot's identity)."""
+    path = factor_path(directory, layer_key, attr)
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "factor_f32" not in data:
+        return None
+    if str(data.get("identity", "")) != store_identity():
+        return None  # another checkpoint / map / layout: vouches for nothing here
+    return data
+
+
+def claim_scale_factor(
+    directory: str,
+    layer_key: str,
+    attr: str,
+    proposal: Optional[float],
+    *,
+    group_size: int,
+    layout: str,
+    writer: str = "",
+) -> Tuple[float, str]:
+    """The factor of (layer, ``attr``) for this boot: ``(factor, source)``, source in ``"adopted"`` (somebody
+    published first) or ``"published"`` (this call did). ``proposal=None`` means "I cannot propose" (placeholder
+    weights, a subset of the rows, an expert-dim shard window): then only an existing sidecar helps, else
+    :class:`W4A8FactorUnavailable`. A proposal is only ever published by the caller's scheme when that caller holds
+    the whole layer tensor (the scheme gates it), so identical data cannot publish two different factors.
+
+    A record that disagrees on the layout or the group size is an error (two different boots share the directory)."""
+    path = factor_path(directory, layer_key, attr)
+    ident = store_identity()
+    for _attempt in range(3):
+        have = read_factor(directory, layer_key, attr)
+        if have is not None:
+            if have.get("layout") != layout or int(have.get("group_size", -2)) != int(group_size):
+                raise RuntimeError(
+                    f"{FACTOR_MARKER}: {path} was published for layout={have.get('layout')!r} "
+                    f"group_size={have.get('group_size')} but this process runs layout={layout!r} "
+                    f"group_size={group_size} under the same store identity -- two boots share {directory}"
+                )
+            return _f32_from_bits(have["factor_f32"]), "adopted"
+        if proposal is None:
+            raise W4A8FactorUnavailable(
+                f"{FACTOR_MARKER}: no scale factor published for {layer_key}/{attr} in {directory} and this rank "
+                f"cannot compute one -- it sees only a subset of the tensor (placeholder weights, vetoed / cut "
+                f"rows, or an expert-dim shard window of SGLANG_UNEVEN_MOE_EXPERT_SHARD) and only a rank with the "
+                f"whole tensor publishes. Start the group that holds the whole layer (P) first, or run with the "
+                f"checkpoint rows complete."
+            )
+        os.makedirs(directory, exist_ok=True)
+        rec = {
+            "layout": layout,
+            "identity": ident,
+            "tensor": attr,
+            "group_size": int(group_size),
+            "factor_f32": _f32_bits(proposal),
+            "factor": float(_f32_from_bits(_f32_bits(proposal))),
+            "writer": writer or f"pid{os.getpid()}",
+        }
+        tmp = f"{path}.{os.getpid()}.{id(rec):x}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(rec, fh)
+        try:
+            os.link(tmp, path)
+            published = True
+        except FileExistsError:
+            published = False
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        if published:
+            return _f32_from_bits(rec["factor_f32"]), "published"
+        # a sidecar exists but read_factor refused it: another boot's identity -> replace it once, then retry
+        if read_factor(directory, layer_key, attr) is None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    raise RuntimeError(f"{FACTOR_MARKER}: could not agree on a factor for {layer_key}/{attr} in {directory}")
 
 
 def slot_fraction() -> float:

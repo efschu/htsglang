@@ -607,6 +607,17 @@ CURATED: Dict[str, Dict[str, object]] = {
         "text": 'X-CURVES: a request that lies deeper than the curves reach: clamp (default, computed at the price of the deepest row and named) or refuse (W193 at the front). Only with --x-mode curve (otherwise W194); an unknown value is refused W196; refused in the dual layout (W197).',
         "gain": "", "cost": 'refuse turns such requests away at the front (W193).',
         "satz_quelle": "launcher.py --x-curves-beyond (help=, Zeilen 23025-23027); W194/W196/W197: x_curves.py (Zeilen 94-104, _check_mode_words, refuse_in_dual)", "depends": []},
+    # ---- H88-E (07.10., PLAN-H88-W4A8-1007 D3): Text nur aus help= von server_args.py und dem Kommentar von environ.py; Nutzen/Kosten sind nicht gemessen
+    "--moe-act-int8": {
+        "kind": "flag", "group": "Quantisierung", "level": "experte", "planner_derived": False, "scope": "server",
+        "text": "H88: Die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard off = der W4A16-Marlin-Pfad, Argv und Umgebung unverändert. Umgebungsform: SGLANG_MOE_ACT_INT8=1; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
+        "gain": "unbelegt (kein Metallbeweis)", "cost": "unbelegt (kein Metallbeweis)",
+        "satz_quelle": "server_args.py moe_act_int8 (help=); environ.py SGLANG_MOE_ACT_INT8 (Kommentar); layers/quantization/moe_act_int8.py (NO_SCHEME_MESSAGE)", "depends": []},
+    "SGLANG_MOE_ACT_INT8": {
+        "kind": "env", "group": "Quantisierung", "level": "experte", "planner_derived": False,
+        "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
+        "gain": "unbelegt (kein Metallbeweis)", "cost": "unbelegt (kein Metallbeweis)",
+        "satz_quelle": "environ.py SGLANG_MOE_ACT_INT8 (Kommentar); server_args.py moe_act_int8 (help=); Profil docker/profiles/nf-int4-w4a8.env (Kopfkommentar)", "depends": []},
 }
 
 
