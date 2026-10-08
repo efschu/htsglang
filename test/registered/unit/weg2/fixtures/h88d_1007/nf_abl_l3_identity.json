@@ -1,0 +1,29 @@
+{
+ "_provenance": "Read-only copies of two files of the running NF store (proxmox:/spinning/subvol-999-disk-0/spinning/docker-acceptance/nf/store/l3-nextflash-Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp-dc6a8c2062/), read 2026-10-07 by H88-D: L3_IDENTITY.json (launcher identity) and L3_RANK_IDENTITY.P.json / .D.json (identical). Nothing in the store was written. rank_server_args are the ServerArgs fields compute_model_identity_hash reads, recovered by matching the recorded model_identity 9341197366e3616e (revision '', dtype auto, quantization '', kv fp8_e4m3).",
+ "dir_name": "l3-nextflash-Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp-dc6a8c2062",
+ "digest10": "dc6a8c2062",
+ "identity": {
+  "form_kv": "",
+  "generation": "706",
+  "kv_cache_dtype": "fp8_e4m3",
+  "model_config_sha1": "cbd3f9cb4153e1af2844294f9d4df4af20f6d475",
+  "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp",
+  "override_d": "4d77ae4a3f85a614",
+  "override_p": "4d77ae4a3f85a614",
+  "profile": "nextflash",
+  "vision": "transient",
+  "weights_fp": "eb3db743f5d427eb7a16eeacb86699ad02fa440d"
+ },
+ "rank_identity": {
+  "model_identity": "9341197366e3616e",
+  "override_sha": "4d77ae4a3f85a614",
+  "weights_fp": "eb3db743f5d427eb7a16eeacb86699ad02fa440d"
+ },
+ "rank_server_args": {
+  "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp",
+  "revision": null,
+  "dtype": "auto",
+  "quantization": null,
+  "kv_cache_dtype": "fp8_e4m3"
+ }
+}

@@ -85,6 +85,7 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import pp_ordered_cut_for as weg2_pp_ordered_cut_for
+from sglang.srt.weg2 import moe_act_switch as _moe_act_switch
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import bar1_windows as bar1_windows_mod
 from sglang.srt.weg2 import inventory_view as inventory_view_mod
@@ -7542,6 +7543,17 @@ L3_IDENTITY_FILE = "L3_IDENTITY.json"
 #: YaRN x2: how the runtime applies a rope override (hf_transformers.config.
 #: apply_model_override_args, nested sub-config merge). Bump when that changes.
 L3_ROPE_APPLY = "merge-v1"
+#: H88-D (D4): the W4A8 switch of the MoE experts (flag ``--moe-act-int8 on|off``,
+#: env ``SGLANG_MOE_ACT_INT8``; registered by H88-E, read here DEFENSIVELY and
+#: default off). It changes the BYTES of every KV page the experts feed
+#: (activations are rounded to int8 before the expert GEMM) without changing a
+#: page key, so a store written under it must be another identity. The field
+#: ``moe_act`` enters the identity ONLY while the switch is on -- with it off the
+#: dict is byte-identical to the one the running stores carry (generation stays
+#: ``L3_PERSIST_GENERATION``; nothing is renamed, swept or invalidated).
+L3_MOE_ACT_FLAG = _moe_act_switch.MOE_ACT_INT8_FLAG
+L3_MOE_ACT_ENV = _moe_act_switch.MOE_ACT_INT8_ENV
+L3_MOE_ACT_VALUE = "int8"
 
 
 def _l3_extra_flag(extra: str, flag: str) -> str:
@@ -7583,9 +7595,63 @@ def l3_weights_fingerprint(model: str) -> str:
     return hashlib.sha1(repr(rows).encode()).hexdigest()
 
 
+def l3_moe_act_active(extra: str = "", env_spec: str = "", flag: object = None,
+                      env: Optional[Mapping[str, str]] = None) -> bool:
+    """H88-D: is the W4A8 switch on for ONE group? True when ANY source says on:
+    the group's own EXTRA string (``--moe-act-int8 on``, last occurrence like
+    argparse), the launcher-wide flag value (``flag``: ns.moe_act_int8), the
+    group env (``--env-p``/``--env-d`` spec) or the process env. The spelling of
+    each source is the RUNTIME's (``weg2.moe_act_switch``: flag == "on", env =
+    EnvBool true-set true/1/yes/y), never wider and never narrower: narrower is a
+    store that mixes pages of two activation precisions (runtime W4A8, identity
+    default), wider a store renamed for a switch that does nothing. A union over
+    the flag sources on purpose; for the ENV the group env wins over the process env (see below).
+    Anything unparsable or absent is OFF (default)."""
+    if (_moe_act_switch.flag_value_on(_l3_extra_flag(extra, L3_MOE_ACT_FLAG))
+            or _moe_act_switch.flag_value_on(flag)):
+        return True
+    # ENV SOURCES ARE NOT A UNION: the runtime applies the group env LAST over the process env
+    # (build_env: "Applied LAST so an operator value is what the group runs"). A key present in the
+    # group env therefore decides alone (``--env-p SGLANG_MOE_ACT_INT8=0`` beats a global export of 1);
+    # the process env counts only when the group env does not carry the key.
+    try:
+        genv = parse_group_env(env_spec)
+    except ValueError:  # a malformed --env-p/-d is refused by name where it is parsed
+        genv = {}
+    if L3_MOE_ACT_ENV in genv:
+        return _moe_act_switch.env_value_on(genv[L3_MOE_ACT_ENV])
+    return _moe_act_switch.env_value_on((os.environ if env is None else env).get(L3_MOE_ACT_ENV))
+
+
+def l3_moe_act_resolve(extra_p: str = "", extra_d: str = "", env_p: str = "", env_d: str = "",
+                       moe_act_int8: object = None, env: Optional[Mapping[str, str]] = None,
+                       d_only: bool = False) -> bool:
+    """H88-D: the ONE boot-wide W4A8 switch value. P and D MUST agree: the page
+    key of a canonical page carries the rank identity (``compute_model_identity_hash``,
+    per group), and leg 2 of a request reads the prefix group P wrote through the
+    store -- P on / D off (or the reverse) would give the two groups different key
+    suffixes, so D never finds P's pages (double prefill or a refusal at the PD
+    handshake). An asymmetric switch is therefore REFUSED by name, not given a
+    third identity. ``d_only`` boots have no group P: only D's value counts."""
+    d_on = l3_moe_act_active(extra_d, env_d, moe_act_int8, env)
+    if d_only:
+        return d_on
+    p_on = l3_moe_act_active(extra_p, env_p, moe_act_int8, env)
+    if p_on != d_on:
+        raise SystemExit(
+            f"W4A8 switch ({L3_MOE_ACT_FLAG} / {L3_MOE_ACT_ENV}): REFUSED -- it is on for group "
+            f"{'P' if p_on else 'D'} only. P and D must agree: the L3 page key carries the rank identity per "
+            f"group, so group D would never find the pages group P wrote (double prefill / PD handshake refusal). "
+            f"Set it in BOTH --extra-p/--extra-d (or --env-p/--env-d), or in neither.")
+    return p_on
+
+
 def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
                         kv_cache_dtype: str = KV_CACHE_DTYPE, extra_p: str = "",
-                        extra_d: str = "", vision: str = "") -> dict:
+                        extra_d: str = "", vision: str = "", *, env_p: str = "",
+                        env_d: str = "", moe_act_int8: object = None,
+                        env: Optional[Mapping[str, str]] = None,
+                        d_only: bool = False) -> dict:
     """L3P: what a persistent store is FOR. User 2026-09-27: "aber natürlich
     zwischen 27b und nf verschiedene L3 caches. sonst knallts" -- one model,
     one directory. Beside the checkpoint (path, config sha, weight-file stat
@@ -7634,6 +7700,13 @@ def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
     if rope_p or rope_d:
         ident["rope"] = rope_p if rope_p == rope_d else f"P={rope_p},D={rope_d}"
         ident["rope_apply"] = L3_ROPE_APPLY
+    # H88-D (D4): W4A8 experts -> another store, ONLY while the switch is on.
+    # Rule (a): the new weight math is a new identity (one full recompute);
+    # rule (b): everything else leaves the identity alone, so with the switch
+    # off no key is added; rule (c): ``generation`` is NOT raised for this.
+    # P and D agree or the boot is refused (l3_moe_act_resolve): no "third" identity.
+    if l3_moe_act_resolve(extra_p, extra_d, env_p, env_d, moe_act_int8, env, d_only):
+        ident["moe_act"] = L3_MOE_ACT_VALUE
     return ident
 
 
@@ -25746,11 +25819,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # makes) x RAM_BYTES_PER_ENTRY, once per owner (one per group).
     from sglang.srt.mem_cache.storage.file import store_journal as _store_journal
 
+    # H88-D: an asymmetric W4A8 switch (on for P xor D) is refused here, by name,
+    # for every boot -- also one without a persistent L3 (the PD handshake and the
+    # per-boot store keys carry the same rank identity).
+    l3_moe_act_resolve(getattr(ns, "extra_p", "") or "", getattr(ns, "extra_d", "") or "",
+                       getattr(ns, "env_p", "") or "", getattr(ns, "env_d", "") or "",
+                       getattr(ns, "moe_act_int8", None), None, bool(getattr(ns, "d_only", False)))
     _l3_idx_ident = (l3_persist_identity(ns.model, getattr(ns, "profile", ""),
                                          getattr(ns, "form_kv", "") or "",
                                          extra_p=getattr(ns, "extra_p", "") or "",
                                          extra_d=getattr(ns, "extra_d", "") or "",
-                                         vision=str(getattr(ns, "weg2_vision", "") or ""))
+                                         vision=str(getattr(ns, "weg2_vision", "") or ""),
+                                         env_p=getattr(ns, "env_p", "") or "",
+                                         env_d=getattr(ns, "env_d", "") or "",
+                                         moe_act_int8=getattr(ns, "moe_act_int8", None),
+                                         d_only=bool(getattr(ns, "d_only", False)))
                      if l3_persist_enabled() else None)
     _l3_idx_owners = 1 if getattr(ns, "d_only", False) else 2
     _l3_idx_n, _l3_idx_src = (
@@ -25944,7 +26027,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                      getattr(ns, "form_kv", "") or "",
                                      extra_p=getattr(ns, "extra_p", "") or "",
                                      extra_d=getattr(ns, "extra_d", "") or "",
-                                     vision=str(getattr(ns, "weg2_vision", "") or ""))
+                                     vision=str(getattr(ns, "weg2_vision", "") or ""),
+                                     env_p=getattr(ns, "env_p", "") or "",
+                                     env_d=getattr(ns, "env_d", "") or "",
+                                     moe_act_int8=getattr(ns, "moe_act_int8", None),
+                                     d_only=bool(getattr(ns, "d_only", False)))
                  if l3_persist_enabled() else None)
     store_plan = plan_store(
         ns.tag,
