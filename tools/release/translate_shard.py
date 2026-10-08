@@ -24,7 +24,9 @@ SRC, OUT, TIM = sys.argv[1:4]
 MODEL = sys.argv[4] if len(sys.argv) > 4 else "Qwen3.8-27B-cachy-think"
 KINDS = None if len(sys.argv) <= 5 or sys.argv[5] == "all" else set(sys.argv[5].split(","))
 TM_FILE = sys.argv[6] if len(sys.argv) > 6 else None
-URL = "http://127.0.0.1:30099/v1/messages"
+# F0-D (08.10.2026): TRANSLATE_URL points the driver at a translation seat directly (the cachy box serves /v1/messages itself:
+# TRANSLATE_URL=http://192.168.22.238:8064/v1/messages); the default stays the local split router.
+URL = os.environ.get("TRANSLATE_URL", "http://127.0.0.1:30099/v1/messages")
 BATCH_UNITS, BATCH_CHARS, RETRIES = 40, 24000, 2
 GLOSS = json.load(open(os.path.join(KIT, "data", "de_en_subwords.json")))
 GLOSS = GLOSS.get("map", GLOSS)

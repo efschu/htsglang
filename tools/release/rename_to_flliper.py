@@ -285,6 +285,17 @@ W_DENY_SPAN = [
     # the calibration schema `weg2-pp-calib/1` (host_ledger CALIB_SCHEMA, 4 files under gpu-arb/weg2/calib, read
     # with `!=` -> refused) and `weg2-lane-coverage-1` (written into lane records)
     ("persisted-id", re.compile(r"--weg2-xchg-region\b|\bweg2-pp-calib/\d+|\bweg2-lane-coverage-\d+")),
+    #
+    # F0-D (08.10.2026, found by comparing the launcher dry-run of the old and the renamed tree, profile dual): three more identities
+    # that are HASHED or checked by equality against persisted files.  (1) `weg2-footprint/1` (form.FOOTPRINT_SCHEMA) is part of the
+    # JSON blob that is hashed into `footprint_key(model)`: renamed, every footprint key changes (dual dry-run: 1bf723bf1eeb ->
+    # fc0c36830a6f for the NVFP4 checkpoint) and no longer equals `form.REFERENCE_FOOTPRINTS` (pinned constants of the INT8 reference
+    # model, 28e1c5c3...) or `host_ledger.NF_FOOTPRINT`: the reference model would be judged FOREIGN and the host ledger would price its
+    # ratchet differently.  (2) `weg2-x-curves/1` (x_curves.X_CURVES_FORMAT) is compared with `!=` against the `format` field of the curve
+    # files (`profiles_release/27b.xcurves.json` carries it).  (3) `weg2.form_measures/2|3` (form_measures.SCHEMA_V2/V3) is checked with
+    # `==` when a measure document is read.  The runtime has no reader for the renamed spelling and R1 forbids giving it one, so the
+    # format id stays as written: "a format id is data, not a name".
+    ("persisted-id", re.compile(r"\bweg2-footprint/\d+|\bweg2-x-curves/\d+|\bweg2\.form_measures/\d+")),
 ]
 
 
@@ -1091,7 +1102,9 @@ def cmd_selftest(_: argparse.Namespace) -> int:
                       ('startswith("weg2xsn") prefix="weg2ring-" weg2_x weg2.front', 'startswith("weg2xsn") prefix="weg2ring-" pdflip_x pdflip.front'),
                       ('int.from_bytes(b"WEG2XCHG", "little") WEG2-XCHG', 'int.from_bytes(b"WEG2XCHG", "little") PDFLIP-XCHG'),
                       ('"--weg2-xchg-region=armed" "--weg2-xchg-inject" CALIB_SCHEMA = "weg2-pp-calib/1"',
-                       '"--weg2-xchg-region=armed" "--pdflip-xchg-inject" CALIB_SCHEMA = "weg2-pp-calib/1"')]:
+                       '"--weg2-xchg-region=armed" "--pdflip-xchg-inject" CALIB_SCHEMA = "weg2-pp-calib/1"'),
+                      ('FOOTPRINT_SCHEMA = "weg2-footprint/1" X_CURVES_FORMAT = "weg2-x-curves/1" SCHEMA_V3 = "weg2.form_measures/3" weg2.state/1',
+                       'FOOTPRINT_SCHEMA = "weg2-footprint/1" X_CURVES_FORMAT = "weg2-x-curves/1" SCHEMA_V3 = "weg2.form_measures/3" pdflip.state/1')]:
         got, _, _ = rewrite_weg2(src)
         bad += got != want
         print(("ok  " if got == want else "FAIL"), "(weg2)", repr(src), "->", repr(got))
