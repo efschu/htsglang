@@ -60,8 +60,8 @@ for path, mode, data in iter_tree(root):
     if text is None or not R.in_scope(path) or ext in R.CXX_EXT:
         continue
     n_files += 1
-    new_text, rep, skip = R.rewrite_all(text, path.endswith(".py"), True, imap)
-    clash = R.file_collisions(text, R.rewrite_all(text, path.endswith(".py"), True, {})[0])
+    new_text, rep, skip = R.rewrite_all(text, path.endswith(".py"), True, imap, path)
+    clash = R.file_collisions(text, R.rewrite_all(text, path.endswith(".py"), True, {}, path)[0])
     ok = R.COLLISION_OK.get(path, frozenset())
     clash = {k: v for k, v in clash.items() if k not in ok}
     if clash:
