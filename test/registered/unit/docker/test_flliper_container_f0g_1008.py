@@ -3,8 +3,9 @@
 What is pinned here, without docker, GPU or network:
 
   * docker/flliper/profiles_release/*.env and profiles/nf-int4-h6-abl.env are the kit's conversion
-    (tools/release/profconv.py, ``rename_to_flliper.rewrite_all``) of the byte-for-byte old files next to them
-    (``*.env.alt``): converting the old file gives the new one, the conversion is idempotent, the new file carries no
+    (tools/release/profconv.py, ``rename_to_flliper.rewrite_all``) of the old files next to them (``*.env.alt``; the old file with
+    ONE kind of line changed: a sibling-source line names ``<sibling>.env.alt``, so a .alt run is a pure old-spelling run, see
+    ``PC.alt_text`` / ``PC.from_alt``): converting the old file gives the new one, the conversion is idempotent, the new file carries no
     pre-rename name (SGLANG_*, --weg2-*, WEG2-*) and differs from the old one ONLY at names (line count equal, every
     line equal after both name families are folded to one token).  The five kit profiles are byte-equal to
     tools/release/profconv/.
@@ -82,6 +83,11 @@ def _tree_profiles():
     return sorted(REL.glob("*.env")) + sorted(RIG.glob("*.env"))
 
 
+def _old(p):
+    """The old-spelling file of a tree profile: its .alt with the sibling-source lines mapped back (PC.from_alt) = the live file of 08.10."""
+    return PC.from_alt(_read(str(p) + ".alt"))
+
+
 class TestProfilesInTree(unittest.TestCase):
     def test_set_is_present(self):
         names = {p.name for p in _tree_profiles()}
@@ -94,7 +100,7 @@ class TestProfilesInTree(unittest.TestCase):
 
     def test_new_is_the_conversion_of_alt_and_idempotent(self):
         for p in _tree_profiles():
-            old, new = _read(str(p) + ".alt"), _read(p)
+            old, new = _old(p), _read(p)
             self.assertEqual(PC.convert(old, IMAP), new, p.name)
             self.assertEqual(PC.convert(new, IMAP), new, p.name + " (idempotent)")
 
@@ -109,7 +115,7 @@ class TestProfilesInTree(unittest.TestCase):
 
     def test_alt_vs_new_differ_only_at_names(self):
         for p in _tree_profiles():
-            a, b = _read(str(p) + ".alt").splitlines(), _read(p).splitlines()
+            a, b = _old(p).splitlines(), _read(p).splitlines()
             self.assertEqual(len(a), len(b), p.name)
             for i, (x, y) in enumerate(zip(a, b), 1):
                 # the HTSGLANG_* product env is not touched: fold it out first, then both name families to one token
@@ -118,7 +124,7 @@ class TestProfilesInTree(unittest.TestCase):
 
     def test_htsglang_product_env_is_unchanged(self):
         for p in _tree_profiles():
-            old, new = _read(str(p) + ".alt"), _read(p)
+            old, new = _old(p), _read(p)
             self.assertEqual(re.findall(r"HTSGLANG_[A-Z0-9_]+", old), re.findall(r"HTSGLANG_[A-Z0-9_]+", new), p.name)
 
     def test_kit_five_equal_the_kit_dir(self):
@@ -135,8 +141,43 @@ class TestProfilesInTree(unittest.TestCase):
             for dep in re.findall(r'^\s*source "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)/([A-Za-z0-9._-]+\.env)"', _read(p), re.M):
                 self.assertTrue((p.parent / dep).is_file(), "%s sources %s" % (p.name, dep))
 
+    def test_alt_is_self_contained_and_maps_back_byte_for_byte(self):
+        """Fix round 1 (finding 1): 10 of the 16 profiles source a sibling.  As .alt each must source the sibling's .alt (a pure old-spelling
+        chain, not old loop + converted base); the only difference to the live file is that one line kind, and PC.from_alt gives it back."""
+        n_sourcing = 0
+        for p in _tree_profiles():
+            alt = _read(str(p) + ".alt")
+            deps = re.findall(r'^\s*source "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)/([A-Za-z0-9._-]+)"', alt, re.M)
+            for dep in deps:
+                n_sourcing += 1
+                self.assertTrue(dep.endswith(".env.alt"), "%s.alt sources %s" % (p.name, dep))
+                self.assertTrue((p.parent / dep).is_file(), "%s.alt sources %s: missing" % (p.name, dep))
+            self.assertEqual(PC.alt_text(PC.from_alt(alt)), alt, p.name)          # both directions are exact
+            self.assertEqual(PC.from_alt(PC.alt_text(_read(p))), _read(p), p.name)   # a file without old sibling names would not move
+        self.assertGreaterEqual(n_sourcing, 10)
+        self.assertEqual(sum(1 for p in _tree_profiles() if PC.alt_text(_old(p)) != _old(p)), 10)
+
+    def test_alt_chain_is_pure_old_and_new_chain_is_pure_new(self):
+        """The chain a profile sources, executed (bash, `_form` stubbed like the dry-run does): the variables it sets carry NO new spelling for
+        a .alt and NO old spelling for the converted file.  A mixed chain (the finding) would show both."""
+        old_re, new_re = PC.OLD_NAME_RE, re.compile(r"(?<![A-Za-z])FLLIPER_|--pdflip-|PDFLIP-|flliper\.srt")
+        checked = 0
+        for p in _tree_profiles():
+            for kind, f in (("alt", pathlib.Path(str(p) + ".alt")), ("new", p)):
+                r = subprocess.run(["bash", "-c", '_form(){ :; }; set -eu; source "$1"; declare -p PROFILE_ARGS; declare -p | grep -E "^declare -[-a-zA-Z]+ [A-Z_0-9]+=" | grep -v -E " (BASH|SHLVL|PWD|_=|OLDPWD)"', "x", str(f)],
+                                   capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"}, timeout=60)
+                self.assertEqual(r.returncode, 0, "%s: %s" % (f.name, r.stderr[-800:]))
+                out = r.stdout
+                self.assertIn("PROFILE_ARGS", out, f.name)
+                if kind == "alt":
+                    self.assertIsNone(new_re.search(out), "%s: new spelling in a .alt chain: %s" % (f.name, new_re.search(out)))
+                else:
+                    self.assertIsNone(old_re.search(out), "%s: old spelling in the converted chain: %s" % (f.name, old_re.search(out)))
+                checked += 1
+        self.assertEqual(checked, 2 * len(_tree_profiles()))
+
     def test_nf_abl_delivers_resident_expert_fraction(self):
-        new, old = _read(RIG / "nf-int4-h6-abl.env"), _read(str(RIG / "nf-int4-h6-abl.env") + ".alt")
+        new, old = _read(RIG / "nf-int4-h6-abl.env"), _old(RIG / "nf-int4-h6-abl.env")
         self.assertIn("SGLANG_MOE_RESIDENT_EXPERT_FRACTION=", old)          # the F0-D finding: the old profile names the old spelling
         self.assertNotIn("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", new)
         self.assertEqual(new.count("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION="), 2)   # NF_ENV_P_FORM and NF_ENV_D_FORM
@@ -164,7 +205,7 @@ class TestProfilesInTree(unittest.TestCase):
                 if not live.is_file():
                     continue
                 txt = _read(live)
-                if txt not in (_read(str(p) + ".alt"), _read(p)):
+                if txt not in (_old(p), _read(p)):
                     moved.append(str(live))
         if moved:
             self.skipTest("LIVE PROFILE MOVED under its committed snapshot (re-run profconv.py --tree-out): " + ", ".join(moved))
@@ -181,8 +222,8 @@ class TestProfilesInTree(unittest.TestCase):
             rel, rig = pathlib.Path(td, "rel"), pathlib.Path(td, "rig")
             rel.mkdir(); rig.mkdir()
             for p in sorted(REL.glob("27b*.env"))[:3]:
-                shutil.copy(str(p) + ".alt", rel / p.name)
-            shutil.copy(str(RIG / "nf-int4-h6-abl.env") + ".alt", rig / "nf-int4-h6-abl.env")
+                (rel / p.name).write_text(_old(p), encoding="utf-8")
+            (rig / "nf-int4-h6-abl.env").write_text(_old(RIG / "nf-int4-h6-abl.env"), encoding="utf-8")
             before = {p.name: p.read_bytes() for p in list(rel.iterdir()) + list(rig.iterdir())}
             cmd = [sys.executable, str(KIT / "profconv.py"), "--convert-live", "--src", str(rel), "--src2", str(rig)]
             plan = subprocess.run(cmd, capture_output=True, text=True)
@@ -194,9 +235,92 @@ class TestProfilesInTree(unittest.TestCase):
             for d in (rel, rig):
                 for p in d.glob("*.env"):
                     self.assertEqual(p.read_text(), _read([x for x in _tree_profiles() if x.name == p.name][0]))   # = the committed new file
-                    self.assertEqual((d / (p.name + ".alt")).read_bytes(), before[p.name])                         # old kept byte for byte
+                    tree_p = [x for x in _tree_profiles() if x.name == p.name][0]
+                    self.assertEqual((d / (p.name + ".alt")).read_text(), _read(str(tree_p) + ".alt"))               # = the committed .alt
+                    self.assertEqual(PC.from_alt((d / (p.name + ".alt")).read_text()).encode(), before[p.name])      # old kept byte for byte
             again = subprocess.run(cmd + ["--apply"], capture_output=True, text=True)
             self.assertIn("0 to convert", again.stdout)
+            # the way back: rollback-live restores the live files byte for byte (plan first, then --apply)
+            rb = [sys.executable, str(KIT / "profconv.py"), "--rollback-live", "--src", str(rel), "--src2", str(rig)]
+            conv = {p.name: p.read_bytes() for d in (rel, rig) for p in d.glob("*.env")}
+            plan = subprocess.run(rb, capture_output=True, text=True)
+            self.assertIn("would restore", plan.stdout)
+            self.assertEqual(conv, {p.name: p.read_bytes() for d in (rel, rig) for p in d.glob("*.env")})
+            done = subprocess.run(rb + ["--apply"], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(before, {p.name: p.read_bytes() for d in (rel, rig) for p in d.glob("*.env")})
+            self.assertIn("0 to restore", subprocess.run(rb + ["--apply"], capture_output=True, text=True).stdout)
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestDryRunComparison(unittest.TestCase):
+    """Fix round 1 (finding 2): the acceptance 'dry-run old vs new, 0 diff modulo names' has a record in the tree: one protocol per profile
+    (docker/flliper/drycmp/protocols/<profile>.txt) and SUMMARY.txt, written by drycmp.py / summary.py from the logs of run_pair.sh."""
+
+    PROT = D / "drycmp" / "protocols"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dc = _load("drycmp_f0g", D / "drycmp" / "drycmp.py")
+        cls.sm = _load("drycmp_summary_f0g", D / "drycmp" / "summary.py")
+
+    def test_one_protocol_per_profile_all_ok(self):
+        want = sorted(p.stem for p in _tree_profiles())
+        got = sorted(p.stem for p in self.PROT.glob("*.txt") if p.stem != "SUMMARY")
+        self.assertEqual(got, want)
+        self.assertEqual(len(want), 16)
+        for n in want:
+            t = _read(self.PROT / (n + ".txt"))
+            self.assertIn("VERDICT OK:", t, n)
+            self.assertIn("PROFILE_ARGS folded: equal", t, n)
+            self.assertIn("(pre-rename)   profile file %s.env.alt" % n, t, n)       # the OLD side is the pure .alt chain, not the converted sibling
+
+    def test_summary_is_what_the_protocols_say_and_counts_are_exact(self):
+        self.assertEqual(_read(self.PROT / "SUMMARY.txt"), self.sm.build(str(self.PROT)))
+        t = _read(self.PROT / "SUMMARY.txt")
+        # 13 stop at a refusal about model/draft files, 1 at the plan's W64, 2 complete: 13 + 1 + 2 = 16 (the commit message of F0-G had 12 + 4)
+        self.assertIn("13 (config.json 7, W163 1, W128 5)", t)
+        self.assertIn("(W64): 1. Plan complete (DRY-RUN complete, EXIT=0): 2.  13 + 1 + 2 = 16.", t)
+        self.assertIn("VERDICT: 16 OK, 0 FAIL.", t)
+        self.assertIn("LIMIT (stated, not a success)", t)
+
+    def test_the_plan_reaching_profiles_have_equal_env_dicts(self):
+        for n, groups in (("27b-nvfp4", {"D": 74, "P": 71}), ("27b-nvfp4-dual.diet", {"D": 68, "P": 68}), ("27b-nvfp4-dual", {"P": 80})):
+            t = _read(self.PROT / (n + ".txt"))
+            for g, k in groups.items():
+                self.assertIn("ENV group %s: keys old=%d new=%d  only_old=[] only_new=[]  changed=0" % (g, k, k), t, n)
+
+    def _mini(self, td, old_lines, new_lines):
+        for side, lines in (("old", old_lines), ("new", new_lines)):
+            pathlib.Path(td, "%s_p.log" % side).write_text("\n".join(lines) + "\n")
+        ns = type("A", (), dict(old_tree="/o", new_tree="/n", work="/w", old_tree_sha="o", new_tree_sha="n"))()
+        out = pathlib.Path(td, "out")
+        out.mkdir()
+        return self.dc.compare("p", td, ns, str(out))[0]
+
+    def test_comparison_accepts_names_and_rejects_real_differences(self):
+        args_old = "PROFILE_ARGS(p): --weg2-x 1 --foo 2"
+        env_old = 'ENVDUMP P [["SGLANG_WEG2_A", "1"], ["SGLANG_B", "/o/x"]]'
+        tail = ["WEG2-LAUNCH VRAM 100 MiB free", "EXIT=1"]
+        base_new = ["PROFILE_ARGS(p): --pdflip-x 1 --foo 2", 'ENVDUMP P [["FLLIPER_PDFLIP_A", "1"], ["FLLIPER_B", "/n/x"]]',
+                    "PDFLIP-LAUNCH VRAM 101 MiB free", "EXIT=1"]
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(self._mini(td, [args_old, env_old] + tail, base_new))            # names, a digit (reading) and the tree path differ: fine
+        mutants = {
+            "env value": [base_new[0], 'ENVDUMP P [["FLLIPER_PDFLIP_A", "2"], ["FLLIPER_B", "/n/x"]]'] + base_new[2:],
+            "env key only on one side": [base_new[0], 'ENVDUMP P [["FLLIPER_PDFLIP_A", "1"], ["FLLIPER_B", "/n/x"], ["FLLIPER_C", "1"]]'] + base_new[2:],
+            "flag": ["PROFILE_ARGS(p): --pdflip-x 1 --foo 3"] + base_new[1:],
+            "unexplained line": base_new[:3] + ["PDFLIP-LAUNCH something new happened", "EXIT=1"],
+        }
+        for what, new in mutants.items():
+            with tempfile.TemporaryDirectory() as td:
+                self.assertFalse(self._mini(td, [args_old, env_old] + tail, new), what)
 
 
 @unittest.skipUnless(EP.is_file() and shutil.which("bash"), "entrypoint not in this tree")
@@ -248,14 +372,22 @@ class TestDuoEntrypoint(unittest.TestCase):
         self.assertIn("REFUSED PROFILE", out)
 
     def test_the_old_profile_names_still_run(self):
-        # alt (old-name) files in the same stand-in: the entrypoint is agnostic about the spelling INSIDE a profile (the mirror folds it later)
-        for n in ("27b", "nf-int4"):
-            shutil.copy(str(REL / (n + ".env")) + ".alt", pathlib.Path(self.td, "opt", "profiles", n + ".env"))
+        # the old-spelling chain in the same stand-in: <n>.env = the OLD file (PC.from_alt of the .alt) and its sibling profiles as the .alt
+        # files they source (`27b-base.env.alt`): a pure old-spelling run, not an old file over the converted base.  The entrypoint is
+        # agnostic about the spelling INSIDE a profile (the mirror folds it later).
+        prof = pathlib.Path(self.td, "opt", "profiles")
+        for a in REL.glob("*.env.alt"):
+            shutil.copy(a, prof / a.name)
+        for n in ("27b", "nf-int4", "27b-nvfp4"):
+            (prof / (n + ".env")).write_text(_old(REL / (n + ".env")), encoding="utf-8")
             try:
                 rc, out = self._run(n)
                 self.assertEqual(rc, 0, out[-1500:])
+                self.assertIn("SANDBOX-STOP STAND=%s" % ("27b" if n.startswith("27b") else "nf"), out)
             finally:
-                shutil.copy(REL / (n + ".env"), pathlib.Path(self.td, "opt", "profiles", n + ".env"))
+                shutil.copy(REL / (n + ".env"), prof / (n + ".env"))
+        for a in REL.glob("*.env.alt"):
+            (prof / a.name).unlink()
 
 
 def _run_bodies(text):

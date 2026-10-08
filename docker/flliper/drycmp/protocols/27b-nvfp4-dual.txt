@@ -1,0 +1,17 @@
+PROFILE 27b-nvfp4-dual
+OLD  tree dab894b021 (pre-rename)   profile file 27b-nvfp4-dual.env.alt (pure old-spelling chain)
+NEW  tree 67366ac820 (renamed)      profile file 27b-nvfp4-dual.env
+BOUNDARY old: refusal W64   [EXIT=1]
+BOUNDARY new: refusal W64   [EXIT=1]
+PROFILE_ARGS folded: equal
+ENV group P: keys old=80 new=80  only_old=[] only_new=[]  changed=0  run-specific=['NAME_NAME_BOOT_TOKEN']
+compile warnings dropped (fresh checkout, not launcher output): old=0 new=0
+OTHER lines: old=243 new=243  equal after name folding=224  equal except digits (live-box readings/timings)=16  matched by skeleton=241
+RESIDUAL lines old-side 2  new-side 2 (full lines first, then the word-level pairing)
+   - WEG2-LAUNCH H2c STORE-IDENTITY ENTFAELLT: keine Experten-Karte -> D-Store-Adopt inaktiv
+   - WEG2-LAUNCH D-RANK VRAM (#145) VERDIKT D(dual-share, P-Plan): rang0 nvml1 NVIDIA GeForce RTX 5090: total 32607 - fremd 0 - nichttorch 0 - reserve 0 = 32607 verfuegbar, gefragt 19784 -> REST 12823 MiB [Korridor ok (12823 >= 819 MiB)] | rang1 nvml0 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 10424 -> REST 10056 MiB [Korridor ok (10056 >= 819 MiB)] | rang2 nvml2 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 10288 -> REST 10192 MiB [Korridor ok (10192 >= 819 MiB)] [NICHT GEBUCHT: --d-foreign-context-mib, --d-nontorch-mib, --d-reserve-mib -- diese Zeile ist damit eine OBERGRENZE, keine Bilanz]
+   + PDFLIP-LAUNCH H2c STORE-IDENTITY ENTFAELLT: no experts card -> D-Store-Adopt inactive
+   + PDFLIP-LAUNCH D-RANK VRAM (#145) VERDIKT D(dual-share, P-Plan): rang0 nvml1 NVIDIA GeForce RTX 5090: total 32607 - fremd 0 - nichttorch 0 - reserve 0 = 32607 verfuegbar, gefragt 19784 -> REST 12823 MiB [Korridor ok (12823 >= 819 MiB)] | rang1 nvml0 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 10424 -> REST 10056 MiB [Korridor ok (10056 >= 819 MiB)] | rang2 nvml2 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 10288 -> REST 10192 MiB [Korridor ok (10192 >= 819 MiB)] [NICHT GEBUCHT: --d-foreign-context-mib, --d-nontorch-mib, --d-reserve-mib -- this row is thus a OBERGRENZE, keine Bilanz]
+   pair: translation [keine Experten-Karte -> no experts card] ; translation [inaktiv -> inactive]
+   pair: translation [diese Zeile ist damit eine -> this row is thus a]
+VERDICT OK: 0 diff modulo names for flags and env; 2 translated prose line(s) (German -> English, listed above), nothing unexplained (up to the boundary above)
