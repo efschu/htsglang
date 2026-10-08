@@ -195,6 +195,49 @@ def prefetch_done_under_ballot(
     return verdict
 
 
+def cover_post_drain_intake(
+    verdicts: Optional[Dict[str, bool]], reqs: Sequence
+) -> List[str]:
+    """NF 08.10. (#580 after #791b): a pending verdict for every request that
+    entered the waiting queue AFTER this pass's memoised drain.
+
+    THE GAP. #791b pulled the drain forward to
+    ``Scheduler._update_uniform_pool_budget`` (the ballot needs its local
+    verdicts there), so on the TP loop the drain sees the queue BEFORE
+    ``_get_new_batch_prefill_raw`` moves the grammar-ready requests in -- the
+    placement #580 required ("AFTER the grammar queue has drained") was
+    inverted. A request whose grammar finished compiling then reaches the
+    admission loop with no drained verdict and ``_prefetch_done_for`` raises
+    on every TP rank (NF boots 10080959 pdflip-1-8 and 10081009 pdflip-0-8, the
+    same 13528-token chat body: D's per-process grammar cache misses after
+    every restart, P's leg 1 carries no grammar).
+
+    WHY "PENDING" IS THE GROUP'S OWN ANSWER, not a mask: such a rid is not in
+    this pass's ballot (the ballot's rids were read from the same pre-intake
+    queue), and ``prefetch_done_under_ballot`` already answers an unballoted
+    rid with False. Writing False here yields that same decision without the
+    live ``check_prefetch_progress`` call that would enter a collective
+    outside the drain. The grammar-ready set is TP-uniform (all_gather
+    intersection in ``GrammarManager.get_ready_grammar_requests``), so every
+    rank covers the same rids. The next pass's drain and ballot see the rid in
+    the queue like any other.
+
+    ``verdicts`` None (no memo: PP loop, kv-session-offload, single rank) ->
+    nothing to do, the caller drains after the intake itself. A rid the
+    memo already holds keeps its verdict. Returns the covered rids.
+    """
+    if verdicts is None:
+        return []
+    covered = []
+    for req in reqs:
+        rid = getattr(req, "rid", None)
+        if rid is None or rid in verdicts:
+            continue
+        verdicts[rid] = False
+        covered.append(str(rid))
+    return covered
+
+
 #: #823: log cadence for a PERSISTING rank-local degradation.
 #:
 #: The first degraded pass is always reported, then the cadence widens
