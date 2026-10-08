@@ -16,8 +16,8 @@ from typing import Any, Optional
 #: the message of the RuntimeError (a test and the boot-log reader match this text)
 NO_SCHEME_MESSAGE = "MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree"
 
-#: whether this tree has a W4A8 MoE scheme behind the switch.  H88-B sets this True when it adds the scheme.
-HAS_W4A8_MOE_SCHEME = False
+#: whether this tree has a W4A8 MoE scheme behind the switch.  H88-B (CompressedTensorsWNA16A8MoE) sets this True.
+HAS_W4A8_MOE_SCHEME = True
 
 
 def moe_act_int8_requested(server_args: Optional[Any] = None) -> bool:

@@ -392,6 +392,7 @@ def expert_shard_generic_eligible(quant_config, plan_active, moe_ep_size, opt_in
 _CT_TRANSPOSING_METHODS = (
     "CompressedTensorsWNA16MarlinMoE",
     "CompressedTensorsWNA16MoE",
+    "CompressedTensorsWNA16A8MoE",
     "CompressedTensorsWNA16TritonMoE",
 )
 
@@ -2452,6 +2453,7 @@ class FusedMoE(torch.nn.Module):
                 method.__class__.__name__
                 in [
                     "CompressedTensorsWNA16MoE",
+                    "CompressedTensorsWNA16A8MoE",
                     "CompressedTensorsWNA16TritonMoE",
                 ]
             )

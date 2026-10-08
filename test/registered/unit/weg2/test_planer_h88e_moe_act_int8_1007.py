@@ -157,14 +157,24 @@ class TestSwitchReader(_SwitchEnv):
         os.environ["SGLANG_MOE_ACT_INT8"] = "1"
         self.assertTrue(self.M.moe_act_int8_requested(SAoff()))
 
-    def test_no_scheme_in_this_tree_names_itself(self):
-        self.assertFalse(self.M.HAS_W4A8_MOE_SCHEME)
-        self.assertEqual(self.M.NO_SCHEME_MESSAGE, MSG)
-        self.M.require_w4a8_moe_scheme()                                   # off: returns
+    def test_this_tree_has_the_w4a8_scheme_since_h88b(self):
+        self.assertTrue(self.M.HAS_W4A8_MOE_SCHEME)
         os.environ["SGLANG_MOE_ACT_INT8"] = "1"
-        with self.assertRaises(RuntimeError) as cm:
-            self.M.require_w4a8_moe_scheme()
-        self.assertEqual(str(cm.exception), MSG)
+        self.M.require_w4a8_moe_scheme()                                   # on + scheme in the tree: returns
+
+    def test_a_tree_without_the_scheme_names_itself(self):
+        # H88-B set HAS_W4A8_MOE_SCHEME = True; the guard itself is still what a tree WITHOUT the scheme hits
+        self.assertEqual(self.M.NO_SCHEME_MESSAGE, MSG)
+        old = self.M.HAS_W4A8_MOE_SCHEME
+        self.M.HAS_W4A8_MOE_SCHEME = False
+        try:
+            self.M.require_w4a8_moe_scheme()                               # off: returns
+            os.environ["SGLANG_MOE_ACT_INT8"] = "1"
+            with self.assertRaises(RuntimeError) as cm:
+                self.M.require_w4a8_moe_scheme()
+            self.assertEqual(str(cm.exception), MSG)
+        finally:
+            self.M.HAS_W4A8_MOE_SCHEME = old
 
     def test_a_tree_with_the_scheme_passes(self):
         os.environ["SGLANG_MOE_ACT_INT8"] = "1"
@@ -212,9 +222,18 @@ class TestDispatch(_SwitchEnv):
         self.assertIs(self.cfg.get_moe_scheme(object(), "model.layers.0.mlp.experts"), self.sentinel)
 
     def test_switch_on_without_a_w4a8_scheme_stops_with_the_named_error(self):
+        # since H88-B the tree has the scheme (HAS_W4A8_MOE_SCHEME = True); the dispatch still stops
+        # with the named error in a tree that has none, so the flag is patched back here
+        from sglang.srt.layers.quantization import moe_act_int8 as M
+
         os.environ["SGLANG_MOE_ACT_INT8"] = "1"
-        with self.assertRaises(RuntimeError) as cm:
-            self.cfg.get_moe_scheme(object(), "model.layers.0.mlp.experts")
+        old = M.HAS_W4A8_MOE_SCHEME
+        M.HAS_W4A8_MOE_SCHEME = False
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                self.cfg.get_moe_scheme(object(), "model.layers.0.mlp.experts")
+        finally:
+            M.HAS_W4A8_MOE_SCHEME = old
         self.assertEqual(str(cm.exception), MSG)
 
     def test_the_flag_form_stops_the_same_way(self):
@@ -223,13 +242,22 @@ class TestDispatch(_SwitchEnv):
         from sglang.srt.layers.quantization import moe_act_int8 as M
 
         real = M.moe_act_int8_requested
+        old = M.HAS_W4A8_MOE_SCHEME
+        M.HAS_W4A8_MOE_SCHEME = False
         M.moe_act_int8_requested = lambda server_args=None: real(types.SimpleNamespace(moe_act_int8="on"))
         try:
             with self.assertRaises(RuntimeError) as cm:
                 self.cfg.get_moe_scheme(object(), "model.layers.0.mlp.experts")
         finally:
             M.moe_act_int8_requested = real
+            M.HAS_W4A8_MOE_SCHEME = old
         self.assertEqual(str(cm.exception), MSG)
+
+    def test_switch_on_with_the_scheme_on_a_non_cuda_box_stays_w4a16(self):
+        # H88-B: _is_cuda is False on this box, so the W4A8 branch is not taken (the CUDA case is
+        # test_ct_wna16a8_moe_h88b_1007.TestDispatch)
+        os.environ["SGLANG_MOE_ACT_INT8"] = "1"
+        self.assertIs(self.cfg.get_moe_scheme(object(), "model.layers.0.mlp.experts"), self.sentinel)
 
 
 class TestProfile(unittest.TestCase):
