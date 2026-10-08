@@ -15,5 +15,6 @@
  "ident_fix_collision_ok_1007_nf.json": {
   "base": "copy of ident_fix_collision_ok_1007_27b.json minus docker/pdflip-release/test_rigdash_ctx_1995.sh (the file does not exist on the NF line)",
   "extra_pairs": "none yet (see the F0-E run log)"
- }
+ },
+ "run_env_F0_E": "LINE=nf COLLISION_OK_FILE=tools/release/data/collision_ok_1007_nf.json FIXMAP_EXTRA=tools/release/data/ident_map_1007.json IDENT_FIX_COLLISION_OK_FILE=tools/release/data/ident_fix_collision_ok_1007_nf.json IDENT_FIX_WEB=1 RIG_TEST_WRAP=tools/release/capped_run.sh SKIP_DRY=0. IDENT_FIX_WEB=1 is REQUIRED: without it step 2 leaves the dashboard .js/.html (static/index.html, modellprofil.js, profil*.js) on the German identifiers the renamed Python writes and the dashboard suite goes 76 failed (first F0-E run, 925 passed / 76 failed); the 27B run (F0-D) had it set."
 }
