@@ -211,7 +211,10 @@ def canonical_env(env: MutableMapping, *, foreign_keep=FOREIGN_READERS,
     the RENAMED spelling's value wins, on either side of the rename (a profile
     that moved to the new name must not be overridden by a stale old one;
     RENAME_PLAN 4.1); when only one is present its value moves onto the
-    canonical spelling. Then every non-canonical spelling is REMOVED, so a
+    canonical spelling. For a ``foreign_keep`` name the CANONICAL spelling wins
+    instead: it is the one the launcher writes into a child's env, over a
+    base env that still carries the twin of the parent's resolved value (the
+    launcher's value must arrive; after the rename canonical = renamed). Then every non-canonical spelling is REMOVED, so a
     later ``env.pop(canonical)`` removes the variable -- no other spelling
     survives to be mirrored back by a child's own import. The exception is
     ``foreign_keep`` (legacy spellings read by code outside the rename): for
@@ -238,13 +241,19 @@ def canonical_env(env: MutableMapping, *, foreign_keep=FOREIGN_READERS,
     for (leg, new, canon), present in groups.items():
         foreign = leg in foreign_keep
         if report is not None:
-            if leg in env and new in env and env[leg] != env[new]:
+            if leg in env and new in env and env[leg] != env[new] and not (foreign and canon == leg):
                 report.setdefault("conflicts", []).append((leg, new))
             if leg in env and canon != leg and not (foreign and new in env and env[leg] == env[new]):
                 report.setdefault("legacy", []).append(leg)
         if present == [canon] and (not foreign or leg == canon):
             continue
-        value = env[new] if new in env else env[leg]
+        # a foreign reader's canonical spelling is the one the launcher writes to its children (the rename
+        # tool rewrites that literal along with the tree), so beside a derived twin of the other spelling the
+        # canonical value wins; everywhere else the renamed spelling does
+        if foreign and canon in env:
+            value = env[canon]
+        else:
+            value = env[new] if new in env else env[leg]
         env[canon] = value
         for k in present:
             if k != canon and not (foreign and k in (leg, new)):

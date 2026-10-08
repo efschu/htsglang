@@ -103,6 +103,33 @@ class TestEnvMirror(CustomTestCase):
         nc.canonical_env({GEN[0] + rest: "8"}, report=rep)      # the user set only the old one
         self.assertEqual(rep.get("legacy", []), [] if C == 0 else [leg])
 
+    def test_the_launchers_write_of_a_foreign_name_beats_the_twin_of_the_parent(self):
+        """Review F0-C 1.1: a parent resolved a foreign name to both spellings; the launcher then writes the canonical one
+        (the rename tool rewrites that literal along) into the child's env, and ``canonical_env`` must keep ITS value."""
+        for leg in sorted(nc.FOREIGN_READERS):
+            fam = nc._env_family(leg)
+            self.assertIsNotNone(fam)
+            _leg, new, canon = fam
+            parent = {new: "0"}
+            nc.canonical_env(parent)
+            self.assertEqual(parent[_leg], "0")
+            child = dict(parent)
+            child[canon] = "1"                       # what the launcher writes
+            rep = {}
+            nc.canonical_env(child, report=rep)
+            self.assertEqual(child[canon], "1", leg)
+            self.assertEqual(child[_leg], "1", leg)  # what the foreign code reads
+            self.assertEqual(child.get(new), "1", leg)
+            self.assertNotIn((_leg, new), rep.get("conflicts", []), leg)
+
+    def test_a_non_foreign_conflict_still_lets_the_renamed_spelling_win(self):
+        rest = "ZZ_NO_FOREIGN"
+        rep = {}
+        env = {GEN[0] + rest: "old", GEN[1] + rest: "new"}
+        nc.canonical_env(env, report=rep)
+        self.assertEqual(env, {_canon(GEN, rest): "new"})
+        self.assertEqual(rep["conflicts"], [(GEN[0] + rest, GEN[1] + rest)])
+
     def test_the_env_without_a_report_is_unchanged_behaviour(self):
         env = {_canon(GEN, "A"): "1", "PATH": "/bin"}
         self.assertIs(nc.canonical_env(env), env)
