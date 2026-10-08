@@ -241,6 +241,7 @@ from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
 from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
+from flliper.srt.pdflip import d_head_hold as _pdflip_d_head_hold  # DQH
 from flliper.srt.pdflip import progress_beacon as _pdflip_beacon  # FP forward-progress beacon
 from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from flliper.srt.pdflip.vision_verdict import PdFlipVisionVerdict  # H125f vision verdict on the chain
@@ -2161,6 +2162,8 @@ class Scheduler(
         self.init_invariant_checker()
 
         self.init_pdflip_d_lead_probe()
+
+        self.init_pdflip_d_head_hold()
 
         self.init_kv_events_publisher()
 
@@ -5035,6 +5038,24 @@ class Scheduler(
     def init_pdflip_d_lead_probe(self) -> None:
         self.pdflip_d_lead_probe = build_d_lead_probe(
             group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        )
+
+    def init_pdflip_d_head_hold(self) -> None:
+        # DQH (pdflip/d_head_hold.py): a refused D head is re-evaluated on a change
+        self.pdflip_d_head_hold = _pdflip_d_head_hold.build(
+            group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        )
+
+    def _pdflip_d_head_fingerprint(self, running_batch, prefetch_verdicts) -> Optional[tuple]:
+        """DQH: what the held head's verdict reads (replicated values).
+        ``prefetch_verdicts`` is this iteration's drain memo as the pass found
+        it (the pass consumes it, so the caller reads it before the pass)."""
+        return _pdflip_d_head_hold.fingerprint(
+            hol_state=self.__dict__.get("_pdflip_hol"),
+            waiting=self.waiting_queue,
+            running=running_batch.reqs if running_batch is not None else (),
+            prefetch_verdicts=prefetch_verdicts,
+            continuation=self.chunked_req is not None or bool(getattr(self, "anchor_tails", None)),
         )
 
     def init_parked_decode_set(self) -> None:
@@ -12765,10 +12786,25 @@ class Scheduler(
             # this decode round before the next extend (rank-uniform)
             new_batch = None
             self._admission_decline_note = "gate=pdflip_skip_first_decode"
+        elif self.pdflip_d_head_hold.should_hold(
+            self._pdflip_d_head_fingerprint(running_batch, self.__dict__.get("_pass_prefetch_verdicts"))
+        ):
+            # DQH (pdflip/d_head_hold.py): the refused D head and everything its
+            # verdict reads are unchanged -- no pass this round (replicated
+            # inputs, same iterations on every rank). The SEAT-AGE pass count
+            # moves as if the pass ran, so a refusal view ages honestly.
+            new_batch = None
+            self._pdflip_sa_pass = getattr(self, "_pdflip_sa_pass", 0) + 1
+            self._admission_decline_note = "gate=pdflip_d_head_hold"
         else:
+            _dqh_verdicts = self.__dict__.get("_pass_prefetch_verdicts")
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+            self.pdflip_d_head_hold.note_pass(
+                fp=self._pdflip_d_head_fingerprint(running_batch, _dqh_verdicts),
+                built_nothing=new_batch is None,
+            )
             if (
                 self.congruent_prefill_lane is not None
                 and new_batch is not None
