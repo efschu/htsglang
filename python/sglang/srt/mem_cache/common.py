@@ -873,6 +873,19 @@ def deliverable_evictable_or(tree_cache, fallback) -> int:
     return int(fallback())
 
 
+def payable_evictable_or(tree_cache, fallback) -> int:
+    """PW (NF int18 1008): the evictable count a peel asked NOW can pay -- the
+    reported count minus the backup wall the last short peel measured -- where
+    the cache's CLASS defines it, else ``fallback()`` (looked up on the type for
+    the reason :func:`deliverable_evictable_or` gives)."""
+    fn = getattr(type(tree_cache), "payable_evictable_size", None)
+    if callable(fn):
+        v = fn(tree_cache)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    return int(fallback())
+
+
 #: F1 (nf-next-1006-01): what the scheduler's iteration reduce publishes on the
 #: tree cache when a residency cap (``KvRowCap``) is engaged and the ranks'
 #: admission is pinned to the group MIN (uneven DCP). Absent / 0 everywhere

@@ -849,6 +849,7 @@ def _weg2_park_on() -> bool:
 
 
 from sglang.srt.mem_cache.common import deliverable_evictable_or  # ED
+from sglang.srt.mem_cache.common import payable_evictable_or  # PW
 from sglang.srt.mem_cache.common import (  # F1
     cap_above_published,
     cap_blind_gap_published,
@@ -1117,9 +1118,12 @@ def _h105d_cut_load_back_room(adder, req) -> bool:
 
     tc = adder.tree_cache
     reported = int(tc.evictable_size())
+    # PW (NF int18 1008, 12:13-12:17Z weg2-28-97): the backup wall the last short
+    # peel measured is not asked again -- the count the peel can PAY decides.
+    payable = min(reported, payable_evictable_or(tc, tc.evictable_size))
     evicted = 0
-    if reported > 0:
-        res = tc.evict(EvictParams(num_tokens=min(reported, need - available)))
+    if payable > 0 and need <= available + payable:
+        res = tc.evict(EvictParams(num_tokens=min(payable, need - available)))
         # evict() returns None on some caches (as read by H105c/H106 too)
         evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
         available = int(alloc.available_size())
@@ -1131,12 +1135,12 @@ def _h105d_cut_load_back_room(adder, req) -> bool:
         logger.info(
             "H105d FORM-A-CUT LOAD-BACK ROOM rid=%s kv_rows=%d chunk_rows=%d "
             "promised=%d need=%d available=%d evicted=%d reported_evictable=%d "
-            "rem_total_tokens=%s (n=%d): this rank cannot hold the rows this pass "
-            "allocates for it (load-back + first chunk + the pass's earlier "
-            "chunks, H110) even after evicting its shortfall; it votes NO_TOKEN "
-            "and the group's MIN keeps the request queued on every rank",
+            "payable_evictable=%d rem_total_tokens=%s (n=%d): this rank cannot hold "
+            "the rows this pass allocates for it (load-back + first chunk + the "
+            "pass's earlier chunks, H110) even after evicting what it can pay; it "
+            "votes NO_TOKEN and the group's MIN keeps the request queued on every rank",
             req.rid, kv_rows, chunk_rows, promised, need, available, evicted,
-            reported, adder.rem_total_tokens, n,
+            reported, payable, adder.rem_total_tokens, n,
         )
     return False
 

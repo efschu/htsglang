@@ -202,6 +202,9 @@ class FullComponent(TreeComponent):
                 census = _ef.census_and_repair(self.cache, ct)
                 self._peel(request, tracker)
                 _ef.log_census(census, request, got, tracker[ct], reported)
+                if tracker[ct] < request:
+                    # PW: what the tree still reports is MEASURED unpayable now
+                    _ef.note_peel_short(self.cache, ct)
 
     def _peel(self, request: int, tracker: dict[ComponentType, int]) -> None:
         heap = [

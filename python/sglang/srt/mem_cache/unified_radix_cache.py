@@ -11403,6 +11403,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         return _ef.deliverable_evictable(self, BASE_COMPONENT_TYPE)
 
+    def payable_evictable_size(self) -> int:
+        """PW (NF int18 1008): the reported FULL-evictable count minus what the
+        last short peel measured unpayable (the backup wall), on every rank --
+        the most a peel asked now can pay (mem_cache/evict_frontier_census.py)."""
+        from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+        return _ef.payable_evictable(self, BASE_COMPONENT_TYPE)
+
     def full_protected_size(self) -> int:
         return self.protected_size()
 
