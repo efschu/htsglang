@@ -5645,6 +5645,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.l3_present = True
             released += int(host_freed or 0) // P
             spilled += 1
+        if released < int(need_pages):
+            # W3-HOST-LEAF (NF int22 1008_171755: candidates=0 on all P stages;
+            # port of the 27B Q-697c spill, weg2/host_only_spill.py): when the
+            # device-resident round did not cover the claim, host-only leaves
+            # spill too (L3 copy first). Gate off: not entered.
+            from sglang.srt.weg2 import host_only_spill as _hos
+
+            if _hos.armed(self):
+                released += _hos.spill_host_only(
+                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip)["released"]
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k
         if released == 0:
