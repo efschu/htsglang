@@ -764,6 +764,15 @@ time series in VictoriaMetrics and every panel query.  Closed in three parts, ea
    `test_metric_names_must_keep_1008.py`: static scan vs the old inventory (fixture), the exporters on synthetic input (front exposition, rank gauges,
    sampler lines, /v1/loads), the engine on the old spellings, the must-keep list; no `pdflip_*` / `flliper:*` name for the same metric appears next to the old one.
 
-Left to the dashboard package (F0-F): the readers in `tools/rig_dashboard` (`server.py` reads `flliper:*` from the servers, `rigdash` reads `pdflip_*` series: both
-must read the old and the new spelling, F0-F does this for rigdash) and the generated `catalog.json` / UI texts that mention the names.
+Fix round 2 (review findings 1 and 2): a **regex head** is a metric name too.  The parser of the exposition in `rigmon/sources.py`
+(`^(sglang:[a-z_0-9]+)`) and the one of the dashboard's engine tile (`tools/rig_dashboard/server.py`, `^(sglang:[a-z_]+)` + its key map) spell the family
+as the head of a regex, which no name table lists: restored keys with a renamed regex read nothing and raise nothing.  Rule: table key `regex_heads`
+(`sglang:` directly followed by `[`, `(` or a backslash is kept; `^flliper:(cu\d+)` docker-image regexes and `sglang::` process titles are not heads),
+per-file entries `sglang:` for the two readers, `sglang:[` / `sglang:(` in the translation gate.  `server.py` is therefore NOT left to F0-F (F0-F
+does not touch it: `git diff 8aaa67e72c 33006acfb2 -- tools/rig_dashboard/server.py` is empty); `validate_544.sh` (a grep of the exposition) came back too.
+Tests: the two parsers run on a REAL exposition (`SchedulerMetricsCollector` -> `generate_latest`), a static scan for kit-spelled regex heads, the engine
+on the old text of the three files, mutants of both regexes fail the tests.
+
+Still left to the dashboard package (F0-F): `rigdash` reads `pdflip_*` series (it must read the old and the new spelling, F0-F does this) and the
+generated `catalog.json` / UI texts / READMEs that mention the names.
 

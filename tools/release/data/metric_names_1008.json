@@ -159,6 +159,9 @@
   "hicache_host_*_tokens",
   "spill_tier_*_bytes"
  ],
+ "regex_heads": [
+  "sglang:"
+ ],
  "weg2_global": [
   "weg2_awake",
   "weg2_d_seats",
@@ -195,6 +198,9 @@
   ],
   "python/sglang/srt/entrypoints/v1_loads.py": [
    "sglang_"
+  ],
+  "python/sglang/srt/rigmon/sources.py": [
+   "sglang:"
   ],
   "python/sglang/srt/weg2/front.py": [
    "weg2_group"
@@ -236,6 +242,9 @@
   ],
   "tools/rig_dashboard/rigdash/vmpush.py": [
    "weg2_"
+  ],
+  "tools/rig_dashboard/server.py": [
+   "sglang:"
   ]
  }
 }
