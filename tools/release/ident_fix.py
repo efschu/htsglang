@@ -105,7 +105,12 @@ if os.environ.get("IDENT_FIX_COLLISION_OK_FILE"):
     COLLISION_OK = {p: frozenset(ws) for p, ws in json.load(open(os.environ["IDENT_FIX_COLLISION_OK_FILE"])).items() if not p.startswith("_")}
 allowed = []
 
-touched = sorted({f for k in M for f in files_with(k) if in_scope(f)})
+# F0-K (M3, 09.10.2026): files whose GERMAN words are DATA, not identifiers.  The dashboard's language switch (desk/dashboard-i18n-1008, 9d3f7bed11)
+# keeps its German translation table in static/i18n_de.json: key = English source text of the page, value = the German text the page shows
+# in German.  The mechanical pass (sglang -> flliper) must reach it (a key has to equal the renamed page text), this pass must not: it would
+# turn the German values into English words (`Katalog` -> `Catalog`, `Spitze` -> `Peak`) and the German view would silently show English.
+NO_IDENT_FIX = ("tools/rig_dashboard/rigdash/static/i18n_de.json",)
+touched = sorted({f for k in M for f in files_with(k) if in_scope(f) and f not in NO_IDENT_FIX})
 # collisions: a target that already exists in a file we touch
 coll = []
 for f in touched:
