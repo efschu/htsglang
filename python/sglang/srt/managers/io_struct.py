@@ -1645,6 +1645,14 @@ class Weg2ParkRunningReqInput(BaseReq, kw_only=True):
     #: decode) at the round boundary, in the SEAT-AGE pressure shape; empty =
     #: park every running request (H91b).
     youngest: str = ""
+    #: PRIORITY LANES 1008 (L2, weg2/lanes.py): park ONLY these rids (the running requests of the lanes below
+    #: a new floor), RETAINING their span with the forced host write-through -- no sleep follows, the other
+    #: running requests decode on. Empty = park every running request (H91b). Needs SGLANG_WEG2_LANES=1.
+    rids: List[str] = []
+    #: ``"lane"``: the parked requests are held for their floor -- no 30-s awake re-queue, no #248h
+    #: capacity re-queue, no dormant hold -- until ``POST /weg2/lane_floor`` lets their lane in again.
+    #: Needs ``rids``. Empty = an ordinary park.
+    hold: str = ""
 
 
 class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
@@ -1667,6 +1675,34 @@ class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
     #: sequence up to its #59b depth -- filled by the tokenizer manager (it holds
     #: prompt + output ids; the scheduler computes nothing for it).
     weg2_seq_hash: Dict[str, str] = {}
+    #: PRIORITY LANES 1008 (L2): True when this answers a ``rids`` / ``hold`` park (a lane park): ``parked`` =
+    #: the rids that left the batch (or were already parked), ``held`` = requested rids that only wait on D
+    #: (kept back by the floor alone).
+    lane: bool = False
+    #: lane park only: {requested rid: why it was not parked}
+    lane_skipped: Dict[str, str] = {}
+
+
+class Weg2LaneFloorReqInput(BaseReq, kw_only=True):
+    """PRIORITY LANES 1008 (L2/L3, ``weg2/lanes.py`` ``RPC_LANE_FLOOR``): the front's floor -- ``POST
+    /weg2/lane_floor`` with ``{"floor": <int>, "epoch": <int>}``. Group D: its admission lets in only requests
+    with ``priority >= floor`` and re-queues the held lane parks of the lanes now let in, oldest first.
+    Needs SGLANG_WEG2_LANES=1."""
+
+    floor: int = 0
+    epoch: int = 0
+
+
+class Weg2LaneFloorReqOutput(BaseReq, kw_only=True):
+    success: bool
+    #: the floor / epoch in force on this scheduler after the call
+    floor: int = 0
+    epoch: int = 0
+    #: rids of the held lane parks this call re-queued, oldest first
+    requeued: List[str] = []
+    #: lane holds still standing
+    held: int = 0
+    message: str = ""
 
 
 class Weg2ParkWindowReqInput(BaseReq, kw_only=True):
