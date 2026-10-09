@@ -9644,6 +9644,8 @@ class Front:
                           if _asr.enabled()  # ARRIVAL-SEAT: the KV need's decode part
                           else self._acquire_short_seat(rid, est_prompt, short_refused,
                                                                uncached=remainder))
+            if seat is None:
+                self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: the provisional booking of the collect gate
             if seat is not None:
                 self._d_pf_book().grant(rid=rid, tokens=remainder, now=time.time())  # X-SUM-PRICE
                 if self.x_split:
@@ -10494,6 +10496,12 @@ class Front:
         if st["route"] == "P":
             return "P"
         if st["t_open"] is None and not self._dc_d_busy():
+            if envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+                # X-SUM-PRICE: this SHORT is served on D -- book its tokens in THIS
+                # loop turn. Booked after the seat (the caller's grant), six
+                # arrivals of one burst all read an empty book (NF int23xsum
+                # 09.10.: 6 x 5200 on an idle D, six D seats, no DECODE-COLLECT).
+                self._d_pf_book().grant(rid=rid, tokens=int(uncached or 0), now=time.time())
             return None
         now = time.time()
         st["shorts"][rid] = (now, int(uncached or 0))

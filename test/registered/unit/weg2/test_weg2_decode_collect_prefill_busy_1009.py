@@ -74,8 +74,9 @@ def test_an_idle_d_with_nothing_in_flight_still_serves_at_once(monkeypatch):
     _on(monkeypatch)
     f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
     f.tp_prefill_max_tokens = X_LIVE
-    assert asyncio.run(f._decode_collect_short("a", 6239)) is None
     assert f._dc_carried() == 0 and not f._dc_d_busy()
+    assert asyncio.run(f._decode_collect_short("a", 6239)) is None
+    assert f._dc_carried() == 6239, "served on D now: the gate booked it for the next arrival"
 
 
 def test_a_d_that_prefills_a_granted_short_is_busy(monkeypatch):
@@ -126,6 +127,26 @@ def test_the_burst_of_six_sends_five_to_p_and_keeps_one_on_d(monkeypatch):
 
     assert asyncio.run(burst()) == [None] * 5
     assert f.counters["decode_collect_release_P"] >= 1
+
+
+def test_a_simultaneous_burst_books_before_the_seat_not_after(monkeypatch):
+    """NF int23xsum metal run 09.10. (6 x 5200 on an idle D, X=6008): all six
+    arrivals read the book in the same loop turn; the grant used to be booked
+    only after the seat (the caller), so every one saw ``carried == 0``, took a
+    D seat and D prefilled 31k tokens. No manual grant here -- the gate itself
+    must book the first SHORT before the others look."""
+    _on(monkeypatch, window="0.3")
+    monkeypatch.setenv("SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S", "0")
+    f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = 6008
+
+    async def burst():
+        return await asyncio.gather(*[f._acquire_short_seat(f"s{i}", 5260, uncached=5200)
+                                      for i in range(6)])
+
+    seats = asyncio.run(burst())
+    assert sum(s is not None for s in seats) == 1, "one SHORT on D, the sum 31200 > X sends the rest to P"
+    assert f._d_pf_book().pending_tokens(now=time.time(), live={}) == 5200
 
 
 def test_switch_off_is_the_old_blind_path(monkeypatch):
