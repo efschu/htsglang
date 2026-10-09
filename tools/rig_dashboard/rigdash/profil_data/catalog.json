@@ -29577,7 +29577,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2522
+      "line": 2524
      }
     }
    },
@@ -29632,7 +29632,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2512
+    "line": 2514
    },
    "status": "harvested",
    "text": "",
@@ -29655,7 +29655,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2558
+      "line": 2560
      }
     }
    },
@@ -39184,7 +39184,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2533
+      "line": 2535
      }
     }
    },
@@ -39353,7 +39353,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2537
+      "line": 2539
      }
     }
    },
@@ -53555,7 +53555,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1701
+    "line": 1703
    },
    "status": "harvested",
    "text": "",
@@ -65103,7 +65103,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1640
+    "line": 1642
    },
    "status": "explained",
    "text": "Protection against a mutual blockade when waking D to P: two groups wait in a circle for memory room. On: the waiting part counts its own waiting from the start of the wait; the resolution (swapping the rest out to host RAM) begins after about 0.1 s instead of about 0.6 s. Off: only after the wait flag has gone up after 0.5 s. Default off (preparation/experiment, \"Default off until metal A/B\"). According to the code necessary before FLLIPER_OPT_PDFLIP_DRAFT_PARK_SKIP_UNCHANGED (is off) goes on again. Related: FLLIPER_PDFLIP_BAR1_SPILL_GRACE_S (0.1 s). Acts only for the sending side. Not verified individually on the metal. No user value recognizable.",
@@ -65728,7 +65728,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1949
+      "line": 1951
      }
     }
    },
@@ -70820,7 +70820,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3658
+      "line": 3660
      }
     }
    },
@@ -71101,7 +71101,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2053
+      "line": 2055
      }
     }
    },
@@ -71179,7 +71179,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4330
+      "line": 4332
      }
     }
    },
@@ -71287,7 +71287,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2551
+      "line": 2553
      }
     }
    },
@@ -71601,7 +71601,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2073
+    "line": 2075
    },
    "status": "harvested",
    "text": "",
@@ -71831,7 +71831,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1977
+    "line": 1979
    },
    "status": "harvested",
    "text": "",
@@ -71854,7 +71854,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2542
+      "line": 2544
      }
     }
    },
@@ -72076,7 +72076,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4310
+      "line": 4312
      }
     }
    },
@@ -72794,7 +72794,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1988
+    "line": 1990
    },
    "status": "harvested",
    "text": "",
@@ -72822,7 +72822,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1983
+    "line": 1985
    },
    "status": "harvested",
    "text": "",
@@ -72847,7 +72847,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 1100,
+    "line": 1101,
     "tree": "nf"
    },
    "status": "explained",
@@ -72861,23 +72861,23 @@
    "bare": false,
    "choices": null,
    "cost": "",
-   "default": "False",
+   "default": "True",
    "depends": [
     {
      "belegt": true,
      "calc": "text",
      "edge": "K132",
-     "effect": "The host-leaf spill works through the arena pool of the W3 spill; on hybrid boots that pool is the anchor pool of FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL (both default off) -- what it brings is freeing arena room from host-only leaves; what it costs is two linked switches.",
+     "effect": "The host-leaf spill works through the arena pool of the W3 spill; on hybrid boots that pool is the anchor pool of FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL (the host-leaf switch is on by default since the user decision of 09.10., the anchor pool is off by default) -- what it brings is freeing arena room from host-only leaves; what it costs is two linked switches.",
      "evidence": {
-      "anchor": "``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` that carries the pool) AND the local-PP",
+      "anchor": "``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` carries, default off) AND the local-PP",
       "aufloesung": "other_line",
       "file": "python/flliper/srt/pdflip/host_only_spill.py",
-      "row_note": 32,
-      "zeile": 32
+      "row_note": 33,
+      "zeile": 33
      },
      "quelle": "catalog",
      "rel": "requires",
-     "satz": "The host-leaf spill works through the arena pool of the W3 spill; on hybrid boots that pool is the anchor pool of FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL (both default off) -- what it brings is freeing arena room from host-only leaves; what it costs is two linked switches.",
+     "satz": "The host-leaf spill works through the arena pool of the W3 spill; on hybrid boots that pool is the anchor pool of FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL (the host-leaf switch is on by default since the user decision of 09.10., the anchor pool is off by default) -- what it brings is freeing arena room from host-only leaves; what it costs is two linked switches.",
      "to": "FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL",
      "to_kind": "env",
      "trees": [
@@ -72888,7 +72888,7 @@
    ],
    "gain": "A full KV arena can free room from host-only leaves.",
    "group": "Other",
-   "help": "W3-HOST-LEAF (NF int22, P 18:33:37-18:34:20Z, boot 1008_171755): the W3 spill found candidates=0 on all three stages -- it releases only host copies of device-resident nodes; the full KV arena freed nothing for a claim (ARENA-DROP freed=0). On (local-PP floor only, as UD-H): the 27B line's Q-697c host-only spill, ported (pdflip/host_only_spill.py): host-only H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257), then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs the spill's arena pool (on hybrid boots FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL). Off = the old spill.",
+   "help": "W3-HOST-LEAF (NF int22, P 18:33:37-18:34:20Z, boot 1008_171755): the W3 spill found candidates=0 on all three stages -- it releases only host copies of device-resident nodes; the full KV arena freed nothing for a claim (ARENA-DROP freed=0). On (local-PP floor only, as UD-H): the 27B line's Q-697c host-only spill, ported (pdflip/host_only_spill.py): host-only H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257), then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs the spill's arena pool (on hybrid boots FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL). Default on (user decision 09.10.); 0 = the old spill.",
    "id": "FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES",
    "kind": "env",
    "level": "expert",
@@ -72899,7 +72899,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 1088,
+    "line": 1089,
     "tree": "nf"
    },
    "status": "explained",
@@ -73402,7 +73402,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1219
+      "line": 1221
      }
     }
    },
@@ -73456,7 +73456,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1222
+    "line": 1224
    },
    "status": "harvested",
    "text": "",
@@ -75296,7 +75296,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4430
+      "line": 4432
      }
     }
    },
@@ -77124,11 +77124,11 @@
    "bare": false,
    "choices": null,
    "cost": "",
-   "default": "False",
+   "default": "True",
    "depends": [],
    "gain": "A full anchor arena can make room without losing an anchor (the next reader takes it from the store).",
    "group": "Other",
-   "help": "MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D mamba anchor arena (32 slots, 6 staging) held only END and deepest anchors, so the flush / park-first spill found victim=none (`#1427 ARENA-DROP ... slot_bytes=58834944 freed=0` x59, `PDFLIP-ANCHOR-LOST at=flush n=15` incl. the END anchor 112896 of the parked pdflip-24-128). On: with no victim by the old rules, the shallowest settled END/deepest anchor OFF the claimer's park chain is secured to L3 first (arena_secure_to_disk) and then released -- never one whose copy could not be secured. Off = the old answer, byte for byte.",
+   "help": "MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D mamba anchor arena (32 slots, 6 staging) held only END and deepest anchors, so the flush / park-first spill found victim=none (`#1427 ARENA-DROP ... slot_bytes=58834944 freed=0` x59, `PDFLIP-ANCHOR-LOST at=flush n=15` incl. the END anchor 112896 of the parked pdflip-24-128). On: with no victim by the old rules, the shallowest settled END/deepest anchor OFF the claimer's park chain is secured to L3 first (arena_secure_to_disk) and then released -- never one whose copy could not be secured. Default on (user decision 09.10.); 0 = the old answer, byte for byte.",
    "id": "FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT",
    "kind": "env",
    "level": "expert",
@@ -77139,7 +77139,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 1110,
+    "line": 1112,
     "tree": "nf"
    },
    "status": "explained",
@@ -77445,7 +77445,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4239
+      "line": 4241
      }
     }
    },
@@ -78006,7 +78006,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2418
+    "line": 2420
    },
    "status": "explained",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -78155,7 +78155,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1895
+    "line": 1897
    },
    "status": "harvested",
    "text": "",
@@ -78212,7 +78212,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1918
+    "line": 1920
    },
    "status": "harvested",
    "text": "",
@@ -81174,7 +81174,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1678
+      "line": 1680
      }
     }
    },
@@ -84643,7 +84643,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4417
+      "line": 4419
      }
     }
    },
@@ -85374,7 +85374,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4623,
+    "line": 4625,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -85402,7 +85402,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4622,
+    "line": 4624,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85430,7 +85430,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 1970,
+    "line": 1972,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85458,7 +85458,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2193,
+    "line": 2195,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85518,7 +85518,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2202,
+    "line": 2204,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85546,7 +85546,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2207,
+    "line": 2209,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85720,15 +85720,15 @@
   "curated": 119,
   "unexplained": 602
  },
- "tree_rev": "27b=77e8694871+nf=077bfc2f56",
+ "tree_rev": "27b=9a213225d8+nf=97f3fda8a1",
  "trees": {
   "27b": {
    "entries": 2642,
-   "rev": "77e8694871"
+   "rev": "9a213225d8"
   },
   "nf": {
    "entries": 2506,
-   "rev": "077bfc2f56"
+   "rev": "97f3fda8a1"
   }
  },
  "warnungen": []
