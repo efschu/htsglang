@@ -455,6 +455,10 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vt-big { flex: 1; display: flex; align-items: center; font-size: 34px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .vt-big small { font-size: 14px; font-weight: 400; color: var(--text-2); margin-left: 4px; }
+.vt-bs { flex: 1; display: grid; grid-template-columns: repeat(6, 1fr); gap: 0 4px; align-content: center; }
+.vt-bsc { min-width: 0; text-align: center; } .vt-bsc b { display: block; font-size: 17px; font-weight: 650; line-height: 1.2; }
+.vt-bsk { display: flex; align-items: center; justify-content: center; gap: 3px; font-size: 11px; color: var(--text-2); white-space: nowrap; }
+.vt-bsk i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
 .vt-gauge { flex: 1; min-height: 0; width: 100%; }
 .vt-gv { fill: var(--text); font: 650 11px system-ui, sans-serif; }
 .vt-f { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-width: 0; }
@@ -611,8 +615,8 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
     <div class="vgrid">
       <div class="vp w2"><h3><span>User TTFT <span class="muted">s &middot; arrival at the front &rarr; first content from D, mean of the requests per bucket &middot; from VictoriaMetrics (PromQL)</span></span><span id="vl-s-ttft"></span></h3><div class="u" id="vl-c-ttft"></div></div>
       <div class="vp"><h3><span>Prefill throughput <span class="muted">tok/s &middot; P and D, per chunk</span></span><span id="vl-s-pre"></span></h3><div class="u" id="vl-c-pre"></div></div>
-      <div class="vp"><h3><span>Decode throughput <span class="muted">tok/s &middot; all streams and per stream</span></span><span id="vl-s-dec"></span></h3><div class="u" id="vl-c-dec"></div></div>
-      <div class="vp"><h3><span>Input tokens: from cache / recomputed <span class="muted">tok/s, stacked &middot; handoff P&rarr;D dashed, never cache</span></span><span id="vl-s-cache"></span></h3><div class="u" id="vl-c-cache"></div></div>
+      <div class="vp"><h3><span>Decode throughput <span class="muted">tok/s &middot; all streams, and per batch size bs 1 &hellip; 6 (only time at exactly that size)</span></span><span id="vl-s-dec"></span></h3><div class="u" id="vl-c-dec"></div></div>
+      <div class="vp"><h3><span>Input tokens of the prefill in progress <span class="muted">tokens, stacked &middot; blue = from cache, constant from the start of the request &middot; green = newly prefilled so far, rises on top &middot; handoff P&rarr;D amber, never cache</span></span><span id="vl-s-cache"></span></h3><div class="u" id="vl-c-cache"></div></div>
       <div class="vp"><h3><span>KV cache occupancy <span class="muted">% of the KV tokens per group</span></span><span id="vl-s-kv"></span></h3><div class="u" id="vl-c-kv"></div></div>
       <div class="vp w2"><h3><span>Flip time per flip <span class="muted">s &middot; P&rarr;D: last P chunk done &rarr; first decode token produced &middot; D&rarr;P: last decode token produced &rarr; first prefill chunk starts computing &middot; counted flips only (user 06.10.)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
     </div>
