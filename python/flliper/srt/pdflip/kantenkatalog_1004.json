@@ -399,7 +399,7 @@
      "satz": "Under --x-mode curve, --x-ceiling-tokens limits X from above; D's W50 latch is the lower value of the envelope of the curves and this upper limit (the curve decides below).",
      "evidence": {"file": "python/flliper/srt/pdflip/launcher.py", "zeile": 23018, "anchor": "D's W50 riegel = the LOWER of the curves' envelope and"}},
     {"id": "K132", "von": "FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES", "nach": "FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL", "rel": "requires", "calc": "text", "value": null,
-     "satz": "The host-leaf spill works through the arena pool of the W3 spill; on hybrid boots that pool is the anchor pool of FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL (both default off) -- what it brings is freeing arena room from host-only leaves; what it costs is two linked switches.",
-     "evidence": {"file": "python/flliper/srt/pdflip/host_only_spill.py", "zeile": 32, "anchor": "``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` that carries the pool) AND the local-PP"}, "trees": ["nf"]}
+     "satz": "The host-leaf spill works through the arena pool of the W3 spill; on hybrid boots that pool is the anchor pool of FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL (the host-leaf switch is on by default since the user decision of 09.10., the anchor pool is off by default) -- what it brings is freeing arena room from host-only leaves; what it costs is two linked switches.",
+     "evidence": {"file": "python/flliper/srt/pdflip/host_only_spill.py", "zeile": 33, "anchor": "``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` carries, default off) AND the local-PP"}, "trees": ["nf"]}
   ]
 }
