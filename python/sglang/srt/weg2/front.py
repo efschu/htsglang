@@ -167,6 +167,8 @@ from sglang.srt.weg2 import session_trace as _st  # SESSION-TRACE: session hash 
 # DASHBOARD-IPC 01.10. (stdlib only, imported HERE: no first import on the loop, weg2rc2)
 from sglang.srt.weg2 import front_requests as _frq  # front.flip / d_activity / ttft_by_via / request_done
 from sglang.srt.weg2 import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
+from sglang.srt.weg2 import d_prefill_inflight as _dpf  # X-SUM-PRICE on the arrival path
+from sglang.srt.weg2 import sum_price as _sp  # X-SUM-PRICE: the one rule
 
 logger = logging.getLogger("weg2.front")
 
@@ -4123,22 +4125,12 @@ def _decode_collect_window_s() -> float:
 
 
 def _sum_priced_take(entries: List["Pending"], *, carried: int, limit: int) -> Tuple[List["Pending"], List["Pending"]]:
-    """X-SUM-PRICE: X bounds what D prefills IN TOTAL. Take the queued SHORTs
-    oldest first while ``carried`` (already waiting for D) plus the taken
-    ``est_uncached`` stay within ``limit``; the rest is returned as kept back
-    (it stays queued, the flip to P takes it). The first entry is taken when
-    nothing is carried (its own price already passed X)."""
-    taken: List["Pending"] = []
-    kept: List["Pending"] = []
-    total = int(carried)
-    for p in sorted(entries, key=lambda e: float(e.t_arrive)):
-        u = int(p.est_uncached or 0)
-        if total + u <= int(limit):
-            taken.append(p)
-            total += u
-        else:
-            kept.append(p)
-    return taken, kept
+    """X-SUM-PRICE for the queued SHORTs: oldest first while ``carried`` plus
+    the taken ``est_uncached`` stay within ``limit`` (the one rule:
+    ``sum_price``); the rest stays queued, the flip to P takes it."""
+    return _sp.take_oldest_first(entries, tokens_of=lambda p: p.est_uncached,
+                                 arrived_of=lambda p: float(p.t_arrive),
+                                 carried=carried, limit=limit)
 
 
 class Front:
@@ -9653,6 +9645,7 @@ class Front:
                           else self._acquire_short_seat(rid, est_prompt, short_refused,
                                                                uncached=remainder))
             if seat is not None:
+                self._d_pf_book().grant(rid=rid, tokens=remainder, now=time.time())  # X-SUM-PRICE
                 if self.x_split:
                     self._note_x_grant(
                         rid, self._x_band_floor() if _x_busy_at_grant else x_route,
@@ -10036,7 +10029,7 @@ class Front:
                     and 0 <= int(p.est_uncached) <= x_idle):
                 return "none"
         total = sum(int(p.est_uncached) for p in self.queue)
-        if total > x_idle:
+        if not _sp.fits(carried=0, tokens=total, limit=x_idle):
             return "none"
         if self._d_holds_work():
             return "none"  # D decodes: no flip happens anyway; re-evaluated when it ends
@@ -10335,6 +10328,44 @@ class Front:
         D = self.groups.get("D") if isinstance(self.groups, dict) else None
         return bool(D is not None and self._flip_ledger(D))
 
+    def _d_pf_book(self) -> "_dpf.DPrefillInflight":
+        return self.__dict__.setdefault("_d_pf", _dpf.DPrefillInflight())
+
+    def _d_inflight_tokens(self) -> int:
+        """The uncached tokens D has been granted to prefill as SHORT and has
+        not finished (no first content yet). DECODE-COLLECT used to look only
+        at D's DECODES, so a burst arriving on an idle D went in one by one --
+        each under X, 37k together (NF y6 09.10.). Switch off: 0."""
+        book = self.__dict__.get("_d_pf")  # created by the first SHORT grant
+        if book is None or not envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+            return 0
+        if not (self.awake == "D" and self.state == "serving"):
+            return 0
+        D = self.groups.get("D") if isinstance(self.groups, dict) else None
+        if D is None:
+            return 0
+        return book.pending_tokens(now=time.time(), live=D.outstanding)
+
+    def _d_carried_tokens(self) -> int:
+        """X-SUM-PRICE (user 05.10. "pending token werden gesammelt und als
+        SUMME bepreist"): what D already has to prefill -- requests handed to
+        D and not started, plus granted SHORTs still prefilling. THE one
+        ``carried`` every sum check (``sum_price.fits``) starts from."""
+        handed = sum(int(getattr(r, "est_uncached", 0) or 0)
+                     for r in self._ready_for_d if getattr(r, "d_direct", False))
+        return handed + Front._d_inflight_tokens(self)
+
+    def _dc_carried(self) -> int:
+        """DECODE-COLLECT's ``carried``: with the arrival-path switch off it
+        is 0 (the collected set is priced alone, as before)."""
+        if not envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+            return 0
+        return self._d_carried_tokens()
+
+    def _dc_d_busy(self) -> bool:
+        """D decodes, or prefills a granted SHORT: the arrivals collect."""
+        return self._dc_decoding() or self._dc_carried() > 0
+
     def _dc_st(self) -> dict:
         st = self.__dict__.setdefault("_dc_state", {"epoch": None})
         if st.get("epoch") != self.epoch:
@@ -10358,15 +10389,18 @@ class Front:
             live_q = [p for p in self.queue if not p.fut.done()]
         fresh = [p for p in live_q if float(getattr(p, "t_arrive", now) or now) > st["t_rel"]]
         if st["t_open"] is None:
-            if not (fresh or st["shorts"]) or not self._dc_decoding():
+            if not (fresh or st["shorts"]) or not self._dc_d_busy():
                 return None
             ts = [float(getattr(p, "t_arrive", now) or now) for p in fresh] + [t for t, _ in st["shorts"].values()]
             st["t_open"] = min(ts) if ts else now
         x_tok = int(self.tp_prefill_max_tokens)
         unc = [int(getattr(p, "est_uncached", 0) or 0) for p in fresh] + [u for _, u in st["shorts"].values()]
-        n, tokens = len(unc), sum(unc)
+        n = len(unc)
+        carried = self._dc_carried()  # X-SUM-PRICE: what D still prefills counts
+        tokens = sum(unc) + carried
+        set_fits = _sp.fits(carried=carried, tokens=sum(unc), limit=x_tok)
         waited = max(0.0, now - st["t_open"])
-        decoding = self._dc_decoding()
+        decoding = self._dc_d_busy()
         p_bound = any(phase_policy.immediate_park_trigger([p], x_tok) is not None
                       or bool(getattr(p, "p_only", False)) for p in fresh)
         try:
@@ -10375,7 +10409,7 @@ class Front:
             dcheck = 0.0
         stage = "window" if decoding else "d-idle"
         if waited < win and decoding:
-            if 0.0 < dcheck < win and waited >= dcheck and not p_bound and tokens <= x_tok:
+            if 0.0 < dcheck < win and waited >= dcheck and not p_bound and set_fits:
                 stage = "dcheck"  # a small set: D prefills it now
             else:
                 if 0.0 < dcheck < win and waited >= dcheck and st.get("dcheck_wid") != st["wid"]:
@@ -10393,7 +10427,7 @@ class Front:
         if stage == "window" and 0.0 < dcheck < win:
             route = "P"  # user ~19:13Z: "ansonsten wartet er auf die 15er grenze und flippt"
         else:
-            route = "P" if (p_bound or tokens > x_tok) else "D"
+            route = "P" if (p_bound or not set_fits) else "D"
         st.update(route=route, t_rel=now, t_open=None, shorts={}, wid=st["wid"] + 1,
                   rel_rids=[p.rid for p in fresh])  # route D: the set _dc_hand_to_d moves
         self.counters["decode_collect_release_" + route] += 1
@@ -10459,7 +10493,7 @@ class Front:
         st = self._dc_st()
         if st["route"] == "P":
             return "P"
-        if st["t_open"] is None and not self._dc_decoding():
+        if st["t_open"] is None and not self._dc_d_busy():
             return None
         now = time.time()
         st["shorts"][rid] = (now, int(uncached or 0))
@@ -10495,10 +10529,12 @@ class Front:
         cands = sorted((p for p in self.queue if p.rid in rel and not p.fut.done()),
                        key=lambda p: float(_g(p, "t_arrive", now) or now))
         moved, total = [], 0
+        carried0 = self._dc_carried()
         for p in cands:
             u = int(_g(p, "est_uncached", 0) or 0)
             if (_g(p, "p_only", False) or _g(p, "intake_stalled", False) or _g(p, "leg1_done", False)
-                    or _g(p, "reroutes", 0) or _g(p, "x_requeues", 0) or u < 0 or total + u > x):
+                    or _g(p, "reroutes", 0) or _g(p, "x_requeues", 0) or u < 0
+                    or not _sp.fits(carried=carried0 + total, tokens=u, limit=x)):
                 continue
             total += u
             moved.append(p)
@@ -11341,7 +11377,7 @@ class Front:
         # passed X=12288 alone and D prefilled 36.7k of fresh text (44k in that
         # minute) -- the very sum DECODE-COLLECT sends to P. Oldest first up to X
         # (counting what already waits for D); the rest stays queued for P.
-        carried = sum(int(_g(r, "est_uncached", 0) or 0) for r in self._ready_for_d if _g(r, "d_direct", False))
+        carried = Front._d_carried_tokens(self)
         moved, kept_back = _sum_priced_take(eligible, carried=carried, limit=x)
         if kept_back:
             self.counters["arrival_seat_queue_sum_kept"] += len(kept_back)
@@ -12173,6 +12209,7 @@ class Front:
                            rid, max(0.0, time.time() - pending.t_arrive) if pending is not None else 0.0)
             return web.json_response({"error": f"WEG2-CLIENT-GONE rid={rid} state=pre-d"}, status=499)
         g.outstanding[rid] = time.time()
+        self._d_pf_book().enter_leg2(rid=rid)  # X-SUM-PRICE: D holds the grant now
         # #1289 round 2: THE SOLO WITNESS for the r_D sample below. `r_D` is
         # D's PREFILL rate -- tokens over the wall of a prefill D ran ALONE --
         # so what qualifies a sample is CONCURRENCY, not a pricing verdict.
@@ -12391,6 +12428,7 @@ class Front:
                 _fc: Dict[str, Optional[float]] = {"t": None, "arr": None}  # USAGE-DETAILS: ttft_s
                 if _has_content:
                     _adm[2] = time.time()  # USAGE-DETAILS: D's prefill of this leg is done
+                    self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: first content = prefill over
                     # #49 rest, INSTRUMENT (routing unchanged): D's first
                     # content for this leg. Joined by rid with the
                     # ROUTE-VERDICT line (the arrival), it is the
@@ -12908,6 +12946,7 @@ class Front:
         finally:
             if _adm[2] is None:
                 _adm[2] = time.time()  # USAGE-DETAILS: a leg without content ends its window here
+            self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: a non-stream leg ends here too
             g.outstanding.pop(rid, None)
             (self.__dict__.get("_d_prefill_legs") or {}).pop(rid, None)  # PARK-HANDBACK
             self._d_inflight_end(rid)  # X-CREDIT-INFLIGHT-1002
@@ -15800,7 +15839,7 @@ class Front:
         # sum at once, so it is capped at X as well as at N -- the X IN FORCE,
         # which the live re-solve moves during a boot. The launcher refuses
         # N > X at launch (W153); this riegel holds whatever the flags say.
-        if total > min(n_max, x):
+        if not _sp.fits(carried=self._d_carried_tokens(), tokens=total, limit=min(n_max, x)):
             if total <= n_max:
                 self.counters["d_short_drain_x_capped"] += 1
             return 0
