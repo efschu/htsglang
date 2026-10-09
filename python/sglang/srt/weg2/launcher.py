@@ -12777,7 +12777,7 @@ def choose_host_ledger(
     # flip arm -- no flip ratchet, no dormant group, no P host pools. False is
     # byte-identical to every flip boot.
     d_only: bool = False,
-
+    vision_victim_host_gib: float = 0.0,  # VISION-WEIGHTS AP4: transient host image of the displaced weights (printed post, in no ledger sum, warning only); LAST
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -13015,7 +13015,7 @@ def choose_host_ledger(
         # H25: the parked D draft's pinned host image (ledger post
         # 'd_draft_host'), priced by `d_draft_park_term` -- one kwargs block,
         # so the pinned arm and the ladder price the same post.
-        d_draft_host_gib=float(d_draft_host_gib),
+        d_draft_host_gib=float(d_draft_host_gib), vision_victim_host_gib=float(vision_victim_host_gib),  # AP4: displaced weights (printed post only)
         # rc12d: the torch allocation history (weg2/memhist.py) -- 5.4 GiB of
         # host nobody booked when it was armed from rank start in P and D.
         memhist_gib=float(memhist_gib), memhist_run_only=bool(memhist_run_only),
@@ -23964,7 +23964,10 @@ def build_parser() -> argparse.ArgumentParser:
              "(27B flip: MLP storages; dual: only the hull parts D does not share); "
              "the victim bytes go to a host image (freed after every image) and come "
              "back with a device checksum before the admission -- a mismatch stops "
-             "the group (W110c). No KV page, no free VRAM, always synchronous.",
+             "the group (W110c). No KV page, no free VRAM, always synchronous. "
+             "`kvtail` or `auto` TOLD on the command line together with --dual-layout "
+             "is refused (W111): the dual P pool is born trimmed to 0 tokens, so the "
+             "dual's place is `weights`.",
     )
     ap.add_argument(
         # #1356: see VISION_OFF. Default `off` = P and D boot TEXT-ONLY.
@@ -24905,6 +24908,92 @@ def d_park_split_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Opt
             "SGLANG_WEG2_D_PARK_IMMEDIATE off" % (front_src, d_src))
 
 
+#: VISION-SYNC LAW (user 02.10. ~08:00Z, both lines; ported from the NF line c651892375 launcher.py:24175-24205 by VISION-WEIGHTS AP4): the
+#: switches that would let a vision stage outlive its pass (weg2/vision_rank_runner: the async stage and its PP0 row term). Either one ON is
+#: refused at launch, by name. On the 27B line the runner's default is the async stage (vision_rank_runner.vision_async_on, default ON): only an
+#: EXPLICIT on is refused here, an unset switch is the old default path and stays unchanged; ``--weg2-vision-place weights`` is synchronous
+#: always (vision_rank_runner.arm_victims refuses the async switch at arming too).
+VISION_ASYNC_SWITCHES: Tuple[str, ...] = (
+    "SGLANG_WEG2_VISION_ASYNC",
+    "SGLANG_WEG2_P_ROW_VISION_ASYNC",
+)
+VISION_SYNC_LAW = (
+    "VISION-SYNC LAW (user 02.10. ~08:00Z, both lines): vision runs ONLY synchronously, BEFORE "
+    "the real prefill; spare VRAM goes to MoE experts (NF) and to the L15 cache (27B), never "
+    "to a vision tower that sits there across passes")
+
+
+def vision_async_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """VISION-SYNC LAW: the refusal line when :data:`VISION_ASYNC_SWITCHES` are
+    set ON in the launcher's own environment (which build_env and the front
+    inherit) or in ``--env-p`` / ``--env-d``; None when every one is unset or
+    off (an explicit 0/false/no/off is the law's own value and passes). Any
+    spelling of a switch's rename family counts."""
+    env = dict(os.environ if environ is None else environ)
+    scopes = (
+        ("launcher env", env),
+        ("--env-p", parse_group_env(str(getattr(ns, "env_p", "") or ""))),
+        ("--env-d", parse_group_env(str(getattr(ns, "env_d", "") or ""))),
+    )
+    hits: List[str] = []
+    for where, scope in scopes:
+        for name in VISION_ASYNC_SWITCHES:
+            raw = weg2_form._explicit_env(scope, name)
+            if raw is not None and raw.lower() not in ("0", "false", "no", "off"):
+                hits.append(f"{where} {name}={raw}")
+    if not hits:
+        return None
+    return ("WEG2 VISION-ASYNC refused: %s -- %s. Set it 0 (27B line: an UNSET SGLANG_WEG2_VISION_ASYNC is the async stage, "
+            "vision_rank_runner.vision_async_on default ON; NF line: unset = sync)" % (", ".join(hits), VISION_SYNC_LAW))
+
+
+#: VISION-WEIGHTS AP4 (plan PLAN-VISION-GEWICHTE-VERDRAENGEN-1009 section 8): the places that are guaranteed broken in the dual layout. The tower
+#: of kvtail needs free KV-tail pages and the dual P pool is born trimmed to 0 tokens (weg2/dual_p_kv_stage.py:1-25), so ``reserve_tail_pages``
+#: returns None (weg2/vision_rank_stage.py:117-129); ``auto`` resolves to kvtail first. ``weights`` is the place of the dual.
+VISION_PLACES_BROKEN_IN_DUAL: Tuple[str, ...] = ("kvtail", VISION_PLACE_AUTO)
+W111_VISION_PLACE_DUAL = "W111 Weg2VisionArmRefused"
+
+
+def vision_place_dual_refusal(ns, argv: Optional[Sequence[str]] = None) -> Optional[str]:
+    """VISION-WEIGHTS AP4: ``--weg2-vision-place kvtail|auto`` told on the command line together with ``--dual-layout`` (and the transient tower) is
+    refused by name -- the dual P pool has no KV-tail page to lend, so the first image would be refused at request time (W105). Only a place that
+    was TOLD counts (``bs_source``: the argv, not a comparison with the default): a profile that does not name the place keeps the old default path
+    byte for byte (text-only serving works, the golden dry runs are unchanged); the place for the dual is ``weights``. None = consistent."""
+    if not bool(getattr(ns, "dual_layout", False)):
+        return None
+    if str(getattr(ns, "weg2_vision", VISION_OFF)) != VISION_TRANSIENT:
+        return None
+    place = str(getattr(ns, "weg2_vision_place", VISION_PLACE_AUTO) or VISION_PLACE_AUTO)
+    if place not in VISION_PLACES_BROKEN_IN_DUAL or bs_source("--weg2-vision-place", argv) != "flag":
+        return None
+    return (f"{W111_VISION_PLACE_DUAL}: --weg2-vision-place {place} with --dual-layout: the dual P pool is born trimmed to 0 tokens "
+            "(weg2/dual_p_kv_stage.py), so the tower has no KV-tail page to lend and the first image request would be refused (W105). "
+            "Use --weg2-vision-place weights (the tower borrows weight memory of PP0, only the hull parts that are not D's shard) "
+            "or leave --weg2-vision-place unset")
+
+
+def vision_victim_host_term(ns) -> Tuple[float, str]:
+    """VISION-WEIGHTS AP4: ``(MiB, provenance)`` of the host image of the displaced weights (ledger post ``vision_victim_host``).
+
+    Non-zero only with ``--weg2-vision transient`` + ``--weg2-vision-place weights`` on a dense (27B) form: the victim bytes (= the tower bytes,
+    plan section 2) wait in an anonymous pageable host image while one image is encoded and are freed after the give-back (TRANSIENT, 0 between
+    images). NF (experts): 0, the victim rows have their copy in the expert store. A tower size that cannot be read is said (0 MiB, unmeasured),
+    never guessed. HOST RAM IS A WARNING ONLY (user rule 2026-10-06): this term never refuses."""
+    from sglang.srt.weg2 import vision_victim_plan as _vvp
+
+    if not _vvp.active(getattr(ns, "weg2_vision", VISION_OFF), getattr(ns, "weg2_vision_place", VISION_PLACE_AUTO)):
+        return 0.0, "none (--weg2-vision-place is not 'weights')"
+    form = getattr(ns, "weg2_boot_form", None)
+    if getattr(form, "arch", None) == "moe":
+        return 0.0, "none (victim = resident expert rows; their copy is in the expert store, already booked)"
+    nbytes, src = _vvp.tower_bytes_from_checkpoint(str(getattr(ns, "model", "") or ""))
+    if nbytes is None:
+        return 0.0, f"UNMEASURED ({src})"
+    kind = _vvp.KIND_PP_ONLY if bool(getattr(ns, "dual_layout", False)) else _vvp.KIND_DENSE
+    return nbytes / (1 << 20), (f"victim={kind}: the tower bytes wait in a pageable host image per image request, freed after the give-back "
+                                f"({src}); transient, 0 between images; printed only, in no ledger sum")
+
+
 def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
     """H91b/H95 (Nutzer-Design 25.09.): ``--profile nextflash`` without an
     explicit ``--d-bs`` runs D with up to ``DEFAULT_D_BS_NEXTFLASH`` (6) seats
@@ -25075,6 +25164,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if _park_split:
             print(_park_split, flush=True)
             raise SystemExit(_park_split)
+        _vis_async = vision_async_refusal(ns)  # VISION-SYNC LAW (user 02.10.), ported from the NF line
+        if _vis_async:
+            print(_vis_async, flush=True)
+            raise SystemExit(_vis_async)
     # VRAM-VERTRAG M1: the profile's hand pins, read before any solver
     # publishes into --extra-*/--env-* (every one is planner debt: OVERRIDE)
     from sglang.srt.weg2 import vram_plan_view as _vpv
@@ -25201,6 +25294,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # evidence dir that a LATER boot's ingest would pick up -- the stale
         # dump problem, manufactured by the instrument itself.
         return teardown(ns.teardown)
+    # VISION-WEIGHTS AP4: a place that is guaranteed broken in the dual layout is refused by name, here at the verdict site (parse side; no
+    # computing core). After resolve_dual_layout (--dual-share implies --dual-layout), after the teardown branch.
+    _vis_place_dual = vision_place_dual_refusal(ns, list(sys.argv[1:] if argv is None else argv))
+    if _vis_place_dual:
+        print(_vis_place_dual, flush=True)
+        raise SystemExit(_vis_place_dual)
     # Arm the complement instrument in the LAUNCHER's own process too. The
     # rank processes never import this module, so without this the ingest
     # could only ever print NO-OBSERVATION for `launcher.py` -- an honest
@@ -25265,6 +25364,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # H25 (C): what D's parked draft holds in pinned host RAM -- a desk fact,
     # refused (W128) before any sweep or launch when it cannot be priced.
     d_draft_host_mib, d_draft_host_prov = d_draft_park_term(ns, draft_on_p)
+    # VISION-WEIGHTS AP4: the host image of the displaced weights (ledger post vision_victim_host); a WARNING only, never a refusal
+    vision_victim_host_mib, vision_victim_host_prov = vision_victim_host_term(ns)
     # #1032 RESOLVED HERE, BEFORE THE SWEEPS, THE STORE AND ANY LAUNCH: a
     # retracted token vector is a desk fact, and the whole point of W46 is that
     # it must not cost a boot window -- nor a mount, nor an shm sweep -- to
@@ -26051,6 +26152,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         draft_kv_on_p, draft_on_p_prov,
         [] if draft_kv_on_p else strip_speculative_flags(shlex.split(ns.extra_p))[1]))
     log(f"WEG2-HOST d_draft_host={d_draft_host_mib:.0f} MiB -- {d_draft_host_prov}")
+    if vision_victim_host_prov and not vision_victim_host_prov.startswith("none (--weg2-vision-place"):
+        # only with --weg2-vision-place weights: the default boots print nothing new (golden dry runs byte-equal)
+        log(f"WEG2-HOST vision_victim_host={vision_victim_host_mib:.0f} MiB -- {vision_victim_host_prov}")
+        if vision_victim_host_mib > 0:
+            log("WEG2 VISION-VICTIM host-RAM WARNING (never a refusal, user rule 2026-10-06): --weg2-vision-place weights holds "
+                f"{vision_victim_host_mib:.0f} MiB of displaced weights in host RAM while one image is encoded (transient, 0 afterwards)")
     if p_prefill_graph_bucket():
         # Only when on: the default boot's front log stays byte-identical.
         log(p_prefill_graph_line())
@@ -26635,6 +26742,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ring_plan.host_weights_bytes,
             ring_plan.host_weights_span1_bytes, ring_plan.provenance,
             d_draft_host_gib=d_draft_host_mib / 1024.0,
+            vision_victim_host_gib=vision_victim_host_mib / 1024.0,
             memhist_gib=_memhist_gib, memhist_run_only=_memhist_run_only,
             l3_index_gib=_l3_index_gib,
             cold_tier_shm_gib=_cold_tier_shm_gib,

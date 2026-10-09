@@ -88,10 +88,10 @@
      "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 4095, "anker": "X CEILING: --x-ceiling-tokens"}},
     {"id": "K28", "von": "--d-short-drain-tokens", "nach": "--tp-prefill-max-tokens", "rel": "skaliert_mit", "calc": "text", "wert": null,
      "satz": "The drain may not exceed the X that this start grants -- more is refused by name with W153, never silently capped.",
-     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 25461, "anker": "refuse_short_drain_above_x(int(ns.d_short_drain_tokens"}},
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 25570, "anker": "refuse_short_drain_above_x(int(ns.d_short_drain_tokens"}},
     {"id": "K29", "von": "--d-short-drain-tokens", "nach": "--d-hold-s", "rel": "skaliert_mit", "calc": "text", "wert": null,
      "satz": "Both operating point values are checked together: negative is turned away, 0 or unset is off.",
-     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 25458, "anker": "both must be >= 0"}},
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 25567, "anker": "both must be >= 0"}},
     {"id": "K30", "von": "--p-chunk-policy", "nach": "--p-chunk-max", "rel": "braucht", "calc": "text", "wert": "dynamic",
      "satz": "Under 'dynamic' the policy reads --p-chunk-max as the plan upper limit; below the graph bucket the start is turned away.",
      "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 1391, "anker": "it is the plan's CEILING (--p-chunk-max)"}},
@@ -142,7 +142,7 @@
      "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 5341, "anker": "F14-FREI"}},
     {"id": "K46", "von": "--d-tp-objective", "nach": "--rank-tp-ratio", "rel": "abgeleitet_von", "calc": "text", "wert": null,
      "satz": "The target together with D's budget decides D's rank TP split -- whoever wants D's distribution changes the target, not the vector.",
-     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 27340, "anker": "p_split=p_split, chunk_layers=chunk_layers)\n        d_ratio = d_tp_ratio_decision("}},
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 27456, "anker": "p_split=p_split, chunk_layers=chunk_layers)\n        d_ratio = d_tp_ratio_decision("}},
     {"id": "K47", "von": "--profile", "nach": "PROFILE_LINE", "rel": "skaliert_mit", "calc": "text", "wert": null,
      "satz": "The profile line must match the image line, otherwise the entrypoint refuses with PROFILE -- an NF profile on a 27b image is not a boot.",
      "beleg": {"datei": "/spinning/gpu-arb/docker/entrypoint.sh", "zeile": 304, "anker": "Profil-Linie"}},
@@ -397,6 +397,15 @@
      "beleg": {"datei": "python/sglang/srt/weg2/x_curves.py", "zeile": 568, "anker": "raise XCurvesRefused(W_X_MODE_IN_DUAL, ("}, "baeume": ["27b"]},
     {"id": "K131", "von": "--x-mode", "nach": "--x-ceiling-tokens", "rel": "skaliert_mit", "calc": "text", "wert": null,
      "satz": "Under --x-mode curve, --x-ceiling-tokens limits X from above; D's W50 latch is the lower value of the envelope of the curves and this upper limit (the curve decides below).",
-     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 23018, "anker": "D's W50 riegel = the LOWER of the curves' envelope and"}}
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 23018, "anker": "D's W50 riegel = the LOWER of the curves' envelope and"}},
+    {"id": "K132", "von": "--weg2-vision-place", "nach": "--weg2-vision", "rel": "braucht", "calc": "text", "wert": "weights",
+     "satz": "The place 'weights' (the tower borrows weight memory of PP0 instead of KV-tail pages or free VRAM) acts only on the transient stage: with any other --weg2-vision the start is refused by name (W111) -- what it brings is a tower without a KV or free-VRAM claim; what it costs is the transient form.",
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 8524, "anker": "they act only on the transient stage"}, "baeume": ["27b"]},
+    {"id": "K133", "von": "--weg2-vision-place", "nach": "SGLANG_WEG2_VISION_ASYNC", "rel": "schliesst_aus", "calc": "text", "wert": "weights",
+     "satz": "The place 'weights' is always synchronous: the victims are borrowed only inside one pass before the admission, so SGLANG_WEG2_VISION_ASYNC (or SGLANG_WEG2_P_ROW_VISION_ASYNC) switched on is refused at launch by name (VISION-SYNC LAW) -- what it brings is a tower that never outlives its pass; what it costs is the async overlap.",
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 24946, "anker": "WEG2 VISION-ASYNC refused"}, "baeume": ["27b"]},
+    {"id": "K134", "von": "--weg2-vision-place", "nach": "--dual-layout", "rel": "schliesst_aus", "calc": "text", "wert": "kvtail",
+     "satz": "The places 'kvtail' and 'auto' (told on the command line) are refused together with --dual-layout (W111): the dual P pool is born trimmed to 0 tokens, so the tower has no KV-tail page to lend -- the place for the dual is 'weights'.",
+     "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 24969, "anker": "with --dual-layout: the dual P pool is born trimmed to 0 tokens"}, "baeume": ["27b"]}
   ]
 }
