@@ -21,7 +21,7 @@ the DATA does not come from the #407 ``TierRegistry``: that registry is a
 capability/profile description with no production consumer wired to it, and
 ``TierCapacity.reserved`` is never populated from a live source. Reading it
 would produce zeros that look like measurements. The rows below therefore read
-each consumer's own bookkeeping, through the ``flliper:spill_tier_*_bytes``
+each consumer's own bookkeeping, through the ``sglang:spill_tier_*_bytes``
 gauges the scheduler publishes (``observability/spill_tiers.py``), and every
 tier with no live source is emitted as an explicit ABSENT row carrying the
 reason.
@@ -64,8 +64,8 @@ __all__ = [
     "tier_view",
 ]
 
-SPILL_USED_METRIC = "flliper:spill_tier_used_bytes"
-SPILL_TOTAL_METRIC = "flliper:spill_tier_total_bytes"
+SPILL_USED_METRIC = "sglang:spill_tier_used_bytes"
+SPILL_TOTAL_METRIC = "sglang:spill_tier_total_bytes"
 
 MEASURED = "measured"
 ABSENT = "absent"
@@ -329,7 +329,7 @@ def _hicache_row(hicache, metrics_available, no_scrape) -> TierRow:
         kind="host_ram", location="local", provenance=MEASURED,
         used=hicache.get("host_used_tokens"),
         total=hicache.get("host_total_tokens"),
-        unit="tokens", source="flliper:hicache_host_*_tokens",
+        unit="tokens", source="sglang:hicache_host_*_tokens",
         consumer="hicache L2",
         total_scope="host KV pool capacity, in KV tokens (no byte gauge exists)")
 

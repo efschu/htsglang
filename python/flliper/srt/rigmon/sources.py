@@ -682,7 +682,7 @@ class GpuSampler:
 # Engine statistics
 # ---------------------------------------------------------------------------
 
-_METRIC = re.compile(r"^(flliper:[a-z_0-9]+)(?:\{([^}]*)\})?\s+([0-9eE.+-]+)\s*$")
+_METRIC = re.compile(r"^(sglang:[a-z_0-9]+)(?:\{([^}]*)\})?\s+([0-9eE.+-]+)\s*$")
 _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
 
 #: Metrics the engine already publishes PER TP RANK, which is what makes an
@@ -708,11 +708,11 @@ _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
 #: non-blocking ``Event.query()``, so no synchronisation stands in the hot
 #: loop.
 PER_RANK_KEYS = {
-    "forward_execution_seconds_total": "flliper:forward_execution_seconds_total",
-    "estimated_flops_per_gpu_total": "flliper:estimated_flops_per_gpu_total",
-    "estimated_read_bytes_per_gpu_total": "flliper:estimated_read_bytes_per_gpu_total",
-    "estimated_write_bytes_per_gpu_total": "flliper:estimated_write_bytes_per_gpu_total",
-    "fwd_occupancy": "flliper:fwd_occupancy",
+    "forward_execution_seconds_total": "sglang:forward_execution_seconds_total",
+    "estimated_flops_per_gpu_total": "sglang:estimated_flops_per_gpu_total",
+    "estimated_read_bytes_per_gpu_total": "sglang:estimated_read_bytes_per_gpu_total",
+    "estimated_write_bytes_per_gpu_total": "sglang:estimated_write_bytes_per_gpu_total",
+    "fwd_occupancy": "sglang:fwd_occupancy",
 }
 
 #: The forward-time counter carries a ``category`` label naming the forward
@@ -725,27 +725,27 @@ PER_RANK_KEYS = {
 #: ``target_verify`` (the speculative verify round), ``decode`` (the
 #: non-speculative decode step), ``eagle_draft`` / ``eagle_draft_extend`` (the
 #: drafter's own passes) and ``idle``.
-FORWARD_TIME_METRIC = "flliper:forward_execution_seconds_total"
+FORWARD_TIME_METRIC = "sglang:forward_execution_seconds_total"
 
 #: Prometheus names the collector keeps, mapped to short keys.
 _ENGINE_KEYS = {
-    "gen_throughput": "flliper:gen_throughput",
-    "num_running_reqs": "flliper:num_running_reqs",
-    "num_queue_reqs": "flliper:num_queue_reqs",
-    "num_paused_reqs": "flliper:num_paused_reqs",
-    "token_usage": "flliper:token_usage",
-    "kv_used_tokens": "flliper:kv_used_tokens",
-    "kv_available_tokens": "flliper:kv_available_tokens",
-    "mamba_used_tokens": "flliper:mamba_used_tokens",
-    "max_total_num_tokens": "flliper:max_total_num_tokens",
-    "cache_hit_rate": "flliper:cache_hit_rate",
-    "spec_accept_length": "flliper:spec_accept_length",
-    "num_requests_total": "flliper:num_requests_total",
-    "prompt_tokens_total": "flliper:prompt_tokens_total",
-    "generation_tokens_total": "flliper:generation_tokens_total",
-    "e2e_request_latency_seconds": "flliper:e2e_request_latency_seconds_sum",
-    "inter_token_latency_seconds": "flliper:inter_token_latency_seconds_sum",
-    "utilization": "flliper:utilization",
+    "gen_throughput": "sglang:gen_throughput",
+    "num_running_reqs": "sglang:num_running_reqs",
+    "num_queue_reqs": "sglang:num_queue_reqs",
+    "num_paused_reqs": "sglang:num_paused_reqs",
+    "token_usage": "sglang:token_usage",
+    "kv_used_tokens": "sglang:kv_used_tokens",
+    "kv_available_tokens": "sglang:kv_available_tokens",
+    "mamba_used_tokens": "sglang:mamba_used_tokens",
+    "max_total_num_tokens": "sglang:max_total_num_tokens",
+    "cache_hit_rate": "sglang:cache_hit_rate",
+    "spec_accept_length": "sglang:spec_accept_length",
+    "num_requests_total": "sglang:num_requests_total",
+    "prompt_tokens_total": "sglang:prompt_tokens_total",
+    "generation_tokens_total": "sglang:generation_tokens_total",
+    "e2e_request_latency_seconds": "sglang:e2e_request_latency_seconds_sum",
+    "inter_token_latency_seconds": "sglang:inter_token_latency_seconds_sum",
+    "utilization": "sglang:utilization",
 }
 
 

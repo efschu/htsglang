@@ -14,7 +14,7 @@ A. ``front.flip`` (Vorlauf / Layer / Nachlauf) and ``front.d_activity``, live.
 B. ``front.ttft_by_via`` = {after_p|d_direct|d_single: n, ms_sum, ms_max,
    last_ms, last_ts, queue/p_prefill/flip_wait/d_first_token/other _ms_sum}.
 C. ``request_done`` per finished request (events.jsonl, IPC thread), optional
-   Influx point ``pdflip_req`` (FLLIPER_PDFLIP_METRICS_PUSH_URL, default off).
+   Influx point ``weg2_req`` (FLLIPER_PDFLIP_METRICS_PUSH_URL, default off).
 D. ``park`` per park episode.
 
 RED on 7b8a2a41a1: the stale chunk fires ``flip_first_work``; the rest does
@@ -401,9 +401,9 @@ class TestFrontWiring(CustomTestCase):
         b.first_token("pdflip-9-9", 1.5, "d_direct")
         rec, _ = b.done("pdflip-9-9", 2.0, 200, 0)
         tags, fields = influx_req_fields(rec)
-        line = front_metrics.influx_line("pdflip_req", dict(tags, model="NF"), fields, ts_ns=2_000_000_000)
+        line = front_metrics.influx_line("weg2_req", dict(tags, model="NF"), fields, ts_ns=2_000_000_000)
         head = line.split(" ", 1)[0]
-        self.assertEqual(head, "pdflip_req,model=NF,status=200,via=d_direct")
+        self.assertEqual(head, "weg2_req,model=NF,status=200,via=d_direct")
         self.assertIn('rid="pdflip-9-9"', line)
         self.assertIn("ttft_ms=500i", line)
 
@@ -421,7 +421,7 @@ class TestFrontWiring(CustomTestCase):
         while time.time() < deadline and not posted:
             time.sleep(0.02)
         self.assertEqual(posted[0][0], "http://vm:8428/write")
-        self.assertTrue(posted[0][1].startswith(b"pdflip_req,"))
+        self.assertTrue(posted[0][1].startswith(b"weg2_req,"))
 
 
 if __name__ == "__main__":

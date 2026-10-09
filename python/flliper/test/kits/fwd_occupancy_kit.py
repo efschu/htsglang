@@ -1,6 +1,6 @@
 """Single-batch decode GPU occupancy sanity kit.
 
-Probes ``flliper:fwd_occupancy`` (a 0-100 percentage averaged over the
+Probes ``sglang:fwd_occupancy`` (a 0-100 percentage averaged over the
 last ``decode_log_interval`` batches; resets to NaN at window
 boundaries) under one long single-batch ``/generate`` request, and
 asserts median above a threshold. Single-batch is where CPU overhead
@@ -23,14 +23,14 @@ import requests
 import tabulate
 
 _FWD_OCCUPANCY_RE = re.compile(
-    r"^flliper:fwd_occupancy(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE
+    r"^sglang:fwd_occupancy(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE
 )
 _GENERATE_REQUEST_TIMEOUT = 600
 _METRICS_REQUEST_TIMEOUT = 10
 
 
 class FwdOccupancyMixin:
-    """Assert single-batch ``flliper:fwd_occupancy`` median > threshold."""
+    """Assert single-batch ``sglang:fwd_occupancy`` median > threshold."""
 
     fwd_occupancy_threshold: float = 95.0
     fwd_occupancy_min_samples: int = 5
@@ -87,9 +87,9 @@ class FwdOccupancyMixin:
                 f"/metrics returned {resp.status_code}; the test class's "
                 "server must be launched with --enable-metrics"
             )
-        if "flliper:fwd_occupancy" not in resp.text:
+        if "sglang:fwd_occupancy" not in resp.text:
             raise AssertionError(
-                "flliper:fwd_occupancy gauge not exposed; set "
+                "sglang:fwd_occupancy gauge not exposed; set "
                 "FLLIPER_ENABLE_METRICS_DEVICE_TIMER=1 in the server's env "
                 "and pass --enable-metrics"
             )
@@ -247,7 +247,7 @@ class FwdOccupancyMixin:
         self.assertGreater(
             median,
             self.fwd_occupancy_threshold,
-            f"flliper:fwd_occupancy median={median:.2f} did not exceed "
+            f"sglang:fwd_occupancy median={median:.2f} did not exceed "
             f"threshold {self.fwd_occupancy_threshold} "
             f"(peak={peak:.2f}, p10={p10:.2f}, n={len(samples)})",
         )

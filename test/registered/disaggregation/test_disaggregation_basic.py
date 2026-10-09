@@ -512,7 +512,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
                 self.assertGreater(len(body["text"]), 0)
 
     async def _get_num_running_reqs(self, session):
-        """Query flliper:num_running_reqs from prefill node's /metrics."""
+        """Query sglang:num_running_reqs from prefill node's /metrics."""
         async with session.get(
             self.prefill_url + "/metrics",
             timeout=aiohttp.ClientTimeout(total=5),
@@ -523,7 +523,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
                 # Match the gauge line, skip HELP/TYPE comments and
                 # per-priority breakdowns (which have priority="<int>")
                 if (
-                    line.startswith("flliper:num_running_reqs{")
+                    line.startswith("sglang:num_running_reqs{")
                     and "priority=" not in line
                 ):
                     return int(float(line.split()[-1]))

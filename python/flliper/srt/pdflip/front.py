@@ -166,7 +166,7 @@ from flliper.srt.pdflip import handoff_seam as _hs  # #243 seam: HANDOFF-LOST re
 from flliper.srt.pdflip import session_trace as _st  # SESSION-TRACE: session hash + shared prefix
 # DASHBOARD-IPC 01.10. (stdlib only, imported HERE: no first import on the loop, weg2rc2)
 from flliper.srt.pdflip import front_requests as _frq  # front.flip / d_activity / ttft_by_via / request_done
-from flliper.srt.pdflip import front_metrics as _fmet  # pdflip_req Influx push (TSDB-DELTA 1c, default off)
+from flliper.srt.pdflip import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
 
 logger = logging.getLogger("pdflip.front")
 
@@ -8428,7 +8428,7 @@ class Front:
 
     def _rb_done(self, rid: str, status: Any) -> None:
         """The handler's end: ``request_done`` (+ the ``park`` of a park still
-        open) into events.jsonl, and the optional ``pdflip_req`` push."""
+        open) into events.jsonl, and the optional ``weg2_req`` push."""
         b = self.__dict__.get("_req_book_obj")
         if b is None:
             return
@@ -8453,14 +8453,14 @@ class Front:
         return p
 
     def _ipc_req_push(self, rec: dict) -> None:
-        """Runs in the IPC thread: one ``pdflip_req`` line, bundled ~2 s."""
+        """Runs in the IPC thread: one ``weg2_req`` line, bundled ~2 s."""
         p = Front._ipc_pusher(self)
         if p is None:
             return
         tags, fields = _frq.influx_req_fields(rec)
         tags["model"] = envs.FLLIPER_PDFLIP_METRICS_MODEL.get() or None
         ts = rec.get("end_ts")
-        p.add(_fmet.influx_line("pdflip_req", tags, fields,
+        p.add(_fmet.influx_line("weg2_req", tags, fields,
                           ts_ns=int(float(ts) * 1e9) if ts is not None else None))
         p.maybe_flush()
 

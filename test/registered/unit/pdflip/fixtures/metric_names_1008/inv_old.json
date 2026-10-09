@@ -1,0 +1,1604 @@
+{
+ "_comment": "Metric-name inventory of the pre-rename tree (base below): every series / label / job name that leaves the process or that a panel queries. Made by tools/release/metric_inventory.py scan --repo <repo> --ref <base>. EVIDENCE: do not edit, do not rename (fixtures/** keeps its bytes).",
+ "base": "a452294dd2 (NF freeze head, desk/nf-int15-1007)",
+ "defined": [
+  "sglang:backup_bandwidth",
+  "sglang:backup_pgs",
+  "sglang:backuped_tokens_total",
+  "sglang:cache_hit_rate",
+  "sglang:cached_tokens_total",
+  "sglang:context_len",
+  "sglang:cuda_graph_passes_total",
+  "sglang:decode_sum_seq_lens",
+  "sglang:dp_cooperation_forward_execution_seconds_total",
+  "sglang:dp_cooperation_realtime_tokens_total",
+  "sglang:e2e_request_latency_seconds",
+  "sglang:encoder_cache_entries",
+  "sglang:encoder_cache_evictions_total",
+  "sglang:encoder_cache_hit_files_total",
+  "sglang:encoder_cache_hit_tokens_total",
+  "sglang:encoder_cache_size_mb",
+  "sglang:encoder_cache_total_files_total",
+  "sglang:encoder_cache_total_tokens_total",
+  "sglang:encoder_dp_pending_requests",
+  "sglang:encoder_mm_items_per_batch",
+  "sglang:encoder_mm_items_per_request",
+  "sglang:encoder_model_forward_seconds",
+  "sglang:encoder_preprocess_seconds",
+  "sglang:encoder_queue_wait_seconds",
+  "sglang:encoder_request_e2e_latency_seconds",
+  "sglang:encoder_requests_received_total",
+  "sglang:encoder_requests_total",
+  "sglang:encoder_transfer_seconds",
+  "sglang:engine_load_weights_time",
+  "sglang:engine_startup_time",
+  "sglang:eplb_balancedness",
+  "sglang:eplb_gpu_physical_count",
+  "sglang:estimated_flops_per_gpu_total",
+  "sglang:estimated_read_bytes_per_gpu_total",
+  "sglang:estimated_write_bytes_per_gpu_total",
+  "sglang:evicted_tokens_total",
+  "sglang:eviction_duration_seconds",
+  "sglang:failed_session_recoveries_total",
+  "sglang:forward_execution_seconds_total",
+  "sglang:full_token_usage",
+  "sglang:func_latency_seconds",
+  "sglang:fwd_occupancy",
+  "sglang:gen_throughput",
+  "sglang:generation_tokens_histogram",
+  "sglang:generation_tokens_total",
+  "sglang:get_loads_duration_seconds",
+  "sglang:grammar_compilation_time_seconds",
+  "sglang:grammar_ebnf_size",
+  "sglang:grammar_schema_count",
+  "sglang:grammar_tree_traversal_time_avg",
+  "sglang:grammar_tree_traversal_time_max",
+  "sglang:hicache_host_total_tokens",
+  "sglang:hicache_host_used_tokens",
+  "sglang:http_requests_active",
+  "sglang:http_requests_total",
+  "sglang:http_responses_total",
+  "sglang:inter_token_latency_seconds",
+  "sglang:is_cuda_graph",
+  "sglang:kv_available_tokens",
+  "sglang:kv_evictable_tokens",
+  "sglang:kv_transfer_alloc_ms",
+  "sglang:kv_transfer_bootstrap_ms",
+  "sglang:kv_transfer_latency_ms",
+  "sglang:kv_transfer_speed_gb_s",
+  "sglang:kv_transfer_total_mb",
+  "sglang:kv_used_tokens",
+  "sglang:lane_device_cost_ms",
+  "sglang:lane_occupancy",
+  "sglang:lane_share",
+  "sglang:lane_share_e",
+  "sglang:lane_share_floor",
+  "sglang:load_back_duration_seconds",
+  "sglang:load_back_tokens_total",
+  "sglang:lora_pool_slots_total",
+  "sglang:lora_pool_slots_used",
+  "sglang:lora_pool_utilization",
+  "sglang:mamba_available_tokens",
+  "sglang:mamba_evictable_tokens",
+  "sglang:mamba_usage",
+  "sglang:mamba_used_tokens",
+  "sglang:max_running_requests_under_SLO",
+  "sglang:max_total_num_tokens",
+  "sglang:new_token_ratio",
+  "sglang:num_aborted_requests_total",
+  "sglang:num_bootstrap_failed_reqs_total",
+  "sglang:num_decode_prealloc_queue_reqs",
+  "sglang:num_decode_transfer_queue_reqs",
+  "sglang:num_grammar_aborted_total",
+  "sglang:num_grammar_cache_hit_total",
+  "sglang:num_grammar_queue_reqs",
+  "sglang:num_grammar_timeout_total",
+  "sglang:num_grammar_total",
+  "sglang:num_pages",
+  "sglang:num_paused_reqs",
+  "sglang:num_prefill_bootstrap_queue_reqs",
+  "sglang:num_prefill_inflight_queue_reqs",
+  "sglang:num_prefill_retries_total",
+  "sglang:num_queue_reqs",
+  "sglang:num_requests_total",
+  "sglang:num_retracted_input_tokens_total",
+  "sglang:num_retracted_output_tokens_total",
+  "sglang:num_retracted_reqs",
+  "sglang:num_retracted_requests_total",
+  "sglang:num_running_reqs",
+  "sglang:num_so_requests_total",
+  "sglang:num_streaming_sessions",
+  "sglang:num_transfer_failed_reqs_total",
+  "sglang:num_unique_running_routing_keys",
+  "sglang:num_used_tokens",
+  "sglang:page_size",
+  "sglang:pending_prealloc_token_usage",
+  "sglang:per_stage_req_latency_seconds",
+  "sglang:prefetch_bandwidth",
+  "sglang:prefetch_pgs",
+  "sglang:prefetched_tokens_total",
+  "sglang:prefill_delayer_outcomes_total",
+  "sglang:prefill_delayer_wait_forward_passes",
+  "sglang:prefill_delayer_wait_seconds",
+  "sglang:process_cpu_seconds_total",
+  "sglang:prompt_tokens_histogram",
+  "sglang:prompt_tokens_total",
+  "sglang:queue_time_seconds",
+  "sglang:realtime_tokens_total",
+  "sglang:routing_key_all_req_count",
+  "sglang:routing_key_running_req_count",
+  "sglang:routing_keys_active",
+  "sglang:spec_accept_length",
+  "sglang:spec_accept_rate",
+  "sglang:spec_block_accept_length",
+  "sglang:spec_cap_length",
+  "sglang:spec_ema_accept_len",
+  "sglang:spec_num_draft_tokens",
+  "sglang:spec_num_steps",
+  "sglang:spec_verify_calls_total",
+  "sglang:spill_tier_total_bytes",
+  "sglang:spill_tier_used_bytes",
+  "sglang:startup_available_gpu_memory_gb",
+  "sglang:startup_latency_breakdown_seconds_max",
+  "sglang:streaming_session_held_tokens",
+  "sglang:swa_available_tokens",
+  "sglang:swa_evictable_tokens",
+  "sglang:swa_token_usage",
+  "sglang:swa_used_tokens",
+  "sglang:time_to_first_token_seconds",
+  "sglang:token_usage",
+  "sglang:uncached_prompt_tokens_histogram",
+  "sglang:utilization",
+  "sglang:weight_load_duration_seconds",
+  "sglang_{}",
+  "sglang_{}_{}",
+  "weg2-front",
+  "weg2_boot_decode_busy_seconds_total",
+  "weg2_boot_decode_seat_seconds_total",
+  "weg2_boot_decode_seconds_total",
+  "weg2_boot_decode_settled_ts",
+  "weg2_boot_decode_tokens_total",
+  "weg2_flip_user_view_ms",
+  "weg2_front_awake",
+  "weg2_front_queue",
+  "weg2_front_served_tokens_total",
+  "weg2_front_served_total",
+  "weg2_front_ttft_count",
+  "weg2_front_ttft_ms_max",
+  "weg2_front_ttft_ms_sum",
+  "weg2_front_up",
+  "weg2_front_verdict_count",
+  "weg2_front_verdict_ms_sum",
+  "weg2_gpu_pcie_bytes_per_second",
+  "weg2_rank_cache_%s_total",
+  "weg2_rank_l3_prefetch_total",
+  "weg2_rank_prefill_compute_ms_total",
+  "weg2_rank_prefill_new_tokens_total",
+  "weg2_req"
+ ],
+ "family": "weg2_/sglang:/sglang_",
+ "hits": [
+  {
+   "kind": "text",
+   "line": 112,
+   "name": "sglang_e2e_request_latency_seconds_bucket",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 128,
+   "name": "sglang_e2e_request_latency_seconds_bucket",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 145,
+   "name": "sglang_e2e_request_latency_seconds_bucket",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 162,
+   "name": "sglang_e2e_request_latency_seconds_count",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 162,
+   "name": "sglang_e2e_request_latency_seconds_sum",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 358,
+   "name": "sglang_time_to_first_token_seconds_bucket",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 374,
+   "name": "sglang_time_to_first_token_seconds_bucket",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 391,
+   "name": "sglang_time_to_first_token_seconds_bucket",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 408,
+   "name": "sglang_time_to_first_token_seconds_count",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 408,
+   "name": "sglang_time_to_first_token_seconds_sum",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 609,
+   "name": "sglang_num_running_reqs",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 710,
+   "name": "sglang_gen_throughput",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 808,
+   "name": "sglang_cache_hit_rate",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "text",
+   "line": 909,
+   "name": "sglang_num_queue_reqs",
+   "path": "examples/monitoring/grafana/dashboards/json/sglang-dashboard.json"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2891,
+   "name": "sglang:encoder_dp_pending_requests",
+   "path": "python/sglang/srt/disaggregation/encode_server.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 61,
+   "name": "sglang:failed_session_recoveries_total",
+   "path": "python/sglang/srt/disaggregation/mooncake/conn.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 55,
+   "name": "sglang_{}_{}",
+   "path": "python/sglang/srt/entrypoints/v1_loads.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 58,
+   "name": "sglang_",
+   "path": "python/sglang/srt/entrypoints/v1_loads.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 58,
+   "name": "sglang_{}",
+   "path": "python/sglang/srt/entrypoints/v1_loads.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 10,
+   "name": "sglang:process_cpu_seconds_total",
+   "path": "python/sglang/srt/observability/cpu_monitor.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 35,
+   "name": "sglang:func_latency_seconds",
+   "path": "python/sglang/srt/observability/func_timer.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 283,
+   "name": "sglang:num_running_reqs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 289,
+   "name": "sglang:num_queue_reqs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 295,
+   "name": "sglang:num_grammar_queue_reqs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 301,
+   "name": "sglang:gen_throughput",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 307,
+   "name": "sglang:cache_hit_rate",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 313,
+   "name": "sglang:decode_sum_seq_lens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 323,
+   "name": "sglang:token_usage",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 329,
+   "name": "sglang:full_token_usage",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 335,
+   "name": "sglang:swa_token_usage",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 341,
+   "name": "sglang:mamba_usage",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 351,
+   "name": "sglang:num_used_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 357,
+   "name": "sglang:kv_available_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 363,
+   "name": "sglang:kv_evictable_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 369,
+   "name": "sglang:kv_used_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 375,
+   "name": "sglang:swa_available_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 381,
+   "name": "sglang:swa_evictable_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 387,
+   "name": "sglang:swa_used_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 393,
+   "name": "sglang:mamba_available_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 399,
+   "name": "sglang:mamba_evictable_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 405,
+   "name": "sglang:mamba_used_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 415,
+   "name": "sglang:weight_load_duration_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 436,
+   "name": "sglang:lane_share",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 447,
+   "name": "sglang:lane_share_e",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 456,
+   "name": "sglang:lane_share_floor",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 469,
+   "name": "sglang:lane_occupancy",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 479,
+   "name": "sglang:lane_device_cost_ms",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 493,
+   "name": "sglang:spec_accept_length",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 499,
+   "name": "sglang:spec_accept_rate",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 505,
+   "name": "sglang:spec_cap_length",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 511,
+   "name": "sglang:spec_block_accept_length",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 517,
+   "name": "sglang:spec_num_steps",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 523,
+   "name": "sglang:spec_ema_accept_len",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 529,
+   "name": "sglang:spec_num_draft_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 540,
+   "name": "sglang:num_retracted_reqs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 545,
+   "name": "sglang:num_retracted_requests_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 551,
+   "name": "sglang:num_retracted_input_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 556,
+   "name": "sglang:num_retracted_output_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 561,
+   "name": "sglang:num_paused_reqs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 570,
+   "name": "sglang:num_prefill_bootstrap_queue_reqs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 576,
+   "name": "sglang:num_prefill_inflight_queue_reqs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 582,
+   "name": "sglang:num_decode_prealloc_queue_reqs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 588,
+   "name": "sglang:num_decode_transfer_queue_reqs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 594,
+   "name": "sglang:kv_transfer_speed_gb_s",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 600,
+   "name": "sglang:kv_transfer_latency_ms",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 606,
+   "name": "sglang:pending_prealloc_token_usage",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 612,
+   "name": "sglang:num_bootstrap_failed_reqs_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 617,
+   "name": "sglang:num_transfer_failed_reqs_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 622,
+   "name": "sglang:num_prefill_retries_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 627,
+   "name": "sglang:kv_transfer_bootstrap_ms",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 633,
+   "name": "sglang:kv_transfer_alloc_ms",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 639,
+   "name": "sglang:kv_transfer_total_mb",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 649,
+   "name": "sglang:utilization",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 655,
+   "name": "sglang:fwd_occupancy",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 665,
+   "name": "sglang:new_token_ratio",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 676,
+   "name": "sglang:is_cuda_graph",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 682,
+   "name": "sglang:cuda_graph_passes_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 692,
+   "name": "sglang:lora_pool_slots_used",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 698,
+   "name": "sglang:lora_pool_slots_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 704,
+   "name": "sglang:lora_pool_utilization",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 715,
+   "name": "sglang:hicache_host_used_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 721,
+   "name": "sglang:hicache_host_total_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 737,
+   "name": "sglang:spill_tier_used_bytes",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 747,
+   "name": "sglang:spill_tier_total_bytes",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 761,
+   "name": "sglang:num_streaming_sessions",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 767,
+   "name": "sglang:streaming_session_held_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 777,
+   "name": "sglang:num_unique_running_routing_keys",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 783,
+   "name": "sglang:routing_key_running_req_count",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 789,
+   "name": "sglang:routing_key_all_req_count",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 799,
+   "name": "sglang:queue_time_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 846,
+   "name": "sglang:per_stage_req_latency_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 857,
+   "name": "sglang:grammar_compilation_time_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 881,
+   "name": "sglang:num_grammar_cache_hit_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 886,
+   "name": "sglang:num_grammar_aborted_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 891,
+   "name": "sglang:num_grammar_timeout_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 896,
+   "name": "sglang:num_grammar_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 901,
+   "name": "sglang:grammar_schema_count",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 929,
+   "name": "sglang:grammar_ebnf_size",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 971,
+   "name": "sglang:grammar_tree_traversal_time_avg",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 977,
+   "name": "sglang:grammar_tree_traversal_time_max",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 990,
+   "name": "sglang:eplb_balancedness",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 996,
+   "name": "sglang:realtime_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1004,
+   "name": "sglang:forward_execution_seconds_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1012,
+   "name": "sglang:estimated_flops_per_gpu_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1020,
+   "name": "sglang:estimated_read_bytes_per_gpu_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1028,
+   "name": "sglang:estimated_write_bytes_per_gpu_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1037,
+   "name": "sglang:dp_cooperation_realtime_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1045,
+   "name": "sglang:dp_cooperation_forward_execution_seconds_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1059,
+   "name": "sglang:prefill_delayer_wait_forward_passes",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1076,
+   "name": "sglang:prefill_delayer_wait_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1089,
+   "name": "sglang:prefill_delayer_outcomes_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1104,
+   "name": "sglang:max_total_num_tokens",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1110,
+   "name": "sglang:max_running_requests_under_SLO",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1116,
+   "name": "sglang:engine_startup_time",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1122,
+   "name": "sglang:engine_load_weights_time",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1128,
+   "name": "sglang:page_size",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1134,
+   "name": "sglang:num_pages",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1140,
+   "name": "sglang:context_len",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1146,
+   "name": "sglang:startup_available_gpu_memory_gb",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1611,
+   "name": "sglang:prompt_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1616,
+   "name": "sglang:generation_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1621,
+   "name": "sglang:spec_verify_calls_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1664,
+   "name": "sglang:prompt_tokens_histogram",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1672,
+   "name": "sglang:uncached_prompt_tokens_histogram",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1680,
+   "name": "sglang:generation_tokens_histogram",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1690,
+   "name": "sglang:cached_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1696,
+   "name": "sglang:num_requests_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1702,
+   "name": "sglang:get_loads_duration_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1709,
+   "name": "sglang:num_so_requests_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1715,
+   "name": "sglang:num_aborted_requests_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1796,
+   "name": "sglang:time_to_first_token_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1803,
+   "name": "sglang:inter_token_latency_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1810,
+   "name": "sglang:e2e_request_latency_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1926,
+   "name": "sglang:prefetched_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1932,
+   "name": "sglang:backuped_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1956,
+   "name": "sglang:prefetch_pgs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1963,
+   "name": "sglang:backup_pgs",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1970,
+   "name": "sglang:prefetch_bandwidth",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 1977,
+   "name": "sglang:backup_bandwidth",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2018,
+   "name": "sglang:eplb_gpu_physical_count",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2088,
+   "name": "sglang:eviction_duration_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2095,
+   "name": "sglang:evicted_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2101,
+   "name": "sglang:load_back_duration_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2108,
+   "name": "sglang:load_back_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2142,
+   "name": "sglang:encoder_cache_evictions_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2147,
+   "name": "sglang:encoder_cache_size_mb",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2153,
+   "name": "sglang:encoder_cache_entries",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2159,
+   "name": "sglang:encoder_cache_hit_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2164,
+   "name": "sglang:encoder_cache_total_tokens_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2169,
+   "name": "sglang:encoder_cache_hit_files_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2174,
+   "name": "sglang:encoder_cache_total_files_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2181,
+   "name": "sglang:encoder_requests_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2189,
+   "name": "sglang:encoder_requests_received_total",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2196,
+   "name": "sglang:encoder_mm_items_per_batch",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2224,
+   "name": "sglang:encoder_mm_items_per_request",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2232,
+   "name": "sglang:encoder_request_e2e_latency_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2242,
+   "name": "sglang:encoder_queue_wait_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2250,
+   "name": "sglang:encoder_preprocess_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2258,
+   "name": "sglang:encoder_model_forward_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 2266,
+   "name": "sglang:encoder_transfer_seconds",
+   "path": "python/sglang/srt/observability/metrics_collector.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 40,
+   "name": "sglang:startup_latency_breakdown_seconds_max",
+   "path": "python/sglang/srt/observability/startup_func_log_and_timer.py"
+  },
+  {
+   "kind": "reader",
+   "line": 1315,
+   "name": "sglang:spec_accept_rate",
+   "path": "python/sglang/srt/planner/energy.py"
+  },
+  {
+   "kind": "reader",
+   "line": 1316,
+   "name": "sglang:spec_num_steps",
+   "path": "python/sglang/srt/planner/energy.py"
+  },
+  {
+   "kind": "reader",
+   "line": 1317,
+   "name": "sglang:spec_ema_accept_len",
+   "path": "python/sglang/srt/planner/energy.py"
+  },
+  {
+   "kind": "reader",
+   "line": 1318,
+   "name": "sglang:gen_throughput",
+   "path": "python/sglang/srt/planner/energy.py"
+  },
+  {
+   "kind": "reader",
+   "line": 113,
+   "name": "sglang:spec_accept_rate",
+   "path": "python/sglang/srt/planner/live_metrics.py"
+  },
+  {
+   "kind": "reader",
+   "line": 114,
+   "name": "sglang:spec_num_steps",
+   "path": "python/sglang/srt/planner/live_metrics.py"
+  },
+  {
+   "kind": "reader",
+   "line": 115,
+   "name": "sglang:spec_ema_accept_len",
+   "path": "python/sglang/srt/planner/live_metrics.py"
+  },
+  {
+   "kind": "reader",
+   "line": 116,
+   "name": "sglang:gen_throughput",
+   "path": "python/sglang/srt/planner/live_metrics.py"
+  },
+  {
+   "kind": "reader",
+   "line": 121,
+   "name": "sglang:num_running_reqs",
+   "path": "python/sglang/srt/planner/live_metrics.py"
+  },
+  {
+   "kind": "reader",
+   "line": 122,
+   "name": "sglang:num_queue_reqs",
+   "path": "python/sglang/srt/planner/live_metrics.py"
+  },
+  {
+   "kind": "reader",
+   "line": 123,
+   "name": "sglang:hicache_host_used_tokens",
+   "path": "python/sglang/srt/planner/live_metrics.py"
+  },
+  {
+   "kind": "reader",
+   "line": 124,
+   "name": "sglang:hicache_host_total_tokens",
+   "path": "python/sglang/srt/planner/live_metrics.py"
+  },
+  {
+   "kind": "reader",
+   "line": 67,
+   "name": "sglang:spill_tier_used_bytes",
+   "path": "python/sglang/srt/planner/tier_occupancy.py"
+  },
+  {
+   "kind": "reader",
+   "line": 68,
+   "name": "sglang:spill_tier_total_bytes",
+   "path": "python/sglang/srt/planner/tier_occupancy.py"
+  },
+  {
+   "kind": "reader",
+   "line": 715,
+   "name": "sglang:fwd_occupancy",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 732,
+   "name": "sglang:gen_throughput",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 733,
+   "name": "sglang:num_running_reqs",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 734,
+   "name": "sglang:num_queue_reqs",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 735,
+   "name": "sglang:num_paused_reqs",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 736,
+   "name": "sglang:token_usage",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 737,
+   "name": "sglang:kv_used_tokens",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 738,
+   "name": "sglang:kv_available_tokens",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 739,
+   "name": "sglang:mamba_used_tokens",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 740,
+   "name": "sglang:max_total_num_tokens",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 741,
+   "name": "sglang:cache_hit_rate",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 742,
+   "name": "sglang:spec_accept_length",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 746,
+   "name": "sglang:e2e_request_latency_seconds_sum",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 747,
+   "name": "sglang:inter_token_latency_seconds_sum",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "reader",
+   "line": 748,
+   "name": "sglang:utilization",
+   "path": "python/sglang/srt/rigmon/sources.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 3216,
+   "name": "sglang:http_requests_total",
+   "path": "python/sglang/srt/utils/common.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 3222,
+   "name": "sglang:http_responses_total",
+   "path": "python/sglang/srt/utils/common.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 3228,
+   "name": "sglang:http_requests_active",
+   "path": "python/sglang/srt/utils/common.py"
+  },
+  {
+   "kind": "prom-def",
+   "line": 3236,
+   "name": "sglang:routing_keys_active",
+   "path": "python/sglang/srt/utils/common.py"
+  },
+  {
+   "kind": "influx",
+   "line": 8463,
+   "name": "weg2_req",
+   "path": "python/sglang/srt/weg2/front.py"
+  },
+  {
+   "kind": "reader",
+   "line": 153,
+   "name": "sglang:num_running_reqs",
+   "path": "scripts/gpu_battery/s14_decode_punkt.py"
+  },
+  {
+   "kind": "reader",
+   "line": 154,
+   "name": "sglang:num_queue_reqs",
+   "path": "scripts/gpu_battery/s14_decode_punkt.py"
+  },
+  {
+   "kind": "reader",
+   "line": 155,
+   "name": "sglang:gen_throughput",
+   "path": "scripts/gpu_battery/s14_decode_punkt.py"
+  },
+  {
+   "kind": "reader",
+   "line": 156,
+   "name": "sglang:spec_accept_length",
+   "path": "scripts/gpu_battery/s14_decode_punkt.py"
+  },
+  {
+   "kind": "reader",
+   "line": 157,
+   "name": "sglang:token_usage",
+   "path": "scripts/gpu_battery/s14_decode_punkt.py"
+  },
+  {
+   "kind": "reader",
+   "line": 158,
+   "name": "sglang:cache_hit_rate",
+   "path": "scripts/gpu_battery/s14_decode_punkt.py"
+  },
+  {
+   "kind": "reader",
+   "line": 177,
+   "name": "sglang:num_running_reqs",
+   "path": "scripts/gpu_battery/s16_structured_point.py"
+  },
+  {
+   "kind": "reader",
+   "line": 178,
+   "name": "sglang:num_queue_reqs",
+   "path": "scripts/gpu_battery/s16_structured_point.py"
+  },
+  {
+   "kind": "reader",
+   "line": 179,
+   "name": "sglang:gen_throughput",
+   "path": "scripts/gpu_battery/s16_structured_point.py"
+  },
+  {
+   "kind": "reader",
+   "line": 180,
+   "name": "sglang:spec_accept_length",
+   "path": "scripts/gpu_battery/s16_structured_point.py"
+  },
+  {
+   "kind": "reader",
+   "line": 181,
+   "name": "sglang:token_usage",
+   "path": "scripts/gpu_battery/s16_structured_point.py"
+  },
+  {
+   "kind": "reader",
+   "line": 182,
+   "name": "sglang:cache_hit_rate",
+   "path": "scripts/gpu_battery/s16_structured_point.py"
+  },
+  {
+   "kind": "text",
+   "line": 290,
+   "name": "sglang:e2e_request_latency_seconds_sum",
+   "path": "scripts/probe/peer_kill_proof.sh"
+  },
+  {
+   "kind": "text",
+   "line": 292,
+   "name": "sglang:time_to_first_token_seconds_sum",
+   "path": "scripts/probe/peer_kill_proof.sh"
+  },
+  {
+   "kind": "text",
+   "line": 304,
+   "name": "sglang:time_to_first_token_seconds",
+   "path": "tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json"
+  },
+  {
+   "kind": "text",
+   "line": 355,
+   "name": "sglang:time_to_first_token_seconds_bucket",
+   "path": "tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json"
+  },
+  {
+   "kind": "text",
+   "line": 364,
+   "name": "sglang:time_to_first_token_seconds_bucket",
+   "path": "tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json"
+  },
+  {
+   "kind": "reader",
+   "line": 76,
+   "name": "sglang:time_to_first_token_seconds",
+   "path": "tools/rig_dashboard/rigdash/deploy/grafana/make_dashboard.py"
+  },
+  {
+   "kind": "text",
+   "line": 33,
+   "name": "weg2-front",
+   "path": "tools/rig_dashboard/rigdash/deploy/vm/scrape.yml"
+  },
+  {
+   "kind": "emitter",
+   "line": 84,
+   "name": "weg2_front_up",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 86,
+   "name": "weg2_front_served_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 90,
+   "name": "weg2_front_served_tokens_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 93,
+   "name": "weg2_front_ttft_count",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 94,
+   "name": "weg2_front_ttft_ms_sum",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 95,
+   "name": "weg2_front_ttft_ms_max",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 96,
+   "name": "weg2_front_verdict_count",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 97,
+   "name": "weg2_front_verdict_ms_sum",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 99,
+   "name": "weg2_front_",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 101,
+   "name": "weg2_front_queue",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 105,
+   "name": "weg2_front_awake",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 111,
+   "name": "weg2_rank_",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 114,
+   "name": "weg2_rank_cache_%s_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 117,
+   "name": "weg2_rank_l3_prefetch_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 196,
+   "name": "weg2_gpu_pcie_bytes_per_second",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 375,
+   "name": "weg2_flip_user_view_ms",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 387,
+   "name": "weg2_boot_decode_seconds_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 387,
+   "name": "weg2_boot_decode_tokens_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 388,
+   "name": "weg2_boot_decode_busy_seconds_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 388,
+   "name": "weg2_boot_decode_seat_seconds_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 389,
+   "name": "weg2_boot_decode_settled_ts",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 464,
+   "name": "weg2_rank_prefill_compute_ms_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  },
+  {
+   "kind": "emitter",
+   "line": 464,
+   "name": "weg2_rank_prefill_new_tokens_total",
+   "path": "tools/rig_dashboard/rigdash/vmpush.py"
+  }
+ ]
+}

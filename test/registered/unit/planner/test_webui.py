@@ -5386,7 +5386,7 @@ class TestSpillTierPanel(CustomTestCase):
         from flliper.srt.planner import tier_occupancy
 
         view = tier_occupancy.tier_view(
-            'flliper:spill_tier_used_bytes{spill_tier="expert_host_ram"} 1024\n',
+            'sglang:spill_tier_used_bytes{spill_tier="expert_host_ram"} 1024\n',
             hicache={"host_used_tokens": 5, "host_total_tokens": 10},
             meminfo_text="MemTotal: 1024 kB\n")
         self.assertEqual(view["host_ram_counted"], ["expert_host_ram"])

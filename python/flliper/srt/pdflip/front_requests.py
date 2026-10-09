@@ -12,7 +12,7 @@ state.json / events.jsonl / VictoriaMetrics):
   decomposition (``front.ttft_by_via``);
 * a session view -- one ``request_done`` event per finished request and one
   ``park`` event per park episode (events.jsonl), optionally the Influx point
-  ``pdflip_req`` (TSDB-DELTA-27B-1001.md 1c).
+  ``weg2_req`` (TSDB-DELTA-27B-1001.md 1c).
 
 Shape rules (operator 01.10.): nothing here waits, locks or syncs. Every
 method is a handful of dict operations on the event loop; the records are
@@ -504,7 +504,7 @@ class RequestBook:
 
 
 def influx_req_fields(rec: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """``(tags, fields)`` of the ``pdflip_req`` point (TSDB-DELTA 1c): low-cardinality
+    """``(tags, fields)`` of the ``weg2_req`` point (TSDB-DELTA 1c): low-cardinality
     tags only (via, status); rid and session are FIELDS."""
     pf = rec.get("prefill") or {}
     c = rec.get("cached") or {}

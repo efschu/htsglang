@@ -35,17 +35,17 @@ from flliper.srt.planner.webui import hicache_saved_read, hicache_saved_record
 
 
 # ---------------------------------------------------------------------------
-# Recovered-prefill-token metric (flliper:cached_tokens_total by cache_source).
+# Recovered-prefill-token metric (sglang:cached_tokens_total by cache_source).
 # ---------------------------------------------------------------------------
 
 _METRICS = (
-    "# HELP flliper:cached_tokens_total foo\n"
-    "# TYPE flliper:cached_tokens_total counter\n"
-    'flliper:cached_tokens_total{model="m",cache_source="device"} 900\n'
-    'flliper:cached_tokens_total{model="m",cache_source="host"} 100\n'
-    'flliper:cached_tokens_total{model="m",cache_source="host"} 25\n'
-    'flliper:cached_tokens_total{model="m",cache_source="storage_file"} 40\n'
-    "flliper:prompt_tokens_total 5000\n"
+    "# HELP sglang:cached_tokens_total foo\n"
+    "# TYPE sglang:cached_tokens_total counter\n"
+    'sglang:cached_tokens_total{model="m",cache_source="device"} 900\n'
+    'sglang:cached_tokens_total{model="m",cache_source="host"} 100\n'
+    'sglang:cached_tokens_total{model="m",cache_source="host"} 25\n'
+    'sglang:cached_tokens_total{model="m",cache_source="storage_file"} 40\n'
+    "sglang:prompt_tokens_total 5000\n"
 )
 
 
@@ -66,7 +66,7 @@ class TestRecoveredTokenMetric(unittest.TestCase):
     def test_bare_total_fallback_excluded(self):
         # When the per-source breakdown is unavailable the counter carries a
         # "total" label (or none) that lumps in the device tier -> excluded.
-        text = "flliper:cached_tokens_total 777\n"
+        text = "sglang:cached_tokens_total 777\n"
         self.assertEqual(cached_tokens_by_source(text), {"total": 777.0})
         self.assertEqual(hicache_recovered_from_metrics(text), 0.0)
 
