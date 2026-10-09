@@ -8521,7 +8521,9 @@ VISION_SOURCE_DISK = "disk"
 VISION_SOURCE_RAM = "ram"
 VISION_SOURCES = (VISION_SOURCE_DISK, VISION_SOURCE_RAM)
 VISION_PLACE_AUTO = "auto"
-VISION_PLACES = (VISION_PLACE_AUTO, "kvtail", "free")
+#: VISION-WEIGHTS (09.10.): `weights` = the tower borrows victim weight memory
+#: of P's PP0 (weg2.vision_victim); off until the metal proof
+VISION_PLACES = (VISION_PLACE_AUTO, "kvtail", "free", "weights")
 VISION_SOURCE_ENV = "SGLANG_WEG2_VISION_SOURCE"
 VISION_PLACE_ENV = "SGLANG_WEG2_VISION_PLACE"
 
@@ -23328,7 +23330,12 @@ def build_parser() -> argparse.ArgumentParser:
              "--weg2-vision transient). `auto` (default): the KV tail when it is "
              "wholly free (the phase start), else the card's free VRAM, else a "
              "named refusal. `kvtail`: the 27B stage exactly. `free`: always the "
-             "card's free VRAM.",
+             "card's free VRAM. `weights` (VISION-WEIGHTS, not yet a profile default): "
+             "the tower's parameters are views on victim WEIGHT memory of PP0 "
+             "(27B flip: MLP storages; dual: only the hull parts D does not share); "
+             "the victim bytes go to a host image (freed after every image) and come "
+             "back with a device checksum before the admission -- a mismatch stops "
+             "the group (W110c). No KV page, no free VRAM, always synchronous.",
     )
     ap.add_argument(
         # #1356: see VISION_OFF. Default `off` = P and D boot TEXT-ONLY.

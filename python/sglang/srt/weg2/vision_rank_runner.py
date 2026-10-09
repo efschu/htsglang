@@ -79,6 +79,7 @@ from sglang.srt.weg2.vision_stage_service import (
     W_NOT_ARMED,
     W_STAGE_OK,
     W_TEARDOWN,
+    W_TIMEOUT,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,11 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
             refusal = str(exc)
     scheduler._weg2_vision_place = place
     scheduler._weg2_vision_source = None
+    # VISION-WEIGHTS (AP1 hook 1/4): the victim source of this rank and the
+    # M0 arming line; a refusal arms the pass to abort images by name
+    scheduler._weg2_vision_victims = None
+    if not refusal and place == vrs.PLACE_WEIGHTS:
+        scheduler._weg2_vision_victims, refusal = arm_victims(scheduler, env)
     if not refusal and source_kind == vrs.SOURCE_RAM:
         scheduler._weg2_vision_source = arm_ram_source(
             str(getattr(getattr(scheduler, "server_args", None), "model_path", "") or ""), env)
@@ -165,6 +171,8 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
         logger.info("%s ARMED in-rank: PP0 pid=%d, place=%s (tower on the KV tail%s), "
                     "source=%s (%s, bounce %dx%d MiB), before the admission after the wake",
                     W_STAGE_OK, os.getpid(), place,
+                    " never; on victim weight memory, returned and checksummed after the encode"
+                    if place == vrs.PLACE_WEIGHTS else
                     "" if place == vrs.PLACE_KVTAIL else
                     ", else in the card's free VRAM" if place == vrs.PLACE_AUTO else
                     " never; the card's free VRAM",
@@ -173,6 +181,27 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
                     else "checkpoint shard, O_DIRECT",
                     vrs.BOUNCE_COUNT, vrs.BOUNCE_BYTES // vrs.MIB)
     return True
+
+
+def arm_victims(scheduler, env: Optional[Dict[str, str]] = None) -> Tuple[Optional[Any], str]:
+    """VISION-WEIGHTS: (victim source, refusal). The VISION-SYNC LAW (user
+    02.10.) holds for this place without exception -- the stage borrows
+    weights only inside one synchronous pass, so an explicit
+    ``SGLANG_WEG2_VISION_ASYNC`` on is refused by name here."""
+    from sglang.srt.weg2 import vision_victim as vv
+
+    e = os.environ if env is None else env
+    if str(e.get(VISION_ASYNC_ENV, "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return None, (f"{VISION_ASYNC_ENV}=1 with place=weights: the victims are borrowed only inside "
+                      "one synchronous pass before the admission (VISION-SYNC LAW)")
+    try:
+        source = vv.resolve_source(scheduler)
+        shard = find_tower_shard(str(getattr(getattr(scheduler, "server_args", None), "model_path", "") or ""))
+        line, why = vv.arming_line(source, vrs.checkpoint_tensors(shard, is_vision_weight), _tower_name)
+    except Exception as exc:  # noqa: BLE001 -- a named arming refusal, never a dead boot
+        return None, f"{vv.W_VICTIM_PLAN_REFUSED}: {type(exc).__name__}: {exc}"
+    (logger.error if why else logger.info)("%s%s", line, f" -- {why}" if why else "")
+    return (None if why else source), why
 
 
 def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
@@ -624,6 +653,65 @@ class StageOutcome:
     #: whether the tower's index came from the per-rank cache
     cached_bytes: int = 0
     index_cached: bool = False
+    #: VISION-WEIGHTS: the W102 additions of a weights stage, the checksum
+    #: verdict, the encode's measured allocator peak vs its planned work, the
+    #: host-RAM line, and -- non-empty = W110c -- the FATAL non-return
+    victim_fields: str = ""
+    checksum: str = ""
+    encode_peak_bytes: Optional[int] = None
+    planned_work_bytes: Optional[int] = None
+    victim_host_line: str = ""
+    fatal: str = ""
+
+
+class _StageDeadline(vrs.VisionRankStageRefused):
+    """W109: the stage's deadline passed between two legs."""
+
+
+def _check_deadline(deadline_s: Optional[float], t_start: float, clock: Callable[[], float],
+                    leg: str) -> None:
+    """Plan §6.3: the deadline is checked only BETWEEN legs, never before the
+    victims' return (that runs in the finally regardless)."""
+    if deadline_s is not None and clock() - t_start > deadline_s:
+        raise _StageDeadline(f"{W_TIMEOUT}: {deadline_s:.1f} s passed before the {leg} leg")
+
+
+def _weights_lease(scheduler, module, items, backend, hf_config, device, victims, air, clock, out):
+    """VISION-WEIGHTS (hook 2/4): wait for PP0's forward, check the encode's
+    work memory against the card's air (computed from the real image), then
+    borrow the victims (W105b/W111b before any byte moved)."""
+    from sglang.srt.weg2 import vision_victim as vv
+
+    out.sync_ms = wait_pp0_forward(scheduler, clock)
+    if victims is None:
+        raise vv.VisionVictimPlanRefused(f"{vv.W_VICTIM_PLAN_REFUSED}: no victim source armed on PP0")
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is not None and items:
+        out.planned_work_bytes = vv.encode_work_for(vc, items, backend)
+        card_free, cache_idle = air(device)
+        why = vv.encode_air_refusal(out.planned_work_bytes, card_free, cache_idle,
+                                    max(vv.item_patches(it) for it in items))
+        if why:
+            raise vv.VisionVictimShort(why)
+    # the scheduler's own stream was synchronized at the top of the reserve
+    # leg, PP0's forward_stream just above: nothing queued reads a victim
+    return vv.VictimLease.open(victims, module, clock=clock)
+
+
+def _close_lease(out: "StageOutcome", lease, device: torch.device, run: int) -> None:
+    """VISION-WEIGHTS (hook 3/4): the victims back -- FIRST in the teardown,
+    before any teardown step can raise; a failed return is W110c, fatal."""
+    sync = (lambda: torch.cuda.current_stream(device).synchronize()) if device.type == "cuda" else None
+    why = lease.close(sync=sync)
+    out.legs_ms.update({k: lease.legs_ms[k] for k in ("stash", "restore", "verify") if k in lease.legs_ms})
+    out.victim_fields = lease.fields()
+    out.victim_host_line = lease.host_line(run)
+    out.checksum = "ok" if why is None else "MISMATCH" if "MISMATCH" in why else "FAILED"
+    if why is not None:
+        out.ok = False
+        out.code = why.split(":", 1)[0]
+        out.fatal = why
+        out.detail = f"{why}; {out.detail}" if out.detail else why
 
 
 def wait_pp0_forward(scheduler, clock: Callable[[], float] = time.perf_counter) -> float:
@@ -655,14 +743,20 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                    clock: Callable[[], float] = time.perf_counter,
                    place: str = vrs.PLACE_KVTAIL,
                    source: Optional[vrs.TowerSource] = None,
-                   air: Callable[[torch.device], Tuple[int, int]] = card_air) -> StageOutcome:
+                   air: Callable[[torch.device], Tuple[int, int]] = card_air,
+                   victims: Optional[Any] = None,
+                   deadline_s: Optional[float] = None) -> StageOutcome:
     """One tower load for all ``reqs``. Never raises: the verdict is the
     outcome. The teardown runs on every path, and the residue is measured
     only after the failure (and its traceback, which pins the forward's
-    activations) is gone."""
+    activations) is gone. ``victims`` (place=weights): the armed victim
+    source; ``deadline_s``: checked only between legs (W109)."""
     from sglang.srt.layers.rotary_embedding import factory as rope_factory
+    from sglang.srt.weg2 import vision_victim as vv
 
     out = StageOutcome()
+    lease = None
+    t_stage0 = clock()
     items = [it for r in reqs for it in unstaged_items(r)]
     out.items = len(items)
     allocator = scheduler.token_to_kv_pool_allocator
@@ -705,7 +799,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             out.tower_bytes = sum(sizes)
             buffers = pages = None
             tail_why = ""
-            if place != vrs.PLACE_FREE:
+            if place not in (vrs.PLACE_FREE, vrs.PLACE_WEIGHTS):
                 try:
                     buffers = vrs.attention_kv_buffers(allocator.get_kvcache())
                     pages = vrs.slots_for(sizes, buffers, out.num_pages, page_size)
@@ -729,7 +823,12 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                     tail_why = (f"the KV tail ({pages} of {out.num_pages} pages for "
                                 f"{out.tower_bytes / vrs.MIB:.0f} MiB of tower) is not wholly "
                                 "free on PP0")
-            if res is not None:
+            if place == vrs.PLACE_WEIGHTS:
+                lease = _weights_lease(scheduler, module, items, backend, hf_config, device,
+                                       victims, air, clock, out)
+                out.place = vrs.PLACE_WEIGHTS
+                segments = None
+            elif res is not None:
                 out.place = vrs.PLACE_KVTAIL
                 out.tail_pages = res.pages
                 segments = vrs.tail_segments(buffers, res, out.num_pages)
@@ -754,14 +853,19 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                 logger.info("%s place=free on PP0 (%s)%s", W_STAGE_OK, why,
                             f" -- {tail_why}" if tail_why else "")
             out.legs_wall["reserve"] = (w0, time.time())
+            _check_deadline(deadline_s, t_stage0, clock, "load")
             leg, t0 = "load", clock()
             w0 = _enter("load")
-            views = vrs.place_parameters(module, vrs.SlabAllocator(segments))
+            views = vrs.place_parameters(
+                module, lease.slab() if lease is not None else vrs.SlabAllocator(segments))
             segments = None
             # VISION-LOAD-WARM-1002: the 47-shard index + header once per rank
             shard, ck_tensors, out.index_cached = vrs.tower_index(
                 model_dir, find_tower_shard, is_vision_weight)
-            plan = vrs.plan_checkpoint_into(views, ck_tensors, _tower_name)
+            ck_name = _tower_name
+            if lease is not None:  # VISION-WEIGHTS: a row-split tower (AP2) reads its pieces
+                ck_tensors, ck_name = vv.split_checkpoint(ck_tensors, lease.split, _tower_name)
+            plan = vrs.plan_checkpoint_into(views, ck_tensors, ck_name)
             src = source if source is not None else vrs.disk_source(shard)
             if src.kind == vrs.SOURCE_RAM and not os.path.exists(src.path):
                 # the image left (a cleaned /dev/shm): staged again, named, and
@@ -782,10 +886,14 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             out.cached_bytes = rep.cached_bytes
             out.legs_ms["load"] = (clock() - t0) * 1e3
             out.legs_wall["load"] = (w0, time.time())
+            _check_deadline(deadline_s, t_stage0, clock, "encode")
             leg, t0 = "encode", clock()
             w0 = _enter("encode")
+            peak0 = vv.encode_peak_start(device) if lease is not None else None
             with torch.inference_mode(), attention_backend_scope(backend):
                 rows = encode(module, items)
+            if peak0 is not None:
+                out.encode_peak_bytes = vv.encode_peak_since(device, peak0)
             # (d): the encode's first item vs the rest (a cold first kernel
             # load shows as first >> per-item rest); encode_items fills it
             out.encode_ms = dict(getattr(module, "_weg2_encode_ms", {}) or {})
@@ -804,8 +912,15 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             out.ok = False
             out.code = (W_NO_ROOM if leg == "reserve"
                         else W_ENCODE if leg in ("items", "encode", "attach") else W_LOAD)
+            if isinstance(exc, (vv.VisionVictimShort, vv.VisionVictimPlanRefused, _StageDeadline)):
+                out.code = (vv.W_VICTIM_SHORT if isinstance(exc, vv.VisionVictimShort)
+                            else vv.W_VICTIM_PLAN_REFUSED if isinstance(exc, vv.VisionVictimPlanRefused)
+                            else W_TIMEOUT)
             out.detail = f"{leg}: {type(exc).__name__}: {exc}"
     finally:
+        if lease is not None:  # VISION-WEIGHTS: the victims back FIRST (plan §6.1/6.2)
+            _close_lease(out, lease, device, int(getattr(scheduler, "_weg2_vision_runs", 0) or 0))
+            lease = None
         t0 = clock()
         w0 = _enter("teardown")
         # VISION-GC-SKIP-1002: every tensor the tower held, weakly -- the full
@@ -936,10 +1051,16 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
         line += (f" gc={out.gc_mode or 'none'} gc_alive={out.gc_alive} "
                  f"read_cached_mib={out.cached_bytes / vrs.MIB:.1f} "
                  f"index={'cached' if out.index_cached else 'parsed'}")
+    if out.victim_fields:  # VISION-WEIGHTS: only a weights stage adds these
+        line += (f" {out.victim_fields} checksum={out.checksum or 'n/a'} "
+                 f"encode_peak_mib={_mib_or_na(out.encode_peak_bytes)} "
+                 f"planned_work_mib={_mib_or_na(out.planned_work_bytes)}")
     if out.ok:
         logger.info("%s %s rids=%s", W_STAGE_OK, line, list(rids))
     else:
         logger.error("%s %s rids=%s -- %s", out.code, line, list(rids), out.detail)
+    if out.victim_host_line:
+        logger.info(out.victim_host_line)
     leak, basis = teardown_leak_bytes(out)
     own = [s for s in out.survivors if s.own]
     foreign = [s for s in out.survivors if not s.own]
@@ -1269,7 +1390,9 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
         refusal = scheduler._weg2_vision_arm_refusal
         started = None
         _async_ok = False
-        if not refusal and vision_async_on():
+        # VISION-WEIGHTS (hook 4/4): a weights stage is synchronous, always
+        if (not refusal and vision_async_on()
+                and getattr(scheduler, "_weg2_vision_place", vrs.PLACE_AUTO) != vrs.PLACE_WEIGHTS):
             _async_ok, _why = vision_async_admissible(scheduler)
             if not _async_ok and not getattr(scheduler, "_weg2_vision_async_refused_said", False):
                 scheduler._weg2_vision_async_refused_said = True
@@ -1316,6 +1439,7 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
                     device=dev,
                     place=getattr(scheduler, "_weg2_vision_place", vrs.PLACE_AUTO),
                     source=getattr(scheduler, "_weg2_vision_source", None),
+                    victims=getattr(scheduler, "_weg2_vision_victims", None),
                 )
                 if dev.type == "cuda":
                     out.card = _nvml_index_of(dev.index if dev.index is not None else 0)
@@ -1324,6 +1448,15 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
                 out = StageOutcome(ok=False, code=W_LOAD,
                                    detail=f"stage: {type(exc).__name__}: {exc}")
             log_outcome(out, [r.rid for r in pending], scheduler._weg2_vision_runs)
+            if out.fatal:
+                # W110c: the ONE stage verdict that kills the group -- victim
+                # weight bytes did not come back, and a forward on them would
+                # serve wrong text (raenge-nie-uneins: crash-stop, never go on)
+                from sglang.srt.weg2.vision_victim import VisionVictimNotRestored
+
+                raise VisionVictimNotRestored(
+                    f"{out.fatal} -- rids={[r.rid for r in pending]}; the P group stops here, the "
+                    "watchdog/launcher restarts it")
             if not out.ok:
                 _refuse(scheduler, pending, out.code, out.detail)
                 held = pending + held

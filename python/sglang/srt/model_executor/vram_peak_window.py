@@ -145,6 +145,18 @@ def cum_peak_allocated(cuda) -> int:
     return max(int(_STATE["shadow_alloc"]), int(_max_allocated_bytes(cuda)))
 
 
+def fold_and_rebase(cuda) -> int:
+    """VISION-WEIGHTS (09.10.): a caller that opens its OWN peak window (the
+    vision encode) folds the counter into the shadow first, so
+    ``cum_peak_allocated`` keeps "since the pools"; returns the allocated
+    bytes now (the window's start)."""
+    pa, pr, a, _r = _peaks(cuda)
+    _STATE["shadow_alloc"] = max(int(_STATE["shadow_alloc"]), pa)
+    _STATE["shadow_reserved"] = max(int(_STATE["shadow_reserved"]), pr)
+    cuda.reset_peak_memory_stats()
+    return a
+
+
 def reset_since_pools() -> None:
     """``after pools`` re-based the counter: the shadow starts over with it,
     and the first window opens now."""
