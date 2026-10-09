@@ -386,14 +386,14 @@ def compute_model_identity_hash(
                 identity_parts.append(f"{name}={value}")
     # H88-D (D4): W4A8 experts (``--moe-act-int8 on`` / ``SGLANG_MOE_ACT_INT8``).
     # Activations are rounded to int8 before the expert GEMM, so the KV bytes of
-    # a page differ while its token-id key does not: another identity, but ONLY
-    # while the switch is on -- with it off nothing is appended and the key is
-    # byte-identical to the one persisted stores already carry. Appended after
-    # the vectors, outside the ``include_parallel_vectors`` gate: it answers
-    # "same weights math?", which the PD handshake and the L3 rank identity ask
-    # as well as the storage key does.
+    # a page differ while its token-id key does not: another identity, ONLY while
+    # the switch is on (off: nothing appended, key byte-identical). After the
+    # vectors, outside the ``include_parallel_vectors`` gate: "same weights
+    # math?" is asked by the PD handshake and the L3 rank identity too. The value
+    # "int8;s16" (``moe_act_switch.IDENTITY_VALUE``, ONE constant with launcher field
+    # ``moe_act``) names the scale encoding too; old "moe_act=int8" = other identity.
     if moe_act_int8_active(server_args):
-        identity_parts.append("moe_act=int8")
+        identity_parts.append(f"moe_act={_moe_act_switch.IDENTITY_VALUE}")
     identity_str = "|".join(identity_parts)
     return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
 

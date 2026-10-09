@@ -7553,7 +7553,7 @@ L3_ROPE_APPLY = "merge-v1"
 #: ``L3_PERSIST_GENERATION``; nothing is renamed, swept or invalidated).
 L3_MOE_ACT_FLAG = _moe_act_switch.MOE_ACT_INT8_FLAG
 L3_MOE_ACT_ENV = _moe_act_switch.MOE_ACT_INT8_ENV
-L3_MOE_ACT_VALUE = "int8"
+L3_MOE_ACT_VALUE = _moe_act_switch.IDENTITY_VALUE  # "int8;s16" (+ scale encoding), ONE value with the rank part
 
 
 def _l3_extra_flag(extra: str, flag: str) -> str:

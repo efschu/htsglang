@@ -6,7 +6,8 @@ Rules of the NF seat (memory nf-h88-w4a8-und-1243-auftrag-1007):
  (c) nobody sweeps, renames or invalidates the store, and ``generation`` (``L3_PERSIST_GENERATION`` = "706") is NOT raised.
 
 Mechanism under test: the field ``moe_act`` is added to ``launcher.l3_persist_identity`` (launcher side, directory digest and
-W57) and ``moe_act=int8`` to ``hicache_storage.compute_model_identity_hash`` (key suffix, PD handshake, L3 rank identity and
+W57) and ``moe_act=int8;s16`` (``moe_act_switch.IDENTITY_VALUE``; planer decision 1008: the value names the scale encoding too,
+the earlier ``moe_act=int8`` form is another identity) to ``hicache_storage.compute_model_identity_hash`` (key suffix, PD handshake, L3 rank identity and
 W165) ONLY while the switch (flag ``--moe-act-int8 on`` / env ``SGLANG_MOE_ACT_INT8=1``, registered by H88-E, read defensively
 here) is on. Off, both are byte-identical.
 
@@ -35,6 +36,12 @@ LAUNCH = json.load(open(os.path.join(HERE, "fixtures", "planer_1006", "golden", 
 LIVE_IDENT = FIX["identity"]
 LIVE_DIGEST = "dc6a8c2062"  # the plan's pin (running boot), also FIX["digest10"]
 LIVE_RANK_HASH = "9341197366e3616e"  # model_identity in the live L3_RANK_IDENTITY.<group>.json
+# planer decision 1008: the switch value names activation precision AND scale encoding (launcher field == rank part value)
+A8I_VALUE = "int8;s16"
+A8I_OLD_RANK_HASH = "40676341cb5764ad"  # rank identity of the earlier "moe_act=int8" form (other scale encoding)
+A8I_OLD_DIGEST = "47fff2c009"  # launcher dir digest of the earlier form (LIVE_IDENT + moe_act="int8")
+A8I_RANK_HASH = "df3c2335485b4873"  # rank identity now: sha256(<live parts>|moe_act=int8;s16)[:16]
+A8I_DIGEST = "df4005bac5"  # launcher dir digest now: sha1(json(LIVE_IDENT + moe_act="int8;s16"))[:10]
 
 
 def _flag(argv, name):
@@ -130,7 +137,7 @@ def test_switch_on_gives_another_hash_in_every_source(tmp_path, how):
     on = L.l3_persist_identity(str(model_dir), "nextflash", "", extra_p=ep, extra_d=ed, **kw)
     off = L.l3_persist_identity(str(model_dir), "nextflash", "", extra_p=_flag(argv, "--extra-p"),
                                 extra_d=_flag(argv, "--extra-d"), vision="transient", env_p=vp, env_d=vd, env={})
-    assert on["moe_act"] == "int8"
+    assert on["moe_act"] == A8I_VALUE
     assert "moe_act" not in off
     assert L.l3_persist_dir_name(on) != L.l3_persist_dir_name(off)
     assert {k: v for k, v in on.items() if k != "moe_act"} == off  # exactly one key more, nothing else moves
@@ -138,11 +145,11 @@ def test_switch_on_gives_another_hash_in_every_source(tmp_path, how):
 
 def test_switch_on_on_the_live_identity_is_not_dc6a8c2062_and_names_the_field(tmp_path):
     ident = _abl_derived_identity(tmp_path, moe_act_int8="on")
-    assert ident["moe_act"] == "int8"
+    assert ident["moe_act"] == A8I_VALUE
     assert L.l3_persist_dir_name(ident) != FIX["dir_name"]
     assert not L.l3_persist_dir_name(ident).endswith(LIVE_DIGEST)
     assert L.l3_persist_dir_name(ident).startswith("l3-nextflash-Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp-")
-    assert ident == dict(LIVE_IDENT, moe_act="int8")
+    assert ident == dict(LIVE_IDENT, moe_act=A8I_VALUE)
 
 
 def test_p_and_d_asymmetric_switch_is_refused_by_name_never_a_third_identity(tmp_path):
@@ -168,9 +175,9 @@ def test_p_and_d_asymmetric_switch_is_refused_by_name_never_a_third_identity(tmp
     # both groups on (any source) is the one valid "on"; neither is the default
     (tmp_path / "ok1").mkdir()
     (tmp_path / "ok2").mkdir()
-    assert _abl_derived_identity(tmp_path / "ok1", moe_act_int8="on")["moe_act"] == "int8"
+    assert _abl_derived_identity(tmp_path / "ok1", moe_act_int8="on")["moe_act"] == A8I_VALUE
     both = _abl_derived_identity(tmp_path / "ok2", env_p=_flag(argv, "--env-p") + on, env_d=_flag(argv, "--env-d") + on)
-    assert both["moe_act"] == "int8"
+    assert both["moe_act"] == A8I_VALUE
     # a d_only boot has no group P: only D's value counts, and a P-only switch is no asymmetry there
     assert L.l3_moe_act_resolve("", "--moe-act-int8 on", "", "", None, {}, d_only=True) is True
     assert L.l3_moe_act_resolve("--moe-act-int8 on", "", "", "", None, {}, d_only=True) is False
@@ -233,7 +240,7 @@ def test_process_env_on_and_both_groups_on_is_the_switch_identity(tmp_path):
     on = ";SGLANG_MOE_ACT_INT8=1"
     ident = _abl_derived_identity(tmp_path, env_p=_flag(argv, "--env-p") + on, env_d=_flag(argv, "--env-d") + on,
                                   env={"SGLANG_MOE_ACT_INT8": "1"})
-    assert ident["moe_act"] == "int8"
+    assert ident["moe_act"] == A8I_VALUE
 
 
 # ---------------------------------------------------------------- one predicate = the runtime's reading (review finding 2)
@@ -276,7 +283,7 @@ def test_y_in_both_group_envs_moves_launcher_and_rank_identity_alike(tmp_path, m
         sub.mkdir()
         ident = _abl_derived_identity(sub, env_p=_flag(argv, "--env-p") + f";SGLANG_MOE_ACT_INT8={y}",
                                       env_d=_flag(argv, "--env-d") + f";SGLANG_MOE_ACT_INT8={y}")
-        assert ident["moe_act"] == "int8"
+        assert ident["moe_act"] == A8I_VALUE
         monkeypatch.setenv("SGLANG_MOE_ACT_INT8", y)
         assert HS.compute_model_identity_hash(_sa(), include_parallel_vectors=False) != LIVE_RANK_HASH
 
@@ -343,7 +350,7 @@ def test_rank_identity_with_the_switch_differs_attr_and_env(monkeypatch):
         assert on != base_nov, attr
         assert on == HS.compute_model_identity_hash(_sa(moe_act_int8=attr))
     # recipe with the extra part, written out independently
-    parts = [FIX["rank_server_args"]["model_path"], "", "auto", "", "fp8_e4m3", "moe_act=int8"]
+    parts = [FIX["rank_server_args"]["model_path"], "", "auto", "", "fp8_e4m3", "moe_act=int8;s16"]
     assert HS.compute_model_identity_hash(_sa(moe_act_int8="on")) == hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
     for off in ("off", "0", "", None, False, "1", "true", "int8"):
         assert HS.compute_model_identity_hash(_sa(moe_act_int8=off), include_parallel_vectors=False) == base_nov, off
@@ -378,7 +385,7 @@ def test_rank_identity_record_moves_with_the_switch(tmp_path):
 def test_w57_a_store_of_the_default_identity_refuses_a_switch_on_boot_and_back(tmp_path):
     d = str(tmp_path / "store")
     default = dict(LIVE_IDENT)
-    on = dict(LIVE_IDENT, moe_act="int8")
+    on = dict(LIVE_IDENT, moe_act=A8I_VALUE)
     assert L.l3_persist_check_identity(d, default, dry=False) == "new"
     assert L.l3_persist_check_identity(d, default, dry=False) == "match"
     with pytest.raises(L.Weg2StoreDiskRefused) as e:
@@ -458,3 +465,64 @@ def test_the_resolve_main_runs_for_every_boot_is_a_noop_in_the_default(tmp_path)
     assert L.l3_moe_act_resolve(*args, None, {}) is False          # empty process env
     assert L.l3_moe_act_resolve(*args, None) is False              # os.environ, key removed by the autouse fixture
     assert "moe_act" not in _abl_derived_identity(tmp_path)        # and the identity does not grow the field
+
+
+# ---------------------------------------------------------------- (6) planer decision 1008: the value carries the scale encoding
+def test_s16_one_value_launcher_field_equals_rank_part():
+    """The launcher field ``moe_act`` and the rank part ``moe_act=<value>`` are ONE constant, "int8;s16"."""
+    from sglang.srt.weg2 import moe_act_switch as M
+
+    assert M.IDENTITY_VALUE == L.L3_MOE_ACT_VALUE == A8I_VALUE == "int8;s16"
+    # the rank part is "moe_act=" + the launcher field value: the recipe with the launcher's value IS the rank hash
+    parts = [FIX["rank_server_args"]["model_path"], "", "auto", "", "fp8_e4m3", "moe_act=" + L.L3_MOE_ACT_VALUE]
+    assert HS.compute_model_identity_hash(_sa(moe_act_int8="on")) == hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def test_s16_default_identity_is_untouched_launcher_and_rank(tmp_path):
+    """Rule (b) after the s16 change: switch off -> launcher digest dc6a8c2062 and rank identity 9341197366e3616e, byte for byte."""
+    ident = _abl_derived_identity(tmp_path)
+    assert "moe_act" not in ident
+    assert hashlib.sha1(json.dumps(ident, sort_keys=True).encode()).hexdigest()[:10] == LIVE_DIGEST
+    assert L.l3_persist_dir_name(ident) == FIX["dir_name"]
+    for off in (None, "off", False):
+        assert HS.compute_model_identity_hash(_sa(moe_act_int8=off)) == LIVE_RANK_HASH, off
+        assert HS.compute_model_identity_hash(_sa(moe_act_int8=off), include_parallel_vectors=False) == LIVE_RANK_HASH, off
+        assert HS.l3_rank_identity(_sa(moe_act_int8=off))["model_identity"] == LIVE_RANK_HASH, off
+
+
+def test_s16_old_a8i_value_pins_reproduce_from_the_old_recipe():
+    """The two old A8i pins are what the earlier "moe_act=int8" recipe gave (independent of the code under test)."""
+    parts = [FIX["rank_server_args"]["model_path"], "", "auto", "", "fp8_e4m3", "moe_act=int8"]
+    assert hashlib.sha256("|".join(parts).encode()).hexdigest()[:16] == A8I_OLD_RANK_HASH
+    old = dict(LIVE_IDENT, moe_act="int8")
+    assert hashlib.sha1(json.dumps(old, sort_keys=True).encode()).hexdigest()[:10] == A8I_OLD_DIGEST
+
+
+def test_s16_a8i_identity_differs_from_the_old_value_rank_side(monkeypatch):
+    """Red before the change (the rank part was "moe_act=int8" -> 40676341cb5764ad), green after."""
+    for sa in (_sa(moe_act_int8="on"), _sa(moe_act_int8=True)):
+        h = HS.compute_model_identity_hash(sa)
+        assert h != A8I_OLD_RANK_HASH and h != LIVE_RANK_HASH
+        assert h == A8I_RANK_HASH
+        assert HS.compute_model_identity_hash(sa, include_parallel_vectors=False) == A8I_RANK_HASH
+    monkeypatch.setenv("SGLANG_MOE_ACT_INT8", "1")
+    assert HS.compute_model_identity_hash(_sa()) == A8I_RANK_HASH != A8I_OLD_RANK_HASH
+
+
+def test_s16_a8i_identity_differs_from_the_old_value_launcher_side(tmp_path):
+    """Red before the change (field "int8" -> digest 47fff2c009), green after: a store of the old A8i form is never reused."""
+    ident = _abl_derived_identity(tmp_path, moe_act_int8="on")
+    assert ident["moe_act"] == A8I_VALUE
+    digest = hashlib.sha1(json.dumps(ident, sort_keys=True).encode()).hexdigest()[:10]
+    assert digest == A8I_DIGEST
+    assert digest not in (A8I_OLD_DIGEST, LIVE_DIGEST)
+    assert L.l3_persist_dir_name(ident).endswith("-abl-wxp-" + A8I_DIGEST)
+
+
+def test_s16_w57_a_store_of_the_old_a8i_form_refuses_the_new_one(tmp_path):
+    d = str(tmp_path / "store_old_a8i")
+    old = dict(LIVE_IDENT, moe_act="int8")
+    assert L.l3_persist_check_identity(d, old, dry=False) == "new"
+    with pytest.raises(L.Weg2StoreDiskRefused) as e:
+        L.l3_persist_check_identity(d, dict(LIVE_IDENT, moe_act=A8I_VALUE), dry=False)
+    assert "W57" in str(e.value) and "moe_act" in str(e.value)

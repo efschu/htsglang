@@ -349,7 +349,8 @@ class TestCatalog(unittest.TestCase):
         self.assertEqual((k134["von"], k134["nach"], k134["rel"]), ("--moe-act-int8", "--hicache-storage-backend", "skaliert_mit"))
         self.assertEqual(k134["baeume"], ["nf"])
         self.assertEqual(k134["beleg"]["datei"], "python/sglang/srt/mem_cache/hicache_storage.py")
-        self.assertEqual(k134["beleg"]["anker"], 'identity_parts.append("moe_act=int8")')
+        # planer decision 1008: the rank part carries the scale encoding ("int8;s16" = moe_act_switch.IDENTITY_VALUE)
+        self.assertEqual(k134["beleg"]["anker"], 'identity_parts.append(f"moe_act={_moe_act_switch.IDENTITY_VALUE}")')
         self.assertIn("launcher.py:7709", k134["satz"])
         with open(os.path.join(WEG2, "offen.txt"), encoding="utf-8") as fh:
             offen = fh.read()
@@ -565,7 +566,7 @@ class TestDryRun(unittest.TestCase):
 
     def test_the_switch_form_differs_from_the_golden_only_by_the_switch_and_what_follows_from_it(self):
         """H88-F (08.10.): with H88-B/C/D merged the switch has consequences in the dump, all named and nothing else:
-        (1) the switch itself in WEG2-GROUP-ENV P/D (H88-E), (2) the L3 store directory/identity carries ``moe_act=int8``
+        (1) the switch itself in WEG2-GROUP-ENV P/D (H88-E), (2) the L3 store directory/identity carries ``moe_act=int8;s16``
         (H88-D: dir suffix and the front's --store-dir), (3) the expert-store identity carries the layout (H88-C: H2c
         STORE-IDENTITY id + ' layout=marlin_w4a8') and (4) ONE new line 'H88C MOE-LAYOUT layout=marlin_w4a8 P=.. D=..'.
         Take those four out of the new lines and they ARE the golden lines."""
@@ -587,12 +588,12 @@ class TestDryRun(unittest.TestCase):
         m_new = re.search(r"-abl-wxp-([0-9a-f]{10})\b", "\n".join(rest))
         self.assertTrue(m_old and m_new)
         self.assertNotEqual(m_old.group(1), m_new.group(1))
-        self.assertTrue(any('"moe_act": "int8"' in x for x in rest))
+        self.assertTrue(any('"moe_act": "int8;s16"' in x for x in rest))
         self.assertTrue(any("SGLANG_MOE_ACT_INT8=1" in x for x in rest))
         norm = []
         for x in rest:
             x = x.replace(";SGLANG_MOE_ACT_INT8=1", "").replace("SGLANG_MOE_ACT_INT8=1;", "")
-            x = x.replace(m_new.group(1), m_old.group(1)).replace(' "moe_act": "int8",', "")
+            x = x.replace(m_new.group(1), m_old.group(1)).replace(' "moe_act": "int8;s16",', "")
             x = re.sub(r"(STORE[-_]IDENTITY[=_ ](?:id=)?)[0-9a-f]{24}", r"\1<ID>", x).replace(" layout=marlin_w4a8", "")
             norm.append(x)
         want_minus = [re.sub(r"(STORE[-_]IDENTITY[=_ ](?:id=)?)[0-9a-f]{24}", r"\1<ID>", x) for x in minus]

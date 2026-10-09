@@ -18,6 +18,15 @@ from typing import Any
 MOE_ACT_INT8_ENV = "SGLANG_MOE_ACT_INT8"
 MOE_ACT_INT8_FLAG = "--moe-act-int8"
 
+#: H88 (planer decision 1008): the value the switch writes into BOTH L3 identities -- the launcher field
+#: ``moe_act`` (``launcher.l3_persist_identity``) and the rank part ``moe_act=<value>``
+#: (``hicache_storage.compute_model_identity_hash``). It names the activation precision AND the scale
+#: encoding of the W4A8 experts (``s16``: the int16 band-encoded weight scales of the SCALEFIX layout), so
+#: a store written by the earlier ``moe_act=int8`` form (rank identity 40676341cb5764ad, other scale
+#: encoding) is never read back as this one. ONE constant for both sides: the two identities cannot drift
+#: apart. Only ever used while the switch is on (H88-D rule b: off adds nothing, the default identity stays).
+IDENTITY_VALUE = "int8;s16"
+
 #: byte for byte the true-set of ``sglang.srt.environ.EnvBool.parse`` (a test pins the two together)
 ENV_TRUE = ("true", "1", "yes", "y")
 FLAG_ON = "on"

@@ -16648,7 +16648,7 @@
       "nf"
      ],
      "beleg": {
-      "anker": "identity_parts.append(\"moe_act=int8\")",
+      "anker": "identity_parts.append(f\"moe_act={_moe_act_switch.IDENTITY_VALUE}\")",
       "aufloesung": "andere_linie",
       "datei": "python/sglang/srt/mem_cache/hicache_storage.py",
       "zeile": 396,
@@ -16656,11 +16656,11 @@
      },
      "belegt": true,
      "calc": "text",
-     "effect": "With the switch on the experts compute in int8 activations, so the L3 identity of the HiCache store carries its own field (H88-D rule a: new weight math is a new identity, the first boot of this form recomputes every L3 page once; rule b: with the switch off no key is added and persisted stores keep their identity byte for byte). The storage side appends 'moe_act=int8' to the identity string (hicache_storage.py:396); the launcher adds ident['moe_act'] = L3_MOE_ACT_VALUE for the persistent store directory (launcher.py:7709) and refuses the boot when P and D disagree (l3_moe_act_resolve).",
+     "effect": "With the switch on the experts compute in int8 activations, so the L3 identity of the HiCache store carries its own field (H88-D rule a: new weight math is a new identity, the first boot of this form recomputes every L3 page once; rule b: with the switch off no key is added and persisted stores keep their identity byte for byte). The storage side appends 'moe_act=int8;s16' (activation precision and scale encoding, moe_act_switch.IDENTITY_VALUE; the earlier 'moe_act=int8' form is another identity) to the identity string (hicache_storage.py:396); the launcher adds ident['moe_act'] = L3_MOE_ACT_VALUE (the same constant) for the persistent store directory (launcher.py:7709) and refuses the boot when P and D disagree (l3_moe_act_resolve).",
      "kante": "K134",
      "quelle": "katalog",
      "rel": "skaliert_mit",
-     "satz": "With the switch on the experts compute in int8 activations, so the L3 identity of the HiCache store carries its own field (H88-D rule a: new weight math is a new identity, the first boot of this form recomputes every L3 page once; rule b: with the switch off no key is added and persisted stores keep their identity byte for byte). The storage side appends 'moe_act=int8' to the identity string (hicache_storage.py:396); the launcher adds ident['moe_act'] = L3_MOE_ACT_VALUE for the persistent store directory (launcher.py:7709) and refuses the boot when P and D disagree (l3_moe_act_resolve).",
+     "satz": "With the switch on the experts compute in int8 activations, so the L3 identity of the HiCache store carries its own field (H88-D rule a: new weight math is a new identity, the first boot of this form recomputes every L3 page once; rule b: with the switch off no key is added and persisted stores keep their identity byte for byte). The storage side appends 'moe_act=int8;s16' (activation precision and scale encoding, moe_act_switch.IDENTITY_VALUE; the earlier 'moe_act=int8' form is another identity) to the identity string (hicache_storage.py:396); the launcher adds ident['moe_act'] = L3_MOE_ACT_VALUE (the same constant) for the persistent store directory (launcher.py:7709) and refuses the boot when P and D disagree (l3_moe_act_resolve).",
      "to": "--hicache-storage-backend",
      "to_kind": "flag",
      "wert": null
@@ -85790,7 +85790,7 @@
   "kuratiert": 121,
   "unerklaert": 602
  },
- "tree_rev": "27b=84d04adae1+nf=c651892375+h88sf",
+ "tree_rev": "27b=84d04adae1+nf=ae4ab773c0+h88ident",
  "trees": {
   "27b": {
    "entries": 2641,
@@ -85798,7 +85798,7 @@
   },
   "nf": {
    "entries": 2507,
-   "rev": "c651892375+h88sf"
+   "rev": "ae4ab773c0+h88ident"
   }
  },
  "warnungen": []
