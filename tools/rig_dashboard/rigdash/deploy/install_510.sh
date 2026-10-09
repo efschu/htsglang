@@ -20,8 +20,12 @@ check_only=0
 if [ "${1:-}" = "--check" ]; then check_only=1; shift; fi
 rev=${1:-HEAD}
 sha=$(git -C "$repo" rev-parse --short=10 "$rev")
-#: Revision, deren Planer-Dateien das Gate liefern (NF-Linie mit HW-GENERIC card_identity.py, Boot nfint4h6abldauer 03.10.)
-GATE_REV=${KARTENPLAN_GATE_REV:-044316dd1a}
+# F0-F (rename): the three pins below (044316dd1a, 136a929fa5, 3d729b672c) are PRE-rename commits: their planner files lie under
+# the pre-rename package path, the renamed dashboard loads python/flliper/srt/pdflip/ (kartenplan_gate.py, profil.py, modellprofil.py) -- the
+# old pins fail the cat-file checks below. The renamed line carries all of these modules in the deployed revision itself, so the default
+# of every pin is that revision ($sha); the env names still pin another renamed revision.
+#: Revision, deren Planer-Dateien das Gate liefern (renamed line: the deployed revision; before: NF line 044316dd1a with HW-GENERIC card_identity.py)
+GATE_REV=${KARTENPLAN_GATE_REV:-$sha}
 git -C "$repo" cat-file -e "$GATE_REV^{commit}" || { echo "REFUSED: Gate-Revision $GATE_REV nicht im Repo" >&2; exit 3; }
 for f in card_identity.py topology.py; do
   git -C "$repo" cat-file -e "$GATE_REV:python/flliper/srt/pdflip/$f" || { echo "REFUSED: $f fehlt in $GATE_REV" >&2; exit 3; }
@@ -30,13 +34,13 @@ done
 # desk/profil-editor-s1-py-1003 (nicht auf der Dashboard-Linie); PROFIL_REV nennt die Revision, aus der sie kommen (Env KARTENPLAN_PROFIL_REV).
 # Das Dashboard laedt sie per Dateipfad (profil.py); der Katalog liegt im rigdash-Release (rigdash/profil_data/catalog.json), die Nutzerprofile
 # in $FLLIPER_PROFILES_DIR (Standard /var/lib/flliper/profiles, derselbe Ort wie im Entrypoint).
-PROFIL_REV=${KARTENPLAN_PROFIL_REV:-136a929fa5}
+PROFIL_REV=${KARTENPLAN_PROFIL_REV:-$sha}
 git -C "$repo" cat-file -e "$PROFIL_REV^{commit}" || { echo "REFUSED: Revision $PROFIL_REV (Planer-Zweig des Profil-Editors) nicht im Repo" >&2; exit 3; }
 for f in profile_json.py refusals.py profile_catalog.py; do
   git -C "$repo" cat-file -e "$PROFIL_REV:python/flliper/srt/pdflip/$f" || { echo "REFUSED: $f fehlt in $PROFIL_REV" >&2; exit 3; }
 done
 # Auftrag 960 (S3): model_profile.py (Schaetzer, stdlib) liegt auf dem Zweig desk/profil-s3-modell-1003; MODELLPROFIL_REV nennt die Revision.
-MODELLPROFIL_REV=${KARTENPLAN_MODELLPROFIL_REV:-3d729b672c}
+MODELLPROFIL_REV=${KARTENPLAN_MODELLPROFIL_REV:-$sha}
 git -C "$repo" cat-file -e "$MODELLPROFIL_REV:python/flliper/srt/pdflip/model_profile.py" || { echo "REFUSED: model_profile.py fehlt in $MODELLPROFIL_REV" >&2; exit 3; }
 dst=/opt/rigdash/kartenplan/releases/$GATE_REV
 echo "Planer-Stufe: $dst  (card_identity.py, topology.py aus $GATE_REV)"

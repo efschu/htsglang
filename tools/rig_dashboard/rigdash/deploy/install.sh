@@ -16,6 +16,24 @@
 # außer mit RIGDASH_DEPLOY_ROLLBACK=1 (bewusster Rückschritt, Grund im Commit/Entscheidungslog).
 # Nur prüfen, nichts ändern: install.sh --check [<git-rev>]
 set -euo pipefail
+
+# --- state dir of the dashboard (F0-F, rename) -----------------------------------------------------------------------
+# New home: /var/lib/flliper (the product's state volume; hardware.json already lies there). A rig that ran the dashboard
+# BEFORE the rename keeps card history, history.sqlite and the live ring in /var/lib/rigdash: that directory stays the
+# state dir (fallback) as long as /var/lib/flliper holds no history of its own -- nothing is moved or copied, and a
+# deploy never starts the panels on an empty history. RIGDASH_STATE_DIR names one explicitly; RIGDASH_VARLIB is a test hook.
+# BEGIN state-dir
+pick_state_dir() {
+  local varlib=${RIGDASH_VARLIB:-/var/lib}
+  if [ -n "${RIGDASH_STATE_DIR:-}" ]; then echo "$RIGDASH_STATE_DIR"; return; fi
+  if [ ! -e "$varlib/flliper/history.sqlite" ] && [ -e "$varlib/rigdash/history.sqlite" ]; then
+    echo "$varlib/rigdash"
+  else
+    echo "$varlib/flliper"
+  fi
+}
+# END state-dir
+
 here=$(cd "$(dirname "$0")" && pwd)
 repo=${RIGDASH_REPO:-$(git -C "$here" rev-parse --show-toplevel)}
 check_only=0
@@ -83,9 +101,15 @@ fi
 ls -1dt /opt/rigdash/releases/*/ | tail -n +4 | grep -v "/$sha/" | xargs -r rm -rf || true
 ls -1dt /opt/rigdash/planner/releases/*/ | tail -n +4 | grep -v "/$tree/" | xargs -r rm -rf || true
 
-for u in rig-dashboard rig-planner; do
-  install -m 0644 "$dst/rigdash/deploy/$u.service" "/etc/systemd/system/$u.service"
-done
+state_dir=$(pick_state_dir)
+echo "state dir of rig-dashboard: $state_dir"
+# rig-dashboard.service is written for /var/lib/flliper; the fallback (or RIGDASH_STATE_DIR) is substituted at install time
+# (--state-dir and StateDirectory= name the same directory; StateDirectory= takes the part below /var/lib).
+sed -e "s#--state-dir /var/lib/flliper#--state-dir $state_dir#" \
+    -e "s#^StateDirectory=flliper\$#StateDirectory=${state_dir#/var/lib/}#" \
+    "$dst/rigdash/deploy/rig-dashboard.service" > /etc/systemd/system/rig-dashboard.service
+chmod 0644 /etc/systemd/system/rig-dashboard.service
+install -m 0644 "$dst/rigdash/deploy/rig-planner.service" /etc/systemd/system/rig-planner.service
 systemctl daemon-reload
 systemctl enable rig-dashboard.service rig-planner.service >/dev/null 2>&1
 systemctl restart rig-dashboard.service rig-planner.service

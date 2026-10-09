@@ -195,13 +195,13 @@ def docker_run_example(name: str, force: dict) -> List[str]:
     lines = []
     if force.get("show_line"):
         lines.append("# FLLIPER_FORCE=1 is needed only because the planner refuses: %s" % ", ".join(c["code"] for c in force["force_codes"]))
-    lines += ["docker run -d --name htsglang-mine \\",
+    lines += ["docker run -d --name flliper-mine \\",
               "  <the flags from section 3.3 of the README: --gpus, --shm-size, --memory, -p, model mounts> \\",
               "  -v flliper-state:/var/lib/flliper \\",
               "  -e MODE=pdflip -e FLLIPER_PROFILE=%s \\" % name]
     if force.get("show_line"):
         lines.append("  -e %s \\" % FORCE_ENV)
-    lines.append("  ghcr.io/efschu/htsglang:<tag> serve")
+    lines.append("  ghcr.io/efschu/flliper:<tag> serve")
     return lines
 
 

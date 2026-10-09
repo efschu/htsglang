@@ -59,6 +59,26 @@ def record_dir_for(root: str, model: Optional[str]) -> str:
     return os.path.join(root, model_id(model), RECORD_SUBDIR)
 
 
+def legacy_root_for(root: str) -> Optional[str]:
+    """F0-F (rename): the records root of the same line BEFORE the rename, or ``None``. The line's records root is
+    ``<evidence>/records/<subsystem>``; what the pre-rename tree wrote lies under the old subsystem name next to it
+    (``name_compat.STEM_TOKENS``: old, new) and is never moved or rewritten. A root that does not end in the new
+    subsystem name (``--env-d`` named another one) has no legacy sibling."""
+    from flliper.srt import name_compat as _nc
+
+    old, new = _nc.STEM_TOKENS
+    head, tail = os.path.split(str(root).rstrip("/"))
+    return os.path.join(head, old) if tail == new and head else None
+
+
+def record_dirs_for(root: str, model: Optional[str]) -> tuple:
+    """Every directory the launcher READS the rank records of ``model`` from: :func:`record_dir_for` of the root
+    (where the ranks write today) first, then that of the legacy root when there is one. Writers keep using
+    :func:`record_dir_for` alone."""
+    legacy = legacy_root_for(root)
+    return (record_dir_for(root, model),) + ((record_dir_for(legacy, model),) if legacy else ())
+
+
 def record_dir() -> Optional[str]:
     """The records root of the line, or ``None`` when off (read once per
     process)."""

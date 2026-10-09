@@ -1,4 +1,4 @@
-# The htsglang planner (capacity / feasibility / wizard / capability panels /
+# The fLLiper planner (capacity / feasibility / wizard / capability panels /
 # benchmark history) as an always-on, READ-ONLY companion of rig-dashboard:
 # http://192.168.0.88:8780/ .  Live P/D prefill and decode rates are NOT
 # computed here -- they live on rig-dashboard (:8890), from the boot logs.
@@ -16,7 +16,7 @@
 # The interpreter is the htsglang-gpu venv (torch + deps), used read-only.
 
 [Unit]
-Description=htsglang planner, read-only companion of rig-dashboard (LAN :8780)
+Description=fLLiper planner, read-only companion of rig-dashboard (LAN :8780)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
