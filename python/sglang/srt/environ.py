@@ -1112,6 +1112,22 @@ class Envs:
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).
     SGLANG_WEG2_PARK_STUCK_PHASES = EnvInt(3)
+    # PRIORITY LANES 1008 (plan deskq/PLAN-PRIO-LANES-1008.md, part L1; weg2/lanes.py): a
+    # request carries an integer `priority` (no number = lane 0, higher = higher lane, equal =
+    # same lane); between lanes the rule is strict displacement. 1 = the front reads the field,
+    # keeps lane_floor / lane_epoch / per-lane counters (state.json front.lane_floor,
+    # front.lane_epoch, front.lanes) and the Anthropic adapter forwards `priority`.
+    # Off (default) = the front does not read `priority`, no lane field in state.json, the
+    # request book or a log line. Read by the front and by both groups (the env is inherited).
+    SGLANG_WEG2_LANES = EnvBool(False)
+    # PRIORITY LANES 1008: seconds between the keepalive comment lines (`: lane-hold floor=N`)
+    # the front writes into a held SSE stream. Used only with SGLANG_WEG2_LANES=1 (the sender
+    # is part L4 of the plan; part L1 only declares the value).
+    SGLANG_WEG2_LANE_KEEPALIVE_S = EnvInt(15)
+    # PRIORITY LANES 1008: the P-side prefill chunk size in tokens while a higher lane waits;
+    # 0 = the normal chunk. Used only with SGLANG_WEG2_LANES=1 (part L3 of the plan reads it;
+    # part L1 only declares the value).
+    SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS = EnvInt(0)
     # TSDB (user 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md 1c): the front's
     # optional Influx-line push of one `weg2_req` point per finished request
     # to VictoriaMetrics (e.g. http://192.168.0.88:8428/write), bundled ~2 s in
