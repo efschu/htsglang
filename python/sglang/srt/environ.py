@@ -1084,8 +1084,9 @@ class Envs:
     # H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257),
     # then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs
     # the spill's arena pool (on hybrid boots
-    # SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL). Off = the old spill.
-    SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES = EnvBool(False)
+    # SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL). Default on (user decision
+    # 09.10.); 0 = the old spill.
+    SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES = EnvBool(True)
     # W3-ANCHOR-POOL (NF int20 1008_135412, P PP0 13:58-14:01): the W3-ARENA
     # spill (UnifiedRadixCache._w3_arena_spill) stopped at its first gate on
     # every hybrid boot -- the KV host pool is a HostPoolGroup whose
@@ -1106,8 +1107,9 @@ class Envs:
     # On: with no victim by the old rules, the shallowest settled END/deepest
     # anchor OFF the claimer's park chain is secured to L3 first
     # (arena_secure_to_disk) and then released -- never one whose copy could
-    # not be secured. Off = the old answer, byte for byte.
-    SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT = EnvBool(False)
+    # not be secured. Default on (user decision 09.10.); 0 = the old answer,
+    # byte for byte.
+    SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT = EnvBool(True)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).

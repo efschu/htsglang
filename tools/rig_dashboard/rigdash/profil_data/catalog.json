@@ -29635,7 +29635,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2522
+      "line": 2524
      }
     }
    },
@@ -29690,7 +29690,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2512
+    "line": 2514
    },
    "status": "geerntet",
    "text": "",
@@ -29713,7 +29713,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2558
+      "line": 2560
      }
     }
    },
@@ -38432,7 +38432,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4631
+    "line": 4633
    },
    "status": "unerklaert",
    "text": "",
@@ -38750,7 +38750,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4630
+    "line": 4632
    },
    "status": "geerntet",
    "text": "",
@@ -39303,7 +39303,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2193
+    "line": 2195
    },
    "status": "geerntet",
    "text": "",
@@ -39326,7 +39326,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2533
+      "line": 2535
      }
     }
    },
@@ -39495,7 +39495,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2537
+      "line": 2539
      }
     }
    },
@@ -39695,7 +39695,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1970
+    "line": 1972
    },
    "status": "geerntet",
    "text": "",
@@ -47654,7 +47654,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2202
+    "line": 2204
    },
    "status": "geerntet",
    "text": "",
@@ -47682,7 +47682,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2207
+    "line": 2209
    },
    "status": "geerntet",
    "text": "",
@@ -48710,7 +48710,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 3383
+    "line": 3385
    },
    "status": "kuratiert",
    "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
@@ -53833,7 +53833,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1701
+    "line": 1703
    },
    "status": "geerntet",
    "text": "",
@@ -65381,7 +65381,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1640
+    "line": 1642
    },
    "status": "erklaert",
    "text": "Protection against a mutual blockade when waking D to P: two groups wait in a circle for memory room. On: the waiting part counts its own waiting from the start of the wait; the resolution (swapping the rest out to host RAM) begins after about 0.1 s instead of about 0.6 s. Off: only after the wait flag has gone up after 0.5 s. Default off (preparation/experiment, \"Default off until metal A/B\"). According to the code necessary before SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED (is off) goes on again. Related: SGLANG_WEG2_BAR1_SPILL_GRACE_S (0.1 s). Acts only for the sending side. Not verified individually on the metal. No user value recognizable.",
@@ -66006,7 +66006,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1949
+      "line": 1951
      }
     }
    },
@@ -71098,7 +71098,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3666
+      "line": 3668
      }
     }
    },
@@ -71379,7 +71379,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2053
+      "line": 2055
      }
     }
    },
@@ -71457,7 +71457,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4338
+      "line": 4340
      }
     }
    },
@@ -71564,7 +71564,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2551
+      "line": 2553
      }
     }
    },
@@ -71878,7 +71878,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2073
+    "line": 2075
    },
    "status": "geerntet",
    "text": "",
@@ -72136,7 +72136,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1977
+    "line": 1979
    },
    "status": "geerntet",
    "text": "",
@@ -72159,7 +72159,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2542
+      "line": 2544
      }
     }
    },
@@ -72381,7 +72381,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4318
+      "line": 4320
      }
     }
    },
@@ -73126,7 +73126,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1988
+    "line": 1990
    },
    "status": "geerntet",
    "text": "",
@@ -73154,7 +73154,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1983
+    "line": 1985
    },
    "status": "geerntet",
    "text": "",
@@ -73182,7 +73182,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1100
+    "line": 1101
    },
    "status": "geerntet",
    "text": "",
@@ -73195,11 +73195,11 @@
    "bare": false,
    "choices": null,
    "cost": "",
-   "default": "False",
+   "default": "True",
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "W3-HOST-LEAF (NF int22, P 18:33:37-18:34:20Z, boot 1008_171755): the W3 spill found candidates=0 on all three stages -- it releases only host copies of device-resident nodes; the full KV arena freed nothing for a claim (ARENA-DROP freed=0). On (local-PP floor only, as UD-H): the 27B line's Q-697c host-only spill, ported (weg2/host_only_spill.py): host-only H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257), then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs the spill's arena pool (on hybrid boots SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL). Off = the old spill.",
+   "help": "W3-HOST-LEAF (NF int22, P 18:33:37-18:34:20Z, boot 1008_171755): the W3 spill found candidates=0 on all three stages -- it releases only host copies of device-resident nodes; the full KV arena freed nothing for a claim (ARENA-DROP freed=0). On (local-PP floor only, as UD-H): the 27B line's Q-697c host-only spill, ported (weg2/host_only_spill.py): host-only H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257), then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs the spill's arena pool (on hybrid boots SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL). Default on (user decision 09.10.); 0 = the old spill.",
    "id": "SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES",
    "kind": "env",
    "level": "experte",
@@ -73210,7 +73210,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1088
+    "line": 1089
    },
    "status": "geerntet",
    "text": "",
@@ -73709,7 +73709,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1219
+      "line": 1221
      }
     }
    },
@@ -73763,7 +73763,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1222
+    "line": 1224
    },
    "status": "geerntet",
    "text": "",
@@ -75651,7 +75651,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4438
+      "line": 4440
      }
     }
    },
@@ -77482,11 +77482,11 @@
    "bare": false,
    "choices": null,
    "cost": "",
-   "default": "False",
+   "default": "True",
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D mamba anchor arena (32 slots, 6 staging) held only END and deepest anchors, so the flush / park-first spill found victim=none (`#1427 ARENA-DROP ... slot_bytes=58834944 freed=0` x59, `WEG2-ANCHOR-LOST at=flush n=15` incl. the END anchor 112896 of the parked weg2-24-128). On: with no victim by the old rules, the shallowest settled END/deepest anchor OFF the claimer's park chain is secured to L3 first (arena_secure_to_disk) and then released -- never one whose copy could not be secured. Off = the old answer, byte for byte.",
+   "help": "MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D mamba anchor arena (32 slots, 6 staging) held only END and deepest anchors, so the flush / park-first spill found victim=none (`#1427 ARENA-DROP ... slot_bytes=58834944 freed=0` x59, `WEG2-ANCHOR-LOST at=flush n=15` incl. the END anchor 112896 of the parked weg2-24-128). On: with no victim by the old rules, the shallowest settled END/deepest anchor OFF the claimer's park chain is secured to L3 first (arena_secure_to_disk) and then released -- never one whose copy could not be secured. Default on (user decision 09.10.); 0 = the old answer, byte for byte.",
    "id": "SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT",
    "kind": "env",
    "level": "experte",
@@ -77497,7 +77497,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1110
+    "line": 1112
    },
    "status": "geerntet",
    "text": "",
@@ -77799,7 +77799,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4247
+      "line": 4249
      }
     }
    },
@@ -78360,7 +78360,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2418
+    "line": 2420
    },
    "status": "erklaert",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -78509,7 +78509,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1895
+    "line": 1897
    },
    "status": "geerntet",
    "text": "",
@@ -78566,7 +78566,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1918
+    "line": 1920
    },
    "status": "geerntet",
    "text": "",
@@ -81528,7 +81528,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1678
+      "line": 1680
      }
     }
    },
@@ -84997,7 +84997,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4425
+      "line": 4427
      }
     }
    },
@@ -85790,7 +85790,7 @@
   "kuratiert": 121,
   "unerklaert": 602
  },
- "tree_rev": "27b=84d04adae1+nf=ae4ab773c0+h88ident",
+ "tree_rev": "27b=84d04adae1+nf=dacc89e543+defon",
  "trees": {
   "27b": {
    "entries": 2641,
@@ -85798,7 +85798,7 @@
   },
   "nf": {
    "entries": 2507,
-   "rev": "ae4ab773c0+h88ident"
+   "rev": "dacc89e543+defon"
   }
  },
  "warnungen": []
