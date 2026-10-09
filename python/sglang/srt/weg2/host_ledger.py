@@ -2947,8 +2947,9 @@ def charge_terms(
     # hand-off (charged) and the shmem no class names (printed, ungebucht).
     census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
-    # VISION-WEIGHTS AP4: host image of the displaced weights (--weg2-vision-place weights), TRANSIENT: charged at the RUN moment only, 0 at launch
-    # and between images; 0.0 changes no number of any existing arm; a warning term (W20/W87 warn only, host-RAM rule 06.10.). Last parameter.
+    # VISION-WEIGHTS AP4: host image of the displaced weights (--weg2-vision-place weights), TRANSIENT (0 at launch
+    # and between images). A NAMED, PRINTED post only (ARM line, WEG2-HOST): in NO sum, so it never moves predicted_run_peak_gib, run_leftover,
+    # the chosen arm, W20 or W21 (host-RAM rule 06.10.: warning, never refusal). Last parameter.
     vision_victim_host_gib: float = 0.0,
 ) -> Dict[str, object]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
@@ -3241,8 +3242,9 @@ def _run_moment_charges_gib(terms: Dict[str, object]) -> float:
     """
     return (
         _boot_charges_gib(terms) + _flip_ratchet_charge_gib(terms)
-        # VISION-WEIGHTS AP4: the displaced weights wait in host RAM while an image is encoded -- a RUN-moment term (0 at launch and between images)
-        + float(terms.get("vision_victim_host_gib", 0.0) or 0.0)
+        # VISION-WEIGHTS AP4 (fix round 1): ``vision_victim_host_gib`` is deliberately NOT in this sum. It is a WARNING post only (printed in the
+        # ARM line and WEG2-HOST, user rule host RAM 06.10.): in any fundability sum it would move predicted_run_peak_gib / run_leftover and so
+        # the chosen arm, W20 and W21, i.e. turn a warning into a refusal.
         # rc12d: the lean history arms after the first sleep -- run moment only
         + (float(terms.get("memhist_gib", 0.0) or 0.0) if terms.get("memhist_run_only") else 0.0)
     )
@@ -4795,8 +4797,9 @@ def price(
     d_only: bool = False,
     reference_model_ok: Optional[bool] = None,
     reference_model_why: str = "",
-    # VISION-WEIGHTS AP4: host image of the displaced weights (--weg2-vision-place weights), TRANSIENT: charged at the RUN moment only, 0 at launch
-    # and between images; 0.0 changes no number of any existing arm; a warning term (W20/W87 warn only, host-RAM rule 06.10.). Last parameter.
+    # VISION-WEIGHTS AP4: host image of the displaced weights (--weg2-vision-place weights), TRANSIENT (0 at launch
+    # and between images). A NAMED, PRINTED post only (ARM line, WEG2-HOST): in NO sum, so it never moves predicted_run_peak_gib, run_leftover,
+    # the chosen arm, W20 or W21 (host-RAM rule 06.10.: warning, never refusal). Last parameter.
     vision_victim_host_gib: float = 0.0,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
@@ -6394,8 +6397,9 @@ def choose(
     # hand-off (charged) and the shmem no class names (printed, ungebucht).
     census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
-    # VISION-WEIGHTS AP4: host image of the displaced weights (--weg2-vision-place weights), TRANSIENT: charged at the RUN moment only, 0 at launch
-    # and between images; 0.0 changes no number of any existing arm; a warning term (W20/W87 warn only, host-RAM rule 06.10.). Last parameter.
+    # VISION-WEIGHTS AP4: host image of the displaced weights (--weg2-vision-place weights), TRANSIENT (0 at launch
+    # and between images). A NAMED, PRINTED post only (ARM line, WEG2-HOST): in NO sum, so it never moves predicted_run_peak_gib, run_leftover,
+    # the chosen arm, W20 or W21 (host-RAM rule 06.10.: warning, never refusal). Last parameter.
     vision_victim_host_gib: float = 0.0,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
