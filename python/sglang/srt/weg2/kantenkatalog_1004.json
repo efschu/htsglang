@@ -400,9 +400,9 @@
      "beleg": {"datei": "python/sglang/srt/weg2/launcher.py", "zeile": 23018, "anker": "D's W50 riegel = the LOWER of the curves' envelope and"}},
     {"id": "K135", "von": "SGLANG_WEG2_LANE_KEEPALIVE_S", "nach": "SGLANG_WEG2_LANES", "rel": "braucht", "calc": "text", "wert": null,
      "satz": "The keepalive period of a held SSE stream (default 15 s) is used only with SGLANG_WEG2_LANES=1; without the lane switch no request has a lane and the value does nothing.",
-     "beleg": {"datei": "python/sglang/srt/environ.py", "zeile": 1096, "anker": "SGLANG_WEG2_LANE_KEEPALIVE_S = EnvInt(15)"}},
+     "beleg": {"datei": "python/sglang/srt/environ.py", "zeile": 1096, "anker": "SGLANG_WEG2_LANE_KEEPALIVE_S = EnvInt(15)"}, "baeume": ["nf"]},
     {"id": "K136", "von": "SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS", "nach": "SGLANG_WEG2_LANES", "rel": "braucht", "calc": "text", "wert": null,
      "satz": "The P-side chunk size while a higher lane waits (0 = the normal chunk) is used only with SGLANG_WEG2_LANES=1; without the lane switch the value does nothing.",
-     "beleg": {"datei": "python/sglang/srt/environ.py", "zeile": 1100, "anker": "SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS = EnvInt(0)"}}
+     "beleg": {"datei": "python/sglang/srt/environ.py", "zeile": 1100, "anker": "SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS = EnvInt(0)"}, "baeume": ["nf"]}
   ]
 }
