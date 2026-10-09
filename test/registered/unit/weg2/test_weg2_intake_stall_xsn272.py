@@ -213,7 +213,7 @@ def test_xsn286_a_requeued_request_is_ordinary_again_after_its_next_leg1():
     from sglang.srt.weg2 import front as fr
     src = open(fr.__file__).read()
     i = src.index("async def one(p: Pending) -> Pending:")
-    blk = src[i:i + 3000]  # xsn291: the too-large branch sits in between; DP-NACHLAUF 02.10.: the early-leg await too
+    blk = src[i:i + 3300]  # LANES L4: the take-off-P guard sits in between too; xsn291: the too-large branch sits in between; DP-NACHLAUF 02.10.: the early-leg await too
     j = blk.index("await self.leg1(p)")          # the real leg 1, not the skip_leg1 stub
     k2 = blk.index("p.leg1_done = True", j)
     assert "p.intake_stalled = False" in blk[k2:k2 + 700]

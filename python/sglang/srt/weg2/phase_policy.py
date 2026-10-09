@@ -155,9 +155,35 @@ def wait_bound_fired(wait_s: Optional[float], bound_s: float) -> bool:
     return bound_s > 0 and wait_s is not None and wait_s >= bound_s
 
 
+#: PRIORITY LANES 1008 (L4): the park stamp of a request D holds for a LANE (``hold="lane"``): it never lapses.
+#: D keeps such a park until the lane floor falls (no 30-s requeue, no #248h capacity requeue), so the front's
+#: part-B clock must not count it as running again. ``float("inf")`` makes every ``now - t`` comparison False
+#: without a special case at any of the lapse sites.
+LANE_PARK_STAMP = float("inf")
+#: the body keys of the lane park (``POST /weg2/park_running``, L2 reads them)
+LANE_PARK_HOLD = "lane"
+PARK_REASON_LANE = "lane-preempt"
+
+
+def lane_park_body(epoch: int, rids: Sequence[str], floor: int, lane_epoch: int) -> dict:
+    """PRIORITY LANES 1008 (L4 -> L2): ``POST /weg2/park_running`` for exactly ``rids`` (the lower-lane requests D
+    runs), held for the lane: ``{"epoch", "reason", "rids", "hold": "lane", "floor", "lane_epoch"}``. Without
+    ``rids`` / ``hold`` the body is :func:`park_body`'s, so an old D that ignores the new keys would park every
+    running request -- the front reads the answer's ``parked`` list and parks nothing it was not told about."""
+    body = park_body(epoch, 0.0, reason=PARK_REASON_LANE)
+    body["rids"] = [str(r) for r in rids]
+    body["hold"] = LANE_PARK_HOLD
+    body["floor"] = int(floor)
+    body["lane_epoch"] = int(lane_epoch)
+    return body
+
+
 def parked_lapsed(t_parked: float, now: float) -> bool:
     """Part B re-queues a parked request no sleep followed after
-    :data:`PARK_REQUEUE_S`; from then on it is running on D again."""
+    :data:`PARK_REQUEUE_S`; from then on it is running on D again. A lane park
+    (:data:`LANE_PARK_STAMP`) is held by D until the floor falls and never lapses."""
+    if t_parked == LANE_PARK_STAMP:
+        return False
     return float(now) - float(t_parked) >= PARK_REQUEUE_S
 
 

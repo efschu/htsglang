@@ -165,6 +165,7 @@ from sglang.srt.weg2 import usage_true as _ut  # USAGE-TRUE: the client sees the
 from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
 from sglang.srt.weg2 import session_trace as _st  # SESSION-TRACE: session hash + shared prefix
 from sglang.srt.weg2 import lanes as _lanes  # PRIORITY LANES 1008 (L1): request field + lane state, default off
+from sglang.srt.weg2 import lane_ctl as _lctl  # PRIORITY LANES 1008 (L4): the lane controller, default off
 # DASHBOARD-IPC 01.10. (stdlib only, imported HERE: no first import on the loop, weg2rc2)
 from sglang.srt.weg2 import front_requests as _frq  # front.flip / d_activity / ttft_by_via / request_done
 from sglang.srt.weg2 import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
@@ -3423,10 +3424,23 @@ class Group:
         return "prefill" if self.name == "P" else "decode"
 
 
+def _lane_late_done(on_done):
+    """PRIORITY LANES 1008 (L4): the done-callback of a held leg whose drain pool already returned."""
+    def _cb(t) -> None:
+        if t.cancelled() or t.exception() is not None:
+            return
+        try:
+            on_done(t.result())
+        except Exception as e:  # noqa: BLE001 -- a late hand-over never breaks the loop
+            logger.warning("WEG2 LANE late leg-1 hand-over failed: %r", e)
+    return _cb
+
+
 async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
                         stats: Optional[Dict[str, int]] = None,
-                        extra=None, poll_s: float = 0.0, cap_exempt=None) -> int:
+                        extra=None, poll_s: float = 0.0, cap_exempt=None, lane_held=None,
+                        lane_take=None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -3465,6 +3479,18 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     holds for its store read); with it the pool also wakes every ``poll_s``
     while legs are in flight, not only on a completion. ``stats`` then also
     counts ``overlap_dispatched``.
+
+    PRIORITY LANES 1008 (L4, ``lane_held``): ``lane_held(item)`` True = this in-flight leg is held for a higher
+    lane (L3 stopped it at a chunk border). A held leg counts against neither the concurrency limit, nor the
+    phase cap, nor the pool plan -- the higher lane's leg must be dispatched beside it -- and a drain whose only
+    in-flight legs are held RETURNS instead of waiting for them (they finish in a later phase; ``on_done`` runs
+    from a done-callback then). The pool wakes every 0.1 s so a floor that moved is noticed. ``None`` = off.
+
+    ``lane_take`` (async ``(items, cancel_all)``): when ONLY held legs are left, the pool hands them to it instead
+    of leaving them on P -- a held leg parked in P's waiting queue is not idle for the P->D witness (W3), and
+    nothing would run it again after the floor fell. The callback marks the Pendings, calls ``cancel_all()``
+    (their ``one`` tasks end with the Pending, un-prefilled), takes them off P by rid and keeps them for the lane
+    resume; the pool then waits for the tasks and returns when they are gone. ``None`` = the late-callback form.
     """
     inflight: Dict[Any, int] = {}
     inflight_tokens = 0
@@ -3476,6 +3502,7 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     # dispatch order, which is the queue's (arrival) order.
     seq: Dict[Any, int] = {}
     items: Dict[Any, Any] = {}
+    taken: set = set()  # PRIORITY LANES 1008 (L4): tasks already handed to ``lane_take``
     rounds = 0
     if stats is not None:
         for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds", "overlap_dispatched",
@@ -3501,22 +3528,36 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
         except Exception:  # noqa: BLE001 - the instrument never stops the drain
             return limit
 
+    def _held() -> Tuple[int, int]:
+        if lane_held is None:
+            return 0, 0
+        n_h = tok_h = 0
+        for t_, it_ in items.items():
+            try:
+                if lane_held(it_):
+                    n_h += 1
+                    tok_h += inflight.get(t_, 0)
+            except Exception:  # noqa: BLE001 - the predicate never stops the drain
+                pass
+        return n_h, tok_h
+
     while True:
         dispatched = False
-        while queue and len(inflight) < _cap() and may_dispatch():
+        _nh, _th = _held()
+        while queue and (len(inflight) - _nh) < _cap() and may_dispatch():
             idx = 0
             ride = False
-            if phase_policy.phase_cap_reached(dispatched_total, max_dispatch):
+            if phase_policy.phase_cap_reached(dispatched_total - _nh, max_dispatch):
                 idx = _exempt_index()
                 if idx is None:
                     break
                 ride = True
             c = int(cost(queue[idx])) if (cost is not None and budget > 0) else 0
-            if not phase_policy.p_overlap_admits(inflight_tokens, len(inflight), c, budget):
+            if not phase_policy.p_overlap_admits(inflight_tokens - _th, len(inflight) - _nh, c, budget):
                 if stats is not None:
                     stats["pool_holds"] += 1
                 break
-            _beyond = len(inflight) >= limit
+            _beyond = (len(inflight) - _nh) >= limit
             if idx == 0:
                 item = queue.popleft()
             else:
@@ -3541,13 +3582,38 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
             rounds += 1
         if not inflight:
             return rounds
+        if lane_held is not None:
+            _nh, _th = _held()
+            if len(inflight) - _nh <= 0:
+                # every leg still in flight is held for a higher lane: they cannot finish before the floor falls,
+                # so this drain ends (the P->D flip follows)
+                _fresh = [_t for _t in inflight if _t not in taken]
+                if lane_take is not None and _fresh:
+                    # take them OFF P before the flip (they would stay in P's waiting queue: not idle, W3), keep
+                    # them for the lane resume; the tasks end with the Pending and are read below
+                    taken.update(_fresh)
+                    try:
+                        await lane_take([items[_t] for _t in _fresh],
+                                        lambda _ts=tuple(_fresh): [_t.cancel() for _t in _ts])
+                    except Exception as _e:  # noqa: BLE001 -- the late-callback form is the fallback
+                        logger.warning("WEG2 LANE-P-TAKE failed: %r -- the held legs stay on P (late hand-over)", _e)
+                        for _t in _fresh:
+                            _t.add_done_callback(_lane_late_done(on_done))
+                        return rounds
+                elif lane_take is None:
+                    for _t in list(inflight):
+                        _t.add_done_callback(_lane_late_done(on_done))
+                    return rounds
         done, _pending = await asyncio.wait(
             set(inflight), return_when=asyncio.FIRST_COMPLETED,
-            timeout=(poll_s if (extra is not None and poll_s > 0 and queue) else None))
+            timeout=(0.1 if lane_held is not None
+                     else poll_s if (extra is not None and poll_s > 0 and queue) else None))
         for t in sorted(done, key=seq.__getitem__):
             inflight_tokens -= inflight.pop(t, 0)
             seq.pop(t, None)
             items.pop(t, None)
+            if t in taken and t.cancelled():
+                continue  # PRIORITY LANES 1008 (L4): cancelled before it ran; ``lane_take`` kept its Pending
             on_done(t.result())
 
 
@@ -3659,6 +3725,22 @@ class Pending:
     #: PRIORITY LANES 1008 (L1, weg2/lanes.py): the request's lane (its `priority`, no number = 0).
     #: Set only with SGLANG_WEG2_LANES=1; off it stays 0 and nothing reads it.
     lane: int = 0
+    #: PRIORITY LANES 1008 (L4): seconds this request was HELD for a higher lane. ``t_arrive`` stays the ORIGINAL
+    #: arrival (order, "oldest first"); every wait clock counts from ``t_arrive + lane_held_s``
+    #: (weg2/lane_ctl.clock_t). Always 0 with the switch off.
+    lane_held_s: float = 0.0
+    #: PRIORITY LANES 1008 (L4): active | held | resuming (weg2/lanes.LANE_STATES); "" with the switch off.
+    lane_state: str = ""
+    #: PRIORITY LANES 1008 (L4): this leg 1 was taken off P for a higher lane (``lane_ctl.p_take``): its ``one`` task
+    #: ends with the Pending un-prefilled, no hand-off to D, no failure answer; reset at the lane resume.
+    lane_p_taken: bool = False
+    #: PRIORITY LANES 1008 (L4 FR2): this leg 1 runs AGAIN after it was taken off P (``lane_ctl.p_take``) or its
+    #: early leg was cancelled for a lane hold; the P response of that re-run is checked for the prefix the first
+    #: run left (``lane_ctl.retake_check``, LANE-REPREFILL). ``lane_p_ran_s``: seconds the first run stood on P at the
+    #: take; ``lane_p_done_tokens``: tokens P reported finished at the take (0 = P reports none, today's case).
+    lane_retake: bool = False
+    lane_p_ran_s: float = 0.0
+    lane_p_done_tokens: int = 0
 
 
 #: H102 (#23p, dkrnfbar1agent0925): A CLIENT THAT HANGS UP BEFORE ITS ANSWER
@@ -4713,6 +4795,9 @@ class Front:
         D no longer runs them, so neither the drain nor the W3 witness may
         wait for or count them. For P, and for a D with nothing parked, this
         is the ledger itself."""
+        if g.name == "P" and _lanes.enabled():
+            # PRIORITY LANES 1008 (L4): a P leg held for a higher lane waits for its lane, not for this flip
+            return _lctl.p_ledger(self, g)
         parked = getattr(self, "_d_parked", None) or {}
         # RVP-DRAIN (27B rc12z7b 07:51:45Z, weg2-12-22/14-23/14-25/14-27): a
         # request D refused mid-stream (W50-REROUTE) is HELD by D -- stream
@@ -4770,8 +4855,11 @@ class Front:
         if dst != "D":
             return {}
         parked = getattr(self, "_d_parked", None) or {}
+        _lane_parked = Front._lane_parked_set(self)  # PRIORITY LANES 1008 (L4): held by D for a lane, not resumed
+        if _lane_parked:
+            parked = {r: t for r, t in parked.items() if r not in _lane_parked}
         D = (getattr(self, "groups", None) or {}).get("D")
-        held = [r for r in (getattr(D, "outstanding", None) or {}) if r not in parked]
+        held = [r for r in (getattr(D, "outstanding", None) or {}) if r not in parked and r not in _lane_parked]
         ready = [p for p in (getattr(self, "_ready_for_d", None) or ())
                  if getattr(p, "fut", None) is None or not p.fut.done()]
         try:
@@ -4780,6 +4868,7 @@ class Front:
             inflight = 0
         out = {"handoff_n": len(held) + len(ready) + max(0, inflight),
                "parked_n": len(parked)}
+        out.update(Front._lane_wake_fields(self))  # PRIORITY LANES 1008 (L4): {} with the switch off
         try:
             defer = Front._seat_rotate_plan(self, parked, ready)
         except Exception as e:  # noqa: BLE001 -- a plan never breaks the wake
@@ -4982,6 +5071,7 @@ class Front:
             self.queue.append(p)
             self._rvp_inflight.add(rid)
             self.counters["rvp_rerouted"] += 1
+            Front._lane_reprefill(self, rid)  # PRIORITY LANES 1008 (L4): a lane resume without a prefix is counted
             if str(r.get("reason", "")).startswith("x_refusal_midstream"):
                 self.counters["route_reroute_midstream"] = self.counters.get("route_reroute_midstream", 0) + 1  # FEHLT 8
             logger.warning(
@@ -5211,7 +5301,7 @@ class Front:
             # comes at its end, or earlier when D runs nothing or a hard cap binds.
             x_tok = int(self.tp_prefill_max_tokens)
             # the queued requests that need P, read by the park trigger's own reader
-            items = [(float(q.t_arrive), int(q.est_uncached)) for q in self.queue
+            items = [(_lctl.clock_t(q), int(q.est_uncached)) for q in self.queue
                      if phase_policy.immediate_park_trigger([q], x_tok) is not None]
             threshold = int(envs.SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS.get()) or x_tok
             round_trip_s, rt_src = self._park_collect_window_s()
@@ -5382,7 +5472,7 @@ class Front:
                 int(self.tp_prefill_max_tokens), int(self._x_band_floor()),
                 bool(getattr(immediate, "x_deferred", False)),
                 bool(getattr(immediate, "p_only", False)), int(getattr(immediate, "x_requeues", 0) or 0),
-                max(0.0, now - float(immediate.t_arrive)), max(0.0, now - float(self.t_awake)),
+                max(0.0, now - _lctl.clock_t(immediate)), max(0.0, now - float(self.t_awake)),
                 len(running), len(self._ready_for_d), len(self.queue),
                 "parking the running decodes, then the flip to P" if running
                 else "nothing running: the flip to P follows without a park")
@@ -5390,7 +5480,7 @@ class Front:
             self.counters["wait_bound_fired"] += 1
             # ROS-1P: a served / finished request (future done) is not waiting.
             oldest = max((p for p in self.queue if not p.fut.done()),
-                         key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
+                         key=lambda p: phase_policy.d_phase_wait_s(_lctl.clock_t(p), self.t_awake, now),
                          default=None)
             logger.warning(
                 "WEG2 WAIT-BOUND FIRED epoch=%d oldest_rid=%s waited_s=%.1f bound_s=%.1f "
@@ -5893,6 +5983,8 @@ class Front:
                     "close theirs at the server bound (H78, x174 leg 1 'Server disconnected')",
                     "force_close" if _ka_client is None else "%.1f s" % _ka_client, _ka_server, _ka_src)
         app["controller"] = asyncio.create_task(self.controller())
+        if _lanes.enabled():  # PRIORITY LANES 1008 (L4): the lane loop (floor sync, straggler parks, keepalive)
+            app["lane_ctl"] = asyncio.create_task(_lctl.loop(self))
         app["admitter"] = asyncio.create_task(self.d_admitter())
         app["health"] = asyncio.create_task(self.health_poller())
         app["corridor"] = asyncio.create_task(self.corridor_sampler())
@@ -7199,6 +7291,158 @@ class Front:
         ls = self.__dict__.get("_lane_state_obj")
         if ls is not None:
             ls.end(rid)
+        lc = self.__dict__.get("_lane_ctl_obj")  # PRIORITY LANES 1008 (L4): the rid leaves every lane register
+        if lc is not None:
+            lc.forget(rid)
+            _lctl.kick(self)  # an end may empty the floor lane: the lane loop looks now
+
+    # ---- PRIORITY LANES 1008 (L4): the lane controller's hooks (weg2/lane_ctl.py). Every one returns before it
+    # looks at a lane when SGLANG_WEG2_LANES is off. ----
+    def _lane_parked_set(self) -> set:
+        lc = self.__dict__.get("_lane_ctl_obj")
+        # booked parks: the confirmed ones and the dormant bookings D has not confirmed yet (lane_ctl._park_d)
+        return (set(lc.parked_d) | set(lc.dormant)) if lc is not None else set()
+
+    def _lane_wake_fields(self) -> Dict[str, int]:
+        """The wake message to D carries the floor.  Informational only: D's ``ResumeMemoryOccupationReqInput`` is
+        parsed with ``extra_behavior='ignore'`` (utils/msgspec_utils.py), so nothing on D relies on it -- the floor
+        RPC and the park RPC after the wake are the contract."""
+        if not _lanes.enabled():
+            return {}
+        ls = self.__dict__.get("_lane_state_obj")
+        if ls is None or ls.lane_floor <= 0:
+            return {}
+        return {"lane_floor": int(ls.lane_floor), "lane_epoch": int(ls.lane_epoch)}
+
+    def _lane_unpark_keep(self, parked) -> dict:
+        """P->D wake: take the lane parks out of ``_d_parked`` for the PARK-RESUME and hand them back."""
+        lc = self.__dict__.get("_lane_ctl_obj")
+        if lc is None or not parked:
+            return {}
+        keep = {r: parked[r] for r in list(parked) if r in lc.parked_d or r in lc.dormant}
+        for r in keep:
+            parked.pop(r, None)
+        if lc.dormant:
+            lc.park_tried = 0.0  # D is awake now: the park RPC for the unconfirmed dormant bookings goes at once
+        return keep
+
+    async def _lane_arrive(self, request, rid: str, payload) -> Optional[web.StreamResponse]:
+        """After ``_lane_note``: reconcile the floor, and hold a request that arrived BELOW it before any pricing,
+        seat or queue place. Returns a response only when the client left while it was held."""
+        if not _lanes.enabled():
+            return None
+        if isinstance(payload, dict) and payload.get("stream"):
+            _lctl.pre_register(self, rid, request)  # L4 FR2: a held stream is opened for its keepalive
+        try:
+            out = await _lctl.arrive(self, request, rid, client_gone, web)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- the lane layer never loses a request
+            logger.exception("WEG2 LANE-ARRIVE rid=%s failed: %r -- the request goes on unheld", rid, e)
+            return None
+        lc = self.__dict__.get("_lane_ctl_obj")
+        if out is None and lc is not None and rid in lc.gate_done:
+            # it was held: the clocks of the rule start at the release (held time counts against no bound)
+            if _asr.enabled():
+                self._asr_arrival_note(rid)
+            self._x_last_arrival = time.time()
+        return out
+
+    async def _lane_reconcile(self, cause: str = "controller") -> None:
+        if not _lanes.enabled():
+            return
+        try:
+            await _lctl.reconcile(self, cause)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- the lane layer never stops the controller's pass
+            logger.exception("WEG2 LANE reconcile (%s) failed: %r -- the pass goes on", cause, e)
+
+    def _lane_kick(self) -> None:
+        if _lanes.enabled():
+            _lctl.kick(self)
+
+    def _lane_stamp(self, p: "Pending") -> "Pending":
+        """A Pending created after the gate: original arrival kept as the order, the hold as the clock offset."""
+        if _lanes.enabled():
+            _lctl.stamp(self, p)
+        return p
+
+    def _lane_p_held(self, p: "Pending") -> bool:
+        return _lctl.lane_held_leg(self, p)
+
+    def _lane_held_pendings(self) -> List["Pending"]:
+        lc = self.__dict__.get("_lane_ctl_obj")
+        return [h.p for h in lc.held.values()] if lc is not None else []
+
+    def _lane_health_hold(self, g: "Group", fp_dir: str) -> Optional[str]:
+        """W17 / health poll: a group whose requests all wait behind a higher lane runs no forward -- that is a
+        hold, not a stall (weg2/progress_beacon.lane_hold)."""
+        if not _lanes.enabled():
+            return None
+        ls = self.__dict__.get("_lane_state_obj")
+        lc = self.__dict__.get("_lane_ctl_obj")
+        if ls is None or lc is None or ls.lane_floor <= 0:
+            return None
+        from sglang.srt.weg2 import progress_beacon as _fp
+
+        held = any(ls.lane_for(r) < ls.lane_floor for r in list(g.outstanding))
+        if not held and g.name == "P":
+            held = bool(lc.held)  # waiting requests are P's to prefill next
+        lane = _fp.read_group_lane(fp_dir, g.name, g.sid) if fp_dir else {}
+        return _fp.lane_hold(ls.lane_floor, ls.lane_epoch, lane, held,
+                             acked=lc.acked.get(g.name) == (ls.lane_floor, ls.lane_epoch))
+
+    def _lane_reprefill(self, rid: str, why: str = "") -> None:
+        """LANE-REPREFILL: a request that was held / parked for a lane found no prefix at its resume (D asked for a
+        P prefill, RESUME-VIA-P) -- the displacement chain (VRAM -> L2 -> L3) did not keep its KV. Must count 0 on
+        metal; a count is the chain's fault, not the lane's (plan decision 3)."""
+        if not _lanes.enabled():
+            return
+        lc = self.__dict__.get("_lane_ctl_obj")
+        if lc is None or str(rid) not in lc.ever_held:
+            return
+        lc.reprefill.add(str(rid))
+        self.counters["lane_reprefill"] += 1
+        logger.warning("%s rid=%s lane=%d floor=%d epoch=%d -- the resume of a lane-held request found no prefix: "
+                       "P prefills its context again (RESUME-VIA-P); the VRAM->L2->L3 chain did not keep its KV "
+                       "(must count 0 on metal)%s", _lanes.MARK_REPREFILL, rid, Front._lane_state(self).lane_for(rid),
+                       Front._lane_state(self).lane_floor, Front._lane_state(self).lane_epoch,
+                       (" [" + why + "]") if why else "")
+
+    def _lane_stream_open(self, rid: str, request, resp):
+        return _lctl.stream_open(self, rid, request, resp)
+
+    async def _lane_pre_finish(self, request, out, exc):
+        """The handler of a request whose SSE response the lane loop OPENED EARLY (``lane_ctl.pre_*``) ended with
+        something else than that response -- a ``json_response`` 503, an HTTPException, a raised error: the status
+        line is sent already, so the answer becomes ONE named error event on the open stream and the stream is
+        closed. Returns the open response, or None when the request has no early-opened response (the caller goes
+        on as before)."""
+        pre = request.get("weg2_lane_pre") if hasattr(request, "get") else None
+        if pre is None or out is pre:
+            return None
+        if exc is not None:
+            msg = f"{type(exc).__name__}: {exc}"
+        else:
+            msg = ""
+            try:
+                body = getattr(out, "body", None)
+                msg = (body.decode(errors="replace") if isinstance(body, (bytes, bytearray))
+                       else str(getattr(out, "text", "") or ""))[:400]
+            except Exception:  # noqa: BLE001
+                msg = ""
+            msg = f"status={getattr(out, 'status', '?')} {msg}".strip()
+        self.counters["lane_pre_error_event"] += 1
+        logger.warning("WEG2 LANE-SSE-ERROR rid=%s path=%s -- the stream was opened early for the keepalive and "
+                       "the request ended with an answer that is no stream: sent as an error event, stream "
+                       "closed (%s)", request.get("weg2_lane_rid", "?"), request.path, msg[:200])
+        try:
+            await pre.write(named_error_chunk(request.path, f"WEG2 lane hold ended with an error: {msg}"))
+            await pre.write_eof()
+        except Exception:  # noqa: BLE001 -- a client that left
+            pass
+        return pre
 
     def _lane_block(self) -> dict:
         """``{lane_floor, lane_epoch, lanes}`` for state.json / ``/weg2/state``; ``{}`` with the switch off
@@ -7208,12 +7452,17 @@ class Front:
         try:
             q = [p.rid for p in list(getattr(self, "queue", None) or ())]
             q += [p.rid for p in list(getattr(self, "_ready_for_d", None) or ())]
+            lc = self.__dict__.get("_lane_ctl_obj")
+            if lc is not None:  # PRIORITY LANES 1008 (L4): held ones are still pending, in their own lane
+                q += lc.held_rids() + list(lc.gates) + list(lc.waiter_held)
             gp, gd = self.groups.get("P"), self.groups.get("D")
-            return Front._lane_state(self).state_block(
+            blk = Front._lane_state(self).state_block(
                 pending=q,
                 running_p=list(getattr(gp, "outstanding", None) or ()),
                 running_d=list(getattr(gd, "outstanding", None) or ()),
                 parked=list(getattr(self, "_d_parked", None) or ()))
+            blk.update(_lctl.hold_block(self))  # front.lane_hold: only once the controller holds something
+            return blk
         except Exception:  # noqa: BLE001 -- an instrument, never the route
             return {}
 
@@ -8074,7 +8323,7 @@ class Front:
         if self.__dict__.get("_flip_phase_obj") is not None:  # DASHBOARD-IPC: no flip after a STOP
             self._flip_phase_obj.abort(time.time(), "front_stop")
             Front._ipc_live_kick(self)
-        for p in list(self.queue) + list(self._ready_for_d):
+        for p in list(self.queue) + list(self._ready_for_d) + Front._lane_held_pendings(self):
             if not p.fut.done():
                 p.fut.set_exception(self.stop)
         for p in list(self.queue):  # Q-1368: no early leg outlives the STOP unread
@@ -9301,6 +9550,14 @@ class Front:
         logger.warning("WEG2-CLIENT-GONE rid=%s state=%s action=%s wait_s=%.1f (H102)",
                        rid, state, action,
                        max(0.0, time.time() - p.t_arrive) if p is not None else 0.0)
+        if _lanes.enabled():
+            # PRIORITY LANES 1008 (L4): a lane request whose client left may empty the floor lane -- the lane
+            # loop looks now (its handler's end takes the rid out of the lane register)
+            lc = self.__dict__.get("_lane_ctl_obj")
+            if lc is not None and p is not None:
+                for k in [k for k, h in lc.held.items() if h.p is p]:
+                    lc.held.pop(k, None)
+            _lctl.kick(self)
 
     async def handle_abort(self, request: web.Request) -> web.Response:
         payload = await request.json()
@@ -9311,6 +9568,9 @@ class Front:
             if rid in grp.outstanding:
                 grp.outstanding.pop(rid, None)
         (getattr(self, "_d_parked", None) or {}).pop(rid, None)  # H91 part C: parked rid leaves too
+        for p in Front._lane_held_pendings(self):  # PRIORITY LANES 1008 (L4): a held request is abortable too
+            if (p.rid == rid or p.payload.get("rid") == rid) and not p.fut.done():
+                p.fut.set_exception(web.HTTPRequestTimeout(text="aborted"))
         for p in list(self.queue):
             if p.rid == rid or p.payload.get("rid") == rid:
                 self.queue.remove(p)
@@ -9344,7 +9604,19 @@ class Front:
             if task is not None:
                 live.add(task)
             try:
-                return await handler(request)
+                if not _lanes.enabled():
+                    return await handler(request)
+                try:
+                    out = await handler(request)
+                except (asyncio.CancelledError, Weg2Stop):
+                    raise
+                except Exception as e:  # noqa: BLE001 -- an exception after the early SSE open: an error event
+                    out = await Front._lane_pre_finish(self, request, None, e)
+                    if out is None:
+                        raise
+                    return out
+                fin = await Front._lane_pre_finish(self, request, out, None)
+                return out if fin is None else fin
             except asyncio.CancelledError:
                 if (self.state != "STOP" or task is None
                         or not getattr(task, "_weg2_stop_cancel", False)
@@ -9451,6 +9723,14 @@ class Front:
         if isinstance(payload, dict):
             payload["rid"] = rid  # #1442: P and D see the same rid (the hand-off key)
         text = request_text(payload)
+        # PRIORITY LANES 1008: the request's lane (L1, a no-op with SGLANG_WEG2_LANES off: the front does not read
+        # `priority`), then the GATE (L4): a higher lane preempts at once (deferred during a flip), a request that
+        # arrived BELOW the floor waits here -- before pricing, a seat or a queue place -- and keeps its original
+        # arrival. Placed before the pricing so a long hold never routes on a stale price.
+        Front._lane_note(self, rid, payload)
+        _lane_out = await Front._lane_arrive(self, request, rid, payload)
+        if _lane_out is not None:
+            return _lane_out
         # #49: a text D served in THIS epoch counts with everything D computed
         # for it -- but only while D is the awake, serving group. Queued or
         # P-phase arrivals are priced on the measured cached share alone (D
@@ -9486,9 +9766,6 @@ class Front:
         # Q-530 SALT-ISOLATION: the namespace is noted at the arrival, so every
         # recording site knows it even when the exact count falls back
         Front._ns_note(self, rid, payload)
-        # PRIORITY LANES 1008 (L1): the request's lane, read from the raw payload (a no-op with
-        # SGLANG_WEG2_LANES off: the front does not read `priority`)
-        Front._lane_note(self, rid, payload)
         _pb_fut = Front._pb_register(self, rid, remainder) if self.x_exact else None
         # EARLY-FLIP: D idle and a chars/3 price far over X -> the D->P flip begins
         # NOW, beside the count and the probe below; it awaits this verdict
@@ -9837,6 +10114,7 @@ class Front:
                     lane=Front._lane_for(self, rid))
         if _pb_to_p is not None:
             p.d_eligible = False  # PRICE-BARRIER: it rides the LONG's P phase, never handed back to D
+        Front._lane_stamp(self, p)  # PRIORITY LANES 1008 (L4): original arrival + hold as clock offset
         if _sk and self.awake == "D" and self.admit_d and self.state == "serving":
             # SK: D is awake -- the kept SHORT waits in D's own admission line,
             # BEHIND the batch work that held the gate (no overtaking, no flip
@@ -10025,6 +10303,12 @@ class Front:
                 busy = f"arrival_in_window={self._rid - arrivals0}"
             else:
                 busy = self._x_solo_busy()
+            if busy is None and _lanes.enabled():
+                _ls = self.__dict__.get("_lane_state_obj")
+                if _ls is not None and _ls.lane_floor > 0 and _ls.lane_for(rid) < _ls.lane_floor:
+                    # PRIORITY LANES 1008 (L4): the floor rose inside the window -- a request below it never goes
+                    # to D as a singleton; routed to P it queues, and the lane sweep holds it
+                    busy = f"lane_floor={_ls.lane_floor}"
         self.counters["x_solo_d" if busy is None else "x_solo_p"] += 1
         logger.info("WEG2 X-SOLO rid=%s uncached=%d X_live=%d verdict=%s reason=%s "
                     "(band floor = X_busy %d, the start X unless --x-busy-tokens; window_ms=%d; "
@@ -10432,11 +10716,11 @@ class Front:
             return "P"
         if live_q is None:
             live_q = [p for p in self.queue if not p.fut.done()]
-        fresh = [p for p in live_q if float(getattr(p, "t_arrive", now) or now) > st["t_rel"]]
+        fresh = [p for p in live_q if _lctl.clock_t(p, now) > st["t_rel"]]
         if st["t_open"] is None:
             if not (fresh or st["shorts"]) or not self._dc_decoding():
                 return None
-            ts = [float(getattr(p, "t_arrive", now) or now) for p in fresh] + [t for t, _ in st["shorts"].values()]
+            ts = [_lctl.clock_t(p, now) for p in fresh] + [t for t, _ in st["shorts"].values()]
             st["t_open"] = min(ts) if ts else now
         x_tok = int(self.tp_prefill_max_tokens)
         unc = [int(getattr(p, "est_uncached", 0) or 0) for p in fresh] + [u for _, u in st["shorts"].values()]
@@ -10519,7 +10803,7 @@ class Front:
                 self._dc_p_cap = 1  # the displacement made room for one
             return res
         st = self._asr_st()
-        wait_s = _asr.oldest_wait_s([p.t_arrive for p in live_q] + list(st["waiters"].values()),
+        wait_s = _asr.oldest_wait_s([_lctl.clock_t(p) for p in live_q] + Front._asr_waiter_clocks(self, st),
                                     self.t_awake, now)
         if _asr.bound_fired(wait_s, bound):
             await self._arrival_seat_park_youngest(D, wait_s, bound, now)
@@ -10604,6 +10888,14 @@ class Front:
 
     #: NF-STAU: arrival stamps kept for the TTFT clocks (bounded, oldest out)
     ASR_ARRIVALS_KEPT = 4096
+
+    def _asr_waiter_clocks(self, st: dict) -> List[float]:
+        """The ARRIVAL-SEAT waiters' wait clocks: the order stamp plus the time the lane held the waiter
+        (``st["lane_off"]``, PRIORITY LANES 1008 L4; empty with the switch off)."""
+        off = st.get("lane_off")
+        if not off:
+            return list(st["waiters"].values())
+        return [t + float(off.get(r, 0.0)) for r, t in st["waiters"].items()]
 
     def _asr_arrival_note(self, rid: str) -> None:
         d = self.__dict__.setdefault("_asr_arrive", collections.OrderedDict())
@@ -10998,6 +11290,14 @@ class Front:
         waiters = st["waiters"]
         fits_of = st.setdefault("fits", {})
         waiters[rid] = time.time()
+        _lane_on = _lanes.enabled()
+        if _lane_on:
+            # PRIORITY LANES 1008 (L4): a request released from the arrival gate keeps its ORIGINAL arrival as the
+            # order stamp, and the time it waited at the gate is its clock offset
+            _g = (self.__dict__.get("_lane_ctl_obj") and self._lane_ctl_obj.gate_done.get(rid)) or None
+            if _g is not None:
+                waiters[rid] = _g[0]
+                st.setdefault("lane_off", {})[rid] = float(_g[1])
         told = None
         age_plan = _asr.age_plan_enabled()
         bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
@@ -11005,6 +11305,10 @@ class Front:
             while True:
                 if not (self.awake == "D" and self.admit_d and self.state == "serving"):
                     return False
+                if _lane_on and _lctl.waiter_hold(self, st, rid):
+                    # held for a higher lane: no seat, no clock, no displacement -- until the floor falls
+                    await asyncio.sleep(0.05)
+                    continue
                 head = min(waiters.items(), key=lambda kv: kv[1])[0]
                 taken, n = self._arrival_seat_taken()
                 free = _asr.seat_free(taken, n)
@@ -11028,8 +11332,9 @@ class Front:
                     # free seat it cannot use) and the head has not waited the bound
                     older = [r for r, t in waiters.items() if t < waiters[rid]]
                     backfill = (all(fits_of.get(r) is False for r in older)
-                                and _asr.backfill_allowed(time.time() - max(waiters[head], self.t_awake),
-                                                          bound))
+                                and _asr.backfill_allowed(
+                                    time.time() - max(waiters[head] + float((st.get("lane_off") or {}).get(head, 0.0)),
+                                                      self.t_awake), bound))
                 if free and fits and (head == rid or backfill):
                     st["granted"][rid] = time.time()
                     self.counters["arrival_seat_d_prefill"] += 1
@@ -11053,6 +11358,11 @@ class Front:
         finally:
             waiters.pop(rid, None)
             fits_of.pop(rid, None)
+            if _lane_on:
+                (st.get("lane_off") or {}).pop(rid, None)
+                _lc = self.__dict__.get("_lane_ctl_obj")
+                if _lc is not None:
+                    _lc.waiter_held.pop(rid, None)
             if age_plan:
                 st.setdefault("age_plan", {}).pop(rid, None)
                 st.setdefault("age_told", {}).pop(rid, None)
@@ -11157,7 +11467,7 @@ class Front:
         handed = self._asr_queued_short_to_d(live_q, now) if live_q else []
         if handed:
             live_q = [p for p in live_q if all(p is not h for h in handed)]
-        wait_s = _asr.oldest_wait_s([p.t_arrive for p in live_q] + list(st["waiters"].values()),
+        wait_s = _asr.oldest_wait_s([_lctl.clock_t(p) for p in live_q] + Front._asr_waiter_clocks(self, st),
                                     self.t_awake, now)
         age_plan = _asr.age_plan_enabled()
         if _asr.bound_fired(wait_s, bound) and not age_plan:
@@ -11173,7 +11483,7 @@ class Front:
             # non-candidate too -- an entry no rule takes must not wait for
             # ever behind FLIP-ECONOMICS (300 s there); fired, the flip to P
             # takes the backlog (the fairness bound's path)
-            q_wait = _asr.oldest_wait_s([p.t_arrive for p in live_q], self.t_awake, now)
+            q_wait = _asr.oldest_wait_s([_lctl.clock_t(p) for p in live_q], self.t_awake, now)
             if live_q and _asr.bound_fired(q_wait, bound):
                 head = min(live_q, key=lambda q: float(q.t_arrive))
                 if st.get("wait_any_rid") != head.rid:
@@ -11218,7 +11528,7 @@ class Front:
             # arrival (arrival order among the fitting ones) that fits takes it.
             # The head is asked first on every tick; past the bound backfill
             # stops and (c) displaces for the head.
-            head_wait = now - max(float(head.t_arrive), float(self.t_awake))
+            head_wait = now - max(_lctl.clock_t(head), float(self.t_awake))
             if _asr.backfill_allowed(head_wait, bound):
                 for q in cands[1:]:
                     f2, why2 = await self._arrival_seat_fits(
@@ -11266,7 +11576,7 @@ class Front:
         229 s on 'wait_seat why=kv', 17 younger requests admitted past it)."""
         st = self._asr_st()
         p = min(cands, key=lambda c: float(getattr(c, "t_arrive", now) or now))
-        waited = now - max(float(getattr(p, "t_arrive", now) or now), float(self.t_awake))
+        waited = now - max(_lctl.clock_t(p, now), float(self.t_awake))
         if waited > 2.0 and st.get("pbound_stall_rid") != p.rid:
             st["pbound_stall_rid"] = p.rid
             self.counters["arrival_seat_pbound_stall"] += 1
@@ -11823,6 +12133,8 @@ class Front:
                     return task.result()
                 now = time.time()
                 t_evidence = max(t_evidence, getattr(self, "_p_leg1_done_t", 0.0))
+                if _lanes.enabled() and Front._lane_p_held(self, p):
+                    t_evidence = now  # PRIORITY LANES 1008 (L4): a leg held for a higher lane is no stall
                 if now - t_sample >= 10.0:
                     t_sample = now
                     try:
@@ -11889,6 +12201,8 @@ class Front:
                 js = {}
             pt, ct, _, _ = usage_of(js)
             p.leg1_prompt_tokens = pt
+            if p.lane_retake:
+                _lctl.retake_check(self, p, pt, ct)  # PRIORITY LANES 1008 (L4 FR2): LANE-REPREFILL on a lost prefix
             self._note_p_prefix_reuse(p, ct)
             # #1324: NO PRESENCE RECORD HERE. This site used to call
             # `self.spans.record(p.text, pt)`, i.e. it credited the span
@@ -12517,13 +12831,20 @@ class Front:
                         and envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get()):
                     self._p_anchor_presence(rid, text, pending)
                 if stream:
-                    resp = web.StreamResponse(
-                        status=r.status,
-                        headers=({"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)}
-                                 if r.status == 503 else None))
-                    resp.content_type = r.content_type
-                    await resp.prepare(request)
+                    # PRIORITY LANES 1008 (L4 FR2): a stream held long enough was opened early (200 + SSE) so it
+                    # could get its keepalive; leg 2 continues on THAT response (None = the normal path, always
+                    # so with the switch off)
+                    resp = await _lctl.pre_take(self, request, rid) if _lanes.enabled() else None
+                    if resp is None:
+                        resp = web.StreamResponse(
+                            status=r.status,
+                            headers=({"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)}
+                                     if r.status == 503 else None))
+                        resp.content_type = r.content_type
+                        await resp.prepare(request)
                     request["weg2_prepared"] = True   # W3-STOP: a STOP closes this stream, no 503 after it
+                    # PRIORITY LANES 1008 (L4): the open stream, for the keepalive of a held one (None = off)
+                    _lane_stream = Front._lane_stream_open(self, rid, request, resp)
                     tail = bytearray()
                     # Q0-B: the Anthropic prompt count arrives ONCE, at the
                     # head of the stream, and the bounded tail below trims the
@@ -12633,6 +12954,9 @@ class Front:
                                                       chunk=chunk, path=request.path)
                         try:
                             await resp.write(chunk)
+                            if _lane_stream is not None:  # the border the keepalive needs, the quiet it counts from
+                                _lane_stream["boundary"] = chunk.endswith(b"\n\n")
+                                _lane_stream["t_last"] = time.time()
                         except ConnectionError as e:
                             # aiohttp's ClientConnectionResetError is a
                             # ConnectionResetError; the drain waiter's
@@ -14135,7 +14459,7 @@ class Front:
         Front._flip_phase(self).layer(f"{src}>{dst}", t_flip0, _vreason)
         Front._ipc_live_kick(self)
         if src == "D" and dst == "P":
-            _live = [q.t_arrive for q in self.queue if getattr(q, "fut", None) is None or not q.fut.done()]
+            _live = [_lctl.clock_t(q) for q in self.queue if getattr(q, "fut", None) is None or not q.fut.done()]
             self._ipc_dp_clock().begin(self.epoch, t_flip0, min(_live) if _live else None)
             # DP-NACHLAUF: leg 1 of the queue head goes to the dormant P now
             if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
@@ -14677,6 +15001,8 @@ class Front:
         # starts again at its next observation on the awake D.
         self._d_free_since = None
         _h91_parked = getattr(self, "_d_parked", None)
+        # PRIORITY LANES 1008 (L4): the lane parks stay parked over this wake (D holds them until the floor falls)
+        _lane_keep = Front._lane_unpark_keep(self, _h91_parked) if dst == "D" else None
         if dst == "D" and _h91_parked:
             # H91 part C rule 3: D is awake again and resumes the requests it
             # parked on the wait bound FIRST (D orders them). From here they
@@ -14690,6 +15016,8 @@ class Front:
             self._park_resume_epoch = self.epoch
             Front._seat_rotate_note_resume(self, list(_h91_parked))  # #244
             _h91_parked.clear()
+        if _lane_keep:
+            _h91_parked.update(_lane_keep)
         if dst == "D":
             self._asr_clear_parked("flip-to-D")  # NF-STAU: D resumed every park
             # DASHBOARD-IPC: every park the front booked ends with D awake again
@@ -14716,6 +15044,7 @@ class Front:
         self._flip_stage = "none"
         # C8: phase dwell restarts here, and the L2 admission ordinal with it.
         self.t_awake = time.time()
+        Front._lane_kick(self)  # PRIORITY LANES 1008 (L4): a deferred lane preempts after WEG2-FLIP done
         try:  # #1455 WEG2-FLIP-TIMELINE: every stage as a delta to the flip begin, one line
             _m = self._flip_marks
             _b = _m.get("drain", self.t_awake)
@@ -15959,7 +16288,9 @@ class Front:
                 _ro_state = _ro.ReadState(urllib.parse.urlparse(self.groups["P"].url).port)
             except Exception:  # noqa: BLE001
                 _ro_state, _ro_max = None, 0
-        sem = asyncio.Semaphore(self.p_concurrency + _ahead + _ro_max)
+        # PRIORITY LANES 1008 (L4): legs held for a higher lane keep their slot; the pool enforces the real limit
+        sem = asyncio.Semaphore(self.p_concurrency + _ahead + _ro_max
+                                + (_lctl.SEM_EXTRA if _lanes.enabled() else 0))
         logger.info("WEG2 P-READ-OVERLAP max_extra=%d state=%s (RO: legs P holds for a store "
                     "read free a dispatch slot each; 0 = the p_concurrency+ahead cap alone)",
                     _ro_max, getattr(_ro_state, "path", None))
@@ -15971,6 +16302,9 @@ class Front:
             try:
                 if self.state != "serving":
                     continue
+                # PRIORITY LANES 1008 (L4): the LANE branch comes before everything else -- the floor is brought
+                # to the highest open lane (preempt / resume) before this pass reads queue, parks or flips.
+                await Front._lane_reconcile(self, "controller")
                 self._hl_sweep()  # #243 seam: lost hand-offs of waiting rids -> P
                 self._rvp_take()
                 if self.awake == "D":
@@ -15989,7 +16323,7 @@ class Front:
                     if _x_rg == "moved":
                         continue
                     self._drop_lapsed_parks()
-                    oldest = self.queue[0].t_arrive if self.queue else None
+                    oldest = _lctl.clock_t(self.queue[0]) if self.queue else None
                     # H91 part C rule 3: with the wait bound armed it is the
                     # D phase's pre-emption and REPLACES the fairness switch
                     # here (the fairness bound, 45 s, would otherwise close
@@ -16000,7 +16334,7 @@ class Front:
                     wait_fired = False
                     if self.d_wait_bound_s > 0:
                         wait_s = phase_policy.oldest_d_phase_wait(
-                            (p.t_arrive for p in self.queue), self.t_awake, time.time())
+                            (_lctl.clock_t(p) for p in self.queue), self.t_awake, time.time())
                         wait_fired = phase_policy.wait_bound_fired(wait_s, self.d_wait_bound_s)
                         fairness_fired = wait_fired or not self.admit_d
                     elif _asr.enabled():
@@ -16168,6 +16502,8 @@ class Front:
                                     return p
                                 await self.leg1(p)
                         except Exception as e:  # noqa: BLE001
+                            if p.lane_p_taken:  # LANES L4: ended by the take-off-P abort, kept for the resume
+                                return p
                             if p.client_gone:  # H102: aborted on P for a client that left
                                 self.counters["leg1_client_gone"] += 1
                                 return p
@@ -16197,8 +16533,22 @@ class Front:
                         p.intake_stalled = False
                     return p
 
+                if _lanes.enabled():
+                    _one_inner = one
+
+                    async def one(p: Pending) -> Pending:  # noqa: F811 -- PRIORITY LANES 1008 (L4)
+                        # a leg taken off P for a higher lane ends by cancel: the Pending comes back un-prefilled
+                        try:
+                            return await _one_inner(p)
+                        except asyncio.CancelledError:
+                            if p.lane_p_taken:
+                                return p
+                            raise
+
                 def _on_leg1_done(p: Pending) -> None:
                     nonlocal _drain_uncached, prefilled
+                    if p.lane_p_taken:
+                        return  # PRIORITY LANES 1008 (L4): taken off P for a higher lane, kept in the lane register
                     if p.intake_stalled:
                         return  # weg2xsn272: back in the queue, not ready for D
                     if p.client_gone:
@@ -16243,6 +16593,9 @@ class Front:
                     extra=(None if _ro_state is None else
                            (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
                     poll_s=_ro.POLL_S,
+                    # PRIORITY LANES 1008 (L4): legs held for a higher lane stand beside the pool, not in it
+                    lane_held=((lambda p: Front._lane_p_held(self, p)) if _lanes.enabled() else None),
+                    lane_take=((lambda its, cancel: _lctl.p_take(self, its, cancel)) if _lanes.enabled() else None),
                     # FLIPCYCLE H5: the phase cap never strands a SHORT
                     # (the seat gate's cap is hard: a SHORT needs a D seat too)
                     cap_exempt=(self._p_phase_short_rides
@@ -16504,6 +16857,9 @@ class Front:
                 _cur = _fp.read_group(_fp_dir, g.name, g.sid)
                 _fp_why = _fp.progress(_fp_prev.get(g.name, {}), _cur)
                 _fp_prev[g.name] = _cur
+            if _fp_why is None and _lanes.enabled():
+                # PRIORITY LANES 1008 (L4): a group whose requests all wait behind a higher lane is on hold
+                _fp_why = Front._lane_health_hold(self, g, _fp_dir)
             if ok and alive and hold is None:
                 g.health_fail_streak = 0
                 g.health_facts = _fh.GroupFacts(True, True, 0, None, time.time())

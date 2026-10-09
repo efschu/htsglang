@@ -200,6 +200,28 @@ def progress(prev: Dict[int, Tuple[int, int, int]], cur: Dict[int, Tuple[int, in
     return None
 
 
+def lane_hold(front_floor: int, front_epoch: int,
+              group_lane: Optional[Dict[int, Tuple[int, int]]] = None,
+              held: bool = False, acked: bool = False) -> Optional[str]:
+    """PRIORITY LANES 1008 (L4): why a group that shows NO forward progress is on a LANE HOLD and not stalled.
+
+    A group whose requests all wait behind a higher lane runs no forward: ``forward_ct`` stands, nothing is in
+    forward -- the picture a watchdog (W17 / H86 / the front's leg-1 stall) reads as a stall. It is a hold when
+    the front keeps the lane floor above 0, the front holds requests of this group below it (``held``: parked on
+    D, in flight on P, or waiting for it) AND the group knows the floor: either a rank's beacon trailer (written
+    by L2 / L3 with :func:`beat_lane`) shows the front's epoch, or the front's floor RPC to the group was
+    acknowledged (``acked``; a group without the trailer, 32-byte files, is read through the RPC alone).
+    Returns a short reason or None (None = no hold: the stall reading stands)."""
+    if not held or int(front_floor) <= 0:
+        return None
+    for pid, (floor, epoch) in sorted((group_lane or {}).items()):
+        if int(epoch) == int(front_epoch) and int(floor) == int(front_floor):
+            return f"lane-hold floor={int(floor)} epoch={int(epoch)} (pid {pid})"
+    if acked:
+        return f"lane-hold floor={int(front_floor)} epoch={int(front_epoch)} (floor RPC acknowledged)"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # FLIPZEIT D>P END (user order 02.10., NF + 27B identical names): FLIPZEIT runs
 # from the last token of the outgoing phase to the first token of the incoming
