@@ -1487,7 +1487,7 @@
 "doc is not a": "doc ist kein",
 "doc must be a JSON object": "doc muss ein JSON-Objekt sein",
 "Docker health contradicts the progress:": "Docker-Health widerspricht dem Fortschritt:",
-"Docker on the Proxmox host (htsglang-*)": "Docker auf dem Proxmox-Host (htsglang-*)",
+"Docker on the Proxmox host (flliper-*, before the rename htsglang-*)": "Docker auf dem Proxmox-Host (flliper-*, vor der Umbenennung htsglang-*)",
 "Docker query switched off": "Docker-Abfrage abgeschaltet",
 "Docker reports": "Docker meldet",
 "Docker reports the container": "Docker meldet den Container",

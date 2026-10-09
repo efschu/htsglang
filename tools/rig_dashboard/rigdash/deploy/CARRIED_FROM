@@ -1,0 +1,6 @@
+# Commits of the OLD-name dashboard line whose content THIS tree carries in renamed form (F0-K M3, install.sh `carried`).
+# A commit of the old line can never be an ancestor of a renamed tree (the content was ported by the rename kit, not merged), so
+# install.sh --check would refuse every renamed revision on the two ancestry rules (deploy line tip, running release).  A revision names here
+# what it carries; the rules then count it as contained.  First field = commit (10+ hex digits), rest = what it is.
+d983311745  tip of desk/dashboard-ipc-0929 (the deploy line) when the rename was cut
+9d3f7bed11  running release /opt/rigdash/current (08.10.): language switch EN/DE + RigTip + TTFT + sessions + History bs levels (ported as the six F0-K M3 commits)
