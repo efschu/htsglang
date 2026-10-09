@@ -727,6 +727,13 @@ class Envs:
     # 0 = off. y4b: two needless P legs (p_ms 7712 / 7460, flips included),
     # then the third refusal ended the client's stream with W50.
     FLLIPER_PDFLIP_RVP_CAPACITY_PARK_S = EnvFloat(120.0)
+    # CAPPARK-FLIP-HOLD (08.10., NF dauer10081045 D->P flip epoch 4->5): while
+    # a flip park is open (park_running until the sleep / the awake re-queue)
+    # the #248h capacity re-queue does not run -- the capacity-parked requests
+    # ride the flip and the wake's hold read takes them up. On metal the
+    # re-queue ran three just-parked requests to their end while the front's
+    # D->P quiesce waited 28180 ms for D. Off = the re-queue inside the park.
+    FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD = EnvBool(True)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing
@@ -754,6 +761,16 @@ class Envs:
     # channel exists. Off = the immediate stop (pre-H98d). Reached only
     # where that stop would have fired; everywhere else byte-identical.
     FLLIPER_PDFLIP_ENABLE_FORM_A_STALE_VOTE_DEFER = EnvBool(True)
+    # ENABLE_FORM_A_ADMIT_ROOM_FIRST (H98e, the cause behind H98d, NF xc D
+    # 21:37:29Z 07.10., pdflip-130-2093 -> pdflip-130-2092): a Form A load-back
+    # whose group ADMIT is already taken (worker off the token cut, every
+    # rank on it) decides its room from the LIVE pool with a shortfall-only
+    # eviction on its FIRST attempt (H105c's follow-room). Off = the first
+    # attempt goes through the pass-published floor, whose refusal runs the
+    # xsn285 full drain (every evictable leaf, the voted-but-not-admitted
+    # prefixes of the same pass included) before H105c retries from the
+    # live pool. The host-first path (H105b/H106) is not touched.
+    FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST = EnvBool(True)
     # POOLLEAK_INSTR (NF y9nf6 boot 3, 07:03:50Z: "[full] ... withheld=92672
     # ... deficit of 128 row(s)" + 3 mamba slots on TP1/TP2 right after a D
     # park): LOG-ONLY instruments, no behaviour -- per-request pool holdings
@@ -1037,6 +1054,16 @@ class Envs:
     # stands where that round left it, a repeat round cannot issue (kvs2 W3), so
     # the poll skips its ~1.2 s sweep (P.log 144297 sweep_ms=1221.1 per poll).
     FLLIPER_PDFLIP_FLUSH_SWEEP_MEMO = EnvBool(False)
+    # PR-ARENA (NF int22, P PP1 18:34:20Z, boot 1008_171755 @ 6b3bd1a6df): the
+    # PP room vote's walk (pdflip/pp_room_vote.estimate_payable) priced a peel's
+    # write_back backup at the KV host pool's available_size() -- on an arena
+    # pool (slots - claimed) * P, complete slots counted free -- while every
+    # claim was refused (no free slot): PP1's fact paid 195968 tokens the peel
+    # could not (on_frontier=8192 behind_device_child=187776), PP0 launched
+    # 16321 rows, PP1 'Prefill out of memory'. On: an arena-bound pool's backup
+    # room is its FREE slots (slots - complete - claimed) times the slot's
+    # tokens. Off = the available_size() reading, byte for byte.
+    FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM = EnvBool(True)
     # SWEEP-FULL-ARENA (NF boot 1007_2142, P->D flip epoch 2: drain+quiesce
     # 41730 ms, sleep-kv 8883 ms, cards idle): once a publish sweep's backup
     # was refused for KV arena room (#1421 arena_claim), every later node
@@ -1049,6 +1076,38 @@ class Envs:
     # (R12) only, never while a D park records its refusals (HY). Off = every
     # refused claim is made as before.
     FLLIPER_PDFLIP_ENABLE_SWEEP_FULL_ARENA_SKIP = EnvBool(True)
+    # W3-HOST-LEAF (NF int22, P 18:33:37-18:34:20Z, boot 1008_171755): the W3
+    # spill found candidates=0 on all three stages -- it releases only host
+    # copies of device-resident nodes; the full KV arena freed nothing for a
+    # claim (ARENA-DROP freed=0). On (local-PP floor only, as UD-H): the 27B
+    # line's Q-697c host-only spill, ported (pdflip/host_only_spill.py): host-only
+    # H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257),
+    # then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs
+    # the spill's arena pool (on hybrid boots
+    # FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL). Off = the old spill.
+    FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES = EnvBool(False)
+    # W3-ANCHOR-POOL (NF int20 1008_135412, P PP0 13:58-14:01): the W3-ARENA
+    # spill (UnifiedRadixCache._w3_arena_spill) stopped at its first gate on
+    # every hybrid boot -- the KV host pool is a HostPoolGroup whose
+    # __getattr__ forwards the claim calls but not secure_rows_to_l3, so
+    # hasattr() said False and it returned 0 before its log line ('W3-ARENA'
+    # 0x in 15 NF P logs; PUBLISH-SWEEP issued=0 refused=5130, every L3->L2
+    # fill ended at the full arena: ARENA-GET MISS, prefetch completed=0 of
+    # hit_pages=1318). On: the spill uses the group's anchor (arena) host
+    # pool, the one alloc_write already forwards to -- the 27B dual line's
+    # Q-697c (a), without its dual gate. Off = the old silent stop, byte for
+    # byte.
+    FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL = EnvBool(False)
+    # MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D
+    # mamba anchor arena (32 slots, 6 staging) held only END and deepest
+    # anchors, so the flush / park-first spill found victim=none (`#1427
+    # ARENA-DROP ... slot_bytes=58834944 freed=0` x59, `PDFLIP-ANCHOR-LOST
+    # at=flush n=15` incl. the END anchor 112896 of the parked pdflip-24-128).
+    # On: with no victim by the old rules, the shallowest settled END/deepest
+    # anchor OFF the claimer's park chain is secured to L3 first
+    # (arena_secure_to_disk) and then released -- never one whose copy could
+    # not be secured. Off = the old answer, byte for byte.
+    FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT = EnvBool(False)
     # #287 NEED0 (c, 30.09., NF y4k pdflip-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (pdflip/park_stuck.py).

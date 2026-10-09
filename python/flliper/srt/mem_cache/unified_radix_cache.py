@@ -4377,6 +4377,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # paid, and its parent becomes the next leaf.
                     from flliper.srt.pdflip import pp_slot_fidelity as _sf
 
+                    if _sf.unbacked_drop_floor(self, node) and node.children:
+                        # UD-H: the leaf's only children are host-only nodes
+                        self._ud_clear_host_children(node)
                     if _sf.unbacked_drop_allowed(self, node):
                         self._ud_drop_unbacked_leaf(node, tracker)
                     return
@@ -4423,6 +4426,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _ud_clear_host_children(self, node: UnifiedTreeNode) -> bool:
+        """UD-H (NF int19 1008, P PP2 13:37:49Z; int18 12:53:27Z PP2 ``#1421 ...
+        node=341 backuped=True parent=277 parent_backuped=False``): a device leaf
+        whose backup the full arena refused, with children that hold NO device
+        rows (backed children already demoted to the host), cannot be dropped
+        (#841: it would orphan them) and cannot be backed up -- it blocks
+        everything behind it (``EVICT-FRONTIER-CENSUS on_frontier=3456
+        behind_device_child=128768``, the peel paid 0, ``Prefill out of memory``,
+        RANK-DEATH). On the local-PP floor (the caller checked it) the host-only
+        subtree below is evicted from the host first -- cache content lost,
+        recomputable, and its arena slots come free -- so the leaf becomes
+        droppable. All or nothing: any device row, device lock or host lock
+        below leaves the subtree untouched. True when no child is left."""
+        order = []
+        stack = list(node.children.values())
+        while stack:
+            d = stack.pop()
+            if not d.evicted or not d.backuped:
+                return False
+            if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in d.component_data):
+                return False
+            order.append(d)
+            stack.extend(d.children.values())
+        host_tracker = {ct: 0 for ct in self.tree_components}
+        for d in reversed(order):  # children before their parent
+            attached = d.parent is not None and any(c is d for c in d.parent.children.values())
+            if not attached:
+                continue  # a cascade above already removed it
+            if not self._is_host_leaf(d):
+                break
+            self._evict_host_leaf(d, host_tracker)
+        left = len(node.children)
+        n = getattr(UnifiedRadixCache, "_ud_h_n", 0) + 1
+        UnifiedRadixCache._ud_h_n = n
+        if n <= 24 or (n & (n - 1)) == 0:
+            logger.warning(
+                "UD-H HOST-CHILDREN-CLEARED node=%s host_nodes=%d host_tokens=%d left=%d (n=%d): "
+                "a write_back leaf the full arena refused had host-only children; they leave "
+                "the host so the leaf can be dropped on the local-PP floor",
+                node.id, len(order), host_tracker.get(BASE_COMPONENT_TYPE, 0), left, n,
+            )
+        return left == 0
 
     def _ud_drop_unbacked_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -5248,6 +5294,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         cands = [a for a in cands if a.node is not node]
         victim = _mad.pick_park_victim(cands, chain_ids=self._pdflip_park_chain(),
                                        claimer_is_end=bool(node.pdflip_park_end))
+        if victim is None or not victim.slots:
+            victim = self._pdflip_last_resort_victim(node, mp)
         depth = _mad.ancestor_path(target=node, root=self.root_node)[1]
         if victim is None or not victim.slots:
             logger.warning("PDFLIP PARK-END-ANCHOR-FIRST SPILL node=%s depth=%s end=%s victim=none (no releasable "
@@ -5302,6 +5350,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tree = [a for a in tree if a.node is not node]
         victim = _mad.pick_foreign_victim(tree, rid="")
         if victim is None or not victim.slots:
+            victim = self._pdflip_last_resort_victim(node, mp)
+        if victim is None or not victim.slots:
             logger.warning("PDFLIP MAMBA-ARENA FLUSH-SPILL node=%s depth=%s victim=none (no releasable "
                            "intermediate anchor in the tree -- the node stays un-backed, named)",
                            getattr(node, "id", "?"), _mad.ancestor_path(target=node, root=self.root_node)[1])
@@ -5327,17 +5377,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     int(sec.get("written", 0) or 0))
         return True
 
-    def _pdflip_anchor_of(self, n, mp):
+    def _pdflip_anchor_of(self, n, mp, allow_end=False):
         """(held, slots): an arena anchor sits on `n`; its slots when this rank
-        may release it (settled write, no host lock, not the end anchor)."""
+        may release it (settled write, no host lock, not the end anchor --
+        ``allow_end``: the end anchor too, MAMBA-LAST-RESORT)."""
         cd = n.component_data[ComponentType.MAMBA]
         hv = cd.host_value
         if hv is None or hv.numel() == 0 or not mp.is_arena_id(int(hv.min())):
             return False, None
-        if (n._pdflip_end_anchor or n.write_through_pending_id is not None
+        if ((n._pdflip_end_anchor and not allow_end) or n.write_through_pending_id is not None
                 or cd.host_lock_ref > 0 or n.id in self._pdflip_direct_mamba_rows):
             return True, None
         return True, mp.settled_anchor_slots(hv)
+
+    def _pdflip_last_resort_victim(self, node, mp):
+        """MAMBA-LAST-RESORT (``FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT``, default
+        off): the anchor a full arena's claim may spill when the H19 /
+        PARK-END-ANCHOR-FIRST rules found none (NF int22, D TP0 boot
+        1008_171755 17:51:57: 26 usable slots, all END or deepest anchors,
+        ``FLUSH-SPILL victim=none`` x4, ``ARENA-DROP slot_bytes=58834944
+        freed=0`` x59, ``PDFLIP-ANCHOR-LOST at=flush n=15`` incl. the END anchor
+        of the parked pdflip-24-128 -- D recomputed what the L3 could have
+        served). The shallowest settled anchor (END too) off the claimer's
+        park chain; the caller secures its L3 copy before it releases it, so
+        no anchor is lost -- the next reader takes it from the store. None
+        with the switch off: the old answer, byte for byte."""
+        if not envs.FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT.get():
+            return None
+        cands = _mad.tree_anchors(
+            root=self.root_node,
+            anchor_of=lambda n: self._pdflip_anchor_of(n, mp, allow_end=True),
+            include_untagged=True)
+        cands = [a for a in cands if a.node is not node]
+        return _mad.pick_last_resort_victim(cands, chain_ids=self._pdflip_park_chain())
 
     def _pdflip_full_victim(self, node, rid, owned, mp):
         """FULL: the request's own shallowest anchor; a request with none to
@@ -5536,7 +5608,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if pool is None or getattr(pool, "arena", None) is None:
             return 0
         if not hasattr(pool, "secure_rows_to_l3"):
-            return 0
+            # W3-ANCHOR-POOL: the hybrid HostPoolGroup forwards the claim
+            # calls only; switched on, the spill works through its anchor
+            # (arena) pool. Off: the old silent stop.
+            pool = _w3_anchor_spill_pool(pool)
+            if pool is None:
+                return 0
         if _r12.role() is not None:
             # Form A: a worker's host rows mirror TP0's verdicts (R12); the
             # spill stays on the groups without the shadow protocol
@@ -5594,6 +5671,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.l3_present = True
             released += int(host_freed or 0) // P
             spilled += 1
+        if released < int(need_pages):
+            # W3-HOST-LEAF (NF int22 1008_171755: candidates=0 on all P stages;
+            # port of the 27B Q-697c spill, pdflip/host_only_spill.py): when the
+            # device-resident round did not cover the claim, host-only leaves
+            # spill too (L3 copy first). Gate off: not entered.
+            from flliper.srt.pdflip import host_only_spill as _hos
+
+            if _hos.armed(self):
+                released += _hos.spill_host_only(
+                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip)["released"]
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k
         if released == 0:
@@ -6767,9 +6854,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # refuse-and-retry-next-pass below skews this stage a pass behind its
         # peers. There the shortfall is evicted and the load runs in THIS pass;
         # None = not that form, False = the residual: the path below unchanged.
-        if kv_tokens > floor:
-            from flliper.srt.pdflip import pp_slot_fidelity as _sf
+        from flliper.srt.pdflip import pp_slot_fidelity as _sf
 
+        # PR (pdflip/pp_room_vote.py): under the stages' agreed R_m, at most R_m
+        floor = _sf.agreed_floor(self, floor)
+        if kv_tokens > floor:
             if _sf.local_pp_room(self, kv_tokens, floor, getattr(req, "rid", None)):
                 # A group of one's floor IS this rank's available_size():
                 # re-read after the eviction, it clears the load-back.
@@ -11403,6 +11492,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         return _ef.deliverable_evictable(self, BASE_COMPONENT_TYPE)
 
+    def payable_evictable_size(self) -> int:
+        """PW (NF int18 1008): the reported FULL-evictable count minus what the
+        last short peel measured unpayable (the backup wall), on every rank --
+        the most a peel asked now can pay (mem_cache/evict_frontier_census.py)."""
+        from flliper.srt.mem_cache import evict_frontier_census as _ef
+
+        return _ef.payable_evictable(self, BASE_COMPONENT_TYPE)
+
     def full_protected_size(self) -> int:
         return self.protected_size()
 
@@ -12303,6 +12400,32 @@ def _full_arena_suffix(stats: dict) -> str:
         return ""
     return (" arena_full_skipped=%d (SWEEP-FULL-ARENA: counted refused without the claim -- "
             "the KV arena has no room for them after this sweep's arena_claim refusal)" % n)
+
+
+def _w3_anchor_spill_pool(pool):
+    """W3-ANCHOR-POOL (NF int20, boot 1008_135412 @ 45cdd0a290, P PP0
+    13:58:09-14:01:12): the pool that carries ``secure_rows_to_l3`` when
+    ``pool`` does not -- the anchor host pool of a hybrid ``HostPoolGroup``
+    (the arena pool its ``alloc_write`` / ``claim_would_refuse`` forward to).
+
+    Metal: the KV arena (6485 slots) was full of P's own tree references from
+    the first reads on; ``W3-ARENA`` printed 0 lines (and 0 in the 15 NF P
+    logs before it) because the group has no ``secure_rows_to_l3`` and the
+    spill returned before its log line. ``PUBLISH-SWEEP`` issued=0 refused=5130
+    (arena_full_skipped=5102) for the whole phase, and every L3->L2 fill of a
+    store hit ended at the arena (``#1436 ARENA-GET MISS``, ``#1157 PREFETCH
+    REAPED ... hit_pages=1318 completed=0``): 705k tokens the store held were
+    prefilled again (17-22 % hit rate 13:59-14:01).
+
+    None = switch ``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` off (the old
+    stop, byte for byte) or no anchor pool that has the call."""
+    if not envs.FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL.get():
+        return None
+    entry = getattr(pool, "anchor_entry", None)
+    host = getattr(entry, "host_pool", None)
+    if host is None or not hasattr(host, "secure_rows_to_l3"):
+        return None
+    return host
 
 
 def _aux_components(tree) -> tuple:

@@ -272,6 +272,14 @@ def pool_terms(tree, alloc):
     inflight = bool(getattr(tree, "ongoing_write_through", None)) or bool(
         getattr(tree, "ongoing_load_back", None)
     )
+    # PR (pdflip/pp_room_vote.py; mem_cache.common.PP_ROOM_CAP_ATTR, read by its
+    # literal name -- this module stays light): the room every PP stage can
+    # pay. A P that runs empty with a head no stage can hold is then the stall.
+    room_cap = getattr(tree, "pdflip_pp_room_cap", None)
+    if isinstance(room_cap, int) and not isinstance(room_cap, bool):
+        total = min(free + evictable, max(0, room_cap))
+        free = min(free, total)
+        evictable = total - free
     return free, evictable, inflight
 
 

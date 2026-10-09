@@ -1260,6 +1260,32 @@ EXPLAINED.update({
         "satz_quelle": '27B-Sitz (Commit bbf5fd846e, Bericht 1981, Test test_pdflip_admission_wedge_queue_clock_1981) und NF-Sitz (Berichte 1507/1531-03, Code invariant_checker.py:1202-1360 im Baum bce16a6ddf)'},
 })
 
+# F0-H round 2 (08.10.2026): the NF post-freeze switches that the catalog of F0-E did not know (CAPPARK_FLIP_HOLD, W3_SPILL_ANCHOR_POOL from round 1;
+# PP_ROOM_ARENA_FREE_ROOM, W3_SPILL_HOST_LEAVES, MAMBA_SPILL_LAST_RESORT from int23). Each sentence is the comment of the switch in environ.py, shortened, no number
+# that is not in that comment. catalog.json is NOT rebuilt here (F0-I does it).
+EXPLAINED.update({
+    'FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": 'While a flip park is open (from park_running until the sleep or the awake re-queue) the #248h capacity re-queue does not run: the capacity-parked requests ride the flip and the wake takes them up. Off: the re-queue runs inside the park (on metal it ran three just-parked requests to their end while the front waited 28180 ms for D). Default on.',
+        "gain": 'The D->P flip does not wait for D to finish capacity-parked requests.', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, CAPPARK-FLIP-HOLD comment)", "trees_expected": ["nf"]},
+    'FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "On hybrid boots the W3 arena spill stopped at its first gate because the KV host pool is a group whose forwarding does not include secure_rows_to_l3. On: the spill uses the group's anchor (arena) host pool, the one alloc_write already forwards to. Off: the old silent stop. Default off.",
+        "gain": 'The W3 arena spill works on hybrid boots (it can then free arena room for a claim).', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, W3-ANCHOR-POOL comment)", "trees_expected": ["nf"]},
+    'FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "The prefill stages' room vote priced a peel's backup at the host pool's available_size(), which on an arena pool counts complete slots as free while every claim was refused (one stage paid 195968 tokens the peel could not and ended in 'Prefill out of memory'). On: an arena-bound pool's backup room is its FREE slots times the slot's tokens. Off: the available_size() reading. Default on.",
+        "gain": 'The room vote no longer promises backup room the arena cannot give.', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, PR-ARENA comment)", "trees_expected": ["nf"]},
+    'FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "The W3 spill found no candidates because it released only host copies of device-resident nodes. On (local-PP floor only): host-only leaves first get their L3 copy for every page, then leave the tree; leaves with a host-only anchor state or in flight stay. Needs the spill's arena pool (on hybrid boots FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL). Off: the old spill. Default off.",
+        "gain": 'A full KV arena can free room from host-only leaves.', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, W3-HOST-LEAF comment)", "trees_expected": ["nf"]},
+    'FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "The D mamba anchor arena held only END and deepest anchors, so the flush spill found no victim. On: with no victim by the old rules, the shallowest settled END/deepest anchor off the claimer's park chain is secured to L3 first and then released, never one whose copy could not be secured. Off: the old answer. Default off.",
+        "gain": 'A full anchor arena can make room without losing an anchor (the next reader takes it from the store).', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, MAMBA-LAST-RESORT comment)", "trees_expected": ["nf"]},
+})
+
 #: Lesehilfe der NF-Sätze (NF-Sitz, Bericht 1504): wird mit dem Katalog ausgeliefert, die Seite zeigt sie als Glossar/Tooltip, die Sätze erklären die Wörter nicht noch einmal.
 GLOSSARY: Dict[str, str] = {
     "D": 'the decode card (computes the answer word by word)',

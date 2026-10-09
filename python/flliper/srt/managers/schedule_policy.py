@@ -849,12 +849,61 @@ def _pdflip_park_on() -> bool:
 
 
 from flliper.srt.mem_cache.common import deliverable_evictable_or  # ED
+from flliper.srt.mem_cache.common import payable_evictable_or  # PW
 from flliper.srt.mem_cache.common import (  # F1
     cap_above_published,
     cap_blind_gap_published,
     deliverable_evictable_cap_aware_or,
     note_cap_blind_admit,
 )
+
+
+@contextmanager
+def _form_a_admit_taken_room(tree_cache, admit_taken: bool):
+    """H98e (NF xc D 21:37:29Z 07.10., pdflip-130-2093 -> pdflip-130-2092; the
+    WURZEL behind H98d): the room rule of a load-back whose group ADMIT is
+    already taken, applied to its FIRST attempt.
+
+    ``admit_taken``: this rank read the H105 verdict BEFORE its load-back and
+    it was ADMIT -- a worker off the token cut, every rank on it (H105d
+    gathers before any load-back). The admission is then decided; what is
+    left is room, and H105c/H105d already answer that from the LIVE pool with
+    a shortfall-only eviction (``_form_a_load_back_floor`` under
+    ``_h105c_follow_room``). The first attempt used to go through the
+    pass-published, ledger-charged floor instead -- published once per
+    iteration, debited for allocations (#694), never credited for frees, so
+    it can sit below the live pool. On the token cut H105d had just proven
+    the live pool held these rows on every rank, yet the floor refused, and
+    the refusal ran the xsn285 drain --
+    ``evict(num_tokens=evictable_size())``, EVERY evictable leaf -- before
+    H105c's retry loaded from the very room that had been there all along
+    (D log 21:37:29: ``EVICT-FRONTIER-CENSUS request=168832`` on every rank,
+    then ``H105c FORM-A FOLLOW-ROOM rid=pdflip-130-2093 kv_tokens=49280
+    evicted=0 available=142464``). The drain took the device tail of
+    pdflip-130-2092, whose depth the pass had voted (175104) but not yet
+    admitted; the full mamba arena backed it up KV-only (P-FUND), the anchor
+    was gone, and the H98 depth went stale (H98d's death).
+
+    On (switch ``FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST``): no drain for
+    room that exists; a real shortfall is evicted in LRU order -- the pass's
+    vote probes just refreshed every voted path, so they go last -- and only
+    a live pool that still cannot hold the rows reaches the xsn285 branch and
+    H105c's retry, as before. The host-first path (H105b/H106: the host
+    loads back BEFORE its verdict) is untouched, as is every non-Form-A
+    boot (no verdict callable -> ``admit_taken`` False)."""
+    if not admit_taken or tree_cache is None:
+        yield
+        return
+    from flliper.srt.environ import envs
+
+    if not envs.FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST.get():
+        yield
+        return
+    tree_cache._h105c_follow_room = True
+    try:
+        yield
+    finally:
+        tree_cache._h105c_follow_room = False
 
 
 def _h105c_follow(adder, req, lb_extent, follow, new_indices) -> torch.Tensor:
@@ -1034,43 +1083,100 @@ def _h105d_cut_load_back_room(adder, req) -> bool:
     no rank loads, no rank waits alone. When every rank has the room, the
     group ADMITs and H105c's follow load-back finds it -- the H105c stop stays
     the named stop for room that vanished between vote and load-back.
-    Off the token cut: True, untouched (the host decides, H105b/H106)."""
-    if not _pp_load_back_extent(req):
-        return True
+    Off the token cut: True, untouched (the host decides, H105b/H106).
+
+    H110 (NF int15, 9341551eae, D log boot_weg2_dkrnfint4h6ablxcbar1dauer
+    10080122_9341551eae_1008_012219.D.log 437580-437746, 05:53:12Z, pdflip-44-438):
+    the room priced here is the rows THIS PASS allocates on this rank, not the
+    load-back alone -- the load-back rows, the first extend chunk behind them
+    (``_h110_chunk_rows``) and the chunks this adder already promised in the
+    same pass (``_h110_promised_rows``: admitted, not yet allocated). The
+    load-back-only check passed pdflip-44-438 at 86464 rows on ~87488 available;
+    the load-back left 1024, the 2368-token chunk then asked the tree for 1408,
+    its only frontier leaf (72576 tokens, un-backed write_back, ``#1421
+    BACKUP-REFUSED why=arena_claim``) paid 0 and all three ranks raised
+    "Prefill out of memory" -> RANK-DEATH, W17, container gone. A request
+    without a load-back is priced the same way (its chunk + the pass's
+    promises), since its extend meets the same peel."""
     from flliper.srt.rank_role import form_a_token_cut_active
 
     if not form_a_token_cut_active():
         return True
-    kv_rows = _h105d_load_back_kv_rows(req.best_match_node)
+    kv_rows = (
+        _h105d_load_back_kv_rows(req.best_match_node)
+        if _pp_load_back_extent(req)
+        else 0
+    )
+    chunk_rows = _h110_chunk_rows(adder, req, kv_rows)
+    promised = _h110_promised_rows(adder)
+    need = kv_rows + chunk_rows + promised
     alloc = adder.token_to_kv_pool_allocator
     available = int(alloc.available_size())
-    if kv_rows <= available:
+    if need <= available:
         return True
     from flliper.srt.mem_cache.base_prefix_cache import EvictParams
 
     tc = adder.tree_cache
     reported = int(tc.evictable_size())
+    # PW (NF int18 1008, 12:13-12:17Z pdflip-28-97): the backup wall the last short
+    # peel measured is not asked again -- the count the peel can PAY decides.
+    payable = min(reported, payable_evictable_or(tc, tc.evictable_size))
     evicted = 0
-    if reported > 0:
-        res = tc.evict(EvictParams(num_tokens=min(reported, kv_rows - available)))
+    if payable > 0 and need <= available + payable:
+        res = tc.evict(EvictParams(num_tokens=min(payable, need - available)))
         # evict() returns None on some caches (as read by H105c/H106 too)
         evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
         available = int(alloc.available_size())
-    if kv_rows <= available:
+    if need <= available:
         return True
     _H105D_REFUSED["n"] += 1
     n = _H105D_REFUSED["n"]
     if n <= 3 or (n & (n - 1)) == 0:
         logger.info(
-            "H105d FORM-A-CUT LOAD-BACK ROOM rid=%s kv_rows=%d available=%d "
-            "evicted=%d reported_evictable=%d rem_total_tokens=%s (n=%d): this "
-            "rank cannot hold its own load-back rows even after evicting its "
-            "shortfall; it votes NO_TOKEN and the group's MIN keeps the request "
-            "queued on every rank",
-            req.rid, kv_rows, available, evicted, reported,
-            adder.rem_total_tokens, n,
+            "H105d FORM-A-CUT LOAD-BACK ROOM rid=%s kv_rows=%d chunk_rows=%d "
+            "promised=%d need=%d available=%d evicted=%d reported_evictable=%d "
+            "payable_evictable=%d rem_total_tokens=%s (n=%d): this rank cannot hold "
+            "the rows this pass allocates for it (load-back + first chunk + the "
+            "pass's earlier chunks, H110) even after evicting what it can pay; it "
+            "votes NO_TOKEN and the group's MIN keeps the request queued on every rank",
+            req.rid, kv_rows, chunk_rows, promised, need, available, evicted,
+            reported, payable, adder.rem_total_tokens, n,
         )
     return False
+
+
+def _h110_int(v) -> int:
+    """A count read off a request/adder, 0 for anything that is not an int
+    (a desk double answers every getattr)."""
+    return int(v) if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def _h110_chunk_rows(adder, req, kv_rows: int) -> int:
+    """H110: the device rows the first extend chunk behind a load-back of
+    ``kv_rows`` allocates in this pass -- the rest of the extend after the
+    load-back, cut to the adder's chunk width (all of it without chunking),
+    plus the one page the paged allocator may add (the 1408 = 1344 + 64 of
+    the 05:53:12Z ask)."""
+    ext = max(0, len(req.full_untruncated_fill_ids) - len(req.prefix_indices))
+    rest = max(0, ext - max(0, min(int(kv_rows), ext)))
+    width = adder.rem_chunk_tokens
+    if isinstance(width, int) and not isinstance(width, bool) and width > 0:
+        rest = min(rest, width)
+    return rest + max(1, _h110_int(getattr(adder, "page_size", 1)))
+
+
+def _h110_promised_rows(adder) -> int:
+    """H110: rows this adder already promised in this pass and that are not
+    allocated yet -- every admitted request's extend chunk (``extend_input_len``,
+    set at its admission) plus a page each; they are allocated together in
+    ``prepare_for_extend`` after the adder is done, so ``available_size()``
+    does not show them. A load-back's own rows are allocated at admission and
+    already left ``available_size()``."""
+    page = max(1, _h110_int(getattr(adder, "page_size", 1)))
+    rows = 0
+    for r in list(getattr(adder, "can_run_list", None) or ()):
+        rows += _h110_int(getattr(r, "extend_input_len", 0)) + page
+    return rows
 
 
 class PrefillAdder:
@@ -2937,18 +3043,24 @@ class PrefillAdder:
                 _h106_d0 = int(
                     getattr(self.tree_cache, "_pdflip_loadback_drained_total", 0) or 0
                 )
-                new_indices, req.last_node = self.tree_cache.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        # THE TOLD EXTENT, NOT THIS RANK'S OWN HIT. On
-                        # `pp_size <= 1` the two are the same value by
-                        # construction (`_pp_load_back_extent` returns the
-                        # local hit there), so upstream's path is byte-for-byte
-                        # what it was.
-                        host_hit_length=_lb_extent,
-                        req=req,
+                # H98e: past a gathered/followed ADMIT the load-back decides
+                # its room from the live pool on the FIRST attempt (H105c's
+                # follow-room), never through the xsn285 full drain.
+                with _form_a_admit_taken_room(
+                    self.tree_cache, _fa_follow is not None and not _fa_host_first
+                ):
+                    new_indices, req.last_node = self.tree_cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=req.best_match_node,
+                            # THE TOLD EXTENT, NOT THIS RANK'S OWN HIT. On
+                            # `pp_size <= 1` the two are the same value by
+                            # construction (`_pp_load_back_extent` returns the
+                            # local hit there), so upstream's path is
+                            # byte-for-byte what it was.
+                            host_hit_length=_lb_extent,
+                            req=req,
+                        )
                     )
-                )
                 PDFLIP_ADMIT_T["lb_ms"] += (time.perf_counter() - _lb_t0) * 1000.0
                 if _fa_host_first:
                     req._h106_host_drained = max(

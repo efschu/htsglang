@@ -240,6 +240,8 @@ from flliper.srt.pdflip import fork_anchor as _pdflip_fork
 from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
 from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
+from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
+from flliper.srt.pdflip import d_head_hold as _pdflip_d_head_hold  # DQH
 from flliper.srt.pdflip import progress_beacon as _pdflip_beacon  # FP forward-progress beacon
 from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from flliper.srt.pdflip.vision_verdict import PdFlipVisionVerdict  # H125f vision verdict on the chain
@@ -2160,6 +2162,8 @@ class Scheduler(
         self.init_invariant_checker()
 
         self.init_pdflip_d_lead_probe()
+
+        self.init_pdflip_d_head_hold()
 
         self.init_kv_events_publisher()
 
@@ -5034,6 +5038,24 @@ class Scheduler(
     def init_pdflip_d_lead_probe(self) -> None:
         self.pdflip_d_lead_probe = build_d_lead_probe(
             group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        )
+
+    def init_pdflip_d_head_hold(self) -> None:
+        # DQH (pdflip/d_head_hold.py): a refused D head is re-evaluated on a change
+        self.pdflip_d_head_hold = _pdflip_d_head_hold.build(
+            group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        )
+
+    def _pdflip_d_head_fingerprint(self, running_batch, prefetch_verdicts) -> Optional[tuple]:
+        """DQH: what the held head's verdict reads (replicated values).
+        ``prefetch_verdicts`` is this iteration's drain memo as the pass found
+        it (the pass consumes it, so the caller reads it before the pass)."""
+        return _pdflip_d_head_hold.fingerprint(
+            hol_state=self.__dict__.get("_pdflip_hol"),
+            waiting=self.waiting_queue,
+            running=running_batch.reqs if running_batch is not None else (),
+            prefetch_verdicts=prefetch_verdicts,
+            continuation=self.chunked_req is not None or bool(getattr(self, "anchor_tails", None)),
         )
 
     def init_parked_decode_set(self) -> None:
@@ -12764,10 +12786,25 @@ class Scheduler(
             # this decode round before the next extend (rank-uniform)
             new_batch = None
             self._admission_decline_note = "gate=pdflip_skip_first_decode"
+        elif self.pdflip_d_head_hold.should_hold(
+            self._pdflip_d_head_fingerprint(running_batch, self.__dict__.get("_pass_prefetch_verdicts"))
+        ):
+            # DQH (pdflip/d_head_hold.py): the refused D head and everything its
+            # verdict reads are unchanged -- no pass this round (replicated
+            # inputs, same iterations on every rank). The SEAT-AGE pass count
+            # moves as if the pass ran, so a refusal view ages honestly.
+            new_batch = None
+            self._pdflip_sa_pass = getattr(self, "_pdflip_sa_pass", 0) + 1
+            self._admission_decline_note = "gate=pdflip_d_head_hold"
         else:
+            _dqh_verdicts = self.__dict__.get("_pass_prefetch_verdicts")
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+            self.pdflip_d_head_hold.note_pass(
+                fp=self._pdflip_d_head_fingerprint(running_batch, _dqh_verdicts),
+                built_nothing=new_batch is None,
+            )
             if (
                 self.congruent_prefill_lane is not None
                 and new_batch is not None
@@ -14238,13 +14275,19 @@ class Scheduler(
             )
         return verdict == "W31"
 
-    def _pdflip_answer_x_refusals(self, refused: List[Req], head_inputs=None) -> None:
+    def _pdflip_answer_x_refusals(
+        self, refused: List[Req], head_inputs=None, wall_rows: Optional[Dict[int, int]] = None
+    ) -> None:
         """Remove the W31-refused requests and answer them BY NAME (C11).
 
         Not a silent skip: a request left in the queue would be re-offered
         every pass and never served, which is a livelock wearing the costume
         of a policy. The named 503 is what lets the caller re-route it
         through the prefill group exactly once (its own W35 bounds that).
+
+        ``wall_rows`` (PW-R, pdflip/d_wall_head.py): ``id(req) -> device rows``
+        of a head the backup wall made unservable; its refusal names those rows
+        as the extent, so the front prices the re-route at what D could not hold.
         """
         x = int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0)
         refused_ids = {id(r) for r in refused}
@@ -14258,7 +14301,10 @@ class Scheduler(
             _cap_local = [_pdflip_rvp.capacity_park_candidate(r, x, sched=self) for r in refused]
             _cap_park = [bool(f) for f in self._pdflip_group_min_flags(_cap_local)]
         for _i, req in enumerate(refused):
-            uncached = self.pdflip_uncached_extent(req, head_inputs)
+            if wall_rows is not None and id(req) in wall_rows:
+                uncached = int(wall_rows[id(req)])
+            else:
+                uncached = self.pdflip_uncached_extent(req, head_inputs)
             if _cap_park[_i]:
                 _tc = getattr(self, "tree_cache", None)
                 if _tc is not None:
@@ -14289,6 +14335,11 @@ class Scheduler(
                 f"prefix matching is {uncached}. Refused by name so the caller re-routes it "
                 f"through the prefill group -- never prefilled here silently."
             )
+            if wall_rows is not None and id(req) in wall_rows:
+                message += (
+                    " D-WALL-HEAD: the extent is the device rows this request needs; the "
+                    "host arena takes no backup, so nothing D holds can leave the device."
+                )
             logger.warning("W50 PdFlipTpPrefillExceeded rid=%s uncached=%d X=%d", req.rid, uncached, x)
             # #Q0/#991 THE THIRD EXIT. A request refused here was matched
             # first, and the match may have drawn a COW resume slot
@@ -15670,6 +15721,7 @@ class Scheduler(
         # and one lap of latency disappears with it.
 
         # Check if the grammar is ready in the grammar queue
+        ready_grammar_requests = ()
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
@@ -15739,6 +15791,26 @@ class Scheduler(
         prefetch_verdicts = self.__dict__.pop("_pass_prefetch_verdicts", None)
         if prefetch_verdicts is None:
             prefetch_verdicts = self._drain_prefetch_progress()
+        elif ready_grammar_requests and self.enable_hicache_storage:
+            # NF 08.10. (#580 after #791b): the memo was drained at the budget
+            # site, BEFORE the grammar intake above -- its rids are pending
+            # this pass (the ballot does not hold them either), drained next
+            # pass. See prefetch_ballot.cover_post_drain_intake.
+            _covered = prefetch_ballot.cover_post_drain_intake(
+                prefetch_verdicts, ready_grammar_requests
+            )
+            if _covered:
+                _n = getattr(self, "_grammar_intake_covered_n", 0) + 1
+                self._grammar_intake_covered_n = _n
+                if _n <= 8 or _n % 64 == 0:
+                    logger.info(
+                        "#580 GRAMMAR-INTAKE PENDING rids=%s n=%d: entered the "
+                        "waiting queue after this pass's memoised prefetch drain "
+                        "(grammar compiled); not-done this pass, drained and "
+                        "balloted from the next",
+                        _covered,
+                        _n,
+                    )
         _prefetch_ballot = self.__dict__.pop("_uniform_prefetch_ballot", None)
         # #823 W9b: take the group's batch verdict HERE, once, above every
         # early return and above both consumers -- the same position and the
@@ -17607,8 +17679,24 @@ class Scheduler(
         # the send is a no-op off rank 0 (`SenderWrapper(None)`,
         # ipc_channels.py:71), so a rank-local refusal would drop the
         # request from that rank's queue with no client-visible signal.
+        # PW-R (pdflip/d_wall_head.py): the group-D HOL head the backup wall makes
+        # unservable goes back to the front by name (W50) instead of waiting for
+        # a flip nothing on D can bring. `_hol.head` is the pass's first NO_TOKEN
+        # (the same rid on every rank), so the group MIN inside is entered alike.
+        _wall_rows = None
+        if _hol.head is not None:
+            _wall_head = _pdflip_d_wall_head.pick_unservable_head(
+                head_rid=_hol.head,
+                waiting=self.waiting_queue,
+                tree=self.tree_cache,
+                available=int(self.token_to_kv_pool_allocator.available_size()),
+                group_min=self._pdflip_group_min_flags,
+            )
+            if _wall_head is not None:
+                _x_refused.append(_wall_head)
+                _wall_rows = {id(_wall_head): _pdflip_d_wall_head.device_need_rows(_wall_head)}
         if _x_refused:
-            self._pdflip_answer_x_refusals(_x_refused, _head_inputs)
+            self._pdflip_answer_x_refusals(_x_refused, _head_inputs, wall_rows=_wall_rows)
         if _v_refused:
             self._pdflip_answer_vision_d_refusals(_v_refused, _head_inputs)
 

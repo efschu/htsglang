@@ -6329,6 +6329,10 @@ class SchedulerPPMixin:
         # follower's slot are already on the object when the arc carries it.
         # Nothing here blocks: see `_pdflip_vote_pass_hook`.
         self._pdflip_vote_pass_hook(recv_reqs)
+        # PR (pdflip/pp_room_vote.py): followers send their payable room to PP0,
+        # PP0 forms R_m for this pass (stamped on list m below). Non-blocking on
+        # both ends, no collective (#1268's rule).
+        self._pdflip_pp_room_pass_hook()
 
         # #631 REQ-TRACE (bounded): the check-2 wedge's open question is
         # where a relayed request dies between the consumed chain hop and
@@ -6431,6 +6435,11 @@ class SchedulerPPMixin:
             # decided last pass at the front of the wire (pdflip/flush_verdict.py).
             if self.pp_group.is_first_rank:
                 _wire_reqs = _flush_verdict.pp0_wire(self, _wire_reqs)
+            # PR (pdflip/pp_room_vote.py): R_m rides list m; nothing without one.
+            if self.pp_group.is_first_rank and self.__dict__.get("_pdflip_pr_verdict") is not None:
+                from flliper.srt.pdflip import pp_room_vote as _pr
+
+                _wire_reqs = _pr.stamp_cap(_wire_reqs, self._pdflip_pr_verdict)
             try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
                 _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
                          if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
@@ -6457,6 +6466,15 @@ class SchedulerPPMixin:
         # leaves `recv_reqs` before dispatch on EVERY rank -- it is a lap, not
         # a request, and `process_input_requests` has no handler for it.
         recv_reqs = self._pdflip_vote_after_forward(recv_reqs)
+        # PR (pdflip/pp_room_vote.py): a follower takes R_m off list m after
+        # relaying it and applies it in THIS pass, as PP0 does (None: no cap).
+        if not self.pp_group.is_first_rank and int(getattr(self.ps, "pp_size", 1) or 1) > 1:
+            from flliper.srt.pdflip import pp_room_vote as _pr
+
+            recv_reqs, _pr_cap = _pr.absorb_cap(recv_reqs)
+            _pr_tree = self.__dict__.get("tree_cache")
+            if _pr_tree is not None:
+                _pr.apply_cap(_pr_tree, _pr_cap)
         # z30j: a follower applies PP0's flush verdicts (already forwarded
         # onward above) to the flushes it parked, before this pass's dispatch.
         if not self.pp_group.is_first_rank:
@@ -6485,6 +6503,57 @@ class SchedulerPPMixin:
     # ------------------------------------------------------------------
     # #1268 fix 1c: the idle vote travels home on the ring lap
     # ------------------------------------------------------------------
+
+    def _pdflip_pp_room_pass_hook(self: Scheduler) -> None:
+        """PR: one non-blocking step of the PP room vote (pdflip/pp_room_vote.py)."""
+        if int(getattr(self.ps, "pp_size", 1) or 1) <= 1 or not self._pdflip_vote_is_wire_rank():
+            return
+        from flliper.srt.managers.pdflip_told_fallback import GlooAckChannel, _world_ranks
+        from flliper.srt.pdflip import pp_room_vote as _pr
+        from flliper.srt.pdflip.pp_slot_fidelity import FLOOR_LOCAL_PP_ATTR
+
+        channel = self.__dict__.get("_pdflip_pr_channel")
+        if channel is None:
+            channel = self._pdflip_pr_channel = GlooAckChannel(
+                self.world_group.cpu_group, int(self.ps.pp_rank), _world_ranks(self),
+                tag=_pr.PDFLIP_ROOM_TAG, label="pp-room",
+            )
+        tree = self.tree_cache
+        local_floor = bool(getattr(tree, FLOOR_LOCAL_PP_ATTR, False))
+        if self.pp_group.is_first_rank:
+            from flliper.srt.mem_cache.common import fundable_extend_tokens
+
+            book = self.__dict__.get("_pdflip_pr_book")
+            if book is None:
+                book = self._pdflip_pr_book = _pr.RoomBook()
+            book.begin_pass()
+            book.note_batches(self.__dict__.get("mbs") or ())
+            verdict = None
+            if book.absorb(channel.harvest()) or book.facts:
+                own = _pr.follower_fact(
+                    tree=tree, allocator=self.token_to_kv_pool_allocator, rank=0,
+                    executed=int(self.forward_ct), local_floor=local_floor,
+                )
+                verdict = book.cap(own.room)
+            # R_m for THIS pass: applied here and stamped on list m (below)
+            self._pdflip_pr_verdict = verdict
+            _pr.set_cap(tree, None)
+            if verdict is not None:
+                _pr.note_binding(verdict, fundable_extend_tokens(tree), book)
+                _pr.set_cap(tree, verdict.cap)
+            return
+        if not local_floor:
+            return
+        sender = self.__dict__.get("_pdflip_pr_sender")
+        if sender is None:
+            sender = self._pdflip_pr_sender = _pr.FollowerSender()
+        now = time.monotonic()
+        fact = _pr.follower_fact(
+            tree=tree, allocator=self.token_to_kv_pool_allocator, rank=int(self.ps.pp_rank),
+            executed=int(self.forward_ct), local_floor=local_floor,
+        )
+        sender.offer(fact, now)
+        sender.flush(channel, now)
 
     def _pdflip_vote_dp_offset(self: Scheduler) -> int:
         return self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size

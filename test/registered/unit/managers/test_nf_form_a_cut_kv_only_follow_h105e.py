@@ -228,6 +228,17 @@ class KvOnlyFollowTest(unittest.TestCase):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     def test_xc_1652_kv_only_workers_follow_and_the_riegel_agrees(self):
+        # H98e: switched on (default) the first load-back past the gathered
+        # ADMIT already decides from the live pool; off, it is the floor's and
+        # the H105e follow retries -- both must end in the host's extend set.
+        from flliper.srt.environ import envs
+
+        for room_first, seen in ((False, [False, True]), (True, [True])):
+            with self.subTest(room_first=room_first), \
+                    envs.FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST.override(room_first):
+                self._xc_1652(seen)
+
+    def _xc_1652(self, seen):
         out, adders, reqs = _group_gate()
         host_set = m.form_a_extend_set(adders[0].can_run_list)
         self.assertEqual(host_set, [(RID, EXTENT, TOTAL)])
@@ -237,10 +248,10 @@ class KvOnlyFollowTest(unittest.TestCase):
             # base: FormAAdmissionSplit H105 RU FORM-A EXTEND-SET SPLIT
             # host=[(rid, 16640, 18729)] local=[(rid, 0, 2688)] -- the metal line
             m.form_a_extend_set_check(local, is_host=False, exchange=lambda p: host_set)
-            # the retry made its own room; the first attempt was the floor's
-            self.assertEqual(adders[r].tree_cache.load_backs, [False, True], f"TP{r}")
+            # off: the retry made its own room; the first attempt was the floor's
+            self.assertEqual(adders[r].tree_cache.load_backs, seen, f"TP{r}")
             self.assertEqual(len(reqs[r].prefix_indices), EXTENT, f"TP{r}")
-        self.assertEqual(adders[0].tree_cache.load_backs, [False, True])
+        self.assertEqual(adders[0].tree_cache.load_backs, seen)
 
     def test_off_the_token_cut_a_kv_only_rank_keeps_the_1048_arm(self):
         """No cut (H105b form): untouched -- a KV-only worker that served 0

@@ -263,22 +263,37 @@ class TokenCutLoadBackRoomTest(unittest.TestCase):
             self.assertEqual(adders[r].can_run_list, [])
             # nobody loaded back: the vote came first and was NO_TOKEN
             self.assertEqual(adders[r].tree_cache.load_backs, [])
-            # the room attempt ran before the vote: shortfall asked, 7616 paid
-            self.assertEqual(adders[r].tree_cache.evicts, [(KV_ROWS - AVAILABLE, DELIVERED)])
+            # the room attempt ran before the vote: shortfall asked, 7616 paid.
+            # H110: the shortfall is the pass's rows -- the load-back plus the
+            # 12647-token rest behind it (one chunk at width 16384) plus the
+            # allocator's page (page_size=1 here)
+            self.assertEqual(
+                adders[r].tree_cache.evicts,
+                [(KV_ROWS + (EXTENT[0] + UNCACHED - KV_ROWS) + 1 - AVAILABLE, DELIVERED)],
+            )
         self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})
         self.assertEqual(_refused(), 3)
 
     def test_deliverable_room_admits_and_the_follow_load_back_serves(self):
         """The peel CAN pay the shortfall on every rank: ADMIT as before, and
-        H105c's follow load-back finds the room the vote already made."""
-        out, adders, reqs, gather = _group_gate(deliverable=REPORTED_EVICTABLE)
-        for r in range(3):
-            self.assertEqual(out[r], AddReqResult.CONTINUE, f"TP{r}: {out[r]}")
-            self.assertEqual([q.rid for q in adders[r].can_run_list], [RID])
-            self.assertEqual(adders[r].tree_cache.load_backs, [False, True])
-            self.assertEqual(len(reqs[r].prefix_indices), KV_ROWS)
-        self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})
-        self.assertIn(_refused(), (0, None))  # no refusal (None: a base without the counter)
+        H105c's follow load-back finds the room the vote already made (H98e
+        on, the default: on its first attempt; off: on the retry after the
+        floor's refusal)."""
+        from flliper.srt.environ import envs
+
+        for room_first, seen in ((False, [False, True]), (True, [True])):
+            with self.subTest(room_first=room_first), \
+                    envs.FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST.override(room_first):
+                if hasattr(sp, "_H105D_REFUSED"):
+                    sp._H105D_REFUSED["n"] = 0
+                out, adders, reqs, gather = _group_gate(deliverable=REPORTED_EVICTABLE)
+                for r in range(3):
+                    self.assertEqual(out[r], AddReqResult.CONTINUE, f"TP{r}: {out[r]}")
+                    self.assertEqual([q.rid for q in adders[r].can_run_list], [RID])
+                    self.assertEqual(adders[r].tree_cache.load_backs, seen)
+                    self.assertEqual(len(reqs[r].prefix_indices), KV_ROWS)
+                self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})
+                self.assertIn(_refused(), (0, None))  # no refusal (None: a base without the counter)
 
     def test_one_tight_rank_refuses_for_the_group(self):
         """Only TP2's peel is short: its NO_TOKEN is the group's MIN, every rank
