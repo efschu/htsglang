@@ -1683,6 +1683,17 @@ class Weg2ParkWindowReqInput(BaseReq, kw_only=True):
     c_ms: float = 0.0
 
 
+class Weg2LaneFloorReqInput(BaseReq, kw_only=True):
+    """PRIORITY LANES 1008 (plan deskq/PLAN-PRIO-LANES-1008.md, weg2/lanes.py ``RPC_LANE_FLOOR``): the front's lane
+    floor, ``POST /weg2/lane_floor`` to a group -- ``{"floor": int, "epoch": int}``.  No reply.  Group P (part L3): PP0
+    takes it at the top of its next pass and stamps it on the PP-room vote (``pp_room_vote.Weg2PpLaneFloor``), every
+    stage applies it in the same pass; group D (part L2) reads it in its admission.  Ignored without
+    ``SGLANG_WEG2_LANES=1``."""
+
+    floor: int = 0
+    epoch: int = 0
+
+
 class PlePrefetchHintReqInput(BaseReq, kw_only=True):
     """fnFL2 H43: the front's hint that request ``rid`` (its prompt tokenized
     here, ``input_ids``) will come to this group; the PP0 scheduler starts the

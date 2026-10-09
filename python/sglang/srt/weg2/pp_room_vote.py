@@ -75,6 +75,14 @@ class Weg2PpRoomFact(msgspec.Struct, frozen=True):
     sim_us: float = 0.0
 
 
+class Weg2PpRoomFactLane(Weg2PpRoomFact, frozen=True):
+    """PRIORITY LANES 1008 (L3): the same fact plus the lane floor / epoch the sending stage APPLIES.  Only a stage that
+    holds lane state sends this subclass; a boot without lanes sends the plain fact, wire unchanged."""
+
+    lane_floor: int = -1
+    lane_epoch: int = -1
+
+
 class CapVerdict(msgspec.Struct, frozen=True):
     cap: int
     rank: int
@@ -146,7 +154,8 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
     return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
 
 
-def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: bool) -> Weg2PpRoomFact:
+def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: bool,
+                  lane_floor: int = -1, lane_epoch: int = -1) -> Weg2PpRoomFact:
     from sglang.srt.mem_cache.common import payable_evictable_or
 
     available = int(allocator.available_size())
@@ -164,6 +173,10 @@ def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: boo
     walked = estimate_payable(tree, local_floor=local_floor, host_free=host_free)
     sim_us = (time.perf_counter() - t0) * 1e6
     payable = max(0, min(walked, walled))
+    if int(lane_epoch) >= 0:
+        return Weg2PpRoomFactLane(rank=int(rank), executed=int(executed), room=available + payable,
+                                  available=available, payable=payable, reported=reported, sim_us=sim_us,
+                                  lane_floor=int(lane_floor), lane_epoch=int(lane_epoch))
     return Weg2PpRoomFact(rank=int(rank), executed=int(executed), room=available + payable,
                           available=available, payable=payable, reported=reported, sim_us=sim_us)
 
@@ -228,6 +241,17 @@ class RoomBook:
 
     def begin_pass(self) -> None:
         self.pass_no += 1
+
+    def lane_echo(self) -> Dict[int, Tuple[int, int]]:
+        """PRIORITY LANES 1008 (L3): ``{rank: (lane_floor, lane_epoch)}`` each fresh follower fact says it applies (only
+        facts that carry lane state).  PP0 reads whether every stage stands on one epoch."""
+        out: Dict[int, Tuple[int, int]] = {}
+        for rank, (f, seen) in sorted(self.facts.items()):
+            if self.pass_no - seen > FACT_MAX_AGE_PASSES:
+                continue
+            if isinstance(f, Weg2PpRoomFactLane):
+                out[int(rank)] = (int(f.lane_floor), int(f.lane_epoch))
+        return out
 
     def note_batches(self, batches: Iterable[Any]) -> None:
         for b in batches:
@@ -302,6 +326,32 @@ def absorb_cap(recv_reqs) -> Tuple[list, Optional[int]]:
         return recv_reqs, None  # the list untouched: byte-identical
     rest = [r for r in recv_reqs if not isinstance(r, Weg2PpRoomCap)]
     return rest, int(caps[-1].cap)
+
+
+class Weg2PpLaneFloor(msgspec.Struct, frozen=True):
+    """PRIORITY LANES 1008 (L3): the lane floor every stage applies in pass m, riding list m of the request chain beside
+    ``Weg2PpRoomCap`` (PP0 applies it in pass m and stamps the standing value; a follower takes it off after relaying).
+    ``PR LANE-FLOOR floor=N epoch=E`` is logged by each stage when its applied value changes."""
+
+    floor: int
+    epoch: int
+
+
+def stamp_lane_floor(wire_reqs, stamp: Optional["Weg2PpLaneFloor"]) -> list:
+    """PP0, before the chain send: list m carries the lane floor (nothing without one: byte-identical)."""
+    out = list(wire_reqs or ())
+    if stamp is not None:
+        out.append(stamp)
+    return out
+
+
+def absorb_lane_floor(recv_reqs) -> Tuple[list, Optional["Weg2PpLaneFloor"]]:
+    """A follower, after relaying list m: take the lane floor off it (None when absent; the list untouched then)."""
+    marks = [r for r in (recv_reqs or ()) if isinstance(r, Weg2PpLaneFloor)]
+    if not marks:
+        return recv_reqs, None
+    rest = [r for r in recv_reqs if not isinstance(r, Weg2PpLaneFloor)]
+    return rest, marks[-1]
 
 
 def note_binding(verdict: Optional[CapVerdict], own_fundable: int, book: RoomBook) -> None:
