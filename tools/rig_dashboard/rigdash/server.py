@@ -52,6 +52,11 @@ STATIC_FILES = {
     "/uplot.LICENSE": ("uplot.LICENSE", "text/plain; charset=utf-8"),
     "/grafik.js": ("grafik.js", "application/javascript; charset=utf-8"),
     "/zoom.js": ("zoom.js", "application/javascript; charset=utf-8"),
+    # language switch (user 08.10.): English is the source text, German the translation memory (i18n_de.json)
+    "/i18n.js": ("i18n.js", "application/javascript; charset=utf-8"),
+    "/i18n_de.json": ("i18n_de.json", "application/json; charset=utf-8"),
+    # floating boxes of the page (user 08.10.): one placement inside the viewport for every tip and source badge
+    "/tooltip.js": ("tooltip.js", "application/javascript; charset=utf-8"),
     # Profil-Editor (Nutzer-Entscheid 05.10.: kommt INS Release, Auftrag 1984): die Module des Reiters Profil stehen in beiden Ausgaben.
     # Sie rechnen nichts und lösen nichts am Rig aus; was Rig-Betrieb ist (Hardware messen = gpuq), sperren die Routen.
     "/profil.js": ("profil.js", "application/javascript; charset=utf-8"),

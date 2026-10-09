@@ -137,10 +137,7 @@
   function tipShow(html, x, y) {
     if (!tipEl) { tipEl = document.createElement("div"); tipEl.className = "kp-tip"; tipEl.setAttribute("role", "tooltip"); document.body.appendChild(tipEl); }
     tipEl.innerHTML = html;
-    tipEl.style.display = "block";
-    const r = tipEl.getBoundingClientRect();
-    tipEl.style.left = Math.max(8, Math.min(x + 12, window.innerWidth - r.width - 8)) + "px";
-    tipEl.style.top = (y - r.height - 12 < 8 ? y + 18 : y - r.height - 12) + "px";
+    RigTip.place(tipEl, x, y, { maxW: 380 });
   }
   function tipHide() { if (tipEl) tipEl.style.display = "none"; }
   function segAt(ev) {

@@ -250,7 +250,7 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .kp-ph-chip { display: inline-block; font-size: 11px; font-weight: 650; padding: 0 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); vertical-align: 1px; }
 .pf-fold.kp-in { margin: 2px 0 8px; font-size: 12px; } .pf-fold.kp-in > summary { font-weight: 500; color: var(--text-2); cursor: pointer; }
 @media (max-width: 520px) { .pf-bar-h { line-height: 1.5; } .kp-edge span { font-size: 9.5px; } }
-.kp-tip { position: fixed; z-index: 50; display: none; max-width: min(380px, calc(100vw - 16px)); padding: 7px 10px; font-size: 12.5px; line-height: 1.45; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); box-shadow: 0 4px 16px rgba(0,0,0,.25); pointer-events: none; }
+.kp-tip { position: fixed; z-index: 50; display: none; overflow-wrap: anywhere; max-width: min(380px, calc(100vw - 16px)); padding: 7px 10px; font-size: 12.5px; line-height: 1.45; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); box-shadow: 0 4px 16px rgba(0,0,0,.25); pointer-events: none; }
 .kp-t-bad { color: var(--bad); }
 .kp-bud { font-size: 11.5px; min-width: 9.5em; text-align: right; }
 .kp-s { display: inline-block; height: 100%; min-width: 1px; }
@@ -269,6 +269,11 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .cardstrip .bar { height: 5px; background: var(--bar-bg); border-radius: 3px; overflow: hidden; margin-top: 3px; }
 .cardstrip .bar i { display: block; height: 100%; background: var(--bar); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 12px; }
+/* source badges (user 08.10.: "falsch plaziert, zum Teil zu gross oder abgeschnitten"): never wider than their line, cut with an
+   ellipsis at 36 characters; the full text is in the floating box (tooltip.js: hover, focus, tap), never clipped by the screen edge */
+.ipcsrc, .logsrc { display: inline-block; max-width: 36ch; overflow: hidden; text-overflow: ellipsis; vertical-align: text-bottom; cursor: help; }
+.rigtip { position: fixed; z-index: 80; display: none; padding: 7px 10px; font-size: 12.5px; line-height: 1.45; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface); color: var(--text); box-shadow: 0 4px 16px rgba(0,0,0,.25); pointer-events: none; overflow-wrap: anywhere; }
 .logsrc { font-size: 10px; font-weight: 500; padding: 0 5px; border-radius: 6px; border: 1px dashed var(--warn); color: var(--warn); margin-left: 6px; white-space: nowrap; letter-spacing: .02em; }
 .ipcsrc { font-size: 10px; padding: 0 5px; border-radius: 6px; border: 1px solid var(--good); color: var(--good); margin-left: 6px; white-space: nowrap; }
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--surface-2);
@@ -360,7 +365,7 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .xaxis { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); }
 .tip { position: fixed; pointer-events: none; background: var(--surface); color: var(--text);
   border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 12px;
-  box-shadow: 0 2px 8px rgba(0,0,0,.2); display: none; z-index: 10; white-space: nowrap; }
+  box-shadow: 0 2px 8px rgba(0,0,0,.2); display: none; z-index: 10; overflow-wrap: anywhere; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--text-2); font-weight: 600; font-size: 12px; }
@@ -393,7 +398,6 @@ section.card.hang { border: 3px solid var(--alarm-hang); }
 /* keine seitliche Seitenrolle (30.09.: die Quell-Plakette im Kachelkopf und die Cache-Tabelle schoben die Seite
    auf 1933 px bei 1500 px Fenster): Plakette bricht um, breite Tabellen rollen in ihrer Karte */
 .tile .label { flex-wrap: wrap; min-width: 0; }
-.tile .label .ipcsrc, .tile .label .logsrc { white-space: normal; overflow-wrap: anywhere; }
 .cachebox td, .cachebox th { font-size: 12px; white-space: nowrap; }
 .launch { font-size: 11px; color: var(--text-2); margin-top: 6px; max-height: 360px; overflow: auto; }
 .launch div { padding: 2px 0; border-bottom: 1px dashed var(--line); overflow-wrap: anywhere; }
@@ -469,6 +473,8 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
 .vp.w2 { grid-column: 1 / -1; }
 .vp h3 { display: flex; justify-content: space-between; gap: 8px; margin: 0 0 6px; font-size: 13px; font-weight: 650; }
 .vp h3 .muted { font-size: 12px; }
+.vp h3 > span:last-child { display: flex; justify-content: flex-end; align-items: flex-start; flex: 0 0 auto; max-width: 45%; }
+.vp h3 > span:last-child > .ipcsrc, .vp h3 > span:last-child > .logsrc { min-width: 0; margin-left: 0; }
 .vp .u { min-height: 200px; }
 .vp .uplot { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
 .vp .u-legend { font-size: 12px; color: var(--text-2); text-align: left; margin: 4px 0 2px; }
@@ -546,7 +552,6 @@ details.fold[open] { padding-bottom: 12px; }
 details.fold-sub { margin: 4px 0; } details.fold-sub > summary { font-size: 13px; color: var(--text); }
 /* Handy (01.10.): lange Tags/Quellen im Boot-Kopf schoben die Seite auf 847 px */
 section.card .muted, section.card .mono { overflow-wrap: anywhere; }
-section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap: anywhere; }
 .stand { font-size: 12.5px; padding: 8px 10px; border-radius: 8px; margin: 0 0 10px; border: 1px solid var(--line); background: var(--surface-2); }
 .stand.warn { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, var(--surface)); }
 .stand.bad { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, var(--surface)); }
@@ -726,6 +731,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
 </main>
 <div class="tip" id="tip"></div>
 <script src="zoom.js"></script>
+<script src="tooltip.js"></script>
 <!--DEV:BEGIN-->
 <script src="kartenplan.js"></script>
 <!--DEV:END-->
@@ -851,7 +857,7 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
       if (!best || Math.abs(best[0] - tx) > Math.max(2 * step, (t1 - t0) / 45)) { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); return; }
       cross.setAttribute("x1", x(best[0])); cross.setAttribute("x2", x(best[0])); cross.setAttribute("visibility", "visible");
       tip.innerHTML = `<b>${fmt(best[1], digits)}</b> ${unit} &middot; ${hhmm(best[0])}${best[1] === 0 ? " &middot; idle / no work" : ""}${opt.tipExtra ? opt.tipExtra(best[2]) : ""}`;
-      tip.style.display = "block"; tip.style.left = (e.clientX + 12) + "px"; tip.style.top = (e.clientY - 28) + "px";
+      RigTip.place(tip, e.clientX, e.clientY);
     };
     el.onmouseleave = () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); };
   }};
@@ -1091,12 +1097,7 @@ function fitPhaseLabels() {
 }
 function showTip(html, x, y) {
   tip.innerHTML = html;
-  tip.style.whiteSpace = "normal";
-  tip.style.maxWidth = Math.min(460, window.innerWidth - 16) + "px";
-  tip.style.display = "block";
-  const r = tip.getBoundingClientRect();
-  tip.style.left = Math.max(8, Math.min(x + 12, window.innerWidth - r.width - 8)) + "px";
-  tip.style.top = (y - r.height - 12 < 8 ? y + 18 : y - r.height - 12) + "px";
+  RigTip.place(tip, x, y);
 }
 let tapTimer = null, tapPinned = false;   // a tapped tip stays (touch sends a mouseleave right after the tap)
 function bindPhaseBars() {
