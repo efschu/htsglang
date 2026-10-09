@@ -15,6 +15,11 @@
 #       Arbeit still heraus -- so wäre Stufe 1 beim nächsten Deploy der alten Linie verloren),
 # außer mit RIGDASH_DEPLOY_ROLLBACK=1 (bewusster Rückschritt, Grund im Commit/Entscheidungslog).
 # Nur prüfen, nichts ändern: install.sh --check [<git-rev>]
+#
+# UMBENANNTER BAUM (F0-K, M3): ein Commit des alten Namens kann in einem umbenannten Baum nie Vorfahre sein -- dessen Inhalt wurde per Kit-Regel
+# PORTIERT, nicht gemerged. Ein Baum nennt deshalb in tools/rig_dashboard/rigdash/deploy/CARRIED_FROM die Commits der alten Linie, deren Inhalt er
+# trägt (Linienspitze, laufendes Release). Beide Prüfungen gelten für so einen Commit als erfüllt, WENN die Datei in der zu deployenden Revision
+# selbst steht (ein Vorfahr-Nachweis, kein Schalter von außen). Ohne die Datei ändert sich nichts.
 set -euo pipefail
 
 # --- state dir of the dashboard (F0-F, rename) -----------------------------------------------------------------------
@@ -44,14 +49,19 @@ LINE=${RIGDASH_DEPLOY_LINE:-desk/dashboard-ipc-0929}
 git -C "$repo" fetch -q origin "$LINE" 2>/dev/null || true
 line_tip=$(git -C "$repo" rev-parse -q --verify "origin/$LINE^{commit}" || git -C "$repo" rev-parse -q --verify "$LINE^{commit}") || {
   echo "REFUSED: Deploy-Linie $LINE nicht auflösbar (weder origin/$LINE noch lokal)" >&2; exit 3; }
-if ! git -C "$repo" merge-base --is-ancestor "$line_tip" "$sha"; then
+# carried <old-commit>: does $sha's own CARRIED_FROM list it (first 10 hex digits)? -- the renamed tree carries its content (F0-K M3)
+carried() {
+  git -C "$repo" show "$sha:tools/rig_dashboard/rigdash/deploy/CARRIED_FROM" 2>/dev/null \
+    | awk -v want="${1:0:10}" '$1 !~ /^#/ && NF && substr($1,1,10) == want { found = 1 } END { exit !found }'
+}
+if ! git -C "$repo" merge-base --is-ancestor "$line_tip" "$sha" && ! carried "$line_tip"; then
   echo "REFUSED: $sha ist kein Nachfahre der Deploy-Linie $LINE (${line_tip:0:10}) -- auf $LINE aufsetzen oder ff übernehmen" >&2
   exit 3
 fi
-cur=$(basename "$(readlink /opt/rigdash/current 2>/dev/null || true)")
+cur=$(basename "$(readlink "${RIGDASH_CURRENT_LINK:-/opt/rigdash/current}" 2>/dev/null || true)")
 if [ -n "$cur" ] && [ "${RIGDASH_DEPLOY_ROLLBACK:-0}" != 1 ] \
    && git -C "$repo" cat-file -e "$cur^{commit}" 2>/dev/null \
-   && ! git -C "$repo" merge-base --is-ancestor "$cur" "$sha"; then
+   && ! git -C "$repo" merge-base --is-ancestor "$cur" "$sha" && ! carried "$cur"; then
   echo "REFUSED: $sha enthält das laufende Release $cur nicht -- dessen Commits fielen heraus (RIGDASH_DEPLOY_ROLLBACK=1 für einen bewussten Rückschritt)" >&2
   exit 3
 fi
