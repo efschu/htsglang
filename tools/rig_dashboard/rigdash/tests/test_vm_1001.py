@@ -17,6 +17,27 @@ def _ipc():
             "flip_user_time": [{"start_ts": 301.0, "flip_user_ms": 3700.0}]}
 
 
+def test_ttft_falls_back_to_the_request_book_without_the_arrival_seat_block():
+    """08.10.: a 27B boot without the arrival-seat rule has no front.arrival_seat, but front.ttft_by_via (both lines): the
+    sampler pushes weg2_front_ttft_* from it, so the 27B tile gets values (VM held no ttft series for model 27B)."""
+    ipc = _ipc()
+    ipc["front"].pop("arrival_seat")
+    ipc["front"]["ttft_by_via"] = {"after_p": {"n": 2, "ms_sum": 9000.0, "ms_max": 6000.0},
+                                   "d_direct": {"n": 3, "ms_sum": 3000.0, "ms_max": 1500.0},
+                                   "d_single": {"n": 0, "ms_sum": 0.0, "ms_max": 0.0}}
+    ls = vmpush.lines_for_boot(ipc, {}, "27B", 1_000)
+    assert 'weg2_front_ttft_count{boot="boot-20261001T064831Z-2025",model="27B"} 5.0 1000' in ls
+    assert 'weg2_front_ttft_ms_sum{boot="boot-20261001T064831Z-2025",model="27B"} 12000.0 1000' in ls
+    assert 'weg2_front_ttft_ms_max{boot="boot-20261001T064831Z-2025",model="27B"} 6000.0 1000' in ls
+
+
+def test_arrival_seat_counters_win_over_the_request_book():
+    ipc = _ipc()
+    ipc["front"]["ttft_by_via"] = {"d_direct": {"n": 99, "ms_sum": 1.0, "ms_max": 1.0}}
+    ls = vmpush.lines_for_boot(ipc, {}, "NF", 1_000)
+    assert 'weg2_front_ttft_count{boot="boot-20261001T064831Z-2025",model="NF"} 4.0 1000' in ls
+
+
 def test_short_boot_is_one_label_per_boot():
     assert vmpush.short_boot("nfh91abc-boot-20261001T064831Z-2025") == "boot-20261001T064831Z-2025"
 

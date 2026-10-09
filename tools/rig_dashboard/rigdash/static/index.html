@@ -718,9 +718,10 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
     <p>The dashboard sends no request to any model except <span class="mono">GET /pdflip/state</span> every 10 s.
     VictoriaMetrics (:8428) fetches <span class="mono">/metrics</span> of the front every 15 s (user order 01.10.: time-series DB).</p>
     <p><b>TTFT</b> = arrival at the front &rarr; first content from D (<span class="mono">LEG2-FIRST-CONTENT</span>), as IPC counter
-    <span class="mono">state.json front.arrival_seat.ttft_*</span> (NF front); the sampler writes it to VictoriaMetrics
-    (<span class="mono">pdflip_front_ttft_*</span>), the tile reads it via PromQL. The 27B front does not have it until the image with
-    <span class="mono">pdflip_ttft_seconds</span>.</p>
+    <span class="mono">state.json front.arrival_seat.ttft_*</span> (written while the arrival-seat rule is armed), otherwise the
+    request book's <span class="mono">front.ttft_by_via</span> (both lines); the sampler writes it to VictoriaMetrics
+    (<span class="mono">weg2_front_ttft_*</span>), the tile reads it via PromQL. An empty tile names its cause: no running boot of the model,
+    boot running but no request answered yet, or the front delivers neither block.</p>
   </details>
 </main>
 <div class="tip" id="tip"></div>
@@ -1809,16 +1810,33 @@ function flipDepth(b, dir, f) {
   if (!pd || pd.x == null || f.last_t == null || dg.p_depth_t == null || Math.abs(dg.p_depth_t - f.last_t) > 0.01) return "";
   return `<br><span class="muted">${dt("nachprefill")} ${tokRange(pd.x, pd.y, pd.n)}</span>`;
 }
+// The front's TTFT counters (08.10.): front.arrival_seat.ttft_* exists only while the arrival-seat rule is armed, while
+// front.ttft_by_via (the request book: n, ms_sum, ms_max, last_ms per route) is written by BOTH lines -- the second one fills in.
+const VIAS = ["after_p", "d_direct", "d_single"];
+function viaSum(tv) {
+  const rows = VIAS.map((k) => (tv || {})[k]).filter((x) => x && x.n);
+  return rows.length ? {n: rows.reduce((a, x) => a + x.n, 0), sum: rows.reduce((a, x) => a + x.ms_sum, 0), max: Math.max(...rows.map((x) => x.ms_max))} : {n: 0, sum: 0, max: null};
+}
 function ttftOf(b, d) {
   const m = lineOf(b), v = d.vm || {};
-  const a = ((b.ipc || {}).front || (b.front || {})).arrival_seat || null;
+  const fr = (b.ipc || {}).front || (b.front || {});
+  const a = fr.arrival_seat && fr.arrival_seat.ttft_n != null ? fr.arrival_seat : null, tv = fr.ttft_by_via || null, vs = viaSum(tv);
   const r = {m5: (v.ttft_mean_5m_ms || {})[m], n5: (v.ttft_n_5m || {})[m], mb: (v.ttft_mean_boot_ms || {})[m],
     mx: (v.ttft_max_boot_ms || {})[m], src: v.error ? null : "VictoriaMetrics", n: a ? a.ttft_n : null};
   if (r.mb == null && a && a.ttft_n) { r.mb = a.ttft_ms_sum / a.ttft_n; r.mx = a.ttft_ms_max; r.src = "state.json"; }
-  if (!a || a.ttft_n == null)
-    r.missing = m === "27B" ? "27B front delivers no TTFT (until the image with pdflip_ttft_seconds, TSDB delta 01.10.)"
-      : "front.arrival_seat.ttft_* missing in IPC";
+  else if (r.mb == null && !a && vs.n) { r.mb = vs.sum / vs.n; r.mx = vs.max; r.src = "state.json front.ttft_by_via"; }
+  if (!a && !tv) r.missing = "front delivers neither arrival_seat.ttft_* nor ttft_by_via";
   return r;
+}
+// why an empty TTFT tile is empty, per model, from the boot state (08.10.; the old text named the 27B line as the cause)
+function ttftWhy(m, d) {
+  const b = (d.boots || []).find((x) => lineOf(x) === m && x.live && !((x.ipc || {}).terminal));
+  if (!b) return {short: `no running boot of ${m}`, detail: ""};
+  const fr = (b.ipc || {}).front || {}, a = fr.arrival_seat && fr.arrival_seat.ttft_n != null ? fr.arrival_seat : null, tv = fr.ttft_by_via || null;
+  if (!a && !tv) return {short: "front delivers no TTFT", detail: `${m} boot is running, but its state.json front has neither arrival_seat.ttft_* nor ttft_by_via`};
+  const n = a ? a.ttft_n : viaSum(tv).n;
+  if (!n) return {short: "no request answered yet", detail: `${m} boot is running; the front counts n=0 first tokens (${a ? "arrival_seat.ttft_n" : "ttft_by_via"})`};
+  return {short: "no VictoriaMetrics samples yet", detail: `the front counts ${fmt(n)} first tokens; the sampler has not yet written weg2_front_ttft_* of model ${m} to VictoriaMetrics (every 5 s)`};
 }
 function kpi(k, v, unit, sub, cls, color, title) {
   const na = typeof v === "object" && v && v.na;
@@ -1885,13 +1903,17 @@ function ovCard(b, d, now) {
   const tK = tl ? "TTFT &middot; last request" : ttft.m5 != null ? "TTFT &middot; avg 5 min" : "TTFT &middot; avg since boot";
   const as = ((ipc.front || {}).arrival_seat) || {};
   const rt = b.prefill_route || {};
+  const tvb = (ipc.front || {}).ttft_by_via || {};
+  const viaTxt = (k, label) => tvb[k] && tvb[k].n ? `${label} avg ${sec(tvb[k].ms_sum / tvb[k].n)} s (n=${fmt(tvb[k].n)})` : null;
+  const tvia = [viaTxt("after_p", "via P"), viaTxt("d_direct", "directly D"), viaTxt("d_single", "single")].filter(Boolean);
+  const tviaHtml = tvia.length ? `TTFT per route: ${tvia.join(" &middot; ")}` : (tvb.after_p || tvb.d_direct ? "TTFT per route: no first token yet" : "");
   const tSub = ttft.missing && tv == null ? "" : [
     tl ? `${tl.exact ? "" : "mean of " + tl.n + " in the 5 s tick, "}${ago(now - tl.t)} ago` : null,
     ttft.m5 != null ? `avg 5 min ${sec(ttft.m5)} s (n=${fmt(ttft.n5)})` : null,
     ttft.mb != null ? `since boot avg ${sec(ttft.mb)} s, max ${sec(ttft.mx)} s, n=${fmt(ttft.n)}` : null,
     as.verdict_n ? `of which arrival&rarr;seat decision avg ${sec(as.verdict_ms_sum / as.verdict_n)} s` : null,
     rt.via_p != null ? `requests via P ${fmt(rt.via_p)} &middot; directly D ${fmt(rt.d_direct)}` : null,
-    `<span class="miss">split via P / directly D: missing in IPC (front.arrival_seat.ttft_by_via)</span>`].filter(Boolean).join("<br>");
+    tviaHtml ? tviaHtml : `<span class="miss">split via P / directly D: missing in IPC (front.ttft_by_via)</span>`].filter(Boolean).join("<br>");
   const tKpi = kpi(tK, tv != null ? sec(tv) : (ttft.missing ? {na: ttft.missing} : null), "s", tSub, "hl wide", "var(--s7)",
     "arrival at the front → first content from D (LEG2-FIRST-CONTENT), both routes mixed; source " + (ttft.src || "–"));
   // Decode
@@ -1998,10 +2020,10 @@ function vmHtml(d) {
     const m5 = (v.ttft_mean_5m_ms || {})[m], n5 = (v.ttft_n_5m || {})[m];
     const mb = (v.ttft_mean_boot_ms || {})[m], mx = (v.ttft_max_boot_ms || {})[m];
     const any = m5 != null || mb != null;
-    const miss = m === "27B" ? "27B front: no arrival_seat.ttft_* (writer front.py _asr.note_ms, NF line only)" : "no running boot";
+    const why = any ? null : ttftWhy(m, d);
     return `<div class="vtile" id="vm-ttft-${m}"><div class="vt-h">TTFT ${m} &middot; avg 5 min</div>
-      <div class="vt-big num">${any ? (m5 != null ? sec(m5) : "—") + "<small>s</small>" : `<span style="font-size:14px;color:var(--muted)">${esc(miss)}</span>`}</div>
-      <div class="vt-f"><span class="vt-sub">${any ? `${n5 != null ? fmt(n5) + " requests in 5 min &middot; " : ""}since boot avg ${sec(mb)} s &middot; max ${sec(mx)} s` : ""}</span>${vmsrc}</div></div>`;
+      <div class="vt-big num">${any ? (m5 != null ? sec(m5) : "—") + "<small>s</small>" : `<span style="font-size:14px;color:var(--muted)">${esc(why.short)}</span>`}</div>
+      <div class="vt-f"><span class="vt-sub"${why ? ' style="white-space:normal"' : ""} title="${esc(why ? why.detail : "")}">${any ? `${n5 != null ? fmt(n5) + " requests in 5 min &middot; " : ""}since boot avg ${sec(mb)} s &middot; max ${sec(mx)} s` : esc(why.detail)}</span>${vmsrc}</div></div>`;
   };
   return models.map(t).join("") + `<div class="vtile" id="vm-power"><div class="vt-h">Power all cards</div>
     <div class="vt-big num">${fmt(v.power_sum_w)}<small>W</small></div><div class="vt-f"><span class="vt-sub">nvidia_gpu_exporter (NVML)</span>${vmsrc}</div></div>`;
