@@ -82,6 +82,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
     VramBudgetReqInput,
     VramBudgetReqOutput,
+    Weg2LaneFloorReqInput,
+    Weg2LaneFloorReqOutput,
     Weg2ParkRunningReqInput,
     Weg2ParkRunningReqOutput,
 )
@@ -123,6 +125,7 @@ _COMMUNICATOR_SPECS = [
     ("session_checkpoint", SessionCheckpointReqOutput),
     ("vram_budget", VramBudgetReqOutput),
     ("weg2_park_running", Weg2ParkRunningReqOutput),
+    ("weg2_lane_floor", Weg2LaneFloorReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -429,6 +432,14 @@ class TokenizerControlMixin:
         except Exception:  # noqa: BLE001 -- the park answer never fails on a mark
             pass
         return out
+
+    async def weg2_lane_floor(
+        self: TokenizerManager, obj: Weg2LaneFloorReqInput
+    ) -> Weg2LaneFloorReqOutput:
+        """PRIORITY LANES 1008 (L2): hand the front's floor to the scheduler; group D takes it into its
+        admission and re-queues the held lane parks it lets in again."""
+        self.auto_create_handle_loop()
+        return (await self.weg2_lane_floor_communicator(obj))[0]
 
     async def clear_hicache_storage(self: TokenizerManager, force: bool = False) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage (``force``: also a persistent L3 store)."""
