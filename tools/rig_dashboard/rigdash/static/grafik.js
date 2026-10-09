@@ -368,15 +368,18 @@
           paths: uPlot.paths && uPlot.paths.stepped ? uPlot.paths.stepped({ align: 1 }) : undefined, value: seatVal }),
           wall("wall clock incl. pauses", C.s3)]),
     }, rowsDec(d));
+    // Input tokens (user 08.10.): LEVELS of the prefill in progress, stacked -- the cached prefix (blue) is there from the
+    // first second of the request, the tokens newly prefilled so far (green) rise on top of it up to the whole input;
+    // the part of a D request that P handed over sits between them (amber, never cache).  No prefill = a gap.
+    const tokAxis = (v) => v == null ? "–" : fmtN(v, 0) + " tok";
     charts.cache = mk("vl-c-cache", {
-      scales: { y: { range: zeroUp(10) } },
-      axes: [axisX(), axisY(tps)],
+      scales: { y: { range: zeroUp(1000) } },
+      axes: [axisX(), axisY(tokAxis)],
       series: [{},
-        line("from cache", C.s1, "tok/s", { fill: C.s1 + "66", value: valFmt("tok/s", null, (i) => raw.v[0][i]) }),
-        line("recomputed P", C.s2, "tok/s", { fill: C.s2 + "66", value: valFmt("tok/s", null, (i) => raw.v[1][i]) }),
-        line("recomputed D", C.s3, "tok/s", { fill: C.s3 + "66", value: valFmt("tok/s", null, (i) => raw.v[2][i]) }),
-        line("Handoff P→D (no cache)", C.s4, "tok/s", { fill: undefined, dash: [5, 4], width: 1.5 })],
-      bands: [{ series: [2, 1], fill: C.s2 + "66" }, { series: [3, 2], fill: C.s3 + "66" }],
+        line("from cache", C.s1, "tok", { fill: C.s1 + "88", value: valFmt("tok", 0, (i) => raw.v[0][i]) }),
+        line("taken over from P (handoff, no cache)", C.s4, "tok", { fill: C.s4 + "88", value: valFmt("tok", 0, (i) => raw.v[1][i]) }),
+        line("newly prefilled so far (top = whole input)", C.s3, "tok", { fill: C.s3 + "88", value: valFmt("tok", 0, (i) => raw.v[2][i]) })],
+      bands: [{ series: [2, 1], fill: C.s4 + "88" }, { series: [3, 2], fill: C.s3 + "88" }],
     }, rowsCache(d));
     // TTFT der Nutzer (Nutzer 01.10.: zentrale Messgroesse, mit Verlauf) aus VictoriaMetrics; Balken je Eimer
     charts.ttft = mk("vl-c-ttft", {
@@ -458,16 +461,15 @@
   const rowsPower = (d) => [d.t, d.series["gsum.power"]].concat(rowsCards(d, "power").slice(1));
   function rowsCache(d) {
     const s = d.series, n = d.t.length;
-    const a = s["m.tok_cache"] || [], b = s["m.tok_comp_p"] || [], c = s["m.tok_comp_d"] || [], h = s["m.tok_handoff"] || [];
-    const has = (i) => a[i] != null || b[i] != null || c[i] != null;
-    raw.v = [a, b, c];
+    const a = s["m.pf_cache"] || [], h = s["m.pf_hand"] || [], w = s["m.pf_new"] || [];
+    raw.v = [a, h, w];
     const c1 = [], c2 = [], c3 = [];
     for (let i = 0; i < n; i++) {
-      if (!has(i)) { c1.push(null); c2.push(null); c3.push(null); continue; }
-      const x = a[i] || 0, y = b[i] || 0, z = c[i] || 0;
+      if (a[i] == null && h[i] == null && w[i] == null) { c1.push(null); c2.push(null); c3.push(null); continue; }
+      const x = a[i] || 0, y = h[i] || 0, z = w[i] || 0;
       c1.push(x); c2.push(x + y); c3.push(x + y + z);
     }
-    return [d.t, c1, c2, c3, h.map((v) => (v == null ? null : v))];
+    return [d.t, c1, c2, c3];
   }
   // Flipzeit (Nutzer 06.10.): P>D = letzter P-Chunk fertig -> erstes Decode-Token erzeugt, D>P = letztes Decode-Token
   // erzeugt -> erster Prefill-Chunk beginnt zu rechnen; beide aus den Marken flip_t2t (dieselben wie die Kacheln,

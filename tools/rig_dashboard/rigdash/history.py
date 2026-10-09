@@ -587,6 +587,13 @@ class Recorder:
                     vals.update({"ph_" + k: b["ph_" + k][i] for k in activity.STATES})
                     # dual boots only (activity.CO_STATES): the part of ph_P with D working at the same time
                     vals.update({"ph_" + k: b["ph_" + k][i] for k in activity.CO_STATES if "ph_" + k in b})
+                    if b["pf_cached"][i] is not None:
+                        # the prefill in progress (levels, tokens): the cached prefix, of a D request the share
+                        # handed over from P apart from it, and the tokens newly prefilled so far
+                        pc_, hd = b["pf_cached"][i], 0.0
+                        if b["pf_isd"][i]:
+                            hd = pc_ if split is None else pc_ * split
+                        vals.update({"pf_cache": pc_ - hd, "pf_hand": hd, "pf_new": b["pf_new"][i]})
                     rows += [(pre + k, ts, v) for k, v in vals.items() if v is not None]
                 self.db.put(rows)
                 c1 = self.db.get("cursor.p1")
@@ -832,6 +839,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     mp = SERIES % model
     msr = ["p_tps", "d_tps", "dec_tps", "stream_tps", "kv_pct", "kv_p_pct", "ipc"] + ["tok_" + k for k in cacheacct.CLASSES] \
         + ["ph_" + k for k in activity.STATES] + ["ph_" + k for k in activity.CO_STATES] + list(BUSY_SERIES)
+    msr += ["pf_cache", "pf_hand", "pf_new"]       # the prefill in progress (levels)
     names += [mp + k for k in msr] + [mp + "tier_" + k for k in cacheacct.TIERS]
     data = db.query(names, lo, hi, step, now)
     t0 = int(lo // step) * step
